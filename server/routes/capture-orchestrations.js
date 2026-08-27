@@ -7,6 +7,10 @@ import {
   requireTenantWriter,
 } from '../middleware/auth.js';
 import {
+  captureAgentFullHeartbeatAt,
+  captureAgentFullHeartbeatOnline,
+  captureAgentLivenessAt,
+  captureAgentLivenessOnline,
   captureAgentOnline,
   findCaptureAgentExecutionSlotBlocker,
   lockCaptureAgentExecutionSlot,
@@ -334,7 +338,14 @@ function publicAgent(agent) {
     capabilities: agent.capabilities,
     status: agent.status,
     last_heartbeat_at: agent.last_heartbeat_at,
-    online: captureAgentOnline(agent.last_heartbeat_at),
+    last_liveness_at: captureAgentLivenessAt(agent),
+    last_full_heartbeat_at: captureAgentFullHeartbeatAt(agent),
+    connected: captureAgentLivenessOnline(agent),
+    fullHeartbeatHealthy: captureAgentFullHeartbeatOnline(agent),
+    degraded:
+      safeJson(agent.capabilities).taskStateKnown === false ||
+      safeJson(agent.capabilities).heartbeatDegraded === true,
+    online: captureAgentLivenessOnline(agent),
   };
 }
 
@@ -572,7 +583,9 @@ async function loadRetryAgentCandidates(
       AND ac.status = 'active'
       AND ab.id IS NOT NULL
       AND (ac.expires_at IS NULL OR ac.expires_at >= now())
-      AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+      AND COALESCE(ca.last_full_heartbeat_at, ca.last_heartbeat_at) >=
+        now() - interval '2 minutes'
+      AND ca.capabilities->>'taskStateKnown' IS DISTINCT FROM 'false'
       AND daily_usage.last_event_at IS NOT NULL
       AND (
         current_social_account.daily_search_limit IS NULL OR
@@ -620,7 +633,8 @@ async function loadRetryAgentCandidates(
       recent_technical_failure_count ASC,
       recent_success_count DESC,
       last_assignment_at ASC NULLS FIRST,
-      ca.last_heartbeat_at DESC NULLS LAST,
+      COALESCE(ca.last_full_heartbeat_at, ca.last_heartbeat_at)
+        DESC NULLS LAST,
       ca.id
     ${lock ? 'FOR UPDATE OF ca, daily_usage' : ''}
   `, [
@@ -1912,7 +1926,7 @@ async function loadIdlePendingRetryAgent(tx, {tenantId, parent, lineage}) {
   });
   const eligibleCandidates = candidates.filter(agent =>
     !agentCompatibilityFailure(agent, parent.platform, planSnapshot) &&
-    captureAgentOnline(agent.last_heartbeat_at) &&
+    captureAgentFullHeartbeatOnline(agent) &&
     crossDeviceRetryAgentDailyUsageEligible(agent)
   );
   for (const candidate of eligibleCandidates) {
@@ -1937,7 +1951,7 @@ async function loadIdlePendingRetryAgent(tx, {tenantId, parent, lineage}) {
       const locked = lockedCandidates[0] || null;
       const eligible = locked &&
         !agentCompatibilityFailure(locked, parent.platform, planSnapshot) &&
-        captureAgentOnline(locked.last_heartbeat_at) &&
+        captureAgentFullHeartbeatOnline(locked) &&
         crossDeviceRetryAgentDailyUsageEligible(locked);
       const blocker = eligible
         ? await findCaptureAgentExecutionSlotBlocker(tx, tenantId, locked.id)
@@ -4932,7 +4946,7 @@ router.post(
           const agentId = String(agent.id);
           if (
             agentCompatibilityFailure(agent, parent.platform, planSnapshot) ||
-            !captureAgentOnline(agent.last_heartbeat_at) ||
+            !captureAgentFullHeartbeatOnline(agent) ||
             !crossDeviceRetryAgentDailyUsageEligible(agent)
           ) continue;
           const blocker = await findCaptureAgentExecutionSlotBlocker(
@@ -5682,7 +5696,7 @@ router.post(
             409,
           )};
         }
-        if (!captureAgentOnline(targetAgent.last_heartbeat_at)) {
+        if (!captureAgentFullHeartbeatOnline(targetAgent)) {
           return {failure: requestError(
             'handoff_target_offline',
             '接力节点当前离线，请选择在线空闲节点',
@@ -6156,6 +6170,8 @@ router.get(
             ca.app_version AS agent_app_version,
             ca.status AS agent_status,
             ca.last_heartbeat_at AS agent_last_heartbeat_at,
+            ca.last_liveness_at AS agent_last_liveness_at,
+            ca.last_full_heartbeat_at AS agent_last_full_heartbeat_at,
             command.id AS command_id,
             command.status AS command_status,
             command.expires_at AS command_expires_at
@@ -6188,7 +6204,8 @@ router.get(
           SELECT
             ca.id, ca.display_name, ca.host_label, ca.browser_name,
             ca.operating_system, ca.app_version, ca.allowed_platforms,
-            ca.capabilities, ca.status, ca.last_heartbeat_at
+            ca.capabilities, ca.status, ca.last_heartbeat_at,
+            ca.last_liveness_at, ca.last_full_heartbeat_at
           FROM capture_agents ca
           WHERE ca.tenant_id = $1
             AND (
@@ -6271,7 +6288,12 @@ router.get(
           .map(publicParentItem),
         executions: executions.map(execution => ({
           ...execution,
-          agent_online: captureAgentOnline(execution.agent_last_heartbeat_at),
+          agent_online: captureAgentLivenessOnline({
+            last_heartbeat_at: execution.agent_last_heartbeat_at,
+            last_liveness_at: execution.agent_last_liveness_at,
+            last_full_heartbeat_at:
+              execution.agent_last_full_heartbeat_at,
+          }),
         })),
         agents: agents.map(publicAgent),
         retryCandidates: retryCandidates.map(publicRetryAgentCandidate),

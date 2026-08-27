@@ -241,7 +241,7 @@ test('observe-only control plane reconciles a historical failure to final succes
           (SELECT COUNT(*)::int FROM capture_task_item_attempts WHERE item_id = $2) AS attempt_count
       `, [runTask.id, item.id]),
     ]);
-    assert.equal(run.runtime_baseline_version, '0.3.94');
+    assert.equal(run.runtime_baseline_version, '0.3.95');
     assert.equal(run.snapshot_count, 2);
     assert.equal(run.verdict, 'healthy');
     assert.equal(snapshots.length, 2);

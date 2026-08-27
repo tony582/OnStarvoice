@@ -332,11 +332,36 @@ function createHarness() {
     OnStarvoiceCloudTaskAgent: {
       buildHeartbeatPayload(options = {}) {
         return {
-          agent: {clientUuid: options.runtime?.clientUuid || ""},
-          tasks: Array.isArray(options.ledger?.runs)
-            ? options.ledger.runs.map((run) => ({...run}))
-            : [],
-          unattendedPlan: options.unattendedPlan || null,
+          agent: {
+            registrationId: options.agentId || "",
+            clientUuid: options.runtime?.clientUuid || "",
+            appVersion: options.runtime?.appVersion || "",
+            capabilities: {taskStateKnown: options.taskStateKnown !== false},
+            health: {
+              status: Array.isArray(options.degradedHealth) &&
+                  options.degradedHealth.length > 0
+                ? "degraded"
+                : "healthy",
+              degradedReasons: options.degradedHealth || [],
+            },
+            lastError: options.lastError || "",
+          },
+          ...(options.taskStateKnown === false
+            ? {}
+            : {
+                tasks: Array.isArray(options.ledger?.runs)
+                  ? options.ledger.runs.map((run) => ({...run}))
+                  : [],
+              }),
+          ...(options.unattendedPlanKnown === false
+            ? {}
+            : {unattendedPlan: options.unattendedPlan || null}),
+          ...(options.observedSocialAccountsKnown === false
+            ? {}
+            : {observedSocialAccounts: options.observedSocialAccounts || []}),
+          ...(options.socialUsageEventsKnown === false
+            ? {}
+            : {socialUsageEvents: options.socialUsageEvents || []}),
           reason: options.reason || "",
           lastError: options.lastError || "",
         };
@@ -397,6 +422,9 @@ function createHarness() {
       `  persistTargetedPostRunRequest,\n` +
       `  executeCloudTaskAgentCommand,\n` +
       `  syncCloudTaskAgent,\n` +
+      `  ensureRuntimeState,\n` +
+      `  rememberCloudCommandResult,\n` +
+      `  compactExpiredControlStorage,\n` +
       `  superviseUnattendedKeywordRun,\n` +
       `  syncUnattendedSupervisorAlarm,\n` +
       `  upsertTaskLedgerRun,\n` +
@@ -3599,6 +3627,73 @@ test("switching capture-agent identity does not mirror the previous tenant's loc
   assert.equal(harness.cloudHeartbeats.at(-1).unattendedPlan.keywords[0], "客户 B 计划");
 });
 
+test("heartbeat still uses the authenticated endpoint but omits unknown task state after a local read failure", async () => {
+  const harness = createHarness();
+  const now = new Date().toISOString();
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "degraded-agent", token: "degraded-token"},
+  };
+  harness.storage["onstarvoice.runtime"] = {
+    clientUuid: "degraded-client-uuid",
+    clientLabel: "degraded-client",
+    appVersion: "0.3.94",
+  };
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    keywords: ["不能伪报为空"],
+    updatedAt: now,
+  });
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [{
+      id: "known-running-task",
+      status: "running",
+      attemptId: "known-running-attempt",
+      updatedAt: now,
+    }],
+  };
+  harness.setStorageGetHandler(async (keys, result) => {
+    if (
+      Array.isArray(keys) &&
+      keys.includes(TASK_LEDGER_KEY) &&
+      keys.includes(UNATTENDED_REQUEST_KEY) &&
+      keys.includes(TARGETED_POST_REQUEST_KEY)
+    ) {
+      throw new Error("injected non-critical task bundle read failure");
+    }
+    return result;
+  });
+
+  const response = await harness.api.syncCloudTaskAgent({
+    reason: "degraded-task-read",
+    force: true,
+  });
+  const heartbeat = harness.cloudHeartbeats.at(-1);
+
+  assert.equal(response.ok, true);
+  assert.equal(heartbeat.agent.registrationId, "degraded-agent");
+  assert.equal(heartbeat.agent.clientUuid, "degraded-client-uuid");
+  assert.equal(
+    heartbeat.agent.appVersion,
+    harness.chrome.runtime.getManifest().version,
+  );
+  assert.equal(heartbeat.agent.capabilities.taskStateKnown, false);
+  assert.equal(heartbeat.agent.health.status, "degraded");
+  assert.ok(
+    heartbeat.agent.health.degradedReasons.includes("task_state_unavailable"),
+  );
+  assert.match(heartbeat.agent.lastError, /LOCAL_HEARTBEAT_DEGRADED/u);
+  assert.equal(Object.hasOwn(heartbeat, "tasks"), false);
+  assert.equal(Object.hasOwn(heartbeat, "unattendedPlan"), false);
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].id,
+    "known-running-task",
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_PLAN_KEY].keywords[0],
+    "不能伪报为空",
+  );
+});
+
 test("switching Agent scope cannot revive another tenant's recovery snapshot", async () => {
   const harness = createHarness();
   const now = new Date().toISOString();
@@ -5861,6 +5956,287 @@ test("a terminal task ledger write releases the reserve once and succeeds on its
     ),
     [CONTROL_STORAGE_RESERVE_KEY],
   );
+});
+
+test("runtime identity survives quota pressure while cleanup preserves auth plans requests and active tasks", async () => {
+  const harness = createHarness();
+  const now = Date.now();
+  const old = new Date(now - 45 * 24 * 60 * 60 * 1000).toISOString();
+  const fresh = new Date(now - 60 * 1000).toISOString();
+  const auth = {captureAgent: {id: "agent-safe", token: "secret-safe"}};
+  const plan = {enabled: true, keywords: ["必须保留"], updatedAt: fresh};
+  const request = {
+    id: "active-unattended",
+    attemptId: "active-attempt",
+    status: "running",
+    updatedAt: fresh,
+  };
+  const targeted = {
+    id: "active-targeted",
+    attemptId: "active-targeted-attempt",
+    status: "running",
+    updatedAt: fresh,
+  };
+  harness.storage["onstarvoice.auth"] = auth;
+  harness.storage[UNATTENDED_PLAN_KEY] = plan;
+  harness.storage[UNATTENDED_REQUEST_KEY] = request;
+  harness.storage[TARGETED_POST_REQUEST_KEY] = targeted;
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    opaqueLedgerField: {mustRemain: "untouched"},
+    runs: [{
+      id: "active-task",
+      status: "running",
+      attemptId: "active-task-attempt",
+      checkpoint: {cursor: 17, nested: {keyword: "保留原样"}},
+      localClosures: [{attemptId: "active-task-attempt", proof: "exact"}],
+      unknownRuntimeField: {mustRemain: true},
+      updatedAt: fresh,
+    }, {
+      id: "needs-action-task",
+      status: "needs_action",
+      attemptId: "needs-action-attempt",
+      checkpoint: {cursor: 9},
+      localClosures: [{attemptId: "needs-action-attempt", proof: "recoverable"}],
+      unknownRuntimeField: "preserve-needs-action",
+      updatedAt: old,
+    }, {
+      id: "unknown-status-task",
+      status: "future_recovery_state",
+      attemptId: "unknown-attempt",
+      checkpoint: {cursor: 4},
+      localClosures: [{attemptId: "unknown-attempt", proof: "future"}],
+      unknownRuntimeField: "preserve-unknown-status",
+      updatedAt: old,
+    }, {
+      id: "terminal-without-time",
+      status: "failed",
+      attemptId: "missing-time-attempt",
+      checkpoint: {cursor: 3},
+      unknownRuntimeField: "preserve-unknown-age",
+    }, {
+      id: "expired-terminal-task",
+      status: "completed",
+      attemptId: "expired-attempt",
+      updatedAt: old,
+      finishedAt: old,
+    }],
+    updatedAt: fresh,
+  };
+  const protectedLedgerRuns = structuredClone(
+    harness.storage[TASK_LEDGER_KEY].runs.slice(0, 4),
+  );
+  harness.storage[SYNC_HISTORY_KEY] = {
+    entries: [{id: "old-sync", createdAt: old}, {id: "fresh-sync", createdAt: fresh}],
+  };
+  harness.storage["onstarvoice.cloudCommandResults"] = {
+    old: {storedAt: old},
+    fresh: {storedAt: fresh},
+  };
+  harness.storage["onstarvoice.diagnostics"] = {
+    recentActions: [{id: "old-action", at: old}, {id: "fresh-action", at: fresh}],
+    recentErrors: [{id: "old-error", at: old}, {id: "fresh-error", at: fresh}],
+    recentStages: [{id: "old-stage", at: old}, {id: "fresh-stage", at: fresh}],
+    recentTasks: [{id: "old-task", at: old}, {id: "fresh-task", at: fresh}],
+  };
+  const protectedSyncHistory = structuredClone(
+    harness.storage[SYNC_HISTORY_KEY],
+  );
+  const protectedDiagnostics = structuredClone(
+    harness.storage["onstarvoice.diagnostics"],
+  );
+  harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+    version: 1,
+    agentScopeId: "agent-safe",
+    updatedAt: fresh,
+    requests: {
+      expired: {
+        id: "expired-archive",
+        attemptId: "expired-archive-attempt",
+        status: "failed",
+        cloudAgentScopeId: "agent-safe",
+        createdAt: old,
+        updatedAt: old,
+        finishedAt: old,
+        archivedAt: old,
+        planSnapshot: buildUnattendedPlan({keywords: ["过期"]}),
+      },
+      recent: {
+        id: "recent-archive",
+        attemptId: "recent-archive-attempt",
+        status: "failed",
+        cloudAgentScopeId: "agent-safe",
+        createdAt: fresh,
+        updatedAt: fresh,
+        finishedAt: fresh,
+        archivedAt: fresh,
+        planSnapshot: buildUnattendedPlan({keywords: ["保留"]}),
+      },
+    },
+  };
+  harness.storage[CONTROL_STORAGE_RESERVE_KEY] = {
+    schemaVersion: 1,
+    padding: "0".repeat(CONTROL_STORAGE_RESERVE_BYTES),
+  };
+  let runtimeWrites = 0;
+  harness.setStorageSetHandler(async values => {
+    if (!values["onstarvoice.runtime"]) return;
+    runtimeWrites += 1;
+    if (runtimeWrites === 1) {
+      throw new Error("Resource::kQuotaBytes quota exceeded");
+    }
+  });
+
+  const runtime = await harness.api.ensureRuntimeState();
+
+  assert.equal(runtimeWrites, 2);
+  assert.ok(runtime.clientUuid);
+  assert.ok(runtime.appVersion);
+  assert.deepEqual(harness.storage["onstarvoice.auth"], auth);
+  assert.deepEqual(harness.storage[UNATTENDED_PLAN_KEY], plan);
+  assert.deepEqual(harness.storage[UNATTENDED_REQUEST_KEY], request);
+  assert.deepEqual(harness.storage[TARGETED_POST_REQUEST_KEY], targeted);
+  assert.deepEqual(
+    structuredClone(harness.storage[TASK_LEDGER_KEY].runs),
+    protectedLedgerRuns,
+  );
+  assert.deepEqual(
+    structuredClone(harness.storage[TASK_LEDGER_KEY].opaqueLedgerField),
+    {mustRemain: "untouched"},
+  );
+  assert.deepEqual(
+    structuredClone(harness.storage[SYNC_HISTORY_KEY]),
+    protectedSyncHistory,
+  );
+  assert.deepEqual(
+    Object.keys(harness.storage["onstarvoice.cloudCommandResults"]),
+    ["fresh"],
+  );
+  assert.deepEqual(
+    Object.keys(harness.storage[UNATTENDED_ARCHIVE_KEY].requests),
+    ["recent-archive"],
+  );
+  assert.deepEqual(
+    structuredClone(harness.storage["onstarvoice.diagnostics"]),
+    protectedDiagnostics,
+  );
+  assert.equal(harness.storage[CONTROL_STORAGE_RESERVE_KEY], undefined);
+});
+
+test("storage cleanup never applies the task-center terminal row cap", async () => {
+  const harness = createHarness();
+  const now = Date.now();
+  const fresh = new Date(now - 60 * 1000).toISOString();
+  const old = new Date(now - 45 * 24 * 60 * 60 * 1000).toISOString();
+  const freshTerminalRuns = Array.from({length: 305}, (_, index) => ({
+    id: `fresh-terminal-${index}`,
+    status: "completed",
+    attemptId: `attempt-${index}`,
+    checkpoint: {cursor: index},
+    localClosures: [{attemptId: `attempt-${index}`, proof: `proof-${index}`}],
+    unknownField: {index},
+    finishedAt: fresh,
+    updatedAt: fresh,
+  }));
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 99,
+    opaqueLedgerField: {schema: "future"},
+    runs: [
+      ...freshTerminalRuns,
+      {
+        id: "provably-expired-terminal",
+        status: "failed",
+        attemptId: "expired-attempt",
+        finishedAt: old,
+        updatedAt: old,
+      },
+    ],
+  };
+
+  const result = await harness.api.compactExpiredControlStorage({
+    force: true,
+    reason: "test_terminal_retention_only",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.deepEqual(
+    structuredClone(harness.storage[TASK_LEDGER_KEY]),
+    {
+      version: 99,
+      opaqueLedgerField: {schema: "future"},
+      runs: freshTerminalRuns,
+    },
+  );
+});
+
+test("command-result cleanup and concurrent remember share one mutation queue", async () => {
+  const harness = createHarness();
+  const now = Date.now();
+  const old = new Date(now - 10 * 24 * 60 * 60 * 1000).toISOString();
+  const fresh = new Date(now - 60 * 1000).toISOString();
+  const commandResultsKey = "onstarvoice.cloudCommandResults";
+  harness.storage[commandResultsKey] = {
+    expired: {state: "completed", storedAt: old},
+    fresh: {state: "completed", storedAt: fresh},
+  };
+
+  let commandResultGetCount = 0;
+  let releaseCleanupSet;
+  let markCleanupSetReached;
+  const cleanupSetReached = new Promise(resolve => {
+    markCleanupSetReached = resolve;
+  });
+  const cleanupSetBarrier = new Promise(resolve => {
+    releaseCleanupSet = resolve;
+  });
+  let heldCleanupSet = false;
+  harness.setStorageGetHandler(async (keys, result) => {
+    if (keys === commandResultsKey) commandResultGetCount += 1;
+    return result;
+  });
+  harness.setStorageSetHandler(async values => {
+    if (
+      heldCleanupSet ||
+      !Object.hasOwn(values, commandResultsKey) ||
+      Object.hasOwn(values[commandResultsKey] || {}, "new-command")
+    ) {
+      return;
+    }
+    heldCleanupSet = true;
+    markCleanupSetReached();
+    await cleanupSetBarrier;
+  });
+
+  const cleanup = harness.api.compactExpiredControlStorage({
+    force: true,
+    reason: "test_command_result_race",
+  });
+  await cleanupSetReached;
+  const remember = harness.api.rememberCloudCommandResult("new-command", {
+    state: "completed",
+    accepted: true,
+  });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(
+    commandResultGetCount,
+    1,
+    "remember must not read until cleanup releases the mutation queue",
+  );
+
+  releaseCleanupSet();
+  const [cleanupResult, remembered] = await Promise.all([cleanup, remember]);
+
+  assert.equal(cleanupResult.ok, true);
+  assert.equal(cleanupResult.changed, true);
+  assert.equal(remembered.accepted, true);
+  assert.equal(commandResultGetCount, 2);
+  assert.deepEqual(
+    Object.keys(harness.storage[commandResultsKey]).sort(),
+    ["fresh", "new-command"],
+  );
+  assert.equal(harness.storage[commandResultsKey].expired, undefined);
+  assert.equal(harness.storage[commandResultsKey].fresh.storedAt, fresh);
 });
 
 test("an exhausted terminal ledger retry rejects and leaves the running attempt durable", async () => {

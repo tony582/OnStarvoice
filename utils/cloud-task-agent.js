@@ -1082,13 +1082,22 @@
     socialUsageEvents = [],
     reason = "heartbeat",
     lastError = "",
+    agentId = "",
+    taskStateKnown = true,
+    unattendedPlanKnown = true,
+    observedSocialAccountsKnown = true,
+    socialUsageEventsKnown = true,
+    degradedHealth = [],
   } = {}) {
     const safeRuntime = objectValue(runtime);
     const safeLedger = objectValue(ledger);
     const request = objectValue(unattendedRequest);
     const controlRequestId = text(request.id || request.requestId, 240);
     const controlAttemptId = text(request.attemptId, 240);
-    const runs = Array.isArray(safeLedger.runs) ? safeLedger.runs : [];
+    const safeTaskStateKnown = taskStateKnown === true;
+    const runs = safeTaskStateKnown && Array.isArray(safeLedger.runs)
+      ? safeLedger.runs
+      : [];
     const heartbeatNow = Date.now();
     const healthOptions = {
       now: heartbeatNow,
@@ -1152,8 +1161,15 @@
       tasks.unshift(targetedSnapshot);
     }
 
+    const degradedReasons = (Array.isArray(degradedHealth)
+      ? degradedHealth
+      : [])
+      .map(value => text(value, 120))
+      .filter(Boolean)
+      .slice(0, 12);
     return {
       agent: {
+        registrationId: text(agentId, 240),
         clientUuid: text(safeRuntime.clientUuid, 240),
         clientLabel: text(safeRuntime.clientLabel, 240),
         appVersion: healthVersion(safeRuntime.appVersion),
@@ -1184,24 +1200,43 @@
           socialAccountDailyUsage: true,
           structuredTaskHealthV1: true,
           dutyRecoveryLineageV1: true,
+          taskStateKnown: safeTaskStateKnown,
+          heartbeatDegraded: degradedReasons.length > 0,
           taskLedgerVersion: Number(safeLedger.version || 1) || 1,
         },
         lastError: sanitizeText(lastError, 1000),
+        health: {
+          status: degradedReasons.length > 0 ? "degraded" : "healthy",
+          degradedReasons,
+          taskStateKnown: safeTaskStateKnown,
+        },
       },
-      unattendedPlan: buildUnattendedPlanSnapshot(unattendedPlan),
-      tasks,
-      observedSocialAccounts: (
-        Array.isArray(observedSocialAccounts) ? observedSocialAccounts : []
-      )
-        .slice(0, 10)
-        .map(buildObservedSocialAccountSnapshot)
-        .filter(Boolean),
-      socialUsageEvents: (
-        Array.isArray(socialUsageEvents) ? socialUsageEvents : []
-      )
-        .slice(0, 200)
-        .map(buildSocialUsageEventSnapshot)
-        .filter(Boolean),
+      ...(unattendedPlanKnown === true
+        ? {unattendedPlan: buildUnattendedPlanSnapshot(unattendedPlan)}
+        : {}),
+      ...(safeTaskStateKnown ? {tasks} : {}),
+      ...(observedSocialAccountsKnown === true
+        ? {
+            observedSocialAccounts: (
+              Array.isArray(observedSocialAccounts)
+                ? observedSocialAccounts
+                : []
+            )
+              .slice(0, 10)
+              .map(buildObservedSocialAccountSnapshot)
+              .filter(Boolean),
+          }
+        : {}),
+      ...(socialUsageEventsKnown === true
+        ? {
+            socialUsageEvents: (
+              Array.isArray(socialUsageEvents) ? socialUsageEvents : []
+            )
+              .slice(0, 200)
+              .map(buildSocialUsageEventSnapshot)
+              .filter(Boolean),
+          }
+        : {}),
       reason: text(reason, 120),
       sentAt: new Date(heartbeatNow).toISOString(),
     };

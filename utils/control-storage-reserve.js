@@ -122,6 +122,7 @@
     {
       storage = null,
       restoreDelayMs = CONTROL_STORAGE_RESTORE_DELAY_MS,
+      onQuotaPressure = null,
     } = {},
   ) {
     if (typeof operation !== "function") {
@@ -141,6 +142,18 @@
       // fenced read-modify-write can re-read its authoritative attempt/lease
       // instead of replaying a stale prepared document.
       await releaseControlStorageReserve({storage: area});
+      if (typeof onQuotaPressure === "function") {
+        try {
+          await onQuotaPressure({storage: area, initialError});
+        } catch (cleanupError) {
+          // Cleanup is opportunistic. The reserved bytes still guarantee the
+          // one critical retry; a cleanup failure must not replace its error.
+          root.console?.warn?.(
+            "[Storage] Quota cleanup failed before control retry:",
+            cleanupError,
+          );
+        }
+      }
       try {
         const value = await operation();
         scheduleControlStorageReserveRestore({

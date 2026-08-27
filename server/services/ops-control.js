@@ -14,7 +14,7 @@ import {runOpsControlGuardedActions} from './ops-control-actions.js';
 import {normalizeCaptureRecoverySettings} from './capture-recovery-intents.js';
 
 export const OPS_CONTROL_POLICY_VERSION = 'ops-guarded-v1';
-export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.94';
+export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.95';
 export const OPS_CONTROL_MODE = 'observe';
 export const OPS_CONTROL_MODES = Object.freeze(['observe', 'guarded']);
 export const OPS_CONTROL_ACTION_TYPES = Object.freeze([
@@ -687,12 +687,15 @@ async function collectAgents(db, tenantId) {
       status,
       allowed_platforms,
       last_heartbeat_at,
+      last_liveness_at,
+      last_full_heartbeat_at,
+      capabilities,
       updated_at,
       (last_error <> '') AS has_error
     FROM capture_agents
     WHERE tenant_id = $1
       AND status IN ('active', 'paused')
-    ORDER BY last_heartbeat_at DESC NULLS LAST, id
+    ORDER BY COALESCE(last_full_heartbeat_at, last_heartbeat_at) DESC NULLS LAST, id
     LIMIT 200
   `, [tenantId]);
 }
@@ -948,10 +951,24 @@ function normalizeTask(row) {
 }
 
 function normalizeAgent(row, capturedAt) {
-  const heartbeatAt = iso(row.last_heartbeat_at);
+  const heartbeatAt = iso(
+    row.last_full_heartbeat_at || row.last_heartbeat_at,
+  );
+  const livenessAt = iso(
+    row.last_liveness_at ||
+      row.last_full_heartbeat_at ||
+      row.last_heartbeat_at,
+  );
   const heartbeatAgeSeconds = heartbeatAt
     ? Math.max(0, Math.floor((timestamp(capturedAt) - timestamp(heartbeatAt)) / 1000))
     : null;
+  const livenessAgeSeconds = livenessAt
+    ? Math.max(0, Math.floor((timestamp(capturedAt) - timestamp(livenessAt)) / 1000))
+    : null;
+  const capabilities = object(row.capabilities);
+  const taskStateKnown = capabilities.taskStateKnown !== false;
+  const heartbeatDegraded = capabilities.heartbeatDegraded === true ||
+    !taskStateKnown;
   return {
     id: text(row.id, 80),
     name: text(row.display_name || row.client_label || row.browser_name, 240),
@@ -963,7 +980,18 @@ function normalizeAgent(row, capturedAt) {
       : [],
     heartbeatAt,
     heartbeatAgeSeconds,
+    livenessAt,
+    livenessAgeSeconds,
+    connected: row.status === 'active'
+      && livenessAgeSeconds !== null
+      && livenessAgeSeconds <= 180,
+    heartbeatDegraded,
+    fullHeartbeatHealthy: row.status === 'active'
+      && taskStateKnown
+      && heartbeatAgeSeconds !== null
+      && heartbeatAgeSeconds <= 180,
     online: row.status === 'active'
+      && taskStateKnown
       && heartbeatAgeSeconds !== null
       && heartbeatAgeSeconds <= 180,
     baselineCurrent: text(row.app_version, 80) === OPS_CONTROL_RUNTIME_BASELINE_VERSION,
@@ -1420,7 +1448,7 @@ export function buildOpsControlDigestHtml(digest) {
       </table>
       <h3 style="font-size:15px;margin:22px 0 8px">事项</h3>
       <ul style="padding-left:20px;color:#374151">${rows}</ul>
-      <p style="margin:24px 0 0;color:#9ca3af;font-size:12px">规则控制面${guarded ? '受控动作模式' : '观察模式'} · 0.3.94 自愈运行时基线 · 本轮未调用大模型${guarded ? ' · 所有动作均写入幂等账本并等待后续快照验收' : '，未执行采集业务写操作'}。</p>
+      <p style="margin:24px 0 0;color:#9ca3af;font-size:12px">规则控制面${guarded ? '受控动作模式' : '观察模式'} · ${OPS_CONTROL_RUNTIME_BASELINE_VERSION} 自愈运行时基线 · 本轮未调用大模型${guarded ? ' · 所有动作均写入幂等账本并等待后续快照验收' : '，未执行采集业务写操作'}。</p>
     </div>
   `;
 }
@@ -1689,7 +1717,7 @@ export function buildOpsControlIncidentAlertHtml(incidents, {
       <h2 style="margin:0 0 8px;font-size:20px">StarVoice 值守需要关注</h2>
       <p style="margin:0 0 18px;color:#4b5563">以下事项当前没有正在等待验收的自动恢复动作，请及时查看。</p>
       <ul style="padding-left:20px">${rows}</ul>
-      <p style="margin:22px 0 0;color:#9ca3af;font-size:12px">规则控制面${mode === 'guarded' ? '受控动作模式' : '观察模式'} · 0.3.94 自愈运行时基线 · 本轮未调用大模型。</p>
+      <p style="margin:22px 0 0;color:#9ca3af;font-size:12px">规则控制面${mode === 'guarded' ? '受控动作模式' : '观察模式'} · ${OPS_CONTROL_RUNTIME_BASELINE_VERSION} 自愈运行时基线 · 本轮未调用大模型。</p>
     </div>
   `;
 }

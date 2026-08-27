@@ -757,8 +757,13 @@ export async function wakeWaitingCaptureRecoveryIntents({
               auth_code.expires_at IS NULL
               OR auth_code.expires_at > $2::timestamptz
             )
-            AND agent.last_heartbeat_at >=
+            AND COALESCE(
+              agent.last_full_heartbeat_at,
+              agent.last_heartbeat_at
+            ) >=
               $2::timestamptz - interval '2 minutes'
+            AND agent.capabilities->>'taskStateKnown'
+              IS DISTINCT FROM 'false'
             AND agent.capabilities @> '{
               "remoteTaskCreate": true,
               "remoteStop": true

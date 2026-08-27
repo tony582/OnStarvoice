@@ -61,7 +61,12 @@ const STORAGE_KEYS = {
   targetedPostRunRequest: 'onstarvoice.targetedPostRunRequest',
   observedSocialAccounts: 'onstarvoice.observedSocialAccounts',
   socialAccountUsageQueue: 'onstarvoice.socialAccountUsageQueue',
+  diagnostics: 'onstarvoice.diagnostics',
 };
+
+const CONTROL_STORAGE_CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
+const TASK_LEDGER_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const CLOUD_COMMAND_RESULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const AUTHORITATIVE_CONTROL_TERMINAL_STATUSES = new Set([
   'completed',
@@ -73,11 +78,24 @@ const AUTHORITATIVE_CONTROL_TERMINAL_STATUSES = new Set([
   'needs_action',
 ]);
 
-async function runAuthoritativeControlStorageMutation(mutation) {
+async function runAuthoritativeControlStorageMutation(
+  mutation,
+  {relieveStoragePressure = false} = {},
+) {
   const result =
     await controlStorageReserveApi.runWithControlStorageReserveRetry(
       mutation,
-      {storage: chrome.storage.local},
+      {
+        storage: chrome.storage.local,
+        ...(relieveStoragePressure
+          ? {
+              onQuotaPressure: () => compactExpiredControlStorage({
+                force: true,
+                reason: 'quota_pressure',
+              }),
+            }
+          : {}),
+      },
     );
   return result.value;
 }
@@ -793,6 +811,7 @@ let unattendedRunnerTabLifecycleQueue = Promise.resolve();
 let taskLedgerMutationQueue = Promise.resolve();
 let captureTaskBeginQueue = Promise.resolve();
 let targetedPostRunMutationQueue = Promise.resolve();
+let cloudCommandResultsMutationQueue = Promise.resolve();
 
 function runUnattendedRunMutation(operation) {
   const pending = unattendedRunMutationQueue.then(operation, operation);
@@ -827,6 +846,12 @@ function runCaptureTaskBeginOperation(operation) {
 function runTargetedPostRunMutation(operation) {
   const pending = targetedPostRunMutationQueue.then(operation, operation);
   targetedPostRunMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runCloudCommandResultsMutation(operation) {
+  const pending = cloudCommandResultsMutationQueue.then(operation, operation);
+  cloudCommandResultsMutationQueue = pending.catch(() => null);
   return pending;
 }
 
@@ -2336,7 +2361,8 @@ async function ensureCloudTaskAgentScope(agentId) {
   });
   if (switched) {
     cloudTaskAgentLastError = '';
-    await chrome.storage.local.remove(STORAGE_KEYS.cloudCommandResults);
+    await runCloudCommandResultsMutation(() =>
+      chrome.storage.local.remove(STORAGE_KEYS.cloudCommandResults));
     await clearUnattendedKeywordRunArchive();
   }
   return next;
@@ -2393,22 +2419,24 @@ async function readCloudCommandResults() {
 }
 
 async function rememberCloudCommandResult(commandId, result) {
-  const current = await readCloudCommandResults();
-  const entries = Object.entries({
-    ...current,
-    [commandId]: {
-      ...(result && typeof result === 'object' ? result : {}),
-      storedAt: new Date().toISOString(),
-    },
-  })
-    .sort((left, right) =>
-      Date.parse(String(right[1]?.storedAt || '')) -
-      Date.parse(String(left[1]?.storedAt || '')),
-    )
-    .slice(0, 50);
-  const next = Object.fromEntries(entries);
-  await chrome.storage.local.set({[STORAGE_KEYS.cloudCommandResults]: next});
-  return next[commandId];
+  return await runCloudCommandResultsMutation(async () => {
+    const current = await readCloudCommandResults();
+    const entries = Object.entries({
+      ...current,
+      [commandId]: {
+        ...(result && typeof result === 'object' ? result : {}),
+        storedAt: new Date().toISOString(),
+      },
+    })
+      .sort((left, right) =>
+        Date.parse(String(right[1]?.storedAt || '')) -
+        Date.parse(String(left[1]?.storedAt || '')),
+      )
+      .slice(0, 50);
+    const next = Object.fromEntries(entries);
+    await chrome.storage.local.set({[STORAGE_KEYS.cloudCommandResults]: next});
+    return next[commandId];
+  });
 }
 
 function summarizeCloudRecoveryResult(result) {
@@ -4033,6 +4061,21 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
 
   cloudTaskAgentSyncInFlight = true;
   try {
+    const degradedHealth = [];
+    const markDegraded = (code) => {
+      const normalized = String(code || '').trim().toLowerCase();
+      if (normalized && !degradedHealth.includes(normalized)) {
+        degradedHealth.push(normalized);
+      }
+    };
+    const cleanup = await compactExpiredControlStorage({
+      reason: 'heartbeat',
+    }).catch(() => ({ok: false, failures: [{area: 'control_storage'}]}));
+    if (cleanup.ok === false) {
+      for (const failure of cleanup.failures || []) {
+        markDegraded(`cleanup_${failure.area || 'unknown'}_failed`);
+      }
+    }
     // A previous terminal runner may have finished cleanup after the heartbeat
     // that carried its terminal status. Re-evaluate the exact local predicate
     // before reading the ledger so this same heartbeat can carry closure proof.
@@ -4040,48 +4083,123 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       closeOwnedRunnerTabs: true,
     }).catch((error) => {
       console.warn('[CloudTaskAgent] local closure reconcile failed:', error);
+      markDegraded('local_closure_reconcile_failed');
     });
-    const agentStatus = await ensureCloudTaskAgentScope(credential.id);
-    const [
-      runtime,
-      ledger,
-      stored,
-      observedSocialAccounts,
-      socialUsageEvents,
-    ] = await Promise.all([
-      ensureRuntimeState(),
-      readTaskLedger(),
-      chrome.storage.local.get([
-        STORAGE_KEYS.unattendedKeywordRunRequest,
-        STORAGE_KEYS.unattendedKeywordPlan,
-        STORAGE_KEYS.targetedPostRunRequest,
-      ]),
+    let agentStatus = {};
+    let agentScopeKnown = true;
+    try {
+      agentStatus = await ensureCloudTaskAgentScope(credential.id);
+    } catch (error) {
+      agentScopeKnown = false;
+      markDegraded('agent_scope_state_unavailable');
+      console.warn('[CloudTaskAgent] agent scope unavailable:', error);
+    }
+
+    let runtime;
+    try {
+      runtime = await ensureRuntimeState();
+    } catch (error) {
+      markDegraded('runtime_state_write_failed');
+      console.warn('[CloudTaskAgent] runtime state degraded:', error);
+      try {
+        runtime = await readRuntimeState();
+      } catch (readError) {
+        markDegraded('runtime_state_read_failed');
+        runtime = {};
+      }
+    }
+    runtime = {
+      ...(runtime && typeof runtime === 'object' ? runtime : {}),
+      clientLabel: String(runtime?.clientLabel || getPlatformLabel()),
+      appVersion: String(runtime?.appVersion || getAppVersion()),
+    };
+
+    let ledger = {};
+    let stored = {};
+    let taskStateKnown = agentScopeKnown;
+    if (agentScopeKnown) {
+      try {
+        [ledger, stored] = await Promise.all([
+          readTaskLedger(),
+          chrome.storage.local.get([
+            STORAGE_KEYS.unattendedKeywordRunRequest,
+            STORAGE_KEYS.unattendedKeywordPlan,
+            STORAGE_KEYS.targetedPostRunRequest,
+          ]),
+        ]);
+      } catch (error) {
+        taskStateKnown = false;
+        ledger = {};
+        stored = {};
+        markDegraded('task_state_unavailable');
+        console.warn('[CloudTaskAgent] task state unavailable:', error);
+      }
+    } else {
+      markDegraded('task_state_scope_unknown');
+    }
+
+    const [observedResult, usageResult] = await Promise.allSettled([
       refreshObservedSocialAccounts(),
       readSocialAccountUsageQueue(),
     ]);
-    const scopedLedger = buildCloudScopedTaskLedger(
-      ledger,
-      agentStatus.scopeStartedAt,
-      credential.id,
-    );
-    const scopedPlan = buildCloudScopedUnattendedPlan(
-      stored[STORAGE_KEYS.unattendedKeywordPlan],
-      agentStatus,
-      credential.id,
-    );
+    const observedSocialAccountsKnown = observedResult.status === 'fulfilled';
+    const socialUsageEventsKnown = usageResult.status === 'fulfilled';
+    if (!observedSocialAccountsKnown) {
+      markDegraded('social_account_state_unavailable');
+    }
+    if (!socialUsageEventsKnown) {
+      markDegraded('social_usage_state_unavailable');
+    }
+    const observedSocialAccounts = observedSocialAccountsKnown
+      ? observedResult.value
+      : {accounts: []};
+    const socialUsageEvents = socialUsageEventsKnown
+      ? usageResult.value
+      : [];
+    const scopedLedger = taskStateKnown
+      ? buildCloudScopedTaskLedger(
+          ledger,
+          agentStatus.scopeStartedAt,
+          credential.id,
+        )
+      : {};
+    const scopedPlan = taskStateKnown
+      ? buildCloudScopedUnattendedPlan(
+          stored[STORAGE_KEYS.unattendedKeywordPlan],
+          agentStatus,
+          credential.id,
+        )
+      : null;
     const reportedLastError = normalizeCloudTaskAgentError(
       agentStatus.lastError || cloudTaskAgentLastError,
     );
+    const degradedLastError = degradedHealth.length > 0
+      ? `LOCAL_HEARTBEAT_DEGRADED:${degradedHealth.join(',')}`
+      : '';
     const payload = cloudTaskAgentApi.buildHeartbeatPayload({
       runtime,
       ledger: scopedLedger,
-      unattendedRequest: stored[STORAGE_KEYS.unattendedKeywordRunRequest],
-      targetedPostRequest: stored[STORAGE_KEYS.targetedPostRunRequest],
+      unattendedRequest: taskStateKnown
+        ? stored[STORAGE_KEYS.unattendedKeywordRunRequest]
+        : null,
+      targetedPostRequest: taskStateKnown
+        ? stored[STORAGE_KEYS.targetedPostRunRequest]
+        : null,
       unattendedPlan: scopedPlan,
-      observedSocialAccounts: observedSocialAccounts.accounts,
+      observedSocialAccounts: Array.isArray(observedSocialAccounts?.accounts)
+        ? observedSocialAccounts.accounts
+        : [],
       socialUsageEvents,
       reason,
-      lastError: reportedLastError,
+      lastError: [reportedLastError, degradedLastError]
+        .filter(Boolean)
+        .join(' | '),
+      agentId: credential.id,
+      taskStateKnown,
+      unattendedPlanKnown: taskStateKnown,
+      observedSocialAccountsKnown,
+      socialUsageEventsKnown,
+      degradedHealth,
     });
     const response = await cloudTaskAgentApi.sendHeartbeat({
       token: credential.token,
@@ -4091,7 +4209,9 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       recordCloudTaskAgentFailure();
       await rememberCloudTaskAgentError(
         response?.message || response?.reason || '云端任务中心同步失败',
-      );
+      ).catch((error) => {
+        console.warn('[CloudTaskAgent] failed to persist sync error:', error);
+      });
       return response;
     }
 
@@ -4103,7 +4223,10 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
     } else {
       cloudTaskAgentLastError = '';
     }
-    if (Array.isArray(response.acceptedSocialUsageEventIds)) {
+    if (
+      socialUsageEventsKnown &&
+      Array.isArray(response.acceptedSocialUsageEventIds)
+    ) {
       await acknowledgeSocialAccountUsageEvents(
         response.acceptedSocialUsageEventIds,
       );
@@ -4151,6 +4274,177 @@ async function syncCloudTaskAgentAlarm() {
   await chrome.alarms.create(CLOUD_TASK_AGENT_ALARM_NAME, {
     periodInMinutes: CLOUD_TASK_AGENT_PERIOD_MINUTES,
   });
+}
+
+let lastControlStorageCleanupAt = 0;
+
+function storedRecordTimestamp(value = {}) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  for (const candidate of [
+    source.storedAt,
+    source.updatedAt,
+    source.finishedAt,
+    source.createdAt,
+    source.occurredAt,
+    source.at,
+    source.timestamp,
+  ]) {
+    const parsed = Date.parse(String(candidate || ''));
+    if (Number.isFinite(parsed)) return parsed;
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  }
+  return 0;
+}
+
+async function compactExpiredTaskLedger(now) {
+  return await runTaskLedgerMutation(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+    const raw = stored[STORAGE_KEYS.taskLedger];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return {changed: false};
+    }
+    const rawRuns = Array.isArray(raw.runs) ? raw.runs : [];
+    const safelyExpiredTerminalStatuses = new Set([
+      'completed',
+      'completed_with_warnings',
+      'completed_with_failures',
+      'failed',
+      'canceled',
+      'skipped',
+    ]);
+    const retainedRuns = rawRuns.filter((run) => {
+      const status = String(run?.status || '').trim().toLowerCase();
+      // needs_action remains operator-recoverable. Nonterminal and unknown
+      // statuses are also preserved byte-for-byte instead of being normalized.
+      if (!safelyExpiredTerminalStatuses.has(status)) return true;
+      const timestamps = [
+        run?.storedAt,
+        run?.archivedAt,
+        run?.finishedAt,
+        run?.businessProgressAt,
+        run?.heartbeatAt,
+        run?.updatedAt,
+        run?.startedAt,
+        run?.createdAt,
+      ]
+        .map(candidate => {
+          const parsed = Date.parse(String(candidate || ''));
+          if (Number.isFinite(parsed)) return parsed;
+          const numeric = Number(candidate);
+          return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+        })
+        .filter(timestamp => timestamp > 0);
+      // An unknown age can never prove expiry. If timestamps disagree, use the
+      // newest fact so cleanup cannot discard a recently touched terminal row.
+      const latestTimestamp = timestamps.length > 0
+        ? Math.max(...timestamps)
+        : 0;
+      return !latestTimestamp ||
+        now - latestTimestamp <= TASK_LEDGER_TERMINAL_RETENTION_MS;
+    });
+    if (retainedRuns.length === rawRuns.length) {
+      return {changed: false};
+    }
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.taskLedger]: {
+        ...raw,
+        runs: retainedRuns,
+      },
+    });
+    return {changed: true};
+  });
+}
+
+async function compactExpiredUnattendedArchive(now) {
+  return await runUnattendedRunArchiveMutation(async () => {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.unattendedKeywordRunArchive,
+      STORAGE_KEYS.auth,
+    ]);
+    const raw = stored[STORAGE_KEYS.unattendedKeywordRunArchive];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return {changed: false};
+    }
+    const auth =
+      stored[STORAGE_KEYS.auth] &&
+      typeof stored[STORAGE_KEYS.auth] === 'object' &&
+      !Array.isArray(stored[STORAGE_KEYS.auth])
+        ? stored[STORAGE_KEYS.auth]
+        : {};
+    const agentId = String(auth.captureAgent?.id || '').trim();
+    const compacted = normalizeUnattendedKeywordRunArchive(
+      raw,
+      now,
+      agentId,
+    );
+    if (JSON.stringify(compacted) === JSON.stringify(raw)) {
+      return {changed: false};
+    }
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunArchive]: compacted,
+    });
+    return {changed: true};
+  });
+}
+
+async function compactExpiredAuxiliaryHistory(now) {
+  return await runCloudCommandResultsMutation(async () => {
+    const commandResults = await readCloudCommandResults();
+    const retained = Object.fromEntries(
+      Object.entries(commandResults).filter(([, value]) => {
+        const timestamp = storedRecordTimestamp(value);
+        return !timestamp || now - timestamp <= CLOUD_COMMAND_RESULT_RETENTION_MS;
+      }),
+    );
+    if (Object.keys(retained).length === Object.keys(commandResults).length) {
+      return {changed: false};
+    }
+    if (Object.keys(retained).length > 0) {
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.cloudCommandResults]: retained,
+      });
+    } else {
+      await chrome.storage.local.remove(STORAGE_KEYS.cloudCommandResults);
+    }
+    return {changed: true};
+  });
+}
+
+async function compactExpiredControlStorage({
+  force = false,
+  reason = 'heartbeat',
+} = {}) {
+  const now = Date.now();
+  if (
+    !force &&
+    lastControlStorageCleanupAt > 0 &&
+    now - lastControlStorageCleanupAt < CONTROL_STORAGE_CLEANUP_INTERVAL_MS
+  ) {
+    return {ok: true, skipped: true, reason: 'cleanup_throttled'};
+  }
+  lastControlStorageCleanupAt = now;
+  const operations = await Promise.allSettled([
+    compactExpiredTaskLedger(now),
+    compactExpiredUnattendedArchive(now),
+    compactExpiredAuxiliaryHistory(now),
+  ]);
+  const failures = operations
+    .map((result, index) => ({result, index}))
+    .filter(({result}) => result.status === 'rejected')
+    .map(({result, index}) => ({
+      area: ['task_ledger', 'unattended_archive', 'auxiliary_history'][index],
+      message: String(result.reason?.message || result.reason || '').slice(0, 240),
+    }));
+  return {
+    ok: failures.length === 0,
+    reason,
+    failures,
+    changed: operations.some(
+      result => result.status === 'fulfilled' && result.value?.changed === true,
+    ),
+  };
 }
 
 function taskRunActivityAt(run) {
@@ -8729,12 +9023,15 @@ async function ensureRuntimeState() {
       };
       // Fence every downstream write before touching debugger, workers or groups.
       // If cleanup fails, the runtime ownership snapshot remains for the next retry.
-      await chrome.storage.local.set({
-        [STORAGE_KEYS.runtime]: {
-          ...current,
-          ...nextPatch,
-        },
-      });
+      await runAuthoritativeControlStorageMutation(
+        () => chrome.storage.local.set({
+          [STORAGE_KEYS.runtime]: {
+            ...current,
+            ...nextPatch,
+          },
+        }),
+        {relieveStoragePressure: true},
+      );
       await cleanupStaleCaptureRuntimeSession(current.captureDebugSession);
       if (staleTaskId && !unattended.active) {
         await terminalizeCaptureTaskLedgerRun(staleTaskId, {
@@ -8770,9 +9067,12 @@ async function ensureRuntimeState() {
       ...current,
       ...nextPatch,
     };
-    await chrome.storage.local.set({
-      [STORAGE_KEYS.runtime]: next,
-    });
+    await runAuthoritativeControlStorageMutation(
+      () => chrome.storage.local.set({
+        [STORAGE_KEYS.runtime]: next,
+      }),
+      {relieveStoragePressure: true},
+    );
     return next;
   });
   if (unattendedRecoveryTaskId) {

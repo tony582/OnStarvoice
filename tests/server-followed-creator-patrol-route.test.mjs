@@ -358,7 +358,8 @@ test('stale profile execution cleanup preserves live commands and online runners
   assert.equal(reconciled.length, 1);
   const cleanup = statements[0];
   assert.match(cleanup.sql, /active_command\.expires_at > now\(\)/u);
-  assert.match(cleanup.sql, /active_agent\.last_heartbeat_at >=/u);
+  assert.match(cleanup.sql, /active_agent\.last_liveness_at/u);
+  assert.match(cleanup.sql, /active_agent\.last_full_heartbeat_at/u);
   assert.match(cleanup.sql, /FOR UPDATE OF execution SKIP LOCKED/u);
   assert.equal(cleanup.params[0], 25);
   assert.equal(cleanup.params[1], 15);

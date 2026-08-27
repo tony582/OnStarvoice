@@ -370,7 +370,7 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   );
   assert.match(handoff, /settledSourceItemIds/u);
   assert.match(handoff, /handoff_target_same_as_source/u);
-  assert.match(handoff, /captureAgentOnline\(targetAgent\.last_heartbeat_at\)/u);
+  assert.match(handoff, /captureAgentFullHeartbeatOnline\(targetAgent\)/u);
   assert.match(handoff, /handoff_target_busy/u);
   assert.match(handoff, /findCaptureAgentExecutionSlotBlocker/u);
   assert.match(handoff, /blockerKind: targetBusyTask\.kind/u);
@@ -409,7 +409,7 @@ test('failed keyword retry atomically shards each item to a distinct idle Agent 
   assert.match(retry, /HANDOFF_SOURCE_FINAL_STATUSES\.has\(task\.status\)/u);
   assert.match(retry, /for \(const agentId of candidateAgentIds\)/u);
   assert.match(retry, /await lockCaptureAgentExecutionSlot\(tx, req\.tenantId, agentId\)/u);
-  assert.match(retry, /captureAgentOnline\(agent\.last_heartbeat_at\)/u);
+  assert.match(retry, /captureAgentFullHeartbeatOnline\(agent\)/u);
   assert.doesNotMatch(retry, /retry_no_idle_agents/u);
   assert.match(retry, /status = 'retryable'/u);
   assert.match(retry, /retryWaitingItems/u);
@@ -683,6 +683,16 @@ test('detail reader is tenant scoped and returns the complete orchestration proj
   assert.match(route, /record\.content AS source_record_content/u);
   assert.match(route, /function publicParentItem/u);
   assert.match(detail, /\.map\(publicParentItem\)/u);
+  assert.match(detail, /agent_last_liveness_at/u);
+  assert.match(detail, /agent_last_full_heartbeat_at/u);
+  assert.match(
+    detail,
+    /agent_online: captureAgentLivenessOnline\(\{/u,
+  );
+  assert.match(
+    detail,
+    /ca\.last_liveness_at, ca\.last_full_heartbeat_at/u,
+  );
   assert.match(
     detail,
     /WHERE attempt\.tenant_id = \$1[\s\S]*attempt\.parent_task_id = \$2/u,

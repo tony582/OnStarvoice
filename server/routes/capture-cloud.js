@@ -9,6 +9,10 @@ import {
 } from '../middleware/auth.js';
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+  captureAgentFullHeartbeatAt,
+  captureAgentFullHeartbeatOnline,
+  captureAgentLivenessAt,
+  captureAgentLivenessOnline,
   captureAgentOnline,
   bindCloudTaskSnapshotHealthToAttempt,
   cloudTaskAttemptIdentityAcceptsSnapshot,
@@ -377,7 +381,8 @@ export async function lockActiveCaptureAgentSession(
   // retirement cannot write after the retirement transaction has committed.
   await lockCaptureAgentExecutionSlot(executor, tenantId, agentId);
   const currentAgent = await executor.queryOne(`
-    SELECT id, tenant_id, status, auth_code_id, auth_binding_id
+    SELECT id, tenant_id, status, auth_code_id, auth_binding_id,
+      last_heartbeat_at, last_liveness_at, last_full_heartbeat_at
     FROM capture_agents
     WHERE id = $1 AND tenant_id = $2
     FOR UPDATE
@@ -1123,6 +1128,7 @@ export function crossDeviceRetryAgentSupportsTask(
   commandPayload = {},
 ) {
   const capabilities = safeJson(agent.capabilities);
+  if (capabilities.taskStateKnown === false) return false;
   if (capabilities.remoteTaskCreate !== true) return false;
   const dutyRecoveryRequested =
     Object.keys(safeJson(commandPayload.dutyRecovery)).length > 0;
@@ -1387,6 +1393,26 @@ export async function supersedeStalePlanConfigurationAttention(tx, {
   }
 }
 
+export function captureCreateCommandExpiryEligible({
+  status = '',
+  commandType = '',
+  lastLivenessAt = '',
+  lastFullHeartbeatAt = '',
+  lastHeartbeatAt = '',
+} = {}, now = Date.now(), livenessGraceMs =
+  ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN * 60 * 1000) {
+  const normalizedStatus = text(status, 40).toLowerCase();
+  if (normalizedStatus === 'pending') return true;
+  if (normalizedStatus !== 'acknowledged') return false;
+  if (text(commandType, 40).toLowerCase() !== 'create') return true;
+  const effectiveLivenessAt = captureAgentLivenessAt({
+    last_liveness_at: lastLivenessAt,
+    last_full_heartbeat_at: lastFullHeartbeatAt,
+    last_heartbeat_at: lastHeartbeatAt,
+  });
+  return !captureAgentOnline(effectiveLivenessAt, now, livenessGraceMs);
+}
+
 async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) {
   const scopedTaskId = text(taskId, 100);
   const scopedAgentId = text(agentId, 100);
@@ -1407,7 +1433,51 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     ORDER BY t.id
     FOR UPDATE
   `, [tenantId, scopedTaskId, scopedAgentId]);
-  const expired = await tx.queryAll(`
+  // An acknowledged create may already be running locally even when its full
+  // task snapshot is delayed. Candidate selection therefore uses the cheap
+  // liveness lease; pending creates and non-create commands keep their normal
+  // expiry semantics.
+  const expiryCandidates = await tx.queryAll(`
+    SELECT c.id, c.status, c.command_type,
+      COALESCE(
+        ca.last_liveness_at,
+        ca.last_full_heartbeat_at,
+        ca.last_heartbeat_at
+      ) AS agent_liveness_at
+    FROM capture_agent_commands c
+    LEFT JOIN capture_agents ca
+      ON ca.id = c.agent_id AND ca.tenant_id = c.tenant_id
+    WHERE c.tenant_id = $1
+      AND ($2 = '' OR c.task_id::text = $2)
+      AND ($3 = '' OR c.agent_id::text = $3)
+      AND c.status IN ('pending', 'acknowledged')
+      AND c.expires_at <= now()
+      AND (
+        c.status = 'pending'
+        OR c.command_type <> 'create'
+        OR COALESCE(
+          ca.last_liveness_at,
+          ca.last_full_heartbeat_at,
+          ca.last_heartbeat_at,
+          '-infinity'::timestamptz
+        ) < now() - make_interval(mins => $4::integer)
+      )
+    ORDER BY c.id
+    FOR UPDATE OF c
+  `, [
+    tenantId,
+    scopedTaskId,
+    scopedAgentId,
+    ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
+  ]);
+  const expiryCandidateIds = expiryCandidates
+    .filter(command => captureCreateCommandExpiryEligible({
+      status: command.status,
+      commandType: command.command_type,
+      lastLivenessAt: command.agent_liveness_at,
+    }))
+    .map(command => command.id);
+  const expired = expiryCandidateIds.length > 0 ? await tx.queryAll(`
     UPDATE capture_agent_commands
     SET status = 'expired',
       result = jsonb_build_object('reason', 'expired'),
@@ -1415,10 +1485,33 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     WHERE tenant_id = $1
       AND ($2 = '' OR task_id::text = $2)
       AND ($3 = '' OR agent_id::text = $3)
+      AND id = ANY($4::uuid[])
       AND status IN ('pending', 'acknowledged')
       AND expires_at <= now()
+      AND (
+        status = 'pending'
+        OR command_type <> 'create'
+        OR NOT EXISTS (
+          SELECT 1
+          FROM capture_agents ca
+          WHERE ca.id = capture_agent_commands.agent_id
+            AND ca.tenant_id = capture_agent_commands.tenant_id
+            AND COALESCE(
+              ca.last_liveness_at,
+              ca.last_full_heartbeat_at,
+              ca.last_heartbeat_at,
+              '-infinity'::timestamptz
+            ) >= now() - make_interval(mins => $5::integer)
+        )
+      )
     RETURNING id, task_id, agent_id, command_type, payload
-  `, [tenantId, scopedTaskId, scopedAgentId]);
+  `, [
+    tenantId,
+    scopedTaskId,
+    scopedAgentId,
+    expiryCandidateIds,
+    ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
+  ]) : [];
 
   for (const command of expired) {
     if (command.command_type === 'create') {
@@ -5977,10 +6070,13 @@ router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
       if (!currentAgent) return {agentInactive: true};
       await tx.execute(`
         UPDATE capture_agents
-        SET last_heartbeat_at = now(), updated_at = now()
+        SET last_liveness_at = now(), updated_at = now()
         WHERE id = $1 AND tenant_id = $2
       `, [req.captureAgent.id, req.captureAgent.tenant_id]);
-      return {agentInactive: false};
+      return {
+        agentInactive: false,
+        fullHeartbeatAt: captureAgentFullHeartbeatAt(currentAgent),
+      };
     });
     if (result.agentInactive) {
       return res.status(403).json({
@@ -5993,7 +6089,9 @@ router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
       ok: true,
       agent: {
         id: req.captureAgent.id,
-        heartbeatAt: new Date().toISOString(),
+        livenessAt: new Date().toISOString(),
+        heartbeatAt: result.fullHeartbeatAt,
+        fullHeartbeatAt: result.fullHeartbeatAt,
       },
     });
   } catch (err) {
@@ -6009,7 +6107,8 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
       return res.status(409).json({ ok: false, error: 'agent_identity_mismatch', message: '采集节点身份不匹配，请重新验证扩展' });
     }
 
-    const rawTasks = Array.isArray(req.body?.tasks)
+    const hasTaskSnapshotList = Array.isArray(req.body?.tasks);
+    const rawTasks = hasTaskSnapshotList
       ? req.body.tasks.slice(0, MAX_HEARTBEAT_TASKS)
       : [];
     const snapshots = rawTasks.map(normalizeCloudTaskSnapshot).filter(Boolean);
@@ -6025,6 +6124,10 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
     const heartbeatCapabilities = sanitizeCloudStructuredObject(
       req.body?.agent?.capabilities,
     );
+    const hasObservedSocialAccounts = Object.prototype.hasOwnProperty.call(
+      req.body || {},
+      'observedSocialAccounts',
+    );
     const observedSocialAccounts = (
       Array.isArray(req.body?.observedSocialAccounts)
         ? req.body.observedSocialAccounts
@@ -6032,6 +6135,10 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
     )
       .slice(0, 10)
       .map(item => sanitizeCloudStructuredObject(item));
+    const hasSocialUsageEvents = Object.prototype.hasOwnProperty.call(
+      req.body || {},
+      'socialUsageEvents',
+    );
     const socialUsageEvents = (
       Array.isArray(req.body?.socialUsageEvents)
         ? req.body.socialUsageEvents
@@ -6044,6 +6151,12 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         heartbeatCapabilities.supportedPlatforms,
       );
     }
+    const taskStateKnown =
+      heartbeatCapabilities.taskStateKnown !== false && hasTaskSnapshotList;
+    heartbeatCapabilities.taskStateKnown = taskStateKnown;
+    const taskStateIncomplete = !taskStateKnown;
+    const heartbeatDegraded =
+      heartbeatCapabilities.heartbeatDegraded === true || taskStateIncomplete;
     const result = await withTransaction(async tx => {
       const currentAgent = await lockActiveCaptureAgentSession(tx, agent);
       if (!currentAgent) return {agentInactive: true};
@@ -6052,23 +6165,32 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         SET client_label = COALESCE(NULLIF($1, ''), client_label),
           app_version = COALESCE(NULLIF($2, ''), app_version),
           capabilities = $3::jsonb,
-          last_heartbeat_at = now(),
+          last_liveness_at = now(),
+          last_full_heartbeat_at = CASE
+            WHEN $5::boolean THEN last_full_heartbeat_at
+            ELSE now()
+          END,
+          last_heartbeat_at = CASE
+            WHEN $5::boolean THEN last_heartbeat_at
+            ELSE now()
+          END,
           last_error = $4,
           unattended_plan = CASE
-            WHEN $5::boolean THEN $6::jsonb
+            WHEN $6::boolean AND NOT $5::boolean THEN $7::jsonb
             ELSE unattended_plan
           END,
           unattended_plan_updated_at = CASE
-            WHEN $5::boolean THEN now()
+            WHEN $6::boolean AND NOT $5::boolean THEN now()
             ELSE unattended_plan_updated_at
           END,
           updated_at = now()
-        WHERE id = $7 AND tenant_id = $8
+        WHERE id = $8 AND tenant_id = $9
       `, [
         text(req.body?.agent?.clientLabel, 240),
         text(req.body?.agent?.appVersion, 80),
         JSON.stringify(heartbeatCapabilities),
         sanitizeCloudText(req.body?.agent?.lastError, 1000),
+        taskStateIncomplete,
         hasUnattendedPlan,
         JSON.stringify(unattendedPlan),
         agent.id,
@@ -6077,26 +6199,35 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
 
       await expireStaleCommands(tx, agent.tenant_id, null, agent.id);
 
-      const socialAccountResult = await processSocialAccountHeartbeat(tx, {
-        agent,
-        observedAccounts: observedSocialAccounts,
-        usageEvents: socialUsageEvents,
-      });
+      const socialAccountResult =
+        hasObservedSocialAccounts || hasSocialUsageEvents
+          ? await processSocialAccountHeartbeat(tx, {
+            agent,
+            observedAccounts: hasObservedSocialAccounts
+              ? observedSocialAccounts
+              : [],
+            usageEvents: hasSocialUsageEvents ? socialUsageEvents : [],
+          })
+          : {observedAccountCount: 0, acceptedUsageEventIds: []};
 
       const mirroredTasks = [];
-      for (const snapshot of snapshots) {
-        mirroredTasks.push(await mirrorTaskSnapshot(tx, agent, snapshot));
+      if (!taskStateIncomplete) {
+        for (const snapshot of snapshots) {
+          mirroredTasks.push(await mirrorTaskSnapshot(tx, agent, snapshot));
+        }
       }
 
-      const elasticClaim = await dispatchNextElasticWorkItem(tx, {
-        agent: {
-          ...agent,
-          ...currentAgent,
-        },
-        capabilities: heartbeatCapabilities,
-      });
+      const elasticClaim = taskStateIncomplete
+        ? null
+        : await dispatchNextElasticWorkItem(tx, {
+            agent: {
+              ...agent,
+              ...currentAgent,
+            },
+            capabilities: heartbeatCapabilities,
+          });
 
-      const commands = await tx.queryAll(`
+      const commands = taskStateKnown ? await tx.queryAll(`
         SELECT c.id, c.command_type, c.payload, c.status, c.created_at,
           t.id AS task_id, t.client_task_id, t.control_task_id,
           t.task_type, t.platform, t.title, t.status AS task_status
@@ -6164,7 +6295,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         agent.auth_binding_id,
         Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [],
         normalizeCaptureAgentPlatforms(heartbeatCapabilities.supportedPlatforms),
-      ]);
+      ]) : [];
 
       if (commands.length > 0) {
         await tx.execute(`
@@ -6192,7 +6323,16 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         }
       }
 
-      return { mirroredTasks, commands, socialAccountResult, elasticClaim };
+      return {
+        mirroredTasks,
+        commands,
+        socialAccountResult,
+        elasticClaim,
+        heartbeatDegraded,
+        taskStateKnown,
+        taskStateIncomplete,
+        previousFullHeartbeatAt: captureAgentFullHeartbeatAt(currentAgent),
+      };
     });
 
     if (result.agentInactive) {
@@ -6206,8 +6346,16 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
       ok: true,
       agent: {
         id: agent.id,
-        heartbeatAt: new Date().toISOString(),
+        livenessAt: new Date().toISOString(),
+        heartbeatAt: result.taskStateIncomplete
+          ? result.previousFullHeartbeatAt
+          : new Date().toISOString(),
+        fullHeartbeatAt: result.taskStateIncomplete
+          ? result.previousFullHeartbeatAt
+          : new Date().toISOString(),
       },
+      heartbeatDegraded: result.heartbeatDegraded,
+      taskStateKnown: result.taskStateKnown,
       tasksAccepted: result.mirroredTasks.length,
       observedAccountsAccepted:
         result.socialAccountResult.observedAccountCount,
@@ -6952,7 +7100,16 @@ router.get('/history', requireTenantAccess, requireSessionUser, async (req, res,
           ca.allowed_platforms AS agent_allowed_platforms,
           ca.capabilities AS agent_capabilities,
           ca.last_heartbeat_at AS agent_last_heartbeat_at,
-          (ca.status = 'active' AND ca.last_heartbeat_at >= now() - interval '2 minutes') AS agent_online,
+          ca.last_liveness_at AS agent_last_liveness_at,
+          ca.last_full_heartbeat_at AS agent_last_full_heartbeat_at,
+          (
+            ca.status = 'active'
+            AND COALESCE(
+              ca.last_liveness_at,
+              ca.last_full_heartbeat_at,
+              ca.last_heartbeat_at
+            ) >= now() - interval '2 minutes'
+          ) AS agent_online,
           ca.status AS agent_status,
           t.status AS effective_status
         FROM capture_tasks t
@@ -7029,15 +7186,29 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           ca.host_label, ca.browser_name, ca.operating_system, ca.app_version,
           ca.allowed_platforms, ca.capabilities, ca.unattended_plan,
           ca.unattended_plan_updated_at, ca.status,
-          ca.last_heartbeat_at, ca.last_error, ca.created_at, ca.updated_at,
+          ca.last_heartbeat_at, ca.last_liveness_at,
+          ca.last_full_heartbeat_at, ca.last_error,
+          ca.created_at, ca.updated_at,
           COALESCE(task_load.active_task_count, 0)::integer
             AS active_task_count,
           COALESCE(task_load.queued_task_count, 0)::integer
             AS queued_task_count,
           (
             ca.status = 'active'
-            AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+            AND COALESCE(
+              ca.last_liveness_at,
+              ca.last_full_heartbeat_at,
+              ca.last_heartbeat_at
+            ) >= now() - interval '2 minutes'
           ) AS online
+          , (
+            ca.status = 'active'
+            AND COALESCE(
+              ca.last_full_heartbeat_at,
+              ca.last_heartbeat_at
+            ) >= now() - interval '2 minutes'
+            AND ca.capabilities->>'taskStateKnown' IS DISTINCT FROM 'false'
+          ) AS dispatch_ready
         FROM capture_agents ca
         LEFT JOIN task_load ON task_load.agent_id = ca.id
         WHERE ca.tenant_id = $1
@@ -7053,9 +7224,15 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           ca.allowed_platforms AS agent_allowed_platforms,
           ca.capabilities AS agent_capabilities,
           ca.last_heartbeat_at AS agent_last_heartbeat_at,
+          ca.last_liveness_at AS agent_last_liveness_at,
+          ca.last_full_heartbeat_at AS agent_last_full_heartbeat_at,
           (
             ca.status = 'active'
-            AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+            AND COALESCE(
+              ca.last_liveness_at,
+              ca.last_full_heartbeat_at,
+              ca.last_heartbeat_at
+            ) >= now() - interval '2 minutes'
           ) AS agent_online,
           ca.status AS agent_status,
           CASE
@@ -7121,7 +7298,11 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
                 t.task_type = 'capture_orchestration'
                 OR (
                   ca.status = 'active'
-                  AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+                  AND COALESCE(
+                    ca.last_liveness_at,
+                    ca.last_full_heartbeat_at,
+                    ca.last_heartbeat_at
+                  ) >= now() - interval '2 minutes'
                 )
               )
           ) AS running_tasks,
@@ -7162,9 +7343,17 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
     ]);
 
     const aiAdmission = getTenantAiAdmissionSnapshot(req.tenantId);
+    const publicAgents = agents.map(agent => ({
+      ...agent,
+      connected: agent.online === true,
+      fullHeartbeatHealthy: agent.dispatch_ready === true,
+      degraded:
+        safeJson(agent.capabilities).taskStateKnown === false ||
+        safeJson(agent.capabilities).heartbeatDegraded === true,
+    }));
     return res.json({
       ok: true,
-      agents,
+      agents: publicAgents,
       tasks: tasks.map(task => ({
         ...task,
         effective_status:
@@ -7174,8 +7363,11 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             : task.status,
       })),
       summary: {
-        agents: agents.length,
-        onlineAgents: agents.filter(agent => agent.status === 'active' && captureAgentOnline(agent.last_heartbeat_at)).length,
+        agents: publicAgents.length,
+        onlineAgents: publicAgents.filter(agent => agent.connected).length,
+        dispatchReadyAgents: publicAgents.filter(
+          agent => agent.fullHeartbeatHealthy,
+        ).length,
         runningTasks: Number(taskSummary?.running_tasks || 0),
         attentionTasks: Number(taskSummary?.attention_tasks || 0),
         historyTasks: Number(taskSummary?.history_tasks || 0),
@@ -7277,7 +7469,8 @@ router.delete('/agents/:id', requireTenantAccess, requireSessionUser, requireTen
       await lockCaptureAgentExecutionSlot(tx, req.tenantId, agentId);
 
       const agent = await tx.queryOne(`
-        SELECT id, display_name, status, last_heartbeat_at, unattended_plan
+        SELECT id, display_name, status, last_heartbeat_at,
+          last_liveness_at, last_full_heartbeat_at, unattended_plan
         FROM capture_agents
         WHERE id = $1 AND tenant_id = $2
         FOR UPDATE
@@ -7330,7 +7523,7 @@ router.delete('/agents/:id', requireTenantAccess, requireSessionUser, requireTen
       `, [req.tenantId, agentId]);
 
       const blockers = {
-        online: captureAgentOnline(agent.last_heartbeat_at),
+        online: captureAgentLivenessOnline(agent),
         activeTasks: Number(taskLoad?.count || 0),
         activeWorkItems: Number(workItemLoad?.count || 0),
         pendingCommands: Number(pendingCommands?.count || 0),
@@ -7482,7 +7675,8 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
       // in its new tenant cannot be changed by this operation.
       await lockCaptureAgentExecutionSlot(tx, req.tenantId, agentId);
       const agent = await tx.queryOne(`
-        SELECT id, display_name, status, last_heartbeat_at, unattended_plan
+        SELECT id, display_name, status, last_heartbeat_at,
+          last_liveness_at, last_full_heartbeat_at, unattended_plan
         FROM capture_agents
         WHERE id = $1 AND tenant_id = $2
         FOR UPDATE
@@ -7494,7 +7688,7 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
       if (agent.status === 'migrated' && movedToAnotherTenant) {
         return {agent, alreadyMigrated: true};
       }
-      if (captureAgentOnline(agent.last_heartbeat_at)) {
+      if (captureAgentLivenessOnline(agent)) {
         return {agent, online: true};
       }
 
@@ -9267,7 +9461,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
       agent.auth_code_status === 'active' &&
       Boolean(agent.active_auth_binding_id) &&
       !authExpired &&
-      captureAgentOnline(agent.last_heartbeat_at) &&
+      captureAgentFullHeartbeatOnline(agent) &&
       Number(agent.active_task_count || 0) === 0 &&
       Number(agent.active_command_count || 0) === 0 &&
       crossDeviceRetryAgentDailyUsageEligible(agent) &&
@@ -9335,7 +9529,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
         locked.auth_code_status === 'active' &&
         Boolean(locked.active_auth_binding_id) &&
         !authExpired &&
-        captureAgentOnline(locked.last_heartbeat_at) &&
+        captureAgentFullHeartbeatOnline(locked) &&
         crossDeviceRetryAgentDailyUsageEligible(locked) &&
         crossDeviceRetryAgentSupportsTask(locked, task, commandPayload);
       if (eligible && safetyHandoffPolicy) {
@@ -10615,7 +10809,9 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             ac.status AS auth_code_status,
             ac.expires_at AS auth_code_expires_at,
             binding.id AS active_auth_binding_id,
-            ca.last_heartbeat_at >= clock_timestamp() - interval '2 minutes'
+            COALESCE(ca.last_full_heartbeat_at, ca.last_heartbeat_at) >=
+              clock_timestamp() - interval '2 minutes'
+              AND ca.capabilities->>'taskStateKnown' IS DISTINCT FROM 'false'
               AS heartbeat_fresh,
             (
               ac.expires_at IS NULL OR ac.expires_at > clock_timestamp()
@@ -11290,19 +11486,18 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         'completed', 'completed_with_warnings', 'completed_with_failures',
         'failed', 'canceled', 'skipped', 'superseded'
       )
-      AND (
-        (
-          agent.last_heartbeat_at <
-            now() - make_interval(mins => $1::integer)
-          AND child.updated_at <
-            now() - make_interval(mins => $1::integer)
-        )
-        OR (
-          child.status IN ('claimed', 'running', 'recovering')
-          AND COALESCE(child.heartbeat_at, child.started_at, child.created_at) <
-            now() - make_interval(mins => $1::integer)
-        )
-      )
+      AND COALESCE(
+        agent.last_liveness_at,
+        agent.last_full_heartbeat_at,
+        agent.last_heartbeat_at,
+        '-infinity'::timestamptz
+      ) < now() - make_interval(mins => $1::integer)
+      AND COALESCE(
+        child.heartbeat_at,
+        child.updated_at,
+        child.started_at,
+        child.created_at
+      ) < now() - make_interval(mins => $1::integer)
       AND NOT EXISTS (
         SELECT 1
         FROM capture_agent_commands command
@@ -11341,7 +11536,11 @@ export async function reconcileElasticCaptureLeases(input = 50) {
       `, [candidate.parent_task_id, candidate.tenant_id]);
       if (!parent) return false;
       const child = await tx.queryOne(`
-        SELECT child.*, agent.last_heartbeat_at AS agent_last_heartbeat_at
+        SELECT child.*,
+          agent.last_heartbeat_at AS agent_last_heartbeat_at,
+          agent.last_liveness_at AS agent_last_liveness_at,
+          agent.last_full_heartbeat_at AS agent_last_full_heartbeat_at,
+          agent.capabilities AS agent_capabilities
         FROM capture_tasks child
         JOIN capture_agents agent
           ON agent.id = child.assigned_agent_id
@@ -11351,22 +11550,18 @@ export async function reconcileElasticCaptureLeases(input = 50) {
           AND child.status IN (
             'pending', 'claimed', 'running', 'recovering', 'waiting_device'
           )
-          AND (
-            (
-              agent.last_heartbeat_at <
-                now() - make_interval(mins => $4::integer)
-              AND child.updated_at <
-                now() - make_interval(mins => $4::integer)
-            )
-            OR (
-              child.status IN ('claimed', 'running', 'recovering')
-              AND COALESCE(
-                child.heartbeat_at,
-                child.started_at,
-                child.created_at
-              ) < now() - make_interval(mins => $4::integer)
-            )
-          )
+          AND COALESCE(
+            agent.last_liveness_at,
+            agent.last_full_heartbeat_at,
+            agent.last_heartbeat_at,
+            '-infinity'::timestamptz
+          ) < now() - make_interval(mins => $4::integer)
+          AND COALESCE(
+            child.heartbeat_at,
+            child.updated_at,
+            child.started_at,
+            child.created_at
+          ) < now() - make_interval(mins => $4::integer)
           AND NOT EXISTS (
             SELECT 1
             FROM capture_agent_commands command
@@ -11382,13 +11577,18 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
       ]);
       if (!child) return false;
-      const agentHeartbeatAt = Date.parse(
-        String(child.agent_last_heartbeat_at || ''),
+      const agentView = {
+        last_heartbeat_at: child.agent_last_heartbeat_at,
+        last_liveness_at: child.agent_last_liveness_at,
+        last_full_heartbeat_at: child.agent_last_full_heartbeat_at,
+        capabilities: child.agent_capabilities,
+      };
+      const agentConnected = captureAgentLivenessOnline(
+        agentView,
+        Date.now(),
+        ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN * 60 * 1000,
       );
-      const agentOffline =
-        !Number.isFinite(agentHeartbeatAt) ||
-        agentHeartbeatAt <
-          Date.now() - ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN * 60 * 1000;
+      const agentOffline = !agentConnected;
       const timeoutCode = agentOffline
         ? 'elastic_agent_offline_timeout'
         : 'elastic_task_heartbeat_timeout';
@@ -11435,9 +11635,9 @@ export async function reconcileElasticCaptureLeases(input = 50) {
           timeoutCode,
         },
       });
-      return true;
+      return 'requeued';
     });
-    if (settled) summary.requeued += 1;
+    if (settled === 'requeued') summary.requeued += 1;
     else summary.skipped += 1;
   }
   return summary;

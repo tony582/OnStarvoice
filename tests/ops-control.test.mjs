@@ -149,7 +149,7 @@ test('control plane defaults to tenant-off observe-only mode with an explicit gl
   assert.equal(defaults.actionsEnabled, false);
   assert.equal(defaults.actionsGlobalEnabled, false);
   assert.equal(defaults.llmEnabled, false);
-  assert.equal(defaults.runtimeBaselineVersion, '0.3.94');
+  assert.equal(defaults.runtimeBaselineVersion, '0.3.95');
   assert.equal(resolveOpsControlGlobalEnabled({OPS_CONTROL_GLOBAL_ENABLED: 'off'}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({OPS_CONTROL_ACTIONS_GLOBAL_ENABLED: 'true'}), true);
@@ -575,6 +575,55 @@ test('terminal parent status absorbs stale active child residue in normalized ta
   });
   assert.equal(normalized.tasks[0].active, false);
   assert.equal(normalized.taskSummary.active, 0);
+});
+
+test('control-plane agent evidence separates connection, task-state health, and auxiliary warnings', () => {
+  const normalized = normalizeOpsControlEvidence({
+    capturedAt: '2026-08-27T06:00:00.000Z',
+    schedules: [],
+    tasks: [],
+    operations: {},
+    persistence: {},
+    ai: {},
+    agents: [
+      {
+        id: 'task-state-missing',
+        status: 'active',
+        last_liveness_at: '2026-08-27T05:59:50.000Z',
+        last_full_heartbeat_at: '2026-08-27T05:59:40.000Z',
+        capabilities: {taskStateKnown: false, heartbeatDegraded: true},
+      },
+      {
+        id: 'auxiliary-warning',
+        status: 'active',
+        last_liveness_at: '2026-08-27T05:59:50.000Z',
+        last_full_heartbeat_at: '2026-08-27T05:59:40.000Z',
+        capabilities: {taskStateKnown: true, heartbeatDegraded: true},
+      },
+      {
+        id: 'legacy-offline',
+        status: 'active',
+        last_heartbeat_at: '2026-08-27T05:40:00.000Z',
+        capabilities: {},
+      },
+    ],
+  });
+  const incomplete = normalized.agents[0];
+  assert.equal(incomplete.connected, true);
+  assert.equal(incomplete.fullHeartbeatHealthy, false);
+  assert.equal(incomplete.online, false);
+  assert.equal(incomplete.heartbeatDegraded, true);
+
+  const auxiliary = normalized.agents[1];
+  assert.equal(auxiliary.connected, true);
+  assert.equal(auxiliary.fullHeartbeatHealthy, true);
+  assert.equal(auxiliary.online, true);
+  assert.equal(auxiliary.heartbeatDegraded, true);
+
+  const offline = normalized.agents[2];
+  assert.equal(offline.connected, false);
+  assert.equal(offline.fullHeartbeatHealthy, false);
+  assert.equal(offline.online, false);
 });
 
 test('digest is deterministic, identifies observe-only mode and does not claim an LLM action', () => {

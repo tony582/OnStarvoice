@@ -1131,6 +1131,44 @@ test("historical tasks do not invent a remote-control id", () => {
   assert.equal(payload.tasks[0].controlTaskId, "");
 });
 
+test("degraded heartbeat omits unknown task and plan collections instead of reporting them empty", () => {
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {
+      clientUuid: "known-client-uuid",
+      clientLabel: "known-client",
+      appVersion: "0.3.94",
+    },
+    agentId: "known-agent-registration",
+    ledger: {
+      runs: [{id: "must-not-be-misreported", status: "running"}],
+    },
+    unattendedPlan: {enabled: true, keywords: ["必须保留"]},
+    observedSocialAccounts: [{platform: "douyin"}],
+    socialUsageEvents: [{eventId: "usage-1", searches: 1}],
+    taskStateKnown: false,
+    unattendedPlanKnown: false,
+    observedSocialAccountsKnown: false,
+    socialUsageEventsKnown: false,
+    degradedHealth: ["task_state_unavailable", "cleanup_task_ledger_failed"],
+    lastError: "LOCAL_HEARTBEAT_DEGRADED",
+  });
+
+  assert.equal(payload.agent.registrationId, "known-agent-registration");
+  assert.equal(payload.agent.clientUuid, "known-client-uuid");
+  assert.equal(payload.agent.appVersion, "0.3.94");
+  assert.equal(payload.agent.capabilities.taskStateKnown, false);
+  assert.equal(payload.agent.capabilities.heartbeatDegraded, true);
+  assert.equal(payload.agent.health.status, "degraded");
+  assert.deepEqual(payload.agent.health.degradedReasons, [
+    "task_state_unavailable",
+    "cleanup_task_ledger_failed",
+  ]);
+  assert.equal(Object.hasOwn(payload, "tasks"), false);
+  assert.equal(Object.hasOwn(payload, "unattendedPlan"), false);
+  assert.equal(Object.hasOwn(payload, "observedSocialAccounts"), false);
+  assert.equal(Object.hasOwn(payload, "socialUsageEvents"), false);
+});
+
 test("cloud bearer tokens are never replayed to another trust origin", async () => {
   const calls = [];
   const result = await agent.requestJson({

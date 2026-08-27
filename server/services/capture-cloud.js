@@ -936,6 +936,41 @@ export function captureAgentOnline(lastHeartbeatAt, now = Date.now(), staleMs = 
   return Number.isFinite(timestamp) && now - timestamp <= staleMs;
 }
 
+export function captureAgentHeartbeatDegraded(agent = {}) {
+  const capabilities = sanitizeCloudStructuredObject(agent.capabilities);
+  return capabilities.taskStateKnown === false ||
+    capabilities.heartbeatDegraded === true;
+}
+
+export function captureAgentLivenessAt(agent = {}) {
+  return agent.last_liveness_at ||
+    agent.last_full_heartbeat_at ||
+    agent.last_heartbeat_at ||
+    null;
+}
+
+export function captureAgentFullHeartbeatAt(agent = {}) {
+  return agent.last_full_heartbeat_at || agent.last_heartbeat_at || null;
+}
+
+export function captureAgentLivenessOnline(
+  agent,
+  now = Date.now(),
+  staleMs = 2 * 60 * 1000,
+) {
+  return captureAgentOnline(captureAgentLivenessAt(agent), now, staleMs);
+}
+
+export function captureAgentFullHeartbeatOnline(
+  agent,
+  now = Date.now(),
+  staleMs = 2 * 60 * 1000,
+) {
+  const capabilities = sanitizeCloudStructuredObject(agent.capabilities);
+  return capabilities.taskStateKnown !== false &&
+    captureAgentOnline(captureAgentFullHeartbeatAt(agent), now, staleMs);
+}
+
 // These are the states that can still own the browser's single capture lock.
 // Attention/terminal states such as interrupted, needs_action and failed keep
 // their audit history, but the extension has already released its execution

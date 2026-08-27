@@ -7,6 +7,9 @@ import vm from "node:vm";
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
   bindCloudTaskSnapshotHealthToAttempt,
+  captureAgentFullHeartbeatOnline,
+  captureAgentHeartbeatDegraded,
+  captureAgentLivenessOnline,
   captureAgentOnline,
   cloudTaskAttemptIdentityAcceptsSnapshot,
   findCaptureAgentExecutionSlotBlocker,
@@ -23,6 +26,7 @@ import {
 } from "../server/services/capture-cloud.js";
 import {
   captureTaskBusinessRootVisibilitySql,
+  captureCreateCommandExpiryEligible,
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
   buildSequentialSearchResumeCheckpoint,
@@ -703,6 +707,28 @@ test("cross-device retry requires exact workflow capabilities and blocks safety 
     task_type: "followed_creator_post_patrol",
     platform: "douyin",
   }), true);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      taskStateKnown: true,
+      heartbeatDegraded: true,
+    },
+  }, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }), true);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      taskStateKnown: false,
+      heartbeatDegraded: true,
+    },
+  }, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }), false);
   assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
     task_type: "followed_creator_post_patrol",
     platform: "douyin",
@@ -1950,7 +1976,7 @@ test("agent deletion is a guarded soft revoke that preserves history", () => {
   const executionLock = removal.indexOf("await lockCaptureAgentExecutionSlot(");
   const agentRowLock = removal.indexOf("FOR UPDATE");
   assert.ok(executionLock >= 0 && executionLock < agentRowLock);
-  assert.match(removal, /captureAgentOnline\(agent\.last_heartbeat_at\)/u);
+  assert.match(removal, /captureAgentLivenessOnline\(agent\)/u);
   assert.match(
     removal,
     /COALESCE\(t\.assigned_agent_id, t\.origin_agent_id\)[\s\S]*AGENT_REMOVAL_TASK_STATUSES/u,
@@ -2021,7 +2047,7 @@ test("Agent tenant migration is reversible while permanent retirement stays irre
   assert.doesNotMatch(retirement, /WHERE client_uuid/u);
   assert.match(
     retirement,
-    /captureAgentOnline\(agent\.last_heartbeat_at\)[\s\S]*agent_retirement_online/u,
+    /captureAgentLivenessOnline\(agent\)[\s\S]*agent_retirement_online/u,
   );
   assert.match(
     retirement,
@@ -2191,6 +2217,66 @@ test("create command failures and successful stops settle orchestration work ite
   );
 });
 
+test("acknowledged create expiry waits for Agent liveness, while pending expiry does not", () => {
+  const now = Date.parse("2026-08-27T06:00:00.000Z");
+  const graceMs = 10 * 60 * 1000;
+  const freshLivenessAt = "2026-08-27T05:59:55.000Z";
+  const staleFullHeartbeatAt = "2026-08-27T05:30:00.000Z";
+
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "pending",
+    commandType: "create",
+    lastLivenessAt: freshLivenessAt,
+    lastFullHeartbeatAt: staleFullHeartbeatAt,
+  }, now, graceMs), true, "an unclaimed create still expires at expires_at");
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "acknowledged",
+    commandType: "create",
+    lastLivenessAt: freshLivenessAt,
+    lastFullHeartbeatAt: staleFullHeartbeatAt,
+  }, now, graceMs), false, "fresh liveness holds an acknowledged create even when the full snapshot is stale");
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "acknowledged",
+    commandType: "create",
+    lastLivenessAt: "2026-08-27T05:49:59.999Z",
+    lastFullHeartbeatAt: staleFullHeartbeatAt,
+  }, now, graceMs), true, "an acknowledged create may expire after the liveness grace elapses");
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "acknowledged",
+    commandType: "stop",
+    lastLivenessAt: freshLivenessAt,
+  }, now, graceMs), true, "non-create command expiry remains unchanged");
+});
+
+test("stale command reconciliation rechecks acknowledged create liveness before retry projection", () => {
+  const expiry = readRouteSection(
+    "async function expireStaleCommands",
+    "async function resolveResumeCommandFromSuccessor",
+  );
+  const candidateCheck = expiry.indexOf("const expiryCandidates = await tx.queryAll");
+  const candidateLock = expiry.indexOf("FOR UPDATE OF c", candidateCheck);
+  const atomicRecheck = expiry.indexOf("id = ANY($4::uuid[])", candidateLock);
+  const retryProjection = expiry.indexOf("projectOrchestrationChildControlOutcome", atomicRecheck);
+
+  assert.ok(candidateCheck >= 0);
+  assert.ok(candidateLock > candidateCheck, "expiry candidates must be command-row locked");
+  assert.ok(atomicRecheck > candidateLock, "the expiry update must recheck the locked candidate set");
+  assert.ok(retryProjection > atomicRecheck, "retry projection must only see commands that passed both checks");
+  assert.match(
+    expiry,
+    /c\.status = 'pending'[\s\S]*c\.command_type <> 'create'[\s\S]*ca\.last_liveness_at[\s\S]*ca\.last_full_heartbeat_at[\s\S]*make_interval\(mins => \$4::integer\)/u,
+  );
+  assert.match(
+    expiry,
+    /status = 'pending'[\s\S]*command_type <> 'create'[\s\S]*NOT EXISTS \([\s\S]*ca\.last_liveness_at[\s\S]*>= now\(\) - make_interval\(mins => \$5::integer\)/u,
+  );
+  assert.match(
+    expiry,
+    /AND metadata->>'createCommandId' = \$3/u,
+    "an expired command must not settle a newer task attempt",
+  );
+});
+
 test("elastic queue claims one keyword or platform-bound content item per idle heartbeat and fences late attempts", () => {
   const claim = readRouteSection(
     "async function dispatchNextElasticWorkItem",
@@ -2296,10 +2382,15 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
     'export async function reconcileAutomaticCaptureRetries',
   );
   assert.match(lease, /ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN/u);
-  assert.match(lease, /agent\.last_heartbeat_at/u);
+  assert.match(lease, /agent\.last_liveness_at/u);
   assert.match(lease, /child\.heartbeat_at/u);
   assert.match(lease, /elastic_task_heartbeat_timeout/u);
-  assert.match(lease, /!Number\.isFinite\(agentHeartbeatAt\)/u);
+  assert.match(lease, /captureAgentLivenessOnline/u);
+  assert.match(
+    lease,
+    /COALESCE\([\s\S]*agent\.last_liveness_at[\s\S]*'-infinity'::timestamptz[\s\S]*< now\(\)[\s\S]*AND COALESCE\([\s\S]*child\.heartbeat_at[\s\S]*child\.updated_at/u,
+  );
+  assert.doesNotMatch(lease, /AGENT_TASK_STATE_UNAVAILABLE/u);
   assert.match(lease, /status: 'retryable'/u);
   assert.match(lease, /elastic_agent_offline_timeout/u);
   assert.match(lease, /FOR UPDATE SKIP LOCKED/u);
@@ -2559,6 +2650,122 @@ test("online state is derived from a short heartbeat lease", () => {
   assert.equal(captureAgentOnline("2026-07-20T07:59:01.000Z", now), true);
   assert.equal(captureAgentOnline("2026-07-20T07:57:59.000Z", now), false);
   assert.equal(captureAgentOnline("", now), false);
+});
+
+test("Agent liveness, full task-state health, and auxiliary degradation are distinct", () => {
+  const now = Date.parse("2026-08-27T06:00:00.000Z");
+  const incomplete = {
+    last_liveness_at: "2026-08-27T05:59:50.000Z",
+    last_full_heartbeat_at: "2026-08-27T05:50:00.000Z",
+    last_heartbeat_at: "2026-08-27T05:50:00.000Z",
+    capabilities: {
+      taskStateKnown: false,
+      heartbeatDegraded: true,
+    },
+  };
+  assert.equal(captureAgentLivenessOnline(incomplete, now), true);
+  assert.equal(captureAgentFullHeartbeatOnline(incomplete, now), false);
+  assert.equal(captureAgentHeartbeatDegraded(incomplete), true);
+
+  const auxiliaryWarning = {
+    last_liveness_at: "2026-08-27T05:59:50.000Z",
+    last_full_heartbeat_at: "2026-08-27T05:59:45.000Z",
+    last_heartbeat_at: "2026-08-27T05:59:45.000Z",
+    capabilities: {
+      taskStateKnown: true,
+      heartbeatDegraded: true,
+    },
+  };
+  assert.equal(captureAgentFullHeartbeatOnline(auxiliaryWarning, now), true);
+  assert.equal(captureAgentHeartbeatDegraded(auxiliaryWarning), true);
+
+  const legacy = {
+    last_heartbeat_at: "2026-08-27T05:59:45.000Z",
+    capabilities: {},
+  };
+  assert.equal(captureAgentLivenessOnline(legacy, now), true);
+  assert.equal(captureAgentFullHeartbeatOnline(legacy, now), true);
+});
+
+test("heartbeat routes keep liveness-only and incomplete task-state writes isolated", () => {
+  const liveness = readRouteSection(
+    "router.post('/agent/liveness'",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(liveness, /SET last_liveness_at = now\(\)/u);
+  assert.doesNotMatch(liveness, /SET last_heartbeat_at = now\(\)/u);
+  assert.doesNotMatch(liveness, /last_full_heartbeat_at = now\(\)/u);
+
+  const heartbeat = readRouteSection(
+    "router.post('/agent/heartbeat'",
+    "router.post('/agent/commands/:id/complete'",
+  );
+  assert.match(
+    heartbeat,
+    /const hasTaskSnapshotList = Array\.isArray\(req\.body\?\.tasks\);[\s\S]*const rawTasks = hasTaskSnapshotList/u,
+  );
+  assert.match(
+    heartbeat,
+    /heartbeatCapabilities\.taskStateKnown !== false && hasTaskSnapshotList;[\s\S]*heartbeatCapabilities\.taskStateKnown = taskStateKnown;/u,
+  );
+  assert.match(heartbeat, /const taskStateIncomplete = !taskStateKnown/u);
+  assert.match(
+    heartbeat,
+    /last_liveness_at = now\(\)[\s\S]*last_full_heartbeat_at = CASE[\s\S]*last_heartbeat_at = CASE/u,
+  );
+  assert.match(
+    heartbeat,
+    /if \(!taskStateIncomplete\) \{[\s\S]*mirrorTaskSnapshot/u,
+  );
+  assert.match(
+    heartbeat,
+    /const elasticClaim = taskStateIncomplete[\s\S]*dispatchNextElasticWorkItem/u,
+  );
+  assert.match(
+    heartbeat,
+    /const commands = taskStateKnown \? await tx\.queryAll/u,
+  );
+  assert.match(heartbeat, /hasObservedSocialAccounts \|\| hasSocialUsageEvents/u);
+
+  const hasTaskSnapshotListExpression = heartbeat.match(
+    /const hasTaskSnapshotList = ([^;]+);/u,
+  )?.[1];
+  const taskStateKnownExpression = heartbeat.match(
+    /const taskStateKnown =\s*([\s\S]*?);\s*heartbeatCapabilities\.taskStateKnown/u,
+  )?.[1];
+  assert.ok(hasTaskSnapshotListExpression);
+  assert.ok(taskStateKnownExpression);
+  const evaluateTaskStateKnown = (body, capabilityValue) => vm.runInNewContext(`
+    (() => {
+      const hasTaskSnapshotList = ${hasTaskSnapshotListExpression};
+      return ${taskStateKnownExpression};
+    })()
+  `, {
+    req: {body},
+    heartbeatCapabilities: {taskStateKnown: capabilityValue},
+  });
+  assert.equal(evaluateTaskStateKnown({}, undefined), false);
+  assert.equal(evaluateTaskStateKnown({tasks: {}}, true), false);
+  assert.equal(evaluateTaskStateKnown({tasks: []}, undefined), true);
+  assert.equal(evaluateTaskStateKnown({tasks: []}, false), false);
+});
+
+test("heartbeat migration backfills legacy evidence without changing its full-heartbeat meaning", async () => {
+  const migration = await readFile(new URL(
+    "../server/db/migrations/076_capture_agent_heartbeat_semantics.sql",
+    import.meta.url,
+  ), "utf8");
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS last_liveness_at/u);
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS last_full_heartbeat_at/u);
+  assert.match(
+    migration,
+    /last_liveness_at = COALESCE\(last_liveness_at, last_heartbeat_at\)/u,
+  );
+  assert.match(
+    migration,
+    /last_full_heartbeat_at = COALESCE\([\s\S]*last_heartbeat_at/u,
+  );
+  assert.match(migration, /Legacy compatibility alias/u);
 });
 
 test("heartbeat prioritizes plan configuration ahead of ordinary creates with stable ordering", () => {

@@ -35,6 +35,7 @@ function readDetailBatchFunctionSource() {
 test("capture task runtime declares native tab-group permissions and worker module", () => {
   assert.equal(manifest.permissions.includes("tabs"), true);
   assert.equal(manifest.permissions.includes("tabGroups"), true);
+  assert.equal(manifest.permissions.includes("unlimitedStorage"), true);
   assert.match(backgroundSource, /utils\/capture\/task-tab-group\.js/);
   assert.match(backgroundSource, /utils\/capture\/task-runtime\.js/);
   assert.match(backgroundSource, /utils\/capture\/task-owner\.js/);

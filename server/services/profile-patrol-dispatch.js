@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import {withTransaction} from '../db/init.js';
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+  captureAgentFullHeartbeatOnline,
   captureAgentOnline,
   findCaptureAgentExecutionSlotBlocker,
   lockCaptureAgentExecutionSlot,
@@ -145,6 +146,13 @@ export function profilePatrolAgentCompatibilityFailure(
     );
   }
   const capabilities = safeJson(agent.capabilities);
+  if (capabilities.taskStateKnown === false) {
+    return requestError(
+      'agent_heartbeat_degraded',
+      '目标执行节点本地任务状态暂不可用，请等待完整心跳恢复',
+      409,
+    );
+  }
   const capability = PROFILE_PATROL_CAPABILITIES[subjectType];
   if (
     !workflow ||
@@ -236,7 +244,7 @@ export async function loadAvailableScheduledProfilePatrolAgent(tx, {
       [platform],
       subjectType,
     ) &&
-    captureAgentOnline(agent.last_heartbeat_at) &&
+    captureAgentFullHeartbeatOnline(agent) &&
     Number(agent.active_task_count || 0) === 0 &&
     Number(agent.active_command_count || 0) === 0);
   for (const candidate of eligibleCandidates) {
@@ -249,7 +257,7 @@ export async function loadAvailableScheduledProfilePatrolAgent(tx, {
     );
     if (
       !compatible.failure &&
-      captureAgentOnline(compatible.agent.last_heartbeat_at)
+      captureAgentFullHeartbeatOnline(compatible.agent)
     ) {
       return {
         agent: compatible.agent,
@@ -325,7 +333,11 @@ export async function reconcileStaleProfilePatrolExecutions(
               OR (
                 active_task.status IN ('claimed', 'running', 'recovering')
                 AND active_agent.status = 'active'
-                AND active_agent.last_heartbeat_at >=
+                AND COALESCE(
+                  active_agent.last_liveness_at,
+                  active_agent.last_full_heartbeat_at,
+                  active_agent.last_heartbeat_at
+                ) >=
                   now() - interval '2 minutes'
               )
               OR (

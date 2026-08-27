@@ -71,9 +71,15 @@ test("extension heartbeat and remote task controls are wired into the service wo
   assert.match(background, /cloudTaskAgentApi\.completeCommand/u);
   assert.match(background, /scheduleCloudTaskAgentSync\('task_ledger_changed'\)/u);
   assert.match(background, /CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS - \(Date\.now\(\) - cloudTaskAgentLastSyncAt\)/u);
-  assert.match(background, /lastError: reportedLastError/u);
-  assert.match(background, /const scopedPlan = buildCloudScopedUnattendedPlan/u);
+  assert.match(background, /const degradedLastError = degradedHealth\.length > 0/u);
+  assert.match(
+    background,
+    /lastError: \[reportedLastError, degradedLastError\][\s\S]*?\.join\('\s\|\s'\)/u,
+  );
+  assert.match(background, /const scopedPlan = taskStateKnown[\s\S]*?buildCloudScopedUnattendedPlan/u);
   assert.match(background, /unattendedPlan: scopedPlan/u);
+  assert.match(background, /taskStateKnown,/u);
+  assert.match(background, /unattendedPlanKnown: taskStateKnown/u);
   assert.match(background, /planScopeAgentId/u);
   assert.match(background, /commandType === 'create'/u);
   assert.match(background, /commandType === 'stop'/u);

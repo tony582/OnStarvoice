@@ -218,6 +218,49 @@ test("reserve establishment is skipped when measured headroom is too small", asy
   assert.equal(mock.writes.length, 0);
 });
 
+test("quota cleanup hook runs after reserve release and cannot replace the critical retry", async () => {
+  const mock = createChromeStorage();
+  const area = mock.chrome.storage.local;
+  globalThis.chrome = mock.chrome;
+  await area.set({
+    [storageModule.CONTROL_STORAGE_RESERVE_KEY]: {
+      schemaVersion: 1,
+      padding: "0".repeat(storageModule.CONTROL_STORAGE_RESERVE_BYTES),
+    },
+    protectedAuth: {token: "preserved"},
+  });
+  const events = [];
+  let attempts = 0;
+  const result = await storageModule.runWithControlStorageReserveRetry(
+    async () => {
+      attempts += 1;
+      events.push(`attempt-${attempts}`);
+      if (attempts === 1) {
+        throw new Error("Resource::kQuotaBytes quota exceeded");
+      }
+      return "persisted";
+    },
+    {
+      storage: area,
+      onQuotaPressure: async () => {
+        events.push("cleanup");
+        assert.equal(
+          mock.values.has(storageModule.CONTROL_STORAGE_RESERVE_KEY),
+          false,
+        );
+        assert.deepEqual(mock.values.get("protectedAuth"), {
+          token: "preserved",
+        });
+        throw new Error("injected cleanup failure");
+      },
+    },
+  );
+
+  assert.equal(result.value, "persisted");
+  assert.deepEqual(events, ["attempt-1", "cleanup", "attempt-2"]);
+  assert.deepEqual(mock.values.get("protectedAuth"), {token: "preserved"});
+});
+
 test("storage pressure reports profile-scoped watermarks", async () => {
   const mock = createChromeStorage();
   globalThis.chrome = mock.chrome;

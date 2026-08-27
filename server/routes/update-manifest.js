@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.94',
+  latestVersion: '0.3.95',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-27',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.94-20260827.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.95-20260827.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.95',
+      releaseDate: '2026-08-27',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: 'Extension 存储满时自动恢复完整心跳',
+              desc: '解除浏览器扩展本地存储的 10MB 上限，并只压缩明确过期的历史记录；登录、设备身份、当前计划、当前请求和活跃任务不会被清理。',
+            },
+            {
+              title: '任务状态读不全时不再伪报失败或空任务',
+              desc: '降级心跳仍会上报设备身份、版本和故障原因，但省略未知任务集合；后台不会因此清空任务、领取新任务或错误跨设备接力。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '区分浏览器在线与完整任务心跳',
+              desc: '后台分别记录轻量存活和完整任务同步；浏览器仍在线时保留原任务占位，只有浏览器与任务心跳都确认过期后才允许安全重派。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.94',
       releaseDate: '2026-08-27',
