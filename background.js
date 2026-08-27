@@ -25,6 +25,7 @@ try {
 }
 
 importScripts(
+  'utils/control-storage-reserve.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
   'utils/capture/debug-session.js',
@@ -38,6 +39,11 @@ const captureTaskTabGroupApi = globalThis.OnStarvoiceCaptureTaskTabGroup;
 const cloudTaskAgentApi = globalThis.OnStarvoiceCloudTaskAgent;
 const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
 const socialAccountUsageApi = globalThis.OnStarvoiceSocialAccountUsage;
+const controlStorageReserveApi =
+  globalThis.OnStarvoiceControlStorageReserve;
+if (!controlStorageReserveApi) {
+  throw new Error('Control storage reserve helper is unavailable');
+}
 const CAPTURE_TASK_GROUP_TITLE =
   captureTaskTabGroupApi.DEFAULT_GROUP_TITLE || 'StarVoice 采集任务';
 
@@ -56,6 +62,25 @@ const STORAGE_KEYS = {
   observedSocialAccounts: 'onstarvoice.observedSocialAccounts',
   socialAccountUsageQueue: 'onstarvoice.socialAccountUsageQueue',
 };
+
+const AUTHORITATIVE_CONTROL_TERMINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+  'needs_action',
+]);
+
+async function runAuthoritativeControlStorageMutation(mutation) {
+  const result =
+    await controlStorageReserveApi.runWithControlStorageReserveRetry(
+      mutation,
+      {storage: chrome.storage.local},
+    );
+  return result.value;
+}
 
 const DEFAULT_RUNTIME = {
   clientUuid: '',
@@ -78,6 +103,10 @@ const UNATTENDED_KEYWORD_ALARM_NAME = 'onstarvoice:unattended-keyword-plan';
 const UNATTENDED_SUPERVISOR_ALARM_NAME = 'onstarvoice:unattended-supervisor';
 const CLOUD_TASK_AGENT_ALARM_NAME = 'onstarvoice:cloud-task-agent';
 const UNATTENDED_RUNNER_QUERY_KEY = 'unattendedRun';
+const UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY = 'unattendedAttempt';
+const UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX =
+  'onstarvoice.unattendedCheckpointReportOutbox.v2.';
+const UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION = 1;
 const TARGETED_POST_RUNNER_QUERY_KEY = 'targetedPostRun';
 const TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY = 'targetedPostAttempt';
 const SCHEDULE_MODES = new Set([
@@ -493,6 +522,15 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
     'syncFailedCount',
     'syncSkippedCount',
     'syncRemainingCount',
+    'streamingSyncEnqueuedCount',
+    'streamingSyncProcessedCount',
+    'streamingSyncSuccessCount',
+    'streamingSyncFailedCount',
+    'streamingSyncSkippedCount',
+    'streamingSyncPendingCount',
+    'streamingSyncActiveCount',
+    'streamingSyncRemainingCount',
+    'capturedRecordCount',
     'keywordCompletedCount',
     'keywordPartialCount',
     'keywordFailedCount',
@@ -590,6 +628,26 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
           }))
       : [],
     taskMeta,
+    streamingSyncEvidenceKnown:
+      typeof progress.streamingSyncEvidenceKnown === 'boolean'
+        ? progress.streamingSyncEvidenceKnown
+        : null,
+    streamingSyncDrainCompleted:
+      typeof progress.streamingSyncDrainCompleted === 'boolean'
+        ? progress.streamingSyncDrainCompleted
+        : null,
+    streamingSyncEnabled:
+      typeof progress.streamingSyncEnabled === 'boolean'
+        ? progress.streamingSyncEnabled
+        : null,
+    streamingSyncBlocked:
+      typeof progress.streamingSyncBlocked === 'boolean'
+        ? progress.streamingSyncBlocked
+        : null,
+    streamingSyncCanceled:
+      typeof progress.streamingSyncCanceled === 'boolean'
+        ? progress.streamingSyncCanceled
+        : null,
     ...normalizedCounts,
   };
 }
@@ -731,6 +789,7 @@ async function readUnattendedKeywordPlan() {
 
 let unattendedRunMutationQueue = Promise.resolve();
 let unattendedRunArchiveMutationQueue = Promise.resolve();
+let unattendedRunnerTabLifecycleQueue = Promise.resolve();
 let taskLedgerMutationQueue = Promise.resolve();
 let captureTaskBeginQueue = Promise.resolve();
 let targetedPostRunMutationQueue = Promise.resolve();
@@ -744,6 +803,12 @@ function runUnattendedRunMutation(operation) {
 function runUnattendedRunArchiveMutation(operation) {
   const pending = unattendedRunArchiveMutationQueue.then(operation, operation);
   unattendedRunArchiveMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runUnattendedRunnerTabLifecycle(operation) {
+  const pending = unattendedRunnerTabLifecycleQueue.then(operation, operation);
+  unattendedRunnerTabLifecycleQueue = pending.catch(() => null);
   return pending;
 }
 
@@ -1745,11 +1810,11 @@ async function persistUnattendedRunMutation(
     mirrorPlan = true,
   } = {},
 ) {
-  return await runTaskLedgerMutation(async () => {
-    const normalized = normalizeUnattendedRunRequest(request);
-    if (!normalized) {
-      return {request: null, plan: null, ledger: null};
-    }
+  const normalized = normalizeUnattendedRunRequest(request);
+  if (!normalized) {
+    return {request: null, plan: null, ledger: null};
+  }
+  const persist = () => runTaskLedgerMutation(async () => {
     const now = String(normalized.updatedAt || new Date().toISOString());
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.unattendedKeywordPlan,
@@ -1841,6 +1906,9 @@ async function persistUnattendedRunMutation(
       ledgerReason: ledgerResult.reason,
     };
   });
+  return isTerminalUnattendedRunStatus(normalized.status)
+    ? await runAuthoritativeControlStorageMutation(persist)
+    : await persist();
 }
 
 async function readTaskLedger() {
@@ -2782,6 +2850,25 @@ async function closeSupersededTargetedPostRunnerTabs(
   superseded,
   expectedCurrent = null,
 ) {
+  if (
+    !targetedPostLogicalRequestId(superseded) ||
+    !String(superseded?.attemptId || '').trim() ||
+    isSameTargetedPostAttempt(superseded, expectedCurrent)
+  ) {
+    return {
+      ok: true,
+      current: await readTargetedPostRunRequest({persistNormalized: false}),
+      removedTabIds: [],
+      removedCount: 0,
+    };
+  }
+  return await closeOwnedTargetedPostRunnerTabs(
+    superseded,
+    expectedCurrent,
+  );
+}
+
+async function closeOwnedTargetedPostRunnerTabs(target, expectedCurrent) {
   let current = await readTargetedPostRunRequest({
     persistNormalized: false,
   });
@@ -2792,9 +2879,8 @@ async function closeSupersededTargetedPostRunnerTabs(
     removedCount: 0,
   };
   if (
-    !targetedPostLogicalRequestId(superseded) ||
-    !String(superseded?.attemptId || '').trim() ||
-    isSameTargetedPostAttempt(superseded, expectedCurrent)
+    !targetedPostLogicalRequestId(target) ||
+    !String(target?.attemptId || '').trim()
   ) {
     return initialResult;
   }
@@ -2812,7 +2898,7 @@ async function closeSupersededTargetedPostRunnerTabs(
     };
   }
   const candidates = tabs.filter((tab) =>
-    isTargetedPostRunnerTabForAttempt(tab, superseded),
+    isTargetedPostRunnerTabForAttempt(tab, target),
   );
   const removedTabIds = [];
   for (const tab of candidates) {
@@ -2842,6 +2928,27 @@ async function closeSupersededTargetedPostRunnerTabs(
     removedTabIds,
     removedCount: removedTabIds.length,
   };
+}
+
+async function closeTerminalTargetedPostRunnerTabs(request) {
+  const status = String(request?.status || '').trim().toLowerCase();
+  if (
+    status === 'needs_action' ||
+    !cloudTargetedPostApi?.isTerminalRunStatus?.(status)
+  ) {
+    return {
+      ok: true,
+      current: await readTargetedPostRunRequest({persistNormalized: false}),
+      removedTabIds: [],
+      removedCount: 0,
+      skipped: true,
+      reason:
+        status === 'needs_action'
+          ? 'targeted_post_needs_action_preserved'
+          : 'targeted_post_not_terminal',
+    };
+  }
+  return await closeOwnedTargetedPostRunnerTabs(request, request);
 }
 
 function buildTargetedPostTaskCenterRun(request, existingRun = null) {
@@ -2981,7 +3088,7 @@ async function persistTargetedPostRunRequest(request) {
   }
   const normalized = normalizeStoredTargetedPostRunRequest(request);
   const requestToPersist = normalized.request || request;
-  return await runTaskLedgerMutation(async () => {
+  const persist = () => runTaskLedgerMutation(async () => {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
     const core = getUnattendedTaskCenterCore();
     const now = new Date().toISOString();
@@ -3030,6 +3137,11 @@ async function persistTargetedPostRunRequest(request) {
     scheduleCloudTaskAgentSync('targeted_post_state_changed');
     return requestToPersist;
   });
+  return cloudTargetedPostApi?.isTerminalRunStatus?.(
+    String(requestToPersist.status || ''),
+  )
+    ? await runAuthoritativeControlStorageMutation(persist)
+    : await persist();
 }
 
 async function createOrResumeTargetedPostRun(command, payload) {
@@ -3921,6 +4033,14 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
 
   cloudTaskAgentSyncInFlight = true;
   try {
+    // A previous terminal runner may have finished cleanup after the heartbeat
+    // that carried its terminal status. Re-evaluate the exact local predicate
+    // before reading the ledger so this same heartbeat can carry closure proof.
+    await reconcileUnattendedLocalClosureEvidence({
+      closeOwnedRunnerTabs: true,
+    }).catch((error) => {
+      console.warn('[CloudTaskAgent] local closure reconcile failed:', error);
+    });
     const agentStatus = await ensureCloudTaskAgentScope(credential.id);
     const [
       runtime,
@@ -4218,18 +4338,21 @@ async function clearTaskCenterRecords() {
 }
 
 async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}) {
-  return await runTaskLedgerMutation(async () => {
+  const sourceRun =
+    run && typeof run === 'object' && !Array.isArray(run) ? run : {};
+  const sourcePatch =
+    patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+  const taskId = String(sourcePatch.id || sourceRun.id || '').trim();
+  const requestedStatus = String(
+    sourcePatch.status || sourceRun.status || '',
+  ).trim().toLowerCase();
+  const persist = () => runTaskLedgerMutation(async () => {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
     const core = getUnattendedTaskCenterCore();
     const now = new Date().toISOString();
     let ledger = core?.normalizeTaskLedger
       ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
       : stored[STORAGE_KEYS.taskLedger] || {version: 1, runs: [], updatedAt: ''};
-    const sourceRun =
-      run && typeof run === 'object' && !Array.isArray(run) ? run : {};
-    const sourcePatch =
-      patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
-    const taskId = String(sourcePatch.id || sourceRun.id || '').trim();
     if (!taskId) {
       return {accepted: false, reason: 'invalid_id', data: null, ledger};
     }
@@ -4283,6 +4406,9 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
       ledger: result.ledger,
     };
   });
+  return AUTHORITATIVE_CONTROL_TERMINAL_STATUSES.has(requestedStatus)
+    ? await runAuthoritativeControlStorageMutation(persist)
+    : await persist();
 }
 
 async function terminalizeCaptureTaskLedgerRun(
@@ -4357,11 +4483,7 @@ async function terminalizeCaptureTaskLedgerRun(
       '[CaptureTask] failed to terminalize task-center record:',
       error,
     );
-    return {
-      accepted: false,
-      reason: 'task_ledger_update_failed',
-      error,
-    };
+    throw error;
   }
 }
 
@@ -4620,24 +4742,42 @@ async function releaseUnattendedKeywordPlanLock() {
 async function cleanupTerminalUnattendedRuntime(request, tabIds = []) {
   const normalizedRequest = normalizeUnattendedRunRequest(request);
   if (!normalizedRequest) return {request: null, relayedCount: 0};
-  const reconciledRequest = normalizeUnattendedRunRequest({
-    ...normalizedRequest,
-    recoveryPendingLaunch: false,
-    recoveryWaitUntil: '',
-    wakeGraceUntil: '',
-    progress: {
-      ...(normalizedRequest.progress &&
-      typeof normalizedRequest.progress === 'object'
-        ? normalizedRequest.progress
-        : {}),
-      phase: `unattended_${normalizedRequest.status}`,
-      waitUntil: '',
-      remainingMs: null,
-    },
+  const expectedRequestId = String(normalizedRequest.id || '').trim();
+  const expectedAttemptId = String(normalizedRequest.attemptId || '').trim();
+  const persistCleanupState = () => runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== expectedRequestId ||
+      current.attemptId !== expectedAttemptId ||
+      !isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return null;
+    }
+    const reconciled = normalizeUnattendedRunRequest({
+      ...current,
+      recoveryPendingLaunch: false,
+      recoveryWaitUntil: '',
+      wakeGraceUntil: '',
+      progress: {
+        ...(current.progress && typeof current.progress === 'object'
+          ? current.progress
+          : {}),
+        phase: `unattended_${current.status}`,
+        waitUntil: '',
+        remainingMs: null,
+      },
+    });
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciled,
+    });
+    return reconciled;
   });
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciledRequest,
-  });
+  const reconciledRequest =
+    await runAuthoritativeControlStorageMutation(persistCleanupState);
+  if (!reconciledRequest) {
+    return {request: normalizedRequest, relayedCount: 0};
+  }
   const terminalLock = await snapshotUnattendedKeywordPlanLock();
   const progress = normalizeUnattendedRunProgress(
     reconciledRequest.progress,
@@ -4661,7 +4801,657 @@ async function cleanupTerminalUnattendedRuntime(request, tabIds = []) {
   }).catch((error) => {
     console.warn('[Background] terminal unattended cleanup pending:', error);
   });
+  // The terminal mutation is durable before cleanup begins. Closure evidence
+  // is deliberately deferred: the sidebar still needs a chance to drain its
+  // checkpoint outbox, and only the background can authoritatively inspect
+  // every task-owned resource across Extension documents.
+  scheduleCloudTaskAgentSync('unattended_terminal_cleanup', 500);
   return {request: reconciledRequest, relayedCount};
+}
+
+function isUnattendedRunnerTabForRequest(
+  tab,
+  requestId = '',
+  attemptId = '',
+) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  if (!normalizedRequestId) return false;
+  try {
+    const candidate = new URL(String(tab?.url || ''));
+    const sidebar = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
+    return (
+      candidate.origin === sidebar.origin &&
+      candidate.pathname === sidebar.pathname &&
+      candidate.searchParams.get(UNATTENDED_RUNNER_QUERY_KEY) ===
+        normalizedRequestId &&
+      (!normalizedAttemptId ||
+        candidate.searchParams.get(UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY) ===
+          normalizedAttemptId)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isLegacyUnattendedRunnerTabForRequest(tab, requestId = '') {
+  const normalizedRequestId = String(requestId || '').trim();
+  if (!normalizedRequestId) return false;
+  try {
+    const candidate = new URL(String(tab?.url || ''));
+    const sidebar = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
+    return (
+      candidate.origin === sidebar.origin &&
+      candidate.pathname === sidebar.pathname &&
+      candidate.searchParams.get(UNATTENDED_RUNNER_QUERY_KEY) ===
+        normalizedRequestId &&
+      !candidate.searchParams.get(UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY)
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function inspectUnattendedCheckpointOutboxAttempt(
+  requestId,
+  attemptId,
+) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  let stored;
+  try {
+    stored = await chrome.storage.local.get(null);
+  } catch (error) {
+    return {known: false, pendingCount: null, reason: 'outbox_read_failed', error};
+  }
+  let pendingCount = 0;
+  for (const [key, rawValue] of Object.entries(stored || {})) {
+    if (!key.startsWith(UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX)) {
+      continue;
+    }
+    const value =
+      rawValue && typeof rawValue === 'object' && !Array.isArray(rawValue)
+        ? rawValue
+        : null;
+    if (!value) {
+      return {known: false, pendingCount: null, reason: 'outbox_entry_invalid'};
+    }
+    const entryRequestId = String(value.requestId || '').trim();
+    const entryAttemptId = String(value.attemptId || '').trim();
+    const entryId = String(value.id || '').trim();
+    const revision = String(value.revision || '').trim();
+    const patch =
+      value.patch &&
+      typeof value.patch === 'object' &&
+      !Array.isArray(value.patch)
+        ? value.patch
+        : null;
+    if (
+      !entryRequestId ||
+      !entryAttemptId ||
+      !entryId ||
+      entryId !== `${entryRequestId}:${entryAttemptId}` ||
+      !revision ||
+      key !== `${UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX}${revision}` ||
+      !patch ||
+      !patch.checkpoint ||
+      typeof patch.checkpoint !== 'object' ||
+      Array.isArray(patch.checkpoint)
+    ) {
+      // A malformed durable row cannot be attributed away from this attempt.
+      // Treat it as unknown instead of manufacturing a zero-pending result.
+      return {known: false, pendingCount: null, reason: 'outbox_identity_unknown'};
+    }
+    if (
+      entryRequestId === normalizedRequestId &&
+      entryAttemptId === normalizedAttemptId
+    ) {
+      const deliveryStatus = String(
+        value.deliveryStatus || value.outboxStatus || '',
+      ).trim().toLowerCase();
+      const acknowledged = Boolean(
+        value.acknowledged === true ||
+        value.acked === true ||
+        value.delivered === true ||
+        value.acknowledgedAt ||
+        value.ackedAt ||
+        value.deliveredAt ||
+        ['acked', 'acknowledged', 'delivered'].includes(deliveryStatus)
+      );
+      if (!acknowledged) pendingCount += 1;
+    }
+  }
+  return {known: true, pendingCount, reason: ''};
+}
+
+function resolveUnattendedClosureItemIdentities(request = {}) {
+  const context =
+    request.orchestrationContext &&
+    typeof request.orchestrationContext === 'object' &&
+    !Array.isArray(request.orchestrationContext)
+      ? request.orchestrationContext
+      : {};
+  const attempts = Array.isArray(context.itemAttempts)
+    ? context.itemAttempts.filter((candidate) =>
+        candidate &&
+        typeof candidate === 'object' &&
+        String(candidate.itemId || '').trim() &&
+        String(candidate.attemptId || '').trim() &&
+        Number.isSafeInteger(Number(candidate.attemptNumber)) &&
+        Number(candidate.attemptNumber) > 0 &&
+        Number.isSafeInteger(Number(candidate.assignmentRevision)) &&
+        Number(candidate.assignmentRevision) >= 0,
+      )
+    : [];
+  if (attempts.length === 0) return [];
+  const identities = attempts.map(attempt => ({
+    itemId: String(attempt.itemId || '').trim(),
+    itemAttemptId: String(attempt.attemptId || '').trim(),
+    attemptNumber: Number(attempt.attemptNumber),
+    assignmentRevision: Number(attempt.assignmentRevision),
+  }));
+  const unique = new Set(
+    identities.map(identity =>
+      `${identity.itemId}:${identity.itemAttemptId}`,
+    ),
+  );
+  return unique.size === identities.length ? identities : [];
+}
+
+function inspectUnattendedBusinessUploadEvidence(request = {}) {
+  const progress =
+    request.progress &&
+    typeof request.progress === 'object' &&
+    !Array.isArray(request.progress)
+      ? request.progress
+      : {};
+  const exactCount = (value) =>
+    Number.isSafeInteger(Number(value)) && Number(value) >= 0
+      ? Number(value)
+      : null;
+  if (
+    progress.streamingSyncEvidenceKnown !== true ||
+    progress.streamingSyncDrainCompleted !== true ||
+    typeof progress.streamingSyncEnabled !== 'boolean' ||
+    typeof progress.streamingSyncBlocked !== 'boolean' ||
+    typeof progress.streamingSyncCanceled !== 'boolean'
+  ) {
+    return {known: false, reason: 'business_upload_state_unknown'};
+  }
+  if (
+    String(progress.unattendedRequestId || '').trim() !==
+      String(request.id || '').trim() ||
+    String(progress.unattendedAttemptId || '').trim() !==
+      String(request.attemptId || '').trim() ||
+    String(progress.progressScope || '').trim().toLowerCase() !== 'terminal'
+  ) {
+    return {known: false, reason: 'business_upload_attempt_mismatch'};
+  }
+  const fields = {
+    streamingSyncEnqueuedCount: exactCount(
+      progress.streamingSyncEnqueuedCount,
+    ),
+    streamingSyncProcessedCount: exactCount(
+      progress.streamingSyncProcessedCount,
+    ),
+    streamingSyncSuccessCount: exactCount(
+      progress.streamingSyncSuccessCount,
+    ),
+    streamingSyncFailedCount: exactCount(
+      progress.streamingSyncFailedCount,
+    ),
+    streamingSyncSkippedCount: exactCount(
+      progress.streamingSyncSkippedCount,
+    ),
+    streamingSyncPendingCount: exactCount(
+      progress.streamingSyncPendingCount,
+    ),
+    streamingSyncActiveCount: exactCount(
+      progress.streamingSyncActiveCount,
+    ),
+    streamingSyncRemainingCount: exactCount(
+      progress.streamingSyncRemainingCount,
+    ),
+    capturedRecordCount: exactCount(progress.capturedRecordCount),
+  };
+  if (Object.values(fields).some((value) => value === null)) {
+    return {known: false, reason: 'business_upload_counts_unknown'};
+  }
+  const requestSavedCount = exactCount(request.counts?.saved);
+  if (
+    requestSavedCount === null ||
+    requestSavedCount !== fields.capturedRecordCount
+  ) {
+    return {known: false, reason: 'business_upload_capture_count_mismatch'};
+  }
+  const enabled = progress.streamingSyncEnabled === true;
+  const completelyDrained = Boolean(
+    progress.streamingSyncBlocked === false &&
+    progress.streamingSyncCanceled === false &&
+    fields.streamingSyncPendingCount === 0 &&
+    fields.streamingSyncActiveCount === 0 &&
+    fields.streamingSyncRemainingCount === 0 &&
+    fields.streamingSyncFailedCount === 0 &&
+    fields.streamingSyncSkippedCount === 0
+  );
+  const everyCapturedRecordUploaded = enabled
+    ? fields.streamingSyncEnqueuedCount === fields.capturedRecordCount &&
+      fields.streamingSyncProcessedCount === fields.streamingSyncEnqueuedCount &&
+      fields.streamingSyncSuccessCount === fields.streamingSyncEnqueuedCount
+    : fields.capturedRecordCount === 0 &&
+      fields.streamingSyncEnqueuedCount === 0 &&
+      fields.streamingSyncProcessedCount === 0 &&
+      fields.streamingSyncSuccessCount === 0;
+  const cleared = completelyDrained && everyCapturedRecordUploaded;
+  return {
+    known: true,
+    cleared,
+    reason: cleared
+      ? 'business_uploads_cleared'
+      : 'business_uploads_not_cleared',
+    state: {
+      businessUploadEvidenceKnown: true,
+      streamingSyncDrainCompleted: true,
+      streamingSyncEnabled: enabled,
+      ...fields,
+      streamingSyncBlocked: progress.streamingSyncBlocked,
+      streamingSyncCanceled: progress.streamingSyncCanceled,
+    },
+  };
+}
+
+async function inspectUnattendedLocalClosurePredicate(
+  request,
+  {closeOwnedRunnerTabs = false} = {},
+) {
+  const normalized = normalizeUnattendedRunRequest(request);
+  if (
+    !normalized ||
+    !isTerminalUnattendedRunStatus(normalized.status) ||
+    !String(normalized.attemptId || '').trim()
+  ) {
+    return {closed: false, reason: 'request_not_terminal'};
+  }
+  const itemIdentities = resolveUnattendedClosureItemIdentities(normalized);
+  if (itemIdentities.length === 0) {
+    return {closed: false, reason: 'item_attempt_identity_unknown'};
+  }
+  const businessUploads = inspectUnattendedBusinessUploadEvidence(normalized);
+  if (!businessUploads.known || !businessUploads.cleared) {
+    return {
+      closed: false,
+      reason: businessUploads.reason || 'business_upload_state_unknown',
+      businessUploads,
+    };
+  }
+  const initialOutbox = await inspectUnattendedCheckpointOutboxAttempt(
+    normalized.id,
+    normalized.attemptId,
+  );
+  if (!initialOutbox.known) {
+    return {
+      closed: false,
+      reason: initialOutbox.reason || 'outbox_state_unknown',
+    };
+  }
+  if (initialOutbox.pendingCount !== 0) {
+    // Keep the runner alive so its module can still flush the durable row.
+    return {closed: false, reason: 'checkpoint_reports_pending'};
+  }
+  const taskId = buildUnattendedCaptureTaskId(normalized.id);
+  const runnerInspection = await runUnattendedRunnerTabLifecycle(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== normalized.id ||
+      current.attemptId !== normalized.attemptId ||
+      !isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return {ok: false, reason: 'attempt_superseded'};
+    }
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({});
+    } catch (error) {
+      return {ok: false, reason: 'runner_tab_query_failed', error};
+    }
+    const assignedRunnerTabId = Number(current.runnerTabId);
+    const isOwnedRunnerTab = (tab) =>
+      isUnattendedRunnerTabForRequest(
+        tab,
+        normalized.id,
+        normalized.attemptId,
+      ) ||
+      (
+        Number.isFinite(assignedRunnerTabId) &&
+        assignedRunnerTabId > 0 &&
+        Number(tab?.id) === assignedRunnerTabId &&
+        isLegacyUnattendedRunnerTabForRequest(tab, normalized.id)
+      );
+    let exactRunnerTabs = tabs.filter(isOwnedRunnerTab);
+    if (closeOwnedRunnerTabs && exactRunnerTabs.length > 0) {
+      try {
+        for (const tab of exactRunnerTabs) {
+          const tabId = Number(tab?.id);
+          if (!Number.isFinite(tabId) || tabId <= 0) continue;
+          const latestRequest = await readUnattendedKeywordRunRequest();
+          if (
+            !latestRequest ||
+            latestRequest.id !== normalized.id ||
+            latestRequest.attemptId !== normalized.attemptId ||
+            !isTerminalUnattendedRunStatus(latestRequest.status)
+          ) {
+            return {ok: false, reason: 'attempt_superseded'};
+          }
+          let liveTab;
+          try {
+            liveTab = await chrome.tabs.get(tabId);
+          } catch (error) {
+            if (
+              /no tab with id|not found|does not exist|invalid tab id/iu.test(
+                String(error?.message || error || ''),
+              )
+            ) {
+              continue;
+            }
+            throw error;
+          }
+          if (!isOwnedRunnerTab(liveTab)) {
+            continue;
+          }
+          await chrome.tabs.remove(tabId);
+        }
+        const remainingTabs = await chrome.tabs.query({});
+        exactRunnerTabs = remainingTabs.filter(isOwnedRunnerTab);
+      } catch (error) {
+        return {ok: false, reason: 'runner_tab_close_unconfirmed', error};
+      }
+    }
+    return {ok: true, runnerTabs: exactRunnerTabs};
+  });
+  if (!runnerInspection.ok) {
+    return {
+      closed: false,
+      reason: runnerInspection.reason,
+      ...(runnerInspection.error ? {error: runnerInspection.error} : {}),
+    };
+  }
+  const runnerTabs = runnerInspection.runnerTabs;
+
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.captureExecutionLock,
+    STORAGE_KEYS.runtime,
+  ]).catch((error) => ({__readError: error}));
+  if (stored.__readError) {
+    return {closed: false, reason: 'runtime_state_unknown', error: stored.__readError};
+  }
+  const rawLock = stored[STORAGE_KEYS.captureExecutionLock];
+  const runtime =
+    stored[STORAGE_KEYS.runtime] &&
+    typeof stored[STORAGE_KEYS.runtime] === 'object'
+      ? stored[STORAGE_KEYS.runtime]
+      : {};
+  const debugSession = captureDebugSessionManager?.getSessionByTaskId(taskId);
+  const taskGroup = captureTaskTabGroupManager?.getTask(taskId);
+  const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(taskId);
+  const owner = captureTaskOwnerCoordinator?.getOwner(taskId);
+  const runtimeDebugTaskId = String(
+    runtime.captureDebugSession?.taskId || '',
+  ).trim();
+  const runtimeDebugPresent = Boolean(runtimeDebugTaskId === taskId);
+  // Re-read after every task-owned document has disappeared. At this point no
+  // exact-attempt writer remains; a late durable row blocks proof rather than
+  // being silently ignored.
+  const outbox = await inspectUnattendedCheckpointOutboxAttempt(
+    normalized.id,
+    normalized.attemptId,
+  );
+  if (!outbox.known) {
+    return {closed: false, reason: outbox.reason || 'outbox_state_unknown'};
+  }
+
+  const groupSourceTabId = resolveCaptureTaskTabId(taskGroup?.sourceTabId);
+  const groupWorkerTabIds = Array.isArray(taskGroup?.workerTabIds)
+    ? taskGroup.workerTabIds.map(resolveCaptureTaskTabId).filter(Boolean)
+    : [];
+  const detailTaskTabIds = new Set([
+    ...pendingWorkerTabIds.map(resolveCaptureTaskTabId).filter(Boolean),
+    ...groupWorkerTabIds,
+  ]);
+  const platformTaskTabCount = groupSourceTabId ? 1 : 0;
+  const runnerTabCount = runnerTabs.length;
+  const ownedTaskTabCount = new Set([
+    ...runnerTabs.map((tab) => resolveCaptureTaskTabId(tab?.id)).filter(Boolean),
+    ...(groupSourceTabId ? [groupSourceTabId] : []),
+    ...detailTaskTabIds,
+  ]).size;
+  const state = {
+    terminalLedgerConfirmed: true,
+    runnerTabCount,
+    platformTaskTabCount,
+    detailTaskTabCount: detailTaskTabIds.size,
+    ownedTaskTabCount,
+    executionLockPresent: Boolean(rawLock),
+    debugSessionPresent: Boolean(debugSession || runtimeDebugPresent),
+    taskSessionPresent: Boolean(
+      taskGroup ||
+      captureTaskCleanupInProgress.has(taskId),
+    ),
+    taskOwnerPresent: Boolean(owner?.connected || owner?.abandoning),
+    pendingCheckpointReportCount: outbox.pendingCount,
+    ...businessUploads.state,
+  };
+  const closed = Boolean(
+    state.runnerTabCount === 0 &&
+    state.platformTaskTabCount === 0 &&
+    state.detailTaskTabCount === 0 &&
+    state.ownedTaskTabCount === 0 &&
+    state.executionLockPresent === false &&
+    state.debugSessionPresent === false &&
+    state.taskSessionPresent === false &&
+    state.taskOwnerPresent === false &&
+    state.pendingCheckpointReportCount === 0 &&
+    state.businessUploadEvidenceKnown === true &&
+    state.streamingSyncDrainCompleted === true &&
+    state.streamingSyncPendingCount === 0 &&
+    state.streamingSyncActiveCount === 0 &&
+    state.streamingSyncRemainingCount === 0 &&
+    state.streamingSyncFailedCount === 0 &&
+    state.streamingSyncSkippedCount === 0 &&
+    state.streamingSyncBlocked === false &&
+    state.streamingSyncCanceled === false
+  );
+  return {
+    closed,
+    reason: closed ? 'local_runtime_closed' : 'local_runtime_still_owned',
+    request: normalized,
+    taskId,
+    itemIdentities,
+    state,
+  };
+}
+
+async function persistUnattendedLocalClosureEvidence(predicate) {
+  if (
+    !predicate?.closed ||
+    !predicate.request ||
+    !Array.isArray(predicate.itemIdentities) ||
+    predicate.itemIdentities.length === 0
+  ) {
+    return {persisted: false, reason: predicate?.reason || 'predicate_not_closed'};
+  }
+  const expectedRequestId = String(predicate.request.id || '').trim();
+  const expectedAttemptId = String(predicate.request.attemptId || '').trim();
+  const persist = () => runUnattendedRunMutation(async () =>
+    runTaskLedgerMutation(async () => {
+      const stored = await chrome.storage.local.get([
+        STORAGE_KEYS.unattendedKeywordRunRequest,
+        STORAGE_KEYS.taskLedger,
+      ]);
+      const current = normalizeUnattendedRunRequest(
+        stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+      );
+      if (
+        !current ||
+        current.id !== expectedRequestId ||
+        current.attemptId !== expectedAttemptId ||
+        !isTerminalUnattendedRunStatus(current.status)
+      ) {
+        return {persisted: false, reason: 'attempt_superseded'};
+      }
+      const currentItemIdentities =
+        resolveUnattendedClosureItemIdentities(current);
+      const expectedItemIdentityKeys = predicate.itemIdentities.map(identity =>
+        `${identity.itemId}:${identity.itemAttemptId}:` +
+          `${identity.attemptNumber}:${identity.assignmentRevision}`,
+      );
+      const currentItemIdentityKeys = currentItemIdentities.map(identity =>
+        `${identity.itemId}:${identity.itemAttemptId}:` +
+          `${identity.attemptNumber}:${identity.assignmentRevision}`,
+      );
+      if (
+        currentItemIdentityKeys.length !== expectedItemIdentityKeys.length ||
+        currentItemIdentityKeys.some(
+          (identity, index) => identity !== expectedItemIdentityKeys[index],
+        )
+      ) {
+        return {persisted: false, reason: 'item_attempt_identity_changed'};
+      }
+      const core = getUnattendedTaskCenterCore();
+      const now = new Date().toISOString();
+      const ledger = core?.normalizeTaskLedger
+        ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
+        : stored[STORAGE_KEYS.taskLedger];
+      const runs = Array.isArray(ledger?.runs) ? [...ledger.runs] : [];
+      const runIndex = runs.findIndex((run) =>
+        String(run?.id || '').trim() === expectedRequestId,
+      );
+      const run = runIndex >= 0 ? runs[runIndex] : null;
+      if (
+        !run ||
+        String(run.attemptId || '').trim() !== expectedAttemptId ||
+        !isTerminalUnattendedRunStatus(run.status)
+      ) {
+        return {persisted: false, reason: 'terminal_ledger_mismatch'};
+      }
+      const existingClosures = Array.isArray(run.metadata?.localClosures)
+        ? run.metadata.localClosures
+        : run.metadata?.localClosure
+          ? [run.metadata.localClosure]
+          : [];
+      const existingClosureKeys = new Set(
+        existingClosures
+          .filter(existing =>
+            existing?.version === UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION &&
+            String(existing.requestId || '').trim() === expectedRequestId &&
+            String(existing.attemptId || '').trim() === expectedAttemptId,
+          )
+          .map(existing =>
+            `${String(existing.itemId || '').trim()}:` +
+              `${String(existing.itemAttemptId || '').trim()}:` +
+              `${Number(existing.attemptNumber)}:` +
+              Number(existing.assignmentRevision),
+          ),
+      );
+      if (
+        predicate.itemIdentities.every(identity => existingClosureKeys.has(
+          `${identity.itemId}:${identity.itemAttemptId}:` +
+            `${identity.attemptNumber}:${identity.assignmentRevision}`,
+        ))
+      ) {
+        return {
+          persisted: false,
+          reason: 'already_persisted',
+          evidence: existingClosures[0] || null,
+          evidences: existingClosures,
+        };
+      }
+      const snapshotRevision = Math.max(
+        Math.max(0, Number(current.progressSeq) || 0),
+        Math.max(0, Number(run.progressSeq) || 0),
+      ) + 1;
+      const evidences = Object.freeze(predicate.itemIdentities.map(identity =>
+        Object.freeze({
+          version: UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION,
+          requestId: expectedRequestId,
+          attemptId: expectedAttemptId,
+          itemId: identity.itemId,
+          itemAttemptId: identity.itemAttemptId,
+          // The server fences safety handoff to each business item attempt,
+          // which may differ from this browser task's local retry counter.
+          attemptNumber: identity.attemptNumber,
+          assignmentRevision: identity.assignmentRevision,
+          snapshotRevision,
+          terminalStatus: String(current.status || '').trim().toLowerCase(),
+          terminalUpdatedAt: String(
+            current.updatedAt || current.finishedAt || '',
+          ),
+          closedAt: now,
+          ...predicate.state,
+        }),
+      ));
+      const evidence = evidences[0];
+      const nextRequest = {
+        ...current,
+        localClosureEvidence: evidence,
+        localClosureEvidences: evidences,
+        progressSeq: snapshotRevision,
+        heartbeatAt: now,
+        updatedAt: now,
+      };
+      runs[runIndex] = {
+        ...run,
+        progressSeq: snapshotRevision,
+        heartbeatAt: now,
+        updatedAt: now,
+        metadata: {
+          ...(run.metadata && typeof run.metadata === 'object'
+            ? run.metadata
+            : {}),
+          localClosure: evidence,
+          localClosures: evidences,
+        },
+      };
+      const nextLedger = {
+        ...(ledger && typeof ledger === 'object' ? ledger : {}),
+        runs,
+        updatedAt: now,
+      };
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
+        [STORAGE_KEYS.taskLedger]: nextLedger,
+      });
+      return {
+        persisted: true,
+        reason: 'local_closure_persisted',
+        evidence,
+        evidences,
+      };
+    }),
+  );
+  return await runAuthoritativeControlStorageMutation(persist);
+}
+
+async function reconcileUnattendedLocalClosureEvidence({
+  expectedRequestId = '',
+  expectedAttemptId = '',
+  closeOwnedRunnerTabs = true,
+} = {}) {
+  const request = await readUnattendedKeywordRunRequest();
+  if (
+    !request ||
+    (expectedRequestId && request.id !== String(expectedRequestId)) ||
+    (expectedAttemptId && request.attemptId !== String(expectedAttemptId))
+  ) {
+    return {persisted: false, reason: 'attempt_superseded'};
+  }
+  const predicate = await inspectUnattendedLocalClosurePredicate(request, {
+    closeOwnedRunnerTabs,
+  });
+  if (!predicate.closed) {
+    return {persisted: false, reason: predicate.reason, predicate};
+  }
+  return await persistUnattendedLocalClosureEvidence(predicate);
 }
 
 async function snapshotUnattendedKeywordPlanLock() {
@@ -4680,7 +5470,7 @@ async function cancelAndReleaseUnattendedExecutionTargets(
     lockSnapshot?.holderTabId,
   ]);
   if (lockSnapshot?.id) {
-    await releaseCaptureExecutionLock(lockSnapshot.id).catch(() => false);
+    await releaseCaptureExecutionLock(lockSnapshot.id);
   }
   return relayedCount;
 }
@@ -4733,15 +5523,41 @@ async function cancelUnattendedKeywordRunFromControl({
     const relayedCount = terminalCleanup.relayedCount;
     if (isRetryableUnattendedRunRequest(reconciledTerminalRequest)) {
       const now = new Date().toISOString();
-      const dismissedRequest = {
-        ...reconciledTerminalRequest,
-        recoveryDismissedAt: now,
-        recoveryDismissedMessage: message,
-        updatedAt: now,
-      };
-      await chrome.storage.local.set({
-        [STORAGE_KEYS.unattendedKeywordRunRequest]: dismissedRequest,
+      const expectedAttemptId = String(
+        reconciledTerminalRequest.attemptId || '',
+      ).trim();
+      const persistDismissal = () => runUnattendedRunMutation(async () => {
+        const current = await readUnattendedKeywordRunRequest();
+        if (
+          !current ||
+          current.id !== reconciledTerminalRequest.id ||
+          current.attemptId !== expectedAttemptId ||
+          !isRetryableUnattendedRunRequest(current)
+        ) {
+          return null;
+        }
+        const dismissed = {
+          ...current,
+          recoveryDismissedAt: now,
+          recoveryDismissedMessage: message,
+          updatedAt: now,
+        };
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.unattendedKeywordRunRequest]: dismissed,
+        });
+        return dismissed;
       });
+      const dismissedRequest =
+        await runAuthoritativeControlStorageMutation(persistDismissal);
+      if (!dismissedRequest) {
+        return {
+          accepted: false,
+          reason: 'attempt_mismatch',
+          request: await readUnattendedKeywordRunRequest(),
+          plan: await readUnattendedKeywordPlan(),
+          relayedCount,
+        };
+      }
       await removeArchivedUnattendedKeywordRunRequest(request.id);
       scheduleCloudTaskAgentSync('unattended_recovery_dismissed');
       return {
@@ -5315,7 +6131,7 @@ async function releaseCaptureExecutionLock(
   lockId = '',
   {holderId = '', holderDocumentId = '', requireHolder = false} = {},
 ) {
-  return await runCaptureExecutionLockOperation(async () => {
+  const release = () => runCaptureExecutionLockOperation(async () => {
     if (!lockId) {
       return false;
     }
@@ -5350,6 +6166,7 @@ async function releaseCaptureExecutionLock(
     await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
     return true;
   });
+  return await runAuthoritativeControlStorageMutation(release);
 }
 
 async function syncUnattendedKeywordAlarm(plan) {
@@ -5367,9 +6184,20 @@ async function syncUnattendedKeywordAlarm(plan) {
   await chrome.alarms.create(UNATTENDED_KEYWORD_ALARM_NAME, { when });
 }
 
-function buildUnattendedRunnerUrl(requestId) {
+function buildUnattendedRunnerUrl(requestId, attemptId) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  if (!normalizedRequestId || !normalizedAttemptId) {
+    const error = new Error('无人值守运行页缺少任务执行轮次');
+    error.code = 'UNATTENDED_ATTEMPT_REQUIRED';
+    throw error;
+  }
   const url = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
-  url.searchParams.set(UNATTENDED_RUNNER_QUERY_KEY, requestId);
+  url.searchParams.set(UNATTENDED_RUNNER_QUERY_KEY, normalizedRequestId);
+  url.searchParams.set(
+    UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY,
+    normalizedAttemptId,
+  );
   return url.toString();
 }
 
@@ -5463,37 +6291,37 @@ async function openTargetedPostRunnerTab(
   });
 }
 
-async function openUnattendedRunnerTab(requestId, { windowId = null } = {}) {
-  const runnerUrl = buildUnattendedRunnerUrl(requestId);
-  const sidebarUrl = chrome.runtime.getURL(SIDEBAR_PAGE_PATH);
-  const allTabs = await chrome.tabs.query({});
-  const existingRunner = allTabs.find((tab) => {
-    const currentUrl = String(tab?.url || '');
-    return (
-      currentUrl.startsWith(`${sidebarUrl}?`) &&
-      currentUrl.includes(`${UNATTENDED_RUNNER_QUERY_KEY}=`)
+async function openUnattendedRunnerTab(
+  requestId,
+  {windowId = null, attemptId = ''} = {},
+) {
+  return await runUnattendedRunnerTabLifecycle(async () => {
+    const runnerUrl = buildUnattendedRunnerUrl(requestId, attemptId);
+    const allTabs = await chrome.tabs.query({});
+    const existingRunner = allTabs.find((tab) =>
+      isUnattendedRunnerTabForRequest(tab, requestId, attemptId),
     );
-  });
 
-  if (existingRunner?.id) {
-    return await chrome.tabs.update(existingRunner.id, {
+    if (existingRunner?.id) {
+      return await chrome.tabs.update(existingRunner.id, {
+        url: runnerUrl,
+        active: true,
+        autoDiscardable: false,
+      });
+    }
+
+    const createOptions = {
       url: runnerUrl,
       active: true,
+    };
+    const concreteWindowId = normalizeConcreteWindowId(windowId);
+    const createdRunner = await createRunnerTab(createOptions, concreteWindowId);
+    if (!createdRunner?.id) {
+      return createdRunner;
+    }
+    return await chrome.tabs.update(createdRunner.id, {
       autoDiscardable: false,
     });
-  }
-
-  const createOptions = {
-    url: runnerUrl,
-    active: true,
-  };
-  const concreteWindowId = normalizeConcreteWindowId(windowId);
-  const createdRunner = await createRunnerTab(createOptions, concreteWindowId);
-  if (!createdRunner?.id) {
-    return createdRunner;
-  }
-  return await chrome.tabs.update(createdRunner.id, {
-    autoDiscardable: false,
   });
 }
 
@@ -5611,6 +6439,8 @@ async function bindUnattendedRunnerTab(request, runnerTabId) {
 
 async function claimUnattendedKeywordRun({
   requestId = '',
+  attemptId = '',
+  requireAttempt = false,
   senderTabId = null,
   senderDocumentId = '',
   holderId = '',
@@ -5619,6 +6449,13 @@ async function claimUnattendedKeywordRun({
     const request = await readUnattendedKeywordRunRequest();
     if (!request || (requestId && request.id !== requestId)) {
       return {accepted: false, reason: 'not_found', data: null};
+    }
+    const normalizedAttemptId = String(attemptId || '').trim();
+    if (requireAttempt && !normalizedAttemptId) {
+      return {accepted: false, reason: 'runner_attempt_required', data: null};
+    }
+    if (normalizedAttemptId && request.attemptId !== normalizedAttemptId) {
+      return {accepted: false, reason: 'attempt_superseded', data: null};
     }
     if (isTerminalUnattendedRunStatus(request.status)) {
       return {accepted: false, reason: 'terminal', data: null};
@@ -6087,6 +6924,7 @@ async function launchUnattendedKeywordRun(
     const platformTab = await activateOrCreatePlatformTab(normalizedPlan.platform);
     const runnerTab = await openUnattendedRunnerTab(request.id, {
       windowId: platformTab?.windowId,
+      attemptId: request.attemptId,
     });
     await bindUnattendedRunnerTab(request, runnerTab?.id);
   } catch (error) {
@@ -6538,6 +7376,7 @@ async function launchPendingUnattendedRecovery(request) {
     const platformTab = await activateOrCreatePlatformTab(plan.platform);
     const runnerTab = await openUnattendedRunnerTab(pendingRequest.id, {
       windowId: platformTab?.windowId,
+      attemptId: pendingRequest.attemptId,
     });
     const boundRequest = await bindUnattendedRunnerTab(
       pendingRequest,
@@ -6614,6 +7453,12 @@ async function launchPendingUnattendedRecovery(request) {
           retryable: returnToCloud || !exhausted,
           requiresManualAction: exhausted && !returnToCloud,
           category: 'temporary_runtime_recovery',
+          ...(exhausted
+            ? {
+                fastRetryExhausted: true,
+                failureOrigin: 'extension_runtime',
+              }
+            : {}),
         },
       };
       await persistUnattendedRunMutation(nextRequest, {
@@ -6734,6 +7579,8 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
           retryable: cloudAssigned,
           requiresManualAction: !cloudAssigned,
           category: 'temporary_runtime_recovery',
+          fastRetryExhausted: true,
+          failureOrigin: 'extension_runtime',
         },
       };
       await persistUnattendedRunMutation(nextRequest, {
@@ -6829,7 +7676,7 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
     );
   }
   if (oldUnattendedLock?.id) {
-    await releaseCaptureExecutionLock(oldUnattendedLock.id).catch(() => false);
+    await releaseCaptureExecutionLock(oldUnattendedLock.id);
   }
   if (transition.action === 'terminal') {
     return {recovered: false, terminal: true, request: transition.request};
@@ -10077,7 +10924,7 @@ async function clearUnattendedCaptureTaskLockBinding(
   const normalizedLockId = String(lockId || '').trim();
   const normalizedTaskId = String(taskId || '').trim();
   if (!normalizedLockId || !normalizedTaskId) return false;
-  return await runCaptureExecutionLockOperation(async () => {
+  const clearBinding = () => runCaptureExecutionLockOperation(async () => {
     const stored = await chrome.storage.local.get(
       STORAGE_KEYS.captureExecutionLock,
     );
@@ -10111,6 +10958,7 @@ async function clearUnattendedCaptureTaskLockBinding(
     });
     return true;
   });
+  return await runAuthoritativeControlStorageMutation(clearBinding);
 }
 
 async function releaseUnattendedCaptureTaskResourcesForRecovery(
@@ -11291,6 +12139,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           };
         });
         let cloudReport = null;
+        let runnerCleanup = null;
         if (
           result.ok &&
           cloudTargetedPostApi.isTerminalRunStatus(result.data?.status)
@@ -11299,10 +12148,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // 可能在计时器执行前休眠。直接等待指令回执，确保云端工作项、
           // 父任务和帖子可用性在同一次消息生命周期内完成结算。
           cloudReport = await reportTargetedPostTerminalToCloud(result.data);
+          // 运行页只能在终态 request 与任务账本已经原子落盘、终态报告
+          // 已完成本地记账/云端尝试之后关闭。needs_action 必须保留现场，
+          // 且清理始终按 requestId + attemptId 精确匹配任务自有 shell。
+          runnerCleanup = await closeTerminalTargetedPostRunnerTabs(
+            result.data,
+          );
         }
         sendResponse({
           ...result,
           cloudReported: cloudReport?.ok === true,
+          runnerClosed: Number(runnerCleanup?.removedCount) > 0,
         });
         return;
       }
@@ -11319,6 +12175,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const requestId = String(message?.requestId || '').trim();
         const result = await claimUnattendedKeywordRun({
           requestId,
+          attemptId: String(message?.attemptId || '').trim(),
+          requireAttempt: Boolean(requestId),
           senderTabId: sender?.tab?.id,
           senderDocumentId: sender?.documentId,
           holderId: String(message?.holderId || ''),
@@ -11344,6 +12202,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           data: result.data,
           accepted: result.accepted,
           reason: result.reason,
+        });
+        return;
+      }
+
+      if (type === 'onstarvoice:finalize-unattended-local-closure') {
+        const result = await reconcileUnattendedLocalClosureEvidence({
+          expectedRequestId: String(message?.requestId || '').trim(),
+          expectedAttemptId: String(message?.attemptId || '').trim(),
+          closeOwnedRunnerTabs: true,
+        });
+        if (result?.persisted === true) {
+          scheduleCloudTaskAgentSync('unattended_local_closure_persisted', 0);
+        }
+        sendResponse({
+          ok: result?.persisted === true || result?.reason === 'already_persisted',
+          accepted:
+            result?.persisted === true || result?.reason === 'already_persisted',
+          reason: result?.reason || 'local_closure_unavailable',
+          data: result?.evidence || null,
         });
         return;
       }

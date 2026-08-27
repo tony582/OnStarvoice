@@ -4,6 +4,8 @@
  * 禁止业务层直接操作 chrome.storage
  */
 
+import "./control-storage-reserve.js";
+
 import {
   STORAGE_KEY,
   AUTH_STATUS,
@@ -18,6 +20,105 @@ import {
   normalizeStoredRecord,
   serializeRecordEnvelope,
 } from "./platform/record-envelope.js";
+
+const controlStorageReserveApi =
+  globalThis.OnStarvoiceControlStorageReserve;
+if (!controlStorageReserveApi) {
+  throw new Error("Control storage reserve helper is unavailable");
+}
+
+export const CONTROL_STORAGE_RESERVE_KEY =
+  controlStorageReserveApi.CONTROL_STORAGE_RESERVE_KEY;
+export const CONTROL_STORAGE_RESERVE_BYTES =
+  controlStorageReserveApi.CONTROL_STORAGE_RESERVE_BYTES;
+export const SYNCED_RECORD_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function isStorageQuotaError(error) {
+  return controlStorageReserveApi.isStorageQuotaError(error);
+}
+
+async function writeStorageEntry(key, value) {
+  try {
+    await chrome.storage.local.set({[key]: value});
+    return {ok: true, error: null};
+  } catch (error) {
+    console.error(`[Storage] Failed to set ${key}:`, error);
+    return {ok: false, error};
+  }
+}
+
+export async function releaseControlStorageReserve(options = {}) {
+  try {
+    return await controlStorageReserveApi.releaseControlStorageReserve(
+      options,
+    );
+  } catch (error) {
+    console.warn("[Storage] Failed to release control reserve:", error);
+    return false;
+  }
+}
+
+export async function ensureControlStorageReserve(options = {}) {
+  try {
+    return await controlStorageReserveApi.ensureControlStorageReserve(
+      options,
+    );
+  } catch (error) {
+    console.warn("[Storage] Failed to establish control reserve:", error);
+    return false;
+  }
+}
+
+export async function runWithControlStorageReserveRetry(
+  operation,
+  options = {},
+) {
+  return await controlStorageReserveApi.runWithControlStorageReserveRetry(
+    operation,
+    options,
+  );
+}
+
+export function scheduleControlStorageReserveRestore(options = {}) {
+  return controlStorageReserveApi.scheduleControlStorageReserveRestore(
+    options,
+  );
+}
+
+export async function getStoragePressureSnapshot() {
+  const canMeasureBytes =
+    typeof chrome.storage.local.getBytesInUse === "function";
+  let bytesUsed = null;
+  if (canMeasureBytes) {
+    try {
+      bytesUsed = Math.max(
+        0,
+        Number(await chrome.storage.local.getBytesInUse(null)) || 0,
+      );
+    } catch (error) {
+      console.warn("[Storage] Failed to measure storage pressure:", error);
+    }
+  }
+  const quotaBytes = Math.max(
+    0,
+    Number(chrome.storage.local.QUOTA_BYTES) || 10 * 1024 * 1024,
+  );
+  const utilization =
+    bytesUsed !== null && quotaBytes > 0 ? bytesUsed / quotaBytes : null;
+  const remainingBytes =
+    bytesUsed !== null ? Math.max(0, quotaBytes - bytesUsed) : null;
+  const pressure =
+    utilization === null
+      ? "unknown"
+      : utilization >= 0.95 || remainingBytes < 512 * 1024
+        ? "red"
+        : utilization >= 0.85 || remainingBytes < 1.5 * 1024 * 1024
+          ? "orange"
+          : utilization >= 0.7
+            ? "yellow"
+            : "green";
+  return {bytesUsed, quotaBytes, remainingBytes, utilization, pressure};
+}
 
 // ==================== 辅助函数 ====================
 
@@ -38,13 +139,7 @@ async function getItem(key) {
  * 通用写入函数
  */
 async function setItem(key, value) {
-  try {
-    await chrome.storage.local.set({[key]: value});
-    return true;
-  } catch (error) {
-    console.error(`[Storage] Failed to set ${key}:`, error);
-    return false;
-  }
+  return (await writeStorageEntry(key, value)).ok;
 }
 
 let dataPoolMutationQueue = Promise.resolve();
@@ -544,13 +639,112 @@ export async function getDataPool() {
  * 设置数据池
  */
 export async function setDataPool(dataPool) {
-  return await setItem(STORAGE_KEY.DATA_POOL, {
+  const serializedPool = {
     ...dataPool,
     records: Array.isArray(dataPool?.records)
       ? dataPool.records.map((record) => serializeRecordEnvelope(record))
       : [],
     lastUpdatedAt: Date.now(),
+  };
+  const firstWrite = await writeStorageEntry(
+    STORAGE_KEY.DATA_POOL,
+    serializedPool,
+  );
+  if (firstWrite.ok) {
+    scheduleControlStorageReserveRestore();
+    return true;
+  }
+  if (!isStorageQuotaError(firstWrite.error)) return false;
+
+  // 配额已满时先释放专门预留的控制状态空间。这样即使数据池无法继续写，
+  // 停止、锁释放、终态确认和任务页清场仍有落盘余量。
+  await releaseControlStorageReserve();
+  const compacted = compactDataPoolForQuota(dataPool);
+  if (compacted.removedCount === 0) {
+    return false;
+  }
+  const compactedSerializedPool = {
+    ...compacted.dataPool,
+    records: compacted.dataPool.records.map((record) =>
+      serializeRecordEnvelope(record),
+    ),
+    lastUpdatedAt: Date.now(),
+  };
+  const retryWrite = await writeStorageEntry(
+    STORAGE_KEY.DATA_POOL,
+    compactedSerializedPool,
+  );
+  if (!retryWrite.ok) return false;
+  scheduleControlStorageReserveRestore();
+  return true;
+}
+
+export function compactDataPoolForQuota(
+  dataPool,
+  {
+    now = Date.now(),
+    retentionMs = SYNCED_RECORD_RETENTION_MS,
+  } = {},
+) {
+  const source =
+    dataPool && typeof dataPool === "object" && !Array.isArray(dataPool)
+      ? dataPool
+      : {};
+  const records = Array.isArray(source.records) ? source.records : [];
+  const cutoff = Math.max(0, Number(now) || Date.now()) -
+    Math.max(0, Number(retentionMs) || SYNCED_RECORD_RETENTION_MS);
+  const activeStatuses = new Set([
+    "pending",
+    "running",
+    "capturing",
+    "syncing",
+  ]);
+  const keptRecords = records.filter((record) => {
+    const status = String(record?.status || "").trim().toLowerCase();
+    const numericLastSyncedAt = Number(record?.lastSyncedAt);
+    const parsedLastSyncedAt = Date.parse(String(record?.lastSyncedAt || ""));
+    const lastSyncedAt = Number.isFinite(numericLastSyncedAt) &&
+      numericLastSyncedAt > 0
+      ? numericLastSyncedAt
+      : parsedLastSyncedAt;
+    const payload =
+      record?.payload && typeof record.payload === "object"
+        ? record.payload
+        : record?.normalizedPayload &&
+            typeof record.normalizedPayload === "object"
+          ? record.normalizedPayload
+          : {};
+    const activeTrace = Boolean(
+      activeStatuses.has(
+        String(record?.detailCapture?.status || "").trim().toLowerCase(),
+      ) ||
+      activeStatuses.has(
+        String(record?.commentCapture?.status || "").trim().toLowerCase(),
+      ) ||
+      activeStatuses.has(
+        String(payload.detailCaptureStatus || "").trim().toLowerCase(),
+      ) ||
+      activeStatuses.has(
+        String(payload.commentsCaptureStatus || "").trim().toLowerCase(),
+      )
+    );
+    const safeToCompact =
+      status === RECORD_STATUS.SYNCED &&
+      Number.isFinite(lastSyncedAt) &&
+      lastSyncedAt > 0 &&
+      lastSyncedAt < cutoff &&
+      !activeTrace;
+    return !safeToCompact;
   });
+  return {
+    dataPool: {
+      ...source,
+      records: keptRecords,
+      lastCompactedAt: Math.max(0, Number(now) || Date.now()),
+      lastCompactedReason: "quota_pressure",
+    },
+    removedCount: records.length - keptRecords.length,
+  };
 }
 
 /**
@@ -786,7 +980,10 @@ export async function updateRecord(recordId, updates) {
     };
     dataPool.records[index] = normalizeStoredRecord(dataPool.records[index]);
 
-    await setDataPool(dataPool);
+    const saved = await setDataPool(dataPool);
+    if (!saved) {
+      throw new Error("本地缓存更新失败，请检查扩展存储空间或稍后重试");
+    }
     return true;
   });
 }
@@ -798,7 +995,10 @@ export async function deleteRecord(recordId) {
   return await runDataPoolMutation(async () => {
     const dataPool = await getDataPool();
     dataPool.records = dataPool.records.filter((r) => r.id !== recordId);
-    await setDataPool(dataPool);
+    const saved = await setDataPool(dataPool);
+    if (!saved) {
+      throw new Error("本地缓存删除失败，请检查扩展存储空间或稍后重试");
+    }
     return true;
   });
 }
@@ -811,7 +1011,10 @@ export async function deleteRecords(recordIds) {
     const dataPool = await getDataPool();
     const idsSet = new Set(recordIds);
     dataPool.records = dataPool.records.filter((r) => !idsSet.has(r.id));
-    await setDataPool(dataPool);
+    const saved = await setDataPool(dataPool);
+    if (!saved) {
+      throw new Error("本地缓存批量删除失败，请检查扩展存储空间或稍后重试");
+    }
     return true;
   });
 }
@@ -823,7 +1026,10 @@ export async function clearAllRecords() {
   return await runDataPoolMutation(async () => {
     const dataPool = await getDataPool();
     dataPool.records = [];
-    await setDataPool(dataPool);
+    const saved = await setDataPool(dataPool);
+    if (!saved) {
+      throw new Error("本地缓存清空失败，请检查扩展存储空间或稍后重试");
+    }
     return true;
   });
 }
@@ -837,7 +1043,10 @@ export async function clearSyncedRecords() {
     dataPool.records = dataPool.records.filter(
       (r) => r.status !== RECORD_STATUS.SYNCED,
     );
-    await setDataPool(dataPool);
+    const saved = await setDataPool(dataPool);
+    if (!saved) {
+      throw new Error("已同步缓存清理失败，请检查扩展存储空间或稍后重试");
+    }
     return true;
   });
 }

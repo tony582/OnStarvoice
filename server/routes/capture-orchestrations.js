@@ -12,7 +12,11 @@ import {
   lockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   normalizeRemoteTaskInput,
+  tryLockCaptureAgentExecutionSlot,
 } from '../services/capture-cloud.js';
+import {
+  crossDeviceRetryAgentDailyUsageEligible,
+} from './capture-cloud.js';
 import {
   aggregateParentTaskItems,
   allocateKeywordWorkItems,
@@ -43,6 +47,21 @@ const HANDOFF_PLATFORM_SAFETY_CODES = new Set([
   'CAPTCHA_PAGE_DETECTED',
 ]);
 const RETRY_ITEM_STATUSES = new Set(['retryable', 'needs_action', 'failed']);
+const RETRY_AGENT_SLOT_BLOCKING_STATUSES = [
+  'pending',
+  'waiting_device',
+  'claimed',
+  'running',
+  'recovering',
+  'resume_requested',
+];
+const RETRY_PENDING_PARENT_BLOCKED_STATUSES = [
+  'completed',
+  'completed_with_warnings',
+  'canceled',
+  'skipped',
+  'superseded',
+];
 const ORCHESTRATION_STOPPABLE_STATUSES = new Set([
   'pending',
   'assigned',
@@ -277,6 +296,7 @@ async function appendEvent(tx, {
   taskId,
   agentId = null,
   eventType,
+  actorType = 'user',
   actorId = '',
   actorName = '',
   status = '',
@@ -287,12 +307,13 @@ async function appendEvent(tx, {
     INSERT INTO capture_task_events (
       tenant_id, task_id, agent_id, event_type,
       actor_type, actor_id, actor_name, status, message, payload
-    ) VALUES ($1, $2, $3, $4, 'user', $5, $6, $7, $8, $9::jsonb)
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
   `, [
     tenantId,
     taskId,
     agentId,
     eventType,
+    actorType === 'system' ? 'system' : 'user',
     text(actorId, 240),
     text(actorName, 240),
     text(status, 80),
@@ -466,6 +487,162 @@ async function loadCompatibleAgents(
   return {
     agents: agentIds.map(agentId => byId.get(agentId)),
     agentsById: byId,
+  };
+}
+
+async function loadRetryAgentCandidates(
+  executor,
+  {tenantId, platform, agentIds = [], lock = false},
+) {
+  const restrictAgentIds = Array.isArray(agentIds) && agentIds.length > 0;
+  return executor.queryAll(`
+    SELECT ca.*,
+      tenant.status AS tenant_status,
+      ac.status AS auth_code_status,
+      ac.expires_at AS auth_code_expires_at,
+      ab.id AS active_auth_binding_id,
+      daily_usage.usage_date =
+        (now() AT TIME ZONE 'Asia/Shanghai')::date AS today_usage_current,
+      daily_usage.searches AS today_searches,
+      daily_usage.failed_events AS today_failed_events,
+      daily_usage.safety_verifications AS today_safety_verifications,
+      daily_usage.last_event_at AS today_usage_last_event_at,
+      current_social_account.daily_search_limit,
+      current_social_account.health_status AS account_health_status,
+      current_social_binding.last_login_state,
+      (
+        SELECT COUNT(*)::integer
+        FROM capture_tasks recent_failure
+        WHERE recent_failure.tenant_id = ca.tenant_id
+          AND COALESCE(
+            recent_failure.assigned_agent_id,
+            recent_failure.origin_agent_id
+          ) = ca.id
+          AND recent_failure.created_at > now() - interval '2 hours'
+          AND recent_failure.status IN ('failed', 'completed_with_failures')
+          AND NOT (
+            COALESCE(recent_failure.error::text, '') ~*
+              'captcha|security.verification|login.required|safety.block'
+          )
+      ) AS recent_technical_failure_count,
+      (
+        SELECT COUNT(*)::integer
+        FROM capture_tasks recent_success
+        WHERE recent_success.tenant_id = ca.tenant_id
+          AND COALESCE(
+            recent_success.assigned_agent_id,
+            recent_success.origin_agent_id
+          ) = ca.id
+          AND recent_success.created_at > now() - interval '2 hours'
+          AND recent_success.status IN ('completed', 'completed_with_warnings')
+      ) AS recent_success_count,
+      (
+        SELECT MAX(recent_assignment.created_at)
+        FROM capture_tasks recent_assignment
+        WHERE recent_assignment.tenant_id = ca.tenant_id
+          AND COALESCE(
+            recent_assignment.assigned_agent_id,
+            recent_assignment.origin_agent_id
+          ) = ca.id
+      ) AS last_assignment_at
+    FROM capture_agents ca
+    JOIN tenants tenant ON tenant.id = ca.tenant_id
+    LEFT JOIN auth_codes ac
+      ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
+    LEFT JOIN auth_bindings ab
+      ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+    JOIN social_agent_daily_usage daily_usage
+      ON daily_usage.tenant_id = ca.tenant_id
+      AND daily_usage.agent_id = ca.id
+      AND daily_usage.platform = $2
+      AND daily_usage.usage_date =
+        (now() AT TIME ZONE 'Asia/Shanghai')::date
+    LEFT JOIN social_account_bindings current_social_binding
+      ON current_social_binding.tenant_id = ca.tenant_id
+      AND current_social_binding.agent_id = ca.id
+      AND current_social_binding.platform = $2
+      AND current_social_binding.status = 'current'
+    LEFT JOIN social_accounts current_social_account
+      ON current_social_account.tenant_id = ca.tenant_id
+      AND current_social_account.id = current_social_binding.social_account_id
+    WHERE ca.tenant_id = $1
+      AND ($4::boolean = false OR ca.id = ANY($5::uuid[]))
+      AND ca.status = 'active'
+      AND tenant.status = 'active'
+      AND ac.status = 'active'
+      AND ab.id IS NOT NULL
+      AND (ac.expires_at IS NULL OR ac.expires_at >= now())
+      AND ca.last_heartbeat_at >= now() - interval '2 minutes'
+      AND daily_usage.last_event_at IS NOT NULL
+      AND (
+        current_social_account.daily_search_limit IS NULL OR
+        current_social_account.daily_search_limit = 0 OR
+        daily_usage.searches < current_social_account.daily_search_limit
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM capture_tasks active_task
+        WHERE active_task.tenant_id = ca.tenant_id
+          AND COALESCE(
+            active_task.assigned_agent_id,
+            active_task.origin_agent_id
+          ) = ca.id
+          AND active_task.task_type <> 'capture_orchestration'
+          AND active_task.status = ANY($3::text[])
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM capture_agent_commands active_command
+        WHERE active_command.tenant_id = ca.tenant_id
+          AND active_command.agent_id = ca.id
+          AND active_command.status IN ('pending', 'acknowledged')
+          AND (
+            active_command.expires_at IS NULL OR
+            active_command.expires_at > now()
+          )
+      )
+    ORDER BY daily_usage.searches ASC,
+      CASE COALESCE(current_social_account.health_status, 'unknown')
+        WHEN 'active' THEN 0
+        WHEN 'unknown' THEN 1
+        WHEN 'resting' THEN 2
+        WHEN 'risk' THEN 3
+        WHEN 'login_required' THEN 4
+        ELSE 5
+      END ASC,
+      CASE COALESCE(current_social_binding.last_login_state, 'unknown')
+        WHEN 'authenticated' THEN 0
+        WHEN 'unknown' THEN 1
+        ELSE 2
+      END ASC,
+      daily_usage.failed_events ASC,
+      daily_usage.safety_verifications ASC,
+      recent_technical_failure_count ASC,
+      recent_success_count DESC,
+      last_assignment_at ASC NULLS FIRST,
+      ca.last_heartbeat_at DESC NULLS LAST,
+      ca.id
+    ${lock ? 'FOR UPDATE OF ca, daily_usage' : ''}
+  `, [
+    tenantId,
+    platform,
+    RETRY_AGENT_SLOT_BLOCKING_STATUSES,
+    restrictAgentIds,
+    restrictAgentIds ? agentIds : [],
+  ]);
+}
+
+function publicRetryAgentCandidate(agent) {
+  return {
+    ...publicAgent(agent),
+    todaySearches: Number(agent.today_searches),
+    dailySearchLimit: agent.daily_search_limit === null
+      ? null
+      : Number(agent.daily_search_limit),
+    accountHealthStatus: text(agent.account_health_status, 40) || 'unknown',
+    recentTechnicalFailureCount:
+      Number(agent.recent_technical_failure_count || 0),
+    recentSuccessCount: Number(agent.recent_success_count || 0),
   };
 }
 
@@ -787,7 +964,9 @@ router.delete(
           SELECT id
           FROM capture_tasks
           WHERE tenant_id = $1 AND parent_task_id = $2
-          ORDER BY id
+          ORDER BY
+            COALESCE((metadata->>'retryDispatchOrdinal')::integer, 0),
+            id
           FOR UPDATE
         `, [req.tenantId, parent.id]);
         const stillDraft =
@@ -1005,7 +1184,6 @@ function normalizeRetryItems(body) {
     )};
   }
   const requestKey = normalizedUuid(body?.requestKey);
-  const targetAgentId = normalizedUuid(body?.targetAgentId);
   const sourceItemIds = Array.isArray(body?.itemIds) ? body.itemIds : [];
   const itemIds = [];
   const seen = new Set();
@@ -1021,10 +1199,10 @@ function normalizeRetryItems(body) {
     seen.add(itemId);
     itemIds.push(itemId);
   }
-  if (!requestKey || !targetAgentId || itemIds.length === 0) {
+  if (!requestKey || itemIds.length === 0) {
     return {failure: requestError(
       'invalid_retry_request',
-      'requestKey、targetAgentId 和至少一个 itemId 必须有效',
+      'requestKey 和至少一个 itemId 必须有效',
     )};
   }
   if (itemIds.length > 30) {
@@ -1033,13 +1211,1345 @@ function normalizeRetryItems(body) {
       '一次最多重试 30 个关键词',
     )};
   }
+  const assignments = [];
+  const assignedItems = new Set();
+  const assignedAgents = new Set();
+  const rawAssignments = Array.isArray(body?.assignments)
+    ? body.assignments
+    : [];
+  for (const rawAssignment of rawAssignments) {
+    const itemId = normalizedUuid(rawAssignment?.itemId);
+    const agentId = normalizedUuid(rawAssignment?.agentId);
+    if (!itemId || !agentId || !seen.has(itemId)) {
+      return {failure: requestError(
+        'invalid_retry_assignment',
+        '逐项覆盖必须引用本次重试中的有效 itemId 和 agentId',
+      )};
+    }
+    if (assignedItems.has(itemId)) {
+      return {failure: requestError(
+        'duplicate_retry_item_assignment',
+        '同一个失败项不能重复覆盖分配',
+      )};
+    }
+    if (assignedAgents.has(agentId)) {
+      return {failure: requestError(
+        'duplicate_retry_agent_assignment',
+        '单个 Agent 同一批只能领取一个失败项',
+      )};
+    }
+    assignedItems.add(itemId);
+    assignedAgents.add(agentId);
+    assignments.push({itemId, agentId});
+  }
+  // Keep the old one-item client callable while removing targetAgentId as a
+  // batch requirement. A multi-item request must use per-item overrides or
+  // leave assignments empty for transactional auto-sharding.
+  const legacyTargetAgentId = normalizedUuid(body?.targetAgentId);
+  if (legacyTargetAgentId) {
+    if (assignments.length > 0) {
+      return {failure: requestError(
+        'conflicting_retry_assignment_modes',
+        'targetAgentId 不能和逐项 assignments 同时提交',
+      )};
+    }
+    if (itemIds.length === 1) {
+      assignments.push({itemId: itemIds[0], agentId: legacyTargetAgentId});
+    }
+  }
   return {
     expectedRevision,
     requestKey,
-    targetAgentId,
     itemIds,
+    assignments,
+    legacyTargetAgentId,
+    legacyBatchTarget: Boolean(legacyTargetAgentId && itemIds.length > 1),
     confirmSafety: body?.confirmSafety === true,
   };
+}
+
+export function allocateRetryItemsForRetry({items = [], agents = [], overrides = []}) {
+  const overrideByItemId = new Map(
+    overrides.map(assignment => [
+      String(assignment.itemId || ''),
+      String(assignment.agentId || ''),
+    ]),
+  );
+  const idleById = new Map(
+    agents.map(agent => [String(agent.id || ''), agent]),
+  );
+  const reservedOverrideAgentIds = new Set(
+    overrides
+      .map(assignment => String(assignment.agentId || ''))
+      .filter(agentId => idleById.has(agentId)),
+  );
+  const automaticAgents = agents.filter(
+    agent => !reservedOverrideAgentIds.has(String(agent.id || '')),
+  );
+  const usedAgentIds = new Set();
+  let automaticIndex = 0;
+  const dispatched = [];
+  const waiting = [];
+  for (const item of items) {
+    const itemId = String(item.id || '');
+    const overrideAgentId = overrideByItemId.get(itemId) || '';
+    let agent = overrideAgentId ? idleById.get(overrideAgentId) : null;
+    if (agent && usedAgentIds.has(String(agent.id))) agent = null;
+    if (!overrideAgentId) {
+      while (
+        automaticIndex < automaticAgents.length &&
+        usedAgentIds.has(String(automaticAgents[automaticIndex].id))
+      ) automaticIndex += 1;
+      agent = automaticAgents[automaticIndex++] || null;
+    }
+    if (!agent) {
+      waiting.push({
+        itemId,
+        keyword: item.keyword,
+        status: 'retryable',
+        reason: overrideAgentId
+          ? 'assigned_agent_unavailable'
+          : 'no_idle_agent',
+        ...(overrideAgentId ? {agentId: overrideAgentId} : {}),
+      });
+      continue;
+    }
+    const agentId = String(agent.id);
+    usedAgentIds.add(agentId);
+    dispatched.push({item, agentId, agent});
+  }
+  return {dispatched, waiting};
+}
+
+function deterministicRetryUuid(...parts) {
+  const digits = crypto
+    .createHash('sha256')
+    .update(parts.map(part => String(part ?? '')).join('\u001f'))
+    .digest('hex')
+    .slice(0, 32)
+    .split('');
+  digits[12] = '5';
+  digits[16] = ((Number.parseInt(digits[16], 16) & 0x3) | 0x8).toString(16);
+  const hex = digits.join('');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join('-');
+}
+
+function inspectPendingRetryLineage(item, parent = null) {
+  const metadata = safeJson(item?.metadata);
+  const requestKey = normalizedUuid(metadata.retryWaitingRequestKey);
+  const requestHash = text(metadata.retryWaitingRequestHash, 80).toLowerCase();
+  const planHash = text(metadata.retryWaitingPlanHash, 80).toLowerCase();
+  const sourceExecutionTaskId = normalizedUuid(
+    metadata.retryWaitingSourceExecutionTaskId,
+  );
+  const preferredAgentId = normalizedUuid(metadata.retryWaitingAgentId);
+  const rawPreferredAgentId = text(metadata.retryWaitingAgentId, 100);
+  const waitingParentRevision = Number(metadata.retryWaitingParentRevision);
+  const itemRevision = Number(metadata.retryWaitingItemRevision);
+  const attemptCount = Number(metadata.retryWaitingAttemptCount);
+  const currentItemRevision = Number(item?.assignment_revision);
+  const currentAttemptCount = Number(item?.attempt_count);
+  let invalidReason = '';
+  if (metadata.retryPending !== true) {
+    invalidReason = 'marker_not_pending';
+  } else if (!requestKey) {
+    invalidReason = 'request_key_invalid';
+  } else if (!/^[0-9a-f]{64}$/u.test(requestHash)) {
+    invalidReason = 'request_hash_invalid';
+  } else if (!/^[0-9a-f]{64}$/u.test(planHash)) {
+    invalidReason = 'plan_hash_invalid';
+  } else if (!sourceExecutionTaskId) {
+    invalidReason = 'source_execution_invalid';
+  } else if (rawPreferredAgentId && !preferredAgentId) {
+    invalidReason = 'preferred_agent_invalid';
+  } else if (
+    !Number.isSafeInteger(waitingParentRevision) ||
+    waitingParentRevision < 1
+  ) {
+    invalidReason = 'authorized_parent_revision_invalid';
+  } else if (!Number.isSafeInteger(itemRevision) || itemRevision < 0) {
+    invalidReason = 'item_revision_invalid';
+  } else if (!Number.isSafeInteger(attemptCount) || attemptCount < 0) {
+    invalidReason = 'attempt_count_invalid';
+  } else if (itemRevision !== currentItemRevision) {
+    invalidReason = 'item_revision_changed';
+  } else if (attemptCount !== currentAttemptCount) {
+    invalidReason = 'attempt_count_changed';
+  } else if (
+    sourceExecutionTaskId !== String(item?.execution_task_id || '')
+  ) {
+    invalidReason = 'source_execution_changed';
+  } else if (
+    parent &&
+    Number(parent.orchestration_revision || 0) < waitingParentRevision
+  ) {
+    invalidReason = 'parent_revision_regressed';
+  } else if (
+    parent &&
+    hashOrchestrationRequest(safeJson(parent.metadata?.planSnapshot)) !==
+      planHash
+  ) {
+    invalidReason = 'parent_plan_changed';
+  }
+  return {
+    invalidReason,
+    lineage: invalidReason
+      ? null
+      : {
+          requestKey,
+          requestHash,
+          planHash,
+          sourceExecutionTaskId,
+          preferredAgentId,
+          waitingParentRevision,
+          itemRevision,
+          attemptCount,
+          safetyConfirmed: metadata.retryWaitingSafetyConfirmed === true,
+          requestedByUserId: normalizedUuid(
+            metadata.retryWaitingRequestedByUserId,
+          ),
+          requestedByName: text(metadata.retryWaitingRequestedByName, 240),
+          batchSize: Math.max(1, Number(metadata.retryWaitingBatchSize) || 1),
+          dispatchOrdinal: Math.max(
+            0,
+            Number(metadata.retryWaitingDispatchOrdinal) || 0,
+          ),
+        },
+  };
+}
+
+function pendingRetryLineage(item, parent = null) {
+  return inspectPendingRetryLineage(item, parent).lineage;
+}
+
+function pendingRetryMarkerSnapshot(item) {
+  const metadata = safeJson(item?.metadata);
+  return Object.fromEntries(
+    Object.entries(metadata).filter(([key]) =>
+      key === 'retryPending' || key.startsWith('retryWaiting')
+    ),
+  );
+}
+
+function publicPendingRetryItem(item) {
+  const metadata = safeJson(item?.metadata);
+  return {
+    itemId: item.id,
+    keyword: item.keyword,
+    status: 'retryable',
+    reason: text(metadata.retryWaitingReason, 80) || 'no_idle_agent',
+    ...(normalizedUuid(metadata.retryWaitingAgentId)
+      ? {agentId: normalizedUuid(metadata.retryWaitingAgentId)}
+      : {}),
+  };
+}
+
+async function loadPendingRetryCandidates(
+  executor,
+  limit = 20,
+  excludedItemIds = [],
+) {
+  return executor.queryAll(`
+    SELECT item.id, item.tenant_id, item.task_id, item.item_key,
+      item.ordinal, item.keyword, item.platform, item.item_type,
+      item.status, item.attempt_count, item.assigned_agent_id,
+      item.execution_task_id, item.assignment_revision, item.request_hash,
+      item.error, item.metadata, item.assigned_at, item.dispatched_at,
+      item.started_at, item.finished_at,
+      parent.title AS parent_title,
+      parent.platform AS parent_platform,
+      parent.metadata AS parent_metadata,
+      parent.orchestration_revision AS parent_revision
+    FROM capture_task_items item
+    JOIN capture_tasks parent
+      ON parent.id = item.task_id
+      AND parent.tenant_id = item.tenant_id
+      AND parent.task_type = 'capture_orchestration'
+    JOIN capture_tasks source_execution
+      ON source_execution.id = item.execution_task_id
+      AND source_execution.tenant_id = item.tenant_id
+      AND source_execution.parent_task_id = item.task_id
+    JOIN tenants tenant ON tenant.id = item.tenant_id
+    WHERE item.status = 'retryable'
+      AND item.metadata->>'retryPending' = 'true'
+      AND tenant.status = 'active'
+      AND source_execution.status = ANY($1::text[])
+      AND NOT (parent.status = ANY($2::text[]))
+      AND parent.metadata->>'operatorStopped' IS DISTINCT FROM 'true'
+      AND parent.metadata->>'orchestrationTemplate' IS DISTINCT FROM 'true'
+      AND parent.metadata->>'executionMode' IS DISTINCT FROM 'unattended_plan'
+      AND NOT (item.id = ANY($3::uuid[]))
+      AND NOT EXISTS (
+        SELECT 1
+        FROM capture_task_item_attempts active_attempt
+        WHERE active_attempt.tenant_id = item.tenant_id
+          AND active_attempt.item_id = item.id
+          AND active_attempt.status IN (
+            'assigned', 'dispatch_pending', 'dispatched',
+            'waiting_device', 'running'
+          )
+    )
+    ORDER BY
+      COALESCE(
+        item.metadata->>'retryWaitingLastCheckedAt',
+        item.metadata->>'retryWaitingSince',
+        item.updated_at::text
+      ),
+      item.tenant_id,
+      item.task_id,
+      item.ordinal,
+      item.id
+    LIMIT $4
+  `, [HANDOFF_SOURCE_FINAL_STATUSES.size > 0
+    ? [...HANDOFF_SOURCE_FINAL_STATUSES]
+    : [], RETRY_PENDING_PARENT_BLOCKED_STATUSES, excludedItemIds, limit]);
+}
+
+function retryPendingRowKey(row) {
+  return `${String(row?.tenant_id || '')}:${String(row?.id || '')}`;
+}
+
+function retryPendingParentKey(row) {
+  return `${String(row?.tenant_id || '')}:${String(
+    row?.task_id || row?.id || '',
+  )}`;
+}
+
+function retryPendingInvalidationReason(item, parent) {
+  if (!item || !parent || item.status !== 'retryable') return '';
+  if (RETRY_PENDING_PARENT_BLOCKED_STATUSES.includes(parent.status)) {
+    return 'parent_status_terminal';
+  }
+  const parentMetadata = safeJson(parent.metadata);
+  if (parentMetadata.operatorStopped === true) return 'parent_operator_stopped';
+  if (
+    parentMetadata.orchestrationTemplate === true ||
+    parentMetadata.executionMode === 'unattended_plan'
+  ) {
+    return 'parent_dispatch_mode_changed';
+  }
+  const inspection = inspectPendingRetryLineage(item, parent);
+  if (
+    inspection.lineage &&
+    itemRequiresManualSafetyAction(item) &&
+    inspection.lineage.safetyConfirmed !== true
+  ) {
+    return 'safety_confirmation_missing';
+  }
+  return inspection.invalidReason === 'marker_not_pending'
+    ? ''
+    : inspection.invalidReason;
+}
+
+async function invalidateLockedPendingRetryMarker(tx, {
+  preview,
+  item,
+  parent,
+  reason,
+}) {
+  const marker = pendingRetryMarkerSnapshot(preview);
+  const previewMetadata = safeJson(preview?.metadata);
+  const requestHashJson = Object.prototype.hasOwnProperty.call(
+    previewMetadata,
+    'retryWaitingRequestHash',
+  )
+    ? JSON.stringify(previewMetadata.retryWaitingRequestHash)
+    : null;
+  const actionMetadata = {
+    action: 'retry_pending_marker_invalidated',
+    trigger: 'capture_orchestration_recovery_sweep',
+    protocolVersion: 1,
+    tenantId: preview.tenant_id,
+    parentTaskId: preview.task_id,
+    itemId: preview.id,
+    reason,
+    originalRequestKey: text(
+      previewMetadata.retryWaitingRequestKey,
+      100,
+    ),
+    originalRequestHash: text(
+      previewMetadata.retryWaitingRequestHash,
+      80,
+    ),
+    authorizedPlanHash: text(
+      previewMetadata.retryWaitingPlanHash,
+      80,
+    ),
+    authorizedParentRevision: Number(
+      previewMetadata.retryWaitingParentRevision,
+    ),
+    expectedItemRevision: Number(preview.assignment_revision),
+    expectedAttemptCount: Number(preview.attempt_count),
+    sourceExecutionTaskId: String(preview.execution_task_id || ''),
+  };
+  const invalidated = await tx.queryOne(`
+    UPDATE capture_task_items AS stale_item
+    SET metadata = (
+          SELECT COALESCE(
+            jsonb_object_agg(retained.key, retained.value),
+            '{}'::jsonb
+          )
+          FROM jsonb_each(stale_item.metadata) AS retained(key, value)
+          WHERE retained.key <> 'retryPending'
+            AND retained.key NOT LIKE 'retryWaiting%'
+        ) || jsonb_build_object(
+          'retryWaitingInvalidatedAt', now(),
+          'retryWaitingInvalidatedReason', $1::text,
+          'retryWaitingInvalidatedBy',
+            'capture_orchestration_recovery_sweep',
+          'retryWaitingInvalidatedMarker', $2::jsonb
+        ),
+      updated_at = now()
+    WHERE stale_item.id = $3
+      AND stale_item.tenant_id = $4
+      AND stale_item.task_id = $5
+      AND stale_item.status = 'retryable'
+      AND stale_item.execution_task_id IS NOT DISTINCT FROM $6::uuid
+      AND stale_item.assignment_revision = $7
+      AND stale_item.attempt_count = $8
+      AND stale_item.metadata->'retryWaitingRequestHash'
+        IS NOT DISTINCT FROM $9::jsonb
+      AND (
+        SELECT COALESCE(
+          jsonb_object_agg(current_marker.key, current_marker.value),
+          '{}'::jsonb
+        )
+        FROM jsonb_each(stale_item.metadata)
+          AS current_marker(key, value)
+        WHERE current_marker.key = 'retryPending'
+          OR current_marker.key LIKE 'retryWaiting%'
+      ) = $2::jsonb
+    RETURNING id, status, metadata
+  `, [
+    reason,
+    JSON.stringify(marker),
+    preview.id,
+    preview.tenant_id,
+    preview.task_id,
+    preview.execution_task_id,
+    Number(preview.assignment_revision),
+    Number(preview.attempt_count),
+    requestHashJson,
+  ]);
+  if (!invalidated) return false;
+  await appendEvent(tx, {
+    tenantId: preview.tenant_id,
+    taskId: preview.task_id,
+    eventType: 'orchestration_retry_pending_invalidated',
+    actorType: 'system',
+    actorId: 'retry_waiting_sweeper',
+    actorName: '系统 · 等待重试状态校验',
+    status: parent.status,
+    message: '等待重试标记已失效，保留关键词业务状态并停止自动续接',
+    payload: actionMetadata,
+  });
+  return true;
+}
+
+async function invalidatePreviewStalePendingRetries(tx, previews) {
+  const stalePreviews = previews.filter(preview => {
+    const previewParent = {
+      id: preview.task_id,
+      tenant_id: preview.tenant_id,
+      title: preview.parent_title,
+      platform: preview.parent_platform,
+      metadata: safeJson(preview.parent_metadata),
+      orchestration_revision: Number(preview.parent_revision || 0),
+    };
+    return Boolean(retryPendingInvalidationReason(preview, previewParent));
+  });
+  if (stalePreviews.length === 0) {
+    return {
+      staleCount: 0,
+      invalidatedCount: 0,
+      retainedCount: 0,
+      reconciledParentCount: 0,
+    };
+  }
+
+  // A cleanup transaction has no Agent lease. Lock every source first, then
+  // every parent, then every item in stable tenant/id order. Returning after
+  // this phase prevents a later Agent lock from inverting the dispatch order.
+  const sources = [...new Map(stalePreviews.map(preview => [
+    `${preview.tenant_id}:${preview.execution_task_id}`,
+    preview,
+  ])).values()].sort((left, right) =>
+    `${left.tenant_id}:${left.execution_task_id}`.localeCompare(
+      `${right.tenant_id}:${right.execution_task_id}`,
+    )
+  );
+  for (const preview of sources) {
+    await tx.queryOne(`
+      /* retry_pending_invalidation_source_lock */
+      SELECT id
+      FROM capture_tasks
+      WHERE id = $1 AND tenant_id = $2 AND parent_task_id = $3
+      FOR UPDATE
+    `, [preview.execution_task_id, preview.tenant_id, preview.task_id]);
+  }
+
+  const parentPreviews = [...new Map(stalePreviews.map(preview => [
+    retryPendingParentKey(preview),
+    preview,
+  ])).values()].sort((left, right) =>
+    retryPendingParentKey(left).localeCompare(retryPendingParentKey(right))
+  );
+  const parentByKey = new Map();
+  for (const preview of parentPreviews) {
+    const parent = await tx.queryOne(
+      parentSelect({lock: true}),
+      [preview.task_id, preview.tenant_id],
+    );
+    if (parent) parentByKey.set(retryPendingParentKey(preview), parent);
+  }
+
+  const itemPreviews = [...stalePreviews].sort((left, right) =>
+    retryPendingRowKey(left).localeCompare(retryPendingRowKey(right))
+  );
+  const itemByKey = new Map();
+  for (const preview of itemPreviews) {
+    const item = await tx.queryOne(`
+      SELECT id, tenant_id, task_id, item_key, ordinal, keyword, platform,
+        item_type, status, attempt_count, assigned_agent_id,
+        execution_task_id, assignment_revision, request_hash, error, metadata,
+        assigned_at, dispatched_at, started_at, finished_at
+      FROM capture_task_items
+      WHERE id = $1 AND tenant_id = $2 AND task_id = $3
+      FOR UPDATE
+    `, [preview.id, preview.tenant_id, preview.task_id]);
+    if (item) itemByKey.set(retryPendingRowKey(preview), item);
+  }
+
+  let invalidatedCount = 0;
+  let retainedCount = 0;
+  const invalidatedByParent = new Map();
+  for (const preview of itemPreviews) {
+    const item = itemByKey.get(retryPendingRowKey(preview));
+    const parent = parentByKey.get(retryPendingParentKey(preview));
+    const reason = retryPendingInvalidationReason(item, parent);
+    if (!reason) {
+      retainedCount += 1;
+      continue;
+    }
+    const invalidated = await invalidateLockedPendingRetryMarker(tx, {
+      preview,
+      item,
+      parent,
+      reason,
+    });
+    if (invalidated) {
+      invalidatedCount += 1;
+      const parentKey = retryPendingParentKey(preview);
+      const entry = invalidatedByParent.get(parentKey) || {
+        itemIds: [],
+        parent: parentByKey.get(parentKey),
+      };
+      entry.itemIds.push(preview.id);
+      invalidatedByParent.set(parentKey, entry);
+    } else retainedCount += 1;
+  }
+
+  let reconciledParentCount = 0;
+  for (const {itemIds, parent} of invalidatedByParent.values()) {
+    if (!parent || itemIds.length === 0) continue;
+    const refreshedItems = await listParentItems(
+      tx,
+      parent.tenant_id,
+      parent.id,
+    );
+    const remainingWaiting = refreshedItems
+      .filter(candidate =>
+        candidate.status === 'retryable' &&
+        safeJson(candidate.metadata).retryPending === true
+      )
+      .map(publicPendingRetryItem);
+    const aggregate = aggregateParentTaskItems(refreshedItems);
+    const currentRevision = Number(parent.orchestration_revision || 0);
+    const parentUpdate = await tx.queryOne(`
+      UPDATE capture_tasks
+      SET orchestration_revision = orchestration_revision + 1,
+        status = $1,
+        progress = $2::jsonb,
+        counts = $3::jsonb,
+        metadata = metadata || jsonb_build_object(
+          'lastRetryWaiting', $4::jsonb,
+          'lastRetryWaitingInvalidatedAt', now(),
+          'lastRetryWaitingInvalidatedCount', $5::integer,
+          'lastRetryWaitingInvalidatedItemIds', $6::jsonb
+        ),
+        message = CASE
+          WHEN jsonb_array_length($4::jsonb) > 0
+            THEN '部分等待重试授权已失效，其余仍在等待空闲 Agent'
+          ELSE '等待重试授权已失效，请重新确认后再重试'
+        END,
+        finished_at = NULL,
+        updated_at = now(),
+        source_updated_at = now()
+      WHERE id = $7 AND tenant_id = $8
+        AND task_type = 'capture_orchestration'
+        AND orchestration_revision = $9
+      RETURNING id, status, orchestration_revision
+    `, [
+      aggregate.status,
+      JSON.stringify(aggregate.progress),
+      JSON.stringify(aggregate.counts),
+      JSON.stringify(remainingWaiting),
+      itemIds.length,
+      JSON.stringify(itemIds),
+      parent.id,
+      parent.tenant_id,
+      currentRevision,
+    ]);
+    if (!parentUpdate) {
+      const error = new Error(
+        'orchestration_retry_pending_invalidation_revision_conflict',
+      );
+      error.code =
+        'orchestration_retry_pending_invalidation_revision_conflict';
+      throw error;
+    }
+    await appendEvent(tx, {
+      tenantId: parent.tenant_id,
+      taskId: parent.id,
+      eventType: 'orchestration_retry_pending_projection_reconciled',
+      actorType: 'system',
+      actorId: 'retry_waiting_sweeper',
+      actorName: '系统 · 等待重试状态校验',
+      status: parentUpdate.status,
+      message: remainingWaiting.length > 0
+        ? '失效等待项已移出自动队列，其余等待项继续排队'
+        : '失效等待项已移出自动队列，父任务已恢复真实处理状态',
+      payload: {
+        action: 'retry_pending_projection_reconciled',
+        trigger: 'capture_orchestration_recovery_sweep',
+        protocolVersion: 1,
+        tenantId: parent.tenant_id,
+        parentTaskId: parent.id,
+        invalidatedItemIds: itemIds,
+        invalidatedCount: itemIds.length,
+        remainingWaiting,
+        previousRevision: currentRevision,
+        revision: Number(parentUpdate.orchestration_revision),
+      },
+    });
+    reconciledParentCount += 1;
+  }
+  return {
+    staleCount: stalePreviews.length,
+    invalidatedCount,
+    retainedCount,
+    reconciledParentCount,
+  };
+}
+
+async function touchPendingRetryWaitingMarkers(tx, previews) {
+  const checkedItemIds = [];
+  for (const preview of previews) {
+    const marker = pendingRetryMarkerSnapshot(preview);
+    const previewMetadata = safeJson(preview?.metadata);
+    const requestHashJson = Object.prototype.hasOwnProperty.call(
+      previewMetadata,
+      'retryWaitingRequestHash',
+    )
+      ? JSON.stringify(previewMetadata.retryWaitingRequestHash)
+      : null;
+    const touched = await tx.queryOne(`
+      UPDATE capture_task_items AS waiting_item
+      SET metadata = jsonb_set(
+          waiting_item.metadata,
+          '{retryWaitingLastCheckedAt}',
+          to_jsonb(now()),
+          true
+        ),
+        updated_at = now()
+      WHERE waiting_item.id = $1
+        AND waiting_item.tenant_id = $2
+        AND waiting_item.task_id = $3
+        AND waiting_item.status = 'retryable'
+        AND waiting_item.execution_task_id IS NOT DISTINCT FROM $4::uuid
+        AND waiting_item.assignment_revision = $5
+        AND waiting_item.attempt_count = $6
+        AND waiting_item.metadata->'retryWaitingRequestHash'
+          IS NOT DISTINCT FROM $7::jsonb
+        AND (
+          SELECT COALESCE(
+            jsonb_object_agg(current_marker.key, current_marker.value),
+            '{}'::jsonb
+          )
+          FROM jsonb_each(waiting_item.metadata)
+            AS current_marker(key, value)
+          WHERE current_marker.key = 'retryPending'
+            OR current_marker.key LIKE 'retryWaiting%'
+        ) = $8::jsonb
+      RETURNING id
+    `, [
+      preview.id,
+      preview.tenant_id,
+      preview.task_id,
+      preview.execution_task_id,
+      Number(preview.assignment_revision),
+      Number(preview.attempt_count),
+      requestHashJson,
+      JSON.stringify(marker),
+    ]);
+    if (touched) checkedItemIds.push(touched.id);
+  }
+  return {checkedCount: checkedItemIds.length, checkedItemIds};
+}
+
+async function loadIdlePendingRetryAgent(tx, {tenantId, parent, lineage}) {
+  const planSnapshot = safeJson(parent.metadata?.planSnapshot);
+  const candidates = await loadRetryAgentCandidates(tx, {
+    tenantId,
+    platform: parent.platform,
+    agentIds: lineage.preferredAgentId ? [lineage.preferredAgentId] : [],
+  });
+  const eligibleCandidates = candidates.filter(agent =>
+    !agentCompatibilityFailure(agent, parent.platform, planSnapshot) &&
+    captureAgentOnline(agent.last_heartbeat_at) &&
+    crossDeviceRetryAgentDailyUsageEligible(agent)
+  );
+  for (const candidate of eligibleCandidates) {
+    const savepoint = 'orchestration_retry_pending_agent';
+    await tx.execute(`SAVEPOINT ${savepoint}`);
+    try {
+      const slotLocked = await tryLockCaptureAgentExecutionSlot(
+        tx,
+        tenantId,
+        candidate.id,
+      );
+      if (!slotLocked) {
+        await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+        continue;
+      }
+      const lockedCandidates = await loadRetryAgentCandidates(tx, {
+        tenantId,
+        platform: parent.platform,
+        agentIds: [candidate.id],
+        lock: true,
+      });
+      const locked = lockedCandidates[0] || null;
+      const eligible = locked &&
+        !agentCompatibilityFailure(locked, parent.platform, planSnapshot) &&
+        captureAgentOnline(locked.last_heartbeat_at) &&
+        crossDeviceRetryAgentDailyUsageEligible(locked);
+      const blocker = eligible
+        ? await findCaptureAgentExecutionSlotBlocker(tx, tenantId, locked.id)
+        : {kind: 'ineligible'};
+      if (!eligible || blocker) {
+        await tx.execute(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+        continue;
+      }
+      await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+      return locked;
+    } catch (error) {
+      try {
+        await tx.execute(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+      } catch {}
+      throw error;
+    }
+  }
+  return null;
+}
+
+async function dispatchOnePendingOrchestrationRetry(
+  tx,
+  {scanLimit = 20, excludedItemIds = []} = {},
+) {
+  const candidates = await loadPendingRetryCandidates(
+    tx,
+    scanLimit,
+    excludedItemIds,
+  );
+  if (candidates.length === 0) return {kind: 'empty'};
+  const staleCleanup = await invalidatePreviewStalePendingRetries(
+    tx,
+    candidates,
+  );
+  if (staleCleanup.staleCount > 0) {
+    return {kind: 'stale', ...staleCleanup};
+  }
+  let waitingCount = 0;
+  let staleCount = 0;
+  const waitingPreviews = [];
+  for (const preview of candidates) {
+    const previewParent = {
+      id: preview.task_id,
+      tenant_id: preview.tenant_id,
+      title: preview.parent_title,
+      platform: preview.parent_platform,
+      metadata: safeJson(preview.parent_metadata),
+      orchestration_revision: Number(preview.parent_revision || 0),
+    };
+    const previewLineage = pendingRetryLineage(preview, previewParent);
+    if (!previewLineage) {
+      staleCount += 1;
+      continue;
+    }
+    const targetAgent = await loadIdlePendingRetryAgent(tx, {
+      tenantId: preview.tenant_id,
+      parent: previewParent,
+      lineage: previewLineage,
+    });
+    if (!targetAgent) {
+      waitingCount += 1;
+      waitingPreviews.push(preview);
+      continue;
+    }
+
+    // Match the existing retry dispatch lock order: target Agent slot first,
+    // source execution second, parent third, and the exact item last. This
+    // prevents a late terminal heartbeat from deadlocking an automatic claim.
+    const sourceTask = await tx.queryOne(`
+      SELECT id, tenant_id, parent_task_id, status
+      FROM capture_tasks
+      WHERE id = $1 AND tenant_id = $2 AND parent_task_id = $3
+      FOR UPDATE
+    `, [
+      previewLineage.sourceExecutionTaskId,
+      preview.tenant_id,
+      preview.task_id,
+    ]);
+    const parent = await tx.queryOne(
+      parentSelect({lock: true}),
+      [preview.task_id, preview.tenant_id],
+    );
+    const item = await tx.queryOne(`
+      SELECT id, tenant_id, task_id, item_key, ordinal, keyword, platform,
+        item_type, status, attempt_count, assigned_agent_id,
+        execution_task_id, assignment_revision, request_hash, error, metadata,
+        assigned_at, dispatched_at, started_at, finished_at
+      FROM capture_task_items
+      WHERE id = $1 AND tenant_id = $2 AND task_id = $3
+      FOR UPDATE
+    `, [preview.id, preview.tenant_id, preview.task_id]);
+    const lineage = pendingRetryLineage(item, parent);
+    const planSnapshot = safeJson(parent?.metadata?.planSnapshot);
+    const invalidationReason = retryPendingInvalidationReason(item, parent) ||
+      (
+        lineage &&
+        itemRequiresManualSafetyAction(item) &&
+        lineage.safetyConfirmed !== true
+          ? 'safety_confirmation_missing'
+          : ''
+      );
+    if (invalidationReason) {
+      const invalidated = await invalidateLockedPendingRetryMarker(tx, {
+        preview,
+        item,
+        parent,
+        reason: invalidationReason,
+      });
+      return {
+        kind: 'stale',
+        staleCount: 1,
+        invalidatedCount: invalidated ? 1 : 0,
+        retainedCount: invalidated ? 0 : 1,
+      };
+    }
+    if (
+      !sourceTask ||
+      !parent ||
+      !item ||
+      !lineage ||
+      RETRY_PENDING_PARENT_BLOCKED_STATUSES.includes(parent.status) ||
+      safeJson(parent.metadata).operatorStopped === true ||
+      lineage.requestKey !== previewLineage.requestKey ||
+      lineage.requestHash !== previewLineage.requestHash ||
+      lineage.sourceExecutionTaskId !== previewLineage.sourceExecutionTaskId ||
+      lineage.itemRevision !== previewLineage.itemRevision ||
+      lineage.attemptCount !== previewLineage.attemptCount ||
+      !HANDOFF_SOURCE_FINAL_STATUSES.has(sourceTask.status) ||
+      item.status !== 'retryable' ||
+      agentCompatibilityFailure(targetAgent, parent.platform, planSnapshot)
+    ) {
+      return {
+        kind: 'stale',
+        staleCount: 1,
+        invalidatedCount: 0,
+        retainedCount: 1,
+      };
+    }
+    const activeAttempt = await tx.queryOne(`
+      SELECT id
+      FROM capture_task_item_attempts
+      WHERE tenant_id = $1 AND item_id = $2
+        AND status IN (
+          'assigned', 'dispatch_pending', 'dispatched',
+          'waiting_device', 'running'
+        )
+      ORDER BY attempt_number DESC, id
+      LIMIT 1
+      FOR UPDATE
+    `, [item.tenant_id, item.id]);
+    if (activeAttempt) {
+      return {
+        kind: 'stale',
+        staleCount: 1,
+        invalidatedCount: 0,
+        retainedCount: 1,
+      };
+    }
+
+    const currentRevision = Number(parent.orchestration_revision || 0);
+    const nextRevision = currentRevision + 1;
+    const childTaskId = deterministicRetryUuid(
+      'orchestration-retry-pending-task-v1',
+      item.tenant_id,
+      parent.id,
+      item.id,
+      lineage.sourceExecutionTaskId,
+      lineage.itemRevision,
+      lineage.attemptCount,
+      lineage.requestKey,
+    );
+    const commandId = deterministicRetryUuid(
+      'orchestration-retry-pending-command-v1',
+      childTaskId,
+    );
+    const itemAttemptId = deterministicRetryUuid(
+      'orchestration-retry-pending-attempt-v1',
+      childTaskId,
+      item.id,
+    );
+    const continuationRequestHash = hashOrchestrationRequest({
+      action: 'retry_items_pending_continuation',
+      tenantId: item.tenant_id,
+      parentTaskId: parent.id,
+      itemId: item.id,
+      sourceExecutionTaskId: lineage.sourceExecutionTaskId,
+      sourceAssignmentRevision: lineage.itemRevision,
+      sourceAttemptCount: lineage.attemptCount,
+      authorizedParentRevision: lineage.waitingParentRevision,
+      claimedParentRevision: currentRevision,
+      retryRequestKey: lineage.requestKey,
+    });
+    const childTaskInput = normalizeRemoteTaskInput({
+      clientTaskId: childTaskId,
+      title: `${parent.title} · ${text(item.keyword, 80)}重试`,
+      executionMode: 'one_time',
+      planSnapshot: {
+        ...planSnapshot,
+        enabled: true,
+        autoLoop: false,
+        maxRounds: 1,
+        roundGapMin: 0,
+        platform: parent.platform,
+        keywords: [item.keyword],
+      },
+    });
+    const childPlan = childTaskInput.planSnapshot;
+    const actionMetadata = {
+      action: 'retry_pending_auto_dispatch',
+      trigger: 'capture_orchestration_recovery_sweep',
+      protocolVersion: 1,
+      originalRequestKey: lineage.requestKey,
+      originalRequestHash: lineage.requestHash,
+      authorizedPlanHash: lineage.planHash,
+      continuationRequestKey: childTaskId,
+      continuationRequestHash,
+      tenantId: item.tenant_id,
+      parentTaskId: parent.id,
+      itemId: item.id,
+      sourceExecutionTaskId: lineage.sourceExecutionTaskId,
+      sourceAssignmentRevision: lineage.itemRevision,
+      sourceAttemptCount: lineage.attemptCount,
+      authorizedParentRevision: lineage.waitingParentRevision,
+      claimedParentRevision: currentRevision,
+      assignedParentRevision: nextRevision,
+      agentId: targetAgent.id,
+      shanghaiUsageDateCurrent: targetAgent.today_usage_current === true,
+      todaySearches: Number(targetAgent.today_searches),
+      dailySearchLimit: targetAgent.daily_search_limit === null
+        ? null
+        : Number(targetAgent.daily_search_limit),
+    };
+    const childMetadata = {
+      remoteCreated: true,
+      remoteRequestHash: continuationRequestHash,
+      createCommandId: commandId,
+      requestedByUserId: lineage.requestedByUserId || '',
+      requestedByName: lineage.requestedByName,
+      executionMode: 'one_time',
+      planSnapshot: childPlan,
+      orchestrationChild: true,
+      parentTaskId: parent.id,
+      orchestrationRevision: nextRevision,
+      itemIds: [item.id],
+      retryRequestHash: lineage.requestHash,
+      retryRequestKey: lineage.requestKey,
+      retryBatchSize: lineage.batchSize,
+      retryDispatchOrdinal: lineage.dispatchOrdinal,
+      retryDispatchedItemIds: [item.id],
+      retryWaitingItems: [],
+      retrySourceExecutionTaskIds: [lineage.sourceExecutionTaskId],
+      retryConfirmedByUser: true,
+      retrySafetyConfirmed: lineage.safetyConfirmed,
+      retryAutoContinuation: true,
+      retryContinuationRequestKey: childTaskId,
+      retryContinuationRequestHash: continuationRequestHash,
+      retryContinuationAction: actionMetadata,
+    };
+    const child = await tx.queryOne(`
+      INSERT INTO capture_tasks (
+        id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
+        client_task_id, task_type, feature_key, title, platform,
+        source, trigger_type, status, progress, checkpoint, counts,
+        metadata, message, source_updated_at
+      ) VALUES (
+        $1::uuid, $2, $3, $4, $4,
+        $1::uuid::text, 'unattended_keyword_capture',
+        'unattended_keyword_plan', $5, $6,
+        'cloud', 'orchestration_retry', 'pending',
+        $7::jsonb, $8::jsonb, $9::jsonb,
+        $10::jsonb, '空闲 Agent 已释放，云端自动续接等待中的重试项', now()
+      )
+      RETURNING id, parent_task_id, assigned_agent_id, title, platform,
+        status, progress, counts, metadata, created_at, updated_at
+    `, [
+      childTaskId,
+      item.tenant_id,
+      parent.id,
+      targetAgent.id,
+      childTaskInput.title,
+      parent.platform,
+      JSON.stringify({current: 0, total: 1, phase: 'queued'}),
+      JSON.stringify({round: 1, keywordIndex: 0}),
+      JSON.stringify({
+        total: 1,
+        processed: 0,
+        success: 0,
+        failed: 0,
+        skipped: 0,
+      }),
+      JSON.stringify(childMetadata),
+    ]);
+    const updatedItem = await tx.queryOne(`
+      UPDATE capture_task_items
+      SET status = 'dispatched',
+        attempt_count = attempt_count + 1,
+        assigned_agent_id = $1,
+        execution_task_id = $2,
+        assignment_revision = $3,
+        request_hash = $4,
+        error = '{}'::jsonb,
+        metadata = (
+          metadata - ARRAY[
+            'retryPending', 'retryWaitingSince', 'retryWaitingRequestKey',
+            'retryWaitingRequestHash', 'retryWaitingPlanHash',
+            'retryWaitingReason',
+            'retryWaitingAgentId', 'retryWaitingParentRevision',
+            'retryWaitingItemRevision', 'retryWaitingAttemptCount',
+            'retryWaitingSourceExecutionTaskId',
+            'retryWaitingSafetyConfirmed', 'retryWaitingRequestedByUserId',
+            'retryWaitingRequestedByName', 'retryWaitingBatchSize',
+            'retryWaitingDispatchOrdinal', 'retryWaitingLastCheckedAt'
+          ]::text[]
+        ) || jsonb_build_object(
+          'retrySourceExecutionTaskId', $5::uuid::text,
+          'retryRequestKey', $6::uuid::text,
+          'retryAutoContinuation', true,
+          'retryContinuationRequestKey', $2::uuid::text,
+          'retryContinuationRequestHash', $4::text,
+          'retryContinuationAction', $7::jsonb
+        ),
+        assigned_at = now(),
+        dispatched_at = now(),
+        started_at = NULL,
+        finished_at = NULL,
+        updated_at = now()
+      WHERE id = $8 AND tenant_id = $9 AND task_id = $10
+        AND execution_task_id = $5
+        AND assignment_revision = $11
+        AND attempt_count = $12
+        AND status = 'retryable'
+        AND metadata->>'retryPending' = 'true'
+        AND metadata->>'retryWaitingRequestKey' = $6::uuid::text
+        AND metadata->>'retryWaitingRequestHash' = $13
+        AND metadata->>'retryWaitingSourceExecutionTaskId' = $5::uuid::text
+        AND metadata->>'retryWaitingParentRevision' = $14
+        AND metadata->>'retryWaitingPlanHash' = $15
+        AND metadata->>'retryWaitingItemRevision' = $11::text
+        AND metadata->>'retryWaitingAttemptCount' = $12::text
+      RETURNING id, attempt_count
+    `, [
+      targetAgent.id,
+      child.id,
+      nextRevision,
+      continuationRequestHash,
+      lineage.sourceExecutionTaskId,
+      lineage.requestKey,
+      JSON.stringify(actionMetadata),
+      item.id,
+      item.tenant_id,
+      parent.id,
+      lineage.itemRevision,
+      lineage.attemptCount,
+      lineage.requestHash,
+      String(lineage.waitingParentRevision),
+      lineage.planHash,
+    ]);
+    if (!updatedItem) {
+      const error = new Error('orchestration_retry_pending_item_conflict');
+      error.code = 'orchestration_retry_pending_item_conflict';
+      throw error;
+    }
+    await tx.execute(`
+      INSERT INTO capture_task_item_attempts (
+        id, tenant_id, item_id, parent_task_id, execution_task_id,
+        agent_id, agent_display_name,
+        attempt_number, assignment_revision, status,
+        request_hash, checkpoint, result, error, dispatched_at
+      ) VALUES (
+        $1, $2, $3, $4, $5,
+        $6, $7, $8, $9, 'dispatched',
+        $10, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
+      )
+    `, [
+      itemAttemptId,
+      item.tenant_id,
+      item.id,
+      parent.id,
+      child.id,
+      targetAgent.id,
+      text(targetAgent.display_name, 240),
+      Number(updatedItem.attempt_count),
+      nextRevision,
+      continuationRequestHash,
+    ]);
+    const itemAttemptBindings = [{
+      itemId: item.id,
+      attemptId: itemAttemptId,
+      requestHash: continuationRequestHash,
+      attemptNumber: Number(updatedItem.attempt_count),
+      assignmentRevision: nextRevision,
+      keyword: item.keyword,
+    }];
+    const command = await tx.queryOne(`
+      INSERT INTO capture_agent_commands (
+        id, tenant_id, agent_id, task_id, command_type, payload,
+        requested_by_user_id, requested_by_name
+      ) VALUES (
+        $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
+      )
+      RETURNING id, status, expires_at, created_at
+    `, [
+      commandId,
+      item.tenant_id,
+      targetAgent.id,
+      child.id,
+      JSON.stringify({
+        taskId: child.id,
+        clientTaskId: child.id,
+        title: child.title,
+        executionMode: 'one_time',
+        platform: childPlan.platform,
+        planSnapshot: childPlan,
+        requestHash: continuationRequestHash,
+        authCodeId: targetAgent.auth_code_id,
+        authBindingId: targetAgent.auth_binding_id,
+        orchestration: {
+          parentTaskId: parent.id,
+          revision: nextRevision,
+          itemIds: [item.id],
+          itemAttempts: itemAttemptBindings,
+          retrySourceExecutionTaskIds: [lineage.sourceExecutionTaskId],
+          retryParentRequestKey: lineage.requestKey,
+        },
+      }),
+      lineage.requestedByUserId || null,
+      '系统 · 等待重试自动续接',
+    ]);
+
+    const refreshedItems = await listParentItems(
+      tx,
+      item.tenant_id,
+      parent.id,
+    );
+    const remainingWaiting = refreshedItems
+      .filter(candidate =>
+        candidate.status === 'retryable' &&
+        safeJson(candidate.metadata).retryPending === true
+      )
+      .map(publicPendingRetryItem);
+    const aggregate = aggregateParentTaskItems(refreshedItems);
+    const parentUpdate = await tx.queryOne(`
+      UPDATE capture_tasks
+      SET orchestration_revision = orchestration_revision + 1,
+        status = $1,
+        progress = $2::jsonb,
+        counts = $3::jsonb,
+        metadata = metadata || jsonb_build_object(
+          'lastRetryAt', now(),
+          'lastRetryTaskIds', jsonb_build_array($4::uuid::text),
+          'lastRetryRequestKey', $5::uuid::text,
+          'lastRetryRequestHash', $6::text,
+          'lastRetryAssignments', $7::jsonb,
+          'lastRetryWaiting', $8::jsonb,
+          'lastRetryAutoContinuationAt', now(),
+          'lastRetryAutoContinuationAction', $9::jsonb
+        ),
+        message = CASE
+          WHEN jsonb_array_length($8::jsonb) > 0
+            THEN '空闲 Agent 已自动续接一个失败关键词，其余继续等待'
+          ELSE '等待中的失败关键词已自动续接到空闲 Agent'
+        END,
+        finished_at = NULL,
+        updated_at = now(),
+        source_updated_at = now()
+      WHERE id = $10 AND tenant_id = $11
+        AND task_type = 'capture_orchestration'
+        AND orchestration_revision = $12
+      RETURNING id, orchestration_revision, status
+    `, [
+      aggregate.status,
+      JSON.stringify(aggregate.progress),
+      JSON.stringify(aggregate.counts),
+      child.id,
+      lineage.requestKey,
+      lineage.requestHash,
+      JSON.stringify([{
+        itemId: item.id,
+        agentId: targetAgent.id,
+        taskId: child.id,
+        automaticContinuation: true,
+      }]),
+      JSON.stringify(remainingWaiting),
+      JSON.stringify(actionMetadata),
+      parent.id,
+      item.tenant_id,
+      currentRevision,
+    ]);
+    if (!parentUpdate) {
+      const error = new Error('orchestration_retry_pending_revision_conflict');
+      error.code = 'orchestration_retry_pending_revision_conflict';
+      throw error;
+    }
+    await tx.execute(`
+      UPDATE capture_tasks
+      SET metadata = jsonb_set(
+        metadata,
+        '{retryWaitingItems}',
+        $1::jsonb,
+        true
+      ), updated_at = now()
+      WHERE tenant_id = $2 AND parent_task_id = $3
+        AND metadata->>'retryRequestKey' = $4::uuid::text
+    `, [
+      JSON.stringify(remainingWaiting),
+      item.tenant_id,
+      parent.id,
+      lineage.requestKey,
+    ]);
+    await appendEvent(tx, {
+      tenantId: item.tenant_id,
+      taskId: child.id,
+      agentId: targetAgent.id,
+      eventType: 'orchestration_retry_pending_child_dispatched',
+      actorType: 'system',
+      actorId: 'retry_waiting_sweeper',
+      actorName: '系统 · 等待重试自动续接',
+      status: child.status,
+      message: 'Agent 槽释放后，等待中的失败关键词已自动下发',
+      payload: actionMetadata,
+    });
+    await appendEvent(tx, {
+      tenantId: item.tenant_id,
+      taskId: parent.id,
+      agentId: targetAgent.id,
+      eventType: 'orchestration_retry_pending_dispatched',
+      actorType: 'system',
+      actorId: 'retry_waiting_sweeper',
+      actorName: '系统 · 等待重试自动续接',
+      status: parentUpdate.status,
+      message: remainingWaiting.length > 0
+        ? '已自动续接一个等待项，其余继续等待空闲 Agent'
+        : '所有等待项均已自动续接',
+      payload: {
+        ...actionMetadata,
+        revision: Number(parentUpdate.orchestration_revision),
+        commandId: command.id,
+        remainingWaiting,
+      },
+    });
+    return {
+      kind: 'dispatched',
+      tenantId: item.tenant_id,
+      parentTaskId: parent.id,
+      itemId: item.id,
+      taskId: child.id,
+      commandId: command.id,
+      agentId: targetAgent.id,
+      revision: Number(parentUpdate.orchestration_revision),
+      remainingWaiting: remainingWaiting.length,
+    };
+  }
+  const waitingCheck = waitingPreviews.length > 0
+    ? await touchPendingRetryWaitingMarkers(tx, waitingPreviews)
+    : {checkedCount: 0, checkedItemIds: []};
+  return waitingCount > 0
+    ? {kind: 'waiting_for_agent', waitingCount, ...waitingCheck, staleCount}
+    : {kind: staleCount > 0 ? 'stale' : 'empty', waitingCount, staleCount};
+}
+
+export async function reconcilePendingOrchestrationRetries(input = 10) {
+  const requested = typeof input === 'object' ? input.limit : input;
+  const numeric = Number(requested);
+  const limit = Number.isFinite(numeric)
+    ? Math.max(1, Math.min(100, Math.floor(numeric)))
+    : 10;
+  const summary = {
+    inspected: 0,
+    dispatched: 0,
+    waitingForAgent: 0,
+    stale: 0,
+    invalidated: 0,
+    failed: 0,
+    results: [],
+  };
+  const excludedItemIds = new Set();
+  for (let index = 0; index < limit; index += 1) {
+    try {
+      const result = await withTransaction(tx =>
+        dispatchOnePendingOrchestrationRetry(tx, {
+          scanLimit: Math.max(20, limit),
+          excludedItemIds: [...excludedItemIds],
+        })
+      );
+      if (result.kind === 'empty') break;
+      summary.inspected += 1;
+      summary.results.push(result);
+      if (result.kind === 'dispatched') {
+        summary.dispatched += 1;
+        continue;
+      }
+      if (result.kind === 'waiting_for_agent') {
+        summary.waitingForAgent += Number(result.waitingCount || 1);
+        for (const itemId of result.checkedItemIds || []) {
+          excludedItemIds.add(itemId);
+        }
+        if (Number(result.checkedCount || 0) > 0) continue;
+        break;
+      }
+      summary.stale += Number(result.staleCount || 1);
+      summary.invalidated += Number(result.invalidatedCount || 0);
+    } catch (error) {
+      summary.failed += 1;
+      summary.results.push({
+        kind: 'failed',
+        error: text(error?.code || error?.message || error, 240),
+      });
+    }
+  }
+  return summary;
 }
 
 router.post(
@@ -1573,6 +3083,9 @@ router.post(
             orchestrationRevision: nextRevision,
             itemIds: groupItems.map(item => item.id),
           };
+          const itemAttemptIdByItemId = new Map(
+            groupItems.map(item => [String(item.id), crypto.randomUUID()]),
+          );
           const child = await tx.queryOne(`
             INSERT INTO capture_tasks (
               id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
@@ -1608,6 +3121,70 @@ router.post(
             }),
             JSON.stringify(childMetadata),
           ]);
+          const itemAttemptBindings = [];
+          for (const item of groupItems) {
+            const updatedItem = await tx.queryOne(`
+              UPDATE capture_task_items
+              SET status = 'dispatched',
+                attempt_count = attempt_count + 1,
+                assigned_agent_id = $1,
+                execution_task_id = $2,
+                assignment_revision = $3,
+                request_hash = $4,
+                assigned_at = now(),
+                dispatched_at = now(),
+                updated_at = now()
+              WHERE id = $5 AND tenant_id = $6 AND task_id = $7
+                AND status = 'pending'
+                AND assigned_agent_id IS NULL
+                AND execution_task_id IS NULL
+              RETURNING id, attempt_count, assignment_revision, request_hash
+            `, [
+              agentId,
+              child.id,
+              nextRevision,
+              childRequestHash,
+              item.id,
+              req.tenantId,
+              parent.id,
+            ]);
+            if (!updatedItem) {
+              const conflict = new Error('orchestration_item_assignment_conflict');
+              conflict.code = 'orchestration_item_assignment_conflict';
+              throw conflict;
+            }
+            await tx.execute(`
+              INSERT INTO capture_task_item_attempts (
+                id, tenant_id, item_id, parent_task_id, execution_task_id,
+                agent_id, agent_display_name,
+                attempt_number, assignment_revision, status,
+                request_hash, checkpoint, result, error, dispatched_at
+              ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9, 'dispatched',
+                $10, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
+              )
+            `, [
+              itemAttemptIdByItemId.get(String(item.id)),
+              req.tenantId,
+              item.id,
+              parent.id,
+              child.id,
+              agentId,
+              text(agent.display_name, 240),
+              Number(updatedItem.attempt_count),
+              Number(updatedItem.assignment_revision),
+              updatedItem.request_hash,
+            ]);
+            itemAttemptBindings.push({
+              itemId: updatedItem.id,
+              attemptId: itemAttemptIdByItemId.get(String(item.id)),
+              requestHash: updatedItem.request_hash,
+              attemptNumber: Number(updatedItem.attempt_count),
+              assignmentRevision: Number(updatedItem.assignment_revision),
+              keyword: item.keyword,
+            });
+          }
           const command = await tx.queryOne(`
             INSERT INTO capture_agent_commands (
               id, tenant_id, agent_id, task_id, command_type, payload,
@@ -1635,65 +3212,12 @@ router.post(
                 parentTaskId: parent.id,
                 revision: nextRevision,
                 itemIds: groupItems.map(item => item.id),
+                itemAttempts: itemAttemptBindings,
               },
             }),
             req.user?.id || null,
             text(req.actorName, 240),
           ]);
-          for (const item of groupItems) {
-            const updatedItem = await tx.queryOne(`
-              UPDATE capture_task_items
-              SET status = 'dispatched',
-                attempt_count = attempt_count + 1,
-                assigned_agent_id = $1,
-                execution_task_id = $2,
-                assignment_revision = $3,
-                request_hash = $4,
-                assigned_at = now(),
-                dispatched_at = now(),
-                updated_at = now()
-              WHERE id = $5 AND tenant_id = $6 AND task_id = $7
-                AND status = 'pending'
-                AND assigned_agent_id IS NULL
-                AND execution_task_id IS NULL
-              RETURNING id
-            `, [
-              agentId,
-              child.id,
-              nextRevision,
-              childRequestHash,
-              item.id,
-              req.tenantId,
-              parent.id,
-            ]);
-            if (!updatedItem) {
-              const conflict = new Error('orchestration_item_assignment_conflict');
-              conflict.code = 'orchestration_item_assignment_conflict';
-              throw conflict;
-            }
-            await tx.execute(`
-              INSERT INTO capture_task_item_attempts (
-                id, tenant_id, item_id, parent_task_id, execution_task_id,
-                agent_id, agent_display_name,
-                attempt_number, assignment_revision, status,
-                request_hash, checkpoint, result, error, dispatched_at
-              ) VALUES (
-                $1, $2, $3, $4, $5,
-                $6, $7, 1, $8, 'dispatched',
-                $9, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
-              )
-            `, [
-              crypto.randomUUID(),
-              req.tenantId,
-              item.id,
-              parent.id,
-              child.id,
-              agentId,
-              text(agent.display_name, 240),
-              nextRevision,
-              childRequestHash,
-            ]);
-          }
           await appendEvent(tx, {
             tenantId: req.tenantId,
             taskId: child.id,
@@ -3134,37 +4658,59 @@ router.post(
       if (!orchestrationId) return;
       const normalized = normalizeRetryItems(req.body);
       if (normalized.failure) return sendRequestError(res, normalized.failure);
-      const retryRequestHash = hashOrchestrationRequest({
-        action: 'retry_items',
-        orchestrationId,
-        expectedRevision: normalized.expectedRevision,
-        targetAgentId: normalized.targetAgentId,
-        itemIds: [...normalized.itemIds].sort(),
-        confirmSafety: normalized.confirmSafety,
-      });
+      const retryRequestHash = hashOrchestrationRequest(
+        normalized.legacyTargetAgentId
+          ? {
+              action: 'retry_items',
+              orchestrationId,
+              expectedRevision: normalized.expectedRevision,
+              targetAgentId: normalized.legacyTargetAgentId,
+              itemIds: [...normalized.itemIds].sort(),
+              confirmSafety: normalized.confirmSafety,
+            }
+          : {
+              action: 'retry_items_atomic_shard',
+              orchestrationId,
+              expectedRevision: normalized.expectedRevision,
+              itemIds: [...normalized.itemIds].sort(),
+              assignments: [...normalized.assignments].sort((left, right) =>
+                left.itemId.localeCompare(right.itemId)
+              ),
+              confirmSafety: normalized.confirmSafety,
+            },
+      );
       const result = await withTransaction(async tx => {
         await tx.execute(
           'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
           ['capture_task_global_id', normalized.requestKey],
         );
-        await lockCaptureAgentExecutionSlot(
-          tx,
-          req.tenantId,
-          normalized.targetAgentId,
-        );
-        const existingTask = await tx.queryOne(`
+        const existingTasks = await tx.queryAll(`
           SELECT id, parent_task_id, assigned_agent_id, status, metadata
           FROM capture_tasks
-          WHERE id = $1::uuid AND tenant_id = $2
+          WHERE tenant_id = $1 AND parent_task_id = $2
+            AND (
+              id = $3::uuid
+              OR metadata->>'retryRequestKey' = $3::uuid::text
+            )
+          ORDER BY id
           FOR UPDATE
-        `, [normalized.requestKey, req.tenantId]);
-        if (existingTask) {
-          const existingMetadata = safeJson(existingTask.metadata);
-          const exactReplay =
-            String(existingTask.parent_task_id || '') === orchestrationId &&
-            String(existingTask.assigned_agent_id || '') ===
-              normalized.targetAgentId &&
-            existingMetadata.retryRequestHash === retryRequestHash;
+        `, [req.tenantId, orchestrationId, normalized.requestKey]);
+        const existingWaitingItems = await tx.queryAll(`
+          SELECT id, keyword, metadata
+          FROM capture_task_items
+          WHERE tenant_id = $1 AND task_id = $2
+            AND status = 'retryable'
+            AND metadata->>'retryPending' = 'true'
+            AND metadata->>'retryWaitingRequestKey' = $3::uuid::text
+          ORDER BY ordinal, id
+          FOR UPDATE
+        `, [req.tenantId, orchestrationId, normalized.requestKey]);
+        if (existingTasks.length > 0 || existingWaitingItems.length > 0) {
+          const exactReplay = existingTasks.every(task =>
+            safeJson(task.metadata).retryRequestHash === retryRequestHash
+          ) && existingWaitingItems.every(item =>
+            safeJson(item.metadata).retryWaitingRequestHash === retryRequestHash
+          );
           if (!exactReplay) {
             return {failure: requestError(
               'idempotency_key_conflict',
@@ -3172,38 +4718,114 @@ router.post(
               409,
             )};
           }
-          const command = await tx.queryOne(`
-            SELECT id, status
+          const taskIds = existingTasks.map(task => task.id);
+          const commands = await tx.queryAll(`
+            SELECT id, task_id, status
             FROM capture_agent_commands
-            WHERE tenant_id = $1 AND task_id = $2
-              AND agent_id = $3 AND command_type = 'create'
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-          `, [req.tenantId, existingTask.id, normalized.targetAgentId]);
+            WHERE tenant_id = $1 AND task_id = ANY($2::uuid[])
+              AND command_type = 'create'
+            ORDER BY task_id, created_at DESC, id DESC
+          `, [req.tenantId, taskIds]);
+          const commandByTaskId = new Map();
+          for (const command of commands) {
+            if (!commandByTaskId.has(String(command.task_id))) {
+              commandByTaskId.set(String(command.task_id), command);
+            }
+          }
           const items = await tx.queryAll(`
-            SELECT id, keyword
+            SELECT id, keyword, execution_task_id
             FROM capture_task_items
             WHERE tenant_id = $1 AND task_id = $2
-              AND execution_task_id = $3
+              AND execution_task_id = ANY($3::uuid[])
             ORDER BY ordinal, id
-          `, [req.tenantId, orchestrationId, existingTask.id]);
-          return {
-            existing: true,
-            revision: Number(existingMetadata.orchestrationRevision || 0),
-            execution: {
-              taskId: existingTask.id,
-              agentId: existingTask.assigned_agent_id,
+          `, [req.tenantId, orchestrationId, taskIds]);
+          const executions = existingTasks.map(task => {
+            const command = commandByTaskId.get(String(task.id));
+            const taskItems = items.filter(item =>
+              String(item.execution_task_id) === String(task.id)
+            );
+            return {
+              taskId: task.id,
+              agentId: task.assigned_agent_id,
               commandId: command?.id || null,
               commandStatus: command?.status || '',
-              status: existingTask.status,
-              itemIds: items.map(item => item.id),
-              keywords: items.map(item => item.keyword),
-            },
+              status: task.status,
+              itemIds: taskItems.map(item => item.id),
+              keywords: taskItems.map(item => item.keyword),
+            };
+          });
+          const waiting = existingWaitingItems.map(publicPendingRetryItem);
+          const replayParent = await tx.queryOne(
+            parentSelect(),
+            [orchestrationId, req.tenantId],
+          );
+          return {
+            existing: true,
+            revision: Number(replayParent?.orchestration_revision || 0),
+            executions,
+            waiting,
           };
         }
+        if (normalized.legacyBatchTarget) {
+          return {failure: requestError(
+            'legacy_retry_target_not_atomic',
+            '批量重试不再接受统一 targetAgentId，请使用逐项覆盖或自动分配',
+          )};
+        }
+        // Read the parent once to discover the candidate pool, reserve all
+        // candidate execution slots in stable ID order, then lock and re-read
+        // the parent/items below before making any assignment.
+        const parentPreview = await tx.queryOne(
+          parentSelect(),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parentPreview) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        const explicitAgentIds = normalized.assignments.map(
+          assignment => assignment.agentId,
+        );
+        if (explicitAgentIds.length > 0) {
+          const explicitAgents = await loadCompatibleAgents(
+            tx,
+            req.tenantId,
+            explicitAgentIds,
+            parentPreview.platform,
+            safeJson(parentPreview.metadata?.planSnapshot),
+          );
+          if (explicitAgents.failure) {
+            return {failure: explicitAgents.failure};
+          }
+        }
+        const candidateIdRows = await loadRetryAgentCandidates(tx, {
+          tenantId: req.tenantId,
+          platform: parentPreview.platform,
+        });
+        const candidateAgentIds = [...new Set(
+          candidateIdRows.map(row => String(row.id)),
+        )].sort((left, right) => left.localeCompare(right));
+        for (const agentId of candidateAgentIds) {
+          await lockCaptureAgentExecutionSlot(tx, req.tenantId, agentId);
+        }
+        // All retry dispatchers share one lock order: Agent advisory slots,
+        // Agent/usage rows, source executions, parent, then items. In
+        // particular, never acquire capture_agents after a parent/item lock;
+        // the automatic retry consumer already owns that Agent row first.
+        const candidateAgents = candidateAgentIds.length > 0
+          ? await loadRetryAgentCandidates(tx, {
+              tenantId: req.tenantId,
+              platform: parentPreview.platform,
+              agentIds: candidateAgentIds,
+              lock: true,
+            })
+          : [];
         // Agent heartbeats lock a child execution before its parent. Resolve
-        // and lock the selected source executions first so retry dispatch
-        // cannot deadlock a late terminal heartbeat.
+        // and lock the selected source executions before parent/items so retry
+        // dispatch cannot deadlock a late terminal heartbeat.
         const sourceTasks = await tx.queryAll(`
           SELECT source.id, source.status, source.assigned_agent_id
           FROM capture_tasks source
@@ -3301,83 +4923,82 @@ router.post(
           )};
         }
 
-        const planSnapshot = safeJson(parent.metadata?.planSnapshot);
-        const compatible = await loadCompatibleAgents(
-          tx,
-          req.tenantId,
-          [normalized.targetAgentId],
-          parent.platform,
-          planSnapshot,
-          {lock: true},
-        );
-        if (compatible.failure) return {failure: compatible.failure};
-        const targetAgent = compatible.agentsById.get(normalized.targetAgentId);
-        if (!captureAgentOnline(targetAgent.last_heartbeat_at)) {
-          return {failure: requestError(
-            'retry_target_offline',
-            '目标 Agent 当前离线，请选择在线空闲节点',
-            409,
-          )};
-        }
-        const targetBusyTask = await findCaptureAgentExecutionSlotBlocker(
-          tx,
-          req.tenantId,
-          normalized.targetAgentId,
-        );
-        if (targetBusyTask) {
-          return {failure: requestError(
-            'retry_target_busy',
-            '目标 Agent 当前有执行中或排队任务，请选择空闲节点',
-            409,
-            {
-              blockingTaskId: targetBusyTask.task_id || targetBusyTask.id,
-              blockingTaskStatus: targetBusyTask.status,
-              blockerKind: targetBusyTask.kind,
-            },
-          )};
-        }
-
         retryItems.sort(
           (left, right) => Number(left.ordinal) - Number(right.ordinal),
         );
-        const nextRevision = currentRevision + 1;
-        const childTaskId = normalized.requestKey;
-        const commandId = crypto.randomUUID();
-        const childTaskInput = normalizeRemoteTaskInput({
-          clientTaskId: childTaskId,
-          title: `${parent.title} · 云端重试`,
-          executionMode: 'one_time',
-          planSnapshot: {
-            ...planSnapshot,
-            enabled: true,
-            autoLoop: false,
-            maxRounds: 1,
-            roundGapMin: 0,
-            platform: parent.platform,
-            keywords: retryItems.map(item => item.keyword),
-          },
+        const planSnapshot = safeJson(parent.metadata?.planSnapshot);
+        const idleAgents = [];
+        for (const agent of candidateAgents) {
+          const agentId = String(agent.id);
+          if (
+            agentCompatibilityFailure(agent, parent.platform, planSnapshot) ||
+            !captureAgentOnline(agent.last_heartbeat_at) ||
+            !crossDeviceRetryAgentDailyUsageEligible(agent)
+          ) continue;
+          const blocker = await findCaptureAgentExecutionSlotBlocker(
+            tx,
+            req.tenantId,
+            agentId,
+          );
+          if (blocker) continue;
+          idleAgents.push(agent);
+        }
+        const allocation = allocateRetryItemsForRetry({
+          items: retryItems,
+          agents: idleAgents,
+          overrides: normalized.assignments,
         });
-        const childPlan = childTaskInput.planSnapshot;
-        const total = childPlan.keywords.length;
-        const childMetadata = {
-          remoteCreated: true,
-          remoteRequestHash: retryRequestHash,
-          createCommandId: commandId,
-          requestedByUserId: req.user?.id || '',
-          requestedByName: text(req.actorName, 240),
-          executionMode: 'one_time',
-          planSnapshot: childPlan,
-          orchestrationChild: true,
-          parentTaskId: parent.id,
-          orchestrationRevision: nextRevision,
-          itemIds: retryItems.map(item => item.id),
-          retryRequestHash,
-          retryRequestKey: normalized.requestKey,
-          retrySourceExecutionTaskIds: sourceTaskIds,
-          retryConfirmedByUser: true,
-          retrySafetyConfirmed: normalized.confirmSafety,
-        };
-        const child = await tx.queryOne(`
+        const retryAssignments = allocation.dispatched;
+        const waiting = allocation.waiting;
+        const nextRevision = currentRevision + 1;
+        const executions = [];
+        for (let index = 0; index < retryAssignments.length; index += 1) {
+          const {item, agentId, agent} = retryAssignments[index];
+          const childTaskId = index === 0
+            ? normalized.requestKey
+            : crypto.randomUUID();
+          const commandId = crypto.randomUUID();
+          const itemAttemptId = crypto.randomUUID();
+          const childTaskInput = normalizeRemoteTaskInput({
+            clientTaskId: childTaskId,
+            title: `${parent.title} · ${text(item.keyword, 80)}重试`,
+            executionMode: 'one_time',
+            planSnapshot: {
+              ...planSnapshot,
+              enabled: true,
+              autoLoop: false,
+              maxRounds: 1,
+              roundGapMin: 0,
+              platform: parent.platform,
+              keywords: [item.keyword],
+            },
+          });
+          const childPlan = childTaskInput.planSnapshot;
+          const childMetadata = {
+            remoteCreated: true,
+            remoteRequestHash: retryRequestHash,
+            createCommandId: commandId,
+            requestedByUserId: req.user?.id || '',
+            requestedByName: text(req.actorName, 240),
+            executionMode: 'one_time',
+            planSnapshot: childPlan,
+            orchestrationChild: true,
+            parentTaskId: parent.id,
+            orchestrationRevision: nextRevision,
+            itemIds: [item.id],
+            retryRequestHash,
+            retryRequestKey: normalized.requestKey,
+            retryBatchSize: retryItems.length,
+            retryDispatchOrdinal: index,
+            retryDispatchedItemIds: retryAssignments.map(
+              assignment => assignment.item.id,
+            ),
+            retryWaitingItems: waiting,
+            retrySourceExecutionTaskIds: [item.execution_task_id],
+            retryConfirmedByUser: true,
+            retrySafetyConfirmed: normalized.confirmSafety,
+          };
+          const child = await tx.queryOne(`
           INSERT INTO capture_tasks (
             id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
             client_task_id, task_type, feature_key, title, platform,
@@ -3393,59 +5014,24 @@ router.post(
           )
           RETURNING id, parent_task_id, assigned_agent_id, title, platform,
             status, progress, counts, metadata, created_at, updated_at
-        `, [
-          childTaskId,
-          req.tenantId,
-          parent.id,
-          normalized.targetAgentId,
-          childTaskInput.title,
-          parent.platform,
-          JSON.stringify({current: 0, total, phase: 'queued'}),
+          `, [
+            childTaskId,
+            req.tenantId,
+            parent.id,
+            agentId,
+            childTaskInput.title,
+            parent.platform,
+            JSON.stringify({current: 0, total: 1, phase: 'queued'}),
           JSON.stringify({round: 1, keywordIndex: 0}),
           JSON.stringify({
-            total,
+            total: 1,
             processed: 0,
             success: 0,
             failed: 0,
             skipped: 0,
           }),
-          JSON.stringify(childMetadata),
-        ]);
-        const command = await tx.queryOne(`
-          INSERT INTO capture_agent_commands (
-            id, tenant_id, agent_id, task_id, command_type, payload,
-            requested_by_user_id, requested_by_name
-          ) VALUES (
-            $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
-          )
-          RETURNING id, status, expires_at, created_at
-        `, [
-          commandId,
-          req.tenantId,
-          normalized.targetAgentId,
-          child.id,
-          JSON.stringify({
-            taskId: child.id,
-            clientTaskId: child.id,
-            title: child.title,
-            executionMode: 'one_time',
-            platform: childPlan.platform,
-            planSnapshot: childPlan,
-            requestHash: retryRequestHash,
-            authCodeId: targetAgent.auth_code_id,
-            authBindingId: targetAgent.auth_binding_id,
-            orchestration: {
-              parentTaskId: parent.id,
-              revision: nextRevision,
-              itemIds: retryItems.map(item => item.id),
-              retrySourceExecutionTaskIds: sourceTaskIds,
-            },
-          }),
-          req.user?.id || null,
-          text(req.actorName, 240),
-        ]);
-
-        for (const item of retryItems) {
+            JSON.stringify(childMetadata),
+          ]);
           const updatedItem = await tx.queryOne(`
             UPDATE capture_task_items
             SET status = 'dispatched',
@@ -3455,7 +5041,21 @@ router.post(
               assignment_revision = $3,
               request_hash = $4,
               error = '{}'::jsonb,
-              metadata = metadata || jsonb_build_object(
+              metadata = (
+                metadata - ARRAY[
+                  'retryPending', 'retryWaitingSince',
+                  'retryWaitingRequestKey', 'retryWaitingRequestHash',
+                  'retryWaitingPlanHash',
+                  'retryWaitingReason', 'retryWaitingAgentId',
+                  'retryWaitingParentRevision', 'retryWaitingItemRevision',
+                  'retryWaitingAttemptCount',
+                  'retryWaitingSourceExecutionTaskId',
+                  'retryWaitingSafetyConfirmed',
+                  'retryWaitingRequestedByUserId',
+                  'retryWaitingRequestedByName', 'retryWaitingBatchSize',
+                  'retryWaitingDispatchOrdinal', 'retryWaitingLastCheckedAt'
+                ]::text[]
+              ) || jsonb_build_object(
                 'retrySourceExecutionTaskId', $5::uuid::text,
                 'retryRequestKey', $6::uuid::text
               ),
@@ -3468,9 +5068,9 @@ router.post(
               AND execution_task_id IS NOT DISTINCT FROM $5
               AND assignment_revision = $10
               AND status IN ('retryable', 'needs_action', 'failed')
-            RETURNING id, attempt_count
+            RETURNING id, attempt_count, assignment_revision, request_hash
           `, [
-            normalized.targetAgentId,
+            agentId,
             child.id,
             nextRevision,
             retryRequestHash,
@@ -3498,17 +5098,152 @@ router.post(
               $10, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
             )
           `, [
-            crypto.randomUUID(),
+            itemAttemptId,
             req.tenantId,
             item.id,
             parent.id,
             child.id,
-            normalized.targetAgentId,
-            text(targetAgent.display_name, 240),
+            agentId,
+            text(agent.display_name, 240),
             Number(updatedItem.attempt_count),
             nextRevision,
             retryRequestHash,
           ]);
+          const itemAttemptBindings = [{
+            itemId: updatedItem.id,
+            attemptId: itemAttemptId,
+            requestHash: updatedItem.request_hash,
+            attemptNumber: Number(updatedItem.attempt_count),
+            assignmentRevision: Number(updatedItem.assignment_revision),
+            keyword: item.keyword,
+          }];
+          const command = await tx.queryOne(`
+          INSERT INTO capture_agent_commands (
+            id, tenant_id, agent_id, task_id, command_type, payload,
+            requested_by_user_id, requested_by_name
+          ) VALUES (
+            $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
+          )
+          RETURNING id, status, expires_at, created_at
+          `, [
+            commandId,
+            req.tenantId,
+            agentId,
+            child.id,
+            JSON.stringify({
+            taskId: child.id,
+            clientTaskId: child.id,
+            title: child.title,
+            executionMode: 'one_time',
+            platform: childPlan.platform,
+            planSnapshot: childPlan,
+            requestHash: retryRequestHash,
+            authCodeId: agent.auth_code_id,
+            authBindingId: agent.auth_binding_id,
+            orchestration: {
+              parentTaskId: parent.id,
+              revision: nextRevision,
+              itemIds: [item.id],
+              itemAttempts: itemAttemptBindings,
+              retrySourceExecutionTaskIds: [item.execution_task_id],
+            },
+          }),
+          req.user?.id || null,
+          text(req.actorName, 240),
+          ]);
+          await appendEvent(tx, {
+            tenantId: req.tenantId,
+            taskId: child.id,
+            agentId,
+            eventType: 'orchestration_retry_child_dispatched',
+            actorId: req.user?.id || '',
+            actorName: req.actorName,
+            status: child.status,
+            message: '失败关键词已按单项租约向 Agent 下发',
+            payload: {
+              parentTaskId: parent.id,
+              revision: nextRevision,
+              commandId: command.id,
+              sourceExecutionTaskIds: [item.execution_task_id],
+              itemIds: [item.id],
+              keywords: [item.keyword],
+            },
+          });
+          executions.push({
+            taskId: child.id,
+            agentId,
+            commandId: command.id,
+            commandStatus: command.status,
+            status: child.status,
+            itemIds: [item.id],
+            keywords: [item.keyword],
+          });
+        }
+
+        const retryItemById = new Map(
+          retryItems.map(item => [String(item.id), item]),
+        );
+        const retryOrdinalById = new Map(
+          retryItems.map((item, index) => [String(item.id), index]),
+        );
+        for (const waitingItem of waiting) {
+          const item = retryItemById.get(waitingItem.itemId);
+          const preserved = await tx.queryOne(`
+            UPDATE capture_task_items
+            SET status = 'retryable',
+              metadata = (metadata - 'retryWaitingLastCheckedAt') ||
+                jsonb_build_object(
+                'retryPending', true,
+                'retryWaitingSince', now(),
+                'retryWaitingRequestKey', $1::uuid::text,
+                'retryWaitingRequestHash', $2::text,
+                'retryWaitingReason', $3::text,
+                'retryWaitingAgentId', $4::text,
+                'retryWaitingParentRevision', $5::integer,
+                'retryWaitingItemRevision', $6::integer,
+                'retryWaitingAttemptCount', $7::integer,
+                'retryWaitingSourceExecutionTaskId', $8::uuid::text,
+                'retryWaitingSafetyConfirmed', $9::boolean,
+                'retryWaitingRequestedByUserId', $10::text,
+                'retryWaitingRequestedByName', $11::text,
+                'retryWaitingBatchSize', $12::integer,
+                'retryWaitingDispatchOrdinal', $13::integer,
+                'retryWaitingPlanHash', $14::text
+              ),
+              updated_at = now()
+            WHERE id = $15 AND tenant_id = $16 AND task_id = $17
+              AND execution_task_id IS NOT DISTINCT FROM $18
+              AND assignment_revision = $19
+              AND attempt_count = $20
+              AND status IN ('retryable', 'needs_action', 'failed')
+            RETURNING id, status
+          `, [
+            normalized.requestKey,
+            retryRequestHash,
+            waitingItem.reason,
+            waitingItem.agentId || '',
+            nextRevision,
+            Number(item.assignment_revision || 0),
+            Number(item.attempt_count || 0),
+            item.execution_task_id,
+            normalized.confirmSafety,
+            req.user?.id || '',
+            text(req.actorName, 240),
+            retryItems.length,
+            retryOrdinalById.get(waitingItem.itemId) || 0,
+            hashOrchestrationRequest(planSnapshot),
+            item.id,
+            req.tenantId,
+            parent.id,
+            item.execution_task_id,
+            Number(item.assignment_revision || 0),
+            Number(item.attempt_count || 0),
+          ]);
+          if (!preserved) {
+            const error = new Error('orchestration_retry_item_conflict');
+            error.code = 'orchestration_retry_item_conflict';
+            throw error;
+          }
         }
 
         const refreshedItems = await listParentItems(
@@ -3525,25 +5260,39 @@ router.post(
             counts = $3::jsonb,
             metadata = metadata || jsonb_build_object(
               'lastRetryAt', now(),
-              'lastRetryTaskId', $4::uuid::text,
+              'lastRetryTaskIds', $4::jsonb,
               'lastRetryRequestKey', $5::uuid::text,
-              'lastRetryTargetAgentId', $6::uuid::text
+              'lastRetryRequestHash', $6::text,
+              'lastRetryAssignments', $7::jsonb,
+              'lastRetryWaiting', $8::jsonb
             ),
-            message = '失败关键词已从云端下发重试',
+            message = CASE
+              WHEN jsonb_array_length($4::jsonb) = 0
+                THEN '失败关键词正在等待空闲 Agent，释放后将自动续接'
+              WHEN jsonb_array_length($8::jsonb) > 0
+                THEN '部分失败关键词已分片下发，其余等待空闲 Agent'
+              ELSE '失败关键词已按单项租约分片下发重试'
+            END,
             finished_at = NULL,
             updated_at = now(),
             source_updated_at = now()
-          WHERE id = $7 AND tenant_id = $8
+          WHERE id = $9 AND tenant_id = $10
             AND task_type = 'capture_orchestration'
-            AND orchestration_revision = $9
+            AND orchestration_revision = $11
           RETURNING id, orchestration_revision, status
         `, [
           aggregate.status,
           JSON.stringify(aggregate.progress),
           JSON.stringify(aggregate.counts),
-          child.id,
+          JSON.stringify(executions.map(execution => execution.taskId)),
           normalized.requestKey,
-          normalized.targetAgentId,
+          retryRequestHash,
+          JSON.stringify(executions.map(execution => ({
+            itemId: execution.itemIds[0],
+            agentId: execution.agentId,
+            taskId: execution.taskId,
+          }))),
+          JSON.stringify(waiting),
           parent.id,
           req.tenantId,
           currentRevision,
@@ -3555,34 +5304,27 @@ router.post(
         }
         await appendEvent(tx, {
           tenantId: req.tenantId,
-          taskId: child.id,
-          agentId: normalized.targetAgentId,
-          eventType: 'orchestration_retry_child_dispatched',
-          actorId: req.user?.id || '',
-          actorName: req.actorName,
-          status: child.status,
-          message: '失败关键词重试已向目标 Agent 下发',
-          payload: {
-            parentTaskId: parent.id,
-            revision: nextRevision,
-            commandId: command.id,
-            sourceExecutionTaskIds: sourceTaskIds,
-            itemIds: retryItems.map(item => item.id),
-            keywords: retryItems.map(item => item.keyword),
-          },
-        });
-        await appendEvent(tx, {
-          tenantId: req.tenantId,
           taskId: parent.id,
-          eventType: 'orchestration_retry_dispatched',
+          eventType: executions.length > 0
+            ? 'orchestration_retry_dispatched'
+            : 'orchestration_retry_waiting',
           actorId: req.user?.id || '',
           actorName: req.actorName,
           status: parentUpdate.status,
-          message: '失败关键词已在同一无人值守任务内重试',
+          message: executions.length === 0
+            ? '失败关键词已进入等待队列，将在 Agent 槽释放后自动续接'
+            : waiting.length > 0
+            ? '部分失败关键词已分片重试，其余等待空闲 Agent'
+            : '失败关键词已按单项租约分片重试',
           payload: {
+            action: executions.length > 0
+              ? 'retry_items_atomic_shard'
+              : 'retry_items_waiting_for_agent',
+            requestKey: normalized.requestKey,
+            requestHash: retryRequestHash,
             revision: parentUpdate.orchestration_revision,
-            retryTaskId: child.id,
-            targetAgentId: normalized.targetAgentId,
+            executions,
+            waiting,
             sourceExecutionTaskIds: sourceTaskIds,
             itemIds: retryItems.map(item => item.id),
           },
@@ -3590,15 +5332,8 @@ router.post(
         return {
           existing: false,
           revision: Number(parentUpdate.orchestration_revision),
-          execution: {
-            taskId: child.id,
-            agentId: normalized.targetAgentId,
-            commandId: command.id,
-            commandStatus: command.status,
-            status: child.status,
-            itemIds: retryItems.map(item => item.id),
-            keywords: retryItems.map(item => item.keyword),
-          },
+          executions,
+          waiting,
         };
       });
       if (result.failure) return sendRequestError(res, result.failure);
@@ -3608,10 +5343,17 @@ router.post(
         action: 'retry_items',
         orchestrationId,
         revision: result.revision,
-        execution: result.execution,
+        execution: result.executions[0] || null,
+        dispatched: result.executions,
+        executions: result.executions,
+        waiting: result.waiting,
         message: result.existing
-          ? '该失败项重试请求已经下发'
-          : '失败关键词已在原无人值守任务中重新下发',
+          ? '该失败项分片重试请求已经下发'
+          : result.executions.length === 0
+            ? `${result.waiting.length} 个关键词正在等待空闲 Agent，释放后将自动续接`
+          : result.waiting.length > 0
+            ? `${result.executions.length} 个关键词已接力，${result.waiting.length} 个等待空闲 Agent`
+            : '失败关键词已按单项租约分片到空闲 Agent',
       });
     } catch (error) {
       if (
@@ -4020,6 +5762,9 @@ router.post(
         const nextRevision = currentRevision + 1;
         const childTaskId = normalized.requestKey;
         const commandId = crypto.randomUUID();
+        const itemAttemptIdByItemId = new Map(
+          eligibleItems.map(item => [String(item.id), crypto.randomUUID()]),
+        );
         const childTaskInput = normalizeRemoteTaskInput({
           clientTaskId: childTaskId,
           title: `${parent.title} · 接力`,
@@ -4086,40 +5831,7 @@ router.post(
           }),
           JSON.stringify(childMetadata),
         ]);
-        const command = await tx.queryOne(`
-          INSERT INTO capture_agent_commands (
-            id, tenant_id, agent_id, task_id, command_type, payload,
-            requested_by_user_id, requested_by_name
-          ) VALUES (
-            $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
-          )
-          RETURNING id, status, expires_at, created_at
-        `, [
-          commandId,
-          req.tenantId,
-          normalized.targetAgentId,
-          child.id,
-          JSON.stringify({
-            taskId: child.id,
-            clientTaskId: child.id,
-            title: child.title,
-            executionMode: 'one_time',
-            platform: childPlan.platform,
-            planSnapshot: childPlan,
-            requestHash: handoffRequestHash,
-            authCodeId: targetAgent.auth_code_id,
-            authBindingId: targetAgent.auth_binding_id,
-            orchestration: {
-              parentTaskId: parent.id,
-              revision: nextRevision,
-              itemIds: eligibleItems.map(item => item.id),
-              handoffSourceExecutionTaskId: sourceTask.id,
-            },
-          }),
-          req.user?.id || null,
-          text(req.actorName, 240),
-        ]);
-
+        const itemAttemptBindings = [];
         for (const item of eligibleItems) {
           await tx.execute(`
             UPDATE capture_task_item_attempts
@@ -4164,7 +5876,7 @@ router.post(
                 'completed', 'completed_with_warnings',
                 'failed', 'skipped'
               )
-            RETURNING id, attempt_count
+            RETURNING id, attempt_count, assignment_revision, request_hash
           `, [
             normalized.targetAgentId,
             child.id,
@@ -4194,7 +5906,7 @@ router.post(
               $10, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
             )
           `, [
-            crypto.randomUUID(),
+            itemAttemptIdByItemId.get(String(item.id)),
             req.tenantId,
             item.id,
             parent.id,
@@ -4205,7 +5917,49 @@ router.post(
             nextRevision,
             handoffRequestHash,
           ]);
+          itemAttemptBindings.push({
+            itemId: updatedItem.id,
+            attemptId: itemAttemptIdByItemId.get(String(item.id)),
+            requestHash: updatedItem.request_hash,
+            attemptNumber: Number(updatedItem.attempt_count),
+            assignmentRevision: Number(updatedItem.assignment_revision),
+            keyword: item.keyword,
+          });
         }
+        const command = await tx.queryOne(`
+          INSERT INTO capture_agent_commands (
+            id, tenant_id, agent_id, task_id, command_type, payload,
+            requested_by_user_id, requested_by_name
+          ) VALUES (
+            $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
+          )
+          RETURNING id, status, expires_at, created_at
+        `, [
+          commandId,
+          req.tenantId,
+          normalized.targetAgentId,
+          child.id,
+          JSON.stringify({
+            taskId: child.id,
+            clientTaskId: child.id,
+            title: child.title,
+            executionMode: 'one_time',
+            platform: childPlan.platform,
+            planSnapshot: childPlan,
+            requestHash: handoffRequestHash,
+            authCodeId: targetAgent.auth_code_id,
+            authBindingId: targetAgent.auth_binding_id,
+            orchestration: {
+              parentTaskId: parent.id,
+              revision: nextRevision,
+              itemIds: eligibleItems.map(item => item.id),
+              itemAttempts: itemAttemptBindings,
+              handoffSourceExecutionTaskId: sourceTask.id,
+            },
+          }),
+          req.user?.id || null,
+          text(req.actorName, 240),
+        ]);
         await tx.execute(`
           UPDATE capture_tasks
           SET status = 'superseded',
@@ -4449,6 +6203,16 @@ router.get(
             )
           ORDER BY ca.id
         `, [req.tenantId, orchestration.id, eligibleAgentIds]);
+        const retryCandidates = SUPPORTED_PLATFORMS.has(orchestration.platform)
+          ? (await loadRetryAgentCandidates(tx, {
+              tenantId: req.tenantId,
+              platform: orchestration.platform,
+            })).filter(agent => !agentCompatibilityFailure(
+              agent,
+              orchestration.platform,
+              safeJson(orchestration.metadata?.planSnapshot),
+            ))
+          : [];
         const attempts = await tx.queryAll(`
           SELECT attempt.*,
             COALESCE(NULLIF(attempt.agent_display_name, ''), ca.display_name, '')
@@ -4470,7 +6234,15 @@ router.get(
           req.tenantId,
           orchestration.orchestration_schedule_id,
         );
-        return {orchestration, items, executions, agents, attempts, schedule};
+        return {
+          orchestration,
+          items,
+          executions,
+          agents,
+          retryCandidates,
+          attempts,
+          schedule,
+        };
       });
       if (!result) {
         return sendRequestError(res, requestError(
@@ -4479,7 +6251,15 @@ router.get(
           404,
         ));
       }
-      const {orchestration, items, executions, agents, attempts, schedule} = result;
+      const {
+        orchestration,
+        items,
+        executions,
+        agents,
+        retryCandidates,
+        attempts,
+        schedule,
+      } = result;
       return res.json({
         ok: true,
         orchestration: {
@@ -4494,6 +6274,7 @@ router.get(
           agent_online: captureAgentOnline(execution.agent_last_heartbeat_at),
         })),
         agents: agents.map(publicAgent),
+        retryCandidates: retryCandidates.map(publicRetryAgentCandidate),
         attempts,
         schedule,
       });

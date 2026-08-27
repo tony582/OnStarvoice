@@ -3,12 +3,48 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.93',
+  latestVersion: '0.3.94',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-25',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.93-20260825.zip',
+  releaseDate: '2026-08-27',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.94-20260827.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.94',
+      releaseDate: '2026-08-27',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '慢搜索按真实页面进度等待',
+              desc: '抖音弱网下不再只按固定时间判失败；搜索结果、筛选与详情阶段分别保留活动证据，只有可验证的终止错误才会结束当前尝试。',
+            },
+            {
+              title: '终态任务彻底退出浏览器运行态',
+              desc: '任务终态得到服务端确认后清理本地占用与旧完成页；浏览器重载不再继续接管已经结束的任务。',
+            },
+            {
+              title: '存储配额耗尽仍可回报任务终态',
+              desc: '为控制状态保留独立空间，并在常规写入失败时保存精简闭环证据，避免页面仍运行而后台误以为任务已经消失。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '安全验证只允许一次跨账号接力',
+              desc: '遇到可识别的搜索安全验证时，可在来源执行链已经安静后交给另一台合格空闲 Agent 一次；再次验证会停止并通知，不无限换账号。',
+            },
+            {
+              title: '失败关键词可分散到多台空闲 Agent',
+              desc: '接力分配按关键词独立选择候选，并保留等待态；没有空闲设备时会在后续调度中继续尝试，不要求把多个词都压到同一设备。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.93',
       releaseDate: '2026-08-25',

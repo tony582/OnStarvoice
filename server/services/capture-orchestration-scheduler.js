@@ -732,6 +732,17 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       scheduleId: schedule.id,
       scheduledFor: scheduledFor.toISOString(),
     };
+    const itemAttemptBindings = groupItems.map(item => ({
+      itemId: item.id,
+      attemptId: crypto.randomUUID(),
+      requestHash,
+      attemptNumber: 1,
+      assignmentRevision: 1,
+      keyword: item.keyword,
+    }));
+    const attemptBindingByItemId = new Map(
+      itemAttemptBindings.map(binding => [String(binding.itemId), binding]),
+    );
     await tx.execute(`
       INSERT INTO capture_tasks (
         id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
@@ -769,6 +780,38 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       scheduledFor.toISOString(),
       Number(schedule.revision),
     ]);
+    for (const item of groupItems) {
+      const attemptBinding = attemptBindingByItemId.get(String(item.id));
+      await tx.execute(`
+        UPDATE capture_task_items
+        SET status = 'dispatched',
+          attempt_count = 1,
+          execution_task_id = $1,
+          request_hash = $2,
+          dispatched_at = now(),
+          updated_at = now()
+        WHERE id = $3 AND tenant_id = $4
+      `, [childTaskId, requestHash, item.id, schedule.tenant_id]);
+      await tx.execute(`
+        INSERT INTO capture_task_item_attempts (
+          id, tenant_id, item_id, parent_task_id, execution_task_id,
+          agent_id, attempt_number, assignment_revision, status,
+          request_hash, checkpoint, result, error, dispatched_at
+        ) VALUES (
+          $1, $2, $3, $4, $5,
+          $6, 1, 1, 'dispatched',
+          $7, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
+        )
+      `, [
+        attemptBinding.attemptId,
+        schedule.tenant_id,
+        item.id,
+        runTaskId,
+        childTaskId,
+        agentId,
+        requestHash,
+      ]);
+    }
     await tx.execute(`
       INSERT INTO capture_agent_commands (
         id, tenant_id, agent_id, task_id, command_type, payload,
@@ -796,43 +839,13 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
           parentTaskId: runTaskId,
           revision: 1,
           itemIds: groupItems.map(item => item.id),
+          itemAttempts: itemAttemptBindings,
           scheduleId: schedule.id,
           scheduledFor: scheduledFor.toISOString(),
         },
       }),
       commandExpiresAt,
     ]);
-    for (const item of groupItems) {
-      await tx.execute(`
-        UPDATE capture_task_items
-        SET status = 'dispatched',
-          attempt_count = 1,
-          execution_task_id = $1,
-          request_hash = $2,
-          dispatched_at = now(),
-          updated_at = now()
-        WHERE id = $3 AND tenant_id = $4
-      `, [childTaskId, requestHash, item.id, schedule.tenant_id]);
-      await tx.execute(`
-        INSERT INTO capture_task_item_attempts (
-          id, tenant_id, item_id, parent_task_id, execution_task_id,
-          agent_id, attempt_number, assignment_revision, status,
-          request_hash, checkpoint, result, error, dispatched_at
-        ) VALUES (
-          $1, $2, $3, $4, $5,
-          $6, 1, 1, 'dispatched',
-          $7, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
-        )
-      `, [
-        crypto.randomUUID(),
-        schedule.tenant_id,
-        item.id,
-        runTaskId,
-        childTaskId,
-        agentId,
-        requestHash,
-      ]);
-    }
     await appendEvent(tx, {
       tenantId: schedule.tenant_id,
       taskId: childTaskId,

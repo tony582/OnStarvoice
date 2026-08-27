@@ -27,6 +27,7 @@ import {
   captureTaskSnapshotFingerprint,
   buildSequentialSearchResumeCheckpoint,
   classifyCaptureRecoveryDisposition,
+  crossDeviceRetryAgentDailyUsageEligible,
   crossDeviceRetryAgentSupportsTask,
   crossDeviceRetryItemNeedsManualSafety,
   crossDeviceRetrySourceAgentIdsForItems,
@@ -36,6 +37,7 @@ import {
   projectElasticAttemptBudget,
   projectElasticBootstrapPacing,
   elasticRecoveryHoldRemainingMs,
+  evaluateObservedCompletionCandidate,
   isProfilePatrolTask,
   isExplicitUserCancellationSnapshot,
   lockActiveCaptureAgentSession,
@@ -268,6 +270,127 @@ test("duty cross-device retry fails closed before opening a transaction", async 
   assert.deepEqual(await dispatchCrossDeviceRetry({
     itemIds: ["not-a-uuid"],
   }), {error: "invalid_retry_item_scope"});
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    safetyHandoff: {
+      count: 0,
+      challengeCode: 'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+      sourcePlatformAccountId: 'source-account',
+      sourceLoginState: 'authenticated',
+      requireDistinctPlatformAccount: true,
+      requireSourceLineageQuiet: true,
+    },
+  }), {error: 'invalid_duty_recovery_request'});
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    tenantId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    taskId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    requestKey: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    expectedRevision: 1,
+    recoveryPhase: 'duty',
+    automatic: true,
+    dutyRecoveryIntentId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    dutyRecoveryLeaseToken: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    dutyRecoveryGeneration: 1,
+    itemIds: ['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'],
+    expectedItemRevision: 1,
+    expectedAttemptNumber: 1,
+    expectedSourceAttemptId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+    safetyHandoff: {
+      count: 0,
+      challengeCode: 'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+      sourcePlatformAccountId: 'source-account',
+      sourceLoginState: 'authenticated',
+      requireDistinctPlatformAccount: true,
+      requireSourceLineageQuiet: true,
+    },
+  }), {
+    error: 'retry_requires_manual_safety_action',
+    code: 'HUMAN_REQUIRED',
+    humanRequired: true,
+    reason: 'source_local_closure_proof_unavailable',
+  });
+});
+
+test('search-challenge handoff is counted independently but remains fail-closed', () => {
+  const projection = readRouteSection(
+    'export function projectElasticKeywordRecoveryStatus({',
+    'export function isExplicitUserCancellationSnapshot',
+  );
+  assert.match(projection, /safetyHandoffCount = 0/u);
+  assert.match(projection, /sourceLocalClosureProven = false/u);
+  assert.match(
+    projection,
+    /Number\(safetyHandoffCount\)[\s\S]*ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS/u,
+  );
+  assert.doesNotMatch(
+    projection,
+    /normalizedAttemptCount <= ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS/u,
+  );
+
+  const elasticClaim = readRouteSection(
+    'async function dispatchNextElasticWorkItem',
+    "router.post('/agent/liveness'",
+  );
+  assert.match(elasticClaim, /CAPTURE_SAFETY_HANDOFF_SEARCH_CODES/u);
+  assert.match(elasticClaim, /item\.status = 'retryable'/u);
+
+  const dutyDispatch = readRouteSection(
+    'export async function dispatchCrossDeviceRetry',
+    'export async function reconcileElasticCaptureLeases',
+  );
+  assert.match(
+    dutyDispatch,
+    /source_local_closure_proof_unavailable/u,
+  );
+  assert.ok(
+    dutyDispatch.indexOf('source_local_closure_proof_unavailable') <
+      dutyDispatch.indexOf('return await withTransaction'),
+  );
+  assert.match(dutyDispatch, /evaluateCaptureSafetyHandoff/u);
+  assert.match(dutyDispatch, /sourcePlatformAccountId/u);
+  assert.match(dutyDispatch, /targetPlatformAccountId/u);
+  assert.match(dutyDispatch, /source_lineage_silent/u);
+  assert.match(
+    dutyDispatch,
+    /safety_handoff_count = safety_handoff_count \+[\s\S]*safety_handoff_count = 0/u,
+  );
+  assert.match(dutyDispatch, /FOR SHARE OF binding, account/u);
+  assert.match(dutyDispatch, /source_lineage_silent = false/u);
+  assert.ok(
+    (dutyDispatch.match(/loadVerifiedCaptureLocalClosureProof\(/gu) || [])
+      .length >= 2,
+    'safety handoff must verify local closure at source classification and again before writes',
+  );
+  const closureProofLoader = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      'async function loadVerifiedCaptureLocalClosureProof',
+    ),
+    captureCloudRouteSource.indexOf(
+      'export async function dispatchCrossDeviceRetry',
+    ),
+  );
+  assert.match(closureProofLoader, /FROM capture_task_snapshots snapshot/u);
+  assert.match(closureProofLoader, /snapshot\.attempt_id/u);
+  assert.match(closureProofLoader, /snapshot\.agent_id = \$3::uuid/u);
+  assert.match(
+    closureProofLoader,
+    /snapshot\.metadata->'localClosures' AS local_closures/u,
+  );
+  assert.match(closureProofLoader, /selectCaptureLocalClosureEvidence\(/u);
+  assert.match(closureProofLoader, /expectedItemId: expected\.itemId/u);
+  assert.match(
+    closureProofLoader,
+    /expectedItemAttemptId: expected\.itemAttemptId/u,
+  );
+  assert.match(
+    closureProofLoader,
+    /execution_attempt\.client_attempt_id = snapshot\.client_attempt_id/u,
+  );
+  assert.match(closureProofLoader, /expectedSnapshotRevision/u);
+  assert.doesNotMatch(
+    closureProofLoader,
+    /snapshot\.metadata \? 'localClosure'/u,
+    'the latest terminal snapshot stays authoritative even if its proof is missing',
+  );
 });
 
 test("only explicit operator cancellation is terminal", () => {
@@ -363,13 +486,41 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "needs_action",
     error: safety,
     attemptCount: 1,
+    sourceLocalClosureProven: true,
   }), "retryable");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'needs_action',
+    error: {
+      code: 'PAGE_CHALLENGE_BLOCK',
+      securityBlocked: true,
+    },
+    attemptCount: 1,
+    safetyHandoffCount: 0,
+  }), 'needs_action');
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "needs_action",
     error: safety,
     attemptCount: 2,
+    safetyHandoffCount: 1,
+    sourceLocalClosureProven: true,
   }), "needs_action");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "needs_action",
+    error: safety,
+    attemptCount: 99,
+    safetyHandoffCount: 0,
+    sourceLocalClosureProven: true,
+  }), "retryable");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'needs_action',
+    error: safety,
+    attemptCount: 1,
+    safetyHandoffCount: 0,
+  }), 'needs_action');
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
@@ -675,6 +826,83 @@ test("cloud task snapshots normalize local ledger aliases and timestamps", () =>
     normalizeCloudTaskSnapshot({id: "historical-task", status: "failed"}).controlTaskId,
     "",
   );
+});
+
+test("local closure has one top-level heartbeat channel and metadata cannot forge it", () => {
+  const localClosure = {
+    version: 1,
+    requestId: "closure-task",
+    attemptId: "closure-attempt",
+    itemId: "11111111-1111-4111-8111-111111111111",
+    itemAttemptId: "22222222-2222-4222-8222-222222222222",
+    attemptNumber: 1,
+    assignmentRevision: 3,
+    snapshotRevision: 9,
+    terminalStatus: "needs_action",
+    terminalUpdatedAt: "2026-08-27T00:59:00.000Z",
+    closedAt: "2026-08-27T00:59:10.000Z",
+    terminalLedgerConfirmed: true,
+    runnerTabCount: 0,
+    platformTaskTabCount: 0,
+    detailTaskTabCount: 0,
+    ownedTaskTabCount: 0,
+    executionLockPresent: false,
+    debugSessionPresent: false,
+    taskSessionPresent: false,
+    taskOwnerPresent: false,
+    pendingCheckpointReportCount: 0,
+    businessUploadEvidenceKnown: true,
+    streamingSyncDrainCompleted: true,
+    streamingSyncEnabled: false,
+    streamingSyncEnqueuedCount: 0,
+    streamingSyncProcessedCount: 0,
+    streamingSyncSuccessCount: 0,
+    streamingSyncFailedCount: 0,
+    streamingSyncSkippedCount: 0,
+    streamingSyncPendingCount: 0,
+    streamingSyncActiveCount: 0,
+    streamingSyncRemainingCount: 0,
+    streamingSyncBlocked: false,
+    streamingSyncCanceled: false,
+    capturedRecordCount: 0,
+  };
+  const promoted = normalizeCloudTaskSnapshot({
+    id: "closure-task",
+    status: "needs_action",
+    localClosure,
+    metadata: {localClosure: {...localClosure, attemptId: "forged"}},
+  });
+  assert.deepEqual(promoted.metadata.localClosure, localClosure);
+
+  const metadataOnly = normalizeCloudTaskSnapshot({
+    id: "closure-task",
+    status: "needs_action",
+    metadata: {localClosure},
+  });
+  assert.equal(metadataOnly.metadata.localClosure, undefined);
+
+  const secondClosure = {
+    ...localClosure,
+    itemId: "44444444-4444-4444-8444-444444444444",
+    itemAttemptId: "55555555-5555-4555-8555-555555555555",
+    attemptNumber: 2,
+  };
+  const plural = normalizeCloudTaskSnapshot({
+    id: "closure-task",
+    status: "needs_action",
+    localClosure,
+    localClosures: [localClosure, secondClosure],
+    metadata: {
+      localClosures: [{...secondClosure, attemptId: "forged"}],
+    },
+  });
+  assert.deepEqual(plural.metadata.localClosures, [localClosure, secondClosure]);
+  const pluralMetadataOnly = normalizeCloudTaskSnapshot({
+    id: "closure-task",
+    status: "needs_action",
+    metadata: {localClosures: [localClosure, secondClosure]},
+  });
+  assert.equal(pluralMetadataOnly.metadata.localClosures, undefined);
 });
 
 test("cloud task snapshots preserve bounded structured health without browser secrets", () => {
@@ -1988,6 +2216,16 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /elasticAttemptBudgetUsed/u);
   assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
   assert.match(claim, /attemptIdentity,/u);
+  assert.match(claim, /const itemAttemptBindings = \[\{/u);
+  assert.match(
+    claim,
+    /orchestration:[\s\S]*itemAttempts: itemAttemptBindings/u,
+  );
+  assert.ok(
+    claim.indexOf('INSERT INTO capture_task_item_attempts') <
+      claim.indexOf('INSERT INTO capture_agent_commands'),
+    'elastic claims must persist their attempt before publishing command',
+  );
   assert.match(claim, /projectElasticBootstrapPacing/u);
   assert.match(claim, /\.\.\.\(bootstrapPacing \|\| \{\}\)/u);
   assert.match(claim, /ELASTIC_BOOTSTRAP_CONGESTION_WINDOW_MS/u);
@@ -3053,6 +3291,189 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(
     captureCloudRouteSource,
     /promotedRetryParent' IS DISTINCT FROM 'true'/u,
+  );
+});
+
+test("late Xiaohongshu evidence detector is read-only and never trusts human reports", () => {
+  const candidate = evaluateObservedCompletionCandidate({
+    item_id: "11111111-1111-4111-8111-111111111111",
+    task_id: "22222222-2222-4222-8222-222222222222",
+    source_execution_task_id: "33333333-3333-4333-8333-333333333333",
+    source_attempt_id: "44444444-4444-4444-8444-444444444444",
+    source_attempt_number: 2,
+    source_assignment_revision: 7,
+    source_attempt_status: "failed",
+    source_attempt_started_at: "2026-08-27T01:00:00.000Z",
+    source_attempt_checkpoint: {
+      savedCount: 2,
+      scanComplete: true,
+      searchPassResults: [
+        {round: 1, status: "completed", scanComplete: true},
+        {round: 2, status: "completed_with_warnings", scanComplete: true},
+      ],
+    },
+    source_attempt_result: {savedCount: 2},
+    parent_metadata: {planSnapshot: {searchPasses: ["main", "latest"]}},
+    platform: "xiaohongshu",
+    item_status: "needs_action",
+    exact_observation_count: 2,
+    latest_observation_at: "2026-08-27T01:03:00.000Z",
+    lineage_last_activity_at: "2026-08-27T01:05:00.000Z",
+    lineage_silent: true,
+    active_started_attempt_count: 0,
+    active_command_count: 0,
+    active_execution_count: 0,
+    active_recovery_lease_count: 0,
+    started_successor_attempt_count: 0,
+    unstarted_successor_attempt_count: 1,
+    humanReport: "现场说已经保存成功",
+  });
+
+  assert.equal(candidate.evidenceCandidate, true);
+  assert.equal(candidate.reconcileEligible, false);
+  assert.equal(candidate.readOnly, true);
+  assert.equal(candidate.runtimeAbsenceUnverified, true);
+  assert.equal(candidate.humanReportAcceptedAsEvidence, false);
+  assert.deepEqual(candidate.blockingChecks, ["runtimeAbsenceUnverified"]);
+  assert.equal(candidate.successorAttempts.requiresTransactionalSealing, true);
+  assert.equal(candidate.successorAttempts.sealed, false);
+});
+
+test("late evidence detector rejects incomplete scope, mismatched saves, or active lineage", () => {
+  const result = evaluateObservedCompletionCandidate({
+    source_attempt_id: "44444444-4444-4444-8444-444444444444",
+    source_attempt_status: "running",
+    source_attempt_started_at: "2026-08-27T01:00:00.000Z",
+    source_attempt_checkpoint: {
+      savedCount: 3,
+      scanComplete: false,
+      searchPassResults: [{round: 1, status: "completed", scanComplete: true}],
+    },
+    parent_metadata: {planSnapshot: {searchPasses: ["main", "latest"]}},
+    platform: "xiaohongshu",
+    item_status: "needs_action",
+    exact_observation_count: 2,
+    lineage_silent: false,
+    active_started_attempt_count: 1,
+    active_command_count: 1,
+    active_execution_count: 1,
+    active_recovery_lease_count: 1,
+    started_successor_attempt_count: 1,
+  });
+
+  assert.equal(result.evidenceCandidate, false);
+  assert.equal(result.reconcileEligible, false);
+  assert.ok(result.blockingChecks.includes("savedObservationConsistent"));
+  assert.ok(result.blockingChecks.includes("scopeComplete"));
+  assert.ok(result.blockingChecks.includes("noActiveAttempt"));
+  assert.ok(result.blockingChecks.includes("noActiveCommand"));
+  assert.ok(result.blockingChecks.includes("noActiveExecution"));
+  assert.ok(result.blockingChecks.includes("noActiveRecoveryLease"));
+  assert.ok(result.blockingChecks.includes("lineageSilent"));
+  assert.ok(result.blockingChecks.includes("noStartedSuccessorAttempt"));
+});
+
+test("late evidence candidate endpoint is tenant-scoped and cannot mutate state", () => {
+  const route = readRouteSection(
+    "router.get('/late-evidence-candidates'",
+    "router.get('/history'",
+  );
+  assert.match(route, /item\.tenant_id = \$1/u);
+  assert.match(route, /item\.platform = 'xiaohongshu'/u);
+  assert.match(route, /capture_task_item_attempt_id = source_attempt\.id/u);
+  assert.match(route, /command\.status IN \('pending', 'acknowledged'\)/u);
+  assert.match(
+    route,
+    /command\.task_id IN \([\s\S]*SELECT DISTINCT attempt\.execution_task_id[\s\S]*attempt\.item_id = item\.id/u,
+  );
+  assert.doesNotMatch(
+    route,
+    /command\.task_id IN \(item\.task_id, source_attempt\.execution_task_id\)/u,
+  );
+  assert.match(route, /intent\.lease_expires_at > clock_timestamp\(\)/u);
+  assert.match(route, /automaticMutationEnabled: false/u);
+  assert.match(route, /runtimeAbsenceSource: 'not_persisted'/u);
+  assert.doesNotMatch(route, /\b(?:UPDATE|INSERT|DELETE)\b/u);
+  assert.doesNotMatch(route, /req\.body/u);
+});
+
+test("cross-device retry uses known current-day Agent search usage and enforces account limits", () => {
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({}), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: false,
+    today_usage_last_event_at: '2026-08-26T23:59:59.000Z',
+    today_searches: 0,
+    daily_search_limit: 10,
+  }), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_usage_last_event_at: null,
+    today_searches: 0,
+    daily_search_limit: 10,
+  }), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_usage_last_event_at: '2026-08-27T00:01:00.000Z',
+    today_searches: 7,
+    daily_search_limit: 10,
+  }), true);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_usage_last_event_at: '2026-08-27T00:01:00.000Z',
+    today_searches: 10,
+    daily_search_limit: 10,
+  }), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_usage_last_event_at: '2026-08-27T00:01:00.000Z',
+    today_searches: 35,
+    daily_search_limit: 0,
+  }), true);
+
+  const idleAgentSelection = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      "async function loadIdleCrossDeviceRetryAgent",
+    ),
+    captureCloudRouteSource.indexOf("function promotedRetryFallbackTarget"),
+  );
+  assert.match(
+    idleAgentSelection,
+    /JOIN social_agent_daily_usage daily_usage/u,
+  );
+  assert.doesNotMatch(
+    idleAgentSelection,
+    /social_account_daily_usage/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /daily_usage\.usage_date =\s*\(now\(\) AT TIME ZONE 'Asia\/Shanghai'\)::date/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /daily_usage\.last_event_at IS NOT NULL/u,
+  );
+  assert.doesNotMatch(
+    idleAgentSelection,
+    /COALESCE\(daily_usage\.searches,\s*0\)/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /daily_usage\.searches < current_social_account\.daily_search_limit/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /ORDER BY daily_usage\.searches ASC,\s*recent_technical_failure_count ASC/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /FOR UPDATE OF ca, daily_usage/u,
+  );
+  assert.equal(
+    (idleAgentSelection.match(
+      /crossDeviceRetryAgentDailyUsageEligible\(/gu,
+    ) || []).length,
+    2,
+    'usage eligibility must be checked both before and after slot locking',
   );
 });
 

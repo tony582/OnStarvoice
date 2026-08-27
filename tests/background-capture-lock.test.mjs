@@ -18,6 +18,10 @@ const cloudTargetedPostSource = await readFile(
   resolve(repoRoot, "utils/cloud-targeted-post.js"),
   "utf8",
 );
+const controlStorageReserveSource = await readFile(
+  resolve(repoRoot, "utils/control-storage-reserve.js"),
+  "utf8",
+);
 const phase5RuntimeSources = await Promise.all(
   [
     "utils/runtime-tab-policy.js",
@@ -89,7 +93,12 @@ function createHarness() {
   let tabQueryHandler = null;
   let tabUpdateHandler = null;
   let tabGroupHandler = null;
+  let tabRemoveHandler = null;
   let storageGetHandler = null;
+  let storageSetHandler = null;
+  let storageRemoveHandler = null;
+  const storageSetCalls = [];
+  const storageRemoveCalls = [];
   let reloadHook = null;
   let nextRuntimeSetError = null;
   const unrefSetTimeout = (handler, delay, ...args) => {
@@ -124,6 +133,10 @@ function createHarness() {
         : result;
     },
     async set(values) {
+      storageSetCalls.push(values);
+      if (typeof storageSetHandler === "function") {
+        await storageSetHandler(values, storageSetCalls.length, storage);
+      }
       if (
         nextRuntimeSetError &&
         Object.hasOwn(values, "onstarvoice.runtime")
@@ -135,6 +148,10 @@ function createHarness() {
       Object.assign(storage, values);
     },
     async remove(keys) {
+      storageRemoveCalls.push(keys);
+      if (typeof storageRemoveHandler === "function") {
+        await storageRemoveHandler(keys, storageRemoveCalls.length, storage);
+      }
       for (const key of Array.isArray(keys) ? keys : [keys]) {
         delete storage[key];
       }
@@ -245,6 +262,9 @@ function createHarness() {
       },
       async ungroup() {},
       async remove(tabId) {
+        if (typeof tabRemoveHandler === "function") {
+          await tabRemoveHandler(tabId);
+        }
         removedTabIds.push(Number(tabId));
         missingTabIds.add(Number(tabId));
       },
@@ -336,6 +356,9 @@ function createHarness() {
   vm.runInContext(cloudTargetedPostSource, context, {
     filename: "utils/cloud-targeted-post.js",
   });
+  vm.runInContext(controlStorageReserveSource, context, {
+    filename: "utils/control-storage-reserve.js",
+  });
   for (const {path, source} of phase5RuntimeSources) {
     vm.runInContext(source, context, {filename: path});
   }
@@ -345,6 +368,7 @@ function createHarness() {
       `  bindCaptureExecutionLockToTask,\n` +
       `  readActiveCaptureExecutionLock,\n` +
       `  releaseCaptureExecutionLock,\n` +
+      `  clearUnattendedCaptureTaskLockBinding,\n` +
       `  renewCaptureExecutionLock,\n` +
       `  normalizeCaptureProgress,\n` +
       `  writeRuntimeState,\n` +
@@ -358,6 +382,7 @@ function createHarness() {
       `  readTargetedPostRunRequest,\n` +
       `  createOrResumeTargetedPostRun,\n` +
       `  closeSupersededTargetedPostRunnerTabs,\n` +
+      `  closeTerminalTargetedPostRunnerTabs,\n` +
       `  cancelTargetedPostRunFromControl,\n` +
       `  openTargetedPostRunnerTab,\n` +
       `  openUnattendedRunnerTab,\n` +
@@ -389,6 +414,9 @@ function createHarness() {
       `  handleCaptureRuntimeTabReplaced,\n` +
       `  getCaptureTaskGroup: (taskId) => captureTaskTabGroupManager.getTask(taskId),\n` +
       `  releaseUnattendedKeywordPlanLock,\n` +
+      `  inspectUnattendedBusinessUploadEvidence,\n` +
+      `  inspectUnattendedLocalClosurePredicate,\n` +
+      `  reconcileUnattendedLocalClosureEvidence,\n` +
       `  flush: () => captureExecutionLockOperationQueue,\n` +
       `  flushRuntime: () => runtimeMutationQueue,\n` +
       `  flushUnattended: () => unattendedRunMutationQueue,\n` +
@@ -410,6 +438,8 @@ function createHarness() {
     removedTabIds,
     badgeTextHistory,
     sentTabMessages,
+    storageSetCalls,
+    storageRemoveCalls,
     failNextRuntimeSet(error = new Error("runtime set failed")) {
       nextRuntimeSetError = error;
     },
@@ -451,6 +481,9 @@ function createHarness() {
     setTabQueryHandler(handler) {
       tabQueryHandler = handler;
     },
+    setTabRemoveHandler(handler) {
+      tabRemoveHandler = handler;
+    },
     setTabUpdateHandler(handler) {
       tabUpdateHandler = handler;
     },
@@ -459,6 +492,12 @@ function createHarness() {
     },
     setStorageGetHandler(handler) {
       storageGetHandler = handler;
+    },
+    setStorageSetHandler(handler) {
+      storageSetHandler = handler;
+    },
+    setStorageRemoveHandler(handler) {
+      storageRemoveHandler = handler;
     },
     setTabMissing(tabId, missing = true) {
       if (missing) missingTabIds.add(Number(tabId));
@@ -482,6 +521,11 @@ const TARGETED_POST_REQUEST_KEY = "onstarvoice.targetedPostRunRequest";
 const UNATTENDED_ARCHIVE_KEY = "onstarvoice.unattendedKeywordRunArchive";
 const TASK_LEDGER_KEY = "onstarvoice.taskLedger";
 const SYNC_HISTORY_KEY = "onstarvoice.sync_history";
+const UNATTENDED_OUTBOX_PREFIX =
+  "onstarvoice.unattendedCheckpointReportOutbox.v2.";
+const CONTROL_STORAGE_RESERVE_KEY =
+  "onstarvoice.controlStorageReserve";
+const CONTROL_STORAGE_RESERVE_BYTES = 64 * 1024;
 
 function buildUnattendedPlan(overrides = {}) {
   return {
@@ -599,10 +643,485 @@ function buildUnattendedRunnerSender(request, holderDocumentId) {
     documentId: String(holderDocumentId || ""),
     tab: {
       id: Number(request?.runnerTabId),
-      url: `chrome-extension://test/sidebar/sidebar.html?unattendedRun=${request.id}`,
+      url:
+        `chrome-extension://test/sidebar/sidebar.html?unattendedRun=${request.id}` +
+        `&unattendedAttempt=${request.attemptId}`,
     },
   };
 }
+
+function seedTerminalUnattendedClosureCandidate(harness, overrides = {}) {
+  const now = new Date().toISOString();
+  const requestId = overrides.id || "closure-request";
+  const attemptId = overrides.attemptId || "closure-attempt";
+  const progress = {
+    current: 1,
+    total: 1,
+    progressScope: "terminal",
+    phase: "unattended_needs_action",
+    unattendedRequestId: requestId,
+    unattendedAttemptId: attemptId,
+    streamingSyncEvidenceKnown: true,
+    streamingSyncDrainCompleted: true,
+    streamingSyncEnabled: true,
+    streamingSyncEnqueuedCount: 0,
+    streamingSyncProcessedCount: 0,
+    streamingSyncSuccessCount: 0,
+    streamingSyncFailedCount: 0,
+    streamingSyncSkippedCount: 0,
+    streamingSyncPendingCount: 0,
+    streamingSyncActiveCount: 0,
+    streamingSyncRemainingCount: 0,
+    streamingSyncBlocked: false,
+    streamingSyncCanceled: false,
+    capturedRecordCount: 0,
+    finishedAt: now,
+    updatedAt: now,
+    ...(overrides.progress || {}),
+  };
+  const request = {
+    schemaVersion: 2,
+    id: requestId,
+    attemptId,
+    attemptNumber: 1,
+    progressSeq: 8,
+    status: "needs_action",
+    platform: "douyin",
+    createdAt: now,
+    startedAt: now,
+    updatedAt: now,
+    finishedAt: now,
+    heartbeatAt: now,
+    businessProgressAt: now,
+    counts: {total: 1, processed: 1, saved: 0},
+    progress,
+    orchestrationContext: {
+      parentTaskId: "parent-task",
+      itemAttempts: [{
+        itemId: "item-1",
+        attemptId: "item-attempt-1",
+        attemptNumber: 3,
+        assignmentRevision: 7,
+      }],
+    },
+    ...overrides,
+    progress,
+  };
+  harness.storage[UNATTENDED_REQUEST_KEY] = request;
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [{
+      id: requestId,
+      taskType: "unattended_keyword_capture",
+      status: request.status,
+      attemptId,
+      attemptNumber: request.attemptNumber,
+      progressSeq: request.progressSeq,
+      counts: request.counts,
+      progress,
+      createdAt: now,
+      startedAt: now,
+      updatedAt: now,
+      finishedAt: now,
+      metadata: {},
+    }],
+    updatedAt: now,
+  };
+  return request;
+}
+
+test("local closure closes only its exact runner and persists authoritative upload proof", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness);
+  harness.setTabQueryHandler(async () => [
+    ...(harness.removedTabIds.includes(71)
+      ? []
+      : [{
+          id: 71,
+          url:
+            "chrome-extension://test/sidebar/sidebar.html" +
+            `?unattendedRun=${request.id}&unattendedAttempt=${request.attemptId}`,
+        }]),
+    {id: 72, url: "https://www.douyin.com/search/test?type=general"},
+    {
+      id: 73,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        "?unattendedRun=another-request",
+    },
+  ]);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: tabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?unattendedRun=${request.id}&unattendedAttempt=${request.attemptId}`,
+  }));
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+    closeOwnedRunnerTabs: true,
+  });
+
+  assert.equal(result.persisted, true);
+  assert.deepEqual(harness.removedTabIds, [71]);
+  const evidence =
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure;
+  assert.equal(evidence.requestId, request.id);
+  assert.equal(evidence.attemptId, request.attemptId);
+  assert.equal(evidence.itemAttemptId, "item-attempt-1");
+  assert.equal(evidence.attemptNumber, 3);
+  assert.equal(evidence.businessUploadEvidenceKnown, true);
+  assert.equal(evidence.streamingSyncDrainCompleted, true);
+  assert.equal(evidence.streamingSyncRemainingCount, 0);
+  assert.equal(evidence.capturedRecordCount, 0);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence.closedAt,
+    evidence.closedAt,
+  );
+});
+
+test("one drained fixed-batch runtime emits exact proof for every item attempt", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    orchestrationContext: {
+      parentTaskId: "fixed-batch-parent",
+      revision: 9,
+      itemIds: ["item-1", "item-2"],
+      itemAttempts: [{
+        itemId: "item-1",
+        attemptId: "item-attempt-1",
+        attemptNumber: 3,
+        assignmentRevision: 9,
+      }, {
+        itemId: "item-2",
+        attemptId: "item-attempt-2",
+        attemptNumber: 2,
+        assignmentRevision: 9,
+      }],
+    },
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, true);
+  assert.equal(result.evidences.length, 2);
+  const metadata = harness.storage[TASK_LEDGER_KEY].runs[0].metadata;
+  assert.deepEqual(
+    metadata.localClosures.map(closure => ({
+      itemId: closure.itemId,
+      itemAttemptId: closure.itemAttemptId,
+      attemptNumber: closure.attemptNumber,
+      assignmentRevision: closure.assignmentRevision,
+    })),
+    [{
+      itemId: "item-1",
+      itemAttemptId: "item-attempt-1",
+      attemptNumber: 3,
+      assignmentRevision: 9,
+    }, {
+      itemId: "item-2",
+      itemAttemptId: "item-attempt-2",
+      attemptNumber: 2,
+      assignmentRevision: 9,
+    }],
+  );
+  assert.equal(metadata.localClosure.itemAttemptId, "item-attempt-1");
+  assert.equal(
+    new Set(metadata.localClosures.map(closure => closure.closedAt)).size,
+    1,
+  );
+  assert.equal(
+    new Set(metadata.localClosures.map(closure => closure.snapshotRevision)).size,
+    1,
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidences.length,
+    2,
+  );
+
+  const replay = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+  assert.equal(replay.persisted, false);
+  assert.equal(replay.reason, "already_persisted");
+});
+
+test("0.3.94 closes an assigned legacy terminal runner without an attempt query", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "legacy-closure-request",
+    attemptId: "legacy-closure-attempt",
+    runnerTabId: 74,
+  });
+  const legacyUrl =
+    "chrome-extension://test/sidebar/sidebar.html" +
+    `?unattendedRun=${request.id}`;
+  harness.setTabQueryHandler(async () =>
+    harness.removedTabIds.includes(74)
+      ? []
+      : [{id: 74, url: legacyUrl}],
+  );
+  harness.setTabGetHandler(async (tabId) => ({id: tabId, url: legacyUrl}));
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+    closeOwnedRunnerTabs: true,
+  });
+
+  assert.equal(result.persisted, true);
+  assert.deepEqual(harness.removedTabIds, [74]);
+});
+
+test("authoritative local-closure request and ledger persist through one reserve retry", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "closure-quota-request",
+    attemptId: "closure-quota-attempt",
+  });
+  harness.storage[CONTROL_STORAGE_RESERVE_KEY] = {
+    schemaVersion: 1,
+    padding: "0".repeat(CONTROL_STORAGE_RESERVE_BYTES),
+  };
+  harness.setTabQueryHandler(async () => []);
+  let closureWriteAttempts = 0;
+  harness.setStorageSetHandler(async (values) => {
+    if (
+      !values[UNATTENDED_REQUEST_KEY]?.localClosureEvidence ||
+      !values[TASK_LEDGER_KEY]
+    ) {
+      return;
+    }
+    closureWriteAttempts += 1;
+    if (closureWriteAttempts === 1) {
+      throw new Error("Resource::kQuotaBytes quota exceeded");
+    }
+  });
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, true);
+  assert.equal(closureWriteAttempts, 2);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence.attemptId,
+    request.attemptId,
+  );
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure.attemptId,
+    request.attemptId,
+  );
+  assert.deepEqual(
+    harness.storageRemoveCalls.filter(
+      (key) => key === CONTROL_STORAGE_RESERVE_KEY,
+    ),
+    [CONTROL_STORAGE_RESERVE_KEY],
+  );
+});
+
+test("missing or defaulted streaming stats can never manufacture local closure", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    progress: {
+      streamingSyncEvidenceKnown: false,
+      streamingSyncDrainCompleted: false,
+      streamingSyncRemainingCount: 0,
+      streamingSyncFailedCount: 0,
+    },
+  });
+  harness.setTabQueryHandler(async () => [{
+    id: 81,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?unattendedRun=${request.id}&unattendedAttempt=${request.attemptId}`,
+  }]);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "business_upload_state_unknown");
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure,
+    undefined,
+  );
+});
+
+test("unacknowledged checkpoint outbox rows keep the exact runner alive", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness);
+  harness.storage[`${UNATTENDED_OUTBOX_PREFIX}pending`] = {
+    id: `${request.id}:${request.attemptId}`,
+    requestId: request.id,
+    attemptId: request.attemptId,
+    revision: "pending",
+    patch: {checkpoint: {round: 1}},
+    deliveryStatus: "pending",
+  };
+  harness.setTabQueryHandler(async () => [{
+    id: 91,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?unattendedRun=${request.id}&unattendedAttempt=${request.attemptId}`,
+  }]);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "checkpoint_reports_pending");
+  assert.deepEqual(harness.removedTabIds, []);
+});
+
+test("an older attempt cannot write closure evidence over the current attempt", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    attemptId: "closure-attempt-2",
+    attemptNumber: 2,
+  });
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: "closure-attempt-1",
+  });
+
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "attempt_superseded");
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure,
+    undefined,
+  );
+});
+
+test("terminal cleanup never closes a newer runner for the same request", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "closure-race-request",
+    attemptId: "closure-race-old-attempt",
+  });
+  let firstQuery = true;
+  harness.setTabQueryHandler(async () => {
+    if (firstQuery) {
+      firstQuery = false;
+      harness.storage[UNATTENDED_REQUEST_KEY] = {
+        ...harness.storage[UNATTENDED_REQUEST_KEY],
+        attemptId: "closure-race-new-attempt",
+        status: "pending",
+      };
+      harness.storage[TASK_LEDGER_KEY].runs[0] = {
+        ...harness.storage[TASK_LEDGER_KEY].runs[0],
+        attemptId: "closure-race-new-attempt",
+        status: "pending",
+      };
+    }
+    return [
+      ...(harness.removedTabIds.includes(101)
+        ? []
+        : [{
+            id: 101,
+            url:
+              "chrome-extension://test/sidebar/sidebar.html" +
+              `?unattendedRun=${request.id}` +
+              `&unattendedAttempt=${request.attemptId}`,
+          }]),
+      {
+        id: 102,
+        url:
+          "chrome-extension://test/sidebar/sidebar.html" +
+          `?unattendedRun=${request.id}` +
+          "&unattendedAttempt=closure-race-new-attempt",
+      },
+    ];
+  });
+  harness.setTabGetHandler(async (tabId) => ({
+    id: tabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?unattendedRun=${request.id}` +
+      (tabId === 101
+        ? `&unattendedAttempt=${request.attemptId}`
+        : "&unattendedAttempt=closure-race-new-attempt"),
+  }));
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+    closeOwnedRunnerTabs: true,
+  });
+
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "attempt_superseded");
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].attemptId,
+    "closure-race-new-attempt",
+  );
+});
+
+test("terminal cleanup rechecks a runner tab before removing a reused tab id", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "closure-reused-tab-request",
+    attemptId: "closure-reused-tab-old-attempt",
+  });
+  let queryCount = 0;
+  harness.setTabQueryHandler(async () => {
+    queryCount += 1;
+    return [{
+      id: 111,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?unattendedRun=${request.id}` +
+        `&unattendedAttempt=${
+          queryCount === 1
+            ? request.attemptId
+            : "closure-reused-tab-new-attempt"
+        }`,
+    }];
+  });
+  harness.setTabGetHandler(async (tabId) => {
+    harness.storage[UNATTENDED_REQUEST_KEY] = {
+      ...harness.storage[UNATTENDED_REQUEST_KEY],
+      attemptId: "closure-reused-tab-new-attempt",
+      status: "pending",
+    };
+    harness.storage[TASK_LEDGER_KEY].runs[0] = {
+      ...harness.storage[TASK_LEDGER_KEY].runs[0],
+      attemptId: "closure-reused-tab-new-attempt",
+      status: "pending",
+    };
+    return {
+      id: tabId,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?unattendedRun=${request.id}` +
+        "&unattendedAttempt=closure-reused-tab-new-attempt",
+    };
+  });
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+    closeOwnedRunnerTabs: true,
+  });
+
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "attempt_superseded");
+  assert.deepEqual(harness.removedTabIds, []);
+});
 
 test("capture progress is persisted with heartbeat and runner metadata", () => {
   const harness = createHarness();
@@ -1312,6 +1831,68 @@ test("matching holder credential can release after Chrome replaces the document 
   assert.equal(harness.storage[LOCK_KEY], undefined);
 });
 
+test("a reserve retry re-runs the lock fence instead of overwriting a replacement owner", async () => {
+  const harness = createHarness();
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "old-holder",
+    holderDocumentId: "old-document",
+    holderTabId: 41,
+  });
+  const bound = await harness.api.bindCaptureExecutionLockToTask(
+    "unattended-capture:fenced-request",
+    41,
+    {
+      allowUnattendedRebind: true,
+      attemptId: "attempt-old",
+      expectedLockId: acquired.lock.id,
+      expectedHolderId: "old-holder",
+      expectedHolderDocumentId: "old-document",
+    },
+  );
+  harness.storage[CONTROL_STORAGE_RESERVE_KEY] = {
+    schemaVersion: 1,
+    padding: "0".repeat(CONTROL_STORAGE_RESERVE_BYTES),
+  };
+  let bindingWriteAttempts = 0;
+  harness.setStorageSetHandler(async (values) => {
+    const nextLock = values[LOCK_KEY];
+    if (!nextLock || nextLock.captureTaskId !== "") return;
+    bindingWriteAttempts += 1;
+    harness.storage[LOCK_KEY] = {
+      ...harness.storage[LOCK_KEY],
+      id: "replacement-lock",
+      holderId: "replacement-holder",
+      holderDocumentId: "replacement-document",
+    };
+    throw new Error("Resource::kQuotaBytes quota exceeded");
+  });
+
+  const cleared = await harness.api.clearUnattendedCaptureTaskLockBinding(
+    bound.id,
+    "unattended-capture:fenced-request",
+    {
+      expectedHolderId: "old-holder",
+      expectedHolderDocumentId: "old-document",
+      expectedHolderTabId: 41,
+    },
+  );
+
+  assert.equal(cleared, false);
+  assert.equal(bindingWriteAttempts, 1);
+  assert.equal(harness.storage[LOCK_KEY].id, "replacement-lock");
+  assert.equal(
+    harness.storage[LOCK_KEY].captureTaskId,
+    "unattended-capture:fenced-request",
+  );
+  assert.deepEqual(
+    harness.storageRemoveCalls.filter(
+      (key) => key === CONTROL_STORAGE_RESERVE_KEY,
+    ),
+    [CONTROL_STORAGE_RESERVE_KEY],
+  );
+});
+
 test("legacy 12-hour ghost locks are removed immediately after upgrade", async () => {
   const harness = createHarness();
   const oldTimestamp = new Date().toISOString();
@@ -1370,12 +1951,14 @@ test("a newly created unattended runner tab is made non-discardable", async () =
 
   const runner = await harness.api.openUnattendedRunnerTab("request-create", {
     windowId: 7,
+    attemptId: "attempt-create",
   });
 
   assert.equal(harness.createdTabs.length, 1);
   assert.equal(harness.createdTabs[0].active, true);
   assert.equal(harness.createdTabs[0].windowId, 7);
   assert.match(harness.createdTabs[0].url, /unattendedRun=request-create/);
+  assert.match(harness.createdTabs[0].url, /unattendedAttempt=attempt-create/);
   assert.deepEqual(harness.updatedTabs, [
     {id: harness.createdTabs[0].id, autoDiscardable: false},
   ]);
@@ -1442,7 +2025,9 @@ test("a targeted post runner falls back once when its preferred window closed", 
 test("an unattended runner never coerces a missing window to id zero", async () => {
   const harness = createHarness();
 
-  await harness.api.openUnattendedRunnerTab("unattended-no-window");
+  await harness.api.openUnattendedRunnerTab("unattended-no-window", {
+    attemptId: "unattended-no-window-attempt",
+  });
 
   assert.equal(harness.createdTabs.length, 1);
   assert.equal(
@@ -1464,6 +2049,7 @@ test("an unattended runner falls back once when its preferred window closed", as
 
   await harness.api.openUnattendedRunnerTab("unattended-stale-window", {
     windowId: 9,
+    attemptId: "unattended-stale-window-attempt",
   });
 
   assert.equal(attempts.length, 2);
@@ -1601,27 +2187,222 @@ test("targeted stop rejects a missing attempt", async () => {
   assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "running");
 });
 
-test("a reused unattended runner tab stays non-discardable", async () => {
+test("the exact unattended attempt runner stays non-discardable", async () => {
   const harness = createHarness();
   harness.setTabQueryHandler(async () => [
     {
       id: 77,
-      url: "chrome-extension://test/sidebar/sidebar.html?unattendedRun=old-request",
+      url: "chrome-extension://test/sidebar/sidebar.html?unattendedRun=request-reuse&unattendedAttempt=request-reuse-attempt",
     },
   ]);
 
-  const runner = await harness.api.openUnattendedRunnerTab("request-reuse");
+  const runner = await harness.api.openUnattendedRunnerTab("request-reuse", {
+    attemptId: "request-reuse-attempt",
+  });
 
   assert.equal(harness.createdTabs.length, 0);
   assert.deepEqual(harness.updatedTabs, [
     {
       id: 77,
-      url: "chrome-extension://test/sidebar/sidebar.html?unattendedRun=request-reuse",
+      url: "chrome-extension://test/sidebar/sidebar.html?unattendedRun=request-reuse&unattendedAttempt=request-reuse-attempt",
       active: true,
       autoDiscardable: false,
     },
   ]);
   assert.equal(runner.autoDiscardable, false);
+});
+
+test("a new unattended attempt never rewrites an older attempt tab", async () => {
+  const harness = createHarness();
+  harness.setTabQueryHandler(async () => [{
+    id: 77,
+    url: "chrome-extension://test/sidebar/sidebar.html?unattendedRun=same-request&unattendedAttempt=old-attempt",
+  }]);
+
+  const runner = await harness.api.openUnattendedRunnerTab("same-request", {
+    attemptId: "new-attempt",
+  });
+
+  assert.equal(harness.createdTabs.length, 1);
+  assert.equal(harness.createdTabs[0].id, runner.id);
+  assert.match(harness.createdTabs[0].url, /unattendedAttempt=new-attempt/u);
+  assert.equal(
+    harness.updatedTabs.some((tab) => tab.id === 77),
+    false,
+  );
+});
+
+test("a settled targeted-post update closes only its exact runner after report and ledger persistence", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-close-request",
+    clientTaskId: "targeted-close-request",
+    taskId: "targeted-close-task",
+    attemptId: "targeted-close-attempt",
+    cloudCommandId: "targeted-close-command",
+    platform: "xiaohongshu",
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "agent-targeted-close",
+      token: "targeted-close-token",
+    },
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  harness.setTabQueryHandler(async () => [
+    {
+      id: 61,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        "?targetedPostRun=targeted-close-request" +
+        "&targetedPostAttempt=targeted-close-attempt",
+    },
+    {
+      id: 62,
+      url: "chrome-extension://test/sidebar/sidebar.html",
+    },
+    {
+      id: 63,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        "?targetedPostRun=targeted-close-request" +
+        "&targetedPostAttempt=another-attempt",
+    },
+    {
+      id: 64,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        "?targetedPostRun=another-request" +
+        "&targetedPostAttempt=targeted-close-attempt",
+    },
+    {
+      id: 65,
+      url:
+        "https://example.com/sidebar/sidebar.html" +
+        "?targetedPostRun=targeted-close-request" +
+        "&targetedPostAttempt=targeted-close-attempt",
+    },
+  ]);
+  let removalSnapshot = null;
+  harness.setTabRemoveHandler(async (tabId) => {
+    const ledgerRun = harness.storage[TASK_LEDGER_KEY]?.runs?.find(
+      (run) => run.id === "targeted-close-request::targeted-close-attempt",
+    );
+    removalSnapshot = {
+      tabId: Number(tabId),
+      requestStatus:
+        harness.storage[TARGETED_POST_REQUEST_KEY]?.status || "",
+      ledgerStatus: ledgerRun?.status || "",
+      cloudCompletionCount: harness.cloudCommandCompletions.length,
+    };
+  });
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      status: "completed",
+      finishedAt: "2026-07-29T00:00:05.000Z",
+      message: "定向巡检已完成",
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.cloudReported, true);
+  assert.equal(response.runnerClosed, true);
+  assert.deepEqual(harness.removedTabIds, [61]);
+  assert.deepEqual(removalSnapshot, {
+    tabId: 61,
+    requestStatus: "completed",
+    ledgerStatus: "completed",
+    cloudCompletionCount: 1,
+  });
+});
+
+test("a needs-action targeted-post update preserves its exact runner for inspection", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-needs-action-request",
+    clientTaskId: "targeted-needs-action-request",
+    taskId: "targeted-needs-action-task",
+    attemptId: "targeted-needs-action-attempt",
+    cloudCommandId: "targeted-needs-action-command",
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "agent-targeted-needs-action",
+      token: "targeted-needs-action-token",
+    },
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  harness.setTabQueryHandler(async () => [
+    {
+      id: 71,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        "?targetedPostRun=targeted-needs-action-request" +
+        "&targetedPostAttempt=targeted-needs-action-attempt",
+    },
+  ]);
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      status: "needs_action",
+      finishedAt: "2026-07-29T00:00:05.000Z",
+      message: "需要人工检查任务现场",
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.cloudReported, true);
+  assert.equal(response.runnerClosed, false);
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "needs_action",
+  );
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) =>
+      run.id ===
+      "targeted-needs-action-request::targeted-needs-action-attempt",
+  );
+  assert.equal(ledgerRun.status, "needs_action");
+});
+
+test("terminal targeted-post cleanup refuses a stale request-attempt owner", async () => {
+  const harness = createHarness();
+  const stale = buildTargetedPostRequest({
+    id: "targeted-owner-request",
+    clientTaskId: "targeted-owner-request",
+    attemptId: "targeted-owner-stale-attempt",
+    status: "completed",
+  });
+  const current = buildTargetedPostRequest({
+    id: "targeted-owner-request",
+    clientTaskId: "targeted-owner-request",
+    attemptId: "targeted-owner-current-attempt",
+    status: "running",
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = current;
+  harness.setTabQueryHandler(async () => [
+    {
+      id: 81,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        "?targetedPostRun=targeted-owner-request" +
+        "&targetedPostAttempt=targeted-owner-stale-attempt",
+    },
+  ]);
+
+  const result =
+    await harness.api.closeTerminalTargetedPostRunnerTabs(stale);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(harness.removedTabIds, []);
 });
 
 test("a terminal targeted-post update reports its cloud command before the message lifecycle ends", async () => {
@@ -1656,13 +2437,14 @@ test("a terminal targeted-post update reports its cloud command before the messa
     checkpoint: {processedCount: 0, total: 1},
   };
 
+  const terminalFinishedAt = new Date().toISOString();
   const response = await harness.sendBackgroundMessage({
     type: "onstarvoice:update-targeted-post-run",
     requestId: "targeted-terminal-request",
     attemptId: "targeted-terminal-attempt",
     patch: {
       status: "completed",
-      finishedAt: "2026-07-27T11:00:04.000Z",
+      finishedAt: terminalFinishedAt,
       message: "负面帖子巡查已完成",
       targetResults: [{
         workflow: "negative_post_patrol",
@@ -1678,7 +2460,7 @@ test("a terminal targeted-post update reports its cloud command before the messa
           availabilityStatus: "page_unavailable",
           reason: "post_deleted_or_unavailable",
           evidence: ["xhs_unavailable_qr_layout"],
-          observedAt: "2026-07-27T11:00:04.000Z",
+          observedAt: terminalFinishedAt,
         },
       }],
     },
@@ -3923,6 +4705,14 @@ test("repeated old progress cannot replenish the four spaced automatic recoverie
   assert.equal(exhausted.terminal, true, JSON.stringify(exhausted));
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 4);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].error.fastRetryExhausted,
+    true,
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].error.failureOrigin,
+    "extension_runtime",
+  );
 });
 
 test("a legacy service-abnormal checkpoint no longer blocks recovery", async () => {
@@ -4621,6 +5411,14 @@ test("repeated runner launch failures also stop instead of recovering forever", 
 
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryLaunchFailures, 4);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].error.fastRetryExhausted,
+    true,
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].error.failureOrigin,
+    "extension_runtime",
+  );
 });
 
 test("keyword checkpoints become task-center success failure and skip details", async () => {
@@ -5016,6 +5814,100 @@ test("generic task ledger messages share normalized upsert and history reads", a
   assert.equal(ledger.ok, true);
   assert.equal(ledger.data.runs[0].id, "manual-task-1");
   assert.equal(ledger.data.runs[0].events[0].message, "开始采集");
+});
+
+test("a terminal task ledger write releases the reserve once and succeeds on its only retry", async () => {
+  const harness = createHarness();
+  await harness.api.upsertTaskLedgerRun({
+    run: {
+      id: "quota-terminal-task",
+      taskType: "capture",
+      status: "running",
+      attemptId: "quota-terminal-attempt",
+    },
+  });
+  harness.storage[CONTROL_STORAGE_RESERVE_KEY] = {
+    schemaVersion: 1,
+    padding: "0".repeat(CONTROL_STORAGE_RESERVE_BYTES),
+  };
+  let terminalWriteAttempts = 0;
+  harness.setStorageSetHandler(async (values) => {
+    const run = values[TASK_LEDGER_KEY]?.runs?.find(
+      (item) => item.id === "quota-terminal-task",
+    );
+    if (run?.status !== "canceled") return;
+    terminalWriteAttempts += 1;
+    if (terminalWriteAttempts === 1) {
+      throw new Error("Resource::kQuotaBytes quota exceeded");
+    }
+  });
+
+  const result = await harness.api.terminalizeCaptureTaskLedgerRun(
+    "quota-terminal-task",
+    {reason: "source_tab_removed"},
+  );
+
+  assert.equal(result.accepted, true);
+  assert.equal(terminalWriteAttempts, 2);
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs.find(
+      (item) => item.id === "quota-terminal-task",
+    ).status,
+    "canceled",
+  );
+  assert.deepEqual(
+    harness.storageRemoveCalls.filter(
+      (key) => key === CONTROL_STORAGE_RESERVE_KEY,
+    ),
+    [CONTROL_STORAGE_RESERVE_KEY],
+  );
+});
+
+test("an exhausted terminal ledger retry rejects and leaves the running attempt durable", async () => {
+  const harness = createHarness();
+  await harness.api.upsertTaskLedgerRun({
+    run: {
+      id: "quota-terminal-exhausted",
+      taskType: "capture",
+      status: "running",
+      attemptId: "quota-terminal-attempt",
+    },
+  });
+  harness.storage[CONTROL_STORAGE_RESERVE_KEY] = {
+    schemaVersion: 1,
+    padding: "tiny",
+  };
+  let terminalWriteAttempts = 0;
+  harness.setStorageSetHandler(async (values) => {
+    const run = values[TASK_LEDGER_KEY]?.runs?.find(
+      (item) => item.id === "quota-terminal-exhausted",
+    );
+    if (run?.status !== "canceled") return;
+    terminalWriteAttempts += 1;
+    throw new Error("Resource::kQuotaBytes quota exceeded");
+  });
+
+  await assert.rejects(
+    harness.api.terminalizeCaptureTaskLedgerRun(
+      "quota-terminal-exhausted",
+      {reason: "source_tab_removed"},
+    ),
+    /kQuotaBytes quota exceeded/,
+  );
+
+  assert.equal(terminalWriteAttempts, 2);
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs.find(
+      (item) => item.id === "quota-terminal-exhausted",
+    ).status,
+    "running",
+  );
+  assert.deepEqual(
+    harness.storageRemoveCalls.filter(
+      (key) => key === CONTROL_STORAGE_RESERVE_KEY,
+    ),
+    [CONTROL_STORAGE_RESERVE_KEY],
+  );
 });
 
 test("abnormal Debug shutdown immediately terminalizes the task ledger", async () => {
@@ -6347,6 +7239,39 @@ test("claim without holder evidence is rejected before changing request state", 
 
   assert.equal(claim.accepted, false, JSON.stringify(claim));
   assert.equal(claim.reason, "missing_lock_holder");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "pending");
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+});
+
+test("a runner URL must carry the current unattended attempt", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    status: "pending",
+    attemptId: "attempt-current",
+    startedAt: "",
+    claimedAt: "",
+  });
+
+  const missing = await harness.api.claimUnattendedKeywordRun({
+    requestId: request.id,
+    requireAttempt: true,
+    senderTabId: request.runnerTabId,
+    senderDocumentId: "runner-document",
+    holderId: "runner-holder",
+  });
+  const stale = await harness.api.claimUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: "attempt-old",
+    requireAttempt: true,
+    senderTabId: request.runnerTabId,
+    senderDocumentId: "runner-document",
+    holderId: "runner-holder",
+  });
+
+  assert.equal(missing.accepted, false);
+  assert.equal(missing.reason, "runner_attempt_required");
+  assert.equal(stale.accepted, false);
+  assert.equal(stale.reason, "attempt_superseded");
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "pending");
   assert.equal(harness.storage[LOCK_KEY], undefined);
 });

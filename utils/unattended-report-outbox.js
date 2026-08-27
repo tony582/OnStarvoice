@@ -1,3 +1,9 @@
+import {
+  isStorageQuotaError,
+  runWithControlStorageReserveRetry,
+  scheduleControlStorageReserveRestore,
+} from "./storage.js";
+
 const STORAGE_KEY_PREFIX =
   "onstarvoice.unattendedCheckpointReportOutbox.v2.";
 const MAX_OUTBOX_ENTRIES = 20;
@@ -8,6 +14,17 @@ const TERMINAL_REJECTION_REASONS = new Set([
   "stale_progress",
   "terminal",
 ]);
+const ACKNOWLEDGED_DELIVERY_STATUSES = new Set([
+  "acked",
+  "acknowledged",
+  "delivered",
+]);
+const OUTBOX_MUTATION_LOCK_NAME =
+  "onstarvoice.unattendedCheckpointReportOutbox.v2.mutation";
+const OUTBOX_MUTATION_QUEUE = Symbol.for(
+  "onstarvoice.unattendedCheckpointReportOutbox.v2.mutationQueue",
+);
+const fallbackMutationQueues = new WeakMap();
 
 let revisionCounter = 0;
 
@@ -100,6 +117,18 @@ function normalizeEntry(value, storageKey = "") {
     revision: normalizeIdentity(source.revision),
     createdAt: String(source.createdAt || ""),
     updatedAt: String(source.updatedAt || ""),
+    deliveryStatus: String(
+      source.deliveryStatus || source.outboxStatus || "",
+    )
+      .trim()
+      .toLowerCase(),
+    acknowledgedAt: String(
+      source.acknowledgedAt || source.ackedAt || source.deliveredAt || "",
+    ).trim(),
+    acknowledged:
+      source.acknowledged === true ||
+      source.acked === true ||
+      source.delivered === true,
   };
   return entry.storageKey.startsWith(STORAGE_KEY_PREFIX) &&
     entry.id &&
@@ -109,6 +138,61 @@ function normalizeEntry(value, storageKey = "") {
     entry.revision
     ? entry
     : null;
+}
+
+function storedEntryValue(entry) {
+  const value = {
+    id: entry.id,
+    requestId: entry.requestId,
+    attemptId: entry.attemptId,
+    patch: entry.patch,
+    revision: entry.revision,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+  };
+  if (entry.deliveryStatus) value.deliveryStatus = entry.deliveryStatus;
+  if (entry.acknowledgedAt) value.acknowledgedAt = entry.acknowledgedAt;
+  if (entry.acknowledged) value.acknowledged = true;
+  return value;
+}
+
+function entryWasAcknowledged(entry) {
+  return Boolean(
+    entry?.acknowledged ||
+      entry?.acknowledgedAt ||
+      ACKNOWLEDGED_DELIVERY_STATUSES.has(entry?.deliveryStatus),
+  );
+}
+
+async function runStorageMutation(storage, mutation) {
+  const lockManager = globalThis.navigator?.locks;
+  if (lockManager && typeof lockManager.request === "function") {
+    return await lockManager.request(
+      OUTBOX_MUTATION_LOCK_NAME,
+      {mode: "exclusive"},
+      mutation,
+    );
+  }
+
+  let previous = fallbackMutationQueues.get(storage) || Promise.resolve();
+  try {
+    previous = storage[OUTBOX_MUTATION_QUEUE] || previous;
+  } catch {
+    // Some browser API proxy objects do not allow expando properties.
+  }
+  const result = previous.then(mutation, mutation);
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  fallbackMutationQueues.set(storage, settled);
+  try {
+    storage[OUTBOX_MUTATION_QUEUE] = settled;
+  } catch {
+    // The module-local WeakMap still serializes this document. Real Extension
+    // documents use the origin-wide Web Locks path above.
+  }
+  return await result;
 }
 
 async function readEntries(storage) {
@@ -145,6 +229,7 @@ async function removeExactKeys(storage, keys) {
   );
   if (normalized.length === 0) return 0;
   await storage.remove(normalized);
+  scheduleControlStorageReserveRestore({storage});
   return normalized.length;
 }
 
@@ -162,15 +247,55 @@ async function pruneEntries(storage) {
       (entry) => newestByAttempt.get(entry.id)?.storageKey !== entry.storageKey,
     )
     .map((entry) => entry.storageKey);
-  const newest = Array.from(newestByAttempt.values()).sort((left, right) => {
-    const timestampDifference = timestamp(left) - timestamp(right);
-    return timestampDifference || String(left.revision).localeCompare(String(right.revision));
-  });
-  const overflowKeys = newest
-    .slice(0, Math.max(0, newest.length - MAX_OUTBOX_ENTRIES))
+  const acknowledgedKeys = entries
+    .filter(entryWasAcknowledged)
     .map((entry) => entry.storageKey);
-  await removeExactKeys(storage, duplicateKeys.concat(overflowKeys));
+  // A distinct, unacknowledged attempt is durable business evidence. Capacity
+  // pressure may reject a new attempt, but must never evict an existing active,
+  // unsynced, failed, or needs_action checkpoint. Only a superseded snapshot
+  // for the same attempt, or an explicitly ACKed row, is safe to remove.
+  await removeExactKeys(storage, duplicateKeys.concat(acknowledgedKeys));
   return await readEntries(storage);
+}
+
+async function setEntryWithOneQuotaRetry(storage, storageKey, entry) {
+  const value = storedEntryValue(entry);
+  let writeAttempts = 0;
+  let initialWriteError = null;
+  try {
+    const result = await runWithControlStorageReserveRetry(
+      async () => {
+        writeAttempts += 1;
+        try {
+          await storage.set({[storageKey]: value});
+        } catch (error) {
+          if (writeAttempts === 1) initialWriteError = error;
+          throw error;
+        }
+      },
+      {storage},
+    );
+    return {ok: true, retried: result.retried};
+  } catch (error) {
+    return {
+      ok: false,
+      reason: isStorageQuotaError(error)
+        ? "storage_quota"
+        : "storage_error",
+      error,
+      retried: writeAttempts > 1,
+      ...(writeAttempts > 1 ? {initialError: initialWriteError} : {}),
+    };
+  }
+}
+
+async function removeEntryIfRevisionMatches(storage, entry) {
+  const stored = await storage.get(entry.storageKey);
+  const current = normalizeEntry(stored?.[entry.storageKey], entry.storageKey);
+  if (!current || current.revision !== entry.revision) return false;
+  await storage.remove(entry.storageKey);
+  scheduleControlStorageReserveRestore({storage});
+  return true;
 }
 
 export async function enqueueUnattendedCheckpointReport(
@@ -188,8 +313,9 @@ export async function enqueueUnattendedCheckpointReport(
     const nowMs = Math.max(0, Number(now()) || Date.now());
     const timestampText = new Date(nowMs).toISOString();
     const revision = nextRevision(nowMs);
-    const storageKey = buildStorageKey(revision);
-    const entry = {
+    const immutableStorageKey = buildStorageKey(revision);
+    const candidate = {
+      storageKey: immutableStorageKey,
       id: buildEntryId(normalizedRequestId, normalizedAttemptId),
       requestId: normalizedRequestId,
       attemptId: normalizedAttemptId,
@@ -198,30 +324,62 @@ export async function enqueueUnattendedCheckpointReport(
       createdAt: timestampText,
       updatedAt: timestampText,
     };
-    // Each write has an immutable key. No document performs a read-modify-write
-    // on a shared array, so a sidebar and runner tab cannot erase each other's
-    // newer checkpoint while an older delivery is being acknowledged.
-    await area.set({[storageKey]: entry});
-    const retained = await pruneEntries(area);
-    const exactEntry = retained.find(
-      (candidate) => candidate.storageKey === storageKey,
-    );
-    const retainedEntry = retained.find(
-      (candidate) => candidate.id === entry.id,
-    );
-    if (!exactEntry && !retainedEntry) {
-      return {
-        ok: false,
-        reason: "outbox_capacity",
+    return await runStorageMutation(area, async () => {
+      // Compact before the write. In particular, updating an existing attempt
+      // reuses its storage key, so a full store does not need room for a
+      // transient twenty-first immutable document.
+      const retainedBeforeWrite = await pruneEntries(area);
+      const existing = retainedBeforeWrite.find(
+        (entry) => entry.id === candidate.id,
+      );
+      if (existing && compareNewest(candidate, existing) <= 0) {
+        return {ok: true, reason: "superseded", entry: existing};
+      }
+      if (!existing && retainedBeforeWrite.length >= MAX_OUTBOX_ENTRIES) {
+        return {ok: false, reason: "outbox_capacity"};
+      }
+
+      const storageKey = existing?.storageKey || immutableStorageKey;
+      const entry = {
+        ...candidate,
+        storageKey,
+        // Preserve fields not present in a partial checkpoint patch, while the
+        // new checkpoint itself replaces the old cumulative checkpoint.
+        patch: existing
+          ? cloneCheckpointPatch({...existing.patch, ...candidate.patch}) ||
+            candidate.patch
+          : candidate.patch,
       };
-    }
-    return {
-      ok: true,
-      reason: exactEntry ? "queued" : "superseded",
-      entry: exactEntry || retainedEntry,
-    };
+      const written = await setEntryWithOneQuotaRetry(
+        area,
+        storageKey,
+        entry,
+      );
+      if (!written.ok) return written;
+
+      const stored = await area.get(storageKey);
+      const durable = normalizeEntry(stored?.[storageKey], storageKey);
+      if (!durable) {
+        return {ok: false, reason: "storage_error"};
+      }
+      if (durable.revision !== entry.revision) {
+        return compareNewest(durable, entry) >= 0
+          ? {ok: true, reason: "superseded", entry: durable}
+          : {ok: false, reason: "storage_conflict"};
+      }
+      return {
+        ok: true,
+        reason: "queued",
+        entry: durable,
+        retried: written.retried,
+      };
+    });
   } catch (error) {
-    return {ok: false, reason: "storage_error", error};
+    return {
+      ok: false,
+      reason: isStorageQuotaError(error) ? "storage_quota" : "storage_error",
+      error,
+    };
   }
 }
 
@@ -234,16 +392,18 @@ export async function discardUnattendedCheckpointReports(
   if (!normalizedRequestId) return {ok: false, removed: 0};
   try {
     const area = resolveStorageArea(storage);
-    const entries = await readEntries(area);
-    const keys = entries
-      .filter(
-        (entry) =>
-          entry.requestId === normalizedRequestId &&
-          (!normalizedAttemptId || entry.attemptId === normalizedAttemptId),
-      )
-      .map((entry) => entry.storageKey);
-    await removeExactKeys(area, keys);
-    return {ok: true, removed: keys.length};
+    return await runStorageMutation(area, async () => {
+      const entries = await readEntries(area);
+      const keys = entries
+        .filter(
+          (entry) =>
+            entry.requestId === normalizedRequestId &&
+            (!normalizedAttemptId || entry.attemptId === normalizedAttemptId),
+        )
+        .map((entry) => entry.storageKey);
+      await removeExactKeys(area, keys);
+      return {ok: true, removed: keys.length};
+    });
   } catch (error) {
     return {ok: false, removed: 0, error};
   }
@@ -257,7 +417,10 @@ export async function flushUnattendedCheckpointReportOutbox(
     throw new TypeError("outbox send must be a function");
   }
   const area = resolveStorageArea(storage);
-  const entries = (await pruneEntries(area)).sort((left, right) => {
+  const entries = (await runStorageMutation(
+    area,
+    () => pruneEntries(area),
+  )).sort((left, right) => {
     const timeDifference = timestamp(left) - timestamp(right);
     return timeDifference || compareNewest(left, right);
   });
@@ -291,7 +454,10 @@ export async function flushUnattendedCheckpointReportOutbox(
       accepted ||
       (explicitRejection && TERMINAL_REJECTION_REASONS.has(reason))
     ) {
-      await removeExactKeys(area, entry.storageKey);
+      await runStorageMutation(
+        area,
+        () => removeEntryIfRevisionMatches(area, entry),
+      );
       if (accepted) delivered += 1;
       else discarded += 1;
       continue;

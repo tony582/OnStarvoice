@@ -62,7 +62,14 @@ import {
   flushUnattendedCheckpointReportOutbox,
 } from "../utils/unattended-report-outbox.js";
 import {runEnhancementWithSingleRetry} from "../utils/capture/enhancement-retry.js";
-import {addSyncHistoryEntry, getAuth, getRecords} from "../utils/storage.js";
+import {
+  addSyncHistoryEntry,
+  ensureControlStorageReserve,
+  getAuth,
+  getRecords,
+  isStorageQuotaError,
+  releaseControlStorageReserve,
+} from "../utils/storage.js";
 
 import {
   verify,
@@ -862,6 +869,8 @@ const KEYWORD_SORT_SYNC_INTERVAL_MS = 1800;
 const EXTENSION_UPDATE_MODAL_STATE_KEY = "onstarvoice.updateModalState";
 const RISK_NOTICE_ACKNOWLEDGED_KEY = "onstarvoice.riskNoticeAcknowledged";
 const MEMBER_GROUP_PROMPT_STATE_KEY = "onstarvoice.memberGroupPromptState";
+const TERMINAL_SUMMARY_ACK_STORAGE_KEY =
+  "onstarvoice.terminalSummaryAcknowledgements";
 const DEFAULT_UPDATE_DOWNLOAD_URL = "https://voice.minilife.online/about";
 const DEFAULT_UPDATE_CHANGELOG_URL = "https://voice.minilife.online/about#changelog";
 const EXTENSION_MANAGEMENT_URL = `chrome://extensions/?id=${chrome.runtime.id}`;
@@ -1124,13 +1133,11 @@ const BATCH_DRAFT_SESSION_KEY = "onstarvoice.batchDraftByPlatform";
 const BATCH_DRAFT_LEGACY_KEYS = ["expandedKeywords", "expandedSeedKeyword"];
 const BATCH_DRAFT_PLATFORMS = new Set(["xiaohongshu", "douyin", "unknown"]);
 const UNATTENDED_RUN_QUERY_KEY = "unattendedRun";
+const UNATTENDED_RUN_ATTEMPT_QUERY_KEY = "unattendedAttempt";
 const TARGETED_POST_RUN_QUERY_KEY = "targetedPostRun";
 const TARGETED_POST_RUN_ATTEMPT_QUERY_KEY = "targetedPostAttempt";
 const TARGETED_POST_RUN_REQUEST_STORAGE_KEY =
   "onstarvoice.targetedPostRunRequest";
-const TARGETED_POST_RUNNER_HOME_URLS = Object.freeze({
-  douyin: "https://www.douyin.com/jingxuan",
-});
 const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
 const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
 const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
@@ -3131,6 +3138,11 @@ async function handleCopyDiagnostics() {
 export async function initSidebar() {
   console.log("[Sidebar] Initializing...");
 
+  // 先恢复用户已经确认关闭的终态摘要，避免 initAllStates 首屏短暂复活旧任务。
+  await loadTerminalCaptureSummaryAcknowledgements();
+  // 在任务状态开始写入前建立控制面保留区；建立失败不会阻断启动，但后续
+  // quota 路径仍会明确失败而不是把控制写入误报为成功。
+  await ensureControlStorageReserve();
   // 初始化所有状态
   await initAllStates();
   void flushPendingUnattendedCheckpointReports({quiet: true});
@@ -5438,7 +5450,68 @@ function renderCaptureDebugSession(runtime = {}) {
   });
 }
 
-function dismissAllTerminalCaptureSummaries() {
+async function loadTerminalCaptureSummaryAcknowledgements() {
+  try {
+    const stored = await chrome.storage.local.get(
+      TERMINAL_SUMMARY_ACK_STORAGE_KEY,
+    );
+    const acknowledgements =
+      stored?.[TERMINAL_SUMMARY_ACK_STORAGE_KEY] &&
+      typeof stored[TERMINAL_SUMMARY_ACK_STORAGE_KEY] === "object"
+        ? stored[TERMINAL_SUMMARY_ACK_STORAGE_KEY]
+        : {};
+    debugSessionDismissedUnattendedTerminalRunAt = String(
+      acknowledgements.unattendedTerminalSummaryId || "",
+    ).trim();
+    debugSessionDismissedTargetedTerminalRunAt = String(
+      acknowledgements.targetedTerminalSummaryId || "",
+    ).trim();
+    return true;
+  } catch (error) {
+    console.warn("[Sidebar] Load terminal summary acknowledgements failed:", error);
+    return false;
+  }
+}
+
+async function persistTerminalCaptureSummaryAcknowledgements() {
+  const acknowledgements = {
+    schemaVersion: 1,
+    unattendedTerminalSummaryId:
+      debugSessionDismissedUnattendedTerminalRunAt,
+    targetedTerminalSummaryId:
+      debugSessionDismissedTargetedTerminalRunAt,
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    await chrome.storage.local.set({
+      [TERMINAL_SUMMARY_ACK_STORAGE_KEY]: acknowledgements,
+    });
+    return true;
+  } catch (error) {
+    if (isStorageQuotaError(error)) {
+      await releaseControlStorageReserve();
+      try {
+        await chrome.storage.local.set({
+          [TERMINAL_SUMMARY_ACK_STORAGE_KEY]: acknowledgements,
+        });
+        void ensureControlStorageReserve();
+        return true;
+      } catch (retryError) {
+        console.warn(
+          "[Sidebar] Persist terminal acknowledgement after reserve release failed:",
+          retryError,
+        );
+      }
+    }
+    console.warn(
+      "[Sidebar] Persist terminal summary acknowledgements failed:",
+      error,
+    );
+    return false;
+  }
+}
+
+async function dismissAllTerminalCaptureSummaries() {
   const displayPlan = buildKeywordRunDisplayPlan(keywordPlanState);
   const planStatus = String(
     displayPlan?.lastRunStatus || "",
@@ -5464,6 +5537,7 @@ function dismissAllTerminalCaptureSummaries() {
       ).trim() ||
       `${String(targetedPostRunState?.id || "")}:${targetedStatus}:${String(targetedPostRunState?.message || "").trim()}`;
   }
+  return await persistTerminalCaptureSummaryAcknowledgements();
 }
 
 function setupDebugSessionPanelControls() {
@@ -5479,7 +5553,7 @@ function setupDebugSessionPanelControls() {
     if (panel?.dataset?.terminal === "true") {
       // 一个页面可能同时保留“一次性/无人值守”和“定向巡查”的终态。
       // 关闭应退出任务状态视图，而不是只隐藏当前一张卡后露出另一张。
-      dismissAllTerminalCaptureSummaries();
+      await dismissAllTerminalCaptureSummaries();
       debugSessionPanelMinimized = false;
       renderCaptureDebugSession(getCurrentRuntime() || {});
       return;
@@ -13398,7 +13472,10 @@ async function drainStreamingDetailSyncQueue(
   {round = null, updateProgress = null, notifyProgress = null} = {},
 ) {
   if (!streamingSyncQueue?.enabled) {
-    return streamingSyncQueue?.getStats?.() || null;
+    const disabledStats = streamingSyncQueue?.getStats?.();
+    return disabledStats && typeof disabledStats === "object"
+      ? {...disabledStats, drainCompleted: true}
+      : null;
   }
 
   const before = streamingSyncQueue.getStats();
@@ -13444,7 +13521,13 @@ async function drainStreamingDetailSyncQueue(
       "warning",
     );
   }
-  return result;
+  return {
+    ...result,
+    // This bit is set only by the awaited terminal drain path. A bare queue
+    // snapshot, a missing result, or a progress payload with defaulted zeroes
+    // must never be treated as proof that task-owned uploads are gone.
+    drainCompleted: true,
+  };
 }
 
 async function handleBatchKeywordCapture(options = {}) {
@@ -15731,6 +15814,18 @@ function getUnattendedRunRequestIdFromUrl() {
   }
 }
 
+function getUnattendedRunAttemptIdFromUrl() {
+  try {
+    return (
+      new URLSearchParams(window.location.search).get(
+        UNATTENDED_RUN_ATTEMPT_QUERY_KEY,
+      ) || ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
 function getTargetedPostRunRequestIdFromUrl() {
   try {
     return (
@@ -16252,18 +16347,9 @@ async function settleTargetedPostRunnerTab(
     return false;
   }
 
-  const detectedPlatform = detectPlatformFromUrl(runnerTab?.url || "");
-  const normalizedPlatform =
-    detectedPlatform && detectedPlatform !== "unknown"
-      ? detectedPlatform
-      : String(platform || "").trim().toLowerCase();
-  const homeUrl = TARGETED_POST_RUNNER_HOME_URLS[normalizedPlatform] || "";
-  if (!homeUrl) {
-    return false;
-  }
-
-  // 这个标签页由定向任务自己创建，可以安全收尾。先停止当前作品的音视频，
-  // 再回到平台首页，避免任务结束后仍在后台循环播放。
+  // 这个标签页由当前定向任务自己创建，可以安全收尾。先停止当前作品的
+  // 音视频；正常终态直接关闭，避免每个巡检任务在浏览器里留下一个平台
+  // 首页。needs_action 保留现场供用户处理，但同样停止媒体播放。
   try {
     await chrome.scripting.executeScript({
       target: {tabId: normalizedTabId},
@@ -16293,13 +16379,10 @@ async function settleTargetedPostRunnerTab(
   }
 
   try {
-    await chrome.tabs.update(normalizedTabId, {
-      url: homeUrl,
-      active: true,
-    });
+    await chrome.tabs.remove(normalizedTabId);
     return true;
   } catch (error) {
-    console.warn("[Sidebar] Restore targeted runner home failed:", error);
+    console.warn("[Sidebar] Close targeted runner tab failed:", error);
     return false;
   }
 }
@@ -17103,6 +17186,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     return;
   }
   const requestId = getUnattendedRunRequestIdFromUrl();
+  const requestAttemptId = getUnattendedRunAttemptIdFromUrl();
   if (!requestId && !allowPending) {
     return;
   }
@@ -17119,6 +17203,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:claim-unattended-keyword-run",
       requestId,
+      attemptId: requestAttemptId,
       holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
     });
     if (
@@ -17201,6 +17286,18 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     ) {
       await releaseCaptureExecutionLock(claimedAdoptedLockId);
     }
+    // Closure is a separate, fail-closed phase after terminal persistence,
+    // task-session cleanup and lock release. Drain this attempt's durable
+    // checkpoints before asking background to close the exact task runner and
+    // attest that no task-owned browser resource remains.
+    await flushPendingUnattendedCheckpointReports({quiet: true}).catch(
+      () => null,
+    );
+    await sendUnattendedRuntimeMessage({
+      type: "onstarvoice:finalize-unattended-local-closure",
+      requestId: claimedRequestId,
+      attemptId: claimedAttemptId,
+    }).catch(() => null);
   }
 }
 
@@ -17818,6 +17915,27 @@ function buildUnattendedTerminalProgress({
   );
   const sync =
     streamingSync && typeof streamingSync === "object" ? streamingSync : {};
+  const syncInteger = (value) =>
+    Number.isSafeInteger(Number(value)) && Number(value) >= 0
+      ? Number(value)
+      : null;
+  const streamingSyncEvidenceKnown = Boolean(
+    streamingSync &&
+      typeof streamingSync === "object" &&
+      typeof sync.enabled === "boolean" &&
+      sync.drainCompleted === true &&
+      syncInteger(sync.enqueuedCount) !== null &&
+      syncInteger(sync.processedCount) !== null &&
+      syncInteger(sync.successCount) !== null &&
+      syncInteger(sync.failedCount) !== null &&
+      syncInteger(sync.skippedCount) !== null &&
+      syncInteger(sync.pendingCount) !== null &&
+      syncInteger(sync.activeCount) !== null &&
+      syncInteger(sync.remainingCount) !== null &&
+      typeof sync.blocked === "boolean" &&
+      typeof sync.canceled === "boolean"
+  );
+  const capturedRecordCount = Math.max(0, Number(summary?.saved) || 0);
   return {
     ...previous,
     captureTaskId:
@@ -17882,6 +18000,35 @@ function buildUnattendedTerminalProgress({
       0,
       Number(sync.remainingCount ?? previous.syncRemainingCount) || 0,
     ),
+    // Closure evidence consumes only these explicit attempt-local fields. The
+    // legacy sync* values above remain UI counters and may be defaulted for
+    // backwards compatibility; they are intentionally not authoritative.
+    streamingSyncEvidenceKnown,
+    streamingSyncDrainCompleted:
+      streamingSyncEvidenceKnown && sync.drainCompleted === true,
+    streamingSyncEnabled:
+      streamingSyncEvidenceKnown ? sync.enabled === true : null,
+    streamingSyncEnqueuedCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.enqueuedCount) : null,
+    streamingSyncProcessedCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.processedCount) : null,
+    streamingSyncSuccessCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.successCount) : null,
+    streamingSyncFailedCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.failedCount) : null,
+    streamingSyncSkippedCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.skippedCount) : null,
+    streamingSyncPendingCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.pendingCount) : null,
+    streamingSyncActiveCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.activeCount) : null,
+    streamingSyncRemainingCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.remainingCount) : null,
+    streamingSyncBlocked:
+      streamingSyncEvidenceKnown ? sync.blocked === true : null,
+    streamingSyncCanceled:
+      streamingSyncEvidenceKnown ? sync.canceled === true : null,
+    capturedRecordCount,
     updatedAt: String(finishedAt || new Date().toISOString()),
   };
 }

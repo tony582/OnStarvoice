@@ -873,13 +873,13 @@ test("official comment patrol cancellation ends and releases its exact native ta
   );
 });
 
-test("a completed Douyin targeted patrol pauses its owned media and returns its runner home", async () => {
+test("a completed Douyin targeted patrol pauses media and closes its owned runner", async () => {
   const cleanupSection = readFunctionSection(
     "async function settleTargetedPostRunnerTab(",
     "async function waitForTargetedPostRunnerTab(",
   );
   const scriptCalls = [];
-  const tabUpdates = [];
+  const removedTabIds = [];
   const context = {
     chrome: {
       tabs: {
@@ -887,10 +887,7 @@ test("a completed Douyin targeted patrol pauses its owned media and returns its 
           id: 77,
           url: "https://www.douyin.com/video/766193585000000001",
         }),
-        update: async (tabId, patch) => {
-          tabUpdates.push({tabId, patch});
-          return {id: tabId, ...patch};
-        },
+        remove: async (tabId) => removedTabIds.push(tabId),
       },
       scripting: {
         executeScript: async (payload) => {
@@ -918,16 +915,7 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   );
   assert.equal(scriptCalls.length, 1);
   assert.equal(scriptCalls[0].target.tabId, 77);
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(tabUpdates)),
-    [{
-      tabId: 77,
-      patch: {
-        url: "https://www.douyin.com/jingxuan",
-        active: true,
-      },
-    }],
-  );
+  assert.deepEqual(removedTabIds, [77]);
 
   const runnerSection = readFunctionSection(
     "async function maybeClaimAndRunTargetedPostWorkflow()",
@@ -943,13 +931,13 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   assert.ok(clearIndex > settleIndex);
 });
 
-test("targeted patrol cleanup never redirects a non-Douyin runner", async () => {
+test("a completed Xiaohongshu targeted patrol closes its owned runner", async () => {
   const cleanupSection = readFunctionSection(
     "async function settleTargetedPostRunnerTab(",
     "async function waitForTargetedPostRunnerTab(",
   );
   const scriptCalls = [];
-  const tabUpdates = [];
+  const removedTabIds = [];
   const context = {
     chrome: {
       tabs: {
@@ -957,10 +945,7 @@ test("targeted patrol cleanup never redirects a non-Douyin runner", async () => 
           id: 88,
           url: "https://www.xiaohongshu.com/explore/note-1",
         }),
-        update: async (tabId, patch) => {
-          tabUpdates.push({tabId, patch});
-          return {id: tabId, ...patch};
-        },
+        remove: async (tabId) => removedTabIds.push(tabId),
       },
       scripting: {
         executeScript: async (payload) => {
@@ -985,11 +970,11 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   );
 
   assert.equal(
-    await context.__settleTargetedPostRunnerTab(88, "douyin"),
-    false,
+    await context.__settleTargetedPostRunnerTab(88, "xiaohongshu"),
+    true,
   );
-  assert.equal(scriptCalls.length, 0);
-  assert.equal(tabUpdates.length, 0);
+  assert.equal(scriptCalls.length, 1);
+  assert.deepEqual(removedTabIds, [88]);
 });
 
 test("targeted patrol safety intervention pauses media without leaving the page", async () => {
@@ -998,7 +983,7 @@ test("targeted patrol safety intervention pauses media without leaving the page"
     "async function waitForTargetedPostRunnerTab(",
   );
   const scriptCalls = [];
-  const tabUpdates = [];
+  const removedTabIds = [];
   const context = {
     chrome: {
       tabs: {
@@ -1006,10 +991,7 @@ test("targeted patrol safety intervention pauses media without leaving the page"
           id: 99,
           url: "https://www.douyin.com/video/766193585000000002",
         }),
-        update: async (tabId, patch) => {
-          tabUpdates.push({tabId, patch});
-          return {id: tabId, ...patch};
-        },
+        remove: async (tabId) => removedTabIds.push(tabId),
       },
       scripting: {
         executeScript: async (payload) => {
@@ -1037,7 +1019,7 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
     true,
   );
   assert.equal(scriptCalls.length, 1);
-  assert.equal(tabUpdates.length, 0);
+  assert.equal(removedTabIds.length, 0);
 });
 
 test("a normal side panel without a runner query renders shared targeted state and stops that exact request", async () => {
@@ -1137,12 +1119,28 @@ test("a normal side panel without a runner query renders shared targeted state a
   assert.match(initSection, /loadTargetedPostRunStateForDisplay\(\)/u);
 });
 
-test("closing a terminal status page dismisses both current terminal task families", () => {
+test("closing a terminal status page persists both acknowledgements across reloads", async () => {
   const dismissSection = readFunctionSection(
-    "function dismissAllTerminalCaptureSummaries()",
+    "async function loadTerminalCaptureSummaryAcknowledgements()",
     "function setupDebugSessionPanelControls()",
   );
+  const writes = [];
   const context = {
+    TERMINAL_SUMMARY_ACK_STORAGE_KEY:
+      "onstarvoice.terminalSummaryAcknowledgements",
+    chrome: {
+      storage: {
+        local: {
+          get: async () => ({
+            "onstarvoice.terminalSummaryAcknowledgements": {
+              unattendedTerminalSummaryId: "previous-unattended",
+              targetedTerminalSummaryId: "previous-targeted",
+            },
+          }),
+          set: async (value) => writes.push(value),
+        },
+      },
+    },
     keywordPlanState: {},
     buildKeywordRunDisplayPlan: () => ({
       lastRunStatus: "completed",
@@ -1169,7 +1167,20 @@ globalThis.__dismissAll = dismissAllTerminalCaptureSummaries;`,
     context,
   );
 
-  context.__dismissAll();
+  assert.equal(
+    await context.loadTerminalCaptureSummaryAcknowledgements(),
+    true,
+  );
+  assert.equal(
+    context.debugSessionDismissedUnattendedTerminalRunAt,
+    "previous-unattended",
+  );
+  assert.equal(
+    context.debugSessionDismissedTargetedTerminalRunAt,
+    "previous-targeted",
+  );
+
+  await context.__dismissAll();
 
   assert.equal(
     context.debugSessionDismissedUnattendedTerminalRunAt,
@@ -1179,6 +1190,18 @@ globalThis.__dismissAll = dismissAllTerminalCaptureSummaries;`,
     context.debugSessionDismissedTargetedTerminalRunAt,
     "2026-07-27T12:01:00.000Z",
   );
+  assert.equal(writes.length, 1);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      writes[0]["onstarvoice.terminalSummaryAcknowledgements"],
+    )),
+    {
+      schemaVersion: 1,
+      unattendedTerminalSummaryId: "2026-07-27T12:00:00.000Z",
+      targetedTerminalSummaryId: "2026-07-27T12:01:00.000Z",
+      updatedAt: writes[0]["onstarvoice.terminalSummaryAcknowledgements"].updatedAt,
+    },
+  );
 
   const controlsSection = readFunctionSection(
     "function setupDebugSessionPanelControls()",
@@ -1186,7 +1209,7 @@ globalThis.__dismissAll = dismissAllTerminalCaptureSummaries;`,
   );
   assert.match(
     controlsSection,
-    /dataset\?\.terminal === "true"[\s\S]*?dismissAllTerminalCaptureSummaries\(\)/u,
+    /dataset\?\.terminal === "true"[\s\S]*?await dismissAllTerminalCaptureSummaries\(\)/u,
   );
 });
 

@@ -96,6 +96,72 @@ test("heartbeat mirrors the newest local tasks and marks the active control requ
   assert.deepEqual(plain(payload.tasks[0].progress), {current: 2, total: 10});
 });
 
+test("terminal ledger closure evidence survives reload and is reported top-level", () => {
+  const closure = {
+    version: 1,
+    requestId: "closure-task",
+    attemptId: "closure-attempt",
+    snapshotRevision: 9,
+    closedAt: "2026-08-27T00:59:00.000Z",
+    debugSessionPresent: false,
+    taskSessionPresent: false,
+  };
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "closure-agent", appVersion: "0.3.93"},
+    ledger: {
+      version: 1,
+      runs: [{
+        id: "closure-task",
+        taskType: "unattended_keyword_capture",
+        status: "needs_action",
+        attemptId: "closure-attempt",
+        progressSeq: 9,
+        updatedAt: "2026-08-27T00:59:00.000Z",
+        metadata: {localClosure: closure},
+      }],
+    },
+  });
+
+  assert.deepEqual(plain(payload.tasks[0].localClosure), closure);
+  assert.deepEqual(plain(payload.tasks[0].metadata.localClosure), closure);
+});
+
+test("fixed-batch closure evidence array is reported through the authoritative top-level channel", () => {
+  const closures = [{
+    version: 1,
+    requestId: "closure-task",
+    attemptId: "closure-attempt",
+    itemId: "item-1",
+    itemAttemptId: "attempt-1",
+    snapshotRevision: 9,
+  }, {
+    version: 1,
+    requestId: "closure-task",
+    attemptId: "closure-attempt",
+    itemId: "item-2",
+    itemAttemptId: "attempt-2",
+    snapshotRevision: 9,
+  }];
+  const payload = agent.buildHeartbeatPayload({
+    runtime: {clientUuid: "closure-agent", appVersion: "0.3.94"},
+    ledger: {
+      version: 1,
+      runs: [{
+        id: "closure-task",
+        taskType: "unattended_keyword_capture",
+        status: "needs_action",
+        attemptId: "closure-attempt",
+        progressSeq: 9,
+        updatedAt: "2026-08-27T00:59:00.000Z",
+        metadata: {localClosure: closures[0], localClosures: closures},
+      }],
+    },
+  });
+
+  assert.deepEqual(plain(payload.tasks[0].localClosures), closures);
+  assert.deepEqual(plain(payload.tasks[0].localClosure), closures[0]);
+});
+
 test("every task carries bounded structured health evidence without page copy or URLs", () => {
   const progressAt = new Date(Date.now() - 1500).toISOString();
   const payload = agent.buildHeartbeatPayload({

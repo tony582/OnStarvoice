@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useState } from 'react'
+import { Fragment, useCallback, useState } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { Check, ChevronDown, Minus, X, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -99,9 +99,9 @@ export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }
 }) {
   const [openMenuKey, setOpenMenuKey] = useState<string | null>(null)
 
-  useEffect(() => {
-    if (count <= 0 || busy) setOpenMenuKey(null)
-  }, [busy, count])
+  if (openMenuKey !== null && (count <= 0 || busy)) {
+    setOpenMenuKey(null)
+  }
 
   const runAction = useCallback((key: string) => {
     setOpenMenuKey(null)

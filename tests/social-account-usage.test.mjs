@@ -14,6 +14,7 @@ import {
   normalizeSocialUsageEvent,
   normalizeSocialUsageEvents,
   processSocialAccountHeartbeat,
+  recordObservedSocialAgentAvailability,
   socialAccountIdentityMatchesAccount,
 } from "../server/services/social-account-usage.js";
 import {
@@ -375,6 +376,68 @@ test("manual Agent binding cannot be overwritten by a conflicting heartbeat", as
     JSON.parse(executed[0].params[0]).identityConflict,
     true,
   );
+});
+
+test("a trusted authenticated observation seeds a zero-usage candidate row", async () => {
+  const executed = [];
+  const tx = {
+    async execute(sql, params) {
+      executed.push({sql, params});
+      return null;
+    },
+  };
+  const seeded = await recordObservedSocialAgentAvailability(tx, {
+    agent: {id: "agent-idle", tenant_id: "tenant-a"},
+    account: {id: "account-idle"},
+    observed: {
+      platform: "douyin",
+      platformAccountId: "idle-account",
+      loginState: "authenticated",
+      confidence: "high",
+      observedAt: "2026-07-26T01:02:03.000Z",
+    },
+  });
+
+  assert.equal(seeded, true);
+  assert.equal(executed.length, 1);
+  assert.match(executed[0].sql, /INSERT INTO social_agent_daily_usage/u);
+  assert.match(executed[0].sql, /0, 0, 0, 0/u);
+  assert.match(executed[0].sql, /ON CONFLICT/u);
+  assert.equal(executed[0].params[1], "agent-idle");
+  assert.equal(executed[0].params[2], "douyin");
+  assert.equal(executed[0].params[3], "2026-07-26");
+});
+
+test("unknown, logged-out, or unbound observations cannot seed availability", async () => {
+  const executed = [];
+  const tx = {
+    async execute(sql, params) {
+      executed.push({sql, params});
+    },
+  };
+  const base = {
+    platform: "douyin",
+    platformAccountId: "idle-account",
+    confidence: "high",
+    observedAt: "2026-07-26T01:02:03.000Z",
+  };
+
+  assert.equal(await recordObservedSocialAgentAvailability(tx, {
+    agent: {id: "agent-idle", tenant_id: "tenant-a"},
+    account: {id: "account-idle"},
+    observed: {...base, loginState: "unknown"},
+  }), false);
+  assert.equal(await recordObservedSocialAgentAvailability(tx, {
+    agent: {id: "agent-idle", tenant_id: "tenant-a"},
+    account: {id: "account-idle"},
+    observed: {...base, loginState: "logged_out"},
+  }), false);
+  assert.equal(await recordObservedSocialAgentAvailability(tx, {
+    agent: {id: "agent-idle", tenant_id: "tenant-a"},
+    account: null,
+    observed: {...base, loginState: "authenticated"},
+  }), false);
+  assert.equal(executed.length, 0);
 });
 
 test("unbound Agent usage is persisted and acknowledged without an account", async () => {

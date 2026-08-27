@@ -690,6 +690,15 @@ type LlmRelayAgent = {
   created_at?: string
 }
 
+type SettingsResponse = {
+  settings?: Record<string, string>
+  aiFailoverStatus?: AiFailoverStatus | null
+}
+
+type LlmRelayAgentsResponse = {
+  agents?: LlmRelayAgent[]
+}
+
 export function SettingsPage() {
   const { refresh: refreshBadges } = useBadges()
   const [settings, setSettings] = useState<Record<string, string>>({})
@@ -701,10 +710,10 @@ export function SettingsPage() {
   const [loading, setLoading] = useState(true)
 
   const loadSettings = useCallback(() => Promise.all([
-      api.get<any>('/admin/settings'),
-      api.get<any>('/admin/official-accounts'),
-      api.get<any>('/admin/llm-relay-agents'),
-    ]).then(([sData, _officialAccounts, relayData]) => {
+      api.get<SettingsResponse>('/admin/settings'),
+      api.get<unknown>('/admin/official-accounts'),
+      api.get<LlmRelayAgentsResponse>('/admin/llm-relay-agents'),
+    ]).then(([sData, , relayData]) => {
       setSettings(sData.settings || {})
       setAiFailoverStatus(sData.aiFailoverStatus || null)
       setLlmRelayAgents(relayData.agents || [])

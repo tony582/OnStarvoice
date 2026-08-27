@@ -401,6 +401,28 @@ test("events are capped, length-limited, and redact credentials", () => {
   assert.equal(latest.metadata.safe, "visible");
 });
 
+test("fixed-batch local closure proofs survive ledger normalization as bounded objects", () => {
+  const localClosures = Array.from({length: 31}, (_, index) => ({
+    version: 1,
+    itemId: `item-${index + 1}`,
+    itemAttemptId: `attempt-${index + 1}`,
+    attemptNumber: index + 1,
+    assignmentRevision: 7,
+    authToken: "must-not-survive",
+  }));
+  const run = core.normalizeTaskRun({
+    id: "fixed-batch-closure",
+    status: "needs_action",
+    metadata: {localClosures},
+  }, {now: NOW});
+
+  assert.equal(run.metadata.localClosures.length, 30);
+  assert.equal(typeof run.metadata.localClosures[0], "object");
+  assert.equal(run.metadata.localClosures[0].itemId, "item-1");
+  assert.equal(run.metadata.localClosures[29].itemAttemptId, "attempt-30");
+  assert.equal(run.metadata.localClosures[0].authToken, "[REDACTED]");
+});
+
 test("legacy adapter imports sync, snake/camel monitor, and latest unattended state", () => {
   const items = core.buildLegacyTaskCenterItems(
     {

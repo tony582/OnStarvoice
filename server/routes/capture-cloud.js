@@ -37,6 +37,14 @@ import {
 import {
   CAPTURE_PLATFORM_SAFETY_CODES,
 } from '../services/capture-health-schema.js';
+import {
+  CAPTURE_SAFETY_HANDOFF_SEARCH_CODES,
+  evaluateCaptureSafetyHandoff,
+} from '../services/capture-safety-handoff-policy.js';
+import {
+  selectCaptureLocalClosureEvidence,
+  verifyCaptureLocalClosureProof,
+} from '../services/capture-local-closure-proof.js';
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
@@ -125,6 +133,9 @@ const ELASTIC_BOOTSTRAP_CONGESTION_MAX_DELAY_MS = 30 * 1000;
 const ELASTIC_BOOTSTRAP_MAX_DELAY_MS = 45 * 1000;
 const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set(
   CAPTURE_PLATFORM_SAFETY_CODES,
+);
+const AUTOMATIC_SEARCH_SAFETY_HANDOFF_CODES = new Set(
+  CAPTURE_SAFETY_HANDOFF_SEARCH_CODES,
 );
 const ELASTIC_AGENT_CAPACITY_CODES = new Set([
   'CAPTURE_TASK_GROUP_BUSY',
@@ -399,6 +410,137 @@ export function orchestrationCheckpointTimestamp(value) {
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
+const LATE_EVIDENCE_ACTIVE_ATTEMPT_STATUSES = new Set([
+  'assigned',
+  'dispatch_pending',
+  'dispatched',
+  'waiting_device',
+  'running',
+]);
+
+export function evaluateObservedCompletionCandidate(row = {}) {
+  const checkpoint = safeJson(row.source_attempt_checkpoint);
+  const result = safeJson(row.source_attempt_result);
+  const parentMetadata = safeJson(row.parent_metadata);
+  const planSnapshot = safeJson(
+    parentMetadata.planSnapshot || parentMetadata.plan_snapshot,
+  );
+  const configuredPasses = Array.isArray(planSnapshot.searchPasses)
+    ? planSnapshot.searchPasses.filter(value => text(value, 80)).length
+    : 0;
+  const expectedPassCount = Math.max(1, configuredPasses);
+  const passRows = Array.isArray(checkpoint.searchPassResults)
+    ? checkpoint.searchPassResults
+    : [];
+  const settledRounds = new Set();
+  for (const value of passRows) {
+    const pass = safeJson(value);
+    const round = orchestrationCheckpointInteger(pass.round);
+    if (
+      round >= 1 &&
+      round <= expectedPassCount &&
+      ['completed', 'completed_with_warnings'].includes(
+        text(pass.status, 80).toLowerCase(),
+      ) &&
+      pass.scanComplete === true &&
+      pass.partial !== true
+    ) {
+      settledRounds.add(round);
+    }
+  }
+  const savedCount = orchestrationCheckpointInteger(
+    checkpoint.savedCount ?? checkpoint.saved_count ??
+      result.savedCount ?? result.saved_count,
+  );
+  const observationCount = orchestrationCheckpointInteger(
+    row.exact_observation_count,
+  );
+  const sourceAttemptStatus = text(row.source_attempt_status, 80).toLowerCase();
+  const databaseChecks = Object.freeze({
+    xiaohongshuOnly: text(row.platform, 40).toLowerCase() === 'xiaohongshu',
+    reconcilableItemState: ['failed', 'needs_action'].includes(
+      text(row.item_status, 80).toLowerCase(),
+    ),
+    exactObservationLineage: Boolean(
+      text(row.source_attempt_id, 100) && observationCount > 0,
+    ),
+    savedEvidencePresent: savedCount > 0,
+    savedObservationConsistent:
+      savedCount > 0 && observationCount >= savedCount,
+    scopeComplete:
+      checkpoint.scanComplete === true &&
+      checkpoint.partial !== true &&
+      settledRounds.size === expectedPassCount,
+    noStartedSuccessorAttempt:
+      orchestrationCheckpointInteger(row.started_successor_attempt_count) === 0,
+    noActiveAttempt:
+      orchestrationCheckpointInteger(row.active_started_attempt_count) === 0 &&
+      !(
+        LATE_EVIDENCE_ACTIVE_ATTEMPT_STATUSES.has(sourceAttemptStatus) &&
+        Boolean(row.source_attempt_started_at)
+      ),
+    noActiveCommand:
+      orchestrationCheckpointInteger(row.active_command_count) === 0,
+    noActiveExecution:
+      orchestrationCheckpointInteger(row.active_execution_count) === 0,
+    noActiveRecoveryLease:
+      orchestrationCheckpointInteger(row.active_recovery_lease_count) === 0,
+    lineageSilent: row.lineage_silent === true,
+  });
+  const blockingChecks = Object.entries(databaseChecks)
+    .filter(([, passed]) => passed !== true)
+    .map(([name]) => name);
+  const evidenceCandidate = blockingChecks.length === 0;
+  const unstartedSuccessorAttemptCount = orchestrationCheckpointInteger(
+    row.unstarted_successor_attempt_count,
+  );
+
+  // Runner tabs and the execution lock/lease live only in browser-local
+  // storage today. Neither a user report nor an HTTP request parameter can
+  // prove their absence, so this read-only detector can never authorize a
+  // state transition on its own.
+  return Object.freeze({
+    itemId: text(row.item_id, 100),
+    taskId: text(row.task_id, 100),
+    executionTaskId: text(row.source_execution_task_id, 100),
+    sourceAttemptId: text(row.source_attempt_id, 100),
+    assignmentRevision: orchestrationCheckpointInteger(
+      row.source_assignment_revision,
+    ),
+    attemptNumber: orchestrationCheckpointInteger(row.source_attempt_number),
+    evidenceCandidate,
+    reconcileEligible: false,
+    readOnly: true,
+    runtimeAbsenceUnverified: true,
+    humanReportAcceptedAsEvidence: false,
+    blockingChecks: Object.freeze([
+      ...blockingChecks,
+      ...(evidenceCandidate ? ['runtimeAbsenceUnverified'] : []),
+    ]),
+    databaseChecks,
+    evidence: Object.freeze({
+      savedCount,
+      observationCount,
+      expectedPassCount,
+      settledPassCount: settledRounds.size,
+      latestObservationAt: orchestrationCheckpointTimestamp(
+        row.latest_observation_at,
+      ),
+      lineageLastActivityAt: orchestrationCheckpointTimestamp(
+        row.lineage_last_activity_at,
+      ),
+    }),
+    successorAttempts: Object.freeze({
+      unstartedCount: unstartedSuccessorAttemptCount,
+      startedCount: orchestrationCheckpointInteger(
+        row.started_successor_attempt_count,
+      ),
+      requiresTransactionalSealing: unstartedSuccessorAttemptCount > 0,
+      sealed: false,
+    }),
+  });
+}
+
 function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
@@ -648,6 +790,8 @@ export function projectElasticKeywordRecoveryStatus({
   error = {},
   checkpoint = {},
   attemptCount = 0,
+  safetyHandoffCount = 0,
+  sourceLocalClosureProven = false,
   technicalLimitReached = false,
 } = {}) {
   const normalizedStatus = text(status, 80).toLowerCase();
@@ -668,7 +812,20 @@ export function projectElasticKeywordRecoveryStatus({
     metadata: {checkpoint},
   });
   if (safetyBlocked) {
-    return normalizedAttemptCount <= ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS
+    const safetyCode = text(
+      safeJson(error).code ||
+        safeJson(checkpoint).errorCode ||
+        safeJson(checkpoint).error_code,
+      100,
+    ).toUpperCase();
+    if (!AUTOMATIC_SEARCH_SAFETY_HANDOFF_CODES.has(safetyCode)) {
+      return 'needs_action';
+    }
+    if (sourceLocalClosureProven !== true) {
+      return 'needs_action';
+    }
+    return Math.max(0, Number(safetyHandoffCount) || 0) <
+      ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS
       ? 'retryable'
       : 'needs_action';
   }
@@ -1032,6 +1189,27 @@ export function crossDeviceRetryAgentSupportsTask(
     return capabilities.officialAccountCommentPatrol === true;
   }
   return false;
+}
+
+export function crossDeviceRetryAgentDailyUsageEligible(agent = {}) {
+  const searches = Number(agent.today_searches);
+  if (
+    agent.today_usage_current !== true ||
+    !agent.today_usage_last_event_at ||
+    !Number.isInteger(searches) ||
+    searches < 0
+  ) {
+    return false;
+  }
+
+  const rawLimit = agent.daily_search_limit;
+  if (rawLimit === null || rawLimit === undefined || rawLimit === '') {
+    return true;
+  }
+  const limit = Number(rawLimit);
+  return Number.isInteger(limit) &&
+    limit >= 0 &&
+    (limit === 0 || searches < limit);
 }
 
 function abortCrossDeviceRetry(error, details = {}) {
@@ -3250,7 +3428,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
   for (const entry of negativePatrolTargetResults(snapshot)) {
     const currentItemState = elasticPool
       ? await tx.queryOne(`
-          SELECT attempt_count
+          SELECT attempt_count, safety_handoff_count
           FROM capture_task_items
           WHERE tenant_id = $1
             AND task_id = $2
@@ -3289,6 +3467,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
             error: entry.error,
             checkpoint: entry,
             attemptCount: serverAttemptCount,
+            safetyHandoffCount: currentItemState?.safety_handoff_count,
           })
         : 'failed'
       : entry.status;
@@ -3640,7 +3819,8 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
     };
     const snapshotCheckpoint = safeJson(snapshot.checkpoint);
     const unresolvedItems = await tx.queryAll(`
-      SELECT id, attempt_count, assignment_revision, metadata, error
+      SELECT id, attempt_count, safety_handoff_count,
+        assignment_revision, metadata, error
       FROM capture_task_items
       WHERE tenant_id = $1
         AND task_id = $2
@@ -3675,6 +3855,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
                 error: unresolvedError,
                 checkpoint: snapshotCheckpoint,
                 attemptCount,
+                safetyHandoffCount: unresolvedItem.safety_handoff_count,
               })
             : 'needs_action';
       const recovery = buildElasticRecoveryMetadata({
@@ -3944,7 +4125,7 @@ async function projectOrchestrationChildControlOutcome(tx, {
   const normalizedError = safeJson(error);
   const currentItemState = elasticPool
     ? await tx.queryOne(`
-        SELECT id, attempt_count, metadata
+        SELECT id, attempt_count, safety_handoff_count, metadata
         FROM capture_task_items
         WHERE tenant_id = $1
           AND task_id = $2
@@ -3978,6 +4159,7 @@ async function projectOrchestrationChildControlOutcome(tx, {
     status,
     error: normalizedError,
     attemptCount: projectedAttemptCount,
+    safetyHandoffCount: currentItemState?.safety_handoff_count,
     technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
   });
   const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(projectedStatus);
@@ -4246,7 +4428,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     };
     const currentItemState = elasticPool
       ? await tx.queryOne(`
-          SELECT id, attempt_count, metadata
+          SELECT id, attempt_count, safety_handoff_count, metadata
           FROM capture_task_items
           WHERE tenant_id = $1
             AND task_id = $2
@@ -4280,6 +4462,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       error,
       checkpoint,
       attemptCount: projectedAttemptCount,
+      safetyHandoffCount: currentItemState?.safety_handoff_count,
       technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
     });
     const recovery = buildElasticRecoveryMetadata({
@@ -4443,7 +4626,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     if (activeKeyword) {
       const currentActiveItem = elasticPool
         ? await tx.queryOne(`
-            SELECT id, attempt_count, metadata
+            SELECT id, attempt_count, safety_handoff_count, metadata
             FROM capture_task_items
             WHERE tenant_id = $1
               AND task_id = $2
@@ -4479,6 +4662,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         error: childError,
         checkpoint: snapshotCheckpoint,
         attemptCount: projectedAttemptCount,
+        safetyHandoffCount: currentActiveItem?.safety_handoff_count,
         technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
       });
       const recovery = buildElasticRecoveryMetadata({
@@ -5212,11 +5396,13 @@ async function dispatchNextElasticWorkItem(tx, {
       item.ordinal,
       item.keyword,
       item.item_type,
+      item.error AS item_error,
       item.record_id,
       item.external_id,
       item.url_snapshot,
       item.status AS item_status,
       item.attempt_count,
+      item.safety_handoff_count,
       item.assignment_revision,
       item.execution_task_id,
       item.metadata AS item_metadata,
@@ -5252,6 +5438,15 @@ async function dispatchNextElasticWorkItem(tx, {
         OR (item.item_type = 'watched_content' AND $8::boolean)
       )
       AND item.status IN ('pending', 'retryable')
+      AND NOT (
+        item.status = 'retryable'
+        AND upper(COALESCE(
+          NULLIF(item.error->>'code', ''),
+          NULLIF(item.metadata->'checkpoint'->>'errorCode', ''),
+          NULLIF(item.metadata->'checkpoint'->>'error_code', ''),
+          ''
+        )) = ANY($11::text[])
+      )
       AND (
         COALESCE(jsonb_array_length(parent.metadata->'planSnapshot'->'searchPasses'), 0) <= 1
         OR $10::boolean
@@ -5317,6 +5512,7 @@ async function dispatchNextElasticWorkItem(tx, {
     canClaimWatchedContent,
     ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS,
     canClaimSequentialSearch,
+    CAPTURE_SAFETY_HANDOFF_SEARCH_CODES,
   ]);
   if (!candidate) return null;
 
@@ -5511,6 +5707,36 @@ async function dispatchNextElasticWorkItem(tx, {
       attemptIdentity,
     };
   }
+  const itemAttemptBindings = [{
+    itemId: candidate.item_id,
+    attemptId: attemptIdentity,
+    requestHash,
+    attemptNumber,
+    assignmentRevision,
+    keyword: text(candidate.keyword, 120),
+    recordId: text(candidate.record_id, 100),
+    externalId: text(candidate.external_id, 160),
+  }];
+  const bindTargetAttempt = (target) => ({
+    ...safeJson(target),
+    captureTaskItemAttemptId: attemptIdentity,
+    captureTaskItemRequestHash: requestHash,
+    captureTaskItemAttemptNumber: attemptNumber,
+    captureTaskItemAssignmentRevision: assignmentRevision,
+  });
+  commandPayload = {
+    ...commandPayload,
+    ...(Array.isArray(commandPayload.targets)
+      ? {targets: commandPayload.targets.map(bindTargetAttempt)}
+      : {}),
+    ...(Array.isArray(commandPayload.items)
+      ? {items: commandPayload.items.map(bindTargetAttempt)}
+      : {}),
+    orchestration: {
+      ...safeJson(commandPayload.orchestration),
+      itemAttempts: itemAttemptBindings,
+    },
+  };
   const childMetadata = {
     remoteCreated: true,
     remoteRequestHash: requestHash,
@@ -5619,22 +5845,6 @@ async function dispatchNextElasticWorkItem(tx, {
     candidate.scheduled_for || null,
     candidate.schedule_revision || null,
   ]);
-  await tx.execute(`
-    INSERT INTO capture_agent_commands (
-      id, tenant_id, agent_id, task_id, command_type, payload,
-      requested_by_name, expires_at
-    ) VALUES (
-      $1, $2, $3, $4, 'create', $5::jsonb,
-      '云端弹性调度器', $6
-    )
-  `, [
-    commandId,
-    agent.tenant_id,
-    agent.id,
-    childTaskId,
-    JSON.stringify(commandPayload),
-    new Date(Date.now() + ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS).toISOString(),
-  ]);
   const updatedItem = await tx.queryOne(`
     UPDATE capture_task_items
     SET status = 'dispatched',
@@ -5693,6 +5903,22 @@ async function dispatchNextElasticWorkItem(tx, {
     attemptNumber,
     assignmentRevision,
     requestHash,
+  ]);
+  await tx.execute(`
+    INSERT INTO capture_agent_commands (
+      id, tenant_id, agent_id, task_id, command_type, payload,
+      requested_by_name, expires_at
+    ) VALUES (
+      $1, $2, $3, $4, 'create', $5::jsonb,
+      '云端弹性调度器', $6
+    )
+  `, [
+    commandId,
+    agent.tenant_id,
+    agent.id,
+    childTaskId,
+    JSON.stringify(commandPayload),
+    new Date(Date.now() + ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS).toISOString(),
   ]);
   await refreshOrchestrationParentTask(tx, {
     tenantId: agent.tenant_id,
@@ -6466,6 +6692,165 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
       ok: true,
       commandId: commandResult.command.id,
       idempotent: commandResult.idempotent === true,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/late-evidence-candidates', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    const requestedLimit = Number(req.query.limit);
+    const limit = Math.max(
+      1,
+      Math.min(
+        100,
+        Math.floor(Number.isFinite(requestedLimit) ? requestedLimit : 25),
+      ),
+    );
+    const quietMinutes = Math.max(
+      10,
+      Math.min(
+        24 * 60,
+        Math.floor(Number(req.query.quietMinutes) || 15),
+      ),
+    );
+    const rows = await queryAll(`
+      SELECT
+        item.id AS item_id,
+        item.task_id,
+        item.status AS item_status,
+        item.platform,
+        parent.metadata AS parent_metadata,
+        source_attempt.id AS source_attempt_id,
+        source_attempt.execution_task_id AS source_execution_task_id,
+        source_attempt.attempt_number AS source_attempt_number,
+        source_attempt.assignment_revision AS source_assignment_revision,
+        source_attempt.status AS source_attempt_status,
+        source_attempt.checkpoint AS source_attempt_checkpoint,
+        source_attempt.result AS source_attempt_result,
+        source_attempt.started_at AS source_attempt_started_at,
+        observation_evidence.observation_count AS exact_observation_count,
+        observation_evidence.latest_observation_at,
+        successor_attempts.unstarted_count AS unstarted_successor_attempt_count,
+        successor_attempts.started_count AS started_successor_attempt_count,
+        active_attempts.count AS active_started_attempt_count,
+        active_commands.count AS active_command_count,
+        active_executions.count AS active_execution_count,
+        active_recovery_leases.count AS active_recovery_lease_count,
+        lineage_clock.last_activity_at AS lineage_last_activity_at,
+        lineage_clock.last_activity_at <
+          now() - make_interval(mins => $2::integer) AS lineage_silent
+      FROM capture_task_items item
+      JOIN capture_tasks parent
+        ON parent.id = item.task_id AND parent.tenant_id = item.tenant_id
+      JOIN LATERAL (
+        SELECT attempt.*
+        FROM capture_task_item_attempts attempt
+        WHERE attempt.tenant_id = item.tenant_id
+          AND attempt.item_id = item.id
+          AND EXISTS (
+            SELECT 1
+            FROM record_observations observation
+            WHERE observation.tenant_id = attempt.tenant_id
+              AND observation.capture_task_item_attempt_id = attempt.id
+          )
+        ORDER BY attempt.attempt_number DESC, attempt.created_at DESC,
+          attempt.id DESC
+        LIMIT 1
+      ) source_attempt ON true
+      JOIN LATERAL (
+        SELECT COUNT(*)::integer AS observation_count,
+          MAX(observation.captured_at) AS latest_observation_at
+        FROM record_observations observation
+        WHERE observation.tenant_id = source_attempt.tenant_id
+          AND observation.capture_task_item_attempt_id = source_attempt.id
+      ) observation_evidence ON true
+      LEFT JOIN capture_tasks source_execution
+        ON source_execution.id = source_attempt.execution_task_id
+        AND source_execution.tenant_id = source_attempt.tenant_id
+      CROSS JOIN LATERAL (
+        SELECT
+          COUNT(*) FILTER (WHERE later.started_at IS NULL)::integer
+            AS unstarted_count,
+          COUNT(*) FILTER (WHERE later.started_at IS NOT NULL)::integer
+            AS started_count
+        FROM capture_task_item_attempts later
+        WHERE later.tenant_id = source_attempt.tenant_id
+          AND later.item_id = source_attempt.item_id
+          AND later.attempt_number > source_attempt.attempt_number
+      ) successor_attempts
+      CROSS JOIN LATERAL (
+        SELECT COUNT(*)::integer AS count
+        FROM capture_task_item_attempts attempt
+        WHERE attempt.tenant_id = item.tenant_id
+          AND attempt.item_id = item.id
+          AND attempt.started_at IS NOT NULL
+          AND attempt.status IN (
+            'assigned', 'dispatch_pending', 'dispatched',
+            'waiting_device', 'running'
+          )
+      ) active_attempts
+      CROSS JOIN LATERAL (
+        SELECT COUNT(*)::integer AS count
+        FROM capture_agent_commands command
+        WHERE command.tenant_id = item.tenant_id
+          AND (
+            command.task_id = item.task_id
+            OR command.task_id IN (
+              SELECT DISTINCT attempt.execution_task_id
+              FROM capture_task_item_attempts attempt
+              WHERE attempt.tenant_id = item.tenant_id
+                AND attempt.item_id = item.id
+                AND attempt.execution_task_id IS NOT NULL
+            )
+          )
+          AND command.status IN ('pending', 'acknowledged')
+      ) active_commands
+      CROSS JOIN LATERAL (
+        SELECT COUNT(*)::integer AS count
+        FROM capture_tasks execution
+        WHERE execution.tenant_id = item.tenant_id
+          AND execution.id = source_attempt.execution_task_id
+          AND execution.status IN (
+            'pending', 'waiting_device', 'claimed', 'running',
+            'recovering', 'resume_requested'
+          )
+      ) active_executions
+      CROSS JOIN LATERAL (
+        SELECT COUNT(*)::integer AS count
+        FROM capture_recovery_intents intent
+        WHERE intent.tenant_id = item.tenant_id
+          AND intent.item_id = item.id
+          AND intent.lease_token IS NOT NULL
+          AND intent.lease_expires_at > clock_timestamp()
+      ) active_recovery_leases
+      CROSS JOIN LATERAL (
+        SELECT GREATEST(
+          source_attempt.updated_at,
+          source_attempt.finished_at,
+          source_execution.business_progress_at,
+          source_execution.heartbeat_at,
+          source_execution.source_updated_at,
+          source_execution.updated_at
+        ) AS last_activity_at
+      ) lineage_clock
+      WHERE item.tenant_id = $1
+        AND item.platform = 'xiaohongshu'
+        AND item.status IN ('failed', 'needs_action')
+      ORDER BY observation_evidence.latest_observation_at DESC,
+        item.updated_at DESC, item.id
+      LIMIT $3
+    `, [req.tenantId, quietMinutes, limit]);
+    const candidates = rows.map(row => evaluateObservedCompletionCandidate(row));
+    return res.json({
+      ok: true,
+      readOnly: true,
+      automaticMutationEnabled: false,
+      runtimeAbsenceSource: 'not_persisted',
+      humanReportsAcceptedAsEvidence: false,
+      quietMinutes,
+      candidates,
     });
   } catch (err) {
     return next(err);
@@ -8754,14 +9139,26 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
   task,
   sourceAgentIds = [],
   commandPayload = {},
+  safetyHandoffPolicy = null,
 }) {
+  const platform = text(task.platform, 40).toLowerCase();
+  if (!['xiaohongshu', 'douyin', 'weibo'].includes(platform)) return null;
   const excludedIds = sourceAgentIds
     .map(value => text(value, 100).toLowerCase())
     .filter(value => UUID_PATTERN.test(value));
+  // Agent usage remains authoritative even when account identity is absent.
+  // A current account contributes only its configured hard search limit.
   const candidates = await tx.queryAll(`
     SELECT ca.*, tenant.status AS tenant_status,
       ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
       ab.id AS active_auth_binding_id,
+      daily_usage.usage_date =
+        (now() AT TIME ZONE 'Asia/Shanghai')::date AS today_usage_current,
+      daily_usage.searches AS today_searches,
+      daily_usage.last_event_at AS today_usage_last_event_at,
+      current_social_account.daily_search_limit,
+      current_social_account.platform_account_id,
+      current_social_binding.last_login_state,
       (
         SELECT COUNT(*)::integer
         FROM capture_tasks active_task
@@ -8826,10 +9223,32 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
       ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
     LEFT JOIN auth_bindings ab
       ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+    JOIN social_agent_daily_usage daily_usage
+      ON daily_usage.tenant_id = ca.tenant_id
+      AND daily_usage.agent_id = ca.id
+      AND daily_usage.platform = $5
+      AND daily_usage.usage_date =
+        (now() AT TIME ZONE 'Asia/Shanghai')::date
+    LEFT JOIN social_account_bindings current_social_binding
+      ON current_social_binding.tenant_id = ca.tenant_id
+      AND current_social_binding.agent_id = ca.id
+      AND current_social_binding.platform = $5
+      AND current_social_binding.status = 'current'
+    LEFT JOIN social_accounts current_social_account
+      ON current_social_account.tenant_id = ca.tenant_id
+      AND current_social_account.id =
+        current_social_binding.social_account_id
     WHERE ca.tenant_id = $1
       AND ca.status = 'active'
       AND NOT (ca.id = ANY($2::uuid[]))
-    ORDER BY recent_technical_failure_count ASC,
+      AND daily_usage.last_event_at IS NOT NULL
+      AND (
+        current_social_account.daily_search_limit IS NULL OR
+        current_social_account.daily_search_limit = 0 OR
+        daily_usage.searches < current_social_account.daily_search_limit
+      )
+    ORDER BY daily_usage.searches ASC,
+      recent_technical_failure_count ASC,
       recent_success_count DESC,
       last_assignment_at ASC NULLS FIRST,
       ca.last_heartbeat_at DESC NULLS LAST,
@@ -8839,6 +9258,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
     excludedIds,
     task.id,
     CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+    platform,
   ]);
   const eligibleCandidates = candidates.filter(agent => {
     const authExpired = agent.auth_code_expires_at &&
@@ -8850,6 +9270,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
       captureAgentOnline(agent.last_heartbeat_at) &&
       Number(agent.active_task_count || 0) === 0 &&
       Number(agent.active_command_count || 0) === 0 &&
+      crossDeviceRetryAgentDailyUsageEligible(agent) &&
       crossDeviceRetryAgentSupportsTask(agent, task, commandPayload);
   });
   for (const candidate of eligibleCandidates) {
@@ -8868,26 +9289,74 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
       const locked = await tx.queryOne(`
         SELECT ca.*, tenant.status AS tenant_status,
           ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
-          ab.id AS active_auth_binding_id
+          ab.id AS active_auth_binding_id,
+          daily_usage.usage_date =
+            (now() AT TIME ZONE 'Asia/Shanghai')::date AS today_usage_current,
+          daily_usage.searches AS today_searches,
+          daily_usage.last_event_at AS today_usage_last_event_at,
+          current_social_account.daily_search_limit,
+          current_social_account.platform_account_id,
+          current_social_binding.last_login_state
         FROM capture_agents ca
         JOIN tenants tenant ON tenant.id = ca.tenant_id
         LEFT JOIN auth_codes ac
           ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
         LEFT JOIN auth_bindings ab
           ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
+        JOIN social_agent_daily_usage daily_usage
+          ON daily_usage.tenant_id = ca.tenant_id
+          AND daily_usage.agent_id = ca.id
+          AND daily_usage.platform = $3
+          AND daily_usage.usage_date =
+            (now() AT TIME ZONE 'Asia/Shanghai')::date
+        LEFT JOIN social_account_bindings current_social_binding
+          ON current_social_binding.tenant_id = ca.tenant_id
+          AND current_social_binding.agent_id = ca.id
+          AND current_social_binding.platform = $3
+          AND current_social_binding.status = 'current'
+        LEFT JOIN social_accounts current_social_account
+          ON current_social_account.tenant_id = ca.tenant_id
+          AND current_social_account.id =
+            current_social_binding.social_account_id
         WHERE ca.id = $1 AND ca.tenant_id = $2
-        FOR UPDATE OF ca
-      `, [candidate.id, tenantId]);
+          AND daily_usage.last_event_at IS NOT NULL
+          AND (
+            current_social_account.daily_search_limit IS NULL OR
+            current_social_account.daily_search_limit = 0 OR
+            daily_usage.searches < current_social_account.daily_search_limit
+          )
+        FOR UPDATE OF ca, daily_usage
+      `, [candidate.id, tenantId, platform]);
       const authExpired = locked?.auth_code_expires_at &&
         new Date(locked.auth_code_expires_at) < new Date();
-      const eligible = locked &&
+      let eligible = locked &&
         locked.status === 'active' &&
         locked.tenant_status === 'active' &&
         locked.auth_code_status === 'active' &&
         Boolean(locked.active_auth_binding_id) &&
         !authExpired &&
         captureAgentOnline(locked.last_heartbeat_at) &&
+        crossDeviceRetryAgentDailyUsageEligible(locked) &&
         crossDeviceRetryAgentSupportsTask(locked, task, commandPayload);
+      if (eligible && safetyHandoffPolicy) {
+        const lockedAccount = await tx.queryOne(`
+          SELECT binding.last_login_state, account.platform_account_id
+          FROM social_account_bindings binding
+          JOIN social_accounts account
+            ON account.tenant_id = binding.tenant_id
+            AND account.id = binding.social_account_id
+          WHERE binding.tenant_id = $1
+            AND binding.agent_id = $2
+            AND binding.platform = $3
+            AND binding.status = 'current'
+          FOR SHARE OF binding, account
+        `, [tenantId, locked.id, platform]);
+        eligible = evaluateCaptureSafetyHandoff({
+          ...safetyHandoffPolicy,
+          targetPlatformAccountId: lockedAccount?.platform_account_id,
+          targetLoginState: lockedAccount?.last_login_state,
+        }).automaticEligible === true;
+      }
       const busy = eligible
         ? await findCaptureAgentExecutionSlotBlocker(
             tx,
@@ -9076,6 +9545,96 @@ async function renewProfileRetryExecutions(tx, tenantId, items, targets) {
   return {executionIdByItem};
 }
 
+async function loadVerifiedCaptureLocalClosureProof(tx, {
+  tenantId,
+  executionTaskId,
+  sourceAgentId,
+  itemId,
+  itemAttemptId,
+  itemAttemptNumber,
+  assignmentRevision,
+} = {}) {
+  const expected = {
+    tenantId: text(tenantId, 100).toLowerCase(),
+    executionTaskId: text(executionTaskId, 100).toLowerCase(),
+    sourceAgentId: text(sourceAgentId, 100).toLowerCase(),
+    itemId: text(itemId, 100).toLowerCase(),
+    itemAttemptId: text(itemAttemptId, 100).toLowerCase(),
+    itemAttemptNumber: Number(itemAttemptNumber),
+    assignmentRevision: Number(assignmentRevision),
+  };
+  if (
+    !UUID_PATTERN.test(expected.tenantId) ||
+    !UUID_PATTERN.test(expected.executionTaskId) ||
+    !UUID_PATTERN.test(expected.sourceAgentId) ||
+    !UUID_PATTERN.test(expected.itemId) ||
+    !UUID_PATTERN.test(expected.itemAttemptId) ||
+    !Number.isSafeInteger(expected.itemAttemptNumber) ||
+    expected.itemAttemptNumber < 1 ||
+    !Number.isSafeInteger(expected.assignmentRevision) ||
+    expected.assignmentRevision < 0
+  ) {
+    return verifyCaptureLocalClosureProof();
+  }
+  const snapshot = await tx.queryOne(`
+    SELECT snapshot.metadata->'localClosure' AS local_closure,
+      snapshot.metadata->'localClosures' AS local_closures,
+      snapshot.agent_id, snapshot.client_task_id,
+      snapshot.client_attempt_id, snapshot.attempt_number,
+      snapshot.progress_seq, snapshot.status, snapshot.received_at,
+      clock_timestamp() AS proof_now
+    FROM capture_task_snapshots snapshot
+    JOIN capture_tasks execution_task
+      ON execution_task.tenant_id = snapshot.tenant_id
+      AND execution_task.id = snapshot.task_id
+    JOIN capture_task_attempts execution_attempt
+      ON execution_attempt.tenant_id = snapshot.tenant_id
+      AND execution_attempt.id = snapshot.attempt_id
+      AND execution_attempt.task_id = snapshot.task_id
+      AND execution_attempt.agent_id = snapshot.agent_id
+      AND execution_attempt.client_attempt_id = snapshot.client_attempt_id
+      AND execution_attempt.attempt_number = snapshot.attempt_number
+    WHERE snapshot.tenant_id = $1::uuid
+      AND snapshot.task_id = $2::uuid
+      AND snapshot.agent_id = $3::uuid
+      AND snapshot.client_task_id = execution_task.client_task_id
+      AND snapshot.client_attempt_id <> ''
+      AND snapshot.status IN (
+        'completed', 'completed_with_warnings',
+        'completed_with_failures', 'failed',
+        'canceled', 'skipped', 'needs_action'
+      )
+    ORDER BY snapshot.progress_seq DESC,
+      snapshot.source_updated_at DESC, snapshot.id DESC
+    LIMIT 1
+  `, [
+    expected.tenantId,
+    expected.executionTaskId,
+    expected.sourceAgentId,
+  ]);
+  const evidence = selectCaptureLocalClosureEvidence({
+    evidence: snapshot?.local_closure,
+    evidences: snapshot?.local_closures,
+    expectedItemId: expected.itemId,
+    expectedItemAttemptId: expected.itemAttemptId,
+  });
+  return verifyCaptureLocalClosureProof({
+    evidence,
+    expectedRequestId: snapshot?.client_task_id,
+    expectedAttemptId: snapshot?.client_attempt_id,
+    expectedItemId: expected.itemId,
+    expectedItemAttemptId: expected.itemAttemptId,
+    expectedAttemptNumber: expected.itemAttemptNumber,
+    expectedAssignmentRevision: expected.assignmentRevision,
+    expectedSnapshotRevision: snapshot?.progress_seq,
+    expectedAgentId: expected.sourceAgentId,
+    snapshotAgentId: snapshot?.agent_id,
+    snapshotStatus: snapshot?.status,
+    snapshotReceivedAt: snapshot?.received_at,
+    now: snapshot?.proof_now || new Date(),
+  });
+}
+
 export async function dispatchCrossDeviceRetry(options = {}) {
   const {
     tenantId,
@@ -9095,11 +9654,15 @@ export async function dispatchCrossDeviceRetry(options = {}) {
     expectedSourceAttemptId,
     expectedAttemptNumber,
     allowPreviouslyAttemptedAgents = false,
+    safetyHandoff = null,
   } = options;
   if (!['fast', 'duty'].includes(recoveryPhase)) {
     return {error: 'invalid_recovery_phase'};
   }
   const dutyRecovery = recoveryPhase === 'duty';
+  const safetyHandoffRequested = safetyHandoff !== null &&
+    safetyHandoff !== undefined;
+  const safetyHandoffRequest = safeJson(safetyHandoff);
   const requestedItemIds = Array.isArray(itemIds)
     ? Array.from(new Set(
         itemIds
@@ -9152,6 +9715,37 @@ export async function dispatchCrossDeviceRetry(options = {}) {
   if (!dutyRecovery && allowPreviouslyAttemptedAgents === true) {
     return {error: 'invalid_duty_recovery_request'};
   }
+  if (
+    safetyHandoffRequested &&
+    (
+      !dutyRecovery ||
+      !Number.isSafeInteger(Number(safetyHandoffRequest.count)) ||
+      Number(safetyHandoffRequest.count) < 0 ||
+      safetyHandoffRequest.requireDistinctPlatformAccount !== true ||
+      safetyHandoffRequest.requireSourceLineageQuiet !== true ||
+      !text(safetyHandoffRequest.challengeCode, 100) ||
+      !text(safetyHandoffRequest.sourcePlatformAccountId, 320) ||
+      text(safetyHandoffRequest.sourceLoginState, 40).toLowerCase() !==
+        'authenticated'
+    )
+  ) {
+    return {error: 'invalid_duty_recovery_request'};
+  }
+  if (
+    safetyHandoffRequested &&
+    safetyHandoffRequest.sourceLocalClosureProven !== true
+  ) {
+    return {
+      error: 'retry_requires_manual_safety_action',
+      code: 'HUMAN_REQUIRED',
+      humanRequired: true,
+      reason: 'source_local_closure_proof_unavailable',
+    };
+  }
+  // `sourceLocalClosureProven` is only an internal caller hint that prevents
+  // an obviously incomplete request from entering the transaction. It is not
+  // authority: the append-only terminal snapshot is loaded and verified
+  // below, then loaded once more immediately before the first child write.
   const dutyIntentId = dutyRecovery
     ? text(dutyRecoveryIntentId, 100).toLowerCase()
     : '';
@@ -9198,6 +9792,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
   };
   try {
     return await withTransaction(async tx => {
+      let dutySafetyHandoffPolicy = null;
       await tx.execute(
         'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
         ['capture_cross_device_retry', requestKey],
@@ -9223,7 +9818,9 @@ export async function dispatchCrossDeviceRetry(options = {}) {
               !Array.isArray(replayMetadata.itemIds) ||
               replayMetadata.itemIds.length !== 1 ||
               text(replayMetadata.itemIds[0], 100).toLowerCase() !==
-                requestedItemIds[0]
+                requestedItemIds[0] ||
+              (replayMetadata.safetyHandoff === true) !==
+                safetyHandoffRequested
             )
           )
         ) {
@@ -9330,6 +9927,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         const durableIntent = await tx.queryOne(`
           SELECT id, parent_task_id, item_id, generation, created_at,
             status, action_count, recovery_task_id, dispatched_attempt_id,
+            safety_handoff_count, source_lineage_silent,
             lease_token, lease_expires_at, available_at, window_ends_at,
             CASE
               WHEN verification->>'reuseEligibleAt' ~
@@ -9396,6 +9994,17 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           || Number(durableIntent.action_count || 0) !== 0
           || durableIntent.recovery_task_id
           || durableIntent.dispatched_attempt_id
+          || (
+            safetyHandoffRequested &&
+            (
+              Number(durableIntent.safety_handoff_count || 0) !== 0 ||
+              durableIntent.source_lineage_silent !== false
+            )
+          )
+          || (
+            !safetyHandoffRequested &&
+            durableIntent.source_lineage_silent === true
+          )
           || !['ready', 'waiting_due', 'waiting_agent'].includes(
             text(durableIntent.status, 80).toLowerCase(),
           )
@@ -9503,7 +10112,110 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           },
           {phase: 'duty'},
         );
-        if (!sourceDisposition.automatic) {
+        if (safetyHandoffRequested) {
+          const sourceAccount = await tx.queryOne(`
+            SELECT binding.last_login_state, account.platform_account_id
+            FROM social_account_bindings binding
+            JOIN social_accounts account
+              ON account.tenant_id = binding.tenant_id
+              AND account.id = binding.social_account_id
+            WHERE binding.tenant_id = $1
+              AND binding.agent_id = $2
+              AND binding.platform = $3
+              AND binding.status = 'current'
+            FOR SHARE OF binding, account
+          `, [
+            req.tenantId,
+            currentSourceAttempt?.agent_id || sourceItem.assigned_agent_id,
+            text(sourceItem.platform || initialTask.platform, 40).toLowerCase(),
+          ]);
+          const mergedError = {
+            ...safeJson(sourceItem.error),
+            ...safeJson(currentSourceAttempt?.error),
+          };
+          const mergedCheckpoint = {
+            ...safeJson(safeJson(sourceItem.metadata).checkpoint),
+            ...safeJson(currentSourceAttempt?.checkpoint),
+          };
+          const challengeCode = text(
+            mergedError.code ||
+              mergedCheckpoint.errorCode ||
+              mergedCheckpoint.error_code,
+            100,
+          ).toUpperCase();
+          if (
+            Number(safetyHandoffRequest.count) !==
+              Number(sourceItem.safety_handoff_count || 0) ||
+            text(
+              safetyHandoffRequest.sourcePlatformAccountId,
+              320,
+            ).toLowerCase() !== text(
+              sourceAccount?.platform_account_id,
+              320,
+            ).toLowerCase() ||
+            text(safetyHandoffRequest.challengeCode, 100).toUpperCase() !==
+              challengeCode
+          ) {
+            return supersededResult({reason: 'safety_handoff_source_changed'});
+          }
+          const sourceAgentId = text(
+            currentSourceAttempt?.agent_id || sourceItem.assigned_agent_id,
+            100,
+          ).toLowerCase();
+          const localClosureProof = await loadVerifiedCaptureLocalClosureProof(
+            tx,
+            {
+              tenantId: req.tenantId,
+              executionTaskId: sourceItem.execution_task_id,
+              sourceAgentId,
+              itemId: sourceItem.id,
+              itemAttemptId: currentSourceAttemptId,
+              itemAttemptNumber:
+                currentSourceAttempt?.attempt_number ?? sourceItem.attempt_count,
+              assignmentRevision: sourceItem.assignment_revision,
+            },
+          );
+          const safetyDecision = evaluateCaptureSafetyHandoff({
+            faultClass: 'platform_safety',
+            challengeCode,
+            platform: sourceItem.platform || initialTask.platform,
+            businessTaskType: promotedRetryBusinessTaskType(initialTask),
+            itemType: sourceItem.item_type,
+            safetyHandoffCount: sourceItem.safety_handoff_count,
+            sourcePlatformAccountId: sourceAccount?.platform_account_id,
+            sourceLoginState: sourceAccount?.last_login_state,
+            sourceLocalClosureProven: localClosureProof.proven === true,
+          });
+          if (!safetyDecision.automaticEligible) {
+            return {
+              error: 'retry_requires_manual_safety_action',
+              code: 'HUMAN_REQUIRED',
+              humanRequired: true,
+              reason: safetyDecision.reason,
+            };
+          }
+          dutySafetyHandoffPolicy = {
+            faultClass: 'platform_safety',
+            challengeCode,
+            platform: sourceItem.platform || initialTask.platform,
+            businessTaskType: promotedRetryBusinessTaskType(initialTask),
+            itemType: sourceItem.item_type,
+            safetyHandoffCount: sourceItem.safety_handoff_count,
+            sourcePlatformAccountId: sourceAccount.platform_account_id,
+            sourceLoginState: sourceAccount.last_login_state,
+            sourceLocalClosureProven: true,
+            sourceExecutionTaskId: sourceItem.execution_task_id,
+            sourceAgentId,
+            sourceItemId: sourceItem.id,
+            sourceItemAttemptId: currentSourceAttemptId,
+            sourceItemAttemptNumber: Number(
+              currentSourceAttempt?.attempt_number ?? sourceItem.attempt_count,
+            ),
+            sourceAssignmentRevision: Number(
+              sourceItem.assignment_revision,
+            ),
+          };
+        } else if (!sourceDisposition.automatic) {
           if (sourceDisposition.kind === 'manual_current') {
             return {
               error: 'retry_requires_manual_safety_action',
@@ -9584,7 +10296,9 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         abortCrossDeviceRetry('retry_items_unavailable');
       }
       let retryItems = scopedItems.filter(
-        item => (dutyRecovery
+        item => (dutySafetyHandoffPolicy
+          ? text(item.id, 100).toLowerCase() === requestedItemIds[0]
+          : dutyRecovery
           ? classifyCaptureRecoveryDisposition(item, {phase: 'duty'}).automatic
           : classifyCaptureRecoveryDisposition(item).automatic),
       );
@@ -9739,6 +10453,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             attemptedAgents,
           ),
           commandPayload: agentCompatibilityPayload,
+          safetyHandoffPolicy: dutySafetyHandoffPolicy,
         });
         if (!targetAgent && dutyRecovery && allowPreviouslyAttemptedAgents) {
           targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
@@ -9749,6 +10464,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
               attemptedAgents,
             ),
             commandPayload: agentCompatibilityPayload,
+            safetyHandoffPolicy: dutySafetyHandoffPolicy,
           });
         }
         if (!targetAgent) {
@@ -9770,6 +10486,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         recoveryPhase: dutyRecovery ? 'duty' : 'fast',
         dutyRecoveryIntentId: dutyIntentId,
         dutyRecoveryGeneration: dutyGeneration,
+        safetyHandoff: Boolean(dutySafetyHandoffPolicy),
       })).digest('hex');
       const commandId = crypto.randomUUID();
 
@@ -9958,6 +10675,60 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             code: 'RECOVERY_AGENT_NO_LONGER_USABLE',
           });
         }
+        if (dutySafetyHandoffPolicy) {
+          const finalTargetAccount = await tx.queryOne(`
+            SELECT binding.last_login_state, account.platform_account_id
+            FROM social_account_bindings binding
+            JOIN social_accounts account
+              ON account.tenant_id = binding.tenant_id
+              AND account.id = binding.social_account_id
+            WHERE binding.tenant_id = $1
+              AND binding.agent_id = $2
+              AND binding.platform = $3
+              AND binding.status = 'current'
+            FOR SHARE OF binding, account
+          `, [
+            req.tenantId,
+            targetAgent.id,
+            text(parent.platform, 40).toLowerCase(),
+          ]);
+          const finalSafetyDecision = evaluateCaptureSafetyHandoff({
+            ...dutySafetyHandoffPolicy,
+            targetPlatformAccountId:
+              finalTargetAccount?.platform_account_id,
+            targetLoginState: finalTargetAccount?.last_login_state,
+          });
+          if (!finalSafetyDecision.automaticEligible) {
+            abortCrossDeviceRetry('idle_compatible_agent_unavailable', {
+              code: 'DISTINCT_AUTHENTICATED_ACCOUNT_UNAVAILABLE',
+            });
+          }
+          const finalLocalClosureProof =
+            await loadVerifiedCaptureLocalClosureProof(tx, {
+              tenantId: req.tenantId,
+              executionTaskId:
+                dutySafetyHandoffPolicy.sourceExecutionTaskId,
+              sourceAgentId: dutySafetyHandoffPolicy.sourceAgentId,
+              itemId: dutySafetyHandoffPolicy.sourceItemId,
+              itemAttemptId:
+                dutySafetyHandoffPolicy.sourceItemAttemptId,
+              itemAttemptNumber:
+                dutySafetyHandoffPolicy.sourceItemAttemptNumber,
+              assignmentRevision:
+                dutySafetyHandoffPolicy.sourceAssignmentRevision,
+            });
+          if (!finalLocalClosureProof.proven) {
+            abortCrossDeviceRetry(
+              'retry_requires_manual_safety_action',
+              {
+                code: 'HUMAN_REQUIRED',
+                humanRequired: true,
+                reason: 'source_local_closure_proof_unavailable',
+                failedChecks: finalLocalClosureProof.failedChecks,
+              },
+            );
+          }
+        }
         if (businessTaskType === 'watched_content_patrol') {
           const watchedIntent = await tx.queryOne(`
             SELECT watched.record_id
@@ -10090,6 +10861,8 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             execution_task_id = $3,
             assignment_revision = $4,
             request_hash = $5,
+            safety_handoff_count = safety_handoff_count +
+              CASE WHEN $15::boolean THEN 1 ELSE 0 END,
             result_record_id = NULL,
             result_observation_id = NULL,
             error = '{}'::jsonb,
@@ -10105,8 +10878,13 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             AND execution_task_id IS NOT DISTINCT FROM $6::uuid
             AND assignment_revision = $13
             AND status = ANY($14::text[])
+            AND (
+              NOT $15::boolean
+              OR safety_handoff_count = 0
+            )
           RETURNING id, execution_task_id, assigned_agent_id,
-            attempt_count, assignment_revision, status, request_hash
+            attempt_count, safety_handoff_count,
+            assignment_revision, status, request_hash
         `, [
           attemptNumber,
           targetAgent.id,
@@ -10122,6 +10900,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           parent.id,
           Number(item.assignment_revision || 0),
           [...CROSS_DEVICE_RETRY_ITEM_STATUSES],
+          Boolean(dutySafetyHandoffPolicy),
         ]);
         if (!updatedItem) {
           const conflict = new Error('cross_device_retry_item_conflict');
@@ -10159,6 +10938,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           assignmentRevision: updatedItem.assignment_revision,
           status: updatedItem.status,
           requestHash: updatedItem.request_hash,
+          safetyHandoffCount: updatedItem.safety_handoff_count,
         });
       }
       const itemAttemptBindings = dispatchedItemAttempts.map((attempt) => {
@@ -10237,6 +11017,11 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             dispatched_at = COALESCE(dispatched_at, clock_timestamp()),
             expected_assignment_revision = $8::integer,
             expected_attempt_number = $9::integer,
+            safety_handoff_count = CASE
+              WHEN $11::boolean THEN 1
+              ELSE safety_handoff_count
+            END,
+            source_lineage_silent = false,
             action_count = GREATEST(action_count, 1),
             decision_payload = decision_payload || jsonb_build_object(
               'recoveryTaskId', $4::uuid,
@@ -10245,6 +11030,9 @@ export async function dispatchCrossDeviceRetry(options = {}) {
               'dispatchedAttemptId', $7::uuid,
               'executionTaskId', $4::uuid,
               'generation', $10::integer,
+              'safetyHandoff', $11::boolean,
+              'safetyHandoffCount', CASE WHEN $11::boolean THEN 1 ELSE 0 END,
+              'sourceLineageSilent', false,
               'dispatchBoundAtomically', true
             ),
             verification = verification || jsonb_build_object(
@@ -10275,6 +11063,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           dutyAttempt?.assignmentRevision,
           dutyAttempt?.attemptNumber,
           dutyGeneration,
+          Boolean(dutySafetyHandoffPolicy),
         ]);
         if (!boundIntent) {
           abortCrossDeviceRetry('duty_recovery_lease_expired', {
@@ -10441,6 +11230,20 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         error: error.crossDeviceRetryError,
         waitingForSource: true,
         ...safeJson(error.details),
+      };
+    }
+    if (
+      dutyRecovery &&
+      error?.crossDeviceRetryError ===
+        'retry_requires_manual_safety_action'
+    ) {
+      return {
+        error: 'retry_requires_manual_safety_action',
+        code: 'HUMAN_REQUIRED',
+        humanRequired: true,
+        reason:
+          text(error?.details?.reason, 160) ||
+          'source_local_closure_proof_unavailable',
       };
     }
     throw error;

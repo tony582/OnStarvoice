@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   CAPTURE_RECOVERY_ACTIONS_GLOBAL_ENV,
   CAPTURE_RECOVERY_AGENT_SLOT_SOURCE_TYPE,
+  CAPTURE_RECOVERY_LOCAL_CLOSURE_RECHECK_MS,
   CAPTURE_RECOVERY_VERIFY_DELAY_MS,
   CAPTURE_RECOVERY_WAITING_AGENT_BACKOFF_MS,
   buildCaptureRecoveryKey,
@@ -40,6 +41,81 @@ const recoveryTaskId = '80000000-0000-4000-8000-000000000001';
 const recoveryCommandId = '90000000-0000-4000-8000-000000000001';
 const recoveryAgentId = 'a0000000-0000-4000-8000-000000000001';
 const recoveryAttemptId = 'b0000000-0000-4000-8000-000000000001';
+const sourceAgentId = 'c0000000-0000-4000-8000-000000000001';
+const sourceExecutionClientTaskId =
+  'd0000000-0000-4000-8000-000000000001';
+const sourceExecutionClientAttemptId =
+  'e0000000-0000-4000-8000-000000000001';
+
+function localClosureEvidence(overrides = {}) {
+  return {
+    version: 1,
+    requestId: sourceExecutionClientTaskId,
+    attemptId: sourceExecutionClientAttemptId,
+    itemId,
+    itemAttemptId: sourceAttemptId,
+    attemptNumber: 3,
+    assignmentRevision: 7,
+    snapshotRevision: 12,
+    terminalStatus: 'needs_action',
+    terminalUpdatedAt: '2026-08-25T00:59:30.000Z',
+    closedAt: '2026-08-25T00:59:45.000Z',
+    terminalLedgerConfirmed: true,
+    runnerTabCount: 0,
+    platformTaskTabCount: 0,
+    detailTaskTabCount: 0,
+    ownedTaskTabCount: 0,
+    executionLockPresent: false,
+    debugSessionPresent: false,
+    taskSessionPresent: false,
+    taskOwnerPresent: false,
+    pendingCheckpointReportCount: 0,
+    businessUploadEvidenceKnown: true,
+    streamingSyncDrainCompleted: true,
+    capturedRecordCount: 0,
+    streamingSyncEnabled: false,
+    streamingSyncEnqueuedCount: 0,
+    streamingSyncProcessedCount: 0,
+    streamingSyncSuccessCount: 0,
+    streamingSyncFailedCount: 0,
+    streamingSyncSkippedCount: 0,
+    streamingSyncPendingCount: 0,
+    streamingSyncActiveCount: 0,
+    streamingSyncRemainingCount: 0,
+    streamingSyncBlocked: false,
+    streamingSyncCanceled: false,
+    ...overrides,
+  };
+}
+
+function recoverySafetyClosureRow(overrides = {}) {
+  return recoveryCandidateRow({
+    intent_fault_class: 'platform_safety',
+    intent_safety_handoff_count: 0,
+    item_status: 'needs_action',
+    item_attempt_count: 3,
+    safety_handoff_count: 0,
+    item_type: 'keyword',
+    item_platform: 'douyin',
+    parent_task_type: 'unattended_keyword_capture',
+    source_platform_account_id: 'douyin-account-a',
+    source_login_state: 'authenticated',
+    error: {code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE'},
+    current_source_attempt_error: {
+      code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+      securityBlocked: true,
+    },
+    current_source_attempt_agent_id: sourceAgentId,
+    execution_client_task_id: sourceExecutionClientTaskId,
+    execution_attempt_client_attempt_id: sourceExecutionClientAttemptId,
+    source_local_closure_snapshot_agent_id: sourceAgentId,
+    source_local_closure_snapshot_status: 'needs_action',
+    source_local_closure_snapshot_received_at: '2026-08-25T00:59:50.000Z',
+    source_local_closure_snapshot_revision: 12,
+    source_local_closure_evidence: localClosureEvidence(),
+    ...overrides,
+  });
+}
 
 function recoveryCandidateRow(overrides = {}) {
   return {
@@ -352,6 +428,100 @@ test('candidate classification separates Extension, network, safety and user-sto
   assert.equal(safety.terminalStatus, 'waiting_human');
   assert.equal(safety.decision, 'human_required');
 
+  const firstAllowlistedSearchChallenge = classifyCaptureRecoveryCandidate({
+    status: 'needs_action',
+    attempt_count: 19,
+    safety_handoff_count: 0,
+    item_type: 'keyword',
+    item_platform: 'douyin',
+    parent_task_type: 'unattended_keyword_capture',
+    source_platform_account_id: 'douyin-account-a',
+    source_login_state: 'authenticated',
+    error: {code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE'},
+  });
+  assert.equal(firstAllowlistedSearchChallenge.eligible, true);
+  assert.equal(firstAllowlistedSearchChallenge.terminalStatus, null);
+  assert.equal(firstAllowlistedSearchChallenge.decision, 'observe');
+  assert.equal(
+    firstAllowlistedSearchChallenge.reason,
+    'platform_safety_waiting_local_closure',
+  );
+  assert.equal(firstAllowlistedSearchChallenge.waitingForLocalClosure, true);
+  assert.equal(
+    firstAllowlistedSearchChallenge.safetyHandoff.automaticEligible,
+    false,
+  );
+  assert.equal(
+    firstAllowlistedSearchChallenge.safetyHandoff.safetyHandoffCount,
+    0,
+  );
+
+  const firstChallengeWithClosure = classifyCaptureRecoveryCandidate({
+    status: 'needs_action',
+    safety_handoff_count: 0,
+    item_type: 'keyword',
+    item_platform: 'douyin',
+    parent_task_type: 'unattended_keyword_capture',
+    source_platform_account_id: 'douyin-account-a',
+    source_login_state: 'authenticated',
+    source_local_closure_proven: true,
+    error: {code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE'},
+  });
+  assert.equal(firstChallengeWithClosure.terminalStatus, null);
+  assert.equal(firstChallengeWithClosure.reason, 'platform_safety_handoff_candidate');
+  assert.equal(firstChallengeWithClosure.safetyHandoff.automaticEligible, true);
+
+  const failedClosureProof = classifyCaptureRecoveryCandidate({
+    status: 'needs_action',
+    safety_handoff_count: 0,
+    item_type: 'keyword',
+    item_platform: 'douyin',
+    parent_task_type: 'unattended_keyword_capture',
+    source_platform_account_id: 'douyin-account-a',
+    source_login_state: 'authenticated',
+    source_local_closure_proof_failed: true,
+    error: {code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE'},
+  });
+  assert.equal(failedClosureProof.terminalStatus, 'waiting_human');
+  assert.equal(
+    failedClosureProof.reason,
+    'platform_safety_local_closure_proof_failed',
+  );
+
+  const secondAllowlistedSearchChallenge = classifyCaptureRecoveryCandidate({
+    status: 'retryable',
+    attempt_count: 1,
+    safety_handoff_count: 1,
+    item_type: 'keyword',
+    item_platform: 'douyin',
+    parent_task_type: 'unattended_keyword_capture',
+    source_platform_account_id: 'douyin-account-b',
+    source_login_state: 'authenticated',
+    error: {code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE'},
+  });
+  assert.equal(secondAllowlistedSearchChallenge.terminalStatus, 'waiting_human');
+  assert.equal(
+    secondAllowlistedSearchChallenge.safetyHandoff.reason,
+    'safety_handoff_already_used',
+  );
+
+  const invalidSourceLogin = classifyCaptureRecoveryCandidate({
+    status: 'needs_action',
+    safety_handoff_count: 0,
+    item_type: 'keyword',
+    item_platform: 'douyin',
+    parent_task_type: 'unattended_keyword_capture',
+    source_platform_account_id: 'douyin-account-a',
+    source_login_state: 'expired',
+    source_local_closure_proven: true,
+    error: {code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE'},
+  });
+  assert.equal(invalidSourceLogin.terminalStatus, 'waiting_human');
+  assert.equal(
+    invalidSourceLogin.safetyHandoff.reason,
+    'source_login_not_authenticated',
+  );
+
   const humanBoundaries = [
     ['item_error', {
       error: {code: 'NEW_PLATFORM_CHALLENGE', requiresManualAction: true},
@@ -410,6 +580,122 @@ test('candidate classification separates Extension, network, safety and user-sto
   const completed = classifyCaptureRecoveryCandidate({status: 'completed'});
   assert.equal(completed.eligible, false);
   assert.equal(completed.terminalStatus, 'resolved');
+});
+
+test('an exhausted local retry marker opens duty recovery without weakening stop or safety boundaries', () => {
+  for (const code of [
+    'UNATTENDED_RECOVERY_EXHAUSTED',
+    'UNATTENDED_RECOVERY_LAUNCH_EXHAUSTED',
+  ]) {
+    const exhausted = classifyCaptureRecoveryCandidate({
+      status: 'failed',
+      attempt_count: 1,
+      error: {
+        code,
+        fastRetryExhausted: true,
+        failureOrigin: 'extension_runtime',
+      },
+    });
+    assert.equal(exhausted.eligible, true, code);
+    assert.equal(exhausted.faultClass, 'extension_runtime', code);
+    assert.equal(exhausted.reason, 'observe_candidate', code);
+    assert.equal(exhausted.fastBudget.exhausted, true, code);
+    assert.equal(exhausted.fastBudget.explicitExhausted, true, code);
+  }
+
+  const transient = classifyCaptureRecoveryCandidate({
+    status: 'failed',
+    attempt_count: 1,
+    error: {code: 'CONTENT_RELAY_TIMEOUT'},
+  });
+  assert.equal(transient.eligible, false);
+  assert.equal(transient.reason, 'fast_recovery_budget_available');
+
+  const stopped = classifyCaptureRecoveryCandidate({
+    status: 'canceled',
+    attempt_count: 1,
+    error: {
+      code: 'USER_CANCELED',
+      fastRetryExhausted: true,
+      failureOrigin: 'extension_runtime',
+    },
+  });
+  assert.equal(stopped.eligible, false);
+  assert.equal(stopped.terminalStatus, 'stopped_by_user');
+
+  const safety = classifyCaptureRecoveryCandidate({
+    status: 'needs_action',
+    attempt_count: 1,
+    error: {
+      code: 'DOUYIN_SEARCH_CAPTCHA_REQUIRED',
+      fastRetryExhausted: true,
+      failureOrigin: 'extension_runtime',
+    },
+  });
+  assert.equal(safety.faultClass, 'platform_safety');
+  assert.equal(safety.terminalStatus, 'waiting_human');
+  assert.equal(safety.decision, 'human_required');
+});
+
+test('a first cloud item with exhausted local retries creates a ready recovery intent', async () => {
+  for (const code of [
+    'UNATTENDED_RECOVERY_EXHAUSTED',
+    'UNATTENDED_RECOVERY_LAUNCH_EXHAUSTED',
+  ]) {
+    let persistedEvidence = null;
+    const result = await ingestCaptureRecoveryItem({
+      tenantId,
+      itemId,
+      now: new Date('2026-08-25T01:00:00.000Z'),
+      withTransaction: async callback => callback({
+        execute: async () => 1,
+        queryAll: async () => [],
+        queryOne: async (sql, params) => {
+          if (/FROM capture_task_items item/u.test(sql)) {
+            return {
+              item_id: itemId,
+              tenant_id: tenantId,
+              parent_task_id: parentTaskId,
+              source_attempt_id: sourceAttemptId,
+              source_attempt_number: 1,
+              execution_attempt_id: executionAttemptId,
+              execution_attempt_number: 4,
+              status: 'failed',
+              attempt_count: 1,
+              assignment_revision: 1,
+              error: {
+                code,
+                fastRetryExhausted: true,
+                failureOrigin: 'extension_runtime',
+              },
+              metadata: {},
+              parent_metadata: {},
+              parent_created_at: '2026-08-25T00:00:00.000Z',
+            };
+          }
+          if (/source_fingerprint = \$2/u.test(sql)) return null;
+          if (/ORDER BY generation DESC/u.test(sql)) return null;
+          if (/INSERT INTO capture_recovery_intents/u.test(sql)) {
+            persistedEvidence = JSON.parse(params[16]);
+            return {
+              id: intentId,
+              generation: 1,
+              status: 'ready',
+              decision: 'none',
+            };
+          }
+          assert.fail(`unexpected SQL for ${code}: ${sql}`);
+        },
+      }),
+    });
+    assert.equal(result.kind, 'created', code);
+    assert.equal(result.intent.status, 'ready', code);
+    assert.equal(result.classification.eligible, true, code);
+    assert.equal(result.classification.faultClass, 'extension_runtime', code);
+    assert.equal(result.classification.fastBudget.explicitExhausted, true, code);
+    assert.equal(persistedEvidence.fastBudget.explicitExhausted, true, code);
+    assert.equal(persistedEvidence.fastBudget.attemptCount, 1, code);
+  }
 });
 
 test('recovery error codes use a closed business-code namespace', () => {
@@ -479,6 +765,322 @@ test('unknown error codes persist only as UNKNOWN in recovery evidence', async (
   assert.equal(result.classification.code, 'UNKNOWN');
   assert.equal(persistedEvidence.errorCode, 'UNKNOWN');
   assert.equal(JSON.stringify(persistedEvidence).includes(credential), false);
+});
+
+test('ingest requeues the same safety fingerprint when its authoritative closure snapshot arrives', async () => {
+  const statements = [];
+  const result = await ingestCaptureRecoveryItem({
+    tenantId,
+    itemId,
+    now: new Date('2026-08-25T01:00:00.000Z'),
+    withTransaction: async callback => callback({
+      execute: async () => 1,
+      queryAll: async () => [],
+      queryOne: async (sql, params) => {
+        statements.push({sql, params});
+        if (/FROM capture_task_items item/u.test(sql)) {
+          assert.match(sql, /FROM capture_task_snapshots snapshot/u);
+          assert.match(sql, /snapshot\.attempt_id = execution_attempt\.id/u);
+          assert.match(
+            sql,
+            /snapshot\.client_task_id = execution_task\.client_task_id/u,
+          );
+          assert.match(
+            sql,
+            /snapshot\.client_attempt_id = execution_attempt\.client_attempt_id/u,
+          );
+          assert.doesNotMatch(
+            sql,
+            /snapshot\.metadata->'localClosure' IS NOT NULL/u,
+            'the latest terminal snapshot must be authoritative even when it has no proof',
+          );
+          return {
+            ...recoverySafetyClosureRow(),
+            status: 'needs_action',
+            source_attempt_number: 3,
+            source_attempt_agent_id: sourceAgentId,
+            execution_attempt_id: executionAttemptId,
+            execution_attempt_number: 1,
+          };
+        }
+        if (/source_fingerprint = \$2/u.test(sql)) {
+          return {
+            id: intentId,
+            status: 'waiting_due',
+            action_count: 0,
+          };
+        }
+        if (/SET status = 'ready'/u.test(sql)) {
+          return {
+            id: intentId,
+            status: 'ready',
+            decision: 'none',
+          };
+        }
+        assert.fail(`unexpected SQL: ${sql}`);
+      },
+    }),
+  });
+  assert.equal(result.kind, 'local_closure_proven_requeued');
+  assert.equal(result.intent.status, 'ready');
+  const requeue = statements.find(entry => /SET status = 'ready'/u.test(entry.sql));
+  assert.ok(requeue);
+  assert.match(requeue.sql, /action_count = 0/u);
+  assert.match(requeue.sql, /status IN \('ready', 'waiting_due', 'waiting_agent'\)/u);
+});
+
+test('guarded recovery keeps a first search challenge reevaluable while local closure proof is pending', async () => {
+  let dispatchCalls = 0;
+  const updates = [];
+  const current = recoveryCandidateRow({
+    intent_fault_class: 'platform_safety',
+    intent_safety_handoff_count: 0,
+    item_status: 'retryable',
+    item_attempt_count: 19,
+    safety_handoff_count: 0,
+    item_type: 'keyword',
+    item_platform: 'douyin',
+    parent_task_type: 'unattended_keyword_capture',
+    source_platform_account_id: 'douyin-account-a',
+    source_login_state: 'authenticated',
+    error: {code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE'},
+    current_source_attempt_error: {
+      code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+      securityBlocked: true,
+    },
+  });
+  const settled = await processClaimedCaptureRecoveryIntent({
+    tenantId,
+    intent: {id: intentId, generation: 1, status: 'ready'},
+    leaseToken,
+    now: new Date('2026-08-25T01:00:00.000Z'),
+    policy: {mode: 'guarded', actionsEnabled: true},
+    dispatchRecovery: async input => {
+      dispatchCalls += 1;
+      assert.fail(`unexpected safety dispatch: ${JSON.stringify(input)}`);
+    },
+    queryOne: async (sql, params) => {
+      if (/FROM capture_recovery_intents intent/u.test(sql)) return current;
+      updates.push({sql, params});
+      return {
+        id: intentId,
+        status: params[3],
+        decision: params[4],
+        decision_payload: JSON.parse(params[5]),
+        verification: JSON.parse(params[6]),
+        available_at: params[8],
+      };
+    },
+  });
+  assert.equal(settled.status, 'waiting_due');
+  assert.equal(settled.decision, 'observe');
+  assert.equal(settled.decision_payload.redHumanNotification, false);
+  assert.equal(dispatchCalls, 0);
+  assert.equal(updates[0].params[3], 'waiting_due');
+  assert.equal(
+    settled.verification.reason,
+    'platform_safety_waiting_local_closure',
+  );
+  assert.equal(
+    new Date(settled.available_at).toISOString(),
+    new Date(
+      Date.parse('2026-08-25T01:00:00.000Z')
+        + CAPTURE_RECOVERY_LOCAL_CLOSURE_RECHECK_MS,
+    ).toISOString(),
+  );
+  assert.doesNotMatch(updates[0].sql, /attempt_count/u);
+});
+
+test('an authoritative exact-attempt closure proof enables one safety handoff dispatch', async () => {
+  const calls = [];
+  const settled = await processClaimedCaptureRecoveryIntent({
+    tenantId,
+    intent: {id: intentId, generation: 1, status: 'ready'},
+    leaseToken,
+    now: new Date('2026-08-25T01:00:00.000Z'),
+    policy: {mode: 'guarded', actionsEnabled: true},
+    dispatchRecovery: async input => {
+      calls.push(input);
+      return {
+        child: {id: recoveryTaskId},
+        command: {id: recoveryCommandId},
+        agent: {id: recoveryAgentId},
+        itemAttempts: [{
+          id: recoveryAttemptId,
+          itemId,
+          executionTaskId: recoveryTaskId,
+          agentId: recoveryAgentId,
+          attemptNumber: 4,
+          assignmentRevision: 11,
+          status: 'dispatched',
+        }],
+      };
+    },
+    queryOne: async (sql, params) => {
+      if (/FROM capture_recovery_intents intent/u.test(sql)) {
+        assert.match(sql, /FROM capture_task_snapshots snapshot/u);
+        assert.match(sql, /snapshot\.task_id = item\.execution_task_id/u);
+        assert.match(sql, /snapshot\.attempt_id = current_execution_attempt\.id/u);
+        assert.match(sql, /snapshot\.agent_id = current_item_attempt\.agent_id/u);
+        assert.match(
+          sql,
+          /snapshot\.client_task_id = source_execution_task\.client_task_id/u,
+        );
+        assert.match(
+          sql,
+          /snapshot\.client_attempt_id =\s*current_execution_attempt\.client_attempt_id/u,
+        );
+        return recoverySafetyClosureRow();
+      }
+      return {
+        id: intentId,
+        status: 'verifying_collection',
+        decision: 'cross_agent_recovery',
+        action_count: 1,
+      };
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].safetyHandoff.sourceLocalClosureProven, true);
+  assert.equal(calls[0].safetyHandoff.challengeCode, 'DOUYIN_SEARCH_SECURITY_CHALLENGE');
+  assert.equal(calls[0].safetyHandoff.count, 0);
+  assert.equal(settled.status, 'verifying_collection');
+});
+
+test('multi-item recovery selects the exact closure proof instead of the legacy first item', async () => {
+  const secondItemId = '21000000-0000-4000-8000-000000000002';
+  const secondSourceAttemptId = '41000000-0000-4000-8000-000000000002';
+  const secondEvidence = localClosureEvidence({
+    itemId: secondItemId,
+    itemAttemptId: secondSourceAttemptId,
+    attemptNumber: 4,
+    assignmentRevision: 8,
+  });
+  const calls = [];
+  const settled = await processClaimedCaptureRecoveryIntent({
+    tenantId,
+    intent: {id: intentId, generation: 1, status: 'ready'},
+    leaseToken,
+    now: new Date('2026-08-25T01:00:00.000Z'),
+    policy: {mode: 'guarded', actionsEnabled: true},
+    dispatchRecovery: async input => {
+      calls.push(input);
+      return {
+        child: {id: recoveryTaskId},
+        command: {id: recoveryCommandId},
+        agent: {id: recoveryAgentId},
+        itemAttempts: [{
+          id: recoveryAttemptId,
+          itemId: secondItemId,
+          executionTaskId: recoveryTaskId,
+          agentId: recoveryAgentId,
+          attemptNumber: 5,
+          assignmentRevision: 9,
+          status: 'dispatched',
+        }],
+      };
+    },
+    queryOne: async sql => {
+      if (/FROM capture_recovery_intents intent/u.test(sql)) {
+        assert.match(
+          sql,
+          /local_closure_snapshot\.metadata->'localClosures' AS\s+source_local_closure_evidences/u,
+        );
+        return recoverySafetyClosureRow({
+          item_id: secondItemId,
+          source_attempt_id: secondSourceAttemptId,
+          current_source_attempt_id: secondSourceAttemptId,
+          current_source_attempt_number: 4,
+          current_source_assignment_revision: 8,
+          assignment_revision: 8,
+          expected_attempt_number: 4,
+          expected_assignment_revision: 8,
+          source_local_closure_evidence: localClosureEvidence(),
+          source_local_closure_evidences: [
+            localClosureEvidence(),
+            secondEvidence,
+          ],
+        });
+      }
+      return {
+        id: intentId,
+        status: 'verifying_collection',
+        decision: 'cross_agent_recovery',
+        action_count: 1,
+      };
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].itemIds, [secondItemId]);
+  assert.equal(calls[0].safetyHandoff.sourceLocalClosureProven, true);
+  assert.equal(settled.status, 'verifying_collection');
+});
+
+test('a malformed exact-attempt closure proof remains a human boundary', async () => {
+  let dispatchCalls = 0;
+  const settled = await processClaimedCaptureRecoveryIntent({
+    tenantId,
+    intent: {id: intentId, generation: 1, status: 'ready'},
+    leaseToken,
+    now: new Date('2026-08-25T01:00:00.000Z'),
+    policy: {mode: 'guarded', actionsEnabled: true},
+    dispatchRecovery: async () => { dispatchCalls += 1; },
+    queryOne: async (sql, params) => {
+      if (/FROM capture_recovery_intents intent/u.test(sql)) {
+        return recoverySafetyClosureRow({
+          source_local_closure_evidence: localClosureEvidence({
+            requestId: 'wrong-request',
+          }),
+        });
+      }
+      return {
+        id: intentId,
+        status: params[3],
+        decision: params[4],
+        verification: JSON.parse(params[6]),
+      };
+    },
+  });
+  assert.equal(dispatchCalls, 0);
+  assert.equal(settled.status, 'waiting_human');
+  assert.equal(
+    settled.verification.reason,
+    'platform_safety_local_closure_proof_failed',
+  );
+});
+
+test('missing local closure proof times out to waiting human without dispatch', async () => {
+  let dispatchCalls = 0;
+  const settled = await processClaimedCaptureRecoveryIntent({
+    tenantId,
+    intent: {id: intentId, generation: 1, status: 'waiting_due'},
+    leaseToken,
+    now: new Date('2026-08-25T03:00:01.000Z'),
+    policy: {mode: 'guarded', actionsEnabled: true},
+    dispatchRecovery: async () => { dispatchCalls += 1; },
+    queryOne: async (sql, params) => {
+      if (/FROM capture_recovery_intents intent/u.test(sql)) {
+        return recoverySafetyClosureRow({
+          source_local_closure_snapshot_agent_id: null,
+          source_local_closure_snapshot_status: null,
+          source_local_closure_snapshot_received_at: null,
+          source_local_closure_evidence: null,
+        });
+      }
+      return {
+        id: intentId,
+        status: params[3],
+        decision: params[4],
+        decision_payload: JSON.parse(params[5]),
+      };
+    },
+  });
+  assert.equal(dispatchCalls, 0);
+  assert.equal(settled.status, 'waiting_human');
+  assert.equal(
+    settled.decision_payload.reason,
+    'source_local_closure_proof_timeout',
+  );
 });
 
 test('attempt-scoped structured health is unpacked, bounded and privacy-safe', () => {

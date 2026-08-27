@@ -14,6 +14,10 @@ test('recovery error codes are accepted only from the explicit business-code set
     ['STALE_TASK_HEARTBEAT_TIMEOUT', 'STALE_TASK_HEARTBEAT_TIMEOUT'],
     ['CAPTURE_TASK_UNEXPECTED_CANCELLATION', 'CAPTURE_TASK_UNEXPECTED_CANCELLATION'],
     ['EXTENSION_RUNTIME_RESTARTED', 'EXTENSION_RUNTIME_RESTARTED'],
+    [
+      'UNATTENDED_RECOVERY_LAUNCH_EXHAUSTED',
+      'UNATTENDED_RECOVERY_LAUNCH_EXHAUSTED',
+    ],
     ['USER_CANCELED', 'USER_CANCELED'],
   ]) {
     assert.equal(normalizeCaptureRecoveryErrorCode(input), expected, input);

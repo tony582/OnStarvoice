@@ -10,6 +10,10 @@ import {
   UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES,
   UNATTENDED_CHECKPOINT_REPORT_OUTBOX_STORAGE_KEY,
 } from "../utils/unattended-report-outbox.js";
+import {
+  CONTROL_STORAGE_RESERVE_BYTES,
+  CONTROL_STORAGE_RESERVE_KEY,
+} from "../utils/storage.js";
 
 const sidebarSource = readFileSync(
   new URL("../sidebar/sidebar-logic.js", import.meta.url),
@@ -46,6 +50,70 @@ function createStorage(initial = {}) {
       }
     },
   };
+}
+
+function createSetFailureStorage({
+  initial = {},
+  failSetCalls = [],
+  errorFactory = () => new Error("Resource::kQuotaBytes quota exceeded"),
+  rejectNewOutboxKeyAt = null,
+} = {}) {
+  const storage = createStorage(initial);
+  const baseSet = storage.set.bind(storage);
+  const failedCalls = new Set(failSetCalls);
+  let setCalls = 0;
+  storage.set = async (patch) => {
+    setCalls += 1;
+    const [key] = Object.keys(patch);
+    const outboxKeyCount = Object.keys(storage.data).filter((storedKey) =>
+      storedKey.startsWith(UNATTENDED_CHECKPOINT_REPORT_OUTBOX_STORAGE_KEY),
+    ).length;
+    if (
+      failedCalls.has(setCalls) ||
+      (
+        Number.isSafeInteger(rejectNewOutboxKeyAt) &&
+        outboxKeyCount >= rejectNewOutboxKeyAt &&
+        key.startsWith(UNATTENDED_CHECKPOINT_REPORT_OUTBOX_STORAGE_KEY) &&
+        !Object.prototype.hasOwnProperty.call(storage.data, key)
+      )
+    ) {
+      throw errorFactory();
+    }
+    await baseSet(patch);
+  };
+  storage.setCallCount = () => setCalls;
+  return storage;
+}
+
+function storageBytes(value) {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function createByteQuotaStorage(initial = {}) {
+  const storage = createStorage(initial);
+  const baseSet = storage.set.bind(storage);
+  const baseRemove = storage.remove.bind(storage);
+  const removed = [];
+  let quotaBytes = storageBytes(storage.data);
+  storage.QUOTA_BYTES = quotaBytes;
+  storage.getBytesInUse = async () => storageBytes(storage.data);
+  storage.set = async (patch) => {
+    const next = {...storage.data, ...structuredClone(patch)};
+    if (storageBytes(next) > quotaBytes) {
+      throw new Error("Resource::kQuotaBytes quota exceeded");
+    }
+    await baseSet(patch);
+  };
+  storage.remove = async (keys) => {
+    removed.push(...(Array.isArray(keys) ? keys : [keys]));
+    await baseRemove(keys);
+  };
+  storage.setQuotaBytes = (value) => {
+    quotaBytes = Math.max(0, Number(value) || 0);
+    storage.QUOTA_BYTES = quotaBytes;
+  };
+  storage.removed = removed;
+  return storage;
 }
 
 function storedEntries(storage) {
@@ -139,30 +207,39 @@ test("checkpoint outbox keeps only the newest durable snapshot per attempt", asy
   assert.equal(entries[0].updatedAt, new Date(2000).toISOString());
 });
 
-test("checkpoint outbox is bounded and evicts the oldest attempts", async () => {
+test("checkpoint outbox is bounded without evicting distinct unsynced attempts", async () => {
   const storage = createStorage();
+  const results = [];
   for (
     let index = 0;
     index < UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES + 3;
     index += 1
   ) {
-    await enqueueUnattendedCheckpointReport(
+    results.push(await enqueueUnattendedCheckpointReport(
       {
         requestId: `request-${index}`,
         attemptId: `attempt-${index}`,
         patch: checkpointPatch(index),
       },
       {storage, now: () => index + 1},
-    );
+    ));
   }
 
   const entries = storedEntries(storage);
   assert.equal(entries.length, UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES);
-  assert.equal(entries[0].requestId, "request-3");
+  assert.equal(entries[0].requestId, "request-0");
+  assert.equal(entries.at(-1).requestId, "request-19");
+  assert.equal(results.slice(0, 20).every((result) => result.ok), true);
+  assert.deepEqual(
+    results.slice(20).map((result) => result.reason),
+    ["outbox_capacity", "outbox_capacity", "outbox_capacity"],
+  );
 });
 
-test("capacity eviction uses age across attempts instead of unrelated progress sequences", async () => {
-  const storage = createStorage();
+test("a full outbox updates the same attempt without needing a transient new key", async () => {
+  const storage = createSetFailureStorage({
+    rejectNewOutboxKeyAt: UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES,
+  });
   for (
     let index = 0;
     index < UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES;
@@ -170,18 +247,60 @@ test("capacity eviction uses age across attempts instead of unrelated progress s
   ) {
     const queued = await enqueueUnattendedCheckpointReport(
       {
-        requestId: `old-request-${index}`,
-        attemptId: `old-attempt-${index}`,
-        patch: checkpointPatch(100),
+        requestId: `request-${index}`,
+        attemptId: `attempt-${index}`,
+        patch: checkpointPatch(index + 1),
       },
       {storage, now: () => index + 1},
     );
     assert.equal(queued.ok, true);
   }
-  const newest = await enqueueUnattendedCheckpointReport(
+  const keyCountBefore = Object.keys(storage.data).length;
+  const updated = await enqueueUnattendedCheckpointReport(
     {
-      requestId: "current-request",
-      attemptId: "current-attempt",
+      requestId: "request-0",
+      attemptId: "attempt-0",
+      patch: checkpointPatch(100),
+    },
+    {storage, now: () => 10_000},
+  );
+
+  assert.equal(updated.ok, true);
+  assert.equal(updated.reason, "queued");
+  assert.equal(Object.keys(storage.data).length, keyCountBefore);
+  const entries = storedEntries(storage);
+  assert.equal(entries.length, UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES);
+  assert.equal(
+    entries.find((entry) => entry.requestId === "request-0")?.patch.progressSeq,
+    100,
+  );
+});
+
+test("capacity preserves active, unsynced, failed, and needs_action attempts", async () => {
+  const storage = createStorage();
+  const statuses = ["running", "failed", "needs_action"];
+  for (
+    let index = 0;
+    index < UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES;
+    index += 1
+  ) {
+    const queued = await enqueueUnattendedCheckpointReport(
+      {
+        requestId: `protected-request-${index}`,
+        attemptId: `protected-attempt-${index}`,
+        patch: checkpointPatch(index + 1, {
+          status: statuses[index % statuses.length],
+        }),
+      },
+      {storage, now: () => index + 1},
+    );
+    assert.equal(queued.ok, true);
+  }
+  const before = structuredClone(storedEntries(storage));
+  const rejected = await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "new-request",
+      attemptId: "new-attempt",
       patch: checkpointPatch(1),
     },
     {
@@ -190,28 +309,200 @@ test("capacity eviction uses age across attempts instead of unrelated progress s
     },
   );
 
-  assert.equal(newest.ok, true);
-  assert.equal(newest.reason, "queued");
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.reason, "outbox_capacity");
+  assert.deepEqual(storedEntries(storage), before);
+});
+
+test("preflight removes an explicitly ACKed row before admitting a new attempt", async () => {
+  const storage = createStorage();
+  for (
+    let index = 0;
+    index < UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES;
+    index += 1
+  ) {
+    await enqueueUnattendedCheckpointReport(
+      {
+        requestId: `request-${index}`,
+        attemptId: `attempt-${index}`,
+        patch: checkpointPatch(index + 1),
+      },
+      {storage, now: () => index + 1},
+    );
+  }
+  const acknowledgedKey = Object.keys(storage.data).find((key) =>
+    key.startsWith(UNATTENDED_CHECKPOINT_REPORT_OUTBOX_STORAGE_KEY),
+  );
+  storage.data[acknowledgedKey].acknowledgedAt = new Date().toISOString();
+
+  const queued = await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "replacement-request",
+      attemptId: "replacement-attempt",
+      patch: checkpointPatch(1),
+    },
+    {storage, now: () => 1000},
+  );
+
+  assert.equal(queued.ok, true);
   const entries = storedEntries(storage);
   assert.equal(entries.length, UNATTENDED_CHECKPOINT_REPORT_OUTBOX_MAX_ENTRIES);
   assert.equal(
-    entries.some((entry) => entry.requestId === "current-request"),
-    true,
-  );
-  assert.equal(
-    entries.some((entry) => entry.requestId === "old-request-0"),
+    entries.some((entry) => entry.requestId === "request-0"),
     false,
   );
-  const notDurable = await enqueueUnattendedCheckpointReport(
+  assert.equal(
+    entries.some((entry) => entry.requestId === "replacement-request"),
+    true,
+  );
+});
+
+test("a genuinely full quota releases the reserve once and makes the second outbox write durable", async () => {
+  const storage = createByteQuotaStorage({
+    [CONTROL_STORAGE_RESERVE_KEY]: {
+      schemaVersion: 1,
+      padding: "0".repeat(CONTROL_STORAGE_RESERVE_BYTES),
+    },
+  });
+
+  const queued = await enqueueUnattendedCheckpointReport(
     {
-      requestId: "clock-skewed-request",
-      attemptId: "clock-skewed-attempt",
+      requestId: "request-real-quota",
+      attemptId: "attempt-real-quota",
       patch: checkpointPatch(1),
     },
-    {storage, now: () => 0.5},
+    {storage, now: () => 1000},
   );
-  assert.equal(notDurable.ok, false);
-  assert.equal(notDurable.reason, "outbox_capacity");
+
+  assert.equal(queued.ok, true);
+  assert.equal(queued.retried, true);
+  assert.deepEqual(storage.removed, [CONTROL_STORAGE_RESERVE_KEY]);
+  assert.equal(storage.data[CONTROL_STORAGE_RESERVE_KEY], undefined);
+  assert.equal(storedEntries(storage).length, 1);
+});
+
+test("an exhausted real-quota retry propagates failure and preserves the previous unsynced row", async () => {
+  const seeded = createStorage();
+  await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "request-real-quota-exhausted",
+      attemptId: "attempt-real-quota-exhausted",
+      patch: checkpointPatch(1, {status: "failed"}),
+    },
+    {storage: seeded, now: () => 1000},
+  );
+  const previous = structuredClone(storedEntries(seeded));
+  const storage = createByteQuotaStorage({
+    ...seeded.data,
+    [CONTROL_STORAGE_RESERVE_KEY]: {
+      schemaVersion: 1,
+      padding: "0".repeat(CONTROL_STORAGE_RESERVE_BYTES),
+    },
+  });
+
+  const queued = await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "request-real-quota-exhausted",
+      attemptId: "attempt-real-quota-exhausted",
+      patch: checkpointPatch(2, {
+        status: "failed",
+        summary: {evidence: "x".repeat(CONTROL_STORAGE_RESERVE_BYTES * 2)},
+      }),
+    },
+    {storage, now: () => 2000},
+  );
+
+  assert.equal(queued.ok, false);
+  assert.equal(queued.reason, "storage_quota");
+  assert.equal(queued.retried, true);
+  assert.deepEqual(storage.removed, [CONTROL_STORAGE_RESERVE_KEY]);
+  assert.deepEqual(storedEntries(storage), previous);
+});
+
+test("quota failure receives exactly one reserve-backed retry", async () => {
+  const storage = createSetFailureStorage({failSetCalls: [1]});
+  const queued = await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "request-quota-retry",
+      attemptId: "attempt-quota-retry",
+      patch: checkpointPatch(1),
+    },
+    {storage, now: () => 1000},
+  );
+
+  assert.equal(queued.ok, true);
+  assert.equal(queued.retried, true);
+  assert.equal(storage.setCallCount(), 2);
+  assert.equal(storedEntries(storage).length, 1);
+});
+
+test("a second quota failure stops without a third write", async () => {
+  const storage = createSetFailureStorage({failSetCalls: [1, 2, 3]});
+  const queued = await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "request-quota-exhausted",
+      attemptId: "attempt-quota-exhausted",
+      patch: checkpointPatch(1),
+    },
+    {storage, now: () => 1000},
+  );
+
+  assert.equal(queued.ok, false);
+  assert.equal(queued.reason, "storage_quota");
+  assert.equal(queued.retried, true);
+  assert.equal(storage.setCallCount(), 2);
+  assert.deepEqual(storedEntries(storage), []);
+});
+
+test("exhausted quota retry preserves the previous unsynced failed checkpoint", async () => {
+  const seeded = createStorage();
+  await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "request-protected-failure",
+      attemptId: "attempt-protected-failure",
+      patch: checkpointPatch(1, {status: "failed"}),
+    },
+    {storage: seeded, now: () => 1000},
+  );
+  const previous = structuredClone(storedEntries(seeded));
+  const storage = createSetFailureStorage({
+    initial: seeded.data,
+    failSetCalls: [1, 2, 3],
+  });
+
+  const queued = await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "request-protected-failure",
+      attemptId: "attempt-protected-failure",
+      patch: checkpointPatch(2, {status: "failed"}),
+    },
+    {storage, now: () => 2000},
+  );
+
+  assert.equal(queued.ok, false);
+  assert.equal(queued.reason, "storage_quota");
+  assert.equal(storage.setCallCount(), 2);
+  assert.deepEqual(storedEntries(storage), previous);
+});
+
+test("a non-quota storage failure is never retried", async () => {
+  const storage = createSetFailureStorage({
+    failSetCalls: [1, 2],
+    errorFactory: () => new Error("storage backend unavailable"),
+  });
+  const queued = await enqueueUnattendedCheckpointReport(
+    {
+      requestId: "request-storage-error",
+      attemptId: "attempt-storage-error",
+      patch: checkpointPatch(1),
+    },
+    {storage, now: () => 1000},
+  );
+
+  assert.equal(queued.ok, false);
+  assert.equal(queued.reason, "storage_error");
+  assert.equal(queued.retried, false);
+  assert.equal(storage.setCallCount(), 1);
 });
 
 test("transport failure retains the checkpoint for a later automatic replay", async () => {

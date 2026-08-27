@@ -83,6 +83,9 @@ function safeJobs(overrides = {}) {
     async reconcileElasticCaptureLeases() {
       return {requeued: 0};
     },
+    async reconcilePendingOrchestrationRetries() {
+      return {dispatched: 0, waitingForAgent: 0, failed: 0};
+    },
     async reconcilePendingCaptureCommands() {
       return {commandCount: 0};
     },
@@ -143,6 +146,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   let reconcileCalls = 0;
   let patrolCalls = 0;
   let fallbackRecoveryLimit = 0;
+  let pendingRetryLimit = 0;
   const runtime = startSchedulerCronJobs({
     cronModule: fakeCron,
     logger: quietLogger(),
@@ -159,6 +163,10 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
       async reconcileAutomaticCaptureRetries(limit) {
         fallbackRecoveryLimit = limit;
         return {dispatched: 0, waitingForAgent: 0, manualOnly: 0, failed: 0};
+      },
+      async reconcilePendingOrchestrationRetries(limit) {
+        pendingRetryLimit = limit;
+        return {dispatched: 0, waitingForAgent: 0, failed: 0};
       },
     }),
   });
@@ -186,6 +194,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   await fakeCron.registrations[2].task.fire();
   assert.equal(reconcileCalls, 2);
   assert.equal(fallbackRecoveryLimit, 10);
+  assert.equal(pendingRetryLimit, 10);
 
   assert.equal(runtime.stop(), true);
   assert.equal(runtime.stop(), false);

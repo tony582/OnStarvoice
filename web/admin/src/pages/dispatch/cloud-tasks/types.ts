@@ -33,6 +33,11 @@ export type OrchestrationCloudAgent = {
   online: boolean
   active_task_count?: number
   queued_task_count?: number
+  todaySearches?: number
+  dailySearchLimit?: number | null
+  accountHealthStatus?: string
+  recentTechnicalFailureCount?: number
+  recentSuccessCount?: number
 }
 
 export type OrchestrationRecord = {
@@ -176,6 +181,7 @@ export type OrchestrationDetailResponse = {
   items: OrchestrationItemRecord[]
   executions: OrchestrationExecutionRecord[]
   agents: OrchestrationCloudAgent[]
+  retryCandidates?: OrchestrationCloudAgent[]
   attempts: OrchestrationAttemptRecord[]
   schedule?: OrchestrationScheduleRecord | null
 }

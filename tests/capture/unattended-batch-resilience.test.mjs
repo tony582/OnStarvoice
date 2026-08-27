@@ -174,8 +174,13 @@ function readKeywordSearchReadinessSource() {
   return captureSyncSource.slice(start, end);
 }
 
-function createKeywordSearchReadinessHarness({snapshots = [], challenge = null} = {}) {
-  let now = 0;
+function createKeywordSearchReadinessHarness({
+  snapshots = [],
+  challenge = null,
+  startNow = 0,
+} = {}) {
+  let now = Number(startNow) || 0;
+  const startedAt = now;
   let snapshotIndex = 0;
   let challengeChecks = 0;
   let executeCalls = 0;
@@ -193,6 +198,8 @@ function createKeywordSearchReadinessHarness({snapshots = [], challenge = null} 
     BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS: 12000,
     BATCH_KEYWORD_RESULTS_STABLE_POLLS: 2,
     DOUYIN_KEYWORD_RESULTS_READY_TIMEOUT_MS: 45000,
+    DOUYIN_KEYWORD_RESULTS_SLOW_PROGRESS_EXTENSION_MS: 30000,
+    DOUYIN_KEYWORD_RESULTS_PROGRESS_RECENCY_MS: 15000,
     DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE:
       "DOUYIN_SEARCH_SERVICE_ABNORMAL",
     DOUYIN_SEARCH_SERVICE_ABNORMAL_STABLE_POLLS: 2,
@@ -235,6 +242,7 @@ function createKeywordSearchReadinessHarness({snapshots = [], challenge = null} 
   );
   return {
     wait: context.__waitForResults,
+    elapsed: () => now - startedAt,
     stats: () => ({challengeChecks, executeCalls}),
   };
 }
@@ -646,6 +654,241 @@ test("Douyin result readiness keeps waiting for a slow result page by default", 
   );
 });
 
+test("Douyin runs one bounded slow-progress probe when visible results await generation proof", async () => {
+  const submissionNonce = "slow-generation";
+  const visibleUnconfirmed = {
+    cardCount: 2,
+    workIds: ["766193585000009991", "766193585000009992"],
+    keywordMatched: true,
+    pageUrl: "https://www.douyin.com/search/慢词?type=general",
+    submissionNonce,
+    postSubmitGenerationChanged: false,
+  };
+  const confirmedGeneration = {
+    ...visibleUnconfirmed,
+    postSubmitGenerationChanged: true,
+  };
+  const slowProgressEvents = [];
+  const harness = createKeywordSearchReadinessHarness({
+    snapshots: [
+      visibleUnconfirmed,
+      visibleUnconfirmed,
+      confirmedGeneration,
+      confirmedGeneration,
+    ],
+  });
+
+  const result = await harness.wait(101, "douyin", null, {
+    keyword: "慢词",
+    timeoutMs: 600,
+    slowProgressExtensionMs: 900,
+    stablePolls: 2,
+    returnState: true,
+    requireResultTransition: true,
+    previousWorkIds: visibleUnconfirmed.workIds,
+    submitAccepted: true,
+    submissionNonce,
+    onSlowProgress: (event) => slowProgressEvents.push(event),
+  });
+
+  assert.equal(result.ready, true);
+  assert.equal(result.slowProgressProbeUsed, true);
+  assert.equal(result.slowProgressReason, "visible_results_generation_unconfirmed");
+  assert.equal(slowProgressEvents.length, 1);
+  assert.equal(
+    slowProgressEvents[0].readinessCode,
+    "DOUYIN_RESULTS_VISIBLE_GENERATION_UNPROVEN",
+  );
+  assert.ok(harness.elapsed() > 600);
+  assert.ok(harness.elapsed() <= 1500);
+});
+
+test("Douyin does not extend a readiness timeout when no current-result evidence exists", async () => {
+  const harness = createKeywordSearchReadinessHarness({
+    snapshots: [
+      {
+        cardCount: 0,
+        workIds: [],
+        keywordMatched: true,
+        pageUrl: "https://www.douyin.com/search/慢词?type=general",
+      },
+    ],
+  });
+  const slowProgressEvents = [];
+
+  const result = await harness.wait(101, "douyin", null, {
+    keyword: "慢词",
+    timeoutMs: 600,
+    slowProgressExtensionMs: 900,
+    returnState: true,
+    requireResultTransition: true,
+    previousWorkIds: [],
+    submitAccepted: true,
+    submissionNonce: "missing-results",
+    onSlowProgress: (event) => slowProgressEvents.push(event),
+  });
+
+  assert.equal(result.ready, false);
+  assert.equal(result.slowProgressProbeUsed, false);
+  assert.equal(result.readinessCode, "DOUYIN_SEARCH_RESULTS_NOT_READY");
+  assert.equal(slowProgressEvents.length, 0);
+  assert.equal(harness.elapsed(), 600);
+});
+
+test("Douyin does not extend for result progress older than the recency window", async () => {
+  const submissionNonce = "stale-signature";
+  const harness = createKeywordSearchReadinessHarness({
+    startNow: 1_700_000_000_000,
+    snapshots: [
+      {
+        cardCount: 1,
+        workIds: ["766193585000009991"],
+        keywordMatched: true,
+        pageUrl: "https://www.douyin.com/search/慢词?type=general",
+        submissionNonce,
+        postSubmitGenerationChanged: false,
+      },
+      {
+        cardCount: 0,
+        workIds: [],
+        keywordMatched: true,
+        pageUrl: "https://www.douyin.com/search/慢词?type=general",
+        submissionNonce,
+        postSubmitGenerationChanged: false,
+      },
+    ],
+  });
+  const slowProgressEvents = [];
+
+  const result = await harness.wait(101, "douyin", null, {
+    keyword: "慢词",
+    timeoutMs: 16200,
+    slowProgressExtensionMs: 900,
+    stablePolls: 2,
+    returnState: true,
+    requireResultTransition: true,
+    previousWorkIds: ["766193585000009991"],
+    submitAccepted: true,
+    submissionNonce,
+    onSlowProgress: (event) => slowProgressEvents.push(event),
+  });
+
+  assert.equal(result.ready, false);
+  assert.equal(result.slowProgressProbeUsed, false);
+  assert.equal(slowProgressEvents.length, 0);
+  assert.equal(harness.elapsed(), 16200);
+});
+
+test("Douyin extends once for recent signature progress after cards disappear", async () => {
+  const submissionNonce = "recent-signature";
+  const harness = createKeywordSearchReadinessHarness({
+    startNow: 1_700_000_000_000,
+    snapshots: [
+      {
+        cardCount: 1,
+        workIds: ["766193585000009991"],
+        keywordMatched: true,
+        pageUrl: "https://www.douyin.com/search/慢词?type=general",
+        submissionNonce,
+        postSubmitGenerationChanged: false,
+      },
+      {
+        cardCount: 0,
+        workIds: [],
+        keywordMatched: true,
+        pageUrl: "https://www.douyin.com/search/慢词?type=general",
+        submissionNonce,
+        postSubmitGenerationChanged: false,
+      },
+    ],
+  });
+  const slowProgressEvents = [];
+
+  const result = await harness.wait(101, "douyin", null, {
+    keyword: "慢词",
+    timeoutMs: 600,
+    slowProgressExtensionMs: 900,
+    stablePolls: 2,
+    returnState: true,
+    requireResultTransition: true,
+    previousWorkIds: ["766193585000009991"],
+    submitAccepted: true,
+    submissionNonce,
+    onSlowProgress: (event) => slowProgressEvents.push(event),
+  });
+
+  assert.equal(result.ready, false);
+  assert.equal(result.slowProgressProbeUsed, true);
+  assert.equal(result.slowProgressReason, "result_signature_progress");
+  assert.equal(slowProgressEvents.length, 1);
+  assert.equal(harness.elapsed(), 1500);
+});
+
+test("an explicit Douyin timeout remains hard unless the caller enables the slow-progress probe", async () => {
+  const submissionNonce = "explicit-hard-timeout";
+  const harness = createKeywordSearchReadinessHarness({
+    snapshots: [
+      {
+        cardCount: 1,
+        workIds: ["766193585000009991"],
+        keywordMatched: true,
+        pageUrl: "https://www.douyin.com/search/慢词?type=general",
+        submissionNonce,
+        postSubmitGenerationChanged: false,
+      },
+    ],
+  });
+
+  const result = await harness.wait(101, "douyin", null, {
+    keyword: "慢词",
+    timeoutMs: 600,
+    returnState: true,
+    requireResultTransition: true,
+    previousWorkIds: ["766193585000009991"],
+    submitAccepted: true,
+    submissionNonce,
+  });
+
+  assert.equal(result.ready, false);
+  assert.equal(result.slowProgressProbeUsed, false);
+  assert.equal(harness.elapsed(), 600);
+});
+
+test("Douyin slow-progress probing stays bounded and never accepts unproven visible cards", async () => {
+  const submissionNonce = "never-confirmed";
+  const visibleUnconfirmed = {
+    cardCount: 2,
+    workIds: ["766193585000009991", "766193585000009992"],
+    keywordMatched: true,
+    pageUrl: "https://www.douyin.com/search/慢词?type=general",
+    submissionNonce,
+    postSubmitGenerationChanged: false,
+  };
+  const harness = createKeywordSearchReadinessHarness({
+    snapshots: [visibleUnconfirmed],
+  });
+
+  const result = await harness.wait(101, "douyin", null, {
+    keyword: "慢词",
+    timeoutMs: 600,
+    slowProgressExtensionMs: 900,
+    stablePolls: 2,
+    returnState: true,
+    requireResultTransition: true,
+    previousWorkIds: visibleUnconfirmed.workIds,
+    submitAccepted: true,
+    submissionNonce,
+  });
+
+  assert.equal(result.ready, false);
+  assert.equal(result.slowProgressProbeUsed, true);
+  assert.equal(
+    result.readinessCode,
+    "DOUYIN_RESULTS_VISIBLE_GENERATION_UNPROVEN",
+  );
+  assert.equal(harness.elapsed(), 1500);
+});
+
 test("Douyin does not treat an older longer keyword as an exact target", async () => {
   const harness = createDouyinKeywordLiteralHarness({inputKeyword: "宝马X3"});
 
@@ -679,6 +922,20 @@ test("Douyin does not treat an older longer keyword as an exact target", async (
     readinessSource,
     /platformKey === 'douyin'[\s\S]*?normalizedInputKeyword === expected/u,
   );
+});
+
+test("Douyin whole-keyword submission requires an explicit allowlisted reason", async () => {
+  const harness = createDouyinKeywordLiteralHarness({inputKeyword: "宝马"});
+
+  assert.equal(await harness.submit(101, "douyin", "宝马"), false);
+  assert.equal(harness.searchClicks(), 0);
+
+  const accepted = await harness.submit(101, "douyin", "宝马", null, {
+    reason: "initial_search_generation",
+  });
+  assert.equal(accepted.accepted, true);
+  assert.equal(accepted.reason, "initial_search_generation");
+  assert.equal(harness.searchClicks(), 1);
 });
 
 test("Douyin readiness ignores generic numeric IDs and long account-number text", () => {
@@ -1368,10 +1625,22 @@ function createBatchHarness({
       sourcePageUrl: "",
     }),
     setCaptureTaskTakeoverStateInTab: async () => {},
-    submitKeywordSearchInTab: async (tabId, platform, keyword) => {
-      submitCalls.push({tabId, platform, keyword});
+    submitKeywordSearchInTab: async (
+      tabId,
+      platform,
+      keyword,
+      shouldStop,
+      submitOptions = {},
+    ) => {
+      submitCalls.push({
+        tabId,
+        platform,
+        keyword,
+        reason: String(submitOptions.reason || ""),
+      });
       return {
         accepted: true,
+        reason: String(submitOptions.reason || ""),
         baselineCaptured: true,
         previousWorkIds: ["766193585000009991"],
         submissionNonce: `resubmit-${submitCalls.length}`,
@@ -1513,6 +1782,10 @@ test("a no-op filter retry cannot fall through to Douyin capture", async () => {
   assert.equal(result.ok, false);
   assert.equal(harness.captureCalls.length, 0);
   assert.equal(harness.submitCalls.length, 1);
+  assert.equal(
+    harness.submitCalls[0].reason,
+    "filter_generation_recovery",
+  );
   const retryReadiness = readinessCalls[2];
   assert.equal(retryReadiness.requireResultTransition, true);
   assert.equal(retryReadiness.submitAccepted, true);
@@ -1543,6 +1816,7 @@ test("an empty-result no-op resubmit cannot launch a second Douyin capture", asy
   assert.equal(result.ok, false);
   assert.equal(harness.captureCalls.length, 1);
   assert.equal(harness.submitCalls.length, 1);
+  assert.equal(harness.submitCalls[0].reason, "empty_list_recovery");
   assert.equal(readinessCalls[1].requireResultTransition, true);
   assert.equal(readinessCalls[1].submitAccepted, true);
   assert.equal(readinessCalls[1].submissionNonce, "resubmit-1");

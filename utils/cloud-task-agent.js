@@ -44,8 +44,18 @@
   }
 
   function sanitizeStructuredValue(value, key = "", depth = 0) {
-    const normalizedKey = String(key || "").replace(/([a-z0-9])([A-Z])/g, "$1_$2");
-    if (SENSITIVE_KEY_PATTERN.test(normalizedKey)) return "[REDACTED]";
+    const normalizedKey = String(key || "")
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .toLowerCase();
+    // These are closure-state booleans, not session identifiers. Preserve the
+    // exact false values so the server can fail-closed verify local teardown.
+    const isLocalClosureSessionFlag =
+      (normalizedKey === "debug_session_present" ||
+        normalizedKey === "task_session_present") &&
+      typeof value === "boolean";
+    if (SENSITIVE_KEY_PATTERN.test(normalizedKey) && !isLocalClosureSessionFlag) {
+      return "[REDACTED]";
+    }
     if (value === null || typeof value === "boolean") return value;
     if (typeof value === "number") return Number.isFinite(value) ? value : null;
     if (typeof value === "string") return sanitizeText(value);
@@ -853,6 +863,12 @@
     const isCurrentControlRequest =
       controlRequestId &&
       (id === controlRequestId || text(metadata.controlTaskId, 240) === controlRequestId);
+    const localClosure = objectValue(metadata.localClosure);
+    const localClosures = (Array.isArray(metadata.localClosures)
+      ? metadata.localClosures
+      : [])
+      .slice(0, 30)
+      .map((entry) => sanitizeStructuredValue(objectValue(entry)));
     const snapshot = {
       id,
       controlTaskId: isCurrentControlRequest
@@ -889,6 +905,10 @@
         .map((result) => sanitizeStructuredValue(objectValue(result))),
       counts: sanitizeStructuredValue(objectValue(source.counts)),
       metadata: sanitizeStructuredValue(metadata),
+      ...(Object.keys(localClosure).length > 0
+        ? {localClosure: sanitizeStructuredValue(localClosure)}
+        : {}),
+      ...(localClosures.length > 0 ? {localClosures} : {}),
       error: sanitizeStructuredValue(objectValue(source.error)),
       message: sanitizeText(source.message, 2000),
       appVersion: healthVersion(

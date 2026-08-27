@@ -219,6 +219,32 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(detail, /\/retry-items/u);
   assert.match(detail, /回写当前父任务/u);
   assert.match(detail, /重试失败关键词/u);
+  assert.match(detail, /keywordRetryAllocation/u);
+  assert.match(detail, /detail\.retryCandidates/u);
+  assert.match(detail, /自动分配预览/u);
+  assert.match(detail, /逐项覆盖/u);
+  assert.match(detail, /assignments,/u);
+  assert.match(detail, /当前没有空闲兼容 Agent/u);
+  assert.match(detail, /进入自动等待队列/u);
+  assert.match(detail, /keywordRetryDispatchableCount > 0/u);
+  assert.match(detail, /个现在接力/u);
+  assert.match(detail, /槽位释放后自动接力/u);
+  assert.match(detail, /buildKeywordRetryAssignments\(\{/u);
+  assert.match(detail, /items: keywordRetryItems/u);
+  assert.match(detail, /overrides: keywordRetryAgentOverrides/u);
+  assert.doesNotMatch(
+    detail,
+    /keywordRetryAllocation\s*\.filter[\s\S]*agentId: allocation\.agent/u,
+  );
+  assert.match(detail, /allocation\.strictWaiting/u);
+  assert.match(detail, /指定 Agent 当前不可用，将严格等待/u);
+  assert.match(detail, /不会自动改派/u);
+  assert.match(detail, /已指定 · 当前不可用（将严格等待）/u);
+  assert.match(
+    detail,
+    /keywordRetryDispatchableCount > 0 && keywordRetryWaitingCount/u,
+  );
+  assert.doesNotMatch(detail, /keywordRetryTargetAgentId/u);
   assert.match(detail, /automaticKeywordRecoveryActive/u);
   assert.match(detail, /关键词自动尝试已耗尽/u);
   assert.match(detail, /页面不再把失败项误报为“正在自动恢复”/u);

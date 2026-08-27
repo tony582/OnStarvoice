@@ -17,6 +17,11 @@ import {
   normalizeCaptureHealthStage,
   normalizeCaptureHealthTabStatus,
 } from './capture-health-schema.js';
+import {
+  selectCaptureLocalClosureEvidence,
+  verifyCaptureLocalClosureProof,
+} from './capture-local-closure-proof.js';
+import {evaluateCaptureSafetyHandoff} from './capture-safety-handoff-policy.js';
 
 export const CAPTURE_RECOVERY_SETTING_KEYS = Object.freeze({
   enabled: 'ops_control_recovery_enabled',
@@ -39,6 +44,7 @@ export const CAPTURE_RECOVERY_MAX_GENERATIONS = 3;
 export const CAPTURE_RECOVERY_WAITING_AGENT_BACKOFF_MS = 10 * 60 * 1000;
 export const CAPTURE_RECOVERY_VERIFY_DELAY_MS = 2 * 60 * 1000;
 export const CAPTURE_RECOVERY_VERIFICATION_GRACE_MS = 30 * 60 * 1000;
+export const CAPTURE_RECOVERY_LOCAL_CLOSURE_RECHECK_MS = 60 * 1000;
 
 const CAPTURE_RECOVERY_GENERATION_BACKOFF_MS = Object.freeze({
   1: 0,
@@ -1086,6 +1092,110 @@ export function captureRecoveryFastBudgetState(candidate = {}) {
   });
 }
 
+function captureSafetyHandoffPolicyInput(candidate = {}, {
+  faultClass = 'unknown',
+  code = 'UNKNOWN',
+} = {}) {
+  const parentMetadata = object(
+    candidate.parent_metadata || candidate.parentMetadata,
+  );
+  return {
+    faultClass,
+    challengeCode: code,
+    platform: candidate.item_platform || candidate.platform,
+    businessTaskType:
+      parentMetadata.promotedBusinessTaskType
+      || parentMetadata.businessTaskType
+      || parentMetadata.workflow
+      || candidate.parent_feature_key
+      || candidate.parent_task_type,
+    itemType: candidate.item_type || candidate.itemType,
+    safetyHandoffCount:
+      candidate.safety_handoff_count ?? candidate.safetyHandoffCount,
+    sourcePlatformAccountId:
+      candidate.source_platform_account_id
+      || candidate.sourcePlatformAccountId,
+    sourceLoginState:
+      candidate.source_login_state || candidate.sourceLoginState,
+    sourceLocalClosureProven:
+      candidate.source_local_closure_proven === true
+      || candidate.sourceLocalClosureProven === true,
+  };
+}
+
+function captureLocalClosureEvidence(candidate = {}) {
+  const legacyEvidence = candidate.source_local_closure_evidence
+    ?? candidate.sourceLocalClosureEvidence;
+  const evidences = candidate.source_local_closure_evidences
+    ?? candidate.sourceLocalClosureEvidences;
+  return selectCaptureLocalClosureEvidence({
+    evidence: legacyEvidence,
+    evidences,
+    expectedItemId: candidate.item_id || candidate.itemId,
+    expectedItemAttemptId:
+      candidate.source_attempt_id ||
+      candidate.current_source_attempt_id ||
+      candidate.sourceAttemptId,
+  });
+}
+
+function withCaptureLocalClosureProof(candidate = {}, now = new Date()) {
+  const evidence = captureLocalClosureEvidence(candidate);
+  const evidencePresent = Boolean(
+    Object.keys(object(
+      candidate.source_local_closure_evidence ??
+        candidate.sourceLocalClosureEvidence,
+    )).length > 0 ||
+    Array.isArray(
+      candidate.source_local_closure_evidences ??
+        candidate.sourceLocalClosureEvidences,
+    )
+  );
+  const proof = verifyCaptureLocalClosureProof({
+    evidence,
+    expectedRequestId:
+      candidate.execution_client_task_id || candidate.executionClientTaskId,
+    expectedAttemptId:
+      candidate.execution_attempt_client_attempt_id
+      || candidate.executionAttemptClientAttemptId,
+    expectedItemId: candidate.item_id || candidate.itemId,
+    expectedItemAttemptId:
+      candidate.source_attempt_id
+      || candidate.current_source_attempt_id
+      || candidate.sourceAttemptId,
+    expectedAttemptNumber:
+      candidate.source_attempt_number
+      ?? candidate.current_source_attempt_number
+      ?? candidate.sourceAttemptNumber,
+    expectedAssignmentRevision:
+      candidate.assignment_revision ?? candidate.assignmentRevision,
+    expectedSnapshotRevision:
+      candidate.source_local_closure_snapshot_revision
+      ?? candidate.sourceLocalClosureSnapshotRevision,
+    expectedAgentId:
+      candidate.source_attempt_agent_id
+      || candidate.current_source_attempt_agent_id
+      || candidate.assigned_agent_id
+      || candidate.item_assigned_agent_id,
+    snapshotAgentId:
+      candidate.source_local_closure_snapshot_agent_id
+      || candidate.sourceLocalClosureSnapshotAgentId,
+    snapshotStatus:
+      candidate.source_local_closure_snapshot_status
+      || candidate.sourceLocalClosureSnapshotStatus,
+    snapshotReceivedAt:
+      candidate.source_local_closure_snapshot_received_at
+      || candidate.sourceLocalClosureSnapshotReceivedAt,
+    now,
+  });
+  return {
+    ...candidate,
+    source_local_closure_proven: proof.proven === true,
+    source_local_closure_proof_failed: evidencePresent && proof.proven !== true,
+    source_local_closure_proof: proof,
+  };
+}
+
 export function classifyCaptureRecoveryCandidate(candidate = {}) {
   const status = text(candidate.status, 80).toLowerCase();
   const stage = inferredStage(candidate);
@@ -1127,6 +1237,37 @@ export function classifyCaptureRecoveryCandidate(candidate = {}) {
     });
   }
   if (faultClass === 'platform_safety') {
+    const safetyHandoff = evaluateCaptureSafetyHandoff(
+      captureSafetyHandoffPolicyInput(candidate, {faultClass, code}),
+    );
+    if (safetyHandoff.automaticEligible) {
+      return Object.freeze({
+        eligible: true,
+        terminalStatus: null,
+        decision: 'none',
+        stage,
+        faultClass,
+        code,
+        reason: 'platform_safety_handoff_candidate',
+        safetyHandoff,
+      });
+    }
+    if (
+      safetyHandoff.reason === 'source_local_closure_proof_unavailable'
+      && candidate.source_local_closure_proof_failed !== true
+    ) {
+      return Object.freeze({
+        eligible: true,
+        terminalStatus: null,
+        decision: 'observe',
+        stage,
+        faultClass,
+        code,
+        reason: 'platform_safety_waiting_local_closure',
+        waitingForLocalClosure: true,
+        safetyHandoff,
+      });
+    }
     return Object.freeze({
       eligible: true,
       terminalStatus: 'waiting_human',
@@ -1134,7 +1275,10 @@ export function classifyCaptureRecoveryCandidate(candidate = {}) {
       stage,
       faultClass,
       code,
-      reason: 'platform_safety',
+      reason: candidate.source_local_closure_proof_failed === true
+        ? 'platform_safety_local_closure_proof_failed'
+        : 'platform_safety',
+      safetyHandoff,
     });
   }
   if (!['retryable', 'needs_action', 'failed'].includes(status)) {
@@ -1255,6 +1399,22 @@ function captureRecoveryIntentEvidence({
     errorCode: classification.code,
     reason: classification.reason,
     fastBudget: classification.fastBudget || captureRecoveryFastBudgetState(candidate),
+    safetyHandoffCount: integer(candidate.safety_handoff_count),
+    ...(classification.safetyHandoff
+      ? {
+          safetyHandoff: {
+            automaticEligible:
+              classification.safetyHandoff.automaticEligible === true,
+            reason: classification.safetyHandoff.reason,
+            sourceLineageSilent:
+              classification.safetyHandoff.sourceLineageSilent === true,
+            sourceLineageSilenceRequired:
+              classification.safetyHandoff.sourceLineageSilenceRequired === true,
+            targetAccountRequired:
+              classification.safetyHandoff.targetAccountRequired === true,
+          },
+        }
+      : {}),
     windowFallback: window.fallback,
     windowReused: window.reused === true,
     backoffMs: Math.max(0, timestamp(availableAt) - timestamp(now)),
@@ -1334,17 +1494,23 @@ async function loadCaptureRecoveryCandidate(tx, tenantId, itemId) {
       item.task_id AS parent_task_id,
       item.execution_task_id,
       item.assigned_agent_id,
+      item.platform AS item_platform,
+      item.item_type,
       item.status,
       item.attempt_count,
+      item.safety_handoff_count,
       item.assignment_revision,
       item.error,
       item.metadata,
       item.created_at AS item_created_at,
       item.updated_at,
       parent.status AS parent_status,
+      parent.task_type AS parent_task_type,
+      parent.feature_key AS parent_feature_key,
       parent.metadata AS parent_metadata,
       parent.created_at AS parent_created_at,
       parent.scheduled_for AS parent_scheduled_for,
+      execution_task.client_task_id AS execution_client_task_id,
       execution_task.status AS execution_status,
       execution_task.metadata AS execution_metadata,
       execution_task.progress_seq AS execution_progress_seq,
@@ -1357,12 +1523,28 @@ async function loadCaptureRecoveryCandidate(tx, tenantId, itemId) {
       item_attempt.agent_id AS source_attempt_agent_id,
       execution_attempt.id AS execution_attempt_id,
       execution_attempt.agent_id AS execution_attempt_agent_id,
+      execution_attempt.client_attempt_id AS
+        execution_attempt_client_attempt_id,
       execution_attempt.attempt_number AS execution_attempt_number,
       execution_attempt.status AS execution_attempt_status,
       execution_attempt.checkpoint AS execution_attempt_checkpoint,
       execution_attempt.error AS execution_attempt_error,
       execution_attempt.app_version AS execution_attempt_app_version,
-      execution_attempt.health_evidence AS execution_attempt_health_evidence
+      execution_attempt.health_evidence AS execution_attempt_health_evidence,
+      local_closure_snapshot.id AS source_local_closure_snapshot_id,
+      local_closure_snapshot.agent_id AS
+        source_local_closure_snapshot_agent_id,
+      local_closure_snapshot.status AS source_local_closure_snapshot_status,
+      local_closure_snapshot.received_at AS
+        source_local_closure_snapshot_received_at,
+      local_closure_snapshot.progress_seq AS
+        source_local_closure_snapshot_revision,
+      local_closure_snapshot.metadata->'localClosure' AS
+        source_local_closure_evidence,
+      local_closure_snapshot.metadata->'localClosures' AS
+        source_local_closure_evidences,
+      source_social_account.platform_account_id AS source_platform_account_id,
+      source_social_binding.last_login_state AS source_login_state
     FROM capture_task_items item
     JOIN capture_tasks parent
       ON parent.id = item.task_id AND parent.tenant_id = item.tenant_id
@@ -1385,6 +1567,42 @@ async function loadCaptureRecoveryCandidate(tx, tenantId, itemId) {
       ORDER BY latest.attempt_number DESC, latest.created_at DESC, latest.id DESC
       LIMIT 1
     ) execution_attempt ON true
+    LEFT JOIN LATERAL (
+      SELECT snapshot.id, snapshot.agent_id, snapshot.status,
+        snapshot.progress_seq,
+        snapshot.metadata, snapshot.received_at
+      FROM capture_task_snapshots snapshot
+      WHERE snapshot.tenant_id = item.tenant_id
+        AND snapshot.task_id = COALESCE(item.execution_task_id, item.task_id)
+        AND snapshot.attempt_id = execution_attempt.id
+        AND snapshot.agent_id = COALESCE(
+          item_attempt.agent_id,
+          item.assigned_agent_id
+        )
+        AND snapshot.client_task_id = execution_task.client_task_id
+        AND snapshot.client_attempt_id = execution_attempt.client_attempt_id
+        AND snapshot.status IN (
+          'completed', 'completed_with_warnings',
+          'completed_with_failures', 'failed', 'canceled', 'cancelled',
+          'skipped', 'needs_action'
+        )
+      ORDER BY snapshot.source_updated_at DESC, snapshot.id DESC
+      LIMIT 1
+    ) local_closure_snapshot ON true
+    LEFT JOIN social_account_bindings source_social_binding
+      ON source_social_binding.tenant_id = item.tenant_id
+      AND source_social_binding.agent_id = COALESCE(
+        item_attempt.agent_id,
+        item.assigned_agent_id
+      )
+      AND source_social_binding.platform = COALESCE(
+        NULLIF(item.platform, ''),
+        parent.platform
+      )
+      AND source_social_binding.status = 'current'
+    LEFT JOIN social_accounts source_social_account
+      ON source_social_account.tenant_id = source_social_binding.tenant_id
+      AND source_social_account.id = source_social_binding.social_account_id
     WHERE item.tenant_id = $1 AND item.id = $2
   `, [tenantId, itemId]);
 }
@@ -1481,8 +1699,13 @@ export async function ingestCaptureRecoveryItem({
   withTransaction = dbWithTransaction,
 } = {}) {
   return withTransaction(async tx => {
-    const candidate = await loadCaptureRecoveryCandidate(tx, tenantId, itemId);
-    if (!candidate) return {kind: 'item_missing', itemId};
+    const loadedCandidate = await loadCaptureRecoveryCandidate(
+      tx,
+      tenantId,
+      itemId,
+    );
+    if (!loadedCandidate) return {kind: 'item_missing', itemId};
+    const candidate = withCaptureLocalClosureProof(loadedCandidate, now);
     const classification = classifyCaptureRecoveryCandidate(candidate);
     if (classification.terminalStatus && !classification.eligible) {
       if ([
@@ -1576,6 +1799,70 @@ export async function ingestCaptureRecoveryItem({
           classification,
           intent: escalated,
         };
+      }
+      if (
+        classification.faultClass === 'platform_safety'
+        && classification.safetyHandoff?.automaticEligible === true
+      ) {
+        const observedAt = new Date(now).toISOString();
+        const reevaluable = await tx.queryOne(`
+          UPDATE capture_recovery_intents
+          SET status = 'ready',
+            decision = 'none',
+            evidence = evidence || $3::jsonb,
+            decision_payload = '{}'::jsonb,
+            verification = verification || $4::jsonb,
+            available_at = $5,
+            lease_token = NULL,
+            lease_owner = '',
+            leased_at = NULL,
+            lease_expires_at = NULL,
+            resolved_at = NULL,
+            updated_at = $5
+          WHERE tenant_id = $1 AND id = $2
+            AND action_count = 0
+            AND recovery_task_id IS NULL
+            AND recovery_command_id IS NULL
+            AND dispatched_attempt_id IS NULL
+            AND (
+              status IN ('ready', 'waiting_due', 'waiting_agent')
+              OR (
+                status = 'waiting_human'
+                AND COALESCE(
+                  evidence #>> '{safetyHandoff,reason}',
+                  decision_payload->>'reason',
+                  ''
+                ) = 'source_local_closure_proof_unavailable'
+              )
+            )
+          RETURNING *
+        `, [
+          tenantId,
+          existing.id,
+          JSON.stringify({
+            sourceStatus: candidate.status,
+            errorCode: classification.code,
+            health: buildBoundedCaptureRecoveryHealth(candidate),
+            safetyHandoff: {
+              automaticEligible: true,
+              reason: classification.safetyHandoff.reason,
+            },
+          }),
+          JSON.stringify({
+            observedAt,
+            reason: 'authoritative_local_closure_arrived',
+            sameSourceFingerprint: true,
+          }),
+          observedAt,
+        ]);
+        if (reevaluable) {
+          return {
+            kind: 'local_closure_proven_requeued',
+            itemId,
+            classification,
+            intent: reevaluable,
+          };
+        }
       }
       return {kind: 'existing', itemId, classification, intent: existing};
     }
@@ -1672,9 +1959,17 @@ export async function ingestCaptureRecoveryItem({
       generation,
       sourceFingerprint,
     });
-    const initialStatus = classification.terminalStatus || 'ready';
+    const initialStatus = classification.waitingForLocalClosure === true
+      ? 'waiting_due'
+      : classification.terminalStatus || 'ready';
     const initialDecision = classification.decision || 'none';
-    const initialAvailableAt = classification.terminalStatus
+    const initialAvailableAt = classification.waitingForLocalClosure === true
+      ? boundedRecoveryFollowupAt(
+          now,
+          window.windowEndsAt,
+          CAPTURE_RECOVERY_LOCAL_CLOSURE_RECHECK_MS,
+        )
+      : classification.terminalStatus
       ? new Date(now)
       : captureRecoveryGenerationAvailableAt({
           generation,
@@ -1707,6 +2002,8 @@ export async function ingestCaptureRecoveryItem({
           window_ends_at = $14,
           available_at = $15,
           evidence = $16::jsonb,
+          safety_handoff_count = $18,
+          source_lineage_silent = false,
           decision_payload = '{}'::jsonb,
           verification = verification || $17::jsonb,
           last_error = '',
@@ -1750,6 +2047,7 @@ export async function ingestCaptureRecoveryItem({
           budgetGenerationPreserved: true,
           previousSourceFingerprint: text(latest.source_fingerprint, 64),
         }),
+        integer(candidate.safety_handoff_count),
       ]);
       if (rebound) {
         return {
@@ -1776,6 +2074,7 @@ export async function ingestCaptureRecoveryItem({
         recovery_key, source_fingerprint,
         expected_assignment_revision, expected_attempt_number,
         window_ends_at, available_at, evidence,
+        safety_handoff_count, source_lineage_silent,
         resolved_at, created_at, updated_at
       ) VALUES (
         $1, $2, $3,
@@ -1784,7 +2083,8 @@ export async function ingestCaptureRecoveryItem({
         $11, $12,
         $13, $14,
         $15, $16, $17::jsonb,
-        $18, $16, $16
+        $18, false,
+        $19, $16, $16
       )
       ON CONFLICT (tenant_id, source_fingerprint) DO NOTHING
       RETURNING *
@@ -1812,6 +2112,7 @@ export async function ingestCaptureRecoveryItem({
         availableAt: initialAvailableAt,
         now,
       })),
+      integer(candidate.safety_handoff_count),
       TERMINAL_STATUSES.has(initialStatus) ? new Date(now).toISOString() : null,
     ]);
     if (!intent) {
@@ -2864,6 +3165,8 @@ export async function processClaimedCaptureRecoveryIntent({
       intent.source_execution_attempt_id,
       intent.expected_assignment_revision,
       intent.expected_attempt_number,
+      intent.safety_handoff_count AS intent_safety_handoff_count,
+      intent.source_lineage_silent AS intent_source_lineage_silent,
       intent.window_ends_at,
       item.task_id AS parent_task_id,
       item.execution_task_id,
@@ -2880,6 +3183,7 @@ export async function processClaimedCaptureRecoveryIntent({
       ) AS watched_record_active,
       item.status AS item_status,
       item.attempt_count AS item_attempt_count,
+      item.safety_handoff_count,
       item.assignment_revision,
       COALESCE(result_observation.record_id, item.result_record_id) AS
         result_record_id,
@@ -2911,6 +3215,7 @@ export async function processClaimedCaptureRecoveryIntent({
       parent.feature_key AS parent_feature_key,
       parent.metadata AS parent_metadata,
       parent.orchestration_revision AS parent_orchestration_revision,
+      source_execution_task.client_task_id AS execution_client_task_id,
       current_item_attempt.id AS current_source_attempt_id,
       current_item_attempt.attempt_number AS current_source_attempt_number,
       current_item_attempt.assignment_revision AS current_source_assignment_revision,
@@ -2919,11 +3224,28 @@ export async function processClaimedCaptureRecoveryIntent({
       current_item_attempt.result AS current_source_attempt_result,
       current_item_attempt.error AS current_source_attempt_error,
       current_item_attempt.agent_id AS current_source_attempt_agent_id,
+      source_social_account.platform_account_id AS source_platform_account_id,
+      source_social_binding.last_login_state AS source_login_state,
       current_execution_attempt.id AS current_execution_attempt_id,
+      current_execution_attempt.agent_id AS current_execution_attempt_agent_id,
+      current_execution_attempt.client_attempt_id AS
+        execution_attempt_client_attempt_id,
       current_execution_attempt.attempt_number AS current_execution_attempt_number,
       current_execution_attempt.status AS current_execution_attempt_status,
       current_execution_attempt.checkpoint AS current_execution_attempt_checkpoint,
       current_execution_attempt.error AS current_execution_attempt_error,
+      local_closure_snapshot.id AS source_local_closure_snapshot_id,
+      local_closure_snapshot.agent_id AS
+        source_local_closure_snapshot_agent_id,
+      local_closure_snapshot.status AS source_local_closure_snapshot_status,
+      local_closure_snapshot.received_at AS
+        source_local_closure_snapshot_received_at,
+      local_closure_snapshot.progress_seq AS
+        source_local_closure_snapshot_revision,
+      local_closure_snapshot.metadata->'localClosure' AS
+        source_local_closure_evidence,
+      local_closure_snapshot.metadata->'localClosures' AS
+        source_local_closure_evidences,
       dispatched_attempt.id AS exact_dispatched_attempt_id,
       dispatched_attempt.item_id AS exact_dispatched_item_id,
       dispatched_attempt.parent_task_id AS exact_dispatched_parent_task_id,
@@ -2996,6 +3318,9 @@ export async function processClaimedCaptureRecoveryIntent({
       ON item.id = intent.item_id AND item.tenant_id = intent.tenant_id
     JOIN capture_tasks parent
       ON parent.id = intent.parent_task_id AND parent.tenant_id = intent.tenant_id
+    LEFT JOIN capture_tasks source_execution_task
+      ON source_execution_task.id = item.execution_task_id
+      AND source_execution_task.tenant_id = item.tenant_id
     LEFT JOIN LATERAL (
       SELECT exact_observation.*
       FROM record_observations exact_observation
@@ -3034,6 +3359,20 @@ export async function processClaimedCaptureRecoveryIntent({
       ORDER BY latest.attempt_number DESC, latest.created_at DESC, latest.id DESC
       LIMIT 1
     ) current_item_attempt ON true
+    LEFT JOIN social_account_bindings source_social_binding
+      ON source_social_binding.tenant_id = item.tenant_id
+      AND source_social_binding.agent_id = COALESCE(
+        current_item_attempt.agent_id,
+        item.assigned_agent_id
+      )
+      AND source_social_binding.platform = COALESCE(
+        NULLIF(item.platform, ''),
+        parent.platform
+      )
+      AND source_social_binding.status = 'current'
+    LEFT JOIN social_accounts source_social_account
+      ON source_social_account.tenant_id = source_social_binding.tenant_id
+      AND source_social_account.id = source_social_binding.social_account_id
     LEFT JOIN capture_task_item_attempts dispatched_attempt
       ON dispatched_attempt.id = intent.dispatched_attempt_id
       AND dispatched_attempt.tenant_id = intent.tenant_id
@@ -3076,14 +3415,34 @@ export async function processClaimedCaptureRecoveryIntent({
         AND observation.capture_task_item_attempt_id = intent.dispatched_attempt_id
     ) attempt_business ON true
     LEFT JOIN LATERAL (
-      SELECT latest.id, latest.attempt_number, latest.status,
-        latest.checkpoint, latest.error
+      SELECT latest.id, latest.agent_id, latest.client_attempt_id,
+        latest.attempt_number, latest.status, latest.checkpoint, latest.error
       FROM capture_task_attempts latest
       WHERE latest.tenant_id = intent.tenant_id
         AND latest.task_id = COALESCE(item.execution_task_id, item.task_id)
       ORDER BY latest.attempt_number DESC, latest.created_at DESC, latest.id DESC
       LIMIT 1
     ) current_execution_attempt ON true
+    LEFT JOIN LATERAL (
+      SELECT snapshot.id, snapshot.agent_id, snapshot.status,
+        snapshot.progress_seq,
+        snapshot.metadata, snapshot.received_at
+      FROM capture_task_snapshots snapshot
+      WHERE snapshot.tenant_id = intent.tenant_id
+        AND snapshot.task_id = item.execution_task_id
+        AND snapshot.attempt_id = current_execution_attempt.id
+        AND snapshot.agent_id = current_item_attempt.agent_id
+        AND snapshot.client_task_id = source_execution_task.client_task_id
+        AND snapshot.client_attempt_id =
+          current_execution_attempt.client_attempt_id
+        AND snapshot.status IN (
+          'completed', 'completed_with_warnings',
+          'completed_with_failures', 'failed', 'canceled', 'cancelled',
+          'skipped', 'needs_action'
+        )
+      ORDER BY snapshot.source_updated_at DESC, snapshot.id DESC
+      LIMIT 1
+    ) local_closure_snapshot ON true
     LEFT JOIN capture_tasks recovery_task
       ON recovery_task.id = intent.recovery_task_id
       AND recovery_task.tenant_id = intent.tenant_id
@@ -3187,6 +3546,7 @@ export async function processClaimedCaptureRecoveryIntent({
       queryOne,
     });
   }
+  const currentWithLocalClosure = withCaptureLocalClosureProof(current, now);
   if (captureRecoveryExplicitUserStop(current)) {
     return settleCaptureRecoveryIntent({
       tenantId,
@@ -3278,7 +3638,7 @@ export async function processClaimedCaptureRecoveryIntent({
     });
   }
   const classification = classifyCaptureRecoveryCandidate({
-    ...current,
+    ...currentWithLocalClosure,
     status: current.item_status,
     source_attempt_checkpoint: current.current_source_attempt_checkpoint,
     source_attempt_error: current.current_source_attempt_error,
@@ -3506,6 +3866,27 @@ export async function processClaimedCaptureRecoveryIntent({
     });
   }
 
+  if (classification.waitingForLocalClosure === true && windowEnded) {
+    return settleCaptureRecoveryIntent({
+      tenantId,
+      intentId: intent.id,
+      leaseToken,
+      status: 'waiting_human',
+      decision: 'human_required',
+      decisionPayload: {
+        reason: 'source_local_closure_proof_timeout',
+        noBusinessAction: true,
+      },
+      verification: {
+        reason: 'source_local_closure_proof_timeout',
+        failedChecks:
+          currentWithLocalClosure.source_local_closure_proof?.failedChecks || [],
+      },
+      now,
+      queryOne,
+    });
+  }
+
   if (windowEnded) {
     return settleCaptureRecoveryIntent({
       tenantId,
@@ -3562,6 +3943,33 @@ export async function processClaimedCaptureRecoveryIntent({
       queryOne,
     });
   }
+  if (classification.waitingForLocalClosure === true) {
+    return settleCaptureRecoveryIntent({
+      tenantId,
+      intentId: intent.id,
+      leaseToken,
+      status: 'waiting_due',
+      decision: 'observe',
+      decisionPayload: {
+        reason: 'source_local_closure_proof_pending',
+        noBusinessAction: true,
+        redHumanNotification: false,
+      },
+      verification: {
+        reason: classification.reason,
+        failedChecks:
+          currentWithLocalClosure.source_local_closure_proof?.failedChecks || [],
+        reevaluable: true,
+      },
+      availableAt: boundedRecoveryFollowupAt(
+        now,
+        current.window_ends_at,
+        CAPTURE_RECOVERY_LOCAL_CLOSURE_RECHECK_MS,
+      ),
+      now,
+      queryOne,
+    });
+  }
   if (classification.terminalStatus) {
     return settleCaptureRecoveryIntent({
       tenantId,
@@ -3598,7 +4006,35 @@ export async function processClaimedCaptureRecoveryIntent({
     });
   }
 
-  if (!AUTOMATIC_CAPTURE_RECOVERY_FAULT_CLASSES.has(classification.faultClass)) {
+  const automaticSafetyHandoff = Boolean(
+    classification.faultClass === 'platform_safety'
+    && classification.safetyHandoff?.automaticEligible === true,
+  );
+  if (
+    automaticSafetyHandoff
+    && integer(current.intent_safety_handoff_count)
+      !== integer(current.safety_handoff_count)
+  ) {
+    return settleCaptureRecoveryIntent({
+      tenantId,
+      intentId: intent.id,
+      leaseToken,
+      status: 'waiting_human',
+      decision: 'human_required',
+      decisionPayload: {
+        reason: 'safety_handoff_budget_snapshot_mismatch',
+        noBusinessAction: true,
+      },
+      verification: {reason: 'safety_handoff_budget_changed'},
+      now,
+      queryOne,
+    });
+  }
+
+  if (
+    !automaticSafetyHandoff
+    && !AUTOMATIC_CAPTURE_RECOVERY_FAULT_CLASSES.has(classification.faultClass)
+  ) {
     return settleCaptureRecoveryIntent({
       tenantId,
       intentId: intent.id,
@@ -3645,6 +4081,19 @@ export async function processClaimedCaptureRecoveryIntent({
       dutyRecoveryLeaseToken: leaseToken,
       dutyRecoveryGeneration: integer(current.generation || intent.generation, 1),
       allowPreviouslyAttemptedAgents,
+      ...(automaticSafetyHandoff
+        ? {
+            safetyHandoff: {
+              count: integer(current.safety_handoff_count),
+              challengeCode: classification.code,
+              sourcePlatformAccountId: current.source_platform_account_id,
+              sourceLoginState: current.source_login_state,
+              requireDistinctPlatformAccount: true,
+              requireSourceLineageQuiet: true,
+              sourceLocalClosureProven: true,
+            },
+          }
+        : {}),
     });
   } catch (error) {
     dispatched = {

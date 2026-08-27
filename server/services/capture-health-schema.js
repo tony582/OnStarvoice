@@ -180,6 +180,7 @@ const RECOVERY_ERROR_CODES = new Set([
   'unattended_ledger_rejected',
   'unattended_recovery_blocked',
   'unattended_recovery_exhausted',
+  'unattended_recovery_launch_exhausted',
   'unattended_runtime_message_timeout',
   'unattended_search_bootstrap_canceled',
   'unattended_search_bootstrap_failed',

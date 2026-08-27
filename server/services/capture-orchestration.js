@@ -753,6 +753,12 @@ export function aggregateParentTaskItems(items = []) {
   const source = Array.isArray(items) ? items : [];
   const statuses = source.map(item => normalizeItemStatus(item?.status));
   const count = status => statuses.filter(itemStatus => itemStatus === status).length;
+  const retryWaiting = source.filter(item =>
+    normalizeItemStatus(item?.status) === 'retryable' &&
+    item?.metadata &&
+    typeof item.metadata === 'object' &&
+    item.metadata.retryPending === true
+  ).length;
   const counts = {
     total: statuses.length,
     pending: count('pending'),
@@ -762,6 +768,7 @@ export function aggregateParentTaskItems(items = []) {
     waitingDevice: count('waiting_device'),
     running: count('running'),
     retryable: count('retryable'),
+    retryWaiting,
     needsAction: count('needs_action'),
     completed: count('completed'),
     completedWithWarnings: count('completed_with_warnings'),
@@ -783,7 +790,10 @@ export function aggregateParentTaskItems(items = []) {
         : 'completed';
   } else if (counts.running > 0) {
     status = 'running';
-  } else if (counts.needsAction > 0 || counts.retryable > 0) {
+  } else if (
+    counts.needsAction > 0 ||
+    counts.retryable > counts.retryWaiting
+  ) {
     status = 'needs_action';
   } else if (
     counts.assigned > 0 ||

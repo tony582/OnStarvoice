@@ -14701,6 +14701,11 @@ const BATCH_KEYWORD_NAV_POLL_MS = 300;
 const BATCH_KEYWORD_AFTER_NAV_WAIT_MS = 2000;
 const BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS = 12000;
 const DOUYIN_KEYWORD_RESULTS_READY_TIMEOUT_MS = 45000;
+// 抖音慢网/高负载下，结果卡可能已出现，但提交 witness 的 busy/clear/root
+// lifecycle 仍晚于固定 45 秒。只在当前提交仍有可见结果或近期签名进展时，
+// 允许一次有界探测；它不会放宽结果代际或筛选确认门，也不会重新提交搜索。
+const DOUYIN_KEYWORD_RESULTS_SLOW_PROGRESS_EXTENSION_MS = 30000;
+const DOUYIN_KEYWORD_RESULTS_PROGRESS_RECENCY_MS = 15000;
 const BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS = 5000;
 const BATCH_KEYWORD_RESULTS_STABLE_POLLS = 2;
 const DOUYIN_SEARCH_SERVICE_ABNORMAL_STABLE_POLLS = 2;
@@ -15906,6 +15911,10 @@ export async function batchCaptureByKeywords({
         confirmedEmpty: value.confirmedEmpty === true,
         emptyMessage: String(value.emptyMessage || '').trim(),
         pageUrl: String(value.pageUrl || '').trim(),
+        readinessCode: String(value.readinessCode || '').trim(),
+        slowProgressProbeUsed: value.slowProgressProbeUsed === true,
+        slowProgressReason: String(value.slowProgressReason || '').trim(),
+        waitedMs: Math.max(0, Number(value.waitedMs) || 0),
       };
     }
     return {
@@ -15913,8 +15922,32 @@ export async function batchCaptureByKeywords({
       confirmedEmpty: false,
       emptyMessage: '',
       pageUrl: '',
+      readinessCode: '',
+      slowProgressProbeUsed: false,
+      slowProgressReason: '',
+      waitedMs: 0,
     };
   };
+  const createDouyinSlowProgressReporter = ({keyword, current, total, stage}) =>
+    !onProgress
+      ? null
+      : (probe = {}) => {
+          onProgress({
+            current,
+            total,
+            keyword,
+            phase: 'waiting_results',
+            stage: String(stage || 'results_visible_unconfirmed'),
+            readinessCode: String(probe.readinessCode || ''),
+            slowProgressProbeUsed: true,
+            slowProgressReason: String(probe.reason || ''),
+            remainingMs: Math.max(0, Number(probe.extensionMs) || 0),
+            message:
+              stage === 'filtered_results_visible_unconfirmed'
+                ? `已看到「${keyword}」筛选后的结果，正在等待本次筛选代际确认(${current}/${total})...`
+                : `已看到「${keyword}」的搜索结果，正在等待本次搜索代际确认(${current}/${total})...`,
+          });
+        };
   const throwConfirmedEmptySearchResult = (keyword, readiness) => {
     if (!readiness?.confirmedEmpty) return;
     const error = new Error(
@@ -16024,6 +16057,12 @@ export async function batchCaptureByKeywords({
               douyinSearchTransition?.submissionNonce || '',
             navigationTransitionAccepted:
               douyinSearchTransition?.navigationTransitionAccepted === true,
+            onSlowProgress: createDouyinSlowProgressReporter({
+              keyword,
+              current: i + 1,
+              total: keywords.length,
+              stage: 'results_visible_unconfirmed',
+            }),
           },
         ),
       );
@@ -16064,6 +16103,7 @@ export async function batchCaptureByKeywords({
               platform,
               keyword,
               shouldStop,
+              {reason: 'filter_generation_recovery'},
             );
             await waitForDouyinSearchPacingWindow(
               runnerTabId,
@@ -16087,6 +16127,12 @@ export async function batchCaptureByKeywords({
                     retrySearchTransition?.accepted === true,
                   submissionNonce:
                     retrySearchTransition?.submissionNonce || '',
+                  onSlowProgress: createDouyinSlowProgressReporter({
+                    keyword,
+                    current: i + 1,
+                    total: keywords.length,
+                    stage: 'results_visible_unconfirmed',
+                  }),
                 },
               ),
             );
@@ -16174,6 +16220,12 @@ export async function batchCaptureByKeywords({
                   filterChanged
                     ? filterTransition?.submissionNonce || ''
                     : '',
+                onSlowProgress: createDouyinSlowProgressReporter({
+                  keyword,
+                  current: i + 1,
+                  total: keywords.length,
+                  stage: 'filtered_results_visible_unconfirmed',
+                }),
               },
             ),
           );
@@ -16246,6 +16298,7 @@ export async function batchCaptureByKeywords({
             platform,
             keyword,
             shouldStop,
+            {reason: 'empty_list_recovery'},
           );
         }
         const reportRetryWaitProgress = (remainingMs = BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS) => {
@@ -16289,6 +16342,12 @@ export async function batchCaptureByKeywords({
                 douyinSearchTransition?.accepted === true,
               submissionNonce:
                 douyinSearchTransition?.submissionNonce || '',
+              onSlowProgress: createDouyinSlowProgressReporter({
+                keyword,
+                current: i + 1,
+                total: keywords.length,
+                stage: 'results_visible_unconfirmed',
+              }),
             },
           ),
         );
@@ -16346,6 +16405,12 @@ export async function batchCaptureByKeywords({
                   refilterChanged
                     ? refilterTransition?.submissionNonce || ''
                     : '',
+                onSlowProgress: createDouyinSlowProgressReporter({
+                  keyword,
+                  current: i + 1,
+                  total: keywords.length,
+                  stage: 'filtered_results_visible_unconfirmed',
+                }),
               },
             ),
           );
@@ -17291,8 +17356,20 @@ async function submitKeywordSearchInTab(
   platform = '',
   keyword = '',
   shouldStop = null,
+  {reason = ''} = {},
 ) {
   if (!isDouyinPlatform(platform)) {
+    return false;
+  }
+  const normalizedReason = String(reason || '').trim().toLowerCase();
+  const allowedReasons = new Set([
+    'initial_search_generation',
+    'filter_generation_recovery',
+    'empty_list_recovery',
+  ]);
+  // 整词提交会重置筛选并触发平台搜索。没有明确、受控 reason 时禁止点击，
+  // 避免慢进展探测退化成无条件重复搜索。
+  if (!allowedReasons.has(normalizedReason)) {
     return false;
   }
   if (typeof shouldStop === 'function' && shouldStop()) {
@@ -17510,7 +17587,7 @@ async function submitKeywordSearchInTab(
             attributeFilter: ['aria-busy'],
           });
           if (typeof setTimeout === 'function') {
-            setTimeout(() => observer.disconnect(), 60_000);
+            setTimeout(() => observer.disconnect(), 90_000);
           }
           return nonce;
         };
@@ -17599,6 +17676,7 @@ async function submitKeywordSearchInTab(
   return Object.freeze({
     accepted: true,
     via: String(result?.via || ''),
+    reason: normalizedReason,
     submissionNonce: String(result?.submissionNonce || ''),
     baselineCaptured: previousResults.captured === true,
     previousWorkIds: previousResults.workIds,
@@ -17840,7 +17918,7 @@ async function beginDouyinSearchResultTransitionInTab(
           attributeFilter: ['aria-busy'],
         });
         if (typeof setTimeout === 'function') {
-          setTimeout(() => observer.disconnect(), 60_000);
+          setTimeout(() => observer.disconnect(), 90_000);
         }
         return nonce;
       },
@@ -17992,6 +18070,7 @@ async function switchDouyinKeywordSearchInTab(
     'douyin',
     keyword,
     shouldStop,
+    {reason: 'initial_search_generation'},
   );
   return Object.freeze({
     baselineCaptured: submission?.baselineCaptured === true,
@@ -18664,6 +18743,8 @@ async function waitForKeywordSearchResultsInTab(
     submitAccepted = false,
     submissionNonce = '',
     navigationTransitionAccepted = false,
+    slowProgressExtensionMs = null,
+    onSlowProgress = null,
   } = {},
 ) {
   const normalizedTabId = Number(tabId);
@@ -18679,14 +18760,24 @@ async function waitForKeywordSearchResultsInTab(
   }
 
   const startedAt = Date.now();
+  const isDouyinReadiness =
+    String(platform || '').trim().toLowerCase() === 'douyin';
   const hasExplicitTimeout = timeoutMs !== null && timeoutMs !== undefined;
   const defaultTimeout =
-    String(platform || '').trim().toLowerCase() === 'douyin'
+    isDouyinReadiness
       ? DOUYIN_KEYWORD_RESULTS_READY_TIMEOUT_MS
       : BATCH_KEYWORD_RESULTS_READY_TIMEOUT_MS;
   const timeout = Math.max(
     0,
     hasExplicitTimeout ? Number(timeoutMs) || 0 : defaultTimeout,
+  );
+  const slowProgressExtension = Math.max(
+    0,
+    slowProgressExtensionMs === null || slowProgressExtensionMs === undefined
+      ? isDouyinReadiness && !hasExplicitTimeout
+        ? DOUYIN_KEYWORD_RESULTS_SLOW_PROGRESS_EXTENSION_MS
+        : 0
+      : Number(slowProgressExtensionMs) || 0,
   );
   const requiredStablePolls = Math.max(1, Math.floor(Number(stablePolls) || 1));
   const normalizedPreviousWorkIds = Array.from(
@@ -18704,7 +18795,56 @@ async function waitForKeywordSearchResultsInTab(
   let lastServiceAbnormalSignature = '';
   let serviceAbnormalStableCount = 0;
   let serviceAbnormalFirstObservedAt = null;
-  while (Date.now() - startedAt < timeout) {
+  let slowProgressProbeUsed = false;
+  let slowProgressReason = '';
+  let activeTimeout = timeout;
+  let currentAttemptResultsVisible = false;
+  let lastObservedProgressSignature = '';
+  let lastResultProgressAt = null;
+  while (true) {
+    const observedAt = Date.now();
+    const elapsedMs = observedAt - startedAt;
+    if (elapsedMs >= activeTimeout) {
+      const resultProgressAgeMs = Number.isFinite(lastResultProgressAt)
+        ? observedAt - lastResultProgressAt
+        : null;
+      const recentSignatureProgress = Boolean(
+        Number.isFinite(resultProgressAgeMs) &&
+          resultProgressAgeMs >= 0 &&
+          resultProgressAgeMs <=
+            DOUYIN_KEYWORD_RESULTS_PROGRESS_RECENCY_MS,
+      );
+      const canRunSlowProgressProbe = Boolean(
+        isDouyinReadiness &&
+          !slowProgressProbeUsed &&
+          slowProgressExtension > 0 &&
+          (currentAttemptResultsVisible || recentSignatureProgress),
+      );
+      if (!canRunSlowProgressProbe) {
+        break;
+      }
+      slowProgressProbeUsed = true;
+      slowProgressReason = currentAttemptResultsVisible
+        ? 'visible_results_generation_unconfirmed'
+        : 'result_signature_progress';
+      activeTimeout = timeout + slowProgressExtension;
+      if (typeof onSlowProgress === 'function') {
+        try {
+          await onSlowProgress({
+            stage: 'results_visible_unconfirmed',
+            reason: slowProgressReason,
+            readinessCode: 'DOUYIN_RESULTS_VISIBLE_GENERATION_UNPROVEN',
+            elapsedMs,
+            extensionMs: slowProgressExtension,
+          });
+        } catch {
+          // 可见性回调不得中断页面证据探测。
+        }
+      }
+      if (elapsedMs >= activeTimeout) {
+        break;
+      }
+    }
     if (typeof shouldStop === 'function' && shouldStop()) {
       throw new Error('BATCH_CAPTURE_CANCELED');
     }
@@ -19239,8 +19379,6 @@ async function waitForKeywordSearchResultsInTab(
       throw createXhsSecurityBlockError(snapshot.securityEvidence);
     }
 
-    const isDouyinReadiness =
-      String(platform || '').trim().toLowerCase() === 'douyin';
     const douyinWorkIds = Array.from(
       new Set(
         (Array.isArray(snapshot?.workIds) ? snapshot.workIds : [])
@@ -19269,6 +19407,30 @@ async function waitForKeywordSearchResultsInTab(
           String(submissionNonce || '') &&
         snapshot?.postSubmitGenerationChanged === true,
     );
+    const matchingSubmissionWitness = Boolean(
+      isDouyinReadiness &&
+        submitAccepted === true &&
+        String(submissionNonce || '') &&
+        String(snapshot?.submissionNonce || '') ===
+          String(submissionNonce || ''),
+    );
+    currentAttemptResultsVisible = Boolean(
+      isDouyinReadiness &&
+        searchPathReady &&
+        !keywordConflict &&
+        cardCount > 0 &&
+        (keywordMatched ||
+          navigationTransitionAccepted === true ||
+          matchingSubmissionWitness),
+    );
+    if (
+      currentAttemptResultsVisible &&
+      signature &&
+      signature !== lastObservedProgressSignature
+    ) {
+      lastObservedProgressSignature = signature;
+      lastResultProgressAt = Date.now();
+    }
     const confirmedEmpty =
       searchPathReady &&
       !keywordConflict &&
@@ -19335,6 +19497,10 @@ async function waitForKeywordSearchResultsInTab(
             confirmedEmpty: false,
             emptyMessage: '',
             pageUrl: lastPageUrl,
+            readinessCode: '',
+            slowProgressProbeUsed,
+            slowProgressReason,
+            waitedMs: Date.now() - startedAt,
           }
         : true;
     }
@@ -19352,6 +19518,15 @@ async function waitForKeywordSearchResultsInTab(
         confirmedEmpty: false,
         emptyMessage: '',
         pageUrl: lastPageUrl,
+        readinessCode:
+          isDouyinReadiness && slowProgressProbeUsed
+            ? 'DOUYIN_RESULTS_VISIBLE_GENERATION_UNPROVEN'
+            : isDouyinReadiness
+              ? 'DOUYIN_SEARCH_RESULTS_NOT_READY'
+              : '',
+        slowProgressProbeUsed,
+        slowProgressReason,
+        waitedMs: Date.now() - startedAt,
       }
     : false;
 }

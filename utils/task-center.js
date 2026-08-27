@@ -11,6 +11,7 @@
   const MAX_ID_LENGTH = 180;
   const MAX_METADATA_KEYS = 24;
   const MAX_CHECKPOINT_KEYWORD_RESULTS = 500;
+  const MAX_LOCAL_CLOSURE_EVIDENCES = 30;
 
   const TERMINAL_STATUSES = new Set([
     "completed",
@@ -99,7 +100,11 @@
   }
 
   function sanitizeStructuredValue(value, key = "", depth = 0) {
-    const normalizedKey = String(key || "").replace(/([a-z0-9])([A-Z])/g, "$1_$2");
+    const normalizedKey = String(key || "")
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .toLowerCase();
+    const localClosureEvidence = normalizedKey === "local_closure";
+    const localClosureEvidenceList = normalizedKey === "local_closures";
     if (SENSITIVE_KEY_PATTERN.test(normalizedKey)) {
       return "[REDACTED]";
     }
@@ -108,11 +113,15 @@
       return Number.isFinite(value) ? value : null;
     }
     if (typeof value === "string") return sanitizeText(value);
-    if (depth >= 2) return sanitizeText(value);
+    if (depth >= 2 && !localClosureEvidence) return sanitizeText(value);
     if (Array.isArray(value)) {
       return value
-        .slice(0, 20)
-        .map((item) => sanitizeStructuredValue(item, "", depth + 1));
+        .slice(0, localClosureEvidenceList ? MAX_LOCAL_CLOSURE_EVIDENCES : 20)
+        .map((item) => sanitizeStructuredValue(
+          item,
+          localClosureEvidenceList ? "localClosure" : "",
+          depth + 1,
+        ));
     }
     if (!value || typeof value !== "object") return sanitizeText(value);
 
@@ -253,6 +262,23 @@
 
   function normalizeProgress(value = {}) {
     const input = objectValue(value);
+    const optionalNonNegativeInteger = (key) => {
+      if (!hasOwn(input, key)) return null;
+      const value = input[key];
+      if (
+        value === null ||
+        value === '' ||
+        !Number.isSafeInteger(Number(value)) ||
+        Number(value) < 0
+      ) {
+        return null;
+      }
+      return Number(value);
+    };
+    const optionalBoolean = (key) =>
+      hasOwn(input, key) && typeof input[key] === 'boolean'
+        ? input[key]
+        : null;
     const progress = {
       current: normalizeNonNegativeInteger(input.current),
       total: normalizeNonNegativeInteger(input.total),
@@ -267,6 +293,42 @@
       remainingMs: normalizeNonNegativeInteger(input.remainingMs),
       savedCount: normalizeNonNegativeInteger(
         input.savedCount == null ? input.saved : input.savedCount,
+      ),
+      streamingSyncEvidenceKnown: optionalBoolean(
+        'streamingSyncEvidenceKnown',
+      ),
+      streamingSyncDrainCompleted: optionalBoolean(
+        'streamingSyncDrainCompleted',
+      ),
+      streamingSyncEnabled: optionalBoolean('streamingSyncEnabled'),
+      streamingSyncEnqueuedCount: optionalNonNegativeInteger(
+        'streamingSyncEnqueuedCount',
+      ),
+      streamingSyncProcessedCount: optionalNonNegativeInteger(
+        'streamingSyncProcessedCount',
+      ),
+      streamingSyncSuccessCount: optionalNonNegativeInteger(
+        'streamingSyncSuccessCount',
+      ),
+      streamingSyncFailedCount: optionalNonNegativeInteger(
+        'streamingSyncFailedCount',
+      ),
+      streamingSyncSkippedCount: optionalNonNegativeInteger(
+        'streamingSyncSkippedCount',
+      ),
+      streamingSyncPendingCount: optionalNonNegativeInteger(
+        'streamingSyncPendingCount',
+      ),
+      streamingSyncActiveCount: optionalNonNegativeInteger(
+        'streamingSyncActiveCount',
+      ),
+      streamingSyncRemainingCount: optionalNonNegativeInteger(
+        'streamingSyncRemainingCount',
+      ),
+      streamingSyncBlocked: optionalBoolean('streamingSyncBlocked'),
+      streamingSyncCanceled: optionalBoolean('streamingSyncCanceled'),
+      capturedRecordCount: optionalNonNegativeInteger(
+        'capturedRecordCount',
       ),
       updatedAt: normalizeTimestamp(input.updatedAt),
     };

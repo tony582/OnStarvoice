@@ -34,6 +34,10 @@ import type {
 // 平台/状态文案与时间格式化统一以 lib.ts 为准，避免两处定义漂移。
 import { PLATFORM_LABELS, STATUS_LABELS, formatTime } from './lib'
 import { KeywordExecutionReport } from './KeywordExecutionReport'
+import {
+  allocateKeywordRetryItems,
+  buildKeywordRetryAssignments,
+} from './retry-item-allocation.js'
 
 const SORT_LABELS: Record<string, string> = {
   comprehensive: '综合排序',
@@ -341,7 +345,7 @@ export function OrchestrationDetailWorkspace({
   const [scheduleUpdating, setScheduleUpdating] = useState(false)
   const [scheduleRunningNow, setScheduleRunningNow] = useState(false)
   const [attentionAction, setAttentionAction] = useState<'resume' | 'stop' | ''>('')
-  const [keywordRetryTargetAgentId, setKeywordRetryTargetAgentId] = useState('')
+  const [keywordRetryAgentOverrides, setKeywordRetryAgentOverrides] = useState<Record<string, string>>({})
   const [keywordRetrying, setKeywordRetrying] = useState(false)
   const [negativeReassignOpen, setNegativeReassignOpen] = useState(false)
   const [negativeReassigning, setNegativeReassigning] = useState(false)
@@ -390,7 +394,7 @@ export function OrchestrationDetailWorkspace({
     setActionError('')
     setNegativeReassignOpen(false)
     setNegativeReassignAgentIds(new Set())
-    setKeywordRetryTargetAgentId('')
+    setKeywordRetryAgentOverrides({})
     pendingNegativeReassign.current = null
     pendingKeywordRetry.current = null
     pendingScheduleRunNow.current = null
@@ -477,27 +481,35 @@ export function OrchestrationDetailWorkspace({
   ), [detail?.attempts, detail?.executions, keywordRetryItems])
   const keywordRetryCandidates = useMemo(() => {
     if (!detail || contentPatrol) return []
-    return availableAgents
-      .filter(agent => agentSupportsKeywordRetry(
+    const source = Array.isArray(detail.retryCandidates)
+      ? detail.retryCandidates
+      : availableAgents
+    return source.filter(agent => agentSupportsKeywordRetry(
         agent,
         detail.orchestration.platform,
       ))
-      .sort((left, right) => {
-        const leftOriginal = keywordRetrySourceAgentIds.has(left.id) ? 1 : 0
-        const rightOriginal = keywordRetrySourceAgentIds.has(right.id) ? 1 : 0
-        if (leftOriginal !== rightOriginal) return leftOriginal - rightOriginal
-        return `${left.host_label}${left.display_name}`.localeCompare(
-          `${right.host_label}${right.display_name}`,
-          'zh-CN',
-        )
-      })
-  }, [availableAgents, contentPatrol, detail, keywordRetrySourceAgentIds])
+  }, [availableAgents, contentPatrol, detail])
   const keywordAutomaticCandidates = useMemo(
     () => keywordRetryCandidates.filter(agent =>
       !keywordRetrySourceAgentIds.has(agent.id),
     ),
     [keywordRetryCandidates, keywordRetrySourceAgentIds],
   )
+  const keywordRetryAllocation = useMemo(() => {
+    return allocateKeywordRetryItems({
+      items: keywordRetryItems,
+      candidates: keywordRetryCandidates,
+      overrides: keywordRetryAgentOverrides,
+    })
+  }, [keywordRetryAgentOverrides, keywordRetryCandidates, keywordRetryItems])
+  const keywordRetryDispatchableCount = keywordRetryAllocation.filter(
+    allocation => Boolean(allocation.agent),
+  ).length
+  const keywordRetryWaitingCount =
+    keywordRetryAllocation.length - keywordRetryDispatchableCount
+  const keywordRetryStrictWaitingCount = keywordRetryAllocation.filter(
+    allocation => allocation.strictWaiting,
+  ).length
   const negativeReassignItems = useMemo(() => {
     if (!negativePatrol) return []
     return sortedItems.filter(item => {
@@ -949,22 +961,27 @@ export function OrchestrationDetailWorkspace({
       keywordRetrying ||
       keywordRetryItems.length === 0
     ) return
-    const targetAgentId =
-      keywordRetryTargetAgentId || keywordRetryCandidates[0]?.id || ''
-    const target = keywordRetryCandidates.find(
-      agent => agent.id === targetAgentId,
-    )
-    if (!target) {
-      setActionError('当前没有支持该平台的在线空闲 Agent')
-      return
-    }
     const confirmSafety = keywordRetryItems.some(item =>
       safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata),
     )
-    const originalCount = keywordRetrySourceAgentIds.has(targetAgentId) ? 1 : 0
+    const originalCount = keywordRetryAllocation.filter(allocation =>
+      allocation.agent && keywordRetrySourceAgentIds.has(allocation.agent.id),
+    ).length
     if (!window.confirm(
-      `确定把 ${keywordRetryItems.length} 个失败关键词交给 ${agentName(target)} 重试吗？` +
-      `${originalCount ? ' 这是原执行 Agent。' : ' 这是新的空闲 Agent。'}` +
+      (keywordRetryDispatchableCount > 0
+        ? `确定按预览让 ${keywordRetryDispatchableCount} 个失败关键词现在接力吗？`
+        : `当前没有空闲兼容 Agent，确定让 ${keywordRetryWaitingCount} 个失败关键词进入自动等待队列吗？`) +
+      `${keywordRetryDispatchableCount > 0 && keywordRetryWaitingCount
+        ? ` 另有 ${keywordRetryWaitingCount} 个等待空闲 Agent，槽位释放后自动接力。`
+        : ''}` +
+      `${keywordRetryStrictWaitingCount > 0
+        ? ` 其中 ${keywordRetryStrictWaitingCount} 项指定的 Agent 当前不可用，将严格等待该 Agent，不会自动改派。`
+        : ''}` +
+      `${keywordRetryDispatchableCount === 0
+        ? ''
+        : originalCount
+          ? ` 其中 ${originalCount} 项使用原执行 Agent。`
+          : ' 当前可接力项全部使用其他空闲 Agent。'}` +
       ' 新结果会写回当前无人值守任务，不会生成独立根任务。' +
       `${confirmSafety ? ' 其中包含曾触发安全验证的关键词，请确认目标设备已可正常访问平台。' : ''}`,
     )) return
@@ -975,11 +992,15 @@ export function OrchestrationDetailWorkspace({
       0,
     )
     const itemIds = keywordRetryItems.map(item => item.id)
+    const assignments = buildKeywordRetryAssignments({
+      items: keywordRetryItems,
+      overrides: keywordRetryAgentOverrides,
+    })
     const fingerprint = JSON.stringify({
       orchestrationId,
       expectedRevision,
-      targetAgentId,
       itemIds,
+      assignments,
       confirmSafety,
     })
     if (
@@ -995,22 +1016,26 @@ export function OrchestrationDetailWorkspace({
     setActionError('')
     setActionFeedback('')
     try {
-      const result = await api.post<{message?: string}>(
+      const result = await api.post<{
+        message?: string
+        dispatched?: Array<{itemIds?: string[]}>
+        waiting?: Array<{itemId?: string}>
+      }>(
         `/capture-cloud/orchestrations/${orchestrationId}/retry-items`,
         {
           requestKey: pendingKeywordRetry.current.requestKey,
           expectedRevision,
-          targetAgentId,
           itemIds,
+          assignments,
           confirmSafety,
         },
         {timeoutMs: 30_000},
       )
       pendingKeywordRetry.current = null
-      setKeywordRetryTargetAgentId('')
+      setKeywordRetryAgentOverrides({})
       setActionFeedback(
         result.message ||
-        `${keywordRetryItems.length} 个失败关键词已在原任务中重新下发`,
+        `${result.dispatched?.length || assignments.length} 个关键词已接力，${result.waiting?.length || 0} 个等待空闲 Agent 并将在槽位释放后自动接力`,
       )
       await load(true)
       await onChanged?.()
@@ -1448,7 +1473,7 @@ export function OrchestrationDetailWorkspace({
                         ? '该批次已完成结算，不会继续自动下发；请查看每次尝试的真实错误后决定是否新建补采任务。'
                         : orchestrationFinal && elasticPool
                           ? '该批次已经结算，页面不再把失败项误报为“正在自动恢复”。'
-                          : '此历史任务未启用自动接力，可选择原 Agent 或其他在线空闲 Agent 手工重试。'}
+                          : '默认每个失败关键词分配一台空闲 Agent；你可以在下方逐项覆盖。'}
                   </p>
                 </div>
               </div>
@@ -1462,35 +1487,109 @@ export function OrchestrationDetailWorkspace({
                 <span className="inline-flex min-h-9 items-center rounded-lg border border-border bg-muted/50 px-3 text-xs font-medium text-muted-foreground">
                   当前任务已结算，不会继续自动分配
                 </span>
-              ) : <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                <select
-                  aria-label="选择失败关键词重试 Agent"
-                  value={keywordRetryTargetAgentId || keywordRetryCandidates[0]?.id || ''}
-                  onChange={event => setKeywordRetryTargetAgentId(event.target.value)}
-                  disabled={!writable || keywordRetrying || keywordRetryCandidates.length === 0}
-                  className="h-9 min-w-52 max-w-full rounded-lg border border-border bg-background px-3 text-xs text-foreground outline-none focus:ring-2 focus:ring-primary"
-                >
-                  {keywordRetryCandidates.length === 0
-                    ? <option value="">没有在线空闲 Agent</option>
-                    : keywordRetryCandidates.map(agent => (
-                        <option key={agent.id} value={agent.id}>
-                          {agentName(agent)}
-                          {keywordRetrySourceAgentIds.has(agent.id) ? '（原 Agent）' : '（空闲 Agent）'}
-                        </option>
-                      ))}
-                </select>
+              ) : <div className="flex flex-col items-end gap-1">
                 <Button
                   size="sm"
                   onClick={() => void retryFailedKeywords()}
-                  disabled={!writable || keywordRetrying || keywordRetryCandidates.length === 0}
+                  disabled={!writable || keywordRetrying}
                 >
                   {keywordRetrying
                     ? <Loader2 className="h-4 w-4 animate-spin" />
                     : <Send className="h-4 w-4" />}
                   重试失败关键词
                 </Button>
+                {keywordRetryWaitingCount > 0 && (
+                  <span className={cn(
+                    'text-[11px]',
+                    keywordRetryDispatchableCount > 0
+                      ? 'text-muted-foreground'
+                      : 'text-status-red',
+                  )}>
+                    {keywordRetryDispatchableCount} 个现在接力，{keywordRetryWaitingCount} 个等待
+                    {keywordRetryStrictWaitingCount > 0
+                      ? `（其中 ${keywordRetryStrictWaitingCount} 个严格等待指定 Agent）`
+                      : '槽位释放后自动接力'}
+                  </span>
+                )}
               </div>}
             </div>
+            {!automaticKeywordRecoveryActive && !(orchestrationFinal && elasticPool) && (
+              <div className="mt-4 overflow-hidden rounded-xl border border-border bg-background/80">
+                <div className="hidden grid-cols-[minmax(0,1fr)_minmax(12rem,0.9fr)] gap-3 border-b border-border bg-muted/35 px-3 py-2 text-[11px] font-semibold text-muted-foreground sm:grid">
+                  <span>失败关键词</span>
+                  <span>单项执行 Agent</span>
+                </div>
+                {keywordRetryAllocation.map(allocation => {
+                  const overriddenElsewhere = new Set(
+                    Object.entries(keywordRetryAgentOverrides)
+                      .filter(([itemId]) => itemId !== allocation.item.id)
+                      .map(([, agentId]) => agentId),
+                  )
+                  return (
+                    <div
+                      key={allocation.item.id}
+                      className="grid grid-cols-1 gap-2 border-b border-border px-3 py-2.5 last:border-b-0 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,0.9fr)] sm:items-center sm:gap-3"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate text-xs font-medium text-foreground">
+                          {keywordForItem(allocation.item)}
+                        </p>
+                        <p className="mt-0.5 text-[10px] text-muted-foreground">
+                          {allocation.strictWaiting
+                            ? '已人工覆盖 · 指定 Agent 当前不可用，将严格等待'
+                            : allocation.overridden
+                              ? '已人工覆盖'
+                              : '自动分配预览'}
+                        </p>
+                      </div>
+                      <select
+                        aria-label={`为关键词 ${keywordForItem(allocation.item)} 选择重试 Agent`}
+                        value={keywordRetryAgentOverrides[allocation.item.id] || ''}
+                        onChange={event => setKeywordRetryAgentOverrides(current => ({
+                          ...current,
+                          [allocation.item.id]: event.target.value,
+                        }))}
+                        disabled={
+                          !writable ||
+                          keywordRetrying ||
+                          (
+                            keywordRetryCandidates.length === 0 &&
+                            !allocation.overrideAgentId
+                          )
+                        }
+                        className="h-9 min-w-0 rounded-lg border border-border bg-background px-2.5 text-xs text-foreground outline-none focus:ring-2 focus:ring-primary"
+                      >
+                        <option value="">
+                          {allocation.agent
+                            ? `自动 · ${agentName(allocation.agent)}`
+                            : '自动 · 等待槽位释放后接力'}
+                        </option>
+                        {allocation.strictWaiting && (
+                          <option value={allocation.overrideAgentId}>
+                            已指定 · 当前不可用（将严格等待）
+                          </option>
+                        )}
+                        {keywordRetryCandidates.map(agent => (
+                          <option
+                            key={agent.id}
+                            value={agent.id}
+                            disabled={overriddenElsewhere.has(agent.id)}
+                          >
+                            {agentName(agent)}
+                            {keywordRetrySourceAgentIds.has(agent.id) ? '（原 Agent）' : ''}
+                            {agent.todaySearches !== undefined
+                              ? ` · 今日搜索 ${agent.todaySearches}${agent.dailySearchLimit
+                                ? `/${agent.dailySearchLimit}`
+                                : ''}`
+                              : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
           </section>
         )}
         {negativePatrol && negativeReassignItems.length > 0 && (

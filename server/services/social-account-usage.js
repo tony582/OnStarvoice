@@ -659,6 +659,48 @@ async function resolveSocialAccountForUsageEvent(tx, agent, event) {
   return {id: account.id, observed};
 }
 
+export async function recordObservedSocialAgentAvailability(
+  tx,
+  {agent, account = null, observed = null} = {},
+) {
+  const normalized = normalizeObservedSocialAccount(observed);
+  if (
+    !agent?.id ||
+    !agent?.tenant_id ||
+    !account?.id ||
+    !normalized ||
+    normalized.loginState !== 'authenticated' ||
+    !isTrustedSocialAccountObservation(normalized)
+  ) {
+    return false;
+  }
+  await tx.execute(`
+    INSERT INTO social_agent_daily_usage (
+      tenant_id, agent_id, platform, usage_date,
+      searches, enhancements, capture_runs, captured_items,
+      failed_events, safety_verifications, last_event_at, last_safety_at
+    ) VALUES (
+      $1, $2, $3, $4::date,
+      0, 0, 0, 0,
+      0, 0, $5::timestamptz, NULL
+    )
+    ON CONFLICT (tenant_id, agent_id, platform, usage_date)
+    DO UPDATE SET
+      last_event_at = GREATEST(
+        social_agent_daily_usage.last_event_at,
+        EXCLUDED.last_event_at
+      ),
+      updated_at = now()
+  `, [
+    agent.tenant_id,
+    agent.id,
+    normalized.platform,
+    shanghaiDate(normalized.observedAt),
+    normalized.observedAt,
+  ]);
+  return true;
+}
+
 export async function processSocialAccountHeartbeat(
   tx,
   {
@@ -674,12 +716,17 @@ export async function processSocialAccountHeartbeat(
     const observed = normalizeObservedSocialAccount(item);
     if (!observed) continue;
     observedByPlatform.set(observed.platform, observed);
-    await ensureCurrentSocialAccount(
+    const account = await ensureCurrentSocialAccount(
       tx,
       agent,
       observed.platform,
       observed,
     );
+    await recordObservedSocialAgentAvailability(tx, {
+      agent,
+      account,
+      observed,
+    });
   }
 
   const acceptedUsageEventIds = [];

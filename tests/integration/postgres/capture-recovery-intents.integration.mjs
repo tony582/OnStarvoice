@@ -56,6 +56,35 @@ test('guarded recovery ledger is tenant-scoped, attempt-aware and restart-safe i
     'uniq_capture_task_items_id_tenant',
     'uniq_capture_tasks_id_tenant',
   ]);
+  const safetyColumns = await queryAll(`
+    SELECT table_name, column_name, column_default, is_nullable
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND (
+        (table_name = 'capture_task_items'
+          AND column_name = 'safety_handoff_count')
+        OR
+        (table_name = 'capture_recovery_intents'
+          AND column_name IN (
+            'safety_handoff_count',
+            'source_lineage_silent'
+          ))
+      )
+    ORDER BY table_name, column_name
+  `);
+  assert.deepEqual(
+    safetyColumns.map(row => [
+      row.table_name,
+      row.column_name,
+      row.column_default,
+      row.is_nullable,
+    ]),
+    [
+      ['capture_recovery_intents', 'safety_handoff_count', '0', 'NO'],
+      ['capture_recovery_intents', 'source_lineage_silent', 'false', 'NO'],
+      ['capture_task_items', 'safety_handoff_count', '0', 'NO'],
+    ],
+  );
 
   const authCode = await queryOne(`
     INSERT INTO auth_codes (tenant_id, code, status, expires_at)

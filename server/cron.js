@@ -16,6 +16,9 @@ import {
   reconcileElasticCaptureLeases,
   reconcilePendingCaptureCommands,
 } from './routes/capture-cloud.js';
+import {
+  reconcilePendingOrchestrationRetries,
+} from './routes/capture-orchestrations.js';
 import {createDrainController} from './runtime/drain-controller.js';
 
 const DEFAULT_JOBS = Object.freeze({
@@ -31,6 +34,7 @@ const DEFAULT_JOBS = Object.freeze({
   queryAll,
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
+  reconcilePendingOrchestrationRetries,
   reconcilePendingCaptureCommands,
   runOpsControlCycle,
 });
@@ -165,6 +169,17 @@ function schedulerDefinitions(jobs, logger) {
               logger,
               'log',
               `[Cron] Elastic work queue: ${elasticLeases.requeued} stale item(s) requeued`,
+            );
+          }
+          const pendingRetries =
+            await jobs.reconcilePendingOrchestrationRetries(10);
+          if (pendingRetries.dispatched > 0 || pendingRetries.failed > 0) {
+            safeLog(
+              logger,
+              'log',
+              `[Cron] Waiting retry continuation: ${pendingRetries.dispatched} dispatched, ` +
+              `${pendingRetries.waitingForAgent} waiting for Agent, ` +
+              `${pendingRetries.failed} failed`,
             );
           }
           // Transitional safety net: the selector excludes tenants whose new

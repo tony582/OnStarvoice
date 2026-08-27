@@ -283,6 +283,27 @@ test('allocation omits empty Agent groups and never emits a no-op command group'
   assert.ok(allocation.groups.every(group => group.keywords.length === 1));
 });
 
+test('scheduled fixed-batch commands carry the exact durable item-attempt identities', async () => {
+  const scheduler = await readFile(
+    new URL(
+      '../server/services/capture-orchestration-scheduler.js',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  const fixedStart = scheduler.indexOf('const itemsByAgent = new Map()');
+  assert.ok(fixedStart >= 0);
+  const fixed = scheduler.slice(fixedStart);
+  assert.match(fixed, /const itemAttemptBindings = groupItems\.map/u);
+  assert.match(fixed, /attemptId: crypto\.randomUUID\(\)/u);
+  assert.match(fixed, /itemAttempts: itemAttemptBindings/u);
+  assert.ok(
+    fixed.indexOf('INSERT INTO capture_task_item_attempts') <
+      fixed.indexOf('INSERT INTO capture_agent_commands'),
+    'the scheduler must persist attempts before publishing a claimable command',
+  );
+});
+
 test('request hash ignores idempotency labels and object key order but detects allocation changes', () => {
   const first = {
     requestKey: 'retry-1',
@@ -408,6 +429,23 @@ test('parent aggregate stays running during mixed progress and settles conservat
   assert.equal(stopped.status, 'canceled');
   assert.equal(stopped.progress.percent, 100);
   assert.equal(stopped.terminal, true);
+});
+
+test('retryPending capacity wait remains pending instead of becoming a failure', () => {
+  const waiting = aggregateParentTaskItems([
+    {status: 'completed'},
+    {status: 'retryable', metadata: {retryPending: true}},
+  ]);
+  assert.equal(waiting.status, 'pending');
+  assert.equal(waiting.counts.retryable, 1);
+  assert.equal(waiting.counts.retryWaiting, 1);
+  assert.equal(waiting.terminal, false);
+
+  const unresolved = aggregateParentTaskItems([
+    {status: 'retryable', metadata: {retryPending: true}},
+    {status: 'retryable', metadata: {}},
+  ]);
+  assert.equal(unresolved.status, 'needs_action');
 });
 
 test('migration adds parent/item audit fields without pretending to implement a lease or fence', async () => {

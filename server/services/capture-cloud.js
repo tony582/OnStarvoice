@@ -9,6 +9,10 @@ import {
   normalizeCaptureHealthStage,
   normalizeCaptureHealthTabStatus,
 } from './capture-health-schema.js';
+import {
+  normalizeCaptureLocalClosureEvidence,
+  normalizeCaptureLocalClosureEvidenceList,
+} from './capture-local-closure-proof.js';
 
 const CLOUD_TASK_STATUSES = new Set([
   'pending',
@@ -765,6 +769,21 @@ export function normalizeCloudTaskSnapshot(input = {}) {
   const metadata = removeCloudTaskHealthMetadataAliases(
     sanitizeCloudStructuredObject(task.metadata),
   );
+  // Local closure has exactly one authoritative top-level channel. Metadata
+  // aliases are removed before strictly normalized single/array reports are
+  // promoted. The legacy object remains supported for rolling upgrades.
+  delete metadata.localClosure;
+  delete metadata.local_closure;
+  delete metadata.localClosures;
+  delete metadata.local_closures;
+  const localClosure = normalizeCaptureLocalClosureEvidence(
+    task.localClosure ?? task.local_closure,
+  );
+  const localClosures = normalizeCaptureLocalClosureEvidenceList(
+    task.localClosures ?? task.local_closures,
+  );
+  if (localClosure) metadata.localClosure = localClosure;
+  if (localClosures.length > 0) metadata.localClosures = localClosures;
   const promoteMetadataField = (key, value) => {
     if (
       value === undefined ||
