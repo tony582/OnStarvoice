@@ -38,6 +38,7 @@ import {
   crossDeviceRetryTaskSupported,
   dispatchCrossDeviceRetry,
   elasticAttemptBudgetAfterOutcome,
+  expectedElasticKeywordSearches,
   projectElasticAttemptBudget,
   projectElasticBootstrapPacing,
   elasticRecoveryHoldRemainingMs,
@@ -517,7 +518,7 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     attemptCount: 99,
     safetyHandoffCount: 0,
     sourceLocalClosureProven: true,
-  }), "retryable");
+  }), "needs_action");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: 'needs_action',
@@ -530,7 +531,7 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "failed",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     attemptCount: 2,
-  }), "retryable");
+  }), "failed");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
@@ -617,6 +618,25 @@ test("elastic queue does not spend business retries on local capacity or dispatc
   assert.equal(firstBootstrapProjection.attemptBudget, 0);
   assert.equal(firstBootstrapProjection.technicalAttemptCount, 1);
   assert.equal(firstBootstrapProjection.technicalLimitReached, false);
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'failed',
+    error: {code: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED'},
+    attemptCount: 1,
+    technicalLimitReached: firstBootstrapProjection.technicalLimitReached,
+  }), 'retryable');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'failed',
+    error: {code: 'BUSINESS_CAPTURE_FAILED'},
+    attemptCount: 2,
+  }), 'failed');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'failed',
+    error: {code: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED'},
+    attemptCount: 2,
+  }), 'failed');
   const thirdBootstrapProjection = projectElasticAttemptBudget({
     attempt_count: 3,
     metadata: {
@@ -1633,6 +1653,21 @@ test("sequential Douyin checkpoints retain both passes and resume only the unfin
     },
     keyword: "别克壁纸",
   }), null);
+  assert.equal(expectedElasticKeywordSearches({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    keyword: "别克壁纸",
+  }), 2);
+  assert.equal(expectedElasticKeywordSearches({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    itemMetadata: {checkpoint: entries[0]},
+    keyword: "别克壁纸",
+  }), 1);
 });
 
 test("elastic sequential patrol keeps one bounded cross-agent handoff", () => {
@@ -2300,6 +2335,23 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /const attemptBudget[\s\S]*candidate\.attempt_budget_used/u);
   assert.match(claim, /attempt_count = \$1[\s\S]*attemptNumber,[\s\S]*attemptBudget/u);
   assert.match(claim, /elasticAttemptBudgetUsed/u);
+  assert.match(claim, /item\.attempt_count < \$3/u);
+  assert.match(claim, /freshCapabilities\.singleRelayV1 === true/u);
+  assert.match(claim, /requiresSingleRelay/u);
+  assert.match(claim, /waitingForSourceClosure/u);
+  assert.match(
+    claim,
+    /CASE[\s\S]*waitingForSourceClosure'[\s\S]*THEN 1[\s\S]*sourceClosureBlockedAt/u,
+  );
+  assert.match(claim, /loadVerifiedCaptureLocalClosureProof/u);
+  assert.match(claim, /item\.started_at AS item_started_at/u);
+  assert.match(
+    claim,
+    /const neverOpened =\s*!previousExecutionTaskId[\s\S]*!candidate\.item_started_at[\s\S]*attempt_count[\s\S]*!sourceAttempt/u,
+  );
+  assert.match(claim, /!neverOpened && localClosureProof\.proven !== true/u);
+  assert.match(claim, /status = 'retryable'[\s\S]*elastic_handoff_waiting_local_closure/u);
+  assert.match(claim, /expectedElasticKeywordSearches/u);
   assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
   assert.match(claim, /attemptIdentity,/u);
   assert.match(claim, /const itemAttemptBindings = \[\{/u);
@@ -2322,9 +2374,28 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /classifyCaptureRecoveryDisposition/u);
   assert.match(claim, /'manual_current'/u);
   assert.match(claim, /elasticRecoveryHoldRemainingMs\(recentRecoveryAttempt\)/u);
-  assert.match(claim, /recent_same_agent_attempt/u);
-  assert.match(claim, /recent_same_agent_attempt\.agent_id = \$2::uuid/u);
-  assert.match(claim, /ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS/u);
+  assert.match(
+    claim,
+    /parent\.metadata @> jsonb_build_object\([\s\S]*'eligibleAgentIds'[\s\S]*OR \([\s\S]*item\.status = 'retryable'[\s\S]*'relayAgentIds'/u,
+    'standby Agents may claim only a retryable item; fresh work stays in the plan pool',
+  );
+  assert.match(claim, /capture_task_item_attempts same_agent_attempt/u);
+  assert.match(claim, /same_agent_attempt\.agent_id = \$2::uuid/u);
+  const sameAgentFence = claim.match(
+    /AND NOT EXISTS \(\s*SELECT 1\s*FROM capture_task_item_attempts same_agent_attempt[\s\S]*?same_agent_attempt\.agent_id = \$2::uuid\s*\)/u,
+  )?.[0] || '';
+  assert.ok(sameAgentFence, 'the same-Agent attempt fence must be present');
+  assert.doesNotMatch(
+    sameAgentFence,
+    /updated_at/u,
+    'an Agent that already tried an item must never reclaim it after a cooldown',
+  );
+  assert.match(claim, /reserveCaptureResourceAdmission\(tx,/u);
+  assert.ok(
+    claim.indexOf('reserveCaptureResourceAdmission(tx,') <
+      claim.indexOf('const childTaskId = crypto.randomUUID()'),
+    'resource capacity must be reserved before a child task is created',
+  );
   assert.doesNotMatch(
     claim,
     /recovery[^\n]*nextEvaluationAt|nextEvaluationAt[^\n]*recovery/u,
@@ -2386,6 +2457,14 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   assert.match(lease, /child\.heartbeat_at/u);
   assert.match(lease, /elastic_task_heartbeat_timeout/u);
   assert.match(lease, /captureAgentLivenessOnline/u);
+  assert.match(lease, /loadVerifiedCaptureLocalClosureProof/u);
+  assert.match(lease, /elastic_stale_execution_waiting_local_closure/u);
+  assert.match(lease, /return 'waiting_local_closure'/u);
+  assert.ok(
+    lease.indexOf('loadVerifiedCaptureLocalClosureProof') <
+      lease.indexOf("SET status = 'failed'"),
+    'a stale execution must prove local closure before it can be requeued',
+  );
   assert.match(
     lease,
     /COALESCE\([\s\S]*agent\.last_liveness_at[\s\S]*'-infinity'::timestamptz[\s\S]*< now\(\)[\s\S]*AND COALESCE\([\s\S]*child\.heartbeat_at[\s\S]*child\.updated_at/u,
@@ -2809,6 +2888,23 @@ test("a newer unattended plan fences older active plan commands after idempotenc
   assert.match(createRoute, /eventType: 'plan_configuration_superseded'/u);
 });
 
+test("direct one-Agent tasks cannot inherit or submit elastic resource policy", () => {
+  const createRoute = readRouteSection(
+    "router.post('/agents/:id/tasks'",
+    "router.post('/tasks/:id/resume'",
+  );
+  assert.match(createRoute, /delete mirroredPlan\.resourcePolicy/u);
+  assert.match(createRoute, /delete mirroredPlan\.resource_policy/u);
+  assert.match(
+    createRoute,
+    /Object\.keys\(directResourcePolicy\)\.length > 0[\s\S]*capture_resource_policy_requires_elastic_schedule/u,
+  );
+  assert.ok(
+    createRoute.indexOf('delete mirroredPlan.resourcePolicy') <
+      createRoute.indexOf('const normalizedInput = normalizeRemoteTaskInput'),
+  );
+});
+
 test("a successful plan command supersedes only older needs-action configurations", async () => {
   const statements = [];
   await supersedeStalePlanConfigurationAttention({
@@ -3084,6 +3180,14 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
     maxRounds: 999,
     roundGapMin: -9,
     recoveryPolicy: {allowIdleAgentHandoff: false},
+    resourcePolicy: {
+      maxActive: 2,
+      maxActivePerHost: 1,
+      capacityGroup: 'shared-5g',
+      maxActiveInGroup: 1,
+      maxDailySearchesPerAgent: 20,
+      relayAgentIds: ['11111111-1111-4111-8111-111111111111'],
+    },
     nextRunAt,
   });
 
@@ -3104,6 +3208,14 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
   assert.deepEqual(normalized.planSnapshot.recoveryPolicy, {
     allowIdleAgentHandoff: false,
     platformSafetyMode: "manual_confirmed",
+  });
+  assert.deepEqual(normalized.planSnapshot.resourcePolicy, {
+    maxActive: 2,
+    maxActivePerHost: 1,
+    maxActiveInGroup: 1,
+    capacityGroup: 'shared-5g',
+    maxDailySearchesPerAgent: 20,
+    relayAgentIds: ['11111111-1111-4111-8111-111111111111'],
   });
   assert.equal(normalized.planSnapshot.nextRunAt, nextRunAt);
 
@@ -3617,7 +3729,17 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
     today_usage_last_event_at: null,
     today_searches: 0,
     daily_search_limit: 10,
-  }), false);
+  }), true);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_searches: 9,
+    daily_search_limit: 10,
+  }, 2), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_searches: 8,
+    daily_search_limit: 10,
+  }, 2), true);
   assert.equal(crossDeviceRetryAgentDailyUsageEligible({
     today_usage_current: true,
     today_usage_last_event_at: '2026-08-27T00:01:00.000Z',
@@ -3645,7 +3767,7 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
   );
   assert.match(
     idleAgentSelection,
-    /JOIN social_agent_daily_usage daily_usage/u,
+    /LEFT JOIN social_agent_daily_usage daily_usage/u,
   );
   assert.doesNotMatch(
     idleAgentSelection,
@@ -3655,25 +3777,39 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
     idleAgentSelection,
     /daily_usage\.usage_date =\s*\(now\(\) AT TIME ZONE 'Asia\/Shanghai'\)::date/u,
   );
-  assert.match(
+  assert.doesNotMatch(
     idleAgentSelection,
     /daily_usage\.last_event_at IS NOT NULL/u,
   );
-  assert.doesNotMatch(
+  assert.match(
     idleAgentSelection,
     /COALESCE\(daily_usage\.searches,\s*0\)/u,
   );
   assert.match(
     idleAgentSelection,
-    /daily_usage\.searches < current_social_account\.daily_search_limit/u,
+    /COALESCE\(daily_usage\.searches,\s*0\) \+ \$7::integer <=\s*current_social_account\.daily_search_limit/u,
+  );
+  assert.match(idleAgentSelection, /expectedSearches = 1/u);
+  assert.match(idleAgentSelection, /expectedSearches,/u);
+  assert.match(
+    idleAgentSelection,
+    /ORDER BY COALESCE\(daily_usage\.searches,\s*0\) ASC,\s*recent_technical_failure_count ASC/u,
   );
   assert.match(
     idleAgentSelection,
-    /ORDER BY daily_usage\.searches ASC,\s*recent_technical_failure_count ASC/u,
+    /FOR UPDATE OF ca/u,
   );
   assert.match(
     idleAgentSelection,
-    /FOR UPDATE OF ca, daily_usage/u,
+    /captureResourceAgentIds\([\s\S]*eligibleAgentIds:[\s\S]*resourcePolicy/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /cardinality\(\$6::uuid\[\]\) = 0 OR ca\.id = ANY\(\$6::uuid\[\]\)/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /reserveCaptureResourceAdmission\(tx,[\s\S]*resourcePolicy/u,
   );
   assert.equal(
     (idleAgentSelection.match(
@@ -3682,6 +3818,27 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
     2,
     'usage eligibility must be checked both before and after slot locking',
   );
+});
+
+test("resource admission serializes plan and shared-host capacity before dispatch", () => {
+  const admission = readRouteSection(
+    "async function reserveCaptureResourceAdmission",
+    "function dutyRecoveryGlobalActionsEnabled",
+  );
+  assert.match(admission, /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
+  assert.match(admission, /plan:\$\{parentTaskId\}/u);
+  assert.match(admission, /host:\$\{hostLabel\}/u);
+  assert.match(admission, /group:\$\{capacityGroup\}/u);
+  assert.match(admission, /FILTER \(WHERE parent_task_id = \$2\)::integer AS plan_active/u);
+  assert.match(admission, /FILTER \(WHERE host_label = \$3\)::integer AS host_active/u);
+  assert.match(admission, /FILTER \(WHERE capacity_group = \$7\)::integer AS group_active/u);
+  assert.match(admission, /capture_agent_commands active_command/u);
+  assert.match(admission, /active_command\.status IN \('pending', 'acknowledged'\)/u);
+  assert.match(admission, /social_agent_daily_usage daily_usage/u);
+  assert.match(admission, /projectCaptureResourceAdmission\(/u);
+  assert.match(admission, /todaySearches: counts\?\.today_searches/u);
+  assert.match(admission, /expectedSearches/u);
+  assert.match(admission, /dailySearchLimit: counts\?\.daily_search_limit/u);
 });
 
 test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", () => {
@@ -3695,6 +3852,21 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
   );
   assert.match(dispatchCore, /recoveryPhase = 'fast'/u);
   assert.match(
+    dispatchCore,
+    /retryDistributionMode === 'elastic_pool'[\s\S]*singleRelayV1: true[\s\S]*disableAutomaticSearchRetry: true/u,
+  );
+  assert.match(
+    dispatchCore,
+    /\.\.\.\(retryDistributionMode[\s\S]*distributionMode: retryDistributionMode/u,
+  );
+  assert.doesNotMatch(
+    dispatchCore,
+    /distributionMode: 'elastic_pool'/u,
+    'a fixed or promoted retry must not be mislabeled as an elastic queue claim',
+  );
+  assert.match(dispatchCore, /retry_source_local_closure_unproven/u);
+  assert.match(dispatchCore, /expectedSearches: expectedRetrySearches/u);
+  assert.match(
     captureCloudRouteSource,
     /crossDeviceRetrySourceReady\([\s\S]*dutyRecovery = false[\s\S]*if \(dutyRecovery\) return true/u,
   );
@@ -3705,6 +3877,14 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
   assert.match(dispatchCore, /expectedSourceAttemptId/u);
   assert.match(dispatchCore, /expectedAttemptNumber/u);
   assert.match(dispatchCore, /FOR UPDATE[\s\S]*source_attempt_changed/u);
+  assert.match(
+    dispatchCore,
+    /const sourceAttemptNumber = Math\.max\([\s\S]*currentSourceAttempt\?\.attempt_number[\s\S]*sourceItem\.attempt_count[\s\S]*sourceAttemptNumber >= AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT[\s\S]*AUTOMATIC_ATTEMPT_LIMIT_REACHED/u,
+  );
+  assert.doesNotMatch(
+    dispatchCore,
+    /crossDeviceRetrySafetyAgentIdsForItems/u,
+  );
   assert.match(dispatchCore, /code: 'NO_IDLE_AGENT'/u);
   assert.match(dispatchCore, /waitingForAgent: true/u);
   assert.match(dispatchCore, /code: 'SOURCE_EXECUTION_ACTIVE'/u);

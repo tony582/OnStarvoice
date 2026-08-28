@@ -92,6 +92,78 @@ test('elastic distribution is explicit and unknown values stay backward-compatib
       .distributionMode,
     'fixed_batch',
   );
+
+  const unattendedElastic = normalizeOrchestrationRequest({
+    platform: 'xiaohongshu',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    keywords: ['别克'],
+    agents: [{id: 'agent-a'}],
+    schedule: {mode: 'daily', startTime: '05:30'},
+    resourcePolicy: {
+      maxActive: 2,
+      maxActivePerHost: 3,
+      capacityGroup: 'shared-5g',
+      maxActiveInGroup: 1,
+      maxDailySearchesPerAgent: 20,
+      relayAgentIds: ['11111111-1111-4111-8111-111111111111'],
+    },
+  });
+  assert.equal(
+    unattendedElastic.taskInput.recoveryPolicy.disableAutomaticSearchRetry,
+    true,
+  );
+  assert.equal(
+    unattendedElastic.taskInput.recoveryPolicy.singleRelayV1,
+    true,
+  );
+  assert.deepEqual(unattendedElastic.taskInput.resourcePolicy, {
+    maxActive: 2,
+    maxActivePerHost: 3,
+    maxActiveInGroup: 1,
+    capacityGroup: 'shared-5g',
+    maxDailySearchesPerAgent: 20,
+    relayAgentIds: ['11111111-1111-4111-8111-111111111111'],
+  });
+});
+
+test('resource admission policy rejects invalid or non-elastic schedules', () => {
+  assert.throws(
+    () => normalizeOrchestrationRequest({
+      platform: 'xiaohongshu',
+      executionMode: 'unattended_plan',
+      distributionMode: 'fixed_batch',
+      resourcePolicy: {maxActive: 1},
+    }),
+    error => error?.code === 'capture_resource_policy_requires_elastic_schedule',
+  );
+  assert.throws(
+    () => normalizeOrchestrationRequest({
+      platform: 'xiaohongshu',
+      executionMode: 'unattended_plan',
+      distributionMode: 'elastic_pool',
+      resourcePolicy: {maxActive: 'many'},
+    }),
+    error => error?.code === 'invalid_capture_resource_policy',
+  );
+  assert.throws(
+    () => normalizeOrchestrationRequest({
+      platform: 'xiaohongshu',
+      executionMode: 'unattended_plan',
+      distributionMode: 'elastic_pool',
+      resourcePolicy: {maxActiv: 1},
+    }),
+    error => error?.code === 'invalid_capture_resource_policy',
+  );
+  assert.throws(
+    () => normalizeOrchestrationRequest({
+      platform: 'xiaohongshu',
+      executionMode: 'unattended_plan',
+      distributionMode: 'elastic_pool',
+      resourcePolicy: {maxActiveInGroup: 1},
+    }),
+    error => error?.code === 'invalid_capture_resource_policy',
+  );
 });
 
 test('Douyin unattended elastic plans allow one focused search after comprehensive', () => {
@@ -148,6 +220,23 @@ test('Douyin unattended elastic plans allow one focused search after comprehensi
     const normalized = normalizeOrchestrationRequest(input);
     assert.equal(Object.hasOwn(normalized.taskInput, 'searchPasses'), false);
   }
+});
+
+test('fixed plans keep the legacy retry contract even when search retry is disabled', () => {
+  const fixed = normalizeOrchestrationRequest({
+    platform: 'xiaohongshu',
+    executionMode: 'unattended_plan',
+    distributionMode: 'fixed_batch',
+    recoveryPolicy: {disableAutomaticSearchRetry: true},
+    keywords: ['别克'],
+    agents: [{id: 'agent-a'}],
+    schedule: {mode: 'daily', startTime: '05:30'},
+  });
+  assert.equal(fixed.taskInput.recoveryPolicy.disableAutomaticSearchRetry, true);
+  assert.equal(
+    Object.hasOwn(fixed.taskInput.recoveryPolicy, 'singleRelayV1'),
+    false,
+  );
 });
 
 test('non-patrol search filters remain single-choice even when an API sends arrays', () => {
@@ -560,6 +649,11 @@ test('elastic schedule occurrences materialize pending work without preassigning
   assert.match(scheduler, /capture_orchestration_schedule_agents/u);
   assert.match(scheduler, /eligibleAgentIds/u);
   assert.match(scheduler, /distributionMode === 'elastic_pool' \? 'pending' : 'assigned'/u);
+  assert.match(
+    scheduler,
+    /distributionMode === 'elastic_pool'[\s\S]*disableAutomaticSearchRetry: true/u,
+  );
+  assert.match(scheduler, /singleRelayV1: true/u);
   const elasticStart = scheduler.indexOf("if (distributionMode === 'elastic_pool')");
   const fixedDispatch = scheduler.indexOf('const itemsByAgent = new Map()', elasticStart);
   assert.ok(elasticStart >= 0);
@@ -598,6 +692,7 @@ test('sequential patrol stays one keyword item and is executed inside one Agent 
   assert.match(refresh, /status = 'needs_action'[\s\S]*status = 'retryable'[\s\S]*disableAutomaticSearchRetry/u);
   assert.doesNotMatch(refresh, /staged_patrol_predecessor_not_safe/u);
   assert.match(agent, /remoteSequentialSearchPassesV1: true/u);
+  assert.match(agent, /singleRelayV1: true/u);
 });
 
 test('terminal or attention-only schedule residue never blocks the next occurrence', async () => {

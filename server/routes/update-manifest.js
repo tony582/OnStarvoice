@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.95',
+  latestVersion: '0.3.96',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-27',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.95-20260827.zip',
+  releaseDate: '2026-08-28',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.96-20260828.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.96',
+      releaseDate: '2026-08-28',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '云端任务不再重复提交同一搜索轮次',
+              desc: '无人值守的每个配置搜索轮次只提交一次；慢页面继续在原页面等待，确认失败后才允许换一台设备接力一次。抖音综合与图文仍是两个串行轮次，手动 Extension 搜索保持原有行为。',
+            },
+            {
+              title: '失败关键词最多自动接力一次',
+              desc: '接力只能选择未执行过该关键词、兼容、空闲且当日低用量的 Agent；第二次仍失败即转人工，不再同设备循环或无限换账号。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '支持按物理电脑和共享网络限流',
+              desc: '启用该策略的弹性无人值守计划可分别限制单次并发、同一物理电脑并发和共享 5G 网络并发；抖音综合与图文仍在同一设备串行完成。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.95',
       releaseDate: '2026-08-27',

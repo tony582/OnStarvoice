@@ -15701,6 +15701,7 @@ export async function batchCaptureByKeywords({
   searchFilters = null,
   disableAutomaticSearchRetry = false,
   requireVerifiedFilters = false,
+  initialSearchEvidence = null,
   afterKeywordCapture = null,
   onKeywordSettled = null,
   waitForegroundTabId = null,
@@ -15819,6 +15820,13 @@ export async function batchCaptureByKeywords({
   let fatal = false;
   let recoveryRequired = false;
   let blockingError = null;
+  const reusableInitialSearchEvidence =
+    initialSearchEvidence &&
+    typeof initialSearchEvidence === 'object' &&
+    !Array.isArray(initialSearchEvidence)
+      ? initialSearchEvidence
+      : null;
+  let initialSearchEvidenceConsumed = false;
   const resolveKeywordFailure = (...values) => {
     const candidates = values.filter(Boolean);
     const structured = candidates
@@ -15993,23 +16001,59 @@ export async function batchCaptureByKeywords({
       }
       // 构建搜索 URL
       const searchUrl = buildKeywordSearchUrl(keyword, platform, baseSearchUrl);
+      const reuseInitialSearch = Boolean(
+        !initialSearchEvidenceConsumed &&
+        reusableInitialSearchEvidence?.ready === true &&
+        String(reusableInitialSearchEvidence.keyword || '').trim() === keyword &&
+        String(reusableInitialSearchEvidence.platform || '').trim() === platform &&
+        Number(reusableInitialSearchEvidence.tabId) === runnerTabId &&
+        (
+          !isDouyinPlatform(platform) ||
+          reusableInitialSearchEvidence.navigationTransitionAccepted === true ||
+          reusableInitialSearchEvidence.submitAccepted === true
+        )
+      );
+      if (reuseInitialSearch) {
+        initialSearchEvidenceConsumed = true;
+      }
 
       let douyinSearchTransition = null;
       if (isDouyinPlatform(platform)) {
-        douyinSearchTransition = await switchDouyinKeywordSearchInTab(
-          runnerTabId,
-          keyword,
-          searchUrl,
-          shouldStop,
-        );
+        douyinSearchTransition = reuseInitialSearch
+          ? {
+              baselineCaptured:
+                reusableInitialSearchEvidence.baselineCaptured === true,
+              previousWorkIds: Array.isArray(
+                reusableInitialSearchEvidence.previousWorkIds,
+              )
+                ? reusableInitialSearchEvidence.previousWorkIds
+                : [],
+              submitAccepted:
+                reusableInitialSearchEvidence.submitAccepted === true,
+              submissionNonce: String(
+                reusableInitialSearchEvidence.submissionNonce || '',
+              ),
+              navigationTransitionAccepted:
+                reusableInitialSearchEvidence.navigationTransitionAccepted ===
+                true,
+            }
+          : await switchDouyinKeywordSearchInTab(
+              runnerTabId,
+              keyword,
+              searchUrl,
+              shouldStop,
+            );
         await waitForDouyinSearchPacingWindow(
           runnerTabId,
           shouldStop,
           {phase: 'search'},
         );
       } else {
-        // 导航到搜索页
-        await navigateToSearchUrl(runnerTabId, searchUrl, shouldStop);
+        // The unattended bootstrap already opened the first keyword. Reuse
+        // that exact bound tab once; later keywords still navigate normally.
+        if (!reuseInitialSearch) {
+          await navigateToSearchUrl(runnerTabId, searchUrl, shouldStop);
+        }
       }
       if (captureTaskId) {
         await setCaptureTaskTakeoverStateInTab({
@@ -17785,7 +17829,7 @@ async function readDouyinSearchWorkIdsInTab(tabId) {
     .catch(() => ({captured: false, workIds: []}));
 }
 
-async function beginDouyinSearchResultTransitionInTab(
+export async function beginDouyinSearchResultTransitionInTab(
   tabId,
   keyword = '',
 ) {
@@ -17933,7 +17977,7 @@ async function beginDouyinSearchResultTransitionInTab(
   });
 }
 
-async function readDouyinSearchDocumentGenerationInTab(tabId) {
+export async function readDouyinSearchDocumentGenerationInTab(tabId) {
   const normalizedTabId = Number(tabId);
   if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
     return null;

@@ -5,7 +5,9 @@ import test from 'node:test';
 import {
   CAPTURE_RECOVERY_ACTIONS_GLOBAL_ENV,
   CAPTURE_RECOVERY_AGENT_SLOT_SOURCE_TYPE,
+  CAPTURE_RECOVERY_FAST_ATTEMPT_LIMIT,
   CAPTURE_RECOVERY_LOCAL_CLOSURE_RECHECK_MS,
+  CAPTURE_RECOVERY_MAX_GENERATIONS,
   CAPTURE_RECOVERY_VERIFY_DELAY_MS,
   CAPTURE_RECOVERY_WAITING_AGENT_BACKOFF_MS,
   buildCaptureRecoveryKey,
@@ -1311,9 +1313,11 @@ test('source fingerprints replay one failure while generation keys remain determ
   }));
 });
 
-test('generation backoff is fixed at immediate, 30 and 60 minutes inside one hard window', () => {
+test('duty recovery allows one immediate generation and clamps overflow to that policy', () => {
   const now = new Date('2026-08-25T01:00:00.000Z');
   const windowEndsAt = '2026-08-25T03:00:00.000Z';
+  assert.equal(CAPTURE_RECOVERY_FAST_ATTEMPT_LIMIT, 2);
+  assert.equal(CAPTURE_RECOVERY_MAX_GENERATIONS, 1);
   assert.equal(
     captureRecoveryGenerationAvailableAt({generation: 1, now, windowEndsAt})
       .toISOString(),
@@ -1322,12 +1326,12 @@ test('generation backoff is fixed at immediate, 30 and 60 minutes inside one har
   assert.equal(
     captureRecoveryGenerationAvailableAt({generation: 2, now, windowEndsAt})
       .toISOString(),
-    '2026-08-25T01:30:00.000Z',
+    '2026-08-25T01:00:00.000Z',
   );
   assert.equal(
     captureRecoveryGenerationAvailableAt({generation: 3, now, windowEndsAt})
       .toISOString(),
-    '2026-08-25T02:00:00.000Z',
+    '2026-08-25T01:00:00.000Z',
   );
   assert.equal(
     captureRecoveryGenerationAvailableAt({
@@ -1344,7 +1348,7 @@ test('generation backoff is fixed at immediate, 30 and 60 minutes inside one har
       now,
       windowEndsAt: '2026-08-25T01:20:00.000Z',
     }).toISOString(),
-    '2026-08-25T01:20:00.000Z',
+    '2026-08-25T01:00:00.000Z',
   );
 });
 
@@ -1666,7 +1670,7 @@ test('durable intent claims use skip-locked leases and bounded claim metadata', 
   assert.equal(claimed.deferred.length, 0);
 });
 
-test('generation hard budget persists a waiting-human boundary on the latest intent', async () => {
+test('a second duty generation persists a waiting-human boundary on the first intent', async () => {
   const statements = [];
   const result = await ingestCaptureRecoveryItem({
     tenantId,
@@ -1696,7 +1700,7 @@ test('generation hard budget persists a waiting-human boundary on the latest int
         if (/ORDER BY generation DESC/u.test(sql)) {
           return {
             id: intentId,
-            generation: 3,
+            generation: 1,
             stage: 'search_ready',
             status: 'waiting_due',
             action_count: 1,
@@ -1707,7 +1711,7 @@ test('generation hard budget persists a waiting-human boundary on the latest int
         if (/SET status = 'waiting_human'/u.test(sql)) {
           return {
             id: intentId,
-            generation: 3,
+            generation: 1,
             status: 'waiting_human',
             decision: 'human_required',
           };
@@ -1877,7 +1881,7 @@ test('no idle Agent becomes WAITING_AGENT without spending action or generation 
     tenantId,
     intent: {
       id: intentId,
-      generation: 2,
+      generation: 1,
       stage: 'detail_capture',
       fault_class: 'network_local',
     },
@@ -1891,12 +1895,12 @@ test('no idle Agent becomes WAITING_AGENT without spending action or generation 
     }),
     queryOne: async (sql, params) => {
       if (/FROM capture_recovery_intents intent/u.test(sql)) {
-        return recoveryCandidateRow({generation: 2});
+        return recoveryCandidateRow({generation: 1});
       }
       writes.push({sql, params});
       return {
         id: intentId,
-        generation: 2,
+        generation: 1,
         status: params[3],
         decision: params[4],
         decision_payload: JSON.parse(params[5]),

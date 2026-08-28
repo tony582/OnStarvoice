@@ -1,4 +1,8 @@
 import crypto from 'node:crypto';
+import {
+  normalizeCaptureResourcePolicy,
+  validateCaptureResourcePolicy,
+} from './capture-resource-policy.js';
 
 const PLATFORM_ALIASES = Object.freeze({
   xhs: 'xiaohongshu',
@@ -473,6 +477,18 @@ export function normalizeOrchestrationRequest(
     ...(requireVerifiedFilters ? {requireVerifiedFilters: true} : {}),
     platformSafetyMode: 'manual_confirmed',
   };
+  const rawResourcePolicy =
+    source.resourcePolicy ?? source.resource_policy ?? {};
+  const resourcePolicyValidation = validateCaptureResourcePolicy(
+    rawResourcePolicy,
+  );
+  if (!resourcePolicyValidation.valid) {
+    throw scheduleError(
+      'invalid_capture_resource_policy',
+      '采集并发策略格式无效，请检查计划并发、共享网络组和接力节点',
+    );
+  }
+  const resourcePolicy = normalizeCaptureResourcePolicy(rawResourcePolicy);
   const rawDistributionMode = text(
     source.distributionMode || source.distribution_mode || 'fixed_batch',
     40,
@@ -480,6 +496,15 @@ export function normalizeOrchestrationRequest(
   const distributionMode = rawDistributionMode === 'elastic_pool'
     ? 'elastic_pool'
     : 'fixed_batch';
+  if (
+    Object.keys(resourcePolicy).length > 0 &&
+    !(executionMode === 'unattended_plan' && distributionMode === 'elastic_pool')
+  ) {
+    throw scheduleError(
+      'capture_resource_policy_requires_elastic_schedule',
+      '采集并发策略仅适用于弹性节点池无人值守计划',
+    );
+  }
   const platform = normalizePlatform(source.platform);
   const baseContentType = readFilter('contentType');
   const searchPasses = normalizeSequentialSearchPasses(
@@ -495,6 +520,14 @@ export function normalizeOrchestrationRequest(
   const effectiveSearchPasses = sequentialSearchEnabled
     ? searchPasses
     : [baseContentType || 'all'];
+  // Cloud elastic work is retried by assigning the failed item to one
+  // different Agent. Re-submitting the same search inside the first browser
+  // duplicates platform traffic and is especially harmful on a shared 5G
+  // link, so every elastic item gets one complete local search only.
+  if (executionMode === 'unattended_plan' && distributionMode === 'elastic_pool') {
+    recoveryPolicy.disableAutomaticSearchRetry = true;
+    recoveryPolicy.singleRelayV1 = true;
+  }
   if (sequentialSearchEnabled) {
     recoveryPolicy.disableAutomaticSearchRetry = true;
     recoveryPolicy.requireVerifiedFilters = true;
@@ -534,6 +567,7 @@ export function normalizeOrchestrationRequest(
       roundGapMin: schedule?.roundGapMin || 10,
       ...(sequentialSearchEnabled ? {searchPasses: effectiveSearchPasses} : {}),
       recoveryPolicy,
+      ...(Object.keys(resourcePolicy).length > 0 ? {resourcePolicy} : {}),
       ...(schedule ? schedule : {}),
       ...(hasCaptureSettings
         ? {captureSettings: normalizeCaptureSettings(source.captureSettings)}

@@ -2262,6 +2262,7 @@ test("a new unattended attempt never rewrites an older attempt tab", async () =>
 
 test("a settled targeted-post update closes only its exact runner after report and ledger persistence", async () => {
   const harness = createHarness();
+  const recentAt = new Date(Date.now() - 5_000).toISOString();
   const request = buildTargetedPostRequest({
     id: "targeted-close-request",
     clientTaskId: "targeted-close-request",
@@ -2269,6 +2270,9 @@ test("a settled targeted-post update closes only its exact runner after report a
     attemptId: "targeted-close-attempt",
     cloudCommandId: "targeted-close-command",
     platform: "xiaohongshu",
+    createdAt: recentAt,
+    updatedAt: recentAt,
+    heartbeatAt: recentAt,
   });
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {
@@ -2331,7 +2335,7 @@ test("a settled targeted-post update closes only its exact runner after report a
     attemptId: request.attemptId,
     patch: {
       status: "completed",
-      finishedAt: "2026-07-29T00:00:05.000Z",
+      finishedAt: new Date().toISOString(),
       message: "定向巡检已完成",
     },
   });

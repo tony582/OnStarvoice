@@ -1684,6 +1684,7 @@ function createBatchHarness({
       afterKeywordCapture: options.afterKeywordCapture ?? afterKeywordCapture,
       onKeywordSettled: async (payload) => settled.push(payload),
       onProgress: (payload) => progress.push(payload),
+      initialSearchEvidence: options.initialSearchEvidence || null,
       searchFilters: options.searchFilters || null,
       disableAutomaticSearchRetry:
         options.disableAutomaticSearchRetry === true,
@@ -1713,6 +1714,116 @@ function successCapture(keyword) {
     savedRecords: [],
   };
 }
+
+test("XHS reuses the exact unattended bootstrap search once", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+  });
+
+  const result = await harness.run({
+    platform: "xiaohongshu",
+    keywords: ["词1"],
+    initialSearchEvidence: {
+      ready: true,
+      keyword: "词1",
+      platform: "xiaohongshu",
+      tabId: 101,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.captureCalls.length, 1);
+  assert.equal(harness.navigationCalls.length, 0);
+});
+
+test("Douyin reuses the exact unattended bootstrap transition once", async () => {
+  const readinessCalls = [];
+  const previousWorkIds = ["766193585000009991"];
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+    waitForResults: async (options) => {
+      readinessCalls.push(options);
+      return true;
+    },
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1"],
+    initialSearchEvidence: {
+      ready: true,
+      keyword: "词1",
+      platform: "douyin",
+      tabId: 101,
+      baselineCaptured: true,
+      previousWorkIds,
+      submitAccepted: true,
+      submissionNonce: "bootstrap-submit",
+      navigationTransitionAccepted: false,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.captureCalls.length, 1);
+  assert.equal(harness.navigationCalls.length, 0);
+  assert.equal(harness.submitCalls.length, 0);
+  assert.deepEqual(readinessCalls[0].previousWorkIds, previousWorkIds);
+  assert.equal(readinessCalls[0].submitAccepted, true);
+  assert.equal(readinessCalls[0].submissionNonce, "bootstrap-submit");
+  assert.deepEqual(
+    harness.pacingCalls.map((entry) => entry.phase),
+    ["search"],
+  );
+});
+
+test("Douyin bootstrap identity without navigation proof performs one real search", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+  });
+
+  const result = await harness.run({
+    platform: "douyin",
+    keywords: ["词1"],
+    initialSearchEvidence: {
+      ready: true,
+      keyword: "词1",
+      platform: "douyin",
+      tabId: 101,
+      baselineCaptured: true,
+      previousWorkIds: ["766193585000009991"],
+      submitAccepted: false,
+      navigationTransitionAccepted: false,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.captureCalls.length, 1);
+  assert.equal(harness.navigationCalls.length, 1);
+});
+
+test("bootstrap search evidence is rejected when its bound tab does not match", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) =>
+      successCapture(captureParams.keyword),
+  });
+
+  const result = await harness.run({
+    platform: "xiaohongshu",
+    keywords: ["词1"],
+    initialSearchEvidence: {
+      ready: true,
+      keyword: "词1",
+      platform: "xiaohongshu",
+      tabId: 202,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(harness.navigationCalls.length, 1);
+});
 
 test("Douyin restores a paced settle window after search and filtering", async () => {
   const harness = createBatchHarness({

@@ -121,6 +121,20 @@ test('allocation preview uses deterministic balanced groups and validates compat
   );
   assert.match(compatibility, /ORDER BY ca\.id/u);
   assert.match(compatibility, /agentCompatibilityFailure/u);
+  assert.match(
+    compatibility,
+    /normalizeCaptureResourcePolicy\([\s\S]*resourcePolicy[\s\S]*relayAgentIds/u,
+  );
+  assert.match(compatibility, /const allAgentIds = Array\.from\(new Set/u);
+  assert.match(compatibility, /byId\.size !== allAgentIds\.length/u);
+  assert.match(compatibility, /includeRelayPool = true/u);
+  assert.match(compatibility, /const relayAgentIds = includeRelayPool/u);
+  const compatibilityContract = section(
+    'function agentCompatibilityFailure',
+    'async function loadCompatibleAgents',
+  );
+  assert.match(compatibilityContract, /singleRelayV1/u);
+  assert.match(compatibilityContract, /agent_single_relay_capability_missing/u);
 });
 
 test('dispatch is revision-CAS protected and locks parent, items, then agents', () => {
@@ -283,6 +297,14 @@ test('schedule edit updates the same template with revision protection and leave
   assert.match(edit, /eventType: 'orchestration_schedule_updated'/u);
   assert.match(edit, /已生成的运行批次保持不变/u);
   assert.match(edit, /修改从下一次运行开始生效/u);
+  assert.match(edit, /existingPlanSnapshot: safeJson\(schedule\.plan_snapshot\)/u);
+  const normalizeEdit = section(
+    'function normalizeScheduleUpdate',
+    'async function appendEvent',
+  );
+  assert.match(normalizeEdit, /carriesResourcePolicy/u);
+  assert.match(normalizeEdit, /preservedResourcePolicy/u);
+  assert.match(normalizeEdit, /rawDistributionMode === 'elastic_pool'/u);
 });
 
 test('schedule pause and resume are tenant scoped, idempotent, and never backfill missed runs', () => {
@@ -362,6 +384,11 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   assert.match(handoff, /handoff_disabled_by_task_policy/u);
   assert.match(
     handoff,
+    /\{lock: true, includeRelayPool: false\}/u,
+    'an explicit handoff must not be blocked by an unselected relay node',
+  );
+  assert.match(
+    handoff,
     /SET status = 'failed'[\s\S]*'code', 'handoff_source_security_item_failed'/u,
   );
   assert.match(
@@ -401,6 +428,7 @@ test('failed keyword retry atomically shards each item to a distinct idle Agent 
     "router.post(\n  '/orchestrations/:id/resolve-attention'",
   );
   assert.match(retry, /normalizeRetryItems/u);
+  assert.match(retry, /\{includeRelayPool: false\}/u);
   assert.match(retry, /action: 'retry_items_atomic_shard'/u);
   assert.match(retry, /metadata->>'retryRequestKey'/u);
   assert.match(retry, /existingTasks\.every/u);
@@ -462,6 +490,29 @@ test('failed keyword retry atomically shards each item to a distinct idle Agent 
   assert.doesNotMatch(waitingSet, /attempt_count\s*=/u);
   assert.doesNotMatch(waitingSet, /assigned_agent_id\s*=/u);
   assert.doesNotMatch(waitingSet, /execution_task_id\s*=/u);
+});
+
+test('elastic retries have one owner and cannot fall back to the legacy child creator', () => {
+  const retry = section(
+    "router.post(\n  '/orchestrations/:id/retry-items'",
+    "router.post(\n  '/orchestrations/:id/resolve-attention'",
+  );
+  const previewGate = retry.indexOf('if (elasticQueueOwnsRetry(parentPreview))');
+  const replayRead = retry.indexOf('const existingTasks =');
+  const childInsert = retry.indexOf('INSERT INTO capture_tasks');
+  assert.ok(previewGate >= 0);
+  assert.ok(replayRead > previewGate);
+  assert.ok(childInsert > replayRead);
+  assert.match(retry, /retry_items_managed_by_elastic_dispatcher/u);
+
+  const lockedParent = retry.indexOf('parentSelect({lock: true})');
+  const lockedGate = retry.indexOf(
+    'if (elasticQueueOwnsRetry(parent))',
+    lockedParent,
+  );
+  assert.ok(lockedParent >= 0);
+  assert.ok(lockedGate > lockedParent);
+  assert.ok(lockedGate < childInsert);
 });
 
 test('four retry items with three ranked idle Agents dispatch three and preserve one waiting', async () => {
@@ -556,6 +607,12 @@ test('retryPending has a bounded deterministic consumer on the existing recovery
   assert.match(dispatch, /retryWaitingLastCheckedAt/u);
   assert.match(dispatch, /excludedItemIds/u);
   assert.match(dispatch, /safety_confirmation_missing/u);
+  const invalidation = section(
+    'function retryPendingInvalidationReason',
+    'async function invalidateLockedPendingRetryMarker',
+  );
+  assert.match(invalidation, /elasticQueueOwnsRetry\(parent\)/u);
+  assert.match(invalidation, /elastic_queue_retry_managed/u);
   assert.match(dispatch, /aggregateParentTaskItems\(refreshedItems\)/u);
   assert.match(dispatch, /lastRetryWaitingInvalidatedCount/u);
   assert.match(

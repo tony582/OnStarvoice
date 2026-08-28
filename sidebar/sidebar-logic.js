@@ -46,6 +46,8 @@ import {
   batchCaptureByUrls,
   lightSampleByKeywords,
   captureTabContent,
+  beginDouyinSearchResultTransitionInTab,
+  readDouyinSearchDocumentGenerationInTab,
   beginCaptureTaskSession,
   updateCaptureTaskSession,
   endCaptureTaskSession,
@@ -13577,6 +13579,12 @@ async function handleBatchKeywordCapture(options = {}) {
     runOptions.disableAutomaticSearchRetry === true;
   const requireVerifiedFilters =
     runOptions.requireVerifiedFilters === true;
+  let bootstrapInitialSearchEvidence =
+    runOptions.initialSearchEvidence &&
+    typeof runOptions.initialSearchEvidence === "object" &&
+    !Array.isArray(runOptions.initialSearchEvidence)
+      ? runOptions.initialSearchEvidence
+      : null;
   const sequentialSearchPasses = normalizeUnattendedSearchPasses({
     searchPasses: runOptions.searchPasses,
     searchFilters: runOptions.searchFilters,
@@ -14413,9 +14421,15 @@ async function handleBatchKeywordCapture(options = {}) {
         maxAttempts: maxKeywordAttempts,
         runAttempt: async ({keywords: attemptKeywords, attempt}) => {
           keywordAttempt = attempt;
+          const attemptInitialSearchEvidence =
+            attempt === 1 ? bootstrapInitialSearchEvidence : null;
+          // A bootstrap navigation proves exactly one search operation. Never
+          // let a later local retry or search pass reuse that old page proof.
+          bootstrapInitialSearchEvidence = null;
           const attemptResult = await batchCaptureByKeywords({
             ...baseBatchOptions,
             keywords: attemptKeywords,
+            initialSearchEvidence: attemptInitialSearchEvidence,
           });
           return attemptResult;
         },
@@ -17740,6 +17754,16 @@ async function navigateActiveTabToKeywordSearchForPlan({
         preferredWindowId = Number(targetTab.windowId);
       }
       try {
+        const [previousDocumentGeneration, douyinSearchTransition] =
+          platform === "douyin"
+            ? await Promise.all([
+                readDouyinSearchDocumentGenerationInTab(originalTargetTabId),
+                beginDouyinSearchResultTransitionInTab(
+                  originalTargetTabId,
+                  keyword,
+                ),
+              ])
+            : [null, null];
         if (
           Number.isFinite(Number(targetTab.windowId)) &&
           Number(targetTab.windowId) >= 0
@@ -17758,7 +17782,7 @@ async function navigateActiveTabToKeywordSearchForPlan({
         }
         const readyState = await waitForActiveTabReady(
           preferredTabId,
-          15000,
+          platform === "douyin" ? 45000 : 15000,
           {
             windowId: targetTab.windowId,
             platform,
@@ -17782,6 +17806,7 @@ async function navigateActiveTabToKeywordSearchForPlan({
               tabId: preferredTabId,
               expectedUrl: searchUrl,
               expectedKeyword: keyword,
+              timeoutMs: platform === "douyin" ? 15000 : 8000,
               shouldStop,
             })
           : false;
@@ -17791,6 +17816,33 @@ async function navigateActiveTabToKeywordSearchForPlan({
             stoppedError.code = "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
             throw stoppedError;
           }
+          const currentDocumentGeneration =
+            platform === "douyin"
+              ? await readDouyinSearchDocumentGenerationInTab(preferredTabId)
+              : null;
+          const navigationTransitionAccepted = Boolean(
+            platform === "douyin" &&
+              Number(previousDocumentGeneration?.timeOrigin) > 0 &&
+              Number(currentDocumentGeneration?.timeOrigin) > 0 &&
+              Number(previousDocumentGeneration.timeOrigin) !==
+                Number(currentDocumentGeneration.timeOrigin) &&
+              currentDocumentGeneration?.readyState === "complete",
+          );
+          const submitAccepted = Boolean(
+            platform === "douyin" &&
+              String(douyinSearchTransition?.submissionNonce || "").trim(),
+          );
+          if (
+            platform === "douyin" &&
+            !navigationTransitionAccepted &&
+            !submitAccepted
+          ) {
+            const proofError = new Error(
+              "抖音搜索页已打开，但无法确认这次搜索操作，已停止以免重复搜索或误采旧结果",
+            );
+            proofError.code = "UNATTENDED_SEARCH_BOOTSTRAP_PROOF_MISSING";
+            throw proofError;
+          }
           return {
             tabId: preferredTabId,
             tab: readyState.tab,
@@ -17798,6 +17850,25 @@ async function navigateActiveTabToKeywordSearchForPlan({
             url: String(readyState.tab?.url || searchUrl),
             attemptCount: attempt,
             recovered: attempt > 1,
+            initialSearchEvidence: {
+              ready: true,
+              keyword: String(keyword || "").trim(),
+              platform,
+              tabId: preferredTabId,
+              pageUrl: String(readyState.tab?.url || searchUrl),
+              baselineCaptured:
+                douyinSearchTransition?.baselineCaptured === true,
+              previousWorkIds: Array.isArray(
+                douyinSearchTransition?.previousWorkIds,
+              )
+                ? douyinSearchTransition.previousWorkIds
+                : [],
+              submissionNonce: String(
+                douyinSearchTransition?.submissionNonce || "",
+              ).trim(),
+              submitAccepted,
+              navigationTransitionAccepted,
+            },
           };
         }
         lastError = new Error("搜索结果页尚未就绪，无法启动无人值守采集");
@@ -18156,6 +18227,23 @@ async function runUnattendedKeywordPlanRequest(request) {
       requestAttemptId ===
         String(activeUnattendedRunAttemptId || "").trim());
   const plan = request?.planSnapshot || {};
+  // Only the cloud elastic single-relay contract collapses local recovery to
+  // one complete browser run. Legacy local schedules retain their proven
+  // bounded recovery, while manual Extension searches never enter this path.
+  const singleRelayMode =
+    request?.cloudAssigned === true &&
+    request?.orchestrationContext?.distributionMode === "elastic_pool" &&
+    plan.recoveryPolicy?.singleRelayV1 === true &&
+    plan.recoveryPolicy?.disableAutomaticSearchRetry === true;
+  const localKeywordMaxAttempts = singleRelayMode
+    ? 1
+    : UNATTENDED_KEYWORD_MAX_ATTEMPTS;
+  const localBootstrapMaxAttempts = singleRelayMode
+    ? 1
+    : UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS;
+  const localCaptureSessionMaxAttempts = singleRelayMode
+    ? 1
+    : UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS;
   const keywords = dedupeKeywords(
     Array.isArray(plan.keywords) ? plan.keywords : [],
   ).slice(0, MAX_BATCH_KEYWORDS);
@@ -18517,18 +18605,18 @@ async function runUnattendedKeywordPlanRequest(request) {
       let lastError = null;
       for (
         let attempt = 1;
-        attempt <= UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS;
+        attempt <= localCaptureSessionMaxAttempts;
         attempt += 1
       ) {
         const attemptMessage =
           attempt === 1
             ? "正在建立浏览器采集接管"
-            : `正在第 ${attempt}/${UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS} 次建立浏览器采集接管`;
+            : `正在第 ${attempt}/${localCaptureSessionMaxAttempts} 次建立浏览器采集接管`;
         await reportAutomaticRecoveryStage({
           phase: "starting_capture_session",
           message: attemptMessage,
           attemptCurrent: attempt,
-          attemptTotal: UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS,
+          attemptTotal: localCaptureSessionMaxAttempts,
           retried: Math.max(0, attempt - 1),
         });
         try {
@@ -18548,7 +18636,7 @@ async function runUnattendedKeywordPlanRequest(request) {
           const retryable = UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES.has(code);
           if (
             !retryable ||
-            attempt >= UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS
+            attempt >= localCaptureSessionMaxAttempts
           ) {
             break;
           }
@@ -18561,12 +18649,12 @@ async function runUnattendedKeywordPlanRequest(request) {
           );
           const waitUntil = new Date(Date.now() + delayMs).toISOString();
           const nextAttempt = attempt + 1;
-          const waitMessage = `浏览器采集资源暂时占用，第 ${nextAttempt}/${UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS} 次接管将在倒计时结束后开始`;
+          const waitMessage = `浏览器采集资源暂时占用，第 ${nextAttempt}/${localCaptureSessionMaxAttempts} 次接管将在倒计时结束后开始`;
           await reportAutomaticRecoveryStage({
             phase: "waiting_capture_session_retry",
             message: waitMessage,
             attemptCurrent: nextAttempt,
-            attemptTotal: UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS,
+            attemptTotal: localCaptureSessionMaxAttempts,
             waitUntil,
             remainingMs: delayMs,
             retried: attempt,
@@ -18654,7 +18742,7 @@ async function runUnattendedKeywordPlanRequest(request) {
       baseSearchUrl: String(
         switchResult?.data?.url || getCurrentRuntime()?.lastPageUrl || "",
       ).trim(),
-      maxAttempts: UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS,
+      maxAttempts: localBootstrapMaxAttempts,
       shouldStop: () =>
         activeUnattendedAttemptRejected ||
         !isCurrentRequestAttempt() ||
@@ -18792,11 +18880,9 @@ async function runUnattendedKeywordPlanRequest(request) {
     batchRunResult = await handleBatchKeywordCapture({
       onProgress: reportKeywordProgress,
       onKeywordSettled: reportKeywordCheckpoint,
+      initialSearchEvidence: navigationResult?.initialSearchEvidence || null,
       resumeCheckpoint: checkpoint,
-      maxKeywordAttempts:
-        plan.recoveryPolicy?.disableAutomaticSearchRetry === true
-          ? 1
-          : UNATTENDED_KEYWORD_MAX_ATTEMPTS,
+      maxKeywordAttempts: localKeywordMaxAttempts,
       waitForegroundTabId: null,
       sourceTabId: unattendedSourceTabId,
       executionLockOwner: "unattended_keyword_plan",

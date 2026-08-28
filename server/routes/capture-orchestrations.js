@@ -31,6 +31,9 @@ import {
 import {
   runCaptureOrchestrationScheduleNow,
 } from '../services/capture-orchestration-scheduler.js';
+import {
+  normalizeCaptureResourcePolicy,
+} from '../services/capture-resource-policy.js';
 
 const router = Router();
 const UUID_PATTERN =
@@ -104,6 +107,11 @@ function text(value, limit = 1000) {
 
 function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function elasticQueueOwnsRetry(parent) {
+  const metadata = safeJson(parent?.metadata);
+  return metadata.distributionMode === 'elastic_pool';
 }
 
 function itemRequiresManualSafetyAction(item) {
@@ -257,7 +265,11 @@ function normalizeCreateRequest(body) {
   }
 }
 
-function normalizeScheduleUpdate(body, orchestrationId) {
+function normalizeScheduleUpdate(
+  body,
+  orchestrationId,
+  {existingPlanSnapshot = {}} = {},
+) {
   const expectedRevision = Number(body?.expectedRevision);
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
     return {failure: requestError(
@@ -280,8 +292,22 @@ function normalizeScheduleUpdate(body, orchestrationId) {
   }
   const normalizedAgents = normalizedAgentIds(body?.agentIds);
   if (normalizedAgents.failure) return normalizedAgents;
+  const safeBody = safeJson(body);
+  const carriesResourcePolicy =
+    Object.prototype.hasOwnProperty.call(safeBody, 'resourcePolicy') ||
+    Object.prototype.hasOwnProperty.call(safeBody, 'resource_policy');
+  const preservedResourcePolicy = normalizeCaptureResourcePolicy(
+    safeJson(existingPlanSnapshot).resourcePolicy,
+  );
   const normalized = normalizeCreateRequest({
-    ...safeJson(body),
+    ...safeBody,
+    ...(
+      rawDistributionMode === 'elastic_pool' &&
+        !carriesResourcePolicy &&
+        Object.keys(preservedResourcePolicy).length > 0
+        ? {resourcePolicy: preservedResourcePolicy}
+        : {}
+    ),
     requestKey: orchestrationId,
     executionMode: 'unattended_plan',
     distributionMode: rawDistributionMode,
@@ -423,6 +449,15 @@ function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
       message: '目标节点版本尚不支持同一关键词串行补充巡检，请先更新扩展',
     };
   }
+  if (
+    safeJson(planSnapshot.recoveryPolicy).singleRelayV1 === true &&
+    capabilities.singleRelayV1 !== true
+  ) {
+    return {
+      code: 'agent_single_relay_capability_missing',
+      message: '目标节点版本尚不支持单次跨设备接力，请先更新扩展',
+    };
+  }
   const allowedPlatforms = Array.isArray(agent.allowed_platforms)
     ? agent.allowed_platforms
     : [];
@@ -453,11 +488,20 @@ async function loadCompatibleAgents(
   agentIds,
   platform,
   planSnapshot,
-  {lock = false} = {},
+  {lock = false, includeRelayPool = true} = {},
 ) {
+  const relayAgentIds = includeRelayPool
+    ? normalizeCaptureResourcePolicy(
+        safeJson(planSnapshot).resourcePolicy,
+      ).relayAgentIds || []
+    : [];
+  const allAgentIds = Array.from(new Set([
+    ...agentIds,
+    ...relayAgentIds,
+  ]));
   const orderedForLock = lock
-    ? [...agentIds].sort((left, right) => left.localeCompare(right))
-    : agentIds;
+    ? [...allAgentIds].sort((left, right) => left.localeCompare(right))
+    : allAgentIds;
   const agents = await executor.queryAll(`
     SELECT ca.*,
       tenant.status AS tenant_status,
@@ -476,14 +520,14 @@ async function loadCompatibleAgents(
     ${lock ? 'FOR UPDATE OF ca' : ''}
   `, [tenantId, orderedForLock]);
   const byId = new Map(agents.map(agent => [String(agent.id), agent]));
-  if (byId.size !== agentIds.length) {
+  if (byId.size !== allAgentIds.length) {
     return {failure: requestError(
       'agent_not_found',
       '一个或多个执行节点不存在于当前租户',
       404,
     )};
   }
-  for (const agentId of agentIds) {
+  for (const agentId of allAgentIds) {
     const agent = byId.get(agentId);
     const failure = agentCompatibilityFailure(agent, platform, planSnapshot);
     if (failure) {
@@ -1547,6 +1591,9 @@ function retryPendingInvalidationReason(item, parent) {
     parentMetadata.executionMode === 'unattended_plan'
   ) {
     return 'parent_dispatch_mode_changed';
+  }
+  if (elasticQueueOwnsRetry(parent)) {
+    return 'elastic_queue_retry_managed';
   }
   const inspection = inspectPendingRetryLineage(item, parent);
   if (
@@ -3579,8 +3626,6 @@ router.patch(
     try {
       const orchestrationId = orchestrationRouteId(req, res);
       if (!orchestrationId) return;
-      const normalized = normalizeScheduleUpdate(req.body, orchestrationId);
-      if (normalized.failure) return sendRequestError(res, normalized.failure);
       const result = await withTransaction(async tx => {
         const parentSnapshot = await tx.queryOne(
           parentSelect(),
@@ -3627,6 +3672,12 @@ router.patch(
             409,
           )};
         }
+        const normalized = normalizeScheduleUpdate(
+          req.body,
+          orchestrationId,
+          {existingPlanSnapshot: safeJson(schedule.plan_snapshot)},
+        );
+        if (normalized.failure) return {failure: normalized.failure};
         const parent = await tx.queryOne(
           parentSelect({lock: true}),
           [orchestrationId, req.tenantId],
@@ -4698,6 +4749,24 @@ router.post(
           'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
           ['capture_task_global_id', normalized.requestKey],
         );
+        const parentPreview = await tx.queryOne(
+          parentSelect(),
+          [orchestrationId, req.tenantId],
+        );
+        if (!parentPreview) {
+          return {failure: requestError(
+            'orchestration_not_found',
+            '编排任务不存在',
+            404,
+          )};
+        }
+        if (elasticQueueOwnsRetry(parentPreview)) {
+          return {failure: requestError(
+            'retry_items_managed_by_elastic_dispatcher',
+            '当前任务由云端单次接力自动收口，无需人工重复创建重试任务',
+            409,
+          )};
+        }
         const existingTasks = await tx.queryAll(`
           SELECT id, parent_task_id, assigned_agent_id, status, metadata
           FROM capture_tasks
@@ -4789,17 +4858,6 @@ router.post(
         // Read the parent once to discover the candidate pool, reserve all
         // candidate execution slots in stable ID order, then lock and re-read
         // the parent/items below before making any assignment.
-        const parentPreview = await tx.queryOne(
-          parentSelect(),
-          [orchestrationId, req.tenantId],
-        );
-        if (!parentPreview) {
-          return {failure: requestError(
-            'orchestration_not_found',
-            '编排任务不存在',
-            404,
-          )};
-        }
         const explicitAgentIds = normalized.assignments.map(
           assignment => assignment.agentId,
         );
@@ -4810,6 +4868,7 @@ router.post(
             explicitAgentIds,
             parentPreview.platform,
             safeJson(parentPreview.metadata?.planSnapshot),
+            {includeRelayPool: false},
           );
           if (explicitAgents.failure) {
             return {failure: explicitAgents.failure};
@@ -4865,6 +4924,13 @@ router.post(
             'orchestration_not_found',
             '编排任务不存在',
             404,
+          )};
+        }
+        if (elasticQueueOwnsRetry(parent)) {
+          return {failure: requestError(
+            'retry_items_managed_by_elastic_dispatcher',
+            '当前任务由云端单次接力自动收口，无需人工重复创建重试任务',
+            409,
           )};
         }
         const currentRevision = Number(parent.orchestration_revision || 0);
@@ -5682,7 +5748,7 @@ router.post(
           [normalized.targetAgentId],
           parent.platform,
           planSnapshot,
-          {lock: true},
+          {lock: true, includeRelayPool: false},
         );
         if (compatible.failure) return {failure: compatible.failure};
         const targetAgent = compatible.agentsById.get(normalized.targetAgentId);

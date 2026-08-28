@@ -1184,6 +1184,7 @@
           remoteTaskEnhancementOptions: true,
           remoteTaskKeywordPostLimit: true,
           remoteSequentialSearchPassesV1: true,
+          singleRelayV1: true,
           remoteOrchestrationRecoveryMergeV1: true,
           negativePostPatrol: true,
           watchedContentPatrol: true,

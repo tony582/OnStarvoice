@@ -1527,11 +1527,11 @@ test("unattended Douyin navigation readiness is bound to the expected URL and ke
   );
   assert.match(
     navigationSection,
-    /waitForActiveTabReady\(\s*preferredTabId,\s*15000,\s*\{[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
+    /waitForActiveTabReady\(\s*preferredTabId,\s*platform === "douyin" \? 45000 : 15000,\s*\{[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
   );
   assert.match(
     navigationSection,
-    /readyState\.ready\s*\?\s*await waitForRuntimeSearchPage\(\{[\s\S]*?platform,[\s\S]*?tabId:\s*preferredTabId,[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
+    /readyState\.ready\s*\?\s*await waitForRuntimeSearchPage\(\{[\s\S]*?platform,[\s\S]*?tabId:\s*preferredTabId,[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,[\s\S]*?timeoutMs:\s*platform === "douyin" \? 15000 : 8000,/,
     "runtime readiness must describe the same final tab and search identity",
   );
   assert.match(
@@ -1558,6 +1558,7 @@ function createUnattendedNavigationHarness({
   const updates = [];
   const retries = [];
   let runtimeChecks = 0;
+  let documentGenerationReads = 0;
   let stopRequested = false;
   const tab = {
     id: 101,
@@ -1566,10 +1567,23 @@ function createUnattendedNavigationHarness({
     url: "https://www.douyin.com/jingxuan",
   };
   const sandbox = vm.createContext({
-    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 4,
+    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 1,
     UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS: [0, 0],
     buildSidebarKeywordSearchUrl: (keyword) =>
       `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=general`,
+    beginDouyinSearchResultTransitionInTab: async () => ({
+      baselineCaptured: true,
+      previousWorkIds: ["766193585000009991"],
+      submissionNonce: "bootstrap-submit",
+    }),
+    readDouyinSearchDocumentGenerationInTab: async () => {
+      documentGenerationReads += 1;
+      return {
+        timeOrigin: documentGenerationReads,
+        readyState: "complete",
+        pageUrl: tab.url,
+      };
+    },
     chrome: {
       tabs: {
         get: async () => {
@@ -1620,25 +1634,42 @@ function createUnattendedNavigationHarness({
   };
 }
 
-test("unattended bootstrap reopens the same keyword after a transient page drift", async () => {
+test("successful unattended bootstrap returns one exact reusable search proof", async () => {
+  const harness = createUnattendedNavigationHarness({
+    tabReadiness: [true],
+    runtimeReadiness: [true],
+  });
+
+  const result = await harness.navigate();
+  assert.equal(harness.updates.length, 1);
+  assert.equal(result.initialSearchEvidence.ready, true);
+  assert.equal(result.initialSearchEvidence.keyword, "凯迪拉克");
+  assert.equal(result.initialSearchEvidence.platform, "douyin");
+  assert.equal(result.initialSearchEvidence.tabId, 101);
+  assert.equal(
+    result.initialSearchEvidence.navigationTransitionAccepted,
+    true,
+  );
+});
+
+test("unattended bootstrap does not repeat the same search after a transient page drift", async () => {
   const harness = createUnattendedNavigationHarness({
     tabReadiness: [false, true],
     runtimeReadiness: [true],
   });
 
-  const result = await harness.navigate();
-
-  assert.equal(result.recovered, true);
-  assert.equal(result.attemptCount, 2);
-  assert.equal(harness.updates.length, 2);
-  assert.equal(harness.updates[0].url, harness.updates[1].url);
+  await assert.rejects(harness.navigate(), (error) => {
+    assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
+    assert.equal(error.attempts, 1);
+    return true;
+  });
+  assert.equal(harness.updates.length, 1);
   assert.match(harness.updates[0].url, /\/search\/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B/);
-  assert.equal(harness.retries.length, 1);
-  assert.equal(harness.retries[0].nextAttempt, 2);
+  assert.equal(harness.retries.length, 0);
   assert.equal(
     harness.runtimeChecks(),
-    1,
-    "a failed tab identity must retry immediately instead of waiting on stale runtime state",
+    0,
+    "a failed tab identity must be handed back without issuing the same search again",
   );
 });
 
@@ -1649,11 +1680,11 @@ test("unattended bootstrap retry is bounded and exposes a recoverable error code
 
   await assert.rejects(harness.navigate(), (error) => {
     assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
-    assert.equal(error.attempts, 4);
+    assert.equal(error.attempts, 1);
     return true;
   });
-  assert.equal(harness.updates.length, 4);
-  assert.equal(harness.retries.length, 3);
+  assert.equal(harness.updates.length, 1);
+  assert.equal(harness.retries.length, 0);
   assert.equal(harness.runtimeChecks(), 0);
 });
 
@@ -1700,19 +1731,20 @@ test("unattended Douyin bootstrap accepts the bound search shell while global ru
   assert.equal(probeCount, 1);
 });
 
-test("unattended bootstrap retries when the tab is ready but runtime is a video page", async () => {
+test("unattended bootstrap hands back when the bound tab runtime is still a video page", async () => {
   const harness = createUnattendedNavigationHarness({
     tabReadiness: [true, true],
     runtimeReadiness: [false, true],
   });
 
-  const result = await harness.navigate();
-
-  assert.equal(result.recovered, true);
-  assert.equal(result.attemptCount, 2);
-  assert.equal(harness.updates.length, 2);
-  assert.equal(harness.runtimeChecks(), 2);
-  assert.equal(harness.retries.length, 1);
+  await assert.rejects(harness.navigate(), (error) => {
+    assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
+    assert.equal(error.attempts, 1);
+    return true;
+  });
+  assert.equal(harness.updates.length, 1);
+  assert.equal(harness.runtimeChecks(), 1);
+  assert.equal(harness.retries.length, 0);
 });
 
 test("unattended bootstrap cannot pass its final fence after cancellation", async () => {
@@ -1750,7 +1782,7 @@ test("a missing tracked tab never hijacks the user's unrelated active page", asy
     return true;
   });
   assert.equal(harness.updates.length, 0);
-  assert.equal(harness.retries.length, 3);
+  assert.equal(harness.retries.length, 0);
 });
 
 test("elastic unattended starts obey a bounded soft gate and healthy manual runs do not wait", () => {
@@ -1867,6 +1899,10 @@ test("unattended bootstrap retry is reported before keyword batch delegation", (
   assert.ok(retryIndex > navigationIndex);
   assert.ok(batchIndex > retryIndex);
   assert.ok(terminalCatchIndex > batchIndex);
+  assert.match(
+    section.slice(batchIndex),
+    /initialSearchEvidence:\s*navigationResult\?\.initialSearchEvidence \|\| null/,
+  );
   assert.match(section.slice(retryIndex, batchIndex), /phase: "waiting_search_page_retry"/);
   assert.match(section.slice(retryIndex, batchIndex), /waitUntil,/);
   assert.match(section.slice(retryIndex, batchIndex), /retried: Math\.max\(0, Number\(nextAttempt\) - 1\)/);
@@ -1885,21 +1921,45 @@ test("unattended bootstrap retry is reported before keyword batch delegation", (
   );
 });
 
-test("unattended keyword failures use four spaced attempts with a durable countdown", () => {
+test("one cloud item uses one local bootstrap session and keyword attempt", () => {
   assert.match(sidebarSource, /const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 4/u);
-  assert.match(
-    sidebarSource,
-    /const UNATTENDED_KEYWORD_RETRY_DELAYS_MS = Object\.freeze\(\[\s*30 \* 1000,\s*2 \* 60 \* 1000,\s*5 \* 60 \* 1000,/u,
-  );
+  assert.match(sidebarSource, /const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 4/u);
+  assert.match(sidebarSource, /const UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS = 4/u);
   const handlerSection = readFunctionSection(
     "async function handleBatchKeywordCapture(options = {})",
     "async function reportUnattendedKeywordRun(",
   );
   assert.match(handlerSection, /Math\.min\(4, Number\(runOptions\.maxKeywordAttempts\) \|\| 1\)/u);
-  assert.match(handlerSection, /UNATTENDED_KEYWORD_RETRY_DELAYS_MS\[/u);
-  assert.match(handlerSection, /"keyword_retry_wait"/u);
-  assert.match(handlerSection, /waitUntil,/u);
   assert.match(handlerSection, /attemptTotal: maxKeywordAttempts/u);
+
+  const unattendedSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction({",
+  );
+  assert.match(
+    unattendedSection,
+    /const singleRelayMode =[\s\S]*request\?\.cloudAssigned === true[\s\S]*distributionMode === "elastic_pool"[\s\S]*singleRelayV1 === true[\s\S]*disableAutomaticSearchRetry === true/u,
+  );
+  assert.match(
+    unattendedSection,
+    /const localKeywordMaxAttempts = singleRelayMode[\s\S]*?UNATTENDED_KEYWORD_MAX_ATTEMPTS/u,
+  );
+  assert.match(
+    unattendedSection,
+    /const localBootstrapMaxAttempts = singleRelayMode[\s\S]*?UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS/u,
+  );
+  assert.match(
+    unattendedSection,
+    /const localCaptureSessionMaxAttempts = singleRelayMode[\s\S]*?UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS/u,
+  );
+  assert.match(
+    unattendedSection,
+    /maxAttempts:\s*localBootstrapMaxAttempts/u,
+  );
+  assert.match(
+    unattendedSection,
+    /maxKeywordAttempts:\s*localKeywordMaxAttempts/u,
+  );
 });
 
 test("elastic keyword cooldown releases the work item, pauses the source Agent, and leaves the loading page", () => {

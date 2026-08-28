@@ -49,6 +49,11 @@ import {
   selectCaptureLocalClosureEvidence,
   verifyCaptureLocalClosureProof,
 } from '../services/capture-local-closure-proof.js';
+import {
+  captureResourceAgentIds,
+  normalizeCaptureResourcePolicy,
+  projectCaptureResourceAdmission,
+} from '../services/capture-resource-policy.js';
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
@@ -114,7 +119,9 @@ const CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES = new Set([
   'superseded',
   'needs_action',
 ]);
-const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 3;
+// One normal execution plus one different-Agent relay. More generations make
+// a congested host or weak network noisier without improving the real result.
+const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 2;
 const DUTY_RECOVERY_TRUE_VALUES = new Set(['1', 'true', 'on', 'yes']);
 const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
   'ops_control_recovery_enabled',
@@ -129,7 +136,7 @@ const ELASTIC_SAFETY_AGENT_HOLD_MS = 30 * 60 * 1000;
 const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
 const ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS = 1;
-const ELASTIC_TECHNICAL_HANDOFF_LIMIT = 3;
+const ELASTIC_TECHNICAL_HANDOFF_LIMIT = 2;
 const ELASTIC_BOOTSTRAP_STAGGER_BUCKETS = 4;
 const ELASTIC_BOOTSTRAP_STAGGER_GAP_MS = 6 * 1000;
 const ELASTIC_BOOTSTRAP_CONGESTION_WINDOW_MS = 2 * 60 * 1000;
@@ -147,6 +154,136 @@ const ELASTIC_AGENT_CAPACITY_CODES = new Set([
   'CAPTURE_TASK_DEBUG_BUSY',
   'CAPTURE_LOCK_CONFLICT',
 ]);
+
+function captureTaskResourcePolicy(task = {}) {
+  const metadata = safeJson(task.metadata || task.parent_metadata);
+  return normalizeCaptureResourcePolicy(
+    safeJson(metadata.planSnapshot).resourcePolicy,
+  );
+}
+
+async function reserveCaptureResourceAdmission(tx, {
+  tenantId,
+  parentTaskId,
+  agent,
+  platform = '',
+  resourcePolicy = {},
+  expectedSearches = 1,
+} = {}) {
+  const policy = normalizeCaptureResourcePolicy(resourcePolicy);
+  const hostLabel = text(agent?.host_label, 120).toLowerCase();
+  const capacityGroup = text(policy.capacityGroup, 80).toLowerCase();
+  const lockKeys = [
+    ...(policy.maxActive ? [`plan:${parentTaskId}`] : []),
+    ...(policy.maxActivePerHost && hostLabel
+      ? [`host:${hostLabel}`]
+      : []),
+    ...(policy.maxActiveInGroup && capacityGroup
+      ? [`group:${capacityGroup}`]
+      : []),
+  ].sort((left, right) => left.localeCompare(right));
+  for (const lockKey of lockKeys) {
+    await tx.execute(
+      'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+      ['capture_resource_admission', `${tenantId}:${lockKey}`],
+    );
+  }
+  const usagePlatform = text(platform, 40).toLowerCase();
+  const counts = await tx.queryOne(`
+    WITH occupied AS (
+      SELECT
+        active_task.id AS execution_id,
+        active_task.parent_task_id,
+        LOWER(BTRIM(active_agent.host_label)) AS host_label,
+        LOWER(BTRIM(COALESCE(
+          active_task.metadata->'planSnapshot'->'resourcePolicy'->>'capacityGroup',
+          ''
+        ))) AS capacity_group
+      FROM capture_tasks active_task
+      JOIN capture_agents active_agent
+        ON active_agent.id = COALESCE(
+          active_task.assigned_agent_id,
+          active_task.origin_agent_id
+        )
+        AND active_agent.tenant_id = active_task.tenant_id
+      WHERE active_task.tenant_id = $1
+        AND active_task.task_type <> 'capture_orchestration'
+        AND active_task.status = ANY($5::text[])
+
+      UNION
+
+      SELECT
+        active_command.task_id AS execution_id,
+        command_task.parent_task_id,
+        LOWER(BTRIM(command_agent.host_label)) AS host_label,
+        LOWER(BTRIM(COALESCE(
+          command_task.metadata->'planSnapshot'->'resourcePolicy'->>'capacityGroup',
+          ''
+        ))) AS capacity_group
+      FROM capture_agent_commands active_command
+      JOIN capture_agents command_agent
+        ON command_agent.id = active_command.agent_id
+        AND command_agent.tenant_id = active_command.tenant_id
+      LEFT JOIN capture_tasks command_task
+        ON command_task.id = active_command.task_id
+        AND command_task.tenant_id = active_command.tenant_id
+      WHERE active_command.tenant_id = $1
+        AND active_command.status IN ('pending', 'acknowledged')
+        AND (
+          active_command.expires_at IS NULL OR
+          active_command.expires_at > now()
+        )
+    )
+    SELECT
+      COUNT(DISTINCT execution_id)
+        FILTER (WHERE parent_task_id = $2)::integer AS plan_active,
+      COUNT(DISTINCT execution_id)
+        FILTER (WHERE host_label = $3)::integer AS host_active,
+      COUNT(DISTINCT execution_id)
+        FILTER (WHERE capacity_group = $7)::integer AS group_active,
+      COALESCE((
+        SELECT daily_usage.searches
+        FROM social_agent_daily_usage daily_usage
+        WHERE daily_usage.tenant_id = $1
+          AND daily_usage.agent_id = $4
+          AND daily_usage.platform = $6
+          AND daily_usage.usage_date =
+            (now() AT TIME ZONE 'Asia/Shanghai')::date
+      ), 0)::integer AS today_searches,
+      COALESCE((
+        SELECT account.daily_search_limit
+        FROM social_account_bindings binding
+        JOIN social_accounts account
+          ON account.tenant_id = binding.tenant_id
+          AND account.id = binding.social_account_id
+        WHERE binding.tenant_id = $1
+          AND binding.agent_id = $4
+          AND binding.platform = $6
+          AND binding.status = 'current'
+        ORDER BY binding.started_at DESC NULLS LAST, binding.id DESC
+        LIMIT 1
+      ), 0)::integer AS daily_search_limit
+    FROM occupied
+  `, [
+    tenantId,
+    parentTaskId,
+    hostLabel,
+    agent.id,
+    CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+    usagePlatform,
+    capacityGroup,
+  ]);
+  return projectCaptureResourceAdmission({
+    resourcePolicy: policy,
+    hostLabel,
+    planActive: counts?.plan_active,
+    hostActive: counts?.host_active,
+    groupActive: counts?.group_active,
+    todaySearches: counts?.today_searches,
+    expectedSearches,
+    dailySearchLimit: counts?.daily_search_limit,
+  });
+}
 
 function dutyRecoveryGlobalActionsEnabled(env = process.env) {
   return DUTY_RECOVERY_TRUE_VALUES.has(
@@ -242,6 +379,10 @@ const CROSS_DEVICE_RETRY_MESSAGES = Object.freeze({
   retry_source_command_active: [
     'retry_source_command_active',
     '原执行仍有待确认的远程指令，请等待设备确认后重试',
+  ],
+  retry_source_local_closure_unproven: [
+    'retry_source_local_closure_unproven',
+    '原设备正在关闭本地工作页，确认完成后会自动继续接力',
   ],
   retry_profile_subscription_invalid: [
     'retry_profile_subscription_invalid',
@@ -381,7 +522,7 @@ export async function lockActiveCaptureAgentSession(
   // retirement cannot write after the retirement transaction has committed.
   await lockCaptureAgentExecutionSlot(executor, tenantId, agentId);
   const currentAgent = await executor.queryOne(`
-    SELECT id, tenant_id, status, auth_code_id, auth_binding_id,
+    SELECT id, tenant_id, status, auth_code_id, auth_binding_id, host_label,
       last_heartbeat_at, last_liveness_at, last_full_heartbeat_at
     FROM capture_agents
     WHERE id = $1 AND tenant_id = $2
@@ -571,6 +712,7 @@ function remoteTaskRequestHash(agentId, title, executionMode, planSnapshot) {
     searchFilters: plan.searchFilters,
     keywordMaxDetectedItems: plan.keywordMaxDetectedItems,
     captureSettings: plan.captureSettings,
+    resourcePolicy: plan.resourcePolicy,
     mode: plan.mode,
     startTime: plan.startTime,
     randomOffsetMin: plan.randomOffsetMin,
@@ -816,6 +958,9 @@ export function projectElasticKeywordRecoveryStatus({
     error,
     metadata: {checkpoint},
   });
+  if (normalizedAttemptCount >= AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT) {
+    return safetyBlocked || technicalLimitReached ? 'needs_action' : 'failed';
+  }
   if (safetyBlocked) {
     const safetyCode = text(
       safeJson(error).code ||
@@ -1157,6 +1302,12 @@ export function crossDeviceRetryAgentSupportsTask(
       metadata.planSnapshot || commandPayload.planSnapshot,
     );
     if (
+      safeJson(planSnapshot.recoveryPolicy).singleRelayV1 === true &&
+      capabilities.singleRelayV1 !== true
+    ) {
+      return false;
+    }
+    if (
       Object.keys(safeJson(planSnapshot.captureSettings)).length > 0 &&
       capabilities.remoteTaskEnhancementOptions !== true
     ) {
@@ -1197,16 +1348,22 @@ export function crossDeviceRetryAgentSupportsTask(
   return false;
 }
 
-export function crossDeviceRetryAgentDailyUsageEligible(agent = {}) {
+export function crossDeviceRetryAgentDailyUsageEligible(
+  agent = {},
+  expectedSearches = 1,
+) {
   const searches = Number(agent.today_searches);
   if (
     agent.today_usage_current !== true ||
-    !agent.today_usage_last_event_at ||
     !Number.isInteger(searches) ||
     searches < 0
   ) {
     return false;
   }
+  const rawSearchCost = Number(expectedSearches);
+  const searchCost = Number.isFinite(rawSearchCost) && rawSearchCost >= 0
+    ? Math.floor(rawSearchCost)
+    : 1;
 
   const rawLimit = agent.daily_search_limit;
   if (rawLimit === null || rawLimit === undefined || rawLimit === '') {
@@ -1215,7 +1372,7 @@ export function crossDeviceRetryAgentDailyUsageEligible(agent = {}) {
   const limit = Number(rawLimit);
   return Number.isInteger(limit) &&
     limit >= 0 &&
-    (limit === 0 || searches < limit);
+    (limit === 0 || searches + searchCost <= limit);
 }
 
 function abortCrossDeviceRetry(error, details = {}) {
@@ -2875,6 +3032,28 @@ export function buildSequentialSearchResumeCheckpoint({
   };
 }
 
+export function expectedElasticKeywordSearches({
+  planSnapshot = {},
+  itemMetadata = {},
+  keyword = '',
+} = {}) {
+  const plan = safeJson(planSnapshot);
+  const passes = Array.isArray(plan.searchPasses)
+    ? plan.searchPasses.map(pass => text(pass, 80)).filter(Boolean)
+    : [];
+  const configuredSearches = Math.max(1, passes.length);
+  if (configuredSearches === 1) return 1;
+  const resumeCheckpoint = buildSequentialSearchResumeCheckpoint({
+    planSnapshot: plan,
+    itemMetadata,
+    keyword,
+  });
+  const completedPrefix = resumeCheckpoint
+    ? Math.max(0, Number(resumeCheckpoint.round) - 1)
+    : 0;
+  return Math.max(1, configuredSearches - completedPrefix);
+}
+
 function orchestrationItemAttemptStatus(itemStatus) {
   // Item attempts start at dispatch, so a checkpoint entry with no meaningful
   // status must not move the append-only audit back to a pre-dispatch state.
@@ -4246,12 +4425,14 @@ async function projectOrchestrationChildControlOutcome(tx, {
         ),
         metadataPatch: {},
       };
-  const projectedAttemptCount = attemptBudgetProjection.attemptBudget;
   const projectedStatus = projectElasticKeywordRecoveryStatus({
     elasticPool,
     status,
     error: normalizedError,
-    attemptCount: projectedAttemptCount,
+    attemptCount: Math.max(
+      0,
+      Number(currentItemState?.attempt_count) || 0,
+    ),
     safetyHandoffCount: currentItemState?.safety_handoff_count,
     technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
   });
@@ -4548,13 +4729,12 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
           task.id,
         )
       : {attemptBudget: serverAttemptCount, metadataPatch: {}};
-    const projectedAttemptCount = attemptBudgetProjection.attemptBudget;
     const status = projectElasticKeywordRecoveryStatus({
       elasticPool,
       status: checkpointProjectedStatus,
       error,
       checkpoint,
-      attemptCount: projectedAttemptCount,
+      attemptCount: serverAttemptCount,
       safetyHandoffCount: currentItemState?.safety_handoff_count,
       technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
     });
@@ -4562,7 +4742,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       status,
       error,
       checkpoint,
-      attemptCount: projectedAttemptCount,
+      attemptCount: serverAttemptCount,
       sourceAgentId: agent.id,
     });
     if (Object.keys(recovery).length > 0) {
@@ -4748,13 +4928,12 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
             task.id,
           )
         : {attemptBudget: serverAttemptCount, metadataPatch: {}};
-      const projectedAttemptCount = attemptBudgetProjection.attemptBudget;
       const activeUnresolvedStatus = projectElasticKeywordRecoveryStatus({
         elasticPool,
         status: baseUnresolvedStatus,
         error: childError,
         checkpoint: snapshotCheckpoint,
-        attemptCount: projectedAttemptCount,
+        attemptCount: serverAttemptCount,
         safetyHandoffCount: currentActiveItem?.safety_handoff_count,
         technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
       });
@@ -4762,7 +4941,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         status: activeUnresolvedStatus,
         error: childError,
         checkpoint: snapshotCheckpoint,
-        attemptCount: projectedAttemptCount,
+        attemptCount: serverAttemptCount,
         sourceAgentId: agent.id,
       });
       const activeChildError = Object.keys(recovery).length > 0
@@ -5410,7 +5589,8 @@ async function dispatchNextElasticWorkItem(tx, {
   const freshCapabilities = safeJson(capabilities);
   const canClaimKeyword =
     freshCapabilities.remoteTaskCreate === true &&
-    freshCapabilities.remoteTaskKeywordPostLimit === true;
+    freshCapabilities.remoteTaskKeywordPostLimit === true &&
+    freshCapabilities.singleRelayV1 === true;
   const canClaimNegativePost =
     freshCapabilities.remoteTaskCreate === true &&
     freshCapabilities.remoteTargetedPostCaptureV1 === true &&
@@ -5494,9 +5674,11 @@ async function dispatchNextElasticWorkItem(tx, {
       item.external_id,
       item.url_snapshot,
       item.status AS item_status,
+      item.started_at AS item_started_at,
       item.attempt_count,
       item.safety_handoff_count,
       item.assignment_revision,
+      item.assigned_agent_id AS source_agent_id,
       item.execution_task_id,
       item.metadata AS item_metadata,
       COALESCE(
@@ -5522,8 +5704,17 @@ async function dispatchNextElasticWorkItem(tx, {
       AND parent.status IN ('pending', 'running', 'needs_action')
       AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
       AND COALESCE(parent.metadata->>'orchestrationTemplate', 'false') <> 'true'
-      AND parent.metadata @> jsonb_build_object(
-        'eligibleAgentIds', jsonb_build_array($2::text)
+      AND (
+        parent.metadata @> jsonb_build_object(
+          'eligibleAgentIds', jsonb_build_array($2::text)
+        )
+        OR (
+          item.status = 'retryable'
+          AND parent.metadata->'planSnapshot'->'resourcePolicy' @>
+            jsonb_build_object(
+              'relayAgentIds', jsonb_build_array($2::text)
+            )
+        )
       )
       AND (
         (item.item_type = 'keyword' AND $6::boolean)
@@ -5538,11 +5729,11 @@ async function dispatchNextElasticWorkItem(tx, {
           NULLIF(item.metadata->'checkpoint'->>'errorCode', ''),
           NULLIF(item.metadata->'checkpoint'->>'error_code', ''),
           ''
-        )) = ANY($11::text[])
+        )) = ANY($10::text[])
       )
       AND (
         COALESCE(jsonb_array_length(parent.metadata->'planSnapshot'->'searchPasses'), 0) <= 1
-        OR $10::boolean
+        OR $9::boolean
       )
       AND COALESCE(
         CASE
@@ -5552,6 +5743,7 @@ async function dispatchNextElasticWorkItem(tx, {
         END,
         item.attempt_count
       ) < $3
+      AND item.attempt_count < $3
       AND (cardinality($4::text[]) = 0 OR item.platform = ANY($4::text[]))
       AND (cardinality($5::text[]) = 0 OR item.platform = ANY($5::text[]))
       AND (
@@ -5577,17 +5769,17 @@ async function dispatchNextElasticWorkItem(tx, {
       )
       AND NOT EXISTS (
         SELECT 1
-        FROM capture_task_item_attempts recent_same_agent_attempt
-        WHERE recent_same_agent_attempt.tenant_id = item.tenant_id
-          AND recent_same_agent_attempt.item_id = item.id
-          AND recent_same_agent_attempt.agent_id = $2::uuid
-          AND recent_same_agent_attempt.status IN (
-            'retryable', 'needs_action', 'failed'
-          )
-          AND recent_same_agent_attempt.updated_at >
-            now() - ($9::bigint * interval '1 millisecond')
+        FROM capture_task_item_attempts same_agent_attempt
+        WHERE same_agent_attempt.tenant_id = item.tenant_id
+          AND same_agent_attempt.item_id = item.id
+          AND same_agent_attempt.agent_id = $2::uuid
       )
     ORDER BY
+      CASE
+        WHEN item.metadata->>'waitingForSourceClosure' = 'true' THEN 1
+        ELSE 0
+      END,
+      COALESCE(item.metadata->>'sourceClosureBlockedAt', ''),
       COALESCE(parent.scheduled_for, parent.created_at),
       parent.created_at,
       item.ordinal,
@@ -5603,7 +5795,6 @@ async function dispatchNextElasticWorkItem(tx, {
     canClaimKeyword,
     canClaimNegativePost,
     canClaimWatchedContent,
-    ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS,
     canClaimSequentialSearch,
     CAPTURE_SAFETY_HANDOFF_SEARCH_CODES,
   ]);
@@ -5612,9 +5803,108 @@ async function dispatchNextElasticWorkItem(tx, {
   const parentMetadata = safeJson(candidate.parent_metadata);
   const planSnapshot = safeJson(parentMetadata.planSnapshot);
   const itemMetadata = safeJson(candidate.item_metadata);
+  const previousExecutionTaskId = text(candidate.execution_task_id, 100);
+  const requiresSingleRelay =
+    itemMetadata.singleRelayV1 === true ||
+    safeJson(planSnapshot.recoveryPolicy).singleRelayV1 === true;
+  if (requiresSingleRelay && freshCapabilities.singleRelayV1 !== true) {
+    return null;
+  }
+  if (candidate.item_status === 'retryable') {
+    const sourceExecutionKnown = UUID_PATTERN.test(previousExecutionTaskId);
+    const sourceAttempt = await tx.queryOne(`
+      SELECT id, agent_id, attempt_number, assignment_revision
+      FROM capture_task_item_attempts
+      WHERE tenant_id = $1
+        AND item_id = $2
+        AND ($3::uuid IS NULL OR execution_task_id = $3)
+      ORDER BY attempt_number DESC, created_at DESC, id DESC
+      LIMIT 1
+      FOR UPDATE
+    `, [
+      agent.tenant_id,
+      candidate.item_id,
+      sourceExecutionKnown ? previousExecutionTaskId : null,
+    ]);
+    const neverOpened =
+      !previousExecutionTaskId &&
+      !candidate.item_started_at &&
+      Math.max(0, Number(candidate.attempt_count) || 0) === 0 &&
+      !sourceAttempt;
+    const sourceAgentId = text(
+      sourceAttempt?.agent_id || candidate.source_agent_id,
+      100,
+    ).toLowerCase();
+    const localClosureProof = neverOpened
+      ? {proven: true, reason: 'item_never_opened'}
+      : await loadVerifiedCaptureLocalClosureProof(tx, {
+          tenantId: agent.tenant_id,
+          executionTaskId: previousExecutionTaskId,
+          sourceAgentId,
+          itemId: candidate.item_id,
+          itemAttemptId: sourceAttempt?.id,
+          itemAttemptNumber: sourceAttempt?.attempt_number,
+          assignmentRevision:
+            sourceAttempt?.assignment_revision ?? candidate.assignment_revision,
+        });
+    if (!neverOpened && localClosureProof.proven !== true) {
+      const firstWait = itemMetadata.waitingForSourceClosure !== true;
+      await tx.execute(`
+        UPDATE capture_task_items
+        SET metadata = metadata || jsonb_build_object(
+            'waitingForSourceClosure', true,
+            'sourceClosureBlockedAt', now()::text
+          )
+        WHERE tenant_id = $1
+          AND task_id = $2
+          AND id = $3
+          AND status = 'retryable'
+          AND assignment_revision = $4
+      `, [
+        agent.tenant_id,
+        candidate.parent_id,
+        candidate.item_id,
+        Number(candidate.assignment_revision || 0),
+      ]);
+      if (firstWait) {
+        await appendEvent(tx, {
+          tenantId: agent.tenant_id,
+          taskId: candidate.parent_id,
+          agentId: sourceAgentId || null,
+          eventType: 'elastic_handoff_waiting_local_closure',
+          actorType: 'system',
+          actorName: '云端弹性调度器',
+          status: 'retryable',
+          message: '原设备尚未确认关闭本地工作页，暂缓接力以免同一关键词双跑',
+          payload: {
+            itemId: candidate.item_id,
+            sourceExecutionTaskId: previousExecutionTaskId,
+            sourceItemAttemptId: text(sourceAttempt?.id, 100),
+            proofReason: text(localClosureProof.reason, 160),
+          },
+        });
+      }
+      return null;
+    }
+  }
   const negativePost = candidate.item_type === 'negative_post';
   const watchedContent = candidate.item_type === 'watched_content';
   const targetedContent = negativePost || watchedContent;
+  const resourceAdmission = await reserveCaptureResourceAdmission(tx, {
+    tenantId: agent.tenant_id,
+    parentTaskId: candidate.parent_id,
+    agent,
+    platform: candidate.item_platform || candidate.parent_platform,
+    resourcePolicy: planSnapshot.resourcePolicy,
+    expectedSearches: targetedContent
+      ? 0
+      : expectedElasticKeywordSearches({
+          planSnapshot,
+          itemMetadata,
+          keyword: candidate.keyword,
+        }),
+  });
+  if (!resourceAdmission.allowed) return null;
   let bootstrapPacing = null;
   if (!targetedContent) {
     const recentBootstrapHealth = await tx.queryOne(`
@@ -5762,10 +6052,16 @@ async function dispatchNextElasticWorkItem(tx, {
         },
         recoveryPolicy: {
           ...safeJson(planSnapshot.recoveryPolicy),
-          disableAutomaticSearchRetry:
-            itemMetadata.disableAutomaticSearchRetry === true,
+          // Every keyword claimed from the elastic queue uses the same one-run
+          // protocol, including old materialized items that predate per-item
+          // flags. The capability gate above prevents an old Extension from
+          // accepting this contract.
+          disableAutomaticSearchRetry: true,
+          singleRelayV1: true,
           requireVerifiedFilters:
-            itemMetadata.requireVerifiedFilters === true,
+            itemMetadata.requireVerifiedFilters === true ||
+            safeJson(planSnapshot.recoveryPolicy)
+              .requireVerifiedFilters === true,
         },
       },
     });
@@ -5867,7 +6163,6 @@ async function dispatchNextElasticWorkItem(tx, {
     scheduleId: candidate.orchestration_schedule_id || undefined,
     scheduledFor: candidate.scheduled_for || undefined,
   };
-  const previousExecutionTaskId = text(candidate.execution_task_id, 100);
   if (
     UUID_PATTERN.test(previousExecutionTaskId) &&
     previousExecutionTaskId !== childTaskId
@@ -5942,7 +6237,10 @@ async function dispatchNextElasticWorkItem(tx, {
     UPDATE capture_task_items
     SET status = 'dispatched',
       attempt_count = $1,
-      metadata = (metadata - 'checkpoint' - 'targetResult') ||
+      metadata = (
+        metadata - 'checkpoint' - 'targetResult' -
+        'waitingForSourceClosure' - 'sourceClosureBlockedAt'
+      ) ||
         jsonb_build_object('elasticAttemptBudgetUsed', $2::integer),
       assigned_agent_id = $3,
       execution_task_id = $4,
@@ -8144,8 +8442,19 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
         return {error: 'agent_capability_missing'};
       }
 
-      const mirroredPlan = safeJson(agent.unattended_plan);
+      const mirroredPlan = {...safeJson(agent.unattended_plan)};
+      // Resource admission belongs to an elastic schedule, never to a direct
+      // one-Agent task. A previously mirrored schedule must not silently turn
+      // a manual/direct dispatch into an ungoverned policy-bearing run.
+      delete mirroredPlan.resourcePolicy;
+      delete mirroredPlan.resource_policy;
       const body = safeJson(req.body);
+      const directResourcePolicy = safeJson(
+        body.resourcePolicy ?? body.resource_policy,
+      );
+      if (Object.keys(directResourcePolicy).length > 0) {
+        return {error: 'capture_resource_policy_requires_elastic_schedule'};
+      }
       const hasKeywordMaxDetectedItems = Object.prototype.hasOwnProperty.call(
         body,
         'keywordMaxDetectedItems',
@@ -8537,6 +8846,10 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
       agent_enhancement_capability_missing: ['agent_enhancement_capability_missing', '目标节点版本尚不支持远程任务增强选项，请先更新扩展'],
       agent_keyword_limit_capability_missing: ['agent_keyword_limit_capability_missing', '目标节点版本尚不支持为远程任务指定帖子采集数量，请先更新扩展'],
       invalid_keyword_max_detected_items: ['invalid_keyword_max_detected_items', '每个关键词采集帖子数必须是大于 0 的整数'],
+      capture_resource_policy_requires_elastic_schedule: [
+        'capture_resource_policy_requires_elastic_schedule',
+        '资源并发策略只对云端弹性计划生效，不能附在单节点直派任务上',
+      ],
       custom_dates_required: ['custom_dates_required', '指定日期计划至少需要一个有效日期'],
       request_key_required: ['request_key_required', '缺少任务请求标识，请刷新页面后重试'],
       invalid_client_task_id: ['invalid_client_task_id', 'clientTaskId 必须是有效 UUID'],
@@ -8556,6 +8869,7 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
             'request_key_required',
             'invalid_client_task_id',
             'invalid_keyword_max_detected_items',
+            'capture_resource_policy_requires_elastic_schedule',
             'custom_dates_required',
           ].includes(result.error) ? 400 : 409;
       return res.status(status).json({ok: false, error, message});
@@ -9334,21 +9648,37 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
   sourceAgentIds = [],
   commandPayload = {},
   safetyHandoffPolicy = null,
+  expectedSearches = 1,
 }) {
   const platform = text(task.platform, 40).toLowerCase();
   if (!['xiaohongshu', 'douyin', 'weibo'].includes(platform)) return null;
   const excludedIds = sourceAgentIds
     .map(value => text(value, 100).toLowerCase())
     .filter(value => UUID_PATTERN.test(value));
+  const taskMetadata = safeJson(task.metadata);
+  const resourcePolicy = captureTaskResourcePolicy(task);
+  const allowedAgentIds = captureResourceAgentIds({
+    eligibleAgentIds: taskMetadata.eligibleAgentIds,
+    resourcePolicy,
+  });
+  if (
+    taskMetadata.distributionMode === 'elastic_pool' &&
+    allowedAgentIds.length === 0
+  ) {
+    return null;
+  }
   // Agent usage remains authoritative even when account identity is absent.
   // A current account contributes only its configured hard search limit.
   const candidates = await tx.queryAll(`
     SELECT ca.*, tenant.status AS tenant_status,
       ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
       ab.id AS active_auth_binding_id,
-      daily_usage.usage_date =
-        (now() AT TIME ZONE 'Asia/Shanghai')::date AS today_usage_current,
-      daily_usage.searches AS today_searches,
+      COALESCE(
+        daily_usage.usage_date =
+          (now() AT TIME ZONE 'Asia/Shanghai')::date,
+        true
+      ) AS today_usage_current,
+      COALESCE(daily_usage.searches, 0)::integer AS today_searches,
       daily_usage.last_event_at AS today_usage_last_event_at,
       current_social_account.daily_search_limit,
       current_social_account.platform_account_id,
@@ -9417,7 +9747,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
       ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
     LEFT JOIN auth_bindings ab
       ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
-    JOIN social_agent_daily_usage daily_usage
+    LEFT JOIN social_agent_daily_usage daily_usage
       ON daily_usage.tenant_id = ca.tenant_id
       AND daily_usage.agent_id = ca.id
       AND daily_usage.platform = $5
@@ -9435,13 +9765,14 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
     WHERE ca.tenant_id = $1
       AND ca.status = 'active'
       AND NOT (ca.id = ANY($2::uuid[]))
-      AND daily_usage.last_event_at IS NOT NULL
+      AND (cardinality($6::uuid[]) = 0 OR ca.id = ANY($6::uuid[]))
       AND (
         current_social_account.daily_search_limit IS NULL OR
         current_social_account.daily_search_limit = 0 OR
-        daily_usage.searches < current_social_account.daily_search_limit
+        COALESCE(daily_usage.searches, 0) + $7::integer <=
+          current_social_account.daily_search_limit
       )
-    ORDER BY daily_usage.searches ASC,
+    ORDER BY COALESCE(daily_usage.searches, 0) ASC,
       recent_technical_failure_count ASC,
       recent_success_count DESC,
       last_assignment_at ASC NULLS FIRST,
@@ -9453,6 +9784,8 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
     task.id,
     CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
     platform,
+    allowedAgentIds,
+    Math.max(0, Math.floor(Number(expectedSearches) || 0)),
   ]);
   const eligibleCandidates = candidates.filter(agent => {
     const authExpired = agent.auth_code_expires_at &&
@@ -9464,7 +9797,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
       captureAgentFullHeartbeatOnline(agent) &&
       Number(agent.active_task_count || 0) === 0 &&
       Number(agent.active_command_count || 0) === 0 &&
-      crossDeviceRetryAgentDailyUsageEligible(agent) &&
+      crossDeviceRetryAgentDailyUsageEligible(agent, expectedSearches) &&
       crossDeviceRetryAgentSupportsTask(agent, task, commandPayload);
   });
   for (const candidate of eligibleCandidates) {
@@ -9484,9 +9817,12 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
         SELECT ca.*, tenant.status AS tenant_status,
           ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
           ab.id AS active_auth_binding_id,
-          daily_usage.usage_date =
-            (now() AT TIME ZONE 'Asia/Shanghai')::date AS today_usage_current,
-          daily_usage.searches AS today_searches,
+          COALESCE(
+            daily_usage.usage_date =
+              (now() AT TIME ZONE 'Asia/Shanghai')::date,
+            true
+          ) AS today_usage_current,
+          COALESCE(daily_usage.searches, 0)::integer AS today_searches,
           daily_usage.last_event_at AS today_usage_last_event_at,
           current_social_account.daily_search_limit,
           current_social_account.platform_account_id,
@@ -9497,7 +9833,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
           ON ac.id = ca.auth_code_id AND ac.tenant_id = ca.tenant_id
         LEFT JOIN auth_bindings ab
           ON ab.id = ca.auth_binding_id AND ab.code_id = ac.id
-        JOIN social_agent_daily_usage daily_usage
+        LEFT JOIN social_agent_daily_usage daily_usage
           ON daily_usage.tenant_id = ca.tenant_id
           AND daily_usage.agent_id = ca.id
           AND daily_usage.platform = $3
@@ -9513,14 +9849,21 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
           AND current_social_account.id =
             current_social_binding.social_account_id
         WHERE ca.id = $1 AND ca.tenant_id = $2
-          AND daily_usage.last_event_at IS NOT NULL
+          AND (cardinality($4::uuid[]) = 0 OR ca.id = ANY($4::uuid[]))
           AND (
             current_social_account.daily_search_limit IS NULL OR
             current_social_account.daily_search_limit = 0 OR
-            daily_usage.searches < current_social_account.daily_search_limit
+            COALESCE(daily_usage.searches, 0) + $5::integer <=
+              current_social_account.daily_search_limit
           )
-        FOR UPDATE OF ca, daily_usage
-      `, [candidate.id, tenantId, platform]);
+        FOR UPDATE OF ca
+      `, [
+        candidate.id,
+        tenantId,
+        platform,
+        allowedAgentIds,
+        Math.max(0, Math.floor(Number(expectedSearches) || 0)),
+      ]);
       const authExpired = locked?.auth_code_expires_at &&
         new Date(locked.auth_code_expires_at) < new Date();
       let eligible = locked &&
@@ -9530,7 +9873,7 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
         Boolean(locked.active_auth_binding_id) &&
         !authExpired &&
         captureAgentFullHeartbeatOnline(locked) &&
-        crossDeviceRetryAgentDailyUsageEligible(locked) &&
+        crossDeviceRetryAgentDailyUsageEligible(locked, expectedSearches) &&
         crossDeviceRetryAgentSupportsTask(locked, task, commandPayload);
       if (eligible && safetyHandoffPolicy) {
         const lockedAccount = await tx.queryOne(`
@@ -9559,7 +9902,17 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
             {excludeTaskIds: [task.id]},
           )
         : {kind: 'ineligible'};
-      if (!eligible || busy) {
+      const resourceAdmission = eligible && !busy
+        ? await reserveCaptureResourceAdmission(tx, {
+            tenantId,
+            parentTaskId: task.id,
+            agent: locked,
+            platform,
+            resourcePolicy,
+            expectedSearches,
+          })
+        : {allowed: false, reason: 'agent_busy'};
+      if (!eligible || busy || !resourceAdmission.allowed) {
         // Rolling back to the per-candidate savepoint releases both its row
         // lock and its transaction-level advisory lock before trying the next
         // idle browser. Locks acquired by the surrounding dispatch remain.
@@ -9889,7 +10242,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         text(requestKey, 100).toLowerCase() ||
       !Number.isSafeInteger(Number(dutyRecoveryGeneration)) ||
       Number(dutyRecoveryGeneration) < 1 ||
-      Number(dutyRecoveryGeneration) > 3 ||
+      Number(dutyRecoveryGeneration) > 1 ||
       !Number.isSafeInteger(Number(expectedRevision)) ||
       Number(expectedRevision) < 0 ||
       !Number.isSafeInteger(Number(expectedItemRevision)) ||
@@ -10289,6 +10642,20 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             ),
           });
         }
+        const sourceAttemptNumber = Math.max(
+          0,
+          Number(currentSourceAttempt?.attempt_number) || 0,
+          Number(sourceItem.attempt_count) || 0,
+        );
+        if (
+          sourceAttemptNumber >= AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT
+        ) {
+          return {
+            error: 'retry_items_not_automatically_recoverable',
+            code: 'AUTOMATIC_ATTEMPT_LIMIT_REACHED',
+            humanRequired: true,
+          };
+        }
         const sourceDisposition = classifyCaptureRecoveryDisposition(
           {
             ...sourceItem,
@@ -10459,6 +10826,36 @@ export async function dispatchCrossDeviceRetry(options = {}) {
       if (promoted.error) abortCrossDeviceRetry(promoted.error);
       const parent = promoted.parent;
       const businessTaskType = promoted.businessTaskType;
+      const parentMetadata = safeJson(parent.metadata);
+      const parentPlanSnapshot = safeJson(parentMetadata.planSnapshot);
+      const retryDistributionMode =
+        ['elastic_pool', 'fixed_batch'].includes(
+          text(parentMetadata.distributionMode, 40),
+        )
+          ? text(parentMetadata.distributionMode, 40)
+          : '';
+      const elasticKeywordRetry =
+        businessTaskType === 'unattended_keyword_capture' &&
+        retryDistributionMode === 'elastic_pool';
+      const retryPlanSnapshot = elasticKeywordRetry
+        ? {
+            ...parentPlanSnapshot,
+            recoveryPolicy: {
+              ...safeJson(parentPlanSnapshot.recoveryPolicy),
+              singleRelayV1: true,
+              disableAutomaticSearchRetry: true,
+            },
+          }
+        : parentPlanSnapshot;
+      const retryTaskForAgentSelection = elasticKeywordRetry
+        ? {
+            ...parent,
+            metadata: {
+              ...parentMetadata,
+              planSnapshot: retryPlanSnapshot,
+            },
+          }
+        : parent;
 
       const items = await tx.queryAll(`
         SELECT *
@@ -10600,6 +10997,63 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             : {},
         );
       }
+      if (automatic) {
+        for (const retryItem of retryItems) {
+          const sourceExecutionTaskId = text(
+            retryItem.execution_task_id,
+            100,
+          ).toLowerCase();
+          const sourceAttempt = UUID_PATTERN.test(sourceExecutionTaskId)
+            ? await tx.queryOne(`
+                SELECT id, agent_id, attempt_number, assignment_revision
+                FROM capture_task_item_attempts
+                WHERE tenant_id = $1
+                  AND item_id = $2
+                  AND execution_task_id = $3
+                ORDER BY attempt_number DESC, created_at DESC, id DESC
+                LIMIT 1
+                FOR UPDATE
+              `, [req.tenantId, retryItem.id, sourceExecutionTaskId])
+            : null;
+          const neverOpened =
+            !sourceExecutionTaskId &&
+            !retryItem.started_at &&
+            Math.max(0, Number(retryItem.attempt_count) || 0) === 0 &&
+            !sourceAttempt;
+          if (neverOpened) {
+            // A queued item with no execution, no attempt and no start time
+            // has no browser page to close. This is the only proof-free
+            // automatic handoff; any partial/malformed lineage fails closed.
+            continue;
+          }
+          const localClosureProof = await loadVerifiedCaptureLocalClosureProof(
+            tx,
+            {
+              tenantId: req.tenantId,
+              executionTaskId: sourceExecutionTaskId,
+              sourceAgentId:
+                sourceAttempt?.agent_id || retryItem.assigned_agent_id,
+              itemId: retryItem.id,
+              itemAttemptId: sourceAttempt?.id,
+              itemAttemptNumber: sourceAttempt?.attempt_number,
+              assignmentRevision:
+                sourceAttempt?.assignment_revision ??
+                retryItem.assignment_revision,
+            },
+          );
+          if (!localClosureProof.proven) {
+            abortCrossDeviceRetry(
+              'retry_source_local_closure_unproven',
+              {
+                code: 'SOURCE_LOCAL_CLOSURE_UNPROVEN',
+                waitingForSource: true,
+                itemId: retryItem.id,
+                sourceExecutionTaskId,
+              },
+            );
+          }
+        }
+      }
 
       // Finish profile authorization and execution-lineage preparation before
       // acquiring an Agent slot. If no compatible Agent remains, the explicit
@@ -10627,9 +11081,26 @@ export async function dispatchCrossDeviceRetry(options = {}) {
       const agentCompatibilityPayload = dutyRecovery
         ? {
             ...safeJson(sourceCommand?.payload),
+            ...(elasticKeywordRetry
+              ? {planSnapshot: retryPlanSnapshot}
+              : {}),
             dutyRecovery: {intentId: dutyIntentId, protocolVersion: 1},
           }
-        : safeJson(sourceCommand?.payload);
+        : {
+            ...safeJson(sourceCommand?.payload),
+            ...(elasticKeywordRetry
+              ? {planSnapshot: retryPlanSnapshot}
+              : {}),
+          };
+      const expectedRetrySearches =
+        businessTaskType === 'unattended_keyword_capture'
+          ? retryItems.reduce((total, retryItem) => total +
+              expectedElasticKeywordSearches({
+                planSnapshot: retryPlanSnapshot,
+                itemMetadata: retryItem.metadata,
+                keyword: retryItem.keyword,
+              }), 0)
+          : 0;
 
       if (!targetAgent) {
         const attemptedAgents = await tx.queryAll(`
@@ -10641,26 +11112,15 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         `, [req.tenantId, retryItems.map(item => item.id)]);
         targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
           tenantId: req.tenantId,
-          task: parent,
+          task: retryTaskForAgentSelection,
           sourceAgentIds: crossDeviceRetrySourceAgentIdsForItems(
             retryItems,
             attemptedAgents,
           ),
           commandPayload: agentCompatibilityPayload,
           safetyHandoffPolicy: dutySafetyHandoffPolicy,
+          expectedSearches: expectedRetrySearches,
         });
-        if (!targetAgent && dutyRecovery && allowPreviouslyAttemptedAgents) {
-          targetAgent = await loadIdleCrossDeviceRetryAgent(tx, {
-            tenantId: req.tenantId,
-            task: parent,
-            sourceAgentIds: crossDeviceRetrySafetyAgentIdsForItems(
-              retryItems,
-              attemptedAgents,
-            ),
-            commandPayload: agentCompatibilityPayload,
-            safetyHandoffPolicy: dutySafetyHandoffPolicy,
-          });
-        }
         if (!targetAgent) {
           abortCrossDeviceRetry('idle_compatible_agent_unavailable', {
             code: 'NO_IDLE_AGENT',
@@ -10688,7 +11148,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
       let childPlan = {};
       let sequentialResumeCheckpoint = null;
       if (businessTaskType === 'unattended_keyword_capture') {
-        const planSnapshot = safeJson(safeJson(parent.metadata).planSnapshot);
+        const planSnapshot = retryPlanSnapshot;
         if (retryItems.length === 1) {
           sequentialResumeCheckpoint = buildSequentialSearchResumeCheckpoint({
             planSnapshot,
@@ -10729,6 +11189,9 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             revision: nextRevision,
             itemIds: retryItems.map(item => item.id),
             sourceExecutionTaskIds,
+            ...(retryDistributionMode
+              ? {distributionMode: retryDistributionMode}
+              : {}),
           },
         };
       } else {
@@ -11429,6 +11892,17 @@ export async function dispatchCrossDeviceRetry(options = {}) {
       };
     }
     if (
+      automatic &&
+      error?.crossDeviceRetryError ===
+        'retry_source_local_closure_unproven'
+    ) {
+      return {
+        error: 'retry_source_local_closure_unproven',
+        waitingForSource: true,
+        ...safeJson(error.details),
+      };
+    }
+    if (
       dutyRecovery &&
       error?.crossDeviceRetryError ===
         'retry_requires_manual_safety_action'
@@ -11595,6 +12069,80 @@ export async function reconcileElasticCaptureLeases(input = 50) {
       const timeoutMessage = agentOffline
         ? '执行节点持续离线，工作项已退回弹性队列'
         : '执行节点在线但当前任务心跳中断，工作项已退回弹性队列';
+      const sourceItem = await tx.queryOne(`
+        SELECT id, assigned_agent_id, assignment_revision
+        FROM capture_task_items
+        WHERE tenant_id = $1
+          AND task_id = $2
+          AND execution_task_id = $3
+          AND assigned_agent_id = $4
+        ORDER BY ordinal, id
+        LIMIT 1
+        FOR UPDATE
+      `, [
+        candidate.tenant_id,
+        candidate.parent_task_id,
+        child.id,
+        child.assigned_agent_id,
+      ]);
+      const sourceAttempt = sourceItem
+        ? await tx.queryOne(`
+            SELECT id, agent_id, attempt_number, assignment_revision
+            FROM capture_task_item_attempts
+            WHERE tenant_id = $1
+              AND item_id = $2
+              AND execution_task_id = $3
+              AND agent_id = $4
+            ORDER BY attempt_number DESC, created_at DESC, id DESC
+            LIMIT 1
+            FOR UPDATE
+          `, [
+            candidate.tenant_id,
+            sourceItem.id,
+            child.id,
+            child.assigned_agent_id,
+          ])
+        : null;
+      const localClosureProof = await loadVerifiedCaptureLocalClosureProof(tx, {
+        tenantId: candidate.tenant_id,
+        executionTaskId: child.id,
+        sourceAgentId: child.assigned_agent_id,
+        itemId: sourceItem?.id,
+        itemAttemptId: sourceAttempt?.id,
+        itemAttemptNumber: sourceAttempt?.attempt_number,
+        assignmentRevision:
+          sourceAttempt?.assignment_revision ??
+          sourceItem?.assignment_revision,
+      });
+      if (!localClosureProof.proven) {
+        const firstWait =
+          safeJson(child.metadata).waitingForSourceClosure !== true;
+        await tx.execute(`
+          UPDATE capture_tasks
+          SET metadata = metadata || jsonb_build_object(
+            'waitingForSourceClosure', true,
+            'sourceClosureBlockedAt', now()::text
+          )
+          WHERE id = $1 AND tenant_id = $2
+        `, [child.id, candidate.tenant_id]);
+        if (firstWait) {
+          await appendEvent(tx, {
+            tenantId: candidate.tenant_id,
+            taskId: child.id,
+            agentId: child.assigned_agent_id,
+            eventType: 'elastic_stale_execution_waiting_local_closure',
+            status: child.status,
+            message: '任务心跳中断，但原设备尚未确认关闭本地工作页，暂不接力',
+            payload: {
+              parentTaskId: candidate.parent_task_id,
+              itemId: sourceItem?.id || '',
+              timeoutCode,
+              proofReason: text(localClosureProof.reason, 160),
+            },
+          });
+        }
+        return 'waiting_local_closure';
+      }
       const failed = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = 'failed',

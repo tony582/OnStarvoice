@@ -13,6 +13,9 @@ import {
   normalizeCaptureLocalClosureEvidence,
   normalizeCaptureLocalClosureEvidenceList,
 } from './capture-local-closure-proof.js';
+import {
+  normalizeCaptureResourcePolicy,
+} from './capture-resource-policy.js';
 
 const CLOUD_TASK_STATUSES = new Set([
   'pending',
@@ -438,6 +441,11 @@ export function normalizeRemoteTaskInput(input = {}) {
     rawRecoveryPolicy.require_verified_filters,
     false,
   );
+  const singleRelayV1 = boolean(
+    rawRecoveryPolicy.singleRelayV1 ??
+    rawRecoveryPolicy.single_relay_v1,
+    false,
+  );
   const recoveryPolicy = {
     allowIdleAgentHandoff: boolean(
       rawRecoveryPolicy.allowIdleAgentHandoff ??
@@ -446,10 +454,14 @@ export function normalizeRemoteTaskInput(input = {}) {
     ),
     ...(disableAutomaticSearchRetry ? {disableAutomaticSearchRetry: true} : {}),
     ...(requireVerifiedFilters ? {requireVerifiedFilters: true} : {}),
+    ...(singleRelayV1 ? {singleRelayV1: true} : {}),
     // Platform safety challenges are never allowed to trigger an automatic
     // device switch. This value is intentionally fixed by the server contract.
     platformSafetyMode: 'manual_confirmed',
   };
+  const resourcePolicy = normalizeCaptureResourcePolicy(
+    read('resourcePolicy') || read('resource_policy'),
+  );
 
   const planSnapshot = {
     enabled,
@@ -465,6 +477,7 @@ export function normalizeRemoteTaskInput(input = {}) {
     maxRounds,
     ...(sequentialSearchEnabled ? {searchPasses} : {}),
     recoveryPolicy,
+    ...(Object.keys(resourcePolicy).length > 0 ? {resourcePolicy} : {}),
     holidayDates: '',
     customDates,
     ...(hasCaptureSettings ? {captureSettings} : {}),

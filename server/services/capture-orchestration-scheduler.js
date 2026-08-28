@@ -574,10 +574,15 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
         keyword: templateItem.keyword,
         ordinal: Number(templateItem.ordinal),
         scheduleTemplateItemId: templateItem.id,
+        ...(distributionMode === 'elastic_pool'
+          ? {
+              disableAutomaticSearchRetry: true,
+              singleRelayV1: true,
+            }
+          : {}),
         ...(sequentialSearchEnabled
           ? {
               searchPasses,
-              disableAutomaticSearchRetry: true,
               requireVerifiedFilters: true,
             }
           : {}),
