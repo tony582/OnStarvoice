@@ -12,7 +12,7 @@ const NOW = new Date('2026-08-27T01:00:00.000Z');
 
 function evidence(overrides = {}) {
   return {
-    version: 1,
+    version: 2,
     requestId: 'request-1',
     attemptId: 'attempt-1',
     itemId: '11111111-1111-4111-8111-111111111111',
@@ -81,6 +81,20 @@ test('authoritative terminal closure evidence is accepted exactly once scoped', 
   assert.equal(result.evidence.streamingSyncRemainingCount, 0);
   assert.equal(result.evidence.capturedRecordCount, 2);
   assert.equal(result.evidence.streamingSyncExcludedUniqueCount, 1);
+});
+
+test('legacy v1 closure remains valid during a rolling Extension update', () => {
+  const legacy = evidence({version: 1, capturedRecordCount: 2});
+  delete legacy.streamingSyncCapturedUniqueCount;
+  delete legacy.streamingSyncEnqueuedUniqueCount;
+  delete legacy.streamingSyncExcludedUniqueCount;
+  delete legacy.streamingSyncSucceededUniqueCount;
+  assert.ok(normalizeCaptureLocalClosureEvidence(legacy));
+
+  assert.equal(
+    normalizeCaptureLocalClosureEvidence({...legacy, capturedRecordCount: 3}),
+    null,
+  );
 });
 
 test('missing or default-looking upload stats never normalize as closure proof', () => {
@@ -156,7 +170,20 @@ test('enabled sync proof is based on unique coverage rather than raw saved rows'
   assert.equal(normalized.streamingSyncCapturedUniqueCount, 3);
 });
 
-test('agent, attempt, assignment, snapshot revision and freshness are all fenced', () => {
+test('nonzero saved rows cannot be proven by an all-zero unique ledger', () => {
+  assert.equal(normalizeCaptureLocalClosureEvidence(evidence({
+    capturedRecordCount: 2,
+    streamingSyncEnqueuedCount: 0,
+    streamingSyncProcessedCount: 0,
+    streamingSyncSuccessCount: 0,
+    streamingSyncCapturedUniqueCount: 0,
+    streamingSyncEnqueuedUniqueCount: 0,
+    streamingSyncExcludedUniqueCount: 0,
+    streamingSyncSucceededUniqueCount: 0,
+  })), null);
+});
+
+test('agent, attempt, assignment, snapshot revision and clocks are all fenced', () => {
   for (const [overrides, failedCheck] of [
     [{expectedAttemptId: 'attempt-2'}, 'attempt'],
     [{expectedItemAttemptId: '44444444-4444-4444-8444-444444444444'}, 'itemAttempt'],
@@ -164,12 +191,20 @@ test('agent, attempt, assignment, snapshot revision and freshness are all fenced
     [{expectedSnapshotRevision: 12}, 'snapshotRevision'],
     [{snapshotAgentId: '55555555-5555-4555-8555-555555555555'}, 'agent'],
     [{snapshotStatus: 'completed'}, 'terminalStatusMatches'],
-    [{snapshotReceivedAt: '2026-08-26T23:00:00.000Z'}, 'freshSnapshot'],
+    [{snapshotReceivedAt: '2026-08-27T01:02:00.000Z'}, 'freshSnapshot'],
   ]) {
     const result = verify(overrides);
     assert.equal(result.proven, false, failedCheck);
     assert.ok(result.failedChecks.includes(failedCheck), failedCheck);
   }
+});
+
+test('persisted exact closure proof does not expire while an item remains fenced', () => {
+  const result = verify({
+    now: new Date('2026-08-28T01:00:00.000Z'),
+  });
+  assert.equal(result.proven, true);
+  assert.deepEqual(result.failedChecks, []);
 });
 
 test('multi-item closure selection stays exact and rejects malformed or duplicate arrays', () => {

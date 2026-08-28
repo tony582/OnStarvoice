@@ -189,7 +189,7 @@ test('mixed-platform profile patrol is rejected before any task is created', asy
   assert.equal(queried, false);
 });
 
-test('scheduled profile patrol treats attention tasks as idle and fails over without rebinding', async () => {
+test('scheduled profile patrol treats settled attention as idle but blocks interrupted execution', async () => {
   const {
     loadAvailableScheduledProfilePatrolAgent,
     profilePatrolTaskBlocksAgentSlot,
@@ -200,7 +200,7 @@ test('scheduled profile patrol treats attention tasks as idle and fails over wit
   assert.equal(profilePatrolTaskBlocksAgentSlot('waiting_device'), true);
   assert.equal(profilePatrolTaskBlocksAgentSlot('resume_requested'), true);
   assert.equal(profilePatrolTaskBlocksAgentSlot('needs_action'), false);
-  assert.equal(profilePatrolTaskBlocksAgentSlot('interrupted'), false);
+  assert.equal(profilePatrolTaskBlocksAgentSlot('interrupted'), true);
   assert.equal(profilePatrolTaskBlocksAgentSlot('failed'), false);
 
   const preferredAgentId = '10000000-0000-4000-8000-000000000001';
@@ -369,6 +369,7 @@ test('stale profile execution cleanup preserves live commands and online runners
     'claimed',
     'running',
     'recovering',
+    'interrupted',
     'resume_requested',
   ]);
   assert.equal(statements.length, 1);

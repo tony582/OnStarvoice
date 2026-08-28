@@ -27,6 +27,9 @@ import {
 import {
   captureTaskBusinessRootVisibilitySql,
   captureCreateCommandExpiryEligible,
+  captureCreateCommandExpiredBeforeOpen,
+  captureExecutionNeverOpened,
+  captureItemRequiresLocalClosureReuseFence,
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
   buildSequentialSearchResumeCheckpoint,
@@ -97,6 +100,32 @@ test("capture agents distinguish browser profiles while retaining their environm
   );
 });
 
+test("local closure reuse fencing only applies to marked keyword executions", () => {
+  assert.equal(
+    captureItemRequiresLocalClosureReuseFence({
+      itemType: "keyword",
+      sourceExecutionMetadata: {requiresLocalClosureReuseFenceV1: true},
+    }),
+    true,
+  );
+  assert.equal(
+    captureItemRequiresLocalClosureReuseFence({
+      itemType: "keyword",
+      sourceExecutionMetadata: {},
+    }),
+    false,
+  );
+  for (const itemType of ["negative_post", "watched_content"]) {
+    assert.equal(
+      captureItemRequiresLocalClosureReuseFence({
+        itemType,
+        sourceExecutionMetadata: {requiresLocalClosureReuseFenceV1: true},
+      }),
+      false,
+    );
+  }
+});
+
 test("guarded recovery adapters fail closed before an invalid target can widen scope", async () => {
   const tenantId = "11111111-1111-4111-8111-111111111111";
   assert.equal(
@@ -138,9 +167,10 @@ test("physical Agent slots ignore attention history but block live commands", as
     "claimed",
     "running",
     "recovering",
+    "interrupted",
     "resume_requested",
   ]);
-  assert.equal(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes("interrupted"), false);
+  assert.equal(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes("interrupted"), true);
   assert.equal(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes("needs_action"), false);
 
   let statement = null;
@@ -1779,6 +1809,8 @@ test("handoff metadata survives agent snapshots and fences resume on the source 
     "router.post('/agent/heartbeat'",
   );
   for (const field of [
+    "requiresLocalClosureReuseFenceV1",
+    "stoppedBeforeDispatch",
     "handoffRequestHash",
     "handoffRequestKey",
     "handoffSourceExecutionTaskId",
@@ -1798,6 +1830,89 @@ test("handoff metadata survives agent snapshots and fences resume on the source 
   assert.match(resume, /task\.metadata\?\.handoffSuccessorTaskId/u);
   assert.match(resume, /task_handed_off/u);
   assert.match(resume, /后续关键词已经转交其他 Agent/u);
+});
+
+test("server-owned local closure metadata survives snapshots without Agent injection", () => {
+  const mirror = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(
+    mirror,
+    /metadata = \(\s*EXCLUDED\.metadata\s*- 'requiresLocalClosureReuseFenceV1'\s*- 'stoppedBeforeDispatch'\s*\)/u,
+    "an Agent snapshot must not mint either server-owned fence field",
+  );
+  assert.match(
+    mirror,
+    /const agentSnapshotMetadata = \{\.\.\.safeJson\(snapshot\.metadata\)\};[\s\S]*delete agentSnapshotMetadata\.requiresLocalClosureReuseFenceV1;[\s\S]*delete agentSnapshotMetadata\.stoppedBeforeDispatch;[\s\S]*JSON\.stringify\(agentSnapshotMetadata\)/u,
+    "newly discovered snapshots must be stripped before their initial insert too",
+  );
+  for (const field of [
+    "requiresLocalClosureReuseFenceV1",
+    "stoppedBeforeDispatch",
+  ]) {
+    assert.match(
+      mirror,
+      new RegExp(`'${field}', capture_tasks\\.metadata->'${field}'`, "u"),
+      `${field} must round-trip from existing server metadata`,
+    );
+  }
+});
+
+test("historical closure reuse ignores mutable item start after Agent A to B reassignment", () => {
+  const reuseGate = readRouteSection(
+    "async function loadCaptureAgentLocalClosureReuseGate",
+    "export async function dispatchCrossDeviceRetry",
+  );
+  assert.match(reuseGate, /attempt\.agent_id = \$2/u);
+  assert.match(
+    reuseGate,
+    /execution\.started_at IS NULL[\s\S]*attempt\.started_at IS NULL/u,
+    "Agent A's immutable execution and attempt starts define whether A opened",
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /item\.started_at IS NULL/u,
+    "Agent B starting the shared item later must not retroactively change A",
+  );
+
+  const claim = readRouteSection(
+    "async function dispatchNextElasticWorkItem",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(
+    claim,
+    /item\.started_at AS item_started_at[\s\S]*itemStartedAt: candidate\.item_started_at/u,
+    "the current source candidate may still use the item start before reassignment",
+  );
+});
+
+test("legacy 0.3.96 keyword reuse gets bounded quiescence without weakening marked proof", () => {
+  const reuseGate = readRouteSection(
+    "async function loadCaptureAgentLocalClosureReuseGate",
+    "export async function dispatchCrossDeviceRetry",
+  );
+  assert.match(
+    reuseGate,
+    /SELECT DISTINCT ON \(requires_local_closure_proof\)[\s\S]*requires_local_closure_proof DESC/u,
+    "marked and legacy histories must be evaluated independently",
+  );
+  const markedProof = reuseGate.indexOf("if (latestMarkedAttempt)");
+  const legacyGrace = reuseGate.indexOf("legacy_local_cleanup_quiescence");
+  assert.ok(markedProof >= 0);
+  assert.ok(
+    legacyGrace > markedProof,
+    "a capability downgrade cannot replace the proof required by marked history",
+  );
+  assert.match(
+    reuseGate,
+    /terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)/u,
+  );
+  assert.match(
+    reuseGate,
+    /latestLegacyAttempt\.legacy_quiescent !== true/u,
+  );
+  assert.doesNotMatch(reuseGate, /capabilities|freshCapabilities/u);
 });
 
 test("agent execution-slot locks serialize heartbeat, resume, and handoff assignment", async () => {
@@ -2205,6 +2320,15 @@ test("create command failures and successful stops settle orchestration work ite
   );
   assert.match(
     expiry,
+    /'reason', 'agent_inactive',[\s\S]*'commandStatusBefore', c\.status[\s\S]*result->>'commandStatusBefore' AS command_status_before/u,
+    "Agent-unavailable settlement must persist whether create was pending or acknowledged",
+  );
+  assert.match(
+    expiry,
+    /'code', 'create_agent_unavailable',[\s\S]*'commandStatusBefore', \$4::text/u,
+  );
+  assert.match(
+    expiry,
     /failProfileDiscoveryWork\(tx,[\s\S]*code: 'create_command_expired'/u,
   );
   assert.match(
@@ -2287,6 +2411,131 @@ test("acknowledged create expiry waits for Agent liveness, while pending expiry 
   }, now, graceMs), true, "non-create command expiry remains unchanged");
 });
 
+test("only a never-acknowledged expired create can bypass local closure", () => {
+  const pendingExpiry = {
+    code: "create_command_expired",
+    commandStatusBeforeExpiry: "pending",
+  };
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({error: pendingExpiry}),
+    true,
+  );
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({
+      error: {...pendingExpiry, commandStatusBeforeExpiry: "acknowledged"},
+    }),
+    false,
+  );
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({
+      error: pendingExpiry,
+      executionStartedAt: "2026-08-29T00:00:00.000Z",
+    }),
+    false,
+  );
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({
+      error: pendingExpiry,
+      attemptStartedAt: "2026-08-29T00:00:00.000Z",
+    }),
+    false,
+  );
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({
+      error: pendingExpiry,
+      itemStartedAt: "2026-08-29T00:00:00.000Z",
+    }),
+    false,
+  );
+});
+
+test("never-open classification covers unavailable Agents and pre-dispatch stops", () => {
+  const executionTaskId = "11111111-1111-4111-8111-111111111111";
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      error: {
+        code: "create_agent_unavailable",
+        commandStatusBefore: "pending",
+      },
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      sourceExecutionMetadata: {stoppedBeforeDispatch: true},
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      error: {
+        code: "create_agent_unavailable",
+        commandStatusBefore: "pending",
+      },
+      attemptStartedAt: "2026-08-29T00:00:00.000Z",
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "an attempt start is evidence that a browser may need closure",
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      error: {
+        code: "create_agent_unavailable",
+        commandStatusBefore: "acknowledged",
+      },
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "an acknowledged create may have opened and must fail closed",
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      error: {
+        code: "create_agent_unavailable",
+        commandStatusBefore: "pending",
+      },
+      executionStartedAt: "2026-08-29T00:00:00.000Z",
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "an execution start keeps the closure fence fail-closed",
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      sourceExecutionMetadata: {stoppedBeforeDispatch: true},
+      itemStartedAt: "2026-08-29T00:00:00.000Z",
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "an item start keeps the closure fence fail-closed",
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "unknown partial lineage must not bypass the closure fence",
+  );
+  assert.equal(captureExecutionNeverOpened({}), true);
+});
+
 test("stale command reconciliation rechecks acknowledged create liveness before retry projection", () => {
   const expiry = readRouteSection(
     "async function expireStaleCommands",
@@ -2341,19 +2590,86 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /elasticAttemptBudgetUsed/u);
   assert.match(claim, /item\.attempt_count < \$3/u);
   assert.match(claim, /freshCapabilities\.singleRelayV1 === true/u);
+  assert.match(claim, /freshCapabilities\.localClosureReuseFenceV1 === true/u);
+  assert.match(
+    claim,
+    /const localClosureReuseGate = await loadCaptureAgentLocalClosureReuseGate\([\s\S]*tenantId: agent\.tenant_id,[\s\S]*agentId: agent\.id[\s\S]*if \(!localClosureReuseGate\.ready\)/u,
+  );
+  const reuseGate = readRouteSection(
+    "async function loadCaptureAgentLocalClosureReuseGate",
+    "export async function dispatchCrossDeviceRetry",
+  );
+  assert.match(
+    reuseGate,
+    /requiresLocalClosureReuseFenceV1[\s\S]*JOIN capture_task_items item[\s\S]*item\.item_type = 'keyword'/u,
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /'superseded'|'interrupted'/u,
+  );
+  assert.match(
+    reuseGate,
+    /execution\.started_at IS NULL[\s\S]*attempt\.started_at IS NULL/u,
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /item\.started_at IS NULL/u,
+    "historical Agent A must not be reclassified when Agent B later starts the shared item",
+  );
+  assert.match(
+    reuseGate,
+    /execution\.error->>'code' = 'create_agent_unavailable'[\s\S]*execution\.error->>'commandStatusBefore' = 'pending'/u,
+  );
+  assert.ok(
+    reuseGate.indexOf("AND NOT (") <
+      reuseGate.indexOf("ORDER BY requires_local_closure_proof"),
+    "strict never-open rows must be removed before latest-attempt ordering",
+  );
+  assert.match(reuseGate, /loadVerifiedCaptureLocalClosureProof/u);
+  assert.match(
+    reuseGate,
+    /COALESCE\([\s\S]*requiresLocalClosureReuseFenceV1[\s\S]*AS requires_local_closure_proof/u,
+  );
+  assert.match(
+    reuseGate,
+    /terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)[\s\S]*legacy_local_cleanup_quiescence/u,
+    "unmarked 0.3.96 history must pause reuse for a bounded server-first grace",
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 2 \* 60 \* 1000/u,
+  );
   assert.match(claim, /requiresSingleRelay/u);
   assert.match(claim, /waitingForSourceClosure/u);
+  assert.match(claim, /source_execution_metadata/u);
+  assert.match(
+    claim,
+    /captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: candidate\.item_type,[\s\S]*sourceExecutionMetadata: candidate\.source_execution_metadata/u,
+  );
   assert.match(
     claim,
     /CASE[\s\S]*waitingForSourceClosure'[\s\S]*THEN 1[\s\S]*sourceClosureBlockedAt/u,
   );
   assert.match(claim, /loadVerifiedCaptureLocalClosureProof/u);
   assert.match(claim, /item\.started_at AS item_started_at/u);
+  assert.match(claim, /AS source_execution_started_at/u);
   assert.match(
     claim,
-    /const neverOpened =\s*!previousExecutionTaskId[\s\S]*!candidate\.item_started_at[\s\S]*attempt_count[\s\S]*!sourceAttempt/u,
+    /const neverOpened = captureExecutionNeverOpened\(\{[\s\S]*executionTaskId: previousExecutionTaskId,[\s\S]*sourceExecutionMetadata: candidate\.source_execution_metadata,[\s\S]*executionStartedAt: candidate\.source_execution_started_at,[\s\S]*attemptExists: Boolean\(sourceAttempt\)/u,
+  );
+  assert.match(reuseGate, /commandStatusBeforeExpiry' = 'pending'/u);
+  assert.match(reuseGate, /execution\.error->>'code' = 'create_agent_unavailable'/u);
+  assert.match(reuseGate, /execution\.metadata->>'stoppedBeforeDispatch' = 'true'/u);
+  assert.match(claim, /requiresLocalClosureReuseFenceV1: true/u);
+  assert.doesNotMatch(
+    reuseGate,
+    /attempt\.updated_at > now\(\) - interval '30 minutes'/u,
   );
   assert.match(claim, /!neverOpened && localClosureProof\.proven !== true/u);
+  assert.match(
+    claim,
+    /canFenceLocalClosureReuse && candidate\.item_type === 'keyword'[\s\S]*requiresLocalClosureReuseFenceV1: true/u,
+  );
   assert.match(claim, /status = 'retryable'[\s\S]*elastic_handoff_waiting_local_closure/u);
   assert.match(claim, /expectedElasticKeywordSearches/u);
   assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
@@ -2462,6 +2778,10 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   assert.match(lease, /elastic_task_heartbeat_timeout/u);
   assert.match(lease, /captureAgentLivenessOnline/u);
   assert.match(lease, /loadVerifiedCaptureLocalClosureProof/u);
+  assert.match(
+    lease,
+    /captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: sourceItem\?\.item_type,[\s\S]*sourceExecutionMetadata: child\.metadata/u,
+  );
   assert.match(lease, /elastic_stale_execution_waiting_local_closure/u);
   assert.match(lease, /return 'waiting_local_closure'/u);
   assert.ok(
@@ -3874,6 +4194,20 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
     'a fixed or promoted retry must not be mislabeled as an elastic queue claim',
   );
   assert.match(dispatchCore, /retry_source_local_closure_unproven/u);
+  assert.match(dispatchCore, /SELECT id, status, metadata/u);
+  assert.match(dispatchCore, /sourceExecutionMetadataById/u);
+  assert.match(
+    dispatchCore,
+    /const sourceExecutionMetadata =\s*sourceExecutionMetadataById\.get\(sourceExecutionTaskId\)[\s\S]*captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: retryItem\.item_type,[\s\S]*sourceExecutionMetadata,/u,
+  );
+  assert.match(
+    dispatchCore,
+    /const neverOpened = captureExecutionNeverOpened\(\{[\s\S]*executionTaskId: sourceExecutionTaskId,[\s\S]*sourceExecutionMetadata,[\s\S]*executionStartedAt:[\s\S]*sourceExecutionStartedAtById\.get\(sourceExecutionTaskId\)[\s\S]*attemptExists: Boolean\(sourceAttempt\)/u,
+  );
+  assert.match(
+    dispatchCore,
+    /const targetSupportsLocalClosureReuseFence =\s*businessTaskType === 'unattended_keyword_capture'[\s\S]*safeJson\(targetAgent\.capabilities\)\.localClosureReuseFenceV1 === true[\s\S]*requiresLocalClosureReuseFenceV1: undefined[\s\S]*targetSupportsLocalClosureReuseFence[\s\S]*requiresLocalClosureReuseFenceV1: true/u,
+  );
   assert.match(dispatchCore, /expectedSearches: expectedRetrySearches/u);
   assert.match(
     captureCloudRouteSource,
@@ -3914,6 +4248,19 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
   );
   assert.match(dispatchCore, /dutyRecoverySourceAttemptId/u);
   assert.match(dispatchCore, /recoveryPhase: 'duty'/u);
+
+  const agentSelection = readRouteSection(
+    "async function loadIdleCrossDeviceRetryAgent",
+    "function promotedRetryFallbackTarget",
+  );
+  assert.match(
+    agentSelection,
+    /tryLockCaptureAgentExecutionSlot[\s\S]*loadCaptureAgentLocalClosureReuseGate\(tx,[\s\S]*agentId: locked\.id/u,
+  );
+  assert.match(
+    agentSelection,
+    /localClosureReuseGate\.ready[\s\S]*reserveCaptureResourceAdmission[\s\S]*!localClosureReuseGate\.ready/u,
+  );
 });
 
 test("recovery verification and replay clocks require exact business evidence", () => {

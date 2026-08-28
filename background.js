@@ -124,7 +124,7 @@ const UNATTENDED_RUNNER_QUERY_KEY = 'unattendedRun';
 const UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY = 'unattendedAttempt';
 const UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX =
   'onstarvoice.unattendedCheckpointReportOutbox.v2.';
-const UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION = 1;
+const UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION = 2;
 const TARGETED_POST_RUNNER_QUERY_KEY = 'targetedPostRun';
 const TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY = 'targetedPostAttempt';
 const SCHEDULE_MODES = new Set([
@@ -2020,6 +2020,7 @@ let cloudTaskAgentSyncTimer = null;
 let cloudTaskAgentLastError = '';
 let cloudTaskAgentFailureCount = 0;
 let cloudTaskAgentRetryNotBefore = 0;
+const cloudTaskAgentConfirmedLocalClosureKeys = new Set();
 let socialAccountIdentityRefreshInFlight = null;
 let socialAccountUsageQueueMutation = Promise.resolve();
 
@@ -4221,6 +4222,14 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
 
     clearCloudTaskAgentFailureBackoff();
     cloudTaskAgentLastSyncAt = Date.now();
+    // A successful heartbeat is one transaction on the server. Remember only
+    // the exact terminal attempt + closure-v2 identity set that this request
+    // carried, so an in-heartbeat resume command can safely reuse the receipt
+    // without recursively starting a second heartbeat.
+    rememberConfirmedUnattendedLocalClosures(
+      payload,
+      stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+    );
     if (reportedLastError) {
       await clearReportedCloudTaskAgentError(reportedLastError);
       cloudTaskAgentSyncPending = true;
@@ -4881,7 +4890,7 @@ async function markUnattendedRunRequestStale(request, message) {
   });
 }
 
-async function cancelUnattendedKeywordRunRequest(
+async function cancelUnattendedKeywordRunRequestWithinMutation(
   message,
   {
     requestId = '',
@@ -4890,69 +4899,82 @@ async function cancelUnattendedKeywordRunRequest(
     cancelSource = 'user',
     cancelReason = 'user_canceled',
     errorCode = 'USER_CANCELED',
+    requirePlanDisabled = false,
+    expectedPlanUpdatedAt = '',
   } = {},
 ) {
-  return await runUnattendedRunMutation(async () => {
-    const request = await readUnattendedKeywordRunRequest();
-    if (
-      !request ||
-      (requestId && request.id !== requestId) ||
-      (attemptId && request.attemptId !== attemptId) ||
-      (localOnly && request.cloudAssigned === true) ||
-      (isTerminalUnattendedRunStatus(request.status) &&
-        request.status !== 'needs_action')
-    ) {
-      return null;
-    }
-    const now = new Date().toISOString();
-    const nextRequest = {
-      ...request,
-      status: 'canceled',
-      error: {
-        code: String(errorCode || 'USER_CANCELED'),
-        reason: String(cancelReason || 'user_canceled'),
-        category: String(cancelReason || 'user_canceled'),
-        message,
-        retryable: false,
-      },
-      metadata: {
-        ...(request.metadata && typeof request.metadata === 'object'
-          ? request.metadata
-          : {}),
-        cancelSource: String(cancelSource || 'user'),
-        cancelReason: String(cancelReason || 'user_canceled'),
-      },
-      recoveryPendingLaunch: false,
-      recoveryWaitUntil: '',
-      wakeGraceUntil: '',
-      finishedAt: now,
-      updatedAt: now,
+  const request = await readUnattendedKeywordRunRequest();
+  const plan = requirePlanDisabled
+    ? await readUnattendedKeywordPlan()
+    : null;
+  if (
+    !request ||
+    (requestId && request.id !== requestId) ||
+    (attemptId && request.attemptId !== attemptId) ||
+    (localOnly && request.cloudAssigned === true) ||
+    (requirePlanDisabled && plan?.enabled !== false) ||
+    (requirePlanDisabled &&
+      expectedPlanUpdatedAt &&
+      String(plan?.updatedAt || '') !== String(expectedPlanUpdatedAt)) ||
+    (isTerminalUnattendedRunStatus(request.status) &&
+      request.status !== 'needs_action')
+  ) {
+    return null;
+  }
+  const now = new Date().toISOString();
+  const nextRequest = {
+    ...request,
+    status: 'canceled',
+    error: {
+      code: String(errorCode || 'USER_CANCELED'),
+      reason: String(cancelReason || 'user_canceled'),
+      category: String(cancelReason || 'user_canceled'),
       message,
-      progress: {
-        ...(request.progress && typeof request.progress === 'object'
-          ? request.progress
-          : {}),
-        phase: 'unattended_canceled',
-        waitUntil: '',
-        remainingMs: null,
-        message,
-        updatedAt: now,
+      retryable: false,
+    },
+    metadata: {
+      ...(request.metadata && typeof request.metadata === 'object'
+        ? request.metadata
+        : {}),
+      cancelSource: String(cancelSource || 'user'),
+      cancelReason: String(cancelReason || 'user_canceled'),
+    },
+    recoveryPendingLaunch: false,
+    recoveryWaitUntil: '',
+    wakeGraceUntil: '',
+    finishedAt: now,
+    updatedAt: now,
+    message,
+    progress: {
+      ...(request.progress && typeof request.progress === 'object'
+        ? request.progress
+        : {}),
+      phase: 'unattended_canceled',
+      waitUntil: '',
+      remainingMs: null,
+      message,
+      updatedAt: now,
+    },
+  };
+  await persistUnattendedRunMutation(nextRequest, {
+    previousRequest: request,
+    event: {
+      type: 'canceled',
+      message,
+      at: now,
+      metadata: {
+        cancelSource: String(cancelSource || 'user'),
+        reason: String(cancelReason || 'user_canceled'),
       },
-    };
-    await persistUnattendedRunMutation(nextRequest, {
-      previousRequest: request,
-      event: {
-        type: 'canceled',
-        message,
-        at: now,
-        metadata: {
-          cancelSource: String(cancelSource || 'user'),
-          reason: String(cancelReason || 'user_canceled'),
-        },
-      },
-    });
-    return nextRequest;
+    },
   });
+  return nextRequest;
+}
+
+async function cancelUnattendedKeywordRunRequest(message, options = {}) {
+  return await runUnattendedRunMutation(async () =>
+    cancelUnattendedKeywordRunRequestWithinMutation(message, options),
+  );
 }
 
 async function relayCancelToTabs(tabIds = []) {
@@ -5052,17 +5074,32 @@ async function releaseUnattendedKeywordPlanLock() {
   return await releaseCaptureExecutionLock(activeLock.id);
 }
 
-async function cleanupTerminalUnattendedRuntime(request, tabIds = []) {
+async function cleanupTerminalUnattendedRuntime(
+  request,
+  tabIds = [],
+  {
+    requirePlanDisabled = false,
+    expectedPlanUpdatedAt = '',
+  } = {},
+) {
   const normalizedRequest = normalizeUnattendedRunRequest(request);
   if (!normalizedRequest) return {request: null, relayedCount: 0};
   const expectedRequestId = String(normalizedRequest.id || '').trim();
   const expectedAttemptId = String(normalizedRequest.attemptId || '').trim();
   const persistCleanupState = () => runUnattendedRunMutation(async () => {
     const current = await readUnattendedKeywordRunRequest();
+    const plan = requirePlanDisabled
+      ? await readUnattendedKeywordPlan()
+      : null;
     if (
       !current ||
       current.id !== expectedRequestId ||
       current.attemptId !== expectedAttemptId ||
+      (requirePlanDisabled && current.cloudAssigned === true) ||
+      (requirePlanDisabled && plan?.enabled !== false) ||
+      (requirePlanDisabled &&
+        expectedPlanUpdatedAt &&
+        String(plan?.updatedAt || '') !== String(expectedPlanUpdatedAt)) ||
       !isTerminalUnattendedRunStatus(current.status)
     ) {
       return null;
@@ -5271,6 +5308,149 @@ function resolveUnattendedClosureItemIdentities(request = {}) {
   return unique.size === identities.length ? identities : [];
 }
 
+function buildExactUnattendedLocalClosureKey({
+  requestId = '',
+  attemptId = '',
+  progressSeq = 0,
+  status = '',
+  orchestrationContext = null,
+  evidence = null,
+  evidences = [],
+} = {}) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  const normalizedProgressSeq = Math.max(0, Number(progressSeq) || 0);
+  if (
+    !normalizedRequestId ||
+    !normalizedAttemptId ||
+    !isTerminalUnattendedRunStatus(normalizedStatus)
+  ) {
+    return '';
+  }
+  const itemIdentities = resolveUnattendedClosureItemIdentities({
+    orchestrationContext,
+  });
+  if (itemIdentities.length === 0) return '';
+  const candidates = (Array.isArray(evidences) && evidences.length > 0
+    ? evidences
+    : evidence
+      ? [evidence]
+      : [])
+    .filter((candidate) =>
+      candidate &&
+      typeof candidate === 'object' &&
+      candidate.version === UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION &&
+      String(candidate.requestId || '').trim() === normalizedRequestId &&
+      String(candidate.attemptId || '').trim() === normalizedAttemptId &&
+      Number(candidate.snapshotRevision) === normalizedProgressSeq,
+    );
+  const evidenceByIdentity = new Map(
+    candidates.map((candidate) => [
+      `${String(candidate.itemId || '').trim()}:` +
+        `${String(candidate.itemAttemptId || '').trim()}:` +
+        `${Number(candidate.attemptNumber)}:` +
+        Number(candidate.assignmentRevision),
+      candidate,
+    ]),
+  );
+  const identityKeys = itemIdentities
+    .map((identity) =>
+      `${identity.itemId}:${identity.itemAttemptId}:` +
+        `${identity.attemptNumber}:${identity.assignmentRevision}`,
+    )
+    .sort();
+  if (
+    evidenceByIdentity.size !== identityKeys.length ||
+    identityKeys.some((identityKey) => !evidenceByIdentity.has(identityKey))
+  ) {
+    return '';
+  }
+  return JSON.stringify({
+    requestId: normalizedRequestId,
+    attemptId: normalizedAttemptId,
+    progressSeq: normalizedProgressSeq,
+    status: normalizedStatus,
+    identities: identityKeys,
+  });
+}
+
+function buildUnattendedLocalClosureKeyFromRequest(request = {}) {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    return '';
+  }
+  return buildExactUnattendedLocalClosureKey({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    progressSeq: request.progressSeq,
+    status: request.status,
+    orchestrationContext: request.orchestrationContext,
+    evidence: request.localClosureEvidence,
+    evidences: request.localClosureEvidences,
+  });
+}
+
+function rememberConfirmedUnattendedLocalClosures(
+  payload = {},
+  authoritativeRequest = null,
+) {
+  const authoritativeKey = buildUnattendedLocalClosureKeyFromRequest(
+    authoritativeRequest,
+  );
+  for (const task of Array.isArray(payload.tasks) ? payload.tasks : []) {
+    const metadata =
+      task?.metadata &&
+      typeof task.metadata === 'object' &&
+      !Array.isArray(task.metadata)
+        ? task.metadata
+        : {};
+    let key = buildExactUnattendedLocalClosureKey({
+      requestId: task.id || task.clientTaskId,
+      attemptId: task.attemptId,
+      progressSeq: task.progressSeq,
+      status: task.status,
+      orchestrationContext: metadata.orchestrationContext,
+      evidence: task.localClosure || metadata.localClosure,
+      evidences: task.localClosures || metadata.localClosures,
+    });
+    // Task-ledger metadata intentionally flattens unknown nested values, so an
+    // orchestrationContext copied into a heartbeat snapshot may no longer carry
+    // its itemAttempts as objects. Rebuild only that identity side from the
+    // exact current control request, while still requiring the heartbeat task
+    // itself to carry the same request/attempt/revision/status and closure-v2
+    // evidence. This is a receipt for the payload accepted by this heartbeat,
+    // not a trust in stale ledger metadata.
+    if (!key && authoritativeKey) {
+      const requestId = String(task.id || task.clientTaskId || '').trim();
+      const attemptId = String(task.attemptId || '').trim();
+      const sameAuthoritativeAttempt = Boolean(
+        requestId === String(authoritativeRequest?.id || '').trim() &&
+        attemptId === String(authoritativeRequest?.attemptId || '').trim() &&
+        Number(task.progressSeq) === Number(authoritativeRequest?.progressSeq) &&
+        String(task.status || '').trim().toLowerCase() ===
+          String(authoritativeRequest?.status || '').trim().toLowerCase()
+      );
+      if (sameAuthoritativeAttempt) {
+        const payloadKey = buildExactUnattendedLocalClosureKey({
+          requestId,
+          attemptId,
+          progressSeq: task.progressSeq,
+          status: task.status,
+          orchestrationContext: authoritativeRequest.orchestrationContext,
+          evidence: task.localClosure || metadata.localClosure,
+          evidences: task.localClosures || metadata.localClosures,
+        });
+        if (payloadKey === authoritativeKey) key = payloadKey;
+      }
+    }
+    if (key) cloudTaskAgentConfirmedLocalClosureKeys.add(key);
+  }
+  while (cloudTaskAgentConfirmedLocalClosureKeys.size > 100) {
+    const oldest = cloudTaskAgentConfirmedLocalClosureKeys.values().next().value;
+    cloudTaskAgentConfirmedLocalClosureKeys.delete(oldest);
+  }
+}
+
 function inspectUnattendedBusinessUploadEvidence(request = {}) {
   const progress =
     request.progress &&
@@ -5353,7 +5533,9 @@ function inspectUnattendedBusinessUploadEvidence(request = {}) {
     fields.streamingSyncSkippedCount === 0
   );
   const everyCapturedRecordUploaded = enabled
-    ? fields.streamingSyncCapturedUniqueCount ===
+    ? (fields.capturedRecordCount === 0 ||
+        fields.streamingSyncCapturedUniqueCount > 0) &&
+      fields.streamingSyncCapturedUniqueCount ===
         fields.streamingSyncEnqueuedUniqueCount +
           fields.streamingSyncExcludedUniqueCount &&
       fields.streamingSyncEnqueuedUniqueCount ===
@@ -5968,38 +6150,91 @@ async function cancelUnattendedKeywordRunFromControl({
   };
 }
 
-async function cleanupDisabledUnattendedKeywordPlanRuntime() {
-  const message = '无人值守计划已关闭，已取消未完成任务';
-  // 状态切换前捕获旧锁和平台页。列表采集阶段 progress 可能尚未带 runnerTabId，
-  // 若先释放锁再取消，旧 content capture 会继续与下一任务并行。
-  const request = await readUnattendedKeywordRunRequest();
-  // 云端一次性下发任务与本地定时计划相互独立。关闭本地计划不能顺带
-  // 取消后台已分配并正在执行的任务。
-  if (!request || request.cloudAssigned === true) {
-    return;
-  }
-  const progress = normalizeUnattendedRunProgress(
-    request?.progress,
-    request?.message,
-  );
-  const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
-  const canceledRequest = await cancelUnattendedKeywordRunRequest(message, {
-    requestId: String(request.id || ''),
-    attemptId: String(request.attemptId || ''),
-    localOnly: true,
-    cancelSource: 'plan_disabled',
-    cancelReason: 'plan_disabled',
-    errorCode: 'PLAN_DISABLED',
+async function cleanupDisabledUnattendedKeywordPlanRuntime({
+  expectedPlanUpdatedAt = '',
+} = {}) {
+  // Keep the exact plan/request compare-and-set, browser cancellation and old
+  // lock release in one request-mutation critical section. Otherwise the old
+  // runner can observe the canceled request and release its lock, allowing a
+  // cloud assignment to publish a successor before this cleanup relays the
+  // unscoped content-script cancellation to the reused platform tab.
+  return await runUnattendedRunMutation(async () => {
+    const message = '无人值守计划已关闭，已取消未完成任务';
+    const currentPlan = await readUnattendedKeywordPlan();
+    if (
+      currentPlan.enabled !== false ||
+      (expectedPlanUpdatedAt &&
+        String(currentPlan.updatedAt || '') !== String(expectedPlanUpdatedAt))
+    ) {
+      return;
+    }
+    const request = await readUnattendedKeywordRunRequest();
+    // 云端一次性下发任务与本地定时计划相互独立。关闭本地计划不能顺带
+    // 取消后台已分配并正在执行的任务。
+    if (!request || request.cloudAssigned === true) {
+      return;
+    }
+    const progress = normalizeUnattendedRunProgress(
+      request.progress,
+      request.message,
+    );
+    // Capture the old lock before publishing cancellation. The runner may
+    // release it as soon as it observes the terminal request in storage.
+    const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
+
+    if (
+      isTerminalUnattendedRunStatus(request.status) &&
+      request.status !== 'needs_action'
+    ) {
+      const reconciledRequest = normalizeUnattendedRunRequest({
+        ...request,
+        recoveryPendingLaunch: false,
+        recoveryWaitUntil: '',
+        wakeGraceUntil: '',
+        progress: {
+          ...(request.progress && typeof request.progress === 'object'
+            ? request.progress
+            : {}),
+          phase: `unattended_${request.status}`,
+          waitUntil: '',
+          remainingMs: null,
+        },
+      });
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciledRequest,
+      });
+      await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
+        request.runnerTabId,
+        progress?.runnerTabId,
+      ]);
+      await releaseUnattendedCaptureTaskResourcesForRecovery(lockSnapshot, {
+        reason: 'unattended_terminal_cleanup',
+        request: reconciledRequest,
+      }).catch((error) => {
+        console.warn('[Background] terminal unattended cleanup pending:', error);
+      });
+      scheduleCloudTaskAgentSync('unattended_terminal_cleanup', 500);
+      return;
+    }
+
+    const canceledRequest =
+      await cancelUnattendedKeywordRunRequestWithinMutation(message, {
+        requestId: String(request.id || ''),
+        attemptId: String(request.attemptId || ''),
+        localOnly: true,
+        cancelSource: 'plan_disabled',
+        cancelReason: 'plan_disabled',
+        errorCode: 'PLAN_DISABLED',
+        requirePlanDisabled: true,
+        expectedPlanUpdatedAt,
+      });
+    if (!canceledRequest) {
+      return;
+    }
+    await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
+      progress?.runnerTabId,
+    ]);
   });
-  // A cloud assignment may replace the local request between the read above
-  // and this serialized mutation. Only tear down targets when that exact
-  // local request was canceled; otherwise the new cloud task owns the lock.
-  if (!canceledRequest) {
-    return;
-  }
-  await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
-    progress?.runnerTabId,
-  ]);
 }
 
 async function resolveUnattendedPlanLockState(activeLock) {
@@ -6081,7 +6316,9 @@ async function saveUnattendedKeywordPlan(
   }
   scheduleCloudTaskAgentSync('unattended_plan_saved');
   if (!nextPlan.enabled) {
-    await cleanupDisabledUnattendedKeywordPlanRuntime();
+    await cleanupDisabledUnattendedKeywordPlanRuntime({
+      expectedPlanUpdatedAt: nextPlan.updatedAt,
+    });
   }
   return nextPlan;
 }
@@ -8198,6 +8435,89 @@ function buildManualRecoveryCheckpoint(request, mode) {
   return checkpoint;
 }
 
+async function prepareUnattendedManualRecoverySource(requestId = '') {
+  const normalizedRequestId = String(requestId || '').trim();
+  const current = await readUnattendedKeywordRunRequest();
+  const source = current?.id === normalizedRequestId
+    ? current
+    : await readArchivedUnattendedKeywordRunRequest(normalizedRequestId);
+  if (!source || !normalizedRequestId) {
+    return {ready: false, reason: 'not_found', request: source || null};
+  }
+  const itemIdentities = resolveUnattendedClosureItemIdentities(source);
+  if (itemIdentities.length === 0) {
+    return {ready: true, request: source, closureKey: ''};
+  }
+  // Exact cleanup can only be established for the current control request.
+  // Starting an orchestration successor from an archived copy would make the
+  // source attempt unverifiable and can overlap its still-owned browser work.
+  if (
+    !current ||
+    current.id !== source.id ||
+    current.attemptId !== source.attemptId
+  ) {
+    return {
+      ready: false,
+      reason: 'source_local_closure_unverifiable',
+      request: source,
+    };
+  }
+  if (!isTerminalUnattendedRunStatus(current.status)) {
+    return {ready: false, reason: 'not_recoverable', request: current};
+  }
+
+  await cleanupTerminalUnattendedRuntime(current);
+  const closure = await reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: current.id,
+    expectedAttemptId: current.attemptId,
+    closeOwnedRunnerTabs: true,
+  });
+  const locallyClosed = await readUnattendedKeywordRunRequest();
+  let closureKey = buildUnattendedLocalClosureKeyFromRequest(locallyClosed);
+  if (
+    !closureKey ||
+    locallyClosed?.id !== current.id ||
+    locallyClosed?.attemptId !== current.attemptId
+  ) {
+    return {
+      ready: false,
+      reason: String(closure?.reason || 'source_local_closure_pending'),
+      request: locallyClosed || current,
+    };
+  }
+
+  if (!cloudTaskAgentConfirmedLocalClosureKeys.has(closureKey)) {
+    const syncResult = await syncCloudTaskAgent({
+      reason: 'manual_recovery_source_closure',
+      force: true,
+    });
+    if (!syncResult?.ok) {
+      return {
+        ready: false,
+        reason: 'source_local_closure_sync_pending',
+        request: await readUnattendedKeywordRunRequest(),
+      };
+    }
+  }
+
+  const confirmed = await readUnattendedKeywordRunRequest();
+  const confirmedKey = buildUnattendedLocalClosureKeyFromRequest(confirmed);
+  if (
+    !confirmedKey ||
+    confirmedKey !== closureKey ||
+    confirmed?.id !== current.id ||
+    confirmed?.attemptId !== current.attemptId ||
+    !cloudTaskAgentConfirmedLocalClosureKeys.has(confirmedKey)
+  ) {
+    return {
+      ready: false,
+      reason: 'source_local_closure_not_confirmed',
+      request: confirmed || current,
+    };
+  }
+  return {ready: true, request: confirmed, closureKey: confirmedKey};
+}
+
 async function manuallyRecoverUnattendedKeywordRun({
   requestId = '',
   mode = 'remaining',
@@ -8207,6 +8527,17 @@ async function manuallyRecoverUnattendedKeywordRun({
   const normalizedMode = new Set(['remaining', 'failed', 'skip_current']).has(mode)
     ? mode
     : 'remaining';
+  const sourcePreparation = await prepareUnattendedManualRecoverySource(
+    requestId,
+  );
+  if (!sourcePreparation.ready) {
+    return {
+      accepted: false,
+      deferred: true,
+      reason: sourcePreparation.reason,
+      request: sourcePreparation.request || null,
+    };
+  }
   const created = await runUnattendedRunMutation(async () => {
     const currentRequest = await readUnattendedKeywordRunRequest();
     const current =
@@ -8229,6 +8560,27 @@ async function manuallyRecoverUnattendedKeywordRun({
     }
     if (!isTerminalUnattendedRunStatus(current.status)) {
       return {accepted: false, reason: 'not_recoverable', request: current};
+    }
+    if (sourcePreparation.closureKey) {
+      const exactCurrentSource = Boolean(
+        currentRequest &&
+        currentRequest.id === current.id &&
+        currentRequest.attemptId === current.attemptId,
+      );
+      const currentClosureKey = buildUnattendedLocalClosureKeyFromRequest(
+        current,
+      );
+      if (
+        !exactCurrentSource ||
+        currentClosureKey !== sourcePreparation.closureKey ||
+        !cloudTaskAgentConfirmedLocalClosureKeys.has(currentClosureKey)
+      ) {
+        return {
+          accepted: false,
+          reason: 'source_local_closure_changed',
+          request: current,
+        };
+      }
     }
     const credential = await readCloudTaskAgentCredential();
     const currentAgentScopeId = String(credential.id || '').trim();
@@ -8383,6 +8735,23 @@ async function manuallyRecoverUnattendedKeywordRun({
       failed: '仅重试失败关键词',
       skip_current: '跳过当前项并继续',
     };
+    const sourceOrchestrationContext =
+      normalizeOrchestrationExecutionContext(current.orchestrationContext);
+    const pendingAdoptionContext = sourceOrchestrationContext
+      ? {
+          ...sourceOrchestrationContext,
+          revision: 0,
+          itemIds: [],
+        }
+      : null;
+    if (pendingAdoptionContext) {
+      // The server creates a new append-only item attempt when it adopts this
+      // local recovery. Reusing the source task's IDs here would let closure-v2
+      // attest to an attempt that this recovery never executed.
+      delete pendingAdoptionContext.itemAttempts;
+      delete pendingAdoptionContext.attemptIdentity;
+      delete pendingAdoptionContext.requiresLocalClosureReuseFenceV1;
+    }
     const nextRequest = {
       ...current,
       schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
@@ -8416,12 +8785,20 @@ async function manuallyRecoverUnattendedKeywordRun({
       heartbeatAt: now,
       businessProgressAt: now,
       runnerTabId: null,
+      ...(pendingAdoptionContext
+        ? {orchestrationContext: pendingAdoptionContext}
+        : {}),
       planSnapshot,
       checkpoint,
       progress: null,
       error: null,
       message: labels[normalizedMode],
     };
+    if (!pendingAdoptionContext) {
+      delete nextRequest.orchestrationContext;
+    }
+    delete nextRequest.localClosureEvidence;
+    delete nextRequest.localClosureEvidences;
     await persistUnattendedRunMutation(nextRequest, {
       event: {
         type: 'manual_recovery',
@@ -8704,7 +9081,9 @@ async function handleUnattendedKeywordAlarm() {
 async function reconcileUnattendedKeywordPlanSchedule({ launchDue = false } = {}) {
   const plan = await readUnattendedKeywordPlan();
   if (!plan.enabled) {
-    await cleanupDisabledUnattendedKeywordPlanRuntime();
+    await cleanupDisabledUnattendedKeywordPlanRuntime({
+      expectedPlanUpdatedAt: plan.updatedAt,
+    });
     await syncUnattendedKeywordAlarm(plan);
     return plan;
   }

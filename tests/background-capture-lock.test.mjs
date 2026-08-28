@@ -97,6 +97,7 @@ function createHarness() {
   let storageGetHandler = null;
   let storageSetHandler = null;
   let storageRemoveHandler = null;
+  let cloudHeartbeatHandler = null;
   const storageSetCalls = [];
   const storageRemoveCalls = [];
   let reloadHook = null;
@@ -368,6 +369,9 @@ function createHarness() {
       },
       async sendHeartbeat(options = {}) {
         cloudHeartbeats.push(JSON.parse(JSON.stringify(options.body || {})));
+        if (typeof cloudHeartbeatHandler === "function") {
+          return await cloudHeartbeatHandler(options, cloudHeartbeats.length);
+        }
         return {ok: true, commands: []};
       },
       async completeCommand(options = {}) {
@@ -413,6 +417,7 @@ function createHarness() {
       `  openUnattendedRunnerTab,\n` +
       `  bindUnattendedRunnerTab,\n` +
       `  saveUnattendedKeywordPlan,\n` +
+      `  cleanupDisabledUnattendedKeywordPlanRuntime,\n` +
       `  claimUnattendedKeywordRun,\n` +
       `  updateUnattendedKeywordRun,\n` +
       `  assessUnattendedRunHealth,\n` +
@@ -526,6 +531,9 @@ function createHarness() {
     },
     setStorageRemoveHandler(handler) {
       storageRemoveHandler = handler;
+    },
+    setCloudHeartbeatHandler(handler) {
+      cloudHeartbeatHandler = handler;
     },
     setTabMissing(tabId, missing = true) {
       if (missing) missingTabIds.add(Number(tabId));
@@ -755,7 +763,11 @@ function seedTerminalUnattendedClosureCandidate(harness, overrides = {}) {
       startedAt: now,
       updatedAt: now,
       finishedAt: now,
-      metadata: {},
+      metadata: {
+        ...(request.orchestrationContext
+          ? {orchestrationContext: request.orchestrationContext}
+          : {}),
+      },
     }],
     updatedAt: now,
   };
@@ -810,6 +822,146 @@ test("local closure closes only its exact runner and persists authoritative uplo
   assert.equal(
     harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence.closedAt,
     evidence.closedAt,
+  );
+});
+
+test("manual orchestration recovery does not replace its source when exact cleanup cannot close the runner", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    cloudAssigned: true,
+    cloudAgentScopeId: "agent-safe",
+    planSnapshot: buildUnattendedPlan({keywords: ["关键词一"]}),
+    checkpoint: {
+      activeKeyword: "关键词一",
+      currentKeyword: "关键词一",
+      failedKeywords: ["关键词一"],
+      keywordResults: [{
+        round: 1,
+        index: 0,
+        keyword: "关键词一",
+        status: "failed",
+      }],
+    },
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-safe", token: "secret-safe"},
+  };
+  harness.setTabQueryHandler(async () => [{
+    id: 71,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?unattendedRun=${request.id}&unattendedAttempt=${request.attemptId}`,
+  }]);
+  harness.setTabGetHandler(async () => ({
+    id: 71,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?unattendedRun=${request.id}&unattendedAttempt=${request.attemptId}`,
+  }));
+  harness.setTabRemoveHandler(async () => {
+    throw new Error("runner close failed");
+  });
+
+  const result = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: request.id,
+    mode: "remaining",
+  });
+
+  assert.equal(result.accepted, false, JSON.stringify(result));
+  assert.equal(result.reason, "runner_tab_close_unconfirmed");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, request.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(harness.cloudHeartbeats.length, 0);
+});
+
+test("manual orchestration recovery does not replace its source until the exact closure heartbeat succeeds", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    cloudAssigned: true,
+    cloudAgentScopeId: "agent-safe",
+    planSnapshot: buildUnattendedPlan({keywords: ["关键词一"]}),
+    checkpoint: {
+      activeKeyword: "关键词一",
+      currentKeyword: "关键词一",
+      failedKeywords: ["关键词一"],
+      keywordResults: [{
+        round: 1,
+        index: 0,
+        keyword: "关键词一",
+        status: "failed",
+      }],
+    },
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-safe", token: "secret-safe"},
+  };
+  harness.setCloudHeartbeatHandler(async () => ({
+    ok: false,
+    reason: "network_error",
+  }));
+
+  const result = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: request.id,
+    mode: "remaining",
+  });
+
+  assert.equal(result.accepted, false, JSON.stringify(result));
+  assert.equal(result.reason, "source_local_closure_sync_pending");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, request.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(harness.cloudHeartbeats.length, 1);
+  const reported = harness.cloudHeartbeats[0].tasks.find(
+    (task) => task.id === request.id,
+  );
+  assert.equal(reported.attemptId, request.attemptId);
+  assert.equal(
+    reported.metadata.localClosures[0].itemAttemptId,
+    "item-attempt-1",
+  );
+});
+
+test("manual orchestration recovery replaces and launches only after exact source closure is confirmed", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    cloudAssigned: true,
+    cloudAgentScopeId: "agent-safe",
+    planSnapshot: buildUnattendedPlan({keywords: ["关键词一"]}),
+    checkpoint: {
+      activeKeyword: "关键词一",
+      currentKeyword: "关键词一",
+      failedKeywords: ["关键词一"],
+      keywordResults: [{
+        round: 1,
+        index: 0,
+        keyword: "关键词一",
+        status: "failed",
+      }],
+    },
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-safe", token: "secret-safe"},
+  };
+
+  const result = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: request.id,
+    mode: "remaining",
+  });
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  const successor = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.notEqual(successor.id, request.id);
+  assert.equal(successor.status, "pending");
+  assert.equal(harness.cloudHeartbeats.length, 1);
+  assert.equal(harness.createdTabs.length, 2);
+  assert.equal(
+    Object.hasOwn(successor.orchestrationContext, "itemAttempts"),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(successor.orchestrationContext, "attemptIdentity"),
+    false,
   );
 });
 
@@ -870,6 +1022,32 @@ test("an abnormal early return leaves incomplete unique coverage and cannot clos
     harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure,
     undefined,
   );
+});
+
+test("nonzero saved rows with an all-zero unique ledger cannot close locally", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    counts: {total: 1, processed: 1, saved: 2},
+    progress: {
+      streamingSyncEnqueuedCount: 0,
+      streamingSyncProcessedCount: 0,
+      streamingSyncSuccessCount: 0,
+      streamingSyncCapturedUniqueCount: 0,
+      streamingSyncEnqueuedUniqueCount: 0,
+      streamingSyncExcludedUniqueCount: 0,
+      streamingSyncSucceededUniqueCount: 0,
+      capturedRecordCount: 2,
+    },
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "business_uploads_not_cleared");
 });
 
 test("one drained fixed-batch runtime emits exact proof for every item attempt", async () => {
@@ -2991,6 +3169,156 @@ test("a cloud unattended-plan delete command clears the local schedule without c
     harness.cloudCommandCompletions[0].result.requestId,
     "cloud-plan-delete-1",
   );
+});
+
+test("disabling a local plan cannot cancel a cloud assignment that wins the cleanup race", async () => {
+  const harness = createHarness();
+  const now = new Date().toISOString();
+  const disabledAt = new Date(Date.now() + 1000).toISOString();
+  const localRequest = {
+    id: "local-plan-run",
+    attemptId: "local-plan-attempt",
+    attemptNumber: 1,
+    status: "running",
+    cloudAssigned: false,
+    runnerTabId: 77,
+    progress: {runnerTabId: 77},
+    createdAt: now,
+    updatedAt: now,
+    heartbeatAt: now,
+    planSnapshot: buildUnattendedPlan({keywords: ["本地计划词"]}),
+  };
+  const cloudRequest = {
+    ...localRequest,
+    id: "cloud-assignment",
+    attemptId: "cloud-attempt",
+    cloudAssigned: true,
+    planSnapshot: buildUnattendedPlan({keywords: ["云端任务词"]}),
+  };
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    enabled: false,
+    updatedAt: disabledAt,
+  });
+  harness.storage[UNATTENDED_REQUEST_KEY] = localRequest;
+  harness.storage[LOCK_KEY] = {
+    schemaVersion: 1,
+    id: "cloud-owned-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "cloud-holder",
+    holderTabId: 77,
+    createdAt: now,
+    heartbeatAt: now,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  };
+
+  let requestReads = 0;
+  harness.setStorageGetHandler(async (keys, result) => {
+    const readsRequest =
+      keys === UNATTENDED_REQUEST_KEY ||
+      (Array.isArray(keys) && keys.includes(UNATTENDED_REQUEST_KEY));
+    if (!readsRequest) return result;
+    requestReads += 1;
+    if (requestReads === 2) {
+      harness.storage[UNATTENDED_REQUEST_KEY] = cloudRequest;
+      return {[UNATTENDED_REQUEST_KEY]: cloudRequest};
+    }
+    return result;
+  });
+
+  await harness.api.cleanupDisabledUnattendedKeywordPlanRuntime({
+    expectedPlanUpdatedAt: disabledAt,
+  });
+
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, "cloud-assignment");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+  assert.equal(harness.storage[LOCK_KEY].id, "cloud-owned-lock");
+  assert.equal(harness.sentTabMessages.length, 0);
+});
+
+test("plan-disable cleanup finishes relaying the old attempt before a successor request can publish", async () => {
+  const harness = createHarness();
+  const now = new Date().toISOString();
+  const disabledAt = new Date(Date.now() + 1000).toISOString();
+  harness.storage[UNATTENDED_PLAN_KEY] = buildUnattendedPlan({
+    enabled: false,
+    updatedAt: disabledAt,
+  });
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    id: "local-plan-run-before-relay",
+    attemptId: "local-plan-attempt-before-relay",
+    attemptNumber: 1,
+    status: "running",
+    cloudAssigned: false,
+    runnerTabId: 77,
+    progress: {runnerTabId: 77},
+    createdAt: now,
+    updatedAt: now,
+    heartbeatAt: now,
+    planSnapshot: buildUnattendedPlan({keywords: ["本地计划词"]}),
+  };
+  harness.storage[LOCK_KEY] = {
+    schemaVersion: 1,
+    id: "local-lock-before-relay",
+    owner: "unattended_keyword_plan",
+    holderId: "local-holder-before-relay",
+    holderTabId: 77,
+    createdAt: now,
+    heartbeatAt: now,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  };
+
+  let successorPromise = null;
+  let successorSettled = false;
+  let successorWonRelayWindow = false;
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload?.action !== "cancelCapture") return {ok: true};
+    // Model the old runner releasing its lease immediately after observing the
+    // canceled request, then a cloud assignment trying to publish a successor
+    // while the stale content cancellation is still in flight.
+    await harness.api.releaseCaptureExecutionLock("local-lock-before-relay");
+    successorPromise = harness.api
+      .createUnattendedKeywordRunRequest(
+        buildUnattendedPlan({
+          enabled: true,
+          platform: "xiaohongshu",
+          keywords: ["云端接力词"],
+        }),
+        {
+          reason: "cloud_assignment",
+          requestId: "cloud-successor-after-relay",
+          cloudCommandId: "cloud-command-after-relay",
+          cloudAssigned: true,
+          executionMode: "one_time",
+        },
+      )
+      .then((request) => {
+        successorSettled = true;
+        return request;
+      });
+    successorWonRelayWindow =
+      (await Promise.race([
+        successorPromise.then(() => true),
+        new Promise((resolve) => setTimeout(() => resolve(false), 20)),
+      ])) === true;
+    return {ok: true};
+  });
+
+  await harness.api.cleanupDisabledUnattendedKeywordPlanRuntime({
+    expectedPlanUpdatedAt: disabledAt,
+  });
+  assert.ok(successorPromise, "the successor must contend during old relay");
+  assert.equal(successorWonRelayWindow, false);
+  assert.equal(successorSettled, false);
+
+  const successor = await successorPromise;
+  assert.equal(successor.id, "cloud-successor-after-relay");
+  assert.equal(successor.cloudAssigned, true);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].id,
+    "cloud-successor-after-relay",
+  );
+  assert.equal(harness.sentTabMessages.length, 1);
+  assert.equal(harness.sentTabMessages[0].payload.action, "cancelCapture");
 });
 
 test("a cloud stop command cancels only its exact active request", async () => {

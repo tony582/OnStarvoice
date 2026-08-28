@@ -985,15 +985,16 @@ export function captureAgentFullHeartbeatOnline(
 }
 
 // These are the states that can still own the browser's single capture lock.
-// Attention/terminal states such as interrupted, needs_action and failed keep
-// their audit history, but the extension has already released its execution
-// lock and another cloud task may safely use the Agent.
+// An interrupted execution remains slot-blocking until normal settlement
+// proves that the Extension has stopped. Attention/terminal states such as
+// needs_action and failed keep audit history after releasing the slot.
 export const CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES = Object.freeze([
   'pending',
   'waiting_device',
   'claimed',
   'running',
   'recovering',
+  'interrupted',
   'resume_requested',
 ]);
 

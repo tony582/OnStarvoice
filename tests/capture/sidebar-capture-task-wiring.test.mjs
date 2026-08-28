@@ -1731,6 +1731,49 @@ test("unattended Douyin bootstrap accepts the bound search shell while global ru
   assert.equal(probeCount, 1);
 });
 
+test("unattended Xiaohongshu bootstrap accepts the exact bound search shell while global runtime lags", async () => {
+  const runtimeSection = readFunctionSection(
+    "async function waitForRuntimeSearchPage(",
+    "function resolveUnattendedBootstrapStartGate(",
+  );
+  let probeCount = 0;
+  const sandbox = vm.createContext({
+    PAGE_TYPE: {SEARCH_RESULTS: "search_results"},
+    chrome: {
+      scripting: {
+        executeScript: async () => {
+          probeCount += 1;
+          return [{result: true}];
+        },
+      },
+    },
+    getCurrentRuntime: () => ({
+      platform: "xiaohongshu",
+      pageType: "note_detail",
+      lastActiveTabId: 101,
+      lastPageUrl: "https://www.xiaohongshu.com/explore/123456789",
+    }),
+    getPagePlatform: (runtime) => runtime?.platform || "",
+    setTimeout: (resolve) => resolve(),
+  });
+  vm.runInContext(
+    `${runtimeSection}\nglobalThis.__wait = waitForRuntimeSearchPage;`,
+    sandbox,
+  );
+
+  const ready = await sandbox.__wait({
+    platform: "xiaohongshu",
+    tabId: 101,
+    expectedUrl:
+      "https://www.xiaohongshu.com/search_result?keyword=%E5%88%AB%E5%85%8B%E5%A3%81%E7%BA%B8",
+    expectedKeyword: "别克壁纸",
+    timeoutMs: 1000,
+  });
+
+  assert.equal(ready, true);
+  assert.equal(probeCount, 1);
+});
+
 test("unattended bootstrap hands back when the bound tab runtime is still a video page", async () => {
   const harness = createUnattendedNavigationHarness({
     tabReadiness: [true, true],
@@ -1921,7 +1964,7 @@ test("unattended bootstrap retry is reported before keyword batch delegation", (
   );
 });
 
-test("one cloud item uses one local bootstrap session and keyword attempt", () => {
+test("one cloud item uses one business keyword attempt while retaining bounded technical recovery", () => {
   assert.match(sidebarSource, /const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 4/u);
   assert.match(sidebarSource, /const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 4/u);
   assert.match(sidebarSource, /const UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS = 4/u);
@@ -1946,11 +1989,11 @@ test("one cloud item uses one local bootstrap session and keyword attempt", () =
   );
   assert.match(
     unattendedSection,
-    /const localBootstrapMaxAttempts = singleRelayMode[\s\S]*?UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS/u,
+    /const localBootstrapMaxAttempts = UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS/u,
   );
   assert.match(
     unattendedSection,
-    /const localCaptureSessionMaxAttempts = singleRelayMode[\s\S]*?UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS/u,
+    /const localCaptureSessionMaxAttempts =\s*UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS/u,
   );
   assert.match(
     unattendedSection,
@@ -1959,6 +2002,44 @@ test("one cloud item uses one local bootstrap session and keyword attempt", () =
   assert.match(
     unattendedSection,
     /maxKeywordAttempts:\s*localKeywordMaxAttempts/u,
+  );
+  assert.match(
+    handlerSection,
+    /const bootstrapEvidenceAccepted = Boolean\([\s\S]*preferredSourceTabId[\s\S]*bootstrapEvidenceTabId === Number\(preferredSourceTabId\)/u,
+  );
+  assert.match(
+    handlerSection,
+    /runtime\?\.pageType !== PAGE_TYPE\.SEARCH_RESULTS &&[\s\S]*!bootstrapEvidenceAccepted/u,
+  );
+  assert.match(
+    unattendedSection,
+    /const noCaptureBootstrapSync =[\s\S]*capturedUniqueCount: 0,[\s\S]*enqueuedUniqueCount: 0,[\s\S]*excludedUniqueCount: 0,[\s\S]*succeededUniqueCount: 0/u,
+  );
+
+  const manualNoteSection = readFunctionSection(
+    "async function handleCaptureNoteData()",
+    "async function handleCaptureBloggerData()",
+  );
+  const manualSearchSection = readFunctionSection(
+    "async function handleCaptureSearchData()",
+    "function setKeywordStrategyTab(",
+  );
+  assert.doesNotMatch(manualNoteSection, /bootstrapInitialSearchEvidence/u);
+  assert.doesNotMatch(manualSearchSection, /bootstrapInitialSearchEvidence/u);
+});
+
+test("task sidebar adopts only newer progress from the exact active list run", () => {
+  const renderSection = readFunctionSection(
+    "function renderCaptureDebugSession(runtime = {})",
+    "async function loadTerminalCaptureSummaryAcknowledgements()",
+  );
+  assert.match(renderSection, /session\?\.activeListRunId/u);
+  assert.match(renderSection, /runtimeProgress\.listCaptureRunId/u);
+  assert.match(renderSection, /runtimeListRunId === activeListRunId/u);
+  assert.match(renderSection, /runtimeProgressAt > sessionProgressAt/u);
+  assert.match(
+    renderSection,
+    /canUseLiveListProgress[\s\S]*\{\.\.\.sessionProgress, \.\.\.runtimeProgress\}/u,
   );
 });
 
@@ -2189,7 +2270,7 @@ test("streaming sync waits for a safe terminal decision before queuing failed de
   );
   assert.match(
     batch,
-    /afterKeywordCapture:[\s\S]*?registerCaptured\?\.\(recordIds\)[\s\S]*?if \(!isCurrentUnattendedInvocation\(\)\)/u,
+    /onKeywordSettled: onKeywordSettled \|\| streamingSyncQueue\?\.enabled[\s\S]*?settleKeywordRecordsForStreamingSync\([\s\S]*?if \(!ownerCurrent \|\| !onKeywordSettled\)/u,
   );
   assert.ok(stopAt >= 0);
   assert.ok(recoverableAt > stopAt);
@@ -2198,6 +2279,44 @@ test("streaming sync waits for a safe terminal decision before queuing failed de
     batch.slice(0, stopAt),
     /streamingSyncQueue\.enqueueMissing\(recordIds/u,
   );
+});
+
+test("keyword settlement classifies saved records before the unattended ownership fence", () => {
+  const settlement = readFunctionSection(
+    "function settleKeywordRecordsForStreamingSync(",
+    "function formatStreamingSyncSummary(",
+  );
+  const batch = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  const registerAt = settlement.indexOf(
+    "streamingSyncQueue.registerCaptured(recordIds)",
+  );
+  const unsafeAt = settlement.indexOf("const mustExclude");
+  const enqueueAt = settlement.indexOf(
+    "streamingSyncQueue.enqueueMissing(recordIds",
+  );
+  const fenceAt = batch.indexOf("if (!ownerCurrent || !onKeywordSettled)");
+  const settleAt = batch.indexOf("settleKeywordRecordsForStreamingSync(");
+
+  assert.ok(registerAt >= 0);
+  assert.ok(unsafeAt > registerAt);
+  assert.ok(enqueueAt > unsafeAt);
+  assert.match(
+    settlement,
+    /!ownerCurrent[\s\S]*?settled\?\.canceled[\s\S]*?result\.fatal[\s\S]*?result\.securityBlocked[\s\S]*?result\.integrityBlocked/u,
+  );
+  assert.match(
+    settlement,
+    /if \(mustExclude\) \{[\s\S]*?markExcluded[\s\S]*?return;[\s\S]*?enqueueMissing/u,
+  );
+  assert.match(
+    settlement,
+    /if \(!streamingSyncQueue\.hasSeen\(recordId\)\) \{[\s\S]*?markExcluded/u,
+  );
+  assert.ok(settleAt >= 0);
+  assert.ok(fenceAt > settleAt);
 });
 
 test("manual Douyin multi-keyword capture retries only after the first pass", () => {

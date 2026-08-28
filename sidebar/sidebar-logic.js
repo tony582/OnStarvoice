@@ -7821,17 +7821,8 @@ async function handlePlatformMenuSwitch(targetPlatform) {
 
 async function handleCaptureNoteData() {
   const runtime = getCurrentRuntime();
-  const bootstrapEvidenceTabId = Number(bootstrapInitialSearchEvidence?.tabId);
-  const bootstrapEvidenceAccepted = Boolean(
-    bootstrapInitialSearchEvidence?.ready === true &&
-      String(bootstrapInitialSearchEvidence?.platform || "").trim() &&
-      (!preferredSourceTabId ||
-        bootstrapEvidenceTabId === Number(preferredSourceTabId)),
-  );
   const selectedPlatform = getViewPlatform(runtime);
-  const pagePlatform = bootstrapEvidenceAccepted
-    ? String(bootstrapInitialSearchEvidence.platform || "").trim()
-    : getPagePlatform(runtime);
+  const pagePlatform = getPagePlatform(runtime);
   if (selectedPlatform !== pagePlatform) {
     const platformCopy = getPlatformCopy(selectedPlatform);
     showMessage(
@@ -8194,10 +8185,7 @@ async function handleCaptureSearchData() {
     );
     return;
   }
-  if (
-    runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS &&
-    !bootstrapEvidenceAccepted
-  ) {
+  if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
     showMessage("请先切换到搜索页", "error");
     return;
   }
@@ -13456,6 +13444,64 @@ function routeDetailItemToStreamingSync(
   streamingSyncQueue.enqueue(recordId, {sourceLabel, keyword});
 }
 
+function settleKeywordRecordsForStreamingSync(
+  streamingSyncQueue,
+  settled = {},
+  {ownerCurrent = true} = {},
+) {
+  if (!streamingSyncQueue?.enabled) {
+    return;
+  }
+  const recordIds = Array.from(
+    new Set(
+      (Array.isArray(settled?.recordIds) ? settled.recordIds : [])
+        .map((recordId) => String(recordId || "").trim())
+        .filter(Boolean),
+    ),
+  );
+  // List capture has already persisted these records locally. Register them
+  // before the request/attempt ownership fence so a superseded runner can
+  // still produce a complete, attempt-local closure ledger.
+  streamingSyncQueue.registerCaptured(recordIds);
+  if (recordIds.length === 0) {
+    return;
+  }
+
+  const result =
+    settled?.result && typeof settled.result === "object"
+      ? settled.result
+      : {};
+  const mustExclude = Boolean(
+    !ownerCurrent ||
+      settled?.canceled ||
+      settled?.securityBlocked ||
+      result.canceled ||
+      result.fatal ||
+      result.securityBlocked ||
+      result.platformSafetyBlocked ||
+      result.requiresManualAction ||
+      result.integrityBlocked ||
+      result.enhanceResult?.integrityBlocked,
+  );
+  if (mustExclude) {
+    recordIds.forEach((recordId) => streamingSyncQueue.markExcluded(recordId));
+    return;
+  }
+
+  streamingSyncQueue.enqueueMissing(recordIds, {
+    sourceLabel: `关键词「${String(settled?.keyword || "").trim()}」笔记`,
+    keyword: String(settled?.keyword || "").trim(),
+  });
+  // A stop predicate can close the queue between registration and enqueue.
+  // Explicitly classify anything that could not enter the queue so the local
+  // closure proof never hangs on an unclassified saved record.
+  recordIds.forEach((recordId) => {
+    if (!streamingSyncQueue.hasSeen(recordId)) {
+      streamingSyncQueue.markExcluded(recordId);
+    }
+  });
+}
+
 function formatStreamingSyncSummary(stats = {}) {
   if (!stats?.enabled || Number(stats.enqueuedCount || 0) === 0) {
     return "";
@@ -13709,7 +13755,19 @@ async function handleBatchKeywordCapture(options = {}) {
 
   const runtime = getCurrentRuntime();
   const selectedPlatform = getViewPlatform(runtime);
-  const pagePlatform = getPagePlatform(runtime);
+  const bootstrapEvidenceTabId = Number(bootstrapInitialSearchEvidence?.tabId);
+  const bootstrapEvidencePlatform = String(
+    bootstrapInitialSearchEvidence?.platform || "",
+  ).trim();
+  const bootstrapEvidenceAccepted = Boolean(
+    preferredSourceTabId &&
+      bootstrapInitialSearchEvidence?.ready === true &&
+      bootstrapEvidencePlatform &&
+      bootstrapEvidenceTabId === Number(preferredSourceTabId),
+  );
+  const pagePlatform = bootstrapEvidenceAccepted
+    ? bootstrapEvidencePlatform
+    : getPagePlatform(runtime);
   const captureTaskDebugSupported =
     supportsPersistentCaptureTaskPlatform(pagePlatform);
   if (selectedPlatform !== pagePlatform) {
@@ -13720,7 +13778,10 @@ async function handleBatchKeywordCapture(options = {}) {
     );
     return {started: false, reason: "当前数据视图与页面平台不一致"};
   }
-  if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
+  if (
+    runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS &&
+    !bootstrapEvidenceAccepted
+  ) {
     showMessage("请先切换到搜索页", "error");
     return {started: false, reason: "当前页面不是搜索结果页"};
   }
@@ -14160,9 +14221,15 @@ async function handleBatchKeywordCapture(options = {}) {
           maxDurationMs: settings.sharedMaxDurationMs,
         },
         waitForegroundTabId,
-        onKeywordSettled: onKeywordSettled
+        onKeywordSettled: onKeywordSettled || streamingSyncQueue?.enabled
           ? async (settled = {}) => {
-              if (!isCurrentUnattendedInvocation()) {
+              const ownerCurrent = isCurrentUnattendedInvocation();
+              settleKeywordRecordsForStreamingSync(
+                streamingSyncQueue,
+                settled,
+                {ownerCurrent},
+              );
+              if (!ownerCurrent || !onKeywordSettled) {
                 return;
               }
               const originalIndex = Math.max(
@@ -17457,6 +17524,32 @@ async function waitForActiveTabReady(
     .trim()
     .toLowerCase();
   const normalizedExpectedKeyword = String(expectedKeyword || "").trim();
+  const normalizeSearchKeyword = (value) =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/gu, "");
+  const readSearchKeywordFromUrl = (value) => {
+    try {
+      const parsed = new URL(String(value || ""));
+      if (expectedPlatform === "xiaohongshu") {
+        return parsed.searchParams.get("keyword") ||
+          parsed.searchParams.get("q") || "";
+      }
+      if (expectedPlatform === "douyin") {
+        return decodeURIComponent(
+          String(parsed.pathname || "").split("/search/")[1]?.split("/")[0] ||
+            "",
+        );
+      }
+      if (expectedPlatform === "weibo") {
+        return parsed.searchParams.get("q") || "";
+      }
+    } catch {
+      return "";
+    }
+    return "";
+  };
   const matchesExpectedSearch = (tab) => {
     const tabUrl = String(tab?.url || "").trim();
     if (!tabUrl) return false;
@@ -17469,13 +17562,8 @@ async function waitForActiveTabReady(
     if (!normalizedExpectedKeyword) {
       return !normalizedExpectedUrl || tabUrl === normalizedExpectedUrl;
     }
-    try {
-      return decodeURIComponent(tabUrl.replace(/\+/gu, "%20")).includes(
-        normalizedExpectedKeyword,
-      );
-    } catch {
-      return tabUrl.includes(encodeURIComponent(normalizedExpectedKeyword));
-    }
+    return normalizeSearchKeyword(readSearchKeywordFromUrl(tabUrl)) ===
+      normalizeSearchKeyword(normalizedExpectedKeyword);
   };
   while (Date.now() - startedAt < timeoutMs) {
     if (typeof shouldStop === "function" && shouldStop()) {
@@ -17549,6 +17637,32 @@ async function waitForRuntimeSearchPage({
   const expectedTabId = Number(tabId);
   const normalizedExpectedKeyword = String(expectedKeyword || "").trim();
   const normalizedExpectedUrl = String(expectedUrl || "").trim();
+  const normalizeSearchKeyword = (value) =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/gu, "");
+  const readSearchKeywordFromUrl = (value) => {
+    try {
+      const parsed = new URL(String(value || ""));
+      if (platform === "xiaohongshu") {
+        return parsed.searchParams.get("keyword") ||
+          parsed.searchParams.get("q") || "";
+      }
+      if (platform === "douyin") {
+        return decodeURIComponent(
+          String(parsed.pathname || "").split("/search/")[1]?.split("/")[0] ||
+            "",
+        );
+      }
+      if (platform === "weibo") {
+        return parsed.searchParams.get("q") || "";
+      }
+    } catch {
+      return "";
+    }
+    return "";
+  };
   while (Date.now() - startedAt < timeoutMs) {
     if (typeof shouldStop === "function" && shouldStop()) {
       const error = new Error("无人值守搜索页恢复已取消");
@@ -17559,15 +17673,9 @@ async function waitForRuntimeSearchPage({
     const runtimeUrl = String(runtime?.lastPageUrl || "");
     let keywordMatches = !normalizedExpectedKeyword;
     if (!keywordMatches) {
-      try {
-        keywordMatches = decodeURIComponent(
-          runtimeUrl.replace(/\+/gu, "%20"),
-        ).includes(normalizedExpectedKeyword);
-      } catch {
-        keywordMatches = runtimeUrl.includes(
-          encodeURIComponent(normalizedExpectedKeyword),
-        );
-      }
+      keywordMatches = normalizeSearchKeyword(
+        readSearchKeywordFromUrl(runtimeUrl),
+      ) === normalizeSearchKeyword(normalizedExpectedKeyword);
     } else if (normalizedExpectedUrl) {
       keywordMatches = runtimeUrl === normalizedExpectedUrl;
     }
@@ -17633,7 +17741,7 @@ async function waitForRuntimeSearchPage({
               const keywordMatched =
                 Boolean(expected) &&
                 (normalize(queryKeyword) === expected ||
-                  normalize(inputKeyword).includes(expected));
+                  normalize(inputKeyword) === expected);
               const bodyText = String(document.body?.innerText || "");
               const hasSearchShell = Boolean(
                 document.querySelector(
@@ -17668,7 +17776,7 @@ async function waitForRuntimeSearchPage({
             const keywordMatched =
               Boolean(expected) &&
               (normalize(urlKeyword) === expected ||
-                normalize(inputKeyword).includes(expected));
+                normalize(inputKeyword) === expected);
             const bodyText = String(document.body?.innerText || "");
             const hasSearchShell = Boolean(
               document.querySelector(
@@ -18079,6 +18187,7 @@ function buildUnattendedTerminalProgress({
     Number.isSafeInteger(Number(value)) && Number(value) >= 0
       ? Number(value)
       : null;
+  const capturedRecordCount = Math.max(0, Number(summary?.saved) || 0);
   const streamingSyncEvidenceKnown = Boolean(
     streamingSync &&
       typeof streamingSync === "object" &&
@@ -18096,10 +18205,11 @@ function buildUnattendedTerminalProgress({
       syncInteger(sync.enqueuedUniqueCount) !== null &&
       syncInteger(sync.excludedUniqueCount) !== null &&
       syncInteger(sync.succeededUniqueCount) !== null &&
+      (capturedRecordCount === 0 ||
+        syncInteger(sync.capturedUniqueCount) > 0) &&
       typeof sync.blocked === "boolean" &&
       typeof sync.canceled === "boolean"
   );
-  const capturedRecordCount = Math.max(0, Number(summary?.saved) || 0);
   return {
     ...previous,
     captureTaskId:
@@ -19278,6 +19388,10 @@ async function runUnattendedKeywordPlanRequest(request) {
               pendingCount: 0,
               activeCount: 0,
               remainingCount: 0,
+              capturedUniqueCount: 0,
+              enqueuedUniqueCount: 0,
+              excludedUniqueCount: 0,
+              succeededUniqueCount: 0,
               blocked: false,
               canceled: false,
               drainCompleted: true,

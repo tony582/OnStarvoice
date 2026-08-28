@@ -129,6 +129,7 @@ const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
 ]);
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
+const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 2 * 60 * 1000;
 const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
 const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
 const ELASTIC_AGENT_CAPACITY_HOLD_MS = 30 * 60 * 1000;
@@ -1570,6 +1571,68 @@ export function captureCreateCommandExpiryEligible({
   return !captureAgentOnline(effectiveLivenessAt, now, livenessGraceMs);
 }
 
+export function captureCreateCommandExpiredBeforeOpen({
+  error = {},
+  executionStartedAt = null,
+  itemStartedAt = null,
+  attemptStartedAt = null,
+} = {}) {
+  const normalizedError = safeJson(error);
+  return Boolean(
+    !executionStartedAt &&
+      !itemStartedAt &&
+      !attemptStartedAt &&
+      text(normalizedError.code, 100).toLowerCase() ===
+        'create_command_expired' &&
+      text(normalizedError.commandStatusBeforeExpiry, 40).toLowerCase() ===
+        'pending',
+  );
+}
+
+export function captureExecutionNeverOpened({
+  executionTaskId = '',
+  error = {},
+  sourceExecutionMetadata = {},
+  executionStartedAt = null,
+  itemStartedAt = null,
+  attemptStartedAt = null,
+  attemptExists = false,
+  attemptCount = 0,
+} = {}) {
+  if (executionStartedAt || itemStartedAt || attemptStartedAt) return false;
+  const normalizedError = safeJson(error);
+  const normalizedMetadata = safeJson(sourceExecutionMetadata);
+  if (
+    (
+      text(normalizedError.code, 100).toLowerCase() ===
+        'create_agent_unavailable' &&
+      text(normalizedError.commandStatusBefore, 40).toLowerCase() === 'pending'
+    ) ||
+    normalizedMetadata.stoppedBeforeDispatch === true
+  ) {
+    return true;
+  }
+  if (captureCreateCommandExpiredBeforeOpen({
+    error: normalizedError,
+    executionStartedAt,
+    itemStartedAt,
+    attemptStartedAt,
+  })) {
+    return true;
+  }
+  return !text(executionTaskId, 100) &&
+    Math.max(0, Number(attemptCount) || 0) === 0 &&
+    attemptExists !== true;
+}
+
+export function captureItemRequiresLocalClosureReuseFence({
+  itemType,
+  sourceExecutionMetadata,
+} = {}) {
+  return text(itemType, 40).toLowerCase() === 'keyword' &&
+    safeJson(sourceExecutionMetadata).requiresLocalClosureReuseFenceV1 === true;
+}
+
 async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) {
   const scopedTaskId = text(taskId, 100);
   const scopedAgentId = text(agentId, 100);
@@ -1634,6 +1697,12 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
       lastLivenessAt: command.agent_liveness_at,
     }))
     .map(command => command.id);
+  const expiryCandidateStatusById = new Map(
+    expiryCandidates.map(command => [
+      String(command.id),
+      text(command.status, 40).toLowerCase(),
+    ]),
+  );
   const expired = expiryCandidateIds.length > 0 ? await tx.queryAll(`
     UPDATE capture_agent_commands
     SET status = 'expired',
@@ -1672,13 +1741,16 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
 
   for (const command of expired) {
     if (command.command_type === 'create') {
+      const commandStatusBeforeExpiry =
+        expiryCandidateStatusById.get(String(command.id)) || '';
       const failedTask = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = 'failed',
           message = '设备创建指令已过期，任务未执行',
           error = jsonb_build_object(
             'code', 'create_command_expired',
-            'message', '设备未在指令有效期内领取并创建任务'
+            'message', '设备未在指令有效期内领取并创建任务',
+            'commandStatusBeforeExpiry', $4::text
           ),
           finished_at = now(),
           updated_at = now()
@@ -1686,7 +1758,12 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
           AND status IN ('pending', 'claimed')
           AND metadata->>'createCommandId' = $3
         RETURNING id, status, parent_task_id, task_type, metadata
-      `, [command.task_id, tenantId, command.id]);
+      `, [
+        command.task_id,
+        tenantId,
+        command.id,
+        commandStatusBeforeExpiry,
+      ]);
       await appendEvent(tx, {
         tenantId,
         taskId: command.task_id,
@@ -1719,6 +1796,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
             code: 'create_command_expired',
             message: '设备未在指令有效期内领取并创建任务',
             automaticRetry: elasticQueueItem,
+            commandStatusBeforeExpiry,
           },
         });
       }
@@ -1789,7 +1867,10 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
   const unavailable = await tx.queryAll(`
     UPDATE capture_agent_commands c
     SET status = 'expired',
-      result = jsonb_build_object('reason', 'agent_inactive'),
+      result = jsonb_build_object(
+        'reason', 'agent_inactive',
+        'commandStatusBefore', c.status
+      ),
       finished_at = now(), updated_at = now()
     WHERE c.tenant_id = $1
       AND ($2 = '' OR c.task_id::text = $2)
@@ -1837,24 +1918,30 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
             OR t.platform = ANY(ca.allowed_platforms)
           )
       )
-    RETURNING id, task_id, agent_id, command_type, payload
+    RETURNING id, task_id, agent_id, command_type, payload,
+      result->>'commandStatusBefore' AS command_status_before
   `, [tenantId, scopedTaskId, scopedAgentId]);
   for (const command of unavailable) {
     if (command.command_type === 'create') {
+      const commandStatusBefore = text(
+        command.command_status_before,
+        40,
+      ).toLowerCase();
       const failedTask = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = 'needs_action',
           message = '目标节点授权或平台职责已变化，任务未执行',
           error = jsonb_build_object(
             'code', 'create_agent_unavailable',
-            'message', '目标节点授权或平台职责已变化'
+            'message', '目标节点授权或平台职责已变化',
+            'commandStatusBefore', $4::text
           ),
           updated_at = now()
         WHERE id = $1 AND tenant_id = $2
           AND status IN ('pending', 'claimed')
           AND metadata->>'createCommandId' = $3
         RETURNING id, status, parent_task_id, task_type, metadata
-      `, [command.task_id, tenantId, command.id]);
+      `, [command.task_id, tenantId, command.id, commandStatusBefore]);
       await appendEvent(tx, {
         tenantId,
         taskId: command.task_id,
@@ -1864,7 +1951,11 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         message: failedTask
           ? '目标节点授权或平台职责已变化，创建指令已取消'
           : '目标任务已有更新状态，旧创建指令已取消',
-        payload: {commandId: command.id, commandType: command.command_type},
+        payload: {
+          commandId: command.id,
+          commandType: command.command_type,
+          commandStatusBefore,
+        },
       });
       if (failedTask) {
         await failProfileDiscoveryWork(tx, {
@@ -1884,6 +1975,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
           error: {
             code: 'create_agent_unavailable',
             message: '目标节点授权或平台职责已变化',
+            commandStatusBefore,
           },
         });
       }
@@ -3169,16 +3261,25 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
       .filter(Boolean),
   );
   const sourceItems = await tx.queryAll(`
-    SELECT id, keyword, ordinal, status, attempt_count,
-      assignment_revision
-    FROM capture_task_items
-    WHERE tenant_id = $1
-      AND task_id = $2
-      AND execution_task_id = $3
-      AND assigned_agent_id = $4
-      AND status IN ('retryable', 'needs_action', 'failed')
-    ORDER BY id
-    FOR UPDATE
+    SELECT item.id, item.keyword, item.ordinal, item.status,
+      item.attempt_count, item.assignment_revision,
+      source_attempt.id AS source_attempt_id
+    FROM capture_task_items item
+    JOIN capture_task_item_attempts source_attempt
+      ON source_attempt.tenant_id = item.tenant_id
+      AND source_attempt.item_id = item.id
+      AND source_attempt.parent_task_id = item.task_id
+      AND source_attempt.execution_task_id = item.execution_task_id
+      AND source_attempt.agent_id = item.assigned_agent_id
+      AND source_attempt.attempt_number = item.attempt_count
+      AND source_attempt.assignment_revision = item.assignment_revision
+    WHERE item.tenant_id = $1
+      AND item.task_id = $2
+      AND item.execution_task_id = $3
+      AND item.assigned_agent_id = $4
+      AND item.status IN ('retryable', 'needs_action', 'failed')
+    ORDER BY item.id
+    FOR UPDATE OF item, source_attempt
   `, [
     agent.tenant_id,
     parent.id,
@@ -3193,6 +3294,26 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
     .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
     .slice(0, 30);
   if (eligibleItems.length === 0) return task;
+
+  if (
+    captureItemRequiresLocalClosureReuseFence({
+      itemType: 'keyword',
+      sourceExecutionMetadata: sourceMetadata,
+    })
+  ) {
+    for (const item of eligibleItems) {
+      const proof = await loadVerifiedCaptureLocalClosureProof(tx, {
+        tenantId: agent.tenant_id,
+        executionTaskId: sourceTask.id,
+        sourceAgentId: agent.id,
+        itemId: item.id,
+        itemAttemptId: item.source_attempt_id,
+        itemAttemptNumber: item.attempt_count,
+        assignmentRevision: item.assignment_revision,
+      });
+      if (proof.proven !== true) return task;
+    }
+  }
 
   const nextRevision = Number(parent.orchestration_revision || 0) + 1;
   const requestHash = crypto
@@ -5085,6 +5206,9 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
 
 export async function mirrorTaskSnapshot(tx, agent, snapshot) {
   snapshot = bindCloudTaskSnapshotHealthToAttempt(snapshot);
+  const agentSnapshotMetadata = {...safeJson(snapshot.metadata)};
+  delete agentSnapshotMetadata.requiresLocalClosureReuseFenceV1;
+  delete agentSnapshotMetadata.stoppedBeforeDispatch;
   const previous = await tx.queryOne(`
     SELECT task.id, task.status, task.attempt_number,
       occupied_attempt.client_attempt_id AS occupied_attempt_id
@@ -5186,7 +5310,11 @@ export async function mirrorTaskSnapshot(tx, agent, snapshot) {
       progress = EXCLUDED.progress,
       checkpoint = EXCLUDED.checkpoint,
       counts = EXCLUDED.counts,
-      metadata = EXCLUDED.metadata
+      metadata = (
+          EXCLUDED.metadata
+          - 'requiresLocalClosureReuseFenceV1'
+          - 'stoppedBeforeDispatch'
+        )
         || CASE
           WHEN capture_tasks.status = 'resume_requested'
             AND EXCLUDED.status IN ('needs_action', 'failed', 'interrupted', 'completed_with_failures')
@@ -5211,6 +5339,8 @@ export async function mirrorTaskSnapshot(tx, agent, snapshot) {
             'orchestrationRevision', capture_tasks.metadata->'orchestrationRevision',
             'itemIds', capture_tasks.metadata->'itemIds',
             'attemptIdentity', capture_tasks.metadata->'attemptIdentity',
+            'requiresLocalClosureReuseFenceV1', capture_tasks.metadata->'requiresLocalClosureReuseFenceV1',
+            'stoppedBeforeDispatch', capture_tasks.metadata->'stoppedBeforeDispatch',
             'handoffRequestHash', capture_tasks.metadata->'handoffRequestHash',
             'handoffRequestKey', capture_tasks.metadata->'handoffRequestKey',
             'handoffSourceExecutionTaskId', capture_tasks.metadata->'handoffSourceExecutionTaskId',
@@ -5372,7 +5502,7 @@ export async function mirrorTaskSnapshot(tx, agent, snapshot) {
     JSON.stringify(snapshot.progress),
     JSON.stringify(snapshot.checkpoint),
     JSON.stringify(snapshot.counts),
-    JSON.stringify(snapshot.metadata),
+    JSON.stringify(agentSnapshotMetadata),
     JSON.stringify(snapshot.error),
     snapshot.message,
     snapshot.attemptNumber,
@@ -5601,6 +5731,8 @@ async function dispatchNextElasticWorkItem(tx, {
     freshCapabilities.watchedContentPatrol === true;
   const canClaimSequentialSearch =
     freshCapabilities.remoteSequentialSearchPassesV1 === true;
+  const canFenceLocalClosureReuse =
+    freshCapabilities.localClosureReuseFenceV1 === true;
   if (!canClaimKeyword && !canClaimNegativePost && !canClaimWatchedContent) {
     return null;
   }
@@ -5612,50 +5744,16 @@ async function dispatchNextElasticWorkItem(tx, {
   if (busy) return null;
   // A terminal execution snapshot reaches the server before the Extension has
   // necessarily ended its debug session, released the local capture group and
-  // closed its runner tab. Do not reuse this Agent for the next elastic item
-  // until the exact preceding attempt supplies authoritative local-closure
-  // proof; otherwise the next BEGIN races the old cleanup and fails with
-  // capture_task_group_busy.
-  const latestTerminalElasticAttempt = await tx.queryOne(`
-    SELECT
-      attempt.id,
-      attempt.item_id,
-      attempt.attempt_number,
-      attempt.assignment_revision,
-      attempt.execution_task_id
-    FROM capture_task_item_attempts attempt
-    JOIN capture_tasks parent
-      ON parent.id = attempt.parent_task_id
-      AND parent.tenant_id = attempt.tenant_id
-    JOIN capture_tasks execution
-      ON execution.id = attempt.execution_task_id
-      AND execution.tenant_id = attempt.tenant_id
-    WHERE attempt.tenant_id = $1
-      AND attempt.agent_id = $2
-      AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
-      AND execution.status IN (
-        'completed', 'completed_with_warnings',
-        'completed_with_failures', 'failed', 'canceled',
-        'skipped', 'superseded', 'needs_action', 'interrupted'
-      )
-      AND attempt.updated_at > now() - interval '30 minutes'
-    ORDER BY attempt.updated_at DESC, attempt.id DESC
-    LIMIT 1
-  `, [agent.tenant_id, agent.id]);
-  if (latestTerminalElasticAttempt) {
-    const precedingClosure = await loadVerifiedCaptureLocalClosureProof(tx, {
-      tenantId: agent.tenant_id,
-      executionTaskId: latestTerminalElasticAttempt.execution_task_id,
-      sourceAgentId: agent.id,
-      itemId: latestTerminalElasticAttempt.item_id,
-      itemAttemptId: latestTerminalElasticAttempt.id,
-      itemAttemptNumber: latestTerminalElasticAttempt.attempt_number,
-      assignmentRevision:
-        latestTerminalElasticAttempt.assignment_revision,
-    });
-    if (precedingClosure.proven !== true) {
-      return null;
-    }
+  // closed its runner tab. Marked history remains fail-closed even if a client
+  // later reports downgraded capabilities. Legacy unmarked history receives a
+  // bounded quiescence window so a server-first rollout is safe without
+  // permanently removing an older Extension from the pool.
+  const localClosureReuseGate = await loadCaptureAgentLocalClosureReuseGate(
+    tx,
+    {tenantId: agent.tenant_id, agentId: agent.id},
+  );
+  if (!localClosureReuseGate.ready) {
+    return null;
   }
   const recentRecoveryAttempt = await tx.queryOne(`
     SELECT attempt.status, attempt.error, attempt.checkpoint,
@@ -5727,6 +5825,20 @@ async function dispatchNextElasticWorkItem(tx, {
       item.assignment_revision,
       item.assigned_agent_id AS source_agent_id,
       item.execution_task_id,
+      (
+        SELECT previous_execution.metadata
+        FROM capture_tasks previous_execution
+        WHERE previous_execution.id = item.execution_task_id
+          AND previous_execution.tenant_id = item.tenant_id
+        LIMIT 1
+      ) AS source_execution_metadata,
+      (
+        SELECT previous_execution.started_at
+        FROM capture_tasks previous_execution
+        WHERE previous_execution.id = item.execution_task_id
+          AND previous_execution.tenant_id = item.tenant_id
+        LIMIT 1
+      ) AS source_execution_started_at,
       item.metadata AS item_metadata,
       COALESCE(
         CASE
@@ -5857,10 +5969,15 @@ async function dispatchNextElasticWorkItem(tx, {
   if (requiresSingleRelay && freshCapabilities.singleRelayV1 !== true) {
     return null;
   }
-  if (candidate.item_status === 'retryable') {
+  const requiresSourceLocalClosure =
+    captureItemRequiresLocalClosureReuseFence({
+      itemType: candidate.item_type,
+      sourceExecutionMetadata: candidate.source_execution_metadata,
+    });
+  if (candidate.item_status === 'retryable' && requiresSourceLocalClosure) {
     const sourceExecutionKnown = UUID_PATTERN.test(previousExecutionTaskId);
     const sourceAttempt = await tx.queryOne(`
-      SELECT id, agent_id, attempt_number, assignment_revision
+      SELECT id, agent_id, attempt_number, assignment_revision, started_at
       FROM capture_task_item_attempts
       WHERE tenant_id = $1
         AND item_id = $2
@@ -5873,11 +5990,16 @@ async function dispatchNextElasticWorkItem(tx, {
       candidate.item_id,
       sourceExecutionKnown ? previousExecutionTaskId : null,
     ]);
-    const neverOpened =
-      !previousExecutionTaskId &&
-      !candidate.item_started_at &&
-      Math.max(0, Number(candidate.attempt_count) || 0) === 0 &&
-      !sourceAttempt;
+    const neverOpened = captureExecutionNeverOpened({
+      executionTaskId: previousExecutionTaskId,
+      error: candidate.item_error,
+      sourceExecutionMetadata: candidate.source_execution_metadata,
+      executionStartedAt: candidate.source_execution_started_at,
+      itemStartedAt: candidate.item_started_at,
+      attemptStartedAt: sourceAttempt?.started_at,
+      attemptExists: Boolean(sourceAttempt),
+      attemptCount: candidate.attempt_count,
+    });
     const sourceAgentId = text(
       sourceAttempt?.agent_id || candidate.source_agent_id,
       100,
@@ -6198,6 +6320,9 @@ async function dispatchNextElasticWorkItem(tx, {
     distributionMode: 'elastic_pool',
     claimUnit,
     attemptIdentity,
+    ...(canFenceLocalClosureReuse && candidate.item_type === 'keyword'
+      ? {requiresLocalClosureReuseFenceV1: true}
+      : {}),
     ...(bootstrapPacing ? {bootstrapPacing} : {}),
     ...(sequentialResumeCheckpoint
       ? {
@@ -9949,7 +10074,13 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
             {excludeTaskIds: [task.id]},
           )
         : {kind: 'ineligible'};
-      const resourceAdmission = eligible && !busy
+      const localClosureReuseGate = eligible && !busy
+        ? await loadCaptureAgentLocalClosureReuseGate(tx, {
+            tenantId,
+            agentId: locked.id,
+          })
+        : {ready: false, reason: 'agent_ineligible_or_busy'};
+      const resourceAdmission = eligible && !busy && localClosureReuseGate.ready
         ? await reserveCaptureResourceAdmission(tx, {
             tenantId,
             parentTaskId: task.id,
@@ -9959,7 +10090,12 @@ async function loadIdleCrossDeviceRetryAgent(tx, {
             expectedSearches,
           })
         : {allowed: false, reason: 'agent_busy'};
-      if (!eligible || busy || !resourceAdmission.allowed) {
+      if (
+        !eligible ||
+        busy ||
+        !localClosureReuseGate.ready ||
+        !resourceAdmission.allowed
+      ) {
         // Rolling back to the per-candidate savepoint releases both its row
         // lock and its transaction-level advisory lock before trying the next
         // idle browser. Locks acquired by the surrounding dispatch remain.
@@ -10227,6 +10363,121 @@ async function loadVerifiedCaptureLocalClosureProof(tx, {
     snapshotReceivedAt: snapshot?.received_at,
     now: snapshot?.proof_now || new Date(),
   });
+}
+
+async function loadCaptureAgentLocalClosureReuseGate(tx, {
+  tenantId,
+  agentId,
+} = {}) {
+  // Exclude only executions that provably never reached a browser *inside the
+  // SQL*. That lets ORDER/LIMIT fall through to an older, potentially-opened
+  // attempt instead of allowing a newer never-open row to hide it.
+  const history = await tx.queryAll(`
+    WITH reusable_history AS (
+      SELECT
+        attempt.id,
+        attempt.item_id,
+        attempt.attempt_number,
+        attempt.assignment_revision,
+        attempt.execution_task_id,
+        COALESCE(
+          execution.metadata->>'requiresLocalClosureReuseFenceV1' = 'true',
+          false
+        ) AS requires_local_closure_proof,
+        GREATEST(
+          COALESCE(execution.finished_at, '-infinity'::timestamptz),
+          execution.updated_at,
+          COALESCE(attempt.finished_at, '-infinity'::timestamptz),
+          attempt.updated_at
+        ) AS terminal_at
+      FROM capture_task_item_attempts attempt
+      JOIN capture_task_items item
+        ON item.id = attempt.item_id
+        AND item.tenant_id = attempt.tenant_id
+      JOIN capture_tasks parent
+        ON parent.id = attempt.parent_task_id
+        AND parent.tenant_id = attempt.tenant_id
+      JOIN capture_tasks execution
+        ON execution.id = attempt.execution_task_id
+        AND execution.tenant_id = attempt.tenant_id
+      WHERE attempt.tenant_id = $1
+        AND attempt.agent_id = $2
+        AND item.item_type = 'keyword'
+        AND execution.status IN (
+          'completed', 'completed_with_warnings',
+          'completed_with_failures', 'failed', 'canceled',
+          'skipped', 'needs_action'
+        )
+        AND NOT (
+          execution.started_at IS NULL
+          AND attempt.started_at IS NULL
+          AND (
+            (
+              execution.error->>'code' = 'create_command_expired'
+              AND execution.error->>'commandStatusBeforeExpiry' = 'pending'
+            )
+            OR (
+              execution.error->>'code' = 'create_agent_unavailable'
+              AND execution.error->>'commandStatusBefore' = 'pending'
+            )
+            OR execution.metadata->>'stoppedBeforeDispatch' = 'true'
+          )
+        )
+    )
+    SELECT DISTINCT ON (requires_local_closure_proof)
+      id,
+      item_id,
+      attempt_number,
+      assignment_revision,
+      execution_task_id,
+      requires_local_closure_proof,
+      terminal_at,
+      terminal_at <= now() - make_interval(secs => $3::integer)
+        AS legacy_quiescent
+    FROM reusable_history
+    ORDER BY requires_local_closure_proof DESC, terminal_at DESC, id DESC
+  `, [
+    tenantId,
+    agentId,
+    Math.floor(LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS / 1000),
+  ]);
+  const latestMarkedAttempt = history.find(
+    attempt => attempt.requires_local_closure_proof === true,
+  );
+  if (latestMarkedAttempt) {
+    const proof = await loadVerifiedCaptureLocalClosureProof(tx, {
+      tenantId,
+      executionTaskId: latestMarkedAttempt.execution_task_id,
+      sourceAgentId: agentId,
+      itemId: latestMarkedAttempt.item_id,
+      itemAttemptId: latestMarkedAttempt.id,
+      itemAttemptNumber: latestMarkedAttempt.attempt_number,
+      assignmentRevision: latestMarkedAttempt.assignment_revision,
+    });
+    if (proof.proven !== true) {
+      return {
+        ready: false,
+        reason: proof.reason,
+        attempt: latestMarkedAttempt,
+      };
+    }
+  }
+  const latestLegacyAttempt = history.find(
+    attempt => attempt.requires_local_closure_proof !== true,
+  );
+  if (latestLegacyAttempt && latestLegacyAttempt.legacy_quiescent !== true) {
+    return {
+      ready: false,
+      reason: 'legacy_local_cleanup_quiescence',
+      attempt: latestLegacyAttempt,
+    };
+  }
+  return {
+    ready: true,
+    reason: latestMarkedAttempt
+      ? 'marked_local_closure_proven'
+      : 'local_closure_reuse_ready',
+  };
 }
 
 export async function dispatchCrossDeviceRetry(options = {}) {
@@ -10941,6 +11192,8 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           : classifyCaptureRecoveryDisposition(item).automatic),
       );
       let sourceExecutionPending = false;
+      const sourceExecutionMetadataById = new Map();
+      const sourceExecutionStartedAtById = new Map();
       if (automatic && retryItems.length > 0) {
         const executionTaskIds = Array.from(new Set(
           retryItems
@@ -10949,7 +11202,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         ));
         const sourceStates = executionTaskIds.length > 0
           ? await tx.queryAll(`
-              SELECT id, status
+              SELECT id, status, metadata, started_at
               FROM capture_tasks
               WHERE tenant_id = $1 AND id = ANY($2::uuid[])
             `, [req.tenantId, executionTaskIds])
@@ -10957,6 +11210,16 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         const sourceStatusById = new Map(
           sourceStates.map(source => [String(source.id), source.status]),
         );
+        for (const source of sourceStates) {
+          sourceExecutionMetadataById.set(
+            String(source.id),
+            safeJson(source.metadata),
+          );
+          sourceExecutionStartedAtById.set(
+            String(source.id),
+            source.started_at,
+          );
+        }
         retryItems = retryItems
           .filter(item => {
             const executionTaskId = text(item.execution_task_id, 100);
@@ -11050,9 +11313,18 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             retryItem.execution_task_id,
             100,
           ).toLowerCase();
+          const sourceExecutionMetadata =
+            sourceExecutionMetadataById.get(sourceExecutionTaskId);
+          if (!captureItemRequiresLocalClosureReuseFence({
+            itemType: retryItem.item_type,
+            sourceExecutionMetadata,
+          })) {
+            continue;
+          }
           const sourceAttempt = UUID_PATTERN.test(sourceExecutionTaskId)
             ? await tx.queryOne(`
-                SELECT id, agent_id, attempt_number, assignment_revision
+                SELECT id, agent_id, attempt_number, assignment_revision,
+                  started_at
                 FROM capture_task_item_attempts
                 WHERE tenant_id = $1
                   AND item_id = $2
@@ -11062,15 +11334,20 @@ export async function dispatchCrossDeviceRetry(options = {}) {
                 FOR UPDATE
               `, [req.tenantId, retryItem.id, sourceExecutionTaskId])
             : null;
-          const neverOpened =
-            !sourceExecutionTaskId &&
-            !retryItem.started_at &&
-            Math.max(0, Number(retryItem.attempt_count) || 0) === 0 &&
-            !sourceAttempt;
+          const neverOpened = captureExecutionNeverOpened({
+            executionTaskId: sourceExecutionTaskId,
+            error: retryItem.error,
+            sourceExecutionMetadata,
+            executionStartedAt:
+              sourceExecutionStartedAtById.get(sourceExecutionTaskId),
+            itemStartedAt: retryItem.started_at,
+            attemptStartedAt: sourceAttempt?.started_at,
+            attemptExists: Boolean(sourceAttempt),
+            attemptCount: retryItem.attempt_count,
+          });
           if (neverOpened) {
-            // A queued item with no execution, no attempt and no start time
-            // has no browser page to close. This is the only proof-free
-            // automatic handoff; any partial/malformed lineage fails closed.
+            // Work stopped before browser dispatch has no local page to close.
+            // Any partial/malformed lineage still fails closed.
             continue;
           }
           const localClosureProof = await loadVerifiedCaptureLocalClosureProof(
@@ -11269,8 +11546,15 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           sourceAttemptNumber: Number(expectedAttemptNumber),
         };
       }
+      const targetSupportsLocalClosureReuseFence =
+        businessTaskType === 'unattended_keyword_capture' &&
+        safeJson(targetAgent.capabilities).localClosureReuseFenceV1 === true;
       const childMetadata = {
         ...safeJson(parent.metadata),
+        // A promoted parent may itself be a marked child. Do not inherit its
+        // fence marker or stop settlement unless this successor earns it.
+        requiresLocalClosureReuseFenceV1: undefined,
+        stoppedBeforeDispatch: undefined,
         promotedRetryParent: false,
         promotedBusinessTaskType: businessTaskType,
         workflow: businessTaskType,
@@ -11287,6 +11571,9 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         crossDeviceRetryRequestKey: requestKey,
         crossDeviceRetrySourceExecutionTaskIds: sourceExecutionTaskIds,
         automaticRecovery: automatic,
+        ...(targetSupportsLocalClosureReuseFence
+          ? {requiresLocalClosureReuseFenceV1: true}
+          : {}),
         ...(dutyRecovery
           ? {
               dutyRecovery: true,
@@ -12117,7 +12404,7 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         ? '执行节点持续离线，工作项已退回弹性队列'
         : '执行节点在线但当前任务心跳中断，工作项已退回弹性队列';
       const sourceItem = await tx.queryOne(`
-        SELECT id, assigned_agent_id, assignment_revision
+        SELECT id, item_type, assigned_agent_id, assignment_revision
         FROM capture_task_items
         WHERE tenant_id = $1
           AND task_id = $2
@@ -12150,18 +12437,25 @@ export async function reconcileElasticCaptureLeases(input = 50) {
             child.assigned_agent_id,
           ])
         : null;
-      const localClosureProof = await loadVerifiedCaptureLocalClosureProof(tx, {
-        tenantId: candidate.tenant_id,
-        executionTaskId: child.id,
-        sourceAgentId: child.assigned_agent_id,
-        itemId: sourceItem?.id,
-        itemAttemptId: sourceAttempt?.id,
-        itemAttemptNumber: sourceAttempt?.attempt_number,
-        assignmentRevision:
-          sourceAttempt?.assignment_revision ??
-          sourceItem?.assignment_revision,
-      });
-      if (!localClosureProof.proven) {
+      const requiresSourceLocalClosure =
+        captureItemRequiresLocalClosureReuseFence({
+          itemType: sourceItem?.item_type,
+          sourceExecutionMetadata: child.metadata,
+        });
+      const localClosureProof = requiresSourceLocalClosure
+        ? await loadVerifiedCaptureLocalClosureProof(tx, {
+            tenantId: candidate.tenant_id,
+            executionTaskId: child.id,
+            sourceAgentId: child.assigned_agent_id,
+            itemId: sourceItem?.id,
+            itemAttemptId: sourceAttempt?.id,
+            itemAttemptNumber: sourceAttempt?.attempt_number,
+            assignmentRevision:
+              sourceAttempt?.assignment_revision ??
+              sourceItem?.assignment_revision,
+          })
+        : {proven: true, reason: 'local_closure_reuse_fence_not_required'};
+      if (requiresSourceLocalClosure && !localClosureProof.proven) {
         const firstWait =
           safeJson(child.metadata).waitingForSourceClosure !== true;
         await tx.execute(`

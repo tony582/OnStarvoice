@@ -3,12 +3,35 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.96',
+  latestVersion: '0.3.97',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-28',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.96-20260828.zip',
+  releaseDate: '2026-08-29',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.97-20260829.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.97',
+      releaseDate: '2026-08-29',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '慢搜索复用已经打开的准确结果页',
+              desc: '小红书和抖音只接受与当前关键词完全一致的搜索页；页面已出现准确结果时继续筛选和采集，不再重复搜索，也不会误用前缀相似的旧页面。',
+            },
+            {
+              title: '失败关键词在安全闭环后正常接力',
+              desc: '原 Agent 的任务、页面、锁和待上传数据确认全部结束后，空闲 Agent 才可领取；已打开但回报迟到的任务不会被当成未开始，也不会永久卡住候选队列。',
+            },
+            {
+              title: '计划关闭与云端任务相互隔离',
+              desc: '关闭本地无人值守计划只清理该计划自己的运行态，不再取消刚接到的云端任务；终态清理也不会误伤后继任务。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.96',
       releaseDate: '2026-08-28',

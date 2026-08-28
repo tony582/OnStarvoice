@@ -1042,6 +1042,7 @@ test("heartbeat advertises remote task creation and mirrors a sanitized unattend
   assert.equal(payload.agent.capabilities.remoteTaskKeywordPostLimit, true);
   assert.equal(payload.agent.capabilities.remoteSequentialSearchPassesV1, true);
   assert.equal(payload.agent.capabilities.singleRelayV1, true);
+  assert.equal(payload.agent.capabilities.localClosureReuseFenceV1, true);
   assert.equal(payload.agent.capabilities.negativePostPatrol, true);
   assert.equal(payload.agent.capabilities.remoteTargetedPostCaptureV1, true);
   assert.equal(payload.agent.capabilities.unattendedPlanMirror, true);

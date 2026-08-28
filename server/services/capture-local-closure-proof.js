@@ -1,5 +1,5 @@
-const LOCAL_CLOSURE_VERSION = 1;
-const LOCAL_CLOSURE_MAX_AGE_MS = 30 * 60 * 1000;
+const LOCAL_CLOSURE_VERSION = 2;
+const LEGACY_LOCAL_CLOSURE_VERSION = 1;
 const LOCAL_CLOSURE_FUTURE_SKEW_MS = 60 * 1000;
 
 const TERMINAL_STATUSES = new Set([
@@ -174,27 +174,44 @@ export function normalizeCaptureLocalClosureEvidence(value = {}) {
         : null,
     capturedRecordCount: integer(source.capturedRecordCount),
   };
-  const uploadCountsMatch = normalized.streamingSyncEnabled === true
-    ? normalized.streamingSyncCapturedUniqueCount ===
-        normalized.streamingSyncEnqueuedUniqueCount +
-          normalized.streamingSyncExcludedUniqueCount &&
-      normalized.streamingSyncEnqueuedUniqueCount ===
-        normalized.streamingSyncSucceededUniqueCount &&
-      normalized.streamingSyncProcessedCount ===
-        normalized.streamingSyncEnqueuedCount &&
-      normalized.streamingSyncSuccessCount ===
-        normalized.streamingSyncEnqueuedCount
-    : normalized.streamingSyncEnabled === false &&
-      normalized.capturedRecordCount === 0 &&
-      normalized.streamingSyncCapturedUniqueCount === 0 &&
-      normalized.streamingSyncEnqueuedUniqueCount === 0 &&
-      normalized.streamingSyncExcludedUniqueCount === 0 &&
-      normalized.streamingSyncSucceededUniqueCount === 0 &&
-      normalized.streamingSyncEnqueuedCount === 0 &&
-      normalized.streamingSyncProcessedCount === 0 &&
-      normalized.streamingSyncSuccessCount === 0;
+  // v1 used saved-row equality. Keep accepting that fail-closed proof during
+  // a rolling Extension update, while v2 uses attempt-local unique coverage so
+  // duplicate rows and intentional AI exclusions do not block safe handoff.
+  const uploadCountsMatch = version === LEGACY_LOCAL_CLOSURE_VERSION
+    ? normalized.streamingSyncEnabled === true
+      ? normalized.streamingSyncEnqueuedCount === normalized.capturedRecordCount &&
+        normalized.streamingSyncProcessedCount ===
+          normalized.streamingSyncEnqueuedCount &&
+        normalized.streamingSyncSuccessCount ===
+          normalized.streamingSyncEnqueuedCount
+      : normalized.streamingSyncEnabled === false &&
+        normalized.capturedRecordCount === 0 &&
+        normalized.streamingSyncEnqueuedCount === 0 &&
+        normalized.streamingSyncProcessedCount === 0 &&
+        normalized.streamingSyncSuccessCount === 0
+    : normalized.streamingSyncEnabled === true
+      ? (normalized.capturedRecordCount === 0 ||
+          normalized.streamingSyncCapturedUniqueCount > 0) &&
+        normalized.streamingSyncCapturedUniqueCount ===
+          normalized.streamingSyncEnqueuedUniqueCount +
+            normalized.streamingSyncExcludedUniqueCount &&
+        normalized.streamingSyncEnqueuedUniqueCount ===
+          normalized.streamingSyncSucceededUniqueCount &&
+        normalized.streamingSyncProcessedCount ===
+          normalized.streamingSyncEnqueuedCount &&
+        normalized.streamingSyncSuccessCount ===
+          normalized.streamingSyncEnqueuedCount
+      : normalized.streamingSyncEnabled === false &&
+        normalized.capturedRecordCount === 0 &&
+        normalized.streamingSyncCapturedUniqueCount === 0 &&
+        normalized.streamingSyncEnqueuedUniqueCount === 0 &&
+        normalized.streamingSyncExcludedUniqueCount === 0 &&
+        normalized.streamingSyncSucceededUniqueCount === 0 &&
+        normalized.streamingSyncEnqueuedCount === 0 &&
+        normalized.streamingSyncProcessedCount === 0 &&
+        normalized.streamingSyncSuccessCount === 0;
   if (
-    version !== LOCAL_CLOSURE_VERSION ||
+    ![LEGACY_LOCAL_CLOSURE_VERSION, LOCAL_CLOSURE_VERSION].includes(version) ||
     !requestId ||
     !attemptId ||
     !itemId ||
@@ -299,6 +316,7 @@ export function verifyCaptureLocalClosureProof({
   const normalized = normalizeCaptureLocalClosureEvidence(evidence);
   const nowMs = timestamp(now);
   const receivedAtMs = timestamp(snapshotReceivedAt);
+  const terminalUpdatedAtMs = timestamp(normalized?.terminalUpdatedAt);
   const closedAtMs = timestamp(normalized?.closedAt);
   const checks = Object.freeze({
     normalized: Boolean(normalized),
@@ -346,14 +364,16 @@ export function verifyCaptureLocalClosureProof({
     freshSnapshot: Boolean(
       nowMs > 0 &&
       receivedAtMs > 0 &&
+      terminalUpdatedAtMs > 0 &&
       receivedAtMs <= nowMs + LOCAL_CLOSURE_FUTURE_SKEW_MS &&
-      nowMs - receivedAtMs <= LOCAL_CLOSURE_MAX_AGE_MS,
+      terminalUpdatedAtMs <= receivedAtMs + LOCAL_CLOSURE_FUTURE_SKEW_MS,
     ),
     saneClosureClock: Boolean(
       normalized &&
       nowMs > 0 &&
       closedAtMs > 0 &&
       closedAtMs <= nowMs + LOCAL_CLOSURE_FUTURE_SKEW_MS &&
+      terminalUpdatedAtMs <= closedAtMs + LOCAL_CLOSURE_FUTURE_SKEW_MS &&
       closedAtMs <= receivedAtMs + LOCAL_CLOSURE_FUTURE_SKEW_MS,
     ),
   });
@@ -373,5 +393,3 @@ export function verifyCaptureLocalClosureProof({
 
 export const CAPTURE_LOCAL_CLOSURE_EVIDENCE_VERSION =
   LOCAL_CLOSURE_VERSION;
-export const CAPTURE_LOCAL_CLOSURE_MAX_AGE_MS =
-  LOCAL_CLOSURE_MAX_AGE_MS;
