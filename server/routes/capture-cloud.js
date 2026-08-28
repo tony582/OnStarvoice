@@ -5610,6 +5610,53 @@ async function dispatchNextElasticWorkItem(tx, {
     agent.id,
   );
   if (busy) return null;
+  // A terminal execution snapshot reaches the server before the Extension has
+  // necessarily ended its debug session, released the local capture group and
+  // closed its runner tab. Do not reuse this Agent for the next elastic item
+  // until the exact preceding attempt supplies authoritative local-closure
+  // proof; otherwise the next BEGIN races the old cleanup and fails with
+  // capture_task_group_busy.
+  const latestTerminalElasticAttempt = await tx.queryOne(`
+    SELECT
+      attempt.id,
+      attempt.item_id,
+      attempt.attempt_number,
+      attempt.assignment_revision,
+      attempt.execution_task_id
+    FROM capture_task_item_attempts attempt
+    JOIN capture_tasks parent
+      ON parent.id = attempt.parent_task_id
+      AND parent.tenant_id = attempt.tenant_id
+    JOIN capture_tasks execution
+      ON execution.id = attempt.execution_task_id
+      AND execution.tenant_id = attempt.tenant_id
+    WHERE attempt.tenant_id = $1
+      AND attempt.agent_id = $2
+      AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+      AND execution.status IN (
+        'completed', 'completed_with_warnings',
+        'completed_with_failures', 'failed', 'canceled',
+        'skipped', 'superseded', 'needs_action', 'interrupted'
+      )
+      AND attempt.updated_at > now() - interval '30 minutes'
+    ORDER BY attempt.updated_at DESC, attempt.id DESC
+    LIMIT 1
+  `, [agent.tenant_id, agent.id]);
+  if (latestTerminalElasticAttempt) {
+    const precedingClosure = await loadVerifiedCaptureLocalClosureProof(tx, {
+      tenantId: agent.tenant_id,
+      executionTaskId: latestTerminalElasticAttempt.execution_task_id,
+      sourceAgentId: agent.id,
+      itemId: latestTerminalElasticAttempt.item_id,
+      itemAttemptId: latestTerminalElasticAttempt.id,
+      itemAttemptNumber: latestTerminalElasticAttempt.attempt_number,
+      assignmentRevision:
+        latestTerminalElasticAttempt.assignment_revision,
+    });
+    if (precedingClosure.proven !== true) {
+      return null;
+    }
+  }
   const recentRecoveryAttempt = await tx.queryOne(`
     SELECT attempt.status, attempt.error, attempt.checkpoint,
       attempt.finished_at, attempt.updated_at

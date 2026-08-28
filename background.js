@@ -4877,12 +4877,24 @@ async function markUnattendedRunRequestStale(request, message) {
   });
 }
 
-async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {}) {
+async function cancelUnattendedKeywordRunRequest(
+  message,
+  {
+    requestId = '',
+    attemptId = '',
+    localOnly = false,
+    cancelSource = 'user',
+    cancelReason = 'user_canceled',
+    errorCode = 'USER_CANCELED',
+  } = {},
+) {
   return await runUnattendedRunMutation(async () => {
     const request = await readUnattendedKeywordRunRequest();
     if (
       !request ||
       (requestId && request.id !== requestId) ||
+      (attemptId && request.attemptId !== attemptId) ||
+      (localOnly && request.cloudAssigned === true) ||
       (isTerminalUnattendedRunStatus(request.status) &&
         request.status !== 'needs_action')
     ) {
@@ -4893,9 +4905,9 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
       ...request,
       status: 'canceled',
       error: {
-        code: 'USER_CANCELED',
-        reason: 'user_canceled',
-        category: 'user_canceled',
+        code: String(errorCode || 'USER_CANCELED'),
+        reason: String(cancelReason || 'user_canceled'),
+        category: String(cancelReason || 'user_canceled'),
         message,
         retryable: false,
       },
@@ -4903,8 +4915,8 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
         ...(request.metadata && typeof request.metadata === 'object'
           ? request.metadata
           : {}),
-        cancelSource: 'user',
-        cancelReason: 'user_canceled',
+        cancelSource: String(cancelSource || 'user'),
+        cancelReason: String(cancelReason || 'user_canceled'),
       },
       recoveryPendingLaunch: false,
       recoveryWaitUntil: '',
@@ -4929,7 +4941,10 @@ async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {})
         type: 'canceled',
         message,
         at: now,
-        metadata: {cancelSource: 'user', reason: 'user_canceled'},
+        metadata: {
+          cancelSource: String(cancelSource || 'user'),
+          reason: String(cancelReason || 'user_canceled'),
+        },
       },
     });
     return nextRequest;
@@ -5943,7 +5958,7 @@ async function cleanupDisabledUnattendedKeywordPlanRuntime() {
   const request = await readUnattendedKeywordRunRequest();
   // 云端一次性下发任务与本地定时计划相互独立。关闭本地计划不能顺带
   // 取消后台已分配并正在执行的任务。
-  if (request?.cloudAssigned === true) {
+  if (!request || request.cloudAssigned === true) {
     return;
   }
   const progress = normalizeUnattendedRunProgress(
@@ -5951,7 +5966,20 @@ async function cleanupDisabledUnattendedKeywordPlanRuntime() {
     request?.message,
   );
   const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
-  await cancelUnattendedKeywordRunRequest(message);
+  const canceledRequest = await cancelUnattendedKeywordRunRequest(message, {
+    requestId: String(request.id || ''),
+    attemptId: String(request.attemptId || ''),
+    localOnly: true,
+    cancelSource: 'plan_disabled',
+    cancelReason: 'plan_disabled',
+    errorCode: 'PLAN_DISABLED',
+  });
+  // A cloud assignment may replace the local request between the read above
+  // and this serialized mutation. Only tear down targets when that exact
+  // local request was canceled; otherwise the new cloud task owns the lock.
+  if (!canceledRequest) {
+    return;
+  }
   await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
     progress?.runnerTabId,
   ]);

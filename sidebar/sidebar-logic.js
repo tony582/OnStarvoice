@@ -5246,13 +5246,34 @@ function renderCaptureDebugSession(runtime = {}) {
   const platform = String(
     session.platform || detectPlatformFromUrl(session.pageUrl || runtime.lastPageUrl || ""),
   ).trim() || "xiaohongshu";
-  const progress = projectCaptureTaskProgress(
+  const sessionProgress =
     session?.progress && typeof session.progress === "object"
       ? session.progress
-      : runtime?.lastCaptureProgress &&
-          typeof runtime.lastCaptureProgress === "object"
-        ? runtime.lastCaptureProgress
-        : {},
+      : {};
+  const runtimeProgress =
+    runtime?.lastCaptureProgress &&
+    typeof runtime.lastCaptureProgress === "object"
+      ? runtime.lastCaptureProgress
+      : {};
+  const activeListRunId = String(session?.activeListRunId || "").trim();
+  const runtimeListRunId = String(runtimeProgress.listCaptureRunId || "").trim();
+  const sessionProgressAt = parseCaptureTaskTime(sessionProgress.updatedAt);
+  const runtimeProgressAt = parseCaptureTaskTime(runtimeProgress.updatedAt);
+  const canUseLiveListProgress = Boolean(
+    activeListRunId &&
+      runtimeListRunId === activeListRunId &&
+      runtimeProgressAt > sessionProgressAt,
+  );
+  // Content keeps reporting scrolling/marked counts while the debug session is
+  // waiting for the relay response. Merge only the exact active list run and
+  // only when it is newer, so stale progress from a previous keyword cannot
+  // overwrite the current task.
+  const progress = projectCaptureTaskProgress(
+    canUseLiveListProgress
+      ? {...sessionProgress, ...runtimeProgress}
+      : Object.keys(sessionProgress).length > 0
+        ? sessionProgress
+        : runtimeProgress,
   );
   const logo = document.getElementById("debugSessionLogo");
   if (logo) {
@@ -7800,8 +7821,17 @@ async function handlePlatformMenuSwitch(targetPlatform) {
 
 async function handleCaptureNoteData() {
   const runtime = getCurrentRuntime();
+  const bootstrapEvidenceTabId = Number(bootstrapInitialSearchEvidence?.tabId);
+  const bootstrapEvidenceAccepted = Boolean(
+    bootstrapInitialSearchEvidence?.ready === true &&
+      String(bootstrapInitialSearchEvidence?.platform || "").trim() &&
+      (!preferredSourceTabId ||
+        bootstrapEvidenceTabId === Number(preferredSourceTabId)),
+  );
   const selectedPlatform = getViewPlatform(runtime);
-  const pagePlatform = getPagePlatform(runtime);
+  const pagePlatform = bootstrapEvidenceAccepted
+    ? String(bootstrapInitialSearchEvidence.platform || "").trim()
+    : getPagePlatform(runtime);
   if (selectedPlatform !== pagePlatform) {
     const platformCopy = getPlatformCopy(selectedPlatform);
     showMessage(
@@ -8164,7 +8194,10 @@ async function handleCaptureSearchData() {
     );
     return;
   }
-  if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
+  if (
+    runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS &&
+    !bootstrapEvidenceAccepted
+  ) {
     showMessage("请先切换到搜索页", "error");
     return;
   }
@@ -13714,6 +13747,8 @@ async function handleBatchKeywordCapture(options = {}) {
   let streamingSyncQueue = null;
   let streamingSyncResult = null;
   let streamingSyncDrained = false;
+  let failureOutcome = null;
+  let caughtError = null;
   let sidebarTaskContext = null;
   let captureTaskContext = null;
   let captureTaskContextNeedsCompletion = false;
@@ -14706,15 +14741,17 @@ async function handleBatchKeywordCapture(options = {}) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
     sidebarTaskStatus = "failed";
     sidebarTaskError = error;
+    caughtError = error;
     if (error?.code === "UNATTENDED_ELASTIC_ITEM_RELEASED") {
       throw error;
     }
     showMessage("批量采集失败: " + error.message, "error");
-    return {
+    failureOutcome = {
       started: true,
       ok: false,
       error: error.message,
     };
+    return failureOutcome;
   } finally {
     const ownsBatchInvocation = () =>
       activeBatchKeywordInvocationToken === batchInvocationToken;
@@ -14722,7 +14759,7 @@ async function handleBatchKeywordCapture(options = {}) {
       ownsBatchInvocation() && isCurrentUnattendedInvocation();
     if (
       ownsCurrentBatchInvocation() &&
-      streamingSyncQueue?.enabled &&
+      streamingSyncQueue &&
       !streamingSyncDrained
     ) {
       streamingSyncResult = await drainStreamingDetailSyncQueue(
@@ -14732,6 +14769,19 @@ async function handleBatchKeywordCapture(options = {}) {
         console.warn("[Sidebar] Drain streaming sync after batch failed:", error);
         return streamingSyncQueue.getStats();
       });
+      streamingSyncDrained = true;
+    }
+    // The terminal drain happens in finally so every exceptional exit uses the
+    // same queue. Preserve that result on the already-returned object/error;
+    // otherwise the outer unattended runner cannot prove the source attempt is
+    // locally closed and a safe relay waits forever.
+    if (streamingSyncResult) {
+      if (failureOutcome) {
+        failureOutcome.streamingSync = streamingSyncResult;
+      }
+      if (caughtError && typeof caughtError === "object") {
+        caughtError.streamingSync = streamingSyncResult;
+      }
     }
     const shouldEndCaptureTaskSession =
       ownsCurrentBatchInvocation() &&
@@ -17535,19 +17585,19 @@ async function waitForRuntimeSearchPage({
       }
       return true;
     }
-    // 抖音页面在慢加载时，全局 runtime 可能晚于已绑定标签页更新。
+    // 平台页面在慢加载时，全局 runtime 可能晚于已绑定标签页更新。
     // 直接核验任务绑定的 tab，只接受“正确搜索词 + 搜索页骨架已出现”；
     // 结果卡片由后续的长等待检查负责，这里不因结果还在加载而刷新页面。
     if (
-      platform === "douyin" &&
+      (platform === "douyin" || platform === "xiaohongshu") &&
       Number.isFinite(expectedTabId) &&
       expectedTabId > 0
     ) {
       const boundTabReady = await chrome.scripting
         .executeScript({
           target: {tabId: expectedTabId},
-          args: [normalizedExpectedKeyword],
-          func: (expectedKeywordValue) => {
+          args: [normalizedExpectedKeyword, platform],
+          func: (expectedKeywordValue, expectedPlatform) => {
             const normalize = (value) =>
               String(value || "")
                 .trim()
@@ -17564,6 +17614,44 @@ async function waitForRuntimeSearchPage({
             const url = new URL(window.location.href);
             const hostname = String(url.hostname || "").toLowerCase();
             const pathname = String(url.pathname || "");
+            if (expectedPlatform === "xiaohongshu") {
+              const queryKeyword = decode(
+                url.searchParams.get("keyword") ||
+                  url.searchParams.get("q") ||
+                  "",
+              );
+              const inputKeyword =
+                Array.from(
+                  document.querySelectorAll(
+                    'input[type="search"], input[placeholder*="搜索"], input.search-input',
+                  ),
+                )
+                  .map((node) => node.value || node.textContent || "")
+                  .map((value) => String(value || "").trim())
+                  .find(Boolean) || "";
+              const keywordMatched =
+                Boolean(expected) &&
+                (normalize(queryKeyword) === expected ||
+                  normalize(inputKeyword).includes(expected));
+              const bodyText = String(document.body?.innerText || "");
+              const hasSearchShell = Boolean(
+                document.querySelector(
+                  '.feeds-container, section.note-item, .note-item, [class*="feeds"]',
+                ) ||
+                  (/全部/u.test(bodyText) &&
+                    /图文/u.test(bodyText) &&
+                    /视频/u.test(bodyText)),
+              );
+              return Boolean(
+                (hostname === "xiaohongshu.com" ||
+                  hostname.endsWith(".xiaohongshu.com")) &&
+                  (pathname === "/search_result" ||
+                    pathname === "/web/search_result") &&
+                  document.readyState !== "loading" &&
+                  keywordMatched &&
+                  hasSearchShell,
+              );
+            }
             const urlKeyword = decode(
               pathname.split("/search/")[1]?.split("/")[0] || "",
             );
@@ -18227,9 +18315,10 @@ async function runUnattendedKeywordPlanRequest(request) {
       requestAttemptId ===
         String(activeUnattendedRunAttemptId || "").trim());
   const plan = request?.planSnapshot || {};
-  // Only the cloud elastic single-relay contract collapses local recovery to
-  // one complete browser run. Legacy local schedules retain their proven
-  // bounded recovery, while manual Extension searches never enter this path.
+  // The single-relay contract limits complete business runs, not technical
+  // page/session recovery inside one run. Under shared-machine or weak-network
+  // load those bounded recoveries remain necessary and do not duplicate the
+  // keyword capture.
   const singleRelayMode =
     request?.cloudAssigned === true &&
     request?.orchestrationContext?.distributionMode === "elastic_pool" &&
@@ -18238,12 +18327,9 @@ async function runUnattendedKeywordPlanRequest(request) {
   const localKeywordMaxAttempts = singleRelayMode
     ? 1
     : UNATTENDED_KEYWORD_MAX_ATTEMPTS;
-  const localBootstrapMaxAttempts = singleRelayMode
-    ? 1
-    : UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS;
-  const localCaptureSessionMaxAttempts = singleRelayMode
-    ? 1
-    : UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS;
+  const localBootstrapMaxAttempts = UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS;
+  const localCaptureSessionMaxAttempts =
+    UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS;
   const keywords = dedupeKeywords(
     Array.isArray(plan.keywords) ? plan.keywords : [],
   ).slice(0, MAX_BATCH_KEYWORDS);
@@ -18267,6 +18353,7 @@ async function runUnattendedKeywordPlanRequest(request) {
   let unattendedCaptureTaskError = null;
   let reportKeywordProgress = null;
   let batchRunResult = null;
+  let capturePipelineStarted = false;
   let unattendedCaptureTaskTerminalProgress = null;
   let unattendedSourceTabId = null;
 
@@ -18877,6 +18964,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         keywords,
         taskTotal: plannedTaskTotal,
       });
+    capturePipelineStarted = true;
     batchRunResult = await handleBatchKeywordCapture({
       onProgress: reportKeywordProgress,
       onKeywordSettled: reportKeywordCheckpoint,
@@ -19158,12 +19246,40 @@ async function runUnattendedKeywordPlanRequest(request) {
             ? "completed_with_failures"
             : "failed";
       const failureSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
+      const bootstrapAttemptCount = Math.max(1, Number(error?.attempts) || 1);
+      const bootstrapRecoveryCount = Math.max(0, bootstrapAttemptCount - 1);
+      const bootstrapFailureCopy = bootstrapRecoveryCount > 0
+        ? `搜索页首次打开并经过 ${bootstrapRecoveryCount} 次恢复仍未就绪`
+        : "搜索页首次打开仍未就绪";
+      const noCaptureBootstrapSync =
+        bootstrapFailed &&
+        capturePipelineStarted === false &&
+        Math.max(0, Number(failureSummary?.saved) || 0) === 0
+          ? {
+              enabled: false,
+              enqueuedCount: 0,
+              processedCount: 0,
+              successCount: 0,
+              failedCount: 0,
+              skippedCount: 0,
+              pendingCount: 0,
+              activeCount: 0,
+              remainingCount: 0,
+              blocked: false,
+              canceled: false,
+              drainCompleted: true,
+            }
+          : null;
+      const terminalStreamingSync =
+        error?.streamingSync ??
+        batchRunResult?.streamingSync ??
+        noCaptureBootstrapSync;
       const terminalMessage = elasticItemReleased
         ? `关键词「${String(error?.keyword || resumeKeyword || "").trim()}」已解除当前 Agent 锁定并交回云端；其它空闲 Agent 可立即接力，当前 Agent 进入冷却${cooldownHomeResult?.ok ? "并已返回平台首页" : ""}`
         : cloudTechnicalRecovery
-        ? `搜索页经过 ${Number(error?.attempts) || UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS} 次分散恢复仍未就绪，当前关键词已交回云端等待其它 Agent 接力${cooldownHomeResult?.ok ? "；当前 Agent 已返回平台首页并进入冷却" : ""}`
+        ? `${bootstrapFailureCopy}，当前关键词已交回云端等待其它 Agent 接力${cooldownHomeResult?.ok ? "；当前 Agent 已返回平台首页并进入冷却" : ""}`
         : bootstrapFailed
-          ? `搜索页经过 ${Number(error?.attempts) || UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS} 次分散恢复仍未就绪，请检查设备网络后继续`
+          ? `${bootstrapFailureCopy}，请检查设备网络后继续`
         : cancellation?.message || error.message;
       showMessage(
         terminalStatus === "canceled"
@@ -19188,7 +19304,7 @@ async function runUnattendedKeywordPlanRequest(request) {
             finishedAt,
             message: terminalMessage,
             summary: failureSummary,
-            streamingSync: batchRunResult?.streamingSync,
+            streamingSync: terminalStreamingSync,
           }),
           error:
             terminalStatus === "canceled"
