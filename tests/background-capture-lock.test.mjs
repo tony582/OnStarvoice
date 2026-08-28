@@ -922,7 +922,7 @@ test("manual orchestration recovery does not replace its source until the exact 
   );
 });
 
-test("manual orchestration recovery replaces and launches only after exact source closure is confirmed", async () => {
+test("manual orchestration recovery waits for atomic adoption receipt and later closes with its exact item attempt", async () => {
   const harness = createHarness();
   const request = seedTerminalUnattendedClosureCandidate(harness, {
     cloudAssigned: true,
@@ -943,25 +943,201 @@ test("manual orchestration recovery replaces and launches only after exact sourc
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {id: "agent-safe", token: "secret-safe"},
   };
+  harness.setCloudHeartbeatHandler(async ({body}, heartbeatNumber) => {
+    if (heartbeatNumber <= 2) return {ok: true, commands: []};
+    const successor = body.tasks.find(
+      (task) => task?.metadata?.parentRequestId === request.id,
+    );
+    assert.ok(successor, JSON.stringify(body));
+    return {
+      ok: true,
+      commands: [],
+      localRecoveryAdoptions: [{
+        requestId: successor.id,
+        attemptId: successor.attemptId,
+        agentId: "agent-safe",
+        parentRequestId: request.id,
+        parentTaskId: "parent-task",
+        orchestrationRevision: 8,
+        itemIds: ["item-1"],
+        itemAttempts: [{
+          itemId: "item-1",
+          attemptId: "item-attempt-2",
+          attemptNumber: 4,
+          assignmentRevision: 8,
+        }],
+        requiresLocalClosureReuseFenceV1: true,
+      }],
+    };
+  });
 
   const result = await harness.api.manuallyRecoverUnattendedKeywordRun({
     requestId: request.id,
     mode: "remaining",
   });
 
-  assert.equal(result.accepted, true, JSON.stringify(result));
+  assert.equal(result.accepted, false, JSON.stringify(result));
+  assert.equal(result.deferred, true);
+  assert.equal(harness.createdTabs.length, 0);
+  const replay = await harness.api.syncCloudTaskAgent({
+    reason: "replay_lost_adoption_receipt",
+    force: true,
+  });
+  assert.equal(replay.ok, true, JSON.stringify(replay));
   const successor = harness.storage[UNATTENDED_REQUEST_KEY];
   assert.notEqual(successor.id, request.id);
   assert.equal(successor.status, "pending");
-  assert.equal(harness.cloudHeartbeats.length, 1);
+  assert.equal(harness.cloudHeartbeats.length, 3);
   assert.equal(harness.createdTabs.length, 2);
-  assert.equal(
-    Object.hasOwn(successor.orchestrationContext, "itemAttempts"),
-    false,
+  assert.equal(successor.orchestrationContext.itemAttempts[0].attemptId, "item-attempt-2");
+  assert.equal(successor.orchestrationContext.itemAttempts[0].attemptNumber, 4);
+  assert.equal(successor.orchestrationContext.itemAttempts[0].assignmentRevision, 8);
+  assert.equal(successor.orchestrationContext.requiresLocalClosureReuseFenceV1, true);
+
+  const finishedAt = new Date().toISOString();
+  const terminalSuccessor = {
+    ...successor,
+    status: "needs_action",
+    progressSeq: successor.progressSeq + 1,
+    runnerTabId: null,
+    recoveryPendingLaunch: false,
+    updatedAt: finishedAt,
+    finishedAt,
+    counts: {total: 1, processed: 1, saved: 0},
+    progress: {
+      current: 1,
+      total: 1,
+      progressScope: "terminal",
+      phase: "unattended_needs_action",
+      unattendedRequestId: successor.id,
+      unattendedAttemptId: successor.attemptId,
+      streamingSyncEvidenceKnown: true,
+      streamingSyncDrainCompleted: true,
+      streamingSyncEnabled: true,
+      streamingSyncEnqueuedCount: 0,
+      streamingSyncProcessedCount: 0,
+      streamingSyncSuccessCount: 0,
+      streamingSyncFailedCount: 0,
+      streamingSyncSkippedCount: 0,
+      streamingSyncPendingCount: 0,
+      streamingSyncActiveCount: 0,
+      streamingSyncRemainingCount: 0,
+      streamingSyncCapturedUniqueCount: 0,
+      streamingSyncEnqueuedUniqueCount: 0,
+      streamingSyncExcludedUniqueCount: 0,
+      streamingSyncSucceededUniqueCount: 0,
+      streamingSyncBlocked: false,
+      streamingSyncCanceled: false,
+      capturedRecordCount: 0,
+      finishedAt,
+      updatedAt: finishedAt,
+    },
+  };
+  harness.storage[UNATTENDED_REQUEST_KEY] = terminalSuccessor;
+  const successorRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === successor.id,
   );
+  Object.assign(successorRun, {
+    status: terminalSuccessor.status,
+    progressSeq: terminalSuccessor.progressSeq,
+    counts: terminalSuccessor.counts,
+    progress: terminalSuccessor.progress,
+    updatedAt: finishedAt,
+    finishedAt,
+    metadata: {
+      ...(successorRun.metadata || {}),
+      orchestrationContext: terminalSuccessor.orchestrationContext,
+    },
+  });
+  harness.setTabQueryHandler(async () => []);
+  const closure = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: successor.id,
+    expectedAttemptId: successor.attemptId,
+  });
+  assert.equal(closure.persisted, true, JSON.stringify(closure));
+  const closed = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(closed.localClosureEvidence.itemAttemptId, "item-attempt-2");
+  assert.equal(closed.localClosureEvidence.attemptNumber, 4);
+  assert.equal(closed.localClosureEvidence.assignmentRevision, 8);
+});
+
+test("manual orchestration recovery stays dormant when another agent wins adoption", async () => {
+  const harness = createHarness();
+  const recoveryCommandId = "cloud-command-adoption-conflict";
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    cloudAssigned: true,
+    cloudAgentScopeId: "agent-safe",
+    planSnapshot: buildUnattendedPlan({keywords: ["关键词一"]}),
+    checkpoint: {
+      activeKeyword: "关键词一",
+      currentKeyword: "关键词一",
+      failedKeywords: ["关键词一"],
+      keywordResults: [{
+        round: 1,
+        index: 0,
+        keyword: "关键词一",
+        status: "failed",
+      }],
+    },
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-safe", token: "secret-safe"},
+  };
+  harness.setCloudHeartbeatHandler(async () => ({
+    ok: true,
+    commands: [],
+    localRecoveryAdoptions: [],
+  }));
+
+  const result = await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: request.id,
+    mode: "remaining",
+    cloudCommandId: recoveryCommandId,
+  });
+
+  assert.equal(result.accepted, false, JSON.stringify(result));
+  assert.equal(result.deferred, true);
+  assert.equal(result.reason, "recovery_adoption_not_confirmed");
+  const successor = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.notEqual(successor.id, request.id);
+  assert.equal(successor.status, "failed");
+  assert.equal(successor.recoveryPendingLaunch, false);
+  assert.equal(successor.error.code, "RECOVERY_ADOPTION_NOT_CONFIRMED");
+  assert.equal(harness.createdTabs.length, 0);
+
+  const supervised = await harness.api.superviseUnattendedKeywordRun({
+    reason: "test_other_agent_won",
+  });
+  assert.equal(supervised.reason, "no_active_request");
+  assert.equal(harness.createdTabs.length, 0);
+
+  const now = new Date().toISOString();
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    schemaVersion: 2,
+    id: "newer-terminal-task",
+    attemptId: "newer-terminal-attempt",
+    attemptNumber: 1,
+    status: "completed",
+    createdAt: now,
+    updatedAt: now,
+    finishedAt: now,
+    planSnapshot: buildUnattendedPlan({keywords: ["新任务"]}),
+  };
+  const replay = await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: recoveryCommandId,
+      command_type: "resume",
+      client_task_id: request.id,
+      payload: {controlTaskId: request.id, mode: "remaining"},
+    },
+    "agent-token",
+  );
+  assert.equal(replay.ok, true, JSON.stringify(replay));
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  assert.equal(harness.cloudCommandCompletions[0].success, false);
   assert.equal(
-    Object.hasOwn(successor.orchestrationContext, "attemptIdentity"),
-    false,
+    harness.cloudCommandCompletions[0].result.reason,
+    "recovery_adoption_rejected",
   );
 });
 

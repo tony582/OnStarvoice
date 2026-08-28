@@ -3166,7 +3166,13 @@ async function lockOrchestrationParent(tx, tenantId, parentTaskId) {
   `, [parentTaskId, tenantId]);
 }
 
-async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
+async function adoptLocalOrchestrationRecovery(
+  tx,
+  agent,
+  task,
+  snapshot,
+  {supportsLocalClosureReuseFenceV1 = false} = {},
+) {
   if (
     !task ||
     task.parent_task_id ||
@@ -3326,7 +3332,7 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
       attemptNumber: Math.max(1, Number(snapshot.attemptNumber) || 1),
     }))
     .digest('hex');
-  const adoptedTask = await tx.queryOne(`
+  let adoptedTask = await tx.queryOne(`
     UPDATE capture_tasks
     SET parent_task_id = $1,
       title = $2,
@@ -3378,6 +3384,7 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
     `, [parent.id, agent.tenant_id, detachedLineageTaskIds]);
   }
 
+  const itemAttempts = [];
   for (const item of eligibleItems) {
     const updatedItem = await tx.queryOne(`
       UPDATE capture_task_items
@@ -3419,6 +3426,7 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
       error.code = 'orchestration_local_recovery_item_conflict';
       throw error;
     }
+    const itemAttemptId = crypto.randomUUID();
     await tx.execute(`
       INSERT INTO capture_task_item_attempts (
         id, tenant_id, item_id, parent_task_id, execution_task_id,
@@ -3430,7 +3438,7 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
         $9, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
       )
     `, [
-      crypto.randomUUID(),
+      itemAttemptId,
       agent.tenant_id,
       item.id,
       parent.id,
@@ -3440,7 +3448,40 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
       nextRevision,
       requestHash,
     ]);
+    itemAttempts.push({
+      itemId: String(item.id),
+      attemptId: itemAttemptId,
+      attemptNumber: Number(updatedItem.attempt_count),
+      assignmentRevision: nextRevision,
+    });
   }
+  const localRecoveryClientAttemptId = text(snapshot.attemptId, 100);
+  adoptedTask = await tx.queryOne(`
+    UPDATE capture_tasks
+    SET metadata = metadata || jsonb_strip_nulls(jsonb_build_object(
+        'itemAttempts', $1::jsonb,
+        'attemptIdentity', CASE
+          WHEN jsonb_array_length($1::jsonb) = 1
+            THEN $1::jsonb->0->>'attemptId'
+          ELSE NULL
+        END,
+        'localRecoveryClientAttemptId', NULLIF($2, ''),
+        'requiresLocalClosureReuseFenceV1', CASE
+          WHEN $3::boolean THEN to_jsonb(true)
+          ELSE NULL
+        END
+      )),
+      updated_at = now(),
+      source_updated_at = now()
+    WHERE id = $4 AND tenant_id = $5
+    RETURNING *
+  `, [
+    JSON.stringify(itemAttempts),
+    localRecoveryClientAttemptId,
+    supportsLocalClosureReuseFenceV1,
+    adoptedTask.id,
+    agent.tenant_id,
+  ]);
   await tx.execute(`
     UPDATE capture_tasks
     SET status = 'superseded',
@@ -3495,6 +3536,60 @@ async function adoptLocalOrchestrationRecovery(tx, agent, task, snapshot) {
     },
   });
   return adoptedTask;
+}
+
+function buildLocalRecoveryAdoptionReceipt(task, snapshot, agentId = '') {
+  const metadata = safeJson(task?.metadata);
+  const snapshotMetadata = safeJson(snapshot?.metadata);
+  const requestId = text(task?.client_task_id, 240);
+  const attemptId = text(metadata.localRecoveryClientAttemptId, 100);
+  const parentRequestId = text(snapshotMetadata.parentRequestId, 240);
+  const parentTaskId = text(metadata.parentTaskId, 100);
+  const orchestrationRevision = Number(metadata.orchestrationRevision);
+  const itemAttempts = (Array.isArray(metadata.itemAttempts)
+    ? metadata.itemAttempts
+    : [])
+    .map(entry => ({
+      itemId: text(entry?.itemId, 100),
+      attemptId: text(entry?.attemptId, 100),
+      attemptNumber: Number(entry?.attemptNumber),
+      assignmentRevision: Number(entry?.assignmentRevision),
+    }));
+  const valid = Boolean(
+    metadata.localRecovery === true &&
+    requestId &&
+    requestId === text(snapshot?.clientTaskId, 240) &&
+    attemptId &&
+    attemptId === text(snapshot?.attemptId, 100) &&
+    parentRequestId &&
+    UUID_PATTERN.test(parentTaskId) &&
+    Number.isSafeInteger(orchestrationRevision) &&
+    orchestrationRevision > 0 &&
+    itemAttempts.length > 0 &&
+    itemAttempts.every(entry =>
+      UUID_PATTERN.test(entry.itemId) &&
+      UUID_PATTERN.test(entry.attemptId) &&
+      Number.isSafeInteger(entry.attemptNumber) &&
+      entry.attemptNumber > 0 &&
+      Number.isSafeInteger(entry.assignmentRevision) &&
+      entry.assignmentRevision === orchestrationRevision
+    ) &&
+    new Set(itemAttempts.map(entry => entry.itemId)).size === itemAttempts.length &&
+    new Set(itemAttempts.map(entry => entry.attemptId)).size === itemAttempts.length
+  );
+  if (!valid) return null;
+  return {
+    requestId,
+    attemptId,
+    agentId: text(agentId, 100),
+    parentRequestId,
+    parentTaskId,
+    orchestrationRevision,
+    itemIds: itemAttempts.map(entry => entry.itemId),
+    itemAttempts,
+    requiresLocalClosureReuseFenceV1:
+      metadata.requiresLocalClosureReuseFenceV1 === true,
+  };
 }
 
 async function refreshOrchestrationParentTask(tx, {
@@ -5204,11 +5299,19 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
   });
 }
 
-export async function mirrorTaskSnapshot(tx, agent, snapshot) {
+export async function mirrorTaskSnapshot(
+  tx,
+  agent,
+  snapshot,
+  {supportsLocalClosureReuseFenceV1 = false} = {},
+) {
   snapshot = bindCloudTaskSnapshotHealthToAttempt(snapshot);
   const agentSnapshotMetadata = {...safeJson(snapshot.metadata)};
   delete agentSnapshotMetadata.requiresLocalClosureReuseFenceV1;
   delete agentSnapshotMetadata.stoppedBeforeDispatch;
+  delete agentSnapshotMetadata.itemAttempts;
+  delete agentSnapshotMetadata.attemptIdentity;
+  delete agentSnapshotMetadata.localRecoveryClientAttemptId;
   const previous = await tx.queryOne(`
     SELECT task.id, task.status, task.attempt_number,
       occupied_attempt.client_attempt_id AS occupied_attempt_id
@@ -5379,7 +5482,11 @@ export async function mirrorTaskSnapshot(tx, agent, snapshot) {
             'itemIds', capture_tasks.metadata->'itemIds',
             'localRecovery', capture_tasks.metadata->'localRecovery',
             'localRecoverySourceExecutionTaskId', capture_tasks.metadata->'localRecoverySourceExecutionTaskId',
-            'localRecoveryAdoptedAt', capture_tasks.metadata->'localRecoveryAdoptedAt'
+            'localRecoveryAdoptedAt', capture_tasks.metadata->'localRecoveryAdoptedAt',
+            'itemAttempts', capture_tasks.metadata->'itemAttempts',
+            'attemptIdentity', capture_tasks.metadata->'attemptIdentity',
+            'localRecoveryClientAttemptId', capture_tasks.metadata->'localRecoveryClientAttemptId',
+            'requiresLocalClosureReuseFenceV1', capture_tasks.metadata->'requiresLocalClosureReuseFenceV1'
           ))
           ELSE '{}'::jsonb
         END
@@ -5527,7 +5634,9 @@ export async function mirrorTaskSnapshot(tx, agent, snapshot) {
   }
 
   if (snapshotAccepted) {
-    task = await adoptLocalOrchestrationRecovery(tx, agent, task, snapshot);
+    task = await adoptLocalOrchestrationRecovery(tx, agent, task, snapshot, {
+      supportsLocalClosureReuseFenceV1,
+    });
   }
 
   let attempt = null;
@@ -6681,9 +6790,20 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
           : {observedAccountCount: 0, acceptedUsageEventIds: []};
 
       const mirroredTasks = [];
+      const localRecoveryAdoptions = [];
       if (!taskStateIncomplete) {
         for (const snapshot of snapshots) {
-          mirroredTasks.push(await mirrorTaskSnapshot(tx, agent, snapshot));
+          const mirroredTask = await mirrorTaskSnapshot(tx, agent, snapshot, {
+            supportsLocalClosureReuseFenceV1:
+              heartbeatCapabilities.localClosureReuseFenceV1 === true,
+          });
+          mirroredTasks.push(mirroredTask);
+          const adoptionReceipt = buildLocalRecoveryAdoptionReceipt(
+            mirroredTask,
+            snapshot,
+            agent.id,
+          );
+          if (adoptionReceipt) localRecoveryAdoptions.push(adoptionReceipt);
         }
       }
 
@@ -6795,6 +6915,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
 
       return {
         mirroredTasks,
+        localRecoveryAdoptions,
         commands,
         socialAccountResult,
         elasticClaim,
@@ -6832,6 +6953,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
       acceptedSocialUsageEventIds:
         result.socialAccountResult.acceptedUsageEventIds,
       elasticWorkItemClaimed: Boolean(result.elasticClaim),
+      localRecoveryAdoptions: result.localRecoveryAdoptions,
       commands: result.commands,
     });
   } catch (err) {

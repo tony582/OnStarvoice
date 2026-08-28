@@ -64,7 +64,7 @@ test('a device-side retry is adopted by the original orchestration parent', asyn
   );
   assert.match(
     route,
-    /task = await adoptLocalOrchestrationRecovery\(tx, agent, task, snapshot\)/u,
+    /task = await adoptLocalOrchestrationRecovery\(tx, agent, task, snapshot, \{\s*supportsLocalClosureReuseFenceV1,\s*\}\)/u,
   );
   assert.match(agent, /remoteOrchestrationRecoveryMergeV1: true/u);
 });

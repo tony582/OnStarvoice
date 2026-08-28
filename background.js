@@ -938,6 +938,8 @@ function normalizeOrchestrationExecutionContext(value) {
   const attemptIdentity = String(
     source.attemptIdentity || source.attempt_identity || '',
   ).trim().slice(0, 100);
+  const requiresLocalClosureReuseFenceV1 =
+    source.requiresLocalClosureReuseFenceV1 === true;
   const bootstrapStartAt = Date.parse(
     String(
       source.bootstrapStartNotBefore ||
@@ -971,6 +973,9 @@ function normalizeOrchestrationExecutionContext(value) {
     ...(itemAttempts.length > 0 ? {itemAttempts} : {}),
     ...(distributionMode ? {distributionMode} : {}),
     ...(attemptIdentity ? {attemptIdentity} : {}),
+    ...(requiresLocalClosureReuseFenceV1
+      ? {requiresLocalClosureReuseFenceV1: true}
+      : {}),
     ...(bootstrapStartNotBefore ? {bootstrapStartNotBefore} : {}),
     ...(bootstrapDelayMs ? {bootstrapDelayMs} : {}),
     ...(bootstrapStartNotBefore
@@ -3939,15 +3944,45 @@ async function executeCloudTaskAgentCommand(command, token) {
             (run) => run?.metadata?.cloudCommandId === commandId,
           ) || null;
     if (reconciledRun) {
+      const exactCurrentRequest = Boolean(
+        currentRequest?.id === reconciledRun.id &&
+        currentRequest?.attemptId === reconciledRun.attemptId
+      );
+      const manualOrchestrationRecovery = Boolean(
+        exactCurrentRequest &&
+        currentRequest?.recoveryReason === 'manual_recovery' &&
+        normalizeOrchestrationExecutionContext(
+          currentRequest?.orchestrationContext,
+        )
+      );
+      if (
+        manualOrchestrationRecovery &&
+        !unattendedManualRecoveryHasAdoptionReceipt(currentRequest) &&
+        currentRequest?.error?.code !== 'RECOVERY_ADOPTION_NOT_CONFIRMED'
+      ) {
+        return {
+          ok: true,
+          deferred: true,
+          reason: 'recovery_adoption_pending',
+          commandId,
+        };
+      }
+      const adoptionRejected = Boolean(
+        reconciledRun?.error?.code === 'RECOVERY_ADOPTION_NOT_CONFIRMED' ||
+        (exactCurrentRequest &&
+          currentRequest?.error?.code === 'RECOVERY_ADOPTION_NOT_CONFIRMED')
+      );
       commandResult = await rememberCloudCommandResult(commandId, {
         state: 'completed',
-        accepted: true,
-        reason: 'reconciled',
+        accepted: !adoptionRejected,
+        reason: adoptionRejected ? 'recovery_adoption_rejected' : 'reconciled',
         requestId: String(reconciledRun.id || ''),
         parentRequestId: String(
           reconciledRun.parentRequestId || reconciledRun.metadata?.parentRequestId || requestId,
         ),
-        message: '已对账到设备创建的恢复任务',
+        message: adoptionRejected
+          ? '恢复工作项已由其它 Agent 接管，本设备没有启动重复采集'
+          : '已对账到设备创建的恢复任务',
       });
     } else {
       const recoverableRequest =
@@ -3986,6 +4021,14 @@ async function executeCloudTaskAgentCommand(command, token) {
           cloudCommandId: commandId,
           allowedKeywords: payload.allowedKeywords,
         });
+        if (recovery?.deferred === true) {
+          return {
+            ok: true,
+            deferred: true,
+            reason: String(recovery.reason || 'recovery_adoption_pending'),
+            commandId,
+          };
+        }
         commandResult = await rememberCloudCommandResult(
           commandId,
           summarizeCloudRecoveryResult(recovery),
@@ -4230,6 +4273,17 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       payload,
       stored[STORAGE_KEYS.unattendedKeywordRunRequest],
     );
+    await applyUnattendedLocalRecoveryAdoptionReceipts(
+      response.localRecoveryAdoptions,
+      payload,
+      Array.isArray(response.localRecoveryAdoptions),
+    ).catch((error) => {
+      console.warn(
+        '[CloudTaskAgent] local recovery adoption receipt failed:',
+        error,
+      );
+      cloudTaskAgentSyncPending = true;
+    });
     if (reportedLastError) {
       await clearReportedCloudTaskAgentError(reportedLastError);
       cloudTaskAgentSyncPending = true;
@@ -5449,6 +5503,183 @@ function rememberConfirmedUnattendedLocalClosures(
     const oldest = cloudTaskAgentConfirmedLocalClosureKeys.values().next().value;
     cloudTaskAgentConfirmedLocalClosureKeys.delete(oldest);
   }
+}
+
+function normalizeUnattendedLocalRecoveryAdoptionReceipt(receipt, request) {
+  if (
+    !receipt ||
+    typeof receipt !== 'object' ||
+    Array.isArray(receipt) ||
+    !request ||
+    request.status !== 'recovering' ||
+    request.recoveryPendingLaunch !== true ||
+    request.recoveryReason !== 'manual_recovery'
+  ) {
+    return null;
+  }
+  const currentContext = normalizeOrchestrationExecutionContext(
+    request.orchestrationContext,
+  );
+  const requestId = String(receipt.requestId || '').trim();
+  const attemptId = String(receipt.attemptId || '').trim();
+  const agentId = String(receipt.agentId || '').trim();
+  const parentRequestId = String(receipt.parentRequestId || '').trim();
+  const parentTaskId = String(receipt.parentTaskId || '').trim();
+  const revision = Number(receipt.orchestrationRevision);
+  if (
+    !currentContext ||
+    requestId !== request.id ||
+    attemptId !== request.attemptId ||
+    !agentId ||
+    agentId !== String(request.cloudAgentScopeId || '').trim() ||
+    parentRequestId !== String(request.parentRequestId || '').trim() ||
+    parentTaskId !== currentContext.parentTaskId ||
+    !Number.isSafeInteger(revision) ||
+    revision <= 0 ||
+    receipt.requiresLocalClosureReuseFenceV1 !== true
+  ) {
+    return null;
+  }
+  const adoptedContext = normalizeOrchestrationExecutionContext({
+    ...currentContext,
+    revision,
+    itemIds: receipt.itemIds,
+    itemAttempts: receipt.itemAttempts,
+    attemptIdentity:
+      Array.isArray(receipt.itemAttempts) && receipt.itemAttempts.length === 1
+        ? receipt.itemAttempts[0]?.attemptId
+        : '',
+    requiresLocalClosureReuseFenceV1: true,
+  });
+  const identities = resolveUnattendedClosureItemIdentities({
+    orchestrationContext: adoptedContext,
+  });
+  const expectedItemIds = Array.from(
+    new Set(
+      (Array.isArray(receipt.itemIds) ? receipt.itemIds : [])
+        .map(itemId => String(itemId || '').trim())
+        .filter(Boolean),
+    ),
+  ).sort();
+  const adoptedItemIds = identities
+    .map(identity => identity.itemId)
+    .sort();
+  if (
+    identities.length === 0 ||
+    identities.length !== (Array.isArray(receipt.itemAttempts)
+      ? receipt.itemAttempts.length
+      : 0) ||
+    expectedItemIds.length !== identities.length ||
+    expectedItemIds.some((itemId, index) => itemId !== adoptedItemIds[index])
+  ) {
+    return null;
+  }
+  return adoptedContext;
+}
+
+async function applyUnattendedLocalRecoveryAdoptionReceipts(
+  receipts = [],
+  payload = {},
+  receiptProtocolKnown = false,
+) {
+  const candidates = Array.isArray(receipts) ? receipts : [];
+  const adoptedRequest = await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (!current) return null;
+    const receipt = candidates.find(candidate =>
+      String(candidate?.requestId || '').trim() === current.id &&
+      String(candidate?.attemptId || '').trim() === current.attemptId
+    );
+    const orchestrationContext =
+      normalizeUnattendedLocalRecoveryAdoptionReceipt(receipt, current);
+    if (!orchestrationContext) {
+      const exactAttemptWasReported = Boolean(
+        receiptProtocolKnown &&
+        current.status === 'recovering' &&
+        current.recoveryPendingLaunch === true &&
+        current.recoveryReason === 'manual_recovery' &&
+        normalizeOrchestrationExecutionContext(
+          current.orchestrationContext,
+        ) &&
+        (Array.isArray(payload?.tasks) ? payload.tasks : []).some(task =>
+          String(task?.id || task?.clientTaskId || '').trim() === current.id &&
+          String(task?.attemptId || '').trim() === current.attemptId
+        )
+      );
+      if (!exactAttemptWasReported) return null;
+      const now = new Date().toISOString();
+      const rejectedRequest = {
+        ...current,
+        status: 'failed',
+        recoveryPendingLaunch: false,
+        recoveryWaitUntil: '',
+        finishedAt: now,
+        updatedAt: now,
+        message: '恢复工作项未被云端锁定，已停止本机启动；任务可能已由其它 Agent 接管',
+        error: {
+          code: 'RECOVERY_ADOPTION_NOT_CONFIRMED',
+          message: '云端未返回当前恢复尝试的精确工作项凭证',
+          retryable: false,
+          requiresManualAction: false,
+        },
+      };
+      await persistUnattendedRunMutation(rejectedRequest, {
+        previousRequest: current,
+        event: {
+          type: 'recovery_adoption_rejected',
+          message: rejectedRequest.message,
+          at: now,
+        },
+      });
+      return {rejected: true, request: rejectedRequest};
+    }
+    const now = new Date().toISOString();
+    const nextRequest = {
+      ...current,
+      orchestrationContext,
+      recoveryAdoptedAt: now,
+      updatedAt: now,
+      heartbeatAt: now,
+      message: '云端已锁定恢复工作项，正在启动采集页',
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event: {
+        type: 'manual_recovery_adopted',
+        message: nextRequest.message,
+        at: now,
+      },
+    });
+    return {rejected: false, request: nextRequest};
+  });
+  if (!adoptedRequest) {
+    return {adopted: false, launched: false, reason: 'receipt_rejected'};
+  }
+  if (adoptedRequest.rejected) {
+    return {
+      adopted: false,
+      launched: false,
+      terminal: true,
+      reason: 'receipt_rejected',
+      request: adoptedRequest.request,
+    };
+  }
+  const request = adoptedRequest.request;
+  if (request.parentRequestId) {
+    await resolveSupersededNeedsActionTask(
+      request.parentRequestId,
+      request.id,
+      '云端已锁定新的恢复任务',
+    );
+  }
+  const launchResult = await launchPendingUnattendedRecovery(request);
+  return {
+    adopted: true,
+    launched: launchResult.recovered === true,
+    deferred: launchResult.deferred === true,
+    reason: launchResult.reason || (launchResult.recovered ? 'recovered' : 'deferred'),
+    request: launchResult.request || request,
+  };
 }
 
 function inspectUnattendedBusinessUploadEvidence(request = {}) {
@@ -7862,7 +8093,35 @@ async function markUnattendedRecoveryStopUnconfirmed(request, message) {
   });
 }
 
+function unattendedManualRecoveryHasAdoptionReceipt(request) {
+  if (
+    request?.recoveryReason !== 'manual_recovery' ||
+    !normalizeOrchestrationExecutionContext(request?.orchestrationContext)
+  ) {
+    return true;
+  }
+  const context = normalizeOrchestrationExecutionContext(
+    request.orchestrationContext,
+  );
+  return Boolean(
+    String(request.recoveryAdoptedAt || '').trim() &&
+    context?.requiresLocalClosureReuseFenceV1 === true &&
+    resolveUnattendedClosureItemIdentities({
+      orchestrationContext: context,
+    }).length > 0
+  );
+}
+
 async function launchPendingUnattendedRecovery(request) {
+  if (!unattendedManualRecoveryHasAdoptionReceipt(request)) {
+    scheduleCloudTaskAgentSync('manual_recovery_adoption_pending', 0);
+    return {
+      recovered: false,
+      deferred: true,
+      reason: 'recovery_adoption_pending',
+      request,
+    };
+  }
   const storedLock = await readStoredCaptureExecutionLock();
   const activeLock =
     storedLock && String(storedLock.owner || '') !== 'unattended_keyword_plan'
@@ -8812,10 +9071,42 @@ async function manuallyRecoverUnattendedKeywordRun({
       reason: 'created',
       request: nextRequest,
       previousRequest: current,
+      requiresServerAdoption: Boolean(pendingAdoptionContext),
     };
   });
   if (!created.accepted) {
     return created;
+  }
+  if (created.requiresServerAdoption) {
+    const adoptionSync = await syncCloudTaskAgent({
+      reason: 'manual_recovery_adoption',
+      force: true,
+    });
+    const current = await readUnattendedKeywordRunRequest();
+    const launched = Boolean(
+      current &&
+      current.id === created.request.id &&
+      current.attemptId === created.request.attemptId &&
+      current.recoveryPendingLaunch !== true &&
+      ['pending', 'claimed', 'running'].includes(String(current.status || ''))
+    );
+    if (!launched) {
+      if (!adoptionSync?.ok) cloudTaskAgentSyncPending = true;
+      return {
+        accepted: false,
+        deferred: true,
+        reason: adoptionSync?.ok
+          ? 'recovery_adoption_not_confirmed'
+          : 'recovery_adoption_sync_pending',
+        request: current || created.request,
+      };
+    }
+    return {
+      accepted: true,
+      deferred: false,
+      reason: 'recovered',
+      request: current,
+    };
   }
   if (created.previousRequest?.status === 'needs_action') {
     await resolveSupersededNeedsActionTask(
@@ -8925,6 +9216,15 @@ async function superviseUnattendedKeywordRun({
     }
 
     if (request.status === 'recovering' && request.recoveryPendingLaunch) {
+      if (!unattendedManualRecoveryHasAdoptionReceipt(request)) {
+        scheduleCloudTaskAgentSync('manual_recovery_adoption_pending', 0);
+        return {
+          healthy: true,
+          deferred: true,
+          reason: 'recovery_adoption_pending',
+          request,
+        };
+      }
       const waitUntil = parseTimestampMs(request.recoveryWaitUntil);
       if (Number.isFinite(waitUntil) && waitUntil > nowMs) {
         return {healthy: true, reason: 'recovery_wait', request};
