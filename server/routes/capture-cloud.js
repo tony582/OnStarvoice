@@ -260,7 +260,7 @@ async function reserveCaptureResourceAdmission(tx, {
           AND binding.agent_id = $4
           AND binding.platform = $6
           AND binding.status = 'current'
-        ORDER BY binding.started_at DESC NULLS LAST, binding.id DESC
+        ORDER BY binding.first_seen_at DESC, binding.id DESC
         LIMIT 1
       ), 0)::integer AS daily_search_limit
     FROM occupied

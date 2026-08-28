@@ -3835,6 +3835,11 @@ test("resource admission serializes plan and shared-host capacity before dispatc
   assert.match(admission, /capture_agent_commands active_command/u);
   assert.match(admission, /active_command\.status IN \('pending', 'acknowledged'\)/u);
   assert.match(admission, /social_agent_daily_usage daily_usage/u);
+  assert.match(
+    admission,
+    /ORDER BY binding\.first_seen_at DESC, binding\.id DESC/u,
+  );
+  assert.doesNotMatch(admission, /binding\.started_at/u);
   assert.match(admission, /projectCaptureResourceAdmission\(/u);
   assert.match(admission, /todaySearches: counts\?\.today_searches/u);
   assert.match(admission, /expectedSearches/u);
