@@ -13443,7 +13443,7 @@ function routeDetailItemToStreamingSync(
     phase === "detail_item_filtered" ||
     phase === "detail_item_skipped"
   ) {
-    streamingSyncQueue.markSeen(recordId);
+    streamingSyncQueue.markExcluded(recordId);
     return;
   }
   // Failed detail items must wait until the whole enhancement result is known.
@@ -14186,6 +14186,7 @@ async function handleBatchKeywordCapture(options = {}) {
               recordIds,
               runnerTabId,
             }) => {
+              streamingSyncQueue?.registerCaptured?.(recordIds);
               if (!isCurrentUnattendedInvocation()) {
                 return {
                   ok: false,
@@ -18091,6 +18092,10 @@ function buildUnattendedTerminalProgress({
       syncInteger(sync.pendingCount) !== null &&
       syncInteger(sync.activeCount) !== null &&
       syncInteger(sync.remainingCount) !== null &&
+      syncInteger(sync.capturedUniqueCount) !== null &&
+      syncInteger(sync.enqueuedUniqueCount) !== null &&
+      syncInteger(sync.excludedUniqueCount) !== null &&
+      syncInteger(sync.succeededUniqueCount) !== null &&
       typeof sync.blocked === "boolean" &&
       typeof sync.canceled === "boolean"
   );
@@ -18183,6 +18188,14 @@ function buildUnattendedTerminalProgress({
       streamingSyncEvidenceKnown ? syncInteger(sync.activeCount) : null,
     streamingSyncRemainingCount:
       streamingSyncEvidenceKnown ? syncInteger(sync.remainingCount) : null,
+    streamingSyncCapturedUniqueCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.capturedUniqueCount) : null,
+    streamingSyncEnqueuedUniqueCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.enqueuedUniqueCount) : null,
+    streamingSyncExcludedUniqueCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.excludedUniqueCount) : null,
+    streamingSyncSucceededUniqueCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.succeededUniqueCount) : null,
     streamingSyncBlocked:
       streamingSyncEvidenceKnown ? sync.blocked === true : null,
     streamingSyncCanceled:

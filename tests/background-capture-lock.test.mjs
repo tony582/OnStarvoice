@@ -700,6 +700,10 @@ function seedTerminalUnattendedClosureCandidate(harness, overrides = {}) {
     streamingSyncPendingCount: 0,
     streamingSyncActiveCount: 0,
     streamingSyncRemainingCount: 0,
+    streamingSyncCapturedUniqueCount: 0,
+    streamingSyncEnqueuedUniqueCount: 0,
+    streamingSyncExcludedUniqueCount: 0,
+    streamingSyncSucceededUniqueCount: 0,
     streamingSyncBlocked: false,
     streamingSyncCanceled: false,
     capturedRecordCount: 0,
@@ -806,6 +810,65 @@ test("local closure closes only its exact runner and persists authoritative uplo
   assert.equal(
     harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence.closedAt,
     evidence.closedAt,
+  );
+});
+
+test("local closure uses unique sync coverage when saved rows include duplicates or exclusions", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    counts: {total: 1, processed: 1, saved: 4},
+    progress: {
+      streamingSyncEnqueuedCount: 2,
+      streamingSyncProcessedCount: 2,
+      streamingSyncSuccessCount: 2,
+      streamingSyncCapturedUniqueCount: 3,
+      streamingSyncEnqueuedUniqueCount: 2,
+      streamingSyncExcludedUniqueCount: 1,
+      streamingSyncSucceededUniqueCount: 2,
+      capturedRecordCount: 4,
+    },
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, true);
+  const evidence =
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure;
+  assert.equal(evidence.streamingSyncCapturedUniqueCount, 3);
+  assert.equal(evidence.streamingSyncExcludedUniqueCount, 1);
+});
+
+test("an abnormal early return leaves incomplete unique coverage and cannot close", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    counts: {total: 1, processed: 1, saved: 3},
+    progress: {
+      streamingSyncEnqueuedCount: 1,
+      streamingSyncProcessedCount: 1,
+      streamingSyncSuccessCount: 1,
+      streamingSyncCapturedUniqueCount: 3,
+      streamingSyncEnqueuedUniqueCount: 1,
+      streamingSyncExcludedUniqueCount: 1,
+      streamingSyncSucceededUniqueCount: 1,
+      capturedRecordCount: 3,
+    },
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "business_uploads_not_cleared");
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure,
+    undefined,
   );
 });
 

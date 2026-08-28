@@ -325,6 +325,18 @@
       streamingSyncRemainingCount: optionalNonNegativeInteger(
         'streamingSyncRemainingCount',
       ),
+      streamingSyncCapturedUniqueCount: optionalNonNegativeInteger(
+        'streamingSyncCapturedUniqueCount',
+      ),
+      streamingSyncEnqueuedUniqueCount: optionalNonNegativeInteger(
+        'streamingSyncEnqueuedUniqueCount',
+      ),
+      streamingSyncExcludedUniqueCount: optionalNonNegativeInteger(
+        'streamingSyncExcludedUniqueCount',
+      ),
+      streamingSyncSucceededUniqueCount: optionalNonNegativeInteger(
+        'streamingSyncSucceededUniqueCount',
+      ),
       streamingSyncBlocked: optionalBoolean('streamingSyncBlocked'),
       streamingSyncCanceled: optionalBoolean('streamingSyncCanceled'),
       capturedRecordCount: optionalNonNegativeInteger(

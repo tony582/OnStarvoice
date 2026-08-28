@@ -22,6 +22,10 @@ export function createRecordSyncQueue({
   const pendingJobs = [];
   const pendingIds = new Set();
   const seenIds = new Set();
+  const capturedIds = new Set();
+  const enqueuedIds = new Set();
+  const excludedIds = new Set();
+  const succeededIds = new Set();
   const dirtyIds = new Set();
   const latestMetaById = new Map();
   let activeJob = null;
@@ -57,6 +61,10 @@ export function createRecordSyncQueue({
     error: blockedError,
     canceled,
     cancelReason,
+    capturedUniqueCount: capturedIds.size,
+    enqueuedUniqueCount: enqueuedIds.size,
+    excludedUniqueCount: excludedIds.size,
+    succeededUniqueCount: succeededIds.size,
   });
 
   const stopRequested = () => {
@@ -113,14 +121,34 @@ export function createRecordSyncQueue({
     }
   };
 
-  const markSeen = (recordId) => {
+  const registerCaptured = (recordIds) => {
+    const ids = Array.isArray(recordIds) ? recordIds : [recordIds];
+    let addedCount = 0;
+    ids.forEach((recordId) => {
+      const normalizedId = normalizeRecordId(recordId);
+      if (!normalizedId || capturedIds.has(normalizedId)) return;
+      capturedIds.add(normalizedId);
+      addedCount += 1;
+    });
+    return addedCount;
+  };
+
+  const markExcluded = (recordId) => {
     const normalizedId = normalizeRecordId(recordId);
     if (!normalizedId) {
       return false;
     }
     seenIds.add(normalizedId);
+    if (enqueuedIds.has(normalizedId)) {
+      return false;
+    }
+    excludedIds.add(normalizedId);
     return true;
   };
+
+  // Kept as a compatibility alias for callers that only need deduplication.
+  // New capture paths should use markExcluded so closure coverage is explicit.
+  const markSeen = markExcluded;
 
   const enqueue = (recordId, meta = {}) => {
     if (!queueEnabled || syncCancellationState()) {
@@ -132,6 +160,8 @@ export function createRecordSyncQueue({
     }
 
     seenIds.add(normalizedId);
+    excludedIds.delete(normalizedId);
+    enqueuedIds.add(normalizedId);
     latestMetaById.set(normalizedId, meta || {});
     if (activeJob?.recordId === normalizedId) {
       dirtyIds.add(normalizedId);
@@ -275,6 +305,7 @@ export function createRecordSyncQueue({
       stats.failedCount += 1;
     } else {
       stats.successCount += 1;
+      succeededIds.add(job.recordId);
     }
 
     emitState("settled", {
@@ -340,6 +371,8 @@ export function createRecordSyncQueue({
     enabled: queueEnabled,
     enqueue,
     enqueueMissing,
+    registerCaptured,
+    markExcluded,
     markSeen,
     hasSeen(recordId) {
       return seenIds.has(normalizeRecordId(recordId));

@@ -152,6 +152,18 @@ export function normalizeCaptureLocalClosureEvidence(value = {}) {
     streamingSyncRemainingCount: integer(
       source.streamingSyncRemainingCount,
     ),
+    streamingSyncCapturedUniqueCount: integer(
+      source.streamingSyncCapturedUniqueCount,
+    ),
+    streamingSyncEnqueuedUniqueCount: integer(
+      source.streamingSyncEnqueuedUniqueCount,
+    ),
+    streamingSyncExcludedUniqueCount: integer(
+      source.streamingSyncExcludedUniqueCount,
+    ),
+    streamingSyncSucceededUniqueCount: integer(
+      source.streamingSyncSucceededUniqueCount,
+    ),
     streamingSyncBlocked:
       typeof source.streamingSyncBlocked === 'boolean'
         ? source.streamingSyncBlocked
@@ -163,13 +175,21 @@ export function normalizeCaptureLocalClosureEvidence(value = {}) {
     capturedRecordCount: integer(source.capturedRecordCount),
   };
   const uploadCountsMatch = normalized.streamingSyncEnabled === true
-    ? normalized.streamingSyncEnqueuedCount === normalized.capturedRecordCount &&
+    ? normalized.streamingSyncCapturedUniqueCount ===
+        normalized.streamingSyncEnqueuedUniqueCount +
+          normalized.streamingSyncExcludedUniqueCount &&
+      normalized.streamingSyncEnqueuedUniqueCount ===
+        normalized.streamingSyncSucceededUniqueCount &&
       normalized.streamingSyncProcessedCount ===
         normalized.streamingSyncEnqueuedCount &&
       normalized.streamingSyncSuccessCount ===
         normalized.streamingSyncEnqueuedCount
     : normalized.streamingSyncEnabled === false &&
       normalized.capturedRecordCount === 0 &&
+      normalized.streamingSyncCapturedUniqueCount === 0 &&
+      normalized.streamingSyncEnqueuedUniqueCount === 0 &&
+      normalized.streamingSyncExcludedUniqueCount === 0 &&
+      normalized.streamingSyncSucceededUniqueCount === 0 &&
       normalized.streamingSyncEnqueuedCount === 0 &&
       normalized.streamingSyncProcessedCount === 0 &&
       normalized.streamingSyncSuccessCount === 0;

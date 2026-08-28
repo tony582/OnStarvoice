@@ -44,6 +44,10 @@ function evidence(overrides = {}) {
     streamingSyncPendingCount: 0,
     streamingSyncActiveCount: 0,
     streamingSyncRemainingCount: 0,
+    streamingSyncCapturedUniqueCount: 3,
+    streamingSyncEnqueuedUniqueCount: 2,
+    streamingSyncExcludedUniqueCount: 1,
+    streamingSyncSucceededUniqueCount: 2,
     streamingSyncBlocked: false,
     streamingSyncCanceled: false,
     capturedRecordCount: 2,
@@ -76,6 +80,7 @@ test('authoritative terminal closure evidence is accepted exactly once scoped', 
   assert.deepEqual(result.failedChecks, []);
   assert.equal(result.evidence.streamingSyncRemainingCount, 0);
   assert.equal(result.evidence.capturedRecordCount, 2);
+  assert.equal(result.evidence.streamingSyncExcludedUniqueCount, 1);
 });
 
 test('missing or default-looking upload stats never normalize as closure proof', () => {
@@ -89,6 +94,8 @@ test('missing or default-looking upload stats never normalize as closure proof',
     evidence({streamingSyncCanceled: true}),
     evidence({streamingSyncEnqueuedCount: 1}),
     evidence({streamingSyncProcessedCount: 1}),
+    evidence({streamingSyncCapturedUniqueCount: 4}),
+    evidence({streamingSyncSucceededUniqueCount: 1}),
   ]) {
     assert.equal(normalizeCaptureLocalClosureEvidence(incomplete), null);
   }
@@ -117,6 +124,10 @@ test('disabled streaming sync is accepted only when this attempt captured nothin
     streamingSyncEnqueuedCount: 0,
     streamingSyncProcessedCount: 0,
     streamingSyncSuccessCount: 0,
+    streamingSyncCapturedUniqueCount: 0,
+    streamingSyncEnqueuedUniqueCount: 0,
+    streamingSyncExcludedUniqueCount: 0,
+    streamingSyncSucceededUniqueCount: 0,
     capturedRecordCount: 0,
   });
   assert.ok(normalizeCaptureLocalClosureEvidence(empty));
@@ -127,6 +138,22 @@ test('disabled streaming sync is accepted only when this attempt captured nothin
     }),
     null,
   );
+});
+
+test('enabled sync proof is based on unique coverage rather than raw saved rows', () => {
+  const normalized = normalizeCaptureLocalClosureEvidence(evidence({
+    capturedRecordCount: 5,
+    streamingSyncEnqueuedCount: 2,
+    streamingSyncProcessedCount: 2,
+    streamingSyncSuccessCount: 2,
+    streamingSyncCapturedUniqueCount: 3,
+    streamingSyncEnqueuedUniqueCount: 2,
+    streamingSyncExcludedUniqueCount: 1,
+    streamingSyncSucceededUniqueCount: 2,
+  }));
+  assert.ok(normalized);
+  assert.equal(normalized.capturedRecordCount, 5);
+  assert.equal(normalized.streamingSyncCapturedUniqueCount, 3);
 });
 
 test('agent, attempt, assignment, snapshot revision and freshness are all fenced', () => {

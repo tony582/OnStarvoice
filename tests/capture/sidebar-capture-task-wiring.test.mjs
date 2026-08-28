@@ -2185,7 +2185,11 @@ test("streaming sync waits for a safe terminal decision before queuing failed de
   );
   assert.match(
     router,
-    /phase === "detail_item_filtered"[\s\S]*?phase === "detail_item_skipped"[\s\S]*?markSeen/u,
+    /phase === "detail_item_filtered"[\s\S]*?phase === "detail_item_skipped"[\s\S]*?markExcluded/u,
+  );
+  assert.match(
+    batch,
+    /afterKeywordCapture:[\s\S]*?registerCaptured\?\.\(recordIds\)[\s\S]*?if \(!isCurrentUnattendedInvocation\(\)\)/u,
   );
   assert.ok(stopAt >= 0);
   assert.ok(recoverableAt > stopAt);

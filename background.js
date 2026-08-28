@@ -548,6 +548,10 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
     'streamingSyncPendingCount',
     'streamingSyncActiveCount',
     'streamingSyncRemainingCount',
+    'streamingSyncCapturedUniqueCount',
+    'streamingSyncEnqueuedUniqueCount',
+    'streamingSyncExcludedUniqueCount',
+    'streamingSyncSucceededUniqueCount',
     'capturedRecordCount',
     'keywordCompletedCount',
     'keywordPartialCount',
@@ -5321,17 +5325,22 @@ function inspectUnattendedBusinessUploadEvidence(request = {}) {
     streamingSyncRemainingCount: exactCount(
       progress.streamingSyncRemainingCount,
     ),
+    streamingSyncCapturedUniqueCount: exactCount(
+      progress.streamingSyncCapturedUniqueCount,
+    ),
+    streamingSyncEnqueuedUniqueCount: exactCount(
+      progress.streamingSyncEnqueuedUniqueCount,
+    ),
+    streamingSyncExcludedUniqueCount: exactCount(
+      progress.streamingSyncExcludedUniqueCount,
+    ),
+    streamingSyncSucceededUniqueCount: exactCount(
+      progress.streamingSyncSucceededUniqueCount,
+    ),
     capturedRecordCount: exactCount(progress.capturedRecordCount),
   };
   if (Object.values(fields).some((value) => value === null)) {
     return {known: false, reason: 'business_upload_counts_unknown'};
-  }
-  const requestSavedCount = exactCount(request.counts?.saved);
-  if (
-    requestSavedCount === null ||
-    requestSavedCount !== fields.capturedRecordCount
-  ) {
-    return {known: false, reason: 'business_upload_capture_count_mismatch'};
   }
   const enabled = progress.streamingSyncEnabled === true;
   const completelyDrained = Boolean(
@@ -5344,10 +5353,18 @@ function inspectUnattendedBusinessUploadEvidence(request = {}) {
     fields.streamingSyncSkippedCount === 0
   );
   const everyCapturedRecordUploaded = enabled
-    ? fields.streamingSyncEnqueuedCount === fields.capturedRecordCount &&
+    ? fields.streamingSyncCapturedUniqueCount ===
+        fields.streamingSyncEnqueuedUniqueCount +
+          fields.streamingSyncExcludedUniqueCount &&
+      fields.streamingSyncEnqueuedUniqueCount ===
+        fields.streamingSyncSucceededUniqueCount &&
       fields.streamingSyncProcessedCount === fields.streamingSyncEnqueuedCount &&
       fields.streamingSyncSuccessCount === fields.streamingSyncEnqueuedCount
-    : fields.capturedRecordCount === 0 &&
+    : fields.streamingSyncCapturedUniqueCount === 0 &&
+      fields.streamingSyncEnqueuedUniqueCount === 0 &&
+      fields.streamingSyncExcludedUniqueCount === 0 &&
+      fields.streamingSyncSucceededUniqueCount === 0 &&
+      exactCount(request.counts?.saved) === 0 &&
       fields.streamingSyncEnqueuedCount === 0 &&
       fields.streamingSyncProcessedCount === 0 &&
       fields.streamingSyncSuccessCount === 0;
