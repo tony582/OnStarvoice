@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.98',
+  latestVersion: '0.3.99',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-29',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.98-20260829.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.99-20260829.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.99',
+      releaseDate: '2026-08-29',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '已结算批次不再被迟到回报重新拉起',
+              desc: '父任务完成、部分失败、停止或失败后即进入不可逆终态；迟到的页面回报、控制结果与服务重启扫描都只保留审计，不再重开工作项、创建新 attempt 或让浏览器自己再次运行。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.98',
       releaseDate: '2026-08-29',

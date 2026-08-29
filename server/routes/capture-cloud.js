@@ -2391,6 +2391,19 @@ const ORCHESTRATION_ITEM_TERMINAL_STATUSES = new Set([
   'skipped',
   'canceled',
 ]);
+const ORCHESTRATION_PARENT_TERMINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+  'superseded',
+]);
+
+export function orchestrationParentAcceptsProjection(status) {
+  return !ORCHESTRATION_PARENT_TERMINAL_STATUSES.has(text(status, 80));
+}
 const NEGATIVE_PATROL_RESULT_STATUSES = new Set([
   'completed',
   'completed_with_warnings',
@@ -3698,7 +3711,7 @@ async function refreshOrchestrationParentTask(tx, {
   const parent = lockedParent ||
     await lockOrchestrationParent(tx, tenantId, parentTaskId);
   if (!parent) return null;
-  if (['canceled', 'superseded'].includes(parent.status)) return parent;
+  if (!orchestrationParentAcceptsProjection(parent.status)) return parent;
   const parentMetadata = safeJson(parent.metadata);
   const elasticPool = parentMetadata.distributionMode === 'elastic_pool';
 
@@ -4707,6 +4720,7 @@ async function projectOrchestrationChildControlOutcome(tx, {
     childTask.parent_task_id,
   );
   if (!parent) return null;
+  if (!orchestrationParentAcceptsProjection(parent.status)) return parent;
 
   const elasticPool =
     safeJson(parent.metadata).distributionMode === 'elastic_pool';
@@ -4848,7 +4862,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     task.parent_task_id,
   );
   if (!parent) return null;
-  if (['canceled', 'superseded'].includes(parent.status)) return parent;
+  if (!orchestrationParentAcceptsProjection(parent.status)) return parent;
   const elasticPool =
     safeJson(parent.metadata).distributionMode === 'elastic_pool';
   const elasticAgentAttemptLimit = elasticParentAgentAttemptLimit(

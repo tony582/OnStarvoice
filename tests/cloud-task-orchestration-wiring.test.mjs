@@ -25,7 +25,7 @@ test('accepted child snapshots project keyword checkpoints to their exact parent
   assert.match(projection, /refreshOrchestrationParentTask/u);
   assert.match(
     projection,
-    /\['canceled', 'superseded'\]\.includes\(parent\.status\)/u,
+    /!orchestrationParentAcceptsProjection\(parent\.status\)/u,
   );
   assert.match(route, /'orchestrationChild', capture_tasks\.metadata->'orchestrationChild'/u);
   assert.match(route, /'parentTaskId', capture_tasks\.metadata->'parentTaskId'/u);
@@ -110,7 +110,11 @@ test('schedule status follows its latest run before and after terminal settlemen
   const refresh = route.slice(refreshStart, refreshEnd);
   assert.match(
     refresh,
-    /\['canceled', 'superseded'\]\.includes\(parent\.status\)/u,
+    /!orchestrationParentAcceptsProjection\(parent\.status\)/u,
+  );
+  assert.match(
+    route,
+    /const ORCHESTRATION_PARENT_TERMINAL_STATUSES = new Set\(\[[\s\S]*'completed_with_failures'[\s\S]*'superseded'[\s\S]*\]\)/u,
   );
   assert.match(refresh, /last_run_status = \$2/u);
   assert.match(refresh, /scheduled_run_needs_action/u);

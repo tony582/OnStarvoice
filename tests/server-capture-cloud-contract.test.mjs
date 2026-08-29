@@ -54,6 +54,7 @@ import {
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
   orchestrationCheckpointTimestamp,
+  orchestrationParentAcceptsProjection,
   projectElasticKeywordRecoveryStatus,
   projectCanceledChildItemStatus,
   reconcileAutomaticCaptureRetries,
@@ -1796,6 +1797,56 @@ test("operator cancellation is absorbing against late child heartbeats", () => {
   assert.match(
     captureCloudRouteSource,
     /capture_task_item_attempts\.status <> 'canceled' OR \$1 = 'canceled'/u,
+  );
+});
+
+test("every settled orchestration parent is absorbing against late projections", () => {
+  for (const status of [
+    "completed",
+    "completed_with_warnings",
+    "completed_with_failures",
+    "failed",
+    "canceled",
+    "skipped",
+    "superseded",
+  ]) {
+    assert.equal(
+      orchestrationParentAcceptsProjection(status),
+      false,
+      `${status} must not be reopened by a late child snapshot`,
+    );
+  }
+  for (const status of ["pending", "running", "needs_action"]) {
+    assert.equal(orchestrationParentAcceptsProjection(status), true);
+  }
+
+  const refresh = readRouteSection(
+    "async function refreshOrchestrationParentTask",
+    "async function projectNegativePatrolSnapshot",
+  );
+  const controlProjection = readRouteSection(
+    "async function projectOrchestrationChildControlOutcome",
+    "async function projectOrchestrationSnapshot",
+  );
+  const snapshotProjection = readRouteSection(
+    "async function projectOrchestrationSnapshot",
+    "export async function mirrorTaskSnapshot",
+  );
+  for (const section of [refresh, controlProjection, snapshotProjection]) {
+    assert.match(
+      section,
+      /if \(!orchestrationParentAcceptsProjection\(parent\.status\)\) return parent;/u,
+    );
+  }
+
+  const leaseRecovery = readRouteSection(
+    "export async function reconcileElasticCaptureLeases",
+    "export async function reconcileAutomaticCaptureRetries",
+  );
+  assert.match(
+    leaseRecovery,
+    /parent\.status NOT IN \([\s\S]*'completed_with_failures'[\s\S]*'superseded'[\s\S]*\)/u,
+    "restart lease reconciliation must exclude every settled parent",
   );
 });
 

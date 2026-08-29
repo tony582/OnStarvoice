@@ -14,7 +14,7 @@ import {runOpsControlGuardedActions} from './ops-control-actions.js';
 import {normalizeCaptureRecoverySettings} from './capture-recovery-intents.js';
 
 export const OPS_CONTROL_POLICY_VERSION = 'ops-guarded-v1';
-export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.98';
+export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.99';
 export const OPS_CONTROL_MODE = 'observe';
 export const OPS_CONTROL_MODES = Object.freeze(['observe', 'guarded']);
 export const OPS_CONTROL_ACTION_TYPES = Object.freeze([
