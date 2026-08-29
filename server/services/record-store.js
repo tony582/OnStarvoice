@@ -35,6 +35,159 @@ function normalizeUrl(url) {
   }
 }
 
+const DOUYIN_CONTENT_ID_PATTERN = /^\d{8,}$/u;
+const DOUYIN_IMAGE_NOTE_TYPES = new Set([
+  'image', 'images', 'image_text', 'image-text', 'image_note', 'image-note',
+  'picture', 'photo', 'note', '图文', '图片',
+]);
+const DOUYIN_VIDEO_NOTE_TYPES = new Set(['video', '视频']);
+
+function recordPayloadObject(payload) {
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'string') return {};
+  try {
+    const parsed = JSON.parse(payload);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeDouyinContentId(value) {
+  const normalized = String(value || '').trim();
+  return DOUYIN_CONTENT_ID_PATTERN.test(normalized) ? normalized : '';
+}
+
+function parseDouyinDirectContentUrl(value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(String(value).trim());
+    if (!/(^|\.)douyin\.com$/iu.test(parsed.hostname)) return null;
+    const matched = parsed.pathname.match(/^\/(video|note)\/(\d{8,})(?:\/|$)/iu);
+    if (!matched) return null;
+    return {
+      kind: matched[1].toLowerCase(),
+      id: matched[2],
+      url: `https://www.douyin.com/${matched[1].toLowerCase()}/${matched[2]}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function douyinPayloadCandidates(payload) {
+  const parsed = recordPayloadObject(payload);
+  const firstItem = Array.isArray(parsed.items)
+    ? parsed.items.find(item => item && typeof item === 'object' && !Array.isArray(item)) || {}
+    : {};
+  const detailPayload = recordPayloadObject(parsed.detailPayload);
+  const itemDetailPayload = recordPayloadObject(firstItem.detailPayload);
+  return {parsed, firstItem, detailPayload, itemDetailPayload};
+}
+
+function douyinDirectUrlCandidates(record = {}) {
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = douyinPayloadCandidates(record.payload);
+  return [
+    record.canonical_url,
+    record.url,
+    parsed.detailCaptureNoteUrl,
+    parsed.noteUrl,
+    parsed.url,
+    detailPayload.noteUrl,
+    detailPayload.url,
+    firstItem.detailCaptureNoteUrl,
+    firstItem.noteUrl,
+    firstItem.url,
+    itemDetailPayload.noteUrl,
+    itemDetailPayload.url,
+  ].map(parseDouyinDirectContentUrl).filter(Boolean);
+}
+
+function douyinRecordContentId(record = {}, directCandidates = []) {
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = douyinPayloadCandidates(record.payload);
+  const values = [
+    record.external_id,
+    record.note_id,
+    record.noteId,
+    parsed.noteId,
+    parsed.awemeId,
+    detailPayload.noteId,
+    detailPayload.awemeId,
+    firstItem.noteId,
+    firstItem.awemeId,
+    itemDetailPayload.noteId,
+    itemDetailPayload.awemeId,
+    ...directCandidates.map(candidate => candidate.id),
+  ];
+  for (const value of values) {
+    const normalized = normalizeDouyinContentId(value);
+    if (normalized) return normalized;
+  }
+  for (const value of [record.url, record.canonical_url]) {
+    try {
+      const modalId = new URL(String(value || '')).searchParams.get('modal_id');
+      const normalized = normalizeDouyinContentId(modalId);
+      if (normalized) return normalized;
+    } catch {
+      // Not a URL; leave it untouched rather than guessing an identity.
+    }
+  }
+  return '';
+}
+
+function douyinRecordContentKind(record = {}) {
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = douyinPayloadCandidates(record.payload);
+  const values = [
+    record.note_type,
+    record.noteType,
+    parsed.noteType,
+    parsed.note_type,
+    detailPayload.noteType,
+    detailPayload.note_type,
+    firstItem.noteType,
+    firstItem.note_type,
+    itemDetailPayload.noteType,
+    itemDetailPayload.note_type,
+  ];
+  for (const value of values) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (DOUYIN_IMAGE_NOTE_TYPES.has(normalized)) return 'note';
+    if (DOUYIN_VIDEO_NOTE_TYPES.has(normalized)) return 'video';
+  }
+  return '';
+}
+
+/**
+ * Douyin search-modal URLs are browser navigation state, not durable work URLs.
+ * Resolve a direct /video/:id or /note/:id URL without mutating the capture
+ * payload, which remains the audit trail for navigation and detail recovery.
+ */
+export function resolveDouyinCanonicalRecordUrl(record = {}) {
+  const platform = String(record.platform || '').trim().toLowerCase();
+  const hasDouyinUrl = [record.url, record.canonical_url]
+    .some(value => /(^|\.)douyin\.com(?:\/|$)/iu.test(String(value || '').replace(/^https?:\/\//iu, '')));
+  if (platform !== 'douyin' && !hasDouyinUrl) return '';
+
+  const directCandidates = douyinDirectUrlCandidates(record);
+  const contentId = douyinRecordContentId(record, directCandidates);
+  const matchingDirect = directCandidates.find(candidate => !contentId || candidate.id === contentId);
+  if (matchingDirect) return matchingDirect.url;
+  if (!contentId) return '';
+
+  const kind = douyinRecordContentKind(record);
+  return kind ? `https://www.douyin.com/${kind}/${contentId}` : '';
+}
+
+export function normalizeCapturedRecordLinks(record = {}) {
+  const canonicalUrl = resolveDouyinCanonicalRecordUrl(record);
+  if (!canonicalUrl) return record;
+  return {
+    ...record,
+    url: canonicalUrl,
+    canonical_url: canonicalUrl,
+  };
+}
+
 function jsonText(value, fallback) {
   if (value == null || value === '') return fallback;
   if (typeof value === 'string') {
@@ -661,6 +814,7 @@ export function mergeObservationMetrics(record = {}, existing = {}) {
 }
 
 export async function upsertCapturedRecord(record, context) {
+  record = normalizeCapturedRecordLinks(record);
   const tenantId = context.tenantId;
   const authCode = context.authCode || '';
   const monitorExecutionId = context.monitorExecutionId || null;
@@ -674,7 +828,7 @@ export async function upsertCapturedRecord(record, context) {
     0,
     Number(context.commentWorkflowExpectedCount) || 0,
   );
-  const canonicalUrl = normalizeUrl(record.url);
+  const canonicalUrl = normalizeUrl(record.canonical_url || record.url);
   const contentHash = buildContentHash(record, canonicalUrl);
   const tags = jsonText(record.tags, '[]');
   const imageUrls = jsonText(record.image_urls, '[]');

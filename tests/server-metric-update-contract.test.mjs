@@ -6,6 +6,8 @@ import {
   guardRecordCommentCount,
   guardRecordTextCompleteness,
   mergeObservationMetrics,
+  normalizeCapturedRecordLinks,
+  resolveDouyinCanonicalRecordUrl,
   resolveGuardedCommentsCount,
   resolveCapturedTextUpdate,
   resolveRecordRelabelReason,
@@ -29,6 +31,67 @@ const COLLECT_KEYS = [
   'collectsCount',
   'collects_count',
 ];
+
+test('Douyin search navigation URLs are not persisted as original work URLs', () => {
+  const imageRecord = {
+    platform: 'douyin',
+    external_id: '7679243972795505774',
+    note_type: 'image',
+    url: 'https://www.douyin.com/search/%E5%AE%89%E5%90%89%E6%98%9F?type=general&modal_id=7679243972795505774',
+    payload: {
+      detailCaptureStatus: 'failed',
+      detailCaptureNoteUrl: 'https://www.douyin.com/note/7679243972795505774?previous_page=search_result',
+    },
+  };
+  const videoRecord = {
+    platform: 'douyin',
+    external_id: '7679329980892269553',
+    note_type: 'video',
+    url: 'https://www.douyin.com/search/%E5%AE%89%E5%90%89%E6%98%9F?modal_id=7679329980892269553',
+    payload: JSON.stringify({detailCaptureStatus: 'failed'}),
+  };
+
+  assert.equal(
+    resolveDouyinCanonicalRecordUrl(imageRecord),
+    'https://www.douyin.com/note/7679243972795505774',
+  );
+  assert.deepEqual(normalizeCapturedRecordLinks(videoRecord), {
+    ...videoRecord,
+    url: 'https://www.douyin.com/video/7679329980892269553',
+    canonical_url: 'https://www.douyin.com/video/7679329980892269553',
+  });
+  assert.equal(
+    JSON.parse(normalizeCapturedRecordLinks(videoRecord).payload).detailCaptureStatus,
+    'failed',
+  );
+});
+
+test('Douyin canonical link normalization is conservative without a proven work type', () => {
+  const searchOnly = {
+    platform: 'douyin',
+    external_id: '7679243972795505774',
+    url: 'https://www.douyin.com/search/test?modal_id=7679243972795505774',
+  };
+  const direct = {
+    platform: 'douyin',
+    external_id: '7679243972795505774',
+    url: 'https://www.douyin.com/note/7679243972795505774?foo=bar#comments',
+  };
+  const xiaohongshu = {
+    platform: 'xiaohongshu',
+    external_id: '7679243972795505774',
+    note_type: 'image',
+    url: 'https://www.xiaohongshu.com/search_result?keyword=test',
+  };
+
+  assert.equal(resolveDouyinCanonicalRecordUrl(searchOnly), '');
+  assert.strictEqual(normalizeCapturedRecordLinks(searchOnly), searchOnly);
+  assert.equal(
+    resolveDouyinCanonicalRecordUrl(direct),
+    'https://www.douyin.com/note/7679243972795505774',
+  );
+  assert.strictEqual(normalizeCapturedRecordLinks(xiaohongshu), xiaohongshu);
+});
 
 test('legacy likes-only list payload does not turn comments or collects into zero', () => {
   const payload = {

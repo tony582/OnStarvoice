@@ -27,6 +27,7 @@ import {
   RecordLabelChips, RecordLabelEditor, RecordLabelsHeading,
 } from '@/components/shared/RecordLabels'
 import { tagsFromRecord, type CustomTag, type CustomTagPatch } from '@/lib/custom-tags'
+import { isRecordDetailDegraded, recordDisplayTitle, resolveRecordOriginalUrl } from '@/lib/record-display'
 
 /**
  * 内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
@@ -116,6 +117,9 @@ function RecordDrawerContent({
   const [savingNote, setSavingNote] = useState(false)
   const [noteError, setNoteError] = useState('')
   const [actionError, setActionError] = useState('')
+  const displayTitle = recordDisplayTitle(r)
+  const originalUrl = resolveRecordOriginalUrl(r)
+  const detailDegraded = isRecordDetailDegraded(r)
   const panelRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(() => {
     const saved = Number(localStorage.getItem('osv_detail_width'))
@@ -434,6 +438,7 @@ function RecordDrawerContent({
                   {r.content_availability_status === 'page_unavailable' && (
                     <StatusBadge tone="muted"><Ban className="h-3 w-3" />已删除或不可访问</StatusBadge>
                   )}
+                  {detailDegraded && <StatusBadge tone="muted">详情待补采</StatusBadge>}
                   {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
                   {canWrite && onSetWatched ? (
                     <button type="button" onClick={() => void setWatched()} disabled={watchBusy}
@@ -462,7 +467,7 @@ function RecordDrawerContent({
                     </button>
                   )}
                 </div>
-                <h3 className="text-[17px] font-bold leading-snug text-foreground">{r.title || String(r.content || '').replace(/\s+/g, ' ').trim().slice(0, 40) || '(无标题)'}</h3>
+                <h3 className="text-[17px] font-bold leading-snug text-foreground">{displayTitle}</h3>
 
                 {/* Author + links */}
                 <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1.5">
@@ -473,7 +478,7 @@ function RecordDrawerContent({
                     <span className="text-[13px] font-semibold">{r.author_name || '未知作者'}</span>
                     <span className="text-[11px] text-muted-foreground">粉丝 {Number(r.author_fans) > 0 ? formatNumber(r.author_fans) : '-'}</span>
                   </div>
-                  {r.url && <a href={r.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
+                  {originalUrl && <a href={originalUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
                   {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><User className="h-3.5 w-3.5" />主页</a>}
                   {r.publish_display && <span className="text-[12px] text-muted-foreground">发布于 {r.publish_display}</span>}
                 </div>

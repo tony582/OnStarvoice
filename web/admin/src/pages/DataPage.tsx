@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/input'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
 import { useNav } from '@/lib/navigation'
+import { recordDisplayTitle, resolveRecordOriginalUrl } from '@/lib/record-display'
 
 type TableKey =
   | 'single_notes'
@@ -786,7 +787,7 @@ function groupMobileColumns(columns: Column[]) {
 function mobileRecordTitle(row: any, table: TableKey) {
   if (table === 'blogger_profiles') return String(firstValue(row.author_name, row.title, bloggerIdentifier(row), '未命名博主'))
   if (table === 'comment_leads') return String(firstValue(row.comment_content, row.record_title, '未命名评论'))
-  return String(firstValue(row.title, row.record_title, row.content, row.author_name, '未命名记录'))
+  return recordDisplayTitle(row, String(firstValue(row.record_title, row.author_name, '未命名记录')))
 }
 
 function mobileRecordSubtitle(row: any, table: TableKey) {
@@ -822,7 +823,7 @@ function mobileRecordStats(row: any, table: TableKey) {
 function mobileOriginalUrl(row: any, table: TableKey) {
   if (table === 'blogger_profiles') return String(firstValue(authorHomepage(row), row.url))
   if (table === 'comment_leads') return String(firstValue(row.record_url, row.url))
-  return String(firstValue(row.url, row.record_url))
+  return resolveRecordOriginalUrl(row) || String(row.record_url || '')
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -896,14 +897,14 @@ function keywordNoteColumns(platform: string): Column[] {
       col('keyword', '关键词', r => textCell(r.keyword || value(r, 'payload.keyword'))),
       col('author', '博主', r => textCell(r.author_name)),
       col('profile', '博主主页', r => linkCell(authorHomepage(r), '查看博主主页')),
-      col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+      col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
       col('likes', '点赞数', r => metricCell(r.likes)),
       col('collects', '收藏数', r => metricCell(r.collects)),
       col('comments', '评论数', r => metricCell(r.comments_count)),
       col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
       col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
-      col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+      col('url', '笔记链接', r => linkCell(resolveRecordOriginalUrl(r), '打开笔记')),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
       col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
       col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
