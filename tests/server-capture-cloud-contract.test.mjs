@@ -345,7 +345,7 @@ test("duty cross-device retry fails closed before opening a transaction", async 
   });
 });
 
-test('search-challenge handoff is counted independently but remains fail-closed', () => {
+test('search-challenge handoff is counted independently without blocking the elastic queue', () => {
   const projection = readRouteSection(
     'export function projectElasticKeywordRecoveryStatus({',
     'export function isExplicitUserCancellationSnapshot',
@@ -365,8 +365,16 @@ test('search-challenge handoff is counted independently but remains fail-closed'
     'async function dispatchNextElasticWorkItem',
     "router.post('/agent/liveness'",
   );
-  assert.match(elasticClaim, /CAPTURE_SAFETY_HANDOFF_SEARCH_CODES/u);
+  assert.doesNotMatch(elasticClaim, /CAPTURE_SAFETY_HANDOFF_SEARCH_CODES/u);
   assert.match(elasticClaim, /item\.status = 'retryable'/u);
+  assert.match(
+    elasticClaim,
+    /CASE WHEN item\.status = 'pending' THEN 0 ELSE 1 END/u,
+  );
+  assert.match(
+    elasticClaim,
+    /sourceClosureGraceElapsed[\s\S]*ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS/u,
+  );
 
   const dutyDispatch = readRouteSection(
     'export async function dispatchCrossDeviceRetry',
@@ -555,7 +563,7 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     error: safety,
     attemptCount: 1,
     safetyHandoffCount: 0,
-  }), 'needs_action');
+  }), 'retryable');
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
@@ -598,6 +606,12 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     updated_at: "2026-08-12T01:55:00.000Z",
   }, now), 0);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    execution_finished_at: "2026-08-12T01:55:00.000Z",
+    updated_at: "2026-08-12T01:59:59.000Z",
+  }, now), 0, "heartbeats must not restart a finished recovery cooldown");
 });
 
 test("elastic queue does not spend business retries on local capacity or dispatch failures", () => {
@@ -862,7 +876,7 @@ test("cross-device retry requires exact workflow capabilities and blocks safety 
   }), true);
   assert.equal(crossDeviceRetryItemNeedsManualSafety({
     metadata: {checkpoint: {requiresManualAction: true}},
-  }), true);
+  }), false);
   assert.equal(crossDeviceRetryItemNeedsManualSafety({
     error: {code: "LOGIN_REQUIRED", category: "login_required"},
   }), true);
@@ -1887,7 +1901,7 @@ test("historical closure reuse ignores mutable item start after Agent A to B rea
   );
 });
 
-test("legacy 0.3.96 keyword reuse gets bounded quiescence without weakening marked proof", () => {
+test("keyword reuse gets one bounded quiescence even when closure proof is missing", () => {
   const reuseGate = readRouteSection(
     "async function loadCaptureAgentLocalClosureReuseGate",
     "export async function dispatchCrossDeviceRetry",
@@ -1898,11 +1912,13 @@ test("legacy 0.3.96 keyword reuse gets bounded quiescence without weakening mark
     "marked and legacy histories must be evaluated independently",
   );
   const markedProof = reuseGate.indexOf("if (latestMarkedAttempt)");
-  const legacyGrace = reuseGate.indexOf("legacy_local_cleanup_quiescence");
+  const boundedGrace = reuseGate.indexOf(
+    "bounded_local_cleanup_quiescence_elapsed",
+  );
   assert.ok(markedProof >= 0);
   assert.ok(
-    legacyGrace > markedProof,
-    "a capability downgrade cannot replace the proof required by marked history",
+    boundedGrace > markedProof,
+    "marked history must stop blocking after the stable terminal grace",
   );
   assert.match(
     reuseGate,
@@ -1910,7 +1926,7 @@ test("legacy 0.3.96 keyword reuse gets bounded quiescence without weakening mark
   );
   assert.match(
     reuseGate,
-    /latestLegacyAttempt\.legacy_quiescent !== true/u,
+    /latestLegacyAttempt\.closure_quiescent !== true/u,
   );
   assert.doesNotMatch(reuseGate, /capabilities|freshCapabilities/u);
 });
@@ -2632,12 +2648,12 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   );
   assert.match(
     reuseGate,
-    /terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)[\s\S]*legacy_local_cleanup_quiescence/u,
-    "unmarked 0.3.96 history must pause reuse for a bounded server-first grace",
+    /terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)[\s\S]*local_cleanup_quiescence/u,
+    "all terminal history must pause reuse only for a bounded server-first grace",
   );
   assert.match(
     captureCloudRouteSource,
-    /LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 2 \* 60 \* 1000/u,
+    /LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 \* 1000/u,
   );
   assert.match(claim, /requiresSingleRelay/u);
   assert.match(claim, /waitingForSourceClosure/u);
@@ -2665,7 +2681,10 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
     reuseGate,
     /attempt\.updated_at > now\(\) - interval '30 minutes'/u,
   );
-  assert.match(claim, /!neverOpened && localClosureProof\.proven !== true/u);
+  assert.match(
+    claim,
+    /localClosureProof\.proven !== true &&[\s\S]*!sourceClosureGraceElapsed/u,
+  );
   assert.match(
     claim,
     /canFenceLocalClosureReuse && candidate\.item_type === 'keyword'[\s\S]*requiresLocalClosureReuseFenceV1: true/u,

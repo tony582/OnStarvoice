@@ -129,7 +129,8 @@ const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
 ]);
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
-const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 2 * 60 * 1000;
+const LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
+const ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS = 20 * 1000;
 const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
 const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
 const ELASTIC_AGENT_CAPACITY_HOLD_MS = 30 * 60 * 1000;
@@ -925,8 +926,6 @@ export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
       || value.security_blocked === true
       || value.platformSafetyBlocked === true
       || value.platform_safety_blocked === true
-      || value.requiresManualAction === true
-      || value.requires_manual_action === true
       || safeJson(value.securityEvidence).confirmed === true
       || safeJson(value.security_evidence).confirmed === true
     ));
@@ -970,9 +969,6 @@ export function projectElasticKeywordRecoveryStatus({
       100,
     ).toUpperCase();
     if (!AUTOMATIC_SEARCH_SAFETY_HANDOFF_CODES.has(safetyCode)) {
-      return 'needs_action';
-    }
-    if (sourceLocalClosureProven !== true) {
       return 'needs_action';
     }
     return Math.max(0, Number(safetyHandoffCount) || 0) <
@@ -1190,12 +1186,22 @@ export function elasticRecoveryHoldRemainingMs(
   now = Date.now(),
 ) {
   const source = attempt && typeof attempt === 'object' ? attempt : {};
-  const updatedAt = Date.parse(String(
-    source.updated_at || source.updatedAt || source.finished_at || '',
+  const recoveryAnchorAt = Date.parse(String(
+    source.finished_at ||
+      source.finishedAt ||
+      source.execution_finished_at ||
+      source.executionFinishedAt ||
+      source.recovery_anchor_at ||
+      source.recoveryAnchorAt ||
+      source.created_at ||
+      source.createdAt ||
+      source.updated_at ||
+      source.updatedAt ||
+      '',
   ));
-  if (!Number.isFinite(updatedAt)) return 0;
+  if (!Number.isFinite(recoveryAnchorAt)) return 0;
   const holdMs = elasticAgentRecoveryHoldMs(source);
-  return Math.max(0, updatedAt + holdMs - Number(now || Date.now()));
+  return Math.max(0, recoveryAnchorAt + holdMs - Number(now || Date.now()));
 }
 
 function buildElasticRecoveryMetadata({
@@ -5866,17 +5872,25 @@ async function dispatchNextElasticWorkItem(tx, {
   }
   const recentRecoveryAttempt = await tx.queryOne(`
     SELECT attempt.status, attempt.error, attempt.checkpoint,
-      attempt.finished_at, attempt.updated_at
+      attempt.finished_at, attempt.updated_at,
+      execution.finished_at AS execution_finished_at
     FROM capture_task_item_attempts attempt
     JOIN capture_tasks parent
       ON parent.id = attempt.parent_task_id
       AND parent.tenant_id = attempt.tenant_id
+    LEFT JOIN capture_tasks execution
+      ON execution.id = attempt.execution_task_id
+      AND execution.tenant_id = attempt.tenant_id
     WHERE attempt.tenant_id = $1
       AND attempt.agent_id = $2
       AND attempt.status IN ('retryable', 'needs_action', 'failed')
       AND attempt.updated_at > now() - interval '30 minutes'
       AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
-    ORDER BY attempt.updated_at DESC, attempt.id DESC
+    ORDER BY COALESCE(
+      attempt.finished_at,
+      execution.finished_at,
+      attempt.created_at
+    ) DESC, attempt.id DESC
     LIMIT 1
   `, [agent.tenant_id, agent.id]);
   if (elasticRecoveryHoldRemainingMs(recentRecoveryAttempt) > 0) {
@@ -5948,6 +5962,13 @@ async function dispatchNextElasticWorkItem(tx, {
           AND previous_execution.tenant_id = item.tenant_id
         LIMIT 1
       ) AS source_execution_started_at,
+      (
+        SELECT previous_execution.finished_at
+        FROM capture_tasks previous_execution
+        WHERE previous_execution.id = item.execution_task_id
+          AND previous_execution.tenant_id = item.tenant_id
+        LIMIT 1
+      ) AS source_execution_finished_at,
       item.metadata AS item_metadata,
       COALESCE(
         CASE
@@ -5990,15 +6011,6 @@ async function dispatchNextElasticWorkItem(tx, {
         OR (item.item_type = 'watched_content' AND $8::boolean)
       )
       AND item.status IN ('pending', 'retryable')
-      AND NOT (
-        item.status = 'retryable'
-        AND upper(COALESCE(
-          NULLIF(item.error->>'code', ''),
-          NULLIF(item.metadata->'checkpoint'->>'errorCode', ''),
-          NULLIF(item.metadata->'checkpoint'->>'error_code', ''),
-          ''
-        )) = ANY($10::text[])
-      )
       AND (
         COALESCE(jsonb_array_length(parent.metadata->'planSnapshot'->'searchPasses'), 0) <= 1
         OR $9::boolean
@@ -6043,6 +6055,7 @@ async function dispatchNextElasticWorkItem(tx, {
           AND same_agent_attempt.agent_id = $2::uuid
       )
     ORDER BY
+      CASE WHEN item.status = 'pending' THEN 0 ELSE 1 END,
       CASE
         WHEN item.metadata->>'waitingForSourceClosure' = 'true' THEN 1
         ELSE 0
@@ -6064,7 +6077,6 @@ async function dispatchNextElasticWorkItem(tx, {
     canClaimNegativePost,
     canClaimWatchedContent,
     canClaimSequentialSearch,
-    CAPTURE_SAFETY_HANDOFF_SEARCH_CODES,
   ]);
   if (!candidate) return null;
 
@@ -6125,7 +6137,18 @@ async function dispatchNextElasticWorkItem(tx, {
           assignmentRevision:
             sourceAttempt?.assignment_revision ?? candidate.assignment_revision,
         });
-    if (!neverOpened && localClosureProof.proven !== true) {
+    const sourceExecutionFinishedAt = Date.parse(String(
+      candidate.source_execution_finished_at || '',
+    ));
+    const sourceClosureGraceElapsed =
+      Number.isFinite(sourceExecutionFinishedAt) &&
+      Date.now() - sourceExecutionFinishedAt >=
+        ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS;
+    if (
+      !neverOpened &&
+      localClosureProof.proven !== true &&
+      !sourceClosureGraceElapsed
+    ) {
       const firstWait = itemMetadata.waitingForSourceClosure !== true;
       await tx.execute(`
         UPDATE capture_task_items
@@ -10506,11 +10529,9 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
           execution.metadata->>'requiresLocalClosureReuseFenceV1' = 'true',
           false
         ) AS requires_local_closure_proof,
-        GREATEST(
-          COALESCE(execution.finished_at, '-infinity'::timestamptz),
-          execution.updated_at,
-          COALESCE(attempt.finished_at, '-infinity'::timestamptz),
-          attempt.updated_at
+        COALESCE(
+          execution.finished_at,
+          attempt.finished_at
         ) AS terminal_at
       FROM capture_task_item_attempts attempt
       JOIN capture_task_items item
@@ -10555,13 +10576,13 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
       requires_local_closure_proof,
       terminal_at,
       terminal_at <= now() - make_interval(secs => $3::integer)
-        AS legacy_quiescent
+        AS closure_quiescent
     FROM reusable_history
     ORDER BY requires_local_closure_proof DESC, terminal_at DESC, id DESC
   `, [
     tenantId,
     agentId,
-    Math.floor(LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS / 1000),
+    Math.floor(LOCAL_CLOSURE_REUSE_QUIESCENCE_MS / 1000),
   ]);
   const latestMarkedAttempt = history.find(
     attempt => attempt.requires_local_closure_proof === true,
@@ -10576,7 +10597,10 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
       itemAttemptNumber: latestMarkedAttempt.attempt_number,
       assignmentRevision: latestMarkedAttempt.assignment_revision,
     });
-    if (proof.proven !== true) {
+    if (
+      proof.proven !== true &&
+      latestMarkedAttempt.closure_quiescent !== true
+    ) {
       return {
         ready: false,
         reason: proof.reason,
@@ -10587,17 +10611,19 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
   const latestLegacyAttempt = history.find(
     attempt => attempt.requires_local_closure_proof !== true,
   );
-  if (latestLegacyAttempt && latestLegacyAttempt.legacy_quiescent !== true) {
+  if (latestLegacyAttempt && latestLegacyAttempt.closure_quiescent !== true) {
     return {
       ready: false,
-      reason: 'legacy_local_cleanup_quiescence',
+      reason: 'local_cleanup_quiescence',
       attempt: latestLegacyAttempt,
     };
   }
   return {
     ready: true,
     reason: latestMarkedAttempt
-      ? 'marked_local_closure_proven'
+      ? latestMarkedAttempt.closure_quiescent === true
+        ? 'bounded_local_cleanup_quiescence_elapsed'
+        : 'marked_local_closure_proven'
       : 'local_closure_reuse_ready',
   };
 }
