@@ -1554,6 +1554,8 @@ function createBatchHarness({
     BATCH_KEYWORD_EMPTY_RETRY_WAIT_MS: 0,
     DOUYIN_SEARCH_SECURITY_CHALLENGE_CODE:
       "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+    DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE:
+      "DOUYIN_SEARCH_SERVICE_ABNORMAL",
     Math,
     activateTabForReliableTimer: async () => {},
     buildInterKeywordDelayMessage: ({keyword}) => `next:${keyword}`,
@@ -2102,7 +2104,7 @@ test("a confirmed empty Douyin result settles as a successful zero-result keywor
   );
 });
 
-test("Douyin service-abnormal state fails the current keyword and continues the next", async () => {
+test("Douyin service-abnormal empty state settles as zero results and continues the next", async () => {
   let readinessChecks = 0;
   const harness = createBatchHarness({
     captureKeyword: async ({captureParams}) =>
@@ -2151,14 +2153,17 @@ test("Douyin service-abnormal state fails the current keyword and continues the 
   assert.equal(harness.settled.length, 2);
   assert.equal(harness.settled[0].keyword, "词1");
   assert.equal(harness.settled[0].securityBlocked, false);
+  assert.equal(harness.settled[0].result.ok, true);
+  assert.equal(harness.settled[0].result.noResults, true);
+  assert.equal(harness.settled[0].result.resultKind, "no_matching_results");
   assert.equal(
-    harness.settled[0].result.errorCode,
+    harness.settled[0].result.normalizedFromErrorCode,
     "DOUYIN_SEARCH_SERVICE_ABNORMAL",
   );
   assert.equal(harness.settled[1].keyword, "词2");
   assert.equal(harness.settled[1].result.ok, true);
-  assert.equal(result.stats.success, 1);
-  assert.equal(result.stats.failed, 1);
+  assert.equal(result.stats.success, 2);
+  assert.equal(result.stats.failed, 0);
   assert.equal(harness.progress.at(-1)?.phase, "done");
 });
 

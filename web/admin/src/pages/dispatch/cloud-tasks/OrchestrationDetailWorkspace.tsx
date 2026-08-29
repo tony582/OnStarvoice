@@ -221,6 +221,10 @@ function attemptItemId(attempt: OrchestrationAttemptRecord) {
   return String(attempt.itemId || attempt.item_id || '')
 }
 
+function attemptAgentId(attempt: OrchestrationAttemptRecord) {
+  return String(attempt.agentId || attempt.agent_id || '')
+}
+
 function itemAssignedAgentId(
   item: OrchestrationItemRecord,
   executions: OrchestrationExecutionRecord[],
@@ -479,6 +483,17 @@ export function OrchestrationDetailWorkspace({
       ))
       .filter(Boolean),
   ), [detail?.attempts, detail?.executions, keywordRetryItems])
+  const attemptedAgentIdsByRetryItem = useMemo(() => {
+    const attempted = new Map<string, Set<string>>()
+    for (const attempt of detail?.attempts || []) {
+      const itemId = attemptItemId(attempt)
+      const agentId = attemptAgentId(attempt)
+      if (!itemId || !agentId) continue
+      if (!attempted.has(itemId)) attempted.set(itemId, new Set())
+      attempted.get(itemId)!.add(agentId)
+    }
+    return attempted
+  }, [detail?.attempts])
   const keywordRetryCandidates = useMemo(() => {
     if (!detail || contentPatrol) return []
     const source = Array.isArray(detail.retryCandidates)
@@ -500,16 +515,14 @@ export function OrchestrationDetailWorkspace({
       items: keywordRetryItems,
       candidates: keywordRetryCandidates,
       overrides: keywordRetryAgentOverrides,
+      attemptedAgentIdsByItem: attemptedAgentIdsByRetryItem,
     })
-  }, [keywordRetryAgentOverrides, keywordRetryCandidates, keywordRetryItems])
+  }, [attemptedAgentIdsByRetryItem, keywordRetryAgentOverrides, keywordRetryCandidates, keywordRetryItems])
   const keywordRetryDispatchableCount = keywordRetryAllocation.filter(
     allocation => Boolean(allocation.agent),
   ).length
   const keywordRetryWaitingCount =
     keywordRetryAllocation.length - keywordRetryDispatchableCount
-  const keywordRetryStrictWaitingCount = keywordRetryAllocation.filter(
-    allocation => allocation.strictWaiting,
-  ).length
   const negativeReassignItems = useMemo(() => {
     if (!negativePatrol) return []
     return sortedItems.filter(item => {
@@ -753,11 +766,11 @@ export function OrchestrationDetailWorkspace({
       const recovery = recoveryValue && typeof recoveryValue === 'object' && !Array.isArray(recoveryValue)
         ? recoveryValue as Record<string, unknown>
         : {}
+      const sourceAgentCooling = recovery.sourceAgentCooling !== false
       const waitUntil = timestamp(
-        recovery.sourceAgentHoldUntil ||
-        recovery.source_agent_hold_until ||
-        recovery.nextEvaluationAt ||
-        recovery.next_evaluation_at,
+        sourceAgentCooling
+          ? recovery.sourceAgentHoldUntil || recovery.source_agent_hold_until
+          : recovery.nextEvaluationAt || recovery.next_evaluation_at,
       )
       const attemptCurrent = Math.max(1, Number(
         recovery.attemptCurrent || recovery.attempt_current || item.attempt_count || 1,
@@ -779,14 +792,16 @@ export function OrchestrationDetailWorkspace({
       states.push({
         id: `item:${item.id}`,
         label: `工作项已释放 · 换 Agent ${attemptCurrent}/${attemptTotal}`,
-        message: String(recovery.reason || '') === 'platform_safety_handoff'
-          ? `${workUnit}「${keywordForItem(item)}」已解除原 Agent 锁定，其他账号可立即复核；原 Agent 冷却期间不会领取新任务${cooldownHomeStatus}`
-          : `${workUnit}「${keywordForItem(item)}」已解除原 Agent 锁定，其他空闲 Agent 可立即领取；原 Agent 冷却期间不会领取新任务${cooldownHomeStatus}`,
+        message: sourceAgentCooling
+          ? `${workUnit}「${keywordForItem(item)}」已解除原 Agent 锁定，其他空闲 Agent 可立即领取；原 Agent 暂停领取新任务${cooldownHomeStatus}`
+          : String(recovery.reason || '') === 'platform_safety_handoff'
+            ? `仅隔离${workUnit}「${keywordForItem(item)}」与原账号这一组合；系统正在未尝试账号中接力，原账号可继续领取其他关键词${cooldownHomeStatus}`
+            : `${workUnit}「${keywordForItem(item)}」正在等待未尝试过的空闲 Agent；原 Agent 可继续领取其他关键词${cooldownHomeStatus}`,
         attemptCurrent,
         attemptTotal,
         waitUntil,
         agentLabel: `原 Agent：${agentName(agentsById.get(String(recovery.sourceAgentId || item.assigned_agent_id || '')))}`,
-        countdownKind: 'agent_cooldown',
+        countdownKind: sourceAgentCooling ? 'agent_cooldown' : 'retry',
       })
     }
     return states
@@ -914,7 +929,7 @@ export function OrchestrationDetailWorkspace({
   const resumeAttentionSource = async () => {
     if (!attentionContext || !writable || attentionAction) return
     const verificationConfirmation = elasticPool
-      ? '请确认已经在原 Agent 的平台页面完成人工验证。确认后只解除该账号冷却；受阻关键词仍由其它空闲 Agent 接力，不会重开旧任务。'
+      ? '请确认已经在原 Agent 的平台页面完成人工验证。确认后只记录该账号已恢复并关闭旧执行；受阻关键词仍由其它未尝试账号接力，同词不会回到原账号，其他关键词不受影响。'
       : '请确认已经在当前 Agent 的平台页面完成人工验证。确认后将从未完成位置继续，并保留此前结果。'
     if (!window.confirm(verificationConfirmation)) return
     setAttentionAction('resume')
@@ -926,13 +941,13 @@ export function OrchestrationDetailWorkspace({
         { mode: 'remaining' },
       )
       setActionFeedback(result.message || (elasticPool
-        ? '原账号冷却已解除，受阻关键词继续由其它 Agent 接力'
+        ? '原账号验证状态已更新；受阻关键词继续由其它 Agent 接力'
         : '已向当前 Agent 发送继续剩余关键词指令'))
       await load(true)
       await onChanged?.()
     } catch (err) {
       setActionError(err instanceof Error ? err.message : (elasticPool
-        ? '解除账号冷却失败'
+        ? '更新账号验证状态失败'
         : '发送继续指令失败'))
     } finally {
       setAttentionAction('')
@@ -941,7 +956,7 @@ export function OrchestrationDetailWorkspace({
 
   const stopAttentionSource = async () => {
     if (!attentionContext || !writable || attentionAction) return
-    if (!window.confirm('确定结束当前 Agent 的任务吗？后续关键词不再执行，已经采集和保存的结果会保留。')) return
+    if (!window.confirm('确定停止这台 Agent 的当前执行吗？只停止这一条执行；已经采集和保存的结果会保留。')) return
     setAttentionAction('stop')
     setActionFeedback('')
     setActionError('')
@@ -950,7 +965,7 @@ export function OrchestrationDetailWorkspace({
         `/capture-cloud/tasks/${attentionContext.sourceTaskId}/stop`,
         {},
       )
-      setActionFeedback(result.message || '已向当前 Agent 发送结束并保留结果指令')
+      setActionFeedback(result.message || '已请求停止这台 Agent 的当前执行，已有结果会保留')
       await load(true)
       await onChanged?.()
     } catch (err) {
@@ -980,9 +995,6 @@ export function OrchestrationDetailWorkspace({
         : `当前没有空闲兼容 Agent，确定让 ${keywordRetryWaitingCount} 个失败关键词进入自动等待队列吗？`) +
       `${keywordRetryDispatchableCount > 0 && keywordRetryWaitingCount
         ? ` 另有 ${keywordRetryWaitingCount} 个等待空闲 Agent，槽位释放后自动接力。`
-        : ''}` +
-      `${keywordRetryStrictWaitingCount > 0
-        ? ` 其中 ${keywordRetryStrictWaitingCount} 项指定的 Agent 当前不可用，将严格等待该 Agent，不会自动改派。`
         : ''}` +
       `${keywordRetryDispatchableCount === 0
         ? ''
@@ -1385,7 +1397,7 @@ export function OrchestrationDetailWorkspace({
                   <h3 className="text-sm font-bold text-foreground">
                     {attentionContext.sourceEnded
                       ? '当前 Agent 已结束，后续关键词由系统自动接力'
-                      : '自动恢复与换设备复核后仍需人工验证'}
+                      : '当前账号需要验证；其他关键词继续自动分配'}
                   </h3>
                   <span className="rounded-full bg-status-red/10 px-2 py-0.5 text-[10px] font-semibold text-status-red">
                     {attentionContext.currentOrdinal > 0
@@ -1411,7 +1423,7 @@ export function OrchestrationDetailWorkspace({
                         ? <Loader2 className="h-4 w-4 animate-spin" />
                         : <Play className="h-4 w-4" />}
                       {elasticPool
-                        ? '验证完成，解除账号冷却'
+                        ? '已完成验证，更新账号状态'
                         : '验证完成，当前 Agent 继续'}
                     </Button>
                   )}
@@ -1425,7 +1437,7 @@ export function OrchestrationDetailWorkspace({
                       {attentionAction === 'stop'
                         ? <Loader2 className="h-4 w-4 animate-spin" />
                         : <Square className="h-3.5 w-3.5 fill-current" />}
-                      结束并保留
+                      停止这台 Agent（保留结果）
                     </Button>
                   )}
                   {idleHandoffAllowed && attentionContext.unstartedCount > 0 && (
@@ -1443,7 +1455,7 @@ export function OrchestrationDetailWorkspace({
                       : '当前任务已结束，现有结果已保留；该历史任务创建时未启用自动接力。'
                     : idleHandoffAllowed
                     ? '系统已经先做过原 Agent 分散重试，并尝试换一个账号复核；再次遇到验证码或登录限制后才暂停，避免在多个账号间继续扩散风控。其他未开始关键词仍会自动分配。'
-                    : '该历史任务创建时未启用自动接力；你可以在当前 Agent 验证后继续，或结束并保留结果。'}
+                    : '该历史任务创建时未启用自动接力；你可以在当前 Agent 验证后继续，或停止这台 Agent 的当前执行并保留结果。'}
                 </p>
               </div>
             </div>
@@ -1464,14 +1476,14 @@ export function OrchestrationDetailWorkspace({
                         : keywordRecoveryExhausted
                           ? `${keywordRetryItems.length} 个关键词自动尝试已耗尽`
                           : orchestrationFinal && elasticPool
-                            ? `${keywordRetryItems.length} 个关键词自动恢复已停止`
+                            ? `${keywordRetryItems.length} 个关键词仍需复核`
                             : `${keywordRetryItems.length} 个关键词可云端重试`}
                     </h3>
                     <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
                       {automaticKeywordRecoveryActive
                         ? '系统自动分配'
                         : orchestrationFinal && elasticPool
-                          ? '任务已结算'
+                          ? '可继续接力'
                           : '回写当前父任务'}
                     </span>
                   </div>
@@ -1481,8 +1493,8 @@ export function OrchestrationDetailWorkspace({
                       : keywordRecoveryExhausted
                         ? '该批次已完成结算，不会继续自动下发；请查看每次尝试的真实错误后决定是否新建补采任务。'
                         : orchestrationFinal && elasticPool
-                          ? '该批次已经结算，页面不再把失败项误报为“正在自动恢复”。'
-                          : '默认每个失败关键词分配一台空闲 Agent；你可以在下方逐项覆盖。'}
+                          ? '旧批次虽已结算，仍可把未完成关键词交给未尝试过的空闲 Agent；新批次不会在仍有可用接力账号时提前结算。'
+                          : '不用手动选择；提交时系统会为每个失败关键词挑选一台未尝试过且近期稳定的空闲 Agent。下拉框只用于指定优先账号。'}
                   </p>
                 </div>
               </div>
@@ -1491,10 +1503,6 @@ export function OrchestrationDetailWorkspace({
                   {keywordAutomaticCandidates.length > 0
                     ? '系统按上方倒计时自动检查并下发，无需人工操作'
                     : '正在等待兼容的空闲 Agent；上方会显示检查状态'}
-                </span>
-              ) : orchestrationFinal && elasticPool ? (
-                <span className="inline-flex min-h-9 items-center rounded-lg border border-border bg-muted/50 px-3 text-xs font-medium text-muted-foreground">
-                  当前任务已结算，不会继续自动分配
                 </span>
               ) : <div className="flex flex-col items-end gap-1">
                 <Button
@@ -1514,19 +1522,16 @@ export function OrchestrationDetailWorkspace({
                       ? 'text-muted-foreground'
                       : 'text-status-red',
                   )}>
-                    {keywordRetryDispatchableCount} 个现在接力，{keywordRetryWaitingCount} 个等待
-                    {keywordRetryStrictWaitingCount > 0
-                      ? `（其中 ${keywordRetryStrictWaitingCount} 个严格等待指定 Agent）`
-                      : '槽位释放后自动接力'}
+                    {keywordRetryDispatchableCount} 个现在接力，{keywordRetryWaitingCount} 个等待；槽位释放后自动改派
                   </span>
                 )}
               </div>}
             </div>
-            {!automaticKeywordRecoveryActive && !(orchestrationFinal && elasticPool) && (
+            {!automaticKeywordRecoveryActive && (
               <div className="mt-4 overflow-hidden rounded-xl border border-border bg-background/80">
                 <div className="hidden grid-cols-[minmax(0,1fr)_minmax(12rem,0.9fr)] gap-3 border-b border-border bg-muted/35 px-3 py-2 text-[11px] font-semibold text-muted-foreground sm:grid">
                   <span>失败关键词</span>
-                  <span>单项执行 Agent</span>
+                  <span>优先 Agent（可选）</span>
                 </div>
                 {keywordRetryAllocation.map(allocation => {
                   const overriddenElsewhere = new Set(
@@ -1534,6 +1539,9 @@ export function OrchestrationDetailWorkspace({
                       .filter(([itemId]) => itemId !== allocation.item.id)
                       .map(([, agentId]) => agentId),
                   )
+                  const attemptedAgentIds = attemptedAgentIdsByRetryItem.get(
+                    allocation.item.id,
+                  ) || new Set<string>()
                   return (
                     <div
                       key={allocation.item.id}
@@ -1544,11 +1552,11 @@ export function OrchestrationDetailWorkspace({
                           {keywordForItem(allocation.item)}
                         </p>
                         <p className="mt-0.5 text-[10px] text-muted-foreground">
-                          {allocation.strictWaiting
-                            ? '已人工覆盖 · 指定 Agent 当前不可用，将严格等待'
-                            : allocation.overridden
-                              ? '已人工覆盖'
-                              : '自动分配预览'}
+                          {allocation.overridden
+                            ? '将优先使用所选 Agent'
+                            : allocation.preferenceFallback
+                              ? '所选 Agent 不可用或已跑过此词，提交时会自动改派'
+                              : '系统将在提交时自动选择'}
                         </p>
                       </div>
                       <select
@@ -1573,19 +1581,21 @@ export function OrchestrationDetailWorkspace({
                             ? `自动 · ${agentName(allocation.agent)}`
                             : '自动 · 等待槽位释放后接力'}
                         </option>
-                        {allocation.strictWaiting && (
-                          <option value={allocation.overrideAgentId}>
-                            已指定 · 当前不可用（将严格等待）
-                          </option>
-                        )}
                         {keywordRetryCandidates.map(agent => (
                           <option
                             key={agent.id}
                             value={agent.id}
-                            disabled={overriddenElsewhere.has(agent.id)}
+                            disabled={
+                              overriddenElsewhere.has(agent.id) ||
+                              attemptedAgentIds.has(agent.id)
+                            }
                           >
                             {agentName(agent)}
-                            {keywordRetrySourceAgentIds.has(agent.id) ? '（原 Agent）' : ''}
+                            {attemptedAgentIds.has(agent.id)
+                              ? '（此词已尝试）'
+                              : keywordRetrySourceAgentIds.has(agent.id)
+                                ? '（原 Agent）'
+                                : ''}
                             {agent.todaySearches !== undefined
                               ? ` · 今日搜索 ${agent.todaySearches}${agent.dailySearchLimit
                                 ? `/${agent.dailySearchLimit}`

@@ -3,12 +3,52 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.97',
+  latestVersion: '0.3.98',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-29',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.97-20260829.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.98-20260829.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.3.98',
+      releaseDate: '2026-08-29',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '验证只隔离当前关键词与当前账号',
+              desc: '抖音遇到验证码或安全验证后释放当前工作项，由未尝试过的空闲账号接力；原账号仍可领取其他关键词，不再连坐整批任务，也不会在冷却倒计时中循环。',
+            },
+            {
+              title: '抖音明确无结果不再误报失败',
+              desc: '搜索结果为空或页面明确显示服务异常且没有可采作品时，按“无搜索结果、0 条正常完成”收口，并继续执行下一关键词。',
+            },
+            {
+              title: '小红书长评论采集不再被提前终止',
+              desc: '评论详情阶段采用独立的有界等待时间；持续上报心跳且仍在采集时不会被通用看门狗提前关闭页面。',
+            },
+            {
+              title: '离线节点不再长期占住关键词',
+              desc: 'Agent 的存活与完整任务心跳都确认过期后，服务端撤销旧执行租约并把关键词交给未尝试过的在线账号；旧节点迟到回报仍受尝试栅栏约束。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '失败词自动选择未尝试空闲账号',
+              desc: '系统按计划内实际账号数保留有限接力预算，优先选择近期稳定且未执行过该词的空闲 Agent；人工下拉选择仅作为优先项，不可用时自动改派，不再严格等待。',
+            },
+            {
+              title: '保留结果的异常显示为部分完成',
+              desc: '关键词已保存数据但后续增强未完整结束时，后台显示“部分完成”和真实保存数量，不再把已有结果隐藏在红色失败状态里。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.97',
       releaseDate: '2026-08-29',

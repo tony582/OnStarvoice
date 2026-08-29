@@ -492,27 +492,34 @@ test('failed keyword retry atomically shards each item to a distinct idle Agent 
   assert.doesNotMatch(waitingSet, /execution_task_id\s*=/u);
 });
 
-test('elastic retries have one owner and cannot fall back to the legacy child creator', () => {
+test('active elastic retries keep one owner while settled failures remain recoverable', () => {
   const retry = section(
     "router.post(\n  '/orchestrations/:id/retry-items'",
     "router.post(\n  '/orchestrations/:id/resolve-attention'",
   );
-  const previewGate = retry.indexOf('if (elasticQueueOwnsRetry(parentPreview))');
   const replayRead = retry.indexOf('const existingTasks =');
   const childInsert = retry.indexOf('INSERT INTO capture_tasks');
-  assert.ok(previewGate >= 0);
-  assert.ok(replayRead > previewGate);
+  assert.equal(
+    retry.indexOf('if (elasticQueueOwnsRetry(parentPreview))'),
+    -1,
+    'a terminal failed item must not be blocked by the stale preview gate',
+  );
+  assert.ok(replayRead >= 0);
   assert.ok(childInsert > replayRead);
   assert.match(retry, /retry_items_managed_by_elastic_dispatcher/u);
 
   const lockedParent = retry.indexOf('parentSelect({lock: true})');
   const lockedGate = retry.indexOf(
-    'if (elasticQueueOwnsRetry(parent))',
+    'elasticQueueOwnsRetry(parent) &&',
     lockedParent,
   );
   assert.ok(lockedParent >= 0);
   assert.ok(lockedGate > lockedParent);
   assert.ok(lockedGate < childInsert);
+  assert.match(
+    retry.slice(lockedGate, childInsert),
+    /retryItems\.some\(item => item\.status === 'retryable'\)/u,
+  );
 });
 
 test('four retry items with three ranked idle Agents dispatch three and preserve one waiting', async () => {
@@ -537,27 +544,50 @@ test('four retry items with three ranked idle Agents dispatch three and preserve
     itemId: 'item-4',
     keyword: 'keyword-4',
     status: 'retryable',
-    reason: 'no_idle_agent',
+    reason: 'no_idle_untried_agent',
   }]);
 });
 
-test('an unavailable per-item override remains fenced to that Agent while waiting', async () => {
+test('an unavailable per-item preference falls back to another idle Agent', async () => {
   const {allocateRetryItemsForRetry} = await import(
     new URL('../server/routes/capture-orchestrations.js', import.meta.url)
   );
   const allocation = allocateRetryItemsForRetry({
     items: [{id: 'item-1', keyword: 'keyword-1'}],
-    agents: [],
+    agents: [{id: 'agent-auto'}],
     overrides: [{itemId: 'item-1', agentId: 'agent-required'}],
   });
-  assert.deepEqual(allocation.dispatched, []);
-  assert.deepEqual(allocation.waiting, [{
-    itemId: 'item-1',
-    keyword: 'keyword-1',
-    status: 'retryable',
-    reason: 'assigned_agent_unavailable',
-    agentId: 'agent-required',
-  }]);
+  assert.equal(allocation.dispatched[0].agentId, 'agent-auto');
+  assert.equal(
+    allocation.dispatched[0].preferenceFallbackReason,
+    'preferred_agent_unavailable',
+  );
+  assert.deepEqual(allocation.waiting, []);
+});
+
+test('retry allocation never sends a keyword back to an Agent that already tried it', async () => {
+  const {allocateRetryItemsForRetry} = await import(
+    new URL('../server/routes/capture-orchestrations.js', import.meta.url)
+  );
+  const allocation = allocateRetryItemsForRetry({
+    items: [
+      {id: 'item-1', keyword: 'keyword-1'},
+      {id: 'item-2', keyword: 'keyword-2'},
+    ],
+    agents: [{id: 'agent-1'}, {id: 'agent-2'}, {id: 'agent-3'}],
+    overrides: [{itemId: 'item-1', agentId: 'agent-1'}],
+    attemptedAgentIdsByItem: new Map([
+      ['item-1', new Set(['agent-1', 'agent-2'])],
+    ]),
+  });
+  assert.deepEqual(
+    allocation.dispatched.map(entry => [entry.item.id, entry.agentId]),
+    [['item-1', 'agent-3'], ['item-2', 'agent-1']],
+  );
+  assert.equal(
+    allocation.dispatched[0].preferenceFallbackReason,
+    'preferred_agent_already_attempted',
+  );
 });
 
 test('retry candidate SQL fails closed on unknown Shanghai usage and hard limits', () => {
@@ -572,7 +602,8 @@ test('retry candidate SQL fails closed on unknown Shanghai usage and hard limits
   assert.match(candidates, /AS today_usage_current/u);
   assert.doesNotMatch(candidates, /COALESCE\(daily_usage\.searches,\s*0\)/u);
   assert.match(candidates, /daily_usage\.searches < current_social_account\.daily_search_limit/u);
-  assert.match(candidates, /ORDER BY daily_usage\.searches ASC,[\s\S]*health_status[\s\S]*recent_technical_failure_count ASC/u);
+  assert.match(candidates, /ORDER BY[\s\S]*health_status[\s\S]*recent_technical_failure_count ASC[\s\S]*daily_usage\.searches ASC/u);
+  assert.match(candidates, /FROM capture_task_item_attempts recent_failure/u);
   assert.match(candidates, /FOR UPDATE OF ca, daily_usage/u);
   assert.match(route, /crossDeviceRetryAgentDailyUsageEligible\(agent\)/u);
 });

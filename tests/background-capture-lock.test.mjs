@@ -5705,6 +5705,54 @@ test("supervisor detects business stalls even while runner heartbeats are fresh"
   assert.notEqual(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, request.attemptId);
 });
 
+test("a live ten-minute comment capture is not killed by the generic six-minute watchdog", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    heartbeatAt: new Date().toISOString(),
+    businessProgressAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    progress: {
+      current: 1,
+      total: 1,
+      keyword: "关键词一",
+      phase: "detail_comments_capturing",
+      captureAction: "captureComments",
+      message: "正在采集评论",
+    },
+  });
+
+  const result = await harness.api.superviseUnattendedKeywordRun();
+
+  assert.equal(result.healthy, true, JSON.stringify(result));
+  assert.equal(result.reason, "active");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, request.attemptId);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+});
+
+test("the comment-stage watchdog remains bounded after twelve minutes", async () => {
+  const harness = createHarness();
+  seedUnattendedRequest(harness, {
+    heartbeatAt: new Date().toISOString(),
+    businessProgressAt: new Date(Date.now() - 13 * 60 * 1000).toISOString(),
+    progress: {
+      current: 1,
+      total: 1,
+      keyword: "关键词一",
+      phase: "detail_comments_capturing",
+      captureAction: "captureComments",
+      message: "正在采集评论",
+    },
+  });
+
+  const result = await harness.api.superviseUnattendedKeywordRun();
+
+  assert.equal(result.deferred, true, JSON.stringify(result));
+  assert.equal(result.reason, "recovery_wait");
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].progress.phase,
+    "waiting_automatic_recovery",
+  );
+});
+
 test("fresh content business progress protects a long-running unattended capture", async () => {
   const harness = createHarness();
   const request = seedUnattendedRequest(harness, {

@@ -16064,8 +16064,8 @@ export async function batchCaptureByKeywords({
         });
       }
 
-      // 抖音结果探针会每 300ms 检查“服务出现异常”，不要先固定等 2 秒，
-      // 让当前关键词尽快失败并把执行权交给下一个词。其它平台保留原有渲染宽限。
+      // 抖音结果探针会每 300ms 检查“服务出现异常”，不要先固定等 2 秒。
+      // 稳定异常且没有作品时，本词按 0 条正常完成并继续；其它平台保留原有渲染宽限。
       if (!isDouyinPlatform(platform)) {
         await waitMsWithStop(
           BATCH_KEYWORD_AFTER_NAV_WAIT_MS,
@@ -16121,7 +16121,7 @@ export async function batchCaptureByKeywords({
       // 按需切换搜索「排序 / 范围」(默认值则跳过)。
       // 关键:筛选后结果没加载(如抖音「服务出现异常」)绝不能继续采——有界重试会
       // 重新点搜索,把筛选清空,采回来的就是未筛选(可能好几年前)的内容(客户投诉根源)。
-      // 抖音撞到异常页时,像手动一样重新点一次搜索并把筛选重挂;仍失败则本词判失败跳过,宁缺勿错。
+      // 抖音撞到异常页时,像手动一样重新点一次搜索并把筛选重挂;仍无作品则本词按 0 条收口,宁缺勿错。
       if (hasActiveBatchSearchFilters(searchFilters)) {
         let filteredResultsReady = false;
         const maxFilterAttempts =
@@ -16605,10 +16605,15 @@ export async function batchCaptureByKeywords({
         canceled = true;
         break;
       }
+      const normalizedKeywordErrorCode = String(error?.code || '')
+        .trim()
+        .toUpperCase();
       if (
-        String(error?.code || '').trim().toUpperCase() ===
-        'CONFIRMED_EMPTY_SEARCH_RESULTS'
+        normalizedKeywordErrorCode === 'CONFIRMED_EMPTY_SEARCH_RESULTS' ||
+        normalizedKeywordErrorCode === DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE
       ) {
+        const normalizedServiceEmpty =
+          normalizedKeywordErrorCode === DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE;
         keywordResult = {
           keyword,
           ok: true,
@@ -16619,8 +16624,13 @@ export async function batchCaptureByKeywords({
           scanComplete: true,
           recordIds: [],
           message:
-            error?.message ||
-            `「${keyword}」在当前筛选范围内没有匹配内容`,
+            normalizedServiceEmpty
+              ? `「${keyword}」未返回可采搜索结果，已按 0 条正常完成`
+              : error?.message ||
+                `「${keyword}」在当前筛选范围内没有匹配内容`,
+          ...(normalizedServiceEmpty
+            ? {normalizedFromErrorCode: DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE}
+            : {}),
         };
         results.push(keywordResult);
         successCount++;
@@ -16630,7 +16640,9 @@ export async function batchCaptureByKeywords({
             total: keywords.length,
             keyword,
             phase: 'no_matching_results',
-            message: `「${keyword}」在当前筛选范围内没有匹配内容，已按 0 条正常完成`,
+            message: normalizedServiceEmpty
+              ? `「${keyword}」未返回可采搜索结果，已按 0 条正常完成`
+              : `「${keyword}」在当前筛选范围内没有匹配内容，已按 0 条正常完成`,
             recordIds: [],
             runnerTabId,
           });

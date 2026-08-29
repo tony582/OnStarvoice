@@ -567,14 +567,13 @@ async function loadRetryAgentCandidates(
       current_social_binding.last_login_state,
       (
         SELECT COUNT(*)::integer
-        FROM capture_tasks recent_failure
+        FROM capture_task_item_attempts recent_failure
         WHERE recent_failure.tenant_id = ca.tenant_id
-          AND COALESCE(
-            recent_failure.assigned_agent_id,
-            recent_failure.origin_agent_id
-          ) = ca.id
-          AND recent_failure.created_at > now() - interval '2 hours'
-          AND recent_failure.status IN ('failed', 'completed_with_failures')
+          AND recent_failure.agent_id = ca.id
+          AND recent_failure.updated_at > now() - interval '2 hours'
+          AND recent_failure.status IN (
+            'retryable', 'needs_action', 'failed', 'interrupted'
+          )
           AND NOT (
             COALESCE(recent_failure.error::text, '') ~*
               'captcha|security.verification|login.required|safety.block'
@@ -658,7 +657,7 @@ async function loadRetryAgentCandidates(
             active_command.expires_at > now()
           )
       )
-    ORDER BY daily_usage.searches ASC,
+    ORDER BY
       CASE COALESCE(current_social_account.health_status, 'unknown')
         WHEN 'active' THEN 0
         WHEN 'unknown' THEN 1
@@ -672,9 +671,10 @@ async function loadRetryAgentCandidates(
         WHEN 'unknown' THEN 1
         ELSE 2
       END ASC,
+      recent_technical_failure_count ASC,
       daily_usage.failed_events ASC,
       daily_usage.safety_verifications ASC,
-      recent_technical_failure_count ASC,
+      daily_usage.searches ASC,
       recent_success_count DESC,
       last_assignment_at ASC NULLS FIRST,
       COALESCE(ca.last_full_heartbeat_at, ca.last_heartbeat_at)
@@ -1326,7 +1326,12 @@ function normalizeRetryItems(body) {
   };
 }
 
-export function allocateRetryItemsForRetry({items = [], agents = [], overrides = []}) {
+export function allocateRetryItemsForRetry({
+  items = [],
+  agents = [],
+  overrides = [],
+  attemptedAgentIdsByItem = new Map(),
+}) {
   const overrideByItemId = new Map(
     overrides.map(assignment => [
       String(assignment.itemId || ''),
@@ -1336,45 +1341,73 @@ export function allocateRetryItemsForRetry({items = [], agents = [], overrides =
   const idleById = new Map(
     agents.map(agent => [String(agent.id || ''), agent]),
   );
-  const reservedOverrideAgentIds = new Set(
-    overrides
-      .map(assignment => String(assignment.agentId || ''))
-      .filter(agentId => idleById.has(agentId)),
-  );
-  const automaticAgents = agents.filter(
-    agent => !reservedOverrideAgentIds.has(String(agent.id || '')),
-  );
+  const reservedOverrideAgentIds = new Set();
+  for (const item of items) {
+    const itemId = String(item.id || '');
+    const overrideAgentId = overrideByItemId.get(itemId) || '';
+    const attemptedAgentIds = attemptedAgentIdsByItem instanceof Map
+      ? attemptedAgentIdsByItem.get(itemId) || new Set()
+      : new Set(attemptedAgentIdsByItem?.[itemId] || []);
+    if (
+      overrideAgentId &&
+      idleById.has(overrideAgentId) &&
+      !attemptedAgentIds.has(overrideAgentId)
+    ) {
+      reservedOverrideAgentIds.add(overrideAgentId);
+    }
+  }
   const usedAgentIds = new Set();
-  let automaticIndex = 0;
   const dispatched = [];
   const waiting = [];
   for (const item of items) {
     const itemId = String(item.id || '');
+    const attemptedAgentIds = attemptedAgentIdsByItem instanceof Map
+      ? attemptedAgentIdsByItem.get(itemId) || new Set()
+      : new Set(attemptedAgentIdsByItem?.[itemId] || []);
     const overrideAgentId = overrideByItemId.get(itemId) || '';
-    let agent = overrideAgentId ? idleById.get(overrideAgentId) : null;
+    let agent = overrideAgentId && !attemptedAgentIds.has(overrideAgentId)
+      ? idleById.get(overrideAgentId)
+      : null;
     if (agent && usedAgentIds.has(String(agent.id))) agent = null;
-    if (!overrideAgentId) {
-      while (
-        automaticIndex < automaticAgents.length &&
-        usedAgentIds.has(String(automaticAgents[automaticIndex].id))
-      ) automaticIndex += 1;
-      agent = automaticAgents[automaticIndex++] || null;
+    if (!agent) {
+      agent = agents.find(candidate => {
+        const candidateId = String(candidate.id || '');
+        if (
+          usedAgentIds.has(candidateId) ||
+          attemptedAgentIds.has(candidateId)
+        ) return false;
+        // An explicit choice is a preference, not a strict wait. Preserve a
+        // still-valid preference for its own item, but fall back to another
+        // stable idle Agent when the preferred one became busy or already ran
+        // this keyword.
+        return !reservedOverrideAgentIds.has(candidateId) ||
+          candidateId === overrideAgentId;
+      }) || null;
     }
     if (!agent) {
       waiting.push({
         itemId,
         keyword: item.keyword,
         status: 'retryable',
-        reason: overrideAgentId
-          ? 'assigned_agent_unavailable'
-          : 'no_idle_agent',
-        ...(overrideAgentId ? {agentId: overrideAgentId} : {}),
+        reason: 'no_idle_untried_agent',
       });
       continue;
     }
     const agentId = String(agent.id);
     usedAgentIds.add(agentId);
-    dispatched.push({item, agentId, agent});
+    dispatched.push({
+      item,
+      agentId,
+      agent,
+      ...(overrideAgentId && overrideAgentId !== agentId
+        ? {
+            preferredAgentId: overrideAgentId,
+            preferenceFallbackReason: attemptedAgentIds.has(overrideAgentId)
+              ? 'preferred_agent_already_attempted'
+              : 'preferred_agent_unavailable',
+          }
+        : {}),
+    });
   }
   return {dispatched, waiting};
 }
@@ -4760,13 +4793,6 @@ router.post(
             404,
           )};
         }
-        if (elasticQueueOwnsRetry(parentPreview)) {
-          return {failure: requestError(
-            'retry_items_managed_by_elastic_dispatcher',
-            '当前任务由云端单次接力自动收口，无需人工重复创建重试任务',
-            409,
-          )};
-        }
         const existingTasks = await tx.queryAll(`
           SELECT id, parent_task_id, assigned_agent_id, status, metadata
           FROM capture_tasks
@@ -4926,13 +4952,6 @@ router.post(
             404,
           )};
         }
-        if (elasticQueueOwnsRetry(parent)) {
-          return {failure: requestError(
-            'retry_items_managed_by_elastic_dispatcher',
-            '当前任务由云端单次接力自动收口，无需人工重复创建重试任务',
-            409,
-          )};
-        }
         const currentRevision = Number(parent.orchestration_revision || 0);
         if (currentRevision !== normalized.expectedRevision) {
           return {failure: requestError(
@@ -4978,6 +4997,16 @@ router.post(
             {itemIds: ineligible.map(item => item.id)},
           )};
         }
+        if (
+          elasticQueueOwnsRetry(parent) &&
+          retryItems.some(item => item.status === 'retryable')
+        ) {
+          return {failure: requestError(
+            'retry_items_managed_by_elastic_dispatcher',
+            '这些关键词仍在自动接力队列中，无需人工重复创建重试任务',
+            409,
+          )};
+        }
         const safetyItems = retryItems.filter(item =>
           itemRequiresManualSafetyAction(item)
         );
@@ -5006,6 +5035,21 @@ router.post(
         retryItems.sort(
           (left, right) => Number(left.ordinal) - Number(right.ordinal),
         );
+        const previousAttempts = await tx.queryAll(`
+          SELECT item_id, agent_id
+          FROM capture_task_item_attempts
+          WHERE tenant_id = $1
+            AND item_id = ANY($2::uuid[])
+            AND agent_id IS NOT NULL
+        `, [req.tenantId, retryItems.map(item => item.id)]);
+        const attemptedAgentIdsByItem = new Map();
+        for (const attempt of previousAttempts) {
+          const itemId = String(attempt.item_id);
+          if (!attemptedAgentIdsByItem.has(itemId)) {
+            attemptedAgentIdsByItem.set(itemId, new Set());
+          }
+          attemptedAgentIdsByItem.get(itemId).add(String(attempt.agent_id));
+        }
         const planSnapshot = safeJson(parent.metadata?.planSnapshot);
         const idleAgents = [];
         for (const agent of candidateAgents) {
@@ -5027,6 +5071,7 @@ router.post(
           items: retryItems,
           agents: idleAgents,
           overrides: normalized.assignments,
+          attemptedAgentIdsByItem,
         });
         const retryAssignments = allocation.dispatched;
         const waiting = allocation.waiting;

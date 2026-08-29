@@ -138,7 +138,6 @@ const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
 // endless in the task center. Keep the item immediately available to another
 // Agent and use only a short, bounded source-account cooldown.
 const ELASTIC_AGENT_CAPACITY_HOLD_MS = 5 * 60 * 1000;
-const ELASTIC_SAFETY_AGENT_HOLD_MS = 5 * 60 * 1000;
 const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
 const ELASTIC_TECHNICAL_HANDOFF_LIMIT = 2;
@@ -1189,7 +1188,10 @@ function elasticAgentRecoveryHoldMs(source = {}) {
     error: safeJson(source.error),
     metadata: {checkpoint: safeJson(source.checkpoint)},
   })
-    ? ELASTIC_SAFETY_AGENT_HOLD_MS
+    // Verification fences the immutable keyword + account attempt below. It
+    // must not quarantine the whole Agent and leave unrelated fresh keywords
+    // waiting while that browser is otherwise online and usable.
+    ? 0
     : ELASTIC_TECHNICAL_AGENT_HOLD_MS;
 }
 
@@ -1303,8 +1305,9 @@ function buildElasticRecoveryMetadata({
   });
   return {
     // retryable means the current child no longer owns this item. Another
-    // compatible Agent may claim it immediately; only the failing source Agent
-    // is cooled down, and it is kept off the same item for a longer window.
+    // compatible Agent may claim it immediately. Technical failures can apply
+    // a short whole-Agent hold; safety failures fence only this item/account
+    // pair and leave unrelated keywords claimable.
     state: 'released_for_handoff',
     reason: safetyBlocked ? 'platform_safety_handoff' : 'technical_recovery',
     attemptCurrent: Math.max(1, Number(attemptCount) || 1),
@@ -1313,7 +1316,7 @@ function buildElasticRecoveryMetadata({
     queuedAt: new Date(recoveryAnchorMs).toISOString(),
     handoffReadyAt: new Date(recoveryAnchorMs).toISOString(),
     itemLockReleased: true,
-    sourceAgentCooling: !operatorHoldReleased,
+    sourceAgentCooling: !operatorHoldReleased && sourceAgentHoldMs > 0,
     ...(operatorHoldReleased
       ? {operatorHoldReleasedAt: new Date(operatorHoldReleasedAtMs).toISOString()}
       : {}),
@@ -13341,7 +13344,7 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
             await tx.execute(`
               UPDATE capture_tasks
               SET status = 'completed_with_failures',
-                message = '验证已确认，原账号冷却解除；受阻关键词继续由其它 Agent 接力',
+                message = '验证已确认，账号状态已恢复；受阻关键词继续由其它 Agent 接力',
                 metadata = metadata || jsonb_build_object(
                   'operatorHoldReleasedAt', $1::text,
                   'operatorHoldReleasedBy', $2::text
@@ -13360,7 +13363,7 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
               actorId: req.user?.id || '',
               actorName: req.actorName,
               status: 'completed_with_failures',
-              message: '验证已确认，原账号冷却解除，旧任务不再恢复',
+              message: '验证已确认，原账号状态已更新，旧任务不再恢复',
               payload: {
                 parentTaskId: task.parent_task_id,
                 releasedKeywords,
@@ -13376,7 +13379,7 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
               actorId: req.user?.id || '',
               actorName: req.actorName,
               status: 'retryable',
-              message: '原账号验证完成，账号冷却已解除；关键词保持可接力',
+              message: '原账号验证完成；受阻关键词保持由其它未尝试账号接力',
               payload: {
                 sourceTaskId: task.id,
                 releasedKeywords,
@@ -13527,7 +13530,7 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
         ok: true,
         status: 'source_agent_hold_released',
         releasedKeywords: result.releasedKeywords,
-        message: '原账号冷却已解除；受阻关键词仍由其它空闲 Agent 接力，不会重开旧任务',
+        message: '原账号验证状态已更新；受阻关键词仍由其它未尝试 Agent 接力，不会重开旧任务',
       });
     }
     const online = captureAgentOnline(result.task.last_heartbeat_at);

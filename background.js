@@ -143,6 +143,12 @@ const UNATTENDED_LOCK_RETRY_DELAY_MS = 5 * 60 * 1000;
 const UNATTENDED_RUN_CLAIM_GRACE_MS = 2 * 60 * 1000;
 const UNATTENDED_RUN_ACTIVE_GRACE_MS = 3 * 60 * 1000;
 const UNATTENDED_RUN_BUSINESS_STALL_MS = 6 * 60 * 1000;
+// A single comment-detail request is allowed to run for up to ten minutes.
+// The generic six-minute business watchdog used to kill that healthy request,
+// remove its tab, and manufacture a follow-up `No tab with id` failure. Keep
+// the runner-heartbeat fence at three minutes, but give this explicit long
+// stage a bounded margin beyond its own operation timeout.
+const UNATTENDED_RUN_COMMENT_STAGE_STALL_MS = 12 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_PERIOD_MINUTES = 1;
 const CLOUD_TASK_AGENT_PERIOD_MINUTES = 1;
 const CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS = 15 * 1000;
@@ -7919,11 +7925,27 @@ async function assessUnattendedRunHealth(
       return {healthy: false, reason: 'runner_heartbeat_stale'};
     }
     const businessProgressAt = parseTimestampMs(request.businessProgressAt);
+    const progressPhase = String(request?.progress?.phase || '')
+      .trim()
+      .toLowerCase();
+    const captureAction = String(request?.progress?.captureAction || '')
+      .trim()
+      .toLowerCase();
+    const businessStallLimitMs =
+      progressPhase === 'detail_comments_capturing' ||
+      progressPhase.startsWith('comments_') ||
+      captureAction === 'capturecomments'
+        ? UNATTENDED_RUN_COMMENT_STAGE_STALL_MS
+        : UNATTENDED_RUN_BUSINESS_STALL_MS;
     if (
       !Number.isFinite(businessProgressAt) ||
-      nowMs - businessProgressAt > UNATTENDED_RUN_BUSINESS_STALL_MS
+      nowMs - businessProgressAt > businessStallLimitMs
     ) {
-      return {healthy: false, reason: 'business_progress_stalled'};
+      return {
+        healthy: false,
+        reason: 'business_progress_stalled',
+        businessStallLimitMs,
+      };
     }
   }
 

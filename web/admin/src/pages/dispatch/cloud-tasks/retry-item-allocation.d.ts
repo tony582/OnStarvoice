@@ -11,7 +11,8 @@ export interface KeywordRetryAllocation<Item, Agent> {
   agent: Agent | null
   overrideAgentId: string
   overridden: boolean
-  strictWaiting: boolean
+  preferenceFallback: boolean
+  preferredAgentAlreadyAttempted: boolean
 }
 
 export function allocateKeywordRetryItems<
@@ -21,6 +22,7 @@ export function allocateKeywordRetryItems<
   items?: Item[]
   candidates?: Agent[]
   overrides?: Record<string, string>
+  attemptedAgentIdsByItem?: Record<string, string[]> | Map<string, Set<string>>
 }): Array<KeywordRetryAllocation<Item, Agent>>
 
 export function buildKeywordRetryAssignments<

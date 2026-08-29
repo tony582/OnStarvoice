@@ -2,30 +2,63 @@ export function allocateKeywordRetryItems({
   items = [],
   candidates = [],
   overrides = {},
+  attemptedAgentIdsByItem = {},
 } = {}) {
   const candidateById = new Map(
     candidates.map(candidate => [String(candidate.id || ''), candidate]),
   );
-  const reservedAgentIds = new Set(
-    Object.values(overrides)
-      .map(agentId => String(agentId || '').trim())
-      .filter(agentId => candidateById.has(agentId)),
+  const attemptedForItem = itemId => new Set(
+    attemptedAgentIdsByItem instanceof Map
+      ? attemptedAgentIdsByItem.get(String(itemId || '')) || []
+      : attemptedAgentIdsByItem?.[String(itemId || '')] || [],
   );
-  const automaticAgents = candidates.filter(
-    agent => !reservedAgentIds.has(String(agent.id || '')),
-  );
-  let automaticIndex = 0;
-  return items.map(item => {
+  const reservedAgentIds = new Set();
+  for (const item of items) {
     const overrideAgentId = String(overrides[item.id] || '').trim();
-    const agent = overrideAgentId
+    if (
+      overrideAgentId &&
+      candidateById.has(overrideAgentId) &&
+      !attemptedForItem(item.id).has(overrideAgentId)
+    ) {
+      reservedAgentIds.add(overrideAgentId);
+    }
+  }
+  const usedAgentIds = new Set();
+  return items.map(item => {
+    const attemptedAgentIds = attemptedForItem(item.id);
+    const overrideAgentId = String(overrides[item.id] || '').trim();
+    let agent = overrideAgentId && !attemptedAgentIds.has(overrideAgentId)
       ? candidateById.get(overrideAgentId) || null
-      : automaticAgents[automaticIndex++] || null;
+      : null;
+    if (agent && usedAgentIds.has(String(agent.id || ''))) agent = null;
+    if (!agent) {
+      agent = candidates.find(candidate => {
+        const candidateId = String(candidate.id || '');
+        return Boolean(
+          candidateId &&
+          !usedAgentIds.has(candidateId) &&
+          !attemptedAgentIds.has(candidateId) &&
+          (
+            !reservedAgentIds.has(candidateId) ||
+            candidateId === overrideAgentId
+          )
+        );
+      }) || null;
+    }
+    if (agent) usedAgentIds.add(String(agent.id || ''));
     return {
       item,
       agent,
       overrideAgentId,
-      overridden: Boolean(overrideAgentId),
-      strictWaiting: Boolean(overrideAgentId && !agent),
+      overridden: Boolean(
+        overrideAgentId && String(agent?.id || '') === overrideAgentId,
+      ),
+      preferenceFallback: Boolean(
+        overrideAgentId && String(agent?.id || '') !== overrideAgentId,
+      ),
+      preferredAgentAlreadyAttempted: Boolean(
+        overrideAgentId && attemptedAgentIds.has(overrideAgentId),
+      ),
     };
   });
 }

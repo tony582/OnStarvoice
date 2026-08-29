@@ -616,7 +616,7 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "retryable",
     error: safety,
     updated_at: "2026-08-12T01:58:00.000Z",
-  }, now), 3 * 60_000);
+  }, now), 0, "verification fences only the keyword and source account pair");
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: safety,
@@ -2822,7 +2822,7 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.ok(commandRead > elastic);
 });
 
-test("elastic recovery releases the item immediately while cooling only the source Agent", () => {
+test("elastic recovery releases the item immediately and scopes verification to the item-account pair", () => {
   const recovery = readRouteSection(
     "function buildElasticRecoveryMetadata({",
     "export function crossDeviceRetryAgentSupportsTask(",
@@ -2831,7 +2831,7 @@ test("elastic recovery releases the item immediately while cooling only the sour
   assert.match(recovery, /state: 'released_for_handoff'/u);
   assert.match(recovery, /handoffReadyAt/u);
   assert.match(recovery, /itemLockReleased: true/u);
-  assert.match(recovery, /sourceAgentCooling: !operatorHoldReleased/u);
+  assert.match(recovery, /sourceAgentCooling: !operatorHoldReleased && sourceAgentHoldMs > 0/u);
   assert.match(recovery, /previousRecovery\.queuedAt/u);
   assert.match(recovery, /operatorHoldReleasedAt/u);
   assert.match(recovery, /cooldownHomeRestored/u);

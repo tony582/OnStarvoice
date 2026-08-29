@@ -164,7 +164,7 @@ export function TaskCard({
       ? '失败词已达上限'
       : '暂时不能继续'
     : safetyAttention && task.agent_online
-      ? '验证完成，原设备继续'
+      ? '验证已完成，继续本设备'
       : safetyAttention
         ? '原设备上线后继续'
         : task.agent_online
@@ -172,15 +172,15 @@ export function TaskCard({
           : '上线后继续'
   const stopActionLabel = safetyAttention
     ? task.agent_online
-      ? '结束并保留结果'
-      : '上线后结束并保留'
+      ? '停止本设备任务（保留结果）'
+      : '上线后停止（保留结果）'
     : task.agent_online
       ? '停止任务'
       : '上线后停止'
   const stopPendingLabel = safetyAttention
     ? task.agent_online
-      ? '等待设备结束并保留'
-      : '已排队，上线后结束'
+      ? '正在停止本设备任务（保留结果）'
+      : '已排队，上线后停止（保留结果）'
     : task.agent_online
       ? '等待设备停止'
       : '已排队，上线后停止'
@@ -388,7 +388,7 @@ export function TaskCard({
                     ? '失败词已达上限'
                     : '暂时不能继续'
                   : safetyAttention && task.agent_online
-                    ? '验证完成，原设备继续'
+                    ? '验证已完成，继续本设备'
                     : safetyAttention
                       ? '原设备上线后继续'
                   : task.agent_online
@@ -401,8 +401,8 @@ export function TaskCard({
                 {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
                 {safetyAttention
                   ? task.agent_online
-                    ? '结束并保留结果'
-                    : '上线后结束并保留'
+                    ? '停止本设备任务（保留结果）'
+                    : '上线后停止（保留结果）'
                   : task.agent_online
                     ? '停止任务'
                     : '上线后停止'}
@@ -413,8 +413,8 @@ export function TaskCard({
                 <Loader2 className="h-4 w-4 animate-spin" />
                 {safetyAttention
                   ? task.agent_online
-                    ? '等待设备结束并保留'
-                    : '已排队，上线后结束'
+                    ? '正在停止本设备任务（保留结果）'
+                    : '已排队，上线后停止（保留结果）'
                   : task.agent_online
                     ? '等待设备停止'
                     : '已排队，上线后停止'}
