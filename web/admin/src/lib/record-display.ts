@@ -1,6 +1,7 @@
 type LooseRecord = Record<string, unknown>
 
 const DOUYIN_ID = /^\d{8,}$/u
+const XHS_ID = /^[A-Za-z0-9_-]{8,}$/u
 const IMAGE_TYPES = new Set([
   'image', 'images', 'image_text', 'image-text', 'image_note', 'image-note',
   'picture', 'photo', 'note', '图文', '图片',
@@ -70,6 +71,49 @@ function normalizedContentId(value: unknown) {
   return DOUYIN_ID.test(normalized) ? normalized : ''
 }
 
+function normalizedXhsContentId(value: unknown) {
+  const normalized = String(value || '').trim()
+  return XHS_ID.test(normalized) ? normalized : ''
+}
+
+function directXhsUrl(value: unknown) {
+  if (!value) return null
+  try {
+    const parsed = new URL(String(value).trim())
+    if (!/(^|\.)xiaohongshu\.com$/iu.test(parsed.hostname)) return null
+    const matched = parsed.pathname.match(
+      /^\/(?:explore|search_result|discovery\/item|note|video)\/([A-Za-z0-9_-]{8,})(?:\/|$)/iu,
+    )
+    return matched
+      ? { id: matched[1], url: `https://www.xiaohongshu.com/explore/${matched[1]}` }
+      : null
+  } catch {
+    return null
+  }
+}
+
+function xhsOriginalUrl(record: LooseRecord) {
+  const { payload, firstItem, detailPayload, itemDetailPayload } = payloadParts(record)
+  const candidates = [
+    record.canonical_url,
+    record.url,
+    payload.detailCaptureNoteUrl,
+    payload.noteUrl,
+    payload.url,
+    detailPayload.noteUrl,
+    detailPayload.url,
+    firstItem.detailCaptureNoteUrl,
+    firstItem.noteUrl,
+    firstItem.url,
+    itemDetailPayload.noteUrl,
+    itemDetailPayload.url,
+  ].map(directXhsUrl).filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
+  const id = normalizedXhsContentId(record.external_id)
+  const direct = candidates.find(candidate => !id || candidate.id === id)
+  if (direct) return direct.url
+  return id ? `https://www.xiaohongshu.com/explore/${id}` : ''
+}
+
 function douyinContentId(record: LooseRecord, directCandidates: ReturnType<typeof douyinDirectCandidates>) {
   const { payload, firstItem, detailPayload, itemDetailPayload } = payloadParts(record)
   for (const value of [
@@ -134,6 +178,12 @@ export function resolveRecordOriginalUrl(value: unknown): string {
     const kind = douyinContentKind(record)
     if (contentId && kind) return `https://www.douyin.com/${kind}/${contentId}`
   }
+  const hasXhsUrl = [record.url, record.canonical_url]
+    .some(url => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(url || '').replace(/^https?:\/\//iu, '')))
+  if (platform === 'xiaohongshu' || hasXhsUrl) {
+    const direct = xhsOriginalUrl(record)
+    if (direct) return direct
+  }
   return String(record.canonical_url || record.url || '')
 }
 
@@ -150,14 +200,17 @@ function detailCaptureStatus(record: LooseRecord) {
 export function isRecordDetailDegraded(value: unknown): boolean {
   const record = objectValue(value)
   const title = String(record.title || '').trim()
+  const content = String(record.content || '').trim()
   const placeholder = /^抖音搜索结果\s+\d+$/u.test(title)
-  return placeholder && ['failed', 'partial', 'error'].includes(detailCaptureStatus(record))
+  const failed = ['failed', 'partial', 'error'].includes(detailCaptureStatus(record))
+  return failed && (placeholder || (!title && !content))
 }
 
 export function recordDisplayTitle(value: unknown, fallback = '(无标题)'): string {
   const record = objectValue(value)
   if (isRecordDetailDegraded(record)) {
     const id = normalizedContentId(record.external_id)
+      || normalizedXhsContentId(record.external_id)
       || String(record.title || '').match(/\d{8,}/u)?.[0]
       || ''
     return id ? `详情待补采 · ${id}` : '详情待补采'

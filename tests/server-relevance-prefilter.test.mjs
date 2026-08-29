@@ -32,6 +32,8 @@ import {
   resolveRelevancePrefilterCacheRoutes,
   resolvePurposeLLMConfigValues,
   runPrefilterCloudFallbackPolicy,
+  sanitizePromptText,
+  truncatePromptText,
 } from '../server/services/ai-labeler.js';
 import { resolveMonitoringIntent } from '../server/services/monitoring-intent.js';
 
@@ -315,6 +317,23 @@ test('routine DeepSeek and Qwen requests explicitly disable thinking', () => {
   assert.equal(qwen.enable_thinking, false);
   assert.equal(Object.hasOwn(qwen, 'thinking'), false);
   assert.deepEqual(qwen.response_format, {type: 'json_object'});
+});
+
+test('model prompts never contain a lone UTF-16 surrogate after truncation or serialization', () => {
+  const emojiBoundary = '123👇';
+  assert.equal(emojiBoundary.slice(0, 4), '123\uD83D');
+  assert.equal(truncatePromptText(emojiBoundary, 4), emojiBoundary);
+  assert.equal(sanitizePromptText(`prefix\uD83D`), 'prefix�');
+
+  const request = buildOpenAICompatibleRequestBody({
+    provider: 'deepseek',
+    model: 'deepseek-v4-flash',
+    systemPrompt: 'Return JSON.',
+    userMessage: `prefix\uD83D`,
+    thinking: false,
+  });
+  assert.equal(request.messages[1].content, 'prefix�');
+  assert.doesNotMatch(JSON.stringify(request), /\\ud83d/iu);
 });
 
 test('purpose route never reuses a credential across providers', () => {

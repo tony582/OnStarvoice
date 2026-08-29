@@ -613,6 +613,14 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     const offset = (Math.max(1, Number(page)) - 1) * limit;
     params.push(limit, offset);
     const records = await queryAll(`
+      WITH page_records AS MATERIALIZED (
+        SELECT r.id
+        FROM records r
+        LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
+        ${where}
+        ORDER BY ${orderBySql(sort, dir)}
+        LIMIT $${params.length - 1} OFFSET $${params.length}
+      )
       SELECT
         r.id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
         r.author_fans, r.url, r.cover_url, r.cover_local, r.image_urls, r.image_local_urls, r.note_type,
@@ -683,13 +691,12 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
           ORDER BY rc.last_seen_at DESC
           LIMIT 1
         ) AS latest_negative_comment
-      FROM records r
+      FROM page_records page
+      JOIN records r ON r.id = page.id
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       ${LATEST_CONTENT_TICKET_JOIN}
       ${LATEST_CONTENT_PROGRESS_JOIN}
-      ${where}
       ORDER BY ${orderBySql(sort, dir)}
-      LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
 
     records.forEach(r => { r.publish_display = formatPublishDate(r.publish_time, r.created_at); });

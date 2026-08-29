@@ -8,6 +8,7 @@ import {
   mergeObservationMetrics,
   normalizeCapturedRecordLinks,
   resolveDouyinCanonicalRecordUrl,
+  resolveXhsCanonicalRecordUrl,
   resolveGuardedCommentsCount,
   resolveCapturedTextUpdate,
   resolveRecordRelabelReason,
@@ -90,7 +91,33 @@ test('Douyin canonical link normalization is conservative without a proven work 
     resolveDouyinCanonicalRecordUrl(direct),
     'https://www.douyin.com/note/7679243972795505774',
   );
-  assert.strictEqual(normalizeCapturedRecordLinks(xiaohongshu), xiaohongshu);
+  assert.deepEqual(normalizeCapturedRecordLinks(xiaohongshu), {
+    ...xiaohongshu,
+    url: 'https://www.xiaohongshu.com/explore/7679243972795505774',
+    canonical_url: 'https://www.xiaohongshu.com/explore/7679243972795505774',
+  });
+});
+
+test('Xiaohongshu search-result detail routes are normalized to stable work URLs', () => {
+  const record = {
+    platform: 'xiaohongshu',
+    external_id: '6a92558e000000001f000325',
+    url: 'https://www.xiaohongshu.com/search_result/6a92558e000000001f000325?xsec_token=temporary&xsec_source=pc_search',
+    payload: JSON.stringify({
+      detailCaptureStatus: 'failed',
+      detailCaptureFailureCode: 'PAGE_OPEN_TIMEOUT',
+    }),
+  };
+
+  assert.equal(
+    resolveXhsCanonicalRecordUrl(record),
+    'https://www.xiaohongshu.com/explore/6a92558e000000001f000325',
+  );
+  assert.deepEqual(normalizeCapturedRecordLinks(record), {
+    ...record,
+    url: 'https://www.xiaohongshu.com/explore/6a92558e000000001f000325',
+    canonical_url: 'https://www.xiaohongshu.com/explore/6a92558e000000001f000325',
+  });
 });
 
 test('legacy likes-only list payload does not turn comments or collects into zero', () => {

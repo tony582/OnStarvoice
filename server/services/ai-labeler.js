@@ -187,7 +187,7 @@ export function buildUserMessage(record) {
     text += `全部召回关键词（只用于归属，不覆盖整体相关性）：${observedKeywords.slice(0, 30).join('、')}\n`;
   }
   if (record.title) text += `标题：${record.title}\n`;
-  if (record.content) text += `正文：${record.content.slice(0, 2000)}\n`;
+  if (record.content) text += `正文：${truncatePromptText(record.content, 2000)}\n`;
   if (record.author_name) text += `作者：${record.author_name}\n`;
   if (record.platform) text += `平台：${record.platform}\n`;
   if (record.tags) {
@@ -257,8 +257,8 @@ async function callGemini(apiKey, model, systemPrompt, userMessage, options = {}
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      system_instruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ parts: [{ text: userMessage }] }],
+      system_instruction: { parts: [{ text: sanitizePromptText(systemPrompt) }] },
+      contents: [{ parts: [{ text: sanitizePromptText(userMessage) }] }],
       generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
     }),
     signal: AbortSignal.timeout(timeoutMs), // 防止 LLM 请求挂死冻住整个评论入库串行队列
@@ -330,6 +330,41 @@ export function normalizeLLMProvider(value) {
   return LLM_PROVIDER_ALIASES[normalized] || normalized || 'gemini';
 }
 
+// JavaScript 的 String#slice 按 UTF-16 code unit 截断，恰好切在 emoji 等非 BMP
+// 字符中间时会留下孤立 surrogate。部分 OpenAI-compatible 上游会拒绝这样的
+// JSON 字符串（DeepSeek 返回 unexpected end of hex escape）。所有模型请求在
+// 序列化前再做一次边界清洗；提示词的定长截取则按完整 code point 进行。
+export function sanitizePromptText(value) {
+  const input = String(value ?? '');
+  let output = '';
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = input.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        output += input[index] + input[index + 1];
+        index += 1;
+      } else {
+        output += '\uFFFD';
+      }
+      continue;
+    }
+    if (code >= 0xDC00 && code <= 0xDFFF) {
+      output += '\uFFFD';
+      continue;
+    }
+    output += input[index];
+  }
+  return output;
+}
+
+export function truncatePromptText(value, maxCodePoints) {
+  const clean = sanitizePromptText(value);
+  const limit = Math.max(0, Number(maxCodePoints) || 0);
+  if (!limit) return '';
+  return Array.from(clean).slice(0, limit).join('');
+}
+
 export function buildOpenAICompatibleRequestBody({
   provider,
   model,
@@ -343,8 +378,8 @@ export function buildOpenAICompatibleRequestBody({
   const body = {
     model,
     messages: [
-      {role: 'system', content: systemPrompt},
-      {role: 'user', content: userMessage},
+      {role: 'system', content: sanitizePromptText(systemPrompt)},
+      {role: 'user', content: sanitizePromptText(userMessage)},
     ],
     temperature,
     response_format: {type: 'json_object'},
@@ -1377,7 +1412,7 @@ export function buildCommentSystemPrompt(brand) {
 function buildCommentUserMessage({ record = {}, comment = {} }) {
   const lines = [];
   if (record.title) lines.push(`原帖标题：${record.title}`);
-  if (record.content) lines.push(`原帖正文：${String(record.content).slice(0, 1200)}`);
+  if (record.content) lines.push(`原帖正文：${truncatePromptText(record.content, 1200)}`);
   if (record.category) lines.push(`原帖主题：${record.category}`);
   if (record.sentiment) lines.push(`原帖情绪：${record.sentiment}`);
   if (record.platform) lines.push(`平台：${record.platform}`);
@@ -1454,16 +1489,16 @@ export function buildCommentBatchSystemPrompt(brand) {
 function buildCommentBatchUserMessage({ record = {}, comments = [] }) {
   const head = [];
   if (record.title) head.push(`原帖标题：${record.title}`);
-  if (record.content) head.push(`原帖正文：${String(record.content).slice(0, 800)}`);
+  if (record.content) head.push(`原帖正文：${truncatePromptText(record.content, 800)}`);
   if (record.category) head.push(`原帖主题：${record.category}`);
   if (record.sentiment) head.push(`原帖情绪：${record.sentiment}`);
   if (record.platform) head.push(`平台：${record.platform}`);
   const arr = comments.map((c, i) => ({
     i,
-    author: String(c.author_name || '').slice(0, 40),
-    content: String(c.content || '').slice(0, 300),
+    author: truncatePromptText(c.author_name, 40),
+    content: truncatePromptText(c.content, 300),
     likes: Number(c.like_count || 0),
-    ip: String(c.ip_location || '').slice(0, 20),
+    ip: truncatePromptText(c.ip_location, 20),
   }));
   return `${head.join('\n')}\n\n评论数组(逐条判断,按 i 一一对应返回):\n${JSON.stringify(arr)}`;
 }

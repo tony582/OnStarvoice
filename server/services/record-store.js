@@ -36,6 +36,7 @@ function normalizeUrl(url) {
 }
 
 const DOUYIN_CONTENT_ID_PATTERN = /^\d{8,}$/u;
+const XHS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{8,}$/u;
 const DOUYIN_IMAGE_NOTE_TYPES = new Set([
   'image', 'images', 'image_text', 'image-text', 'image_note', 'image-note',
   'picture', 'photo', 'note', '图文', '图片',
@@ -75,7 +76,7 @@ function parseDouyinDirectContentUrl(value) {
   }
 }
 
-function douyinPayloadCandidates(payload) {
+function recordPayloadCandidates(payload) {
   const parsed = recordPayloadObject(payload);
   const firstItem = Array.isArray(parsed.items)
     ? parsed.items.find(item => item && typeof item === 'object' && !Array.isArray(item)) || {}
@@ -86,7 +87,7 @@ function douyinPayloadCandidates(payload) {
 }
 
 function douyinDirectUrlCandidates(record = {}) {
-  const {parsed, firstItem, detailPayload, itemDetailPayload} = douyinPayloadCandidates(record.payload);
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
   return [
     record.canonical_url,
     record.url,
@@ -104,7 +105,7 @@ function douyinDirectUrlCandidates(record = {}) {
 }
 
 function douyinRecordContentId(record = {}, directCandidates = []) {
-  const {parsed, firstItem, detailPayload, itemDetailPayload} = douyinPayloadCandidates(record.payload);
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
   const values = [
     record.external_id,
     record.note_id,
@@ -136,7 +137,7 @@ function douyinRecordContentId(record = {}, directCandidates = []) {
 }
 
 function douyinRecordContentKind(record = {}) {
-  const {parsed, firstItem, detailPayload, itemDetailPayload} = douyinPayloadCandidates(record.payload);
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
   const values = [
     record.note_type,
     record.noteType,
@@ -178,8 +179,64 @@ export function resolveDouyinCanonicalRecordUrl(record = {}) {
   return kind ? `https://www.douyin.com/${kind}/${contentId}` : '';
 }
 
+function normalizeXhsContentId(value) {
+  const normalized = String(value || '').trim();
+  return XHS_CONTENT_ID_PATTERN.test(normalized) ? normalized : '';
+}
+
+function parseXhsDirectContentUrl(value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(String(value).trim());
+    if (!/(^|\.)xiaohongshu\.com$/iu.test(parsed.hostname)) return null;
+    const matched = parsed.pathname.match(
+      /^\/(?:explore|search_result|discovery\/item|note|video)\/([A-Za-z0-9_-]{8,})(?:\/|$)/iu,
+    );
+    if (!matched) return null;
+    return {
+      id: matched[1],
+      url: `https://www.xiaohongshu.com/explore/${matched[1]}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Xiaohongshu /search_result/:id is a browser navigation route. Persist the
+ * stable /explore/:id work URL so a failed detail attempt cannot leak its
+ * temporary search route into the triage workspace.
+ */
+export function resolveXhsCanonicalRecordUrl(record = {}) {
+  const platform = String(record.platform || '').trim().toLowerCase();
+  const hasXhsUrl = [record.url, record.canonical_url]
+    .some(value => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(value || '').replace(/^https?:\/\//iu, '')));
+  if (platform !== 'xiaohongshu' && !hasXhsUrl) return '';
+
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
+  const candidates = [
+    record.canonical_url,
+    record.url,
+    parsed.detailCaptureNoteUrl,
+    parsed.noteUrl,
+    parsed.url,
+    detailPayload.noteUrl,
+    detailPayload.url,
+    firstItem.detailCaptureNoteUrl,
+    firstItem.noteUrl,
+    firstItem.url,
+    itemDetailPayload.noteUrl,
+    itemDetailPayload.url,
+  ].map(parseXhsDirectContentUrl).filter(Boolean);
+  const externalId = normalizeXhsContentId(record.external_id);
+  const matching = candidates.find(candidate => !externalId || candidate.id === externalId);
+  if (matching) return matching.url;
+  return externalId ? `https://www.xiaohongshu.com/explore/${externalId}` : '';
+}
+
 export function normalizeCapturedRecordLinks(record = {}) {
-  const canonicalUrl = resolveDouyinCanonicalRecordUrl(record);
+  const canonicalUrl = resolveDouyinCanonicalRecordUrl(record)
+    || resolveXhsCanonicalRecordUrl(record);
   if (!canonicalUrl) return record;
   return {
     ...record,

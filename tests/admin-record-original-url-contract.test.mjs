@@ -19,3 +19,13 @@ test('admin workbench resolves Douyin original links separately from search navi
   assert.match(drawer, /href=\{originalUrl\}/);
   assert.match(data, /linkCell\(resolveRecordOriginalUrl\(r\), '打开笔记'\)/);
 });
+
+test('admin workbench distinguishes titleless Xiaohongshu notes from failed detail placeholders', () => {
+  const helper = source('web/admin/src/lib/record-display.ts');
+  const data = source('web/admin/src/pages/DataPage.tsx');
+
+  assert.match(helper, /xiaohongshu\.com\/explore\/\$\{matched\[1\]\}/);
+  assert.match(helper, /failed && \(placeholder \|\| \(!title && !content\)\)/);
+  assert.match(helper, /return String\(record\.title \|\| record\.content \|\| fallback\)/);
+  assert.match(data, /col\('title', '标题', \(r, ctx\) => longCell\(recordDisplayTitle\(r\), 180, ctx\)\)/);
+});
