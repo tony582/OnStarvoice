@@ -2875,10 +2875,18 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   );
   assert.match(lease, /elastic_stale_execution_waiting_local_closure/u);
   assert.match(lease, /return 'waiting_local_closure'/u);
-  assert.ok(
-    lease.indexOf('loadVerifiedCaptureLocalClosureProof') <
-      lease.indexOf("SET status = 'failed'"),
-    'a stale execution must prove local closure before it can be requeued',
+  assert.match(
+    lease,
+    /requiresSourceLocalClosure\s*&&[\s\S]*!localClosureProof\.proven\s*&&[\s\S]*!agentOffline/u,
+    'task-heartbeat-only recovery must still prove local closure',
+  );
+  assert.match(lease, /'serverLeaseRevoked', \$5::boolean/u);
+  assert.match(lease, /serverLeaseRevoked: agentOffline/u);
+  assert.match(lease, /sourceLocalClosureProven: localClosureProof\.proven === true/u);
+  assert.match(
+    captureCloudRouteSource,
+    /capture_tasks\.error->>'code'[\s\S]*ELASTIC_AGENT_OFFLINE_TIMEOUT[\s\S]*ELASTIC_TASK_HEARTBEAT_TIMEOUT/u,
+    'late snapshots from a server-revoked stale runner must remain fenced',
   );
   assert.match(
     lease,

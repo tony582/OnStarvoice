@@ -12806,7 +12806,19 @@ export async function reconcileElasticCaptureLeases(input = 50) {
               sourceItem?.assignment_revision,
           })
         : {proven: true, reason: 'local_closure_reuse_fence_not_required'};
-      if (requiresSourceLocalClosure && !localClosureProof.proven) {
+      // Both the Agent liveness lease and the execution heartbeat have already
+      // been stale for the full offline timeout before this row reaches the
+      // reconciler. At that point the server revokes the old execution lease
+      // and the assignment-revision fence rejects every late snapshot from
+      // that runner. Requiring the disconnected browser to upload one more
+      // closure proof would make an unattended keyword wait forever. Keep the
+      // proof gate for a future task-heartbeat-only recovery, but do not let a
+      // confirmed-offline source account quarantine the keyword itself.
+      if (
+        requiresSourceLocalClosure &&
+        !localClosureProof.proven &&
+        !agentOffline
+      ) {
         const firstWait =
           safeJson(child.metadata).waitingForSourceClosure !== true;
         await tx.execute(`
@@ -12841,14 +12853,21 @@ export async function reconcileElasticCaptureLeases(input = 50) {
           error = jsonb_build_object(
             'code', $3::text,
             'message', $4::text,
-            'retryable', true
+            'retryable', true,
+            'serverLeaseRevoked', $5::boolean
           ),
           message = $4,
           finished_at = now(),
           updated_at = now()
         WHERE id = $1 AND tenant_id = $2
         RETURNING *
-      `, [child.id, candidate.tenant_id, timeoutCode, timeoutMessage]);
+      `, [
+        child.id,
+        candidate.tenant_id,
+        timeoutCode,
+        timeoutMessage,
+        agentOffline,
+      ]);
       await projectOrchestrationChildControlOutcome(tx, {
         tenantId: candidate.tenant_id,
         childTask: failed,
@@ -12858,6 +12877,7 @@ export async function reconcileElasticCaptureLeases(input = 50) {
           code: timeoutCode,
           message: timeoutMessage,
           automaticRetry: true,
+          serverLeaseRevoked: agentOffline,
         },
         actorType: 'system',
         actorName: '云端弹性调度器',
@@ -12873,6 +12893,8 @@ export async function reconcileElasticCaptureLeases(input = 50) {
           parentTaskId: candidate.parent_task_id,
           offlineTimeoutMinutes: ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
           timeoutCode,
+          serverLeaseRevoked: agentOffline,
+          sourceLocalClosureProven: localClosureProof.proven === true,
         },
       });
       return 'requeued';
