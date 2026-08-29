@@ -690,16 +690,26 @@ export function allocateKeywordWorkItems({
   return {items, groups};
 }
 
-function explicitSafetyBlock(entry) {
+function checkpointEntryErrorCode(entry) {
   const source = object(entry);
   const error = object(source.error);
-  const errorCode = text(
+  return text(
     source.errorCode ||
     source.error_code ||
     error.code,
     100,
   ).toUpperCase();
-  if (errorCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL') {
+}
+
+function explicitSafetyBlock(entry) {
+  const source = object(entry);
+  const error = object(source.error);
+  const errorCode = checkpointEntryErrorCode(source);
+  if ([
+    'DOUYIN_SEARCH_SERVICE_ABNORMAL',
+    'SEARCH_FILTER_APPLICATION_FAILED',
+    'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
+  ].includes(errorCode)) {
     return false;
   }
   return (
@@ -722,8 +732,9 @@ function explicitSafetyBlock(entry) {
  * Project one extension keyword checkpoint entry onto a server item status.
  * Protective-stop handling only trusts explicit structured evidence;
  * error-message text is never classified as a platform restriction. Douyin's
- * service-abnormal state is a retryable per-keyword search failure. Its exact
- * code also downgrades legacy Extension snapshots that carried old stop flags.
+ * service-abnormal state is the platform's empty-search rendering in this
+ * workflow. Its exact structured code settles only that keyword as a zero-row
+ * success; it must not consume a relay attempt or freeze an account.
  */
 export function checkpointEntryToItemStatus(
   entry = {},
@@ -733,6 +744,9 @@ export function checkpointEntryToItemStatus(
   const rawStatus = text(source.status, 80)
     .toLowerCase()
     .replace(/[\s-]+/gu, '_');
+  if (checkpointEntryErrorCode(source) === 'DOUYIN_SEARCH_SERVICE_ABNORMAL') {
+    return 'completed';
+  }
   if (explicitSafetyBlock(source)) return 'needs_action';
 
   const aliases = {

@@ -913,7 +913,10 @@ export function OrchestrationDetailWorkspace({
 
   const resumeAttentionSource = async () => {
     if (!attentionContext || !writable || attentionAction) return
-    if (!window.confirm('请确认已经在当前 Agent 的平台页面完成人工验证。确认后将从未完成位置继续，并保留此前结果。')) return
+    const verificationConfirmation = elasticPool
+      ? '请确认已经在原 Agent 的平台页面完成人工验证。确认后只解除该账号冷却；受阻关键词仍由其它空闲 Agent 接力，不会重开旧任务。'
+      : '请确认已经在当前 Agent 的平台页面完成人工验证。确认后将从未完成位置继续，并保留此前结果。'
+    if (!window.confirm(verificationConfirmation)) return
     setAttentionAction('resume')
     setActionFeedback('')
     setActionError('')
@@ -922,11 +925,15 @@ export function OrchestrationDetailWorkspace({
         `/capture-cloud/tasks/${attentionContext.sourceTaskId}/resume`,
         { mode: 'remaining' },
       )
-      setActionFeedback(result.message || '已向当前 Agent 发送继续剩余关键词指令')
+      setActionFeedback(result.message || (elasticPool
+        ? '原账号冷却已解除，受阻关键词继续由其它 Agent 接力'
+        : '已向当前 Agent 发送继续剩余关键词指令'))
       await load(true)
       await onChanged?.()
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : '发送继续指令失败')
+      setActionError(err instanceof Error ? err.message : (elasticPool
+        ? '解除账号冷却失败'
+        : '发送继续指令失败'))
     } finally {
       setAttentionAction('')
     }
@@ -1403,7 +1410,9 @@ export function OrchestrationDetailWorkspace({
                       {attentionAction === 'resume'
                         ? <Loader2 className="h-4 w-4 animate-spin" />
                         : <Play className="h-4 w-4" />}
-                      验证完成，当前 Agent 继续
+                      {elasticPool
+                        ? '验证完成，解除账号冷却'
+                        : '验证完成，当前 Agent 继续'}
                     </Button>
                   )}
                   {!attentionContext.sourceFinal && (

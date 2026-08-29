@@ -352,14 +352,10 @@ test('search-challenge handoff is counted independently without blocking the ela
   );
   assert.match(projection, /safetyHandoffCount = 0/u);
   assert.match(projection, /sourceLocalClosureProven = false/u);
-  assert.match(
-    projection,
-    /Number\(safetyHandoffCount\)[\s\S]*ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS/u,
-  );
-  assert.doesNotMatch(
-    projection,
-    /normalizedAttemptCount <= ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS/u,
-  );
+  assert.match(projection, /agentAttemptLimit/u);
+  assert.match(projection, /normalizedAttemptCount >= normalizedAttemptLimit/u);
+  assert.match(projection, /A challenge belongs to the source account\/session/u);
+  assert.doesNotMatch(projection, /ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS/u);
 
   const elasticClaim = readRouteSection(
     'async function dispatchNextElasticWorkItem',
@@ -551,6 +547,20 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
   }), "needs_action");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
+    status: 'needs_action',
+    error: safety,
+    attemptCount: 2,
+    agentAttemptLimit: 6,
+  }), 'retryable', 'one challenged account must not freeze the keyword');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'needs_action',
+    error: safety,
+    attemptCount: 6,
+    agentAttemptLimit: 6,
+  }), 'needs_action', 'all distinct candidate accounts bound the relay');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
     status: "needs_action",
     error: safety,
     attemptCount: 99,
@@ -582,7 +592,8 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     attemptCount: 0,
     technicalLimitReached: true,
-  }), "needs_action");
+    agentAttemptLimit: 6,
+  }), "retryable");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: false,
     status: "needs_action",
@@ -600,7 +611,20 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "retryable",
     error: safety,
     updated_at: "2026-08-12T01:50:00.000Z",
-  }, now), 20 * 60_000);
+  }, now), 0);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: safety,
+    updated_at: "2026-08-12T01:58:00.000Z",
+  }, now), 3 * 60_000);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: safety,
+    checkpoint: {
+      recovery: {operatorHoldReleasedAt: "2026-08-12T01:59:00.000Z"},
+    },
+    updated_at: "2026-08-12T01:59:30.000Z",
+  }, now), 0, "operator verification must clear the source account hold");
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
@@ -699,7 +723,12 @@ test("elastic queue does not spend business retries on local capacity or dispatc
     status: "retryable",
     error: {code: "capture_task_group_busy"},
     updated_at: "2026-08-13T01:45:00.000Z",
-  }, now), 15 * 60_000);
+  }, now), 0);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "capture_task_group_busy"},
+    updated_at: "2026-08-13T01:58:00.000Z",
+  }, now), 3 * 60_000);
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: {code: "elastic_task_heartbeat_timeout"},
@@ -1598,6 +1627,24 @@ test("orchestration checkpoint projection never reopens a terminal activeKeyword
   );
 });
 
+test("Douyin service-abnormal settles only the active keyword as an explicit empty result", () => {
+  const projection = readRouteSection(
+    "async function projectOrchestrationSnapshot",
+    "export async function mirrorTaskSnapshot",
+  );
+  assert.match(projection, /DOUYIN_SEARCH_SERVICE_ABNORMAL/u);
+  assert.match(projection, /keywordServiceAbnormal \? 'completed'/u);
+  assert.match(projection, /resultKind: 'no_search_results'/u);
+  assert.match(projection, /'noResults', \$12::boolean/u);
+  assert.match(projection, /activeUnresolvedStatus = childServiceAbnormalSettlesEmpty[\s\S]*\? 'completed'/u);
+  assert.match(projection, /released_after_prior_keyword_no_results/u);
+  assert.doesNotMatch(
+    projection,
+    /baseUnresolvedStatus = childServiceAbnormalSettlesEmpty\s*\? 'completed'/u,
+    "one empty keyword must not falsely complete untouched siblings",
+  );
+});
+
 test("sequential Douyin checkpoints retain both passes and resume only the unfinished pass", () => {
   const runningEntries = orchestrationCheckpointEntries({
     status: "running",
@@ -1844,6 +1891,14 @@ test("handoff metadata survives agent snapshots and fences resume on the source 
   assert.match(resume, /task\.metadata\?\.handoffSuccessorTaskId/u);
   assert.match(resume, /task_handed_off/u);
   assert.match(resume, /后续关键词已经转交其他 Agent/u);
+  assert.match(resume, /releasedSafetyAttempts/u);
+  assert.match(resume, /source_account_verification_confirmed/u);
+  assert.match(resume, /operatorHoldReleasedAt/u);
+  assert.match(resume, /source_agent_hold_released/u);
+  assert.ok(
+    resume.indexOf('releasedSafetyAttempts') < resume.indexOf('const existing'),
+    "verification must clear the source hold before a stale resume command can short-circuit it",
+  );
 });
 
 test("server-owned local closure metadata survives snapshots without Agent injection", () => {
@@ -1923,6 +1978,16 @@ test("keyword reuse gets one bounded quiescence even when closure proof is missi
   assert.match(
     reuseGate,
     /terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)/u,
+  );
+  assert.match(
+    reuseGate,
+    /GREATEST\(execution\.updated_at, attempt\.updated_at\)/u,
+    "legacy terminal states without finished_at must age out of reuse fencing",
+  );
+  assert.match(
+    reuseGate,
+    /terminal_at DESC NULLS LAST/u,
+    "missing terminal timestamps must never sort ahead forever",
   );
   assert.match(
     reuseGate,
@@ -2604,7 +2669,9 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /const attemptBudget[\s\S]*candidate\.attempt_budget_used/u);
   assert.match(claim, /attempt_count = \$1[\s\S]*attemptNumber,[\s\S]*attemptBudget/u);
   assert.match(claim, /elasticAttemptBudgetUsed/u);
-  assert.match(claim, /item\.attempt_count < \$3/u);
+  assert.match(claim, /item\.attempt_count < agent_policy\.agent_attempt_limit/u);
+  assert.match(claim, /COUNT\(DISTINCT configured_agent_id\)/u);
+  assert.match(claim, /CROSS JOIN LATERAL/u);
   assert.match(claim, /freshCapabilities\.singleRelayV1 === true/u);
   assert.match(claim, /freshCapabilities\.localClosureReuseFenceV1 === true/u);
   assert.match(
@@ -2710,8 +2777,11 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /assignment_revision = \$5/u);
   assert.match(claim, /execution_task_id = \$4/u);
   assert.match(claim, /INSERT INTO capture_task_item_attempts/u);
-  assert.match(claim, /classifyCaptureRecoveryDisposition/u);
-  assert.match(claim, /'manual_current'/u);
+  assert.doesNotMatch(
+    claim,
+    /unresolvedSafetyItem/u,
+    "one challenged keyword must not quarantine the entire source Agent",
+  );
   assert.match(claim, /elasticRecoveryHoldRemainingMs\(recentRecoveryAttempt\)/u);
   assert.match(
     claim,
@@ -2761,7 +2831,9 @@ test("elastic recovery releases the item immediately while cooling only the sour
   assert.match(recovery, /state: 'released_for_handoff'/u);
   assert.match(recovery, /handoffReadyAt/u);
   assert.match(recovery, /itemLockReleased: true/u);
-  assert.match(recovery, /sourceAgentCooling: true/u);
+  assert.match(recovery, /sourceAgentCooling: !operatorHoldReleased/u);
+  assert.match(recovery, /previousRecovery\.queuedAt/u);
+  assert.match(recovery, /operatorHoldReleasedAt/u);
   assert.match(recovery, /cooldownHomeRestored/u);
   assert.match(recovery, /cooldownHomeUrl/u);
   assert.match(recovery, /sourceAgentHoldUntil/u);

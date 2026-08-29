@@ -55,6 +55,7 @@ test('admin waits visibly, retries one safety challenge across Agents, and escal
   assert.match(orchestration, /login\[_ -\]\?required/u)
   assert.match(orchestration, /requiresManualAction/u)
   assert.match(orchestration, /验证完成，当前 Agent 继续/u)
+  assert.match(orchestration, /验证完成，解除账号冷却/u)
   assert.match(orchestration, /结束并保留/u)
   assert.match(orchestration, /系统正在按词分配后续/u)
   assert.match(orchestration, /其他未开始关键词仍会自动分配/u)

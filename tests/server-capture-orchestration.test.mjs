@@ -449,7 +449,7 @@ test('checkpoint mapping is retry-aware and requires structured safety evidence'
       attemptCount: 1,
       errorCode: 'DOUYIN_SEARCH_SERVICE_ABNORMAL',
     }),
-    'retryable',
+    'completed',
   );
   assert.equal(
     checkpointEntryToItemStatus({
@@ -458,8 +458,28 @@ test('checkpoint mapping is retry-aware and requires structured safety evidence'
       errorCode: 'DOUYIN_SEARCH_SERVICE_ABNORMAL',
       requiresManualAction: true,
     }),
+    'completed',
+    'the exact service-abnormal rendering settles as an empty search result',
+  );
+  assert.equal(
+    checkpointEntryToItemStatus({
+      status: 'failed',
+      attemptCount: 1,
+      errorCode: 'SEARCH_FILTER_APPLICATION_FAILED',
+      requiresManualAction: true,
+    }),
     'retryable',
-    'legacy service-abnormal flags must be downgraded after the behavior change',
+    'filter setup is a technical retry and never an account safety freeze',
+  );
+  assert.equal(
+    checkpointEntryToItemStatus({
+      status: 'failed',
+      attemptCount: 1,
+      errorCode: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
+      requiresManualAction: true,
+    }),
+    'retryable',
+    'search readiness remains retryable on another distinct Agent',
   );
   assert.equal(
     checkpointEntryToItemStatus({
