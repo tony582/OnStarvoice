@@ -676,7 +676,9 @@ function MobileRecordDetail({
   onOpenWorkbench?: () => void
 }) {
   const grouped = useMemo(() => groupMobileColumns(columns.filter(column => column.key !== 'attachments')), [columns])
-  const originalUrl = mobileOriginalUrl(row, table)
+  const sourceRecord = mobileSourceRecord(row, table)
+  const originalUrl = table === 'blogger_profiles' ? mobileOriginalUrl(row, table) : ''
+  const hasSourceAction = table !== 'blogger_profiles' && hasRecordSource(sourceRecord)
   const hasAttachments = MEDIA_TABLES.has(table) && buildRecordMediaTasks(row).length > 0
 
   return (
@@ -747,12 +749,18 @@ function MobileRecordDetail({
               打开原文 <ExternalLink className="h-4 w-4" />
             </a>
           )}
+          {hasSourceAction && (
+            <RecordSourceAction
+              record={sourceRecord}
+              className="h-11 flex-1 justify-center rounded-xl bg-primary px-3 text-sm font-bold !text-primary-foreground hover:!no-underline"
+            />
+          )}
           {onOpenWorkbench && (
             <button type="button" onClick={onOpenWorkbench} className="inline-flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl bg-primary px-3 text-sm font-bold text-primary-foreground">
               去处理 <ArrowRight className="h-4 w-4" />
             </button>
           )}
-          {!hasAttachments && !originalUrl && !onOpenWorkbench && (
+          {!hasAttachments && !originalUrl && !hasSourceAction && !onOpenWorkbench && (
             <button type="button" onClick={onClose} className="h-11 w-full rounded-xl bg-primary text-sm font-bold text-primary-foreground">返回记录列表</button>
           )}
         </div>
@@ -823,8 +831,16 @@ function mobileRecordStats(row: any, table: TableKey) {
 
 function mobileOriginalUrl(row: any, table: TableKey) {
   if (table === 'blogger_profiles') return String(firstValue(authorHomepage(row), row.url))
-  if (table === 'comment_leads') return String(firstValue(row.record_url, row.url))
-  return resolveRecordOriginalUrl(row) || String(row.record_url || '')
+  return resolveRecordOriginalUrl(mobileSourceRecord(row, table))
+}
+
+function mobileSourceRecord(row: any, table: TableKey) {
+  if (table !== 'comment_leads') return row
+  return {
+    ...row,
+    id: row.record_id,
+    url: firstValue(row.record_url, row.url),
+  }
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -1875,12 +1891,15 @@ function linkCell(url: unknown, label: string) {
   )
 }
 
-function recordSourceCell(record: any) {
+function hasRecordSource(record: any) {
   const platform = String(record?.platform || '').trim().toLowerCase()
   const hasXhsUrl = [record?.url, record?.canonical_url]
     .some(url => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(url || '').replace(/^https?:\/\//iu, '')))
-  const hasSource = platform === 'xiaohongshu' || hasXhsUrl || Boolean(resolveRecordOriginalUrl(record))
-  if (!hasSource) return <span className="text-muted-foreground">-</span>
+  return platform === 'xiaohongshu' || hasXhsUrl || Boolean(resolveRecordOriginalUrl(record))
+}
+
+function recordSourceCell(record: any) {
+  if (!hasRecordSource(record)) return <span className="text-muted-foreground">-</span>
   return (
     <RecordSourceAction
       record={record}

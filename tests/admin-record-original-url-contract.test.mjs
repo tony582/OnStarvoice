@@ -37,6 +37,9 @@ test('all record-centric admin surfaces avoid stale Xiaohongshu hrefs', () => {
     'web/admin/src/pages/monitoring/OfficialCommentPatrolTab.tsx',
     'web/admin/src/pages/OpinionAnalysisPage.tsx',
     'web/admin/src/pages/insights/DashboardTab.tsx',
+    'web/admin/src/pages/workbench/LeadsQueue.tsx',
+    'web/admin/src/components/shared/CommentLeadDrawer.tsx',
+    'web/admin/src/components/shared/TicketDrawer.tsx',
   ];
 
   for (const path of paths) {
@@ -44,6 +47,22 @@ test('all record-centric admin surfaces avoid stale Xiaohongshu hrefs', () => {
     assert.match(adminSurface, /RecordSourceAction/, path);
     assert.doesNotMatch(adminSurface, /href=\{(?:hit|post|record|r|it)\.url\}/, path);
   }
+
+  const leads = source('web/admin/src/pages/workbench/LeadsQueue.tsx');
+  const commentLeadDrawer = source('web/admin/src/components/shared/CommentLeadDrawer.tsx');
+  const ticketDrawer = source('web/admin/src/components/shared/TicketDrawer.tsx');
+  const data = source('web/admin/src/pages/DataPage.tsx');
+  assert.doesNotMatch(leads, /href=\{lead\.record_url\}/);
+  assert.match(leads, /id: lead\.record_id, platform: lead\.platform, url: lead\.record_url/);
+  assert.doesNotMatch(commentLeadDrawer, /href=\{lead\.record_url\}/);
+  assert.match(commentLeadDrawer, /id: lead\.record_id, platform: lead\.platform, url: lead\.record_url/);
+  assert.doesNotMatch(ticketDrawer, /href=\{postUrl\}/);
+  assert.match(ticketDrawer, /id: rec\?\.id \|\| t\.source_record_id \|\| cmt\?\.record_id/);
+  assert.match(data, /const sourceRecord = mobileSourceRecord\(row, table\)/);
+  assert.match(data, /<RecordSourceAction[\s\S]*record=\{sourceRecord\}/);
+  assert.match(data, /id: row\.record_id/);
+  assert.doesNotMatch(data, /return String\(firstValue\(row\.record_url, row\.url\)\)/);
+  assert.doesNotMatch(data, /resolveRecordOriginalUrl\(row\) \|\| String\(row\.record_url \|\| ''\)/);
 });
 
 test('admin workbench distinguishes titleless Xiaohongshu notes from failed detail placeholders', () => {
