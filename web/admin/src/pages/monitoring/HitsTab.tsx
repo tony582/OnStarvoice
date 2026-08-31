@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
 const RANGE_OPTIONS = [
   { value: 'today', label: '今日' },
@@ -26,6 +27,14 @@ const PLATFORM_OPTIONS = [
 
 function interaction(row: any) {
   return Number(row.likes || 0) + Number(row.comments_count || 0) + Number(row.collects || 0) + Number(row.shares || 0)
+}
+
+function sourceRecord(row: any) {
+  return { ...row, id: row.record_id || row.id }
+}
+
+function hasSourceAction(row: any) {
+  return String(row?.platform || '').trim().toLowerCase() === 'xiaohongshu' || Boolean(row?.url)
 }
 
 export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }) {
@@ -203,7 +212,7 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
                         <Button
                           variant="outline"
                           size="sm"
-                          className={hit.url ? 'w-full' : 'col-span-2 w-full'}
+                          className={hasSourceAction(hit) ? 'w-full' : 'col-span-2 w-full'}
                           aria-expanded={expanded}
                           aria-controls={`monitor-hit-${hitId}`}
                           onClick={() => setExpandedHitId(expanded ? '' : hitId)}
@@ -211,15 +220,11 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
                           详情
                           <ChevronDown className={`h-4 w-4 transition-transform ${expanded ? 'rotate-180' : ''}`} />
                         </Button>
-                        {hit.url && (
-                          <a
-                            href={hit.url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex h-10 touch-manipulation items-center justify-center gap-2 rounded-lg bg-primary px-3.5 text-xs font-medium text-primary-foreground transition-colors active:bg-primary/90"
-                          >
-                            查看原文 <ExternalLink className="h-3.5 w-3.5" />
-                          </a>
+                        {hasSourceAction(hit) && (
+                          <RecordSourceAction
+                            record={sourceRecord(hit)}
+                            className="h-10 touch-manipulation justify-center gap-2 rounded-lg bg-primary px-3.5 text-xs font-medium text-primary-foreground no-underline transition-colors hover:no-underline active:bg-primary/90"
+                          />
                         )}
                       </div>
                     </div>
@@ -253,10 +258,8 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
                       <div className="flex flex-wrap items-center gap-2">
                         <StatusBadge tone="neutral">{platformName(hit.platform)}</StatusBadge>
                         <StatusBadge tone="muted">{LABELS.recordType[hit.record_type] || hit.record_type || '内容'}</StatusBadge>
-                        {hit.url && (
-                          <a href={hit.url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline">
-                            原文 <ExternalLink className="h-3 w-3" />
-                          </a>
+                        {hasSourceAction(hit) && (
+                          <RecordSourceAction record={sourceRecord(hit)} compact className="text-xs font-semibold" />
                         )}
                       </div>
                       <div className="mt-2 font-medium leading-5">{hit.title || compact(hit.content || '', 80) || '(无标题)'}</div>
@@ -323,7 +326,7 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function MobileHitDetail({ hit, onClose }: { hit: any; onClose: () => void }) {
   const title = hit.title || compact(hit.content || '', 80) || '(无标题)'
-  const hasFooterAction = Boolean(hit.url || hit.monitor_account_url)
+  const hasFooterAction = Boolean(hasSourceAction(hit) || hit.monitor_account_url)
 
   return (
     <section
@@ -394,14 +397,15 @@ function MobileHitDetail({ hit, onClose }: { hit: any; onClose: () => void }) {
       {hasFooterAction && (
         <footer className="grid shrink-0 grid-cols-2 gap-2.5 border-t border-border/70 bg-background px-4 pt-3 pb-[max(env(safe-area-inset-bottom),0.75rem)]">
           {hit.monitor_account_url ? (
-            <a href={hit.monitor_account_url} target="_blank" rel="noreferrer" className={`inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-border bg-card px-3 text-xs font-semibold text-foreground ${hit.url ? '' : 'col-span-2'}`}>
+            <a href={hit.monitor_account_url} target="_blank" rel="noreferrer" className={`inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-border bg-card px-3 text-xs font-semibold text-foreground ${hasSourceAction(hit) ? '' : 'col-span-2'}`}>
               关注对象主页 <ExternalLink className="h-3.5 w-3.5" />
             </a>
           ) : null}
-          {hit.url && (
-            <a href={hit.url} target="_blank" rel="noreferrer" className={`inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-primary px-3 text-xs font-semibold text-primary-foreground ${hit.monitor_account_url ? '' : 'col-span-2'}`}>
-              查看原文 <ExternalLink className="h-3.5 w-3.5" />
-            </a>
+          {hasSourceAction(hit) && (
+            <RecordSourceAction
+              record={sourceRecord(hit)}
+              className={`h-11 justify-center gap-2 rounded-lg bg-primary px-3 text-xs font-semibold text-primary-foreground no-underline hover:no-underline ${hit.monitor_account_url ? '' : 'col-span-2'}`}
+            />
           )}
         </footer>
       )}

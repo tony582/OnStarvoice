@@ -13,7 +13,8 @@ import {
   resolveTenantMonitoringScope,
 } from './monitoring-intent.js';
 
-export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v3';
+export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v4';
+export const PREFILTER_DETAIL_PROMPT_VERSION = 'prefilter-detail-v1';
 export const PREFILTER_PROVIDER = 'deepseek';
 export const PREFILTER_MAX_LIST_BATCH = 40;
 export const PREFILTER_MIN_SKIP_THRESHOLD = 0.97;
@@ -22,11 +23,15 @@ export const PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD = 0.95;
 export const PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH = 0.05;
 export const PREFILTER_DEFAULT_MODEL_TIMEOUT_MS = 20000;
 export const PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS = 5000;
+export const PREFILTER_FAIL_OPEN_SAMPLE_RATE = 0.1;
+export const PREFILTER_FAIL_OPEN_SAMPLE_MAX = 3;
+export const PREFILTER_DEFER_MINUTES = 15;
 
 const VALID_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
 const VALID_MODES = new Set(['disabled', 'shadow', 'conservative']);
 const VALID_DECISIONS = new Set(['keep', 'skip', 'need_detail']);
 const VALID_TENANT_RELEVANCE = new Set(['relevant', 'irrelevant', 'uncertain']);
+const VALID_STAGES = new Set(['list', 'detail']);
 const MODE_RANK = { disabled: 0, shadow: 1, conservative: 2 };
 const PROTECTED_MONITORING_SIGNAL_PATTERN = /(?:安吉星|onstar|紧急(?:救援|求助)|道路救援|\bsos\b|远程(?:启动|控制|解锁|上锁|空调)?.{0,8}(?:失败|失效|不能|无法|用不了|没反应|故障|异常)|客服.{0,8}(?:投诉|误导|不处理|不解决)|续费.{0,8}(?:投诉|误导|收费|争议|贵|坑|不续)|一生黑)/iu;
 
@@ -104,7 +109,7 @@ function normalizeIntent(raw, keywordHash) {
   };
 }
 
-function sanitizeListItem(raw, index) {
+function sanitizeListItem(raw, index, stage = 'list') {
   const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const itemId = boundedText(source.itemId, 256);
   const item = {
@@ -114,10 +119,22 @@ function sanitizeListItem(raw, index) {
     author: boundedText(source.author, 200),
     noteType: boundedText(source.noteType, 40),
     publishTime: boundedText(source.publishTime, 100),
+    ...(stage === 'detail'
+      ? {
+          content: boundedText(source.content, 5000),
+          tags: boundedStringArray(source.tags, {maxItems: 30, maxLength: 100}),
+          ocrText: boundedText(source.ocrText, 3000),
+          transcript: boundedText(source.transcript, 4000),
+        }
+      : {}),
   };
   if (!item.externalId && itemId.includes(':')) item.externalId = itemId.slice(itemId.indexOf(':') + 1);
-  item.inputValid = Boolean(item.title || item.author);
-  item.inputError = item.inputValid ? '' : `第 ${index + 1} 项缺少可判断的标题和作者`;
+  item.inputValid = stage === 'detail'
+    ? Boolean(item.title || item.author || item.content || item.tags.length || item.ocrText || item.transcript)
+    : Boolean(item.title || item.author);
+  item.inputError = item.inputValid
+    ? ''
+    : `第 ${index + 1} 项缺少可判断的${stage === 'detail' ? '最小详情' : '标题和作者'}`;
   return item;
 }
 
@@ -130,18 +147,30 @@ export function validatePrefilterRequest(body = {}) {
   const platform = normalizePlatform(body.platform);
   const stage = boundedText(body.stage || 'list', 20).toLowerCase();
   const keyword = normalizePrefilterKeyword(body.keyword);
-  const requestedPromptVersion = boundedText(body.promptVersion || PREFILTER_PROMPT_VERSION, 100);
+  const requestedPromptVersion = boundedText(
+    body.promptVersion || (
+      stage === 'detail'
+        ? PREFILTER_DETAIL_PROMPT_VERSION
+        : PREFILTER_PROMPT_VERSION
+    ),
+    100,
+  );
   const requestedModeRaw = boundedText(body.mode || 'shadow', 30).toLowerCase();
 
   if (!requestId) return { ok: false, status: 400, error: 'REQUEST_ID_REQUIRED', message: '缺少 requestId' };
   if (!idempotencyKey) return { ok: false, status: 400, error: 'IDEMPOTENCY_KEY_REQUIRED', message: '缺少 idempotencyKey' };
   if (!VALID_PLATFORMS.has(platform)) return { ok: false, status: 422, error: 'INVALID_PLATFORM', message: '仅支持小红书和抖音' };
-  if (stage !== 'list') return { ok: false, status: 422, error: 'UNSUPPORTED_STAGE', message: '第一期仅支持 list 文字判断' };
+  if (!VALID_STAGES.has(stage)) return { ok: false, status: 422, error: 'UNSUPPORTED_STAGE', message: '仅支持 list 或 detail 相关性判断' };
   if (!keyword) return { ok: false, status: 422, error: 'KEYWORD_REQUIRED', message: '缺少搜索关键词' };
-  if (!['prefilter-list-v1', 'prefilter-list-v2', PREFILTER_PROMPT_VERSION].includes(requestedPromptVersion)) {
+  const allowedPromptVersions = stage === 'detail'
+    ? [PREFILTER_DETAIL_PROMPT_VERSION]
+    : ['prefilter-list-v1', 'prefilter-list-v2', 'prefilter-list-v3', PREFILTER_PROMPT_VERSION];
+  if (!allowedPromptVersions.includes(requestedPromptVersion)) {
     return { ok: false, status: 409, error: 'PROMPT_VERSION_CONFLICT', message: '前置筛选提示词版本不匹配' };
   }
-  const promptVersion = PREFILTER_PROMPT_VERSION;
+  const promptVersion = stage === 'detail'
+    ? PREFILTER_DETAIL_PROMPT_VERSION
+    : PREFILTER_PROMPT_VERSION;
   if (!VALID_MODES.has(requestedModeRaw)) {
     return { ok: false, status: 422, error: 'INVALID_MODE', message: '筛选模式无效' };
   }
@@ -152,7 +181,7 @@ export function validatePrefilterRequest(body = {}) {
     return { ok: false, status: 413, error: 'BATCH_TOO_LARGE', message: `列表批次最多 ${PREFILTER_MAX_LIST_BATCH} 条` };
   }
 
-  const items = body.items.map(sanitizeListItem);
+  const items = body.items.map((item, index) => sanitizeListItem(item, index, stage));
   if (items.some(item => !item.itemId)) {
     return { ok: false, status: 422, error: 'ITEM_ID_REQUIRED', message: '每一项都必须提供 itemId' };
   }
@@ -213,6 +242,10 @@ export function contentSummaryHash(item) {
     author: item.author,
     noteType: item.noteType,
     publishTime: item.publishTime,
+    content: item.content || '',
+    tags: item.tags || [],
+    ocrText: item.ocrText || '',
+    transcript: item.transcript || '',
   }));
 }
 
@@ -278,7 +311,14 @@ async function resolvePrefilterPolicy(tenantId, request) {
 }
 
 export function hasProtectedMonitoringSignal(item = {}) {
-  return PROTECTED_MONITORING_SIGNAL_PATTERN.test(`${item.title || ''} ${item.author || ''}`);
+  return PROTECTED_MONITORING_SIGNAL_PATTERN.test([
+    item.title,
+    item.author,
+    item.content,
+    ...(Array.isArray(item.tags) ? item.tags : []),
+    item.ocrText,
+    item.transcript,
+  ].filter(Boolean).join(' '));
 }
 
 export function determineExecutionDisposition({
@@ -289,10 +329,12 @@ export function determineExecutionDisposition({
   brandMatch,
   confidence,
   protectedSignal = false,
+  stage = 'list',
 }, policy) {
-  if (status !== 'ok') return 'collect_full';
+  const effectiveStage = VALID_STAGES.has(stage) ? stage : (policy?.stage || 'list');
   if (policy.effectiveMode !== 'conservative') return 'collect_full';
   if (protectedSignal) return 'collect_full';
+  if (status !== 'ok') return 'defer_enhancement';
   const numericQueryMatch = normalizeScore(queryMatch);
   const numericBrandMatch = normalizeScore(brandMatch);
   const numericConfidence = normalizeScore(confidence);
@@ -317,6 +359,13 @@ export function determineExecutionDisposition({
     && numericConfidence !== null
     && numericConfidence >= policy.skipThreshold
   ) return 'skip_full_capture';
+  if (
+    effectiveStage === 'list'
+    && (
+      modelDecision === 'need_detail'
+      || tenantRelevance === 'uncertain'
+    )
+  ) return 'collect_minimal_detail';
   return 'collect_full';
 }
 
@@ -324,8 +373,15 @@ export function buildPrefilterSystemPrompt(
   brand = {},
   intent = {},
   tenantScope = resolveTenantMonitoringScope(brand),
+  stage = 'list',
 ) {
+  const evidenceDescription = stage === 'detail'
+    ? '你收到的是已读取正文后的最小详情包（标题、正文、标签、作者、时间，以及已有的 OCR/口播文本），本轮结论是最终判断。'
+    : '你收到的是搜索列表文字；证据不足时必须请求最小详情，本轮结论是暂定判断。';
   return `你是采集前的双维度相关性筛选器。你必须分别判断“当前搜索词是否匹配”和“是否属于租户整体监控范围”，两者不能互相覆盖。
+
+判断阶段：${stage}
+${evidenceDescription}
 
 租户品牌：${brand.brandName || '未配置'}
 品牌别名：${(brand.brandAliases || []).join('、') || '无'}
@@ -353,7 +409,7 @@ ${formatMonitoringIntentForPrompt(intent)}
 3. 内容命中任一其它监测关键词或主题时，即使当前 decision=skip，tenantRelevance 也必须是 relevant 或 uncertain。
 4. 安吉星、紧急/道路救援、远程控制故障、客服投诉、续费争议等风险线索必须保守采集，不得仅因当前搜索词不匹配而判整体无关。
 5. 人名、地名、谐音、租户范围外的其它品牌、泛词巧合命中可判 decision=skip 且 tenantRelevance=irrelevant。
-6. 标题是兜底标题、只有封面可能含证据、视频依赖画面或口播时必须 need_detail，tenantRelevance 至少 uncertain。
+6. ${stage === 'detail' ? '已经提供最小详情后，仍有明确证据缺口时可以 need_detail，但不得把明确相关内容误判为无关。' : '标题是兜底标题、只有封面可能含证据、视频依赖画面或口播时必须 need_detail，tenantRelevance 至少 uncertain。'}
 7. 证据不足时必须 need_detail，禁止为了提高跳过率猜测。
 8. 每个输入 itemId 必须恰好输出一次；不得输出未知 itemId。
 9. 只输出 JSON 对象，不要 Markdown 或解释性前后缀。
@@ -373,7 +429,24 @@ export function buildPrefilterUserMessage(request) {
     intent: request.intent,
     items: request.items
       .filter(item => item.inputValid)
-      .map(({ itemId, title, author, noteType, publishTime }) => ({ itemId, title, author, noteType, publishTime })),
+      .map((item) => {
+        const base = {
+          itemId: item.itemId,
+          title: item.title,
+          author: item.author,
+          noteType: item.noteType,
+          publishTime: item.publishTime,
+        };
+        return request.stage === 'detail'
+          ? {
+              ...base,
+              content: item.content,
+              tags: item.tags,
+              ocrText: item.ocrText,
+              transcript: item.transcript,
+            }
+          : base;
+      }),
   });
 }
 
@@ -391,20 +464,67 @@ function failOpenItem(item, status, reason, policy) {
     status,
     modelDecision: null,
     tenantRelevance: null,
-    decisionFinality: 'provisional',
+    decisionFinality: policy?.stage === 'detail' ? 'final' : 'provisional',
     queryMatch: null,
     brandMatch: null,
     confidence: null,
     reason: boundedText(reason, 1000) || 'AI 判断不可用，已按安全策略继续采集',
     evidence: [],
     missingSignals: [],
-    executionDisposition: 'collect_full',
+    executionDisposition: 'defer_enhancement',
     failOpen: true,
     protectedSignal: hasProtectedMonitoringSignal(item),
     cacheHit: false,
   };
-  result.executionDisposition = determineExecutionDisposition(result, policy);
+  result.executionDisposition = determineExecutionDisposition(
+    {...result, stage: policy?.stage || 'list'},
+    policy,
+  );
   return result;
+}
+
+export function applyBoundedFailOpenSampling(items = []) {
+  let sampled = 0;
+  return (Array.isArray(items) ? items : []).map((item) => {
+    if (
+      item?.executionDisposition !== 'defer_enhancement'
+      || item?.protectedSignal === true
+      || sampled >= PREFILTER_FAIL_OPEN_SAMPLE_MAX
+    ) return item;
+    const bucket = Number.parseInt(sha256(item.itemId).slice(0, 8), 16) % 10000;
+    if (bucket >= PREFILTER_FAIL_OPEN_SAMPLE_RATE * 10000) return item;
+    sampled += 1;
+    return {
+      ...item,
+      executionDisposition: 'collect_full',
+      sampledFullCapture: true,
+      reason: `${item.reason}；命中 ${Math.round(PREFILTER_FAIL_OPEN_SAMPLE_RATE * 100)}% 降级抽样，继续完整采集`,
+    };
+  });
+}
+
+export function projectRelevanceDisposition(result = {}, stage = 'list') {
+  const disposition = boundedText(result.executionDisposition, 80).toLowerCase();
+  if (disposition === 'skip_full_capture') {
+    return {
+      businessVisibility: 'filtered_out',
+      enhancementState: 'skipped',
+      deferredUntilMinutes: 0,
+    };
+  }
+  if (disposition === 'defer_enhancement') {
+    return {
+      businessVisibility: 'deferred',
+      enhancementState: 'deferred',
+      deferredUntilMinutes: PREFILTER_DEFER_MINUTES,
+    };
+  }
+  return {
+    businessVisibility: 'eligible',
+    enhancementState:
+      stage === 'detail' ? 'minimal_captured' : 'not_started',
+    deferredUntilMinutes: 0,
+  };
 }
 
 function normalizeOneModelItem(item, raw, policy) {
@@ -433,7 +553,7 @@ function normalizeOneModelItem(item, raw, policy) {
     status: 'ok',
     modelDecision: decision,
     tenantRelevance,
-    decisionFinality: 'provisional',
+    decisionFinality: policy?.stage === 'detail' ? 'final' : 'provisional',
     queryMatch,
     brandMatch,
     confidence,
@@ -445,7 +565,10 @@ function normalizeOneModelItem(item, raw, policy) {
     failOpen: false,
     cacheHit: false,
   };
-  result.executionDisposition = determineExecutionDisposition(result, policy);
+  result.executionDisposition = determineExecutionDisposition(
+    {...result, stage: policy?.stage || 'list'},
+    policy,
+  );
   return result;
 }
 
@@ -620,6 +743,19 @@ async function persistPrefilterOutcome({
   await withTransaction(async tx => {
     for (const [index, result] of response.items.entries()) {
       const sourceItem = request.items[index];
+      const projection = projectRelevanceDisposition(result, request.stage);
+      const parentDecision = request.stage === 'detail'
+        ? await tx.queryOne(`
+            SELECT id
+            FROM relevance_prefilter_decisions
+            WHERE tenant_id = $1
+              AND platform = $2
+              AND external_id = $3
+              AND stage = 'list'
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+          `, [tenantId, request.platform, sourceItem.externalId])
+        : null;
       await tx.execute(`
         INSERT INTO relevance_prefilter_decisions (
           tenant_id, prefilter_request_id, request_id,
@@ -629,7 +765,9 @@ async function persistPrefilterOutcome({
           intent_id, intent_version, prompt_version, model_provider, model_name,
           server_model_status, model_decision, decision_finality, execution_disposition,
           query_match, brand_match, confidence, reason, evidence, missing_signals,
-          effective_mode, skip_threshold, latency_ms, cache_hit, metadata
+          effective_mode, skip_threshold, latency_ms, cache_hit, metadata,
+          parent_decision_id, business_visibility, enhancement_state,
+          disposition_applied_at, deferred_until, sampled_full_capture
         ) VALUES (
           $1, $2, $3,
           $4, $5, $6, $7, $8,
@@ -638,7 +776,11 @@ async function persistPrefilterOutcome({
           $16, $17, $18, $19, $20,
           $21, $22, $23, $24,
           $25, $26, $27, $28, $29::jsonb, $30::jsonb,
-          $31, $32, $33, $34, $35::jsonb
+          $31, $32, $33, $34, $35::jsonb,
+          $36, $37, $38,
+          now(),
+          CASE WHEN $39::integer > 0 THEN now() + ($39::text || ' minutes')::interval ELSE NULL END,
+          $40
         )
         ON CONFLICT (tenant_id, prefilter_request_id, item_id) DO NOTHING
       `, [
@@ -682,7 +824,28 @@ async function persistPrefilterOutcome({
           tenantRelevance: result.tenantRelevance || null,
           protectedSignal: Boolean(result.protectedSignal),
         }),
+        parentDecision?.id || null,
+        projection.businessVisibility,
+        projection.enhancementState,
+        projection.deferredUntilMinutes,
+        Boolean(result.sampledFullCapture),
       ]);
+      if (sourceItem.externalId) {
+        await tx.execute(`
+          UPDATE records
+          SET business_visibility = $4,
+              relevance_disposition_updated_at = now(),
+              updated_at = now()
+          WHERE tenant_id = $1
+            AND platform = $2
+            AND external_id = $3
+        `, [
+          tenantId,
+          request.platform,
+          sourceItem.externalId,
+          projection.businessVisibility,
+        ]);
+      }
       if (result.status === 'ok' && !result.cacheHit) {
         await tx.execute(`
           INSERT INTO relevance_prefilter_cache (
@@ -757,7 +920,10 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
   if (existing?.kind === 'replay') return existing.response;
 
     await assertDailyQuota(tenantId, request.items.length);
-    const policy = await resolvePrefilterPolicy(tenantId, request);
+    const policy = {
+      ...(await resolvePrefilterPolicy(tenantId, request)),
+      stage: request.stage,
+    };
     const reservation = await reservePrefilterRequest(tenantId, request, bodyHash);
     if (reservation.kind === 'replay') return reservation.response;
     const startedAt = Date.now();
@@ -800,7 +966,12 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
             );
             const result = await callRelevancePrefilterWithPrompt(
               tenantId,
-              buildPrefilterSystemPrompt(brand, request.intent, tenantScope),
+              buildPrefilterSystemPrompt(
+                brand,
+                request.intent,
+                tenantScope,
+                request.stage,
+              ),
               buildPrefilterUserMessage(pendingRequest),
               {
                 timeoutMs: modelTimeoutMs(),
@@ -865,21 +1036,30 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
             || pendingResults.get(item.itemId)
             || failOpenItem(item, 'model_error', 'AI 未返回该项目，已继续原采集流程', policy);
         });
+        items = applyBoundedFailOpenSampling(items);
         degraded = unknownOutputCount > 0 || items.some(item => item.status !== 'ok');
       } catch (error) {
         const timedOut = isTimeoutError(error);
         degraded = true;
-        items = allFailOpenItems(
+        items = applyBoundedFailOpenSampling(allFailOpenItems(
           request,
           timedOut ? 'timeout' : 'model_error',
           timedOut
             ? 'AI 判断超时，已按安全策略继续采集'
             : `AI 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
           policy
-        );
+        ));
       }
     }
 
+    items = applyBoundedFailOpenSampling(items).map((item) => {
+      const projection = projectRelevanceDisposition(item, request.stage);
+      return {
+        ...item,
+        businessVisibility: projection.businessVisibility,
+        enhancementState: projection.enhancementState,
+      };
+    });
     const response = {
       ok: true,
       degraded,
@@ -893,6 +1073,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
         keywords: tenantScope.keywords,
       },
       promptVersion: request.promptVersion,
+      stage: request.stage,
       provider,
       model,
       latencyMs: Date.now() - startedAt,
@@ -900,6 +1081,8 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
       skipThreshold: policy.skipThreshold,
       clearIrrelevantSkipThreshold: policy.clearIrrelevantSkipThreshold,
       clearIrrelevantMaxMatch: policy.clearIrrelevantMaxMatch,
+      failOpenSampleRate: PREFILTER_FAIL_OPEN_SAMPLE_RATE,
+      failOpenSampleMax: PREFILTER_FAIL_OPEN_SAMPLE_MAX,
       unknownOutputCount,
       modelDiagnostics,
       cacheHitCount: items.filter(item => item.cacheHit).length,

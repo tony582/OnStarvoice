@@ -1178,6 +1178,7 @@
           supportedPlatforms: ["xiaohongshu", "douyin", "weibo"],
           remoteResume: true,
           remoteTaskCreate: true,
+          xiaohongshuSourceOpenV1: true,
           remoteStop: true,
           remoteUnattendedPlanWrite: true,
           remoteUnattendedPlanDelete: true,

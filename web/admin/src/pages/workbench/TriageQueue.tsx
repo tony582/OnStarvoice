@@ -3,7 +3,7 @@ import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MessageSquarePlus, MessageSquareText,
   Check, CheckCircle, Archive, ArchiveRestore, CircleOff, Loader2, ChevronDown,
-  User, FileText, Bell, ExternalLink,
+  User, FileText, Bell,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
   Rows3, Kanban, MoreHorizontal, Radar, ShieldAlert, Star,
   Tags,
@@ -36,6 +36,7 @@ import {
   type FeishuTableNumberSaveResult,
 } from '@/components/shared/FeishuTableNumberControl'
 import { RecordLabelChips } from '@/components/shared/RecordLabels'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import {
   normalizeCustomTags, tagsFromRecord,
   type CustomTag, type CustomTagPatch,
@@ -44,7 +45,7 @@ import { TriageBoard } from '@/pages/workbench/TriageBoard'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 import { useNav } from '@/lib/navigation'
-import { recordDisplayTitle, resolveRecordOriginalUrl } from '@/lib/record-display'
+import { recordDisplayTitle } from '@/lib/record-display'
 
 interface Pagination { page: number; totalPages: number; total: number }
 interface CustomTagsMutationResponse {
@@ -1705,7 +1706,6 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
     || (r.official_response_status && r.official_response_status !== 'none')
   const availabilityLabel = contentAvailabilityLabel(r)
   const displayTitle = recordDisplayTitle(r)
-  const originalUrl = resolveRecordOriginalUrl(r)
 
   return (
     <article
@@ -1745,7 +1745,7 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
             <span className="inline-flex min-w-0 items-center gap-1"><User className="h-3 w-3 shrink-0" /><span className="max-w-28 truncate">{r.author_name || '未知作者'}</span></span>
             <span>{platformName(r.platform)}</span>
-            {originalUrl && <a href={originalUrl} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()} className="inline-flex items-center gap-0.5 font-semibold text-primary">原文<ExternalLink className="h-3 w-3" /></a>}
+            <RecordSourceAction record={r} compact className="font-semibold" />
           </div>
         </div>
         {canWrite ? (
@@ -1835,7 +1835,6 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
   const triageLabel = LABELS.triage[triageStatus] || triageStatus
   const availabilityLabel = contentAvailabilityLabel(r)
   const displayTitle = recordDisplayTitle(r)
-  const originalUrl = resolveRecordOriginalUrl(r)
 
   return (
     <tr data-record-detail-trigger className={cn('group cursor-pointer transition-colors', open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45')} onClick={onOpenDetail}>
@@ -1870,7 +1869,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
             <div className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-muted-foreground">
               <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
               {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
-              {originalUrl && <a href={originalUrl} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><ExternalLink className="h-2.5 w-2.5" />原文</a>}
+              <RecordSourceAction record={r} compact />
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}
             </div>
             {triageStatus === 'negative_feishu' && (

@@ -870,6 +870,43 @@ export function mergeObservationMetrics(record = {}, existing = {}) {
   return merged;
 }
 
+export function resolveRecordBusinessVisibility(record = {}, existing = {}) {
+  let payload = record?.payload;
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      payload = {};
+    }
+  }
+  const safePayload = payload && typeof payload === 'object' ? payload : {};
+  const audit = safePayload.aiRelevancePrefilter
+    && typeof safePayload.aiRelevancePrefilter === 'object'
+    ? safePayload.aiRelevancePrefilter
+    : {};
+  const detailStatus = String(safePayload.detailCaptureStatus || '').trim().toLowerCase();
+  const disposition = String(
+    audit.executionDisposition || audit.modelExecutionDisposition || '',
+  ).trim().toLowerCase();
+  if (
+    detailStatus === 'filtered'
+    || disposition === 'skip_expensive'
+    || disposition === 'skip_full_capture'
+  ) return 'filtered_out';
+  if (detailStatus === 'deferred' || disposition === 'defer_enhancement') {
+    return 'deferred';
+  }
+  if (
+    detailStatus === 'done'
+    || disposition === 'collect_full'
+    || disposition === 'collect_minimal_detail'
+  ) return 'eligible';
+  const previous = String(existing?.business_visibility || '').trim().toLowerCase();
+  return ['eligible', 'filtered_out', 'deferred'].includes(previous)
+    ? previous
+    : 'eligible';
+}
+
 export async function upsertCapturedRecord(record, context) {
   record = normalizeCapturedRecordLinks(record);
   const tenantId = context.tenantId;
@@ -920,6 +957,7 @@ export async function upsertCapturedRecord(record, context) {
     record = guardRecordCommentCount(record, existing || {});
     record = guardRecordTextCompleteness(record, existing || {});
     payload = jsonText(record.payload, '{}');
+    const businessVisibility = resolveRecordBusinessVisibility(record, existing || {});
 
     if (existing) {
       const changedFields = detectChangedFields(existing, { ...record, tags, image_urls: imageUrls, payload });
@@ -972,6 +1010,11 @@ export async function upsertCapturedRecord(record, context) {
           auth_code = COALESCE(NULLIF($32, ''), auth_code),
           author_account_no = COALESCE(NULLIF($34, ''), author_account_no),
           publish_location = COALESCE(NULLIF($35, ''), publish_location),
+          business_visibility = $36,
+          relevance_disposition_updated_at = CASE
+            WHEN business_visibility IS DISTINCT FROM $36 THEN now()
+            ELSE relevance_disposition_updated_at
+          END,
           last_seen_at = now(),
           seen_count = seen_count + 1,
           updated_at = now()
@@ -996,6 +1039,7 @@ export async function upsertCapturedRecord(record, context) {
         existing.id,
         record.author_account_no || '', // $34:人看的号(空不覆盖,见 COALESCE NULLIF)
         record.publish_location || '',
+        businessVisibility,
       ]);
 
       await appendOfficialContentAudit(tx, {
@@ -1038,6 +1082,7 @@ export async function upsertCapturedRecord(record, context) {
       return {
         id: existing.id,
         action: 'updated',
+        businessVisibility,
         observationId,
         shouldRelabel: Boolean(relabelReason),
         relabelReason,
@@ -1060,7 +1105,7 @@ export async function upsertCapturedRecord(record, context) {
         comments_capture_status, comments_total_captured,
         capture_timestamp,
         keyword, source_type, payload, auth_code, content_hash, author_account_no,
-        publish_location
+        publish_location, business_visibility, relevance_disposition_updated_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6,
         $7, $8, $9, $10,
@@ -1073,7 +1118,8 @@ export async function upsertCapturedRecord(record, context) {
         $29, $30,
         $31,
         $32, $33, $34::jsonb, $35, $36, $37,
-        $38
+        $38, $39,
+        CASE WHEN $39 = 'eligible' THEN NULL ELSE now() END
       )
       RETURNING id
     `, [
@@ -1091,6 +1137,7 @@ export async function upsertCapturedRecord(record, context) {
       record.keyword || '', record.source_type || '', payload, authCode, contentHash,
       record.author_account_no || '', // $37:人看的号
       record.publish_location || '',
+      businessVisibility,
     ]);
 
     const observationId = await insertObservation(tx, {
@@ -1118,14 +1165,17 @@ export async function upsertCapturedRecord(record, context) {
     return {
       id: inserted.id,
       action: 'inserted',
+      businessVisibility,
       observationId,
       officialContent: officialResolution.officialContent,
       officialContentSource: officialResolution.source,
     };
   });
   // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
-  if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);
-  if (imageUrls !== '[]') queueRecordImagesLocalization(__result.id, imageUrls, record.platform);
+  if (__result.businessVisibility === 'eligible') {
+    if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);
+    if (imageUrls !== '[]') queueRecordImagesLocalization(__result.id, imageUrls, record.platform);
+  }
   return __result;
 }
 

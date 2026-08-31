@@ -181,8 +181,10 @@ export function resolveRecordOriginalUrl(value: unknown): string {
   const hasXhsUrl = [record.url, record.canonical_url]
     .some(url => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(url || '').replace(/^https?:\/\//iu, '')))
   if (platform === 'xiaohongshu' || hasXhsUrl) {
-    const direct = xhsOriginalUrl(record)
-    if (direct) return direct
+    // Xiaohongshu xsec links are temporary capabilities tied to the search
+    // context and Chrome Profile. Callers must use RecordSourceAction so an
+    // online capture Agent refreshes the link locally; never render a stale href.
+    return ''
   }
   return String(record.canonical_url || record.url || '')
 }

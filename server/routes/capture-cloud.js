@@ -156,6 +156,11 @@ const ELASTIC_AGENT_CAPACITY_CODES = new Set([
   'CAPTURE_TASK_GROUP_BUSY',
   'CAPTURE_TASK_CLEANUP_PENDING',
   'CAPTURE_TASK_DEBUG_BUSY',
+  'CAPTURE_TASK_DEBUG_PREFLIGHT_UNAVAILABLE',
+  'CAPTURE_TASK_DEBUG_PREFLIGHT_FAILED',
+  'CAPTURE_TASK_DEBUG_STARVOICE_ACTIVE',
+  'CAPTURE_TASK_EXTERNAL_DEBUGGER_BUSY',
+  'CAPTURE_TASK_DEBUG_OWNERSHIP_UNKNOWN',
   'CAPTURE_LOCK_CONFLICT',
 ]);
 
@@ -1990,6 +1995,11 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
           AND (
             c.command_type <> 'create'
             OR ca.capabilities->>'remoteTaskCreate' = 'true'
+          )
+          AND (
+            c.command_type <> 'create'
+            OR c.payload->>'executionMode' <> 'source_open'
+            OR ca.capabilities->>'xiaohongshuSourceOpenV1' = 'true'
           )
           AND (
             c.command_type <> 'create'
@@ -7079,6 +7089,11 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
             OR t.platform = ANY($6::text[])
           )
           AND (
+            c.command_type <> 'create'
+            OR c.payload->>'executionMode' <> 'source_open'
+            OR $7::boolean = true
+          )
+          AND (
             c.command_type <> 'resume'
             OR (
               t.status = 'resume_requested'
@@ -7112,6 +7127,8 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
           -- unattended-plan configuration behind ten deferred capture jobs.
           WHEN c.command_type = 'create'
             AND c.payload->>'executionMode' = 'unattended_plan' THEN 2
+          WHEN c.command_type = 'create'
+            AND c.payload->>'executionMode' = 'source_open' THEN 2
           ELSE 3
         END, c.created_at ASC, c.id ASC
         LIMIT 10
@@ -7122,6 +7139,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         agent.auth_binding_id,
         Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [],
         normalizeCaptureAgentPlatforms(heartbeatCapabilities.supportedPlatforms),
+        heartbeatCapabilities.xiaohongshuSourceOpenV1 === true,
       ]) : [];
 
       if (commands.length > 0) {
@@ -7233,8 +7251,15 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
 
       let success = reportedSuccess;
       let stopOutcome = null;
-      const createExecutionMode = command.payload?.executionMode === 'unattended_plan'
-        ? 'unattended_plan'
+      const requestedCreateExecutionMode = text(
+        command.payload?.executionMode,
+        80,
+      );
+      const createExecutionMode = [
+        'unattended_plan',
+        'source_open',
+      ].includes(requestedCreateExecutionMode)
+        ? requestedCreateExecutionMode
         : 'one_time';
       const createPlanOperation =
         createExecutionMode === 'unattended_plan' &&
@@ -7247,6 +7272,9 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           isTargetedPostTaskType(lockedTask?.task_type) ||
           isTargetedPostTaskType(command.payload?.workflow)
         );
+      const sourceOpenCreate =
+        command.command_type === 'create' &&
+        createExecutionMode === 'source_open';
       let expectedCreateRequestId = '';
       let allowLateCreateSuccess = false;
       if (
@@ -7333,9 +7361,20 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
         const expectedRequestId = expectedCreateRequestId ||
           text(command.payload?.clientTaskId, 240);
         nextStatus = success
-          ? createExecutionMode === 'unattended_plan' ? 'completed' : 'claimed'
+          ? ['unattended_plan', 'source_open'].includes(createExecutionMode)
+            ? 'completed'
+            : 'claimed'
           : 'needs_action';
-        eventMessage = targetedPostCreate
+        eventMessage = sourceOpenCreate
+          ? text(
+              resultPayload.message || (
+                success
+                  ? '设备已刷新并打开小红书原文'
+                  : '设备未能刷新打开小红书原文'
+              ),
+              2000,
+            )
+          : targetedPostCreate
           ? text(
               resultPayload.message || (
                 success
@@ -7372,6 +7411,10 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
             progress = CASE
               WHEN $2 AND $11 = 'unattended_plan'
                 THEN jsonb_build_object('current', 1, 'total', 1, 'phase', 'saved')
+              WHEN $2 AND $11 = 'source_open'
+                THEN jsonb_build_object(
+                  'current', 1, 'total', 1, 'percent', 100, 'phase', 'opened'
+                )
               ELSE progress
             END,
             counts = CASE
@@ -7380,10 +7423,15 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
                   'total', 1, 'processed', 1, 'success', 1,
                   'failed', 0, 'skipped', 0
                 )
+              WHEN $2 AND $11 = 'source_open'
+                THEN jsonb_build_object(
+                  'total', 1, 'processed', 1, 'success', 1,
+                  'failed', 0, 'skipped', 0
+                )
               ELSE counts
             END,
             finished_at = CASE
-              WHEN NOT $2 OR $11 = 'unattended_plan' THEN now()
+              WHEN NOT $2 OR $11 IN ('unattended_plan', 'source_open') THEN now()
               ELSE NULL
             END,
             metadata = metadata || $6::jsonb,
@@ -7418,7 +7466,12 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
                     planDeletedAt: new Date().toISOString(),
                   }
                 : {planAppliedAt: new Date().toISOString()}
-              : {localRequestId: expectedRequestId}),
+              : createExecutionMode === 'source_open'
+                ? {
+                    sourceOpenedAt: new Date().toISOString(),
+                    sourceOpenReason: text(resultPayload.reason, 120),
+                  }
+                : {localRequestId: expectedRequestId}),
           } : {
             createFailedAt: new Date().toISOString(),
             executionMode: createExecutionMode,

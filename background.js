@@ -3632,6 +3632,23 @@ async function executeCloudTaskAgentCommand(command, token) {
       '',
   ).trim();
 
+  if (
+    commandType === 'create' &&
+    String(payload.executionMode || '').trim() === 'source_open'
+  ) {
+    commandResult = await executeXhsSourceOpenCommand(
+      command,
+      payload,
+      commandResult,
+    );
+    return await cloudTaskAgentApi.completeCommand({
+      token,
+      commandId,
+      success: commandResult?.accepted === true,
+      result: commandResult,
+    });
+  }
+
   if (commandType === 'create' && isCloudTargetedPostPayload(payload)) {
     const targeted = await executeCloudTargetedPostCreateCommand(
       command,
@@ -4049,6 +4066,245 @@ async function executeCloudTaskAgentCommand(command, token) {
     success: commandResult.accepted === true,
     result: commandResult,
   });
+}
+
+function buildXhsSourceSearchUrl(searchQuery) {
+  const url = new URL('https://www.xiaohongshu.com/search_result');
+  url.searchParams.set('keyword', String(searchQuery || '').trim());
+  url.searchParams.set('source', 'web_explore_feed');
+  url.searchParams.set('type', '51');
+  return url.toString();
+}
+
+function validatedFreshXhsSourceUrl(value, expectedNoteId) {
+  try {
+    const url = new URL(String(value || '').trim());
+    const host = String(url.hostname || '').toLowerCase();
+    const expected = String(expectedNoteId || '').trim().toLowerCase();
+    const matched = String(url.pathname || '').match(
+      /\/(?:explore|search_result|discovery\/item|note|video)\/([A-Za-z0-9_-]{8,})(?:\/|$)/i,
+    );
+    if (
+      (host !== 'xiaohongshu.com' && !host.endsWith('.xiaohongshu.com')) ||
+      !matched?.[1] ||
+      matched[1].toLowerCase() !== expected ||
+      !url.searchParams.get('xsec_token')
+    ) {
+      return '';
+    }
+    if (!url.searchParams.get('xsec_source')) {
+      url.searchParams.set('xsec_source', 'pc_search');
+    }
+    return url.toString();
+  } catch {
+    return '';
+  }
+}
+
+async function inspectXhsSourceOpenPage(tabId, expectedNoteId) {
+  if (!chrome.scripting?.executeScript) {
+    return {ok: false, reason: 'source_open_probe_unavailable'};
+  }
+  try {
+    const [execution] = await chrome.scripting.executeScript({
+      target: {tabId: Number(tabId)},
+      args: [String(expectedNoteId || '').trim().toLowerCase()],
+      func: (expected) => {
+        const title = String(document.title || '').trim();
+        const bodyText = String(document.body?.innerText || '')
+          .replace(/\s+/gu, ' ')
+          .trim()
+          .slice(0, 12000);
+        const pageText = `${title} ${bodyText}`.toLowerCase();
+        if (
+          /当前笔记暂时无法浏览|sorry[,，]?\s*this page isn['’]?t available right now|error[_\s-]*code\s*[:：]?\s*300031/iu.test(
+            pageText,
+          )
+        ) {
+          return {ok: false, reason: 'source_unavailable'};
+        }
+        if (
+          /安全限制.{0,80}访问频繁|requests too frequent|scan with logged-in rednote app.{0,120}account security/iu.test(
+            pageText,
+          )
+        ) {
+          return {ok: false, reason: 'security_blocked'};
+        }
+        if (/请先登录|登录后(?:查看|浏览|探索)/iu.test(pageText)) {
+          return {ok: false, reason: 'login_required'};
+        }
+        const routeId = location.pathname.match(
+          /\/(?:explore|search_result|discovery\/item|note|video)\/([A-Za-z0-9_-]{8,})(?:\/|$)/i,
+        )?.[1]?.toLowerCase() || '';
+        return routeId === expected
+          ? {ok: true, reason: 'source_opened'}
+          : {ok: false, reason: 'source_identity_mismatch'};
+      },
+    });
+    return execution?.result || {ok: false, reason: 'source_open_probe_failed'};
+  } catch {
+    return {ok: false, reason: 'source_open_probe_failed'};
+  }
+}
+
+function normalizeXhsSourceSearchQueries(payload, expectedNoteId) {
+  const rawQueries = Array.isArray(payload.searchQueries)
+    ? payload.searchQueries
+    : [
+        payload.searchQuery,
+        payload.title,
+        payload.authorName,
+        expectedNoteId,
+      ];
+  const seen = new Set();
+  const queries = [];
+  for (const rawQuery of rawQueries) {
+    const query = String(rawQuery || '').replace(/\s+/gu, ' ').trim().slice(0, 200);
+    const key = query.toLowerCase();
+    if (!query || seen.has(key)) continue;
+    seen.add(key);
+    queries.push(query);
+    if (queries.length >= 2) break;
+  }
+  return queries;
+}
+
+async function executeXhsSourceOpenCommand(command, payload, cachedResult) {
+  const commandId = String(command?.id || '').trim();
+  const requestId = String(
+    payload.clientTaskId || command.client_task_id || '',
+  ).trim();
+  const expectedNoteId = String(payload.externalId || '').trim();
+  const searchQueries = normalizeXhsSourceSearchQueries(payload, expectedNoteId);
+  if (cachedResult && cachedResult.state !== 'executing') {
+    return cachedResult;
+  }
+  if (!requestId || !expectedNoteId || searchQueries.length === 0) {
+    return rememberCloudCommandResult(commandId, {
+      state: 'completed',
+      accepted: false,
+      requestId,
+      executionMode: 'source_open',
+      reason: 'invalid_source_open_payload',
+      message: '实时打开指令缺少内容身份或搜索上下文',
+    });
+  }
+
+  await rememberCloudCommandResult(commandId, {
+    state: 'executing',
+    accepted: false,
+    requestId,
+    executionMode: 'source_open',
+    reason: 'executing',
+  });
+  let searchUrl = buildXhsSourceSearchUrl(searchQueries[0]);
+  let tabId = null;
+  try {
+    const tab = await chrome.tabs.create({url: searchUrl, active: true});
+    tabId = Number(tab?.id);
+    if (!Number.isInteger(tabId)) {
+      throw new Error('无法创建小红书搜索页');
+    }
+    if (Number.isInteger(tab?.windowId)) {
+      await chrome.windows.update(tab.windowId, {focused: true}).catch(() => null);
+    }
+    let lookup = null;
+    let sourceUrl = '';
+    for (let queryIndex = 0; queryIndex < searchQueries.length; queryIndex += 1) {
+      searchUrl = buildXhsSourceSearchUrl(searchQueries[queryIndex]);
+      if (queryIndex > 0) {
+        await chrome.tabs.update(tabId, {url: searchUrl, active: true});
+      }
+      await new Promise(resolve => setTimeout(resolve, 300));
+      await waitForTabReady(tabId, {timeoutMs: 30000});
+      await ensureContentScriptReady(tabId);
+      await waitForContentScriptReady(tabId, {timeoutMs: 15000});
+      lookup = await sendContentMessageWithTimeout(
+        tabId,
+        {
+          action: 'findXhsSourceNote',
+          expectedNoteId,
+          maxScrollTimes: 10,
+          maxDurationMs: 22000,
+        },
+        30000,
+      );
+      sourceUrl = validatedFreshXhsSourceUrl(
+        lookup?.sourceUrl,
+        expectedNoteId,
+      );
+      if (lookup?.ok === true && sourceUrl) break;
+      if (!['source_not_found', 'fresh_source_token_missing'].includes(
+        String(lookup?.reason || ''),
+      )) break;
+    }
+    if (lookup?.ok !== true || !sourceUrl) {
+      const reason = String(
+        lookup?.reason || (lookup?.found ? 'fresh_source_token_missing' : 'source_not_found'),
+      );
+      return rememberCloudCommandResult(commandId, {
+        state: 'completed',
+        accepted: false,
+        requestId,
+        executionMode: 'source_open',
+        reason,
+        fallbackTabOpened: true,
+        tabId,
+        message: String(
+          lookup?.message || '本次搜索未取得可用的新链接，已保留搜索页供人工确认',
+        ).slice(0, 1000),
+      });
+    }
+
+    await chrome.tabs.update(tabId, {url: sourceUrl, active: true});
+    await new Promise(resolve => setTimeout(resolve, 300));
+    await waitForTabReady(tabId, {timeoutMs: 30000});
+    const inspection = await inspectXhsSourceOpenPage(tabId, expectedNoteId);
+    if (inspection.ok !== true) {
+      // Leave a useful, token-free location instead of a dead 404 page.
+      await chrome.tabs.update(tabId, {url: searchUrl, active: true}).catch(() => null);
+      const reason = String(inspection.reason || 'source_open_failed');
+      const messages = {
+        source_unavailable: '小红书仍提示当前笔记暂时无法浏览，已返回搜索页',
+        security_blocked: '小红书要求安全验证，已停止并保留搜索页',
+        login_required: '当前小红书 Profile 需要先登录，已保留搜索页',
+        source_identity_mismatch: '打开结果与目标笔记ID不一致，已返回搜索页',
+        source_open_probe_unavailable: '扩展无法核验打开结果，已安全返回搜索页',
+        source_open_probe_failed: '打开结果核验失败，已安全返回搜索页',
+      };
+      return rememberCloudCommandResult(commandId, {
+        state: 'completed',
+        accepted: false,
+        requestId,
+        executionMode: 'source_open',
+        reason,
+        fallbackTabOpened: true,
+        tabId,
+        message: messages[reason] || '小红书原文未能完成核验，已保留搜索页',
+      });
+    }
+
+    return rememberCloudCommandResult(commandId, {
+      state: 'completed',
+      accepted: true,
+      requestId,
+      executionMode: 'source_open',
+      reason: inspection.reason || 'source_opened',
+      tabId,
+      message: '已在当前小红书 Profile 中刷新链接并打开原文',
+    });
+  } catch (error) {
+    return rememberCloudCommandResult(commandId, {
+      state: 'completed',
+      accepted: false,
+      requestId,
+      executionMode: 'source_open',
+      reason: String(error?.code || 'source_open_failed'),
+      fallbackTabOpened: Number.isInteger(tabId),
+      ...(Number.isInteger(tabId) ? {tabId} : {}),
+      message: String(error?.message || '小红书原文实时打开失败').slice(0, 1000),
+    });
+  }
 }
 
 async function syncCloudTaskAgentLiveness({reason = 'liveness'} = {}) {
@@ -10755,6 +11011,40 @@ function createCaptureTaskError(code, message, details = null) {
   return error;
 }
 
+function createCaptureTaskDebugOwnershipError(ownership = {}) {
+  const kind = String(ownership?.kind || '').trim();
+  const messages = {
+    starvoice_active:
+      '当前 Agent 已有 StarVoice 采集会话运行，本任务将交给其他空闲 Agent',
+    external_debugger:
+      '当前页面正被 DevTools 或外部调试器占用，本任务将交给其他空闲 Agent',
+    unknown_occupancy:
+      '当前 Agent 无法确认浏览器调试占用来源，本任务将交给其他空闲 Agent',
+  };
+  return createCaptureTaskError(
+    String(ownership?.code || 'capture_task_debug_ownership_unknown'),
+    messages[kind] || messages.unknown_occupancy,
+    {
+      debugOwnership: kind || 'unknown_occupancy',
+      retryable: ownership?.retryable !== false,
+      automaticReroute: ownership?.automaticReroute !== false,
+      safeToDetach: false,
+      ...(Number.isSafeInteger(Number(ownership?.tabId))
+        ? {tabId: Number(ownership.tabId)}
+        : {}),
+      ...(String(ownership?.taskId || '').trim()
+        ? {ownerTaskId: String(ownership.taskId).trim()}
+        : {}),
+      ...(String(ownership?.state || '').trim()
+        ? {ownerState: String(ownership.state).trim()}
+        : {}),
+      ...(String(ownership?.reason || '').trim()
+        ? {reason: String(ownership.reason).trim().slice(0, 320)}
+        : {}),
+    },
+  );
+}
+
 function getCaptureTaskRequest(message) {
   const payload =
     message?.payload && typeof message.payload === 'object'
@@ -11196,7 +11486,8 @@ async function beginCaptureTaskNow(message, sender) {
     return fence;
   };
 
-  await releaseConfirmedStaleCaptureTaskGroupsForBegin();
+  const staleRecovery =
+    await releaseConfirmedStaleCaptureTaskGroupsForBegin();
   await reconcileUnattendedBeginFence();
 
   const existingSession =
@@ -11210,15 +11501,6 @@ async function beginCaptureTaskNow(message, sender) {
     throw createCaptureTaskError(
       'capture_task_cleanup_pending',
       '上一采集任务仍在安全清理工作页，请稍后重试',
-    );
-  }
-  const conflictingGroup = captureTaskTabGroupManager
-    .getActiveTasks()
-    .find((candidate) => candidate?.taskId !== taskId);
-  if (conflictingGroup) {
-    throw createCaptureTaskError(
-      'capture_task_group_busy',
-      '已有采集标签组正在运行，请先结束当前任务',
     );
   }
   if (existingSession && existingSession.tabId !== sourceTabId) {
@@ -11237,26 +11519,61 @@ async function beginCaptureTaskNow(message, sender) {
       activeDebugSession.taskId !== taskId ||
       activeDebugSession.tabId !== sourceTabId)
   ) {
+    const ownership =
+      globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+        requestedTaskId: taskId,
+        requestedTabId: sourceTabId,
+        activeSession: activeDebugSession,
+        staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+    });
+    throw createCaptureTaskDebugOwnershipError(ownership);
+  }
+  const conflictingGroup = captureTaskTabGroupManager
+    .getActiveTasks()
+    .find((candidate) => candidate?.taskId !== taskId);
+  if (conflictingGroup) {
     throw createCaptureTaskError(
-      'capture_task_debug_busy',
-      '已有页面处于 AI Debug 采集任务，请先结束当前任务',
+      'capture_task_group_busy',
+      '已有采集标签组正在运行，请先结束当前任务',
+      {
+        debugOwnership: 'starvoice_active',
+        retryable: true,
+        automaticReroute: true,
+        safeToDetach: false,
+        ownerTaskId: String(conflictingGroup.taskId || '').trim(),
+      },
     );
   }
+  let debugOwnership =
+    globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+      requestedTaskId: taskId,
+      requestedTabId: sourceTabId,
+      activeSession: existingSession,
+      staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+    });
   if (!existingSession) {
     if (typeof chrome.debugger?.getTargets !== 'function') {
-      throw createCaptureTaskError(
-        'capture_task_debug_preflight_unavailable',
-        '当前浏览器无法确认页面调试占用状态，未启动采集任务',
-      );
+      debugOwnership =
+        globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+          requestedTaskId: taskId,
+          requestedTabId: sourceTabId,
+          staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+          preflightAvailable: false,
+        });
+      throw createCaptureTaskDebugOwnershipError(debugOwnership);
     }
     let targets = [];
     try {
       targets = await chrome.debugger.getTargets();
     } catch (error) {
-      throw createCaptureTaskError(
-        'capture_task_debug_preflight_failed',
-        `无法确认页面调试占用状态：${String(error?.message || error || '未知错误')}`,
-      );
+      debugOwnership =
+        globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+          requestedTaskId: taskId,
+          requestedTabId: sourceTabId,
+          staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+          preflightError: error,
+        });
+      throw createCaptureTaskDebugOwnershipError(debugOwnership);
     }
     const occupied = (Array.isArray(targets) ? targets : []).some(
       (target) =>
@@ -11264,10 +11581,14 @@ async function beginCaptureTaskNow(message, sender) {
         Number(target?.tabId) === sourceTabId,
     );
     if (occupied) {
-      throw createCaptureTaskError(
-        'capture_task_debug_busy',
-        '当前页面已被 DevTools 或其他调试任务占用，请关闭后重试',
-      );
+      debugOwnership =
+        globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+          requestedTaskId: taskId,
+          requestedTabId: sourceTabId,
+          staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+          targetAttached: true,
+        });
+      throw createCaptureTaskDebugOwnershipError(debugOwnership);
     }
   }
   await reconcileUnattendedBeginFence();
@@ -11308,25 +11629,37 @@ async function beginCaptureTaskNow(message, sender) {
     } else {
       group = activeGroupAfterFence;
     }
-    session = await captureDebugSessionManager.start({
-      tabId: sourceTabId,
-      runId:
-        String(request.runId || '').trim() ||
-        existingSession?.runId ||
-        `capture-task:${taskId}`,
-      label: String(request.label || '').trim() || '采集任务',
-      pageTitle: sourceTab?.title || '',
-      pageUrl: sourceTab?.url || '',
-      platform: sourcePlatform,
-      persistent: true,
-      taskId,
-      attemptId: request.attemptId,
-      progress: request.progress ?? null,
-      workerTabIds: existingSession?.workerTabIds || [],
-      groupId: group.groupId,
-      originalGroupId: group.originalGroupId,
-      minimized: Boolean(request.minimized),
-    });
+    try {
+      session = await captureDebugSessionManager.start({
+        tabId: sourceTabId,
+        runId:
+          String(request.runId || '').trim() ||
+          existingSession?.runId ||
+          `capture-task:${taskId}`,
+        label: String(request.label || '').trim() || '采集任务',
+        pageTitle: sourceTab?.title || '',
+        pageUrl: sourceTab?.url || '',
+        platform: sourcePlatform,
+        persistent: true,
+        taskId,
+        attemptId: request.attemptId,
+        progress: request.progress ?? null,
+        workerTabIds: existingSession?.workerTabIds || [],
+        groupId: group.groupId,
+        originalGroupId: group.originalGroupId,
+        minimized: Boolean(request.minimized),
+      });
+    } catch (error) {
+      if (error?.code !== 'debug_session_attach_failed') throw error;
+      debugOwnership =
+        globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+          requestedTaskId: taskId,
+          requestedTabId: sourceTabId,
+          staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+          attachError: error?.cause || error,
+        });
+      throw createCaptureTaskDebugOwnershipError(debugOwnership);
+    }
 
     const update = {taskId, groupId: group.groupId};
     if (Object.prototype.hasOwnProperty.call(request, 'progress')) {
@@ -11344,7 +11677,7 @@ async function beginCaptureTaskNow(message, sender) {
     }
     await writeRuntimeState({captureTaskCancellation: null});
     await reconcileUnattendedBeginFence({rollback: true});
-    return {taskId, session, group};
+    return {taskId, session, group, debugOwnership};
   } catch (error) {
     if (session || group || existingSession || existingGroup) {
       try {

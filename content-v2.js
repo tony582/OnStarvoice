@@ -19,6 +19,7 @@ import {
 } from "./utils/capture/index.js";
 
 import {expandKeywordViaSuggestions} from "./utils/capture/keyword-expansion.js";
+import {findXhsSourceNote} from "./utils/capture/keyword-search.js";
 
 import {detectPageType, detectPlatformFromUrl} from "./utils/helpers.js";
 import {setCancelFlag, resetCancelFlag} from "./utils/scroll.js";
@@ -415,6 +416,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       runTrackedCaptureRequest(request, () =>
         handleCaptureKeywordNotes(request, sendResponseWithDiagnostics),
       );
+      return true;
+
+    case "findXhsSourceNote":
+      handleFindXhsSourceNote(request, sendResponseWithDiagnostics);
       return true;
 
     case "updateListCaptureTraceBindings":
@@ -950,6 +955,24 @@ async function handleCaptureKeywordNotes(request, sendResponse) {
     });
   } finally {
     pendingListCaptureCancellations.delete(captureFeedback.runId);
+  }
+}
+
+async function handleFindXhsSourceNote(request, sendResponse) {
+  try {
+    const result = await findXhsSourceNote({
+      expectedNoteId: request.expectedNoteId,
+      maxScrollTimes: request.maxScrollTimes,
+      maxDurationMs: request.maxDurationMs,
+    });
+    sendResponse(result);
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      found: false,
+      reason: String(error?.code || "source_lookup_failed"),
+      message: String(error?.message || "小红书原文定位失败"),
+    });
   }
 }
 

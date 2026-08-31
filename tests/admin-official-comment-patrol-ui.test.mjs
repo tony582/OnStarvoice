@@ -206,9 +206,8 @@ test('official comment workbench uses a dispatch-style split and complete list p
   assert.match(monitoringTab, /lg:flex-nowrap lg:justify-end/u)
 })
 
-test('every post surface provides a safe original-post link', () => {
-  assert.match(monitoringTab, /查看原文/u)
-  assert.match(monitoringTab, /target="_blank"/u)
-  assert.match(monitoringTab, /rel="noreferrer"/u)
+test('every post surface delegates original-post opening to the safe source action', () => {
+  assert.match(monitoringTab, /RecordSourceAction record=\{post\}/u)
+  assert.doesNotMatch(monitoringTab, /href=\{post\.url\}/u)
   assert.match(monitoringTab, /原文链接待补充/u)
 })

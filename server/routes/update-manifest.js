@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.3.99',
+  latestVersion: '0.4.0',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-29',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.3.99-20260829.zip',
+  releaseDate: '2026-08-31',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.0-20260831.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.0',
+      releaseDate: '2026-08-31',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '小红书原文改为同账号实时找回',
+              desc: '后台只保存稳定笔记身份；点击原文后由对应 Agent 在已登录的浏览器 Profile 内重新搜索并核对笔记 ID，再使用当次有效上下文打开。临时 xsec 参数不上传、不落库，也不再回放失效历史链接。',
+            },
+            {
+              title: '浏览器调试占用可归因并自动接力',
+              desc: '区分 StarVoice 活跃会话、已确认陈旧会话、外部调试器与未知占用；只定点回收本机自有且已陈旧的资源，其余保留现场并将云端任务交给其它空闲 Agent。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: 'AI 相关性采用最小详情二次判断',
+              desc: '列表高置信无关内容直接跳过；证据不足时只读取标题、作者、正文、标签、OCR 与逐字稿等最小详情再判断。模型异常采用有界抽样或延后增强，过滤记录不再进入普通业务队列。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.3.99',
       releaseDate: '2026-08-29',

@@ -11,6 +11,7 @@ import {
   resolveXhsCanonicalRecordUrl,
   resolveGuardedCommentsCount,
   resolveCapturedTextUpdate,
+  resolveRecordBusinessVisibility,
   resolveRecordRelabelReason,
 } from '../server/services/record-store.js';
 import {
@@ -404,6 +405,40 @@ test('sync forces AI only for enriched updates while preserving normal inserts',
     {id: 'existing-record', force: true, reason: 'new_keyword_context'},
   );
   assert.equal(buildSyncAiJob({id: 'existing-record', action: 'updated'}), null);
+  assert.equal(buildSyncAiJob({
+    id: 'filtered-record',
+    action: 'inserted',
+    businessVisibility: 'filtered_out',
+  }), null);
+  assert.equal(buildSyncAiJob({
+    id: 'deferred-record',
+    action: 'updated',
+    shouldRelabel: true,
+    businessVisibility: 'deferred',
+  }), null);
+});
+
+test('prefilter audit projects records into one explicit business visibility state', () => {
+  assert.equal(resolveRecordBusinessVisibility({
+    payload: {detailCaptureStatus: 'filtered'},
+  }), 'filtered_out');
+  assert.equal(resolveRecordBusinessVisibility({
+    payload: {
+      aiRelevancePrefilter: {modelExecutionDisposition: 'skip_full_capture'},
+    },
+  }), 'filtered_out');
+  assert.equal(resolveRecordBusinessVisibility({
+    payload: {detailCaptureStatus: 'deferred'},
+  }), 'deferred');
+  assert.equal(resolveRecordBusinessVisibility({
+    payload: {
+      aiRelevancePrefilter: {executionDisposition: 'collect_minimal_detail'},
+    },
+  }), 'eligible');
+  assert.equal(resolveRecordBusinessVisibility(
+    {payload: {}},
+    {business_visibility: 'deferred'},
+  ), 'deferred');
 });
 
 test('legacy comment count cannot overwrite a trusted stored count', () => {

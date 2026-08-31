@@ -6,9 +6,12 @@ import {
   RELEVANCE_PREFILTER_BATCH_SIZE,
   RELEVANCE_PREFILTER_MAX_CONCURRENCY,
   RELEVANCE_PREFILTER_TIMEOUT_MS,
+  RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION,
+  buildRelevanceDetailCandidate,
   buildRelevancePrefilterCandidate,
   buildRelevancePrefilterIdempotencyKey,
   evaluateRelevancePrefilterRecords,
+  evaluateRelevanceDetailRecord,
   normalizeRelevancePrefilterDecision,
 } from '../../utils/capture/relevance-prefilter.js';
 import {scopeRelevancePrefilterIdempotencyKey} from '../../utils/api.js';
@@ -67,6 +70,24 @@ test('candidate uses list text only and never forwards cover or body', () => {
   assert.equal(JSON.stringify(candidate.evidence).includes('private-cover'), false);
   assert.equal(JSON.stringify(candidate.evidence).includes('正文'), false);
   assert.equal(candidate.evidence.externalId, 'note-1');
+});
+
+test('detail candidate contains only bounded minimal evidence', () => {
+  const candidate = buildRelevanceDetailCandidate(keywordRecord(1), {
+    title: '昂科威 Plus 使用感受',
+    author: '车主',
+    content: '正文内容',
+    tags: ['昂科威', '车机'],
+    ocrText: '屏幕显示文字',
+    transcript: '视频口播文字',
+    commentsCleanedItems: [{content: '评论不得发送'}],
+    bloggerFollowersCount: 999,
+    imageUrls: ['https://private.example/image.jpg'],
+  });
+  assert.equal(candidate.evidence.content, '正文内容');
+  assert.deepEqual(candidate.evidence.tags, ['昂科威', '车机']);
+  const serialized = JSON.stringify(candidate.evidence);
+  assert.doesNotMatch(serialized, /评论不得发送|bloggerFollowersCount|private\.example/u);
 });
 
 test('only valid high-confidence skip is actionable', () => {
@@ -202,7 +223,7 @@ test('a whole timed-out batch fails open without split retries', async () => {
           status: 'timeout',
           modelDecision: null,
           confidence: null,
-          executionDisposition: 'collect_full',
+          executionDisposition: 'defer_enhancement',
           reason: 'MODEL_TIMEOUT',
         })),
       };
@@ -215,6 +236,7 @@ test('a whole timed-out batch fails open without split retries', async () => {
   assert.equal(result.timeoutCount, 5);
   assert.equal(result.evaluatedCount, 0);
   assert.equal(result.failedOpenCount, 5);
+  assert.equal(result.deferredCount, 5);
 });
 
 test('multiple timed-out micro-batches each make one request only', async () => {
@@ -231,7 +253,7 @@ test('multiple timed-out micro-batches each make one request only', async () => 
           status: 'timeout',
           modelDecision: null,
           confidence: null,
-          executionDisposition: 'collect_full',
+          executionDisposition: 'defer_enhancement',
           reason: 'MODEL_TIMEOUT',
         })),
       };
@@ -245,6 +267,7 @@ test('multiple timed-out micro-batches each make one request only', async () => 
   assert.equal(result.evaluatedCount, 0);
   assert.equal(result.failedOpenCount, 17);
   assert.deepEqual(result.skippedRecordIds, []);
+  assert.equal(result.deferredCount, 17);
 });
 
 test('identical list text in a later capture run receives a new idempotency key', async () => {
@@ -372,6 +395,7 @@ test('request failure, missing items and need_detail all fail open', async () =>
   });
   assert.deepEqual(thrown.skippedRecordIds, []);
   assert.equal(thrown.failedOpenCount, 2);
+  assert.equal(thrown.deferredCount, 2);
 
   const partial = await evaluateRelevancePrefilterRecords(records, {
     enabled: true,
@@ -384,12 +408,53 @@ test('request failure, missing items and need_detail all fail open', async () =>
           modelDecision: 'need_detail',
           tenantRelevance: 'uncertain',
           confidence: 0.99,
+          executionDisposition: 'collect_minimal_detail',
         },
       ],
     }),
   });
   assert.deepEqual(partial.skippedRecordIds, []);
   assert.equal(partial.failedOpenCount, 1);
+  assert.equal(partial.minimalDetailCount, 1);
+  assert.equal(partial.deferredCount, 1);
+});
+
+test('detail second stage uses one minimal request and can terminate expensive capture', async () => {
+  const requests = [];
+  const decision = await evaluateRelevanceDetailRecord(
+    keywordRecord(1),
+    {
+      title: '大众壁纸合集',
+      author: '车友',
+      content: '全文只讨论大众汽车，与别克无关',
+      tags: ['大众'],
+      commentsCleanedItems: [{content: '不得发送'}],
+    },
+    {
+      requestBatch: async (request) => {
+        requests.push(request);
+        return {
+          ok: true,
+          items: request.items.map((item) => ({
+            itemId: item.itemId,
+            status: 'ok',
+            modelDecision: 'skip',
+            tenantRelevance: 'irrelevant',
+            confidence: 0.99,
+            executionDisposition: 'skip_full_capture',
+            decisionFinality: 'final',
+            reason: '最小详情确认无关',
+          })),
+        };
+      },
+    },
+  );
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].stage, 'detail');
+  assert.equal(requests[0].promptVersion, RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION);
+  assert.doesNotMatch(JSON.stringify(requests[0]), /不得发送/u);
+  assert.equal(decision.shouldSkip, true);
+  assert.equal(decision.executionDisposition, 'skip_full_capture');
 });
 
 test('detail batch invokes AI before creating a detail runner and only for keyword records', () => {
@@ -439,4 +504,12 @@ test('detail batch invokes AI before creating a detail runner and only for keywo
       'AI filtering must not delete list records in either terminal branch',
     );
   }
+
+  const noteCaptureAt = fullBody.indexOf('let noteResult = await captureCurrentNotePayload();');
+  const secondStageAt = fullBody.indexOf('await evaluateRelevanceDetailRecord(');
+  const bloggerAt = fullBody.indexOf('await captureBloggerMetricsForDetailPayload(');
+  const commentsAt = fullBody.indexOf('await captureCommentsForCurrentNote(');
+  assert.ok(secondStageAt > noteCaptureAt, 'detail AI must run after minimal note capture');
+  assert.ok(bloggerAt > secondStageAt, 'detail AI must run before blogger metrics');
+  assert.ok(commentsAt > secondStageAt, 'detail AI must run before comments');
 });

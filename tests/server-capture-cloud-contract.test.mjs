@@ -661,6 +661,15 @@ test("elastic queue does not spend business retries on local capacity or dispatc
   assert.equal(elasticAttemptBudgetAfterOutcome(2, {
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
   }), 1);
+  for (const code of [
+    "capture_task_debug_starvoice_active",
+    "capture_task_external_debugger_busy",
+    "capture_task_debug_ownership_unknown",
+  ]) {
+    assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+      error: {code},
+    }), 1, `${code} must hand off without spending a business retry`);
+  }
   const firstProjection = projectElasticAttemptBudget({
     attempt_count: 3,
     metadata: {elasticAttemptBudgetUsed: 3},

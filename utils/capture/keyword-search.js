@@ -23,6 +23,7 @@ import {
   buildScrollLoadStage,
   countMissingMetric,
 } from "./stage-diagnostics.js";
+import {detectXhsSecurityPage} from "./xiaohongshu-security.js";
 
 const KEYWORD_SORT_DIMENSION = {
   LIKES: "likes",
@@ -38,6 +39,122 @@ const SORT_DIMENSION_LABEL_MAP = {
 
 const MIN_KEYWORD_STALL_TIMEOUT_MS = 15000;
 const REQUIRED_KEYWORD_STALL_ROUNDS = 5;
+
+function sourceOpenPageFailure() {
+  const title = String(document.title || "").trim();
+  const bodyText = String(document.body?.innerText || "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 12000);
+  const pageUrl = String(window.location.href || "");
+  const securityEvidence = detectXhsSecurityPage({
+    title,
+    text: bodyText,
+    url: pageUrl,
+  });
+  if (securityEvidence) {
+    return {
+      reason: "security_blocked",
+      message: securityEvidence.reason === "account_security_qr"
+        ? "小红书要求扫码完成账号安全验证"
+        : "小红书提示访问频繁，请稍后重试",
+      securityEvidence,
+    };
+  }
+  const normalized = `${title} ${bodyText}`.toLowerCase();
+  if (
+    /当前笔记暂时无法浏览|sorry[,，]?\s*this page isn['’]?t available right now|error[_\s-]*code\s*[:：]?\s*300031/iu.test(
+      normalized,
+    )
+  ) {
+    return {
+      reason: "source_unavailable",
+      message: "小红书提示当前笔记暂时无法浏览",
+    };
+  }
+  if (
+    /请先登录|登录后(?:查看|浏览|探索)|scan with logged-in rednote app/iu.test(
+      normalized,
+    )
+  ) {
+    return {
+      reason: "login_required",
+      message: "当前小红书 Profile 需要先登录",
+    };
+  }
+  return null;
+}
+
+/**
+ * Re-locate one Xiaohongshu note inside the current, freshly opened search
+ * context. The returned xsec URL is extension-local and must never be sent to
+ * the management API or persisted as a durable record URL.
+ */
+export async function findXhsSourceNote({
+  expectedNoteId = "",
+  maxScrollTimes = 16,
+  maxDurationMs = 45000,
+} = {}) {
+  const targetId = String(expectedNoteId || "").trim().toLowerCase();
+  if (!targetId) {
+    return {
+      ok: false,
+      found: false,
+      reason: "source_identity_missing",
+      message: "缺少小红书笔记ID",
+    };
+  }
+
+  resetCancelFlag();
+  await wait(1200);
+  const startedAt = Date.now();
+  const scrollLimit = Math.max(0, Math.min(30, Number(maxScrollTimes) || 16));
+  const durationLimit = Math.max(
+    5000,
+    Math.min(90000, Number(maxDurationMs) || 45000),
+  );
+  let previousCount = -1;
+  let stagnantRounds = 0;
+
+  for (let scrollIndex = 0; scrollIndex <= scrollLimit; scrollIndex += 1) {
+    const failure = sourceOpenPageFailure();
+    if (failure) {
+      return {ok: false, found: false, ...failure};
+    }
+    const notes = extractNoteCards(KEYWORD_SORT_DIMENSION.LIKES);
+    const match = notes.find(note => (
+      String(note.noteId || "").trim().toLowerCase() === targetId
+    ));
+    if (match?.url) {
+      return {
+        ok: true,
+        found: true,
+        reason: "source_matched",
+        message: "已在当前搜索结果中定位原文",
+        noteId: String(match.noteId || expectedNoteId),
+        // Intentionally consumed only by the extension service worker.
+        sourceUrl: ensureXhsNoteUrlSource(match.url),
+      };
+    }
+    if (scrollIndex >= scrollLimit || Date.now() - startedAt >= durationLimit) {
+      break;
+    }
+
+    if (notes.length === previousCount) stagnantRounds += 1;
+    else stagnantRounds = 0;
+    previousCount = notes.length;
+    if (stagnantRounds >= REQUIRED_KEYWORD_STALL_ROUNDS) break;
+    await scrollKeywordSearchResults({noNewContentCount: stagnantRounds});
+    await wait(650);
+  }
+
+  return {
+    ok: false,
+    found: false,
+    reason: "source_not_found",
+    message: "本次搜索结果未定位到该笔记，已保留搜索页供人工确认",
+  };
+}
 
 /**
  * 采集关键词搜索结果

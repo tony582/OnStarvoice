@@ -8,6 +8,9 @@ import {
   PREFILTER_CLEAR_IRRELEVANT_SKIP_THRESHOLD,
   PREFILTER_DEFAULT_MODEL_TIMEOUT_MS,
   PREFILTER_DEFAULT_QUEUE_TIMEOUT_MS,
+  PREFILTER_DETAIL_PROMPT_VERSION,
+  PREFILTER_FAIL_OPEN_SAMPLE_MAX,
+  PREFILTER_FAIL_OPEN_SAMPLE_RATE,
   PREFILTER_MAX_LIST_BATCH,
   PREFILTER_MAX_CLEAR_IRRELEVANT_MATCH,
   PREFILTER_MAX_TENANT_SKIP_MATCH,
@@ -15,8 +18,10 @@ import {
   PREFILTER_PROMPT_VERSION,
   buildPrefilterSystemPrompt,
   buildPrefilterUserMessage,
+  applyBoundedFailOpenSampling,
   determineExecutionDisposition,
   normalizePrefilterModelResponse,
+  projectRelevanceDisposition,
   prefilterCacheKey,
   prefilterRequestBodyHash,
   resolvePrefilterPolicyValues,
@@ -106,8 +111,35 @@ test('invalid batch shapes are rejected before any model call', () => {
     })).error,
     'DUPLICATE_ITEM_ID',
   );
-  assert.equal(validatePrefilterRequest(validBody({ stage: 'detail' })).error, 'UNSUPPORTED_STAGE');
+  assert.equal(validatePrefilterRequest(validBody({ stage: 'unknown' })).error, 'UNSUPPORTED_STAGE');
   assert.equal(validatePrefilterRequest(validBody({ promptVersion: 'prefilter-list-v0' })).error, 'PROMPT_VERSION_CONFLICT');
+});
+
+test('detail-stage validation accepts only the bounded minimal detail package', () => {
+  const result = validatePrefilterRequest(validBody({
+    stage: 'detail',
+    promptVersion: PREFILTER_DETAIL_PROMPT_VERSION,
+    items: [{
+      itemId: 'xiaohongshu:a',
+      externalId: 'a',
+      title: '车机使用体验',
+      author: '车主',
+      content: '正文'.repeat(4000),
+      tags: Array.from({length: 40}, (_, index) => `标签${index}`),
+      ocrText: '屏幕文字',
+      transcript: '口播内容',
+      comments: [{content: '不得进入二判'}],
+      profileMetrics: {fans: 10},
+    }],
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.value.stage, 'detail');
+  assert.equal(result.value.promptVersion, PREFILTER_DETAIL_PROMPT_VERSION);
+  assert.equal(result.value.items[0].content.length, 5000);
+  assert.equal(result.value.items[0].tags.length, 30);
+  const message = buildPrefilterUserMessage(result.value);
+  assert.match(message, /屏幕文字|口播内容/u);
+  assert.doesNotMatch(message, /不得进入二判|profileMetrics|fans/u);
 });
 
 test('prefilter sends every configured provider only minimal list text', () => {
@@ -171,10 +203,10 @@ test('three-state normalization preserves partial success and fail-opens missing
   assert.equal(normalized.items[0].modelDecision, 'skip');
   assert.equal(normalized.items[0].executionDisposition, 'skip_full_capture');
   assert.equal(normalized.items[1].status, 'model_error');
-  assert.equal(normalized.items[1].executionDisposition, 'collect_full');
+  assert.equal(normalized.items[1].executionDisposition, 'defer_enhancement');
   assert.equal(normalized.items[1].failOpen, true);
   assert.equal(normalized.items[2].status, 'invalid_input');
-  assert.equal(normalized.items[2].executionDisposition, 'collect_full');
+  assert.equal(normalized.items[2].executionDisposition, 'defer_enhancement');
   assert.equal(normalized.unknownOutputCount, 1);
   assert.equal(normalized.degraded, true);
 });
@@ -194,12 +226,79 @@ test('shadow mode never skips while conservative mode has a narrow clear-noise p
   assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0.0501, confidence: 0.95 }, conservative), 'collect_full');
   assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: '', brandMatch: '', confidence: 0.95 }, conservative), 'collect_full');
   assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 0.9 }, conservative), 'collect_full');
-  assert.equal(determineExecutionDisposition({ status: 'model_error', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 1 }, conservative), 'collect_full');
+  assert.equal(determineExecutionDisposition({ status: 'model_error', modelDecision: 'skip', tenantRelevance: 'irrelevant', queryMatch: 0, brandMatch: 0, confidence: 1 }, conservative), 'defer_enhancement');
   assert.equal(determineExecutionDisposition({ status: 'ok', modelDecision: 'skip', tenantRelevance: 'irrelevant', brandMatch: 0, confidence: 0.97 }, conservative), 'skip_full_capture');
   assert.equal(PREFILTER_MAX_TENANT_SKIP_MATCH, 0.2);
 
   const serverShadow = resolvePrefilterPolicyValues({ requestedMode: 'conservative', serverMode: 'shadow' });
   assert.equal(serverShadow.effectiveMode, 'shadow');
+});
+
+test('list uncertainty requests minimal detail while detail decisions are final', () => {
+  const listRequest = validatePrefilterRequest(validBody()).value;
+  const listPolicy = {...resolvePrefilterPolicyValues({requestedMode: 'conservative'}), stage: 'list'};
+  const list = normalizePrefilterModelResponse(listRequest, {
+    items: [{
+      itemId: listRequest.items[0].itemId,
+      decision: 'need_detail',
+      tenantRelevance: 'uncertain',
+      queryMatch: 0.4,
+      brandMatch: 0.4,
+      confidence: 0.9,
+      reason: '标题不足，需要正文',
+    }],
+  }, listPolicy).items[0];
+  assert.equal(list.executionDisposition, 'collect_minimal_detail');
+  assert.equal(list.decisionFinality, 'provisional');
+
+  const detailRequest = validatePrefilterRequest(validBody({
+    stage: 'detail',
+    promptVersion: PREFILTER_DETAIL_PROMPT_VERSION,
+    items: [{
+      itemId: 'xiaohongshu:a',
+      externalId: 'a',
+      title: '大众车机壁纸',
+      author: '车友',
+      content: '全文只讲大众汽车',
+      tags: ['大众'],
+    }],
+  })).value;
+  const detailPolicy = {...resolvePrefilterPolicyValues({requestedMode: 'conservative'}), stage: 'detail'};
+  const detail = normalizePrefilterModelResponse(detailRequest, {
+    items: [{
+      itemId: detailRequest.items[0].itemId,
+      decision: 'skip',
+      tenantRelevance: 'irrelevant',
+      queryMatch: 0,
+      brandMatch: 0,
+      confidence: 0.99,
+      reason: '最小详情已确认无关',
+    }],
+  }, detailPolicy).items[0];
+  assert.equal(detail.executionDisposition, 'skip_full_capture');
+  assert.equal(detail.decisionFinality, 'final');
+  assert.deepEqual(projectRelevanceDisposition(detail, 'detail'), {
+    businessVisibility: 'filtered_out',
+    enhancementState: 'skipped',
+    deferredUntilMinutes: 0,
+  });
+});
+
+test('fail-open sampling is deterministic and bounded', () => {
+  const items = Array.from({length: 200}, (_, index) => ({
+    itemId: `item-${index}`,
+    executionDisposition: 'defer_enhancement',
+    protectedSignal: false,
+    reason: '模型异常',
+  }));
+  const first = applyBoundedFailOpenSampling(items);
+  const second = applyBoundedFailOpenSampling(items);
+  assert.deepEqual(first, second);
+  const sampled = first.filter((item) => item.sampledFullCapture);
+  assert.ok(sampled.length > 0);
+  assert.ok(sampled.length <= PREFILTER_FAIL_OPEN_SAMPLE_MAX);
+  assert.equal(PREFILTER_FAIL_OPEN_SAMPLE_RATE, 0.1);
+  assert.ok(first.some((item) => item.executionDisposition === 'defer_enhancement'));
 });
 
 test('clear unrelated noise skips at 0.95 without weakening existing monitoring-signal protection', () => {

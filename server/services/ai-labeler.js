@@ -1275,6 +1275,7 @@ function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment
 export async function labelRecord(recordId, options = {}) {
   const record = await queryOne('SELECT * FROM records WHERE id = $1', [recordId]);
   if (['official_content', 'blogger_profile'].includes(record?.record_type)) return null;
+  if (record?.business_visibility && record.business_visibility !== 'eligible') return null;
   if (!record || (!options.force && record.ai_labeled_at && hasRelevanceResult(record))) return null;
 
   const observationRows = await queryAll(`
@@ -1367,6 +1368,7 @@ export async function labelPendingRecords(limit = 50) {
   const records = await queryAll(
     `SELECT id FROM records
      WHERE record_type NOT IN ('official_content', 'blogger_profile')
+       AND business_visibility = 'eligible'
        AND (ai_labeled_at IS NULL OR ai_result->>'relevance' IS NULL)
      ORDER BY created_at DESC
      LIMIT $1`,

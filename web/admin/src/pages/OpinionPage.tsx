@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Loader2, Inbox, Search, RefreshCw, ChevronLeft, ChevronRight, ExternalLink, UserCog } from 'lucide-react'
+import { Loader2, Inbox, Search, RefreshCw, ChevronLeft, ChevronRight, UserCog } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate, formatNumber, LABELS, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -9,6 +9,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { TicketDrawer } from '@/components/shared/TicketDrawer'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 
@@ -159,7 +160,10 @@ export function OpinionPage() {
                   </button>
                   <div className="mt-3 flex items-center gap-2 border-t border-border/70 pt-3">
                     <Button variant="outline" size="sm" className="flex-1" onClick={() => setDrawer(it)}>查看详情</Button>
-                    {it.url && <Button variant="outline" size="sm" onClick={() => window.open(it.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="h-3.5 w-3.5" />原文</Button>}
+                    <RecordSourceAction
+                      record={{ id: it.source_record_id, platform: it.platform, url: it.url }}
+                      className="h-9 rounded-md border border-border px-3 text-xs font-medium hover:bg-accent"
+                    />
                     {actionable && <Button size="sm" className="flex-1" onClick={() => act(it, 'done', true)}>处理完成</Button>}
                     {actionable && <Button variant="ghost" size="sm" onClick={() => act(it, 'dismiss', true)}>忽略</Button>}
                     {closable && <Button size="sm" className="flex-1" onClick={() => act(it, 'close')}>结案</Button>}
@@ -187,7 +191,11 @@ export function OpinionPage() {
                       <StatusBadge tone="neutral">{platformName(it.platform)}</StatusBadge>
                       {it.external_ticket_no && <StatusBadge tone="ticketed" className="max-w-40"><span className="truncate">工单 {it.external_ticket_no}</span></StatusBadge>}
                       {it.category && <StatusBadge tone="neutral">{LABELS.leadType[it.category] || it.category}</StatusBadge>}
-                      {it.url && <a href={it.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex items-center gap-0.5 text-[11px] font-semibold text-primary hover:underline">原文<ExternalLink className="h-3 w-3" /></a>}
+                      <RecordSourceAction
+                        record={{ id: it.source_record_id, platform: it.platform, url: it.url }}
+                        compact
+                        className="text-[11px] font-semibold"
+                      />
                     </div>
                     <div className="line-clamp-2 text-[13px] leading-5 text-foreground">{it.item_text || it.title || '(无内容)'}</div>
                     {it.dispatch_note && <div className="mt-1.5 rounded-md bg-amber-50 px-2 py-1 text-[11px] leading-5 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300">转单说明:{it.dispatch_note}</div>}

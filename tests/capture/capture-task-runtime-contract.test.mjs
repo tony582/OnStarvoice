@@ -8,6 +8,7 @@ const [
   manifestSource,
   captureSyncSource,
   douyinKeywordSearchSource,
+  debugSessionSource,
 ] = await Promise.all([
   readFile(new URL("background.js", repoRoot), "utf8"),
   readFile(new URL("manifest.json", repoRoot), "utf8"),
@@ -16,6 +17,7 @@ const [
     new URL("utils/capture/douyin-keyword-search.js", repoRoot),
     "utf8",
   ),
+  readFile(new URL("utils/capture/debug-session.js", repoRoot), "utf8"),
 ]);
 const manifest = JSON.parse(manifestSource);
 
@@ -117,7 +119,19 @@ test("task begin checks debugger ownership before changing native groups", () =>
   const groupAt = body.indexOf("captureTaskTabGroupManager.begin");
   assert.ok(ownershipAt >= 0);
   assert.ok(groupAt > ownershipAt);
-  assert.match(body, /capture_task_debug_busy/u);
+  assert.match(body, /classifyDebugOwnership/u);
+  assert.match(body, /createCaptureTaskDebugOwnershipError/u);
+  for (const code of [
+    "capture_task_debug_starvoice_active",
+    "capture_task_external_debugger_busy",
+    "capture_task_debug_ownership_unknown",
+  ]) {
+    assert.match(
+      `${backgroundSource}\n${debugSessionSource}`,
+      new RegExp(code, "u"),
+    );
+  }
+  assert.doesNotMatch(body, /'capture_task_debug_busy'/u);
 });
 
 test("task begin reconciles only confirmed stale native groups before reporting group busy", () => {
@@ -499,7 +513,7 @@ test("filtered items still pass the shared post-item safety delay", () => {
       itemCatchBodyAt > labeledTryAt &&
       itemCatchAt > labeledTryAt,
   );
-  assert.equal((itemBody.match(/break captureCurrentDetail;/gu) || []).length, 2);
+  assert.equal((itemBody.match(/break captureCurrentDetail;/gu) || []).length, 3);
   assert.doesNotMatch(itemBody, /\bcontinue;/u);
   assert.ok(itemFinallyAt > itemCatchAt && itemDelayAt > itemFinallyAt);
 });
@@ -656,7 +670,7 @@ test("required owner is verified before and after task mutations", () => {
   const firstOwnerCheckAt = body.indexOf("requireConnectedCaptureTaskOwner(taskId)");
   const groupAt = body.indexOf("captureTaskTabGroupManager.begin");
   const lastOwnerCheckAt = body.lastIndexOf("requireConnectedCaptureTaskOwner(taskId)");
-  const returnAt = body.indexOf("return {taskId, session, group}");
+  const returnAt = body.indexOf("return {taskId, session, group, debugOwnership}");
   assert.ok(firstOwnerCheckAt >= 0 && firstOwnerCheckAt < groupAt);
   assert.ok(lastOwnerCheckAt > groupAt && lastOwnerCheckAt < returnAt);
   assert.match(body, /ownerRequired = request\.ownerRequired === true/u);

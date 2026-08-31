@@ -602,6 +602,13 @@ async function startRequiredCaptureTaskSession(options = {}) {
   error.code = String(
     result?.response?.error?.code || result?.reason || "capture_task_unavailable",
   );
+  if (
+    result?.response?.error?.details &&
+    typeof result.response.error.details === "object" &&
+    !Array.isArray(result.response.error.details)
+  ) {
+    error.details = {...result.response.error.details};
+  }
   throw error;
 }
 
@@ -1184,7 +1191,15 @@ const UNATTENDED_CAPTURE_SESSION_RETRY_DELAYS_MS = Object.freeze([
 const UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES = new Set([
   "capture_task_group_busy",
   "capture_task_cleanup_pending",
+]);
+const UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES = new Set([
+  "capture_task_group_busy",
   "capture_task_debug_busy",
+  "capture_task_debug_preflight_unavailable",
+  "capture_task_debug_preflight_failed",
+  "capture_task_debug_starvoice_active",
+  "capture_task_external_debugger_busy",
+  "capture_task_debug_ownership_unknown",
 ]);
 let activeUnattendedRunRequestId = "";
 let activeUnattendedRunAttemptId = "";
@@ -4109,7 +4124,7 @@ function resolveCaptureTaskActionCopy(progress = {}) {
         candidateCount > 0
           ? `正在根据当前关键词预判 ${candidateCount} 条列表结果`
           : "正在根据当前关键词预判列表结果",
-      nextAction: "只会高置信度跳过无关项，其余结果继续正常增强",
+      nextAction: "证据不足时先读最小详情二判，再决定是否抓评论和博主数据",
     };
   }
   if (phase === "detail_ai_prefilter_done") {
@@ -4125,7 +4140,7 @@ function resolveCaptureTaskActionCopy(progress = {}) {
     return {
       title:
         failedOpenCount > 0
-          ? `AI 筛选完成 · ${failedOpenCount} 条超时或异常后继续采集`
+          ? `AI 筛选完成 · ${failedOpenCount} 条超时或异常已抽样或延迟增强`
           : filteredCount > 0
           ? `AI 筛选完成 · 已跳过 ${filteredCount} 条无关结果`
           : retryCount > 0
@@ -4135,8 +4150,35 @@ function resolveCaptureTaskActionCopy(progress = {}) {
         readProgressText(progress?.message) || "相关性判断已经完成",
       nextAction:
         failedOpenCount > 0
-          ? "超时或异常条目不会被 AI 跳过，仍会继续采集详情"
+          ? "少量抽样项继续完整采集，其余条目延迟增强并保留审计"
           : "接下来只为需要保留的结果采集详情、评论和博主信息",
+    };
+  }
+  if (
+    phase === "detail_ai_second_stage_start" ||
+    phase === "detail_ai_second_stage_done"
+  ) {
+    return {
+      title:
+        phase === "detail_ai_second_stage_start"
+          ? "AI 正在用最小详情二判"
+          : "AI 二判完成 · 继续完整增强",
+      explanation:
+        readProgressText(progress?.message) ||
+        "仅使用正文、标签和已有画面或口播文字判断相关性",
+      nextAction:
+        phase === "detail_ai_second_stage_start"
+          ? "确认相关后才会读取评论和博主数据"
+          : "开始读取评论和博主数据",
+    };
+  }
+  if (phase === "detail_item_deferred") {
+    return {
+      title: `AI 已延迟${itemLabel}增强`,
+      explanation:
+        readProgressText(progress?.message) ||
+        "最小数据已保留，本轮不继续抓取评论和博主信息",
+      nextAction: "下一轮或手动重试可继续增强",
     };
   }
   if (phase === "detail_item_filtered") {
@@ -18843,6 +18885,13 @@ async function runUnattendedKeywordPlanRequest(request) {
         } catch (error) {
           lastError = error;
           const code = String(error?.code || "").trim();
+          const cloudHandoff = Boolean(
+            request?.cloudAssigned === true &&
+              UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES.has(code),
+          );
+          if (cloudHandoff) {
+            break;
+          }
           const retryable = UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES.has(code);
           if (
             !retryable ||
@@ -18898,6 +18947,13 @@ async function runUnattendedKeywordPlanRequest(request) {
       );
       startError.code = code;
       startError.cause = lastError;
+      if (
+        lastError?.details &&
+        typeof lastError.details === "object" &&
+        !Array.isArray(lastError.details)
+      ) {
+        startError.details = {...lastError.details};
+      }
       throw startError;
     };
     // 抖音首个 /jingxuan -> /search 导航可能触发 Chrome Tab replacement。
@@ -19297,6 +19353,11 @@ async function runUnattendedKeywordPlanRequest(request) {
         error?.code === "UNATTENDED_SEARCH_BOOTSTRAP_FAILED";
       const bootstrapCanceled =
         error?.code === "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
+      const debugOwnershipHandoff = Boolean(
+        UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES.has(
+          String(error?.code || "").trim(),
+        ) && error?.details?.automaticReroute !== false,
+      );
       const cancellation = bootstrapCanceled
         ? resolveUnattendedCancellationTerminal(
             activeCaptureTaskCancellationReason,
@@ -19356,7 +19417,7 @@ async function runUnattendedKeywordPlanRequest(request) {
       }
       const cloudTechnicalRecovery = Boolean(
         request?.cloudAssigned === true &&
-          (bootstrapFailed || elasticItemReleased),
+          (bootstrapFailed || elasticItemReleased || debugOwnershipHandoff),
       );
       const needsAction =
         safetyBlocked || (bootstrapFailed && !cloudTechnicalRecovery);
@@ -19403,6 +19464,8 @@ async function runUnattendedKeywordPlanRequest(request) {
         noCaptureBootstrapSync;
       const terminalMessage = elasticItemReleased
         ? `关键词「${String(error?.keyword || resumeKeyword || "").trim()}」已解除当前 Agent 锁定并交回云端；其它空闲 Agent 可立即接力，当前 Agent 进入冷却${cooldownHomeResult?.ok ? "并已返回平台首页" : ""}`
+        : debugOwnershipHandoff && cloudTechnicalRecovery
+          ? `${String(error?.message || "浏览器调试资源暂不可用").trim()}；当前页面及既有会话保持不动，任务已交回云端等待其它空闲 Agent 接力`
         : cloudTechnicalRecovery
         ? `${bootstrapFailureCopy}，当前关键词已交回云端等待其它 Agent 接力${cooldownHomeResult?.ok ? "；当前 Agent 已返回平台首页并进入冷却" : ""}`
         : bootstrapFailed
@@ -19445,9 +19508,21 @@ async function runUnattendedKeywordPlanRequest(request) {
                     ? {
                         retryable: true,
                         requiresManualAction: false,
-                        category: elasticItemReleased
-                          ? "elastic_item_handoff"
-                          : "temporary_page_readiness",
+                        category: debugOwnershipHandoff
+                          ? "browser_debug_ownership"
+                          : elasticItemReleased
+                            ? "elastic_item_handoff"
+                            : "temporary_page_readiness",
+                        ...(debugOwnershipHandoff
+                          ? {
+                              automaticReroute: true,
+                              debugOwnership: String(
+                                error?.details?.debugOwnership ||
+                                  "unknown_occupancy",
+                              ),
+                              safeToDetach: false,
+                            }
+                          : {}),
                         ...(elasticCooldownRelease
                           ? {
                               itemLockReleased: true,
@@ -29761,6 +29836,7 @@ function isDetailCaptureDone(record) {
     .toLowerCase();
   return (
     isDetailCaptureFiltered(record) ||
+    detailStatus === "deferred" ||
     (detailStatus === "done" &&
       payload.detailPayload &&
       typeof payload.detailPayload === "object")
@@ -29768,13 +29844,15 @@ function isDetailCaptureDone(record) {
 }
 
 function isDetailCaptureRetryable(record) {
-  if (!isDetailCaptureRecord(record) || isDetailCaptureDone(record)) {
+  if (!isDetailCaptureRecord(record)) {
     return false;
   }
   const payload = record?.payload || {};
   const status = String(payload.detailCaptureStatus || "not_started")
     .trim()
     .toLowerCase();
+  if (status === "deferred") return true;
+  if (isDetailCaptureDone(record)) return false;
   return status !== "capturing";
 }
 

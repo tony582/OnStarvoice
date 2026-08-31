@@ -7220,7 +7220,10 @@ test("stale-group recovery never removes a task with a live Debug session", asyn
   });
 
   assert.equal(blocked.ok, false);
-  assert.equal(blocked.error.code, "capture_task_group_busy");
+  assert.equal(blocked.error.code, "capture_task_debug_starvoice_active");
+  assert.equal(blocked.error.details?.debugOwnership, "starvoice_active");
+  assert.equal(blocked.error.details?.automaticReroute, true);
+  assert.equal(blocked.error.details?.safeToDetach, false);
   assert.equal(harness.api.getCaptureTaskGroup("live-debug-task")?.sourceTabId, 41);
 });
 

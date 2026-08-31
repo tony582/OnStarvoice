@@ -2510,6 +2510,32 @@ test("capture progress rejects stale owners before forwarding into local UI", ()
   );
 });
 
+test("cloud Debug ownership conflicts hand off without touching the occupied page", () => {
+  for (const code of [
+    "capture_task_debug_starvoice_active",
+    "capture_task_external_debugger_busy",
+    "capture_task_debug_ownership_unknown",
+  ]) {
+    assert.match(sidebarSource, new RegExp(code, "u"));
+  }
+  const unattendedSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction({",
+  );
+  assert.match(
+    unattendedSection,
+    /request\?\.cloudAssigned === true[\s\S]*UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES\.has\(code\)[\s\S]*if \(cloudHandoff\) \{\s*break;/u,
+  );
+  assert.match(
+    unattendedSection,
+    /debugOwnershipHandoff[\s\S]*browser_debug_ownership[\s\S]*automaticReroute: true[\s\S]*safeToDetach: false/u,
+  );
+  assert.match(
+    unattendedSection,
+    /当前页面及既有会话保持不动，任务已交回云端等待其它空闲 Agent 接力/u,
+  );
+});
+
 test("task surface renders real A/B worker states from progress", () => {
   assert.match(sidebarHtml, /id="debugSessionWorkers"/);
   assert.match(sidebarHtml, /data-worker-index="0"/);

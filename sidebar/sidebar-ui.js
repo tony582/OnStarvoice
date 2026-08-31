@@ -3034,6 +3034,30 @@ function resolveDetailCaptureStatusRow(record) {
     };
   }
 
+  if (status === "deferred") {
+    const audit =
+      payload.aiRelevancePrefilter &&
+      typeof payload.aiRelevancePrefilter === "object"
+        ? payload.aiRelevancePrefilter
+        : {};
+    const reason = String(audit.reason || "").trim();
+    return {
+      text: "AI 增强已延迟 · 最小数据已保留",
+      textClass: "is-partial",
+      rowClass: "is-partial",
+      detail:
+        reason ||
+        "模型超时或异常时未继续抓取评论和博主数据；下一轮或手动重试可继续增强",
+      actions: `
+        <button
+          class="icon-btn is-retry btn-retry-detail"
+          data-record-id="${escapeHtml(record.id)}"
+          type="button"
+        >重试增强</button>
+      `,
+    };
+  }
+
   if (
     status === "done" &&
     payload.detailPayload &&

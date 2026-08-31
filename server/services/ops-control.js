@@ -14,7 +14,7 @@ import {runOpsControlGuardedActions} from './ops-control-actions.js';
 import {normalizeCaptureRecoverySettings} from './capture-recovery-intents.js';
 
 export const OPS_CONTROL_POLICY_VERSION = 'ops-guarded-v1';
-export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.3.99';
+export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.0';
 export const OPS_CONTROL_MODE = 'observe';
 export const OPS_CONTROL_MODES = Object.freeze(['observe', 'guarded']);
 export const OPS_CONTROL_ACTION_TYPES = Object.freeze([
@@ -800,11 +800,13 @@ async function collectPersistence(db, tenantId, window) {
       (SELECT COUNT(*) FROM records record
         WHERE record.tenant_id = $1
           AND record.record_type NOT IN ('official_content', 'blogger_profile')
+          AND record.business_visibility = 'eligible'
           AND (record.ai_labeled_at IS NULL OR record.ai_result->>'relevance' IS NULL)
       )::int AS pending_record_ai_count,
       (SELECT MIN(record.created_at) FROM records record
         WHERE record.tenant_id = $1
           AND record.record_type NOT IN ('official_content', 'blogger_profile')
+          AND record.business_visibility = 'eligible'
           AND (record.ai_labeled_at IS NULL OR record.ai_result->>'relevance' IS NULL)
       ) AS oldest_pending_record_ai_at,
       (SELECT COUNT(*) FROM records record

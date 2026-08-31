@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   Loader2, Flame, Heart, MessageCircle, Star, Share2, X, FileText,
-  Anchor, Type, ListTree, Hash, Sparkles, Copy, ExternalLink, Wand2,
+  Anchor, Type, ListTree, Hash, Sparkles, Copy, Wand2,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, platformName, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { getCover } from '@/components/shared/RecordDrawer'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
 export function HitsPage() {
   const [hits, setHits] = useState<any[]>([])
@@ -120,7 +121,7 @@ function HitDrawer({ hit, onClose, onAnalyzed }: { hit: any; onClose: () => void
                 <span className="inline-flex items-center gap-0.5"><Heart className="h-3 w-3" />{formatNumber(hit.likes)}</span>
                 <span className="inline-flex items-center gap-0.5"><MessageCircle className="h-3 w-3" />{formatNumber(hit.comments_count)}</span>
                 <span className="inline-flex items-center gap-0.5"><Share2 className="h-3 w-3" />{formatNumber(hit.shares)}</span>
-                {hit.url && <a href={hit.url} target="_blank" rel="noreferrer" className="text-primary hover:underline"><ExternalLink className="h-3 w-3" /></a>}
+                <RecordSourceAction record={hit} compact className="text-[11px]" />
               </div>
             </div>
           </div>

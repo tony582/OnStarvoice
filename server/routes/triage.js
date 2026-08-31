@@ -17,6 +17,11 @@ import {
   getRecordLifecycles,
   sendRecordArchived,
 } from '../services/record-lifecycle.js';
+import {
+  enqueueXhsSourceOpen,
+  getXhsSourceOpenTask,
+  redactXhsRecordNavigation,
+} from '../services/xhs-source-open.js';
 
 const router = Router();
 
@@ -100,30 +105,18 @@ function platformUserId(authorId, profileUrl, accountNo, payloadNo) {
   return ''; // 没有真号 → 空,不显示假ID
 }
 
-// 帖子链接:优先用采到的真实帖子URL(含 xsec_token,可直接打开);若那其实是主页/缺失,用 external_id 按平台重建。
+// 小红书 xsec 属于短期、Profile 绑定的导航上下文，禁止写入导出文件或
+// 管理端响应。小红书原文只能在管理端通过 Agent 实时刷新后打开。
 function isNoteUrl(u) {
   const s = String(u || '');
   if (/\/user\/profile\/|\/user\//.test(s)) return false; // 主页不是帖子
   return /\/explore\/|\/discovery\/item\/|\/note\/|\/video\/|weibo\.com\/detail\/|m\.weibo\.cn\/|\/search_result\//.test(s);
 }
-// 小红书笔记链接缺非空 xsec_source 会被判 300013(访问频繁)。导出/原文链接补上 pc_search,
-// token 不动即可正常打开(与采集端 ensureXhsNoteUrlSource 同理)。
-function fixXhsNoteSource(u) {
-  const raw = String(u || '');
-  if (!/xiaohongshu\.com/.test(raw)) return raw;
-  try {
-    const parsed = new URL(raw);
-    if (parsed.searchParams.get('xsec_token') && !parsed.searchParams.get('xsec_source')) {
-      parsed.searchParams.set('xsec_source', 'pc_search');
-    }
-    return parsed.toString();
-  } catch { return raw; }
-}
 function postUrl(r) {
-  if (isNoteUrl(r.url)) return fixXhsNoteSource(r.url);
+  if (r.platform === 'xiaohongshu') return '';
+  if (isNoteUrl(r.url)) return r.url;
   const id = String(r.external_id || '').trim();
   if (!id) return r.url || '';
-  if (r.platform === 'xiaohongshu') return `https://www.xiaohongshu.com/explore/${id}`;
   if (r.platform === 'douyin') return r.note_type === 'image' ? `https://www.douyin.com/note/${id}` : `https://www.douyin.com/video/${id}`;
   if (r.platform === 'weibo') return `https://weibo.com/detail/${id}`;
   return r.url || '';
@@ -146,6 +139,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // workspace.js 的 /badges 计数 import 此常量,保证侧边栏徽标与收件箱列表数字一致。
 export const ACTIVE_QUEUE_CONDITION = `
   r.record_type NOT IN ('official_content', 'blogger_profile')
+  AND r.business_visibility = 'eligible'
   AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
   AND COALESCE(rt.status, 'unhandled') = 'unhandled'
   AND rt.archived_at IS NULL
@@ -154,6 +148,7 @@ export const ACTIVE_QUEUE_CONDITION = `
 // 处理状态和归档生命周期相互独立。两个列表共享状态范围，只按 archived_at 分组。
 const TRIAGE_CONTENT_CONDITION = `
   r.record_type NOT IN ('official_content', 'blogger_profile')
+  AND r.business_visibility = 'eligible'
   AND (
     r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant'
     OR EXISTS (
@@ -560,7 +555,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       });
     }
     const params = [req.tenantId];
-    let where = 'WHERE r.tenant_id = $1';
+    let where = "WHERE r.tenant_id = $1 AND r.business_visibility = 'eligible'";
     where = appendPlatformFilter(where, params, platform);
     where = appendSentimentFilter(where, params, sentiment);
     const bucket = String(req.query.bucket || '');
@@ -622,8 +617,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         LIMIT $${params.length - 1} OFFSET $${params.length}
       )
       SELECT
-        r.id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
-        r.author_fans, r.url, r.cover_url, r.cover_local, r.image_urls, r.image_local_urls, r.note_type,
+        r.id, r.external_id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
+        r.author_fans, r.url, r.canonical_url, r.cover_url, r.cover_local, r.image_urls, r.image_local_urls, r.note_type,
         r.publish_time, r.published_ts, r.publish_location, r.blogger_profile_url,
         r.likes, r.comments_count, r.collects, r.shares,
         r.comments_capture_status, r.comments_total_captured,
@@ -699,17 +694,63 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       ORDER BY ${orderBySql(sort, dir)}
     `, params);
 
-    records.forEach(r => { r.publish_display = formatPublishDate(r.publish_time, r.created_at); });
+    const publicRecords = records.map(record => redactXhsRecordNavigation({
+      ...record,
+      publish_display: formatPublishDate(record.publish_time, record.created_at),
+    }));
 
     return res.json({
       ok: true,
-      records,
+      records: publicRecords,
       pagination: { page: Number(page), pageSize: limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
     if (err.status && err.code) {
       return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
     }
+    return next(err);
+  }
+});
+
+// 小红书搜索卡片链接携带的是短期、Profile 绑定的 xsec 上下文。后台不再回放
+// 历史 token，而是把“原文”交给已升级的在线采集节点，在原 Profile 中重新定位。
+router.post('/records/:recordId/source-open', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const task = await enqueueXhsSourceOpen({
+      tenantId: req.tenantId,
+      recordId: req.params.recordId,
+      requestedByUserId: req.user?.id || '',
+      requestedByName: req.user?.name || req.user?.email || '',
+    });
+    return res.status(task.reused ? 200 : 202).json({ok: true, sourceOpen: task});
+  } catch (err) {
+    if (err.status && err.code) {
+      return res.status(err.status).json({
+        ok: false,
+        error: err.code,
+        message: err.message,
+      });
+    }
+    return next(err);
+  }
+});
+
+router.get('/records/:recordId/source-open/:taskId', requireTenantAccess, async (req, res, next) => {
+  try {
+    const task = await getXhsSourceOpenTask({
+      tenantId: req.tenantId,
+      recordId: req.params.recordId,
+      taskId: req.params.taskId,
+    });
+    if (!task) {
+      return res.status(404).json({
+        ok: false,
+        error: 'source_open_task_not_found',
+        message: '实时打开任务不存在或不属于当前内容',
+      });
+    }
+    return res.json({ok: true, sourceOpen: task});
+  } catch (err) {
     return next(err);
   }
 });
@@ -1233,7 +1274,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       });
     }
     const params = [req.tenantId];
-    let where = 'WHERE r.tenant_id = $1';
+    let where = "WHERE r.tenant_id = $1 AND r.business_visibility = 'eligible'";
     where = appendPlatformFilter(where, params, platform);
     where = appendSentimentFilter(where, params, sentiment);
     const bucket = String(req.query.bucket || '');

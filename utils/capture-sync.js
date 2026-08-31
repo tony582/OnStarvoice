@@ -96,8 +96,11 @@ import {
   XHS_SECURITY_PAGE_MARKERS,
 } from './capture/xiaohongshu-security.js';
 import {
+  evaluateRelevanceDetailRecord,
   evaluateRelevancePrefilterRecords,
+  RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION,
   RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
+  RELEVANCE_PREFILTER_LIST_PROMPT_VERSION,
 } from './capture/relevance-prefilter.js';
 import './capture/target-page-availability.js';
 // StarVoice 未启用福利中心（welfare-usage.js）；相关 welfare 埋点已移除，见下方 no-op。
@@ -118,6 +121,7 @@ const DETAIL_CAPTURE_STATUS = {
   CAPTURING: 'capturing',
   DONE: 'done',
   FILTERED: 'filtered',
+  DEFERRED: 'deferred',
   FAILED: 'failed',
 };
 
@@ -3521,6 +3525,8 @@ export async function batchCaptureDetailsForRecords(
     enabled: Boolean(resolvedEnableAiRelevancePrefilter),
     evaluatedCount: 0,
     skippedCount: 0,
+    minimalDetailCount: 0,
+    deferredCount: 0,
     failedOpenCount: 0,
     retryCount: 0,
     retriedItemCount: 0,
@@ -3530,6 +3536,7 @@ export async function batchCaptureDetailsForRecords(
     canceled: false,
   };
   let relevancePrefilterSkipRecordIdSet = new Set();
+  let relevancePrefilterDeferredRecordIdSet = new Set();
   const recordsForRelevancePrefilter = [];
   if (resolvedEnableAiRelevancePrefilter) {
     for (const recordId of uniqueRecordIds) {
@@ -3559,6 +3566,14 @@ export async function batchCaptureDetailsForRecords(
       relevancePrefilterSkipRecordIdSet = new Set(
         relevancePrefilterResult.skippedRecordIds,
       );
+      relevancePrefilterDeferredRecordIdSet = new Set(
+        relevancePrefilterResult.decisions
+          .filter(
+            (decision) =>
+              decision.executionDisposition === 'defer_enhancement',
+          )
+          .map((decision) => decision.recordId),
+      );
 
       const evaluatedAt = Date.now();
       for (const decision of relevancePrefilterResult.decisions) {
@@ -3575,12 +3590,17 @@ export async function batchCaptureDetailsForRecords(
               .toLowerCase() === DETAIL_CAPTURE_STATUS.DONE &&
             latestPayload.detailPayload &&
             typeof latestPayload.detailPayload === 'object';
+          const terminalStatus = decision.shouldSkip
+            ? DETAIL_CAPTURE_STATUS.FILTERED
+            : decision.executionDisposition === 'defer_enhancement'
+              ? DETAIL_CAPTURE_STATUS.DEFERRED
+              : '';
           const nextPayload =
-            decision.shouldSkip && !hasCompletedDetail
+            terminalStatus && !hasCompletedDetail
               ? applyDetailCapturePatch(
                   latestPayload,
                   createDetailCapturePatch({
-                    status: DETAIL_CAPTURE_STATUS.FILTERED,
+                    status: terminalStatus,
                     finishedAt: evaluatedAt,
                     error: '',
                     failureCode: '',
@@ -3602,10 +3622,10 @@ export async function batchCaptureDetailsForRecords(
                 reason: decision.reason,
                 keyword: decision.keyword,
                 stage: 'list',
-                promptVersion: 'prefilter-list-v3',
+                promptVersion: RELEVANCE_PREFILTER_LIST_PROMPT_VERSION,
                 executionDisposition: decision.shouldSkip
                   ? 'skip_expensive'
-                  : 'collect_full',
+                  : decision.executionDisposition || 'collect_full',
                 modelExecutionDisposition:
                   decision.executionDisposition || null,
                 evaluatedAt,
@@ -3623,7 +3643,7 @@ export async function batchCaptureDetailsForRecords(
         phase: 'detail_ai_prefilter_done',
         message:
           relevancePrefilterResult.failedOpenCount > 0
-            ? `AI 预判完成：${relevancePrefilterResult.failedOpenCount} 条超时或异常，已安全继续采集`
+            ? `AI 预判完成：${relevancePrefilterResult.failedOpenCount} 条超时或异常，已按限额抽样或延迟增强`
             : relevancePrefilterResult.skippedCount > 0
             ? `AI 预判完成：高置信度跳过 ${relevancePrefilterResult.skippedCount} 条，其余继续采集`
             : relevancePrefilterResult.retryCount > 0
@@ -3638,6 +3658,8 @@ export async function batchCaptureDetailsForRecords(
         retryCount: relevancePrefilterResult.retryCount,
         retriedItemCount: relevancePrefilterResult.retriedItemCount,
         timeoutCount: relevancePrefilterResult.timeoutCount,
+        minimalDetailCount: relevancePrefilterResult.minimalDetailCount,
+        deferredCount: relevancePrefilterDeferredRecordIdSet.size,
       }, 'detail ai prefilter done');
     }
   }
@@ -3662,6 +3684,7 @@ export async function batchCaptureDetailsForRecords(
   const preDetailSkipRecordIdSet = new Set([
     ...skipRecordIdSet,
     ...relevancePrefilterSkipRecordIdSet,
+    ...relevancePrefilterDeferredRecordIdSet,
   ]);
   const relevanceDecisionByRecordId = new Map(
     relevancePrefilterResult.decisions.map((decision) => [
@@ -3670,13 +3693,14 @@ export async function batchCaptureDetailsForRecords(
     ]),
   );
 
-  // 全部已采过或被 AI 高置信度过滤 → 不必开补采标签页。
+  // 全部已采过、被 AI 高置信度过滤或按降级策略延迟 → 不开详情页。
   if (
     preDetailSkipRecordIdSet.size > 0 &&
     preDetailSkipRecordIdSet.size === uniqueRecordIds.length
   ) {
     const skippedResults = [];
     let aiFilteredCount = 0;
+    let aiDeferredCount = 0;
     let alreadyCapturedCount = 0;
     for (let index = 0; index < uniqueRecordIds.length; index += 1) {
       const recordId = uniqueRecordIds[index];
@@ -3728,6 +3752,34 @@ export async function batchCaptureDetailsForRecords(
             ...captureTraceFields,
           }, 'detail ai relevance filtered without runner');
         }
+      } else if (relevancePrefilterDeferredRecordIdSet.has(recordId)) {
+        const decision = relevanceDecisionByRecordId.get(recordId) || {};
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'deferred',
+          record,
+          tabId: activeTab?.id,
+        });
+        aiDeferredCount += 1;
+        skippedResults.push({
+          recordId,
+          ok: true,
+          deferred: true,
+          reason: 'ai_relevance_deferred',
+          message: `${markerLabel} AI 暂不可用，已延迟增强且不进入业务视图`,
+          aiRelevanceReason: decision.reason || '',
+          ...captureTraceFields,
+        });
+        await reportProgressFailSoft(onProgress, {
+          phase: 'detail_item_deferred',
+          message: `${progressLabel}：AI 判断异常，已延迟详情、评论和博主增强`,
+          recordId,
+          current: index + 1,
+          total: uniqueRecordIds.length,
+          deferredCount: aiDeferredCount,
+          runnerTabId: activeTab?.id || null,
+          ...captureTraceFields,
+        }, 'detail ai relevance deferred without runner');
       } else {
         await persistAndPublishCaptureTraceState({
           recordId,
@@ -3765,8 +3817,8 @@ export async function batchCaptureDetailsForRecords(
       await reportProgressFailSoft(onProgress, {
         phase: 'detail_batch_done',
         message:
-          aiFilteredCount > 0
-            ? `无需打开详情：AI 已过滤 ${aiFilteredCount} 条无关结果${alreadyCapturedCount > 0 ? `，另有 ${alreadyCapturedCount} 条之前已采过` : ''}`
+          aiFilteredCount > 0 || aiDeferredCount > 0
+            ? `无需打开详情：AI 已过滤 ${aiFilteredCount} 条、延迟增强 ${aiDeferredCount} 条${alreadyCapturedCount > 0 ? `，另有 ${alreadyCapturedCount} 条之前已采过` : ''}`
             : `全部 ${uniqueRecordIds.length} 条均已采过,跳过补采`,
         current: uniqueRecordIds.length,
         total: uniqueRecordIds.length,
@@ -3775,6 +3827,7 @@ export async function batchCaptureDetailsForRecords(
         filteredCount: aiFilteredCount,
         skippedCount: alreadyCapturedCount,
         aiFilteredCount,
+        deferredCount: aiDeferredCount,
       }, 'detail batch done');
     }
     return {
@@ -3788,6 +3841,7 @@ export async function batchCaptureDetailsForRecords(
       filteredCount: aiFilteredCount,
       skippedCount: alreadyCapturedCount,
       aiFilteredCount,
+      deferredCount: aiDeferredCount,
       results: skippedResults,
       diagnostics: { stageTrace: [] },
       error: null,
@@ -3799,6 +3853,7 @@ export async function batchCaptureDetailsForRecords(
   let successCount = 0;
   let failedCount = 0;
   let filteredCount = 0;
+  let deferredCount = 0;
   let skippedCount = 0; // 增量采集:之前已采过、本次跳过的条数(单列,不混入"过滤")
   let securityBlocked = false; // 撞上平台安全限制/验证页 → 立即停整批,别再硬刷
   let integrityBlocked = false; // 任一作品身份无法闭环 → 停整批,禁止继续写入
@@ -4383,11 +4438,12 @@ export async function batchCaptureDetailsForRecords(
       uniqueRecordIds.length - preDetailSkipRecordIdSet.size;
     onProgress({
       phase: 'detail_skip_summary',
-      message: `采集增强：共 ${uniqueRecordIds.length} 条，AI 过滤 ${relevancePrefilterSkipRecordIdSet.size} 条，之前已采过 ${skipRecordIdSet.size} 条，本次补采 ${toCaptureCount} 条`,
+      message: `采集增强：共 ${uniqueRecordIds.length} 条，AI 过滤 ${relevancePrefilterSkipRecordIdSet.size} 条、延迟 ${relevancePrefilterDeferredRecordIdSet.size} 条，之前已采过 ${skipRecordIdSet.size} 条，本次补采 ${toCaptureCount} 条`,
       current: 0,
       total: uniqueRecordIds.length,
       skippedCount: skipRecordIdSet.size,
       aiFilteredCount: relevancePrefilterSkipRecordIdSet.size,
+      deferredCount: relevancePrefilterDeferredRecordIdSet.size,
       toCaptureCount,
       runnerTabId: runnerContext.runnerTabId,
     }, 'detail skip summary');
@@ -4429,8 +4485,8 @@ export async function batchCaptureDetailsForRecords(
         progressLabel,
       };
 
-      // AI 只真正执行 high-confidence skip。灰区、need_detail、接口错误
-      // 和超时都不会进入这个分支，仍沿用下面的原详情采集流程。
+      // 高置信度无关项不再增强；普通 AI 异常按有界抽样策略延迟，避免
+      // 模型故障把整批退化成昂贵的完整详情/评论/主页采集。
       if (relevancePrefilterSkipRecordIdSet.has(recordId)) {
         const decision = relevanceDecisionByRecordId.get(recordId) || {};
         discardPrefetchForRecord(recordId);
@@ -4468,6 +4524,42 @@ export async function batchCaptureDetailsForRecords(
             ...captureTraceFields,
           }, 'detail ai relevance filtered');
         }
+        activeDetailItemContext = null;
+        continue;
+      }
+
+      if (relevancePrefilterDeferredRecordIdSet.has(recordId)) {
+        const decision = relevanceDecisionByRecordId.get(recordId) || {};
+        discardPrefetchForRecord(recordId);
+        await persistAndPublishCaptureTraceState({
+          recordId,
+          state: 'deferred',
+          record,
+          tabId: runnerContext.sourceTabId,
+        });
+        deferredCount += 1;
+        results.push({
+          recordId,
+          ok: true,
+          deferred: true,
+          reason: 'ai_relevance_deferred',
+          message: `${markerLabel} AI 判断异常，已延迟采集增强`,
+          aiRelevanceReason: decision.reason || '',
+          ...captureTraceFields,
+        });
+        await reportProgressFailSoft(onProgress, {
+          phase: 'detail_item_deferred',
+          message: `${progressLabel}：AI 判断异常，已延迟详情、评论和博主增强`,
+          recordId,
+          current,
+          total: uniqueRecordIds.length,
+          successCount,
+          failedCount,
+          filteredCount,
+          deferredCount,
+          runnerTabId: runnerContext.runnerTabId,
+          ...captureTraceFields,
+        }, 'detail ai relevance deferred');
         activeDetailItemContext = null;
         continue;
       }
@@ -5055,6 +5147,196 @@ export async function batchCaptureDetailsForRecords(
           }
         }
         detailPayload = ensureBloggerMetricsFields(detailPayload);
+
+        const listRelevanceDecision =
+          relevanceDecisionByRecordId.get(recordId) || null;
+        const needsMinimalDetailDecision = Boolean(
+          resolvedEnableAiRelevancePrefilter &&
+            listRelevanceDecision &&
+            (listRelevanceDecision.executionDisposition ===
+              'collect_minimal_detail' ||
+              listRelevanceDecision.modelDecision === 'need_detail'),
+        );
+        if (needsMinimalDetailDecision) {
+          activeStage = 'ai_detail_relevance';
+          activeDetailItemContext.activeStage = activeStage;
+          await reportProgressFailSoft(onProgress, {
+            phase: 'detail_ai_second_stage_start',
+            message: `${progressLabel}：已读取最小详情，正在二次判断相关性...`,
+            recordId,
+            current,
+            total: uniqueRecordIds.length,
+            runnerTabId: runnerContext.runnerTabId,
+            ...captureTraceFields,
+          }, 'detail ai second stage start');
+
+          const detailRelevanceDecision = await evaluateRelevanceDetailRecord(
+            record,
+            detailPayload,
+            {
+              enabled: true,
+              keyword:
+                listRelevanceDecision.keyword || relevanceKeyword || '',
+              threshold:
+                settings.aiRelevancePrefilterThreshold ??
+                RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
+              shouldStop: shouldStopDetailBatch,
+            },
+          );
+          const detailDisposition = String(
+            detailRelevanceDecision.executionDisposition || 'collect_full',
+          ).trim().toLowerCase();
+          const detailEvaluatedAt = Date.now();
+          const latestBeforeDecision = (await getRecord(recordId)) || record;
+          const latestBeforeDecisionPayload =
+            latestBeforeDecision.payload &&
+            typeof latestBeforeDecision.payload === 'object'
+              ? latestBeforeDecision.payload
+              : {};
+          const detailAudit = {
+            status: detailRelevanceDecision.status,
+            modelDecision: detailRelevanceDecision.modelDecision,
+            tenantRelevance: detailRelevanceDecision.tenantRelevance,
+            confidence: detailRelevanceDecision.confidence,
+            protectedSignal: Boolean(
+              detailRelevanceDecision.protectedSignal,
+            ),
+            sampledFullCapture: Boolean(
+              detailRelevanceDecision.sampledFullCapture,
+            ),
+            reason: detailRelevanceDecision.reason,
+            keyword:
+              listRelevanceDecision.keyword || relevanceKeyword || '',
+            stage: 'detail',
+            promptVersion: RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION,
+            executionDisposition:
+              detailDisposition === 'skip_full_capture'
+                ? 'skip_expensive'
+                : detailDisposition,
+            modelExecutionDisposition: detailDisposition,
+            parentStage: 'list',
+            parentExecutionDisposition:
+              listRelevanceDecision.executionDisposition || '',
+            evaluatedAt: detailEvaluatedAt,
+          };
+
+          if (
+            detailDisposition === 'skip_full_capture' ||
+            detailDisposition === 'defer_enhancement'
+          ) {
+            const terminalStatus =
+              detailDisposition === 'skip_full_capture'
+                ? DETAIL_CAPTURE_STATUS.FILTERED
+                : DETAIL_CAPTURE_STATUS.DEFERRED;
+            detailPayload = sanitizeMediaFieldsForStorage(
+              normalizeDetailPayloadAgainstRecord(
+                latestBeforeDecision,
+                detailPayload,
+              ),
+            );
+            const terminalPayload = applyDetailCapturePatch(
+              {
+                ...latestBeforeDecisionPayload,
+                aiRelevancePrefilter: detailAudit,
+              },
+              createDetailCapturePatch({
+                status: terminalStatus,
+                startedAt,
+                finishedAt: detailEvaluatedAt,
+                error: '',
+                failureCode: '',
+                failureStage: '',
+                failureCategory: '',
+                diagnosticMessage: '',
+                noteUrl,
+                detailPayload,
+              }),
+            );
+            const terminalTraceState =
+              detailDisposition === 'skip_full_capture'
+                ? 'filtered'
+                : 'deferred';
+            const terminalTraceTransition = transitionRecordCaptureTrace(
+              latestBeforeDecision,
+              terminalPayload,
+              terminalTraceState,
+            );
+            const preview = buildDetailCapturePreview(record, detailPayload);
+            await updateRecord(recordId, {
+              status: RECORD_STATUS.DRAFT,
+              payload: terminalTraceTransition.payload,
+              title: preview.title,
+              summary: preview.summary,
+            });
+            await sendCaptureTraceBindingsToTab(
+              runnerContext.sourceTabId,
+              [terminalTraceTransition.binding],
+            );
+
+            if (detailDisposition === 'skip_full_capture') {
+              filteredCount += 1;
+              results.push({
+                recordId,
+                ok: true,
+                filtered: true,
+                reason: 'ai_detail_relevance_filtered',
+                message: `${markerLabel} 最小详情二判为无关，已跳过评论和博主采集`,
+                aiRelevanceConfidence:
+                  detailRelevanceDecision.confidence ?? null,
+                aiRelevanceReason: detailRelevanceDecision.reason || '',
+                ...captureTraceFields,
+              });
+            } else {
+              deferredCount += 1;
+              results.push({
+                recordId,
+                ok: true,
+                deferred: true,
+                reason: 'ai_detail_relevance_deferred',
+                message: `${markerLabel} 最小详情已保留，评论和博主增强已延迟`,
+                aiRelevanceReason: detailRelevanceDecision.reason || '',
+                ...captureTraceFields,
+              });
+            }
+            await reportProgressFailSoft(onProgress, {
+              phase:
+                detailDisposition === 'skip_full_capture'
+                  ? 'detail_item_filtered'
+                  : 'detail_item_deferred',
+              message:
+                detailDisposition === 'skip_full_capture'
+                  ? `${progressLabel}：最小详情二判为无关，已跳过评论和博主采集`
+                  : `${progressLabel}：最小详情已保留，AI 异常后续增强已延迟`,
+              recordId,
+              current,
+              total: uniqueRecordIds.length,
+              successCount,
+              failedCount,
+              filteredCount,
+              deferredCount,
+              runnerTabId: runnerContext.runnerTabId,
+              ...captureTraceFields,
+            }, 'detail ai second stage terminal');
+            activeDetailItemContext = null;
+            break captureCurrentDetail;
+          }
+
+          await updateRecord(recordId, {
+            payload: {
+              ...latestBeforeDecisionPayload,
+              aiRelevancePrefilter: detailAudit,
+            },
+          });
+          await reportProgressFailSoft(onProgress, {
+            phase: 'detail_ai_second_stage_done',
+            message: `${progressLabel}：二判需继续完整增强，开始采集评论和博主数据`,
+            recordId,
+            current,
+            total: uniqueRecordIds.length,
+            runnerTabId: runnerContext.runnerTabId,
+            ...captureTraceFields,
+          }, 'detail ai second stage done');
+        }
 
         let stopAfterCurrent = false;
         if (shouldCaptureBloggerMetricsForRecord) {
@@ -6156,6 +6438,7 @@ export async function batchCaptureDetailsForRecords(
     successCount,
     failedCount,
     filteredCount,
+    deferredCount,
     keywordFilterMode: detailKeywordFilterEnabled ? 'detail' : '',
     keywordFilterEnabled: detailKeywordFilterEnabled,
     keywordFilteredCount: detailKeywordFilteredCount,
@@ -6182,6 +6465,7 @@ export async function batchCaptureDetailsForRecords(
 
   if (onProgress) {
     const skipNote = skippedCount > 0 ? `，跳过 ${skippedCount} 条(之前已采过)` : '';
+    const deferNote = deferredCount > 0 ? `，延迟增强 ${deferredCount} 条` : '';
     await reportProgressFailSoft(onProgress, {
       phase: canceled
         ? 'detail_batch_canceled'
@@ -6195,21 +6479,22 @@ export async function batchCaptureDetailsForRecords(
               ? 'detail_batch_failed'
               : 'detail_batch_done',
       message: canceled
-        ? `详情补采已中止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
+        ? `详情补采已中止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${deferNote}${skipNote}`
         : securityBlocked
-          ? `详情补采遇到安全验证并已停止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
+          ? `详情补采遇到安全验证并已停止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${deferNote}${skipNote}`
           : integrityBlocked
-            ? `详情补采因作品身份无法确认而停止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
+            ? `详情补采因作品身份无法确认而停止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${deferNote}${skipNote}`
           : runnerInterrupted
-            ? `详情工作页中断，已停止剩余任务：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
+            ? `详情工作页中断，已停止剩余任务：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${deferNote}${skipNote}`
             : batchUnexpectedError
-              ? `详情补采异常终止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`
-              : `详情补采完成：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${skipNote}`,
+              ? `详情补采异常终止：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${deferNote}${skipNote}`
+              : `详情补采完成：成功 ${successCount}，失败 ${failedCount}，过滤 ${filteredCount}${deferNote}${skipNote}`,
       current: processedCount,
       total: uniqueRecordIds.length,
       successCount,
       failedCount,
       filteredCount,
+      deferredCount,
       skippedCount,
       runnerRecoveryCount: detailRunnerRecoveryCount,
       runnerTabId: runnerContext.runnerTabId,
@@ -6237,6 +6522,7 @@ export async function batchCaptureDetailsForRecords(
     successCount,
     failedCount,
     filteredCount,
+    deferredCount,
     skippedCount,
     results,
     diagnostics: {

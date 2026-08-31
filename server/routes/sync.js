@@ -264,6 +264,10 @@ export function normalizeRecord(body) {
 
 export function buildSyncAiJob(result = {}) {
   if (!result.id || result.officialContent) return null;
+  if (
+    result.businessVisibility
+    && result.businessVisibility !== 'eligible'
+  ) return null;
   if (result.action === 'inserted') return { id: result.id, force: false };
   if (result.action === 'updated' && result.shouldRelabel) {
     return { id: result.id, force: true, reason: result.relabelReason || 'capture_enriched' };
