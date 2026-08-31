@@ -9,6 +9,7 @@ import {
   normalizeCapturedRecordLinks,
   resolveDouyinCanonicalRecordUrl,
   resolveXhsCanonicalRecordUrl,
+  resolveXhsSourceRecordUrl,
   resolveGuardedCommentsCount,
   resolveCapturedTextUpdate,
   resolveRecordBusinessVisibility,
@@ -94,12 +95,12 @@ test('Douyin canonical link normalization is conservative without a proven work 
   );
   assert.deepEqual(normalizeCapturedRecordLinks(xiaohongshu), {
     ...xiaohongshu,
-    url: 'https://www.xiaohongshu.com/explore/7679243972795505774',
+    url: '',
     canonical_url: 'https://www.xiaohongshu.com/explore/7679243972795505774',
   });
 });
 
-test('Xiaohongshu search-result detail routes are normalized to stable work URLs', () => {
+test('Xiaohongshu keeps complete navigation URL separate from stable identity URL', () => {
   const record = {
     platform: 'xiaohongshu',
     external_id: '6a92558e000000001f000325',
@@ -114,10 +115,60 @@ test('Xiaohongshu search-result detail routes are normalized to stable work URLs
     resolveXhsCanonicalRecordUrl(record),
     'https://www.xiaohongshu.com/explore/6a92558e000000001f000325',
   );
+  assert.equal(resolveXhsSourceRecordUrl(record), record.url);
   assert.deepEqual(normalizeCapturedRecordLinks(record), {
     ...record,
-    url: 'https://www.xiaohongshu.com/explore/6a92558e000000001f000325',
+    url: record.url,
     canonical_url: 'https://www.xiaohongshu.com/explore/6a92558e000000001f000325',
+  });
+});
+
+test('Xiaohongshu restores the clicked detail URL from payload instead of the bare record URL', () => {
+  const noteId = '68e8d33e0000000005032c3f';
+  const clickedUrl = `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=fresh-detail-token&xsec_source=pc_search`;
+  const record = {
+    platform: 'xiaohongshu',
+    external_id: noteId,
+    url: `https://www.xiaohongshu.com/explore/${noteId}`,
+    payload: {
+      detailCaptureNoteUrl: `https://www.xiaohongshu.com/search_result/${noteId}?xsec_token=fresh-detail-token&xsec_source=pc_search`,
+      items: [{
+        noteId,
+        url: clickedUrl,
+        noteUrl: clickedUrl,
+      }],
+    },
+  };
+
+  assert.equal(resolveXhsSourceRecordUrl(record), clickedUrl);
+  assert.deepEqual(normalizeCapturedRecordLinks(record), {
+    ...record,
+    url: clickedUrl,
+    canonical_url: `https://www.xiaohongshu.com/explore/${noteId}`,
+  });
+});
+
+test('Xiaohongshu rejects bare, insecure and wrong-note URLs as source navigation', () => {
+  const noteId = '6a92558e000000001f000325';
+  const record = {
+    platform: 'xiaohongshu',
+    external_id: noteId,
+    url: `https://www.xiaohongshu.com/explore/${noteId}`,
+    payload: {
+      items: [{
+        noteId,
+        url: `https://www.xiaohongshu.com/explore/6a92558e000000001f000399?xsec_token=wrong-note`,
+      }],
+      detailCaptureNoteUrl: `http://www.xiaohongshu.com/search_result/${noteId}?xsec_token=insecure`,
+      noteUrl: `https://www.xiaohongshu.com:444/explore/${noteId}?xsec_token=wrong-port`,
+    },
+  };
+
+  assert.equal(resolveXhsSourceRecordUrl(record), '');
+  assert.deepEqual(normalizeCapturedRecordLinks(record), {
+    ...record,
+    url: '',
+    canonical_url: `https://www.xiaohongshu.com/explore/${noteId}`,
   });
 });
 

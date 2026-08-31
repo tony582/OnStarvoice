@@ -188,60 +188,113 @@ function parseXhsDirectContentUrl(value) {
   if (!value) return null;
   try {
     const parsed = new URL(String(value).trim());
-    if (!/(^|\.)xiaohongshu\.com$/iu.test(parsed.hostname)) return null;
-    const matched = parsed.pathname.match(
+    if (
+      parsed.protocol !== 'https:'
+      || (parsed.port && parsed.port !== '443')
+      || parsed.username
+      || parsed.password
+      || !/(^|\.)xiaohongshu\.com$/iu.test(parsed.hostname)
+    ) return null;
+    const directMatch = parsed.pathname.match(
       /^\/(?:explore|search_result|discovery\/item|note|video)\/([A-Za-z0-9_-]{8,})(?:\/|$)/iu,
     );
-    if (!matched) return null;
+    const profileMatch = parsed.pathname.match(
+      /^\/user\/profile\/[A-Za-z0-9_-]{6,100}\/([A-Za-z0-9_-]{8,})(?:\/|$)/iu,
+    );
+    const id = directMatch?.[1] || profileMatch?.[1] || '';
+    if (!id) return null;
+    parsed.hash = '';
     return {
-      id: matched[1],
-      url: `https://www.xiaohongshu.com/explore/${matched[1]}`,
+      id,
+      url: parsed.toString(),
+      canonicalUrl: `https://www.xiaohongshu.com/explore/${id}`,
+      hasToken: Boolean(String(parsed.searchParams.get('xsec_token') || '').trim()),
+      hasSource: Boolean(String(parsed.searchParams.get('xsec_source') || '').trim()),
+      path: parsed.pathname,
     };
   } catch {
     return null;
   }
 }
 
+function xhsDirectUrlCandidates(record = {}) {
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
+  return [
+    record.url,
+    parsed.url,
+    parsed.noteUrl,
+    firstItem.url,
+    firstItem.noteUrl,
+    detailPayload.url,
+    detailPayload.noteUrl,
+    itemDetailPayload.url,
+    itemDetailPayload.noteUrl,
+    parsed.detailCaptureNoteUrl,
+    firstItem.detailCaptureNoteUrl,
+    record.canonical_url,
+  ].map(parseXhsDirectContentUrl).filter(Boolean);
+}
+
+function scoreXhsSourceUrl(candidate) {
+  if (!candidate?.hasToken) return -1;
+  let score = candidate.hasSource ? 20 : 0;
+  if (/^\/explore\//iu.test(candidate.path)) score += 50;
+  else if (/^\/discovery\/item\//iu.test(candidate.path)) score += 45;
+  else if (/^\/user\/profile\//iu.test(candidate.path)) score += 40;
+  else if (/^\/(?:note|video)\//iu.test(candidate.path)) score += 35;
+  else if (/^\/search_result\//iu.test(candidate.path)) score += 30;
+  return score;
+}
+
 /**
- * Xiaohongshu /search_result/:id is a browser navigation route. Persist the
- * stable /explore/:id work URL so a failed detail attempt cannot leak its
- * temporary search route into the triage workspace.
+ * Keep the best complete URL captured for the note, preferring the resolved
+ * /explore detail route. canonical_url remains the stable de-duplication key.
  */
+export function resolveXhsSourceRecordUrl(record = {}) {
+  const platform = String(record.platform || '').trim().toLowerCase();
+  const candidates = xhsDirectUrlCandidates(record);
+  if (platform !== 'xiaohongshu' && candidates.length === 0) return '';
+
+  const externalId = normalizeXhsContentId(record.external_id).toLowerCase();
+  const matching = candidates
+    .map((candidate, index) => ({candidate, index, score: scoreXhsSourceUrl(candidate)}))
+    .filter(({candidate, score}) => (
+      score >= 0 && (!externalId || candidate.id.toLowerCase() === externalId)
+    ))
+    .sort((left, right) => right.score - left.score || left.index - right.index);
+  return matching[0]?.candidate.url || '';
+}
+
+/** Keep a stable /explore/:id identity separate from the captured navigation URL. */
 export function resolveXhsCanonicalRecordUrl(record = {}) {
   const platform = String(record.platform || '').trim().toLowerCase();
   const hasXhsUrl = [record.url, record.canonical_url]
     .some(value => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(value || '').replace(/^https?:\/\//iu, '')));
   if (platform !== 'xiaohongshu' && !hasXhsUrl) return '';
 
-  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
-  const candidates = [
-    record.canonical_url,
-    record.url,
-    parsed.detailCaptureNoteUrl,
-    parsed.noteUrl,
-    parsed.url,
-    detailPayload.noteUrl,
-    detailPayload.url,
-    firstItem.detailCaptureNoteUrl,
-    firstItem.noteUrl,
-    firstItem.url,
-    itemDetailPayload.noteUrl,
-    itemDetailPayload.url,
-  ].map(parseXhsDirectContentUrl).filter(Boolean);
+  const candidates = xhsDirectUrlCandidates(record);
   const externalId = normalizeXhsContentId(record.external_id);
   const matching = candidates.find(candidate => !externalId || candidate.id === externalId);
-  if (matching) return matching.url;
+  if (matching) return matching.canonicalUrl;
   return externalId ? `https://www.xiaohongshu.com/explore/${externalId}` : '';
 }
 
 export function normalizeCapturedRecordLinks(record = {}) {
-  const canonicalUrl = resolveDouyinCanonicalRecordUrl(record)
-    || resolveXhsCanonicalRecordUrl(record);
-  if (!canonicalUrl) return record;
+  const douyinCanonicalUrl = resolveDouyinCanonicalRecordUrl(record);
+  if (douyinCanonicalUrl) {
+    return {
+      ...record,
+      url: douyinCanonicalUrl,
+      canonical_url: douyinCanonicalUrl,
+    };
+  }
+
+  const xhsCanonicalUrl = resolveXhsCanonicalRecordUrl(record);
+  if (!xhsCanonicalUrl) return record;
   return {
     ...record,
-    url: canonicalUrl,
-    canonical_url: canonicalUrl,
+    url: resolveXhsSourceRecordUrl(record),
+    canonical_url: xhsCanonicalUrl,
   };
 }
 

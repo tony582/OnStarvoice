@@ -29,11 +29,11 @@ function interaction(row: any) {
   return Number(row.likes || 0) + Number(row.comments_count || 0) + Number(row.collects || 0) + Number(row.shares || 0)
 }
 
-function sourceRecord(row: any) {
+function sourceRecord(row: Record<string, unknown>) {
   return { ...row, id: row.record_id || row.id }
 }
 
-function hasSourceAction(row: any) {
+function hasSourceAction(row: Record<string, unknown>) {
   return String(row?.platform || '').trim().toLowerCase() === 'xiaohongshu' || Boolean(row?.url)
 }
 

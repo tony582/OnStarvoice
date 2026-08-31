@@ -1891,14 +1891,14 @@ function linkCell(url: unknown, label: string) {
   )
 }
 
-function hasRecordSource(record: any) {
+function hasRecordSource(record: Record<string, unknown>) {
   const platform = String(record?.platform || '').trim().toLowerCase()
   const hasXhsUrl = [record?.url, record?.canonical_url]
     .some(url => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(url || '').replace(/^https?:\/\//iu, '')))
   return platform === 'xiaohongshu' || hasXhsUrl || Boolean(resolveRecordOriginalUrl(record))
 }
 
-function recordSourceCell(record: any) {
+function recordSourceCell(record: Record<string, unknown>) {
   if (!hasRecordSource(record)) return <span className="text-muted-foreground">-</span>
   return (
     <RecordSourceAction

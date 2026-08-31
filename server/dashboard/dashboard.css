@@ -532,6 +532,7 @@ tbody tr:last-child td { border-bottom: none; }
 
 a { color: var(--primary); text-decoration: none; transition: color var(--transition); }
 a:hover { color: var(--primary-hover); }
+.source-unavailable { color: var(--text-muted); }
 
 /* ============================================================
    RESPONSIVE

@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.0',
+  latestVersion: '0.4.1',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-31',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.0-20260831.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.1-20260831.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.1',
+      releaseDate: '2026-08-31',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '小红书完整原文链接保留并直接打开',
+              desc: '采集时保留与目标笔记 ID 一致的完整小红书原文链接；后台直接打开已保存链接，不再点击后等待 Agent 重新搜索和慢刷新。未保存有效完整链接的历史内容会明确显示原文不可用。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.0',
       releaseDate: '2026-08-31',

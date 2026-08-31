@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { queryAll, queryOne, execute, withTransaction, getAllSettings, setSettings, getDefaultTenantId } from '../db/init.js';
 import { requireAdmin, requirePlatformAdmin } from '../middleware/auth.js';
 import { serializeRecords } from '../services/record-store.js';
+import { redactXhsRecordNavigation } from '../services/xhs-source-open.js';
 import { hashPassword, normalizeEmail } from '../services/auth-service.js';
 import {
   getAiFailoverStatus,
@@ -622,7 +623,7 @@ router.get('/records', async (req, res, next) => {
 
     return res.json({
       ok: true,
-      records: serializeRecords(records),
+      records: serializeRecords(records).map(record => redactXhsRecordNavigation(record)),
       pagination: { page: Number(page), pageSize: limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {

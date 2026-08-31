@@ -1458,6 +1458,88 @@ function refreshListCaptureMetricsInPlace(existingRecord, freshRecord) {
   return changed;
 }
 
+function validatedFreshXhsCaptureUrl(value, expectedNoteId) {
+  const expected = String(expectedNoteId || '').trim().toLowerCase();
+  if (!expected) return '';
+  try {
+    const url = new URL(String(value || '').trim());
+    const host = String(url.hostname || '').toLowerCase();
+    const actual = String(extractNoteId(url.toString()) || '').trim().toLowerCase();
+    if (
+      url.protocol !== 'https:' ||
+      (host !== 'xiaohongshu.com' && !host.endsWith('.xiaohongshu.com')) ||
+      (url.port && url.port !== '443') ||
+      url.username ||
+      url.password ||
+      actual !== expected ||
+      !String(url.searchParams.get('xsec_token') || '').trim()
+    ) {
+      return '';
+    }
+    return url.toString();
+  } catch {
+    return '';
+  }
+}
+
+export function refreshListCaptureSourceUrlInPlace(existingRecord, freshRecord) {
+  if (
+    resolveRecordIdentityPlatform(existingRecord) !== 'xiaohongshu' ||
+    resolveRecordIdentityPlatform(freshRecord) !== 'xiaohongshu'
+  ) {
+    return false;
+  }
+  const existingItem = existingRecord?.payload?.items?.[0];
+  const freshItem = freshRecord?.payload?.items?.[0];
+  if (!existingItem || typeof existingItem !== 'object') return false;
+  if (!freshItem || typeof freshItem !== 'object') return false;
+
+  const existingNoteId = String(
+    existingItem.noteId ||
+      extractNoteId(existingItem.url) ||
+      extractNoteId(existingItem.noteUrl) ||
+      '',
+  ).trim().toLowerCase();
+  const freshNoteId = String(
+    freshItem.noteId ||
+      extractNoteId(freshItem.url) ||
+      extractNoteId(freshItem.noteUrl) ||
+      '',
+  ).trim().toLowerCase();
+  if (!existingNoteId || existingNoteId !== freshNoteId) return false;
+
+  const nextUrl = [freshItem.url, freshItem.noteUrl, freshItem.detailPageUrl]
+    .map((candidate) => validatedFreshXhsCaptureUrl(candidate, freshNoteId))
+    .find(Boolean) || '';
+  if (!nextUrl) return false;
+
+  let changed = false;
+  if (String(existingItem.url || '').trim() !== nextUrl) {
+    existingItem.url = nextUrl;
+    changed = true;
+  }
+  const replaceSameNoteUrl = (container, field) => {
+    if (!container || typeof container !== 'object') return;
+    if (!Object.prototype.hasOwnProperty.call(container, field)) return;
+    const current = String(container[field] || '').trim();
+    if (String(extractNoteId(current) || '').trim().toLowerCase() !== freshNoteId) {
+      return;
+    }
+    if (current === nextUrl) return;
+    container[field] = nextUrl;
+    changed = true;
+  };
+  replaceSameNoteUrl(existingItem, 'noteUrl');
+  replaceSameNoteUrl(existingItem, 'detailPageUrl');
+  replaceSameNoteUrl(existingRecord.payload, 'url');
+  replaceSameNoteUrl(existingRecord.payload, 'noteUrl');
+  replaceSameNoteUrl(existingRecord.payload, 'detailCaptureNoteUrl');
+  replaceSameNoteUrl(existingRecord.payload?.detailPayload, 'url');
+  replaceSameNoteUrl(existingRecord.payload?.detailPayload, 'noteUrl');
+  if (changed) existingRecord.updatedAt = Date.now();
+  return changed;
+}
+
 const LIST_METRIC_KNOWN_FLAG_KEYS = Object.freeze({
   likes: ['likesKnown', 'likeCountKnown'],
   comments: [
@@ -1688,9 +1770,12 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
         // 没刷新到(0/空/没变)才按「已采过」计入 skipped。
         const keywordLabelsChanged =
           mergeKeywordMatchLabelsInPlace(existingRecord, record);
+        const sourceUrlChanged =
+          refreshListCaptureSourceUrlInPlace(existingRecord, record);
         if (
           refreshListCaptureMetricsInPlace(existingRecord, record) ||
           keywordLabelsChanged ||
+          sourceUrlChanged ||
           traceMerge.changed
         ) {
           refreshedRecords.push(existingRecord);

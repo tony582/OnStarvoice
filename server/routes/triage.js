@@ -18,8 +18,6 @@ import {
   sendRecordArchived,
 } from '../services/record-lifecycle.js';
 import {
-  enqueueXhsSourceOpen,
-  getXhsSourceOpenTask,
   redactXhsRecordNavigation,
 } from '../services/xhs-source-open.js';
 
@@ -708,49 +706,6 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     if (err.status && err.code) {
       return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
     }
-    return next(err);
-  }
-});
-
-// 小红书搜索卡片链接携带的是短期、Profile 绑定的 xsec 上下文。后台不再回放
-// 历史 token，而是把“原文”交给已升级的在线采集节点，在原 Profile 中重新定位。
-router.post('/records/:recordId/source-open', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
-  try {
-    const task = await enqueueXhsSourceOpen({
-      tenantId: req.tenantId,
-      recordId: req.params.recordId,
-      requestedByUserId: req.user?.id || '',
-      requestedByName: req.user?.name || req.user?.email || '',
-    });
-    return res.status(task.reused ? 200 : 202).json({ok: true, sourceOpen: task});
-  } catch (err) {
-    if (err.status && err.code) {
-      return res.status(err.status).json({
-        ok: false,
-        error: err.code,
-        message: err.message,
-      });
-    }
-    return next(err);
-  }
-});
-
-router.get('/records/:recordId/source-open/:taskId', requireTenantAccess, async (req, res, next) => {
-  try {
-    const task = await getXhsSourceOpenTask({
-      tenantId: req.tenantId,
-      recordId: req.params.recordId,
-      taskId: req.params.taskId,
-    });
-    if (!task) {
-      return res.status(404).json({
-        ok: false,
-        error: 'source_open_task_not_found',
-        message: '实时打开任务不存在或不属于当前内容',
-      });
-    }
-    return res.json({ok: true, sourceOpen: task});
-  } catch (err) {
     return next(err);
   }
 });

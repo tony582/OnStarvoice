@@ -76,44 +76,6 @@ function normalizedXhsContentId(value: unknown) {
   return XHS_ID.test(normalized) ? normalized : ''
 }
 
-function directXhsUrl(value: unknown) {
-  if (!value) return null
-  try {
-    const parsed = new URL(String(value).trim())
-    if (!/(^|\.)xiaohongshu\.com$/iu.test(parsed.hostname)) return null
-    const matched = parsed.pathname.match(
-      /^\/(?:explore|search_result|discovery\/item|note|video)\/([A-Za-z0-9_-]{8,})(?:\/|$)/iu,
-    )
-    return matched
-      ? { id: matched[1], url: `https://www.xiaohongshu.com/explore/${matched[1]}` }
-      : null
-  } catch {
-    return null
-  }
-}
-
-function xhsOriginalUrl(record: LooseRecord) {
-  const { payload, firstItem, detailPayload, itemDetailPayload } = payloadParts(record)
-  const candidates = [
-    record.canonical_url,
-    record.url,
-    payload.detailCaptureNoteUrl,
-    payload.noteUrl,
-    payload.url,
-    detailPayload.noteUrl,
-    detailPayload.url,
-    firstItem.detailCaptureNoteUrl,
-    firstItem.noteUrl,
-    firstItem.url,
-    itemDetailPayload.noteUrl,
-    itemDetailPayload.url,
-  ].map(directXhsUrl).filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
-  const id = normalizedXhsContentId(record.external_id)
-  const direct = candidates.find(candidate => !id || candidate.id === id)
-  if (direct) return direct.url
-  return id ? `https://www.xiaohongshu.com/explore/${id}` : ''
-}
-
 function douyinContentId(record: LooseRecord, directCandidates: ReturnType<typeof douyinDirectCandidates>) {
   const { payload, firstItem, detailPayload, itemDetailPayload } = payloadParts(record)
   for (const value of [
@@ -181,9 +143,8 @@ export function resolveRecordOriginalUrl(value: unknown): string {
   const hasXhsUrl = [record.url, record.canonical_url]
     .some(url => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(url || '').replace(/^https?:\/\//iu, '')))
   if (platform === 'xiaohongshu' || hasXhsUrl) {
-    // Xiaohongshu xsec links are temporary capabilities tied to the search
-    // context and Chrome Profile. Callers must use RecordSourceAction so an
-    // online capture Agent refreshes the link locally; never render a stale href.
+    // Callers use RecordSourceAction, which validates the captured xsec URL
+    // against the note identity before exposing a navigation href.
     return ''
   }
   return String(record.canonical_url || record.url || '')

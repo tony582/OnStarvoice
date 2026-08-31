@@ -445,7 +445,6 @@ export async function captureKeywordNotes({
     if (items.length === 0) {
       const sample = allItems.slice(0, 3).map((item) => ({
         noteId: item.noteId,
-        url: item.url,
         title: item.title,
         likes: item.likes,
         collects: item.collects,
@@ -756,7 +755,19 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
       const dedupeKey = String(
         noteId || noteUrl || `${finalTitle}|${authorName}|${cover}`,
       ).trim();
-      if (!dedupeKey || dedupe.has(dedupeKey)) {
+      if (!dedupeKey) {
+        return;
+      }
+      if (dedupe.has(dedupeKey)) {
+        const existing = notes.find((note) => (
+          String(note.noteId || note.url || '').trim() === dedupeKey
+        ));
+        if (existing) {
+          existing.url = pickBestNoteUrl([existing.url, noteUrl]);
+          if (!existing.authorProfileUrl && authorProfileUrl) {
+            existing.authorProfileUrl = authorProfileUrl;
+          }
+        }
         return;
       }
       dedupe.add(dedupeKey);
@@ -798,21 +809,26 @@ function extractNoteUrlFromCard(cardNode) {
 
   const candidates = [];
   if (cardNode instanceof HTMLAnchorElement) {
-    candidates.push(cardNode.getAttribute("href") || cardNode.href || "");
+    candidates.push(cardNode.getAttribute("href"));
+    candidates.push(cardNode.href);
   }
 
   const directLink = cardNode.querySelector(
     'a[href*="/explore/"],a[href*="/discovery/item/"],a[href*="/note/"],a[href*="/video/"],a[href*="/search_result/"],a[href*="/user/profile/"],a[href]',
   );
   if (directLink) {
-    candidates.push(directLink.getAttribute("href") || directLink.href || "");
+    candidates.push(directLink.getAttribute("href"));
+    candidates.push(directLink.href);
   }
 
   const allLinks = cardNode.querySelectorAll(
     "a[href],a[data-href],a[data-url],a[data-note-url]",
   );
   allLinks.forEach((link) => {
-    candidates.push(link.getAttribute("href") || link.href || "");
+    // Keep both the literal attribute and the browser-resolved href. Some SPA
+    // cards update only one of them; scoring below chooses the complete xsec URL.
+    candidates.push(link.getAttribute("href"));
+    candidates.push(link.href);
     candidates.push(link.getAttribute("data-href"));
     candidates.push(link.getAttribute("data-url"));
     candidates.push(link.getAttribute("data-note-url"));
@@ -1529,7 +1545,7 @@ function normalizeAbsoluteUrl(url) {
   }
 }
 
-function pickBestNoteUrl(candidates = []) {
+export function pickBestNoteUrl(candidates = []) {
   const uniqueCandidates = new Set();
   const normalizedCandidates = [];
 
@@ -1585,7 +1601,7 @@ function pickBestAuthorProfileUrl(candidates = []) {
 
 // 小红书笔记 URL 必须带非空 xsec_source(搜索卡片是 pc_search)。卡片 href 里这个值常是空的,
 // 空 source 直开会被判 300013(访问频繁)。采集即补齐,保证存库/导出「帖子链接」「原文」都能开。
-function ensureXhsNoteUrlSource(url) {
+export function ensureXhsNoteUrlSource(url) {
   const raw = String(url || "");
   if (!raw) return raw;
   try {
@@ -1661,7 +1677,7 @@ function hashText(value) {
   return hash.toString(36);
 }
 
-function mergeNotesIntoMap(noteMap, notes = [], maxItems = Infinity) {
+export function mergeNotesIntoMap(noteMap, notes = [], maxItems = Infinity) {
   if (!(noteMap instanceof Map) || !Array.isArray(notes)) {
     return;
   }
@@ -1676,6 +1692,9 @@ function mergeNotesIntoMap(noteMap, notes = [], maxItems = Infinity) {
     noteMap.set(key, {
       ...previous,
       ...note,
+      // Repeated scroll rounds must not let a later bare/canonical URL replace
+      // the complete clickable URL captured for the same note earlier.
+      url: pickBestNoteUrl([previous.url, note.url]),
     });
   });
 }

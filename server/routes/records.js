@@ -24,6 +24,7 @@ import {
 } from '../services/image-text-extraction.js';
 import { formatPublishDate } from '../services/publish-date.js';
 import { getRecordLifecycle, getRecordLifecycles, sendRecordArchived } from '../services/record-lifecycle.js';
+import { redactXhsRecordNavigation } from '../services/xhs-source-open.js';
 
 const router = Router();
 
@@ -184,7 +185,15 @@ async function listRecordTable(req, table) {
     ORDER BY created_at DESC, last_seen_at DESC
     LIMIT $${params.length - 1} OFFSET $${params.length}
   `, params);
-  return { rows, pagination: { page, pageSize, total: Number(total || 0), totalPages: Math.ceil(Number(total || 0) / pageSize) } };
+  return {
+    rows: rows.map(row => redactXhsRecordNavigation(row)),
+    pagination: {
+      page,
+      pageSize,
+      total: Number(total || 0),
+      totalPages: Math.ceil(Number(total || 0) / pageSize),
+    },
+  };
 }
 
 async function listCommentLeadTable(req) {
