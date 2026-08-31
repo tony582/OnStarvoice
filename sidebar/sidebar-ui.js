@@ -2957,21 +2957,13 @@ function resolveAiRelevanceFilteredStatus(payload = {}) {
   const executionDisposition = String(audit.executionDisposition || "")
     .trim()
     .toLowerCase();
-  const modelExecutionDisposition = String(
-    audit.modelExecutionDisposition || "",
-  )
-    .trim()
-    .toLowerCase();
   const modelDecision = String(audit.modelDecision || audit.decision || "")
     .trim()
     .toLowerCase();
   const traceState = String(payload?.captureTrace?.state || "")
     .trim()
     .toLowerCase();
-  const hasAiSkipAudit =
-    executionDisposition === "skip_expensive" ||
-    (modelExecutionDisposition === "skip_full_capture" &&
-      modelDecision === "skip");
+  const hasAiSkipAudit = executionDisposition === "skip_expensive";
   const aiFiltered =
     detailStatus === "filtered" ||
     hasAiSkipAudit ||

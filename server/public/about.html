@@ -70,7 +70,14 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.1<span class="date">2026-08-31</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.2<span class="date">2026-08-31</span><span class="pill">最新</span></h3>
+          <ul>
+            <li>统一服务端与 Extension 的 AI 相关性执行契约；服务端确认明显无关后，在打开详情页前停止，不再采集正文、评论和博主数据。</li>
+            <li>区分模型建议与 Extension 实际动作，修复页面显示“已跳过增强”但实际仍继续采集的假状态。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.1<span class="date">2026-08-31</span></h3>
           <ul>
             <li>采集时保留与目标笔记 ID 一致的完整小红书原文链接，后台直接打开已保存链接；移除点击后等待 Agent 重新搜索的慢刷新流程。</li>
             <li>历史内容未保存可核验的完整链接时，明确显示“原文不可用”，不再自动触发搜索或用稳定身份链接替代原文。</li>

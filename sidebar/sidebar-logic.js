@@ -29794,11 +29794,6 @@ function isAiRelevanceFilteredPayload(payload = {}) {
   const executionDisposition = String(audit.executionDisposition || "")
     .trim()
     .toLowerCase();
-  const modelExecutionDisposition = String(
-    audit.modelExecutionDisposition || "",
-  )
-    .trim()
-    .toLowerCase();
   const modelDecision = String(audit.modelDecision || audit.decision || "")
     .trim()
     .toLowerCase();
@@ -29808,8 +29803,6 @@ function isAiRelevanceFilteredPayload(payload = {}) {
 
   return (
     executionDisposition === "skip_expensive" ||
-    (modelExecutionDisposition === "skip_full_capture" &&
-      modelDecision === "skip") ||
     (traceState === "filtered" && modelDecision === "skip")
   );
 }

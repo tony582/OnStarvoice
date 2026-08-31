@@ -90,13 +90,13 @@ test('detail candidate contains only bounded minimal evidence', () => {
   assert.doesNotMatch(serialized, /评论不得发送|bloggerFollowersCount|private\.example/u);
 });
 
-test('only valid high-confidence skip is actionable', () => {
+test('a valid server skip disposition is actionable without a second client threshold', () => {
   assert.equal(
     normalizeRelevancePrefilterDecision({
       status: 'ok',
       modelDecision: 'skip',
       tenantRelevance: 'irrelevant',
-      confidence: 0.97,
+      confidence: 0.95,
       executionDisposition: 'skip_full_capture',
     }).shouldSkip,
     true,
@@ -113,13 +113,6 @@ test('only valid high-confidence skip is actionable', () => {
     'legacy decision alias remains fail-safe compatible',
   );
   for (const response of [
-    {
-      status: 'ok',
-      modelDecision: 'skip',
-      tenantRelevance: 'irrelevant',
-      confidence: 0.969,
-      executionDisposition: 'skip_full_capture',
-    },
     {status: 'ok', modelDecision: 'need_detail', tenantRelevance: 'uncertain', confidence: 1},
     {status: 'timeout', modelDecision: 'skip', confidence: 1},
     {status: 'ok', modelDecision: 'skip', confidence: 'invalid'},
@@ -138,6 +131,27 @@ test('only valid high-confidence skip is actionable', () => {
       confidence: 1,
       executionDisposition: 'skip_full_capture',
     }).shouldSkip,
+    false,
+  );
+  assert.equal(
+    normalizeRelevancePrefilterDecision({
+      status: 'ok',
+      modelDecision: 'skip',
+      tenantRelevance: 'irrelevant',
+      confidence: 1,
+      protectedSignal: true,
+      executionDisposition: 'skip_full_capture',
+    }).shouldSkip,
+    false,
+  );
+  assert.equal(
+    normalizeRelevancePrefilterDecision({
+      status: 'ok',
+      modelDecision: 'skip',
+      tenantRelevance: 'irrelevant',
+      confidence: 1,
+      executionDisposition: 'skip_full_capture',
+    }, {canSkip: false}).shouldSkip,
     false,
   );
 });
@@ -504,6 +518,19 @@ test('detail batch invokes AI before creating a detail runner and only for keywo
       'AI filtering must not delete list records in either terminal branch',
     );
   }
+
+  const mixedSkipStart = aiSkipBranches[1].index;
+  const mixedSkipEnd = fullBody.indexOf(
+    'if (relevancePrefilterDeferredRecordIdSet.has(recordId))',
+    mixedSkipStart,
+  );
+  const mixedSkipBranch = fullBody.slice(mixedSkipStart, mixedSkipEnd);
+  assert.match(mixedSkipBranch, /continue;/u);
+  assert.doesNotMatch(
+    mixedSkipBranch,
+    /captureCurrentNotePayload|captureCommentsForCurrentNote|captureBloggerMetricsForDetailPayload/u,
+    'an actionable list skip must exit before detail, comment or blogger capture',
+  );
 
   const noteCaptureAt = fullBody.indexOf('let noteResult = await captureCurrentNotePayload();');
   const secondStageAt = fullBody.indexOf('await evaluateRelevanceDetailRecord(');

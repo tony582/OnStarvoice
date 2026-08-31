@@ -363,7 +363,7 @@ function isTimeoutLikeError(error) {
 
 export function normalizeRelevancePrefilterDecision(
   raw = {},
-  {threshold = RELEVANCE_PREFILTER_DEFAULT_THRESHOLD, canSkip = true} = {},
+  {canSkip = true} = {},
 ) {
   const status = normalizeText(raw?.status, 40).toLocaleLowerCase();
   const modelDecision = normalizeText(
@@ -379,7 +379,6 @@ export function normalizeRelevancePrefilterDecision(
     raw?.executionDisposition,
     80,
   ).toLocaleLowerCase();
-  const normalizedThreshold = normalizeThreshold(threshold);
   const protectedSignal = raw?.protectedSignal === true;
   const valid =
     status === 'ok' &&
@@ -394,8 +393,7 @@ export function normalizeRelevancePrefilterDecision(
       modelDecision === 'skip' &&
       tenantRelevance === 'irrelevant' &&
       !protectedSignal &&
-      executionDisposition === 'skip_full_capture' &&
-      confidence >= normalizedThreshold,
+      executionDisposition === 'skip_full_capture',
   );
   return {
     valid,

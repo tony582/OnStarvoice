@@ -155,6 +155,51 @@ test("AI skips persist as a terminal filtered detail state and settle without op
   assert.match(allSkippedSection, /state:\s*'deferred'/);
 });
 
+test("capture audit separates the server model disposition from the action actually executed", () => {
+  const helperSection = readSourceSection(
+    captureSyncSource,
+    "function resolveActualRelevanceExecutionDisposition(decision = {})",
+    "const CAPTURE_TASK_MESSAGE_TYPE",
+  );
+  const context = vm.createContext({});
+  vm.runInContext(
+    `${helperSection}\nglobalThis.__resolveDisposition = resolveActualRelevanceExecutionDisposition;`,
+    context,
+  );
+  const resolveDisposition = context.__resolveDisposition;
+
+  assert.equal(
+    resolveDisposition({
+      shouldSkip: true,
+      executionDisposition: "skip_full_capture",
+    }),
+    "skip_expensive",
+  );
+  assert.equal(
+    resolveDisposition({
+      shouldSkip: false,
+      executionDisposition: "skip_full_capture",
+    }),
+    "collect_full",
+  );
+  assert.equal(
+    resolveDisposition({executionDisposition: "defer_enhancement"}),
+    "defer_enhancement",
+  );
+  assert.equal(
+    resolveDisposition({executionDisposition: "collect_minimal_detail"}),
+    "collect_minimal_detail",
+  );
+  assert.match(
+    captureSyncSource,
+    /executionDisposition:\s*actualExecutionDisposition,[\s\S]*modelExecutionDisposition:\s*decision\.executionDisposition/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /executionDisposition:\s*actualDetailDisposition,[\s\S]*modelExecutionDisposition:\s*detailDisposition/u,
+  );
+});
+
 test("filtered records are terminal for pending, retry and sync-blocker logic including legacy records", () => {
   const section = readSourceSection(
     sidebarLogic,
@@ -184,6 +229,20 @@ test("filtered records are terminal for pending, retry and sync-blocker logic in
       },
     }),
     true,
+  );
+  assert.equal(
+    isDone({
+      type: "keyword_notes",
+      payload: {
+        aiRelevancePrefilter: {
+          modelDecision: "skip",
+          modelExecutionDisposition: "skip_full_capture",
+          executionDisposition: "collect_full",
+        },
+      },
+    }),
+    false,
+    "a raw model skip is not a completed client action",
   );
   assert.equal(
     isDone({
@@ -235,6 +294,18 @@ test("record cards visibly explain AI filtering with keyword, confidence and rea
   assert.match(status.detail, /关键词「别克壁纸」/);
   assert.match(status.detail, /置信度 99%/);
   assert.match(status.detail, /内容主体为大众汽车/);
+  assert.equal(
+    context.__resolve({
+      detailCaptureStatus: "done",
+      aiRelevancePrefilter: {
+        modelDecision: "skip",
+        modelExecutionDisposition: "skip_full_capture",
+        executionDisposition: "collect_full",
+      },
+    }),
+    null,
+    "the card must not claim an enhancement skip that the client did not execute",
+  );
 
   const rowSection = readSourceSection(
     sidebarUi,

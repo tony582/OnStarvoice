@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.1',
+  latestVersion: '0.4.2',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-08-31',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.1-20260831.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.2-20260831.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.2',
+      releaseDate: '2026-08-31',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: 'AI 明确无关内容真正停止增强采集',
+              desc: '统一服务端与 Extension 的相关性执行契约：服务端确认 skip_full_capture 后，Extension 会在打开详情页之前停止，不再采集正文、评论和博主数据；同时区分模型建议与实际动作，避免显示“已跳过”却仍继续采集。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.1',
       releaseDate: '2026-08-31',

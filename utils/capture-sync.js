@@ -125,6 +125,18 @@ const DETAIL_CAPTURE_STATUS = {
   FAILED: 'failed',
 };
 
+function resolveActualRelevanceExecutionDisposition(decision = {}) {
+  const modelDisposition = String(
+    decision?.executionDisposition || '',
+  ).trim().toLowerCase();
+  if (decision?.shouldSkip === true) return 'skip_expensive';
+  if (modelDisposition === 'defer_enhancement') return 'defer_enhancement';
+  if (modelDisposition === 'collect_minimal_detail') {
+    return 'collect_minimal_detail';
+  }
+  return 'collect_full';
+}
+
 const CAPTURE_TASK_MESSAGE_TYPE = Object.freeze({
   BEGIN: 'onstarvoice:begin-capture-task',
   UPDATE: 'onstarvoice:update-capture-task',
@@ -3680,6 +3692,8 @@ export async function batchCaptureDetailsForRecords(
             : decision.executionDisposition === 'defer_enhancement'
               ? DETAIL_CAPTURE_STATUS.DEFERRED
               : '';
+          const actualExecutionDisposition =
+            resolveActualRelevanceExecutionDisposition(decision);
           const nextPayload =
             terminalStatus && !hasCompletedDetail
               ? applyDetailCapturePatch(
@@ -3708,9 +3722,7 @@ export async function batchCaptureDetailsForRecords(
                 keyword: decision.keyword,
                 stage: 'list',
                 promptVersion: RELEVANCE_PREFILTER_LIST_PROMPT_VERSION,
-                executionDisposition: decision.shouldSkip
-                  ? 'skip_expensive'
-                  : decision.executionDisposition || 'collect_full',
+                executionDisposition: actualExecutionDisposition,
                 modelExecutionDisposition:
                   decision.executionDisposition || null,
                 evaluatedAt,
@@ -5238,9 +5250,8 @@ export async function batchCaptureDetailsForRecords(
         const needsMinimalDetailDecision = Boolean(
           resolvedEnableAiRelevancePrefilter &&
             listRelevanceDecision &&
-            (listRelevanceDecision.executionDisposition ===
-              'collect_minimal_detail' ||
-              listRelevanceDecision.modelDecision === 'need_detail'),
+            listRelevanceDecision.executionDisposition ===
+              'collect_minimal_detail',
         );
         if (needsMinimalDetailDecision) {
           activeStage = 'ai_detail_relevance';
@@ -5271,6 +5282,10 @@ export async function batchCaptureDetailsForRecords(
           const detailDisposition = String(
             detailRelevanceDecision.executionDisposition || 'collect_full',
           ).trim().toLowerCase();
+          const actualDetailDisposition =
+            resolveActualRelevanceExecutionDisposition(
+              detailRelevanceDecision,
+            );
           const detailEvaluatedAt = Date.now();
           const latestBeforeDecision = (await getRecord(recordId)) || record;
           const latestBeforeDecisionPayload =
@@ -5294,10 +5309,7 @@ export async function batchCaptureDetailsForRecords(
               listRelevanceDecision.keyword || relevanceKeyword || '',
             stage: 'detail',
             promptVersion: RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION,
-            executionDisposition:
-              detailDisposition === 'skip_full_capture'
-                ? 'skip_expensive'
-                : detailDisposition,
+            executionDisposition: actualDetailDisposition,
             modelExecutionDisposition: detailDisposition,
             parentStage: 'list',
             parentExecutionDisposition:
@@ -5306,11 +5318,11 @@ export async function batchCaptureDetailsForRecords(
           };
 
           if (
-            detailDisposition === 'skip_full_capture' ||
-            detailDisposition === 'defer_enhancement'
+            actualDetailDisposition === 'skip_expensive' ||
+            actualDetailDisposition === 'defer_enhancement'
           ) {
             const terminalStatus =
-              detailDisposition === 'skip_full_capture'
+              actualDetailDisposition === 'skip_expensive'
                 ? DETAIL_CAPTURE_STATUS.FILTERED
                 : DETAIL_CAPTURE_STATUS.DEFERRED;
             detailPayload = sanitizeMediaFieldsForStorage(
@@ -5338,7 +5350,7 @@ export async function batchCaptureDetailsForRecords(
               }),
             );
             const terminalTraceState =
-              detailDisposition === 'skip_full_capture'
+              actualDetailDisposition === 'skip_expensive'
                 ? 'filtered'
                 : 'deferred';
             const terminalTraceTransition = transitionRecordCaptureTrace(
@@ -5358,7 +5370,7 @@ export async function batchCaptureDetailsForRecords(
               [terminalTraceTransition.binding],
             );
 
-            if (detailDisposition === 'skip_full_capture') {
+            if (actualDetailDisposition === 'skip_expensive') {
               filteredCount += 1;
               results.push({
                 recordId,
@@ -5385,11 +5397,11 @@ export async function batchCaptureDetailsForRecords(
             }
             await reportProgressFailSoft(onProgress, {
               phase:
-                detailDisposition === 'skip_full_capture'
+                actualDetailDisposition === 'skip_expensive'
                   ? 'detail_item_filtered'
                   : 'detail_item_deferred',
               message:
-                detailDisposition === 'skip_full_capture'
+                actualDetailDisposition === 'skip_expensive'
                   ? `${progressLabel}：最小详情二判为无关，已跳过评论和博主采集`
                   : `${progressLabel}：最小详情已保留，AI 异常后续增强已延迟`,
               recordId,
