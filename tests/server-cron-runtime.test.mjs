@@ -324,6 +324,51 @@ test('scheduler recovery stops when command reconciliation fails', async () => {
   runtime.destroy();
 });
 
+test('scheduler recovery stops when elastic lease reconciliation fails', async () => {
+  const fakeCron = createFakeCron();
+  const sequence = [];
+  const errors = [];
+  const runtime = startSchedulerCronJobs({
+    cronModule: fakeCron,
+    logger: {
+      log() {},
+      error(...args) {
+        errors.push(args);
+      },
+    },
+    jobs: safeJobs({
+      async reconcilePendingCaptureCommands() {
+        sequence.push('reconcile');
+        return {commandCount: 0};
+      },
+      async enqueueDueCaptureOrchestrations(limit) {
+        sequence.push(`orchestration:${limit}`);
+        return [];
+      },
+      async reconcileElasticCaptureLeases(limit) {
+        sequence.push(`elastic:${limit}`);
+        throw new Error('elastic reconciliation failed');
+      },
+      async reconcileAutomaticCaptureRetries() {
+        sequence.push('automatic');
+        return {dispatched: 0, waitingForAgent: 0, manualOnly: 0, failed: 0};
+      },
+    }),
+  });
+
+  await fakeCron.registrations[2].task.fire();
+  assert.deepEqual(sequence, [
+    'reconcile',
+    'orchestration:20',
+    'elastic:50',
+  ]);
+  assert.deepEqual(errors, [[
+    '[Cron] Multi-Agent schedule/recovery error:',
+    'elastic reconciliation failed',
+  ]]);
+  runtime.destroy();
+});
+
 test('AI cron owns batch labeling and configured reports only', async () => {
   const fakeCron = createFakeCron();
   let labelingLimit = 0;
