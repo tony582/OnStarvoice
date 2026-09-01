@@ -8,12 +8,17 @@ import {fileURLToPath} from 'node:url';
 
 import {validatePostgresIntegrationTarget} from '../../../scripts/lib/postgres-integration-target.mjs';
 import {createApp} from '../../../server/app.js';
+import {withTransaction} from '../../../server/db/init.js';
 import {runMigrations} from '../../../server/db/migrate.js';
 import {closePool, getPool} from '../../../server/db/pool.js';
 import {
   dispatchCrossDeviceRetry,
 } from '../../../server/modules/capture/infrastructure/postgres-cross-device-retry.js';
 import {createSession} from '../../../server/services/auth-service.js';
+import {
+  enqueueDueProfilePatrolTasks,
+  materializeProfilePatrolTask,
+} from '../../../server/services/profile-patrol-dispatch.js';
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -334,6 +339,36 @@ async function assertWaitingOnAdvisoryFence({
   }]);
 }
 
+async function assertGrantedAdvisoryFence({
+  observerClient,
+  holderPid,
+  namespace,
+  key,
+}) {
+  await observerClient.query('SELECT pg_stat_clear_snapshot()');
+  const result = await observerClient.query(`
+    SELECT
+      lock.classid::text::bigint =
+        ((hashtext($1)::bigint + 4294967296) % 4294967296)
+        AS namespace_matches,
+      lock.objid::text::bigint =
+        ((hashtext($2)::bigint + 4294967296) % 4294967296)
+        AS key_matches,
+      lock.objsubid = 2 AS two_key_lock
+    FROM pg_locks lock
+    WHERE lock.pid = $3
+      AND lock.locktype = 'advisory'
+      AND lock.granted = true
+  `, [namespace, key, holderPid]);
+  assert.ok(
+    result.rows.some(row =>
+      row.namespace_matches === true &&
+      row.key_matches === true &&
+      row.two_key_lock === true),
+    `${namespace}/${key} was not held by backend ${holderPid}`,
+  );
+}
+
 async function createRetryRaceFixture(pool, token) {
   const tenant = await pool.query(
     'INSERT INTO tenants (name) VALUES ($1) RETURNING id',
@@ -516,6 +551,222 @@ async function createRetryRaceFixture(pool, token) {
     tenantId,
     userId,
   };
+}
+
+async function createProfileRetryRaceFixture(pool, token) {
+  const tenant = await pool.query(
+    'INSERT INTO tenants (name) VALUES ($1) RETURNING id',
+    [`P3 profile retry lock ${token}`],
+  );
+  const tenantId = tenant.rows[0].id;
+  const capabilities = {
+    taskStateKnown: true,
+    remoteTaskCreate: true,
+    remoteTargetedPostCaptureV1: true,
+    followedCreatorPostPatrol: true,
+    supportedPlatforms: ['douyin'],
+  };
+  const createAgent = async (label) => {
+    const authCode = await pool.query(`
+      INSERT INTO auth_codes (
+        tenant_id, code, type, status, max_bindings
+      ) VALUES ($1, $2, 'permanent', 'active', 1)
+      RETURNING id
+    `, [tenantId, `P3-PROFILE-LOCK-${label}-${token}`]);
+    const authCodeId = authCode.rows[0].id;
+    const binding = await pool.query(`
+      INSERT INTO auth_bindings (code_id, fingerprint)
+      VALUES ($1, $2)
+      RETURNING id
+    `, [authCodeId, `p3-profile-lock-${label}-${token}`]);
+    const authBindingId = binding.rows[0].id;
+    const agent = await pool.query(`
+      INSERT INTO capture_agents (
+        tenant_id, auth_code_id, auth_binding_id, client_uuid,
+        display_name, allowed_platforms, capabilities, status,
+        last_heartbeat_at, last_liveness_at, last_full_heartbeat_at
+      ) VALUES (
+        $1, $2, $3, $4,
+        $5, ARRAY['douyin']::text[], $6::jsonb, 'active',
+        now(), now(), now()
+      )
+      RETURNING *
+    `, [
+      tenantId,
+      authCodeId,
+      authBindingId,
+      `p3-profile-lock-${label}-${token}`,
+      `P3 profile ${label} ${token}`,
+      JSON.stringify(capabilities),
+    ]);
+    return agent.rows[0];
+  };
+  const sourceAgent = await createAgent('source');
+  const targetAgent = await createAgent('target');
+  const subscription = await pool.query(`
+    INSERT INTO monitor_subscriptions (
+      tenant_id, name, keyword, platform, account_url,
+      cadence_minutes, status, next_run_at, subject_type,
+      assigned_agent_id
+    ) VALUES (
+      $1, $2, $3, 'douyin', $4,
+      60, 'active', now() - interval '1 minute', 'creator',
+      $5
+    )
+    RETURNING *
+  `, [
+    tenantId,
+    `P3 profile retry lock ${token}`,
+    `profile-retry-${token}`,
+    `https://www.douyin.com/user/profile-retry-${token}`,
+    targetAgent.id,
+  ]);
+  const subscriptionRow = subscription.rows[0];
+  const sourceTaskId = randomUUID();
+  const sourceDispatch = await withTransaction(async tx =>
+    materializeProfilePatrolTask(tx, {
+      tenantId,
+      subjectType: 'creator',
+      agent: sourceAgent,
+      subscriptions: [subscriptionRow],
+      requestKey: sourceTaskId,
+      title: `P3 Profile lock source ${token}`,
+      monitorSettings: {
+        publishWindow: '7d',
+        timezone: 'Asia/Shanghai',
+      },
+      captureSettings: {autoSyncAfterDetailCapture: true},
+      triggerType: 'profile_scan_manual',
+      requestedByName: 'P3 profile lock fixture',
+      actorType: 'system',
+    }));
+  const item = await pool.query(`
+    SELECT id, metadata
+    FROM capture_task_items
+    WHERE tenant_id = $1 AND task_id = $2
+  `, [tenantId, sourceTaskId]);
+  assert.equal(item.rows.length, 1);
+  const itemId = item.rows[0].id;
+  const monitorExecutionId = item.rows[0].metadata.monitorExecutionId;
+  assert.match(monitorExecutionId, /^[0-9a-f-]{36}$/u);
+
+  await pool.query(`
+    UPDATE capture_tasks
+    SET status = 'failed',
+      error = '{"code":"TRANSIENT_NETWORK"}'::jsonb,
+      started_at = COALESCE(started_at, now() - interval '2 minutes'),
+      finished_at = now(), updated_at = now(), source_updated_at = now()
+    WHERE id = $1 AND tenant_id = $2
+  `, [sourceTaskId, tenantId]);
+  await pool.query(`
+    UPDATE capture_task_items
+    SET status = 'retryable', attempt_count = 1,
+      error = '{"code":"TRANSIENT_NETWORK"}'::jsonb,
+      started_at = COALESCE(started_at, now() - interval '2 minutes'),
+      finished_at = now(), updated_at = now()
+    WHERE id = $1 AND tenant_id = $2
+  `, [itemId, tenantId]);
+  await pool.query(`
+    UPDATE capture_task_item_attempts
+    SET status = 'retryable',
+      error = '{"code":"TRANSIENT_NETWORK"}'::jsonb,
+      started_at = COALESCE(started_at, now() - interval '2 minutes'),
+      finished_at = now(), updated_at = now()
+    WHERE item_id = $1 AND tenant_id = $2
+  `, [itemId, tenantId]);
+  await pool.query(`
+    UPDATE capture_agent_commands
+    SET status = 'failed',
+      result = '{"error":"TRANSIENT_NETWORK"}'::jsonb,
+      finished_at = now(), updated_at = now()
+    WHERE id = $1 AND tenant_id = $2
+  `, [sourceDispatch.commandId, tenantId]);
+  await pool.query(`
+    UPDATE monitor_executions
+    SET status = 'failed',
+      error_message = 'P3 profile retry lock fixture',
+      finished_at = now(), updated_at = now()
+    WHERE id = $1 AND tenant_id = $2
+  `, [monitorExecutionId, tenantId]);
+  await pool.query(`
+    UPDATE capture_agents
+    SET status = 'paused', updated_at = now()
+    WHERE id = $1 AND tenant_id = $2
+  `, [sourceAgent.id, tenantId]);
+
+  return {
+    itemId,
+    monitorExecutionId,
+    sourceAgentId: sourceAgent.id,
+    sourceTaskId,
+    subscriptionId: subscriptionRow.id,
+    targetAgentId: targetAgent.id,
+    tenantId,
+  };
+}
+
+async function readProfileRetryRaceState(pool, fixture) {
+  const result = await pool.query(`
+    SELECT
+      (SELECT task_type
+       FROM capture_tasks
+       WHERE id = $1::uuid) AS parent_task_type,
+      (SELECT status
+       FROM capture_tasks
+       WHERE id = $1::uuid) AS parent_status,
+      (SELECT orchestration_revision
+       FROM capture_tasks
+       WHERE id = $1::uuid) AS parent_revision,
+      (SELECT count(*)::integer
+       FROM capture_tasks
+       WHERE parent_task_id = $1::uuid
+         AND trigger_type = 'cross_device_retry') AS retry_task_count,
+      (SELECT count(*)::integer
+       FROM capture_tasks scheduled_task
+       JOIN capture_task_items scheduled_item
+         ON scheduled_item.task_id = scheduled_task.id
+        AND scheduled_item.tenant_id = scheduled_task.tenant_id
+       WHERE scheduled_task.tenant_id = $2
+         AND scheduled_task.trigger_type = 'profile_scan_schedule'
+         AND scheduled_item.external_id = $3::uuid::text
+       ) AS scheduled_task_count,
+      (SELECT count(*)::integer
+       FROM capture_agent_commands command
+       JOIN capture_tasks child ON child.id = command.task_id
+       WHERE child.parent_task_id = $1::uuid
+         AND child.trigger_type = 'cross_device_retry'
+         AND command.command_type = 'create') AS retry_command_count,
+      (SELECT count(*)::integer
+       FROM capture_task_events
+       WHERE task_id = $1::uuid
+         AND event_type = 'cross_device_retry_dispatched') AS retry_event_count,
+      (SELECT count(*)::integer
+       FROM capture_task_item_attempts
+       WHERE item_id = $4::uuid) AS item_attempt_count,
+      (SELECT count(*)::integer
+       FROM monitor_executions
+       WHERE subscription_id = $3::uuid
+         AND status IN ('pending', 'running')) AS active_execution_count,
+      (SELECT status
+       FROM monitor_executions
+       WHERE id = $5::uuid) AS source_execution_status,
+      (SELECT metadata->>'monitorExecutionId'
+       FROM capture_task_items
+       WHERE id = $4::uuid) AS current_execution_id,
+      (SELECT assigned_agent_id
+       FROM capture_task_items
+       WHERE id = $4::uuid) AS current_agent_id,
+      (SELECT last_error
+       FROM monitor_subscriptions
+       WHERE id = $3::uuid) AS subscription_last_error
+  `, [
+    fixture.sourceTaskId,
+    fixture.tenantId,
+    fixture.subscriptionId,
+    fixture.itemId,
+    fixture.monitorExecutionId,
+  ]);
+  return result.rows[0];
 }
 
 async function readRetryRaceState(pool, fixture, losingRequestKey) {
@@ -1098,4 +1349,319 @@ test('real PostgreSQL serializes HTTP retry-items with canonical automatic retry
     0,
     'retry competition left a transaction advisory lock behind',
   );
+});
+
+test('real PostgreSQL serializes Profile scheduler with canonical retry', async t => {
+  const target = validatePostgresIntegrationTarget({
+    testDatabaseUrl: process.env.TEST_DATABASE_URL,
+    databaseUrl: process.env.DATABASE_URL,
+    requireDatabaseUrl: true,
+  });
+  const token = randomUUID().replaceAll('-', '').slice(0, 16);
+  const applicationPrefix = `p3-profile-lock-${token}`;
+  const poolApplicationName = `${applicationPrefix}-pool`;
+  const originalApplicationName = process.env.PGAPPNAME;
+  const originalPoolMax = process.env.PG_POOL_MAX;
+  process.env.PGAPPNAME = poolApplicationName;
+  process.env.PG_POOL_MAX = '2';
+
+  let pool;
+  let fixture;
+  let barrierClient;
+  let barrierTransactionOpen = false;
+  const trackedOperations = [];
+  const trackOperation = promise => {
+    promise.catch(() => {});
+    trackedOperations.push(promise);
+    return promise;
+  };
+
+  t.after(async () => {
+    const cleanupErrors = [];
+    const attemptCleanup = async callback => {
+      try {
+        await callback();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+
+    if (barrierClient && barrierTransactionOpen) {
+      await attemptCleanup(() => runBoundedClientStep({
+        client: barrierClient,
+        promise: barrierClient.query('ROLLBACK'),
+        timeoutMs: 5000,
+        message: 'Timed out rolling back Profile subscription barrier',
+      }));
+      barrierTransactionOpen = false;
+    }
+    let operationsSettled = false;
+    try {
+      await withTimeout(
+        Promise.allSettled(trackedOperations),
+        10000,
+        'Timed out settling Profile lock operations',
+      );
+      operationsSettled = true;
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (!operationsSettled) {
+      await attemptCleanup(() => terminateApplicationSessions({
+        databaseUrl: target.rawUrl,
+        applicationName: poolApplicationName,
+        controlApplicationName: `${applicationPrefix}-termination-control`,
+      }));
+      await attemptCleanup(() => withTimeout(
+        Promise.allSettled(trackedOperations),
+        5000,
+        'Profile lock operations did not settle after backend termination',
+      ));
+    }
+    if (barrierClient) {
+      const clientToClose = barrierClient;
+      barrierClient = null;
+      await attemptCleanup(() => closeBoundedClient(
+        clientToClose,
+        5000,
+        'Profile subscription barrier client',
+      ));
+    }
+    if (fixture) {
+      await attemptCleanup(() => withCleanupClient({
+        databaseUrl: target.rawUrl,
+        applicationName: `${applicationPrefix}-fixture-cleanup`,
+        timeoutMs: 10000,
+        operation: client => client.query(
+          'DELETE FROM tenants WHERE id = $1',
+          [fixture.tenantId],
+        ),
+      }));
+      fixture = null;
+    }
+    if (pool) {
+      const closePoolPromise = closePool();
+      closePoolPromise.catch(() => {});
+      let poolClosed = false;
+      try {
+        await withTimeout(
+          closePoolPromise,
+          5000,
+          'Timed out closing Profile lock pool',
+        );
+        poolClosed = true;
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (!poolClosed) {
+        await attemptCleanup(() => terminateApplicationSessions({
+          databaseUrl: target.rawUrl,
+          applicationName: poolApplicationName,
+          controlApplicationName: `${applicationPrefix}-pool-close-control`,
+        }));
+        await attemptCleanup(() => withTimeout(
+          closePoolPromise,
+          5000,
+          'Profile lock pool did not close after backend termination',
+        ));
+      }
+      pool = null;
+    }
+    restoreEnvironment('PGAPPNAME', originalApplicationName);
+    restoreEnvironment('PG_POOL_MAX', originalPoolMax);
+
+    await attemptCleanup(() => withCleanupClient({
+      databaseUrl: target.rawUrl,
+      applicationName: `${applicationPrefix}-residue-verifier`,
+      timeoutMs: 5000,
+      async operation(verifier) {
+        await verifier.query('SELECT pg_stat_clear_snapshot()');
+        const residue = await verifier.query(`
+          SELECT
+            (SELECT count(*)::integer
+             FROM pg_stat_activity activity
+             WHERE activity.datname = current_database()
+               AND activity.application_name LIKE $1
+               AND activity.pid <> pg_backend_pid()) AS session_count,
+            (SELECT count(*)::integer
+             FROM pg_locks lock
+             JOIN pg_stat_activity activity ON activity.pid = lock.pid
+             WHERE activity.datname = current_database()
+               AND activity.application_name LIKE $1
+               AND activity.pid <> pg_backend_pid()
+               AND lock.locktype = 'advisory') AS advisory_lock_count
+        `, [`${applicationPrefix}%`]);
+        assert.deepEqual(residue.rows[0], {
+          advisory_lock_count: 0,
+          session_count: 0,
+        });
+      },
+    }));
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(cleanupErrors, 'P3 Profile lock cleanup failed');
+    }
+  });
+
+  pool = getPool();
+  await runMigrations();
+  fixture = await createProfileRetryRaceFixture(pool, token);
+  barrierClient = new Client({
+    connectionString: target.rawUrl,
+    application_name: `${applicationPrefix}-barrier`,
+    connectionTimeoutMillis: 10000,
+    query_timeout: 10000,
+  });
+  await connectBoundedClient(
+    barrierClient,
+    5000,
+    'Profile subscription barrier client',
+  );
+  await runBoundedClientStep({
+    client: barrierClient,
+    promise: barrierClient.query('BEGIN'),
+    timeoutMs: 5000,
+    message: 'Timed out beginning Profile subscription barrier',
+  });
+  barrierTransactionOpen = true;
+  const barrierBackend = await barrierClient.query(
+    'SELECT pg_backend_pid()::integer AS pid',
+  );
+  const barrierPid = barrierBackend.rows[0].pid;
+  await runBoundedClientStep({
+    client: barrierClient,
+    promise: barrierClient.query(`
+      SELECT id
+      FROM monitor_subscriptions
+      WHERE id = $1
+      FOR UPDATE
+    `, [fixture.subscriptionId]),
+    timeoutMs: 5000,
+    message: 'Timed out locking the Profile subscription barrier',
+  });
+
+  const retryRequestKey = randomUUID();
+  const retryOptions = {
+    tenantId: fixture.tenantId,
+    taskId: fixture.sourceTaskId,
+    requestKey: retryRequestKey,
+    expectedRevision: 1,
+    actorType: 'system',
+    requestedByName: 'P3 Profile lock test',
+    automatic: true,
+  };
+  const retryOperation = trackOperation(
+    dispatchCrossDeviceRetry(retryOptions),
+  );
+  const retryWaiter = await waitForDirectLockWaiter({
+    observerClient: barrierClient,
+    poolApplicationName,
+    blockerPid: barrierPid,
+    label: 'Profile retry subscription waiter',
+  });
+  assert.match(retryWaiter.query, /FROM monitor_subscriptions/u);
+  assert.match(retryWaiter.query, /FOR UPDATE/u);
+  await assertGrantedAdvisoryFence({
+    observerClient: barrierClient,
+    holderPid: retryWaiter.pid,
+    namespace: 'capture_agent_execution_slot',
+    key: `${fixture.tenantId}:${fixture.targetAgentId}`,
+  });
+
+  const schedulerOperation = trackOperation(enqueueDueProfilePatrolTasks(1));
+  const schedulerWaiter = await waitForDirectLockWaiter({
+    observerClient: barrierClient,
+    poolApplicationName,
+    blockerPid: retryWaiter.pid,
+    excludedPids: [retryWaiter.pid],
+    label: 'Profile scheduler Agent-slot waiter',
+  });
+  assert.match(schedulerWaiter.query, /pg_advisory_xact_lock/u);
+  await assertWaitingOnAdvisoryFence({
+    observerClient: barrierClient,
+    waiterPid: schedulerWaiter.pid,
+    namespace: 'capture_agent_execution_slot',
+    key: `${fixture.tenantId}:${fixture.targetAgentId}`,
+  });
+
+  await runBoundedClientStep({
+    client: barrierClient,
+    promise: barrierClient.query('COMMIT'),
+    timeoutMs: 5000,
+    message: 'Timed out releasing Profile subscription barrier',
+  });
+  barrierTransactionOpen = false;
+  const outcomes = await withTimeout(
+    Promise.allSettled([retryOperation, schedulerOperation]),
+    15000,
+    'Timed out settling Profile scheduler/retry competition',
+  );
+  for (const outcome of outcomes) {
+    assert.equal(
+      outcome.status,
+      'fulfilled',
+      `Profile competition rejected with ${errorCode(outcome) || 'unknown error'}`,
+    );
+  }
+  const retry = outcomes[0].value;
+  const scheduler = outcomes[1].value;
+  assert.equal(retry.existing, false);
+  assert.equal(retry.child.id, retryRequestKey);
+  assert.equal(retry.child.assigned_agent_id, fixture.targetAgentId);
+  assert.equal(retry.child.trigger_type, 'cross_device_retry');
+  assert.deepEqual(scheduler.map(result => result.kind), ['busy']);
+
+  const afterRace = await withTimeout(
+    trackOperation(readProfileRetryRaceState(pool, fixture)),
+    5000,
+    'Timed out reading Profile retry race state',
+  );
+  assert.equal(afterRace.parent_task_type, 'capture_orchestration');
+  assert.equal(afterRace.parent_status, 'pending');
+  assert.equal(afterRace.parent_revision, 2);
+  assert.equal(afterRace.retry_task_count, 1);
+  assert.equal(afterRace.scheduled_task_count, 0);
+  assert.equal(afterRace.retry_command_count, 1);
+  assert.equal(afterRace.retry_event_count, 1);
+  assert.equal(afterRace.item_attempt_count, 2);
+  assert.equal(afterRace.active_execution_count, 1);
+  assert.equal(afterRace.source_execution_status, 'failed');
+  assert.notEqual(
+    afterRace.current_execution_id,
+    fixture.monitorExecutionId,
+  );
+  assert.equal(afterRace.current_agent_id, fixture.targetAgentId);
+  assert.equal(afterRace.subscription_last_error, '');
+
+  const replay = await withTimeout(
+    trackOperation(dispatchCrossDeviceRetry(retryOptions)),
+    5000,
+    'Timed out replaying the Profile retry winner',
+  );
+  assert.equal(replay.existing, true);
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.child.id, retryRequestKey);
+  const afterReplay = await withTimeout(
+    trackOperation(readProfileRetryRaceState(pool, fixture)),
+    5000,
+    'Timed out reading Profile retry replay state',
+  );
+  assert.deepEqual(
+    afterReplay,
+    afterRace,
+    'Profile retry replay duplicated lineage or scheduler residue',
+  );
+
+  const advisoryResidue = await withTimeout(
+    trackOperation(pool.query(`
+      SELECT count(*)::integer AS count
+      FROM pg_locks lock
+      JOIN pg_stat_activity activity ON activity.pid = lock.pid
+      WHERE activity.datname = current_database()
+        AND activity.application_name = $1
+        AND lock.locktype = 'advisory'
+    `, [poolApplicationName])),
+    5000,
+    'Timed out checking Profile advisory-lock residue',
+  );
+  assert.equal(advisoryResidue.rows[0].count, 0);
 });

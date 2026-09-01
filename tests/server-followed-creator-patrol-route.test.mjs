@@ -409,8 +409,12 @@ test('scheduled profile patrol materializes real dispatch-center tasks', () => {
     dispatchService,
     /ms\.subject_type IN \('creator', 'official'\)/u,
   );
-  assert.match(dispatchService, /subscription\.assigned_agent_id/u);
+  assert.match(dispatchService, /subscriptionSnapshot\.assigned_agent_id/u);
   assert.match(dispatchService, /loadAvailableScheduledProfilePatrolAgent/u);
+  assert.match(
+    dispatchService,
+    /SAVEPOINT \$\{savepoint\}[\s\S]*ROLLBACK TO SAVEPOINT \$\{savepoint\}/u,
+  );
   assert.match(dispatchService, /selection: !preferred/u);
   assert.match(dispatchService, /scheduledAgentSelection/u);
   assert.match(dispatchService, /reconcileStaleProfilePatrolExecutions/u);
@@ -428,6 +432,41 @@ test('scheduled profile patrol materializes real dispatch-center tasks', () => {
     /error\?\.error === 'subscription_execution_busy'[\s\S]*kind: 'busy'/u,
   );
   assert.match(dispatchService, /当前没有在线、空闲且支持该平台的执行节点/u);
+});
+
+test('every Profile dispatcher locks the Agent before subscriptions and executions', () => {
+  const scheduledStart = dispatchService.indexOf(
+    'async function enqueueDueProfilePatrolSubscription',
+  );
+  const scheduledEnd = dispatchService.indexOf(
+    'export async function enqueueDueProfilePatrolTasks',
+    scheduledStart,
+  );
+  const scheduled = dispatchService.slice(scheduledStart, scheduledEnd);
+  assert.ok(
+    scheduled.indexOf('loadAvailableScheduledProfilePatrolAgent') <
+      scheduled.indexOf('lockDueProfilePatrolSubscription'),
+  );
+  assert.ok(
+    scheduled.indexOf('lockDueProfilePatrolSubscription') <
+      scheduled.indexOf('const reusableExecution = await tx.queryOne'),
+  );
+
+  const manualStart = route.indexOf('const snapshotRows = await tx.queryAll');
+  const manualEnd = route.indexOf('const agent = compatible.agent', manualStart);
+  const manual = route.slice(manualStart, manualEnd);
+  assert.ok(
+    manual.indexOf('loadCompatibleProfilePatrolAgent') <
+      manual.indexOf('ORDER BY id\n          FOR UPDATE'),
+  );
+  assert.ok(
+    manual.indexOf('ORDER BY id\n          FOR UPDATE') <
+      manual.indexOf('const activeExecutions = await tx.queryAll'),
+  );
+  assert.match(
+    manual,
+    /ORDER BY execution\.subscription_id, execution\.id[\s\S]*FOR UPDATE OF execution/u,
+  );
 });
 
 test('scheduled occurrence participates in the dispatch idempotency hash', async () => {

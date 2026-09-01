@@ -13,6 +13,7 @@ import {
 import {
   loadCompatibleProfilePatrolAgent,
   materializeProfilePatrolTask,
+  profilePatrolAgentCompatibilityFailure,
   profilePatrolRequestHash,
 } from '../services/profile-patrol-dispatch.js';
 import {negativePatrolTargetUrl} from './negative-patrol.js';
@@ -1449,6 +1450,58 @@ router.post(
 
       const result = await withTransaction(async tx => {
         await tx.execute('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [WORKFLOW, requestKey]);
+        const subscriptionSnapshot = await tx.queryOne(`
+          SELECT subscription.*, account.account_name,
+            account.platform AS account_platform,
+            account.profile_url AS official_profile_url,
+            account.status AS official_account_status
+          FROM official_accounts account
+          JOIN monitor_subscriptions subscription
+            ON subscription.tenant_id = account.tenant_id
+            AND subscription.official_account_id = account.id
+            AND subscription.subject_type = 'official'
+            AND subscription.status = 'active'
+          WHERE account.id = $1::uuid
+            AND account.tenant_id = $2
+            AND account.status = 'active'
+            AND account.platform IN ('xiaohongshu', 'douyin')
+            AND COALESCE(subscription.account_url, account.profile_url, '') <> ''
+          ORDER BY subscription.updated_at DESC, subscription.id
+          LIMIT 1
+        `, [normalized.filter.officialAccountId, req.tenantId]);
+        if (!subscriptionSnapshot) {
+          return {failure: requestError(
+            'official_account_profile_subscription_missing',
+            '该官方账号尚未配置可执行的账号主页巡查计划，请先补充主页链接并启用账号',
+            409,
+          )};
+        }
+        const snapshotPlatform = text(
+          subscriptionSnapshot.account_platform ||
+            subscriptionSnapshot.platform,
+          40,
+        ).toLowerCase();
+        if (
+          normalized.filter.requestedPlatform &&
+          normalized.filter.requestedPlatform !== snapshotPlatform
+        ) {
+          return {failure: requestError(
+            'official_account_platform_mismatch',
+            '所选平台与官方账号的平台不一致',
+          )};
+        }
+        const compatible = await loadCompatibleProfilePatrolAgent(
+          tx,
+          req.tenantId,
+          agentId,
+          [snapshotPlatform],
+          'official',
+          {excludeTaskIds: [requestKey]},
+        );
+        if (compatible.failure) return {failure: compatible.failure};
+
+        // Match the scheduler and retry path: Agent slot/row precedes the
+        // Profile subscription and monitor execution locks.
         const subscription = await tx.queryOne(`
           SELECT subscription.*, account.account_name,
             account.platform AS account_platform,
@@ -1469,10 +1522,13 @@ router.post(
           LIMIT 1
           FOR UPDATE OF subscription, account
         `, [normalized.filter.officialAccountId, req.tenantId]);
-        if (!subscription) {
+        if (
+          !subscription ||
+          String(subscription.id) !== String(subscriptionSnapshot.id)
+        ) {
           return {failure: requestError(
-            'official_account_profile_subscription_missing',
-            '该官方账号尚未配置可执行的账号主页巡查计划，请先补充主页链接并启用账号',
+            'subscription_selection_changed',
+            '官方账号巡查计划在下发期间发生变化，请重试',
             409,
           )};
         }
@@ -1489,6 +1545,15 @@ router.post(
             '所选平台与官方账号的平台不一致',
           )};
         }
+        const lockedCompatibilityFailure =
+          profilePatrolAgentCompatibilityFailure(
+            compatible.agent,
+            [platform],
+            'official',
+          );
+        if (lockedCompatibilityFailure) {
+          return {failure: lockedCompatibilityFailure};
+        }
         subscription.name = text(
           subscription.account_name || subscription.name,
           240,
@@ -1498,15 +1563,6 @@ router.post(
           subscription.account_url || subscription.official_profile_url,
           3000,
         );
-        const compatible = await loadCompatibleProfilePatrolAgent(
-          tx,
-          req.tenantId,
-          agentId,
-          [platform],
-          'official',
-          {excludeTaskIds: [requestKey]},
-        );
-        if (compatible.failure) return {failure: compatible.failure};
         const requestHash = profilePatrolRequestHash({
           workflow: WORKFLOW,
           agentId,

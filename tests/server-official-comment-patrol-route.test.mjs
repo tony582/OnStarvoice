@@ -278,6 +278,14 @@ test('create route creates one account-page Agent task and forces comment sampli
   assert.match(route, /agent_required/u);
   assert.match(route, /loadCompatibleProfilePatrolAgent/u);
   assert.match(createRoute, /\{excludeTaskIds: \[requestKey\]\}/u);
+  assert.ok(
+    createRoute.indexOf('loadCompatibleProfilePatrolAgent') <
+      createRoute.indexOf('FOR UPDATE OF subscription, account'),
+  );
+  assert.ok(
+    createRoute.indexOf('FOR UPDATE OF subscription, account') <
+      createRoute.indexOf('materializeProfilePatrolTask'),
+  );
   assert.match(route, /materializeProfilePatrolTask/u);
   assert.match(route, /subjectType: 'official'/u);
   assert.match(route, /official_account_comment_patrol/u);

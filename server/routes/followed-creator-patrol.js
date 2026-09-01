@@ -14,6 +14,7 @@ import {
   PROFILE_PATROL_WORKFLOWS,
   loadCompatibleProfilePatrolAgent,
   materializeProfilePatrolTask,
+  profilePatrolAgentCompatibilityFailure,
   profilePatrolRequestHash,
 } from '../services/profile-patrol-dispatch.js';
 
@@ -315,11 +316,58 @@ router.post(
             409,
           )};
         }
+        const snapshotRows = await tx.queryAll(`
+          SELECT *
+          FROM monitor_subscriptions
+          WHERE tenant_id = $1
+            AND id = ANY($2::uuid[])
+        `, [req.tenantId, normalizedIds.ids]);
+        const snapshotById = new Map(
+          snapshotRows.map(row => [String(row.id), row]),
+        );
+        const subscriptionSnapshots = normalizedIds.ids
+          .map(id => snapshotById.get(id))
+          .filter(Boolean);
+        if (subscriptionSnapshots.length !== normalizedIds.ids.length) {
+          return {failure: requestError(
+            'subscription_selection_changed',
+            '部分关注账号已不存在，请刷新后重试',
+            409,
+          )};
+        }
+        const invalidSnapshot = subscriptionSnapshots.filter(row =>
+          row.status !== 'active' ||
+          (row.subject_type || 'creator') !== subjectType ||
+          !canonicalProfileUrl(row.account_url, row.platform));
+        if (invalidSnapshot.length > 0) {
+          return {failure: requestError(
+            'subscription_not_dispatchable',
+            '部分账号角色、状态或主页链接不再符合扫描条件',
+            409,
+            {subscriptionIds: invalidSnapshot.map(row => row.id)},
+          )};
+        }
+        const snapshotPlatforms = [...new Set(
+          subscriptionSnapshots.map(row =>
+            text(row.platform, 40).toLowerCase()),
+        )];
+        const compatible = await loadCompatibleProfilePatrolAgent(
+          tx,
+          req.tenantId,
+          agentId,
+          snapshotPlatforms,
+          subjectType,
+        );
+        if (compatible.failure) return {failure: compatible.failure};
+
+        // Canonical Profile lock order: Agent slot/row first, subscriptions
+        // in stable ID order second, then their active execution rows.
         const rows = await tx.queryAll(`
           SELECT *
           FROM monitor_subscriptions
           WHERE tenant_id = $1
             AND id = ANY($2::uuid[])
+          ORDER BY id
           FOR UPDATE
         `, [req.tenantId, normalizedIds.ids]);
         const byId = new Map(rows.map(row => [String(row.id), row]));
@@ -345,6 +393,16 @@ router.post(
             {subscriptionIds: invalid.map(row => row.id)},
           )};
         }
+        const lockedCompatibilityFailure =
+          profilePatrolAgentCompatibilityFailure(
+            compatible.agent,
+            [...new Set(subscriptions.map(row =>
+              text(row.platform, 40).toLowerCase()))],
+            subjectType,
+          );
+        if (lockedCompatibilityFailure) {
+          return {failure: lockedCompatibilityFailure};
+        }
         const activeExecutions = await tx.queryAll(`
           SELECT execution.subscription_id,
             execution.id,
@@ -363,6 +421,7 @@ router.post(
           WHERE execution.tenant_id = $1
             AND execution.subscription_id = ANY($2::uuid[])
             AND execution.status IN ('pending', 'running')
+          ORDER BY execution.subscription_id, execution.id
           FOR UPDATE OF execution
         `, [req.tenantId, normalizedIds.ids]);
         const busy = activeExecutions.filter(execution =>
@@ -389,17 +448,6 @@ router.post(
             );
           }
         }
-        const platforms = [...new Set(
-          subscriptions.map(row => text(row.platform, 40).toLowerCase()),
-        )];
-        const compatible = await loadCompatibleProfilePatrolAgent(
-          tx,
-          req.tenantId,
-          agentId,
-          platforms,
-          subjectType,
-        );
-        if (compatible.failure) return {failure: compatible.failure};
         const agent = compatible.agent;
         await tx.execute(`
           UPDATE monitor_subscriptions
