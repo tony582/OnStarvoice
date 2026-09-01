@@ -2786,6 +2786,20 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   );
   assert.match(
     reuseGate,
+    /LEFT JOIN LATERAL \([\s\S]*FROM capture_task_attempts execution_attempt[\s\S]*execution_attempt\.tenant_id = attempt\.tenant_id[\s\S]*execution_attempt\.task_id = execution\.id[\s\S]*execution_attempt\.agent_id = attempt\.agent_id[\s\S]*execution_attempt\.client_attempt_id <> ''[\s\S]*ORDER BY execution_attempt\.attempt_number DESC/u,
+    "the gate must classify history by the Extension version that ran that exact execution",
+  );
+  assert.match(
+    reuseGate,
+    /execution_version\.app_version ~[\s\S]*regexp_match\([\s\S]*execution_version\.app_version[\s\S]*\)::numeric\[\] < \$4::numeric\[\][\s\S]*THEN false[\s\S]*ELSE true/u,
+    "known pre-0.4.3 executions are legacy while unknown and current versions remain strict",
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object\.freeze\(\[0, 4, 3\]\)/u,
+  );
+  assert.match(
+    reuseGate,
     /latestLegacyAttempt &&[\s\S]*latestLegacyAttempt\.legacy_closure_quiescent !== true[\s\S]*local_cleanup_quiescence/u,
     "only legacy terminal history may use the bounded compatibility grace",
   );

@@ -130,6 +130,7 @@ const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
 const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
+const LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object.freeze([0, 4, 3]);
 const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
 const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
 // A half-hour source-Agent quarantine removes too much capacity from a small
@@ -10802,10 +10803,27 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
         attempt.attempt_number,
         attempt.assignment_revision,
         attempt.execution_task_id,
-        COALESCE(
-          execution.metadata->>'requiresLocalClosureReuseFenceV1' = 'true',
-          false
-        ) AS requires_local_closure_proof,
+        execution_version.app_version AS execution_app_version,
+        CASE
+          WHEN COALESCE(
+            execution.metadata->>'requiresLocalClosureReuseFenceV1' = 'true',
+            false
+          ) = false THEN false
+          -- Versions before 0.4.3 could receive the server-owned fence marker,
+          -- but they never emitted localClosure evidence. Treat only those
+          -- known historical runtimes as legacy; missing or malformed versions
+          -- remain fail-closed, and 0.4.3+ still requires exact proof.
+          WHEN execution_version.app_version ~
+            '^[0-9]+[.][0-9]+[.][0-9]+$'
+            AND (
+              regexp_match(
+                execution_version.app_version,
+                '^([0-9]+)[.]([0-9]+)[.]([0-9]+)$'
+              )
+            )::numeric[] < $4::numeric[]
+          THEN false
+          ELSE true
+        END AS requires_local_closure_proof,
         COALESCE(
           execution.finished_at,
           attempt.finished_at,
@@ -10825,6 +10843,18 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
       JOIN capture_tasks execution
         ON execution.id = attempt.execution_task_id
         AND execution.tenant_id = attempt.tenant_id
+      LEFT JOIN LATERAL (
+        SELECT NULLIF(execution_attempt.app_version, '') AS app_version
+        FROM capture_task_attempts execution_attempt
+        WHERE execution_attempt.tenant_id = attempt.tenant_id
+          AND execution_attempt.task_id = execution.id
+          AND execution_attempt.agent_id = attempt.agent_id
+          AND execution_attempt.client_attempt_id <> ''
+        ORDER BY execution_attempt.attempt_number DESC,
+          execution_attempt.updated_at DESC,
+          execution_attempt.id DESC
+        LIMIT 1
+      ) execution_version ON true
       WHERE attempt.tenant_id = $1
         AND attempt.agent_id = $2
         AND item.item_type = 'keyword'
@@ -10868,6 +10898,7 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
     tenantId,
     agentId,
     Math.floor(LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS / 1000),
+    LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS,
   ]);
   const latestMarkedAttempt = history.find(
     attempt => attempt.requires_local_closure_proof === true,
