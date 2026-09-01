@@ -595,7 +595,7 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "retryable",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     updated_at: "2026-08-12T01:59:00.000Z",
-  }, now), 60_000);
+  }, now), 0, "technical errors must not cool an otherwise healthy Agent");
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: safety,
@@ -726,12 +726,12 @@ test("elastic queue does not spend business retries on local capacity or dispatc
     status: "retryable",
     error: {code: "capture_task_group_busy"},
     updated_at: "2026-08-13T01:58:00.000Z",
-  }, now), 3 * 60_000);
+  }, now), 0);
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: {code: "elastic_task_heartbeat_timeout"},
     updated_at: "2026-08-13T01:55:00.000Z",
-  }, now), 5 * 60_000);
+  }, now), 0);
 });
 
 test("elastic bootstrap pacing staggers healthy starts and only adds a short congestion delay", () => {
@@ -2759,13 +2759,31 @@ test("elastic recovery releases the item immediately and scopes verification to 
   assert.match(recovery, /state: 'released_for_handoff'/u);
   assert.match(recovery, /handoffReadyAt/u);
   assert.match(recovery, /itemLockReleased: true/u);
-  assert.match(recovery, /sourceAgentCooling: !operatorHoldReleased && sourceAgentHoldMs > 0/u);
+  assert.match(recovery, /sourceAgentCooling: false/u);
   assert.match(recovery, /previousRecovery\.queuedAt/u);
   assert.match(recovery, /operatorHoldReleasedAt/u);
   assert.match(recovery, /cooldownHomeRestored/u);
   assert.match(recovery, /cooldownHomeUrl/u);
   assert.match(recovery, /sourceAgentHoldUntil/u);
   assert.match(recovery, /sourceAgentSameItemRetryAfter/u);
+});
+
+test("technical recovery never quarantines the whole source Agent", () => {
+  const recovery = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "CAPTURE_TASK_DEBUG_STARVOICE_ACTIVE"},
+    attemptCount: 1,
+    sourceAgentId: "agent-source",
+    now: new Date("2026-09-02T00:00:00.000Z"),
+  });
+
+  assert.equal(recovery.sourceAgentCooling, false);
+  assert.equal(recovery.sourceAgentHoldUntil, recovery.queuedAt);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "CAPTURE_TASK_DEBUG_STARVOICE_ACTIVE"},
+    updated_at: recovery.queuedAt,
+  }, Date.parse("2026-09-02T00:00:01.000Z")), 0);
 });
 
 test("repeated terminal heartbeats preserve the original elastic recovery review anchor", () => {

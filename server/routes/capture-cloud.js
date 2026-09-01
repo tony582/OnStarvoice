@@ -131,13 +131,13 @@ const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
 const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
 const LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object.freeze([0, 4, 4]);
-const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
-const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
-// A half-hour source-Agent quarantine removes too much capacity from a small
-// production pool and, before the recovery clock was made stable, could look
-// endless in the task center. Keep the item immediately available to another
-// Agent and use only a short, bounded source-account cooldown.
-const ELASTIC_AGENT_CAPACITY_HOLD_MS = 5 * 60 * 1000;
+// Technical failures release only the failed work item. They are not evidence
+// that the browser account is unsafe, so the source Agent remains immediately
+// eligible for unrelated work. Platform safety signals are fenced separately
+// at the immutable item + account-attempt boundary below.
+const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 0;
+const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 0;
+const ELASTIC_AGENT_CAPACITY_HOLD_MS = 0;
 const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
 const ELASTIC_TECHNICAL_HANDOFF_LIMIT = 2;
@@ -1341,7 +1341,7 @@ export function buildElasticRecoveryMetadata({
     queuedAt: new Date(recoveryAnchorMs).toISOString(),
     handoffReadyAt: new Date(recoveryAnchorMs).toISOString(),
     itemLockReleased: true,
-    sourceAgentCooling: !operatorHoldReleased && sourceAgentHoldMs > 0,
+    sourceAgentCooling: false,
     ...(operatorHoldReleased
       ? {operatorHoldReleasedAt: new Date(operatorHoldReleasedAtMs).toISOString()}
       : {}),
