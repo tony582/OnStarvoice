@@ -46,6 +46,8 @@ import {
   batchCaptureByUrls,
   lightSampleByKeywords,
   captureTabContent,
+  beginDouyinSearchResultTransitionInTab,
+  readDouyinSearchDocumentGenerationInTab,
   beginCaptureTaskSession,
   updateCaptureTaskSession,
   endCaptureTaskSession,
@@ -56,8 +58,20 @@ import {
   DEFAULT_CAPTURE_SETTINGS,
 } from "../utils/capture-settings.js";
 import {createRecordSyncQueue} from "../utils/record-sync-queue.js";
+import {
+  discardUnattendedCheckpointReports,
+  enqueueUnattendedCheckpointReport,
+  flushUnattendedCheckpointReportOutbox,
+} from "../utils/unattended-report-outbox.js";
 import {runEnhancementWithSingleRetry} from "../utils/capture/enhancement-retry.js";
-import {addSyncHistoryEntry, getAuth, getRecords} from "../utils/storage.js";
+import {
+  addSyncHistoryEntry,
+  ensureControlStorageReserve,
+  getAuth,
+  getRecords,
+  isStorageQuotaError,
+  releaseControlStorageReserve,
+} from "../utils/storage.js";
 
 import {
   verify,
@@ -588,6 +602,13 @@ async function startRequiredCaptureTaskSession(options = {}) {
   error.code = String(
     result?.response?.error?.code || result?.reason || "capture_task_unavailable",
   );
+  if (
+    result?.response?.error?.details &&
+    typeof result.response.error.details === "object" &&
+    !Array.isArray(result.response.error.details)
+  ) {
+    error.details = {...result.response.error.details};
+  }
   throw error;
 }
 
@@ -857,6 +878,8 @@ const KEYWORD_SORT_SYNC_INTERVAL_MS = 1800;
 const EXTENSION_UPDATE_MODAL_STATE_KEY = "onstarvoice.updateModalState";
 const RISK_NOTICE_ACKNOWLEDGED_KEY = "onstarvoice.riskNoticeAcknowledged";
 const MEMBER_GROUP_PROMPT_STATE_KEY = "onstarvoice.memberGroupPromptState";
+const TERMINAL_SUMMARY_ACK_STORAGE_KEY =
+  "onstarvoice.terminalSummaryAcknowledgements";
 const DEFAULT_UPDATE_DOWNLOAD_URL = "https://voice.minilife.online/about";
 const DEFAULT_UPDATE_CHANGELOG_URL = "https://voice.minilife.online/about#changelog";
 const EXTENSION_MANAGEMENT_URL = `chrome://extensions/?id=${chrome.runtime.id}`;
@@ -1119,13 +1142,11 @@ const BATCH_DRAFT_SESSION_KEY = "onstarvoice.batchDraftByPlatform";
 const BATCH_DRAFT_LEGACY_KEYS = ["expandedKeywords", "expandedSeedKeyword"];
 const BATCH_DRAFT_PLATFORMS = new Set(["xiaohongshu", "douyin", "unknown"]);
 const UNATTENDED_RUN_QUERY_KEY = "unattendedRun";
+const UNATTENDED_RUN_ATTEMPT_QUERY_KEY = "unattendedAttempt";
 const TARGETED_POST_RUN_QUERY_KEY = "targetedPostRun";
 const TARGETED_POST_RUN_ATTEMPT_QUERY_KEY = "targetedPostAttempt";
 const TARGETED_POST_RUN_REQUEST_STORAGE_KEY =
   "onstarvoice.targetedPostRunRequest";
-const TARGETED_POST_RUNNER_HOME_URLS = Object.freeze({
-  douyin: "https://www.douyin.com/jingxuan",
-});
 const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
 const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
 const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
@@ -1134,6 +1155,7 @@ const UNATTENDED_RUN_HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const UNATTENDED_PROTECTED_WAIT_TICK_MS = 30 * 1000;
 const UNATTENDED_CONTENT_PROGRESS_MIN_INTERVAL_MS = 1500;
 const UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
+const UNATTENDED_INITIAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
 const UNATTENDED_TERMINAL_CONFIRM_RETRY_MAX_MS = 30 * 1000;
 const UNATTENDED_RUNTIME_MESSAGE_TIMEOUT_MS = 10 * 1000;
 const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 4;
@@ -1151,14 +1173,15 @@ const UNATTENDED_ELASTIC_RELEASE_MIN_DELAY_MS = 2 * 60 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MIN_MS = 8 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MAX_MS = 18 * 1000;
 // 首次把平台页切到关键词时，弱网、平台改写页面或标签替换都可能让短时
-// 就绪检查错过目标页。重试必须分散到真实等待窗口，并把 nextRetryAt 上报给
-// 任务中心；不能连续快速刷新两次后就把普通技术故障升级成人工介入。
+// 就绪检查错过目标页。优先给当前 Agent 足够时间等待同一页面完成加载；
+// 只有绑定页始终无法就绪才交给其它 Agent，避免多台设备反复搜索同一词。
 const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 4;
 const UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS = Object.freeze([
   20 * 1000,
   60 * 1000,
   3 * 60 * 1000,
 ]);
+const UNATTENDED_BOOTSTRAP_GATE_MAX_WAIT_MS = 60 * 1000;
 const UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS = 4;
 const UNATTENDED_CAPTURE_SESSION_RETRY_DELAYS_MS = Object.freeze([
   15 * 1000,
@@ -1168,7 +1191,15 @@ const UNATTENDED_CAPTURE_SESSION_RETRY_DELAYS_MS = Object.freeze([
 const UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES = new Set([
   "capture_task_group_busy",
   "capture_task_cleanup_pending",
+]);
+const UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES = new Set([
+  "capture_task_group_busy",
   "capture_task_debug_busy",
+  "capture_task_debug_preflight_unavailable",
+  "capture_task_debug_preflight_failed",
+  "capture_task_debug_starvoice_active",
+  "capture_task_external_debugger_busy",
+  "capture_task_debug_ownership_unknown",
 ]);
 let activeUnattendedRunRequestId = "";
 let activeUnattendedRunAttemptId = "";
@@ -2406,6 +2437,41 @@ function getKeywordExecutionCopy(source = {}) {
   };
 }
 
+function normalizeUnattendedSearchPasses(plan = {}) {
+  const allowed = new Set(["all", "image", "video"]);
+  const fallback = allowed.has(String(plan?.searchFilters?.contentType || ""))
+    ? String(plan.searchFilters.contentType)
+    : "all";
+  const requested = [];
+  const seen = new Set();
+  for (const rawValue of Array.isArray(plan?.searchPasses)
+    ? plan.searchPasses
+    : []) {
+    const value = String(rawValue || "").trim().toLowerCase();
+    if (!allowed.has(value) || seen.has(value)) continue;
+    seen.add(value);
+    requested.push(value);
+    if (requested.length >= 3) break;
+  }
+  if (requested.length === 0) return [fallback];
+  if (requested.length === 1) return requested;
+  if (requested.includes("all")) {
+    const supplement = requested.find(
+      (value) => value === "image" || value === "video",
+    );
+    return supplement ? ["all", supplement] : ["all"];
+  }
+  return [requested[0]];
+}
+
+function unattendedSearchPassLabel(value = "") {
+  return {
+    all: "综合巡检",
+    image: "图文巡检",
+    video: "视频巡检",
+  }[String(value || "").trim()] || "巡检";
+}
+
 function buildKeywordRunDisplayPlan(
   plan = keywordPlanState,
   request = activeKeywordRunState,
@@ -3089,8 +3155,14 @@ async function handleCopyDiagnostics() {
 export async function initSidebar() {
   console.log("[Sidebar] Initializing...");
 
+  // 先恢复用户已经确认关闭的终态摘要，避免 initAllStates 首屏短暂复活旧任务。
+  await loadTerminalCaptureSummaryAcknowledgements();
+  // 在任务状态开始写入前建立控制面保留区；建立失败不会阻断启动，但后续
+  // quota 路径仍会明确失败而不是把控制写入误报为成功。
+  await ensureControlStorageReserve();
   // 初始化所有状态
   await initAllStates();
+  void flushPendingUnattendedCheckpointReports({quiet: true});
   connectCaptureTaskOwnerPort();
   syncCaptureTaskOwnerFromRuntime(getCurrentRuntime() || {});
 
@@ -4052,7 +4124,7 @@ function resolveCaptureTaskActionCopy(progress = {}) {
         candidateCount > 0
           ? `正在根据当前关键词预判 ${candidateCount} 条列表结果`
           : "正在根据当前关键词预判列表结果",
-      nextAction: "只会高置信度跳过无关项，其余结果继续正常增强",
+      nextAction: "证据不足时先读最小详情二判，再决定是否抓评论和博主数据",
     };
   }
   if (phase === "detail_ai_prefilter_done") {
@@ -4068,7 +4140,7 @@ function resolveCaptureTaskActionCopy(progress = {}) {
     return {
       title:
         failedOpenCount > 0
-          ? `AI 筛选完成 · ${failedOpenCount} 条超时或异常后继续采集`
+          ? `AI 筛选完成 · ${failedOpenCount} 条超时或异常已抽样或延迟增强`
           : filteredCount > 0
           ? `AI 筛选完成 · 已跳过 ${filteredCount} 条无关结果`
           : retryCount > 0
@@ -4078,8 +4150,35 @@ function resolveCaptureTaskActionCopy(progress = {}) {
         readProgressText(progress?.message) || "相关性判断已经完成",
       nextAction:
         failedOpenCount > 0
-          ? "超时或异常条目不会被 AI 跳过，仍会继续采集详情"
+          ? "少量抽样项继续完整采集，其余条目延迟增强并保留审计"
           : "接下来只为需要保留的结果采集详情、评论和博主信息",
+    };
+  }
+  if (
+    phase === "detail_ai_second_stage_start" ||
+    phase === "detail_ai_second_stage_done"
+  ) {
+    return {
+      title:
+        phase === "detail_ai_second_stage_start"
+          ? "AI 正在用最小详情二判"
+          : "AI 二判完成 · 继续完整增强",
+      explanation:
+        readProgressText(progress?.message) ||
+        "仅使用正文、标签和已有画面或口播文字判断相关性",
+      nextAction:
+        phase === "detail_ai_second_stage_start"
+          ? "确认相关后才会读取评论和博主数据"
+          : "开始读取评论和博主数据",
+    };
+  }
+  if (phase === "detail_item_deferred") {
+    return {
+      title: `AI 已延迟${itemLabel}增强`,
+      explanation:
+        readProgressText(progress?.message) ||
+        "最小数据已保留，本轮不继续抓取评论和博主信息",
+      nextAction: "下一轮或手动重试可继续增强",
     };
   }
   if (phase === "detail_item_filtered") {
@@ -5189,13 +5288,34 @@ function renderCaptureDebugSession(runtime = {}) {
   const platform = String(
     session.platform || detectPlatformFromUrl(session.pageUrl || runtime.lastPageUrl || ""),
   ).trim() || "xiaohongshu";
-  const progress = projectCaptureTaskProgress(
+  const sessionProgress =
     session?.progress && typeof session.progress === "object"
       ? session.progress
-      : runtime?.lastCaptureProgress &&
-          typeof runtime.lastCaptureProgress === "object"
-        ? runtime.lastCaptureProgress
-        : {},
+      : {};
+  const runtimeProgress =
+    runtime?.lastCaptureProgress &&
+    typeof runtime.lastCaptureProgress === "object"
+      ? runtime.lastCaptureProgress
+      : {};
+  const activeListRunId = String(session?.activeListRunId || "").trim();
+  const runtimeListRunId = String(runtimeProgress.listCaptureRunId || "").trim();
+  const sessionProgressAt = parseCaptureTaskTime(sessionProgress.updatedAt);
+  const runtimeProgressAt = parseCaptureTaskTime(runtimeProgress.updatedAt);
+  const canUseLiveListProgress = Boolean(
+    activeListRunId &&
+      runtimeListRunId === activeListRunId &&
+      runtimeProgressAt > sessionProgressAt,
+  );
+  // Content keeps reporting scrolling/marked counts while the debug session is
+  // waiting for the relay response. Merge only the exact active list run and
+  // only when it is newer, so stale progress from a previous keyword cannot
+  // overwrite the current task.
+  const progress = projectCaptureTaskProgress(
+    canUseLiveListProgress
+      ? {...sessionProgress, ...runtimeProgress}
+      : Object.keys(sessionProgress).length > 0
+        ? sessionProgress
+        : runtimeProgress,
   );
   const logo = document.getElementById("debugSessionLogo");
   if (logo) {
@@ -5395,7 +5515,68 @@ function renderCaptureDebugSession(runtime = {}) {
   });
 }
 
-function dismissAllTerminalCaptureSummaries() {
+async function loadTerminalCaptureSummaryAcknowledgements() {
+  try {
+    const stored = await chrome.storage.local.get(
+      TERMINAL_SUMMARY_ACK_STORAGE_KEY,
+    );
+    const acknowledgements =
+      stored?.[TERMINAL_SUMMARY_ACK_STORAGE_KEY] &&
+      typeof stored[TERMINAL_SUMMARY_ACK_STORAGE_KEY] === "object"
+        ? stored[TERMINAL_SUMMARY_ACK_STORAGE_KEY]
+        : {};
+    debugSessionDismissedUnattendedTerminalRunAt = String(
+      acknowledgements.unattendedTerminalSummaryId || "",
+    ).trim();
+    debugSessionDismissedTargetedTerminalRunAt = String(
+      acknowledgements.targetedTerminalSummaryId || "",
+    ).trim();
+    return true;
+  } catch (error) {
+    console.warn("[Sidebar] Load terminal summary acknowledgements failed:", error);
+    return false;
+  }
+}
+
+async function persistTerminalCaptureSummaryAcknowledgements() {
+  const acknowledgements = {
+    schemaVersion: 1,
+    unattendedTerminalSummaryId:
+      debugSessionDismissedUnattendedTerminalRunAt,
+    targetedTerminalSummaryId:
+      debugSessionDismissedTargetedTerminalRunAt,
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    await chrome.storage.local.set({
+      [TERMINAL_SUMMARY_ACK_STORAGE_KEY]: acknowledgements,
+    });
+    return true;
+  } catch (error) {
+    if (isStorageQuotaError(error)) {
+      await releaseControlStorageReserve();
+      try {
+        await chrome.storage.local.set({
+          [TERMINAL_SUMMARY_ACK_STORAGE_KEY]: acknowledgements,
+        });
+        void ensureControlStorageReserve();
+        return true;
+      } catch (retryError) {
+        console.warn(
+          "[Sidebar] Persist terminal acknowledgement after reserve release failed:",
+          retryError,
+        );
+      }
+    }
+    console.warn(
+      "[Sidebar] Persist terminal summary acknowledgements failed:",
+      error,
+    );
+    return false;
+  }
+}
+
+async function dismissAllTerminalCaptureSummaries() {
   const displayPlan = buildKeywordRunDisplayPlan(keywordPlanState);
   const planStatus = String(
     displayPlan?.lastRunStatus || "",
@@ -5421,6 +5602,7 @@ function dismissAllTerminalCaptureSummaries() {
       ).trim() ||
       `${String(targetedPostRunState?.id || "")}:${targetedStatus}:${String(targetedPostRunState?.message || "").trim()}`;
   }
+  return await persistTerminalCaptureSummaryAcknowledgements();
 }
 
 function setupDebugSessionPanelControls() {
@@ -5436,7 +5618,7 @@ function setupDebugSessionPanelControls() {
     if (panel?.dataset?.terminal === "true") {
       // 一个页面可能同时保留“一次性/无人值守”和“定向巡查”的终态。
       // 关闭应退出任务状态视图，而不是只隐藏当前一张卡后露出另一张。
-      dismissAllTerminalCaptureSummaries();
+      await dismissAllTerminalCaptureSummaries();
       debugSessionPanelMinimized = false;
       renderCaptureDebugSession(getCurrentRuntime() || {});
       return;
@@ -13191,7 +13373,12 @@ function sleepWithStop(
 
 function createStreamingDetailAutoSyncQueue(
   settings,
-  {shouldStop = null, signal = null} = {},
+  {
+    shouldStop = null,
+    signal = null,
+    captureTaskId = "",
+    resolveCaptureTaskItemAttempt = null,
+  } = {},
 ) {
   return createRecordSyncQueue({
     enabled: Boolean(
@@ -13200,7 +13387,13 @@ function createStreamingDetailAutoSyncQueue(
     ),
     shouldStop,
     signal,
+    retryDelaysMs: [1000, 3000, 8000],
+    shouldRetry: isTransientStreamingSyncFailure,
     processRecord: async ({recordId, meta = {}, signal: jobSignal = null}) => {
+      const captureAttempt =
+        typeof resolveCaptureTaskItemAttempt === "function"
+          ? resolveCaptureTaskItemAttempt(meta)
+          : null;
       const result = await maybeRunAutoSyncAfterDetailCapture(settings, {
         sourceLabel: String(meta?.sourceLabel || "当前笔记"),
         recordIds: [recordId],
@@ -13208,6 +13401,13 @@ function createStreamingDetailAutoSyncQueue(
         refreshAfter: false,
         shouldStop,
         signal: jobSignal || signal,
+        captureTaskId,
+        captureTaskItemAttemptId: String(
+          captureAttempt?.attemptId || "",
+        ).trim(),
+        captureTaskItemRequestHash: String(
+          captureAttempt?.requestHash || "",
+        ).trim(),
       });
       return {
         ...result,
@@ -13221,10 +13421,45 @@ function createStreamingDetailAutoSyncQueue(
   });
 }
 
+function isTransientStreamingSyncFailure(result = {}) {
+  if (
+    result?.ok !== false ||
+    result?.blocked ||
+    result?.skipped ||
+    result?.canceled ||
+    result?.phase === "check"
+  ) {
+    return false;
+  }
+  const fragments = [
+    result?.phase,
+    result?.reason,
+    result?.message,
+    result?.pausedReason,
+    result?.pausedMessage,
+    result?.error?.code,
+    result?.error?.message,
+    ...(Array.isArray(result?.results)
+      ? result.results.flatMap((item) => [
+          item?.reason,
+          item?.message,
+          item?.error?.code,
+          item?.error?.message,
+        ])
+      : []),
+  ]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+  const failureText = fragments.join(" ");
+  return /(?:timeout|timed out|network|fetch|offline|rate.?limit|too many requests|econn|enet|eai_again|socket|connection|http[_ ]?5\d\d|\b(?:429|500|502|503|504)\b|网络|超时|限流|请求失败|服务繁忙|连接(?:失败|中断|重置))/i.test(
+    failureText,
+  );
+}
+
 function routeDetailItemToStreamingSync(
   streamingSyncQueue,
   progress = {},
-  {sourceLabel = "当前笔记"} = {},
+  {sourceLabel = "当前笔记", keyword = ""} = {},
 ) {
   if (!streamingSyncQueue?.enabled) {
     return;
@@ -13238,7 +13473,7 @@ function routeDetailItemToStreamingSync(
     phase === "detail_item_filtered" ||
     phase === "detail_item_skipped"
   ) {
-    streamingSyncQueue.markSeen(recordId);
+    streamingSyncQueue.markExcluded(recordId);
     return;
   }
   // Failed detail items must wait until the whole enhancement result is known.
@@ -13248,14 +13483,76 @@ function routeDetailItemToStreamingSync(
   if (phase !== "detail_item_done") {
     return;
   }
-  streamingSyncQueue.enqueue(recordId, {sourceLabel});
+  streamingSyncQueue.enqueue(recordId, {sourceLabel, keyword});
+}
+
+function settleKeywordRecordsForStreamingSync(
+  streamingSyncQueue,
+  settled = {},
+  {ownerCurrent = true} = {},
+) {
+  if (!streamingSyncQueue?.enabled) {
+    return;
+  }
+  const recordIds = Array.from(
+    new Set(
+      (Array.isArray(settled?.recordIds) ? settled.recordIds : [])
+        .map((recordId) => String(recordId || "").trim())
+        .filter(Boolean),
+    ),
+  );
+  // List capture has already persisted these records locally. Register them
+  // before the request/attempt ownership fence so a superseded runner can
+  // still produce a complete, attempt-local closure ledger.
+  streamingSyncQueue.registerCaptured(recordIds);
+  if (recordIds.length === 0) {
+    return;
+  }
+
+  const result =
+    settled?.result && typeof settled.result === "object"
+      ? settled.result
+      : {};
+  const mustExclude = Boolean(
+    !ownerCurrent ||
+      settled?.canceled ||
+      settled?.securityBlocked ||
+      result.canceled ||
+      result.fatal ||
+      result.securityBlocked ||
+      result.platformSafetyBlocked ||
+      result.requiresManualAction ||
+      result.integrityBlocked ||
+      result.enhanceResult?.integrityBlocked,
+  );
+  if (mustExclude) {
+    recordIds.forEach((recordId) => streamingSyncQueue.markExcluded(recordId));
+    return;
+  }
+
+  streamingSyncQueue.enqueueMissing(recordIds, {
+    sourceLabel: `关键词「${String(settled?.keyword || "").trim()}」笔记`,
+    keyword: String(settled?.keyword || "").trim(),
+  });
+  // A stop predicate can close the queue between registration and enqueue.
+  // Explicitly classify anything that could not enter the queue so the local
+  // closure proof never hangs on an unclassified saved record.
+  recordIds.forEach((recordId) => {
+    if (!streamingSyncQueue.hasSeen(recordId)) {
+      streamingSyncQueue.markExcluded(recordId);
+    }
+  });
 }
 
 function formatStreamingSyncSummary(stats = {}) {
   if (!stats?.enabled || Number(stats.enqueuedCount || 0) === 0) {
     return "";
   }
-  return `同步成功 ${Number(stats.successCount || 0)}，失败 ${Number(stats.failedCount || 0)}，待上传 ${Number(stats.remainingCount || 0)}`;
+  const retryNote =
+    Number(stats.retryCount || 0) > 0
+      ? `，瞬时重试 ${Number(stats.retryCount || 0)}`
+      : "";
+  return `同步成功 ${Number(stats.successCount || 0)}，失败 ${Number(stats.failedCount || 0)}，待上传 ${Number(stats.remainingCount || 0)}${retryNote}`;
 }
 
 function buildStreamingSyncTaskIssue(stats = {}) {
@@ -13283,6 +13580,7 @@ function buildStreamingSyncTaskMetadata(stats = {}) {
     syncFailedCount: Number(stats?.failedCount || 0),
     syncSkippedCount: Number(stats?.skippedCount || 0),
     syncRemainingCount: Number(stats?.remainingCount || 0),
+    syncRetryCount: Number(stats?.retryCount || 0),
     syncBlocked: Boolean(stats?.blocked),
   };
 }
@@ -13297,7 +13595,10 @@ async function drainStreamingDetailSyncQueue(
   {round = null, updateProgress = null, notifyProgress = null} = {},
 ) {
   if (!streamingSyncQueue?.enabled) {
-    return streamingSyncQueue?.getStats?.() || null;
+    const disabledStats = streamingSyncQueue?.getStats?.();
+    return disabledStats && typeof disabledStats === "object"
+      ? {...disabledStats, drainCompleted: true}
+      : null;
   }
 
   const before = streamingSyncQueue.getStats();
@@ -13326,7 +13627,8 @@ async function drainStreamingDetailSyncQueue(
     syncFailedCount: Number(result.failedCount || 0),
     syncSkippedCount: Number(result.skippedCount || 0),
     syncRemainingCount: Number(result.remainingCount || 0),
-    message: `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}`,
+    syncRetryCount: Number(result.retryCount || 0),
+    message: `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}${Number(result.retryCount || 0) > 0 ? `，瞬时重试 ${Number(result.retryCount || 0)}` : ""}`,
   };
   updateProgress?.(doneProgress);
   notifyProgress?.(doneProgress);
@@ -13342,7 +13644,13 @@ async function drainStreamingDetailSyncQueue(
       "warning",
     );
   }
-  return result;
+  return {
+    ...result,
+    // This bit is set only by the awaited terminal drain path. A bare queue
+    // snapshot, a missing result, or a progress payload with defaulted zeroes
+    // must never be treated as proof that task-owned uploads are gone.
+    drainCompleted: true,
+  };
 }
 
 async function handleBatchKeywordCapture(options = {}) {
@@ -13388,6 +13696,21 @@ async function handleBatchKeywordCapture(options = {}) {
         : "manual";
   const releaseElasticItemOnLongRetry =
     runOptions.releaseElasticItemOnLongRetry === true;
+  const disableAutomaticSearchRetry =
+    runOptions.disableAutomaticSearchRetry === true;
+  const requireVerifiedFilters =
+    runOptions.requireVerifiedFilters === true;
+  let bootstrapInitialSearchEvidence =
+    runOptions.initialSearchEvidence &&
+    typeof runOptions.initialSearchEvidence === "object" &&
+    !Array.isArray(runOptions.initialSearchEvidence)
+      ? runOptions.initialSearchEvidence
+      : null;
+  const sequentialSearchPasses = normalizeUnattendedSearchPasses({
+    searchPasses: runOptions.searchPasses,
+    searchFilters: runOptions.searchFilters,
+  });
+  const sequentialSearchEnabled = sequentialSearchPasses.length > 1;
   // Unattended identity belongs to this invocation, not to the mutable global
   // claim slot.  A delayed callback from a previous runner must never be
   // relabeled with the request/attempt that happens to be active later.
@@ -13397,6 +13720,29 @@ async function handleBatchKeywordCapture(options = {}) {
   const scopedUnattendedAttemptId = String(
     runOptions.unattendedAttemptId || "",
   ).trim();
+  const captureTaskItemAttempts = (Array.isArray(
+    runOptions.captureTaskItemAttempts,
+  )
+    ? runOptions.captureTaskItemAttempts
+    : [])
+    .map((entry) =>
+      entry && typeof entry === "object" && !Array.isArray(entry)
+        ? entry
+        : {},
+    )
+    .filter(
+      (entry) =>
+        String(entry.attemptId || "").trim() &&
+        String(entry.keyword || "").trim(),
+    );
+  const resolveCaptureTaskItemAttempt = (value = {}) => {
+    const keyword = String(value?.keyword || "").trim();
+    if (!keyword) return null;
+    const matches = captureTaskItemAttempts.filter(
+      (entry) => String(entry.keyword || "").trim() === keyword,
+    );
+    return matches.length === 1 ? matches[0] : null;
+  };
   const isCurrentUnattendedInvocation = () =>
     !scopedUnattendedRequestId ||
     (scopedUnattendedRequestId ===
@@ -13451,7 +13797,19 @@ async function handleBatchKeywordCapture(options = {}) {
 
   const runtime = getCurrentRuntime();
   const selectedPlatform = getViewPlatform(runtime);
-  const pagePlatform = getPagePlatform(runtime);
+  const bootstrapEvidenceTabId = Number(bootstrapInitialSearchEvidence?.tabId);
+  const bootstrapEvidencePlatform = String(
+    bootstrapInitialSearchEvidence?.platform || "",
+  ).trim();
+  const bootstrapEvidenceAccepted = Boolean(
+    preferredSourceTabId &&
+      bootstrapInitialSearchEvidence?.ready === true &&
+      bootstrapEvidencePlatform &&
+      bootstrapEvidenceTabId === Number(preferredSourceTabId),
+  );
+  const pagePlatform = bootstrapEvidenceAccepted
+    ? bootstrapEvidencePlatform
+    : getPagePlatform(runtime);
   const captureTaskDebugSupported =
     supportsPersistentCaptureTaskPlatform(pagePlatform);
   if (selectedPlatform !== pagePlatform) {
@@ -13462,7 +13820,10 @@ async function handleBatchKeywordCapture(options = {}) {
     );
     return {started: false, reason: "当前数据视图与页面平台不一致"};
   }
-  if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
+  if (
+    runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS &&
+    !bootstrapEvidenceAccepted
+  ) {
     showMessage("请先切换到搜索页", "error");
     return {started: false, reason: "当前页面不是搜索结果页"};
   }
@@ -13489,6 +13850,8 @@ async function handleBatchKeywordCapture(options = {}) {
   let streamingSyncQueue = null;
   let streamingSyncResult = null;
   let streamingSyncDrained = false;
+  let failureOutcome = null;
+  let caughtError = null;
   let sidebarTaskContext = null;
   let captureTaskContext = null;
   let captureTaskContextNeedsCompletion = false;
@@ -13583,6 +13946,8 @@ async function handleBatchKeywordCapture(options = {}) {
       resolveCurrentDetailCaptureSettings(storedCaptureSettings);
     streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings, {
       shouldStop: shouldStopBatchInvocation,
+      captureTaskId: scopedUnattendedRequestId,
+      resolveCaptureTaskItemAttempt,
     });
     if (
       settings.autoDetailCaptureAfterListCapture &&
@@ -13741,6 +14106,9 @@ async function handleBatchKeywordCapture(options = {}) {
     captureTaskDisplayMeta = {
       ...captureTaskDisplayMeta,
       searchFilters: {...(searchFilters || {})},
+      ...(sequentialSearchEnabled
+        ? {searchPasses: [...sequentialSearchPasses]}
+        : {}),
       enhancementEnabled: Boolean(settings.autoDetailCaptureAfterListCapture),
       aiRelevancePrefilterEnabled: Boolean(
         settings.enableAiRelevancePrefilter,
@@ -13842,6 +14210,22 @@ async function handleBatchKeywordCapture(options = {}) {
 
     do {
       round += 1;
+      const activeSearchPass = sequentialSearchEnabled
+        ? sequentialSearchPasses[Math.min(round - 1, sequentialSearchPasses.length - 1)]
+        : "";
+      const activeSearchPassLabel = unattendedSearchPassLabel(activeSearchPass);
+      const roundSearchFilters = activeSearchPass
+        ? {...searchFilters, contentType: activeSearchPass}
+        : searchFilters;
+      if (activeSearchPass) {
+        captureTaskDisplayMeta = {
+          ...captureTaskDisplayMeta,
+          searchFilters: {...roundSearchFilters},
+          searchPassCurrent: round,
+          searchPassTotal: sequentialSearchPasses.length,
+          searchPassLabel: activeSearchPassLabel,
+        };
+      }
       const completedBeforeRun = resolveCompletedCheckpointKeywords(
         resumeCheckpoint,
         round,
@@ -13866,7 +14250,9 @@ async function handleBatchKeywordCapture(options = {}) {
         baseSearchUrl,
         sourceTabId: activeBatchRunnerTabId,
         captureTaskId: persistentCaptureTaskId,
-        searchFilters,
+        searchFilters: roundSearchFilters,
+        disableAutomaticSearchRetry,
+        requireVerifiedFilters,
         captureParams: {
           minLikes: keywordMinLikes,
           sortDimension: sortContext.dimension,
@@ -13877,9 +14263,15 @@ async function handleBatchKeywordCapture(options = {}) {
           maxDurationMs: settings.sharedMaxDurationMs,
         },
         waitForegroundTabId,
-        onKeywordSettled: onKeywordSettled
+        onKeywordSettled: onKeywordSettled || streamingSyncQueue?.enabled
           ? async (settled = {}) => {
-              if (!isCurrentUnattendedInvocation()) {
+              const ownerCurrent = isCurrentUnattendedInvocation();
+              settleKeywordRecordsForStreamingSync(
+                streamingSyncQueue,
+                settled,
+                {ownerCurrent},
+              );
+              if (!ownerCurrent || !onKeywordSettled) {
                 return;
               }
               const originalIndex = Math.max(
@@ -13903,6 +14295,7 @@ async function handleBatchKeywordCapture(options = {}) {
               recordIds,
               runnerTabId,
             }) => {
+              streamingSyncQueue?.registerCaptured?.(recordIds);
               if (!isCurrentUnattendedInvocation()) {
                 return {
                   ok: false,
@@ -13953,6 +14346,7 @@ async function handleBatchKeywordCapture(options = {}) {
                             progress,
                             {
                               sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                              keyword: capturedKeyword,
                             },
                           )
                       : null,
@@ -14064,13 +14458,24 @@ async function handleBatchKeywordCapture(options = {}) {
               if (streamingSyncQueue?.enabled) {
                 streamingSyncQueue.enqueueMissing(recordIds, {
                   sourceLabel: `关键词「${capturedKeyword}」笔记`,
+                  keyword: capturedKeyword,
                 });
               }
               if (!streamingSyncQueue?.enabled) {
+                const captureAttempt = resolveCaptureTaskItemAttempt({
+                  keyword: capturedKeyword,
+                });
                 await maybeRunAutoSyncAfterDetailCapture(settings, {
                   sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
                   recordIds,
                   shouldStop: shouldStopBatchInvocation,
+                  captureTaskId: scopedUnattendedRequestId,
+                  captureTaskItemAttemptId: String(
+                    captureAttempt?.attemptId || "",
+                  ).trim(),
+                  captureTaskItemRequestHash: String(
+                    captureAttempt?.requestHash || "",
+                  ).trim(),
                 });
               }
               return enhanceResult;
@@ -14108,8 +14513,20 @@ async function handleBatchKeywordCapture(options = {}) {
             maxAttempts: maxKeywordAttempts,
           };
           const progressForUi = autoLoop
-            ? { ...normalizedProgress, round, message: `第 ${round} 轮 · ${progress.message || ""}` }
+            ? {
+                ...normalizedProgress,
+                round,
+                message: sequentialSearchEnabled
+                  ? `${activeSearchPassLabel} · ${progress.message || ""}`
+                  : `第 ${round} 轮 · ${progress.message || ""}`,
+              }
             : { ...normalizedProgress, round };
+          if (sequentialSearchEnabled) {
+            progressForUi.searchPass = activeSearchPass;
+            progressForUi.searchPassCurrent = round;
+            progressForUi.searchPassTotal = sequentialSearchPasses.length;
+            progressForUi.searchPassLabel = activeSearchPassLabel;
+          }
           progressForUi.message = appendStreamingSyncSummary(
             progressForUi.message,
             streamingSyncQueue,
@@ -14149,9 +14566,15 @@ async function handleBatchKeywordCapture(options = {}) {
         maxAttempts: maxKeywordAttempts,
         runAttempt: async ({keywords: attemptKeywords, attempt}) => {
           keywordAttempt = attempt;
+          const attemptInitialSearchEvidence =
+            attempt === 1 ? bootstrapInitialSearchEvidence : null;
+          // A bootstrap navigation proves exactly one search operation. Never
+          // let a later local retry or search pass reuse that old page proof.
+          bootstrapInitialSearchEvidence = null;
           const attemptResult = await batchCaptureByKeywords({
             ...baseBatchOptions,
             keywords: attemptKeywords,
+            initialSearchEvidence: attemptInitialSearchEvidence,
           });
           return attemptResult;
         },
@@ -14245,6 +14668,8 @@ async function handleBatchKeywordCapture(options = {}) {
       if (
         shouldStopBatchInvocation() ||
         result.canceled ||
+        result.fatal ||
+        result.recoveryRequired ||
         !autoLoop ||
         round >= maxRounds
       ) {
@@ -14360,7 +14785,9 @@ async function handleBatchKeywordCapture(options = {}) {
     } else if (autoLoop) {
       const stopped = result.canceled || batchKeywordCancelRequested;
       showMessage(
-        `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`,
+        sequentialSearchEnabled
+          ? `无人值守采集${stopped ? "已停止" : "结束"}：已执行 ${round}/${sequentialSearchPasses.length} 个巡检步骤，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`
+          : `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`,
         stopped ? "warning" : "success",
       );
     } else if (result.canceled) {
@@ -14424,15 +14851,17 @@ async function handleBatchKeywordCapture(options = {}) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
     sidebarTaskStatus = "failed";
     sidebarTaskError = error;
+    caughtError = error;
     if (error?.code === "UNATTENDED_ELASTIC_ITEM_RELEASED") {
       throw error;
     }
     showMessage("批量采集失败: " + error.message, "error");
-    return {
+    failureOutcome = {
       started: true,
       ok: false,
       error: error.message,
     };
+    return failureOutcome;
   } finally {
     const ownsBatchInvocation = () =>
       activeBatchKeywordInvocationToken === batchInvocationToken;
@@ -14440,7 +14869,7 @@ async function handleBatchKeywordCapture(options = {}) {
       ownsBatchInvocation() && isCurrentUnattendedInvocation();
     if (
       ownsCurrentBatchInvocation() &&
-      streamingSyncQueue?.enabled &&
+      streamingSyncQueue &&
       !streamingSyncDrained
     ) {
       streamingSyncResult = await drainStreamingDetailSyncQueue(
@@ -14450,6 +14879,19 @@ async function handleBatchKeywordCapture(options = {}) {
         console.warn("[Sidebar] Drain streaming sync after batch failed:", error);
         return streamingSyncQueue.getStats();
       });
+      streamingSyncDrained = true;
+    }
+    // The terminal drain happens in finally so every exceptional exit uses the
+    // same queue. Preserve that result on the already-returned object/error;
+    // otherwise the outer unattended runner cannot prove the source attempt is
+    // locally closed and a safe relay waits forever.
+    if (streamingSyncResult) {
+      if (failureOutcome) {
+        failureOutcome.streamingSync = streamingSyncResult;
+      }
+      if (caughtError && typeof caughtError === "object") {
+        caughtError.streamingSync = streamingSyncResult;
+      }
     }
     const shouldEndCaptureTaskSession =
       ownsCurrentBatchInvocation() &&
@@ -14589,7 +15031,11 @@ function stopRejectedUnattendedAttempt(reason = "attempt_mismatch") {
 async function reportUnattendedKeywordRun(
   requestId,
   patch = {},
-  {attemptId = activeUnattendedRunAttemptId, quiet = false} = {},
+  {
+    attemptId = activeUnattendedRunAttemptId,
+    quiet = false,
+    durableCheckpoint = false,
+  } = {},
 ) {
   if (!requestId) {
     return {ok: false, accepted: false, reason: "missing_request_id", data: null};
@@ -14601,21 +15047,69 @@ async function reportUnattendedKeywordRun(
       attemptId: String(attemptId || ""),
       patch,
     });
-    const accepted = response?.accepted !== false && response?.ok !== false;
-    const reason = String(response?.reason || "");
+    const hasExplicitAcceptance = typeof response?.accepted === "boolean";
+    const accepted = response?.accepted === true && response?.ok !== false;
+    const reason = String(
+      response?.reason || (hasExplicitAcceptance ? "" : "transport_error"),
+    );
     if (
       !accepted &&
       (reason === "attempt_mismatch" || reason === "terminal")
     ) {
       stopRejectedUnattendedAttempt(reason);
     }
+    if (
+      !accepted &&
+      ["attempt_mismatch", "not_found", "terminal"].includes(reason)
+    ) {
+      await discardUnattendedCheckpointReports({requestId, attemptId});
+    }
+    if (!accepted && !hasExplicitAcceptance && durableCheckpoint) {
+      const queued = await enqueueUnattendedCheckpointReport({
+        requestId,
+        attemptId,
+        patch,
+      });
+      if (queued.ok) {
+        return {
+          ok: true,
+          accepted: true,
+          reason: "queued_durable",
+          data: null,
+          durable: true,
+        };
+      }
+    }
+    // Do not delete a queued checkpoint merely because this direct report was
+    // accepted: a newer report for the same attempt may have been queued while
+    // this message was in flight. Flush below preserves revision fencing, and
+    // the task ledger rejects an older replay as stale_progress.
+    if (accepted) {
+      void flushPendingUnattendedCheckpointReports({quiet: true});
+    }
     return {
-      ok: response?.ok !== false,
+      ok: hasExplicitAcceptance && response?.ok !== false,
       accepted,
       reason,
       data: response?.data || null,
     };
   } catch (error) {
+    if (durableCheckpoint) {
+      const queued = await enqueueUnattendedCheckpointReport({
+        requestId,
+        attemptId,
+        patch,
+      });
+      if (queued.ok) {
+        return {
+          ok: true,
+          accepted: true,
+          reason: "queued_durable",
+          data: null,
+          durable: true,
+        };
+      }
+    }
     if (!quiet) {
       console.warn("[Sidebar] Update unattended keyword run failed:", error);
     }
@@ -14627,6 +15121,52 @@ async function reportUnattendedKeywordRun(
       error,
     };
   }
+}
+
+let unattendedCheckpointOutboxFlushPromise = null;
+
+function flushPendingUnattendedCheckpointReports({quiet = false} = {}) {
+  if (unattendedCheckpointOutboxFlushPromise) {
+    return unattendedCheckpointOutboxFlushPromise;
+  }
+  unattendedCheckpointOutboxFlushPromise =
+    flushUnattendedCheckpointReportOutbox({
+      send: sendUnattendedRuntimeMessage,
+    })
+      .catch((error) => {
+        if (!quiet) {
+          console.warn(
+            "[Sidebar] Flush unattended checkpoint outbox failed:",
+            error,
+          );
+        }
+        return {ok: false, reason: "flush_error", error};
+      })
+      .finally(() => {
+        unattendedCheckpointOutboxFlushPromise = null;
+      });
+  return unattendedCheckpointOutboxFlushPromise;
+}
+
+async function reportInitialUnattendedKeywordRun(
+  requestId,
+  patch = {},
+  {attemptId = activeUnattendedRunAttemptId} = {},
+) {
+  let lastResult = null;
+  for (const delayMs of UNATTENDED_INITIAL_REPORT_RETRY_DELAYS_MS) {
+    if (delayMs > 0) {
+      await sleep(delayMs);
+    }
+    lastResult = await reportUnattendedKeywordRun(requestId, patch, {
+      attemptId,
+      quiet: delayMs < UNATTENDED_INITIAL_REPORT_RETRY_DELAYS_MS.at(-1),
+    });
+    if (lastResult.accepted || lastResult.reason !== "transport_error") {
+      return lastResult;
+    }
+  }
+  return lastResult;
 }
 
 async function sendUnattendedRuntimeMessage(message) {
@@ -15448,6 +15988,18 @@ function getUnattendedRunRequestIdFromUrl() {
   }
 }
 
+function getUnattendedRunAttemptIdFromUrl() {
+  try {
+    return (
+      new URLSearchParams(window.location.search).get(
+        UNATTENDED_RUN_ATTEMPT_QUERY_KEY,
+      ) || ""
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
 function getTargetedPostRunRequestIdFromUrl() {
   try {
     return (
@@ -15830,22 +16382,11 @@ function startTargetedPostRunHeartbeat(invocationToken, getCurrentRequest) {
 
     inFlight = true;
     const now = new Date().toISOString();
-    const progress =
-      current.progress &&
-      typeof current.progress === "object" &&
-      !Array.isArray(current.progress)
-        ? current.progress
-        : {};
     try {
       await updateTargetedPostRun(
         current,
         {
           heartbeatAt: now,
-          businessProgressAt: now,
-          progress: {
-            ...progress,
-            updatedAt: now,
-          },
         },
         invocationToken,
       );
@@ -15980,18 +16521,9 @@ async function settleTargetedPostRunnerTab(
     return false;
   }
 
-  const detectedPlatform = detectPlatformFromUrl(runnerTab?.url || "");
-  const normalizedPlatform =
-    detectedPlatform && detectedPlatform !== "unknown"
-      ? detectedPlatform
-      : String(platform || "").trim().toLowerCase();
-  const homeUrl = TARGETED_POST_RUNNER_HOME_URLS[normalizedPlatform] || "";
-  if (!homeUrl) {
-    return false;
-  }
-
-  // 这个标签页由定向任务自己创建，可以安全收尾。先停止当前作品的音视频，
-  // 再回到平台首页，避免任务结束后仍在后台循环播放。
+  // 这个标签页由当前定向任务自己创建，可以安全收尾。先停止当前作品的
+  // 音视频；正常终态直接关闭，避免每个巡检任务在浏览器里留下一个平台
+  // 首页。needs_action 保留现场供用户处理，但同样停止媒体播放。
   try {
     await chrome.scripting.executeScript({
       target: {tabId: normalizedTabId},
@@ -16021,13 +16553,10 @@ async function settleTargetedPostRunnerTab(
   }
 
   try {
-    await chrome.tabs.update(normalizedTabId, {
-      url: homeUrl,
-      active: true,
-    });
+    await chrome.tabs.remove(normalizedTabId);
     return true;
   } catch (error) {
-    console.warn("[Sidebar] Restore targeted runner home failed:", error);
+    console.warn("[Sidebar] Close targeted runner tab failed:", error);
     return false;
   }
 }
@@ -16078,13 +16607,6 @@ function buildTargetedProfileCaptureTaskContext(
   request = {},
   invocationToken = null,
 ) {
-  if (
-    String(request?.workflow || "").trim() !==
-    "official_account_comment_patrol"
-  ) {
-    return null;
-  }
-
   const requestToken = getTargetedPostInvocationTokenFromRequest(request);
   if (
     !requestToken ||
@@ -16096,11 +16618,16 @@ function buildTargetedProfileCaptureTaskContext(
     );
   }
 
-  // Native Debug resources use the same physical run identity as the cloud
-  // task ledger. Keeping the attempt in the task id prevents a late cleanup
-  // from attempt A from releasing attempt B after a device retry/handoff.
+  const officialCommentPatrol =
+    String(request?.workflow || "").trim() ===
+    "official_account_comment_patrol";
+  // Native Debug resources for comment patrol use the physical run identity,
+  // while server evidence always uses the UUID cloud task identity.
   return Object.freeze({
-    taskId: `${requestToken.requestId}::${requestToken.attemptId}`,
+    taskId: officialCommentPatrol
+      ? `${requestToken.requestId}::${requestToken.attemptId}`
+      : "",
+    captureTaskId: String(request.taskId || request.id || "").trim(),
     attemptId: requestToken.attemptId,
     label: getTargetedWorkflowLabel(request.workflow),
     ownerRequired: true,
@@ -16183,6 +16710,54 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
   let executionLock = null;
   let targetTabId = null;
   let stopTargetedPostHeartbeat = () => {};
+  let targetedBusinessProgressTimer = null;
+  let pendingTargetedBusinessProgress = null;
+  let targetedBusinessProgressInFlight = Promise.resolve();
+  const publishTargetedBusinessProgress = () => {
+    if (targetedBusinessProgressTimer !== null) {
+      clearTimeout(targetedBusinessProgressTimer);
+      targetedBusinessProgressTimer = null;
+    }
+    const patch = pendingTargetedBusinessProgress;
+    pendingTargetedBusinessProgress = null;
+    if (!patch) return targetedBusinessProgressInFlight;
+    targetedBusinessProgressInFlight = targetedBusinessProgressInFlight
+      .then(async () => {
+        if (!isActiveTargetedPostInvocation(invocationToken)) return;
+        request = await updateTargetedPostRun(
+          targetedPostRunState || request,
+          patch,
+          invocationToken,
+        );
+      })
+      .catch((error) => {
+        if (isActiveTargetedPostInvocation(invocationToken)) {
+          console.warn(
+            "[Sidebar] Targeted business progress persistence failed:",
+            error,
+          );
+        }
+      });
+    return targetedBusinessProgressInFlight;
+  };
+  const queueTargetedBusinessProgress = (progress = {}, message = "") => {
+    const updatedAt =
+      String(progress?.updatedAt || "").trim() || new Date().toISOString();
+    pendingTargetedBusinessProgress = {
+      progress: {...progress, updatedAt},
+      message: String(message || progress?.message || "").trim(),
+      businessProgressAt: updatedAt,
+    };
+    if (targetedBusinessProgressTimer === null) {
+      targetedBusinessProgressTimer = setTimeout(() => {
+        void publishTargetedBusinessProgress();
+      }, 1000);
+    }
+  };
+  const flushTargetedBusinessProgress = async () => {
+    await publishTargetedBusinessProgress();
+    await targetedBusinessProgressInFlight;
+  };
   const shouldStop = () =>
     !isActiveTargetedPostInvocation(invocationToken) ||
     (isSameTargetedPostInvocationToken(
@@ -16323,7 +16898,15 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           // the legacy monitor-start endpoint would correctly reject this
           // execution because it is linked to a cloud task item.
           executionPreclaimed: true,
-          captureTaskContext: targetedProfileCaptureTaskContext,
+          captureTaskContext: {
+            ...targetedProfileCaptureTaskContext,
+            captureTaskItemAttemptId: String(
+              target.captureTaskItemAttemptId || "",
+            ).trim(),
+            captureTaskItemRequestHash: String(
+              target.captureTaskItemRequestHash || "",
+            ).trim(),
+          },
           shouldStop,
           onProgress: (progress = {}) => {
             if (!isActiveTargetedPostInvocation(invocationToken)) {
@@ -16376,6 +16959,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
                 message: nextProgress.message,
               },
             );
+            queueTargetedBusinessProgress(
+              nextProgress,
+              nextProgress.message,
+            );
             renderCaptureDebugSession(getCurrentRuntime() || {});
           },
         });
@@ -16406,6 +16993,17 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
               : monitorStatus === "success"
                 ? "profile_scan_completed"
                 : "profile_scan_failed",
+          scanComplete: monitorResult?.scanComplete === true,
+          partial: monitorResult?.partial === true,
+          incompleteReason: String(monitorResult?.incompleteReason || ""),
+          ...(monitorStatus === "no_hit"
+            ? {
+                noResults: true,
+                resultKind: "profile_scan_no_new_posts",
+                qualifyingCount: 0,
+                scanComplete: true,
+              }
+            : {}),
           scannedCount: Math.max(
             0,
             Number(monitorResult?.scannedCount) || 0,
@@ -16424,16 +17022,14 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           ),
           ...(monitorStatus === "failed"
             ? {
-                error: {
-                  code: String(
-                    monitorResult?.errorCode || "PROFILE_SCAN_FAILED",
-                  ),
-                  stage: "profile_scan",
-                  message: String(
-                    monitorResult?.errorMessage || "账号作品扫描失败",
-                  ).slice(0, 1000),
-                  retryable: true,
-                },
+                error: cloudTargetedPostApi.projectCaptureFailure(
+                  [monitorResult?.error, monitorResult],
+                  {
+                    fallbackCode: "PROFILE_SCAN_FAILED",
+                    stage: "profile_scan",
+                    fallbackMessage: "账号作品扫描失败",
+                  },
+                ),
               }
             : {}),
         };
@@ -16502,6 +17098,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
                 message: nextProgress.message,
               },
             );
+            queueTargetedBusinessProgress(
+              nextProgress,
+              nextProgress.message,
+            );
             renderCaptureDebugSession(getCurrentRuntime() || {});
           },
           shouldStop,
@@ -16547,6 +17147,13 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
                 {
                   trigger: targetedWorkflow,
                   syncScope: "all",
+                  captureTaskId: String(request.taskId || request.id || ""),
+                  captureTaskItemAttemptId: String(
+                    target.captureTaskItemAttemptId || "",
+                  ).trim(),
+                  captureTaskItemRequestHash: String(
+                    target.captureTaskItemRequestHash || "",
+                  ).trim(),
                   captureSettings: {
                     ...captureSettings,
                     autoSyncAfterDetailCapture: true,
@@ -16567,6 +17174,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           }
         }
       }
+      await flushTargetedBusinessProgress();
       if (!isActiveTargetedPostInvocation(invocationToken)) {
         throw createTargetedPostInvocationError();
       }
@@ -16628,6 +17236,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           ? "completed_with_warnings"
           : "failed";
     stopTargetedPostHeartbeat();
+    await flushTargetedBusinessProgress();
     request = await updateTargetedPostRun(request, {
       status: finalStatus,
       finishedAt: new Date().toISOString(),
@@ -16659,6 +17268,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     await refreshDataPool();
   } catch (error) {
     stopTargetedPostHeartbeat();
+    await flushTargetedBusinessProgress();
     console.error("[Sidebar] Targeted post workflow failed:", error);
     const staleInvocation =
       String(error?.code || "") === "stale_targeted_post_attempt" ||
@@ -16702,6 +17312,10 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     }
   } finally {
     stopTargetedPostHeartbeat();
+    if (targetedBusinessProgressTimer !== null) {
+      clearTimeout(targetedBusinessProgressTimer);
+      targetedBusinessProgressTimer = null;
+    }
     const cleanupOwnership =
       getTargetedPostInvocationOwnership(invocationToken);
     if (
@@ -16746,6 +17360,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     return;
   }
   const requestId = getUnattendedRunRequestIdFromUrl();
+  const requestAttemptId = getUnattendedRunAttemptIdFromUrl();
   if (!requestId && !allowPending) {
     return;
   }
@@ -16762,6 +17377,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     const response = await chrome.runtime.sendMessage({
       type: "onstarvoice:claim-unattended-keyword-run",
       requestId,
+      attemptId: requestAttemptId,
       holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
     });
     if (
@@ -16844,6 +17460,18 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     ) {
       await releaseCaptureExecutionLock(claimedAdoptedLockId);
     }
+    // Closure is a separate, fail-closed phase after terminal persistence,
+    // task-session cleanup and lock release. Drain this attempt's durable
+    // checkpoints before asking background to close the exact task runner and
+    // attest that no task-owned browser resource remains.
+    await flushPendingUnattendedCheckpointReports({quiet: true}).catch(
+      () => null,
+    );
+    await sendUnattendedRuntimeMessage({
+      type: "onstarvoice:finalize-unattended-local-closure",
+      requestId: claimedRequestId,
+      attemptId: claimedAttemptId,
+    }).catch(() => null);
   }
 }
 
@@ -16938,6 +17566,32 @@ async function waitForActiveTabReady(
     .trim()
     .toLowerCase();
   const normalizedExpectedKeyword = String(expectedKeyword || "").trim();
+  const normalizeSearchKeyword = (value) =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/gu, "");
+  const readSearchKeywordFromUrl = (value) => {
+    try {
+      const parsed = new URL(String(value || ""));
+      if (expectedPlatform === "xiaohongshu") {
+        return parsed.searchParams.get("keyword") ||
+          parsed.searchParams.get("q") || "";
+      }
+      if (expectedPlatform === "douyin") {
+        return decodeURIComponent(
+          String(parsed.pathname || "").split("/search/")[1]?.split("/")[0] ||
+            "",
+        );
+      }
+      if (expectedPlatform === "weibo") {
+        return parsed.searchParams.get("q") || "";
+      }
+    } catch {
+      return "";
+    }
+    return "";
+  };
   const matchesExpectedSearch = (tab) => {
     const tabUrl = String(tab?.url || "").trim();
     if (!tabUrl) return false;
@@ -16950,13 +17604,8 @@ async function waitForActiveTabReady(
     if (!normalizedExpectedKeyword) {
       return !normalizedExpectedUrl || tabUrl === normalizedExpectedUrl;
     }
-    try {
-      return decodeURIComponent(tabUrl.replace(/\+/gu, "%20")).includes(
-        normalizedExpectedKeyword,
-      );
-    } catch {
-      return tabUrl.includes(encodeURIComponent(normalizedExpectedKeyword));
-    }
+    return normalizeSearchKeyword(readSearchKeywordFromUrl(tabUrl)) ===
+      normalizeSearchKeyword(normalizedExpectedKeyword);
   };
   while (Date.now() - startedAt < timeoutMs) {
     if (typeof shouldStop === "function" && shouldStop()) {
@@ -17030,6 +17679,32 @@ async function waitForRuntimeSearchPage({
   const expectedTabId = Number(tabId);
   const normalizedExpectedKeyword = String(expectedKeyword || "").trim();
   const normalizedExpectedUrl = String(expectedUrl || "").trim();
+  const normalizeSearchKeyword = (value) =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/gu, "");
+  const readSearchKeywordFromUrl = (value) => {
+    try {
+      const parsed = new URL(String(value || ""));
+      if (platform === "xiaohongshu") {
+        return parsed.searchParams.get("keyword") ||
+          parsed.searchParams.get("q") || "";
+      }
+      if (platform === "douyin") {
+        return decodeURIComponent(
+          String(parsed.pathname || "").split("/search/")[1]?.split("/")[0] ||
+            "",
+        );
+      }
+      if (platform === "weibo") {
+        return parsed.searchParams.get("q") || "";
+      }
+    } catch {
+      return "";
+    }
+    return "";
+  };
   while (Date.now() - startedAt < timeoutMs) {
     if (typeof shouldStop === "function" && shouldStop()) {
       const error = new Error("无人值守搜索页恢复已取消");
@@ -17040,15 +17715,9 @@ async function waitForRuntimeSearchPage({
     const runtimeUrl = String(runtime?.lastPageUrl || "");
     let keywordMatches = !normalizedExpectedKeyword;
     if (!keywordMatches) {
-      try {
-        keywordMatches = decodeURIComponent(
-          runtimeUrl.replace(/\+/gu, "%20"),
-        ).includes(normalizedExpectedKeyword);
-      } catch {
-        keywordMatches = runtimeUrl.includes(
-          encodeURIComponent(normalizedExpectedKeyword),
-        );
-      }
+      keywordMatches = normalizeSearchKeyword(
+        readSearchKeywordFromUrl(runtimeUrl),
+      ) === normalizeSearchKeyword(normalizedExpectedKeyword);
     } else if (normalizedExpectedUrl) {
       keywordMatches = runtimeUrl === normalizedExpectedUrl;
     }
@@ -17067,9 +17736,149 @@ async function waitForRuntimeSearchPage({
       }
       return true;
     }
+    // 平台页面在慢加载时，全局 runtime 可能晚于已绑定标签页更新。
+    // 直接核验任务绑定的 tab，只接受“正确搜索词 + 搜索页骨架已出现”；
+    // 结果卡片由后续的长等待检查负责，这里不因结果还在加载而刷新页面。
+    if (
+      (platform === "douyin" || platform === "xiaohongshu") &&
+      Number.isFinite(expectedTabId) &&
+      expectedTabId > 0
+    ) {
+      const boundTabReady = await chrome.scripting
+        .executeScript({
+          target: {tabId: expectedTabId},
+          args: [normalizedExpectedKeyword, platform],
+          func: (expectedKeywordValue, expectedPlatform) => {
+            const normalize = (value) =>
+              String(value || "")
+                .trim()
+                .toLowerCase()
+                .replace(/\s+/gu, "");
+            const decode = (value) => {
+              try {
+                return decodeURIComponent(String(value || ""));
+              } catch {
+                return String(value || "");
+              }
+            };
+            const expected = normalize(expectedKeywordValue);
+            const url = new URL(window.location.href);
+            const hostname = String(url.hostname || "").toLowerCase();
+            const pathname = String(url.pathname || "");
+            if (expectedPlatform === "xiaohongshu") {
+              const queryKeyword = decode(
+                url.searchParams.get("keyword") ||
+                  url.searchParams.get("q") ||
+                  "",
+              );
+              const inputKeyword =
+                Array.from(
+                  document.querySelectorAll(
+                    'input[type="search"], input[placeholder*="搜索"], input.search-input',
+                  ),
+                )
+                  .map((node) => node.value || node.textContent || "")
+                  .map((value) => String(value || "").trim())
+                  .find(Boolean) || "";
+              const keywordMatched =
+                Boolean(expected) &&
+                (normalize(queryKeyword) === expected ||
+                  normalize(inputKeyword) === expected);
+              const bodyText = String(document.body?.innerText || "");
+              const hasSearchShell = Boolean(
+                document.querySelector(
+                  '.feeds-container, section.note-item, .note-item, [class*="feeds"]',
+                ) ||
+                  (/全部/u.test(bodyText) &&
+                    /图文/u.test(bodyText) &&
+                    /视频/u.test(bodyText)),
+              );
+              return Boolean(
+                (hostname === "xiaohongshu.com" ||
+                  hostname.endsWith(".xiaohongshu.com")) &&
+                  (pathname === "/search_result" ||
+                    pathname === "/web/search_result") &&
+                  document.readyState !== "loading" &&
+                  keywordMatched &&
+                  hasSearchShell,
+              );
+            }
+            const urlKeyword = decode(
+              pathname.split("/search/")[1]?.split("/")[0] || "",
+            );
+            const inputKeyword =
+              Array.from(
+                document.querySelectorAll(
+                  '[data-e2e="searchbar-input"], input[type="search"], input[placeholder*="搜索"]',
+                ),
+              )
+                .map((node) => node.value || node.textContent || "")
+                .map((value) => String(value || "").trim())
+                .find(Boolean) || "";
+            const keywordMatched =
+              Boolean(expected) &&
+              (normalize(urlKeyword) === expected ||
+                normalize(inputKeyword) === expected);
+            const bodyText = String(document.body?.innerText || "");
+            const hasSearchShell = Boolean(
+              document.querySelector(
+                '[data-e2e="searchbar-input"], #search-result-container, #waterFallScrollContainer, [data-e2e="scroll-list"]',
+              ) || (/综合/u.test(bodyText) && /视频|用户|直播/u.test(bodyText)),
+            );
+            return Boolean(
+              (hostname === "douyin.com" ||
+                hostname.endsWith(".douyin.com")) &&
+                pathname.startsWith("/search/") &&
+                document.readyState !== "loading" &&
+                keywordMatched &&
+                hasSearchShell,
+            );
+          },
+        })
+        .then(([result]) => Boolean(result?.result))
+        .catch(() => false);
+      if (boundTabReady) {
+        if (typeof shouldStop === "function" && shouldStop()) {
+          const error = new Error("无人值守搜索页恢复已取消");
+          error.code = "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
+          throw error;
+        }
+        return true;
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return false;
+}
+
+function resolveUnattendedBootstrapStartGate(request = {}, now = Date.now()) {
+  const orchestrationContext =
+    request?.orchestrationContext &&
+    typeof request.orchestrationContext === "object"
+      ? request.orchestrationContext
+      : {};
+  if (orchestrationContext.distributionMode !== "elastic_pool") {
+    return {delayed: false, waitMs: 0, waitUntil: "", reason: ""};
+  }
+  const notBeforeMs = Date.parse(
+    String(orchestrationContext.bootstrapStartNotBefore || ""),
+  );
+  if (!Number.isFinite(notBeforeMs)) {
+    return {delayed: false, waitMs: 0, waitUntil: "", reason: ""};
+  }
+  const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const waitMs = Math.min(
+    UNATTENDED_BOOTSTRAP_GATE_MAX_WAIT_MS,
+    Math.max(0, notBeforeMs - nowMs),
+  );
+  return {
+    delayed: waitMs > 0,
+    waitMs,
+    waitUntil: new Date(nowMs + waitMs).toISOString(),
+    reason: String(
+      orchestrationContext.bootstrapPacingReason || "staggered_start",
+    ).trim(),
+  };
 }
 
 async function navigateActiveTabToKeywordSearchForPlan({
@@ -17184,6 +17993,16 @@ async function navigateActiveTabToKeywordSearchForPlan({
         preferredWindowId = Number(targetTab.windowId);
       }
       try {
+        const [previousDocumentGeneration, douyinSearchTransition] =
+          platform === "douyin"
+            ? await Promise.all([
+                readDouyinSearchDocumentGenerationInTab(originalTargetTabId),
+                beginDouyinSearchResultTransitionInTab(
+                  originalTargetTabId,
+                  keyword,
+                ),
+              ])
+            : [null, null];
         if (
           Number.isFinite(Number(targetTab.windowId)) &&
           Number(targetTab.windowId) >= 0
@@ -17202,7 +18021,7 @@ async function navigateActiveTabToKeywordSearchForPlan({
         }
         const readyState = await waitForActiveTabReady(
           preferredTabId,
-          15000,
+          platform === "douyin" ? 45000 : 15000,
           {
             windowId: targetTab.windowId,
             platform,
@@ -17226,6 +18045,7 @@ async function navigateActiveTabToKeywordSearchForPlan({
               tabId: preferredTabId,
               expectedUrl: searchUrl,
               expectedKeyword: keyword,
+              timeoutMs: platform === "douyin" ? 15000 : 8000,
               shouldStop,
             })
           : false;
@@ -17235,6 +18055,33 @@ async function navigateActiveTabToKeywordSearchForPlan({
             stoppedError.code = "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
             throw stoppedError;
           }
+          const currentDocumentGeneration =
+            platform === "douyin"
+              ? await readDouyinSearchDocumentGenerationInTab(preferredTabId)
+              : null;
+          const navigationTransitionAccepted = Boolean(
+            platform === "douyin" &&
+              Number(previousDocumentGeneration?.timeOrigin) > 0 &&
+              Number(currentDocumentGeneration?.timeOrigin) > 0 &&
+              Number(previousDocumentGeneration.timeOrigin) !==
+                Number(currentDocumentGeneration.timeOrigin) &&
+              currentDocumentGeneration?.readyState === "complete",
+          );
+          const submitAccepted = Boolean(
+            platform === "douyin" &&
+              String(douyinSearchTransition?.submissionNonce || "").trim(),
+          );
+          if (
+            platform === "douyin" &&
+            !navigationTransitionAccepted &&
+            !submitAccepted
+          ) {
+            const proofError = new Error(
+              "抖音搜索页已打开，但无法确认这次搜索操作，已停止以免重复搜索或误采旧结果",
+            );
+            proofError.code = "UNATTENDED_SEARCH_BOOTSTRAP_PROOF_MISSING";
+            throw proofError;
+          }
           return {
             tabId: preferredTabId,
             tab: readyState.tab,
@@ -17242,6 +18089,25 @@ async function navigateActiveTabToKeywordSearchForPlan({
             url: String(readyState.tab?.url || searchUrl),
             attemptCount: attempt,
             recovered: attempt > 1,
+            initialSearchEvidence: {
+              ready: true,
+              keyword: String(keyword || "").trim(),
+              platform,
+              tabId: preferredTabId,
+              pageUrl: String(readyState.tab?.url || searchUrl),
+              baselineCaptured:
+                douyinSearchTransition?.baselineCaptured === true,
+              previousWorkIds: Array.isArray(
+                douyinSearchTransition?.previousWorkIds,
+              )
+                ? douyinSearchTransition.previousWorkIds
+                : [],
+              submissionNonce: String(
+                douyinSearchTransition?.submissionNonce || "",
+              ).trim(),
+              submitAccepted,
+              navigationTransitionAccepted,
+            },
           };
         }
         lastError = new Error("搜索结果页尚未就绪，无法启动无人值守采集");
@@ -17359,6 +18225,33 @@ function buildUnattendedTerminalProgress({
   );
   const sync =
     streamingSync && typeof streamingSync === "object" ? streamingSync : {};
+  const syncInteger = (value) =>
+    Number.isSafeInteger(Number(value)) && Number(value) >= 0
+      ? Number(value)
+      : null;
+  const capturedRecordCount = Math.max(0, Number(summary?.saved) || 0);
+  const streamingSyncEvidenceKnown = Boolean(
+    streamingSync &&
+      typeof streamingSync === "object" &&
+      typeof sync.enabled === "boolean" &&
+      sync.drainCompleted === true &&
+      syncInteger(sync.enqueuedCount) !== null &&
+      syncInteger(sync.processedCount) !== null &&
+      syncInteger(sync.successCount) !== null &&
+      syncInteger(sync.failedCount) !== null &&
+      syncInteger(sync.skippedCount) !== null &&
+      syncInteger(sync.pendingCount) !== null &&
+      syncInteger(sync.activeCount) !== null &&
+      syncInteger(sync.remainingCount) !== null &&
+      syncInteger(sync.capturedUniqueCount) !== null &&
+      syncInteger(sync.enqueuedUniqueCount) !== null &&
+      syncInteger(sync.excludedUniqueCount) !== null &&
+      syncInteger(sync.succeededUniqueCount) !== null &&
+      (capturedRecordCount === 0 ||
+        syncInteger(sync.capturedUniqueCount) > 0) &&
+      typeof sync.blocked === "boolean" &&
+      typeof sync.canceled === "boolean"
+  );
   return {
     ...previous,
     captureTaskId:
@@ -17423,6 +18316,43 @@ function buildUnattendedTerminalProgress({
       0,
       Number(sync.remainingCount ?? previous.syncRemainingCount) || 0,
     ),
+    // Closure evidence consumes only these explicit attempt-local fields. The
+    // legacy sync* values above remain UI counters and may be defaulted for
+    // backwards compatibility; they are intentionally not authoritative.
+    streamingSyncEvidenceKnown,
+    streamingSyncDrainCompleted:
+      streamingSyncEvidenceKnown && sync.drainCompleted === true,
+    streamingSyncEnabled:
+      streamingSyncEvidenceKnown ? sync.enabled === true : null,
+    streamingSyncEnqueuedCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.enqueuedCount) : null,
+    streamingSyncProcessedCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.processedCount) : null,
+    streamingSyncSuccessCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.successCount) : null,
+    streamingSyncFailedCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.failedCount) : null,
+    streamingSyncSkippedCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.skippedCount) : null,
+    streamingSyncPendingCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.pendingCount) : null,
+    streamingSyncActiveCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.activeCount) : null,
+    streamingSyncRemainingCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.remainingCount) : null,
+    streamingSyncCapturedUniqueCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.capturedUniqueCount) : null,
+    streamingSyncEnqueuedUniqueCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.enqueuedUniqueCount) : null,
+    streamingSyncExcludedUniqueCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.excludedUniqueCount) : null,
+    streamingSyncSucceededUniqueCount:
+      streamingSyncEvidenceKnown ? syncInteger(sync.succeededUniqueCount) : null,
+    streamingSyncBlocked:
+      streamingSyncEvidenceKnown ? sync.blocked === true : null,
+    streamingSyncCanceled:
+      streamingSyncEvidenceKnown ? sync.canceled === true : null,
+    capturedRecordCount,
     updatedAt: String(finishedAt || new Date().toISOString()),
   };
 }
@@ -17439,7 +18369,14 @@ function createUnattendedKeywordCheckpointReporter({
     message = "",
     waitUntil,
   } = {}) => {
-    const checkpointSummary = summary || summarizeUnattendedKeywordCheckpoint(checkpoint);
+    const checkpointSummary =
+      summary || summarizeUnattendedKeywordCheckpoint(checkpoint);
+    // Checkpoints participate in the same monotonic task fence as visible
+    // progress. If this report is queued locally and a newer direct report is
+    // accepted first, background will reject the old replay as stale_progress
+    // instead of letting it roll the durable checkpoint backwards.
+    activeUnattendedProgressSeq += 1;
+    const checkpointProgressSeq = activeUnattendedProgressSeq;
     let reportResult = null;
     for (const delayMs of [0, 300, 900]) {
       if (delayMs > 0) await sleep(delayMs);
@@ -17453,6 +18390,7 @@ function createUnattendedKeywordCheckpointReporter({
           total: taskTotal,
         }),
         message,
+        progressSeq: checkpointProgressSeq,
         businessProgressAt: checkpoint.updatedAt,
       };
       if (waitUntil !== undefined) {
@@ -17461,7 +18399,7 @@ function createUnattendedKeywordCheckpointReporter({
       reportResult = await reportUnattendedKeywordRun(
         requestId,
         reportPatch,
-        {attemptId},
+        {attemptId, durableCheckpoint: true},
       );
       if (
         reportResult?.accepted ||
@@ -17542,13 +18480,33 @@ async function runUnattendedKeywordPlanRequest(request) {
       requestAttemptId ===
         String(activeUnattendedRunAttemptId || "").trim());
   const plan = request?.planSnapshot || {};
+  // The single-relay contract limits complete business runs, not technical
+  // page/session recovery inside one run. Under shared-machine or weak-network
+  // load those bounded recoveries remain necessary and do not duplicate the
+  // keyword capture.
+  const singleRelayMode =
+    request?.cloudAssigned === true &&
+    request?.orchestrationContext?.distributionMode === "elastic_pool" &&
+    plan.recoveryPolicy?.singleRelayV1 === true &&
+    plan.recoveryPolicy?.disableAutomaticSearchRetry === true;
+  const localKeywordMaxAttempts = singleRelayMode
+    ? 1
+    : UNATTENDED_KEYWORD_MAX_ATTEMPTS;
+  const localBootstrapMaxAttempts = UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS;
+  const localCaptureSessionMaxAttempts =
+    UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS;
   const keywords = dedupeKeywords(
     Array.isArray(plan.keywords) ? plan.keywords : [],
   ).slice(0, MAX_BATCH_KEYWORDS);
   const platform = String(plan.platform || "xiaohongshu").trim();
+  const searchPasses = normalizeUnattendedSearchPasses(plan);
+  const sequentialSearchEnabled =
+    platform === "douyin" && searchPasses.length > 1;
   const captureTaskDebugSupported =
     supportsPersistentCaptureTaskPlatform(platform);
-  const plannedRounds = Math.max(1, Number(plan.maxRounds) || 1);
+  const plannedRounds = sequentialSearchEnabled
+    ? searchPasses.length
+    : Math.max(1, Number(plan.maxRounds) || 1);
   const plannedTaskTotal = keywords.length * plannedRounds;
   const checkpoint = normalizeUnattendedKeywordCheckpoint(request, keywords, {
     maxRounds: plannedRounds,
@@ -17560,6 +18518,7 @@ async function runUnattendedKeywordPlanRequest(request) {
   let unattendedCaptureTaskError = null;
   let reportKeywordProgress = null;
   let batchRunResult = null;
+  let capturePipelineStarted = false;
   let unattendedCaptureTaskTerminalProgress = null;
   let unattendedSourceTabId = null;
 
@@ -17670,6 +18629,7 @@ async function runUnattendedKeywordPlanRequest(request) {
     taskMeta: {
       keywordList: [...keywords],
       searchFilters: {...(plan.searchFilters || {})},
+      ...(sequentialSearchEnabled ? {searchPasses: [...searchPasses]} : {}),
       executionMode,
       ...(Object.prototype.hasOwnProperty.call(
         plan,
@@ -17713,7 +18673,7 @@ async function runUnattendedKeywordPlanRequest(request) {
     throw error;
   }
   rememberCaptureTaskProgressContext(startingProgress);
-  const startReport = await reportUnattendedKeywordRun(
+  const startReport = await reportInitialUnattendedKeywordRun(
     requestId,
     {
       status: "running",
@@ -17729,8 +18689,41 @@ async function runUnattendedKeywordPlanRequest(request) {
     },
     {attemptId: requestAttemptId},
   );
-  if (!startReport?.accepted) {
-    throw new Error(`${executionCopy.taskLabel}已被其它恢复尝试接管`);
+  const startReportAlreadyApplied = Boolean(
+    startReport?.reason === "stale_progress" &&
+      String(startReport?.data?.id || "") === requestId &&
+      String(startReport?.data?.attemptId || "") === requestAttemptId &&
+      ["started", "running"].includes(
+        String(startReport?.data?.status || ""),
+      ),
+  );
+  if (!startReport?.accepted && !startReportAlreadyApplied) {
+    const rejectionReason = String(startReport?.reason || "unknown");
+    const replaced = ["attempt_mismatch", "terminal"].includes(
+      rejectionReason,
+    );
+    const transportFailure = rejectionReason === "transport_error";
+    const error = new Error(
+      replaced
+        ? `${executionCopy.taskLabel}已被新的恢复尝试接管`
+        : transportFailure
+          ? `${executionCopy.taskLabel}状态上报连续超时，尚未开始平台搜索`
+          : `${executionCopy.taskLabel}状态上报被拒绝（${rejectionReason}）`,
+    );
+    error.code = replaced
+      ? "UNATTENDED_ATTEMPT_REPLACED"
+      : transportFailure
+        ? "UNATTENDED_STATUS_REPORT_TIMEOUT"
+        : rejectionReason === "not_found"
+          ? "UNATTENDED_REQUEST_NOT_FOUND"
+          : "UNATTENDED_STATUS_REPORT_REJECTED";
+    error.details = {
+      reportReason: rejectionReason,
+      requestId,
+      attemptId: requestAttemptId,
+      platformSearchStarted: false,
+    };
+    throw error;
   }
   keywordPlanState = {
     ...(keywordPlanState && typeof keywordPlanState === "object"
@@ -17793,22 +18786,55 @@ async function runUnattendedKeywordPlanRequest(request) {
     );
   };
 
-  let switchResult = null;
   try {
-    switchResult = await chrome.runtime.sendMessage({
-      type: "onstarvoice:switch-platform-tab",
-      platform,
-    });
-    if (!switchResult?.ok) {
-      throw new Error(
-        switchResult?.error?.message || "打开平台页面失败，无法执行计划",
+    const bootstrapGate = resolveUnattendedBootstrapStartGate(request);
+    if (bootstrapGate.delayed) {
+      const waitSeconds = Math.max(
+        1,
+        Math.ceil(bootstrapGate.waitMs / 1000),
       );
+      await reportAutomaticRecoveryStage({
+        phase: "waiting_bootstrap_slot",
+        message:
+          bootstrapGate.reason === "recent_technical_congestion"
+            ? `检测到多个节点刚发生技术卡顿，${waitSeconds} 秒后错峰打开搜索页`
+            : `正在错峰启动，${waitSeconds} 秒后打开搜索页`,
+        waitUntil: bootstrapGate.waitUntil,
+        remainingMs: bootstrapGate.waitMs,
+      });
+      await sleepWithStop(bootstrapGate.waitMs, () =>
+        activeUnattendedAttemptRejected ||
+        !isCurrentRequestAttempt() ||
+        batchKeywordCancelRequested ||
+        Boolean(activeCaptureTaskCancellationReason),
+      );
+      if (
+        activeUnattendedAttemptRejected ||
+        !isCurrentRequestAttempt() ||
+        batchKeywordCancelRequested ||
+        Boolean(activeCaptureTaskCancellationReason)
+      ) {
+        const canceledError = new Error("无人值守错峰启动已取消");
+        canceledError.code = "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
+        throw canceledError;
+      }
     }
-  } catch (error) {
-    throw new Error(`打开平台页面失败：${error.message}`);
-  }
 
-  try {
+    let switchResult = null;
+    try {
+      switchResult = await chrome.runtime.sendMessage({
+        type: "onstarvoice:switch-platform-tab",
+        platform,
+      });
+      if (!switchResult?.ok) {
+        throw new Error(
+          switchResult?.error?.message || "打开平台页面失败，无法执行计划",
+        );
+      }
+    } catch (error) {
+      throw new Error(`打开平台页面失败：${error.message}`);
+    }
+
     unattendedSourceTabId = await resolveCaptureTaskSourceTabId({
       preferredTabId: switchResult?.data?.tabId,
       platform,
@@ -17831,18 +18857,18 @@ async function runUnattendedKeywordPlanRequest(request) {
       let lastError = null;
       for (
         let attempt = 1;
-        attempt <= UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS;
+        attempt <= localCaptureSessionMaxAttempts;
         attempt += 1
       ) {
         const attemptMessage =
           attempt === 1
             ? "正在建立浏览器采集接管"
-            : `正在第 ${attempt}/${UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS} 次建立浏览器采集接管`;
+            : `正在第 ${attempt}/${localCaptureSessionMaxAttempts} 次建立浏览器采集接管`;
         await reportAutomaticRecoveryStage({
           phase: "starting_capture_session",
           message: attemptMessage,
           attemptCurrent: attempt,
-          attemptTotal: UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS,
+          attemptTotal: localCaptureSessionMaxAttempts,
           retried: Math.max(0, attempt - 1),
         });
         try {
@@ -17859,10 +18885,17 @@ async function runUnattendedKeywordPlanRequest(request) {
         } catch (error) {
           lastError = error;
           const code = String(error?.code || "").trim();
+          const cloudHandoff = Boolean(
+            request?.cloudAssigned === true &&
+              UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES.has(code),
+          );
+          if (cloudHandoff) {
+            break;
+          }
           const retryable = UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES.has(code);
           if (
             !retryable ||
-            attempt >= UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS
+            attempt >= localCaptureSessionMaxAttempts
           ) {
             break;
           }
@@ -17875,12 +18908,12 @@ async function runUnattendedKeywordPlanRequest(request) {
           );
           const waitUntil = new Date(Date.now() + delayMs).toISOString();
           const nextAttempt = attempt + 1;
-          const waitMessage = `浏览器采集资源暂时占用，第 ${nextAttempt}/${UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS} 次接管将在倒计时结束后开始`;
+          const waitMessage = `浏览器采集资源暂时占用，第 ${nextAttempt}/${localCaptureSessionMaxAttempts} 次接管将在倒计时结束后开始`;
           await reportAutomaticRecoveryStage({
             phase: "waiting_capture_session_retry",
             message: waitMessage,
             attemptCurrent: nextAttempt,
-            attemptTotal: UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS,
+            attemptTotal: localCaptureSessionMaxAttempts,
             waitUntil,
             remainingMs: delayMs,
             retried: attempt,
@@ -17914,6 +18947,13 @@ async function runUnattendedKeywordPlanRequest(request) {
       );
       startError.code = code;
       startError.cause = lastError;
+      if (
+        lastError?.details &&
+        typeof lastError.details === "object" &&
+        !Array.isArray(lastError.details)
+      ) {
+        startError.details = {...lastError.details};
+      }
       throw startError;
     };
     // 抖音首个 /jingxuan -> /search 导航可能触发 Chrome Tab replacement。
@@ -17948,11 +18988,13 @@ async function runUnattendedKeywordPlanRequest(request) {
     }
     const loopGapInput = document.getElementById("inputLoopGapMin");
     if (loopGapInput) {
-      loopGapInput.value = String(Math.max(0, Number(plan.roundGapMin) || 0));
+      loopGapInput.value = String(
+        sequentialSearchEnabled ? 0 : Math.max(0, Number(plan.roundGapMin) || 0),
+      );
     }
     const loopRoundsInput = document.getElementById("inputLoopRounds");
     if (loopRoundsInput) {
-      loopRoundsInput.value = String(Math.max(1, Number(plan.maxRounds) || 1));
+      loopRoundsInput.value = String(plannedRounds);
     }
     const scheduledInput = document.getElementById("inputBatchScheduledStart");
     if (scheduledInput) {
@@ -17966,7 +19008,7 @@ async function runUnattendedKeywordPlanRequest(request) {
       baseSearchUrl: String(
         switchResult?.data?.url || getCurrentRuntime()?.lastPageUrl || "",
       ).trim(),
-      maxAttempts: UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS,
+      maxAttempts: localBootstrapMaxAttempts,
       shouldStop: () =>
         activeUnattendedAttemptRejected ||
         !isCurrentRequestAttempt() ||
@@ -18049,8 +19091,10 @@ async function runUnattendedKeywordPlanRequest(request) {
       {
         status: "running",
         message:
-          plannedRounds > 1
-            ? "已交给多轮采集流程执行"
+          sequentialSearchEnabled
+            ? `已交给同一 Agent 串行执行：${searchPasses.map(unattendedSearchPassLabel).join(" → ")}`
+            : plannedRounds > 1
+              ? "已交给多轮采集流程执行"
             : "已交给采集流程执行",
         checkpoint,
         counts: buildUnattendedTaskCounts(
@@ -18099,11 +19143,13 @@ async function runUnattendedKeywordPlanRequest(request) {
         keywords,
         taskTotal: plannedTaskTotal,
       });
+    capturePipelineStarted = true;
     batchRunResult = await handleBatchKeywordCapture({
       onProgress: reportKeywordProgress,
       onKeywordSettled: reportKeywordCheckpoint,
+      initialSearchEvidence: navigationResult?.initialSearchEvidence || null,
       resumeCheckpoint: checkpoint,
-      maxKeywordAttempts: UNATTENDED_KEYWORD_MAX_ATTEMPTS,
+      maxKeywordAttempts: localKeywordMaxAttempts,
       waitForegroundTabId: null,
       sourceTabId: unattendedSourceTabId,
       executionLockOwner: "unattended_keyword_plan",
@@ -18112,7 +19158,17 @@ async function runUnattendedKeywordPlanRequest(request) {
       executionMode,
       unattendedRequestId: requestId,
       unattendedAttemptId: requestAttemptId,
+      captureTaskItemAttempts: Array.isArray(
+        request?.orchestrationContext?.itemAttempts,
+      )
+        ? request.orchestrationContext.itemAttempts
+        : [],
+      searchPasses: sequentialSearchEnabled ? searchPasses : null,
       searchFilters: plan.searchFilters || {},
+      disableAutomaticSearchRetry:
+        plan.recoveryPolicy?.disableAutomaticSearchRetry === true,
+      requireVerifiedFilters:
+        plan.recoveryPolicy?.requireVerifiedFilters === true,
       keywordMaxDetectedItems:
         Object.prototype.hasOwnProperty.call(
           plan,
@@ -18257,7 +19313,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         ? "completed_with_failures"
         : "completed";
     unattendedCaptureTaskStatus = status;
-    const message = `${executionCopy.taskLabel}${status === "completed_with_failures" ? "部分" : ""}完成：共 ${stats.total} 个关键词次，完整完成 ${stats.success}，部分完成 ${stats.partial}，失败 ${stats.failed}`;
+    const message = `${executionCopy.taskLabel}${status === "completed_with_failures" ? "部分" : ""}完成：共 ${stats.total} 个${sequentialSearchEnabled ? "巡检步骤" : "关键词次"}，完整完成 ${stats.success}，部分完成 ${stats.partial}，失败 ${stats.failed}`;
     const finishedAt = new Date().toISOString();
     await reportUnattendedTerminalRun(
       requestId,
@@ -18297,6 +19353,11 @@ async function runUnattendedKeywordPlanRequest(request) {
         error?.code === "UNATTENDED_SEARCH_BOOTSTRAP_FAILED";
       const bootstrapCanceled =
         error?.code === "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
+      const debugOwnershipHandoff = Boolean(
+        UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES.has(
+          String(error?.code || "").trim(),
+        ) && error?.details?.automaticReroute !== false,
+      );
       const cancellation = bootstrapCanceled
         ? resolveUnattendedCancellationTerminal(
             activeCaptureTaskCancellationReason,
@@ -18356,7 +19417,7 @@ async function runUnattendedKeywordPlanRequest(request) {
       }
       const cloudTechnicalRecovery = Boolean(
         request?.cloudAssigned === true &&
-          (bootstrapFailed || elasticItemReleased),
+          (bootstrapFailed || elasticItemReleased || debugOwnershipHandoff),
       );
       const needsAction =
         safetyBlocked || (bootstrapFailed && !cloudTechnicalRecovery);
@@ -18369,12 +19430,46 @@ async function runUnattendedKeywordPlanRequest(request) {
             ? "completed_with_failures"
             : "failed";
       const failureSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
+      const bootstrapAttemptCount = Math.max(1, Number(error?.attempts) || 1);
+      const bootstrapRecoveryCount = Math.max(0, bootstrapAttemptCount - 1);
+      const bootstrapFailureCopy = bootstrapRecoveryCount > 0
+        ? `搜索页首次打开并经过 ${bootstrapRecoveryCount} 次恢复仍未就绪`
+        : "搜索页首次打开仍未就绪";
+      const noCaptureBootstrapSync =
+        bootstrapFailed &&
+        capturePipelineStarted === false &&
+        Math.max(0, Number(failureSummary?.saved) || 0) === 0
+          ? {
+              enabled: false,
+              enqueuedCount: 0,
+              processedCount: 0,
+              successCount: 0,
+              failedCount: 0,
+              skippedCount: 0,
+              pendingCount: 0,
+              activeCount: 0,
+              remainingCount: 0,
+              capturedUniqueCount: 0,
+              enqueuedUniqueCount: 0,
+              excludedUniqueCount: 0,
+              succeededUniqueCount: 0,
+              blocked: false,
+              canceled: false,
+              drainCompleted: true,
+            }
+          : null;
+      const terminalStreamingSync =
+        error?.streamingSync ??
+        batchRunResult?.streamingSync ??
+        noCaptureBootstrapSync;
       const terminalMessage = elasticItemReleased
         ? `关键词「${String(error?.keyword || resumeKeyword || "").trim()}」已解除当前 Agent 锁定并交回云端；其它空闲 Agent 可立即接力，当前 Agent 进入冷却${cooldownHomeResult?.ok ? "并已返回平台首页" : ""}`
+        : debugOwnershipHandoff && cloudTechnicalRecovery
+          ? `${String(error?.message || "浏览器调试资源暂不可用").trim()}；当前页面及既有会话保持不动，任务已交回云端等待其它空闲 Agent 接力`
         : cloudTechnicalRecovery
-        ? `搜索页经过 ${Number(error?.attempts) || UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS} 次分散恢复仍未就绪，当前关键词已交回云端等待其它 Agent 接力${cooldownHomeResult?.ok ? "；当前 Agent 已返回平台首页并进入冷却" : ""}`
+        ? `${bootstrapFailureCopy}，当前关键词已交回云端等待其它 Agent 接力${cooldownHomeResult?.ok ? "；当前 Agent 已返回平台首页并进入冷却" : ""}`
         : bootstrapFailed
-          ? `搜索页经过 ${Number(error?.attempts) || UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS} 次分散恢复仍未就绪，请检查设备网络后继续`
+          ? `${bootstrapFailureCopy}，请检查设备网络后继续`
         : cancellation?.message || error.message;
       showMessage(
         terminalStatus === "canceled"
@@ -18399,7 +19494,7 @@ async function runUnattendedKeywordPlanRequest(request) {
             finishedAt,
             message: terminalMessage,
             summary: failureSummary,
-            streamingSync: batchRunResult?.streamingSync,
+            streamingSync: terminalStreamingSync,
           }),
           error:
             terminalStatus === "canceled"
@@ -18413,9 +19508,21 @@ async function runUnattendedKeywordPlanRequest(request) {
                     ? {
                         retryable: true,
                         requiresManualAction: false,
-                        category: elasticItemReleased
-                          ? "elastic_item_handoff"
-                          : "temporary_page_readiness",
+                        category: debugOwnershipHandoff
+                          ? "browser_debug_ownership"
+                          : elasticItemReleased
+                            ? "elastic_item_handoff"
+                            : "temporary_page_readiness",
+                        ...(debugOwnershipHandoff
+                          ? {
+                              automaticReroute: true,
+                              debugOwnership: String(
+                                error?.details?.debugOwnership ||
+                                  "unknown_occupancy",
+                              ),
+                              safeToDetach: false,
+                            }
+                          : {}),
                         ...(elasticCooldownRelease
                           ? {
                               itemLockReleased: true,
@@ -21031,6 +22138,53 @@ async function executeMonitorRunItem({
       shouldStop,
     });
     const recordIds = collectBatchRecordIds(captureResult);
+    const captureFailure = cloudTargetedPostApi.projectCaptureFailure(
+      [
+        captureResult,
+        ...(Array.isArray(captureResult?.results)
+          ? captureResult.results
+          : []),
+      ],
+      {
+        fallbackCode: "CAPTURE_FAILED",
+        stage: "profile_scan",
+        fallbackMessage: "采集账号作品失败",
+      },
+    );
+    const incompleteCaptureEntries = Array.isArray(captureResult?.results)
+      ? captureResult.results.filter(
+          (entry) => entry?.partial === true || entry?.scanComplete === false,
+        )
+      : [];
+    const profileScanComplete = Boolean(
+      captureResult?.scanComplete === true &&
+        captureResult?.partial !== true &&
+        incompleteCaptureEntries.length === 0,
+    );
+
+    if (captureFailure.requiresManualAction === true) {
+      await finishMonitorExecutionSafely(executionId, {
+        status: "failed",
+        recordsFound: recordIds.length,
+        errorMessage: captureFailure.message,
+      });
+      return {
+        ...baseResult,
+        status: "failed",
+        scannedCount: recordIds.length,
+        hitCount: 0,
+        errorCode: captureFailure.code,
+        errorCategory: captureFailure.category || "platform_safety_block",
+        errorMessage: captureFailure.message,
+        securityBlocked: captureFailure.securityBlocked === true,
+        platformSafetyBlocked:
+          captureFailure.platformSafetyBlocked === true,
+        requiresManualAction: true,
+        retryable: false,
+        securityEvidence: captureFailure.securityEvidence || null,
+        error: captureFailure,
+      };
+    }
 
     if (captureResult?.canceled) {
       await finishMonitorExecutionSafely(executionId, {
@@ -21048,19 +22202,58 @@ async function executeMonitorRunItem({
       };
     }
 
-    if (!captureResult?.ok && recordIds.length === 0) {
-      const errorMessage =
-        captureResult?.results?.find((item) => item?.error)?.error ||
-        "采集账号作品失败";
+    if (!profileScanComplete) {
+      const incompleteFailure = cloudTargetedPostApi.projectCaptureFailure(
+        [
+          ...incompleteCaptureEntries.map((entry) => entry?.error),
+          ...incompleteCaptureEntries,
+          captureResult?.error,
+          captureResult,
+        ],
+        {
+          fallbackCode: "PROFILE_SCAN_INCOMPLETE",
+          stage: "profile_scan",
+          fallbackMessage:
+            "账号作品列表未完整采集，已保留本轮结果并等待重试",
+        },
+      );
       await finishMonitorExecutionSafely(executionId, {
         status: "failed",
-        errorMessage,
+        recordsFound: recordIds.length,
+        errorMessage: incompleteFailure.message,
       });
       return {
         ...baseResult,
         status: "failed",
-        errorCode: "capture_failed",
-        errorMessage,
+        partial: true,
+        scanComplete: false,
+        incompleteReason: String(
+          captureResult?.incompleteReason || "partial_capture",
+        ),
+        scannedCount: recordIds.length,
+        hitCount: 0,
+        errorCode: incompleteFailure.code,
+        errorCategory: incompleteFailure.category || "capture_incomplete",
+        errorMessage: incompleteFailure.message,
+        retryable: incompleteFailure.retryable !== false,
+        error: incompleteFailure,
+        captureResult,
+      };
+    }
+
+    if (!captureResult?.ok && recordIds.length === 0) {
+      await finishMonitorExecutionSafely(executionId, {
+        status: "failed",
+        errorMessage: captureFailure.message,
+      });
+      return {
+        ...baseResult,
+        status: "failed",
+        errorCode: captureFailure.code,
+        errorCategory: captureFailure.category || "",
+        errorMessage: captureFailure.message,
+        retryable: captureFailure.retryable,
+        error: captureFailure,
       };
     }
 
@@ -21075,6 +22268,11 @@ async function executeMonitorRunItem({
       return {
         ...baseResult,
         status: "no_hit",
+        noResults: true,
+        resultKind: "profile_scan_no_new_posts",
+        businessOutcome: "profile_scan_no_new_posts",
+        qualifyingCount: 0,
+        scanComplete: true,
         scannedCount: 0,
         hitCount: 0,
       };
@@ -21147,6 +22345,11 @@ async function executeMonitorRunItem({
       return {
         ...baseResult,
         status: "no_hit",
+        noResults: true,
+        resultKind: "profile_scan_no_new_posts",
+        businessOutcome: "profile_scan_no_new_posts",
+        qualifyingCount: 0,
+        scanComplete: true,
         scannedCount: publishFilterResult.scannedCount,
         hitCount: 0,
         filteredCount: publishFilterResult.filteredCount,
@@ -21298,6 +22501,15 @@ async function executeMonitorRunItem({
         trigger: "monitor_run_now",
         syncScope: "all",
         monitorExecutionId: executionId,
+        captureTaskId: String(
+          captureTaskContext?.captureTaskId || "",
+        ).trim(),
+        captureTaskItemAttemptId: String(
+          captureTaskContext?.captureTaskItemAttemptId || "",
+        ).trim(),
+        captureTaskItemRequestHash: String(
+          captureTaskContext?.captureTaskItemRequestHash || "",
+        ).trim(),
         captureSettings,
         commentLeadsConfig: buildCommentLeadsConfigFromSettings(captureSettings),
         shouldStop,
@@ -21337,6 +22549,11 @@ async function executeMonitorRunItem({
     return {
       ...baseResult,
       status: hasTaskFailure ? "failed" : "success",
+      partial: hasTaskFailure,
+      scanComplete: !hasTaskFailure,
+      incompleteReason: hasTaskFailure
+        ? "profile_postprocessing_failed"
+        : "",
       scannedCount: publishFilterResult.scannedCount,
       hitCount: syncStats.successCount,
       filteredCount: publishFilterResult.filteredCount,
@@ -23305,6 +24522,9 @@ async function maybeRunAutoSyncAfterDetailCapture(
     syncProgress = null,
     shouldStop = null,
     signal = null,
+    captureTaskId = "",
+    captureTaskItemAttemptId = "",
+    captureTaskItemRequestHash = "",
   } = {},
 ) {
   const stopRequested = () => {
@@ -23426,6 +24646,9 @@ async function maybeRunAutoSyncAfterDetailCapture(
       commentLeadsConfig,
       shouldStop: stopRequested,
       signal,
+      captureTaskId,
+      captureTaskItemAttemptId,
+      captureTaskItemRequestHash,
     });
 
     if (result?.canceled) return canceledResult();
@@ -28571,11 +29794,6 @@ function isAiRelevanceFilteredPayload(payload = {}) {
   const executionDisposition = String(audit.executionDisposition || "")
     .trim()
     .toLowerCase();
-  const modelExecutionDisposition = String(
-    audit.modelExecutionDisposition || "",
-  )
-    .trim()
-    .toLowerCase();
   const modelDecision = String(audit.modelDecision || audit.decision || "")
     .trim()
     .toLowerCase();
@@ -28585,8 +29803,6 @@ function isAiRelevanceFilteredPayload(payload = {}) {
 
   return (
     executionDisposition === "skip_expensive" ||
-    (modelExecutionDisposition === "skip_full_capture" &&
-      modelDecision === "skip") ||
     (traceState === "filtered" && modelDecision === "skip")
   );
 }
@@ -28613,6 +29829,7 @@ function isDetailCaptureDone(record) {
     .toLowerCase();
   return (
     isDetailCaptureFiltered(record) ||
+    detailStatus === "deferred" ||
     (detailStatus === "done" &&
       payload.detailPayload &&
       typeof payload.detailPayload === "object")
@@ -28620,13 +29837,15 @@ function isDetailCaptureDone(record) {
 }
 
 function isDetailCaptureRetryable(record) {
-  if (!isDetailCaptureRecord(record) || isDetailCaptureDone(record)) {
+  if (!isDetailCaptureRecord(record)) {
     return false;
   }
   const payload = record?.payload || {};
   const status = String(payload.detailCaptureStatus || "not_started")
     .trim()
     .toLowerCase();
+  if (status === "deferred") return true;
+  if (isDetailCaptureDone(record)) return false;
   return status !== "capturing";
 }
 

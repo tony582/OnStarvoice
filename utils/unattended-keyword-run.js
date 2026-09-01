@@ -16,6 +16,23 @@ function nonNegativeInt(value, fallback = 0) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function normalizeSecurityEvidence(...values) {
+  const source = values
+    .map((value) =>
+      value?.securityEvidence || value?.security_evidence || value,
+    )
+    .find((value) => value?.confirmed === true);
+  if (!source) return null;
+  return {
+    confirmed: true,
+    platform: text(source.platform).slice(0, 40),
+    variant: text(source.variant).slice(0, 100),
+    language: text(source.language).slice(0, 40),
+    reason: text(source.reason).slice(0, 100),
+    pageUrl: text(source.pageUrl || source.page_url).slice(0, 2000),
+  };
+}
+
 export function buildCheckpointKeywordKey(round, keyword) {
   return `${positiveInt(round)}:${text(keyword)}`;
 }
@@ -60,6 +77,8 @@ export function normalizeUnattendedKeywordCheckpoint(
         rawEntry?.error_category ||
         rawError?.category,
     );
+    const keywordServiceAbnormal =
+      errorCode.toUpperCase() === DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE;
     const securityBlocked = Boolean(
       rawEntry?.securityBlocked ||
         rawEntry?.security_blocked ||
@@ -68,11 +87,19 @@ export function normalizeUnattendedKeywordCheckpoint(
         rawError?.securityBlocked ||
         rawError?.platformSafetyBlocked,
     );
+    const platformSafetyBlocked = Boolean(
+      rawEntry?.platformSafetyBlocked ||
+        rawEntry?.platform_safety_blocked ||
+        rawError?.platformSafetyBlocked,
+    );
     const requiresManualAction = Boolean(
       rawEntry?.requiresManualAction ||
         rawEntry?.requires_manual_action ||
         rawError?.requiresManualAction,
     );
+    const securityEvidence = keywordServiceAbnormal
+      ? null
+      : normalizeSecurityEvidence(rawEntry, rawError);
     const noResults = Boolean(
       rawEntry?.noResults ||
         rawEntry?.no_results ||
@@ -84,6 +111,8 @@ export function normalizeUnattendedKeywordCheckpoint(
     const resultKind = text(
       rawEntry?.resultKind || rawEntry?.result_kind,
     );
+    const hasCandidateCount = rawEntry?.candidateCount !== undefined
+      || rawEntry?.candidate_count !== undefined;
     keywordResults.push({
       round,
       // 旧快照中的 DOM/index 可能已经失真；永远按当前计划关键词顺序重算。
@@ -95,10 +124,22 @@ export function normalizeUnattendedKeywordCheckpoint(
       error: text(rawError?.message || rawEntry?.error),
       ...(noResults ? {noResults: true} : {}),
       ...(resultKind ? {resultKind} : {}),
+      ...(hasCandidateCount
+        ? {
+            candidateCount: nonNegativeInt(
+              rawEntry?.candidateCount ?? rawEntry?.candidate_count,
+            ),
+          }
+        : {}),
+      ...(rawEntry?.scanComplete === true || rawEntry?.scan_complete === true
+        ? {scanComplete: true}
+        : {}),
       ...(errorCode ? {errorCode} : {}),
       ...(errorCategory ? {errorCategory} : {}),
       ...(securityBlocked ? {securityBlocked: true} : {}),
+      ...(platformSafetyBlocked ? {platformSafetyBlocked: true} : {}),
       ...(requiresManualAction ? {requiresManualAction: true} : {}),
+      ...(securityEvidence ? {securityEvidence} : {}),
       finishedAt: text(rawEntry?.finishedAt),
     });
   }
@@ -208,29 +249,41 @@ export function summarizeUnattendedKeywordCheckpoint(checkpoint = {}) {
 }
 
 export function isUnattendedSafetyBlock(value) {
-  const valueText = text(value?.message || value).toLowerCase();
-  const codeText = text(value?.code || value?.reason).toLowerCase();
-  if (codeText === DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE.toLowerCase()) {
+  const codeText = text(
+    value?.code || value?.errorCode || value?.error?.code || value?.reason,
+  ).toUpperCase();
+  if (codeText === DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE) {
     return false;
   }
   const explicitSafetyCodes = new Set([
-    "platform_safety_block",
-    "security_verification_required",
-    "page_challenge_block",
-    "xhs_security_block",
-    "http_429",
-    "rate_limited",
+    "PLATFORM_SAFETY_BLOCK",
+    "SECURITY_VERIFICATION_REQUIRED",
+    "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+    "PAGE_CHALLENGE_BLOCK",
+    "XHS_SECURITY_BLOCK",
+    "HTTP_429",
+    "RATE_LIMITED",
+    "LOGIN_REQUIRED",
+    "AUTHENTICATION_REQUIRED",
   ]);
+  const category = text(
+    value?.category || value?.errorCategory || value?.error?.category,
+  ).toLowerCase();
   return (
     value?.securityBlocked === true ||
     value?.security_blocked === true ||
     value?.platformSafetyBlocked === true ||
     value?.platform_safety_blocked === true ||
+    value?.error?.securityBlocked === true ||
+    value?.error?.platformSafetyBlocked === true ||
+    value?.securityEvidence?.confirmed === true ||
+    value?.error?.securityEvidence?.confirmed === true ||
     explicitSafetyCodes.has(codeText) ||
-    /(captcha|login|auth|security|risk|forbidden|account|challenge)/i.test(codeText) ||
-    /(验证码|人机验证|安全限制|安全验证|访问频繁|访问受限|风控|登录失效|请(?:先|重新)?登录|重新登录|账号异常|账号限制|captcha|security.?block|security.?check|login.?required|risk.?control|challenge)/i.test(
-      valueText,
-    )
+    [
+      "platform_safety_block",
+      "login_required",
+      "authentication_required",
+    ].includes(category)
   );
 }
 
@@ -296,6 +349,17 @@ export function mergeKeywordAttemptResults({
                 blockedItem?.requiresManualAction,
               ),
               retryable: false,
+              ...(normalizeSecurityEvidence(
+                blockedItem,
+                blockedItem?.error,
+              )
+                ? {
+                    securityEvidence: normalizeSecurityEvidence(
+                      blockedItem,
+                      blockedItem?.error,
+                    ),
+                  }
+                : {}),
             }
           : null;
       })(),
@@ -625,6 +689,12 @@ export function settleUnattendedKeywordCheckpoint({
       result?.requiresManualAction ||
       resultError?.requiresManualAction,
   );
+  const platformSafetyBlocked = Boolean(
+    result?.platformSafetyBlocked ||
+      result?.platform_safety_blocked ||
+      resultError?.platformSafetyBlocked,
+  );
+  const securityEvidence = normalizeSecurityEvidence(result, resultError);
   const noResults = Boolean(
     result?.noResults ||
       result?.no_results ||
@@ -636,6 +706,8 @@ export function settleUnattendedKeywordCheckpoint({
   const resultKind =
     text(result?.resultKind || result?.result_kind) ||
     (noResults ? "no_matching_results" : "");
+  const hasCandidateCount = result?.candidateCount !== undefined
+    || result?.candidate_count !== undefined;
   const status = resolvedSecurityBlocked
     ? "failed"
     : canceled
@@ -675,12 +747,24 @@ export function settleUnattendedKeywordCheckpoint({
     ),
     ...(noResults ? {noResults: true} : {}),
     ...(resultKind ? {resultKind} : {}),
+    ...(hasCandidateCount
+      ? {
+          candidateCount: nonNegativeInt(
+            result?.candidateCount ?? result?.candidate_count,
+          ),
+        }
+      : {}),
+    ...(result?.scanComplete === true || result?.scan_complete === true
+      ? {scanComplete: true}
+      : {}),
     ...(resolvedErrorCode ? {errorCode: resolvedErrorCode} : {}),
     ...(resolvedErrorCategory
       ? {errorCategory: resolvedErrorCategory}
       : {}),
     ...(resolvedSecurityBlocked ? {securityBlocked: true} : {}),
+    ...(platformSafetyBlocked ? {platformSafetyBlocked: true} : {}),
     ...(requiresManualAction ? {requiresManualAction: true} : {}),
+    ...(securityEvidence ? {securityEvidence} : {}),
     finishedAt,
   };
 

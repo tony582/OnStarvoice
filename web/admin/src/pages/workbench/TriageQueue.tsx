@@ -1,11 +1,12 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   Inbox, Search, ChevronLeft, ChevronRight, MessageSquarePlus, MessageSquareText,
   Check, CheckCircle, Archive, ArchiveRestore, CircleOff, Loader2, ChevronDown,
-  User, FileText, Bell, ExternalLink,
+  User, FileText, Bell,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
   Rows3, Kanban, MoreHorizontal, Radar, ShieldAlert, Star,
+  Tags,
 } from 'lucide-react'
 import { api, isApiNetworkError } from '@/lib/api'
 import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
@@ -23,6 +24,11 @@ import { CombinedDateRangeFilter, type CombinedDateRanges } from '@/components/s
 import { MultiSelect } from '@/components/shared/MultiSelect'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
+import {
+  BatchCustomTagDialog,
+  type BatchCustomTagMode,
+  type BatchCustomTagValues,
+} from '@/components/shared/BatchCustomTagDialog'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { useStatusChangePrompt, type StatusChangeValues } from '@/components/shared/StatusChangePrompt'
 import {
@@ -30,6 +36,7 @@ import {
   type FeishuTableNumberSaveResult,
 } from '@/components/shared/FeishuTableNumberControl'
 import { RecordLabelChips } from '@/components/shared/RecordLabels'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import {
   normalizeCustomTags, tagsFromRecord,
   type CustomTag, type CustomTagPatch,
@@ -38,6 +45,7 @@ import { TriageBoard } from '@/pages/workbench/TriageBoard'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 import { useNav } from '@/lib/navigation'
+import { recordDisplayTitle } from '@/lib/record-display'
 
 interface Pagination { page: number; totalPages: number; total: number }
 interface CustomTagsMutationResponse {
@@ -63,6 +71,15 @@ interface ArchiveMutationResponse {
 interface BatchModeMutationResponse {
   updated?: unknown
   updatedIds?: unknown
+  skipped?: unknown
+}
+interface BatchCustomTagsMutationResponse {
+  operation?: unknown
+  tags?: unknown
+  updated?: unknown
+  updatedIds?: unknown
+  unchanged?: unknown
+  unchangedIds?: unknown
   skipped?: unknown
 }
 interface WatchMutationResponse {
@@ -347,7 +364,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [watchedFilter, setWatchedFilter] = useState(initial?.watched === 'watched' ? 'watched' : '')
-  const [keyword, setKeyword] = useState(initial?.keyword ?? '')
+  const [keyword, setKeyword] = useState(() => String(initial?.keyword ?? '').trim())
+  const [keywordDraft, setKeywordDraft] = useState(() => String(initial?.keyword ?? '').trim())
   const [triageStatuses, setTriageStatuses] = useState<string[]>(() =>
     String(initial?.status || '').split(',').map(value => value.trim()).filter(Boolean))
   const [risk, setRisk] = useState<string[]>([])
@@ -375,13 +393,28 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [drawerRecord, setDrawerRecord] = useState<any>(null)
   const [drawerInitialTab, setDrawerInitialTab] = useState<'content' | 'history'>('content')
   const [batchBusy, setBatchBusy] = useState(false)
+  const [batchTagMode, setBatchTagMode] = useState<BatchCustomTagMode | null>(null)
   const [batchFeedback, setBatchFeedback] = useState<BatchFeedback | null>(null)
   const batchFeedbackTimer = useRef<number | undefined>(undefined)
   const customTagRequestSeq = useRef(0)
+  const listRequestSeq = useRef(0)
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
   const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${watchedFilter}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
+
+  const batchRemovalCatalog = (() => {
+    const tagsById = new Map<string, CustomTag>()
+    for (const record of records) {
+      if (!sel.has(String(record.id))) continue
+      for (const tag of tagsFromRecord(record)) {
+        const current = tagsById.get(tag.id)
+        if (current) current.usageCount = Number(current.usageCount || 0) + 1
+        else tagsById.set(tag.id, { ...tag, usageCount: 1 })
+      }
+    }
+    return [...tagsById.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'))
+  })()
 
   const showBatchFeedback = useCallback((message: string, tone: BatchFeedback['tone']) => {
     window.clearTimeout(batchFeedbackTimer.current)
@@ -427,17 +460,33 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return params
   }, [archiveView, triageStatuses, risk, identity, sentiment, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
+  // 看板与列表使用同一套筛选；看板逐列自行补 status，不能继承列表的状态多选。
+  const boardFilterQuery = useMemo(() => {
+    const params = filterParams()
+    params.delete('status')
+    params.delete('bucket')
+    params.delete('sort')
+    params.delete('dir')
+    params.set('queue', 'triage')
+    return params.toString()
+  }, [filterParams])
+
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
+    const requestSeq = ++listRequestSeq.current
     if (!options?.silent) setLoading(true)
     try {
       const params = filterParams()
       params.set('page', String(page))
       params.set('pageSize', String(pageSize))
       const data = await api.get<any>('/triage/records?' + params)
+      if (requestSeq !== listRequestSeq.current) return
       setRecords(data.records || [])
       setPagination(data.pagination || null)
-    } catch (err) { console.error(err) }
-    finally { if (!options?.silent) setLoading(false) }
+    } catch (err) {
+      if (requestSeq === listRequestSeq.current) console.error(err)
+    } finally {
+      if (requestSeq === listRequestSeq.current) setLoading(false)
+    }
   }), [filterParams, pageSize])
 
   const exportXlsx = async () => {
@@ -454,15 +503,23 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
-  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || (view === 'list' && customTagIds.length) || activeDateFilterCount || hasCustomSort)
+  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment].filter(Boolean).length
     + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
-    setPlatform(''); setSentiment(''); setKeyword(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
+    setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setSort({ field: 'publish', dir: 'desc' })
   }
+  // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
+  useEffect(() => {
+    const nextKeyword = keywordDraft.trim()
+    if (nextKeyword === keyword) return
+    const timeoutId = window.setTimeout(() => setKeyword(nextKeyword), 400)
+    return () => window.clearTimeout(timeoutId)
+  }, [keywordDraft, keyword])
   useEffect(() => { void load() }, [load])
   useEffect(() => { void loadCustomTagCatalog() }, [loadCustomTagCatalog])
+  useEffect(() => () => { listRequestSeq.current += 1 }, [])
   // 写后统一刷新:回退空页 + 拉列表 + 更新徽标
   const reloadAfterMutation = useCallback(async () => {
     const page = pagination?.page || 1
@@ -556,6 +613,77 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       await load(willEmpty ? page - 1 : page)
     }
     return tags
+  }
+
+  const closeBatchTagDialog = useCallback(() => {
+    setBatchTagMode(null)
+    void loadCustomTagCatalog()
+  }, [loadCustomTagCatalog])
+
+  const applyBatchCustomTags = async (values: BatchCustomTagValues): Promise<void> => {
+    if (archiveView === 'archived' || sel.count === 0) return
+    setBatchFeedback(null)
+    setBatchBusy(true)
+    try {
+      const ids = [...sel.selected]
+      const result = await api.patch<BatchCustomTagsMutationResponse>('/records/custom-tags/batch', {
+        ids,
+        addTagIds: values.addTagIds,
+        addNames: values.addNames,
+        removeTagIds: values.removeTagIds,
+      })
+      const operation = values.removeTagIds.length ? 'remove' : 'add'
+      const updated = Math.max(0, Number(result.updated || 0))
+      const unchanged = Math.max(0, Number(result.unchanged || 0))
+      const skipped = Array.isArray(result.skipped)
+        ? result.skipped.flatMap(item => {
+          if (!item || typeof item !== 'object') return []
+          const row = item as { id?: unknown; reason?: unknown }
+          const id = String(row.id || '').toLowerCase()
+          const reason = String(row.reason || '')
+          return id ? [{ id, reason }] : []
+        })
+        : []
+      const limitIds = skipped.filter(item => item.reason === 'tag_limit').map(item => item.id)
+      const archivedCount = skipped.filter(item => item.reason === 'archived').length
+      const missingCount = skipped.filter(item => item.reason === 'not_found').length
+      const tagNames = normalizeCustomTags(result.tags).map(tag => `“${tag.name}”`).join('、')
+        || [
+          ...values.addNames,
+          ...(operation === 'remove' ? values.removeTagIds : values.addTagIds)
+            .map(id => (operation === 'remove' ? batchRemovalCatalog : customTagCatalog)
+              .find(tag => tag.id === id)?.name || ''),
+        ]
+          .filter(Boolean)
+          .map(name => `“${name}”`)
+          .join('、')
+      const skippedParts = [
+        limitIds.length ? `${limitIds.length} 条达到标签上限` : '',
+        archivedCount ? `${archivedCount} 条已归档` : '',
+        missingCount ? `${missingCount} 条已不存在` : '',
+      ].filter(Boolean)
+
+      if (operation === 'add' && limitIds.length) sel.setAll(limitIds, true)
+      else sel.clear()
+      const message = operation === 'remove'
+        ? updated > 0
+          ? `已从 ${updated} 条内容移除${tagNames || '所选标签'}${unchanged ? `，${unchanged} 条原本未关联` : ''}${skippedParts.length ? `；${skippedParts.join('，')}未处理` : ''}`
+          : unchanged > 0 && !skippedParts.length
+            ? `所选 ${unchanged} 条内容均未关联${tagNames || '所选标签'}，无需移除`
+            : `没有内容被修改${skippedParts.length ? `：${skippedParts.join('，')}` : ''}`
+        : updated > 0
+          ? `已将${tagNames || '所选标签'}添加到 ${updated} 条内容${unchanged ? `，${unchanged} 条原本已有` : ''}${skippedParts.length ? `；${skippedParts.join('，')}未处理` : ''}`
+          : unchanged > 0 && !skippedParts.length
+            ? `所选 ${unchanged} 条内容原本已有${tagNames || '所选标签'}，无需重复添加`
+            : `没有内容被修改${skippedParts.length ? `：${skippedParts.join('，')}` : ''}`
+      showBatchFeedback(message, skippedParts.length ? 'warning' : 'success')
+      await Promise.all([
+        loadCustomTagCatalog(),
+        load(pagination?.page || 1, { silent: true }),
+      ])
+    } finally {
+      setBatchBusy(false)
+    }
   }
 
   const deleteCustomTag = async (tag: CustomTag): Promise<number> => {
@@ -1055,8 +1183,22 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[140px] lg:max-w-[680px] lg:flex-1">
             <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input value={keyword} onChange={e => setKeyword(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') { load(); setBoardNonce(n => n + 1) } }} placeholder="搜索标题、正文、作者、飞书表号…" className="h-10 w-full border-transparent bg-muted pl-8 text-[12px] focus:bg-card lg:h-8" />
+              <Input value={keywordDraft} onChange={e => setKeywordDraft(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key !== 'Enter') return
+                  e.preventDefault()
+                  setKeyword(keywordDraft.trim())
+                }} placeholder="搜索标题、正文、作者、飞书表号、账号、平台ID、采集词、标签…" className="h-10 w-full border-transparent bg-muted px-8 text-[12px] focus:bg-card lg:h-8" />
+              {keywordDraft && (
+                <button
+                  type="button"
+                  aria-label="清空搜索"
+                  onClick={() => { setKeywordDraft(''); setKeyword('') }}
+                  className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-card hover:text-foreground"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
             <button
               type="button"
@@ -1107,7 +1249,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   aria-pressed={view === value}
                   onClick={() => {
                     setView(value)
-                    if (value === 'board') setWatchedFilter('')
+                    if (value === 'board') {
+                      setWatchedFilter('')
+                      setTriageStatuses([])
+                      setSort({ field: 'publish', dir: 'desc' })
+                    }
                   }}
                   className={cn(
                     'inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-semibold transition-colors',
@@ -1208,14 +1354,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             </TriageSelect>
           </div>
 
-          {view === 'list' && (
-            <>
-              <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} triggerClassName="w-full justify-between lg:!w-[82px] lg:!px-2 xl:!w-full" />
-              <div className="hidden shrink-0 lg:block">
-                <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} triggerClassName="xl:w-full xl:justify-between" />
-              </div>
-            </>
-          )}
+          <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} triggerClassName="w-full justify-between lg:!w-[82px] lg:!px-2 xl:!w-full" />
+          <div className="hidden shrink-0 lg:block">
+            <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} triggerClassName="xl:w-full xl:justify-between" />
+          </div>
 
           <button
             type="button"
@@ -1233,10 +1375,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {/* Board view */}
       {view === 'board' ? (
         <TriageBoard
-          sentiment={sentiment}
-          platform={platform}
-          keyword={keyword}
-          reloadKey={`${sentiment}|${platform}|${boardNonce}`}
+          filterQuery={boardFilterQuery}
+          reloadKey={String(boardNonce)}
           canWrite={canWrite()}
           onOpen={record => openDrawer(record)}
           onChangeMode={(record, nextStatus) => changeRecordMode(record, nextStatus)}
@@ -1477,7 +1617,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           busy={batchBusy}
           onClear={sel.clear}
           onAction={key => {
-            if (key === 'archive') void runArchiveBatch(true)
+            if (key === 'custom_tags_add') setBatchTagMode('add')
+            else if (key === 'custom_tags_remove') setBatchTagMode('remove')
+            else if (key === 'archive') void runArchiveBatch(true)
             else if (key === 'unarchive') void runArchiveBatch(false)
             else if (key === 'watch') void runWatchBatch(true)
             else if (key === 'unwatch') void runWatchBatch(false)
@@ -1485,7 +1627,10 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             else if (key === 'create_watched_patrol') createPatrolFromSelection('watched_content')
             else void runBatch(key as TriageMode)
           }}
-          actions={[]}
+          actions={archiveView === 'archived' ? [] : [
+            { key: 'custom_tags_add', label: '添加标签', icon: Tags },
+            { key: 'custom_tags_remove', label: '移除标签', icon: Tags, tone: 'danger' },
+          ]}
           menus={[
             {
               key: 'patrol',
@@ -1530,6 +1675,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {drawerProps && <RecordDrawer {...drawerProps} />}
       {dialog}
       {statusChangeDialog}
+      {batchTagMode && sel.count > 0 && (
+        <BatchCustomTagDialog
+          mode={batchTagMode}
+          count={sel.count}
+          catalog={batchTagMode === 'remove' ? batchRemovalCatalog : customTagCatalog}
+          onSearch={batchTagMode === 'add'
+            ? query => { void loadCustomTagCatalog(query) }
+            : undefined}
+          onApply={applyBatchCustomTags}
+          onCancel={closeBatchTagDialog}
+        />
+      )}
     </div>
   )
 }
@@ -1548,6 +1705,7 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
     || String(r.content_availability_status || '') === 'deleted'
     || (r.official_response_status && r.official_response_status !== 'none')
   const availabilityLabel = contentAvailabilityLabel(r)
+  const displayTitle = recordDisplayTitle(r)
 
   return (
     <article
@@ -1583,11 +1741,11 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
           </div>
         )}
         <div className="min-w-0 flex-1">
-          <div className="line-clamp-2 text-[14px] font-semibold leading-5">{r.title || r.content || '(无标题)'}</div>
+          <div className="line-clamp-2 text-[14px] font-semibold leading-5">{displayTitle}</div>
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
             <span className="inline-flex min-w-0 items-center gap-1"><User className="h-3 w-3 shrink-0" /><span className="max-w-28 truncate">{r.author_name || '未知作者'}</span></span>
             <span>{platformName(r.platform)}</span>
-            {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={event => event.stopPropagation()} className="inline-flex items-center gap-0.5 font-semibold text-primary">原文<ExternalLink className="h-3 w-3" /></a>}
+            <RecordSourceAction record={r} compact className="font-semibold" />
           </div>
         </div>
         {canWrite ? (
@@ -1676,6 +1834,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
   const triageStatus = r.triage_status || 'unhandled'
   const triageLabel = LABELS.triage[triageStatus] || triageStatus
   const availabilityLabel = contentAvailabilityLabel(r)
+  const displayTitle = recordDisplayTitle(r)
 
   return (
     <tr data-record-detail-trigger className={cn('group cursor-pointer transition-colors', open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45')} onClick={onOpenDetail}>
@@ -1696,7 +1855,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
           )}
           <div className="min-w-0 max-w-[300px]">
             <div className="flex items-start gap-1.5">
-              <div className="line-clamp-2 min-w-0 flex-1 text-[13px] font-medium leading-tight">{r.title || r.content || '(无标题)'}</div>
+              <div className="line-clamp-2 min-w-0 flex-1 text-[13px] font-medium leading-tight">{displayTitle}</div>
               {canWrite ? (
                 <button type="button" onClick={event => { event.stopPropagation(); void onToggleWatch() }}
                   disabled={watchBusy} aria-label={r.is_watched ? '取消关注' : '关注内容'} title={r.is_watched ? '取消关注' : '关注内容'}
@@ -1710,7 +1869,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
             <div className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-muted-foreground">
               <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
               {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
-              {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><ExternalLink className="h-2.5 w-2.5" />原文</a>}
+              <RecordSourceAction record={r} compact />
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}
             </div>
             {triageStatus === 'negative_feishu' && (

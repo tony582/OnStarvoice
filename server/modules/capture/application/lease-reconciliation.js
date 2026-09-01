@@ -10,10 +10,20 @@ function normalizeCandidateLimit(value) {
 }
 
 export function createElasticCaptureLeaseReconciler({
+  reconcileLeases,
   listCandidates,
   withTransaction,
   settleCandidate,
 } = {}) {
+  if (reconcileLeases !== undefined) {
+    const runReconciliation = requireDependency(
+      'reconcileLeases',
+      reconcileLeases,
+    );
+    return async function reconcileElasticCaptureLeases(input = 50) {
+      return runReconciliation(input);
+    };
+  }
   const listLeaseCandidates = requireDependency(
     'listCandidates',
     listCandidates,

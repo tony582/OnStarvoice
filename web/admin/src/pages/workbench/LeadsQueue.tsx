@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
-  ChevronLeft, ChevronRight, ExternalLink, Loader2, MessageSquareWarning,
+  ChevronLeft, ChevronRight, Loader2, MessageSquareWarning,
   RefreshCw, Search, CheckCheck, CircleSlash, Footprints, Sparkles, Download,
   X, ArrowUp, ArrowDown, ChevronsUpDown,
 } from 'lucide-react'
@@ -17,6 +17,7 @@ import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFi
 import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { CommentLeadDrawer } from '@/components/shared/CommentLeadDrawer'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
 import { useTicketDispatch } from '@/components/shared/TicketDispatch'
 import { useAuth } from '@/lib/auth'
@@ -356,17 +357,11 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
                           <div className="min-w-0 flex-1 text-[12px] leading-5 text-foreground">
                             {compact(lead.record_title || '(无标题)', 62)}
                           </div>
-                          {lead.record_url && (
-                            <a
-                              href={lead.record_url}
-                              target="_blank"
-                              rel="noreferrer"
-                              onClick={e => e.stopPropagation()}
-                              className="inline-flex h-7 shrink-0 items-center gap-1 rounded-lg px-1.5 text-[11px] font-semibold text-primary active:bg-primary/10"
-                            >
-                              打开<ExternalLink className="h-3 w-3" />
-                            </a>
-                          )}
+                          <RecordSourceAction
+                            record={{ id: lead.record_id, platform: lead.platform, url: lead.record_url }}
+                            compact
+                            className="h-7 rounded-lg px-1.5 text-[11px] font-semibold active:bg-primary/10"
+                          />
                         </div>
                         <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 border-t border-border/40 pt-1.5 text-[10px] tabular-nums text-muted-foreground">
                           <span>首次发现 {formatDateCompact(lead.comment_first_seen_at)}</span>

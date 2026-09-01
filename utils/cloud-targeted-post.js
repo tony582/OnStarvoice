@@ -40,6 +40,16 @@
     "cancel_requested",
     ...TERMINAL_STATUSES,
   ]);
+  const BUSINESS_PROGRESS_VOLATILE_KEYS = new Set([
+    "businessprogressat",
+    "elapsed",
+    "elapsedms",
+    "heartbeatat",
+    "remaining",
+    "remainingms",
+    "updatedat",
+    "waituntil",
+  ]);
 
   function objectValue(value) {
     return value && typeof value === "object" && !Array.isArray(value)
@@ -50,6 +60,54 @@
   function text(value, limit = 1000) {
     const normalized = String(value == null ? "" : value).trim();
     return normalized.length > limit ? normalized.slice(0, limit) : normalized;
+  }
+
+  function normalizeBusinessProgressMessage(value) {
+    return text(value, 2000)
+      .replace(
+        /\b\d+(?:\.\d+)?\s*(?:milliseconds?|msecs?|ms|seconds?|secs?|minutes?|mins?)\b/giu,
+        "#time",
+      )
+      .replace(/\d+(?:\.\d+)?\s*(?:毫秒|秒|分钟)/gu, "#时间")
+      .replace(/(剩余|倒计时)\s*\d+(?:\.\d+)?/gu, "$1#")
+      .replace(/\s+/gu, " ")
+      .trim();
+  }
+
+  function normalizeBusinessProgressSemanticValue(value, key = "") {
+    if (value == null) return value;
+    if (Array.isArray(value)) {
+      return value.map((entry) =>
+        normalizeBusinessProgressSemanticValue(entry),
+      );
+    }
+    if (typeof value === "object") {
+      return Object.fromEntries(
+        Object.keys(value)
+          .filter(
+            (entryKey) =>
+              !BUSINESS_PROGRESS_VOLATILE_KEYS.has(
+                String(entryKey || "").toLowerCase(),
+              ),
+          )
+          .sort()
+          .map((entryKey) => [
+            entryKey,
+            normalizeBusinessProgressSemanticValue(
+              value[entryKey],
+              entryKey,
+            ),
+          ]),
+      );
+    }
+    if (typeof value === "string" && String(key).toLowerCase() === "message") {
+      return normalizeBusinessProgressMessage(value);
+    }
+    return value;
+  }
+
+  function businessProgressFingerprint(value) {
+    return JSON.stringify(normalizeBusinessProgressSemanticValue(value));
   }
 
   function normalizePlatform(value) {
@@ -407,6 +465,26 @@
       }
       seenItems.add(itemId);
       seenRecords.add(recordId);
+      const captureAttempt = {
+        captureTaskItemAttemptId: text(
+          target.captureTaskItemAttemptId || target.attemptId,
+          100,
+        ),
+        captureTaskItemRequestHash: text(
+          target.captureTaskItemRequestHash || target.requestHash,
+          100,
+        ),
+        captureTaskItemAttemptNumber: Math.max(
+          0,
+          Math.floor(Number(target.captureTaskItemAttemptNumber) || 0),
+        ),
+        captureTaskItemAssignmentRevision: Math.max(
+          0,
+          Math.floor(
+            Number(target.captureTaskItemAssignmentRevision) || 0,
+          ),
+        ),
+      };
       if (isProfilePatrol) {
         const subscriptionId = text(
           target.subscriptionId || target.recordId,
@@ -437,6 +515,7 @@
           routeKind: canonical.routeKind,
           title: text(target.title || target.name, 500),
           ordinal: index + 1,
+          ...captureAttempt,
         };
       }
       return {
@@ -449,6 +528,7 @@
         title: text(target.title, 500),
         publishedAt,
         ordinal: index + 1,
+        ...captureAttempt,
       };
     });
 
@@ -556,6 +636,119 @@
     return [...ids];
   }
 
+  function projectCaptureFailure(
+    values = [],
+    {
+      fallbackCode = "TARGET_CAPTURE_FAILED",
+      stage = "capture",
+      fallbackMessage = "作品采集失败",
+    } = {},
+  ) {
+    const queue = Array.isArray(values) ? values : [values];
+    const candidates = [];
+    for (const raw of queue) {
+      const source = objectValue(raw);
+      if (Object.keys(source).length > 0) {
+        candidates.push(source);
+        for (const nested of [source.error, source.blockingError]) {
+          const nestedSource = objectValue(nested);
+          if (Object.keys(nestedSource).length > 0) candidates.push(nestedSource);
+        }
+      }
+    }
+    const code = text(
+      candidates.map((source) =>
+        source.code || source.errorCode || source.error_code,
+      ).find(Boolean),
+      120,
+    ).toUpperCase() || fallbackCode;
+    const category = text(
+      candidates.map((source) =>
+        source.category || source.errorCategory || source.error_category,
+      ).find(Boolean),
+      120,
+    ).toLowerCase();
+    const securityEvidenceSource = candidates
+      .map((source) =>
+        objectValue(source.securityEvidence || source.security_evidence),
+      )
+      .find((source) => source.confirmed === true);
+    const securityBlocked = candidates.some((source) =>
+      source.securityBlocked === true || source.security_blocked === true,
+    );
+    const platformSafetyBlocked = candidates.some((source) =>
+      source.platformSafetyBlocked === true
+      || source.platform_safety_blocked === true,
+    );
+    const requiresManualAction = candidates.some((source) =>
+      source.requiresManualAction === true
+      || source.requires_manual_action === true,
+    );
+    const safetyBoundary = securityBlocked
+      || platformSafetyBlocked
+      || requiresManualAction
+      || securityEvidenceSource?.confirmed === true
+      || /(?:CAPTCHA|SECURITY_CHALLENGE|LOGIN_REQUIRED|AUTH_REQUIRED)/u.test(code)
+      || [
+        "AUTHENTICATION_REQUIRED",
+        "HTTP_429",
+        "PAGE_CHALLENGE_BLOCK",
+        "PLATFORM_SAFETY_BLOCK",
+        "RATE_LIMITED",
+        "SECURITY_VERIFICATION_REQUIRED",
+        "XHS_SECURITY_BLOCK",
+      ].includes(code)
+      || [
+        "platform_safety_block",
+        "login_required",
+        "authentication_required",
+      ].includes(category);
+    const message = text(
+      candidates.map((source) =>
+        source.message
+        || (typeof source.error === "string" ? source.error : ""),
+      ).find(Boolean)
+        || queue.find((value) => typeof value === "string")
+        || fallbackMessage,
+      1000,
+    );
+    const explicitRetryable = candidates
+      .map((source) => source.retryable)
+      .find((value) => typeof value === "boolean");
+    return {
+      code,
+      stage: text(
+        candidates.map((source) => source.stage || source.phase).find(Boolean)
+          || stage,
+        80,
+      ),
+      message,
+      ...(category ? {category} : {}),
+      ...(securityBlocked ? {securityBlocked: true} : {}),
+      ...(platformSafetyBlocked ? {platformSafetyBlocked: true} : {}),
+      ...(requiresManualAction || safetyBoundary
+        ? {requiresManualAction: true}
+        : {}),
+      ...(securityEvidenceSource?.confirmed === true
+        ? {
+            securityEvidence: {
+              confirmed: true,
+              platform: text(securityEvidenceSource.platform, 40),
+              variant: text(securityEvidenceSource.variant, 100),
+              language: text(securityEvidenceSource.language, 40),
+              reason: text(securityEvidenceSource.reason, 120),
+              pageUrl: text(
+                securityEvidenceSource.pageUrl
+                  || securityEvidenceSource.page_url,
+                2000,
+              ),
+            },
+          }
+        : {}),
+      retryable: safetyBoundary ? false : explicitRetryable !== false,
+    };
+  }
+
   function buildTargetResult({
     target,
     batchResult = {},
@@ -602,6 +795,8 @@
         status: "skipped",
         recordIds: [],
         captured: false,
+        partial: false,
+        scanComplete: true,
         businessOutcome: text(
           itemResult.businessOutcome,
           120,
@@ -643,12 +838,36 @@
         ...base,
         status: "failed",
         recordIds,
-        error: {
-          code: "TARGET_CAPTURE_FAILED",
+        error: projectCaptureFailure([itemResult, batchResult], {
+          fallbackCode: "TARGET_CAPTURE_FAILED",
           stage: "capture",
-          message: text(itemResult?.error || "作品采集失败", 1000),
-          retryable: true,
-        },
+          fallbackMessage: "作品采集失败",
+        }),
+      };
+    }
+    if (itemResult.partial === true || itemResult.scanComplete === false) {
+      return {
+        ...base,
+        status: "failed",
+        partial: true,
+        scanComplete: false,
+        recordIds,
+        localCaptureCompleted: recordIds.length > 0,
+        error: projectCaptureFailure(
+          [
+            itemResult.error,
+            itemResult.commentsResult,
+            itemResult.bloggerMetricsResult,
+            itemResult,
+            batchResult,
+          ],
+          {
+            fallbackCode: "TARGET_CAPTURE_INCOMPLETE",
+            stage: "capture",
+            fallbackMessage:
+              "作品主体已保留，但本轮要求的采集步骤未完整完成",
+          },
+        ),
       };
     }
 
@@ -681,9 +900,8 @@
 
     return {
       ...base,
-      status: itemResult.partial
-        ? "completed_with_warnings"
-        : "completed",
+      status: "completed",
+      scanComplete: true,
       capturedExternalId: base.externalId,
       recordIds,
       warning: text(itemResult.warning, 1000),
@@ -791,7 +1009,9 @@
     );
     return {
       ...source,
-      status: partiallySynced ? "completed_with_warnings" : "failed",
+      status: "failed",
+      partial: partiallySynced,
+      scanComplete: false,
       localCaptureCompleted: true,
       backendSynced: false,
       sync: {
@@ -964,6 +1184,7 @@
       createdAt,
       updatedAt: createdAt,
       heartbeatAt: createdAt,
+      businessProgressAt: createdAt,
       captureSettings: normalizeCaptureSettings(source.captureSettings),
       monitorSettings: objectValue(source.monitorSettings),
       targets: Array.isArray(source.targets) ? source.targets : [],
@@ -989,6 +1210,34 @@
       : normalizeTargetResults(source.targetResults, source.targets);
     const checkpoint = buildCheckpoint(source.targets, targetResults);
     const updatedAt = new Date().toISOString();
+    const statusChanged = status !== (text(source.status, 80) || "pending");
+    const progress =
+      update.progress && typeof update.progress === "object"
+        ? update.progress
+        : source.progress;
+    const progressChanged =
+      Object.prototype.hasOwnProperty.call(update, "progress") &&
+      businessProgressFingerprint(progress) !==
+        businessProgressFingerprint(source.progress);
+    const targetResultsChanged =
+      Object.prototype.hasOwnProperty.call(update, "targetResults") &&
+      businessProgressFingerprint(targetResults) !==
+        businessProgressFingerprint(
+          normalizeTargetResults(source.targetResults, source.targets),
+        );
+    const hasBusinessProgress =
+      progressChanged ||
+      targetResultsChanged ||
+      statusChanged;
+    const businessProgressAt =
+      hasBusinessProgress
+        ? text(update.businessProgressAt, 80) ||
+          text(update.progress?.updatedAt, 80) ||
+          updatedAt
+        : text(source.businessProgressAt, 80) ||
+          text(source.startedAt, 80) ||
+          text(source.createdAt, 80) ||
+          updatedAt;
     return {
       ...source,
       status,
@@ -1000,6 +1249,7 @@
           ? Number(update.runnerTabId)
           : source.runnerTabId,
       heartbeatAt: text(update.heartbeatAt, 80) || source.heartbeatAt,
+      businessProgressAt,
       startedAt: text(update.startedAt, 80) || source.startedAt,
       finishedAt: text(update.finishedAt, 80) || source.finishedAt,
       message: text(update.message, 1000) || source.message,
@@ -1009,10 +1259,7 @@
           : update.error === null
             ? null
             : source.error,
-      progress:
-        update.progress && typeof update.progress === "object"
-          ? update.progress
-          : source.progress,
+      progress,
       targetResults,
       checkpoint,
       updatedAt,
@@ -1039,6 +1286,7 @@
     normalizeCaptureSettings,
     collectRecordExternalIds,
     buildTargetResult,
+    projectCaptureFailure,
     buildCommentObservation,
     applySyncResult,
     normalizeTargetResults,

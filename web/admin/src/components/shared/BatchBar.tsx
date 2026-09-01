@@ -97,6 +97,22 @@ export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }
   onClear: () => void
   busy?: boolean
 }) {
+  const [openMenuKey, setOpenMenuKey] = useState<string | null>(null)
+
+  if (openMenuKey !== null && (count <= 0 || busy)) {
+    setOpenMenuKey(null)
+  }
+
+  const runAction = useCallback((key: string) => {
+    setOpenMenuKey(null)
+    onAction(key)
+  }, [onAction])
+
+  const clearSelection = useCallback(() => {
+    setOpenMenuKey(null)
+    onClear()
+  }, [onClear])
+
   if (count <= 0) return null
   return (
     <div className="pointer-events-none fixed inset-x-0 bottom-[calc(max(1rem,env(safe-area-inset-bottom))+3.75rem)] z-40 flex justify-center px-3 sm:px-4 lg:bottom-[max(1rem,env(safe-area-inset-bottom))]">
@@ -120,7 +136,7 @@ export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }
                 <button
                   type="button"
                   disabled={busy}
-                  onClick={() => onAction(action.key)}
+                  onClick={() => runAction(action.key)}
                   className={cn(
                     'inline-flex h-10 shrink-0 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors disabled:opacity-50 lg:h-8',
                     action.tone === 'danger'
@@ -137,7 +153,11 @@ export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }
           {menus.map(menu => {
             const MenuIcon = menu.icon
             return (
-              <DropdownMenu.Root key={menu.key}>
+              <DropdownMenu.Root
+                key={menu.key}
+                open={openMenuKey === menu.key}
+                onOpenChange={open => setOpenMenuKey(open ? menu.key : null)}
+              >
                 <DropdownMenu.Trigger asChild>
                   <button
                     type="button"
@@ -167,7 +187,7 @@ export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }
                         <Fragment key={action.key}>
                           {action.separatorBefore && <DropdownMenu.Separator className="my-1 h-px bg-border/70" />}
                           <DropdownMenu.Item
-                            onSelect={() => onAction(action.key)}
+                            onSelect={() => runAction(action.key)}
                             className={cn(
                               'flex min-h-9 cursor-pointer select-none items-center gap-2 rounded-md px-2.5 text-[12px] font-medium outline-none data-[highlighted]:bg-accent data-[highlighted]:text-primary',
                               action.tone === 'danger' && 'text-rose-600 data-[highlighted]:bg-rose-50 dark:data-[highlighted]:bg-rose-950/30',
@@ -188,7 +208,7 @@ export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }
           <button
             type="button"
             disabled={busy}
-            onClick={onClear}
+            onClick={clearSelection}
             className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50 lg:h-8 lg:w-8"
             aria-label="取消选择"
           >

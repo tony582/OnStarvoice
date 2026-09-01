@@ -24,6 +24,17 @@ export type UnattendedPlan = {
   searchFilters?: {
     sort?: string
     publishTime?: string
+    contentType?: string
+    searchScope?: string
+    distance?: string
+    videoDuration?: string
+  }
+  searchPasses?: string[]
+  recoveryPolicy?: {
+    allowIdleAgentHandoff?: boolean
+    platformSafetyMode?: string
+    disableAutomaticSearchRetry?: boolean
+    requireVerifiedFilters?: boolean
   }
   captureSettings?: CaptureEnhancementSettings
   keywordMaxDetectedItems?: number
@@ -397,7 +408,9 @@ export function taskKeywordResults(task: CloudTask): TaskKeywordResult[] {
           item.no_results,
           item.emptyResult,
           item.empty_result,
-        ) || diagnosticText(item.resultKind, item.result_kind) === 'no_matching_results',
+        ) || ['no_matching_results', 'no_search_results'].includes(
+          diagnosticText(item.resultKind, item.result_kind),
+        ),
         resultKind: diagnosticText(item.resultKind, item.result_kind),
         attemptCount: safeNumber(item.attemptCount ?? item.attempt_count),
         savedCount: safeNumber(item.savedCount ?? item.saved_count),
@@ -461,6 +474,7 @@ export function taskPhaseLabel(phase = '') {
     needs_action: '等待人工处理',
     platform_safety_block: '等待人工安全验证',
     no_matching_results: '筛选范围内无匹配内容',
+    no_search_results: '无搜索结果',
     failed: '执行失败',
     partial: '部分完成',
     completed: '执行完成',
@@ -564,6 +578,9 @@ export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
   const skippedFromItems = items.filter(item => item.status === 'skipped').length
   const skipped = hasKeywordCheckpoint ? skippedFromItems : safeNumber(counts.skipped)
   const noResults = items.filter(item => item.status === 'completed' && item.noResults).length
+  const noSearchResults = items.filter(item =>
+    item.status === 'completed' && item.resultKind === 'no_search_results'
+  ).length
   const savedFromItems = items.reduce((sum, item) => sum + item.savedCount, 0)
   const retriesFromItems = items.reduce((sum, item) => sum + Math.max(0, item.attemptCount - 1), 0)
   const currentKeyword = diagnosticText(
@@ -654,12 +671,16 @@ export function taskDiagnostics(task: CloudTask): TaskDiagnostics {
   } else if (items.length > 0 && completed + skipped >= items.length) {
     const capturedCount = Math.max(0, completed - noResults)
     headline = noResults > 0
-      ? `${capturedCount} 个关键词采到结果 · ${noResults} 个筛选范围内无匹配内容`
+      ? `${capturedCount} 个关键词采到结果 · ${noSearchResults > 0
+        ? `${noSearchResults} 个无搜索结果${noResults > noSearchResults
+          ? ` · ${noResults - noSearchResults} 个筛选范围内无匹配内容`
+          : ''}`
+        : `${noResults} 个筛选范围内无匹配内容`}`
       : `${completed} 个关键词已完整完成`
     explanation = skipped > 0
       ? `另有 ${skipped} 个关键词已按规则跳过。`
       : noResults > 0
-        ? '无匹配内容已按 0 条正常结算，不计入失败或未完成。'
+        ? '无搜索结果或无匹配内容已按 0 条正常结算，不计入失败或未完成。'
         : '列表与已启用的增强步骤均已结算。'
     tone = 'success'
   } else {

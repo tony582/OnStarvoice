@@ -1504,6 +1504,7 @@ router.post(
           agentId,
           [platform],
           'official',
+          {excludeTaskIds: [requestKey]},
         );
         if (compatible.failure) return {failure: compatible.failure};
         const requestHash = profilePatrolRequestHash({

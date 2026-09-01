@@ -127,6 +127,7 @@ function canaryExecutor({pool, target, schema}) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(`SET LOCAL search_path TO ${quoteIdentifier(schema)}, public`);
       const result = await operation({
         logicalUrl,
         query: boundCanaryQuery({

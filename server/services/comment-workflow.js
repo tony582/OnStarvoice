@@ -1,5 +1,11 @@
 import crypto from 'crypto';
-import { queryAll, queryOne, withTransaction, getSetting } from '../db/init.js';
+import {
+  execute,
+  queryAll,
+  queryOne,
+  withTransaction,
+  getSetting,
+} from '../db/init.js';
 import { classifyCommentWithAI, classifyCommentsBatch } from './ai-labeler.js';
 import { upsertCommentLeadForComment } from './comment-leads.js';
 import {
@@ -457,6 +463,22 @@ function isDouyinNonComment(item) {
 // 算好,再进事务快速入库。AI 精度不变(仍逐条判定),只是把"几百次串行慢调用"压成"几十次并行调用"。
 const BATCH_SIZE = 12;
 const BATCH_CONCURRENCY = 4;
+const COMMENT_AI_RETRY_COOLDOWN_SECONDS = 60;
+const COMMENT_AI_PERMANENT_FAILURE_LIMIT = 3;
+
+function commentAiRetryAttempts(comment) {
+  const aiResult = comment?.ai_result && typeof comment.ai_result === 'object'
+    ? comment.ai_result
+    : {};
+  return Math.max(0, Number(aiResult.commentAiRetryAttempts) || 0);
+}
+
+// 400 请求格式错误与模型返回非 JSON 都不会靠高频原样重试自愈。先短暂退避，
+// 连续三次仍失败时明确保留 Phase 1 的规则分类并结算；超时、限流、5xx 等
+// 瞬时故障只退避不结算，恢复后仍会再次进入 AI 精炼。
+function isPermanentCommentAiFailure(error) {
+  return Number(error?.status) === 400 || error?.code === 'LLM_JSON_PARSE_FAILED';
+}
 
 // 限并发 map:最多 limit 个 worker 并行消费 items,按下标顺序写回 results。
 async function mapLimit(items, limit, fn) {
@@ -645,13 +667,22 @@ export async function upsertRecordComments(recordId, record, context) {
 export async function refineCommentsWithAI({ limit = 300 } = {}) {
   const pending = await queryAll(`
     SELECT rc.id, rc.record_id, rc.tenant_id, rc.content, rc.author_name, rc.like_count, rc.ip_location,
+           rc.ai_result, rc.updated_at,
            r.title AS r_title, r.content AS r_content, r.platform AS r_platform,
            r.sentiment AS r_sentiment, r.category AS r_category, r.record_type AS r_type,
            r.negative_comment_count AS r_neg
     FROM record_comments rc
     JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
     WHERE rc.ai_classified_at IS NULL AND rc.is_official = false
-    ORDER BY rc.record_id, rc.id
+      AND (
+        COALESCE(rc.ai_result->>'commentAiRetryPending', 'false') <> 'true'
+        OR rc.updated_at <= now() - INTERVAL '${COMMENT_AI_RETRY_COOLDOWN_SECONDS} seconds'
+      )
+    ORDER BY
+      (COALESCE(rc.ai_result->>'commentAiRetryPending', 'false') = 'true') ASC,
+      rc.updated_at ASC,
+      rc.record_id,
+      rc.id
     LIMIT $1
   `, [limit]);
   if (!pending.length) return 0;
@@ -675,6 +706,7 @@ export async function refineCommentsWithAI({ limit = 300 } = {}) {
     // LLM 调用在事务之外,分批并发
     const done = await mapLimit(batches, BATCH_CONCURRENCY, async (batch) => {
       let ai = null;
+      let error = null;
       try {
         ai = await classifyCommentsBatch({
           tenantId, record,
@@ -682,9 +714,10 @@ export async function refineCommentsWithAI({ limit = 300 } = {}) {
         });
       } catch (err) {
         console.error('[CommentRefine] 批量分类失败,留待下轮:', err.message);
+        error = err;
         ai = null;
       }
-      return { batch, ai };
+      return { batch, ai, error };
     });
 
     // 写库在一个快事务里(无 LLM)
@@ -695,8 +728,43 @@ export async function refineCommentsWithAI({ limit = 300 } = {}) {
         'SELECT id, title, content, url, keyword, author_name, author_id, platform, record_type FROM records WHERE id = $1 AND tenant_id = $2',
         [recordId, tenantId]
       );
-      for (const { batch, ai } of done) {
-        if (!ai) continue; // 整批失败:保持待精炼,下轮再来
+      for (const { batch, ai, error } of done) {
+        if (!ai) {
+          for (const comment of batch) {
+            const attempts = commentAiRetryAttempts(comment) + 1;
+            const settleWithRuleFallback = isPermanentCommentAiFailure(error)
+              && attempts >= COMMENT_AI_PERMANENT_FAILURE_LIMIT;
+            const errorMetadata = {
+              commentAiRetryPending: !settleWithRuleFallback,
+              commentAiRetryAttempts: attempts,
+              commentAiLastErrorCode: String(error?.code || 'COMMENT_AI_ERROR').slice(0, 80),
+              commentAiLastError: String(error?.message || error || 'AI 精炼失败').slice(0, 300),
+              commentAiLastAttemptAt: new Date().toISOString(),
+              ...(settleWithRuleFallback ? {
+                commentAiRuleFallback: true,
+                commentAiRuleFallbackReason: 'permanent_failure_limit',
+              } : {}),
+            };
+            await tx.execute(`
+              UPDATE record_comments
+              SET ai_result = COALESCE(ai_result, '{}'::jsonb) || $1::jsonb,
+                  ai_classified_at = CASE WHEN $2 THEN now() ELSE ai_classified_at END,
+                  updated_at = now()
+              WHERE id = $3 AND ai_classified_at IS NULL
+            `, [JSON.stringify(errorMetadata), settleWithRuleFallback, comment.id]);
+            if (settleWithRuleFallback) changed += 1;
+          }
+          if (isPermanentCommentAiFailure(error)
+              && batch.some(comment => commentAiRetryAttempts(comment) + 1 >= COMMENT_AI_PERMANENT_FAILURE_LIMIT)) {
+            console.warn('[CommentRefine] 永久失败已保留规则分类并结算，避免阻塞后续评论', {
+              recordId,
+              comments: batch.length,
+              code: error?.code || '',
+              status: error?.status || 0,
+            });
+          }
+          continue;
+        }
         for (let j = 0; j < batch.length; j++) {
           const cls = ai[j];
           if (!cls) continue; // 单条缺失:留待下轮
@@ -776,6 +844,132 @@ export async function reprocessPendingComments({ limit = 2000 } = {}) {
   }
   console.log(`[Reprocess] 自愈补回 ${fixed}/${rows.length} 条记录的评论`);
   return fixed;
+}
+
+export async function reprocessPendingCommentWorkflowReceipts({
+  limit = 100,
+} = {}) {
+  const boundedLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+  const rows = await queryAll(`
+    SELECT observation.id AS observation_id,
+      observation.tenant_id, observation.record_id,
+      observation.comment_workflow_expected_count,
+      observation.comment_workflow_updated_at,
+      record.platform, record.title, record.content,
+      record.author_name, record.author_id, record.author_account_no,
+      record.url, record.keyword,
+      COALESCE(
+        CASE
+          WHEN jsonb_typeof(observation.payload->'items'->0->'commentsCleanedItems') = 'array'
+            THEN observation.payload->'items'->0->'commentsCleanedItems'
+        END,
+        CASE
+          WHEN jsonb_typeof(observation.payload->'commentsCleanedItems') = 'array'
+            THEN observation.payload->'commentsCleanedItems'
+        END,
+        CASE
+          WHEN jsonb_typeof(observation.payload->'detailPayload'->'commentsCleanedItems') = 'array'
+            THEN observation.payload->'detailPayload'->'commentsCleanedItems'
+        END,
+        '[]'::jsonb
+      ) AS cleaned,
+      COALESCE(
+        CASE
+          WHEN jsonb_typeof(observation.payload->'items'->0->'officialReplyItems') = 'array'
+            THEN observation.payload->'items'->0->'officialReplyItems'
+        END,
+        CASE
+          WHEN jsonb_typeof(observation.payload->'officialReplyItems') = 'array'
+            THEN observation.payload->'officialReplyItems'
+        END,
+        CASE
+          WHEN jsonb_typeof(observation.payload->'detailPayload'->'officialReplyItems') = 'array'
+            THEN observation.payload->'detailPayload'->'officialReplyItems'
+        END,
+        '[]'::jsonb
+      ) AS official_reply
+    FROM record_observations observation
+    JOIN records record
+      ON record.id = observation.record_id
+      AND record.tenant_id = observation.tenant_id
+    WHERE (
+      observation.comment_workflow_status = 'queued'
+        AND observation.comment_workflow_updated_at < now() - interval '15 seconds'
+    ) OR (
+      observation.comment_workflow_status = 'running'
+        AND observation.comment_workflow_updated_at < now() - interval '2 minutes'
+    ) OR (
+      observation.comment_workflow_status = 'failed'
+        AND observation.comment_workflow_updated_at < now() - interval '30 seconds'
+    )
+    ORDER BY observation.comment_workflow_updated_at, observation.id
+    LIMIT $1
+  `, [boundedLimit]);
+  const summary = {claimed: 0, persisted: 0, failed: 0};
+  for (const row of rows) {
+    const claimed = await queryOne(`
+      UPDATE record_observations
+      SET comment_workflow_status = 'running',
+        comment_workflow_started_at = COALESCE(
+          comment_workflow_started_at,
+          now()
+        ),
+        comment_workflow_error = '',
+        comment_workflow_updated_at = now()
+      WHERE id = $1 AND tenant_id = $2
+        AND comment_workflow_status IN ('queued', 'running', 'failed')
+        AND comment_workflow_updated_at = $3::timestamptz
+      RETURNING id
+    `, [row.observation_id, row.tenant_id, row.comment_workflow_updated_at]);
+    if (!claimed) continue;
+    summary.claimed += 1;
+    try {
+      const stats = await upsertRecordComments(row.record_id, {
+        platform: row.platform,
+        title: row.title,
+        content: row.content,
+        author_name: row.author_name,
+        author_id: row.author_id,
+        author_account_no: row.author_account_no,
+        url: row.url,
+        keyword: row.keyword,
+        comments_cleaned_items: row.cleaned || [],
+        official_reply_items: row.official_reply || [],
+      }, {tenantId: row.tenant_id, authCode: ''});
+      await execute(`
+        UPDATE record_observations
+        SET comment_workflow_status = 'persisted',
+          comment_workflow_processed_count = $3,
+          comment_workflow_error = '',
+          comment_workflow_finished_at = now(),
+          comment_workflow_updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+          AND comment_workflow_status = 'running'
+      `, [
+        row.observation_id,
+        row.tenant_id,
+        Math.max(0, Number(stats.inserted || 0) + Number(stats.updated || 0)),
+      ]);
+      summary.persisted += 1;
+    } catch (error) {
+      await execute(`
+        UPDATE record_observations
+        SET comment_workflow_status = 'failed',
+          comment_workflow_error = $3,
+          comment_workflow_finished_at = now(),
+          comment_workflow_updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+          AND comment_workflow_status = 'running'
+      `, [
+        row.observation_id,
+        row.tenant_id,
+        String(error?.message || error || 'comment_workflow_failed')
+          .slice(0, 1000),
+      ]);
+      summary.failed += 1;
+    }
+  }
+  return summary;
 }
 
 export async function getRecordComments(tenantId, recordId) {

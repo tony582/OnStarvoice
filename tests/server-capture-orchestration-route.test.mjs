@@ -121,6 +121,20 @@ test('allocation preview uses deterministic balanced groups and validates compat
   );
   assert.match(compatibility, /ORDER BY ca\.id/u);
   assert.match(compatibility, /agentCompatibilityFailure/u);
+  assert.match(
+    compatibility,
+    /normalizeCaptureResourcePolicy\([\s\S]*resourcePolicy[\s\S]*relayAgentIds/u,
+  );
+  assert.match(compatibility, /const allAgentIds = Array\.from\(new Set/u);
+  assert.match(compatibility, /byId\.size !== allAgentIds\.length/u);
+  assert.match(compatibility, /includeRelayPool = true/u);
+  assert.match(compatibility, /const relayAgentIds = includeRelayPool/u);
+  const compatibilityContract = section(
+    'function agentCompatibilityFailure',
+    'async function loadCompatibleAgents',
+  );
+  assert.match(compatibilityContract, /singleRelayV1/u);
+  assert.match(compatibilityContract, /agent_single_relay_capability_missing/u);
 });
 
 test('dispatch is revision-CAS protected and locks parent, items, then agents', () => {
@@ -167,6 +181,14 @@ test('one-time dispatch creates disjoint ordinary child tasks, create commands, 
   assert.match(dispatch, /INSERT INTO capture_agent_commands/u);
   assert.match(dispatch, /'create'/u);
   assert.match(dispatch, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(dispatch, /const itemAttemptBindings = \[\]/u);
+  assert.match(dispatch, /itemAttempts: itemAttemptBindings/u);
+  const fixedDispatch = dispatch.slice(dispatch.indexOf('const executions = [];'));
+  assert.ok(
+    fixedDispatch.indexOf('INSERT INTO capture_task_item_attempts') <
+      fixedDispatch.indexOf('INSERT INTO capture_agent_commands'),
+    'fixed-batch attempts must be durable before the create command is visible',
+  );
   assert.match(dispatch, /'dispatched'/u);
   assert.match(dispatch, /eventType: 'orchestration_child_dispatched'/u);
   assert.match(dispatch, /eventType: 'orchestration_dispatched'/u);
@@ -275,6 +297,14 @@ test('schedule edit updates the same template with revision protection and leave
   assert.match(edit, /eventType: 'orchestration_schedule_updated'/u);
   assert.match(edit, /已生成的运行批次保持不变/u);
   assert.match(edit, /修改从下一次运行开始生效/u);
+  assert.match(edit, /existingPlanSnapshot: safeJson\(schedule\.plan_snapshot\)/u);
+  const normalizeEdit = section(
+    'function normalizeScheduleUpdate',
+    'async function appendEvent',
+  );
+  assert.match(normalizeEdit, /carriesResourcePolicy/u);
+  assert.match(normalizeEdit, /preservedResourcePolicy/u);
+  assert.match(normalizeEdit, /rawDistributionMode === 'elastic_pool'/u);
 });
 
 test('schedule pause and resume are tenant scoped, idempotent, and never backfill missed runs', () => {
@@ -354,6 +384,11 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   assert.match(handoff, /handoff_disabled_by_task_policy/u);
   assert.match(
     handoff,
+    /\{lock: true, includeRelayPool: false\}/u,
+    'an explicit handoff must not be blocked by an unselected relay node',
+  );
+  assert.match(
+    handoff,
     /SET status = 'failed'[\s\S]*'code', 'handoff_source_security_item_failed'/u,
   );
   assert.match(
@@ -362,7 +397,7 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   );
   assert.match(handoff, /settledSourceItemIds/u);
   assert.match(handoff, /handoff_target_same_as_source/u);
-  assert.match(handoff, /captureAgentOnline\(targetAgent\.last_heartbeat_at\)/u);
+  assert.match(handoff, /captureAgentFullHeartbeatOnline\(targetAgent\)/u);
   assert.match(handoff, /handoff_target_busy/u);
   assert.match(handoff, /findCaptureAgentExecutionSlotBlocker/u);
   assert.match(handoff, /blockerKind: targetBusyTask\.kind/u);
@@ -370,6 +405,8 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   assert.match(handoff, /AND orchestration_revision = \$9/u);
   assert.match(handoff, /attempt_count = attempt_count \+ 1/u);
   assert.match(handoff, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(handoff, /const itemAttemptIdByItemId = new Map/u);
+  assert.match(handoff, /itemAttempts: itemAttemptBindings/u);
   assert.match(handoff, /handoffConfirmedByUser: true/u);
   assert.match(
     handoff,
@@ -385,29 +422,325 @@ test('manual handoff transfers only unstarted whole keywords after the source is
   );
 });
 
-test('failed keyword retry stays inside the same parent and can target an idle Agent', () => {
+test('failed keyword retry atomically shards each item to a distinct idle Agent lease', () => {
   const retry = section(
     "router.post(\n  '/orchestrations/:id/retry-items'",
     "router.post(\n  '/orchestrations/:id/resolve-attention'",
   );
   assert.match(retry, /normalizeRetryItems/u);
+  assert.match(retry, /\{includeRelayPool: false\}/u);
+  assert.match(retry, /action: 'retry_items_atomic_shard'/u);
+  assert.match(retry, /metadata->>'retryRequestKey'/u);
+  assert.match(retry, /existingTasks\.every/u);
   assert.match(retry, /RETRY_ITEM_STATUSES/u);
   assert.match(retry, /retry_requires_safety_confirmation/u);
   assert.match(retry, /HANDOFF_SOURCE_FINAL_STATUSES\.has\(task\.status\)/u);
-  assert.match(retry, /lockCaptureAgentExecutionSlot/u);
-  assert.match(retry, /captureAgentOnline\(targetAgent\.last_heartbeat_at\)/u);
-  assert.match(retry, /retry_target_busy/u);
+  assert.match(retry, /for \(const agentId of candidateAgentIds\)/u);
+  assert.match(retry, /await lockCaptureAgentExecutionSlot\(tx, req\.tenantId, agentId\)/u);
+  assert.match(retry, /captureAgentFullHeartbeatOnline\(agent\)/u);
+  assert.doesNotMatch(retry, /retry_no_idle_agents/u);
+  assert.match(retry, /status = 'retryable'/u);
+  assert.match(retry, /retryWaitingItems/u);
+  assert.match(retry, /dispatched: result\.executions/u);
+  assert.match(retry, /waiting: result\.waiting/u);
+  assert.match(retry, /single|单项租约/u);
+  assert.match(retry, /for \(let index = 0; index < retryAssignments\.length; index \+= 1\)/u);
+  assert.match(retry, /keywords: \[item\.keyword\]/u);
+  assert.match(retry, /const itemAttemptId = crypto\.randomUUID\(\)/u);
+  assert.match(retry, /itemAttempts: itemAttemptBindings/u);
+  assert.match(retry, /itemIds: \[item\.id\]/u);
   assert.match(retry, /'orchestration_retry'/u);
   assert.match(retry, /parent_task_id/u);
   assert.match(retry, /attempt_count = attempt_count \+ 1/u);
   assert.match(retry, /INSERT INTO capture_task_item_attempts/u);
   assert.match(retry, /retrySourceExecutionTaskIds/u);
   assert.match(retry, /orchestration_revision = orchestration_revision \+ 1/u);
-  assert.match(retry, /eventType: 'orchestration_retry_dispatched'/u);
+  assert.match(retry, /'orchestration_retry_dispatched'/u);
+  assert.match(retry, /executions: result\.executions/u);
   assert.doesNotMatch(
     retry,
     /SET status = 'superseded'/u,
     'retrying one failed item must not erase sibling results on its source execution',
+  );
+  const waitingStart = retry.indexOf('for (const waitingItem of waiting)');
+  const waitingEnd = retry.indexOf('const refreshedItems', waitingStart);
+  assert.notEqual(waitingStart, -1);
+  assert.notEqual(waitingEnd, -1);
+  const waitingUpdate = retry.slice(waitingStart, waitingEnd);
+  assert.match(waitingUpdate, /SET status = 'retryable'/u);
+  assert.match(waitingUpdate, /'retryPending', true/u);
+  for (const lineageField of [
+    'retryWaitingRequestHash',
+    'retryWaitingPlanHash',
+    'retryWaitingAgentId',
+    'retryWaitingParentRevision',
+    'retryWaitingItemRevision',
+    'retryWaitingAttemptCount',
+    'retryWaitingSourceExecutionTaskId',
+    'retryWaitingSafetyConfirmed',
+    'retryWaitingBatchSize',
+    'retryWaitingDispatchOrdinal',
+  ]) {
+    assert.match(waitingUpdate, new RegExp(lineageField, 'u'));
+  }
+  const waitingSet = waitingUpdate.slice(
+    waitingUpdate.indexOf('SET'),
+    waitingUpdate.indexOf('WHERE'),
+  );
+  assert.doesNotMatch(waitingSet, /attempt_count\s*=/u);
+  assert.doesNotMatch(waitingSet, /assigned_agent_id\s*=/u);
+  assert.doesNotMatch(waitingSet, /execution_task_id\s*=/u);
+});
+
+test('active elastic retries keep one owner while settled failures remain recoverable', () => {
+  const retry = section(
+    "router.post(\n  '/orchestrations/:id/retry-items'",
+    "router.post(\n  '/orchestrations/:id/resolve-attention'",
+  );
+  const replayRead = retry.indexOf('const existingTasks =');
+  const childInsert = retry.indexOf('INSERT INTO capture_tasks');
+  assert.equal(
+    retry.indexOf('if (elasticQueueOwnsRetry(parentPreview))'),
+    -1,
+    'a terminal failed item must not be blocked by the stale preview gate',
+  );
+  assert.ok(replayRead >= 0);
+  assert.ok(childInsert > replayRead);
+  assert.match(retry, /retry_items_managed_by_elastic_dispatcher/u);
+
+  const lockedParent = retry.indexOf('parentSelect({lock: true})');
+  const lockedGate = retry.indexOf(
+    'elasticQueueOwnsRetry(parent) &&',
+    lockedParent,
+  );
+  assert.ok(lockedParent >= 0);
+  assert.ok(lockedGate > lockedParent);
+  assert.ok(lockedGate < childInsert);
+  assert.match(
+    retry.slice(lockedGate, childInsert),
+    /retryItems\.some\(item => item\.status === 'retryable'\)/u,
+  );
+});
+
+test('four retry items with three ranked idle Agents dispatch three and preserve one waiting', async () => {
+  const {allocateRetryItemsForRetry} = await import(
+    new URL('../server/routes/capture-orchestrations.js', import.meta.url)
+  );
+  const items = [1, 2, 3, 4].map(index => ({
+    id: `item-${index}`,
+    keyword: `keyword-${index}`,
+  }));
+  const agents = [1, 2, 3].map(index => ({id: `agent-${index}`}));
+  const allocation = allocateRetryItemsForRetry({items, agents});
+  assert.deepEqual(
+    allocation.dispatched.map(entry => [entry.item.id, entry.agentId]),
+    [
+      ['item-1', 'agent-1'],
+      ['item-2', 'agent-2'],
+      ['item-3', 'agent-3'],
+    ],
+  );
+  assert.deepEqual(allocation.waiting, [{
+    itemId: 'item-4',
+    keyword: 'keyword-4',
+    status: 'retryable',
+    reason: 'no_idle_untried_agent',
+  }]);
+});
+
+test('an unavailable per-item preference falls back to another idle Agent', async () => {
+  const {allocateRetryItemsForRetry} = await import(
+    new URL('../server/routes/capture-orchestrations.js', import.meta.url)
+  );
+  const allocation = allocateRetryItemsForRetry({
+    items: [{id: 'item-1', keyword: 'keyword-1'}],
+    agents: [{id: 'agent-auto'}],
+    overrides: [{itemId: 'item-1', agentId: 'agent-required'}],
+  });
+  assert.equal(allocation.dispatched[0].agentId, 'agent-auto');
+  assert.equal(
+    allocation.dispatched[0].preferenceFallbackReason,
+    'preferred_agent_unavailable',
+  );
+  assert.deepEqual(allocation.waiting, []);
+});
+
+test('retry allocation never sends a keyword back to an Agent that already tried it', async () => {
+  const {allocateRetryItemsForRetry} = await import(
+    new URL('../server/routes/capture-orchestrations.js', import.meta.url)
+  );
+  const allocation = allocateRetryItemsForRetry({
+    items: [
+      {id: 'item-1', keyword: 'keyword-1'},
+      {id: 'item-2', keyword: 'keyword-2'},
+    ],
+    agents: [{id: 'agent-1'}, {id: 'agent-2'}, {id: 'agent-3'}],
+    overrides: [{itemId: 'item-1', agentId: 'agent-1'}],
+    attemptedAgentIdsByItem: new Map([
+      ['item-1', new Set(['agent-1', 'agent-2'])],
+    ]),
+  });
+  assert.deepEqual(
+    allocation.dispatched.map(entry => [entry.item.id, entry.agentId]),
+    [['item-1', 'agent-3'], ['item-2', 'agent-1']],
+  );
+  assert.equal(
+    allocation.dispatched[0].preferenceFallbackReason,
+    'preferred_agent_already_attempted',
+  );
+});
+
+test('retry candidate SQL fails closed on unknown Shanghai usage and hard limits', () => {
+  const candidateStart = route.indexOf('async function loadRetryAgentCandidates');
+  const candidateEnd = route.indexOf('function publicRetryAgentCandidate', candidateStart);
+  assert.notEqual(candidateStart, -1);
+  assert.notEqual(candidateEnd, -1);
+  const candidates = route.slice(candidateStart, candidateEnd);
+  assert.match(candidates, /JOIN social_agent_daily_usage daily_usage/u);
+  assert.match(candidates, /now\(\) AT TIME ZONE 'Asia\/Shanghai'/u);
+  assert.match(candidates, /daily_usage\.last_event_at IS NOT NULL/u);
+  assert.match(candidates, /AS today_usage_current/u);
+  assert.doesNotMatch(candidates, /COALESCE\(daily_usage\.searches,\s*0\)/u);
+  assert.match(candidates, /daily_usage\.searches < current_social_account\.daily_search_limit/u);
+  assert.match(candidates, /ORDER BY[\s\S]*health_status[\s\S]*recent_technical_failure_count ASC[\s\S]*daily_usage\.searches ASC/u);
+  assert.match(candidates, /FROM capture_task_item_attempts recent_failure/u);
+  assert.match(candidates, /FOR UPDATE OF ca, daily_usage/u);
+  assert.match(route, /crossDeviceRetryAgentDailyUsageEligible\(agent\)/u);
+});
+
+test('retryPending has a bounded deterministic consumer on the existing recovery sweep', () => {
+  const consumerStart = route.indexOf(
+    'export async function reconcilePendingOrchestrationRetries',
+  );
+  const consumerEnd = route.indexOf("router.post(\n  '/orchestrations/:id/dispatch'", consumerStart);
+  assert.notEqual(consumerStart, -1);
+  assert.notEqual(consumerEnd, -1);
+  const consumer = route.slice(consumerStart, consumerEnd);
+  const dispatchStart = route.indexOf('function deterministicRetryUuid');
+  assert.notEqual(dispatchStart, -1);
+  const dispatch = route.slice(dispatchStart, consumerEnd);
+  assert.match(dispatch, /metadata->>'retryPending' = 'true'/u);
+  assert.match(dispatch, /deterministicRetryUuid/u);
+  assert.match(dispatch, /tryLockCaptureAgentExecutionSlot/u);
+  assert.match(dispatch, /crossDeviceRetryAgentDailyUsageEligible/u);
+  assert.match(dispatch, /HANDOFF_SOURCE_FINAL_STATUSES\.has\(sourceTask\.status\)/u);
+  assert.match(dispatch, /lineage\.safetyConfirmed/u);
+  assert.match(dispatch, /lineage\.preferredAgentId/u);
+  assert.match(dispatch, /AND assignment_revision = \$11/u);
+  assert.match(dispatch, /AND attempt_count = \$12/u);
+  assert.match(dispatch, /retryWaitingRequestHash' = \$13/u);
+  assert.match(dispatch, /INSERT INTO capture_task_item_attempts/u);
+  assert.match(dispatch, /actorType: 'system'/u);
+  assert.match(dispatch, /retryWaitingInvalidatedAt/u);
+  assert.match(dispatch, /retryWaitingInvalidatedReason/u);
+  assert.match(dispatch, /retryWaitingInvalidatedMarker/u);
+  assert.match(dispatch, /jsonb_object_agg\(current_marker\.key, current_marker\.value\)/u);
+  assert.match(dispatch, /retryWaitingLastCheckedAt/u);
+  assert.match(dispatch, /excludedItemIds/u);
+  assert.match(dispatch, /safety_confirmation_missing/u);
+  const invalidation = section(
+    'function retryPendingInvalidationReason',
+    'async function invalidateLockedPendingRetryMarker',
+  );
+  assert.match(invalidation, /elasticQueueOwnsRetry\(parent\)/u);
+  assert.match(invalidation, /elastic_queue_retry_managed/u);
+  assert.match(dispatch, /aggregateParentTaskItems\(refreshedItems\)/u);
+  assert.match(dispatch, /lastRetryWaitingInvalidatedCount/u);
+  assert.match(
+    dispatch,
+    /orchestration_retry_pending_projection_reconciled/u,
+  );
+  assert.match(consumer, /Math\.min\(100/u);
+  assert.doesNotMatch(consumer, /crypto\.randomUUID/u);
+});
+
+test('manual and automatic retry dispatch share one deadlock-safe lock order', () => {
+  const retry = section(
+    "router.post(\n  '/orchestrations/:id/retry-items'",
+    "router.post(\n  '/orchestrations/:id/resolve-attention'",
+  );
+  const advisorySlot = retry.indexOf('lockCaptureAgentExecutionSlot(');
+  const agentRows = retry.indexOf('const candidateAgents =');
+  const sourceRows = retry.indexOf('const sourceTasks =');
+  const parentRow = retry.indexOf('parentSelect({lock: true})');
+  const itemRows = retry.indexOf('const items = await listParentItems');
+  assert.ok(advisorySlot >= 0);
+  assert.ok(agentRows > advisorySlot);
+  assert.ok(sourceRows > agentRows);
+  assert.ok(parentRow > sourceRows);
+  assert.ok(itemRows > parentRow);
+
+  const consumerStart = route.indexOf(
+    'async function loadIdlePendingRetryAgent',
+  );
+  const consumerEnd = route.indexOf(
+    'export async function reconcilePendingOrchestrationRetries',
+    consumerStart,
+  );
+  const consumer = route.slice(consumerStart, consumerEnd);
+  const consumerAdvisory = consumer.indexOf(
+    'tryLockCaptureAgentExecutionSlot(',
+  );
+  const consumerAgentRows = consumer.indexOf('lock: true');
+  const consumerSourceRows = consumer.indexOf('const sourceTask =');
+  const consumerParentRow = consumer.indexOf('parentSelect({lock: true})');
+  const consumerItemRows = consumer.indexOf('const item = await tx.queryOne');
+  assert.ok(consumerAdvisory >= 0);
+  assert.ok(consumerAgentRows > consumerAdvisory);
+  assert.ok(consumerSourceRows > consumerAgentRows);
+  assert.ok(consumerParentRow > consumerSourceRows);
+  assert.ok(consumerItemRows > consumerParentRow);
+});
+
+test('automatic waiting continuation binds its deterministic attempt into the command', () => {
+  const consumerStart = route.indexOf(
+    'async function dispatchOnePendingOrchestrationRetry',
+  );
+  const consumerEnd = route.indexOf(
+    'export async function reconcilePendingOrchestrationRetries',
+    consumerStart,
+  );
+  assert.ok(consumerStart >= 0);
+  assert.ok(consumerEnd > consumerStart);
+  const consumer = route.slice(consumerStart, consumerEnd);
+  assert.match(consumer, /const itemAttemptId = deterministicRetryUuid/u);
+  assert.match(consumer, /itemAttempts: itemAttemptBindings/u);
+  assert.ok(
+    consumer.indexOf('INSERT INTO capture_task_item_attempts') <
+      consumer.indexOf('INSERT INTO capture_agent_commands'),
+    'automatic continuation must persist the attempt before publishing command',
+  );
+});
+
+test('idempotent replay reads live retryPending rows instead of a child snapshot', () => {
+  const retry = section(
+    "router.post(\n  '/orchestrations/:id/retry-items'",
+    "router.post(\n  '/orchestrations/:id/resolve-attention'",
+  );
+  assert.match(retry, /existingWaitingItems/u);
+  assert.match(retry, /existingWaitingItems\.map\(publicPendingRetryItem\)/u);
+  assert.doesNotMatch(retry, /replayMetadata\.retryWaitingItems/u);
+});
+
+test('retry request no longer requires one targetAgentId for a multi-item batch', () => {
+  const normalizeStart = route.indexOf('function normalizeRetryItems');
+  const normalizeEnd = route.indexOf("router.post(\n  '/orchestrations/:id/dispatch'", normalizeStart);
+  assert.notEqual(normalizeStart, -1);
+  assert.notEqual(normalizeEnd, -1);
+  const normalize = route.slice(normalizeStart, normalizeEnd);
+  assert.match(normalize, /if \(!requestKey \|\| itemIds\.length === 0\)/u);
+  assert.match(normalize, /Array\.isArray\(body\?\.assignments\)/u);
+  assert.match(normalize, /duplicate_retry_agent_assignment/u);
+  assert.match(normalize, /legacyBatchTarget/u);
+  const retry = section(
+    "router.post(\n  '/orchestrations/:id/retry-items'",
+    "router.post(\n  '/orchestrations/:id/resolve-attention'",
+  );
+  assert.match(retry, /existingTasks\.length > 0[\s\S]*legacy_retry_target_not_atomic/u);
+  assert.doesNotMatch(
+    normalize,
+    /if \(!requestKey \|\| !targetAgentId/u,
+    'targetAgentId must not remain mandatory for retry batches',
   );
 });
 
@@ -438,6 +771,16 @@ test('detail reader is tenant scoped and returns the complete orchestration proj
   assert.match(route, /record\.content AS source_record_content/u);
   assert.match(route, /function publicParentItem/u);
   assert.match(detail, /\.map\(publicParentItem\)/u);
+  assert.match(detail, /agent_last_liveness_at/u);
+  assert.match(detail, /agent_last_full_heartbeat_at/u);
+  assert.match(
+    detail,
+    /agent_online: captureAgentLivenessOnline\(\{/u,
+  );
+  assert.match(
+    detail,
+    /ca\.last_liveness_at, ca\.last_full_heartbeat_at/u,
+  );
   assert.match(
     detail,
     /WHERE attempt\.tenant_id = \$1[\s\S]*attempt\.parent_task_id = \$2/u,

@@ -12,7 +12,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  ExternalLink,
   Heart,
   Loader2,
   MessageCircle,
@@ -32,6 +31,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusPill } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
 type Sentiment = {
   total: number
@@ -728,16 +728,8 @@ function PostTableRow({
             <div className="mt-1 truncate text-[10px] text-muted-foreground">
               {post.officialAccount.name} · {formatPublish(post.publishedAt, post.publishTime)}
             </div>
-            {post.url ? (
-              <a
-                href={post.url}
-                target="_blank"
-                rel="noreferrer"
-                onClick={event => event.stopPropagation()}
-                className="mt-1 inline-flex items-center gap-1 text-[10px] font-medium text-primary hover:underline"
-              >
-                查看原文 <ExternalLink className="h-2.5 w-2.5" />
-              </a>
+            {post.url || post.platform === 'xiaohongshu' ? (
+              <RecordSourceAction record={post} compact className="mt-1 text-[10px]" />
             ) : (
               <span className="mt-1 inline-flex text-[10px] text-muted-foreground">
                 原文链接待补充
@@ -784,15 +776,8 @@ function PostMobileCard({
           </p>
         </div>
       </button>
-      {post.url ? (
-        <a
-          href={post.url}
-          target="_blank"
-          rel="noreferrer"
-          className="mt-2 inline-flex items-center gap-1 text-[11px] font-medium text-primary hover:underline"
-        >
-          查看原文 <ExternalLink className="h-3 w-3" />
-        </a>
+      {post.url || post.platform === 'xiaohongshu' ? (
+        <RecordSourceAction record={post} compact className="mt-2 text-[11px]" />
       ) : (
         <span className="mt-2 inline-flex text-[11px] text-muted-foreground">
           原文链接待补充

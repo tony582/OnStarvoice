@@ -56,9 +56,9 @@ test("AI relevance prefilter is a search-only enhancement option with safe copy"
   assert.equal(optionMatches?.length, 1);
   assert.doesNotMatch(bloggerSection, /ai-relevance-prefilter/);
   assert.match(searchSection, /AI 精准筛选/);
-  assert.match(searchSection, /后台 DeepSeek/);
-  assert.match(searchSection, /仅在高置信度判定无关时跳过增强/);
-  assert.match(searchSection, /服务异常都会继续采集/);
+  assert.match(searchSection, /最小详情再二判/);
+  assert.match(searchSection, /高置信度无关项跳过评论和博主增强/);
+  assert.match(searchSection, /模型异常按少量抽样继续，其余延迟增强/);
   assert.ok(
     searchSection.indexOf('data-detail-setting="auto-sync"') <
       searchSection.indexOf('data-detail-setting="ai-relevance-prefilter"'),
@@ -140,18 +140,64 @@ test("AI skips persist as a terminal filtered detail state and settle without op
   assert.match(captureSyncSource, /FILTERED:\s*'filtered'/);
   assert.match(
     captureSyncSource,
-    /status:\s*DETAIL_CAPTURE_STATUS\.FILTERED/,
+    /terminalStatus = decision\.shouldSkip[\s\S]*DETAIL_CAPTURE_STATUS\.FILTERED/,
   );
 
   const allSkippedSection = readSourceSection(
     captureSyncSource,
-    "// 全部已采过或被 AI 高置信度过滤",
+    "// 全部已采过、被 AI 高置信度过滤或按降级策略延迟",
     "const results = [];",
   );
   assert.match(allSkippedSection, /phase:\s*'detail_item_filtered'/);
   assert.match(allSkippedSection, /phase:\s*'detail_item_skipped'/);
   assert.match(allSkippedSection, /recordId,/);
   assert.match(allSkippedSection, /state:\s*'filtered'/);
+  assert.match(allSkippedSection, /state:\s*'deferred'/);
+});
+
+test("capture audit separates the server model disposition from the action actually executed", () => {
+  const helperSection = readSourceSection(
+    captureSyncSource,
+    "function resolveActualRelevanceExecutionDisposition(decision = {})",
+    "const CAPTURE_TASK_MESSAGE_TYPE",
+  );
+  const context = vm.createContext({});
+  vm.runInContext(
+    `${helperSection}\nglobalThis.__resolveDisposition = resolveActualRelevanceExecutionDisposition;`,
+    context,
+  );
+  const resolveDisposition = context.__resolveDisposition;
+
+  assert.equal(
+    resolveDisposition({
+      shouldSkip: true,
+      executionDisposition: "skip_full_capture",
+    }),
+    "skip_expensive",
+  );
+  assert.equal(
+    resolveDisposition({
+      shouldSkip: false,
+      executionDisposition: "skip_full_capture",
+    }),
+    "collect_full",
+  );
+  assert.equal(
+    resolveDisposition({executionDisposition: "defer_enhancement"}),
+    "defer_enhancement",
+  );
+  assert.equal(
+    resolveDisposition({executionDisposition: "collect_minimal_detail"}),
+    "collect_minimal_detail",
+  );
+  assert.match(
+    captureSyncSource,
+    /executionDisposition:\s*actualExecutionDisposition,[\s\S]*modelExecutionDisposition:\s*decision\.executionDisposition/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /executionDisposition:\s*actualDetailDisposition,[\s\S]*modelExecutionDisposition:\s*detailDisposition/u,
+  );
 });
 
 test("filtered records are terminal for pending, retry and sync-blocker logic including legacy records", () => {
@@ -172,6 +218,10 @@ test("filtered records are terminal for pending, retry and sync-blocker logic in
     true,
   );
   assert.equal(
+    isDone({type: "keyword_notes", payload: {detailCaptureStatus: "deferred"}}),
+    true,
+  );
+  assert.equal(
     isDone({
       type: "keyword_notes",
       payload: {
@@ -179,6 +229,20 @@ test("filtered records are terminal for pending, retry and sync-blocker logic in
       },
     }),
     true,
+  );
+  assert.equal(
+    isDone({
+      type: "keyword_notes",
+      payload: {
+        aiRelevancePrefilter: {
+          modelDecision: "skip",
+          modelExecutionDisposition: "skip_full_capture",
+          executionDisposition: "collect_full",
+        },
+      },
+    }),
+    false,
+    "a raw model skip is not a completed client action",
   );
   assert.equal(
     isDone({
@@ -230,6 +294,18 @@ test("record cards visibly explain AI filtering with keyword, confidence and rea
   assert.match(status.detail, /关键词「别克壁纸」/);
   assert.match(status.detail, /置信度 99%/);
   assert.match(status.detail, /内容主体为大众汽车/);
+  assert.equal(
+    context.__resolve({
+      detailCaptureStatus: "done",
+      aiRelevancePrefilter: {
+        modelDecision: "skip",
+        modelExecutionDisposition: "skip_full_capture",
+        executionDisposition: "collect_full",
+      },
+    }),
+    null,
+    "the card must not claim an enhancement skip that the client did not execute",
+  );
 
   const rowSection = readSourceSection(
     sidebarUi,
@@ -256,7 +332,7 @@ test("task progress explains AI prefilter start, completion and per-item skips",
   assert.match(actionCopySection, /phase === "detail_ai_prefilter_done"/);
   assert.match(actionCopySection, /AI 筛选完成/);
   assert.match(actionCopySection, /failedOpenCount/);
-  assert.match(actionCopySection, /超时或异常后继续采集/);
+  assert.match(actionCopySection, /超时或异常已抽样或延迟增强/);
   assert.match(actionCopySection, /phase === "detail_item_filtered"/);
   assert.match(actionCopySection, /AI 已跳过/);
 });

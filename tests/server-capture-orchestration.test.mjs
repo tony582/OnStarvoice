@@ -11,6 +11,23 @@ import {
   normalizeOrchestrationRequest,
   normalizeOrchestrationSchedule,
 } from '../server/services/capture-orchestration.js';
+import {enqueueDueCaptureOrchestrations} from '../server/services/capture-orchestration-scheduler.js';
+
+test('guarded schedule materialization rejects an empty or invalid target scope', async () => {
+  const tenantId = '11111111-1111-4111-8111-111111111111';
+  assert.deepEqual(
+    await enqueueDueCaptureOrchestrations({tenantId, scheduleIds: [], limit: 1}),
+    [{kind: 'invalid_schedule_scope'}],
+  );
+  assert.deepEqual(
+    await enqueueDueCaptureOrchestrations({
+      tenantId,
+      scheduleIds: ['not-a-uuid'],
+      limit: 1,
+    }),
+    [{kind: 'invalid_schedule_scope'}],
+  );
+});
 
 test('orchestration input keeps a validated cloud schedule without changing allocation order', () => {
   const normalized = normalizeOrchestrationRequest({
@@ -75,6 +92,173 @@ test('elastic distribution is explicit and unknown values stay backward-compatib
       .distributionMode,
     'fixed_batch',
   );
+
+  const unattendedElastic = normalizeOrchestrationRequest({
+    platform: 'xiaohongshu',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    keywords: ['别克'],
+    agents: [{id: 'agent-a'}],
+    schedule: {mode: 'daily', startTime: '05:30'},
+    resourcePolicy: {
+      maxActive: 2,
+      maxActivePerHost: 3,
+      capacityGroup: 'shared-5g',
+      maxActiveInGroup: 1,
+      maxDailySearchesPerAgent: 20,
+      relayAgentIds: ['11111111-1111-4111-8111-111111111111'],
+    },
+  });
+  assert.equal(
+    unattendedElastic.taskInput.recoveryPolicy.disableAutomaticSearchRetry,
+    true,
+  );
+  assert.equal(
+    unattendedElastic.taskInput.recoveryPolicy.singleRelayV1,
+    true,
+  );
+  assert.deepEqual(unattendedElastic.taskInput.resourcePolicy, {
+    maxActive: 2,
+    maxActivePerHost: 3,
+    maxActiveInGroup: 1,
+    capacityGroup: 'shared-5g',
+    maxDailySearchesPerAgent: 20,
+    relayAgentIds: ['11111111-1111-4111-8111-111111111111'],
+  });
+});
+
+test('resource admission policy rejects invalid or non-elastic schedules', () => {
+  assert.throws(
+    () => normalizeOrchestrationRequest({
+      platform: 'xiaohongshu',
+      executionMode: 'unattended_plan',
+      distributionMode: 'fixed_batch',
+      resourcePolicy: {maxActive: 1},
+    }),
+    error => error?.code === 'capture_resource_policy_requires_elastic_schedule',
+  );
+  assert.throws(
+    () => normalizeOrchestrationRequest({
+      platform: 'xiaohongshu',
+      executionMode: 'unattended_plan',
+      distributionMode: 'elastic_pool',
+      resourcePolicy: {maxActive: 'many'},
+    }),
+    error => error?.code === 'invalid_capture_resource_policy',
+  );
+  assert.throws(
+    () => normalizeOrchestrationRequest({
+      platform: 'xiaohongshu',
+      executionMode: 'unattended_plan',
+      distributionMode: 'elastic_pool',
+      resourcePolicy: {maxActiv: 1},
+    }),
+    error => error?.code === 'invalid_capture_resource_policy',
+  );
+  assert.throws(
+    () => normalizeOrchestrationRequest({
+      platform: 'xiaohongshu',
+      executionMode: 'unattended_plan',
+      distributionMode: 'elastic_pool',
+      resourcePolicy: {maxActiveInGroup: 1},
+    }),
+    error => error?.code === 'invalid_capture_resource_policy',
+  );
+});
+
+test('Douyin unattended elastic plans allow one focused search after comprehensive', () => {
+  const imageSupplement = normalizeOrchestrationRequest({
+    platform: 'douyin',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    searchPasses: ['all', 'image'],
+    keywords: ['别克壁纸'],
+    agents: [{id: 'agent-a'}],
+    schedule: {mode: 'daily', startTime: '06:30'},
+  });
+  assert.deepEqual(imageSupplement.taskInput.searchPasses, ['all', 'image']);
+  assert.equal(imageSupplement.taskInput.searchFilters.contentType, 'all');
+  assert.equal(imageSupplement.taskInput.recoveryPolicy.disableAutomaticSearchRetry, true);
+  assert.equal(imageSupplement.taskInput.recoveryPolicy.requireVerifiedFilters, true);
+
+  const videoSupplement = normalizeOrchestrationRequest({
+    platform: 'douyin',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    searchPasses: ['all', 'video'],
+    schedule: {mode: 'daily'},
+  });
+  assert.deepEqual(videoSupplement.taskInput.searchPasses, ['all', 'video']);
+
+  const incompatiblePair = normalizeOrchestrationRequest({
+    platform: 'douyin',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    searchPasses: ['image', 'video'],
+    searchFilters: {contentType: 'image'},
+    schedule: {mode: 'daily'},
+  });
+  assert.equal(Object.hasOwn(incompatiblePair.taskInput, 'searchPasses'), false);
+  assert.equal(incompatiblePair.taskInput.searchFilters.contentType, 'image');
+
+  for (const input of [
+    {
+      platform: 'xiaohongshu', executionMode: 'unattended_plan',
+      distributionMode: 'elastic_pool', searchPasses: ['all', 'image'],
+      schedule: {mode: 'daily'},
+    },
+    {
+      platform: 'douyin', executionMode: 'unattended_plan',
+      distributionMode: 'fixed_batch', searchPasses: ['all', 'image'],
+      schedule: {mode: 'daily'},
+    },
+    {
+      platform: 'douyin', executionMode: 'one_time',
+      distributionMode: 'elastic_pool', searchPasses: ['all', 'image'],
+    },
+  ]) {
+    const normalized = normalizeOrchestrationRequest(input);
+    assert.equal(Object.hasOwn(normalized.taskInput, 'searchPasses'), false);
+  }
+});
+
+test('fixed plans keep the legacy retry contract even when search retry is disabled', () => {
+  const fixed = normalizeOrchestrationRequest({
+    platform: 'xiaohongshu',
+    executionMode: 'unattended_plan',
+    distributionMode: 'fixed_batch',
+    recoveryPolicy: {disableAutomaticSearchRetry: true},
+    keywords: ['别克'],
+    agents: [{id: 'agent-a'}],
+    schedule: {mode: 'daily', startTime: '05:30'},
+  });
+  assert.equal(fixed.taskInput.recoveryPolicy.disableAutomaticSearchRetry, true);
+  assert.equal(
+    Object.hasOwn(fixed.taskInput.recoveryPolicy, 'singleRelayV1'),
+    false,
+  );
+});
+
+test('non-patrol search filters remain single-choice even when an API sends arrays', () => {
+  const normalized = normalizeOrchestrationRequest({
+    platform: 'douyin',
+    executionMode: 'unattended_plan',
+    distributionMode: 'elastic_pool',
+    searchPasses: ['all', 'video'],
+    searchFilters: {
+      publishTime: ['day', 'week'],
+      sort: ['latest', 'likes'],
+      searchScope: ['unviewed', 'viewed'],
+      videoDuration: ['under_1m', 'over_5m'],
+    },
+    schedule: {mode: 'daily'},
+  });
+
+  assert.equal(normalized.taskInput.searchFilters.publishTime, 'day');
+  assert.equal(normalized.taskInput.searchFilters.sort, 'latest');
+  assert.equal(normalized.taskInput.searchFilters.searchScope, 'unviewed');
+  assert.equal(normalized.taskInput.searchFilters.videoDuration, 'under_1m');
+  assert.deepEqual(normalized.taskInput.searchPasses, ['all', 'video']);
 });
 
 test('custom-date schedules reject malformed dates and normalize accepted dates', () => {
@@ -188,6 +372,27 @@ test('allocation omits empty Agent groups and never emits a no-op command group'
   assert.ok(allocation.groups.every(group => group.keywords.length === 1));
 });
 
+test('scheduled fixed-batch commands carry the exact durable item-attempt identities', async () => {
+  const scheduler = await readFile(
+    new URL(
+      '../server/services/capture-orchestration-scheduler.js',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  const fixedStart = scheduler.indexOf('const itemsByAgent = new Map()');
+  assert.ok(fixedStart >= 0);
+  const fixed = scheduler.slice(fixedStart);
+  assert.match(fixed, /const itemAttemptBindings = groupItems\.map/u);
+  assert.match(fixed, /attemptId: crypto\.randomUUID\(\)/u);
+  assert.match(fixed, /itemAttempts: itemAttemptBindings/u);
+  assert.ok(
+    fixed.indexOf('INSERT INTO capture_task_item_attempts') <
+      fixed.indexOf('INSERT INTO capture_agent_commands'),
+    'the scheduler must persist attempts before publishing a claimable command',
+  );
+});
+
 test('request hash ignores idempotency labels and object key order but detects allocation changes', () => {
   const first = {
     requestKey: 'retry-1',
@@ -244,7 +449,7 @@ test('checkpoint mapping is retry-aware and requires structured safety evidence'
       attemptCount: 1,
       errorCode: 'DOUYIN_SEARCH_SERVICE_ABNORMAL',
     }),
-    'retryable',
+    'completed',
   );
   assert.equal(
     checkpointEntryToItemStatus({
@@ -253,8 +458,28 @@ test('checkpoint mapping is retry-aware and requires structured safety evidence'
       errorCode: 'DOUYIN_SEARCH_SERVICE_ABNORMAL',
       requiresManualAction: true,
     }),
+    'completed',
+    'the exact service-abnormal rendering settles as an empty search result',
+  );
+  assert.equal(
+    checkpointEntryToItemStatus({
+      status: 'failed',
+      attemptCount: 1,
+      errorCode: 'SEARCH_FILTER_APPLICATION_FAILED',
+      requiresManualAction: true,
+    }),
     'retryable',
-    'legacy service-abnormal flags must be downgraded after the behavior change',
+    'filter setup is a technical retry and never an account safety freeze',
+  );
+  assert.equal(
+    checkpointEntryToItemStatus({
+      status: 'failed',
+      attemptCount: 1,
+      errorCode: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
+      requiresManualAction: true,
+    }),
+    'retryable',
+    'search readiness remains retryable on another distinct Agent',
   );
   assert.equal(
     checkpointEntryToItemStatus({
@@ -315,6 +540,23 @@ test('parent aggregate stays running during mixed progress and settles conservat
   assert.equal(stopped.terminal, true);
 });
 
+test('retryPending capacity wait remains pending instead of becoming a failure', () => {
+  const waiting = aggregateParentTaskItems([
+    {status: 'completed'},
+    {status: 'retryable', metadata: {retryPending: true}},
+  ]);
+  assert.equal(waiting.status, 'pending');
+  assert.equal(waiting.counts.retryable, 1);
+  assert.equal(waiting.counts.retryWaiting, 1);
+  assert.equal(waiting.terminal, false);
+
+  const unresolved = aggregateParentTaskItems([
+    {status: 'retryable', metadata: {retryPending: true}},
+    {status: 'retryable', metadata: {}},
+  ]);
+  assert.equal(unresolved.status, 'needs_action');
+});
+
 test('migration adds parent/item audit fields without pretending to implement a lease or fence', async () => {
   const migration = await readFile(
     new URL(
@@ -369,6 +611,24 @@ test('elastic work queue migration is additive and keeps old schedules fixed', a
   assert.doesNotMatch(migration, /DELETE FROM/u);
 });
 
+test('bootstrap pacing lookback stays tenant-scoped and index-backed', async () => {
+  const migration = await readFile(
+    new URL(
+      '../server/db/migrations/069_capture_bootstrap_pacing.sql',
+      import.meta.url,
+    ),
+    'utf8',
+  );
+  assert.match(
+    migration,
+    /capture_task_item_attempts \(tenant_id, updated_at DESC\)/u,
+  );
+  assert.match(
+    migration,
+    /WHERE status IN \('retryable', 'needs_action', 'failed'\)/u,
+  );
+});
+
 test('schedule overlap guard ignores its template but still detects active occurrences', async () => {
   const scheduler = await readFile(
     new URL(
@@ -409,6 +669,11 @@ test('elastic schedule occurrences materialize pending work without preassigning
   assert.match(scheduler, /capture_orchestration_schedule_agents/u);
   assert.match(scheduler, /eligibleAgentIds/u);
   assert.match(scheduler, /distributionMode === 'elastic_pool' \? 'pending' : 'assigned'/u);
+  assert.match(
+    scheduler,
+    /distributionMode === 'elastic_pool'[\s\S]*disableAutomaticSearchRetry: true/u,
+  );
+  assert.match(scheduler, /singleRelayV1: true/u);
   const elasticStart = scheduler.indexOf("if (distributionMode === 'elastic_pool')");
   const fixedDispatch = scheduler.indexOf('const itemsByAgent = new Map()', elasticStart);
   assert.ok(elasticStart >= 0);
@@ -416,6 +681,38 @@ test('elastic schedule occurrences materialize pending work without preassigning
   const elastic = scheduler.slice(elasticStart, fixedDispatch);
   assert.match(elastic, /orchestration_schedule_queue_created/u);
   assert.doesNotMatch(elastic, /INSERT INTO capture_agent_commands/u);
+});
+
+test('sequential patrol stays one keyword item and is executed inside one Agent task', async () => {
+  const [scheduler, route, agent] = await Promise.all([
+    readFile(new URL('../server/services/capture-orchestration-scheduler.js', import.meta.url), 'utf8'),
+    readFile(new URL('../server/routes/capture-cloud.js', import.meta.url), 'utf8'),
+    readFile(new URL('../utils/cloud-task-agent.js', import.meta.url), 'utf8'),
+  ]);
+
+  assert.match(scheduler, /const runItemTotal = templateItems\.length/u);
+  assert.match(scheduler, /sequentialSearch:[\s\S]*passes: searchPasses/u);
+  assert.match(scheduler, /searchPasses,[\s\S]*disableAutomaticSearchRetry: true/u);
+  assert.match(scheduler, /disableAutomaticSearchRetry: true/u);
+  assert.match(scheduler, /requireVerifiedFilters: true/u);
+  assert.match(scheduler, /remoteSequentialSearchPassesV1/u);
+  assert.doesNotMatch(scheduler, /dependsOnItemId/u);
+
+  const claimStart = route.indexOf('async function dispatchNextElasticWorkItem');
+  const claimEnd = route.indexOf('async function dispatchQueuedCommands', claimStart);
+  const claim = route.slice(claimStart, claimEnd);
+  assert.match(claim, /remoteSequentialSearchPassesV1 === true/u);
+  assert.match(claim, /parent\.metadata->'planSnapshot'->'searchPasses'/u);
+  assert.match(claim, /planSnapshot,[\s\S]*maxRounds: 1/u);
+  assert.doesNotMatch(claim, /dependsOnItemId/u);
+
+  const refreshStart = route.indexOf('async function refreshOrchestrationParentTask');
+  const refreshEnd = route.indexOf('async function projectNegativePatrolSnapshot', refreshStart);
+  const refresh = route.slice(refreshStart, refreshEnd);
+  assert.match(refresh, /status = 'needs_action'[\s\S]*status = 'retryable'[\s\S]*disableAutomaticSearchRetry/u);
+  assert.doesNotMatch(refresh, /staged_patrol_predecessor_not_safe/u);
+  assert.match(agent, /remoteSequentialSearchPassesV1: true/u);
+  assert.match(agent, /singleRelayV1: true/u);
 });
 
 test('terminal or attention-only schedule residue never blocks the next occurrence', async () => {

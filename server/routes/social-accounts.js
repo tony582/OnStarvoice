@@ -25,23 +25,9 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const AGENT_BINDING_MODES = new Set(['auto', 'manual']);
 const TASK_SAFETY_EVIDENCE_PATTERN = [
-  'captcha',
-  'security[ _-]+verification',
-  'login[ _-]+required',
-  'authentication[ _-]+required',
-  'auth[ _-]+required',
-  'platform[ _-]+safety[ _-]+block',
-  'risk[ _-]+control',
-  'douyin[ _-]+search[ _-]+security[ _-]+challenge',
-  'xhs[ _-]+security[ _-]+block',
+  '"(code|errorCode|error_code)"[[:space:]]*:[[:space:]]*"(XHS_SECURITY_BLOCK|DOUYIN_SEARCH_SECURITY_CHALLENGE|SECURITY_VERIFICATION_REQUIRED|PAGE_CHALLENGE_BLOCK|PLATFORM_SAFETY_BLOCK|HTTP_429|RATE_LIMITED|LOGIN_REQUIRED|AUTHENTICATION_REQUIRED)"',
   '"(platformSafetyBlocked|platform_safety_blocked|securityBlocked|security_blocked|loginRequired|login_required)"[[:space:]]*:[[:space:]]*true',
-  '验证码',
-  '安全验证',
-  '安全限制',
-  '访问频繁',
-  '访问受限',
-  '风控',
-  '登录失效',
+  '"(securityEvidence|safetyEvidence)"[[:space:]]*:[[:space:]]*\\{[^}]*"confirmed"[[:space:]]*:[[:space:]]*true',
 ].join('|');
 
 function text(value, limit = 1000) {
@@ -375,7 +361,6 @@ router.get(
             OR task.checkpoint::text ~* $2
             OR task.progress::text ~* $2
             OR task.metadata::text ~* $2
-            OR task.message ~* $2
           )
         GROUP BY COALESCE(task.assigned_agent_id, task.origin_agent_id)
       `, [req.tenantId, TASK_SAFETY_EVIDENCE_PATTERN]);

@@ -3,14 +3,18 @@ import test from 'node:test';
 
 import {
   formatMonitoringIntentForPrompt,
+  formatTenantMonitoringScopeForPrompt,
   listKnownMonitoringIntents,
   normalizeMonitoringKeyword,
   resolveMonitoringIntent,
+  resolveTenantMonitoringScope,
 } from '../server/services/monitoring-intent.js';
 import {
   RECORD_CLASSIFICATION_PROMPT_VERSION,
+  applyManualRelevanceOverride,
   buildSystemPrompt,
   buildUserMessage,
+  normalizeRecordClassificationResult,
 } from '../server/services/ai-labeler.js';
 
 const CUSTOMER_KEYWORDS = [
@@ -42,6 +46,14 @@ test('统一监测标准完整覆盖客户的 13 个关键词', () => {
   const expected = CUSTOMER_KEYWORDS.map(normalizeMonitoringKeyword);
   assert.deepEqual(new Set(actual), new Set(expected));
   assert.equal(actual.length, 13);
+
+  const scope = resolveTenantMonitoringScope(BRAND);
+  assert.deepEqual(new Set(scope.keywords.map(normalizeMonitoringKeyword)), new Set(expected));
+  assert.ok(scope.targetEntity.includes('安吉星'));
+  assert.ok(scope.targetEntity.includes('别克'));
+  assert.ok(scope.targetEntity.includes('凯迪拉克'));
+  assert.ok(scope.targetContent.includes('道路或紧急救援'));
+  assert.match(formatTenantMonitoringScopeForPrompt(scope), /全部监测关键词/);
 });
 
 test('关键词标准忽略空格和大小写，并要求对象与主题同时命中', () => {
@@ -69,24 +81,84 @@ test('至境哨兵不会扩展为所有至境车型舆情', () => {
   assert.match(standard, /目标对象：至境、别克至境/);
   assert.match(standard, /目标主题：哨兵模式、驻车监控/);
   assert.match(standard, /胎噪/);
-  assert.match(standard, /优先级高于宽泛品牌背景/);
+  assert.match(standard, /只用于判断 currentKeywordMatch/);
 });
 
-test('后台最终标注显式携带采集关键词并使用同一任务标准', () => {
-  assert.equal(RECORD_CLASSIFICATION_PROMPT_VERSION, 'record-topic-v2');
+test('后台最终标注以整体范围为准并保留当前关键词归属', () => {
+  assert.equal(RECORD_CLASSIFICATION_PROMPT_VERSION, 'record-topic-v4');
   const intent = resolveMonitoringIntent('凯迪拉克OTA');
   const prompt = buildSystemPrompt(BRAND, intent);
   const userMessage = buildUserMessage({
     keyword: '凯迪拉克OTA',
+    observed_keywords: ['凯迪拉克OTA', '安吉星'],
     title: '凯迪拉克碰撞测试',
     content: '只介绍碰撞表现，没有软件升级内容。',
+    comments_text: '评论只是讨论碰撞成绩。',
   });
 
-  assert.match(prompt, /必须同时核对“目标对象”和“目标主题”/);
+  assert.match(prompt, /租户整体监控范围/);
+  assert.match(prompt, /currentKeywordMatch/);
   assert.match(prompt, /与OTA或软件升级无关的凯迪拉克车辆问题/);
-  assert.match(prompt, /“凯迪拉克碰撞测试”在“凯迪拉克OTA”任务中 irrelevant/);
+  assert.match(prompt, /凯迪拉克CT5经常莫名拨打紧急救援电话/);
+  assert.match(prompt, /昂科威plus远程失败/);
+  assert.match(prompt, /安吉星，一生黑/);
   assert.match(prompt, /“安全感”“安全配置可靠”等正向表达不能据此生成风险或负面结论/);
-  assert.match(userMessage, /采集关键词（仅表示召回入口，不代表一定相关）：凯迪拉克OTA/);
+  assert.match(prompt, /评论区不属于主贴判断证据/);
+  assert.match(prompt, /不能反向把中性或正向主贴判为 negative/);
+  assert.match(userMessage, /当前记录关键词（仅表示最近召回入口）：凯迪拉克OTA/);
+  assert.match(userMessage, /全部召回关键词[\s\S]*安吉星/);
+  assert.doesNotMatch(userMessage, /评论只是讨论碰撞成绩/);
+  assert.doesNotMatch(userMessage, /评论上下文/);
+});
+
+test('整体无关不再伪装成中性，整体相关投诉保持负面', () => {
+  const irrelevant = normalizeRecordClassificationResult({
+    relevance: 'irrelevant',
+    currentKeywordMatch: 'irrelevant',
+    sentiment: 'negative',
+    category: 'brand_image',
+  });
+  assert.equal(irrelevant.sentiment, '');
+  assert.equal(irrelevant.sentimentStatus, 'not_applicable');
+  assert.equal(irrelevant.category, 'other');
+
+  const complaint = normalizeRecordClassificationResult({
+    relevance: 'relevant',
+    currentKeywordMatch: 'irrelevant',
+    matchedTopics: ['安吉星', '续费套餐', '官方客服体验'],
+    sentiment: 'negative',
+    sentimentStatus: 'classified',
+    intent: 'complaint',
+    category: 'renewal_billing',
+  });
+  assert.equal(complaint.relevance, 'relevant');
+  assert.equal(complaint.currentKeywordMatch, 'irrelevant');
+  assert.equal(complaint.sentiment, 'negative');
+  assert.equal(complaint.category, 'renewal_billing');
+});
+
+test('人工确认整体相关时先保护相关性，再保留模型识别出的负面情感', () => {
+  const protectedResult = normalizeRecordClassificationResult(
+    applyManualRelevanceOverride({
+      relevance: 'irrelevant',
+      currentKeywordMatch: 'irrelevant',
+      relevanceReason: '旧模型只按当前关键词判断',
+      sentiment: 'negative',
+      intent: 'complaint',
+      category: 'service_quality',
+    }, {
+      relevance: {
+        value: 'relevant',
+        reason: '人工确认属于上汽通用整体监测范围',
+      },
+    }),
+  );
+
+  assert.equal(protectedResult.relevance, 'relevant');
+  assert.equal(protectedResult.manualRelevanceOverride, true);
+  assert.equal(protectedResult.sentiment, 'negative');
+  assert.equal(protectedResult.sentimentStatus, 'classified');
+  assert.equal(protectedResult.category, 'service_quality');
 });
 
 test('未知关键词保留租户实体但不做宽泛品牌扩展', () => {

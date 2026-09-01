@@ -492,6 +492,7 @@ async function loadTenantPressure(tx, tenantId, kind) {
         FROM records
         WHERE tenant_id = $1
           AND record_type NOT IN ('official_content', 'blogger_profile')
+          AND business_visibility = 'eligible'
           AND ai_labeled_at IS NULL
           AND created_at >= now() - interval '24 hours') AS pending_records,
        (SELECT count(*)

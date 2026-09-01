@@ -189,7 +189,7 @@ test('mixed-platform profile patrol is rejected before any task is created', asy
   assert.equal(queried, false);
 });
 
-test('scheduled profile patrol treats attention tasks as idle and fails over without rebinding', async () => {
+test('scheduled profile patrol treats settled attention as idle but blocks interrupted execution', async () => {
   const {
     loadAvailableScheduledProfilePatrolAgent,
     profilePatrolTaskBlocksAgentSlot,
@@ -200,7 +200,7 @@ test('scheduled profile patrol treats attention tasks as idle and fails over wit
   assert.equal(profilePatrolTaskBlocksAgentSlot('waiting_device'), true);
   assert.equal(profilePatrolTaskBlocksAgentSlot('resume_requested'), true);
   assert.equal(profilePatrolTaskBlocksAgentSlot('needs_action'), false);
-  assert.equal(profilePatrolTaskBlocksAgentSlot('interrupted'), false);
+  assert.equal(profilePatrolTaskBlocksAgentSlot('interrupted'), true);
   assert.equal(profilePatrolTaskBlocksAgentSlot('failed'), false);
 
   const preferredAgentId = '10000000-0000-4000-8000-000000000001';
@@ -266,6 +266,70 @@ test('scheduled profile patrol treats attention tasks as idle and fails over wit
   false);
 });
 
+test('manual profile patrol shares the Agent execution-slot lock and rechecks blockers', async () => {
+  const {loadCompatibleProfilePatrolAgent} = await import(
+    `../server/services/profile-patrol-dispatch.js?slot=${Date.now()}`
+  );
+  const tenantId = '30000000-0000-4000-8000-000000000003';
+  const agentId = '20000000-0000-4000-8000-000000000002';
+  const blockerTaskId = '10000000-0000-4000-8000-000000000001';
+  const statements = [];
+  const tx = {
+    async execute(sql, params) {
+      statements.push({kind: 'execute', sql, params});
+      return {rowCount: 1};
+    },
+    async queryOne(sql, params) {
+      statements.push({kind: 'queryOne', sql, params});
+      if (sql.includes('FROM capture_agents ca')) {
+        return {
+          id: agentId,
+          tenant_status: 'active',
+          status: 'active',
+          auth_code_status: 'active',
+          auth_code_expires_at: null,
+          active_auth_binding_id:
+            '40000000-0000-4000-8000-000000000004',
+          allowed_platforms: ['douyin'],
+          capabilities: {
+            remoteTaskCreate: true,
+            remoteTargetedPostCaptureV1: true,
+            followedCreatorPostPatrol: true,
+            supportedPlatforms: ['douyin'],
+          },
+        };
+      }
+      if (sql.includes("SELECT blocker.kind")) {
+        return {
+          kind: 'task',
+          id: blockerTaskId,
+          task_id: blockerTaskId,
+          status: 'running',
+        };
+      }
+      throw new Error(`Unexpected queryOne: ${sql}`);
+    },
+  };
+
+  const result = await loadCompatibleProfilePatrolAgent(
+    tx,
+    tenantId,
+    agentId,
+    ['douyin'],
+    'creator',
+  );
+  assert.equal(result.failure.error, 'profile_scan_agent_busy');
+  assert.equal(result.failure.status, 409);
+  assert.equal(result.failure.details.blockerTaskId, blockerTaskId);
+  assert.match(statements[0].sql, /pg_advisory_xact_lock/u);
+  assert.ok(
+    statements.findIndex(statement =>
+      statement.sql.includes('pg_advisory_xact_lock')) <
+      statements.findIndex(statement =>
+        statement.sql.includes('FROM capture_agents ca')),
+  );
+});
+
 test('stale profile execution cleanup preserves live commands and online runners', async () => {
   const {reconcileStaleProfilePatrolExecutions} = await import(
     `../server/services/profile-patrol-dispatch.js?reconcile=${Date.now()}`
@@ -294,7 +358,8 @@ test('stale profile execution cleanup preserves live commands and online runners
   assert.equal(reconciled.length, 1);
   const cleanup = statements[0];
   assert.match(cleanup.sql, /active_command\.expires_at > now\(\)/u);
-  assert.match(cleanup.sql, /active_agent\.last_heartbeat_at >=/u);
+  assert.match(cleanup.sql, /active_agent\.last_liveness_at/u);
+  assert.match(cleanup.sql, /active_agent\.last_full_heartbeat_at/u);
   assert.match(cleanup.sql, /FOR UPDATE OF execution SKIP LOCKED/u);
   assert.equal(cleanup.params[0], 25);
   assert.equal(cleanup.params[1], 15);
@@ -304,6 +369,7 @@ test('stale profile execution cleanup preserves live commands and online runners
     'claimed',
     'running',
     'recovering',
+    'interrupted',
     'resume_requested',
   ]);
   assert.equal(statements.length, 1);

@@ -14,6 +14,9 @@ const VERSION_FIELDS = [
   'tags', 'image_urls', 'comments_text', 'video_url', 'audio_url', 'source_type',
   'publish_location', 'payload',
 ];
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/iu;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -30,6 +33,269 @@ function normalizeUrl(url) {
   } catch {
     return String(url).trim();
   }
+}
+
+const DOUYIN_CONTENT_ID_PATTERN = /^\d{8,}$/u;
+const XHS_CONTENT_ID_PATTERN = /^[A-Za-z0-9_-]{8,}$/u;
+const DOUYIN_IMAGE_NOTE_TYPES = new Set([
+  'image', 'images', 'image_text', 'image-text', 'image_note', 'image-note',
+  'picture', 'photo', 'note', '图文', '图片',
+]);
+const DOUYIN_VIDEO_NOTE_TYPES = new Set(['video', '视频']);
+
+function recordPayloadObject(payload) {
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'string') return {};
+  try {
+    const parsed = JSON.parse(payload);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeDouyinContentId(value) {
+  const normalized = String(value || '').trim();
+  return DOUYIN_CONTENT_ID_PATTERN.test(normalized) ? normalized : '';
+}
+
+function parseDouyinDirectContentUrl(value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(String(value).trim());
+    if (!/(^|\.)douyin\.com$/iu.test(parsed.hostname)) return null;
+    const matched = parsed.pathname.match(/^\/(video|note)\/(\d{8,})(?:\/|$)/iu);
+    if (!matched) return null;
+    return {
+      kind: matched[1].toLowerCase(),
+      id: matched[2],
+      url: `https://www.douyin.com/${matched[1].toLowerCase()}/${matched[2]}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function recordPayloadCandidates(payload) {
+  const parsed = recordPayloadObject(payload);
+  const firstItem = Array.isArray(parsed.items)
+    ? parsed.items.find(item => item && typeof item === 'object' && !Array.isArray(item)) || {}
+    : {};
+  const detailPayload = recordPayloadObject(parsed.detailPayload);
+  const itemDetailPayload = recordPayloadObject(firstItem.detailPayload);
+  return {parsed, firstItem, detailPayload, itemDetailPayload};
+}
+
+function douyinDirectUrlCandidates(record = {}) {
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
+  return [
+    record.canonical_url,
+    record.url,
+    parsed.detailCaptureNoteUrl,
+    parsed.noteUrl,
+    parsed.url,
+    detailPayload.noteUrl,
+    detailPayload.url,
+    firstItem.detailCaptureNoteUrl,
+    firstItem.noteUrl,
+    firstItem.url,
+    itemDetailPayload.noteUrl,
+    itemDetailPayload.url,
+  ].map(parseDouyinDirectContentUrl).filter(Boolean);
+}
+
+function douyinRecordContentId(record = {}, directCandidates = []) {
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
+  const values = [
+    record.external_id,
+    record.note_id,
+    record.noteId,
+    parsed.noteId,
+    parsed.awemeId,
+    detailPayload.noteId,
+    detailPayload.awemeId,
+    firstItem.noteId,
+    firstItem.awemeId,
+    itemDetailPayload.noteId,
+    itemDetailPayload.awemeId,
+    ...directCandidates.map(candidate => candidate.id),
+  ];
+  for (const value of values) {
+    const normalized = normalizeDouyinContentId(value);
+    if (normalized) return normalized;
+  }
+  for (const value of [record.url, record.canonical_url]) {
+    try {
+      const modalId = new URL(String(value || '')).searchParams.get('modal_id');
+      const normalized = normalizeDouyinContentId(modalId);
+      if (normalized) return normalized;
+    } catch {
+      // Not a URL; leave it untouched rather than guessing an identity.
+    }
+  }
+  return '';
+}
+
+function douyinRecordContentKind(record = {}) {
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
+  const values = [
+    record.note_type,
+    record.noteType,
+    parsed.noteType,
+    parsed.note_type,
+    detailPayload.noteType,
+    detailPayload.note_type,
+    firstItem.noteType,
+    firstItem.note_type,
+    itemDetailPayload.noteType,
+    itemDetailPayload.note_type,
+  ];
+  for (const value of values) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (DOUYIN_IMAGE_NOTE_TYPES.has(normalized)) return 'note';
+    if (DOUYIN_VIDEO_NOTE_TYPES.has(normalized)) return 'video';
+  }
+  return '';
+}
+
+/**
+ * Douyin search-modal URLs are browser navigation state, not durable work URLs.
+ * Resolve a direct /video/:id or /note/:id URL without mutating the capture
+ * payload, which remains the audit trail for navigation and detail recovery.
+ */
+export function resolveDouyinCanonicalRecordUrl(record = {}) {
+  const platform = String(record.platform || '').trim().toLowerCase();
+  const hasDouyinUrl = [record.url, record.canonical_url]
+    .some(value => /(^|\.)douyin\.com(?:\/|$)/iu.test(String(value || '').replace(/^https?:\/\//iu, '')));
+  if (platform !== 'douyin' && !hasDouyinUrl) return '';
+
+  const directCandidates = douyinDirectUrlCandidates(record);
+  const contentId = douyinRecordContentId(record, directCandidates);
+  const matchingDirect = directCandidates.find(candidate => !contentId || candidate.id === contentId);
+  if (matchingDirect) return matchingDirect.url;
+  if (!contentId) return '';
+
+  const kind = douyinRecordContentKind(record);
+  return kind ? `https://www.douyin.com/${kind}/${contentId}` : '';
+}
+
+function normalizeXhsContentId(value) {
+  const normalized = String(value || '').trim();
+  return XHS_CONTENT_ID_PATTERN.test(normalized) ? normalized : '';
+}
+
+function parseXhsDirectContentUrl(value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(String(value).trim());
+    if (
+      parsed.protocol !== 'https:'
+      || (parsed.port && parsed.port !== '443')
+      || parsed.username
+      || parsed.password
+      || !/(^|\.)xiaohongshu\.com$/iu.test(parsed.hostname)
+    ) return null;
+    const directMatch = parsed.pathname.match(
+      /^\/(?:explore|search_result|discovery\/item|note|video)\/([A-Za-z0-9_-]{8,})(?:\/|$)/iu,
+    );
+    const profileMatch = parsed.pathname.match(
+      /^\/user\/profile\/[A-Za-z0-9_-]{6,100}\/([A-Za-z0-9_-]{8,})(?:\/|$)/iu,
+    );
+    const id = directMatch?.[1] || profileMatch?.[1] || '';
+    if (!id) return null;
+    parsed.hash = '';
+    return {
+      id,
+      url: parsed.toString(),
+      canonicalUrl: `https://www.xiaohongshu.com/explore/${id}`,
+      hasToken: Boolean(String(parsed.searchParams.get('xsec_token') || '').trim()),
+      hasSource: Boolean(String(parsed.searchParams.get('xsec_source') || '').trim()),
+      path: parsed.pathname,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function xhsDirectUrlCandidates(record = {}) {
+  const {parsed, firstItem, detailPayload, itemDetailPayload} = recordPayloadCandidates(record.payload);
+  return [
+    record.url,
+    parsed.url,
+    parsed.noteUrl,
+    firstItem.url,
+    firstItem.noteUrl,
+    detailPayload.url,
+    detailPayload.noteUrl,
+    itemDetailPayload.url,
+    itemDetailPayload.noteUrl,
+    parsed.detailCaptureNoteUrl,
+    firstItem.detailCaptureNoteUrl,
+    record.canonical_url,
+  ].map(parseXhsDirectContentUrl).filter(Boolean);
+}
+
+function scoreXhsSourceUrl(candidate) {
+  if (!candidate?.hasToken) return -1;
+  let score = candidate.hasSource ? 20 : 0;
+  if (/^\/explore\//iu.test(candidate.path)) score += 50;
+  else if (/^\/discovery\/item\//iu.test(candidate.path)) score += 45;
+  else if (/^\/user\/profile\//iu.test(candidate.path)) score += 40;
+  else if (/^\/(?:note|video)\//iu.test(candidate.path)) score += 35;
+  else if (/^\/search_result\//iu.test(candidate.path)) score += 30;
+  return score;
+}
+
+/**
+ * Keep the best complete URL captured for the note, preferring the resolved
+ * /explore detail route. canonical_url remains the stable de-duplication key.
+ */
+export function resolveXhsSourceRecordUrl(record = {}) {
+  const platform = String(record.platform || '').trim().toLowerCase();
+  const candidates = xhsDirectUrlCandidates(record);
+  if (platform !== 'xiaohongshu' && candidates.length === 0) return '';
+
+  const externalId = normalizeXhsContentId(record.external_id).toLowerCase();
+  const matching = candidates
+    .map((candidate, index) => ({candidate, index, score: scoreXhsSourceUrl(candidate)}))
+    .filter(({candidate, score}) => (
+      score >= 0 && (!externalId || candidate.id.toLowerCase() === externalId)
+    ))
+    .sort((left, right) => right.score - left.score || left.index - right.index);
+  return matching[0]?.candidate.url || '';
+}
+
+/** Keep a stable /explore/:id identity separate from the captured navigation URL. */
+export function resolveXhsCanonicalRecordUrl(record = {}) {
+  const platform = String(record.platform || '').trim().toLowerCase();
+  const hasXhsUrl = [record.url, record.canonical_url]
+    .some(value => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(value || '').replace(/^https?:\/\//iu, '')));
+  if (platform !== 'xiaohongshu' && !hasXhsUrl) return '';
+
+  const candidates = xhsDirectUrlCandidates(record);
+  const externalId = normalizeXhsContentId(record.external_id);
+  const matching = candidates.find(candidate => !externalId || candidate.id === externalId);
+  if (matching) return matching.canonicalUrl;
+  return externalId ? `https://www.xiaohongshu.com/explore/${externalId}` : '';
+}
+
+export function normalizeCapturedRecordLinks(record = {}) {
+  const douyinCanonicalUrl = resolveDouyinCanonicalRecordUrl(record);
+  if (douyinCanonicalUrl) {
+    return {
+      ...record,
+      url: douyinCanonicalUrl,
+      canonical_url: douyinCanonicalUrl,
+    };
+  }
+
+  const xhsCanonicalUrl = resolveXhsCanonicalRecordUrl(record);
+  if (!xhsCanonicalUrl) return record;
+  return {
+    ...record,
+    url: resolveXhsSourceRecordUrl(record),
+    canonical_url: xhsCanonicalUrl,
+  };
 }
 
 function jsonText(value, fallback) {
@@ -324,6 +590,40 @@ function meaningful(value) {
   return true;
 }
 
+function parseObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function resolveRecordRelabelReason(existing = {}, incoming = {}, changedFields = []) {
+  const fields = new Set(Array.isArray(changedFields) ? changedFields : []);
+  const existingPayload = parseObject(existing.payload);
+  const incomingPayload = parseObject(incoming.payload);
+  if (
+    String(existingPayload.detailCaptureStatus || '') !== 'done'
+    && String(incomingPayload.detailCaptureStatus || '') === 'done'
+  ) return 'detail_completed';
+  if (fields.has('content') && meaningful(incoming.content)) return 'content_enriched';
+  if (fields.has('comments_text') && meaningful(incoming.comments_text)) return 'comments_enriched';
+
+  const aiResult = parseObject(existing.ai_result);
+  const previousRelevance = String(aiResult.relevance || '').trim().toLowerCase();
+  const previousKeyword = String(existing.keyword || '').trim().toLocaleLowerCase();
+  const incomingKeyword = String(incoming.keyword || '').trim().toLocaleLowerCase();
+  if (
+    ['irrelevant', 'uncertain'].includes(previousRelevance)
+    && incomingKeyword
+    && incomingKeyword !== previousKeyword
+  ) return 'new_keyword_context';
+  return '';
+}
+
 function compareValue(existingValue, nextValue) {
   if (!meaningful(nextValue)) return false;
   if (Array.isArray(existingValue) || typeof existingValue === 'object') {
@@ -358,22 +658,198 @@ function versionPayload(existing, fields) {
   return data;
 }
 
-async function insertObservation(tx, { tenantId, recordId, authCode, monitorExecutionId, record }) {
+async function loadCaptureObservationLineage(tx, {
+  tenantId,
+  captureTaskId,
+  captureAgentId,
+  captureAgentAuthCodeId,
+  captureAgentAuthBindingId,
+  captureTaskItemAttemptId,
+  captureTaskItemRequestHash,
+  recordId,
+  monitorExecutionId,
+  record,
+}) {
+  const normalizedTaskId = String(captureTaskId || '').trim().toLowerCase();
+  const normalizedAgentId = String(captureAgentId || '').trim().toLowerCase();
+  const normalizedAuthCodeId = String(captureAgentAuthCodeId || '').trim().toLowerCase();
+  const normalizedAuthBindingId = String(captureAgentAuthBindingId || '').trim().toLowerCase();
+  const normalizedItemAttemptId = String(
+    captureTaskItemAttemptId || '',
+  ).trim().toLowerCase();
+  const normalizedItemRequestHash = String(
+    captureTaskItemRequestHash || '',
+  ).trim().toLowerCase();
+  if (
+    !UUID_PATTERN.test(normalizedTaskId) ||
+    !UUID_PATTERN.test(normalizedAgentId) ||
+    !UUID_PATTERN.test(normalizedAuthCodeId) ||
+    !UUID_PATTERN.test(normalizedAuthBindingId)
+  ) {
+    return null;
+  }
+  return tx.queryOne(`
+    WITH exact_task AS (
+      SELECT task.*
+      FROM capture_tasks task
+      JOIN capture_agents agent
+        ON agent.id = $7::uuid
+        AND agent.tenant_id = task.tenant_id
+        AND agent.status = 'active'
+        AND agent.auth_code_id = $8::uuid
+        AND agent.auth_binding_id = $9::uuid
+      JOIN tenants tenant
+        ON tenant.id = task.tenant_id AND tenant.status = 'active'
+      JOIN auth_codes auth_code
+        ON auth_code.id = agent.auth_code_id
+        AND auth_code.tenant_id = task.tenant_id
+        AND auth_code.status = 'active'
+        AND (auth_code.expires_at IS NULL OR auth_code.expires_at >= now())
+      JOIN auth_bindings binding
+        ON binding.id = agent.auth_binding_id
+        AND binding.code_id = auth_code.id
+      WHERE task.id = $1::uuid
+        AND task.tenant_id = $2
+        AND COALESCE(task.assigned_agent_id, task.origin_agent_id) = agent.id
+    ), matched_items AS (
+      SELECT candidate.id
+      FROM capture_task_items candidate
+      JOIN exact_task task ON true
+      WHERE candidate.tenant_id = task.tenant_id
+        AND candidate.task_id = COALESCE(task.parent_task_id, task.id)
+        AND candidate.execution_task_id = task.id
+        AND candidate.assigned_agent_id = $7::uuid
+        AND (
+          (BTRIM(candidate.keyword) <> '' AND candidate.keyword = $4)
+          OR candidate.record_id = $3::uuid
+          OR (BTRIM(candidate.external_id) <> '' AND candidate.external_id = $5)
+          OR (
+            $6::uuid IS NOT NULL
+            AND candidate.metadata->>'monitorExecutionId' = $6::uuid::text
+          )
+        )
+    ), exact_item AS (
+      SELECT (array_agg(id ORDER BY id))[1] AS id
+      FROM matched_items
+      HAVING COUNT(*) = 1
+    ), exact_attempt AS (
+      SELECT (array_agg(attempt.id ORDER BY attempt.id))[1] AS id
+      FROM capture_task_item_attempts attempt
+      JOIN exact_task task ON true
+      JOIN exact_item item ON true
+      JOIN capture_task_items current_item
+        ON current_item.id = item.id
+        AND current_item.tenant_id = task.tenant_id
+      WHERE attempt.tenant_id = task.tenant_id
+        AND attempt.item_id = item.id
+        AND attempt.parent_task_id = current_item.task_id
+        AND attempt.execution_task_id = task.id
+        AND attempt.agent_id = $7::uuid
+        AND attempt.assignment_revision = current_item.assignment_revision
+        AND attempt.attempt_number = current_item.attempt_count
+        AND (
+          task.metadata->>'dutyRecovery' IS DISTINCT FROM 'true'
+          OR (
+            attempt.id = $10::uuid
+            AND attempt.request_hash = $11
+            AND current_item.request_hash = $11
+            AND task.metadata->>'remoteRequestHash' = $11
+          )
+        )
+      HAVING COUNT(*) = 1
+    )
+    SELECT task.id AS capture_task_id,
+      item.id AS capture_task_item_id,
+      attempt.id AS capture_task_item_attempt_id
+    FROM exact_task task
+    JOIN exact_item item ON true
+    JOIN exact_attempt attempt ON true
+    WHERE task.metadata->>'dutyRecovery' IS DISTINCT FROM 'true'
+      OR EXISTS (
+        SELECT 1
+        FROM capture_recovery_intents intent
+        WHERE intent.tenant_id = task.tenant_id
+          AND intent.recovery_task_id = task.id
+          AND intent.item_id = item.id
+          AND intent.dispatched_attempt_id = attempt.id
+          AND intent.recovery_agent_id = $7::uuid
+          AND intent.status = 'verifying_collection'
+          AND intent.resolved_at IS NULL
+          AND task.metadata->>'dutyRecoveryIntentId' = intent.id::text
+          AND task.metadata->>'dutyRecoveryGeneration' = intent.generation::text
+          AND task.metadata->>'dutyRecoverySourceItemId' = item.id::text
+      )
+  `, [
+    normalizedTaskId,
+    tenantId,
+    recordId,
+    record.keyword || '',
+    record.external_id || '',
+    UUID_PATTERN.test(String(monitorExecutionId || '').trim())
+      ? monitorExecutionId
+      : null,
+    normalizedAgentId,
+    normalizedAuthCodeId,
+    normalizedAuthBindingId,
+    UUID_PATTERN.test(normalizedItemAttemptId)
+      ? normalizedItemAttemptId
+      : null,
+    SHA256_PATTERN.test(normalizedItemRequestHash)
+      ? normalizedItemRequestHash
+      : '',
+  ]);
+}
+
+async function insertObservation(tx, {
+  tenantId,
+  recordId,
+  authCode,
+  monitorExecutionId,
+  captureTaskId,
+  captureAgentId,
+  captureAgentAuthCodeId,
+  captureAgentAuthBindingId,
+  captureTaskItemAttemptId,
+  captureTaskItemRequestHash,
+  commentWorkflowExpectedCount = 0,
+  record,
+}) {
+  const lineage = await loadCaptureObservationLineage(tx, {
+    tenantId,
+    captureTaskId,
+    captureAgentId,
+    captureAgentAuthCodeId,
+    captureAgentAuthBindingId,
+    captureTaskItemAttemptId,
+    captureTaskItemRequestHash,
+    recordId,
+    monitorExecutionId,
+    record,
+  });
   const result = await tx.queryOne(`
     INSERT INTO record_observations (
       tenant_id, record_id, monitor_execution_id, source_auth_code,
+      capture_task_id, capture_task_item_id, capture_task_item_attempt_id,
+      comment_workflow_status, comment_workflow_expected_count,
       platform, keyword, rank_position,
       likes, comments_count, collects, shares,
       captured_at, payload
     ) VALUES (
       $1, $2, $3, $4,
       $5, $6, $7,
-      $8, $9, $10, $11,
-      now(), $12::jsonb
+      CASE WHEN $8::integer > 0 THEN 'queued' ELSE 'not_required' END,
+      $8::integer,
+      $9, $10, $11,
+      $12, $13, $14, $15,
+      now(), $16::jsonb
     )
     RETURNING id
   `, [
     tenantId, recordId, monitorExecutionId || null, authCode || '',
+    lineage?.capture_task_id || null,
+    lineage?.capture_task_item_id || null,
+    lineage?.capture_task_item_attempt_id || null,
+    Math.max(0, Number(commentWorkflowExpectedCount) || 0),
     record.platform || 'unknown', record.keyword || '', record.rank_position || null,
     cleanNumber(record.likes), cleanNumber(record.comments_count), cleanNumber(record.collects), cleanNumber(record.shares),
     jsonText(record.payload, '{}'),
@@ -447,12 +923,60 @@ export function mergeObservationMetrics(record = {}, existing = {}) {
   return merged;
 }
 
+export function resolveRecordBusinessVisibility(record = {}, existing = {}) {
+  let payload = record?.payload;
+  if (typeof payload === 'string') {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      payload = {};
+    }
+  }
+  const safePayload = payload && typeof payload === 'object' ? payload : {};
+  const audit = safePayload.aiRelevancePrefilter
+    && typeof safePayload.aiRelevancePrefilter === 'object'
+    ? safePayload.aiRelevancePrefilter
+    : {};
+  const detailStatus = String(safePayload.detailCaptureStatus || '').trim().toLowerCase();
+  const disposition = String(
+    audit.executionDisposition || audit.modelExecutionDisposition || '',
+  ).trim().toLowerCase();
+  if (
+    detailStatus === 'filtered'
+    || disposition === 'skip_expensive'
+    || disposition === 'skip_full_capture'
+  ) return 'filtered_out';
+  if (detailStatus === 'deferred' || disposition === 'defer_enhancement') {
+    return 'deferred';
+  }
+  if (
+    detailStatus === 'done'
+    || disposition === 'collect_full'
+    || disposition === 'collect_minimal_detail'
+  ) return 'eligible';
+  const previous = String(existing?.business_visibility || '').trim().toLowerCase();
+  return ['eligible', 'filtered_out', 'deferred'].includes(previous)
+    ? previous
+    : 'eligible';
+}
+
 export async function upsertCapturedRecord(record, context) {
+  record = normalizeCapturedRecordLinks(record);
   const tenantId = context.tenantId;
   const authCode = context.authCode || '';
   const monitorExecutionId = context.monitorExecutionId || null;
   const localizeMedia = context.localizeMedia !== false;
-  const canonicalUrl = normalizeUrl(record.url);
+  const captureTaskId = context.captureTaskId || null;
+  const captureAgentId = context.captureAgentId || null;
+  const captureAgentAuthCodeId = context.captureAgentAuthCodeId || null;
+  const captureAgentAuthBindingId = context.captureAgentAuthBindingId || null;
+  const captureTaskItemAttemptId = context.captureTaskItemAttemptId || null;
+  const captureTaskItemRequestHash = context.captureTaskItemRequestHash || null;
+  const commentWorkflowExpectedCount = Math.max(
+    0,
+    Number(context.commentWorkflowExpectedCount) || 0,
+  );
+  const canonicalUrl = normalizeUrl(record.canonical_url || record.url);
   const contentHash = buildContentHash(record, canonicalUrl);
   const tags = jsonText(record.tags, '[]');
   const imageUrls = jsonText(record.image_urls, '[]');
@@ -487,9 +1011,15 @@ export async function upsertCapturedRecord(record, context) {
     record = guardRecordCommentCount(record, existing || {});
     record = guardRecordTextCompleteness(record, existing || {});
     payload = jsonText(record.payload, '{}');
+    const businessVisibility = resolveRecordBusinessVisibility(record, existing || {});
 
     if (existing) {
       const changedFields = detectChangedFields(existing, { ...record, tags, image_urls: imageUrls, payload });
+      const relabelReason = resolveRecordRelabelReason(
+        existing,
+        { ...record, tags, image_urls: imageUrls, payload },
+        changedFields,
+      );
 
       await tx.execute(`
         UPDATE records SET
@@ -534,6 +1064,11 @@ export async function upsertCapturedRecord(record, context) {
           auth_code = COALESCE(NULLIF($32, ''), auth_code),
           author_account_no = COALESCE(NULLIF($34, ''), author_account_no),
           publish_location = COALESCE(NULLIF($35, ''), publish_location),
+          business_visibility = $36,
+          relevance_disposition_updated_at = CASE
+            WHEN business_visibility IS DISTINCT FROM $36 THEN now()
+            ELSE relevance_disposition_updated_at
+          END,
           last_seen_at = now(),
           seen_count = seen_count + 1,
           updated_at = now()
@@ -558,6 +1093,7 @@ export async function upsertCapturedRecord(record, context) {
         existing.id,
         record.author_account_no || '', // $34:人看的号(空不覆盖,见 COALESCE NULLIF)
         record.publish_location || '',
+        businessVisibility,
       ]);
 
       await appendOfficialContentAudit(tx, {
@@ -574,6 +1110,13 @@ export async function upsertCapturedRecord(record, context) {
         recordId: existing.id,
         authCode,
         monitorExecutionId,
+        captureTaskId,
+        captureAgentId,
+        captureAgentAuthCodeId,
+        captureAgentAuthBindingId,
+        captureTaskItemAttemptId,
+        captureTaskItemRequestHash,
+        commentWorkflowExpectedCount,
         record: mergeObservationMetrics({...record, payload}, existing),
       });
 
@@ -593,7 +1136,11 @@ export async function upsertCapturedRecord(record, context) {
       return {
         id: existing.id,
         action: 'updated',
+        businessVisibility,
         observationId,
+        shouldRelabel: Boolean(relabelReason),
+        relabelReason,
+        changedFields,
         officialContent: officialResolution.officialContent,
         officialContentSource: officialResolution.source,
       };
@@ -612,7 +1159,7 @@ export async function upsertCapturedRecord(record, context) {
         comments_capture_status, comments_total_captured,
         capture_timestamp,
         keyword, source_type, payload, auth_code, content_hash, author_account_no,
-        publish_location
+        publish_location, business_visibility, relevance_disposition_updated_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6,
         $7, $8, $9, $10,
@@ -625,7 +1172,8 @@ export async function upsertCapturedRecord(record, context) {
         $29, $30,
         $31,
         $32, $33, $34::jsonb, $35, $36, $37,
-        $38
+        $38, $39,
+        CASE WHEN $39 = 'eligible' THEN NULL ELSE now() END
       )
       RETURNING id
     `, [
@@ -643,9 +1191,23 @@ export async function upsertCapturedRecord(record, context) {
       record.keyword || '', record.source_type || '', payload, authCode, contentHash,
       record.author_account_no || '', // $37:人看的号
       record.publish_location || '',
+      businessVisibility,
     ]);
 
-    const observationId = await insertObservation(tx, { tenantId, recordId: inserted.id, authCode, monitorExecutionId, record: { ...record, payload } });
+    const observationId = await insertObservation(tx, {
+      tenantId,
+      recordId: inserted.id,
+      authCode,
+      monitorExecutionId,
+      captureTaskId,
+      captureAgentId,
+      captureAgentAuthCodeId,
+      captureAgentAuthBindingId,
+      captureTaskItemAttemptId,
+      captureTaskItemRequestHash,
+      commentWorkflowExpectedCount,
+      record: {...record, payload},
+    });
     await appendOfficialContentAudit(tx, {
       tenantId,
       recordId: inserted.id,
@@ -657,17 +1219,16 @@ export async function upsertCapturedRecord(record, context) {
     return {
       id: inserted.id,
       action: 'inserted',
+      businessVisibility,
       observationId,
       officialContent: officialResolution.officialContent,
       officialContentSource: officialResolution.source,
     };
   });
   // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
-  if (localizeMedia && record.cover_url) {
-    queueCoverLocalization(__result.id, record.cover_url, record.platform);
-  }
-  if (localizeMedia && imageUrls !== '[]') {
-    queueRecordImagesLocalization(__result.id, imageUrls, record.platform);
+  if (localizeMedia && __result.businessVisibility === 'eligible') {
+    if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);
+    if (imageUrls !== '[]') queueRecordImagesLocalization(__result.id, imageUrls, record.platform);
   }
   return __result;
 }

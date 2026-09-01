@@ -15,6 +15,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import { InfoHint } from '@/components/shared/InfoHint'
 import { NegativePatrolOverview } from '@/pages/insights/NegativePatrolTab'
 
@@ -1067,9 +1068,12 @@ function AiInsightPanel({ month }: { month: string }) {
         {list.map((id: string, i: number) => {
           const m = map[id] || {}
           const label = String(m.title || id).slice(0, 14)
-          return m.url
-            ? <a key={i} href={m.url} target="_blank" rel="noreferrer" className="rounded bg-muted px-1.5 py-0.5 text-[10.5px] text-primary hover:underline">{label}</a>
-            : <span key={i} className="rounded bg-muted px-1.5 py-0.5 text-[10.5px] text-muted-foreground">{label}</span>
+          return (
+            <span key={i} className="inline-flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10.5px] text-muted-foreground">
+              <span>{label}</span>
+              <RecordSourceAction record={{ id, ...m }} compact className="text-[10.5px]" />
+            </span>
+          )
         })}
       </span>
     )

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  DEFAULT_AI_CAPTURE_CONCURRENCY,
   DEFAULT_AI_QUEUE_TIMEOUT_MS,
   DEFAULT_AI_TENANT_CONCURRENCY,
   TenantAiAdmissionController,
@@ -23,12 +24,20 @@ async function nextTurn() {
 
 test('tenant AI admission has one shared six-request ceiling by default', () => {
   assert.equal(DEFAULT_AI_TENANT_CONCURRENCY, 6);
+  assert.equal(DEFAULT_AI_CAPTURE_CONCURRENCY, 4);
   assert.equal(DEFAULT_AI_QUEUE_TIMEOUT_MS, 120000);
   const controller = new TenantAiAdmissionController();
   assert.deepEqual(controller.snapshot('tenant-a'), {
     tenantId: 'tenant-a',
     limit: 6,
+    captureLimit: 4,
     active: 0,
+    activeByPriority: {
+      capture: 0,
+      interactive: 0,
+      normal: 0,
+      background: 0,
+    },
     queued: 0,
     queuedByPriority: {
       capture: 0,
@@ -40,7 +49,7 @@ test('tenant AI admission has one shared six-request ceiling by default', () => 
   });
 });
 
-test('capture requests pass queued background work without exceeding the limit', async () => {
+test('final classification passes queued capture work without exceeding the limit', async () => {
   const controller = new TenantAiAdmissionController({concurrency: 1});
   const blocker = deferred();
   const order = [];
@@ -62,7 +71,7 @@ test('capture requests pass queued background work without exceeding the limit',
 
   blocker.resolve();
   await Promise.all([first, normal, capture]);
-  assert.deepEqual(order, ['active-background', 'capture', 'normal']);
+  assert.deepEqual(order, ['active-background', 'normal', 'capture']);
   assert.equal(controller.snapshot('tenant-a').active, 0);
 });
 
@@ -112,7 +121,46 @@ test('timed-out waiters leave no queue residue or active-slot leak', async () =>
   );
   assert.equal(controller.snapshot('tenant-a').active, 1);
   assert.equal(controller.snapshot('tenant-a').queued, 0);
-  controller.release(admission.tenantId);
+  controller.release(admission);
+  assert.equal(controller.snapshot('tenant-a').active, 0);
+});
+
+test('capture work leaves two tenant slots available for final classification', async () => {
+  const controller = new TenantAiAdmissionController({
+    concurrency: 6,
+    captureConcurrency: 4,
+  });
+  const captureGate = deferred();
+  const captures = Array.from({length: 6}, (_, index) => controller.run(
+    'tenant-a',
+    async () => {
+      await captureGate.promise;
+      return index;
+    },
+    {priority: 'capture', kind: 'relevance_prefilter'},
+  ));
+  await nextTurn();
+  assert.equal(controller.snapshot('tenant-a').active, 4);
+  assert.equal(controller.snapshot('tenant-a').queued, 2);
+
+  const finalGate = deferred();
+  const finals = Array.from({length: 2}, () => controller.run(
+    'tenant-a',
+    async () => finalGate.promise,
+    {priority: 'normal', kind: 'record_classification'},
+  ));
+  await nextTurn();
+  assert.equal(controller.snapshot('tenant-a').active, 6);
+  assert.deepEqual(controller.snapshot('tenant-a').activeByPriority, {
+    capture: 4,
+    interactive: 0,
+    normal: 2,
+    background: 0,
+  });
+
+  finalGate.resolve();
+  captureGate.resolve();
+  await Promise.all([...captures, ...finals]);
   assert.equal(controller.snapshot('tenant-a').active, 0);
 });
 

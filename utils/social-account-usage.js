@@ -58,23 +58,36 @@
     );
   }
 
-  const SAFETY_EVIDENCE_PATTERN =
-    /captcha|security.?verification|verification.?required|page.?challenge|security.?challenge|platform.?safety|safety.?block|risk.?control|forbidden|login.?required|auth(?:entication)?.?required|logged.?out|验证码|安全验证|安全限制|访问频繁|访问受限|风控|登录失效|请(?:先|重新)?登录|账号异常|账号限制/iu;
+  const SAFETY_EVIDENCE_CODES = new Set([
+    "XHS_SECURITY_BLOCK",
+    "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+    "SECURITY_VERIFICATION_REQUIRED",
+    "PAGE_CHALLENGE_BLOCK",
+    "PLATFORM_SAFETY_BLOCK",
+    "HTTP_429",
+    "RATE_LIMITED",
+    "LOGIN_REQUIRED",
+    "AUTHENTICATION_REQUIRED",
+  ]);
+  const SAFETY_EVIDENCE_CATEGORIES = new Set([
+    "platform_safety_block",
+    "login_required",
+    "authentication_required",
+  ]);
 
   function containsSafetyEvidence(value, depth = 0) {
     if (depth > 4 || value == null) return false;
-    if (typeof value === "string") return SAFETY_EVIDENCE_PATTERN.test(value);
-    if (typeof value === "boolean" || typeof value === "number") return false;
+    if (typeof value !== "object") return false;
     if (Array.isArray(value)) {
       return value.slice(0, 30).some(item => containsSafetyEvidence(item, depth + 1));
     }
-    if (typeof value !== "object") return false;
+    const code = text(value.code || value.errorCode, 120).toUpperCase();
+    const category = text(value.category || value.errorCategory, 120)
+      .toLowerCase();
     if (
-      [value.code, value.category, value.message, value.reason]
-        .some(candidate =>
-          typeof candidate === "string" &&
-          SAFETY_EVIDENCE_PATTERN.test(candidate),
-        )
+      SAFETY_EVIDENCE_CODES.has(code) ||
+      SAFETY_EVIDENCE_CATEGORIES.has(category) ||
+      value.securityEvidence?.confirmed === true
     ) {
       return true;
     }
@@ -87,6 +100,24 @@
       }
       return containsSafetyEvidence(nested, depth + 1);
     });
+  }
+
+  function confirmedSafetyEvidence(...values) {
+    const candidates = values.flatMap((value) => [
+      value?.securityEvidence,
+      value?.error?.securityEvidence,
+      value?.diagnostics?.securityEvidence,
+    ]);
+    const source = candidates.find((value) => value?.confirmed === true);
+    if (!source) return null;
+    return {
+      confirmed: true,
+      platform: text(source.platform, 40),
+      variant: text(source.variant, 100),
+      language: text(source.language, 40),
+      reason: text(source.reason, 100),
+      pageUrl: text(source.pageUrl || source.page_url, 2000),
+    };
   }
 
   function buildUsageEventFromRelay({
@@ -115,6 +146,7 @@
     const capturedItems = capturedItemCount(normalizedAction, response);
     const safetyVerification =
       containsSafetyEvidence(error) || containsSafetyEvidence(response);
+    const safetyEvidence = confirmedSafetyEvidence(error, response);
     const account = objectValue(observedAccount);
     return {
       eventId: createEventId(),
@@ -147,6 +179,7 @@
             response?.diagnostics?.errorCode,
           120,
         ),
+        ...(safetyEvidence ? {safetyEvidence} : {}),
       },
     };
   }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import {
   Activity, AlertOctagon, Inbox, Loader2, ShieldAlert, ArrowRight,
-  Radio, Heart, MessageCircle, MessageSquare,
+  Radio, Heart, MessageCircle, MessageSquare, MoonStar, RefreshCw,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { compact, formatNumber, formatDate, platformName, cn } from '@/lib/utils'
@@ -21,17 +21,94 @@ interface OverviewData {
   pendingRecords: any[]
 }
 
+interface OpsControlSummary {
+  kind: string
+  mode: 'observe' | 'guarded'
+  observeOnly: boolean
+  llmUsed: boolean
+  runtimeBaselineVersion: string
+  policy: {
+    enabled: boolean
+    globalEnabled: boolean
+    tenantEnabled: boolean
+    actionsGlobalEnabled: boolean
+    actionsEnabled: boolean
+    actionAllowlist: string[]
+    windowStart: string
+    windowEnd: string
+  }
+  run?: {
+    id: string
+    service_date: string
+    lifecycle_status: 'observing' | 'progressing' | 'recovering' | 'settled'
+    verdict: 'pending' | 'healthy' | 'degraded' | 'blocked_manual' | 'incident'
+    snapshot_count: number
+    summary?: {
+      headline?: string
+      observedScheduleCount?: number
+      expectedScheduleCount?: number
+      taskCount?: number
+      activeTaskCount?: number
+      recoveredItemCount?: number
+      sourceClosureBlockedCount?: number
+      manualBlockerCount?: number
+      onlineAgentCount?: number
+      registeredAgentCount?: number
+      actions?: {
+        total?: number
+        pendingVerification?: number
+        verified?: number
+        failed?: number
+        blocked?: number
+      }
+    }
+    last_snapshot_at?: string
+  } | null
+  digest?: { summary?: string; delivery_status?: string } | null
+  incidents?: Array<{
+    id: string
+    type?: string
+    incident_type?: string
+    severity: string
+    title: string
+    message: string
+    alert_delivery_status?: string
+    alert_sent_at?: string
+  }>
+  actions?: Array<{ id: string; action_type: string; status: string; target_id: string }>
+}
+
 export function OverviewPage() {
   const { navigate } = useNav()
   const { badges } = useBadges()
   const { canWrite } = useAuth()
   const [data, setData] = useState<OverviewData | null>(null)
+  const [ops, setOps] = useState<OpsControlSummary | null>(null)
+  const [opsBusy, setOpsBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [drawer, setDrawer] = useState<any>(null)
 
   useEffect(() => {
-    api.get<OverviewData>('/workspace/overview?days=7').then(setData).catch(console.error).finally(() => setLoading(false))
+    Promise.all([
+      api.get<OverviewData>('/workspace/overview?days=7'),
+      api.get<OpsControlSummary>('/ops-control/summary').catch(() => null),
+    ]).then(([overview, opsSummary]) => {
+      setData(overview)
+      setOps(opsSummary)
+    }).catch(console.error).finally(() => setLoading(false))
   }, [])
+
+  const observeNow = async () => {
+    setOpsBusy(true)
+    try {
+      await api.post('/ops-control/observe-now', {})
+      setOps(await api.get<OpsControlSummary>('/ops-control/summary'))
+    } catch (error) {
+      console.error(error)
+    } finally {
+      setOpsBusy(false)
+    }
+  }
 
   if (loading) {
     return <div className="flex items-center justify-center py-24"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
@@ -59,6 +136,14 @@ export function OverviewPage() {
           评论风险提醒 · {commentRiskAttentionEnabled ? '已开启' : '已关闭'}
         </span>
       </div>
+
+      <OpsControlCard
+        data={ops}
+        busy={opsBusy}
+        canObserve={canWrite()}
+        onObserve={observeNow}
+        onOpenDispatch={() => navigate('dispatch')}
+      />
 
       {/* Numbers 行 */}
       <div className={cn('grid grid-cols-1 gap-3 min-[360px]:grid-cols-2', commentRiskAttentionEnabled ? 'lg:grid-cols-3 xl:grid-cols-5' : 'lg:grid-cols-4')}>
@@ -148,6 +233,132 @@ export function OverviewPage() {
       {drawer && (
         <RecordDrawer record={drawer} onClose={() => setDrawer(null)} canWrite={canWrite()} />
       )}
+    </div>
+  )
+}
+
+const OPS_VERDICT = {
+  pending: { label: '观察中', tone: 'neutral', accent: 'border-l-status-blue' },
+  healthy: { label: '无需处理', tone: 'positive', accent: 'border-l-status-green' },
+  degraded: { label: '部分异常', tone: 'medium', accent: 'border-l-status-orange' },
+  blocked_manual: { label: '需要人工', tone: 'medium', accent: 'border-l-status-orange' },
+  incident: { label: '系统异常', tone: 'negative', accent: 'border-l-status-red' },
+} as const
+
+function OpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
+  data: OpsControlSummary | null
+  busy: boolean
+  canObserve: boolean
+  onObserve: () => void
+  onOpenDispatch: () => void
+}) {
+  const enabled = data?.policy?.enabled === true
+  const run = data?.run || null
+  const verdict = run?.verdict || 'pending'
+  const style = OPS_VERDICT[verdict]
+  const summary = run?.summary || {}
+  const actionSummary = summary.actions || {}
+  const sourceClosureBlockedCount = Number(summary.sourceClosureBlockedCount || 0)
+  const explicitManualBlockerCount = Number(summary.manualBlockerCount || 0)
+  const guarded = data?.mode === 'guarded'
+  const actionsEnabled = data?.policy?.actionsEnabled === true
+  const disabledReason = data?.policy?.globalEnabled === false
+    ? '服务端全局 kill switch 已关闭'
+    : '本租户尚未开启值守观察'
+  const headline = !data
+    ? '值守控制面暂不可用'
+    : !enabled
+      ? '观察模式尚未启用'
+      : run?.summary?.headline || data.digest?.summary || '等待首次连续观察'
+  const attention = verdict === 'incident' || verdict === 'blocked_manual' || verdict === 'degraded'
+    || Number(actionSummary.failed || 0) > 0 || Number(actionSummary.blocked || 0) > 0
+  const firstIncident = data?.incidents?.[0]
+  const firstIncidentType = firstIncident?.incident_type || firstIncident?.type || ''
+  const alertLabel = firstIncidentType === 'capture_source_closure_blocked'
+    ? '自动恢复已阻塞，等待原 Agent 关闭确认'
+    : firstIncident?.alert_delivery_status === 'sent'
+    ? '异常提醒已发送'
+    : ['retry_wait', 'blocked_config', 'failed'].includes(firstIncident?.alert_delivery_status || '')
+      ? '异常提醒发送异常'
+      : firstIncident ? '先自动恢复，必要时提醒' : ''
+
+  return (
+    <section data-ops-control-card className={cn('rounded-xl border border-l-[3px] border-border bg-card p-4 shadow-xs sm:p-5', enabled ? style.accent : 'border-l-border')}>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <MoonStar className="h-4 w-4 text-primary" />
+            <h2 className="text-[13px] font-semibold tracking-tight">昨夜值守</h2>
+            <StatusBadge tone={enabled ? style.tone : 'neutral'}>{enabled ? style.label : '未开启'}</StatusBadge>
+            <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+              {guarded ? (actionsEnabled ? '受控动作' : '受控动作未放行') : '观察模式'}
+            </span>
+          </div>
+          <p className="mt-2 text-sm font-semibold text-foreground">{headline}</p>
+          {!enabled && <p className="mt-1 text-xs text-muted-foreground">{disabledReason}</p>}
+          {enabled && run && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              {run.service_date} · {Number(run.snapshot_count || 0)} 次快照
+              {run.last_snapshot_at ? ` · 最近观察 ${formatDate(run.last_snapshot_at)}` : ''}
+            </p>
+          )}
+        </div>
+        <div className="flex shrink-0 flex-wrap gap-2">
+          {enabled && canObserve && (
+            <button type="button" onClick={onObserve} disabled={busy}
+              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50">
+              {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}立即复核
+            </button>
+          )}
+          {attention && (
+            <button type="button" onClick={onOpenDispatch}
+              className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground">
+              查看调度 <ArrowRight className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {enabled && run && (
+        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
+          <OpsFact label="计划覆盖" value={`${Number(summary.observedScheduleCount || 0)}/${Number(summary.expectedScheduleCount || 0)}`} />
+          <OpsFact label="任务" value={String(Number(summary.taskCount || 0))} />
+          <OpsFact label="仍在执行" value={String(Number(summary.activeTaskCount || 0))} />
+          <OpsFact label="恢复已完成" value={String(Number(summary.recoveredItemCount || 0))} />
+          <OpsFact label="恢复阻塞" value={String(sourceClosureBlockedCount)} danger={sourceClosureBlockedCount > 0} />
+          <OpsFact label="需人工" value={String(explicitManualBlockerCount)} danger={explicitManualBlockerCount > 0} />
+          <OpsFact label="在线 Agent" value={`${Number(summary.onlineAgentCount || 0)}/${Number(summary.registeredAgentCount || 0)}`} />
+          <OpsFact
+            label="动作 已验收/待验收"
+            value={`${Number(actionSummary.verified || 0)}/${Number(actionSummary.pendingVerification || 0)}`}
+            danger={Number(actionSummary.failed || 0) + Number(actionSummary.blocked || 0) > 0}
+          />
+        </div>
+      )}
+
+      {enabled && (data?.incidents || []).length > 0 && (
+        <div className="mt-3 border-t border-border pt-3 text-xs text-muted-foreground">
+          <span className="font-semibold text-foreground">当前事项：</span>{firstIncident?.title}
+          {(data?.incidents || []).length > 1 ? `，另有 ${(data?.incidents || []).length - 1} 项` : ''}
+          {alertLabel ? <span className="ml-2 font-medium">· {alertLabel}</span> : null}
+        </div>
+      )}
+      <p className="mt-3 text-[10.5px] leading-5 text-muted-foreground">
+        {data?.runtimeBaselineVersion || '0.3.91'} 值守与受控恢复基线 · 未调用 LLM · {actionsEnabled
+          ? '仅执行白名单动作；只有后续快照验收成功才计入“恢复已完成”'
+          : guarded
+            ? '动作总闸、租户模式或白名单尚未全部放行'
+            : '当前只观察、判断和通知'}
+      </p>
+    </section>
+  )
+}
+
+function OpsFact({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
+  return (
+    <div className="rounded-lg bg-muted/45 px-3 py-2">
+      <div className="text-[10px] font-medium text-muted-foreground">{label}</div>
+      <div className={cn('mt-1 text-sm font-bold tabular-nums', danger ? 'text-status-red' : 'text-foreground')}>{value}</div>
     </div>
   )
 }

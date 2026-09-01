@@ -16,6 +16,11 @@ const MAX_RECENT_ERRORS = 20;
 const MAX_RECENT_STAGES = 60;
 const MAX_RECENT_TASKS = 20;
 const MAX_TEXT_LENGTH = 220;
+const MAX_HEALTH_LATENCY_MS = 2 * 60 * 1000;
+const MAX_HEALTH_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_HEAP_MB = 1024 * 1024;
+const KNOWN_SECRET_TOKEN_FAMILY_PATTERN =
+  /(?:^|[^A-Za-z0-9])(?:xox[baprs][_-][A-Za-z0-9_-]{10,}|glpat[_-][A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|(?:AKIA|ASIA)[0-9A-Z]{16})(?:$|[^A-Za-z0-9])/iu;
 const SENSITIVE_KEY_PATTERN =
   /(token|cookie|secret|password|authorization|credential|code|feishuAppToken|appToken|body|content|comments?|text|payload)/i;
 const SENSITIVE_STAGE_KEY_PATTERN =
@@ -29,6 +34,30 @@ function normalizeText(value, limit = MAX_TEXT_LENGTH) {
   const text = String(value || "").trim();
   if (!text) return "";
   return text.length > limit ? text.slice(0, limit) : text;
+}
+
+export function sanitizeDiagnosticText(value, limit = MAX_TEXT_LENGTH) {
+  return normalizeText(value, limit)
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+/giu, "Bearer [REDACTED]")
+    .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/gu, "[CREDENTIAL_REDACTED]")
+    .replace(
+      /\b(?:xox[baprs]-[A-Za-z0-9-]{10,}|glpat-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|npm_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{35}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,})\b/giu,
+      "[REDACTED]",
+    )
+    .replace(
+      /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu,
+      "[CREDENTIAL_REDACTED]",
+    )
+    .replace(/\b[A-Za-z0-9]{32,}\b/gu, "[CREDENTIAL_REDACTED]")
+    .replace(
+      /\b(authorization|cookie|password|passwd|secret|token|api[_-]?key|auth(?:entication)?[_-]?code|activation[_-]?code|credential|session)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;&]+)/giu,
+      "$1=[REDACTED]",
+    )
+    .replace(
+      /\b(authorization|cookie|password|passwd|secret|token|api[_-]?key|auth(?:entication)?[_-]?code|activation[_-]?code|credential|session|bearer)[_.:-]+[A-Za-z0-9._~+\/-]+\b/giu,
+      "$1_[REDACTED]",
+    )
+    .replace(/https?:\/\/[^\s<>"']+/giu, "[URL_REDACTED]");
 }
 
 function getChromeStorage() {
@@ -88,16 +117,25 @@ function normalizeDiagnosticsState(input = {}) {
   return {
     version: 1,
     recentActions: Array.isArray(source.recentActions)
-      ? source.recentActions.slice(0, MAX_RECENT_ACTIONS)
+      ? source.recentActions
+          .slice(0, MAX_RECENT_ACTIONS)
+          .map((item) => normalizeEvent(item))
       : [],
     recentErrors: Array.isArray(source.recentErrors)
-      ? source.recentErrors.slice(0, MAX_RECENT_ERRORS)
+      ? source.recentErrors.slice(0, MAX_RECENT_ERRORS).map((item) => ({
+          ...normalizeEvent(item),
+          error: normalizeError(item?.error, "runtime_error"),
+        }))
       : [],
     recentStages: Array.isArray(source.recentStages)
-      ? source.recentStages.slice(0, MAX_RECENT_STAGES)
+      ? source.recentStages
+          .slice(0, MAX_RECENT_STAGES)
+          .map((item) => normalizeStageTrace(item))
       : [],
     recentTasks: Array.isArray(source.recentTasks)
-      ? source.recentTasks.slice(0, MAX_RECENT_TASKS)
+      ? source.recentTasks
+          .slice(0, MAX_RECENT_TASKS)
+          .map((item) => normalizeEvent(item))
       : [],
     lastUpdatedAt: normalizeText(source.lastUpdatedAt, 80) || nowIso(),
   };
@@ -106,9 +144,31 @@ function normalizeDiagnosticsState(input = {}) {
 function safeUrlParts(rawUrl = "") {
   try {
     const parsed = new URL(String(rawUrl || ""));
+    const hostname = String(parsed.hostname || "").toLowerCase();
+    const host = hostname === "douyin.com" || hostname.endsWith(".douyin.com")
+      ? "douyin.com"
+      : hostname === "xiaohongshu.com" || hostname.endsWith(".xiaohongshu.com")
+        ? "xiaohongshu.com"
+        : hostname === "weibo.com" || hostname.endsWith(".weibo.com")
+          ? "weibo.com"
+          : "other";
+    const pathname = String(parsed.pathname || "/").toLowerCase();
+    const path = /\/(?:video|note)\//u.test(pathname)
+      ? "/work/:id"
+      : /\/user(?:\/profile)?\//u.test(pathname)
+        ? "/profile/:id"
+        : /\/search(?:\/|$)|\/jingxuan\/search/u.test(pathname)
+          ? "/search/:query"
+          : /\/search_result(?:\/|$)/u.test(pathname)
+            ? "/search_result"
+            : /\/explore(?:\/|$)/u.test(pathname)
+              ? "/explore"
+              : pathname === "/"
+                ? "/"
+                : "/other";
     return {
-      host: normalizeText(parsed.host, 160),
-      path: normalizeText(parsed.pathname || "/", 220),
+      host,
+      path,
     };
   } catch {
     return {
@@ -116,6 +176,390 @@ function safeUrlParts(rawUrl = "") {
       path: "",
     };
   }
+}
+
+function boundedMetric(
+  value,
+  {minimum = 0, maximum = Number.MAX_SAFE_INTEGER, decimals = 0} = {},
+) {
+  if (
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    typeof value === "boolean"
+  ) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  const bounded = Math.min(maximum, Math.max(minimum, parsed));
+  const factor = 10 ** Math.max(0, Math.min(3, decimals));
+  return Math.round(bounded * factor) / factor;
+}
+
+function timestampValue(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 1000000000000) return numeric;
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function healthAgeMs(value, now = Date.now()) {
+  const timestamp = timestampValue(value);
+  if (timestamp <= 0) return null;
+  return boundedMetric(now - timestamp, {
+    minimum: 0,
+    maximum: MAX_HEALTH_AGE_MS,
+  });
+}
+
+function healthTimestamp(value) {
+  const timestamp = timestampValue(value);
+  return timestamp > 0 ? new Date(timestamp).toISOString() : "";
+}
+
+function healthCode(value, limit = 80, fallback = "unknown") {
+  const raw = normalizeText(value, Math.max(limit * 4, 320));
+  const compact = raw.replace(/[._:-]/gu, "");
+  if (
+    !raw ||
+    /(?:https?:\/\/|www\.|[/?#&=@]|(?:token|cookie|authorization|bearer|password|passwd|secret|api[_-]?key|apikey|auth(?:entication)?[_-]?code|activation[_-]?code|credential|session))/iu.test(raw) ||
+    KNOWN_SECRET_TOKEN_FAMILY_PATTERN.test(raw) ||
+    /(?:^|[^A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:$|[^A-Za-z0-9_-])/u.test(raw) ||
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(raw) ||
+    /(?:^|[._:-])[A-Za-z0-9]{32,}(?:$|[._:-])/u.test(raw) ||
+    (
+      compact.length >= 32 &&
+      /^[A-Za-z0-9+/_-]+$/u.test(compact) &&
+      /[a-z]/u.test(compact) &&
+      /[A-Z]/u.test(compact) &&
+      /\d/u.test(compact)
+    )
+  ) return fallback;
+  const normalized = raw.slice(0, limit);
+  return /^[A-Za-z0-9_.:-]+$/u.test(normalized)
+    ? normalized.toLowerCase()
+    : fallback;
+}
+
+function booleanOrNull(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function nestedObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+}
+
+function firstBoundedMetric(values = [], options = {}) {
+  for (const value of values) {
+    const normalized = boundedMetric(value, options);
+    if (normalized !== null) return normalized;
+  }
+  return null;
+}
+
+function recentRequestTiming(runtime = {}, diagnosticsState = {}) {
+  const source = nestedObject(runtime);
+  const runtimeHealth = nestedObject(
+    source.healthEvidence || source.runtimeHealth || source.health,
+  );
+  const runtimeNetwork = nestedObject(runtimeHealth.network);
+  const directLatency = firstBoundedMetric(
+    [
+      source.lastRequestLatencyMs,
+      source.lastApiRttMs,
+      source.apiRttMs,
+      runtimeNetwork.lastRequestLatencyMs,
+      runtimeNetwork.apiRttMs,
+      runtimeNetwork.latencyMs,
+    ],
+    {minimum: 0, maximum: MAX_HEALTH_LATENCY_MS, decimals: 1},
+  );
+  if (directLatency !== null) {
+    return {
+      latencyMs: directLatency,
+      observedAt: healthTimestamp(
+        source.lastRequestAt || runtimeNetwork.observedAt,
+      ),
+      source: "runtime",
+    };
+  }
+
+  const stages = Array.isArray(diagnosticsState?.recentStages)
+    ? diagnosticsState.recentStages
+    : [];
+  for (const stage of stages.slice(0, MAX_RECENT_STAGES)) {
+    const stageKey = healthCode(stage?.stageKey, 120, "");
+    const stageSource = healthCode(stage?.source, 80, "");
+    if (
+      stageSource !== "api" &&
+      !/(?:api|request|network|sync)/u.test(stageKey)
+    ) {
+      continue;
+    }
+    const metrics = nestedObject(stage?.metrics);
+    const latencyMs = firstBoundedMetric(
+      [
+        metrics.apiRttMs,
+        metrics.requestLatencyMs,
+        metrics.latencyMs,
+        metrics.elapsedMs,
+        metrics.durationMs,
+      ],
+      {minimum: 0, maximum: MAX_HEALTH_LATENCY_MS, decimals: 1},
+    );
+    if (latencyMs === null) continue;
+    return {
+      latencyMs,
+      observedAt: healthTimestamp(stage?.at),
+      source: "diagnostic_stage",
+    };
+  }
+
+  return {latencyMs: null, observedAt: "", source: "unavailable"};
+}
+
+function buildNetworkHealth(runtime = {}, diagnosticsState = {}) {
+  const timing = recentRequestTiming(runtime, diagnosticsState);
+  const recentErrors = Array.isArray(diagnosticsState?.recentErrors)
+    ? diagnosticsState.recentErrors.slice(0, MAX_RECENT_ERRORS)
+    : [];
+  const apiErrors = recentErrors.filter((entry) => {
+    const source = healthCode(entry?.source, 80, "");
+    const stage = healthCode(entry?.stage, 120, "");
+    return source === "api" || /(?:api|request|network|sync)/u.test(stage);
+  });
+  const errorCodes = apiErrors.map((entry) =>
+    healthCode(entry?.error?.code, 120, "unknown"),
+  );
+  return {
+    available: timing.latencyMs !== null || apiErrors.length > 0,
+    recentRequestLatencyMs: timing.latencyMs,
+    latencyObservedAt: timing.observedAt,
+    latencySource: timing.source,
+    recentApiErrorCount: apiErrors.length,
+    recentTimeoutCount: errorCodes.filter((code) => code.includes("timeout"))
+      .length,
+    recentNetworkErrorCount: errorCodes.filter((code) =>
+      code.includes("network"),
+    ).length,
+    lastErrorCode: errorCodes[0] || "",
+    lastErrorAt: healthTimestamp(apiErrors[0]?.at),
+  };
+}
+
+function buildHeapHealth(memoryObservation = {}) {
+  const source = nestedObject(memoryObservation);
+  const bytesToMb = (value) => {
+    const bytes = boundedMetric(value, {
+      minimum: 0,
+      maximum: MAX_HEAP_MB * 1024 * 1024,
+    });
+    return bytes === null
+      ? null
+      : boundedMetric(bytes / (1024 * 1024), {
+          minimum: 0,
+          maximum: MAX_HEAP_MB,
+          decimals: 1,
+        });
+  };
+  const usedMb = bytesToMb(source.usedJSHeapSize);
+  const totalMb = bytesToMb(source.totalJSHeapSize);
+  const limitMb = bytesToMb(source.jsHeapSizeLimit);
+  const utilizationPct =
+    usedMb !== null && limitMb !== null && limitMb > 0
+      ? boundedMetric((usedMb / limitMb) * 100, {
+          minimum: 0,
+          maximum: 100,
+          decimals: 1,
+        })
+      : null;
+  return {
+    available: usedMb !== null || totalMb !== null || limitMb !== null,
+    usedMb,
+    totalMb,
+    limitMb,
+    utilizationPct,
+  };
+}
+
+export function buildBrowserRuntimeHealthSnapshot({
+  runtime = {},
+  diagnosticsState = {},
+  tabObservation = {},
+  eventLoopObservation = {},
+  memoryObservation = {},
+  sampledAt = nowIso(),
+  now = Date.now(),
+} = {}) {
+  const runtimeSource = nestedObject(runtime);
+  const tab = nestedObject(tabObservation);
+  const eventLoop = nestedObject(eventLoopObservation);
+  const eventLoopAverageMs = boundedMetric(eventLoop.averageLagMs, {
+    minimum: 0,
+    maximum: MAX_HEALTH_LATENCY_MS,
+    decimals: 1,
+  });
+  const eventLoopMaxMs = boundedMetric(eventLoop.maxLagMs, {
+    minimum: 0,
+    maximum: MAX_HEALTH_LATENCY_MS,
+    decimals: 1,
+  });
+
+  return {
+    version: 1,
+    sampledAt: healthTimestamp(sampledAt) || nowIso(),
+    cpu: {
+      available: false,
+      reason: "browser_extension_api_unavailable",
+      proxyMetrics: [
+        "event_loop_lag",
+        "heap_usage",
+        "tab_lifecycle",
+        "request_latency",
+      ],
+    },
+    eventLoop: {
+      available: eventLoopAverageMs !== null || eventLoopMaxMs !== null,
+      sampleCount:
+        boundedMetric(eventLoop.sampleCount, {minimum: 0, maximum: 10}) ?? 0,
+      averageLagMs: eventLoopAverageMs,
+      maxLagMs: eventLoopMaxMs,
+    },
+    heap: buildHeapHealth(memoryObservation),
+    tab: {
+      available: tab.available === true,
+      tracked: tab.tracked === true,
+      status: healthCode(tab.status, 30, "unavailable"),
+      active: booleanOrNull(tab.active),
+      discarded: booleanOrNull(tab.discarded),
+      frozen: booleanOrNull(tab.frozen),
+      autoDiscardable: booleanOrNull(tab.autoDiscardable),
+    },
+    network: buildNetworkHealth(runtimeSource, diagnosticsState),
+    runtime: {
+      platform: healthCode(runtimeSource.platform, 40),
+      pageType: healthCode(runtimeSource.pageType, 60),
+      detailReady: booleanOrNull(runtimeSource.detailReady),
+      stateAgeMs: healthAgeMs(runtimeSource.lastUpdatedAt, now),
+      captureProgressAgeMs: healthAgeMs(
+        runtimeSource.lastCaptureProgressAt,
+        now,
+      ),
+      serviceWorkerRestartCount: boundedMetric(
+        runtimeSource.serviceWorkerRestartCount,
+        {minimum: 0, maximum: 1000000},
+      ),
+    },
+  };
+}
+
+async function sampleEventLoopHealth({sampleCount = 3, delayMs = 8} = {}) {
+  if (typeof setTimeout !== "function") {
+    return {available: false, sampleCount: 0};
+  }
+  const monotonicNow = () => {
+    try {
+      if (typeof globalThis.performance?.now === "function") {
+        return globalThis.performance.now();
+      }
+    } catch {
+      // Fall back to wall-clock sampling.
+    }
+    return Date.now();
+  };
+  const samples = [];
+  for (let index = 0; index < sampleCount; index += 1) {
+    const startedAt = monotonicNow();
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    samples.push(Math.max(0, monotonicNow() - startedAt - delayMs));
+  }
+  return {
+    available: samples.length > 0,
+    sampleCount: samples.length,
+    averageLagMs:
+      samples.length > 0
+        ? samples.reduce((total, value) => total + value, 0) / samples.length
+        : null,
+    maxLagMs: samples.length > 0 ? Math.max(...samples) : null,
+  };
+}
+
+function readMemoryObservation() {
+  try {
+    const memory = globalThis.performance?.memory;
+    if (!memory || typeof memory !== "object") return {};
+    return {
+      usedJSHeapSize: memory.usedJSHeapSize,
+      totalJSHeapSize: memory.totalJSHeapSize,
+      jsHeapSizeLimit: memory.jsHeapSizeLimit,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function trackedTabId(runtime = {}, taskLedger = {}) {
+  const direct = Number(runtime?.lastActiveTabId);
+  if (Number.isFinite(direct) && direct > 0) return Math.floor(direct);
+  const runs = Array.isArray(taskLedger?.runs) ? taskLedger.runs : [];
+  const activeStatuses = new Set([
+    "pending",
+    "running",
+    "recovering",
+    "paused",
+    "needs_action",
+  ]);
+  const activeRun = runs.find((run) =>
+    activeStatuses.has(String(run?.status || "")),
+  );
+  const runnerTabId = Number(activeRun?.runnerTabId);
+  return Number.isFinite(runnerTabId) && runnerTabId > 0
+    ? Math.floor(runnerTabId)
+    : null;
+}
+
+async function readTabObservation(runtime = {}, taskLedger = {}) {
+  const tabsApi = globalThis.chrome?.tabs;
+  if (!tabsApi || typeof tabsApi.get !== "function") {
+    return {available: false, tracked: false, status: "unavailable"};
+  }
+  const tabId = trackedTabId(runtime, taskLedger);
+  if (!tabId) {
+    return {available: true, tracked: false, status: "untracked"};
+  }
+  try {
+    const tab = await tabsApi.get(tabId);
+    return {
+      available: true,
+      tracked: Boolean(tab),
+      status: tab?.status || "unknown",
+      active: tab?.active,
+      discarded: tab?.discarded,
+      frozen: tab?.frozen,
+      autoDiscardable: tab?.autoDiscardable,
+    };
+  } catch {
+    return {available: true, tracked: false, status: "missing"};
+  }
+}
+
+async function collectBrowserRuntimeHealth({
+  runtime = {},
+  diagnosticsState = {},
+  taskLedger = {},
+} = {}) {
+  const [eventLoopObservation, tabObservation] = await Promise.all([
+    sampleEventLoopHealth(),
+    readTabObservation(runtime, taskLedger),
+  ]);
+  return buildBrowserRuntimeHealthSnapshot({
+    runtime,
+    diagnosticsState,
+    tabObservation,
+    eventLoopObservation,
+    memoryObservation: readMemoryObservation(),
+  });
 }
 
 function countSelectorMatches(selectors = []) {
@@ -174,7 +618,7 @@ function sanitizeValue(value, depth = 0) {
   if (value === null || value === undefined) return value;
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
-  if (typeof value === "string") return normalizeText(value);
+  if (typeof value === "string") return sanitizeDiagnosticText(value);
   if (depth >= 1) return "[object]";
 
   if (Array.isArray(value)) {
@@ -232,7 +676,7 @@ function sanitizeStageMetrics(metrics = {}, depth = 0) {
       continue;
     }
     if (typeof value === "string") {
-      safe[normalizedKey] = normalizeText(value, 160);
+      safe[normalizedKey] = sanitizeDiagnosticText(value, 160);
       continue;
     }
     if (Array.isArray(value)) {
@@ -241,7 +685,7 @@ function sanitizeStageMetrics(metrics = {}, depth = 0) {
         .map((item) =>
           typeof item === "number" || typeof item === "boolean"
             ? item
-            : normalizeText(item, 80),
+            : sanitizeDiagnosticText(item, 80),
         );
       continue;
     }
@@ -269,8 +713,8 @@ function normalizeError(error = null, fallbackCode = "unknown_error") {
   );
 
   return {
-    code: code || fallbackCode,
-    message,
+    code: healthCode(code, 120, fallbackCode),
+    message: sanitizeDiagnosticText(message),
   };
 }
 
@@ -289,10 +733,10 @@ function normalizeEvent(input = {}) {
       source.correlationId || taskContext?.correlationId,
       120,
     ),
-    source: normalizeText(source.source, 80),
-    action: normalizeText(source.action, 120),
-    stage: normalizeText(source.stage, 120),
-    status: normalizeText(source.status, 80),
+    source: healthCode(source.source, 80, ""),
+    action: sanitizeDiagnosticText(source.action, 120),
+    stage: healthCode(source.stage, 120, ""),
+    status: healthCode(source.status, 80, ""),
     metadata: sanitizeMetadata(source.metadata || {}),
   };
 }
@@ -310,15 +754,15 @@ function normalizeStageTrace(input = {}) {
     at: normalizeText(source.at, 80) || nowIso(),
     featureKey: normalizeText(featureKey, 120),
     parentFeatureKey: normalizeText(parentFeatureKey, 120),
-    stageKey: normalizeText(source.stageKey || source.stage, 120),
-    label: normalizeText(source.label, 120),
-    status: normalizeText(source.status, 80) || "unknown",
+    stageKey: healthCode(source.stageKey || source.stage, 120, ""),
+    label: sanitizeDiagnosticText(source.label, 120),
+    status: healthCode(source.status, 80),
     taskId: normalizeText(source.taskId || taskContext?.taskId, 120),
     correlationId: normalizeText(
       source.correlationId || taskContext?.correlationId,
       120,
     ),
-    source: normalizeText(source.source, 80),
+    source: healthCode(source.source, 80, ""),
     metrics: sanitizeStageMetrics(source.metrics || source.metadata || {}),
     error: source.error ? normalizeError(source.error, "stage_error") : null,
   };
@@ -474,7 +918,7 @@ function buildTaskCenterDiagnostics(taskLedger = {}) {
       current: Number(run?.progress?.current) || 0,
       total: Number(run?.progress?.total) || 0,
       phase: normalizeText(run?.progress?.phase, 80),
-      message: normalizeText(run?.progress?.message, 180),
+      message: sanitizeDiagnosticText(run?.progress?.message, 180),
     },
     counts: sanitizeMetadata(run?.counts || run?.summary || {}),
     recovery: {
@@ -483,7 +927,7 @@ function buildTaskCenterDiagnostics(taskLedger = {}) {
         0,
         Number(run?.metadata?.maxRecoveryAttempts) || 0,
       ),
-      reason: normalizeText(run?.metadata?.recoveryReason, 120),
+      reason: sanitizeDiagnosticText(run?.metadata?.recoveryReason, 120),
       waitUntil: normalizeText(run?.metadata?.recoveryWaitUntil, 80),
     },
     error: run?.error
@@ -509,6 +953,11 @@ export async function buildDiagnosticsReport(extra = {}) {
   const monitorItems = Array.isArray(snapshot.monitor?.items)
     ? snapshot.monitor.items
     : [];
+  const browserRuntime = await collectBrowserRuntimeHealth({
+    runtime: snapshot.runtime,
+    diagnosticsState: state,
+    taskLedger: snapshot.taskLedger,
+  });
 
   return {
     generatedAt: nowIso(),
@@ -523,10 +972,11 @@ export async function buildDiagnosticsReport(extra = {}) {
       host: snapshot.page.host,
       path: snapshot.page.path,
     },
+    browserRuntime,
     auth: {
       status: normalizeText(snapshot.auth?.status, 80),
       verified: Boolean(snapshot.auth?.verified),
-      reason: normalizeText(snapshot.auth?.reason, 120),
+      reason: sanitizeDiagnosticText(snapshot.auth?.reason, 120),
       remainingCredits:
         Number(snapshot.auth?.credentialCredit?.remainingCredits) || null,
     },
@@ -534,7 +984,10 @@ export async function buildDiagnosticsReport(extra = {}) {
       status: normalizeText(snapshot.capture?.status, 80),
       activeType: normalizeText(snapshot.capture?.activeType, 80),
       phase: normalizeText(snapshot.capture?.progress?.phase, 80),
-      message: normalizeText(snapshot.capture?.progress?.message, 180),
+      message: sanitizeDiagnosticText(
+        snapshot.capture?.progress?.message,
+        180,
+      ),
       error: snapshot.capture?.error
         ? normalizeError(snapshot.capture.error, "capture_error")
         : null,
@@ -542,7 +995,7 @@ export async function buildDiagnosticsReport(extra = {}) {
     sync: {
       status: normalizeText(snapshot.sync?.status, 80),
       activeSyncType: normalizeText(snapshot.sync?.activeSyncType, 80),
-      message: normalizeText(snapshot.sync?.message, 180),
+      message: sanitizeDiagnosticText(snapshot.sync?.message, 180),
       error: snapshot.sync?.error
         ? normalizeError(snapshot.sync.error, "sync_error")
         : null,
@@ -562,7 +1015,7 @@ export async function buildDiagnosticsReport(extra = {}) {
     recentErrors: state.recentErrors.slice(0, 10),
     recentStages: state.recentStages.slice(0, 20),
     recentTasks: state.recentTasks.slice(0, 10),
-    note: "诊断信息已脱敏：不包含正文全文、评论全文、token、cookie、飞书密钥或激活码。",
+    note: "诊断信息已脱敏：不包含正文全文、评论全文、token、cookie、飞书密钥、激活码或完整 URL；浏览器不提供 CPU 指标时使用事件循环、Heap、标签页生命周期和请求延迟作为近似证据。",
     extra: sanitizeMetadata(extra),
   };
 }

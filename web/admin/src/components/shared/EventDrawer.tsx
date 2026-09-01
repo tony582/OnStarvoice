@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { X, Loader2, Heart, MessageCircle, Star, Share2, ExternalLink, Activity, TrendingUp, Globe, Clock, ArrowLeft } from 'lucide-react'
+import { X, Loader2, Heart, MessageCircle, Star, Share2, Activity, TrendingUp, Globe, Clock, ArrowLeft } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatNumber, formatFullDate, platformName, LABELS, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
 /**
  * 事件详情:把一个 issue 当"事件",核心是【时间脉络】——关联内容按时间排成时间线,
@@ -101,7 +102,7 @@ export function EventDrawer({ eventId, onClose }: { eventId: string; onClose: ()
                             <span className="inline-flex items-center gap-0.5"><Star className="h-3 w-3" />{formatNumber(r.collects)}</span>
                             <span className="inline-flex items-center gap-0.5"><Share2 className="h-3 w-3" />{formatNumber(r.shares)}</span>
                             <span className="ml-auto font-medium text-foreground">{formatNumber(inter)} 互动</span>
-                            {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="text-primary hover:underline"><ExternalLink className="h-3 w-3" /></a>}
+                            <RecordSourceAction record={r} compact className="text-[11px]" />
                           </div>
                         </div>
                       </div>

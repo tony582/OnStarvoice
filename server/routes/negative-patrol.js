@@ -396,6 +396,7 @@ function candidateWhere(tenantId, filter, recordIds = []) {
       AND r.platform = ANY($2::text[])
       AND r.sentiment = 'negative'
       AND r.record_type <> 'official_content'
+      AND r.business_visibility = 'eligible'
       AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
       AND r.content_availability_status NOT IN (
         'deleted',
@@ -533,6 +534,7 @@ function watchedCandidateWhere(tenantId, filter, recordIds = []) {
     WHERE r.tenant_id = $1
       AND r.platform = ANY($2::text[])
       AND r.record_type NOT IN ('official_content', 'blogger_profile')
+      AND r.business_visibility = 'eligible'
       AND r.content_availability_status NOT IN ('deleted', 'page_unavailable')
       AND r.external_id ~ '^[[:alnum:]_-]{5,200}$'
       AND EXISTS (

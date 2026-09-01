@@ -14,6 +14,34 @@ import {
   unattendedPlanDates,
 } from './lib'
 
+const CONTENT_TYPE_LABELS: Record<string, string> = {
+  all: '全部',
+  video: '视频',
+  image: '图文',
+}
+const PATROL_TYPE_LABELS: Record<string, string> = {
+  all: '综合',
+  video: '视频',
+  image: '图文',
+}
+const SEARCH_SCOPE_LABELS: Record<string, string> = {
+  all: '全部',
+  viewed: '已看过',
+  unviewed: '未看过',
+  followed: '已关注',
+}
+const DISTANCE_LABELS: Record<string, string> = {
+  all: '不限距离',
+  city: '同城',
+  nearby: '附近',
+}
+const VIDEO_DURATION_LABELS: Record<string, string> = {
+  all: '不限时长',
+  under_1m: '1 分钟以内',
+  '1_5m': '1–5 分钟',
+  over_5m: '5 分钟以上',
+}
+
 export function UnattendedPlanSummary({
   plan,
   mirroredAt,
@@ -60,6 +88,17 @@ export function UnattendedPlanSummary({
   const mode = PLAN_MODE_LABELS[String(plan.mode || '')] || String(plan.mode || '本地设置')
   const sortLabel = SORT_OPTIONS.find(option => option.value === plan.searchFilters?.sort)?.label || '综合排序'
   const publishTimeLabel = PUBLISH_TIME_OPTIONS.find(option => option.value === plan.searchFilters?.publishTime)?.label || '不限时间'
+  const contentTypeLabel = CONTENT_TYPE_LABELS[String(plan.searchFilters?.contentType || 'all')] || String(plan.searchFilters?.contentType || '全部')
+  const searchPassLabels = (Array.isArray(plan.searchPasses) ? plan.searchPasses : [])
+    .map(value => PATROL_TYPE_LABELS[String(value || '')] || '')
+    .filter(Boolean)
+  const sequentialSearchEnabled = searchPassLabels.length > 1
+  const contentPathLabel = sequentialSearchEnabled
+    ? searchPassLabels.join(' → ')
+    : contentTypeLabel
+  const searchScopeLabel = SEARCH_SCOPE_LABELS[String(plan.searchFilters?.searchScope || 'all')] || String(plan.searchFilters?.searchScope || '全部')
+  const distanceLabel = DISTANCE_LABELS[String(plan.searchFilters?.distance || 'all')] || String(plan.searchFilters?.distance || '不限距离')
+  const videoDurationLabel = VIDEO_DURATION_LABELS[String(plan.searchFilters?.videoDuration || 'all')] || String(plan.searchFilters?.videoDuration || '不限时长')
   const lastRunStatus = STATUS_LABELS[String(plan.lastRunStatus || '')] || String(plan.lastRunStatus || '')
   const captureSettings = plan.captureSettings
   const keywordMaxDetectedItems = Number(plan.keywordMaxDetectedItems)
@@ -137,6 +176,17 @@ export function UnattendedPlanSummary({
         )}
         <div>排序：<span className="text-foreground">{sortLabel}</span></div>
         <div>时间：<span className="text-foreground">{publishTimeLabel}</span></div>
+        <div>巡检：<span className="text-foreground">{contentPathLabel}</span></div>
+        <div>范围：<span className="text-foreground">{searchScopeLabel}</span></div>
+        {plan.platform === 'xiaohongshu' && (
+          <div>距离：<span className="text-foreground">{distanceLabel}</span></div>
+        )}
+        {plan.platform === 'douyin' && (
+          <div>视频时长：<span className="text-foreground">{videoDurationLabel}</span></div>
+        )}
+        {sequentialSearchEnabled && (
+          <div className="sm:col-span-2">执行方式：<span className="text-foreground">同一 Agent 串行 · 每次采集后增强新增内容 · 逐字段确认筛选 · 不自动刷新补搜</span></div>
+        )}
         <div className="sm:col-span-2">采集数量：<span className="text-foreground">{hasKeywordMaxDetectedItems ? `每个关键词最多 ${keywordMaxDetectedItems} 条` : '每词上限使用设备本地设置'}</span></div>
         <div>下次运行：<span className="text-foreground">{ended ? '无后续排期' : formatTime(plan.nextRunAt)}</span></div>
         <div>上次运行：<span className="text-foreground">{formatTime(plan.lastRunAt)}{lastRunStatus ? ` · ${lastRunStatus}` : ''}</span></div>

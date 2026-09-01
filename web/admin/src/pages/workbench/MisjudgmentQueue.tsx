@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  ArrowDown, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink,
+  ArrowDown, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download,
   FileText, FileWarning, Loader2, RefreshCw, Search, User,
 } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/input'
 import { StatusBadge, StatusPill } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { useNotePrompt } from '@/components/shared/NotePrompt'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import {
   WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar,
 } from '@/components/shared/Workbench'
@@ -22,6 +23,7 @@ type JsonMap = Record<string, unknown>
 
 interface FeedbackItem {
   id: string
+  record_id?: string
   feedback_type?: string
   review_status?: string
   reason?: string
@@ -440,16 +442,10 @@ function MobileFeedbackCard({
                 <User className="h-3.5 w-3.5 shrink-0" />
                 <span className="max-w-48 truncate">{record.author || '未知作者'}</span>
               </span>
-              {record.url && (
-                <a
-                  href={record.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex min-h-9 items-center gap-1 rounded-lg px-2 font-semibold text-primary hover:bg-primary/8"
-                >
-                  查看原文<ExternalLink className="h-3.5 w-3.5" />
-                </a>
-              )}
+              <RecordSourceAction
+                record={record}
+                className="min-h-9 rounded-lg px-2 font-semibold hover:bg-primary/8"
+              />
             </div>
 
             {changes.length > 1 && (
@@ -572,12 +568,7 @@ function FeedbackRow({
             <User className="h-3 w-3 shrink-0" />
             <span className="max-w-28 truncate">{record.author || '未知作者'}</span>
           </span>
-          {record.url && (
-            <a href={record.url} target="_blank" rel="noreferrer"
-              className="inline-flex items-center gap-0.5 font-semibold text-primary hover:underline">
-              原文<ExternalLink className="h-3 w-3" />
-            </a>
-          )}
+          <RecordSourceAction record={record} compact className="text-[11px] font-semibold" />
         </div>
       </td>
       <td className="max-w-[390px] px-3 py-3.5">
@@ -638,6 +629,7 @@ function FeedbackRow({
 function recordFields(item: FeedbackItem) {
   const snapshot = asMap(item.record_snapshot)
   return {
+    id: firstText(item.record_id, snapshot.id, snapshot.record_id),
     title: firstText(item.record_title, item.title, snapshot.title),
     content: firstText(item.record_content, item.content, snapshot.content, snapshot.text),
     platform: firstText(item.record_platform, item.platform, snapshot.platform),

@@ -95,3 +95,123 @@ test("a broken stop predicate fails closed before processing a write", async () 
   assert.equal(stats.canceled, true);
   assert.equal(stats.pendingCount, 0);
 });
+
+test("transient failures retry with bounded delays and settle once", async () => {
+  const attempts = [];
+  const phases = [];
+  const queue = createRecordSyncQueue({
+    retryDelaysMs: [0, 0, 0],
+    shouldRetry(result) {
+      return result?.reason === "network_timeout";
+    },
+    onStateChange(state) {
+      phases.push(state.phase);
+    },
+    async processRecord({recordId}) {
+      attempts.push(recordId);
+      return attempts.length < 3
+        ? {ok: false, reason: "network_timeout"}
+        : {ok: true};
+    },
+  });
+
+  queue.enqueue("record-a");
+  const stats = await queue.drain();
+  assert.deepEqual(attempts, ["record-a", "record-a", "record-a"]);
+  assert.equal(stats.retryCount, 2);
+  assert.equal(stats.processedCount, 1);
+  assert.equal(stats.successCount, 1);
+  assert.equal(stats.failedCount, 0);
+  assert.equal(phases.filter((phase) => phase === "retry_wait").length, 2);
+});
+
+test("unique coverage separates captured, uploaded, and intentionally excluded records", async () => {
+  const queue = createRecordSyncQueue({
+    async processRecord() {
+      return {ok: true};
+    },
+  });
+
+  assert.equal(
+    queue.registerCaptured(["record-a", "record-a", "record-b", "record-c"]),
+    3,
+  );
+  assert.equal(queue.markExcluded("record-c"), true);
+  assert.equal(queue.enqueue("record-a"), true);
+  assert.equal(queue.enqueue("record-a"), false);
+  assert.equal(queue.enqueue("record-b"), true);
+
+  const stats = await queue.drain();
+  assert.equal(stats.capturedUniqueCount, 3);
+  assert.equal(stats.enqueuedUniqueCount, 2);
+  assert.equal(stats.excludedUniqueCount, 1);
+  assert.equal(stats.succeededUniqueCount, 2);
+  assert.equal(stats.enqueuedCount, 3);
+  assert.equal(stats.successCount, 3);
+});
+
+test("a captured record left unclassified remains visible as missing coverage", async () => {
+  const queue = createRecordSyncQueue({
+    async processRecord() {
+      return {ok: true};
+    },
+  });
+
+  queue.registerCaptured(["record-a", "record-b"]);
+  queue.enqueue("record-a");
+  const stats = await queue.drain();
+
+  assert.equal(stats.capturedUniqueCount, 2);
+  assert.equal(stats.enqueuedUniqueCount + stats.excludedUniqueCount, 1);
+  assert.equal(stats.succeededUniqueCount, 1);
+});
+
+test("non-transient failures do not retry", async () => {
+  let attemptCount = 0;
+  const queue = createRecordSyncQueue({
+    retryDelaysMs: [0, 0, 0],
+    shouldRetry(result) {
+      return result?.reason === "network_timeout";
+    },
+    async processRecord() {
+      attemptCount += 1;
+      return {ok: false, reason: "INVALID_PAYLOAD"};
+    },
+  });
+
+  queue.enqueue("record-a");
+  const stats = await queue.drain();
+  assert.equal(attemptCount, 1);
+  assert.equal(stats.retryCount, 0);
+  assert.equal(stats.failedCount, 1);
+});
+
+test("cancellation interrupts a retry delay without another write", async () => {
+  const controller = new AbortController();
+  let attemptCount = 0;
+  let retryWaitSeen = false;
+  const queue = createRecordSyncQueue({
+    signal: controller.signal,
+    retryDelaysMs: [5000],
+    shouldRetry: () => true,
+    onStateChange(state) {
+      if (state.phase === "retry_wait") {
+        retryWaitSeen = true;
+        controller.abort();
+      }
+    },
+    async processRecord() {
+      attemptCount += 1;
+      return {ok: false, reason: "network_timeout"};
+    },
+  });
+
+  queue.enqueue("record-a");
+  const stats = await queue.drain();
+  assert.equal(retryWaitSeen, true);
+  assert.equal(attemptCount, 1);
+  assert.equal(stats.retryCount, 0);
+  assert.equal(stats.canceled, true);
+  assert.equal(stats.skippedCount, 1);
+  assert.equal(stats.failedCount, 0);
+});

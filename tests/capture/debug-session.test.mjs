@@ -3,8 +3,13 @@ import test from "node:test";
 
 await import("../../utils/capture/debug-session.js");
 
-const {createManager, isListCaptureAction, resolveListRelayRunId} =
-  globalThis.OnStarvoiceCaptureDebugSession;
+const {
+  createManager,
+  classifyDebugOwnership,
+  isExternalDebuggerConflict,
+  isListCaptureAction,
+  resolveListRelayRunId,
+} = globalThis.OnStarvoiceCaptureDebugSession;
 
 function createDebuggerDouble({
   attachError = null,
@@ -73,6 +78,87 @@ test("list capture actions are the only automatic debug-session entrypoints", ()
   assert.equal(isListCaptureAction("captureSingleNote"), false);
   assert.equal(isListCaptureAction("captureComments"), false);
   assert.equal(isListCaptureAction("cancelCapture"), false);
+});
+
+test("debug ownership distinguishes StarVoice, stale recovery, external debugger and unknown state", () => {
+  assert.deepEqual(
+    classifyDebugOwnership({
+      requestedTaskId: "task-current",
+      requestedTabId: 41,
+      activeSession: {
+        persistent: true,
+        taskId: "task-current",
+        tabId: 41,
+        state: "attached",
+      },
+    }),
+    {
+      kind: "owned_by_request",
+      code: "",
+      retryable: false,
+      automaticReroute: false,
+      safeToDetach: false,
+      taskId: "task-current",
+      tabId: 41,
+    },
+  );
+
+  const active = classifyDebugOwnership({
+    requestedTaskId: "task-next",
+    requestedTabId: 44,
+    activeSession: {
+      persistent: true,
+      taskId: "task-running",
+      tabId: 41,
+      state: "attached",
+    },
+  });
+  assert.equal(active.kind, "starvoice_active");
+  assert.equal(active.code, "capture_task_debug_starvoice_active");
+  assert.equal(active.automaticReroute, true);
+  assert.equal(active.safeToDetach, false);
+
+  const recovered = classifyDebugOwnership({
+    requestedTaskId: "task-next",
+    requestedTabId: 44,
+    staleReleasedTaskIds: ["task-old", "task-old"],
+  });
+  assert.equal(recovered.kind, "starvoice_stale_recovered");
+  assert.deepEqual(recovered.releasedTaskIds, ["task-old"]);
+  assert.equal(recovered.automaticReroute, false);
+
+  const external = classifyDebugOwnership({
+    requestedTaskId: "task-next",
+    requestedTabId: 44,
+    targetAttached: true,
+  });
+  assert.equal(external.kind, "external_debugger");
+  assert.equal(external.code, "capture_task_external_debugger_busy");
+  assert.equal(external.automaticReroute, true);
+  assert.equal(external.safeToDetach, false);
+
+  const attachConflict = new Error(
+    "Another debugger is already attached to the tab with id: 44",
+  );
+  assert.equal(isExternalDebuggerConflict(attachConflict), true);
+  assert.equal(
+    classifyDebugOwnership({
+      requestedTaskId: "task-next",
+      requestedTabId: 44,
+      attachError: attachConflict,
+    }).kind,
+    "external_debugger",
+  );
+
+  const unknown = classifyDebugOwnership({
+    requestedTaskId: "task-next",
+    requestedTabId: 44,
+    preflightError: new Error("debugger target query unavailable"),
+  });
+  assert.equal(unknown.kind, "unknown_occupancy");
+  assert.equal(unknown.code, "capture_task_debug_ownership_unknown");
+  assert.equal(unknown.automaticReroute, true);
+  assert.equal(unknown.safeToDetach, false);
 });
 
 test("consecutive keyword relays receive independent child run ids", async () => {

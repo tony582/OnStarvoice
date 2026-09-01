@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
-  AlertTriangle, ArrowLeft, ArrowRight, Check, ClipboardList, Copy, ExternalLink, Loader2,
+  AlertTriangle, ArrowLeft, ArrowRight, Check, ClipboardList, Copy, Loader2,
   MessageSquare, Plus, Quote, Radar, RotateCcw, ScanSearch, ShieldAlert,
   Sparkles, TrendingUp, Trash2, X,
 } from 'lucide-react'
@@ -13,6 +13,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordDrawer } from '@/components/shared/RecordDrawer'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
 interface TopicAnalysis {
   id: string
@@ -550,12 +551,11 @@ function SampleLinks({ ids, sampleMap, className, onOpenRecord }: {
             className="inline-flex min-w-0 items-center gap-1 text-[10.5px] font-medium text-primary hover:underline">
             <ScanSearch className="h-3 w-3 shrink-0" /><span className="truncate">{l.title || '查看该条'}</span>
           </button>
-          {l.url && (
-            <a href={l.url} target="_blank" rel="noreferrer" aria-label="打开原帖"
-              className="shrink-0 text-muted-foreground hover:text-primary">
-              <ExternalLink className="h-3 w-3" />
-            </a>
-          )}
+          <RecordSourceAction
+            record={{ id: l.id, ...l }}
+            compact
+            className="text-[10.5px] text-muted-foreground hover:text-primary"
+          />
         </span>
       ))}
     </div>
@@ -722,11 +722,12 @@ function ResultBlocks({ payload, analysisSource, onOpenRecord }: {
                         <ScanSearch className="h-3 w-3" />查看该条
                       </button>
                     )}
-                    {sampleMap[v.recordId]?.url && (
-                      <a href={sampleMap[v.recordId].url} target="_blank" rel="noreferrer" aria-label="打开原帖"
-                        className="inline-flex items-center gap-0.5 hover:text-primary">
-                        <ExternalLink className="h-3 w-3" />
-                      </a>
+                    {sampleMap[v.recordId] && (
+                      <RecordSourceAction
+                        record={{ id: v.recordId, ...sampleMap[v.recordId] }}
+                        compact
+                        className="text-[10.5px] text-muted-foreground hover:text-primary"
+                      />
                     )}
                   </div>
                 </div>
@@ -773,10 +774,12 @@ function ResultBlocks({ payload, analysisSource, onOpenRecord }: {
                       <ScanSearch className="h-3.5 w-3.5" />
                     </button>
                   )}
-                  {sampleMap[n.recordId]?.url && (
-                    <a href={sampleMap[n.recordId].url} target="_blank" rel="noreferrer" aria-label="打开原帖" className="shrink-0 text-muted-foreground hover:text-primary">
-                      <ExternalLink className="h-3.5 w-3.5" />
-                    </a>
+                  {sampleMap[n.recordId] && (
+                    <RecordSourceAction
+                      record={{ id: n.recordId, ...sampleMap[n.recordId] }}
+                      compact
+                      className="text-[10.5px] text-muted-foreground hover:text-primary"
+                    />
                   )}
                 </div>
               ))}

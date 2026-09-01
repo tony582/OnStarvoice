@@ -26,7 +26,7 @@ type Props = {
   attempts: OrchestrationAttemptRecord[]
 }
 
-type StageKey = 'waiting' | 'search' | 'list' | 'enhancement' | 'sync' | 'completed' | 'failed'
+type StageKey = 'waiting' | 'search' | 'list' | 'enhancement' | 'sync' | 'completed' | 'partial' | 'failed'
 
 type KeywordProgress = {
   item: OrchestrationItemRecord
@@ -56,7 +56,7 @@ const DONE_STATUSES = new Set(['completed', 'completed_with_warnings'])
 
 const FAILURE_STATUSES = new Set(['retryable', 'needs_action', 'failed', 'interrupted', 'completed_with_failures'])
 
-const STAGE_ORDER: Array<{ key: Exclude<StageKey, 'waiting' | 'completed' | 'failed'>; label: string }> = [
+const STAGE_ORDER: Array<{ key: Exclude<StageKey, 'waiting' | 'completed' | 'partial' | 'failed'>; label: string }> = [
   { key: 'search', label: '搜索' },
   { key: 'list', label: '列表采集' },
   { key: 'enhancement', label: '增强' },
@@ -177,8 +177,15 @@ function agentName(agent?: OrchestrationCloudAgent) {
   return agent.display_name || `${agent.host_label || '未命名设备'} · ${agent.browser_name || '浏览器'}`
 }
 
-function progressStage(phaseValue: unknown, status: string): { stage: StageKey; label: string } {
+function progressStage(
+  phaseValue: unknown,
+  status: string,
+  savedCount: number | null,
+): { stage: StageKey; label: string } {
   if (DONE_STATUSES.has(status)) return { stage: 'completed', label: '已完成' }
+  if (FAILURE_STATUSES.has(status) && Number(savedCount || 0) > 0) {
+    return { stage: 'partial', label: '部分完成' }
+  }
   if (FAILURE_STATUSES.has(status)) return { stage: 'failed', label: STATUS_LABELS[status] || '执行异常' }
 
   const phase = String(phaseValue || '').toLowerCase()
@@ -190,7 +197,8 @@ function progressStage(phaseValue: unknown, status: string): { stage: StageKey; 
   return { stage: 'waiting', label: STATUS_LABELS[status] || '等待执行' }
 }
 
-function statusTone(status: string) {
+function statusTone(status: string, stage: StageKey | '' = '') {
+  if (stage === 'partial') return 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
   if (FAILURE_STATUSES.has(status)) return 'border-status-red/25 bg-status-red/8 text-status-red'
   if (DONE_STATUSES.has(status)) return 'border-status-green/25 bg-status-green/8 text-status-green'
   if (ACTIVE_STATUSES.has(status)) return 'border-primary/25 bg-primary/8 text-primary'
@@ -226,7 +234,8 @@ function buildKeywordProgress(
   const checkpoint = ownsLiveProgress ? executionCheckpoint : {}
   const metadataCheckpoint = objectValue(item.metadata?.checkpoint)
   const status = String(item.status || execution?.status || 'pending')
-  const { stage, label } = progressStage(progress.phase || checkpoint.phase, status)
+  const progressPhase = progress.phase || checkpoint.phase
+  const provisionalStage = progressStage(progressPhase, status, null).stage
   const itemCurrent = finiteNumber(progress.itemCurrent, progress.item_current)
   const itemTotal = maxFinite(
     progress.itemTotal,
@@ -234,11 +243,11 @@ function buildKeywordProgress(
     progress.detectedCount,
     progress.collectedCount,
   )
-  const inferredCompleted = itemCurrent === null ? null : Math.max(0, itemCurrent - (stage === 'enhancement' ? 1 : 0))
+  const inferredCompleted = itemCurrent === null ? null : Math.max(0, itemCurrent - (provisionalStage === 'enhancement' ? 1 : 0))
   const enhancedCount = maxFinite(
     progress.detailSuccessCount,
     progress.detail_success_count,
-    stage === 'enhancement' ? inferredCompleted : null,
+    provisionalStage === 'enhancement' ? inferredCompleted : null,
   )
   const searchCount = maxFinite(
     progress.detectedCount,
@@ -253,6 +262,11 @@ function buildKeywordProgress(
     checkpoint.savedCount,
     metadataCheckpoint.savedCount,
     item.metadata?.savedCount,
+  )
+  const { stage, label } = progressStage(
+    progressPhase,
+    status,
+    savedCount,
   )
   const agentId = itemAgentId(item, execution, attempts)
   // Execution rows retain the historical Agent identity even when that Agent
@@ -290,10 +304,14 @@ function buildKeywordProgress(
 function StageRail({ progress }: { progress: KeywordProgress }) {
   const activeIndex = STAGE_ORDER.findIndex(stage => stage.key === progress.stage)
   const terminalDone = progress.stage === 'completed'
+  const terminalPartial = progress.stage === 'partial'
   return (
     <ol className="grid grid-cols-4 gap-1" aria-label="当前关键词执行阶段">
       {STAGE_ORDER.map((stage, index) => {
-        const completed = terminalDone || activeIndex > index
+        const partialWarning = terminalPartial && stage.key === 'enhancement'
+        const completed = terminalDone || (
+          terminalPartial && ['search', 'list', 'sync'].includes(stage.key)
+        ) || activeIndex > index
         const active = activeIndex === index
         return (
           <li key={stage.key} className="min-w-0">
@@ -301,17 +319,19 @@ function StageRail({ progress }: { progress: KeywordProgress }) {
               <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border ${
                 completed
                   ? 'border-status-green bg-status-green text-white'
+                  : partialWarning
+                    ? 'border-amber-500 bg-amber-500/10 text-amber-700 dark:text-amber-300'
                   : active
                     ? 'border-primary bg-primary/10 text-primary'
                     : 'border-border bg-background text-muted-foreground'
               }`}>
-                {completed ? <Check className="h-3.5 w-3.5" /> : active ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Circle className="h-2.5 w-2.5" />}
+                {completed ? <Check className="h-3.5 w-3.5" /> : active ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Circle className={`h-2.5 w-2.5 ${partialWarning ? 'fill-current' : ''}`} />}
               </span>
               {index < STAGE_ORDER.length - 1 && (
                 <span className={`h-px min-w-2 flex-1 ${completed ? 'bg-status-green/55' : 'bg-border'}`} />
               )}
             </div>
-            <span className={`block truncate text-[10px] font-medium ${active ? 'text-primary' : completed ? 'text-status-green' : 'text-muted-foreground'}`}>
+            <span className={`block truncate text-[10px] font-medium ${partialWarning ? 'text-amber-700 dark:text-amber-300' : active ? 'text-primary' : completed ? 'text-status-green' : 'text-muted-foreground'}`}>
               {stage.label}
             </span>
           </li>
@@ -421,8 +441,8 @@ export function KeywordExecutionReport({ items, executions, agents, attempts }: 
                 <span className="min-w-0">
                   <span className="flex flex-wrap items-center gap-2">
                     <strong className="truncate text-sm text-foreground">{progress.keyword}</strong>
-                    <span className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold ${statusTone(progress.status)}`}>
-                      {isLive ? progress.stageLabel : STATUS_LABELS[progress.status] || progress.stageLabel}
+                    <span className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold ${statusTone(progress.status, progress.stage)}`}>
+                      {isLive || progress.stage === 'partial' ? progress.stageLabel : STATUS_LABELS[progress.status] || progress.stageLabel}
                     </span>
                   </span>
                   <span className="mt-1.5 flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -456,7 +476,7 @@ export function KeywordExecutionReport({ items, executions, agents, attempts }: 
                 <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">Selected keyword</div>
                 <h3 className="mt-1 truncate text-base font-bold text-foreground">{selected.keyword}</h3>
               </div>
-              <span className={`shrink-0 rounded-full border px-2 py-1 text-[10px] font-semibold ${statusTone(selected.status)}`}>{selected.stageLabel}</span>
+              <span className={`shrink-0 rounded-full border px-2 py-1 text-[10px] font-semibold ${statusTone(selected.status, selected.stage)}`}>{selected.stageLabel}</span>
             </div>
             <div className="mt-3 flex items-center gap-2 text-[11px] text-muted-foreground">
               <Bot className="h-3.5 w-3.5" />
@@ -502,6 +522,11 @@ export function KeywordExecutionReport({ items, executions, agents, attempts }: 
             </div>
 
             <div className="space-y-1 text-[11px] leading-4 text-muted-foreground">
+              {selected.stage === 'partial' && (
+                <p className="rounded-lg border border-amber-500/20 bg-amber-500/8 px-2.5 py-2 text-amber-800 dark:text-amber-200">
+                  已保存 {countLabel(selected.savedCount)}；未完成的增强仍需后续重试，已有结果不会丢失。
+                </p>
+              )}
               {selected.message && <p className="rounded-lg bg-muted/35 px-2.5 py-2 text-foreground">{selected.message}</p>}
               <p>最后上报：<strong className="font-medium text-foreground">{formatTime(selected.updatedAt)}</strong></p>
               <p>尝试次数：<strong className="font-medium text-foreground">{Math.max(0, Number(selected.item.attempt_count || 0))}</strong></p>

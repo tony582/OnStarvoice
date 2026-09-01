@@ -119,6 +119,7 @@ export async function checkAlerts(recordId) {
   const record = await queryOne('SELECT * FROM records WHERE id = $1', [recordId]);
   if (!record) return [];
   if (['official_content', 'blogger_profile'].includes(record.record_type)) return [];
+  if (record.business_visibility !== 'eligible') return [];
 
   const alerts = [];
 
@@ -168,6 +169,7 @@ export async function checkAlerts(recordId) {
        FROM records
        WHERE tenant_id = $1
          AND record_type NOT IN ('official_content', 'blogger_profile')
+         AND business_visibility = 'eligible'
          AND created_at >= now() - interval '14 days'`,
       [record.tenant_id]
     );
@@ -197,7 +199,7 @@ export async function checkAlerts(recordId) {
     windowStart.setMinutes(windowStart.getMinutes() - burstWindow);
 
     const recentNeg = await queryOne(
-      "SELECT COUNT(*) as n FROM records WHERE tenant_id = $1 AND record_type NOT IN ('official_content', 'blogger_profile') AND sentiment = 'negative' AND created_at >= $2",
+      "SELECT COUNT(*) as n FROM records WHERE tenant_id = $1 AND record_type NOT IN ('official_content', 'blogger_profile') AND business_visibility = 'eligible' AND sentiment = 'negative' AND created_at >= $2",
       [record.tenant_id, windowStart.toISOString()]
     );
 

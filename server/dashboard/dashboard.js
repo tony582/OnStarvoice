@@ -223,6 +223,60 @@ function linkHtml(url, label) {
   return '<a href="' + escHtml(href) + '" target="_blank" rel="noopener noreferrer">' + escHtml(label || href) + '</a>';
 }
 
+function xhsNoteIdFromUrl(value) {
+  try {
+    var url = new URL(String(value || '').trim());
+    var host = url.hostname.toLowerCase();
+    if (
+      url.protocol !== 'https:' ||
+      (host !== 'xiaohongshu.com' && !host.endsWith('.xiaohongshu.com')) ||
+      (url.port && url.port !== '443') ||
+      url.username ||
+      url.password
+    ) return '';
+    var direct = url.pathname.match(
+      /^\/(?:explore|search_result|discovery\/item|note|video)\/([A-Za-z0-9_-]{8,100})(?:\/|$)/i
+    );
+    var profile = url.pathname.match(
+      /^\/user\/profile\/[A-Za-z0-9_-]{6,100}\/([A-Za-z0-9_-]{8,100})(?:\/|$)/i
+    );
+    return (direct && direct[1]) || (profile && profile[1]) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function recordSourceLinkHtml(record) {
+  var platform = String(record && record.platform || '').trim().toLowerCase();
+  var sourceUrl = String(record && record.url || '').trim();
+  var canonicalUrl = String(record && record.canonical_url || '').trim();
+  var hasXhsUrl = /(^|\.)xiaohongshu\.com(?:\/|$)/i.test(
+    sourceUrl.replace(/^https?:\/\//i, '')
+  ) || /(^|\.)xiaohongshu\.com(?:\/|$)/i.test(
+    canonicalUrl.replace(/^https?:\/\//i, '')
+  );
+  if (platform !== 'xiaohongshu' && !hasXhsUrl) {
+    return sourceUrl ? linkHtml(sourceUrl, '打开原文') : '-';
+  }
+  var expectedId = String(record && record.external_id || '').trim()
+    || xhsNoteIdFromUrl(canonicalUrl);
+  var actualId = xhsNoteIdFromUrl(sourceUrl);
+  try {
+    var parsed = new URL(sourceUrl);
+    if (
+      actualId &&
+      expectedId &&
+      actualId.toLowerCase() === expectedId.toLowerCase() &&
+      String(parsed.searchParams.get('xsec_token') || '').trim()
+    ) {
+      return linkHtml(parsed.toString(), '打开原文');
+    }
+  } catch (e) {
+    // Invalid captured URL is presented as unavailable below.
+  }
+  return '<span class="source-unavailable">原文不可用</span>';
+}
+
 function parseJsonArray(value) {
   if (Array.isArray(value)) return value;
   try { return JSON.parse(value || '[]'); } catch(e) { return []; }
@@ -258,7 +312,7 @@ function showRecordDetail(idx) {
     ['点赞与收藏数', r.blogger_liked_collected > 0 ? r.blogger_liked_collected.toLocaleString() : '-'],
     ['账号属性', escHtml(ACCOUNT_TYPE_LABEL[r.blogger_account_type] || r.blogger_account_type || '-')],
     ['标题', escHtml(r.title || '-')],
-    ['笔记链接', r.url ? linkHtml(r.url, r.url.slice(0, 60) + (r.url.length > 60 ? '...' : '')) : '-'],
+    ['笔记链接', recordSourceLinkHtml(r)],
     ['正文', '<div class="detail-content">' + escHtml(r.content || '(无内容)') + '</div>'],
     ['话题标签', tags.length > 0 ? tags.map(function(t) { return '<span class="tag-chip">' + escHtml(typeof t === 'string' ? t : (t.name || t.tagName || '')) + '</span>'; }).join(' ') : '-'],
     ['笔记类型', r.video_url ? '视频' : '图文'],

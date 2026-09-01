@@ -30,17 +30,40 @@ function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
-const SAFETY_EVIDENCE_PATTERN =
-  /captcha|security.?verification|verification.?required|page.?challenge|security.?challenge|platform.?safety|safety.?block|risk.?control|forbidden|login.?required|auth(?:entication)?.?required|logged.?out|验证码|安全验证|安全限制|访问频繁|访问受限|风控|登录失效|请(?:先|重新)?登录|账号异常|账号限制/iu;
+const SAFETY_EVIDENCE_CODES = new Set([
+  'XHS_SECURITY_BLOCK',
+  'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+  'SECURITY_VERIFICATION_REQUIRED',
+  'PAGE_CHALLENGE_BLOCK',
+  'PLATFORM_SAFETY_BLOCK',
+  'HTTP_429',
+  'RATE_LIMITED',
+  'LOGIN_REQUIRED',
+  'AUTHENTICATION_REQUIRED',
+]);
+const SAFETY_EVIDENCE_CATEGORIES = new Set([
+  'platform_safety_block',
+  'login_required',
+  'authentication_required',
+]);
 
 function containsSafetyEvidence(value, depth = 0) {
   if (depth > 4 || value == null) return false;
-  if (typeof value === 'string') return SAFETY_EVIDENCE_PATTERN.test(value);
-  if (typeof value === 'boolean' || typeof value === 'number') return false;
+  if (typeof value !== 'object') return false;
   if (Array.isArray(value)) {
     return value.slice(0, 30).some(item => containsSafetyEvidence(item, depth + 1));
   }
-  if (typeof value !== 'object') return false;
+  const code = text(value.code || value.errorCode, 120).toUpperCase();
+  const category = text(value.category || value.errorCategory, 120)
+    .toLowerCase();
+  if (
+    SAFETY_EVIDENCE_CODES.has(code) ||
+    SAFETY_EVIDENCE_CATEGORIES.has(category) ||
+    value.securityEvidence?.confirmed === true ||
+    value.safetyEvidence?.confirmed === true
+  ) {
+    return true;
+  }
   return Object.entries(value).slice(0, 80).some(([key, nested]) => {
     if (
       /platformSafetyBlocked|platform_safety_blocked|securityBlocked|security_blocked|requiresManualAction|requires_manual_action|loginRequired|login_required/iu.test(key) &&
@@ -636,6 +659,48 @@ async function resolveSocialAccountForUsageEvent(tx, agent, event) {
   return {id: account.id, observed};
 }
 
+export async function recordObservedSocialAgentAvailability(
+  tx,
+  {agent, account = null, observed = null} = {},
+) {
+  const normalized = normalizeObservedSocialAccount(observed);
+  if (
+    !agent?.id ||
+    !agent?.tenant_id ||
+    !account?.id ||
+    !normalized ||
+    normalized.loginState !== 'authenticated' ||
+    !isTrustedSocialAccountObservation(normalized)
+  ) {
+    return false;
+  }
+  await tx.execute(`
+    INSERT INTO social_agent_daily_usage (
+      tenant_id, agent_id, platform, usage_date,
+      searches, enhancements, capture_runs, captured_items,
+      failed_events, safety_verifications, last_event_at, last_safety_at
+    ) VALUES (
+      $1, $2, $3, $4::date,
+      0, 0, 0, 0,
+      0, 0, $5::timestamptz, NULL
+    )
+    ON CONFLICT (tenant_id, agent_id, platform, usage_date)
+    DO UPDATE SET
+      last_event_at = GREATEST(
+        social_agent_daily_usage.last_event_at,
+        EXCLUDED.last_event_at
+      ),
+      updated_at = now()
+  `, [
+    agent.tenant_id,
+    agent.id,
+    normalized.platform,
+    shanghaiDate(normalized.observedAt),
+    normalized.observedAt,
+  ]);
+  return true;
+}
+
 export async function processSocialAccountHeartbeat(
   tx,
   {
@@ -651,12 +716,17 @@ export async function processSocialAccountHeartbeat(
     const observed = normalizeObservedSocialAccount(item);
     if (!observed) continue;
     observedByPlatform.set(observed.platform, observed);
-    await ensureCurrentSocialAccount(
+    const account = await ensureCurrentSocialAccount(
       tx,
       agent,
       observed.platform,
       observed,
     );
+    await recordObservedSocialAgentAvailability(tx, {
+      agent,
+      account,
+      observed,
+    });
   }
 
   const acceptedUsageEventIds = [];

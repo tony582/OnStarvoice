@@ -25,6 +25,7 @@ try {
 }
 
 importScripts(
+  'utils/control-storage-reserve.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
   'utils/capture/debug-session.js',
@@ -38,6 +39,11 @@ const captureTaskTabGroupApi = globalThis.OnStarvoiceCaptureTaskTabGroup;
 const cloudTaskAgentApi = globalThis.OnStarvoiceCloudTaskAgent;
 const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
 const socialAccountUsageApi = globalThis.OnStarvoiceSocialAccountUsage;
+const controlStorageReserveApi =
+  globalThis.OnStarvoiceControlStorageReserve;
+if (!controlStorageReserveApi) {
+  throw new Error('Control storage reserve helper is unavailable');
+}
 const CAPTURE_TASK_GROUP_TITLE =
   captureTaskTabGroupApi.DEFAULT_GROUP_TITLE || 'StarVoice 采集任务';
 
@@ -55,7 +61,44 @@ const STORAGE_KEYS = {
   targetedPostRunRequest: 'onstarvoice.targetedPostRunRequest',
   observedSocialAccounts: 'onstarvoice.observedSocialAccounts',
   socialAccountUsageQueue: 'onstarvoice.socialAccountUsageQueue',
+  diagnostics: 'onstarvoice.diagnostics',
 };
+
+const CONTROL_STORAGE_CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
+const TASK_LEDGER_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const CLOUD_COMMAND_RESULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+const AUTHORITATIVE_CONTROL_TERMINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+  'needs_action',
+]);
+
+async function runAuthoritativeControlStorageMutation(
+  mutation,
+  {relieveStoragePressure = false} = {},
+) {
+  const result =
+    await controlStorageReserveApi.runWithControlStorageReserveRetry(
+      mutation,
+      {
+        storage: chrome.storage.local,
+        ...(relieveStoragePressure
+          ? {
+              onQuotaPressure: () => compactExpiredControlStorage({
+                force: true,
+                reason: 'quota_pressure',
+              }),
+            }
+          : {}),
+      },
+    );
+  return result.value;
+}
 
 const DEFAULT_RUNTIME = {
   clientUuid: '',
@@ -78,6 +121,11 @@ const UNATTENDED_KEYWORD_ALARM_NAME = 'onstarvoice:unattended-keyword-plan';
 const UNATTENDED_SUPERVISOR_ALARM_NAME = 'onstarvoice:unattended-supervisor';
 const CLOUD_TASK_AGENT_ALARM_NAME = 'onstarvoice:cloud-task-agent';
 const UNATTENDED_RUNNER_QUERY_KEY = 'unattendedRun';
+const UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY = 'unattendedAttempt';
+const UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX =
+  'onstarvoice.unattendedCheckpointReportOutbox.v2.';
+const UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION = 2;
+const UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION = 1;
 const TARGETED_POST_RUNNER_QUERY_KEY = 'targetedPostRun';
 const TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY = 'targetedPostAttempt';
 const SCHEDULE_MODES = new Set([
@@ -96,6 +144,12 @@ const UNATTENDED_LOCK_RETRY_DELAY_MS = 5 * 60 * 1000;
 const UNATTENDED_RUN_CLAIM_GRACE_MS = 2 * 60 * 1000;
 const UNATTENDED_RUN_ACTIVE_GRACE_MS = 3 * 60 * 1000;
 const UNATTENDED_RUN_BUSINESS_STALL_MS = 6 * 60 * 1000;
+// A single comment-detail request is allowed to run for up to ten minutes.
+// The generic six-minute business watchdog used to kill that healthy request,
+// remove its tab, and manufacture a follow-up `No tab with id` failure. Keep
+// the runner-heartbeat fence at three minutes, but give this explicit long
+// stage a bounded margin beyond its own operation timeout.
+const UNATTENDED_RUN_COMMENT_STAGE_STALL_MS = 12 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_PERIOD_MINUTES = 1;
 const CLOUD_TASK_AGENT_PERIOD_MINUTES = 1;
 const CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS = 15 * 1000;
@@ -156,8 +210,101 @@ const settledCaptureRequestIds = new Map();
 let captureDebugSessionManager = null;
 let captureTaskTabGroupManager = null;
 let captureTaskOwnerCoordinator = null;
+const CAPTURE_TASK_REPLACEMENT_TAB_TTL_MS = 10 * 60 * 1000;
+const captureTaskReplacementTabIds = new Map();
 const captureTaskPendingWorkerTabIds = new Map();
 const captureTaskCleanupInProgress = new Set();
+let captureTaskBeginInFlight = null;
+
+function pruneCaptureTaskReplacementTabs(now = Date.now()) {
+  for (const [tabId, replacement] of captureTaskReplacementTabIds) {
+    if (Number(replacement?.expiresAt) <= now) {
+      captureTaskReplacementTabIds.delete(tabId);
+    }
+  }
+}
+
+function rememberCaptureTaskReplacementTab({
+  removedTabId,
+  addedTabId,
+  taskId,
+  attemptId = '',
+} = {}) {
+  const oldTabId = resolveCaptureTaskTabId(removedTabId);
+  const newTabId = resolveCaptureTaskTabId(addedTabId);
+  const normalizedTaskId = String(taskId || '').trim();
+  if (!oldTabId || !newTabId || !normalizedTaskId) return false;
+  pruneCaptureTaskReplacementTabs();
+  captureTaskReplacementTabIds.set(oldTabId, {
+    tabId: newTabId,
+    taskId: normalizedTaskId,
+    attemptId: String(attemptId || '').trim(),
+    expiresAt: Date.now() + CAPTURE_TASK_REPLACEMENT_TAB_TTL_MS,
+  });
+  return true;
+}
+
+function resolveCaptureTaskReplacementLease(
+  tabId,
+  {taskId = '', attemptId = ''} = {},
+) {
+  const originalTabId = resolveCaptureTaskTabId(tabId);
+  const requestedTaskId = String(taskId || '').trim();
+  const requestedAttemptId = String(attemptId || '').trim();
+  if (!originalTabId) return null;
+  pruneCaptureTaskReplacementTabs();
+
+  let replacementTabId = originalTabId;
+  let replacementTaskId = requestedTaskId;
+  let replacementAttemptId = requestedAttemptId;
+  const visited = new Set([originalTabId]);
+  for (let depth = 0; depth < 8; depth += 1) {
+    const replacement = captureTaskReplacementTabIds.get(replacementTabId);
+    if (!replacement) break;
+    if (
+      replacementTaskId &&
+      replacement.taskId !== replacementTaskId
+    ) {
+      return null;
+    }
+    if (
+      replacementAttemptId &&
+      String(replacement.attemptId || '').trim() !== replacementAttemptId
+    ) {
+      return null;
+    }
+    replacementTaskId = replacementTaskId || replacement.taskId;
+    replacementAttemptId =
+      replacementAttemptId || String(replacement.attemptId || '').trim();
+    replacementTabId = resolveCaptureTaskTabId(replacement.tabId);
+    if (!replacementTabId || visited.has(replacementTabId)) return null;
+    visited.add(replacementTabId);
+  }
+  if (replacementTabId === originalTabId || !replacementTaskId) return null;
+
+  return {
+    tabId: replacementTabId,
+    taskId: replacementTaskId,
+    attemptId: replacementAttemptId,
+  };
+}
+
+function resolveCaptureTaskReplacementTab(tabId, taskId = '') {
+  const replacement = resolveCaptureTaskReplacementLease(tabId, {taskId});
+  if (!replacement) return null;
+
+  const group = captureTaskTabGroupManager?.getTask(replacement.taskId);
+  if (
+    !group ||
+    (
+      Number(group.sourceTabId) !== replacement.tabId &&
+      !group.workerTabIds?.includes(replacement.tabId)
+    )
+  ) {
+    return null;
+  }
+  return replacement;
+}
 const DEFAULT_UNATTENDED_KEYWORD_PLAN = Object.freeze({
   enabled: false,
   platform: 'xiaohongshu',
@@ -400,6 +547,19 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
     'syncFailedCount',
     'syncSkippedCount',
     'syncRemainingCount',
+    'streamingSyncEnqueuedCount',
+    'streamingSyncProcessedCount',
+    'streamingSyncSuccessCount',
+    'streamingSyncFailedCount',
+    'streamingSyncSkippedCount',
+    'streamingSyncPendingCount',
+    'streamingSyncActiveCount',
+    'streamingSyncRemainingCount',
+    'streamingSyncCapturedUniqueCount',
+    'streamingSyncEnqueuedUniqueCount',
+    'streamingSyncExcludedUniqueCount',
+    'streamingSyncSucceededUniqueCount',
+    'capturedRecordCount',
     'keywordCompletedCount',
     'keywordPartialCount',
     'keywordFailedCount',
@@ -497,6 +657,26 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
           }))
       : [],
     taskMeta,
+    streamingSyncEvidenceKnown:
+      typeof progress.streamingSyncEvidenceKnown === 'boolean'
+        ? progress.streamingSyncEvidenceKnown
+        : null,
+    streamingSyncDrainCompleted:
+      typeof progress.streamingSyncDrainCompleted === 'boolean'
+        ? progress.streamingSyncDrainCompleted
+        : null,
+    streamingSyncEnabled:
+      typeof progress.streamingSyncEnabled === 'boolean'
+        ? progress.streamingSyncEnabled
+        : null,
+    streamingSyncBlocked:
+      typeof progress.streamingSyncBlocked === 'boolean'
+        ? progress.streamingSyncBlocked
+        : null,
+    streamingSyncCanceled:
+      typeof progress.streamingSyncCanceled === 'boolean'
+        ? progress.streamingSyncCanceled
+        : null,
     ...normalizedCounts,
   };
 }
@@ -638,9 +818,11 @@ async function readUnattendedKeywordPlan() {
 
 let unattendedRunMutationQueue = Promise.resolve();
 let unattendedRunArchiveMutationQueue = Promise.resolve();
+let unattendedRunnerTabLifecycleQueue = Promise.resolve();
 let taskLedgerMutationQueue = Promise.resolve();
 let captureTaskBeginQueue = Promise.resolve();
 let targetedPostRunMutationQueue = Promise.resolve();
+let cloudCommandResultsMutationQueue = Promise.resolve();
 
 function runUnattendedRunMutation(operation) {
   const pending = unattendedRunMutationQueue.then(operation, operation);
@@ -651,6 +833,12 @@ function runUnattendedRunMutation(operation) {
 function runUnattendedRunArchiveMutation(operation) {
   const pending = unattendedRunArchiveMutationQueue.then(operation, operation);
   unattendedRunArchiveMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runUnattendedRunnerTabLifecycle(operation) {
+  const pending = unattendedRunnerTabLifecycleQueue.then(operation, operation);
+  unattendedRunnerTabLifecycleQueue = pending.catch(() => null);
   return pending;
 }
 
@@ -669,6 +857,12 @@ function runCaptureTaskBeginOperation(operation) {
 function runTargetedPostRunMutation(operation) {
   const pending = targetedPostRunMutationQueue.then(operation, operation);
   targetedPostRunMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runCloudCommandResultsMutation(operation) {
+  const pending = cloudCommandResultsMutationQueue.then(operation, operation);
+  cloudCommandResultsMutationQueue = pending.catch(() => null);
   return pending;
 }
 
@@ -719,15 +913,88 @@ function normalizeOrchestrationExecutionContext(value) {
         .filter(Boolean),
     ),
   ).slice(0, 30);
+  const itemAttempts = (Array.isArray(source.itemAttempts)
+    ? source.itemAttempts
+    : [])
+    .slice(0, 30)
+    .map((entry) => {
+      const attempt =
+        entry && typeof entry === 'object' && !Array.isArray(entry) ? entry : {};
+      return {
+        itemId: String(attempt.itemId || '').trim().slice(0, 100),
+        attemptId: String(
+          attempt.attemptId || attempt.captureTaskItemAttemptId || '',
+        ).trim().slice(0, 100),
+        requestHash: String(
+          attempt.requestHash || attempt.captureTaskItemRequestHash || '',
+        ).trim().slice(0, 100),
+        keyword: String(attempt.keyword || '').trim().slice(0, 120),
+        recordId: String(attempt.recordId || '').trim().slice(0, 100),
+        externalId: String(attempt.externalId || '').trim().slice(0, 160),
+        attemptNumber: Math.max(
+          0,
+          Math.floor(Number(attempt.attemptNumber) || 0),
+        ),
+        assignmentRevision: Math.max(
+          0,
+          Math.floor(Number(attempt.assignmentRevision) || 0),
+        ),
+      };
+    })
+    .filter((attempt) => attempt.itemId && attempt.attemptId);
   const attemptIdentity = String(
     source.attemptIdentity || source.attempt_identity || '',
   ).trim().slice(0, 100);
+  const requiresLocalClosureReuseFenceV1 =
+    source.requiresLocalClosureReuseFenceV1 === true;
+  const bootstrapStartAt = Date.parse(
+    String(
+      source.bootstrapStartNotBefore ||
+        source.bootstrap_start_not_before ||
+        '',
+    ),
+  );
+  const bootstrapStartNotBefore = Number.isFinite(bootstrapStartAt)
+    ? new Date(bootstrapStartAt).toISOString()
+    : '';
+  const bootstrapDelayMs = Math.max(
+    0,
+    Math.min(60 * 1000, Math.floor(Number(source.bootstrapDelayMs) || 0)),
+  );
+  const bootstrapStaggerBucket = Math.max(
+    0,
+    Math.min(20, Math.floor(Number(source.bootstrapStaggerBucket) || 0)),
+  );
+  const recentTechnicalFailureCount = Math.max(
+    0,
+    Math.min(100, Math.floor(Number(source.recentTechnicalFailureCount) || 0)),
+  );
+  const recentAffectedAgentCount = Math.max(
+    0,
+    Math.min(100, Math.floor(Number(source.recentAffectedAgentCount) || 0)),
+  );
   return {
     parentTaskId,
     revision: Math.max(0, Math.floor(Number(source.revision) || 0)),
     itemIds,
+    ...(itemAttempts.length > 0 ? {itemAttempts} : {}),
     ...(distributionMode ? {distributionMode} : {}),
     ...(attemptIdentity ? {attemptIdentity} : {}),
+    ...(requiresLocalClosureReuseFenceV1
+      ? {requiresLocalClosureReuseFenceV1: true}
+      : {}),
+    ...(bootstrapStartNotBefore ? {bootstrapStartNotBefore} : {}),
+    ...(bootstrapDelayMs ? {bootstrapDelayMs} : {}),
+    ...(bootstrapStartNotBefore
+      ? {
+          bootstrapPacingReason: String(
+            source.bootstrapPacingReason || '',
+          ).trim().slice(0, 80),
+          bootstrapStaggerBucket,
+          recentTechnicalFailureCount,
+          recentAffectedAgentCount,
+        }
+      : {}),
     scheduleId: String(source.scheduleId || '').trim().slice(0, 100),
     scheduledFor: String(source.scheduledFor || '').trim().slice(0, 100),
     sourceExecutionTaskId: String(
@@ -960,6 +1227,34 @@ function parseTimestampMs(value) {
   return Number.isFinite(timestamp) ? timestamp : NaN;
 }
 
+function resolveUnattendedBusinessProgressAt({
+  suppliedAt,
+  currentAt,
+  now,
+  hasProgressSequence = false,
+} = {}) {
+  const nowMs = parseTimestampMs(now);
+  const currentMs = parseTimestampMs(currentAt);
+  const suppliedMs = parseTimestampMs(suppliedAt);
+  if (
+    hasProgressSequence &&
+    Number.isFinite(suppliedMs) &&
+    Number.isFinite(nowMs) &&
+    suppliedMs <= nowMs &&
+    (!Number.isFinite(currentMs) || suppliedMs >= currentMs)
+  ) {
+    return new Date(suppliedMs).toISOString();
+  }
+  if (
+    Number.isFinite(suppliedMs) &&
+    Number.isFinite(currentMs) &&
+    suppliedMs < currentMs
+  ) {
+    return new Date(currentMs).toISOString();
+  }
+  return Number.isFinite(nowMs) ? new Date(nowMs).toISOString() : String(now || '');
+}
+
 const UNATTENDED_PROGRESS_VOLATILE_FIELDS = new Set([
   'businessProgressAt',
   'elapsedMs',
@@ -989,24 +1284,36 @@ function buildUnattendedBusinessProgressFingerprint(value) {
   return JSON.stringify(normalize(value));
 }
 
+const UNATTENDED_SETTLED_CHECKPOINT_STATUSES = new Set([
+  'completed',
+  'failed',
+  'partial',
+  'skipped',
+]);
+
 function buildUnattendedRecoveryMilestoneFingerprint(checkpoint) {
   const source =
     checkpoint && typeof checkpoint === 'object' && !Array.isArray(checkpoint)
       ? checkpoint
       : {};
   const keywordResults = Array.isArray(source.keywordResults)
-    ? source.keywordResults.map((entry) => ({
-        round: Math.max(1, Number(entry?.round) || 1),
-        index: Math.max(0, Number(entry?.index) || 0),
-        keyword: String(entry?.keyword || ''),
-        status: String(entry?.status || ''),
-        attemptCount: Math.max(0, Number(entry?.attemptCount) || 0),
-        savedCount: Math.max(0, Number(entry?.savedCount) || 0),
-        error: String(entry?.error || ''),
-        errorCode: String(entry?.errorCode || ''),
-        securityBlocked: entry?.securityBlocked === true,
-        requiresManualAction: entry?.requiresManualAction === true,
-      }))
+    ? source.keywordResults
+        .filter((entry) =>
+          UNATTENDED_SETTLED_CHECKPOINT_STATUSES.has(
+            String(entry?.status || '').trim().toLowerCase(),
+          ),
+        )
+        .map((entry) => ({
+          round: Math.max(1, Number(entry?.round) || 1),
+          index: Math.max(0, Number(entry?.index) || 0),
+          keyword: String(entry?.keyword || ''),
+          status: String(entry?.status || '').trim().toLowerCase(),
+          savedCount: Math.max(0, Number(entry?.savedCount) || 0),
+          noResults: entry?.noResults === true,
+          resultKind: String(entry?.resultKind || ''),
+          candidateCount: Math.max(0, Number(entry?.candidateCount) || 0),
+          scanComplete: entry?.scanComplete === true,
+        }))
     : [];
   const normalizeKeywords = (value) =>
     Array.isArray(value)
@@ -1019,6 +1326,215 @@ function buildUnattendedRecoveryMilestoneFingerprint(checkpoint) {
     failedKeywords: normalizeKeywords(source.failedKeywords),
     skippedKeywords: normalizeKeywords(source.skippedKeywords),
   });
+}
+
+function normalizeUnattendedCheckpointRound(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function normalizeUnattendedCheckpointIndex(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function buildUnattendedCheckpointResultKey(entry) {
+  const round = normalizeUnattendedCheckpointRound(entry?.round);
+  const keyword = String(entry?.keyword || '').trim();
+  return keyword
+    ? `${round}:keyword:${keyword}`
+    : `${round}:index:${normalizeUnattendedCheckpointIndex(entry?.index)}`;
+}
+
+function collectUnattendedCheckpointResultKeys(checkpoint) {
+  return new Set(
+    (Array.isArray(checkpoint?.keywordResults)
+      ? checkpoint.keywordResults
+      : []
+    ).map((entry) => buildUnattendedCheckpointResultKey(entry)),
+  );
+}
+
+function normalizeUnattendedCheckpointResultStatus(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isUnattendedCheckpointResultStatusRegression(currentStatus, nextStatus) {
+  const current = normalizeUnattendedCheckpointResultStatus(currentStatus);
+  const next = normalizeUnattendedCheckpointResultStatus(nextStatus);
+  if (current === next) return false;
+  if (!current) return false;
+  const monotonicTransitions = {
+    retrying: new Set(['partial', 'failed', 'completed']),
+    partial: new Set(['failed', 'completed']),
+    failed: new Set(['completed']),
+  };
+  return !monotonicTransitions[current]?.has(next);
+}
+
+function isUnattendedCheckpointResultRegression(nextEntry, currentEntry) {
+  if (
+    isUnattendedCheckpointResultStatusRegression(
+      currentEntry?.status,
+      nextEntry?.status,
+    )
+  ) {
+    return true;
+  }
+  for (const field of ['index', 'attemptCount', 'savedCount']) {
+    if (
+      normalizeUnattendedCheckpointIndex(nextEntry?.[field]) <
+      normalizeUnattendedCheckpointIndex(currentEntry?.[field])
+    ) {
+      return true;
+    }
+  }
+  for (const field of [
+    'noResults',
+    'securityBlocked',
+    'platformSafetyBlocked',
+    'requiresManualAction',
+  ]) {
+    if (currentEntry?.[field] === true && nextEntry?.[field] !== true) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildUnattendedCheckpointResultMap(checkpoint) {
+  return new Map(
+    (Array.isArray(checkpoint?.keywordResults)
+      ? checkpoint.keywordResults
+      : []
+    ).map((entry) => [buildUnattendedCheckpointResultKey(entry), entry]),
+  );
+}
+
+function collectUnattendedSettledCheckpointKeywords(checkpoint) {
+  const keywords = new Set();
+  for (const field of [
+    'completedKeywords',
+    'failedKeywords',
+    'skippedKeywords',
+  ]) {
+    for (const value of Array.isArray(checkpoint?.[field])
+      ? checkpoint[field]
+      : []) {
+      const keyword = String(value || '').trim();
+      if (keyword) keywords.add(keyword);
+    }
+  }
+  for (const entry of Array.isArray(checkpoint?.keywordResults)
+    ? checkpoint.keywordResults
+    : []) {
+    const keyword = String(entry?.keyword || '').trim();
+    const status = String(entry?.status || '').trim();
+    if (keyword && UNATTENDED_SETTLED_CHECKPOINT_STATUSES.has(status)) {
+      keywords.add(keyword);
+    }
+  }
+  return keywords;
+}
+
+function collectUnattendedCheckpointSettlementStatuses(checkpoint) {
+  const statuses = new Map();
+  const add = (keywordValue, statusValue) => {
+    const keyword = String(keywordValue || '').trim();
+    const status = normalizeUnattendedCheckpointResultStatus(statusValue);
+    if (!keyword || !status) return;
+    const current = statuses.get(keyword) || new Set();
+    current.add(status);
+    statuses.set(keyword, current);
+  };
+  for (const [field, status] of [
+    ['completedKeywords', 'completed'],
+    ['failedKeywords', 'failed'],
+    ['skippedKeywords', 'skipped'],
+  ]) {
+    for (const keyword of Array.isArray(checkpoint?.[field])
+      ? checkpoint[field]
+      : []) {
+      add(keyword, status);
+    }
+  }
+  for (const entry of Array.isArray(checkpoint?.keywordResults)
+    ? checkpoint.keywordResults
+    : []) {
+    if (
+      UNATTENDED_SETTLED_CHECKPOINT_STATUSES.has(
+        normalizeUnattendedCheckpointResultStatus(entry?.status),
+      )
+    ) {
+      add(entry?.keyword, entry?.status);
+    }
+  }
+  return statuses;
+}
+
+function isUnattendedCheckpointSettlementRegression(
+  nextCheckpoint,
+  currentCheckpoint,
+) {
+  const nextStatuses = collectUnattendedCheckpointSettlementStatuses(
+    nextCheckpoint,
+  );
+  for (const [keyword, currentStatuses] of
+    collectUnattendedCheckpointSettlementStatuses(currentCheckpoint)) {
+    const available = nextStatuses.get(keyword) || new Set();
+    for (const status of currentStatuses) {
+      const preserved = available.has(status);
+      const upgraded =
+        (status === 'failed' && available.has('completed')) ||
+        (status === 'partial' &&
+          (available.has('failed') || available.has('completed')));
+      if (!preserved && !upgraded) return true;
+    }
+  }
+  return false;
+}
+
+function isLegacyUnattendedCheckpointRegression(nextCheckpoint, currentCheckpoint) {
+  const nextRound = normalizeUnattendedCheckpointRound(nextCheckpoint?.round);
+  const currentRound = normalizeUnattendedCheckpointRound(
+    currentCheckpoint?.round,
+  );
+  if (nextRound < currentRound) return true;
+  if (nextRound === currentRound) {
+    for (const field of ['keywordIndex', 'activeKeywordIndex']) {
+      if (
+        normalizeUnattendedCheckpointIndex(nextCheckpoint?.[field]) <
+        normalizeUnattendedCheckpointIndex(currentCheckpoint?.[field])
+      ) {
+        return true;
+      }
+    }
+  }
+
+  const nextSettledKeywords = collectUnattendedSettledCheckpointKeywords(
+    nextCheckpoint,
+  );
+  for (const keyword of collectUnattendedSettledCheckpointKeywords(
+    currentCheckpoint,
+  )) {
+    if (!nextSettledKeywords.has(keyword)) return true;
+  }
+  if (
+    isUnattendedCheckpointSettlementRegression(nextCheckpoint, currentCheckpoint)
+  ) {
+    return true;
+  }
+
+  const nextResults = buildUnattendedCheckpointResultMap(nextCheckpoint);
+  for (const [resultKey, currentEntry] of
+    buildUnattendedCheckpointResultMap(currentCheckpoint)) {
+    const nextEntry = nextResults.get(resultKey);
+    if (!nextEntry) return true;
+    if (isUnattendedCheckpointResultRegression(nextEntry, currentEntry)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function getUnattendedTaskCenterCore() {
@@ -1085,6 +1601,10 @@ function buildTaskCenterCheckpointFromUnattendedRequest(request) {
       status: String(entry?.status || '').trim(),
       attemptCount: Math.max(0, Number(entry?.attemptCount) || 0),
       savedCount: Math.max(0, Number(entry?.savedCount) || 0),
+      noResults: entry?.noResults === true,
+      resultKind: String(entry?.resultKind || '').trim(),
+      candidateCount: Math.max(0, Number(entry?.candidateCount) || 0),
+      scanComplete: entry?.scanComplete === true,
       error: String(entry?.error || '').trim(),
       errorCode: String(entry?.errorCode || '').trim(),
       errorCategory: String(entry?.errorCategory || '').trim(),
@@ -1331,11 +1851,11 @@ async function persistUnattendedRunMutation(
     mirrorPlan = true,
   } = {},
 ) {
-  return await runTaskLedgerMutation(async () => {
-    const normalized = normalizeUnattendedRunRequest(request);
-    if (!normalized) {
-      return {request: null, plan: null, ledger: null};
-    }
+  const normalized = normalizeUnattendedRunRequest(request);
+  if (!normalized) {
+    return {request: null, plan: null, ledger: null};
+  }
+  const persist = () => runTaskLedgerMutation(async () => {
     const now = String(normalized.updatedAt || new Date().toISOString());
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.unattendedKeywordPlan,
@@ -1427,6 +1947,9 @@ async function persistUnattendedRunMutation(
       ledgerReason: ledgerResult.reason,
     };
   });
+  return isTerminalUnattendedRunStatus(normalized.status)
+    ? await runAuthoritativeControlStorageMutation(persist)
+    : await persist();
 }
 
 async function readTaskLedger() {
@@ -1509,6 +2032,7 @@ let cloudTaskAgentSyncTimer = null;
 let cloudTaskAgentLastError = '';
 let cloudTaskAgentFailureCount = 0;
 let cloudTaskAgentRetryNotBefore = 0;
+const cloudTaskAgentConfirmedLocalClosureKeys = new Set();
 let socialAccountIdentityRefreshInFlight = null;
 let socialAccountUsageQueueMutation = Promise.resolve();
 
@@ -1854,7 +2378,8 @@ async function ensureCloudTaskAgentScope(agentId) {
   });
   if (switched) {
     cloudTaskAgentLastError = '';
-    await chrome.storage.local.remove(STORAGE_KEYS.cloudCommandResults);
+    await runCloudCommandResultsMutation(() =>
+      chrome.storage.local.remove(STORAGE_KEYS.cloudCommandResults));
     await clearUnattendedKeywordRunArchive();
   }
   return next;
@@ -1911,22 +2436,24 @@ async function readCloudCommandResults() {
 }
 
 async function rememberCloudCommandResult(commandId, result) {
-  const current = await readCloudCommandResults();
-  const entries = Object.entries({
-    ...current,
-    [commandId]: {
-      ...(result && typeof result === 'object' ? result : {}),
-      storedAt: new Date().toISOString(),
-    },
-  })
-    .sort((left, right) =>
-      Date.parse(String(right[1]?.storedAt || '')) -
-      Date.parse(String(left[1]?.storedAt || '')),
-    )
-    .slice(0, 50);
-  const next = Object.fromEntries(entries);
-  await chrome.storage.local.set({[STORAGE_KEYS.cloudCommandResults]: next});
-  return next[commandId];
+  return await runCloudCommandResultsMutation(async () => {
+    const current = await readCloudCommandResults();
+    const entries = Object.entries({
+      ...current,
+      [commandId]: {
+        ...(result && typeof result === 'object' ? result : {}),
+        storedAt: new Date().toISOString(),
+      },
+    })
+      .sort((left, right) =>
+        Date.parse(String(right[1]?.storedAt || '')) -
+        Date.parse(String(left[1]?.storedAt || '')),
+      )
+      .slice(0, 50);
+    const next = Object.fromEntries(entries);
+    await chrome.storage.local.set({[STORAGE_KEYS.cloudCommandResults]: next});
+    return next[commandId];
+  });
 }
 
 function summarizeCloudRecoveryResult(result) {
@@ -2368,6 +2895,25 @@ async function closeSupersededTargetedPostRunnerTabs(
   superseded,
   expectedCurrent = null,
 ) {
+  if (
+    !targetedPostLogicalRequestId(superseded) ||
+    !String(superseded?.attemptId || '').trim() ||
+    isSameTargetedPostAttempt(superseded, expectedCurrent)
+  ) {
+    return {
+      ok: true,
+      current: await readTargetedPostRunRequest({persistNormalized: false}),
+      removedTabIds: [],
+      removedCount: 0,
+    };
+  }
+  return await closeOwnedTargetedPostRunnerTabs(
+    superseded,
+    expectedCurrent,
+  );
+}
+
+async function closeOwnedTargetedPostRunnerTabs(target, expectedCurrent) {
   let current = await readTargetedPostRunRequest({
     persistNormalized: false,
   });
@@ -2378,9 +2924,8 @@ async function closeSupersededTargetedPostRunnerTabs(
     removedCount: 0,
   };
   if (
-    !targetedPostLogicalRequestId(superseded) ||
-    !String(superseded?.attemptId || '').trim() ||
-    isSameTargetedPostAttempt(superseded, expectedCurrent)
+    !targetedPostLogicalRequestId(target) ||
+    !String(target?.attemptId || '').trim()
   ) {
     return initialResult;
   }
@@ -2398,7 +2943,7 @@ async function closeSupersededTargetedPostRunnerTabs(
     };
   }
   const candidates = tabs.filter((tab) =>
-    isTargetedPostRunnerTabForAttempt(tab, superseded),
+    isTargetedPostRunnerTabForAttempt(tab, target),
   );
   const removedTabIds = [];
   for (const tab of candidates) {
@@ -2428,6 +2973,27 @@ async function closeSupersededTargetedPostRunnerTabs(
     removedTabIds,
     removedCount: removedTabIds.length,
   };
+}
+
+async function closeTerminalTargetedPostRunnerTabs(request) {
+  const status = String(request?.status || '').trim().toLowerCase();
+  if (
+    status === 'needs_action' ||
+    !cloudTargetedPostApi?.isTerminalRunStatus?.(status)
+  ) {
+    return {
+      ok: true,
+      current: await readTargetedPostRunRequest({persistNormalized: false}),
+      removedTabIds: [],
+      removedCount: 0,
+      skipped: true,
+      reason:
+        status === 'needs_action'
+          ? 'targeted_post_needs_action_preserved'
+          : 'targeted_post_not_terminal',
+    };
+  }
+  return await closeOwnedTargetedPostRunnerTabs(request, request);
 }
 
 function buildTargetedPostTaskCenterRun(request, existingRun = null) {
@@ -2501,7 +3067,12 @@ function buildTargetedPostTaskCenterRun(request, existingRun = null) {
     updatedAt,
     finishedAt: terminal ? String(request.finishedAt || updatedAt) : '',
     heartbeatAt: String(request.heartbeatAt || updatedAt),
-    businessProgressAt: String(progress.updatedAt || updatedAt),
+    businessProgressAt: String(
+      request.businessProgressAt ||
+        request.startedAt ||
+        request.createdAt ||
+        updatedAt,
+    ),
     message:
       String(progress.message || request.message || '').trim() ||
       (request.cancelRequested === true ? '正在停止定向巡查任务' : ''),
@@ -2562,7 +3133,7 @@ async function persistTargetedPostRunRequest(request) {
   }
   const normalized = normalizeStoredTargetedPostRunRequest(request);
   const requestToPersist = normalized.request || request;
-  return await runTaskLedgerMutation(async () => {
+  const persist = () => runTaskLedgerMutation(async () => {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
     const core = getUnattendedTaskCenterCore();
     const now = new Date().toISOString();
@@ -2611,6 +3182,11 @@ async function persistTargetedPostRunRequest(request) {
     scheduleCloudTaskAgentSync('targeted_post_state_changed');
     return requestToPersist;
   });
+  return cloudTargetedPostApi?.isTerminalRunStatus?.(
+    String(requestToPersist.status || ''),
+  )
+    ? await runAuthoritativeControlStorageMutation(persist)
+    : await persist();
 }
 
 async function createOrResumeTargetedPostRun(command, payload) {
@@ -3057,6 +3633,23 @@ async function executeCloudTaskAgentCommand(command, token) {
       '',
   ).trim();
 
+  if (
+    commandType === 'create' &&
+    String(payload.executionMode || '').trim() === 'source_open'
+  ) {
+    commandResult = await executeXhsSourceOpenCommand(
+      command,
+      payload,
+      commandResult,
+    );
+    return await cloudTaskAgentApi.completeCommand({
+      token,
+      commandId,
+      success: commandResult?.accepted === true,
+      result: commandResult,
+    });
+  }
+
   if (commandType === 'create' && isCloudTargetedPostPayload(payload)) {
     const targeted = await executeCloudTargetedPostCreateCommand(
       command,
@@ -3289,6 +3882,10 @@ async function executeCloudTaskAgentCommand(command, token) {
                     : {}),
                   attemptIdentity: payload.attemptIdentity,
                 }),
+                checkpoint:
+                  payload.checkpoint && typeof payload.checkpoint === 'object'
+                    ? payload.checkpoint
+                    : null,
               },
             );
             if (!request) {
@@ -3371,15 +3968,45 @@ async function executeCloudTaskAgentCommand(command, token) {
             (run) => run?.metadata?.cloudCommandId === commandId,
           ) || null;
     if (reconciledRun) {
+      const exactCurrentRequest = Boolean(
+        currentRequest?.id === reconciledRun.id &&
+        currentRequest?.attemptId === reconciledRun.attemptId
+      );
+      const manualOrchestrationRecovery = Boolean(
+        exactCurrentRequest &&
+        currentRequest?.recoveryReason === 'manual_recovery' &&
+        normalizeOrchestrationExecutionContext(
+          currentRequest?.orchestrationContext,
+        )
+      );
+      if (
+        manualOrchestrationRecovery &&
+        !unattendedManualRecoveryHasAdoptionReceipt(currentRequest) &&
+        currentRequest?.error?.code !== 'RECOVERY_ADOPTION_NOT_CONFIRMED'
+      ) {
+        return {
+          ok: true,
+          deferred: true,
+          reason: 'recovery_adoption_pending',
+          commandId,
+        };
+      }
+      const adoptionRejected = Boolean(
+        reconciledRun?.error?.code === 'RECOVERY_ADOPTION_NOT_CONFIRMED' ||
+        (exactCurrentRequest &&
+          currentRequest?.error?.code === 'RECOVERY_ADOPTION_NOT_CONFIRMED')
+      );
       commandResult = await rememberCloudCommandResult(commandId, {
         state: 'completed',
-        accepted: true,
-        reason: 'reconciled',
+        accepted: !adoptionRejected,
+        reason: adoptionRejected ? 'recovery_adoption_rejected' : 'reconciled',
         requestId: String(reconciledRun.id || ''),
         parentRequestId: String(
           reconciledRun.parentRequestId || reconciledRun.metadata?.parentRequestId || requestId,
         ),
-        message: '已对账到设备创建的恢复任务',
+        message: adoptionRejected
+          ? '恢复工作项已由其它 Agent 接管，本设备没有启动重复采集'
+          : '已对账到设备创建的恢复任务',
       });
     } else {
       const recoverableRequest =
@@ -3418,6 +4045,14 @@ async function executeCloudTaskAgentCommand(command, token) {
           cloudCommandId: commandId,
           allowedKeywords: payload.allowedKeywords,
         });
+        if (recovery?.deferred === true) {
+          return {
+            ok: true,
+            deferred: true,
+            reason: String(recovery.reason || 'recovery_adoption_pending'),
+            commandId,
+          };
+        }
         commandResult = await rememberCloudCommandResult(
           commandId,
           summarizeCloudRecoveryResult(recovery),
@@ -3431,6 +4066,23 @@ async function executeCloudTaskAgentCommand(command, token) {
     commandId,
     success: commandResult.accepted === true,
     result: commandResult,
+  });
+}
+
+async function executeXhsSourceOpenCommand(command, payload, cachedResult) {
+  const commandId = String(command?.id || '').trim();
+  const requestId = String(
+    payload.clientTaskId || command.client_task_id || '',
+  ).trim();
+  // Direct-link mode: collection preserves the card URL at capture time.
+  // Clicking an original link must not trigger a second Agent-side lookup.
+  return rememberCloudCommandResult(commandId, {
+    state: 'completed',
+    accepted: false,
+    requestId,
+    executionMode: 'source_open',
+    reason: 'source_refresh_disabled',
+    message: '当前版本直接使用采集时保存的原文链接，不再刷新或打开帖子',
   });
 }
 
@@ -3498,47 +4150,145 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
 
   cloudTaskAgentSyncInFlight = true;
   try {
-    const agentStatus = await ensureCloudTaskAgentScope(credential.id);
-    const [
-      runtime,
-      ledger,
-      stored,
-      observedSocialAccounts,
-      socialUsageEvents,
-    ] = await Promise.all([
-      ensureRuntimeState(),
-      readTaskLedger(),
-      chrome.storage.local.get([
-        STORAGE_KEYS.unattendedKeywordRunRequest,
-        STORAGE_KEYS.unattendedKeywordPlan,
-        STORAGE_KEYS.targetedPostRunRequest,
-      ]),
+    const degradedHealth = [];
+    const markDegraded = (code) => {
+      const normalized = String(code || '').trim().toLowerCase();
+      if (normalized && !degradedHealth.includes(normalized)) {
+        degradedHealth.push(normalized);
+      }
+    };
+    const cleanup = await compactExpiredControlStorage({
+      reason: 'heartbeat',
+    }).catch(() => ({ok: false, failures: [{area: 'control_storage'}]}));
+    if (cleanup.ok === false) {
+      for (const failure of cleanup.failures || []) {
+        markDegraded(`cleanup_${failure.area || 'unknown'}_failed`);
+      }
+    }
+    // A previous terminal runner may have finished cleanup after the heartbeat
+    // that carried its terminal status. Re-evaluate the exact local predicate
+    // before reading the ledger so this same heartbeat can carry closure proof.
+    await reconcileUnattendedLocalClosureEvidence({
+      closeOwnedRunnerTabs: true,
+    }).catch((error) => {
+      console.warn('[CloudTaskAgent] local closure reconcile failed:', error);
+      markDegraded('local_closure_reconcile_failed');
+    });
+    let agentStatus = {};
+    let agentScopeKnown = true;
+    try {
+      agentStatus = await ensureCloudTaskAgentScope(credential.id);
+    } catch (error) {
+      agentScopeKnown = false;
+      markDegraded('agent_scope_state_unavailable');
+      console.warn('[CloudTaskAgent] agent scope unavailable:', error);
+    }
+
+    let runtime;
+    try {
+      runtime = await ensureRuntimeState();
+    } catch (error) {
+      markDegraded('runtime_state_write_failed');
+      console.warn('[CloudTaskAgent] runtime state degraded:', error);
+      try {
+        runtime = await readRuntimeState();
+      } catch (readError) {
+        markDegraded('runtime_state_read_failed');
+        runtime = {};
+      }
+    }
+    runtime = {
+      ...(runtime && typeof runtime === 'object' ? runtime : {}),
+      clientLabel: String(runtime?.clientLabel || getPlatformLabel()),
+      appVersion: String(runtime?.appVersion || getAppVersion()),
+    };
+
+    let ledger = {};
+    let stored = {};
+    let taskStateKnown = agentScopeKnown;
+    if (agentScopeKnown) {
+      try {
+        [ledger, stored] = await Promise.all([
+          readTaskLedger(),
+          chrome.storage.local.get([
+            STORAGE_KEYS.unattendedKeywordRunRequest,
+            STORAGE_KEYS.unattendedKeywordPlan,
+            STORAGE_KEYS.targetedPostRunRequest,
+          ]),
+        ]);
+      } catch (error) {
+        taskStateKnown = false;
+        ledger = {};
+        stored = {};
+        markDegraded('task_state_unavailable');
+        console.warn('[CloudTaskAgent] task state unavailable:', error);
+      }
+    } else {
+      markDegraded('task_state_scope_unknown');
+    }
+
+    const [observedResult, usageResult] = await Promise.allSettled([
       refreshObservedSocialAccounts(),
       readSocialAccountUsageQueue(),
     ]);
-    const scopedLedger = buildCloudScopedTaskLedger(
-      ledger,
-      agentStatus.scopeStartedAt,
-      credential.id,
-    );
-    const scopedPlan = buildCloudScopedUnattendedPlan(
-      stored[STORAGE_KEYS.unattendedKeywordPlan],
-      agentStatus,
-      credential.id,
-    );
+    const observedSocialAccountsKnown = observedResult.status === 'fulfilled';
+    const socialUsageEventsKnown = usageResult.status === 'fulfilled';
+    if (!observedSocialAccountsKnown) {
+      markDegraded('social_account_state_unavailable');
+    }
+    if (!socialUsageEventsKnown) {
+      markDegraded('social_usage_state_unavailable');
+    }
+    const observedSocialAccounts = observedSocialAccountsKnown
+      ? observedResult.value
+      : {accounts: []};
+    const socialUsageEvents = socialUsageEventsKnown
+      ? usageResult.value
+      : [];
+    const scopedLedger = taskStateKnown
+      ? buildCloudScopedTaskLedger(
+          ledger,
+          agentStatus.scopeStartedAt,
+          credential.id,
+        )
+      : {};
+    const scopedPlan = taskStateKnown
+      ? buildCloudScopedUnattendedPlan(
+          stored[STORAGE_KEYS.unattendedKeywordPlan],
+          agentStatus,
+          credential.id,
+        )
+      : null;
     const reportedLastError = normalizeCloudTaskAgentError(
       agentStatus.lastError || cloudTaskAgentLastError,
     );
+    const degradedLastError = degradedHealth.length > 0
+      ? `LOCAL_HEARTBEAT_DEGRADED:${degradedHealth.join(',')}`
+      : '';
     const payload = cloudTaskAgentApi.buildHeartbeatPayload({
       runtime,
       ledger: scopedLedger,
-      unattendedRequest: stored[STORAGE_KEYS.unattendedKeywordRunRequest],
-      targetedPostRequest: stored[STORAGE_KEYS.targetedPostRunRequest],
+      unattendedRequest: taskStateKnown
+        ? stored[STORAGE_KEYS.unattendedKeywordRunRequest]
+        : null,
+      targetedPostRequest: taskStateKnown
+        ? stored[STORAGE_KEYS.targetedPostRunRequest]
+        : null,
       unattendedPlan: scopedPlan,
-      observedSocialAccounts: observedSocialAccounts.accounts,
+      observedSocialAccounts: Array.isArray(observedSocialAccounts?.accounts)
+        ? observedSocialAccounts.accounts
+        : [],
       socialUsageEvents,
       reason,
-      lastError: reportedLastError,
+      lastError: [reportedLastError, degradedLastError]
+        .filter(Boolean)
+        .join(' | '),
+      agentId: credential.id,
+      taskStateKnown,
+      unattendedPlanKnown: taskStateKnown,
+      observedSocialAccountsKnown,
+      socialUsageEventsKnown,
+      degradedHealth,
     });
     const response = await cloudTaskAgentApi.sendHeartbeat({
       token: credential.token,
@@ -3548,19 +4298,43 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       recordCloudTaskAgentFailure();
       await rememberCloudTaskAgentError(
         response?.message || response?.reason || '云端任务中心同步失败',
-      );
+      ).catch((error) => {
+        console.warn('[CloudTaskAgent] failed to persist sync error:', error);
+      });
       return response;
     }
 
     clearCloudTaskAgentFailureBackoff();
     cloudTaskAgentLastSyncAt = Date.now();
+    // A successful heartbeat is one transaction on the server. Remember only
+    // the exact terminal attempt + closure-v2 identity set that this request
+    // carried, so an in-heartbeat resume command can safely reuse the receipt
+    // without recursively starting a second heartbeat.
+    rememberConfirmedUnattendedLocalClosures(
+      payload,
+      stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+    );
+    await applyUnattendedLocalRecoveryAdoptionReceipts(
+      response.localRecoveryAdoptions,
+      payload,
+      Array.isArray(response.localRecoveryAdoptions),
+    ).catch((error) => {
+      console.warn(
+        '[CloudTaskAgent] local recovery adoption receipt failed:',
+        error,
+      );
+      cloudTaskAgentSyncPending = true;
+    });
     if (reportedLastError) {
       await clearReportedCloudTaskAgentError(reportedLastError);
       cloudTaskAgentSyncPending = true;
     } else {
       cloudTaskAgentLastError = '';
     }
-    if (Array.isArray(response.acceptedSocialUsageEventIds)) {
+    if (
+      socialUsageEventsKnown &&
+      Array.isArray(response.acceptedSocialUsageEventIds)
+    ) {
       await acknowledgeSocialAccountUsageEvents(
         response.acceptedSocialUsageEventIds,
       );
@@ -3608,6 +4382,177 @@ async function syncCloudTaskAgentAlarm() {
   await chrome.alarms.create(CLOUD_TASK_AGENT_ALARM_NAME, {
     periodInMinutes: CLOUD_TASK_AGENT_PERIOD_MINUTES,
   });
+}
+
+let lastControlStorageCleanupAt = 0;
+
+function storedRecordTimestamp(value = {}) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  for (const candidate of [
+    source.storedAt,
+    source.updatedAt,
+    source.finishedAt,
+    source.createdAt,
+    source.occurredAt,
+    source.at,
+    source.timestamp,
+  ]) {
+    const parsed = Date.parse(String(candidate || ''));
+    if (Number.isFinite(parsed)) return parsed;
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  }
+  return 0;
+}
+
+async function compactExpiredTaskLedger(now) {
+  return await runTaskLedgerMutation(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+    const raw = stored[STORAGE_KEYS.taskLedger];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return {changed: false};
+    }
+    const rawRuns = Array.isArray(raw.runs) ? raw.runs : [];
+    const safelyExpiredTerminalStatuses = new Set([
+      'completed',
+      'completed_with_warnings',
+      'completed_with_failures',
+      'failed',
+      'canceled',
+      'skipped',
+    ]);
+    const retainedRuns = rawRuns.filter((run) => {
+      const status = String(run?.status || '').trim().toLowerCase();
+      // needs_action remains operator-recoverable. Nonterminal and unknown
+      // statuses are also preserved byte-for-byte instead of being normalized.
+      if (!safelyExpiredTerminalStatuses.has(status)) return true;
+      const timestamps = [
+        run?.storedAt,
+        run?.archivedAt,
+        run?.finishedAt,
+        run?.businessProgressAt,
+        run?.heartbeatAt,
+        run?.updatedAt,
+        run?.startedAt,
+        run?.createdAt,
+      ]
+        .map(candidate => {
+          const parsed = Date.parse(String(candidate || ''));
+          if (Number.isFinite(parsed)) return parsed;
+          const numeric = Number(candidate);
+          return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+        })
+        .filter(timestamp => timestamp > 0);
+      // An unknown age can never prove expiry. If timestamps disagree, use the
+      // newest fact so cleanup cannot discard a recently touched terminal row.
+      const latestTimestamp = timestamps.length > 0
+        ? Math.max(...timestamps)
+        : 0;
+      return !latestTimestamp ||
+        now - latestTimestamp <= TASK_LEDGER_TERMINAL_RETENTION_MS;
+    });
+    if (retainedRuns.length === rawRuns.length) {
+      return {changed: false};
+    }
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.taskLedger]: {
+        ...raw,
+        runs: retainedRuns,
+      },
+    });
+    return {changed: true};
+  });
+}
+
+async function compactExpiredUnattendedArchive(now) {
+  return await runUnattendedRunArchiveMutation(async () => {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.unattendedKeywordRunArchive,
+      STORAGE_KEYS.auth,
+    ]);
+    const raw = stored[STORAGE_KEYS.unattendedKeywordRunArchive];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return {changed: false};
+    }
+    const auth =
+      stored[STORAGE_KEYS.auth] &&
+      typeof stored[STORAGE_KEYS.auth] === 'object' &&
+      !Array.isArray(stored[STORAGE_KEYS.auth])
+        ? stored[STORAGE_KEYS.auth]
+        : {};
+    const agentId = String(auth.captureAgent?.id || '').trim();
+    const compacted = normalizeUnattendedKeywordRunArchive(
+      raw,
+      now,
+      agentId,
+    );
+    if (JSON.stringify(compacted) === JSON.stringify(raw)) {
+      return {changed: false};
+    }
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunArchive]: compacted,
+    });
+    return {changed: true};
+  });
+}
+
+async function compactExpiredAuxiliaryHistory(now) {
+  return await runCloudCommandResultsMutation(async () => {
+    const commandResults = await readCloudCommandResults();
+    const retained = Object.fromEntries(
+      Object.entries(commandResults).filter(([, value]) => {
+        const timestamp = storedRecordTimestamp(value);
+        return !timestamp || now - timestamp <= CLOUD_COMMAND_RESULT_RETENTION_MS;
+      }),
+    );
+    if (Object.keys(retained).length === Object.keys(commandResults).length) {
+      return {changed: false};
+    }
+    if (Object.keys(retained).length > 0) {
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.cloudCommandResults]: retained,
+      });
+    } else {
+      await chrome.storage.local.remove(STORAGE_KEYS.cloudCommandResults);
+    }
+    return {changed: true};
+  });
+}
+
+async function compactExpiredControlStorage({
+  force = false,
+  reason = 'heartbeat',
+} = {}) {
+  const now = Date.now();
+  if (
+    !force &&
+    lastControlStorageCleanupAt > 0 &&
+    now - lastControlStorageCleanupAt < CONTROL_STORAGE_CLEANUP_INTERVAL_MS
+  ) {
+    return {ok: true, skipped: true, reason: 'cleanup_throttled'};
+  }
+  lastControlStorageCleanupAt = now;
+  const operations = await Promise.allSettled([
+    compactExpiredTaskLedger(now),
+    compactExpiredUnattendedArchive(now),
+    compactExpiredAuxiliaryHistory(now),
+  ]);
+  const failures = operations
+    .map((result, index) => ({result, index}))
+    .filter(({result}) => result.status === 'rejected')
+    .map(({result, index}) => ({
+      area: ['task_ledger', 'unattended_archive', 'auxiliary_history'][index],
+      message: String(result.reason?.message || result.reason || '').slice(0, 240),
+    }));
+  return {
+    ok: failures.length === 0,
+    reason,
+    failures,
+    changed: operations.some(
+      result => result.status === 'fulfilled' && result.value?.changed === true,
+    ),
+  };
 }
 
 function taskRunActivityAt(run) {
@@ -3795,18 +4740,21 @@ async function clearTaskCenterRecords() {
 }
 
 async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}) {
-  return await runTaskLedgerMutation(async () => {
+  const sourceRun =
+    run && typeof run === 'object' && !Array.isArray(run) ? run : {};
+  const sourcePatch =
+    patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+  const taskId = String(sourcePatch.id || sourceRun.id || '').trim();
+  const requestedStatus = String(
+    sourcePatch.status || sourceRun.status || '',
+  ).trim().toLowerCase();
+  const persist = () => runTaskLedgerMutation(async () => {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
     const core = getUnattendedTaskCenterCore();
     const now = new Date().toISOString();
     let ledger = core?.normalizeTaskLedger
       ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
       : stored[STORAGE_KEYS.taskLedger] || {version: 1, runs: [], updatedAt: ''};
-    const sourceRun =
-      run && typeof run === 'object' && !Array.isArray(run) ? run : {};
-    const sourcePatch =
-      patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
-    const taskId = String(sourcePatch.id || sourceRun.id || '').trim();
     if (!taskId) {
       return {accepted: false, reason: 'invalid_id', data: null, ledger};
     }
@@ -3860,6 +4808,9 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
       ledger: result.ledger,
     };
   });
+  return AUTHORITATIVE_CONTROL_TERMINAL_STATUSES.has(requestedStatus)
+    ? await runAuthoritativeControlStorageMutation(persist)
+    : await persist();
 }
 
 async function terminalizeCaptureTaskLedgerRun(
@@ -3934,11 +4885,7 @@ async function terminalizeCaptureTaskLedgerRun(
       '[CaptureTask] failed to terminalize task-center record:',
       error,
     );
-    return {
-      accepted: false,
-      reason: 'task_ledger_update_failed',
-      error,
-    };
+    throw error;
   }
 }
 
@@ -4038,47 +4985,138 @@ async function markUnattendedRunRequestStale(request, message) {
   });
 }
 
-async function cancelUnattendedKeywordRunRequest(message, {requestId = ''} = {}) {
-  return await runUnattendedRunMutation(async () => {
-    const request = await readUnattendedKeywordRunRequest();
-    if (
-      !request ||
-      (requestId && request.id !== requestId) ||
-      (isTerminalUnattendedRunStatus(request.status) &&
-        request.status !== 'needs_action')
-    ) {
-      return null;
-    }
-    const now = new Date().toISOString();
-    const nextRequest = {
-      ...request,
-      status: 'canceled',
-      recoveryPendingLaunch: false,
-      recoveryWaitUntil: '',
-      wakeGraceUntil: '',
-      finishedAt: now,
-      updatedAt: now,
+async function cancelUnattendedKeywordRunRequestWithinMutation(
+  message,
+  {
+    requestId = '',
+    attemptId = '',
+    localOnly = false,
+    cancelSource = 'user',
+    cancelReason = 'user_canceled',
+    errorCode = 'USER_CANCELED',
+    requirePlanDisabled = false,
+    expectedPlanUpdatedAt = '',
+  } = {},
+) {
+  const request = await readUnattendedKeywordRunRequest();
+  const plan = requirePlanDisabled
+    ? await readUnattendedKeywordPlan()
+    : null;
+  if (
+    !request ||
+    (requestId && request.id !== requestId) ||
+    (attemptId && request.attemptId !== attemptId) ||
+    (localOnly && request.cloudAssigned === true) ||
+    (requirePlanDisabled && plan?.enabled !== false) ||
+    (requirePlanDisabled &&
+      expectedPlanUpdatedAt &&
+      String(plan?.updatedAt || '') !== String(expectedPlanUpdatedAt)) ||
+    (isTerminalUnattendedRunStatus(request.status) &&
+      request.status !== 'needs_action')
+  ) {
+    return null;
+  }
+  const now = new Date().toISOString();
+  const nextRequest = {
+    ...request,
+    status: 'canceled',
+    error: {
+      code: String(errorCode || 'USER_CANCELED'),
+      reason: String(cancelReason || 'user_canceled'),
+      category: String(cancelReason || 'user_canceled'),
       message,
-      progress: {
-        ...(request.progress && typeof request.progress === 'object'
-          ? request.progress
-          : {}),
-        phase: 'unattended_canceled',
-        waitUntil: '',
-        remainingMs: null,
-        message,
-        updatedAt: now,
+      retryable: false,
+    },
+    metadata: {
+      ...(request.metadata && typeof request.metadata === 'object'
+        ? request.metadata
+        : {}),
+      cancelSource: String(cancelSource || 'user'),
+      cancelReason: String(cancelReason || 'user_canceled'),
+    },
+    recoveryPendingLaunch: false,
+    recoveryWaitUntil: '',
+    wakeGraceUntil: '',
+    finishedAt: now,
+    updatedAt: now,
+    message,
+    progress: {
+      ...(request.progress && typeof request.progress === 'object'
+        ? request.progress
+        : {}),
+      phase: 'unattended_canceled',
+      waitUntil: '',
+      remainingMs: null,
+      message,
+      updatedAt: now,
+    },
+  };
+  await persistUnattendedRunMutation(nextRequest, {
+    previousRequest: request,
+    event: {
+      type: 'canceled',
+      message,
+      at: now,
+      metadata: {
+        cancelSource: String(cancelSource || 'user'),
+        reason: String(cancelReason || 'user_canceled'),
       },
-    };
-    await persistUnattendedRunMutation(nextRequest, {
-      previousRequest: request,
-      event: {type: 'canceled', message, at: now},
-    });
-    return nextRequest;
+    },
   });
+  return nextRequest;
 }
 
-async function relayCancelToTabs(tabIds = []) {
+async function cancelUnattendedKeywordRunRequest(message, options = {}) {
+  return await runUnattendedRunMutation(async () =>
+    cancelUnattendedKeywordRunRequestWithinMutation(message, options),
+  );
+}
+
+async function waitForContentCaptureToSettle(
+  tabId,
+  {captureRequestId = '', timeoutMs = 3500, pollMs = 100} = {},
+) {
+  const startedAt = Date.now();
+  const normalizedRequestId = String(captureRequestId || '').trim();
+  while (Date.now() - startedAt < timeoutMs) {
+    let inspection;
+    try {
+      inspection = await sendContentMessageWithTimeout(
+        tabId,
+        {
+          action: 'inspectCaptureActivity',
+          ...(normalizedRequestId
+            ? {captureRequestId: normalizedRequestId}
+            : {}),
+        },
+        Math.min(1500, timeoutMs),
+      );
+    } catch (error) {
+      return {ok: false, reason: 'activity_inspection_unavailable', error};
+    }
+    if (
+      inspection?.ok !== true ||
+      typeof inspection.targetActive !== 'boolean' ||
+      !Number.isFinite(Number(inspection.activeCount))
+    ) {
+      return {ok: false, reason: 'activity_inspection_unsupported'};
+    }
+    if (
+      inspection.targetActive === false &&
+      (normalizedRequestId || Number(inspection.activeCount) === 0)
+    ) {
+      return {
+        ok: true,
+        reason: 'content_capture_settled',
+        activeCount: Number(inspection.activeCount),
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return {ok: false, reason: 'content_capture_still_active'};
+}
+
+async function relayCancelToTabs(tabIds = [], {captureRequestId = ''} = {}) {
   const uniqueTabIds = [
     ...new Set(
       tabIds
@@ -4089,14 +5127,15 @@ async function relayCancelToTabs(tabIds = []) {
   let successCount = 0;
   for (const tabId of uniqueTabIds) {
     try {
-      await captureDebugSessionManager?.stopByTab(
-        tabId,
-        'unattended_cancel_requested',
-      );
       // 取消是"应秒回"的操作:若某个 tab 的 content script 卡死,不应无限阻塞其它 tab 的取消。
       // 只在此取消路径加 5s 超时守卫,主采集中继(relay-to-content)不受影响。
       const response = await Promise.race([
-        relayToContentWithRetry(tabId, { action: 'cancelCapture' }),
+        relayToContentWithRetry(tabId, {
+          action: 'cancelCapture',
+          ...(String(captureRequestId || '').trim()
+            ? {captureRequestId: String(captureRequestId).trim()}
+            : {}),
+        }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('cancel relay timeout')), 5000),
         ),
@@ -4104,6 +5143,15 @@ async function relayCancelToTabs(tabIds = []) {
       if (!response?.ok) {
         throw new Error(
           response?.error?.message || 'cancel relay was not acknowledged',
+        );
+      }
+      const settled = await waitForContentCaptureToSettle(tabId, {
+        captureRequestId,
+      });
+      if (!settled.ok) {
+        throw Object.assign(
+          new Error(settled.reason || 'capture stop was not confirmed'),
+          {cause: settled.error},
         );
       }
       successCount += 1;
@@ -4114,22 +5162,51 @@ async function relayCancelToTabs(tabIds = []) {
   return successCount;
 }
 
-async function stopPreviousUnattendedCaptureForResume(lock) {
-  const holderTabId = Number(lock?.holderTabId);
-  if (!Number.isFinite(holderTabId) || holderTabId <= 0) {
-    return {ok: true, method: 'no_target'};
-  }
+async function reloadTabAndWaitForDocumentReplacement(
+  holderTabId,
+  {timeoutMs = 10 * 1000} = {},
+) {
+  return await new Promise((resolve, reject) => {
+    let sawLoading = false;
+    let settled = false;
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      if (error) reject(error);
+      else resolve(true);
+    };
+    const onUpdated = (updatedTabId, changeInfo = {}) => {
+      if (Number(updatedTabId) !== Number(holderTabId)) return;
+      if (String(changeInfo.status || '') === 'loading') {
+        sawLoading = true;
+        return;
+      }
+      if (sawLoading && String(changeInfo.status || '') === 'complete') {
+        finish();
+      }
+    };
+    const timeoutId = setTimeout(
+      () => finish(new Error('source tab reload lifecycle was not observed')),
+      timeoutMs,
+    );
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    Promise.resolve()
+      .then(() => chrome.tabs.reload(holderTabId))
+      .catch(finish);
+  });
+}
 
-  const relayedCount = await relayCancelToTabs([holderTabId]);
-  if (relayedCount > 0) {
-    return {ok: true, method: 'cancel_acknowledged'};
-  }
-
-  // 卡死或断网时 content script 可能无法确认取消。刷新平台页会销毁旧的
-  // content 执行上下文，是恢复前唯一可确认的硬停止；刷新本身失败则禁止新执行。
+async function reloadUnattendedCaptureTabAndConfirm(holderTabId) {
   try {
-    await chrome.tabs.reload(holderTabId);
-    return {ok: true, method: 'tab_reloaded'};
+    // tabs.reload only confirms that navigation was requested. A stale old
+    // document may still answer `ping` while the tab also reports `complete`, so
+    // closure requires the same tab to emit a full loading -> complete cycle.
+    await reloadTabAndWaitForDocumentReplacement(holderTabId);
+    await ensureContentScriptReady(holderTabId);
+    await waitForContentScriptReady(holderTabId, {timeoutMs: 5000});
+    return {ok: true, method: 'tab_reloaded_and_ready'};
   } catch (reloadError) {
     try {
       await chrome.tabs.get(holderTabId);
@@ -4149,21 +5226,69 @@ async function stopPreviousUnattendedCaptureForResume(lock) {
   }
 }
 
-async function stopUnattendedCaptureTargetsForRecovery(tabIds = []) {
-  const uniqueTabIds = [
-    ...new Set(
-      tabIds
-        .map((tabId) => Number(tabId))
-        .filter((tabId) => Number.isFinite(tabId) && tabId > 0),
-    ),
-  ];
-  for (const holderTabId of uniqueTabIds) {
-    const result = await stopPreviousUnattendedCaptureForResume({holderTabId});
+async function stopPreviousUnattendedCaptureForResume(lock) {
+  const holderTabId = Number(lock?.holderTabId);
+  if (!Number.isFinite(holderTabId) || holderTabId <= 0) {
+    return {ok: true, method: 'no_target'};
+  }
+
+  const captureRequestId = String(lock?.captureRequestId || '').trim();
+  const relayedCount = await relayCancelToTabs([holderTabId], {
+    captureRequestId,
+  });
+  // Only a request-scoped identity can prove that the old handler itself left
+  // activeCaptureRequestCounts. An unscoped empty activity set cannot prove that a
+  // legacy handler (which never registered an id) is no longer executing.
+  if (captureRequestId && relayedCount > 0) {
+    return {ok: true, method: 'content_capture_settled'};
+  }
+
+  if (lock?.allowReload === false) {
+    try {
+      await chrome.tabs.get(holderTabId);
+    } catch {
+      return {ok: true, method: 'tab_missing'};
+    }
+    return {
+      ok: false,
+      method: 'stop_unconfirmed',
+      error: new Error('exact capture activity could not be inspected'),
+    };
+  }
+
+  // Older content scripts cannot expose settled state. A fully completed
+  // reload is the fail-closed fallback because it destroys the old context.
+  return await reloadUnattendedCaptureTabAndConfirm(holderTabId);
+}
+
+async function stopUnattendedCaptureTargetsForRecovery(targets = []) {
+  const uniqueTargets = new Map();
+  for (const candidate of targets) {
+    const source = candidate && typeof candidate === 'object'
+      ? candidate
+      : {holderTabId: candidate};
+    const holderTabId = resolveCaptureTaskTabId(
+      source.holderTabId,
+      source.tabId,
+    );
+    if (!holderTabId || uniqueTargets.has(holderTabId)) continue;
+    uniqueTargets.set(holderTabId, {
+      holderTabId,
+      captureRequestId: String(source.captureRequestId || '').trim(),
+      allowReload: source.allowReload !== false,
+    });
+  }
+  for (const target of uniqueTargets.values()) {
+    const result = await stopPreviousUnattendedCaptureForResume(target);
     if (!result.ok) {
-      return {...result, holderTabId};
+      return {...result, holderTabId: target.holderTabId};
     }
   }
-  return {ok: true, method: uniqueTabIds.length ? 'all_stopped' : 'no_target'};
+  return {
+    ok: true,
+    method: uniqueTargets.size ? 'all_stopped' : 'no_target',
+    targetTabIds: [...uniqueTargets.keys()],
+  };
 }
 
 async function releaseUnattendedKeywordPlanLock() {
@@ -4175,51 +5300,1485 @@ async function releaseUnattendedKeywordPlanLock() {
   return await releaseCaptureExecutionLock(activeLock.id);
 }
 
-async function cleanupTerminalUnattendedRuntime(request, tabIds = []) {
+async function cleanupTerminalUnattendedRuntime(
+  request,
+  tabIds = [],
+  {
+    requirePlanDisabled = false,
+    expectedPlanUpdatedAt = '',
+  } = {},
+) {
   const normalizedRequest = normalizeUnattendedRunRequest(request);
   if (!normalizedRequest) return {request: null, relayedCount: 0};
-  const reconciledRequest = normalizeUnattendedRunRequest({
-    ...normalizedRequest,
-    recoveryPendingLaunch: false,
-    recoveryWaitUntil: '',
-    wakeGraceUntil: '',
-    progress: {
-      ...(normalizedRequest.progress &&
-      typeof normalizedRequest.progress === 'object'
-        ? normalizedRequest.progress
-        : {}),
-      phase: `unattended_${normalizedRequest.status}`,
-      waitUntil: '',
-      remainingMs: null,
+  const expectedRequestId = String(normalizedRequest.id || '').trim();
+  const expectedAttemptId = String(normalizedRequest.attemptId || '').trim();
+  const persistCleanupState = () => runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    const plan = requirePlanDisabled
+      ? await readUnattendedKeywordPlan()
+      : null;
+    if (
+      !current ||
+      current.id !== expectedRequestId ||
+      current.attemptId !== expectedAttemptId ||
+      (requirePlanDisabled && current.cloudAssigned === true) ||
+      (requirePlanDisabled && plan?.enabled !== false) ||
+      (requirePlanDisabled &&
+        expectedPlanUpdatedAt &&
+        String(plan?.updatedAt || '') !== String(expectedPlanUpdatedAt)) ||
+      !isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return null;
+    }
+    const reconciled = normalizeUnattendedRunRequest({
+      ...current,
+      recoveryPendingLaunch: false,
+      recoveryWaitUntil: '',
+      wakeGraceUntil: '',
+      progress: {
+        ...(current.progress && typeof current.progress === 'object'
+          ? current.progress
+          : {}),
+        phase: `unattended_${current.status}`,
+        waitUntil: '',
+        remainingMs: null,
+      },
+    });
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciled,
+    });
+    return reconciled;
+  });
+  const reconciledRequest =
+    await runAuthoritativeControlStorageMutation(persistCleanupState);
+  if (!reconciledRequest) {
+    return {request: normalizedRequest, relayedCount: 0};
+  }
+  // The terminal write is durable first; the shared retry path then preserves
+  // exact ownership until the old content handler has actually settled. `tabIds`
+  // is intentionally not trusted here: caller/progress tab ids can outlive the
+  // attempt and be reused by unrelated work.
+  void tabIds;
+  const cleanup = await retryUnattendedLocalClosureCleanup(reconciledRequest);
+  if (!cleanup.cleaned) {
+    console.warn(
+      '[Background] terminal unattended cleanup pending:',
+      cleanup.reason,
+      cleanup.error || cleanup.stopResult?.error || '',
+    );
+  }
+  // The terminal mutation is durable before cleanup begins. Closure evidence
+  // is deliberately deferred: the sidebar still needs a chance to drain its
+  // checkpoint outbox, and only the background can authoritatively inspect
+  // every task-owned resource across Extension documents.
+  scheduleCloudTaskAgentSync('unattended_terminal_cleanup', 500);
+  return {
+    request: await readUnattendedKeywordRunRequest() || reconciledRequest,
+    relayedCount: cleanup.stopResult?.targetTabIds?.length || 0,
+    cleanupConfirmed: cleanup.cleaned === true,
+    cleanupReason: cleanup.reason,
+  };
+}
+
+function isUnattendedRunnerTabForRequest(
+  tab,
+  requestId = '',
+  attemptId = '',
+) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  if (!normalizedRequestId) return false;
+  try {
+    const candidate = new URL(String(tab?.url || ''));
+    const sidebar = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
+    return (
+      candidate.origin === sidebar.origin &&
+      candidate.pathname === sidebar.pathname &&
+      candidate.searchParams.get(UNATTENDED_RUNNER_QUERY_KEY) ===
+        normalizedRequestId &&
+      (!normalizedAttemptId ||
+        candidate.searchParams.get(UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY) ===
+          normalizedAttemptId)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isLegacyUnattendedRunnerTabForRequest(tab, requestId = '') {
+  const normalizedRequestId = String(requestId || '').trim();
+  if (!normalizedRequestId) return false;
+  try {
+    const candidate = new URL(String(tab?.url || ''));
+    const sidebar = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
+    return (
+      candidate.origin === sidebar.origin &&
+      candidate.pathname === sidebar.pathname &&
+      candidate.searchParams.get(UNATTENDED_RUNNER_QUERY_KEY) ===
+        normalizedRequestId &&
+      !candidate.searchParams.get(UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY)
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function inspectUnattendedCheckpointOutboxAttempt(
+  requestId,
+  attemptId,
+) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  let stored;
+  try {
+    stored = await chrome.storage.local.get(null);
+  } catch (error) {
+    return {known: false, pendingCount: null, reason: 'outbox_read_failed', error};
+  }
+  let pendingCount = 0;
+  for (const [key, rawValue] of Object.entries(stored || {})) {
+    if (!key.startsWith(UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX)) {
+      continue;
+    }
+    const value =
+      rawValue && typeof rawValue === 'object' && !Array.isArray(rawValue)
+        ? rawValue
+        : null;
+    if (!value) {
+      return {known: false, pendingCount: null, reason: 'outbox_entry_invalid'};
+    }
+    const entryRequestId = String(value.requestId || '').trim();
+    const entryAttemptId = String(value.attemptId || '').trim();
+    const entryId = String(value.id || '').trim();
+    const revision = String(value.revision || '').trim();
+    const patch =
+      value.patch &&
+      typeof value.patch === 'object' &&
+      !Array.isArray(value.patch)
+        ? value.patch
+        : null;
+    if (
+      !entryRequestId ||
+      !entryAttemptId ||
+      !entryId ||
+      entryId !== `${entryRequestId}:${entryAttemptId}` ||
+      !revision ||
+      key !== `${UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX}${revision}` ||
+      !patch ||
+      !patch.checkpoint ||
+      typeof patch.checkpoint !== 'object' ||
+      Array.isArray(patch.checkpoint)
+    ) {
+      // A malformed durable row cannot be attributed away from this attempt.
+      // Treat it as unknown instead of manufacturing a zero-pending result.
+      return {known: false, pendingCount: null, reason: 'outbox_identity_unknown'};
+    }
+    if (
+      entryRequestId === normalizedRequestId &&
+      entryAttemptId === normalizedAttemptId
+    ) {
+      const deliveryStatus = String(
+        value.deliveryStatus || value.outboxStatus || '',
+      ).trim().toLowerCase();
+      const acknowledged = Boolean(
+        value.acknowledged === true ||
+        value.acked === true ||
+        value.delivered === true ||
+        value.acknowledgedAt ||
+        value.ackedAt ||
+        value.deliveredAt ||
+        ['acked', 'acknowledged', 'delivered'].includes(deliveryStatus)
+      );
+      if (!acknowledged) pendingCount += 1;
+    }
+  }
+  return {known: true, pendingCount, reason: ''};
+}
+
+function resolveUnattendedClosureItemIdentities(request = {}) {
+  const context =
+    request.orchestrationContext &&
+    typeof request.orchestrationContext === 'object' &&
+    !Array.isArray(request.orchestrationContext)
+      ? request.orchestrationContext
+      : {};
+  const attempts = Array.isArray(context.itemAttempts)
+    ? context.itemAttempts.filter((candidate) =>
+        candidate &&
+        typeof candidate === 'object' &&
+        String(candidate.itemId || '').trim() &&
+        String(candidate.attemptId || '').trim() &&
+        Number.isSafeInteger(Number(candidate.attemptNumber)) &&
+        Number(candidate.attemptNumber) > 0 &&
+        Number.isSafeInteger(Number(candidate.assignmentRevision)) &&
+        Number(candidate.assignmentRevision) >= 0,
+      )
+    : [];
+  if (attempts.length === 0) return [];
+  const identities = attempts.map(attempt => ({
+    itemId: String(attempt.itemId || '').trim(),
+    itemAttemptId: String(attempt.attemptId || '').trim(),
+    attemptNumber: Number(attempt.attemptNumber),
+    assignmentRevision: Number(attempt.assignmentRevision),
+  }));
+  const unique = new Set(
+    identities.map(identity =>
+      `${identity.itemId}:${identity.itemAttemptId}`,
+    ),
+  );
+  return unique.size === identities.length ? identities : [];
+}
+
+function buildExactUnattendedLocalClosureKey({
+  requestId = '',
+  attemptId = '',
+  progressSeq = 0,
+  status = '',
+  orchestrationContext = null,
+  evidence = null,
+  evidences = [],
+} = {}) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  const normalizedProgressSeq = Math.max(0, Number(progressSeq) || 0);
+  if (
+    !normalizedRequestId ||
+    !normalizedAttemptId ||
+    !isTerminalUnattendedRunStatus(normalizedStatus)
+  ) {
+    return '';
+  }
+  const itemIdentities = resolveUnattendedClosureItemIdentities({
+    orchestrationContext,
+  });
+  if (itemIdentities.length === 0) return '';
+  const candidates = (Array.isArray(evidences) && evidences.length > 0
+    ? evidences
+    : evidence
+      ? [evidence]
+      : [])
+    .filter((candidate) =>
+      candidate &&
+      typeof candidate === 'object' &&
+      candidate.version === UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION &&
+      String(candidate.requestId || '').trim() === normalizedRequestId &&
+      String(candidate.attemptId || '').trim() === normalizedAttemptId &&
+      Number(candidate.snapshotRevision) === normalizedProgressSeq,
+    );
+  const evidenceByIdentity = new Map(
+    candidates.map((candidate) => [
+      `${String(candidate.itemId || '').trim()}:` +
+        `${String(candidate.itemAttemptId || '').trim()}:` +
+        `${Number(candidate.attemptNumber)}:` +
+        Number(candidate.assignmentRevision),
+      candidate,
+    ]),
+  );
+  const identityKeys = itemIdentities
+    .map((identity) =>
+      `${identity.itemId}:${identity.itemAttemptId}:` +
+        `${identity.attemptNumber}:${identity.assignmentRevision}`,
+    )
+    .sort();
+  if (
+    evidenceByIdentity.size !== identityKeys.length ||
+    identityKeys.some((identityKey) => !evidenceByIdentity.has(identityKey))
+  ) {
+    return '';
+  }
+  return JSON.stringify({
+    requestId: normalizedRequestId,
+    attemptId: normalizedAttemptId,
+    progressSeq: normalizedProgressSeq,
+    status: normalizedStatus,
+    identities: identityKeys,
+  });
+}
+
+function buildUnattendedLocalClosureKeyFromRequest(request = {}) {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    return '';
+  }
+  return buildExactUnattendedLocalClosureKey({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    progressSeq: request.progressSeq,
+    status: request.status,
+    orchestrationContext: request.orchestrationContext,
+    evidence: request.localClosureEvidence,
+    evidences: request.localClosureEvidences,
+  });
+}
+
+function rememberConfirmedUnattendedLocalClosures(
+  payload = {},
+  authoritativeRequest = null,
+) {
+  const authoritativeKey = buildUnattendedLocalClosureKeyFromRequest(
+    authoritativeRequest,
+  );
+  for (const task of Array.isArray(payload.tasks) ? payload.tasks : []) {
+    const metadata =
+      task?.metadata &&
+      typeof task.metadata === 'object' &&
+      !Array.isArray(task.metadata)
+        ? task.metadata
+        : {};
+    let key = buildExactUnattendedLocalClosureKey({
+      requestId: task.id || task.clientTaskId,
+      attemptId: task.attemptId,
+      progressSeq: task.progressSeq,
+      status: task.status,
+      orchestrationContext: metadata.orchestrationContext,
+      evidence: task.localClosure || metadata.localClosure,
+      evidences: task.localClosures || metadata.localClosures,
+    });
+    // Task-ledger metadata intentionally flattens unknown nested values, so an
+    // orchestrationContext copied into a heartbeat snapshot may no longer carry
+    // its itemAttempts as objects. Rebuild only that identity side from the
+    // exact current control request, while still requiring the heartbeat task
+    // itself to carry the same request/attempt/revision/status and closure-v2
+    // evidence. This is a receipt for the payload accepted by this heartbeat,
+    // not a trust in stale ledger metadata.
+    if (!key && authoritativeKey) {
+      const requestId = String(task.id || task.clientTaskId || '').trim();
+      const attemptId = String(task.attemptId || '').trim();
+      const sameAuthoritativeAttempt = Boolean(
+        requestId === String(authoritativeRequest?.id || '').trim() &&
+        attemptId === String(authoritativeRequest?.attemptId || '').trim() &&
+        Number(task.progressSeq) === Number(authoritativeRequest?.progressSeq) &&
+        String(task.status || '').trim().toLowerCase() ===
+          String(authoritativeRequest?.status || '').trim().toLowerCase()
+      );
+      if (sameAuthoritativeAttempt) {
+        const payloadKey = buildExactUnattendedLocalClosureKey({
+          requestId,
+          attemptId,
+          progressSeq: task.progressSeq,
+          status: task.status,
+          orchestrationContext: authoritativeRequest.orchestrationContext,
+          evidence: task.localClosure || metadata.localClosure,
+          evidences: task.localClosures || metadata.localClosures,
+        });
+        if (payloadKey === authoritativeKey) key = payloadKey;
+      }
+    }
+    if (key) cloudTaskAgentConfirmedLocalClosureKeys.add(key);
+  }
+  while (cloudTaskAgentConfirmedLocalClosureKeys.size > 100) {
+    const oldest = cloudTaskAgentConfirmedLocalClosureKeys.values().next().value;
+    cloudTaskAgentConfirmedLocalClosureKeys.delete(oldest);
+  }
+}
+
+function normalizeUnattendedLocalRecoveryAdoptionReceipt(receipt, request) {
+  if (
+    !receipt ||
+    typeof receipt !== 'object' ||
+    Array.isArray(receipt) ||
+    !request ||
+    request.status !== 'recovering' ||
+    request.recoveryPendingLaunch !== true ||
+    request.recoveryReason !== 'manual_recovery'
+  ) {
+    return null;
+  }
+  const currentContext = normalizeOrchestrationExecutionContext(
+    request.orchestrationContext,
+  );
+  const requestId = String(receipt.requestId || '').trim();
+  const attemptId = String(receipt.attemptId || '').trim();
+  const agentId = String(receipt.agentId || '').trim();
+  const parentRequestId = String(receipt.parentRequestId || '').trim();
+  const parentTaskId = String(receipt.parentTaskId || '').trim();
+  const revision = Number(receipt.orchestrationRevision);
+  if (
+    !currentContext ||
+    requestId !== request.id ||
+    attemptId !== request.attemptId ||
+    !agentId ||
+    agentId !== String(request.cloudAgentScopeId || '').trim() ||
+    parentRequestId !== String(request.parentRequestId || '').trim() ||
+    parentTaskId !== currentContext.parentTaskId ||
+    !Number.isSafeInteger(revision) ||
+    revision <= 0 ||
+    receipt.requiresLocalClosureReuseFenceV1 !== true
+  ) {
+    return null;
+  }
+  const adoptedContext = normalizeOrchestrationExecutionContext({
+    ...currentContext,
+    revision,
+    itemIds: receipt.itemIds,
+    itemAttempts: receipt.itemAttempts,
+    attemptIdentity:
+      Array.isArray(receipt.itemAttempts) && receipt.itemAttempts.length === 1
+        ? receipt.itemAttempts[0]?.attemptId
+        : '',
+    requiresLocalClosureReuseFenceV1: true,
+  });
+  const identities = resolveUnattendedClosureItemIdentities({
+    orchestrationContext: adoptedContext,
+  });
+  const expectedItemIds = Array.from(
+    new Set(
+      (Array.isArray(receipt.itemIds) ? receipt.itemIds : [])
+        .map(itemId => String(itemId || '').trim())
+        .filter(Boolean),
+    ),
+  ).sort();
+  const adoptedItemIds = identities
+    .map(identity => identity.itemId)
+    .sort();
+  if (
+    identities.length === 0 ||
+    identities.length !== (Array.isArray(receipt.itemAttempts)
+      ? receipt.itemAttempts.length
+      : 0) ||
+    expectedItemIds.length !== identities.length ||
+    expectedItemIds.some((itemId, index) => itemId !== adoptedItemIds[index])
+  ) {
+    return null;
+  }
+  return adoptedContext;
+}
+
+async function applyUnattendedLocalRecoveryAdoptionReceipts(
+  receipts = [],
+  payload = {},
+  receiptProtocolKnown = false,
+) {
+  const candidates = Array.isArray(receipts) ? receipts : [];
+  const adoptedRequest = await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (!current) return null;
+    const receipt = candidates.find(candidate =>
+      String(candidate?.requestId || '').trim() === current.id &&
+      String(candidate?.attemptId || '').trim() === current.attemptId
+    );
+    const orchestrationContext =
+      normalizeUnattendedLocalRecoveryAdoptionReceipt(receipt, current);
+    if (!orchestrationContext) {
+      const exactAttemptWasReported = Boolean(
+        receiptProtocolKnown &&
+        current.status === 'recovering' &&
+        current.recoveryPendingLaunch === true &&
+        current.recoveryReason === 'manual_recovery' &&
+        normalizeOrchestrationExecutionContext(
+          current.orchestrationContext,
+        ) &&
+        (Array.isArray(payload?.tasks) ? payload.tasks : []).some(task =>
+          String(task?.id || task?.clientTaskId || '').trim() === current.id &&
+          String(task?.attemptId || '').trim() === current.attemptId
+        )
+      );
+      if (!exactAttemptWasReported) return null;
+      const now = new Date().toISOString();
+      const rejectedRequest = {
+        ...current,
+        status: 'failed',
+        recoveryPendingLaunch: false,
+        recoveryWaitUntil: '',
+        finishedAt: now,
+        updatedAt: now,
+        message: '恢复工作项未被云端锁定，已停止本机启动；任务可能已由其它 Agent 接管',
+        error: {
+          code: 'RECOVERY_ADOPTION_NOT_CONFIRMED',
+          message: '云端未返回当前恢复尝试的精确工作项凭证',
+          retryable: false,
+          requiresManualAction: false,
+        },
+      };
+      await persistUnattendedRunMutation(rejectedRequest, {
+        previousRequest: current,
+        event: {
+          type: 'recovery_adoption_rejected',
+          message: rejectedRequest.message,
+          at: now,
+        },
+      });
+      return {rejected: true, request: rejectedRequest};
+    }
+    const now = new Date().toISOString();
+    const nextRequest = {
+      ...current,
+      orchestrationContext,
+      recoveryAdoptedAt: now,
+      updatedAt: now,
+      heartbeatAt: now,
+      message: '云端已锁定恢复工作项，正在启动采集页',
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event: {
+        type: 'manual_recovery_adopted',
+        message: nextRequest.message,
+        at: now,
+      },
+    });
+    return {rejected: false, request: nextRequest};
+  });
+  if (!adoptedRequest) {
+    return {adopted: false, launched: false, reason: 'receipt_rejected'};
+  }
+  if (adoptedRequest.rejected) {
+    return {
+      adopted: false,
+      launched: false,
+      terminal: true,
+      reason: 'receipt_rejected',
+      request: adoptedRequest.request,
+    };
+  }
+  const request = adoptedRequest.request;
+  if (request.parentRequestId) {
+    await resolveSupersededNeedsActionTask(
+      request.parentRequestId,
+      request.id,
+      '云端已锁定新的恢复任务',
+    );
+  }
+  const launchResult = await launchPendingUnattendedRecovery(request);
+  return {
+    adopted: true,
+    launched: launchResult.recovered === true,
+    deferred: launchResult.deferred === true,
+    reason: launchResult.reason || (launchResult.recovered ? 'recovered' : 'deferred'),
+    request: launchResult.request || request,
+  };
+}
+
+function inspectUnattendedBusinessUploadEvidence(request = {}) {
+  const progress =
+    request.progress &&
+    typeof request.progress === 'object' &&
+    !Array.isArray(request.progress)
+      ? request.progress
+      : {};
+  const exactCount = (value) =>
+    Number.isSafeInteger(Number(value)) && Number(value) >= 0
+      ? Number(value)
+      : null;
+  if (
+    progress.streamingSyncEvidenceKnown !== true ||
+    progress.streamingSyncDrainCompleted !== true ||
+    typeof progress.streamingSyncEnabled !== 'boolean' ||
+    typeof progress.streamingSyncBlocked !== 'boolean' ||
+    typeof progress.streamingSyncCanceled !== 'boolean'
+  ) {
+    return {known: false, reason: 'business_upload_state_unknown'};
+  }
+  if (
+    String(progress.unattendedRequestId || '').trim() !==
+      String(request.id || '').trim() ||
+    String(progress.unattendedAttemptId || '').trim() !==
+      String(request.attemptId || '').trim() ||
+    String(progress.progressScope || '').trim().toLowerCase() !== 'terminal'
+  ) {
+    return {known: false, reason: 'business_upload_attempt_mismatch'};
+  }
+  const fields = {
+    streamingSyncEnqueuedCount: exactCount(
+      progress.streamingSyncEnqueuedCount,
+    ),
+    streamingSyncProcessedCount: exactCount(
+      progress.streamingSyncProcessedCount,
+    ),
+    streamingSyncSuccessCount: exactCount(
+      progress.streamingSyncSuccessCount,
+    ),
+    streamingSyncFailedCount: exactCount(
+      progress.streamingSyncFailedCount,
+    ),
+    streamingSyncSkippedCount: exactCount(
+      progress.streamingSyncSkippedCount,
+    ),
+    streamingSyncPendingCount: exactCount(
+      progress.streamingSyncPendingCount,
+    ),
+    streamingSyncActiveCount: exactCount(
+      progress.streamingSyncActiveCount,
+    ),
+    streamingSyncRemainingCount: exactCount(
+      progress.streamingSyncRemainingCount,
+    ),
+    streamingSyncCapturedUniqueCount: exactCount(
+      progress.streamingSyncCapturedUniqueCount,
+    ),
+    streamingSyncEnqueuedUniqueCount: exactCount(
+      progress.streamingSyncEnqueuedUniqueCount,
+    ),
+    streamingSyncExcludedUniqueCount: exactCount(
+      progress.streamingSyncExcludedUniqueCount,
+    ),
+    streamingSyncSucceededUniqueCount: exactCount(
+      progress.streamingSyncSucceededUniqueCount,
+    ),
+    capturedRecordCount: exactCount(progress.capturedRecordCount),
+  };
+  if (Object.values(fields).some((value) => value === null)) {
+    return {known: false, reason: 'business_upload_counts_unknown'};
+  }
+  const enabled = progress.streamingSyncEnabled === true;
+  const completelyDrained = Boolean(
+    progress.streamingSyncBlocked === false &&
+    progress.streamingSyncCanceled === false &&
+    fields.streamingSyncPendingCount === 0 &&
+    fields.streamingSyncActiveCount === 0 &&
+    fields.streamingSyncRemainingCount === 0 &&
+    fields.streamingSyncFailedCount === 0 &&
+    fields.streamingSyncSkippedCount === 0
+  );
+  const everyCapturedRecordUploaded = enabled
+    ? (fields.capturedRecordCount === 0 ||
+        fields.streamingSyncCapturedUniqueCount > 0) &&
+      fields.streamingSyncCapturedUniqueCount ===
+        fields.streamingSyncEnqueuedUniqueCount +
+          fields.streamingSyncExcludedUniqueCount &&
+      fields.streamingSyncEnqueuedUniqueCount ===
+        fields.streamingSyncSucceededUniqueCount &&
+      fields.streamingSyncProcessedCount === fields.streamingSyncEnqueuedCount &&
+      fields.streamingSyncSuccessCount === fields.streamingSyncEnqueuedCount
+    : fields.streamingSyncCapturedUniqueCount === 0 &&
+      fields.streamingSyncEnqueuedUniqueCount === 0 &&
+      fields.streamingSyncExcludedUniqueCount === 0 &&
+      fields.streamingSyncSucceededUniqueCount === 0 &&
+      exactCount(request.counts?.saved) === 0 &&
+      fields.streamingSyncEnqueuedCount === 0 &&
+      fields.streamingSyncProcessedCount === 0 &&
+      fields.streamingSyncSuccessCount === 0;
+  const cleared = completelyDrained && everyCapturedRecordUploaded;
+  return {
+    known: true,
+    cleared,
+    reason: cleared
+      ? 'business_uploads_cleared'
+      : 'business_uploads_not_cleared',
+    state: {
+      businessUploadEvidenceKnown: true,
+      streamingSyncDrainCompleted: true,
+      streamingSyncEnabled: enabled,
+      ...fields,
+      streamingSyncBlocked: progress.streamingSyncBlocked,
+      streamingSyncCanceled: progress.streamingSyncCanceled,
     },
-  });
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciledRequest,
-  });
-  const terminalLock = await snapshotUnattendedKeywordPlanLock();
-  const progress = normalizeUnattendedRunProgress(
-    reconciledRequest.progress,
-    reconciledRequest.message,
+  };
+}
+
+function isCaptureExecutionLockOwnedByUnattendedAttempt(
+  lock,
+  request,
+) {
+  if (
+    !lock ||
+    typeof lock !== 'object' ||
+    String(lock.owner || '') !== 'unattended_keyword_plan'
+  ) {
+    return false;
+  }
+  const requestId = String(request?.id || '').trim();
+  const attemptId = String(request?.attemptId || '').trim();
+  if (!requestId || !attemptId) return false;
+
+  const stableTaskId = buildUnattendedCaptureTaskId(requestId);
+  const lockTaskId = String(lock.captureTaskId || '').trim();
+  const lockAttemptId = String(lock.captureTaskAttemptId || '').trim();
+  if (lockTaskId === stableTaskId) {
+    return !lockAttemptId || lockAttemptId === attemptId;
+  }
+  // Older task wrappers could bind a generated child task id while retaining
+  // the authoritative unattended attempt id.
+  if (lockAttemptId) return lockAttemptId === attemptId;
+  if (lockTaskId) return false;
+
+  // A reservation can become terminal before BEGIN binds its stable task id.
+  // In that narrow window the exact runner tab is the remaining ownership
+  // fence. Do not infer ownership from the global lock alone.
+  const holderTabId = resolveCaptureTaskTabId(lock.holderTabId);
+  const runnerTabIds = new Set(
+    [request.runnerTabId, request.progress?.runnerTabId]
+      .map((tabId) => resolveCaptureTaskTabId(tabId))
+      .filter(Boolean),
   );
-  const relayedCount = await cancelAndReleaseUnattendedExecutionTargets(
-    terminalLock,
-    [
-      ...tabIds,
-      reconciledRequest.runnerTabId,
-      progress?.runnerTabId,
-    ],
+  return Boolean(holderTabId && runnerTabIds.has(holderTabId));
+}
+
+function buildCaptureExecutionLockStopIdentity(lock) {
+  if (!lock || typeof lock !== 'object') return null;
+  return {
+    id: String(lock.id || ''),
+    owner: String(lock.owner || ''),
+    holderId: String(lock.holderId || ''),
+    holderDocumentId: String(lock.holderDocumentId || ''),
+    holderTabId: resolveCaptureTaskTabId(lock.holderTabId),
+    captureTaskId: String(lock.captureTaskId || '').trim(),
+    captureTaskAttemptId: String(lock.captureTaskAttemptId || '').trim(),
+  };
+}
+
+function captureExecutionLockMatchesStopIdentity(lock, identity) {
+  if (!identity) return !lock;
+  const actual = buildCaptureExecutionLockStopIdentity(lock);
+  return Boolean(
+    actual &&
+    actual.id === identity.id &&
+    actual.owner === identity.owner &&
+    actual.holderId === identity.holderId &&
+    actual.holderDocumentId === identity.holderDocumentId &&
+    actual.holderTabId === identity.holderTabId &&
+    actual.captureTaskId === identity.captureTaskId &&
+    actual.captureTaskAttemptId === identity.captureTaskAttemptId
   );
-  // The local ledger can reach a terminal state after the execution lease was
-  // already released.  The stable unattended task id is still sufficient to
-  // find and close a stranded Debug/group/worker session, so cleanup must not
-  // depend on a surviving lock document.
-  await releaseUnattendedCaptureTaskResourcesForRecovery(terminalLock, {
-    reason: 'unattended_terminal_cleanup',
-    request: reconciledRequest,
-  }).catch((error) => {
-    console.warn('[Background] terminal unattended cleanup pending:', error);
+}
+
+async function releaseExactCaptureExecutionLockSnapshot(lockSnapshot) {
+  const expected = buildCaptureExecutionLockStopIdentity(lockSnapshot);
+  if (!expected?.id) return true;
+  const release = () => runCaptureExecutionLockOperation(async () => {
+    const stored = await chrome.storage.local.get(
+      STORAGE_KEYS.captureExecutionLock,
+    );
+    const current = normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+    if (!current) return true;
+    if (!captureExecutionLockMatchesStopIdentity(current, expected)) {
+      return false;
+    }
+    await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
+    return true;
   });
-  return {request: reconciledRequest, relayedCount};
+  return await runAuthoritativeControlStorageMutation(release);
+}
+
+function readExactUnattendedStopConfirmation(request) {
+  const confirmation = request?.localClosureStopConfirmation;
+  if (
+    !confirmation ||
+    typeof confirmation !== 'object' ||
+    confirmation.version !== UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION ||
+    String(confirmation.requestId || '').trim() !==
+      String(request?.id || '').trim() ||
+    String(confirmation.attemptId || '').trim() !==
+      String(request?.attemptId || '').trim()
+  ) {
+    return null;
+  }
+  return confirmation;
+}
+
+function collectExactUnattendedSourceStopTargets({
+  request,
+  exactLock,
+  debugSnapshot,
+  groupSnapshot,
+} = {}) {
+  const captureRequestId = String(
+    debugSnapshot?.progress?.captureRequestId ||
+      request?.progress?.captureRequestId ||
+      '',
+  ).trim();
+  const targets = [];
+  // Before BEGIN the lock holder is the extension runner itself. It must stay
+  // alive to flush checkpoint rows and is not a platform source tab.
+  if (String(exactLock?.captureTaskId || '').trim()) {
+    targets.push({
+      holderTabId: exactLock.holderTabId,
+      captureRequestId,
+      ownership: 'bound_execution_lock',
+    });
+  }
+  targets.push(
+    {
+      holderTabId: debugSnapshot?.sourceTabId || debugSnapshot?.tabId,
+      captureRequestId,
+      ownership: 'debug_session',
+    },
+    {
+      holderTabId: groupSnapshot?.sourceTabId,
+      captureRequestId,
+      ownership: 'task_group',
+    },
+  );
+  const progressTabId = resolveCaptureTaskTabId(request?.progress?.runnerTabId);
+  if (progressTabId && captureRequestId) {
+    targets.push({
+      holderTabId: progressTabId,
+      captureRequestId,
+      // A progress tab id alone is not ownership. The request-scoped content
+      // identity is safe to inspect/cancel, but never authorizes reloading a tab
+      // that may since have been reused by another task.
+      allowReload: false,
+      ownership: 'capture_request_identity',
+    });
+  }
+  const unique = new Map();
+  for (const target of targets) {
+    const tabId = resolveCaptureTaskTabId(target.holderTabId);
+    if (!tabId || unique.has(tabId)) continue;
+    unique.set(tabId, {...target, holderTabId: tabId});
+  }
+  return [...unique.values()];
+}
+
+function buildUnattendedSourceResourceFingerprint({
+  exactLock,
+  targets = [],
+  taskId = '',
+} = {}) {
+  return {
+    taskId: String(taskId || '').trim(),
+    lock: buildCaptureExecutionLockStopIdentity(exactLock),
+    targetTabIds: targets
+      .map((target) => resolveCaptureTaskTabId(target?.holderTabId))
+      .filter(Boolean)
+      .sort((left, right) => left - right),
+  };
+}
+
+function sameUnattendedSourceResourceFingerprint(left, right) {
+  if (!left || !right || left.taskId !== right.taskId) return false;
+  if (
+    JSON.stringify(left.targetTabIds || []) !==
+    JSON.stringify(right.targetTabIds || [])
+  ) {
+    return false;
+  }
+  if (!left.lock && !right.lock) return true;
+  return captureExecutionLockMatchesStopIdentity(right.lock, left.lock);
+}
+
+async function persistUnattendedStopConfirmationWithinMutation(
+  current,
+  {stage, fingerprint, method = ''} = {},
+) {
+  const now = new Date().toISOString();
+  const previous = readExactUnattendedStopConfirmation(current);
+  const confirmation = {
+    version: UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION,
+    requestId: String(current.id || '').trim(),
+    attemptId: String(current.attemptId || '').trim(),
+    stage,
+    taskId: String(fingerprint?.taskId || previous?.taskId || '').trim(),
+    lockIdentity: fingerprint?.lock || previous?.lockIdentity || null,
+    targetTabIds: Array.isArray(fingerprint?.targetTabIds)
+      ? fingerprint.targetTabIds
+      : Array.isArray(previous?.targetTabIds)
+        ? previous.targetTabIds
+        : [],
+    method: String(method || previous?.method || ''),
+    sourceStoppedAt: previous?.sourceStoppedAt || now,
+    ...(stage === 'runtime_released' ? {runtimeReleasedAt: now} : {}),
+  };
+  const next = {...current, localClosureStopConfirmation: confirmation};
+  await runAuthoritativeControlStorageMutation(() =>
+    chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunRequest]: next,
+    }),
+  );
+  return next;
+}
+
+async function retryUnattendedLocalClosureCleanup(request) {
+  const expectedRequestId = String(request?.id || '').trim();
+  const expectedAttemptId = String(request?.attemptId || '').trim();
+  return await runUnattendedRunMutation(async () => {
+    let current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== expectedRequestId ||
+      current.attemptId !== expectedAttemptId ||
+      !isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return {cleaned: false, reason: 'attempt_superseded'};
+    }
+
+    if (buildUnattendedLocalClosureKeyFromRequest(current)) {
+      return {cleaned: true, reason: 'already_persisted'};
+    }
+
+    const storedLock = await readStoredCaptureExecutionLock();
+    const exactLock = isCaptureExecutionLockOwnedByUnattendedAttempt(
+      storedLock,
+      current,
+    )
+      ? storedLock
+      : null;
+    const taskId = String(
+      exactLock?.captureTaskId ||
+        buildUnattendedCaptureTaskId(current.id) ||
+        '',
+    ).trim();
+    const debugSnapshot = taskId
+      ? captureDebugSessionManager?.getSessionByTaskId(taskId)
+      : null;
+    const groupSnapshot = taskId
+      ? captureTaskTabGroupManager?.getTask(taskId)
+      : null;
+    const exactTargets = collectExactUnattendedSourceStopTargets({
+      request: current,
+      exactLock,
+      debugSnapshot,
+      groupSnapshot,
+    });
+    const fingerprint = buildUnattendedSourceResourceFingerprint({
+      exactLock,
+      targets: exactTargets,
+      taskId,
+    });
+    let confirmation = readExactUnattendedStopConfirmation(current);
+    if (confirmation?.stage === 'runtime_released') {
+      return {cleaned: true, reason: 'runtime_release_already_confirmed'};
+    }
+    if (confirmation?.stage === 'source_stopped') {
+      const confirmedFingerprint = {
+        taskId: String(confirmation.taskId || '').trim(),
+        lock: confirmation.lockIdentity || null,
+        targetTabIds: Array.isArray(confirmation.targetTabIds)
+          ? confirmation.targetTabIds
+          : [],
+      };
+      if (
+        exactTargets.length > 0 &&
+        !sameUnattendedSourceResourceFingerprint(
+          confirmedFingerprint,
+          fingerprint,
+        )
+      ) {
+        // tabs.onReplaced or a late BEGIN moved this exact attempt to a new
+        // source. The old confirmation cannot authorize releasing the new tab.
+        confirmation = null;
+      }
+    }
+
+    let stopResult = {ok: true, method: 'previously_confirmed'};
+    if (!confirmation) {
+      const unownedProgressTabId = resolveCaptureTaskTabId(
+        current.progress?.runnerTabId,
+      );
+      const boundSourceIdentityMissing = Boolean(
+        exactLock &&
+        String(exactLock.captureTaskId || '').trim() &&
+        exactTargets.length === 0,
+      );
+      if (
+        exactTargets.length === 0 &&
+        (unownedProgressTabId || boundSourceIdentityMissing)
+      ) {
+        return {
+          cleaned: false,
+          reason: 'source_identity_unverifiable',
+        };
+      }
+      stopResult = await stopUnattendedCaptureTargetsForRecovery(exactTargets);
+      if (!stopResult.ok) {
+        return {
+          cleaned: false,
+          reason: 'previous_capture_stop_unconfirmed',
+          stopResult,
+        };
+      }
+      const lockAfterStop = await readStoredCaptureExecutionLock();
+      const exactLockAfterStop = isCaptureExecutionLockOwnedByUnattendedAttempt(
+        lockAfterStop,
+        current,
+      )
+        ? lockAfterStop
+        : null;
+      if (
+        (exactLock &&
+          !captureExecutionLockMatchesStopIdentity(
+            exactLockAfterStop,
+            fingerprint.lock,
+          )) ||
+        (!exactLock && exactLockAfterStop)
+      ) {
+        return {cleaned: false, reason: 'runtime_identity_changed'};
+      }
+      try {
+        current = await persistUnattendedStopConfirmationWithinMutation(
+          current,
+          {stage: 'source_stopped', fingerprint, method: stopResult.method},
+        );
+        confirmation = readExactUnattendedStopConfirmation(current);
+      } catch (error) {
+        return {
+          cleaned: false,
+          reason: 'source_stop_confirmation_persist_failed',
+          error,
+        };
+      }
+    }
+    try {
+      // Always retry the stable task cleanup: the first terminal pass may have
+      // failed after releasing its lock, leaving Debug/group/worker/owner state
+      // that would otherwise block every later heartbeat forever.
+      await releaseUnattendedCaptureTaskResourcesForRecovery(exactLock, {
+        reason: 'unattended_local_closure_reconcile',
+        request: current,
+        preserveLockBinding: true,
+      });
+      if (exactLock?.id) {
+        const released = await releaseExactCaptureExecutionLockSnapshot(exactLock);
+        if (!released) {
+          return {cleaned: false, reason: 'runtime_identity_changed'};
+        }
+      }
+      current = await persistUnattendedStopConfirmationWithinMutation(current, {
+        stage: 'runtime_released',
+        fingerprint,
+        method: confirmation?.method || stopResult.method,
+      });
+    } catch (error) {
+      return {
+        cleaned: false,
+        reason: 'terminal_runtime_cleanup_failed',
+        error,
+      };
+    }
+    return {
+      cleaned: true,
+      reason: exactLock ? 'exact_runtime_released' : 'stable_runtime_rechecked',
+      stopResult,
+    };
+  });
+}
+
+async function inspectUnattendedLocalClosurePredicate(
+  request,
+  {closeOwnedRunnerTabs = false} = {},
+) {
+  const normalized = normalizeUnattendedRunRequest(request);
+  if (
+    !normalized ||
+    !isTerminalUnattendedRunStatus(normalized.status) ||
+    !String(normalized.attemptId || '').trim()
+  ) {
+    return {closed: false, reason: 'request_not_terminal'};
+  }
+  const itemIdentities = resolveUnattendedClosureItemIdentities(normalized);
+  if (itemIdentities.length === 0) {
+    return {closed: false, reason: 'item_attempt_identity_unknown'};
+  }
+  const stopConfirmation = readExactUnattendedStopConfirmation(normalized);
+  if (
+    stopConfirmation?.stage !== 'runtime_released' ||
+    !String(stopConfirmation.runtimeReleasedAt || '').trim()
+  ) {
+    return {closed: false, reason: 'source_stop_not_confirmed'};
+  }
+  const businessUploads = inspectUnattendedBusinessUploadEvidence(normalized);
+  if (!businessUploads.known || !businessUploads.cleared) {
+    return {
+      closed: false,
+      reason: businessUploads.reason || 'business_upload_state_unknown',
+      businessUploads,
+    };
+  }
+  const initialOutbox = await inspectUnattendedCheckpointOutboxAttempt(
+    normalized.id,
+    normalized.attemptId,
+  );
+  if (!initialOutbox.known) {
+    return {
+      closed: false,
+      reason: initialOutbox.reason || 'outbox_state_unknown',
+    };
+  }
+  if (initialOutbox.pendingCount !== 0) {
+    // Keep the runner alive so its module can still flush the durable row.
+    return {closed: false, reason: 'checkpoint_reports_pending'};
+  }
+  const taskId = buildUnattendedCaptureTaskId(normalized.id);
+  const runnerInspection = await runUnattendedRunnerTabLifecycle(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== normalized.id ||
+      current.attemptId !== normalized.attemptId ||
+      !isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return {ok: false, reason: 'attempt_superseded'};
+    }
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({});
+    } catch (error) {
+      return {ok: false, reason: 'runner_tab_query_failed', error};
+    }
+    const assignedRunnerTabId = Number(current.runnerTabId);
+    const isOwnedRunnerTab = (tab) =>
+      isUnattendedRunnerTabForRequest(
+        tab,
+        normalized.id,
+        normalized.attemptId,
+      ) ||
+      (
+        Number.isFinite(assignedRunnerTabId) &&
+        assignedRunnerTabId > 0 &&
+        Number(tab?.id) === assignedRunnerTabId &&
+        isLegacyUnattendedRunnerTabForRequest(tab, normalized.id)
+      );
+    let exactRunnerTabs = tabs.filter(isOwnedRunnerTab);
+    if (closeOwnedRunnerTabs && exactRunnerTabs.length > 0) {
+      try {
+        for (const tab of exactRunnerTabs) {
+          const tabId = Number(tab?.id);
+          if (!Number.isFinite(tabId) || tabId <= 0) continue;
+          const latestRequest = await readUnattendedKeywordRunRequest();
+          if (
+            !latestRequest ||
+            latestRequest.id !== normalized.id ||
+            latestRequest.attemptId !== normalized.attemptId ||
+            !isTerminalUnattendedRunStatus(latestRequest.status)
+          ) {
+            return {ok: false, reason: 'attempt_superseded'};
+          }
+          let liveTab;
+          try {
+            liveTab = await chrome.tabs.get(tabId);
+          } catch (error) {
+            if (
+              /no tab with id|not found|does not exist|invalid tab id/iu.test(
+                String(error?.message || error || ''),
+              )
+            ) {
+              continue;
+            }
+            throw error;
+          }
+          if (!isOwnedRunnerTab(liveTab)) {
+            continue;
+          }
+          await chrome.tabs.remove(tabId);
+        }
+        const remainingTabs = await chrome.tabs.query({});
+        exactRunnerTabs = remainingTabs.filter(isOwnedRunnerTab);
+      } catch (error) {
+        return {ok: false, reason: 'runner_tab_close_unconfirmed', error};
+      }
+    }
+    return {ok: true, runnerTabs: exactRunnerTabs};
+  });
+  if (!runnerInspection.ok) {
+    return {
+      closed: false,
+      reason: runnerInspection.reason,
+      ...(runnerInspection.error ? {error: runnerInspection.error} : {}),
+    };
+  }
+  const runnerTabs = runnerInspection.runnerTabs;
+
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.captureExecutionLock,
+    STORAGE_KEYS.runtime,
+  ]).catch((error) => ({__readError: error}));
+  if (stored.__readError) {
+    return {closed: false, reason: 'runtime_state_unknown', error: stored.__readError};
+  }
+  const rawLock = stored[STORAGE_KEYS.captureExecutionLock];
+  const runtime =
+    stored[STORAGE_KEYS.runtime] &&
+    typeof stored[STORAGE_KEYS.runtime] === 'object'
+      ? stored[STORAGE_KEYS.runtime]
+      : {};
+  const debugSession = captureDebugSessionManager?.getSessionByTaskId(taskId);
+  const taskGroup = captureTaskTabGroupManager?.getTask(taskId);
+  const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(taskId);
+  const owner = captureTaskOwnerCoordinator?.getOwner(taskId);
+  const runtimeDebugTaskId = String(
+    runtime.captureDebugSession?.taskId || '',
+  ).trim();
+  const runtimeDebugPresent = Boolean(runtimeDebugTaskId === taskId);
+  const executionLockPresent = isCaptureExecutionLockOwnedByUnattendedAttempt(
+    rawLock,
+    normalized,
+  );
+  // Re-read after every task-owned document has disappeared. At this point no
+  // exact-attempt writer remains; a late durable row blocks proof rather than
+  // being silently ignored.
+  const outbox = await inspectUnattendedCheckpointOutboxAttempt(
+    normalized.id,
+    normalized.attemptId,
+  );
+  if (!outbox.known) {
+    return {closed: false, reason: outbox.reason || 'outbox_state_unknown'};
+  }
+
+  const groupSourceTabId = resolveCaptureTaskTabId(taskGroup?.sourceTabId);
+  const groupWorkerTabIds = Array.isArray(taskGroup?.workerTabIds)
+    ? taskGroup.workerTabIds.map(resolveCaptureTaskTabId).filter(Boolean)
+    : [];
+  const detailTaskTabIds = new Set([
+    ...pendingWorkerTabIds.map(resolveCaptureTaskTabId).filter(Boolean),
+    ...groupWorkerTabIds,
+  ]);
+  const platformTaskTabCount = groupSourceTabId ? 1 : 0;
+  const runnerTabCount = runnerTabs.length;
+  const ownedTaskTabCount = new Set([
+    ...runnerTabs.map((tab) => resolveCaptureTaskTabId(tab?.id)).filter(Boolean),
+    ...(groupSourceTabId ? [groupSourceTabId] : []),
+    ...detailTaskTabIds,
+  ]).size;
+  const state = {
+    terminalLedgerConfirmed: true,
+    sourceStopConfirmed: true,
+    sourceStopMethod: String(stopConfirmation.method || ''),
+    runnerTabCount,
+    platformTaskTabCount,
+    detailTaskTabCount: detailTaskTabIds.size,
+    ownedTaskTabCount,
+    executionLockPresent,
+    debugSessionPresent: Boolean(debugSession || runtimeDebugPresent),
+    taskSessionPresent: Boolean(
+      taskGroup ||
+      captureTaskCleanupInProgress.has(taskId),
+    ),
+    taskOwnerPresent: Boolean(owner?.connected || owner?.abandoning),
+    pendingCheckpointReportCount: outbox.pendingCount,
+    ...businessUploads.state,
+  };
+  const closed = Boolean(
+    state.runnerTabCount === 0 &&
+    state.platformTaskTabCount === 0 &&
+    state.detailTaskTabCount === 0 &&
+    state.ownedTaskTabCount === 0 &&
+    state.executionLockPresent === false &&
+    state.debugSessionPresent === false &&
+    state.taskSessionPresent === false &&
+    state.taskOwnerPresent === false &&
+    state.pendingCheckpointReportCount === 0 &&
+    state.businessUploadEvidenceKnown === true &&
+    state.streamingSyncDrainCompleted === true &&
+    state.streamingSyncPendingCount === 0 &&
+    state.streamingSyncActiveCount === 0 &&
+    state.streamingSyncRemainingCount === 0 &&
+    state.streamingSyncFailedCount === 0 &&
+    state.streamingSyncSkippedCount === 0 &&
+    state.streamingSyncBlocked === false &&
+    state.streamingSyncCanceled === false
+  );
+  return {
+    closed,
+    reason: closed ? 'local_runtime_closed' : 'local_runtime_still_owned',
+    request: normalized,
+    taskId,
+    itemIdentities,
+    state,
+  };
+}
+
+async function persistUnattendedLocalClosureEvidence(predicate) {
+  if (
+    !predicate?.closed ||
+    !predicate.request ||
+    !Array.isArray(predicate.itemIdentities) ||
+    predicate.itemIdentities.length === 0
+  ) {
+    return {persisted: false, reason: predicate?.reason || 'predicate_not_closed'};
+  }
+  const expectedRequestId = String(predicate.request.id || '').trim();
+  const expectedAttemptId = String(predicate.request.attemptId || '').trim();
+  const persist = () => runUnattendedRunMutation(async () =>
+    runTaskLedgerMutation(async () => {
+      const stored = await chrome.storage.local.get([
+        STORAGE_KEYS.unattendedKeywordRunRequest,
+        STORAGE_KEYS.taskLedger,
+      ]);
+      const current = normalizeUnattendedRunRequest(
+        stored[STORAGE_KEYS.unattendedKeywordRunRequest],
+      );
+      if (
+        !current ||
+        current.id !== expectedRequestId ||
+        current.attemptId !== expectedAttemptId ||
+        !isTerminalUnattendedRunStatus(current.status)
+      ) {
+        return {persisted: false, reason: 'attempt_superseded'};
+      }
+      const currentItemIdentities =
+        resolveUnattendedClosureItemIdentities(current);
+      const expectedItemIdentityKeys = predicate.itemIdentities.map(identity =>
+        `${identity.itemId}:${identity.itemAttemptId}:` +
+          `${identity.attemptNumber}:${identity.assignmentRevision}`,
+      );
+      const currentItemIdentityKeys = currentItemIdentities.map(identity =>
+        `${identity.itemId}:${identity.itemAttemptId}:` +
+          `${identity.attemptNumber}:${identity.assignmentRevision}`,
+      );
+      if (
+        currentItemIdentityKeys.length !== expectedItemIdentityKeys.length ||
+        currentItemIdentityKeys.some(
+          (identity, index) => identity !== expectedItemIdentityKeys[index],
+        )
+      ) {
+        return {persisted: false, reason: 'item_attempt_identity_changed'};
+      }
+      const core = getUnattendedTaskCenterCore();
+      const now = new Date().toISOString();
+      const ledger = core?.normalizeTaskLedger
+        ? core.normalizeTaskLedger(stored[STORAGE_KEYS.taskLedger], {now})
+        : stored[STORAGE_KEYS.taskLedger];
+      const runs = Array.isArray(ledger?.runs) ? [...ledger.runs] : [];
+      const runIndex = runs.findIndex((run) =>
+        String(run?.id || '').trim() === expectedRequestId,
+      );
+      const run = runIndex >= 0 ? runs[runIndex] : null;
+      if (
+        !run ||
+        String(run.attemptId || '').trim() !== expectedAttemptId ||
+        !isTerminalUnattendedRunStatus(run.status)
+      ) {
+        return {persisted: false, reason: 'terminal_ledger_mismatch'};
+      }
+      const existingClosures = Array.isArray(run.metadata?.localClosures)
+        ? run.metadata.localClosures
+        : run.metadata?.localClosure
+          ? [run.metadata.localClosure]
+          : [];
+      const existingClosureKeys = new Set(
+        existingClosures
+          .filter(existing =>
+            existing?.version === UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION &&
+            String(existing.requestId || '').trim() === expectedRequestId &&
+            String(existing.attemptId || '').trim() === expectedAttemptId,
+          )
+          .map(existing =>
+            `${String(existing.itemId || '').trim()}:` +
+              `${String(existing.itemAttemptId || '').trim()}:` +
+              `${Number(existing.attemptNumber)}:` +
+              Number(existing.assignmentRevision),
+          ),
+      );
+      if (
+        predicate.itemIdentities.every(identity => existingClosureKeys.has(
+          `${identity.itemId}:${identity.itemAttemptId}:` +
+            `${identity.attemptNumber}:${identity.assignmentRevision}`,
+        ))
+      ) {
+        return {
+          persisted: false,
+          reason: 'already_persisted',
+          evidence: existingClosures[0] || null,
+          evidences: existingClosures,
+        };
+      }
+      const snapshotRevision = Math.max(
+        Math.max(0, Number(current.progressSeq) || 0),
+        Math.max(0, Number(run.progressSeq) || 0),
+      ) + 1;
+      const evidences = Object.freeze(predicate.itemIdentities.map(identity =>
+        Object.freeze({
+          version: UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION,
+          requestId: expectedRequestId,
+          attemptId: expectedAttemptId,
+          itemId: identity.itemId,
+          itemAttemptId: identity.itemAttemptId,
+          // The server fences safety handoff to each business item attempt,
+          // which may differ from this browser task's local retry counter.
+          attemptNumber: identity.attemptNumber,
+          assignmentRevision: identity.assignmentRevision,
+          snapshotRevision,
+          terminalStatus: String(current.status || '').trim().toLowerCase(),
+          terminalUpdatedAt: String(
+            current.updatedAt || current.finishedAt || '',
+          ),
+          closedAt: now,
+          ...predicate.state,
+        }),
+      ));
+      const evidence = evidences[0];
+      const nextRequest = {
+        ...current,
+        localClosureEvidence: evidence,
+        localClosureEvidences: evidences,
+        progressSeq: snapshotRevision,
+        heartbeatAt: now,
+        updatedAt: now,
+      };
+      runs[runIndex] = {
+        ...run,
+        progressSeq: snapshotRevision,
+        heartbeatAt: now,
+        updatedAt: now,
+        metadata: {
+          ...(run.metadata && typeof run.metadata === 'object'
+            ? run.metadata
+            : {}),
+          localClosure: evidence,
+          localClosures: evidences,
+        },
+      };
+      const nextLedger = {
+        ...(ledger && typeof ledger === 'object' ? ledger : {}),
+        runs,
+        updatedAt: now,
+      };
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
+        [STORAGE_KEYS.taskLedger]: nextLedger,
+      });
+      return {
+        persisted: true,
+        reason: 'local_closure_persisted',
+        evidence,
+        evidences,
+      };
+    }),
+  );
+  return await runAuthoritativeControlStorageMutation(persist);
+}
+
+async function reconcileUnattendedLocalClosureEvidence({
+  expectedRequestId = '',
+  expectedAttemptId = '',
+  closeOwnedRunnerTabs = true,
+} = {}) {
+  const request = await readUnattendedKeywordRunRequest();
+  if (
+    !request ||
+    (expectedRequestId && request.id !== String(expectedRequestId)) ||
+    (expectedAttemptId && request.attemptId !== String(expectedAttemptId))
+  ) {
+    return {persisted: false, reason: 'attempt_superseded'};
+  }
+  if (buildUnattendedLocalClosureKeyFromRequest(request)) {
+    return {
+      persisted: false,
+      reason: 'already_persisted',
+      evidence: request.localClosureEvidence || null,
+      evidences: Array.isArray(request.localClosureEvidences)
+        ? request.localClosureEvidences
+        : request.localClosureEvidence
+          ? [request.localClosureEvidence]
+          : [],
+    };
+  }
+  const cleanup = await retryUnattendedLocalClosureCleanup(request);
+  if (!cleanup.cleaned) {
+    return {
+      persisted: false,
+      reason: cleanup.reason,
+      ...(cleanup.error ? {error: cleanup.error} : {}),
+    };
+  }
+  const current = await readUnattendedKeywordRunRequest();
+  if (
+    !current ||
+    current.id !== request.id ||
+    current.attemptId !== request.attemptId
+  ) {
+    return {persisted: false, reason: 'attempt_superseded'};
+  }
+  const predicate = await inspectUnattendedLocalClosurePredicate(current, {
+    closeOwnedRunnerTabs,
+  });
+  if (!predicate.closed) {
+    return {persisted: false, reason: predicate.reason, predicate};
+  }
+  return await persistUnattendedLocalClosureEvidence(predicate);
 }
 
 async function snapshotUnattendedKeywordPlanLock() {
@@ -4238,7 +6797,7 @@ async function cancelAndReleaseUnattendedExecutionTargets(
     lockSnapshot?.holderTabId,
   ]);
   if (lockSnapshot?.id) {
-    await releaseCaptureExecutionLock(lockSnapshot.id).catch(() => false);
+    await releaseCaptureExecutionLock(lockSnapshot.id);
   }
   return relayedCount;
 }
@@ -4291,15 +6850,41 @@ async function cancelUnattendedKeywordRunFromControl({
     const relayedCount = terminalCleanup.relayedCount;
     if (isRetryableUnattendedRunRequest(reconciledTerminalRequest)) {
       const now = new Date().toISOString();
-      const dismissedRequest = {
-        ...reconciledTerminalRequest,
-        recoveryDismissedAt: now,
-        recoveryDismissedMessage: message,
-        updatedAt: now,
-      };
-      await chrome.storage.local.set({
-        [STORAGE_KEYS.unattendedKeywordRunRequest]: dismissedRequest,
+      const expectedAttemptId = String(
+        reconciledTerminalRequest.attemptId || '',
+      ).trim();
+      const persistDismissal = () => runUnattendedRunMutation(async () => {
+        const current = await readUnattendedKeywordRunRequest();
+        if (
+          !current ||
+          current.id !== reconciledTerminalRequest.id ||
+          current.attemptId !== expectedAttemptId ||
+          !isRetryableUnattendedRunRequest(current)
+        ) {
+          return null;
+        }
+        const dismissed = {
+          ...current,
+          recoveryDismissedAt: now,
+          recoveryDismissedMessage: message,
+          updatedAt: now,
+        };
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.unattendedKeywordRunRequest]: dismissed,
+        });
+        return dismissed;
       });
+      const dismissedRequest =
+        await runAuthoritativeControlStorageMutation(persistDismissal);
+      if (!dismissedRequest) {
+        return {
+          accepted: false,
+          reason: 'attempt_mismatch',
+          request: await readUnattendedKeywordRunRequest(),
+          plan: await readUnattendedKeywordPlan(),
+          relayedCount,
+        };
+      }
       await removeArchivedUnattendedKeywordRunRequest(request.id);
       scheduleCloudTaskAgentSync('unattended_recovery_dismissed');
       return {
@@ -4384,25 +6969,91 @@ async function cancelUnattendedKeywordRunFromControl({
   };
 }
 
-async function cleanupDisabledUnattendedKeywordPlanRuntime() {
-  const message = '无人值守计划已关闭，已取消未完成任务';
-  // 状态切换前捕获旧锁和平台页。列表采集阶段 progress 可能尚未带 runnerTabId，
-  // 若先释放锁再取消，旧 content capture 会继续与下一任务并行。
-  const request = await readUnattendedKeywordRunRequest();
-  // 云端一次性下发任务与本地定时计划相互独立。关闭本地计划不能顺带
-  // 取消后台已分配并正在执行的任务。
-  if (request?.cloudAssigned === true) {
-    return;
-  }
-  const progress = normalizeUnattendedRunProgress(
-    request?.progress,
-    request?.message,
-  );
-  const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
-  await cancelUnattendedKeywordRunRequest(message);
-  await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
-    progress?.runnerTabId,
-  ]);
+async function cleanupDisabledUnattendedKeywordPlanRuntime({
+  expectedPlanUpdatedAt = '',
+} = {}) {
+  // Keep the exact plan/request compare-and-set, browser cancellation and old
+  // lock release in one request-mutation critical section. Otherwise the old
+  // runner can observe the canceled request and release its lock, allowing a
+  // cloud assignment to publish a successor before this cleanup relays the
+  // unscoped content-script cancellation to the reused platform tab.
+  return await runUnattendedRunMutation(async () => {
+    const message = '无人值守计划已关闭，已取消未完成任务';
+    const currentPlan = await readUnattendedKeywordPlan();
+    if (
+      currentPlan.enabled !== false ||
+      (expectedPlanUpdatedAt &&
+        String(currentPlan.updatedAt || '') !== String(expectedPlanUpdatedAt))
+    ) {
+      return;
+    }
+    const request = await readUnattendedKeywordRunRequest();
+    // 云端一次性下发任务与本地定时计划相互独立。关闭本地计划不能顺带
+    // 取消后台已分配并正在执行的任务。
+    if (!request || request.cloudAssigned === true) {
+      return;
+    }
+    const progress = normalizeUnattendedRunProgress(
+      request.progress,
+      request.message,
+    );
+    // Capture the old lock before publishing cancellation. The runner may
+    // release it as soon as it observes the terminal request in storage.
+    const lockSnapshot = await snapshotUnattendedKeywordPlanLock();
+
+    if (
+      isTerminalUnattendedRunStatus(request.status) &&
+      request.status !== 'needs_action'
+    ) {
+      const reconciledRequest = normalizeUnattendedRunRequest({
+        ...request,
+        recoveryPendingLaunch: false,
+        recoveryWaitUntil: '',
+        wakeGraceUntil: '',
+        progress: {
+          ...(request.progress && typeof request.progress === 'object'
+            ? request.progress
+            : {}),
+          phase: `unattended_${request.status}`,
+          waitUntil: '',
+          remainingMs: null,
+        },
+      });
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciledRequest,
+      });
+      await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
+        request.runnerTabId,
+        progress?.runnerTabId,
+      ]);
+      await releaseUnattendedCaptureTaskResourcesForRecovery(lockSnapshot, {
+        reason: 'unattended_terminal_cleanup',
+        request: reconciledRequest,
+      }).catch((error) => {
+        console.warn('[Background] terminal unattended cleanup pending:', error);
+      });
+      scheduleCloudTaskAgentSync('unattended_terminal_cleanup', 500);
+      return;
+    }
+
+    const canceledRequest =
+      await cancelUnattendedKeywordRunRequestWithinMutation(message, {
+        requestId: String(request.id || ''),
+        attemptId: String(request.attemptId || ''),
+        localOnly: true,
+        cancelSource: 'plan_disabled',
+        cancelReason: 'plan_disabled',
+        errorCode: 'PLAN_DISABLED',
+        requirePlanDisabled: true,
+        expectedPlanUpdatedAt,
+      });
+    if (!canceledRequest) {
+      return;
+    }
+    await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
+      progress?.runnerTabId,
+    ]);
+  });
 }
 
 async function resolveUnattendedPlanLockState(activeLock) {
@@ -4484,7 +7135,9 @@ async function saveUnattendedKeywordPlan(
   }
   scheduleCloudTaskAgentSync('unattended_plan_saved');
   if (!nextPlan.enabled) {
-    await cleanupDisabledUnattendedKeywordPlanRuntime();
+    await cleanupDisabledUnattendedKeywordPlanRuntime({
+      expectedPlanUpdatedAt: nextPlan.updatedAt,
+    });
   }
   return nextPlan;
 }
@@ -4873,7 +7526,7 @@ async function releaseCaptureExecutionLock(
   lockId = '',
   {holderId = '', holderDocumentId = '', requireHolder = false} = {},
 ) {
-  return await runCaptureExecutionLockOperation(async () => {
+  const release = () => runCaptureExecutionLockOperation(async () => {
     if (!lockId) {
       return false;
     }
@@ -4908,6 +7561,7 @@ async function releaseCaptureExecutionLock(
     await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
     return true;
   });
+  return await runAuthoritativeControlStorageMutation(release);
 }
 
 async function syncUnattendedKeywordAlarm(plan) {
@@ -4925,9 +7579,20 @@ async function syncUnattendedKeywordAlarm(plan) {
   await chrome.alarms.create(UNATTENDED_KEYWORD_ALARM_NAME, { when });
 }
 
-function buildUnattendedRunnerUrl(requestId) {
+function buildUnattendedRunnerUrl(requestId, attemptId) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  if (!normalizedRequestId || !normalizedAttemptId) {
+    const error = new Error('无人值守运行页缺少任务执行轮次');
+    error.code = 'UNATTENDED_ATTEMPT_REQUIRED';
+    throw error;
+  }
   const url = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
-  url.searchParams.set(UNATTENDED_RUNNER_QUERY_KEY, requestId);
+  url.searchParams.set(UNATTENDED_RUNNER_QUERY_KEY, normalizedRequestId);
+  url.searchParams.set(
+    UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY,
+    normalizedAttemptId,
+  );
   return url.toString();
 }
 
@@ -5021,37 +7686,37 @@ async function openTargetedPostRunnerTab(
   });
 }
 
-async function openUnattendedRunnerTab(requestId, { windowId = null } = {}) {
-  const runnerUrl = buildUnattendedRunnerUrl(requestId);
-  const sidebarUrl = chrome.runtime.getURL(SIDEBAR_PAGE_PATH);
-  const allTabs = await chrome.tabs.query({});
-  const existingRunner = allTabs.find((tab) => {
-    const currentUrl = String(tab?.url || '');
-    return (
-      currentUrl.startsWith(`${sidebarUrl}?`) &&
-      currentUrl.includes(`${UNATTENDED_RUNNER_QUERY_KEY}=`)
+async function openUnattendedRunnerTab(
+  requestId,
+  {windowId = null, attemptId = ''} = {},
+) {
+  return await runUnattendedRunnerTabLifecycle(async () => {
+    const runnerUrl = buildUnattendedRunnerUrl(requestId, attemptId);
+    const allTabs = await chrome.tabs.query({});
+    const existingRunner = allTabs.find((tab) =>
+      isUnattendedRunnerTabForRequest(tab, requestId, attemptId),
     );
-  });
 
-  if (existingRunner?.id) {
-    return await chrome.tabs.update(existingRunner.id, {
+    if (existingRunner?.id) {
+      return await chrome.tabs.update(existingRunner.id, {
+        url: runnerUrl,
+        active: true,
+        autoDiscardable: false,
+      });
+    }
+
+    const createOptions = {
       url: runnerUrl,
       active: true,
+    };
+    const concreteWindowId = normalizeConcreteWindowId(windowId);
+    const createdRunner = await createRunnerTab(createOptions, concreteWindowId);
+    if (!createdRunner?.id) {
+      return createdRunner;
+    }
+    return await chrome.tabs.update(createdRunner.id, {
       autoDiscardable: false,
     });
-  }
-
-  const createOptions = {
-    url: runnerUrl,
-    active: true,
-  };
-  const concreteWindowId = normalizeConcreteWindowId(windowId);
-  const createdRunner = await createRunnerTab(createOptions, concreteWindowId);
-  if (!createdRunner?.id) {
-    return createdRunner;
-  }
-  return await chrome.tabs.update(createdRunner.id, {
-    autoDiscardable: false,
   });
 }
 
@@ -5064,6 +7729,7 @@ async function createUnattendedKeywordRunRequest(
     cloudAssigned = false,
     executionMode = '',
     orchestrationContext = null,
+    checkpoint = null,
   } = {},
 ) {
   return await runUnattendedRunMutation(async () => {
@@ -5104,6 +7770,9 @@ async function createUnattendedKeywordRunRequest(
       heartbeatAt: now,
       businessProgressAt: now,
       planSnapshot: normalizeUnattendedKeywordPlan(plan),
+      ...(checkpoint && typeof checkpoint === 'object'
+        ? {checkpoint: JSON.parse(JSON.stringify(checkpoint))}
+        : {}),
       progress: null,
       error: null,
       message: `已创建${executionCopy.taskLabel}，等待运行页领取`,
@@ -5165,6 +7834,8 @@ async function bindUnattendedRunnerTab(request, runnerTabId) {
 
 async function claimUnattendedKeywordRun({
   requestId = '',
+  attemptId = '',
+  requireAttempt = false,
   senderTabId = null,
   senderDocumentId = '',
   holderId = '',
@@ -5173,6 +7844,13 @@ async function claimUnattendedKeywordRun({
     const request = await readUnattendedKeywordRunRequest();
     if (!request || (requestId && request.id !== requestId)) {
       return {accepted: false, reason: 'not_found', data: null};
+    }
+    const normalizedAttemptId = String(attemptId || '').trim();
+    if (requireAttempt && !normalizedAttemptId) {
+      return {accepted: false, reason: 'runner_attempt_required', data: null};
+    }
+    if (normalizedAttemptId && request.attemptId !== normalizedAttemptId) {
+      return {accepted: false, reason: 'attempt_superseded', data: null};
     }
     if (isTerminalUnattendedRunStatus(request.status)) {
       return {accepted: false, reason: 'terminal', data: null};
@@ -5348,15 +8026,80 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
     if (!request || !requestId || request.id !== requestId) {
       return {accepted: false, reason: 'not_found', data: null};
     }
+    const safePatch =
+      patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
+    const hasCheckpoint =
+      safePatch.checkpoint &&
+      typeof safePatch.checkpoint === 'object' &&
+      !Array.isArray(safePatch.checkpoint);
     if (!attemptId || request.attemptId !== attemptId) {
+      const previousAttemptCheckpointHandoff = Boolean(
+        hasCheckpoint &&
+          String(request.previousAttemptId || '') === String(attemptId || '') &&
+          !isTerminalUnattendedRunStatus(request.status) &&
+          buildUnattendedBusinessProgressFingerprint(safePatch.checkpoint) !==
+            buildUnattendedBusinessProgressFingerprint(
+              request.checkpoint || null,
+            ) &&
+          !isLegacyUnattendedCheckpointRegression(
+            safePatch.checkpoint,
+            request.checkpoint,
+          ),
+      );
+      if (previousAttemptCheckpointHandoff) {
+        const now = new Date().toISOString();
+        const milestoneAdvanced =
+          buildUnattendedRecoveryMilestoneFingerprint(safePatch.checkpoint) !==
+          buildUnattendedRecoveryMilestoneFingerprint(
+            request.checkpoint || null,
+          );
+        const nextRequest = {
+          ...request,
+          checkpoint: safePatch.checkpoint,
+          ...(safePatch.counts && typeof safePatch.counts === 'object'
+            ? {counts: safePatch.counts}
+            : {}),
+          ...(safePatch.summary && typeof safePatch.summary === 'object'
+            ? {summary: safePatch.summary}
+            : {}),
+          progressSeq: Math.max(
+            Math.max(0, Number(request.progressSeq) || 0) + 1,
+            Math.max(0, Number(safePatch.progressSeq) || 0),
+          ),
+          businessProgressAt: resolveUnattendedBusinessProgressAt({
+            suppliedAt: safePatch.businessProgressAt,
+            currentAt: request.businessProgressAt,
+            now,
+            hasProgressSequence: true,
+          }),
+          recoveryCount: milestoneAdvanced
+            ? 0
+            : Math.max(0, Number(request.recoveryCount) || 0),
+          recoveryLaunchFailures: milestoneAdvanced
+            ? 0
+            : Math.max(0, Number(request.recoveryLaunchFailures) || 0),
+          updatedAt: now,
+        };
+        await persistUnattendedRunMutation(nextRequest, {
+          previousRequest: request,
+          event: {
+            type: 'previous_attempt_checkpoint_handoff',
+            message: '已合并上一执行 attempt 尚未落盘的关键词检查点',
+            at: now,
+          },
+        });
+        return {
+          accepted: true,
+          reason: 'checkpoint_handoff',
+          data: nextRequest,
+        };
+      }
       return {accepted: false, reason: 'attempt_mismatch', data: request};
     }
     if (isTerminalUnattendedRunStatus(request.status)) {
       return {accepted: false, reason: 'terminal', data: request};
     }
 
-    const safePatch =
-      patch && typeof patch === 'object' && !Array.isArray(patch) ? patch : {};
     const allowedPatchFields = [
       'status',
       'message',
@@ -5381,10 +8124,6 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       safePatch.progress &&
       typeof safePatch.progress === 'object' &&
       !Array.isArray(safePatch.progress);
-    const hasCheckpoint =
-      safePatch.checkpoint &&
-      typeof safePatch.checkpoint === 'object' &&
-      !Array.isArray(safePatch.checkpoint);
     // 恢复后的 runner 会先重放已保存的 progress/checkpoint。语义变化可
     // 刷新业务时钟，但只有关键词结算等持久检查点里程碑才能归还“连续恢复”
     // 预算；仅阶段切换、时间戳变化、心跳或同一检查点重试均不能清零预算。
@@ -5402,17 +8141,38 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       buildUnattendedRecoveryMilestoneFingerprint(safePatch.checkpoint) !==
         buildUnattendedRecoveryMilestoneFingerprint(request.checkpoint || null);
     let nextProgressSeq = request.progressSeq;
-    if (hasProgress) {
+    if (hasProgress || hasCheckpoint) {
       const suppliedProgressSeq = Number(safePatch.progressSeq);
-      if (
+      const staleSequence =
         Number.isFinite(suppliedProgressSeq) &&
-        suppliedProgressSeq <= request.progressSeq
+        suppliedProgressSeq <= request.progressSeq;
+      const monotonicCheckpointHandoff = Boolean(
+        staleSequence &&
+          hasCheckpoint &&
+          checkpointAdvanced &&
+          !isLegacyUnattendedCheckpointRegression(
+            safePatch.checkpoint,
+            request.checkpoint,
+          ),
+      );
+      if (
+        (staleSequence && !monotonicCheckpointHandoff) ||
+        (!Number.isFinite(suppliedProgressSeq) &&
+          hasCheckpoint &&
+          isLegacyUnattendedCheckpointRegression(
+            safePatch.checkpoint,
+            request.checkpoint,
+          ))
       ) {
         return {accepted: false, reason: 'stale_progress', data: request};
       }
-      nextProgressSeq = Number.isFinite(suppliedProgressSeq)
-        ? Math.floor(suppliedProgressSeq)
-        : request.progressSeq + 1;
+      nextProgressSeq = monotonicCheckpointHandoff
+        ? Math.max(0, Number(request.progressSeq) || 0) + 1
+        : Number.isFinite(suppliedProgressSeq)
+          ? Math.floor(suppliedProgressSeq)
+        : hasProgress
+          ? request.progressSeq + 1
+          : request.progressSeq;
     }
 
     const requestedStatus = String(safePatch.status || '').trim();
@@ -5453,7 +8213,14 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       progress: normalizedProgress,
       status: nextStatus,
       heartbeatAt: safePatch.heartbeatAt ? now : request.heartbeatAt,
-      businessProgressAt: hasBusinessProgress ? now : request.businessProgressAt,
+      businessProgressAt: hasBusinessProgress
+        ? resolveUnattendedBusinessProgressAt({
+            suppliedAt: safePatch.businessProgressAt,
+            currentAt: request.businessProgressAt,
+            now,
+            hasProgressSequence: Number.isFinite(Number(safePatch.progressSeq)),
+          })
+        : request.businessProgressAt,
       recoveryCount: recoveryMilestoneAdvanced
         ? 0
         : Math.max(0, Number(request.recoveryCount) || 0),
@@ -5528,6 +8295,7 @@ async function launchUnattendedKeywordRun(
     cloudAssigned = false,
     executionMode = '',
     orchestrationContext = null,
+    checkpoint = null,
   } = {},
 ) {
   const normalizedPlan = normalizeUnattendedKeywordPlan(plan);
@@ -5542,6 +8310,7 @@ async function launchUnattendedKeywordRun(
     cloudAssigned,
     executionMode,
     orchestrationContext,
+    checkpoint,
   });
   if (requestId && request.id !== requestId) {
     return null;
@@ -5550,6 +8319,7 @@ async function launchUnattendedKeywordRun(
     const platformTab = await activateOrCreatePlatformTab(normalizedPlan.platform);
     const runnerTab = await openUnattendedRunnerTab(request.id, {
       windowId: platformTab?.windowId,
+      attemptId: request.attemptId,
     });
     await bindUnattendedRunnerTab(request, runnerTab?.id);
   } catch (error) {
@@ -5737,11 +8507,27 @@ async function assessUnattendedRunHealth(
       return {healthy: false, reason: 'runner_heartbeat_stale'};
     }
     const businessProgressAt = parseTimestampMs(request.businessProgressAt);
+    const progressPhase = String(request?.progress?.phase || '')
+      .trim()
+      .toLowerCase();
+    const captureAction = String(request?.progress?.captureAction || '')
+      .trim()
+      .toLowerCase();
+    const businessStallLimitMs =
+      progressPhase === 'detail_comments_capturing' ||
+      progressPhase.startsWith('comments_') ||
+      captureAction === 'capturecomments'
+        ? UNATTENDED_RUN_COMMENT_STAGE_STALL_MS
+        : UNATTENDED_RUN_BUSINESS_STALL_MS;
     if (
       !Number.isFinite(businessProgressAt) ||
-      nowMs - businessProgressAt > UNATTENDED_RUN_BUSINESS_STALL_MS
+      nowMs - businessProgressAt > businessStallLimitMs
     ) {
-      return {healthy: false, reason: 'business_progress_stalled'};
+      return {
+        healthy: false,
+        reason: 'business_progress_stalled',
+        businessStallLimitMs,
+      };
     }
   }
 
@@ -5911,7 +8697,35 @@ async function markUnattendedRecoveryStopUnconfirmed(request, message) {
   });
 }
 
+function unattendedManualRecoveryHasAdoptionReceipt(request) {
+  if (
+    request?.recoveryReason !== 'manual_recovery' ||
+    !normalizeOrchestrationExecutionContext(request?.orchestrationContext)
+  ) {
+    return true;
+  }
+  const context = normalizeOrchestrationExecutionContext(
+    request.orchestrationContext,
+  );
+  return Boolean(
+    String(request.recoveryAdoptedAt || '').trim() &&
+    context?.requiresLocalClosureReuseFenceV1 === true &&
+    resolveUnattendedClosureItemIdentities({
+      orchestrationContext: context,
+    }).length > 0
+  );
+}
+
 async function launchPendingUnattendedRecovery(request) {
+  if (!unattendedManualRecoveryHasAdoptionReceipt(request)) {
+    scheduleCloudTaskAgentSync('manual_recovery_adoption_pending', 0);
+    return {
+      recovered: false,
+      deferred: true,
+      reason: 'recovery_adoption_pending',
+      request,
+    };
+  }
   const storedLock = await readStoredCaptureExecutionLock();
   const activeLock =
     storedLock && String(storedLock.owner || '') !== 'unattended_keyword_plan'
@@ -6001,6 +8815,7 @@ async function launchPendingUnattendedRecovery(request) {
     const platformTab = await activateOrCreatePlatformTab(plan.platform);
     const runnerTab = await openUnattendedRunnerTab(pendingRequest.id, {
       windowId: platformTab?.windowId,
+      attemptId: pendingRequest.attemptId,
     });
     const boundRequest = await bindUnattendedRunnerTab(
       pendingRequest,
@@ -6077,6 +8892,12 @@ async function launchPendingUnattendedRecovery(request) {
           retryable: returnToCloud || !exhausted,
           requiresManualAction: exhausted && !returnToCloud,
           category: 'temporary_runtime_recovery',
+          ...(exhausted
+            ? {
+                fastRetryExhausted: true,
+                failureOrigin: 'extension_runtime',
+              }
+            : {}),
         },
       };
       await persistUnattendedRunMutation(nextRequest, {
@@ -6197,6 +9018,8 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
           retryable: cloudAssigned,
           requiresManualAction: !cloudAssigned,
           category: 'temporary_runtime_recovery',
+          fastRetryExhausted: true,
+          failureOrigin: 'extension_runtime',
         },
       };
       await persistUnattendedRunMutation(nextRequest, {
@@ -6225,6 +9048,7 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
     const message = `${reasonText}，第 ${nextRecoveryCount}/${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次自动恢复将在倒计时结束后开始`;
     const nextRequest = {
       ...current,
+      previousAttemptId: current.attemptId,
       attemptId: createUuid(),
       attemptNumber: Math.max(1, Number(current.attemptNumber) || 1) + 1,
       progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,
@@ -6253,6 +9077,9 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
       },
       error: null,
     };
+    delete nextRequest.localClosureEvidence;
+    delete nextRequest.localClosureEvidences;
+    delete nextRequest.localClosureStopConfirmation;
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: current,
       allowAttemptTransition: true,
@@ -6291,7 +9118,7 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
     );
   }
   if (oldUnattendedLock?.id) {
-    await releaseCaptureExecutionLock(oldUnattendedLock.id).catch(() => false);
+    await releaseCaptureExecutionLock(oldUnattendedLock.id);
   }
   if (transition.action === 'terminal') {
     return {recovered: false, terminal: true, request: transition.request};
@@ -6474,6 +9301,89 @@ function buildManualRecoveryCheckpoint(request, mode) {
   return checkpoint;
 }
 
+async function prepareUnattendedManualRecoverySource(requestId = '') {
+  const normalizedRequestId = String(requestId || '').trim();
+  const current = await readUnattendedKeywordRunRequest();
+  const source = current?.id === normalizedRequestId
+    ? current
+    : await readArchivedUnattendedKeywordRunRequest(normalizedRequestId);
+  if (!source || !normalizedRequestId) {
+    return {ready: false, reason: 'not_found', request: source || null};
+  }
+  const itemIdentities = resolveUnattendedClosureItemIdentities(source);
+  if (itemIdentities.length === 0) {
+    return {ready: true, request: source, closureKey: ''};
+  }
+  // Exact cleanup can only be established for the current control request.
+  // Starting an orchestration successor from an archived copy would make the
+  // source attempt unverifiable and can overlap its still-owned browser work.
+  if (
+    !current ||
+    current.id !== source.id ||
+    current.attemptId !== source.attemptId
+  ) {
+    return {
+      ready: false,
+      reason: 'source_local_closure_unverifiable',
+      request: source,
+    };
+  }
+  if (!isTerminalUnattendedRunStatus(current.status)) {
+    return {ready: false, reason: 'not_recoverable', request: current};
+  }
+
+  await cleanupTerminalUnattendedRuntime(current);
+  const closure = await reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: current.id,
+    expectedAttemptId: current.attemptId,
+    closeOwnedRunnerTabs: true,
+  });
+  const locallyClosed = await readUnattendedKeywordRunRequest();
+  let closureKey = buildUnattendedLocalClosureKeyFromRequest(locallyClosed);
+  if (
+    !closureKey ||
+    locallyClosed?.id !== current.id ||
+    locallyClosed?.attemptId !== current.attemptId
+  ) {
+    return {
+      ready: false,
+      reason: String(closure?.reason || 'source_local_closure_pending'),
+      request: locallyClosed || current,
+    };
+  }
+
+  if (!cloudTaskAgentConfirmedLocalClosureKeys.has(closureKey)) {
+    const syncResult = await syncCloudTaskAgent({
+      reason: 'manual_recovery_source_closure',
+      force: true,
+    });
+    if (!syncResult?.ok) {
+      return {
+        ready: false,
+        reason: 'source_local_closure_sync_pending',
+        request: await readUnattendedKeywordRunRequest(),
+      };
+    }
+  }
+
+  const confirmed = await readUnattendedKeywordRunRequest();
+  const confirmedKey = buildUnattendedLocalClosureKeyFromRequest(confirmed);
+  if (
+    !confirmedKey ||
+    confirmedKey !== closureKey ||
+    confirmed?.id !== current.id ||
+    confirmed?.attemptId !== current.attemptId ||
+    !cloudTaskAgentConfirmedLocalClosureKeys.has(confirmedKey)
+  ) {
+    return {
+      ready: false,
+      reason: 'source_local_closure_not_confirmed',
+      request: confirmed || current,
+    };
+  }
+  return {ready: true, request: confirmed, closureKey: confirmedKey};
+}
+
 async function manuallyRecoverUnattendedKeywordRun({
   requestId = '',
   mode = 'remaining',
@@ -6483,6 +9393,17 @@ async function manuallyRecoverUnattendedKeywordRun({
   const normalizedMode = new Set(['remaining', 'failed', 'skip_current']).has(mode)
     ? mode
     : 'remaining';
+  const sourcePreparation = await prepareUnattendedManualRecoverySource(
+    requestId,
+  );
+  if (!sourcePreparation.ready) {
+    return {
+      accepted: false,
+      deferred: true,
+      reason: sourcePreparation.reason,
+      request: sourcePreparation.request || null,
+    };
+  }
   const created = await runUnattendedRunMutation(async () => {
     const currentRequest = await readUnattendedKeywordRunRequest();
     const current =
@@ -6505,6 +9426,27 @@ async function manuallyRecoverUnattendedKeywordRun({
     }
     if (!isTerminalUnattendedRunStatus(current.status)) {
       return {accepted: false, reason: 'not_recoverable', request: current};
+    }
+    if (sourcePreparation.closureKey) {
+      const exactCurrentSource = Boolean(
+        currentRequest &&
+        currentRequest.id === current.id &&
+        currentRequest.attemptId === current.attemptId,
+      );
+      const currentClosureKey = buildUnattendedLocalClosureKeyFromRequest(
+        current,
+      );
+      if (
+        !exactCurrentSource ||
+        currentClosureKey !== sourcePreparation.closureKey ||
+        !cloudTaskAgentConfirmedLocalClosureKeys.has(currentClosureKey)
+      ) {
+        return {
+          accepted: false,
+          reason: 'source_local_closure_changed',
+          request: current,
+        };
+      }
     }
     const credential = await readCloudTaskAgentCredential();
     const currentAgentScopeId = String(credential.id || '').trim();
@@ -6659,6 +9601,23 @@ async function manuallyRecoverUnattendedKeywordRun({
       failed: '仅重试失败关键词',
       skip_current: '跳过当前项并继续',
     };
+    const sourceOrchestrationContext =
+      normalizeOrchestrationExecutionContext(current.orchestrationContext);
+    const pendingAdoptionContext = sourceOrchestrationContext
+      ? {
+          ...sourceOrchestrationContext,
+          revision: 0,
+          itemIds: [],
+        }
+      : null;
+    if (pendingAdoptionContext) {
+      // The server creates a new append-only item attempt when it adopts this
+      // local recovery. Reusing the source task's IDs here would let closure-v2
+      // attest to an attempt that this recovery never executed.
+      delete pendingAdoptionContext.itemAttempts;
+      delete pendingAdoptionContext.attemptIdentity;
+      delete pendingAdoptionContext.requiresLocalClosureReuseFenceV1;
+    }
     const nextRequest = {
       ...current,
       schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
@@ -6692,12 +9651,21 @@ async function manuallyRecoverUnattendedKeywordRun({
       heartbeatAt: now,
       businessProgressAt: now,
       runnerTabId: null,
+      ...(pendingAdoptionContext
+        ? {orchestrationContext: pendingAdoptionContext}
+        : {}),
       planSnapshot,
       checkpoint,
       progress: null,
       error: null,
       message: labels[normalizedMode],
     };
+    if (!pendingAdoptionContext) {
+      delete nextRequest.orchestrationContext;
+    }
+    delete nextRequest.localClosureEvidence;
+    delete nextRequest.localClosureEvidences;
+    delete nextRequest.localClosureStopConfirmation;
     await persistUnattendedRunMutation(nextRequest, {
       event: {
         type: 'manual_recovery',
@@ -6711,10 +9679,42 @@ async function manuallyRecoverUnattendedKeywordRun({
       reason: 'created',
       request: nextRequest,
       previousRequest: current,
+      requiresServerAdoption: Boolean(pendingAdoptionContext),
     };
   });
   if (!created.accepted) {
     return created;
+  }
+  if (created.requiresServerAdoption) {
+    const adoptionSync = await syncCloudTaskAgent({
+      reason: 'manual_recovery_adoption',
+      force: true,
+    });
+    const current = await readUnattendedKeywordRunRequest();
+    const launched = Boolean(
+      current &&
+      current.id === created.request.id &&
+      current.attemptId === created.request.attemptId &&
+      current.recoveryPendingLaunch !== true &&
+      ['pending', 'claimed', 'running'].includes(String(current.status || ''))
+    );
+    if (!launched) {
+      if (!adoptionSync?.ok) cloudTaskAgentSyncPending = true;
+      return {
+        accepted: false,
+        deferred: true,
+        reason: adoptionSync?.ok
+          ? 'recovery_adoption_not_confirmed'
+          : 'recovery_adoption_sync_pending',
+        request: current || created.request,
+      };
+    }
+    return {
+      accepted: true,
+      deferred: false,
+      reason: 'recovered',
+      request: current,
+    };
   }
   if (created.previousRequest?.status === 'needs_action') {
     await resolveSupersededNeedsActionTask(
@@ -6824,6 +9824,15 @@ async function superviseUnattendedKeywordRun({
     }
 
     if (request.status === 'recovering' && request.recoveryPendingLaunch) {
+      if (!unattendedManualRecoveryHasAdoptionReceipt(request)) {
+        scheduleCloudTaskAgentSync('manual_recovery_adoption_pending', 0);
+        return {
+          healthy: true,
+          deferred: true,
+          reason: 'recovery_adoption_pending',
+          request,
+        };
+      }
       const waitUntil = parseTimestampMs(request.recoveryWaitUntil);
       if (Number.isFinite(waitUntil) && waitUntil > nowMs) {
         return {healthy: true, reason: 'recovery_wait', request};
@@ -6980,7 +9989,9 @@ async function handleUnattendedKeywordAlarm() {
 async function reconcileUnattendedKeywordPlanSchedule({ launchDue = false } = {}) {
   const plan = await readUnattendedKeywordPlan();
   if (!plan.enabled) {
-    await cleanupDisabledUnattendedKeywordPlanRuntime();
+    await cleanupDisabledUnattendedKeywordPlanRuntime({
+      expectedPlanUpdatedAt: plan.updatedAt,
+    });
     await syncUnattendedKeywordAlarm(plan);
     return plan;
   }
@@ -7344,12 +10355,15 @@ async function ensureRuntimeState() {
       };
       // Fence every downstream write before touching debugger, workers or groups.
       // If cleanup fails, the runtime ownership snapshot remains for the next retry.
-      await chrome.storage.local.set({
-        [STORAGE_KEYS.runtime]: {
-          ...current,
-          ...nextPatch,
-        },
-      });
+      await runAuthoritativeControlStorageMutation(
+        () => chrome.storage.local.set({
+          [STORAGE_KEYS.runtime]: {
+            ...current,
+            ...nextPatch,
+          },
+        }),
+        {relieveStoragePressure: true},
+      );
       await cleanupStaleCaptureRuntimeSession(current.captureDebugSession);
       if (staleTaskId && !unattended.active) {
         await terminalizeCaptureTaskLedgerRun(staleTaskId, {
@@ -7385,9 +10399,12 @@ async function ensureRuntimeState() {
       ...current,
       ...nextPatch,
     };
-    await chrome.storage.local.set({
-      [STORAGE_KEYS.runtime]: next,
-    });
+    await runAuthoritativeControlStorageMutation(
+      () => chrome.storage.local.set({
+        [STORAGE_KEYS.runtime]: next,
+      }),
+      {relieveStoragePressure: true},
+    );
     return next;
   });
   if (unattendedRecoveryTaskId) {
@@ -7732,6 +10749,7 @@ function getContentRelayTimeoutMs(payload = {}) {
   if (
     action === 'ping' ||
     action === 'cancelCapture' ||
+    action === 'inspectCaptureActivity' ||
     action === 'detectPageType' ||
     action === 'detectSearchSortDimension'
   ) {
@@ -8315,10 +11333,47 @@ captureDebugSessionManager =
     },
   });
 
-function createCaptureTaskError(code, message) {
+function createCaptureTaskError(code, message, details = null) {
   const error = new Error(message);
   error.code = code;
+  if (details && typeof details === 'object' && !Array.isArray(details)) {
+    error.details = details;
+  }
   return error;
+}
+
+function createCaptureTaskDebugOwnershipError(ownership = {}) {
+  const kind = String(ownership?.kind || '').trim();
+  const messages = {
+    starvoice_active:
+      '当前 Agent 已有 StarVoice 采集会话运行，本任务将交给其他空闲 Agent',
+    external_debugger:
+      '当前页面正被 DevTools 或外部调试器占用，本任务将交给其他空闲 Agent',
+    unknown_occupancy:
+      '当前 Agent 无法确认浏览器调试占用来源，本任务将交给其他空闲 Agent',
+  };
+  return createCaptureTaskError(
+    String(ownership?.code || 'capture_task_debug_ownership_unknown'),
+    messages[kind] || messages.unknown_occupancy,
+    {
+      debugOwnership: kind || 'unknown_occupancy',
+      retryable: ownership?.retryable !== false,
+      automaticReroute: ownership?.automaticReroute !== false,
+      safeToDetach: false,
+      ...(Number.isSafeInteger(Number(ownership?.tabId))
+        ? {tabId: Number(ownership.tabId)}
+        : {}),
+      ...(String(ownership?.taskId || '').trim()
+        ? {ownerTaskId: String(ownership.taskId).trim()}
+        : {}),
+      ...(String(ownership?.state || '').trim()
+        ? {ownerState: String(ownership.state).trim()}
+        : {}),
+      ...(String(ownership?.reason || '').trim()
+        ? {reason: String(ownership.reason).trim().slice(0, 320)}
+        : {}),
+    },
+  );
 }
 
 function getCaptureTaskRequest(message) {
@@ -8526,16 +11581,38 @@ async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
 }
 
 async function beginCaptureTask(message, sender) {
-  return await runCaptureTaskBeginOperation(() =>
-    beginCaptureTaskNow(message, sender),
-  );
+  return await runCaptureTaskBeginOperation(async () => {
+    const request = getCaptureTaskRequest(message);
+    const marker = {
+      taskId: requireCaptureTaskId(request),
+      attemptId: String(request.attemptId || '').trim(),
+      sourceTabId: resolveCaptureTaskTabId(
+        request.sourceTabId,
+        request.tabId,
+        sender?.tab?.id,
+      ),
+    };
+    captureTaskBeginInFlight = marker;
+    try {
+      return await beginCaptureTaskNow(message, sender);
+    } finally {
+      if (captureTaskBeginInFlight === marker) {
+        captureTaskBeginInFlight = null;
+      }
+    }
+  });
 }
 
 async function beginCaptureTaskNow(message, sender) {
   const request = getCaptureTaskRequest(message);
   const taskId = requireCaptureTaskId(request);
   const ownerRequired = request.ownerRequired === true;
-  const sourceTabId = resolveCaptureTaskTabId(
+  const attemptId = String(request.attemptId || '').trim();
+  let sourceTabId = resolveCaptureTaskTabId(
+    captureTaskBeginInFlight?.taskId === taskId &&
+        captureTaskBeginInFlight?.attemptId === attemptId
+      ? captureTaskBeginInFlight.sourceTabId
+      : null,
     request.sourceTabId,
     request.tabId,
     sender?.tab?.id,
@@ -8546,10 +11623,29 @@ async function beginCaptureTaskNow(message, sender) {
       '采集任务缺少有效的来源 Tab',
     );
   }
-  const sourceTab = await chrome.tabs.get(sourceTabId);
-  const detectedPlatform = detectPlatformFromUrl(sourceTab?.url || '');
+  let sourceTab = null;
+  try {
+    sourceTab = await chrome.tabs.get(sourceTabId);
+  } catch (error) {
+    const replacement = resolveCaptureTaskReplacementLease(sourceTabId, {
+      taskId,
+      attemptId,
+    });
+    const replacementTabId = resolveCaptureTaskTabId(
+      captureTaskBeginInFlight?.taskId === taskId &&
+          captureTaskBeginInFlight?.attemptId === attemptId
+        ? captureTaskBeginInFlight.sourceTabId
+        : null,
+      replacement?.tabId,
+    );
+    if (!replacementTabId || replacementTabId === sourceTabId) {
+      throw error;
+    }
+    sourceTabId = replacementTabId;
+    sourceTab = await chrome.tabs.get(sourceTabId);
+  }
+  let sourcePlatform = detectPlatformFromUrl(sourceTab?.url || '');
   const requestedPlatform = normalizePlatformId(request.platform);
-  const sourcePlatform = detectedPlatform;
   if (!new Set(['xiaohongshu', 'douyin']).has(sourcePlatform)) {
     throw createCaptureTaskError(
       'capture_task_platform_unsupported',
@@ -8606,7 +11702,7 @@ async function beginCaptureTaskNow(message, sender) {
     attemptId: request.attemptId,
     sender,
   });
-  const boundExecutionLock = await bindCaptureExecutionLockToTask(
+  let boundExecutionLock = await bindCaptureExecutionLockToTask(
     taskId,
     sourceTabId,
     {
@@ -8631,27 +11727,99 @@ async function beginCaptureTaskNow(message, sender) {
       '无人值守任务执行锁未能绑定，未启动浏览器接管',
     );
   }
-  await releaseConfirmedStaleCaptureTaskGroupsForBegin();
 
-  const finalBeginAttemptFence = await inspectUnattendedCaptureTaskAttempt({
-    taskId,
-    attemptId: request.attemptId,
-  });
-  if (
-    finalBeginAttemptFence.unattended &&
-    (!finalBeginAttemptFence.current ||
-      !finalBeginAttemptFence.active ||
-      !finalBeginAttemptFence.lockMatchesTaskAttempt ||
-      !matchesUnattendedBeginLease(
-        finalBeginAttemptFence.lock,
-        boundExecutionLock,
-      ))
-  ) {
-    throw createCaptureTaskError(
-      'unattended_begin_fence_changed',
-      '无人值守任务状态已经变化，未启动浏览器接管',
+  const reconcileUnattendedBeginFence = async ({rollback = false} = {}) => {
+    const fence = await inspectUnattendedCaptureTaskAttempt({
+      taskId,
+      attemptId,
+    });
+    const leaseMatches = !fence.unattended || matchesUnattendedBeginLease(
+      fence.lock,
+      boundExecutionLock,
+      {taskId, attemptId},
     );
-  }
+    if (
+      fence.unattended &&
+      (!fence.current ||
+        !fence.active ||
+        !fence.lockMatchesTaskAttempt ||
+        !leaseMatches)
+    ) {
+      const details = describeUnattendedBeginFenceMismatch(
+        fence,
+        boundExecutionLock,
+      );
+      console.warn('[CaptureTask] unattended BEGIN fence changed:', details);
+      throw createCaptureTaskError(
+        'unattended_begin_fence_changed',
+        rollback
+          ? '无人值守任务状态已经变化，已撤销浏览器接管'
+          : '无人值守任务状态已经变化，未启动浏览器接管',
+        details,
+      );
+    }
+    const inFlightReplacementTabId = resolveCaptureTaskTabId(
+      captureTaskBeginInFlight?.taskId === taskId &&
+          captureTaskBeginInFlight?.attemptId === attemptId
+        ? captureTaskBeginInFlight.sourceTabId
+        : null,
+    );
+    const replacementTabId = resolveCaptureTaskTabId(
+      inFlightReplacementTabId !== sourceTabId
+        ? inFlightReplacementTabId
+        : fence.unattended
+          ? fence.lock?.holderTabId
+          : null,
+    );
+    if (replacementTabId && replacementTabId !== sourceTabId) {
+      const replacement = resolveCaptureTaskReplacementLease(sourceTabId, {
+        taskId,
+        attemptId,
+      });
+      if (!replacement || replacement.tabId !== replacementTabId) {
+        const details = describeUnattendedBeginFenceMismatch(
+          fence,
+          boundExecutionLock,
+        );
+        throw createCaptureTaskError(
+          'unattended_begin_fence_changed',
+          '无人值守任务页面发生了未经确认的切换，未启动浏览器接管',
+          details,
+        );
+      }
+      const replacementTab = await chrome.tabs.get(replacementTabId);
+      const replacementPlatform = detectPlatformFromUrl(
+        replacementTab?.url || '',
+      );
+      if (
+        replacementPlatform !== sourcePlatform ||
+        (requestedPlatform !== 'unknown' &&
+          replacementPlatform !== requestedPlatform)
+      ) {
+        throw createCaptureTaskError(
+          'capture_task_platform_mismatch',
+          '浏览器替换后的任务页面与原任务平台不一致，已拒绝接管',
+        );
+      }
+      sourceTabId = replacementTabId;
+      sourceTab = replacementTab;
+      sourcePlatform = replacementPlatform;
+      if (
+        captureTaskBeginInFlight?.taskId === taskId &&
+        captureTaskBeginInFlight?.attemptId === attemptId
+      ) {
+        captureTaskBeginInFlight.sourceTabId = replacementTabId;
+      }
+    }
+    if (fence.unattended) {
+      boundExecutionLock = fence.lock;
+    }
+    return fence;
+  };
+
+  const staleRecovery =
+    await releaseConfirmedStaleCaptureTaskGroupsForBegin();
+  await reconcileUnattendedBeginFence();
 
   const existingSession =
     captureDebugSessionManager.getSessionByTaskId(taskId);
@@ -8664,15 +11832,6 @@ async function beginCaptureTaskNow(message, sender) {
     throw createCaptureTaskError(
       'capture_task_cleanup_pending',
       '上一采集任务仍在安全清理工作页，请稍后重试',
-    );
-  }
-  const conflictingGroup = captureTaskTabGroupManager
-    .getActiveTasks()
-    .find((candidate) => candidate?.taskId !== taskId);
-  if (conflictingGroup) {
-    throw createCaptureTaskError(
-      'capture_task_group_busy',
-      '已有采集标签组正在运行，请先结束当前任务',
     );
   }
   if (existingSession && existingSession.tabId !== sourceTabId) {
@@ -8691,26 +11850,61 @@ async function beginCaptureTaskNow(message, sender) {
       activeDebugSession.taskId !== taskId ||
       activeDebugSession.tabId !== sourceTabId)
   ) {
+    const ownership =
+      globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+        requestedTaskId: taskId,
+        requestedTabId: sourceTabId,
+        activeSession: activeDebugSession,
+        staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+    });
+    throw createCaptureTaskDebugOwnershipError(ownership);
+  }
+  const conflictingGroup = captureTaskTabGroupManager
+    .getActiveTasks()
+    .find((candidate) => candidate?.taskId !== taskId);
+  if (conflictingGroup) {
     throw createCaptureTaskError(
-      'capture_task_debug_busy',
-      '已有页面处于 AI Debug 采集任务，请先结束当前任务',
+      'capture_task_group_busy',
+      '已有采集标签组正在运行，请先结束当前任务',
+      {
+        debugOwnership: 'starvoice_active',
+        retryable: true,
+        automaticReroute: true,
+        safeToDetach: false,
+        ownerTaskId: String(conflictingGroup.taskId || '').trim(),
+      },
     );
   }
+  let debugOwnership =
+    globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+      requestedTaskId: taskId,
+      requestedTabId: sourceTabId,
+      activeSession: existingSession,
+      staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+    });
   if (!existingSession) {
     if (typeof chrome.debugger?.getTargets !== 'function') {
-      throw createCaptureTaskError(
-        'capture_task_debug_preflight_unavailable',
-        '当前浏览器无法确认页面调试占用状态，未启动采集任务',
-      );
+      debugOwnership =
+        globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+          requestedTaskId: taskId,
+          requestedTabId: sourceTabId,
+          staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+          preflightAvailable: false,
+        });
+      throw createCaptureTaskDebugOwnershipError(debugOwnership);
     }
     let targets = [];
     try {
       targets = await chrome.debugger.getTargets();
     } catch (error) {
-      throw createCaptureTaskError(
-        'capture_task_debug_preflight_failed',
-        `无法确认页面调试占用状态：${String(error?.message || error || '未知错误')}`,
-      );
+      debugOwnership =
+        globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+          requestedTaskId: taskId,
+          requestedTabId: sourceTabId,
+          staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+          preflightError: error,
+        });
+      throw createCaptureTaskDebugOwnershipError(debugOwnership);
     }
     const occupied = (Array.isArray(targets) ? targets : []).some(
       (target) =>
@@ -8718,12 +11912,17 @@ async function beginCaptureTaskNow(message, sender) {
         Number(target?.tabId) === sourceTabId,
     );
     if (occupied) {
-      throw createCaptureTaskError(
-        'capture_task_debug_busy',
-        '当前页面已被 DevTools 或其他调试任务占用，请关闭后重试',
-      );
+      debugOwnership =
+        globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+          requestedTaskId: taskId,
+          requestedTabId: sourceTabId,
+          staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+          targetAttached: true,
+        });
+      throw createCaptureTaskDebugOwnershipError(debugOwnership);
     }
   }
+  await reconcileUnattendedBeginFence();
   let group = null;
   let session = null;
 
@@ -8733,25 +11932,65 @@ async function beginCaptureTaskNow(message, sender) {
       sourceTabId,
       title: CAPTURE_TASK_GROUP_TITLE,
     });
-    session = await captureDebugSessionManager.start({
-      tabId: sourceTabId,
-      runId:
-        String(request.runId || '').trim() ||
-        existingSession?.runId ||
-        `capture-task:${taskId}`,
-      label: String(request.label || '').trim() || '采集任务',
-      pageTitle: sourceTab?.title || '',
-      pageUrl: sourceTab?.url || '',
-      platform: sourcePlatform,
-      persistent: true,
-      taskId,
-      attemptId: request.attemptId,
-      progress: request.progress ?? null,
-      workerTabIds: existingSession?.workerTabIds || [],
-      groupId: group.groupId,
-      originalGroupId: group.originalGroupId,
-      minimized: Boolean(request.minimized),
-    });
+    await reconcileUnattendedBeginFence();
+    const activeGroupAfterFence =
+      captureTaskTabGroupManager.getTask(taskId) || group;
+    if (activeGroupAfterFence.sourceTabId !== sourceTabId) {
+      const groupReplacement = resolveCaptureTaskReplacementLease(
+        activeGroupAfterFence.sourceTabId,
+        {taskId, attemptId},
+      );
+      if (!groupReplacement || groupReplacement.tabId !== sourceTabId) {
+        throw createCaptureTaskError(
+          'capture_task_replacement_not_rebound',
+          '浏览器替换了采集页面，但任务标签组未能重新绑定',
+        );
+      }
+      const groupResult = await captureTaskTabGroupManager.replaceTab({
+        removedTabId: activeGroupAfterFence.sourceTabId,
+        addedTabId: sourceTabId,
+      });
+      if (groupResult?.replaced !== true) {
+        throw createCaptureTaskError(
+          'capture_task_replacement_not_rebound',
+          '浏览器替换了采集页面，但任务标签组未能重新绑定',
+        );
+      }
+      group = groupResult.group;
+    } else {
+      group = activeGroupAfterFence;
+    }
+    try {
+      session = await captureDebugSessionManager.start({
+        tabId: sourceTabId,
+        runId:
+          String(request.runId || '').trim() ||
+          existingSession?.runId ||
+          `capture-task:${taskId}`,
+        label: String(request.label || '').trim() || '采集任务',
+        pageTitle: sourceTab?.title || '',
+        pageUrl: sourceTab?.url || '',
+        platform: sourcePlatform,
+        persistent: true,
+        taskId,
+        attemptId: request.attemptId,
+        progress: request.progress ?? null,
+        workerTabIds: existingSession?.workerTabIds || [],
+        groupId: group.groupId,
+        originalGroupId: group.originalGroupId,
+        minimized: Boolean(request.minimized),
+      });
+    } catch (error) {
+      if (error?.code !== 'debug_session_attach_failed') throw error;
+      debugOwnership =
+        globalThis.OnStarvoiceCaptureDebugSession.classifyDebugOwnership({
+          requestedTaskId: taskId,
+          requestedTabId: sourceTabId,
+          staleReleasedTaskIds: staleRecovery.releasedTaskIds,
+          attachError: error?.cause || error,
+        });
+      throw createCaptureTaskDebugOwnershipError(debugOwnership);
+    }
 
     const update = {taskId, groupId: group.groupId};
     if (Object.prototype.hasOwnProperty.call(request, 'progress')) {
@@ -8768,27 +12007,8 @@ async function beginCaptureTaskNow(message, sender) {
       await requireConnectedCaptureTaskOwner(taskId);
     }
     await writeRuntimeState({captureTaskCancellation: null});
-    const completedBeginAttemptFence =
-      await inspectUnattendedCaptureTaskAttempt({
-        taskId,
-        attemptId: request.attemptId,
-      });
-    if (
-      completedBeginAttemptFence.unattended &&
-      (!completedBeginAttemptFence.current ||
-        !completedBeginAttemptFence.active ||
-        !completedBeginAttemptFence.lockMatchesTaskAttempt ||
-        !matchesUnattendedBeginLease(
-          completedBeginAttemptFence.lock,
-          boundExecutionLock,
-        ))
-    ) {
-      throw createCaptureTaskError(
-        'unattended_begin_fence_changed',
-        '无人值守任务状态已经变化，已撤销浏览器接管',
-      );
-    }
-    return {taskId, session, group};
+    await reconcileUnattendedBeginFence({rollback: true});
+    return {taskId, session, group, debugOwnership};
   } catch (error) {
     if (session || group || existingSession || existingGroup) {
       try {
@@ -9340,8 +12560,12 @@ async function inspectUnattendedCaptureTaskAttempt({
   };
 }
 
-function matchesUnattendedBeginLease(actualLock, expectedLock) {
-  return Boolean(
+function matchesUnattendedBeginLease(
+  actualLock,
+  expectedLock,
+  {taskId = '', attemptId = ''} = {},
+) {
+  const stableLeaseMatches = Boolean(
     actualLock &&
       expectedLock &&
       String(actualLock.id || '') === String(expectedLock.id || '') &&
@@ -9350,13 +12574,52 @@ function matchesUnattendedBeginLease(actualLock, expectedLock) {
         String(expectedLock.holderId || '') &&
       String(actualLock.holderDocumentId || '') ===
         String(expectedLock.holderDocumentId || '') &&
-      resolveCaptureTaskTabId(actualLock.holderTabId) ===
-        resolveCaptureTaskTabId(expectedLock.holderTabId) &&
       String(actualLock.captureTaskId || '').trim() ===
         String(expectedLock.captureTaskId || '').trim() &&
       String(actualLock.captureTaskAttemptId || '').trim() ===
         String(expectedLock.captureTaskAttemptId || '').trim()
   );
+  if (!stableLeaseMatches) return false;
+
+  const actualTabId = resolveCaptureTaskTabId(actualLock.holderTabId);
+  const expectedTabId = resolveCaptureTaskTabId(expectedLock.holderTabId);
+  if (actualTabId === expectedTabId) return true;
+  const replacement = resolveCaptureTaskReplacementLease(expectedTabId, {
+    taskId:
+      String(taskId || '').trim() ||
+      String(expectedLock.captureTaskId || '').trim(),
+    attemptId:
+      String(attemptId || '').trim() ||
+      String(expectedLock.captureTaskAttemptId || '').trim(),
+  });
+  return Boolean(replacement && replacement.tabId === actualTabId);
+}
+
+function describeUnattendedBeginFenceMismatch(actualFence, expectedLock) {
+  const actualLock = actualFence?.lock || null;
+  return {
+    current: actualFence?.current === true,
+    active: actualFence?.active === true,
+    lockMatchesTaskAttempt: actualFence?.lockMatchesTaskAttempt === true,
+    expected: {
+      lockId: String(expectedLock?.id || ''),
+      owner: String(expectedLock?.owner || ''),
+      holderId: String(expectedLock?.holderId || ''),
+      holderDocumentId: String(expectedLock?.holderDocumentId || ''),
+      holderTabId: resolveCaptureTaskTabId(expectedLock?.holderTabId),
+      captureTaskId: String(expectedLock?.captureTaskId || ''),
+      attemptId: String(expectedLock?.captureTaskAttemptId || ''),
+    },
+    actual: {
+      lockId: String(actualLock?.id || ''),
+      owner: String(actualLock?.owner || ''),
+      holderId: String(actualLock?.holderId || ''),
+      holderDocumentId: String(actualLock?.holderDocumentId || ''),
+      holderTabId: resolveCaptureTaskTabId(actualLock?.holderTabId),
+      captureTaskId: String(actualLock?.captureTaskId || ''),
+      attemptId: String(actualLock?.captureTaskAttemptId || ''),
+    },
+  };
 }
 
 async function clearUnattendedCaptureTaskLockBinding(
@@ -9371,7 +12634,7 @@ async function clearUnattendedCaptureTaskLockBinding(
   const normalizedLockId = String(lockId || '').trim();
   const normalizedTaskId = String(taskId || '').trim();
   if (!normalizedLockId || !normalizedTaskId) return false;
-  return await runCaptureExecutionLockOperation(async () => {
+  const clearBinding = () => runCaptureExecutionLockOperation(async () => {
     const stored = await chrome.storage.local.get(
       STORAGE_KEYS.captureExecutionLock,
     );
@@ -9405,11 +12668,16 @@ async function clearUnattendedCaptureTaskLockBinding(
     });
     return true;
   });
+  return await runAuthoritativeControlStorageMutation(clearBinding);
 }
 
 async function releaseUnattendedCaptureTaskResourcesForRecovery(
   lock,
-  {reason = 'unattended_runtime_recovery', request = null} = {},
+  {
+    reason = 'unattended_runtime_recovery',
+    request = null,
+    preserveLockBinding = false,
+  } = {},
 ) {
   // Recovery can clear the persisted lock binding before every asynchronous
   // Debug/group/worker cleanup callback has finished.  The replacement runner
@@ -9429,11 +12697,13 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
   } else {
     captureTaskOwnerCoordinator?.clearTask(taskId);
   }
-  await clearUnattendedCaptureTaskLockBinding(lock?.id, taskId, {
-    expectedHolderId: lock?.holderId,
-    expectedHolderDocumentId: lock?.holderDocumentId,
-    expectedHolderTabId: lock?.holderTabId,
-  });
+  if (!preserveLockBinding) {
+    await clearUnattendedCaptureTaskLockBinding(lock?.id, taskId, {
+      expectedHolderId: lock?.holderId,
+      expectedHolderDocumentId: lock?.holderDocumentId,
+      expectedHolderTabId: lock?.holderTabId,
+    });
+  }
 
   // 0.3.43 及更早版本为每次 runner 生成随机 child task。只收口这类
   // 旧记录；新版使用同一 request 的稳定 taskId，恢复后仍是同一项任务。
@@ -9943,8 +13213,20 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
         Number(group?.sourceTabId) === normalizedRemovedTabId ||
         group?.workerTabIds?.includes(normalizedRemovedTabId),
     );
+  const pendingBegin =
+    captureTaskBeginInFlight &&
+    resolveCaptureTaskTabId(captureTaskBeginInFlight.sourceTabId) ===
+      normalizedRemovedTabId
+      ? captureTaskBeginInFlight
+      : null;
   const taskId = String(
-    previousDebugSession?.taskId || previousGroup?.taskId || '',
+    previousDebugSession?.taskId ||
+      previousGroup?.taskId ||
+      pendingBegin?.taskId ||
+      '',
+  ).trim();
+  const attemptId = String(
+    previousDebugSession?.attemptId || pendingBegin?.attemptId || '',
   ).trim();
   const replacementRole =
     Number(previousGroup?.sourceTabId) === normalizedRemovedTabId
@@ -9969,6 +13251,29 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
     return false;
   }
 
+  rememberCaptureTaskReplacementTab({
+    removedTabId: normalizedRemovedTabId,
+    addedTabId: normalizedAddedTabId,
+    taskId,
+    attemptId,
+  });
+  if (pendingBegin) {
+    pendingBegin.sourceTabId = normalizedAddedTabId;
+  }
+  if (pendingBegin && !previousDebugSession && !previousGroup) {
+    await Promise.all([
+      replaceCaptureExecutionLockTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+      replaceUnattendedRunnerTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+    ]);
+    return true;
+  }
+
   let replacementTab = null;
   try {
     replacementTab = await chrome.tabs.get(normalizedAddedTabId);
@@ -9982,9 +13287,16 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
       pageTitle: replacementTab?.title || '',
       pageUrl: replacementTab?.url || '',
     });
+    const debugBindingCanFinishInBegin = Boolean(
+      pendingBegin &&
+        replacementRole === 'source' &&
+        !previousDebugSession,
+    );
     if (
       groupResult?.replaced !== true ||
-      (replacementRole && debugResult?.replaced !== true)
+      (replacementRole &&
+        debugResult?.replaced !== true &&
+        !debugBindingCanFinishInBegin)
     ) {
       throw createCaptureTaskError(
         'capture_task_replacement_not_rebound',
@@ -10008,6 +13320,12 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
         normalizedAddedTabId,
       ),
     ]);
+    rememberCaptureTaskReplacementTab({
+      removedTabId: normalizedRemovedTabId,
+      addedTabId: normalizedAddedTabId,
+      taskId,
+      attemptId,
+    });
     return true;
   } catch (error) {
     const message = `浏览器替换采集页面后接管迁移失败：${String(
@@ -10537,6 +13855,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           };
         });
         let cloudReport = null;
+        let runnerCleanup = null;
         if (
           result.ok &&
           cloudTargetedPostApi.isTerminalRunStatus(result.data?.status)
@@ -10545,10 +13864,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // 可能在计时器执行前休眠。直接等待指令回执，确保云端工作项、
           // 父任务和帖子可用性在同一次消息生命周期内完成结算。
           cloudReport = await reportTargetedPostTerminalToCloud(result.data);
+          // 运行页只能在终态 request 与任务账本已经原子落盘、终态报告
+          // 已完成本地记账/云端尝试之后关闭。needs_action 必须保留现场，
+          // 且清理始终按 requestId + attemptId 精确匹配任务自有 shell。
+          runnerCleanup = await closeTerminalTargetedPostRunnerTabs(
+            result.data,
+          );
         }
         sendResponse({
           ...result,
           cloudReported: cloudReport?.ok === true,
+          runnerClosed: Number(runnerCleanup?.removedCount) > 0,
         });
         return;
       }
@@ -10565,6 +13891,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const requestId = String(message?.requestId || '').trim();
         const result = await claimUnattendedKeywordRun({
           requestId,
+          attemptId: String(message?.attemptId || '').trim(),
+          requireAttempt: Boolean(requestId),
           senderTabId: sender?.tab?.id,
           senderDocumentId: sender?.documentId,
           holderId: String(message?.holderId || ''),
@@ -10590,6 +13918,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           data: result.data,
           accepted: result.accepted,
           reason: result.reason,
+        });
+        return;
+      }
+
+      if (type === 'onstarvoice:finalize-unattended-local-closure') {
+        const result = await reconcileUnattendedLocalClosureEvidence({
+          expectedRequestId: String(message?.requestId || '').trim(),
+          expectedAttemptId: String(message?.attemptId || '').trim(),
+          closeOwnedRunnerTabs: true,
+        });
+        if (result?.persisted === true) {
+          scheduleCloudTaskAgentSync('unattended_local_closure_persisted', 0);
+        }
+        sendResponse({
+          ok: result?.persisted === true || result?.reason === 'already_persisted',
+          accepted:
+            result?.persisted === true || result?.reason === 'already_persisted',
+          reason: result?.reason || 'local_closure_unavailable',
+          data: result?.evidence || null,
         });
         return;
       }
@@ -10800,8 +14147,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:relay-to-content') {
-        const tabId = message?.tabId;
-        if (typeof tabId !== 'number') {
+        const requestedTabId = message?.tabId;
+        if (typeof requestedTabId !== 'number') {
           throw new Error('invalid tabId');
         }
 
@@ -10810,20 +14157,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ? message.payload
             : {};
         const contentAction = String(sourcePayload.action || '');
+        const requestedTaskId = String(
+          sourcePayload.taskId || sourcePayload.taskContext?.taskId || '',
+        ).trim();
+        let relayTabId = requestedTabId;
         let relayTab = null;
         try {
-          relayTab = await chrome.tabs.get(tabId);
+          relayTab = await chrome.tabs.get(relayTabId);
         } catch {
-          relayTab = null;
+          const replacement = resolveCaptureTaskReplacementTab(
+            requestedTabId,
+            requestedTaskId,
+          );
+          if (replacement) {
+            relayTabId = replacement.tabId;
+            try {
+              relayTab = await chrome.tabs.get(relayTabId);
+            } catch {
+              relayTab = null;
+            }
+          }
         }
         const existingDebugSession =
-          captureDebugSessionManager.getSession(tabId);
+          captureDebugSessionManager.getSession(relayTabId);
         if (
           contentAction === 'cancelCapture' &&
           !existingDebugSession?.persistent
         ) {
           await captureDebugSessionManager.stopByTab(
-            tabId,
+            relayTabId,
             'user_cancel_requested',
           );
         }
@@ -10895,7 +14257,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                   : '搜索结果采集'
                 : '博主作品采集';
             debugSession = await captureDebugSessionManager.start({
-              tabId,
+              tabId: relayTabId,
               runId: listRunId,
               label,
               pageTitle: relayTab?.title || '',
@@ -10913,14 +14275,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         let response;
         let relayError = null;
         try {
-          response = await relayToContentWithRetry(tabId, relayPayload);
+          response = await relayToContentWithRetry(relayTabId, relayPayload);
         } catch (error) {
           relayError = error;
           throw error;
         } finally {
           if (debugSession && debugSessionStartedByRelay) {
             await captureDebugSessionManager.stop({
-              tabId,
+              tabId: relayTabId,
               runId: debugSession.runId,
               reason: 'capture_relay_finished',
             });
@@ -10962,6 +14324,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         error: {
           code: String(error?.code || 'runtime_error'),
           message: error instanceof Error ? error.message : 'unknown runtime error',
+          ...(error?.details &&
+          typeof error.details === 'object' &&
+          !Array.isArray(error.details)
+            ? {details: error.details}
+            : {}),
         },
       });
     }

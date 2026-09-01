@@ -69,6 +69,27 @@ test("Douyin DOM capture rejects an unopened search modal before reading a card"
   );
 });
 
+test("slow Douyin details remain recoverable until the target work is hydrated", () => {
+  assert.match(
+    captureSyncSource,
+    /DOUYIN_DETAIL_READY_PROBE_TIMEOUT_MS = 20000/u,
+  );
+
+  assert.match(
+    singleNoteSource,
+    /DOUYIN_DETAIL_DOM_READY_TIMEOUT_MS = 25000/u,
+  );
+  assert.match(
+    singleNoteSource,
+    /ensureDetailPageReady\(DOUYIN_DOM_PROFILE,[\s\S]*?timeout: DOUYIN_DETAIL_DOM_READY_TIMEOUT_MS/u,
+  );
+  assert.match(
+    singleNoteSource,
+    /notReadyError\.code = "DOUYIN_DETAIL_NOT_READY"/u,
+    "a slow DOM must enter the existing alternate-entry retry path",
+  );
+});
+
 test("Douyin DOM identity wins over a misleading modal_id URL", async () => {
   const previousWindow = globalThis.window;
   globalThis.window = {

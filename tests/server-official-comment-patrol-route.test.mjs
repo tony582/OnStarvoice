@@ -119,10 +119,10 @@ test('official post workbench exposes current engagement, sentiment, advice, and
     /本次巡查|上次巡查|相比上次巡查|较上次巡查|风险趋势|评论覆盖|本次新增/u,
   );
   assert.doesNotMatch(monitoringTab, /label="点赞"|label="回复鼓励"|标记完成/u);
-  assert.match(monitoringTab, /查看原文/u);
+  assert.match(monitoringTab, /RecordSourceAction record=\{post\}/u);
   assert.doesNotMatch(monitoringTab, /查看原帖/u);
   assert.doesNotMatch(monitoringTab, />帖子列表</u);
-  assert.match(monitoringTab, /href=\{post\.url\}/u);
+  assert.doesNotMatch(monitoringTab, /href=\{post\.url\}/u);
   assert.match(route, /record\.likes, record\.shares/u);
   assert.match(
     route,
@@ -277,6 +277,7 @@ test('create route creates one account-page Agent task and forces comment sampli
   assert.match(route, /'\/official-comment-patrol\/tasks'/u);
   assert.match(route, /agent_required/u);
   assert.match(route, /loadCompatibleProfilePatrolAgent/u);
+  assert.match(createRoute, /\{excludeTaskIds: \[requestKey\]\}/u);
   assert.match(route, /materializeProfilePatrolTask/u);
   assert.match(route, /subjectType: 'official'/u);
   assert.match(route, /official_account_comment_patrol/u);

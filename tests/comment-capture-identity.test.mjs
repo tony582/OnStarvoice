@@ -171,6 +171,101 @@ test("long XHS detail and blogger operations emit relay-only heartbeats", () => 
   assert.match(blogger, /stopHeartbeat\(\)/u);
 });
 
+test("content capture activity inspection reports exact request settlement", () => {
+  const inspectionBlock = sourceBlock(
+    contentSource,
+    "function handleInspectCaptureActivity",
+    "function reportCaptureProgress",
+  );
+  const inspectionContext = vm.createContext({
+    activeCaptureRequestCounts: new Map([["capture-active", 1]]),
+  });
+  vm.runInContext(
+    `${inspectionBlock}\n;globalThis.__inspect = handleInspectCaptureActivity;`,
+    inspectionContext,
+  );
+  let response = null;
+  inspectionContext.__inspect(
+    {captureRequestId: "capture-active"},
+    (value) => { response = value; },
+  );
+  assert.equal(response.ok, true);
+  assert.equal(response.targetActive, true);
+  assert.equal(response.activeCount, 1);
+
+  inspectionContext.activeCaptureRequestCounts.delete("capture-active");
+  inspectionContext.__inspect(
+    {captureRequestId: "capture-active"},
+    (value) => { response = value; },
+  );
+  assert.equal(response.targetActive, false);
+  assert.equal(response.activeCount, 0);
+});
+
+test("same-id concurrent capture invocations remain active until all settle", async () => {
+  const trackingBlock = sourceBlock(
+    contentSource,
+    "function runTrackedCaptureRequest",
+    "function handleInspectCaptureActivity",
+  );
+  const inspectionBlock = sourceBlock(
+    contentSource,
+    "function handleInspectCaptureActivity",
+    "function reportCaptureProgress",
+  );
+  const trackingContext = vm.createContext({
+    activeCaptureRequestCounts: new Map(),
+    console: {error() {}},
+  });
+  vm.runInContext(
+    `${trackingBlock}\n${inspectionBlock}\n;globalThis.__captureActivity = {runTrackedCaptureRequest, handleInspectCaptureActivity};`,
+    trackingContext,
+    {filename: "content-v2-capture-activity.js"},
+  );
+
+  let resolveFirst;
+  let resolveSecond;
+  const firstInvocation = new Promise((resolve) => {
+    resolveFirst = resolve;
+  });
+  const secondInvocation = new Promise((resolve) => {
+    resolveSecond = resolve;
+  });
+  const request = {captureRequestId: "capture-shared"};
+  trackingContext.__captureActivity.runTrackedCaptureRequest(
+    request,
+    () => firstInvocation,
+  );
+  trackingContext.__captureActivity.runTrackedCaptureRequest(
+    request,
+    () => secondInvocation,
+  );
+
+  const inspect = () => {
+    let response = null;
+    trackingContext.__captureActivity.handleInspectCaptureActivity(
+      request,
+      (value) => { response = value; },
+    );
+    return response;
+  };
+
+  assert.equal(inspect().targetActive, true);
+  assert.equal(inspect().activeCount, 2);
+
+  resolveFirst();
+  await firstInvocation;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(inspect().targetActive, true);
+  assert.equal(inspect().activeCount, 1);
+
+  resolveSecond();
+  await secondInvocation;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(inspect().targetActive, false);
+  assert.equal(inspect().activeCount, 0);
+});
+
 test("Douyin comment capture carries and checks the expected work identity before merging", () => {
   const currentNoteBlock = sourceBlock(
     captureSyncSource,
