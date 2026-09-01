@@ -4278,10 +4278,16 @@ test("settled single-node tasks can retry on another idle Agent without forking 
     "export async function dispatchCrossDeviceRetry",
     "async function listAutomaticCaptureRetryCandidates",
   );
-  const idleAgentSelection = readSourceSection(
+  const promotion = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "single-node promotion",
+    "function previewPromotedRetryKeywordItems",
+    "function crossDeviceRetryAgentEligible",
+  );
+  const agentSelection = readSourceSection(
     postgresCrossDeviceRetrySource,
     "cross-device Agent selection",
-    "async function loadIdleCrossDeviceRetryAgent",
+    "async function findIdleCrossDeviceRetryAgents",
     "function promotedRetryFallbackTarget",
   );
   const profileRetryRenewal = readSourceSection(
@@ -4290,15 +4296,21 @@ test("settled single-node tasks can retry on another idle Agent without forking 
     "async function renewProfileRetryExecutions",
     "export async function dispatchCrossDeviceRetry",
   );
-  assert.match(dispatchCore, /loadIdleCrossDeviceRetryAgent/u);
-  assert.match(idleAgentSelection, /for \(const candidate of eligibleCandidates\)/u);
+  assert.match(dispatchCore, /findIdleCrossDeviceRetryAgents/u);
+  assert.match(dispatchCore, /lockIdleCrossDeviceRetryAgent/u);
+  assert.match(dispatchCore, /lockedCrossDeviceRetryAgentStillEligible/u);
   assert.match(
-    idleAgentSelection,
+    dispatchCore,
+    /export async function dispatchCrossDeviceRetry\(options = \{\}\)[\s\S]*automatic = false/u,
+    'the public retry dispatch must retain an explicit automatic=false default',
+  );
+  assert.match(
+    agentSelection,
     /const savepoint = 'capture_retry_agent_candidate'/u,
   );
-  assert.match(idleAgentSelection, /tryLockCaptureAgentExecutionSlot/u);
+  assert.match(agentSelection, /tryLockCaptureAgentExecutionSlot/u);
   assert.match(
-    idleAgentSelection,
+    agentSelection,
     /ROLLBACK TO SAVEPOINT \$\{savepoint\}/u,
   );
   assert.match(postgresCrossDeviceRetrySource, /AS active_command_count/u);
@@ -4314,9 +4326,9 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(dispatchCore, /INSERT INTO capture_task_item_attempts/u);
   assert.match(dispatchCore, /renewProfileRetryExecutions/u);
   assert.ok(
-    dispatchCore.indexOf('renewProfileRetryExecutions') <
-      dispatchCore.indexOf('targetAgent = await loadIdleCrossDeviceRetryAgent'),
-    'profile execution renewal must precede Agent-slot acquisition',
+    dispatchCore.indexOf('const targetAgent = await lockIdleCrossDeviceRetryAgent') <
+      dispatchCore.indexOf('renewProfileRetryExecutions'),
+    'canonical retry must acquire the Agent slot before profile renewal writes',
   );
   assert.match(
     profileRetryRenewal,
@@ -4328,11 +4340,7 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   );
   assert.match(
     dispatchCore,
-    /abortCrossDeviceRetry\('idle_compatible_agent_unavailable'/u,
-  );
-  assert.match(
-    dispatchCore,
-    /crossDeviceRetryError ===[\s\S]*'idle_compatible_agent_unavailable'[\s\S]*return noIdleAgentResult\(\)/u,
+    /if \(!targetAgent\)[\s\S]*return noIdleAgentResult\(\)/u,
   );
   assert.match(dispatchCore, /cross_device_retry_dispatched/u);
   assert.match(dispatchCore, /abortCrossDeviceRetry\(promoted\.error\)/u);
@@ -4344,6 +4352,118 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(
     postgresCrossDeviceRetrySource,
     /promotedRetryParent' IS DISTINCT FROM 'true'/u,
+  );
+  assert.match(
+    promotion,
+    /orchestrationCheckpointEntries\(task\)[\s\S]*INSERT INTO capture_task_items[\s\S]*INSERT INTO capture_task_item_attempts/u,
+  );
+  const promotedSourceMarker = promotion.indexOf(
+    'promotedSourceExecution: true',
+  );
+  const sourceChildInsert = promotion.indexOf(
+    'INSERT INTO capture_tasks',
+    promotedSourceMarker,
+  );
+  const sourceItemRelink = promotion.indexOf(
+    'UPDATE capture_task_items',
+    sourceChildInsert,
+  );
+  const sourceAttemptRelink = promotion.indexOf(
+    'UPDATE capture_task_item_attempts',
+    sourceItemRelink,
+  );
+  assert.ok(
+    promotedSourceMarker >= 0 &&
+      promotedSourceMarker < sourceChildInsert &&
+      sourceChildInsert < sourceItemRelink &&
+      sourceItemRelink < sourceAttemptRelink,
+    'single-node promotion must create its source child before relinking items and attempts',
+  );
+  assert.match(
+    promotion,
+    /synthesizePromotedKeywordItems\([\s\S]*SET task_type = 'capture_orchestration'[\s\S]*'promotedRetryParent', true[\s\S]*'promotedSourceExecutionTaskId'/u,
+  );
+
+  assert.match(
+    profileRetryRenewal,
+    /item\.item_type !== 'profile_subscription'[\s\S]*UUID_PATTERN\.test\(subscriptionId\)[\s\S]*FROM monitor_subscriptions[\s\S]*subscription\.status !== 'active'/u,
+  );
+  assert.match(
+    profileRetryRenewal,
+    /UPDATE monitor_executions[\s\S]*status IN \('pending', 'running'\)[\s\S]*INSERT INTO monitor_executions[\s\S]*ON CONFLICT \(subscription_id\)[\s\S]*WHERE status IN \('pending', 'running'\)[\s\S]*DO NOTHING/u,
+  );
+  assert.match(
+    profileRetryRenewal,
+    /executionIdByItem\.set\(String\(item\.id\), execution\.id\)[\s\S]*executionId: execution\.id/u,
+  );
+  assert.match(
+    dispatchCore,
+    /renewedExecutions\.executionIdByItem\.get\([\s\S]*'monitorExecutionId', \$8::text/u,
+  );
+
+  const requestLock = dispatchCore.indexOf(
+    "'capture_task_global_id', requestKey",
+  );
+  const parentControlLock = dispatchCore.indexOf(
+    "'capture_orchestration_control', taskId",
+    requestLock,
+  );
+  const candidateSelection = dispatchCore.indexOf(
+    'const candidateAgents = await findIdleCrossDeviceRetryAgents',
+    parentControlLock,
+  );
+  const agentSlotLock = dispatchCore.indexOf(
+    'const targetAgent = await lockIdleCrossDeviceRetryAgent',
+    candidateSelection,
+  );
+  const sourceTaskLocks = dispatchCore.indexOf(
+    'const lockedSourceTasks =',
+    agentSlotLock,
+  );
+  const expireCommands = dispatchCore.indexOf(
+    'await expireStaleCommands(',
+    sourceTaskLocks,
+  );
+  const taskLock = dispatchCore.indexOf(
+    'const task = await tx.queryOne',
+    expireCommands,
+  );
+  const itemLocks = dispatchCore.indexOf(
+    'const lockedSelection = await loadCrossDeviceRetryItemSelection',
+    taskLock,
+  );
+  assert.ok(
+    requestLock >= 0 &&
+      requestLock < parentControlLock &&
+      parentControlLock < candidateSelection &&
+      candidateSelection < agentSlotLock &&
+      agentSlotLock < sourceTaskLocks &&
+      sourceTaskLocks < expireCommands &&
+      expireCommands < taskLock &&
+      taskLock < itemLocks,
+    'common retry must lock request, parent control, Agent, sources, parent, then items',
+  );
+  const lockedSourceSection = dispatchCore.slice(
+    sourceTaskLocks,
+    expireCommands,
+  );
+  assert.match(
+    lockedSourceSection,
+    /ORDER BY id[\s\S]*FOR UPDATE/u,
+    'common retry must lock source tasks in stable UUID order',
+  );
+  assert.match(
+    dispatchCore.slice(itemLocks),
+    /lock: true/u,
+    'the final item selection must take row locks after the parent',
+  );
+  assert.match(
+    dispatchCore,
+    /AND execution_task_id IS NOT DISTINCT FROM \$6::uuid[\s\S]*AND assignment_revision = \$13/u,
+  );
+  assert.match(
+    dispatchCore,
+    /AND task_type = 'capture_orchestration'[\s\S]*AND orchestration_revision = \$9/u,
   );
 });
 
@@ -4493,10 +4613,16 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
     daily_search_limit: 0,
   }), true);
 
+  const agentEligibility = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "cross-device Agent eligibility",
+    "function crossDeviceRetryAgentEligible",
+    "async function findIdleCrossDeviceRetryAgents",
+  );
   const idleAgentSelection = readSourceSection(
     postgresCrossDeviceRetrySource,
     "cross-device Agent selection",
-    "async function loadIdleCrossDeviceRetryAgent",
+    "async function findIdleCrossDeviceRetryAgents",
     "function promotedRetryFallbackTarget",
   );
   assert.match(
@@ -4526,6 +4652,10 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
   assert.match(idleAgentSelection, /expectedSearches = 1/u);
   assert.match(idleAgentSelection, /expectedSearches,/u);
   assert.match(
+    agentEligibility,
+    /crossDeviceRetryAgentDailyUsageEligible\(agent, expectedSearches\)/u,
+  );
+  assert.match(
     idleAgentSelection,
     /ORDER BY COALESCE\(daily_usage\.searches,\s*0\) ASC,\s*recent_technical_failure_count ASC/u,
   );
@@ -4545,12 +4675,10 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
     idleAgentSelection,
     /reserveCaptureResourceAdmission\(tx,[\s\S]*resourcePolicy/u,
   );
-  assert.equal(
-    (idleAgentSelection.match(
-      /crossDeviceRetryAgentDailyUsageEligible\(/gu,
-    ) || []).length,
-    2,
-    'usage eligibility must be checked both before and after slot locking',
+  assert.ok(
+    (idleAgentSelection.match(/crossDeviceRetryAgentEligible\(/gu) || [])
+      .length >= 3,
+    'eligibility must be checked before locking, after slot locking, and after row fences',
   );
 });
 
@@ -4661,7 +4789,7 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
   const agentSelection = readSourceSection(
     postgresCrossDeviceRetrySource,
     "cross-device Agent selection",
-    "async function loadIdleCrossDeviceRetryAgent",
+    "async function findIdleCrossDeviceRetryAgents",
     "function promotedRetryFallbackTarget",
   );
   assert.match(
