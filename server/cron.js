@@ -13,11 +13,13 @@ import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-ret
 import {runOpsControlCycle} from './services/ops-control.js';
 import {
   reconcileAutomaticCaptureRetries,
-  reconcilePendingCaptureCommands,
 } from './routes/capture-cloud.js';
 import {
   reconcilePendingOrchestrationRetries,
 } from './routes/capture-orchestrations.js';
+import {
+  reconcilePendingCaptureCommands,
+} from './modules/capture/infrastructure/postgres-command-reconciliation.js';
 import {
   reconcileElasticCaptureLeases,
 } from './modules/capture/infrastructure/postgres-lease-reconciliation.js';
