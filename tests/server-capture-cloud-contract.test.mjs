@@ -2458,7 +2458,7 @@ test("create command failures and successful stops settle orchestration work ite
   );
 });
 
-test("acknowledged create expiry waits for Agent liveness, while pending expiry does not", () => {
+test("acknowledged create expiry is bounded by execution evidence, not Agent liveness", () => {
   const now = Date.parse("2026-08-27T06:00:00.000Z");
   const graceMs = 10 * 60 * 1000;
   const freshLivenessAt = "2026-08-27T05:59:55.000Z";
@@ -2475,7 +2475,16 @@ test("acknowledged create expiry waits for Agent liveness, while pending expiry 
     commandType: "create",
     lastLivenessAt: freshLivenessAt,
     lastFullHeartbeatAt: staleFullHeartbeatAt,
-  }, now, graceMs), false, "fresh liveness holds an acknowledged create even when the full snapshot is stale");
+    taskStatus: "pending",
+  }, now, graceMs), true, "an online Agent cannot hold an expired create without execution evidence");
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "acknowledged",
+    commandType: "create",
+    lastLivenessAt: freshLivenessAt,
+    taskStatus: "running",
+    taskHeartbeatAt: freshLivenessAt,
+    executionAttemptObserved: true,
+  }, now, graceMs), false, "an authoritative task snapshot protects a real local execution");
   assert.equal(captureCreateCommandExpiryEligible({
     status: "acknowledged",
     commandType: "create",
@@ -2614,7 +2623,7 @@ test("never-open classification covers unavailable Agents and pre-dispatch stops
   assert.equal(captureExecutionNeverOpened({}), true);
 });
 
-test("stale command reconciliation rechecks acknowledged create liveness before retry projection", () => {
+test("stale command reconciliation rechecks execution evidence before retry projection", () => {
   const expiry = readRouteSection(
     "async function expireStaleCommands",
     "async function resolveResumeCommandFromSuccessor",
@@ -2630,11 +2639,11 @@ test("stale command reconciliation rechecks acknowledged create liveness before 
   assert.ok(retryProjection > atomicRecheck, "retry projection must only see commands that passed both checks");
   assert.match(
     expiry,
-    /c\.status = 'pending'[\s\S]*c\.command_type <> 'create'[\s\S]*ca\.last_liveness_at[\s\S]*ca\.last_full_heartbeat_at[\s\S]*make_interval\(mins => \$4::integer\)/u,
+    /c\.status = 'pending'[\s\S]*c\.command_type <> 'create'[\s\S]*task\.status IN \('pending', 'claimed'\)[\s\S]*task\.heartbeat_at IS NULL[\s\S]*capture_task_attempts[\s\S]*ca\.last_liveness_at/u,
   );
   assert.match(
     expiry,
-    /status = 'pending'[\s\S]*command_type <> 'create'[\s\S]*NOT EXISTS \([\s\S]*ca\.last_liveness_at[\s\S]*>= now\(\) - make_interval\(mins => \$5::integer\)/u,
+    /status = 'pending'[\s\S]*command_type <> 'create'[\s\S]*EXISTS \([\s\S]*capture_tasks task[\s\S]*task\.heartbeat_at IS NULL[\s\S]*capture_task_attempts task_attempt[\s\S]*OR NOT EXISTS \([\s\S]*ca\.last_liveness_at/u,
   );
   assert.match(
     expiry,

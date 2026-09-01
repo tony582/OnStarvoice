@@ -1671,6 +1671,10 @@ export function captureCreateCommandExpiryEligible({
   lastLivenessAt = '',
   lastFullHeartbeatAt = '',
   lastHeartbeatAt = '',
+  taskStatus = '',
+  taskHeartbeatAt = '',
+  taskStartedAt = '',
+  executionAttemptObserved = false,
 } = {}, now = Date.now(), livenessGraceMs =
   ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN * 60 * 1000) {
   const normalizedStatus = text(status, 40).toLowerCase();
@@ -1682,7 +1686,17 @@ export function captureCreateCommandExpiryEligible({
     last_full_heartbeat_at: lastFullHeartbeatAt,
     last_heartbeat_at: lastHeartbeatAt,
   });
-  return !captureAgentOnline(effectiveLivenessAt, now, livenessGraceMs);
+  if (!captureAgentOnline(effectiveLivenessAt, now, livenessGraceMs)) {
+    return true;
+  }
+  // Heartbeat delivery acknowledges a command before the Extension has
+  // actually created the local task. Online liveness alone cannot prove that
+  // the create started. Once expires_at passes, requeue an acknowledged create
+  // that still has no task heartbeat, start time, or attempt snapshot; exact
+  // attempt fencing and idempotent record persistence absorb a late client.
+  return ['pending', 'claimed'].includes(
+    text(taskStatus, 40).toLowerCase(),
+  ) && !taskHeartbeatAt && !taskStartedAt && executionAttemptObserved !== true;
 }
 
 export function captureCreateCommandExpiredBeforeOpen({
@@ -1777,8 +1791,20 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         ca.last_liveness_at,
         ca.last_full_heartbeat_at,
         ca.last_heartbeat_at
-      ) AS agent_liveness_at
+      ) AS agent_liveness_at,
+      task.status AS task_status,
+      task.heartbeat_at AS task_heartbeat_at,
+      task.started_at AS task_started_at,
+      EXISTS (
+        SELECT 1
+        FROM capture_task_attempts task_attempt
+        WHERE task_attempt.tenant_id = c.tenant_id
+          AND task_attempt.task_id = c.task_id
+          AND task_attempt.client_attempt_id <> ''
+      ) AS execution_attempt_observed
     FROM capture_agent_commands c
+    JOIN capture_tasks task
+      ON task.id = c.task_id AND task.tenant_id = c.tenant_id
     LEFT JOIN capture_agents ca
       ON ca.id = c.agent_id AND ca.tenant_id = c.tenant_id
     WHERE c.tenant_id = $1
@@ -1789,6 +1815,18 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
       AND (
         c.status = 'pending'
         OR c.command_type <> 'create'
+        OR (
+          task.status IN ('pending', 'claimed')
+          AND task.heartbeat_at IS NULL
+          AND task.started_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM capture_task_attempts task_attempt
+            WHERE task_attempt.tenant_id = c.tenant_id
+              AND task_attempt.task_id = c.task_id
+              AND task_attempt.client_attempt_id <> ''
+          )
+        )
         OR COALESCE(
           ca.last_liveness_at,
           ca.last_full_heartbeat_at,
@@ -1809,6 +1847,10 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
       status: command.status,
       commandType: command.command_type,
       lastLivenessAt: command.agent_liveness_at,
+      taskStatus: command.task_status,
+      taskHeartbeatAt: command.task_heartbeat_at,
+      taskStartedAt: command.task_started_at,
+      executionAttemptObserved: command.execution_attempt_observed,
     }))
     .map(command => command.id);
   const expiryCandidateStatusById = new Map(
@@ -1831,6 +1873,22 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
       AND (
         status = 'pending'
         OR command_type <> 'create'
+        OR EXISTS (
+          SELECT 1
+          FROM capture_tasks task
+          WHERE task.id = capture_agent_commands.task_id
+            AND task.tenant_id = capture_agent_commands.tenant_id
+            AND task.status IN ('pending', 'claimed')
+            AND task.heartbeat_at IS NULL
+            AND task.started_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1
+              FROM capture_task_attempts task_attempt
+              WHERE task_attempt.tenant_id = capture_agent_commands.tenant_id
+                AND task_attempt.task_id = capture_agent_commands.task_id
+                AND task_attempt.client_attempt_id <> ''
+            )
+        )
         OR NOT EXISTS (
           SELECT 1
           FROM capture_agents ca
