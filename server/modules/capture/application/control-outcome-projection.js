@@ -1,4 +1,18 @@
-import {aggregateParentTaskItems} from '../../../services/capture-orchestration.js';
+import {
+  aggregateParentTaskItems,
+  checkpointEntryToItemStatus,
+} from '../../../services/capture-orchestration.js';
+
+export const CAPTURE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+const EXPLICIT_USER_CANCELLATION_CODES = new Set([
+  'USER_CANCELED',
+  'USER_CANCELLED',
+  'USER_CANCEL_REQUESTED',
+]);
+
+const POSTGRES_INTEGER_MAX = 2147483647;
 
 import {CAPTURE_PLATFORM_SAFETY_CODES} from '../../../services/capture-health-schema.js';
 
@@ -60,7 +74,6 @@ export function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
   return normalized.length > limit ? normalized.slice(0, limit) : normalized;
 }
-
 export function orchestrationCheckpointTimestamp(value) {
   const normalized = text(value, 100);
   if (!normalized) return null;
@@ -71,6 +84,257 @@ export function orchestrationCheckpointTimestamp(value) {
 export function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
+
+export function isExplicitUserCancellationCode(value) {
+  return EXPLICIT_USER_CANCELLATION_CODES.has(
+    text(value, 100).toUpperCase(),
+  );
+}
+
+export function orchestrationCheckpointInteger(value) {
+  const parsed = Math.floor(Number(value));
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.min(POSTGRES_INTEGER_MAX, Math.max(0, parsed));
+}
+
+export function isExplicitUserCancellationSnapshot(task = {}, snapshot = {}) {
+  const taskMetadata = safeJson(task.metadata);
+  const snapshotMetadata = safeJson(snapshot.metadata);
+  const snapshotError = safeJson(snapshot.error);
+  const code = text(
+    snapshotError.code || snapshot.errorCode || snapshot.error_code,
+    100,
+  ).toUpperCase();
+  const category = text(
+    snapshotError.category || snapshot.errorCategory || snapshot.error_category,
+    100,
+  ).toLowerCase();
+  const cancelSource = text(
+    snapshotMetadata.cancelSource ||
+      snapshotMetadata.cancel_source ||
+      snapshotError.cancelSource ||
+      snapshotError.cancel_source,
+    80,
+  ).toLowerCase();
+  return Boolean(
+    taskMetadata.stopCommandId ||
+      isExplicitUserCancellationCode(code) ||
+      category === 'user_canceled' ||
+      cancelSource === 'user'
+  );
+}
+
+export function orchestrationCheckpointEntries(snapshot) {
+  const checkpoint = safeJson(snapshot?.checkpoint);
+  const progress = safeJson(snapshot?.progress);
+  const entries = Array.isArray(checkpoint.keywordResults)
+    ? checkpoint.keywordResults
+      .map(entry => safeJson(entry))
+      .filter(entry => text(entry.keyword, 120))
+    : [];
+  const groupedByKeyword = new Map();
+  for (const rawEntry of entries) {
+    const keyword = text(rawEntry.keyword, 120);
+    const entry = {...rawEntry};
+    delete entry.searchPassResults;
+    const group = groupedByKeyword.get(keyword) || {
+      representative: null,
+      searchPassResults: [],
+    };
+    group.searchPassResults.push(entry);
+    const currentRound = Math.max(1, Number(entry.round) || 1);
+    const representativeRound = Math.max(
+      1,
+      Number(group.representative?.round) || 1,
+    );
+    if (!group.representative || currentRound >= representativeRound) {
+      group.representative = entry;
+    }
+    groupedByKeyword.set(keyword, group);
+  }
+  const byKeyword = new Map(
+    Array.from(groupedByKeyword.entries(), ([keyword, group]) => {
+      const searchPassResults = group.searchPassResults
+        .sort((left, right) =>
+          Math.max(1, Number(left.round) || 1) -
+          Math.max(1, Number(right.round) || 1),
+        );
+      return [
+        keyword,
+        {
+          ...group.representative,
+          searchPassResults,
+        },
+      ];
+    }),
+  );
+  const activeKeyword = text(
+    progress.keyword ||
+      progress.currentKeyword ||
+      checkpoint.currentKeyword ||
+      checkpoint.activeKeyword,
+    120,
+  );
+  const existingEntry = byKeyword.get(activeKeyword);
+  const existingStatus = existingEntry
+    ? checkpointEntryToItemStatus(existingEntry)
+    : '';
+  const activeRound = Math.max(
+    1,
+    Number(progress.round) || 0,
+    Number(progress.roundCurrent) || 0,
+    Number(checkpoint.round) || 0,
+  );
+  const existingRound = Math.max(1, Number(existingEntry?.round) || 1);
+  const taskIsActivelyExecuting = ['claimed', 'running', 'recovering'].includes(
+    text(snapshot?.status, 80),
+  );
+  // settleUnattendedKeywordCheckpoint intentionally retains activeKeyword and
+  // activePhase after a keyword finishes, including in the final completed
+  // snapshot. Only a genuinely active child task may project a running item,
+  // and it must never overwrite an already terminal keyword result.
+  if (
+    activeKeyword &&
+    taskIsActivelyExecuting &&
+    (
+      !ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(existingStatus) ||
+      existingRound < activeRound
+    )
+  ) {
+    byKeyword.set(activeKeyword, {
+      ...safeJson(existingEntry),
+      keyword: activeKeyword,
+      status: 'running',
+      round: activeRound,
+      index: Math.max(
+        0,
+        Number(checkpoint.activeKeywordIndex ?? checkpoint.keywordIndex) || 0,
+      ),
+    });
+  }
+  return Array.from(byKeyword.values());
+}
+
+function sequentialSearchResumeEntry(entry = {}, keyword = '') {
+  const source = safeJson(entry);
+  return {
+    round: Math.max(1, Number(source.round) || 1),
+    index: 0,
+    keyword: text(keyword || source.keyword, 120),
+    status: 'completed',
+    attemptCount: Math.max(0, Number(source.attemptCount) || 0),
+    savedCount: Math.max(0, Number(source.savedCount) || 0),
+    ...(source.noResults === true || source.no_results === true
+      ? {noResults: true}
+      : {}),
+    ...(text(source.resultKind || source.result_kind, 80)
+      ? {resultKind: text(source.resultKind || source.result_kind, 80)}
+      : {}),
+    ...(source.candidateCount !== undefined || source.candidate_count !== undefined
+      ? {
+          candidateCount: orchestrationCheckpointInteger(
+            source.candidateCount ?? source.candidate_count,
+          ),
+        }
+      : {}),
+    ...(source.scanComplete === true || source.scan_complete === true
+      ? {scanComplete: true}
+      : {}),
+    error: '',
+    finishedAt: orchestrationCheckpointTimestamp(source.finishedAt),
+  };
+}
+
+export function buildSequentialSearchResumeCheckpoint({
+  planSnapshot = {},
+  itemMetadata = {},
+  keyword = '',
+  now = new Date(),
+} = {}) {
+  const plan = safeJson(planSnapshot);
+  const normalizedKeyword = text(keyword, 120);
+  const searchPasses = Array.isArray(plan.searchPasses)
+    ? plan.searchPasses.map(pass => text(pass, 80)).filter(Boolean)
+    : [];
+  if (
+    text(plan.platform, 80).toLowerCase() !== 'douyin' ||
+    searchPasses.length < 2 ||
+    !normalizedKeyword
+  ) {
+    return null;
+  }
+
+  const checkpoint = safeJson(safeJson(itemMetadata).checkpoint);
+  const passResults = Array.isArray(checkpoint.searchPassResults)
+    ? checkpoint.searchPassResults
+    : [];
+  const latestByRound = new Map();
+  for (const result of passResults) {
+    const source = safeJson(result);
+    if (text(source.keyword, 120) !== normalizedKeyword) continue;
+    const round = Math.max(1, Number(source.round) || 1);
+    if (round > searchPasses.length) continue;
+    latestByRound.set(round, source);
+  }
+
+  const completedPrefix = [];
+  for (let round = 1; round <= searchPasses.length; round += 1) {
+    const result = latestByRound.get(round);
+    if (text(result?.status, 80).toLowerCase() !== 'completed') break;
+    completedPrefix.push(sequentialSearchResumeEntry(result, normalizedKeyword));
+  }
+  if (
+    completedPrefix.length === 0 ||
+    completedPrefix.length >= searchPasses.length
+  ) {
+    return null;
+  }
+
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const updatedAt = Number.isFinite(nowDate.getTime())
+    ? nowDate.toISOString()
+    : new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    round: completedPrefix.length + 1,
+    activeKeywordIndex: 0,
+    activeKeyword: '',
+    activePhase: 'pending',
+    keywordResults: completedPrefix,
+    updatedAt,
+  };
+}
+
+export function expectedElasticKeywordSearches({
+  planSnapshot = {},
+  itemMetadata = {},
+  keyword = '',
+} = {}) {
+  const plan = safeJson(planSnapshot);
+  const passes = Array.isArray(plan.searchPasses)
+    ? plan.searchPasses.map(pass => text(pass, 80)).filter(Boolean)
+    : [];
+  const configuredSearches = Math.max(1, passes.length);
+  if (configuredSearches === 1) return 1;
+  const resumeCheckpoint = buildSequentialSearchResumeCheckpoint({
+    planSnapshot: plan,
+    itemMetadata,
+    keyword,
+  });
+  const completedPrefix = resumeCheckpoint
+    ? Math.max(0, Number(resumeCheckpoint.round) - 1)
+    : 0;
+  return Math.max(1, configuredSearches - completedPrefix);
+}
+
+export function orchestrationItemAttemptStatus(itemStatus) {
+  // Item attempts start at dispatch, so a checkpoint entry with no meaningful
+  // status must not move the append-only audit back to a pre-dispatch state.
+  return itemStatus === 'pending' || itemStatus === 'assigned'
+    ? 'dispatched'
+    : itemStatus;
+}
+
 
 export function promotedRetryBusinessTaskType(task = {}) {
   const metadata = safeJson(task.metadata);

@@ -122,6 +122,20 @@ const postgresLocalClosureProofSource = await readFile(
   ),
   "utf8",
 );
+const postgresCrossDeviceRetrySource = await readFile(
+  new URL(
+    "../server/modules/capture/infrastructure/postgres-cross-device-retry.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const postgresResourceAdmissionSource = await readFile(
+  new URL(
+    "../server/modules/capture/infrastructure/postgres-resource-admission.js",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const automaticRecoverySource = await readFile(
   new URL(
     "../server/modules/capture/application/automatic-recovery.js",
@@ -164,7 +178,6 @@ test("capture agents distinguish browser profiles while retaining their environm
     {browserName: "Chrome", operatingSystem: "macOS"},
   );
 });
-
 test("local closure reuse fencing only applies to marked keyword executions", () => {
   assert.equal(
     captureItemRequiresLocalClosureReuseFence({
@@ -441,7 +454,9 @@ test('search-challenge handoff is counted independently without blocking the ela
     'a marked source must remain fenced until exact local closure is proven',
   );
 
-  const dutyDispatch = readRouteSection(
+  const dutyDispatch = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    'PostgreSQL cross-device retry',
     'export async function dispatchCrossDeviceRetry',
     'async function listAutomaticCaptureRetryCandidates',
   );
@@ -2061,7 +2076,9 @@ test("server-owned local closure metadata survives snapshots without Agent injec
 });
 
 test("historical closure reuse ignores mutable item start after Agent A to B reassignment", () => {
-  const reuseGate = readRouteSection(
+  const reuseGate = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "PostgreSQL cross-device retry",
     "async function loadCaptureAgentLocalClosureReuseGate",
     "export async function dispatchCrossDeviceRetry",
   );
@@ -2089,7 +2106,9 @@ test("historical closure reuse ignores mutable item start after Agent A to B rea
 });
 
 test("current-schema keyword reuse requires exact closure proof while legacy keeps bounded quiescence", () => {
-  const reuseGate = readRouteSection(
+  const reuseGate = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "PostgreSQL cross-device retry",
     "async function loadCaptureAgentLocalClosureReuseGate",
     "export async function dispatchCrossDeviceRetry",
   );
@@ -2824,7 +2843,9 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
     claim,
     /const localClosureReuseGate = await loadCaptureAgentLocalClosureReuseGate\([\s\S]*tenantId: agent\.tenant_id,[\s\S]*agentId: agent\.id[\s\S]*if \(!localClosureReuseGate\.ready\)/u,
   );
-  const reuseGate = readRouteSection(
+  const reuseGate = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "PostgreSQL cross-device retry",
     "async function loadCaptureAgentLocalClosureReuseGate",
     "export async function dispatchCrossDeviceRetry",
   );
@@ -2865,7 +2886,7 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
     "only legacy terminal history may use the bounded compatibility grace",
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 \* 1000/u,
   );
   assert.match(claim, /requiresSingleRelay/u);
@@ -2976,7 +2997,7 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
 test("elastic recovery releases the item immediately and scopes verification to the item-account pair", () => {
   const recovery = readRouteSection(
     "function buildElasticRecoveryMetadata({",
-    "export function crossDeviceRetryAgentSupportsTask(",
+    "function sendCrossDeviceRetryError(",
   );
 
   assert.match(recovery, /state: 'released_for_handoff'/u);
@@ -3180,7 +3201,7 @@ test("elastic queue requires exact closure before reclaiming stale current-schem
     /from '\.\/modules\/capture\/infrastructure\/postgres-lease-reconciliation\.js';/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /COALESCE\(metadata->>'distributionMode', ''\) <> 'elastic_pool'/u,
   );
 });
@@ -4040,7 +4061,7 @@ test("remote request identity changes when only the keyword post limit changes",
     controlOutcomeProjectionSource,
     "control outcome projection",
     "export function safeJson(value)",
-    "export function promotedRetryBusinessTaskType(",
+    "export function isExplicitUserCancellationCode(",
   ).replace("export function safeJson", "function safeJson");
   const hashSource = readRouteSection(
     "function remoteTaskRequestHash(",
@@ -4251,25 +4272,23 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(retry, /requireSessionUser/u);
   assert.match(retry, /requireTenantWriter/u);
   assert.match(retry, /dispatchCrossDeviceRetry/u);
-  const dispatchCore = captureCloudRouteSource.slice(
-    captureCloudRouteSource.indexOf("async function dispatchCrossDeviceRetry"),
-    captureCloudRouteSource.indexOf(
-      "async function listAutomaticCaptureRetryCandidates",
-    ),
+  const dispatchCore = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "PostgreSQL cross-device dispatch",
+    "export async function dispatchCrossDeviceRetry",
+    "async function listAutomaticCaptureRetryCandidates",
   );
-  const idleAgentSelection = captureCloudRouteSource.slice(
-    captureCloudRouteSource.indexOf(
-      "async function loadIdleCrossDeviceRetryAgent",
-    ),
-    captureCloudRouteSource.indexOf("function promotedRetryFallbackTarget"),
+  const idleAgentSelection = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "cross-device Agent selection",
+    "async function loadIdleCrossDeviceRetryAgent",
+    "function promotedRetryFallbackTarget",
   );
-  const profileRetryRenewal = captureCloudRouteSource.slice(
-    captureCloudRouteSource.indexOf(
-      "async function renewProfileRetryExecutions",
-    ),
-    captureCloudRouteSource.indexOf(
-      "export async function dispatchCrossDeviceRetry",
-    ),
+  const profileRetryRenewal = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "profile retry renewal",
+    "async function renewProfileRetryExecutions",
+    "export async function dispatchCrossDeviceRetry",
   );
   assert.match(dispatchCore, /loadIdleCrossDeviceRetryAgent/u);
   assert.match(idleAgentSelection, /for \(const candidate of eligibleCandidates\)/u);
@@ -4282,12 +4301,12 @@ test("settled single-node tasks can retry on another idle Agent without forking 
     idleAgentSelection,
     /ROLLBACK TO SAVEPOINT \$\{savepoint\}/u,
   );
-  assert.match(captureCloudRouteSource, /AS active_command_count/u);
+  assert.match(postgresCrossDeviceRetrySource, /AS active_command_count/u);
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /Number\(agent\.active_command_count \|\| 0\) === 0/u,
   );
-  assert.match(captureCloudRouteSource, /findCaptureAgentExecutionSlotBlocker/u);
+  assert.match(postgresCrossDeviceRetrySource, /findCaptureAgentExecutionSlotBlocker/u);
   assert.match(dispatchCore, /promoteSingleNodeTaskForRetry/u);
   assert.match(dispatchCore, /task_type = 'capture_orchestration'/u);
   assert.match(dispatchCore, /parent_task_id/u);
@@ -4319,11 +4338,11 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(dispatchCore, /abortCrossDeviceRetry\(promoted\.error\)/u);
   assert.match(dispatchCore, /abortCrossDeviceRetry\(renewedExecutions\.error\)/u);
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /cross_device_retry_transaction_abort/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /promotedRetryParent' IS DISTINCT FROM 'true'/u,
   );
 });
@@ -4474,11 +4493,11 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
     daily_search_limit: 0,
   }), true);
 
-  const idleAgentSelection = captureCloudRouteSource.slice(
-    captureCloudRouteSource.indexOf(
-      "async function loadIdleCrossDeviceRetryAgent",
-    ),
-    captureCloudRouteSource.indexOf("function promotedRetryFallbackTarget"),
+  const idleAgentSelection = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "cross-device Agent selection",
+    "async function loadIdleCrossDeviceRetryAgent",
+    "function promotedRetryFallbackTarget",
   );
   assert.match(
     idleAgentSelection,
@@ -4536,9 +4555,10 @@ test("cross-device retry uses known current-day Agent search usage and enforces 
 });
 
 test("resource admission serializes plan and shared-host capacity before dispatch", () => {
-  const admission = readRouteSection(
-    "async function reserveCaptureResourceAdmission",
-    "function dutyRecoveryGlobalActionsEnabled",
+  const admission = readSourceSection(
+    postgresResourceAdmissionSource,
+    "PostgreSQL resource admission",
+    "export async function reserveCaptureResourceAdmission",
   );
   assert.match(admission, /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
   assert.match(admission, /plan:\$\{parentTaskId\}/u);
@@ -4562,13 +4582,11 @@ test("resource admission serializes plan and shared-host capacity before dispatc
 });
 
 test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", () => {
-  const dispatchCore = captureCloudRouteSource.slice(
-    captureCloudRouteSource.indexOf(
-      "export async function dispatchCrossDeviceRetry",
-    ),
-    captureCloudRouteSource.indexOf(
-      "export async function reconcileElasticCaptureLeases",
-    ),
+  const dispatchCore = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "PostgreSQL cross-device dispatch",
+    "export async function dispatchCrossDeviceRetry",
+    "async function listAutomaticCaptureRetryCandidates",
   );
   assert.match(dispatchCore, /recoveryPhase = 'fast'/u);
   assert.match(
@@ -4601,7 +4619,7 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
   );
   assert.match(dispatchCore, /expectedSearches: expectedRetrySearches/u);
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /crossDeviceRetrySourceReady\([\s\S]*dutyRecovery = false[\s\S]*if \(dutyRecovery\) return true/u,
   );
   assert.match(dispatchCore, /requestedItemIds\.length !== 1/u);
@@ -4640,7 +4658,9 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
   assert.match(dispatchCore, /dutyRecoverySourceAttemptId/u);
   assert.match(dispatchCore, /recoveryPhase: 'duty'/u);
 
-  const agentSelection = readRouteSection(
+  const agentSelection = readSourceSection(
+    postgresCrossDeviceRetrySource,
+    "cross-device Agent selection",
     "async function loadIdleCrossDeviceRetryAgent",
     "function promotedRetryFallbackTarget",
   );
@@ -4679,39 +4699,39 @@ test("recovery verification and replay clocks require exact business evidence", 
 
 test("legacy retry remains only as a fallback outside guarded duty Agent tenants", () => {
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /createAutomaticCaptureRetryReconciler\(\{[\s\S]*listCandidates: listAutomaticCaptureRetryCandidates,[\s\S]*dispatchRetry: dispatchCrossDeviceRetry/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /createRequestKey: \(\) => crypto\.randomUUID\(\)[\s\S]*formatErrorMessage: message => text\(message, 240\)/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /export async function reconcileAutomaticCaptureRetries\(input = 10\)[\s\S]*invalid_tenant_id[\s\S]*invalid_task_scope[\s\S]*return reconcileAutomaticCaptureRetriesImpl\(\{[\s\S]*tenantId,[\s\S]*taskIds,[\s\S]*maxDispatchesPerTask,[\s\S]*requestedByName/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /status = ANY\(\$1::text\[\]\)[\s\S]*allowIdleAgentHandoff/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /classifyCaptureRecoveryDisposition\(item\)\.automatic/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /sort\(\(left, right\) => Number\(left\.ordinal\) - Number\(right\.ordinal\)\)[\s\S]*\.slice\(0, 1\)/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES[\s\S]*lastAutomaticRecoveryTaskId/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /item_id = ANY\(\$2::uuid\[\]\)[\s\S]*crossDeviceRetrySourceAgentIdsForItems/u,
   );
   assert.match(
-    captureCloudRouteSource,
+    postgresCrossDeviceRetrySource,
     /\$7::boolean = false[\s\S]*recovery_enabled\.key = 'ops_control_recovery_enabled'[\s\S]*LOWER\(BTRIM\(recovery_mode\.value\)\) = 'guarded'/u,
   );
   assert.match(
