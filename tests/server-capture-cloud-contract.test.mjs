@@ -327,7 +327,8 @@ test('search-challenge handoff is counted independently without blocking the ela
   assert.match(projection, /safetyHandoffCount = 0/u);
   assert.match(projection, /sourceLocalClosureProven = false/u);
   assert.match(projection, /agentAttemptLimit/u);
-  assert.match(projection, /normalizedAttemptCount >= normalizedAttemptLimit/u);
+  assert.match(projection, /normalizedAttemptCount >= automaticAttemptLimit/u);
+  assert.match(projection, /ELASTIC_TECHNICAL_RETRY_ROUNDS/u);
   assert.match(projection, /A challenge belongs to the source account\/session/u);
   assert.doesNotMatch(projection, /ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS/u);
 
@@ -568,13 +569,19 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "failed",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     attemptCount: 2,
-  }), "failed");
+  }), "retryable");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     attemptCount: 3,
-  }), "failed");
+  }), "retryable");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "failed",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    attemptCount: 4,
+  }), "failed", "two complete technical passes are the hard bound");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
@@ -696,12 +703,18 @@ test("elastic queue does not spend business retries on local capacity or dispatc
     status: 'failed',
     error: {code: 'BUSINESS_CAPTURE_FAILED'},
     attemptCount: 2,
-  }), 'failed');
+  }), 'retryable');
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: 'failed',
     error: {code: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED'},
     attemptCount: 2,
+  }), 'retryable');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'failed',
+    error: {code: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED'},
+    attemptCount: 4,
   }), 'failed');
   const thirdBootstrapProjection = projectElasticAttemptBudget({
     attempt_count: 3,
@@ -2675,7 +2688,14 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /const attemptBudget[\s\S]*candidate\.attempt_budget_used/u);
   assert.match(claim, /attempt_count = \$1[\s\S]*attemptNumber,[\s\S]*attemptBudget/u);
   assert.match(claim, /elasticAttemptBudgetUsed/u);
-  assert.match(claim, /item\.attempt_count < agent_policy\.agent_attempt_limit/u);
+  assert.match(
+    claim,
+    /item\.attempt_count <[\s\S]*agent_policy\.agent_attempt_limit \* \$10::integer/u,
+  );
+  assert.match(claim, /ELASTIC_TECHNICAL_RETRY_ROUNDS/u);
+  assert.match(claim, /FROM capture_task_item_attempts safety_attempt/u);
+  assert.match(claim, /MOD\(item\.attempt_count, agent_policy\.agent_attempt_limit\)/u);
+  assert.match(claim, /item\.assigned_agent_id IS DISTINCT FROM \$2::uuid/u);
   assert.match(claim, /COUNT\(DISTINCT configured_agent_id\)/u);
   assert.match(claim, /CROSS JOIN LATERAL/u);
   assert.match(claim, /freshCapabilities\.singleRelayV1 === true/u);
@@ -2716,16 +2736,18 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
     /parent\.metadata @> jsonb_build_object\([\s\S]*'eligibleAgentIds'[\s\S]*OR \([\s\S]*item\.status = 'retryable'[\s\S]*'relayAgentIds'/u,
     'standby Agents may claim only a retryable item; fresh work stays in the plan pool',
   );
-  assert.match(claim, /capture_task_item_attempts same_agent_attempt/u);
-  assert.match(claim, /same_agent_attempt\.agent_id = \$2::uuid/u);
-  const sameAgentFence = claim.match(
-    /AND NOT EXISTS \(\s*SELECT 1\s*FROM capture_task_item_attempts same_agent_attempt[\s\S]*?same_agent_attempt\.agent_id = \$2::uuid\s*\)/u,
-  )?.[0] || '';
-  assert.ok(sameAgentFence, 'the same-Agent attempt fence must be present');
-  assert.doesNotMatch(
-    sameAgentFence,
-    /updated_at/u,
-    'an Agent that already tried an item must never reclaim it after a cooldown',
+  assert.match(claim, /capture_task_item_attempts safety_attempt/u);
+  assert.match(claim, /safety_attempt\.agent_id = \$2::uuid/u);
+  assert.match(claim, /capture_task_item_attempts recent_attempt/u);
+  assert.match(
+    claim,
+    /MOD\(item\.attempt_count, agent_policy\.agent_attempt_limit\)/u,
+    'technical attempts reset only after the whole pool pass is exhausted',
+  );
+  assert.match(
+    claim,
+    /safety_attempt\.error[\s\S]*requiresManualAction[\s\S]*securityEvidence/u,
+    'a safety-fenced item/account pair must never be recycled',
   );
   assert.match(claim, /reserveCaptureResourceAdmission\(tx,/u);
   assert.ok(

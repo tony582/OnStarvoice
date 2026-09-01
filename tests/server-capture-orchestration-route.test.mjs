@@ -441,6 +441,11 @@ test('failed keyword retry atomically shards each item to a distinct idle Agent 
   assert.doesNotMatch(retry, /retry_no_idle_agents/u);
   assert.match(retry, /status = 'retryable'/u);
   assert.match(retry, /retryWaitingItems/u);
+  assert.match(
+    retry,
+    /if \(elasticQueueOwnsRetry\(parent\)\)[\s\S]*elasticRetryWaitingSince[\s\S]*continue/u,
+    'elastic retries must remain on the real heartbeat queue instead of a fake manual waiting marker',
+  );
   assert.match(retry, /dispatched: result\.executions/u);
   assert.match(retry, /waiting: result\.waiting/u);
   assert.match(retry, /single|单项租约/u);
@@ -588,6 +593,37 @@ test('retry allocation never sends a keyword back to an Agent that already tried
     allocation.dispatched[0].preferenceFallbackReason,
     'preferred_agent_already_attempted',
   );
+});
+
+test('technical retry opens a real next pool pass while safety-fenced accounts stay excluded', async () => {
+  const {allocateRetryItemsForRetry} = await import(
+    new URL('../server/routes/capture-orchestrations.js', import.meta.url)
+  );
+  const allocation = allocateRetryItemsForRetry({
+    items: [{
+      id: 'item-1',
+      keyword: 'keyword-1',
+      assigned_agent_id: 'agent-3',
+    }],
+    agents: [
+      {id: 'agent-1'},
+      {id: 'agent-2'},
+      {id: 'agent-3'},
+    ],
+    attemptedAgentIdsByItem: new Map([
+      ['item-1', new Set(['agent-1', 'agent-2', 'agent-3'])],
+    ]),
+    reusableAttemptedItemIds: new Set(['item-1']),
+    safetyFencedAgentIdsByItem: new Map([
+      ['item-1', new Set(['agent-1'])],
+    ]),
+  });
+  assert.deepEqual(
+    allocation.dispatched.map(entry => [entry.item.id, entry.agentId]),
+    [['item-1', 'agent-2']],
+    'the next pass avoids both the safety-fenced account and the latest source',
+  );
+  assert.deepEqual(allocation.waiting, []);
 });
 
 test('retry candidate SQL fails closed on unknown Shanghai usage and hard limits', () => {

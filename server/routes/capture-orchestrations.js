@@ -1331,6 +1331,8 @@ export function allocateRetryItemsForRetry({
   agents = [],
   overrides = [],
   attemptedAgentIdsByItem = new Map(),
+  reusableAttemptedItemIds = new Set(),
+  safetyFencedAgentIdsByItem = new Map(),
 }) {
   const overrideByItemId = new Map(
     overrides.map(assignment => [
@@ -1348,10 +1350,17 @@ export function allocateRetryItemsForRetry({
     const attemptedAgentIds = attemptedAgentIdsByItem instanceof Map
       ? attemptedAgentIdsByItem.get(itemId) || new Set()
       : new Set(attemptedAgentIdsByItem?.[itemId] || []);
+    const safetyFencedAgentIds = safetyFencedAgentIdsByItem instanceof Map
+      ? safetyFencedAgentIdsByItem.get(itemId) || new Set()
+      : new Set(safetyFencedAgentIdsByItem?.[itemId] || []);
+    const mayReuseAttempted = reusableAttemptedItemIds instanceof Set
+      ? reusableAttemptedItemIds.has(itemId)
+      : Boolean(reusableAttemptedItemIds?.[itemId]);
     if (
       overrideAgentId &&
       idleById.has(overrideAgentId) &&
-      !attemptedAgentIds.has(overrideAgentId)
+      !safetyFencedAgentIds.has(overrideAgentId) &&
+      (!attemptedAgentIds.has(overrideAgentId) || mayReuseAttempted)
     ) {
       reservedOverrideAgentIds.add(overrideAgentId);
     }
@@ -1364,8 +1373,16 @@ export function allocateRetryItemsForRetry({
     const attemptedAgentIds = attemptedAgentIdsByItem instanceof Map
       ? attemptedAgentIdsByItem.get(itemId) || new Set()
       : new Set(attemptedAgentIdsByItem?.[itemId] || []);
+    const safetyFencedAgentIds = safetyFencedAgentIdsByItem instanceof Map
+      ? safetyFencedAgentIdsByItem.get(itemId) || new Set()
+      : new Set(safetyFencedAgentIdsByItem?.[itemId] || []);
+    const mayReuseAttempted = reusableAttemptedItemIds instanceof Set
+      ? reusableAttemptedItemIds.has(itemId)
+      : Boolean(reusableAttemptedItemIds?.[itemId]);
     const overrideAgentId = overrideByItemId.get(itemId) || '';
-    let agent = overrideAgentId && !attemptedAgentIds.has(overrideAgentId)
+    let agent = overrideAgentId &&
+      !safetyFencedAgentIds.has(overrideAgentId) &&
+      (!attemptedAgentIds.has(overrideAgentId) || mayReuseAttempted)
       ? idleById.get(overrideAgentId)
       : null;
     if (agent && usedAgentIds.has(String(agent.id))) agent = null;
@@ -1374,6 +1391,7 @@ export function allocateRetryItemsForRetry({
         const candidateId = String(candidate.id || '');
         if (
           usedAgentIds.has(candidateId) ||
+          safetyFencedAgentIds.has(candidateId) ||
           attemptedAgentIds.has(candidateId)
         ) return false;
         // An explicit choice is a preference, not a strict wait. Preserve a
@@ -1384,12 +1402,31 @@ export function allocateRetryItemsForRetry({
           candidateId === overrideAgentId;
       }) || null;
     }
+    if (!agent && mayReuseAttempted) {
+      const reusableAgents = agents.filter(candidate => {
+        const candidateId = String(candidate.id || '');
+        return !usedAgentIds.has(candidateId) &&
+          !safetyFencedAgentIds.has(candidateId) &&
+          (
+            !reservedOverrideAgentIds.has(candidateId) ||
+            candidateId === overrideAgentId
+          );
+      });
+      // Do not immediately bounce the item back to its most recent Agent when
+      // another healthy candidate is idle. Once the whole pool has been tried,
+      // this starts a real bounded next pass instead of a fake waiting marker.
+      agent = reusableAgents.find(candidate =>
+        String(candidate.id || '') !== String(item.assigned_agent_id || '')
+      ) || reusableAgents[0] || null;
+    }
     if (!agent) {
       waiting.push({
         itemId,
         keyword: item.keyword,
         status: 'retryable',
-        reason: 'no_idle_untried_agent',
+        reason: mayReuseAttempted
+          ? 'no_idle_compatible_agent'
+          : 'no_idle_untried_agent',
       });
       continue;
     }
@@ -1402,7 +1439,9 @@ export function allocateRetryItemsForRetry({
       ...(overrideAgentId && overrideAgentId !== agentId
         ? {
             preferredAgentId: overrideAgentId,
-            preferenceFallbackReason: attemptedAgentIds.has(overrideAgentId)
+            preferenceFallbackReason: safetyFencedAgentIds.has(overrideAgentId)
+              ? 'preferred_agent_safety_fenced'
+              : attemptedAgentIds.has(overrideAgentId) && !mayReuseAttempted
               ? 'preferred_agent_already_attempted'
               : 'preferred_agent_unavailable',
           }
@@ -5036,19 +5075,32 @@ router.post(
           (left, right) => Number(left.ordinal) - Number(right.ordinal),
         );
         const previousAttempts = await tx.queryAll(`
-          SELECT item_id, agent_id
+          SELECT item_id, agent_id, error, checkpoint, attempt_number
           FROM capture_task_item_attempts
           WHERE tenant_id = $1
             AND item_id = ANY($2::uuid[])
             AND agent_id IS NOT NULL
+          ORDER BY item_id, attempt_number, created_at, id
         `, [req.tenantId, retryItems.map(item => item.id)]);
         const attemptedAgentIdsByItem = new Map();
+        const safetyFencedAgentIdsByItem = new Map();
         for (const attempt of previousAttempts) {
           const itemId = String(attempt.item_id);
           if (!attemptedAgentIdsByItem.has(itemId)) {
             attemptedAgentIdsByItem.set(itemId, new Set());
           }
           attemptedAgentIdsByItem.get(itemId).add(String(attempt.agent_id));
+          if (itemRequiresManualSafetyAction({
+            error: safeJson(attempt.error),
+            metadata: {checkpoint: safeJson(attempt.checkpoint)},
+          })) {
+            if (!safetyFencedAgentIdsByItem.has(itemId)) {
+              safetyFencedAgentIdsByItem.set(itemId, new Set());
+            }
+            safetyFencedAgentIdsByItem.get(itemId).add(
+              String(attempt.agent_id),
+            );
+          }
         }
         const planSnapshot = safeJson(parent.metadata?.planSnapshot);
         const idleAgents = [];
@@ -5072,6 +5124,10 @@ router.post(
           agents: idleAgents,
           overrides: normalized.assignments,
           attemptedAgentIdsByItem,
+          reusableAttemptedItemIds: new Set(
+            retryItems.map(item => String(item.id)),
+          ),
+          safetyFencedAgentIdsByItem,
         });
         const retryAssignments = allocation.dispatched;
         const waiting = allocation.waiting;
@@ -5313,6 +5369,53 @@ router.post(
         );
         for (const waitingItem of waiting) {
           const item = retryItemById.get(waitingItem.itemId);
+          if (elasticQueueOwnsRetry(parent)) {
+            const preserved = await tx.queryOne(`
+              UPDATE capture_task_items
+              SET status = 'retryable',
+                metadata = (
+                  metadata - ARRAY[
+                    'retryPending', 'retryWaitingSince',
+                    'retryWaitingRequestKey', 'retryWaitingRequestHash',
+                    'retryWaitingPlanHash', 'retryWaitingReason',
+                    'retryWaitingAgentId', 'retryWaitingParentRevision',
+                    'retryWaitingItemRevision', 'retryWaitingAttemptCount',
+                    'retryWaitingSourceExecutionTaskId',
+                    'retryWaitingSafetyConfirmed',
+                    'retryWaitingRequestedByUserId',
+                    'retryWaitingRequestedByName', 'retryWaitingBatchSize',
+                    'retryWaitingDispatchOrdinal',
+                    'retryWaitingLastCheckedAt'
+                  ]::text[]
+                ) || jsonb_build_object(
+                  'elasticRetryWaitingSince', now(),
+                  'elasticRetryWaitingReason', $1::text,
+                  'elasticRetryRequestKey', $2::uuid::text
+                ),
+                updated_at = now()
+              WHERE id = $3 AND tenant_id = $4 AND task_id = $5
+                AND execution_task_id IS NOT DISTINCT FROM $6
+                AND assignment_revision = $7
+                AND attempt_count = $8
+                AND status IN ('retryable', 'needs_action', 'failed')
+              RETURNING id, status
+            `, [
+              waitingItem.reason,
+              normalized.requestKey,
+              item.id,
+              req.tenantId,
+              parent.id,
+              item.execution_task_id,
+              Number(item.assignment_revision || 0),
+              Number(item.attempt_count || 0),
+            ]);
+            if (!preserved) {
+              const error = new Error('orchestration_retry_item_conflict');
+              error.code = 'orchestration_retry_item_conflict';
+              throw error;
+            }
+            continue;
+          }
           const preserved = await tx.queryOne(`
             UPDATE capture_task_items
             SET status = 'retryable',
@@ -5393,9 +5496,9 @@ router.post(
             ),
             message = CASE
               WHEN jsonb_array_length($4::jsonb) = 0
-                THEN '失败关键词正在等待空闲 Agent，释放后将自动续接'
+                THEN '失败关键词尚未下发，正在等待兼容的空闲 Agent'
               WHEN jsonb_array_length($8::jsonb) > 0
-                THEN '部分失败关键词已分片下发，其余等待空闲 Agent'
+                THEN '部分失败关键词已分片下发，其余尚未下发并等待空闲 Agent'
               ELSE '失败关键词已按单项租约分片下发重试'
             END,
             finished_at = NULL,

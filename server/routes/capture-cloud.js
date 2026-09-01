@@ -141,6 +141,11 @@ const ELASTIC_AGENT_CAPACITY_HOLD_MS = 0;
 const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
 const ELASTIC_TECHNICAL_HANDOFF_LIMIT = 2;
+// One pass gives every eligible account a chance. A second pass lets a
+// healthy account retry infrastructure/page failures after the whole pool has
+// been exhausted. Safety failures remain permanently fenced per item/account
+// by the attempt predicate in dispatchNextElasticWorkItem.
+const ELASTIC_TECHNICAL_RETRY_ROUNDS = 2;
 const ELASTIC_BOOTSTRAP_STAGGER_BUCKETS = 4;
 const ELASTIC_BOOTSTRAP_STAGGER_GAP_MS = 6 * 1000;
 const ELASTIC_BOOTSTRAP_CONGESTION_WINDOW_MS = 2 * 60 * 1000;
@@ -977,7 +982,10 @@ export function projectElasticKeywordRecoveryStatus({
     error,
     metadata: {checkpoint},
   });
-  if (normalizedAttemptCount >= normalizedAttemptLimit) {
+  const automaticAttemptLimit = safetyBlocked
+    ? normalizedAttemptLimit
+    : normalizedAttemptLimit * ELASTIC_TECHNICAL_RETRY_ROUNDS;
+  if (normalizedAttemptCount >= automaticAttemptLimit) {
     return safetyBlocked || technicalLimitReached ? 'needs_action' : 'failed';
   }
   if (safetyBlocked) {
@@ -995,7 +1003,7 @@ export function projectElasticKeywordRecoveryStatus({
     // attempt fence below bounds this naturally without freezing fresh work.
     return 'retryable';
   }
-  return normalizedAttemptCount < normalizedAttemptLimit
+  return normalizedAttemptCount < automaticAttemptLimit
     ? 'retryable'
     : 'failed';
 }
@@ -1336,7 +1344,8 @@ export function buildElasticRecoveryMetadata({
     state: 'released_for_handoff',
     reason: safetyBlocked ? 'platform_safety_handoff' : 'technical_recovery',
     attemptCurrent,
-    attemptTotal: Math.max(1, Number(agentAttemptLimit) || 1),
+    attemptTotal: Math.max(1, Number(agentAttemptLimit) || 1) *
+      (safetyBlocked ? 1 : ELASTIC_TECHNICAL_RETRY_ROUNDS),
     sourceAgentId: normalizedSourceAgentId,
     queuedAt: new Date(recoveryAnchorMs).toISOString(),
     handoffReadyAt: new Date(recoveryAnchorMs).toISOString(),
@@ -6114,7 +6123,7 @@ export async function mirrorTaskSnapshot(
   return task;
 }
 
-async function dispatchNextElasticWorkItem(tx, {
+export async function dispatchNextElasticWorkItem(tx, {
   agent,
   capabilities = {},
 } = {}) {
@@ -6303,8 +6312,9 @@ async function dispatchNextElasticWorkItem(tx, {
           ELSE NULL
         END,
         item.attempt_count
-      ) < agent_policy.agent_attempt_limit
-      AND item.attempt_count < agent_policy.agent_attempt_limit
+      ) < agent_policy.agent_attempt_limit * $10::integer
+      AND item.attempt_count <
+        agent_policy.agent_attempt_limit * $10::integer
       AND (cardinality($4::text[]) = 0 OR item.platform = ANY($4::text[]))
       AND (cardinality($5::text[]) = 0 OR item.platform = ANY($5::text[]))
       AND (
@@ -6328,12 +6338,81 @@ async function dispatchNextElasticWorkItem(tx, {
           AND active_command.task_id = item.execution_task_id
           AND active_command.status IN ('pending', 'acknowledged')
       )
+      -- A CAPTCHA/login/safety result fences this exact item/account pair for
+      -- the lifetime of the parent task. Technical failures only fence the
+      -- account for the current pool pass; once every eligible Agent has been
+      -- tried, the next bounded pass may reuse a healthy account.
       AND NOT EXISTS (
         SELECT 1
-        FROM capture_task_item_attempts same_agent_attempt
-        WHERE same_agent_attempt.tenant_id = item.tenant_id
-          AND same_agent_attempt.item_id = item.id
-          AND same_agent_attempt.agent_id = $2::uuid
+        FROM capture_task_item_attempts safety_attempt
+        WHERE safety_attempt.tenant_id = item.tenant_id
+          AND safety_attempt.item_id = item.id
+          AND safety_attempt.agent_id = $2::uuid
+          AND (
+            UPPER(COALESCE(
+              safety_attempt.error->>'code',
+              safety_attempt.checkpoint->>'errorCode',
+              safety_attempt.checkpoint->>'error_code',
+              ''
+            )) = ANY($11::text[])
+            OR LOWER(COALESCE(
+              safety_attempt.error->>'category',
+              safety_attempt.checkpoint->>'errorCategory',
+              safety_attempt.checkpoint->>'error_category',
+              ''
+            )) IN (
+              'platform_safety_block',
+              'login_required',
+              'authentication_required'
+            )
+            OR COALESCE(
+              safety_attempt.error->>'securityBlocked',
+              safety_attempt.error->>'security_blocked',
+              safety_attempt.error->>'platformSafetyBlocked',
+              safety_attempt.error->>'platform_safety_blocked',
+              safety_attempt.checkpoint->>'securityBlocked',
+              safety_attempt.checkpoint->>'security_blocked',
+              safety_attempt.checkpoint->>'platformSafetyBlocked',
+              safety_attempt.checkpoint->>'platform_safety_blocked',
+              'false'
+            ) = 'true'
+            OR COALESCE(
+              safety_attempt.error->>'requiresManualAction',
+              safety_attempt.error->>'requires_manual_action',
+              safety_attempt.checkpoint->>'requiresManualAction',
+              safety_attempt.checkpoint->>'requires_manual_action',
+              'false'
+            ) = 'true'
+            OR COALESCE(
+              safety_attempt.error #>> '{securityEvidence,confirmed}',
+              safety_attempt.error #>> '{security_evidence,confirmed}',
+              safety_attempt.checkpoint #>> '{securityEvidence,confirmed}',
+              safety_attempt.checkpoint #>> '{security_evidence,confirmed}',
+              'false'
+            ) = 'true'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM (
+          SELECT recent_attempt.agent_id,
+            ROW_NUMBER() OVER (
+              ORDER BY recent_attempt.attempt_number DESC,
+                recent_attempt.created_at DESC,
+                recent_attempt.id DESC
+            ) AS reverse_attempt_ordinal
+          FROM capture_task_item_attempts recent_attempt
+          WHERE recent_attempt.tenant_id = item.tenant_id
+            AND recent_attempt.item_id = item.id
+            AND recent_attempt.agent_id IS NOT NULL
+        ) current_round_attempt
+        WHERE current_round_attempt.agent_id = $2::uuid
+          AND current_round_attempt.reverse_attempt_ordinal <=
+            MOD(item.attempt_count, agent_policy.agent_attempt_limit)
+      )
+      AND (
+        agent_policy.agent_attempt_limit = 1
+        OR item.assigned_agent_id IS DISTINCT FROM $2::uuid
       )
     ORDER BY
       CASE WHEN item.status = 'pending' THEN 0 ELSE 1 END,
@@ -6358,6 +6437,8 @@ async function dispatchNextElasticWorkItem(tx, {
     canClaimNegativePost,
     canClaimWatchedContent,
     canClaimSequentialSearch,
+    ELASTIC_TECHNICAL_RETRY_ROUNDS,
+    Array.from(CROSS_DEVICE_RETRY_SAFETY_CODES),
   ]);
   if (!candidate) return null;
 
