@@ -4093,7 +4093,9 @@ export async function processClaimedCaptureRecoveryIntent({
               sourceLoginState: current.source_login_state,
               requireDistinctPlatformAccount: true,
               requireSourceLineageQuiet: true,
-              sourceLocalClosureProven: true,
+              sourceLocalClosureProven:
+                classification.safetyHandoff
+                  ?.sourceLocalClosureObserved === true,
             },
           }
         : {}),

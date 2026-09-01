@@ -624,17 +624,18 @@ test('guarded recovery ledger is tenant-scoped, attempt-aware and restart-safe i
   assert.equal(verifying.expected_attempt_number, 4);
   assert.equal(verifying.expected_assignment_revision, 13);
 
-  const lineageProbe = async (label, context = {}) => {
-    const externalId = `${Date.now()}${Math.floor(Math.random() * 1_000_000)}`;
+  const lineageProbe = async (label, context = {}, externalId = '') => {
+    const resolvedExternalId = externalId ||
+      `${Date.now()}${Math.floor(Math.random() * 1_000_000)}`;
     const result = await upsertCapturedRecord({
-      external_id: externalId,
+      external_id: resolvedExternalId,
       platform: 'douyin',
       record_type: 'single_note',
       title: `Recovery lineage ${label}`,
       content: `Recovery lineage ${label}`,
       author_name: 'Integration',
       author_id: 'integration-author',
-      url: `https://www.douyin.com/video/${externalId}`,
+      url: `https://www.douyin.com/video/${resolvedExternalId}`,
       keyword: 'guarded integration',
       source_type: 'keyword_capture',
       payload: {detailCaptureStatus: 'done'},
@@ -649,31 +650,54 @@ test('guarded recovery ledger is tenant-scoped, attempt-aware and restart-safe i
       WHERE tenant_id = $1 AND id = $2
     `, [tenant.id, result.observationId]);
   };
+  const assertStaleLineageRejected = async (label, context) => {
+    const externalId = `${Date.now()}${Math.floor(Math.random() * 1_000_000)}`;
+    await assert.rejects(
+      lineageProbe(label, context, externalId),
+      error => error?.code === 'stale_attempt' && error?.statusCode === 409,
+    );
+    const persisted = await queryOne(`
+      SELECT
+        (
+          SELECT COUNT(*)::integer
+          FROM records record
+          WHERE record.tenant_id = $1
+            AND record.platform = 'douyin'
+            AND record.external_id = $2
+        ) AS record_count,
+        (
+          SELECT COUNT(*)::integer
+          FROM record_observations observation
+          JOIN records record ON record.id = observation.record_id
+          WHERE record.tenant_id = $1
+            AND record.platform = 'douyin'
+            AND record.external_id = $2
+        ) AS observation_count
+    `, [tenant.id, externalId]);
+    assert.equal(persisted.record_count, 0);
+    assert.equal(persisted.observation_count, 0);
+  };
   const exactAgentContext = {
     captureTaskId: recoveryTaskId,
     captureAgentId: agent.id,
     captureAgentAuthCodeId: authCode.id,
     captureAgentAuthBindingId: authBinding.id,
   };
-  const unauthenticatedLineage = await lineageProbe('no-agent-identity', {
+  await assertStaleLineageRejected('no-agent-identity', {
     captureTaskId: recoveryTaskId,
     captureTaskItemAttemptId: dispatchedAttemptId,
     captureTaskItemRequestHash: guardedRequestHash,
   });
-  assert.equal(unauthenticatedLineage.capture_task_id, null);
-  assert.equal(unauthenticatedLineage.capture_task_item_attempt_id, null);
 
   const wrongAgentIdentity = await queryOne(
     'SELECT gen_random_uuid() AS id',
   );
-  const wrongAgentLineage = await lineageProbe('wrong-agent', {
+  await assertStaleLineageRejected('wrong-agent', {
     ...exactAgentContext,
     captureAgentId: wrongAgentIdentity.id,
     captureTaskItemAttemptId: dispatchedAttemptId,
     captureTaskItemRequestHash: guardedRequestHash,
   });
-  assert.equal(wrongAgentLineage.capture_task_id, null);
-  assert.equal(wrongAgentLineage.capture_task_item_attempt_id, null);
 
   const missingAttemptLineage = await lineageProbe(
     'missing-attempt',
@@ -685,34 +709,28 @@ test('guarded recovery ledger is tenant-scoped, attempt-aware and restart-safe i
   const wrongAttemptIdentity = await queryOne(
     'SELECT gen_random_uuid() AS id',
   );
-  const wrongAttemptLineage = await lineageProbe('wrong-attempt', {
+  await assertStaleLineageRejected('wrong-attempt', {
     ...exactAgentContext,
     captureTaskItemAttemptId: wrongAttemptIdentity.id,
     captureTaskItemRequestHash: guardedRequestHash,
   });
-  assert.equal(wrongAttemptLineage.capture_task_id, null);
-  assert.equal(wrongAttemptLineage.capture_task_item_attempt_id, null);
 
-  const wrongHashLineage = await lineageProbe('wrong-hash', {
+  await assertStaleLineageRejected('wrong-hash', {
     ...exactAgentContext,
     captureTaskItemAttemptId: dispatchedAttemptId,
     captureTaskItemRequestHash: 'b'.repeat(64),
   });
-  assert.equal(wrongHashLineage.capture_task_id, null);
-  assert.equal(wrongHashLineage.capture_task_item_attempt_id, null);
 
   await execute(`
     UPDATE capture_recovery_intents
     SET status = 'waiting_due', updated_at = clock_timestamp()
     WHERE tenant_id = $1 AND id = $2
   `, [tenant.id, guardedIntent.intent.id]);
-  const nonVerifyingLineage = await lineageProbe('not-verifying', {
+  await assertStaleLineageRejected('not-verifying', {
     ...exactAgentContext,
     captureTaskItemAttemptId: dispatchedAttemptId,
     captureTaskItemRequestHash: guardedRequestHash,
   });
-  assert.equal(nonVerifyingLineage.capture_task_id, null);
-  assert.equal(nonVerifyingLineage.capture_task_item_attempt_id, null);
   await execute(`
     UPDATE capture_recovery_intents
     SET status = 'verifying_collection', updated_at = clock_timestamp()

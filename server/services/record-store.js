@@ -17,9 +17,49 @@ const VERSION_FIELDS = [
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/iu;
+const RECORD_IDENTITY_UNIQUE_CONSTRAINTS = new Set([
+  'uniq_records_external_id',
+  'uniq_records_content_hash',
+]);
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+export function isCapturedRecordIdentityConflict(error = {}) {
+  return error?.code === '23505' && RECORD_IDENTITY_UNIQUE_CONSTRAINTS.has(
+    String(error?.constraint || '').trim(),
+  );
+}
+
+export async function retryCapturedRecordIdentityConflict(operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!isCapturedRecordIdentityConflict(error)) throw error;
+    // PostgreSQL waits for the competing unique-key transaction before raising
+    // 23505. The failed transaction has already rolled back, so one bounded
+    // replay can now observe the winner and follow the normal update path.
+    return await operation();
+  }
+}
+
+export function captureAttemptLineageStrictlyRequired(context = {}) {
+  return Boolean(
+    String(context.captureTaskId || '').trim()
+      && String(context.captureTaskItemAttemptId || '').trim()
+      && String(context.captureTaskItemRequestHash || '').trim(),
+  );
+}
+
+export function assertCaptureAttemptLineage(context = {}, lineage = null) {
+  if (captureAttemptLineageStrictlyRequired(context) && !lineage) {
+    const error = new Error('采集尝试已过期或与当前分配不匹配');
+    error.code = 'stale_attempt';
+    error.statusCode = 409;
+    throw error;
+  }
+  return lineage;
 }
 
 function normalizeUrl(url) {
@@ -680,6 +720,11 @@ async function loadCaptureObservationLineage(tx, {
   const normalizedItemRequestHash = String(
     captureTaskItemRequestHash || '',
   ).trim().toLowerCase();
+  const strictAttemptLineage = captureAttemptLineageStrictlyRequired({
+    captureTaskId,
+    captureTaskItemAttemptId,
+    captureTaskItemRequestHash,
+  });
   if (
     !UUID_PATTERN.test(normalizedTaskId) ||
     !UUID_PATTERN.test(normalizedAgentId) ||
@@ -748,11 +793,17 @@ async function loadCaptureObservationLineage(tx, {
         AND attempt.assignment_revision = current_item.assignment_revision
         AND attempt.attempt_number = current_item.attempt_count
         AND (
-          task.metadata->>'dutyRecovery' IS DISTINCT FROM 'true'
+          NOT $12::boolean
           OR (
             attempt.id = $10::uuid
             AND attempt.request_hash = $11
             AND current_item.request_hash = $11
+          )
+        )
+        AND (
+          task.metadata->>'dutyRecovery' IS DISTINCT FROM 'true'
+          OR (
+            $12::boolean
             AND task.metadata->>'remoteRequestHash' = $11
           )
         )
@@ -797,6 +848,7 @@ async function loadCaptureObservationLineage(tx, {
     SHA256_PATTERN.test(normalizedItemRequestHash)
       ? normalizedItemRequestHash
       : '',
+    strictAttemptLineage,
   ]);
 }
 
@@ -814,7 +866,7 @@ async function insertObservation(tx, {
   commentWorkflowExpectedCount = 0,
   record,
 }) {
-  const lineage = await loadCaptureObservationLineage(tx, {
+  const lineageContext = {
     tenantId,
     captureTaskId,
     captureAgentId,
@@ -825,7 +877,11 @@ async function insertObservation(tx, {
     recordId,
     monitorExecutionId,
     record,
-  });
+  };
+  const lineage = assertCaptureAttemptLineage(
+    lineageContext,
+    await loadCaptureObservationLineage(tx, lineageContext),
+  );
   const result = await tx.queryOne(`
     INSERT INTO record_observations (
       tenant_id, record_id, monitor_execution_id, source_auth_code,
@@ -981,7 +1037,7 @@ export async function upsertCapturedRecord(record, context) {
   const imageUrls = jsonText(record.image_urls, '[]');
   let payload = jsonText(record.payload, '{}');
 
-  const __result = await withTransaction(async tx => {
+  const runUpsertTransaction = () => withTransaction(async tx => {
     let existing = null;
     if (record.external_id) {
       existing = await tx.queryOne(
@@ -1224,6 +1280,9 @@ export async function upsertCapturedRecord(record, context) {
       officialContentSource: officialResolution.source,
     };
   });
+  const __result = await retryCapturedRecordIdentityConflict(
+    runUpsertTransaction,
+  );
   // 封面落地:入库后非阻塞把平台封面下载到本地(失败不影响入库,过期靠回填重试)
   if (__result.businessVisibility === 'eligible') {
     if (record.cover_url) queueCoverLocalization(__result.id, record.cover_url, record.platform);

@@ -99,7 +99,7 @@ test('login loss, unknown identity and a second challenge go straight to human',
   }
 });
 
-test('cloud-only silence never substitutes for authoritative local closure proof', () => {
+test('missing local closure telemetry never blocks an otherwise safe handoff', () => {
   for (const cloudClaim of [
     {sourceTaskStatus: 'running'},
     {activeCommandCount: 1},
@@ -110,9 +110,9 @@ test('cloud-only silence never substitutes for authoritative local closure proof
       sourceLocalClosureProven: false,
       ...cloudClaim,
     });
-    assert.equal(decision.automaticEligible, false);
-    assert.equal(decision.decision, 'human_required');
-    assert.equal(decision.reason, 'source_local_closure_proof_unavailable');
+    assert.equal(decision.automaticEligible, true);
+    assert.equal(decision.decision, 'cross_account_handoff');
+    assert.equal(decision.sourceLocalClosureObserved, false);
     assert.equal(decision.sourceLineageSilent, false);
   }
 });

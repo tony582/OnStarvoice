@@ -102,9 +102,9 @@ export function evaluateCaptureSafetyHandoff({
   if (text(sourceLoginState, 40).toLowerCase() !== 'authenticated') {
     return humanRequired('source_login_not_authenticated', details);
   }
-  if (sourceLocalClosureProven !== true) {
-    return humanRequired('source_local_closure_proof_unavailable', details);
-  }
+  // Browser-local closure is telemetry, not dispatch authority. The source
+  // execution/command lineage and the distinct-account rule fence the handoff;
+  // a missing client proof must not freeze the keyword indefinitely.
 
   const targetProvided = targetPlatformAccountId !== undefined;
   if (targetProvided) {
@@ -133,6 +133,7 @@ export function evaluateCaptureSafetyHandoff({
     nextSafetyHandoffCount: 1,
     challengeCode: normalizedCode,
     targetAccountRequired: true,
+    sourceLocalClosureObserved: sourceLocalClosureProven === true,
   });
 }
 

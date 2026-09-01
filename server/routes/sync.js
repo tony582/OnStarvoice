@@ -437,6 +437,13 @@ router.post('/', requireAuth, optionalCaptureAgent, async (req, res) => {
     });
   } catch (err) {
     console.error('[Sync] Error:', err);
+    if (err?.code === 'stale_attempt') {
+      return res.status(409).json({
+        ok: false,
+        error: 'stale_attempt',
+        message: err.message,
+      });
+    }
     return res.status(500).json({ ok: false, error: 'server_error', message: err.message });
   }
 });
@@ -484,14 +491,17 @@ router.post('/batch', requireAuth, optionalCaptureAgent, async (req, res) => {
       if (aiJob && !commentStats.queued && !commentStats.officialContent) aiJobs.push(aiJob);
     } catch (err) {
       const message = err?.message || '同步失败';
+      const reason = err?.code === 'stale_attempt'
+        ? 'stale_attempt'
+        : 'server_error';
       results.push({
         ok: false,
         recordId: originalRecordId,
         action: 'skipped',
-        reason: 'server_error',
+        reason,
         message,
         error: {
-          reason: 'server_error',
+          reason,
           message,
         },
       });

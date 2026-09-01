@@ -6,7 +6,6 @@ import {
   CAPTURE_RECOVERY_ACTIONS_GLOBAL_ENV,
   CAPTURE_RECOVERY_AGENT_SLOT_SOURCE_TYPE,
   CAPTURE_RECOVERY_FAST_ATTEMPT_LIMIT,
-  CAPTURE_RECOVERY_LOCAL_CLOSURE_RECHECK_MS,
   CAPTURE_RECOVERY_MAX_GENERATIONS,
   CAPTURE_RECOVERY_VERIFY_DELAY_MS,
   CAPTURE_RECOVERY_WAITING_AGENT_BACKOFF_MS,
@@ -447,14 +446,18 @@ test('candidate classification separates Extension, network, safety and user-sto
   });
   assert.equal(firstAllowlistedSearchChallenge.eligible, true);
   assert.equal(firstAllowlistedSearchChallenge.terminalStatus, null);
-  assert.equal(firstAllowlistedSearchChallenge.decision, 'observe');
+  assert.equal(firstAllowlistedSearchChallenge.decision, 'none');
   assert.equal(
     firstAllowlistedSearchChallenge.reason,
-    'platform_safety_waiting_local_closure',
+    'platform_safety_handoff_candidate',
   );
-  assert.equal(firstAllowlistedSearchChallenge.waitingForLocalClosure, true);
   assert.equal(
     firstAllowlistedSearchChallenge.safetyHandoff.automaticEligible,
+    true,
+  );
+  assert.equal(
+    firstAllowlistedSearchChallenge.safetyHandoff
+      .sourceLocalClosureObserved,
     false,
   );
   assert.equal(
@@ -488,10 +491,10 @@ test('candidate classification separates Extension, network, safety and user-sto
     source_local_closure_proof_failed: true,
     error: {code: 'DOUYIN_SEARCH_SECURITY_CHALLENGE'},
   });
-  assert.equal(failedClosureProof.terminalStatus, 'waiting_human');
+  assert.equal(failedClosureProof.terminalStatus, null);
   assert.equal(
     failedClosureProof.reason,
-    'platform_safety_local_closure_proof_failed',
+    'platform_safety_handoff_candidate',
   );
 
   const secondAllowlistedSearchChallenge = classifyCaptureRecoveryCandidate({
@@ -835,7 +838,7 @@ test('ingest requeues the same safety fingerprint when its authoritative closure
   assert.match(requeue.sql, /status IN \('ready', 'waiting_due', 'waiting_agent'\)/u);
 });
 
-test('guarded recovery keeps a first search challenge reevaluable while local closure proof is pending', async () => {
+test('guarded recovery dispatches a first search challenge without closure telemetry', async () => {
   let dispatchCalls = 0;
   const updates = [];
   const current = recoveryCandidateRow({
@@ -863,38 +866,36 @@ test('guarded recovery keeps a first search challenge reevaluable while local cl
     policy: {mode: 'guarded', actionsEnabled: true},
     dispatchRecovery: async input => {
       dispatchCalls += 1;
-      assert.fail(`unexpected safety dispatch: ${JSON.stringify(input)}`);
+      assert.equal(input.safetyHandoff.sourceLocalClosureProven, false);
+      return {
+        child: {id: recoveryTaskId},
+        command: {id: recoveryCommandId},
+        agent: {id: recoveryAgentId},
+        itemAttempts: [{
+          id: recoveryAttemptId,
+          itemId,
+          executionTaskId: recoveryTaskId,
+          agentId: recoveryAgentId,
+          attemptNumber: 4,
+          assignmentRevision: 11,
+          status: 'dispatched',
+        }],
+      };
     },
     queryOne: async (sql, params) => {
       if (/FROM capture_recovery_intents intent/u.test(sql)) return current;
       updates.push({sql, params});
       return {
         id: intentId,
-        status: params[3],
-        decision: params[4],
-        decision_payload: JSON.parse(params[5]),
-        verification: JSON.parse(params[6]),
-        available_at: params[8],
+        status: 'verifying_collection',
+        decision: 'cross_agent_recovery',
+        action_count: 1,
       };
     },
   });
-  assert.equal(settled.status, 'waiting_due');
-  assert.equal(settled.decision, 'observe');
-  assert.equal(settled.decision_payload.redHumanNotification, false);
-  assert.equal(dispatchCalls, 0);
-  assert.equal(updates[0].params[3], 'waiting_due');
-  assert.equal(
-    settled.verification.reason,
-    'platform_safety_waiting_local_closure',
-  );
-  assert.equal(
-    new Date(settled.available_at).toISOString(),
-    new Date(
-      Date.parse('2026-08-25T01:00:00.000Z')
-        + CAPTURE_RECOVERY_LOCAL_CLOSURE_RECHECK_MS,
-    ).toISOString(),
-  );
-  assert.doesNotMatch(updates[0].sql, /attempt_count/u);
+  assert.equal(settled.status, 'verifying_collection');
+  assert.equal(settled.decision, 'cross_agent_recovery');
+  assert.equal(dispatchCalls, 1);
 });
 
 test('an authoritative exact-attempt closure proof enables one safety handoff dispatch', async () => {
@@ -1022,7 +1023,7 @@ test('multi-item recovery selects the exact closure proof instead of the legacy 
   assert.equal(settled.status, 'verifying_collection');
 });
 
-test('a malformed exact-attempt closure proof remains a human boundary', async () => {
+test('a malformed exact-attempt closure proof remains audit-only', async () => {
   let dispatchCalls = 0;
   const settled = await processClaimedCaptureRecoveryIntent({
     tenantId,
@@ -1030,7 +1031,24 @@ test('a malformed exact-attempt closure proof remains a human boundary', async (
     leaseToken,
     now: new Date('2026-08-25T01:00:00.000Z'),
     policy: {mode: 'guarded', actionsEnabled: true},
-    dispatchRecovery: async () => { dispatchCalls += 1; },
+    dispatchRecovery: async input => {
+      dispatchCalls += 1;
+      assert.equal(input.safetyHandoff.sourceLocalClosureProven, false);
+      return {
+        child: {id: recoveryTaskId},
+        command: {id: recoveryCommandId},
+        agent: {id: recoveryAgentId},
+        itemAttempts: [{
+          id: recoveryAttemptId,
+          itemId,
+          executionTaskId: recoveryTaskId,
+          agentId: recoveryAgentId,
+          attemptNumber: 4,
+          assignmentRevision: 11,
+          status: 'dispatched',
+        }],
+      };
+    },
     queryOne: async (sql, params) => {
       if (/FROM capture_recovery_intents intent/u.test(sql)) {
         return recoverySafetyClosureRow({
@@ -1041,21 +1059,17 @@ test('a malformed exact-attempt closure proof remains a human boundary', async (
       }
       return {
         id: intentId,
-        status: params[3],
-        decision: params[4],
-        verification: JSON.parse(params[6]),
+        status: 'verifying_collection',
+        decision: 'cross_agent_recovery',
+        action_count: 1,
       };
     },
   });
-  assert.equal(dispatchCalls, 0);
-  assert.equal(settled.status, 'waiting_human');
-  assert.equal(
-    settled.verification.reason,
-    'platform_safety_local_closure_proof_failed',
-  );
+  assert.equal(dispatchCalls, 1);
+  assert.equal(settled.status, 'verifying_collection');
 });
 
-test('missing local closure proof times out to waiting human without dispatch', async () => {
+test('missing local closure proof never replaces the recovery-window boundary', async () => {
   let dispatchCalls = 0;
   const settled = await processClaimedCaptureRecoveryIntent({
     tenantId,
@@ -1078,14 +1092,15 @@ test('missing local closure proof times out to waiting human without dispatch', 
         status: params[3],
         decision: params[4],
         decision_payload: JSON.parse(params[5]),
+        verification: {reason: 'window_ended'},
       };
     },
   });
   assert.equal(dispatchCalls, 0);
-  assert.equal(settled.status, 'waiting_human');
+  assert.equal(settled.status, 'exhausted_window');
   assert.equal(
-    settled.decision_payload.reason,
-    'source_local_closure_proof_timeout',
+    settled.verification.reason,
+    'window_ended',
   );
 });
 
@@ -2648,7 +2663,11 @@ test('migration and wiring keep guarded item recovery durable and default-off', 
   );
   assert.match(
     recordStore,
-    /task\.metadata->>'dutyRecovery' IS DISTINCT FROM 'true'[\s\S]*attempt\.id = \$10::uuid[\s\S]*attempt\.request_hash = \$11[\s\S]*intent\.status = 'verifying_collection'/u,
+    /NOT \$12::boolean[\s\S]*attempt\.id = \$10::uuid[\s\S]*attempt\.request_hash = \$11[\s\S]*current_item\.request_hash = \$11[\s\S]*task\.metadata->>'dutyRecovery' IS DISTINCT FROM 'true'[\s\S]*intent\.status = 'verifying_collection'/u,
+  );
+  assert.match(
+    recordStore,
+    /assertCaptureAttemptLineage\([\s\S]*await loadCaptureObservationLineage\(tx, lineageContext\)/u,
   );
   assert.match(
     service,
