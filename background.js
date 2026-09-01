@@ -119,11 +119,16 @@ const DEFAULT_RUNTIME = {
 
 const UNATTENDED_KEYWORD_ALARM_NAME = 'onstarvoice:unattended-keyword-plan';
 const UNATTENDED_SUPERVISOR_ALARM_NAME = 'onstarvoice:unattended-supervisor';
+const UNATTENDED_LOCAL_CLOSURE_ALARM_NAME =
+  'onstarvoice:unattended-local-closure';
 const CLOUD_TASK_AGENT_ALARM_NAME = 'onstarvoice:cloud-task-agent';
 const UNATTENDED_RUNNER_QUERY_KEY = 'unattendedRun';
 const UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY = 'unattendedAttempt';
 const UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX =
   'onstarvoice.unattendedCheckpointReportOutbox.v2.';
+const UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX =
+  'onstarvoice.unattendedLocalClosureReady.v1.';
+const UNATTENDED_LOCAL_CLOSURE_READY_VERSION = 1;
 const UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION = 2;
 const UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION = 1;
 const TARGETED_POST_RUNNER_QUERY_KEY = 'targetedPostRun';
@@ -155,6 +160,14 @@ const CLOUD_TASK_AGENT_PERIOD_MINUTES = 1;
 const CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS = 15 * 1000;
 const CLOUD_TASK_AGENT_FAILURE_BACKOFF_BASE_MS = 15 * 1000;
 const CLOUD_TASK_AGENT_FAILURE_BACKOFF_MAX_MS = 5 * 60 * 1000;
+const UNATTENDED_LOCAL_CLOSURE_RETRY_DELAYS_MS = Object.freeze([
+  1000,
+  5000,
+  15000,
+  60 * 1000,
+]);
+const UNATTENDED_LOCAL_CLOSURE_ALARM_FALLBACK_DELAY_MS = 30 * 1000;
+const UNATTENDED_LOCAL_CLOSURE_ALARM_RETRY_FLOOR = 3;
 const SOCIAL_ACCOUNT_IDENTITY_REFRESH_MS = 5 * 60 * 1000;
 const SOCIAL_ACCOUNT_IDENTITY_CACHE_MAX_AGE_MS = 30 * 60 * 1000;
 const UNATTENDED_SUPERVISOR_SUSPEND_GAP_MS = 2.5 * 60 * 1000;
@@ -2032,6 +2045,11 @@ let cloudTaskAgentSyncTimer = null;
 let cloudTaskAgentLastError = '';
 let cloudTaskAgentFailureCount = 0;
 let cloudTaskAgentRetryNotBefore = 0;
+let unattendedLocalClosureRetryTimer = null;
+let unattendedLocalClosureRetryIdentity = '';
+let unattendedLocalClosureRetryFailureCount = 0;
+let unattendedLocalClosureRetryMutation = Promise.resolve();
+const unattendedLocalClosureFinalizeInFlightByIdentity = new Map();
 const cloudTaskAgentConfirmedLocalClosureKeys = new Set();
 let socialAccountIdentityRefreshInFlight = null;
 let socialAccountUsageQueueMutation = Promise.resolve();
@@ -4165,12 +4183,9 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
         markDegraded(`cleanup_${failure.area || 'unknown'}_failed`);
       }
     }
-    // A previous terminal runner may have finished cleanup after the heartbeat
-    // that carried its terminal status. Re-evaluate the exact local predicate
-    // before reading the ledger so this same heartbeat can carry closure proof.
-    await reconcileUnattendedLocalClosureEvidence({
-      closeOwnedRunnerTabs: true,
-    }).catch((error) => {
+    // A heartbeat may nudge a terminal handshake, but it cannot bypass the
+    // runner's durable checkpoint flush-ready marker.
+    await retryCurrentTerminalUnattendedLocalClosure().catch((error) => {
       console.warn('[CloudTaskAgent] local closure reconcile failed:', error);
       markDegraded('local_closure_reconcile_failed');
     });
@@ -5529,6 +5544,217 @@ function resolveUnattendedClosureItemIdentities(request = {}) {
   return unique.size === identities.length ? identities : [];
 }
 
+function unattendedRunRequestsLocalClosureProof(request = {}) {
+  const context =
+    request?.orchestrationContext &&
+    typeof request.orchestrationContext === 'object' &&
+    !Array.isArray(request.orchestrationContext)
+      ? request.orchestrationContext
+      : {};
+  return context.requiresLocalClosureReuseFenceV1 === true;
+}
+
+function unattendedRunRequiresLocalClosureProof(request = {}) {
+  return Boolean(
+    unattendedRunRequestsLocalClosureProof(request) &&
+      resolveUnattendedClosureItemIdentities(request).length > 0,
+  );
+}
+
+function buildUnattendedLocalClosureReadyStorageKey(
+  requestId = '',
+  attemptId = '',
+) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  return normalizedRequestId && normalizedAttemptId
+    ? `${UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX}` +
+        `${normalizedRequestId}.${normalizedAttemptId}`
+    : '';
+}
+
+async function readUnattendedLocalClosureReadyMarker(
+  requestId = '',
+  attemptId = '',
+) {
+  const key = buildUnattendedLocalClosureReadyStorageKey(requestId, attemptId);
+  if (!key) return null;
+  const stored = await chrome.storage.local.get(key);
+  const marker =
+    stored?.[key] &&
+    typeof stored[key] === 'object' &&
+    !Array.isArray(stored[key])
+      ? stored[key]
+      : null;
+  if (
+    marker?.version !== UNATTENDED_LOCAL_CLOSURE_READY_VERSION ||
+    String(marker.requestId || '').trim() !== String(requestId || '').trim() ||
+    String(marker.attemptId || '').trim() !== String(attemptId || '').trim() ||
+    !String(marker.readyAt || '').trim()
+  ) {
+    return null;
+  }
+  return marker;
+}
+
+async function persistUnattendedLocalClosureReadyMarker({
+  requestId = '',
+  attemptId = '',
+  readyAt = '',
+} = {}) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  const key = buildUnattendedLocalClosureReadyStorageKey(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
+  if (!key) return {persisted: false, reason: 'attempt_identity_missing'};
+  const current = await readUnattendedKeywordRunRequest();
+  if (
+    !current ||
+    current.id !== normalizedRequestId ||
+    current.attemptId !== normalizedAttemptId
+  ) {
+    return {persisted: false, reason: 'attempt_superseded'};
+  }
+  if (!isTerminalUnattendedRunStatus(current.status)) {
+    return {persisted: false, reason: 'request_not_terminal'};
+  }
+  const marker = {
+    version: UNATTENDED_LOCAL_CLOSURE_READY_VERSION,
+    requestId: normalizedRequestId,
+    attemptId: normalizedAttemptId,
+    readyAt: String(readyAt || '').trim() || new Date().toISOString(),
+  };
+  await runAuthoritativeControlStorageMutation(() =>
+    chrome.storage.local.set({[key]: marker}),
+  );
+  return {persisted: true, reason: 'checkpoint_flush_ready', marker};
+}
+
+async function removeUnattendedLocalClosureReadyMarker(
+  requestId = '',
+  attemptId = '',
+) {
+  const key = buildUnattendedLocalClosureReadyStorageKey(requestId, attemptId);
+  if (!key) return false;
+  await chrome.storage.local.remove(key).catch((error) => {
+    console.warn('[Background] local closure ready marker cleanup failed:', error);
+  });
+  return true;
+}
+
+async function closeExactTerminalUnattendedRunnerAfterFlush(request) {
+  const normalized = normalizeUnattendedRunRequest(request);
+  if (
+    !normalized ||
+    !isTerminalUnattendedRunStatus(normalized.status) ||
+    !String(normalized.attemptId || '').trim()
+  ) {
+    return {closed: false, reason: 'request_not_terminal'};
+  }
+  const marker = await readUnattendedLocalClosureReadyMarker(
+    normalized.id,
+    normalized.attemptId,
+  );
+  if (!marker) {
+    return {closed: false, reason: 'checkpoint_flush_not_ready'};
+  }
+  const initialOutbox = await inspectUnattendedCheckpointOutboxAttempt(
+    normalized.id,
+    normalized.attemptId,
+  );
+  if (!initialOutbox.known) {
+    return {
+      closed: false,
+      reason: initialOutbox.reason || 'outbox_state_unknown',
+    };
+  }
+  if (initialOutbox.pendingCount !== 0) {
+    return {closed: false, reason: 'checkpoint_reports_pending'};
+  }
+  const lifecycle = await runUnattendedRunnerTabLifecycle(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== normalized.id ||
+      current.attemptId !== normalized.attemptId ||
+      !isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return {closed: false, reason: 'attempt_superseded'};
+    }
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({});
+    } catch (error) {
+      return {closed: false, reason: 'runner_tab_query_failed', error};
+    }
+    const assignedRunnerTabId = Number(current.runnerTabId);
+    const isOwnedRunnerTab = (tab) =>
+      isUnattendedRunnerTabForRequest(
+        tab,
+        normalized.id,
+        normalized.attemptId,
+      ) ||
+      (
+        Number.isFinite(assignedRunnerTabId) &&
+        assignedRunnerTabId > 0 &&
+        Number(tab?.id) === assignedRunnerTabId &&
+        isLegacyUnattendedRunnerTabForRequest(tab, normalized.id)
+      );
+    try {
+      for (const tab of tabs.filter(isOwnedRunnerTab)) {
+        const tabId = Number(tab?.id);
+        if (!Number.isFinite(tabId) || tabId <= 0) continue;
+        const latest = await readUnattendedKeywordRunRequest();
+        if (
+          !latest ||
+          latest.id !== normalized.id ||
+          latest.attemptId !== normalized.attemptId ||
+          !isTerminalUnattendedRunStatus(latest.status)
+        ) {
+          return {closed: false, reason: 'attempt_superseded'};
+        }
+        let liveTab;
+        try {
+          liveTab = await chrome.tabs.get(tabId);
+        } catch (error) {
+          if (
+            /no tab with id|not found|does not exist|invalid tab id/iu.test(
+              String(error?.message || error || ''),
+            )
+          ) {
+            continue;
+          }
+          throw error;
+        }
+        if (isOwnedRunnerTab(liveTab)) {
+          await chrome.tabs.remove(tabId);
+        }
+      }
+      const remainingTabs = await chrome.tabs.query({});
+      if (remainingTabs.some(isOwnedRunnerTab)) {
+        return {closed: false, reason: 'runner_tab_close_unconfirmed'};
+      }
+    } catch (error) {
+      return {closed: false, reason: 'runner_tab_close_unconfirmed', error};
+    }
+    return {closed: true, reason: 'runner_tab_closed_after_flush'};
+  });
+  if (!lifecycle.closed) return lifecycle;
+  const finalOutbox = await inspectUnattendedCheckpointOutboxAttempt(
+    normalized.id,
+    normalized.attemptId,
+  );
+  if (!finalOutbox.known) {
+    return {closed: false, reason: finalOutbox.reason || 'outbox_state_unknown'};
+  }
+  if (finalOutbox.pendingCount !== 0) {
+    return {closed: false, reason: 'checkpoint_reports_pending_after_close'};
+  }
+  return lifecycle;
+}
+
 function buildExactUnattendedLocalClosureKey({
   requestId = '',
   attemptId = '',
@@ -6779,6 +7005,386 @@ async function reconcileUnattendedLocalClosureEvidence({
     return {persisted: false, reason: predicate.reason, predicate};
   }
   return await persistUnattendedLocalClosureEvidence(predicate);
+}
+
+function unattendedLocalClosureAttemptIdentity(requestId = '', attemptId = '') {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  return normalizedRequestId && normalizedAttemptId
+    ? `${normalizedRequestId}:${normalizedAttemptId}`
+    : '';
+}
+
+function runUnattendedLocalClosureRetryMutation(operation) {
+  const result = unattendedLocalClosureRetryMutation.then(operation, operation);
+  unattendedLocalClosureRetryMutation = result.catch(() => undefined);
+  return result;
+}
+
+async function clearUnattendedLocalClosureRetry(identity = '') {
+  return await runUnattendedLocalClosureRetryMutation(async () => {
+    const expectedIdentity = String(identity || '').trim();
+    if (
+      expectedIdentity &&
+      unattendedLocalClosureRetryIdentity &&
+      unattendedLocalClosureRetryIdentity !== expectedIdentity
+    ) {
+      return false;
+    }
+    if (unattendedLocalClosureRetryTimer !== null) {
+      clearTimeout(unattendedLocalClosureRetryTimer);
+      unattendedLocalClosureRetryTimer = null;
+    }
+    unattendedLocalClosureRetryIdentity = '';
+    unattendedLocalClosureRetryFailureCount = 0;
+    try {
+      if (typeof chrome.alarms?.clear === 'function') {
+        await chrome.alarms.clear(UNATTENDED_LOCAL_CLOSURE_ALARM_NAME);
+      }
+    } catch (error) {
+      console.warn('[Background] local closure retry alarm clear failed:', error);
+    }
+    return true;
+  });
+}
+
+const UNATTENDED_LOCAL_CLOSURE_PERMANENT_FAILURE_REASONS = new Set([
+  'attempt_identity_missing',
+  'attempt_superseded',
+  'request_not_terminal',
+  'source_identity_unverifiable',
+  'item_attempt_identity_unknown',
+  'business_upload_attempt_mismatch',
+  'business_upload_counts_unknown',
+  'item_attempt_identity_changed',
+  'terminal_ledger_mismatch',
+]);
+
+function shouldRetryUnattendedLocalClosure(reason = '') {
+  const normalizedReason = String(reason || '').trim();
+  return !UNATTENDED_LOCAL_CLOSURE_PERMANENT_FAILURE_REASONS.has(
+    normalizedReason,
+  );
+}
+
+async function scheduleUnattendedLocalClosureRetry({
+  requestId = '',
+  attemptId = '',
+  delayMs = null,
+  failureReason = '',
+  failureCountFloor = 0,
+} = {}) {
+  const identity = unattendedLocalClosureAttemptIdentity(requestId, attemptId);
+  if (!identity) return false;
+  return await runUnattendedLocalClosureRetryMutation(async () => {
+    // The current request is authoritative. A late finalizer for attempt A can
+    // never replace the retry already scheduled for newer terminal attempt B.
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== String(requestId) ||
+      current.attemptId !== String(attemptId) ||
+      !isTerminalUnattendedRunStatus(current.status) ||
+      !unattendedRunRequiresLocalClosureProof(current)
+    ) {
+      return false;
+    }
+    if (unattendedLocalClosureRetryIdentity !== identity) {
+      if (unattendedLocalClosureRetryTimer !== null) {
+        clearTimeout(unattendedLocalClosureRetryTimer);
+        unattendedLocalClosureRetryTimer = null;
+      }
+      try {
+        if (typeof chrome.alarms?.clear === 'function') {
+          await chrome.alarms.clear(UNATTENDED_LOCAL_CLOSURE_ALARM_NAME);
+        }
+      } catch (error) {
+        console.warn('[Background] local closure retry alarm clear failed:', error);
+      }
+      unattendedLocalClosureRetryIdentity = identity;
+      unattendedLocalClosureRetryFailureCount = 0;
+    }
+    const normalizedFailureReason = String(failureReason || '').trim();
+    if (normalizedFailureReason) {
+      unattendedLocalClosureRetryFailureCount = Math.max(
+        unattendedLocalClosureRetryFailureCount,
+        Math.max(0, Number(failureCountFloor) || 0),
+      ) + 1;
+    }
+    const backoffIndex = Math.min(
+      Math.max(0, unattendedLocalClosureRetryFailureCount - 1),
+      UNATTENDED_LOCAL_CLOSURE_RETRY_DELAYS_MS.length - 1,
+    );
+    const requestedDelayMs = Number(delayMs);
+    const boundedDelayMs = Math.max(
+      250,
+      Number.isFinite(requestedDelayMs) && requestedDelayMs > 0
+        ? requestedDelayMs
+        : UNATTENDED_LOCAL_CLOSURE_RETRY_DELAYS_MS[backoffIndex],
+    );
+    if (unattendedLocalClosureRetryTimer === null) {
+      unattendedLocalClosureRetryTimer = setTimeout(() => {
+        unattendedLocalClosureRetryTimer = null;
+        finalizeTerminalUnattendedAttemptExact({
+          requestId,
+          attemptId,
+          scheduleRetry: true,
+          syncOnSuccess: true,
+        }).catch((error) => {
+          console.warn('[Background] local closure retry failed:', error);
+          void scheduleUnattendedLocalClosureRetry({
+            requestId,
+            attemptId,
+            failureReason: 'unexpected_finalize_error',
+            failureCountFloor:
+              UNATTENDED_LOCAL_CLOSURE_ALARM_RETRY_FLOOR,
+          });
+        });
+      }, boundedDelayMs);
+    }
+    if (typeof chrome.alarms?.create === 'function') {
+      try {
+        await chrome.alarms.create(UNATTENDED_LOCAL_CLOSURE_ALARM_NAME, {
+          // The timer is the fast path; this later alarm only wakes a sleeping
+          // MV3 worker and does not double-run the same one-second retry.
+          when:
+            Date.now() +
+            Math.max(
+              boundedDelayMs,
+              UNATTENDED_LOCAL_CLOSURE_ALARM_FALLBACK_DELAY_MS,
+            ),
+        });
+      } catch (error) {
+        console.warn('[Background] local closure retry alarm create failed:', error);
+      }
+    }
+    return true;
+  });
+}
+
+async function finalizeTerminalUnattendedAttemptExact({
+  requestId = '',
+  attemptId = '',
+  scheduleRetry = true,
+  syncOnSuccess = true,
+  retryFailureCountFloor = 0,
+} = {}) {
+  const identity = unattendedLocalClosureAttemptIdentity(requestId, attemptId);
+  if (!identity) {
+    return {persisted: false, reason: 'attempt_identity_missing'};
+  }
+  const existing = unattendedLocalClosureFinalizeInFlightByIdentity.get(
+    identity,
+  );
+  if (existing) {
+    return await existing;
+  }
+  const finalize = async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== String(requestId) ||
+      current.attemptId !== String(attemptId)
+    ) {
+      await clearUnattendedLocalClosureRetry(identity);
+      await removeUnattendedLocalClosureReadyMarker(requestId, attemptId);
+      return {persisted: false, reason: 'attempt_superseded'};
+    }
+    if (!isTerminalUnattendedRunStatus(current.status)) {
+      await clearUnattendedLocalClosureRetry(identity);
+      return {persisted: false, reason: 'request_not_terminal'};
+    }
+    if (
+      unattendedRunRequestsLocalClosureProof(current) &&
+      buildUnattendedLocalClosureKeyFromRequest(current)
+    ) {
+      await clearUnattendedLocalClosureRetry(identity);
+      await removeUnattendedLocalClosureReadyMarker(requestId, attemptId);
+      return {
+        persisted: false,
+        reason: 'already_persisted',
+        evidence: current.localClosureEvidence || null,
+        evidences: Array.isArray(current.localClosureEvidences)
+          ? current.localClosureEvidences
+          : current.localClosureEvidence
+            ? [current.localClosureEvidence]
+            : [],
+      };
+    }
+
+    const readyMarker = await readUnattendedLocalClosureReadyMarker(
+      requestId,
+      attemptId,
+    );
+    if (!readyMarker) {
+      if (
+        scheduleRetry &&
+        unattendedRunRequiresLocalClosureProof(current)
+      ) {
+        await scheduleUnattendedLocalClosureRetry({
+          requestId,
+          attemptId,
+          failureReason: 'checkpoint_flush_not_ready',
+          failureCountFloor: retryFailureCountFloor,
+        });
+      }
+      return {persisted: false, reason: 'checkpoint_flush_not_ready'};
+    }
+
+    if (!unattendedRunRequestsLocalClosureProof(current)) {
+      const cleanup = await cleanupTerminalUnattendedRuntime(current);
+      const exactAfterCleanup = await readUnattendedKeywordRunRequest();
+      if (
+        !exactAfterCleanup ||
+        exactAfterCleanup.id !== String(requestId) ||
+        exactAfterCleanup.attemptId !== String(attemptId) ||
+        !isTerminalUnattendedRunStatus(exactAfterCleanup.status)
+      ) {
+        await removeUnattendedLocalClosureReadyMarker(requestId, attemptId);
+        return {persisted: false, reason: 'attempt_superseded'};
+      }
+      if (cleanup?.cleanupConfirmed !== true) {
+        return {
+          persisted: false,
+          reason: cleanup?.cleanupReason || 'terminal_runtime_cleanup_failed',
+        };
+      }
+      const runner = await closeExactTerminalUnattendedRunnerAfterFlush(
+        exactAfterCleanup,
+      );
+      if (runner.closed) {
+        await removeUnattendedLocalClosureReadyMarker(requestId, attemptId);
+        await clearUnattendedLocalClosureRetry(identity);
+        return {persisted: false, reason: 'local_closure_not_required'};
+      }
+      return {persisted: false, reason: runner.reason, predicate: runner};
+    }
+
+    if (!unattendedRunRequiresLocalClosureProof(current)) {
+      await clearUnattendedLocalClosureRetry(identity);
+      await removeUnattendedLocalClosureReadyMarker(requestId, attemptId);
+      return {persisted: false, reason: 'item_attempt_identity_unknown'};
+    }
+
+    const cleanup = await cleanupTerminalUnattendedRuntime(current);
+    const exactAfterCleanup = await readUnattendedKeywordRunRequest();
+    if (
+      !exactAfterCleanup ||
+      exactAfterCleanup.id !== String(requestId) ||
+      exactAfterCleanup.attemptId !== String(attemptId) ||
+      !isTerminalUnattendedRunStatus(exactAfterCleanup.status)
+    ) {
+      await clearUnattendedLocalClosureRetry(identity);
+      await removeUnattendedLocalClosureReadyMarker(requestId, attemptId);
+      return {persisted: false, reason: 'attempt_superseded'};
+    }
+    if (cleanup?.cleanupConfirmed !== true) {
+      const pending = {
+        persisted: false,
+        reason: cleanup?.cleanupReason || 'terminal_runtime_cleanup_failed',
+      };
+      if (!shouldRetryUnattendedLocalClosure(pending.reason)) {
+        await clearUnattendedLocalClosureRetry(identity);
+        return pending;
+      }
+      if (scheduleRetry) {
+        await scheduleUnattendedLocalClosureRetry({
+          requestId,
+          attemptId,
+          failureReason: pending.reason,
+          failureCountFloor: retryFailureCountFloor,
+        });
+      }
+      return pending;
+    }
+    const closure = await reconcileUnattendedLocalClosureEvidence({
+      expectedRequestId: requestId,
+      expectedAttemptId: attemptId,
+      closeOwnedRunnerTabs: true,
+    });
+    const complete = Boolean(
+      closure?.persisted === true || closure?.reason === 'already_persisted',
+    );
+    if (complete) {
+      await clearUnattendedLocalClosureRetry(identity);
+      await removeUnattendedLocalClosureReadyMarker(requestId, attemptId);
+      if (syncOnSuccess) {
+        if (cloudTaskAgentSyncInFlight) {
+          cloudTaskAgentSyncPending = true;
+        } else {
+          syncCloudTaskAgent({
+            reason: 'unattended_local_closure_persisted',
+            force: true,
+          }).catch((error) => {
+            console.warn('[CloudTaskAgent] local closure sync failed:', error);
+            scheduleCloudTaskAgentSync(
+              'unattended_local_closure_sync_retry',
+              UNATTENDED_LOCAL_CLOSURE_RETRY_DELAYS_MS[0],
+            );
+          });
+        }
+      }
+      return closure;
+    }
+    if (!shouldRetryUnattendedLocalClosure(closure?.reason)) {
+      await clearUnattendedLocalClosureRetry(identity);
+      return closure;
+    }
+    if (scheduleRetry) {
+      await scheduleUnattendedLocalClosureRetry({
+        requestId,
+        attemptId,
+        failureReason: closure?.reason || 'local_closure_pending',
+        failureCountFloor: retryFailureCountFloor,
+      });
+    }
+    return closure;
+  };
+  const inFlight = finalize().finally(() => {
+    if (
+      unattendedLocalClosureFinalizeInFlightByIdentity.get(identity) ===
+      inFlight
+    ) {
+      unattendedLocalClosureFinalizeInFlightByIdentity.delete(identity);
+    }
+  });
+  unattendedLocalClosureFinalizeInFlightByIdentity.set(identity, inFlight);
+  return await inFlight;
+}
+
+async function retryCurrentTerminalUnattendedLocalClosure({
+  retryFailureCountFloor = 0,
+} = {}) {
+  const current = await readUnattendedKeywordRunRequest();
+  if (!current || !isTerminalUnattendedRunStatus(current.status)) {
+    await clearUnattendedLocalClosureRetry();
+    return {persisted: false, reason: 'request_not_terminal'};
+  }
+  const readyMarker = await readUnattendedLocalClosureReadyMarker(
+    current.id,
+    current.attemptId,
+  );
+  if (
+    !unattendedRunRequestsLocalClosureProof(current) &&
+    !readyMarker
+  ) {
+    await clearUnattendedLocalClosureRetry();
+    return {persisted: false, reason: 'local_closure_not_required'};
+  }
+  if (
+    unattendedRunRequestsLocalClosureProof(current) &&
+    !unattendedRunRequiresLocalClosureProof(current)
+  ) {
+    await clearUnattendedLocalClosureRetry();
+    return {persisted: false, reason: 'item_attempt_identity_unknown'};
+  }
+  return await finalizeTerminalUnattendedAttemptExact({
+    requestId: current.id,
+    attemptId: current.attemptId,
+    scheduleRetry: unattendedRunRequiresLocalClosureProof(current),
+    syncOnSuccess: true,
+    retryFailureCountFloor,
+  });
 }
 
 async function snapshotUnattendedKeywordPlanLock() {
@@ -8270,10 +8876,24 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
       previousRunnerTabId: request.runnerTabId,
     };
   });
-  if (
-    result?.accepted &&
-    isTerminalUnattendedRunStatus(result.data?.status)
-  ) {
+  const exactTerminalResult = Boolean(
+    isTerminalUnattendedRunStatus(result?.data?.status) &&
+      String(result?.data?.id || '').trim() === String(requestId || '').trim() &&
+      String(result?.data?.attemptId || '').trim() ===
+        String(attemptId || '').trim() &&
+      (result?.accepted === true || result?.reason === 'terminal'),
+  );
+  if (exactTerminalResult) {
+    // Arm the durable wake-up before any cleanup await. Only cloud attempts
+    // carrying an exact server fence need proof/retry; local schedules use the
+    // sidebar's flush-ready nudge and never enter the proof retry loop.
+    if (unattendedRunRequiresLocalClosureProof(result.data)) {
+      await scheduleUnattendedLocalClosureRetry({
+        requestId: result.data.id,
+        attemptId: result.data.attemptId,
+        delayMs: 250,
+      });
+    }
     const terminalCleanup = await cleanupTerminalUnattendedRuntime(
       result.data,
       [result.previousRunnerTabId, result.data?.progress?.runnerTabId],
@@ -9332,11 +9952,11 @@ async function prepareUnattendedManualRecoverySource(requestId = '') {
     return {ready: false, reason: 'not_recoverable', request: current};
   }
 
-  await cleanupTerminalUnattendedRuntime(current);
-  const closure = await reconcileUnattendedLocalClosureEvidence({
-    expectedRequestId: current.id,
-    expectedAttemptId: current.attemptId,
-    closeOwnedRunnerTabs: true,
+  const closure = await finalizeTerminalUnattendedAttemptExact({
+    requestId: current.id,
+    attemptId: current.attemptId,
+    scheduleRetry: true,
+    syncOnSuccess: false,
   });
   const locallyClosed = await readUnattendedKeywordRunRequest();
   let closureKey = buildUnattendedLocalClosureKeyFromRequest(locallyClosed);
@@ -13431,6 +14051,7 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
   }
   resetObservedAccounts
     .then(() => ensureRuntimeState())
+    .then(() => retryCurrentTerminalUnattendedLocalClosure())
     .catch((error) => {
       console.error('[onstarvoice] failed to initialize runtime on install', error);
     });
@@ -13450,9 +14071,11 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  ensureRuntimeState().catch((error) => {
-    console.error('[onstarvoice] failed to initialize runtime on startup', error);
-  });
+  ensureRuntimeState()
+    .then(() => retryCurrentTerminalUnattendedLocalClosure())
+    .catch((error) => {
+      console.error('[onstarvoice] failed to initialize runtime on startup', error);
+    });
   syncUnattendedSupervisorAlarm()
     .then(() =>
       superviseUnattendedKeywordRun({
@@ -13472,6 +14095,36 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm?.name === UNATTENDED_LOCAL_CLOSURE_ALARM_NAME) {
+    retryCurrentTerminalUnattendedLocalClosure({
+      retryFailureCountFloor:
+        UNATTENDED_LOCAL_CLOSURE_ALARM_RETRY_FLOOR,
+    }).catch(async (error) => {
+      console.error('[onstarvoice] unattended local closure retry failed', error);
+      try {
+        const current = await readUnattendedKeywordRunRequest();
+        if (
+          current &&
+          isTerminalUnattendedRunStatus(current.status) &&
+          unattendedRunRequiresLocalClosureProof(current)
+        ) {
+          await scheduleUnattendedLocalClosureRetry({
+            requestId: current.id,
+            attemptId: current.attemptId,
+            failureReason: 'unexpected_finalize_error',
+            failureCountFloor:
+              UNATTENDED_LOCAL_CLOSURE_ALARM_RETRY_FLOOR,
+          });
+        }
+      } catch (rearmError) {
+        console.error(
+          '[onstarvoice] unattended local closure retry re-arm failed',
+          rearmError,
+        );
+      }
+    });
+    return;
+  }
   if (alarm?.name === CLOUD_TASK_AGENT_ALARM_NAME) {
     syncCloudTaskAgentLiveness({reason: 'cloud_agent_alarm'}).catch((error) => {
       console.error('[onstarvoice] cloud task agent liveness failed', error);
@@ -13498,7 +14151,24 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.storage.onChanged?.addListener?.((changes, areaName) => {
-  if (areaName !== 'local' || !changes[STORAGE_KEYS.auth]) return;
+  if (areaName !== 'local') return;
+  const readyMarkerChange = Object.entries(changes).find(
+    ([key, change]) =>
+      key.startsWith(UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX) &&
+      change?.newValue,
+  );
+  if (readyMarkerChange) {
+    const marker = readyMarkerChange[1]?.newValue;
+    finalizeTerminalUnattendedAttemptExact({
+      requestId: String(marker?.requestId || '').trim(),
+      attemptId: String(marker?.attemptId || '').trim(),
+      scheduleRetry: true,
+      syncOnSuccess: true,
+    }).catch((error) => {
+      console.error('[onstarvoice] flush-ready closure nudge failed', error);
+    });
+  }
+  if (!changes[STORAGE_KEYS.auth]) return;
   const previousAgentId = String(
     changes[STORAGE_KEYS.auth]?.oldValue?.captureAgent?.id || '',
   );
@@ -13923,18 +14593,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:finalize-unattended-local-closure') {
-        const result = await reconcileUnattendedLocalClosureEvidence({
-          expectedRequestId: String(message?.requestId || '').trim(),
-          expectedAttemptId: String(message?.attemptId || '').trim(),
-          closeOwnedRunnerTabs: true,
-        });
-        if (result?.persisted === true) {
-          scheduleCloudTaskAgentSync('unattended_local_closure_persisted', 0);
+        const requestId = String(message?.requestId || '').trim();
+        const attemptId = String(message?.attemptId || '').trim();
+        if (message?.flushReady === true) {
+          const marker = await persistUnattendedLocalClosureReadyMarker({
+            requestId,
+            attemptId,
+            readyAt: String(message?.readyAt || '').trim(),
+          });
+          if (!marker.persisted) {
+            sendResponse({
+              ok: false,
+              accepted: false,
+              reason: marker.reason || 'checkpoint_flush_not_ready',
+              data: null,
+            });
+            return;
+          }
         }
+        const result = await finalizeTerminalUnattendedAttemptExact({
+          requestId,
+          attemptId,
+          scheduleRetry: true,
+          syncOnSuccess: true,
+        });
+        const accepted = Boolean(
+          result?.persisted === true ||
+          result?.reason === 'already_persisted' ||
+          result?.reason === 'local_closure_not_required',
+        );
         sendResponse({
-          ok: result?.persisted === true || result?.reason === 'already_persisted',
-          accepted:
-            result?.persisted === true || result?.reason === 'already_persisted',
+          ok: accepted,
+          accepted,
           reason: result?.reason || 'local_closure_unavailable',
           data: result?.evidence || null,
         });

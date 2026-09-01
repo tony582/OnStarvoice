@@ -3,12 +3,27 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.3',
+  latestVersion: '0.4.4',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-09-01',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.3-20260901.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.4-20260901.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.4',
+      releaseDate: '2026-09-01',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '任务完成后自动释放并继续领取下一条',
+              desc: '将完成、失败和取消后的本地资源清理、关闭证明、云端回传与重试收进 Extension 后台可靠闭环；即使运行页消息丢失或后台休眠，节点也会按精确 request/attempt 自愈，不再完成一条后停止分配。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.3',
       releaseDate: '2026-09-01',

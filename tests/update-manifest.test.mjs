@@ -30,7 +30,7 @@ test('extension update manifest matches the packaged source version', () => {
   assert.equal(OPS_CONTROL_RUNTIME_BASELINE_VERSION, manifest.version);
   assert.match(
     JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases[0]?.releaseNotes),
-    /安全验证后的关键词可以真正自动接力[\s\S]*本地关闭证明/u,
+    /任务完成后自动释放并继续领取下一条[\s\S]*可靠闭环/u,
   );
   assert.match(
     aboutHtml,

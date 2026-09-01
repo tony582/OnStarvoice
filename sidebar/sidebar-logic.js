@@ -1156,6 +1156,20 @@ const UNATTENDED_PROTECTED_WAIT_TICK_MS = 30 * 1000;
 const UNATTENDED_CONTENT_PROGRESS_MIN_INTERVAL_MS = 1500;
 const UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
 const UNATTENDED_INITIAL_REPORT_RETRY_DELAYS_MS = [0, 500, 1500];
+const UNATTENDED_FINAL_FLUSH_RETRY_DELAYS_MS = Object.freeze([
+  0,
+  250,
+  1000,
+  5000,
+  15000,
+]);
+const UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX =
+  "onstarvoice.unattendedLocalClosureReady.v1.";
+const UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX =
+  "onstarvoice.unattendedFinalFlushIntent.v1.";
+const UNATTENDED_LOCAL_CLOSURE_READY_VERSION = 1;
+const UNATTENDED_FINAL_FLUSH_INTENT_VERSION = 1;
+const UNATTENDED_FINAL_FLUSH_RETRY_DELAY_MS = 30 * 1000;
 const UNATTENDED_TERMINAL_CONFIRM_RETRY_MAX_MS = 30 * 1000;
 const UNATTENDED_RUNTIME_MESSAGE_TIMEOUT_MS = 10 * 1000;
 const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 4;
@@ -1232,6 +1246,7 @@ const KEYWORD_PLAN_STATUS_LABELS = {
 };
 const KEYWORD_PLAN_TERMINAL_STATUSES = new Set([
   "completed",
+  "completed_with_warnings",
   "completed_with_failures",
   "needs_action",
   "failed",
@@ -1399,6 +1414,8 @@ let keywordPlanReconcileTimer = null;
 let keywordPlanReconcileInFlight = false;
 let keywordPlanProgressCountdownTimer = null;
 let keywordPlanProgressCountdownToken = 0;
+const unattendedFinalFlushRetryTimersByIdentity = new Map();
+const unattendedFinalFlushInFlightByIdentity = new Map();
 
 function createEmptyKeywordInsightState() {
   return {
@@ -2996,6 +3013,18 @@ function setupKeywordPlanStorageListener() {
         changes[TARGETED_POST_RUN_REQUEST_STORAGE_KEY].newValue || null;
       handleTargetedPostRunRequestStorageChange(request);
     }
+    if (
+      Object.keys(changes || {}).some((key) =>
+        key.startsWith(UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX),
+      )
+    ) {
+      void reconcilePendingUnattendedFinalFlushIntents().catch((error) => {
+        console.warn(
+          "[Sidebar] Reconcile unattended final flush intents failed:",
+          error,
+        );
+      });
+    }
   });
 }
 
@@ -3163,6 +3192,12 @@ export async function initSidebar() {
   // 初始化所有状态
   await initAllStates();
   void flushPendingUnattendedCheckpointReports({quiet: true});
+  void reconcilePendingUnattendedFinalFlushIntents().catch((error) => {
+    console.warn(
+      "[Sidebar] Restore unattended final checkpoint flush failed:",
+      error,
+    );
+  });
   connectCaptureTaskOwnerPort();
   syncCaptureTaskOwnerFromRuntime(getCurrentRuntime() || {});
 
@@ -15148,6 +15183,448 @@ function flushPendingUnattendedCheckpointReports({quiet = false} = {}) {
   return unattendedCheckpointOutboxFlushPromise;
 }
 
+function buildUnattendedLocalClosureReadyStorageKey(
+  requestId = "",
+  attemptId = "",
+) {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  return normalizedRequestId && normalizedAttemptId
+    ? `${UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX}` +
+        `${normalizedRequestId}.${normalizedAttemptId}`
+    : "";
+}
+
+function buildUnattendedFinalFlushIntentStorageKey(
+  requestId = "",
+  attemptId = "",
+) {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  return normalizedRequestId && normalizedAttemptId
+    ? `${UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX}` +
+        `${normalizedRequestId}.${normalizedAttemptId}`
+    : "";
+}
+
+function unattendedFinalFlushIdentity(requestId = "", attemptId = "") {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  return normalizedRequestId && normalizedAttemptId
+    ? `${normalizedRequestId}:${normalizedAttemptId}`
+    : "";
+}
+
+async function setUnattendedLocalClosureControlState(values) {
+  try {
+    await chrome.storage.local.set(values);
+  } catch (error) {
+    if (!isStorageQuotaError(error)) throw error;
+    await releaseControlStorageReserve();
+    await chrome.storage.local.set(values);
+    void ensureControlStorageReserve();
+  }
+}
+
+function clearUnattendedFinalFlushRetryTimer(identity = "") {
+  const normalizedIdentity = String(identity || "").trim();
+  const timer = unattendedFinalFlushRetryTimersByIdentity.get(normalizedIdentity);
+  if (timer) clearTimeout(timer);
+  unattendedFinalFlushRetryTimersByIdentity.delete(normalizedIdentity);
+}
+
+function scheduleUnattendedFinalFlushRetry({
+  requestId,
+  attemptId,
+  failureCount = 0,
+  nextRetryAt = "",
+} = {}) {
+  const identity = unattendedFinalFlushIdentity(requestId, attemptId);
+  if (!identity || unattendedFinalFlushRetryTimersByIdentity.has(identity)) {
+    return false;
+  }
+  const scheduledAt = Date.parse(String(nextRetryAt || ""));
+  const delayMs = Number.isFinite(scheduledAt)
+    ? Math.max(250, scheduledAt - Date.now())
+    : UNATTENDED_FINAL_FLUSH_RETRY_DELAY_MS;
+  const timer = setTimeout(async () => {
+    unattendedFinalFlushRetryTimersByIdentity.delete(identity);
+    try {
+      await finalizeUnattendedLocalClosureAfterFlush(requestId, attemptId, {
+        ensureIntent: false,
+      });
+    } catch (error) {
+      console.warn(
+        "[Sidebar] Retry unattended terminal checkpoint flush failed:",
+        error,
+      );
+      scheduleUnattendedFinalFlushRetry({
+        requestId,
+        attemptId,
+        failureCount: Math.max(0, Number(failureCount) || 0) + 1,
+      });
+    }
+  }, delayMs);
+  unattendedFinalFlushRetryTimersByIdentity.set(identity, timer);
+  return true;
+}
+
+async function ensureUnattendedFinalFlushIntent(requestId, attemptId) {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  const intentKey = buildUnattendedFinalFlushIntentStorageKey(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
+  const markerKey = buildUnattendedLocalClosureReadyStorageKey(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
+  if (!intentKey || !markerKey) {
+    return {ok: false, reason: "attempt_identity_missing"};
+  }
+  const stored = await chrome.storage.local.get([
+    KEYWORD_RUN_REQUEST_STORAGE_KEY,
+    intentKey,
+    markerKey,
+  ]);
+  const current = stored?.[KEYWORD_RUN_REQUEST_STORAGE_KEY];
+  if (
+    String(current?.id || "").trim() !== normalizedRequestId ||
+    String(current?.attemptId || "").trim() !== normalizedAttemptId
+  ) {
+    return {ok: false, reason: "attempt_superseded"};
+  }
+  if (
+    !KEYWORD_PLAN_TERMINAL_STATUSES.has(
+      String(current?.status || "").trim().toLowerCase(),
+    )
+  ) {
+    return {ok: false, reason: "request_not_terminal"};
+  }
+  const existingMarker = stored?.[markerKey];
+  const existingIntent = stored?.[intentKey];
+  if (
+    existingMarker?.version === UNATTENDED_LOCAL_CLOSURE_READY_VERSION &&
+    String(existingMarker.requestId || "").trim() === normalizedRequestId &&
+    String(existingMarker.attemptId || "").trim() === normalizedAttemptId
+  ) {
+    return {
+      ok: true,
+      reason: "checkpoint_flush_ready",
+      status: "ready",
+      marker: existingMarker,
+      intent: existingIntent || null,
+    };
+  }
+  if (String(existingIntent?.status || "") === "ready") {
+    return {ok: false, reason: "closure_already_finalized"};
+  }
+  const now = new Date().toISOString();
+  const intent = {
+    version: UNATTENDED_FINAL_FLUSH_INTENT_VERSION,
+    requestId: normalizedRequestId,
+    attemptId: normalizedAttemptId,
+    status: "pending",
+    createdAt: String(existingIntent?.createdAt || now),
+    updatedAt: now,
+    failureCount: Math.max(0, Number(existingIntent?.failureCount) || 0),
+    nextRetryAt: String(existingIntent?.nextRetryAt || ""),
+  };
+  await setUnattendedLocalClosureControlState({[intentKey]: intent});
+  return {ok: true, reason: "checkpoint_flush_pending", status: "pending", intent};
+}
+
+async function recordUnattendedFinalFlushFailure(
+  requestId,
+  attemptId,
+  reason = "checkpoint_flush_failed",
+) {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  const identity = unattendedFinalFlushIdentity(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
+  const intentKey = buildUnattendedFinalFlushIntentStorageKey(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
+  if (!identity || !intentKey) return false;
+  const stored = await chrome.storage.local.get([
+    KEYWORD_RUN_REQUEST_STORAGE_KEY,
+    intentKey,
+  ]);
+  const current = stored?.[KEYWORD_RUN_REQUEST_STORAGE_KEY];
+  const intent = stored?.[intentKey];
+  if (
+    String(current?.id || "").trim() !== normalizedRequestId ||
+    String(current?.attemptId || "").trim() !== normalizedAttemptId ||
+    !KEYWORD_PLAN_TERMINAL_STATUSES.has(
+      String(current?.status || "").trim().toLowerCase(),
+    ) ||
+    String(intent?.status || "") !== "pending"
+  ) {
+    clearUnattendedFinalFlushRetryTimer(identity);
+    return false;
+  }
+  const failureCount = Math.max(0, Number(intent.failureCount) || 0) + 1;
+  const nextRetryAt = new Date(
+    Date.now() + UNATTENDED_FINAL_FLUSH_RETRY_DELAY_MS,
+  ).toISOString();
+  const nextIntent = {
+    ...intent,
+    status: "pending",
+    failureCount,
+    failureReason: String(reason || "checkpoint_flush_failed"),
+    nextRetryAt,
+    updatedAt: new Date().toISOString(),
+  };
+  await setUnattendedLocalClosureControlState({[intentKey]: nextIntent});
+  clearUnattendedFinalFlushRetryTimer(identity);
+  scheduleUnattendedFinalFlushRetry({
+    requestId: normalizedRequestId,
+    attemptId: normalizedAttemptId,
+    failureCount,
+    nextRetryAt,
+  });
+  return true;
+}
+
+async function persistUnattendedLocalClosureReadyMarker(
+  requestId,
+  attemptId,
+) {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  const key = buildUnattendedLocalClosureReadyStorageKey(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
+  const intentKey = buildUnattendedFinalFlushIntentStorageKey(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
+  if (!key || !intentKey) {
+    return {ok: false, reason: "attempt_identity_missing"};
+  }
+  const stored = await chrome.storage.local.get(
+    KEYWORD_RUN_REQUEST_STORAGE_KEY,
+  );
+  const current = stored?.[KEYWORD_RUN_REQUEST_STORAGE_KEY];
+  if (
+    String(current?.id || "").trim() !== normalizedRequestId ||
+    String(current?.attemptId || "").trim() !== normalizedAttemptId
+  ) {
+    return {ok: false, reason: "attempt_superseded"};
+  }
+  if (
+    !KEYWORD_PLAN_TERMINAL_STATUSES.has(
+      String(current?.status || "").trim().toLowerCase(),
+    )
+  ) {
+    return {ok: false, reason: "request_not_terminal"};
+  }
+  const marker = {
+    version: UNATTENDED_LOCAL_CLOSURE_READY_VERSION,
+    requestId: normalizedRequestId,
+    attemptId: normalizedAttemptId,
+    readyAt: new Date().toISOString(),
+  };
+  await setUnattendedLocalClosureControlState({
+    [key]: marker,
+    [intentKey]: {
+      version: UNATTENDED_FINAL_FLUSH_INTENT_VERSION,
+      requestId: normalizedRequestId,
+      attemptId: normalizedAttemptId,
+      status: "ready",
+      readyAt: marker.readyAt,
+      updatedAt: marker.readyAt,
+    },
+  });
+  await chrome.storage.local.remove(intentKey);
+  clearUnattendedFinalFlushRetryTimer(
+    unattendedFinalFlushIdentity(
+      normalizedRequestId,
+      normalizedAttemptId,
+    ),
+  );
+  return {ok: true, reason: "checkpoint_flush_ready", marker};
+}
+
+async function finalizeUnattendedLocalClosureAfterFlush(
+  requestId,
+  attemptId,
+  {ensureIntent = true} = {},
+) {
+  const normalizedRequestId = String(requestId || "").trim();
+  const normalizedAttemptId = String(attemptId || "").trim();
+  const identity = unattendedFinalFlushIdentity(
+    normalizedRequestId,
+    normalizedAttemptId,
+  );
+  if (!identity) {
+    return {ok: false, reason: "attempt_identity_missing"};
+  }
+  const existing = unattendedFinalFlushInFlightByIdentity.get(identity);
+  if (existing) return await existing;
+  const finalize = async () => {
+    let intentState = null;
+    if (ensureIntent) {
+      intentState = await ensureUnattendedFinalFlushIntent(
+        normalizedRequestId,
+        normalizedAttemptId,
+      );
+      if (!intentState.ok) return intentState;
+    } else {
+      const intentKey = buildUnattendedFinalFlushIntentStorageKey(
+        normalizedRequestId,
+        normalizedAttemptId,
+      );
+      const markerKey = buildUnattendedLocalClosureReadyStorageKey(
+        normalizedRequestId,
+        normalizedAttemptId,
+      );
+      const stored = await chrome.storage.local.get([intentKey, markerKey]);
+      intentState = {
+        ok: Boolean(stored?.[intentKey]),
+        status: String(stored?.[intentKey]?.status || ""),
+        intent: stored?.[intentKey] || null,
+        marker: stored?.[markerKey] || null,
+        reason: stored?.[intentKey]
+          ? "checkpoint_flush_pending"
+          : "flush_intent_missing",
+      };
+      if (!intentState.ok) return intentState;
+    }
+
+    let ready = null;
+    if (intentState.status === "ready" && intentState.marker) {
+      ready = {
+        ok: true,
+        reason: "checkpoint_flush_ready",
+        marker: intentState.marker,
+      };
+    } else {
+      let flushResult = null;
+      for (const delayMs of UNATTENDED_FINAL_FLUSH_RETRY_DELAYS_MS) {
+        if (delayMs > 0) await sleep(delayMs);
+        flushResult = await flushPendingUnattendedCheckpointReports({quiet: true});
+        if (
+          flushResult?.ok === true &&
+          Number(flushResult?.retained || 0) === 0
+        ) {
+          break;
+        }
+      }
+      if (
+        flushResult?.ok !== true ||
+        Number(flushResult?.retained || 0) !== 0
+      ) {
+        const reason = String(
+          flushResult?.reason || "checkpoint_flush_failed",
+        );
+        await recordUnattendedFinalFlushFailure(
+          normalizedRequestId,
+          normalizedAttemptId,
+          reason,
+        );
+        return {ok: false, reason, pending: true};
+      }
+      ready = await persistUnattendedLocalClosureReadyMarker(
+        normalizedRequestId,
+        normalizedAttemptId,
+      );
+      if (!ready.ok) return ready;
+    }
+
+    let response = null;
+    for (const delayMs of UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS) {
+      if (delayMs > 0) await sleep(delayMs);
+      try {
+        response = await sendUnattendedRuntimeMessage({
+          type: "onstarvoice:finalize-unattended-local-closure",
+          requestId: normalizedRequestId,
+          attemptId: normalizedAttemptId,
+          flushReady: true,
+          readyAt: ready.marker.readyAt,
+        });
+        if (response?.accepted === true || response?.ok === true) break;
+        if (
+          ["attempt_superseded", "request_not_terminal"].includes(
+            String(response?.reason || ""),
+          )
+        ) {
+          break;
+        }
+      } catch {
+        // The durable marker and storage change event are the authoritative
+        // recovery path. This message only nudges a currently awake worker.
+      }
+    }
+    return response || ready;
+  };
+  const inFlight = finalize().finally(() => {
+    if (
+      unattendedFinalFlushInFlightByIdentity.get(identity) === inFlight
+    ) {
+      unattendedFinalFlushInFlightByIdentity.delete(identity);
+    }
+  });
+  unattendedFinalFlushInFlightByIdentity.set(identity, inFlight);
+  return await inFlight;
+}
+
+async function reconcilePendingUnattendedFinalFlushIntents() {
+  const stored = await chrome.storage.local.get(null);
+  const current = stored?.[KEYWORD_RUN_REQUEST_STORAGE_KEY];
+  const currentRequestId = String(current?.id || "").trim();
+  const currentAttemptId = String(current?.attemptId || "").trim();
+  const currentTerminal = KEYWORD_PLAN_TERMINAL_STATUSES.has(
+    String(current?.status || "").trim().toLowerCase(),
+  );
+  const staleKeys = [];
+  for (const [key, intent] of Object.entries(stored || {})) {
+    if (!key.startsWith(UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX)) {
+      continue;
+    }
+    const requestId = String(intent?.requestId || "").trim();
+    const attemptId = String(intent?.attemptId || "").trim();
+    const identity = unattendedFinalFlushIdentity(requestId, attemptId);
+    if (
+      !identity ||
+      !currentTerminal ||
+      requestId !== currentRequestId ||
+      attemptId !== currentAttemptId
+    ) {
+      staleKeys.push(key);
+      clearUnattendedFinalFlushRetryTimer(identity);
+      continue;
+    }
+    if (String(intent?.status || "") === "ready") {
+      const markerKey = buildUnattendedLocalClosureReadyStorageKey(
+        requestId,
+        attemptId,
+      );
+      if (stored?.[markerKey]) {
+        void finalizeUnattendedLocalClosureAfterFlush(requestId, attemptId, {
+          ensureIntent: false,
+        });
+      }
+      continue;
+    }
+    scheduleUnattendedFinalFlushRetry({
+      requestId,
+      attemptId,
+      failureCount: intent?.failureCount,
+      nextRetryAt: intent?.nextRetryAt,
+    });
+  }
+  if (staleKeys.length > 0) {
+    await chrome.storage.local.remove(staleKeys);
+  }
+}
+
 async function reportInitialUnattendedKeywordRun(
   requestId,
   patch = {},
@@ -17372,6 +17849,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
   let claimedRequestId = requestId;
   let claimedAttemptId = "";
   let claimedAdoptedLockId = "";
+  let claimedRunAccepted = false;
   let claimedExecutionCopy = getKeywordExecutionCopy();
   try {
     const response = await chrome.runtime.sendMessage({
@@ -17413,6 +17891,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     claimedExecutionCopy = getKeywordExecutionCopy(response.data);
     claimedRequestId = String(response.data.id || requestId || "").trim();
     claimedAttemptId = String(response.data?.attemptId || "").trim();
+    claimedRunAccepted = Boolean(claimedRequestId && claimedAttemptId);
     activateUnattendedRunRequest(response.data);
     if (response.lock && adoptUnattendedCaptureExecutionLock(response.lock)) {
       claimedAdoptedLockId = String(response.lock.id || "").trim();
@@ -17460,18 +17939,21 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     ) {
       await releaseCaptureExecutionLock(claimedAdoptedLockId);
     }
-    // Closure is a separate, fail-closed phase after terminal persistence,
-    // task-session cleanup and lock release. Drain this attempt's durable
-    // checkpoints before asking background to close the exact task runner and
-    // attest that no task-owned browser resource remains.
-    await flushPendingUnattendedCheckpointReports({quiet: true}).catch(
-      () => null,
-    );
-    await sendUnattendedRuntimeMessage({
-      type: "onstarvoice:finalize-unattended-local-closure",
-      requestId: claimedRequestId,
-      attemptId: claimedAttemptId,
-    }).catch(() => null);
+    // The exact attempt first drains every durable checkpoint and then writes
+    // a storage-backed flush-ready marker. Background may close only this
+    // runner after seeing that marker; cloud-fenced runs additionally persist
+    // proof, while local schedules stop after safe runner cleanup.
+    if (claimedRunAccepted) {
+      await finalizeUnattendedLocalClosureAfterFlush(
+        claimedRequestId,
+        claimedAttemptId,
+      ).catch((error) => {
+        console.warn(
+          "[Sidebar] Final unattended checkpoint closure remains pending:",
+          error,
+        );
+      });
+    }
   }
 }
 

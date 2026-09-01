@@ -93,6 +93,7 @@ function createHarness() {
   const cloudCommandCompletions = [];
   const cloudHeartbeats = [];
   const alarmDefinitions = new Map();
+  const alarmCreateHistory = [];
   const missingTabIds = new Set();
   let uuidCounter = 0;
   let contextMode = "alive";
@@ -198,6 +199,7 @@ function createHarness() {
         return true;
       },
       async create(name, options) {
+        alarmCreateHistory.push({name, options: {...options}});
         alarmDefinitions.set(name, {...options});
       },
     },
@@ -498,6 +500,7 @@ function createHarness() {
     api: context.__captureLockTestApi,
     chrome,
     alarmDefinitions,
+    alarmCreateHistory,
     createdTabs,
     cloudCommandCompletions,
     cloudHeartbeats,
@@ -581,6 +584,17 @@ function createHarness() {
       }
       await context.__captureLockTestApi.flushUnattended();
     },
+    async fireAlarm(name) {
+      // One-shot Chrome alarms are removed before their listener runs. Mirror
+      // that lifecycle so a retry has to arm a fresh durable wake-up.
+      alarmDefinitions.delete(name);
+      await Promise.all(
+        chrome.alarms.onAlarm.listeners.map((listener) =>
+          listener({name}),
+        ),
+      );
+      await context.__captureLockTestApi.flushUnattended();
+    },
     storage,
   };
 }
@@ -594,6 +608,10 @@ const TASK_LEDGER_KEY = "onstarvoice.taskLedger";
 const SYNC_HISTORY_KEY = "onstarvoice.sync_history";
 const UNATTENDED_OUTBOX_PREFIX =
   "onstarvoice.unattendedCheckpointReportOutbox.v2.";
+const UNATTENDED_LOCAL_CLOSURE_READY_PREFIX =
+  "onstarvoice.unattendedLocalClosureReady.v1.";
+const UNATTENDED_LOCAL_CLOSURE_ALARM =
+  "onstarvoice:unattended-local-closure";
 const CONTROL_STORAGE_RESERVE_KEY =
   "onstarvoice.controlStorageReserve";
 const CONTROL_STORAGE_RESERVE_BYTES = 64 * 1024;
@@ -772,6 +790,7 @@ function seedTerminalUnattendedClosureCandidate(harness, overrides = {}) {
     progress,
     orchestrationContext: {
       parentTaskId: "parent-task",
+      requiresLocalClosureReuseFenceV1: true,
       itemAttempts: [{
         itemId: "item-1",
         attemptId: "item-attempt-1",
@@ -806,6 +825,31 @@ function seedTerminalUnattendedClosureCandidate(harness, overrides = {}) {
     }],
     updatedAt: now,
   };
+  return request;
+}
+
+function seedUnattendedLocalClosureReadyMarker(harness, request) {
+  const readyAt = new Date().toISOString();
+  const key =
+    `${UNATTENDED_LOCAL_CLOSURE_READY_PREFIX}${request.id}.${request.attemptId}`;
+  harness.storage[key] = {
+    version: 1,
+    requestId: request.id,
+    attemptId: request.attemptId,
+    readyAt,
+  };
+  return {key, readyAt};
+}
+
+function seedRunningUnattendedClosureCandidate(harness, overrides = {}) {
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    status: "running",
+    ...overrides,
+  });
+  delete request.finishedAt;
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs[0];
+  ledgerRun.status = "running";
+  delete ledgerRun.finishedAt;
   return request;
 }
 
@@ -884,6 +928,7 @@ test("a safety-terminal heartbeat rebuilds local closure from the authoritative 
     orchestrationContext: {
       parentTaskId: "safety-parent-task",
       revision: 3,
+      requiresLocalClosureReuseFenceV1: true,
       itemIds: ["safety-item"],
       itemAttempts: [{
         itemId: "safety-item",
@@ -894,6 +939,7 @@ test("a safety-terminal heartbeat rebuilds local closure from the authoritative 
       attemptIdentity: "safety-item-attempt",
     },
   });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {id: "agent-safe", token: "secret-safe"},
   };
@@ -969,6 +1015,7 @@ test("a later heartbeat retries exact safety-terminal lock cleanup before report
     attemptId: "stranded-safety-attempt",
     runnerTabId: 312,
   });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
   const taskId = `unattended-capture:${request.id}`;
   harness.storage[LOCK_KEY] = {
     id: "stranded-safety-lock",
@@ -1458,6 +1505,7 @@ test("manual orchestration recovery does not replace its source when exact clean
       }],
     },
   });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {id: "agent-safe", token: "secret-safe"},
   };
@@ -1508,6 +1556,7 @@ test("manual orchestration recovery does not replace its source until the exact 
       }],
     },
   });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {id: "agent-safe", token: "secret-safe"},
   };
@@ -1555,6 +1604,7 @@ test("manual orchestration recovery waits for atomic adoption receipt and later 
       }],
     },
   });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {id: "agent-safe", token: "secret-safe"},
   };
@@ -1695,6 +1745,7 @@ test("manual orchestration recovery stays dormant when another agent wins adopti
       }],
     },
   });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {id: "agent-safe", token: "secret-safe"},
   };
@@ -2044,6 +2095,296 @@ test("unacknowledged checkpoint outbox rows keep the exact runner alive", async 
   assert.equal(result.persisted, false);
   assert.equal(result.reason, "checkpoint_reports_pending");
   assert.deepEqual(harness.removedTabIds, []);
+});
+
+test("a local non-fenced terminal run never schedules or persists cloud local-closure proof", async () => {
+  const harness = createHarness();
+  const request = seedRunningUnattendedClosureCandidate(harness, {
+    id: "local-terminal-request",
+    attemptId: "local-terminal-attempt",
+    cloudAssigned: false,
+    orchestrationContext: {
+      parentTaskId: "local-parent-task",
+      itemAttempts: [{
+        itemId: "local-item-1",
+        attemptId: "local-item-attempt-1",
+        attemptNumber: 1,
+        assignmentRevision: 0,
+      }],
+    },
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {status: "completed", message: "采集完成"},
+  });
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  assert.equal(result.data.status, "completed");
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  assert.equal(
+    harness.alarmCreateHistory.some(
+      ({name}) => name === UNATTENDED_LOCAL_CLOSURE_ALARM,
+    ),
+    false,
+    "a local run incorrectly armed the cloud local-closure retry",
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence,
+    undefined,
+  );
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure,
+    undefined,
+  );
+});
+
+test("a fenced terminal run without a durable flush-ready marker keeps its runner alive and retries", async () => {
+  const harness = createHarness();
+  const request = seedRunningUnattendedClosureCandidate(harness, {
+    id: "flush-marker-pending-request",
+    attemptId: "flush-marker-pending-attempt",
+    cloudAssigned: true,
+    runnerTabId: 181,
+  });
+  const runnerUrl =
+    "chrome-extension://test/sidebar/sidebar.html" +
+    `?unattendedRun=${request.id}&unattendedAttempt=${request.attemptId}`;
+  harness.setTabQueryHandler(async () =>
+    harness.removedTabIds.includes(181)
+      ? []
+      : [{id: 181, url: runnerUrl}],
+  );
+  harness.setTabGetHandler(async (tabId) => ({id: tabId, url: runnerUrl}));
+
+  const result = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {status: "completed", message: "采集完成，等待 flush seal"},
+  });
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  assert.equal(
+    harness.alarmCreateHistory.some(
+      ({name}) => name === UNATTENDED_LOCAL_CLOSURE_ALARM,
+    ),
+    true,
+    "fenced terminal did not arm local-closure retry",
+  );
+  const alarmCountBeforeRetry = harness.alarmCreateHistory.filter(
+    ({name}) => name === UNATTENDED_LOCAL_CLOSURE_ALARM,
+  ).length;
+  await harness.fireAlarm(UNATTENDED_LOCAL_CLOSURE_ALARM);
+  await waitFor(
+    () =>
+      harness.alarmCreateHistory.filter(
+        ({name}) => name === UNATTENDED_LOCAL_CLOSURE_ALARM,
+      ).length > alarmCountBeforeRetry,
+    "missing marker did not re-arm local-closure retry",
+    {attempts: 100, delayMs: 10},
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence,
+    undefined,
+  );
+  assert.deepEqual(harness.removedTabIds, []);
+});
+
+test("a durable flush-ready marker lets an alarm finish closure after the finalize message is lost", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "alarm-marker-recovery-request",
+    attemptId: "alarm-marker-recovery-attempt",
+    cloudAssigned: true,
+    runnerTabId: 191,
+  });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
+  const runnerUrl =
+    "chrome-extension://test/sidebar/sidebar.html" +
+    `?unattendedRun=${request.id}&unattendedAttempt=${request.attemptId}`;
+  harness.setTabQueryHandler(async () =>
+    harness.removedTabIds.includes(191)
+      ? []
+      : [{id: 191, url: runnerUrl}],
+  );
+  harness.setTabGetHandler(async (tabId) => ({id: tabId, url: runnerUrl}));
+
+  // The runner persisted the marker, but its best-effort finalize message was
+  // lost. The dedicated one-shot alarm must recover solely from durable state.
+  await harness.fireAlarm(UNATTENDED_LOCAL_CLOSURE_ALARM);
+  await waitFor(
+    () =>
+      harness.storage[UNATTENDED_REQUEST_KEY]?.localClosureEvidence
+        ?.attemptId === request.attemptId,
+    "durable marker was not recovered by the alarm",
+    {attempts: 100, delayMs: 10},
+  );
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure.attemptId,
+    request.attemptId,
+  );
+  assert.deepEqual(harness.removedTabIds, [191]);
+});
+
+test("startup recovers a fenced terminal closure from its durable flush-ready marker", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "startup-marker-recovery-request",
+    attemptId: "startup-marker-recovery-attempt",
+    cloudAssigned: true,
+  });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
+  harness.setTabQueryHandler(async () => []);
+
+  for (const listener of harness.chrome.runtime.onStartup.listeners) {
+    listener();
+  }
+
+  await waitFor(
+    () =>
+      harness.storage[UNATTENDED_REQUEST_KEY]?.localClosureEvidence
+        ?.attemptId === request.attemptId,
+    "startup did not recover the exact durable closure marker",
+    {attempts: 100, delayMs: 10},
+  );
+});
+
+test("a later heartbeat recognizes persisted closure without recreating its retry alarm", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "persisted-closure-heartbeat-request",
+    attemptId: "persisted-closure-heartbeat-attempt",
+    cloudAssigned: true,
+  });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-safe", token: "secret-safe"},
+  };
+  harness.setTabQueryHandler(async () => []);
+
+  await harness.fireAlarm(UNATTENDED_LOCAL_CLOSURE_ALARM);
+  await waitFor(
+    () =>
+      harness.storage[UNATTENDED_REQUEST_KEY]?.localClosureEvidence
+        ?.attemptId === request.attemptId,
+    "initial closure proof was not persisted",
+    {attempts: 100, delayMs: 10},
+  );
+  harness.alarmCreateHistory.length = 0;
+
+  const heartbeat = await harness.api.syncCloudTaskAgent({
+    reason: "persisted_closure_heartbeat",
+    force: true,
+  });
+
+  assert.equal(heartbeat.ok, true, JSON.stringify(heartbeat));
+  assert.equal(
+    harness.alarmCreateHistory.some(
+      ({name}) => name === UNATTENDED_LOCAL_CLOSURE_ALARM,
+    ),
+    false,
+    "persisted proof incorrectly restarted the closure retry loop",
+  );
+});
+
+test("a late finalizer for attempt A cannot cancel or overwrite attempt B closure", async () => {
+  const harness = createHarness();
+  const request = seedRunningUnattendedClosureCandidate(harness, {
+    id: "scheduled-superseded-closure-request",
+    attemptId: "scheduled-superseded-closure-attempt-1",
+    cloudAssigned: true,
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  const terminal = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {status: "completed", message: "旧 attempt 完成"},
+  });
+  assert.equal(terminal.accepted, true, JSON.stringify(terminal));
+
+  const nextAttemptId = "scheduled-superseded-closure-attempt-2";
+  const successor = seedTerminalUnattendedClosureCandidate(harness, {
+    id: request.id,
+    attemptId: nextAttemptId,
+    attemptNumber: 2,
+    previousAttemptId: request.attemptId,
+    cloudAssigned: true,
+  });
+  seedUnattendedLocalClosureReadyMarker(harness, successor);
+
+  const lateA = await harness.sendBackgroundMessage({
+    type: "onstarvoice:finalize-unattended-local-closure",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    flushReady: true,
+  });
+  assert.equal(lateA.ok, false, JSON.stringify(lateA));
+
+  await harness.fireAlarm(UNATTENDED_LOCAL_CLOSURE_ALARM);
+  await waitFor(
+    () =>
+      harness.storage[UNATTENDED_REQUEST_KEY]?.localClosureEvidence
+        ?.attemptId === nextAttemptId,
+    "attempt B closure was lost after attempt A finalized late",
+    {attempts: 100, delayMs: 10},
+  );
+  await new Promise((resolve) => setTimeout(resolve, 350));
+
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, nextAttemptId);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence.attemptId,
+    nextAttemptId,
+  );
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure.attemptId,
+    nextAttemptId,
+  );
+  assert.equal(
+    harness.storageSetCalls.some((values) =>
+      values[UNATTENDED_REQUEST_KEY]?.localClosureEvidence?.attemptId ===
+        request.attemptId,
+    ),
+    false,
+    "superseded attempt wrote stale local-closure proof",
+  );
+});
+
+test("a permanent exact-attempt closure failure stops instead of re-arming forever", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "permanent-closure-failure-request",
+    attemptId: "permanent-closure-failure-attempt",
+    cloudAssigned: true,
+  });
+  seedUnattendedLocalClosureReadyMarker(harness, request);
+  harness.storage[TASK_LEDGER_KEY].runs[0] = {
+    ...harness.storage[TASK_LEDGER_KEY].runs[0],
+    attemptId: "different-ledger-attempt",
+  };
+  harness.setTabQueryHandler(async () => []);
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:finalize-unattended-local-closure",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    flushReady: true,
+  });
+
+  assert.equal(response.ok, false, JSON.stringify(response));
+  assert.equal(response.reason, "terminal_ledger_mismatch");
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(
+    harness.alarmDefinitions.has(UNATTENDED_LOCAL_CLOSURE_ALARM),
+    false,
+    "permanent failure incorrectly left a retry alarm armed",
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence,
+    undefined,
+  );
 });
 
 test("an older attempt cannot write closure evidence over the current attempt", async () => {
