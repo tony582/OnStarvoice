@@ -45,7 +45,7 @@ import {
 console.log("[StarVoice V1.0] Content script loaded");
 
 let activeCommentsCaptureRequestId = "";
-const activeCaptureRequestIds = new Set();
+const activeCaptureRequestCounts = new Map();
 let listCaptureInvocationSequence = 0;
 let activeListCaptureDebugOverlay = null;
 const pendingListCaptureCancellations = new Map();
@@ -380,6 +380,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponseWithDiagnostics({ok: true, ready: true});
       return false;
 
+    case "inspectCaptureActivity":
+      handleInspectCaptureActivity(request, sendResponseWithDiagnostics);
+      return false;
+
     case "detectPageType":
       handleDetectPageType(sendResponseWithDiagnostics);
       return true;
@@ -484,8 +488,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 function runTrackedCaptureRequest(request, handler) {
   const requestId = String(request?.captureRequestId || "").trim();
   if (requestId) {
-    activeCaptureRequestIds.add(requestId);
+    activeCaptureRequestCounts.set(
+      requestId,
+      Math.max(0, Number(activeCaptureRequestCounts.get(requestId)) || 0) + 1,
+    );
   }
+
+  const releaseRequest = () => {
+    if (!requestId) return;
+    const activeCount = Math.max(
+      0,
+      Number(activeCaptureRequestCounts.get(requestId)) || 0,
+    );
+    if (activeCount <= 1) {
+      activeCaptureRequestCounts.delete(requestId);
+      return;
+    }
+    activeCaptureRequestCounts.set(requestId, activeCount - 1);
+  };
 
   let result;
   try {
@@ -493,9 +513,7 @@ function runTrackedCaptureRequest(request, handler) {
     // matching cancel message can interleave with the request startup.
     result = handler();
   } catch (error) {
-    if (requestId) {
-      activeCaptureRequestIds.delete(requestId);
-    }
+    releaseRequest();
     throw error;
   }
 
@@ -504,10 +522,27 @@ function runTrackedCaptureRequest(request, handler) {
       console.error("[Content] Tracked capture handler failed:", error);
     })
     .finally(() => {
-      if (requestId) {
-        activeCaptureRequestIds.delete(requestId);
-      }
+      releaseRequest();
     });
+}
+
+function handleInspectCaptureActivity(request, sendResponse) {
+  const targetRequestId = String(request?.captureRequestId || "").trim();
+  const activeCount = [...activeCaptureRequestCounts.values()].reduce(
+    (total, value) => total + Math.max(0, Number(value) || 0),
+    0,
+  );
+  sendResponse({
+    ok: true,
+    captureRequestId: targetRequestId,
+    targetActive: targetRequestId
+      ? Math.max(
+          0,
+          Number(activeCaptureRequestCounts.get(targetRequestId)) || 0,
+        ) > 0
+      : activeCount > 0,
+    activeCount,
+  });
 }
 
 function reportCaptureProgress(request, progress = {}) {
@@ -2083,7 +2118,11 @@ function handleCancelCapture(request, sendResponse) {
       request?.listCaptureRunId,
     );
     const matched =
-      !targetRequestId || activeCaptureRequestIds.has(targetRequestId);
+      !targetRequestId ||
+      Math.max(
+        0,
+        Number(activeCaptureRequestCounts.get(targetRequestId)) || 0,
+      ) > 0;
     const listCaptureMatched = rememberListCaptureCancellation(listCaptureRunId);
     if (matched || listCaptureMatched) {
       setCancelFlag(true);

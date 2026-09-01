@@ -238,6 +238,7 @@ interface MobileOpsControlSummary {
       observedScheduleCount?: number
       expectedScheduleCount?: number
       recoveredItemCount?: number
+      sourceClosureBlockedCount?: number
       manualBlockerCount?: number
       onlineAgentCount?: number
       registeredAgentCount?: number
@@ -252,6 +253,8 @@ interface MobileOpsControlSummary {
   digest?: { summary?: string } | null
   incidents?: Array<{
     id: string
+    type?: string
+    incident_type?: string
     title: string
     alert_delivery_status?: string
     alert_sent_at?: string
@@ -457,10 +460,15 @@ function MobileOpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatc
   const style = MOBILE_OPS_VERDICT[verdict]
   const summary = run?.summary || {}
   const actionSummary = summary.actions || {}
+  const sourceClosureBlockedCount = Number(summary.sourceClosureBlockedCount || 0)
+  const explicitManualBlockerCount = Number(summary.manualBlockerCount || 0)
   const guarded = data?.mode === 'guarded'
   const actionsEnabled = data?.policy?.actionsEnabled === true
   const firstIncident = data?.incidents?.[0]
-  const alertLabel = firstIncident?.alert_delivery_status === 'sent'
+  const firstIncidentType = firstIncident?.incident_type || firstIncident?.type || ''
+  const alertLabel = firstIncidentType === 'capture_source_closure_blocked'
+    ? '恢复阻塞：等待原 Agent 关闭确认'
+    : firstIncident?.alert_delivery_status === 'sent'
     ? '提醒已发'
     : ['retry_wait', 'blocked_config', 'failed'].includes(firstIncident?.alert_delivery_status || '')
       ? '提醒异常'
@@ -498,10 +506,11 @@ function MobileOpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatc
       </div>
 
       {enabled && run && (
-        <div className="mt-3 grid grid-cols-3 divide-x divide-border rounded-xl bg-muted/45 py-2.5 text-center">
+        <div className="mt-3 grid grid-cols-2 gap-y-3 divide-x divide-border rounded-xl bg-muted/45 py-2.5 text-center">
           <MobileOpsFact label="计划覆盖" value={`${Number(summary.observedScheduleCount || 0)}/${Number(summary.expectedScheduleCount || 0)}`} />
-          <MobileOpsFact label="已自动恢复" value={String(Number(summary.recoveredItemCount || 0))} />
-          <MobileOpsFact label="需人工" value={String(Number(summary.manualBlockerCount || 0))} />
+          <MobileOpsFact label="恢复已完成" value={String(Number(summary.recoveredItemCount || 0))} />
+          <MobileOpsFact label="恢复阻塞" value={String(sourceClosureBlockedCount)} />
+          <MobileOpsFact label="需人工" value={String(explicitManualBlockerCount)} />
         </div>
       )}
 
@@ -530,8 +539,8 @@ function MobileOpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatc
       </div>
 
       <p className="mt-3 border-t border-border/70 pt-2 text-[9.5px] leading-4 text-muted-foreground">
-        {data?.runtimeBaselineVersion || '0.3.91'} 已交付自愈基线 · 未调用 LLM · {actionsEnabled
-          ? '仅执行白名单动作，每次一个目标，并由后续快照验收'
+        {data?.runtimeBaselineVersion || '0.3.91'} 值守与受控恢复基线 · 未调用 LLM · {actionsEnabled
+          ? '仅执行白名单动作；后续快照验收成功后才计为恢复完成'
           : guarded ? '动作门禁尚未全部放行' : '当前只观察、判断和通知'}
       </p>
     </section>

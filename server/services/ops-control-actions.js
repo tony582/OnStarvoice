@@ -21,6 +21,15 @@ const ACTION_TARGET_TYPES = Object.freeze({
 });
 const OPEN_ACTION_STATUSES = new Set(['claimed', 'pending_verification']);
 const RETRYABLE_ACTION_STATUSES = new Set(['failed', 'skipped']);
+const FAILED_TASK_TERMINAL_STATUSES = new Set([
+  'failed',
+  'completed_with_failures',
+]);
+const ABANDONED_TASK_TERMINAL_STATUSES = new Set([
+  'canceled',
+  'skipped',
+  'superseded',
+]);
 
 function object(value) {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
@@ -80,6 +89,9 @@ function beforeFacts(actionType, targetId, snapshot) {
       taskStatus: text(task?.status, 80),
       failureCount: taskFailureCount(task),
       recoveredItemCount: integer(task?.recoveredItemCount),
+      sourceClosureBlockedItemCount: integer(
+        task?.sourceClosureBlockedItemCount,
+      ),
       progressSeq: integer(task?.progressSeq),
       businessProgressAt: task?.businessProgressAt || null,
     };
@@ -176,6 +188,52 @@ export function verifyOpsControlAction(action, snapshot, {now = new Date()} = {}
   const task = taskById(snapshot, targetId);
   if (!task) return pending({reason: expired ? 'task_missing_at_deadline' : 'task_not_in_snapshot'});
   const currentFailures = taskFailureCount(task);
+  const actionResult = object(action?.result);
+  const requeuedCount = integer(actionResult.requeued);
+  const reportedSourceClosureBlocked = actionType === 'elastic_requeue'
+    && integer(actionResult.sourceClosureBlocked) > 0;
+  const sourceClosureBlockedItemCount = integer(
+    task.sourceClosureBlockedItemCount,
+  );
+  if (reportedSourceClosureBlocked && sourceClosureBlockedItemCount > 0) {
+    return {
+      status: 'blocked',
+      details: {
+        reason: 'source_local_closure_still_blocked',
+        sourceClosureBlockedItemCount,
+        requeuedCount,
+      },
+    };
+  }
+  if (reportedSourceClosureBlocked && requeuedCount === 0) {
+    if (FAILED_TASK_TERMINAL_STATUSES.has(task.status)) {
+      return {
+        status: 'failed',
+        details: {
+          reason: 'source_closure_target_failed_before_release',
+          taskStatus: task.status,
+          sourceClosureReleased: false,
+        },
+      };
+    }
+    if (ABANDONED_TASK_TERMINAL_STATUSES.has(task.status)) {
+      return {
+        status: 'skipped',
+        details: {
+          reason: 'source_closure_target_abandoned_before_release',
+          taskStatus: task.status,
+          sourceClosureReleased: false,
+        },
+      };
+    }
+    return {
+      status: 'verified',
+      details: {
+        sourceClosureReleased: true,
+        taskStatus: task.status,
+      },
+    };
+  }
   const recoveredAdvanced = integer(task.recoveredItemCount)
     > integer(before.recoveredItemCount);
   const progressAdvanced = integer(task.progressSeq) > integer(before.progressSeq)
@@ -200,11 +258,16 @@ export function verifyOpsControlAction(action, snapshot, {now = new Date()} = {}
   }
 
   if (actionType === 'elastic_requeue' && (
-    progressAdvanced || task.recovering || recoveredAdvanced
+    progressAdvanced || recoveredAdvanced
   )) {
     return {
       status: 'verified',
-      details: {taskStatus: task.status, progressAdvanced, recoveredAdvanced},
+      details: {
+        taskStatus: task.status,
+        progressAdvanced,
+        recoveredAdvanced,
+        sourceClosureReleased: reportedSourceClosureBlocked,
+      },
     };
   }
   return pending({reason: expired ? 'elastic_requeue_verification_timeout' : 'elastic_requeue_pending'});
@@ -241,7 +304,7 @@ async function loadDefaultHandlers() {
   };
 }
 
-function executionProjection(actionType, result) {
+export function projectOpsControlActionExecution(actionType, result) {
   if (actionType === 'capture_retry') {
     if (integer(result?.dispatched) > 0) return {status: 'pending_verification'};
     if (integer(result?.manualOnly) > 0) return {status: 'blocked'};
@@ -264,7 +327,9 @@ function executionProjection(actionType, result) {
     return {status: integer(result?.commandCount) > 0 ? 'pending_verification' : 'skipped'};
   }
   if (result?.error) return {status: 'failed'};
-  return {status: integer(result?.requeued) > 0 ? 'pending_verification' : 'skipped'};
+  if (integer(result?.requeued) > 0) return {status: 'pending_verification'};
+  if (integer(result?.sourceClosureBlocked) > 0) return {status: 'blocked'};
+  return {status: 'skipped'};
 }
 
 async function verifyPendingActions({
@@ -273,6 +338,7 @@ async function verifyPendingActions({
   sequence,
   snapshot,
   now,
+  verificationSeconds,
   queryAll,
   execute,
 }) {
@@ -280,15 +346,24 @@ async function verifyPendingActions({
     SELECT *
     FROM ops_control_actions
     WHERE tenant_id = $1 AND run_id = $2
-      AND status = 'pending_verification'
-    ORDER BY created_at, id
+      AND status IN ('pending_verification', 'blocked')
+    ORDER BY
+      CASE status WHEN 'pending_verification' THEN 0 ELSE 1 END,
+      created_at, id
     LIMIT 20
   `, [tenantId, runId]);
   let verified = 0;
   let verificationFailed = 0;
   for (const action of actions) {
     const verification = verifyOpsControlAction(action, snapshot, {now});
-    if (verification.status === 'pending_verification') continue;
+    if (verification.status === action.status) {
+      continue;
+    }
+    const verificationDueAt = verification.status === 'pending_verification'
+      ? new Date(
+          now.getTime() + integer(verificationSeconds, 900) * 1000,
+        ).toISOString()
+      : null;
     await execute(`
       UPDATE ops_control_actions
       SET status = $3,
@@ -296,9 +371,10 @@ async function verifyPendingActions({
         verification = $5::jsonb,
         verified_at = CASE WHEN $3 = 'verified' THEN $6 ELSE verified_at END,
         last_error = CASE WHEN $3 = 'failed' THEN $7 ELSE '' END,
+        verification_due_at = $8,
         updated_at = $6
       WHERE id = $1 AND tenant_id = $2
-        AND status = 'pending_verification'
+        AND status IN ('pending_verification', 'blocked')
     `, [
       action.id,
       tenantId,
@@ -307,9 +383,10 @@ async function verifyPendingActions({
       JSON.stringify(verification.details),
       now.toISOString(),
       verification.details?.reason || '',
+      verificationDueAt,
     ]);
     if (verification.status === 'verified') verified += 1;
-    else verificationFailed += 1;
+    else if (verification.status === 'failed') verificationFailed += 1;
   }
   return {verified, verificationFailed};
 }
@@ -486,6 +563,7 @@ export async function runOpsControlGuardedActions({
     sequence,
     snapshot,
     now,
+    verificationSeconds: policy.actionVerificationSeconds,
     queryAll,
     execute,
   });
@@ -519,7 +597,10 @@ export async function runOpsControlGuardedActions({
           action,
           candidate,
         });
-        const projection = executionProjection(candidate.actionType, result);
+        const projection = projectOpsControlActionExecution(
+          candidate.actionType,
+          result,
+        );
         const verificationDueAt = projection.status === 'pending_verification'
           ? new Date(now.getTime() + policy.actionVerificationSeconds * 1000).toISOString()
           : null;

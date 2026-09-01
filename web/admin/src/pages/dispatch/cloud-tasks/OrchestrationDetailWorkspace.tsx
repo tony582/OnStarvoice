@@ -38,6 +38,11 @@ import {
   allocateKeywordRetryItems,
   buildKeywordRetryAssignments,
 } from './retry-item-allocation.js'
+import {
+  formatRecoveryCountdown,
+  orchestrationItemStatusBucket,
+  summarizeOrchestrationItems,
+} from './recovery-presentation.js'
 
 const SORT_LABELS: Record<string, string> = {
   comprehensive: '综合排序',
@@ -77,10 +82,6 @@ const VIDEO_DURATION_LABELS: Record<string, string> = {
   over_5m: '5 分钟以上',
 }
 
-const SUCCESS_ITEM_STATUSES = new Set(['completed', 'completed_with_warnings'])
-const SETTLED_ITEM_STATUSES = new Set(['completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'])
-const FAILURE_STATUSES = new Set(['retryable', 'needs_action', 'failed', 'interrupted', 'completed_with_failures'])
-const ACTIVE_STATUSES = new Set(['pending', 'assigned', 'dispatch_pending', 'dispatched', 'waiting_device', 'claimed', 'running', 'recovering'])
 const STOPPABLE_EXECUTION_STATUSES = new Set([
   'pending', 'assigned', 'dispatch_pending', 'dispatched', 'waiting_device',
   'claimed', 'running', 'recovering', 'interrupted',
@@ -158,9 +159,11 @@ function statusLabel(status?: string) {
 
 function statusTone(status?: string) {
   const value = String(status || '')
-  if (FAILURE_STATUSES.has(value)) return 'border-status-red/25 bg-status-red/8 text-status-red'
-  if (['completed', 'completed_with_warnings'].includes(value)) return 'border-status-green/25 bg-status-green/8 text-status-green'
-  if (ACTIVE_STATUSES.has(value)) return 'border-primary/25 bg-primary/8 text-primary'
+  const bucket = orchestrationItemStatusBucket(value)
+  if (bucket === 'failed') return 'border-status-red/25 bg-status-red/8 text-status-red'
+  if (bucket === 'manual') return 'border-status-orange/25 bg-status-orange/8 text-status-orange'
+  if (bucket === 'success') return 'border-status-green/25 bg-status-green/8 text-status-green'
+  if (bucket === 'automatic_recovery' || bucket === 'active') return 'border-primary/25 bg-primary/8 text-primary'
   return 'border-border bg-muted text-muted-foreground'
 }
 
@@ -208,6 +211,28 @@ function executionTaskId(execution: OrchestrationExecutionRecord) {
   return String(execution.taskId || execution.task_id || execution.id || '')
 }
 
+function executionHasAwaitingCommand(execution: OrchestrationExecutionRecord) {
+  const commandId = String(execution.commandId || execution.command_id || '')
+  const commandStatus = String(execution.command_status || '')
+  return Boolean(commandId && ['pending', 'acknowledged'].includes(commandStatus))
+}
+
+function objectRecord(value: unknown) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function itemWaitsForSourceClosure(item: OrchestrationItemRecord) {
+  const checkpoint = objectRecord(item.metadata?.checkpoint)
+  const itemError = objectRecord(item.error)
+  const recovery = objectRecord(checkpoint.recovery || itemError.recovery)
+  return item.metadata?.waitingForSourceClosure === true ||
+    checkpoint.waitingForSourceClosure === true ||
+    itemError.waitingForSourceClosure === true ||
+    recovery.waitingForSourceClosure === true
+}
+
 function executionItemIds(execution: OrchestrationExecutionRecord) {
   const ids = execution.itemIds || execution.item_ids
   return Array.isArray(ids) ? ids.map(String) : []
@@ -253,17 +278,6 @@ function dataMessage(value: unknown) {
 function timestamp(value: unknown) {
   const parsed = Date.parse(String(value || ''))
   return Number.isFinite(parsed) ? parsed : 0
-}
-
-function formatRecoveryCountdown(waitUntil: number, now: number) {
-  const remainingSeconds = Math.max(0, Math.ceil((waitUntil - now) / 1000))
-  const hours = Math.floor(remainingSeconds / 3600)
-  const minutes = Math.floor((remainingSeconds % 3600) / 60)
-  const seconds = remainingSeconds % 60
-  const clock = hours > 0
-    ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-    : `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-  return waitUntil > now ? `${clock} 后重试` : '已到重试时间，正在等待 Agent 回报'
 }
 
 function formatAgentCooldownCountdown(waitUntil: number, now: number) {
@@ -431,10 +445,13 @@ export function OrchestrationDetailWorkspace({
     }
     return result
   }, [detail?.attempts])
-  const completedCount = sortedItems.filter(item => SUCCESS_ITEM_STATUSES.has(item.status)).length
-  const settledCount = sortedItems.filter(item => SETTLED_ITEM_STATUSES.has(item.status)).length
-  const failedCount = sortedItems.filter(item => FAILURE_STATUSES.has(item.status)).length
-  const activeCount = sortedItems.filter(item => ACTIVE_STATUSES.has(item.status)).length
+  const itemStatusSummary = summarizeOrchestrationItems(sortedItems)
+  const completedCount = itemStatusSummary.completed
+  const settledCount = itemStatusSummary.settled
+  const activeCount = itemStatusSummary.active
+  const automaticRecoveryCount = itemStatusSummary.automaticRecovery
+  const manualCount = itemStatusSummary.manual
+  const failedCount = itemStatusSummary.failed
   const progressPercent = sortedItems.length > 0 ? Math.round((settledCount / sortedItems.length) * 100) : 0
   const isScheduleTemplate =
     detail?.orchestration.metadata?.orchestrationTemplate === true
@@ -711,7 +728,11 @@ export function OrchestrationDetailWorkspace({
   }, [attentionContext, availableAgents, detail])
 
   const automaticRecoveryStates = useMemo(() => {
-    if (!detail || isScheduleTemplate) return []
+    if (
+      !detail ||
+      isScheduleTemplate ||
+      FINAL_ORCHESTRATION_STATUSES.has(String(detail.orchestration.status || ''))
+    ) return []
     const states: Array<{
       id: string
       label: string
@@ -720,9 +741,50 @@ export function OrchestrationDetailWorkspace({
       attemptTotal: number
       waitUntil: number
       agentLabel: string
-      countdownKind: 'retry' | 'agent_cooldown'
+      countdownKind: 'retry' | 'agent_cooldown' | 'source_closure'
+      awaitingAgentReport: boolean
     }> = []
+    const itemClosureCardIds = new Set(
+      sortedItems
+        .filter(item => item.status === 'retryable' && itemWaitsForSourceClosure(item))
+        .map(item => String(item.id)),
+    )
     for (const execution of detail.executions) {
+      if (FINAL_EXECUTION_STATUSES.has(String(execution.status || ''))) continue
+      const executionId = executionTaskId(execution)
+      const executionMetadata = objectRecord(execution.metadata)
+      const executionWaitsForSourceClosure =
+        executionMetadata.waitingForSourceClosure === true
+      const executionItems = sortedItems.filter(item =>
+        String(item.execution_task_id || '') === executionId ||
+        executionItemIds(execution).includes(String(item.id)),
+      )
+      if (executionWaitsForSourceClosure) {
+        if (executionItems.some(item => itemClosureCardIds.has(String(item.id)))) {
+          continue
+        }
+        const agentId = executionAgentId(execution)
+        const keywords = executionItems
+          .map(keywordForItem)
+          .filter(Boolean)
+        const targetLabel = keywords.length > 0
+          ? `「${keywords.slice(0, 2).join('、')}」${keywords.length > 2 ? `等 ${keywords.length} 项` : ''}`
+          : '当前工作项'
+        const workUnit = contentPatrol ? '帖子' : '关键词'
+        const attemptCurrent = Math.max(1, Number(execution.attempt_number || 1) || 1)
+        states.push({
+          id: `execution-closure:${executionId}`,
+          label: `等待原 Agent 关闭确认 · ${attemptCurrent}`,
+          message: `系统尚未收到原 Agent 的本地关闭证明，为避免${workUnit}${targetLabel}在两台设备同时执行，暂缓换 Agent；已采集结果继续保留。`,
+          attemptCurrent,
+          attemptTotal: attemptCurrent,
+          waitUntil: 0,
+          agentLabel: `原 Agent：${agentName(agentsById.get(agentId))}`,
+          countdownKind: 'source_closure',
+          awaitingAgentReport: false,
+        })
+        continue
+      }
       const progress = execution.progress && typeof execution.progress === 'object'
         ? execution.progress as Record<string, unknown>
         : {}
@@ -751,21 +813,16 @@ export function OrchestrationDetailWorkspace({
         waitUntil,
         agentLabel: agentName(agentsById.get(agentId)),
         countdownKind: 'retry',
+        awaitingAgentReport: executionHasAwaitingCommand(execution),
       })
     }
     for (const item of sortedItems) {
       if (item.status !== 'retryable') continue
-      const checkpoint = item.metadata?.checkpoint
-      const checkpointRecord = checkpoint && typeof checkpoint === 'object' && !Array.isArray(checkpoint)
-        ? checkpoint as Record<string, unknown>
-        : {}
-      const itemError = item.error && typeof item.error === 'object'
-        ? item.error as Record<string, unknown>
-        : {}
+      const checkpointRecord = objectRecord(item.metadata?.checkpoint)
+      const itemError = objectRecord(item.error)
       const recoveryValue = checkpointRecord.recovery || itemError.recovery
-      const recovery = recoveryValue && typeof recoveryValue === 'object' && !Array.isArray(recoveryValue)
-        ? recoveryValue as Record<string, unknown>
-        : {}
+      const recovery = objectRecord(recoveryValue)
+      const waitingForSourceClosure = itemWaitsForSourceClosure(item)
       const sourceAgentCooling = recovery.sourceAgentCooling !== false
       const waitUntil = timestamp(
         sourceAgentCooling
@@ -791,8 +848,12 @@ export function OrchestrationDetailWorkspace({
         : ''
       states.push({
         id: `item:${item.id}`,
-        label: `工作项已释放 · 换 Agent ${attemptCurrent}/${attemptTotal}`,
-        message: sourceAgentCooling
+        label: waitingForSourceClosure
+          ? `等待原 Agent 关闭确认 · ${attemptCurrent}/${attemptTotal}`
+          : `工作项已释放 · 换 Agent ${attemptCurrent}/${attemptTotal}`,
+        message: waitingForSourceClosure
+          ? `系统尚未收到原 Agent 的本地关闭证明，为避免${workUnit}「${keywordForItem(item)}」在两台设备同时执行，暂缓换 Agent；已采集结果继续保留。`
+          : sourceAgentCooling
           ? `${workUnit}「${keywordForItem(item)}」已解除原 Agent 锁定，其他空闲 Agent 可立即领取；原 Agent 暂停领取新任务${cooldownHomeStatus}`
           : String(recovery.reason || '') === 'platform_safety_handoff'
             ? `仅隔离${workUnit}「${keywordForItem(item)}」与原账号这一组合；系统正在未尝试账号中接力，原账号可继续领取其他关键词${cooldownHomeStatus}`
@@ -801,7 +862,12 @@ export function OrchestrationDetailWorkspace({
         attemptTotal,
         waitUntil,
         agentLabel: `原 Agent：${agentName(agentsById.get(String(recovery.sourceAgentId || item.assigned_agent_id || '')))}`,
-        countdownKind: sourceAgentCooling ? 'agent_cooldown' : 'retry',
+        countdownKind: waitingForSourceClosure
+          ? 'source_closure'
+          : sourceAgentCooling
+            ? 'agent_cooldown'
+            : 'retry',
+        awaitingAgentReport: false,
       })
     }
     return states
@@ -1338,19 +1404,23 @@ export function OrchestrationDetailWorkspace({
 
       <div className="p-4 sm:p-5">
         {automaticRecoveryStates.length > 0 && (
-          <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4" aria-label="自动恢复实时状态">
+          <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4" aria-label="恢复与阻塞实时状态">
             <div className="flex items-start gap-3">
               <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
                 <Clock3 className="h-4.5 w-4.5" />
               </span>
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <h3 className="text-sm font-bold text-foreground">自动恢复实时状态</h3>
+                  <h3 className="text-sm font-bold text-foreground">
+                    {automaticRecoveryStates.some(state => state.countdownKind === 'source_closure')
+                      ? '恢复阻塞实时状态'
+                      : '自动恢复实时状态'}
+                  </h3>
                   <span className="text-[10px] text-muted-foreground">每 5 秒同步设备状态</span>
                 </div>
                 <div className="mt-3 grid gap-2">
                   {automaticRecoveryStates.map(state => {
-                    const due = state.waitUntil > 0 && state.waitUntil <= nowMs
+                    const due = state.countdownKind === 'source_closure' || (state.waitUntil > 0 && state.waitUntil <= nowMs)
                     return (
                       <div key={state.id} className={cn(
                         'rounded-xl border px-3 py-2.5',
@@ -1364,17 +1434,23 @@ export function OrchestrationDetailWorkspace({
                             'font-mono text-xs font-bold tabular-nums',
                             due ? 'text-status-orange' : 'text-primary',
                           )}>
-                            {state.waitUntil > 0
+                            {state.countdownKind === 'source_closure'
+                              ? '等待原 Agent 关闭确认'
+                              : state.waitUntil > 0
                               ? state.countdownKind === 'agent_cooldown'
                                 ? formatAgentCooldownCountdown(state.waitUntil, nowMs)
-                                : formatRecoveryCountdown(state.waitUntil, nowMs)
+                                : formatRecoveryCountdown({
+                                    waitUntil: state.waitUntil,
+                                    now: nowMs,
+                                    awaitingAgentReport: state.awaitingAgentReport,
+                                  })
                               : '排队中，空闲 Agent 自动领取'}
                           </span>
                         </div>
                         <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{state.message}</p>
                         <p className="mt-1 text-[10px] text-muted-foreground">
                           {state.agentLabel}
-                          {state.waitUntil > 0
+                          {state.waitUntil > 0 && state.countdownKind !== 'source_closure'
                             ? ` · ${state.countdownKind === 'agent_cooldown' ? '冷却结束' : '下次动作'} ${new Date(state.waitUntil).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
                             : ''}
                         </p>
@@ -1807,7 +1883,19 @@ export function OrchestrationDetailWorkspace({
             <Activity className="h-4 w-4 shrink-0 text-primary" />
             <span>
               <span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? (elasticPool ? '领取策略' : '固定分配') : '工作项状态'}</span>
-              <span className="block text-xs font-bold">{scheduleTemplate ? (elasticPool ? '空闲节点逐个领取' : `${sortedItems.length} 个关键词已分配`) : `${settledCount} 已结算 · ${activeCount} 进行/等待`}</span>
+              <span className="block text-xs font-bold">
+                {scheduleTemplate
+                  ? elasticPool
+                    ? '空闲节点逐个领取'
+                    : `${sortedItems.length} 个关键词已分配`
+                  : [
+                      `${settledCount} 已结算`,
+                      `${activeCount} 进行/等待`,
+                      automaticRecoveryCount > 0 ? `${automaticRecoveryCount} 自动恢复` : '',
+                      manualCount > 0 ? `${manualCount} 需人工` : '',
+                      failedCount > 0 ? `${failedCount} 失败` : '',
+                    ].filter(Boolean).join(' · ')}
+              </span>
             </span>
           </li>
           <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/45" />
@@ -1835,7 +1923,9 @@ export function OrchestrationDetailWorkspace({
             {!scheduleTemplate && <div className="flex flex-wrap gap-2 text-[11px]">
               <span className="rounded-md bg-status-green/10 px-2 py-1 font-medium text-status-green">成功 {completedCount}</span>
               <span className="rounded-md bg-primary/8 px-2 py-1 font-medium text-primary">进行/等待 {activeCount}</span>
-              {failedCount > 0 && <span className="rounded-md bg-status-red/8 px-2 py-1 font-medium text-status-red">异常 {failedCount}</span>}
+              {automaticRecoveryCount > 0 && <span className="rounded-md bg-primary/8 px-2 py-1 font-medium text-primary">自动恢复 {automaticRecoveryCount}</span>}
+              {manualCount > 0 && <span className="rounded-md bg-status-orange/8 px-2 py-1 font-medium text-status-orange">需人工 {manualCount}</span>}
+              {failedCount > 0 && <span className="rounded-md bg-status-red/8 px-2 py-1 font-medium text-status-red">失败 {failedCount}</span>}
             </div>}
           </div>
           {!scheduleTemplate && <div className="mt-4 flex items-center gap-3">

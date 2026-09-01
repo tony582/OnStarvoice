@@ -129,8 +129,7 @@ const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
 ]);
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
-const LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
-const ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS = 20 * 1000;
+const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
 const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
 const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
 // A half-hour source-Agent quarantine removes too much capacity from a small
@@ -1263,7 +1262,7 @@ function elasticRecoveryMetadataForItem(item = {}) {
   return safeJson(safeJson(item?.error).recovery);
 }
 
-function buildElasticRecoveryMetadata({
+export function buildElasticRecoveryMetadata({
   status = '',
   error = {},
   checkpoint = {},
@@ -1281,17 +1280,37 @@ function buildElasticRecoveryMetadata({
   const recoveryError = safeJson(error);
   const recoveryCheckpoint = safeJson(checkpoint);
   const previousRecovery = safeJson(existingRecovery);
+  const attemptCurrent = Math.max(1, Number(attemptCount) || 1);
   const normalizedSourceAgentId = text(sourceAgentId, 100);
   const previousSourceAgentId = text(previousRecovery.sourceAgentId, 100);
+  const previousAttemptCurrent = Number(previousRecovery.attemptCurrent);
   const previousQueuedAtMs = Date.parse(String(
     previousRecovery.queuedAt || previousRecovery.queued_at || '',
   ));
+  const sameRecoverySource =
+    !previousSourceAgentId || previousSourceAgentId === normalizedSourceAgentId;
+  const sameRecoveryAttempt =
+    sameRecoverySource &&
+    Number.isFinite(previousAttemptCurrent) &&
+    Math.max(1, previousAttemptCurrent) === attemptCurrent;
   const recoveryAnchorMs = (
     Number.isFinite(previousQueuedAtMs) &&
-    (!previousSourceAgentId || previousSourceAgentId === normalizedSourceAgentId)
+    sameRecoveryAttempt
   )
     ? Math.min(previousQueuedAtMs, nowMs)
     : nowMs;
+  const previousNextEvaluationAtMs = Date.parse(String(
+    previousRecovery.nextEvaluationAt ||
+      previousRecovery.next_evaluation_at ||
+      '',
+  ));
+  // A terminal task snapshot can be repeated on every Agent heartbeat. Its
+  // first recovery projection is the durable review anchor; a duplicate
+  // snapshot must not keep moving the deadline to `now + recheck` forever.
+  const nextEvaluationAtMs =
+    sameRecoveryAttempt && Number.isFinite(previousNextEvaluationAtMs)
+      ? previousNextEvaluationAtMs
+      : recoveryAnchorMs + ELASTIC_DISPATCH_RECHECK_MS;
   const operatorHoldReleasedAtMs = Date.parse(String(
     previousRecovery.operatorHoldReleasedAt ||
       previousRecovery.operator_hold_released_at ||
@@ -1315,7 +1334,7 @@ function buildElasticRecoveryMetadata({
     // pair and leave unrelated keywords claimable.
     state: 'released_for_handoff',
     reason: safetyBlocked ? 'platform_safety_handoff' : 'technical_recovery',
-    attemptCurrent: Math.max(1, Number(attemptCount) || 1),
+    attemptCurrent,
     attemptTotal: Math.max(1, Number(agentAttemptLimit) || 1),
     sourceAgentId: normalizedSourceAgentId,
     queuedAt: new Date(recoveryAnchorMs).toISOString(),
@@ -1344,9 +1363,7 @@ function buildElasticRecoveryMetadata({
           ),
         }
       : {}),
-    nextEvaluationAt: new Date(
-      nowMs + ELASTIC_DISPATCH_RECHECK_MS,
-    ).toISOString(),
+    nextEvaluationAt: new Date(nextEvaluationAtMs).toISOString(),
     sourceAgentHoldUntil: new Date(
       operatorHoldReleased
         ? operatorHoldReleasedAtMs
@@ -6158,13 +6175,6 @@ async function dispatchNextElasticWorkItem(tx, {
           AND previous_execution.tenant_id = item.tenant_id
         LIMIT 1
       ) AS source_execution_started_at,
-      (
-        SELECT previous_execution.finished_at
-        FROM capture_tasks previous_execution
-        WHERE previous_execution.id = item.execution_task_id
-          AND previous_execution.tenant_id = item.tenant_id
-        LIMIT 1
-      ) AS source_execution_finished_at,
       item.metadata AS item_metadata,
       agent_policy.agent_attempt_limit,
       COALESCE(
@@ -6359,24 +6369,21 @@ async function dispatchNextElasticWorkItem(tx, {
           assignmentRevision:
             sourceAttempt?.assignment_revision ?? candidate.assignment_revision,
         });
-    const sourceExecutionFinishedAt = Date.parse(String(
-      candidate.source_execution_finished_at || '',
-    ));
-    const sourceClosureGraceElapsed =
-      Number.isFinite(sourceExecutionFinishedAt) &&
-      Date.now() - sourceExecutionFinishedAt >=
-        ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS;
     if (
       !neverOpened &&
-      localClosureProof.proven !== true &&
-      !sourceClosureGraceElapsed
+      localClosureProof.proven !== true
     ) {
       const firstWait = itemMetadata.waitingForSourceClosure !== true;
       await tx.execute(`
         UPDATE capture_task_items
         SET metadata = metadata || jsonb_build_object(
             'waitingForSourceClosure', true,
-            'sourceClosureBlockedAt', now()::text
+            'sourceClosureBlockedAt', COALESCE(
+              NULLIF(metadata->>'sourceClosureBlockedAt', ''),
+              now()::text
+            ),
+            'sourceClosureBlockedReason', $5::text,
+            'sourceClosureBlockedAttemptId', $6::text
           )
         WHERE tenant_id = $1
           AND task_id = $2
@@ -6388,6 +6395,8 @@ async function dispatchNextElasticWorkItem(tx, {
         candidate.parent_id,
         candidate.item_id,
         Number(candidate.assignment_revision || 0),
+        text(localClosureProof.reason, 160),
+        text(sourceAttempt?.id, 100),
       ]);
       if (firstWait) {
         await appendEvent(tx, {
@@ -6765,7 +6774,8 @@ async function dispatchNextElasticWorkItem(tx, {
       attempt_count = $1,
       metadata = (
         metadata - 'checkpoint' - 'targetResult' -
-        'waitingForSourceClosure' - 'sourceClosureBlockedAt'
+        'waitingForSourceClosure' - 'sourceClosureBlockedAt' -
+        'sourceClosureBlockedReason' - 'sourceClosureBlockedAttemptId'
       ) ||
         jsonb_build_object('elasticAttemptBudgetUsed', $2::integer),
       assigned_agent_id = $3,
@@ -10847,15 +10857,17 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
       execution_task_id,
       requires_local_closure_proof,
       terminal_at,
-      terminal_at <= now() - make_interval(secs => $3::integer)
-        AS closure_quiescent
+      CASE
+        WHEN requires_local_closure_proof THEN false
+        ELSE terminal_at <= now() - make_interval(secs => $3::integer)
+      END AS legacy_closure_quiescent
     FROM reusable_history
     ORDER BY requires_local_closure_proof DESC,
       terminal_at DESC NULLS LAST, id DESC
   `, [
     tenantId,
     agentId,
-    Math.floor(LOCAL_CLOSURE_REUSE_QUIESCENCE_MS / 1000),
+    Math.floor(LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS / 1000),
   ]);
   const latestMarkedAttempt = history.find(
     attempt => attempt.requires_local_closure_proof === true,
@@ -10870,10 +10882,11 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
       itemAttemptNumber: latestMarkedAttempt.attempt_number,
       assignmentRevision: latestMarkedAttempt.assignment_revision,
     });
-    if (
-      proof.proven !== true &&
-      latestMarkedAttempt.closure_quiescent !== true
-    ) {
+    // A current-schema execution explicitly opts into the browser-local
+    // closure protocol. Time passing on the server cannot prove that its old
+    // content context, Debug session or task-owned tab stopped, so marked
+    // attempts must never fall through to the legacy quiescence fallback.
+    if (proof.proven !== true) {
       return {
         ready: false,
         reason: proof.reason,
@@ -10884,7 +10897,10 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
   const latestLegacyAttempt = history.find(
     attempt => attempt.requires_local_closure_proof !== true,
   );
-  if (latestLegacyAttempt && latestLegacyAttempt.closure_quiescent !== true) {
+  if (
+    latestLegacyAttempt &&
+    latestLegacyAttempt.legacy_closure_quiescent !== true
+  ) {
     return {
       ready: false,
       reason: 'local_cleanup_quiescence',
@@ -10894,9 +10910,7 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
   return {
     ready: true,
     reason: latestMarkedAttempt
-      ? latestMarkedAttempt.closure_quiescent === true
-        ? 'bounded_local_cleanup_quiescence_elapsed'
-        : 'marked_local_closure_proven'
+      ? 'marked_local_closure_proven'
       : 'local_closure_reuse_ready',
   };
 }
@@ -12698,7 +12712,8 @@ export async function reconcileElasticCaptureLeases(input = 50) {
     return {scanned: 0, requeued: 0, skipped: 0, error: 'invalid_parent_task_scope'};
   }
   const candidates = await queryAll(`
-    SELECT child.id, child.tenant_id, child.parent_task_id
+    SELECT child.id, child.tenant_id, child.parent_task_id,
+      source_item.id AS item_id
     FROM capture_tasks child
     JOIN capture_tasks parent
       ON parent.id = child.parent_task_id
@@ -12706,6 +12721,16 @@ export async function reconcileElasticCaptureLeases(input = 50) {
     JOIN capture_agents agent
       ON agent.id = child.assigned_agent_id
       AND agent.tenant_id = child.tenant_id
+    LEFT JOIN LATERAL (
+      SELECT item.id
+      FROM capture_task_items item
+      WHERE item.tenant_id = child.tenant_id
+        AND item.task_id = child.parent_task_id
+        AND item.execution_task_id = child.id
+        AND item.assigned_agent_id = child.assigned_agent_id
+      ORDER BY item.ordinal, item.id
+      LIMIT 1
+    ) source_item ON true
     WHERE child.parent_task_id IS NOT NULL
       AND child.status IN (
         'pending', 'claimed', 'running', 'recovering', 'waiting_device'
@@ -12748,7 +12773,88 @@ export async function reconcileElasticCaptureLeases(input = 50) {
     parentTaskIds,
   ]);
 
-  const summary = {scanned: candidates.length, requeued: 0, skipped: 0};
+  // Released items waiting for a source-browser closure proof are not stale
+  // execution leases, so the query above intentionally cannot requeue them.
+  // Surface them in the same guarded-action result instead of returning
+  // `scanned: 0`, which previously made a hard anti-double-run fence look like
+  // a no-op or a successful recovery.
+  const sourceClosureBlockers = await queryAll(`
+    SELECT
+      item.id AS item_id,
+      item.task_id AS parent_task_id,
+      item.execution_task_id,
+      item.keyword,
+      COALESCE(
+        NULLIF(item.metadata->>'sourceClosureBlockedAt', ''),
+        NULLIF(execution.metadata->>'sourceClosureBlockedAt', '')
+      ) AS blocked_at,
+      COALESCE(
+        NULLIF(item.metadata->>'sourceClosureBlockedReason', ''),
+        NULLIF(execution.metadata->>'sourceClosureBlockedReason', '')
+      ) AS reason
+    FROM capture_task_items item
+    JOIN capture_tasks parent
+      ON parent.id = item.task_id
+      AND parent.tenant_id = item.tenant_id
+    LEFT JOIN capture_tasks execution
+      ON execution.id = item.execution_task_id
+      AND execution.tenant_id = item.tenant_id
+    WHERE COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+      AND parent.status NOT IN (
+        'completed', 'completed_with_warnings', 'completed_with_failures',
+        'failed', 'canceled', 'skipped', 'superseded'
+      )
+      AND item.status IN (
+        'assigned', 'dispatch_pending', 'dispatched', 'waiting_device',
+        'claimed', 'running', 'recovering', 'retryable'
+      )
+      AND (
+        item.metadata->>'waitingForSourceClosure' = 'true'
+        OR (
+          execution.status IN (
+            'pending', 'claimed', 'running', 'recovering', 'waiting_device'
+          )
+          AND execution.metadata->>'waitingForSourceClosure' = 'true'
+        )
+      )
+      AND ($2::uuid IS NULL OR item.tenant_id = $2::uuid)
+      AND (
+        cardinality($3::uuid[]) = 0
+        OR item.task_id = ANY($3::uuid[])
+      )
+    ORDER BY blocked_at NULLS LAST, item.id
+    LIMIT $1
+  `, [normalizedLimit, tenantId || null, parentTaskIds]);
+
+  const scannedItemKeys = new Set([
+    ...candidates.map(candidate => {
+      const itemId = text(candidate.item_id, 100);
+      return itemId ? `item:${itemId}` : `execution:${text(candidate.id, 100)}`;
+    }),
+    ...sourceClosureBlockers.map(blocker =>
+      `item:${text(blocker.item_id, 100)}`
+    ),
+  ]);
+  const blockerByItem = new Map(
+    sourceClosureBlockers.map(blocker => [
+      text(blocker.item_id, 100),
+      {
+        itemId: text(blocker.item_id, 100),
+        parentTaskId: text(blocker.parent_task_id, 100),
+        executionTaskId: text(blocker.execution_task_id, 100),
+        keyword: text(blocker.keyword, 120),
+        blockedAt: blocker.blocked_at || null,
+        reason: text(blocker.reason, 160),
+      },
+    ]),
+  );
+  const summary = {
+    scanned: scannedItemKeys.size,
+    requeued: 0,
+    skipped: 0,
+    sourceClosureBlocked: blockerByItem.size,
+    sourceClosureBlockers: [...blockerByItem.values()],
+  };
   for (const candidate of candidates) {
     const settled = await withTransaction(async tx => {
       const parent = await tx.queryOne(`
@@ -12825,7 +12931,7 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         ? '执行节点持续离线，工作项已退回弹性队列'
         : '执行节点在线但当前任务心跳中断，工作项已退回弹性队列';
       const sourceItem = await tx.queryOne(`
-        SELECT id, item_type, assigned_agent_id, assignment_revision
+        SELECT id, item_type, assigned_agent_id, assignment_revision, keyword
         FROM capture_task_items
         WHERE tenant_id = $1
           AND task_id = $2
@@ -12876,29 +12982,38 @@ export async function reconcileElasticCaptureLeases(input = 50) {
               sourceItem?.assignment_revision,
           })
         : {proven: true, reason: 'local_closure_reuse_fence_not_required'};
-      // Both the Agent liveness lease and the execution heartbeat have already
-      // been stale for the full offline timeout before this row reaches the
-      // reconciler. At that point the server revokes the old execution lease
-      // and the assignment-revision fence rejects every late snapshot from
-      // that runner. Requiring the disconnected browser to upload one more
-      // closure proof would make an unattended keyword wait forever. Keep the
-      // proof gate for a future task-heartbeat-only recovery, but do not let a
-      // confirmed-offline source account quarantine the keyword itself.
+      // Revoking a stale server lease fences late writes, but it cannot prove
+      // that the disconnected browser stopped operating the platform page.
+      // Current-schema keyword attempts therefore require their exact local
+      // closure proof even when the Agent liveness lease has expired.
       if (
         requiresSourceLocalClosure &&
-        !localClosureProof.proven &&
-        !agentOffline
+        !localClosureProof.proven
       ) {
         const firstWait =
           safeJson(child.metadata).waitingForSourceClosure !== true;
+        const sourceClosureBlockedAt =
+          text(safeJson(child.metadata).sourceClosureBlockedAt, 100) ||
+          new Date().toISOString();
         await tx.execute(`
           UPDATE capture_tasks
           SET metadata = metadata || jsonb_build_object(
             'waitingForSourceClosure', true,
-            'sourceClosureBlockedAt', now()::text
+            'sourceClosureBlockedAt', COALESCE(
+              NULLIF(metadata->>'sourceClosureBlockedAt', ''),
+              $5::text
+            ),
+            'sourceClosureBlockedReason', $3::text,
+            'sourceClosureBlockedAttemptId', $4::text
           )
           WHERE id = $1 AND tenant_id = $2
-        `, [child.id, candidate.tenant_id]);
+        `, [
+          child.id,
+          candidate.tenant_id,
+          text(localClosureProof.reason, 160),
+          text(sourceAttempt?.id, 100),
+          sourceClosureBlockedAt,
+        ]);
         if (firstWait) {
           await appendEvent(tx, {
             tenantId: candidate.tenant_id,
@@ -12915,11 +13030,24 @@ export async function reconcileElasticCaptureLeases(input = 50) {
             },
           });
         }
-        return 'waiting_local_closure';
+        return {
+          outcome: 'waiting_local_closure',
+          blocker: {
+            itemId: text(sourceItem?.id, 100),
+            parentTaskId: text(candidate.parent_task_id, 100),
+            executionTaskId: text(child.id, 100),
+            keyword: text(sourceItem?.keyword, 120),
+            blockedAt: sourceClosureBlockedAt,
+            reason: text(localClosureProof.reason, 160),
+          },
+        };
       }
       const failed = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = 'failed',
+          metadata = metadata - 'waitingForSourceClosure' -
+            'sourceClosureBlockedAt' - 'sourceClosureBlockedReason' -
+            'sourceClosureBlockedAttemptId',
           error = jsonb_build_object(
             'code', $3::text,
             'message', $4::text,
@@ -12969,9 +13097,26 @@ export async function reconcileElasticCaptureLeases(input = 50) {
       });
       return 'requeued';
     });
-    if (settled === 'requeued') summary.requeued += 1;
-    else summary.skipped += 1;
+    if (settled === 'requeued') {
+      summary.requeued += 1;
+      const candidateItemId = text(candidate.item_id, 100);
+      if (candidateItemId) blockerByItem.delete(candidateItemId);
+    } else if (settled?.outcome === 'waiting_local_closure') {
+      const blocker = settled.blocker || {};
+      const itemId = text(blocker.itemId, 100);
+      const blockerKey = itemId ||
+        `execution:${text(blocker.executionTaskId, 100)}`;
+      if (!blockerByItem.has(blockerKey)) {
+        blockerByItem.set(blockerKey, blocker);
+      }
+      summary.sourceClosureBlocked = blockerByItem.size;
+      summary.sourceClosureBlockers = [...blockerByItem.values()];
+    } else {
+      summary.skipped += 1;
+    }
   }
+  summary.sourceClosureBlocked = blockerByItem.size;
+  summary.sourceClosureBlockers = [...blockerByItem.values()];
   return summary;
 }
 

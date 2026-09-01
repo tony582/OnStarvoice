@@ -50,6 +50,7 @@ interface OpsControlSummary {
       taskCount?: number
       activeTaskCount?: number
       recoveredItemCount?: number
+      sourceClosureBlockedCount?: number
       manualBlockerCount?: number
       onlineAgentCount?: number
       registeredAgentCount?: number
@@ -66,6 +67,8 @@ interface OpsControlSummary {
   digest?: { summary?: string; delivery_status?: string } | null
   incidents?: Array<{
     id: string
+    type?: string
+    incident_type?: string
     severity: string
     title: string
     message: string
@@ -255,6 +258,8 @@ function OpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
   const style = OPS_VERDICT[verdict]
   const summary = run?.summary || {}
   const actionSummary = summary.actions || {}
+  const sourceClosureBlockedCount = Number(summary.sourceClosureBlockedCount || 0)
+  const explicitManualBlockerCount = Number(summary.manualBlockerCount || 0)
   const guarded = data?.mode === 'guarded'
   const actionsEnabled = data?.policy?.actionsEnabled === true
   const disabledReason = data?.policy?.globalEnabled === false
@@ -268,7 +273,10 @@ function OpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
   const attention = verdict === 'incident' || verdict === 'blocked_manual' || verdict === 'degraded'
     || Number(actionSummary.failed || 0) > 0 || Number(actionSummary.blocked || 0) > 0
   const firstIncident = data?.incidents?.[0]
-  const alertLabel = firstIncident?.alert_delivery_status === 'sent'
+  const firstIncidentType = firstIncident?.incident_type || firstIncident?.type || ''
+  const alertLabel = firstIncidentType === 'capture_source_closure_blocked'
+    ? '自动恢复已阻塞，等待原 Agent 关闭确认'
+    : firstIncident?.alert_delivery_status === 'sent'
     ? '异常提醒已发送'
     : ['retry_wait', 'blocked_config', 'failed'].includes(firstIncident?.alert_delivery_status || '')
       ? '异常提醒发送异常'
@@ -312,12 +320,13 @@ function OpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
       </div>
 
       {enabled && run && (
-        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-7">
+        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
           <OpsFact label="计划覆盖" value={`${Number(summary.observedScheduleCount || 0)}/${Number(summary.expectedScheduleCount || 0)}`} />
           <OpsFact label="任务" value={String(Number(summary.taskCount || 0))} />
           <OpsFact label="仍在执行" value={String(Number(summary.activeTaskCount || 0))} />
-          <OpsFact label="已自动恢复" value={String(Number(summary.recoveredItemCount || 0))} />
-          <OpsFact label="需人工" value={String(Number(summary.manualBlockerCount || 0))} danger={Number(summary.manualBlockerCount || 0) > 0} />
+          <OpsFact label="恢复已完成" value={String(Number(summary.recoveredItemCount || 0))} />
+          <OpsFact label="恢复阻塞" value={String(sourceClosureBlockedCount)} danger={sourceClosureBlockedCount > 0} />
+          <OpsFact label="需人工" value={String(explicitManualBlockerCount)} danger={explicitManualBlockerCount > 0} />
           <OpsFact label="在线 Agent" value={`${Number(summary.onlineAgentCount || 0)}/${Number(summary.registeredAgentCount || 0)}`} />
           <OpsFact
             label="动作 已验收/待验收"
@@ -335,8 +344,8 @@ function OpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
         </div>
       )}
       <p className="mt-3 text-[10.5px] leading-5 text-muted-foreground">
-        {data?.runtimeBaselineVersion || '0.3.91'} 已交付自愈基线 · 未调用 LLM · {actionsEnabled
-          ? '仅执行白名单动作，每次一个目标，并由后续快照验收'
+        {data?.runtimeBaselineVersion || '0.3.91'} 值守与受控恢复基线 · 未调用 LLM · {actionsEnabled
+          ? '仅执行白名单动作；只有后续快照验收成功才计入“恢复已完成”'
           : guarded
             ? '动作总闸、租户模式或白名单尚未全部放行'
             : '当前只观察、判断和通知'}

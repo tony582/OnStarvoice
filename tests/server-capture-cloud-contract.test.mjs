@@ -33,6 +33,7 @@ import {
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
   buildSequentialSearchResumeCheckpoint,
+  buildElasticRecoveryMetadata,
   classifyCaptureRecoveryDisposition,
   crossDeviceRetryAgentDailyUsageEligible,
   crossDeviceRetryAgentSupportsTask,
@@ -368,9 +369,11 @@ test('search-challenge handoff is counted independently without blocking the ela
     elasticClaim,
     /CASE WHEN item\.status = 'pending' THEN 0 ELSE 1 END/u,
   );
+  assert.doesNotMatch(elasticClaim, /ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS/u);
   assert.match(
     elasticClaim,
-    /sourceClosureGraceElapsed[\s\S]*ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS/u,
+    /!neverOpened[\s\S]*localClosureProof\.proven !== true/u,
+    'a marked source must remain fenced until exact local closure is proven',
   );
 
   const dutyDispatch = readRouteSection(
@@ -2016,7 +2019,7 @@ test("historical closure reuse ignores mutable item start after Agent A to B rea
   );
 });
 
-test("keyword reuse gets one bounded quiescence even when closure proof is missing", () => {
+test("current-schema keyword reuse requires exact closure proof while legacy keeps bounded quiescence", () => {
   const reuseGate = readRouteSection(
     "async function loadCaptureAgentLocalClosureReuseGate",
     "export async function dispatchCrossDeviceRetry",
@@ -2027,17 +2030,25 @@ test("keyword reuse gets one bounded quiescence even when closure proof is missi
     "marked and legacy histories must be evaluated independently",
   );
   const markedProof = reuseGate.indexOf("if (latestMarkedAttempt)");
-  const boundedGrace = reuseGate.indexOf(
-    "bounded_local_cleanup_quiescence_elapsed",
-  );
   assert.ok(markedProof >= 0);
-  assert.ok(
-    boundedGrace > markedProof,
-    "marked history must stop blocking after the stable terminal grace",
+  assert.match(
+    reuseGate,
+    /if \(proof\.proven !== true\) \{[\s\S]*ready: false,[\s\S]*reason: proof\.reason/u,
+    "a marked attempt must remain blocked until its exact proof verifies",
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /proof\.proven !== true\s*&&[\s\S]*closure_quiescent/u,
+    "server time must never replace browser-local proof for current schema",
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /bounded_local_cleanup_quiescence_elapsed/u,
+    "the marked-attempt success path must only report verified proof",
   );
   assert.match(
     reuseGate,
-    /terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)/u,
+    /WHEN requires_local_closure_proof THEN false[\s\S]*ELSE terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)[\s\S]*legacy_closure_quiescent/u,
   );
   assert.match(
     reuseGate,
@@ -2051,7 +2062,7 @@ test("keyword reuse gets one bounded quiescence even when closure proof is missi
   );
   assert.match(
     reuseGate,
-    /latestLegacyAttempt\.closure_quiescent !== true/u,
+    /latestLegacyAttempt\.legacy_closure_quiescent !== true/u,
   );
   assert.doesNotMatch(reuseGate, /capabilities|freshCapabilities/u);
 });
@@ -2775,12 +2786,12 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   );
   assert.match(
     reuseGate,
-    /terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)[\s\S]*local_cleanup_quiescence/u,
-    "all terminal history must pause reuse only for a bounded server-first grace",
+    /latestLegacyAttempt &&[\s\S]*latestLegacyAttempt\.legacy_closure_quiescent !== true[\s\S]*local_cleanup_quiescence/u,
+    "only legacy terminal history may use the bounded compatibility grace",
   );
   assert.match(
     captureCloudRouteSource,
-    /LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 \* 1000/u,
+    /LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 \* 1000/u,
   );
   assert.match(claim, /requiresSingleRelay/u);
   assert.match(claim, /waitingForSourceClosure/u);
@@ -2810,13 +2821,18 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   );
   assert.match(
     claim,
-    /localClosureProof\.proven !== true &&[\s\S]*!sourceClosureGraceElapsed/u,
+    /!neverOpened &&[\s\S]*localClosureProof\.proven !== true/u,
   );
   assert.match(
     claim,
     /canFenceLocalClosureReuse && candidate\.item_type === 'keyword'[\s\S]*requiresLocalClosureReuseFenceV1: true/u,
   );
   assert.match(claim, /status = 'retryable'[\s\S]*elastic_handoff_waiting_local_closure/u);
+  assert.match(
+    claim,
+    /sourceClosureBlockedAt'[\s\S]*COALESCE\([\s\S]*metadata->>'sourceClosureBlockedAt'[\s\S]*now\(\)::text/u,
+    "the first source-closure block timestamp must remain the stable review anchor",
+  );
   assert.match(claim, /expectedElasticKeywordSearches/u);
   assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
   assert.match(claim, /attemptIdentity,/u);
@@ -2900,6 +2916,62 @@ test("elastic recovery releases the item immediately and scopes verification to 
   assert.match(recovery, /sourceAgentSameItemRetryAfter/u);
 });
 
+test("repeated terminal heartbeats preserve the original elastic recovery review anchor", () => {
+  const first = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    checkpoint: {securityBlocked: true},
+    attemptCount: 3,
+    sourceAgentId: "agent-source",
+    now: new Date("2026-09-01T02:00:00.000Z"),
+  });
+  const repeated = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    checkpoint: {securityBlocked: true},
+    attemptCount: 3,
+    sourceAgentId: "agent-source",
+    existingRecovery: first,
+    now: new Date("2026-09-01T02:05:00.000Z"),
+  });
+
+  assert.equal(repeated.queuedAt, first.queuedAt);
+  assert.equal(repeated.nextEvaluationAt, first.nextEvaluationAt);
+  assert.notEqual(
+    repeated.nextEvaluationAt,
+    "2026-09-01T02:06:00.000Z",
+    "a repeated needs_action heartbeat must not manufacture a fresh countdown",
+  );
+
+  const reassigned = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    checkpoint: {securityBlocked: true},
+    attemptCount: 4,
+    sourceAgentId: "agent-successor",
+    existingRecovery: first,
+    now: new Date("2026-09-01T02:05:00.000Z"),
+  });
+  assert.equal(reassigned.queuedAt, "2026-09-01T02:05:00.000Z");
+  assert.equal(reassigned.nextEvaluationAt, "2026-09-01T02:06:00.000Z");
+
+  const sameAgentNewAttempt = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    checkpoint: {securityBlocked: true},
+    attemptCount: 4,
+    sourceAgentId: "agent-source",
+    existingRecovery: first,
+    now: new Date("2026-09-01T02:05:00.000Z"),
+  });
+  assert.equal(sameAgentNewAttempt.queuedAt, "2026-09-01T02:05:00.000Z");
+  assert.equal(
+    sameAgentNewAttempt.nextEvaluationAt,
+    "2026-09-01T02:06:00.000Z",
+    "a genuinely new attempt must receive its own review anchor",
+  );
+});
+
 test("elastic cleanup tolerates child tasks whose work item already settled", () => {
   assert.deepEqual(
     projectElasticAttemptBudget(null, {
@@ -2918,7 +2990,7 @@ test("elastic cleanup tolerates child tasks whose work item already settled", ()
   );
 });
 
-test("elastic queue reclaims stale offline work without disturbing fixed assignments", () => {
+test("elastic queue requires exact closure before reclaiming stale current-schema work", () => {
   const lease = readRouteSection(
     'export async function reconcileElasticCaptureLeases',
     'export async function reconcileAutomaticCaptureRetries',
@@ -2934,11 +3006,17 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
     /captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: sourceItem\?\.item_type,[\s\S]*sourceExecutionMetadata: child\.metadata/u,
   );
   assert.match(lease, /elastic_stale_execution_waiting_local_closure/u);
-  assert.match(lease, /return 'waiting_local_closure'/u);
+  assert.match(lease, /sourceClosureBlocked[\s\S]*sourceClosureBlockers/u);
+  assert.match(lease, /outcome: 'waiting_local_closure'/u);
   assert.match(
     lease,
-    /requiresSourceLocalClosure\s*&&[\s\S]*!localClosureProof\.proven\s*&&[\s\S]*!agentOffline/u,
-    'task-heartbeat-only recovery must still prove local closure',
+    /requiresSourceLocalClosure\s*&&[\s\S]*!localClosureProof\.proven/u,
+    'current-schema recovery must still prove local closure after Agent liveness expires',
+  );
+  assert.doesNotMatch(
+    lease,
+    /!localClosureProof\.proven\s*&&\s*!agentOffline/u,
+    'an offline lease cannot substitute for browser-local closure proof',
   );
   assert.match(lease, /'serverLeaseRevoked', \$5::boolean/u);
   assert.match(lease, /serverLeaseRevoked: agentOffline/u);
@@ -2951,6 +3029,33 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   assert.match(
     lease,
     /COALESCE\([\s\S]*agent\.last_liveness_at[\s\S]*'-infinity'::timestamptz[\s\S]*< now\(\)[\s\S]*AND COALESCE\([\s\S]*child\.heartbeat_at[\s\S]*child\.updated_at/u,
+  );
+  assert.match(
+    lease,
+    /source_item\.id AS item_id[\s\S]*const scannedItemKeys = new Set/u,
+    'candidate executions and existing blockers must share one item identity count',
+  );
+  assert.match(
+    lease,
+    /settled\?\.outcome === 'waiting_local_closure'[\s\S]*summary\.sourceClosureBlocked = blockerByItem\.size/u,
+    'the first blocked reconciliation must be reported in the same result',
+  );
+  const waitingProjectionStart = lease.indexOf(
+    "settled?.outcome === 'waiting_local_closure'",
+  );
+  const waitingProjectionEnd = lease.indexOf(
+    '} else {\n      summary.skipped += 1;',
+    waitingProjectionStart,
+  );
+  assert.ok(waitingProjectionStart >= 0 && waitingProjectionEnd > waitingProjectionStart);
+  const waitingProjection = lease.slice(
+    waitingProjectionStart,
+    waitingProjectionEnd,
+  );
+  assert.doesNotMatch(
+    waitingProjection,
+    /summary\.skipped \+= 1/u,
+    'a local-closure blocker must not first be projected as skipped',
   );
   assert.doesNotMatch(lease, /AGENT_TASK_STATE_UNAVAILABLE/u);
   assert.match(lease, /status: 'retryable'/u);

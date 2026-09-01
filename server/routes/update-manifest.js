@@ -3,12 +3,31 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.2',
+  latestVersion: '0.4.3',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-08-31',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.2-20260831.zip',
+  releaseDate: '2026-09-01',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.3-20260901.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.3',
+      releaseDate: '2026-09-01',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '安全验证后的关键词可以真正自动接力',
+              desc: '异常终态会精确清理当前尝试遗留的浏览器锁、调试会话和任务页，并在同次心跳回传本地关闭证明；无关的新任务锁不会被误删，也不会再阻止旧关键词交给未尝试 Agent。',
+            },
+            {
+              title: '恢复倒计时和值守结果按真实状态展示',
+              desc: '重复异常心跳不再滚动制造新的重试时间；等待关闭证明、自动恢复、需人工和最终失败分别展示，只有后续任务真正完成才计入恢复完成。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.2',
       releaseDate: '2026-08-31',

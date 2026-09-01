@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
-import test from "node:test";
+import test, {after} from "node:test";
 import vm from "node:vm";
 import {fileURLToPath} from "node:url";
 import {dirname, resolve} from "node:path";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+// The background harness intentionally unrefs extension-owned timers so alarms
+// cannot keep this file open. Node 18 also treats an awaited unref polling timer
+// as no live event-loop work, so retain one test-owned handle until teardown.
+const testFileKeepAlive = setInterval(() => {}, 1000);
+after(() => clearInterval(testFileKeepAlive));
 const backgroundSource = await readFile(
   resolve(repoRoot, "background.js"),
   "utf8",
@@ -52,6 +57,10 @@ function createEvent() {
     listeners,
     addListener(listener) {
       listeners.push(listener);
+    },
+    removeListener(listener) {
+      const index = listeners.indexOf(listener);
+      if (index >= 0) listeners.splice(index, 1);
     },
   };
 }
@@ -210,6 +219,9 @@ function createHarness() {
         if (typeof tabMessageHandler === "function") {
           return await tabMessageHandler(tabId, payload);
         }
+        if (payload?.action === "inspectCaptureActivity") {
+          return {ok: true, targetActive: false, activeCount: 0};
+        }
         return {ok: true};
       },
       async get(tabId) {
@@ -243,8 +255,30 @@ function createHarness() {
       },
       async reload(tabId) {
         reloadedTabIds.push(tabId);
+        let hookResult = null;
         if (typeof reloadHook === "function") {
-          await reloadHook(tabId);
+          hookResult = await reloadHook(tabId);
+        }
+        if (hookResult?.emitLifecycle === false) {
+          return;
+        }
+        const tab = {
+          id: Number(tabId),
+          windowId: 1,
+          groupId: -1,
+          url: "https://www.xiaohongshu.com/explore/test-note",
+        };
+        for (const listener of [...chrome.tabs.onUpdated.listeners]) {
+          listener(Number(tabId), {status: "loading"}, {
+            ...tab,
+            status: "loading",
+          });
+        }
+        for (const listener of [...chrome.tabs.onUpdated.listeners]) {
+          listener(Number(tabId), {status: "complete"}, {
+            ...tab,
+            status: "complete",
+          });
         }
       },
       async create(options) {
@@ -449,6 +483,7 @@ function createHarness() {
       `  releaseUnattendedKeywordPlanLock,\n` +
       `  inspectUnattendedBusinessUploadEvidence,\n` +
       `  inspectUnattendedLocalClosurePredicate,\n` +
+      `  reloadTabAndWaitForDocumentReplacement,\n` +
       `  reconcileUnattendedLocalClosureEvidence,\n` +
       `  flush: () => captureExecutionLockOperationQueue,\n` +
       `  flushRuntime: () => runtimeMutationQueue,\n` +
@@ -822,6 +857,586 @@ test("local closure closes only its exact runner and persists authoritative uplo
   assert.equal(
     harness.storage[UNATTENDED_REQUEST_KEY].localClosureEvidence.closedAt,
     evidence.closedAt,
+  );
+});
+
+test("a safety-terminal heartbeat rebuilds local closure from the authoritative request when ledger item attempts are flattened", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "safety-closure-request",
+    attemptId: "safety-closure-attempt",
+    cloudAssigned: true,
+    cloudAgentScopeId: "agent-safe",
+    counts: {total: 2, processed: 2, saved: 5},
+    progressSeq: 546,
+    progress: {
+      current: 2,
+      total: 2,
+      streamingSyncEnqueuedCount: 5,
+      streamingSyncProcessedCount: 5,
+      streamingSyncSuccessCount: 5,
+      streamingSyncCapturedUniqueCount: 5,
+      streamingSyncEnqueuedUniqueCount: 5,
+      streamingSyncExcludedUniqueCount: 0,
+      streamingSyncSucceededUniqueCount: 5,
+      capturedRecordCount: 5,
+    },
+    orchestrationContext: {
+      parentTaskId: "safety-parent-task",
+      revision: 3,
+      itemIds: ["safety-item"],
+      itemAttempts: [{
+        itemId: "safety-item",
+        attemptId: "safety-item-attempt",
+        attemptNumber: 3,
+        assignmentRevision: 3,
+      }],
+      attemptIdentity: "safety-item-attempt",
+    },
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-safe", token: "secret-safe"},
+  };
+  harness.storage[TASK_LEDGER_KEY].runs[0].metadata = {
+    cloudAgentScopeId: "agent-safe",
+    orchestrationContext: {
+      parentTaskId: "safety-parent-task",
+      revision: 3,
+      itemIds: ["safety-item"],
+      itemAttempts: ["[object Object]"],
+      attemptIdentity: "safety-item-attempt",
+    },
+  };
+  harness.setTabQueryHandler(async () => []);
+
+  const heartbeat = await harness.api.syncCloudTaskAgent({
+    reason: "safety_terminal_reconcile",
+    force: true,
+  });
+
+  assert.equal(heartbeat.ok, true, JSON.stringify(heartbeat));
+  const reported = harness.cloudHeartbeats.at(-1).tasks.find(
+    (task) => task.id === request.id,
+  );
+  assert.ok(reported, JSON.stringify(harness.cloudHeartbeats.at(-1)));
+  assert.equal(reported.status, "needs_action");
+  assert.equal(reported.progressSeq, 547);
+  assert.equal(
+    reported.metadata.localClosure.itemAttemptId,
+    "safety-item-attempt",
+  );
+  assert.equal(reported.metadata.localClosures.length, 1);
+});
+
+test("an unrelated capture lock does not block safety-terminal local closure", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "released-safety-request",
+    attemptId: "released-safety-attempt",
+  });
+  harness.storage[LOCK_KEY] = {
+    id: "unrelated-capture-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "unrelated-holder",
+    holderDocumentId: "unrelated-document",
+    holderTabId: 212,
+    captureTaskId: "unattended-capture:another-task",
+    captureTaskAttemptId: "another-attempt",
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, true, JSON.stringify(result));
+  assert.equal(harness.storage[LOCK_KEY].id, "unrelated-capture-lock");
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure.attemptId,
+    request.attemptId,
+  );
+});
+
+test("a later heartbeat retries exact safety-terminal lock cleanup before reporting local closure", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "stranded-safety-request",
+    attemptId: "stranded-safety-attempt",
+    runnerTabId: 312,
+  });
+  const taskId = `unattended-capture:${request.id}`;
+  harness.storage[LOCK_KEY] = {
+    id: "stranded-safety-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "stranded-holder",
+    holderDocumentId: "stranded-document",
+    holderTabId: 312,
+    captureTaskId: taskId,
+    captureTaskAttemptId: request.attemptId,
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-safe", token: "secret-safe"},
+  };
+  harness.setTabQueryHandler(async () => []);
+  let lockRemoveAttempts = 0;
+  harness.setStorageRemoveHandler(async (keys) => {
+    if (!(Array.isArray(keys) ? keys : [keys]).includes(LOCK_KEY)) return;
+    lockRemoveAttempts += 1;
+    if (lockRemoveAttempts === 1) {
+      throw new Error("simulated first terminal lock cleanup failure");
+    }
+  });
+
+  const firstHeartbeat = await harness.api.syncCloudTaskAgent({
+    reason: "retry_stranded_terminal_cleanup",
+    force: true,
+  });
+
+  assert.equal(firstHeartbeat.ok, true, JSON.stringify(firstHeartbeat));
+  assert.equal(harness.storage[LOCK_KEY].id, "stranded-safety-lock");
+  assert.equal(
+    harness.cloudHeartbeats.at(-1).tasks.find((task) => task.id === request.id)
+      .metadata.localClosure,
+    undefined,
+  );
+
+  const secondHeartbeat = await harness.api.syncCloudTaskAgent({
+    reason: "retry_stranded_terminal_cleanup_again",
+    force: true,
+  });
+
+  assert.equal(secondHeartbeat.ok, true, JSON.stringify(secondHeartbeat));
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  const reported = harness.cloudHeartbeats.at(-1).tasks.find(
+    (task) => task.id === request.id,
+  );
+  assert.equal(
+    reported.metadata.localClosure.attemptId,
+    request.attemptId,
+  );
+});
+
+test("local closure fails closed when the exact source tab cannot acknowledge cancel or reload", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "unconfirmed-stop-request",
+    attemptId: "unconfirmed-stop-attempt",
+  });
+  harness.storage[LOCK_KEY] = {
+    id: "unconfirmed-stop-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "unconfirmed-holder",
+    holderDocumentId: "unconfirmed-document",
+    holderTabId: 412,
+    captureTaskId: `unattended-capture:${request.id}`,
+    captureTaskAttemptId: request.attemptId,
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+  harness.setTabMessageHandler(async () => {
+    throw new Error("source content context did not acknowledge cancel");
+  });
+  harness.setReloadHook(async () => {
+    throw new Error("source tab reload rejected");
+  });
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+    closeOwnedRunnerTabs: true,
+  });
+
+  assert.equal(result.persisted, false, JSON.stringify(result));
+  assert.equal(result.reason, "previous_capture_stop_unconfirmed");
+  assert.equal(harness.storage[LOCK_KEY].id, "unconfirmed-stop-lock");
+  assert.deepEqual(harness.reloadedTabIds, [412]);
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure,
+    undefined,
+  );
+});
+
+test("a reload request without a loading-to-complete lifecycle is not closure proof", async () => {
+  const harness = createHarness();
+  const existingListenerCount = harness.chrome.tabs.onUpdated.listeners.length;
+  harness.setReloadHook(async () => ({emitLifecycle: false}));
+
+  await assert.rejects(
+    harness.api.reloadTabAndWaitForDocumentReplacement(418, {timeoutMs: 20}),
+    /reload lifecycle was not observed/,
+  );
+
+  assert.deepEqual(harness.reloadedTabIds, [418]);
+  assert.equal(
+    harness.chrome.tabs.onUpdated.listeners.length,
+    existingListenerCount,
+    "the bounded reload observer must be removed after failure",
+  );
+});
+
+test("a synchronous reload API failure removes its closure observer", async () => {
+  const harness = createHarness();
+  const existingListenerCount = harness.chrome.tabs.onUpdated.listeners.length;
+  harness.chrome.tabs.reload = () => {
+    throw new Error("reload API threw synchronously");
+  };
+
+  await assert.rejects(
+    harness.api.reloadTabAndWaitForDocumentReplacement(418, {timeoutMs: 20}),
+    /reload API threw synchronously/,
+  );
+
+  assert.equal(
+    harness.chrome.tabs.onUpdated.listeners.length,
+    existingListenerCount,
+    "a synchronous reload failure must remove the bounded observer immediately",
+  );
+});
+
+test("cancel acknowledgement cannot release a source while content still reports it active", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "active-after-cancel-request",
+    attemptId: "active-after-cancel-attempt",
+    progress: {
+      runnerTabId: 413,
+      captureRequestId: "capture-still-active",
+    },
+  });
+  harness.storage[LOCK_KEY] = {
+    id: "active-after-cancel-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "active-after-cancel-holder",
+    holderDocumentId: "active-after-cancel-document",
+    holderTabId: 413,
+    captureTaskId: `unattended-capture:${request.id}`,
+    captureTaskAttemptId: request.attemptId,
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload?.action === "cancelCapture") {
+      return {ok: true, matched: true};
+    }
+    if (payload?.action === "inspectCaptureActivity") {
+      return {ok: true, targetActive: true, activeCount: 1};
+    }
+    return {ok: false};
+  });
+  harness.setReloadHook(async () => {
+    throw new Error("reload failed while source remained active");
+  });
+
+  const keepAlive = setInterval(() => {}, 50);
+  let result;
+  try {
+    result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+      expectedRequestId: request.id,
+      expectedAttemptId: request.attemptId,
+    });
+  } finally {
+    clearInterval(keepAlive);
+  }
+
+  assert.equal(result.persisted, false, JSON.stringify(result));
+  assert.equal(result.reason, "previous_capture_stop_unconfirmed");
+  assert.equal(harness.storage[LOCK_KEY].id, "active-after-cancel-lock");
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation,
+    undefined,
+  );
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure,
+    undefined,
+  );
+});
+
+test("exact capture activity must settle before local closure is persisted", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "settled-capture-request",
+    attemptId: "settled-capture-attempt",
+    progress: {
+      runnerTabId: 414,
+      captureRequestId: "capture-exact-request",
+    },
+  });
+  harness.storage[LOCK_KEY] = {
+    id: "settled-capture-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "settled-capture-holder",
+    holderDocumentId: "settled-capture-document",
+    holderTabId: 414,
+    captureTaskId: `unattended-capture:${request.id}`,
+    captureTaskAttemptId: request.attemptId,
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+  let inspectionCount = 0;
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload?.action === "cancelCapture") {
+      assert.equal(payload.captureRequestId, "capture-exact-request");
+      return {ok: true, matched: true};
+    }
+    if (payload?.action === "inspectCaptureActivity") {
+      assert.equal(payload.captureRequestId, "capture-exact-request");
+      inspectionCount += 1;
+      return {
+        ok: true,
+        targetActive: inspectionCount === 1,
+        activeCount: inspectionCount === 1 ? 1 : 0,
+      };
+    }
+    return {ok: true};
+  });
+
+  const keepAlive = setInterval(() => {}, 50);
+  let result;
+  try {
+    result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+      expectedRequestId: request.id,
+      expectedAttemptId: request.attemptId,
+    });
+  } finally {
+    clearInterval(keepAlive);
+  }
+
+  assert.equal(result.persisted, true, JSON.stringify(result));
+  assert.equal(inspectionCount, 2);
+  assert.deepEqual(harness.reloadedTabIds, []);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation.stage,
+    "runtime_released",
+  );
+  assert.equal(result.evidence.sourceStopConfirmed, true);
+});
+
+test("an unrelated lock plus stale progress tab is never used as closure ownership", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "stale-progress-request",
+    attemptId: "stale-progress-attempt",
+    progress: {runnerTabId: 415},
+  });
+  harness.storage[LOCK_KEY] = {
+    id: "new-attempt-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "new-attempt-holder",
+    holderDocumentId: "new-attempt-document",
+    holderTabId: 415,
+    captureTaskId: "unattended-capture:new-attempt",
+    captureTaskAttemptId: "new-attempt",
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, false, JSON.stringify(result));
+  assert.equal(result.reason, "source_identity_unverifiable");
+  assert.equal(harness.storage[LOCK_KEY].id, "new-attempt-lock");
+  assert.deepEqual(harness.sentTabMessages, []);
+  assert.deepEqual(harness.reloadedTabIds, []);
+});
+
+test("an exact bound lock without a verifiable source remains locked and unproven", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "bound-source-missing-request",
+    attemptId: "bound-source-missing-attempt",
+  });
+  harness.storage[LOCK_KEY] = {
+    id: "bound-source-missing-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "bound-source-missing-holder",
+    holderDocumentId: "bound-source-missing-document",
+    holderTabId: null,
+    captureTaskId: `unattended-capture:${request.id}`,
+    captureTaskAttemptId: request.attemptId,
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, false, JSON.stringify(result));
+  assert.equal(result.reason, "source_identity_unverifiable");
+  assert.equal(harness.storage[LOCK_KEY].id, "bound-source-missing-lock");
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation,
+    undefined,
+  );
+  assert.equal(
+    harness.storage[TASK_LEDGER_KEY].runs[0].metadata.localClosure,
+    undefined,
+  );
+  assert.deepEqual(harness.reloadedTabIds, []);
+});
+
+test("a released legacy runtime can close through its exact inactive capture request without reloading the tab", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "legacy-released-runtime-request",
+    attemptId: "legacy-released-runtime-attempt",
+    progress: {
+      runnerTabId: 419,
+      captureRequestId: "legacy-exact-capture-request",
+    },
+  });
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload?.action === "cancelCapture") {
+      assert.equal(payload.captureRequestId, "legacy-exact-capture-request");
+      return {ok: true, matched: false};
+    }
+    if (payload?.action === "inspectCaptureActivity") {
+      return {ok: true, targetActive: false, activeCount: 0};
+    }
+    return {ok: true};
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, true, JSON.stringify(result));
+  assert.deepEqual(harness.reloadedTabIds, []);
+  assert.equal(result.evidence.sourceStopConfirmed, true);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation.method,
+    "all_stopped",
+  );
+});
+
+test("persisted local closure never touches a later tab that reused stale progress identity", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "persisted-closure-request",
+    attemptId: "persisted-closure-attempt",
+  });
+  harness.setTabQueryHandler(async () => []);
+  const first = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+  assert.equal(first.persisted, true);
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    progress: {
+      ...harness.storage[UNATTENDED_REQUEST_KEY].progress,
+      runnerTabId: 416,
+    },
+  };
+  harness.storage[LOCK_KEY] = {
+    id: "later-reused-tab-lock",
+    owner: "unattended_keyword_plan",
+    holderId: "later-holder",
+    holderDocumentId: "later-document",
+    holderTabId: 416,
+    captureTaskId: "unattended-capture:later-request",
+    captureTaskAttemptId: "later-attempt",
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+
+  const replay = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(replay.persisted, false);
+  assert.equal(replay.reason, "already_persisted");
+  assert.equal(harness.storage[LOCK_KEY].id, "later-reused-tab-lock");
+  assert.deepEqual(harness.sentTabMessages, []);
+  assert.deepEqual(harness.reloadedTabIds, []);
+});
+
+test("a same-id lock holder replacement is never released by the old stop snapshot", async () => {
+  const harness = createHarness();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: "lock-holder-race-request",
+    attemptId: "lock-holder-race-attempt",
+    progress: {runnerTabId: 417, captureRequestId: "lock-race-capture"},
+  });
+  const originalLock = {
+    id: "same-id-lock-race",
+    owner: "unattended_keyword_plan",
+    holderId: "same-holder",
+    holderDocumentId: "old-source-document",
+    holderTabId: 417,
+    captureTaskId: `unattended-capture:${request.id}`,
+    captureTaskAttemptId: request.attemptId,
+    schemaVersion: 1,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    expiresAt: Date.now() + 60_000,
+  };
+  harness.storage[LOCK_KEY] = originalLock;
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload?.action === "inspectCaptureActivity") {
+      return {ok: true, targetActive: false, activeCount: 0};
+    }
+    return {ok: true};
+  });
+  let lockReadCount = 0;
+  harness.setStorageGetHandler(async (keys, result) => {
+    if (keys !== LOCK_KEY) return result;
+    lockReadCount += 1;
+    if (lockReadCount !== 2) return result;
+    const replacement = {
+      ...originalLock,
+      holderDocumentId: "replacement-source-document",
+      holderTabId: 418,
+      updatedAt: new Date().toISOString(),
+    };
+    harness.storage[LOCK_KEY] = replacement;
+    return {[LOCK_KEY]: replacement};
+  });
+
+  const result = await harness.api.reconcileUnattendedLocalClosureEvidence({
+    expectedRequestId: request.id,
+    expectedAttemptId: request.attemptId,
+  });
+
+  assert.equal(result.persisted, false, JSON.stringify(result));
+  assert.equal(result.reason, "runtime_identity_changed");
+  assert.equal(harness.storage[LOCK_KEY].holderTabId, 418);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation,
+    undefined,
+  );
+  assert.deepEqual(
+    new Set(harness.sentTabMessages.map(({tabId}) => tabId)),
+    new Set([417]),
   );
 });
 
@@ -2177,9 +2792,11 @@ test("a vanished holder is canceled and replaced immediately", async () => {
   assert.equal(first.ok, true);
   assert.equal(second.ok, true);
   assert.notEqual(second.lock.id, first.lock.id);
-  assert.equal(harness.sentTabMessages.length, 1);
-  assert.equal(harness.sentTabMessages[0].tabId, 7);
-  assert.equal(harness.sentTabMessages[0].payload.action, "cancelCapture");
+  const cancelMessages = harness.sentTabMessages.filter(
+    ({payload}) => payload.action === "cancelCapture",
+  );
+  assert.equal(cancelMessages.length, 1);
+  assert.equal(cancelMessages[0].tabId, 7);
 });
 
 test("an alive holder remains mutually exclusive", async () => {
@@ -3447,6 +4064,9 @@ test("plan-disable cleanup finishes relaying the old attempt before a successor 
   let successorSettled = false;
   let successorWonRelayWindow = false;
   harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload?.action === "inspectCaptureActivity") {
+      return {ok: true, targetActive: false, activeCount: 0};
+    }
     if (payload?.action !== "cancelCapture") return {ok: true};
     // Model the old runner releasing its lease immediately after observing the
     // canceled request, then a cloud assignment trying to publish a successor
@@ -3493,8 +4113,12 @@ test("plan-disable cleanup finishes relaying the old attempt before a successor 
     harness.storage[UNATTENDED_REQUEST_KEY].id,
     "cloud-successor-after-relay",
   );
-  assert.equal(harness.sentTabMessages.length, 1);
-  assert.equal(harness.sentTabMessages[0].payload.action, "cancelCapture");
+  assert.equal(
+    harness.sentTabMessages.filter(
+      ({payload}) => payload.action === "cancelCapture",
+    ).length,
+    1,
+  );
 });
 
 test("a cloud stop command cancels only its exact active request", async () => {
@@ -5637,10 +6261,18 @@ test("runner refresh hard-reloads the old capture tab when cancel is not acknowl
     holderDocumentId: "old-document",
     holderTabId: 91,
   });
-  harness.setTabMessageHandler(async () => ({
-    ok: false,
-    error: {message: "旧页面没有确认取消"},
-  }));
+  harness.setTabMessageHandler(async (tabId, payload) => {
+    if (
+      payload?.action === "ping" &&
+      harness.reloadedTabIds.includes(Number(tabId))
+    ) {
+      return {ok: true, ready: true};
+    }
+    return {
+      ok: false,
+      error: {message: "旧页面没有确认取消"},
+    };
+  });
 
   const resumed = await harness.api.claimUnattendedKeywordRun({
     requestId: request.id,

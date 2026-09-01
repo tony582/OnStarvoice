@@ -25,6 +25,8 @@ import {
   resolveOpsControlActionsGlobalEnabled,
 } from '../server/services/ops-control.js';
 import {
+  projectOpsControlActionExecution,
+  runOpsControlGuardedActions,
   selectOpsControlActionCandidates,
   verifyOpsControlAction,
 } from '../server/services/ops-control-actions.js';
@@ -149,7 +151,7 @@ test('control plane defaults to tenant-off observe-only mode with an explicit gl
   assert.equal(defaults.actionsEnabled, false);
   assert.equal(defaults.actionsGlobalEnabled, false);
   assert.equal(defaults.llmEnabled, false);
-  assert.equal(defaults.runtimeBaselineVersion, '0.4.2');
+  assert.equal(defaults.runtimeBaselineVersion, '0.4.3');
   assert.equal(resolveOpsControlGlobalEnabled({OPS_CONTROL_GLOBAL_ENABLED: 'off'}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({OPS_CONTROL_ACTIONS_GLOBAL_ENABLED: 'true'}), true);
@@ -491,6 +493,315 @@ test('manual final state is separated from a system incident', () => {
   assert.equal(assessment.summary.redIncidentCount, 0);
 });
 
+test('source-local-closure recovery fences are counted as explicit blockers, never recovered items', () => {
+  const rawTask = {
+    id: 'closure-blocked-task',
+    title: '抖音无人值守',
+    status: 'running',
+    distribution_mode: 'elastic_pool',
+    progress_seq: 12,
+    business_progress_at: '2026-08-24T00:00:00.000Z',
+    started_at: '2026-08-23T23:40:00.000Z',
+    created_at: '2026-08-23T23:30:00.000Z',
+    item_total: 13,
+    active_item_count: 1,
+    completed_item_count: 12,
+    recovered_item_count: 0,
+    source_closure_blocked_item_count: 1,
+  };
+  const previous = normalizeOpsControlEvidence({
+    capturedAt: '2026-08-24T00:00:00.000Z',
+    schedules: [],
+    tasks: [rawTask],
+    agents: [],
+    operations: {},
+    persistence: {},
+    ai: {},
+  });
+  const current = normalizeOpsControlEvidence({
+    capturedAt: '2026-08-24T00:05:00.000Z',
+    schedules: [],
+    tasks: [rawTask],
+    agents: [],
+    operations: {},
+    persistence: {},
+    ai: {},
+  });
+
+  assert.equal(current.tasks[0].sourceClosureBlockedItemCount, 1);
+  assert.equal(current.taskSummary.sourceClosureBlockedItems, 1);
+  assert.equal(current.taskSummary.recoveredItems, 0);
+
+  const assessment = assessOpsControlSnapshots(previous, current, policy());
+  assert.equal(assessment.summary.sourceClosureBlockedCount, 1);
+  assert.equal(assessment.summary.manualBlockerCount, 0);
+  assert.ok(assessment.incidents.some(
+    row => row.type === 'capture_source_closure_blocked',
+  ));
+  assert.ok(!assessment.incidents.some(
+    row => row.type === 'manual_intervention_required',
+  ));
+});
+
+test('elastic requeue reports a local-closure fence as blocked instead of skipped or recovered', () => {
+  assert.deepEqual(
+    projectOpsControlActionExecution('elastic_requeue', {
+      scanned: 1,
+      requeued: 0,
+      sourceClosureBlocked: 1,
+    }),
+    {status: 'blocked'},
+  );
+
+  assert.deepEqual(
+    projectOpsControlActionExecution('elastic_requeue', {
+      scanned: 2,
+      requeued: 1,
+      sourceClosureBlocked: 1,
+    }),
+    {status: 'pending_verification'},
+    'a real requeue must remain visible even when another item is closure-blocked',
+  );
+});
+
+test('a source-closure-blocked action is verified after the current blocker disappears', () => {
+  const action = {
+    action_type: 'elastic_requeue',
+    target_id: 'task-a',
+    request: {
+      before: {
+        sourceClosureBlockedItemCount: 1,
+        progressSeq: 10,
+      },
+    },
+    result: {
+      scanned: 1,
+      requeued: 0,
+      sourceClosureBlocked: 1,
+    },
+  };
+  const stillBlocked = snapshot('2026-08-24T00:02:00.000Z', {
+    tasks: [task({sourceClosureBlockedItemCount: 1, progressSeq: 10})],
+  });
+  assert.equal(
+    verifyOpsControlAction(action, stillBlocked, {
+      now: new Date('2026-08-24T00:02:00.000Z'),
+    }).status,
+    'blocked',
+  );
+
+  const released = snapshot('2026-08-24T00:03:00.000Z', {
+    tasks: [task({sourceClosureBlockedItemCount: 0, progressSeq: 10})],
+  });
+  assert.equal(
+    verifyOpsControlAction(action, released, {
+      now: new Date('2026-08-24T00:03:00.000Z'),
+    }).status,
+    'verified',
+  );
+});
+
+test('a source-closure-blocked action is not verified when terminal normalization only hides the blocker', () => {
+  const action = {
+    action_type: 'elastic_requeue',
+    target_id: 'task-a',
+    request: {
+      before: {
+        sourceClosureBlockedItemCount: 1,
+        progressSeq: 10,
+      },
+    },
+    result: {
+      scanned: 1,
+      requeued: 0,
+      sourceClosureBlocked: 1,
+    },
+  };
+
+  for (const status of ['failed', 'completed_with_failures']) {
+    const verification = verifyOpsControlAction(action, snapshot(
+      '2026-08-24T00:03:00.000Z',
+      {tasks: [task({status, sourceClosureBlockedItemCount: 0, progressSeq: 10})]},
+    ));
+    assert.equal(verification.status, 'failed');
+    assert.equal(verification.details.sourceClosureReleased, false);
+  }
+  for (const status of ['canceled', 'skipped', 'superseded']) {
+    const verification = verifyOpsControlAction(action, snapshot(
+      '2026-08-24T00:03:00.000Z',
+      {tasks: [task({status, sourceClosureBlockedItemCount: 0, progressSeq: 10})]},
+    ));
+    assert.equal(verification.status, 'skipped');
+    assert.equal(verification.details.sourceClosureReleased, false);
+  }
+});
+
+test('a mixed elastic requeue is blocked until closure clears and then requires real progress', () => {
+  const action = {
+    action_type: 'elastic_requeue',
+    target_id: 'task-a',
+    request: {
+      before: {
+        sourceClosureBlockedItemCount: 0,
+        recoveredItemCount: 0,
+        progressSeq: 10,
+        businessProgressAt: '2026-08-24T00:00:00.000Z',
+      },
+    },
+    result: {
+      scanned: 2,
+      requeued: 1,
+      sourceClosureBlocked: 1,
+    },
+    verification_due_at: '2026-08-24T00:20:00.000Z',
+  };
+  const stillBlocked = snapshot('2026-08-24T00:02:00.000Z', {
+    tasks: [task({
+      status: 'recovering',
+      recovering: true,
+      sourceClosureBlockedItemCount: 1,
+      progressSeq: 10,
+      businessProgressAt: '2026-08-24T00:00:00.000Z',
+    })],
+  });
+  assert.equal(
+    verifyOpsControlAction(action, stillBlocked, {
+      now: new Date('2026-08-24T00:02:00.000Z'),
+    }).status,
+    'blocked',
+    'a pre-existing recovering flag is not evidence that the mixed action succeeded',
+  );
+
+  const releasedWithoutProgress = snapshot('2026-08-24T00:03:00.000Z', {
+    tasks: [task({
+      status: 'recovering',
+      recovering: true,
+      sourceClosureBlockedItemCount: 0,
+      progressSeq: 10,
+      businessProgressAt: '2026-08-24T00:00:00.000Z',
+    })],
+  });
+  assert.equal(
+    verifyOpsControlAction(action, releasedWithoutProgress, {
+      now: new Date('2026-08-24T00:03:00.000Z'),
+    }).status,
+    'pending_verification',
+  );
+
+  const releasedWithProgress = snapshot('2026-08-24T00:04:00.000Z', {
+    tasks: [task({
+      status: 'running',
+      recovering: false,
+      sourceClosureBlockedItemCount: 0,
+      progressSeq: 11,
+      businessProgressAt: '2026-08-24T00:04:00.000Z',
+    })],
+  });
+  assert.equal(
+    verifyOpsControlAction(action, releasedWithProgress, {
+      now: new Date('2026-08-24T00:04:00.000Z'),
+    }).status,
+    'verified',
+  );
+});
+
+test('guarded action verification persists open-state transitions without counting them as failures', async () => {
+  const runTransition = async ({action, taskSnapshot, now}) => {
+    const updates = [];
+    let openActionQueryCount = 0;
+    const result = await runOpsControlGuardedActions({
+      tenantId: 'tenant-a',
+      run: {id: 'run-a'},
+      sequence: 3,
+      snapshot: snapshot(now.toISOString(), {tasks: [taskSnapshot]}),
+      assessment: {summary: {consecutiveEvidence: true}, incidents: []},
+      policy: {
+        mode: 'guarded',
+        actionsEnabled: false,
+        actionVerificationSeconds: 900,
+      },
+      now,
+      queryAll: async statement => {
+        if (statement.includes('SELECT *') && statement.includes('ops_control_actions')) {
+          openActionQueryCount += 1;
+          return openActionQueryCount === 1 ? [action] : [];
+        }
+        return [];
+      },
+      execute: async (statement, params) => {
+        if (statement.includes('snapshot_after_sequence')) updates.push(params);
+        return null;
+      },
+    });
+    return {result, updates};
+  };
+
+  const baseAction = {
+    id: 'action-a',
+    action_type: 'elastic_requeue',
+    target_id: 'task-a',
+    request: {before: {
+      progressSeq: 10,
+      recoveredItemCount: 0,
+      businessProgressAt: '2026-08-24T00:00:00.000Z',
+    }},
+    result: {requeued: 1, sourceClosureBlocked: 1},
+  };
+  const blocked = await runTransition({
+    action: {...baseAction, status: 'pending_verification'},
+    taskSnapshot: task({
+      sourceClosureBlockedItemCount: 1,
+      progressSeq: 10,
+      recovering: true,
+    }),
+    now: new Date('2026-08-24T00:02:00.000Z'),
+  });
+  assert.equal(blocked.updates[0][2], 'blocked');
+  assert.equal(blocked.updates[0][7], null);
+  assert.equal(blocked.result.verificationFailed, 0);
+
+  const pending = await runTransition({
+    action: {...baseAction, status: 'blocked'},
+    taskSnapshot: task({
+      sourceClosureBlockedItemCount: 0,
+      progressSeq: 10,
+      recovering: true,
+    }),
+    now: new Date('2026-08-24T00:03:00.000Z'),
+  });
+  assert.equal(pending.updates[0][2], 'pending_verification');
+  assert.equal(pending.updates[0][7], '2026-08-24T00:18:00.000Z');
+  assert.equal(pending.result.verificationFailed, 0);
+});
+
+test('ops-control persistence collects source-local-closure blockers from item and active child truth', async () => {
+  const service = await source('server/services/ops-control.js');
+  const actions = await source('server/services/ops-control-actions.js');
+  assert.match(service, /source_closure_blocked_item_count/u);
+  assert.match(service, /item\.metadata->>'waitingForSourceClosure' = 'true'/u);
+  assert.match(
+    service,
+    /closure_blocked_execution\.metadata->>'waitingForSourceClosure' = 'true'/u,
+  );
+  assert.match(
+    service,
+    /item\.status IN \([\s\S]*'retryable'[\s\S]*waitingForSourceClosure/u,
+  );
+  assert.match(actions, /sourceClosureBlocked[\s\S]*status: 'blocked'/u);
+  assert.match(
+    actions,
+    /status IN \('pending_verification', 'blocked'\)/u,
+  );
+  assert.match(
+    actions,
+    /CASE status WHEN 'pending_verification' THEN 0 ELSE 1 END/u,
+  );
+  assert.match(
+    service,
+    /WHERE root\.status NOT IN \([\s\S]*source_closure_blocked_item_count/u,
+  );
+});
+
 test('a task-level terminal failure is not hidden when no work item was created', () => {
   const failedTask = task({
     status: 'failed',
@@ -558,7 +869,7 @@ test('guarded actions select only allowlisted safe targets and require later ver
 });
 
 test('terminal parent status absorbs stale active child residue in normalized task evidence', () => {
-  const normalized = normalizeOpsControlEvidence({
+  const evidence = {
     capturedAt: '2026-08-24T00:01:00.000Z',
     schedules: [],
     agents: [],
@@ -571,10 +882,24 @@ test('terminal parent status absorbs stale active child residue in normalized ta
       item_total: 1,
       active_item_count: 1,
       active_child_count: 1,
+      source_closure_blocked_item_count: 1,
     }],
-  });
+  };
+  const normalized = normalizeOpsControlEvidence(evidence);
   assert.equal(normalized.tasks[0].active, false);
+  assert.equal(normalized.tasks[0].sourceClosureBlockedItemCount, 0);
   assert.equal(normalized.taskSummary.active, 0);
+  assert.equal(normalized.taskSummary.sourceClosureBlockedItems, 0);
+
+  const previous = normalizeOpsControlEvidence({
+    ...evidence,
+    capturedAt: '2026-08-24T00:00:00.000Z',
+  });
+  const assessment = assessOpsControlSnapshots(previous, normalized, policy());
+  assert.equal(assessment.summary.sourceClosureBlockedCount, 0);
+  assert.ok(!assessment.incidents.some(
+    row => row.type === 'capture_source_closure_blocked',
+  ));
 });
 
 test('control-plane agent evidence separates connection, task-state health, and auxiliary warnings', () => {

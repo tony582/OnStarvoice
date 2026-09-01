@@ -14,7 +14,7 @@ import {runOpsControlGuardedActions} from './ops-control-actions.js';
 import {normalizeCaptureRecoverySettings} from './capture-recovery-intents.js';
 
 export const OPS_CONTROL_POLICY_VERSION = 'ops-guarded-v1';
-export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.2';
+export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.3';
 export const OPS_CONTROL_MODE = 'observe';
 export const OPS_CONTROL_MODES = Object.freeze(['observe', 'guarded']);
 export const OPS_CONTROL_ACTION_TYPES = Object.freeze([
@@ -64,6 +64,15 @@ const ACTIVE_ITEM_STATUSES = new Set([
   'running',
   'recovering',
   'retryable',
+]);
+const TERMINAL_TASK_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+  'superseded',
 ]);
 const RECOVERY_TASK_STATUSES = new Set(['recovering', 'resume_requested']);
 const BOOLEAN_TRUE = new Set(['1', 'true', 'on', 'yes']);
@@ -623,6 +632,8 @@ async function collectTasks(db, tenantId, window) {
       COALESCE(item_stats.warning_item_count, 0)::int AS warning_item_count,
       COALESCE(item_stats.failed_item_count, 0)::int AS failed_item_count,
       COALESCE(item_stats.needs_action_item_count, 0)::int AS needs_action_item_count,
+      COALESCE(item_stats.source_closure_blocked_item_count, 0)::int
+        AS source_closure_blocked_item_count,
       COALESCE(item_stats.skipped_item_count, 0)::int AS skipped_item_count,
       COALESCE(item_stats.recovered_item_count, 0)::int AS recovered_item_count,
       COALESCE(attempt_stats.historical_failure_count, 0)::int AS historical_failure_count,
@@ -636,6 +647,31 @@ async function collectTasks(db, tenantId, window) {
         COUNT(*) FILTER (WHERE item.status = 'completed_with_warnings') AS warning_item_count,
         COUNT(*) FILTER (WHERE item.status = 'failed') AS failed_item_count,
         COUNT(*) FILTER (WHERE item.status = 'needs_action') AS needs_action_item_count,
+        COUNT(*) FILTER (
+          WHERE root.status NOT IN (
+            'completed', 'completed_with_warnings',
+            'completed_with_failures', 'failed', 'canceled',
+            'skipped', 'superseded'
+          )
+            AND item.status IN (
+              'assigned', 'dispatch_pending', 'dispatched', 'waiting_device',
+              'claimed', 'running', 'recovering', 'retryable'
+            )
+            AND (
+              item.metadata->>'waitingForSourceClosure' = 'true'
+              OR EXISTS (
+                SELECT 1
+                FROM capture_tasks closure_blocked_execution
+                WHERE closure_blocked_execution.tenant_id = item.tenant_id
+                  AND closure_blocked_execution.id = item.execution_task_id
+                  AND closure_blocked_execution.status IN (
+                    'pending', 'claimed', 'running', 'recovering',
+                    'waiting_device'
+                  )
+                  AND closure_blocked_execution.metadata->>'waitingForSourceClosure' = 'true'
+              )
+            )
+        ) AS source_closure_blocked_item_count,
         COUNT(*) FILTER (WHERE item.status IN ('skipped', 'canceled')) AS skipped_item_count,
         COUNT(*) FILTER (
           WHERE item.status IN ('completed', 'completed_with_warnings')
@@ -945,6 +981,9 @@ function normalizeTask(row) {
     warningItemCount: integer(row.warning_item_count),
     failedItemCount: integer(row.failed_item_count),
     needsActionItemCount: integer(row.needs_action_item_count),
+    sourceClosureBlockedItemCount: TERMINAL_TASK_STATUSES.has(status)
+      ? 0
+      : integer(row.source_closure_blocked_item_count),
     skippedItemCount: integer(row.skipped_item_count),
     recoveredItemCount: integer(row.recovered_item_count),
     historicalFailureCount: integer(row.historical_failure_count),
@@ -1033,6 +1072,10 @@ export function normalizeOpsControlEvidence(evidence = {}) {
       recovering: tasks.filter(row => row.recovering).length,
       finalFailedItems: tasks.reduce((sum, row) => sum + row.failedItemCount, 0),
       finalNeedsActionItems: tasks.reduce((sum, row) => sum + row.needsActionItemCount, 0),
+      sourceClosureBlockedItems: tasks.reduce(
+        (sum, row) => sum + row.sourceClosureBlockedItemCount,
+        0,
+      ),
       finalSkippedItems: tasks.reduce((sum, row) => sum + row.skippedItemCount, 0),
       recoveredItems: tasks.reduce((sum, row) => sum + row.recoveredItemCount, 0),
       historicalFailures: tasks.reduce((sum, row) => sum + row.historicalFailureCount, 0),
@@ -1291,10 +1334,35 @@ export function assessOpsControlSnapshots(previousValue, currentValue, settings 
   }
 
   const finalNeedsActionItemCount = integer(current.taskSummary?.finalNeedsActionItems);
+  const sourceClosureBlockedCount = integer(
+    current.taskSummary?.sourceClosureBlockedItems,
+  );
+  for (const task of current.tasks || []) {
+    if (TERMINAL_TASK_STATUSES.has(task.status)) continue;
+    const blockedItemCount = integer(task.sourceClosureBlockedItemCount);
+    if (blockedItemCount === 0) continue;
+    incidents.push(incident(
+      'capture_source_closure_blocked',
+      task.id,
+      'high',
+      '自动接力缺少原设备关闭证明',
+      `${task.title || task.id} 有 ${blockedItemCount} 个工作项被防双跑门禁阻止接力`,
+      {
+        taskId: task.id,
+        taskStatus: task.status,
+        sourceClosureBlockedItemCount: blockedItemCount,
+        antiDoubleRunFencePreserved: true,
+      },
+    ));
+  }
   const taskLevelManualBlockerCount = (current.tasks || []).filter(task =>
     task.status === 'needs_action' && integer(task.needsActionItemCount) === 0
   ).length;
-  const manualBlockerCount = finalNeedsActionItemCount + taskLevelManualBlockerCount;
+  // A missing source-closure proof is a system recovery blocker, not a request
+  // for the customer to solve a login/captcha. Keep it out of the human-action
+  // count and expose it through sourceClosureBlockedCount instead.
+  const manualBlockerCount = finalNeedsActionItemCount
+    + taskLevelManualBlockerCount;
   if (manualBlockerCount > 0) {
     incidents.push(incident(
       'manual_intervention_required',
@@ -1372,6 +1440,7 @@ export function assessOpsControlSnapshots(previousValue, currentValue, settings 
     historicalFailureCount: integer(current.taskSummary?.historicalFailures),
     finalFailureCount,
     manualBlockerCount,
+    sourceClosureBlockedCount,
     manualRecoveryStopCount,
     observationCount: integer(current.persistence?.observationCount),
     pendingRecordAiCount: integer(current.persistence?.pendingRecordAiCount),

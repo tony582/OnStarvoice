@@ -125,6 +125,7 @@ const UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY = 'unattendedAttempt';
 const UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX =
   'onstarvoice.unattendedCheckpointReportOutbox.v2.';
 const UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION = 2;
+const UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION = 1;
 const TARGETED_POST_RUNNER_QUERY_KEY = 'targetedPostRun';
 const TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY = 'targetedPostAttempt';
 const SCHEDULE_MODES = new Set([
@@ -5071,7 +5072,51 @@ async function cancelUnattendedKeywordRunRequest(message, options = {}) {
   );
 }
 
-async function relayCancelToTabs(tabIds = []) {
+async function waitForContentCaptureToSettle(
+  tabId,
+  {captureRequestId = '', timeoutMs = 3500, pollMs = 100} = {},
+) {
+  const startedAt = Date.now();
+  const normalizedRequestId = String(captureRequestId || '').trim();
+  while (Date.now() - startedAt < timeoutMs) {
+    let inspection;
+    try {
+      inspection = await sendContentMessageWithTimeout(
+        tabId,
+        {
+          action: 'inspectCaptureActivity',
+          ...(normalizedRequestId
+            ? {captureRequestId: normalizedRequestId}
+            : {}),
+        },
+        Math.min(1500, timeoutMs),
+      );
+    } catch (error) {
+      return {ok: false, reason: 'activity_inspection_unavailable', error};
+    }
+    if (
+      inspection?.ok !== true ||
+      typeof inspection.targetActive !== 'boolean' ||
+      !Number.isFinite(Number(inspection.activeCount))
+    ) {
+      return {ok: false, reason: 'activity_inspection_unsupported'};
+    }
+    if (
+      inspection.targetActive === false &&
+      (normalizedRequestId || Number(inspection.activeCount) === 0)
+    ) {
+      return {
+        ok: true,
+        reason: 'content_capture_settled',
+        activeCount: Number(inspection.activeCount),
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return {ok: false, reason: 'content_capture_still_active'};
+}
+
+async function relayCancelToTabs(tabIds = [], {captureRequestId = ''} = {}) {
   const uniqueTabIds = [
     ...new Set(
       tabIds
@@ -5082,14 +5127,15 @@ async function relayCancelToTabs(tabIds = []) {
   let successCount = 0;
   for (const tabId of uniqueTabIds) {
     try {
-      await captureDebugSessionManager?.stopByTab(
-        tabId,
-        'unattended_cancel_requested',
-      );
       // 取消是"应秒回"的操作:若某个 tab 的 content script 卡死,不应无限阻塞其它 tab 的取消。
       // 只在此取消路径加 5s 超时守卫,主采集中继(relay-to-content)不受影响。
       const response = await Promise.race([
-        relayToContentWithRetry(tabId, { action: 'cancelCapture' }),
+        relayToContentWithRetry(tabId, {
+          action: 'cancelCapture',
+          ...(String(captureRequestId || '').trim()
+            ? {captureRequestId: String(captureRequestId).trim()}
+            : {}),
+        }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('cancel relay timeout')), 5000),
         ),
@@ -5097,6 +5143,15 @@ async function relayCancelToTabs(tabIds = []) {
       if (!response?.ok) {
         throw new Error(
           response?.error?.message || 'cancel relay was not acknowledged',
+        );
+      }
+      const settled = await waitForContentCaptureToSettle(tabId, {
+        captureRequestId,
+      });
+      if (!settled.ok) {
+        throw Object.assign(
+          new Error(settled.reason || 'capture stop was not confirmed'),
+          {cause: settled.error},
         );
       }
       successCount += 1;
@@ -5107,22 +5162,51 @@ async function relayCancelToTabs(tabIds = []) {
   return successCount;
 }
 
-async function stopPreviousUnattendedCaptureForResume(lock) {
-  const holderTabId = Number(lock?.holderTabId);
-  if (!Number.isFinite(holderTabId) || holderTabId <= 0) {
-    return {ok: true, method: 'no_target'};
-  }
+async function reloadTabAndWaitForDocumentReplacement(
+  holderTabId,
+  {timeoutMs = 10 * 1000} = {},
+) {
+  return await new Promise((resolve, reject) => {
+    let sawLoading = false;
+    let settled = false;
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      if (error) reject(error);
+      else resolve(true);
+    };
+    const onUpdated = (updatedTabId, changeInfo = {}) => {
+      if (Number(updatedTabId) !== Number(holderTabId)) return;
+      if (String(changeInfo.status || '') === 'loading') {
+        sawLoading = true;
+        return;
+      }
+      if (sawLoading && String(changeInfo.status || '') === 'complete') {
+        finish();
+      }
+    };
+    const timeoutId = setTimeout(
+      () => finish(new Error('source tab reload lifecycle was not observed')),
+      timeoutMs,
+    );
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    Promise.resolve()
+      .then(() => chrome.tabs.reload(holderTabId))
+      .catch(finish);
+  });
+}
 
-  const relayedCount = await relayCancelToTabs([holderTabId]);
-  if (relayedCount > 0) {
-    return {ok: true, method: 'cancel_acknowledged'};
-  }
-
-  // 卡死或断网时 content script 可能无法确认取消。刷新平台页会销毁旧的
-  // content 执行上下文，是恢复前唯一可确认的硬停止；刷新本身失败则禁止新执行。
+async function reloadUnattendedCaptureTabAndConfirm(holderTabId) {
   try {
-    await chrome.tabs.reload(holderTabId);
-    return {ok: true, method: 'tab_reloaded'};
+    // tabs.reload only confirms that navigation was requested. A stale old
+    // document may still answer `ping` while the tab also reports `complete`, so
+    // closure requires the same tab to emit a full loading -> complete cycle.
+    await reloadTabAndWaitForDocumentReplacement(holderTabId);
+    await ensureContentScriptReady(holderTabId);
+    await waitForContentScriptReady(holderTabId, {timeoutMs: 5000});
+    return {ok: true, method: 'tab_reloaded_and_ready'};
   } catch (reloadError) {
     try {
       await chrome.tabs.get(holderTabId);
@@ -5142,21 +5226,69 @@ async function stopPreviousUnattendedCaptureForResume(lock) {
   }
 }
 
-async function stopUnattendedCaptureTargetsForRecovery(tabIds = []) {
-  const uniqueTabIds = [
-    ...new Set(
-      tabIds
-        .map((tabId) => Number(tabId))
-        .filter((tabId) => Number.isFinite(tabId) && tabId > 0),
-    ),
-  ];
-  for (const holderTabId of uniqueTabIds) {
-    const result = await stopPreviousUnattendedCaptureForResume({holderTabId});
+async function stopPreviousUnattendedCaptureForResume(lock) {
+  const holderTabId = Number(lock?.holderTabId);
+  if (!Number.isFinite(holderTabId) || holderTabId <= 0) {
+    return {ok: true, method: 'no_target'};
+  }
+
+  const captureRequestId = String(lock?.captureRequestId || '').trim();
+  const relayedCount = await relayCancelToTabs([holderTabId], {
+    captureRequestId,
+  });
+  // Only a request-scoped identity can prove that the old handler itself left
+  // activeCaptureRequestCounts. An unscoped empty activity set cannot prove that a
+  // legacy handler (which never registered an id) is no longer executing.
+  if (captureRequestId && relayedCount > 0) {
+    return {ok: true, method: 'content_capture_settled'};
+  }
+
+  if (lock?.allowReload === false) {
+    try {
+      await chrome.tabs.get(holderTabId);
+    } catch {
+      return {ok: true, method: 'tab_missing'};
+    }
+    return {
+      ok: false,
+      method: 'stop_unconfirmed',
+      error: new Error('exact capture activity could not be inspected'),
+    };
+  }
+
+  // Older content scripts cannot expose settled state. A fully completed
+  // reload is the fail-closed fallback because it destroys the old context.
+  return await reloadUnattendedCaptureTabAndConfirm(holderTabId);
+}
+
+async function stopUnattendedCaptureTargetsForRecovery(targets = []) {
+  const uniqueTargets = new Map();
+  for (const candidate of targets) {
+    const source = candidate && typeof candidate === 'object'
+      ? candidate
+      : {holderTabId: candidate};
+    const holderTabId = resolveCaptureTaskTabId(
+      source.holderTabId,
+      source.tabId,
+    );
+    if (!holderTabId || uniqueTargets.has(holderTabId)) continue;
+    uniqueTargets.set(holderTabId, {
+      holderTabId,
+      captureRequestId: String(source.captureRequestId || '').trim(),
+      allowReload: source.allowReload !== false,
+    });
+  }
+  for (const target of uniqueTargets.values()) {
+    const result = await stopPreviousUnattendedCaptureForResume(target);
     if (!result.ok) {
-      return {...result, holderTabId};
+      return {...result, holderTabId: target.holderTabId};
     }
   }
-  return {ok: true, method: uniqueTabIds.length ? 'all_stopped' : 'no_target'};
+  return {
+    ok: true,
+    method: uniqueTargets.size ? 'all_stopped' : 'no_target',
+    targetTabIds: [...uniqueTargets.keys()],
+  };
 }
 
 async function releaseUnattendedKeywordPlanLock() {
@@ -5222,35 +5354,30 @@ async function cleanupTerminalUnattendedRuntime(
   if (!reconciledRequest) {
     return {request: normalizedRequest, relayedCount: 0};
   }
-  const terminalLock = await snapshotUnattendedKeywordPlanLock();
-  const progress = normalizeUnattendedRunProgress(
-    reconciledRequest.progress,
-    reconciledRequest.message,
-  );
-  const relayedCount = await cancelAndReleaseUnattendedExecutionTargets(
-    terminalLock,
-    [
-      ...tabIds,
-      reconciledRequest.runnerTabId,
-      progress?.runnerTabId,
-    ],
-  );
-  // The local ledger can reach a terminal state after the execution lease was
-  // already released.  The stable unattended task id is still sufficient to
-  // find and close a stranded Debug/group/worker session, so cleanup must not
-  // depend on a surviving lock document.
-  await releaseUnattendedCaptureTaskResourcesForRecovery(terminalLock, {
-    reason: 'unattended_terminal_cleanup',
-    request: reconciledRequest,
-  }).catch((error) => {
-    console.warn('[Background] terminal unattended cleanup pending:', error);
-  });
+  // The terminal write is durable first; the shared retry path then preserves
+  // exact ownership until the old content handler has actually settled. `tabIds`
+  // is intentionally not trusted here: caller/progress tab ids can outlive the
+  // attempt and be reused by unrelated work.
+  void tabIds;
+  const cleanup = await retryUnattendedLocalClosureCleanup(reconciledRequest);
+  if (!cleanup.cleaned) {
+    console.warn(
+      '[Background] terminal unattended cleanup pending:',
+      cleanup.reason,
+      cleanup.error || cleanup.stopResult?.error || '',
+    );
+  }
   // The terminal mutation is durable before cleanup begins. Closure evidence
   // is deliberately deferred: the sidebar still needs a chance to drain its
   // checkpoint outbox, and only the background can authoritatively inspect
   // every task-owned resource across Extension documents.
   scheduleCloudTaskAgentSync('unattended_terminal_cleanup', 500);
-  return {request: reconciledRequest, relayedCount};
+  return {
+    request: await readUnattendedKeywordRunRequest() || reconciledRequest,
+    relayedCount: cleanup.stopResult?.targetTabIds?.length || 0,
+    cleanupConfirmed: cleanup.cleaned === true,
+    cleanupReason: cleanup.reason,
+  };
 }
 
 function isUnattendedRunnerTabForRequest(
@@ -5839,6 +5966,386 @@ function inspectUnattendedBusinessUploadEvidence(request = {}) {
   };
 }
 
+function isCaptureExecutionLockOwnedByUnattendedAttempt(
+  lock,
+  request,
+) {
+  if (
+    !lock ||
+    typeof lock !== 'object' ||
+    String(lock.owner || '') !== 'unattended_keyword_plan'
+  ) {
+    return false;
+  }
+  const requestId = String(request?.id || '').trim();
+  const attemptId = String(request?.attemptId || '').trim();
+  if (!requestId || !attemptId) return false;
+
+  const stableTaskId = buildUnattendedCaptureTaskId(requestId);
+  const lockTaskId = String(lock.captureTaskId || '').trim();
+  const lockAttemptId = String(lock.captureTaskAttemptId || '').trim();
+  if (lockTaskId === stableTaskId) {
+    return !lockAttemptId || lockAttemptId === attemptId;
+  }
+  // Older task wrappers could bind a generated child task id while retaining
+  // the authoritative unattended attempt id.
+  if (lockAttemptId) return lockAttemptId === attemptId;
+  if (lockTaskId) return false;
+
+  // A reservation can become terminal before BEGIN binds its stable task id.
+  // In that narrow window the exact runner tab is the remaining ownership
+  // fence. Do not infer ownership from the global lock alone.
+  const holderTabId = resolveCaptureTaskTabId(lock.holderTabId);
+  const runnerTabIds = new Set(
+    [request.runnerTabId, request.progress?.runnerTabId]
+      .map((tabId) => resolveCaptureTaskTabId(tabId))
+      .filter(Boolean),
+  );
+  return Boolean(holderTabId && runnerTabIds.has(holderTabId));
+}
+
+function buildCaptureExecutionLockStopIdentity(lock) {
+  if (!lock || typeof lock !== 'object') return null;
+  return {
+    id: String(lock.id || ''),
+    owner: String(lock.owner || ''),
+    holderId: String(lock.holderId || ''),
+    holderDocumentId: String(lock.holderDocumentId || ''),
+    holderTabId: resolveCaptureTaskTabId(lock.holderTabId),
+    captureTaskId: String(lock.captureTaskId || '').trim(),
+    captureTaskAttemptId: String(lock.captureTaskAttemptId || '').trim(),
+  };
+}
+
+function captureExecutionLockMatchesStopIdentity(lock, identity) {
+  if (!identity) return !lock;
+  const actual = buildCaptureExecutionLockStopIdentity(lock);
+  return Boolean(
+    actual &&
+    actual.id === identity.id &&
+    actual.owner === identity.owner &&
+    actual.holderId === identity.holderId &&
+    actual.holderDocumentId === identity.holderDocumentId &&
+    actual.holderTabId === identity.holderTabId &&
+    actual.captureTaskId === identity.captureTaskId &&
+    actual.captureTaskAttemptId === identity.captureTaskAttemptId
+  );
+}
+
+async function releaseExactCaptureExecutionLockSnapshot(lockSnapshot) {
+  const expected = buildCaptureExecutionLockStopIdentity(lockSnapshot);
+  if (!expected?.id) return true;
+  const release = () => runCaptureExecutionLockOperation(async () => {
+    const stored = await chrome.storage.local.get(
+      STORAGE_KEYS.captureExecutionLock,
+    );
+    const current = normalizeCaptureExecutionLock(
+      stored[STORAGE_KEYS.captureExecutionLock],
+      {allowExpired: true},
+    );
+    if (!current) return true;
+    if (!captureExecutionLockMatchesStopIdentity(current, expected)) {
+      return false;
+    }
+    await chrome.storage.local.remove(STORAGE_KEYS.captureExecutionLock);
+    return true;
+  });
+  return await runAuthoritativeControlStorageMutation(release);
+}
+
+function readExactUnattendedStopConfirmation(request) {
+  const confirmation = request?.localClosureStopConfirmation;
+  if (
+    !confirmation ||
+    typeof confirmation !== 'object' ||
+    confirmation.version !== UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION ||
+    String(confirmation.requestId || '').trim() !==
+      String(request?.id || '').trim() ||
+    String(confirmation.attemptId || '').trim() !==
+      String(request?.attemptId || '').trim()
+  ) {
+    return null;
+  }
+  return confirmation;
+}
+
+function collectExactUnattendedSourceStopTargets({
+  request,
+  exactLock,
+  debugSnapshot,
+  groupSnapshot,
+} = {}) {
+  const captureRequestId = String(
+    debugSnapshot?.progress?.captureRequestId ||
+      request?.progress?.captureRequestId ||
+      '',
+  ).trim();
+  const targets = [];
+  // Before BEGIN the lock holder is the extension runner itself. It must stay
+  // alive to flush checkpoint rows and is not a platform source tab.
+  if (String(exactLock?.captureTaskId || '').trim()) {
+    targets.push({
+      holderTabId: exactLock.holderTabId,
+      captureRequestId,
+      ownership: 'bound_execution_lock',
+    });
+  }
+  targets.push(
+    {
+      holderTabId: debugSnapshot?.sourceTabId || debugSnapshot?.tabId,
+      captureRequestId,
+      ownership: 'debug_session',
+    },
+    {
+      holderTabId: groupSnapshot?.sourceTabId,
+      captureRequestId,
+      ownership: 'task_group',
+    },
+  );
+  const progressTabId = resolveCaptureTaskTabId(request?.progress?.runnerTabId);
+  if (progressTabId && captureRequestId) {
+    targets.push({
+      holderTabId: progressTabId,
+      captureRequestId,
+      // A progress tab id alone is not ownership. The request-scoped content
+      // identity is safe to inspect/cancel, but never authorizes reloading a tab
+      // that may since have been reused by another task.
+      allowReload: false,
+      ownership: 'capture_request_identity',
+    });
+  }
+  const unique = new Map();
+  for (const target of targets) {
+    const tabId = resolveCaptureTaskTabId(target.holderTabId);
+    if (!tabId || unique.has(tabId)) continue;
+    unique.set(tabId, {...target, holderTabId: tabId});
+  }
+  return [...unique.values()];
+}
+
+function buildUnattendedSourceResourceFingerprint({
+  exactLock,
+  targets = [],
+  taskId = '',
+} = {}) {
+  return {
+    taskId: String(taskId || '').trim(),
+    lock: buildCaptureExecutionLockStopIdentity(exactLock),
+    targetTabIds: targets
+      .map((target) => resolveCaptureTaskTabId(target?.holderTabId))
+      .filter(Boolean)
+      .sort((left, right) => left - right),
+  };
+}
+
+function sameUnattendedSourceResourceFingerprint(left, right) {
+  if (!left || !right || left.taskId !== right.taskId) return false;
+  if (
+    JSON.stringify(left.targetTabIds || []) !==
+    JSON.stringify(right.targetTabIds || [])
+  ) {
+    return false;
+  }
+  if (!left.lock && !right.lock) return true;
+  return captureExecutionLockMatchesStopIdentity(right.lock, left.lock);
+}
+
+async function persistUnattendedStopConfirmationWithinMutation(
+  current,
+  {stage, fingerprint, method = ''} = {},
+) {
+  const now = new Date().toISOString();
+  const previous = readExactUnattendedStopConfirmation(current);
+  const confirmation = {
+    version: UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION,
+    requestId: String(current.id || '').trim(),
+    attemptId: String(current.attemptId || '').trim(),
+    stage,
+    taskId: String(fingerprint?.taskId || previous?.taskId || '').trim(),
+    lockIdentity: fingerprint?.lock || previous?.lockIdentity || null,
+    targetTabIds: Array.isArray(fingerprint?.targetTabIds)
+      ? fingerprint.targetTabIds
+      : Array.isArray(previous?.targetTabIds)
+        ? previous.targetTabIds
+        : [],
+    method: String(method || previous?.method || ''),
+    sourceStoppedAt: previous?.sourceStoppedAt || now,
+    ...(stage === 'runtime_released' ? {runtimeReleasedAt: now} : {}),
+  };
+  const next = {...current, localClosureStopConfirmation: confirmation};
+  await runAuthoritativeControlStorageMutation(() =>
+    chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunRequest]: next,
+    }),
+  );
+  return next;
+}
+
+async function retryUnattendedLocalClosureCleanup(request) {
+  const expectedRequestId = String(request?.id || '').trim();
+  const expectedAttemptId = String(request?.attemptId || '').trim();
+  return await runUnattendedRunMutation(async () => {
+    let current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== expectedRequestId ||
+      current.attemptId !== expectedAttemptId ||
+      !isTerminalUnattendedRunStatus(current.status)
+    ) {
+      return {cleaned: false, reason: 'attempt_superseded'};
+    }
+
+    if (buildUnattendedLocalClosureKeyFromRequest(current)) {
+      return {cleaned: true, reason: 'already_persisted'};
+    }
+
+    const storedLock = await readStoredCaptureExecutionLock();
+    const exactLock = isCaptureExecutionLockOwnedByUnattendedAttempt(
+      storedLock,
+      current,
+    )
+      ? storedLock
+      : null;
+    const taskId = String(
+      exactLock?.captureTaskId ||
+        buildUnattendedCaptureTaskId(current.id) ||
+        '',
+    ).trim();
+    const debugSnapshot = taskId
+      ? captureDebugSessionManager?.getSessionByTaskId(taskId)
+      : null;
+    const groupSnapshot = taskId
+      ? captureTaskTabGroupManager?.getTask(taskId)
+      : null;
+    const exactTargets = collectExactUnattendedSourceStopTargets({
+      request: current,
+      exactLock,
+      debugSnapshot,
+      groupSnapshot,
+    });
+    const fingerprint = buildUnattendedSourceResourceFingerprint({
+      exactLock,
+      targets: exactTargets,
+      taskId,
+    });
+    let confirmation = readExactUnattendedStopConfirmation(current);
+    if (confirmation?.stage === 'runtime_released') {
+      return {cleaned: true, reason: 'runtime_release_already_confirmed'};
+    }
+    if (confirmation?.stage === 'source_stopped') {
+      const confirmedFingerprint = {
+        taskId: String(confirmation.taskId || '').trim(),
+        lock: confirmation.lockIdentity || null,
+        targetTabIds: Array.isArray(confirmation.targetTabIds)
+          ? confirmation.targetTabIds
+          : [],
+      };
+      if (
+        exactTargets.length > 0 &&
+        !sameUnattendedSourceResourceFingerprint(
+          confirmedFingerprint,
+          fingerprint,
+        )
+      ) {
+        // tabs.onReplaced or a late BEGIN moved this exact attempt to a new
+        // source. The old confirmation cannot authorize releasing the new tab.
+        confirmation = null;
+      }
+    }
+
+    let stopResult = {ok: true, method: 'previously_confirmed'};
+    if (!confirmation) {
+      const unownedProgressTabId = resolveCaptureTaskTabId(
+        current.progress?.runnerTabId,
+      );
+      const boundSourceIdentityMissing = Boolean(
+        exactLock &&
+        String(exactLock.captureTaskId || '').trim() &&
+        exactTargets.length === 0,
+      );
+      if (
+        exactTargets.length === 0 &&
+        (unownedProgressTabId || boundSourceIdentityMissing)
+      ) {
+        return {
+          cleaned: false,
+          reason: 'source_identity_unverifiable',
+        };
+      }
+      stopResult = await stopUnattendedCaptureTargetsForRecovery(exactTargets);
+      if (!stopResult.ok) {
+        return {
+          cleaned: false,
+          reason: 'previous_capture_stop_unconfirmed',
+          stopResult,
+        };
+      }
+      const lockAfterStop = await readStoredCaptureExecutionLock();
+      const exactLockAfterStop = isCaptureExecutionLockOwnedByUnattendedAttempt(
+        lockAfterStop,
+        current,
+      )
+        ? lockAfterStop
+        : null;
+      if (
+        (exactLock &&
+          !captureExecutionLockMatchesStopIdentity(
+            exactLockAfterStop,
+            fingerprint.lock,
+          )) ||
+        (!exactLock && exactLockAfterStop)
+      ) {
+        return {cleaned: false, reason: 'runtime_identity_changed'};
+      }
+      try {
+        current = await persistUnattendedStopConfirmationWithinMutation(
+          current,
+          {stage: 'source_stopped', fingerprint, method: stopResult.method},
+        );
+        confirmation = readExactUnattendedStopConfirmation(current);
+      } catch (error) {
+        return {
+          cleaned: false,
+          reason: 'source_stop_confirmation_persist_failed',
+          error,
+        };
+      }
+    }
+    try {
+      // Always retry the stable task cleanup: the first terminal pass may have
+      // failed after releasing its lock, leaving Debug/group/worker/owner state
+      // that would otherwise block every later heartbeat forever.
+      await releaseUnattendedCaptureTaskResourcesForRecovery(exactLock, {
+        reason: 'unattended_local_closure_reconcile',
+        request: current,
+        preserveLockBinding: true,
+      });
+      if (exactLock?.id) {
+        const released = await releaseExactCaptureExecutionLockSnapshot(exactLock);
+        if (!released) {
+          return {cleaned: false, reason: 'runtime_identity_changed'};
+        }
+      }
+      current = await persistUnattendedStopConfirmationWithinMutation(current, {
+        stage: 'runtime_released',
+        fingerprint,
+        method: confirmation?.method || stopResult.method,
+      });
+    } catch (error) {
+      return {
+        cleaned: false,
+        reason: 'terminal_runtime_cleanup_failed',
+        error,
+      };
+    }
+    return {
+      cleaned: true,
+      reason: exactLock ? 'exact_runtime_released' : 'stable_runtime_rechecked',
+      stopResult,
+    };
+  });
+}
+
 async function inspectUnattendedLocalClosurePredicate(
   request,
   {closeOwnedRunnerTabs = false} = {},
@@ -5854,6 +6361,13 @@ async function inspectUnattendedLocalClosurePredicate(
   const itemIdentities = resolveUnattendedClosureItemIdentities(normalized);
   if (itemIdentities.length === 0) {
     return {closed: false, reason: 'item_attempt_identity_unknown'};
+  }
+  const stopConfirmation = readExactUnattendedStopConfirmation(normalized);
+  if (
+    stopConfirmation?.stage !== 'runtime_released' ||
+    !String(stopConfirmation.runtimeReleasedAt || '').trim()
+  ) {
+    return {closed: false, reason: 'source_stop_not_confirmed'};
   }
   const businessUploads = inspectUnattendedBusinessUploadEvidence(normalized);
   if (!businessUploads.known || !businessUploads.cleared) {
@@ -5978,6 +6492,10 @@ async function inspectUnattendedLocalClosurePredicate(
     runtime.captureDebugSession?.taskId || '',
   ).trim();
   const runtimeDebugPresent = Boolean(runtimeDebugTaskId === taskId);
+  const executionLockPresent = isCaptureExecutionLockOwnedByUnattendedAttempt(
+    rawLock,
+    normalized,
+  );
   // Re-read after every task-owned document has disappeared. At this point no
   // exact-attempt writer remains; a late durable row blocks proof rather than
   // being silently ignored.
@@ -6006,11 +6524,13 @@ async function inspectUnattendedLocalClosurePredicate(
   ]).size;
   const state = {
     terminalLedgerConfirmed: true,
+    sourceStopConfirmed: true,
+    sourceStopMethod: String(stopConfirmation.method || ''),
     runnerTabCount,
     platformTaskTabCount,
     detailTaskTabCount: detailTaskTabIds.size,
     ownedTaskTabCount,
-    executionLockPresent: Boolean(rawLock),
+    executionLockPresent,
     debugSessionPresent: Boolean(debugSession || runtimeDebugPresent),
     taskSessionPresent: Boolean(
       taskGroup ||
@@ -6224,7 +6744,35 @@ async function reconcileUnattendedLocalClosureEvidence({
   ) {
     return {persisted: false, reason: 'attempt_superseded'};
   }
-  const predicate = await inspectUnattendedLocalClosurePredicate(request, {
+  if (buildUnattendedLocalClosureKeyFromRequest(request)) {
+    return {
+      persisted: false,
+      reason: 'already_persisted',
+      evidence: request.localClosureEvidence || null,
+      evidences: Array.isArray(request.localClosureEvidences)
+        ? request.localClosureEvidences
+        : request.localClosureEvidence
+          ? [request.localClosureEvidence]
+          : [],
+    };
+  }
+  const cleanup = await retryUnattendedLocalClosureCleanup(request);
+  if (!cleanup.cleaned) {
+    return {
+      persisted: false,
+      reason: cleanup.reason,
+      ...(cleanup.error ? {error: cleanup.error} : {}),
+    };
+  }
+  const current = await readUnattendedKeywordRunRequest();
+  if (
+    !current ||
+    current.id !== request.id ||
+    current.attemptId !== request.attemptId
+  ) {
+    return {persisted: false, reason: 'attempt_superseded'};
+  }
+  const predicate = await inspectUnattendedLocalClosurePredicate(current, {
     closeOwnedRunnerTabs,
   });
   if (!predicate.closed) {
@@ -8529,6 +9077,9 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
       },
       error: null,
     };
+    delete nextRequest.localClosureEvidence;
+    delete nextRequest.localClosureEvidences;
+    delete nextRequest.localClosureStopConfirmation;
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: current,
       allowAttemptTransition: true,
@@ -9114,6 +9665,7 @@ async function manuallyRecoverUnattendedKeywordRun({
     }
     delete nextRequest.localClosureEvidence;
     delete nextRequest.localClosureEvidences;
+    delete nextRequest.localClosureStopConfirmation;
     await persistUnattendedRunMutation(nextRequest, {
       event: {
         type: 'manual_recovery',
@@ -10197,6 +10749,7 @@ function getContentRelayTimeoutMs(payload = {}) {
   if (
     action === 'ping' ||
     action === 'cancelCapture' ||
+    action === 'inspectCaptureActivity' ||
     action === 'detectPageType' ||
     action === 'detectSearchSortDimension'
   ) {
@@ -12120,7 +12673,11 @@ async function clearUnattendedCaptureTaskLockBinding(
 
 async function releaseUnattendedCaptureTaskResourcesForRecovery(
   lock,
-  {reason = 'unattended_runtime_recovery', request = null} = {},
+  {
+    reason = 'unattended_runtime_recovery',
+    request = null,
+    preserveLockBinding = false,
+  } = {},
 ) {
   // Recovery can clear the persisted lock binding before every asynchronous
   // Debug/group/worker cleanup callback has finished.  The replacement runner
@@ -12140,11 +12697,13 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
   } else {
     captureTaskOwnerCoordinator?.clearTask(taskId);
   }
-  await clearUnattendedCaptureTaskLockBinding(lock?.id, taskId, {
-    expectedHolderId: lock?.holderId,
-    expectedHolderDocumentId: lock?.holderDocumentId,
-    expectedHolderTabId: lock?.holderTabId,
-  });
+  if (!preserveLockBinding) {
+    await clearUnattendedCaptureTaskLockBinding(lock?.id, taskId, {
+      expectedHolderId: lock?.holderId,
+      expectedHolderDocumentId: lock?.holderDocumentId,
+      expectedHolderTabId: lock?.holderTabId,
+    });
+  }
 
   // 0.3.43 及更早版本为每次 runner 生成随机 child task。只收口这类
   // 旧记录；新版使用同一 request 的稳定 taskId，恢复后仍是同一项任务。
