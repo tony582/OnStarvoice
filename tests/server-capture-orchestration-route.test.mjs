@@ -6,17 +6,40 @@ const route = await readFile(
   new URL('../server/routes/capture-orchestrations.js', import.meta.url),
   'utf8',
 );
+const pendingRetryApplication = await readFile(
+  new URL(
+    '../server/modules/capture/application/pending-orchestration-retry.js',
+    import.meta.url,
+  ),
+  'utf8',
+);
+const pendingRetryAdapter = await readFile(
+  new URL(
+    '../server/modules/capture/infrastructure/' +
+      'postgres-pending-orchestration-retry.js',
+    import.meta.url,
+  ),
+  'utf8',
+);
+const cron = await readFile(
+  new URL('../server/cron.js', import.meta.url),
+  'utf8',
+);
 const serverApp = await readFile(
   new URL('../server/app.js', import.meta.url),
   'utf8',
 );
 
-function section(startMarker, endMarker) {
-  const start = route.indexOf(startMarker);
+function sourceSection(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `missing marker: ${startMarker}`);
-  const end = route.indexOf(endMarker, start + startMarker.length);
+  const end = source.indexOf(endMarker, start + startMarker.length);
   assert.notEqual(end, -1, `missing marker: ${endMarker}`);
-  return route.slice(start, end);
+  return source.slice(start, end);
+}
+
+function section(startMarker, endMarker) {
+  return sourceSection(route, startMarker, endMarker);
 }
 
 test('orchestration router is mounted under the existing capture-cloud namespace', () => {
@@ -129,9 +152,10 @@ test('allocation preview uses deterministic balanced groups and validates compat
   assert.match(compatibility, /byId\.size !== allAgentIds\.length/u);
   assert.match(compatibility, /includeRelayPool = true/u);
   assert.match(compatibility, /const relayAgentIds = includeRelayPool/u);
-  const compatibilityContract = section(
-    'function agentCompatibilityFailure',
-    'async function loadCompatibleAgents',
+  const compatibilityContract = sourceSection(
+    pendingRetryApplication,
+    'export function agentCompatibilityFailure',
+    'export function deterministicRetryUuid',
   );
   assert.match(compatibilityContract, /singleRelayV1/u);
   assert.match(compatibilityContract, /agent_single_relay_capability_missing/u);
@@ -667,11 +691,11 @@ test('retry allocation never sends a keyword back to an Agent that already tried
 });
 
 test('retry candidate SQL fails closed on unknown Shanghai usage and hard limits', () => {
-  const candidateStart = route.indexOf('async function loadRetryAgentCandidates');
-  const candidateEnd = route.indexOf('function publicRetryAgentCandidate', candidateStart);
-  assert.notEqual(candidateStart, -1);
-  assert.notEqual(candidateEnd, -1);
-  const candidates = route.slice(candidateStart, candidateEnd);
+  const candidates = sourceSection(
+    pendingRetryAdapter,
+    'export async function loadRetryAgentCandidates',
+    'function parentSelect',
+  );
   assert.match(candidates, /JOIN social_agent_daily_usage daily_usage/u);
   assert.match(candidates, /now\(\) AT TIME ZONE 'Asia\/Shanghai'/u);
   assert.match(candidates, /daily_usage\.last_event_at IS NOT NULL/u);
@@ -681,20 +705,19 @@ test('retry candidate SQL fails closed on unknown Shanghai usage and hard limits
   assert.match(candidates, /ORDER BY[\s\S]*health_status[\s\S]*recent_technical_failure_count ASC[\s\S]*daily_usage\.searches ASC/u);
   assert.match(candidates, /FROM capture_task_item_attempts recent_failure/u);
   assert.match(candidates, /FOR UPDATE OF ca, daily_usage/u);
-  assert.match(route, /crossDeviceRetryAgentDailyUsageEligible\(agent\)/u);
+  assert.match(
+    pendingRetryAdapter,
+    /crossDeviceRetryAgentDailyUsageEligible\(agent\)/u,
+  );
 });
 
 test('retryPending has a bounded deterministic consumer on the existing recovery sweep', () => {
-  const consumerStart = route.indexOf(
-    'export async function reconcilePendingOrchestrationRetries',
+  const consumer = sourceSection(
+    pendingRetryApplication,
+    'function normalizeLimit',
+    'export function createPendingOrchestrationRetryReconciler',
   );
-  const consumerEnd = route.indexOf("router.post(\n  '/orchestrations/:id/dispatch'", consumerStart);
-  assert.notEqual(consumerStart, -1);
-  assert.notEqual(consumerEnd, -1);
-  const consumer = route.slice(consumerStart, consumerEnd);
-  const dispatchStart = route.indexOf('function deterministicRetryUuid');
-  assert.notEqual(dispatchStart, -1);
-  const dispatch = route.slice(dispatchStart, consumerEnd);
+  const dispatch = pendingRetryAdapter;
   assert.match(dispatch, /metadata->>'retryPending' = 'true'/u);
   assert.match(dispatch, /deterministicRetryUuid/u);
   assert.match(dispatch, /tryLockCaptureAgentExecutionSlot/u);
@@ -714,9 +737,10 @@ test('retryPending has a bounded deterministic consumer on the existing recovery
   assert.match(dispatch, /retryWaitingLastCheckedAt/u);
   assert.match(dispatch, /excludedItemIds/u);
   assert.match(dispatch, /safety_confirmation_missing/u);
-  const invalidation = section(
-    'function retryPendingInvalidationReason',
-    'async function invalidateLockedPendingRetryMarker',
+  const invalidation = sourceSection(
+    pendingRetryApplication,
+    'export function retryPendingInvalidationReason',
+    'function normalizeLimit',
   );
   assert.match(invalidation, /elasticQueueOwnsRetry\(parent\)/u);
   assert.match(invalidation, /elastic_queue_retry_managed/u);
@@ -727,7 +751,10 @@ test('retryPending has a bounded deterministic consumer on the existing recovery
     /orchestration_retry_pending_projection_reconciled/u,
   );
   assert.match(consumer, /Math\.min\(100/u);
-  assert.doesNotMatch(consumer, /crypto\.randomUUID/u);
+  assert.doesNotMatch(
+    `${pendingRetryApplication}\n${pendingRetryAdapter}`,
+    /crypto\.randomUUID/u,
+  );
 });
 
 test('manual and automatic retry dispatch share one deadlock-safe lock order', () => {
@@ -746,14 +773,14 @@ test('manual and automatic retry dispatch share one deadlock-safe lock order', (
   assert.ok(parentRow > sourceRows);
   assert.ok(itemRows > parentRow);
 
-  const consumerStart = route.indexOf(
+  const consumerStart = pendingRetryAdapter.indexOf(
     'async function loadIdlePendingRetryAgent',
   );
-  const consumerEnd = route.indexOf(
-    'export async function reconcilePendingOrchestrationRetries',
+  const consumerEnd = pendingRetryAdapter.indexOf(
+    'export const reconcilePendingOrchestrationRetries',
     consumerStart,
   );
-  const consumer = route.slice(consumerStart, consumerEnd);
+  const consumer = pendingRetryAdapter.slice(consumerStart, consumerEnd);
   const consumerAdvisory = consumer.indexOf(
     'tryLockCaptureAgentExecutionSlot(',
   );
@@ -769,22 +796,41 @@ test('manual and automatic retry dispatch share one deadlock-safe lock order', (
 });
 
 test('automatic waiting continuation binds its deterministic attempt into the command', () => {
-  const consumerStart = route.indexOf(
-    'async function dispatchOnePendingOrchestrationRetry',
+  const consumerStart = pendingRetryAdapter.indexOf(
+    'export async function dispatchOnePendingOrchestrationRetry',
   );
-  const consumerEnd = route.indexOf(
-    'export async function reconcilePendingOrchestrationRetries',
+  const consumerEnd = pendingRetryAdapter.indexOf(
+    'export const reconcilePendingOrchestrationRetries',
     consumerStart,
   );
   assert.ok(consumerStart >= 0);
   assert.ok(consumerEnd > consumerStart);
-  const consumer = route.slice(consumerStart, consumerEnd);
+  const consumer = pendingRetryAdapter.slice(consumerStart, consumerEnd);
   assert.match(consumer, /const itemAttemptId = deterministicRetryUuid/u);
   assert.match(consumer, /itemAttempts: itemAttemptBindings/u);
   assert.ok(
     consumer.indexOf('INSERT INTO capture_task_item_attempts') <
       consumer.indexOf('INSERT INTO capture_agent_commands'),
     'automatic continuation must persist the attempt before publishing command',
+  );
+});
+
+test('Cron consumes the canonical pending retry adapter without route imports', () => {
+  assert.match(
+    cron,
+    /from '\.\/modules\/capture\/infrastructure\/postgres-pending-orchestration-retry\.js';/u,
+  );
+  assert.doesNotMatch(
+    cron,
+    /from '\.\/routes\/capture-orchestrations\.js';/u,
+  );
+  assert.match(
+    route,
+    /export \{[\s\S]*reconcilePendingOrchestrationRetries[\s\S]*\} from '\.\.\/modules\/capture\/infrastructure\/postgres-pending-orchestration-retry\.js';/u,
+  );
+  assert.doesNotMatch(
+    pendingRetryAdapter,
+    /from ['"][^'"]*\/routes\//u,
   );
 });
 
