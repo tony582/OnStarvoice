@@ -4332,11 +4332,11 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   );
   assert.match(
     profileRetryRenewal,
-    /FROM monitor_executions[\s\S]*FOR UPDATE SKIP LOCKED[\s\S]*FROM monitor_subscriptions[\s\S]*FOR SHARE SKIP LOCKED/u,
+    /FROM monitor_subscriptions[\s\S]*ORDER BY id[\s\S]*FOR UPDATE[\s\S]*FROM monitor_executions[\s\S]*ORDER BY id[\s\S]*FOR UPDATE/u,
   );
-  assert.match(
+  assert.doesNotMatch(
     profileRetryRenewal,
-    /const subscriptionSnapshot = await tx\.queryOne[\s\S]*retry_profile_subscription_unavailable[\s\S]*FOR SHARE SKIP LOCKED[\s\S]*retry_profile_subscription_busy/u,
+    /SKIP LOCKED|FOR SHARE/u,
   );
   assert.match(
     dispatchCore,
@@ -4394,7 +4394,7 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   );
   assert.match(
     profileRetryRenewal,
-    /executionIdByItem\.set\(String\(item\.id\), execution\.id\)[\s\S]*executionId: execution\.id/u,
+    /executionIdByItem\.set\(String\(entry\.item\.id\), execution\.id\)[\s\S]*executionId: execution\.id/u,
   );
   assert.match(
     dispatchCore,

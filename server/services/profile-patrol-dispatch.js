@@ -248,26 +248,43 @@ export async function loadAvailableScheduledProfilePatrolAgent(tx, {
     Number(agent.active_task_count || 0) === 0 &&
     Number(agent.active_command_count || 0) === 0);
   for (const candidate of eligibleCandidates) {
-    const compatible = await loadCompatibleProfilePatrolAgent(
-      tx,
-      tenantId,
-      candidate.id,
-      [platform],
-      subjectType,
-    );
-    if (
-      !compatible.failure &&
-      captureAgentFullHeartbeatOnline(compatible.agent)
-    ) {
-      return {
-        agent: compatible.agent,
-        preferredAgentId: preferred || null,
-        selection: !preferred
-          ? 'auto'
-          : String(compatible.agent.id) === preferred
-            ? 'preferred'
-            : 'failover',
-      };
+    const savepoint = 'profile_patrol_agent_candidate';
+    await tx.execute(`SAVEPOINT ${savepoint}`);
+    try {
+      const compatible = await loadCompatibleProfilePatrolAgent(
+        tx,
+        tenantId,
+        candidate.id,
+        [platform],
+        subjectType,
+      );
+      if (
+        !compatible.failure &&
+        captureAgentFullHeartbeatOnline(compatible.agent)
+      ) {
+        await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+        return {
+          agent: compatible.agent,
+          preferredAgentId: preferred || null,
+          selection: !preferred
+            ? 'auto'
+            : String(compatible.agent.id) === preferred
+              ? 'preferred'
+              : 'failover',
+        };
+      }
+      // A failed candidate must not leave its Agent row/advisory lock held
+      // while the scheduler tries another preferred order in this transaction.
+      await tx.execute(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+    } catch (error) {
+      try {
+        await tx.execute(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await tx.execute(`RELEASE SAVEPOINT ${savepoint}`);
+      } catch {
+        // Preserve the original failure; the outer transaction will roll back.
+      }
+      throw error;
     }
   }
   return {failure: requestError(
@@ -673,189 +690,297 @@ function profileMonitorSettings(rows) {
   });
 }
 
-export async function enqueueDueProfilePatrolTasks(limit = 20) {
-  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 20));
-  return await withTransaction(async tx => {
-    const reconciledExecutions = await reconcileStaleProfilePatrolExecutions(
-      tx,
-      {limit: safeLimit * 5},
-    );
-    const subscriptions = await tx.queryAll(`
-      SELECT ms.*
-      FROM monitor_subscriptions ms
-      WHERE ms.status = 'active'
-        -- Official-account comment patrol is explicitly launched by the user
-        -- because each run chooses its own post and comment limits. This
-        -- legacy profile cron only schedules followed creators.
-        AND ms.subject_type = 'creator'
-        AND COALESCE(ms.account_url, '') <> ''
-        AND ms.next_run_at <= now()
-        AND NOT EXISTS (
-          SELECT 1
-          FROM monitor_executions execution
-          WHERE execution.subscription_id = ms.id
-            AND (
-              execution.status = 'running'
-              OR (
-                execution.status = 'pending'
-                AND EXISTS (
-                  SELECT 1
-                  FROM capture_task_items item
-                  WHERE item.tenant_id = execution.tenant_id
-                    AND item.metadata->>'monitorExecutionId' =
-                      execution.id::text
-                )
+function profilePatrolSubscriptionFence(subscription) {
+  const timestamp = value => value ? new Date(value).toISOString() : '';
+  return JSON.stringify([
+    String(subscription?.id || ''),
+    String(subscription?.tenant_id || ''),
+    String(subscription?.status || ''),
+    String(subscription?.subject_type || 'creator'),
+    String(subscription?.platform || ''),
+    String(subscription?.account_url || ''),
+    String(subscription?.assigned_agent_id || ''),
+    timestamp(subscription?.next_run_at),
+    timestamp(subscription?.updated_at),
+  ]);
+}
+
+async function loadDueProfilePatrolSubscriptionCandidates(tx, limit) {
+  return await tx.queryAll(`
+    SELECT ms.*
+    FROM monitor_subscriptions ms
+    WHERE ms.status = 'active'
+      -- Official-account comment patrol is explicitly launched by the user
+      -- because each run chooses its own post and comment limits. This
+      -- legacy profile cron only schedules followed creators.
+      AND ms.subject_type = 'creator'
+      AND COALESCE(ms.account_url, '') <> ''
+      AND ms.next_run_at <= now()
+      AND NOT EXISTS (
+        SELECT 1
+        FROM monitor_executions execution
+        WHERE execution.subscription_id = ms.id
+          AND (
+            execution.status = 'running'
+            OR (
+              execution.status = 'pending'
+              AND EXISTS (
+                SELECT 1
+                FROM capture_task_items item
+                WHERE item.tenant_id = execution.tenant_id
+                  AND item.metadata->>'monitorExecutionId' =
+                    execution.id::text
               )
             )
-        )
-      ORDER BY ms.next_run_at ASC, ms.id
-      LIMIT $1
-      FOR UPDATE OF ms SKIP LOCKED
-    `, [safeLimit]);
-    const results = reconciledExecutions.map(execution => ({
-      kind: 'stale_execution_reconciled',
-      subscriptionId: execution.subscription_id,
-      executionId: execution.id,
-      message: '历史账号巡查执行状态未闭环，已清理并重新进入调度',
-    }));
-    const settingsByTenant = new Map();
+          )
+      )
+    ORDER BY ms.next_run_at ASC, ms.id
+    LIMIT $1
+  `, [limit]);
+}
 
-    for (const subscription of subscriptions) {
-      const assignedAgentId = text(subscription.assigned_agent_id, 100);
-      const subjectType = subscription.subject_type || 'creator';
-      const available = await loadAvailableScheduledProfilePatrolAgent(tx, {
-        tenantId: subscription.tenant_id,
-        preferredAgentId: assignedAgentId,
-        platform: subscription.platform,
-        subjectType,
-      });
-      if (available.failure) {
-        const message = available.failure.message;
-        await tx.execute(`
-          UPDATE monitor_subscriptions
-          SET last_error = $1, updated_at = now()
-          WHERE id = $2 AND tenant_id = $3
-        `, [message, subscription.id, subscription.tenant_id]);
-        results.push({
-          kind: 'agent_unavailable',
-          subscriptionId: subscription.id,
-          message,
-        });
-        continue;
-      }
-      const compatible = available;
-      if (!settingsByTenant.has(subscription.tenant_id)) {
-        const rows = await tx.queryAll(`
-          SELECT key, value
-          FROM tenant_settings
-          WHERE tenant_id = $1
-            AND key IN (
-              'monitor_publishWindow', 'monitor_likeThreshold',
-              'monitor_observeWindowHours', 'monitor_timezone'
+async function lockDueProfilePatrolSubscription(tx, subscription) {
+  return await tx.queryOne(`
+    SELECT ms.*
+    FROM monitor_subscriptions ms
+    WHERE ms.id = $1 AND ms.tenant_id = $2
+      AND ms.status = 'active'
+      AND ms.subject_type = 'creator'
+      AND COALESCE(ms.account_url, '') <> ''
+      AND ms.next_run_at <= now()
+      AND NOT EXISTS (
+        SELECT 1
+        FROM monitor_executions execution
+        WHERE execution.subscription_id = ms.id
+          AND (
+            execution.status = 'running'
+            OR (
+              execution.status = 'pending'
+              AND EXISTS (
+                SELECT 1
+                FROM capture_task_items item
+                WHERE item.tenant_id = execution.tenant_id
+                  AND item.metadata->>'monitorExecutionId' =
+                    execution.id::text
+              )
             )
-        `, [subscription.tenant_id]);
-        settingsByTenant.set(
-          subscription.tenant_id,
-          profileMonitorSettings(rows),
-        );
-      }
-      const workflow = PROFILE_PATROL_WORKFLOWS[subjectType];
-      const title = subjectType === 'official'
-        ? `官方账号评论巡查 · ${subscription.name}`
-        : `关注博主作品扫描 · ${subscription.name}`;
-      const scheduledFor = new Date(subscription.next_run_at).toISOString();
-      const captureSettings = sanitizeCloudStructuredObject(
-        subjectType === 'official'
-          ? {
-              includeComments: true,
-              includeCommentsOnDetailCapture: true,
-              autoSyncAfterDetailCapture: true,
-              commentsMaxDetectedItems: 50,
-              skipAlreadyCapturedOnDetailCapture: false,
-              skipOfficialAccounts: true,
-              verifyPublishDateFromDetail: true,
-            }
-          : {autoSyncAfterDetailCapture: true},
+          )
+      )
+    FOR UPDATE OF ms SKIP LOCKED
+  `, [subscription.id, subscription.tenant_id]);
+}
+
+async function enqueueDueProfilePatrolSubscription(
+  subscriptionSnapshot,
+  settingsByTenant,
+) {
+  return await withTransaction(async tx => {
+    const assignedAgentId = text(
+      subscriptionSnapshot.assigned_agent_id,
+      100,
+    );
+    const subjectType = subscriptionSnapshot.subject_type || 'creator';
+
+    // Candidate discovery is read-only. The first blocking lock in every
+    // Profile dispatch transaction is the Agent execution slot/row. Only
+    // after that fence is held may this path claim a subscription/execution.
+    const available = await loadAvailableScheduledProfilePatrolAgent(tx, {
+      tenantId: subscriptionSnapshot.tenant_id,
+      preferredAgentId: assignedAgentId,
+      platform: subscriptionSnapshot.platform,
+      subjectType,
+    });
+    const subscription = await lockDueProfilePatrolSubscription(
+      tx,
+      subscriptionSnapshot,
+    );
+    if (!subscription) {
+      return {
+        kind: 'busy',
+        subscriptionId: subscriptionSnapshot.id,
+        message: '该账号计划已被其他调度流程领取或不再到期',
+      };
+    }
+    if (
+      profilePatrolSubscriptionFence(subscription) !==
+      profilePatrolSubscriptionFence(subscriptionSnapshot)
+    ) {
+      return {
+        kind: 'changed',
+        subscriptionId: subscription.id,
+        message: '账号计划在调度期间发生变化，云端稍后会按最新配置重试',
+      };
+    }
+    if (available.failure) {
+      const message = available.failure.message;
+      await tx.execute(`
+        UPDATE monitor_subscriptions
+        SET last_error = $1, updated_at = now()
+        WHERE id = $2 AND tenant_id = $3
+      `, [message, subscription.id, subscription.tenant_id]);
+      return {
+        kind: 'agent_unavailable',
+        subscriptionId: subscription.id,
+        message,
+      };
+    }
+    const compatibilityFailure = profilePatrolAgentCompatibilityFailure(
+      available.agent,
+      [subscription.platform],
+      subjectType,
+    );
+    if (
+      compatibilityFailure ||
+      !captureAgentFullHeartbeatOnline(available.agent)
+    ) {
+      const message = compatibilityFailure?.message ||
+        '目标执行节点已离线或心跳不完整，云端稍后会自动重试';
+      await tx.execute(`
+        UPDATE monitor_subscriptions
+        SET last_error = $1, updated_at = now()
+        WHERE id = $2 AND tenant_id = $3
+      `, [message, subscription.id, subscription.tenant_id]);
+      return {
+        kind: 'agent_unavailable',
+        subscriptionId: subscription.id,
+        message,
+      };
+    }
+
+    if (!settingsByTenant.has(subscription.tenant_id)) {
+      const rows = await tx.queryAll(`
+        SELECT key, value
+        FROM tenant_settings
+        WHERE tenant_id = $1
+          AND key IN (
+            'monitor_publishWindow', 'monitor_likeThreshold',
+            'monitor_observeWindowHours', 'monitor_timezone'
+          )
+      `, [subscription.tenant_id]);
+      settingsByTenant.set(
+        subscription.tenant_id,
+        profileMonitorSettings(rows),
       );
-      const monitorSettings = settingsByTenant.get(subscription.tenant_id);
-      const requestKey = crypto.randomUUID();
-      const requestHash = profilePatrolRequestHash({
-        workflow,
-        agentId: compatible.agent.id,
-        subscriptionIds: [subscription.id],
+    }
+    const workflow = PROFILE_PATROL_WORKFLOWS[subjectType];
+    const title = subjectType === 'official'
+      ? `官方账号评论巡查 · ${subscription.name}`
+      : `关注博主作品扫描 · ${subscription.name}`;
+    const scheduledFor = new Date(subscription.next_run_at).toISOString();
+    const captureSettings = sanitizeCloudStructuredObject(
+      subjectType === 'official'
+        ? {
+            includeComments: true,
+            includeCommentsOnDetailCapture: true,
+            autoSyncAfterDetailCapture: true,
+            commentsMaxDetectedItems: 50,
+            skipAlreadyCapturedOnDetailCapture: false,
+            skipOfficialAccounts: true,
+            verifyPublishDateFromDetail: true,
+          }
+        : {autoSyncAfterDetailCapture: true},
+    );
+    const monitorSettings = settingsByTenant.get(subscription.tenant_id);
+    const requestKey = crypto.randomUUID();
+    const requestHash = profilePatrolRequestHash({
+      workflow,
+      agentId: available.agent.id,
+      subscriptionIds: [subscription.id],
+      title,
+      monitorSettings,
+      captureSettings,
+      scheduledFor,
+    });
+    const reusableExecution = await tx.queryOne(`
+      SELECT execution.id
+      FROM monitor_executions execution
+      WHERE execution.tenant_id = $1
+        AND execution.subscription_id = $2
+        AND execution.status = 'pending'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM capture_task_items item
+          WHERE item.tenant_id = execution.tenant_id
+            AND item.metadata->>'monitorExecutionId' = execution.id::text
+        )
+      ORDER BY execution.created_at, execution.id
+      LIMIT 1
+      FOR UPDATE OF execution
+    `, [subscription.tenant_id, subscription.id]);
+    const executionIdsBySubscription = new Map();
+    if (reusableExecution) {
+      executionIdsBySubscription.set(
+        String(subscription.id),
+        reusableExecution.id,
+      );
+    }
+    let dispatched;
+    try {
+      dispatched = await materializeProfilePatrolTask(tx, {
+        tenantId: subscription.tenant_id,
+        subjectType,
+        agent: available.agent,
+        subscriptions: [subscription],
+        requestKey,
         title,
         monitorSettings,
         captureSettings,
+        requestHash,
+        executionIdsBySubscription,
+        triggerType: 'profile_scan_schedule',
+        requestedByName: '云端调度器',
+        actorType: 'system',
         scheduledFor,
+        preferredAgentId: available.preferredAgentId,
+        agentSelection: available.selection,
       });
-      const reusableExecution = await tx.queryOne(`
-        SELECT execution.id
-        FROM monitor_executions execution
-        WHERE execution.tenant_id = $1
-          AND execution.subscription_id = $2
-          AND execution.status = 'pending'
-          AND NOT EXISTS (
-            SELECT 1
-            FROM capture_task_items item
-            WHERE item.tenant_id = execution.tenant_id
-              AND item.metadata->>'monitorExecutionId' = execution.id::text
-          )
-        ORDER BY execution.created_at, execution.id
-        LIMIT 1
-        FOR UPDATE OF execution
-      `, [subscription.tenant_id, subscription.id]);
-      const executionIdsBySubscription = new Map();
-      if (reusableExecution) {
-        executionIdsBySubscription.set(
-          String(subscription.id),
-          reusableExecution.id,
-        );
+    } catch (error) {
+      if (error?.error === 'subscription_execution_busy') {
+        return {
+          kind: 'busy',
+          subscriptionId: subscription.id,
+          message: error.message,
+        };
       }
-      let dispatched;
-      try {
-        dispatched = await materializeProfilePatrolTask(tx, {
-          tenantId: subscription.tenant_id,
-          subjectType,
-          agent: compatible.agent,
-          subscriptions: [subscription],
-          requestKey,
-          title,
-          monitorSettings,
-          captureSettings,
-          requestHash,
-          executionIdsBySubscription,
-          triggerType: 'profile_scan_schedule',
-          requestedByName: '云端调度器',
-          actorType: 'system',
-          scheduledFor,
-          preferredAgentId: compatible.preferredAgentId,
-          agentSelection: compatible.selection,
-        });
-      } catch (error) {
-        if (error?.error === 'subscription_execution_busy') {
-          results.push({
-            kind: 'busy',
-            subscriptionId: subscription.id,
-            message: error.message,
-          });
-          continue;
-        }
-        throw error;
-      }
-      await tx.execute(`
-        UPDATE monitor_subscriptions
-        SET last_error = '', updated_at = now()
-        WHERE id = $1 AND tenant_id = $2
-      `, [subscription.id, subscription.tenant_id]);
-      results.push({
-        kind: 'created',
-        subscriptionId: subscription.id,
-        taskId: dispatched.task.id,
-        agentId: compatible.agent.id,
-        agentOnline: dispatched.agentOnline,
-        agentSelection: compatible.selection,
-      });
+      throw error;
     }
-    return results;
+    await tx.execute(`
+      UPDATE monitor_subscriptions
+      SET last_error = '', updated_at = now()
+      WHERE id = $1 AND tenant_id = $2
+    `, [subscription.id, subscription.tenant_id]);
+    return {
+      kind: 'created',
+      subscriptionId: subscription.id,
+      taskId: dispatched.task.id,
+      agentId: available.agent.id,
+      agentOnline: dispatched.agentOnline,
+      agentSelection: available.selection,
+    };
   });
+}
+
+export async function enqueueDueProfilePatrolTasks(limit = 20) {
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 20));
+  const reconciledExecutions = await withTransaction(async tx =>
+    await reconcileStaleProfilePatrolExecutions(
+      tx,
+      {limit: safeLimit * 5},
+    ));
+  const subscriptions = await withTransaction(async tx =>
+    await loadDueProfilePatrolSubscriptionCandidates(tx, safeLimit));
+  const results = reconciledExecutions.map(execution => ({
+    kind: 'stale_execution_reconciled',
+    subscriptionId: execution.subscription_id,
+    executionId: execution.id,
+    message: '历史账号巡查执行状态未闭环，已清理并重新进入调度',
+  }));
+  const settingsByTenant = new Map();
+  for (const subscription of subscriptions) {
+    results.push(await enqueueDueProfilePatrolSubscription(
+      subscription,
+      settingsByTenant,
+    ));
+  }
+  return results;
 }

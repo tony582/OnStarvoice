@@ -5,6 +5,9 @@ import { applyResolvedMetrics } from '../utils/metrics.js';
 import {
   captureOfficialCommentPatrolSnapshots,
 } from '../services/official-comment-patrol-analytics.js';
+import {
+  lockProfileDiscoverySubscriptionsForExecutions,
+} from '../modules/capture/infrastructure/postgres-profile-discovery-work.js';
 
 const router = Router();
 const MONITOR_SETTING_KEYS = new Set([
@@ -1182,6 +1185,11 @@ router.post('/executions/:id/finish', requireTenantAccess, requireTenantWriter, 
 
     const finalStatus = status === 'failed' ? 'failed' : 'succeeded';
     const result = await withTransaction(async tx => {
+      await lockProfileDiscoverySubscriptionsForExecutions(
+        tx,
+        req.tenantId,
+        [req.params.id],
+      );
       const execution = await tx.queryOne(`
         UPDATE monitor_executions
         SET status = $1,
@@ -1193,6 +1201,13 @@ router.post('/executions/:id/finish', requireTenantAccess, requireTenantWriter, 
           finished_at = now(),
           updated_at = now()
         WHERE id = $7 AND tenant_id = $8 AND status IN ('pending', 'running')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM capture_task_items item
+            WHERE item.tenant_id = monitor_executions.tenant_id
+              AND item.metadata->>'monitorExecutionId' =
+                monitor_executions.id::text
+          )
         RETURNING *
       `, [
         finalStatus,

@@ -1399,6 +1399,7 @@ async function loadPromotedRetryPayload(tx, tenantId, parent, items) {
 
 async function renewProfileRetryExecutions(tx, tenantId, items, targets) {
   const executionIdByItem = new Map();
+  const profileItems = [];
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index];
     if (item.item_type !== 'profile_subscription') continue;
@@ -1410,62 +1411,70 @@ async function renewProfileRetryExecutions(tx, tenantId, items, targets) {
     if (!UUID_PATTERN.test(subscriptionId)) {
       return {error: 'retry_profile_subscription_invalid'};
     }
-    const subscriptionSnapshot = await tx.queryOne(`
-      SELECT id, status
-      FROM monitor_subscriptions
-      WHERE id = $1 AND tenant_id = $2
-    `, [subscriptionId, tenantId]);
-    if (!subscriptionSnapshot || subscriptionSnapshot.status !== 'active') {
-      return {error: 'retry_profile_subscription_unavailable'};
-    }
-    // Profile dispatchers do not all acquire subscription/execution rows in
-    // the same order. Never wait while crossing that boundary: claim the
-    // previous execution first with SKIP LOCKED, then claim the subscription
-    // the same way. A competing manual/scheduled dispatch makes this recovery
-    // roll back and retry later instead of forming a lock cycle.
     const previousExecutionId = text(metadata.monitorExecutionId, 100);
-    if (UUID_PATTERN.test(previousExecutionId)) {
-      const previousExecutionExists = await tx.queryOne(`
-        SELECT id
-        FROM monitor_executions
-        WHERE id = $1 AND tenant_id = $2
-      `, [previousExecutionId, tenantId]);
-      if (previousExecutionExists) {
-        const previousExecution = await tx.queryOne(`
-          SELECT id, status
-          FROM monitor_executions
-          WHERE id = $1 AND tenant_id = $2
-          FOR UPDATE SKIP LOCKED
-        `, [previousExecutionId, tenantId]);
-        if (!previousExecution) {
-          return {error: 'retry_profile_execution_busy'};
-        }
-        if (['pending', 'running'].includes(previousExecution.status)) {
-          await tx.execute(`
-            UPDATE monitor_executions
-            SET status = 'failed',
-              error_message =
-                '原设备任务已结束，未完成账号已转交其他设备重试',
-              finished_at = COALESCE(finished_at, now()),
-              updated_at = now()
-            WHERE id = $1 AND tenant_id = $2
-              AND status IN ('pending', 'running')
-          `, [previousExecutionId, tenantId]);
-        }
-      }
-    }
-    const subscription = await tx.queryOne(`
+    profileItems.push({
+      index,
+      item,
+      subscriptionId,
+      previousExecutionId: UUID_PATTERN.test(previousExecutionId)
+        ? previousExecutionId
+        : '',
+    });
+  }
+  if (profileItems.length === 0) return {executionIdByItem};
+
+  // Every Profile entry point now uses one blocking order: Agent slot/row,
+  // then subscriptions in stable ID order, then prior executions in stable
+  // ID order. This transaction already holds the Agent and retry lineage
+  // fences before entering this function.
+  const subscriptionIds = [...new Set(
+    profileItems.map(entry => entry.subscriptionId),
+  )].sort();
+  const subscriptions = await tx.queryAll(`
       SELECT id, status
       FROM monitor_subscriptions
-      WHERE id = $1 AND tenant_id = $2
-      FOR SHARE SKIP LOCKED
-    `, [subscriptionId, tenantId]);
-    if (!subscription) {
-      return {error: 'retry_profile_subscription_busy'};
-    }
-    if (subscription.status !== 'active') {
-      return {error: 'retry_profile_subscription_unavailable'};
-    }
+      WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+      ORDER BY id
+      FOR UPDATE
+    `, [tenantId, subscriptionIds]);
+  if (
+    subscriptions.length !== subscriptionIds.length ||
+    subscriptions.some(subscription => subscription.status !== 'active')
+  ) {
+    return {error: 'retry_profile_subscription_unavailable'};
+  }
+
+  const previousExecutionIds = [...new Set(
+    profileItems
+      .map(entry => entry.previousExecutionId)
+      .filter(Boolean),
+  )].sort();
+  const previousExecutions = previousExecutionIds.length > 0
+    ? await tx.queryAll(`
+        SELECT id, status
+        FROM monitor_executions
+        WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+        ORDER BY id
+        FOR UPDATE
+      `, [tenantId, previousExecutionIds])
+    : [];
+  const activePreviousExecutionIds = previousExecutions
+    .filter(execution => ['pending', 'running'].includes(execution.status))
+    .map(execution => execution.id);
+  if (activePreviousExecutionIds.length > 0) {
+    await tx.execute(`
+      UPDATE monitor_executions
+      SET status = 'failed',
+        error_message =
+          '原设备任务已结束，未完成账号已转交其他设备重试',
+        finished_at = COALESCE(finished_at, now()),
+        updated_at = now()
+      WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+        AND status IN ('pending', 'running')
+    `, [tenantId, activePreviousExecutionIds]);
+  }
+
+  for (const entry of profileItems) {
     const execution = await tx.queryOne(`
       INSERT INTO monitor_executions (tenant_id, subscription_id, status)
       VALUES ($1, $2, 'pending')
@@ -1473,14 +1482,16 @@ async function renewProfileRetryExecutions(tx, tenantId, items, targets) {
         WHERE status IN ('pending', 'running')
       DO NOTHING
       RETURNING id
-    `, [tenantId, subscriptionId]);
-    if (!execution) return {error: 'retry_profile_execution_busy'};
-    executionIdByItem.set(String(item.id), execution.id);
-    targets[index] = {
-      ...targets[index],
-      subscriptionId,
-      recordId: subscriptionId,
-      externalId: subscriptionId,
+    `, [tenantId, entry.subscriptionId]);
+    if (!execution) {
+      return {error: 'retry_profile_execution_busy'};
+    }
+    executionIdByItem.set(String(entry.item.id), execution.id);
+    targets[entry.index] = {
+      ...targets[entry.index],
+      subscriptionId: entry.subscriptionId,
+      recordId: entry.subscriptionId,
+      externalId: entry.subscriptionId,
       executionId: execution.id,
     };
   }

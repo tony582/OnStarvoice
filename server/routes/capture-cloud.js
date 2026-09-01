@@ -99,6 +99,7 @@ import {
   reconcileElasticCaptureLeases,
 } from '../modules/capture/infrastructure/postgres-lease-reconciliation.js';
 import {
+  lockProfileDiscoveryWorkForTask,
   syncProfileDiscoverySubscriptions,
 } from '../modules/capture/infrastructure/postgres-profile-discovery-work.js';
 
@@ -1364,6 +1365,7 @@ async function cancelProfileDiscoveryWork(tx, {
   if (!isProfilePatrolTask(task, payload)) {
     return {itemCount: 0, executionCount: 0};
   }
+  await lockProfileDiscoveryWorkForTask(tx, tenantId, taskId);
   const canceledItems = await tx.queryAll(`
     UPDATE capture_task_items
     SET status = 'canceled',
@@ -2000,6 +2002,9 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
     ) || 0,
   );
   const isProfilePatrol = isProfilePatrolTask(task);
+  if (isProfilePatrol) {
+    await lockProfileDiscoveryWorkForTask(tx, agent.tenant_id, task.id);
+  }
   const projectedItemIds = [];
   for (const entry of negativePatrolTargetResults(snapshot)) {
     const currentItemState = elasticPool
