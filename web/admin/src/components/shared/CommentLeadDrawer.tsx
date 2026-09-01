@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { X, ExternalLink, MessageCircle, Footprints, CheckCheck, CircleSlash, Send, ArrowLeft } from 'lucide-react'
+import { X, MessageCircle, Footprints, CheckCheck, CircleSlash, Send, ArrowLeft } from 'lucide-react'
 import { formatNumber, formatDate, formatFullDate, LABELS, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
 const PANEL_MIN = 420, PANEL_MAX = 860, PANEL_DEFAULT = 560
 
@@ -157,9 +158,10 @@ export function CommentLeadDrawer({ lead, onClose, canWrite, onSetStatus, onDisp
               {lead.record_ai_summary && (
                 <div className="mt-2 rounded-md bg-primary/[0.04] p-2.5 text-[12px] leading-6 text-muted-foreground"><span className="font-semibold text-foreground">帖子AI研判:</span>{lead.record_ai_summary}</div>
               )}
-              {lead.record_url && (
-                <a href={lead.record_url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />查看原帖</a>
-              )}
+              <RecordSourceAction
+                record={{ id: lead.record_id, platform: lead.platform, url: lead.record_url }}
+                className="mt-2 text-[12px] font-semibold"
+              />
             </div>
           </section>
 

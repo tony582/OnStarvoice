@@ -8,6 +8,7 @@ const [
   manifestSource,
   captureSyncSource,
   douyinKeywordSearchSource,
+  debugSessionSource,
 ] = await Promise.all([
   readFile(new URL("background.js", repoRoot), "utf8"),
   readFile(new URL("manifest.json", repoRoot), "utf8"),
@@ -16,12 +17,27 @@ const [
     new URL("utils/capture/douyin-keyword-search.js", repoRoot),
     "utf8",
   ),
+  readFile(new URL("utils/capture/debug-session.js", repoRoot), "utf8"),
 ]);
 const manifest = JSON.parse(manifestSource);
+
+function readDetailBatchFunctionSource() {
+  const start = captureSyncSource.indexOf(
+    "export async function batchCaptureDetailsForRecords",
+  );
+  const end = captureSyncSource.indexOf(
+    "export function resolveSyncInputForRecord",
+    start,
+  );
+  assert.ok(start >= 0, "missing batchCaptureDetailsForRecords");
+  assert.ok(end > start, "missing detail batch end marker");
+  return captureSyncSource.slice(start, end);
+}
 
 test("capture task runtime declares native tab-group permissions and worker module", () => {
   assert.equal(manifest.permissions.includes("tabs"), true);
   assert.equal(manifest.permissions.includes("tabGroups"), true);
+  assert.equal(manifest.permissions.includes("unlimitedStorage"), true);
   assert.match(backgroundSource, /utils\/capture\/task-tab-group\.js/);
   assert.match(backgroundSource, /utils\/capture\/task-runtime\.js/);
   assert.match(backgroundSource, /utils\/capture\/task-owner\.js/);
@@ -103,7 +119,19 @@ test("task begin checks debugger ownership before changing native groups", () =>
   const groupAt = body.indexOf("captureTaskTabGroupManager.begin");
   assert.ok(ownershipAt >= 0);
   assert.ok(groupAt > ownershipAt);
-  assert.match(body, /capture_task_debug_busy/u);
+  assert.match(body, /classifyDebugOwnership/u);
+  assert.match(body, /createCaptureTaskDebugOwnershipError/u);
+  for (const code of [
+    "capture_task_debug_starvoice_active",
+    "capture_task_external_debugger_busy",
+    "capture_task_debug_ownership_unknown",
+  ]) {
+    assert.match(
+      `${backgroundSource}\n${debugSessionSource}`,
+      new RegExp(code, "u"),
+    );
+  }
+  assert.doesNotMatch(body, /'capture_task_debug_busy'/u);
 });
 
 test("task begin reconciles only confirmed stale native groups before reporting group busy", () => {
@@ -151,8 +179,10 @@ test("task-level Debug trusts the source URL and rejects unsupported or spoofed 
   const start = backgroundSource.indexOf("async function beginCaptureTask");
   const end = backgroundSource.indexOf("async function updateCaptureTask", start);
   const body = backgroundSource.slice(start, end);
-  assert.match(body, /const sourceTab = await chrome\.tabs\.get\(sourceTabId\)/u);
+  assert.match(body, /sourceTab = await chrome\.tabs\.get\(sourceTabId\)/u);
   assert.match(body, /detectPlatformFromUrl\(sourceTab\?\.url \|\| ''\)/u);
+  assert.match(body, /resolveCaptureTaskReplacementLease\(sourceTabId/u);
+  assert.match(body, /replacementPlatform !== sourcePlatform/u);
   assert.match(body, /new Set\(\['xiaohongshu', 'douyin'\]\)\.has\(sourcePlatform\)/u);
   assert.match(body, /capture_task_platform_unsupported/u);
   assert.match(body, /requestedPlatform !== sourcePlatform/u);
@@ -248,6 +278,86 @@ test("Douyin detail enhancement stays on one worker and delays unavailable failu
     captureSyncSource,
     /DOUYIN_DETAIL_ROUTE_SETTLE_MS = 1200/u,
   );
+});
+
+test("Xiaohongshu and Douyin interrupted detail workers are recreated with finite per-item and per-batch limits", () => {
+  assert.match(
+    captureSyncSource,
+    /DETAIL_RUNNER_RECREATE_MAX_PER_BATCH = 2/u,
+  );
+  assert.match(
+    captureSyncSource,
+    /DETAIL_RUNNER_RECREATE_MAX_PER_ITEM = 1/u,
+  );
+  const helperStart = captureSyncSource.indexOf(
+    "const recreateInterruptedDetailRunners",
+  );
+  const helperEnd = captureSyncSource.indexOf(
+    "const discardPrefetchForRecord",
+    helperStart,
+  );
+  const helperBody = captureSyncSource.slice(helperStart, helperEnd);
+  assert.match(
+    helperBody,
+    /normalizedRecordPlatform === 'xiaohongshu'[\s\S]*normalizedRecordPlatform === 'douyin'/u,
+  );
+  assert.match(
+    helperBody,
+    /normalizedRecordPlatform === 'douyin' && !normalizedExpectedNoteId/u,
+    "a rebuilt Douyin worker must retain a real expected work ID",
+  );
+  assert.match(helperBody, /previousPipeline\?\.stop/u);
+  assert.match(helperBody, /closeOwnedDetailRunnerTabs\(previousContexts\)/u);
+  assert.match(helperBody, /prepareDetailBatchRunnerContext/u);
+  assert.match(helperBody, /registerCaptureTaskTab/u);
+  assert.match(helperBody, /taskId: normalizedCaptureTaskId/u);
+  assert.match(helperBody, /detail_runner_recreated/u);
+
+  const recoveryCallStart = captureSyncSource.indexOf(
+    "const runnerContextInterrupted",
+    helperEnd,
+  );
+  const recoveryCallEnd = captureSyncSource.indexOf(
+    "const terminalTraceState",
+    recoveryCallStart,
+  );
+  const recoveryCallBody = captureSyncSource.slice(
+    recoveryCallStart,
+    recoveryCallEnd,
+  );
+  assert.match(recoveryCallBody, /recreateInterruptedDetailRunners/u);
+  assert.match(recoveryCallBody, /recordPlatform/u);
+  assert.match(recoveryCallBody, /expectedNoteId: expectedDouyinNoteId/u);
+  assert.match(recoveryCallBody, /index -= 1;\s*continue;/u);
+});
+
+test("Douyin detail core is captured without optional blogger metrics", () => {
+  const body = readDetailBatchFunctionSource();
+  assert.match(
+    body,
+    /const shouldCaptureBloggerMetricsForRecord =\s*includeBloggerMetrics \|\| shouldApplyLowFollowerHitFilter/u,
+  );
+  assert.doesNotMatch(
+    body,
+    /shouldCaptureBloggerMetricsForRecord =[^;]*recordPlatform === 'douyin'/u,
+  );
+  const coreCaptureAt = body.indexOf("const captureCurrentNotePayload");
+  const coreCaptureEnd = body.indexOf("let noteResult", coreCaptureAt);
+  const coreCapture = body.slice(coreCaptureAt, coreCaptureEnd);
+  assert.match(coreCapture, /expectedNoteId: expectedDouyinNoteId/u);
+  assert.match(coreCapture, /includeBloggerMetrics: false/u);
+  assert.match(coreCapture, /preferWorksTabForBloggerMetrics: false/u);
+
+  const optionalMetricsAt = body.indexOf(
+    "const metricsResult = await captureBloggerMetricsForDetailPayload",
+  );
+  const optionalMetricsEnd = body.indexOf(
+    "detailPayload = applyBloggerMetricsResultToPayload",
+    optionalMetricsAt,
+  );
+  const optionalMetrics = body.slice(optionalMetricsAt, optionalMetricsEnd);
+  assert.match(optionalMetrics, /expectedNoteId: expectedDouyinNoteId/u);
+  assert.match(optionalMetrics, /preferWorksTabForBloggerMetrics/u);
 });
 
 test("Douyin card identity and detail route are kept consistent", () => {
@@ -403,7 +513,7 @@ test("filtered items still pass the shared post-item safety delay", () => {
       itemCatchBodyAt > labeledTryAt &&
       itemCatchAt > labeledTryAt,
   );
-  assert.equal((itemBody.match(/break captureCurrentDetail;/gu) || []).length, 2);
+  assert.equal((itemBody.match(/break captureCurrentDetail;/gu) || []).length, 3);
   assert.doesNotMatch(itemBody, /\bcontinue;/u);
   assert.ok(itemFinallyAt > itemCatchAt && itemDelayAt > itemFinallyAt);
 });
@@ -560,7 +670,7 @@ test("required owner is verified before and after task mutations", () => {
   const firstOwnerCheckAt = body.indexOf("requireConnectedCaptureTaskOwner(taskId)");
   const groupAt = body.indexOf("captureTaskTabGroupManager.begin");
   const lastOwnerCheckAt = body.lastIndexOf("requireConnectedCaptureTaskOwner(taskId)");
-  const returnAt = body.indexOf("return {taskId, session, group}");
+  const returnAt = body.indexOf("return {taskId, session, group, debugOwnership}");
   assert.ok(firstOwnerCheckAt >= 0 && firstOwnerCheckAt < groupAt);
   assert.ok(lastOwnerCheckAt > groupAt && lastOwnerCheckAt < returnAt);
   assert.match(body, /ownerRequired = request\.ownerRequired === true/u);
@@ -629,4 +739,25 @@ test("batch sync cancellation reaches spacing, retry, content and lead writes", 
   assert.match(body, /waitForCancelableSyncDelay\([\s\S]*shouldStop,[\s\S]*signal/u);
   assert.match(body, /syncBatch\([\s\S]*\{shouldStop, signal\}/u);
   assert.match(body, /COMMENT_LEADS_SYNC_CANCELED/u);
+});
+
+test("profile recovery lineage survives the final batch request builder", () => {
+  const start = captureSyncSource.indexOf("function buildSyncBatchRecordInput");
+  const end = captureSyncSource.indexOf("function buildSyncRequestPayload", start);
+  const body = captureSyncSource.slice(start, end);
+  assert.match(body, /platform: record\.platform \|\| ''/u);
+  assert.match(body, /workflow: record\.workflow \|\| ''/u);
+  assert.match(
+    body,
+    /monitorExecutionId: record\.monitorExecutionId \|\| ''/u,
+  );
+  assert.match(body, /captureTaskId: record\.captureTaskId \|\| ''/u);
+  assert.match(
+    body,
+    /captureTaskItemAttemptId: record\.captureTaskItemAttemptId \|\| ''/u,
+  );
+  assert.match(
+    body,
+    /captureTaskItemRequestHash: record\.captureTaskItemRequestHash \|\| ''/u,
+  );
 });

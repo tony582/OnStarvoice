@@ -400,9 +400,28 @@ test('migration governance serializes processes, rejects drift, and explicitly a
   });
 
   await t.test('a two-column v066 ledger rejects normal paths until explicit adoption', async () => {
-    const postBaselinePath = path.join(copiedMigrations, postBaselineMigrationName);
-    const postBaselineBytes = await readFile(postBaselinePath);
-    await rm(postBaselinePath);
+    const postBaselineMigrations = await Promise.all(
+      (await readdir(path.join(serverRoot, 'db', 'migrations')))
+        .filter(name => {
+          const match = /^(\d{3})_.+\.sql$/u.exec(name);
+          return match
+            && Number(match[1]) > Number(legacyBaselineTargetName.slice(0, 3))
+            && !/reset/iu.test(name);
+        })
+        .sort()
+        .map(async name => ({
+          name,
+          bytes: await readFile(path.join(copiedMigrations, name)),
+        })),
+    );
+    assert.equal(
+      postBaselineMigrations.some(({name}) => name === postBaselineMigrationName),
+      true,
+      'the v066 simulation must remove the first post-baseline migration',
+    );
+    for (const migration of postBaselineMigrations) {
+      await rm(path.join(copiedMigrations, migration.name));
+    }
     await rm(path.join(copiedMigrations, pendingMigrationName));
     await rm(path.join(copiedMigrations, slowMigrationName));
     await rm(path.join(copiedMigrations, killedHolderMigrationName));
@@ -439,7 +458,9 @@ test('migration governance serializes processes, rejects drift, and explicitly a
       WHERE version = $1
     `, [legacyBaselineTargetName]);
 
-    await writeFile(postBaselinePath, postBaselineBytes);
+    for (const migration of postBaselineMigrations) {
+      await writeFile(path.join(copiedMigrations, migration.name), migration.bytes);
+    }
 
     for (const [suffix, args] of [
       ['legacy-verify-rejected', ['verify']],

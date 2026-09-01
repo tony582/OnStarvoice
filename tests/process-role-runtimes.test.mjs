@@ -75,6 +75,30 @@ function fakeCronRuntime(events) {
   };
 }
 
+function fakeWakeupRuntime(events) {
+  let stopped = false;
+  return {
+    stopNewWork() {
+      if (stopped) return false;
+      stopped = true;
+      events.push('wakeups:stop');
+      return true;
+    },
+    async drain() {
+      events.push('wakeups:drain');
+      return {
+        name: 'ops-control-wakeup',
+        drained: true,
+        timedOut: false,
+        pending: 0,
+      };
+    },
+    snapshot() {
+      return {connected: true};
+    },
+  };
+}
+
 function fakeDrainController(events) {
   return {
     inFlightCount: 0,
@@ -278,6 +302,10 @@ test('scheduler worker has no HTTP listener surface and delegates bounded cron l
       events.push('cron:start');
       return fakeCronRuntime(events);
     },
+    startWakeups: () => {
+      events.push('wakeups:start');
+      return fakeWakeupRuntime(events);
+    },
   });
 
   assert.equal(runtime.kind, 'scheduler');
@@ -288,7 +316,17 @@ test('scheduler worker has no HTTP listener surface and delegates bounded cron l
   assert.equal(runtime.stopNewWork(), false);
   const result = await runtime.drain({ timeoutMs: 20 });
   assert.equal(result.drained, true);
-  assert.deepEqual(events, ['cron:start', 'cron:stop', 'cron:drain', 'cron:destroy']);
+  assert.equal(result.cron.drained, true);
+  assert.equal(result.wakeups.drained, true);
+  assert.deepEqual(events, [
+    'cron:start',
+    'wakeups:start',
+    'cron:stop',
+    'wakeups:stop',
+    'cron:drain',
+    'wakeups:drain',
+    'cron:destroy',
+  ]);
 });
 
 test('split ai-media worker excludes compatibility one-shots and has no HTTP listener', async () => {

@@ -38,6 +38,7 @@ export const SCHEDULE_TERMINAL_RUN_STATUSES = Object.freeze([
   'skipped',
   'superseded',
 ]);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 export function scheduleRunBlocksNextOccurrence({
   runStatus = '',
@@ -136,6 +137,13 @@ function agentFailure(agent, platform, planSnapshot) {
     capabilities.remoteTaskEnhancementOptions !== true
   ) {
     return {code: 'scheduled_agent_enhancement_unsupported', message: '执行节点版本不支持采集增强参数'};
+  }
+  if (
+    Array.isArray(planSnapshot.searchPasses) &&
+    planSnapshot.searchPasses.length > 1 &&
+    capabilities.remoteSequentialSearchPassesV1 !== true
+  ) {
+    return {code: 'scheduled_agent_sequential_search_unsupported', message: '执行节点版本不支持同一关键词串行补充巡检'};
   }
   const allowed = Array.isArray(agent.allowed_platforms)
     ? agent.allowed_platforms
@@ -409,6 +417,15 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
   }
 
   const planSnapshot = object(schedule.plan_snapshot);
+  const searchPasses = Array.isArray(planSnapshot.searchPasses)
+    ? planSnapshot.searchPasses.slice(0, 2)
+    : [];
+  const sequentialSearchEnabled = Boolean(
+    distributionMode === 'elastic_pool' &&
+    schedule.platform === 'douyin' &&
+    searchPasses.length > 1
+  );
+  const runItemTotal = templateItems.length;
   const elasticScheduleAgents = distributionMode === 'elastic_pool'
     ? await tx.queryAll(`
         SELECT agent_id
@@ -461,6 +478,16 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     claimUnit: distributionMode === 'elastic_pool' ? 'keyword' : 'fixed_batch',
     executionMode: 'one_time',
     planSnapshot,
+    ...(sequentialSearchEnabled
+      ? {
+          sequentialSearch: {
+            enabled: true,
+            passes: searchPasses,
+            keywordCount: templateItems.length,
+            itemCount: runItemTotal,
+          },
+        }
+      : {}),
     orchestrationScheduleRun: true,
     manualRunNow: manual,
     scheduleId: schedule.id,
@@ -490,12 +517,12 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     schedule.platform,
     JSON.stringify({
       current: 0,
-      total: templateItems.length,
+      total: runItemTotal,
       phase: distributionMode === 'elastic_pool' ? 'queued' : 'dispatched',
     }),
     JSON.stringify({
-      total: templateItems.length,
-      assigned: distributionMode === 'elastic_pool' ? 0 : templateItems.length,
+      total: runItemTotal,
+      assigned: distributionMode === 'elastic_pool' ? 0 : runItemTotal,
       processed: 0,
       success: 0,
       failed: 0,
@@ -506,7 +533,9 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     scheduledFor.toISOString(),
     Number(schedule.revision),
     distributionMode === 'elastic_pool'
-      ? '无人值守计划已生成本轮云端队列，等待空闲节点领取'
+      ? sequentialSearchEnabled
+        ? '无人值守计划已生成一词一任务的串行巡检队列，等待空闲节点领取'
+        : '无人值守计划已生成本轮云端队列，等待空闲节点领取'
       : '无人值守计划已生成本轮任务，正在下发到执行节点',
   ]);
 
@@ -545,6 +574,18 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
         keyword: templateItem.keyword,
         ordinal: Number(templateItem.ordinal),
         scheduleTemplateItemId: templateItem.id,
+        ...(distributionMode === 'elastic_pool'
+          ? {
+              disableAutomaticSearchRetry: true,
+              singleRelayV1: true,
+            }
+          : {}),
+        ...(sequentialSearchEnabled
+          ? {
+              searchPasses,
+              requireVerifiedFilters: true,
+            }
+          : {}),
       }),
     ]);
     runItems.push(item);
@@ -696,6 +737,17 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       scheduleId: schedule.id,
       scheduledFor: scheduledFor.toISOString(),
     };
+    const itemAttemptBindings = groupItems.map(item => ({
+      itemId: item.id,
+      attemptId: crypto.randomUUID(),
+      requestHash,
+      attemptNumber: 1,
+      assignmentRevision: 1,
+      keyword: item.keyword,
+    }));
+    const attemptBindingByItemId = new Map(
+      itemAttemptBindings.map(binding => [String(binding.itemId), binding]),
+    );
     await tx.execute(`
       INSERT INTO capture_tasks (
         id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
@@ -733,6 +785,38 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       scheduledFor.toISOString(),
       Number(schedule.revision),
     ]);
+    for (const item of groupItems) {
+      const attemptBinding = attemptBindingByItemId.get(String(item.id));
+      await tx.execute(`
+        UPDATE capture_task_items
+        SET status = 'dispatched',
+          attempt_count = 1,
+          execution_task_id = $1,
+          request_hash = $2,
+          dispatched_at = now(),
+          updated_at = now()
+        WHERE id = $3 AND tenant_id = $4
+      `, [childTaskId, requestHash, item.id, schedule.tenant_id]);
+      await tx.execute(`
+        INSERT INTO capture_task_item_attempts (
+          id, tenant_id, item_id, parent_task_id, execution_task_id,
+          agent_id, attempt_number, assignment_revision, status,
+          request_hash, checkpoint, result, error, dispatched_at
+        ) VALUES (
+          $1, $2, $3, $4, $5,
+          $6, 1, 1, 'dispatched',
+          $7, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
+        )
+      `, [
+        attemptBinding.attemptId,
+        schedule.tenant_id,
+        item.id,
+        runTaskId,
+        childTaskId,
+        agentId,
+        requestHash,
+      ]);
+    }
     await tx.execute(`
       INSERT INTO capture_agent_commands (
         id, tenant_id, agent_id, task_id, command_type, payload,
@@ -760,43 +844,13 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
           parentTaskId: runTaskId,
           revision: 1,
           itemIds: groupItems.map(item => item.id),
+          itemAttempts: itemAttemptBindings,
           scheduleId: schedule.id,
           scheduledFor: scheduledFor.toISOString(),
         },
       }),
       commandExpiresAt,
     ]);
-    for (const item of groupItems) {
-      await tx.execute(`
-        UPDATE capture_task_items
-        SET status = 'dispatched',
-          attempt_count = 1,
-          execution_task_id = $1,
-          request_hash = $2,
-          dispatched_at = now(),
-          updated_at = now()
-        WHERE id = $3 AND tenant_id = $4
-      `, [childTaskId, requestHash, item.id, schedule.tenant_id]);
-      await tx.execute(`
-        INSERT INTO capture_task_item_attempts (
-          id, tenant_id, item_id, parent_task_id, execution_task_id,
-          agent_id, attempt_number, assignment_revision, status,
-          request_hash, checkpoint, result, error, dispatched_at
-        ) VALUES (
-          $1, $2, $3, $4, $5,
-          $6, 1, 1, 'dispatched',
-          $7, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
-        )
-      `, [
-        crypto.randomUUID(),
-        schedule.tenant_id,
-        item.id,
-        runTaskId,
-        childTaskId,
-        agentId,
-        requestHash,
-      ]);
-    }
     await appendEvent(tx, {
       tenantId: schedule.tenant_id,
       taskId: childTaskId,
@@ -965,9 +1019,29 @@ export async function runCaptureOrchestrationScheduleNow({
   });
 }
 
-export async function enqueueDueCaptureOrchestrations(limit = 10) {
+export async function enqueueDueCaptureOrchestrations(input = 10) {
+  const options = input && typeof input === 'object' ? input : {limit: input};
   const results = [];
-  const maximum = Math.min(50, Math.max(1, Number(limit) || 10));
+  const maximum = Math.min(50, Math.max(1, Number(options.limit) || 10));
+  const tenantId = text(options.tenantId, 100).toLowerCase();
+  const scheduleIdInput = Array.isArray(options.scheduleIds)
+    ? options.scheduleIds
+    : [];
+  const scheduleIds = Array.from(new Set(
+    scheduleIdInput
+      .map(value => text(value, 100).toLowerCase())
+      .filter(value => UUID_PATTERN.test(value)),
+  ));
+  if (tenantId && !UUID_PATTERN.test(tenantId)) {
+    return [{kind: 'invalid_tenant_id'}];
+  }
+  if (Object.hasOwn(options, 'scheduleIds') && (
+    !tenantId
+    || scheduleIds.length === 0
+    || scheduleIds.length !== scheduleIdInput.length
+  )) {
+    return [{kind: 'invalid_schedule_scope'}];
+  }
   for (let index = 0; index < maximum; index += 1) {
     let claimedSchedule = null;
     try {
@@ -984,10 +1058,12 @@ export async function enqueueDueCaptureOrchestrations(limit = 10) {
         WHERE status = 'active'
           AND next_run_at IS NOT NULL
           AND next_run_at <= now()
+          AND ($1::uuid IS NULL OR tenant_id = $1::uuid)
+          AND (cardinality($2::uuid[]) = 0 OR id = ANY($2::uuid[]))
         ORDER BY next_run_at, id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
-      `);
+      `, [tenantId || null, scheduleIds]);
         if (!schedule) return null;
         claimedSchedule = {
           id: schedule.id,

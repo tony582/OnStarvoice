@@ -13,13 +13,51 @@ import {
 import { parsePublishTimestamp } from './publish-date.js';
 import {
   formatMonitoringIntentForPrompt,
+  formatTenantMonitoringScopeForPrompt,
   resolveMonitoringIntent,
+  resolveTenantMonitoringScope,
 } from './monitoring-intent.js';
 import { scheduleProcessBackgroundWork } from '../runtime/process-background-work.js';
+import {
+  getLlmRelayConfig,
+  isLlmRelayEligibleKind,
+  LLM_RELAY_CLASSIFICATION_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_TIMEOUT_MS,
+  LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS,
+  runLlmRelayPolicy,
+} from './llm-relay.js';
+import { requestLlmRelayAgentCompletion } from './llm-relay-jobs.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v2';
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v4';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
+const LLM_PROVIDER_ALIASES = Object.freeze({
+  aliyun: 'qianwen',
+  alibaba: 'qianwen',
+  dashscope: 'qianwen',
+  qwen: 'qianwen',
+});
+const LLM_PROVIDER_DEFAULTS = Object.freeze({
+  gemini: {model: 'gemini-2.0-flash', endpoint: ''},
+  openai: {model: 'gpt-4o-mini', endpoint: 'https://api.openai.com/v1'},
+  deepseek: {model: 'deepseek-chat', endpoint: 'https://api.deepseek.com/v1'},
+  qianwen: {model: 'qwen-turbo', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1'},
+});
+const PREFILTER_LLM_SETTING_KEYS = Object.freeze({
+  provider: 'relevance_prefilter_llm_provider',
+  model: 'relevance_prefilter_llm_model',
+  apiKey: 'relevance_prefilter_llm_api_key',
+  endpoint: 'relevance_prefilter_llm_api_endpoint',
+});
+export const PREFILTER_QWEN_FALLBACK_SETTING_KEYS = Object.freeze({
+  enabled: 'relevance_prefilter_qwen_fallback_enabled',
+  model: 'relevance_prefilter_qwen_fallback_model',
+  endpoint: 'relevance_prefilter_qwen_fallback_endpoint',
+  apiKey: 'dashscope_api_key',
+});
+export const DEFAULT_PREFILTER_QWEN_FALLBACK_MODEL = 'qwen3.7-flash-2026-07-15';
 
 const DEFAULT_BRAND_CONTEXT = {
   brandName: '安吉星',
@@ -53,45 +91,61 @@ export async function getBrandContext(tenantId) {
   return { brandName, brandAliases, businessContext, positiveContextTerms, noiseTerms };
 }
 
-export function buildSystemPrompt(brand, intent = {}) {
+export function buildSystemPrompt(
+  brand,
+  intent = {},
+  tenantScope = resolveTenantMonitoringScope(brand),
+) {
   return `你是一个可配置品牌的舆情分析专家。当前品牌：${brand.brandName}。
 品牌别名：${brand.brandAliases.join('、') || brand.brandName}。
 业务语境：${brand.businessContext}
 强相关语境词：${brand.positiveContextTerms.join('、') || '无'}。
 常见误命中/噪声：${brand.noiseTerms.join('、') || '无'}。
 
+${formatTenantMonitoringScopeForPrompt(tenantScope)}
+
 ${formatMonitoringIntentForPrompt(intent)}
 
-第一步判断内容是否符合【本次采集任务标准】，不是判断它是否宽泛涉及租户品牌家族：
-- relevant：内容有证据同时指向本次任务的目标对象和目标主题。
-- irrelevant：内容只涉及关联车型/品牌，却没有本次功能主题；或只是相似功能、泛行业话题、搜索词/标签/作者名巧合命中。
-- uncertain：已经出现目标对象或目标功能的直接线索，但列表或正文信息残缺，暂时无法确认两者关系。不能因为“功能相似”就判 uncertain。
+第一步判断 relevance，即内容是否属于【租户整体监控范围】：
+- relevant：内容有证据指向任一监测对象与任一监测主题的合理组合，不要求匹配本次采集关键词。
+- irrelevant：内容明确不属于全部监测关键词、对象和主题，或只是人名、地名、谐音、标签、作者名等噪声巧合。
+- uncertain：已经出现整体监控对象或主题的直接线索，但正文、图片、视频或评价对象仍不足以确认。
 
-第二步先识别“内容实际评价的对象”，再判断情绪：
-- sentiment 必须表示内容对本次监控对象/主题的态度，而不是整段文字里最强烈的情绪。
-- 负面表达若指向其它品牌、其它产品或泛行业现象，不得判为对本次监控对象的 negative。
-- 客观询问、故障确认、经验交流，且没有明显抱怨、指责或维权诉求时，判 neutral + inquiry。
+第二步单独判断 currentKeywordMatch：
+- relevant：符合本次搜索词的目标对象和目标主题。
+- irrelevant：不符合本次搜索词，但这不影响整体 relevance。
+- uncertain：信息不足，无法判断与本次搜索词的关系。
+
+第三步识别“内容实际评价的对象”，独立判断情感：
+- 内容分诊的 relevance、sentiment、intent、category 和 summary 只依据主贴本身（标题、正文、话题标签、作者及主贴媒体文字）；评论区不属于主贴判断证据。
+- 评论必须走独立的评论风险判断。即使评论区有大量负面评论，也绝不能反向把中性或正向主贴判为 negative。
+- 只有整体 relevance 为 relevant 或 uncertain 时才判断 sentiment；整体 irrelevant 时 sentimentStatus=not_applicable、sentiment=null，禁止用 neutral 伪装“未判断”。
+- sentiment 必须表示内容对租户整体监控对象/主题的态度，而不是只看本次采集关键词。
+- 明确的故障、失败、误拨、抱怨、指责、误导、收费争议或维权诉求判 negative；客观询问且无明显不满判 neutral + inquiry。
 - 内容相关与内容负面是两个独立结论；壁纸、教程、咨询可以 relevant 但 sentiment=neutral。
-- “安全”“安全感”“隐私”等普通词本身不代表负面或风险；必须有明确的故障、隐患、泄露、威胁、抱怨等上下文证据。
+- “安全”“安全感”“隐私”等普通词本身不代表负面或风险，必须结合完整上下文。
 
 校准样例：
-- “别克威朗车轮抱死”在“别克哨兵”任务中 irrelevant：它是机械故障，不是哨兵/驻车监控。
-- “至境E7胎噪”在“至境哨兵”任务中 irrelevant：它是车辆体验，不是哨兵功能。
-- “凯迪拉克碰撞测试”在“凯迪拉克OTA”任务中 irrelevant：它没有软件升级主题。
-- “安吉星反复提示更换空调滤芯，怎么关闭”可 relevant；若只是客观询问，则 sentiment=neutral、intent=inquiry。
+- “凯迪拉克CT5经常莫名拨打紧急救援电话”：即使采集关键词是“凯迪拉克车机升级”，currentKeywordMatch=irrelevant；但属于上汽通用安全救援监测，relevance=relevant、sentiment=negative、category=safety_rescue。
+- “昂科威plus远程失败”：即使没有明确写 iBuick，也属于别克远程控制故障，relevance=relevant、sentiment=negative、category=feature_usage。
+- “安吉星，一生黑”且正文投诉续费与客服误导：relevance=relevant、sentiment=negative，并按正文判 renewal_billing 或 service_quality。
+- “别克威朗车轮抱死”不属于哨兵、车机、远控、OTA、客服或其它监测主题时，整体 relevance=irrelevant，而不只是当前关键词不匹配。
+- “凯迪拉克碰撞测试”没有软件升级、安全救援或其它整体监测主题时，整体 relevance=irrelevant。
 - “安全感”“安全配置可靠”等正向表达不能据此生成风险或负面结论。
 
-对每条内容，你需要输出以下JSON格式：
-
+对每条内容，只输出以下 JSON：
 {
   "relevance": "relevant|irrelevant|uncertain",
+  "currentKeywordMatch": "relevant|irrelevant|uncertain",
+  "matchedTopics": ["命中的整体监测关键词或主题"],
   "relevanceConfidence": 0.0-1.0,
-  "relevanceReason": "判断相关或无关的简短原因",
+  "relevanceReason": "同时说明整体相关性与当前关键词关系",
   "noiseType": "none|place_name|person_name|real_estate|store|homophone|generic_word|other",
   "targetEntity": "内容实际讨论或评价的对象",
   "sentimentTarget": "情绪实际指向的对象",
   "evidence": ["支持判断的原文短语"],
-  "sentiment": "positive|neutral|negative",
+  "sentiment": "positive|neutral|negative|null",
+  "sentimentStatus": "classified|not_applicable",
   "intent": "inquiry|complaint|share|suggestion|other",
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|other",
   "subcategory": "具体子分类（中文）",
@@ -117,18 +171,23 @@ ${formatMonitoringIntentForPrompt(intent)}
   · 账号名信号:若作者账号名带本品牌或其别名/子品牌/产品/门店词，且像围绕该品牌运营(如带"官方""客服""旗舰店""XX店""服务中心""4S"等字样),多为经销商/员工/官方相关,优先判 dealer 或 employee。
 
 规则：
-- irrelevant 内容的 sentiment 固定为 neutral，category 固定为 other，summary 说明为何无关。
+- 搜索关键词、话题标签和作者名称是召回线索，不是整体相关性结论。
+- 当前关键词不匹配不能把整体相关内容判成 irrelevant。
 - uncertain 内容的 sentiment 尽量保守，能判断再给 positive/negative，不能判断则 neutral。
-- 租户品牌背景只能帮助理解实体，不能覆盖本次采集任务的目标主题和排除项。
-- 搜索关键词、话题标签和作者名称是召回线索，不是相关性结论。
 - 只输出JSON，不要其他文字。`;
 }
 
 export function buildUserMessage(record) {
   let text = '';
-  if (record.keyword) text += `采集关键词（仅表示召回入口，不代表一定相关）：${record.keyword}\n`;
+  if (record.keyword) text += `当前记录关键词（仅表示最近召回入口）：${record.keyword}\n`;
+  const observedKeywords = Array.isArray(record.observed_keywords)
+    ? [...new Set(record.observed_keywords.map(value => String(value || '').trim()).filter(Boolean))]
+    : [];
+  if (observedKeywords.length > 0) {
+    text += `全部召回关键词（只用于归属，不覆盖整体相关性）：${observedKeywords.slice(0, 30).join('、')}\n`;
+  }
   if (record.title) text += `标题：${record.title}\n`;
-  if (record.content) text += `正文：${record.content.slice(0, 2000)}\n`;
+  if (record.content) text += `正文：${truncatePromptText(record.content, 2000)}\n`;
   if (record.author_name) text += `作者：${record.author_name}\n`;
   if (record.platform) text += `平台：${record.platform}\n`;
   if (record.tags) {
@@ -155,14 +214,15 @@ export function modelRetryDelayMs(attempt, retryAfter = '') {
   return Math.min(5000, 500 * (2 ** Math.max(0, Number(attempt) || 0)));
 }
 
-async function requestModelResponse(url, buildRequest, errorPrefix) {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+async function requestModelResponse(url, buildRequest, errorPrefix, options = {}) {
+  const maxAttempts = Math.max(1, Math.min(3, Number(options.maxAttempts) || 3));
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const response = await fetch(url, buildRequest());
     if (response.ok) return response;
     const responseText = await response.text();
     if (
       RETRYABLE_MODEL_HTTP_STATUSES.has(response.status) &&
-      attempt < 2
+      attempt < maxAttempts - 1
     ) {
       const waitMs = modelRetryDelayMs(
         attempt,
@@ -188,18 +248,21 @@ async function requestModelResponse(url, buildRequest, errorPrefix) {
   throw new Error(`${errorPrefix}: retry exhausted`);
 }
 
-async function callGemini(apiKey, model, systemPrompt, userMessage) {
+async function callGemini(apiKey, model, systemPrompt, userMessage, options = {}) {
+  const timeoutMs = Number.isFinite(Number(options.timeoutMs))
+    ? Math.max(1000, Math.min(40000, Number(options.timeoutMs)))
+    : 40000;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const resp = await requestModelResponse(url, () => ({
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      system_instruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ parts: [{ text: userMessage }] }],
+      system_instruction: { parts: [{ text: sanitizePromptText(systemPrompt) }] },
+      contents: [{ parts: [{ text: sanitizePromptText(userMessage) }] }],
       generationConfig: { responseMimeType: 'application/json', temperature: 0.1 },
     }),
-    signal: AbortSignal.timeout(40000), // 防止 LLM 请求挂死冻住整个评论入库串行队列
-  }), 'Gemini API error');
+    signal: AbortSignal.timeout(timeoutMs), // 防止 LLM 请求挂死冻住整个评论入库串行队列
+  }), 'Gemini API error', {maxAttempts: options.maxAttempts});
   const data = await resp.json();
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
   return JSON.parse(text);
@@ -212,19 +275,23 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
   const maxTokens = Number.isFinite(Number(options.maxTokens))
     ? Math.max(256, Math.min(8192, Number(options.maxTokens)))
     : undefined;
+  const provider = normalizeLLMProvider(options.provider);
+  const requestBody = buildOpenAICompatibleRequestBody({
+    provider,
+    model,
+    systemPrompt,
+    userMessage,
+    temperature: 0.1,
+    maxTokens,
+    thinking: options.thinking,
+  });
   const url = `${endpoint}/chat/completions`;
   const resp = await requestModelResponse(url, () => ({
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      max_tokens: maxTokens,
-    }),
+    body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(timeoutMs), // 前置筛选使用更短预算；现有标注默认仍为 40 秒
-  }), 'LLM API error');
+  }), 'LLM API error', {maxAttempts: options.maxAttempts});
   const data = await resp.json();
   const content = String(data.choices?.[0]?.message?.content || '');
   const finishReason = String(data.choices?.[0]?.finish_reason || '');
@@ -234,6 +301,10 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
     promptTokens: Math.max(0, Number(data.usage?.prompt_tokens) || 0),
     completionTokens: Math.max(0, Number(data.usage?.completion_tokens) || 0),
     totalTokens: Math.max(0, Number(data.usage?.total_tokens) || 0),
+    reasoningTokens: Math.max(
+      0,
+      Number(data.usage?.completion_tokens_details?.reasoning_tokens) || 0,
+    ),
   };
   let parsed;
   try {
@@ -254,24 +325,454 @@ async function callOpenAICompatible(apiKey, model, endpoint, systemPrompt, userM
     : parsed;
 }
 
+export function normalizeLLMProvider(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return LLM_PROVIDER_ALIASES[normalized] || normalized || 'gemini';
+}
+
+// JavaScript 的 String#slice 按 UTF-16 code unit 截断，恰好切在 emoji 等非 BMP
+// 字符中间时会留下孤立 surrogate。部分 OpenAI-compatible 上游会拒绝这样的
+// JSON 字符串（DeepSeek 返回 unexpected end of hex escape）。所有模型请求在
+// 序列化前再做一次边界清洗；提示词的定长截取则按完整 code point 进行。
+export function sanitizePromptText(value) {
+  const input = String(value ?? '');
+  let output = '';
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = input.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        output += input[index] + input[index + 1];
+        index += 1;
+      } else {
+        output += '\uFFFD';
+      }
+      continue;
+    }
+    if (code >= 0xDC00 && code <= 0xDFFF) {
+      output += '\uFFFD';
+      continue;
+    }
+    output += input[index];
+  }
+  return output;
+}
+
+export function truncatePromptText(value, maxCodePoints) {
+  const clean = sanitizePromptText(value);
+  const limit = Math.max(0, Number(maxCodePoints) || 0);
+  if (!limit) return '';
+  return Array.from(clean).slice(0, limit).join('');
+}
+
+export function buildOpenAICompatibleRequestBody({
+  provider,
+  model,
+  systemPrompt,
+  userMessage,
+  temperature = 0.1,
+  maxTokens,
+  thinking,
+}) {
+  const normalizedProvider = normalizeLLMProvider(provider);
+  const body = {
+    model,
+    messages: [
+      {role: 'system', content: sanitizePromptText(systemPrompt)},
+      {role: 'user', content: sanitizePromptText(userMessage)},
+    ],
+    temperature,
+    response_format: {type: 'json_object'},
+  };
+  if (Number.isFinite(Number(maxTokens))) {
+    body.max_tokens = Number(maxTokens);
+  }
+  if (thinking === false) {
+    if (normalizedProvider === 'deepseek') {
+      body.thinking = {type: 'disabled'};
+    } else if (normalizedProvider === 'qianwen') {
+      body.enable_thinking = false;
+    }
+  }
+  return body;
+}
+
+function providerDefaults(provider) {
+  return LLM_PROVIDER_DEFAULTS[normalizeLLMProvider(provider)]
+    || LLM_PROVIDER_DEFAULTS.gemini;
+}
+
+export function resolvePurposeLLMConfigValues(baseConfig, overrides = {}) {
+  const baseProvider = normalizeLLMProvider(baseConfig?.provider);
+  const provider = normalizeLLMProvider(overrides.provider || baseProvider);
+  const defaults = providerDefaults(provider);
+  const sameProvider = provider === baseProvider;
+  return {
+    provider,
+    apiKey: String(
+      overrides.apiKey || (sameProvider ? baseConfig?.apiKey : '') || '',
+    ).trim(),
+    model: String(overrides.model || (sameProvider ? baseConfig?.model : '') || defaults.model).trim(),
+    endpoint: String(
+      overrides.endpoint || (sameProvider ? baseConfig?.endpoint : '') || defaults.endpoint,
+    ).replace(/\/+$/, ''),
+    failover: sameProvider ? baseConfig?.failover : undefined,
+  };
+}
+
+function settingEnabled(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+export function resolvePrefilterQwenFallbackConfigValues(
+  settings = {},
+  environment = {},
+) {
+  const requested = settingEnabled(settings[PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled]);
+  const model = String(
+    settings[PREFILTER_QWEN_FALLBACK_SETTING_KEYS.model]
+      || DEFAULT_PREFILTER_QWEN_FALLBACK_MODEL,
+  ).trim();
+  const endpoint = String(
+    settings[PREFILTER_QWEN_FALLBACK_SETTING_KEYS.endpoint]
+      || LLM_PROVIDER_DEFAULTS.qianwen.endpoint,
+  ).trim().replace(/\/+$/, '');
+  const apiKey = String(
+    settings[PREFILTER_QWEN_FALLBACK_SETTING_KEYS.apiKey]
+      || environment.DASHSCOPE_API_KEY
+      || '',
+  ).trim();
+  let validationError = '';
+  if (requested && !/^[a-z0-9][a-z0-9._:-]{0,199}$/i.test(model)) {
+    validationError = '千问兜底模型名称不合法';
+  } else if (requested) {
+    try {
+      const url = new URL(endpoint);
+      if (
+        url.protocol !== 'https:'
+        || url.username
+        || url.password
+        || url.hostname !== 'dashscope.aliyuncs.com'
+      ) {
+        validationError = '千问兜底地址必须使用阿里云百炼 HTTPS 地址';
+      }
+    } catch {
+      validationError = '千问兜底地址不合法';
+    }
+  }
+  if (requested && !validationError && !apiKey) {
+    validationError = '千问兜底缺少 DashScope API Key';
+  }
+  return {
+    requested,
+    enabled: requested && !validationError,
+    provider: 'qianwen',
+    model,
+    endpoint,
+    apiKey,
+    validationError,
+  };
+}
+
 async function getBaseLLMConfig(tenantId) {
-  const provider = ((await getSetting('llm_provider', tenantId)) || process.env.LLM_PROVIDER || 'gemini').toLowerCase();
+  const provider = normalizeLLMProvider(
+    (await getSetting('llm_provider', tenantId)) || process.env.LLM_PROVIDER || 'gemini',
+  );
   const apiKey = (await getSetting('llm_api_key', tenantId)) || process.env.LLM_API_KEY || '';
   const model = (await getSetting('llm_model', tenantId)) || process.env.LLM_MODEL || '';
   const endpoint = (await getSetting('llm_api_endpoint', tenantId)) || process.env.LLM_API_ENDPOINT || '';
-  const defaults = {
-    gemini: { model: 'gemini-2.0-flash', endpoint: '' },
-    openai: { model: 'gpt-4o-mini', endpoint: 'https://api.openai.com/v1' },
-    deepseek: { model: 'deepseek-chat', endpoint: 'https://api.deepseek.com/v1' },
-    qianwen: { model: 'qwen-turbo', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
-  };
-  const d = defaults[provider] || defaults.gemini;
+  const d = providerDefaults(provider);
   return { provider, apiKey, model: model || d.model, endpoint: endpoint || d.endpoint };
 }
 
 async function getLLMConfig(tenantId) {
   const baseConfig = await getBaseLLMConfig(tenantId);
   return await resolveAiFailoverConfig(tenantId, baseConfig);
+}
+
+export async function getRelevancePrefilterQwenFallbackConfig(tenantId) {
+  const values = await Promise.all([
+    getSetting(PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled, tenantId),
+    getSetting(PREFILTER_QWEN_FALLBACK_SETTING_KEYS.model, tenantId),
+    getSetting(PREFILTER_QWEN_FALLBACK_SETTING_KEYS.endpoint, tenantId),
+    getSetting(PREFILTER_QWEN_FALLBACK_SETTING_KEYS.apiKey, tenantId),
+  ]);
+  const config = resolvePrefilterQwenFallbackConfigValues({
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.enabled]: values[0],
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.model]: values[1],
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.endpoint]: values[2],
+    [PREFILTER_QWEN_FALLBACK_SETTING_KEYS.apiKey]: values[3],
+  }, process.env);
+  if (config.requested && !config.enabled) {
+    console.warn('[RelevancePrefilter] Qwen fallback is requested but unavailable', {
+      tenantId,
+      reason: config.validationError,
+    });
+  }
+  return config;
+}
+
+async function runRelayModelOperation(
+  tenantId,
+  relayConfig,
+  systemPrompt,
+  userMessage,
+  options = {},
+) {
+  const relayTimeoutMs = Number(options.relayTimeoutMs)
+    || LLM_RELAY_CLASSIFICATION_TIMEOUT_MS;
+  const data = await runWithTenantAiAdmission(
+    tenantId,
+    () => requestLlmRelayAgentCompletion({
+      tenantId,
+      model: relayConfig.model,
+      systemPrompt,
+      userMessage,
+      timeoutMs: relayTimeoutMs,
+      requestOptions: {
+        maxTokens: options.maxTokens,
+        timeoutMs: relayTimeoutMs,
+        kind: options.kind,
+      },
+    }),
+    {
+      priority: options.priority || 'normal',
+      kind: options.kind || 'llm_relay',
+      queueTimeoutMs: options.relayQueueTimeoutMs ?? options.queueTimeoutMs,
+    },
+  );
+  return {
+    data,
+    config: {
+      provider: 'antigravity',
+      model: relayConfig.model,
+    },
+    route: 'relay',
+  };
+}
+
+async function runBaseModelOperation(
+  tenantId,
+  config,
+  systemPrompt,
+  userMessage,
+  options = {},
+) {
+  const outcome = await runModelOperationWithFailover(
+    tenantId,
+    config,
+    currentConfig => {
+      const timeoutMs = resolveDeadlineBoundedTimeoutMs(options);
+      if (timeoutMs <= 0) {
+        const error = new Error('AI 前置筛选总等待预算已用完');
+        error.code = 'PREFILTER_TOTAL_BUDGET_EXHAUSTED';
+        throw error;
+      }
+      return currentConfig.provider === 'gemini'
+        ? callGemini(
+          currentConfig.apiKey,
+          currentConfig.model,
+          systemPrompt,
+          userMessage,
+          {...options, timeoutMs},
+        )
+        : callOpenAICompatible(
+          currentConfig.apiKey,
+          currentConfig.model,
+          currentConfig.endpoint,
+          systemPrompt,
+          userMessage,
+          {
+            ...options,
+            timeoutMs,
+            provider: currentConfig.provider,
+            thinking: options.thinking ?? false,
+          },
+        );
+    },
+    {
+      priority: options.priority || 'normal',
+      kind: options.kind || 'llm_prompt',
+      queueTimeoutMs: options.queueTimeoutMs,
+    },
+  );
+  return {...outcome, route: 'base'};
+}
+
+export function resolveDeadlineBoundedTimeoutMs(options = {}, nowMs = Date.now()) {
+  const requested = Number(options.timeoutMs);
+  const requestedTimeoutMs = Number.isFinite(requested)
+    ? Math.max(1000, Math.min(40000, requested))
+    : 40000;
+  const deadlineAtMs = Number(options.deadlineAtMs);
+  if (!Number.isFinite(deadlineAtMs)) return requestedTimeoutMs;
+  const remainingMs = Math.floor(deadlineAtMs - Number(nowMs));
+  if (remainingMs < 1000) return 0;
+  return Math.min(requestedTimeoutMs, remainingMs);
+}
+
+async function runTenantLlmPolicy(
+  tenantId,
+  systemPrompt,
+  userMessage,
+  options = {},
+) {
+  const requestKind = String(options.kind || 'llm_prompt').trim() || 'llm_prompt';
+  const [baseConfig, relayConfig] = await Promise.all([
+    getLLMConfig(tenantId),
+    getLlmRelayConfig(tenantId),
+  ]);
+  return await runLlmRelayPolicy({
+    mode: relayConfig.mode,
+    // Keep the local desktop bridge on bounded classification work. Reports,
+    // summaries and keyword strategy stay on their configured cloud route.
+    relayAvailable: relayConfig.enabled && isLlmRelayEligibleKind(requestKind),
+    baseAvailable: Boolean(baseConfig.apiKey),
+    callRelay: () => runRelayModelOperation(
+      tenantId,
+      relayConfig,
+      systemPrompt,
+      userMessage,
+      options,
+    ),
+    callBase: () => runBaseModelOperation(
+      tenantId,
+      baseConfig,
+      systemPrompt,
+      userMessage,
+      options,
+    ),
+    onRelayError: error => console.warn('[AI] local relay unavailable; using configured cloud model', {
+      tenantId,
+      code: error?.code || 'LLM_RELAY_ERROR',
+    }),
+    onBaseError: error => console.warn('[AI] configured cloud model failed; trying local relay', {
+      tenantId,
+      code: error?.code || 'LLM_BASE_ERROR',
+    }),
+  });
+}
+
+export async function getRelevancePrefilterLLMConfig(
+  tenantId,
+  {disableModelFailover = false, allowMissingApiKey = false} = {},
+) {
+  const baseConfig = disableModelFailover
+    ? await getBaseLLMConfig(tenantId)
+    : await getLLMConfig(tenantId);
+  const values = await Promise.all([
+    getSetting(PREFILTER_LLM_SETTING_KEYS.provider, tenantId),
+    getSetting(PREFILTER_LLM_SETTING_KEYS.model, tenantId),
+    getSetting(PREFILTER_LLM_SETTING_KEYS.apiKey, tenantId),
+    getSetting(PREFILTER_LLM_SETTING_KEYS.endpoint, tenantId),
+  ]);
+  const config = resolvePurposeLLMConfigValues(baseConfig, {
+    provider: values[0],
+    model: values[1],
+    apiKey: values[2],
+    endpoint: values[3],
+  });
+  if (!config.apiKey && !allowMissingApiKey) {
+    const error = new Error(`采集前预判尚未配置 ${config.provider} API Key`);
+    error.code = 'PREFILTER_LLM_API_KEY_MISSING';
+    error.provider = config.provider;
+    error.model = config.model;
+    throw error;
+  }
+  return config;
+}
+
+export function resolveRelevancePrefilterCacheRoutes(
+  cloudConfig = {},
+  relayConfig = {},
+  qwenFallbackConfig = {},
+) {
+  const cloudRoute = cloudConfig.provider && cloudConfig.model
+    ? {provider: String(cloudConfig.provider), model: String(cloudConfig.model)}
+    : null;
+  const qwenFallbackRoute = qwenFallbackConfig.enabled
+    && qwenFallbackConfig.provider
+    && qwenFallbackConfig.model
+    ? {
+      provider: String(qwenFallbackConfig.provider),
+      model: String(qwenFallbackConfig.model),
+    }
+    : null;
+  const relayRoute = relayConfig.enabled
+    && isLlmRelayEligibleKind('relevance_prefilter')
+    && relayConfig.model
+    ? {provider: 'antigravity', model: String(relayConfig.model)}
+    : null;
+  const ordered = relayConfig.mode === 'primary'
+    ? [relayRoute, cloudRoute, qwenFallbackRoute]
+    : [cloudRoute, qwenFallbackRoute, relayRoute];
+  const seen = new Set();
+  return ordered.filter(route => {
+    if (!route) return false;
+    const key = `${route.provider}\n${route.model}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export async function getRelevancePrefilterRouteConfigs(tenantId) {
+  const [qwenFallbackConfig, relayConfig] = await Promise.all([
+    getRelevancePrefilterQwenFallbackConfig(tenantId),
+    getLlmRelayConfig(tenantId),
+  ]);
+  // Once Qwen is explicitly requested, do not let the generic same-provider
+  // DeepSeek Pro failover jump ahead of it, even if Qwen is misconfigured.
+  const primaryConfig = await getRelevancePrefilterLLMConfig(tenantId, {
+    disableModelFailover: qwenFallbackConfig.requested,
+    allowMissingApiKey: qwenFallbackConfig.enabled,
+  });
+  return {
+    primaryConfig,
+    qwenFallbackConfig,
+    relayConfig,
+    cacheRoutes: resolveRelevancePrefilterCacheRoutes(
+      primaryConfig,
+      relayConfig,
+      qwenFallbackConfig,
+    ),
+  };
+}
+
+export async function getRelevancePrefilterCacheRoutes(tenantId, routeConfigs = null) {
+  const resolved = routeConfigs?.primaryConfig
+    ? routeConfigs
+    : await getRelevancePrefilterRouteConfigs(tenantId);
+  return resolved.cacheRoutes;
+}
+
+export async function runPrefilterCloudFallbackPolicy({
+  primaryAvailable,
+  fallbackAvailable,
+  callPrimary,
+  callFallback,
+  onPrimaryError = () => {},
+  onFallbackError = () => {},
+}) {
+  let primaryError = null;
+  if (primaryAvailable && typeof callPrimary === 'function') {
+    try {
+      return await callPrimary();
+    } catch (error) {
+      primaryError = error;
+      onPrimaryError(error);
+    }
+  }
+  if (fallbackAvailable && typeof callFallback === 'function') {
+    try {
+      return await callFallback();
+    } catch (error) {
+      onFallbackError(error);
+      throw error;
+    }
+  }
+  if (primaryError) throw primaryError;
+  return null;
 }
 
 async function safeRecordAiFailure(tenantId, details) {
@@ -387,8 +888,8 @@ async function runModelOperationWithFailover(
 }
 
 /**
- * 前置相关性筛选只允许使用服务端保存的 DeepSeek 配置。
- * 扩展只提交待判断的最小文字字段，永远不会取得或传入模型 Key。
+ * Legacy DeepSeek-only entry point retained for callers outside the relevance
+ * prefilter. The prefilter itself uses its purpose-scoped provider route.
  */
 export async function getDeepSeekConfig(tenantId) {
   const config = await getLLMConfig(tenantId);
@@ -423,9 +924,12 @@ export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage
       systemPrompt,
       userMessage,
       {
+        provider: currentConfig.provider,
         timeoutMs: options.timeoutMs,
         maxTokens: options.maxTokens,
         returnMetadata: options.returnMetadata === true,
+        thinking: options.thinking ?? false,
+        maxAttempts: options.maxAttempts,
       },
     ),
     {
@@ -445,65 +949,183 @@ export async function callDeepSeekWithPrompt(tenantId, systemPrompt, userMessage
       promptTokens: data.promptTokens,
       completionTokens: data.completionTokens,
       totalTokens: data.totalTokens,
+      reasoningTokens: data.reasoningTokens,
     };
   }
   return data;
 }
 
-async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
-  const config = await getLLMConfig(tenantId);
-  if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
-  const brand = await getBrandContext(tenantId);
-  const intent = resolveMonitoringIntent(keyword, { brand });
-  const systemPrompt = buildSystemPrompt(brand, intent);
-  const outcome = await runModelOperationWithFailover(
-    tenantId,
-    config,
-    currentConfig => currentConfig.provider === 'gemini'
-      ? callGemini(currentConfig.apiKey, currentConfig.model, systemPrompt, userMessage)
-      : callOpenAICompatible(
-        currentConfig.apiKey,
-        currentConfig.model,
-        currentConfig.endpoint,
+export async function callRelevancePrefilterWithPrompt(
+  tenantId,
+  systemPrompt,
+  userMessage,
+  options = {},
+) {
+  const deadlineAtMs = Date.now() + LLM_RELAY_PREFILTER_TOTAL_BUDGET_MS;
+  const {
+    routeConfigs: suppliedRouteConfigs,
+    ...callerOptions
+  } = options;
+  const requestKind = String(callerOptions.kind || 'relevance_prefilter').trim()
+    || 'relevance_prefilter';
+  const routeConfigs = suppliedRouteConfigs?.primaryConfig
+    ? suppliedRouteConfigs
+    : await getRelevancePrefilterRouteConfigs(tenantId);
+  const {primaryConfig, qwenFallbackConfig, relayConfig} = routeConfigs;
+  const prefilterOptions = {
+    ...callerOptions,
+    priority: callerOptions.priority || 'capture',
+    kind: requestKind,
+    thinking: false,
+    maxAttempts: 1,
+    deadlineAtMs,
+    relayTimeoutMs: Number(callerOptions.relayTimeoutMs) || LLM_RELAY_PREFILTER_TIMEOUT_MS,
+    relayQueueTimeoutMs: Number(callerOptions.relayQueueTimeoutMs)
+      || LLM_RELAY_PREFILTER_QUEUE_TIMEOUT_MS,
+  };
+  const callCloud = () => runPrefilterCloudFallbackPolicy({
+    primaryAvailable: Boolean(primaryConfig.apiKey),
+    fallbackAvailable: qwenFallbackConfig.enabled,
+    callPrimary: async () => ({
+      ...await runBaseModelOperation(
+        tenantId,
+        primaryConfig,
         systemPrompt,
         userMessage,
+        {
+          ...prefilterOptions,
+          timeoutMs: Math.min(
+            Number(prefilterOptions.timeoutMs) || LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS,
+            LLM_RELAY_PREFILTER_PRIMARY_CLOUD_TIMEOUT_MS,
+          ),
+        },
       ),
+      route: 'primary_cloud',
+    }),
+    callFallback: async () => ({
+      ...await runBaseModelOperation(
+        tenantId,
+        qwenFallbackConfig,
+        systemPrompt,
+        userMessage,
+        prefilterOptions,
+      ),
+      route: 'qwen_fallback',
+    }),
+    onPrimaryError: error => console.warn('[RelevancePrefilter] primary cloud model failed; trying Qwen', {
+      tenantId,
+      provider: primaryConfig.provider,
+      model: primaryConfig.model,
+      code: error?.code || 'PREFILTER_PRIMARY_CLOUD_ERROR',
+    }),
+    onFallbackError: error => console.warn('[RelevancePrefilter] Qwen fallback failed; failing open', {
+      tenantId,
+      model: qwenFallbackConfig.model,
+      code: error?.code || 'PREFILTER_QWEN_FALLBACK_ERROR',
+    }),
+  });
+  const outcome = await runLlmRelayPolicy({
+    mode: relayConfig.mode,
+    relayAvailable: relayConfig.enabled && isLlmRelayEligibleKind(requestKind),
+    baseAvailable: Boolean(primaryConfig.apiKey) || qwenFallbackConfig.enabled,
+    callRelay: () => runRelayModelOperation(
+      tenantId,
+      relayConfig,
+      systemPrompt,
+      userMessage,
+      prefilterOptions,
+    ),
+    callBase: callCloud,
+    onRelayError: error => console.warn('[RelevancePrefilter] local relay unavailable; using cloud model', {
+      tenantId,
+      code: error?.code || 'LLM_RELAY_ERROR',
+    }),
+    onBaseError: error => console.warn('[RelevancePrefilter] cloud model failed; trying local relay', {
+      tenantId,
+      code: error?.code || 'LLM_BASE_ERROR',
+    }),
+  });
+  if (!outcome) return null;
+  const data = outcome.data;
+  if (
+    callerOptions.returnMetadata
+    && outcome.route !== 'relay'
+    && outcome.config.provider !== 'gemini'
+  ) {
+    return {
+      data: data.data,
+      provider: outcome.config.provider,
+      model: outcome.config.model,
+      route: outcome.route,
+      finishReason: data.finishReason,
+      responseLength: data.responseLength,
+      promptTokens: data.promptTokens,
+      completionTokens: data.completionTokens,
+      totalTokens: data.totalTokens,
+      reasoningTokens: data.reasoningTokens,
+    };
+  }
+  return callerOptions.returnMetadata
+    ? {
+      data,
+      provider: outcome.config.provider,
+      model: outcome.config.model,
+      route: outcome.route,
+      finishReason: '',
+      responseLength: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      reasoningTokens: 0,
+    }
+    : data;
+}
+
+async function callLLM(userMessage, tenantId, keyword = '', options = {}) {
+  const brand = await getBrandContext(tenantId);
+  const intent = resolveMonitoringIntent(keyword, { brand });
+  const tenantScope = resolveTenantMonitoringScope(brand);
+  const systemPrompt = buildSystemPrompt(brand, intent, tenantScope);
+  const outcome = await runTenantLlmPolicy(
+    tenantId,
+    systemPrompt,
+    userMessage,
     {
       priority: options.priority || 'normal',
       kind: options.kind || 'record_classification',
       queueTimeoutMs: options.queueTimeoutMs,
+      thinking: false,
     },
   );
+  if (!outcome) {
+    console.warn('[AI] No cloud API key or enabled local relay configured, skipping');
+    return null;
+  }
   return {
     result: outcome.data,
     intent,
+    tenantScope,
     provider: outcome.config.provider,
     model: outcome.config.model,
   };
 }
 
 export async function callLLMWithPrompt(tenantId, systemPrompt, userMessage, options = {}) {
-  const config = await getLLMConfig(tenantId);
-  if (!config.apiKey) { console.warn('[AI] No API key configured, skipping'); return null; }
-  const outcome = await runModelOperationWithFailover(
+  const outcome = await runTenantLlmPolicy(
     tenantId,
-    config,
-    currentConfig => currentConfig.provider === 'gemini'
-      ? callGemini(currentConfig.apiKey, currentConfig.model, systemPrompt, userMessage)
-      : callOpenAICompatible(
-        currentConfig.apiKey,
-        currentConfig.model,
-        currentConfig.endpoint,
-        systemPrompt,
-        userMessage,
-        options,
-      ),
+    systemPrompt,
+    userMessage,
     {
+      ...options,
       priority: options.priority || 'normal',
       kind: options.kind || 'llm_prompt',
       queueTimeoutMs: options.queueTimeoutMs,
     },
   );
+  if (!outcome) {
+    console.warn('[AI] No cloud API key or enabled local relay configured, skipping');
+    return null;
+  }
   return outcome.data;
 }
 
@@ -520,7 +1142,13 @@ export async function probeDeepSeekPrimaryModel({tenantId, model}) {
       String(config.endpoint || 'https://api.deepseek.com/v1').replace(/\/+$/, ''),
       'You are a health probe. Return only a JSON object.',
       'Return exactly {"ok":true}.',
-      {timeoutMs: 10000, maxTokens: 256},
+      {
+        provider: 'deepseek',
+        timeoutMs: 10000,
+        maxTokens: 256,
+        thinking: false,
+        maxAttempts: 1,
+      },
     ),
     {
       priority: 'background',
@@ -537,21 +1165,47 @@ function normalizeRelevance(value) {
   return 'relevant';
 }
 
-function normalizeResult(result) {
+function normalizeCurrentKeywordMatch(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['relevant', 'irrelevant', 'uncertain'].includes(normalized)) return normalized;
+  return 'uncertain';
+}
+
+function normalizeRecordSentiment(value, fallback = 'neutral') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['positive', 'neutral', 'negative'].includes(normalized)) return normalized;
+  return fallback;
+}
+
+export function normalizeRecordClassificationResult(result) {
   const relevance = normalizeRelevance(result?.relevance);
+  const currentKeywordMatch = normalizeCurrentKeywordMatch(
+    result?.currentKeywordMatch ?? result?.current_keyword_match,
+  );
   const normalized = {
     ...result,
     relevance,
+    currentKeywordMatch,
+    matchedTopics: Array.isArray(result?.matchedTopics ?? result?.matched_topics)
+      ? (result.matchedTopics ?? result.matched_topics)
+        .map(value => String(value || '').trim().slice(0, 100))
+        .filter(Boolean)
+        .slice(0, 30)
+      : [],
     relevanceConfidence: Number(result?.relevanceConfidence ?? result?.relevance_confidence ?? result?.confidence ?? 0),
     relevanceReason: String(result?.relevanceReason || result?.relevance_reason || ''),
     noiseType: String(result?.noiseType || result?.noise_type || (relevance === 'irrelevant' ? 'other' : 'none')),
   };
   if (relevance === 'irrelevant') {
-    normalized.sentiment = 'neutral';
+    normalized.sentiment = '';
+    normalized.sentimentStatus = 'not_applicable';
     normalized.intent = 'other';
     normalized.category = 'other';
     normalized.subcategory = normalized.noiseType || '无关内容';
     normalized.summary = normalized.summary || normalized.relevanceReason || '与当前品牌无关';
+  } else {
+    normalized.sentiment = normalizeRecordSentiment(result?.sentiment);
+    normalized.sentimentStatus = 'classified';
   }
   return normalized;
 }
@@ -566,6 +1220,30 @@ function hasRelevanceResult(record) {
   } catch {
     return false;
   }
+}
+
+function parseJsonObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function applyManualRelevanceOverride(result, manualOverrides) {
+  const override = parseJsonObject(manualOverrides).relevance;
+  const rawValue = override && typeof override === 'object' ? override.value : override;
+  const value = String(rawValue || '').trim().toLowerCase();
+  if (!['relevant', 'irrelevant', 'uncertain'].includes(value)) return result;
+  return {
+    ...result,
+    relevance: value,
+    relevanceReason: String(override?.reason || result.relevanceReason || ''),
+    manualRelevanceOverride: true,
+  };
 }
 
 /**
@@ -597,9 +1275,24 @@ function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment
 export async function labelRecord(recordId, options = {}) {
   const record = await queryOne('SELECT * FROM records WHERE id = $1', [recordId]);
   if (['official_content', 'blogger_profile'].includes(record?.record_type)) return null;
+  if (record?.business_visibility && record.business_visibility !== 'eligible') return null;
   if (!record || (!options.force && record.ai_labeled_at && hasRelevanceResult(record))) return null;
 
-  const userMessage = buildUserMessage(record);
+  const observationRows = await queryAll(`
+    SELECT DISTINCT keyword
+    FROM record_observations
+    WHERE record_id = $1 AND tenant_id = $2 AND BTRIM(keyword) <> ''
+    ORDER BY keyword
+  `, [recordId, record.tenant_id]);
+  const observedKeywords = [
+    record.keyword,
+    ...observationRows.map(row => row.keyword),
+  ].map(value => String(value || '').trim()).filter(Boolean);
+  const uniqueObservedKeywords = [...new Set(observedKeywords)];
+  const userMessage = buildUserMessage({
+    ...record,
+    observed_keywords: uniqueObservedKeywords,
+  });
   try {
     const labeled = await callLLM(
       userMessage,
@@ -608,8 +1301,10 @@ export async function labelRecord(recordId, options = {}) {
       {priority: 'normal', kind: 'record_classification'},
     );
     if (!labeled?.result) return null;
+    const manuallyProtectedResult = applyManualRelevanceOverride(labeled.result, record.manual_overrides);
+    const effectiveResult = normalizeRecordClassificationResult(manuallyProtectedResult);
     const result = {
-      ...normalizeResult(labeled.result),
+      ...effectiveResult,
       classifierMetadata: {
         promptVersion: RECORD_CLASSIFICATION_PROMPT_VERSION,
         provider: labeled.provider,
@@ -617,6 +1312,11 @@ export async function labelRecord(recordId, options = {}) {
         monitoringIntentId: labeled.intent.intentId,
         monitoringIntentVersion: labeled.intent.intentVersion,
         monitoringObjective: labeled.intent.objective,
+        monitoringScopeId: labeled.tenantScope.scopeId,
+        monitoringScopeVersion: labeled.tenantScope.scopeVersion,
+        sentimentScope: 'main_post_only',
+        commentRiskScope: 'separate_classifier',
+        observedKeywords: uniqueObservedKeywords.slice(0, 30),
       },
     };
     const publishedTs = String(record.publish_time || '').trim() ? parsePublishTimestamp(record.publish_time, record.created_at) : null;
@@ -668,6 +1368,7 @@ export async function labelPendingRecords(limit = 50) {
   const records = await queryAll(
     `SELECT id FROM records
      WHERE record_type NOT IN ('official_content', 'blogger_profile')
+       AND business_visibility = 'eligible'
        AND (ai_labeled_at IS NULL OR ai_result->>'relevance' IS NULL)
      ORDER BY created_at DESC
      LIMIT $1`,
@@ -713,7 +1414,7 @@ export function buildCommentSystemPrompt(brand) {
 function buildCommentUserMessage({ record = {}, comment = {} }) {
   const lines = [];
   if (record.title) lines.push(`原帖标题：${record.title}`);
-  if (record.content) lines.push(`原帖正文：${String(record.content).slice(0, 1200)}`);
+  if (record.content) lines.push(`原帖正文：${truncatePromptText(record.content, 1200)}`);
   if (record.category) lines.push(`原帖主题：${record.category}`);
   if (record.sentiment) lines.push(`原帖情绪：${record.sentiment}`);
   if (record.platform) lines.push(`平台：${record.platform}`);
@@ -790,16 +1491,16 @@ export function buildCommentBatchSystemPrompt(brand) {
 function buildCommentBatchUserMessage({ record = {}, comments = [] }) {
   const head = [];
   if (record.title) head.push(`原帖标题：${record.title}`);
-  if (record.content) head.push(`原帖正文：${String(record.content).slice(0, 800)}`);
+  if (record.content) head.push(`原帖正文：${truncatePromptText(record.content, 800)}`);
   if (record.category) head.push(`原帖主题：${record.category}`);
   if (record.sentiment) head.push(`原帖情绪：${record.sentiment}`);
   if (record.platform) head.push(`平台：${record.platform}`);
   const arr = comments.map((c, i) => ({
     i,
-    author: String(c.author_name || '').slice(0, 40),
-    content: String(c.content || '').slice(0, 300),
+    author: truncatePromptText(c.author_name, 40),
+    content: truncatePromptText(c.content, 300),
     likes: Number(c.like_count || 0),
-    ip: String(c.ip_location || '').slice(0, 20),
+    ip: truncatePromptText(c.ip_location, 20),
   }));
   return `${head.join('\n')}\n\n评论数组(逐条判断,按 i 一一对应返回):\n${JSON.stringify(arr)}`;
 }

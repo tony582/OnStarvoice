@@ -1,5 +1,21 @@
 import crypto from 'crypto';
 import { withTransaction } from '../db/query.js';
+import {
+  normalizeCaptureHealthDetailReadyReason,
+  normalizeCaptureHealthEndpointClass,
+  normalizeCaptureHealthNetworkStatus,
+  normalizeCaptureHealthPageType,
+  normalizeCaptureHealthPlatform,
+  normalizeCaptureHealthStage,
+  normalizeCaptureHealthTabStatus,
+} from './capture-health-schema.js';
+import {
+  normalizeCaptureLocalClosureEvidence,
+  normalizeCaptureLocalClosureEvidenceList,
+} from './capture-local-closure-proof.js';
+import {
+  normalizeCaptureResourcePolicy,
+} from './capture-resource-policy.js';
 
 const CLOUD_TASK_STATUSES = new Set([
   'pending',
@@ -80,6 +96,55 @@ function boolean(value, fallback = false) {
   if (value === 'true') return true;
   if (value === 'false') return false;
   return fallback;
+}
+
+const SEARCH_FILTER_VALUES = Object.freeze({
+  sort: new Set(['comprehensive', 'latest', 'likes', 'comments', 'collects']),
+  publishTime: new Set(['all', 'day', 'week', 'month', 'halfyear']),
+  contentType: new Set(['all', 'image', 'video']),
+  searchScope: new Set(['all', 'followed', 'viewed', 'unviewed']),
+  distance: new Set(['all', 'city', 'nearby']),
+  videoDuration: new Set(['all', 'under_1m', '1_5m', 'over_5m']),
+});
+
+const SEARCH_FILTER_DEFAULTS = Object.freeze({
+  sort: 'comprehensive',
+  publishTime: 'all',
+  contentType: 'all',
+  searchScope: 'all',
+  distance: 'all',
+  videoDuration: 'all',
+});
+
+function normalizeSingleSearchFilter(name, value) {
+  const candidates = Array.isArray(value) ? value : [value];
+  for (const candidate of candidates) {
+    const normalized = text(candidate, 80).toLowerCase();
+    if (SEARCH_FILTER_VALUES[name]?.has(normalized)) return normalized;
+  }
+  return SEARCH_FILTER_DEFAULTS[name] || '';
+}
+
+function normalizeSequentialSearchPasses(value, fallbackContentType = 'all') {
+  const allowed = new Set(['all', 'image', 'video']);
+  const fallback = allowed.has(fallbackContentType) ? fallbackContentType : 'all';
+  const rawValues = Array.isArray(value) ? value : [];
+  const requested = [];
+  const seen = new Set();
+  for (const rawValue of rawValues) {
+    const normalized = text(rawValue, 20).toLowerCase();
+    if (!allowed.has(normalized) || seen.has(normalized)) continue;
+    seen.add(normalized);
+    requested.push(normalized);
+    if (requested.length >= 3) break;
+  }
+  if (requested.length === 0) return [fallback];
+  if (requested.length === 1) return requested;
+  if (requested.includes('all')) {
+    const supplement = requested.find(item => item === 'image' || item === 'video');
+    return supplement ? ['all', supplement] : ['all'];
+  }
+  return [requested[0]];
 }
 
 function normalizeCalendarDate(value) {
@@ -260,10 +325,10 @@ export function normalizeRemoteTaskInput(input = {}) {
   }
 
   const rawFilters = jsonObject(read('searchFilters'));
-  const filterValue = (key, fallback = '') => {
-    if (has(request, key)) return text(request[key], 80).toLowerCase();
-    return text(rawFilters[key], 80).toLowerCase() || fallback;
-  };
+  const filterValue = (key) => normalizeSingleSearchFilter(
+    key,
+    has(request, key) ? request[key] : rawFilters[key],
+  );
   const searchFilters = {
     sort: filterValue('sort'),
     publishTime: filterValue('publishTime'),
@@ -272,6 +337,16 @@ export function normalizeRemoteTaskInput(input = {}) {
     distance: filterValue('distance'),
     videoDuration: filterValue('videoDuration'),
   };
+  const searchPasses = platform === 'douyin'
+    ? normalizeSequentialSearchPasses(
+        read('searchPasses'),
+        searchFilters.contentType,
+      )
+    : [searchFilters.contentType || 'all'];
+  const sequentialSearchEnabled = searchPasses.length > 1;
+  if (sequentialSearchEnabled) {
+    searchFilters.contentType = searchPasses[0];
+  }
 
   const maxRounds = boundedInteger(read('maxRounds'), 1, 1, 100);
   const roundGapMin = boundedInteger(read('roundGapMin'), 10, 0, 1440);
@@ -356,16 +431,37 @@ export function normalizeRemoteTaskInput(input = {}) {
     ),
   };
   const rawRecoveryPolicy = jsonObject(read('recoveryPolicy'));
+  const disableAutomaticSearchRetry = sequentialSearchEnabled || boolean(
+    rawRecoveryPolicy.disableAutomaticSearchRetry ??
+    rawRecoveryPolicy.disable_automatic_search_retry,
+    false,
+  );
+  const requireVerifiedFilters = sequentialSearchEnabled || boolean(
+    rawRecoveryPolicy.requireVerifiedFilters ??
+    rawRecoveryPolicy.require_verified_filters,
+    false,
+  );
+  const singleRelayV1 = boolean(
+    rawRecoveryPolicy.singleRelayV1 ??
+    rawRecoveryPolicy.single_relay_v1,
+    false,
+  );
   const recoveryPolicy = {
     allowIdleAgentHandoff: boolean(
       rawRecoveryPolicy.allowIdleAgentHandoff ??
       rawRecoveryPolicy.allow_idle_agent_handoff,
       true,
     ),
+    ...(disableAutomaticSearchRetry ? {disableAutomaticSearchRetry: true} : {}),
+    ...(requireVerifiedFilters ? {requireVerifiedFilters: true} : {}),
+    ...(singleRelayV1 ? {singleRelayV1: true} : {}),
     // Platform safety challenges are never allowed to trigger an automatic
     // device switch. This value is intentionally fixed by the server contract.
     platformSafetyMode: 'manual_confirmed',
   };
+  const resourcePolicy = normalizeCaptureResourcePolicy(
+    read('resourcePolicy') || read('resource_policy'),
+  );
 
   const planSnapshot = {
     enabled,
@@ -379,7 +475,9 @@ export function normalizeRemoteTaskInput(input = {}) {
     autoLoop: maxRounds > 1,
     roundGapMin,
     maxRounds,
+    ...(sequentialSearchEnabled ? {searchPasses} : {}),
     recoveryPolicy,
+    ...(Object.keys(resourcePolicy).length > 0 ? {resourcePolicy} : {}),
     holidayDates: '',
     customDates,
     ...(hasCaptureSettings ? {captureSettings} : {}),
@@ -433,13 +531,272 @@ export function normalizeCloudTaskStatus(value, fallback = 'pending') {
   return CLOUD_TASK_STATUSES.has(resolved) ? resolved : fallback;
 }
 
+function boundedHealthNumber(
+  value,
+  {minimum = 0, maximum = Number.MAX_SAFE_INTEGER, decimals = 0} = {},
+) {
+  if (
+    value === null
+    || value === undefined
+    || value === ''
+    || typeof value === 'boolean'
+  ) return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  const bounded = Math.min(maximum, Math.max(minimum, numeric));
+  const factor = 10 ** Math.max(0, Math.min(3, decimals));
+  return Math.round(bounded * factor) / factor;
+}
+
+const SENSITIVE_HEALTH_VALUE_PATTERN =
+  /(?:authorization|cookie|password|passwd|secret|token|api[_-]?key|apikey|auth(?:entication)?[_-]?code|activation[_-]?code|credential|session|bearer)/iu;
+const JWT_LIKE_HEALTH_VALUE_PATTERN =
+  /(?:^|[^A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:$|[^A-Za-z0-9_-])/u;
+const UUID_LIKE_HEALTH_VALUE_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const LONG_OPAQUE_HEALTH_SEGMENT_PATTERN =
+  /(?:^|[._:-])[A-Za-z0-9]{32,}(?:$|[._:-])/u;
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/u;
+
+function looksSensitiveHealthValue(value) {
+  const raw = text(value, 320);
+  if (!raw) return false;
+  if (
+    SENSITIVE_HEALTH_VALUE_PATTERN.test(raw)
+    || JWT_LIKE_HEALTH_VALUE_PATTERN.test(raw)
+    || UUID_LIKE_HEALTH_VALUE_PATTERN.test(raw)
+    || LONG_OPAQUE_HEALTH_SEGMENT_PATTERN.test(raw)
+    || AWS_ACCESS_KEY_ID_PATTERN.test(raw)
+  ) return true;
+  const compact = raw.replace(/[._:-]/gu, '');
+  return (
+    compact.length >= 32
+    && /^[A-Za-z0-9+/_-]+$/u.test(compact)
+    && /[a-z]/u.test(compact)
+    && /[A-Z]/u.test(compact)
+    && /\d/u.test(compact)
+  );
+}
+
+function healthCode(value, limit = 80, fallback = 'unknown') {
+  const raw = text(value, Math.max(limit * 4, 320));
+  if (
+    !raw
+    || /(?:https?:\/\/|www\.|[/?#&=@])/iu.test(raw)
+    || looksSensitiveHealthValue(raw)
+  ) return fallback;
+  const normalized = raw.slice(0, limit);
+  return /^[A-Za-z0-9_.:-]+$/u.test(normalized)
+    ? normalized.toLowerCase()
+    : fallback;
+}
+
+function healthVersion(value) {
+  const raw = text(value, 80);
+  if (!raw || looksSensitiveHealthValue(raw)) return '';
+  return /^\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]{1,32})?$/u.test(raw)
+    ? raw
+    : '';
+}
+
+function nullableHealthBoolean(value) {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function normalizeTaskProgressObservation(value = {}) {
+  const source = jsonObject(value);
+  return {
+    observed: source.observed === true,
+    sequence: boundedHealthNumber(source.sequence, {
+      minimum: 0,
+      maximum: 1000000,
+    }) ?? 0,
+    current: boundedHealthNumber(source.current, {
+      minimum: 0,
+      maximum: 1000000,
+    }) ?? 0,
+    total: boundedHealthNumber(source.total, {
+      minimum: 0,
+      maximum: 1000000,
+    }) ?? 0,
+    observedAt: isoTimestamp(source.observedAt) || '',
+    ageMs: boundedHealthNumber(source.ageMs, {
+      minimum: 0,
+      maximum: 7 * 24 * 60 * 60 * 1000,
+    }),
+  };
+}
+
+function normalizeTaskHealthEvidence(value = {}) {
+  const source = jsonObject(value);
+  const page = jsonObject(source.page);
+  const network = jsonObject(source.network);
+  const runtime = jsonObject(source.runtime);
+  return {
+    version: boundedHealthNumber(source.version, {
+      minimum: 1,
+      maximum: 10,
+    }) ?? 1,
+    sampledAt: isoTimestamp(source.sampledAt) || '',
+    page: {
+      platform: normalizeCaptureHealthPlatform(page.platform),
+      pageType: normalizeCaptureHealthPageType(page.pageType),
+      platformMatchesTask: nullableHealthBoolean(page.platformMatchesTask),
+      detailReady: nullableHealthBoolean(page.detailReady),
+      detailReadyReason: normalizeCaptureHealthDetailReadyReason(
+        page.detailReadyReason,
+      ),
+      tabStatus: normalizeCaptureHealthTabStatus(page.tabStatus),
+      discarded: nullableHealthBoolean(page.discarded),
+      frozen: nullableHealthBoolean(page.frozen),
+    },
+    network: {
+      available: network.available === true,
+      status: normalizeCaptureHealthNetworkStatus(network.status),
+      lastRequestLatencyMs: boundedHealthNumber(
+        network.lastRequestLatencyMs,
+        {minimum: 0, maximum: 2 * 60 * 1000, decimals: 1},
+      ),
+      lastRequestAt: isoTimestamp(network.lastRequestAt) || '',
+      endpointClass: normalizeCaptureHealthEndpointClass(
+        network.endpointClass,
+      ),
+      timeoutCount: boundedHealthNumber(network.timeoutCount, {
+        minimum: 0,
+        maximum: 1000000,
+      }) ?? 0,
+    },
+    runtime: {
+      sampledAt: isoTimestamp(runtime.sampledAt) || '',
+      stateAgeMs: boundedHealthNumber(runtime.stateAgeMs, {
+        minimum: 0,
+        maximum: 7 * 24 * 60 * 60 * 1000,
+      }),
+      captureProgressAgeMs: boundedHealthNumber(runtime.captureProgressAgeMs, {
+        minimum: 0,
+        maximum: 7 * 24 * 60 * 60 * 1000,
+      }),
+      cpuAvailable: runtime.cpuAvailable === true,
+      eventLoopAvailable: runtime.eventLoopAvailable === true,
+      eventLoopSampleCount: boundedHealthNumber(runtime.eventLoopSampleCount, {
+        minimum: 0,
+        maximum: 10,
+      }) ?? 0,
+      eventLoopLagMs: boundedHealthNumber(runtime.eventLoopLagMs, {
+        minimum: 0,
+        maximum: 2 * 60 * 1000,
+        decimals: 1,
+      }),
+      heapAvailable: runtime.heapAvailable === true,
+      heapUsedMb: boundedHealthNumber(runtime.heapUsedMb, {
+        minimum: 0,
+        maximum: 1024 * 1024,
+        decimals: 1,
+      }),
+      heapTotalMb: boundedHealthNumber(runtime.heapTotalMb, {
+        minimum: 0,
+        maximum: 1024 * 1024,
+        decimals: 1,
+      }),
+      heapLimitMb: boundedHealthNumber(runtime.heapLimitMb, {
+        minimum: 0,
+        maximum: 1024 * 1024,
+        decimals: 1,
+      }),
+      serviceWorkerAgeMs: boundedHealthNumber(runtime.serviceWorkerAgeMs, {
+        minimum: 0,
+        maximum: 7 * 24 * 60 * 60 * 1000,
+      }),
+      serviceWorkerRestartCount: boundedHealthNumber(
+        runtime.serviceWorkerRestartCount,
+        {minimum: 0, maximum: 1000000},
+      ),
+    },
+  };
+}
+
+function normalizeStructuredTaskHealth(task = {}) {
+  const source = jsonObject(task);
+  const rawProgressObserved =
+    source.progressObserved ?? source.progress_observed;
+  const rawHealthEvidence = source.healthEvidence ?? source.health_evidence;
+  const appVersion = healthVersion(
+    source.appVersion ?? source.app_version,
+  );
+  const hasEvidence = Boolean(
+    appVersion ||
+      source.stage ||
+      source.phase ||
+      (rawProgressObserved && typeof rawProgressObserved === 'object') ||
+      (rawHealthEvidence && typeof rawHealthEvidence === 'object'),
+  );
+  if (!hasEvidence) return null;
+  const healthEvidence = normalizeTaskHealthEvidence(rawHealthEvidence);
+  return {
+    version: 1,
+    appVersion,
+    stage: normalizeCaptureHealthStage(
+      source.stage || healthEvidence.stage,
+    ),
+    phase: normalizeCaptureHealthStage(
+      source.phase || healthEvidence.phase,
+    ),
+    progressObserved: normalizeTaskProgressObservation(rawProgressObserved),
+    healthEvidence,
+  };
+}
+
+// Health is authoritative only when it comes from the bounded top-level
+// snapshot and is later fenced to a concrete browser attempt. Do not let
+// legacy or caller-controlled metadata aliases become a second health channel.
+const CLOUD_TASK_HEALTH_METADATA_ALIASES = Object.freeze([
+  'structuredTaskHealth',
+  'structured_task_health',
+  'agentPlanAudit',
+  'agent_plan_audit',
+  'healthEvidence',
+  'health_evidence',
+  'runtimeHealth',
+  'runtime_health',
+  'appVersion',
+  'app_version',
+  'stage',
+  'phase',
+  'progressObserved',
+  'progress_observed',
+]);
+
+function removeCloudTaskHealthMetadataAliases(metadata = {}) {
+  for (const key of CLOUD_TASK_HEALTH_METADATA_ALIASES) {
+    delete metadata[key];
+  }
+  return metadata;
+}
+
 export function normalizeCloudTaskSnapshot(input = {}) {
   const task = jsonObject(input);
   const rawClientTaskId = text(task.id || task.clientTaskId, 240);
   if (!rawClientTaskId) return null;
   const rawPlatform = String(task.platform || 'unknown').trim().toLowerCase();
   const platform = PLATFORM_ALIASES[rawPlatform] || 'unknown';
-  const metadata = sanitizeCloudStructuredObject(task.metadata);
+  const metadata = removeCloudTaskHealthMetadataAliases(
+    sanitizeCloudStructuredObject(task.metadata),
+  );
+  // Local closure has exactly one authoritative top-level channel. Metadata
+  // aliases are removed before strictly normalized single/array reports are
+  // promoted. The legacy object remains supported for rolling upgrades.
+  delete metadata.localClosure;
+  delete metadata.local_closure;
+  delete metadata.localClosures;
+  delete metadata.local_closures;
+  const localClosure = normalizeCaptureLocalClosureEvidence(
+    task.localClosure ?? task.local_closure,
+  );
+  const localClosures = normalizeCaptureLocalClosureEvidenceList(
+    task.localClosures ?? task.local_closures,
+  );
+  if (localClosure) metadata.localClosure = localClosure;
+  if (localClosures.length > 0) metadata.localClosures = localClosures;
   const promoteMetadataField = (key, value) => {
     if (
       value === undefined ||
@@ -473,6 +830,10 @@ export function normalizeCloudTaskSnapshot(input = {}) {
     'captureSettings',
     task.captureSettings ?? task.capture_settings,
   );
+  const structuredTaskHealth = normalizeStructuredTaskHealth(task);
+  if (structuredTaskHealth) {
+    metadata.structuredTaskHealth = structuredTaskHealth;
+  }
   const workflow = text(
     task.workflow || metadata.workflow || task.taskType || task.type,
     120,
@@ -517,6 +878,12 @@ export function normalizeCloudTaskSnapshot(input = {}) {
     targetResults,
     counts: sanitizeCloudStructuredObject(task.counts),
     metadata,
+    appVersion: structuredTaskHealth?.appVersion || '',
+    stage: structuredTaskHealth?.stage || 'unknown',
+    phase: structuredTaskHealth?.phase || 'unknown',
+    progressObserved: structuredTaskHealth?.progressObserved || {},
+    healthEvidence: structuredTaskHealth?.healthEvidence || {},
+    structuredTaskHealth: structuredTaskHealth || {},
     error: sanitizeCloudStructuredObject(task.error),
     message: text(safeStructuredValue(task.message), 2000),
     attemptId,
@@ -529,6 +896,44 @@ export function normalizeCloudTaskSnapshot(input = {}) {
     createdAt: isoTimestamp(task.createdAt),
     updatedAt: isoTimestamp(task.updatedAt),
   };
+}
+
+// Structured runtime health is useful only when it can be attributed to the
+// concrete browser attempt that observed it. Legacy reports without an
+// attempt id may still advance their compatible task projection, but they must
+// not replace the current attempt's health or make a snapshot appear bound to
+// that attempt.
+export function bindCloudTaskSnapshotHealthToAttempt(snapshot = {}) {
+  const attemptId = text(snapshot?.attemptId, 240);
+  if (attemptId) return snapshot;
+
+  const metadata = {
+    ...jsonObject(snapshot?.metadata),
+  };
+  removeCloudTaskHealthMetadataAliases(metadata);
+
+  return {
+    ...snapshot,
+    attemptId: '',
+    metadata,
+    appVersion: '',
+    stage: 'unknown',
+    phase: 'unknown',
+    progressObserved: {},
+    healthEvidence: {},
+    structuredTaskHealth: {},
+  };
+}
+
+export function cloudTaskAttemptIdentityAcceptsSnapshot(
+  existingAttemptId,
+  incomingAttemptId,
+) {
+  const existing = text(existingAttemptId, 240);
+  const incoming = text(incomingAttemptId, 240);
+  // A legacy empty slot may be upgraded once to a concrete runner identity.
+  // After that binding exists, only that exact runner may mutate the slot.
+  return !existing || (Boolean(incoming) && incoming === existing);
 }
 
 export function isCloudTaskActive(status) {
@@ -544,16 +949,52 @@ export function captureAgentOnline(lastHeartbeatAt, now = Date.now(), staleMs = 
   return Number.isFinite(timestamp) && now - timestamp <= staleMs;
 }
 
+export function captureAgentHeartbeatDegraded(agent = {}) {
+  const capabilities = sanitizeCloudStructuredObject(agent.capabilities);
+  return capabilities.taskStateKnown === false ||
+    capabilities.heartbeatDegraded === true;
+}
+
+export function captureAgentLivenessAt(agent = {}) {
+  return agent.last_liveness_at ||
+    agent.last_full_heartbeat_at ||
+    agent.last_heartbeat_at ||
+    null;
+}
+
+export function captureAgentFullHeartbeatAt(agent = {}) {
+  return agent.last_full_heartbeat_at || agent.last_heartbeat_at || null;
+}
+
+export function captureAgentLivenessOnline(
+  agent,
+  now = Date.now(),
+  staleMs = 2 * 60 * 1000,
+) {
+  return captureAgentOnline(captureAgentLivenessAt(agent), now, staleMs);
+}
+
+export function captureAgentFullHeartbeatOnline(
+  agent,
+  now = Date.now(),
+  staleMs = 2 * 60 * 1000,
+) {
+  const capabilities = sanitizeCloudStructuredObject(agent.capabilities);
+  return capabilities.taskStateKnown !== false &&
+    captureAgentOnline(captureAgentFullHeartbeatAt(agent), now, staleMs);
+}
+
 // These are the states that can still own the browser's single capture lock.
-// Attention/terminal states such as interrupted, needs_action and failed keep
-// their audit history, but the extension has already released its execution
-// lock and another cloud task may safely use the Agent.
+// An interrupted execution remains slot-blocking until normal settlement
+// proves that the Extension has stopped. Attention/terminal states such as
+// needs_action and failed keep audit history after releasing the slot.
 export const CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES = Object.freeze([
   'pending',
   'waiting_device',
   'claimed',
   'running',
   'recovering',
+  'interrupted',
   'resume_requested',
 ]);
 
@@ -615,6 +1056,25 @@ export async function lockCaptureAgentExecutionSlot(
     'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
     ['capture_agent_execution_slot', `${scopedTenantId}:${scopedAgentId}`],
   );
+}
+
+export async function tryLockCaptureAgentExecutionSlot(
+  executor,
+  tenantId,
+  agentId,
+) {
+  const scopedTenantId = text(tenantId, 100);
+  const scopedAgentId = text(agentId, 100);
+  if (!scopedTenantId || !scopedAgentId) {
+    throw new Error('capture_agent_execution_slot_identity_required');
+  }
+  const result = await executor.queryOne(
+    `SELECT pg_try_advisory_xact_lock(
+      hashtext($1), hashtext($2)
+    ) AS locked`,
+    ['capture_agent_execution_slot', `${scopedTenantId}:${scopedAgentId}`],
+  );
+  return result?.locked === true;
 }
 
 export async function issueCaptureAgentCredential({

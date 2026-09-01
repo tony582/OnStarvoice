@@ -71,6 +71,7 @@ const TRIAGE_LABEL = {
 // 月报、舆情剖析和下钻统一使用内容分诊的数据范围。
 export const RELEVANT_RECORD_SQL = `(
   r.record_type NOT IN ('official_content', 'blogger_profile')
+  AND r.business_visibility = 'eligible'
   AND r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant'
 )`;
 
@@ -511,7 +512,9 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
        FROM (
          SELECT author_id, ${OWN_REGION} AS own_region
          FROM records
-         WHERE tenant_id = $1 AND COALESCE(author_id, '') <> ''
+         WHERE tenant_id = $1
+           AND business_visibility = 'eligible'
+           AND COALESCE(author_id, '') <> ''
        ) s
        WHERE own_region IS NOT NULL AND own_region <> ''
        GROUP BY author_id
@@ -1209,7 +1212,13 @@ export function buildInsightSamplePool(stats) {
   for (const r of pool) {
     const id = r.id || r.record_id;
     if (!id) continue;
-    if (!sampleMap[id]) sampleMap[id] = { title: String(r.title || '').slice(0, 80), url: r.url || r.record_url || '' };
+    if (!sampleMap[id]) {
+      sampleMap[id] = {
+        title: String(r.title || '').slice(0, 80),
+        url: r.url || r.record_url || '',
+        platform: r.platform || '',
+      };
+    }
     if (seen.has(id)) continue;
     seen.add(id);
     samples.push({

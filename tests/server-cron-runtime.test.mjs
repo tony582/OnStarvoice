@@ -83,8 +83,14 @@ function safeJobs(overrides = {}) {
     async reconcileElasticCaptureLeases() {
       return {requeued: 0};
     },
+    async reconcilePendingOrchestrationRetries() {
+      return {dispatched: 0, waitingForAgent: 0, failed: 0};
+    },
     async reconcilePendingCaptureCommands() {
       return {commandCount: 0};
+    },
+    async runOpsControlCycle() {
+      return {status: 'healthy', observed: 0, failed: 0, incidentCount: 0};
     },
     ...overrides,
   };
@@ -140,6 +146,8 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   const sequence = [];
   let reconcileCalls = 0;
   let patrolCalls = 0;
+  let fallbackRecoveryLimit = 0;
+  let pendingRetryLimit = 0;
   const runtime = startSchedulerCronJobs({
     cronModule: fakeCron,
     logger: quietLogger(),
@@ -155,12 +163,20 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
         assert.equal(limit, 20);
         return [];
       },
+      async reconcileAutomaticCaptureRetries(limit) {
+        fallbackRecoveryLimit = limit;
+        return {dispatched: 0, waitingForAgent: 0, manualOnly: 0, failed: 0};
+      },
+      async reconcilePendingOrchestrationRetries(limit) {
+        pendingRetryLimit = limit;
+        return {dispatched: 0, waitingForAgent: 0, failed: 0};
+      },
     }),
   });
 
   assert.deepEqual(
     fakeCron.registrations.map(item => item.expression),
-    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *'],
+    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '*/5 * * * *'],
   );
   assert.deepEqual(
     fakeCron.registrations.map(item => item.options.name),
@@ -169,6 +185,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
       'onstarvoice:profile-patrol',
       'onstarvoice:capture-orchestration-recovery',
       'onstarvoice:capture-attention-notifications',
+      'onstarvoice:ops-control-observer',
     ],
   );
   assert.ok(fakeCron.registrations.every(item => item.options.noOverlap === true));
@@ -178,6 +195,10 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   assert.equal(reconcileCalls, 1);
   assert.equal(patrolCalls, 1);
   assert.deepEqual(sequence, ['reconcile', 'profile-patrol']);
+  await fakeCron.registrations[2].task.fire();
+  assert.equal(reconcileCalls, 2);
+  assert.equal(fallbackRecoveryLimit, 10);
+  assert.equal(pendingRetryLimit, 10);
 
   assert.equal(runtime.stop(), true);
   assert.equal(runtime.stop(), false);
@@ -393,7 +414,7 @@ test('compatibility cron composes both groups without duplicate lifecycle calls'
     jobs: safeJobs(),
   });
 
-  assert.equal(fakeCron.registrations.length, 6);
+  assert.equal(fakeCron.registrations.length, 7);
   assert.deepEqual(runtime.runtimes.map(item => item.groupName), ['scheduler', 'ai']);
   assert.deepEqual(messages, ['[Cron] Scheduled jobs started']);
   assert.equal(runtime.stop(), true);

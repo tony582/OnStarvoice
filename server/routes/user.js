@@ -5,8 +5,13 @@ import { Router } from 'express';
 import { queryAll, queryOne } from '../db/init.js';
 import { requireAuth } from '../middleware/auth.js';
 import { serializeRecords } from '../services/record-store.js';
+import { redactXhsRecordNavigation } from '../services/xhs-source-open.js';
 
 const router = Router();
+
+function publicRecords(records = []) {
+  return serializeRecords(records).map(record => redactXhsRecordNavigation(record));
+}
 
 router.post('/login', requireAuth, (req, res) => {
   const row = req.authCodeRow;
@@ -45,7 +50,14 @@ router.get('/stats', requireAuth, async (req, res, next) => {
 
     return res.json({
       ok: true,
-      stats: { totalRecords, recentRecords, sentimentDist, categoryDist, platformDist, topInteraction },
+      stats: {
+        totalRecords,
+        recentRecords,
+        sentimentDist,
+        categoryDist,
+        platformDist,
+        topInteraction: publicRecords(topInteraction),
+      },
     });
   } catch (err) {
     return next(err);
@@ -88,7 +100,7 @@ router.get('/records', requireAuth, async (req, res, next) => {
 
     return res.json({
       ok: true,
-      records: serializeRecords(records),
+      records: publicRecords(records),
       pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
     });
   } catch (err) {

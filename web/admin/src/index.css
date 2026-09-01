@@ -5,6 +5,8 @@
   --color-foreground: var(--fg);
   --color-card: var(--card);
   --color-card-foreground: var(--card-fg);
+  --color-popover: var(--card);
+  --color-popover-foreground: var(--card-fg);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-fg);
   --color-secondary: var(--secondary);

@@ -82,3 +82,17 @@ test('启动回填只筛选历史候选，并重新排队给 AI 语义分类', a
   assert.match(workflowSource, /ai_classified_at = CASE WHEN \$7 THEN NULL ELSE ai_classified_at END/);
   assert.match(workflowSource, /WHERE rc\.ai_classified_at IS NULL/);
 });
+
+test('评论 AI 坏批次会退避并在确定性失败后规则结算，不再无限阻塞新评论', async () => {
+  const workflowSource = await readFile(
+    new URL('../server/services/comment-workflow.js', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(workflowSource, /COMMENT_AI_RETRY_COOLDOWN_SECONDS = 60/);
+  assert.match(workflowSource, /COMMENT_AI_PERMANENT_FAILURE_LIMIT = 3/);
+  assert.match(workflowSource, /commentAiRetryPending/);
+  assert.match(workflowSource, /rc\.updated_at <= now\(\) - INTERVAL/);
+  assert.match(workflowSource, /commentAiRuleFallbackReason: 'permanent_failure_limit'/);
+  assert.match(workflowSource, /ai_classified_at = CASE WHEN \$2 THEN now\(\)/);
+});

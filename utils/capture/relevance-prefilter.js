@@ -9,16 +9,19 @@
 import {prefilterRelevance} from '../api.js';
 
 export const RELEVANCE_PREFILTER_DEFAULT_THRESHOLD = 0.97;
-// DeepSeek handles smaller groups much more predictably. Keep each request
-// small enough to finish inside the extension's bounded wait while still
-// running the requests for one keyword in parallel.
-export const RELEVANCE_PREFILTER_BATCH_SIZE = 5;
-export const RELEVANCE_PREFILTER_TIMEOUT_MS = 90000;
-export const RELEVANCE_PREFILTER_MAX_CONCURRENCY = 2;
+export const RELEVANCE_PREFILTER_LIST_PROMPT_VERSION = 'prefilter-list-v4';
+export const RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION = 'prefilter-detail-v1';
+// Each Agent submits one bounded micro-batch at a time. The server owns the
+// tenant-wide concurrency gate across every Agent, so local parallel calls
+// would only create queue pressure and duplicate retries.
+export const RELEVANCE_PREFILTER_BATCH_SIZE = 8;
+export const RELEVANCE_PREFILTER_TIMEOUT_MS = 30000;
+export const RELEVANCE_PREFILTER_MAX_CONCURRENCY = 1;
 
 const KEYWORD_RECORD_TYPE = 'keyword_notes';
 const INSUFFICIENT_TITLE_PATTERN =
   /^(?:无标题(?:数据)?|搜索结果笔记|抖音搜索结果(?:\s*\d+)?|关键词\s*[:：]|单篇笔记)$/iu;
+const PROTECTED_MONITORING_SIGNAL_PATTERN = /(?:安吉星|onstar|紧急(?:救援|求助)|道路救援|\bsos\b|远程(?:启动|控制|解锁|上锁|空调)?.{0,8}(?:失败|失效|不能|无法|用不了|没反应|故障|异常)|客服.{0,8}(?:投诉|误导|不处理|不解决)|续费.{0,8}(?:投诉|误导|收费|争议|贵|坑|不续)|一生黑)/iu;
 
 function normalizeText(value, limit = 280) {
   return String(value || '')
@@ -162,6 +165,92 @@ export function buildRelevancePrefilterCandidate(
   };
 }
 
+function flattenDetailText(value, limit = 3000) {
+  if (Array.isArray(value)) {
+    return normalizeText(
+      value
+        .map((item) =>
+          typeof item === 'string'
+            ? item
+            : item?.text || item?.content || item?.transcript || '',
+        )
+        .filter(Boolean)
+        .join(' '),
+      limit,
+    );
+  }
+  if (value && typeof value === 'object') {
+    return normalizeText(
+      value.text || value.content || value.transcript || value.result || '',
+      limit,
+    );
+  }
+  return normalizeText(value, limit);
+}
+
+export function buildRelevanceDetailCandidate(
+  record = {},
+  detailPayload = {},
+  {keyword = ''} = {},
+) {
+  const listCandidate = buildRelevancePrefilterCandidate(record, {keyword});
+  if (!listCandidate) return null;
+  const detail = detailPayload && typeof detailPayload === 'object'
+    ? detailPayload
+    : {};
+  const tags = Array.isArray(detail.tags)
+    ? detail.tags.map((tag) => normalizeText(tag, 100)).filter(Boolean).slice(0, 30)
+    : [];
+  const content = normalizeText(
+    detail.content || detail.description || detail.desc || '',
+    5000,
+  );
+  const ocrText = flattenDetailText(
+    detail.ocrText || detail.imageOcrText || detail.imageOcr || detail.ocrResults,
+    3000,
+  );
+  const transcript = flattenDetailText(
+    detail.transcript || detail.audioTranscript || detail.videoTranscript,
+    4000,
+  );
+  return {
+    ...listCandidate,
+    canSkip: Boolean(
+      listCandidate.canSkip || content || tags.length || ocrText || transcript,
+    ),
+    protectedSignal: PROTECTED_MONITORING_SIGNAL_PATTERN.test(
+      [
+        listCandidate.evidence.title,
+        listCandidate.evidence.author,
+        content,
+        ...tags,
+        ocrText,
+        transcript,
+      ].filter(Boolean).join(' '),
+    ),
+    evidence: {
+      ...listCandidate.evidence,
+      title: normalizeText(detail.title || listCandidate.evidence.title, 500),
+      author: normalizeText(
+        detail.author || detail.authorName || detail.bloggerName || listCandidate.evidence.author,
+        200,
+      ),
+      noteType: normalizeText(
+        detail.noteType || listCandidate.evidence.noteType,
+        40,
+      ),
+      publishTime: normalizeText(
+        detail.publishTime || detail.publishDateRaw || listCandidate.evidence.publishTime,
+        100,
+      ),
+      content,
+      tags,
+      ocrText,
+      transcript,
+    },
+  };
+}
+
 function normalizeThreshold(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return RELEVANCE_PREFILTER_DEFAULT_THRESHOLD;
@@ -239,14 +328,18 @@ export function buildRelevancePrefilterIdempotencyKey({
   keyword = '',
   threshold = RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
   batchIndex = 0,
+  stage = 'list',
   items = [],
 } = {}) {
   const normalizedThreshold = normalizeThreshold(threshold);
   const normalizedRequestId = normalizeText(requestId, 200);
   const contentHash = hashText(JSON.stringify(Array.isArray(items) ? items : []));
+  const normalizedStage = normalizeText(stage, 20).toLocaleLowerCase() === 'detail'
+    ? 'detail'
+    : 'list';
   const baseKey = `${normalizeText(platform, 40).toLocaleLowerCase()}:${hashText(
     normalizeKeyword(keyword),
-  )}:list:conservative:${normalizedThreshold.toFixed(4)}:${Math.max(
+  )}:${normalizedStage}:conservative:${normalizedThreshold.toFixed(4)}:${Math.max(
     0,
     Number(batchIndex) || 0,
   )}:${contentHash}`;
@@ -270,11 +363,15 @@ function isTimeoutLikeError(error) {
 
 export function normalizeRelevancePrefilterDecision(
   raw = {},
-  {threshold = RELEVANCE_PREFILTER_DEFAULT_THRESHOLD, canSkip = true} = {},
+  {canSkip = true} = {},
 ) {
   const status = normalizeText(raw?.status, 40).toLocaleLowerCase();
   const modelDecision = normalizeText(
     raw?.modelDecision || raw?.decision,
+    40,
+  ).toLocaleLowerCase();
+  const tenantRelevance = normalizeText(
+    raw?.tenantRelevance || raw?.tenant_relevance,
     40,
   ).toLocaleLowerCase();
   const confidence = Number(raw?.confidence);
@@ -282,10 +379,11 @@ export function normalizeRelevancePrefilterDecision(
     raw?.executionDisposition,
     80,
   ).toLocaleLowerCase();
-  const normalizedThreshold = normalizeThreshold(threshold);
+  const protectedSignal = raw?.protectedSignal === true;
   const valid =
     status === 'ok' &&
     new Set(['keep', 'skip', 'need_detail']).has(modelDecision) &&
+    new Set(['relevant', 'irrelevant', 'uncertain']).has(tenantRelevance) &&
     Number.isFinite(confidence) &&
     confidence >= 0 &&
     confidence <= 1;
@@ -293,15 +391,20 @@ export function normalizeRelevancePrefilterDecision(
     valid &&
       canSkip &&
       modelDecision === 'skip' &&
-      executionDisposition === 'skip_full_capture' &&
-      confidence >= normalizedThreshold,
+      tenantRelevance === 'irrelevant' &&
+      !protectedSignal &&
+      executionDisposition === 'skip_full_capture',
   );
   return {
     valid,
     shouldSkip,
     status: status || 'model_error',
     modelDecision: valid ? modelDecision : null,
+    tenantRelevance: valid ? tenantRelevance : null,
     confidence: valid ? confidence : null,
+    protectedSignal,
+    sampledFullCapture: raw?.sampledFullCapture === true,
+    decisionFinality: normalizeText(raw?.decisionFinality, 40) || null,
     executionDisposition: executionDisposition || null,
     reason: normalizeText(raw?.reason, 320),
     evidence: Array.isArray(raw?.evidence)
@@ -346,6 +449,8 @@ export async function evaluateRelevancePrefilterRecords(
     enabled: Boolean(enabled),
     evaluatedCount: 0,
     skippedCount: 0,
+    minimalDetailCount: 0,
+    deferredCount: 0,
     failedOpenCount: 0,
     retryCount: 0,
     retriedItemCount: 0,
@@ -407,12 +512,13 @@ export async function evaluateRelevancePrefilterRecords(
             keyword: batch[0].keyword,
             threshold: normalizedThreshold,
             batchIndex: batchIndex * 10 + retryPart,
+            stage: 'list',
             items: requestItems,
           }),
           platform: batch[0].platform,
           stage: 'list',
           keyword: batch[0].keyword,
-          promptVersion: 'prefilter-list-v2',
+          promptVersion: RELEVANCE_PREFILTER_LIST_PROMPT_VERSION,
           mode: 'conservative',
           skipThreshold: normalizedThreshold,
           items: requestItems,
@@ -460,13 +566,20 @@ export async function evaluateRelevancePrefilterRecords(
                 : 'model_error',
             modelDecision: null,
             confidence: null,
-            executionDisposition: null,
+            protectedSignal: PROTECTED_MONITORING_SIGNAL_PATTERN.test(
+              Object.values(candidate.evidence || {}).flat().join(' '),
+            ),
             reason: normalizeText(
               response?.message || 'AI 未返回有效判断，安全放行',
               320,
             ),
             evidence: [],
           };
+      if (!raw) {
+        decision.executionDisposition = decision.protectedSignal
+          ? 'collect_full'
+          : 'defer_enhancement';
+      }
       return {...candidate, ...decision};
     });
   };
@@ -475,29 +588,7 @@ export async function evaluateRelevancePrefilterRecords(
     batchJobs,
     async ({batch, batchIndex}) => {
       const initialDecisions = await requestBatchOnce(batch, {batchIndex});
-      const wholeBatchTimedOut =
-        batch.length > 1 &&
-        initialDecisions.length === batch.length &&
-        initialDecisions.every((decision) => decision.status === 'timeout');
-      if (!wholeBatchTimedOut || isStopRequested(shouldStop)) {
-        decisions.push(...initialDecisions);
-        return;
-      }
-
-      const splitAt = Math.ceil(batch.length / 2);
-      const retryBatches = [batch.slice(0, splitAt), batch.slice(splitAt)].filter(
-        (retryBatch) => retryBatch.length > 0,
-      );
-      retriedItemCount += batch.length;
-      for (let retryPart = 0; retryPart < retryBatches.length; retryPart += 1) {
-        retryCount += 1;
-        decisions.push(
-          ...(await requestBatchOnce(retryBatches[retryPart], {
-            batchIndex,
-            retryPart: retryPart + 1,
-          })),
-        );
-      }
+      decisions.push(...initialDecisions);
     },
   );
 
@@ -508,6 +599,12 @@ export async function evaluateRelevancePrefilterRecords(
     ...resultBase,
     evaluatedCount: decisions.filter((decision) => decision.valid).length,
     skippedCount: skippedRecordIds.length,
+    minimalDetailCount: decisions.filter(
+      (decision) => decision.executionDisposition === 'collect_minimal_detail',
+    ).length,
+    deferredCount: decisions.filter(
+      (decision) => decision.executionDisposition === 'defer_enhancement',
+    ).length,
     failedOpenCount: decisions.filter((decision) => !decision.valid).length,
     retryCount,
     retriedItemCount,
@@ -516,5 +613,101 @@ export async function evaluateRelevancePrefilterRecords(
     skippedRecordIds: [...new Set(skippedRecordIds)],
     decisions,
     canceled: isStopRequested(shouldStop),
+  };
+}
+
+export async function evaluateRelevanceDetailRecord(
+  record,
+  detailPayload,
+  {
+    enabled = true,
+    keyword = '',
+    threshold = RELEVANCE_PREFILTER_DEFAULT_THRESHOLD,
+    timeoutMs = RELEVANCE_PREFILTER_TIMEOUT_MS,
+    shouldStop = null,
+    requestBatch = prefilterRelevance,
+  } = {},
+) {
+  const candidate = buildRelevanceDetailCandidate(record, detailPayload, {keyword});
+  if (!enabled || !candidate) {
+    return {
+      valid: false,
+      shouldSkip: false,
+      status: 'invalid_input',
+      executionDisposition: 'collect_full',
+      reason: '最小详情不满足二判条件，继续完整采集',
+      recordId: candidate?.recordId || normalizeText(record?.id, 180),
+    };
+  }
+  if (isStopRequested(shouldStop)) {
+    return {
+      ...candidate,
+      valid: false,
+      shouldSkip: false,
+      status: 'canceled',
+      executionDisposition: 'defer_enhancement',
+      reason: '任务已停止，最小详情增强已延迟',
+    };
+  }
+
+  const normalizedThreshold = normalizeThreshold(threshold);
+  const requestId = createRequestId();
+  let response;
+  try {
+    response = await requestBatch(
+      {
+        requestId,
+        idempotencyKey: buildRelevancePrefilterIdempotencyKey({
+          requestId,
+          platform: candidate.platform,
+          keyword: candidate.keyword,
+          threshold: normalizedThreshold,
+          stage: 'detail',
+          items: [candidate.evidence],
+        }),
+        platform: candidate.platform,
+        stage: 'detail',
+        keyword: candidate.keyword,
+        promptVersion: RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION,
+        mode: 'conservative',
+        skipThreshold: normalizedThreshold,
+        items: [candidate.evidence],
+      },
+      {timeout: timeoutMs, shouldStop},
+    );
+  } catch (error) {
+    response = {
+      ok: false,
+      reason: isTimeoutLikeError(error) ? 'timeout' : 'model_error',
+      message: isTimeoutLikeError(error)
+        ? 'AI 最小详情二判超时，增强已延迟'
+        : 'AI 最小详情二判不可用，增强已延迟',
+    };
+  }
+  const raw = readResponseItems(response).find(
+    (item) => normalizeText(item?.itemId, 180) === candidate.itemId,
+  );
+  if (!raw) {
+    return {
+      ...candidate,
+      valid: false,
+      shouldSkip: false,
+      status: response?.reason === 'timeout' ? 'timeout' : 'model_error',
+      executionDisposition: candidate.protectedSignal
+        ? 'collect_full'
+        : 'defer_enhancement',
+      protectedSignal: candidate.protectedSignal,
+      reason: normalizeText(
+        response?.message || 'AI 未返回最小详情判断，增强已延迟',
+        320,
+      ),
+    };
+  }
+  return {
+    ...candidate,
+    ...normalizeRelevancePrefilterDecision(raw, {
+      threshold: normalizedThreshold,
+      canSkip: candidate.canSkip,
+    }),
   };
 }

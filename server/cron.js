@@ -10,11 +10,15 @@ import { processCaptureAttentionNotifications } from './services/capture-attenti
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
 import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-retention.js';
+import {runOpsControlCycle} from './services/ops-control.js';
 import {
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
   reconcilePendingCaptureCommands,
 } from './routes/capture-cloud.js';
+import {
+  reconcilePendingOrchestrationRetries,
+} from './routes/capture-orchestrations.js';
 import {createDrainController} from './runtime/drain-controller.js';
 
 const DEFAULT_JOBS = Object.freeze({
@@ -30,7 +34,9 @@ const DEFAULT_JOBS = Object.freeze({
   queryAll,
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
+  reconcilePendingOrchestrationRetries,
   reconcilePendingCaptureCommands,
+  runOpsControlCycle,
 });
 
 function safeLog(logger, method, ...args) {
@@ -165,12 +171,27 @@ function schedulerDefinitions(jobs, logger) {
               `[Cron] Elastic work queue: ${elasticLeases.requeued} stale item(s) requeued`,
             );
           }
+          const pendingRetries =
+            await jobs.reconcilePendingOrchestrationRetries(10);
+          if (pendingRetries.dispatched > 0 || pendingRetries.failed > 0) {
+            safeLog(
+              logger,
+              'log',
+              `[Cron] Waiting retry continuation: ${pendingRetries.dispatched} dispatched, ` +
+              `${pendingRetries.waitingForAgent} waiting for Agent, ` +
+              `${pendingRetries.failed} failed`,
+            );
+          }
+          // Transitional safety net: the selector excludes tenants whose new
+          // duty Agent is globally enabled and in guarded action mode. Tenants
+          // that have not crossed that gate retain the proven legacy handoff
+          // instead of losing automatic recovery during a staged rollout.
           const recovery = await jobs.reconcileAutomaticCaptureRetries(10);
           if (recovery.dispatched > 0 || recovery.failed > 0) {
             safeLog(
               logger,
               'log',
-              `[Cron] Capture auto-dispatch: ${recovery.dispatched} dispatched, ` +
+              `[Cron] Capture fallback dispatch: ${recovery.dispatched} dispatched, ` +
               `${recovery.waitingForAgent} waiting for Agent, ` +
               `${recovery.manualOnly} manual-only, ${recovery.failed} failed`,
             );
@@ -197,6 +218,27 @@ function schedulerDefinitions(jobs, logger) {
           }
         } catch (err) {
           safeLog(logger, 'error', '[Cron] Capture attention notification error:', err.message);
+        }
+      },
+    },
+    {
+      name: 'ops-control-observer',
+      // Event wakeups are the primary path. This bounded reconciliation scan
+      // only recovers from a listener outage or an unexpected legacy writer.
+      expression: '*/5 * * * *',
+      run: async () => {
+        try {
+          const result = await jobs.runOpsControlCycle({logger});
+          if (result.observed > 0 || result.failed > 0) {
+            safeLog(
+              logger,
+              'log',
+              `[Cron] Ops control: ${result.observed} tenant(s) observed, ` +
+              `${result.failed} failed, ${result.incidentCount || 0} incident(s)`,
+            );
+          }
+        } catch (err) {
+          safeLog(logger, 'error', '[Cron] Ops control error:', err.message);
         }
       },
     },

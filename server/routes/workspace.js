@@ -22,7 +22,7 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
          LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
          WHERE r.tenant_id = $1 AND (${ACTIVE_QUEUE_CONDITION})) AS triage_pending,
         (SELECT COUNT(*) FROM comment_leads WHERE tenant_id = $1 AND status = 'new' AND lead_type <> 'sales_intent'
-          AND NOT EXISTS (SELECT 1 FROM records r WHERE r.id = comment_leads.record_id AND r.tenant_id = comment_leads.tenant_id AND r.ai_result->>'relevance' = 'irrelevant')) AS leads_new,
+          AND NOT EXISTS (SELECT 1 FROM records r WHERE r.id = comment_leads.record_id AND r.tenant_id = comment_leads.tenant_id AND (r.ai_result->>'relevance' = 'irrelevant' OR r.business_visibility <> 'eligible'))) AS leads_new,
         (SELECT COUNT(*) FROM issues WHERE tenant_id = $1 AND status NOT IN ('resolved', 'closed', 'ignored')) AS issues_open,
         (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND status IN ('pending', 'doing')) AS tickets_pending,
         (SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND feedback_status = 'pending_review') AS tickets_feedback,
@@ -59,7 +59,9 @@ router.get('/keywords', requireTenantAccess, async (req, res, next) => {
     const rows = await queryAll(
       `SELECT keyword, COUNT(*)::int AS count
        FROM records
-       WHERE tenant_id = $1 AND COALESCE(keyword, '') <> ''
+       WHERE tenant_id = $1
+         AND business_visibility = 'eligible'
+         AND COALESCE(keyword, '') <> ''
        GROUP BY keyword
        ORDER BY count DESC, keyword ASC
        LIMIT 500`,
@@ -78,7 +80,11 @@ router.get('/processing', requireTenantAccess, async (req, res, next) => {
     const row = await queryOne(`
       SELECT COUNT(DISTINCT rc.record_id) AS pending_posts, COUNT(*) AS pending_comments
       FROM record_comments rc
-      WHERE rc.tenant_id = $1 AND rc.ai_classified_at IS NULL AND rc.is_official = false
+      JOIN records r ON r.id = rc.record_id AND r.tenant_id = rc.tenant_id
+      WHERE rc.tenant_id = $1
+        AND r.business_visibility = 'eligible'
+        AND rc.ai_classified_at IS NULL
+        AND rc.is_official = false
     `, [req.tenantId]);
     const pendingPosts = Number(row?.pending_posts || 0);
     const pendingComments = Number(row?.pending_comments || 0);
@@ -99,7 +105,8 @@ router.get('/events', requireTenantAccess, async (req, res, next) => {
     else if (status) { params.push(status); where += ` AND i.status = $${params.length}`; }
 
     const events = await queryAll(`
-      SELECT i.id, i.title, i.severity, i.status, i.summary, i.record_count, i.owner_name,
+      SELECT i.id, i.title, i.severity, i.status, i.summary,
+        COUNT(r.id)::int AS record_count, i.owner_name,
         i.created_at, i.updated_at,
         COALESCE(SUM(r.likes + r.comments_count + r.collects + r.shares), 0) AS reach,
         COUNT(*) FILTER (WHERE r.sentiment = 'negative') AS negative_count,
@@ -108,7 +115,9 @@ router.get('/events', requireTenantAccess, async (req, res, next) => {
         MAX(r.last_seen_at) AS span_end
       FROM issues i
       LEFT JOIN issue_records ir ON ir.issue_id = i.id AND ir.tenant_id = i.tenant_id
-      LEFT JOIN records r ON r.id = ir.record_id AND r.tenant_id = i.tenant_id
+      LEFT JOIN records r ON r.id = ir.record_id
+        AND r.tenant_id = i.tenant_id
+        AND r.business_visibility = 'eligible'
       ${where}
       GROUP BY i.id
       ORDER BY
@@ -140,7 +149,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE sentiment = '') AS pending_label,
         COALESCE(SUM(likes + comments_count + collects + shares), 0) AS total_interaction
       FROM records
-      WHERE tenant_id = $1
+      WHERE tenant_id = $1 AND business_visibility = 'eligible'
     `, [req.tenantId, since, todayStart.toISOString()]);
 
     const issueStats = await queryOne(`
@@ -172,13 +181,18 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       WHERE r.tenant_id = $1
         AND r.record_type NOT IN ('official_content', 'blogger_profile')
+        AND r.business_visibility = 'eligible'
     `, [req.tenantId]);
 
     const operationsStats = await queryOne(`
       SELECT
         (SELECT COUNT(*)
          FROM record_observations ro
+         JOIN records observed_record
+           ON observed_record.id = ro.record_id
+           AND observed_record.tenant_id = ro.tenant_id
          WHERE ro.tenant_id = $1
+           AND observed_record.business_visibility = 'eligible'
            AND ro.monitor_execution_id IS NOT NULL
            AND ro.captured_at >= $2) AS today_monitor_hits,
         (SELECT COUNT(*)
@@ -190,7 +204,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
              SELECT 1 FROM records parent
              WHERE parent.id = cl.record_id
                AND parent.tenant_id = cl.tenant_id
-               AND parent.ai_result->>'relevance' = 'irrelevant'
+               AND (parent.ai_result->>'relevance' = 'irrelevant' OR parent.business_visibility <> 'eligible')
            )) AS today_comment_leads,
         (SELECT COUNT(*)
          FROM comment_leads cl
@@ -201,7 +215,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
              SELECT 1 FROM records parent
              WHERE parent.id = cl.record_id
                AND parent.tenant_id = cl.tenant_id
-               AND parent.ai_result->>'relevance' = 'irrelevant'
+               AND (parent.ai_result->>'relevance' = 'irrelevant' OR parent.business_visibility <> 'eligible')
            )) AS period_comment_leads,
         (SELECT COUNT(*)
          FROM monitor_subscriptions ms
@@ -231,6 +245,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
       WHERE r.tenant_id = $1
         AND r.record_type NOT IN ('official_content', 'blogger_profile')
+        AND r.business_visibility = 'eligible'
         AND COALESCE(rt.status, 'unhandled') = 'unhandled'
         AND rt.archived_at IS NULL
       ORDER BY
@@ -245,7 +260,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE created_at >= $2) AS period_new,
         MAX(last_seen_at) AS last_seen_at
       FROM records
-      WHERE tenant_id = $1
+      WHERE tenant_id = $1 AND business_visibility = 'eligible'
       GROUP BY platform
       ORDER BY count DESC
     `, [req.tenantId, since]);
@@ -255,7 +270,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) AS total,
         COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative
       FROM records
-      WHERE tenant_id = $1 AND created_at >= $2
+      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND created_at >= $2
       GROUP BY day
       ORDER BY day ASC
     `, [req.tenantId, since]);
@@ -264,7 +279,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       SELECT id, platform, record_type, title, content, author_name, url, likes,
         comments_count, collects, shares, sentiment, keyword, created_at, last_seen_at
       FROM records
-      WHERE tenant_id = $1
+      WHERE tenant_id = $1 AND business_visibility = 'eligible'
       ORDER BY created_at DESC
       LIMIT 8
     `, [req.tenantId]);
@@ -274,6 +289,15 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       SELECT *
       FROM comment_leads
       WHERE tenant_id = $1
+        AND NOT EXISTS (
+          SELECT 1 FROM records parent
+          WHERE parent.id = comment_leads.record_id
+            AND parent.tenant_id = comment_leads.tenant_id
+            AND (
+              parent.ai_result->>'relevance' = 'irrelevant'
+              OR parent.business_visibility <> 'eligible'
+            )
+        )
       ORDER BY captured_at DESC, created_at DESC
       LIMIT 8
     `, [req.tenantId]);
@@ -310,6 +334,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LEFT JOIN monitor_executions me ON me.id = ro.monitor_execution_id AND me.tenant_id = ro.tenant_id
       LEFT JOIN monitor_subscriptions ms ON ms.id = me.subscription_id AND ms.tenant_id = ro.tenant_id
       WHERE ro.tenant_id = $1
+        AND r.business_visibility = 'eligible'
         AND ro.monitor_execution_id IS NOT NULL
       ORDER BY ro.captured_at DESC
       LIMIT 8
@@ -322,7 +347,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE created_at >= $2) AS period_new,
         MAX(created_at) AS last_created_at
       FROM records
-      WHERE tenant_id = $1
+      WHERE tenant_id = $1 AND business_visibility = 'eligible'
       GROUP BY COALESCE(NULLIF(record_type, ''), 'single_note')
       ORDER BY count DESC
     `, [req.tenantId, since]);
@@ -370,7 +395,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE COALESCE(sentiment, '') = '') AS unlabeled,
         COUNT(*) AS total
       FROM records
-      WHERE tenant_id = $1
+      WHERE tenant_id = $1 AND business_visibility = 'eligible'
     `, [req.tenantId]);
 
     // 分平台风险(各平台总量与负面数,指挥中心)
@@ -379,7 +404,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) AS total,
         COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative
       FROM records
-      WHERE tenant_id = $1
+      WHERE tenant_id = $1 AND business_visibility = 'eligible'
       GROUP BY platform
       ORDER BY negative DESC, total DESC
     `, [req.tenantId]);

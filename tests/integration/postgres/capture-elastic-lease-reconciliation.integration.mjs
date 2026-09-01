@@ -242,6 +242,16 @@ function assertRequeued(state, timeoutCode) {
   );
 }
 
+function reconciliationSummary({scanned, requeued, skipped}) {
+  return {
+    scanned,
+    requeued,
+    skipped,
+    sourceClosureBlocked: 0,
+    sourceClosureBlockers: [],
+  };
+}
+
 test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollback, and locking', async t => {
   const target = validatePostgresIntegrationTarget({
     testDatabaseUrl: process.env.TEST_DATABASE_URL,
@@ -384,34 +394,34 @@ test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollba
     tenantId,
     distributionMode: 'fixed_batch',
   });
+  const taskHeartbeatBefore = await readLeaseState(pool, taskHeartbeat);
   const fixedBefore = await readLeaseState(pool, fixed);
 
-  assert.deepEqual(await reconcileElasticCaptureLeases(20), {
-    scanned: 2,
-    requeued: 2,
-    skipped: 0,
-  });
+  assert.deepEqual(
+    await reconcileElasticCaptureLeases(20),
+    reconciliationSummary({scanned: 1, requeued: 1, skipped: 0}),
+  );
   assertRequeued(
     await readLeaseState(pool, offline),
     'elastic_agent_offline_timeout',
   );
-  assertRequeued(
+  assert.deepEqual(
     await readLeaseState(pool, taskHeartbeat),
-    'elastic_task_heartbeat_timeout',
+    taskHeartbeatBefore,
+    'a live Agent must retain its lease even when the child heartbeat is stale',
   );
   assert.deepEqual(await readLeaseState(pool, fixed), fixedBefore);
-  assert.deepEqual(await reconcileElasticCaptureLeases(20), {
-    scanned: 0,
-    requeued: 0,
-    skipped: 0,
-  });
+  assert.deepEqual(
+    await reconcileElasticCaptureLeases(20),
+    reconciliationSummary({scanned: 0, requeued: 0, skipped: 0}),
+  );
   const eligibleEventCount = await pool.query(`
     SELECT count(*)::integer AS count
     FROM capture_task_events
     WHERE task_id = ANY($1::uuid[])
       AND event_type = 'elastic_work_item_requeued'
   `, [[offline.childTaskId, taskHeartbeat.childTaskId]]);
-  assert.equal(eligibleEventCount.rows[0].count, 2);
+  assert.equal(eligibleEventCount.rows[0].count, 1);
 
   const commandFenced = await createLeaseFixture(pool, {tenantId});
   const commandFencedBefore = await readLeaseState(pool, commandFenced);
@@ -426,11 +436,10 @@ test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollba
     commandFenced.agentId,
     commandFenced.childTaskId,
   ]);
-  assert.deepEqual(await reconcileElasticCaptureLeases(20), {
-    scanned: 0,
-    requeued: 0,
-    skipped: 0,
-  });
+  assert.deepEqual(
+    await reconcileElasticCaptureLeases(20),
+    reconciliationSummary({scanned: 0, requeued: 0, skipped: 0}),
+  );
   assert.deepEqual(
     await readLeaseState(pool, commandFenced),
     commandFencedBefore,
@@ -466,7 +475,7 @@ test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollba
         5000,
         'Concurrent elastic lease reconciliation did not honor SKIP LOCKED',
       ),
-      {scanned: 1, requeued: 0, skipped: 1},
+      reconciliationSummary({scanned: 1, requeued: 0, skipped: 1}),
     );
     await blockerClient.query('COMMIT');
     blockerTransactionOpen = false;
@@ -476,11 +485,10 @@ test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollba
       blockerTransactionOpen = false;
     }
   }
-  assert.deepEqual(await firstConcurrent, {
-    scanned: 1,
-    requeued: 1,
-    skipped: 0,
-  });
+  assert.deepEqual(
+    await firstConcurrent,
+    reconciliationSummary({scanned: 1, requeued: 1, skipped: 0}),
+  );
   assertRequeued(
     await readLeaseState(pool, concurrent),
     'elastic_agent_offline_timeout',
@@ -504,7 +512,7 @@ test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollba
         5000,
         'Elastic lease reconciliation blocked on a locked child row',
       ),
-      {scanned: 1, requeued: 0, skipped: 1},
+      reconciliationSummary({scanned: 1, requeued: 0, skipped: 1}),
     );
     await blockerClient.query('COMMIT');
     blockerTransactionOpen = false;
@@ -515,11 +523,10 @@ test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollba
     }
   }
   assert.deepEqual(await readLeaseState(pool, childLocked), childLockedBefore);
-  assert.deepEqual(await reconcileElasticCaptureLeases(1), {
-    scanned: 1,
-    requeued: 1,
-    skipped: 0,
-  });
+  assert.deepEqual(
+    await reconcileElasticCaptureLeases(1),
+    reconciliationSummary({scanned: 1, requeued: 1, skipped: 0}),
+  );
   assertRequeued(
     await readLeaseState(pool, childLocked),
     'elastic_agent_offline_timeout',
@@ -569,11 +576,10 @@ test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollba
     `DROP FUNCTION ${quoteProbeIdentifier(rollbackProbe.function)}()`,
   );
   rollbackProbe = null;
-  assert.deepEqual(await reconcileElasticCaptureLeases(1), {
-    scanned: 1,
-    requeued: 1,
-    skipped: 0,
-  });
+  assert.deepEqual(
+    await reconcileElasticCaptureLeases(1),
+    reconciliationSummary({scanned: 1, requeued: 1, skipped: 0}),
+  );
   assertRequeued(
     await readLeaseState(pool, rollback),
     'elastic_agent_offline_timeout',

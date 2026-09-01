@@ -205,7 +205,7 @@ test('同步、AI 与预警链路都对官方内容做独立兜底', async () =>
   assert.match(recordStore, /resolveCapturedRecordType/);
   assert.match(recordStore, /subscription\.subject_type = 'official'/);
   assert.match(recordStore, /officialContent: officialResolution\.officialContent/);
-  assert.match(syncRoute, /!result\.officialContent/);
+  assert.match(syncRoute, /result\.officialContent\) return null/);
   assert.match(aiLabeler, /\['official_content', 'blogger_profile'\]\.includes\(record\?\.record_type\)/);
   assert.match(alertEngine, /\['official_content', 'blogger_profile'\]\.includes\(record\.record_type\)/);
   assert.match(drawer, /新增负评提醒/);

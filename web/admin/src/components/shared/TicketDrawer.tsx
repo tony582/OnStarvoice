@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  ArrowLeft, Ban, Camera, CheckCircle, CheckCircle2, ClipboardCheck, ExternalLink,
+  ArrowLeft, Ban, Camera, CheckCircle, CheckCircle2, ClipboardCheck,
   FileText, Heart, History, LinkIcon, Loader2, MessageCircle, RotateCcw, Share2,
   Radar, Star, StickyNote, User, UserCog, X, ZoomIn,
 } from 'lucide-react'
@@ -15,6 +15,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
 import { recordDisplayImageEntries } from '@/components/shared/record-images'
 import { RecordPatrolPanel } from '@/components/shared/RecordDrawer'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
 
@@ -241,7 +242,12 @@ function TicketDrawerContent({
   const notes = source?.notes || []
   const isComment = t.source_type === 'comment'
   const closed = t.status === 'closed'
-  const postUrl = t.url || rec?.url || cmt?.record_url || ''
+  const sourceRecord = {
+    ...(rec || {}),
+    id: rec?.id || t.source_record_id || cmt?.record_id,
+    platform: rec?.platform || t.platform,
+    url: rec?.url || t.url || cmt?.record_url || '',
+  }
   const cover = recordCover(rec, t)
   const imageEntries = recordDisplayImageEntries(rec)
   const images = imageEntries.map(item => item.url)
@@ -325,7 +331,7 @@ function TicketDrawerContent({
                     <span className="text-[13px] font-semibold">{rec?.author_name || t.author || '未知作者'}</span>
                     <span className="text-[11px] text-muted-foreground">粉丝 {Number(rec?.author_fans) > 0 ? formatNumber(rec.author_fans) : '-'}</span>
                   </div>
-                  {postUrl && <a href={postUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
+                  <RecordSourceAction record={sourceRecord} className="text-[12px] font-semibold" />
                   {rec?.blogger_profile_url && <a href={rec.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><User className="h-3.5 w-3.5" />主页</a>}
                   {(rec?.publish_display || rec?.publish_time) && <span className="text-[12px] text-muted-foreground">发布于 {rec.publish_display || rec.publish_time}</span>}
                 </div>

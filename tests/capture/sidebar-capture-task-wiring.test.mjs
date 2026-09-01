@@ -177,7 +177,7 @@ test("targeted patrol owns the dark task surface and exact stop binding", () => 
   );
 });
 
-test("targeted patrol heartbeat keeps long profile scans alive as business progress", async () => {
+test("targeted patrol heartbeat does not masquerade as business progress", async () => {
   const heartbeatSection = readFunctionSection(
     "function startTargetedPostRunHeartbeat(",
     "async function cancelTargetedPostRunFromSidebar(",
@@ -190,11 +190,7 @@ test("targeted patrol heartbeat keeps long profile scans alive as business progr
     id: token.requestId,
     attemptId: token.attemptId,
     status: "running",
-    progress: {
-      phase: "target_profile_publish_date_verification",
-      current: 1,
-      total: 1,
-    },
+    businessProgressAt: "2026-08-25T01:00:00.000Z",
   };
   const context = {
     TARGETED_POST_RUN_HEARTBEAT_INTERVAL_MS: 20_000,
@@ -239,18 +235,7 @@ globalThis.__startTargetedPostRunHeartbeat = startTargetedPostRunHeartbeat;`,
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0], request);
   assert.equal(calls[0][2], token);
-  assert.equal(
-    calls[0][1].heartbeatAt,
-    calls[0][1].businessProgressAt,
-  );
-  assert.equal(
-    calls[0][1].progress.updatedAt,
-    calls[0][1].heartbeatAt,
-  );
-  assert.equal(
-    calls[0][1].progress.phase,
-    "target_profile_publish_date_verification",
-  );
+  assert.deepEqual(Object.keys(calls[0][1]), ["heartbeatAt"]);
 
   stop();
   assert.equal(clearedTimer, 91);
@@ -628,6 +613,15 @@ test("official comment patrol starts one attempt-fenced task session before deta
         normalizeMonitorRunnerPlatform: (value) => String(value || ""),
         resolveMonitorRunnerAccountUrl: (runItem) => runItem.accountUrl,
         resolveMonitorRunnerName: (runItem) => runItem.title,
+        cloudTargetedPostApi: {
+          projectCaptureFailure: (_candidates, options = {}) => ({
+            code: String(options.fallbackCode || "CAPTURE_FAILED"),
+            message: String(options.fallbackMessage || "采集失败"),
+            category: "",
+            retryable: true,
+            requiresManualAction: false,
+          }),
+        },
         reportMonitorRunProgress: (onProgress, progress, message) => {
           onProgress?.({...progress, message});
           return message;
@@ -637,6 +631,7 @@ test("official comment patrol starts one attempt-fenced task session before deta
           events.push("profile_list");
           return {
             ok: true,
+            scanComplete: true,
             results: [{recordIds: [`${platform}-record`]}],
           };
         },
@@ -723,6 +718,7 @@ test("official comment patrol starts one attempt-fenced task session before deta
         JSON.parse(JSON.stringify(captureTaskContext)),
         {
           taskId: physicalTaskId,
+          captureTaskId: requestId,
           attemptId,
           label: "官方账号评论巡查",
           ownerRequired: true,
@@ -877,13 +873,13 @@ test("official comment patrol cancellation ends and releases its exact native ta
   );
 });
 
-test("a completed Douyin targeted patrol pauses its owned media and returns its runner home", async () => {
+test("a completed Douyin targeted patrol pauses media and closes its owned runner", async () => {
   const cleanupSection = readFunctionSection(
     "async function settleTargetedPostRunnerTab(",
     "async function waitForTargetedPostRunnerTab(",
   );
   const scriptCalls = [];
-  const tabUpdates = [];
+  const removedTabIds = [];
   const context = {
     chrome: {
       tabs: {
@@ -891,10 +887,7 @@ test("a completed Douyin targeted patrol pauses its owned media and returns its 
           id: 77,
           url: "https://www.douyin.com/video/766193585000000001",
         }),
-        update: async (tabId, patch) => {
-          tabUpdates.push({tabId, patch});
-          return {id: tabId, ...patch};
-        },
+        remove: async (tabId) => removedTabIds.push(tabId),
       },
       scripting: {
         executeScript: async (payload) => {
@@ -922,16 +915,7 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   );
   assert.equal(scriptCalls.length, 1);
   assert.equal(scriptCalls[0].target.tabId, 77);
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(tabUpdates)),
-    [{
-      tabId: 77,
-      patch: {
-        url: "https://www.douyin.com/jingxuan",
-        active: true,
-      },
-    }],
-  );
+  assert.deepEqual(removedTabIds, [77]);
 
   const runnerSection = readFunctionSection(
     "async function maybeClaimAndRunTargetedPostWorkflow()",
@@ -947,13 +931,13 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   assert.ok(clearIndex > settleIndex);
 });
 
-test("targeted patrol cleanup never redirects a non-Douyin runner", async () => {
+test("a completed Xiaohongshu targeted patrol closes its owned runner", async () => {
   const cleanupSection = readFunctionSection(
     "async function settleTargetedPostRunnerTab(",
     "async function waitForTargetedPostRunnerTab(",
   );
   const scriptCalls = [];
-  const tabUpdates = [];
+  const removedTabIds = [];
   const context = {
     chrome: {
       tabs: {
@@ -961,10 +945,7 @@ test("targeted patrol cleanup never redirects a non-Douyin runner", async () => 
           id: 88,
           url: "https://www.xiaohongshu.com/explore/note-1",
         }),
-        update: async (tabId, patch) => {
-          tabUpdates.push({tabId, patch});
-          return {id: tabId, ...patch};
-        },
+        remove: async (tabId) => removedTabIds.push(tabId),
       },
       scripting: {
         executeScript: async (payload) => {
@@ -989,11 +970,11 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   );
 
   assert.equal(
-    await context.__settleTargetedPostRunnerTab(88, "douyin"),
-    false,
+    await context.__settleTargetedPostRunnerTab(88, "xiaohongshu"),
+    true,
   );
-  assert.equal(scriptCalls.length, 0);
-  assert.equal(tabUpdates.length, 0);
+  assert.equal(scriptCalls.length, 1);
+  assert.deepEqual(removedTabIds, [88]);
 });
 
 test("targeted patrol safety intervention pauses media without leaving the page", async () => {
@@ -1002,7 +983,7 @@ test("targeted patrol safety intervention pauses media without leaving the page"
     "async function waitForTargetedPostRunnerTab(",
   );
   const scriptCalls = [];
-  const tabUpdates = [];
+  const removedTabIds = [];
   const context = {
     chrome: {
       tabs: {
@@ -1010,10 +991,7 @@ test("targeted patrol safety intervention pauses media without leaving the page"
           id: 99,
           url: "https://www.douyin.com/video/766193585000000002",
         }),
-        update: async (tabId, patch) => {
-          tabUpdates.push({tabId, patch});
-          return {id: tabId, ...patch};
-        },
+        remove: async (tabId) => removedTabIds.push(tabId),
       },
       scripting: {
         executeScript: async (payload) => {
@@ -1041,7 +1019,7 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
     true,
   );
   assert.equal(scriptCalls.length, 1);
-  assert.equal(tabUpdates.length, 0);
+  assert.equal(removedTabIds.length, 0);
 });
 
 test("a normal side panel without a runner query renders shared targeted state and stops that exact request", async () => {
@@ -1141,12 +1119,28 @@ test("a normal side panel without a runner query renders shared targeted state a
   assert.match(initSection, /loadTargetedPostRunStateForDisplay\(\)/u);
 });
 
-test("closing a terminal status page dismisses both current terminal task families", () => {
+test("closing a terminal status page persists both acknowledgements across reloads", async () => {
   const dismissSection = readFunctionSection(
-    "function dismissAllTerminalCaptureSummaries()",
+    "async function loadTerminalCaptureSummaryAcknowledgements()",
     "function setupDebugSessionPanelControls()",
   );
+  const writes = [];
   const context = {
+    TERMINAL_SUMMARY_ACK_STORAGE_KEY:
+      "onstarvoice.terminalSummaryAcknowledgements",
+    chrome: {
+      storage: {
+        local: {
+          get: async () => ({
+            "onstarvoice.terminalSummaryAcknowledgements": {
+              unattendedTerminalSummaryId: "previous-unattended",
+              targetedTerminalSummaryId: "previous-targeted",
+            },
+          }),
+          set: async (value) => writes.push(value),
+        },
+      },
+    },
     keywordPlanState: {},
     buildKeywordRunDisplayPlan: () => ({
       lastRunStatus: "completed",
@@ -1173,7 +1167,20 @@ globalThis.__dismissAll = dismissAllTerminalCaptureSummaries;`,
     context,
   );
 
-  context.__dismissAll();
+  assert.equal(
+    await context.loadTerminalCaptureSummaryAcknowledgements(),
+    true,
+  );
+  assert.equal(
+    context.debugSessionDismissedUnattendedTerminalRunAt,
+    "previous-unattended",
+  );
+  assert.equal(
+    context.debugSessionDismissedTargetedTerminalRunAt,
+    "previous-targeted",
+  );
+
+  await context.__dismissAll();
 
   assert.equal(
     context.debugSessionDismissedUnattendedTerminalRunAt,
@@ -1183,6 +1190,18 @@ globalThis.__dismissAll = dismissAllTerminalCaptureSummaries;`,
     context.debugSessionDismissedTargetedTerminalRunAt,
     "2026-07-27T12:01:00.000Z",
   );
+  assert.equal(writes.length, 1);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      writes[0]["onstarvoice.terminalSummaryAcknowledgements"],
+    )),
+    {
+      schemaVersion: 1,
+      unattendedTerminalSummaryId: "2026-07-27T12:00:00.000Z",
+      targetedTerminalSummaryId: "2026-07-27T12:01:00.000Z",
+      updatedAt: writes[0]["onstarvoice.terminalSummaryAcknowledgements"].updatedAt,
+    },
+  );
 
   const controlsSection = readFunctionSection(
     "function setupDebugSessionPanelControls()",
@@ -1190,7 +1209,7 @@ globalThis.__dismissAll = dismissAllTerminalCaptureSummaries;`,
   );
   assert.match(
     controlsSection,
-    /dataset\?\.terminal === "true"[\s\S]*?dismissAllTerminalCaptureSummaries\(\)/u,
+    /dataset\?\.terminal === "true"[\s\S]*?await dismissAllTerminalCaptureSummaries\(\)/u,
   );
 });
 
@@ -1493,17 +1512,26 @@ test("unattended Douyin navigation readiness is bound to the expected URL and ke
     "a stale complete tab must not be accepted before its search identity matches",
   );
 
+  const runtimeSection = readFunctionSection(
+    "async function waitForRuntimeSearchPage(",
+    "function resolveUnattendedBootstrapStartGate(",
+  );
+  assert.match(runtimeSection, /platform === "douyin"/);
+  assert.match(runtimeSection, /chrome\.scripting[\s\S]*?executeScript/);
+  assert.match(runtimeSection, /keywordMatched &&[\s\S]*?hasSearchShell/);
+  assert.match(runtimeSection, /pathname\.startsWith\("\/search\/"\)/);
+
   const navigationSection = readFunctionSection(
     "async function navigateActiveTabToKeywordSearchForPlan({",
     "function buildUnattendedTaskCounts(",
   );
   assert.match(
     navigationSection,
-    /waitForActiveTabReady\(\s*preferredTabId,\s*15000,\s*\{[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
+    /waitForActiveTabReady\(\s*preferredTabId,\s*platform === "douyin" \? 45000 : 15000,\s*\{[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
   );
   assert.match(
     navigationSection,
-    /readyState\.ready\s*\?\s*await waitForRuntimeSearchPage\(\{[\s\S]*?platform,[\s\S]*?tabId:\s*preferredTabId,[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,/,
+    /readyState\.ready\s*\?\s*await waitForRuntimeSearchPage\(\{[\s\S]*?platform,[\s\S]*?tabId:\s*preferredTabId,[\s\S]*?expectedUrl:\s*searchUrl,[\s\S]*?expectedKeyword:\s*keyword,[\s\S]*?timeoutMs:\s*platform === "douyin" \? 15000 : 8000,/,
     "runtime readiness must describe the same final tab and search identity",
   );
   assert.match(
@@ -1530,6 +1558,7 @@ function createUnattendedNavigationHarness({
   const updates = [];
   const retries = [];
   let runtimeChecks = 0;
+  let documentGenerationReads = 0;
   let stopRequested = false;
   const tab = {
     id: 101,
@@ -1538,10 +1567,23 @@ function createUnattendedNavigationHarness({
     url: "https://www.douyin.com/jingxuan",
   };
   const sandbox = vm.createContext({
-    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 4,
-    UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS: [0, 0, 0],
+    UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS: 1,
+    UNATTENDED_SEARCH_BOOTSTRAP_RETRY_DELAYS_MS: [0, 0],
     buildSidebarKeywordSearchUrl: (keyword) =>
       `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=general`,
+    beginDouyinSearchResultTransitionInTab: async () => ({
+      baselineCaptured: true,
+      previousWorkIds: ["766193585000009991"],
+      submissionNonce: "bootstrap-submit",
+    }),
+    readDouyinSearchDocumentGenerationInTab: async () => {
+      documentGenerationReads += 1;
+      return {
+        timeOrigin: documentGenerationReads,
+        readyState: "complete",
+        pageUrl: tab.url,
+      };
+    },
     chrome: {
       tabs: {
         get: async () => {
@@ -1592,25 +1634,42 @@ function createUnattendedNavigationHarness({
   };
 }
 
-test("unattended bootstrap reopens the same keyword after a transient page drift", async () => {
+test("successful unattended bootstrap returns one exact reusable search proof", async () => {
+  const harness = createUnattendedNavigationHarness({
+    tabReadiness: [true],
+    runtimeReadiness: [true],
+  });
+
+  const result = await harness.navigate();
+  assert.equal(harness.updates.length, 1);
+  assert.equal(result.initialSearchEvidence.ready, true);
+  assert.equal(result.initialSearchEvidence.keyword, "凯迪拉克");
+  assert.equal(result.initialSearchEvidence.platform, "douyin");
+  assert.equal(result.initialSearchEvidence.tabId, 101);
+  assert.equal(
+    result.initialSearchEvidence.navigationTransitionAccepted,
+    true,
+  );
+});
+
+test("unattended bootstrap does not repeat the same search after a transient page drift", async () => {
   const harness = createUnattendedNavigationHarness({
     tabReadiness: [false, true],
     runtimeReadiness: [true],
   });
 
-  const result = await harness.navigate();
-
-  assert.equal(result.recovered, true);
-  assert.equal(result.attemptCount, 2);
-  assert.equal(harness.updates.length, 2);
-  assert.equal(harness.updates[0].url, harness.updates[1].url);
+  await assert.rejects(harness.navigate(), (error) => {
+    assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
+    assert.equal(error.attempts, 1);
+    return true;
+  });
+  assert.equal(harness.updates.length, 1);
   assert.match(harness.updates[0].url, /\/search\/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B/);
-  assert.equal(harness.retries.length, 1);
-  assert.equal(harness.retries[0].nextAttempt, 2);
+  assert.equal(harness.retries.length, 0);
   assert.equal(
     harness.runtimeChecks(),
-    1,
-    "a failed tab identity must retry immediately instead of waiting on stale runtime state",
+    0,
+    "a failed tab identity must be handed back without issuing the same search again",
   );
 });
 
@@ -1621,27 +1680,114 @@ test("unattended bootstrap retry is bounded and exposes a recoverable error code
 
   await assert.rejects(harness.navigate(), (error) => {
     assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
-    assert.equal(error.attempts, 4);
+    assert.equal(error.attempts, 1);
     return true;
   });
-  assert.equal(harness.updates.length, 4);
-  assert.equal(harness.retries.length, 3);
+  assert.equal(harness.updates.length, 1);
+  assert.equal(harness.retries.length, 0);
   assert.equal(harness.runtimeChecks(), 0);
 });
 
-test("unattended bootstrap retries when the tab is ready but runtime is a video page", async () => {
+test("unattended Douyin bootstrap accepts the bound search shell while global runtime lags", async () => {
+  const runtimeSection = readFunctionSection(
+    "async function waitForRuntimeSearchPage(",
+    "function resolveUnattendedBootstrapStartGate(",
+  );
+  let probeCount = 0;
+  const sandbox = vm.createContext({
+    PAGE_TYPE: {SEARCH_RESULTS: "search_results"},
+    chrome: {
+      scripting: {
+        executeScript: async () => {
+          probeCount += 1;
+          return [{result: true}];
+        },
+      },
+    },
+    getCurrentRuntime: () => ({
+      platform: "douyin",
+      pageType: "note_detail",
+      lastActiveTabId: 101,
+      lastPageUrl: "https://www.douyin.com/video/123456789",
+    }),
+    getPagePlatform: (runtime) => runtime?.platform || "",
+    setTimeout: (resolve) => resolve(),
+  });
+  vm.runInContext(
+    `${runtimeSection}\nglobalThis.__wait = waitForRuntimeSearchPage;`,
+    sandbox,
+  );
+
+  const ready = await sandbox.__wait({
+    platform: "douyin",
+    tabId: 101,
+    expectedUrl:
+      "https://www.douyin.com/search/%E5%87%AF%E8%BF%AA%E6%8B%89%E5%85%8B?type=general",
+    expectedKeyword: "凯迪拉克",
+    timeoutMs: 1000,
+  });
+
+  assert.equal(ready, true);
+  assert.equal(probeCount, 1);
+});
+
+test("unattended Xiaohongshu bootstrap accepts the exact bound search shell while global runtime lags", async () => {
+  const runtimeSection = readFunctionSection(
+    "async function waitForRuntimeSearchPage(",
+    "function resolveUnattendedBootstrapStartGate(",
+  );
+  let probeCount = 0;
+  const sandbox = vm.createContext({
+    PAGE_TYPE: {SEARCH_RESULTS: "search_results"},
+    chrome: {
+      scripting: {
+        executeScript: async () => {
+          probeCount += 1;
+          return [{result: true}];
+        },
+      },
+    },
+    getCurrentRuntime: () => ({
+      platform: "xiaohongshu",
+      pageType: "note_detail",
+      lastActiveTabId: 101,
+      lastPageUrl: "https://www.xiaohongshu.com/explore/123456789",
+    }),
+    getPagePlatform: (runtime) => runtime?.platform || "",
+    setTimeout: (resolve) => resolve(),
+  });
+  vm.runInContext(
+    `${runtimeSection}\nglobalThis.__wait = waitForRuntimeSearchPage;`,
+    sandbox,
+  );
+
+  const ready = await sandbox.__wait({
+    platform: "xiaohongshu",
+    tabId: 101,
+    expectedUrl:
+      "https://www.xiaohongshu.com/search_result?keyword=%E5%88%AB%E5%85%8B%E5%A3%81%E7%BA%B8",
+    expectedKeyword: "别克壁纸",
+    timeoutMs: 1000,
+  });
+
+  assert.equal(ready, true);
+  assert.equal(probeCount, 1);
+});
+
+test("unattended bootstrap hands back when the bound tab runtime is still a video page", async () => {
   const harness = createUnattendedNavigationHarness({
     tabReadiness: [true, true],
     runtimeReadiness: [false, true],
   });
 
-  const result = await harness.navigate();
-
-  assert.equal(result.recovered, true);
-  assert.equal(result.attemptCount, 2);
-  assert.equal(harness.updates.length, 2);
-  assert.equal(harness.runtimeChecks(), 2);
-  assert.equal(harness.retries.length, 1);
+  await assert.rejects(harness.navigate(), (error) => {
+    assert.equal(error.code, "UNATTENDED_SEARCH_BOOTSTRAP_FAILED");
+    assert.equal(error.attempts, 1);
+    return true;
+  });
+  assert.equal(harness.updates.length, 1);
+  assert.equal(harness.runtimeChecks(), 1);
+  assert.equal(harness.retries.length, 0);
 });
 
 test("unattended bootstrap cannot pass its final fence after cancellation", async () => {
@@ -1679,7 +1825,45 @@ test("a missing tracked tab never hijacks the user's unrelated active page", asy
     return true;
   });
   assert.equal(harness.updates.length, 0);
-  assert.equal(harness.retries.length, 3);
+  assert.equal(harness.retries.length, 0);
+});
+
+test("elastic unattended starts obey a bounded soft gate and healthy manual runs do not wait", () => {
+  const gateSection = readFunctionSection(
+    "function resolveUnattendedBootstrapStartGate(request = {}, now = Date.now())",
+    "async function navigateActiveTabToKeywordSearchForPlan({",
+  );
+  const sandbox = vm.createContext({
+    UNATTENDED_BOOTSTRAP_GATE_MAX_WAIT_MS: 60_000,
+  });
+  vm.runInContext(
+    `${gateSection}\nglobalThis.__resolveGate = resolveUnattendedBootstrapStartGate;`,
+    sandbox,
+  );
+  const now = Date.parse("2026-08-24T00:00:00.000Z");
+  const manual = sandbox.__resolveGate({}, now);
+  assert.equal(manual.delayed, false);
+  assert.equal(manual.waitMs, 0);
+
+  const delayed = sandbox.__resolveGate({
+    orchestrationContext: {
+      distributionMode: "elastic_pool",
+      bootstrapStartNotBefore: "2026-08-24T00:00:25.000Z",
+      bootstrapPacingReason: "staggered_start",
+    },
+  }, now);
+  assert.equal(delayed.delayed, true);
+  assert.equal(delayed.waitMs, 25_000);
+  assert.equal(delayed.reason, "staggered_start");
+
+  const bounded = sandbox.__resolveGate({
+    orchestrationContext: {
+      distributionMode: "elastic_pool",
+      bootstrapStartNotBefore: "2026-08-24T00:05:00.000Z",
+      bootstrapPacingReason: "recent_technical_congestion",
+    },
+  }, now);
+  assert.equal(bounded.waitMs, 60_000);
 });
 
 test("tab readiness never promotes an unrelated same-platform tab to the task tab", async () => {
@@ -1742,15 +1926,34 @@ test("unattended bootstrap retry is reported before keyword batch delegation", (
   const navigationIndex = section.indexOf(
     "const navigationResult = await navigateActiveTabToKeywordSearchForPlan({",
   );
+  const gateIndex = section.indexOf(
+    "const bootstrapGate = resolveUnattendedBootstrapStartGate(request)",
+  );
+  const switchIndex = section.indexOf("let switchResult = null");
   const retryIndex = section.indexOf("onRetry: async ({nextAttempt, maxAttempts, retryDelayMs, waitUntil})", navigationIndex);
   const batchIndex = section.indexOf("batchRunResult = await handleBatchKeywordCapture({", retryIndex);
+  const terminalCatchIndex = section.indexOf(
+    'console.error("[Sidebar] Unattended keyword plan failed:", error)',
+  );
 
-  assert.ok(navigationIndex > -1);
+  assert.ok(gateIndex > -1);
+  assert.ok(switchIndex > gateIndex);
+  assert.ok(navigationIndex > switchIndex);
   assert.ok(retryIndex > navigationIndex);
   assert.ok(batchIndex > retryIndex);
+  assert.ok(terminalCatchIndex > batchIndex);
+  assert.match(
+    section.slice(batchIndex),
+    /initialSearchEvidence:\s*navigationResult\?\.initialSearchEvidence \|\| null/,
+  );
   assert.match(section.slice(retryIndex, batchIndex), /phase: "waiting_search_page_retry"/);
   assert.match(section.slice(retryIndex, batchIndex), /waitUntil,/);
   assert.match(section.slice(retryIndex, batchIndex), /retried: Math\.max\(0, Number\(nextAttempt\) - 1\)/);
+  assert.match(section.slice(gateIndex, switchIndex), /phase: "waiting_bootstrap_slot"/);
+  assert.match(
+    section.slice(terminalCatchIndex),
+    /const bootstrapCanceled =\s+error\?\.code === "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED"/,
+  );
   assert.match(
     section,
     /const bootstrapFailed =\s+error\?\.code === "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"/,
@@ -1761,21 +1964,83 @@ test("unattended bootstrap retry is reported before keyword batch delegation", (
   );
 });
 
-test("unattended keyword failures use four spaced attempts with a durable countdown", () => {
+test("one cloud item uses one business keyword attempt while retaining bounded technical recovery", () => {
   assert.match(sidebarSource, /const UNATTENDED_KEYWORD_MAX_ATTEMPTS = 4/u);
-  assert.match(
-    sidebarSource,
-    /const UNATTENDED_KEYWORD_RETRY_DELAYS_MS = Object\.freeze\(\[\s*30 \* 1000,\s*2 \* 60 \* 1000,\s*5 \* 60 \* 1000,/u,
-  );
+  assert.match(sidebarSource, /const UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS = 4/u);
+  assert.match(sidebarSource, /const UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS = 4/u);
   const handlerSection = readFunctionSection(
     "async function handleBatchKeywordCapture(options = {})",
     "async function reportUnattendedKeywordRun(",
   );
   assert.match(handlerSection, /Math\.min\(4, Number\(runOptions\.maxKeywordAttempts\) \|\| 1\)/u);
-  assert.match(handlerSection, /UNATTENDED_KEYWORD_RETRY_DELAYS_MS\[/u);
-  assert.match(handlerSection, /"keyword_retry_wait"/u);
-  assert.match(handlerSection, /waitUntil,/u);
   assert.match(handlerSection, /attemptTotal: maxKeywordAttempts/u);
+
+  const unattendedSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction({",
+  );
+  assert.match(
+    unattendedSection,
+    /const singleRelayMode =[\s\S]*request\?\.cloudAssigned === true[\s\S]*distributionMode === "elastic_pool"[\s\S]*singleRelayV1 === true[\s\S]*disableAutomaticSearchRetry === true/u,
+  );
+  assert.match(
+    unattendedSection,
+    /const localKeywordMaxAttempts = singleRelayMode[\s\S]*?UNATTENDED_KEYWORD_MAX_ATTEMPTS/u,
+  );
+  assert.match(
+    unattendedSection,
+    /const localBootstrapMaxAttempts = UNATTENDED_SEARCH_BOOTSTRAP_MAX_ATTEMPTS/u,
+  );
+  assert.match(
+    unattendedSection,
+    /const localCaptureSessionMaxAttempts =\s*UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS/u,
+  );
+  assert.match(
+    unattendedSection,
+    /maxAttempts:\s*localBootstrapMaxAttempts/u,
+  );
+  assert.match(
+    unattendedSection,
+    /maxKeywordAttempts:\s*localKeywordMaxAttempts/u,
+  );
+  assert.match(
+    handlerSection,
+    /const bootstrapEvidenceAccepted = Boolean\([\s\S]*preferredSourceTabId[\s\S]*bootstrapEvidenceTabId === Number\(preferredSourceTabId\)/u,
+  );
+  assert.match(
+    handlerSection,
+    /runtime\?\.pageType !== PAGE_TYPE\.SEARCH_RESULTS &&[\s\S]*!bootstrapEvidenceAccepted/u,
+  );
+  assert.match(
+    unattendedSection,
+    /const noCaptureBootstrapSync =[\s\S]*capturedUniqueCount: 0,[\s\S]*enqueuedUniqueCount: 0,[\s\S]*excludedUniqueCount: 0,[\s\S]*succeededUniqueCount: 0/u,
+  );
+
+  const manualNoteSection = readFunctionSection(
+    "async function handleCaptureNoteData()",
+    "async function handleCaptureBloggerData()",
+  );
+  const manualSearchSection = readFunctionSection(
+    "async function handleCaptureSearchData()",
+    "function setKeywordStrategyTab(",
+  );
+  assert.doesNotMatch(manualNoteSection, /bootstrapInitialSearchEvidence/u);
+  assert.doesNotMatch(manualSearchSection, /bootstrapInitialSearchEvidence/u);
+});
+
+test("task sidebar adopts only newer progress from the exact active list run", () => {
+  const renderSection = readFunctionSection(
+    "function renderCaptureDebugSession(runtime = {})",
+    "async function loadTerminalCaptureSummaryAcknowledgements()",
+  );
+  assert.match(renderSection, /session\?\.activeListRunId/u);
+  assert.match(renderSection, /runtimeProgress\.listCaptureRunId/u);
+  assert.match(renderSection, /runtimeListRunId === activeListRunId/u);
+  assert.match(renderSection, /runtimeProgressAt > sessionProgressAt/u);
+  assert.match(
+    renderSection,
+    /canUseLiveListProgress[\s\S]*\{\.\.\.sessionProgress, \.\.\.runtimeProgress\}/u,
+  );
 });
 
 test("elastic keyword cooldown releases the work item, pauses the source Agent, and leaves the loading page", () => {
@@ -2001,7 +2266,11 @@ test("streaming sync waits for a safe terminal decision before queuing failed de
   );
   assert.match(
     router,
-    /phase === "detail_item_filtered"[\s\S]*?phase === "detail_item_skipped"[\s\S]*?markSeen/u,
+    /phase === "detail_item_filtered"[\s\S]*?phase === "detail_item_skipped"[\s\S]*?markExcluded/u,
+  );
+  assert.match(
+    batch,
+    /onKeywordSettled: onKeywordSettled \|\| streamingSyncQueue\?\.enabled[\s\S]*?settleKeywordRecordsForStreamingSync\([\s\S]*?if \(!ownerCurrent \|\| !onKeywordSettled\)/u,
   );
   assert.ok(stopAt >= 0);
   assert.ok(recoverableAt > stopAt);
@@ -2010,6 +2279,44 @@ test("streaming sync waits for a safe terminal decision before queuing failed de
     batch.slice(0, stopAt),
     /streamingSyncQueue\.enqueueMissing\(recordIds/u,
   );
+});
+
+test("keyword settlement classifies saved records before the unattended ownership fence", () => {
+  const settlement = readFunctionSection(
+    "function settleKeywordRecordsForStreamingSync(",
+    "function formatStreamingSyncSummary(",
+  );
+  const batch = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  const registerAt = settlement.indexOf(
+    "streamingSyncQueue.registerCaptured(recordIds)",
+  );
+  const unsafeAt = settlement.indexOf("const mustExclude");
+  const enqueueAt = settlement.indexOf(
+    "streamingSyncQueue.enqueueMissing(recordIds",
+  );
+  const fenceAt = batch.indexOf("if (!ownerCurrent || !onKeywordSettled)");
+  const settleAt = batch.indexOf("settleKeywordRecordsForStreamingSync(");
+
+  assert.ok(registerAt >= 0);
+  assert.ok(unsafeAt > registerAt);
+  assert.ok(enqueueAt > unsafeAt);
+  assert.match(
+    settlement,
+    /!ownerCurrent[\s\S]*?settled\?\.canceled[\s\S]*?result\.fatal[\s\S]*?result\.securityBlocked[\s\S]*?result\.integrityBlocked/u,
+  );
+  assert.match(
+    settlement,
+    /if \(mustExclude\) \{[\s\S]*?markExcluded[\s\S]*?return;[\s\S]*?enqueueMissing/u,
+  );
+  assert.match(
+    settlement,
+    /if \(!streamingSyncQueue\.hasSeen\(recordId\)\) \{[\s\S]*?markExcluded/u,
+  );
+  assert.ok(settleAt >= 0);
+  assert.ok(fenceAt > settleAt);
 });
 
 test("manual Douyin multi-keyword capture retries only after the first pass", () => {
@@ -2200,6 +2507,32 @@ test("capture progress rejects stale owners before forwarding into local UI", ()
   assert.match(
     section.slice(updateIndex, localPhaseIndex),
     /taskId:\s*incomingCaptureTaskId\s*\|\|\s*captureTaskOwnerTaskId/,
+  );
+});
+
+test("cloud Debug ownership conflicts hand off without touching the occupied page", () => {
+  for (const code of [
+    "capture_task_debug_starvoice_active",
+    "capture_task_external_debugger_busy",
+    "capture_task_debug_ownership_unknown",
+  ]) {
+    assert.match(sidebarSource, new RegExp(code, "u"));
+  }
+  const unattendedSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction({",
+  );
+  assert.match(
+    unattendedSection,
+    /request\?\.cloudAssigned === true[\s\S]*UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES\.has\(code\)[\s\S]*if \(cloudHandoff\) \{\s*break;/u,
+  );
+  assert.match(
+    unattendedSection,
+    /debugOwnershipHandoff[\s\S]*browser_debug_ownership[\s\S]*automaticReroute: true[\s\S]*safeToDetach: false/u,
+  );
+  assert.match(
+    unattendedSection,
+    /当前页面及既有会话保持不动，任务已交回云端等待其它空闲 Agent 接力/u,
   );
 });
 

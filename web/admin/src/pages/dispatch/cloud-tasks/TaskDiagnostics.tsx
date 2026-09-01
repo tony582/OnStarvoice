@@ -108,6 +108,9 @@ function diagnosticTone(diagnostics: TaskDiagnostics) {
 }
 
 function keywordResultCause(item: TaskKeywordResult) {
+  if (item.status === 'completed' && item.resultKind === 'no_search_results') {
+    return '无搜索结果（0 条正常结算）'
+  }
   if (item.status === 'completed' && item.noResults) return '筛选范围内无匹配内容（0 条正常结算）'
   if (item.status === 'completed') return '完整完成'
   if (item.status === 'skipped') return item.error || '按规则跳过'

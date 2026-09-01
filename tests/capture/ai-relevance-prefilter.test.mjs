@@ -6,9 +6,12 @@ import {
   RELEVANCE_PREFILTER_BATCH_SIZE,
   RELEVANCE_PREFILTER_MAX_CONCURRENCY,
   RELEVANCE_PREFILTER_TIMEOUT_MS,
+  RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION,
+  buildRelevanceDetailCandidate,
   buildRelevancePrefilterCandidate,
   buildRelevancePrefilterIdempotencyKey,
   evaluateRelevancePrefilterRecords,
+  evaluateRelevanceDetailRecord,
   normalizeRelevancePrefilterDecision,
 } from '../../utils/capture/relevance-prefilter.js';
 import {scopeRelevancePrefilterIdempotencyKey} from '../../utils/api.js';
@@ -69,12 +72,31 @@ test('candidate uses list text only and never forwards cover or body', () => {
   assert.equal(candidate.evidence.externalId, 'note-1');
 });
 
-test('only valid high-confidence skip is actionable', () => {
+test('detail candidate contains only bounded minimal evidence', () => {
+  const candidate = buildRelevanceDetailCandidate(keywordRecord(1), {
+    title: '昂科威 Plus 使用感受',
+    author: '车主',
+    content: '正文内容',
+    tags: ['昂科威', '车机'],
+    ocrText: '屏幕显示文字',
+    transcript: '视频口播文字',
+    commentsCleanedItems: [{content: '评论不得发送'}],
+    bloggerFollowersCount: 999,
+    imageUrls: ['https://private.example/image.jpg'],
+  });
+  assert.equal(candidate.evidence.content, '正文内容');
+  assert.deepEqual(candidate.evidence.tags, ['昂科威', '车机']);
+  const serialized = JSON.stringify(candidate.evidence);
+  assert.doesNotMatch(serialized, /评论不得发送|bloggerFollowersCount|private\.example/u);
+});
+
+test('a valid server skip disposition is actionable without a second client threshold', () => {
   assert.equal(
     normalizeRelevancePrefilterDecision({
       status: 'ok',
       modelDecision: 'skip',
-      confidence: 0.97,
+      tenantRelevance: 'irrelevant',
+      confidence: 0.95,
       executionDisposition: 'skip_full_capture',
     }).shouldSkip,
     true,
@@ -83,6 +105,7 @@ test('only valid high-confidence skip is actionable', () => {
     normalizeRelevancePrefilterDecision({
       status: 'ok',
       decision: 'skip',
+      tenantRelevance: 'irrelevant',
       confidence: 0.99,
       executionDisposition: 'skip_full_capture',
     }).shouldSkip,
@@ -90,13 +113,7 @@ test('only valid high-confidence skip is actionable', () => {
     'legacy decision alias remains fail-safe compatible',
   );
   for (const response of [
-    {
-      status: 'ok',
-      modelDecision: 'skip',
-      confidence: 0.969,
-      executionDisposition: 'skip_full_capture',
-    },
-    {status: 'ok', modelDecision: 'need_detail', confidence: 1},
+    {status: 'ok', modelDecision: 'need_detail', tenantRelevance: 'uncertain', confidence: 1},
     {status: 'timeout', modelDecision: 'skip', confidence: 1},
     {status: 'ok', modelDecision: 'skip', confidence: 'invalid'},
     {status: 'ok', modelDecision: 'skip', confidence: 1},
@@ -106,6 +123,37 @@ test('only valid high-confidence skip is actionable', () => {
       false,
     );
   }
+  assert.equal(
+    normalizeRelevancePrefilterDecision({
+      status: 'ok',
+      modelDecision: 'skip',
+      tenantRelevance: 'relevant',
+      confidence: 1,
+      executionDisposition: 'skip_full_capture',
+    }).shouldSkip,
+    false,
+  );
+  assert.equal(
+    normalizeRelevancePrefilterDecision({
+      status: 'ok',
+      modelDecision: 'skip',
+      tenantRelevance: 'irrelevant',
+      confidence: 1,
+      protectedSignal: true,
+      executionDisposition: 'skip_full_capture',
+    }).shouldSkip,
+    false,
+  );
+  assert.equal(
+    normalizeRelevancePrefilterDecision({
+      status: 'ok',
+      modelDecision: 'skip',
+      tenantRelevance: 'irrelevant',
+      confidence: 1,
+      executionDisposition: 'skip_full_capture',
+    }, {canSkip: false}).shouldSkip,
+    false,
+  );
 });
 
 test('fallback titles cannot be skipped even when model is overconfident', async () => {
@@ -118,6 +166,7 @@ test('fallback titles cannot be skipped even when model is overconfident', async
         itemId: item.itemId,
         status: 'ok',
         modelDecision: 'skip',
+        tenantRelevance: 'irrelevant',
         confidence: 1,
         executionDisposition: 'skip_full_capture',
       })),
@@ -128,12 +177,12 @@ test('fallback titles cannot be skipped even when model is overconfident', async
   assert.equal(result.decisions[0].shouldSkip, false);
 });
 
-test('records use small DeepSeek batches and the bounded response deadline', async () => {
-  assert.equal(RELEVANCE_PREFILTER_BATCH_SIZE, 5);
-  assert.equal(RELEVANCE_PREFILTER_TIMEOUT_MS, 90000);
+test('records use sequential micro-batches and the bounded response deadline', async () => {
+  assert.equal(RELEVANCE_PREFILTER_BATCH_SIZE, 8);
+  assert.equal(RELEVANCE_PREFILTER_TIMEOUT_MS, 30000);
   assert.match(
     apiSource,
-    /Math\.min\(120000, Number\(options\?\.timeout\) \|\| 90000\)/u,
+    /Math\.min\(120000, Number\(options\?\.timeout\) \|\| 30000\)/u,
     'API layer must not clamp the prefilter back below its response deadline',
   );
   const records = Array.from({length: 41}, (_, index) => keywordRecord(index + 1));
@@ -149,6 +198,7 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
             itemId: item.itemId,
             status: 'ok',
             modelDecision: index === 0 ? 'skip' : 'keep',
+            tenantRelevance: index === 0 ? 'irrelevant' : 'relevant',
             confidence: 0.99,
             executionDisposition:
               index === 0 ? 'skip_full_capture' : 'collect_full',
@@ -157,10 +207,10 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
       };
     },
   });
-  assert.equal(calls.length, 9);
+  assert.equal(calls.length, 6);
   assert.deepEqual(
     calls.map(({request}) => request.items.length).sort((a, b) => b - a),
-    [5, 5, 5, 5, 5, 5, 5, 5, 1],
+    [8, 8, 8, 8, 8, 1],
   );
   assert.equal(calls.every(({request}) => request.mode === 'conservative'), true);
   assert.equal(calls.every(({request}) => request.skipThreshold === 0.97), true);
@@ -168,54 +218,43 @@ test('records use small DeepSeek batches and the bounded response deadline', asy
     calls.every(({request}) => request.idempotencyKey.includes(':conservative:0.9700:')),
     true,
   );
-  assert.equal(calls.every(({options}) => options.timeout === 90000), true);
-  assert.equal(result.skippedRecordIds.length, 9);
+  assert.equal(calls.every(({options}) => options.timeout === 30000), true);
+  assert.equal(result.skippedRecordIds.length, 6);
   assert.equal(result.failedOpenCount, 0);
 });
 
-test('a whole timed-out batch is split and retried once before failing open', async () => {
+test('a whole timed-out batch fails open without split retries', async () => {
   const records = Array.from({length: 5}, (_, index) => keywordRecord(index + 1));
   const calls = [];
   const result = await evaluateRelevancePrefilterRecords(records, {
     enabled: true,
     requestBatch: async ({items}) => {
       calls.push(items.map((item) => item.itemId));
-      if (calls.length === 1) {
-        return {
-          ok: true,
-          items: items.map((item) => ({
-            itemId: item.itemId,
-            status: 'timeout',
-            modelDecision: null,
-            confidence: null,
-            executionDisposition: 'collect_full',
-            reason: 'MODEL_TIMEOUT',
-          })),
-        };
-      }
       return {
         ok: true,
         items: items.map((item) => ({
           itemId: item.itemId,
-          status: 'ok',
-          modelDecision: 'keep',
-          confidence: 1,
-          executionDisposition: 'collect_full',
+          status: 'timeout',
+          modelDecision: null,
+          confidence: null,
+          executionDisposition: 'defer_enhancement',
+          reason: 'MODEL_TIMEOUT',
         })),
       };
     },
   });
 
-  assert.deepEqual(calls.map((items) => items.length), [5, 3, 2]);
-  assert.equal(result.retryCount, 2);
-  assert.equal(result.retriedItemCount, 5);
-  assert.equal(result.timeoutCount, 0);
-  assert.equal(result.evaluatedCount, 5);
-  assert.equal(result.failedOpenCount, 0);
+  assert.deepEqual(calls.map((items) => items.length), [5]);
+  assert.equal(result.retryCount, 0);
+  assert.equal(result.retriedItemCount, 0);
+  assert.equal(result.timeoutCount, 5);
+  assert.equal(result.evaluatedCount, 0);
+  assert.equal(result.failedOpenCount, 5);
+  assert.equal(result.deferredCount, 5);
 });
 
-test('split retries stop after one layer and expose the remaining timeout count', async () => {
-  const records = Array.from({length: 5}, (_, index) => keywordRecord(index + 1));
+test('multiple timed-out micro-batches each make one request only', async () => {
+  const records = Array.from({length: 17}, (_, index) => keywordRecord(index + 1));
   const calls = [];
   const result = await evaluateRelevancePrefilterRecords(records, {
     enabled: true,
@@ -228,20 +267,21 @@ test('split retries stop after one layer and expose the remaining timeout count'
           status: 'timeout',
           modelDecision: null,
           confidence: null,
-          executionDisposition: 'collect_full',
+          executionDisposition: 'defer_enhancement',
           reason: 'MODEL_TIMEOUT',
         })),
       };
     },
   });
 
-  assert.deepEqual(calls, [5, 3, 2]);
-  assert.equal(result.retryCount, 2);
-  assert.equal(result.retriedItemCount, 5);
-  assert.equal(result.timeoutCount, 5);
+  assert.deepEqual(calls, [8, 8, 1]);
+  assert.equal(result.retryCount, 0);
+  assert.equal(result.retriedItemCount, 0);
+  assert.equal(result.timeoutCount, 17);
   assert.equal(result.evaluatedCount, 0);
-  assert.equal(result.failedOpenCount, 5);
+  assert.equal(result.failedOpenCount, 17);
   assert.deepEqual(result.skippedRecordIds, []);
+  assert.equal(result.deferredCount, 17);
 });
 
 test('identical list text in a later capture run receives a new idempotency key', async () => {
@@ -254,6 +294,7 @@ test('identical list text in a later capture run receives a new idempotency key'
         itemId: item.itemId,
         status: 'ok',
         modelDecision: 'keep',
+        tenantRelevance: 'relevant',
         confidence: 1,
         executionDisposition: 'collect_full',
       })),
@@ -314,8 +355,8 @@ test('prefilter idempotency scoping is stable for retries and bounded for the AP
   );
 });
 
-test('parallel DeepSeek batches stay within the server tenant concurrency', async () => {
-  assert.equal(RELEVANCE_PREFILTER_MAX_CONCURRENCY, 2);
+test('each Agent submits only one AI micro-batch at a time', async () => {
+  assert.equal(RELEVANCE_PREFILTER_MAX_CONCURRENCY, 1);
   const records = Array.from({length: 70}, (_, index) => keywordRecord(index + 1));
   let active = 0;
   let maxActive = 0;
@@ -332,13 +373,14 @@ test('parallel DeepSeek batches stay within the server tenant concurrency', asyn
           itemId: item.itemId,
           status: 'ok',
           modelDecision: 'keep',
+          tenantRelevance: 'relevant',
           confidence: 1,
           executionDisposition: 'collect_full',
         })),
       };
     },
   });
-  assert.equal(maxActive, 2);
+  assert.equal(maxActive, 1);
   assert.equal(result.evaluatedCount, 70);
   assert.equal(result.failedOpenCount, 0);
 });
@@ -367,6 +409,7 @@ test('request failure, missing items and need_detail all fail open', async () =>
   });
   assert.deepEqual(thrown.skippedRecordIds, []);
   assert.equal(thrown.failedOpenCount, 2);
+  assert.equal(thrown.deferredCount, 2);
 
   const partial = await evaluateRelevancePrefilterRecords(records, {
     enabled: true,
@@ -377,13 +420,55 @@ test('request failure, missing items and need_detail all fail open', async () =>
           itemId: items[0].itemId,
           status: 'ok',
           modelDecision: 'need_detail',
+          tenantRelevance: 'uncertain',
           confidence: 0.99,
+          executionDisposition: 'collect_minimal_detail',
         },
       ],
     }),
   });
   assert.deepEqual(partial.skippedRecordIds, []);
   assert.equal(partial.failedOpenCount, 1);
+  assert.equal(partial.minimalDetailCount, 1);
+  assert.equal(partial.deferredCount, 1);
+});
+
+test('detail second stage uses one minimal request and can terminate expensive capture', async () => {
+  const requests = [];
+  const decision = await evaluateRelevanceDetailRecord(
+    keywordRecord(1),
+    {
+      title: '大众壁纸合集',
+      author: '车友',
+      content: '全文只讨论大众汽车，与别克无关',
+      tags: ['大众'],
+      commentsCleanedItems: [{content: '不得发送'}],
+    },
+    {
+      requestBatch: async (request) => {
+        requests.push(request);
+        return {
+          ok: true,
+          items: request.items.map((item) => ({
+            itemId: item.itemId,
+            status: 'ok',
+            modelDecision: 'skip',
+            tenantRelevance: 'irrelevant',
+            confidence: 0.99,
+            executionDisposition: 'skip_full_capture',
+            decisionFinality: 'final',
+            reason: '最小详情确认无关',
+          })),
+        };
+      },
+    },
+  );
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].stage, 'detail');
+  assert.equal(requests[0].promptVersion, RELEVANCE_PREFILTER_DETAIL_PROMPT_VERSION);
+  assert.doesNotMatch(JSON.stringify(requests[0]), /不得发送/u);
+  assert.equal(decision.shouldSkip, true);
+  assert.equal(decision.executionDisposition, 'skip_full_capture');
 });
 
 test('detail batch invokes AI before creating a detail runner and only for keyword records', () => {
@@ -433,4 +518,25 @@ test('detail batch invokes AI before creating a detail runner and only for keywo
       'AI filtering must not delete list records in either terminal branch',
     );
   }
+
+  const mixedSkipStart = aiSkipBranches[1].index;
+  const mixedSkipEnd = fullBody.indexOf(
+    'if (relevancePrefilterDeferredRecordIdSet.has(recordId))',
+    mixedSkipStart,
+  );
+  const mixedSkipBranch = fullBody.slice(mixedSkipStart, mixedSkipEnd);
+  assert.match(mixedSkipBranch, /continue;/u);
+  assert.doesNotMatch(
+    mixedSkipBranch,
+    /captureCurrentNotePayload|captureCommentsForCurrentNote|captureBloggerMetricsForDetailPayload/u,
+    'an actionable list skip must exit before detail, comment or blogger capture',
+  );
+
+  const noteCaptureAt = fullBody.indexOf('let noteResult = await captureCurrentNotePayload();');
+  const secondStageAt = fullBody.indexOf('await evaluateRelevanceDetailRecord(');
+  const bloggerAt = fullBody.indexOf('await captureBloggerMetricsForDetailPayload(');
+  const commentsAt = fullBody.indexOf('await captureCommentsForCurrentNote(');
+  assert.ok(secondStageAt > noteCaptureAt, 'detail AI must run after minimal note capture');
+  assert.ok(bloggerAt > secondStageAt, 'detail AI must run before blogger metrics');
+  assert.ok(commentsAt > secondStageAt, 'detail AI must run before comments');
 });

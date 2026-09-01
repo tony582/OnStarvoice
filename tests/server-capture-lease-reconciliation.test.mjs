@@ -53,6 +53,33 @@ test('elastic lease reconciler requires every application port', () => {
   }
 });
 
+test('elastic lease reconciler can adapt a richer production reconciliation', async () => {
+  const inputs = [];
+  const reconcile = createElasticCaptureLeaseReconciler({
+    async reconcileLeases(input) {
+      inputs.push(input);
+      return {
+        scanned: 2,
+        requeued: 1,
+        skipped: 0,
+        sourceClosureBlocked: 1,
+      };
+    },
+  });
+  const scope = {
+    limit: 25,
+    tenantId: 'tenant-a',
+    parentTaskIds: ['task-a'],
+  };
+  assert.deepEqual(await reconcile(scope), {
+    scanned: 2,
+    requeued: 1,
+    skipped: 0,
+    sourceClosureBlocked: 1,
+  });
+  assert.deepEqual(inputs, [scope]);
+});
+
 test('elastic lease reconciler preserves candidate limit normalization', async () => {
   const limits = [];
   const reconcile = createElasticCaptureLeaseReconciler(

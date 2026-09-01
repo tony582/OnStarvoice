@@ -25,7 +25,7 @@ test('accepted child snapshots project keyword checkpoints to their exact parent
   assert.match(projection, /refreshOrchestrationParentTask/u);
   assert.match(
     projection,
-    /\['canceled', 'superseded'\]\.includes\(parent\.status\)/u,
+    /!orchestrationParentAcceptsProjection\(parent\.status\)/u,
   );
   assert.match(route, /'orchestrationChild', capture_tasks\.metadata->'orchestrationChild'/u);
   assert.match(route, /'parentTaskId', capture_tasks\.metadata->'parentTaskId'/u);
@@ -64,7 +64,7 @@ test('a device-side retry is adopted by the original orchestration parent', asyn
   );
   assert.match(
     route,
-    /task = await adoptLocalOrchestrationRecovery\(tx, agent, task, snapshot\)/u,
+    /task = await adoptLocalOrchestrationRecovery\(tx, agent, task, snapshot, \{\s*supportsLocalClosureReuseFenceV1,\s*\}\)/u,
   );
   assert.match(agent, /remoteOrchestrationRecoveryMergeV1: true/u);
 });
@@ -110,7 +110,11 @@ test('schedule status follows its latest run before and after terminal settlemen
   const refresh = route.slice(refreshStart, refreshEnd);
   assert.match(
     refresh,
-    /\['canceled', 'superseded'\]\.includes\(parent\.status\)/u,
+    /!orchestrationParentAcceptsProjection\(parent\.status\)/u,
+  );
+  assert.match(
+    route,
+    /const ORCHESTRATION_PARENT_TERMINAL_STATUSES = new Set\(\[[\s\S]*'completed_with_failures'[\s\S]*'superseded'[\s\S]*\]\)/u,
   );
   assert.match(refresh, /last_run_status = \$2/u);
   assert.match(refresh, /scheduled_run_needs_action/u);
@@ -136,13 +140,15 @@ test('overview returns parent business tasks without exposing orchestration chil
 });
 
 test('production task center exposes real multi-Agent compose and detail flows', async () => {
-  const [dispatchPage, taskCard, plansView, taskLib, composer, detail] = await Promise.all([
+  const [dispatchPage, taskCard, plansView, taskLib, composer, detail, keywordReport, sidebar] = await Promise.all([
     read('web/admin/src/pages/dispatch/DispatchPage.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/PlansView.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/lib.ts'),
     read('web/admin/src/pages/dispatch/cloud-tasks/OrchestrationComposerDrawer.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/OrchestrationDetailWorkspace.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/KeywordExecutionReport.tsx'),
+    read('sidebar/sidebar-logic.js'),
   ]);
   const page = [dispatchPage, taskCard, plansView, taskLib].join('\n');
 
@@ -182,6 +188,29 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /计划 ID、运行次数和历史记录全部保留/u);
   assert.match(composer, /'fixed_batch' as const/u);
   assert.match(composer, /'elastic_pool' as const/u);
+  assert.match(composer, /巡检类型（受限组合）/u);
+  assert.match(composer, /只允许 5 种路径/u);
+  assert.match(composer, /每个关键词最多两次搜索/u);
+  assert.match(composer, /图文与视频不能互相组合/u);
+  assert.match(composer, /发布时间等其它筛选仍保持单选/u);
+  assert.match(composer, /remoteSequentialSearchPassesV1/u);
+  assert.match(composer, /searchPasses/u);
+  assert.match(
+    composer,
+    /searchFilters:\s*\{[\s\S]*sort,[\s\S]*publishTime,[\s\S]*contentType:[\s\S]*searchScope,[\s\S]*distance:[\s\S]*videoDuration:/u,
+  );
+  assert.match(composer, /disableAutomaticSearchRetry: sequentialSearchEnabled/u);
+  assert.match(composer, /requireVerifiedFilters: sequentialSearchEnabled/u);
+  assert.match(composer, /一个关键词任务，由同一 Agent 串行完成/u);
+  assert.match(composer, /每次搜索先采集列表、再增强本次新增内容/u);
+  assert.match(sidebar, /plannedRounds = sequentialSearchEnabled[\s\S]*searchPasses\.length/u);
+  assert.match(sidebar, /roundSearchFilters = activeSearchPass[\s\S]*contentType: activeSearchPass/u);
+  assert.match(sidebar, /searchFilters: roundSearchFilters/u);
+  assert.match(sidebar, /afterKeywordCapture: settings\.autoDetailCaptureAfterListCapture/u);
+  assert.match(
+    sidebar,
+    /result\.canceled \|\|[\s\S]*result\.fatal \|\|[\s\S]*result\.recoveryRequired/u,
+  );
 
   assert.match(detail, /detail\?\.items/u);
   assert.match(detail, /orchestration, executions, agents, attempts, schedule/u);
@@ -189,11 +218,45 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(detail, /暂停计划/u);
   assert.match(detail, /重新启用/u);
   assert.match(detail, /每个计划时间，每个关键词执行 1 次/u);
+  assert.match(detail, /每个关键词由同一 Agent/u);
   assert.match(detail, /任务遇到安全验证时/u);
   assert.match(detail, /接力只处理尚未开始的完整关键词/u);
   assert.match(detail, /\/retry-items/u);
   assert.match(detail, /回写当前父任务/u);
   assert.match(detail, /重试失败关键词/u);
+  assert.match(detail, /keywordRetryAllocation/u);
+  assert.match(detail, /detail\.retryCandidates/u);
+  assert.match(detail, /系统将在提交时自动选择/u);
+  assert.match(detail, /优先 Agent（可选）/u);
+  assert.match(detail, /此词已尝试/u);
+  assert.match(detail, /assignments,/u);
+  assert.match(detail, /当前没有空闲兼容 Agent/u);
+  assert.match(detail, /进入自动等待队列/u);
+  assert.match(detail, /keywordRetryDispatchableCount > 0/u);
+  assert.match(detail, /个现在接力/u);
+  assert.match(detail, /槽位释放后自动改派/u);
+  assert.match(detail, /buildKeywordRetryAssignments\(\{/u);
+  assert.match(detail, /items: keywordRetryItems/u);
+  assert.match(detail, /overrides: keywordRetryAgentOverrides/u);
+  assert.doesNotMatch(
+    detail,
+    /keywordRetryAllocation\s*\.filter[\s\S]*agentId: allocation\.agent/u,
+  );
+  assert.match(detail, /allocation\.preferenceFallback/u);
+  assert.match(detail, /所选 Agent 不可用或已跑过此词/u);
+  assert.doesNotMatch(detail, /严格等待指定 Agent/u);
+  assert.match(
+    detail,
+    /keywordRetryDispatchableCount > 0 && keywordRetryWaitingCount/u,
+  );
+  assert.doesNotMatch(detail, /keywordRetryTargetAgentId/u);
+  assert.match(detail, /automaticKeywordRecoveryActive/u);
+  assert.match(detail, /关键词自动尝试已耗尽/u);
+  assert.match(detail, /旧批次虽已结算/u);
+  assert.match(detail, /新批次不会在仍有可用接力账号时提前结算/u);
+  assert.match(detail, /可继续接力/u);
+  assert.match(keywordReport, /部分完成/u);
+  assert.match(keywordReport, /已有结果不会丢失/u);
   assert.match(detail, /\/schedule\/run-now/u);
   assert.match(detail, /立即运行/u);
   assert.match(detail, /onEditPlan\?\.\(detail\)/u);
@@ -205,6 +268,9 @@ test('production task center exposes real multi-Agent compose and detail flows',
     /\/capture-cloud\/orchestrations\/\$\{orchestrationId\}\/stop/u,
   );
   assert.match(detail, /canStopOrchestration/u);
+  assert.match(detail, /patrolPathLabel/u);
+  assert.match(detail, /同一 Agent/u);
+  assert.match(detail, /不自动刷新补搜/u);
   assert.match(detail, /整个任务和自动接力已停止/u);
   assert.match(
     detail,

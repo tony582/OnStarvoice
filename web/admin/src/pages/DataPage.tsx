@@ -11,7 +11,9 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar } from '@/components/shared/Workbench'
 import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
+import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
 import { useNav } from '@/lib/navigation'
+import { recordDisplayTitle, resolveRecordOriginalUrl } from '@/lib/record-display'
 
 type TableKey =
   | 'single_notes'
@@ -674,7 +676,9 @@ function MobileRecordDetail({
   onOpenWorkbench?: () => void
 }) {
   const grouped = useMemo(() => groupMobileColumns(columns.filter(column => column.key !== 'attachments')), [columns])
-  const originalUrl = mobileOriginalUrl(row, table)
+  const sourceRecord = mobileSourceRecord(row, table)
+  const originalUrl = table === 'blogger_profiles' ? mobileOriginalUrl(row, table) : ''
+  const hasSourceAction = table !== 'blogger_profiles' && hasRecordSource(sourceRecord)
   const hasAttachments = MEDIA_TABLES.has(table) && buildRecordMediaTasks(row).length > 0
 
   return (
@@ -745,12 +749,18 @@ function MobileRecordDetail({
               打开原文 <ExternalLink className="h-4 w-4" />
             </a>
           )}
+          {hasSourceAction && (
+            <RecordSourceAction
+              record={sourceRecord}
+              className="h-11 flex-1 justify-center rounded-xl bg-primary px-3 text-sm font-bold !text-primary-foreground hover:!no-underline"
+            />
+          )}
           {onOpenWorkbench && (
             <button type="button" onClick={onOpenWorkbench} className="inline-flex h-11 flex-1 items-center justify-center gap-1.5 rounded-xl bg-primary px-3 text-sm font-bold text-primary-foreground">
               去处理 <ArrowRight className="h-4 w-4" />
             </button>
           )}
-          {!hasAttachments && !originalUrl && !onOpenWorkbench && (
+          {!hasAttachments && !originalUrl && !hasSourceAction && !onOpenWorkbench && (
             <button type="button" onClick={onClose} className="h-11 w-full rounded-xl bg-primary text-sm font-bold text-primary-foreground">返回记录列表</button>
           )}
         </div>
@@ -786,7 +796,7 @@ function groupMobileColumns(columns: Column[]) {
 function mobileRecordTitle(row: any, table: TableKey) {
   if (table === 'blogger_profiles') return String(firstValue(row.author_name, row.title, bloggerIdentifier(row), '未命名博主'))
   if (table === 'comment_leads') return String(firstValue(row.comment_content, row.record_title, '未命名评论'))
-  return String(firstValue(row.title, row.record_title, row.content, row.author_name, '未命名记录'))
+  return recordDisplayTitle(row, String(firstValue(row.record_title, row.author_name, '未命名记录')))
 }
 
 function mobileRecordSubtitle(row: any, table: TableKey) {
@@ -821,8 +831,16 @@ function mobileRecordStats(row: any, table: TableKey) {
 
 function mobileOriginalUrl(row: any, table: TableKey) {
   if (table === 'blogger_profiles') return String(firstValue(authorHomepage(row), row.url))
-  if (table === 'comment_leads') return String(firstValue(row.record_url, row.url))
-  return String(firstValue(row.url, row.record_url))
+  return resolveRecordOriginalUrl(mobileSourceRecord(row, table))
+}
+
+function mobileSourceRecord(row: any, table: TableKey) {
+  if (table !== 'comment_leads') return row
+  return {
+    ...row,
+    id: row.record_id,
+    url: firstValue(row.record_url, row.url),
+  }
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -856,7 +874,11 @@ function columnsForTable(table: TableKey, platform = ''): Column[] {
   if (table === 'comment_leads') {
     return [
       col('recordTitle', '原笔记标题', (r, ctx) => longCell(r.record_title || '(无标题)', 180, ctx)),
-      col('recordUrl', '原笔记链接', r => linkCell(r.record_url, '原文')),
+      col('recordUrl', '原笔记链接', r => recordSourceCell({
+        ...r,
+        id: r.record_id,
+        url: r.record_url,
+      })),
       col('user', '评论用户', r => textCell(r.comment_author_name)),
       col('ip', 'IP属地', r => textCell(r.comment_ip_location)),
       col('content', '评论内容', (r, ctx) => longCell(r.comment_content, 260, ctx)),
@@ -882,7 +904,7 @@ function columnsForTable(table: TableKey, platform = ''): Column[] {
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
     col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-    col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+    col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
     col('likes', '点赞数', r => metricCell(r.likes)),
@@ -896,14 +918,14 @@ function keywordNoteColumns(platform: string): Column[] {
       col('keyword', '关键词', r => textCell(r.keyword || value(r, 'payload.keyword'))),
       col('author', '博主', r => textCell(r.author_name)),
       col('profile', '博主主页', r => linkCell(authorHomepage(r), '查看博主主页')),
-      col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+      col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
       col('likes', '点赞数', r => metricCell(r.likes)),
       col('collects', '收藏数', r => metricCell(r.collects)),
       col('comments', '评论数', r => metricCell(r.comments_count)),
       col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
       col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
-      col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+      col('url', '笔记链接', r => recordSourceCell(r)),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
       col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
       col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
@@ -921,7 +943,7 @@ function keywordNoteColumns(platform: string): Column[] {
     col('liked', '点赞与收藏数', r => metricCell(bloggerLiked(r))),
     col('account', '账号属性', r => textCell(r.blogger_account_type || value(r, 'payload.accountType'))),
     col('profile', '博主主页', r => linkCell(authorHomepage(r), '查看博主主页')),
-    col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+    col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
     col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
@@ -930,7 +952,7 @@ function keywordNoteColumns(platform: string): Column[] {
     col('comments', '评论数', r => metricCell(r.comments_count)),
     col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
     col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
-    col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+    col('url', '笔记链接', r => recordSourceCell(r)),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
     col('imageLinks', '图片链接', r => linkListCell(imageUrls(r), '图片')),
@@ -973,9 +995,9 @@ function bloggerNoteColumns(platform: string): Column[] {
       col('author', '博主', r => textCell(r.author_name)),
       col('fans', '粉丝数', r => metricCell(r.author_fans)),
       col('liked', '点赞与收藏数', r => metricCell(bloggerLiked(r))),
-      col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+      col('url', '笔记链接', r => recordSourceCell(r)),
       col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
-      col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+      col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
       col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
       col('likes', '点赞数', r => metricCell(r.likes)),
@@ -999,9 +1021,9 @@ function bloggerNoteColumns(platform: string): Column[] {
     col('fans', '粉丝数', r => metricCell(r.author_fans)),
     col('liked', '点赞与收藏数', r => metricCell(bloggerLiked(r))),
     col('account', '账号属性', r => textCell(r.blogger_account_type || value(r, 'payload.accountType'))),
-    col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+    col('url', '笔记链接', r => recordSourceCell(r)),
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
-    col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+    col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
     col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
     col('likes', '点赞数', r => metricCell(r.likes)),
@@ -1021,7 +1043,7 @@ function monitorContentColumns(platform: string): Column[] {
     col('author', '博主', r => textCell(r.author_name)),
     col('profile', '博主主页', r => linkCell(authorHomepage(r), '查看博主主页')),
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
-    col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+    col('url', '笔记链接', r => recordSourceCell(r)),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
     col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
     col('likes', '点赞数', r => metricCell(r.likes)),
@@ -1053,7 +1075,7 @@ function monitorContentColumns(platform: string): Column[] {
   }
 
   columns.push(
-    col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+    col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
     col('video', '视频链接', r => linkCell(videoUrl(r), '查看视频')),
@@ -1099,7 +1121,7 @@ function singleNoteColumns(platform: string): Column[] {
       col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
       col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-      col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+      col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
       col('tags', '话题标签', r => tagCell(r.tags)),
       col('likes', '点赞数', r => metricCell(r.likes)),
@@ -1107,7 +1129,7 @@ function singleNoteColumns(platform: string): Column[] {
       col('comments', '评论数', r => metricCell(r.comments_count)),
       col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
       col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
-      col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+      col('url', '笔记链接', r => recordSourceCell(r)),
       col('imageLinks', '图片链接', r => linkListCell(imageUrls(r), '图片')),
       col('images', '附件图片', r => imagesCell(imageUrls(r), r.title)),
       col('video', '视频链接', r => linkCell(videoUrl(r), '查看视频')),
@@ -1135,14 +1157,14 @@ function singleNoteColumns(platform: string): Column[] {
       col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
       col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-      col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+      col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('likes', '点赞数', r => metricCell(r.likes)),
       col('collects', '收藏数', r => metricCell(r.collects)),
       col('comments', '评论数', r => metricCell(r.comments_count)),
       col('shares', '转发数', r => metricCell(r.shares)),
       col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
       col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
-      col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+      col('url', '笔记链接', r => recordSourceCell(r)),
       col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
       col('tags', '话题标签', r => tagCell(r.tags)),
       col('video', '视频链接', r => linkCell(videoUrl(r), '查看视频')),
@@ -1171,7 +1193,7 @@ function singleNoteColumns(platform: string): Column[] {
     col('type', '笔记类型', r => textCell(noteTypeLabel(r))),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
     col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-    col('title', '标题', (r, ctx) => longCell(r.title || '(无标题)', 180, ctx)),
+    col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
     col('likes', '点赞数', r => metricCell(r.likes)),
@@ -1180,7 +1202,7 @@ function singleNoteColumns(platform: string): Column[] {
     col('shares', '转发数', r => metricCell(r.shares)),
     col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
     col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
-    col('url', '笔记链接', r => linkCell(r.url, '打开笔记')),
+    col('url', '笔记链接', r => recordSourceCell(r)),
     col('imageLinks', '图片链接', r => linkListCell(imageUrls(r), '图片')),
     col('images', '附件图片', r => imagesCell(imageUrls(r), r.title)),
     col('video', '视频链接', r => linkCell(videoUrl(r), '查看视频')),
@@ -1866,6 +1888,23 @@ function linkCell(url: unknown, label: string) {
       {label}
       <ExternalLink className="h-3 w-3" />
     </a>
+  )
+}
+
+function hasRecordSource(record: Record<string, unknown>) {
+  const platform = String(record?.platform || '').trim().toLowerCase()
+  const hasXhsUrl = [record?.url, record?.canonical_url]
+    .some(url => /(^|\.)xiaohongshu\.com(?:\/|$)/iu.test(String(url || '').replace(/^https?:\/\//iu, '')))
+  return platform === 'xiaohongshu' || hasXhsUrl || Boolean(resolveRecordOriginalUrl(record))
+}
+
+function recordSourceCell(record: Record<string, unknown>) {
+  if (!hasRecordSource(record)) return <span className="text-muted-foreground">-</span>
+  return (
+    <RecordSourceAction
+      record={record}
+      className="h-7 rounded-md border border-border bg-background px-2 text-xs font-semibold transition hover:border-primary/40 hover:bg-primary/5"
+    />
   )
 }
 

@@ -6,11 +6,17 @@ import vm from "node:vm";
 
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+  bindCloudTaskSnapshotHealthToAttempt,
+  captureAgentFullHeartbeatOnline,
+  captureAgentHeartbeatDegraded,
+  captureAgentLivenessOnline,
   captureAgentOnline,
+  cloudTaskAttemptIdentityAcceptsSnapshot,
   findCaptureAgentExecutionSlotBlocker,
   isCloudTaskActive,
   isCloudTaskTerminal,
   lockCaptureAgentExecutionSlot,
+  tryLockCaptureAgentExecutionSlot,
   normalizeCaptureAgentPlatforms,
   normalizeCloudTaskSnapshot,
   normalizeCloudTaskStatus,
@@ -20,23 +26,41 @@ import {
 } from "../server/services/capture-cloud.js";
 import {
   captureTaskBusinessRootVisibilitySql,
+  captureCreateCommandExpiryEligible,
+  captureCreateCommandExpiredBeforeOpen,
+  captureExecutionNeverOpened,
+  captureItemRequiresLocalClosureReuseFence,
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
+  buildSequentialSearchResumeCheckpoint,
+  buildElasticRecoveryMetadata,
   classifyCaptureRecoveryDisposition,
+  crossDeviceRetryAgentDailyUsageEligible,
   crossDeviceRetryAgentSupportsTask,
   crossDeviceRetryItemNeedsManualSafety,
   crossDeviceRetrySourceAgentIdsForItems,
   crossDeviceRetryTaskSupported,
+  dispatchCrossDeviceRetry,
   elasticAttemptBudgetAfterOutcome,
+  expectedElasticKeywordSearches,
   projectElasticAttemptBudget,
+  projectElasticBootstrapPacing,
   elasticRecoveryHoldRemainingMs,
+  evaluateObservedCompletionCandidate,
   isProfilePatrolTask,
+  isExplicitUserCancellationSnapshot,
   lockActiveCaptureAgentSession,
+  mirrorTaskSnapshot,
   negativePatrolTargetResults,
   orchestrationCheckpointEntries,
   orchestrationCheckpointInteger,
   orchestrationCheckpointTimestamp,
+  orchestrationParentAcceptsProjection,
   projectElasticKeywordRecoveryStatus,
+  projectCanceledChildItemStatus,
+  reconcileAutomaticCaptureRetries,
+  reconcileElasticCaptureLeases,
+  reconcilePendingCaptureCommands,
   resolveStopCommandOutcome,
   supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
@@ -92,6 +116,58 @@ test("capture agents distinguish browser profiles while retaining their environm
   );
 });
 
+test("local closure reuse fencing only applies to marked keyword executions", () => {
+  assert.equal(
+    captureItemRequiresLocalClosureReuseFence({
+      itemType: "keyword",
+      sourceExecutionMetadata: {requiresLocalClosureReuseFenceV1: true},
+    }),
+    true,
+  );
+  assert.equal(
+    captureItemRequiresLocalClosureReuseFence({
+      itemType: "keyword",
+      sourceExecutionMetadata: {},
+    }),
+    false,
+  );
+  for (const itemType of ["negative_post", "watched_content"]) {
+    assert.equal(
+      captureItemRequiresLocalClosureReuseFence({
+        itemType,
+        sourceExecutionMetadata: {requiresLocalClosureReuseFenceV1: true},
+      }),
+      false,
+    );
+  }
+});
+
+test("guarded recovery adapters fail closed before an invalid target can widen scope", async () => {
+  const tenantId = "11111111-1111-4111-8111-111111111111";
+  assert.equal(
+    (await reconcilePendingCaptureCommands({
+      taskId: "22222222-2222-4222-8222-222222222222",
+    })).error,
+    "tenant_scope_required",
+  );
+  assert.equal(
+    (await reconcileElasticCaptureLeases({
+      tenantId,
+      parentTaskIds: ["not-a-uuid"],
+      limit: 1,
+    })).error,
+    "invalid_parent_task_scope",
+  );
+  assert.equal(
+    (await reconcileAutomaticCaptureRetries({
+      tenantId,
+      taskIds: [],
+      limit: 1,
+    })).error,
+    "invalid_task_scope",
+  );
+});
+
 test("agent platform assignment is bounded, normalized, and deduplicated", () => {
   assert.deepEqual(
     normalizeCaptureAgentPlatforms(["xhs", "douyin", "DOUYIN", "unknown", "weibo"]),
@@ -107,9 +183,10 @@ test("physical Agent slots ignore attention history but block live commands", as
     "claimed",
     "running",
     "recovering",
+    "interrupted",
     "resume_requested",
   ]);
-  assert.equal(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes("interrupted"), false);
+  assert.equal(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes("interrupted"), true);
   assert.equal(CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES.includes("needs_action"), false);
 
   let statement = null;
@@ -207,6 +284,252 @@ test("recovery grading keeps captcha current and automates technical or unstarte
     attempt_count: 3,
     error: {code: "TAB_NOT_FOUND"},
   }), {kind: "automatic_attempts_exhausted", automatic: false});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    attempt_count: 9,
+    error: {code: "TAB_NOT_FOUND"},
+  }, {phase: "duty"}), {kind: "auto_retry_or_handoff", automatic: true});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    attempt_count: 9,
+    error: {code: "IDENTITY_MISMATCH"},
+  }, {phase: "duty"}), {kind: "terminal_business_failure", automatic: false});
+  assert.deepEqual(classifyCaptureRecoveryDisposition({
+    status: "failed",
+    started_at: "2026-08-06T01:00:00.000Z",
+    attempt_count: 9,
+    error: {code: "USER_CANCELLED"},
+  }, {phase: "duty"}), {kind: "terminal_business_failure", automatic: false});
+});
+
+test("duty cross-device retry fails closed before opening a transaction", async () => {
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    recoveryPhase: "duty",
+    automatic: true,
+    requestKey: "11111111-1111-4111-8111-111111111111",
+    dutyRecoveryIntentId: "11111111-1111-4111-8111-111111111111",
+    dutyRecoveryGeneration: 1,
+    itemIds: [
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ],
+    expectedItemRevision: 1,
+    expectedAttemptNumber: 3,
+  }), {error: "invalid_duty_recovery_request"});
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    itemIds: ["not-a-uuid"],
+  }), {error: "invalid_retry_item_scope"});
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    safetyHandoff: {
+      count: 0,
+      challengeCode: 'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+      sourcePlatformAccountId: 'source-account',
+      sourceLoginState: 'authenticated',
+      requireDistinctPlatformAccount: true,
+      requireSourceLineageQuiet: true,
+    },
+  }), {error: 'invalid_duty_recovery_request'});
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    tenantId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    taskId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    requestKey: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    expectedRevision: 1,
+    recoveryPhase: 'duty',
+    automatic: true,
+    dutyRecoveryIntentId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    dutyRecoveryLeaseToken: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    dutyRecoveryGeneration: 1,
+    itemIds: ['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'],
+    expectedItemRevision: 1,
+    expectedAttemptNumber: 1,
+    expectedSourceAttemptId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+    safetyHandoff: {
+      count: 0,
+      challengeCode: 'DOUYIN_SEARCH_SECURITY_CHALLENGE',
+      sourcePlatformAccountId: 'source-account',
+      sourceLoginState: 'authenticated',
+      requireDistinctPlatformAccount: true,
+      requireSourceLineageQuiet: true,
+    },
+  }), {
+    error: 'retry_requires_manual_safety_action',
+    code: 'HUMAN_REQUIRED',
+    humanRequired: true,
+    reason: 'source_local_closure_proof_unavailable',
+  });
+});
+
+test('search-challenge handoff is counted independently without blocking the elastic queue', () => {
+  const projection = readRouteSection(
+    'export function projectElasticKeywordRecoveryStatus({',
+    'export function isExplicitUserCancellationSnapshot',
+  );
+  assert.match(projection, /safetyHandoffCount = 0/u);
+  assert.match(projection, /sourceLocalClosureProven = false/u);
+  assert.match(projection, /agentAttemptLimit/u);
+  assert.match(projection, /normalizedAttemptCount >= normalizedAttemptLimit/u);
+  assert.match(projection, /A challenge belongs to the source account\/session/u);
+  assert.doesNotMatch(projection, /ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS/u);
+
+  const elasticClaim = readRouteSection(
+    'async function dispatchNextElasticWorkItem',
+    "router.post('/agent/liveness'",
+  );
+  assert.doesNotMatch(elasticClaim, /CAPTURE_SAFETY_HANDOFF_SEARCH_CODES/u);
+  assert.match(elasticClaim, /item\.status = 'retryable'/u);
+  assert.match(
+    elasticClaim,
+    /CASE WHEN item\.status = 'pending' THEN 0 ELSE 1 END/u,
+  );
+  assert.doesNotMatch(elasticClaim, /ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS/u);
+  assert.match(
+    elasticClaim,
+    /!neverOpened[\s\S]*localClosureProof\.proven !== true/u,
+    'a marked source must remain fenced until exact local closure is proven',
+  );
+
+  const dutyDispatch = readRouteSection(
+    'export async function dispatchCrossDeviceRetry',
+    'export async function reconcileElasticCaptureLeases',
+  );
+  assert.match(
+    dutyDispatch,
+    /source_local_closure_proof_unavailable/u,
+  );
+  assert.ok(
+    dutyDispatch.indexOf('source_local_closure_proof_unavailable') <
+      dutyDispatch.indexOf('return await withTransaction'),
+  );
+  assert.match(dutyDispatch, /evaluateCaptureSafetyHandoff/u);
+  assert.match(dutyDispatch, /sourcePlatformAccountId/u);
+  assert.match(dutyDispatch, /targetPlatformAccountId/u);
+  assert.match(dutyDispatch, /source_lineage_silent/u);
+  assert.match(
+    dutyDispatch,
+    /safety_handoff_count = safety_handoff_count \+[\s\S]*safety_handoff_count = 0/u,
+  );
+  assert.match(dutyDispatch, /FOR SHARE OF binding, account/u);
+  assert.match(dutyDispatch, /source_lineage_silent = false/u);
+  assert.ok(
+    (dutyDispatch.match(/loadVerifiedCaptureLocalClosureProof\(/gu) || [])
+      .length >= 2,
+    'safety handoff must verify local closure at source classification and again before writes',
+  );
+  const closureProofLoader = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      'async function loadVerifiedCaptureLocalClosureProof',
+    ),
+    captureCloudRouteSource.indexOf(
+      'export async function dispatchCrossDeviceRetry',
+    ),
+  );
+  assert.match(closureProofLoader, /FROM capture_task_snapshots snapshot/u);
+  assert.match(closureProofLoader, /snapshot\.attempt_id/u);
+  assert.match(closureProofLoader, /snapshot\.agent_id = \$3::uuid/u);
+  assert.match(
+    closureProofLoader,
+    /snapshot\.metadata->'localClosures' AS local_closures/u,
+  );
+  assert.match(closureProofLoader, /selectCaptureLocalClosureEvidence\(/u);
+  assert.match(closureProofLoader, /expectedItemId: expected\.itemId/u);
+  assert.match(
+    closureProofLoader,
+    /expectedItemAttemptId: expected\.itemAttemptId/u,
+  );
+  assert.match(
+    closureProofLoader,
+    /execution_attempt\.client_attempt_id = snapshot\.client_attempt_id/u,
+  );
+  assert.match(closureProofLoader, /expectedSnapshotRevision/u);
+  assert.doesNotMatch(
+    closureProofLoader,
+    /snapshot\.metadata \? 'localClosure'/u,
+    'the latest terminal snapshot stays authoritative even if its proof is missing',
+  );
+});
+
+test("only explicit operator cancellation is terminal", () => {
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: true,
+      explicitUserCancellation: true,
+    }),
+    "canceled",
+  );
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: true,
+      explicitUserCancellation: false,
+    }),
+    "retryable",
+  );
+  assert.equal(
+    projectCanceledChildItemStatus({
+      elasticPool: false,
+      explicitUserCancellation: false,
+    }),
+    "needs_action",
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {stopCommandId: "11111111-1111-4111-8111-111111111111"}},
+      {status: "canceled", error: {}},
+    ),
+    true,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "USER_CANCELED", category: "user_canceled"},
+      },
+    ),
+    true,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "runner_owner_disconnected"},
+        message: "用户手动中止当前采集任务",
+      },
+    ),
+    false,
+  );
+  assert.equal(
+    isExplicitUserCancellationSnapshot(
+      {metadata: {}},
+      {
+        status: "canceled",
+        error: {code: "STALE_TASK_HEARTBEAT_TIMEOUT", retryable: true},
+      },
+    ),
+    false,
+  );
+});
+
+test("elastic timeout fences reject stale snapshots from the revoked attempt", () => {
+  const mirror = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "async function dispatchNextElasticWorkItem",
+  );
+  assert.match(
+    mirror,
+    /ELASTIC_AGENT_OFFLINE_TIMEOUT[\s\S]*ELASTIC_TASK_HEARTBEAT_TIMEOUT/u,
+  );
+  assert.match(
+    mirror,
+    /EXCLUDED\.attempt_number = capture_tasks\.attempt_number/u,
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /unexpectedChildCancellation/u,
+  );
+  assert.match(captureCloudRouteSource, /UNEXPECTED_TASK_CANCELLATION/u);
 });
 
 test("elastic keyword recovery is patient, bounded, and escalates safety only after a cross-Agent check", () => {
@@ -220,25 +543,75 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "needs_action",
     error: safety,
     attemptCount: 1,
+    sourceLocalClosureProven: true,
   }), "retryable");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'needs_action',
+    error: {
+      code: 'PAGE_CHALLENGE_BLOCK',
+      securityBlocked: true,
+    },
+    attemptCount: 1,
+    safetyHandoffCount: 0,
+  }), 'needs_action');
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "needs_action",
     error: safety,
     attemptCount: 2,
+    safetyHandoffCount: 1,
+    sourceLocalClosureProven: true,
   }), "needs_action");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'needs_action',
+    error: safety,
+    attemptCount: 2,
+    agentAttemptLimit: 6,
+  }), 'retryable', 'one challenged account must not freeze the keyword');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'needs_action',
+    error: safety,
+    attemptCount: 6,
+    agentAttemptLimit: 6,
+  }), 'needs_action', 'all distinct candidate accounts bound the relay');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "needs_action",
+    error: safety,
+    attemptCount: 99,
+    safetyHandoffCount: 0,
+    sourceLocalClosureProven: true,
+  }), "needs_action");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'needs_action',
+    error: safety,
+    attemptCount: 1,
+    safetyHandoffCount: 0,
+  }), 'retryable');
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     attemptCount: 2,
-  }), "retryable");
+  }), "failed");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     attemptCount: 3,
   }), "failed");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "failed",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    attemptCount: 0,
+    technicalLimitReached: true,
+    agentAttemptLimit: 6,
+  }), "retryable");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: false,
     status: "needs_action",
@@ -256,12 +629,31 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "retryable",
     error: safety,
     updated_at: "2026-08-12T01:50:00.000Z",
-  }, now), 20 * 60_000);
+  }, now), 0);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: safety,
+    updated_at: "2026-08-12T01:58:00.000Z",
+  }, now), 0, "verification fences only the keyword and source account pair");
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: safety,
+    checkpoint: {
+      recovery: {operatorHoldReleasedAt: "2026-08-12T01:59:00.000Z"},
+    },
+    updated_at: "2026-08-12T01:59:30.000Z",
+  }, now), 0, "operator verification must clear the source account hold");
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     updated_at: "2026-08-12T01:55:00.000Z",
   }, now), 0);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    execution_finished_at: "2026-08-12T01:55:00.000Z",
+    updated_at: "2026-08-12T01:59:59.000Z",
+  }, now), 0, "heartbeats must not restart a finished recovery cooldown");
 });
 
 test("elastic queue does not spend business retries on local capacity or dispatch failures", () => {
@@ -271,9 +663,30 @@ test("elastic queue does not spend business retries on local capacity or dispatc
   assert.equal(elasticAttemptBudgetAfterOutcome(2, {
     error: {code: "create_command_expired"},
   }), 1);
+  assert.equal(elasticAttemptBudgetAfterOutcome(3, {
+    error: {code: "unattended_begin_fence_changed"},
+  }), 2);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "UNATTENDED_STATUS_REPORT_TIMEOUT"},
+  }), 1);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "UNATTENDED_STATUS_REPORT_REJECTED"},
+  }), 1);
+  assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+    error: {code: "UNATTENDED_ATTEMPT_REPLACED"},
+  }), 1);
   assert.equal(elasticAttemptBudgetAfterOutcome(2, {
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
-  }), 2);
+  }), 1);
+  for (const code of [
+    "capture_task_debug_starvoice_active",
+    "capture_task_external_debugger_busy",
+    "capture_task_debug_ownership_unknown",
+  ]) {
+    assert.equal(elasticAttemptBudgetAfterOutcome(2, {
+      error: {code},
+    }), 1, `${code} must hand off without spending a business retry`);
+  }
   const firstProjection = projectElasticAttemptBudget({
     attempt_count: 3,
     metadata: {elasticAttemptBudgetUsed: 3},
@@ -291,17 +704,94 @@ test("elastic queue does not spend business retries on local capacity or dispatc
   assert.equal(replayProjection.attemptBudget, 2);
   assert.equal(replayProjection.refunded, false);
 
+  const firstBootstrapProjection = projectElasticAttemptBudget({
+    attempt_count: 1,
+    metadata: {elasticAttemptBudgetUsed: 1},
+  }, {
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+  }, "21111111-1111-4111-8111-111111111111");
+  assert.equal(firstBootstrapProjection.attemptBudget, 0);
+  assert.equal(firstBootstrapProjection.technicalAttemptCount, 1);
+  assert.equal(firstBootstrapProjection.technicalLimitReached, false);
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'failed',
+    error: {code: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED'},
+    attemptCount: 1,
+    technicalLimitReached: firstBootstrapProjection.technicalLimitReached,
+  }), 'retryable');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'failed',
+    error: {code: 'BUSINESS_CAPTURE_FAILED'},
+    attemptCount: 2,
+  }), 'failed');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'failed',
+    error: {code: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED'},
+    attemptCount: 2,
+  }), 'failed');
+  const thirdBootstrapProjection = projectElasticAttemptBudget({
+    attempt_count: 3,
+    metadata: {
+      elasticAttemptBudgetUsed: 1,
+      elasticTechnicalAttemptCount: 2,
+    },
+  }, {
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+  }, "31111111-1111-4111-8111-111111111111");
+  assert.equal(thirdBootstrapProjection.attemptBudget, 0);
+  assert.equal(thirdBootstrapProjection.technicalAttemptCount, 3);
+  assert.equal(thirdBootstrapProjection.technicalLimitReached, true);
+
   const now = Date.parse("2026-08-13T02:00:00.000Z");
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: {code: "capture_task_group_busy"},
     updated_at: "2026-08-13T01:45:00.000Z",
-  }, now), 15 * 60_000);
+  }, now), 0);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "capture_task_group_busy"},
+    updated_at: "2026-08-13T01:58:00.000Z",
+  }, now), 3 * 60_000);
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: {code: "elastic_task_heartbeat_timeout"},
     updated_at: "2026-08-13T01:55:00.000Z",
   }, now), 5 * 60_000);
+});
+
+test("elastic bootstrap pacing staggers healthy starts and only adds a short congestion delay", () => {
+  const now = "2026-08-24T00:00:00.000Z";
+  const healthy = projectElasticBootstrapPacing({
+    seed: "tenant:item:agent",
+    now,
+  });
+  const replay = projectElasticBootstrapPacing({
+    seed: "tenant:item:agent",
+    now,
+  });
+  assert.deepEqual(replay, healthy);
+  assert.equal(healthy.bootstrapPacingReason, "staggered_start");
+  assert.ok(healthy.bootstrapDelayMs >= 0);
+  assert.ok(healthy.bootstrapDelayMs <= 18_000);
+
+  const congested = projectElasticBootstrapPacing({
+    seed: "tenant:item:agent",
+    recentFailureCount: 5,
+    recentAffectedAgentCount: 3,
+    now,
+  });
+  assert.equal(
+    congested.bootstrapPacingReason,
+    "recent_technical_congestion",
+  );
+  assert.ok(congested.bootstrapDelayMs > healthy.bootstrapDelayMs);
+  assert.ok(congested.bootstrapDelayMs <= 45_000);
+  assert.equal(congested.recentTechnicalFailureCount, 5);
+  assert.equal(congested.recentAffectedAgentCount, 3);
 });
 
 test("automatic relay excludes devices per selected item instead of per parent task", () => {
@@ -336,6 +826,59 @@ test("cross-device retry requires exact workflow capabilities and blocks safety 
   assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
     task_type: "followed_creator_post_patrol",
     platform: "douyin",
+  }), true);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      taskStateKnown: true,
+      heartbeatDegraded: true,
+    },
+  }, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }), true);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      taskStateKnown: false,
+      heartbeatDegraded: true,
+    },
+  }, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }, {
+    dutyRecovery: {intentId: "11111111-1111-4111-8111-111111111111"},
+  }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      remoteStop: true,
+    },
+  }, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }, {
+    dutyRecovery: {intentId: "11111111-1111-4111-8111-111111111111"},
+  }), false);
+  assert.equal(crossDeviceRetryAgentSupportsTask({
+    ...baseAgent,
+    capabilities: {
+      ...baseAgent.capabilities,
+      remoteStop: true,
+      dutyRecoveryLineageV1: true,
+    },
+  }, {
+    task_type: "followed_creator_post_patrol",
+    platform: "douyin",
+  }, {
+    dutyRecovery: {intentId: "11111111-1111-4111-8111-111111111111"},
   }), true);
   assert.equal(crossDeviceRetryAgentSupportsTask(baseAgent, {
     task_type: "negative_post_patrol",
@@ -389,7 +932,7 @@ test("cross-device retry requires exact workflow capabilities and blocks safety 
   }), true);
   assert.equal(crossDeviceRetryItemNeedsManualSafety({
     metadata: {checkpoint: {requiresManualAction: true}},
-  }), true);
+  }), false);
   assert.equal(crossDeviceRetryItemNeedsManualSafety({
     error: {code: "LOGIN_REQUIRED", category: "login_required"},
   }), true);
@@ -429,6 +972,414 @@ test("cloud task snapshots normalize local ledger aliases and timestamps", () =>
     normalizeCloudTaskSnapshot({id: "historical-task", status: "failed"}).controlTaskId,
     "",
   );
+});
+
+test("local closure has one top-level heartbeat channel and metadata cannot forge it", () => {
+  const localClosure = {
+    version: 1,
+    requestId: "closure-task",
+    attemptId: "closure-attempt",
+    itemId: "11111111-1111-4111-8111-111111111111",
+    itemAttemptId: "22222222-2222-4222-8222-222222222222",
+    attemptNumber: 1,
+    assignmentRevision: 3,
+    snapshotRevision: 9,
+    terminalStatus: "needs_action",
+    terminalUpdatedAt: "2026-08-27T00:59:00.000Z",
+    closedAt: "2026-08-27T00:59:10.000Z",
+    terminalLedgerConfirmed: true,
+    runnerTabCount: 0,
+    platformTaskTabCount: 0,
+    detailTaskTabCount: 0,
+    ownedTaskTabCount: 0,
+    executionLockPresent: false,
+    debugSessionPresent: false,
+    taskSessionPresent: false,
+    taskOwnerPresent: false,
+    pendingCheckpointReportCount: 0,
+    businessUploadEvidenceKnown: true,
+    streamingSyncDrainCompleted: true,
+    streamingSyncEnabled: false,
+    streamingSyncEnqueuedCount: 0,
+    streamingSyncProcessedCount: 0,
+    streamingSyncSuccessCount: 0,
+    streamingSyncFailedCount: 0,
+    streamingSyncSkippedCount: 0,
+    streamingSyncPendingCount: 0,
+    streamingSyncActiveCount: 0,
+    streamingSyncRemainingCount: 0,
+    streamingSyncCapturedUniqueCount: 0,
+    streamingSyncEnqueuedUniqueCount: 0,
+    streamingSyncExcludedUniqueCount: 0,
+    streamingSyncSucceededUniqueCount: 0,
+    streamingSyncBlocked: false,
+    streamingSyncCanceled: false,
+    capturedRecordCount: 0,
+  };
+  const promoted = normalizeCloudTaskSnapshot({
+    id: "closure-task",
+    status: "needs_action",
+    localClosure,
+    metadata: {localClosure: {...localClosure, attemptId: "forged"}},
+  });
+  assert.deepEqual(promoted.metadata.localClosure, localClosure);
+
+  const metadataOnly = normalizeCloudTaskSnapshot({
+    id: "closure-task",
+    status: "needs_action",
+    metadata: {localClosure},
+  });
+  assert.equal(metadataOnly.metadata.localClosure, undefined);
+
+  const secondClosure = {
+    ...localClosure,
+    itemId: "44444444-4444-4444-8444-444444444444",
+    itemAttemptId: "55555555-5555-4555-8555-555555555555",
+    attemptNumber: 2,
+  };
+  const plural = normalizeCloudTaskSnapshot({
+    id: "closure-task",
+    status: "needs_action",
+    localClosure,
+    localClosures: [localClosure, secondClosure],
+    metadata: {
+      localClosures: [{...secondClosure, attemptId: "forged"}],
+    },
+  });
+  assert.deepEqual(plural.metadata.localClosures, [localClosure, secondClosure]);
+  const pluralMetadataOnly = normalizeCloudTaskSnapshot({
+    id: "closure-task",
+    status: "needs_action",
+    metadata: {localClosures: [localClosure, secondClosure]},
+  });
+  assert.equal(pluralMetadataOnly.metadata.localClosures, undefined);
+});
+
+test("cloud task snapshots preserve bounded structured health without browser secrets", () => {
+  const snapshot = normalizeCloudTaskSnapshot({
+    id: "local-task-health-1",
+    type: "unattended_keyword_plan",
+    platform: "douyin",
+    status: "running",
+    attemptId: "attempt-health-1",
+    attemptNumber: 3,
+    appVersion: "0.3.93",
+    stage: "DETAIL_CAPTURE",
+    phase: "COMMENTS",
+    progressObserved: {
+      observed: true,
+      sequence: 999999999,
+      current: 4,
+      total: 12,
+      observedAt: "2026-08-25T01:50:00.000Z",
+      ageMs: 999999999,
+      url: "https://www.douyin.com/search/private",
+      cookie: "session=secret",
+    },
+    healthEvidence: {
+      version: 99,
+      sampledAt: "2026-08-25T01:50:01.000Z",
+      page: {
+        platform: "douyin",
+        pageType: "note_detail",
+        platformMatchesTask: true,
+        detailReady: false,
+        detailReadyReason: "dom_not_ready",
+        tabStatus: "complete",
+        discarded: false,
+        frozen: true,
+        url: "https://www.douyin.com/video/private",
+        title: "private title",
+      },
+      network: {
+        available: true,
+        status: "success",
+        lastRequestLatencyMs: 999999999,
+        lastRequestAt: "2026-08-25T01:50:02.000Z",
+        endpointClass: "heartbeat",
+        timeoutCount: 999999999,
+        url: "https://api.example.test/private",
+        authorization: "Bearer secret",
+      },
+      runtime: {
+        sampledAt: "2026-08-25T01:50:03.000Z",
+        stateAgeMs: 999999999,
+        captureProgressAgeMs: 999999999,
+        cpuAvailable: false,
+        eventLoopAvailable: true,
+        eventLoopSampleCount: 99,
+        eventLoopLagMs: 999999999,
+        heapAvailable: true,
+        heapUsedMb: 999999999,
+        heapTotalMb: 999999999,
+        heapLimitMb: 999999999,
+        serviceWorkerAgeMs: 999999999,
+        serviceWorkerRestartCount: 999999999,
+        body: "private post body",
+      },
+    },
+    metadata: {
+      structuredTaskHealth: {
+        appVersion: "attacker-controlled",
+        healthEvidence: {url: "https://evil.example/private"},
+      },
+    },
+  });
+
+  assert.equal(snapshot.appVersion, "0.3.93");
+  assert.equal(snapshot.stage, "detail_capture");
+  assert.equal(snapshot.phase, "comments");
+  assert.deepEqual(snapshot.progressObserved, {
+    observed: true,
+    sequence: 1000000,
+    current: 4,
+    total: 12,
+    observedAt: "2026-08-25T01:50:00.000Z",
+    ageMs: 7 * 24 * 60 * 60 * 1000,
+  });
+  assert.equal(snapshot.healthEvidence.version, 10);
+  assert.equal(snapshot.healthEvidence.page.tabStatus, "complete");
+  assert.equal(snapshot.healthEvidence.network.lastRequestLatencyMs, 120000);
+  assert.equal(snapshot.healthEvidence.network.timeoutCount, 1000000);
+  assert.equal(snapshot.healthEvidence.runtime.eventLoopSampleCount, 10);
+  assert.equal(snapshot.healthEvidence.runtime.eventLoopLagMs, 120000);
+  assert.equal(snapshot.healthEvidence.runtime.heapUsedMb, 1024 * 1024);
+  assert.equal(
+    snapshot.healthEvidence.runtime.serviceWorkerAgeMs,
+    7 * 24 * 60 * 60 * 1000,
+  );
+  assert.deepEqual(
+    snapshot.metadata.structuredTaskHealth,
+    snapshot.structuredTaskHealth,
+    "task metadata must use the authoritative top-level health snapshot",
+  );
+
+  const serialized = JSON.stringify(snapshot.structuredTaskHealth);
+  assert.ok(Buffer.byteLength(serialized, "utf8") < 4096);
+  assert.doesNotMatch(
+    serialized,
+    /https?:\/\/|cookie|authorization|bearer|private title|private post body|attacker-controlled/iu,
+  );
+
+  const rejectedVersion = normalizeCloudTaskSnapshot({
+    id: "local-task-health-bad-version",
+    appVersion: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.signature123",
+    stage: "apiKeyProdABC123",
+    phase: "aB3dE5fG7hJ9kL1mN3pR5tV7xZ9cD2fH",
+    healthEvidence: {
+      page: {
+        platform: "private/path",
+        pageType: "https://collector.example/private",
+        detailReadyReason: "password_prod_ABC123",
+      },
+      network: {
+        status: "secret_prod_ABC123",
+        endpointClass: "0123456789abcdef0123456789abcdef01234567",
+      },
+    },
+  });
+  assert.equal(rejectedVersion.appVersion, "");
+  assert.equal(rejectedVersion.stage, "unknown");
+  assert.equal(rejectedVersion.phase, "unknown");
+  assert.equal(rejectedVersion.healthEvidence.page.platform, "unknown");
+  assert.equal(rejectedVersion.healthEvidence.page.pageType, "unknown");
+  assert.equal(rejectedVersion.healthEvidence.page.detailReadyReason, "");
+  assert.equal(rejectedVersion.healthEvidence.network.status, "unavailable");
+  assert.equal(rejectedVersion.healthEvidence.network.endpointClass, "");
+  assert.equal(
+    rejectedVersion.healthEvidence.network.lastRequestLatencyMs,
+    null,
+  );
+  assert.equal(rejectedVersion.healthEvidence.runtime.eventLoopLagMs, null);
+  assert.doesNotMatch(
+    JSON.stringify(rejectedVersion.structuredTaskHealth),
+    /collector\.example|private\/path|eyJhbGci|apiKeyProd|aB3dE5fG|password_prod|secret_prod|0123456789abcdef/iu,
+  );
+
+  const identityShapedHealth = normalizeCloudTaskSnapshot({
+    id: "local-task-health-identity-shaped",
+    attemptId: "attempt-health-identity-shaped",
+    stage: "AKIAIOSFODNN7EXAMPLE",
+    phase: "prod-db.internal",
+    healthEvidence: {
+      page: {
+        platform: "192.168.1.7",
+        pageType: "customer_13800138000",
+        detailReadyReason: "AKIAIOSFODNN7EXAMPLE",
+        tabStatus: "prod-db.internal",
+      },
+      network: {
+        status: "customer_13800138000",
+        endpointClass: "prod-db.internal",
+      },
+    },
+  });
+  assert.equal(identityShapedHealth.stage, "unknown");
+  assert.equal(identityShapedHealth.phase, "unknown");
+  assert.equal(identityShapedHealth.healthEvidence.page.platform, "unknown");
+  assert.equal(identityShapedHealth.healthEvidence.page.pageType, "unknown");
+  assert.equal(identityShapedHealth.healthEvidence.page.detailReadyReason, "");
+  assert.equal(
+    identityShapedHealth.healthEvidence.page.tabStatus,
+    "unavailable",
+  );
+  assert.equal(
+    identityShapedHealth.healthEvidence.network.status,
+    "unavailable",
+  );
+  assert.equal(identityShapedHealth.healthEvidence.network.endpointClass, "");
+  assert.doesNotMatch(
+    JSON.stringify(identityShapedHealth.structuredTaskHealth),
+    /AKIAIOSFODNN7EXAMPLE|prod-db\.internal|192\.168\.1\.7|13800138000/iu,
+  );
+});
+
+test("legacy reports without an attempt id cannot bind or persist structured health", () => {
+  const normalized = normalizeCloudTaskSnapshot({
+    id: "legacy-unbound-health",
+    attemptNumber: 3,
+    progressSeq: 99,
+    appVersion: "0.3.93",
+    stage: "detail_capture",
+    phase: "comments",
+    progressObserved: {observed: true, current: 4, total: 12},
+    healthEvidence: {
+      page: {platform: "douyin", pageType: "note_detail"},
+      network: {available: true, status: "success"},
+    },
+  });
+
+  assert.ok(normalized.metadata.structuredTaskHealth);
+  const persisted = bindCloudTaskSnapshotHealthToAttempt(normalized);
+  assert.equal(persisted.attemptId, "");
+  assert.equal(persisted.appVersion, "");
+  assert.equal(persisted.stage, "unknown");
+  assert.equal(persisted.phase, "unknown");
+  assert.deepEqual(persisted.progressObserved, {});
+  assert.deepEqual(persisted.healthEvidence, {});
+  assert.deepEqual(persisted.structuredTaskHealth, {});
+  assert.equal(
+    Object.hasOwn(persisted.metadata, "structuredTaskHealth"),
+    false,
+  );
+  assert.ok(
+    normalized.metadata.structuredTaskHealth,
+    "binding must not mutate the normalized report used by other consumers",
+  );
+});
+
+test("health metadata aliases cannot bypass authoritative attempt-scoped health", () => {
+  const aliases = {
+    structuredTaskHealth: {stage: "comments"},
+    structured_task_health: {stage: "comments"},
+    agentPlanAudit: {stage: "comments"},
+    agent_plan_audit: {stage: "comments"},
+    healthEvidence: {network: {status: "success"}},
+    health_evidence: {network: {status: "success"}},
+    runtimeHealth: {eventLoopLagMs: 1},
+    runtime_health: {eventLoopLagMs: 1},
+    appVersion: "0.3.93",
+    app_version: "0.3.93",
+    stage: "comments",
+    phase: "comments",
+    progressObserved: {observed: true},
+    progress_observed: {observed: true},
+  };
+  const aliasKeys = Object.keys(aliases);
+  const normalized = normalizeCloudTaskSnapshot({
+    id: "attempt-bound-alias-health",
+    attemptId: "attempt-alias-A",
+    metadata: aliases,
+    appVersion: "0.3.93",
+    stage: "detail_capture",
+    healthEvidence: {network: {available: true, status: "success"}},
+  });
+
+  assert.equal(normalized.metadata.structuredTaskHealth.appVersion, "0.3.93");
+  assert.equal(normalized.metadata.structuredTaskHealth.stage, "detail_capture");
+  for (const key of aliasKeys) {
+    if (key === "structuredTaskHealth") continue;
+    assert.equal(Object.hasOwn(normalized.metadata, key), false, key);
+  }
+
+  const unbound = bindCloudTaskSnapshotHealthToAttempt({
+    ...normalized,
+    attemptId: "",
+    metadata: aliases,
+  });
+  for (const key of aliasKeys) {
+    assert.equal(Object.hasOwn(unbound.metadata, key), false, key);
+  }
+  assert.deepEqual(unbound.structuredTaskHealth, {});
+});
+
+test("attempt identity may upgrade from legacy empty but never downgrade or cross-bind", () => {
+  assert.equal(cloudTaskAttemptIdentityAcceptsSnapshot("", ""), true);
+  assert.equal(cloudTaskAttemptIdentityAcceptsSnapshot("", "attempt-A"), true);
+  assert.equal(
+    cloudTaskAttemptIdentityAcceptsSnapshot("attempt-A", "attempt-A"),
+    true,
+  );
+  assert.equal(cloudTaskAttemptIdentityAcceptsSnapshot("attempt-A", ""), false);
+  assert.equal(
+    cloudTaskAttemptIdentityAcceptsSnapshot("attempt-A", "attempt-B"),
+    false,
+  );
+});
+
+test("an empty-id replay performs no projection write after attempt A owns the slot", async () => {
+  const currentTask = {
+    id: "task-db-A",
+    status: "running",
+    attempt_number: 3,
+    progress_seq: 40,
+    progress: {current: 4, total: 12},
+    checkpoint: {activeKeywordIndex: 4},
+    error: {},
+    metadata: {structuredTaskHealth: {appVersion: "0.3.93"}},
+  };
+  const statements = [];
+  const tx = {
+    async queryOne(sql) {
+      statements.push(sql);
+      if (sql.includes("occupied_attempt.client_attempt_id")) {
+        return {
+          id: currentTask.id,
+          status: currentTask.status,
+          attempt_number: currentTask.attempt_number,
+          occupied_attempt_id: "attempt-A",
+        };
+      }
+      if (sql.includes("SELECT *") && sql.includes("WHERE id = $1")) {
+        return structuredClone(currentTask);
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    },
+    async execute(sql) {
+      throw new Error(`unexpected write: ${sql}`);
+    },
+  };
+  const replay = normalizeCloudTaskSnapshot({
+    id: "legacy-unbound-replay",
+    attemptId: "",
+    attemptNumber: 3,
+    progressSeq: 999,
+    status: "failed",
+    progress: {current: 0, total: 12},
+    checkpoint: {activeKeywordIndex: 0},
+    error: {code: "LATE_LEGACY_FAILURE"},
+    appVersion: "0.3.93",
+    healthEvidence: {page: {platform: "douyin"}},
+  });
+
+  const result = await mirrorTaskSnapshot(
+    tx,
+    {id: "agent-A", tenant_id: "tenant-A"},
+    replay,
+  );
+  assert.deepEqual(result, currentTask);
+  assert.equal(statements.length, 2);
+  assert.equal(statements.some(sql => /INSERT|UPDATE/iu.test(sql)), false);
 });
 
 test("targeted physical run ids normalize to their canonical business task", () => {
@@ -703,6 +1654,159 @@ test("orchestration checkpoint projection never reopens a terminal activeKeyword
   );
 });
 
+test("Douyin service-abnormal settles only the active keyword as an explicit empty result", () => {
+  const projection = readRouteSection(
+    "async function projectOrchestrationSnapshot",
+    "export async function mirrorTaskSnapshot",
+  );
+  assert.match(projection, /DOUYIN_SEARCH_SERVICE_ABNORMAL/u);
+  assert.match(projection, /keywordServiceAbnormal \? 'completed'/u);
+  assert.match(projection, /resultKind: 'no_search_results'/u);
+  assert.match(projection, /'noResults', \$12::boolean/u);
+  assert.match(projection, /activeUnresolvedStatus = childServiceAbnormalSettlesEmpty[\s\S]*\? 'completed'/u);
+  assert.match(projection, /released_after_prior_keyword_no_results/u);
+  assert.doesNotMatch(
+    projection,
+    /baseUnresolvedStatus = childServiceAbnormalSettlesEmpty\s*\? 'completed'/u,
+    "one empty keyword must not falsely complete untouched siblings",
+  );
+});
+
+test("sequential Douyin checkpoints retain both passes and resume only the unfinished pass", () => {
+  const runningEntries = orchestrationCheckpointEntries({
+    status: "running",
+    progress: {keyword: "别克壁纸", roundCurrent: 2},
+    checkpoint: {
+      round: 2,
+      activeKeyword: "别克壁纸",
+      keywordResults: [
+        {
+          round: 1,
+          keyword: "别克壁纸",
+          status: "completed",
+          savedCount: 8,
+        },
+      ],
+    },
+  });
+  assert.equal(runningEntries[0].round, 2);
+  assert.equal(runningEntries[0].status, "running");
+  assert.deepEqual(
+    runningEntries[0].searchPassResults.map(entry => [entry.round, entry.status]),
+    [[1, "completed"]],
+  );
+
+  const entries = orchestrationCheckpointEntries({
+    status: "needs_action",
+    checkpoint: {
+      round: 2,
+      activeKeyword: "别克壁纸",
+      keywordResults: [
+        {
+          round: 1,
+          index: 0,
+          keyword: "别克壁纸",
+          status: "completed",
+          attemptCount: 1,
+          savedCount: 8,
+          finishedAt: "2026-08-22T00:10:00.000Z",
+        },
+        {
+          round: 2,
+          index: 0,
+          keyword: "别克壁纸",
+          status: "failed",
+          attemptCount: 1,
+          savedCount: 0,
+          errorCode: "DOUYIN_SEARCH_SECURITY_CHALLENGE",
+          finishedAt: "2026-08-22T00:12:00.000Z",
+        },
+      ],
+    },
+  });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].round, 2);
+  assert.equal(entries[0].status, "failed");
+  assert.deepEqual(
+    entries[0].searchPassResults.map(entry => [entry.round, entry.status]),
+    [[1, "completed"], [2, "failed"]],
+  );
+
+  const checkpoint = buildSequentialSearchResumeCheckpoint({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    itemMetadata: {checkpoint: entries[0]},
+    keyword: "别克壁纸",
+    now: new Date("2026-08-22T00:15:00.000Z"),
+  });
+  assert.deepEqual(checkpoint, {
+    schemaVersion: 1,
+    round: 2,
+    activeKeywordIndex: 0,
+    activeKeyword: "",
+    activePhase: "pending",
+    keywordResults: [
+      {
+        round: 1,
+        index: 0,
+        keyword: "别克壁纸",
+        status: "completed",
+        attemptCount: 1,
+        savedCount: 8,
+        error: "",
+        finishedAt: "2026-08-22T00:10:00.000Z",
+      },
+    ],
+    updatedAt: "2026-08-22T00:15:00.000Z",
+  });
+  assert.equal(buildSequentialSearchResumeCheckpoint({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    itemMetadata: {
+      checkpoint: {
+        searchPassResults: [
+          {round: 1, keyword: "别克壁纸", status: "failed"},
+        ],
+      },
+    },
+    keyword: "别克壁纸",
+  }), null);
+  assert.equal(expectedElasticKeywordSearches({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    keyword: "别克壁纸",
+  }), 2);
+  assert.equal(expectedElasticKeywordSearches({
+    planSnapshot: {
+      platform: "douyin",
+      searchPasses: ["general", "note"],
+    },
+    itemMetadata: {checkpoint: entries[0]},
+    keyword: "别克壁纸",
+  }), 1);
+});
+
+test("elastic sequential patrol keeps one bounded cross-agent handoff", () => {
+  const refresh = readRouteSection(
+    "async function refreshOrchestrationParentTask",
+    "async function projectNegativePatrolSnapshot",
+  );
+  assert.match(
+    refresh,
+    /const elasticPool = parentMetadata\.distributionMode === 'elastic_pool';[\s\S]*if \(!elasticPool\) \{[\s\S]*automaticRetrySuppressed/u,
+  );
+  assert.doesNotMatch(
+    refresh.slice(0, refresh.indexOf("if (!elasticPool)")),
+    /automaticRetrySuppressed/u,
+  );
+});
+
 test("operator cancellation is absorbing against late child heartbeats", () => {
   const mirror = readRouteSection(
     "async function mirrorTaskSnapshot",
@@ -719,6 +1823,56 @@ test("operator cancellation is absorbing against late child heartbeats", () => {
   assert.match(
     captureCloudRouteSource,
     /capture_task_item_attempts\.status <> 'canceled' OR \$1 = 'canceled'/u,
+  );
+});
+
+test("every settled orchestration parent is absorbing against late projections", () => {
+  for (const status of [
+    "completed",
+    "completed_with_warnings",
+    "completed_with_failures",
+    "failed",
+    "canceled",
+    "skipped",
+    "superseded",
+  ]) {
+    assert.equal(
+      orchestrationParentAcceptsProjection(status),
+      false,
+      `${status} must not be reopened by a late child snapshot`,
+    );
+  }
+  for (const status of ["pending", "running", "needs_action"]) {
+    assert.equal(orchestrationParentAcceptsProjection(status), true);
+  }
+
+  const refresh = readRouteSection(
+    "async function refreshOrchestrationParentTask",
+    "async function projectNegativePatrolSnapshot",
+  );
+  const controlProjection = readRouteSection(
+    "async function projectOrchestrationChildControlOutcome",
+    "async function projectOrchestrationSnapshot",
+  );
+  const snapshotProjection = readRouteSection(
+    "async function projectOrchestrationSnapshot",
+    "export async function mirrorTaskSnapshot",
+  );
+  for (const section of [refresh, controlProjection, snapshotProjection]) {
+    assert.match(
+      section,
+      /if \(!orchestrationParentAcceptsProjection\(parent\.status\)\) return parent;/u,
+    );
+  }
+
+  const leaseRecovery = readRouteSection(
+    "async function reconcileElasticCaptureLeasesInRoute",
+    "export async function reconcileAutomaticCaptureRetries",
+  );
+  assert.match(
+    leaseRecovery,
+    /parent\.status NOT IN \([\s\S]*'completed_with_failures'[\s\S]*'superseded'[\s\S]*\)/u,
+    "restart lease reconciliation must exclude every settled parent",
   );
 });
 
@@ -793,6 +1947,8 @@ test("handoff metadata survives agent snapshots and fences resume on the source 
     "router.post('/agent/heartbeat'",
   );
   for (const field of [
+    "requiresLocalClosureReuseFenceV1",
+    "stoppedBeforeDispatch",
     "handoffRequestHash",
     "handoffRequestKey",
     "handoffSourceExecutionTaskId",
@@ -812,6 +1968,117 @@ test("handoff metadata survives agent snapshots and fences resume on the source 
   assert.match(resume, /task\.metadata\?\.handoffSuccessorTaskId/u);
   assert.match(resume, /task_handed_off/u);
   assert.match(resume, /后续关键词已经转交其他 Agent/u);
+  assert.match(resume, /releasedSafetyAttempts/u);
+  assert.match(resume, /source_account_verification_confirmed/u);
+  assert.match(resume, /operatorHoldReleasedAt/u);
+  assert.match(resume, /source_agent_hold_released/u);
+  assert.ok(
+    resume.indexOf('releasedSafetyAttempts') < resume.indexOf('const existing'),
+    "verification must clear the source hold before a stale resume command can short-circuit it",
+  );
+});
+
+test("server-owned local closure metadata survives snapshots without Agent injection", () => {
+  const mirror = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(
+    mirror,
+    /metadata = \(\s*EXCLUDED\.metadata\s*- 'requiresLocalClosureReuseFenceV1'\s*- 'stoppedBeforeDispatch'\s*\)/u,
+    "an Agent snapshot must not mint either server-owned fence field",
+  );
+  assert.match(
+    mirror,
+    /const agentSnapshotMetadata = \{\.\.\.safeJson\(snapshot\.metadata\)\};[\s\S]*delete agentSnapshotMetadata\.requiresLocalClosureReuseFenceV1;[\s\S]*delete agentSnapshotMetadata\.stoppedBeforeDispatch;[\s\S]*JSON\.stringify\(agentSnapshotMetadata\)/u,
+    "newly discovered snapshots must be stripped before their initial insert too",
+  );
+  for (const field of [
+    "requiresLocalClosureReuseFenceV1",
+    "stoppedBeforeDispatch",
+  ]) {
+    assert.match(
+      mirror,
+      new RegExp(`'${field}', capture_tasks\\.metadata->'${field}'`, "u"),
+      `${field} must round-trip from existing server metadata`,
+    );
+  }
+});
+
+test("historical closure reuse ignores mutable item start after Agent A to B reassignment", () => {
+  const reuseGate = readRouteSection(
+    "async function loadCaptureAgentLocalClosureReuseGate",
+    "export async function dispatchCrossDeviceRetry",
+  );
+  assert.match(reuseGate, /attempt\.agent_id = \$2/u);
+  assert.match(
+    reuseGate,
+    /execution\.started_at IS NULL[\s\S]*attempt\.started_at IS NULL/u,
+    "Agent A's immutable execution and attempt starts define whether A opened",
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /item\.started_at IS NULL/u,
+    "Agent B starting the shared item later must not retroactively change A",
+  );
+
+  const claim = readRouteSection(
+    "async function dispatchNextElasticWorkItem",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(
+    claim,
+    /item\.started_at AS item_started_at[\s\S]*itemStartedAt: candidate\.item_started_at/u,
+    "the current source candidate may still use the item start before reassignment",
+  );
+});
+
+test("current-schema keyword reuse requires exact closure proof while legacy keeps bounded quiescence", () => {
+  const reuseGate = readRouteSection(
+    "async function loadCaptureAgentLocalClosureReuseGate",
+    "export async function dispatchCrossDeviceRetry",
+  );
+  assert.match(
+    reuseGate,
+    /SELECT DISTINCT ON \(requires_local_closure_proof\)[\s\S]*requires_local_closure_proof DESC/u,
+    "marked and legacy histories must be evaluated independently",
+  );
+  const markedProof = reuseGate.indexOf("if (latestMarkedAttempt)");
+  assert.ok(markedProof >= 0);
+  assert.match(
+    reuseGate,
+    /if \(proof\.proven !== true\) \{[\s\S]*ready: false,[\s\S]*reason: proof\.reason/u,
+    "a marked attempt must remain blocked until its exact proof verifies",
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /proof\.proven !== true\s*&&[\s\S]*closure_quiescent/u,
+    "server time must never replace browser-local proof for current schema",
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /bounded_local_cleanup_quiescence_elapsed/u,
+    "the marked-attempt success path must only report verified proof",
+  );
+  assert.match(
+    reuseGate,
+    /WHEN requires_local_closure_proof THEN false[\s\S]*ELSE terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)[\s\S]*legacy_closure_quiescent/u,
+  );
+  assert.match(
+    reuseGate,
+    /GREATEST\(execution\.updated_at, attempt\.updated_at\)/u,
+    "legacy terminal states without finished_at must age out of reuse fencing",
+  );
+  assert.match(
+    reuseGate,
+    /terminal_at DESC NULLS LAST/u,
+    "missing terminal timestamps must never sort ahead forever",
+  );
+  assert.match(
+    reuseGate,
+    /latestLegacyAttempt\.legacy_closure_quiescent !== true/u,
+  );
+  assert.doesNotMatch(reuseGate, /capabilities|freshCapabilities/u);
 });
 
 test("agent execution-slot locks serialize heartbeat, resume, and handoff assignment", async () => {
@@ -825,6 +2092,23 @@ test("agent execution-slot locks serialize heartbeat, resume, and handoff assign
     sql: "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
     params: ["capture_agent_execution_slot", "tenant-a:agent-a"],
   }]);
+
+  const tryCalls = [];
+  assert.equal(await tryLockCaptureAgentExecutionSlot(
+    {
+      queryOne: async (sql, params) => {
+        tryCalls.push({sql, params});
+        return {locked: true};
+      },
+    },
+    "tenant-a",
+    "agent-b",
+  ), true);
+  assert.match(tryCalls[0].sql, /pg_try_advisory_xact_lock/u);
+  assert.deepEqual(
+    tryCalls[0].params,
+    ["capture_agent_execution_slot", "tenant-a:agent-b"],
+  );
 
   const heartbeat = readRouteSection(
     "router.post('/agent/heartbeat'",
@@ -1012,7 +2296,7 @@ test("agent deletion is a guarded soft revoke that preserves history", () => {
   const executionLock = removal.indexOf("await lockCaptureAgentExecutionSlot(");
   const agentRowLock = removal.indexOf("FOR UPDATE");
   assert.ok(executionLock >= 0 && executionLock < agentRowLock);
-  assert.match(removal, /captureAgentOnline\(agent\.last_heartbeat_at\)/u);
+  assert.match(removal, /captureAgentLivenessOnline\(agent\)/u);
   assert.match(
     removal,
     /COALESCE\(t\.assigned_agent_id, t\.origin_agent_id\)[\s\S]*AGENT_REMOVAL_TASK_STATUSES/u,
@@ -1083,7 +2367,7 @@ test("Agent tenant migration is reversible while permanent retirement stays irre
   assert.doesNotMatch(retirement, /WHERE client_uuid/u);
   assert.match(
     retirement,
-    /captureAgentOnline\(agent\.last_heartbeat_at\)[\s\S]*agent_retirement_online/u,
+    /captureAgentLivenessOnline\(agent\)[\s\S]*agent_retirement_online/u,
   );
   assert.match(
     retirement,
@@ -1202,6 +2486,15 @@ test("create command failures and successful stops settle orchestration work ite
   );
   assert.match(
     expiry,
+    /'reason', 'agent_inactive',[\s\S]*'commandStatusBefore', c\.status[\s\S]*result->>'commandStatusBefore' AS command_status_before/u,
+    "Agent-unavailable settlement must persist whether create was pending or acknowledged",
+  );
+  assert.match(
+    expiry,
+    /'code', 'create_agent_unavailable',[\s\S]*'commandStatusBefore', \$4::text/u,
+  );
+  assert.match(
+    expiry,
     /failProfileDiscoveryWork\(tx,[\s\S]*code: 'create_command_expired'/u,
   );
   assert.match(
@@ -1253,6 +2546,191 @@ test("create command failures and successful stops settle orchestration work ite
   );
 });
 
+test("acknowledged create expiry waits for Agent liveness, while pending expiry does not", () => {
+  const now = Date.parse("2026-08-27T06:00:00.000Z");
+  const graceMs = 10 * 60 * 1000;
+  const freshLivenessAt = "2026-08-27T05:59:55.000Z";
+  const staleFullHeartbeatAt = "2026-08-27T05:30:00.000Z";
+
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "pending",
+    commandType: "create",
+    lastLivenessAt: freshLivenessAt,
+    lastFullHeartbeatAt: staleFullHeartbeatAt,
+  }, now, graceMs), true, "an unclaimed create still expires at expires_at");
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "acknowledged",
+    commandType: "create",
+    lastLivenessAt: freshLivenessAt,
+    lastFullHeartbeatAt: staleFullHeartbeatAt,
+  }, now, graceMs), false, "fresh liveness holds an acknowledged create even when the full snapshot is stale");
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "acknowledged",
+    commandType: "create",
+    lastLivenessAt: "2026-08-27T05:49:59.999Z",
+    lastFullHeartbeatAt: staleFullHeartbeatAt,
+  }, now, graceMs), true, "an acknowledged create may expire after the liveness grace elapses");
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "acknowledged",
+    commandType: "stop",
+    lastLivenessAt: freshLivenessAt,
+  }, now, graceMs), true, "non-create command expiry remains unchanged");
+});
+
+test("only a never-acknowledged expired create can bypass local closure", () => {
+  const pendingExpiry = {
+    code: "create_command_expired",
+    commandStatusBeforeExpiry: "pending",
+  };
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({error: pendingExpiry}),
+    true,
+  );
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({
+      error: {...pendingExpiry, commandStatusBeforeExpiry: "acknowledged"},
+    }),
+    false,
+  );
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({
+      error: pendingExpiry,
+      executionStartedAt: "2026-08-29T00:00:00.000Z",
+    }),
+    false,
+  );
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({
+      error: pendingExpiry,
+      attemptStartedAt: "2026-08-29T00:00:00.000Z",
+    }),
+    false,
+  );
+  assert.equal(
+    captureCreateCommandExpiredBeforeOpen({
+      error: pendingExpiry,
+      itemStartedAt: "2026-08-29T00:00:00.000Z",
+    }),
+    false,
+  );
+});
+
+test("never-open classification covers unavailable Agents and pre-dispatch stops", () => {
+  const executionTaskId = "11111111-1111-4111-8111-111111111111";
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      error: {
+        code: "create_agent_unavailable",
+        commandStatusBefore: "pending",
+      },
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      sourceExecutionMetadata: {stoppedBeforeDispatch: true},
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      error: {
+        code: "create_agent_unavailable",
+        commandStatusBefore: "pending",
+      },
+      attemptStartedAt: "2026-08-29T00:00:00.000Z",
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "an attempt start is evidence that a browser may need closure",
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      error: {
+        code: "create_agent_unavailable",
+        commandStatusBefore: "acknowledged",
+      },
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "an acknowledged create may have opened and must fail closed",
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      error: {
+        code: "create_agent_unavailable",
+        commandStatusBefore: "pending",
+      },
+      executionStartedAt: "2026-08-29T00:00:00.000Z",
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "an execution start keeps the closure fence fail-closed",
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      sourceExecutionMetadata: {stoppedBeforeDispatch: true},
+      itemStartedAt: "2026-08-29T00:00:00.000Z",
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "an item start keeps the closure fence fail-closed",
+  );
+  assert.equal(
+    captureExecutionNeverOpened({
+      executionTaskId,
+      attemptExists: true,
+      attemptCount: 1,
+    }),
+    false,
+    "unknown partial lineage must not bypass the closure fence",
+  );
+  assert.equal(captureExecutionNeverOpened({}), true);
+});
+
+test("stale command reconciliation rechecks acknowledged create liveness before retry projection", () => {
+  const expiry = readRouteSection(
+    "async function expireStaleCommands",
+    "async function resolveResumeCommandFromSuccessor",
+  );
+  const candidateCheck = expiry.indexOf("const expiryCandidates = await tx.queryAll");
+  const candidateLock = expiry.indexOf("FOR UPDATE OF c", candidateCheck);
+  const atomicRecheck = expiry.indexOf("id = ANY($4::uuid[])", candidateLock);
+  const retryProjection = expiry.indexOf("projectOrchestrationChildControlOutcome", atomicRecheck);
+
+  assert.ok(candidateCheck >= 0);
+  assert.ok(candidateLock > candidateCheck, "expiry candidates must be command-row locked");
+  assert.ok(atomicRecheck > candidateLock, "the expiry update must recheck the locked candidate set");
+  assert.ok(retryProjection > atomicRecheck, "retry projection must only see commands that passed both checks");
+  assert.match(
+    expiry,
+    /c\.status = 'pending'[\s\S]*c\.command_type <> 'create'[\s\S]*ca\.last_liveness_at[\s\S]*ca\.last_full_heartbeat_at[\s\S]*make_interval\(mins => \$4::integer\)/u,
+  );
+  assert.match(
+    expiry,
+    /status = 'pending'[\s\S]*command_type <> 'create'[\s\S]*NOT EXISTS \([\s\S]*ca\.last_liveness_at[\s\S]*>= now\(\) - make_interval\(mins => \$5::integer\)/u,
+  );
+  assert.match(
+    expiry,
+    /AND metadata->>'createCommandId' = \$3/u,
+    "an expired command must not settle a newer task attempt",
+  );
+});
+
 test("elastic queue claims one keyword or platform-bound content item per idle heartbeat and fences late attempts", () => {
   const claim = readRouteSection(
     "async function dispatchNextElasticWorkItem",
@@ -1276,17 +2754,147 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /const attemptBudget[\s\S]*candidate\.attempt_budget_used/u);
   assert.match(claim, /attempt_count = \$1[\s\S]*attemptNumber,[\s\S]*attemptBudget/u);
   assert.match(claim, /elasticAttemptBudgetUsed/u);
+  assert.match(claim, /item\.attempt_count < agent_policy\.agent_attempt_limit/u);
+  assert.match(claim, /COUNT\(DISTINCT configured_agent_id\)/u);
+  assert.match(claim, /CROSS JOIN LATERAL/u);
+  assert.match(claim, /freshCapabilities\.singleRelayV1 === true/u);
+  assert.match(claim, /freshCapabilities\.localClosureReuseFenceV1 === true/u);
+  assert.match(
+    claim,
+    /const localClosureReuseGate = await loadCaptureAgentLocalClosureReuseGate\([\s\S]*tenantId: agent\.tenant_id,[\s\S]*agentId: agent\.id[\s\S]*if \(!localClosureReuseGate\.ready\)/u,
+  );
+  const reuseGate = readRouteSection(
+    "async function loadCaptureAgentLocalClosureReuseGate",
+    "export async function dispatchCrossDeviceRetry",
+  );
+  assert.match(
+    reuseGate,
+    /requiresLocalClosureReuseFenceV1[\s\S]*JOIN capture_task_items item[\s\S]*item\.item_type = 'keyword'/u,
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /'superseded'|'interrupted'/u,
+  );
+  assert.match(
+    reuseGate,
+    /execution\.started_at IS NULL[\s\S]*attempt\.started_at IS NULL/u,
+  );
+  assert.doesNotMatch(
+    reuseGate,
+    /item\.started_at IS NULL/u,
+    "historical Agent A must not be reclassified when Agent B later starts the shared item",
+  );
+  assert.match(
+    reuseGate,
+    /execution\.error->>'code' = 'create_agent_unavailable'[\s\S]*execution\.error->>'commandStatusBefore' = 'pending'/u,
+  );
+  assert.ok(
+    reuseGate.indexOf("AND NOT (") <
+      reuseGate.indexOf("ORDER BY requires_local_closure_proof"),
+    "strict never-open rows must be removed before latest-attempt ordering",
+  );
+  assert.match(reuseGate, /loadVerifiedCaptureLocalClosureProof/u);
+  assert.match(
+    reuseGate,
+    /COALESCE\([\s\S]*requiresLocalClosureReuseFenceV1[\s\S]*AS requires_local_closure_proof/u,
+  );
+  assert.match(
+    reuseGate,
+    /latestLegacyAttempt &&[\s\S]*latestLegacyAttempt\.legacy_closure_quiescent !== true[\s\S]*local_cleanup_quiescence/u,
+    "only legacy terminal history may use the bounded compatibility grace",
+  );
+  assert.match(
+    captureCloudRouteSource,
+    /LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 \* 1000/u,
+  );
+  assert.match(claim, /requiresSingleRelay/u);
+  assert.match(claim, /waitingForSourceClosure/u);
+  assert.match(claim, /source_execution_metadata/u);
+  assert.match(
+    claim,
+    /captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: candidate\.item_type,[\s\S]*sourceExecutionMetadata: candidate\.source_execution_metadata/u,
+  );
+  assert.match(
+    claim,
+    /CASE[\s\S]*waitingForSourceClosure'[\s\S]*THEN 1[\s\S]*sourceClosureBlockedAt/u,
+  );
+  assert.match(claim, /loadVerifiedCaptureLocalClosureProof/u);
+  assert.match(claim, /item\.started_at AS item_started_at/u);
+  assert.match(claim, /AS source_execution_started_at/u);
+  assert.match(
+    claim,
+    /const neverOpened = captureExecutionNeverOpened\(\{[\s\S]*executionTaskId: previousExecutionTaskId,[\s\S]*sourceExecutionMetadata: candidate\.source_execution_metadata,[\s\S]*executionStartedAt: candidate\.source_execution_started_at,[\s\S]*attemptExists: Boolean\(sourceAttempt\)/u,
+  );
+  assert.match(reuseGate, /commandStatusBeforeExpiry' = 'pending'/u);
+  assert.match(reuseGate, /execution\.error->>'code' = 'create_agent_unavailable'/u);
+  assert.match(reuseGate, /execution\.metadata->>'stoppedBeforeDispatch' = 'true'/u);
+  assert.match(claim, /requiresLocalClosureReuseFenceV1: true/u);
+  assert.doesNotMatch(
+    reuseGate,
+    /attempt\.updated_at > now\(\) - interval '30 minutes'/u,
+  );
+  assert.match(
+    claim,
+    /!neverOpened &&[\s\S]*localClosureProof\.proven !== true/u,
+  );
+  assert.match(
+    claim,
+    /canFenceLocalClosureReuse && candidate\.item_type === 'keyword'[\s\S]*requiresLocalClosureReuseFenceV1: true/u,
+  );
+  assert.match(claim, /status = 'retryable'[\s\S]*elastic_handoff_waiting_local_closure/u);
+  assert.match(
+    claim,
+    /sourceClosureBlockedAt'[\s\S]*COALESCE\([\s\S]*metadata->>'sourceClosureBlockedAt'[\s\S]*now\(\)::text/u,
+    "the first source-closure block timestamp must remain the stable review anchor",
+  );
+  assert.match(claim, /expectedElasticKeywordSearches/u);
   assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
   assert.match(claim, /attemptIdentity,/u);
+  assert.match(claim, /const itemAttemptBindings = \[\{/u);
+  assert.match(
+    claim,
+    /orchestration:[\s\S]*itemAttempts: itemAttemptBindings/u,
+  );
+  assert.ok(
+    claim.indexOf('INSERT INTO capture_task_item_attempts') <
+      claim.indexOf('INSERT INTO capture_agent_commands'),
+    'elastic claims must persist their attempt before publishing command',
+  );
+  assert.match(claim, /projectElasticBootstrapPacing/u);
+  assert.match(claim, /\.\.\.\(bootstrapPacing \|\| \{\}\)/u);
+  assert.match(claim, /ELASTIC_BOOTSTRAP_CONGESTION_WINDOW_MS/u);
+  assert.match(claim, /recentAffectedAgentCount/u);
   assert.match(claim, /assignment_revision = \$5/u);
   assert.match(claim, /execution_task_id = \$4/u);
   assert.match(claim, /INSERT INTO capture_task_item_attempts/u);
-  assert.match(claim, /classifyCaptureRecoveryDisposition/u);
-  assert.match(claim, /'manual_current'/u);
+  assert.doesNotMatch(
+    claim,
+    /unresolvedSafetyItem/u,
+    "one challenged keyword must not quarantine the entire source Agent",
+  );
   assert.match(claim, /elasticRecoveryHoldRemainingMs\(recentRecoveryAttempt\)/u);
-  assert.match(claim, /recent_same_agent_attempt/u);
-  assert.match(claim, /recent_same_agent_attempt\.agent_id = \$2::uuid/u);
-  assert.match(claim, /ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS/u);
+  assert.match(
+    claim,
+    /parent\.metadata @> jsonb_build_object\([\s\S]*'eligibleAgentIds'[\s\S]*OR \([\s\S]*item\.status = 'retryable'[\s\S]*'relayAgentIds'/u,
+    'standby Agents may claim only a retryable item; fresh work stays in the plan pool',
+  );
+  assert.match(claim, /capture_task_item_attempts same_agent_attempt/u);
+  assert.match(claim, /same_agent_attempt\.agent_id = \$2::uuid/u);
+  const sameAgentFence = claim.match(
+    /AND NOT EXISTS \(\s*SELECT 1\s*FROM capture_task_item_attempts same_agent_attempt[\s\S]*?same_agent_attempt\.agent_id = \$2::uuid\s*\)/u,
+  )?.[0] || '';
+  assert.ok(sameAgentFence, 'the same-Agent attempt fence must be present');
+  assert.doesNotMatch(
+    sameAgentFence,
+    /updated_at/u,
+    'an Agent that already tried an item must never reclaim it after a cooldown',
+  );
+  assert.match(claim, /reserveCaptureResourceAdmission\(tx,/u);
+  assert.ok(
+    claim.indexOf('reserveCaptureResourceAdmission(tx,') <
+      claim.indexOf('const childTaskId = crypto.randomUUID()'),
+    'resource capacity must be reserved before a child task is created',
+  );
   assert.doesNotMatch(
     claim,
     /recovery[^\n]*nextEvaluationAt|nextEvaluationAt[^\n]*recovery/u,
@@ -1304,7 +2912,7 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.ok(commandRead > elastic);
 });
 
-test("elastic recovery releases the item immediately while cooling only the source Agent", () => {
+test("elastic recovery releases the item immediately and scopes verification to the item-account pair", () => {
   const recovery = readRouteSection(
     "function buildElasticRecoveryMetadata({",
     "export function crossDeviceRetryAgentSupportsTask(",
@@ -1313,11 +2921,69 @@ test("elastic recovery releases the item immediately while cooling only the sour
   assert.match(recovery, /state: 'released_for_handoff'/u);
   assert.match(recovery, /handoffReadyAt/u);
   assert.match(recovery, /itemLockReleased: true/u);
-  assert.match(recovery, /sourceAgentCooling: true/u);
+  assert.match(recovery, /sourceAgentCooling: !operatorHoldReleased && sourceAgentHoldMs > 0/u);
+  assert.match(recovery, /previousRecovery\.queuedAt/u);
+  assert.match(recovery, /operatorHoldReleasedAt/u);
   assert.match(recovery, /cooldownHomeRestored/u);
   assert.match(recovery, /cooldownHomeUrl/u);
   assert.match(recovery, /sourceAgentHoldUntil/u);
   assert.match(recovery, /sourceAgentSameItemRetryAfter/u);
+});
+
+test("repeated terminal heartbeats preserve the original elastic recovery review anchor", () => {
+  const first = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    checkpoint: {securityBlocked: true},
+    attemptCount: 3,
+    sourceAgentId: "agent-source",
+    now: new Date("2026-09-01T02:00:00.000Z"),
+  });
+  const repeated = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    checkpoint: {securityBlocked: true},
+    attemptCount: 3,
+    sourceAgentId: "agent-source",
+    existingRecovery: first,
+    now: new Date("2026-09-01T02:05:00.000Z"),
+  });
+
+  assert.equal(repeated.queuedAt, first.queuedAt);
+  assert.equal(repeated.nextEvaluationAt, first.nextEvaluationAt);
+  assert.notEqual(
+    repeated.nextEvaluationAt,
+    "2026-09-01T02:06:00.000Z",
+    "a repeated needs_action heartbeat must not manufacture a fresh countdown",
+  );
+
+  const reassigned = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    checkpoint: {securityBlocked: true},
+    attemptCount: 4,
+    sourceAgentId: "agent-successor",
+    existingRecovery: first,
+    now: new Date("2026-09-01T02:05:00.000Z"),
+  });
+  assert.equal(reassigned.queuedAt, "2026-09-01T02:05:00.000Z");
+  assert.equal(reassigned.nextEvaluationAt, "2026-09-01T02:06:00.000Z");
+
+  const sameAgentNewAttempt = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "DOUYIN_SEARCH_SECURITY_CHALLENGE"},
+    checkpoint: {securityBlocked: true},
+    attemptCount: 4,
+    sourceAgentId: "agent-source",
+    existingRecovery: first,
+    now: new Date("2026-09-01T02:05:00.000Z"),
+  });
+  assert.equal(sameAgentNewAttempt.queuedAt, "2026-09-01T02:05:00.000Z");
+  assert.equal(
+    sameAgentNewAttempt.nextEvaluationAt,
+    "2026-09-01T02:06:00.000Z",
+    "a genuinely new attempt must receive its own review anchor",
+  );
 });
 
 test("elastic cleanup tolerates child tasks whose work item already settled", () => {
@@ -1327,22 +2993,85 @@ test("elastic cleanup tolerates child tasks whose work item already settled", ()
     }),
     {
       attemptBudget: 0,
-      metadataPatch: {elasticAttemptBudgetUsed: 0},
+      technicalAttemptCount: 0,
+      technicalLimitReached: false,
+      metadataPatch: {
+        elasticAttemptBudgetUsed: 0,
+        elasticTechnicalAttemptCount: 0,
+      },
       refunded: false,
     },
   );
 });
 
-test("elastic queue reclaims stale offline work without disturbing fixed assignments", () => {
+test("elastic queue requires exact closure before reclaiming stale current-schema work", () => {
   const lease = readRouteSection(
-    'async function listElasticCaptureLeaseCandidates',
+    'async function reconcileElasticCaptureLeasesInRoute',
     'const reconcileElasticCaptureLeasesImpl',
   );
   assert.match(lease, /ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN/u);
-  assert.match(lease, /agent\.last_heartbeat_at/u);
+  assert.match(lease, /agent\.last_liveness_at/u);
   assert.match(lease, /child\.heartbeat_at/u);
   assert.match(lease, /elastic_task_heartbeat_timeout/u);
-  assert.match(lease, /!Number\.isFinite\(agentHeartbeatAt\)/u);
+  assert.match(lease, /captureAgentLivenessOnline/u);
+  assert.match(lease, /loadVerifiedCaptureLocalClosureProof/u);
+  assert.match(
+    lease,
+    /captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: sourceItem\?\.item_type,[\s\S]*sourceExecutionMetadata: child\.metadata/u,
+  );
+  assert.match(lease, /elastic_stale_execution_waiting_local_closure/u);
+  assert.match(lease, /sourceClosureBlocked[\s\S]*sourceClosureBlockers/u);
+  assert.match(lease, /outcome: 'waiting_local_closure'/u);
+  assert.match(
+    lease,
+    /requiresSourceLocalClosure\s*&&[\s\S]*!localClosureProof\.proven/u,
+    'current-schema recovery must still prove local closure after Agent liveness expires',
+  );
+  assert.doesNotMatch(
+    lease,
+    /!localClosureProof\.proven\s*&&\s*!agentOffline/u,
+    'an offline lease cannot substitute for browser-local closure proof',
+  );
+  assert.match(lease, /'serverLeaseRevoked', \$5::boolean/u);
+  assert.match(lease, /serverLeaseRevoked: agentOffline/u);
+  assert.match(lease, /sourceLocalClosureProven: localClosureProof\.proven === true/u);
+  assert.match(
+    captureCloudRouteSource,
+    /capture_tasks\.error->>'code'[\s\S]*ELASTIC_AGENT_OFFLINE_TIMEOUT[\s\S]*ELASTIC_TASK_HEARTBEAT_TIMEOUT/u,
+    'late snapshots from a server-revoked stale runner must remain fenced',
+  );
+  assert.match(
+    lease,
+    /COALESCE\([\s\S]*agent\.last_liveness_at[\s\S]*'-infinity'::timestamptz[\s\S]*< now\(\)[\s\S]*AND COALESCE\([\s\S]*child\.heartbeat_at[\s\S]*child\.updated_at/u,
+  );
+  assert.match(
+    lease,
+    /source_item\.id AS item_id[\s\S]*const scannedItemKeys = new Set/u,
+    'candidate executions and existing blockers must share one item identity count',
+  );
+  assert.match(
+    lease,
+    /settled\?\.outcome === 'waiting_local_closure'[\s\S]*summary\.sourceClosureBlocked = blockerByItem\.size/u,
+    'the first blocked reconciliation must be reported in the same result',
+  );
+  const waitingProjectionStart = lease.indexOf(
+    "settled?.outcome === 'waiting_local_closure'",
+  );
+  const waitingProjectionEnd = lease.indexOf(
+    '} else {\n      summary.skipped += 1;',
+    waitingProjectionStart,
+  );
+  assert.ok(waitingProjectionStart >= 0 && waitingProjectionEnd > waitingProjectionStart);
+  const waitingProjection = lease.slice(
+    waitingProjectionStart,
+    waitingProjectionEnd,
+  );
+  assert.doesNotMatch(
+    waitingProjection,
+    /summary\.skipped \+= 1/u,
+    'a local-closure blocker must not first be projected as skipped',
+  );
+  assert.doesNotMatch(lease, /AGENT_TASK_STATE_UNAVAILABLE/u);
   assert.match(lease, /status: 'retryable'/u);
   assert.match(lease, /elastic_agent_offline_timeout/u);
   assert.match(lease, /FOR UPDATE SKIP LOCKED/u);
@@ -1354,12 +3083,16 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
     2,
   );
   assert.ok(
-    lease.indexOf('SELECT id') <
-      lease.indexOf('SELECT child.*, agent.last_heartbeat_at'),
+    lease.indexOf('SELECT id\n        FROM capture_tasks') <
+      lease.indexOf('SELECT child.*,'),
+  );
+  const requeueProjection = lease.slice(
+    lease.indexOf('const failed = await tx.queryOne'),
+    lease.indexOf("return 'requeued';"),
   );
   assert.ok(
-    lease.indexOf('await projectOrchestrationChildControlOutcome') <
-      lease.indexOf('await appendEvent'),
+    requeueProjection.indexOf('await projectOrchestrationChildControlOutcome') <
+      requeueProjection.indexOf('await appendEvent'),
   );
   assert.doesNotMatch(lease, /child\.metadata->>'cloudWorkQueue'/u);
   assert.match(
@@ -1369,11 +3102,11 @@ test("elastic queue reclaims stale offline work without disturbing fixed assignm
   assert.doesNotMatch(leaseReconciliationSource, /pendingReconciliation/u);
   assert.match(
     captureCloudRouteSource,
-    /createElasticCaptureLeaseReconciler\(\{[\s\S]*listCandidates: listElasticCaptureLeaseCandidates,[\s\S]*settleCandidate: settleElasticCaptureLeaseCandidate/u,
+    /createElasticCaptureLeaseReconciler\(\{[\s\S]*reconcileLeases: reconcileElasticCaptureLeasesInRoute/u,
   );
   assert.match(
     captureCloudRouteSource,
-    /export async function reconcileElasticCaptureLeases\(limit = 50\)[\s\S]*return reconcileElasticCaptureLeasesImpl\(limit\)/u,
+    /export async function reconcileElasticCaptureLeases\(input = 50\)[\s\S]*return reconcileElasticCaptureLeasesImpl\(input\)/u,
   );
   assert.match(
     captureCloudRouteSource,
@@ -1453,6 +3186,21 @@ test("targeted stop commands and receipts are fenced to the current attempt", ()
   assert.match(
     stopRoute,
     /SELECT client_attempt_id[\s\S]*FROM capture_task_attempts[\s\S]*attempt_number = \$3/u,
+  );
+  assert.doesNotMatch(
+    stopRoute,
+    /agent_platform_mismatch/u,
+    "stopping an already-running exact task must not reuse dispatch eligibility",
+  );
+
+  const heartbeat = readRouteSection(
+    "router.post('/agent/heartbeat'",
+    "router.post('/agent/commands/:id/complete'",
+  );
+  assert.match(
+    heartbeat,
+    /c\.command_type = 'stop'[\s\S]*cardinality\(\$5::text\[\]\) = 0/u,
+    "stop delivery bypasses current platform assignment while retaining auth fences",
   );
   assert.match(
     stopRoute,
@@ -1545,7 +3293,17 @@ test("an occupied attempt number rejects a different concrete attempt id", () =>
   );
   assert.match(
     mirrorSection,
-    /FROM capture_task_attempts existing_attempt[\s\S]*existing_attempt\.attempt_number = EXCLUDED\.attempt_number[\s\S]*existing_attempt\.client_attempt_id <> ''[\s\S]*\$27 <> ''[\s\S]*existing_attempt\.client_attempt_id <> \$27/u,
+    /snapshot = bindCloudTaskSnapshotHealthToAttempt\(snapshot\)/u,
+    "unbound legacy reports must lose structured health before task persistence",
+  );
+  assert.match(
+    mirrorSection,
+    /cloudTaskAttemptIdentityAcceptsSnapshot\([\s\S]*previous\.occupied_attempt_id,[\s\S]*snapshot\.attemptId/u,
+    "the preflight must reject an empty or different identity before any projection write",
+  );
+  assert.match(
+    mirrorSection,
+    /FROM capture_task_attempts existing_attempt[\s\S]*existing_attempt\.attempt_number = EXCLUDED\.attempt_number[\s\S]*existing_attempt\.client_attempt_id <> ''[\s\S]*\$27 = ''[\s\S]*OR existing_attempt\.client_attempt_id <> \$27/u,
   );
   assert.match(
     mirrorSection,
@@ -1553,7 +3311,40 @@ test("an occupied attempt number rejects a different concrete attempt id", () =>
   );
   assert.match(
     mirrorSection,
-    /WHERE capture_task_attempts\.client_attempt_id = ''[\s\S]*OR EXCLUDED\.client_attempt_id = ''[\s\S]*OR capture_task_attempts\.client_attempt_id = EXCLUDED\.client_attempt_id/u,
+    /WHERE capture_task_attempts\.client_attempt_id = ''[\s\S]*OR capture_task_attempts\.client_attempt_id = EXCLUDED\.client_attempt_id/u,
+  );
+  assert.doesNotMatch(
+    mirrorSection,
+    /OR EXCLUDED\.client_attempt_id = ''/u,
+  );
+  assert.ok(
+    [...mirrorSection.matchAll(
+      /snapshot\.attemptId \? attempt\?\.id \|\| null : null/gu,
+    )].length >= 2,
+    "an empty attempt id must not bind snapshots or events to an occupied attempt slot",
+  );
+});
+
+test("accepted task attempts persist the bounded version and structured health evidence", () => {
+  const mirrorSection = readRouteSection(
+    "async function mirrorTaskSnapshot",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(
+    mirrorSection,
+    /INSERT INTO capture_task_attempts \([\s\S]*app_version, health_evidence,[\s\S]*CASE WHEN \$4 <> '' THEN \$6 ELSE '' END,[\s\S]*CASE WHEN \$4 <> '' THEN \$7::jsonb ELSE '\{\}'::jsonb END/u,
+  );
+  assert.match(
+    mirrorSection,
+    /app_version = CASE[\s\S]*EXCLUDED\.client_attempt_id <> ''[\s\S]*capture_task_attempts\.client_attempt_id = EXCLUDED\.client_attempt_id[\s\S]*EXCLUDED\.app_version <> ''[\s\S]*capture_task_attempts\.app_version/u,
+  );
+  assert.match(
+    mirrorSection,
+    /health_evidence = CASE[\s\S]*EXCLUDED\.client_attempt_id <> ''[\s\S]*capture_task_attempts\.client_attempt_id = EXCLUDED\.client_attempt_id[\s\S]*EXCLUDED\.health_evidence <> '\{\}'::jsonb[\s\S]*capture_task_attempts\.health_evidence/u,
+  );
+  assert.match(
+    mirrorSection,
+    /snapshot\.appVersion,[\s\S]*JSON\.stringify\(snapshot\.structuredTaskHealth\),[\s\S]*normalizedAttemptStatus/u,
   );
 });
 
@@ -1572,6 +3363,122 @@ test("online state is derived from a short heartbeat lease", () => {
   assert.equal(captureAgentOnline("2026-07-20T07:59:01.000Z", now), true);
   assert.equal(captureAgentOnline("2026-07-20T07:57:59.000Z", now), false);
   assert.equal(captureAgentOnline("", now), false);
+});
+
+test("Agent liveness, full task-state health, and auxiliary degradation are distinct", () => {
+  const now = Date.parse("2026-08-27T06:00:00.000Z");
+  const incomplete = {
+    last_liveness_at: "2026-08-27T05:59:50.000Z",
+    last_full_heartbeat_at: "2026-08-27T05:50:00.000Z",
+    last_heartbeat_at: "2026-08-27T05:50:00.000Z",
+    capabilities: {
+      taskStateKnown: false,
+      heartbeatDegraded: true,
+    },
+  };
+  assert.equal(captureAgentLivenessOnline(incomplete, now), true);
+  assert.equal(captureAgentFullHeartbeatOnline(incomplete, now), false);
+  assert.equal(captureAgentHeartbeatDegraded(incomplete), true);
+
+  const auxiliaryWarning = {
+    last_liveness_at: "2026-08-27T05:59:50.000Z",
+    last_full_heartbeat_at: "2026-08-27T05:59:45.000Z",
+    last_heartbeat_at: "2026-08-27T05:59:45.000Z",
+    capabilities: {
+      taskStateKnown: true,
+      heartbeatDegraded: true,
+    },
+  };
+  assert.equal(captureAgentFullHeartbeatOnline(auxiliaryWarning, now), true);
+  assert.equal(captureAgentHeartbeatDegraded(auxiliaryWarning), true);
+
+  const legacy = {
+    last_heartbeat_at: "2026-08-27T05:59:45.000Z",
+    capabilities: {},
+  };
+  assert.equal(captureAgentLivenessOnline(legacy, now), true);
+  assert.equal(captureAgentFullHeartbeatOnline(legacy, now), true);
+});
+
+test("heartbeat routes keep liveness-only and incomplete task-state writes isolated", () => {
+  const liveness = readRouteSection(
+    "router.post('/agent/liveness'",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(liveness, /SET last_liveness_at = now\(\)/u);
+  assert.doesNotMatch(liveness, /SET last_heartbeat_at = now\(\)/u);
+  assert.doesNotMatch(liveness, /last_full_heartbeat_at = now\(\)/u);
+
+  const heartbeat = readRouteSection(
+    "router.post('/agent/heartbeat'",
+    "router.post('/agent/commands/:id/complete'",
+  );
+  assert.match(
+    heartbeat,
+    /const hasTaskSnapshotList = Array\.isArray\(req\.body\?\.tasks\);[\s\S]*const rawTasks = hasTaskSnapshotList/u,
+  );
+  assert.match(
+    heartbeat,
+    /heartbeatCapabilities\.taskStateKnown !== false && hasTaskSnapshotList;[\s\S]*heartbeatCapabilities\.taskStateKnown = taskStateKnown;/u,
+  );
+  assert.match(heartbeat, /const taskStateIncomplete = !taskStateKnown/u);
+  assert.match(
+    heartbeat,
+    /last_liveness_at = now\(\)[\s\S]*last_full_heartbeat_at = CASE[\s\S]*last_heartbeat_at = CASE/u,
+  );
+  assert.match(
+    heartbeat,
+    /if \(!taskStateIncomplete\) \{[\s\S]*mirrorTaskSnapshot/u,
+  );
+  assert.match(
+    heartbeat,
+    /const elasticClaim = taskStateIncomplete[\s\S]*dispatchNextElasticWorkItem/u,
+  );
+  assert.match(
+    heartbeat,
+    /const commands = taskStateKnown \? await tx\.queryAll/u,
+  );
+  assert.match(heartbeat, /hasObservedSocialAccounts \|\| hasSocialUsageEvents/u);
+
+  const hasTaskSnapshotListExpression = heartbeat.match(
+    /const hasTaskSnapshotList = ([^;]+);/u,
+  )?.[1];
+  const taskStateKnownExpression = heartbeat.match(
+    /const taskStateKnown =\s*([\s\S]*?);\s*heartbeatCapabilities\.taskStateKnown/u,
+  )?.[1];
+  assert.ok(hasTaskSnapshotListExpression);
+  assert.ok(taskStateKnownExpression);
+  const evaluateTaskStateKnown = (body, capabilityValue) => vm.runInNewContext(`
+    (() => {
+      const hasTaskSnapshotList = ${hasTaskSnapshotListExpression};
+      return ${taskStateKnownExpression};
+    })()
+  `, {
+    req: {body},
+    heartbeatCapabilities: {taskStateKnown: capabilityValue},
+  });
+  assert.equal(evaluateTaskStateKnown({}, undefined), false);
+  assert.equal(evaluateTaskStateKnown({tasks: {}}, true), false);
+  assert.equal(evaluateTaskStateKnown({tasks: []}, undefined), true);
+  assert.equal(evaluateTaskStateKnown({tasks: []}, false), false);
+});
+
+test("heartbeat migration backfills legacy evidence without changing its full-heartbeat meaning", async () => {
+  const migration = await readFile(new URL(
+    "../server/db/migrations/076_capture_agent_heartbeat_semantics.sql",
+    import.meta.url,
+  ), "utf8");
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS last_liveness_at/u);
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS last_full_heartbeat_at/u);
+  assert.match(
+    migration,
+    /last_liveness_at = COALESCE\(last_liveness_at, last_heartbeat_at\)/u,
+  );
+  assert.match(
+    migration,
+    /last_full_heartbeat_at = COALESCE\([\s\S]*last_heartbeat_at/u,
+  );
+  assert.match(migration, /Legacy compatibility alias/u);
 });
 
 test("heartbeat prioritizes plan configuration ahead of ordinary creates with stable ordering", () => {
@@ -1613,6 +3520,23 @@ test("a newer unattended plan fences older active plan commands after idempotenc
     /SET status = 'superseded'[\s\S]*task_type = 'unattended_plan_configuration'[\s\S]*status IN \('pending', 'claimed'\)/u,
   );
   assert.match(createRoute, /eventType: 'plan_configuration_superseded'/u);
+});
+
+test("direct one-Agent tasks cannot inherit or submit elastic resource policy", () => {
+  const createRoute = readRouteSection(
+    "router.post('/agents/:id/tasks'",
+    "router.post('/tasks/:id/resume'",
+  );
+  assert.match(createRoute, /delete mirroredPlan\.resourcePolicy/u);
+  assert.match(createRoute, /delete mirroredPlan\.resource_policy/u);
+  assert.match(
+    createRoute,
+    /Object\.keys\(directResourcePolicy\)\.length > 0[\s\S]*capture_resource_policy_requires_elastic_schedule/u,
+  );
+  assert.ok(
+    createRoute.indexOf('delete mirroredPlan.resourcePolicy') <
+      createRoute.indexOf('const normalizedInput = normalizeRemoteTaskInput'),
+  );
 });
 
 test("a successful plan command supersedes only older needs-action configurations", async () => {
@@ -1890,6 +3814,14 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
     maxRounds: 999,
     roundGapMin: -9,
     recoveryPolicy: {allowIdleAgentHandoff: false},
+    resourcePolicy: {
+      maxActive: 2,
+      maxActivePerHost: 1,
+      capacityGroup: 'shared-5g',
+      maxActiveInGroup: 1,
+      maxDailySearchesPerAgent: 20,
+      relayAgentIds: ['11111111-1111-4111-8111-111111111111'],
+    },
     nextRunAt,
   });
 
@@ -1910,6 +3842,14 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
   assert.deepEqual(normalized.planSnapshot.recoveryPolicy, {
     allowIdleAgentHandoff: false,
     platformSafetyMode: "manual_confirmed",
+  });
+  assert.deepEqual(normalized.planSnapshot.resourcePolicy, {
+    maxActive: 2,
+    maxActivePerHost: 1,
+    maxActiveInGroup: 1,
+    capacityGroup: 'shared-5g',
+    maxDailySearchesPerAgent: 20,
+    relayAgentIds: ['11111111-1111-4111-8111-111111111111'],
   });
   assert.equal(normalized.planSnapshot.nextRunAt, nextRunAt);
 
@@ -1948,6 +3888,48 @@ test("remote task input normalizes platform, deduplicates keywords, and clamps e
     unattendedPlan.planSnapshot.customDates,
     "2026-10-01\n2028-02-29\n2026-01-02",
   );
+});
+
+test("remote sequential search passes force verified filters and disable hidden retries", () => {
+  const sequential = normalizeRemoteTaskInput({
+    executionMode: "one_time",
+    platform: "douyin",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "video"],
+  });
+  assert.deepEqual(sequential.planSnapshot.searchPasses, ["all", "video"]);
+  assert.equal(sequential.planSnapshot.searchFilters.contentType, "all");
+  assert.equal(
+    sequential.planSnapshot.recoveryPolicy.disableAutomaticSearchRetry,
+    true,
+  );
+  assert.equal(sequential.planSnapshot.recoveryPolicy.requireVerifiedFilters, true);
+
+  const xhs = normalizeRemoteTaskInput({
+    executionMode: "unattended_plan",
+    platform: "xiaohongshu",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "image"],
+  });
+  assert.equal(Object.hasOwn(xhs.planSnapshot, "searchPasses"), false);
+  assert.equal(
+    Object.hasOwn(xhs.planSnapshot.recoveryPolicy, "disableAutomaticSearchRetry"),
+    false,
+  );
+
+  const constrained = normalizeRemoteTaskInput({
+    executionMode: "one_time",
+    platform: "douyin",
+    keywords: ["别克壁纸"],
+    searchPasses: ["all", "image"],
+    searchFilters: {
+      publishTime: ["day", "week"],
+      sort: ["latest", "likes"],
+    },
+  });
+  assert.equal(constrained.planSnapshot.searchFilters.publishTime, "day");
+  assert.equal(constrained.planSnapshot.searchFilters.sort, "latest");
+  assert.deepEqual(constrained.planSnapshot.searchPasses, ["all", "image"]);
 });
 
 test("remote keyword post limits are optional, normalized, and fail safely", () => {
@@ -2202,7 +4184,31 @@ test("settled single-node tasks can retry on another idle Agent without forking 
       "export async function reconcileAutomaticCaptureRetries",
     ),
   );
+  const idleAgentSelection = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      "async function loadIdleCrossDeviceRetryAgent",
+    ),
+    captureCloudRouteSource.indexOf("function promotedRetryFallbackTarget"),
+  );
+  const profileRetryRenewal = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      "async function renewProfileRetryExecutions",
+    ),
+    captureCloudRouteSource.indexOf(
+      "export async function dispatchCrossDeviceRetry",
+    ),
+  );
   assert.match(dispatchCore, /loadIdleCrossDeviceRetryAgent/u);
+  assert.match(idleAgentSelection, /for \(const candidate of eligibleCandidates\)/u);
+  assert.match(
+    idleAgentSelection,
+    /const savepoint = 'capture_retry_agent_candidate'/u,
+  );
+  assert.match(idleAgentSelection, /tryLockCaptureAgentExecutionSlot/u);
+  assert.match(
+    idleAgentSelection,
+    /ROLLBACK TO SAVEPOINT \$\{savepoint\}/u,
+  );
   assert.match(captureCloudRouteSource, /AS active_command_count/u);
   assert.match(
     captureCloudRouteSource,
@@ -2215,6 +4221,27 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   assert.match(dispatchCore, /crossDeviceRetryRequestKey/u);
   assert.match(dispatchCore, /INSERT INTO capture_task_item_attempts/u);
   assert.match(dispatchCore, /renewProfileRetryExecutions/u);
+  assert.ok(
+    dispatchCore.indexOf('renewProfileRetryExecutions') <
+      dispatchCore.indexOf('targetAgent = await loadIdleCrossDeviceRetryAgent'),
+    'profile execution renewal must precede Agent-slot acquisition',
+  );
+  assert.match(
+    profileRetryRenewal,
+    /FROM monitor_executions[\s\S]*FOR UPDATE SKIP LOCKED[\s\S]*FROM monitor_subscriptions[\s\S]*FOR SHARE SKIP LOCKED/u,
+  );
+  assert.match(
+    profileRetryRenewal,
+    /const subscriptionSnapshot = await tx\.queryOne[\s\S]*retry_profile_subscription_unavailable[\s\S]*FOR SHARE SKIP LOCKED[\s\S]*retry_profile_subscription_busy/u,
+  );
+  assert.match(
+    dispatchCore,
+    /abortCrossDeviceRetry\('idle_compatible_agent_unavailable'/u,
+  );
+  assert.match(
+    dispatchCore,
+    /crossDeviceRetryError ===[\s\S]*'idle_compatible_agent_unavailable'[\s\S]*return noIdleAgentResult\(\)/u,
+  );
   assert.match(dispatchCore, /cross_device_retry_dispatched/u);
   assert.match(dispatchCore, /abortCrossDeviceRetry\(promoted\.error\)/u);
   assert.match(dispatchCore, /abortCrossDeviceRetry\(renewedExecutions\.error\)/u);
@@ -2228,7 +4255,356 @@ test("settled single-node tasks can retry on another idle Agent without forking 
   );
 });
 
-test("cron automatically dispatches unfinished items before attention delivery", () => {
+test("late Xiaohongshu evidence detector is read-only and never trusts human reports", () => {
+  const candidate = evaluateObservedCompletionCandidate({
+    item_id: "11111111-1111-4111-8111-111111111111",
+    task_id: "22222222-2222-4222-8222-222222222222",
+    source_execution_task_id: "33333333-3333-4333-8333-333333333333",
+    source_attempt_id: "44444444-4444-4444-8444-444444444444",
+    source_attempt_number: 2,
+    source_assignment_revision: 7,
+    source_attempt_status: "failed",
+    source_attempt_started_at: "2026-08-27T01:00:00.000Z",
+    source_attempt_checkpoint: {
+      savedCount: 2,
+      scanComplete: true,
+      searchPassResults: [
+        {round: 1, status: "completed", scanComplete: true},
+        {round: 2, status: "completed_with_warnings", scanComplete: true},
+      ],
+    },
+    source_attempt_result: {savedCount: 2},
+    parent_metadata: {planSnapshot: {searchPasses: ["main", "latest"]}},
+    platform: "xiaohongshu",
+    item_status: "needs_action",
+    exact_observation_count: 2,
+    latest_observation_at: "2026-08-27T01:03:00.000Z",
+    lineage_last_activity_at: "2026-08-27T01:05:00.000Z",
+    lineage_silent: true,
+    active_started_attempt_count: 0,
+    active_command_count: 0,
+    active_execution_count: 0,
+    active_recovery_lease_count: 0,
+    started_successor_attempt_count: 0,
+    unstarted_successor_attempt_count: 1,
+    humanReport: "现场说已经保存成功",
+  });
+
+  assert.equal(candidate.evidenceCandidate, true);
+  assert.equal(candidate.reconcileEligible, false);
+  assert.equal(candidate.readOnly, true);
+  assert.equal(candidate.runtimeAbsenceUnverified, true);
+  assert.equal(candidate.humanReportAcceptedAsEvidence, false);
+  assert.deepEqual(candidate.blockingChecks, ["runtimeAbsenceUnverified"]);
+  assert.equal(candidate.successorAttempts.requiresTransactionalSealing, true);
+  assert.equal(candidate.successorAttempts.sealed, false);
+});
+
+test("late evidence detector rejects incomplete scope, mismatched saves, or active lineage", () => {
+  const result = evaluateObservedCompletionCandidate({
+    source_attempt_id: "44444444-4444-4444-8444-444444444444",
+    source_attempt_status: "running",
+    source_attempt_started_at: "2026-08-27T01:00:00.000Z",
+    source_attempt_checkpoint: {
+      savedCount: 3,
+      scanComplete: false,
+      searchPassResults: [{round: 1, status: "completed", scanComplete: true}],
+    },
+    parent_metadata: {planSnapshot: {searchPasses: ["main", "latest"]}},
+    platform: "xiaohongshu",
+    item_status: "needs_action",
+    exact_observation_count: 2,
+    lineage_silent: false,
+    active_started_attempt_count: 1,
+    active_command_count: 1,
+    active_execution_count: 1,
+    active_recovery_lease_count: 1,
+    started_successor_attempt_count: 1,
+  });
+
+  assert.equal(result.evidenceCandidate, false);
+  assert.equal(result.reconcileEligible, false);
+  assert.ok(result.blockingChecks.includes("savedObservationConsistent"));
+  assert.ok(result.blockingChecks.includes("scopeComplete"));
+  assert.ok(result.blockingChecks.includes("noActiveAttempt"));
+  assert.ok(result.blockingChecks.includes("noActiveCommand"));
+  assert.ok(result.blockingChecks.includes("noActiveExecution"));
+  assert.ok(result.blockingChecks.includes("noActiveRecoveryLease"));
+  assert.ok(result.blockingChecks.includes("lineageSilent"));
+  assert.ok(result.blockingChecks.includes("noStartedSuccessorAttempt"));
+});
+
+test("late evidence candidate endpoint is tenant-scoped and cannot mutate state", () => {
+  const route = readRouteSection(
+    "router.get('/late-evidence-candidates'",
+    "router.get('/history'",
+  );
+  assert.match(route, /item\.tenant_id = \$1/u);
+  assert.match(route, /item\.platform = 'xiaohongshu'/u);
+  assert.match(route, /capture_task_item_attempt_id = source_attempt\.id/u);
+  assert.match(route, /command\.status IN \('pending', 'acknowledged'\)/u);
+  assert.match(
+    route,
+    /command\.task_id IN \([\s\S]*SELECT DISTINCT attempt\.execution_task_id[\s\S]*attempt\.item_id = item\.id/u,
+  );
+  assert.doesNotMatch(
+    route,
+    /command\.task_id IN \(item\.task_id, source_attempt\.execution_task_id\)/u,
+  );
+  assert.match(route, /intent\.lease_expires_at > clock_timestamp\(\)/u);
+  assert.match(route, /automaticMutationEnabled: false/u);
+  assert.match(route, /runtimeAbsenceSource: 'not_persisted'/u);
+  assert.doesNotMatch(route, /\b(?:UPDATE|INSERT|DELETE)\b/u);
+  assert.doesNotMatch(route, /req\.body/u);
+});
+
+test("cross-device retry uses known current-day Agent search usage and enforces account limits", () => {
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({}), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: false,
+    today_usage_last_event_at: '2026-08-26T23:59:59.000Z',
+    today_searches: 0,
+    daily_search_limit: 10,
+  }), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_usage_last_event_at: null,
+    today_searches: 0,
+    daily_search_limit: 10,
+  }), true);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_searches: 9,
+    daily_search_limit: 10,
+  }, 2), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_searches: 8,
+    daily_search_limit: 10,
+  }, 2), true);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_usage_last_event_at: '2026-08-27T00:01:00.000Z',
+    today_searches: 7,
+    daily_search_limit: 10,
+  }), true);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_usage_last_event_at: '2026-08-27T00:01:00.000Z',
+    today_searches: 10,
+    daily_search_limit: 10,
+  }), false);
+  assert.equal(crossDeviceRetryAgentDailyUsageEligible({
+    today_usage_current: true,
+    today_usage_last_event_at: '2026-08-27T00:01:00.000Z',
+    today_searches: 35,
+    daily_search_limit: 0,
+  }), true);
+
+  const idleAgentSelection = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      "async function loadIdleCrossDeviceRetryAgent",
+    ),
+    captureCloudRouteSource.indexOf("function promotedRetryFallbackTarget"),
+  );
+  assert.match(
+    idleAgentSelection,
+    /LEFT JOIN social_agent_daily_usage daily_usage/u,
+  );
+  assert.doesNotMatch(
+    idleAgentSelection,
+    /social_account_daily_usage/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /daily_usage\.usage_date =\s*\(now\(\) AT TIME ZONE 'Asia\/Shanghai'\)::date/u,
+  );
+  assert.doesNotMatch(
+    idleAgentSelection,
+    /daily_usage\.last_event_at IS NOT NULL/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /COALESCE\(daily_usage\.searches,\s*0\)/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /COALESCE\(daily_usage\.searches,\s*0\) \+ \$7::integer <=\s*current_social_account\.daily_search_limit/u,
+  );
+  assert.match(idleAgentSelection, /expectedSearches = 1/u);
+  assert.match(idleAgentSelection, /expectedSearches,/u);
+  assert.match(
+    idleAgentSelection,
+    /ORDER BY COALESCE\(daily_usage\.searches,\s*0\) ASC,\s*recent_technical_failure_count ASC/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /FOR UPDATE OF ca/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /captureResourceAgentIds\([\s\S]*eligibleAgentIds:[\s\S]*resourcePolicy/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /cardinality\(\$6::uuid\[\]\) = 0 OR ca\.id = ANY\(\$6::uuid\[\]\)/u,
+  );
+  assert.match(
+    idleAgentSelection,
+    /reserveCaptureResourceAdmission\(tx,[\s\S]*resourcePolicy/u,
+  );
+  assert.equal(
+    (idleAgentSelection.match(
+      /crossDeviceRetryAgentDailyUsageEligible\(/gu,
+    ) || []).length,
+    2,
+    'usage eligibility must be checked both before and after slot locking',
+  );
+});
+
+test("resource admission serializes plan and shared-host capacity before dispatch", () => {
+  const admission = readRouteSection(
+    "async function reserveCaptureResourceAdmission",
+    "function dutyRecoveryGlobalActionsEnabled",
+  );
+  assert.match(admission, /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
+  assert.match(admission, /plan:\$\{parentTaskId\}/u);
+  assert.match(admission, /host:\$\{hostLabel\}/u);
+  assert.match(admission, /group:\$\{capacityGroup\}/u);
+  assert.match(admission, /FILTER \(WHERE parent_task_id = \$2\)::integer AS plan_active/u);
+  assert.match(admission, /FILTER \(WHERE host_label = \$3\)::integer AS host_active/u);
+  assert.match(admission, /FILTER \(WHERE capacity_group = \$7\)::integer AS group_active/u);
+  assert.match(admission, /capture_agent_commands active_command/u);
+  assert.match(admission, /active_command\.status IN \('pending', 'acknowledged'\)/u);
+  assert.match(admission, /social_agent_daily_usage daily_usage/u);
+  assert.match(
+    admission,
+    /ORDER BY binding\.first_seen_at DESC, binding\.id DESC/u,
+  );
+  assert.doesNotMatch(admission, /binding\.started_at/u);
+  assert.match(admission, /projectCaptureResourceAdmission\(/u);
+  assert.match(admission, /todaySearches: counts\?\.today_searches/u);
+  assert.match(admission, /expectedSearches/u);
+  assert.match(admission, /dailySearchLimit: counts\?\.daily_search_limit/u);
+});
+
+test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", () => {
+  const dispatchCore = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf(
+      "export async function dispatchCrossDeviceRetry",
+    ),
+    captureCloudRouteSource.indexOf(
+      "export async function reconcileElasticCaptureLeases",
+    ),
+  );
+  assert.match(dispatchCore, /recoveryPhase = 'fast'/u);
+  assert.match(
+    dispatchCore,
+    /retryDistributionMode === 'elastic_pool'[\s\S]*singleRelayV1: true[\s\S]*disableAutomaticSearchRetry: true/u,
+  );
+  assert.match(
+    dispatchCore,
+    /\.\.\.\(retryDistributionMode[\s\S]*distributionMode: retryDistributionMode/u,
+  );
+  assert.doesNotMatch(
+    dispatchCore,
+    /distributionMode: 'elastic_pool'/u,
+    'a fixed or promoted retry must not be mislabeled as an elastic queue claim',
+  );
+  assert.match(dispatchCore, /retry_source_local_closure_unproven/u);
+  assert.match(dispatchCore, /SELECT id, status, metadata/u);
+  assert.match(dispatchCore, /sourceExecutionMetadataById/u);
+  assert.match(
+    dispatchCore,
+    /const sourceExecutionMetadata =\s*sourceExecutionMetadataById\.get\(sourceExecutionTaskId\)[\s\S]*captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: retryItem\.item_type,[\s\S]*sourceExecutionMetadata,/u,
+  );
+  assert.match(
+    dispatchCore,
+    /const neverOpened = captureExecutionNeverOpened\(\{[\s\S]*executionTaskId: sourceExecutionTaskId,[\s\S]*sourceExecutionMetadata,[\s\S]*executionStartedAt:[\s\S]*sourceExecutionStartedAtById\.get\(sourceExecutionTaskId\)[\s\S]*attemptExists: Boolean\(sourceAttempt\)/u,
+  );
+  assert.match(
+    dispatchCore,
+    /const targetSupportsLocalClosureReuseFence =\s*businessTaskType === 'unattended_keyword_capture'[\s\S]*safeJson\(targetAgent\.capabilities\)\.localClosureReuseFenceV1 === true[\s\S]*requiresLocalClosureReuseFenceV1: undefined[\s\S]*targetSupportsLocalClosureReuseFence[\s\S]*requiresLocalClosureReuseFenceV1: true/u,
+  );
+  assert.match(dispatchCore, /expectedSearches: expectedRetrySearches/u);
+  assert.match(
+    captureCloudRouteSource,
+    /crossDeviceRetrySourceReady\([\s\S]*dutyRecovery = false[\s\S]*if \(dutyRecovery\) return true/u,
+  );
+  assert.match(dispatchCore, /requestedItemIds\.length !== 1/u);
+  assert.match(dispatchCore, /dutyRecoveryIntentId/u);
+  assert.match(dispatchCore, /dutyRecoveryGeneration/u);
+  assert.match(dispatchCore, /expectedItemRevision/u);
+  assert.match(dispatchCore, /expectedSourceAttemptId/u);
+  assert.match(dispatchCore, /expectedAttemptNumber/u);
+  assert.match(dispatchCore, /FOR UPDATE[\s\S]*source_attempt_changed/u);
+  assert.match(
+    dispatchCore,
+    /const sourceAttemptNumber = Math\.max\([\s\S]*currentSourceAttempt\?\.attempt_number[\s\S]*sourceItem\.attempt_count[\s\S]*sourceAttemptNumber >= AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT[\s\S]*AUTOMATIC_ATTEMPT_LIMIT_REACHED/u,
+  );
+  assert.doesNotMatch(
+    dispatchCore,
+    /crossDeviceRetrySafetyAgentIdsForItems/u,
+  );
+  assert.match(dispatchCore, /code: 'NO_IDLE_AGENT'/u);
+  assert.match(dispatchCore, /waitingForAgent: true/u);
+  assert.match(dispatchCore, /code: 'SOURCE_EXECUTION_ACTIVE'/u);
+  assert.match(dispatchCore, /code: 'SOURCE_COMMAND_ACTIVE'/u);
+  assert.match(dispatchCore, /waitingForSource: true/u);
+  assert.match(dispatchCore, /replayed: true/u);
+  assert.match(dispatchCore, /itemAttempts: dispatchedItemAttempts/u);
+  assert.match(dispatchCore, /captureTaskItemAttemptId: binding\.attemptId/u);
+  assert.match(dispatchCore, /captureTaskItemRequestHash: binding\.requestHash/u);
+  assert.match(
+    dispatchCore,
+    /const agentCompatibilityPayload = dutyRecovery[\s\S]*dutyRecovery: \{intentId: dutyIntentId, protocolVersion: 1\}[\s\S]*commandPayload: agentCompatibilityPayload/u,
+  );
+  assert.match(dispatchCore, /orchestration:[\s\S]*itemAttempts: itemAttemptBindings/u);
+  assert.match(
+    dispatchCore,
+    /UPDATE capture_agent_commands[\s\S]*payload = \$3::jsonb/u,
+  );
+  assert.match(dispatchCore, /dutyRecoverySourceAttemptId/u);
+  assert.match(dispatchCore, /recoveryPhase: 'duty'/u);
+
+  const agentSelection = readRouteSection(
+    "async function loadIdleCrossDeviceRetryAgent",
+    "function promotedRetryFallbackTarget",
+  );
+  assert.match(
+    agentSelection,
+    /tryLockCaptureAgentExecutionSlot[\s\S]*loadCaptureAgentLocalClosureReuseGate\(tx,[\s\S]*agentId: locked\.id/u,
+  );
+  assert.match(
+    agentSelection,
+    /localClosureReuseGate\.ready[\s\S]*reserveCaptureResourceAdmission[\s\S]*!localClosureReuseGate\.ready/u,
+  );
+});
+
+test("recovery verification and replay clocks require exact business evidence", () => {
+  const recoverySource = readRouteSection(
+    "async function projectNegativePatrolSnapshot",
+    "async function projectOrchestrationChildControlOutcome",
+  );
+  assert.match(
+    recoverySource,
+    /metadata->'targetResult'\s+IS DISTINCT FROM \$6::jsonb/u,
+  );
+  assert.match(
+    recoverySource,
+    /if \(!item\) continue;\s*projectedItemIds\.push\(item\.id\);/u,
+  );
+  assert.match(
+    recoverySource,
+    /const projectedBusinessProgressAt =\s*orchestrationCheckpointTimestamp\(snapshot\.businessProgressAt\) \|\|\s*\(projectedItemIds\.length > 0 \? now : null\);/u,
+  );
+  assert.doesNotMatch(
+    recoverySource,
+    /const projectedBusinessProgressAt[\s\S]{0,240}snapshot\.heartbeatAt/u,
+  );
+});
+
+test("legacy retry remains only as a fallback outside guarded duty Agent tenants", () => {
   assert.match(
     captureCloudRouteSource,
     /export async function reconcileAutomaticCaptureRetries/u,
@@ -2254,11 +4630,12 @@ test("cron automatically dispatches unfinished items before attention delivery",
     /item_id = ANY\(\$2::uuid\[\]\)[\s\S]*crossDeviceRetrySourceAgentIdsForItems/u,
   );
   assert.match(
+    captureCloudRouteSource,
+    /\$7::boolean = false[\s\S]*recovery_enabled\.key = 'ops_control_recovery_enabled'[\s\S]*LOWER\(BTRIM\(recovery_mode\.value\)\) = 'guarded'/u,
+  );
+  assert.match(
     cronSource,
     /reconcileAutomaticCaptureRetries\(10\)/u,
   );
-  assert.ok(
-    cronSource.indexOf("reconcileAutomaticCaptureRetries(10)") <
-      cronSource.indexOf("processCaptureAttentionNotifications(20)"),
-  );
+  assert.match(cronSource, /processCaptureAttentionNotifications\(20\)/u);
 });

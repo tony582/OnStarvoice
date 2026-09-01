@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import {withTransaction} from '../db/init.js';
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+  captureAgentFullHeartbeatOnline,
   captureAgentOnline,
   findCaptureAgentExecutionSlotBlocker,
   lockCaptureAgentExecutionSlot,
@@ -71,7 +72,12 @@ export async function loadCompatibleProfilePatrolAgent(
   agentId,
   platforms,
   subjectType,
+  {excludeTaskIds = []} = {},
 ) {
+  // Every profile entry point shares the browser's single execution-slot
+  // protocol with duty recovery. The transaction-scoped advisory closes the
+  // race between compatibility lookup and task/command materialization.
+  await lockCaptureAgentExecutionSlot(tx, tenantId, agentId);
   const agent = await tx.queryOne(`
     SELECT ca.*, tenant.status AS tenant_status,
       ac.status AS auth_code_status, ac.expires_at AS auth_code_expires_at,
@@ -90,7 +96,26 @@ export async function loadCompatibleProfilePatrolAgent(
     platforms,
     subjectType,
   );
-  return failure ? {failure} : {agent};
+  if (failure) return {failure};
+  const blocker = await findCaptureAgentExecutionSlotBlocker(
+    tx,
+    tenantId,
+    agent.id,
+    {excludeTaskIds},
+  );
+  if (blocker) {
+    return {failure: requestError(
+      'profile_scan_agent_busy',
+      '该执行节点已有采集任务正在等待或运行，请选择其它空闲节点',
+      409,
+      {
+        blockerKind: text(blocker.kind, 40),
+        blockerTaskId: text(blocker.task_id, 100),
+        blockerStatus: text(blocker.status, 80),
+      },
+    )};
+  }
+  return {agent};
 }
 
 export function profilePatrolAgentCompatibilityFailure(
@@ -121,6 +146,13 @@ export function profilePatrolAgentCompatibilityFailure(
     );
   }
   const capabilities = safeJson(agent.capabilities);
+  if (capabilities.taskStateKnown === false) {
+    return requestError(
+      'agent_heartbeat_degraded',
+      '目标执行节点本地任务状态暂不可用，请等待完整心跳恢复',
+      409,
+    );
+  }
   const capability = PROFILE_PATROL_CAPABILITIES[subjectType];
   if (
     !workflow ||
@@ -206,17 +238,16 @@ export async function loadAvailableScheduledProfilePatrolAgent(tx, {
       ca.last_heartbeat_at DESC NULLS LAST,
       ca.id
   `, [tenantId, preferred, CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES]);
-  const candidate = candidates.find(agent =>
+  const eligibleCandidates = candidates.filter(agent =>
     !profilePatrolAgentCompatibilityFailure(
       agent,
       [platform],
       subjectType,
     ) &&
-    captureAgentOnline(agent.last_heartbeat_at) &&
+    captureAgentFullHeartbeatOnline(agent) &&
     Number(agent.active_task_count || 0) === 0 &&
     Number(agent.active_command_count || 0) === 0);
-  if (candidate) {
-    await lockCaptureAgentExecutionSlot(tx, tenantId, candidate.id);
+  for (const candidate of eligibleCandidates) {
     const compatible = await loadCompatibleProfilePatrolAgent(
       tx,
       tenantId,
@@ -224,16 +255,9 @@ export async function loadAvailableScheduledProfilePatrolAgent(tx, {
       [platform],
       subjectType,
     );
-    const busy = compatible.failure ? true
-      : await findCaptureAgentExecutionSlotBlocker(
-        tx,
-        tenantId,
-        compatible.agent.id,
-      );
     if (
       !compatible.failure &&
-      !busy &&
-      captureAgentOnline(compatible.agent.last_heartbeat_at)
+      captureAgentFullHeartbeatOnline(compatible.agent)
     ) {
       return {
         agent: compatible.agent,
@@ -309,7 +333,11 @@ export async function reconcileStaleProfilePatrolExecutions(
               OR (
                 active_task.status IN ('claimed', 'running', 'recovering')
                 AND active_agent.status = 'active'
-                AND active_agent.last_heartbeat_at >=
+                AND COALESCE(
+                  active_agent.last_liveness_at,
+                  active_agent.last_full_heartbeat_at,
+                  active_agent.last_heartbeat_at
+                ) >=
                   now() - interval '2 minutes'
               )
               OR (

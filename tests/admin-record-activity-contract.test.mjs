@@ -101,6 +101,18 @@ test('drawer and batch expose all eight states with shared status-change prompts
   assert.match(inlineSave, /feishu_table_no: savedNumber/);
 });
 
+test('batch action menus are single-open and render on an opaque popover surface', () => {
+  const batchBar = source('web/admin/src/components/shared/BatchBar.tsx');
+  const styles = source('web/admin/src/index.css');
+
+  assert.match(batchBar, /const \[openMenuKey, setOpenMenuKey\] = useState<string \| null>\(null\)/);
+  assert.match(batchBar, /open=\{openMenuKey === menu\.key\}/);
+  assert.match(batchBar, /onOpenChange=\{open => setOpenMenuKey\(open \? menu\.key : null\)\}/);
+  assert.match(batchBar, /const runAction = useCallback[\s\S]*setOpenMenuKey\(null\)[\s\S]*onAction\(key\)/);
+  assert.match(styles, /--color-popover: var\(--card\);/);
+  assert.match(styles, /--color-popover-foreground: var\(--card-fg\);/);
+});
+
 test('triage filters keep operational dimensions without work-order controls', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
 

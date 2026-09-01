@@ -23,10 +23,20 @@
 
   const SENSITIVE_KEY_PATTERN =
     /(?:authorization|cookie|password|passwd|secret|token|api[_-]?key|auth(?:entication)?[_-]?code|activation[_-]?code|credential|session)/i;
+  const SENSITIVE_HEALTH_VALUE_PATTERN =
+    /(?:authorization|cookie|password|passwd|secret|token|api[_-]?key|apikey|auth(?:entication)?[_-]?code|activation[_-]?code|credential|session|bearer)/iu;
+  const JWT_LIKE_PATTERN =
+    /(?:^|[^A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:$|[^A-Za-z0-9_-])/u;
+  const UUID_LIKE_PATTERN =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+  const LONG_OPAQUE_HEALTH_SEGMENT_PATTERN =
+    /(?:^|[._:-])[A-Za-z0-9]{32,}(?:$|[._:-])/u;
+  const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/u;
 
   function sanitizeText(value, limit = 1000) {
     return text(value, limit)
       .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
+      .replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "[CREDENTIAL_REDACTED]")
       .replace(
         /\b(authorization|cookie|password|passwd|secret|token|api[_-]?key|auth(?:entication)?[_-]?code|activation[_-]?code|credential|session)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;&]+)/gi,
         "$1=[REDACTED]",
@@ -34,8 +44,18 @@
   }
 
   function sanitizeStructuredValue(value, key = "", depth = 0) {
-    const normalizedKey = String(key || "").replace(/([a-z0-9])([A-Z])/g, "$1_$2");
-    if (SENSITIVE_KEY_PATTERN.test(normalizedKey)) return "[REDACTED]";
+    const normalizedKey = String(key || "")
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+      .toLowerCase();
+    // These are closure-state booleans, not session identifiers. Preserve the
+    // exact false values so the server can fail-closed verify local teardown.
+    const isLocalClosureSessionFlag =
+      (normalizedKey === "debug_session_present" ||
+        normalizedKey === "task_session_present") &&
+      typeof value === "boolean";
+    if (SENSITIVE_KEY_PATTERN.test(normalizedKey) && !isLocalClosureSessionFlag) {
+      return "[REDACTED]";
+    }
     if (value === null || typeof value === "boolean") return value;
     if (typeof value === "number") return Number.isFinite(value) ? value : null;
     if (typeof value === "string") return sanitizeText(value);
@@ -55,6 +75,542 @@
     return safe;
   }
 
+  const TASK_HEALTH_EVIDENCE_VERSION = 1;
+  const MAX_HEALTH_LATENCY_MS = 2 * 60 * 1000;
+  const MAX_HEALTH_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+  const MAX_HEALTH_COUNTER = 1000000;
+  const RUNTIME_HEALTH_SAMPLE_CACHE_MS = 10 * 1000;
+  const RUNTIME_HEALTH_SAMPLE_COUNT = 2;
+  const RUNTIME_HEALTH_SAMPLE_DELAY_MS = 8;
+  const MAX_HEALTH_TAB_PROBES = 8;
+  const cloudTaskAgentLoadedAt = Date.now();
+  const taskHealthHints = new WeakMap();
+  let lastCloudRequestObservation = null;
+  let cachedRuntimeHealthSample = null;
+  let runtimeHealthSampleInFlight = null;
+
+  function boundedNumber(value, {
+    minimum = 0,
+    maximum = Number.MAX_SAFE_INTEGER,
+    decimals = 0,
+  } = {}) {
+    if (
+      value === null ||
+      value === undefined ||
+      value === "" ||
+      typeof value === "boolean"
+    ) return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return null;
+    const bounded = Math.min(maximum, Math.max(minimum, parsed));
+    const factor = 10 ** Math.max(0, Math.min(3, decimals));
+    return Math.round(bounded * factor) / factor;
+  }
+
+  function timestampValue(value) {
+    if (Number.isFinite(Number(value)) && Number(value) > 1000000000000) {
+      return Number(value);
+    }
+    return timestampMs(value);
+  }
+
+  function isoTimestamp(value) {
+    const timestamp = timestampValue(value);
+    return timestamp > 0 ? new Date(timestamp).toISOString() : "";
+  }
+
+  function ageMs(value, now = Date.now()) {
+    const timestamp = timestampValue(value);
+    if (timestamp <= 0) return null;
+    return boundedNumber(now - timestamp, {
+      minimum: 0,
+      maximum: MAX_HEALTH_AGE_MS,
+    });
+  }
+
+  // Health evidence accepts code-like values only. Human copy, URLs and page
+  // text are deliberately excluded from this channel even when they exist in
+  // the local task ledger.
+  function looksSensitiveHealthValue(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return false;
+    if (
+      SENSITIVE_HEALTH_VALUE_PATTERN.test(raw) ||
+      JWT_LIKE_PATTERN.test(raw) ||
+      UUID_LIKE_PATTERN.test(raw) ||
+      LONG_OPAQUE_HEALTH_SEGMENT_PATTERN.test(raw) ||
+      AWS_ACCESS_KEY_ID_PATTERN.test(raw)
+    ) return true;
+    const compact = raw.replace(/[._:-]/gu, "");
+    return (
+      compact.length >= 32 &&
+      /^[A-Za-z0-9+/_-]+$/u.test(compact) &&
+      /[a-z]/u.test(compact) &&
+      /[A-Z]/u.test(compact) &&
+      /\d/u.test(compact)
+    );
+  }
+
+  function healthCode(value, limit = 80, fallback = "unknown") {
+    const raw = text(value, Math.max(limit * 4, 320));
+    if (!raw) return fallback;
+    if (
+      /(?:https?:\/\/|www\.|[/?#&=@])/iu.test(raw) ||
+      looksSensitiveHealthValue(raw)
+    ) return fallback;
+    const normalized = raw.slice(0, limit);
+    if (!/^[A-Za-z0-9_.:-]+$/u.test(normalized)) return fallback;
+    return normalized.toLowerCase();
+  }
+
+  function optionalHealthCode(value, limit = 80) {
+    const normalized = healthCode(value, limit, "");
+    return normalized || "";
+  }
+
+  function healthVersion(value) {
+    const raw = text(value, 80);
+    if (!raw || looksSensitiveHealthValue(raw)) return "";
+    return /^\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9.-]{1,32})?$/u.test(raw)
+      ? raw
+      : "";
+  }
+
+  function booleanOrNull(value) {
+    return typeof value === "boolean" ? value : null;
+  }
+
+  function positiveTabId(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(parsed));
+  }
+
+  function requestEndpointClass(endpoint = "") {
+    const normalized = String(endpoint || "");
+    if (normalized.endsWith("/heartbeat")) return "heartbeat";
+    if (normalized.endsWith("/liveness")) return "liveness";
+    if (normalized.includes("/commands/") && normalized.endsWith("/complete")) {
+      return "command_complete";
+    }
+    return "cloud_api";
+  }
+
+  function rememberCloudRequestObservation({
+    endpoint = "",
+    startedAt = 0,
+    outcome = "unknown",
+    status = null,
+  } = {}) {
+    const completedAt = Date.now();
+    lastCloudRequestObservation = {
+      observedAt: new Date(completedAt).toISOString(),
+      endpointClass: requestEndpointClass(endpoint),
+      outcome: healthCode(outcome, 40),
+      latencyMs: boundedNumber(completedAt - Number(startedAt || completedAt), {
+        minimum: 0,
+        maximum: MAX_HEALTH_LATENCY_MS,
+      }),
+      httpStatus: boundedNumber(status, {minimum: 100, maximum: 599}),
+    };
+    return lastCloudRequestObservation;
+  }
+
+  function buildProgressObservation(source = {}, now = Date.now()) {
+    const run = objectValue(source);
+    const progress = objectValue(run.progress);
+    const current = boundedNumber(progress.current, {
+      minimum: 0,
+      maximum: MAX_HEALTH_COUNTER,
+    });
+    const total = boundedNumber(progress.total, {
+      minimum: 0,
+      maximum: MAX_HEALTH_COUNTER,
+    });
+    const sequence = boundedNumber(run.progressSeq, {
+      minimum: 0,
+      maximum: MAX_HEALTH_COUNTER,
+    }) || 0;
+    const observed = Boolean(
+      run.businessProgressAt ||
+        progress.updatedAt ||
+        sequence > 0 ||
+        (current !== null && current > 0),
+    );
+    const observedAt = observed
+      ? isoTimestamp(run.businessProgressAt || progress.updatedAt)
+      : "";
+    return {
+      observed,
+      sequence,
+      current: current ?? 0,
+      total: total ?? 0,
+      observedAt,
+      ageMs: ageMs(observedAt, now),
+    };
+  }
+
+  function healthSource(source = {}, runtime = {}) {
+    const run = objectValue(source);
+    const metadata = objectValue(run.metadata);
+    const runtimeSource = objectValue(runtime);
+    const runtimeHealth = objectValue(
+      runtimeSource.healthEvidence ||
+        runtimeSource.runtimeHealth ||
+        runtimeSource.health,
+    );
+    const taskHealth = objectValue(
+      run.healthEvidence || run.runtimeHealth || metadata.healthEvidence,
+    );
+    return {
+      page: {
+        ...objectValue(runtimeHealth.page),
+        ...objectValue(taskHealth.page),
+      },
+      network: {
+        ...objectValue(runtimeHealth.network),
+        ...objectValue(taskHealth.network),
+      },
+      runtime: {
+        ...objectValue(runtimeHealth.runtime),
+        ...objectValue(taskHealth.runtime),
+      },
+    };
+  }
+
+  function buildTaskHealthEvidence(
+    source = {},
+    runtime = {},
+    {now = Date.now(), networkObservation = lastCloudRequestObservation} = {},
+  ) {
+    const run = objectValue(source);
+    const progress = objectValue(run.progress);
+    const checkpoint = objectValue(run.checkpoint);
+    const metadata = objectValue(run.metadata);
+    const runtimeSource = objectValue(runtime);
+    const supplied = healthSource(run, runtimeSource);
+    const suppliedPage = objectValue(supplied.page);
+    const suppliedNetwork = objectValue(supplied.network);
+    const suppliedRuntime = objectValue(supplied.runtime);
+    const observedNetwork = objectValue(networkObservation);
+    const taskPlatform = healthCode(run.platform, 40);
+    const runtimePlatform = healthCode(
+      runtimeSource.platform || suppliedPage.platform,
+      40,
+    );
+    const platformMatchesTask =
+      taskPlatform === "unknown" || runtimePlatform === "unknown"
+        ? null
+        : taskPlatform === runtimePlatform;
+    const tabStatus = optionalHealthCode(
+      suppliedPage.tabStatus || suppliedPage.status,
+      30,
+    );
+    const phase = healthCode(
+      progress.phase || run.phase || checkpoint.phase || metadata.phase,
+      80,
+    );
+    const stage = healthCode(
+      run.stage || progress.stage || checkpoint.stage || metadata.stage || phase,
+      80,
+    );
+    const requestLatency = boundedNumber(
+      suppliedNetwork.lastRequestLatencyMs ??
+        suppliedNetwork.apiRttMs ??
+        suppliedNetwork.latencyMs ??
+        observedNetwork.latencyMs,
+      {minimum: 0, maximum: MAX_HEALTH_LATENCY_MS},
+    );
+
+    return {
+      version: TASK_HEALTH_EVIDENCE_VERSION,
+      stage,
+      phase,
+      progressObserved: buildProgressObservation(run, now),
+      page: {
+        platform: runtimePlatform,
+        pageType: healthCode(
+          runtimeSource.pageType || suppliedPage.pageType,
+          60,
+        ),
+        platformMatchesTask,
+        detailReady:
+          platformMatchesTask === false
+            ? null
+            : booleanOrNull(
+                typeof runtimeSource.detailReady === "boolean"
+                  ? runtimeSource.detailReady
+                  : suppliedPage.detailReady,
+              ),
+        detailReadyReason: optionalHealthCode(
+          runtimeSource.detailReadyReason || suppliedPage.detailReadyReason,
+          80,
+        ),
+        tabStatus: tabStatus || "unavailable",
+        discarded: booleanOrNull(suppliedPage.discarded),
+        frozen: booleanOrNull(suppliedPage.frozen),
+      },
+      network: {
+        available: requestLatency !== null,
+        status: healthCode(
+          suppliedNetwork.status || observedNetwork.outcome,
+          40,
+          requestLatency === null ? "unavailable" : "unknown",
+        ),
+        lastRequestLatencyMs: requestLatency,
+        lastRequestAt: isoTimestamp(
+          suppliedNetwork.observedAt || observedNetwork.observedAt,
+        ),
+        endpointClass: optionalHealthCode(observedNetwork.endpointClass, 40),
+        timeoutCount:
+          boundedNumber(suppliedNetwork.timeoutCount, {
+            minimum: 0,
+            maximum: MAX_HEALTH_COUNTER,
+          }) ?? 0,
+      },
+      runtime: {
+        stateAgeMs: ageMs(runtimeSource.lastUpdatedAt, now),
+        captureProgressAgeMs: ageMs(
+          runtimeSource.lastCaptureProgressAt,
+          now,
+        ),
+        eventLoopLagMs: boundedNumber(suppliedRuntime.eventLoopLagMs, {
+          minimum: 0,
+          maximum: MAX_HEALTH_LATENCY_MS,
+          decimals: 1,
+        }),
+        heapUsedMb: boundedNumber(suppliedRuntime.heapUsedMb, {
+          minimum: 0,
+          maximum: 1024 * 1024,
+          decimals: 1,
+        }),
+        heapLimitMb: boundedNumber(suppliedRuntime.heapLimitMb, {
+          minimum: 0,
+          maximum: 1024 * 1024,
+          decimals: 1,
+        }),
+        serviceWorkerRestartCount:
+          boundedNumber(suppliedRuntime.serviceWorkerRestartCount, {
+            minimum: 0,
+            maximum: MAX_HEALTH_COUNTER,
+          }) ?? null,
+      },
+    };
+  }
+
+  function monotonicNow() {
+    try {
+      if (typeof root.performance?.now === "function") {
+        return root.performance.now();
+      }
+    } catch {
+      // Wall-clock fallback remains sufficient for a bounded lag proxy.
+    }
+    return Date.now();
+  }
+
+  function readHeapHealthSample() {
+    try {
+      const memory = root.performance?.memory;
+      if (!memory || typeof memory !== "object") {
+        return {
+          available: false,
+          usedMb: null,
+          totalMb: null,
+          limitMb: null,
+        };
+      }
+      const bytesToMb = (value) => {
+        const bytes = boundedNumber(value, {
+          minimum: 0,
+          maximum: 1024 * 1024 * 1024 * 1024,
+        });
+        return bytes === null
+          ? null
+          : boundedNumber(bytes / (1024 * 1024), {
+              minimum: 0,
+              maximum: 1024 * 1024,
+              decimals: 1,
+            });
+      };
+      const usedMb = bytesToMb(memory.usedJSHeapSize);
+      const totalMb = bytesToMb(memory.totalJSHeapSize);
+      const limitMb = bytesToMb(memory.jsHeapSizeLimit);
+      return {
+        available: usedMb !== null || totalMb !== null || limitMb !== null,
+        usedMb,
+        totalMb,
+        limitMb,
+      };
+    } catch {
+      return {
+        available: false,
+        usedMb: null,
+        totalMb: null,
+        limitMb: null,
+      };
+    }
+  }
+
+  async function sampleCloudRuntimeHealth() {
+    const lags = [];
+    if (typeof setTimeout === "function") {
+      for (let index = 0; index < RUNTIME_HEALTH_SAMPLE_COUNT; index += 1) {
+        const startedAt = monotonicNow();
+        await new Promise((resolve) =>
+          setTimeout(resolve, RUNTIME_HEALTH_SAMPLE_DELAY_MS),
+        );
+        lags.push(
+          Math.max(
+            0,
+            monotonicNow() - startedAt - RUNTIME_HEALTH_SAMPLE_DELAY_MS,
+          ),
+        );
+      }
+    }
+    const sampledAtMs = Date.now();
+    const heap = readHeapHealthSample();
+    return {
+      sampledAtMs,
+      sampledAt: new Date(sampledAtMs).toISOString(),
+      cpuAvailable: false,
+      eventLoopAvailable: lags.length > 0,
+      eventLoopSampleCount: lags.length,
+      eventLoopLagMs:
+        lags.length > 0
+          ? boundedNumber(Math.max(...lags), {
+              minimum: 0,
+              maximum: MAX_HEALTH_LATENCY_MS,
+              decimals: 1,
+            })
+          : null,
+      heapAvailable: heap.available,
+      heapUsedMb: heap.usedMb,
+      heapTotalMb: heap.totalMb,
+      heapLimitMb: heap.limitMb,
+      serviceWorkerAgeMs: boundedNumber(
+        sampledAtMs - cloudTaskAgentLoadedAt,
+        {minimum: 0, maximum: MAX_HEALTH_AGE_MS},
+      ),
+    };
+  }
+
+  async function cachedCloudRuntimeHealth() {
+    const now = Date.now();
+    if (
+      cachedRuntimeHealthSample &&
+      now - Number(cachedRuntimeHealthSample.sampledAtMs || 0) <
+        RUNTIME_HEALTH_SAMPLE_CACHE_MS
+    ) {
+      return cachedRuntimeHealthSample;
+    }
+    if (runtimeHealthSampleInFlight) return await runtimeHealthSampleInFlight;
+    runtimeHealthSampleInFlight = sampleCloudRuntimeHealth();
+    try {
+      cachedRuntimeHealthSample = await runtimeHealthSampleInFlight;
+      return cachedRuntimeHealthSample;
+    } finally {
+      runtimeHealthSampleInFlight = null;
+    }
+  }
+
+  async function readTaskTabHealth(tabId) {
+    const normalizedTabId = positiveTabId(tabId);
+    if (normalizedTabId === null) {
+      return {
+        status: "untracked",
+        discarded: null,
+        frozen: null,
+      };
+    }
+    const tabsApi = root.chrome?.tabs;
+    if (!tabsApi || typeof tabsApi.get !== "function") {
+      return {
+        status: "unavailable",
+        discarded: null,
+        frozen: null,
+      };
+    }
+    try {
+      const tab = await tabsApi.get(normalizedTabId);
+      return {
+        status: healthCode(tab?.status, 30, "unknown"),
+        discarded: booleanOrNull(tab?.discarded),
+        frozen: booleanOrNull(tab?.frozen),
+      };
+    } catch {
+      return {status: "missing", discarded: null, frozen: null};
+    }
+  }
+
+  async function enrichHeartbeatHealthEvidence(body = {}) {
+    const payload = objectValue(body);
+    const tasks = Array.isArray(payload.tasks) ? payload.tasks.slice(0, 50) : [];
+    const liveTasks = tasks.filter(
+      (task) => taskHealthHints.get(task)?.liveEvidence === true,
+    );
+    if (liveTasks.length === 0) return payload;
+
+    const runtimeSample = await cachedCloudRuntimeHealth();
+    const tabIds = [];
+    for (const task of liveTasks) {
+      const hint = taskHealthHints.get(task);
+      const tabId = positiveTabId(hint?.tabId);
+      if (
+        tabId !== null &&
+        !tabIds.includes(tabId) &&
+        tabIds.length < MAX_HEALTH_TAB_PROBES
+      ) {
+        tabIds.push(tabId);
+      }
+    }
+    const tabHealthById = new Map(
+      await Promise.all(
+        tabIds.map(async (tabId) => [tabId, await readTaskTabHealth(tabId)]),
+      ),
+    );
+
+    for (const task of liveTasks) {
+      if (!task || typeof task !== "object" || Array.isArray(task)) continue;
+      const hint = taskHealthHints.get(task);
+      const tabId = positiveTabId(hint?.tabId);
+      const tabHealth =
+        tabId === null
+          ? {status: "untracked", discarded: null, frozen: null}
+          : tabHealthById.get(tabId) || {
+              status: "probe_limit",
+              discarded: null,
+              frozen: null,
+            };
+      const existing = objectValue(task.healthEvidence);
+      task.healthEvidence = {
+        ...existing,
+        sampledAt: runtimeSample.sampledAt,
+        page: {
+          ...objectValue(existing.page),
+          tabStatus: tabHealth.status,
+          discarded: tabHealth.discarded,
+          frozen: tabHealth.frozen,
+        },
+        runtime: {
+          ...objectValue(existing.runtime),
+          sampledAt: runtimeSample.sampledAt,
+          cpuAvailable: runtimeSample.cpuAvailable,
+          eventLoopAvailable: runtimeSample.eventLoopAvailable,
+          eventLoopSampleCount: runtimeSample.eventLoopSampleCount,
+          eventLoopLagMs: runtimeSample.eventLoopLagMs,
+          heapAvailable: runtimeSample.heapAvailable,
+          heapUsedMb: runtimeSample.heapUsedMb,
+          heapTotalMb: runtimeSample.heapTotalMb,
+          heapLimitMb: runtimeSample.heapLimitMb,
+          serviceWorkerAgeMs: runtimeSample.serviceWorkerAgeMs,
+        },
+      };
+    }
+    return payload;
+  }
+
   function timestampMs(value) {
     const timestamp = Date.parse(String(value || ""));
     return Number.isFinite(timestamp) ? timestamp : 0;
@@ -66,6 +622,15 @@
     "official_account_comment_patrol",
     "followed_creator_post_patrol",
     "official_account_post_discovery",
+  ]);
+  const LIVE_TASK_HEALTH_STATUSES = new Set([
+    "pending",
+    "waiting_device",
+    "claimed",
+    "running",
+    "recovering",
+    "resume_requested",
+    "stop_requested",
   ]);
 
   // Targeted runs keep attempt-scoped physical IDs in the local task ledger.
@@ -217,6 +782,15 @@
       .filter(Boolean)
       .slice(0, 30);
     const searchFilters = objectValue(source.searchFilters);
+    const searchPasses = (Array.isArray(source.searchPasses)
+      ? source.searchPasses
+      : [])
+      .map((value) => text(value, 20).toLowerCase())
+      .filter((value, index, values) =>
+        ["all", "image", "video"].includes(value) &&
+        values.indexOf(value) === index,
+      )
+      .slice(0, 2);
     const rawCaptureSettings = source.captureSettings;
     const hasCaptureSettings =
       rawCaptureSettings &&
@@ -243,6 +817,7 @@
       randomOffsetMin: Math.max(0, Number(source.randomOffsetMin) || 0),
       keywords,
       searchFilters: sanitizeStructuredValue(searchFilters),
+      ...(searchPasses.length > 1 ? {searchPasses} : {}),
       ...(hasKeywordMaxDetectedItems
         ? {keywordMaxDetectedItems: rawKeywordMaxDetectedItems}
         : {}),
@@ -261,16 +836,40 @@
     };
   }
 
-  function buildTaskSnapshot(run, controlRequestId = "") {
+  function buildTaskSnapshot(
+    run,
+    controlRequestId = "",
+    runtime = {},
+    healthOptions = {},
+  ) {
     const source = objectValue(run);
     const identity = taskSnapshotIdentity(source);
     const id = identity.id;
     if (!id) return null;
     const metadata = objectValue(source.metadata);
+    const safeRuntime = objectValue(runtime);
+    const taskStatus = text(source.status || "pending", 40).toLowerCase();
+    const canUseLiveHealth =
+      LIVE_TASK_HEALTH_STATUSES.has(taskStatus) &&
+      healthOptions.allowLiveHealth !== false;
+    const attemptRuntime = canUseLiveHealth ? safeRuntime : {};
+    const healthEvidence = buildTaskHealthEvidence(
+      source,
+      attemptRuntime,
+      canUseLiveHealth
+        ? healthOptions
+        : {...objectValue(healthOptions), networkObservation: null},
+    );
     const isCurrentControlRequest =
       controlRequestId &&
       (id === controlRequestId || text(metadata.controlTaskId, 240) === controlRequestId);
-    return {
+    const localClosure = objectValue(metadata.localClosure);
+    const localClosures = (Array.isArray(metadata.localClosures)
+      ? metadata.localClosures
+      : [])
+      .slice(0, 30)
+      .map((entry) => sanitizeStructuredValue(objectValue(entry)));
+    const snapshot = {
       id,
       controlTaskId: isCurrentControlRequest
         ? controlRequestId
@@ -306,11 +905,25 @@
         .map((result) => sanitizeStructuredValue(objectValue(result))),
       counts: sanitizeStructuredValue(objectValue(source.counts)),
       metadata: sanitizeStructuredValue(metadata),
+      ...(Object.keys(localClosure).length > 0
+        ? {localClosure: sanitizeStructuredValue(localClosure)}
+        : {}),
+      ...(localClosures.length > 0 ? {localClosures} : {}),
       error: sanitizeStructuredValue(objectValue(source.error)),
       message: sanitizeText(source.message, 2000),
+      appVersion: healthVersion(
+        source.appVersion ||
+          metadata.appVersion ||
+          objectValue(metadata.structuredTaskHealth).appVersion ||
+          (canUseLiveHealth ? safeRuntime.appVersion : ""),
+      ),
       attemptId: identity.attemptId,
       attemptNumber: Math.max(0, Number(source.attemptNumber) || 0),
       progressSeq: Math.max(0, Number(source.progressSeq) || 0),
+      stage: healthEvidence.stage,
+      phase: healthEvidence.phase,
+      progressObserved: healthEvidence.progressObserved,
+      healthEvidence,
       heartbeatAt: text(source.heartbeatAt, 80),
       businessProgressAt: text(source.businessProgressAt, 80),
       startedAt: text(source.startedAt, 80),
@@ -318,11 +931,30 @@
       createdAt: text(source.createdAt, 80),
       updatedAt: text(source.updatedAt, 80),
     };
+    const progress = objectValue(source.progress);
+    const canUseRuntimeTab =
+      canUseLiveHealth &&
+      (isCurrentControlRequest || LIVE_TASK_HEALTH_STATUSES.has(taskStatus));
+    const healthTabId = positiveTabId(
+      source.runnerTabId ??
+        progress.runnerTabId ??
+        (canUseRuntimeTab ? safeRuntime.lastActiveTabId : null),
+    );
+    taskHealthHints.set(snapshot, {
+      tabId: healthTabId,
+      liveEvidence: canUseLiveHealth,
+    });
+    return snapshot;
   }
 
-  function buildTargetedPostTaskSnapshot(request = {}) {
+  function buildTargetedPostTaskSnapshot(
+    request = {},
+    runtime = {},
+    healthOptions = {},
+  ) {
     const source = objectValue(request);
     const descriptor = targetedPostTaskDescriptor(source);
+    const exactAttemptId = taskSnapshotIdentity(source).attemptId;
     return buildTaskSnapshot(
       {
         ...source,
@@ -339,6 +971,11 @@
         },
       },
       text(source.id, 240),
+      runtime,
+      {
+        ...objectValue(healthOptions),
+        allowLiveHealth: Boolean(exactAttemptId),
+      },
     );
   }
 
@@ -418,6 +1055,7 @@
       captureRuns: count(source.captureRuns, 10000),
       capturedItems: count(source.capturedItems),
       succeeded: source.succeeded !== false,
+      safetyVerification: source.safetyVerification === true,
       occurredAt: text(source.occurredAt, 80),
       accountIdentity,
       metadata: sanitizeStructuredValue(objectValue(source.metadata)),
@@ -444,12 +1082,27 @@
     socialUsageEvents = [],
     reason = "heartbeat",
     lastError = "",
+    agentId = "",
+    taskStateKnown = true,
+    unattendedPlanKnown = true,
+    observedSocialAccountsKnown = true,
+    socialUsageEventsKnown = true,
+    degradedHealth = [],
   } = {}) {
     const safeRuntime = objectValue(runtime);
     const safeLedger = objectValue(ledger);
     const request = objectValue(unattendedRequest);
     const controlRequestId = text(request.id || request.requestId, 240);
-    const runs = Array.isArray(safeLedger.runs) ? safeLedger.runs : [];
+    const controlAttemptId = text(request.attemptId, 240);
+    const safeTaskStateKnown = taskStateKnown === true;
+    const runs = safeTaskStateKnown && Array.isArray(safeLedger.runs)
+      ? safeLedger.runs
+      : [];
+    const heartbeatNow = Date.now();
+    const healthOptions = {
+      now: heartbeatNow,
+      networkObservation: lastCloudRequestObservation,
+    };
     const tasks = runs
       .slice()
       .sort((left, right) => {
@@ -458,7 +1111,31 @@
         return rightTime - leftTime;
       })
       .slice(0, 50)
-      .map((run) => buildTaskSnapshot(run, controlRequestId))
+      .map((run) => {
+        const identity = taskSnapshotIdentity(run);
+        const metadata = objectValue(run?.metadata);
+        const matchesControlRequest = Boolean(
+          controlRequestId &&
+            (
+              identity.id === controlRequestId ||
+              text(metadata.controlTaskId, 240) === controlRequestId
+            ),
+        );
+        const matchesControlAttempt = Boolean(
+          controlAttemptId &&
+            identity.attemptId &&
+            identity.attemptId === controlAttemptId,
+        );
+        return buildTaskSnapshot(
+          run,
+          controlRequestId,
+          safeRuntime,
+          {
+            ...healthOptions,
+            allowLiveHealth: matchesControlRequest && matchesControlAttempt,
+          },
+        );
+      })
       .filter(Boolean)
       .filter(
         (task, index, snapshots) =>
@@ -468,6 +1145,8 @@
       );
     const targetedSnapshot = buildTargetedPostTaskSnapshot(
       targetedPostRequest,
+      safeRuntime,
+      healthOptions,
     );
     if (targetedSnapshot) {
       const existingIndex = tasks.findIndex((task) =>
@@ -482,21 +1161,32 @@
       tasks.unshift(targetedSnapshot);
     }
 
+    const degradedReasons = (Array.isArray(degradedHealth)
+      ? degradedHealth
+      : [])
+      .map(value => text(value, 120))
+      .filter(Boolean)
+      .slice(0, 12);
     return {
       agent: {
+        registrationId: text(agentId, 240),
         clientUuid: text(safeRuntime.clientUuid, 240),
         clientLabel: text(safeRuntime.clientLabel, 240),
-        appVersion: text(safeRuntime.appVersion, 80),
+        appVersion: healthVersion(safeRuntime.appVersion),
         capabilities: {
           parallelSlots: 1,
           supportedPlatforms: ["xiaohongshu", "douyin", "weibo"],
           remoteResume: true,
           remoteTaskCreate: true,
+          xiaohongshuSourceOpenV1: false,
           remoteStop: true,
           remoteUnattendedPlanWrite: true,
           remoteUnattendedPlanDelete: true,
           remoteTaskEnhancementOptions: true,
           remoteTaskKeywordPostLimit: true,
+          remoteSequentialSearchPassesV1: true,
+          singleRelayV1: true,
+          localClosureReuseFenceV1: true,
           remoteOrchestrationRecoveryMergeV1: true,
           negativePostPatrol: true,
           watchedContentPatrol: true,
@@ -511,26 +1201,47 @@
           localExecutionLock: true,
           socialAccountIdentity: true,
           socialAccountDailyUsage: true,
+          structuredTaskHealthV1: true,
+          dutyRecoveryLineageV1: true,
+          taskStateKnown: safeTaskStateKnown,
+          heartbeatDegraded: degradedReasons.length > 0,
           taskLedgerVersion: Number(safeLedger.version || 1) || 1,
         },
         lastError: sanitizeText(lastError, 1000),
+        health: {
+          status: degradedReasons.length > 0 ? "degraded" : "healthy",
+          degradedReasons,
+          taskStateKnown: safeTaskStateKnown,
+        },
       },
-      unattendedPlan: buildUnattendedPlanSnapshot(unattendedPlan),
-      tasks,
-      observedSocialAccounts: (
-        Array.isArray(observedSocialAccounts) ? observedSocialAccounts : []
-      )
-        .slice(0, 10)
-        .map(buildObservedSocialAccountSnapshot)
-        .filter(Boolean),
-      socialUsageEvents: (
-        Array.isArray(socialUsageEvents) ? socialUsageEvents : []
-      )
-        .slice(0, 200)
-        .map(buildSocialUsageEventSnapshot)
-        .filter(Boolean),
+      ...(unattendedPlanKnown === true
+        ? {unattendedPlan: buildUnattendedPlanSnapshot(unattendedPlan)}
+        : {}),
+      ...(safeTaskStateKnown ? {tasks} : {}),
+      ...(observedSocialAccountsKnown === true
+        ? {
+            observedSocialAccounts: (
+              Array.isArray(observedSocialAccounts)
+                ? observedSocialAccounts
+                : []
+            )
+              .slice(0, 10)
+              .map(buildObservedSocialAccountSnapshot)
+              .filter(Boolean),
+          }
+        : {}),
+      ...(socialUsageEventsKnown === true
+        ? {
+            socialUsageEvents: (
+              Array.isArray(socialUsageEvents) ? socialUsageEvents : []
+            )
+              .slice(0, 200)
+              .map(buildSocialUsageEventSnapshot)
+              .filter(Boolean),
+          }
+        : {}),
       reason: text(reason, 120),
-      sentAt: new Date().toISOString(),
+      sentAt: new Date(heartbeatNow).toISOString(),
     };
   }
 
@@ -569,6 +1280,7 @@
     for (const baseUrl of trustedBaseUrls) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const requestStartedAt = Date.now();
       try {
         const response = await fetchImpl(`${baseUrl}${endpoint}`, {
           method: "POST",
@@ -582,9 +1294,21 @@
         const data = await response.json().catch(() => null);
         if (response.status === 404) {
           lastError = {ok: false, reason: "endpoint_missing", status: 404};
+          rememberCloudRequestObservation({
+            endpoint,
+            startedAt: requestStartedAt,
+            outcome: "endpoint_missing",
+            status: response.status,
+          });
           continue;
         }
         if (!response.ok || !data?.ok) {
+          rememberCloudRequestObservation({
+            endpoint,
+            startedAt: requestStartedAt,
+            outcome: response.ok ? "application_error" : "http_error",
+            status: response.status,
+          });
           return {
             ok: false,
             status: response.status,
@@ -592,6 +1316,12 @@
             message: data?.message || "云端任务中心请求失败",
           };
         }
+        rememberCloudRequestObservation({
+          endpoint,
+          startedAt: requestStartedAt,
+          outcome: "success",
+          status: response.status,
+        });
         return data;
       } catch (error) {
         lastError = {
@@ -599,6 +1329,11 @@
           reason: error?.name === "AbortError" ? "timeout" : "network_error",
           message: error?.message || "network error",
         };
+        rememberCloudRequestObservation({
+          endpoint,
+          startedAt: requestStartedAt,
+          outcome: lastError.reason,
+        });
       } finally {
         clearTimeout(timeoutId);
       }
@@ -607,8 +1342,10 @@
   }
 
   async function sendHeartbeat(options = {}) {
+    const body = await enrichHeartbeatHealthEvidence(options.body);
     return await requestJson({
       ...options,
+      body,
       endpoint: "/api/capture-cloud/agent/heartbeat",
     });
   }
@@ -633,6 +1370,8 @@
   }
 
   root.OnStarvoiceCloudTaskAgent = Object.freeze({
+    buildTaskHealthEvidence,
+    enrichHeartbeatHealthEvidence,
     buildTaskSnapshot,
     buildTargetedPostTaskSnapshot,
     buildUnattendedPlanSnapshot,

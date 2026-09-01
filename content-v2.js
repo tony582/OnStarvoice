@@ -19,6 +19,7 @@ import {
 } from "./utils/capture/index.js";
 
 import {expandKeywordViaSuggestions} from "./utils/capture/keyword-expansion.js";
+import {findXhsSourceNote} from "./utils/capture/keyword-search.js";
 
 import {detectPageType, detectPlatformFromUrl} from "./utils/helpers.js";
 import {setCancelFlag, resetCancelFlag} from "./utils/scroll.js";
@@ -44,7 +45,7 @@ import {
 console.log("[StarVoice V1.0] Content script loaded");
 
 let activeCommentsCaptureRequestId = "";
-const activeCaptureRequestIds = new Set();
+const activeCaptureRequestCounts = new Map();
 let listCaptureInvocationSequence = 0;
 let activeListCaptureDebugOverlay = null;
 const pendingListCaptureCancellations = new Map();
@@ -379,6 +380,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponseWithDiagnostics({ok: true, ready: true});
       return false;
 
+    case "inspectCaptureActivity":
+      handleInspectCaptureActivity(request, sendResponseWithDiagnostics);
+      return false;
+
     case "detectPageType":
       handleDetectPageType(sendResponseWithDiagnostics);
       return true;
@@ -415,6 +420,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       runTrackedCaptureRequest(request, () =>
         handleCaptureKeywordNotes(request, sendResponseWithDiagnostics),
       );
+      return true;
+
+    case "findXhsSourceNote":
+      handleFindXhsSourceNote(request, sendResponseWithDiagnostics);
       return true;
 
     case "updateListCaptureTraceBindings":
@@ -479,8 +488,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 function runTrackedCaptureRequest(request, handler) {
   const requestId = String(request?.captureRequestId || "").trim();
   if (requestId) {
-    activeCaptureRequestIds.add(requestId);
+    activeCaptureRequestCounts.set(
+      requestId,
+      Math.max(0, Number(activeCaptureRequestCounts.get(requestId)) || 0) + 1,
+    );
   }
+
+  const releaseRequest = () => {
+    if (!requestId) return;
+    const activeCount = Math.max(
+      0,
+      Number(activeCaptureRequestCounts.get(requestId)) || 0,
+    );
+    if (activeCount <= 1) {
+      activeCaptureRequestCounts.delete(requestId);
+      return;
+    }
+    activeCaptureRequestCounts.set(requestId, activeCount - 1);
+  };
 
   let result;
   try {
@@ -488,9 +513,7 @@ function runTrackedCaptureRequest(request, handler) {
     // matching cancel message can interleave with the request startup.
     result = handler();
   } catch (error) {
-    if (requestId) {
-      activeCaptureRequestIds.delete(requestId);
-    }
+    releaseRequest();
     throw error;
   }
 
@@ -499,10 +522,27 @@ function runTrackedCaptureRequest(request, handler) {
       console.error("[Content] Tracked capture handler failed:", error);
     })
     .finally(() => {
-      if (requestId) {
-        activeCaptureRequestIds.delete(requestId);
-      }
+      releaseRequest();
     });
+}
+
+function handleInspectCaptureActivity(request, sendResponse) {
+  const targetRequestId = String(request?.captureRequestId || "").trim();
+  const activeCount = [...activeCaptureRequestCounts.values()].reduce(
+    (total, value) => total + Math.max(0, Number(value) || 0),
+    0,
+  );
+  sendResponse({
+    ok: true,
+    captureRequestId: targetRequestId,
+    targetActive: targetRequestId
+      ? Math.max(
+          0,
+          Number(activeCaptureRequestCounts.get(targetRequestId)) || 0,
+        ) > 0
+      : activeCount > 0,
+    activeCount,
+  });
 }
 
 function reportCaptureProgress(request, progress = {}) {
@@ -953,6 +993,24 @@ async function handleCaptureKeywordNotes(request, sendResponse) {
   }
 }
 
+async function handleFindXhsSourceNote(request, sendResponse) {
+  try {
+    const result = await findXhsSourceNote({
+      expectedNoteId: request.expectedNoteId,
+      maxScrollTimes: request.maxScrollTimes,
+      maxDurationMs: request.maxDurationMs,
+    });
+    sendResponse(result);
+  } catch (error) {
+    sendResponse({
+      ok: false,
+      found: false,
+      reason: String(error?.code || "source_lookup_failed"),
+      message: String(error?.message || "小红书原文定位失败"),
+    });
+  }
+}
+
 /**
  * 处理关键词裂变扩词
  */
@@ -1072,6 +1130,7 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
       searchScope: request?.searchScope || "",
       distance: request?.distance || "",
       videoDuration: request?.videoDuration || "",
+      verifyDefaults: request?.verifyDefaults === true,
     });
     sendResponse({ ok: true, data: result });
   } catch (error) {
@@ -1171,6 +1230,21 @@ async function applyBatchFilterOption({
   return ok;
 }
 
+function isBatchFilterOptionActive({field, labels, platform} = {}) {
+  if (!labels) {
+    return false;
+  }
+  const panel = findStrategyFilterPanel();
+  if (!panel) {
+    return false;
+  }
+  return findOptionCandidatesInFilterSection(
+    panel,
+    getBatchFilterSectionCandidates(field, platform),
+    labels,
+  ).some((node) => isStrategyControlActive(node));
+}
+
 // 复用「找对标账号」的筛选点击能力(ensureKeywordStrategyFilterPanelOpen + applyStrategyFilterInSection),
 // 给批量采集在采集前按需切「排序 / 范围」。默认值则不改,直接返回。
 async function applyBatchSearchFilters({
@@ -1180,10 +1254,19 @@ async function applyBatchSearchFilters({
   searchScope = "",
   distance = "",
   videoDuration = "",
+  verifyDefaults = false,
 } = {}) {
   const pageType = detectPageType(window.location.href);
   if (pageType !== "search_results") {
-    return { applied: false, reason: "not_search_page" };
+    return {
+      applied: false,
+      complete: false,
+      reason: "not_search_page",
+      requestedCount: 0,
+      appliedCount: 0,
+      failedFields: [],
+      results: [],
+    };
   }
   const platform = /douyin\.com/i.test(window.location.href)
     ? "douyin"
@@ -1229,6 +1312,7 @@ async function applyBatchSearchFilters({
       defaultValue: "all",
       labels: BATCH_DISTANCE_LABELS[distance],
       displayLabel: "位置距离",
+      platforms: ["xiaohongshu"],
     },
     {
       field: "videoDuration",
@@ -1236,29 +1320,74 @@ async function applyBatchSearchFilters({
       defaultValue: "all",
       labels: BATCH_VIDEO_DURATION_LABELS[videoDuration],
       displayLabel: "视频时长",
+      platforms: ["douyin"],
     },
-  ].filter((item) => shouldApplyBatchFilter(item.value, item.defaultValue));
+  ]
+    .filter((item) => !item.platforms || item.platforms.includes(platform))
+    .filter((item) => verifyDefaults
+      ? Boolean(String(item.value || "").trim())
+      : shouldApplyBatchFilter(item.value, item.defaultValue));
   if (filterRequests.length === 0) {
-    return { applied: false, reason: "no_filter" };
+    return {
+      applied: false,
+      complete: true,
+      reason: "no_filter",
+      requestedCount: 0,
+      appliedCount: 0,
+      failedFields: [],
+      results: [],
+    };
   }
   const notes = [];
   const opened = await ensureKeywordStrategyFilterPanelOpen(notes);
   if (!opened) {
-    return { applied: false, reason: "panel_not_opened", notes };
+    return {
+      applied: false,
+      complete: false,
+      reason: "panel_not_opened",
+      requestedCount: filterRequests.length,
+      appliedCount: 0,
+      failedFields: filterRequests.map((item) => item.field),
+      results: filterRequests.map((item) => ({
+        field: item.field,
+        value: item.value,
+        applied: false,
+      })),
+      notes,
+    };
   }
-  let applied = false;
+  const results = [];
   for (const request of filterRequests) {
-    const ok = await applyBatchFilterOption({
+    const alreadyActive = isBatchFilterOptionActive({
+      ...request,
+      platform,
+    });
+    const ok = alreadyActive || await applyBatchFilterOption({
       ...request,
       notes,
       platform,
     });
-    if (ok) {
-      applied = true;
-    }
+    results.push({
+      field: request.field,
+      value: request.value,
+      applied: ok,
+      changed: ok && !alreadyActive,
+    });
   }
   await closeKeywordStrategyFilterPanel(notes);
-  return { applied, notes };
+  const appliedCount = results.filter((item) => item.applied).length;
+  const failedFields = results
+    .filter((item) => !item.applied)
+    .map((item) => item.field);
+  return {
+    applied: appliedCount > 0,
+    complete: failedFields.length === 0,
+    requestedCount: results.length,
+    appliedCount,
+    failedFields,
+    results,
+    notes,
+  };
 }
 
 async function prepareKeywordStrategyCapture() {
@@ -1989,7 +2118,11 @@ function handleCancelCapture(request, sendResponse) {
       request?.listCaptureRunId,
     );
     const matched =
-      !targetRequestId || activeCaptureRequestIds.has(targetRequestId);
+      !targetRequestId ||
+      Math.max(
+        0,
+        Number(activeCaptureRequestCounts.get(targetRequestId)) || 0,
+      ) > 0;
     const listCaptureMatched = rememberListCaptureCancellation(listCaptureRunId);
     if (matched || listCaptureMatched) {
       setCancelFlag(true);

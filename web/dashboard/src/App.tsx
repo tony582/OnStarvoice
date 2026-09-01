@@ -7,6 +7,12 @@ import {
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
 
+import {
+  isXhsRecord,
+  targetNoteIdFromRecord,
+  validatedSavedXhsSourceUrl,
+} from './xhs-source-link'
+
 function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)) }
 
 type ApiOptions = Omit<RequestInit, 'body' | 'headers'> & {
@@ -42,6 +48,8 @@ interface RecordRow {
   comments_count?: NumericValue
   collects?: NumericValue
   url?: string | null
+  external_id?: string | null
+  canonical_url?: string | null
   content?: string | null
   ai_summary?: string | null
 }
@@ -86,6 +94,51 @@ async function api<T>(path: string, opts: ApiOptions = {}): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', 'x-auth-code': authCode, ...opts.headers }
   const resp = await fetch('/api/user' + path, { ...opts, headers, body: opts.body ? JSON.stringify(opts.body) : undefined })
   return resp.json() as Promise<T>
+}
+
+function RecordSourceAction({ record, className = '' }: { record: RecordRow; className?: string }) {
+  const isXhs = isXhsRecord(record)
+  if (!isXhs) {
+    if (!record.url) return null
+    return (
+      <a
+        href={record.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={event => event.stopPropagation()}
+        className={cn('inline-flex items-center gap-1 text-primary hover:underline', className)}
+      >
+        <ExternalLink className="h-3.5 w-3.5" />原文
+      </a>
+    )
+  }
+
+  const savedUrl = validatedSavedXhsSourceUrl(
+    String(record.url || ''),
+    targetNoteIdFromRecord(record),
+  )
+  if (!savedUrl) {
+    return (
+      <span
+        title="未保存可用的完整小红书原文链接"
+        aria-label="小红书原文不可用"
+        className={cn('inline-flex items-center gap-1 text-muted-foreground', className)}
+      >
+        原文不可用
+      </span>
+    )
+  }
+  return (
+    <a
+      href={savedUrl}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={event => event.stopPropagation()}
+      className={cn('inline-flex items-center gap-1 text-primary hover:underline', className)}
+    >
+      <ExternalLink className="h-3.5 w-3.5" />原文
+    </a>
+  )
 }
 
 /* ---- Theme Toggle ---- */
@@ -281,8 +334,7 @@ function DashboardView({ owner }: { owner: string }) {
                       </td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{fmt(r.likes)}/{fmt(r.comments_count)}/{fmt(r.collects)}</td>
                       <td className="px-4 py-3 text-right">
-                        {r.url && <a href={r.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}
-                          className="inline-flex items-center gap-1 text-primary hover:underline"><ExternalLink className="h-3.5 w-3.5" />原文</a>}
+                        <RecordSourceAction record={r} />
                       </td>
                     </tr>
                   ))}
@@ -319,7 +371,7 @@ function DashboardView({ owner }: { owner: string }) {
             <p className="mb-4 whitespace-pre-wrap text-sm leading-relaxed">{selected.content || selected.ai_summary || '无内容'}</p>
             <div className="text-xs text-muted-foreground">
               {selected.author_name && <span>作者: {selected.author_name} · </span>}
-              {selected.url && <a href={selected.url} target="_blank" rel="noreferrer" className="text-primary hover:underline">查看原文</a>}
+              <RecordSourceAction record={selected} className="text-xs" />
             </div>
           </div>
         </div>

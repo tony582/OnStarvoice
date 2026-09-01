@@ -11,6 +11,59 @@ function getSessionToken(req) {
   return req.cookies?.osv_session || req.headers['x-session-token'] || '';
 }
 
+function getCaptureAgentToken(req) {
+  const authHeader = String(req.headers.authorization || '');
+  return authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7).trim()
+    : String(req.headers['x-capture-agent-token'] || '').trim();
+}
+
+async function loadCaptureAgentByToken(token) {
+  if (!token) return null;
+  return await queryOne(`
+    SELECT ca.*,
+      ac.status AS auth_code_status,
+      ac.expires_at AS auth_code_expires_at,
+      ab.id AS active_auth_binding_id,
+      t.name AS tenant_name,
+      t.status AS tenant_status
+    FROM capture_agent_tokens cat
+    JOIN capture_agents ca
+      ON ca.id = cat.agent_id
+      AND ca.auth_code_id = cat.auth_code_id
+      AND ca.auth_binding_id = cat.auth_binding_id
+    JOIN tenants t ON t.id = ca.tenant_id
+    LEFT JOIN auth_codes ac
+      ON ac.id = cat.auth_code_id
+      AND ac.id = ca.auth_code_id
+      AND ac.tenant_id = ca.tenant_id
+    LEFT JOIN auth_bindings ab
+      ON ab.id = cat.auth_binding_id
+      AND ab.id = ca.auth_binding_id
+      AND ab.code_id = ac.id
+    WHERE cat.token_hash = $1 AND cat.revoked_at IS NULL
+    LIMIT 1
+  `, [hashCaptureAgentToken(token)]);
+}
+
+function captureAgentEntitlementError(agent) {
+  if (!agent) {
+    return [401, 'invalid_agent_token', '采集节点令牌无效，请重新验证扩展'];
+  }
+  if (agent.status !== 'active' || agent.tenant_status !== 'active') {
+    return [403, 'agent_inactive', '采集节点已暂停或撤销'];
+  }
+  if (
+    !agent.auth_code_id ||
+    !agent.active_auth_binding_id ||
+    agent.auth_code_status !== 'active' ||
+    (agent.auth_code_expires_at && new Date(agent.auth_code_expires_at) < new Date())
+  ) {
+    return [403, 'agent_entitlement_inactive', '采集节点授权已失效，请重新验证扩展'];
+  }
+  return null;
+}
+
 function requestedTenantId(req) {
   return req.headers['x-tenant-id'] || req.query?.tenantId || req.body?.tenantId || '';
 }
@@ -102,51 +155,15 @@ export async function requireTenantAccess(req, res, next) {
  */
 export async function requireCaptureAgent(req, res, next) {
   try {
-    const authHeader = String(req.headers.authorization || '');
-    const token = authHeader.startsWith('Bearer ')
-      ? authHeader.slice(7).trim()
-      : String(req.headers['x-capture-agent-token'] || '').trim();
+    const token = getCaptureAgentToken(req);
     if (!token) {
       return res.status(401).json({ ok: false, error: 'missing_agent_token', message: '缺少采集节点令牌' });
     }
-
-    const agent = await queryOne(`
-      SELECT ca.*,
-        ac.status AS auth_code_status,
-        ac.expires_at AS auth_code_expires_at,
-        ab.id AS active_auth_binding_id,
-        t.name AS tenant_name,
-        t.status AS tenant_status
-      FROM capture_agent_tokens cat
-      JOIN capture_agents ca
-        ON ca.id = cat.agent_id
-        AND ca.auth_code_id = cat.auth_code_id
-        AND ca.auth_binding_id = cat.auth_binding_id
-      JOIN tenants t ON t.id = ca.tenant_id
-      LEFT JOIN auth_codes ac
-        ON ac.id = cat.auth_code_id
-        AND ac.id = ca.auth_code_id
-        AND ac.tenant_id = ca.tenant_id
-      LEFT JOIN auth_bindings ab
-        ON ab.id = cat.auth_binding_id
-        AND ab.id = ca.auth_binding_id
-        AND ab.code_id = ac.id
-      WHERE cat.token_hash = $1 AND cat.revoked_at IS NULL
-      LIMIT 1
-    `, [hashCaptureAgentToken(token)]);
-    if (!agent) {
-      return res.status(401).json({ ok: false, error: 'invalid_agent_token', message: '采集节点令牌无效，请重新验证扩展' });
-    }
-    if (agent.status !== 'active' || agent.tenant_status !== 'active') {
-      return res.status(403).json({ ok: false, error: 'agent_inactive', message: '采集节点已暂停或撤销' });
-    }
-    if (
-      !agent.auth_code_id ||
-      !agent.active_auth_binding_id ||
-      agent.auth_code_status !== 'active' ||
-      (agent.auth_code_expires_at && new Date(agent.auth_code_expires_at) < new Date())
-    ) {
-      return res.status(403).json({ ok: false, error: 'agent_entitlement_inactive', message: '采集节点授权已失效，请重新验证扩展' });
+    const agent = await loadCaptureAgentByToken(token);
+    const entitlementError = captureAgentEntitlementError(agent);
+    if (entitlementError) {
+      const [status, error, message] = entitlementError;
+      return res.status(status).json({ok: false, error, message});
     }
 
     req.captureAgent = agent;
@@ -154,6 +171,39 @@ export async function requireCaptureAgent(req, res, next) {
     req.tenantName = agent.tenant_name;
     req.actorType = 'capture_agent';
     req.actorName = agent.display_name || agent.client_label || agent.client_uuid;
+    return next();
+  } catch (err) {
+    return next(err);
+  }
+}
+
+/**
+ * 普通内容同步仍以激活码确定租户；若请求同时携带节点令牌，则把它
+ * 解析为可选的任务证据身份。没有令牌时内容照常入库，但不能归入任何
+ * capture task/item attempt。令牌与激活码不属于同一绑定时直接拒绝，
+ * 避免跨节点或迟到请求冒充当前恢复尝试。
+ */
+export async function optionalCaptureAgent(req, res, next) {
+  try {
+    const token = getCaptureAgentToken(req);
+    if (!token) return next();
+    const agent = await loadCaptureAgentByToken(token);
+    const entitlementError = captureAgentEntitlementError(agent);
+    if (entitlementError) {
+      const [status, error, message] = entitlementError;
+      return res.status(status).json({ok: false, error, message});
+    }
+    if (
+      String(req.tenantId || '') !== String(agent.tenant_id || '') ||
+      String(req.authCodeRow?.id || '') !== String(agent.auth_code_id || '')
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: 'agent_auth_binding_mismatch',
+        message: '采集节点与当前激活码绑定不一致，请重新验证扩展',
+      });
+    }
+    req.captureAgent = agent;
     return next();
   } catch (err) {
     return next(err);

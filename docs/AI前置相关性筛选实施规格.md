@@ -91,7 +91,7 @@ AI 前置的价值不是替代后端最终分析，而是尽早停止明显无�
 | 品牌相关性 | 内容是否真的涉及别克汽车品牌 | 别克新车发布：相关 |
 | 查询意图匹配 | 内容是否符合“别克壁纸”这一完整意图 | 别克新车发布但没有壁纸：不匹配 |
 
-前置筛选必须独立输出这两个判断。是否进入增强采集，以“查询意图匹配”为主；后端最终舆情分析仍可使用更宽的品牌相关性。
+前置筛选必须独立输出这两个判断。查询意图匹配只决定当前关键词归因；只有查询意图明确不匹配、租户整体监测也明确无关且没有投诉、故障、救援等保护信号时，才允许跳过增强。后端最终舆情分析使用租户品牌背景与全部监测主题综合判断。
 
 ## 5. 当前可用信号
 
@@ -209,6 +209,8 @@ flowchart TD
   "executionDisposition": "collect_full|collect_detail_minimal|skip_expensive|sample_full",
   "queryMatch": 0.0,
   "brandMatch": 0.0,
+  "tenantRelevance": "relevant|irrelevant|uncertain|null",
+  "protectedSignal": false,
   "confidence": 0.0,
   "reason": "标题明确是大众汽车壁纸，与别克壁纸意图不符",
   "evidence": ["标题: 大众GTI壁纸", "作者: 大众车友会"],
@@ -218,13 +220,13 @@ flowchart TD
 
 `modelDecision` 与 `executionDisposition` 必须分开：前者是模型在有限证据下的建议，后者才是采集器此刻允许执行的动作。例如影子模式可以得到 `modelDecision=skip`，但必须写成 `executionDisposition=collect_full`。
 
-只有 `status=ok` 时，`modelDecision / decisionFinality / queryMatch / brandMatch / confidence` 才是必填模型字段。`ai_failed / ai_timed_out / invalid_input` 等非成功状态中，这些字段必须为 `null` 或省略；`executionDisposition` 仍必填且只能安全放行。校验器不得因模型字段为空而丢弃故障审计记录。
+只有 `status=ok` 时，`modelDecision / decisionFinality / queryMatch / brandMatch / tenantRelevance / confidence` 才是必填模型字段。`protectedSignal` 由服务端规则补充。`ai_failed / ai_timed_out / invalid_input` 等非成功状态中，模型字段必须为 `null` 或省略；`executionDisposition` 仍必填且只能安全放行。校验器不得因模型字段为空而丢弃故障审计记录。
 
 处置映射：
 
 | 阶段/模式 | 模型结果 | 实际处置 |
 |---|---|---|
-| `0.3.46` 当前保守列表筛选 | 高置信度 `skip`、标题可信且服务端返回 `skip_full_capture` | 保留基础列表记录，执行 `skip_expensive` |
+| 当前保守列表筛选 | 高置信度 `skip`、`tenantRelevance=irrelevant`、整体匹配分足够低、无保护信号，且服务端返回 `skip_full_capture` | 保留基础列表记录，执行 `skip_expensive` |
 | `0.3.46` 当前保守列表筛选 | `keep / need_detail / 低置信度 / 兜底标题 / 任何失败` | `collect_full` |
 | 第一期影子模式 | 任意结果、超时或错误 | `collect_full` |
 | 阶段 2 保守列表筛选 | 高置信度 `skip` 且未被抽检 | `skip_expensive` |
@@ -289,7 +291,7 @@ discovered
   "platform": "xiaohongshu",
   "stage": "list|detail",
   "keyword": "别克壁纸",
-  "promptVersion": "prefilter-list-v2",
+  "promptVersion": "prefilter-list-v3",
   "intent": {
     "intentId": "intent_uuid",
     "intentVersion": 1,
@@ -317,7 +319,7 @@ discovered
   "ok": true,
   "requestId": "req_uuid",
   "intentId": "intent_uuid",
-  "promptVersion": "prefilter-list-v2",
+  "promptVersion": "prefilter-list-v3",
   "intentVersion": 1,
   "model": "qwen-or-deepseek-model-name",
   "latencyMs": 826,
@@ -329,6 +331,8 @@ discovered
       "decisionFinality": "provisional",
       "queryMatch": 0.99,
       "brandMatch": 0.99,
+      "tenantRelevance": "relevant",
+      "protectedSignal": false,
       "confidence": 0.98,
       "reason": "标题同时命中别克车型与壁纸用途",
       "evidence": ["别克世纪", "车机壁纸"],

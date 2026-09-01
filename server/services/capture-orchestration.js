@@ -1,4 +1,8 @@
 import crypto from 'node:crypto';
+import {
+  normalizeCaptureResourcePolicy,
+  validateCaptureResourcePolicy,
+} from './capture-resource-policy.js';
 
 const PLATFORM_ALIASES = Object.freeze({
   xhs: 'xiaohongshu',
@@ -65,6 +69,56 @@ function boolean(value, fallback = false) {
   if (value === 'true') return true;
   if (value === 'false') return false;
   return fallback;
+}
+
+const SEARCH_FILTER_VALUES = Object.freeze({
+  sort: new Set(['comprehensive', 'latest', 'likes', 'comments', 'collects']),
+  publishTime: new Set(['all', 'day', 'week', 'month', 'halfyear']),
+  contentType: new Set(['all', 'image', 'video']),
+  searchScope: new Set(['all', 'followed', 'viewed', 'unviewed']),
+  distance: new Set(['all', 'city', 'nearby']),
+  videoDuration: new Set(['all', 'under_1m', '1_5m', 'over_5m']),
+});
+
+const SEARCH_FILTER_DEFAULTS = Object.freeze({
+  sort: 'comprehensive',
+  publishTime: 'all',
+  contentType: 'all',
+  searchScope: 'all',
+  distance: 'all',
+  videoDuration: 'all',
+});
+
+function normalizeSingleSearchFilter(name, value) {
+  // Search filters other than the explicitly modeled patrol path are mutually
+  // exclusive. If an API caller sends an array, keep only its first valid
+  // choice rather than creating an unsupported cross-product of searches.
+  const candidates = Array.isArray(value) ? value : [value];
+  for (const candidate of candidates) {
+    const normalized = text(candidate, 80).toLowerCase();
+    if (SEARCH_FILTER_VALUES[name]?.has(normalized)) return normalized;
+  }
+  return SEARCH_FILTER_DEFAULTS[name] || '';
+}
+
+function normalizeSequentialSearchPasses(value, fallbackContentType = 'all') {
+  const allowed = new Set(['all', 'image', 'video']);
+  const fallback = allowed.has(fallbackContentType) ? fallbackContentType : 'all';
+  const requested = normalizeStringList(value, {
+    limit: 3,
+    itemLimit: 20,
+    map: item => text(item, 20).toLowerCase(),
+  }).filter(item => allowed.has(item));
+  if (requested.length === 0) return [fallback];
+  if (requested.length === 1) return requested;
+
+  // Only a comprehensive pass may have one focused supplement. Nested time
+  // filters and arbitrary media combinations remain intentionally unsupported.
+  if (requested.includes('all')) {
+    const supplement = requested.find(item => item === 'image' || item === 'video');
+    return supplement ? ['all', supplement] : ['all'];
+  }
+  return [requested[0]];
 }
 
 function normalizeStringList(value, {limit, itemLimit, map = item => item} = {}) {
@@ -374,12 +428,12 @@ export function normalizeOrchestrationRequest(
     },
   );
   const rawFilters = object(source.searchFilters || source.search_filters);
-  const readFilter = name => text(
+  const readFilter = name => normalizeSingleSearchFilter(
+    name,
     Object.prototype.hasOwnProperty.call(source, name)
       ? source[name]
       : rawFilters[name],
-    80,
-  ).toLowerCase();
+  );
   const hasCaptureSettings = Boolean(
     source.captureSettings &&
     typeof source.captureSettings === 'object' &&
@@ -403,14 +457,38 @@ export function normalizeOrchestrationRequest(
   const rawRecoveryPolicy = object(
     source.recoveryPolicy || source.recovery_policy,
   );
+  const disableAutomaticSearchRetry = boolean(
+    rawRecoveryPolicy.disableAutomaticSearchRetry ??
+    rawRecoveryPolicy.disable_automatic_search_retry,
+    false,
+  );
+  const requireVerifiedFilters = boolean(
+    rawRecoveryPolicy.requireVerifiedFilters ??
+    rawRecoveryPolicy.require_verified_filters,
+    false,
+  );
   const recoveryPolicy = {
     allowIdleAgentHandoff: boolean(
       rawRecoveryPolicy.allowIdleAgentHandoff ??
       rawRecoveryPolicy.allow_idle_agent_handoff,
       true,
     ),
+    ...(disableAutomaticSearchRetry ? {disableAutomaticSearchRetry: true} : {}),
+    ...(requireVerifiedFilters ? {requireVerifiedFilters: true} : {}),
     platformSafetyMode: 'manual_confirmed',
   };
+  const rawResourcePolicy =
+    source.resourcePolicy ?? source.resource_policy ?? {};
+  const resourcePolicyValidation = validateCaptureResourcePolicy(
+    rawResourcePolicy,
+  );
+  if (!resourcePolicyValidation.valid) {
+    throw scheduleError(
+      'invalid_capture_resource_policy',
+      '采集并发策略格式无效，请检查计划并发、共享网络组和接力节点',
+    );
+  }
+  const resourcePolicy = normalizeCaptureResourcePolicy(rawResourcePolicy);
   const rawDistributionMode = text(
     source.distributionMode || source.distribution_mode || 'fixed_batch',
     40,
@@ -418,6 +496,42 @@ export function normalizeOrchestrationRequest(
   const distributionMode = rawDistributionMode === 'elastic_pool'
     ? 'elastic_pool'
     : 'fixed_batch';
+  if (
+    Object.keys(resourcePolicy).length > 0 &&
+    !(executionMode === 'unattended_plan' && distributionMode === 'elastic_pool')
+  ) {
+    throw scheduleError(
+      'capture_resource_policy_requires_elastic_schedule',
+      '采集并发策略仅适用于弹性节点池无人值守计划',
+    );
+  }
+  const platform = normalizePlatform(source.platform);
+  const baseContentType = readFilter('contentType');
+  const searchPasses = normalizeSequentialSearchPasses(
+    source.searchPasses ?? source.search_passes,
+    baseContentType,
+  );
+  const sequentialSearchEnabled = Boolean(
+    executionMode === 'unattended_plan' &&
+    distributionMode === 'elastic_pool' &&
+    platform === 'douyin' &&
+    searchPasses.length > 1
+  );
+  const effectiveSearchPasses = sequentialSearchEnabled
+    ? searchPasses
+    : [baseContentType || 'all'];
+  // Cloud elastic work is retried by assigning the failed item to one
+  // different Agent. Re-submitting the same search inside the first browser
+  // duplicates platform traffic and is especially harmful on a shared 5G
+  // link, so every elastic item gets one complete local search only.
+  if (executionMode === 'unattended_plan' && distributionMode === 'elastic_pool') {
+    recoveryPolicy.disableAutomaticSearchRetry = true;
+    recoveryPolicy.singleRelayV1 = true;
+  }
+  if (sequentialSearchEnabled) {
+    recoveryPolicy.disableAutomaticSearchRetry = true;
+    recoveryPolicy.requireVerifiedFilters = true;
+  }
 
   return {
     requestKey: text(
@@ -428,7 +542,7 @@ export function normalizeOrchestrationRequest(
       240,
     ),
     title: text(source.title || '关键词采集任务', 240),
-    platform: normalizePlatform(source.platform),
+    platform,
     executionMode,
     allocationMode: 'balanced',
     distributionMode,
@@ -438,7 +552,7 @@ export function normalizeOrchestrationRequest(
       searchFilters: {
         sort: readFilter('sort'),
         publishTime: readFilter('publishTime'),
-        contentType: readFilter('contentType'),
+        contentType: effectiveSearchPasses[0],
         searchScope: readFilter('searchScope'),
         distance: readFilter('distance'),
         videoDuration: readFilter('videoDuration'),
@@ -451,7 +565,9 @@ export function normalizeOrchestrationRequest(
       ),
       maxRounds: schedule?.maxRounds || 1,
       roundGapMin: schedule?.roundGapMin || 10,
+      ...(sequentialSearchEnabled ? {searchPasses: effectiveSearchPasses} : {}),
       recoveryPolicy,
+      ...(Object.keys(resourcePolicy).length > 0 ? {resourcePolicy} : {}),
       ...(schedule ? schedule : {}),
       ...(hasCaptureSettings
         ? {captureSettings: normalizeCaptureSettings(source.captureSettings)}
@@ -574,16 +690,26 @@ export function allocateKeywordWorkItems({
   return {items, groups};
 }
 
-function explicitSafetyBlock(entry) {
+function checkpointEntryErrorCode(entry) {
   const source = object(entry);
   const error = object(source.error);
-  const errorCode = text(
+  return text(
     source.errorCode ||
     source.error_code ||
     error.code,
     100,
   ).toUpperCase();
-  if (errorCode === 'DOUYIN_SEARCH_SERVICE_ABNORMAL') {
+}
+
+function explicitSafetyBlock(entry) {
+  const source = object(entry);
+  const error = object(source.error);
+  const errorCode = checkpointEntryErrorCode(source);
+  if ([
+    'DOUYIN_SEARCH_SERVICE_ABNORMAL',
+    'SEARCH_FILTER_APPLICATION_FAILED',
+    'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
+  ].includes(errorCode)) {
     return false;
   }
   return (
@@ -606,8 +732,9 @@ function explicitSafetyBlock(entry) {
  * Project one extension keyword checkpoint entry onto a server item status.
  * Protective-stop handling only trusts explicit structured evidence;
  * error-message text is never classified as a platform restriction. Douyin's
- * service-abnormal state is a retryable per-keyword search failure. Its exact
- * code also downgrades legacy Extension snapshots that carried old stop flags.
+ * service-abnormal state is the platform's empty-search rendering in this
+ * workflow. Its exact structured code settles only that keyword as a zero-row
+ * success; it must not consume a relay attempt or freeze an account.
  */
 export function checkpointEntryToItemStatus(
   entry = {},
@@ -617,6 +744,9 @@ export function checkpointEntryToItemStatus(
   const rawStatus = text(source.status, 80)
     .toLowerCase()
     .replace(/[\s-]+/gu, '_');
+  if (checkpointEntryErrorCode(source) === 'DOUYIN_SEARCH_SERVICE_ABNORMAL') {
+    return 'completed';
+  }
   if (explicitSafetyBlock(source)) return 'needs_action';
 
   const aliases = {
@@ -671,6 +801,12 @@ export function aggregateParentTaskItems(items = []) {
   const source = Array.isArray(items) ? items : [];
   const statuses = source.map(item => normalizeItemStatus(item?.status));
   const count = status => statuses.filter(itemStatus => itemStatus === status).length;
+  const retryWaiting = source.filter(item =>
+    normalizeItemStatus(item?.status) === 'retryable' &&
+    item?.metadata &&
+    typeof item.metadata === 'object' &&
+    item.metadata.retryPending === true
+  ).length;
   const counts = {
     total: statuses.length,
     pending: count('pending'),
@@ -680,6 +816,7 @@ export function aggregateParentTaskItems(items = []) {
     waitingDevice: count('waiting_device'),
     running: count('running'),
     retryable: count('retryable'),
+    retryWaiting,
     needsAction: count('needs_action'),
     completed: count('completed'),
     completedWithWarnings: count('completed_with_warnings'),
@@ -701,7 +838,10 @@ export function aggregateParentTaskItems(items = []) {
         : 'completed';
   } else if (counts.running > 0) {
     status = 'running';
-  } else if (counts.needsAction > 0 || counts.retryable > 0) {
+  } else if (
+    counts.needsAction > 0 ||
+    counts.retryable > counts.retryWaiting
+  ) {
     status = 'needs_action';
   } else if (
     counts.assigned > 0 ||

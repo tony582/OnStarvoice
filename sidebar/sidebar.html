@@ -1200,7 +1200,7 @@
                     <p
                       class="detail-enhance-ai-filter-hint"
                       id="aiRelevancePrefilterHint">
-                      将作品标题等必要信息交给后台 DeepSeek 判断与当前关键词是否匹配。仅在高置信度判定无关时跳过增强；判断不清、超时或服务异常都会继续采集。
+                      先用标题做相关性预判；证据不足时只读取正文、标签等最小详情再二判。高置信度无关项跳过评论和博主增强；模型异常按少量抽样继续，其余延迟增强。
                     </p>
                   </div>
                   <label class="switch-wrap">

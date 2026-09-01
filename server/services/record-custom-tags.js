@@ -2,9 +2,11 @@ export const MAX_CUSTOM_TAG_NAME_LENGTH = 24;
 export const MAX_CUSTOM_TAGS_PER_RECORD = 10;
 export const MAX_CUSTOM_TAG_FILTERS = 20;
 export const MAX_CUSTOM_TAG_PATCH_ITEMS = 20;
+export const MAX_CUSTOM_TAG_BATCH_RECORDS = 100;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PATCH_KEYS = new Set(['addTagIds', 'addNames', 'removeTagIds']);
+const BATCH_KEYS = new Set(['ids', 'addTagIds', 'addNames', 'removeTagIds']);
 
 function unique(values) {
   return [...new Set(values)];
@@ -106,6 +108,74 @@ export function validateCustomTagPatch(body = {}) {
       .sort((a, b) => a.normalizedName.localeCompare(b.normalizedName)),
     removeTagIds: removeTagIds.value,
   };
+}
+
+export function validateCustomTagBatch(body = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return errorResult('invalid_request', '请求内容无效');
+  }
+  const unknown = Object.keys(body).filter(key => !BATCH_KEYS.has(key));
+  if (unknown.length) {
+    return errorResult('unsupported_fields', `不支持字段: ${unknown.join(', ')}`);
+  }
+  if (!Array.isArray(body.ids)) {
+    return errorResult('invalid_ids', `ids 需为 1-${MAX_CUSTOM_TAG_BATCH_RECORDS} 个内容ID`);
+  }
+  const ids = unique(body.ids
+    .map(item => String(item || '').trim().toLowerCase())
+    .filter(Boolean));
+  if (!ids.length || ids.length > MAX_CUSTOM_TAG_BATCH_RECORDS) {
+    return errorResult('invalid_ids', `ids 需为 1-${MAX_CUSTOM_TAG_BATCH_RECORDS} 个内容ID`);
+  }
+  if (ids.some(id => !UUID_RE.test(id))) {
+    return errorResult('invalid_record_id', 'ids 包含无效内容ID');
+  }
+
+  const patch = validateCustomTagPatch({
+    addTagIds: body.addTagIds,
+    addNames: body.addNames,
+    removeTagIds: body.removeTagIds,
+  });
+  if (!patch.ok) return patch;
+  const hasAdditions = patch.addTagIds.length > 0 || patch.addNames.length > 0;
+  const hasRemovals = patch.removeTagIds.length > 0;
+  if (hasAdditions && hasRemovals) {
+    return errorResult('mixed_batch_tag_operation', '批量操作需分别执行添加标签或移除标签');
+  }
+  return { ok: true, ids, operation: hasRemovals ? 'remove' : 'add', patch };
+}
+
+export function planRecordCustomTagBatch({
+  recordIds = [],
+  requestedTagIds = [],
+  existingRows = [],
+  operation = 'add',
+} = {}) {
+  const normalizedRecordIds = unique(recordIds.map(id => String(id).toLowerCase()));
+  const normalizedTagIds = unique(requestedTagIds.map(id => String(id).toLowerCase()));
+  const existingByRecord = new Map(normalizedRecordIds.map(id => [id, new Set()]));
+  for (const row of existingRows) {
+    const recordId = String(row.record_id || row.recordId || '').toLowerCase();
+    const tagId = String(row.id || row.tag_id || row.tagId || '').toLowerCase();
+    if (existingByRecord.has(recordId) && tagId) existingByRecord.get(recordId).add(tagId);
+  }
+
+  const updatedIds = [];
+  const unchangedIds = [];
+  const limitIds = [];
+  for (const recordId of normalizedRecordIds) {
+    const existing = existingByRecord.get(recordId);
+    if (operation === 'remove') {
+      if (normalizedTagIds.some(id => existing.has(id))) updatedIds.push(recordId);
+      else unchangedIds.push(recordId);
+      continue;
+    }
+    const missingCount = normalizedTagIds.filter(id => !existing.has(id)).length;
+    if (missingCount === 0) unchangedIds.push(recordId);
+    else if (existing.size + missingCount > MAX_CUSTOM_TAGS_PER_RECORD) limitIds.push(recordId);
+    else updatedIds.push(recordId);
+  }
+  return { updatedIds, unchangedIds, limitIds };
 }
 
 export function normalizeCustomTagFilter(value, modeValue = '') {
@@ -278,4 +348,173 @@ export async function applyRecordCustomTagPatch(tx, {
     removed: actualRemoved.map(id => beforeById.get(id)).filter(Boolean),
     unchanged: false,
   };
+}
+
+export async function applyRecordCustomTagBatch(tx, {
+  tenantId,
+  recordIds,
+  patch,
+  actorUserId = null,
+  actorName = '',
+}) {
+  const operation = patch.removeTagIds.length ? 'remove' : 'add';
+  const existingRows = await tx.queryAll(`
+    SELECT rct.record_id, ct.id, ct.name
+    FROM record_custom_tags rct
+    JOIN custom_tags ct
+      ON ct.tenant_id = rct.tenant_id
+      AND ct.id = rct.tag_id
+    WHERE rct.tenant_id = $1 AND rct.record_id = ANY($2::uuid[])
+    ORDER BY rct.record_id, ct.name ASC, ct.id ASC
+  `, [tenantId, recordIds]);
+
+  const resolvedById = new Map();
+  const requestedExistingIds = operation === 'remove' ? patch.removeTagIds : patch.addTagIds;
+  if (requestedExistingIds.length) {
+    const existingTags = await tx.queryAll(`
+      SELECT id, name
+      FROM custom_tags
+      WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+      FOR KEY SHARE
+    `, [tenantId, requestedExistingIds]);
+    existingTags.forEach(tag => resolvedById.set(String(tag.id).toLowerCase(), tag));
+    if (existingTags.length !== requestedExistingIds.length) {
+      throw customTagError('tag_not_found', '包含不存在或不属于当前租户的标签', 404);
+    }
+  }
+
+  if (operation === 'add') {
+    for (const item of patch.addNames) {
+      const tag = await tx.queryOne(`
+        INSERT INTO custom_tags (
+          tenant_id, name, normalized_name, created_by_user_id, created_by_name
+        ) VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (tenant_id, normalized_name)
+        DO UPDATE SET updated_at = custom_tags.updated_at
+        RETURNING id, name
+      `, [tenantId, item.name, item.normalizedName, actorUserId, actorName]);
+      resolvedById.set(String(tag.id).toLowerCase(), tag);
+    }
+  }
+
+  const requestedTagIds = unique([
+    ...(operation === 'remove' ? patch.removeTagIds : patch.addTagIds),
+    ...resolvedById.keys(),
+  ]);
+  const tags = requestedTagIds
+    .map(id => resolvedById.get(id))
+    .filter(Boolean)
+    .sort((a, b) => String(a.name).localeCompare(String(b.name), 'zh-CN'));
+  const plan = planRecordCustomTagBatch({ recordIds, requestedTagIds, existingRows, operation });
+
+  // 新建标签但没有任何记录可接收时回滚事务，避免留下未使用的目录项。
+  if (operation === 'add' && !plan.updatedIds.length && plan.limitIds.length) {
+    const error = customTagError(
+      'too_many_custom_tags',
+      `所选内容添加后会超过每条 ${MAX_CUSTOM_TAGS_PER_RECORD} 个标签的上限`,
+      409,
+    );
+    error.recordIds = plan.limitIds;
+    throw error;
+  }
+
+  if (!plan.updatedIds.length) {
+    return { ...plan, operation, tags, changes: [] };
+  }
+
+  if (operation === 'remove') {
+    await tx.execute(`
+      DELETE FROM record_custom_tags
+      WHERE tenant_id = $1
+        AND record_id = ANY($2::uuid[])
+        AND tag_id = ANY($3::uuid[])
+    `, [tenantId, plan.updatedIds, requestedTagIds]);
+  } else {
+    await tx.execute(`
+      INSERT INTO record_custom_tags (
+        tenant_id, record_id, tag_id, added_by_user_id, added_by_name
+      )
+      SELECT $1, selected_records.record_id, selected_tags.tag_id, $4, $5
+      FROM unnest($2::uuid[]) AS selected_records(record_id)
+      CROSS JOIN unnest($3::uuid[]) AS selected_tags(tag_id)
+      ON CONFLICT (tenant_id, record_id, tag_id) DO NOTHING
+    `, [tenantId, plan.updatedIds, requestedTagIds, actorUserId, actorName]);
+    await tx.execute(`
+      UPDATE custom_tags
+      SET last_used_at = now(), updated_at = now()
+      WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+    `, [tenantId, requestedTagIds]);
+  }
+
+  const afterRows = await tx.queryAll(`
+    SELECT rct.record_id, ct.id, ct.name
+    FROM record_custom_tags rct
+    JOIN custom_tags ct
+      ON ct.tenant_id = rct.tenant_id
+      AND ct.id = rct.tag_id
+    WHERE rct.tenant_id = $1 AND rct.record_id = ANY($2::uuid[])
+    ORDER BY rct.record_id, ct.name ASC, ct.id ASC
+  `, [tenantId, plan.updatedIds]);
+  const beforeByRecord = groupCustomTagsByRecord(recordIds, existingRows);
+  const afterByRecord = groupCustomTagsByRecord(plan.updatedIds, afterRows);
+  const changes = plan.updatedIds.map(recordId => {
+    const before = beforeByRecord.get(recordId) || [];
+    const after = afterByRecord.get(recordId) || [];
+    const beforeIds = new Set(before.map(tag => String(tag.id).toLowerCase()));
+    const afterIds = new Set(after.map(tag => String(tag.id).toLowerCase()));
+    return {
+      record_id: recordId,
+      before_tags: before,
+      after_tags: after,
+      added_tags: after.filter(tag => !beforeIds.has(String(tag.id).toLowerCase())),
+      removed_tags: before.filter(tag => !afterIds.has(String(tag.id).toLowerCase())),
+    };
+  });
+  const serializedChanges = JSON.stringify(changes);
+
+  await tx.execute(`
+    INSERT INTO record_versions (
+      tenant_id, record_id, changed_fields, before_data, after_data
+    )
+    SELECT
+      $1, change.record_id, ARRAY['custom_tags']::text[],
+      jsonb_build_object('custom_tags', change.before_tags),
+      jsonb_build_object('custom_tags', change.after_tags)
+    FROM jsonb_to_recordset($2::jsonb) AS change(
+      record_id uuid, before_tags jsonb, after_tags jsonb,
+      added_tags jsonb, removed_tags jsonb
+    )
+  `, [tenantId, serializedChanges]);
+  await tx.execute(`
+    INSERT INTO audit_logs (
+      tenant_id, actor_type, actor_id, actor_user_id,
+      action, target_type, target_id, metadata
+    )
+    SELECT
+      $1, 'user', $2, $3,
+      'record.custom_tags_updated', 'record', change.record_id,
+      jsonb_build_object(
+        'batch', true,
+        'added', change.added_tags,
+        'removed', change.removed_tags,
+        'before', change.before_tags,
+        'after', change.after_tags
+      )
+    FROM jsonb_to_recordset($4::jsonb) AS change(
+      record_id uuid, before_tags jsonb, after_tags jsonb,
+      added_tags jsonb, removed_tags jsonb
+    )
+  `, [tenantId, actorUserId || '', actorUserId, serializedChanges]);
+
+  return { ...plan, operation, tags, changes };
+}
+
+function groupCustomTagsByRecord(recordIds, rows) {
+  const grouped = new Map(recordIds.map(id => [String(id).toLowerCase(), []]));
+  for (const row of rows) {
+    const recordId = String(row.record_id || row.recordId || '').toLowerCase();
+    if (!grouped.has(recordId)) continue;
+    grouped.get(recordId).push({ id: row.id, name: row.name });
+  }
+  return grouped;
 }

@@ -31,12 +31,15 @@ import {
   buildScrollLoadStage,
   countMissingMetric,
 } from "./stage-diagnostics.js";
+import {findDouyinSearchSecurityChallengeNode} from "./douyin-search-guard.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 const MIN_DOUYIN_BLOGGER_STALL_TIMEOUT_MS = 12000;
 const REQUIRED_DOUYIN_BLOGGER_STALL_ROUNDS = 5;
 const DOUYIN_BLOGGER_NOTES_ROOT_ERROR_CODE =
   "DOUYIN_BLOGGER_NOTES_ROOT_NOT_READY";
+const DOUYIN_BLOGGER_RESULTS_UNCONFIRMED_EMPTY_ERROR_CODE =
+  "PROFILE_SCAN_RESULTS_UNCONFIRMED_EMPTY";
 const UNSAFE_DOUYIN_BLOGGER_NOTES_ROOT_SELECTORS = new Set([
   "html",
   "body",
@@ -422,6 +425,16 @@ export async function captureDouyinBloggerNotes({
 
     collectDetectedNotes();
     const allItems = Array.from(noteMap.values());
+    const confirmedEmptyMessage =
+      allItems.length === 0
+        ? findExplicitDouyinBloggerEmptyState(notesRoot)
+        : "";
+    if (allItems.length === 0 && !confirmedEmptyMessage) {
+      throw createRetryableBloggerNotesError(
+        "抖音账号作品列表尚未出现作品卡，也没有明确的空列表提示，请稍后重试",
+        DOUYIN_BLOGGER_RESULTS_UNCONFIRMED_EMPTY_ERROR_CODE,
+      );
+    }
     const likesFiltered = allItems.filter(
       (item) => Number(item.likes || 0) >= normalizedMinLikes,
     );
@@ -465,6 +478,8 @@ export async function captureDouyinBloggerNotes({
       filteredCount: items.length,
       filteredBeforeLimitCount: filteredItems.length,
       items,
+      confirmedEmpty: Boolean(confirmedEmptyMessage),
+      emptyStateMessage: confirmedEmptyMessage,
       captureTimestamp: Date.now(),
     };
     const stageTrace = [
@@ -520,6 +535,8 @@ export async function captureDouyinBloggerNotes({
           noNewContentCount: scrollResult.noNewContentCount,
           elapsedMs: scrollResult.elapsedMs,
         },
+        confirmedEmpty: Boolean(confirmedEmptyMessage),
+        emptyStateMessage: confirmedEmptyMessage,
       },
       diagnostics: {
         stageTrace,
@@ -550,9 +567,14 @@ export async function captureDouyinBloggerNotes({
 }
 
 function assertNoCaptchaPage() {
-  const title = cleanText(document.title || "");
-  const bodyText = cleanText(document.body?.innerText || "");
-  if (/验证码中间页/i.test(title) || /请完成下列验证后继续:/i.test(bodyText)) {
+  if (
+    findDouyinSearchSecurityChallengeNode({
+      root: document,
+      pageUrl: window.location.href,
+      title: document.title || "",
+      requireStructuredContainer: true,
+    })
+  ) {
     throw new Error("当前页面触发抖音验证码或风险中间页");
   }
 }
@@ -1340,11 +1362,60 @@ function findBloggerNotesRootInScope(scope, selectors = []) {
   return null;
 }
 
-function createRetryableBloggerNotesError(message) {
+function createRetryableBloggerNotesError(
+  message,
+  code = DOUYIN_BLOGGER_NOTES_ROOT_ERROR_CODE,
+) {
   const error = new Error(message);
-  error.code = DOUYIN_BLOGGER_NOTES_ROOT_ERROR_CODE;
+  error.code = code;
   error.retryable = true;
   return error;
+}
+
+function findExplicitDouyinBloggerEmptyState(notesRoot) {
+  if (!(notesRoot instanceof Element)) return "";
+  const candidates = Array.from(
+    notesRoot.querySelectorAll(
+      [
+        '[data-e2e*="empty"]',
+        '[class*="empty"]',
+        '[class*="Empty"]',
+        '[role="status"]',
+        "div",
+        "span",
+        "p",
+      ].join(", "),
+    ),
+  ).slice(0, 500);
+  for (const candidate of candidates) {
+    if (!isVisibleDouyinBloggerStateNode(candidate)) continue;
+    const message = cleanText(
+      candidate.innerText || candidate.textContent || "",
+    );
+    if (!message || message.length > 80) continue;
+    if (
+      /^(?:暂无作品|还没有发布作品|暂未发布作品|暂无公开视频|暂无内容)[。！!]?$/u.test(
+        message,
+      )
+    ) {
+      return message;
+    }
+  }
+  return "";
+}
+
+function isVisibleDouyinBloggerStateNode(node) {
+  if (!(node instanceof Element)) return false;
+  const style = window.getComputedStyle?.(node);
+  if (
+    style?.display === "none" ||
+    style?.visibility === "hidden" ||
+    Number(style?.opacity || 1) === 0
+  ) {
+    return false;
+  }
+  const rect = node.getBoundingClientRect?.();
+  return !rect || (Number(rect.width) > 0 && Number(rect.height) > 0);
 }
 
 function extractDouyinProfileNoteCards(notesRoot, bloggerName = "") {

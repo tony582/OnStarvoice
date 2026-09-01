@@ -12,6 +12,14 @@
       "captureBloggerNotes",
       "captureKeywordNotes",
     ]);
+    const DEBUG_OWNERSHIP_KIND = Object.freeze({
+      AVAILABLE: "available",
+      OWNED_BY_REQUEST: "owned_by_request",
+      STARVOICE_ACTIVE: "starvoice_active",
+      STARVOICE_STALE_RECOVERED: "starvoice_stale_recovered",
+      EXTERNAL_DEBUGGER: "external_debugger",
+      UNKNOWN: "unknown_occupancy",
+    });
 
     function cleanText(value, maxLength = 320) {
       return String(value || "").replace(/\s+/gu, " ").trim().slice(0, maxLength);
@@ -74,6 +82,117 @@
       error.code = code;
       if (cause) error.cause = cause;
       return error;
+    }
+
+    function isExternalDebuggerConflict(error) {
+      const message = cleanText(error?.message || error, 500).toLowerCase();
+      return /another debugger is already attached|already attached to the tab|target is already being debugged|cannot attach to this target because.*debugger|devtools.*(?:open|attached)/iu.test(
+        message,
+      );
+    }
+
+    function classifyDebugOwnership({
+      requestedTaskId = "",
+      requestedTabId = null,
+      activeSession = null,
+      staleReleasedTaskIds = [],
+      targetAttached = false,
+      preflightAvailable = true,
+      preflightError = null,
+      attachError = null,
+    } = {}) {
+      const taskId = cleanText(requestedTaskId, 320);
+      const tabId = normalizeTabId(requestedTabId);
+      const activeTaskId = cleanText(activeSession?.taskId, 320);
+      const activeTabId = normalizeTabId(activeSession?.tabId);
+      const activeState = cleanText(activeSession?.state, 80).toLowerCase();
+      const sameRequest = Boolean(
+        activeSession &&
+          activeState === "attached" &&
+          activeSession?.persistent === true &&
+          taskId &&
+          activeTaskId === taskId &&
+          tabId &&
+          activeTabId === tabId,
+      );
+      if (sameRequest) {
+        return Object.freeze({
+          kind: DEBUG_OWNERSHIP_KIND.OWNED_BY_REQUEST,
+          code: "",
+          retryable: false,
+          automaticReroute: false,
+          safeToDetach: false,
+          taskId: activeTaskId,
+          tabId: activeTabId,
+        });
+      }
+      if (activeSession) {
+        return Object.freeze({
+          kind: DEBUG_OWNERSHIP_KIND.STARVOICE_ACTIVE,
+          code: "capture_task_debug_starvoice_active",
+          retryable: true,
+          automaticReroute: true,
+          safeToDetach: false,
+          taskId: activeTaskId,
+          tabId: activeTabId,
+          state: activeState || "unknown",
+        });
+      }
+
+      const releasedTaskIds = Array.from(
+        new Set(
+          (Array.isArray(staleReleasedTaskIds) ? staleReleasedTaskIds : [])
+            .map((value) => cleanText(value, 320))
+            .filter(Boolean),
+        ),
+      );
+      if (targetAttached === true || isExternalDebuggerConflict(attachError)) {
+        return Object.freeze({
+          kind: DEBUG_OWNERSHIP_KIND.EXTERNAL_DEBUGGER,
+          code: "capture_task_external_debugger_busy",
+          retryable: true,
+          automaticReroute: true,
+          safeToDetach: false,
+          tabId,
+        });
+      }
+      if (
+        preflightAvailable !== true ||
+        preflightError ||
+        (attachError && !isExternalDebuggerConflict(attachError))
+      ) {
+        return Object.freeze({
+          kind: DEBUG_OWNERSHIP_KIND.UNKNOWN,
+          code: "capture_task_debug_ownership_unknown",
+          retryable: true,
+          automaticReroute: true,
+          safeToDetach: false,
+          tabId,
+          reason: cleanText(
+            preflightError?.message || preflightError || attachError?.message || attachError,
+            320,
+          ),
+        });
+      }
+      if (releasedTaskIds.length > 0) {
+        return Object.freeze({
+          kind: DEBUG_OWNERSHIP_KIND.STARVOICE_STALE_RECOVERED,
+          code: "",
+          retryable: false,
+          automaticReroute: false,
+          safeToDetach: false,
+          releasedTaskIds,
+          tabId,
+        });
+      }
+      return Object.freeze({
+        kind: DEBUG_OWNERSHIP_KIND.AVAILABLE,
+        code: "",
+        retryable: false,
+        automaticReroute: false,
+        safeToDetach: false,
+        tabId,
+      });
     }
 
     function publicSession(session, overrides = {}) {
@@ -944,6 +1063,9 @@
 
     return Object.freeze({
       PROTOCOL_VERSION,
+      DEBUG_OWNERSHIP_KIND,
+      classifyDebugOwnership,
+      isExternalDebuggerConflict,
       createManager,
       isListCaptureAction,
       resolveListRelayRunId,

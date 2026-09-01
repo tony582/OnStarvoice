@@ -30,6 +30,9 @@ test("normalizes only protocol v1 negative-post detail targets", () => {
         {
           recordId: "record-1",
           externalId: "note-1",
+          captureTaskItemAttemptId:
+            "10000000-0000-4000-8000-000000000001",
+          captureTaskItemRequestHash: "a".repeat(64),
           url: "https://www.xiaohongshu.com/explore/note-1?xsec_source=pc_search&utm_source=bad#fragment",
           title: "目标作品",
         },
@@ -41,6 +44,14 @@ test("normalizes only protocol v1 negative-post detail targets", () => {
   assert.equal(command.workflow, "negative_post_patrol");
   assert.equal(command.captureSettings.autoSyncAfterDetailCapture, true);
   assert.equal(command.targets[0].externalId, "note-1");
+  assert.equal(
+    command.targets[0].captureTaskItemAttemptId,
+    "10000000-0000-4000-8000-000000000001",
+  );
+  assert.equal(
+    command.targets[0].captureTaskItemRequestHash,
+    "a".repeat(64),
+  );
   assert.equal(
     command.targets[0].url,
     "https://www.xiaohongshu.com/explore/note-1?xsec_source=pc_search",
@@ -742,4 +753,88 @@ test("mergeRunPatch ignores unknown target results and preserves formal checkpoi
   assert.equal(merged.status, "completed");
   assert.equal(merged.targetResults.length, 1);
   assert.equal(merged.checkpoint.nextOrdinal, 2);
+});
+
+test("heartbeat-only patches preserve business progress while real progress advances it", () => {
+  const request = targeted.createRunRequest(
+    targeted.normalizeCommandPayload({
+      protocolVersion: 1,
+      workflow: "negative_post_patrol",
+      taskId: "task-1",
+      platform: "douyin",
+      planSnapshot: {
+        targets: [{
+          recordId: "record-1",
+          url: "https://www.douyin.com/video/123",
+        }],
+      },
+    }),
+    {
+      commandId: "command-1",
+      attemptId: "attempt-1",
+      now: "2026-08-25T01:00:00.000Z",
+    },
+  );
+
+  const heartbeat = targeted.mergeRunPatch(request, {
+    heartbeatAt: "2026-08-25T01:00:20.000Z",
+  });
+  assert.equal(heartbeat.heartbeatAt, "2026-08-25T01:00:20.000Z");
+  assert.equal(heartbeat.businessProgressAt, "2026-08-25T01:00:00.000Z");
+
+  const progressed = targeted.mergeRunPatch(heartbeat, {
+    progress: {
+      phase: "target_opening",
+      updatedAt: "2026-08-25T01:00:25.000Z",
+    },
+  });
+  assert.equal(progressed.businessProgressAt, "2026-08-25T01:00:25.000Z");
+
+  const repeatedCountdown = targeted.mergeRunPatch(progressed, {
+    progress: {
+      phase: "target_opening",
+      updatedAt: "2026-08-25T01:00:40.000Z",
+      remainingMs: 9_000,
+      message: "页面仍在加载，9 秒后继续",
+    },
+    businessProgressAt: "2026-08-25T01:00:40.000Z",
+  });
+  const repeatedCountdownAgain = targeted.mergeRunPatch(repeatedCountdown, {
+    progress: {
+      phase: "target_opening",
+      updatedAt: "2026-08-25T01:00:50.000Z",
+      remainingMs: 8_000,
+      message: "页面仍在加载，8 秒后继续",
+    },
+    businessProgressAt: "2026-08-25T01:00:50.000Z",
+  });
+  assert.equal(
+    repeatedCountdownAgain.businessProgressAt,
+    repeatedCountdown.businessProgressAt,
+    "a repeating callback with only timestamps and countdown values is not business progress",
+  );
+
+  const nextTarget = targeted.mergeRunPatch(repeatedCountdownAgain, {
+    progress: {
+      phase: "target_opening",
+      current: 2,
+      total: 3,
+      updatedAt: "2026-08-25T01:01:00.000Z",
+      message: "正在打开第 2 个目标",
+    },
+    businessProgressAt: "2026-08-25T01:01:00.000Z",
+  });
+  assert.equal(nextTarget.businessProgressAt, "2026-08-25T01:01:00.000Z");
+
+  const nextPhase = targeted.mergeRunPatch(nextTarget, {
+    progress: {
+      phase: "target_capturing",
+      current: 2,
+      total: 3,
+      updatedAt: "2026-08-25T01:01:05.000Z",
+      message: "正在采集第 2 个目标",
+    },
+    businessProgressAt: "2026-08-25T01:01:05.000Z",
+  });
+  assert.equal(nextPhase.businessProgressAt, "2026-08-25T01:01:05.000Z");
 });

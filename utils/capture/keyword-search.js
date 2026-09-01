@@ -23,6 +23,7 @@ import {
   buildScrollLoadStage,
   countMissingMetric,
 } from "./stage-diagnostics.js";
+import {detectXhsSecurityPage} from "./xiaohongshu-security.js";
 
 const KEYWORD_SORT_DIMENSION = {
   LIKES: "likes",
@@ -38,6 +39,122 @@ const SORT_DIMENSION_LABEL_MAP = {
 
 const MIN_KEYWORD_STALL_TIMEOUT_MS = 15000;
 const REQUIRED_KEYWORD_STALL_ROUNDS = 5;
+
+function sourceOpenPageFailure() {
+  const title = String(document.title || "").trim();
+  const bodyText = String(document.body?.innerText || "")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 12000);
+  const pageUrl = String(window.location.href || "");
+  const securityEvidence = detectXhsSecurityPage({
+    title,
+    text: bodyText,
+    url: pageUrl,
+  });
+  if (securityEvidence) {
+    return {
+      reason: "security_blocked",
+      message: securityEvidence.reason === "account_security_qr"
+        ? "小红书要求扫码完成账号安全验证"
+        : "小红书提示访问频繁，请稍后重试",
+      securityEvidence,
+    };
+  }
+  const normalized = `${title} ${bodyText}`.toLowerCase();
+  if (
+    /当前笔记暂时无法浏览|sorry[,，]?\s*this page isn['’]?t available right now|error[_\s-]*code\s*[:：]?\s*300031/iu.test(
+      normalized,
+    )
+  ) {
+    return {
+      reason: "source_unavailable",
+      message: "小红书提示当前笔记暂时无法浏览",
+    };
+  }
+  if (
+    /请先登录|登录后(?:查看|浏览|探索)|scan with logged-in rednote app/iu.test(
+      normalized,
+    )
+  ) {
+    return {
+      reason: "login_required",
+      message: "当前小红书 Profile 需要先登录",
+    };
+  }
+  return null;
+}
+
+/**
+ * Re-locate one Xiaohongshu note inside the current, freshly opened search
+ * context. The returned xsec URL is extension-local and must never be sent to
+ * the management API or persisted as a durable record URL.
+ */
+export async function findXhsSourceNote({
+  expectedNoteId = "",
+  maxScrollTimes = 16,
+  maxDurationMs = 45000,
+} = {}) {
+  const targetId = String(expectedNoteId || "").trim().toLowerCase();
+  if (!targetId) {
+    return {
+      ok: false,
+      found: false,
+      reason: "source_identity_missing",
+      message: "缺少小红书笔记ID",
+    };
+  }
+
+  resetCancelFlag();
+  await wait(1200);
+  const startedAt = Date.now();
+  const scrollLimit = Math.max(0, Math.min(30, Number(maxScrollTimes) || 16));
+  const durationLimit = Math.max(
+    5000,
+    Math.min(90000, Number(maxDurationMs) || 45000),
+  );
+  let previousCount = -1;
+  let stagnantRounds = 0;
+
+  for (let scrollIndex = 0; scrollIndex <= scrollLimit; scrollIndex += 1) {
+    const failure = sourceOpenPageFailure();
+    if (failure) {
+      return {ok: false, found: false, ...failure};
+    }
+    const notes = extractNoteCards(KEYWORD_SORT_DIMENSION.LIKES);
+    const match = notes.find(note => (
+      String(note.noteId || "").trim().toLowerCase() === targetId
+    ));
+    if (match?.url) {
+      return {
+        ok: true,
+        found: true,
+        reason: "source_matched",
+        message: "已在当前搜索结果中定位原文",
+        noteId: String(match.noteId || expectedNoteId),
+        // Intentionally consumed only by the extension service worker.
+        sourceUrl: ensureXhsNoteUrlSource(match.url),
+      };
+    }
+    if (scrollIndex >= scrollLimit || Date.now() - startedAt >= durationLimit) {
+      break;
+    }
+
+    if (notes.length === previousCount) stagnantRounds += 1;
+    else stagnantRounds = 0;
+    previousCount = notes.length;
+    if (stagnantRounds >= REQUIRED_KEYWORD_STALL_ROUNDS) break;
+    await scrollKeywordSearchResults({noNewContentCount: stagnantRounds});
+    await wait(650);
+  }
+
+  return {
+    ok: false,
+    found: false,
+    reason: "source_not_found",
+    message: "本次搜索结果未定位到该笔记，已保留搜索页供人工确认",
+  };
+}
 
 /**
  * 采集关键词搜索结果
@@ -328,7 +445,6 @@ export async function captureKeywordNotes({
     if (items.length === 0) {
       const sample = allItems.slice(0, 3).map((item) => ({
         noteId: item.noteId,
-        url: item.url,
         title: item.title,
         likes: item.likes,
         collects: item.collects,
@@ -639,7 +755,19 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
       const dedupeKey = String(
         noteId || noteUrl || `${finalTitle}|${authorName}|${cover}`,
       ).trim();
-      if (!dedupeKey || dedupe.has(dedupeKey)) {
+      if (!dedupeKey) {
+        return;
+      }
+      if (dedupe.has(dedupeKey)) {
+        const existing = notes.find((note) => (
+          String(note.noteId || note.url || '').trim() === dedupeKey
+        ));
+        if (existing) {
+          existing.url = pickBestNoteUrl([existing.url, noteUrl]);
+          if (!existing.authorProfileUrl && authorProfileUrl) {
+            existing.authorProfileUrl = authorProfileUrl;
+          }
+        }
         return;
       }
       dedupe.add(dedupeKey);
@@ -681,21 +809,26 @@ function extractNoteUrlFromCard(cardNode) {
 
   const candidates = [];
   if (cardNode instanceof HTMLAnchorElement) {
-    candidates.push(cardNode.getAttribute("href") || cardNode.href || "");
+    candidates.push(cardNode.getAttribute("href"));
+    candidates.push(cardNode.href);
   }
 
   const directLink = cardNode.querySelector(
     'a[href*="/explore/"],a[href*="/discovery/item/"],a[href*="/note/"],a[href*="/video/"],a[href*="/search_result/"],a[href*="/user/profile/"],a[href]',
   );
   if (directLink) {
-    candidates.push(directLink.getAttribute("href") || directLink.href || "");
+    candidates.push(directLink.getAttribute("href"));
+    candidates.push(directLink.href);
   }
 
   const allLinks = cardNode.querySelectorAll(
     "a[href],a[data-href],a[data-url],a[data-note-url]",
   );
   allLinks.forEach((link) => {
-    candidates.push(link.getAttribute("href") || link.href || "");
+    // Keep both the literal attribute and the browser-resolved href. Some SPA
+    // cards update only one of them; scoring below chooses the complete xsec URL.
+    candidates.push(link.getAttribute("href"));
+    candidates.push(link.href);
     candidates.push(link.getAttribute("data-href"));
     candidates.push(link.getAttribute("data-url"));
     candidates.push(link.getAttribute("data-note-url"));
@@ -1412,7 +1545,7 @@ function normalizeAbsoluteUrl(url) {
   }
 }
 
-function pickBestNoteUrl(candidates = []) {
+export function pickBestNoteUrl(candidates = []) {
   const uniqueCandidates = new Set();
   const normalizedCandidates = [];
 
@@ -1468,7 +1601,7 @@ function pickBestAuthorProfileUrl(candidates = []) {
 
 // 小红书笔记 URL 必须带非空 xsec_source(搜索卡片是 pc_search)。卡片 href 里这个值常是空的,
 // 空 source 直开会被判 300013(访问频繁)。采集即补齐,保证存库/导出「帖子链接」「原文」都能开。
-function ensureXhsNoteUrlSource(url) {
+export function ensureXhsNoteUrlSource(url) {
   const raw = String(url || "");
   if (!raw) return raw;
   try {
@@ -1544,7 +1677,7 @@ function hashText(value) {
   return hash.toString(36);
 }
 
-function mergeNotesIntoMap(noteMap, notes = [], maxItems = Infinity) {
+export function mergeNotesIntoMap(noteMap, notes = [], maxItems = Infinity) {
   if (!(noteMap instanceof Map) || !Array.isArray(notes)) {
     return;
   }
@@ -1559,6 +1692,9 @@ function mergeNotesIntoMap(noteMap, notes = [], maxItems = Infinity) {
     noteMap.set(key, {
       ...previous,
       ...note,
+      // Repeated scroll rounds must not let a later bare/canonical URL replace
+      // the complete clickable URL captured for the same note earlier.
+      url: pickBestNoteUrl([previous.url, note.url]),
     });
   });
 }

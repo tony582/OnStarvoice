@@ -6,13 +6,24 @@ const read = path => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 
 test('mobile monitor is a compact directory with one dispatch entry', async () => {
   const mobile = await read('web/admin/src/mobile/MobileApp.tsx')
+  const monitorHub = mobile.slice(mobile.indexOf('function MonitorHub'), mobile.indexOf('function InsightsHub'))
 
-  assert.match(mobile, /function MonitorHub[\s\S]*任务与设备[\s\S]*调度中心/u)
+  assert.match(monitorHub, /任务与设备[\s\S]*调度中心/u)
+  assert.doesNotMatch(monitorHub, /BETA/u)
   assert.match(mobile, /title="Agent 今日运行"/u)
   assert.match(mobile, /title="关注博主"[\s\S]*页内查看博主新动态/u)
   assert.match(mobile, /title="风险事件"/u)
   assert.doesNotMatch(mobile, /function MonitorCard/u)
   assert.doesNotMatch(mobile, /title="关注对象的新内容"/u)
+})
+
+test('mobile navigation does not decorate dispatch or opinion analysis as preview features', async () => {
+  const mobile = await read('web/admin/src/mobile/MobileApp.tsx')
+  const insightsHub = mobile.slice(mobile.indexOf('function InsightsHub'), mobile.indexOf('function MoreHub'))
+
+  assert.match(insightsHub, />舆情剖析</u)
+  assert.doesNotMatch(insightsHub, /舆情剖析[\s\S]{0,300}>NEW</u)
+  assert.doesNotMatch(mobile, /pageId === 'dispatch'[^\n]*>BETA</u)
 })
 
 test('mobile dispatch separates task and device workspaces explicitly', async () => {
