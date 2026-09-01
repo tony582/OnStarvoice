@@ -2792,11 +2792,11 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(
     reuseGate,
     /execution_version\.app_version ~[\s\S]*regexp_match\([\s\S]*execution_version\.app_version[\s\S]*\)::numeric\[\] < \$4::numeric\[\][\s\S]*THEN false[\s\S]*ELSE true/u,
-    "known pre-0.4.3 executions are legacy while unknown and current versions remain strict",
+    "known pre-0.4.4 executions are legacy while unknown and current versions remain strict",
   );
   assert.match(
     captureCloudRouteSource,
-    /LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object\.freeze\(\[0, 4, 3\]\)/u,
+    /LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object\.freeze\(\[0, 4, 4\]\)/u,
   );
   assert.match(
     reuseGate,

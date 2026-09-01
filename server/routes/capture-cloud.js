@@ -130,7 +130,7 @@ const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
 const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
-const LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object.freeze([0, 4, 3]);
+const LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object.freeze([0, 4, 4]);
 const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
 const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
 // A half-hour source-Agent quarantine removes too much capacity from a small
@@ -10809,10 +10809,10 @@ async function loadCaptureAgentLocalClosureReuseGate(tx, {
             execution.metadata->>'requiresLocalClosureReuseFenceV1' = 'true',
             false
           ) = false THEN false
-          -- Versions before 0.4.3 could receive the server-owned fence marker,
+          -- Versions before 0.4.4 could receive the server-owned fence marker,
           -- but they never emitted localClosure evidence. Treat only those
           -- known historical runtimes as legacy; missing or malformed versions
-          -- remain fail-closed, and 0.4.3+ still requires exact proof.
+          -- remain fail-closed, and 0.4.4+ still requires exact proof.
           WHEN execution_version.app_version ~
             '^[0-9]+[.][0-9]+[.][0-9]+$'
             AND (
