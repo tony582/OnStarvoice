@@ -429,6 +429,26 @@ test('search-challenge handoff is counted independently without blocking the ela
     /execution_attempt\.client_attempt_id = snapshot\.client_attempt_id/u,
   );
   assert.match(closureProofLoader, /expectedSnapshotRevision/u);
+  assert.match(
+    closureProofLoader,
+    /JOIN capture_task_item_attempts item_attempt[\s\S]*item_attempt\.id = \$5::uuid[\s\S]*item_attempt\.item_id = \$4::uuid[\s\S]*item_attempt\.agent_id = \$3::uuid[\s\S]*item_attempt\.attempt_number = \$6::integer[\s\S]*item_attempt\.assignment_revision = \$7::integer/u,
+    'legacy compatibility must retain the exact item-attempt lineage',
+  );
+  assert.match(
+    closureProofLoader,
+    /execution_version\.app_version ~[\s\S]*regexp_match\([\s\S]*\)::numeric\[\] < \$8::numeric\[\][\s\S]*known_legacy_version/u,
+    'only a known pre-0.4.4 execution may use legacy quiescence',
+  );
+  assert.match(
+    closureProofLoader,
+    /legacy\?\.known_legacy_version !== true\) return verified/u,
+    'unknown, malformed and current versions must keep the exact-proof failure',
+  );
+  assert.match(
+    closureProofLoader,
+    /proofNow - terminalAt >= LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS[\s\S]*legacy_local_closure_quiescent[\s\S]*local_cleanup_quiescence/u,
+    'every proof consumer shares the bounded legacy compatibility path',
+  );
   assert.doesNotMatch(
     closureProofLoader,
     /snapshot\.metadata \? 'localClosure'/u,
