@@ -705,6 +705,56 @@ async function createProfileRetryRaceFixture(pool, token) {
   };
 }
 
+async function createLegacyProfileFinishFixture(pool, token) {
+  const tenant = await pool.query(
+    'INSERT INTO tenants (name) VALUES ($1) RETURNING id',
+    [`P3 legacy profile finish ${token}`],
+  );
+  const tenantId = tenant.rows[0].id;
+  const user = await pool.query(`
+    INSERT INTO users (
+      email, name, password_hash, status, must_change_password
+    ) VALUES ($1, $2, $3, 'active', false)
+    RETURNING id
+  `, [
+    `p3-profile-finish-${token}@integration.invalid`,
+    'P3 legacy profile finish operator',
+    'p3-profile-finish-integration-only',
+  ]);
+  const userId = user.rows[0].id;
+  await pool.query(`
+    INSERT INTO user_memberships (user_id, tenant_id, role, status)
+    VALUES ($1, $2, 'tenant_analyst', 'active')
+  `, [userId, tenantId]);
+  const subscription = await pool.query(`
+    INSERT INTO monitor_subscriptions (
+      tenant_id, name, keyword, platform, account_url,
+      cadence_minutes, status, next_run_at, subject_type
+    ) VALUES (
+      $1, $2, $3, 'douyin', $4,
+      60, 'active', now() - interval '1 minute', 'creator'
+    )
+    RETURNING id
+  `, [
+    tenantId,
+    `P3 legacy profile finish ${token}`,
+    `legacy-profile-finish-${token}`,
+    `https://www.douyin.com/user/legacy-profile-finish-${token}`,
+  ]);
+  const subscriptionId = subscription.rows[0].id;
+  const execution = await pool.query(`
+    INSERT INTO monitor_executions (tenant_id, subscription_id, status)
+    VALUES ($1, $2, 'pending')
+    RETURNING id
+  `, [tenantId, subscriptionId]);
+  return {
+    executionId: execution.rows[0].id,
+    subscriptionId,
+    tenantId,
+    userId,
+  };
+}
+
 async function readProfileRetryRaceState(pool, fixture) {
   const result = await pool.query(`
     SELECT
@@ -1664,4 +1714,313 @@ test('real PostgreSQL serializes Profile scheduler with canonical retry', async 
     'Timed out checking Profile advisory-lock residue',
   );
   assert.equal(advisoryResidue.rows[0].count, 0);
+});
+
+test('real PostgreSQL legacy Profile finish locks subscription before execution', async t => {
+  const target = validatePostgresIntegrationTarget({
+    testDatabaseUrl: process.env.TEST_DATABASE_URL,
+    databaseUrl: process.env.DATABASE_URL,
+    requireDatabaseUrl: true,
+  });
+  const token = randomUUID().replaceAll('-', '').slice(0, 16);
+  const applicationPrefix = `p3-profile-finish-${token}`;
+  const poolApplicationName = `${applicationPrefix}-pool`;
+  const originalApplicationName = process.env.PGAPPNAME;
+  const originalPoolMax = process.env.PG_POOL_MAX;
+  process.env.PGAPPNAME = poolApplicationName;
+  process.env.PG_POOL_MAX = '2';
+
+  let pool;
+  let fixture;
+  let server;
+  let barrierClient;
+  let barrierTransactionOpen = false;
+  const trackedOperations = [];
+  const serverErrors = [];
+  const trackOperation = promise => {
+    promise.catch(() => {});
+    trackedOperations.push(promise);
+    return promise;
+  };
+
+  t.after(async () => {
+    const cleanupErrors = [];
+    const attemptCleanup = async callback => {
+      try {
+        await callback();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+
+    if (barrierClient && barrierTransactionOpen) {
+      await attemptCleanup(() => runBoundedClientStep({
+        client: barrierClient,
+        promise: barrierClient.query('ROLLBACK'),
+        timeoutMs: 5000,
+        message: 'Timed out rolling back legacy Profile finish barrier',
+      }));
+      barrierTransactionOpen = false;
+    }
+    let operationsSettled = false;
+    try {
+      await withTimeout(
+        Promise.allSettled(trackedOperations),
+        10000,
+        'Timed out settling legacy Profile finish operations',
+      );
+      operationsSettled = true;
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (!operationsSettled) {
+      await attemptCleanup(() => terminateApplicationSessions({
+        databaseUrl: target.rawUrl,
+        applicationName: poolApplicationName,
+        controlApplicationName: `${applicationPrefix}-termination-control`,
+      }));
+      await attemptCleanup(() => withTimeout(
+        Promise.allSettled(trackedOperations),
+        5000,
+        'Legacy Profile finish did not settle after backend termination',
+      ));
+    }
+    if (barrierClient) {
+      const clientToClose = barrierClient;
+      barrierClient = null;
+      await attemptCleanup(() => closeBoundedClient(
+        clientToClose,
+        5000,
+        'legacy Profile finish barrier client',
+      ));
+    }
+    if (server) {
+      const serverToClose = server;
+      server = null;
+      await attemptCleanup(() => closeServerBounded(serverToClose));
+    }
+    if (fixture) {
+      await attemptCleanup(() => withCleanupClient({
+        databaseUrl: target.rawUrl,
+        applicationName: `${applicationPrefix}-fixture-cleanup`,
+        timeoutMs: 10000,
+        async operation(client) {
+          await client.query('DELETE FROM users WHERE id = $1', [fixture.userId]);
+          await client.query('DELETE FROM tenants WHERE id = $1', [fixture.tenantId]);
+        },
+      }));
+      fixture = null;
+    }
+    if (pool) {
+      const closePoolPromise = closePool();
+      closePoolPromise.catch(() => {});
+      let poolClosed = false;
+      try {
+        await withTimeout(
+          closePoolPromise,
+          5000,
+          'Timed out closing legacy Profile finish pool',
+        );
+        poolClosed = true;
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (!poolClosed) {
+        await attemptCleanup(() => terminateApplicationSessions({
+          databaseUrl: target.rawUrl,
+          applicationName: poolApplicationName,
+          controlApplicationName: `${applicationPrefix}-pool-close-control`,
+        }));
+        await attemptCleanup(() => withTimeout(
+          closePoolPromise,
+          5000,
+          'Legacy Profile finish pool did not close after termination',
+        ));
+      }
+      pool = null;
+    }
+    restoreEnvironment('PGAPPNAME', originalApplicationName);
+    restoreEnvironment('PG_POOL_MAX', originalPoolMax);
+
+    await attemptCleanup(() => withCleanupClient({
+      databaseUrl: target.rawUrl,
+      applicationName: `${applicationPrefix}-residue-verifier`,
+      timeoutMs: 5000,
+      async operation(verifier) {
+        await verifier.query('SELECT pg_stat_clear_snapshot()');
+        const residue = await verifier.query(`
+          SELECT
+            (SELECT count(*)::integer
+             FROM pg_stat_activity activity
+             WHERE activity.datname = current_database()
+               AND activity.application_name LIKE $1
+               AND activity.pid <> pg_backend_pid()) AS session_count,
+            (SELECT count(*)::integer
+             FROM pg_locks lock
+             JOIN pg_stat_activity activity ON activity.pid = lock.pid
+             WHERE activity.datname = current_database()
+               AND activity.application_name LIKE $1
+               AND activity.pid <> pg_backend_pid()
+               AND lock.locktype = 'advisory') AS advisory_lock_count
+        `, [`${applicationPrefix}%`]);
+        assert.deepEqual(residue.rows[0], {
+          advisory_lock_count: 0,
+          session_count: 0,
+        });
+      },
+    }));
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        cleanupErrors,
+        'P3 legacy Profile finish cleanup failed',
+      );
+    }
+  });
+
+  pool = getPool();
+  await runMigrations();
+  fixture = await createLegacyProfileFinishFixture(pool, token);
+  const session = await createSession(fixture.userId, {
+    ip: '127.0.0.1',
+    headers: {'user-agent': 'p3-profile-finish-integration'},
+  });
+  const app = createApp({
+    logger: {
+      log() {},
+      error(...args) {
+        serverErrors.push(args);
+      },
+    },
+  });
+  server = await listenOnTemporaryPort(app);
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  barrierClient = new Client({
+    connectionString: target.rawUrl,
+    application_name: `${applicationPrefix}-barrier`,
+    connectionTimeoutMillis: 10000,
+    query_timeout: 10000,
+  });
+  await connectBoundedClient(
+    barrierClient,
+    5000,
+    'legacy Profile finish barrier client',
+  );
+  await runBoundedClientStep({
+    client: barrierClient,
+    promise: barrierClient.query('BEGIN'),
+    timeoutMs: 5000,
+    message: 'Timed out beginning legacy Profile finish barrier',
+  });
+  barrierTransactionOpen = true;
+  const barrierBackend = await barrierClient.query(
+    'SELECT pg_backend_pid()::integer AS pid',
+  );
+  const barrierPid = barrierBackend.rows[0].pid;
+  await runBoundedClientStep({
+    client: barrierClient,
+    promise: barrierClient.query(`
+      SELECT id
+      FROM monitor_subscriptions
+      WHERE id = $1
+      FOR UPDATE
+    `, [fixture.subscriptionId]),
+    timeoutMs: 5000,
+    message: 'Timed out locking legacy Profile finish subscription',
+  });
+
+  const finishOperation = trackOperation(fetch(
+    `${baseUrl}/api/monitor/executions/${fixture.executionId}/finish`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${session.token}`,
+        'Content-Type': 'application/json',
+        'x-tenant-id': fixture.tenantId,
+      },
+      body: JSON.stringify({
+        status: 'succeeded',
+        recordsFound: 7,
+        newRecords: 3,
+        updatedRecords: 2,
+        negativeCount: 1,
+        nextCursor: `cursor-${token}`,
+      }),
+    },
+  ).then(async response => ({
+    body: await readJson(response),
+    status: response.status,
+  })));
+  const finishWaiter = await waitForDirectLockWaiter({
+    observerClient: barrierClient,
+    poolApplicationName,
+    blockerPid: barrierPid,
+    label: 'legacy Profile finish subscription waiter',
+  });
+  assert.match(finishWaiter.query, /FROM monitor_subscriptions subscription/u);
+  assert.match(finishWaiter.query, /FOR UPDATE OF subscription/u);
+
+  const executionProbe = await runBoundedClientStep({
+    client: barrierClient,
+    promise: barrierClient.query(`
+      SELECT id
+      FROM monitor_executions
+      WHERE id = $1
+      FOR UPDATE NOWAIT
+    `, [fixture.executionId]),
+    timeoutMs: 5000,
+    message: 'Legacy finish locked execution before subscription',
+  });
+  assert.equal(executionProbe.rows[0].id, fixture.executionId);
+
+  await runBoundedClientStep({
+    client: barrierClient,
+    promise: barrierClient.query('COMMIT'),
+    timeoutMs: 5000,
+    message: 'Timed out releasing legacy Profile finish barrier',
+  });
+  barrierTransactionOpen = false;
+  const finish = await withTimeout(
+    finishOperation,
+    10000,
+    'Timed out settling legacy Profile finish',
+  );
+  assert.equal(finish.status, 200);
+  assert.equal(finish.body.ok, true);
+  assert.equal(finish.body.execution.id, fixture.executionId);
+  assert.equal(finish.body.execution.status, 'succeeded');
+
+  const state = await pool.query(`
+    SELECT execution.status,
+      execution.records_found,
+      execution.new_records,
+      execution.updated_records,
+      execution.negative_count,
+      subscription.last_cursor,
+      subscription.last_error,
+      subscription.last_run_at IS NOT NULL AS has_last_run,
+      subscription.next_run_at > subscription.last_run_at AS next_run_advanced
+    FROM monitor_executions execution
+    JOIN monitor_subscriptions subscription
+      ON subscription.id = execution.subscription_id
+    WHERE execution.id = $1
+  `, [fixture.executionId]);
+  assert.deepEqual(state.rows[0], {
+    has_last_run: true,
+    last_cursor: `cursor-${token}`,
+    last_error: '',
+    negative_count: 1,
+    new_records: 3,
+    next_run_advanced: true,
+    records_found: 7,
+    status: 'succeeded',
+    updated_records: 2,
+  });
+  assert.equal(
+    serverErrors.some(args => args.some(value => errorCode(value) === '40P01')),
+    false,
+  );
+  assert.deepEqual(serverErrors, []);
 });

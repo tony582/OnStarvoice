@@ -14,6 +14,10 @@ const captureCloud = await readFile(
   new URL('../server/routes/capture-cloud.js', import.meta.url),
   'utf8',
 );
+const monitorRoute = await readFile(
+  new URL('../server/routes/monitor.js', import.meta.url),
+  'utf8',
+);
 const profileDiscoveryWork = await readFile(
   new URL(
     '../server/modules/capture/infrastructure/postgres-profile-discovery-work.js',
@@ -518,6 +522,80 @@ test('profile scan results project through task center without pretending subscr
     profileDiscoveryWork,
     /WHEN execution\.status = 'failed'\s+THEN now\(\) \+ interval '15 minutes'/u,
   );
+});
+
+test('Profile terminal paths keep task rows before subscriptions and executions', () => {
+  const helperStart = profileDiscoveryWork.indexOf(
+    'export async function lockProfileDiscoveryWorkForTask',
+  );
+  const helperEnd = profileDiscoveryWork.indexOf(
+    'export async function syncProfileDiscoverySubscriptions',
+    helperStart,
+  );
+  const helper = profileDiscoveryWork.slice(helperStart, helperEnd);
+  const itemLock = helper.indexOf('FROM capture_task_items item');
+  const attemptLock = helper.indexOf('FROM capture_task_item_attempts attempt');
+  const subscriptionLock = helper.indexOf(
+    'lockProfileDiscoverySubscriptionsForTask',
+  );
+  const executionLock = helper.indexOf('FROM monitor_executions execution');
+  assert.ok(itemLock >= 0);
+  assert.ok(itemLock < attemptLock);
+  assert.ok(attemptLock < subscriptionLock);
+  assert.ok(subscriptionLock < executionLock);
+  assert.match(helper, /ORDER BY item\.ordinal, item\.id[\s\S]*FOR UPDATE OF item/u);
+  assert.match(
+    helper,
+    /ORDER BY attempt\.item_id, attempt\.attempt_number, attempt\.id[\s\S]*FOR UPDATE OF attempt/u,
+  );
+  assert.match(
+    helper,
+    /ORDER BY execution\.id[\s\S]*FOR UPDATE OF execution/u,
+  );
+
+  const failureStart = profileDiscoveryWork.indexOf(
+    'export async function failProfileDiscoveryWork',
+  );
+  const failure = profileDiscoveryWork.slice(failureStart);
+  assert.ok(
+    failure.indexOf('lockProfileDiscoveryWorkForTask') <
+      failure.indexOf('UPDATE capture_task_items'),
+  );
+
+  const cancelStart = captureCloud.indexOf(
+    'async function cancelProfileDiscoveryWork',
+  );
+  const cancelEnd = captureCloud.indexOf(
+    'export function negativePatrolTargetResults',
+    cancelStart,
+  );
+  const cancel = captureCloud.slice(cancelStart, cancelEnd);
+  assert.ok(
+    cancel.indexOf('lockProfileDiscoveryWorkForTask') <
+      cancel.indexOf('UPDATE capture_task_items'),
+  );
+
+  const projectionStart = captureCloud.indexOf(
+    'async function projectNegativePatrolSnapshot',
+  );
+  const projectionEnd = captureCloud.indexOf(
+    'const items = await tx.queryAll',
+    projectionStart,
+  );
+  const projection = captureCloud.slice(projectionStart, projectionEnd);
+  assert.ok(
+    projection.indexOf('lockProfileDiscoveryWorkForTask') <
+      projection.indexOf('for (const entry of negativePatrolTargetResults'),
+  );
+
+  const finishStart = monitorRoute.indexOf("router.post('/executions/:id/finish'");
+  const finishEnd = monitorRoute.indexOf("router.get('/settings'", finishStart);
+  const finish = monitorRoute.slice(finishStart, finishEnd);
+  assert.ok(
+    finish.indexOf('lockProfileDiscoverySubscriptionsForExecutions') <
+      finish.indexOf('UPDATE monitor_executions'),
+  );
+  assert.match(finish, /NOT EXISTS \([\s\S]*FROM capture_task_items item/u);
 });
 
 test('extension profile scan reuses monitor execution and renders distinct dark task copy', () => {
