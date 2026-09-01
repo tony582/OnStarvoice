@@ -16,7 +16,7 @@ import {
 } from './modules/capture/infrastructure/postgres-cross-device-retry.js';
 import {
   reconcilePendingOrchestrationRetries,
-} from './routes/capture-orchestrations.js';
+} from './modules/capture/infrastructure/postgres-pending-orchestration-retry.js';
 import {
   reconcilePendingCaptureCommands,
 } from './modules/capture/infrastructure/postgres-command-reconciliation.js';

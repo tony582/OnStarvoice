@@ -12,7 +12,7 @@ import {getPool} from '../../../server/db/pool.js';
 import {runMigrations} from '../../../server/db/migrate.js';
 import {
   reconcilePendingOrchestrationRetries,
-} from '../../../server/routes/capture-orchestrations.js';
+} from '../../../server/modules/capture/infrastructure/postgres-pending-orchestration-retry.js';
 import {hashOrchestrationRequest} from '../../../server/services/capture-orchestration.js';
 
 const PLAN_SNAPSHOT = Object.freeze({
