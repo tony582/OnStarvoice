@@ -19,6 +19,7 @@
     }
 
     function normalizeGroupId(value) {
+      if (value === null || value === undefined || value === "") return null;
       const groupId = Number(value);
       return Number.isSafeInteger(groupId) && groupId >= 0 ? groupId : null;
     }
@@ -50,12 +51,16 @@
       return {
         version: 1,
         taskId: group.taskId,
+        ...(group.attemptId ? {attemptId: group.attemptId} : {}),
         sourceTabId: group.sourceTabId,
         workerTabIds: [...group.workerTabIds],
         groupId: group.groupId,
         originalGroupId: group.originalGroupId,
         windowId: group.windowId,
         title: group.title,
+        ...(group.nativeGroupSetupPending === true
+          ? {nativeGroupSetupPending: true}
+          : {}),
         ...overrides,
       };
     }
@@ -126,9 +131,15 @@
         return false;
       }
 
-      async function begin({taskId, sourceTabId, title = groupTitle} = {}) {
+      async function begin({
+        taskId,
+        attemptId = "",
+        sourceTabId,
+        title = groupTitle,
+      } = {}) {
         return enqueue(async () => {
           const normalizedTaskId = cleanText(taskId, 320);
+          const normalizedAttemptId = cleanText(attemptId, 320);
           const normalizedSourceTabId = normalizeTabId(sourceTabId);
           const normalizedTitle =
             cleanText(title, 25) || DEFAULT_GROUP_TITLE;
@@ -141,7 +152,10 @@
 
           const current = groupsByTaskId.get(normalizedTaskId);
           if (current) {
-            if (current.sourceTabId !== normalizedSourceTabId) {
+            if (
+              current.sourceTabId !== normalizedSourceTabId ||
+              cleanText(current.attemptId, 320) !== normalizedAttemptId
+            ) {
               throw createError(
                 "capture_task_group_busy",
                 "该采集任务已经绑定到另一个来源 Tab",
@@ -170,13 +184,51 @@
             });
           } catch (error) {
             if (groupId !== undefined) {
-              await restoreSourceTabGroup(
-                normalizedSourceTabId,
-                Number.isSafeInteger(sourceTab?.groupId) &&
-                  sourceTab.groupId >= 0
-                  ? sourceTab.groupId
-                  : null,
-              ).catch(() => null);
+              try {
+                await restoreSourceTabGroup(
+                  normalizedSourceTabId,
+                  Number.isSafeInteger(sourceTab?.groupId) &&
+                    sourceTab.groupId >= 0
+                    ? sourceTab.groupId
+                    : null,
+                );
+              } catch (cleanupError) {
+                // Keep the exact native group ownership discoverable. The
+                // task-level BEGIN rollback (or a later exact END after an
+                // MV3 restart) can then retry cleanup instead of leaving an
+                // untracked group behind.
+                groupsByTaskId.set(normalizedTaskId, {
+                  taskId: normalizedTaskId,
+                  attemptId: normalizedAttemptId,
+                  sourceTabId: normalizedSourceTabId,
+                  workerTabIds: [],
+                  groupId,
+                  originalGroupId:
+                    Number.isSafeInteger(sourceTab?.groupId) &&
+                    sourceTab.groupId >= 0
+                      ? sourceTab.groupId
+                      : null,
+                  windowId: Number.isSafeInteger(sourceTab?.windowId)
+                    ? sourceTab.windowId
+                    : null,
+                  title: normalizedTitle,
+                  // Chromium created this exact native group, but the title
+                  // update and immediate rollback both failed. Persist this
+                  // marker because an MV3 restart cannot verify ownership by
+                  // title; source/group/window identity is authoritative for
+                  // the later cleanup-only restore path.
+                  nativeGroupSetupPending: true,
+                });
+                const pendingError = createError(
+                  "capture_task_group_cleanup_failed",
+                  "原生采集标签组创建失败，且来源页面分组尚未恢复",
+                  cleanupError,
+                );
+                pendingError.assistFailureCode =
+                  "capture_task_group_create_failed";
+                pendingError.setupError = error;
+                throw pendingError;
+              }
             }
             throw createError(
               "capture_task_group_create_failed",
@@ -187,6 +239,7 @@
 
           const group = {
             taskId: normalizedTaskId,
+            attemptId: normalizedAttemptId,
             sourceTabId: normalizedSourceTabId,
             workerTabIds: [],
             groupId,
@@ -207,6 +260,7 @@
       async function restore(snapshot = {}) {
         return enqueue(async () => {
           const normalizedTaskId = cleanText(snapshot?.taskId, 320);
+          const normalizedAttemptId = cleanText(snapshot?.attemptId, 320);
           const normalizedSourceTabId = normalizeTabId(
             snapshot?.sourceTabId || snapshot?.tabId,
           );
@@ -226,7 +280,8 @@
           if (current) {
             if (
               current.sourceTabId !== normalizedSourceTabId ||
-              current.groupId !== normalizedGroupId
+              current.groupId !== normalizedGroupId ||
+              cleanText(current.attemptId, 320) !== normalizedAttemptId
             ) {
               throw createError(
                 "capture_task_group_restore_conflict",
@@ -288,6 +343,7 @@
 
           const group = {
             taskId: normalizedTaskId,
+            attemptId: normalizedAttemptId,
             sourceTabId: normalizedSourceTabId,
             workerTabIds: Array.from(new Set(workerTabIds)),
             groupId: normalizedGroupId,
@@ -471,7 +527,13 @@
         });
       }
 
-      async function end({taskId, reason = "capture_task_finished"} = {}) {
+      async function end({
+        taskId,
+        attemptId = "",
+        sourceTabId = null,
+        groupId = null,
+        reason = "capture_task_finished",
+      } = {}) {
         return enqueue(async () => {
           const normalizedTaskId = cleanText(taskId, 320);
           if (!normalizedTaskId) {
@@ -480,6 +542,18 @@
           const group = groupsByTaskId.get(normalizedTaskId);
           if (!group) {
             return {released: false, reason: "not_grouped"};
+          }
+          const normalizedAttemptId = cleanText(attemptId, 320);
+          const normalizedSourceTabId = normalizeTabId(sourceTabId);
+          const normalizedGroupId = normalizeGroupId(groupId);
+          if (
+            (normalizedAttemptId &&
+              cleanText(group.attemptId, 320) !== normalizedAttemptId) ||
+            (normalizedSourceTabId &&
+              group.sourceTabId !== normalizedSourceTabId) ||
+            (normalizedGroupId !== null && group.groupId !== normalizedGroupId)
+          ) {
+            return {released: false, reason: "ownership_mismatch"};
           }
           await releaseGroupedTabs(group.workerTabIds);
           await restoreSourceTabGroup(

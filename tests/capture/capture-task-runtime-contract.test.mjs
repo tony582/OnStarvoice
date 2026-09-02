@@ -55,15 +55,18 @@ test("all task-level runtime messages are wired in the service worker", () => {
   }
 });
 
-test("legacy relays only release sessions they started themselves", () => {
-  assert.match(
-    backgroundSource,
-    /if \(existingDebugSession\?\.persistent && isListCaptureAction\) \{[\s\S]*persistentRelayTaskId[\s\S]*persistentRelayTaskId !== existingDebugSession\.taskId[\s\S]*debugSession = await captureDebugSessionManager\.updateTask/u,
+test("list relays never create a transient debugger dependency", () => {
+  const relayStart = backgroundSource.indexOf(
+    "if (type === 'onstarvoice:relay-to-content')",
   );
+  const relaySource = backgroundSource.slice(relayStart);
   assert.match(
-    backgroundSource,
-    /if \(debugSession && debugSessionStartedByRelay\) \{\s*await captureDebugSessionManager\.stop/u,
+    relaySource,
+    /if \(existingDebugSession\?\.persistent && isListCaptureAction\) \{[\s\S]*persistentRelayTaskId[\s\S]*persistentRelayTaskId !== existingDebugSession\.taskId[\s\S]*await captureDebugSessionManager\.updateTask/u,
   );
+  assert.doesNotMatch(relaySource, /debugSessionStartedByRelay/u);
+  assert.doesNotMatch(relaySource, /captureDebugSessionManager\.start\(/u);
+  assert.doesNotMatch(relaySource, /capture_relay_finished/u);
 });
 
 test("persistent debugger ownership does not replace each list relay child run", () => {
@@ -76,7 +79,6 @@ test("persistent debugger ownership does not replace each list relay child run",
     /resolveListRelayRunId\(\s*sourcePayload\.listCaptureRunId,\s*createUuid/u,
   );
   assert.match(relaySource, /activeListRunId: listRunId/u);
-  assert.match(relaySource, /runId: listRunId/u);
   assert.match(relaySource, /listCaptureRunId: listRunId/u);
   assert.doesNotMatch(
     relaySource,
@@ -84,19 +86,20 @@ test("persistent debugger ownership does not replace each list relay child run",
   );
 });
 
-test("unexpected debugger detach fans cancellation out to source and worker tabs", () => {
-  assert.match(
-    backgroundSource,
-    /const cancelListRunId = session\.persistent\s*\? session\.activeListRunId\s*: session\.runId/u,
+test("unexpected debugger detach is observational for persistent and legacy assist sessions", () => {
+  const start = backgroundSource.indexOf(
+    "async function handleUnexpectedCaptureDebugDetach",
   );
-  assert.match(
-    backgroundSource,
-    /const targetTabIds = \[\s*session\.tabId,[\s\S]*session\.workerTabIds/u,
+  const end = backgroundSource.indexOf(
+    "async function handleAbandonedCaptureTask",
+    start,
   );
-  assert.match(
-    backgroundSource,
-    /\[\.\.\.new Set\(targetTabIds\)\]\.map\(\(tabId\) =>[\s\S]*relayToContentWithRetry\(tabId, cancelPayload\)/u,
-  );
+  const body = backgroundSource.slice(start, end);
+  assert.match(body, /transient assist detached; page capture continues/u);
+  assert.match(body, /detached; page capture continues/u);
+  assert.doesNotMatch(body, /relayCaptureTaskCancellation/u);
+  assert.doesNotMatch(body, /publishCaptureTaskCancellation/u);
+  assert.doesNotMatch(body, /terminalizeCaptureTaskLedgerRun/u);
 });
 
 test("task end attempts debugger release before source ungroup cleanup", () => {
@@ -238,7 +241,7 @@ test("A/B detail preloading requires an explicit persistent task and two remaini
 test("Douyin detail enhancement stays on one worker and delays unavailable failures", () => {
   assert.match(
     captureSyncSource,
-    /const allowDetailDoubleBuffer = !detailBatchContainsDouyin/u,
+    /const allowDetailDoubleBuffer = Boolean\([\s\S]*!detailBatchContainsDouyin[\s\S]*taskTabRegistrationActive/u,
   );
   assert.match(
     captureSyncSource,
@@ -412,7 +415,7 @@ test("source removal uses unified task cleanup instead of deleting manager maps 
   assert.doesNotMatch(removedListener, /captureDebugSessionManager\.handleTabRemoved/u);
 });
 
-test("required detail workers fail closed when their explicit task session is missing", () => {
+test("detail workers continue when their optional assist session is missing", () => {
   const registrationAt = captureSyncSource.indexOf(
     "const normalizedCaptureTaskId = normalizeCaptureTaskId(captureTaskId)",
   );
@@ -422,7 +425,12 @@ test("required detail workers fail closed when their explicit task session is mi
   );
   const section = captureSyncSource.slice(registrationAt, navigationAt);
   assert.match(section, /taskTabRegistration\?\.skipped === true/u);
-  assert.match(section, /TASK_TAB_GROUP_UNAVAILABLE/u);
+  assert.match(
+    section,
+    /optional capture assist registration unavailable; continuing detail capture/u,
+  );
+  assert.doesNotMatch(section, /buildSetupFailureResult/u);
+  assert.doesNotMatch(section, /TASK_TAB_GROUP_UNAVAILABLE/u);
   assert.doesNotMatch(section, /getActiveTaskContext\(\)\?\.taskId/u);
 });
 
@@ -597,7 +605,7 @@ test("fresh-worker stale cleanup validates the owned group before touching tab i
   assert.match(body, /workerTab\?\.groupId === taskGroupId/u);
 });
 
-test("native detach and source loss close owned detail workers", () => {
+test("native assist detach is observational while source loss closes owned detail workers", () => {
   const detachAt = backgroundSource.indexOf("onUnexpectedDetach: async");
   const detachEnd = backgroundSource.indexOf("function createCaptureTaskError", detachAt);
   assert.match(
@@ -611,10 +619,15 @@ test("native detach and source loss close owned detail workers", () => {
     "async function handleAbandonedCaptureTask",
     unexpectedAt,
   );
-  assert.match(
-    backgroundSource.slice(unexpectedAt, unexpectedEnd),
-    /releaseCaptureTaskResources/u,
+  const unexpectedBody = backgroundSource.slice(unexpectedAt, unexpectedEnd);
+  const persistentBody = unexpectedBody.slice(
+    unexpectedBody.indexOf("// Debug/DevTools is only a capture assist"),
   );
+  assert.match(persistentBody, /clearCaptureTaskTraceOverlayFailSoft/u);
+  assert.doesNotMatch(persistentBody, /publishCaptureTaskCancellation/u);
+  assert.doesNotMatch(persistentBody, /terminalizeCaptureTaskLedgerRun/u);
+  assert.doesNotMatch(persistentBody, /relayCaptureTaskCancellation/u);
+  assert.doesNotMatch(persistentBody, /releaseCaptureTaskResources/u);
   const removedAt = backgroundSource.indexOf(
     "async function handleCaptureRuntimeTabRemoved",
   );
@@ -670,19 +683,53 @@ test("required owner is verified before and after task mutations", () => {
   const firstOwnerCheckAt = body.indexOf("requireConnectedCaptureTaskOwner(taskId)");
   const groupAt = body.indexOf("captureTaskTabGroupManager.begin");
   const lastOwnerCheckAt = body.lastIndexOf("requireConnectedCaptureTaskOwner(taskId)");
-  const returnAt = body.indexOf("return {taskId, session, group, debugOwnership}");
+  const returnAt = body.indexOf(
+    "return {\n      taskId,\n      session,\n      group,\n      debugOwnership,",
+  );
   assert.ok(firstOwnerCheckAt >= 0 && firstOwnerCheckAt < groupAt);
   assert.ok(lastOwnerCheckAt > groupAt && lastOwnerCheckAt < returnAt);
   assert.match(body, /ownerRequired = request\.ownerRequired === true/u);
 });
 
-test("begin rollback uses the same ordered resource release contract", () => {
+test("begin rollback releases only exact resources created by that attempt", () => {
   const start = backgroundSource.indexOf("async function beginCaptureTask");
   const end = backgroundSource.indexOf("async function updateCaptureTask", start);
   const body = backgroundSource.slice(start, end);
   assert.match(body, /capture_task_begin_rollback/u);
-  assert.match(body, /releaseCaptureTaskResourcesWithRetry/u);
+  assert.match(body, /!preBeginSession[\s\S]*rollbackDebugSnapshot/u);
+  assert.match(body, /!preBeginGroup[\s\S]*rollbackGroupSnapshot/u);
+  const rollbackAt = body.indexOf('const rollbackDebugSnapshot');
+  const debugStopAt = body.indexOf('captureDebugSessionManager.stop', rollbackAt);
+  const workerCloseAt = body.indexOf('closeTrackedCaptureTaskWorkerTabs', rollbackAt);
+  const groupEndAt = body.indexOf('captureTaskTabGroupManager.end', rollbackAt);
+  assert.ok(debugStopAt > rollbackAt);
+  assert.ok(workerCloseAt > debugStopAt);
+  assert.ok(groupEndAt > workerCloseAt);
+  const exactRollback = body.slice(debugStopAt, groupEndAt + 400);
+  assert.match(exactRollback, /attemptId/u);
+  assert.match(exactRollback, /runId: beginRunId/u);
+  assert.match(exactRollback, /sourceTabId/u);
+  assert.match(exactRollback, /groupId: rollbackGroupSnapshot\.groupId/u);
   assert.doesNotMatch(body, /captureDebugSessionManager\.stopByTaskId[\s\S]*captureTaskTabGroupManager\.end/u);
+});
+
+test("capture task BEGIN and END share one lifecycle queue", () => {
+  assert.match(
+    backgroundSource,
+    /function runCaptureTaskLifecycleOperation\(operation\)[\s\S]*captureTaskLifecycleQueue/u,
+  );
+  const beginStart = backgroundSource.indexOf("async function beginCaptureTask(");
+  const beginEnd = backgroundSource.indexOf("async function beginCaptureTaskNow(", beginStart);
+  assert.match(
+    backgroundSource.slice(beginStart, beginEnd),
+    /runCaptureTaskLifecycleOperation/u,
+  );
+  const endStart = backgroundSource.indexOf("async function endCaptureTask(");
+  const endEnd = backgroundSource.indexOf("async function performEndCaptureTask(", endStart);
+  assert.match(
+    backgroundSource.slice(endStart, endEnd),
+    /runCaptureTaskLifecycleOperation/u,
+  );
 });
 
 test("sidebar owner disconnect is a bounded whole-task cancellation", () => {
@@ -708,7 +755,7 @@ test("sidebar owner disconnect is a bounded whole-task cancellation", () => {
   assert.match(body, /releaseCaptureTaskResources/u);
 });
 
-test("native Debug cancellation publishes a task tombstone before cleanup", () => {
+test("persistent native assist detach never publishes a task tombstone or stops capture", () => {
   const start = backgroundSource.indexOf(
     "async function handleUnexpectedCaptureDebugDetach",
   );
@@ -717,15 +764,15 @@ test("native Debug cancellation publishes a task tombstone before cleanup", () =
     start,
   );
   const body = backgroundSource.slice(start, end);
-  const publishAt = body.indexOf("publishCaptureTaskCancellation");
-  const ledgerAt = body.indexOf("terminalizeCaptureTaskLedgerRun", publishAt);
-  const relayAt = body.indexOf("relayCaptureTaskCancellation", ledgerAt);
-  const releaseAt = body.indexOf("releaseCaptureTaskResources", relayAt);
-  assert.ok(publishAt >= 0);
-  assert.ok(ledgerAt > publishAt);
-  assert.ok(relayAt > ledgerAt);
-  assert.ok(releaseAt > relayAt);
-  assert.match(backgroundSource, /captureTaskCancellation: cancellation/u);
+  const persistentBody = body.slice(
+    body.indexOf("// Debug/DevTools is only a capture assist"),
+  );
+  assert.match(persistentBody, /clearCaptureTaskTraceOverlayFailSoft/u);
+  assert.match(persistentBody, /page capture continues/u);
+  assert.doesNotMatch(persistentBody, /publishCaptureTaskCancellation/u);
+  assert.doesNotMatch(persistentBody, /terminalizeCaptureTaskLedgerRun/u);
+  assert.doesNotMatch(persistentBody, /relayCaptureTaskCancellation/u);
+  assert.doesNotMatch(persistentBody, /releaseCaptureTaskResources/u);
 });
 
 test("batch sync cancellation reaches spacing, retry, content and lead writes", () => {

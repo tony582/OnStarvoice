@@ -39,7 +39,9 @@ import {
   buildKeywordRetryAssignments,
 } from './retry-item-allocation.js'
 import {
-  formatRecoveryCountdown,
+  activeRecoveryCommandStatus,
+  formatRecoveryAttemptLabel,
+  formatRecoveryState,
   orchestrationItemStatusBucket,
   summarizeOrchestrationItems,
 } from './recovery-presentation.js'
@@ -96,11 +98,16 @@ const FINAL_EXECUTION_STATUSES = new Set([
   'completed', 'completed_with_warnings', 'completed_with_failures',
   'failed', 'canceled', 'skipped', 'superseded',
 ])
+// Keep this aligned with the server-side elastic claim gate. A retryable item
+// cannot be claimed while its source execution still owns live work.
+const RETRY_SOURCE_RELEASED_EXECUTION_STATUSES = new Set([
+  ...FINAL_EXECUTION_STATUSES,
+  'needs_action', 'interrupted',
+])
 const FINAL_ORCHESTRATION_STATUSES = new Set([
   'completed', 'completed_with_warnings', 'completed_with_failures',
   'failed', 'canceled', 'skipped', 'superseded',
 ])
-const ELASTIC_AUTOMATIC_ATTEMPT_LIMIT = 3
 const HANDOFF_UNSTARTED_EXCLUDED_STATUSES = new Set([
   'completed', 'completed_with_warnings', 'failed', 'skipped',
 ])
@@ -128,16 +135,9 @@ const NEGATIVE_REASSIGN_BLOCKING_EXECUTION_STATUSES = new Set([
 ])
 const KEYWORD_RETRY_STATUSES = new Set(['retryable', 'needs_action', 'failed'])
 
-function elasticAttemptBudgetUsed(item: OrchestrationItemRecord) {
-  const rawBudget = item.metadata?.elasticAttemptBudgetUsed
-  const budget = Number(rawBudget)
-  return Number.isInteger(budget) && budget >= 0
-    ? budget
-    : Math.max(0, Number(item.attempt_count || 0))
-}
-
 const COMMAND_STATUS_LABELS: Record<string, string> = {
   pending: '等待 Agent 领取',
+  acknowledged: 'Agent 已领取',
   claimed: 'Agent 已领取',
   completed: '指令已完成',
   failed: '指令失败',
@@ -211,26 +211,36 @@ function executionTaskId(execution: OrchestrationExecutionRecord) {
   return String(execution.taskId || execution.task_id || execution.id || '')
 }
 
-function executionHasAwaitingCommand(execution: OrchestrationExecutionRecord) {
-  const commandId = String(execution.commandId || execution.command_id || '')
-  const commandStatus = String(execution.command_status || '')
-  return Boolean(commandId && ['pending', 'acknowledged'].includes(commandStatus))
+function executionAwaitingCommandStatus(
+  execution?: OrchestrationExecutionRecord,
+  now = Date.now(),
+) {
+  const blockingCommandId = String(execution?.blocking_command_id || '')
+  const blockingCommandStatus = String(
+    execution?.blocking_command_status || '',
+  ).toLowerCase()
+  const activeBlockingStatus = activeRecoveryCommandStatus({
+    id: blockingCommandId,
+    status: blockingCommandStatus,
+    now,
+  })
+  if (activeBlockingStatus) {
+    return activeBlockingStatus
+  }
+  const commandId = String(execution?.commandId || execution?.command_id || '')
+  const commandStatus = String(execution?.command_status || '').toLowerCase()
+  return activeRecoveryCommandStatus({
+    id: commandId,
+    status: commandStatus,
+    expiresAt: execution?.command_expires_at,
+    now,
+  })
 }
 
 function objectRecord(value: unknown) {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {}
-}
-
-function itemWaitsForSourceClosure(item: OrchestrationItemRecord) {
-  const checkpoint = objectRecord(item.metadata?.checkpoint)
-  const itemError = objectRecord(item.error)
-  const recovery = objectRecord(checkpoint.recovery || itemError.recovery)
-  return item.metadata?.waitingForSourceClosure === true ||
-    checkpoint.waitingForSourceClosure === true ||
-    itemError.waitingForSourceClosure === true ||
-    recovery.waitingForSourceClosure === true
 }
 
 function executionItemIds(execution: OrchestrationExecutionRecord) {
@@ -278,14 +288,6 @@ function dataMessage(value: unknown) {
 function timestamp(value: unknown) {
   const parsed = Date.parse(String(value || ''))
   return Number.isFinite(parsed) ? parsed : 0
-}
-
-function formatAgentCooldownCountdown(waitUntil: number, now: number) {
-  const remainingSeconds = Math.max(0, Math.ceil((waitUntil - now) / 1000))
-  const minutes = Math.floor(remainingSeconds / 60)
-  const seconds = remainingSeconds % 60
-  const clock = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
-  return waitUntil > now ? `原 Agent 冷却 ${clock}` : '原 Agent 冷却已结束'
 }
 
 function safetyDiagnostic(value: unknown): boolean {
@@ -482,24 +484,13 @@ export function OrchestrationDetailWorkspace({
       const sourceExecution = executionsById.get(
         String(item.execution_task_id || ''),
       )
-      return Boolean(
-        sourceExecution &&
-        (
-          FINAL_EXECUTION_STATUSES.has(executionStatus(sourceExecution)) ||
-          (elasticPool && executionStatus(sourceExecution) === 'needs_action')
-        ),
-      )
+      if (!sourceExecution) return false
+      const sourceStatus = executionStatus(sourceExecution)
+      return elasticPool
+        ? RETRY_SOURCE_RELEASED_EXECUTION_STATUSES.has(sourceStatus)
+        : FINAL_EXECUTION_STATUSES.has(sourceStatus)
     })
   }, [contentPatrol, detail, elasticPool, executionsById, isScheduleTemplate, sortedItems])
-  const keywordRetrySourceAgentIds = useMemo(() => new Set(
-    keywordRetryItems
-      .map(item => itemAssignedAgentId(
-        item,
-        detail?.executions || [],
-        detail?.attempts || [],
-      ))
-      .filter(Boolean),
-  ), [detail?.attempts, detail?.executions, keywordRetryItems])
   const attemptedAgentIdsByRetryItem = useMemo(() => {
     const attempted = new Map<string, Set<string>>()
     for (const attempt of detail?.attempts || []) {
@@ -521,12 +512,6 @@ export function OrchestrationDetailWorkspace({
         detail.orchestration.platform,
       ))
   }, [availableAgents, contentPatrol, detail])
-  const keywordAutomaticCandidates = useMemo(
-    () => keywordRetryCandidates.filter(agent =>
-      !keywordRetrySourceAgentIds.has(agent.id),
-    ),
-    [keywordRetryCandidates, keywordRetrySourceAgentIds],
-  )
   const keywordRetryAllocation = useMemo(() => {
     return allocateKeywordRetryItems({
       items: keywordRetryItems,
@@ -535,11 +520,6 @@ export function OrchestrationDetailWorkspace({
       attemptedAgentIdsByItem: attemptedAgentIdsByRetryItem,
     })
   }, [attemptedAgentIdsByRetryItem, keywordRetryAgentOverrides, keywordRetryCandidates, keywordRetryItems])
-  const keywordRetryDispatchableCount = keywordRetryAllocation.filter(
-    allocation => Boolean(allocation.agent),
-  ).length
-  const keywordRetryWaitingCount =
-    keywordRetryAllocation.length - keywordRetryDispatchableCount
   const negativeReassignItems = useMemo(() => {
     if (!negativePatrol) return []
     return sortedItems.filter(item => {
@@ -737,54 +717,13 @@ export function OrchestrationDetailWorkspace({
       id: string
       label: string
       message: string
-      attemptCurrent: number
-      attemptTotal: number
       waitUntil: number
       agentLabel: string
-      countdownKind: 'retry' | 'agent_cooldown' | 'source_closure'
-      awaitingAgentReport: boolean
+      commandStatus: string
+      blockingStatusText: string
     }> = []
-    const itemClosureCardIds = new Set(
-      sortedItems
-        .filter(item => item.status === 'retryable' && itemWaitsForSourceClosure(item))
-        .map(item => String(item.id)),
-    )
     for (const execution of detail.executions) {
       if (FINAL_EXECUTION_STATUSES.has(String(execution.status || ''))) continue
-      const executionId = executionTaskId(execution)
-      const executionMetadata = objectRecord(execution.metadata)
-      const executionWaitsForSourceClosure =
-        executionMetadata.waitingForSourceClosure === true
-      const executionItems = sortedItems.filter(item =>
-        String(item.execution_task_id || '') === executionId ||
-        executionItemIds(execution).includes(String(item.id)),
-      )
-      if (executionWaitsForSourceClosure) {
-        if (executionItems.some(item => itemClosureCardIds.has(String(item.id)))) {
-          continue
-        }
-        const agentId = executionAgentId(execution)
-        const keywords = executionItems
-          .map(keywordForItem)
-          .filter(Boolean)
-        const targetLabel = keywords.length > 0
-          ? `「${keywords.slice(0, 2).join('、')}」${keywords.length > 2 ? `等 ${keywords.length} 项` : ''}`
-          : '当前工作项'
-        const workUnit = contentPatrol ? '帖子' : '关键词'
-        const attemptCurrent = Math.max(1, Number(execution.attempt_number || 1) || 1)
-        states.push({
-          id: `execution-closure:${executionId}`,
-          label: `等待原 Agent 关闭确认 · ${attemptCurrent}`,
-          message: `系统尚未收到原 Agent 的本地关闭证明，为避免${workUnit}${targetLabel}在两台设备同时执行，暂缓换 Agent；已采集结果继续保留。`,
-          attemptCurrent,
-          attemptTotal: attemptCurrent,
-          waitUntil: 0,
-          agentLabel: `原 Agent：${agentName(agentsById.get(agentId))}`,
-          countdownKind: 'source_closure',
-          awaitingAgentReport: false,
-        })
-        continue
-      }
       const progress = execution.progress && typeof execution.progress === 'object'
         ? execution.progress as Record<string, unknown>
         : {}
@@ -799,21 +738,23 @@ export function OrchestrationDetailWorkspace({
       const attemptCurrent = Math.max(0, Number(
         progress.attemptCurrent || progress.attempt_current || progress.attempt || 0,
       ) || 0)
-      const attemptTotal = Math.max(0, Number(
+      const rawAttemptTotal = Number(
         progress.attemptTotal || progress.attempt_total || progress.maxAttempts || 0,
-      ) || 0)
+      )
+      const attemptTotal = Number.isFinite(rawAttemptTotal) && rawAttemptTotal > 0
+        ? Math.max(attemptCurrent, Math.floor(rawAttemptTotal))
+        : null
+      const commandStatus = executionAwaitingCommandStatus(execution, nowMs)
       states.push({
         id: `execution:${executionTaskId(execution)}`,
-        label: attemptCurrent > 0 && attemptTotal > 0
-          ? `当前 Agent 自动恢复 ${attemptCurrent}/${attemptTotal}`
+        label: attemptCurrent > 0
+          ? `当前 Agent 自动恢复 ${formatRecoveryAttemptLabel({attemptCurrent, attemptTotal})}`
           : '当前 Agent 自动恢复',
         message: String(progress.message || execution.message || '正在等待下一次自动恢复'),
-        attemptCurrent,
-        attemptTotal,
         waitUntil,
         agentLabel: agentName(agentsById.get(agentId)),
-        countdownKind: 'retry',
-        awaitingAgentReport: executionHasAwaitingCommand(execution),
+        commandStatus,
+        blockingStatusText: '',
       })
     }
     for (const item of sortedItems) {
@@ -822,56 +763,65 @@ export function OrchestrationDetailWorkspace({
       const itemError = objectRecord(item.error)
       const recoveryValue = checkpointRecord.recovery || itemError.recovery
       const recovery = objectRecord(recoveryValue)
-      const waitingForSourceClosure = itemWaitsForSourceClosure(item)
-      const sourceAgentCooling = recovery.sourceAgentCooling !== false
-      const waitUntil = timestamp(
-        sourceAgentCooling
-          ? recovery.sourceAgentHoldUntil || recovery.source_agent_hold_until
-          : recovery.nextEvaluationAt || recovery.next_evaluation_at,
-      )
+      // A retryable item is claimed by an eligible Agent heartbeat. Recovery
+      // metadata can contain a review anchor, but it is not a scheduled action
+      // and must never be presented as a countdown.
+      const waitUntil = 0
       const attemptCurrent = Math.max(1, Number(
         recovery.attemptCurrent || recovery.attempt_current || item.attempt_count || 1,
       ) || 1)
-      const attemptTotal = Math.max(attemptCurrent, Number(
-        recovery.attemptTotal || recovery.attempt_total || 3,
-      ) || 3)
+      const rawAttemptTotal = Number(
+        recovery.attemptTotal || recovery.attempt_total || 0,
+      )
+      const attemptTotal = Number.isFinite(rawAttemptTotal) && rawAttemptTotal > 0
+        ? Math.max(attemptCurrent, Math.floor(rawAttemptTotal))
+        : null
       const workUnit = contentPatrol || ['negative_post', 'watched_content'].includes(item.item_type)
         ? '帖子'
         : '关键词'
-      const cooldownHomeStatus = Object.prototype.hasOwnProperty.call(
-        recovery,
-        'cooldownHomeRestored',
+      const attemptLabel = formatRecoveryAttemptLabel({attemptCurrent, attemptTotal})
+      const sourceExecutionId = String(item.execution_task_id || '')
+      const sourceExecution = sourceExecutionId
+        ? executionsById.get(sourceExecutionId)
+        : undefined
+      const sourceExecutionStatus = executionStatus(sourceExecution)
+      const commandStatus = executionAwaitingCommandStatus(sourceExecution, nowMs)
+      const sourceExecutionMissing = Boolean(sourceExecutionId && !sourceExecution)
+      const sourceExecutionBlocks = Boolean(
+        sourceExecution &&
+        !RETRY_SOURCE_RELEASED_EXECUTION_STATUSES.has(sourceExecutionStatus),
       )
-        ? recovery.cooldownHomeRestored === true
-          ? '；原 Agent 已返回平台首页'
-          : '；原 Agent 返回平台首页未确认'
-        : ''
+      const blockingStatusText = commandStatus
+        ? ''
+        : sourceExecutionMissing
+          ? '来源执行记录缺失 · 等待服务端校验'
+          : sourceExecutionBlocks
+            ? `原执行仍为${statusLabel(sourceExecutionStatus)} · 尚未释放接力`
+            : ''
+      const label = commandStatus
+        ? `原执行指令尚未结算 · ${attemptLabel}`
+        : blockingStatusText
+          ? `等待原执行结算 · ${attemptLabel}`
+          : `工作项已释放 · 恢复 ${attemptLabel}`
+      const message = commandStatus
+        ? `原执行指令已处于“${COMMAND_STATUS_LABELS[commandStatus] || commandStatus}”；服务端会在该指令结算后再允许其他 Agent 领取这个${workUnit}。`
+        : blockingStatusText
+          ? `该${workUnit}已进入恢复状态，但原执行尚未满足服务端接力条件；已采集结果继续保留。`
+          : String(recovery.reason || '') === 'platform_safety_handoff'
+            ? `仅隔离${workUnit}「${keywordForItem(item)}」与原账号这一组合；其他空闲 Agent 可立即领取，并优先在未尝试账号中接力；原账号可继续领取其他关键词`
+            : `${workUnit}「${keywordForItem(item)}」正在等待兼容的空闲 Agent；技术失败在全池尝试后可进入下一轮，原 Agent 可继续领取其他关键词`
       states.push({
         id: `item:${item.id}`,
-        label: waitingForSourceClosure
-          ? `等待原 Agent 关闭确认 · ${attemptCurrent}/${attemptTotal}`
-          : `工作项已释放 · 换 Agent ${attemptCurrent}/${attemptTotal}`,
-        message: waitingForSourceClosure
-          ? `系统尚未收到原 Agent 的本地关闭证明，为避免${workUnit}「${keywordForItem(item)}」在两台设备同时执行，暂缓换 Agent；已采集结果继续保留。`
-          : sourceAgentCooling
-          ? `${workUnit}「${keywordForItem(item)}」已解除原 Agent 锁定，其他空闲 Agent 可立即领取；原 Agent 暂停领取新任务${cooldownHomeStatus}`
-          : String(recovery.reason || '') === 'platform_safety_handoff'
-            ? `仅隔离${workUnit}「${keywordForItem(item)}」与原账号这一组合；系统正在未尝试账号中接力，原账号可继续领取其他关键词${cooldownHomeStatus}`
-            : `${workUnit}「${keywordForItem(item)}」正在等待未尝试过的空闲 Agent；原 Agent 可继续领取其他关键词${cooldownHomeStatus}`,
-        attemptCurrent,
-        attemptTotal,
+        label,
+        message,
         waitUntil,
         agentLabel: `原 Agent：${agentName(agentsById.get(String(recovery.sourceAgentId || item.assigned_agent_id || '')))}`,
-        countdownKind: waitingForSourceClosure
-          ? 'source_closure'
-          : sourceAgentCooling
-            ? 'agent_cooldown'
-            : 'retry',
-        awaitingAgentReport: false,
+        commandStatus,
+        blockingStatusText,
       })
     }
     return states
-  }, [agentsById, contentPatrol, detail, isScheduleTemplate, nowMs, sortedItems])
+  }, [agentsById, contentPatrol, detail, executionsById, isScheduleTemplate, nowMs, sortedItems])
 
   useEffect(() => {
     if (!orchestrationId) return
@@ -1052,21 +1002,9 @@ export function OrchestrationDetailWorkspace({
     const confirmSafety = keywordRetryItems.some(item =>
       safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata),
     )
-    const originalCount = keywordRetryAllocation.filter(allocation =>
-      allocation.agent && keywordRetrySourceAgentIds.has(allocation.agent.id),
-    ).length
     if (!window.confirm(
-      (keywordRetryDispatchableCount > 0
-        ? `确定按预览让 ${keywordRetryDispatchableCount} 个失败关键词现在接力吗？`
-        : `当前没有空闲兼容 Agent，确定让 ${keywordRetryWaitingCount} 个失败关键词进入自动等待队列吗？`) +
-      `${keywordRetryDispatchableCount > 0 && keywordRetryWaitingCount
-        ? ` 另有 ${keywordRetryWaitingCount} 个等待空闲 Agent，槽位释放后自动接力。`
-        : ''}` +
-      `${keywordRetryDispatchableCount === 0
-        ? ''
-        : originalCount
-          ? ` 其中 ${originalCount} 项使用原执行 Agent。`
-          : ' 当前可接力项全部使用其他空闲 Agent。'}` +
+      `确定提交 ${keywordRetryItems.length} 个失败关键词的接力请求吗？` +
+      ' 最终分配以服务端提交时的实时状态为准：优先未尝试的空闲 Agent；技术失败在全池尝试后可进入下一轮复用；曾触发安全验证的账号会对该关键词继续排除。' +
       ' 新结果会写回当前无人值守任务，不会生成独立根任务。' +
       `${confirmSafety ? ' 其中包含曾触发安全验证的关键词，请确认目标设备已可正常访问平台。' : ''}`,
     )) return
@@ -1299,20 +1237,8 @@ export function OrchestrationDetailWorkspace({
     elasticPool &&
     idleHandoffAllowed &&
     !orchestrationFinal &&
-    keywordRetryItems.some(item =>
-      item.status === 'retryable' &&
-      elasticAttemptBudgetUsed(item) < ELASTIC_AUTOMATIC_ATTEMPT_LIMIT,
-    ),
+    keywordRetryItems.some(item => item.status === 'retryable'),
   )
-  const keywordRecoveryExhausted = Boolean(
-    elasticPool &&
-    orchestrationFinal &&
-    keywordRetryItems.length > 0 &&
-    keywordRetryItems.every(item =>
-      elasticAttemptBudgetUsed(item) >= ELASTIC_AUTOMATIC_ATTEMPT_LIMIT,
-    ),
-  )
-
   return (
     <section className={cn('overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm', className)}>
       <header className="border-b border-border/70 px-4 py-4 sm:px-5">
@@ -1411,16 +1337,16 @@ export function OrchestrationDetailWorkspace({
               </span>
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <h3 className="text-sm font-bold text-foreground">
-                    {automaticRecoveryStates.some(state => state.countdownKind === 'source_closure')
-                      ? '恢复阻塞实时状态'
-                      : '自动恢复实时状态'}
-                  </h3>
+                  <h3 className="text-sm font-bold text-foreground">自动恢复实时状态</h3>
                   <span className="text-[10px] text-muted-foreground">每 5 秒同步设备状态</span>
                 </div>
                 <div className="mt-3 grid gap-2">
                   {automaticRecoveryStates.map(state => {
-                    const due = state.countdownKind === 'source_closure' || (state.waitUntil > 0 && state.waitUntil <= nowMs)
+                    const due = Boolean(state.blockingStatusText) || Boolean(
+                      !state.commandStatus &&
+                      state.waitUntil > 0 &&
+                      state.waitUntil <= nowMs,
+                    )
                     return (
                       <div key={state.id} className={cn(
                         'rounded-xl border px-3 py-2.5',
@@ -1434,24 +1360,18 @@ export function OrchestrationDetailWorkspace({
                             'font-mono text-xs font-bold tabular-nums',
                             due ? 'text-status-orange' : 'text-primary',
                           )}>
-                            {state.countdownKind === 'source_closure'
-                              ? '等待原 Agent 关闭确认'
-                              : state.waitUntil > 0
-                              ? state.countdownKind === 'agent_cooldown'
-                                ? formatAgentCooldownCountdown(state.waitUntil, nowMs)
-                                : formatRecoveryCountdown({
-                                    waitUntil: state.waitUntil,
-                                    now: nowMs,
-                                    awaitingAgentReport: state.awaitingAgentReport,
-                                  })
-                              : '排队中，空闲 Agent 自动领取'}
+                            {state.blockingStatusText || formatRecoveryState({
+                              commandStatus: state.commandStatus,
+                              waitUntil: state.waitUntil,
+                              now: nowMs,
+                            })}
                           </span>
                         </div>
                         <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{state.message}</p>
                         <p className="mt-1 text-[10px] text-muted-foreground">
                           {state.agentLabel}
-                          {state.waitUntil > 0 && state.countdownKind !== 'source_closure'
-                            ? ` · ${state.countdownKind === 'agent_cooldown' ? '冷却结束' : '下次动作'} ${new Date(state.waitUntil).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+                          {!state.commandStatus && !state.blockingStatusText && state.waitUntil > nowMs
+                            ? ` · 下次动作 ${new Date(state.waitUntil).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
                             : ''}
                         </p>
                       </div>
@@ -1549,11 +1469,9 @@ export function OrchestrationDetailWorkspace({
                     <h3 className="text-sm font-bold text-foreground">
                       {automaticKeywordRecoveryActive
                         ? `${keywordRetryItems.length} 个关键词正在自动恢复`
-                        : keywordRecoveryExhausted
-                          ? `${keywordRetryItems.length} 个关键词自动尝试已耗尽`
-                          : orchestrationFinal && elasticPool
-                            ? `${keywordRetryItems.length} 个关键词仍需复核`
-                            : `${keywordRetryItems.length} 个关键词可云端重试`}
+                        : orchestrationFinal && elasticPool
+                          ? `${keywordRetryItems.length} 个关键词仍需复核`
+                          : `${keywordRetryItems.length} 个关键词可云端重试`}
                     </h3>
                     <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
                       {automaticKeywordRecoveryActive
@@ -1566,19 +1484,17 @@ export function OrchestrationDetailWorkspace({
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
                     {automaticKeywordRecoveryActive
                       ? '技术失败会按关键词自动重试，并优先交给近期更稳定的空闲 Agent；新结果仍回写当前任务。'
-                      : keywordRecoveryExhausted
-                        ? '该批次已完成结算，不会继续自动下发；请查看每次尝试的真实错误后决定是否新建补采任务。'
-                        : orchestrationFinal && elasticPool
-                          ? '旧批次虽已结算，仍可把未完成关键词交给未尝试过的空闲 Agent；新批次不会在仍有可用接力账号时提前结算。'
-                          : '不用手动选择；提交时系统会为每个失败关键词挑选一台未尝试过且近期稳定的空闲 Agent。下拉框只用于指定优先账号。'}
+                      : orchestrationFinal && elasticPool
+                        ? '该批次已结算；可先查看每次尝试的真实错误，再选择在当前任务内重试或新建补采任务。'
+                        : '下拉框只是优先 Agent 预览；提交后服务端会按实时空闲、已尝试轮次与安全风控记录完成最终分配。'}
                   </p>
                 </div>
               </div>
               {automaticKeywordRecoveryActive ? (
                 <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
-                  {keywordAutomaticCandidates.length > 0
-                    ? '系统按上方倒计时自动检查并下发，无需人工操作'
-                    : '正在等待兼容的空闲 Agent；上方会显示检查状态'}
+                  {keywordRetryCandidates.length > 0
+                    ? '等待空闲 Agent 心跳领取；真正下发后会显示目标 Agent 和命令状态'
+                    : '当前没有兼容的空闲 Agent；页面每 5 秒刷新一次真实状态'}
                 </span>
               ) : <div className="flex flex-col items-end gap-1">
                 <Button
@@ -1591,16 +1507,9 @@ export function OrchestrationDetailWorkspace({
                     : <Send className="h-4 w-4" />}
                   重试失败关键词
                 </Button>
-                {keywordRetryWaitingCount > 0 && (
-                  <span className={cn(
-                    'text-[11px]',
-                    keywordRetryDispatchableCount > 0
-                      ? 'text-muted-foreground'
-                      : 'text-status-red',
-                  )}>
-                    {keywordRetryDispatchableCount} 个现在接力，{keywordRetryWaitingCount} 个等待；槽位释放后自动改派
-                  </span>
-                )}
+                <span className="max-w-sm text-right text-[11px] leading-4 text-muted-foreground">
+                  页面仅预览优先顺序；是否立即接力以提交时服务端实时分配为准
+                </span>
               </div>}
             </div>
             {!automaticKeywordRecoveryActive && (
@@ -1618,6 +1527,11 @@ export function OrchestrationDetailWorkspace({
                   const attemptedAgentIds = attemptedAgentIdsByRetryItem.get(
                     allocation.item.id,
                   ) || new Set<string>()
+                  const sourceAgentId = itemAssignedAgentId(
+                    allocation.item,
+                    detail?.executions || [],
+                    detail?.attempts || [],
+                  )
                   return (
                     <div
                       key={allocation.item.id}
@@ -1667,10 +1581,12 @@ export function OrchestrationDetailWorkspace({
                             }
                           >
                             {agentName(agent)}
-                            {attemptedAgentIds.has(agent.id)
-                              ? '（此词已尝试）'
-                              : keywordRetrySourceAgentIds.has(agent.id)
-                                ? '（原 Agent）'
+                            {agent.id === sourceAgentId
+                              ? attemptedAgentIds.has(agent.id)
+                                ? '（原 Agent · 此词已尝试）'
+                                : '（原 Agent）'
+                              : attemptedAgentIds.has(agent.id)
+                                ? '（此词已尝试）'
                                 : ''}
                             {agent.todaySearches !== undefined
                               ? ` · 今日搜索 ${agent.todaySearches}${agent.dailySearchLimit

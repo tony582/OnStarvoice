@@ -87,7 +87,7 @@ function createCanceledListCaptureResult(type) {
     data: null,
     error: {
       code: "CAPTURE_CANCELED",
-      message: "AI Debug Session 已由用户停止",
+      message: "采集辅助会话已由用户停止",
     },
   };
 }
@@ -159,7 +159,7 @@ function beginListCaptureFeedback(request, {captureKind, label}) {
       ) {
         overlay.setTaskTakeover({
           active: true,
-          label: "AI 正在接管",
+          label: "采集辅助运行中",
         });
       }
       overlayRunScope = createListCaptureOverlayRunScope(overlay, runId);
@@ -567,7 +567,7 @@ function reportCaptureProgress(request, progress = {}) {
         activeListCaptureDebugOverlay || getListCaptureDebugOverlay();
       overlay.setTaskTakeover({
         active: true,
-        label: "AI 正在接管",
+        label: "采集辅助运行中",
         progress: normalizedProgress,
       });
       activeListCaptureDebugOverlay = overlay;
@@ -761,7 +761,7 @@ function handleSetCaptureTaskTakeover(request, sendResponse) {
         data: {
           taskId: String(request?.taskId || "").trim(),
           active: false,
-          label: String(request?.label || "AI 正在接管").trim(),
+          label: String(request?.label || "采集辅助运行中").trim(),
           ...result,
         },
       });
@@ -770,7 +770,7 @@ function handleSetCaptureTaskTakeover(request, sendResponse) {
     const overlay = getListCaptureDebugOverlay();
     const takeoverOptions = {
       active,
-      label: String(request?.label || "AI 正在接管").trim(),
+      label: String(request?.label || "采集辅助运行中").trim(),
     };
     if (Object.prototype.hasOwnProperty.call(request || {}, "progress")) {
       takeoverOptions.progress =
@@ -793,7 +793,7 @@ function handleSetCaptureTaskTakeover(request, sendResponse) {
       ok: false,
       error: {
         code: "TASK_TAKEOVER_UPDATE_FAILED",
-        message: error?.message || "更新页面接管状态失败",
+        message: error?.message || "更新页面采集辅助状态失败",
       },
     });
   }

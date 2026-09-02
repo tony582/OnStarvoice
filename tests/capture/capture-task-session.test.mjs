@@ -281,7 +281,214 @@ test("failed begin never activates a task session", async () => {
   assert.equal(runtime.messages.length, 1);
 });
 
-test("a replaced source tab is revalidated with background before local reuse", async () => {
+test("a lost BEGIN response is confirmed by an exact idempotent resend before local activation", async () => {
+  let beginAttempts = 0;
+  const runtime = createRuntimeDouble(async (message) => {
+    if (message.type === "onstarvoice:begin-capture-task") {
+      beginAttempts += 1;
+      if (beginAttempts === 1) {
+        throw new Error("message port closed after BEGIN was applied");
+      }
+    }
+    return {ok: true, data: {taskId: message.taskId}};
+  });
+  const options = {chromeApi: runtime.chromeApi};
+  const taskId = "unattended-capture:uncertain-begin-confirmed";
+
+  const begun = await beginCaptureTaskSession(
+    {
+      taskId,
+      tabId: 45,
+      label: "确认已应用 BEGIN",
+      platform: "douyin",
+      ownerRequired: false,
+      attemptId: "attempt-confirmed",
+    },
+    options,
+  );
+
+  assert.equal(begun.ok, true);
+  assert.equal(begun.active, true);
+  const beginMessages = getTaskLifecycleMessages(runtime.messages).filter(
+    (message) => message.type === "onstarvoice:begin-capture-task",
+  );
+  assert.equal(beginMessages.length, 2);
+  assert.deepEqual(beginMessages[1], beginMessages[0]);
+
+  await endCaptureTaskSession({taskId, reason: "completed"}, options);
+});
+
+test("an unconfirmed BEGIN sends an exact attempt-fenced END and never activates locally", async () => {
+  const runtime = createRuntimeDouble(async (message) => {
+    if (message.type === "onstarvoice:begin-capture-task") {
+      throw new Error("message port closed after uncertain BEGIN");
+    }
+    return {ok: true, data: {taskId: message.taskId}};
+  });
+  const options = {chromeApi: runtime.chromeApi};
+  const taskId = "unattended-capture:uncertain-begin-cleanup";
+
+  const begun = await beginCaptureTaskSession(
+    {
+      taskId,
+      tabId: 46,
+      label: "BEGIN 响应持续丢失",
+      platform: "xiaohongshu",
+      ownerRequired: false,
+      attemptId: "attempt-cleanup",
+    },
+    options,
+  );
+
+  assert.equal(begun.ok, false);
+  assert.equal(begun.active, false);
+  assert.equal(begun.cleanupAttempted, true);
+  assert.equal(begun.cleanupConfirmed, true);
+  assert.deepEqual(
+    getTaskLifecycleMessages(runtime.messages).map((message) => message.type),
+    [
+      "onstarvoice:begin-capture-task",
+      "onstarvoice:begin-capture-task",
+      "onstarvoice:end-capture-task",
+    ],
+  );
+  const cleanup = getTaskLifecycleMessages(runtime.messages).at(-1);
+  assert.deepEqual(cleanup, {
+    type: "onstarvoice:end-capture-task",
+    taskId,
+    reason: "begin_confirmation_failed",
+    status: "failed",
+    attemptId: "attempt-cleanup",
+  });
+  assert.equal(getTakeoverMessages(runtime.messages).length, 0);
+  assert.equal(
+    (
+      await updateCaptureTaskSession(
+        {taskId, progress: {phase: "must_not_publish"}},
+        options,
+      )
+    ).reason,
+    "no_active_task_session",
+  );
+});
+
+test("an uncertain BEGIN with unconfirmed cleanup is a hard ownership failure", async () => {
+  const runtime = createRuntimeDouble(async () => {
+    throw new Error("message port unavailable before lifecycle confirmation");
+  });
+  const options = {chromeApi: runtime.chromeApi};
+  const taskId = "unattended-capture:uncertain-cleanup-unconfirmed";
+
+  const begun = await beginCaptureTaskSession(
+    {
+      taskId,
+      tabId: 48,
+      platform: "xiaohongshu",
+      ownerRequired: false,
+      attemptId: "attempt-cleanup-unconfirmed",
+    },
+    options,
+  );
+
+  assert.equal(begun.ok, false);
+  assert.equal(begun.active, false);
+  assert.equal(begun.reason, "capture_task_begin_cleanup_failed");
+  assert.equal(begun.originalReason, "task_session_unavailable");
+  assert.equal(begun.cleanupAttempted, true);
+  assert.equal(begun.cleanupConfirmed, false);
+  assert.deepEqual(
+    getTaskLifecycleMessages(runtime.messages).map((message) => message.type),
+    [
+      "onstarvoice:begin-capture-task",
+      "onstarvoice:begin-capture-task",
+      "onstarvoice:end-capture-task",
+      "onstarvoice:end-capture-task",
+    ],
+  );
+  assert.equal(getTakeoverMessages(runtime.messages).length, 0);
+});
+
+test("an ignored BEGIN confirmation is authoritative and never becomes locally active", async () => {
+  let beginAttempts = 0;
+  const runtime = createRuntimeDouble(async (message) => {
+    if (message.type === "onstarvoice:begin-capture-task") {
+      beginAttempts += 1;
+      if (beginAttempts === 1) {
+        throw new Error("first BEGIN response was lost");
+      }
+      return {
+        ok: true,
+        data: {ignored: true, reason: "stale_unattended_attempt"},
+      };
+    }
+    return {
+      ok: true,
+      data: {ignored: true, reason: "stale_unattended_attempt"},
+    };
+  });
+  const options = {chromeApi: runtime.chromeApi};
+  const taskId = "unattended-capture:uncertain-then-ignored";
+
+  const begun = await beginCaptureTaskSession(
+    {
+      taskId,
+      tabId: 47,
+      platform: "douyin",
+      attemptId: "attempt-obsolete",
+    },
+    options,
+  );
+
+  assert.equal(begun.ok, false);
+  assert.equal(begun.active, false);
+  assert.equal(begun.reason, "stale_unattended_attempt");
+  assert.equal(begun.cleanupAttempted, true);
+  assert.equal(getTakeoverMessages(runtime.messages).length, 0);
+  assert.deepEqual(
+    getTaskLifecycleMessages(runtime.messages).map((message) => message.type),
+    [
+      "onstarvoice:begin-capture-task",
+      "onstarvoice:begin-capture-task",
+      "onstarvoice:end-capture-task",
+    ],
+  );
+});
+
+test("an ignored stale BEGIN never creates a local active session", async () => {
+  const runtime = createRuntimeDouble(async (message) => {
+    if (message.type === "onstarvoice:begin-capture-task") {
+      return {
+        ok: true,
+        data: {ignored: true, reason: "stale_unattended_attempt"},
+      };
+    }
+    return {ok: true, data: {ok: true}};
+  });
+  const options = {chromeApi: runtime.chromeApi};
+  const taskId = "unattended-capture:stale-begin";
+
+  const begun = await beginCaptureTaskSession(
+    {
+      taskId,
+      tabId: 44,
+      platform: "douyin",
+      attemptId: "attempt-stale",
+    },
+    options,
+  );
+
+  assert.equal(begun.ok, false);
+  assert.equal(begun.active, false);
+  assert.equal(begun.reason, "stale_unattended_attempt");
+  assert.equal(
+    (await updateCaptureTaskSession({taskId, progress: {phase: "late"}}, options))
+      .reason,
+    "no_active_task_session",
+  );
+  assert.equal(getTakeoverMessages(runtime.messages).length, 0);
+});
+
+test("an authoritative source mismatch stays a hard rejection without local retry", async () => {
   let replacementBeginAttempts = 0;
   const runtime = createRuntimeDouble(async (message) => {
     if (
@@ -289,12 +496,10 @@ test("a replaced source tab is revalidated with background before local reuse", 
       Number(message.tabId) === 52
     ) {
       replacementBeginAttempts += 1;
-      if (replacementBeginAttempts === 1) {
-        return {
-          ok: false,
-          error: {code: "capture_task_source_mismatch"},
-        };
-      }
+      return {
+        ok: false,
+        error: {code: "capture_task_source_mismatch"},
+      };
     }
     return {ok: true, data: {taskId: message.taskId}};
   });
@@ -309,23 +514,76 @@ test("a replaced source tab is revalidated with background before local reuse", 
     options,
   );
 
-  assert.equal(rebound.ok, true);
-  assert.equal(rebound.active, true);
-  assert.equal(rebound.rebound, true);
-  assert.equal(replacementBeginAttempts, 2);
+  assert.equal(rebound.ok, false);
+  assert.equal(rebound.active, false);
+  assert.equal(rebound.reason, "capture_task_source_mismatch");
+  assert.equal(replacementBeginAttempts, 1);
   const beginMessages = getTaskLifecycleMessages(runtime.messages).filter(
     (message) => message.type === "onstarvoice:begin-capture-task",
   );
   assert.deepEqual(
     beginMessages.map((message) => message.tabId),
-    [51, 52, 52],
+    [51, 52],
   );
 
   await endCaptureTaskSession(
     {taskId: "task-source-rebound", reason: "completed"},
     options,
   );
-  assert.equal(getTakeoverMessages(runtime.messages).at(-1).tabId, 52);
+  assert.equal(getTakeoverMessages(runtime.messages).at(-1).tabId, 51);
+});
+
+test("a confirmed stale-assist degradation keeps exact END ownership without drawing an active overlay", async () => {
+  const runtime = createRuntimeDouble(async (message) => {
+    if (message.type === "onstarvoice:begin-capture-task") {
+      return {
+        ok: true,
+        data: {
+          taskId: message.taskId,
+          assistDegraded: true,
+          assistReason: "capture_assist_source_stale",
+        },
+      };
+    }
+    return {ok: true, data: {released: true}};
+  });
+  const options = {chromeApi: runtime.chromeApi};
+  const taskId = "task-stale-assist-degraded";
+
+  const begun = await beginCaptureTaskSession(
+    {
+      taskId,
+      tabId: 52,
+      platform: "douyin",
+      attemptId: "attempt-stale-assist",
+    },
+    options,
+  );
+
+  assert.equal(begun.ok, true);
+  assert.equal(begun.active, true);
+  assert.equal(begun.degraded, true);
+  assert.equal(begun.assistReason, "capture_assist_source_stale");
+  assert.deepEqual(
+    getTakeoverMessages(runtime.messages).at(-1),
+    {
+      type: "onstarvoice:relay-to-content",
+      tabId: 52,
+      payload: {
+        action: "setCaptureTaskTakeover",
+        taskId,
+        active: false,
+        label: "采集辅助运行中",
+        clearTrace: true,
+      },
+    },
+  );
+
+  await endCaptureTaskSession({taskId, reason: "completed"}, options);
+  const end = getTaskLifecycleMessages(runtime.messages).find(
+    (message) => message.type === "onstarvoice:end-capture-task",
+  );
+  assert.equal(end.attemptId, "attempt-stale-assist");
 });
 
 test("end retries one transient background release failure before clearing ownership", async () => {

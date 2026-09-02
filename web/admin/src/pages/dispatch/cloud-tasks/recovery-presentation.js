@@ -74,3 +74,55 @@ export function formatRecoveryCountdown({
     ? '指令已下发，等待 Agent 回报'
     : '已到检查时间，等待服务端重新评估';
 }
+
+export function formatRecoveryState({
+  commandStatus = '',
+  waitUntil = 0,
+  now = 0,
+} = {}) {
+  const normalizedCommandStatus = String(commandStatus || '').toLowerCase();
+  if (normalizedCommandStatus === 'pending') {
+    return '指令已下发 · 等待 Agent 领取';
+  }
+  if (normalizedCommandStatus === 'acknowledged') {
+    return 'Agent 已领取 · 等待执行回报';
+  }
+  return Number(waitUntil || 0) > Number(now || 0)
+    ? formatRecoveryCountdown({waitUntil, now})
+    : '尚未下发 · 等待空闲 Agent';
+}
+
+export function formatRecoveryAttemptLabel({
+  attemptCurrent = 0,
+  attemptTotal = null,
+} = {}) {
+  const current = Math.max(1, Math.floor(Number(attemptCurrent) || 1));
+  const total = Number(attemptTotal);
+  return Number.isFinite(total) && total >= current && total > 0
+    ? `${current}/${Math.floor(total)}`
+    : `第 ${current} 次`;
+}
+
+export function activeRecoveryCommandStatus({
+  id = '',
+  status = '',
+  expiresAt = '',
+  now = Date.now(),
+} = {}) {
+  const normalizedId = String(id || '').trim();
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  if (
+    !normalizedId ||
+    !['pending', 'acknowledged'].includes(normalizedStatus)
+  ) {
+    return '';
+  }
+  const normalizedExpiresAt = String(expiresAt || '').trim();
+  if (normalizedExpiresAt) {
+    const expiresAtMs = Date.parse(normalizedExpiresAt);
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Number(now || 0)) {
+      return '';
+    }
+  }
+  return normalizedStatus;
+}

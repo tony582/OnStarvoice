@@ -539,7 +539,7 @@ function resolveUnattendedCancellationTerminal(
   }
   const messages = {
     native_debug_canceled:
-      "浏览器 AI Debug 接管意外中断，无人值守任务已停止",
+      "浏览器采集辅助意外中断，无人值守任务已停止",
     sidebar_owner_disconnected:
       "无人值守控制页连接中断，任务已停止",
     source_tab_removed:
@@ -570,12 +570,12 @@ function supportsPersistentCaptureTaskPlatform(platform = "") {
   );
 }
 
-async function startRequiredCaptureTaskSession(options = {}) {
+async function startCaptureAssistSessionStrict(options = {}) {
   const taskId = String(options?.taskId || "").trim();
   const platform = String(options?.platform || "").trim().toLowerCase();
   const ownerRequired = options?.ownerRequired !== false;
   if (!supportsPersistentCaptureTaskPlatform(platform)) {
-    const error = new Error("任务级 AI Debug 当前仅支持小红书和抖音");
+    const error = new Error("当前平台不支持浏览器采集辅助");
     error.code = "capture_task_platform_unsupported";
     throw error;
   }
@@ -596,9 +596,9 @@ async function startRequiredCaptureTaskSession(options = {}) {
     result?.response?.error?.message ||
       result?.error?.message ||
       result?.reason ||
-      "任务接管初始化失败",
+      "采集辅助初始化失败",
   ).trim();
-  const error = new Error(`无法启动 AI Debug 任务：${reason}`);
+  const error = new Error(`无法启动浏览器采集辅助：${reason}`);
   error.code = String(
     result?.response?.error?.code || result?.reason || "capture_task_unavailable",
   );
@@ -610,6 +610,62 @@ async function startRequiredCaptureTaskSession(options = {}) {
     error.details = {...result.response.error.details};
   }
   throw error;
+}
+
+// Browser Debug is an optional accelerator for focus emulation and task
+// tracing. The page/content-script capture pipeline remains authoritative and
+// must continue when Debug is occupied, unavailable, or still cleaning up a
+// previous task. The execution lock below still prevents two real capture
+// pipelines from running concurrently in the same Extension profile.
+const OPTIONAL_CAPTURE_ASSIST_SESSION_CODES = new Set([
+  "runtime_unavailable",
+  "task_session_unavailable",
+  "capture_task_group_create_failed",
+  "capture_task_group_busy",
+  "capture_task_cleanup_pending",
+  "capture_task_not_found",
+  "capture_task_owner_disconnected",
+  "capture_task_debug_busy",
+  "capture_task_debug_preflight_unavailable",
+  "capture_task_debug_preflight_failed",
+  "capture_task_debug_starvoice_active",
+  "capture_task_external_debugger_busy",
+  "capture_task_debug_ownership_unknown",
+  "debug_session_attach_failed",
+  "debug_session_command_failed",
+  "debug_session_detached_during_start",
+  "debug_session_busy",
+  "debug_session_tab_busy",
+]);
+
+async function startOptionalCaptureAssistSession(options = {}) {
+  try {
+    return await startCaptureAssistSessionStrict(options);
+  } catch (error) {
+    const code = String(error?.code || "").trim();
+    if (!OPTIONAL_CAPTURE_ASSIST_SESSION_CODES.has(code)) {
+      // Attempt identity, execution-lock, platform and source-page errors are
+      // authoritative task fences rather than optional assist failures. Never
+      // let an obsolete or terminal runner continue collection by disguising
+      // one of those rejections as a Debug degradation.
+      throw error;
+    }
+    console.warn(
+      "[Sidebar] Optional capture assist unavailable; continuing page capture:",
+      {
+        code,
+        message: String(error?.message || ""),
+      },
+    );
+    return {
+      ok: true,
+      active: false,
+      degraded: true,
+      reason: code || "capture_assist_unavailable",
+      taskId: String(options?.taskId || "").trim(),
+      message: "浏览器采集辅助不可用，已继续执行采集",
+    };
+  }
 }
 
 async function rebuildCaptureTaskSessionForEnhancementRetry({
@@ -766,7 +822,7 @@ async function rebuildCaptureTaskSessionForEnhancementRetry({
       await wait(delayMs);
     }
     try {
-      return await startRequiredCaptureTaskSession({
+      return await startOptionalCaptureAssistSession({
         taskId: normalizedTaskId,
         tabId: Number(sourceTabId),
         label,
@@ -778,7 +834,6 @@ async function rebuildCaptureTaskSessionForEnhancementRetry({
       lastError = error;
       const retryable = new Set([
         "capture_task_cleanup_pending",
-        "capture_task_source_mismatch",
         "capture_task_not_found",
         "capture_task_already_bound",
         "TASK_TAB_GROUP_UNAVAILABLE",
@@ -1078,7 +1133,7 @@ function applyCaptureTaskCancellation(cancellation = {}) {
   showMessage(
     cancellation?.reason === "sidebar_owner_disconnected"
       ? "控制面板已关闭，采集任务已安全停止"
-      : "浏览器 Debug 接管已取消，整项采集正在停止",
+      : "采集任务已取消，整项采集正在停止",
     "warning",
   );
 }
@@ -1178,11 +1233,6 @@ const UNATTENDED_KEYWORD_RETRY_DELAYS_MS = Object.freeze([
   2 * 60 * 1000,
   5 * 60 * 1000,
 ]);
-const UNATTENDED_AGENT_COOLDOWN_HOME_URLS = Object.freeze({
-  xiaohongshu:
-    "https://www.xiaohongshu.com/explore?channel_id=homefeed_recommend",
-  douyin: "https://www.douyin.com/jingxuan",
-});
 const UNATTENDED_ELASTIC_RELEASE_MIN_DELAY_MS = 2 * 60 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MIN_MS = 8 * 1000;
 const UNATTENDED_KEYWORD_RETRY_MAX_MS = 18 * 1000;
@@ -1205,15 +1255,6 @@ const UNATTENDED_CAPTURE_SESSION_RETRY_DELAYS_MS = Object.freeze([
 const UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES = new Set([
   "capture_task_group_busy",
   "capture_task_cleanup_pending",
-]);
-const UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES = new Set([
-  "capture_task_group_busy",
-  "capture_task_debug_busy",
-  "capture_task_debug_preflight_unavailable",
-  "capture_task_debug_preflight_failed",
-  "capture_task_debug_starvoice_active",
-  "capture_task_external_debugger_busy",
-  "capture_task_debug_ownership_unknown",
 ]);
 let activeUnattendedRunRequestId = "";
 let activeUnattendedRunAttemptId = "";
@@ -4123,9 +4164,9 @@ function resolveCaptureTaskActionCopy(progress = {}) {
 
   if (phase.includes("initial")) {
     return {
-      title: "正在接管浏览器",
+      title: "正在准备采集页面",
       explanation: "确认平台页面、登录状态和搜索环境",
-      nextAction: "接管完成后会自动开始当前关键词",
+      nextAction: "页面准备完成后会自动开始当前关键词",
     };
   }
   if (
@@ -8099,21 +8140,30 @@ async function handleCaptureBloggerData() {
   });
   let taskStatus = "completed";
   let taskError = null;
+  let executionLock = null;
   let captureTaskSessionStarted = false;
   showProgress("正在采集博主信息...");
 
   try {
+    executionLock = await acquireCaptureExecutionLock({
+      owner: "manual_blogger_capture",
+      label: "博主主页采集",
+    });
+    if (!executionLock) {
+      taskStatus = "skipped";
+      return;
+    }
     if (supportsPersistentCaptureTaskPlatform(pagePlatform)) {
       const sourceTabId = await resolveCaptureTaskSourceTabId({
         platform: pagePlatform,
       });
-      await startRequiredCaptureTaskSession({
+      const assistSession = await startOptionalCaptureAssistSession({
         taskId: taskContext.taskId,
         tabId: sourceTabId,
         label: "博主主页采集",
         platform: pagePlatform,
       });
-      captureTaskSessionStarted = true;
+      captureTaskSessionStarted = assistSession?.active === true;
     }
 
     const profileResult = await captureAndSync({
@@ -8211,6 +8261,9 @@ async function handleCaptureBloggerData() {
       if (captureTaskEnd?.ok === true) {
         releaseCaptureTaskOwner(taskContext.taskId);
       }
+    }
+    if (executionLock) {
+      await releaseCaptureExecutionLock(executionLock.id);
     }
     finishSidebarTask(taskContext, {
       status: taskStatus,
@@ -8414,7 +8467,7 @@ async function handleCaptureSearchData() {
         preferredTabId: searchActiveTabId,
         platform: pagePlatform,
       });
-      await startRequiredCaptureTaskSession({
+      const assistSession = await startOptionalCaptureAssistSession({
         taskId: taskContext.taskId,
         tabId: sourceTabId,
         label: searchBatchMode
@@ -8422,8 +8475,13 @@ async function handleCaptureSearchData() {
           : `搜索「${keyword}」`,
         platform: pagePlatform,
       });
-      captureTaskSessionStarted = true;
-      persistentCaptureTaskId = taskContext.taskId;
+      captureTaskSessionStarted = assistSession?.active === true;
+      // The task id below is only for the optional native assist lifecycle.
+      // When that assist cannot start, list/detail collection must run without
+      // task grouping instead of treating the missing Debug session as fatal.
+      persistentCaptureTaskId = captureTaskSessionStarted
+        ? taskContext.taskId
+        : "";
     }
 
     let searchRound = 0;
@@ -8437,7 +8495,9 @@ async function handleCaptureSearchData() {
           keywords: [...attemptKeywords],
           platform: pagePlatform,
           baseSearchUrl: activeTabUrl,
-          captureTaskId: persistentCaptureTaskId,
+          captureTaskId: captureTaskSessionStarted
+            ? persistentCaptureTaskId
+            : "",
           searchFilters,
           captureParams: {
             minLikes: keywordMinLikes,
@@ -8463,7 +8523,9 @@ async function handleCaptureSearchData() {
                       sourceLabel: `关键词「${capturedKeyword}」搜索结果`,
                       recordIds,
                       relevanceKeyword: capturedKeyword,
-                      captureTaskId: persistentCaptureTaskId,
+                      captureTaskId: captureTaskSessionStarted
+                        ? persistentCaptureTaskId
+                        : "",
                       onItemSettled: streamingSyncQueue?.enabled
                         ? (progress) =>
                             routeDetailItemToStreamingSync(
@@ -8607,7 +8669,9 @@ async function handleCaptureSearchData() {
                 sourceLabel: "搜索结果",
                 recordIds: actionResult.recordIds,
                 relevanceKeyword: keyword,
-                captureTaskId: persistentCaptureTaskId,
+                captureTaskId: captureTaskSessionStarted
+                  ? persistentCaptureTaskId
+                  : "",
                 onItemSettled: streamingSyncQueue?.enabled
                   ? (progress) =>
                       routeDetailItemToStreamingSync(
@@ -14085,7 +14149,7 @@ async function handleBatchKeywordCapture(options = {}) {
     const ensurePersistentCaptureTaskSession = async () => {
       if (!captureTaskDebugSupported) return;
       if (captureTaskSessionStarted) return;
-      await startRequiredCaptureTaskSession({
+      const assistSession = await startOptionalCaptureAssistSession({
         taskId: persistentCaptureTaskId,
         tabId: sourceTabId,
         label:
@@ -14094,8 +14158,8 @@ async function handleBatchKeywordCapture(options = {}) {
             : `批量搜索采集 · ${keywords.length} 个关键词`,
         platform: pagePlatform,
       });
-      captureTaskSessionStarted = true;
-      captureTaskSessionOwnedHere = true;
+      captureTaskSessionStarted = assistSession?.active === true;
+      captureTaskSessionOwnedHere = assistSession?.active === true;
     };
 
     if (
@@ -14284,7 +14348,9 @@ async function handleBatchKeywordCapture(options = {}) {
         platform: pagePlatform,
         baseSearchUrl,
         sourceTabId: activeBatchRunnerTabId,
-        captureTaskId: persistentCaptureTaskId,
+        captureTaskId: captureTaskSessionStarted
+          ? persistentCaptureTaskId
+          : "",
         searchFilters: roundSearchFilters,
         disableAutomaticSearchRetry,
         requireVerifiedFilters,
@@ -14371,7 +14437,9 @@ async function handleBatchKeywordCapture(options = {}) {
                     recordIds,
                     relevanceKeyword: capturedKeyword,
                     waitForegroundTabId,
-                    captureTaskId: persistentCaptureTaskId,
+                    captureTaskId: captureTaskSessionStarted
+                      ? persistentCaptureTaskId
+                      : "",
                     unattendedRequestId: scopedUnattendedRequestId,
                     unattendedAttemptId: scopedUnattendedAttemptId,
                     onItemSettled: streamingSyncQueue?.enabled
@@ -14670,7 +14738,7 @@ async function handleBatchKeywordCapture(options = {}) {
             waitUntil,
             updatedAt: new Date().toISOString(),
             message: releaseElasticItem
-              ? `关键词「${failedKeywords[0]}」已解除当前 Agent 锁定，正在交回云端；当前 Agent 进入 ${Math.ceil(retryDelay / 1000)} 秒冷却`
+              ? `关键词「${failedKeywords[0]}」已解除当前 Agent 锁定，正在交回云端；当前 Agent 可立即领取其它任务`
               : `${Math.ceil(retryDelay / 1000)} 秒后自动重试 ${failedKeywords.length} 个失败关键词（第 ${attempt}/${maxKeywordAttempts} 次）`,
           };
           updateBatchProgress(retryProgress, "modal");
@@ -17957,38 +18025,6 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
   }
 }
 
-async function returnUnattendedAgentToCooldownHome({
-  tabId = null,
-  platform = "",
-} = {}) {
-  const normalizedTabId = Number(tabId);
-  const normalizedPlatform = String(platform || "").trim().toLowerCase();
-  const homeUrl =
-    UNATTENDED_AGENT_COOLDOWN_HOME_URLS[normalizedPlatform] || "";
-  if (
-    !Number.isSafeInteger(normalizedTabId) ||
-    normalizedTabId <= 0 ||
-    !homeUrl
-  ) {
-    return {ok: false, homeUrl, reason: "cooldown_home_unavailable"};
-  }
-  try {
-    await chrome.tabs.update(normalizedTabId, {
-      url: homeUrl,
-      active: true,
-    });
-    return {ok: true, homeUrl, reason: "cooldown_home_opened"};
-  } catch (error) {
-    console.warn("[Sidebar] Restore unattended cooldown home failed:", error);
-    return {
-      ok: false,
-      homeUrl,
-      reason: "cooldown_home_navigation_failed",
-      message: String(error?.message || error || "页面导航失败"),
-    };
-  }
-}
-
 function buildSidebarKeywordSearchUrl(keyword, platform, baseSearchUrl = "") {
   const encodedKeyword = encodeURIComponent(keyword);
   if (platform === "douyin") {
@@ -19088,7 +19124,7 @@ async function runUnattendedKeywordPlanRequest(request) {
   const startingMessage =
     checkpoint.keywordResults.length > 0
       ? `${executionCopy.taskLabel}正在从关键词「${resumeKeyword}」恢复`
-      : `${executionCopy.taskLabel}已触发，正在启动浏览器接管`;
+      : `${executionCopy.taskLabel}已触发，正在启动采集辅助`;
   const startingKeywordIndex = Math.max(0, keywords.indexOf(resumeKeyword));
   const startingProgress = {
     unattendedRequestId: requestId,
@@ -19344,8 +19380,8 @@ async function runUnattendedKeywordPlanRequest(request) {
       ) {
         const attemptMessage =
           attempt === 1
-            ? "正在建立浏览器采集接管"
-            : `正在第 ${attempt}/${localCaptureSessionMaxAttempts} 次建立浏览器采集接管`;
+            ? "正在启动浏览器采集辅助"
+            : `正在第 ${attempt}/${localCaptureSessionMaxAttempts} 次启动浏览器采集辅助`;
         await reportAutomaticRecoveryStage({
           phase: "starting_capture_session",
           message: attemptMessage,
@@ -19354,7 +19390,7 @@ async function runUnattendedKeywordPlanRequest(request) {
           retried: Math.max(0, attempt - 1),
         });
         try {
-          await startRequiredCaptureTaskSession({
+          const assistSession = await startOptionalCaptureAssistSession({
             taskId: unattendedCaptureTaskContext.taskId,
             tabId: sourceTabId,
             label: `${executionCopy.captureLabel} · ${keywords.length} 个关键词`,
@@ -19362,18 +19398,26 @@ async function runUnattendedKeywordPlanRequest(request) {
             ownerRequired: false,
             attemptId: requestAttemptId,
           });
-          unattendedCaptureTaskSessionStarted = true;
-          return;
+          unattendedCaptureTaskSessionStarted =
+            assistSession?.active === true;
+          if (assistSession?.degraded === true) {
+            await reportAutomaticRecoveryStage({
+              phase: "capture_assist_degraded",
+              message: "浏览器采集辅助不可用，已继续执行采集",
+              attemptCurrent: attempt,
+              attemptTotal: localCaptureSessionMaxAttempts,
+              retried: Math.max(0, attempt - 1),
+            }).catch((error) => {
+              console.warn(
+                "[Sidebar] Capture assist degraded status report failed (ignored):",
+                error,
+              );
+            });
+          }
+          return assistSession;
         } catch (error) {
           lastError = error;
           const code = String(error?.code || "").trim();
-          const cloudHandoff = Boolean(
-            request?.cloudAssigned === true &&
-              UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES.has(code),
-          );
-          if (cloudHandoff) {
-            break;
-          }
           const retryable = UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES.has(code);
           if (
             !retryable ||
@@ -19390,7 +19434,7 @@ async function runUnattendedKeywordPlanRequest(request) {
           );
           const waitUntil = new Date(Date.now() + delayMs).toISOString();
           const nextAttempt = attempt + 1;
-          const waitMessage = `浏览器采集资源暂时占用，第 ${nextAttempt}/${localCaptureSessionMaxAttempts} 次接管将在倒计时结束后开始`;
+          const waitMessage = `浏览器采集辅助暂时不可用，第 ${nextAttempt}/${localCaptureSessionMaxAttempts} 次尝试将在等待结束后开始`;
           await reportAutomaticRecoveryStage({
             phase: "waiting_capture_session_retry",
             message: waitMessage,
@@ -19412,7 +19456,7 @@ async function runUnattendedKeywordPlanRequest(request) {
             batchKeywordCancelRequested ||
             Boolean(activeCaptureTaskCancellationReason)
           ) {
-            const canceledError = new Error("无人值守浏览器接管恢复已取消");
+            const canceledError = new Error("无人值守采集辅助恢复已取消");
             canceledError.code = "UNATTENDED_ATTEMPT_CANCELED";
             throw canceledError;
           }
@@ -19422,10 +19466,10 @@ async function runUnattendedKeywordPlanRequest(request) {
         String(lastError?.code || "").trim() ||
         "CAPTURE_TASK_START_FAILED";
       const message = String(
-        lastError?.message || "无法启动浏览器 AI Debug 接管",
+        lastError?.message || "无法启动浏览器采集辅助",
       ).trim();
       const startError = new Error(
-        `AI Debug 启动失败（${code}）：${message}`,
+        `采集辅助启动失败（${code}）：${message}`,
       );
       startError.code = code;
       startError.cause = lastError;
@@ -19536,7 +19580,7 @@ async function runUnattendedKeywordPlanRequest(request) {
       Boolean(activeCaptureTaskCancellationReason)
     ) {
       const canceledError = new Error(
-        `${executionCopy.taskLabel}已停止，未启动浏览器接管`,
+        `${executionCopy.taskLabel}已停止，未启动采集辅助`,
       );
       canceledError.code = "UNATTENDED_ATTEMPT_CANCELED";
       throw canceledError;
@@ -19544,7 +19588,7 @@ async function runUnattendedKeywordPlanRequest(request) {
     if (captureTaskDebugSupported && !unattendedCaptureTaskSessionStarted) {
       await startUnattendedCaptureTaskSession(unattendedSourceTabId);
     } else if (unattendedCaptureTaskSessionStarted && sourceTabWasReplaced) {
-      const rebound = await beginCaptureTaskSession({
+      const rebound = await startOptionalCaptureAssistSession({
         taskId: unattendedCaptureTaskContext.taskId,
         tabId: unattendedSourceTabId,
         label: `${executionCopy.captureLabel} · ${keywords.length} 个关键词`,
@@ -19552,19 +19596,16 @@ async function runUnattendedKeywordPlanRequest(request) {
         ownerRequired: false,
         attemptId: requestAttemptId,
       });
-      if (rebound?.ok !== true || rebound?.active !== true) {
-        const error = new Error(
-          rebound?.response?.error?.message ||
-            rebound?.error?.message ||
-            "浏览器替换页面后未能恢复 AI Debug 接管",
-        );
-        error.code =
-          String(
-            rebound?.response?.error?.code ||
-              rebound?.reason ||
-              "CAPTURE_TASK_REBIND_FAILED",
-          ).trim() || "CAPTURE_TASK_REBIND_FAILED";
-        throw error;
+      if (rebound?.active !== true) {
+        await reportAutomaticRecoveryStage({
+          phase: "capture_assist_degraded",
+          message: "浏览器页面已切换；采集辅助未恢复，但采集继续执行",
+        }).catch((error) => {
+          console.warn(
+            "[Sidebar] Capture assist rebound report failed (ignored):",
+            error,
+          );
+        });
       }
     }
 
@@ -19835,11 +19876,6 @@ async function runUnattendedKeywordPlanRequest(request) {
         error?.code === "UNATTENDED_SEARCH_BOOTSTRAP_FAILED";
       const bootstrapCanceled =
         error?.code === "UNATTENDED_SEARCH_BOOTSTRAP_CANCELED";
-      const debugOwnershipHandoff = Boolean(
-        UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES.has(
-          String(error?.code || "").trim(),
-        ) && error?.details?.automaticReroute !== false,
-      );
       const cancellation = bootstrapCanceled
         ? resolveUnattendedCancellationTerminal(
             activeCaptureTaskCancellationReason,
@@ -19850,11 +19886,10 @@ async function runUnattendedKeywordPlanRequest(request) {
         request?.cloudAssigned === true &&
           request?.orchestrationContext?.distributionMode === "elastic_pool",
       );
-      const elasticCooldownRelease = Boolean(
+      const elasticTechnicalRelease = Boolean(
         elasticQueueAssigned && (elasticItemReleased || bootstrapFailed),
       );
-      let cooldownHomeResult = null;
-      if (elasticCooldownRelease) {
+      if (elasticTechnicalRelease) {
         if (
           unattendedCaptureTaskSessionStarted &&
           unattendedCaptureTaskContext
@@ -19874,10 +19909,6 @@ async function runUnattendedKeywordPlanRequest(request) {
             unattendedCaptureTaskSessionStarted = false;
           }
         }
-        cooldownHomeResult = await returnUnattendedAgentToCooldownHome({
-          tabId: unattendedSourceTabId,
-          platform,
-        });
         const releasedKeyword = String(
           error?.keyword || resumeKeyword || "",
         ).trim();
@@ -19891,15 +19922,13 @@ async function runUnattendedKeywordPlanRequest(request) {
         if (releasedEntry) {
           Object.assign(releasedEntry, {
             itemLockReleased: true,
-            sourceAgentCooling: true,
-            cooldownHomeRestored: cooldownHomeResult?.ok === true,
-            cooldownHomeUrl: String(cooldownHomeResult?.homeUrl || ""),
+            sourceAgentCooling: false,
           });
         }
       }
       const cloudTechnicalRecovery = Boolean(
         request?.cloudAssigned === true &&
-          (bootstrapFailed || elasticItemReleased || debugOwnershipHandoff),
+          (bootstrapFailed || elasticItemReleased),
       );
       const needsAction =
         safetyBlocked || (bootstrapFailed && !cloudTechnicalRecovery);
@@ -19945,11 +19974,9 @@ async function runUnattendedKeywordPlanRequest(request) {
         batchRunResult?.streamingSync ??
         noCaptureBootstrapSync;
       const terminalMessage = elasticItemReleased
-        ? `关键词「${String(error?.keyword || resumeKeyword || "").trim()}」已解除当前 Agent 锁定并交回云端；其它空闲 Agent 可立即接力，当前 Agent 进入冷却${cooldownHomeResult?.ok ? "并已返回平台首页" : ""}`
-        : debugOwnershipHandoff && cloudTechnicalRecovery
-          ? `${String(error?.message || "浏览器调试资源暂不可用").trim()}；当前页面及既有会话保持不动，任务已交回云端等待其它空闲 Agent 接力`
+        ? `关键词「${String(error?.keyword || resumeKeyword || "").trim()}」已解除当前 Agent 锁定并交回云端；其它空闲 Agent 可立即接力，当前 Agent 可立即领取其它任务`
         : cloudTechnicalRecovery
-        ? `${bootstrapFailureCopy}，当前关键词已交回云端等待其它 Agent 接力${cooldownHomeResult?.ok ? "；当前 Agent 已返回平台首页并进入冷却" : ""}`
+        ? `${bootstrapFailureCopy}，当前关键词已交回云端等待其它 Agent 接力；当前 Agent 可立即领取其它任务`
         : bootstrapFailed
           ? `${bootstrapFailureCopy}，请检查设备网络后继续`
         : cancellation?.message || error.message;
@@ -19990,35 +20017,18 @@ async function runUnattendedKeywordPlanRequest(request) {
                     ? {
                         retryable: true,
                         requiresManualAction: false,
-                        category: debugOwnershipHandoff
-                          ? "browser_debug_ownership"
-                          : elasticItemReleased
-                            ? "elastic_item_handoff"
-                            : "temporary_page_readiness",
-                        ...(debugOwnershipHandoff
-                          ? {
-                              automaticReroute: true,
-                              debugOwnership: String(
-                                error?.details?.debugOwnership ||
-                                  "unknown_occupancy",
-                              ),
-                              safeToDetach: false,
-                            }
-                          : {}),
-                        ...(elasticCooldownRelease
+                        category: elasticItemReleased
+                          ? "elastic_item_handoff"
+                          : "temporary_page_readiness",
+                        ...(elasticTechnicalRelease
                           ? {
                               itemLockReleased: true,
-                              sourceAgentCooling: true,
+                              sourceAgentCooling: false,
                               retryAfterMs: Math.max(
                                 0,
                                 Number(error?.retryAfterMs) || 0,
                               ),
                               retryAt: String(error?.retryAt || ""),
-                              cooldownHomeRestored:
-                                cooldownHomeResult?.ok === true,
-                              cooldownHomeUrl: String(
-                                cooldownHomeResult?.homeUrl || "",
-                              ),
                             }
                           : {}),
                       }
@@ -20288,11 +20298,11 @@ async function handleCancel() {
         status: "canceled",
       });
       if (response?.ok === false) {
-        throw new Error(response?.error?.message || "停止 AI Debug 任务失败");
+        throw new Error(response?.error?.message || "停止采集辅助失败");
       }
     } catch (error) {
       console.warn("[Sidebar] Persistent capture task stop failed:", error);
-      showMessage("采集取消信号已发送，但浏览器接管仍在释放，请再点一次停止", "warning");
+      showMessage("采集取消信号已发送，但采集辅助仍在释放，请再点一次停止", "warning");
     }
   }
 
@@ -22422,7 +22432,7 @@ async function runMonitorCommentPatrolWithCaptureTaskSession({
     throw error;
   }
 
-  await startRequiredCaptureTaskSession({
+  const assistSession = await startOptionalCaptureAssistSession({
     taskId,
     attemptId: String(captureTaskContext?.attemptId || "").trim(),
     tabId: normalizedRunnerTabId,
@@ -22436,7 +22446,10 @@ async function runMonitorCommentPatrolWithCaptureTaskSession({
   let result = null;
   let runError = null;
   try {
-    result = await run();
+    result = await run({
+      captureAssistActive: assistSession?.active === true,
+      captureTaskId: assistSession?.active === true ? taskId : "",
+    });
   } catch (error) {
     runError = error;
   }
@@ -22480,7 +22493,7 @@ async function runMonitorCommentPatrolWithCaptureTaskSession({
     const cleanupError = new Error(
       captureTaskEnd?.response?.error?.message ||
         captureTaskEnd?.error?.message ||
-        "评论巡查结束后浏览器接管未能安全释放",
+        "评论巡查结束后采集辅助未能安全释放",
     );
     cleanupError.code = String(
       captureTaskEnd?.response?.error?.code ||
@@ -22862,7 +22875,7 @@ async function executeMonitorRunItem({
           runnerTabId,
           captureTaskContext,
           shouldStop,
-          run: async () =>
+          run: async ({captureTaskId = ""} = {}) =>
             await runEnhancementWithSingleRetry({
               recordIds: hitRecordIds,
               shouldStop,
@@ -22933,9 +22946,7 @@ async function executeMonitorRunItem({
                     Number(runnerTabId) > 0
                       ? Number(runnerTabId)
                       : null,
-                  captureTaskId: String(
-                    captureTaskContext?.taskId || "",
-                  ).trim(),
+                  captureTaskId: String(captureTaskId || "").trim(),
                 });
               },
             }),
@@ -26482,7 +26493,7 @@ function reportActiveSidebarTaskProgress(progress = {}) {
   const taskContext = getActiveTaskContext();
   if (!taskContext?.taskId) return;
   // 无人值守已有 request root 作为唯一公开任务台账；内部 Debug wrapper
-  // 只负责浏览器接管。若把作品级 current/total 再写成关键词任务，会产生
+  // 只负责浏览器采集辅助。若把作品级 current/total 再写成关键词任务，会产生
   // processed=8,total=4 的双记录和陈旧 detail_item_* 终态。
   if (taskContext.featureKey === "capture.unattended_keyword") return;
   const now = Date.now();

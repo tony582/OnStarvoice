@@ -819,6 +819,28 @@ test('detail reader is tenant scoped and returns the complete orchestration proj
   );
   assert.match(
     detail,
+    /blocking_command\.id AS blocking_command_id,[\s\S]*blocking_command\.status AS blocking_command_status,[\s\S]*blocking_command\.command_type AS blocking_command_type/u,
+  );
+  const blockingCommandProjection = detail.slice(
+    detail.indexOf('SELECT c.id, c.status, c.command_type'),
+    detail.indexOf(') blocking_command ON true'),
+  );
+  assert.match(
+    blockingCommandProjection,
+    /c\.status IN \('pending', 'acknowledged'\)/u,
+  );
+  assert.match(
+    blockingCommandProjection,
+    /c\.expires_at IS NULL OR c\.expires_at > now\(\)/u,
+    'expired commands must not be presented as active recovery blockers',
+  );
+  assert.doesNotMatch(
+    blockingCommandProjection,
+    /AND c\.command_type/u,
+    'the detail blocker must use the same any-active-command predicate as automatic claim',
+  );
+  assert.match(
+    detail,
     /WHERE attempt\.tenant_id = \$1[\s\S]*attempt\.parent_task_id = \$2/u,
   );
   for (const field of [

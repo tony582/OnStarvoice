@@ -243,7 +243,7 @@
       ) {
         throw createError(
           "debug_api_unavailable",
-          "当前浏览器没有提供 AI Debug Session 能力",
+          "当前浏览器没有提供采集辅助能力",
         );
       }
 
@@ -331,7 +331,9 @@
         const detachedSnapshot = publicSession(session, {state: "detached"});
         await publish(session, {
           reason: normalizedReason,
-          cleanupPending: Boolean(session.persistent),
+          // Losing optional Debug is not an END/cleanup request. Persist the
+          // detached logical session so content capture can finish normally.
+          cleanupPending: false,
         });
         if (
           !session.persistent &&
@@ -376,7 +378,7 @@
           if (pendingAttach.detached) {
             throw createError(
               "debug_session_detached_during_recovery",
-              "浏览器页面仍在切换，AI Debug 暂未恢复",
+              "浏览器页面仍在切换，采集辅助暂未恢复",
             );
           }
           session.state = "attached";
@@ -486,13 +488,13 @@
           if (!normalizedTabId || !normalizedRunId) {
             throw createError(
               "invalid_debug_session",
-              "AI Debug Session 缺少有效的 Tab 或任务编号",
+              "采集辅助会话缺少有效的 Tab 或任务编号",
             );
           }
           if (normalizedPersistent && !normalizedTaskId) {
             throw createError(
               "invalid_capture_task",
-              "持久 AI Debug Session 缺少采集任务编号",
+              "持久采集辅助会话缺少采集任务编号",
             );
           }
 
@@ -500,11 +502,13 @@
           if (current?.runId === normalizedRunId) {
             if (
               current.persistent !== normalizedPersistent ||
-              (normalizedPersistent && current.taskId !== normalizedTaskId)
+              (normalizedPersistent &&
+                (current.taskId !== normalizedTaskId ||
+                  cleanText(current.attemptId, 320) !== normalizedAttemptId))
             ) {
               throw createError(
                 "debug_session_tab_busy",
-                "当前页面已经由另一个 AI 采集任务接管",
+                "当前页面已绑定到另一个采集辅助任务",
               );
             }
             return publicSession(current, {reused: true});
@@ -512,64 +516,21 @@
           if (current) {
             throw createError(
               "debug_session_tab_busy",
-              "当前页面已经由另一个 AI 采集任务接管",
+              "当前页面已绑定到另一个采集辅助任务",
             );
           }
           if (sessionsByTab.size > 0) {
             throw createError(
               "debug_session_busy",
-              "已有页面处于 AI Debug Session，请先结束当前采集",
+              "已有页面处于采集辅助会话，请先结束当前采集",
             );
           }
 
-          const debuggee = {tabId: normalizedTabId};
-          const pendingAttach = {detached: false, reason: ""};
-          pendingAttachesByTab.set(normalizedTabId, pendingAttach);
-          try {
-            await debuggerApi.attach(debuggee, PROTOCOL_VERSION);
-          } catch (error) {
-            pendingAttachesByTab.delete(normalizedTabId);
-            throw createError(
-              "debug_session_attach_failed",
-              "无法接管当前页面；请先关闭该页面的 DevTools 或其他调试任务后重试",
-              error,
-            );
-          }
-
-          try {
-            await applyFocusEmulation(normalizedTabId, true);
-            if (pendingAttach.detached) {
-              throw createError(
-                "debug_session_detached_during_start",
-                "浏览器接管刚建立就被取消，采集任务未启动",
-              );
-            }
-          } catch (error) {
-            expectedDetachTabs.add(normalizedTabId);
-            try {
-              await debuggerApi.detach(debuggee);
-            } catch {
-              // The attach is already unusable; cleanup remains best-effort.
-            } finally {
-              expectedDetachTabs.delete(normalizedTabId);
-              pendingAttachesByTab.delete(normalizedTabId);
-            }
-            if (error?.code === "debug_session_detached_during_start") {
-              throw error;
-            }
-            throw createError(
-              "debug_session_command_failed",
-              "浏览器已连接，但无法建立完整的 AI Debug Session",
-              error,
-            );
-          }
-          pendingAttachesByTab.delete(normalizedTabId);
-
-          const session = {
+          const buildSession = (state = "attached") => ({
             tabId: normalizedTabId,
             runId: normalizedRunId,
             label: normalizedLabel,
-            state: "attached",
+            state,
             startedAt: new Date(now()).toISOString(),
             ...(normalizedPageTitle ? {pageTitle: normalizedPageTitle} : {}),
             ...(normalizedPageUrl ? {pageUrl: normalizedPageUrl} : {}),
@@ -590,7 +551,84 @@
                   activeListRunId: cleanText(activeListRunId, 320),
                 }
               : {}),
-          };
+          });
+
+          const debuggee = {tabId: normalizedTabId};
+          const pendingAttach = {detached: false, reason: ""};
+          pendingAttachesByTab.set(normalizedTabId, pendingAttach);
+          try {
+            await debuggerApi.attach(debuggee, PROTOCOL_VERSION);
+          } catch (error) {
+            pendingAttachesByTab.delete(normalizedTabId);
+            throw createError(
+              "debug_session_attach_failed",
+              "无法启用当前页面的采集辅助；请先关闭该页面的 DevTools 或其他调试任务后重试",
+              error,
+            );
+          }
+
+          try {
+            await applyFocusEmulation(normalizedTabId, true);
+            if (pendingAttach.detached) {
+              throw createError(
+                "debug_session_detached_during_start",
+                "采集辅助刚建立就被取消，采集任务未启动",
+              );
+            }
+          } catch (error) {
+            const assistFailureCode =
+              error?.code === "debug_session_detached_during_start"
+                ? "debug_session_detached_during_start"
+                : "debug_session_command_failed";
+            let cleanupError = null;
+            expectedDetachTabs.add(normalizedTabId);
+            try {
+              await debuggerApi.detach(debuggee);
+            } catch (candidate) {
+              // An onDetach event or an explicit "not attached" response is
+              // authoritative proof that the provisional attachment is gone.
+              // Any other detach failure must remain tracked and blocking so
+              // the task-level rollback can retry it before optional assist
+              // degradation is allowed.
+              if (
+                !pendingAttach.detached &&
+                !isDebuggerNotAttachedError(candidate)
+              ) {
+                cleanupError = candidate;
+              }
+            } finally {
+              expectedDetachTabs.delete(normalizedTabId);
+              pendingAttachesByTab.delete(normalizedTabId);
+            }
+            if (cleanupError) {
+              const cleanupSession = buildSession("detaching");
+              sessionsByTab.set(normalizedTabId, cleanupSession);
+              await publish(cleanupSession, {
+                reason: "capture_assist_start_cleanup_pending",
+                cleanupPending: true,
+                assistFailureCode,
+              });
+              const pendingError = createError(
+                "debug_session_start_cleanup_failed",
+                "采集辅助初始化失败，且浏览器调试连接尚未确认释放",
+                cleanupError,
+              );
+              pendingError.assistFailureCode = assistFailureCode;
+              pendingError.setupError = error;
+              throw pendingError;
+            }
+            if (error?.code === "debug_session_detached_during_start") {
+              throw error;
+            }
+            throw createError(
+              "debug_session_command_failed",
+              "浏览器已连接，但无法建立完整的采集辅助会话",
+              error,
+            );
+          }
+          pendingAttachesByTab.delete(normalizedTabId);
+
+          const session = buildSession("attached");
           sessionsByTab.set(normalizedTabId, session);
           await publish(session, {reason: "capture_started"});
           return publicSession(session);
@@ -609,6 +647,8 @@
           const normalizedTabId = normalizeTabId(snapshot?.tabId);
           const normalizedRunId = cleanText(snapshot?.runId, 320);
           const normalizedTaskId = cleanText(snapshot?.taskId, 320);
+          const restoreDetached =
+            cleanText(snapshot?.state, 40).toLowerCase() === "detached";
           if (
             snapshot?.persistent !== true ||
             !normalizedTabId ||
@@ -625,7 +665,9 @@
           if (current) {
             if (
               current.tabId !== normalizedTabId ||
-              current.runId !== normalizedRunId
+              current.runId !== normalizedRunId ||
+              cleanText(current.attemptId, 320) !==
+                cleanText(snapshot?.attemptId, 320)
             ) {
               throw createError(
                 "debug_session_restore_conflict",
@@ -637,51 +679,53 @@
           if (sessionsByTab.size > 0) {
             throw createError(
               "debug_session_busy",
-              "已有页面处于 AI Debug Session，不能恢复另一采集任务",
+              "已有页面处于采集辅助会话，不能恢复另一采集任务",
             );
           }
 
-          const debuggee = {tabId: normalizedTabId};
-          const pendingAttach = {detached: false, reason: ""};
-          pendingAttachesByTab.set(normalizedTabId, pendingAttach);
           let attachedByRestore = false;
           let attachmentReused = false;
-          try {
+          if (!restoreDetached) {
+            const debuggee = {tabId: normalizedTabId};
+            const pendingAttach = {detached: false, reason: ""};
+            pendingAttachesByTab.set(normalizedTabId, pendingAttach);
             try {
-              // A MV3 worker can be reclaimed while Chromium keeps the
-              // extension-owned debugger attachment alive. A successful CDP
-              // command proves this extension still owns that attachment.
-              await applyFocusEmulation(normalizedTabId, true);
-              attachmentReused = true;
-            } catch (error) {
-              if (!isDebuggerNotAttachedError(error)) throw error;
-              await debuggerApi.attach(debuggee, PROTOCOL_VERSION);
-              attachedByRestore = true;
-              await applyFocusEmulation(normalizedTabId, true);
-            }
-            if (pendingAttach.detached) {
-              throw createError(
-                "debug_session_detached_during_restore",
-                "浏览器接管在恢复期间再次断开",
-              );
-            }
-          } catch (error) {
-            if (attachedByRestore) {
-              expectedDetachTabs.add(normalizedTabId);
               try {
-                await debuggerApi.detach(debuggee).catch(() => null);
-              } finally {
-                expectedDetachTabs.delete(normalizedTabId);
+                // A MV3 worker can be reclaimed while Chromium keeps the
+                // extension-owned debugger attachment alive. A successful CDP
+                // command proves this extension still owns that attachment.
+                await applyFocusEmulation(normalizedTabId, true);
+                attachmentReused = true;
+              } catch (error) {
+                if (!isDebuggerNotAttachedError(error)) throw error;
+                await debuggerApi.attach(debuggee, PROTOCOL_VERSION);
+                attachedByRestore = true;
+                await applyFocusEmulation(normalizedTabId, true);
               }
-            }
-            throw createError(
-              "debug_session_restore_failed",
-              "无法恢复上一采集会话",
-              error,
-            );
-          } finally {
-            if (pendingAttachesByTab.get(normalizedTabId) === pendingAttach) {
-              pendingAttachesByTab.delete(normalizedTabId);
+              if (pendingAttach.detached) {
+                throw createError(
+                  "debug_session_detached_during_restore",
+                  "采集辅助在恢复期间再次断开",
+                );
+              }
+            } catch (error) {
+              if (attachedByRestore) {
+                expectedDetachTabs.add(normalizedTabId);
+                try {
+                  await debuggerApi.detach(debuggee).catch(() => null);
+                } finally {
+                  expectedDetachTabs.delete(normalizedTabId);
+                }
+              }
+              throw createError(
+                "debug_session_restore_failed",
+                "无法恢复上一采集会话",
+                error,
+              );
+            } finally {
+              if (pendingAttachesByTab.get(normalizedTabId) === pendingAttach) {
+                pendingAttachesByTab.delete(normalizedTabId);
+              }
             }
           }
 
@@ -690,7 +734,7 @@
             tabId: normalizedTabId,
             runId: normalizedRunId,
             label: cleanText(snapshot?.label, 120) || "采集任务",
-            state: "attached",
+            state: restoreDetached ? "detached" : "attached",
             startedAt:
               startedAt && Number.isFinite(Date.parse(startedAt))
                 ? new Date(Date.parse(startedAt)).toISOString()
@@ -720,14 +764,104 @@
           sessionsByTab.set(normalizedTabId, session);
           if (publishState) {
             await publish(session, {
-              reason: "capture_restored",
+              reason: restoreDetached
+                ? "capture_assist_degraded_restored"
+                : "capture_restored",
               attachmentReused,
+              assistDegraded: restoreDetached,
             });
           }
           return publicSession(session, {
             restored: true,
             attachmentReused,
+            assistDegraded: restoreDetached,
           });
+        });
+      }
+
+      async function degradeTabReplacement(input = {}) {
+        const {
+          removedTabId,
+          addedTabId,
+          pageTitle = "",
+          pageUrl = "",
+          groupId,
+        } = input;
+        const groupIdProvided = Object.prototype.hasOwnProperty.call(
+          input,
+          "groupId",
+        );
+        return enqueue(async () => {
+          const oldTabId = normalizeTabId(removedTabId);
+          const newTabId = normalizeTabId(addedTabId);
+          if (!oldTabId || !newTabId || oldTabId === newTabId) {
+            return {replaced: false, reason: "invalid_tab"};
+          }
+
+          const sourceSession = sessionsByTab.get(oldTabId);
+          if (sourceSession?.persistent) {
+            cancelPendingReplacementDetach(oldTabId);
+            sessionsByTab.delete(oldTabId);
+            sourceSession.tabId = newTabId;
+            sourceSession.state = "detached";
+            const normalizedPageTitle = cleanText(pageTitle, 180);
+            const normalizedPageUrl = cleanText(pageUrl, 800);
+            if (normalizedPageTitle) {
+              sourceSession.pageTitle = normalizedPageTitle;
+            }
+            if (normalizedPageUrl) sourceSession.pageUrl = normalizedPageUrl;
+            if (groupIdProvided) {
+              sourceSession.groupId = normalizeGroupId(groupId);
+            }
+            sourceSession.workerTabIds = normalizeWorkerTabIds(
+              sourceSession.workerTabIds,
+              newTabId,
+            );
+            sessionsByTab.set(newTabId, sourceSession);
+            await publish(sourceSession, {
+              reason: "capture_assist_source_tab_replacement_degraded",
+              removedTabId: oldTabId,
+              addedTabId: newTabId,
+              assistDegraded: true,
+            });
+            return {
+              replaced: true,
+              role: "source",
+              degraded: true,
+              session: publicSession(sourceSession),
+            };
+          }
+
+          for (const session of sessionsByTab.values()) {
+            if (
+              !session.persistent ||
+              !session.workerTabIds.includes(oldTabId)
+            ) {
+              continue;
+            }
+            session.workerTabIds = normalizeWorkerTabIds(
+              session.workerTabIds.map((workerTabId) =>
+                workerTabId === oldTabId ? newTabId : workerTabId,
+              ),
+              session.tabId,
+            );
+            if (groupIdProvided) {
+              session.groupId = normalizeGroupId(groupId);
+            }
+            await publish(session, {
+              reason: "capture_assist_worker_tab_replacement_degraded",
+              removedTabId: oldTabId,
+              addedTabId: newTabId,
+              assistDegraded: true,
+            });
+            return {
+              replaced: true,
+              role: "worker",
+              degraded: true,
+              session: publicSession(session),
+            };
+          }
+          return {replaced: false, reason: "not_tracked"};
         });
       }
 
@@ -814,9 +948,12 @@
       async function stop({
         tabId,
         taskId = "",
+        attemptId = "",
         runId = "",
         reason = "capture_finished",
         force = false,
+        publishState = true,
+        bestEffort = false,
       } = {}) {
         return enqueue(async () => {
           const normalizedTabId = normalizeTabId(tabId);
@@ -833,8 +970,16 @@
           const sessionTabId = session.tabId;
           cancelPendingReplacementDetach(sessionTabId);
           const normalizedRunId = cleanText(runId, 320);
+          const normalizedAttemptId = cleanText(attemptId, 320);
           if (!force && normalizedRunId && normalizedRunId !== session.runId) {
             return {released: false, reason: "run_mismatch"};
+          }
+          if (
+            !force &&
+            normalizedAttemptId &&
+            normalizedAttemptId !== cleanText(session.attemptId, 320)
+          ) {
+            return {released: false, reason: "attempt_mismatch"};
           }
 
           session.state = "detaching";
@@ -848,32 +993,79 @@
               }
             });
           } catch (error) {
-            session.state = "attached";
-            await applyFocusEmulation(sessionTabId, true).catch(() => null);
+            if (sessionsByTab.get(sessionTabId) !== session) {
+              // Chromium can emit onDetach and still reject the initiating
+              // detach promise. The synchronous onDetach ownership removal is
+              // authoritative proof that this exact attachment is gone.
+              return {
+                released: true,
+                reason: cleanText(reason, 120) || "capture_finished",
+                session: publicSession(session, {state: "detached"}),
+              };
+            }
+            if (!bestEffort) {
+              session.state = "attached";
+              await applyFocusEmulation(sessionTabId, true).catch(() => null);
+              await publish(session, {
+                reason: "capture_detach_failed",
+                error: cleanText(error?.message || error, 240),
+              });
+              throw createError(
+                "debug_session_detach_failed",
+                "采集辅助尚未释放，请稍后重试停止任务",
+                error,
+              );
+            }
+            // A failed detach is not evidence that Chromium released the
+            // attachment. Keep exact ownership tracked so the caller can
+            // retry cleanup and must not tear down the native group (or let a
+            // different attempt claim the Tab) while Debug may still be live.
+            session.state = "detaching";
             await publish(session, {
-              reason: "capture_detach_failed",
+              reason: "capture_detach_pending",
+              cleanupPending: true,
               error: cleanText(error?.message || error, 240),
             });
-            throw createError(
-              "debug_session_detach_failed",
-              "浏览器接管尚未释放，请稍后重试停止任务",
-              error,
-            );
+            return {
+              released: false,
+              reason: "detach_failed",
+              session: publicSession(session),
+              error: cleanText(error?.message || error, 240),
+            };
           } finally {
             expectedDetachTabs.delete(sessionTabId);
           }
           if (sessionsByTab.get(sessionTabId) === session) {
             sessionsByTab.delete(sessionTabId);
-            await publish(null, {
-              reason: cleanText(reason, 120) || "capture_finished",
-              previous: publicSession(session, {state: "detached"}),
-            });
+            if (publishState) {
+              await publish(null, {
+                reason: cleanText(reason, 120) || "capture_finished",
+                previous: publicSession(session, {state: "detached"}),
+              });
+            }
           }
           return {
             released: true,
             reason: cleanText(reason, 120) || "capture_finished",
             session: publicSession(session, {state: "detached"}),
           };
+        });
+      }
+
+      async function discardRestoredSession({
+        taskId = "",
+        attemptId = "",
+        runId = "",
+        reason = "capture_restore_fence_changed",
+      } = {}) {
+        return await stop({
+          taskId,
+          attemptId,
+          runId,
+          reason,
+          force: false,
+          publishState: false,
+          bestEffort: true,
         });
       }
 
@@ -934,7 +1126,7 @@
               expectedDetachTabs.delete(newTabId);
               throw createError(
                 "debug_session_replace_failed",
-                "浏览器替换了采集页面，但 AI Debug 未能迁移到新页面",
+                "浏览器替换了采集页面，但采集辅助未能迁移到新页面",
                 error,
               );
             }
@@ -1034,6 +1226,8 @@
       return Object.freeze({
         start,
         restore,
+        degradeTabReplacement,
+        discardRestoredSession,
         stop,
         stopByTab(tabId, reason = "capture_cancelled") {
           return stop({tabId, reason, force: true});

@@ -2230,14 +2230,14 @@ test("Douyin worker loss rebuilds once and retries the same expected work under 
   });
 });
 
-test("detail worker initialization failure settles every nonempty Douyin target", async () => {
+test("capture assist registration failure does not block Xiaohongshu detail capture", async () => {
   const sourceTab = {
     id: 91,
     windowId: 10,
     index: 2,
     active: true,
     status: "complete",
-    url: "https://www.douyin.com/jingxuan/search/init-failure?type=general",
+    url: "https://www.xiaohongshu.com/search_result?keyword=assist-degraded",
   };
   const workerTab = {
     id: 593,
@@ -2247,6 +2247,19 @@ test("detail worker initialization failure settles every nonempty Douyin target"
     status: "complete",
     url: "about:blank",
   };
+  const noteIds = [
+    "6a94e7f40000000021033bd1",
+    "6a94e7f40000000021033bd2",
+  ];
+  const noteUrls = new Map(noteIds.map((noteId) => [
+    noteId,
+    `https://www.xiaohongshu.com/explore/${noteId}?xsec_source=pc_search`,
+  ]));
+  const removedTabIds = [];
+  let workerCurrentUrl = workerTab.url;
+  let workerCreateCount = 0;
+  let registrationAttempts = 0;
+  let captureAttempts = 0;
 
   globalThis.chrome = {
     storage: {local: createMemoryStorageArea()},
@@ -2256,6 +2269,7 @@ test("detail worker initialization failure settles every nonempty Douyin target"
           return {ok: true, data: {taskId: message.taskId}};
         }
         if (message?.type === "onstarvoice:register-capture-task-tab") {
+          registrationAttempts += 1;
           return {
             ok: false,
             error: {
@@ -2264,7 +2278,41 @@ test("detail worker initialization failure settles every nonempty Douyin target"
             },
           };
         }
-        return {ok: true, data: null};
+        if (
+          message?.type === "onstarvoice:relay-to-content" &&
+          message?.payload?.action === "captureSingleNote"
+        ) {
+          captureAttempts += 1;
+          assert.equal(message.tabId, workerTab.id);
+          const expectedNoteId = String(
+            message.payload.expectedNoteId ||
+              workerCurrentUrl.match(/\/explore\/([^?]+)/u)?.[1] ||
+              "",
+          );
+          assert.equal(
+            noteIds.includes(expectedNoteId),
+            true,
+            `unexpected expectedNoteId: ${expectedNoteId}`,
+          );
+          return {
+            ok: true,
+            data: {
+              ok: true,
+              platform: "xiaohongshu",
+              type: "single_note",
+              data: {
+                noteId: expectedNoteId,
+                noteUrl: noteUrls.get(expectedNoteId),
+                title: "Capture continues without assist grouping",
+                content: "The optional assist session is not a collection prerequisite.",
+                author: "Assist fallback author",
+                likes: 6,
+              },
+              error: null,
+            },
+          };
+        }
+        return {ok: true, data: {ok: true}};
       },
       getURL(path) {
         return `chrome-extension://test/${path}`;
@@ -2275,23 +2323,41 @@ test("detail worker initialization failure settles every nonempty Douyin target"
         return [sourceTab];
       },
       async create(properties) {
-        return {...workerTab, ...properties, id: workerTab.id};
+        workerCreateCount += 1;
+        workerCurrentUrl = String(properties?.url || workerTab.url);
+        return {
+          ...workerTab,
+          ...properties,
+          id: workerTab.id,
+          url: workerCurrentUrl,
+        };
       },
       async get(tabId) {
         if (tabId === sourceTab.id) return sourceTab;
-        if (tabId === workerTab.id) return workerTab;
+        if (tabId === workerTab.id) {
+          return {...workerTab, url: workerCurrentUrl, status: "complete"};
+        }
         throw new Error(`No tab with id: ${tabId}`);
       },
-      async remove() {
+      async remove(tabId) {
+        removedTabIds.push(tabId);
         return undefined;
       },
       async update(tabId, patch) {
-        return {id: tabId, ...patch};
+        if (tabId === workerTab.id && patch?.url) {
+          workerCurrentUrl = String(patch.url);
+        }
+        return {
+          id: tabId,
+          ...patch,
+          url: tabId === workerTab.id ? workerCurrentUrl : sourceTab.url,
+          status: "complete",
+        };
       },
     },
     scripting: {
       async executeScript() {
-        return [{result: 0}];
+        return [{result: {blocked: false, isDouyin: false}}];
       },
     },
     windows: {async update() { return {}; }},
@@ -2302,18 +2368,20 @@ test("detail worker initialization failure settles every nonempty Douyin target"
     import("../../utils/capture-sync.js"),
     import("../../utils/task-context.js"),
   ]);
-  const recordIds = ["douyin-init-failure-r1", "douyin-init-failure-r2"];
+  const recordIds = noteIds.map((_, index) =>
+    `xhs-assist-degraded-r${index + 1}`,
+  );
   for (const [index, recordId] of recordIds.entries()) {
-    const noteId = `76619358500000009${index + 1}`;
+    const noteId = noteIds[index];
     await addRecord({
       id: recordId,
       type: "keyword_notes",
-      platform: "douyin",
+      platform: "xiaohongshu",
       payload: {
         items: [{
           noteId,
-          noteType: "video",
-          url: `https://www.douyin.com/video/${noteId}`,
+          noteType: "image",
+          url: noteUrls.get(noteId),
         }],
       },
     });
@@ -2326,31 +2394,34 @@ test("detail worker initialization failure settles every nonempty Douyin target"
   await captureSync.beginCaptureTaskSession({
     taskId: activeTask.taskId,
     tabId: sourceTab.id,
-    label: "Douyin init failure settlement test",
-    platform: "douyin",
+    label: "Xiaohongshu optional assist fallback test",
+    platform: "xiaohongshu",
   });
 
   try {
     const result = await captureSync.batchCaptureDetailsForRecords(recordIds, {
       skipAlreadyCaptured: false,
       captureTaskId: activeTask.taskId,
+      detailAfterNavWaitMs: 1,
     });
 
-    assert.equal(result.ok, false);
-    assert.equal(result.error?.code, "TASK_TAB_GROUP_UNAVAILABLE");
-    assert.equal(result.processedCount, recordIds.length);
-    assert.equal(result.failedCount, recordIds.length);
-    assert.equal(result.results.length, recordIds.length);
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.processedCount, 2);
+    assert.equal(result.successCount, 2);
+    assert.equal(result.failedCount, 0);
     assert.deepEqual(
       result.results.map((item) => item.recordId),
       recordIds,
     );
-    assert.equal(result.results.every((item) => item.ok === false), true);
+    assert.equal(registrationAttempts, 1);
+    assert.equal(workerCreateCount, 1);
+    assert.equal(captureAttempts, 2);
+    assert.deepEqual(removedTabIds, [workerTab.id]);
   } finally {
     await captureSync.endCaptureTaskSession({
       taskId: activeTask.taskId,
       reason: "completed",
-      status: "completed_with_failures",
+      status: "completed",
     });
     taskContext.completeTaskContext({
       taskType: "capture",

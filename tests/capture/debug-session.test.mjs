@@ -379,6 +379,105 @@ test("a real detach failure keeps ownership so Stop can be retried safely", asyn
   assert.equal(manager.getSession(13), null);
 });
 
+test("best-effort detach failure remains tracked until exact cleanup succeeds", async () => {
+  const debuggerApi = createDebuggerDouble({
+    detachError: new Error("debug transport still busy"),
+    emitDetachOnStop: false,
+  });
+  const stateChanges = [];
+  const manager = createManager({
+    debuggerApi,
+    onStateChange: (session, metadata) =>
+      stateChanges.push({session, metadata}),
+  });
+  await manager.start({
+    tabId: 14,
+    runId: "capture-task:stable",
+    persistent: true,
+    taskId: "stable",
+    attemptId: "attempt-A",
+  });
+
+  const failed = await manager.stop({
+    taskId: "stable",
+    attemptId: "attempt-A",
+    runId: "capture-task:stable",
+    bestEffort: true,
+    publishState: false,
+  });
+  assert.equal(failed.released, false);
+  assert.equal(failed.reason, "detach_failed");
+  assert.equal(manager.getSessionByTaskId("stable")?.state, "detaching");
+  assert.equal(
+    manager.getSessionByTaskId("stable")?.attemptId,
+    "attempt-A",
+  );
+  assert.equal(stateChanges.at(-1).metadata.cleanupPending, true);
+
+  debuggerApi.detachError = null;
+  const cleaned = await manager.stop({
+    taskId: "stable",
+    attemptId: "attempt-A",
+    runId: "capture-task:stable",
+  });
+  assert.equal(cleaned.released, true);
+  assert.equal(manager.getSessionByTaskId("stable"), null);
+});
+
+test("an explicit onDetach is authoritative even if the detach promise rejects", async () => {
+  const debuggerApi = createDebuggerDouble({emitDetachOnStop: false});
+  const originalDetach = debuggerApi.detach.bind(debuggerApi);
+  debuggerApi.detach = async (debuggee) => {
+    await originalDetach(debuggee);
+    debuggerApi.emitDetach(debuggee.tabId, "canceled_by_user");
+    throw new Error("transport closed after detach");
+  };
+  const manager = createManager({debuggerApi});
+  await manager.start({
+    tabId: 16,
+    runId: "capture-task:on-detach-proof",
+    persistent: true,
+    taskId: "on-detach-proof",
+    attemptId: "attempt-A",
+  });
+
+  const stopped = await manager.stop({
+    taskId: "on-detach-proof",
+    attemptId: "attempt-A",
+    runId: "capture-task:on-detach-proof",
+    bestEffort: true,
+  });
+
+  assert.equal(stopped.released, true);
+  assert.equal(manager.getSessionByTaskId("on-detach-proof"), null);
+});
+
+test("a stable task run cannot reuse Debug ownership from another attempt", async () => {
+  const manager = createManager({debuggerApi: createDebuggerDouble()});
+  await manager.start({
+    tabId: 15,
+    runId: "capture-task:stable",
+    persistent: true,
+    taskId: "stable",
+    attemptId: "attempt-A",
+  });
+
+  await assert.rejects(
+    manager.start({
+      tabId: 15,
+      runId: "capture-task:stable",
+      persistent: true,
+      taskId: "stable",
+      attemptId: "attempt-B",
+    }),
+    (error) => error?.code === "debug_session_tab_busy",
+  );
+  assert.equal(
+    manager.getSessionByTaskId("stable")?.attemptId,
+    "attempt-A",
+  );
+});
+
 test("attach or CDP setup failure stops capture before it begins", async () => {
   const attachManager = createManager({
     debuggerApi: createDebuggerDouble({attachError: new Error("busy")}),
@@ -402,6 +501,43 @@ test("attach or CDP setup failure stops capture before it begins", async () => {
     commandApi.calls.some(([type]) => type === "detach"),
     true,
   );
+});
+
+test("a setup failure cannot degrade while native Debug cleanup is unconfirmed", async () => {
+  const debuggerApi = createDebuggerDouble({
+    focusError: new Error("unsupported command"),
+    detachError: new Error("transport still busy"),
+    emitDetachOnStop: false,
+  });
+  const manager = createManager({debuggerApi});
+
+  await assert.rejects(
+    manager.start({
+      tabId: 24,
+      runId: "cleanup-pending",
+      persistent: true,
+      taskId: "cleanup-pending-task",
+      attemptId: "attempt-A",
+      platform: "xiaohongshu",
+    }),
+    (error) =>
+      error?.code === "debug_session_start_cleanup_failed" &&
+      error?.assistFailureCode === "debug_session_command_failed",
+  );
+  assert.equal(manager.getSession(24)?.state, "detaching");
+  assert.equal(
+    manager.getSessionByTaskId("cleanup-pending-task")?.attemptId,
+    "attempt-A",
+  );
+
+  debuggerApi.detachError = null;
+  const cleanup = await manager.stop({
+    taskId: "cleanup-pending-task",
+    attemptId: "attempt-A",
+    reason: "capture_task_begin_rollback",
+  });
+  assert.equal(cleanup.released, true);
+  assert.equal(manager.getSessionByTaskId("cleanup-pending-task"), null);
 });
 
 test("an immediate native Cancel during setup cannot publish a fake attached session", async () => {

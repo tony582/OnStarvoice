@@ -833,7 +833,7 @@ let unattendedRunMutationQueue = Promise.resolve();
 let unattendedRunArchiveMutationQueue = Promise.resolve();
 let unattendedRunnerTabLifecycleQueue = Promise.resolve();
 let taskLedgerMutationQueue = Promise.resolve();
-let captureTaskBeginQueue = Promise.resolve();
+let captureTaskLifecycleQueue = Promise.resolve();
 let targetedPostRunMutationQueue = Promise.resolve();
 let cloudCommandResultsMutationQueue = Promise.resolve();
 
@@ -861,9 +861,9 @@ function runTaskLedgerMutation(operation) {
   return pending;
 }
 
-function runCaptureTaskBeginOperation(operation) {
-  const pending = captureTaskBeginQueue.then(operation, operation);
-  captureTaskBeginQueue = pending.catch(() => null);
+function runCaptureTaskLifecycleOperation(operation) {
+  const pending = captureTaskLifecycleQueue.then(operation, operation);
+  captureTaskLifecycleQueue = pending.catch(() => null);
   return pending;
 }
 
@@ -9235,7 +9235,7 @@ function formatUnattendedRecoveryReason(reason, request = null) {
     business_progress_stalled: '采集业务长时间没有新进展',
     runner_owner_disconnected: `${executionCopy.runnerLabel}连接已更换`,
     debug_target_closed: '浏览器替换了采集页面',
-    source_tab_replace_failed: '浏览器替换页面后接管需要重建',
+    source_tab_replace_failed: '浏览器替换页面后采集上下文需要重建',
   };
   return (
     messages[String(reason || '')] || `${executionCopy.taskLabel}运行异常`
@@ -10760,10 +10760,23 @@ async function cleanupStaleCaptureRuntimeSession(session) {
     session.originalGroupId === ''
       ? -1
       : Number(session.originalGroupId);
+  const pendingNativeGroupSetup =
+    session.nativeGroupSetupPending === true;
+  const expectedPlatform = normalizePlatformId(
+    session.platform || detectPlatformFromUrl(session.pageUrl || ''),
+  );
+  const expectedWindowId =
+    session.windowId !== null &&
+    session.windowId !== undefined &&
+    session.windowId !== '' &&
+    Number.isSafeInteger(Number(session.windowId))
+      ? Number(session.windowId)
+      : null;
+  let taskGroup = null;
   let verifiedTaskGroup = false;
   if (Number.isSafeInteger(taskGroupId) && taskGroupId >= 0) {
     try {
-      const taskGroup = await chrome.tabGroups.get(taskGroupId);
+      taskGroup = await chrome.tabGroups.get(taskGroupId);
       verifiedTaskGroup =
         String(taskGroup?.title || '').trim() === CAPTURE_TASK_GROUP_TITLE;
     } catch (error) {
@@ -10781,10 +10794,38 @@ async function cleanupStaleCaptureRuntimeSession(session) {
   }
 
   let sourceTab = null;
-  if (verifiedTaskGroup && sourceTabId) {
+  if ((verifiedTaskGroup || pendingNativeGroupSetup) && sourceTabId) {
     try {
       const candidate = await chrome.tabs.get(sourceTabId);
-      if (candidate?.groupId === taskGroupId) sourceTab = candidate;
+      const candidateWindowId = Number.isSafeInteger(candidate?.windowId)
+        ? candidate.windowId
+        : null;
+      const taskGroupWindowId = Number.isSafeInteger(taskGroup?.windowId)
+        ? taskGroup.windowId
+        : null;
+      const candidatePlatform = detectPlatformFromUrl(candidate?.url || '');
+      const exactPendingOwnership = Boolean(
+        pendingNativeGroupSetup &&
+          taskGroup &&
+          candidate?.groupId === taskGroupId &&
+          expectedWindowId !== null &&
+          candidateWindowId === expectedWindowId &&
+          (taskGroupWindowId === null || taskGroupWindowId === expectedWindowId) &&
+          new Set(['xiaohongshu', 'douyin']).has(expectedPlatform) &&
+          candidatePlatform === expectedPlatform,
+      );
+      const sourceOwnershipVerified = pendingNativeGroupSetup
+        ? exactPendingOwnership
+        : verifiedTaskGroup;
+      if (candidate?.groupId === taskGroupId && sourceOwnershipVerified) {
+        sourceTab = candidate;
+        verifiedTaskGroup = true;
+      } else {
+        // The Tab/group/window/platform identity no longer proves ownership.
+        // Fail closed: never ungroup a reused page merely because an old MV3
+        // cleanup snapshot still names its numeric ids.
+        verifiedTaskGroup = false;
+      }
     } catch (error) {
       const message = String(error?.message || error || '');
       if (/no tab with id|not found|does not exist|invalid tab id/iu.test(message)) {
@@ -10800,7 +10841,13 @@ async function cleanupStaleCaptureRuntimeSession(session) {
     for (const workerTabId of workerTabIds) {
       try {
         const workerTab = await chrome.tabs.get(workerTabId);
-        if (workerTab?.groupId === taskGroupId) {
+        if (
+          workerTab?.groupId === taskGroupId &&
+          (!sourceTab ||
+            !Number.isSafeInteger(sourceTab.windowId) ||
+            (Number.isSafeInteger(workerTab?.windowId) &&
+              workerTab.windowId === sourceTab.windowId))
+        ) {
           verifiedWorkerTabIds.push(workerTabId);
         }
       } catch (error) {
@@ -10828,7 +10875,11 @@ async function cleanupStaleCaptureRuntimeSession(session) {
   if (chrome.action?.setBadgeText) {
     await chrome.action.setBadgeText({text: ''}).catch(() => null);
   }
-  if (sourceTab) {
+  if (
+    sourceTab &&
+    !pendingNativeGroupSetup &&
+    session.debugCleanupConfirmed !== true
+  ) {
     await chrome.debugger.detach({tabId: sourceTab.id}).catch((error) => {
       const message = String(error?.message || error || '');
       if (/not attached|no tab with given id|target closed/iu.test(message)) {
@@ -10869,6 +10920,55 @@ async function cleanupStaleCaptureRuntimeSession(session) {
 
 let captureRuntimeRestorePromise = null;
 
+function captureRuntimeSnapshotMatches(current, expected) {
+  if (!current || !expected) return false;
+  return Boolean(
+    String(current.taskId || '').trim() ===
+      String(expected.taskId || '').trim() &&
+      String(current.runId || '').trim() ===
+        String(expected.runId || '').trim() &&
+      String(current.attemptId || '').trim() ===
+        String(expected.attemptId || '').trim() &&
+      resolveCaptureTaskTabId(current.sourceTabId, current.tabId) ===
+        resolveCaptureTaskTabId(expected.sourceTabId, expected.tabId),
+  );
+}
+
+async function clearPersistedCaptureRuntimeSnapshot(expected) {
+  let cleared = false;
+  await writeRuntimeState((current) => {
+    if (!captureRuntimeSnapshotMatches(current.captureDebugSession, expected)) {
+      return {};
+    }
+    cleared = true;
+    return {captureDebugSession: null};
+  });
+  return cleared;
+}
+
+async function publishRestoredCaptureRuntimeSnapshot(expected, session) {
+  let published = false;
+  await writeRuntimeState((current) => {
+    if (!captureRuntimeSnapshotMatches(current.captureDebugSession, expected)) {
+      return {};
+    }
+    published = true;
+    return {captureDebugSession: session};
+  });
+  if (published && chrome.action?.setBadgeText) {
+    await Promise.allSettled([
+      chrome.action.setBadgeText({
+        text: session?.state === 'attached' ? '1' : '',
+      }),
+      chrome.action.setBadgeBackgroundColor({color: '#6f5cff'}),
+      chrome.action.setBadgeTextColor
+        ? chrome.action.setBadgeTextColor({color: '#ffffff'})
+        : Promise.resolve(),
+    ]);
+  }
+  return published;
+}
+
 async function restorePersistedCaptureRuntimeSession(runtime) {
   const snapshot = runtime?.captureDebugSession;
   if (
@@ -10878,48 +10978,392 @@ async function restorePersistedCaptureRuntimeSession(runtime) {
   ) {
     return {restored: false, reason: 'not_required'};
   }
+  if (captureTaskBeginInFlight) {
+    return {
+      restored: false,
+      reason: 'capture_begin_in_progress',
+      concurrentBegin: true,
+      snapshot,
+    };
+  }
   if (captureRuntimeRestorePromise) return await captureRuntimeRestorePromise;
 
   captureRuntimeRestorePromise = (async () => {
     const taskId = String(snapshot.taskId || '').trim();
     if (!taskId) return {restored: false, reason: 'missing_task_id'};
-    let attemptId = String(
-      snapshot.attemptId ||
-        runtime?.lastCaptureProgress?.unattendedAttemptId ||
-        '',
-    ).trim();
+    const restoreDetachedAssist =
+      snapshot.persistent === true &&
+      String(snapshot.state || '').trim().toLowerCase() === 'detached';
+    // The persisted session must carry its own attempt identity. Progress is a
+    // separate, later-moving record and must never be used to rename an older
+    // browser snapshot into the current unattended attempt.
+    const attemptId = String(snapshot.attemptId || '').trim();
     const initialFence = await inspectUnattendedCaptureTaskAttempt({
       taskId,
       attemptId,
     });
-    if (initialFence.unattended && !attemptId) {
-      attemptId = String(initialFence.currentAttemptId || '').trim();
+    const restoreSnapshot = {...snapshot, attemptId};
+    const cleanupPending = Boolean(
+      restoreSnapshot.cleanupPending === true ||
+        String(restoreSnapshot.state || '').trim().toLowerCase() ===
+          'detaching',
+    );
+    const unattendedSnapshotIsStale = Boolean(
+      initialFence.unattended &&
+        (!attemptId ||
+          !initialFence.current ||
+          (!cleanupPending &&
+            (!initialFence.active || !initialFence.lockMatchesTaskAttempt)) ||
+          (cleanupPending &&
+            !initialFence.terminal &&
+            !initialFence.lockMatchesTaskAttempt)),
+    );
+    if (unattendedSnapshotIsStale) {
+      return {
+        restored: false,
+        reason: attemptId
+          ? 'stale_unattended_attempt'
+          : 'missing_unattended_attempt',
+        staleAttempt: true,
+        snapshot: restoreSnapshot,
+      };
     }
-    if (initialFence.unattended) {
+
+    if (cleanupPending) {
+      try {
+        // Keep cleanup inside the restore fence. BEGIN waits for this promise,
+        // so an old attempt cannot close or forget resources after a new
+        // attempt has already claimed the same stable task id.
+        await cleanupStaleCaptureRuntimeSession(restoreSnapshot);
+        const cleanupCompleted =
+          await clearPersistedCaptureRuntimeSnapshot(restoreSnapshot);
+        return {
+          restored: false,
+          reason: 'capture_cleanup_completed',
+          cleanupPending: true,
+          cleanupCompleted,
+          snapshot: restoreSnapshot,
+        };
+      } catch (error) {
+        // Leave the exact cleanup snapshot in storage for the next MV3 wake.
+        // It must never be revived as a running logical/Debug session.
+        console.warn(
+          '[CaptureTask] persisted cleanup remains pending:',
+          error?.message || error,
+        );
+        return {
+          restored: false,
+          reason: 'capture_cleanup_pending',
+          cleanupPending: true,
+          cleanupCompleted: false,
+          snapshot: restoreSnapshot,
+          error,
+        };
+      }
+    }
+
+    const restoreFenceStillCurrent = async () => {
+      if (!initialFence.unattended) return true;
       const currentFence = await inspectUnattendedCaptureTaskAttempt({
         taskId,
         attemptId,
       });
-      if (!currentFence.active || !currentFence.lockMatchesTaskAttempt) {
-        return {restored: false, reason: 'stale_unattended_attempt'};
+      return Boolean(
+        currentFence.active &&
+          currentFence.lockMatchesTaskAttempt &&
+          matchesUnattendedBeginLease(currentFence.lock, initialFence.lock, {
+            taskId,
+            attemptId,
+          }),
+      );
+    };
+    const staleRestoreResult = (reason = 'stale_unattended_attempt') => ({
+      restored: false,
+      reason,
+      staleAttempt: true,
+      snapshot: restoreSnapshot,
+    });
+    let group = null;
+    let session = null;
+    const discardRestoreAttempt = async () => {
+      const activeSession =
+        captureDebugSessionManager.getSessionByTaskId(taskId);
+      const exactActiveSession = Boolean(
+        activeSession &&
+        String(activeSession.runId || '').trim() ===
+          String(restoreSnapshot.runId || '').trim() &&
+        String(activeSession.attemptId || '').trim() === attemptId
+      );
+      if (activeSession && !exactActiveSession) {
+        return false;
       }
+      if (exactActiveSession) {
+        const debugResult = await captureDebugSessionManager
+          .discardRestoredSession({
+            taskId,
+            attemptId,
+            runId: restoreSnapshot.runId,
+          })
+          .catch((error) => {
+            console.warn(
+              '[CaptureTask] failed to discard fenced restore assist:',
+              error?.message || error,
+            );
+            return {released: false, reason: 'detach_failed'};
+          });
+        if (
+          debugResult?.released !== true &&
+          debugResult?.reason !== 'not_attached'
+        ) {
+          // Do not forget the native group while Chromium may still have the
+          // exact Debug attachment. The cleanup snapshot/session remains
+          // authoritative for a later retry.
+          return false;
+        }
+      }
+      const currentGroup = captureTaskTabGroupManager.getTask(taskId);
+      if (
+        group &&
+        currentGroup &&
+        String(currentGroup.attemptId || '').trim() === attemptId &&
+        Number(currentGroup.sourceTabId) === Number(group.sourceTabId) &&
+        Number(currentGroup.groupId) === Number(group.groupId) &&
+        Number(currentGroup.windowId) === Number(group.windowId)
+      ) {
+        try {
+          if (Array.isArray(currentGroup.workerTabIds)) {
+            await closeTrackedCaptureTaskWorkerTabs(
+              taskId,
+              currentGroup.workerTabIds,
+            );
+          }
+          const groupResult = await captureTaskTabGroupManager.end({
+            taskId,
+            attemptId,
+            sourceTabId: group.sourceTabId,
+            groupId: group.groupId,
+            reason: 'capture_restore_fence_changed',
+          });
+          if (
+            groupResult?.released !== true &&
+            groupResult?.reason !== 'not_grouped'
+          ) {
+            return false;
+          }
+        } catch (error) {
+          console.warn(
+            '[CaptureTask] failed to discard fenced restore group:',
+            error?.message || error,
+          );
+          return false;
+        }
+      }
+      return true;
+    };
+    const discardRestoreOrKeepPending = async (
+      reason = 'stale_unattended_attempt',
+    ) => {
+      if (await discardRestoreAttempt()) return staleRestoreResult(reason);
+      return {
+        restored: false,
+        reason: 'capture_cleanup_pending',
+        cleanupPending: true,
+        cleanupCompleted: false,
+        snapshot: restoreSnapshot,
+      };
+    };
+
+    const restoreSourceTabId = resolveCaptureTaskTabId(
+      restoreSnapshot.sourceTabId,
+      restoreSnapshot.tabId,
+    );
+    const explicitRestorePlatform = normalizePlatformId(
+      restoreSnapshot.platform,
+    );
+    const pageRestorePlatform = detectPlatformFromUrl(
+      restoreSnapshot.pageUrl || '',
+    );
+    if (
+      explicitRestorePlatform !== 'unknown' &&
+      pageRestorePlatform !== 'unknown' &&
+      explicitRestorePlatform !== pageRestorePlatform
+    ) {
+      return {
+        restored: false,
+        reason: 'capture_task_snapshot_platform_mismatch',
+        error: createCaptureTaskError(
+          'capture_task_snapshot_platform_mismatch',
+          '待恢复采集快照的平台信息互相冲突',
+        ),
+      };
+    }
+    const expectedRestorePlatform =
+      explicitRestorePlatform !== 'unknown'
+        ? explicitRestorePlatform
+        : pageRestorePlatform;
+    if (!new Set(['xiaohongshu', 'douyin']).has(expectedRestorePlatform)) {
+      return {
+        restored: false,
+        reason: 'capture_task_snapshot_platform_missing',
+        error: createCaptureTaskError(
+          'capture_task_snapshot_platform_missing',
+          '待恢复采集快照缺少可验证的平台信息',
+        ),
+      };
     }
 
-    const restoreSnapshot = {...snapshot, attemptId};
-    let group = null;
-    try {
-      group = await captureTaskTabGroupManager.restore(restoreSnapshot);
-      const session = await captureDebugSessionManager.restore(
-        {
-          ...restoreSnapshot,
-          workerTabIds: group.workerTabIds,
-          groupId: group.groupId,
-          originalGroupId: group.originalGroupId,
-        },
+    const validateRestoreSource = async () => {
+      let restoreSourceTab;
+      try {
+        restoreSourceTab = await chrome.tabs.get(restoreSourceTabId);
+      } catch (error) {
+        throw createCaptureTaskError(
+          'capture_task_source_tab_missing',
+          '找不到待恢复采集任务的来源页面',
+          error,
+        );
+      }
+      const restorePlatform = detectPlatformFromUrl(
+        restoreSourceTab?.url || '',
       );
-      return {restored: true, session, group};
+      if (!new Set(['xiaohongshu', 'douyin']).has(restorePlatform)) {
+        throw createCaptureTaskError(
+          'capture_task_platform_unsupported',
+          '待恢复采集任务的来源页面已离开支持的平台',
+        );
+      }
+      if (
+        expectedRestorePlatform !== 'unknown' &&
+        expectedRestorePlatform !== restorePlatform
+      ) {
+        throw createCaptureTaskError(
+          'capture_task_platform_mismatch',
+          '待恢复采集任务的平台与当前来源页面不一致',
+        );
+      }
+      return restoreSourceTab;
+    };
+
+    try {
+      await validateRestoreSource();
     } catch (error) {
-      if (group) captureTaskTabGroupManager.forget(taskId);
+      const normalizedError = error?.code
+        ? error
+        : createCaptureTaskError(
+            'capture_task_source_tab_missing',
+            '找不到待恢复采集任务的来源页面',
+            error,
+          );
+      console.warn(
+        '[CaptureTask] persisted source validation failed:',
+        normalizedError?.message || normalizedError,
+      );
+      return {
+        restored: false,
+        reason:
+          normalizedError?.code || 'capture_task_source_validation_failed',
+        error: normalizedError,
+      };
+    }
+    if (!(await restoreFenceStillCurrent())) {
+      return staleRestoreResult();
+    }
+
+    let assistDegraded = restoreDetachedAssist;
+    try {
+      try {
+        group = await captureTaskTabGroupManager.restore(restoreSnapshot);
+      } catch (error) {
+        const optionalGroupRestoreFailure = new Set([
+          'invalid_capture_task_group_restore',
+          'capture_task_group_restore_mismatch',
+        ]).has(String(error?.code || ''));
+        if (!optionalGroupRestoreFailure) throw error;
+        assistDegraded = true;
+        // A degraded assist snapshot is resource ownership, not permission to
+        // turn Debug back on. The native group may also have disappeared while
+        // the MV3 worker was asleep; keep the logical task/session so content
+        // capture and an explicit END can still settle normally.
+        console.warn(
+          '[CaptureTask] detached assist group restore unavailable; page capture continues:',
+          error?.message || error,
+        );
+      }
+      if (!(await restoreFenceStillCurrent())) {
+        return await discardRestoreOrKeepPending();
+      }
+      await validateRestoreSource();
+      const verifiedWorkerTabIds = group?.workerTabIds || [];
+      const normalizedRestoreSnapshot = {
+        ...restoreSnapshot,
+        state: assistDegraded ? 'detached' : restoreSnapshot.state,
+        workerTabIds: verifiedWorkerTabIds,
+        groupId: group?.groupId ?? null,
+        originalGroupId:
+          group?.originalGroupId ?? restoreSnapshot.originalGroupId,
+      };
+      try {
+        session = await captureDebugSessionManager.restore(
+          normalizedRestoreSnapshot,
+          {publishState: false},
+        );
+      } catch (error) {
+        if (
+          assistDegraded ||
+          String(error?.code || '') !== 'debug_session_restore_failed'
+        ) {
+          throw error;
+        }
+        // MV3 may wake after Chromium has already dropped the debugger, or
+        // DevTools may now own the target. Neither condition invalidates the
+        // content-script task. Preserve a detached logical session so normal
+        // progress and END cleanup continue without manufacturing a cancel.
+        assistDegraded = true;
+        if (!(await restoreFenceStillCurrent())) {
+          return await discardRestoreOrKeepPending();
+        }
+        await validateRestoreSource();
+        session = await captureDebugSessionManager.restore(
+          {
+            ...normalizedRestoreSnapshot,
+            state: 'detached',
+          },
+          {publishState: false},
+        );
+      }
+      if (!(await restoreFenceStillCurrent())) {
+        return await discardRestoreOrKeepPending();
+      }
+      await validateRestoreSource();
+      const published = await publishRestoredCaptureRuntimeSnapshot(
+        restoreSnapshot,
+        session,
+      );
+      if (!published || !(await restoreFenceStillCurrent())) {
+        if (published) {
+          await clearPersistedCaptureRuntimeSnapshot(session);
+        }
+        return await discardRestoreOrKeepPending(
+          'capture_restore_fence_changed',
+        );
+      }
+      return {
+        restored: true,
+        session,
+        group,
+        assistDegraded,
+      };
+    } catch (error) {
+      if (!(await discardRestoreAttempt())) {
+        return {
+          restored: false,
+          reason: 'capture_cleanup_pending',
+          cleanupPending: true,
+          cleanupCompleted: false,
+          snapshot: restoreSnapshot,
+          error,
+        };
+      }
       console.warn(
         '[CaptureTask] persisted runtime restore failed:',
         error?.message || error,
@@ -10940,7 +11384,24 @@ async function restorePersistedCaptureRuntimeSession(runtime) {
 
 async function ensureRuntimeState() {
   const beforeRestore = await readRuntimeState();
-  await restorePersistedCaptureRuntimeSession(beforeRestore);
+  const restoreResult =
+    await restorePersistedCaptureRuntimeSession(beforeRestore);
+  const suppressedStaleSnapshot =
+    restoreResult?.cleanupPending ||
+    restoreResult?.staleAttempt ||
+    restoreResult?.concurrentBegin
+      ? restoreResult.snapshot || beforeRestore.captureDebugSession
+      : null;
+  if (restoreResult?.cleanupPending && suppressedStaleSnapshot) {
+    // Cleanup already ran under captureRuntimeRestorePromise. Keep this exact
+    // snapshot suppressed from the generic stale-session cancellation path,
+    // whether cleanup completed or remains queued for the next MV3 wake.
+  } else if (restoreResult?.staleAttempt && suppressedStaleSnapshot) {
+    // A stale or identity-less attempt owns neither the current runner nor its
+    // browser resources. Drop only that exact snapshot without canceling or
+    // recovering the newer attempt sharing the stable task id.
+    await clearPersistedCaptureRuntimeSnapshot(suppressedStaleSnapshot);
+  }
   let unattendedRecoveryTaskId = '';
   const nextRuntime = await runRuntimeMutation(async () => {
     const current = await readRuntimeState();
@@ -10948,7 +11409,11 @@ async function ensureRuntimeState() {
 
     if (
       current.captureDebugSession &&
-      captureDebugSessionManager?.getActiveSessions().length === 0
+      captureDebugSessionManager?.getActiveSessions().length === 0 &&
+      !captureRuntimeSnapshotMatches(
+        current.captureDebugSession,
+        suppressedStaleSnapshot,
+      )
     ) {
       const staleTaskId = String(
         current.captureDebugSession?.taskId || '',
@@ -11908,9 +12373,42 @@ captureDebugSessionManager =
   globalThis.OnStarvoiceCaptureDebugSession.createManager({
     debuggerApi: chrome.debugger,
     onStateChange: async (session, metadata = {}) => {
+      if (session?.persistent && session.taskId) {
+        const stateFence = await inspectUnattendedCaptureTaskAttempt({
+          taskId: session.taskId,
+          attemptId: session.attemptId,
+        });
+        if (
+          stateFence.unattended &&
+          (!stateFence.active || !stateFence.lockMatchesTaskAttempt)
+        ) {
+          console.warn(
+            '[CaptureTask] ignored stale unattended assist state publication',
+            {
+              taskId: session.taskId,
+              attemptId: session.attemptId || '',
+              reason: metadata?.reason || '',
+            },
+          );
+          return;
+        }
+      }
+      if (!session && metadata?.previous?.persistent) {
+        const currentRuntime = await readRuntimeState();
+        if (
+          !captureRuntimeSnapshotMatches(
+            currentRuntime.captureDebugSession,
+            metadata.previous,
+          )
+        ) {
+          return;
+        }
+      }
       if (chrome.action?.setBadgeText) {
         await Promise.allSettled([
-          chrome.action.setBadgeText({text: session ? '1' : ''}),
+          chrome.action.setBadgeText({
+            text: session?.state === 'attached' ? '1' : '',
+          }),
           chrome.action.setBadgeBackgroundColor({color: '#6f5cff'}),
           chrome.action.setBadgeTextColor
             ? chrome.action.setBadgeTextColor({color: '#ffffff'})
@@ -11937,7 +12435,7 @@ captureDebugSessionManager =
       } else if (session && metadata.reason === 'capture_started') {
         patch.lastCaptureProgress = {
           phase: 'debug_session_attached',
-          message: `AI 已接管当前页面 · ${session.label}`,
+          message: `采集辅助运行中 · ${session.label}`,
           ...(session.persistent
             ? {captureTaskId: session.taskId}
             : {listCaptureRunId: session.runId}),
@@ -11946,7 +12444,19 @@ captureDebugSessionManager =
           updatedAt: new Date().toISOString(),
         };
       }
-      await writeRuntimeState(patch);
+      await writeRuntimeState((current) => {
+        if (
+          !session &&
+          metadata?.previous?.persistent &&
+          !captureRuntimeSnapshotMatches(
+            current.captureDebugSession,
+            metadata.previous,
+          )
+        ) {
+          return {};
+        }
+        return patch;
+      });
     },
     onUnexpectedDetach: async ({session, reason}) => {
       await handleUnexpectedCaptureDebugDetach({session, reason});
@@ -12162,7 +12672,29 @@ async function inspectCaptureTaskGroupLiveness(group) {
 async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
   const releasedTaskIds = [];
   const protectedTasks = [];
-  const candidates = captureTaskTabGroupManager.getActiveTasks();
+  const candidatesByTaskId = new Map(
+    captureTaskTabGroupManager
+      .getActiveTasks()
+      .map((group) => [String(group?.taskId || '').trim(), group]),
+  );
+  for (const session of captureDebugSessionManager.getActiveSessions()) {
+    const taskId = String(session?.taskId || '').trim();
+    if (!session?.persistent || !taskId || candidatesByTaskId.has(taskId)) {
+      continue;
+    }
+    candidatesByTaskId.set(taskId, {
+      taskId,
+      sourceTabId: resolveCaptureTaskTabId(session.sourceTabId, session.tabId),
+      workerTabIds: Array.isArray(session.workerTabIds)
+        ? session.workerTabIds
+        : [],
+      groupId: session.groupId ?? null,
+      originalGroupId: session.originalGroupId ?? null,
+    });
+  }
+  const candidates = [...candidatesByTaskId.values()].filter(
+    (candidate) => String(candidate?.taskId || '').trim(),
+  );
   for (const group of candidates) {
     const liveness = await inspectCaptureTaskGroupLiveness(group);
     if (liveness.active) {
@@ -12201,11 +12733,24 @@ async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
 }
 
 async function beginCaptureTask(message, sender) {
-  return await runCaptureTaskBeginOperation(async () => {
+  return await runCaptureTaskLifecycleOperation(async () => {
+    const restoreResult = captureRuntimeRestorePromise
+      ? await captureRuntimeRestorePromise
+      : await restorePersistedCaptureRuntimeSession(await readRuntimeState());
+    if (
+      restoreResult?.cleanupPending &&
+      restoreResult?.cleanupCompleted !== true
+    ) {
+      throw createCaptureTaskError(
+        'capture_task_cleanup_pending',
+        '上一采集任务仍在安全清理工作页，请稍后重试',
+      );
+    }
     const request = getCaptureTaskRequest(message);
     const marker = {
       taskId: requireCaptureTaskId(request),
       attemptId: String(request.attemptId || '').trim(),
+      platform: normalizePlatformId(request.platform),
       sourceTabId: resolveCaptureTaskTabId(
         request.sourceTabId,
         request.tabId,
@@ -12269,7 +12814,7 @@ async function beginCaptureTaskNow(message, sender) {
   if (!new Set(['xiaohongshu', 'douyin']).has(sourcePlatform)) {
     throw createCaptureTaskError(
       'capture_task_platform_unsupported',
-      '任务级 Debug 当前仅支持小红书和抖音',
+      '当前平台不支持浏览器采集辅助',
     );
   }
   if (
@@ -12278,8 +12823,14 @@ async function beginCaptureTaskNow(message, sender) {
   ) {
     throw createCaptureTaskError(
       'capture_task_platform_mismatch',
-      '任务平台与来源页面不一致，已拒绝启动浏览器接管',
+      '任务平台与来源页面不一致，已拒绝启动采集辅助',
     );
+  }
+  if (
+    captureTaskBeginInFlight?.taskId === taskId &&
+    captureTaskBeginInFlight?.attemptId === attemptId
+  ) {
+    captureTaskBeginInFlight.platform = sourcePlatform;
   }
 
   // Fence before consulting the execution lock. Recovery deliberately has a
@@ -12293,13 +12844,13 @@ async function beginCaptureTaskNow(message, sender) {
   if (beginAttemptFence.unattended && !beginAttemptFence.current) {
     throw createCaptureTaskError(
       'stale_unattended_attempt',
-      '旧无人值守运行页已失效，已忽略其浏览器接管请求',
+      '旧无人值守运行页已失效，已忽略其采集辅助请求',
     );
   }
   if (beginAttemptFence.unattended && !beginAttemptFence.active) {
     throw createCaptureTaskError(
       'unattended_request_terminal',
-      '无人值守任务已结束，未启动浏览器接管',
+      '无人值守任务已结束，未启动采集辅助',
     );
   }
   if (
@@ -12308,7 +12859,7 @@ async function beginCaptureTaskNow(message, sender) {
   ) {
     throw createCaptureTaskError(
       'unattended_capture_lock_missing',
-      '无人值守任务执行锁已失效，未启动浏览器接管',
+      '无人值守任务执行锁已失效，未启动采集辅助',
     );
   }
 
@@ -12344,7 +12895,7 @@ async function beginCaptureTaskNow(message, sender) {
   ) {
     throw createCaptureTaskError(
       'unattended_capture_lock_bind_failed',
-      '无人值守任务执行锁未能绑定，未启动浏览器接管',
+      '无人值守任务执行锁未能绑定，未启动采集辅助',
     );
   }
 
@@ -12373,8 +12924,8 @@ async function beginCaptureTaskNow(message, sender) {
       throw createCaptureTaskError(
         'unattended_begin_fence_changed',
         rollback
-          ? '无人值守任务状态已经变化，已撤销浏览器接管'
-          : '无人值守任务状态已经变化，未启动浏览器接管',
+          ? '无人值守任务状态已经变化，已撤销采集辅助'
+          : '无人值守任务状态已经变化，未启动采集辅助',
         details,
       );
     }
@@ -12403,7 +12954,7 @@ async function beginCaptureTaskNow(message, sender) {
         );
         throw createCaptureTaskError(
           'unattended_begin_fence_changed',
-          '无人值守任务页面发生了未经确认的切换，未启动浏览器接管',
+          '无人值守任务页面发生了未经确认的切换，未启动采集辅助',
           details,
         );
       }
@@ -12418,7 +12969,7 @@ async function beginCaptureTaskNow(message, sender) {
       ) {
         throw createCaptureTaskError(
           'capture_task_platform_mismatch',
-          '浏览器替换后的任务页面与原任务平台不一致，已拒绝接管',
+          '浏览器替换后的任务页面与原任务平台不一致，已拒绝迁移采集任务',
         );
       }
       sourceTabId = replacementTabId;
@@ -12441,9 +12992,11 @@ async function beginCaptureTaskNow(message, sender) {
     await releaseConfirmedStaleCaptureTaskGroupsForBegin();
   await reconcileUnattendedBeginFence();
 
-  const existingSession =
+  let existingSession =
     captureDebugSessionManager.getSessionByTaskId(taskId);
-  const existingGroup = captureTaskTabGroupManager.getTask(taskId);
+  let existingGroup = captureTaskTabGroupManager.getTask(taskId);
+  let staleAssistWorkerTabIds = [];
+  let staleAssistDegraded = false;
   const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(taskId);
   if (
     (!existingSession && existingGroup) ||
@@ -12455,18 +13008,237 @@ async function beginCaptureTaskNow(message, sender) {
     );
   }
   if (existingSession && existingSession.tabId !== sourceTabId) {
-    throw createCaptureTaskError(
-      'capture_task_source_mismatch',
-      '该采集任务已经绑定到另一个来源 Tab',
+    const staleSession = existingSession;
+    const staleGroup = existingGroup;
+    const staleSourceTabId = resolveCaptureTaskTabId(staleSession.tabId);
+    const staleAttemptId = String(staleSession.attemptId || '').trim();
+    const stalePlatform = normalizePlatformId(
+      staleSession.platform || detectPlatformFromUrl(staleSession.pageUrl || ''),
     );
+    const replacementLease = resolveCaptureTaskReplacementLease(
+      staleSourceTabId,
+      {taskId, attemptId},
+    );
+    const exactReplacementLease = Boolean(
+      replacementLease &&
+        replacementLease.tabId === sourceTabId &&
+        replacementLease.taskId === taskId &&
+        String(replacementLease.attemptId || '').trim() === attemptId,
+    );
+    const exactExecutionLock = Boolean(
+      unattendedBegin?.unattended === true &&
+        boundExecutionLock &&
+        String(boundExecutionLock.owner || '') ===
+          'unattended_keyword_plan' &&
+        String(boundExecutionLock.captureTaskId || '').trim() === taskId &&
+        String(boundExecutionLock.captureTaskAttemptId || '').trim() ===
+          attemptId &&
+        resolveCaptureTaskTabId(boundExecutionLock.holderTabId) === sourceTabId,
+    );
+    const exactGroupOwnership = Boolean(
+      !staleGroup ||
+        (resolveCaptureTaskTabId(staleGroup.sourceTabId) ===
+          staleSourceTabId &&
+          String(staleGroup.attemptId || '').trim() === attemptId &&
+          (staleSession.groupId === null ||
+            staleSession.groupId === undefined ||
+            Number(staleSession.groupId) === Number(staleGroup.groupId))),
+    );
+    const exactStaleAssist = Boolean(
+      staleSourceTabId &&
+        attemptId &&
+        staleAttemptId === attemptId &&
+        stalePlatform !== 'unknown' &&
+        stalePlatform === sourcePlatform &&
+        exactGroupOwnership &&
+        (exactReplacementLease || exactExecutionLock),
+    );
+    if (!exactStaleAssist) {
+      throw createCaptureTaskError(
+        'capture_task_source_mismatch',
+        '该采集任务已经绑定到另一个来源 Tab，且没有同一执行轮次的页面替换凭证',
+      );
+    }
+
+    // The content task is authoritative; Debug and native grouping are only
+    // assistance. If an exact task+attempt replacement reaches BEGIN before the
+    // asynchronous tabs.onReplaced migration settles, close only that old
+    // assist identity and rebuild it as detached on the verified source. Never
+    // make a generic source mismatch optional: a different attempt/platform (or
+    // a source change without an authoritative lock/lease) remains a hard fence.
+    await reconcileUnattendedBeginFence();
+    staleAssistWorkerTabIds = getTrackedCaptureTaskWorkers(
+      taskId,
+      staleSession,
+      staleGroup,
+    );
+    const stoppedStaleSession = await captureDebugSessionManager.stop({
+      tabId: staleSourceTabId,
+      taskId,
+      attemptId,
+      runId: staleSession.runId,
+      reason: 'capture_assist_source_stale',
+      force: false,
+      publishState: false,
+      bestEffort: true,
+    });
+    if (stoppedStaleSession?.released !== true) {
+      throw createCaptureTaskError(
+        'capture_task_source_mismatch',
+        '旧采集辅助已由其他执行轮次替换，未改动当前任务',
+      );
+    }
+    await clearCaptureTaskTraceOverlayFailSoft({
+      taskId,
+      tabId: staleSourceTabId,
+    });
+    existingSession = null;
+
+    await reconcileUnattendedBeginFence();
+    let reboundGroup = staleGroup;
+    let groupOwnershipRetained = Boolean(staleGroup);
+    if (staleGroup) {
+      if (exactReplacementLease) {
+        try {
+          const groupResult = await captureTaskTabGroupManager.replaceTab({
+            removedTabId: staleSourceTabId,
+            addedTabId: sourceTabId,
+          });
+          if (groupResult?.replaced !== true) {
+            throw createCaptureTaskError(
+              'capture_task_replacement_not_rebound',
+              '旧采集标签组未能迁移到已验证的替换页面',
+            );
+          }
+          reboundGroup = groupResult.group;
+        } catch (error) {
+          console.warn(
+            '[CaptureAssist] exact stale group migration degraded:',
+            error?.message || error,
+          );
+          groupOwnershipRetained = false;
+        }
+      } else {
+        // A transferred unattended execution lock proves the new source but
+        // does not prove Chromium removed the old Tab. Release the old native
+        // group instead of silently leaving that still-live Tab grouped.
+        groupOwnershipRetained = false;
+      }
+
+      if (!groupOwnershipRetained) {
+        const latestGroup = captureTaskTabGroupManager.getTask(taskId);
+        const exactLatestGroup = Boolean(
+          latestGroup &&
+            String(latestGroup.attemptId || '').trim() === attemptId &&
+            Number(latestGroup.sourceTabId) === Number(staleGroup.sourceTabId) &&
+            Number(latestGroup.groupId) === Number(staleGroup.groupId),
+        );
+        if (latestGroup && !exactLatestGroup) {
+          throw createCaptureTaskError(
+            'capture_task_source_mismatch',
+            '采集标签组已由其他执行轮次替换，未改动当前任务',
+          );
+        }
+        if (exactLatestGroup) {
+          try {
+            await captureTaskTabGroupManager.end({
+              taskId,
+              attemptId,
+              sourceTabId: staleGroup.sourceTabId,
+              groupId: staleGroup.groupId,
+              reason: 'capture_assist_source_stale',
+            });
+          } catch (error) {
+            console.warn(
+              '[CaptureAssist] exact stale group cleanup remains pending:',
+              error?.message || error,
+            );
+            const pendingCleanupSnapshot = {
+              ...staleGroup,
+              taskId,
+              runId: staleSession.runId,
+              attemptId,
+              platform: stalePlatform,
+              persistent: true,
+              tabId: staleSourceTabId,
+              sourceTabId: staleSourceTabId,
+              workerTabIds: staleAssistWorkerTabIds,
+              state: 'detaching',
+              cleanupPending: true,
+              debugCleanupConfirmed: true,
+              cleanupReason: 'capture_assist_source_stale',
+            };
+            await writeRuntimeState((current) => {
+              const currentSnapshot = current.captureDebugSession;
+              if (
+                currentSnapshot &&
+                !captureRuntimeSnapshotMatches(
+                  currentSnapshot,
+                  pendingCleanupSnapshot,
+                )
+              ) {
+                return {};
+              }
+              return {captureDebugSession: pendingCleanupSnapshot};
+            });
+            throw createCaptureTaskError(
+              'capture_task_begin_cleanup_failed',
+              '旧采集标签组尚未确认释放，请稍后重试',
+              {
+                retryable: true,
+                cleanupError: String(error?.message || error || '').slice(
+                  0,
+                  320,
+                ),
+              },
+            );
+          }
+        }
+        reboundGroup = null;
+        if (staleAssistWorkerTabIds.length > 0) {
+          captureTaskPendingWorkerTabIds.set(
+            taskId,
+            Array.from(new Set(staleAssistWorkerTabIds)),
+          );
+        }
+      }
+    }
+
+    await reconcileUnattendedBeginFence();
+    try {
+      existingSession = await captureDebugSessionManager.restore(
+        {
+          ...staleSession,
+          tabId: sourceTabId,
+          sourceTabId,
+          state: 'detached',
+          pageTitle: sourceTab?.title || staleSession.pageTitle || '',
+          pageUrl: sourceTab?.url || staleSession.pageUrl || '',
+          platform: sourcePlatform,
+          groupId: reboundGroup?.groupId ?? null,
+          workerTabIds: staleAssistWorkerTabIds,
+        },
+        {publishState: true},
+      );
+    } catch (error) {
+      // The exact old assist has already been closed. A fresh optional assist
+      // start below may still succeed; otherwise the caller degrades without
+      // blocking the content-script collection.
+      existingSession = null;
+      console.warn(
+        '[CaptureAssist] exact stale session restore degraded:',
+        error?.message || error,
+      );
+    }
+    existingGroup = captureTaskTabGroupManager.getTask(taskId);
+    staleAssistDegraded = true;
   }
   const activeDebugSession = captureDebugSessionManager
     .getActiveSessions()
     .find(Boolean);
   if (
     activeDebugSession &&
-    (activeDebugSession.state !== 'attached' ||
-      !activeDebugSession.persistent ||
+    (!activeDebugSession.persistent ||
       activeDebugSession.taskId !== taskId ||
       activeDebugSession.tabId !== sourceTabId)
   ) {
@@ -12543,12 +13315,21 @@ async function beginCaptureTaskNow(message, sender) {
     }
   }
   await reconcileUnattendedBeginFence();
+  const beginRunId =
+    String(request.runId || '').trim() ||
+    existingSession?.runId ||
+    `capture-task:${taskId}`;
+  // A repeated/idempotent BEGIN may arrive after its first response was lost.
+  // Only resources first created by this invocation may be rolled back.
+  const preBeginSession = existingSession;
+  const preBeginGroup = existingGroup;
   let group = null;
   let session = null;
 
   try {
     group = await captureTaskTabGroupManager.begin({
       taskId,
+      attemptId,
       sourceTabId,
       title: CAPTURE_TASK_GROUP_TITLE,
     });
@@ -12583,10 +13364,7 @@ async function beginCaptureTaskNow(message, sender) {
     try {
       session = await captureDebugSessionManager.start({
         tabId: sourceTabId,
-        runId:
-          String(request.runId || '').trim() ||
-          existingSession?.runId ||
-          `capture-task:${taskId}`,
+        runId: beginRunId,
         label: String(request.label || '').trim() || '采集任务',
         pageTitle: sourceTab?.title || '',
         pageUrl: sourceTab?.url || '',
@@ -12595,7 +13373,8 @@ async function beginCaptureTaskNow(message, sender) {
         taskId,
         attemptId: request.attemptId,
         progress: request.progress ?? null,
-        workerTabIds: existingSession?.workerTabIds || [],
+        workerTabIds:
+          existingSession?.workerTabIds || staleAssistWorkerTabIds,
         groupId: group.groupId,
         originalGroupId: group.originalGroupId,
         minimized: Boolean(request.minimized),
@@ -12628,24 +13407,247 @@ async function beginCaptureTaskNow(message, sender) {
     }
     await writeRuntimeState({captureTaskCancellation: null});
     await reconcileUnattendedBeginFence({rollback: true});
-    return {taskId, session, group, debugOwnership};
+    const reusedDetachedAssist = session?.state === 'detached';
+    return {
+      taskId,
+      session,
+      group,
+      debugOwnership,
+      ...(staleAssistDegraded || reusedDetachedAssist
+        ? {
+            assistDegraded: true,
+            assistReason: staleAssistDegraded
+              ? 'capture_assist_source_stale'
+              : 'capture_assist_detached',
+          }
+        : {}),
+    };
   } catch (error) {
-    if (session || group || existingSession || existingGroup) {
+    const currentDebugSnapshot =
+      captureDebugSessionManager.getSessionByTaskId(taskId);
+    const currentGroupSnapshot = captureTaskTabGroupManager.getTask(taskId);
+    const rollbackDebugSnapshot =
+      !preBeginSession &&
+      currentDebugSnapshot &&
+      String(currentDebugSnapshot.taskId || '').trim() === taskId &&
+      String(currentDebugSnapshot.runId || '').trim() === beginRunId &&
+      String(currentDebugSnapshot.attemptId || '').trim() === attemptId &&
+      resolveCaptureTaskTabId(
+        currentDebugSnapshot.sourceTabId,
+        currentDebugSnapshot.tabId,
+      ) === sourceTabId
+        ? currentDebugSnapshot
+        : null;
+    const rollbackGroupSnapshot =
+      !preBeginGroup &&
+      currentGroupSnapshot &&
+      String(currentGroupSnapshot.taskId || '').trim() === taskId &&
+      String(currentGroupSnapshot.attemptId || '').trim() === attemptId &&
+      resolveCaptureTaskTabId(currentGroupSnapshot.sourceTabId) === sourceTabId
+        ? currentGroupSnapshot
+        : null;
+    if (rollbackDebugSnapshot || rollbackGroupSnapshot) {
       try {
-        await releaseCaptureTaskResourcesWithRetry(
-          {
-            taskId,
-            reason: 'capture_task_begin_rollback',
-            debugSnapshot: session || existingSession,
-          },
-          {attempts: 3},
-        );
+        let exactCleanupError = null;
+        for (let cleanupAttempt = 0; cleanupAttempt < 3; cleanupAttempt += 1) {
+          try {
+            if (rollbackDebugSnapshot) {
+              const debugResult = await captureDebugSessionManager.stop({
+                tabId: rollbackDebugSnapshot.tabId,
+                taskId,
+                attemptId,
+                runId: beginRunId,
+                reason: 'capture_task_begin_rollback',
+                force: false,
+              });
+              if (
+                debugResult?.released !== true &&
+                debugResult?.reason !== 'not_attached'
+              ) {
+                throw createCaptureTaskError(
+                  'capture_task_begin_debug_cleanup_mismatch',
+                  '采集辅助初始化资源已由其他执行轮次替换',
+                );
+              }
+            }
+            if (rollbackGroupSnapshot) {
+              const latestGroup = captureTaskTabGroupManager.getTask(taskId);
+              const exactGroup = Boolean(
+                latestGroup &&
+                  String(latestGroup.attemptId || '').trim() === attemptId &&
+                  resolveCaptureTaskTabId(latestGroup.sourceTabId) ===
+                    sourceTabId &&
+                  Number(latestGroup.groupId) ===
+                    Number(rollbackGroupSnapshot.groupId),
+              );
+              if (!exactGroup) {
+                throw createCaptureTaskError(
+                  'capture_task_begin_group_cleanup_mismatch',
+                  '采集标签组已由其他执行轮次替换',
+                );
+              }
+              const rollbackWorkerTabIds = getTrackedCaptureTaskWorkers(
+                taskId,
+                rollbackDebugSnapshot,
+                latestGroup,
+              );
+              if (rollbackWorkerTabIds.length > 0) {
+                await closeTrackedCaptureTaskWorkerTabs(
+                  taskId,
+                  rollbackWorkerTabIds,
+                );
+              }
+              const groupResult = await captureTaskTabGroupManager.end({
+                taskId,
+                attemptId,
+                sourceTabId,
+                groupId: rollbackGroupSnapshot.groupId,
+                reason: 'capture_task_begin_rollback',
+              });
+              if (
+                groupResult?.released !== true &&
+                groupResult?.reason !== 'not_grouped'
+              ) {
+                throw createCaptureTaskError(
+                  'capture_task_begin_group_cleanup_mismatch',
+                  '采集标签组已由其他执行轮次替换',
+                );
+              }
+            }
+            exactCleanupError = null;
+            break;
+          } catch (candidate) {
+            exactCleanupError = candidate;
+            if (cleanupAttempt + 1 < 3) {
+              await new Promise((resolve) => setTimeout(resolve, 250));
+            }
+          }
+        }
+        if (exactCleanupError) throw exactCleanupError;
       } catch (cleanupError) {
-        console.warn(
-          '[CaptureTask] begin rollback remains pending:',
-          cleanupError,
-        );
+        const latestDebugSnapshot =
+          captureDebugSessionManager.getSessionByTaskId(taskId);
+        const latestGroupSnapshot = captureTaskTabGroupManager.getTask(taskId);
+        const pendingDebugSnapshot =
+          rollbackDebugSnapshot &&
+          latestDebugSnapshot &&
+          String(latestDebugSnapshot.runId || '').trim() === beginRunId &&
+          String(latestDebugSnapshot.attemptId || '').trim() === attemptId &&
+          resolveCaptureTaskTabId(
+            latestDebugSnapshot.sourceTabId,
+            latestDebugSnapshot.tabId,
+          ) === sourceTabId
+            ? latestDebugSnapshot
+            : null;
+        const pendingGroupSnapshot =
+          rollbackGroupSnapshot &&
+          latestGroupSnapshot &&
+          String(latestGroupSnapshot.attemptId || '').trim() === attemptId &&
+          resolveCaptureTaskTabId(latestGroupSnapshot.sourceTabId) ===
+            sourceTabId &&
+          Number(latestGroupSnapshot.groupId) ===
+            Number(rollbackGroupSnapshot.groupId)
+            ? latestGroupSnapshot
+            : null;
+        const pendingWorkerTabIds =
+          pendingDebugSnapshot || pendingGroupSnapshot
+            ? getTrackedCaptureTaskWorkers(
+                taskId,
+                pendingDebugSnapshot,
+                pendingGroupSnapshot,
+              )
+            : [];
+        if (
+          pendingDebugSnapshot ||
+          pendingGroupSnapshot ||
+          pendingWorkerTabIds.length > 0
+        ) {
+          const pendingCleanupSnapshot = {
+            ...(pendingGroupSnapshot || {}),
+            ...(pendingDebugSnapshot || {}),
+            taskId,
+            runId:
+              String(
+                pendingDebugSnapshot?.runId || request.runId || '',
+              ).trim() || `capture-task:${taskId}`,
+            attemptId: String(
+              pendingDebugSnapshot?.attemptId || attemptId || '',
+            ).trim(),
+            platform: sourcePlatform,
+            persistent: true,
+            tabId:
+              resolveCaptureTaskTabId(
+                pendingDebugSnapshot?.tabId,
+                pendingGroupSnapshot?.sourceTabId,
+                sourceTabId,
+              ) || null,
+            sourceTabId:
+              resolveCaptureTaskTabId(
+                pendingDebugSnapshot?.sourceTabId,
+                pendingDebugSnapshot?.tabId,
+                pendingGroupSnapshot?.sourceTabId,
+                sourceTabId,
+              ) || null,
+            workerTabIds: pendingWorkerTabIds,
+            state: 'detaching',
+            cleanupPending: true,
+            cleanupReason: 'capture_task_begin_rollback',
+          };
+          await writeRuntimeState((current) => {
+            const currentSnapshot = current.captureDebugSession;
+            if (
+              currentSnapshot &&
+              !captureRuntimeSnapshotMatches(
+                currentSnapshot,
+                pendingCleanupSnapshot,
+              )
+            ) {
+              return {};
+            }
+            return {captureDebugSession: pendingCleanupSnapshot};
+          }).catch((persistError) => {
+            console.warn(
+              '[CaptureTask] failed to persist begin cleanup ownership:',
+              persistError,
+            );
+          });
+          throw createCaptureTaskError(
+            'capture_task_begin_cleanup_failed',
+            '采集辅助初始化失败，且任务资源仍在清理中',
+            {
+              retryable: true,
+              assistFailureCode: String(
+                error?.assistFailureCode || error?.code || '',
+              ).trim(),
+              cleanupError: String(
+                cleanupError?.message || cleanupError || '',
+              ).slice(0, 320),
+            },
+          );
+        }
+        // A newer exact attempt won the ownership race. Do not persist or
+        // clean its resources on behalf of this failed BEGIN.
       }
+    }
+    const recoveredAssistFailureCode = String(
+      error?.assistFailureCode || '',
+    ).trim();
+    if (
+      new Set([
+        'debug_session_start_cleanup_failed',
+        'capture_task_group_cleanup_failed',
+      ]).has(String(error?.code || '')) &&
+      new Set([
+        'capture_task_group_create_failed',
+        'debug_session_command_failed',
+        'debug_session_detached_during_start',
+      ]).has(recoveredAssistFailureCode)
+    ) {
+      throw createCaptureTaskError(
+        recoveredAssistFailureCode,
+        String(error?.setupError?.message || '采集辅助初始化失败'),
+        {cleanupConfirmed: true},
+      );
     }
     throw error;
   }
@@ -12676,13 +13678,17 @@ async function updateCaptureTask(message) {
     session?.sourceTabId,
     session?.tabId,
   );
-  if (sourceTabId && Object.prototype.hasOwnProperty.call(update, 'progress')) {
+  if (
+    sourceTabId &&
+    session?.state === 'attached' &&
+    Object.prototype.hasOwnProperty.call(update, 'progress')
+  ) {
     chrome.tabs
       .sendMessage(sourceTabId, {
         action: 'setCaptureTaskTakeover',
         taskId,
         active: true,
-        label: String(session?.label || 'AI 正在接管'),
+        label: String(session?.label || '采集辅助运行中'),
         progress: session?.progress || update.progress || {},
       })
       .catch((error) => {
@@ -12852,7 +13858,7 @@ async function clearCaptureTaskTraceOverlayFailSoft({
       taskId: String(taskId || '').trim(),
       active: false,
       clearTrace: true,
-      label: 'AI 正在接管',
+      label: '采集辅助运行中',
     });
     return response?.ok !== false;
   } catch (error) {
@@ -12881,7 +13887,7 @@ async function publishCaptureTaskCancellation(taskId, reason) {
       message:
         cancellation.reason === 'sidebar_owner_disconnected'
           ? '控制面板已关闭，采集任务已安全停止'
-          : '浏览器 Debug 接管已取消，整项采集正在停止',
+          : '浏览器采集辅助已取消，整项采集正在停止',
       captureTaskId: cancellation.taskId,
       updatedAt: cancellation.requestedAt,
     },
@@ -13088,15 +14094,6 @@ async function releaseStableUnattendedCaptureTaskResourcesOnly(
   }
   captureTaskOwnerCoordinator?.clearTask(taskId);
   return {released: true, taskId, reason: 'already_absent'};
-}
-
-function isExplicitCaptureTaskStopReason(reason = '') {
-  return new Set([
-    'canceled_by_user',
-    'user_cancel_requested',
-    'unattended_cancel_requested',
-    'manual_cancel_requested',
-  ]).has(String(reason || '').trim().toLowerCase());
 }
 
 async function readUnattendedParentForCaptureTask(taskId = '') {
@@ -13331,7 +14328,7 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
     await terminalizeCaptureTaskLedgerRun(taskId, {
       reason: 'unattended_attempt_replaced',
       status: 'canceled',
-      message: '无人值守运行页已迁移，旧浏览器接管会话已释放',
+      message: '无人值守运行页已迁移，旧采集辅助会话已释放',
     });
   }
   return {released: true, taskId};
@@ -13413,7 +14410,7 @@ async function assertUnattendedBeginCleanupFence({
     if (!holderSnapshotMatches || !requestSnapshotMatches) {
       throw createCaptureTaskError(
         'unattended_runner_mismatch',
-        '无人值守运行页凭证已更换，已忽略旧页面的浏览器接管请求',
+        '无人值守运行页凭证已更换，已忽略旧页面的采集辅助请求',
       );
     }
     return {lock, request};
@@ -13460,14 +14457,14 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
   if (attemptFence.unattended && !attemptFence.current) {
     throw createCaptureTaskError(
       'stale_unattended_attempt',
-      '旧无人值守运行页已失效，已忽略其浏览器接管请求',
+      '旧无人值守运行页已失效，已忽略其采集辅助请求',
     );
   }
   if (!authorizedRunner) {
     if (normalizedTaskId === stableTaskId) {
       throw createCaptureTaskError(
         'unattended_runner_mismatch',
-        '无人值守运行页凭证已更换，已忽略旧页面的浏览器接管请求',
+        '无人值守运行页凭证已更换，已忽略旧页面的采集辅助请求',
       );
     }
     return {unattended: false, reclaimed: false};
@@ -13493,6 +14490,12 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
       resolveCaptureTaskTabId(previousGroup.sourceTabId) !==
         normalizedSourceTabId,
   );
+  const attemptChanged = Boolean(
+    previousSession &&
+      recoveryTaskId === normalizedTaskId &&
+      String(previousSession.attemptId || '').trim() !==
+        String(attemptId || '').trim(),
+  );
   const residualCleanupPending = Boolean(
     recoveryTaskId === normalizedTaskId &&
       // getTrackedCaptureTaskWorkers() without snapshots only exposes worker
@@ -13506,6 +14509,7 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
     (recoveryTaskId !== normalizedTaskId ||
       sourceChanged ||
       groupSourceChanged ||
+      attemptChanged ||
       residualCleanupPending)
   ) {
     const cleanupFence = await assertUnattendedBeginCleanupFence({
@@ -13518,6 +14522,10 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
       {
         reason: 'unattended_runner_rebound',
         request: cleanupFence.request,
+        // The caller already proved the new attempt owns this stable lock.
+        // Releasing the old attempt's browser resources must not erase the
+        // replacement attempt binding while BEGIN continues.
+        preserveLockBinding: true,
       },
     );
   }
@@ -13529,6 +14537,15 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
 }
 
 async function endCaptureTask(message) {
+  // BEGIN and END share one lifecycle queue. In particular, a replacement
+  // attempt cannot create new Debug/group ownership after an older END has
+  // passed its attempt fence but before that END finishes its final cleanup.
+  return await runCaptureTaskLifecycleOperation(
+    () => performEndCaptureTask(message),
+  );
+}
+
+async function performEndCaptureTask(message) {
   const request = getCaptureTaskRequest(message);
   const taskId = requireCaptureTaskId(request);
   const attemptFence = await inspectUnattendedCaptureTaskAttempt({
@@ -13629,67 +14646,30 @@ async function endCaptureTask(message) {
 async function handleUnexpectedCaptureDebugDetach({session, reason} = {}) {
   if (!session) return;
   if (!session.persistent || !session.taskId) {
-    await relayCaptureTaskCancellation(session, reason);
-    return;
-  }
-
-  const stableUnattended = await inspectStableUnattendedCaptureTask(
-    session.taskId,
-  );
-  if (stableUnattended.active) {
-    const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
-      taskId: session.taskId,
-      reason:
-        String(reason || '').trim() === 'target_closed'
-          ? 'debug_target_closed'
-          : 'runner_owner_disconnected',
-    });
-    if (unattendedRecovery.handled) return;
-  }
-  if (stableUnattended.unattended) {
-    // The request root is the only public unattended task. Once that root is
-    // terminal (or a later request has replaced it), a delayed Debug detach
-    // may only release browser resources; it must never create a second
-    // unattended-capture:<id> task-center record.
-    await releaseStableUnattendedCaptureTaskResourcesOnly(stableUnattended, {
-      reason: 'debugger_detached',
-      debugSnapshot: session,
-    });
-    return;
-  }
-
-  if (!isExplicitCaptureTaskStopReason(reason)) {
-    const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
-      taskId: session.taskId,
-      reason:
-        String(reason || '').trim() === 'target_closed'
-          ? 'debug_target_closed'
-          : 'runner_owner_disconnected',
-    });
-    if (unattendedRecovery.handled) return;
-  }
-
-  await publishCaptureTaskCancellation(session.taskId, 'native_debug_canceled');
-  await terminalizeCaptureTaskLedgerRun(session.taskId, {
-    reason: 'native_debug_canceled',
-    message: '浏览器 Debug 接管已取消，采集任务已停止',
-  });
-  await relayCaptureTaskCancellation(session, reason);
-  try {
-    await releaseCaptureTaskResourcesWithRetry(
-      {
-        taskId: session.taskId,
-        reason: 'debugger_detached',
-        debugSnapshot: session,
-      },
-      {attempts: 3},
-    );
-  } catch (error) {
+    // Legacy transient assist sessions are observational as well. Losing
+    // chrome.debugger must never manufacture a user cancellation for the
+    // content-script collection already in progress.
     console.warn(
-      '[CaptureDebugSession] failed to finish externally canceled task:',
-      error,
+      '[CaptureAssist] transient assist detached; page capture continues',
+      {
+        tabId: resolveCaptureTaskTabId(session.tabId),
+        reason: String(reason || '').trim() || 'debugger_detached',
+      },
     );
+    return;
   }
+  // Debug/DevTools is only a capture assist. Losing it must not cancel,
+  // recover, reassign, or terminalize the authoritative content-script task.
+  // The execution lock and task attempt fence remain active independently.
+  await clearCaptureTaskTraceOverlayFailSoft({
+    tabId: session.tabId,
+    taskId: session.taskId,
+  });
+  console.warn('[CaptureAssist] detached; page capture continues', {
+    taskId: session.taskId,
+    tabId: session.tabId,
+    reason: String(reason || '').trim() || 'debugger_detached',
+  });
 }
 
 async function handleAbandonedCaptureTask({taskId} = {}) {
@@ -13855,9 +14835,37 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
         ? 'worker'
         : previousDebugSession?.persistent
           ? 'source'
-          : '';
+          : pendingBegin
+            ? 'source'
+            : '';
 
   if (!taskId) {
+    const unattendedRequest = await readUnattendedKeywordRunRequest();
+    const replacesUnattendedRunner = Boolean(
+      unattendedRequest &&
+        !isTerminalUnattendedRunStatus(unattendedRequest.status) &&
+        Number(unattendedRequest.runnerTabId) === normalizedRemovedTabId,
+    );
+    if (!replacesUnattendedRunner) return false;
+    const expectedPlatform = normalizePlatformId(
+      unattendedRequest?.planSnapshot?.platform || unattendedRequest?.platform,
+    );
+    let replacementTab;
+    try {
+      replacementTab = await waitForTabReady(normalizedAddedTabId, {
+        timeoutMs: 10000,
+        pollMs: 100,
+      });
+    } catch {
+      return false;
+    }
+    if (
+      expectedPlatform === 'unknown' ||
+      String(replacementTab?.status || '').trim().toLowerCase() !== 'complete' ||
+      detectPlatformFromUrl(replacementTab?.url || '') !== expectedPlatform
+    ) {
+      return false;
+    }
     await Promise.all([
       replaceCaptureExecutionLockTabId(
         normalizedRemovedTabId,
@@ -13871,84 +14879,8 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
     return false;
   }
 
-  rememberCaptureTaskReplacementTab({
-    removedTabId: normalizedRemovedTabId,
-    addedTabId: normalizedAddedTabId,
-    taskId,
-    attemptId,
-  });
-  if (pendingBegin) {
-    pendingBegin.sourceTabId = normalizedAddedTabId;
-  }
-  if (pendingBegin && !previousDebugSession && !previousGroup) {
-    await Promise.all([
-      replaceCaptureExecutionLockTabId(
-        normalizedRemovedTabId,
-        normalizedAddedTabId,
-      ),
-      replaceUnattendedRunnerTabId(
-        normalizedRemovedTabId,
-        normalizedAddedTabId,
-      ),
-    ]);
-    return true;
-  }
-
-  let replacementTab = null;
-  try {
-    replacementTab = await chrome.tabs.get(normalizedAddedTabId);
-    const groupResult = await captureTaskTabGroupManager.replaceTab({
-      removedTabId: normalizedRemovedTabId,
-      addedTabId: normalizedAddedTabId,
-    });
-    const debugResult = await captureDebugSessionManager.replaceTab({
-      removedTabId: normalizedRemovedTabId,
-      addedTabId: normalizedAddedTabId,
-      pageTitle: replacementTab?.title || '',
-      pageUrl: replacementTab?.url || '',
-    });
-    const debugBindingCanFinishInBegin = Boolean(
-      pendingBegin &&
-        replacementRole === 'source' &&
-        !previousDebugSession,
-    );
-    if (
-      groupResult?.replaced !== true ||
-      (replacementRole &&
-        debugResult?.replaced !== true &&
-        !debugBindingCanFinishInBegin)
-    ) {
-      throw createCaptureTaskError(
-        'capture_task_replacement_not_rebound',
-        '浏览器替换了采集页面，但任务未能重新绑定',
-      );
-    }
-    if (groupResult?.role === 'worker' || debugResult?.role === 'worker') {
-      replaceTrackedCaptureTaskWorkerTab(
-        taskId,
-        normalizedRemovedTabId,
-        normalizedAddedTabId,
-      );
-    }
-    await Promise.all([
-      replaceCaptureExecutionLockTabId(
-        normalizedRemovedTabId,
-        normalizedAddedTabId,
-      ),
-      replaceUnattendedRunnerTabId(
-        normalizedRemovedTabId,
-        normalizedAddedTabId,
-      ),
-    ]);
-    rememberCaptureTaskReplacementTab({
-      removedTabId: normalizedRemovedTabId,
-      addedTabId: normalizedAddedTabId,
-      taskId,
-      attemptId,
-    });
-    return true;
-  } catch (error) {
-    const message = `浏览器替换采集页面后接管迁移失败：${String(
+  const failAuthoritativeReplacement = async (error) => {
+    const message = `浏览器替换采集页面后任务迁移失败：${String(
       error?.message || error || '未知错误',
     )}`;
     const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
@@ -13989,7 +14921,260 @@ async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
       );
     }
     return false;
+  };
+
+  let replacementTab = null;
+  try {
+    replacementTab = await chrome.tabs.get(normalizedAddedTabId);
+    if (
+      replacementRole === 'source' &&
+      String(replacementTab?.status || '').trim().toLowerCase() &&
+      String(replacementTab?.status || '').trim().toLowerCase() !== 'complete'
+    ) {
+      replacementTab = await waitForTabReady(normalizedAddedTabId, {
+        timeoutMs: 10000,
+        pollMs: 100,
+      });
+    }
+  } catch (error) {
+    // Unlike Debug and native grouping, a missing replacement page means the
+    // content-script execution target itself is gone. Keep the existing
+    // unattended/manual recovery semantics for that authoritative failure.
+    return await failAuthoritativeReplacement(error);
   }
+  if (replacementRole === 'source') {
+    const explicitExpectedPlatform = normalizePlatformId(
+      previousDebugSession?.platform || pendingBegin?.platform,
+    );
+    const pageExpectedPlatform = detectPlatformFromUrl(
+      previousDebugSession?.pageUrl || '',
+    );
+    const expectedPlatform =
+      explicitExpectedPlatform !== 'unknown'
+        ? explicitExpectedPlatform
+        : pageExpectedPlatform;
+    const replacementPlatform = detectPlatformFromUrl(
+      replacementTab?.url || '',
+    );
+    const replacementPageSettled =
+      String(replacementTab?.status || '').trim().toLowerCase() ===
+      'complete';
+    if (
+      expectedPlatform === 'unknown' ||
+      !replacementPageSettled ||
+      replacementPlatform !== expectedPlatform
+    ) {
+      return await failAuthoritativeReplacement(
+        createCaptureTaskError(
+          !replacementPageSettled
+            ? 'capture_task_replacement_unsettled'
+            : replacementPlatform === 'unknown'
+            ? 'capture_task_platform_unsupported'
+            : 'capture_task_platform_mismatch',
+          !replacementPageSettled
+            ? '浏览器替换后的来源页面尚未稳定，未迁移采集任务'
+            : replacementPlatform === 'unknown'
+            ? '浏览器替换后的来源页面已离开支持的平台'
+            : '浏览器替换后的来源页面与原任务平台不一致',
+        ),
+      );
+    }
+  }
+
+  if (pendingBegin) {
+    rememberCaptureTaskReplacementTab({
+      removedTabId: normalizedRemovedTabId,
+      addedTabId: normalizedAddedTabId,
+      taskId,
+      attemptId,
+    });
+    pendingBegin.sourceTabId = normalizedAddedTabId;
+  }
+  if (pendingBegin && !previousDebugSession && !previousGroup) {
+    try {
+      await Promise.all([
+        replaceCaptureExecutionLockTabId(
+          normalizedRemovedTabId,
+          normalizedAddedTabId,
+        ),
+        replaceUnattendedRunnerTabId(
+          normalizedRemovedTabId,
+          normalizedAddedTabId,
+        ),
+      ]);
+    } catch (error) {
+      return await failAuthoritativeReplacement(error);
+    }
+    return true;
+  }
+
+  let groupResult = null;
+  let groupMigrationError = null;
+  if (previousGroup) {
+    try {
+      groupResult = await captureTaskTabGroupManager.replaceTab({
+        removedTabId: normalizedRemovedTabId,
+        addedTabId: normalizedAddedTabId,
+      });
+      if (groupResult?.replaced !== true) {
+        throw createCaptureTaskError(
+          'capture_task_replacement_not_rebound',
+          '浏览器替换了采集页面，但任务标签组未能重新绑定',
+        );
+      }
+    } catch (error) {
+      groupMigrationError = error;
+    }
+  }
+
+  let debugResult = null;
+  let debugMigrationError = null;
+  let debugAssistDegraded =
+    String(previousDebugSession?.state || '').trim().toLowerCase() ===
+    'detached';
+  if (previousDebugSession && !debugAssistDegraded) {
+    try {
+      debugResult = await captureDebugSessionManager.replaceTab({
+        removedTabId: normalizedRemovedTabId,
+        addedTabId: normalizedAddedTabId,
+        pageTitle: replacementTab?.title || '',
+        pageUrl: replacementTab?.url || '',
+      });
+      if (debugResult?.replaced !== true) {
+        throw createCaptureTaskError(
+          'capture_task_replacement_not_rebound',
+          '浏览器替换了采集页面，但采集辅助未能重新绑定',
+        );
+      }
+    } catch (error) {
+      debugMigrationError = error;
+      debugAssistDegraded = true;
+    }
+  }
+
+  const replacementWorkerTabIds = getTrackedCaptureTaskWorkers(
+    taskId,
+    previousDebugSession,
+    previousGroup,
+  ).map((tabId) =>
+    Number(tabId) === normalizedRemovedTabId
+      ? normalizedAddedTabId
+      : Number(tabId),
+  );
+
+  if (groupMigrationError) {
+    // Native grouping is organizational UI only. Forget the stale native
+    // binding but retain every worker id for explicit END cleanup.
+    const forgottenGroup =
+      captureTaskTabGroupManager.forget(taskId)?.group || previousGroup;
+    if (replacementWorkerTabIds.length > 0) {
+      captureTaskPendingWorkerTabIds.set(
+        taskId,
+        Array.from(new Set(replacementWorkerTabIds)),
+      );
+    }
+    if (
+      replacementRole === 'source' &&
+      forgottenGroup?.originalGroupId !== null &&
+      forgottenGroup?.originalGroupId !== undefined &&
+      Number.isSafeInteger(Number(forgottenGroup?.originalGroupId)) &&
+      Number(forgottenGroup.originalGroupId) >= 0
+    ) {
+      await chrome.tabs
+        .group({
+          groupId: Number(forgottenGroup.originalGroupId),
+          tabIds: [normalizedAddedTabId],
+        })
+        .catch(() =>
+          chrome.tabs.ungroup([normalizedAddedTabId]).catch(() => null),
+        );
+    } else {
+      await chrome.tabs.ungroup([normalizedAddedTabId]).catch(() => null);
+    }
+  }
+
+  if (previousDebugSession && debugAssistDegraded) {
+    try {
+      debugResult = await captureDebugSessionManager.degradeTabReplacement({
+        removedTabId: normalizedRemovedTabId,
+        addedTabId: normalizedAddedTabId,
+        pageTitle: replacementTab?.title || '',
+        pageUrl: replacementTab?.url || '',
+        groupId: groupMigrationError
+          ? null
+          : groupResult?.group?.groupId,
+      });
+    } catch (error) {
+      console.warn(
+        '[CaptureAssist] failed to persist replacement degradation; page capture continues:',
+        error?.message || error,
+      );
+    }
+  } else if (groupMigrationError && previousDebugSession) {
+    await captureDebugSessionManager
+      .updateTask({
+        taskId,
+        groupId: null,
+        workerTabIds: replacementWorkerTabIds,
+      })
+      .catch((error) => {
+        console.warn(
+          '[CaptureAssist] failed to record native-group degradation:',
+          error?.message || error,
+        );
+      });
+  }
+
+  if (
+    replacementRole === 'worker' ||
+    groupResult?.role === 'worker' ||
+    debugResult?.role === 'worker'
+  ) {
+    replaceTrackedCaptureTaskWorkerTab(
+      taskId,
+      normalizedRemovedTabId,
+      normalizedAddedTabId,
+    );
+  }
+
+  try {
+    await Promise.all([
+      replaceCaptureExecutionLockTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+      replaceUnattendedRunnerTabId(
+        normalizedRemovedTabId,
+        normalizedAddedTabId,
+      ),
+    ]);
+  } catch (error) {
+    return await failAuthoritativeReplacement(error);
+  }
+
+  rememberCaptureTaskReplacementTab({
+    removedTabId: normalizedRemovedTabId,
+    addedTabId: normalizedAddedTabId,
+    taskId,
+    attemptId,
+  });
+
+  if (debugAssistDegraded && replacementRole === 'source') {
+    await clearCaptureTaskTraceOverlayFailSoft({
+      taskId,
+      tabId: normalizedAddedTabId,
+    });
+  }
+  if (groupMigrationError || debugMigrationError) {
+    console.warn('[CaptureAssist] replacement migration degraded; page capture continues', {
+      taskId,
+      removedTabId: normalizedRemovedTabId,
+      addedTabId: normalizedAddedTabId,
+      groupError: groupMigrationError?.message || '',
+      debugError: debugMigrationError?.message || '',
+    });
+  }
+  return true;
 }
 
 async function handleCaptureRuntimeTabRemoved(tabId) {
@@ -14892,7 +16077,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (!supportedListPlatform) {
             throw createCaptureTaskError(
               'capture_task_platform_unsupported',
-              '任务来源页已离开小红书或抖音，已拒绝继续浏览器接管',
+              '任务来源页已离开小红书或抖音，已拒绝继续采集辅助',
             );
           }
           if (
@@ -14901,7 +16086,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ) {
             throw createCaptureTaskError(
               'capture_task_platform_mismatch',
-              '任务来源页平台已变化，已拒绝继续浏览器接管',
+              '任务来源页平台已变化，已拒绝继续采集辅助',
             );
           }
           persistentRelayTaskId = String(
@@ -14913,14 +16098,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ) {
             throw createCaptureTaskError(
               'capture_task_relay_mismatch',
-              '列表采集子运行与当前浏览器接管任务不一致',
+              '列表采集子运行与当前采集辅助任务不一致',
             );
           }
         }
         const debugEligible =
           supportedListPlatform && isListCaptureAction;
-        let debugSession = null;
-        let debugSessionStartedByRelay = false;
         let relayPayload = sourcePayload;
         if (debugEligible) {
           const listRunId =
@@ -14935,27 +16118,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 '列表子运行编号不能复用任务编号',
               );
             }
-            debugSession = await captureDebugSessionManager.updateTask({
+            await captureDebugSessionManager.updateTask({
               taskId: existingDebugSession.taskId,
               activeListRunId: listRunId,
             });
-          } else {
-            const label =
-              contentAction === 'captureKeywordNotes'
-                ? sourcePayload.keyword
-                  ? `搜索「${String(sourcePayload.keyword).slice(0, 48)}」`
-                  : '搜索结果采集'
-                : '博主作品采集';
-            debugSession = await captureDebugSessionManager.start({
-              tabId: relayTabId,
-              runId: listRunId,
-              label,
-              pageTitle: relayTab?.title || '',
-              pageUrl: relayTab?.url || '',
-              platform,
-            });
-            debugSessionStartedByRelay = !existingDebugSession;
           }
+          // List collection is authoritative and must never depend on a
+          // transient chrome.debugger attachment. A persistent assist session,
+          // when present, receives child-run metadata above; otherwise the
+          // content script runs on its own.
           relayPayload = {
             ...sourcePayload,
             listCaptureRunId: listRunId,
@@ -14970,13 +16141,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           relayError = error;
           throw error;
         } finally {
-          if (debugSession && debugSessionStartedByRelay) {
-            await captureDebugSessionManager.stop({
-              tabId: relayTabId,
-              runId: debugSession.runId,
-              reason: 'capture_relay_finished',
-            });
-          }
           try {
             await recordSocialAccountUsageFromRelay({
               tab: relayTab,

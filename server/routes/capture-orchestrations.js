@@ -6388,7 +6388,10 @@ router.get(
             ca.last_full_heartbeat_at AS agent_last_full_heartbeat_at,
             command.id AS command_id,
             command.status AS command_status,
-            command.expires_at AS command_expires_at
+            command.expires_at AS command_expires_at,
+            blocking_command.id AS blocking_command_id,
+            blocking_command.status AS blocking_command_status,
+            blocking_command.command_type AS blocking_command_type
           FROM capture_tasks child
           LEFT JOIN capture_agents ca
             ON ca.id = child.assigned_agent_id
@@ -6402,6 +6405,19 @@ router.get(
             ORDER BY c.created_at DESC, c.id DESC
             LIMIT 1
           ) command ON true
+          LEFT JOIN LATERAL (
+            SELECT c.id, c.status, c.command_type
+            FROM capture_agent_commands c
+            WHERE c.task_id = child.id
+              AND c.tenant_id = child.tenant_id
+              AND c.status IN ('pending', 'acknowledged')
+              AND (c.expires_at IS NULL OR c.expires_at > now())
+            ORDER BY
+              CASE WHEN c.status = 'acknowledged' THEN 0 ELSE 1 END,
+              c.created_at DESC,
+              c.id DESC
+            LIMIT 1
+          ) blocking_command ON true
           WHERE child.tenant_id = $1
             AND child.parent_task_id = $2
           ORDER BY child.created_at, child.id
