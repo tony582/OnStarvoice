@@ -2255,7 +2255,7 @@ test("unattended detail interruption only stops the whole plan for explicit term
 test("streaming sync waits for a safe terminal decision before queuing failed details", () => {
   const router = readFunctionSection(
     "function routeDetailItemToStreamingSync(",
-    "function formatStreamingSyncSummary(",
+    "function appendStreamingSyncSummary(",
   );
   const batch = readFunctionSection(
     "async function handleBatchKeywordCapture(options = {})",
@@ -2295,7 +2295,7 @@ test("streaming sync waits for a safe terminal decision before queuing failed de
 test("keyword settlement classifies saved records before the unattended ownership fence", () => {
   const settlement = readFunctionSection(
     "function settleKeywordRecordsForStreamingSync(",
-    "function formatStreamingSyncSummary(",
+    "function appendStreamingSyncSummary(",
   );
   const batch = readFunctionSection(
     "async function handleBatchKeywordCapture(options = {})",

@@ -59,6 +59,13 @@ import {
 } from "../utils/capture-settings.js";
 import {createRecordSyncQueue} from "../utils/record-sync-queue.js";
 import {
+  isStreamingSyncReconciliationRequired,
+  formatStreamingSyncSummary,
+  buildStreamingSyncTaskIssue,
+  buildStreamingSyncTaskMetadata,
+  buildStreamingSyncCompletionNotice,
+} from "../utils/capture/streaming-sync-presentation.js";
+import {
   discardUnattendedCheckpointReports,
   enqueueUnattendedCheckpointReport,
   flushUnattendedCheckpointReportOutbox,
@@ -8737,21 +8744,21 @@ async function handleCaptureSearchData() {
     streamingSyncDrained = true;
     if (Number(streamingSyncResult?.failedCount || 0) > 0) {
       taskStatus = "completed_with_failures";
-    } else if (
-      streamingSyncQueue?.enabled &&
-      Number(streamingSyncResult?.enqueuedCount || 0) > 0 &&
-      !streamingSyncResult?.blocked
-    ) {
-      showMessage(
-        `已采数据已同步后台：成功 ${Number(streamingSyncResult?.successCount || 0)} 条，跳过 ${Number(streamingSyncResult?.skippedCount || 0)} 条`,
-        "success",
-      );
+    }
+    const streamingSyncNotice = buildStreamingSyncCompletionNotice(
+      streamingSyncResult,
+      {enabled: streamingSyncQueue?.enabled},
+    );
+    if (streamingSyncNotice) {
+      showMessage(streamingSyncNotice.message, streamingSyncNotice.tone);
     }
 
     if (searchAutoLoop) {
       showMessage(
         `无人值守搜索采集${searchCaptureCancelRequested ? "已停止" : "结束"}:共跑 ${searchRound} 轮`,
-        searchCaptureCancelRequested ? "warning" : "success",
+        searchCaptureCancelRequested || isStreamingSyncReconciliationRequired(streamingSyncResult)
+          ? "warning"
+          : "success",
       );
     }
   } catch (error) {
@@ -13643,47 +13650,6 @@ function settleKeywordRecordsForStreamingSync(
   });
 }
 
-function formatStreamingSyncSummary(stats = {}) {
-  if (!stats?.enabled || Number(stats.enqueuedCount || 0) === 0) {
-    return "";
-  }
-  const retryNote =
-    Number(stats.retryCount || 0) > 0
-      ? `，瞬时重试 ${Number(stats.retryCount || 0)}`
-      : "";
-  return `同步成功 ${Number(stats.successCount || 0)}，失败 ${Number(stats.failedCount || 0)}，待上传 ${Number(stats.remainingCount || 0)}${retryNote}`;
-}
-
-function buildStreamingSyncTaskIssue(stats = {}) {
-  if (!stats?.enabled) return null;
-  const failedCount = Number(stats.failedCount || 0);
-  const remainingCount = Number(stats.remainingCount || 0);
-  const blocked = Boolean(stats.blocked);
-  if (!blocked && failedCount === 0 && remainingCount === 0) {
-    return null;
-  }
-  const successCount = Number(stats.successCount || 0);
-  const blockedReason = String(stats?.error?.message || "").trim();
-  return {
-    code: blocked ? "STREAMING_SYNC_BLOCKED" : "STREAMING_SYNC_INCOMPLETE",
-    message: [
-      blockedReason ? `数据同步未完成：${blockedReason}` : "数据同步未全部完成",
-      `成功 ${successCount}，失败 ${failedCount}，待上传 ${remainingCount}`,
-    ].join("；"),
-  };
-}
-
-function buildStreamingSyncTaskMetadata(stats = {}) {
-  return {
-    syncSuccessCount: Number(stats?.successCount || 0),
-    syncFailedCount: Number(stats?.failedCount || 0),
-    syncSkippedCount: Number(stats?.skippedCount || 0),
-    syncRemainingCount: Number(stats?.remainingCount || 0),
-    syncRetryCount: Number(stats?.retryCount || 0),
-    syncBlocked: Boolean(stats?.blocked),
-  };
-}
-
 function appendStreamingSyncSummary(message, streamingSyncQueue) {
   const summary = formatStreamingSyncSummary(streamingSyncQueue?.getStats?.());
   return summary ? `${String(message || "").trim()} · ${summary}` : message;
@@ -14900,13 +14866,17 @@ async function handleBatchKeywordCapture(options = {}) {
         sequentialSearchEnabled
           ? `无人值守采集${stopped ? "已停止" : "结束"}：已执行 ${round}/${sequentialSearchPasses.length} 个巡检步骤，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`
           : `无人值守采集${stopped ? "已停止" : "结束"}：共跑 ${round} 轮，累计成功 ${totalSuccess}，失败 ${totalFailed}${syncSummary ? `；${syncSummary}` : ""}`,
-        stopped ? "warning" : "success",
+        stopped || isStreamingSyncReconciliationRequired(streamingSyncResult)
+          ? "warning"
+          : "success",
       );
     } else if (result.canceled) {
       showMessage(
         `批量采集已停止：已处理 ${stats.processed}/${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}${syncSummary ? `；${syncSummary}` : ""}`,
         "warning",
       );
+    } else if (isStreamingSyncReconciliationRequired(streamingSyncResult)) {
+      showMessage(`采集已结束；${syncSummary}`, "warning");
     } else {
       showMessage(
         `批量采集完成：共 ${stats.total} 个关键词，成功 ${stats.success}，失败 ${stats.failed}${syncSummary ? `；${syncSummary}` : ""}`,
