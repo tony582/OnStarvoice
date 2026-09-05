@@ -584,7 +584,7 @@ test("official comment patrol starts one attempt-fenced task session before deta
         getTargetedWorkflowLabel: () => "官方账号评论巡查",
         supportsPersistentCaptureTaskPlatform: (value) =>
           value === "douyin" || value === "xiaohongshu",
-        startRequiredCaptureTaskSession: async (options) => {
+        startOptionalCaptureAssistSession: async (options) => {
           events.push("session_begin");
           const begun = await beginCaptureTaskSession(
             options,
@@ -808,7 +808,7 @@ test("official comment patrol cancellation ends and releases its exact native ta
   const calls = [];
   const context = {
     supportsPersistentCaptureTaskPlatform: () => true,
-    startRequiredCaptureTaskSession: async (options) => {
+    startOptionalCaptureAssistSession: async (options) => {
       calls.push({type: "begin", options});
       return {ok: true, active: true};
     },
@@ -1316,23 +1316,38 @@ test("protective platform stops remain needs-action instead of user-canceled", (
   );
 });
 
-test("blogger capture owns one task session across list and detail work", () => {
+test("blogger capture uses one optional assist session across list and detail work", () => {
   const section = readFunctionSection(
     "async function handleCaptureBloggerData()",
     "// 搜索页:",
   );
-  const beginIndex = section.indexOf("await startRequiredCaptureTaskSession({");
+  const lockIndex = section.indexOf("await acquireCaptureExecutionLock({");
+  const beginIndex = section.indexOf("await startOptionalCaptureAssistSession({");
   const firstCaptureIndex = section.indexOf("await captureAndSync({");
   const finallyIndex = section.lastIndexOf("} finally {");
   const endIndex = section.indexOf(
     "await endCaptureTaskSession({",
     finallyIndex,
   );
+  const releaseLockIndex = section.indexOf(
+    "await releaseCaptureExecutionLock(executionLock.id)",
+    finallyIndex,
+  );
   const finishIndex = section.indexOf("finishSidebarTask(", finallyIndex);
 
+  assert.ok(lockIndex > -1 && lockIndex < beginIndex);
   assert.ok(beginIndex > -1 && beginIndex < firstCaptureIndex);
   assert.ok(finallyIndex > firstCaptureIndex);
   assert.ok(endIndex > finallyIndex && endIndex < finishIndex);
+  assert.ok(releaseLockIndex > endIndex);
+  assert.match(
+    section.slice(lockIndex, beginIndex),
+    /owner: "manual_blogger_capture"[\s\S]*label: "博主主页采集"/u,
+  );
+  assert.match(
+    section.slice(lockIndex, beginIndex),
+    /if \(!executionLock\) \{[\s\S]*taskStatus = "skipped";[\s\S]*return;/u,
+  );
   assert.match(section, /enhanceResult\?\.securityBlocked \|\| enhanceResult\?\.canceled/);
   assert.match(section, /taskStatus = "completed_with_failures"/);
   assert.match(
@@ -1341,13 +1356,13 @@ test("blogger capture owns one task session across list and detail work", () => 
   );
 });
 
-test("manual search begins only for the actual run and always ends in finally", () => {
+test("manual search starts optional assist only for the actual run and ends it in finally", () => {
   const section = readFunctionSection(
     "async function handleCaptureSearchData()",
     "function setKeywordStrategyTab(",
   );
   const scheduleIndex = section.indexOf("const scheduledStart =");
-  const beginIndex = section.indexOf("await startRequiredCaptureTaskSession({");
+  const beginIndex = section.indexOf("await startOptionalCaptureAssistSession({");
   const runIndex = section.indexOf("let searchRound = 0;");
   const finallyIndex = section.lastIndexOf("} finally {");
   const endIndex = section.indexOf(
@@ -1360,10 +1375,13 @@ test("manual search begins only for the actual run and always ends in finally", 
   assert.ok(endIndex > finallyIndex);
   assert.match(section, /preferredTabId: searchActiveTabId/);
   assert.match(section, /onProgress: \(p\) => \{\s+handleProgress\(p\);/);
-  assert.match(section, /captureTaskId: persistentCaptureTaskId/);
   assert.match(
     section,
-    /batchCaptureByKeywords\(\{\s+keywords: \[\.\.\.attemptKeywords\],[\s\S]*?captureTaskId: persistentCaptureTaskId/,
+    /persistentCaptureTaskId = captureTaskSessionStarted[\s\S]*?taskContext\.taskId[\s\S]*?: ""/,
+  );
+  assert.match(
+    section,
+    /batchCaptureByKeywords\(\{\s+keywords: \[\.\.\.attemptKeywords\],[\s\S]*?captureTaskId: captureTaskSessionStarted[\s\S]*?persistentCaptureTaskId[\s\S]*?: ""/,
   );
   assert.match(section, /runUnattendedKeywordAttempts\(\{/);
   assert.doesNotMatch(section, /retryFailedEnhancementsAfterRound\(/);
@@ -1406,7 +1424,7 @@ test("batch keyword parent task absorbs hidden streaming sync failures", () => {
   );
 });
 
-test("unattended plan keeps XHS pre-navigation Debug and starts Douyin on the final replacement tab", () => {
+test("unattended plan attempts optional XHS assist before navigation and Douyin assist on the final tab", () => {
   const section = readFunctionSection(
     "async function runUnattendedKeywordPlanRequest(request)",
     "async function runCaptureAction({",
@@ -1415,7 +1433,7 @@ test("unattended plan keeps XHS pre-navigation Debug and starts Douyin on the fi
     "unattendedCaptureTaskContext = beginTaskContext({",
   );
   const startIndex = section.indexOf(
-    "await startRequiredCaptureTaskSession({",
+    "await startOptionalCaptureAssistSession({",
     contextIndex,
   );
   const xhsStartIndex = section.indexOf(
@@ -1435,7 +1453,7 @@ test("unattended plan keeps XHS pre-navigation Debug and starts Douyin on the fi
     finalTabIndex,
   );
   const rehydrateIndex = section.indexOf(
-    "await beginCaptureTaskSession({",
+    "await startOptionalCaptureAssistSession({",
     douyinStartIndex,
   );
   const batchIndex = section.indexOf(
@@ -1479,12 +1497,12 @@ test("unattended plan keeps XHS pre-navigation Debug and starts Douyin on the fi
   );
   assert.match(
     section,
-    /startRequiredCaptureTaskSession\(\{[\s\S]*?ownerRequired: false/,
+    /startOptionalCaptureAssistSession\(\{[\s\S]*?ownerRequired: false/,
     "the transient sidebar runner must not own unattended task lifetime",
   );
   assert.match(
     section,
-    /beginCaptureTaskSession\(\{[\s\S]*?ownerRequired: false/,
+    /startOptionalCaptureAssistSession\(\{[\s\S]*?ownerRequired: false/,
     "replacement-tab rebinding must remain unattended-owned",
   );
   assert.match(
@@ -2043,7 +2061,7 @@ test("task sidebar adopts only newer progress from the exact active list run", (
   );
 });
 
-test("elastic keyword cooldown releases the work item, pauses the source Agent, and leaves the loading page", () => {
+test("elastic technical release keeps the healthy source Agent immediately eligible", () => {
   const handlerSection = readFunctionSection(
     "async function handleBatchKeywordCapture(options = {})",
     "async function reportUnattendedKeywordRun(",
@@ -2052,11 +2070,6 @@ test("elastic keyword cooldown releases the work item, pauses the source Agent, 
     "async function runUnattendedKeywordPlanRequest(request)",
     "async function runCaptureAction({",
   );
-  const cooldownHomeSection = readFunctionSection(
-    "async function returnUnattendedAgentToCooldownHome({",
-    "function buildSidebarKeywordSearchUrl(",
-  );
-
   assert.match(handlerSection, /releaseElasticItemOnLongRetry/u);
   assert.match(handlerSection, /UNATTENDED_ELASTIC_RELEASE_MIN_DELAY_MS/u);
   assert.match(handlerSection, /UNATTENDED_ELASTIC_ITEM_RELEASED/u);
@@ -2065,16 +2078,14 @@ test("elastic keyword cooldown releases the work item, pauses the source Agent, 
     unattendedSection,
     /request\?\.orchestrationContext\?\.distributionMode === "elastic_pool"/u,
   );
-  assert.match(unattendedSection, /returnUnattendedAgentToCooldownHome/u);
   assert.match(
     unattendedSection,
     /elasticQueueAssigned && \(elasticItemReleased \|\| bootstrapFailed\)/u,
   );
-  assert.match(unattendedSection, /cooldownHomeRestored/u);
-  assert.match(cooldownHomeSection, /chrome\.tabs\.update\(normalizedTabId/u);
-  assert.match(cooldownHomeSection, /url: homeUrl/u);
-  assert.match(sidebarSource, /https:\/\/www\.douyin\.com\/jingxuan/u);
-  assert.match(sidebarSource, /https:\/\/www\.xiaohongshu\.com\/explore/u);
+  assert.match(unattendedSection, /sourceAgentCooling: false/u);
+  assert.match(unattendedSection, /当前 Agent 可立即领取其它任务/u);
+  assert.doesNotMatch(unattendedSection, /returnUnattendedAgentToCooldownHome/u);
+  assert.doesNotMatch(unattendedSection, /sourceAgentCooling: true/u);
 });
 
 test("unattended final source tab stays pinned through the batch runner", () => {
@@ -2161,11 +2172,11 @@ test("batch keyword handler reuses caller-owned task lifecycle and threads its i
   assert.ok(ensureIndex > -1 && ensureIndex < firstBatchIndex);
   assert.match(
     section,
-    /const baseBatchOptions = \{[\s\S]*?captureTaskId: persistentCaptureTaskId/,
+    /const baseBatchOptions = \{[\s\S]*?captureTaskId: captureTaskSessionStarted[\s\S]*?persistentCaptureTaskId[\s\S]*?: ""/,
   );
   assert.match(
     section,
-    /maybeRunAutoDetailCaptureAfterListCapture\([\s\S]*?captureTaskId: persistentCaptureTaskId/,
+    /maybeRunAutoDetailCaptureAfterListCapture\([\s\S]*?captureTaskId: captureTaskSessionStarted[\s\S]*?persistentCaptureTaskId[\s\S]*?: ""/,
   );
   assert.match(
     section,
@@ -2378,10 +2389,10 @@ test("one keyword cannot schedule a third detail enhancement attempt", () => {
   );
 });
 
-test("manual task start fails closed when debugger or tab-group ownership is unavailable", () => {
+test("strict capture assist start still verifies task ownership", () => {
   const section = readFunctionSection(
-    "async function startRequiredCaptureTaskSession(options = {})",
-    "const DEFAULT_MONITOR_SETTINGS",
+    "async function startCaptureAssistSessionStrict(options = {})",
+    "const OPTIONAL_CAPTURE_ASSIST_SESSION_CODES",
   );
 
   const bindIndex = section.indexOf("bindCaptureTaskOwner(taskId)");
@@ -2396,10 +2407,91 @@ test("manual task start fails closed when debugger or tab-group ownership is una
   assert.match(section, /throw error;/);
 });
 
+test("pure optional capture assist failures degrade without blocking page collection", async () => {
+  const section = readFunctionSection(
+    "async function startOptionalCaptureAssistSession(options = {})",
+    "async function rebuildCaptureTaskSessionForEnhancementRetry({",
+  );
+  const optionalCodes = [
+    "capture_task_group_create_failed",
+    "capture_task_debug_starvoice_active",
+    "debug_session_attach_failed",
+    "debug_session_command_failed",
+    "debug_session_detached_during_start",
+    "debug_session_busy",
+    "debug_session_tab_busy",
+  ];
+
+  for (const code of optionalCodes) {
+    const sandbox = vm.createContext({
+      console: {warn() {}},
+      OPTIONAL_CAPTURE_ASSIST_SESSION_CODES: new Set(optionalCodes),
+      startCaptureAssistSessionStrict: async () => {
+        const error = new Error(`assist unavailable: ${code}`);
+        error.code = code;
+        throw error;
+      },
+    });
+    vm.runInContext(
+      `${section}\nglobalThis.__startOptionalCaptureAssistSession = startOptionalCaptureAssistSession;`,
+      sandbox,
+    );
+
+    const result = await sandbox.__startOptionalCaptureAssistSession({
+      taskId: "optional-assist-task",
+    });
+    assert.equal(result.ok, true, code);
+    assert.equal(result.active, false, code);
+    assert.equal(result.degraded, true, code);
+    assert.equal(result.reason, code);
+  }
+});
+
+test("optional capture assist never swallows attempt, lock, or identity fences", async () => {
+  const section = readFunctionSection(
+    "async function startOptionalCaptureAssistSession(options = {})",
+    "async function rebuildCaptureTaskSessionForEnhancementRetry({",
+  );
+
+  for (const code of [
+    "stale_unattended_attempt",
+    "unattended_request_terminal",
+    "unattended_capture_lock_missing",
+    "unattended_capture_lock_bind_failed",
+    "unattended_begin_fence_changed",
+    "capture_task_platform_mismatch",
+    "capture_task_source_mismatch",
+    "capture_task_begin_cleanup_failed",
+    "invalid_task_session",
+  ]) {
+    const sandbox = vm.createContext({
+      console: {warn() {}},
+      OPTIONAL_CAPTURE_ASSIST_SESSION_CODES: new Set([
+        "capture_task_debug_starvoice_active",
+      ]),
+      startCaptureAssistSessionStrict: async () => {
+        const error = new Error(`authoritative fence: ${code}`);
+        error.code = code;
+        throw error;
+      },
+    });
+    vm.runInContext(
+      `${section}\nglobalThis.__startOptionalCaptureAssistSession = startOptionalCaptureAssistSession;`,
+      sandbox,
+    );
+
+    await assert.rejects(
+      sandbox.__startOptionalCaptureAssistSession({taskId: "stale-task"}),
+      (error) => error?.code === code,
+      code,
+    );
+  }
+});
+
 test("Weibo capture paths keep their non-Debug workflow", () => {
   const supportSection = readFunctionSection(
     "function supportsPersistentCaptureTaskPlatform(platform = \"\")",
-    "async function startRequiredCaptureTaskSession(",
+    "async function startCaptureAssistSessionStrict(",
   );
   assert.match(
     supportSection,
@@ -2433,9 +2525,12 @@ test("Weibo capture paths keep their non-Debug workflow", () => {
   );
   assert.match(
     searchSection,
-    /persistentCaptureTaskId = taskContext\.taskId/,
+    /persistentCaptureTaskId = captureTaskSessionStarted[\s\S]*?taskContext\.taskId[\s\S]*?: ""/,
   );
-  assert.match(searchSection, /captureTaskId: persistentCaptureTaskId/);
+  assert.match(
+    searchSection,
+    /captureTaskId: captureTaskSessionStarted[\s\S]*?persistentCaptureTaskId[\s\S]*?: ""/,
+  );
   assert.match(
     searchSection,
     /if \(captureTaskSessionStarted\) \{[\s\S]*?endCaptureTaskSession/,
@@ -2464,7 +2559,7 @@ test("Weibo capture paths keep their non-Debug workflow", () => {
   );
   assert.match(
     unattendedSection,
-    /const startUnattendedCaptureTaskSession = async[\s\S]*?startRequiredCaptureTaskSession/,
+    /const startUnattendedCaptureTaskSession = async[\s\S]*?startOptionalCaptureAssistSession/,
   );
   assert.match(
     unattendedSection,
@@ -2476,7 +2571,7 @@ test("Weibo capture paths keep their non-Debug workflow", () => {
   );
   assert.match(
     unattendedSection,
-    /else if \(unattendedCaptureTaskSessionStarted && sourceTabWasReplaced\)[\s\S]*?beginCaptureTaskSession/,
+    /else if \(unattendedCaptureTaskSessionStarted && sourceTabWasReplaced\)[\s\S]*?startOptionalCaptureAssistSession/,
   );
   assert.match(
     unattendedSection,
@@ -2510,7 +2605,7 @@ test("capture progress rejects stale owners before forwarding into local UI", ()
   );
 });
 
-test("cloud Debug ownership conflicts hand off without touching the occupied page", () => {
+test("cloud capture assist conflicts continue collection without cloud handoff", () => {
   for (const code of [
     "capture_task_debug_starvoice_active",
     "capture_task_external_debugger_busy",
@@ -2523,17 +2618,33 @@ test("cloud Debug ownership conflicts hand off without touching the occupied pag
     "async function runCaptureAction({",
   );
   assert.match(
-    unattendedSection,
-    /request\?\.cloudAssigned === true[\s\S]*UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES\.has\(code\)[\s\S]*if \(cloudHandoff\) \{\s*break;/u,
+    sidebarSource,
+    /const OPTIONAL_CAPTURE_ASSIST_SESSION_CODES = new Set\(\[[\s\S]*capture_task_debug_starvoice_active[\s\S]*capture_task_external_debugger_busy[\s\S]*capture_task_debug_ownership_unknown/u,
   );
   assert.match(
     unattendedSection,
-    /debugOwnershipHandoff[\s\S]*browser_debug_ownership[\s\S]*automaticReroute: true[\s\S]*safeToDetach: false/u,
+    /phase: "capture_assist_degraded"[\s\S]*浏览器采集辅助不可用，已继续执行采集/u,
   );
-  assert.match(
-    unattendedSection,
-    /当前页面及既有会话保持不动，任务已交回云端等待其它空闲 Agent 接力/u,
+  assert.doesNotMatch(sidebarSource, /UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES/u);
+  assert.doesNotMatch(unattendedSection, /debugOwnershipHandoff/u);
+  assert.doesNotMatch(unattendedSection, /browser_debug_ownership/u);
+  const optionalAssistCodes = readFunctionSection(
+    "const OPTIONAL_CAPTURE_ASSIST_SESSION_CODES = new Set([",
+    "async function startOptionalCaptureAssistSession(options = {})",
   );
+  for (const code of [
+    "capture_task_group_create_failed",
+    "debug_session_command_failed",
+    "debug_session_detached_during_start",
+    "debug_session_busy",
+    "debug_session_tab_busy",
+  ]) {
+    assert.match(optionalAssistCodes, new RegExp(code, "u"), code);
+  }
+  assert.doesNotMatch(optionalAssistCodes, /capture_task_source_mismatch/u);
+  assert.doesNotMatch(optionalAssistCodes, /capture_task_begin_cleanup_failed/u);
+  assert.doesNotMatch(optionalAssistCodes, /capture_task_group_cleanup_failed/u);
+  assert.doesNotMatch(optionalAssistCodes, /debug_session_start_cleanup_failed/u);
 });
 
 test("task surface renders real A/B worker states from progress", () => {
@@ -2620,7 +2731,7 @@ test("dark task surface stops an active unattended request through its real canc
   assert.match(controlsSection, /else \{\s+await handleCancel\(\)/);
 });
 
-test("unattended Debug startup and unexpected cancellation retain system error identity", () => {
+test("unattended assist startup degrades while real task cancellations retain system identity", () => {
   const terminalSection = readFunctionSection(
     "function resolveUnattendedCancellationTerminal(",
     "function supportsPersistentCaptureTaskPlatform(platform = \"\")",
@@ -2649,9 +2760,12 @@ test("unattended Debug startup and unexpected cancellation retain system error i
   );
   assert.match(
     unattendedSection,
-    /AI Debug 启动失败（\$\{code\}）：\$\{message\}/,
+    /phase: "capture_assist_degraded"[\s\S]*浏览器采集辅助不可用，已继续执行采集/,
   );
-  assert.match(unattendedSection, /startError\.code = code/);
+  assert.match(
+    unattendedSection,
+    /Capture assist degraded status report failed \(ignored\)/,
+  );
   assert.match(
     unattendedSection,
     /resolveUnattendedCancellationTerminal\(\s+activeCaptureTaskCancellationReason/,
@@ -2777,7 +2891,7 @@ test("detail context rebuild fences cleanup with the current unattended attempt"
     "const sendDirectCaptureTaskEnd = async",
   );
   const beginIndex = section.indexOf(
-    "return await startRequiredCaptureTaskSession({",
+    "return await startOptionalCaptureAssistSession({",
   );
   const failedCleanupIndex = section.lastIndexOf(
     'reason: "context_rebuild_failed"',
@@ -2799,7 +2913,7 @@ test("detail context rebuild fences cleanup with the current unattended attempt"
   );
   assert.match(
     section,
-    /attemptId: retryAttemptId,[\s\S]*?return await startRequiredCaptureTaskSession\(\{/,
+    /attemptId: retryAttemptId,[\s\S]*?return await startOptionalCaptureAssistSession\(\{/,
     "the cleanup and replacement BEGIN must share one attempt fence",
   );
   assert.match(section, /unattendedAttemptId = ""/);
@@ -2825,7 +2939,7 @@ function createContextRebuildHarness({
     captureTaskOwnerTaskId: "",
     resolveCaptureTaskSourceTabId: async () => sourceTabId,
     endCaptureTaskSession: async () => endResult,
-    startRequiredCaptureTaskSession: startSession,
+    startOptionalCaptureAssistSession: startSession,
     wait: async () => undefined,
     chrome: {runtime: {sendMessage}},
     console,
@@ -2959,8 +3073,8 @@ test("sidebar binds a dedicated capture owner port and disconnects it on unload"
     /chrome\.runtime\.connect\(\{name: CAPTURE_TASK_OWNER_PORT_NAME\}\)/,
   );
   const startSection = readFunctionSection(
-    "async function startRequiredCaptureTaskSession(options = {})",
-    "const DEFAULT_MONITOR_SETTINGS",
+    "async function startCaptureAssistSessionStrict(options = {})",
+    "const OPTIONAL_CAPTURE_ASSIST_SESSION_CODES",
   );
   assert.match(startSection, /bindCaptureTaskOwner\(/);
   const unloadSection = sidebarSource.slice(

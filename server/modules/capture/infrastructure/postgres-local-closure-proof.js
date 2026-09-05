@@ -5,6 +5,8 @@ import {
 import {safeJson, text} from '../application/control-outcome-projection.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
+const LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object.freeze([0, 4, 4]);
 
 export function captureItemRequiresLocalClosureReuseFence({
   itemType,
@@ -87,7 +89,7 @@ export async function loadVerifiedCaptureLocalClosureProof(tx, {
     expectedItemId: expected.itemId,
     expectedItemAttemptId: expected.itemAttemptId,
   });
-  return verifyCaptureLocalClosureProof({
+  const verified = verifyCaptureLocalClosureProof({
     evidence,
     expectedRequestId: snapshot?.client_task_id,
     expectedAttemptId: snapshot?.client_attempt_id,
@@ -102,4 +104,95 @@ export async function loadVerifiedCaptureLocalClosureProof(tx, {
     snapshotReceivedAt: snapshot?.received_at,
     now: snapshot?.proof_now || new Date(),
   });
+  if (verified.proven === true) return verified;
+
+  // 0.4.3 and earlier could receive the server-owned fence marker but never
+  // emitted localClosure proof. Apply the same bounded compatibility rule to
+  // every proof consumer (same-Agent reuse, elastic handoff, duty recovery and
+  // stale-lease settlement), not only to the Agent-slot gate. Exact execution,
+  // Agent and item-attempt lineage remains mandatory; unknown/malformed and
+  // 0.4.4+ versions stay fail-closed.
+  const legacy = await tx.queryOne(`
+    SELECT
+      execution.metadata->>'requiresLocalClosureReuseFenceV1' = 'true'
+        AS fence_marked,
+      execution_version.app_version,
+      CASE
+        WHEN execution_version.app_version ~
+          '^[0-9]+[.][0-9]+[.][0-9]+$'
+          AND (
+            regexp_match(
+              execution_version.app_version,
+              '^([0-9]+)[.]([0-9]+)[.]([0-9]+)$'
+            )
+          )::numeric[] < $8::numeric[]
+        THEN true
+        ELSE false
+      END AS known_legacy_version,
+      COALESCE(
+        execution.finished_at,
+        item_attempt.finished_at,
+        GREATEST(execution.updated_at, item_attempt.updated_at),
+        execution.updated_at,
+        item_attempt.updated_at,
+        execution.created_at,
+        item_attempt.created_at
+      ) AS terminal_at,
+      clock_timestamp() AS proof_now
+    FROM capture_tasks execution
+    JOIN capture_task_item_attempts item_attempt
+      ON item_attempt.tenant_id = execution.tenant_id
+      AND item_attempt.execution_task_id = execution.id
+      AND item_attempt.id = $5::uuid
+      AND item_attempt.item_id = $4::uuid
+      AND item_attempt.agent_id = $3::uuid
+      AND item_attempt.attempt_number = $6::integer
+      AND item_attempt.assignment_revision = $7::integer
+    LEFT JOIN LATERAL (
+      SELECT NULLIF(execution_attempt.app_version, '') AS app_version
+      FROM capture_task_attempts execution_attempt
+      WHERE execution_attempt.tenant_id = execution.tenant_id
+        AND execution_attempt.task_id = execution.id
+        AND execution_attempt.agent_id = $3::uuid
+        AND execution_attempt.client_attempt_id <> ''
+      ORDER BY execution_attempt.attempt_number DESC,
+        execution_attempt.updated_at DESC,
+        execution_attempt.id DESC
+      LIMIT 1
+    ) execution_version ON true
+    WHERE execution.tenant_id = $1::uuid
+      AND execution.id = $2::uuid
+      AND execution.assigned_agent_id = $3::uuid
+      AND execution.status IN (
+        'completed', 'completed_with_warnings',
+        'completed_with_failures', 'failed',
+        'canceled', 'skipped', 'needs_action'
+      )
+    LIMIT 1
+  `, [
+    expected.tenantId,
+    expected.executionTaskId,
+    expected.sourceAgentId,
+    expected.itemId,
+    expected.itemAttemptId,
+    expected.itemAttemptNumber,
+    expected.assignmentRevision,
+    LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS,
+  ]);
+  if (legacy?.fence_marked !== true) {
+    return legacy
+      ? {proven: true, reason: 'local_closure_reuse_fence_not_required'}
+      : verified;
+  }
+  if (legacy?.known_legacy_version !== true) return verified;
+  const terminalAt = new Date(legacy?.terminal_at || 0).getTime();
+  const proofNow = new Date(legacy?.proof_now || Date.now()).getTime();
+  if (
+    Number.isFinite(terminalAt) &&
+    Number.isFinite(proofNow) &&
+    proofNow - terminalAt >= LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS
+  ) {
+    return {proven: true, reason: 'legacy_local_closure_quiescent'};
+  }
+  return {proven: false, reason: 'local_cleanup_quiescence'};
 }

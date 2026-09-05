@@ -20,6 +20,13 @@ const sidebarSource = readFileSync(
   "utf8",
 );
 
+const UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX =
+  "onstarvoice.unattendedFinalFlushIntent.v1.";
+const UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX =
+  "onstarvoice.unattendedLocalClosureReady.v1.";
+const KEYWORD_RUN_REQUEST_STORAGE_KEY =
+  "onstarvoice.unattendedKeywordRunRequest";
+
 function sourceSection(startMarker, endMarker) {
   const start = sidebarSource.indexOf(startMarker);
   const end = sidebarSource.indexOf(endMarker, start + startMarker.length);
@@ -47,6 +54,110 @@ function createStorage(initial = {}) {
     async remove(keys) {
       for (const key of Array.isArray(keys) ? keys : [keys]) {
         delete data[key];
+      }
+    },
+  };
+}
+
+function createFinalFlushRecoveryHarness({
+  initial = {},
+  flushResults = [],
+} = {}) {
+  const storage = createStorage(initial);
+  const timers = new Map();
+  const messages = [];
+  let timerId = 0;
+  let flushCallCount = 0;
+  const queuedFlushResults = [...flushResults];
+  const context = {
+    console,
+    Date,
+    Map,
+    Set,
+    Promise,
+    structuredClone,
+    KEYWORD_RUN_REQUEST_STORAGE_KEY,
+    KEYWORD_PLAN_TERMINAL_STATUSES: new Set([
+      "completed",
+      "completed_with_failures",
+      "failed",
+      "needs_action",
+      "canceled",
+    ]),
+    UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX,
+    UNATTENDED_FINAL_FLUSH_INTENT_VERSION: 1,
+    UNATTENDED_FINAL_FLUSH_RETRY_DELAY_MS: 30_000,
+    UNATTENDED_FINAL_FLUSH_RETRY_DELAYS_MS: [0, 250, 1000, 5000, 15000],
+    UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX,
+    UNATTENDED_LOCAL_CLOSURE_READY_VERSION: 1,
+    UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS: [0, 500, 1500],
+    unattendedFinalFlushRetryTimersByIdentity: new Map(),
+    unattendedFinalFlushInFlightByIdentity: new Map(),
+    buildUnattendedLocalClosureReadyStorageKey(requestId, attemptId) {
+      const normalizedRequestId = String(requestId || "").trim();
+      const normalizedAttemptId = String(attemptId || "").trim();
+      return normalizedRequestId && normalizedAttemptId
+        ? `${UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX}` +
+            `${normalizedRequestId}.${normalizedAttemptId}`
+        : "";
+    },
+    chrome: {storage: {local: storage}},
+    async sleep() {},
+    async flushPendingUnattendedCheckpointReports() {
+      flushCallCount += 1;
+      return queuedFlushResults.length > 0
+        ? queuedFlushResults.shift()
+        : {ok: false, retained: 1, reason: "transport_error"};
+    },
+    async sendUnattendedRuntimeMessage(message) {
+      messages.push(structuredClone(message));
+      return {ok: true, accepted: true, reason: "local_closure_persisted"};
+    },
+    isStorageQuotaError() {
+      return false;
+    },
+    async releaseControlStorageReserve() {},
+    ensureControlStorageReserve() {},
+    setTimeout(handler, delayMs) {
+      timerId += 1;
+      timers.set(timerId, {handler, delayMs});
+      return timerId;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+  };
+  const closureSection = sourceSection(
+    "function buildUnattendedFinalFlushIntentStorageKey(",
+    "async function reportInitialUnattendedKeywordRun(",
+  );
+  runInNewContext(
+    `${closureSection}\n` +
+      `globalThis.__finalFlushApi = {\n` +
+      `  finalizeUnattendedLocalClosureAfterFlush,\n` +
+      `  reconcilePendingUnattendedFinalFlushIntents,\n` +
+      `};`,
+    context,
+  );
+  return {
+    api: context.__finalFlushApi,
+    storage,
+    timers,
+    messages,
+    queueFlushResult(result) {
+      queuedFlushResults.push(structuredClone(result));
+    },
+    flushCallCount() {
+      return flushCallCount;
+    },
+    async fireNextTimer() {
+      const next = timers.entries().next().value;
+      assert.ok(next, "expected a same-document final-flush retry timer");
+      const [id, timer] = next;
+      timers.delete(id);
+      await timer.handler();
+      for (let index = 0; index < 10; index += 1) {
+        await Promise.resolve();
       }
     },
   };
@@ -140,6 +251,153 @@ function checkpointPatch(index, extra = {}) {
     ...extra,
   };
 }
+
+test("terminal runner seals a drained checkpoint outbox before its finalize nudge", () => {
+  const closureSection = sourceSection(
+    "async function finalizeUnattendedLocalClosureAfterFlush(",
+    "async function reportInitialUnattendedKeywordRun(",
+  );
+  const flushIndex = closureSection.indexOf(
+    "flushPendingUnattendedCheckpointReports",
+  );
+  const markerIndex = closureSection.indexOf(
+    "persistUnattendedLocalClosureReadyMarker",
+  );
+  const finalizeIndex = closureSection.indexOf(
+    'type: "onstarvoice:finalize-unattended-local-closure"',
+  );
+
+  assert.ok(flushIndex >= 0, "missing final checkpoint drain");
+  assert.ok(markerIndex > flushIndex, "flush-ready marker preceded the drain");
+  assert.ok(finalizeIndex > markerIndex, "finalize nudge preceded durable marker");
+  assert.match(
+    closureSection,
+    /flushReady:\s*true/,
+    "finalize nudge did not carry the flush-ready handshake",
+  );
+  assert.match(
+    sidebarSource,
+    /onstarvoice\.unattendedLocalClosureReady\.v1\./,
+  );
+});
+
+test("a final flush that exhausts 21 seconds remains durably recoverable in-document and after sidebar restart", async () => {
+  const requestA = {
+    id: "request-A",
+    attemptId: "attempt-A",
+    status: "completed",
+  };
+  const intentKeyA =
+    `${UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX}` +
+    `${requestA.id}.${requestA.attemptId}`;
+  const readyKeyA =
+    `${UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX}` +
+    `${requestA.id}.${requestA.attemptId}`;
+  const failedFlushes = Array.from({length: 5}, () => ({
+    ok: false,
+    retained: 1,
+    reason: "transport_error",
+  }));
+  const sameDocument = createFinalFlushRecoveryHarness({
+    initial: {[KEYWORD_RUN_REQUEST_STORAGE_KEY]: requestA},
+    flushResults: failedFlushes,
+  });
+
+  const exhausted = await sameDocument.api
+    .finalizeUnattendedLocalClosureAfterFlush(requestA.id, requestA.attemptId);
+
+  assert.equal(exhausted.ok, false);
+  assert.equal(sameDocument.flushCallCount(), 5);
+  assert.equal(
+    sameDocument.storage.data[intentKeyA]?.requestId,
+    requestA.id,
+    "the exact flush intent was not durable after the bounded retry window",
+  );
+  assert.equal(
+    sameDocument.storage.data[intentKeyA]?.attemptId,
+    requestA.attemptId,
+  );
+  assert.equal(sameDocument.storage.data[readyKeyA], undefined);
+  assert.equal(
+    sameDocument.timers.size,
+    1,
+    "the live sidebar stopped retrying after the bounded foreground loop",
+  );
+
+  sameDocument.queueFlushResult({ok: true, retained: 0, reason: "drained"});
+  await sameDocument.fireNextTimer();
+  assert.equal(sameDocument.storage.data[readyKeyA]?.attemptId, "attempt-A");
+  assert.equal(sameDocument.storage.data[intentKeyA], undefined);
+  assert.deepEqual(
+    sameDocument.messages.map((message) => [
+      message.requestId,
+      message.attemptId,
+      message.flushReady,
+    ]),
+    [["request-A", "attempt-A", true]],
+  );
+
+  const requestB = {
+    id: "request-A",
+    attemptId: "attempt-B",
+    status: "completed",
+  };
+  const intentKeyB =
+    `${UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX}` +
+    `${requestB.id}.${requestB.attemptId}`;
+  const readyKeyB =
+    `${UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX}` +
+    `${requestB.id}.${requestB.attemptId}`;
+  const restarted = createFinalFlushRecoveryHarness({
+    initial: {
+      [KEYWORD_RUN_REQUEST_STORAGE_KEY]: requestB,
+      // A stale timer/intent from the previous attempt must never seal B or
+      // send a finalize nudge under A's identity.
+      [intentKeyA]: {
+        version: 1,
+        requestId: requestA.id,
+        attemptId: requestA.attemptId,
+        retryCount: 1,
+        nextRetryAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      },
+      [intentKeyB]: {
+        version: 1,
+        requestId: requestB.id,
+        attemptId: requestB.attemptId,
+        retryCount: 1,
+        nextRetryAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      },
+    },
+    flushResults: [{ok: true, retained: 0, reason: "drained"}],
+  });
+
+  await restarted.api.reconcilePendingUnattendedFinalFlushIntents();
+  while (restarted.timers.size > 0) {
+    await restarted.fireNextTimer();
+  }
+
+  assert.equal(restarted.storage.data[readyKeyA], undefined);
+  assert.equal(restarted.storage.data[intentKeyA], undefined);
+  assert.equal(restarted.storage.data[readyKeyB]?.attemptId, "attempt-B");
+  assert.equal(restarted.storage.data[intentKeyB], undefined);
+  assert.deepEqual(
+    restarted.messages.map((message) => [message.requestId, message.attemptId]),
+    [["request-A", "attempt-B"]],
+    "restart recovery crossed the exact request/attempt fence",
+  );
+
+  const initSection = sourceSection(
+    "export async function initSidebar()",
+    "function buildPublicSidebarAuthState(",
+  );
+  assert.match(
+    initSection,
+    /reconcilePendingUnattendedFinalFlushIntents/u,
+    "sidebar init does not reconcile durable final-flush intents",
+  );
+});
 
 async function runDirectReport({response, durableCheckpoint = true} = {}) {
   const queued = [];

@@ -10,7 +10,11 @@ function createTabGroupDouble({
   sourceGroupId = -1,
   workerGroupId = -1,
   updateError = null,
+  restoreGroupError = null,
+  ungroupError = null,
 } = {}) {
+  let activeRestoreGroupError = restoreGroupError;
+  let activeUngroupError = ungroupError;
   const tabs = new Map([
     [41, {id: 41, windowId: 5, groupId: sourceGroupId}],
     [42, {id: 42, windowId: 5, groupId: workerGroupId}],
@@ -20,6 +24,12 @@ function createTabGroupDouble({
   const calls = [];
   return {
     calls,
+    setRestoreGroupError(error = null) {
+      activeRestoreGroupError = error;
+    },
+    setUngroupError(error = null) {
+      activeUngroupError = error;
+    },
     tabsApi: {
       async get(tabId) {
         calls.push(["get", tabId]);
@@ -29,10 +39,14 @@ function createTabGroupDouble({
       },
       async group(options) {
         calls.push(["group", options]);
+        if (options.groupId !== undefined && activeRestoreGroupError) {
+          throw activeRestoreGroupError;
+        }
         return options.groupId ?? 700;
       },
       async ungroup(tabIds) {
         calls.push(["ungroup", tabIds]);
+        if (activeUngroupError) throw activeUngroupError;
       },
     },
     tabGroupsApi: {
@@ -181,6 +195,68 @@ test("group-title setup failure rolls an originally grouped source back", async 
     {groupId: 55, tabIds: [41]},
   ]);
   assert.equal(manager.getTask("task-begin-rollback"), null);
+});
+
+test("group-title setup failure remains blocking when source rollback is unconfirmed", async () => {
+  const double = createTabGroupDouble({
+    sourceGroupId: 55,
+    updateError: new Error("tab group update failed"),
+    restoreGroupError: new Error("source group restore failed"),
+    ungroupError: new Error("source ungroup failed"),
+  });
+  const manager = createManager(double);
+
+  await assert.rejects(
+    manager.begin({taskId: "task-begin-cleanup-pending", sourceTabId: 41}),
+    (error) => error?.code === "capture_task_group_cleanup_failed",
+  );
+  assert.equal(
+    manager.getTask("task-begin-cleanup-pending")?.groupId,
+    700,
+  );
+  assert.equal(
+    manager.getTask("task-begin-cleanup-pending")
+      ?.nativeGroupSetupPending,
+    true,
+  );
+
+  double.setRestoreGroupError(null);
+  double.setUngroupError(null);
+  const cleanup = await manager.end({
+    taskId: "task-begin-cleanup-pending",
+    reason: "capture_task_begin_rollback",
+  });
+  assert.equal(cleanup.released, true);
+  assert.equal(manager.getTask("task-begin-cleanup-pending"), null);
+});
+
+test("a stable native group cannot be reused or ended by another attempt", async () => {
+  const double = createTabGroupDouble();
+  const manager = createManager(double);
+  await manager.begin({
+    taskId: "stable-task",
+    attemptId: "attempt-A",
+    sourceTabId: 41,
+  });
+
+  await assert.rejects(
+    manager.begin({
+      taskId: "stable-task",
+      attemptId: "attempt-B",
+      sourceTabId: 41,
+    }),
+    (error) => error?.code === "capture_task_group_busy",
+  );
+  assert.deepEqual(
+    await manager.end({
+      taskId: "stable-task",
+      attemptId: "attempt-B",
+      sourceTabId: 41,
+      groupId: 700,
+    }),
+    {released: false, reason: "ownership_mismatch"},
+  );
+  assert.equal(manager.getTask("stable-task")?.attemptId, "attempt-A");
 });
 
 test("workers in another window are rejected before changing the native group", async () => {

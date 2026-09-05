@@ -28,6 +28,10 @@ export const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 2;
 
 const ELASTIC_TECHNICAL_HANDOFF_LIMIT = 2;
 
+// Technical failures may use a second complete pool pass. Safety failures keep
+// their original item/account fence and distinct-Agent attempt limit.
+export const ELASTIC_TECHNICAL_RETRY_ROUNDS = 2;
+
 const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set(
   CAPTURE_PLATFORM_SAFETY_CODES,
 );
@@ -419,7 +423,10 @@ export function projectElasticKeywordRecoveryStatus({
     error,
     metadata: {checkpoint},
   });
-  if (normalizedAttemptCount >= normalizedAttemptLimit) {
+  const automaticAttemptLimit = safetyBlocked
+    ? normalizedAttemptLimit
+    : normalizedAttemptLimit * ELASTIC_TECHNICAL_RETRY_ROUNDS;
+  if (normalizedAttemptCount >= automaticAttemptLimit) {
     return safetyBlocked || technicalLimitReached ? 'needs_action' : 'failed';
   }
   if (safetyBlocked) {
@@ -437,7 +444,7 @@ export function projectElasticKeywordRecoveryStatus({
     // attempt fence below bounds this naturally without freezing fresh work.
     return 'retryable';
   }
-  return normalizedAttemptCount < normalizedAttemptLimit
+  return normalizedAttemptCount < automaticAttemptLimit
     ? 'retryable'
     : 'failed';
 }

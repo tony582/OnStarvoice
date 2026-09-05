@@ -28,6 +28,8 @@ function createMemoryStorageArea() {
 function createDouyinChromeHarness({
   workerTabIds,
   failRegistrationAttempts = 0,
+  failCreateAttempts = 0,
+  captureSingleNote = null,
 } = {}) {
   const sourceTab = {
     id: 641,
@@ -40,6 +42,8 @@ function createDouyinChromeHarness({
   const events = [];
   const registrations = [];
   const removedTabIds = [];
+  const captureCalls = [];
+  const currentUrls = new Map([[sourceTab.id, sourceTab.url]]);
   let createIndex = 0;
   let registrationAttempt = 0;
 
@@ -70,6 +74,14 @@ function createDouyinChromeHarness({
           events.push(`end:${message.taskId}`);
           return {ok: true, data: {taskId: message.taskId}};
         }
+        if (
+          message?.type === "onstarvoice:relay-to-content" &&
+          message?.payload?.action === "captureSingleNote" &&
+          typeof captureSingleNote === "function"
+        ) {
+          captureCalls.push(structuredClone(message));
+          return await captureSingleNote(message);
+        }
         return {ok: true, data: null};
       },
       getURL(path) {
@@ -86,6 +98,11 @@ function createDouyinChromeHarness({
         if (!Number.isSafeInteger(tabId)) {
           throw new Error("worker fixture exhausted");
         }
+        if (createIndex <= failCreateAttempts) {
+          events.push(`create-failed:${tabId}`);
+          throw new Error("simulated worker tab creation failure");
+        }
+        currentUrls.set(tabId, String(properties?.url || "about:blank"));
         events.push(`create:${tabId}`);
         return {
           id: tabId,
@@ -93,23 +110,31 @@ function createDouyinChromeHarness({
           index: sourceTab.index + createIndex,
           active: false,
           status: "complete",
-          url: "about:blank",
+          url: currentUrls.get(tabId),
           ...properties,
         };
       },
       async update(tabId, patch) {
+        if (patch?.url) currentUrls.set(Number(tabId), String(patch.url));
         events.push(`update:${tabId}`);
-        return {id: tabId, status: "complete", ...patch};
+        return {
+          id: tabId,
+          status: "complete",
+          ...patch,
+          url: currentUrls.get(Number(tabId)) || String(patch?.url || ""),
+        };
       },
       async get(tabId) {
-        if (Number(tabId) === sourceTab.id) return {...sourceTab};
+        if (Number(tabId) === sourceTab.id) {
+          return {...sourceTab, url: currentUrls.get(sourceTab.id)};
+        }
         if (workerTabIds.includes(Number(tabId))) {
           return {
             id: Number(tabId),
             windowId: sourceTab.windowId,
             active: false,
             status: "complete",
-            url: "about:blank",
+            url: currentUrls.get(Number(tabId)) || "about:blank",
           };
         }
         throw new Error(`No tab with id: ${tabId}`);
@@ -120,8 +145,29 @@ function createDouyinChromeHarness({
       },
     },
     scripting: {
-      async executeScript() {
-        return [{result: 0}];
+      async executeScript({target, args} = {}) {
+        const tabId = Number(target?.tabId);
+        const currentUrl = currentUrls.get(tabId) || "";
+        const expectedNoteId = String(args?.[0] || "");
+        return [{
+          result: {
+            currentUrl,
+            title: "Douyin detail fixture",
+            isDouyin: true,
+            currentNoteId: expectedNoteId,
+            targetMatched: true,
+            activeWorkIds: expectedNoteId ? [expectedNoteId] : [],
+            conflictingActiveWorkIds: [],
+            activeWorkIdentityConflict: false,
+            detailReady: true,
+            apiDetailReady: true,
+            hasBoundDetailRoot: true,
+            isSearchModalContext: false,
+            blocked: false,
+            unavailable: false,
+            immediateUnavailable: false,
+          },
+        }];
       },
     },
     windows: {
@@ -136,6 +182,7 @@ function createDouyinChromeHarness({
     sourceTab,
     events,
     registrations,
+    captureCalls,
     removedTabIds,
   };
 }
@@ -238,10 +285,98 @@ test("v0.3.48 creates and closes a fresh serial Douyin worker for each consecuti
   }
 });
 
-test("two setup failures settle every item, clean both workers, and release the next manual start", async () => {
+test("Douyin detail capture succeeds when optional assist registration fails", async () => {
+  const noteId = "766193585000000811";
+  const directUrl = `https://www.douyin.com/video/${noteId}`;
+  const harness = createDouyinChromeHarness({
+    workerTabIds: [811],
+    failRegistrationAttempts: 1,
+    captureSingleNote: async (message) => {
+      assert.equal(message.tabId, 811);
+      assert.equal(message.payload.expectedNoteId, noteId);
+      return {
+        ok: true,
+        data: {
+          ok: true,
+          platform: "douyin",
+          type: "single_note",
+          data: {
+            noteId,
+            noteUrl: directUrl,
+            title: "Optional assist fallback detail",
+            content: "Douyin collection remains authoritative without tab grouping.",
+            author: "Fallback author",
+            comments: 0,
+            commentsCountKnown: true,
+            commentsCountSource: "api_statistics",
+          },
+          meta: {pageType: "note_detail"},
+          error: null,
+        },
+      };
+    },
+  });
+  globalThis.chrome = harness.chromeApi;
+
+  const [{addRecord, getRecord}, captureSync, taskContext] = await Promise.all([
+    import("../../utils/storage.js"),
+    import("../../utils/capture-sync.js"),
+    import("../../utils/task-context.js"),
+  ]);
+  const recordId = "v0348-douyin-assist-degraded";
+  await seedDouyinRecord(addRecord, recordId, noteId);
+
+  const activeTask = taskContext.beginTaskContext({
+    taskType: "capture",
+    featureKey: "capture.search",
+  });
+  await captureSync.beginCaptureTaskSession({
+    taskId: activeTask.taskId,
+    tabId: harness.sourceTab.id,
+    label: "Douyin optional assist fallback",
+    platform: "douyin",
+  });
+
+  try {
+    const result = await captureSync.batchCaptureDetailsForRecords([recordId], {
+      captureTaskId: activeTask.taskId,
+      skipAlreadyCaptured: false,
+      includeComments: false,
+      includeBloggerMetrics: false,
+      detailAfterNavWaitMs: 1,
+    });
+
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.processedCount, 1);
+    assert.equal(result.successCount, 1);
+    assert.equal(result.failedCount, 0);
+    assert.equal(harness.registrations.length, 1);
+    assert.equal(harness.registrations[0].tabId, 811);
+    assert.equal(harness.captureCalls.length, 1);
+    assert.deepEqual(harness.removedTabIds, [811]);
+    assert.equal((await getRecord(recordId))?.payload?.detailCaptureStatus, "done");
+  } finally {
+    await captureSync.endCaptureTaskSession({
+      taskId: activeTask.taskId,
+      reason: "completed",
+      status: "completed",
+    });
+    taskContext.completeTaskContext({
+      taskType: "capture",
+      featureKey: "capture.search",
+    });
+  }
+
+  assert.equal(
+    taskContext.getActiveTaskContext("capture", "capture.search"),
+    null,
+  );
+});
+
+test("two worker creation failures settle every item and release the next manual start", async () => {
   const harness = createDouyinChromeHarness({
     workerTabIds: [801, 802, 803],
-    failRegistrationAttempts: 2,
+    failCreateAttempts: 2,
   });
   globalThis.chrome = harness.chromeApi;
 
@@ -280,7 +415,7 @@ test("two setup failures settle every item, clean both workers, and release the 
         },
       );
       assert.equal(result.ok, false);
-      assert.equal(result.error?.code, "TASK_TAB_GROUP_UNAVAILABLE");
+      assert.equal(result.error?.code, "RUNNER_TAB_UNAVAILABLE");
       assert.equal(result.total, failedRecordIds.length);
       assert.equal(result.processedCount, failedRecordIds.length);
       assert.equal(result.failedCount, failedRecordIds.length);
@@ -303,7 +438,7 @@ test("two setup failures settle every item, clean both workers, and release the 
         assert.equal(storedRecord?.payload?.detailCaptureStatus, "failed");
         assert.equal(
           storedRecord?.payload?.detailCaptureFailureCode,
-          "TASK_TAB_GROUP_UNAVAILABLE",
+          "RUNNER_TAB_UNAVAILABLE",
         );
         assert.equal(
           storedRecord?.payload?.detailCaptureFailureStage,
@@ -323,8 +458,8 @@ test("two setup failures settle every item, clean both workers, and release the 
     });
   }
 
-  assert.deepEqual(harness.removedTabIds, [801, 802]);
-  assertOrdered(harness.events, "remove:801", "create:802");
+  assert.deepEqual(harness.removedTabIds, []);
+  assertOrdered(harness.events, "create-failed:801", "create-failed:802");
   assert.equal(
     taskContext.getActiveTaskContext("capture", "capture.search"),
     null,
@@ -351,7 +486,7 @@ test("two setup failures settle every item, clean both workers, and release the 
     assert.equal(harness.registrations.at(-1)?.tabId, 803);
     assert.equal(harness.registrations.at(-1)?.taskId, manualTask.taskId);
     assert.notEqual(manualTask.taskId, failedTask.taskId);
-    assertOrdered(harness.events, "remove:802", "create:803");
+    assertOrdered(harness.events, "create-failed:802", "create:803");
   } finally {
     await captureSync.endCaptureTaskSession({
       taskId: manualTask.taskId,
@@ -364,5 +499,5 @@ test("two setup failures settle every item, clean both workers, and release the 
     });
   }
 
-  assert.deepEqual(harness.removedTabIds, [801, 802, 803]);
+  assert.deepEqual(harness.removedTabIds, [803]);
 });

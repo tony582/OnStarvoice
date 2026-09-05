@@ -651,4 +651,147 @@ test('real PostgreSQL command reconciliation preserves expiry, agent availabilit
   assert.equal(raced.rows[0].result.reason, 'task_state_changed');
   assert.equal(raced.rows[0].task_status, 'canceled');
   assert.deepEqual(raced.rows[0].events, ['command_canceled_task_changed']);
+
+  await pool.query(`
+    UPDATE capture_agents
+    SET last_liveness_at = now(), last_full_heartbeat_at = now(),
+      last_heartbeat_at = now()
+    WHERE id = $1
+  `, [agentId]);
+
+  async function createAcknowledgedCreate({status = 'claimed'} = {}) {
+    const taskId = await insertTask(pool, {tenantId, agentId, status});
+    const commandId = await insertCommand(pool, {
+      tenantId,
+      agentId,
+      taskId,
+      commandType: 'create',
+      expired: true,
+      payload: {
+        authCodeId,
+        authBindingId,
+        platform: 'douyin',
+        executionMode: 'unattended_plan',
+      },
+    });
+    await pool.query(`
+      UPDATE capture_tasks
+      SET metadata = jsonb_build_object('createCommandId', $1::text)
+      WHERE id = $2
+    `, [commandId, taskId]);
+    await pool.query(`
+      UPDATE capture_agent_commands
+      SET status = 'acknowledged', acknowledged_at = now() - interval '2 minutes'
+      WHERE id = $1
+    `, [commandId]);
+    return {taskId, commandId};
+  }
+
+  async function readAcknowledgedCreate(fixture) {
+    const result = await pool.query(`
+      SELECT command.status AS command_status, task.status AS task_status,
+        task.error,
+        (SELECT count(*)::integer FROM capture_task_events event
+         WHERE event.tenant_id = task.tenant_id AND event.task_id = task.id
+           AND event.event_type = 'create_command_expired') AS expiry_events
+      FROM capture_agent_commands command
+      JOIN capture_tasks task
+        ON task.id = command.task_id AND task.tenant_id = command.tenant_id
+      WHERE command.id = $1
+    `, [fixture.commandId]);
+    return result.rows[0];
+  }
+
+  await t.test('an online delivery ACK without execution evidence expires once', async () => {
+    for (const status of ['pending', 'claimed']) {
+      const fixture = await createAcknowledgedCreate({status});
+      const expired = await withTransaction(tx => expireStaleCommands(
+        tx, tenantId, fixture.taskId, agentId,
+      ));
+      assert.equal(expired.length, 1);
+      const state = await readAcknowledgedCreate(fixture);
+      assert.equal(state.command_status, 'expired');
+      assert.equal(state.task_status, 'failed');
+      assert.equal(state.error.code, 'create_command_expired');
+      assert.equal(state.error.commandStatusBeforeExpiry, 'acknowledged');
+      assert.equal(state.expiry_events, 1);
+      assert.deepEqual(await withTransaction(tx => expireStaleCommands(
+        tx, tenantId, fixture.taskId, agentId,
+      )), []);
+      assert.deepEqual(await readAcknowledgedCreate(fixture), state);
+    }
+  });
+
+  await t.test('each independent execution signal protects an online acknowledged create', async () => {
+    for (const evidence of ['heartbeat', 'started', 'client_attempt']) {
+      const fixture = await createAcknowledgedCreate();
+      if (evidence === 'client_attempt') {
+        await pool.query(`
+          INSERT INTO capture_task_attempts (
+            tenant_id, task_id, agent_id, client_attempt_id
+          ) VALUES ($1, $2, $3, $4)
+        `, [tenantId, fixture.taskId, agentId, `e-base-attempt-${randomUUID()}`]);
+      } else if (evidence === 'heartbeat') {
+        await pool.query(
+          'UPDATE capture_tasks SET heartbeat_at = now() WHERE id = $1',
+          [fixture.taskId],
+        );
+      } else {
+        await pool.query(
+          'UPDATE capture_tasks SET started_at = now() WHERE id = $1',
+          [fixture.taskId],
+        );
+      }
+      assert.deepEqual(await withTransaction(tx => expireStaleCommands(
+        tx, tenantId, fixture.taskId, agentId,
+      )), [], evidence);
+      const state = await readAcknowledgedCreate(fixture);
+      assert.equal(state.command_status, 'acknowledged', evidence);
+      assert.equal(state.task_status, 'claimed', evidence);
+      assert.equal(state.expiry_events, 0, evidence);
+    }
+  });
+
+  await t.test('an empty server-side attempt placeholder is not client execution evidence', async () => {
+    const fixture = await createAcknowledgedCreate();
+    await pool.query(`
+      INSERT INTO capture_task_attempts (tenant_id, task_id, agent_id)
+      VALUES ($1, $2, $3)
+    `, [tenantId, fixture.taskId, agentId]);
+    const expired = await withTransaction(tx => expireStaleCommands(
+      tx, tenantId, fixture.taskId, agentId,
+    ));
+    assert.equal(expired.length, 1);
+    assert.equal((await readAcknowledgedCreate(fixture)).command_status, 'expired');
+  });
+
+  await t.test('the atomic expiry update rechecks execution evidence after candidate selection', async () => {
+    const fixture = await createAcknowledgedCreate();
+    let evidenceInjected = false;
+    const expired = await withTransaction(tx => expireStaleCommands({
+      ...tx,
+      async queryAll(sql, params) {
+        const rows = await tx.queryAll(sql, params);
+        if (sql.includes('AS execution_attempt_observed')) {
+          assert.equal(rows.length, 1);
+          assert.equal(rows[0].id, fixture.commandId);
+          // Keep the real PostgreSQL selection and UPDATE. Change the evidence
+          // between them to verify the UPDATE's independent fence, even though
+          // the task lock already serializes ordinary concurrent writers.
+          await tx.execute(
+            'UPDATE capture_tasks SET heartbeat_at = now() WHERE id = $1',
+            [fixture.taskId],
+          );
+          evidenceInjected = true;
+        }
+        return rows;
+      },
+    }, tenantId, fixture.taskId, agentId));
+    assert.equal(evidenceInjected, true);
+    assert.deepEqual(expired, []);
+    const state = await readAcknowledgedCreate(fixture);
+    assert.equal(state.command_status, 'acknowledged');
+    assert.equal(state.task_status, 'claimed');
+    assert.equal(state.expiry_events, 0);
+  });
 });

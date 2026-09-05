@@ -393,34 +393,6 @@ test("duty cross-device retry fails closed before opening a transaction", async 
       requireSourceLineageQuiet: true,
     },
   }), {error: 'invalid_duty_recovery_request'});
-  assert.deepEqual(await dispatchCrossDeviceRetry({
-    tenantId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
-    taskId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-    requestKey: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
-    expectedRevision: 1,
-    recoveryPhase: 'duty',
-    automatic: true,
-    dutyRecoveryIntentId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
-    dutyRecoveryLeaseToken: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
-    dutyRecoveryGeneration: 1,
-    itemIds: ['eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'],
-    expectedItemRevision: 1,
-    expectedAttemptNumber: 1,
-    expectedSourceAttemptId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
-    safetyHandoff: {
-      count: 0,
-      challengeCode: 'DOUYIN_SEARCH_SECURITY_CHALLENGE',
-      sourcePlatformAccountId: 'source-account',
-      sourceLoginState: 'authenticated',
-      requireDistinctPlatformAccount: true,
-      requireSourceLineageQuiet: true,
-    },
-  }), {
-    error: 'retry_requires_manual_safety_action',
-    code: 'HUMAN_REQUIRED',
-    humanRequired: true,
-    reason: 'source_local_closure_proof_unavailable',
-  });
 });
 
 test('search-challenge handoff is counted independently without blocking the elastic queue', () => {
@@ -433,7 +405,8 @@ test('search-challenge handoff is counted independently without blocking the ela
   assert.match(projection, /safetyHandoffCount = 0/u);
   assert.match(projection, /sourceLocalClosureProven = false/u);
   assert.match(projection, /agentAttemptLimit/u);
-  assert.match(projection, /normalizedAttemptCount >= normalizedAttemptLimit/u);
+  assert.match(projection, /normalizedAttemptCount >= automaticAttemptLimit/u);
+  assert.match(projection, /ELASTIC_TECHNICAL_RETRY_ROUNDS/u);
   assert.match(projection, /A challenge belongs to the source account\/session/u);
   assert.doesNotMatch(projection, /ELASTIC_AUTOMATIC_SAFETY_HANDOFF_ATTEMPTS/u);
 
@@ -448,11 +421,7 @@ test('search-challenge handoff is counted independently without blocking the ela
     /CASE WHEN item\.status = 'pending' THEN 0 ELSE 1 END/u,
   );
   assert.doesNotMatch(elasticClaim, /ELASTIC_CROSS_DEVICE_CLOSURE_GRACE_MS/u);
-  assert.match(
-    elasticClaim,
-    /!neverOpened[\s\S]*localClosureProof\.proven !== true/u,
-    'a marked source must remain fenced until exact local closure is proven',
-  );
+  assert.doesNotMatch(elasticClaim, /localClosureProof\.proven !== true/u);
 
   const dutyDispatch = readSourceSection(
     postgresCrossDeviceRetrySource,
@@ -460,13 +429,9 @@ test('search-challenge handoff is counted independently without blocking the ela
     'export async function dispatchCrossDeviceRetry',
     'async function listAutomaticCaptureRetryCandidates',
   );
-  assert.match(
+  assert.doesNotMatch(
     dutyDispatch,
-    /source_local_closure_proof_unavailable/u,
-  );
-  assert.ok(
-    dutyDispatch.indexOf('source_local_closure_proof_unavailable') <
-      dutyDispatch.indexOf('return await withTransaction'),
+    /safetyHandoffRequest\.sourceLocalClosureProven !== true/u,
   );
   assert.match(dutyDispatch, /evaluateCaptureSafetyHandoff/u);
   assert.match(dutyDispatch, /sourcePlatformAccountId/u);
@@ -478,10 +443,11 @@ test('search-challenge handoff is counted independently without blocking the ela
   );
   assert.match(dutyDispatch, /FOR SHARE OF binding, account/u);
   assert.match(dutyDispatch, /source_lineage_silent = false/u);
-  assert.ok(
+  assert.equal(
     (dutyDispatch.match(/loadVerifiedCaptureLocalClosureProof\(/gu) || [])
-      .length >= 2,
-    'safety handoff must verify local closure at source classification and again before writes',
+      .length,
+    1,
+    'closure evidence is sampled once for audit and never rechecked as a gate',
   );
   const closureProofLoader = readSourceSection(
     postgresLocalClosureProofSource,
@@ -506,6 +472,26 @@ test('search-challenge handoff is counted independently without blocking the ela
     /execution_attempt\.client_attempt_id = snapshot\.client_attempt_id/u,
   );
   assert.match(closureProofLoader, /expectedSnapshotRevision/u);
+  assert.match(
+    closureProofLoader,
+    /JOIN capture_task_item_attempts item_attempt[\s\S]*item_attempt\.id = \$5::uuid[\s\S]*item_attempt\.item_id = \$4::uuid[\s\S]*item_attempt\.agent_id = \$3::uuid[\s\S]*item_attempt\.attempt_number = \$6::integer[\s\S]*item_attempt\.assignment_revision = \$7::integer/u,
+    'legacy compatibility must retain the exact item-attempt lineage',
+  );
+  assert.match(
+    closureProofLoader,
+    /execution_version\.app_version ~[\s\S]*regexp_match\([\s\S]*\)::numeric\[\] < \$8::numeric\[\][\s\S]*known_legacy_version/u,
+    'only a known pre-0.4.4 execution may use legacy quiescence',
+  );
+  assert.match(
+    closureProofLoader,
+    /legacy\?\.known_legacy_version !== true\) return verified/u,
+    'unknown, malformed and current versions must keep the exact-proof failure',
+  );
+  assert.match(
+    closureProofLoader,
+    /proofNow - terminalAt >= LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS[\s\S]*legacy_local_closure_quiescent[\s\S]*local_cleanup_quiescence/u,
+    'every proof consumer shares the bounded legacy compatibility path',
+  );
   assert.doesNotMatch(
     closureProofLoader,
     /snapshot\.metadata \? 'localClosure'/u,
@@ -660,13 +646,19 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "failed",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     attemptCount: 2,
-  }), "failed");
+  }), "retryable");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     attemptCount: 3,
-  }), "failed");
+  }), "retryable");
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: "failed",
+    error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
+    attemptCount: 4,
+  }), "failed", "two complete technical passes are the hard bound");
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: "failed",
@@ -687,7 +679,7 @@ test("elastic keyword recovery is patient, bounded, and escalates safety only af
     status: "retryable",
     error: {code: "UNATTENDED_SEARCH_BOOTSTRAP_FAILED"},
     updated_at: "2026-08-12T01:59:00.000Z",
-  }, now), 60_000);
+  }, now), 0, "technical errors must not cool an otherwise healthy Agent");
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: safety,
@@ -788,12 +780,18 @@ test("elastic queue does not spend business retries on local capacity or dispatc
     status: 'failed',
     error: {code: 'BUSINESS_CAPTURE_FAILED'},
     attemptCount: 2,
-  }), 'failed');
+  }), 'retryable');
   assert.equal(projectElasticKeywordRecoveryStatus({
     elasticPool: true,
     status: 'failed',
     error: {code: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED'},
     attemptCount: 2,
+  }), 'retryable');
+  assert.equal(projectElasticKeywordRecoveryStatus({
+    elasticPool: true,
+    status: 'failed',
+    error: {code: 'UNATTENDED_SEARCH_BOOTSTRAP_FAILED'},
+    attemptCount: 4,
   }), 'failed');
   const thirdBootstrapProjection = projectElasticAttemptBudget({
     attempt_count: 3,
@@ -818,12 +816,12 @@ test("elastic queue does not spend business retries on local capacity or dispatc
     status: "retryable",
     error: {code: "capture_task_group_busy"},
     updated_at: "2026-08-13T01:58:00.000Z",
-  }, now), 3 * 60_000);
+  }, now), 0);
   assert.equal(elasticRecoveryHoldRemainingMs({
     status: "retryable",
     error: {code: "elastic_task_heartbeat_timeout"},
     updated_at: "2026-08-13T01:55:00.000Z",
-  }, now), 5 * 60_000);
+  }, now), 0);
 });
 
 test("elastic bootstrap pacing staggers healthy starts and only adds a short congestion delay", () => {
@@ -2075,84 +2073,23 @@ test("server-owned local closure metadata survives snapshots without Agent injec
   }
 });
 
-test("historical closure reuse ignores mutable item start after Agent A to B reassignment", () => {
-  const reuseGate = readSourceSection(
-    postgresCrossDeviceRetrySource,
-    "PostgreSQL cross-device retry",
-    "async function loadCaptureAgentLocalClosureReuseGate",
-    "export async function dispatchCrossDeviceRetry",
-  );
-  assert.match(reuseGate, /attempt\.agent_id = \$2/u);
-  assert.match(
-    reuseGate,
-    /execution\.started_at IS NULL[\s\S]*attempt\.started_at IS NULL/u,
-    "Agent A's immutable execution and attempt starts define whether A opened",
-  );
+test("historical local-closure evidence never participates in Agent allocation", () => {
   assert.doesNotMatch(
-    reuseGate,
-    /item\.started_at IS NULL/u,
-    "Agent B starting the shared item later must not retroactively change A",
+    captureCloudRouteSource,
+    /async function loadCaptureAgentLocalClosureReuseGate/u,
   );
-
   const claim = readRouteSection(
     "async function dispatchNextElasticWorkItem",
     "router.post('/agent/heartbeat'",
   );
-  assert.match(
-    claim,
-    /item\.started_at AS item_started_at[\s\S]*itemStartedAt: candidate\.item_started_at/u,
-    "the current source candidate may still use the item start before reassignment",
-  );
-});
-
-test("current-schema keyword reuse requires exact closure proof while legacy keeps bounded quiescence", () => {
-  const reuseGate = readSourceSection(
+  const retrySelection = readSourceSection(
     postgresCrossDeviceRetrySource,
     "PostgreSQL cross-device retry",
-    "async function loadCaptureAgentLocalClosureReuseGate",
-    "export async function dispatchCrossDeviceRetry",
+    "async function lockIdleCrossDeviceRetryAgent",
+    "function promotedRetryFallbackTarget",
   );
-  assert.match(
-    reuseGate,
-    /SELECT DISTINCT ON \(requires_local_closure_proof\)[\s\S]*requires_local_closure_proof DESC/u,
-    "marked and legacy histories must be evaluated independently",
-  );
-  const markedProof = reuseGate.indexOf("if (latestMarkedAttempt)");
-  assert.ok(markedProof >= 0);
-  assert.match(
-    reuseGate,
-    /if \(proof\.proven !== true\) \{[\s\S]*ready: false,[\s\S]*reason: proof\.reason/u,
-    "a marked attempt must remain blocked until its exact proof verifies",
-  );
-  assert.doesNotMatch(
-    reuseGate,
-    /proof\.proven !== true\s*&&[\s\S]*closure_quiescent/u,
-    "server time must never replace browser-local proof for current schema",
-  );
-  assert.doesNotMatch(
-    reuseGate,
-    /bounded_local_cleanup_quiescence_elapsed/u,
-    "the marked-attempt success path must only report verified proof",
-  );
-  assert.match(
-    reuseGate,
-    /WHEN requires_local_closure_proof THEN false[\s\S]*ELSE terminal_at <= now\(\) - make_interval\(secs => \$3::integer\)[\s\S]*legacy_closure_quiescent/u,
-  );
-  assert.match(
-    reuseGate,
-    /GREATEST\(execution\.updated_at, attempt\.updated_at\)/u,
-    "legacy terminal states without finished_at must age out of reuse fencing",
-  );
-  assert.match(
-    reuseGate,
-    /terminal_at DESC NULLS LAST/u,
-    "missing terminal timestamps must never sort ahead forever",
-  );
-  assert.match(
-    reuseGate,
-    /latestLegacyAttempt\.legacy_closure_quiescent !== true/u,
-  );
-  assert.doesNotMatch(reuseGate, /capabilities|freshCapabilities/u);
+  assert.doesNotMatch(claim, /localClosureReuseGate/u);
+  assert.doesNotMatch(retrySelection, /localClosureReuseGate/u);
 });
 
 test("agent execution-slot locks serialize heartbeat, resume, and handoff assignment", async () => {
@@ -2624,7 +2561,7 @@ test("create command failures and successful stops settle orchestration work ite
   );
 });
 
-test("acknowledged create expiry waits for Agent liveness, while pending expiry does not", () => {
+test("acknowledged create expiry is bounded by execution evidence, not Agent liveness", () => {
   const now = Date.parse("2026-08-27T06:00:00.000Z");
   const graceMs = 10 * 60 * 1000;
   const freshLivenessAt = "2026-08-27T05:59:55.000Z";
@@ -2641,7 +2578,16 @@ test("acknowledged create expiry waits for Agent liveness, while pending expiry 
     commandType: "create",
     lastLivenessAt: freshLivenessAt,
     lastFullHeartbeatAt: staleFullHeartbeatAt,
-  }, now, graceMs), false, "fresh liveness holds an acknowledged create even when the full snapshot is stale");
+    taskStatus: "pending",
+  }, now, graceMs), true, "an online Agent cannot hold an expired create without execution evidence");
+  assert.equal(captureCreateCommandExpiryEligible({
+    status: "acknowledged",
+    commandType: "create",
+    lastLivenessAt: freshLivenessAt,
+    taskStatus: "running",
+    taskHeartbeatAt: freshLivenessAt,
+    executionAttemptObserved: true,
+  }, now, graceMs), false, "an authoritative task snapshot protects a real local execution");
   assert.equal(captureCreateCommandExpiryEligible({
     status: "acknowledged",
     commandType: "create",
@@ -2780,7 +2726,7 @@ test("never-open classification covers unavailable Agents and pre-dispatch stops
   assert.equal(captureExecutionNeverOpened({}), true);
 });
 
-test("stale command reconciliation rechecks acknowledged create liveness before retry projection", () => {
+test("stale command reconciliation rechecks execution evidence before retry projection", () => {
   const expiry = readSourceSection(
     postgresCommandReconciliationSource,
     "PostgreSQL command reconciliation",
@@ -2798,11 +2744,11 @@ test("stale command reconciliation rechecks acknowledged create liveness before 
   assert.ok(retryProjection > atomicRecheck, "retry projection must only see commands that passed both checks");
   assert.match(
     expiry,
-    /c\.status = 'pending'[\s\S]*c\.command_type <> 'create'[\s\S]*ca\.last_liveness_at[\s\S]*ca\.last_full_heartbeat_at[\s\S]*make_interval\(mins => \$4::integer\)/u,
+    /c\.status = 'pending'[\s\S]*c\.command_type <> 'create'[\s\S]*task\.status IN \('pending', 'claimed'\)[\s\S]*task\.heartbeat_at IS NULL[\s\S]*capture_task_attempts[\s\S]*ca\.last_liveness_at/u,
   );
   assert.match(
     expiry,
-    /status = 'pending'[\s\S]*command_type <> 'create'[\s\S]*NOT EXISTS \([\s\S]*ca\.last_liveness_at[\s\S]*>= now\(\) - make_interval\(mins => \$5::integer\)/u,
+    /status = 'pending'[\s\S]*command_type <> 'create'[\s\S]*EXISTS \([\s\S]*capture_tasks task[\s\S]*task\.heartbeat_at IS NULL[\s\S]*capture_task_attempts task_attempt[\s\S]*OR NOT EXISTS \([\s\S]*ca\.last_liveness_at/u,
   );
   assert.match(
     expiry,
@@ -2834,101 +2780,23 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /const attemptBudget[\s\S]*candidate\.attempt_budget_used/u);
   assert.match(claim, /attempt_count = \$1[\s\S]*attemptNumber,[\s\S]*attemptBudget/u);
   assert.match(claim, /elasticAttemptBudgetUsed/u);
-  assert.match(claim, /item\.attempt_count < agent_policy\.agent_attempt_limit/u);
+  assert.match(
+    claim,
+    /item\.attempt_count <[\s\S]*agent_policy\.agent_attempt_limit \* \$10::integer/u,
+  );
+  assert.match(claim, /ELASTIC_TECHNICAL_RETRY_ROUNDS/u);
+  assert.match(claim, /FROM capture_task_item_attempts safety_attempt/u);
+  assert.match(claim, /MOD\(item\.attempt_count, agent_policy\.agent_attempt_limit\)/u);
+  assert.match(claim, /item\.assigned_agent_id IS DISTINCT FROM \$2::uuid/u);
   assert.match(claim, /COUNT\(DISTINCT configured_agent_id\)/u);
   assert.match(claim, /CROSS JOIN LATERAL/u);
   assert.match(claim, /freshCapabilities\.singleRelayV1 === true/u);
-  assert.match(claim, /freshCapabilities\.localClosureReuseFenceV1 === true/u);
-  assert.match(
-    claim,
-    /const localClosureReuseGate = await loadCaptureAgentLocalClosureReuseGate\([\s\S]*tenantId: agent\.tenant_id,[\s\S]*agentId: agent\.id[\s\S]*if \(!localClosureReuseGate\.ready\)/u,
-  );
-  const reuseGate = readSourceSection(
-    postgresCrossDeviceRetrySource,
-    "PostgreSQL cross-device retry",
-    "async function loadCaptureAgentLocalClosureReuseGate",
-    "export async function dispatchCrossDeviceRetry",
-  );
-  assert.match(
-    reuseGate,
-    /requiresLocalClosureReuseFenceV1[\s\S]*JOIN capture_task_items item[\s\S]*item\.item_type = 'keyword'/u,
-  );
-  assert.doesNotMatch(
-    reuseGate,
-    /'superseded'|'interrupted'/u,
-  );
-  assert.match(
-    reuseGate,
-    /execution\.started_at IS NULL[\s\S]*attempt\.started_at IS NULL/u,
-  );
-  assert.doesNotMatch(
-    reuseGate,
-    /item\.started_at IS NULL/u,
-    "historical Agent A must not be reclassified when Agent B later starts the shared item",
-  );
-  assert.match(
-    reuseGate,
-    /execution\.error->>'code' = 'create_agent_unavailable'[\s\S]*execution\.error->>'commandStatusBefore' = 'pending'/u,
-  );
-  assert.ok(
-    reuseGate.indexOf("AND NOT (") <
-      reuseGate.indexOf("ORDER BY requires_local_closure_proof"),
-    "strict never-open rows must be removed before latest-attempt ordering",
-  );
-  assert.match(reuseGate, /loadVerifiedCaptureLocalClosureProof/u);
-  assert.match(
-    reuseGate,
-    /COALESCE\([\s\S]*requiresLocalClosureReuseFenceV1[\s\S]*AS requires_local_closure_proof/u,
-  );
-  assert.match(
-    reuseGate,
-    /latestLegacyAttempt &&[\s\S]*latestLegacyAttempt\.legacy_closure_quiescent !== true[\s\S]*local_cleanup_quiescence/u,
-    "only legacy terminal history may use the bounded compatibility grace",
-  );
-  assert.match(
-    postgresCrossDeviceRetrySource,
-    /LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 \* 1000/u,
-  );
+  assert.doesNotMatch(claim, /loadCaptureAgentLocalClosureReuseGate/u);
+  assert.doesNotMatch(claim, /elastic_handoff_waiting_local_closure/u);
+  assert.doesNotMatch(claim, /requiresLocalClosureReuseFenceV1: true/u);
   assert.match(claim, /requiresSingleRelay/u);
-  assert.match(claim, /waitingForSourceClosure/u);
-  assert.match(claim, /source_execution_metadata/u);
-  assert.match(
-    claim,
-    /captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: candidate\.item_type,[\s\S]*sourceExecutionMetadata: candidate\.source_execution_metadata/u,
-  );
-  assert.match(
-    claim,
-    /CASE[\s\S]*waitingForSourceClosure'[\s\S]*THEN 1[\s\S]*sourceClosureBlockedAt/u,
-  );
-  assert.match(claim, /loadVerifiedCaptureLocalClosureProof/u);
   assert.match(claim, /item\.started_at AS item_started_at/u);
   assert.match(claim, /AS source_execution_started_at/u);
-  assert.match(
-    claim,
-    /const neverOpened = captureExecutionNeverOpened\(\{[\s\S]*executionTaskId: previousExecutionTaskId,[\s\S]*sourceExecutionMetadata: candidate\.source_execution_metadata,[\s\S]*executionStartedAt: candidate\.source_execution_started_at,[\s\S]*attemptExists: Boolean\(sourceAttempt\)/u,
-  );
-  assert.match(reuseGate, /commandStatusBeforeExpiry' = 'pending'/u);
-  assert.match(reuseGate, /execution\.error->>'code' = 'create_agent_unavailable'/u);
-  assert.match(reuseGate, /execution\.metadata->>'stoppedBeforeDispatch' = 'true'/u);
-  assert.match(claim, /requiresLocalClosureReuseFenceV1: true/u);
-  assert.doesNotMatch(
-    reuseGate,
-    /attempt\.updated_at > now\(\) - interval '30 minutes'/u,
-  );
-  assert.match(
-    claim,
-    /!neverOpened &&[\s\S]*localClosureProof\.proven !== true/u,
-  );
-  assert.match(
-    claim,
-    /canFenceLocalClosureReuse && candidate\.item_type === 'keyword'[\s\S]*requiresLocalClosureReuseFenceV1: true/u,
-  );
-  assert.match(claim, /status = 'retryable'[\s\S]*elastic_handoff_waiting_local_closure/u);
-  assert.match(
-    claim,
-    /sourceClosureBlockedAt'[\s\S]*COALESCE\([\s\S]*metadata->>'sourceClosureBlockedAt'[\s\S]*now\(\)::text/u,
-    "the first source-closure block timestamp must remain the stable review anchor",
-  );
   assert.match(claim, /expectedElasticKeywordSearches/u);
   assert.match(claim, /const attemptIdentity = crypto\.randomUUID\(\)/u);
   assert.match(claim, /attemptIdentity,/u);
@@ -2960,16 +2828,18 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
     /parent\.metadata @> jsonb_build_object\([\s\S]*'eligibleAgentIds'[\s\S]*OR \([\s\S]*item\.status = 'retryable'[\s\S]*'relayAgentIds'/u,
     'standby Agents may claim only a retryable item; fresh work stays in the plan pool',
   );
-  assert.match(claim, /capture_task_item_attempts same_agent_attempt/u);
-  assert.match(claim, /same_agent_attempt\.agent_id = \$2::uuid/u);
-  const sameAgentFence = claim.match(
-    /AND NOT EXISTS \(\s*SELECT 1\s*FROM capture_task_item_attempts same_agent_attempt[\s\S]*?same_agent_attempt\.agent_id = \$2::uuid\s*\)/u,
-  )?.[0] || '';
-  assert.ok(sameAgentFence, 'the same-Agent attempt fence must be present');
-  assert.doesNotMatch(
-    sameAgentFence,
-    /updated_at/u,
-    'an Agent that already tried an item must never reclaim it after a cooldown',
+  assert.match(claim, /capture_task_item_attempts safety_attempt/u);
+  assert.match(claim, /safety_attempt\.agent_id = \$2::uuid/u);
+  assert.match(claim, /capture_task_item_attempts recent_attempt/u);
+  assert.match(
+    claim,
+    /MOD\(item\.attempt_count, agent_policy\.agent_attempt_limit\)/u,
+    'technical attempts reset only after the whole pool pass is exhausted',
+  );
+  assert.match(
+    claim,
+    /safety_attempt\.error[\s\S]*requiresManualAction[\s\S]*securityEvidence/u,
+    'a safety-fenced item/account pair must never be recycled',
   );
   assert.match(claim, /reserveCaptureResourceAdmission\(tx,/u);
   assert.ok(
@@ -3003,13 +2873,31 @@ test("elastic recovery releases the item immediately and scopes verification to 
   assert.match(recovery, /state: 'released_for_handoff'/u);
   assert.match(recovery, /handoffReadyAt/u);
   assert.match(recovery, /itemLockReleased: true/u);
-  assert.match(recovery, /sourceAgentCooling: !operatorHoldReleased && sourceAgentHoldMs > 0/u);
+  assert.match(recovery, /sourceAgentCooling: false/u);
   assert.match(recovery, /previousRecovery\.queuedAt/u);
   assert.match(recovery, /operatorHoldReleasedAt/u);
   assert.match(recovery, /cooldownHomeRestored/u);
   assert.match(recovery, /cooldownHomeUrl/u);
   assert.match(recovery, /sourceAgentHoldUntil/u);
   assert.match(recovery, /sourceAgentSameItemRetryAfter/u);
+});
+
+test("technical recovery never quarantines the whole source Agent", () => {
+  const recovery = buildElasticRecoveryMetadata({
+    status: "retryable",
+    error: {code: "CAPTURE_TASK_DEBUG_STARVOICE_ACTIVE"},
+    attemptCount: 1,
+    sourceAgentId: "agent-source",
+    now: new Date("2026-09-02T00:00:00.000Z"),
+  });
+
+  assert.equal(recovery.sourceAgentCooling, false);
+  assert.equal(recovery.sourceAgentHoldUntil, recovery.queuedAt);
+  assert.equal(elasticRecoveryHoldRemainingMs({
+    status: "retryable",
+    error: {code: "CAPTURE_TASK_DEBUG_STARVOICE_ACTIVE"},
+    updated_at: recovery.queuedAt,
+  }, Date.parse("2026-09-02T00:00:01.000Z")), 0);
 });
 
 test("repeated terminal heartbeats preserve the original elastic recovery review anchor", () => {
@@ -3086,7 +2974,7 @@ test("elastic cleanup tolerates child tasks whose work item already settled", ()
   );
 });
 
-test("elastic queue requires exact closure before reclaiming stale current-schema work", () => {
+test("elastic queue reclaims stale work without turning closure telemetry into a blocker", () => {
   const lease = readSourceSection(
     postgresLeaseReconciliationSource,
     "PostgreSQL lease reconciliation",
@@ -3103,18 +2991,12 @@ test("elastic queue requires exact closure before reclaiming stale current-schem
     lease,
     /captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: sourceItem\?\.item_type,[\s\S]*sourceExecutionMetadata: child\.metadata/u,
   );
-  assert.match(lease, /elastic_stale_execution_waiting_local_closure/u);
-  assert.match(lease, /sourceClosureBlocked[\s\S]*sourceClosureBlockers/u);
-  assert.match(lease, /outcome: 'waiting_local_closure'/u);
+  assert.doesNotMatch(lease, /elastic_stale_execution_waiting_local_closure/u);
+  assert.doesNotMatch(lease, /outcome: 'waiting_local_closure'/u);
+  assert.doesNotMatch(lease, /!localClosureProof\.proven/u);
   assert.match(
     lease,
-    /requiresSourceLocalClosure\s*&&[\s\S]*!localClosureProof\.proven/u,
-    'current-schema recovery must still prove local closure after Agent liveness expires',
-  );
-  assert.doesNotMatch(
-    lease,
-    /!localClosureProof\.proven\s*&&\s*!agentOffline/u,
-    'an offline lease cannot substitute for browser-local closure proof',
+    /sourceClosureBlocked: 0,[\s\S]*sourceClosureBlockers: \[\]/u,
   );
   assert.match(lease, /'serverLeaseRevoked', \$5::boolean/u);
   assert.match(lease, /serverLeaseRevoked: agentOffline/u);
@@ -3131,29 +3013,7 @@ test("elastic queue requires exact closure before reclaiming stale current-schem
   assert.match(
     lease,
     /source_item\.id AS item_id[\s\S]*const scannedItemKeys = new Set/u,
-    'candidate executions and existing blockers must share one item identity count',
-  );
-  assert.match(
-    lease,
-    /settled\?\.outcome === 'waiting_local_closure'[\s\S]*summary\.sourceClosureBlocked = blockerByItem\.size/u,
-    'the first blocked reconciliation must be reported in the same result',
-  );
-  const waitingProjectionStart = lease.indexOf(
-    "settled?.outcome === 'waiting_local_closure'",
-  );
-  const waitingProjectionEnd = lease.indexOf(
-    '} else {\n      summary.skipped += 1;',
-    waitingProjectionStart,
-  );
-  assert.ok(waitingProjectionStart >= 0 && waitingProjectionEnd > waitingProjectionStart);
-  const waitingProjection = lease.slice(
-    waitingProjectionStart,
-    waitingProjectionEnd,
-  );
-  assert.doesNotMatch(
-    waitingProjection,
-    /summary\.skipped \+= 1/u,
-    'a local-closure blocker must not first be projected as skipped',
+    'candidate executions retain one item identity count',
   );
   assert.doesNotMatch(lease, /AGENT_TASK_STATE_UNAVAILABLE/u);
   assert.match(lease, /status: 'retryable'/u);
@@ -4730,21 +4590,10 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
     /distributionMode: 'elastic_pool'/u,
     'a fixed or promoted retry must not be mislabeled as an elastic queue claim',
   );
-  assert.match(dispatchCore, /retry_source_local_closure_unproven/u);
-  assert.match(dispatchCore, /SELECT id, status, metadata/u);
-  assert.match(dispatchCore, /sourceExecutionMetadataById/u);
-  assert.match(
-    dispatchCore,
-    /const sourceExecutionMetadata =\s*sourceExecutionMetadataById\.get\(sourceExecutionTaskId\)[\s\S]*captureItemRequiresLocalClosureReuseFence\(\{[\s\S]*itemType: retryItem\.item_type,[\s\S]*sourceExecutionMetadata,/u,
-  );
-  assert.match(
-    dispatchCore,
-    /const neverOpened = captureExecutionNeverOpened\(\{[\s\S]*executionTaskId: sourceExecutionTaskId,[\s\S]*sourceExecutionMetadata,[\s\S]*executionStartedAt:[\s\S]*sourceExecutionStartedAtById\.get\(sourceExecutionTaskId\)[\s\S]*attemptExists: Boolean\(sourceAttempt\)/u,
-  );
-  assert.match(
-    dispatchCore,
-    /const targetSupportsLocalClosureReuseFence =\s*businessTaskType === 'unattended_keyword_capture'[\s\S]*safeJson\(targetAgent\.capabilities\)\.localClosureReuseFenceV1 === true[\s\S]*requiresLocalClosureReuseFenceV1: undefined[\s\S]*targetSupportsLocalClosureReuseFence[\s\S]*requiresLocalClosureReuseFenceV1: true/u,
-  );
+  assert.doesNotMatch(dispatchCore, /retry_source_local_closure_unproven/u);
+  assert.doesNotMatch(dispatchCore, /sourceExecutionMetadataById/u);
+  assert.doesNotMatch(dispatchCore, /targetSupportsLocalClosureReuseFence/u);
+  assert.match(dispatchCore, /requiresLocalClosureReuseFenceV1: undefined/u);
   assert.match(dispatchCore, /expectedSearches: expectedRetrySearches/u);
   assert.match(
     postgresCrossDeviceRetrySource,
@@ -4792,14 +4641,9 @@ test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", ()
     "async function findIdleCrossDeviceRetryAgents",
     "function promotedRetryFallbackTarget",
   );
-  assert.match(
-    agentSelection,
-    /tryLockCaptureAgentExecutionSlot[\s\S]*loadCaptureAgentLocalClosureReuseGate\(tx,[\s\S]*agentId: locked\.id/u,
-  );
-  assert.match(
-    agentSelection,
-    /localClosureReuseGate\.ready[\s\S]*reserveCaptureResourceAdmission[\s\S]*!localClosureReuseGate\.ready/u,
-  );
+  assert.match(agentSelection, /tryLockCaptureAgentExecutionSlot/u);
+  assert.match(agentSelection, /reserveCaptureResourceAdmission/u);
+  assert.doesNotMatch(agentSelection, /localClosureReuseGate/u);
 });
 
 test("recovery verification and replay clocks require exact business evidence", () => {

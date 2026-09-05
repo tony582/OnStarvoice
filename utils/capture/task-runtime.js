@@ -159,7 +159,7 @@
       debugReleased = debugOwnershipReleased(debugResult);
       if (!debugReleased) {
         const error = new Error(
-          "浏览器接管仍处于活动状态，原生标签组暂不释放",
+          "采集辅助仍处于活动状态，原生标签组暂不释放",
         );
         error.code = "capture_task_debug_not_released";
         error.result = debugResult;

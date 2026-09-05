@@ -101,87 +101,18 @@ async function reconcileElasticCaptureLeasesInPostgres(input = 50) {
     parentTaskIds,
   ]);
 
-  // Released items waiting for a source-browser closure proof are not stale
-  // execution leases, so the query above intentionally cannot requeue them.
-  // Surface them in the same guarded-action result instead of returning
-  // `scanned: 0`, which previously made a hard anti-double-run fence look like
-  // a no-op or a successful recovery.
-  const sourceClosureBlockers = await queryAll(`
-    SELECT
-      item.id AS item_id,
-      item.task_id AS parent_task_id,
-      item.execution_task_id,
-      item.keyword,
-      COALESCE(
-        NULLIF(item.metadata->>'sourceClosureBlockedAt', ''),
-        NULLIF(execution.metadata->>'sourceClosureBlockedAt', '')
-      ) AS blocked_at,
-      COALESCE(
-        NULLIF(item.metadata->>'sourceClosureBlockedReason', ''),
-        NULLIF(execution.metadata->>'sourceClosureBlockedReason', '')
-      ) AS reason
-    FROM capture_task_items item
-    JOIN capture_tasks parent
-      ON parent.id = item.task_id
-      AND parent.tenant_id = item.tenant_id
-    LEFT JOIN capture_tasks execution
-      ON execution.id = item.execution_task_id
-      AND execution.tenant_id = item.tenant_id
-    WHERE COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
-      AND parent.status NOT IN (
-        'completed', 'completed_with_warnings', 'completed_with_failures',
-        'failed', 'canceled', 'skipped', 'superseded'
-      )
-      AND item.status IN (
-        'assigned', 'dispatch_pending', 'dispatched', 'waiting_device',
-        'claimed', 'running', 'recovering', 'retryable'
-      )
-      AND (
-        item.metadata->>'waitingForSourceClosure' = 'true'
-        OR (
-          execution.status IN (
-            'pending', 'claimed', 'running', 'recovering', 'waiting_device'
-          )
-          AND execution.metadata->>'waitingForSourceClosure' = 'true'
-        )
-      )
-      AND ($2::uuid IS NULL OR item.tenant_id = $2::uuid)
-      AND (
-        cardinality($3::uuid[]) = 0
-        OR item.task_id = ANY($3::uuid[])
-      )
-    ORDER BY blocked_at NULLS LAST, item.id
-    LIMIT $1
-  `, [normalizedLimit, tenantId || null, parentTaskIds]);
-
   const scannedItemKeys = new Set([
     ...candidates.map(candidate => {
       const itemId = text(candidate.item_id, 100);
       return itemId ? `item:${itemId}` : `execution:${text(candidate.id, 100)}`;
     }),
-    ...sourceClosureBlockers.map(blocker =>
-      `item:${text(blocker.item_id, 100)}`
-    ),
   ]);
-  const blockerByItem = new Map(
-    sourceClosureBlockers.map(blocker => [
-      text(blocker.item_id, 100),
-      {
-        itemId: text(blocker.item_id, 100),
-        parentTaskId: text(blocker.parent_task_id, 100),
-        executionTaskId: text(blocker.execution_task_id, 100),
-        keyword: text(blocker.keyword, 120),
-        blockedAt: blocker.blocked_at || null,
-        reason: text(blocker.reason, 160),
-      },
-    ]),
-  );
   const summary = {
     scanned: scannedItemKeys.size,
     requeued: 0,
     skipped: 0,
-    sourceClosureBlocked: blockerByItem.size,
-    sourceClosureBlockers: [...blockerByItem.values()],
+    sourceClosureBlocked: 0,
+    sourceClosureBlockers: [],
   };
   for (const candidate of candidates) {
     const settled = await withTransaction(async tx => {
@@ -310,66 +241,9 @@ async function reconcileElasticCaptureLeasesInPostgres(input = 50) {
               sourceItem?.assignment_revision,
           })
         : {proven: true, reason: 'local_closure_reuse_fence_not_required'};
-      // Revoking a stale server lease fences late writes, but it cannot prove
-      // that the disconnected browser stopped operating the platform page.
-      // Current-schema keyword attempts therefore require their exact local
-      // closure proof even when the Agent liveness lease has expired.
-      if (
-        requiresSourceLocalClosure &&
-        !localClosureProof.proven
-      ) {
-        const firstWait =
-          safeJson(child.metadata).waitingForSourceClosure !== true;
-        const sourceClosureBlockedAt =
-          text(safeJson(child.metadata).sourceClosureBlockedAt, 100) ||
-          new Date().toISOString();
-        await tx.execute(`
-          UPDATE capture_tasks
-          SET metadata = metadata || jsonb_build_object(
-            'waitingForSourceClosure', true,
-            'sourceClosureBlockedAt', COALESCE(
-              NULLIF(metadata->>'sourceClosureBlockedAt', ''),
-              $5::text
-            ),
-            'sourceClosureBlockedReason', $3::text,
-            'sourceClosureBlockedAttemptId', $4::text
-          )
-          WHERE id = $1 AND tenant_id = $2
-        `, [
-          child.id,
-          candidate.tenant_id,
-          text(localClosureProof.reason, 160),
-          text(sourceAttempt?.id, 100),
-          sourceClosureBlockedAt,
-        ]);
-        if (firstWait) {
-          await appendEvent(tx, {
-            tenantId: candidate.tenant_id,
-            taskId: child.id,
-            agentId: child.assigned_agent_id,
-            eventType: 'elastic_stale_execution_waiting_local_closure',
-            status: child.status,
-            message: '任务心跳中断，但原设备尚未确认关闭本地工作页，暂不接力',
-            payload: {
-              parentTaskId: candidate.parent_task_id,
-              itemId: sourceItem?.id || '',
-              timeoutCode,
-              proofReason: text(localClosureProof.reason, 160),
-            },
-          });
-        }
-        return {
-          outcome: 'waiting_local_closure',
-          blocker: {
-            itemId: text(sourceItem?.id, 100),
-            parentTaskId: text(candidate.parent_task_id, 100),
-            executionTaskId: text(child.id, 100),
-            keyword: text(sourceItem?.keyword, 120),
-            blockedAt: sourceClosureBlockedAt,
-            reason: text(localClosureProof.reason, 160),
-          },
-        };
-      }
+      // Local closure remains diagnostic evidence only. Once the server lease
+      // is stale, the assignment revision fences late writes and the item can
+      // be requeued even when the browser never uploaded closure telemetry.
       const failed = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = 'failed',
@@ -427,24 +301,10 @@ async function reconcileElasticCaptureLeasesInPostgres(input = 50) {
     });
     if (settled === 'requeued') {
       summary.requeued += 1;
-      const candidateItemId = text(candidate.item_id, 100);
-      if (candidateItemId) blockerByItem.delete(candidateItemId);
-    } else if (settled?.outcome === 'waiting_local_closure') {
-      const blocker = settled.blocker || {};
-      const itemId = text(blocker.itemId, 100);
-      const blockerKey = itemId ||
-        `execution:${text(blocker.executionTaskId, 100)}`;
-      if (!blockerByItem.has(blockerKey)) {
-        blockerByItem.set(blockerKey, blocker);
-      }
-      summary.sourceClosureBlocked = blockerByItem.size;
-      summary.sourceClosureBlockers = [...blockerByItem.values()];
     } else {
       summary.skipped += 1;
     }
   }
-  summary.sourceClosureBlocked = blockerByItem.size;
-  summary.sourceClosureBlockers = [...blockerByItem.values()];
   return summary;
 }
 

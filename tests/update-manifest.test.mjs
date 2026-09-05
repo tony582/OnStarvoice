@@ -30,11 +30,11 @@ test('extension update manifest matches the packaged source version', () => {
   assert.equal(OPS_CONTROL_RUNTIME_BASELINE_VERSION, manifest.version);
   assert.match(
     JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases[0]?.releaseNotes),
-    /安全验证后的关键词可以真正自动接力[\s\S]*本地关闭证明/u,
+    /AI Debug 仅作为采集辅助[\s\S]*不再阻断主采集/u,
   );
   assert.match(
     aboutHtml,
-    new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">2026-09-01<\\/span><span class="pill">最新<\\/span>`, 'u'),
+    new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">2026-09-02<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
 });
 

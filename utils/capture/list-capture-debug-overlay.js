@@ -1369,7 +1369,7 @@ export function createListCaptureDebugOverlay({
   let markerElements = new Map();
   let markerInstanceCounter = 0;
   let taskTakeoverActive = false;
-  let taskTakeoverLabel = "AI 正在接管";
+  let taskTakeoverLabel = "采集辅助运行中";
   let taskTakeoverProgress = null;
   let taskTakeoverDeadlineAt = 0;
   let taskTakeoverCountdownTimer = 0;
@@ -1494,7 +1494,7 @@ export function createListCaptureDebugOverlay({
     const waiting = taskTakeoverActive && waitState.waiting;
     const progressMessage = cleanText(taskTakeoverProgress?.message);
     const nextTakeoverLabel =
-      progressMessage || taskTakeoverLabel || "AI 正在接管";
+      progressMessage || taskTakeoverLabel || "采集辅助运行中";
 
     takeover.className = waiting ? "takeover is-waiting" : "takeover";
     takeover.hidden = !taskTakeoverActive &&
@@ -1997,7 +1997,7 @@ export function createListCaptureDebugOverlay({
     takeoverCountdown = null;
     takeoverNext = null;
     taskTakeoverActive = false;
-    taskTakeoverLabel = "AI 正在接管";
+    taskTakeoverLabel = "采集辅助运行中";
     taskTakeoverProgress = null;
     taskTakeoverDeadlineAt = 0;
     lastRenderSnapshot = {
@@ -2050,7 +2050,7 @@ export function createListCaptureDebugOverlay({
     setTaskTakeover(options = {}) {
       const {active = false, label = "", progress} = options;
       taskTakeoverActive = Boolean(active);
-      taskTakeoverLabel = cleanText(label) || "AI 正在接管";
+      taskTakeoverLabel = cleanText(label) || "采集辅助运行中";
       if (Object.prototype.hasOwnProperty.call(options, "progress")) {
         taskTakeoverProgress = normalizeTaskTakeoverProgress(progress);
       }

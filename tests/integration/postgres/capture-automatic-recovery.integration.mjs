@@ -1369,6 +1369,58 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
     sourceAgentId,
     label: 'eligible',
   });
+  const targetClosureHistory = await createRecoveryFixture(pool, {
+    tenantId,
+    sourceAgentId: eligibleTarget.agentId,
+    label: 'target-closure-history',
+    metadata: {automaticRetryDisabled: true},
+  });
+  await dismissFixture(pool, targetClosureHistory);
+  await pool.query(`
+    UPDATE capture_tasks
+    SET metadata = metadata || '{"requiresLocalClosureReuseFenceV1":true}'::jsonb
+    WHERE id = ANY($1::uuid[])
+  `, [[eligible.sourceTaskId, targetClosureHistory.sourceTaskId]]);
+  await pool.query(`
+    UPDATE capture_agents
+    SET capabilities = capabilities || '{"localClosureReuseFenceV1":true}'::jsonb
+    WHERE id = $1
+  `, [eligibleTarget.agentId]);
+  const eligibleBefore = await readRecoveryState(pool, eligible);
+  assert.deepEqual(await dispatchCrossDeviceRetry({
+    tenantId,
+    taskId: eligible.parentTaskId,
+    requestKey: randomUUID(),
+    expectedRevision: 1,
+    automatic: true,
+  }), {error: 'revision_conflict', currentRevision: 0});
+  assert.deepEqual(await readRecoveryState(pool, eligible), eligibleBefore);
+  const activeSourceCommand = await pool.query(`
+    INSERT INTO capture_agent_commands (
+      tenant_id, agent_id, task_id, command_type, payload, expires_at
+    ) VALUES ($1, $2, $3, 'stop', '{}'::jsonb, now() + interval '1 hour')
+    RETURNING id
+  `, [tenantId, sourceAgentId, eligible.sourceTaskId]);
+  await assert.rejects(dispatchCrossDeviceRetry({
+    tenantId,
+    taskId: eligible.parentTaskId,
+    requestKey: randomUUID(),
+    expectedRevision: 0,
+    automatic: true,
+  }), error => {
+    assert.equal(error.crossDeviceRetryError, 'retry_source_command_active');
+    return true;
+  });
+  assert.deepEqual(
+    await readRecoveryState(pool, eligible),
+    eligibleBefore,
+    'closure telemetry must not replace the source-command settlement fence',
+  );
+  await pool.query(`
+    UPDATE capture_agent_commands
+    SET status = 'completed', finished_at = now(), updated_at = now()
+    WHERE id = $1
+  `, [activeSourceCommand.rows[0].id]);
   const eligibleSummary = await reconcileAutomaticCaptureRetries(1);
   const eligibleRetryTaskId = assertFirstAutomaticDispatchSummary(
     eligibleSummary,
@@ -1380,6 +1432,14 @@ test('real PostgreSQL automatic recovery preserves gates, state, CAS, and rollba
     eligible,
     eligibleTarget,
     eligibleRetryTaskId,
+  );
+  assert.equal(
+    Object.hasOwn(
+      eligibleAfterFirstRun.children[0].metadata,
+      'requiresLocalClosureReuseFenceV1',
+    ),
+    false,
+    'a successful retry must not opt a new execution back into a closure gate',
   );
   assert.deepEqual(await reconcileAutomaticCaptureRetries(1), {
     scanned: 1,

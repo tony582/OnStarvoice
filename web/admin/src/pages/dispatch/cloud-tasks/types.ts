@@ -120,6 +120,9 @@ export type OrchestrationExecutionRecord = {
   checkpoint?: Record<string, unknown> | null
   command_status?: string
   command_expires_at?: string | null
+  blocking_command_id?: string | null
+  blocking_command_status?: string | null
+  blocking_command_type?: string | null
   created_at?: string | null
   updated_at?: string | null
   message?: string | null
