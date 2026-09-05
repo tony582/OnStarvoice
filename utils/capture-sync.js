@@ -1827,6 +1827,7 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
     const dataPool = await getDataPool();
     const existingRecords = Array.isArray(dataPool.records) ? dataPool.records : [];
     const keyToRecord = buildDataPoolIdentityIndex(existingRecords);
+    const pendingKnownKeys = session?.knownKeys ? new Set() : null;
     const savedRecords = []; // 全新记录:入本地池(unshift)+ 同步
     const refreshedRecords = []; // 已存但刷新了互动数:就地改 + 同步,但不 unshift(避免本地重复)
     const skippedRecordIds = [];
@@ -1851,7 +1852,9 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
       }
 
       const keys = resolveRecordIdentityKeys(record);
-      const knownInSession = keys.some((key) => session?.knownKeys?.has(key));
+      const knownInSession = keys.some((key) =>
+        session?.knownKeys?.has(key) || pendingKnownKeys?.has(key),
+      );
       if (knownInSession) {
         continue;
       }
@@ -1862,7 +1865,7 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
       if (existingRecord) {
         skippedCount += 1;
         const existingId = String(existingRecord.id || '').trim();
-        keys.forEach((key) => session?.knownKeys?.add(key));
+        keys.forEach((key) => pendingKnownKeys?.add(key));
         const traceMerge = mergeCaptureTraceIntoExistingRecord(
           existingRecord,
           record,
@@ -1899,7 +1902,7 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
       const binding = buildCaptureTraceBinding(boundTrace);
       if (binding) traceBindings.push(binding);
       keys.forEach((key) => {
-        session?.knownKeys?.add(key);
+        pendingKnownKeys?.add(key);
         keyToRecord.set(key, recordToSave);
       });
     }
@@ -1909,13 +1912,17 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
     }
     if (savedRecords.length > 0 || refreshedRecords.length > 0) {
       // 刷新的记录是 dataPool.records 内的引用、已就地改 → 一并持久化
-      await setDataPool(dataPool);
+      const saved = await setDataPool(dataPool);
+      if (!saved) {
+        throw new Error('本地缓存写入失败，请检查扩展存储空间或稍后重试');
+      }
     }
 
     // 全新 + 已存刷新的,都回传给调用方同步(后端按新互动数 upsert)
     const syncRecords = [...savedRecords, ...refreshedRecords];
     const savedRecordIds = syncRecords.map((record) => record?.id).filter(Boolean);
     if (session) {
+      pendingKnownKeys?.forEach((key) => session.knownKeys?.add(key));
       session.stats.savedCount += savedRecords.length; // 统计「新增」只算全新,刷新不计新增
       session.stats.skippedCount += skippedCount;
       session.stats.lastSavedCount = savedRecords.length;
