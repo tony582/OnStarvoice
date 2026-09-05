@@ -13,11 +13,19 @@ export function createRecordSyncQueue({
   signal = null,
   retryDelaysMs = [],
   shouldRetry = null,
+  shouldHoldForReconciliation = null,
 } = {}) {
   const queueEnabled = Boolean(enabled);
   if (queueEnabled && typeof processRecord !== "function") {
     throw new TypeError("record sync queue requires processRecord");
   }
+  if (
+    shouldHoldForReconciliation !== null &&
+    typeof shouldHoldForReconciliation !== "function"
+  ) {
+    throw new TypeError("reconciliation guard must be a function or null");
+  }
+  const reconciliationEnabled = typeof shouldHoldForReconciliation === "function";
 
   const pendingJobs = [];
   const pendingIds = new Set();
@@ -33,6 +41,10 @@ export function createRecordSyncQueue({
   let blockedError = null;
   let canceled = signal?.aborted === true;
   let cancelReason = canceled ? "aborted" : "";
+  let reconciliationHold = null;
+  // Opt-in only: retain IDs canceled while an active request can still return
+  // a receipt. These are not settlement evidence or authorization to replay.
+  const canceledUnresolvedIds = new Set();
   const normalizedRetryDelaysMs = (Array.isArray(retryDelaysMs)
     ? retryDelaysMs
     : []
@@ -49,13 +61,21 @@ export function createRecordSyncQueue({
     retryCount: 0,
   };
 
+  const getHeldRecordIds = () => [...new Set([
+    ...(reconciliationHold ? [reconciliationHold.recordId] : []),
+    ...canceledUnresolvedIds,
+    ...pendingIds,
+    ...dirtyIds,
+  ])];
+
   const getStats = () => ({
     enabled: queueEnabled,
     ...stats,
     pendingCount: pendingJobs.length,
     activeCount: activeJob ? 1 : 0,
-    remainingCount:
-      pendingJobs.length + (activeJob ? 1 : 0) + dirtyIds.size,
+    remainingCount: reconciliationHold
+      ? getHeldRecordIds().length
+      : pendingJobs.length + (activeJob ? 1 : 0) + dirtyIds.size,
     activeRecordId: activeJob?.recordId || "",
     blocked: Boolean(blockedError),
     error: blockedError,
@@ -65,7 +85,20 @@ export function createRecordSyncQueue({
     enqueuedUniqueCount: enqueuedIds.size,
     excludedUniqueCount: excludedIds.size,
     succeededUniqueCount: succeededIds.size,
+    ...(reconciliationHold ? {
+      reconciliationRequired: true,
+      heldRecordId: reconciliationHold.recordId,
+      heldRecordIds: getHeldRecordIds(),
+      heldUniqueCount: getHeldRecordIds().length,
+      drainCompleted: false,
+    } : {}),
   });
+
+  // Receipts can be large. Keep them out of progress events and expose an
+  // independent copy only on explicit request by an opted-in consumer.
+  const getReconciliationSnapshot = () => reconciliationHold
+    ? structuredClone({...reconciliationHold, heldRecordIds: getHeldRecordIds()})
+    : null;
 
   const stopRequested = () => {
     if (canceled || signal?.aborted === true) {
@@ -88,10 +121,17 @@ export function createRecordSyncQueue({
     if (firstCancellation || !cancelReason) {
       cancelReason = String(reason || "capture_task_canceled");
     }
-    pendingJobs.splice(0, pendingJobs.length);
-    pendingIds.clear();
-    dirtyIds.clear();
-    latestMetaById.clear();
+    if (!reconciliationHold) {
+      if (reconciliationEnabled && activeJob) {
+        [activeJob.recordId, ...pendingIds, ...dirtyIds].forEach(
+          (recordId) => canceledUnresolvedIds.add(recordId),
+        );
+      }
+      pendingJobs.splice(0, pendingJobs.length);
+      pendingIds.clear();
+      dirtyIds.clear();
+      latestMetaById.clear();
+    }
     if (firstCancellation) {
       emitState("canceled", {reason: cancelReason});
     }
@@ -163,7 +203,10 @@ export function createRecordSyncQueue({
     excludedIds.delete(normalizedId);
     enqueuedIds.add(normalizedId);
     latestMetaById.set(normalizedId, meta || {});
-    if (activeJob?.recordId === normalizedId) {
+    if (
+      activeJob?.recordId === normalizedId ||
+      reconciliationHold?.recordId === normalizedId
+    ) {
       dirtyIds.add(normalizedId);
       emitState("requeue_requested", {recordId: normalizedId});
       return false;
@@ -232,6 +275,53 @@ export function createRecordSyncQueue({
     return !syncCancellationState();
   };
 
+  const holdIfRequired = (result, context) => {
+    if (!reconciliationEnabled) return false;
+    let resultSnapshot = null;
+    let evidenceUnavailable = false;
+    let guardError = null;
+    let hold = false;
+    try {
+      resultSnapshot = structuredClone(result);
+    } catch {
+      evidenceUnavailable = true;
+      hold = true;
+    }
+    if (!hold) {
+      try {
+        // The guard must not be able to mutate either the receipt or the
+        // result subsequently consumed by the legacy settlement path.
+        const decision = shouldHoldForReconciliation(
+          structuredClone(resultSnapshot),
+          structuredClone(context),
+        );
+        if (decision === true || decision === false) {
+          hold = decision;
+        } else {
+          // Async guards are unsupported. Observe their rejection without
+          // awaiting them, then fail closed instead of authorizing a retry.
+          Promise.resolve(decision).catch(() => {});
+          guardError = "RECONCILIATION_GUARD_INVALID_RESULT";
+          hold = true;
+        }
+      } catch {
+        guardError = "RECONCILIATION_GUARD_FAILED";
+        hold = true;
+      }
+    }
+    if (!hold) return false;
+    reconciliationHold = {
+      recordId: context.recordId,
+      attempt: context.attempt,
+      result: resultSnapshot,
+      evidenceUnavailable,
+      guardError,
+    };
+    activeJob = null;
+    emitState("reconciliation_required", {recordId: context.recordId});
+    return true;
+  };
+
   const processJob = async (job) => {
     if (syncCancellationState()) return;
     activeJob = job;
@@ -256,6 +346,14 @@ export function createRecordSyncQueue({
         } catch (error) {
           result = {ok: false, error};
         }
+      }
+
+      if (holdIfRequired(result, {
+        recordId: job.recordId,
+        meta: latestMeta,
+        attempt: retryIndex + 1,
+      })) {
+        return;
       }
 
       if (
@@ -314,6 +412,7 @@ export function createRecordSyncQueue({
       result,
     });
     activeJob = null;
+    canceledUnresolvedIds.clear();
 
     if (
       dirtyIds.delete(job.recordId) &&
@@ -328,7 +427,7 @@ export function createRecordSyncQueue({
 
   const runWorker = async () => {
     while (pendingJobs.length > 0) {
-      if (syncCancellationState()) break;
+      if (reconciliationHold || syncCancellationState()) break;
       const job = pendingJobs.shift();
       await processJob(job);
     }
@@ -337,6 +436,7 @@ export function createRecordSyncQueue({
   function ensureWorker() {
     if (
       !queueEnabled ||
+      reconciliationHold ||
       workerPromise ||
       pendingJobs.length === 0 ||
       syncCancellationState()
@@ -345,7 +445,7 @@ export function createRecordSyncQueue({
     }
     workerPromise = runWorker().finally(() => {
       workerPromise = null;
-      if (pendingJobs.length > 0 && !syncCancellationState()) {
+      if (!reconciliationHold && pendingJobs.length > 0 && !syncCancellationState()) {
         ensureWorker();
       }
     });
@@ -362,7 +462,10 @@ export function createRecordSyncQueue({
       if (currentWorker) {
         await currentWorker;
       }
-    } while (workerPromise || (!canceled && pendingJobs.length > 0) || activeJob);
+    } while (!reconciliationHold && (
+      workerPromise || (!canceled && pendingJobs.length > 0) || activeJob
+    ));
+    if (reconciliationHold) return getStats();
     emitState(canceled ? "canceled" : "drained");
     return getStats();
   };
@@ -378,6 +481,7 @@ export function createRecordSyncQueue({
       return seenIds.has(normalizeRecordId(recordId));
     },
     getStats,
+    ...(reconciliationEnabled ? {getReconciliationSnapshot} : {}),
     drain,
     cancel,
   };
