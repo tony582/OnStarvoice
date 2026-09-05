@@ -5,8 +5,8 @@ import vm from 'node:vm';
 import {createRecordSyncQueue} from '../../utils/record-sync-queue.js';
 import {projectElasticKeywordRecoveryStatus} from '../../server/modules/capture/application/control-outcome-projection.js';
 
-// Characterize UNMODIFIED consumers, not a fix or production replay guarantee.
-// These are the gates that prevent wiring the prototype into only one call site.
+// Three tests retain legacy gates; targeted projection now consumes explicit
+// holds. This is not a production replay guarantee or full prototype wiring.
 const sidebar = readFileSync(new URL('../../sidebar/sidebar-logic.js', import.meta.url), 'utf8');
 const start = sidebar.indexOf('function createStreamingDetailAutoSyncQueue(');
 const end = sidebar.indexOf('function routeDetailItemToStreamingSync(', start);
@@ -63,7 +63,7 @@ test('current boundary: dirty requeue runs independently of an explicit shouldRe
   assert.equal(stats.blocked, false);
 });
 
-test('current boundary: targeted result projection overwrites proposed non-retryability', () => {
+test('targeted boundary: an explicit local-confirmation code retains a distinct non-retryable hold', () => {
   const context = vm.createContext({Date, Set, URL});
   vm.runInContext(readFileSync(new URL('../../utils/cloud-targeted-post.js', import.meta.url), 'utf8'),
     context, {timeout: 5000});
@@ -74,8 +74,10 @@ test('current boundary: targeted result projection overwrites proposed non-retry
   );
   assert.equal(result.status, 'failed');
   assert.equal(result.backendSynced, false);
-  assert.equal(result.error.code, 'LOCAL_CONFIRMATION_REQUIRED');
-  assert.equal(result.error.retryable, true, 'legacy projection does not consume the proposed flag');
+  assert.equal(result.error.code, 'SYNC_RECONCILIATION_REQUIRED');
+  assert.equal(result.error.retryable, false);
+  assert.equal(result.reconciliationRequired, true);
+  assert.equal(result.sync.status, 'needs_action');
 });
 
 test('current boundary: elastic recovery can reclassify a non-safety local-confirmation failure as retryable', () => {

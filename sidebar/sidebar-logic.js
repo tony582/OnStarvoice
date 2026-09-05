@@ -66,6 +66,10 @@ import {
   buildStreamingSyncCompletionNotice,
 } from "../utils/capture/streaming-sync-presentation.js";
 import {
+  hasSyncReconciliationSignal,
+  buildSyncReconciliationError,
+} from "../utils/capture/sync-reconciliation-state.js";
+import {
   discardUnattendedCheckpointReports,
   enqueueUnattendedCheckpointReport,
   flushUnattendedCheckpointReportOutbox,
@@ -14887,9 +14891,11 @@ async function handleBatchKeywordCapture(options = {}) {
       ? "needs_action"
       : result?.canceled || batchKeywordCancelRequested
         ? "canceled"
-        : totalFailed > 0 || streamingSyncTaskIssue
-          ? "completed_with_failures"
-          : "completed";
+        : hasSyncReconciliationSignal(streamingSyncResult)
+          ? "needs_action"
+          : totalFailed > 0 || streamingSyncTaskIssue
+            ? "completed_with_failures"
+            : "completed";
     if (
       result?.securityBlocked &&
       result?.blockingError &&
@@ -14928,20 +14934,44 @@ async function handleBatchKeywordCapture(options = {}) {
       totalSuccess,
       totalFailed,
       streamingSync: streamingSyncResult,
+      ...(hasSyncReconciliationSignal(streamingSyncResult)
+        ? {reconciliationRequired: true, error: buildSyncReconciliationError()}
+        : {}),
     };
   } catch (error) {
     console.error("[Sidebar] Batch keyword capture failed:", error);
     sidebarTaskStatus = "failed";
     sidebarTaskError = error;
     caughtError = error;
-    if (error?.code === "UNATTENDED_ELASTIC_ITEM_RELEASED") {
+    const reconciliationRequired = hasSyncReconciliationSignal(error);
+    if (
+      error?.code === "UNATTENDED_ELASTIC_ITEM_RELEASED" &&
+      !reconciliationRequired
+    ) {
       throw error;
     }
-    showMessage("批量采集失败: " + error.message, "error");
+    if (reconciliationRequired) {
+      sidebarTaskStatus = batchKeywordCancelRequested ? "canceled" : "needs_action";
+      sidebarTaskError = isUnattendedSafetyBlock(error)
+        ? error
+        : buildSyncReconciliationError();
+      showMessage(sidebarTaskError.message, "warning");
+    } else {
+      showMessage("批量采集失败: " + error.message, "error");
+    }
     failureOutcome = {
       started: true,
       ok: false,
-      error: error.message,
+      error: reconciliationRequired ? buildSyncReconciliationError() : error.message,
+      ...(reconciliationRequired
+        ? {
+            reconciliationRequired: true,
+            canceled: Boolean(batchKeywordCancelRequested),
+            ...(isUnattendedSafetyBlock(error)
+              ? {securityBlocked: true, blockingError: error}
+              : {}),
+          }
+        : {}),
     };
     return failureOutcome;
   } finally {
@@ -14973,6 +15003,27 @@ async function handleBatchKeywordCapture(options = {}) {
       }
       if (caughtError && typeof caughtError === "object") {
         caughtError.streamingSync = streamingSyncResult;
+      }
+    }
+    if (
+      hasSyncReconciliationSignal(streamingSyncResult) ||
+      hasSyncReconciliationSignal(caughtError)
+    ) {
+      if (failureOutcome) {
+        failureOutcome.reconciliationRequired = true;
+        failureOutcome.error = buildSyncReconciliationError();
+        if (batchKeywordCancelRequested) failureOutcome.canceled = true;
+        if (isUnattendedSafetyBlock(caughtError)) {
+          failureOutcome.securityBlocked = true;
+          failureOutcome.blockingError = caughtError;
+        }
+      }
+      if (
+        !batchKeywordCancelRequested && sidebarTaskStatus !== "canceled" &&
+        !isUnattendedSafetyBlock(sidebarTaskError)
+      ) {
+        sidebarTaskStatus = "needs_action";
+        sidebarTaskError = buildSyncReconciliationError();
       }
     }
     const shouldEndCaptureTaskSession =
@@ -17233,6 +17284,11 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
   batchUrlCancelRequested = targetedPostCancelRequested;
   let executionLock = null;
   let targetTabId = null;
+  // Invocation-local latch: status-report failures must not erase a hold that
+  // has already been observed. This is not a durable recovery mechanism.
+  let targetedSyncReconciliationRequired =
+    Array.isArray(request.targetResults) &&
+    request.targetResults.some(hasSyncReconciliationSignal);
   let stopTargetedPostHeartbeat = () => {};
   let targetedBusinessProgressTimer = null;
   let pendingTargetedBusinessProgress = null;
@@ -17302,6 +17358,15 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     : null;
   const workflowLabel = getTargetedWorkflowLabel(targetedWorkflow);
   try {
+    if (targetedSyncReconciliationRequired) {
+      request = await updateTargetedPostRun(request, {
+        status: shouldStop() ? "canceled" : "needs_action",
+        finishedAt: new Date().toISOString(),
+        message: buildSyncReconciliationError().message,
+        error: buildSyncReconciliationError(),
+      }, invocationToken);
+      return;
+    }
     executionLock = await acquireCaptureExecutionLock({
       owner: "cloud_targeted_post_capture",
       label: workflowLabel,
@@ -17388,7 +17453,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       : [];
 
     for (const target of pendingTargets) {
-      if (shouldStop()) break;
+      if (shouldStop() || targetedSyncReconciliationRequired) break;
       const startedAt = new Date().toISOString();
       request = await updateTargetedPostRun(request, {
         status: "running",
@@ -17698,6 +17763,9 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           }
         }
       }
+      targetedSyncReconciliationRequired =
+        targetedSyncReconciliationRequired ||
+        hasSyncReconciliationSignal(targetResult);
       await flushTargetedBusinessProgress();
       if (!isActiveTargetedPostInvocation(invocationToken)) {
         throw createTargetedPostInvocationError();
@@ -17741,7 +17809,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       targetResults = Array.isArray(request.targetResults)
         ? request.targetResults.slice()
         : targetResults;
-      if (canceled) break;
+      if (canceled || hasSyncReconciliationSignal(targetResult)) break;
     }
 
     if (!isActiveTargetedPostInvocation(invocationToken)) {
@@ -17752,13 +17820,16 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       targetResults,
     );
     const canceled = shouldStop() || request.cancelRequested === true;
+    const reconciliationRequired = targetedSyncReconciliationRequired;
     const finalStatus = canceled
       ? "canceled"
-      : checkpoint.failedCount === 0 && checkpoint.warningCount === 0
-        ? "completed"
-        : checkpoint.successCount > 0 || checkpoint.warningCount > 0
-          ? "completed_with_warnings"
-          : "failed";
+      : reconciliationRequired
+        ? "needs_action"
+        : checkpoint.failedCount === 0 && checkpoint.warningCount === 0
+          ? "completed"
+          : checkpoint.successCount > 0 || checkpoint.warningCount > 0
+            ? "completed_with_warnings"
+            : "failed";
     stopTargetedPostHeartbeat();
     await flushTargetedBusinessProgress();
     request = await updateTargetedPostRun(request, {
@@ -17766,6 +17837,9 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       finishedAt: new Date().toISOString(),
       heartbeatAt: new Date().toISOString(),
       targetResults,
+      ...(reconciliationRequired
+        ? {error: buildSyncReconciliationError()}
+        : {}),
       progress: {
         current: checkpoint.processedCount,
         total: checkpoint.total,
@@ -17777,7 +17851,9 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
         failedTargetCount: checkpoint.failedCount,
       },
       message:
-        isProfileDiscovery && finalStatus === "completed"
+        finalStatus === "needs_action"
+          ? buildSyncReconciliationError().message
+          : isProfileDiscovery && finalStatus === "completed"
           ? `${workflowLabel}完成：已扫描 ${checkpoint.capturedCount} 个账号`
           : isProfileDiscovery && finalStatus === "completed_with_warnings"
             ? `${workflowLabel}部分完成：成功 ${checkpoint.capturedCount} 个，失败 ${checkpoint.failedCount} 个`
@@ -17807,14 +17883,18 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           status:
             shouldStop() || error?.code === "TARGET_CAPTURE_CANCELED"
               ? "canceled"
-              : "failed",
+              : targetedSyncReconciliationRequired || hasSyncReconciliationSignal(error)
+                ? "needs_action"
+                : "failed",
           finishedAt: new Date().toISOString(),
           heartbeatAt: new Date().toISOString(),
           message:
             shouldStop() || error?.code === "TARGET_CAPTURE_CANCELED"
               ? `${workflowLabel}已停止并保留已有结果`
               : String(error?.message || `${workflowLabel}失败`),
-          error: {
+          error: targetedSyncReconciliationRequired || hasSyncReconciliationSignal(error)
+            ? buildSyncReconciliationError()
+            : {
             code: String(error?.code || "TARGET_CAPTURE_FAILED"),
             message: String(error?.message || "定向作品采集失败").slice(
               0,
@@ -18730,6 +18810,7 @@ function buildUnattendedTerminalProgress({
   const streamingSyncEvidenceKnown = Boolean(
     streamingSync &&
       typeof streamingSync === "object" &&
+      !hasSyncReconciliationSignal(sync) &&
       typeof sync.enabled === "boolean" &&
       sync.drainCompleted === true &&
       syncInteger(sync.enqueuedCount) !== null &&
@@ -18817,6 +18898,9 @@ function buildUnattendedTerminalProgress({
     // legacy sync* values above remain UI counters and may be defaulted for
     // backwards compatibility; they are intentionally not authoritative.
     streamingSyncEvidenceKnown,
+    ...(hasSyncReconciliationSignal(sync)
+      ? {syncReconciliationRequired: true, syncDrainCompleted: false}
+      : {}),
     streamingSyncDrainCompleted:
       streamingSyncEvidenceKnown && sync.drainCompleted === true,
     streamingSyncEnabled:
@@ -19156,7 +19240,11 @@ async function runUnattendedKeywordPlanRequest(request) {
       keyword: checkpoint.activeKeyword || startingProgress.keyword,
       keywords,
       roundTotal: plannedRounds,
-      streamingSync,
+      streamingSync:
+        hasSyncReconciliationSignal(batchRunResult) ||
+        hasSyncReconciliationSignal(unattendedCaptureTaskError)
+          ? {...streamingSync, reconciliationRequired: true, drainCompleted: false}
+          : streamingSync,
       captureTaskId: unattendedCaptureTaskContext?.taskId || "",
       requestId,
       attemptId: requestAttemptId,
@@ -19694,7 +19782,10 @@ async function runUnattendedKeywordPlanRequest(request) {
     if (!batchRunResult?.started) {
       throw new Error(batchRunResult?.reason || "采集流程未启动");
     }
-    if (batchRunResult?.ok === false && batchRunResult?.error) {
+    if (
+      batchRunResult?.ok === false && batchRunResult?.error &&
+      !hasSyncReconciliationSignal(batchRunResult)
+    ) {
       throw new Error(batchRunResult.error);
     }
     if (batchRunResult?.securityBlocked) {
@@ -19779,6 +19870,37 @@ async function runUnattendedKeywordPlanRequest(request) {
       return;
     }
 
+    if (hasSyncReconciliationSignal(batchRunResult)) {
+      const reconciliationError = buildSyncReconciliationError();
+      unattendedCaptureTaskStatus = "needs_action";
+      unattendedCaptureTaskError = reconciliationError;
+      const summary = summarizeUnattendedKeywordCheckpoint(checkpoint);
+      const finishedAt = new Date().toISOString();
+      await reportUnattendedTerminalRun(
+        requestId,
+        {
+          status: "needs_action",
+          finishedAt,
+          checkpoint,
+          summary,
+          counts: buildUnattendedTaskCounts(checkpoint, summary, {
+            total: plannedTaskTotal,
+          }),
+          message: reconciliationError.message,
+          progress: createTerminalProgress({
+            status: "needs_action",
+            finishedAt,
+            message: reconciliationError.message,
+            summary,
+            streamingSync: batchRunResult.streamingSync,
+          }),
+          error: reconciliationError,
+        },
+        {attemptId: requestAttemptId},
+      );
+      return;
+    }
+
     const checkpointSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
     const checkpointProcessed =
       Math.max(0, Number(checkpointSummary.completed) || 0) +
@@ -19849,6 +19971,9 @@ async function runUnattendedKeywordPlanRequest(request) {
     unattendedCaptureTaskError = error;
     if (!activeUnattendedAttemptRejected) {
       const safetyBlocked = isUnattendedSafetyBlock(error);
+      const reconciliationRequired =
+        hasSyncReconciliationSignal(error) ||
+        hasSyncReconciliationSignal(batchRunResult);
       const elasticItemReleased =
         error?.code === "UNATTENDED_ELASTIC_ITEM_RELEASED";
       const bootstrapFailed =
@@ -19866,6 +19991,7 @@ async function runUnattendedKeywordPlanRequest(request) {
           request?.orchestrationContext?.distributionMode === "elastic_pool",
       );
       const elasticTechnicalRelease = Boolean(
+        !reconciliationRequired &&
         elasticQueueAssigned && (elasticItemReleased || bootstrapFailed),
       );
       if (elasticTechnicalRelease) {
@@ -19906,18 +20032,19 @@ async function runUnattendedKeywordPlanRequest(request) {
         }
       }
       const cloudTechnicalRecovery = Boolean(
-        request?.cloudAssigned === true &&
+        !reconciliationRequired && request?.cloudAssigned === true &&
           (bootstrapFailed || elasticItemReleased),
       );
       const needsAction =
-        safetyBlocked || (bootstrapFailed && !cloudTechnicalRecovery);
+        reconciliationRequired || safetyBlocked ||
+        (bootstrapFailed && !cloudTechnicalRecovery);
       const terminalStatus = cancellation?.status ||
         (needsAction ? "needs_action" : "failed");
       unattendedCaptureTaskStatus =
         terminalStatus === "canceled"
           ? "canceled"
           : terminalStatus === "needs_action"
-            ? "completed_with_failures"
+            ? reconciliationRequired ? "needs_action" : "completed_with_failures"
             : "failed";
       const failureSummary = summarizeUnattendedKeywordCheckpoint(checkpoint);
       const bootstrapAttemptCount = Math.max(1, Number(error?.attempts) || 1);
@@ -19952,7 +20079,9 @@ async function runUnattendedKeywordPlanRequest(request) {
         error?.streamingSync ??
         batchRunResult?.streamingSync ??
         noCaptureBootstrapSync;
-      const terminalMessage = elasticItemReleased
+      const terminalMessage = reconciliationRequired && !safetyBlocked && !cancellation
+        ? buildSyncReconciliationError().message
+        : elasticItemReleased && !reconciliationRequired
         ? `关键词「${String(error?.keyword || resumeKeyword || "").trim()}」已解除当前 Agent 锁定并交回云端；其它空闲 Agent 可立即接力，当前 Agent 可立即领取其它任务`
         : cloudTechnicalRecovery
         ? `${bootstrapFailureCopy}，当前关键词已交回云端等待其它 Agent 接力；当前 Agent 可立即领取其它任务`
@@ -19987,6 +20116,8 @@ async function runUnattendedKeywordPlanRequest(request) {
           error:
             terminalStatus === "canceled"
               ? cancellation?.error || null
+              : reconciliationRequired && !safetyBlocked
+                ? buildSyncReconciliationError()
               : {
                   code: safetyBlocked
                     ? "PLATFORM_SAFETY_BLOCK"
@@ -24521,7 +24652,11 @@ async function handleSyncAll() {
       ? `（客资：成功 ${leadsSyncedCount} / 跳过 ${leadsSkippedCount} / 失败 ${leadsFailedCount}）`
       : "";
 
-    if (result.ok && remainingCount <= 0) {
+    if (hasSyncReconciliationSignal(result)) {
+      taskStatus = "needs_action";
+      taskError = buildSyncReconciliationError();
+      showMessage(taskError.message, "warning");
+    } else if (result.ok && remainingCount <= 0) {
       const successMessage = hasLeadsSkippedOnly
         ? `全部同步成功！共 ${result.successCount} 条。客资 0 条，已跳过${leadsSummary}`
         : `全部同步成功！共 ${result.successCount} 条${leadsSummary}`;
@@ -24547,9 +24682,15 @@ async function handleSyncAll() {
     await Promise.all([refreshDataPool(), refreshSyncHistory()]);
   } catch (error) {
     console.error("[Sidebar] Sync all failed:", error);
-    taskStatus = "failed";
-    taskError = error;
-    showMessage("同步失败: " + error.message, "error");
+    if (hasSyncReconciliationSignal(error) || hasSyncReconciliationSignal(taskError)) {
+      taskStatus = "needs_action";
+      taskError = buildSyncReconciliationError();
+      showMessage(taskError.message, "warning");
+    } else {
+      taskStatus = "failed";
+      taskError = error;
+      showMessage("同步失败: " + error.message, "error");
+    }
   } finally {
     finishSidebarTask(taskContext, {
       status: taskStatus,
@@ -25123,6 +25264,18 @@ async function maybeRunAutoSyncAfterDetailCapture(
       captureTaskItemRequestHash,
     });
 
+    // Preserve the received result before cancellation or refresh can erase
+    // its confirmation signal. No retry or refresh is performed on this path.
+    if (hasSyncReconciliationSignal(result)) {
+      const error = buildSyncReconciliationError();
+      if (!silent) showMessage(error.message, "warning");
+      return {
+        ...result,
+        ok: false,
+        reconciliationRequired: true,
+        error: {...result.error, ...error},
+      };
+    }
     if (result?.canceled) return canceledResult();
 
     if (refreshAfter) {
@@ -25157,6 +25310,16 @@ async function maybeRunAutoSyncAfterDetailCapture(
 
     return result;
   } catch (error) {
+    if (hasSyncReconciliationSignal(error)) {
+      const reconciliationError = buildSyncReconciliationError();
+      if (!silent) showMessage(reconciliationError.message, "warning");
+      return {
+        ok: false,
+        reconciliationRequired: true,
+        phase: "sync",
+        error: {...error, ...reconciliationError},
+      };
+    }
     if (stopRequested()) return canceledResult();
     console.error("[Sidebar] Auto sync after detail capture failed:", error);
     if (!silent) {
