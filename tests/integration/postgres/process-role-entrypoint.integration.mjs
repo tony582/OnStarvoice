@@ -135,7 +135,10 @@ function temporaryPort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
+    // The production Express listener binds the IPv6 wildcard. Reserve the
+    // candidate port on that same address family so a concurrent IPv6-only
+    // local service cannot win the gap between discovery and child startup.
+    server.listen(0, '::', () => {
       const address = server.address();
       assert.ok(address && typeof address === 'object');
       const { port } = address;

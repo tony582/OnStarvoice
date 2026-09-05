@@ -240,7 +240,6 @@ test('Cron and the manual endpoint consume the canonical cross-device bindings',
     'crossDeviceRetrySourceAgentIdsForItems',
     'crossDeviceRetryTaskSupported',
     'dispatchCrossDeviceRetry',
-    'loadCaptureAgentLocalClosureReuseGate',
     'reconcileAutomaticCaptureRetries',
   ]) {
     assert.match(canonicalImport[1], new RegExp(`\\b${binding}\\b`, 'u'));

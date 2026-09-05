@@ -184,6 +184,7 @@ async function readLeaseState(pool, fixture) {
   const [task, item, attempt, events] = await Promise.all([
     pool.query(`
       SELECT child.status AS child_status, child.error AS child_error,
+        child.metadata AS child_metadata,
         child.finished_at::text AS child_finished_at,
         child.updated_at::text AS child_updated_at,
         parent.status AS parent_status, parent.progress AS parent_progress,
@@ -429,6 +430,48 @@ test('real PostgreSQL elastic lease reconciliation preserves eligibility, rollba
       AND event_type = 'elastic_work_item_requeued'
   `, [[offline.childTaskId, taskHeartbeat.childTaskId]]);
   assert.equal(eligibleEventCount.rows[0].count, 1);
+
+  const missingClosure = await createLeaseFixture(pool, {tenantId});
+  await pool.query(`
+    UPDATE capture_tasks
+    SET metadata = metadata || jsonb_build_object(
+      'requiresLocalClosureReuseFenceV1', true,
+      'waitingForSourceClosure', true,
+      'sourceClosureBlockedAt', (now() - interval '1 hour')::text,
+      'sourceClosureBlockedReason', 'local_closure_missing'
+    )
+    WHERE id = $1
+  `, [missingClosure.childTaskId]);
+  const missingClosureBefore = await readLeaseState(pool, missingClosure);
+  assert.equal(
+    missingClosureBefore.task.child_metadata.requiresLocalClosureReuseFenceV1,
+    true,
+  );
+  assert.deepEqual(
+    await reconcileElasticCaptureLeases(20),
+    reconciliationSummary({scanned: 1, requeued: 1, skipped: 0}),
+    'an expired marked lease must not wait indefinitely for missing browser telemetry',
+  );
+  const missingClosureAfter = await readLeaseState(pool, missingClosure);
+  assertRequeued(missingClosureAfter, 'elastic_agent_offline_timeout');
+  assert.equal(
+    missingClosureAfter.events[0].payload.sourceLocalClosureProven,
+    false,
+    'the requeue event must retain the actual missing-proof observation',
+  );
+  assert.equal(
+    Object.hasOwn(missingClosureAfter.task.child_metadata, 'waitingForSourceClosure'),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(missingClosureAfter.task.child_metadata, 'sourceClosureBlockedReason'),
+    false,
+  );
+  assert.deepEqual(
+    await reconcileElasticCaptureLeases(20),
+    reconciliationSummary({scanned: 0, requeued: 0, skipped: 0}),
+    'historical closure metadata must not create fresh recovery blockers',
+  );
 
   const commandFenced = await createLeaseFixture(pool, {tenantId});
   const commandFencedBefore = await readLeaseState(pool, commandFenced);

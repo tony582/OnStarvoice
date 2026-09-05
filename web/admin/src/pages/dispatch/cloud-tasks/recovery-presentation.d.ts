@@ -28,3 +28,21 @@ export function formatRecoveryCountdown(options?: {
   now?: number
   awaitingAgentReport?: boolean
 }): string
+
+export function formatRecoveryState(options?: {
+  commandStatus?: string | null
+  waitUntil?: number
+  now?: number
+}): string
+
+export function formatRecoveryAttemptLabel(options?: {
+  attemptCurrent?: number
+  attemptTotal?: number | null
+}): string
+
+export function activeRecoveryCommandStatus(options?: {
+  id?: unknown
+  status?: unknown
+  expiresAt?: unknown
+  now?: number
+}): string

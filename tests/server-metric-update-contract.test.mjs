@@ -3,10 +3,14 @@ import test from 'node:test';
 
 import {buildSyncAiJob, normalizeRecord} from '../server/routes/sync.js';
 import {
+  assertCaptureAttemptLineage,
+  captureAttemptLineageStrictlyRequired,
   guardRecordCommentCount,
   guardRecordTextCompleteness,
+  isCapturedRecordIdentityConflict,
   mergeObservationMetrics,
   normalizeCapturedRecordLinks,
+  retryCapturedRecordIdentityConflict,
   resolveDouyinCanonicalRecordUrl,
   resolveXhsCanonicalRecordUrl,
   resolveXhsSourceRecordUrl,
@@ -34,6 +38,74 @@ const COLLECT_KEYS = [
   'collectsCount',
   'collects_count',
 ];
+
+test('record identity conflicts retry once after the losing transaction rolls back', async () => {
+  let calls = 0;
+  const result = await retryCapturedRecordIdentityConflict(async () => {
+    calls += 1;
+    if (calls === 1) {
+      throw Object.assign(new Error('duplicate record'), {
+        code: '23505',
+        constraint: 'uniq_records_external_id',
+      });
+    }
+    return {action: 'updated'};
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(result, {action: 'updated'});
+  assert.equal(isCapturedRecordIdentityConflict({
+    code: '23505',
+    constraint: 'uniq_records_content_hash',
+  }), true);
+});
+
+test('record identity conflict retry is bounded and ignores unrelated unique errors', async () => {
+  let boundedCalls = 0;
+  await assert.rejects(
+    retryCapturedRecordIdentityConflict(async () => {
+      boundedCalls += 1;
+      throw Object.assign(new Error('still duplicated'), {
+        code: '23505',
+        constraint: 'uniq_records_external_id',
+      });
+    }),
+    /still duplicated/u,
+  );
+  assert.equal(boundedCalls, 2);
+
+  let unrelatedCalls = 0;
+  await assert.rejects(
+    retryCapturedRecordIdentityConflict(async () => {
+      unrelatedCalls += 1;
+      throw Object.assign(new Error('other unique key'), {
+        code: '23505',
+        constraint: 'some_other_constraint',
+      });
+    }),
+    /other unique key/u,
+  );
+  assert.equal(unrelatedCalls, 1);
+});
+
+test('cloud sync with an exact-attempt contract rejects missing lineage', () => {
+  const context = {
+    captureTaskId: '10000000-0000-4000-8000-000000000001',
+    captureTaskItemAttemptId: '20000000-0000-4000-8000-000000000001',
+    captureTaskItemRequestHash: 'a'.repeat(64),
+  };
+  assert.equal(captureAttemptLineageStrictlyRequired(context), true);
+  assert.throws(
+    () => assertCaptureAttemptLineage(context, null),
+    error => error?.code === 'stale_attempt' && error?.statusCode === 409,
+  );
+  const lineage = {capture_task_item_attempt_id: context.captureTaskItemAttemptId};
+  assert.strictEqual(assertCaptureAttemptLineage(context, lineage), lineage);
+  assert.equal(captureAttemptLineageStrictlyRequired({
+    ...context,
+    captureTaskItemRequestHash: '',
+  }), false);
+});
 
 test('Douyin search navigation URLs are not persisted as original work URLs', () => {
   const imageRecord = {

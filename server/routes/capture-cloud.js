@@ -35,9 +35,11 @@ import {getTenantAiAdmissionSnapshot} from '../services/ai-admission.js';
 import {
   processSocialAccountHeartbeat,
 } from '../services/social-account-usage.js';
+import { CAPTURE_PLATFORM_SAFETY_CODES } from '../services/capture-health-schema.js';
 import {
   AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT,
   ELASTIC_AGENT_CAPACITY_CODES,
+  ELASTIC_TECHNICAL_RETRY_ROUNDS,
   ORCHESTRATION_ITEM_TERMINAL_STATUSES,
   appendEvent,
   crossDeviceRetryItemNeedsManualSafety,
@@ -77,7 +79,6 @@ import {
   crossDeviceRetrySourceAgentIdsForItems,
   crossDeviceRetryTaskSupported,
   dispatchCrossDeviceRetry,
-  loadCaptureAgentLocalClosureReuseGate,
   reconcileAutomaticCaptureRetries,
 } from '../modules/capture/infrastructure/postgres-cross-device-retry.js';
 import {
@@ -147,13 +148,11 @@ const DISMISSIBLE_ATTENTION_STATUSES = new Set([
   'completed_with_failures',
 ]);
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
-const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 2 * 60 * 1000;
-const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 10 * 60 * 1000;
-// A half-hour source-Agent quarantine removes too much capacity from a small
-// production pool and, before the recovery clock was made stable, could look
-// endless in the task center. Keep the item immediately available to another
-// Agent and use only a short, bounded source-account cooldown.
-const ELASTIC_AGENT_CAPACITY_HOLD_MS = 5 * 60 * 1000;
+// Technical failures release only the failed work item. Platform safety remains
+// fenced at the immutable item + account-attempt boundary.
+const ELASTIC_TECHNICAL_AGENT_HOLD_MS = 0;
+const ELASTIC_STALE_TASK_AGENT_HOLD_MS = 0;
+const ELASTIC_AGENT_CAPACITY_HOLD_MS = 0;
 const ELASTIC_SAME_ITEM_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const ELASTIC_DISPATCH_RECHECK_MS = 60 * 1000;
 const ELASTIC_BOOTSTRAP_STAGGER_BUCKETS = 4;
@@ -769,12 +768,13 @@ export function buildElasticRecoveryMetadata({
     state: 'released_for_handoff',
     reason: safetyBlocked ? 'platform_safety_handoff' : 'technical_recovery',
     attemptCurrent,
-    attemptTotal: Math.max(1, Number(agentAttemptLimit) || 1),
+    attemptTotal: Math.max(1, Number(agentAttemptLimit) || 1) *
+      (safetyBlocked ? 1 : ELASTIC_TECHNICAL_RETRY_ROUNDS),
     sourceAgentId: normalizedSourceAgentId,
     queuedAt: new Date(recoveryAnchorMs).toISOString(),
     handoffReadyAt: new Date(recoveryAnchorMs).toISOString(),
     itemLockReleased: true,
-    sourceAgentCooling: !operatorHoldReleased && sourceAgentHoldMs > 0,
+    sourceAgentCooling: false,
     ...(operatorHoldReleased
       ? {operatorHoldReleasedAt: new Date(operatorHoldReleasedAtMs).toISOString()}
       : {}),
@@ -3863,7 +3863,7 @@ export async function mirrorTaskSnapshot(
   return task;
 }
 
-async function dispatchNextElasticWorkItem(tx, {
+export async function dispatchNextElasticWorkItem(tx, {
   agent,
   capabilities = {},
 } = {}) {
@@ -3882,8 +3882,6 @@ async function dispatchNextElasticWorkItem(tx, {
     freshCapabilities.watchedContentPatrol === true;
   const canClaimSequentialSearch =
     freshCapabilities.remoteSequentialSearchPassesV1 === true;
-  const canFenceLocalClosureReuse =
-    freshCapabilities.localClosureReuseFenceV1 === true;
   if (!canClaimKeyword && !canClaimNegativePost && !canClaimWatchedContent) {
     return null;
   }
@@ -3893,19 +3891,11 @@ async function dispatchNextElasticWorkItem(tx, {
     agent.id,
   );
   if (busy) return null;
-  // A terminal execution snapshot reaches the server before the Extension has
-  // necessarily ended its debug session, released the local capture group and
-  // closed its runner tab. Marked history remains fail-closed even if a client
-  // later reports downgraded capabilities. Legacy unmarked history receives a
-  // bounded quiescence window so a server-first rollout is safe without
-  // permanently removing an older Extension from the pool.
-  const localClosureReuseGate = await loadCaptureAgentLocalClosureReuseGate(
-    tx,
-    {tenantId: agent.tenant_id, agentId: agent.id},
-  );
-  if (!localClosureReuseGate.ready) {
-    return null;
-  }
+  // Do not turn browser-local cleanup evidence into a queue-wide allocation
+  // lock. The Extension's execution lock is the authority for local
+  // concurrency; assignment revisions and idempotent persistence fence late or
+  // duplicate results. A missing historical local-closure snapshot is useful
+  // audit evidence, but it must never strand an otherwise idle Agent.
   const recentRecoveryAttempt = await tx.queryOne(`
     SELECT attempt.status, attempt.error, attempt.checkpoint,
       attempt.finished_at, attempt.updated_at,
@@ -4062,8 +4052,9 @@ async function dispatchNextElasticWorkItem(tx, {
           ELSE NULL
         END,
         item.attempt_count
-      ) < agent_policy.agent_attempt_limit
-      AND item.attempt_count < agent_policy.agent_attempt_limit
+      ) < agent_policy.agent_attempt_limit * $10::integer
+      AND item.attempt_count <
+        agent_policy.agent_attempt_limit * $10::integer
       AND (cardinality($4::text[]) = 0 OR item.platform = ANY($4::text[]))
       AND (cardinality($5::text[]) = 0 OR item.platform = ANY($5::text[]))
       AND (
@@ -4087,12 +4078,81 @@ async function dispatchNextElasticWorkItem(tx, {
           AND active_command.task_id = item.execution_task_id
           AND active_command.status IN ('pending', 'acknowledged')
       )
+      -- A CAPTCHA/login/safety result fences this exact item/account pair for
+      -- the lifetime of the parent task. Technical failures only fence the
+      -- account for the current pool pass; once every eligible Agent has been
+      -- tried, the next bounded pass may reuse a healthy account.
       AND NOT EXISTS (
         SELECT 1
-        FROM capture_task_item_attempts same_agent_attempt
-        WHERE same_agent_attempt.tenant_id = item.tenant_id
-          AND same_agent_attempt.item_id = item.id
-          AND same_agent_attempt.agent_id = $2::uuid
+        FROM capture_task_item_attempts safety_attempt
+        WHERE safety_attempt.tenant_id = item.tenant_id
+          AND safety_attempt.item_id = item.id
+          AND safety_attempt.agent_id = $2::uuid
+          AND (
+            UPPER(COALESCE(
+              safety_attempt.error->>'code',
+              safety_attempt.checkpoint->>'errorCode',
+              safety_attempt.checkpoint->>'error_code',
+              ''
+            )) = ANY($11::text[])
+            OR LOWER(COALESCE(
+              safety_attempt.error->>'category',
+              safety_attempt.checkpoint->>'errorCategory',
+              safety_attempt.checkpoint->>'error_category',
+              ''
+            )) IN (
+              'platform_safety_block',
+              'login_required',
+              'authentication_required'
+            )
+            OR COALESCE(
+              safety_attempt.error->>'securityBlocked',
+              safety_attempt.error->>'security_blocked',
+              safety_attempt.error->>'platformSafetyBlocked',
+              safety_attempt.error->>'platform_safety_blocked',
+              safety_attempt.checkpoint->>'securityBlocked',
+              safety_attempt.checkpoint->>'security_blocked',
+              safety_attempt.checkpoint->>'platformSafetyBlocked',
+              safety_attempt.checkpoint->>'platform_safety_blocked',
+              'false'
+            ) = 'true'
+            OR COALESCE(
+              safety_attempt.error->>'requiresManualAction',
+              safety_attempt.error->>'requires_manual_action',
+              safety_attempt.checkpoint->>'requiresManualAction',
+              safety_attempt.checkpoint->>'requires_manual_action',
+              'false'
+            ) = 'true'
+            OR COALESCE(
+              safety_attempt.error #>> '{securityEvidence,confirmed}',
+              safety_attempt.error #>> '{security_evidence,confirmed}',
+              safety_attempt.checkpoint #>> '{securityEvidence,confirmed}',
+              safety_attempt.checkpoint #>> '{security_evidence,confirmed}',
+              'false'
+            ) = 'true'
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM (
+          SELECT recent_attempt.agent_id,
+            ROW_NUMBER() OVER (
+              ORDER BY recent_attempt.attempt_number DESC,
+                recent_attempt.created_at DESC,
+                recent_attempt.id DESC
+            ) AS reverse_attempt_ordinal
+          FROM capture_task_item_attempts recent_attempt
+          WHERE recent_attempt.tenant_id = item.tenant_id
+            AND recent_attempt.item_id = item.id
+            AND recent_attempt.agent_id IS NOT NULL
+        ) current_round_attempt
+        WHERE current_round_attempt.agent_id = $2::uuid
+          AND current_round_attempt.reverse_attempt_ordinal <=
+            MOD(item.attempt_count, agent_policy.agent_attempt_limit)
+      )
+      AND (
+        agent_policy.agent_attempt_limit = 1
+        OR item.assigned_agent_id IS DISTINCT FROM $2::uuid
       )
     ORDER BY
       CASE WHEN item.status = 'pending' THEN 0 ELSE 1 END,
@@ -4117,6 +4177,8 @@ async function dispatchNextElasticWorkItem(tx, {
     canClaimNegativePost,
     canClaimWatchedContent,
     canClaimSequentialSearch,
+    ELASTIC_TECHNICAL_RETRY_ROUNDS,
+    Array.from(CAPTURE_PLATFORM_SAFETY_CODES),
   ]);
   if (!candidate) return null;
 
@@ -4129,103 +4191,6 @@ async function dispatchNextElasticWorkItem(tx, {
     safeJson(planSnapshot.recoveryPolicy).singleRelayV1 === true;
   if (requiresSingleRelay && freshCapabilities.singleRelayV1 !== true) {
     return null;
-  }
-  const requiresSourceLocalClosure =
-    captureItemRequiresLocalClosureReuseFence({
-      itemType: candidate.item_type,
-      sourceExecutionMetadata: candidate.source_execution_metadata,
-    });
-  if (candidate.item_status === 'retryable' && requiresSourceLocalClosure) {
-    const sourceExecutionKnown = UUID_PATTERN.test(previousExecutionTaskId);
-    const sourceAttempt = await tx.queryOne(`
-      SELECT id, agent_id, attempt_number, assignment_revision, started_at
-      FROM capture_task_item_attempts
-      WHERE tenant_id = $1
-        AND item_id = $2
-        AND ($3::uuid IS NULL OR execution_task_id = $3)
-      ORDER BY attempt_number DESC, created_at DESC, id DESC
-      LIMIT 1
-      FOR UPDATE
-    `, [
-      agent.tenant_id,
-      candidate.item_id,
-      sourceExecutionKnown ? previousExecutionTaskId : null,
-    ]);
-    const neverOpened = captureExecutionNeverOpened({
-      executionTaskId: previousExecutionTaskId,
-      error: candidate.item_error,
-      sourceExecutionMetadata: candidate.source_execution_metadata,
-      executionStartedAt: candidate.source_execution_started_at,
-      itemStartedAt: candidate.item_started_at,
-      attemptStartedAt: sourceAttempt?.started_at,
-      attemptExists: Boolean(sourceAttempt),
-      attemptCount: candidate.attempt_count,
-    });
-    const sourceAgentId = text(
-      sourceAttempt?.agent_id || candidate.source_agent_id,
-      100,
-    ).toLowerCase();
-    const localClosureProof = neverOpened
-      ? {proven: true, reason: 'item_never_opened'}
-      : await loadVerifiedCaptureLocalClosureProof(tx, {
-          tenantId: agent.tenant_id,
-          executionTaskId: previousExecutionTaskId,
-          sourceAgentId,
-          itemId: candidate.item_id,
-          itemAttemptId: sourceAttempt?.id,
-          itemAttemptNumber: sourceAttempt?.attempt_number,
-          assignmentRevision:
-            sourceAttempt?.assignment_revision ?? candidate.assignment_revision,
-        });
-    if (
-      !neverOpened &&
-      localClosureProof.proven !== true
-    ) {
-      const firstWait = itemMetadata.waitingForSourceClosure !== true;
-      await tx.execute(`
-        UPDATE capture_task_items
-        SET metadata = metadata || jsonb_build_object(
-            'waitingForSourceClosure', true,
-            'sourceClosureBlockedAt', COALESCE(
-              NULLIF(metadata->>'sourceClosureBlockedAt', ''),
-              now()::text
-            ),
-            'sourceClosureBlockedReason', $5::text,
-            'sourceClosureBlockedAttemptId', $6::text
-          )
-        WHERE tenant_id = $1
-          AND task_id = $2
-          AND id = $3
-          AND status = 'retryable'
-          AND assignment_revision = $4
-      `, [
-        agent.tenant_id,
-        candidate.parent_id,
-        candidate.item_id,
-        Number(candidate.assignment_revision || 0),
-        text(localClosureProof.reason, 160),
-        text(sourceAttempt?.id, 100),
-      ]);
-      if (firstWait) {
-        await appendEvent(tx, {
-          tenantId: agent.tenant_id,
-          taskId: candidate.parent_id,
-          agentId: sourceAgentId || null,
-          eventType: 'elastic_handoff_waiting_local_closure',
-          actorType: 'system',
-          actorName: '云端弹性调度器',
-          status: 'retryable',
-          message: '原设备尚未确认关闭本地工作页，暂缓接力以免同一关键词双跑',
-          payload: {
-            itemId: candidate.item_id,
-            sourceExecutionTaskId: previousExecutionTaskId,
-            sourceItemAttemptId: text(sourceAttempt?.id, 100),
-            proofReason: text(localClosureProof.reason, 160),
-          },
-        });
-      }
-      return null;
-    }
   }
   const negativePost = candidate.item_type === 'negative_post';
   const watchedContent = candidate.item_type === 'watched_content';
@@ -4491,9 +4456,6 @@ async function dispatchNextElasticWorkItem(tx, {
     distributionMode: 'elastic_pool',
     claimUnit,
     attemptIdentity,
-    ...(canFenceLocalClosureReuse && candidate.item_type === 'keyword'
-      ? {requiresLocalClosureReuseFenceV1: true}
-      : {}),
     ...(bootstrapPacing ? {bootstrapPacing} : {}),
     ...(sequentialResumeCheckpoint
       ? {

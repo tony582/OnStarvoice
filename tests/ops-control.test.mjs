@@ -151,7 +151,7 @@ test('control plane defaults to tenant-off observe-only mode with an explicit gl
   assert.equal(defaults.actionsEnabled, false);
   assert.equal(defaults.actionsGlobalEnabled, false);
   assert.equal(defaults.llmEnabled, false);
-  assert.equal(defaults.runtimeBaselineVersion, '0.4.3');
+  assert.equal(defaults.runtimeBaselineVersion, '0.4.5');
   assert.equal(resolveOpsControlGlobalEnabled({OPS_CONTROL_GLOBAL_ENABLED: 'off'}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({OPS_CONTROL_ACTIONS_GLOBAL_ENABLED: 'true'}), true);
@@ -493,7 +493,7 @@ test('manual final state is separated from a system incident', () => {
   assert.equal(assessment.summary.redIncidentCount, 0);
 });
 
-test('source-local-closure recovery fences are counted as explicit blockers, never recovered items', () => {
+test('historical source-closure markers are non-actionable compatibility data', () => {
   const rawTask = {
     id: 'closure-blocked-task',
     title: '抖音无人值守',
@@ -528,14 +528,14 @@ test('source-local-closure recovery fences are counted as explicit blockers, nev
     ai: {},
   });
 
-  assert.equal(current.tasks[0].sourceClosureBlockedItemCount, 1);
-  assert.equal(current.taskSummary.sourceClosureBlockedItems, 1);
+  assert.equal(current.tasks[0].sourceClosureBlockedItemCount, 0);
+  assert.equal(current.taskSummary.sourceClosureBlockedItems, 0);
   assert.equal(current.taskSummary.recoveredItems, 0);
 
   const assessment = assessOpsControlSnapshots(previous, current, policy());
-  assert.equal(assessment.summary.sourceClosureBlockedCount, 1);
+  assert.equal(assessment.summary.sourceClosureBlockedCount, 0);
   assert.equal(assessment.summary.manualBlockerCount, 0);
-  assert.ok(assessment.incidents.some(
+  assert.ok(!assessment.incidents.some(
     row => row.type === 'capture_source_closure_blocked',
   ));
   assert.ok(!assessment.incidents.some(
@@ -774,19 +774,15 @@ test('guarded action verification persists open-state transitions without counti
   assert.equal(pending.result.verificationFailed, 0);
 });
 
-test('ops-control persistence collects source-local-closure blockers from item and active child truth', async () => {
+test('ops-control persistence ignores historical source-closure markers', async () => {
   const service = await source('server/services/ops-control.js');
   const actions = await source('server/services/ops-control-actions.js');
-  assert.match(service, /source_closure_blocked_item_count/u);
-  assert.match(service, /item\.metadata->>'waitingForSourceClosure' = 'true'/u);
-  assert.match(
+  assert.match(service, /0::int AS source_closure_blocked_item_count/u);
+  assert.doesNotMatch(
     service,
-    /closure_blocked_execution\.metadata->>'waitingForSourceClosure' = 'true'/u,
+    /metadata->>'waitingForSourceClosure'/u,
   );
-  assert.match(
-    service,
-    /item\.status IN \([\s\S]*'retryable'[\s\S]*waitingForSourceClosure/u,
-  );
+  assert.doesNotMatch(service, /capture_source_closure_blocked/u);
   assert.match(actions, /sourceClosureBlocked[\s\S]*status: 'blocked'/u);
   assert.match(
     actions,
@@ -796,10 +792,7 @@ test('ops-control persistence collects source-local-closure blockers from item a
     actions,
     /CASE status WHEN 'pending_verification' THEN 0 ELSE 1 END/u,
   );
-  assert.match(
-    service,
-    /WHERE root\.status NOT IN \([\s\S]*source_closure_blocked_item_count/u,
-  );
+  assert.match(service, /const sourceClosureBlockedCount = 0/u);
 });
 
 test('a task-level terminal failure is not hidden when no work item was created', () => {

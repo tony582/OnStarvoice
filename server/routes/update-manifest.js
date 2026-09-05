@@ -3,12 +3,50 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.3',
+  latestVersion: '0.4.5',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-01',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.3-20260901.zip',
+  releaseDate: '2026-09-02',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.5-20260902.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.5',
+      releaseDate: '2026-09-02',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: 'AI Debug 仅作为采集辅助，不再阻断主采集',
+              desc: 'AI Debug 启动失败、被其它会话占用或运行中断开时，Extension 会保留当前页面与采集任务继续执行，不再因此冷却 Agent、转交关键词、返回首页或停止主采集。',
+            },
+            {
+              title: '任务资源按精确 attempt 隔离与清理',
+              desc: '调试会话、任务页、worker 与原生标签组均按任务、attempt、平台和来源页校验所有权；旧尝试与服务工作线程重启不会清理或复活新任务资源，完成后可以继续领取下一条。',
+            },
+            {
+              title: '值守页只展示可验证的恢复事实',
+              desc: '移除虚构的关闭证明、冷却和倒计时状态；过期恢复命令不再显示为正在下发或等待，让异常、自动恢复与真实阻塞保持一致。',
+            },
+          ],
+        },
+      ],
+    },
+    {
+      version: '0.4.4',
+      releaseDate: '2026-09-01',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '任务完成后自动释放并继续领取下一条',
+              desc: '将完成、失败和取消后的本地资源清理、关闭证明、云端回传与重试收进 Extension 后台可靠闭环；即使运行页消息丢失或后台休眠，节点也会按精确 request/attempt 自愈，不再完成一条后停止分配。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.3',
       releaseDate: '2026-09-01',

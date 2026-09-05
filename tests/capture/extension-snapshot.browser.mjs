@@ -10,10 +10,13 @@ import {
   writeFile,
 } from "node:fs/promises";
 import {tmpdir} from "node:os";
-import {createServer} from "node:http";
+import {createServer} from "node:https";
 import {basename, dirname, join, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
-import {spawn} from "node:child_process";
+import {execFile, spawn} from "node:child_process";
+import {promisify} from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const extensionDir = join(repoRoot, "extension-build");
@@ -82,6 +85,59 @@ async function resolveChromiumExecutable() {
   throw new Error(
     "extension smoke test requires open-source Chromium; set CHROMIUM_EXECUTABLE_PATH",
   );
+}
+
+async function createFixtureTlsCredentials(directory) {
+  const configPath = join(directory, "openssl.cnf");
+  const keyPath = join(directory, "fixture.key.pem");
+  const certificatePath = join(directory, "fixture.cert.pem");
+  await writeFile(
+    configPath,
+    `[req]
+prompt = no
+distinguished_name = fixture_identity
+x509_extensions = fixture_extensions
+
+[fixture_identity]
+CN = StarVoice browser fixture
+
+[fixture_extensions]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, digitalSignature, keyEncipherment, keyCertSign
+extendedKeyUsage = serverAuth
+subjectAltName = @fixture_names
+
+[fixture_names]
+DNS.1 = www.xiaohongshu.com
+DNS.2 = www.douyin.com
+DNS.3 = s.weibo.com
+IP.1 = 127.0.0.1
+`,
+  );
+  const opensslExecutable =
+    String(process.env.OPENSSL_EXECUTABLE || "openssl").trim() || "openssl";
+  await execFileAsync(opensslExecutable, [
+    "req",
+    "-x509",
+    "-newkey",
+    "rsa:2048",
+    "-sha256",
+    "-nodes",
+    "-days",
+    "1",
+    "-keyout",
+    keyPath,
+    "-out",
+    certificatePath,
+    "-config",
+    configPath,
+    "-extensions",
+    "fixture_extensions",
+  ]);
+  return {
+    key: await readFile(keyPath),
+    cert: await readFile(certificatePath),
+  };
 }
 
 function deriveUnpackedExtensionId(path) {
@@ -340,7 +396,13 @@ const douyinFixtureCards = douyinFixtureIds
       </article>`,
   )
   .join("");
-const fixtureServer = createServer((request, response) => {
+let fixtureRequestCount = 0;
+const fixtureTlsDir = await mkdtemp(
+  join(tmpdir(), "starvoice-extension-fixture-tls-"),
+);
+const fixtureTlsCredentials = await createFixtureTlsCredentials(fixtureTlsDir);
+const fixtureServer = createServer(fixtureTlsCredentials, (request, response) => {
+  fixtureRequestCount += 1;
   response.writeHead(200, {"content-type": "text/html; charset=utf-8"});
   if (String(request.headers.host || "").startsWith("www.douyin.com")) {
     response.end(
@@ -362,10 +424,10 @@ await new Promise((resolvePromise, rejectPromise) => {
   fixtureServer.listen(0, "127.0.0.1", resolvePromise);
 });
 const fixturePort = fixtureServer.address().port;
-const sourceUrl = `http://www.xiaohongshu.com:${fixturePort}/search_result?keyword=starvoice-fixture`;
+const sourceUrl = `https://www.xiaohongshu.com:${fixturePort}/search_result?keyword=starvoice-fixture`;
 const douyinSourceUrl =
-  `http://www.douyin.com:${fixturePort}/jingxuan/search/starvoice-fixture?type=general`;
-const weiboUrl = `http://s.weibo.com:${fixturePort}/weibo?q=starvoice-fixture`;
+  `https://www.douyin.com:${fixturePort}/jingxuan/search/starvoice-fixture?type=general`;
+const weiboUrl = `https://s.weibo.com:${fixturePort}/weibo?q=starvoice-fixture`;
 const profileDir = await mkdtemp(join(tmpdir(), "starvoice-extension-smoke-"));
 const chrome = spawn(
   executable,
@@ -373,8 +435,13 @@ const chrome = spawn(
     "--headless=new",
     "--no-first-run",
     "--no-default-browser-check",
+    // Keep the isolated browser entirely outside the user's macOS keychain.
+    "--use-mock-keychain",
     "--disable-background-networking",
     "--disable-component-update",
+    // Trust the short-lived fixture certificate only inside this temporary
+    // browser profile; the production-like hostnames still resolve to loopback.
+    "--ignore-certificate-errors",
     "--no-proxy-server",
     "--host-resolver-rules=MAP www.xiaohongshu.com 127.0.0.1, MAP www.douyin.com 127.0.0.1, MAP s.weibo.com 127.0.0.1",
     "--remote-debugging-port=0",
@@ -437,7 +504,7 @@ try {
       const tab = await chrome.tabs.create({url: ${JSON.stringify(sourceUrl)}, active: false});
       for (let attempt = 0; attempt < 100; attempt += 1) {
         const current = await chrome.tabs.get(tab.id);
-        if ((current.url || '').startsWith('http://www.xiaohongshu.com:')) {
+        if (((current.url || current.pendingUrl) || '').startsWith('https://www.xiaohongshu.com:')) {
           return current;
         }
         await new Promise(resolve => setTimeout(resolve, 25));
@@ -446,14 +513,26 @@ try {
     })()`,
   );
   const sourceTabId = sourceTab?.id;
+  const sourceTabUrl = String(sourceTab?.url || sourceTab?.pendingUrl || "");
   assert.equal(Number.isSafeInteger(sourceTabId), true, JSON.stringify(sourceTab));
-  assert.match(String(sourceTab?.url || ""), /^http:\/\/www\.xiaohongshu\.com:/u);
+  assert.match(
+    sourceTabUrl,
+    /^https:\/\/www\.xiaohongshu\.com:/u,
+    JSON.stringify(sourceTab),
+  );
   await waitUntil(async () =>
     await evaluate(
       client,
       `chrome.tabs.get(${sourceTabId}).then(tab => tab.status === 'complete')`,
     ),
-  );
+  ).catch(async (error) => {
+    const current = await evaluate(
+      client,
+      `chrome.tabs.get(${sourceTabId})`,
+    ).catch(() => null);
+    error.message = `${error.message}; fixture requests=${fixtureRequestCount}; tab=${JSON.stringify(current)}`;
+    throw error;
+  });
 
   const taskId = "extension-snapshot-task";
   const begin = await evaluate(
@@ -807,7 +886,7 @@ try {
       const tab = await chrome.tabs.create({url: ${JSON.stringify(douyinSourceUrl)}, active: false});
       for (let attempt = 0; attempt < 100; attempt += 1) {
         const current = await chrome.tabs.get(tab.id);
-        if ((current.url || '').startsWith('http://www.douyin.com:')) {
+        if (((current.url || current.pendingUrl) || '').startsWith('https://www.douyin.com:')) {
           return current;
         }
         await new Promise(resolve => setTimeout(resolve, 25));
@@ -816,7 +895,26 @@ try {
     })()`,
   );
   const douyinTabId = douyinTab?.id;
+  const douyinTabUrl = String(douyinTab?.url || douyinTab?.pendingUrl || "");
   assert.equal(Number.isSafeInteger(douyinTabId), true, JSON.stringify(douyinTab));
+  assert.match(
+    douyinTabUrl,
+    /^https:\/\/www\.douyin\.com:/u,
+    JSON.stringify(douyinTab),
+  );
+  await waitUntil(async () =>
+    await evaluate(
+      client,
+      `chrome.tabs.get(${douyinTabId}).then(tab => tab.status === 'complete')`,
+    ),
+  ).catch(async (error) => {
+    const current = await evaluate(
+      client,
+      `chrome.tabs.get(${douyinTabId})`,
+    ).catch(() => null);
+    error.message = `${error.message}; fixture requests=${fixtureRequestCount}; tab=${JSON.stringify(current)}`;
+    throw error;
+  });
   const douyinTaskId = "extension-snapshot-douyin-task";
   const douyinBegin = await evaluate(
     client,
@@ -974,7 +1072,7 @@ try {
     await evaluate(
       client,
       `chrome.tabs.get(${weiboTabId}).then(tab =>
-        (tab.url || '').startsWith('http://s.weibo.com:'))`,
+        ((tab.url || tab.pendingUrl) || '').startsWith('https://s.weibo.com:'))`,
     ),
   );
   const rejected = await evaluate(
@@ -1013,4 +1111,5 @@ try {
   });
   await rm(profileDir, {recursive: true, force: true});
   await new Promise((resolvePromise) => fixtureServer.close(resolvePromise));
+  await rm(fixtureTlsDir, {recursive: true, force: true});
 }

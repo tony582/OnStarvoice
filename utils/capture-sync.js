@@ -242,12 +242,65 @@ async function sendCaptureTaskLifecycleMessage(
   }
 }
 
+function isUncertainCaptureTaskLifecycleResult(result) {
+  return Boolean(
+    result?.ok !== true &&
+      result?.reason === 'task_session_unavailable' &&
+      result?.error,
+  );
+}
+
+function normalizeIgnoredCaptureTaskBeginResult(result) {
+  if (result?.ok !== true || result?.data?.ignored !== true) return result;
+  return {
+    ...result,
+    ok: false,
+    skipped: true,
+    reason: String(result.data.reason || 'task_session_ignored'),
+  };
+}
+
+async function cleanupUncertainCaptureTaskBegin(
+  {taskId = '', attemptId = ''} = {},
+  options = {},
+) {
+  const endPayload = {
+    taskId: normalizeCaptureTaskId(taskId),
+    reason: 'begin_confirmation_failed',
+    status: 'failed',
+    ...(normalizeCaptureTaskAttemptId(attemptId)
+      ? {attemptId: normalizeCaptureTaskAttemptId(attemptId)}
+      : {}),
+  };
+  let result = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    result = await sendCaptureTaskLifecycleMessage(
+      CAPTURE_TASK_MESSAGE_TYPE.END,
+      endPayload,
+      options,
+    );
+    const terminallyAbsent =
+      result?.reason === 'capture_task_not_found' ||
+      result?.response?.error?.code === 'capture_task_not_found';
+    if (result?.ok === true || terminallyAbsent || attempt === 1) break;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  const terminallyAbsent =
+    result?.reason === 'capture_task_not_found' ||
+    result?.response?.error?.code === 'capture_task_not_found';
+  return {
+    attempted: true,
+    confirmed: result?.ok === true || terminallyAbsent,
+    result,
+  };
+}
+
 async function setCaptureTaskTakeoverStateInTab(
   {
     tabId = null,
     taskId = '',
     active = false,
-    label = 'AI 正在接管',
+    label = '采集辅助运行中',
     clearTrace = false,
   } = {},
   {chromeApi = globalThis.chrome} = {},
@@ -269,7 +322,7 @@ async function setCaptureTaskTakeoverStateInTab(
         action: 'setCaptureTaskTakeover',
         taskId: normalizeCaptureTaskId(taskId),
         active: Boolean(active),
-        label: String(label || 'AI 正在接管').trim().slice(0, 80),
+        label: String(label || '采集辅助运行中').trim().slice(0, 80),
         clearTrace: clearTrace === true,
       },
     });
@@ -332,6 +385,7 @@ export async function beginCaptureTaskSession(
     ...(normalizedAttemptId ? {attemptId: normalizedAttemptId} : {}),
   };
   let result = null;
+  let beginResponseWasUncertain = false;
   const retryDelays = existing ? [0, 120, 360, 720] : [0];
   for (const delayMs of retryDelays) {
     if (delayMs > 0) {
@@ -342,11 +396,12 @@ export async function beginCaptureTaskSession(
       beginPayload,
       options,
     );
-    if (result.ok) break;
+    result = normalizeIgnoredCaptureTaskBeginResult(result);
+    if (result.ok && result.data?.ignored !== true) break;
+    if (result?.data?.ignored === true) break;
     if (
       !existing ||
       !new Set([
-        'capture_task_source_mismatch',
         'capture_task_not_found',
         'capture_task_cleanup_pending',
       ]).has(String(result.reason || ''))
@@ -354,7 +409,37 @@ export async function beginCaptureTaskSession(
       break;
     }
   }
+  if (isUncertainCaptureTaskLifecycleResult(result)) {
+    beginResponseWasUncertain = true;
+    result = normalizeIgnoredCaptureTaskBeginResult(
+      await sendCaptureTaskLifecycleMessage(
+        CAPTURE_TASK_MESSAGE_TYPE.BEGIN,
+        beginPayload,
+        options,
+      ),
+    );
+  }
   if (!result.ok) {
+    if (beginResponseWasUncertain) {
+      const cleanup = await cleanupUncertainCaptureTaskBegin(
+        {taskId: normalizedTaskId, attemptId: normalizedAttemptId},
+        options,
+      );
+      return {
+        ...result,
+        active: false,
+        taskId: normalizedTaskId,
+        reason: cleanup.confirmed
+          ? result.reason
+          : 'capture_task_begin_cleanup_failed',
+        ...(!cleanup.confirmed
+          ? {originalReason: String(result.reason || '')}
+          : {}),
+        cleanupAttempted: cleanup.attempted,
+        cleanupConfirmed: cleanup.confirmed,
+        cleanupResult: cleanup.result,
+      };
+    }
     return {...result, active: false, taskId: normalizedTaskId};
   }
 
@@ -368,12 +453,14 @@ export async function beginCaptureTaskSession(
   session.attemptId = normalizedAttemptId;
   session.state = 'active';
   activeCaptureTaskSessions.set(normalizedTaskId, session);
+  const assistDegraded = result.data?.assistDegraded === true;
   await setCaptureTaskTakeoverStateInTab(
     {
       tabId: normalizedTabId,
       taskId: normalizedTaskId,
-      active: true,
-      label: 'AI 正在接管',
+      active: !assistDegraded,
+      label: '采集辅助运行中',
+      clearTrace: assistDegraded,
     },
     options,
   );
@@ -381,6 +468,14 @@ export async function beginCaptureTaskSession(
     ...result,
     active: true,
     taskId: normalizedTaskId,
+    ...(assistDegraded
+      ? {
+          degraded: true,
+          assistReason:
+            String(result.data?.assistReason || '').trim() ||
+            'capture_assist_unavailable',
+        }
+      : {}),
     ...(existing ? {reused: true, rebound: true} : {}),
   };
 }
@@ -479,7 +574,7 @@ export async function endCaptureTaskSession(
         tabId: session.tabId,
         taskId: session.taskId,
         active: false,
-        label: 'AI 正在接管',
+        label: '采集辅助运行中',
         clearTrace: true,
       },
       options,
@@ -4035,39 +4130,33 @@ export async function batchCaptureDetailsForRecords(
     Boolean(normalizedCaptureTaskId) &&
     (taskTabRegistration?.ok !== true || taskTabRegistration?.skipped === true);
   if (taskTabRegistration?.ok === false || requiredTaskRegistrationMissing) {
-    await closeOwnedDetailRunnerTab({
-      runnerTabId: runnerContext.runnerTabId,
-      sourceTabId: runnerContext.sourceTabId,
-      ownsRunnerTab: runnerContext.ownsRunnerTab,
-    }).catch(() => false);
-    return await buildSetupFailureResult({
-      code: 'TASK_TAB_GROUP_UNAVAILABLE',
-      message:
-        taskTabRegistration?.response?.error?.message ||
-        (taskTabRegistration?.skipped
-          ? '当前详情采集任务已失去浏览器接管状态'
-          : '') ||
-        '详情采集工作页无法加入当前任务标签组',
-      sourceTabId: runnerContext.sourceTabId,
-      runnerTabId: runnerContext.runnerTabId,
-      aiFilteredRecordIds: relevancePrefilterSkipRecordIdSet,
-      alreadyCapturedRecordIds: skipRecordIdSet,
-      relevanceDecisionById: relevanceDecisionByRecordId,
-    });
+    console.warn(
+      '[CaptureSync] optional capture assist registration unavailable; continuing detail capture:',
+      taskTabRegistration?.response?.error?.message ||
+        taskTabRegistration?.reason ||
+        'task group unavailable',
+    );
   }
 
   const remainingDetailCount = Math.max(
     0,
     uniqueRecordIds.length - preDetailSkipRecordIdSet.size,
   );
-  const allowDetailDoubleBuffer = !detailBatchContainsDouyin;
+  const taskTabRegistrationActive = Boolean(
+    taskTabRegistration?.ok === true && taskTabRegistration?.skipped !== true,
+  );
+  const allowDetailDoubleBuffer = Boolean(
+    !detailBatchContainsDouyin &&
+      (!normalizedCaptureTaskId || taskTabRegistrationActive),
+  );
   if (
     normalizedCaptureTaskId &&
     remainingDetailCount >= DETAIL_PREFETCH_WORKER_COUNT &&
     !allowDetailDoubleBuffer
   ) {
-    doubleBufferFallbackReason =
-      '抖音使用单工作页，避免自动连播导致作品错配';
+    doubleBufferFallbackReason = detailBatchContainsDouyin
+      ? '抖音使用单工作页，避免自动连播导致作品错配'
+      : '采集辅助未注册，已使用单工作页避免遗留未跟踪页面';
   }
   if (
     normalizedCaptureTaskId &&
@@ -4099,9 +4188,10 @@ export async function batchCaptureDetailsForRecords(
       if (standbyRegistrationMissing) {
         const error = new Error(
           standbyRegistration?.response?.error?.message ||
-            '预加载工作页未能加入当前任务标签组',
+            standbyRegistration?.reason ||
+            '预加载工作页未能注册采集辅助',
         );
-        error.code = 'DETAIL_STANDBY_REGISTRATION_FAILED';
+        error.code = 'DETAIL_STANDBY_ASSIST_UNAVAILABLE';
         throw error;
       }
       runnerContexts.push(standbyContext);
@@ -4417,12 +4507,12 @@ export async function batchCaptureDetailsForRecords(
           Boolean(normalizedCaptureTaskId) &&
           (registration?.ok !== true || registration?.skipped === true);
         if (registration?.ok === false || registrationMissing) {
-          const error = new Error(
+          console.warn(
+            '[CaptureSync] optional rebuilt-worker assist registration unavailable; continuing ungrouped:',
             registration?.response?.error?.message ||
-              '重建的详情工作页无法加入当前任务标签组',
+              registration?.reason ||
+              'task group unavailable',
           );
-          error.code = 'TASK_TAB_GROUP_UNAVAILABLE';
-          throw error;
         }
         replacementContexts.push(replacementContext);
       } catch (error) {
@@ -16438,15 +16528,6 @@ export async function batchCaptureByKeywords({
           await navigateToSearchUrl(runnerTabId, searchUrl, shouldStop);
         }
       }
-      if (captureTaskId) {
-        await setCaptureTaskTakeoverStateInTab({
-          tabId: runnerTabId,
-          taskId: captureTaskId,
-          active: true,
-          label: 'AI 正在接管',
-        });
-      }
-
       // 抖音结果探针会每 300ms 检查“服务出现异常”，不要先固定等 2 秒。
       // 稳定异常且没有作品时，本词按 0 条正常完成并继续；其它平台保留原有渲染宽限。
       if (!isDouyinPlatform(platform)) {

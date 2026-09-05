@@ -31,7 +31,7 @@ test("Douyin runner contract uses one dedicated worker and never the source tab"
   );
   const registrationEnd = body.indexOf("});", registrationAt) + 3;
   const doubleBufferAt = body.indexOf(
-    "const allowDetailDoubleBuffer = !detailBatchContainsDouyin",
+    "const allowDetailDoubleBuffer = Boolean(",
     registrationEnd,
   );
 
@@ -39,11 +39,26 @@ test("Douyin runner contract uses one dedicated worker and never the source tab"
   assert.ok(registrationAt > runnerInitAt, "worker must be created before registration");
   assert.ok(doubleBufferAt > registrationAt, "missing Douyin serial-worker guard");
 
+  const doubleBufferGuard = body.slice(
+    doubleBufferAt,
+    body.indexOf(");", doubleBufferAt) + 2,
+  );
+  assert.match(
+    doubleBufferGuard,
+    /!detailBatchContainsDouyin/u,
+    "Douyin must never enable the second detail worker",
+  );
+  assert.match(
+    doubleBufferGuard,
+    /!normalizedCaptureTaskId\s*\|\|\s*taskTabRegistrationActive/u,
+    "tracked Xiaohongshu double buffering requires active worker registration",
+  );
+
   const runnerInit = body.slice(runnerInitAt, registrationAt);
   assert.match(
     runnerInit,
     /runnerMode:\s*DETAIL_RUNNER_MODE\.DEDICATED_TAB/u,
-    "Douyin must use the dedicated detail worker supported by task Debug ownership",
+    "Douyin must use a dedicated detail worker instead of the search source tab",
   );
   assert.doesNotMatch(
     runnerInit,

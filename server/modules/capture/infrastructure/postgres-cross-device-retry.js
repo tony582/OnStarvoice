@@ -44,11 +44,9 @@ import {
 } from '../application/automatic-recovery.js';
 import {isProfilePatrolTask} from '../application/profile-patrol.js';
 import {
-  captureExecutionNeverOpened,
   expireStaleCommands,
 } from './postgres-command-reconciliation.js';
 import {
-  captureItemRequiresLocalClosureReuseFence,
   loadVerifiedCaptureLocalClosureProof,
 } from './postgres-local-closure-proof.js';
 import {
@@ -90,7 +88,6 @@ const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
   'ops_control_recovery_enabled',
   'ops_control_recovery_mode',
 ]);
-const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
 const CROSS_DEVICE_RETRY_UNSTARTED_ITEM_STATUSES = new Set([
   'pending',
   'assigned',
@@ -1028,13 +1025,7 @@ async function lockIdleCrossDeviceRetryAgent(tx, {
             {excludeTaskIds: [task.id]},
           )
         : {kind: 'ineligible'};
-      const localClosureReuseGate = eligible && !busy
-        ? await loadCaptureAgentLocalClosureReuseGate(tx, {
-            tenantId,
-            agentId: locked.id,
-          })
-        : {ready: false, reason: 'agent_ineligible_or_busy'};
-      const resourceAdmission = eligible && !busy && localClosureReuseGate.ready
+      const resourceAdmission = eligible && !busy
         ? await reserveCaptureResourceAdmission(tx, {
             tenantId,
             parentTaskId: task.id,
@@ -1047,7 +1038,6 @@ async function lockIdleCrossDeviceRetryAgent(tx, {
       if (
         !eligible ||
         busy ||
-        !localClosureReuseGate.ready ||
         !resourceAdmission.allowed
       ) {
         // Rolling back to the per-candidate savepoint releases both its row
@@ -1121,11 +1111,6 @@ async function lockedCrossDeviceRetryAgentStillEligible(tx, {
     {excludeTaskIds: [task.id]},
   );
   if (busy) return false;
-  const localClosureReuseGate = await loadCaptureAgentLocalClosureReuseGate(tx, {
-    tenantId,
-    agentId: agent.id,
-  });
-  if (!localClosureReuseGate.ready) return false;
   const resourceAdmission = await reserveCaptureResourceAdmission(tx, {
     tenantId,
     parentTaskId: task.id,
@@ -1176,8 +1161,6 @@ async function loadCrossDeviceRetryItemSelection(tx, {
       scopedItems,
       retryItems: [],
       sourceExecutionTaskIds: [],
-      sourceExecutionMetadataById: new Map(),
-      sourceExecutionStartedAtById: new Map(),
     };
   }
   let retryItems = scopedItems.filter(
@@ -1188,8 +1171,6 @@ async function loadCrossDeviceRetryItemSelection(tx, {
         : classifyCaptureRecoveryDisposition(item).automatic,
   );
   let sourceExecutionPending = false;
-  const sourceExecutionMetadataById = new Map();
-  const sourceExecutionStartedAtById = new Map();
   if (automatic && retryItems.length > 0) {
     const executionTaskIds = Array.from(new Set(
       retryItems
@@ -1198,7 +1179,7 @@ async function loadCrossDeviceRetryItemSelection(tx, {
     ));
     const sourceStates = executionTaskIds.length > 0
       ? await tx.queryAll(`
-          SELECT id, status, metadata, started_at
+          SELECT id, status
           FROM capture_tasks
           WHERE tenant_id = $1 AND id = ANY($2::uuid[])
         `, [tenantId, executionTaskIds])
@@ -1206,13 +1187,6 @@ async function loadCrossDeviceRetryItemSelection(tx, {
     const sourceStatusById = new Map(
       sourceStates.map(source => [String(source.id), source.status]),
     );
-    for (const source of sourceStates) {
-      sourceExecutionMetadataById.set(
-        String(source.id),
-        safeJson(source.metadata),
-      );
-      sourceExecutionStartedAtById.set(String(source.id), source.started_at);
-    }
     retryItems = retryItems
       .filter(item => {
         const executionTaskId = text(item.execution_task_id, 100);
@@ -1235,8 +1209,6 @@ async function loadCrossDeviceRetryItemSelection(tx, {
         scopedItems,
         retryItems: [],
         sourceExecutionTaskIds: [],
-        sourceExecutionMetadataById,
-        sourceExecutionStartedAtById,
       };
     }
     const hasManualSafetyItem = scopedItems.some(item =>
@@ -1254,8 +1226,6 @@ async function loadCrossDeviceRetryItemSelection(tx, {
       scopedItems,
       retryItems: [],
       sourceExecutionTaskIds: [],
-      sourceExecutionMetadataById,
-      sourceExecutionStartedAtById,
     };
   }
   return {
@@ -1267,8 +1237,6 @@ async function loadCrossDeviceRetryItemSelection(tx, {
         .map(item => text(item.execution_task_id, 100))
         .filter(Boolean),
     )),
-    sourceExecutionMetadataById,
-    sourceExecutionStartedAtById,
   };
 }
 
@@ -1497,134 +1465,6 @@ async function renewProfileRetryExecutions(tx, tenantId, items, targets) {
   }
   return {executionIdByItem};
 }
-export async function loadCaptureAgentLocalClosureReuseGate(tx, {
-  tenantId,
-  agentId,
-} = {}) {
-  // Exclude only executions that provably never reached a browser *inside the
-  // SQL*. That lets ORDER/LIMIT fall through to an older, potentially-opened
-  // attempt instead of allowing a newer never-open row to hide it.
-  const history = await tx.queryAll(`
-    WITH reusable_history AS (
-      SELECT
-        attempt.id,
-        attempt.item_id,
-        attempt.attempt_number,
-        attempt.assignment_revision,
-        attempt.execution_task_id,
-        COALESCE(
-          execution.metadata->>'requiresLocalClosureReuseFenceV1' = 'true',
-          false
-        ) AS requires_local_closure_proof,
-        COALESCE(
-          execution.finished_at,
-          attempt.finished_at,
-          GREATEST(execution.updated_at, attempt.updated_at),
-          execution.updated_at,
-          attempt.updated_at,
-          execution.created_at,
-          attempt.created_at
-        ) AS terminal_at
-      FROM capture_task_item_attempts attempt
-      JOIN capture_task_items item
-        ON item.id = attempt.item_id
-        AND item.tenant_id = attempt.tenant_id
-      JOIN capture_tasks parent
-        ON parent.id = attempt.parent_task_id
-        AND parent.tenant_id = attempt.tenant_id
-      JOIN capture_tasks execution
-        ON execution.id = attempt.execution_task_id
-        AND execution.tenant_id = attempt.tenant_id
-      WHERE attempt.tenant_id = $1
-        AND attempt.agent_id = $2
-        AND item.item_type = 'keyword'
-        AND execution.status IN (
-          'completed', 'completed_with_warnings',
-          'completed_with_failures', 'failed', 'canceled',
-          'skipped', 'needs_action'
-        )
-        AND NOT (
-          execution.started_at IS NULL
-          AND attempt.started_at IS NULL
-          AND (
-            (
-              execution.error->>'code' = 'create_command_expired'
-              AND execution.error->>'commandStatusBeforeExpiry' = 'pending'
-            )
-            OR (
-              execution.error->>'code' = 'create_agent_unavailable'
-              AND execution.error->>'commandStatusBefore' = 'pending'
-            )
-            OR execution.metadata->>'stoppedBeforeDispatch' = 'true'
-          )
-        )
-    )
-    SELECT DISTINCT ON (requires_local_closure_proof)
-      id,
-      item_id,
-      attempt_number,
-      assignment_revision,
-      execution_task_id,
-      requires_local_closure_proof,
-      terminal_at,
-      CASE
-        WHEN requires_local_closure_proof THEN false
-        ELSE terminal_at <= now() - make_interval(secs => $3::integer)
-      END AS legacy_closure_quiescent
-    FROM reusable_history
-    ORDER BY requires_local_closure_proof DESC,
-      terminal_at DESC NULLS LAST, id DESC
-  `, [
-    tenantId,
-    agentId,
-    Math.floor(LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS / 1000),
-  ]);
-  const latestMarkedAttempt = history.find(
-    attempt => attempt.requires_local_closure_proof === true,
-  );
-  if (latestMarkedAttempt) {
-    const proof = await loadVerifiedCaptureLocalClosureProof(tx, {
-      tenantId,
-      executionTaskId: latestMarkedAttempt.execution_task_id,
-      sourceAgentId: agentId,
-      itemId: latestMarkedAttempt.item_id,
-      itemAttemptId: latestMarkedAttempt.id,
-      itemAttemptNumber: latestMarkedAttempt.attempt_number,
-      assignmentRevision: latestMarkedAttempt.assignment_revision,
-    });
-    // A current-schema execution explicitly opts into the browser-local
-    // closure protocol. Time passing on the server cannot prove that its old
-    // content context, Debug session or task-owned tab stopped, so marked
-    // attempts must never fall through to the legacy quiescence fallback.
-    if (proof.proven !== true) {
-      return {
-        ready: false,
-        reason: proof.reason,
-        attempt: latestMarkedAttempt,
-      };
-    }
-  }
-  const latestLegacyAttempt = history.find(
-    attempt => attempt.requires_local_closure_proof !== true,
-  );
-  if (
-    latestLegacyAttempt &&
-    latestLegacyAttempt.legacy_closure_quiescent !== true
-  ) {
-    return {
-      ready: false,
-      reason: 'local_cleanup_quiescence',
-      attempt: latestLegacyAttempt,
-    };
-  }
-  return {
-    ready: true,
-    reason: latestMarkedAttempt
-      ? 'marked_local_closure_proven'
-      : 'local_closure_reuse_ready',
-  };
-}
-
 export async function dispatchCrossDeviceRetry(options = {}) {
   const {
     tenantId,
@@ -1721,21 +1561,9 @@ export async function dispatchCrossDeviceRetry(options = {}) {
   ) {
     return {error: 'invalid_duty_recovery_request'};
   }
-  if (
-    safetyHandoffRequested &&
-    safetyHandoffRequest.sourceLocalClosureProven !== true
-  ) {
-    return {
-      error: 'retry_requires_manual_safety_action',
-      code: 'HUMAN_REQUIRED',
-      humanRequired: true,
-      reason: 'source_local_closure_proof_unavailable',
-    };
-  }
-  // `sourceLocalClosureProven` is only an internal caller hint that prevents
-  // an obviously incomplete request from entering the transaction. It is not
-  // authority: the append-only terminal snapshot is loaded and verified
-  // below, then loaded once more immediately before the first child write.
+  // Local-closure evidence is retained in the request for audit only. Source
+  // execution/command settlement and assignment lineage are the dispatch
+  // authority; missing browser telemetry is never a human-action boundary.
   const dutyIntentId = dutyRecovery
     ? text(dutyRecoveryIntentId, 100).toLowerCase()
     : '';
@@ -2218,7 +2046,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             safetyHandoffCount: sourceItem.safety_handoff_count,
             sourcePlatformAccountId: sourceAccount.platform_account_id,
             sourceLoginState: sourceAccount.last_login_state,
-            sourceLocalClosureProven: true,
+            sourceLocalClosureProven: localClosureProof.proven === true,
             sourceExecutionTaskId: sourceItem.execution_task_id,
             sourceAgentId,
             sourceItemId: sourceItem.id,
@@ -2547,10 +2375,6 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         abortCrossDeviceRetry(lockedSelection.error, lockedSelection.details);
       }
       const retryItems = lockedSelection.retryItems;
-      const sourceExecutionMetadataById =
-        lockedSelection.sourceExecutionMetadataById;
-      const sourceExecutionStartedAtById =
-        lockedSelection.sourceExecutionStartedAtById;
       if (
         businessTaskType === 'unattended_keyword_capture' &&
         retryItems.length > 30
@@ -2617,77 +2441,8 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             : {},
         );
       }
-      if (automatic) {
-        for (const retryItem of retryItems) {
-          const sourceExecutionTaskId = text(
-            retryItem.execution_task_id,
-            100,
-          ).toLowerCase();
-          const sourceExecutionMetadata =
-            sourceExecutionMetadataById.get(sourceExecutionTaskId);
-          if (!captureItemRequiresLocalClosureReuseFence({
-            itemType: retryItem.item_type,
-            sourceExecutionMetadata,
-          })) {
-            continue;
-          }
-          const sourceAttempt = UUID_PATTERN.test(sourceExecutionTaskId)
-            ? await tx.queryOne(`
-                SELECT id, agent_id, attempt_number, assignment_revision,
-                  started_at
-                FROM capture_task_item_attempts
-                WHERE tenant_id = $1
-                  AND item_id = $2
-                  AND execution_task_id = $3
-                ORDER BY attempt_number DESC, created_at DESC, id DESC
-                LIMIT 1
-                FOR UPDATE
-              `, [req.tenantId, retryItem.id, sourceExecutionTaskId])
-            : null;
-          const neverOpened = captureExecutionNeverOpened({
-            executionTaskId: sourceExecutionTaskId,
-            error: retryItem.error,
-            sourceExecutionMetadata,
-            executionStartedAt:
-              sourceExecutionStartedAtById.get(sourceExecutionTaskId),
-            itemStartedAt: retryItem.started_at,
-            attemptStartedAt: sourceAttempt?.started_at,
-            attemptExists: Boolean(sourceAttempt),
-            attemptCount: retryItem.attempt_count,
-          });
-          if (neverOpened) {
-            // Work stopped before browser dispatch has no local page to close.
-            // Any partial/malformed lineage still fails closed.
-            continue;
-          }
-          const localClosureProof = await loadVerifiedCaptureLocalClosureProof(
-            tx,
-            {
-              tenantId: req.tenantId,
-              executionTaskId: sourceExecutionTaskId,
-              sourceAgentId:
-                sourceAttempt?.agent_id || retryItem.assigned_agent_id,
-              itemId: retryItem.id,
-              itemAttemptId: sourceAttempt?.id,
-              itemAttemptNumber: sourceAttempt?.attempt_number,
-              assignmentRevision:
-                sourceAttempt?.assignment_revision ??
-                retryItem.assignment_revision,
-            },
-          );
-          if (!localClosureProof.proven) {
-            abortCrossDeviceRetry(
-              'retry_source_local_closure_unproven',
-              {
-                code: 'SOURCE_LOCAL_CLOSURE_UNPROVEN',
-                waitingForSource: true,
-                itemId: retryItem.id,
-                sourceExecutionTaskId,
-              },
-            );
-          }
-        }
-      }
+      // Source execution and command settlement, together with exact item and
+      // Attempt fences below, govern retry. Browser-local closure is telemetry.
 
       const lockedAttempts = await loadCrossDeviceRetryAttempts(
         tx,
@@ -2884,9 +2639,6 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           sourceAttemptNumber: Number(expectedAttemptNumber),
         };
       }
-      const targetSupportsLocalClosureReuseFence =
-        businessTaskType === 'unattended_keyword_capture' &&
-        safeJson(targetAgent.capabilities).localClosureReuseFenceV1 === true;
       const childMetadata = {
         ...safeJson(parent.metadata),
         // A promoted parent may itself be a marked child. Do not inherit its
@@ -2909,9 +2661,6 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         crossDeviceRetryRequestKey: requestKey,
         crossDeviceRetrySourceExecutionTaskIds: sourceExecutionTaskIds,
         automaticRecovery: automatic,
-        ...(targetSupportsLocalClosureReuseFence
-          ? {requiresLocalClosureReuseFenceV1: true}
-          : {}),
         ...(dutyRecovery
           ? {
               dutyRecovery: true,
@@ -3033,31 +2782,6 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             abortCrossDeviceRetry('idle_compatible_agent_unavailable', {
               code: 'DISTINCT_AUTHENTICATED_ACCOUNT_UNAVAILABLE',
             });
-          }
-          const finalLocalClosureProof =
-            await loadVerifiedCaptureLocalClosureProof(tx, {
-              tenantId: req.tenantId,
-              executionTaskId:
-                dutySafetyHandoffPolicy.sourceExecutionTaskId,
-              sourceAgentId: dutySafetyHandoffPolicy.sourceAgentId,
-              itemId: dutySafetyHandoffPolicy.sourceItemId,
-              itemAttemptId:
-                dutySafetyHandoffPolicy.sourceItemAttemptId,
-              itemAttemptNumber:
-                dutySafetyHandoffPolicy.sourceItemAttemptNumber,
-              assignmentRevision:
-                dutySafetyHandoffPolicy.sourceAssignmentRevision,
-            });
-          if (!finalLocalClosureProof.proven) {
-            abortCrossDeviceRetry(
-              'retry_requires_manual_safety_action',
-              {
-                code: 'HUMAN_REQUIRED',
-                humanRequired: true,
-                reason: 'source_local_closure_proof_unavailable',
-                failedChecks: finalLocalClosureProof.failedChecks,
-              },
-            );
           }
         }
         if (businessTaskType === 'watched_content_patrol') {
@@ -3564,17 +3288,6 @@ export async function dispatchCrossDeviceRetry(options = {}) {
       };
     }
     if (
-      automatic &&
-      error?.crossDeviceRetryError ===
-        'retry_source_local_closure_unproven'
-    ) {
-      return {
-        error: 'retry_source_local_closure_unproven',
-        waitingForSource: true,
-        ...safeJson(error.details),
-      };
-    }
-    if (
       dutyRecovery &&
       error?.crossDeviceRetryError ===
         'retry_requires_manual_safety_action'
@@ -3585,7 +3298,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         humanRequired: true,
         reason:
           text(error?.details?.reason, 160) ||
-          'source_local_closure_proof_unavailable',
+          'safety_handoff_policy_rejected',
       };
     }
     throw error;
