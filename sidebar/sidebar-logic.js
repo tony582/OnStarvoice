@@ -13706,8 +13706,12 @@ async function drainStreamingDetailSyncQueue(
       current: Number(before.processedCount || 0),
       total: Number(before.enqueuedCount || 0),
       round,
-      phase: "streaming_sync_drain",
-      message: `采集已结束，正在上传剩余 ${Number(before.remainingCount || 0)} 条数据...`,
+      phase: before.reconciliationRequired === true
+        ? "streaming_sync_reconciliation_required"
+        : "streaming_sync_drain",
+      message: before.reconciliationRequired === true
+        ? `同步已挂起，${Number(before.remainingCount || 0)} 条数据待核对；不会自动重发`
+        : `采集已结束，正在上传剩余 ${Number(before.remainingCount || 0)} 条数据...`,
     };
     updateProgress?.(waitingProgress);
     notifyProgress?.(waitingProgress);
@@ -13717,17 +13721,22 @@ async function drainStreamingDetailSyncQueue(
   await Promise.all([refreshDataPool(), refreshSyncHistory()]).catch(
     () => null,
   );
+  const reconciliationRequired = result.reconciliationRequired === true;
   const doneProgress = {
     current: Number(result.processedCount || 0),
     total: Number(result.enqueuedCount || 0),
     round,
-    phase: "streaming_sync_done",
+    phase: reconciliationRequired
+      ? "streaming_sync_reconciliation_required"
+      : "streaming_sync_done",
     syncSuccessCount: Number(result.successCount || 0),
     syncFailedCount: Number(result.failedCount || 0),
     syncSkippedCount: Number(result.skippedCount || 0),
     syncRemainingCount: Number(result.remainingCount || 0),
     syncRetryCount: Number(result.retryCount || 0),
-    message: `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}${Number(result.retryCount || 0) > 0 ? `，瞬时重试 ${Number(result.retryCount || 0)}` : ""}`,
+    message: reconciliationRequired
+      ? `同步已挂起，${Number(result.remainingCount || 0)} 条数据待核对；不会自动重发`
+      : `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}${Number(result.retryCount || 0) > 0 ? `，瞬时重试 ${Number(result.retryCount || 0)}` : ""}`,
   };
   updateProgress?.(doneProgress);
   notifyProgress?.(doneProgress);
@@ -13748,7 +13757,7 @@ async function drainStreamingDetailSyncQueue(
     // This bit is set only by the awaited terminal drain path. A bare queue
     // snapshot, a missing result, or a progress payload with defaulted zeroes
     // must never be treated as proof that task-owned uploads are gone.
-    drainCompleted: true,
+    drainCompleted: !reconciliationRequired,
   };
 }
 
