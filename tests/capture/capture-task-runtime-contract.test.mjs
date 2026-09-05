@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
 
 const repoRoot = new URL("../../", import.meta.url);
 const [
@@ -9,6 +10,7 @@ const [
   captureSyncSource,
   douyinKeywordSearchSource,
   debugSessionSource,
+  executionIdentitySource,
 ] = await Promise.all([
   readFile(new URL("background.js", repoRoot), "utf8"),
   readFile(new URL("manifest.json", repoRoot), "utf8"),
@@ -18,6 +20,7 @@ const [
     "utf8",
   ),
   readFile(new URL("utils/capture/debug-session.js", repoRoot), "utf8"),
+  readFile(new URL("utils/capture/execution-identity.js", repoRoot), "utf8"),
 ]);
 const manifest = JSON.parse(manifestSource);
 
@@ -41,6 +44,71 @@ test("capture task runtime declares native tab-group permissions and worker modu
   assert.match(backgroundSource, /utils\/capture\/task-tab-group\.js/);
   assert.match(backgroundSource, /utils\/capture\/task-runtime\.js/);
   assert.match(backgroundSource, /utils\/capture\/task-owner\.js/);
+});
+
+test("execution identity is a required worker module with one implementation for each extracted helper", () => {
+  const requiredAt = backgroundSource.indexOf("importScripts(\n  'utils/control-storage-reserve.js'");
+  const requiredEnd = backgroundSource.indexOf("\n);", requiredAt);
+  assert.ok(requiredAt >= 0 && requiredEnd > requiredAt);
+  assert.match(
+    backgroundSource.slice(requiredAt, requiredEnd),
+    /'utils\/capture\/execution-identity\.js'/u,
+  );
+  assert.match(backgroundSource, /globalThis\.OnStarvoiceCaptureExecutionIdentity/u);
+  for (const helper of [
+    "resolveCaptureTaskTabId",
+    "buildUnattendedCaptureTaskId",
+    "parseStableUnattendedCaptureTaskId",
+    "isCaptureExecutionLockOwnedByUnattendedAttempt",
+    "buildCaptureExecutionLockStopIdentity",
+    "captureExecutionLockMatchesStopIdentity",
+    "captureRuntimeSnapshotMatches",
+  ]) {
+    assert.match(executionIdentitySource, new RegExp(`function ${helper}\\(`, "u"), helper);
+    assert.doesNotMatch(backgroundSource, new RegExp(`function ${helper}\\(`, "u"), helper);
+    assert.match(backgroundSource, new RegExp(`\\b${helper}\\b`, "u"), helper);
+  }
+});
+
+test("execution identity loads and runs without browser, storage, timers or network access", () => {
+  const sandbox = {module: {exports: {}}};
+  const accesses = [];
+  for (const name of [
+    "chrome", "browser", "document", "localStorage", "sessionStorage", "indexedDB",
+    "fetch", "XMLHttpRequest", "WebSocket", "setTimeout", "setInterval",
+    "clearTimeout", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame",
+    "addEventListener", "removeEventListener", "crypto", "console",
+  ]) {
+    Object.defineProperty(sandbox, name, {
+      get() {
+        accesses.push(name);
+        throw new Error(`pure execution identity accessed ${name}`);
+      },
+    });
+  }
+  vm.runInNewContext(executionIdentitySource, sandbox, {
+    filename: "utils/capture/execution-identity.js",
+    timeout: 1000,
+  });
+  const api = sandbox.OnStarvoiceCaptureExecutionIdentity;
+  assert.equal(api, sandbox.module.exports, "classic-script and CommonJS consumers share the same API");
+  const taskId = api.buildUnattendedCaptureTaskId("pure-request");
+  const currentLock = {
+    id: "pure-lock", owner: "unattended_keyword_plan", holderId: "pure-holder",
+    holderDocumentId: "pure-document", holderTabId: 41, captureTaskId: taskId,
+    captureTaskAttemptId: "pure-attempt",
+  };
+  assert.equal(api.resolveCaptureTaskTabId("41"), 41);
+  assert.equal(api.parseStableUnattendedCaptureTaskId(taskId).requestId, "pure-request");
+  assert.equal(api.isCaptureExecutionLockOwnedByUnattendedAttempt(currentLock, {
+    id: "pure-request", attemptId: "pure-attempt", runnerTabId: 41,
+  }), true);
+  assert.equal(api.captureExecutionLockMatchesStopIdentity(
+    currentLock, api.buildCaptureExecutionLockStopIdentity(currentLock),
+  ), true);
+  const snapshot = {taskId, runId: "pure-run", attemptId: "pure-attempt", tabId: 41};
+  assert.equal(api.captureRuntimeSnapshotMatches(snapshot, snapshot), true);
+  assert.deepEqual(accesses, []);
 });
 
 test("all task-level runtime messages are wired in the service worker", () => {
