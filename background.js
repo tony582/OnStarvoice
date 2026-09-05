@@ -28,11 +28,22 @@ importScripts(
   'utils/control-storage-reserve.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
+  'utils/capture/execution-identity.js',
   'utils/capture/debug-session.js',
   'utils/capture/task-tab-group.js',
   'utils/capture/task-runtime.js',
   'utils/capture/task-owner.js',
 );
+
+const {
+  resolveCaptureTaskTabId,
+  buildUnattendedCaptureTaskId,
+  parseStableUnattendedCaptureTaskId,
+  isCaptureExecutionLockOwnedByUnattendedAttempt,
+  buildCaptureExecutionLockStopIdentity,
+  captureExecutionLockMatchesStopIdentity,
+  captureRuntimeSnapshotMatches,
+} = globalThis.OnStarvoiceCaptureExecutionIdentity;
 
 const runtimeTabPolicy = globalThis.OnStarvoiceRuntimeTabPolicy;
 const captureTaskTabGroupApi = globalThis.OnStarvoiceCaptureTaskTabGroup;
@@ -6192,72 +6203,6 @@ function inspectUnattendedBusinessUploadEvidence(request = {}) {
   };
 }
 
-function isCaptureExecutionLockOwnedByUnattendedAttempt(
-  lock,
-  request,
-) {
-  if (
-    !lock ||
-    typeof lock !== 'object' ||
-    String(lock.owner || '') !== 'unattended_keyword_plan'
-  ) {
-    return false;
-  }
-  const requestId = String(request?.id || '').trim();
-  const attemptId = String(request?.attemptId || '').trim();
-  if (!requestId || !attemptId) return false;
-
-  const stableTaskId = buildUnattendedCaptureTaskId(requestId);
-  const lockTaskId = String(lock.captureTaskId || '').trim();
-  const lockAttemptId = String(lock.captureTaskAttemptId || '').trim();
-  if (lockTaskId === stableTaskId) {
-    return !lockAttemptId || lockAttemptId === attemptId;
-  }
-  // Older task wrappers could bind a generated child task id while retaining
-  // the authoritative unattended attempt id.
-  if (lockAttemptId) return lockAttemptId === attemptId;
-  if (lockTaskId) return false;
-
-  // A reservation can become terminal before BEGIN binds its stable task id.
-  // In that narrow window the exact runner tab is the remaining ownership
-  // fence. Do not infer ownership from the global lock alone.
-  const holderTabId = resolveCaptureTaskTabId(lock.holderTabId);
-  const runnerTabIds = new Set(
-    [request.runnerTabId, request.progress?.runnerTabId]
-      .map((tabId) => resolveCaptureTaskTabId(tabId))
-      .filter(Boolean),
-  );
-  return Boolean(holderTabId && runnerTabIds.has(holderTabId));
-}
-
-function buildCaptureExecutionLockStopIdentity(lock) {
-  if (!lock || typeof lock !== 'object') return null;
-  return {
-    id: String(lock.id || ''),
-    owner: String(lock.owner || ''),
-    holderId: String(lock.holderId || ''),
-    holderDocumentId: String(lock.holderDocumentId || ''),
-    holderTabId: resolveCaptureTaskTabId(lock.holderTabId),
-    captureTaskId: String(lock.captureTaskId || '').trim(),
-    captureTaskAttemptId: String(lock.captureTaskAttemptId || '').trim(),
-  };
-}
-
-function captureExecutionLockMatchesStopIdentity(lock, identity) {
-  if (!identity) return !lock;
-  const actual = buildCaptureExecutionLockStopIdentity(lock);
-  return Boolean(
-    actual &&
-    actual.id === identity.id &&
-    actual.owner === identity.owner &&
-    actual.holderId === identity.holderId &&
-    actual.holderDocumentId === identity.holderDocumentId &&
-    actual.holderTabId === identity.holderTabId &&
-    actual.captureTaskId === identity.captureTaskId &&
-    actual.captureTaskAttemptId === identity.captureTaskAttemptId
-  );
-}
-
 async function releaseExactCaptureExecutionLockSnapshot(lockSnapshot) {
   const expected = buildCaptureExecutionLockStopIdentity(lockSnapshot);
   if (!expected?.id) return true;
@@ -10920,20 +10865,6 @@ async function cleanupStaleCaptureRuntimeSession(session) {
 
 let captureRuntimeRestorePromise = null;
 
-function captureRuntimeSnapshotMatches(current, expected) {
-  if (!current || !expected) return false;
-  return Boolean(
-    String(current.taskId || '').trim() ===
-      String(expected.taskId || '').trim() &&
-      String(current.runId || '').trim() ===
-        String(expected.runId || '').trim() &&
-      String(current.attemptId || '').trim() ===
-        String(expected.attemptId || '').trim() &&
-      resolveCaptureTaskTabId(current.sourceTabId, current.tabId) ===
-        resolveCaptureTaskTabId(expected.sourceTabId, expected.tabId),
-  );
-}
-
 async function clearPersistedCaptureRuntimeSnapshot(expected) {
   let cleared = false;
   await writeRuntimeState((current) => {
@@ -12525,14 +12456,6 @@ function requireCaptureTaskId(request) {
   return taskId;
 }
 
-function resolveCaptureTaskTabId(...values) {
-  for (const value of values) {
-    const tabId = Number(value);
-    if (Number.isSafeInteger(tabId) && tabId > 0) return tabId;
-  }
-  return null;
-}
-
 async function requireConnectedCaptureTaskOwner(
   taskId,
   {attempts = 8, delayMs = 50} = {},
@@ -14020,25 +13943,6 @@ async function releaseCaptureTaskResourcesWithRetry(
     }
   }
   throw lastError;
-}
-
-function buildUnattendedCaptureTaskId(requestId = '') {
-  const normalizedRequestId = String(requestId || '').trim();
-  return normalizedRequestId ? `unattended-capture:${normalizedRequestId}` : '';
-}
-
-function parseStableUnattendedCaptureTaskId(taskId = '') {
-  const normalizedTaskId = String(taskId || '').trim();
-  const prefix = 'unattended-capture:';
-  if (!normalizedTaskId.startsWith(prefix)) {
-    return {unattended: false, taskId: normalizedTaskId, requestId: ''};
-  }
-  const requestId = normalizedTaskId.slice(prefix.length).trim();
-  return {
-    unattended: Boolean(requestId),
-    taskId: normalizedTaskId,
-    requestId,
-  };
 }
 
 async function inspectStableUnattendedCaptureTask(taskId = '') {
