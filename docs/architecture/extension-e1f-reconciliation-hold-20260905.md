@@ -24,6 +24,8 @@
 
 只在显式 opt-in 的实例上提供 `getReconciliationSnapshot()`：未挂起返回 null，挂起后按需返回独立副本，包含当前 recordId、attempt、完整可克隆结果、证据可用性、guardError 和未处理编号。result 是 processRecord 已返回的证据，队列不会自行创造服务器回执或判定本地提交是否成功。
 
+证据复制隔离的当前契约和测试限于普通 JSON 形态结果。`structuredClone` 对 SharedArrayBuffer 及其视图仍共享底层内存；此类特殊输入未纳入本轮接线契约，不能泛称任意可克隆输入都完全隔离。未来生产适配器须约束回执形态，或另行拒绝/处理共享内存类型，不能直接扩大此保证。
+
 挂起后的 `getStats()` 仅增加 `reconciliationRequired`、`heldRecordId`、`heldRecordIds`、`heldUniqueCount`、`drainCompleted:false`。高频统计/状态通知不复制完整正文或回执。显式 opt-in 的结果分类仍需要克隆结果/上下文，因此不承诺启用后零额外内存开销；真实入口未启用。
 
 ## 未处理记录与取消顺序
