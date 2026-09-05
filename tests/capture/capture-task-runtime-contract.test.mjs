@@ -11,6 +11,7 @@ const [
   douyinKeywordSearchSource,
   debugSessionSource,
   executionIdentitySource,
+  taskCenterProjectionSource,
 ] = await Promise.all([
   readFile(new URL("background.js", repoRoot), "utf8"),
   readFile(new URL("manifest.json", repoRoot), "utf8"),
@@ -21,6 +22,7 @@ const [
   ),
   readFile(new URL("utils/capture/debug-session.js", repoRoot), "utf8"),
   readFile(new URL("utils/capture/execution-identity.js", repoRoot), "utf8"),
+  readFile(new URL("utils/capture/task-center-projection.js", repoRoot), "utf8"),
 ]);
 const manifest = JSON.parse(manifestSource);
 
@@ -108,6 +110,61 @@ test("execution identity loads and runs without browser, storage, timers or netw
   ), true);
   const snapshot = {taskId, runId: "pure-run", attemptId: "pure-attempt", tabId: 41};
   assert.equal(api.captureRuntimeSnapshotMatches(snapshot, snapshot), true);
+  assert.deepEqual(accesses, []);
+});
+
+test("task-center projection is a required worker module with one implementation of each helper", () => {
+  const requiredAt = backgroundSource.indexOf("importScripts(\n  'utils/control-storage-reserve.js'");
+  const requiredEnd = backgroundSource.indexOf("\n);", requiredAt);
+  assert.ok(requiredAt >= 0 && requiredEnd > requiredAt);
+  assert.match(
+    backgroundSource.slice(requiredAt, requiredEnd),
+    /'utils\/capture\/task-center-projection\.js'/u,
+  );
+  assert.match(backgroundSource, /globalThis\.OnStarvoiceCaptureTaskCenterProjection/u);
+  for (const helper of [
+    "buildTaskCenterCheckpointFromUnattendedRequest",
+    "buildUnattendedTaskCounts",
+  ]) {
+    assert.match(taskCenterProjectionSource, new RegExp(`function ${helper}\\(`, "u"), helper);
+    assert.doesNotMatch(backgroundSource, new RegExp(`function ${helper}\\(`, "u"), helper);
+    assert.match(backgroundSource, new RegExp(`\\b${helper}\\b`, "u"), helper);
+  }
+});
+
+test("task-center projection loads and executes without browser, storage, network or clock access", () => {
+  const sandbox = {module: {exports: {}}};
+  const accesses = [];
+  const forbidden = (name) => ({
+    get() {
+      accesses.push(name);
+      throw new Error(`pure task-center projection accessed ${name}`);
+    },
+  });
+  for (const name of [
+    "chrome", "browser", "document", "localStorage", "sessionStorage", "indexedDB",
+    "fetch", "XMLHttpRequest", "WebSocket", "setTimeout", "setInterval",
+    "clearTimeout", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame",
+    "addEventListener", "removeEventListener", "crypto", "console", "Date", "performance",
+  ]) {
+    Object.defineProperty(sandbox, name, forbidden(name));
+  }
+  sandbox.Math = Object.create(Math);
+  Object.defineProperty(sandbox.Math, "random", forbidden("Math.random"));
+  vm.runInNewContext(taskCenterProjectionSource, sandbox, {
+    filename: "utils/capture/task-center-projection.js",
+    timeout: 1000,
+  });
+  const api = sandbox.OnStarvoiceCaptureTaskCenterProjection;
+  assert.equal(api, sandbox.module.exports);
+  const request = {
+    checkpoint: {keywordResults: [{keyword: "pure", status: "partial", attemptCount: 2}]},
+    summary: {total: 1, partial: 1},
+  };
+  assert.equal(api.buildTaskCenterCheckpointFromUnattendedRequest(request).failedKeywords[0], "pure");
+  assert.equal(api.buildUnattendedTaskCounts(request).warnings, 1);
+  assert.equal(api.buildTaskCenterCheckpointFromUnattendedRequest(null).round, 1);
+  assert.equal(api.buildUnattendedTaskCounts(null).total, 0);
   assert.deepEqual(accesses, []);
 });
 
