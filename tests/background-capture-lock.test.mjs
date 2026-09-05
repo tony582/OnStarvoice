@@ -3997,7 +3997,8 @@ test("official patrol promotes a representative target failure to the request, t
     attemptId: "official-error-attempt",
     patch: {
       status: "completed_with_warnings",
-      finishedAt: "2026-08-03T05:00:05.000Z",
+      // This checks failure propagation, not expiry of terminal history.
+      finishedAt: new Date().toISOString(),
       message: "官方账号评论巡查已完成，部分账号采集失败",
       targetResults: [
         {
@@ -8055,7 +8056,8 @@ test("targeted native task end releases resources without absorbing a later sync
     attemptId: request.attemptId,
     patch: {
       status: "failed",
-      finishedAt: "2026-08-03T05:10:00.000Z",
+      // Keep this newly finished request within the ledger retention window.
+      finishedAt: new Date().toISOString(),
       message: "官方账号评论巡查同步失败",
       targetResults: [
         {

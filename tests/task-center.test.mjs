@@ -367,6 +367,31 @@ test("ledger prunes only terminal history by age and count", () => {
   assert.equal(ledger.runs.length, 302);
 });
 
+test("upsert applies the default 30-day boundary to finishedAt even when updatedAt is current", () => {
+  const cutoff = NOW - 30 * 24 * 60 * 60 * 1000;
+  for (const status of ["completed_with_warnings", "failed"]) {
+    for (const offset of [-1, 0, 1]) {
+      const finishedAt = new Date(cutoff + offset).toISOString();
+      const result = core.upsertTaskRun(
+        {runs: []},
+        {
+          id: `retention-${status}-${offset}`,
+          status,
+          createdAt: new Date(cutoff - 1000).toISOString(),
+          updatedAt: new Date(NOW).toISOString(),
+          finishedAt,
+        },
+        {now: NOW},
+      );
+
+      assert.equal(result.accepted, true);
+      assert.equal(result.run.finishedAt, finishedAt);
+      assert.equal(result.ledger.runs.length, offset < 0 ? 0 : 1,
+        `${status} at cutoff ${offset}ms`);
+    }
+  }
+});
+
 test("events are capped, length-limited, and redact credentials", () => {
   let run = core.normalizeTaskRun({id: "run-events", status: "running"}, {now: NOW});
   for (let index = 0; index < 55; index += 1) {
