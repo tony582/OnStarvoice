@@ -3,6 +3,7 @@ import {readFileSync} from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import * as presentation from '../../utils/capture/streaming-sync-presentation.js';
+import * as reconciliation from '../../utils/capture/sync-reconciliation-state.js';
 import {createRecordSyncQueue} from '../../utils/record-sync-queue.js';
 
 // Execute the actual sidebar terminal sections and drain adapter. Capture,
@@ -59,6 +60,7 @@ function bridge(stats, overrides = {}) {
   const notifications = [];
   const context = vm.createContext({
     ...presentation,
+    ...reconciliation,
     streamingSyncQueue: {
       enabled: Boolean(stats?.enabled),
       getStats: () => stats,
@@ -198,7 +200,7 @@ test('batch keeps capture failures and ordinary upload failures in the legacy ta
   assert.equal(syncFailure.messages.at(-1).tone, 'success');
 });
 
-test('batch hold warns without a success notice and retains the unresolved task-status gate', async () => {
+test('batch hold warns and carries the explicit needs-action signal to the outer consumer', async () => {
   const stats = heldStats({receipt: {body: 'must not enter presentation metadata'}});
   const original = plain(stats);
   const ui = bridge(stats);
@@ -216,9 +218,9 @@ test('batch hold warns without a success notice and retains the unresolved task-
   assert.equal('heldRecordIds' in ui.context.sidebarTaskMetadata, false);
   assert.deepEqual(stats, original);
   assert.equal(outcome.ok, false);
-  assert.equal(outcome.error, undefined);
-  assert.equal(ui.context.sidebarTaskStatus, 'completed_with_failures',
-    'the outer unattended terminal and server recovery gates remain unwired');
+  assert.deepEqual(plain(outcome.error), reconciliation.buildSyncReconciliationError());
+  assert.equal(outcome.reconciliationRequired, true);
+  assert.equal(ui.context.sidebarTaskStatus, 'needs_action');
   assert.equal(outcome.streamingSync.drainCompleted, false);
 });
 

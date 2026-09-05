@@ -3,6 +3,7 @@ import {readFileSync} from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import {createRecordSyncQueue} from '../../utils/record-sync-queue.js';
+import {hasSyncReconciliationSignal} from '../../utils/capture/sync-reconciliation-state.js';
 
 // Exercise the opt-in queue with the REAL sidebar drain, terminal projection,
 // and background upload-evidence predicate. Browser I/O is replaced, not these
@@ -35,6 +36,7 @@ function createBridge() {
   const messages = [];
   let refreshes = 0;
   const context = vm.createContext({
+    hasSyncReconciliationSignal,
     refreshDataPool: async () => {refreshes += 1;},
     refreshSyncHistory: async () => {refreshes += 1;},
     showMessage: (message, tone) => messages.push({message, tone}),
@@ -158,11 +160,12 @@ test('even an incorrectly forced drain-completed bit cannot clear retained unres
   assert.equal(result.reconciliationRequired, true);
   assert.ok(result.remainingCount > 0);
   const {terminal, evidence} = createBridge().inspect({...result, drainCompleted: true}, 2);
-  assert.equal(terminal.streamingSyncEvidenceKnown, true);
-  assert.ok(terminal.streamingSyncRemainingCount > 0);
-  assert.equal(evidence.known, true);
-  assert.equal(evidence.cleared, false);
-  assert.equal(evidence.reason, 'business_uploads_not_cleared');
+  assert.equal(terminal.streamingSyncEvidenceKnown, false);
+  assert.equal(terminal.syncReconciliationRequired, true);
+  assert.equal(terminal.streamingSyncRemainingCount, null);
+  assert.equal(evidence.known, false);
+  assert.notEqual(evidence.cleared, true);
+  assert.equal(evidence.reason, 'business_upload_state_unknown');
 });
 
 test('cancellation before the active hold result arrives cannot manufacture completed upload evidence', {timeout: 3000}, async () => {

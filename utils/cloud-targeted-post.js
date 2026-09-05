@@ -967,6 +967,40 @@
     };
   }
 
+  // This file also loads through classic importScripts in the background.
+  // Keep this small adapter dependency-free; characterization tests lock its
+  // explicit signal rules to the shared ESM sync-reconciliation-state module.
+  const SYNC_RECONCILIATION_CODES = new Set([
+    "SYNC_RECONCILIATION_REQUIRED",
+    "STREAMING_SYNC_RECONCILIATION_REQUIRED",
+    "LOCAL_CONFIRMATION_REQUIRED",
+  ]);
+
+  function hasDirectSyncReconciliationSignal(value, includeCode = true) {
+    const source = objectValue(value);
+    return source.reconciliationRequired === true ||
+      source.requiresReconciliation === true ||
+      (includeCode && SYNC_RECONCILIATION_CODES.has(source.code));
+  }
+
+  function hasTargetedSyncReconciliationSignal(value) {
+    const source = objectValue(value);
+    return hasDirectSyncReconciliationSignal(source) ||
+      hasDirectSyncReconciliationSignal(source.error) ||
+      hasDirectSyncReconciliationSignal(source.streamingSync, false);
+  }
+
+  function buildTargetedSyncReconciliationError() {
+    return {
+      code: "SYNC_RECONCILIATION_REQUIRED",
+      message: "同步结果需要核对，本地自动处理已暂停",
+      retryable: false,
+      reconciliationRequired: true,
+      category: "local_confirmation",
+      stage: "sync",
+    };
+  }
+
   function applySyncResult(targetResult, syncResult = null, syncError = null) {
     const source = objectValue(targetResult);
     if (!["completed", "completed_with_warnings"].includes(source.status)) {
@@ -979,6 +1013,31 @@
     const expectedCount = Array.isArray(source.recordIds)
       ? source.recordIds.length
       : 0;
+    if (
+      hasTargetedSyncReconciliationSignal(result) ||
+      hasTargetedSyncReconciliationSignal(syncError)
+    ) {
+      return {
+        ...source,
+        // The existing target-result protocol does not accept needs_action.
+        // Retain its compatible envelope without losing the distinct hold:
+        // callers must consume reconciliationRequired before generic failures.
+        status: "failed",
+        partial: successCount > 0,
+        scanComplete: false,
+        localCaptureCompleted: true,
+        backendSynced: false,
+        reconciliationRequired: true,
+        sync: {
+          status: "needs_action",
+          successCount,
+          failedCount,
+          pausedCount,
+          reconciliationRequired: true,
+        },
+        error: buildTargetedSyncReconciliationError(),
+      };
+    }
     const fullySynced =
       !syncError &&
       result.ok === true &&
