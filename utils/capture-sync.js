@@ -10,6 +10,14 @@
  */
 
 import { sync, syncBatch, checkCapturedExternalIds } from './api.js';
+import {
+  normalizeBatchFailureReason,
+  normalizeSyncItemFailureReason,
+  isRateLimitedBatchResult,
+  isRateLimitedSyncItem,
+  isIndeterminateBatchResult,
+  isIndeterminateSyncItem,
+} from './capture/sync-response-classification.js';
 
 import {
   addRecord,
@@ -680,19 +688,6 @@ const SYNC_BATCH_REQUEST_SPACING_MS = 2000;
 const SYNC_RATE_LIMIT_RETRY_ATTEMPTS = 2;
 const SYNC_RATE_LIMIT_RETRY_BASE_DELAY_MS = 5000;
 const SYNC_RATE_LIMIT_RETRY_MAX_DELAY_MS = 60000;
-const RATE_LIMIT_SYNC_REASONS = new Set([
-  'rate_limited',
-  'too_many_requests',
-  '429',
-]);
-const INDETERMINATE_SYNC_REASONS = new Set([
-  'timeout',
-  'network_error',
-  'coze_timeout',
-  'timeout_budget_exceeded',
-  ERROR_REASON.TIMEOUT,
-  ERROR_REASON.NETWORK_ERROR,
-]);
 const MAX_SYNC_REQUEST_PAYLOAD_BYTES = MAX_SYNC_PAYLOAD_BYTES_PER_REQUEST;
 const DEFAULT_CHECK_SYNC_TYPES = [
   SYNC_TYPE.SINGLE_NOTE,
@@ -9132,119 +9127,6 @@ function formatSyncPausedMessage(reason, confirmedSuccessCount, pausedCount) {
   return isRateLimited
     ? `同步接口触发限流，已确认成功 ${confirmedSuccessCount} 条，剩余 ${pausedCount} 条待稍后继续`
     : `同步请求超时或结果未知，已确认成功 ${confirmedSuccessCount} 条，剩余 ${pausedCount} 条待继续`;
-}
-
-function normalizeBatchFailureReason(batchResult) {
-  return String(
-    batchResult?.reason ||
-      batchResult?.error?.reason ||
-      batchResult?.error?.code ||
-      batchResult?.data?.reason ||
-      '',
-  )
-    .trim()
-    .toLowerCase();
-}
-
-function normalizeBatchFailureMessage(batchResult) {
-  return String(
-    batchResult?.message ||
-      batchResult?.error?.message ||
-      batchResult?.data?.message ||
-      '',
-  )
-    .trim()
-    .toLowerCase();
-}
-
-function normalizeSyncItemFailureReason(item, batchResult) {
-  return String(
-    item?.reason ||
-      item?.error?.reason ||
-      item?.error?.code ||
-      normalizeBatchFailureReason(batchResult) ||
-      '',
-  )
-    .trim()
-    .toLowerCase();
-}
-
-function normalizeSyncItemFailureMessage(item, batchResult) {
-  return String(
-    item?.message ||
-      item?.error?.message ||
-      normalizeBatchFailureMessage(batchResult) ||
-      '',
-  )
-    .trim()
-    .toLowerCase();
-}
-
-function isRateLimitedBatchResult(batchResult) {
-  if (!batchResult || batchResult?.ok === true) {
-    return false;
-  }
-  return isRateLimitedSyncReason(
-    normalizeBatchFailureReason(batchResult),
-    normalizeBatchFailureMessage(batchResult),
-    batchResult?.error?.httpStatus || batchResult?.httpStatus,
-  );
-}
-
-function isRateLimitedSyncItem(item, batchResult) {
-  if (item?.ok === true) {
-    return false;
-  }
-  return isRateLimitedSyncReason(
-    normalizeSyncItemFailureReason(item, batchResult),
-    normalizeSyncItemFailureMessage(item, batchResult),
-    item?.httpStatus ||
-      item?.error?.httpStatus ||
-      batchResult?.error?.httpStatus ||
-      batchResult?.httpStatus,
-  );
-}
-
-function isRateLimitedSyncReason(reason, message = '', httpStatus = null) {
-  if (Number(httpStatus) === 429) {
-    return true;
-  }
-  const normalizedReason = String(reason || '').trim().toLowerCase();
-  if (normalizedReason && RATE_LIMIT_SYNC_REASONS.has(normalizedReason)) {
-    return true;
-  }
-  const searchable = `${normalizedReason} ${String(message || '').toLowerCase()}`;
-  return /(^|\s)429(\s|$)|too many requests|rate limit|rate_limited/.test(searchable);
-}
-
-function isIndeterminateBatchResult(batchResult) {
-  if (!batchResult || batchResult?.ok === true || isRateLimitedBatchResult(batchResult)) {
-    return false;
-  }
-  return isIndeterminateSyncReason(
-    normalizeBatchFailureReason(batchResult),
-    normalizeBatchFailureMessage(batchResult),
-  );
-}
-
-function isIndeterminateSyncItem(item, batchResult) {
-  if (item?.ok === true || isRateLimitedSyncItem(item, batchResult)) {
-    return false;
-  }
-  return isIndeterminateSyncReason(
-    normalizeSyncItemFailureReason(item, batchResult),
-    normalizeSyncItemFailureMessage(item, batchResult),
-  );
-}
-
-function isIndeterminateSyncReason(reason, message = '') {
-  const normalizedReason = String(reason || '').trim().toLowerCase();
-  if (normalizedReason && INDETERMINATE_SYNC_REASONS.has(normalizedReason)) {
-    return true;
-  }
-
-  const searchable = `${normalizedReason} ${String(message || '').toLowerCase()}`;
-  return /timeout|timed out|abort|aborted|network|fetch failed/.test(searchable);
 }
 
 function normalizeSyncDelayMs(value, fallback) {
