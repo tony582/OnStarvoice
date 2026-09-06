@@ -636,13 +636,22 @@ test("unattended Debug wrappers never create a second public task ledger", async
     new URL("../../background.js", import.meta.url),
     "utf8",
   );
-  const endStart = backgroundSource.indexOf("async function endCaptureTask(");
-  const endEnd = backgroundSource.indexOf(
+  assert.match(backgroundSource, /'utils\/capture\/lifecycle\/end\.js'/u);
+  assert.match(backgroundSource, /const captureLifecycle = globalThis\.OnStarvoiceCaptureLifecycle\.create\(/u);
+  assert.match(backgroundSource, /const \{[^}]*\bendCaptureTask\b[^}]*\} = captureLifecycle;/u);
+  assert.match(backgroundSource, /await endCaptureTask\(message\)/u);
+  assert.doesNotMatch(backgroundSource, /async function endCaptureTask\(/u);
+  const lifecycleEndSource = await readFile(
+    new URL("../../utils/capture/lifecycle/end.js", import.meta.url),
+    "utf8",
+  );
+  const endStart = lifecycleEndSource.indexOf("async function endCaptureTask(");
+  const endEnd = lifecycleEndSource.indexOf(
     "async function handleUnexpectedCaptureDebugDetach(",
     endStart,
   );
   assert.ok(endStart >= 0 && endEnd > endStart);
-  const endSource = backgroundSource.slice(endStart, endEnd);
+  const endSource = lifecycleEndSource.slice(endStart, endEnd);
   assert.match(
     endSource,
     /if \(!attemptFence\.unattended\) \{[\s\S]*?status: 'recovering'/,

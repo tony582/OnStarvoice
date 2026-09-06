@@ -25,6 +25,71 @@ const [
   readFile(new URL("utils/capture/task-center-projection.js", repoRoot), "utf8"),
 ]);
 const manifest = JSON.parse(manifestSource);
+const lifecycleModuleNames = [
+  "leases", "restore", "admission", "begin", "progress", "cleanup",
+  "attempts", "end", "tabs", "coordinator",
+];
+const lifecycleSources = Object.fromEntries(await Promise.all(
+  lifecycleModuleNames.map(async (name) => [name, await readFile(
+    new URL(`utils/capture/lifecycle/${name}.js`, repoRoot), "utf8",
+  )]),
+));
+
+// Each assertion reads the actual owner, never a concatenated surrogate for
+// background.js. Fail when the function or its closing boundary is missing.
+function readLifecycleFunction(moduleName, functionName) {
+  const source = lifecycleSources[moduleName];
+  assert.equal(typeof source, "string", `missing lifecycle module ${moduleName}`);
+  const declaration = new RegExp(`^    (?:async )?function ${functionName}\\(`, "mu");
+  const start = source.search(declaration);
+  assert.ok(start >= 0, `missing ${moduleName}.${functionName}`);
+  const end = source.indexOf("\n    }\n", start);
+  assert.ok(end > start, `missing closing boundary for ${moduleName}.${functionName}`);
+  return source.slice(start, end + "\n    }".length);
+}
+
+test("capture lifecycle is required, composed once and owns the migrated implementations", () => {
+  const requiredAt = backgroundSource.indexOf("importScripts(\n  'utils/control-storage-reserve.js'");
+  const requiredEnd = backgroundSource.indexOf("\n);", requiredAt);
+  assert.ok(requiredAt >= 0 && requiredEnd > requiredAt);
+  const imports = backgroundSource.slice(requiredAt, requiredEnd);
+  let previousImportAt = -1;
+  for (const name of lifecycleModuleNames) {
+    const importAt = imports.indexOf(`'utils/capture/lifecycle/${name}.js'`);
+    assert.ok(importAt > previousImportAt, `${name} is a required ordered worker module`);
+    previousImportAt = importAt;
+  }
+  assert.equal(
+    (backgroundSource.match(/globalThis\.OnStarvoiceCaptureLifecycle\.create\(/gu) || []).length,
+    1,
+    "all legacy entry points share one lifecycle instance",
+  );
+  const aliases = backgroundSource.match(/const \{([^{}]+)\} = captureLifecycle;/u)?.[1];
+  assert.ok(aliases, "legacy aliases must come from the composed instance");
+  for (const [name, source] of Object.entries(lifecycleSources)) {
+    if (name === "coordinator") continue;
+    const functions = [...source.matchAll(/^    (?:async )?function (\w+)\(/gmu)];
+    assert.ok(functions.length > 0, `${name} has real implementation bodies`);
+    for (const [, functionName] of functions) {
+      assert.match(aliases, new RegExp(`\\b${functionName}\\b`, "u"));
+      assert.doesNotMatch(backgroundSource, new RegExp(`\\bfunction ${functionName}\\(`, "u"));
+    }
+  }
+  assert.match(aliases, /debugSessions: captureDebugSessionManager/u);
+  assert.match(aliases, /tabGroups: captureTaskTabGroupManager/u);
+  assert.match(aliases, /owners: captureTaskOwnerCoordinator/u);
+  for (const stateName of [
+    "captureTaskLifecycleQueue", "captureRuntimeRestorePromise", "captureTaskBeginInFlight",
+    "captureTaskReplacementTabIds", "captureTaskPendingWorkerTabIds", "captureTaskCleanupInProgress",
+  ]) {
+    assert.doesNotMatch(backgroundSource, new RegExp(`\\b(?:let|const) ${stateName}\\b`, "u"));
+    assert.match(lifecycleSources.coordinator, new RegExp(`\\b${stateName}:`, "u"));
+    for (const name of lifecycleModuleNames.filter((name) => name !== "coordinator")) {
+      assert.doesNotMatch(lifecycleSources[name], new RegExp(`\\b(?:let|const) ${stateName}\\b`, "u"));
+    }
+  }
+  assert.doesNotMatch(backgroundSource, /function runCaptureTaskLifecycleOperation\(/u);
+});
 
 function readDetailBatchFunctionSource() {
   const start = captureSyncSource.indexOf(
@@ -169,14 +234,18 @@ test("task-center projection loads and executes without browser, storage, networ
 });
 
 test("all task-level runtime messages are wired in the service worker", () => {
-  for (const type of [
-    "onstarvoice:begin-capture-task",
-    "onstarvoice:update-capture-task",
-    "onstarvoice:register-capture-task-tab",
-    "onstarvoice:end-capture-task",
-    "onstarvoice:set-capture-task-minimized",
+  for (const [type, handler, parameters] of [
+    ["onstarvoice:begin-capture-task", "beginCaptureTask", "message, sender"],
+    ["onstarvoice:update-capture-task", "updateCaptureTask", "message"],
+    ["onstarvoice:register-capture-task-tab", "registerCaptureTaskTab", "message, sender"],
+    ["onstarvoice:end-capture-task", "endCaptureTask", "message"],
+    ["onstarvoice:set-capture-task-minimized", "setCaptureTaskMinimized", "message"],
   ]) {
     assert.equal(backgroundSource.includes(`type === '${type}'`), true, type);
+    assert.match(backgroundSource, new RegExp(
+      `if \\(type === '${type}'\\) \\{\\s*const data = await ${handler}\\(${parameters}\\);\\s*sendResponse\\(\\{ok: true, data\\}\\);\\s*return;\\s*\\}`,
+      "u",
+    ), `${type} delegates to its composed lifecycle alias and preserves the response`);
   }
 });
 
@@ -212,14 +281,7 @@ test("persistent debugger ownership does not replace each list relay child run",
 });
 
 test("unexpected debugger detach is observational for persistent and legacy assist sessions", () => {
-  const start = backgroundSource.indexOf(
-    "async function handleUnexpectedCaptureDebugDetach",
-  );
-  const end = backgroundSource.indexOf(
-    "async function handleAbandonedCaptureTask",
-    start,
-  );
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("end", "handleUnexpectedCaptureDebugDetach");
   assert.match(body, /transient assist detached; page capture continues/u);
   assert.match(body, /detached; page capture continues/u);
   assert.doesNotMatch(body, /relayCaptureTaskCancellation/u);
@@ -228,11 +290,7 @@ test("unexpected debugger detach is observational for persistent and legacy assi
 });
 
 test("task end attempts debugger release before source ungroup cleanup", () => {
-  const start = backgroundSource.indexOf(
-    "async function releaseCaptureTaskResources",
-  );
-  const end = backgroundSource.indexOf("async function endCaptureTask", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("cleanup", "releaseCaptureTaskResources");
   const detachAt = body.indexOf("stopByTaskId");
   const ungroupAt = body.indexOf("captureTaskTabGroupManager.end");
   assert.ok(detachAt >= 0);
@@ -240,9 +298,7 @@ test("task end attempts debugger release before source ungroup cleanup", () => {
 });
 
 test("task begin checks debugger ownership before changing native groups", () => {
-  const start = backgroundSource.indexOf("async function beginCaptureTask");
-  const end = backgroundSource.indexOf("async function updateCaptureTask", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("begin", "beginCaptureTaskNow");
   const ownershipAt = body.indexOf("getActiveSessions()");
   const groupAt = body.indexOf("captureTaskTabGroupManager.begin");
   assert.ok(ownershipAt >= 0);
@@ -255,7 +311,7 @@ test("task begin checks debugger ownership before changing native groups", () =>
     "capture_task_debug_ownership_unknown",
   ]) {
     assert.match(
-      `${backgroundSource}\n${debugSessionSource}`,
+      debugSessionSource,
       new RegExp(code, "u"),
     );
   }
@@ -263,9 +319,7 @@ test("task begin checks debugger ownership before changing native groups", () =>
 });
 
 test("task begin reconciles only confirmed stale native groups before reporting group busy", () => {
-  const start = backgroundSource.indexOf("async function beginCaptureTask");
-  const end = backgroundSource.indexOf("async function updateCaptureTask", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("begin", "beginCaptureTaskNow");
   const reconcileAt = body.indexOf(
     "releaseConfirmedStaleCaptureTaskGroupsForBegin",
   );
@@ -273,14 +327,7 @@ test("task begin reconciles only confirmed stale native groups before reporting 
 
   assert.ok(reconcileAt >= 0);
   assert.ok(conflictAt > reconcileAt);
-  const livenessStart = backgroundSource.indexOf(
-    "async function inspectCaptureTaskGroupLiveness",
-  );
-  const livenessEnd = backgroundSource.indexOf(
-    "async function releaseConfirmedStaleCaptureTaskGroupsForBegin",
-    livenessStart,
-  );
-  const livenessBody = backgroundSource.slice(livenessStart, livenessEnd);
+  const livenessBody = readLifecycleFunction("admission", "inspectCaptureTaskGroupLiveness");
   for (const signal of [
     "debug_session",
     "task_owner",
@@ -298,15 +345,13 @@ test("task begin reconciles only confirmed stale native groups before reporting 
     /reason: 'confirmed_stale',[\s\S]*debugSession,/u,
   );
   assert.match(
-    backgroundSource,
+    readLifecycleFunction("admission", "releaseConfirmedStaleCaptureTaskGroupsForBegin"),
     /releaseCaptureTaskResourcesWithRetry\([\s\S]*reason: 'stale_capture_task_recovered'/u,
   );
 });
 
 test("task-level Debug trusts the source URL and rejects unsupported or spoofed platforms", () => {
-  const start = backgroundSource.indexOf("async function beginCaptureTask");
-  const end = backgroundSource.indexOf("async function updateCaptureTask", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("begin", "beginCaptureTaskNow");
   assert.match(body, /sourceTab = await chrome\.tabs\.get\(sourceTabId\)/u);
   assert.match(body, /detectPlatformFromUrl\(sourceTab\?\.url \|\| ''\)/u);
   assert.match(body, /resolveCaptureTaskReplacementLease\(sourceTabId/u);
@@ -512,9 +557,7 @@ test("Douyin card identity and detail route are kept consistent", () => {
 });
 
 test("worker registration rolls native grouping back if debug ownership ended", () => {
-  const start = backgroundSource.indexOf("async function registerCaptureTaskTab");
-  const end = backgroundSource.indexOf("async function endCaptureTask", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("progress", "registerCaptureTaskTab");
   const registerGroupAt = body.indexOf("captureTaskTabGroupManager.register");
   const registerDebugAt = body.indexOf("captureDebugSessionManager.registerWorkerTab");
   const rollbackAt = body.indexOf("captureTaskTabGroupManager.unregister");
@@ -524,12 +567,13 @@ test("worker registration rolls native grouping back if debug ownership ended", 
 });
 
 test("source removal uses unified task cleanup instead of deleting manager maps independently", () => {
+  const body = readLifecycleFunction("tabs", "handleCaptureRuntimeTabRemoved");
   assert.match(
-    backgroundSource,
+    body,
     /async function handleCaptureRuntimeTabRemoved\(tabId\)[\s\S]*source_tab_removed/u,
   );
   assert.match(
-    backgroundSource,
+    body,
     /handleCaptureRuntimeTabRemoved\(tabId\)[\s\S]*terminalizeCaptureTaskLedgerRun\(session\.taskId/u,
   );
   const removedListener = backgroundSource.slice(
@@ -703,11 +747,7 @@ test("comment capture preserves security challenges as whole-batch fatal errors"
 });
 
 test("fresh-worker stale cleanup validates the owned group before touching tab ids", () => {
-  const start = backgroundSource.indexOf(
-    "async function cleanupStaleCaptureRuntimeSession",
-  );
-  const end = backgroundSource.indexOf("async function ensureRuntimeState", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("restore", "cleanupStaleCaptureRuntimeSession");
   const groupCheckAt = body.indexOf("chrome.tabGroups.get(taskGroupId)");
   const sourceReadAt = body.indexOf("chrome.tabs.get(sourceTabId)");
   const sourceMutationAt = body.indexOf("chrome.debugger.detach");
@@ -731,20 +771,15 @@ test("fresh-worker stale cleanup validates the owned group before touching tab i
 });
 
 test("native assist detach is observational while source loss closes owned detail workers", () => {
-  const detachAt = backgroundSource.indexOf("onUnexpectedDetach: async");
-  const detachEnd = backgroundSource.indexOf("function createCaptureTaskError", detachAt);
+  const coordinatorSource = lifecycleSources.coordinator;
+  const detachAt = coordinatorSource.indexOf("onUnexpectedDetach: async");
+  const detachEnd = coordinatorSource.indexOf("state.captureTaskOwnerCoordinator =", detachAt);
+  assert.ok(detachAt >= 0 && detachEnd > detachAt);
   assert.match(
-    backgroundSource.slice(detachAt, detachEnd),
+    coordinatorSource.slice(detachAt, detachEnd),
     /handleUnexpectedCaptureDebugDetach/u,
   );
-  const unexpectedAt = backgroundSource.indexOf(
-    "async function handleUnexpectedCaptureDebugDetach",
-  );
-  const unexpectedEnd = backgroundSource.indexOf(
-    "async function handleAbandonedCaptureTask",
-    unexpectedAt,
-  );
-  const unexpectedBody = backgroundSource.slice(unexpectedAt, unexpectedEnd);
+  const unexpectedBody = readLifecycleFunction("end", "handleUnexpectedCaptureDebugDetach");
   const persistentBody = unexpectedBody.slice(
     unexpectedBody.indexOf("// Debug/DevTools is only a capture assist"),
   );
@@ -753,28 +788,14 @@ test("native assist detach is observational while source loss closes owned detai
   assert.doesNotMatch(persistentBody, /terminalizeCaptureTaskLedgerRun/u);
   assert.doesNotMatch(persistentBody, /relayCaptureTaskCancellation/u);
   assert.doesNotMatch(persistentBody, /releaseCaptureTaskResources/u);
-  const removedAt = backgroundSource.indexOf(
-    "async function handleCaptureRuntimeTabRemoved",
-  );
-  const removedEnd = backgroundSource.indexOf(
-    "chrome.runtime.onInstalled.addListener",
-    removedAt,
-  );
   assert.match(
-    backgroundSource.slice(removedAt, removedEnd),
+    readLifecycleFunction("tabs", "handleCaptureRuntimeTabRemoved"),
     /releaseCaptureTaskResourcesWithRetry/u,
   );
 });
 
 test("tab replacement migrates persistent capture ownership instead of treating it as source removal", () => {
-  const replacedAt = backgroundSource.indexOf(
-    "async function handleCaptureRuntimeTabReplaced",
-  );
-  const replacedEnd = backgroundSource.indexOf(
-    "async function handleCaptureRuntimeTabRemoved",
-    replacedAt,
-  );
-  const body = backgroundSource.slice(replacedAt, replacedEnd);
+  const body = readLifecycleFunction("tabs", "handleCaptureRuntimeTabReplaced");
   assert.match(body, /captureTaskTabGroupManager\.replaceTab/u);
   assert.match(body, /captureDebugSessionManager\.replaceTab/u);
   assert.match(body, /replaceCaptureExecutionLockTabId/u);
@@ -789,11 +810,7 @@ test("tab replacement migrates persistent capture ownership instead of treating 
 });
 
 test("normal task end also closes any surviving registered worker", () => {
-  const start = backgroundSource.indexOf(
-    "async function releaseCaptureTaskResources",
-  );
-  const end = backgroundSource.indexOf("async function endCaptureTask", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("cleanup", "releaseCaptureTaskResources");
   assert.match(
     body,
     /captureDebugSessionManager\.getSessionByTaskId/u,
@@ -802,24 +819,18 @@ test("normal task end also closes any surviving registered worker", () => {
 });
 
 test("required owner is verified before and after task mutations", () => {
-  const start = backgroundSource.indexOf("async function beginCaptureTask");
-  const end = backgroundSource.indexOf("async function updateCaptureTask", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("begin", "beginCaptureTaskNow");
   const firstOwnerCheckAt = body.indexOf("requireConnectedCaptureTaskOwner(taskId)");
   const groupAt = body.indexOf("captureTaskTabGroupManager.begin");
   const lastOwnerCheckAt = body.lastIndexOf("requireConnectedCaptureTaskOwner(taskId)");
-  const returnAt = body.indexOf(
-    "return {\n      taskId,\n      session,\n      group,\n      debugOwnership,",
-  );
+  const returnAt = body.search(/return \{\s*taskId,\s*session,\s*group,\s*debugOwnership,/u);
   assert.ok(firstOwnerCheckAt >= 0 && firstOwnerCheckAt < groupAt);
   assert.ok(lastOwnerCheckAt > groupAt && lastOwnerCheckAt < returnAt);
   assert.match(body, /ownerRequired = request\.ownerRequired === true/u);
 });
 
 test("begin rollback releases only exact resources created by that attempt", () => {
-  const start = backgroundSource.indexOf("async function beginCaptureTask");
-  const end = backgroundSource.indexOf("async function updateCaptureTask", start);
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("begin", "beginCaptureTaskNow");
   assert.match(body, /capture_task_begin_rollback/u);
   assert.match(body, /!preBeginSession[\s\S]*rollbackDebugSnapshot/u);
   assert.match(body, /!preBeginGroup[\s\S]*rollbackGroupSnapshot/u);
@@ -840,40 +851,32 @@ test("begin rollback releases only exact resources created by that attempt", () 
 
 test("capture task BEGIN and END share one lifecycle queue", () => {
   assert.match(
-    backgroundSource,
-    /function runCaptureTaskLifecycleOperation\(operation\)[\s\S]*captureTaskLifecycleQueue/u,
+    lifecycleSources.coordinator,
+    /operations\.runCaptureTaskLifecycleOperation = \(operation\) => \{\s*const pending = state\.captureTaskLifecycleQueue\.then\(operation, operation\);\s*state\.captureTaskLifecycleQueue = pending\.catch\(\(\) => null\);\s*return pending;/u,
   );
-  const beginStart = backgroundSource.indexOf("async function beginCaptureTask(");
-  const beginEnd = backgroundSource.indexOf("async function beginCaptureTaskNow(", beginStart);
   assert.match(
-    backgroundSource.slice(beginStart, beginEnd),
+    readLifecycleFunction("begin", "beginCaptureTask"),
     /runCaptureTaskLifecycleOperation/u,
   );
-  const endStart = backgroundSource.indexOf("async function endCaptureTask(");
-  const endEnd = backgroundSource.indexOf("async function performEndCaptureTask(", endStart);
   assert.match(
-    backgroundSource.slice(endStart, endEnd),
+    readLifecycleFunction("end", "endCaptureTask"),
     /runCaptureTaskLifecycleOperation/u,
   );
+  for (const name of ["begin", "end"]) {
+    assert.match(lifecycleSources[name], /const runCaptureTaskLifecycleOperation = \(\.\.\.args\) => operations\.runCaptureTaskLifecycleOperation\(\.\.\.args\)/u);
+  }
 });
 
 test("sidebar owner disconnect is a bounded whole-task cancellation", () => {
   assert.match(
-    backgroundSource,
-    /OnStarvoiceCaptureTaskOwner\.createCoordinator\(\{\s*onAbandoned: handleAbandonedCaptureTask/u,
+    lifecycleSources.coordinator,
+    /taskOwnerApi\.createCoordinator\(\{\s*onAbandoned: handleAbandonedCaptureTask/u,
   );
   assert.match(
     backgroundSource,
     /chrome\.runtime\.onConnect\.addListener\(\(port\) => \{\s*captureTaskOwnerCoordinator\.attachPort\(port\)/u,
   );
-  const start = backgroundSource.indexOf(
-    "async function handleAbandonedCaptureTask",
-  );
-  const end = backgroundSource.indexOf(
-    "async function setCaptureTaskMinimized",
-    start,
-  );
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("end", "handleAbandonedCaptureTask");
   assert.match(body, /sidebar_owner_disconnected/u);
   assert.match(body, /terminalizeCaptureTaskLedgerRun\(normalizedTaskId/u);
   assert.match(body, /relayCaptureTaskCancellation/u);
@@ -881,14 +884,7 @@ test("sidebar owner disconnect is a bounded whole-task cancellation", () => {
 });
 
 test("persistent native assist detach never publishes a task tombstone or stops capture", () => {
-  const start = backgroundSource.indexOf(
-    "async function handleUnexpectedCaptureDebugDetach",
-  );
-  const end = backgroundSource.indexOf(
-    "async function handleAbandonedCaptureTask",
-    start,
-  );
-  const body = backgroundSource.slice(start, end);
+  const body = readLifecycleFunction("end", "handleUnexpectedCaptureDebugDetach");
   const persistentBody = body.slice(
     body.indexOf("// Debug/DevTools is only a capture assist"),
   );
