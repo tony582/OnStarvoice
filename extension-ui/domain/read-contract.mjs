@@ -1,4 +1,5 @@
 import { exactRecordId } from './record-id.mjs';
+import { exactReadIdentity } from './read-identity.mjs';
 import { presentResult, presentResultDetail } from './result-presenter.mjs';
 
 // Proposed read-side envelope only. Matching these fields is not authorization.
@@ -21,12 +22,6 @@ function own(value, key, array = false) {
   } catch { return UNREADABLE; }
 }
 
-function identity(value) {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 240) return null;
-  if (/[\s\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\uD800-\uDFFF]/u.test(value)) return null;
-  return value;
-}
-
 function count(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
@@ -45,7 +40,7 @@ export function readScope(value) {
   if (!object(value)) return null;
   const scope = {};
   for (const key of SCOPE_KEYS) {
-    const entry = identity(own(value, key));
+    const entry = exactReadIdentity(own(value, key));
     if (entry === null) return null;
     scope[key] = entry;
   }
@@ -79,7 +74,7 @@ export function decodeResultPage(response, expectedScope, query) {
   const scope = readScope(expectedScope);
   const request = readQuery(query);
   if (!scope || !request || !object(response) || !sameScope(response, scope)) return null;
-  const snapshotId = identity(own(response, 'snapshotId'));
+  const snapshotId = exactReadIdentity(own(response, 'snapshotId'));
   if (snapshotId === null || !sameQuery(own(response, 'query'), request)) return null;
   const sourceCounts = own(response, 'counts');
   const all = own(sourceCounts, 'all');
@@ -119,7 +114,7 @@ export function decodeResultPage(response, expectedScope, query) {
 /** Check identity before touching a bounded detail, then drop all envelope extras. */
 export function decodeResultDetail(response, expectedScope, snapshotId, recordId) {
   const scope = readScope(expectedScope);
-  const snapshot = identity(snapshotId);
+  const snapshot = exactReadIdentity(snapshotId);
   const record = exactRecordId(recordId);
   if (!scope || snapshot === null || !record || !object(response) || !sameScope(response, scope)) return null;
   if (own(response, 'snapshotId') !== snapshot || own(response, 'recordId') !== record) return null;
