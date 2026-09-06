@@ -1,7 +1,7 @@
+import {readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import vm from 'node:vm';
 import * as presentation from '../../utils/capture/streaming-sync-presentation.js';
 import * as reconciliation from '../../utils/capture/sync-reconciliation-state.js';
 import {createRecordSyncQueue} from '../../utils/record-sync-queue.js';
@@ -13,6 +13,7 @@ const sidebar = readFileSync(new URL('../../sidebar/sidebar-logic.js', import.me
 const plain = value => JSON.parse(JSON.stringify(value));
 
 function section(source, start, end) {
+  if (source === sidebar && /function\s+\w+\s*\(/.test(start)) return readSidebarSection(start, end);
   const from = source.indexOf(start);
   assert.ok(from >= 0, `missing actual source marker: ${start}`);
   assert.equal(source.indexOf(start, from + start.length), -1, `ambiguous source marker: ${start}`);

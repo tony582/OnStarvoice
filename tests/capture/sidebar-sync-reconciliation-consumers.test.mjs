@@ -1,7 +1,7 @@
+import {readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import vm from 'node:vm';
 import {hasSyncReconciliationSignal, buildSyncReconciliationError} from '../../utils/capture/sync-reconciliation-state.js';
 import {isUnattendedSafetyBlock, summarizeUnattendedKeywordCheckpoint} from '../../utils/unattended-keyword-run.js';
 
@@ -18,6 +18,7 @@ class FixtureDate extends Date {
 }
 
 function section(source, start, end) {
+  if (source === sidebar && /function\s+\w+\s*\(/.test(start)) return readSidebarSection(start, end);
   const from = source.indexOf(start);
   assert.ok(from >= 0, `missing actual source marker: ${start}`);
   assert.equal(source.indexOf(start, from + start.length), -1, `ambiguous source marker: ${start}`);

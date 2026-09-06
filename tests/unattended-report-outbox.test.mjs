@@ -1,7 +1,8 @@
+import {readSidebarFunction, readSidebarSection, sidebarVm as vm} from './helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 import test from "node:test";
-import {runInNewContext} from "node:vm";
+const {runInNewContext} = vm;
 
 import {
   discardUnattendedCheckpointReports,
@@ -27,13 +28,7 @@ const UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX =
 const KEYWORD_RUN_REQUEST_STORAGE_KEY =
   "onstarvoice.unattendedKeywordRunRequest";
 
-function sourceSection(startMarker, endMarker) {
-  const start = sidebarSource.indexOf(startMarker);
-  const end = sidebarSource.indexOf(endMarker, start + startMarker.length);
-  assert.ok(start >= 0, `missing source marker: ${startMarker}`);
-  assert.ok(end > start, `missing source end marker: ${endMarker}`);
-  return sidebarSource.slice(start, end);
-}
+function sourceSection(startMarker, endMarker) { return readSidebarSection(startMarker, endMarker); }
 
 function createStorage(initial = {}) {
   const data = structuredClone(initial);
@@ -423,10 +418,7 @@ async function runDirectReport({response, durableCheckpoint = true} = {}) {
       return Promise.resolve({ok: true});
     },
   };
-  const baseReporter = sourceSection(
-    "async function reportUnattendedKeywordRun(",
-    "let unattendedCheckpointOutboxFlushPromise",
-  );
+  const baseReporter = readSidebarFunction('reportUnattendedKeywordRun');
   runInNewContext(
     `${baseReporter}\nglobalThis.__reportUnattendedKeywordRun = reportUnattendedKeywordRun;`,
     context,
@@ -1056,10 +1048,7 @@ test("only settled checkpoints use durable acknowledgement semantics", () => {
     "async function reportUnattendedTerminalRun(",
     "function startUnattendedKeywordRunHeartbeat(",
   );
-  const baseReporter = sourceSection(
-    "async function reportUnattendedKeywordRun(",
-    "let unattendedCheckpointOutboxFlushPromise",
-  );
+  const baseReporter = readSidebarFunction('reportUnattendedKeywordRun');
 
   assert.match(checkpointReporter, /durableCheckpoint:\s*true/u);
   assert.match(

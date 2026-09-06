@@ -1,7 +1,7 @@
+import {readSidebarFunction, readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
-import vm from "node:vm";
 
 const sidebarHtml = await readFile(
   new URL("../../sidebar/sidebar.html", import.meta.url),
@@ -33,6 +33,7 @@ const constantsSource = await readFile(
 );
 
 function readSourceSection(source, startMarker, endMarker) {
+  if (source === sidebarLogic && /function\s+\w+\s*\(/.test(startMarker)) return readSidebarSection(startMarker, endMarker);
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
   const end = source.indexOf(endMarker, start + startMarker.length);
@@ -87,7 +88,7 @@ test("AI relevance prefilter uses one persisted setting shared by manual and una
     /enableAiRelevancePrefilter:\s*Boolean\(\s*settings\?\.enableAiRelevancePrefilter/,
   );
   assert.match(
-    sidebarLogic,
+    readSidebarFunction('handleCaptureSearchData'),
     /relevanceKeyword:\s*capturedKeyword/,
   );
   assert.match(

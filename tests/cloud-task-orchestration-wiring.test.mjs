@@ -1,3 +1,4 @@
+import {readSidebarFunction} from './helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
@@ -207,12 +208,13 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /requireVerifiedFilters: sequentialSearchEnabled/u);
   assert.match(composer, /一个关键词任务，由同一 Agent 串行完成/u);
   assert.match(composer, /每次搜索先采集列表、再增强本次新增内容/u);
-  assert.match(sidebar, /plannedRounds = sequentialSearchEnabled[\s\S]*searchPasses\.length/u);
-  assert.match(sidebar, /roundSearchFilters = activeSearchPass[\s\S]*contentType: activeSearchPass/u);
-  assert.match(sidebar, /searchFilters: roundSearchFilters/u);
-  assert.match(sidebar, /afterKeywordCapture: settings\.autoDetailCaptureAfterListCapture/u);
+  assert.match(readSidebarFunction('runUnattendedKeywordPlanRequest'), /plannedRounds = sequentialSearchEnabled[\s\S]*searchPasses\.length/u);
+  const batchSource = readSidebarFunction('handleBatchKeywordCapture');
+  assert.match(batchSource, /roundSearchFilters = activeSearchPass[\s\S]*contentType: activeSearchPass/u);
+  assert.match(batchSource, /searchFilters: roundSearchFilters/u);
+  assert.match(batchSource, /afterKeywordCapture: settings\.autoDetailCaptureAfterListCapture/u);
   assert.match(
-    sidebar,
+    batchSource,
     /result\.canceled \|\|[\s\S]*result\.fatal \|\|[\s\S]*result\.recoveryRequired/u,
   );
 

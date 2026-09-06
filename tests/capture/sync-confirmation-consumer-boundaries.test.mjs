@@ -1,18 +1,14 @@
+import {readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import vm from 'node:vm';
 import {createRecordSyncQueue} from '../../utils/record-sync-queue.js';
 import {projectElasticKeywordRecoveryStatus} from '../../server/modules/capture/application/control-outcome-projection.js';
 
 // Three tests retain legacy gates; targeted projection now consumes explicit
 // holds. This is not a production replay guarantee or full prototype wiring.
 const sidebar = readFileSync(new URL('../../sidebar/sidebar-logic.js', import.meta.url), 'utf8');
-const start = sidebar.indexOf('function createStreamingDetailAutoSyncQueue(');
-const end = sidebar.indexOf('function routeDetailItemToStreamingSync(', start);
-assert.ok(start >= 0 && end > start);
-assert.equal(sidebar.indexOf('function createStreamingDetailAutoSyncQueue(', start + 1), -1);
-const consumerSource = sidebar.slice(start, end);
+const consumerSource = readSidebarSection('function createStreamingDetailAutoSyncQueue(', 'function routeDetailItemToStreamingSync(');
 
 test('current boundary: streaming wrapper drops a proposed blocked flag and text matching ignores retryable false', async () => {
   const proposedResult = {ok: false, blocked: true, retryable: false,

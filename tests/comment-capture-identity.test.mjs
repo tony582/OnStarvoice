@@ -1,8 +1,8 @@
+import {readSidebarFunction, readSidebarSection, sidebarVm as vm} from './helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readCaptureFunction} from './helpers/capture-delivery-source.mjs';
 import {readFile} from "node:fs/promises";
 import test from "node:test";
-import vm from "node:vm";
 import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 
@@ -48,6 +48,7 @@ vm.runInContext(
 const {ensureCommentCaptureIdentity} = context.__commentCaptureIdentityApi;
 
 function sourceBlock(source, startMarker, endMarker) {
+  if (source === sidebarSource && /function\s+\w+\s*\(/.test(startMarker)) return readSidebarSection(startMarker, endMarker);
   const start = source.indexOf(startMarker);
   const end = source.indexOf(endMarker, start + startMarker.length);
   assert.ok(start >= 0, `missing source marker: ${startMarker}`);
@@ -141,11 +142,7 @@ test("detail comments and card stop reuse the bound request instead of the activ
     /captureRequestId:\s*commentCaptureIdentity\.captureRequestId/,
   );
 
-  const cancelBlock = sourceBlock(
-    sidebarSource,
-    "async function handleCancel()",
-    "/**\n * 处理鉴权",
-  );
+  const cancelBlock = readSidebarFunction('handleCancel');
   assert.match(
     cancelBlock,
     /requestCaptureCancelSignal\(relayTabId, cancelRequestId\)/,

@@ -1,7 +1,7 @@
+import {readSidebarFunction, readSidebarSection, readSidebarControllerSources, assertSidebarRuntimeDoesNotMatch, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
-import vm from "node:vm";
 
 import {
   beginCaptureTaskSession,
@@ -23,6 +23,7 @@ const captureSyncSource = await readFile(
 );
 
 function readSourceSection(source, startMarker, endMarker) {
+  if (source === sidebarSource && /function\s+\w+\s*\(/.test(startMarker)) return readSidebarSection(startMarker, endMarker);
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
   const end = source.indexOf(endMarker, start + startMarker.length);
@@ -31,7 +32,7 @@ function readSourceSection(source, startMarker, endMarker) {
 }
 
 function readFunctionSection(startMarker, endMarker) {
-  return readSourceSection(sidebarSource, startMarker, endMarker);
+  return readSidebarSection(startMarker, endMarker);
 }
 
 test("observer sidebar renders the active cloud run before Debug attaches", () => {
@@ -408,10 +409,10 @@ globalThis.__targetedAttemptHelpers = {
     "attempt-a",
   );
   helpers.activateTargetedPostInvocation(attemptA);
-  context.targetedPostRunInFlightOwnerToken = attemptA;
-  context.targetedPostBatchStateOwnerToken = attemptA;
-  context.targetedPostRunnerTabOwnerToken = attemptA;
-  context.targetedPostRunState = {
+  context.controllerState.targetedPostRunInFlightOwnerToken = attemptA;
+  context.controllerState.targetedPostBatchStateOwnerToken = attemptA;
+  context.controllerState.targetedPostRunnerTabOwnerToken = attemptA;
+  context.controllerState.targetedPostRunState = {
     id: "request-1",
     attemptId: "attempt-a",
     status: "running",
@@ -425,10 +426,10 @@ globalThis.__targetedAttemptHelpers = {
 
   assert.equal(Object.isFrozen(attemptA), true);
   assert.deepEqual(
-    JSON.parse(JSON.stringify(context.activeTargetedPostInvocationToken)),
+    JSON.parse(JSON.stringify(context.controllerState.activeTargetedPostInvocationToken)),
     {requestId: "request-1", attemptId: "attempt-b"},
   );
-  assert.equal(context.targetedPostRunState, null);
+  assert.equal(context.controllerState.targetedPostRunState, null);
   assert.deepEqual(stopReasons, ["stale_targeted_post_attempt"]);
   assert.deepEqual(
     JSON.parse(
@@ -443,9 +444,9 @@ globalThis.__targetedAttemptHelpers = {
     "request-1",
     "attempt-b",
   );
-  context.targetedPostRunInFlightOwnerToken = attemptB;
-  context.targetedPostBatchStateOwnerToken = attemptB;
-  context.targetedPostRunnerTabOwnerToken = attemptB;
+  context.controllerState.targetedPostRunInFlightOwnerToken = attemptB;
+  context.controllerState.targetedPostBatchStateOwnerToken = attemptB;
+  context.controllerState.targetedPostRunnerTabOwnerToken = attemptB;
   assert.deepEqual(
     JSON.parse(
       JSON.stringify(
@@ -1112,10 +1113,7 @@ test("a normal side panel without a runner query renders shared targeted state a
   assert.equal(updateCalls[0].request.id, "shared-targeted-request");
   assert.equal(updateCalls[0].patch.cancelRequested, true);
 
-  const initSection = readFunctionSection(
-    "export async function initSidebar()",
-    "// ==================== 状态订阅",
-  );
+  const initSection = readSidebarFunction('initSidebar');
   assert.match(initSection, /loadTargetedPostRunStateForDisplay\(\)/u);
 });
 
@@ -1305,7 +1303,7 @@ test("protective platform stops remain needs-action instead of user-canceled", (
     'result?.securityBlocked\n      ? "needs_action"',
   );
   const canceledIndex = batchSection.indexOf(
-    'result?.canceled || batchKeywordCancelRequested',
+    'result?.canceled || controllerState.batchKeywordCancelRequested',
     needsActionIndex,
   );
   assert.ok(needsActionIndex > -1);
@@ -1317,10 +1315,7 @@ test("protective platform stops remain needs-action instead of user-canceled", (
 });
 
 test("blogger capture uses one optional assist session across list and detail work", () => {
-  const section = readFunctionSection(
-    "async function handleCaptureBloggerData()",
-    "// 搜索页:",
-  );
+  const section = readSidebarFunction('handleCaptureBloggerData');
   const lockIndex = section.indexOf("await acquireCaptureExecutionLock({");
   const beginIndex = section.indexOf("await startOptionalCaptureAssistSession({");
   const firstCaptureIndex = section.indexOf("await captureAndSync({");
@@ -2122,7 +2117,7 @@ test("unattended final source tab stays pinned through the batch runner", () => 
   );
   assert.match(
     handlerSection,
-    /const baseBatchOptions = \{[\s\S]*?sourceTabId:\s*activeBatchRunnerTabId,/,
+    /const baseBatchOptions = \{[\s\S]*?sourceTabId:\s*controllerState\.activeBatchRunnerTabId,/,
   );
 
   const captureSyncBatchSection = readSourceSection(
@@ -2240,7 +2235,7 @@ test("unattended detail interruption only stops the whole plan for explicit term
   );
   assert.match(
     section,
-    /if \(cancellation\.stopBatch\) \{\s*batchKeywordCancelRequested = true/,
+    /if \(cancellation\.stopBatch\) \{\s*controllerState\.batchKeywordCancelRequested = true/,
   );
   assert.match(
     section,
@@ -2248,7 +2243,7 @@ test("unattended detail interruption only stops the whole plan for explicit term
   );
   assert.doesNotMatch(
     section,
-    /if \(enhanceResult\?\.canceled \|\| resultInterruption\.recoverable\) \{\s*batchKeywordCancelRequested = true/,
+    /if \(enhanceResult\?\.canceled \|\| resultInterruption\.recoverable\) \{\s*controllerState\.batchKeywordCancelRequested = true/,
   );
 });
 
@@ -2359,14 +2354,11 @@ test("one keyword cannot schedule a third detail enhancement attempt", () => {
     "async function handleBatchKeywordCapture(options = {})",
     "async function reportUnattendedKeywordRun(",
   );
-  const detailSection = readFunctionSection(
-    "async function runDetailCaptureForRecordIds(",
-    "/**\n * 处理导出",
-  );
+  const detailSection = readSidebarFunction('runDetailCaptureForRecordIds');
 
   // The single-retry helper owns the complete retry budget. Manual and
   // unattended rounds must never launch another enhancement orchestration.
-  assert.doesNotMatch(sidebarSource, /retryFailedEnhancementsAfterRound\(/);
+  assertSidebarRuntimeDoesNotMatch(sidebarSource, /retryFailedEnhancementsAfterRound\(/);
   assert.doesNotMatch(
     manualSection,
     /collectFailedEnhanceRecordIds|enhance_retrying/,
@@ -2390,10 +2382,7 @@ test("one keyword cannot schedule a third detail enhancement attempt", () => {
 });
 
 test("strict capture assist start still verifies task ownership", () => {
-  const section = readFunctionSection(
-    "async function startCaptureAssistSessionStrict(options = {})",
-    "const OPTIONAL_CAPTURE_ASSIST_SESSION_CODES",
-  );
+  const section = readSidebarFunction('startCaptureAssistSessionStrict');
 
   const bindIndex = section.indexOf("bindCaptureTaskOwner(taskId)");
   const beginIndex = section.indexOf("await beginCaptureTaskSession({");
@@ -2498,10 +2487,7 @@ test("Weibo capture paths keep their non-Debug workflow", () => {
     /new Set\(\["xiaohongshu", "douyin"\]\)/,
   );
 
-  const bloggerSection = readFunctionSection(
-    "async function handleCaptureBloggerData()",
-    "// 搜索页:",
-  );
+  const bloggerSection = readSidebarFunction('handleCaptureBloggerData');
   assert.match(
     bloggerSection,
     /if \(supportsPersistentCaptureTaskPlatform\(pagePlatform\)\) \{/,
@@ -2601,7 +2587,7 @@ test("capture progress rejects stale owners before forwarding into local UI", ()
   assert.ok(updateIndex < domIndex);
   assert.match(
     section.slice(updateIndex, localPhaseIndex),
-    /taskId:\s*incomingCaptureTaskId\s*\|\|\s*captureTaskOwnerTaskId/,
+    /taskId:\s*incomingCaptureTaskId\s*\|\|\s*controllerState\.captureTaskOwnerTaskId/,
   );
 });
 
@@ -2625,7 +2611,7 @@ test("cloud capture assist conflicts continue collection without cloud handoff",
     unattendedSection,
     /phase: "capture_assist_degraded"[\s\S]*浏览器采集辅助不可用，已继续执行采集/u,
   );
-  assert.doesNotMatch(sidebarSource, /UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES/u);
+  assertSidebarRuntimeDoesNotMatch(sidebarSource, /UNATTENDED_CAPTURE_SESSION_HANDOFF_CODES/u);
   assert.doesNotMatch(unattendedSection, /debugOwnershipHandoff/u);
   assert.doesNotMatch(unattendedSection, /browser_debug_ownership/u);
   const optionalAssistCodes = readFunctionSection(
@@ -2768,7 +2754,7 @@ test("unattended assist startup degrades while real task cancellations retain sy
   );
   assert.match(
     unattendedSection,
-    /resolveUnattendedCancellationTerminal\(\s+activeCaptureTaskCancellationReason/,
+    /resolveUnattendedCancellationTerminal\(\s+controllerState\.activeCaptureTaskCancellationReason/,
   );
   assert.match(
     unattendedSection,
@@ -2826,16 +2812,13 @@ test("worker revisions prevent late progress from restoring stale A/B states", (
     "function handleProgress(progress)",
     "async function syncRuntimeCommentProgress(",
   );
-  assert.match(section, /incomingWorkerRevision >= detailBatchWorkerRevision/);
+  assert.match(section, /incomingWorkerRevision >= controllerState\.detailBatchWorkerRevision/);
   assert.match(section, /detailBatchWorkerRevision = incomingWorkerRevision/);
   assert.match(section, /workerRevision: Math\.max\(/);
 });
 
 test("detail progress forwards the merged A/B snapshot instead of overwriting it", () => {
-  const section = readFunctionSection(
-    "async function runDetailCaptureForRecordIds(",
-    "/**\n * 处理导出",
-  );
+  const section = readSidebarFunction('runDetailCaptureForRecordIds');
   assert.match(
     section,
     /const mergedProgress = handleProgress\(normalizedProgress\)/,
@@ -2869,10 +2852,7 @@ test("multi-keyword detail progress separates keyword and current-item counts", 
 });
 
 test("task stop targets persisted source or worker and releases persistent Debug ownership", () => {
-  const section = readFunctionSection(
-    "async function handleCancel()",
-    "/**\n * 处理鉴权",
-  );
+  const section = readSidebarFunction('handleCancel');
   assert.match(section, /const captureTaskSession = getCurrentRuntime\(\)\?\.captureDebugSession/);
   assert.match(section, /captureTaskSession\?\.workerTabIds/);
   assert.match(section, /captureTaskSession\?\.sourceTabId/);
@@ -2881,10 +2861,7 @@ test("task stop targets persisted source or worker and releases persistent Debug
 });
 
 test("detail context rebuild fences cleanup with the current unattended attempt", () => {
-  const section = readFunctionSection(
-    "async function rebuildCaptureTaskSessionForEnhancementRetry({",
-    "const DEFAULT_MONITOR_SETTINGS",
-  );
+  const section = readSidebarFunction('rebuildCaptureTaskSessionForEnhancementRetry');
   const attemptIndex = section.indexOf("const retryAttemptId =");
   const localEndIndex = section.indexOf("await endCaptureTaskSession({");
   const directEndIndex = section.indexOf(
@@ -2930,10 +2907,7 @@ function createContextRebuildHarness({
   startSession = async () => ({ok: true, active: true}),
   sourceTabId = 73,
 } = {}) {
-  const section = readFunctionSection(
-    "async function rebuildCaptureTaskSessionForEnhancementRetry({",
-    "const DEFAULT_MONITOR_SETTINGS",
-  );
+  const section = readSidebarFunction('rebuildCaptureTaskSessionForEnhancementRetry');
   const context = {
     activeUnattendedRunAttemptId: "attempt-current",
     captureTaskOwnerTaskId: "",
@@ -3049,7 +3023,7 @@ test("native Debug cancellation stops list, detail and keyword-gap work", () => 
     "function applyCaptureTaskCancellation(cancellation = {})",
     "function syncCaptureTaskOwnerFromRuntime(",
   );
-  assert.match(section, /taskId !== captureTaskOwnerTaskId/);
+  assert.match(section, /taskId !== controllerState\.captureTaskOwnerTaskId/);
   assert.match(section, /searchCaptureCancelRequested = true/);
   assert.match(section, /batchKeywordCancelRequested = true/);
   assert.match(section, /detailBatchCancelRequested = true/);
@@ -3069,19 +3043,18 @@ test("detail cancellation fans out to every known A/B worker", () => {
 
 test("sidebar binds a dedicated capture owner port and disconnects it on unload", () => {
   assert.match(
-    sidebarSource,
+    readSidebarFunction('connectCaptureTaskOwnerPort'),
     /chrome\.runtime\.connect\(\{name: CAPTURE_TASK_OWNER_PORT_NAME\}\)/,
   );
-  const startSection = readFunctionSection(
-    "async function startCaptureAssistSessionStrict(options = {})",
-    "const OPTIONAL_CAPTURE_ASSIST_SESSION_CODES",
-  );
+  const startSection = readSidebarFunction('startCaptureAssistSessionStrict');
   assert.match(startSection, /bindCaptureTaskOwner\(/);
   const unloadSection = sidebarSource.slice(
     sidebarSource.indexOf('window.addEventListener("beforeunload"'),
   );
-  assert.match(unloadSection, /captureTaskOwnerClosing = true/);
-  assert.match(unloadSection, /captureTaskOwnerPort\?\.disconnect\?\.\(\)/);
+  assert.match(unloadSection, /sidebarTaskController\.shutdownCaptureTaskOwner\(\)/);
+  const coordinator = readSidebarControllerSources().find(({path}) => path.endsWith('/coordinator.js')).source;
+  assert.match(coordinator, /controllerState\.captureTaskOwnerClosing = true/);
+  assert.match(coordinator, /controllerState\.captureTaskOwnerPort\?\.disconnect\?\.\(\)/);
 });
 
 test("native cancellation fences automatic backend sync at every task call site", () => {
@@ -3102,7 +3075,7 @@ test("native cancellation fences automatic backend sync at every task call site"
   );
   assert.match(
     searchSection,
-    /shouldStop: \(\) => searchCaptureCancelRequested/,
+    /shouldStop: \(\) => controllerState\.searchCaptureCancelRequested/,
   );
 
   const batchSection = readFunctionSection(
@@ -3111,7 +3084,7 @@ test("native cancellation fences automatic backend sync at every task call site"
   );
   assert.match(
     batchSection,
-    /const shouldStopBatchInvocation = \(\) =>\s+batchKeywordCancelRequested \|\| !isCurrentUnattendedInvocation\(\)/,
+    /const shouldStopBatchInvocation = \(\) =>\s+controllerState\.batchKeywordCancelRequested \|\| !isCurrentUnattendedInvocation\(\)/,
   );
   assert.match(
     batchSection,

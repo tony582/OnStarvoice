@@ -1,7 +1,7 @@
+import {readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import vm from 'node:vm';
 import * as reconciliation from '../../utils/capture/sync-reconciliation-state.js';
 
 // Actual local consumers, with I/O replaced. This does not exercise the real
@@ -9,6 +9,7 @@ import * as reconciliation from '../../utils/capture/sync-reconciliation-state.j
 const source = readFileSync(new URL('../../sidebar/sidebar-logic.js', import.meta.url), 'utf8');
 const plain = value => JSON.parse(JSON.stringify(value));
 function section(input, start, end) {
+  if (input === source && /function\s+\w+\s*\(/.test(start)) return readSidebarSection(start, end);
   const from = input.indexOf(start);
   assert.ok(from >= 0, start);
   assert.equal(input.indexOf(start, from + start.length), -1, start);

@@ -1,7 +1,7 @@
+import {readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import vm from 'node:vm';
 import {createRecordSyncQueue} from '../../utils/record-sync-queue.js';
 import {hasSyncReconciliationSignal} from '../../utils/capture/sync-reconciliation-state.js';
 
@@ -13,6 +13,7 @@ const background = readFileSync(new URL('../../background.js', import.meta.url),
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
 function section(source, start, end) {
+  if (source === sidebar && /function\s+\w+\s*\(/.test(start)) return readSidebarSection(start, end);
   const from = source.indexOf(start);
   assert.ok(from >= 0, `missing actual function: ${start}`);
   assert.equal(source.indexOf(start, from + start.length), -1, `ambiguous actual function: ${start}`);

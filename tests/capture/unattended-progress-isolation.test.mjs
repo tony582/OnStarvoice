@@ -1,60 +1,16 @@
+import {readSidebarFunction, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
-import vm from "node:vm";
 
 const sidebarSource = await readFile(
   new URL("../../sidebar/sidebar-logic.js", import.meta.url),
   "utf8",
 );
 
-function readFunctionSource(name) {
-  const marker = `function ${name}(`;
-  const start = sidebarSource.indexOf(marker);
-  assert.notEqual(start, -1, `missing function: ${name}`);
-  const bodyStart = sidebarSource.indexOf("{", start + marker.length);
-  assert.notEqual(bodyStart, -1, `missing function body: ${name}`);
-  let depth = 0;
-  for (let index = bodyStart; index < sidebarSource.length; index += 1) {
-    const char = sidebarSource[index];
-    if (char === "{") depth += 1;
-    if (char !== "}") continue;
-    depth -= 1;
-    if (depth === 0) return sidebarSource.slice(start, index + 1);
-  }
-  assert.fail(`unterminated function: ${name}`);
-}
+function readFunctionSource(name) { return readSidebarFunction(name); }
 
-function readAsyncFunctionSource(name) {
-  const marker = `async function ${name}(`;
-  const start = sidebarSource.indexOf(marker);
-  assert.notEqual(start, -1, `missing async function: ${name}`);
-  const paramsStart = sidebarSource.indexOf("(", start + marker.length - 1);
-  let paramsDepth = 0;
-  let paramsEnd = -1;
-  for (let index = paramsStart; index < sidebarSource.length; index += 1) {
-    const char = sidebarSource[index];
-    if (char === "(") paramsDepth += 1;
-    if (char !== ")") continue;
-    paramsDepth -= 1;
-    if (paramsDepth === 0) {
-      paramsEnd = index;
-      break;
-    }
-  }
-  assert.notEqual(paramsEnd, -1, `unterminated async params: ${name}`);
-  const bodyStart = sidebarSource.indexOf("{", paramsEnd);
-  assert.notEqual(bodyStart, -1, `missing async function body: ${name}`);
-  let depth = 0;
-  for (let index = bodyStart; index < sidebarSource.length; index += 1) {
-    const char = sidebarSource[index];
-    if (char === "{") depth += 1;
-    if (char !== "}") continue;
-    depth -= 1;
-    if (depth === 0) return sidebarSource.slice(start, index + 1);
-  }
-  assert.fail(`unterminated async function: ${name}`);
-}
+function readAsyncFunctionSource(name) { return readSidebarFunction(name); }
 
 function evaluateUnattendedTerminalClassifier() {
   const source = readFunctionSource("isUnattendedTerminalProgressPhase");
@@ -136,15 +92,7 @@ test("only explicit unattended terminal phases close the unattended task", () =>
 });
 
 test("detail progress carries the owning capture task id before reaching the shared UI", () => {
-  const start = sidebarSource.indexOf(
-    "async function runDetailCaptureForRecordIds(",
-  );
-  const end = sidebarSource.indexOf(
-    "async function handleRetryDetailCapture(",
-    start,
-  );
-  assert.ok(start >= 0 && end > start);
-  const section = sidebarSource.slice(start, end);
+  const section = readSidebarFunction('runDetailCaptureForRecordIds');
   const normalizedAt = section.indexOf("const normalizedProgress");
   const handleAt = section.indexOf("handleProgress(normalizedProgress)");
   assert.ok(normalizedAt >= 0 && handleAt > normalizedAt);
@@ -156,15 +104,7 @@ test("detail progress carries the owning capture task id before reaching the sha
 });
 
 test("batch and detail callbacks keep the immutable unattended request attempt", () => {
-  const batchStart = sidebarSource.indexOf(
-    "async function handleBatchKeywordCapture(options = {})",
-  );
-  const batchEnd = sidebarSource.indexOf(
-    "function activateUnattendedRunRequest",
-    batchStart,
-  );
-  assert.ok(batchStart >= 0 && batchEnd > batchStart);
-  const batchSection = sidebarSource.slice(batchStart, batchEnd);
+  const batchSection = readSidebarFunction('handleBatchKeywordCapture');
   assert.match(batchSection, /runOptions\.unattendedRequestId/);
   assert.match(batchSection, /runOptions\.unattendedAttemptId/);
   assert.match(batchSection, /if \(!isCurrentUnattendedInvocation\(\)\)/);
@@ -192,15 +132,7 @@ test("batch and detail callbacks keep the immutable unattended request attempt",
     "only the active batch invocation may clear shared batch state",
   );
 
-  const detailStart = sidebarSource.indexOf(
-    "async function runDetailCaptureForRecordIds(",
-  );
-  const detailEnd = sidebarSource.indexOf(
-    "async function handleRetryDetailCapture(",
-    detailStart,
-  );
-  assert.ok(detailStart >= 0 && detailEnd > detailStart);
-  const detailSection = sidebarSource.slice(detailStart, detailEnd);
+  const detailSection = readSidebarFunction('runDetailCaptureForRecordIds');
   assert.match(detailSection, /const scopedUnattendedRequestId/);
   assert.match(detailSection, /const scopedUnattendedAttemptId/);
   assert.match(detailSection, /if \(!isCurrentDetailInvocation\(\)\)/);
@@ -228,14 +160,7 @@ test("batch and detail callbacks keep the immutable unattended request attempt",
   const clearSource = readFunctionSource("clearActiveUnattendedRunRequest");
   assert.match(clearSource, /activeUnattendedRunAttemptId !== attemptId/);
 
-  const runStart = sidebarSource.indexOf(
-    "async function runUnattendedKeywordPlanRequest(request)",
-  );
-  const runEnd = sidebarSource.indexOf(
-    "async function runCaptureAction(",
-    runStart,
-  );
-  const runSection = sidebarSource.slice(runStart, runEnd);
+  const runSection = readSidebarFunction('runUnattendedKeywordPlanRequest');
   assert.match(runSection, /const requestAttemptId/);
   assert.match(runSection, /const stillOwnsRequestAttempt =/);
   assert.match(
@@ -246,15 +171,7 @@ test("batch and detail callbacks keep the immutable unattended request attempt",
 });
 
 test("activating an unattended attempt clears cancellation inherited from the previous attempt", () => {
-  const activateStart = sidebarSource.indexOf(
-    "function activateUnattendedRunRequest(",
-  );
-  const activateEnd = sidebarSource.indexOf(
-    "function clearActiveUnattendedRunRequest(",
-    activateStart,
-  );
-  assert.ok(activateStart >= 0 && activateEnd > activateStart);
-  const activateSource = sidebarSource.slice(activateStart, activateEnd);
+  const activateSource = readSidebarFunction('activateUnattendedRunRequest');
   const context = {
     activeUnattendedRunRequestId: "request-old",
     activeUnattendedRunAttemptId: "attempt-old",
@@ -283,24 +200,16 @@ test("activating an unattended attempt clears cancellation inherited from the pr
   });
 
   assert.equal(activationResult, undefined);
-  assert.equal(context.activeUnattendedRunRequestId, "request-new");
-  assert.equal(context.activeUnattendedRunAttemptId, "attempt-new");
-  assert.equal(context.activeCaptureTaskCancellationReason, "");
-  assert.equal(context.batchKeywordCancelRequested, false);
-  assert.equal(context.detailBatchCancelRequested, false);
-  assert.equal(context.searchCaptureCancelRequested, false);
+  assert.equal(context.controllerState.activeUnattendedRunRequestId, "request-new");
+  assert.equal(context.controllerState.activeUnattendedRunAttemptId, "attempt-new");
+  assert.equal(context.controllerState.activeCaptureTaskCancellationReason, "");
+  assert.equal(context.controllerState.batchKeywordCancelRequested, false);
+  assert.equal(context.controllerState.detailBatchCancelRequested, false);
+  assert.equal(context.controllerState.searchCaptureCancelRequested, false);
 });
 
 test("cancellation received after claim but before activation is preserved", () => {
-  const activateStart = sidebarSource.indexOf(
-    "function activateUnattendedRunRequest(",
-  );
-  const activateEnd = sidebarSource.indexOf(
-    "function clearActiveUnattendedRunRequest(",
-    activateStart,
-  );
-  assert.ok(activateStart >= 0 && activateEnd > activateStart);
-  const activateSource = sidebarSource.slice(activateStart, activateEnd);
+  const activateSource = readSidebarFunction('activateUnattendedRunRequest');
   const storageChangeSource = readFunctionSource(
     "handleUnattendedRunRequestStorageChange",
   );
@@ -338,14 +247,14 @@ test("cancellation received after claim but before activation is preserved", () 
   context.activate(canceledRequest);
 
   assert.equal(
-    context.activeCaptureTaskCancellationReason,
+    context.controllerState.activeCaptureTaskCancellationReason,
     "unattended_cancel_requested",
   );
-  assert.equal(context.batchKeywordCancelRequested, true);
-  assert.equal(context.detailBatchCancelRequested, true);
-  assert.equal(context.searchCaptureCancelRequested, true);
-  assert.equal(context.activeUnattendedRunRequestId, "request-current");
-  assert.equal(context.activeUnattendedRunAttemptId, "attempt-current");
+  assert.equal(context.controllerState.batchKeywordCancelRequested, true);
+  assert.equal(context.controllerState.detailBatchCancelRequested, true);
+  assert.equal(context.controllerState.searchCaptureCancelRequested, true);
+  assert.equal(context.controllerState.activeUnattendedRunRequestId, "request-current");
+  assert.equal(context.controllerState.activeUnattendedRunAttemptId, "attempt-current");
 });
 
 test("the awaited unattended start report cannot erase cancellation of the active attempt", () => {
@@ -489,7 +398,7 @@ test("terminal reporting keeps confirming after the initial transport retries", 
       calls += 1;
       if (calls <= 3) {
         assert.equal(
-          context.activeUnattendedTerminalProgressKey,
+          context.controllerState.activeUnattendedTerminalProgressKey,
           "",
           "a transport failure must not commit the terminal fence",
         );
@@ -513,7 +422,7 @@ test("terminal reporting keeps confirming after the initial transport retries", 
   assert.equal(result.accepted, true);
   assert.equal(calls, 4, "terminal confirmation must continue beyond three sends");
   assert.equal(
-    context.activeUnattendedTerminalProgressKey,
+    context.controllerState.activeUnattendedTerminalProgressKey,
     "request-A:attempt-A",
   );
 });
@@ -589,10 +498,10 @@ test("terminal fence survives request cleanup without blocking a later manual ta
   );
 
   context.clearActiveUnattendedRunRequest("request-old", "attempt-old");
-  assert.equal(context.activeUnattendedRunRequestId, "");
-  assert.equal(context.activeUnattendedRunAttemptId, "");
+  assert.equal(context.controllerState.activeUnattendedRunRequestId, "");
+  assert.equal(context.controllerState.activeUnattendedRunAttemptId, "");
   assert.equal(
-    context.activeUnattendedTerminalProgressKey,
+    context.controllerState.activeUnattendedTerminalProgressKey,
     "request-old:attempt-old",
     "cleanup must retain the old terminal identity until a new unattended run starts",
   );
@@ -615,18 +524,7 @@ test("terminal fence survives request cleanup without blocking a later manual ta
 });
 
 test("unattended Debug wrappers never create a second public task ledger", async () => {
-  const sidebarProgressStart = sidebarSource.indexOf(
-    "function reportActiveSidebarTaskProgress(progress = {})",
-  );
-  const sidebarProgressEnd = sidebarSource.indexOf(
-    "function reportActiveUnattendedContentProgress(",
-    sidebarProgressStart,
-  );
-  assert.ok(sidebarProgressStart >= 0 && sidebarProgressEnd > sidebarProgressStart);
-  const sidebarProgressSource = sidebarSource.slice(
-    sidebarProgressStart,
-    sidebarProgressEnd,
-  );
+  const sidebarProgressSource = readSidebarFunction('reportActiveSidebarTaskProgress');
   assert.match(
     sidebarProgressSource,
     /featureKey === "capture\.unattended_keyword"\) return/,
