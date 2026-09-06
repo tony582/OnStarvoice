@@ -91,7 +91,8 @@
 
 ### 交付门和后续
 
-本地源码和双 Node 回归已完成；提交、普通推送、新 stacked Draft PR 及精确 head CI 仍待执行，不能据本地通过提前写成远端完成。
+源码提交 `301766e9bd5e1c39b8778bca04b97df2d53f6a06` 已提交并普通推送，创建 [stacked Draft PR #55](https://github.com/tony582/OnStarvoice/pull/55)，base 为 L1 `5f774ebfcaed24b79bfe84369d9b9c483da38f66`。
+该源码 head 的 [push 6/6](https://github.com/tony582/OnStarvoice/actions/runs/34015915095) 与 [PR 6/6](https://github.com/tony582/OnStarvoice/actions/runs/34015930963) 已全部通过；当时为 OPEN + Draft + CLEAN。本节状态补记只改文档，不改运行源码；晚于源码提交的最终 head 必须独立核验其 CI，不能沿用上述 CI 作为不同 head 的证据。
 独立代码审阅、三份计划文档的最终独立核读、提交前白名单与暂存区空白检查均已通过。
 下一步固定为 L3：先核对 UI 设计交付与 U5/稳定基线缺口，再迁移 Sidebar 的任务 controller、状态投影与受控命令，保持有权历史读取/禁止新采集的规则。不另开与主干无关的小功能。
 L2 没有解决上文第 7 项既有 ACK 确认风险，没有接真实恢复 producer，没有做真实采集、浏览器加载、8 小时/72 小时验收或客户发布；这些仍是独立门槛。UIUX/工作流用语与来源权属区分未因拆文件而完成。
