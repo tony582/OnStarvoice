@@ -1,4 +1,5 @@
 import { presentResult } from './result-presenter.mjs';
+import { RESULT_FILTERS, matchesResultFilter } from './result-review.mjs';
 
 const MAX_PAGE_SIZE = 50;
 
@@ -27,7 +28,8 @@ export function presentResultPage(records, options = {}) {
   const sourceLength = integer(ownValue(source, 'length'), 0);
   const offset = integer(ownValue(options, 'offset'), 0);
   const limit = Math.max(1, Math.min(MAX_PAGE_SIZE, integer(ownValue(options, 'limit'), MAX_PAGE_SIZE)));
-  const filter = ownValue(options, 'filter') === 'attention' ? 'attention' : 'all';
+  const suppliedFilter = ownValue(options, 'filter');
+  const filter = RESULT_FILTERS.includes(suppliedFilter) ? suppliedFilter : 'all';
   const items = [];
   let matchingCount = 0;
   let attentionCount = 0;
@@ -35,7 +37,7 @@ export function presentResultPage(records, options = {}) {
   for (let index = 0; index < sourceLength; index += 1) {
     const item = presentResult(ownValue(source, String(index)));
     if (item.needsAttention) attentionCount += 1;
-    if (filter === 'attention' && !item.needsAttention) continue;
+    if (!matchesResultFilter(item, filter)) continue;
     if (matchingCount >= offset && items.length < limit) items.push(item);
     matchingCount += 1;
   }

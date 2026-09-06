@@ -18,6 +18,7 @@ test('projects the complete independent display contract with successful states'
     capture: { key: 'completed', label: '采集已完成' },
     delivery: { key: 'confirmed', label: '服务器与本地均已确认', tone: 'success' },
     needsAttention: false,
+    review: { unverified: false, hasIssue: false, interventionReported: false, reasons: [] },
   });
 });
 
@@ -211,7 +212,7 @@ test('accessor-backed comments and entries beyond the bounded prefix are not rea
 test('identical inputs produce identical outputs without global runtime services', () => {
   const input = record();
   assert.deepEqual(presentResult(input), presentResult(input));
-  assert.deepEqual(Object.keys(presentResult(input)), ['id', 'title', 'platformLabel', 'kindLabel', 'author', 'summary', 'metrics', 'capture', 'delivery', 'needsAttention']);
+  assert.deepEqual(Object.keys(presentResult(input)), ['id', 'title', 'platformLabel', 'kindLabel', 'author', 'summary', 'metrics', 'capture', 'delivery', 'needsAttention', 'review']);
 });
 
 test('list projection never reads body or comments, even to derive a missing summary', () => {
