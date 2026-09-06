@@ -69,3 +69,9 @@
 刷新/取消/关闭会失效旧请求与选择；未来视图即使拿到了已完成结果，也必须在更新前检查 `session.isCurrent(result.requestToken)`。会话既不连接真实存储，也不修改旧运行链路；设计方案尚未定稿，不增加 UI 入口或最终用语。
 
 完整输入/输出、源侧责任、范围与快照要求、未接线边界见 [U2 接入契约](../docs/architecture/extension-u2-scoped-read-session-20260906.md)。本层只保留当前页 ID，不是现有大数组存储的性能修复；不用于直接更新客户包。
+
+## U3：显式快照数据源与许可生命周期
+
+`domain/result-catalog.mjs` 从可信的新 manifest 建立不可变轻量摘要目录，检查整个目录的 ID 唯一性并支持索引分页。`application/snapshot-result-source.mjs` 将它接成 U2 source：读取前后核验许可世代/有效期，详情按命名空间、记录 ID、快照与记录版本延迟加载，取消后不发布迟到数据。
+
+manifest、真实授权和单条版本化详情均仍由未来可信供给方负责，本批只有人工数据接入；不能用当前登录状态给旧记录补归属。没有复用会修复写回的旧读取器，没有迁移/启用真实数据源或改变客户包。详见 [U3 实施与接线审计](../docs/architecture/extension-u3-authorized-snapshot-source-20260906.md)。
