@@ -33,6 +33,7 @@ R0 已将执行上下文和后台状态提前，再做提交链、Sidebar、新�
 | L3-B 创建基点 | `2c997709c0a4223784901aeaa461fab46108ba8b` | PR #56 最终 head，12/12、OPEN + Draft + CLEAN 重新核验；新隔离分支不改 #56 |
 | L3-B 结构源码候选 | `87d0551b975fbbe56df653ad09670112675d73fa` | [Draft PR #57](https://github.com/tony582/OnStarvoice/pull/57)，运行源码通过双 Node 本地门；状态补记不改运行源码，最终 head CI 以 PR 精确记录为准 |
 | L3-B 旧命令适配创建基点 | `ab7feee55032b929c861c1d33c5f145f7450a7c3` | #57 含 CI 工具准备修正的最终 head，push 6/6 + PR 6/6、OPEN + Draft + CLEAN；新分支不改 #57 |
+| L3-B 旧命令适配源码候选 | `d805ed1b92a258772a5014064c85f6484d4d615b` | [Draft PR #58](https://github.com/tony582/OnStarvoice/pull/58)，双 Node 本地门与独立代码/文档核读通过；最终 head 两组 CI 结果以 #58 精确记录为准 |
 
 L1 工作树为 `OnStarvoice-extension-l1-20260906`，分支为 `codex/extension-l1-execution-lifecycle-20260906`。
 L2 工作树为 `OnStarvoice-extension-l2-20260906`，分支为 `codex/extension-l2-result-delivery-20260906`；不修改 L1 或其他已有 Draft。
@@ -248,6 +249,7 @@ G3 遗留包括旧 API 全集快照、双 Agent 领取、旧身份写回矩阵�
 | 2026-09-06 | #57 文档 head `63c2e95` 的两组 Node 18 CI 暴露 AST 工具未安装；其余 10 项通过 | 干净目录复现后，仅补 CI 的既有锁定工具安装及测试断言；Node 24 准备、原 Node 18 全量不变，不新增依赖/改锁/改运行源码；干净 Node 18 2,205/2,205 | 此失败未作通过处理；修正 head 两组 CI 重新核验并记录在 #57，不推进 C/L4 或发布 |
 
 | 2026-09-06 | 核验 #57 最终 `ab7feee` CI 12/12，隔离推进旧任务中心命令 adapter | 旧 105 行事件处理分为 view/application 两个实际模块；主文件 11,014 行，293 个保留函数逐字不变；双 Node 全量各 2,286、配对各 81、三基点组合各 117 通过 | 本批 Draft 门收口；严格执行只完成 9 文件白名单/验收设计，另授权后实施，云端协议再单独处理；不进入 C/L4 或发布 |
+| 2026-09-06 | 源码 `d805ed1` 普通推送并创建 stacked Draft #58；新无上下文读者核读通过 | base 为 #57 精确 `ab7feee`；状态补记仅三份计划，最终 head CI 独立记录于 #58 | 保持 Draft；后续只在独立授权后实施 9 文件本地严格链，云端另批，不 Ready/合并/发布 |
 
 参考：[原 P7 总计划](../架构优化实施方案与计划.md#p7extension-渐进模块化)、[E-base](extension-ebase-v045-20260905.md)、[E1i 接入缺口](extension-e1i-recovery-protocol-20260906.md)。
 R0/E0 原始计划保留在独立 R0 候选的 `docs/architecture/extension-r0-e0-20260905/`；其验收目录继续作为基准，不把当时“待实施”误当本轮已完成。
