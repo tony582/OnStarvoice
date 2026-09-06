@@ -83,6 +83,15 @@ test('createApp serves the HTTP boundary without database or background startup'
   const baseUrl = `http://127.0.0.1:${address.port}`;
   localOrigin = baseUrl;
 
+  await t.test('strict control authority is mounted and rejects invalid intent without database access', async () => {
+    const response = await fetch(`${baseUrl}/api/capture-cloud/agent/control-authority`, {
+      method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({action: 'resume'}),
+    });
+    assert.equal(response.status, 400);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal((await json(response)).reason, 'invalid_control_target');
+  });
+
   await t.test('reports liveness from /api/health', async () => {
     const response = await fetch(`${baseUrl}/api/health`);
     assert.equal(response.status, 200);

@@ -32,6 +32,7 @@ import feedbackRouter from './routes/feedback.js';
 import customTagsRouter from './routes/custom-tags.js';
 import relevancePrefilterRouter from './routes/relevance-prefilter.js';
 import captureCloudRouter from './routes/capture-cloud.js';
+import captureControlAuthorityRouter from './routes/capture-control-authority.js';
 import captureOrchestrationsRouter from './routes/capture-orchestrations.js';
 import negativePatrolRouter from './routes/negative-patrol.js';
 import officialCommentPatrolRouter from './routes/official-comment-patrol.js';
@@ -171,6 +172,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.use('/api/feedback', feedbackRouter);
   app.use('/api/custom-tags', customTagsRouter);
   app.use('/api/relevance/prefilter', relevancePrefilterRouter);
+  app.use('/api/capture-cloud', captureControlAuthorityRouter);
   app.use('/api/capture-cloud', captureCloudRouter);
   app.use('/api/capture-cloud', captureOrchestrationsRouter);
   app.use('/api/capture-cloud', negativePatrolRouter);

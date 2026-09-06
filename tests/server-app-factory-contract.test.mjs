@@ -32,6 +32,10 @@ function assertAppearsInOrder(source, snippets, message) {
 }
 
 test('app factory owns HTTP composition without process startup side effects', () => {
+  assertAppearsInOrder(appSource, [
+    "app.use('/api/capture-cloud', captureControlAuthorityRouter)",
+    "app.use('/api/capture-cloud', captureCloudRouter)",
+  ], 'read-only authority is mounted without changing the legacy router');
   assert.match(appSource, /export function createApp\(/u);
   assert.doesNotMatch(appSource, /\.listen\s*\(/u);
   assert.doesNotMatch(appSource, /\binitDb\b/u);

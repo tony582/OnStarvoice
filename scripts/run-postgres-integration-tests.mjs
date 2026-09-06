@@ -27,6 +27,7 @@ const tests = entries
 const requiredTestFiles = [
   'capture-automatic-recovery.integration.mjs',
   'capture-command-reconciliation.integration.mjs',
+  'capture-control-authority.integration.mjs',
   'capture-elastic-lease-reconciliation.integration.mjs',
   'capture-elastic-retry-rounds.integration.mjs',
   'capture-retry-lock-order.integration.mjs',
