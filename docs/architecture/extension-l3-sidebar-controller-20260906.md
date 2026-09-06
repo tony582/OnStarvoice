@@ -77,6 +77,8 @@ U5 精确独立候选为 `60ea0243eb6be2a794a88a3aa95d910169752d0b`，不是本�
 
 官方 `scripts/run-node-regression-tests.mjs` 递归全量：Node `24.12.0` 与 `18.20.8` 各 **2,165/2,165**，零失败/取消/跳过/todo；相对父提交 2,148 项增加 17 项常驻真实 controller/宿主测试。全量运行后主迁移 AST 与独立逆向 AST 再次通过，仓库卫生 830 文件和 `git diff --check` 通过；运行源码与测试未被检查修改。
 
-提交与 Draft/精确 head CI 尚待完成，完成后在此补记。下一职责固定为 L3-B，不提前进入 L4，也不把未发布候选计作客户性能改善。
+源码候选 `543d41fda183309935d95eace0b2d3d94adffde0` 已普通推送并创建 [stacked Draft PR #56](https://github.com/tony582/OnStarvoice/pull/56)，base 保持 `f1ed550f4b0bc9125223e95287a829b4edddd64a`。精确源码 head 的 [push 6/6](https://github.com/tony582/OnStarvoice/actions/runs/34018229898) 与 [PR 6/6](https://github.com/tony582/OnStarvoice/actions/runs/34018261822) 全部成功，OPEN + Draft + CLEAN。
+
+本次状态补记只修改三份计划，不改运行源码/测试。最终文档 head 必须重新等待自身 CI，不能借用上述源码 head；实时最终核验写在本 PR 正文和任务交付，不为自引用 head 无限新增文档提交。该候选门完成后下一职责固定为 L3-B，不提前进入 L4，也不把未发布候选计作客户性能改善。
 
 无上下文文档读者已核读三份计划，确认候选/完整 L3/发布及测试边界未混淆；发现原 P8/G8 退役阶段未出现在当前看板，已补回统一与总计划并保留原删除门槛，不新增 L7，不扩大删除授权。全量证据已补齐，CI 状态仍须按精确 head 核验。
