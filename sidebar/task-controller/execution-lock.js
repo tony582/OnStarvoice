@@ -1,5 +1,5 @@
 // L3-A execution-lock: original control flow, explicit state and compatibility ports.
-export function createExecutionLockController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createExecutionLockController({controllerState, controllerPorts, controllerOperations}) {
   const {
     CAPTURE_EXECUTION_LOCK_HEARTBEAT_INTERVAL_MS,
     CAPTURE_EXECUTION_LOCK_HOLDER_ID,

@@ -2,6 +2,7 @@ import {readSidebarFunction, readSidebarSection, sidebarVm as vm} from '../helpe
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
+import {createLegacyProgressVisibilityView} from '../../sidebar/legacy-view/progress-visibility.js';
 
 const sidebarSource = await readFile(
   new URL("../../sidebar/sidebar-logic.js", import.meta.url),
@@ -889,7 +890,12 @@ test("terminal progress fences late unattended UI updates without blocking a new
   );
   assert.match(
     showSection,
-    /if \(sidebarTaskController\.readActiveUnattendedRunRequestId\(\)\)[\s\S]*unattendedProgressState = "running"[\s\S]*else \{[\s\S]*delete progressContainer\.dataset\.unattendedProgressState/,
+    /controllerPorts\.taskView\.showCaptureProgressPresentation\(\{[\s\S]*readActiveUnattendedRunRequestId:\s*\(\) => controllerState\.activeUnattendedRunRequestId/u,
+  );
+  const visibility = createLegacyProgressVisibilityView({});
+  assert.match(
+    visibility.showCaptureProgressPresentation.toString(),
+    /if \(readActiveUnattendedRunRequestId\(\)\)[\s\S]*unattendedProgressState = "running"[\s\S]*else \{[\s\S]*delete progressContainer\.dataset\.unattendedProgressState/,
   );
 
   const planCleanupSection = readSection(
@@ -911,8 +917,13 @@ test("terminal progress fences late unattended UI updates without blocking a new
   );
   assert.match(
     genericCleanupSection,
+    /controllerPorts\.taskView\.hideCaptureProgressPresentation\(\{\s*force,\s*preserveUnattendedTerminalState,/u,
+  );
+  const cleanupPresentation = visibility.hideCaptureProgressPresentation.toString();
+  assert.match(
+    cleanupPresentation,
     /preserveUnattendedTerminalState[\s\S]*unattendedProgressState === "terminal"/,
   );
-  assert.match(genericCleanupSection, /btnCancel\.hidden = true/);
-  assert.match(genericCleanupSection, /btnCancel\.disabled = true/);
+  assert.match(cleanupPresentation, /btnCancel\.hidden = true/);
+  assert.match(cleanupPresentation, /btnCancel\.disabled = true/);
 });

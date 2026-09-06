@@ -1,5 +1,5 @@
 // L3-A batch-keyword: original control flow, explicit state and compatibility ports.
-export function createBatchKeywordController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createBatchKeywordController({controllerState, controllerPorts, controllerOperations}) {
   const {
     MAX_BATCH_KEYWORDS,
     PAGE_ENHANCE_AUTH_REQUIRED_MESSAGE,
@@ -16,7 +16,7 @@ export function createBatchKeywordController({controllerState, controllerBinding
     collectSearchFiltersFromControls,
     completeTaskContext,
     console,
-    document,
+    taskView,
     endCaptureTaskSession,
     ensureAuthVerifiedOrWarn,
     formatStreamingSyncSummary,
@@ -192,10 +192,7 @@ export function createBatchKeywordController({controllerState, controllerBinding
       if (controllerState.detailBatchCaptureInFlight) {
         controllerState.detailBatchCancelRequested = true;
       }
-      const btnBatch = document.getElementById("btnRunBatchKeywords");
-      if (btnBatch) {
-        btnBatch.textContent = "停止中...";
-      }
+      taskView.showBatchKeywordStopping();
       try {
         if (controllerState.detailBatchCaptureInFlight) {
           await requestDetailRunnerCancelSignals({
@@ -413,7 +410,7 @@ export function createBatchKeywordController({controllerState, controllerBinding
 
       const sortContext = await syncKeywordSortDimensionFromPage({
         force: true,
-        fallbackDimension: controllerBindings.keywordSortDimension,
+        fallbackDimension: controllerState.keywordSortDimension,
       });
       const keywordMinLikes = readKeywordMinLikesFromInput(
         settings.keywordMinLikes,
@@ -501,20 +498,13 @@ export function createBatchKeywordController({controllerState, controllerBinding
       controllerState.batchKeywordCaptureInFlight = true;
       controllerState.batchKeywordCancelRequested = false;
 
-      const btnBatch = document.getElementById("btnRunBatchKeywords");
-      if (btnBatch) {
-        btnBatch.textContent = "取消批量采集";
-        btnBatch.classList.remove("btn-primary");
-        btnBatch.classList.add("btn-danger");
-        btnBatch.disabled = false;
-        btnBatch.classList.remove("is-disabled");
-      }
+      taskView.showBatchKeywordRunning();
 
       setBatchProgressVisible("modal", true);
 
       // 执行轮数:1 轮即普通采集,大于 1 才按轮次间隔继续跑。
-      const roundGapMin = Math.max(0, Number(document.getElementById("inputLoopGapMin")?.value) || 0);
-      const maxRounds = Math.max(1, Math.floor(Number(document.getElementById("inputLoopRounds")?.value)) || 1); // 留空/0 = 1 轮(不做无限,防风控)
+      const roundGapMin = Math.max(0, Number(taskView.readBatchLoopGapMinutesInput()) || 0);
+      const maxRounds = Math.max(1, Math.floor(Number(taskView.readBatchLoopRoundsInput())) || 1); // 留空/0 = 1 轮(不做无限,防风控)
       captureTaskRoundTotal = maxRounds;
       const autoLoop = maxRounds > 1;
       const roundGapMs = roundGapMin * 60 * 1000;
@@ -574,7 +564,7 @@ export function createBatchKeywordController({controllerState, controllerBinding
       ).length;
 
       // 定时启动:指定了开始时刻则等到那一刻再开跑(可中断),等待期间显示倒计时
-      const scheduledStartStr = document.getElementById("inputBatchScheduledStart")?.value || "";
+      const scheduledStartStr = taskView.readBatchScheduledStart();
       if (scheduledStartStr) {
         const targetMs = new Date(scheduledStartStr).getTime();
         if (Number.isFinite(targetMs) && targetMs > Date.now()) {
@@ -1419,12 +1409,7 @@ export function createBatchKeywordController({controllerState, controllerBinding
       if (ownsCurrentBatchInvocation()) {
         setBatchProgressDetail("");
 
-        const btnBatch = document.getElementById("btnRunBatchKeywords");
-        if (btnBatch) {
-          btnBatch.textContent = "开始批量采集";
-          btnBatch.classList.add("btn-primary");
-          btnBatch.classList.remove("btn-danger");
-        }
+        taskView.showBatchKeywordIdle();
         updateBatchKeywordInputState();
       }
       if (ownsBatchInvocation()) {

@@ -1,10 +1,10 @@
 // L3-A unattended-control: original control flow, explicit state and compatibility ports.
-export function createUnattendedControlController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createUnattendedControlController({controllerState, controllerPorts, controllerOperations}) {
   const {
     buildKeywordRunDisplayPlan,
     chrome,
     console,
-    document,
+    taskView,
     isExplicitUserUnattendedCancellationMessage,
     loadActiveKeywordRunState,
     loadKeywordPlanUI,
@@ -14,7 +14,7 @@ export function createUnattendedControlController({controllerState, controllerBi
   const getUnattendedRunRequestIdFromUrl = (...args) => controllerOperations.getUnattendedRunRequestIdFromUrl(...args);
 
   async function cancelUnattendedKeywordPlanFromSidebar(requestId = "") {
-    const displayPlan = buildKeywordRunDisplayPlan(controllerBindings.keywordPlanState);
+    const displayPlan = buildKeywordRunDisplayPlan(controllerState.keywordPlanState);
     const progress =
       displayPlan?.lastRunProgress &&
       typeof displayPlan.lastRunProgress === "object"
@@ -24,19 +24,11 @@ export function createUnattendedControlController({controllerState, controllerBi
       requestId ||
         progress.unattendedRequestId ||
         displayPlan?.lastRunRequestId ||
-        controllerBindings.activeKeywordRunState?.id ||
+        controllerState.activeKeywordRunState?.id ||
         "",
     ).trim();
     const runnerTabId = Number(progress.runnerTabId);
-    const progressText = document.getElementById("progressText");
-    const btnCancel = document.getElementById("btnCancel");
-    if (progressText) {
-      progressText.textContent = "正在中止当前采集任务...";
-    }
-    if (btnCancel) {
-      btnCancel.textContent = "停止中...";
-      btnCancel.disabled = true;
-    }
+    const presentation = taskView.beginUnattendedCancelPresentation();
 
     try {
       const response = await chrome.runtime.sendMessage({
@@ -49,7 +41,7 @@ export function createUnattendedControlController({controllerState, controllerBi
         throw new Error(response?.error?.message || "中止无人值守任务失败");
       }
       controllerState.activeCaptureTaskCancellationReason = "unattended_cancel_requested";
-      controllerBindings.activeKeywordRunState = response?.data?.request || controllerBindings.activeKeywordRunState;
+      controllerState.activeKeywordRunState = response?.data?.request || controllerState.activeKeywordRunState;
       await Promise.all([
         loadKeywordPlanUI({preserveInputs: true}),
         loadActiveKeywordRunState(),
@@ -59,10 +51,7 @@ export function createUnattendedControlController({controllerState, controllerBi
       console.warn("[Sidebar] Cancel active keyword run failed:", error);
       showMessage("中止当前采集任务失败: " + error.message, "error");
     } finally {
-      if (btnCancel) {
-        btnCancel.disabled = false;
-        btnCancel.textContent = "中止任务";
-      }
+      presentation.finish();
     }
   }
 

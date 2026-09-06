@@ -1,5 +1,5 @@
 // L3-A unattended-reporting-and-closure: original control flow, explicit state and compatibility ports.
-export function createUnattendedReportingAndClosureController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createUnattendedReportingAndClosureController({controllerState, controllerPorts, controllerOperations}) {
   const {
     KEYWORD_PLAN_TERMINAL_STATUSES,
     KEYWORD_RUN_REQUEST_STORAGE_KEY,

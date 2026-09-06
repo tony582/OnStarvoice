@@ -5,13 +5,23 @@ import {createHash} from 'node:crypto';
 import test from 'node:test';
 import vm from 'node:vm';
 import {createSidebarTaskController} from '../../sidebar/task-controller/coordinator.js';
+import {KEYWORD_SORT_DIMENSION} from '../../sidebar/task-controller/keyword-state.js';
+import {createLegacyKeywordView} from '../../sidebar/legacy-view/coordinator.js';
+import {createLegacyCaptureInputsView} from '../../sidebar/legacy-view/capture-inputs.js';
+import {createLegacyKeywordInputsView} from '../../sidebar/legacy-view/keyword-inputs.js';
+import {createLegacyCaptureProgressView} from '../../sidebar/legacy-view/capture-progress.js';
+import {createLegacyProgressVisibilityView} from '../../sidebar/legacy-view/progress-visibility.js';
+import {readSidebarFunction, readSidebarFunctionOwner} from '../helpers/sidebar-controller-source.mjs';
 import * as constants from '../../utils/constants.js';
 import {DEFAULT_CAPTURE_SETTINGS} from '../../utils/capture-settings.js';
 
 const root = new URL('../../', import.meta.url);
 const hostSource = readFileSync(new URL('sidebar/sidebar-logic.js', root), 'utf8');
-const fixture = JSON.parse(readFileSync(new URL('tests/fixtures/sidebar-controller-migration.json', root), 'utf8'));
+const fixtureSource = readFileSync(new URL('tests/fixtures/sidebar-controller-migration.json', root), 'utf8');
+const fixture = JSON.parse(fixtureSource);
 const moved = fixture.entries.filter(entry => entry.module);
+const viewPrivateNames = new Set(['setRecoveryCopy', 'isRecoveryActionAvailable', 'handoffRecoveryFocus']);
+const controllerMoved = moved.filter(entry => !viewPrivateNames.has(entry.name));
 const plain = value => JSON.parse(JSON.stringify(value));
 const silence = {log() {}, warn() {}, error() {}};
 const hash = source => createHash('sha256').update(source.split('\n').map(line => line.trim()).join('\n')).digest('hex');
@@ -19,13 +29,13 @@ const deferred = () => {let resolve; const promise = new Promise(r => {resolve =
 
 // Every operation below executes actual ESM stages. I/O is synthetic and cannot
 // reach a browser, customer data, authorization service or collection target.
-function harness(overrides = {}, bindings = Object.freeze({})) {
+function harness(overrides = {}) {
   const events = [];
   const timers = new Map();
   const control = {releaseOk: true, failRelay: false};
   let sequence = 0;
   const ports = {
-    ...constants, console: silence,
+    ...constants, KEYWORD_SORT_DIMENSION, console: silence,
     CAPTURE_TASK_OWNER_PORT_NAME: 'synthetic-owner',
     CAPTURE_EXECUTION_LOCK_HOLDER_ID: 'synthetic-holder',
     CAPTURE_EXECUTION_LOCK_HEARTBEAT_INTERVAL_MS: 30000,
@@ -64,7 +74,14 @@ function harness(overrides = {}, bindings = Object.freeze({})) {
     },
     ...overrides,
   };
-  const api = createSidebarTaskController(ports, bindings);
+  ports.taskView = Object.freeze({
+    ...createLegacyCaptureInputsView(ports),
+    ...createLegacyKeywordInputsView(ports),
+    ...createLegacyCaptureProgressView(ports),
+    ...createLegacyProgressVisibilityView(ports),
+    ...overrides.taskView,
+  });
+  const api = createSidebarTaskController(ports);
   return {api, events, ports, timers, control};
 }
 
@@ -79,14 +96,23 @@ test('controller cold import and construction do not read DOM, clocks, random, s
   assert.equal(execFileSync(process.execPath, ['--input-type=module', '--eval', script], {encoding: 'utf8', timeout: 10000}), 'cold-safe');
 });
 
-test('all 165 actual moved bodies match the pinned migration and no mutable state bag is exposed', () => {
+test('L3-A migration evidence stays pinned while current operations use their actual owners', () => {
   assert.equal(fixture.baseline, 'f1ed550f4b0bc9125223e95287a829b4edddd64a');
+  assert.equal(createHash('sha256').update(fixtureSource).digest('hex'),
+    'a658643e3b297b197dd5f0d03817581e4a46e2206ec43c73691ba883bae34b04',
+    'Historical L3-A evidence must not be rewritten to match L3-B changes');
   assert.equal(moved.length, 165);
   assert.equal(fixture.state.length, 62);
   const api = createSidebarTaskController({});
-  for (const entry of moved) assert.equal(hash(api[entry.name].toString()), entry.migratedSha256, entry.name);
+  for (const entry of controllerMoved) {
+    assert.match(readSidebarFunctionOwner(entry.name).path, /^sidebar\/task-controller\//u);
+    assert.equal(hash(api[entry.name].toString()), hash(readSidebarFunction(entry.name)), entry.name);
+  }
+  for (const name of viewPrivateNames) {
+    assert.equal(Object.hasOwn(api, name), false, `${name} is presentation-private`);
+    assert.equal(readSidebarFunctionOwner(name).path, 'sidebar/legacy-view/capture-progress.js');
+  }
   for (const key of ['state', 'controllerState', 'controllerBindings', 'controllerPorts', 'controllerOperations']) assert.equal(Object.hasOwn(api, key), false);
-  assert.equal(Object.keys(api).length, 165 + 8 + 1);
   for (const entry of moved) assert.doesNotMatch(hostSource, new RegExp(`\\bfunction ${entry.name}\\(`, 'u'));
   for (const {name} of fixture.state) assert.doesNotMatch(hostSource, new RegExp(`\\b(?:let|const) ${name}\\b`, 'u'));
 });
@@ -188,19 +214,27 @@ for (const mode of ['success', 'load-failure', 'write-failure']) test(`storage r
   else {await assert.rejects(result, /synthetic/); assert.equal(calls.includes('refresh'), false);}
 });
 
-test('four host bindings stay live and cancel writes only the named active-run binding', async () => {
-  let plan = {lastRunRequestId: 'old'}; let active = {id: 'old'};
-  const writes = []; const calls = [];
-  const bindings = Object.freeze({get keywordPlanState() {return plan;}, get activeKeywordRunState() {return active;},
-    set activeKeywordRunState(value) {writes.push(value); active = value;},
-    get keywordSortDimension() {return 'likes';}, get expandedKeywordsBuffer() {return [];} });
+test('controller-owned keyword state stays live and cancellation uses the latest loaded plan', async () => {
+  let plan = {lastRunRequestId: 'old'};
+  const calls = [];
   const next = {id: 'current', status: 'canceled'};
   const h = harness({buildKeywordRunDisplayPlan: value => value,
     loadKeywordPlanUI: async () => {}, loadActiveKeywordRunState: async () => {},
-    chrome: {runtime: {sendMessage: async message => {calls.push(message); return {ok: true, data: {request: next}};}}}}, bindings);
+    taskView: {renderKeywordPlanStatusLabels: () => {}, hideKeywordPlanProgressPanelIfOwned: () => {}},
+    chrome: {runtime: {sendMessage: async message => {
+      calls.push(message);
+      if (message.type === 'onstarvoice:get-unattended-keyword-plan') return {ok: true, data: plan};
+      return {ok: true, data: {request: next}};
+    }}}});
+  await h.api.loadKeywordPlanUI({preserveInputs: true});
+  assert.equal(h.api.readKeywordPlanState().lastRunRequestId, 'old');
   plan = {lastRunRequestId: 'current'};
+  await h.api.loadKeywordPlanUI({preserveInputs: true});
+  assert.equal(h.api.readKeywordPlanState(), plan);
   await h.api.cancelUnattendedKeywordPlanFromSidebar();
-  assert.equal(calls[0].requestId, 'current'); assert.equal(writes[0], next); assert.equal(active, next);
+  assert.equal(calls.find(call => call.type === 'onstarvoice:cancel-unattended-keyword-run').requestId, 'current');
+  assert.equal(h.api.buildKeywordRunDisplayPlan(null).lastRunRequestId, 'current');
+  assert.equal(harness().api.readKeywordPlanState(), null);
 });
 
 // Execute the complete actual host, not a concatenation of migrated functions.
@@ -215,8 +249,10 @@ function hostHarness(source = hostSource, readyState = 'loading') {
       imports[name] = () => {throw Error(`unexpected imported capability ${name}`);};
     }
   }
-  const context = vm.createContext({...imports, ...constants, DEFAULT_CAPTURE_SETTINGS,
+  const context = vm.createContext({...imports, ...constants, DEFAULT_CAPTURE_SETTINGS, KEYWORD_SORT_DIMENSION,
     AUTH_CODE_VIEW_MODE: {ENCRYPTED: 'encrypted'}, createSidebarTaskController,
+    createLegacyKeywordView, createLegacyCaptureInputsView, createLegacyKeywordInputsView, createLegacyCaptureProgressView, createLegacyProgressVisibilityView,
+    HTMLElement: class HTMLElement {}, navigator: {},
     console: silence, URL, URLSearchParams, TextEncoder,
     crypto: {randomUUID: () => 'synthetic-holder'},
     document: {readyState, getElementById: () => null,
@@ -230,7 +266,7 @@ function hostHarness(source = hostSource, readyState = 'loading') {
   });
   const executable = source.replace(/^import\s*(?:\{[^}]+\}\s*from\s*)?['"][^'"]+['"];?[^\S\n]*\n/gmu, '').replace(/^export (?=(?:async )?function\b)/gmu, '');
   assert.doesNotMatch(executable, /^import\b|^export\b/mu);
-  vm.runInContext(`${executable}\nglobalThis.hostTestApi = {initSidebar, ${moved.map(e => e.name).join(',')}};`, context, {timeout: 1500});
+  vm.runInContext(`${executable}\nglobalThis.hostTestApi = {initSidebar, ${controllerMoved.map(e => e.name).join(',')}};`, context, {timeout: 1500});
   return {events, listeners, context, api: context.hostTestApi};
 }
 
@@ -242,7 +278,8 @@ for (const readyState of ['loading', 'complete']) test(`actual host composes bef
     void h.listeners.get('DOMContentLoaded')();
   } else assert.equal(h.events[0][0], 'storage-read');
   assert.equal(h.events.filter(e => e[0] === 'storage-read').length, 1);
-  for (const {name, migratedSha256} of moved) assert.equal(hash(h.api[name].toString()), migratedSha256, `host alias ${name}`);
+  const actualController = createSidebarTaskController({});
+  for (const {name} of controllerMoved) assert.equal(h.api[name].toString(), actualController[name].toString(), `host alias ${name}`);
   h.listeners.get('beforeunload')(); h.listeners.get('pagehide')();
 });
 

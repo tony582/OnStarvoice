@@ -1,5 +1,5 @@
 // L3-A record-retry: original control flow, explicit state and compatibility ports.
-export function createRecordRetryController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createRecordRetryController({controllerState, controllerPorts, controllerOperations}) {
   const {
     ACTIVE_COMMENT_PROGRESS_PHASES,
     ERROR_MESSAGE_MAP,

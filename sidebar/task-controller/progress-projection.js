@@ -1,5 +1,5 @@
 // L3-A progress-projection: original control flow, explicit state and compatibility ports.
-export function createProgressProjectionController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createProgressProjectionController({controllerState, controllerPorts, controllerOperations}) {
 
 
   function readFiniteProgressNumber(...values) {

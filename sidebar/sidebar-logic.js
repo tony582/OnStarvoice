@@ -1,3 +1,9 @@
+import {KEYWORD_SORT_DIMENSION} from './task-controller/keyword-state.js';
+import {createLegacyKeywordView} from './legacy-view/coordinator.js';
+import {createLegacyCaptureInputsView} from './legacy-view/capture-inputs.js';
+import {createLegacyKeywordInputsView} from './legacy-view/keyword-inputs.js';
+import {createLegacyCaptureProgressView} from './legacy-view/capture-progress.js';
+import {createLegacyProgressVisibilityView} from './legacy-view/progress-visibility.js';
 import {createSidebarTaskController} from './task-controller/coordinator.js';
 
 /**
@@ -250,11 +256,7 @@ const MONITOR_SUBJECT_TYPE = Object.freeze({
   CREATOR: "creator",
   OFFICIAL: "official",
 });
-const KEYWORD_SORT_DIMENSION = {
-  LIKES: "likes",
-  COLLECTS: "collects",
-  COMMENTS: "comments",
-};
+
 const KEYWORD_SORT_DIMENSION_LABEL = {
   [KEYWORD_SORT_DIMENSION.LIKES]: "点赞",
   [KEYWORD_SORT_DIMENSION.COLLECTS]: "收藏",
@@ -320,37 +322,9 @@ let debugSessionLastActivitySignature = "";
 let debugSessionTerminalizedActivityId = "";
 let updateModalListenersBound = false;
 let updateGuideModalListenersBound = false;
-let keywordSortDimension = KEYWORD_SORT_DIMENSION.LIKES;
-let keywordSortSyncTimer = null;
-let lastRuntimePageUrlForKeywordSort = "";
-let expandedKeywordsBuffer = [];
-let keywordExpandInFlight = false;
-let keywordExpandCancelRequested = false;
 
 const CAPTURE_TASK_OWNER_PORT_NAME = "osv.capture.sidebar-owner.v1";
 
-let keywordAnalysisInFlight = false;
-let keywordInsightSampleInFlight = false;
-let keywordInsightRunToken = 0;
-let keywordAnalysisStartedAt = 0;
-let keywordStrategyPanelVisible = false;
-let keywordStrategyActiveTab = "opportunity";
-let keywordBenchmarkInFlight = false;
-let keywordBenchmarkCancelRequested = false;
-let keywordBenchmarkStartedAt = 0;
-let keywordBenchmarkResult = null;
-let keywordBenchmarkErrorMessage = "";
-let keywordBenchmarkAnalysisStatus = "idle";
-let keywordBenchmarkLoadingTitle = "";
-let keywordBenchmarkLoadingMeta = "";
-let keywordOpportunityInFlight = false;
-let keywordOpportunityCancelRequested = false;
-let keywordOpportunityStartedAt = 0;
-let keywordOpportunityResult = null;
-let keywordOpportunityErrorMessage = "";
-let expandedKeywordsPanelVisible = false;
-const expandedKeywordInsightCategoryIds = new Set();
-let lastRuntimePageTypeForKeywordSort = PAGE_TYPE.UNKNOWN;
 let manualSelectedPlatform = "";
 let lastKnownPagePlatform = "unknown";
 let currentUpdateNoticeState = null;
@@ -631,1599 +605,6 @@ const PLATFORM_SEARCH_FILTER_OPTIONS = {
     ],
   },
 };
-let batchDraftByPlatform = {};
-let activeBatchDraftPlatform = "";
-let keywordPlanState = null;
-let activeKeywordRunState = null;
-let keywordPlanReconcileTimer = null;
-let keywordPlanReconcileInFlight = false;
-let keywordPlanProgressCountdownTimer = null;
-let keywordPlanProgressCountdownToken = 0;
-
-function createEmptyKeywordInsightState() {
-  return {
-    analysisVersion: 0,
-    analysisStatus: "idle",
-    analysisErrorMessage: "",
-    analysisResult: null,
-    selectedCategoryIds: [],
-    selectedKeywords: [],
-    sampleStatusByCategoryId: {},
-    sampleResultsByCategoryId: {},
-  };
-}
-
-function createEmptyKeywordOpportunityDraft() {
-  return {
-    keyword: "",
-    sourceTabUrl: "",
-    listItems: [],
-    sampleItems: [],
-    representativeSamples: [],
-  };
-}
-
-function normalizeKeywordOpportunitySampleItems(items = []) {
-  return buildKeywordOpportunityInputItems(items);
-}
-
-function normalizeRepresentativeSampleItems(items = []) {
-  if (!Array.isArray(items)) {
-    return [];
-  }
-  return items
-    .map((item) => ({
-      noteId: String(item?.noteId || "").trim(),
-      url: String(item?.url || "").trim(),
-      title: String(item?.title || "").trim(),
-      authorName: String(item?.authorName || item?.author || "").trim(),
-      publishTime: String(
-        item?.publishTime || item?.publishDate || item?.lastEditedAt || "",
-      ).trim(),
-      likes: Number(item?.likes) || 0,
-      comments: Number(item?.comments) || 0,
-      collects: Number(item?.collects) || 0,
-      noteType: String(item?.noteType || "").trim(),
-      cover: String(item?.cover || item?.coverImageUrl || "").trim(),
-      content: String(item?.content || "").trim(),
-      tags: Array.isArray(item?.tags)
-        ? item.tags.map((tag) => String(tag || "").trim()).filter(Boolean)
-        : [],
-      authorFollowerCount: Number(item?.authorFollowerCount) || 0,
-    }))
-    .filter((item) => item.url);
-}
-
-function normalizeKeywordOpportunityDraft(entry = {}) {
-  const safeEntry = entry && typeof entry === "object" ? entry : {};
-  return {
-    keyword: String(safeEntry.keyword || "").trim(),
-    sourceTabUrl: String(safeEntry.sourceTabUrl || "").trim(),
-    listItems: normalizeKeywordOpportunitySampleItems(safeEntry.listItems),
-    sampleItems: normalizeKeywordOpportunitySampleItems(safeEntry.sampleItems),
-    representativeSamples: normalizeRepresentativeSampleItems(
-      safeEntry.representativeSamples,
-    ),
-  };
-}
-
-function normalizeBatchDraftPlatform(platform) {
-  const normalized = String(platform || "")
-    .trim()
-    .toLowerCase();
-  return BATCH_DRAFT_PLATFORMS.has(normalized) ? normalized : "unknown";
-}
-
-function createEmptyBatchDraft() {
-  return {
-    links: "",
-    bloggers: "",
-    batchKeywordsText: "",
-    seedKeyword: "",
-    expandedKeywords: [],
-    keywordOpportunityDraft: createEmptyKeywordOpportunityDraft(),
-    ...createEmptyKeywordInsightState(),
-  };
-}
-
-function normalizeBatchDraftEntry(entry = {}) {
-  const safeEntry = entry && typeof entry === "object" ? entry : {};
-  const links = String(safeEntry.links || "");
-  const bloggers = String(safeEntry.bloggers || "");
-  const batchKeywordsText = String(safeEntry.batchKeywordsText || "");
-  const seedKeyword = String(safeEntry.seedKeyword || "");
-  const expandedKeywords = Array.isArray(safeEntry.expandedKeywords)
-    ? safeEntry.expandedKeywords
-        .map((item) => String(item || "").trim())
-        .filter(Boolean)
-    : [];
-  const defaultInsightState = createEmptyKeywordInsightState();
-  const rawAnalysisResult =
-    safeEntry.analysisResult && typeof safeEntry.analysisResult === "object"
-      ? safeEntry.analysisResult
-      : null;
-  const selectedCategoryIds = Array.isArray(safeEntry.selectedCategoryIds)
-    ? safeEntry.selectedCategoryIds
-        .map((item) => String(item || "").trim())
-        .filter(Boolean)
-    : [];
-  const selectedKeywords = Array.isArray(safeEntry.selectedKeywords)
-    ? safeEntry.selectedKeywords
-        .map((item) => String(item || "").trim())
-        .filter(Boolean)
-    : [];
-  const sampleStatusByCategoryId =
-    safeEntry.sampleStatusByCategoryId &&
-    typeof safeEntry.sampleStatusByCategoryId === "object"
-      ? Object.fromEntries(
-          Object.entries(safeEntry.sampleStatusByCategoryId).map(
-            ([key, value]) => [
-              String(key || "").trim(),
-              String(value || "").trim() || "idle",
-            ],
-          ),
-        )
-      : {};
-  const sampleResultsByCategoryId =
-    safeEntry.sampleResultsByCategoryId &&
-    typeof safeEntry.sampleResultsByCategoryId === "object"
-      ? safeEntry.sampleResultsByCategoryId
-      : {};
-  const keywordOpportunityDraft = normalizeKeywordOpportunityDraft(
-    safeEntry.keywordOpportunityDraft,
-  );
-
-  return {
-    links,
-    bloggers,
-    batchKeywordsText,
-    seedKeyword,
-    expandedKeywords,
-    analysisVersion:
-      Number.isInteger(safeEntry.analysisVersion) &&
-      safeEntry.analysisVersion >= 0
-        ? safeEntry.analysisVersion
-        : defaultInsightState.analysisVersion,
-    analysisStatus:
-      typeof safeEntry.analysisStatus === "string" && safeEntry.analysisStatus
-        ? safeEntry.analysisStatus
-        : defaultInsightState.analysisStatus,
-    analysisErrorMessage: String(safeEntry.analysisErrorMessage || ""),
-    analysisResult: rawAnalysisResult,
-    selectedCategoryIds,
-    selectedKeywords,
-    sampleStatusByCategoryId,
-    sampleResultsByCategoryId,
-    keywordOpportunityDraft,
-  };
-}
-
-function normalizeBatchDraftStore(rawStore = {}) {
-  const safeStore = rawStore && typeof rawStore === "object" ? rawStore : {};
-  const normalizedStore = {};
-  Object.entries(safeStore).forEach(([platform, entry]) => {
-    const normalizedPlatform = normalizeBatchDraftPlatform(platform);
-    normalizedStore[normalizedPlatform] = normalizeBatchDraftEntry(entry);
-  });
-  return normalizedStore;
-}
-
-function getCurrentBatchDraftPlatform() {
-  const runtime = getCurrentRuntime();
-  return normalizeBatchDraftPlatform(getViewPlatform(runtime));
-}
-
-function resolveBatchDraftPlatform(platform = "") {
-  const raw = String(platform || "").trim();
-  if (!raw) {
-    return getCurrentBatchDraftPlatform();
-  }
-  return normalizeBatchDraftPlatform(raw);
-}
-
-function getBatchDraftForPlatform(platform = "") {
-  const normalizedPlatform = resolveBatchDraftPlatform(platform);
-  const current = batchDraftByPlatform[normalizedPlatform];
-  if (current) {
-    return normalizeBatchDraftEntry(current);
-  }
-  return createEmptyBatchDraft();
-}
-
-function getKeywordInsightState(platform = "") {
-  const draft = getBatchDraftForPlatform(platform);
-  return {
-    analysisVersion: draft.analysisVersion,
-    analysisStatus: draft.analysisStatus,
-    analysisErrorMessage: draft.analysisErrorMessage,
-    analysisResult: draft.analysisResult,
-    selectedCategoryIds: [...draft.selectedCategoryIds],
-    selectedKeywords: [...(draft.selectedKeywords || [])],
-    sampleStatusByCategoryId: {
-      ...(draft.sampleStatusByCategoryId || {}),
-    },
-    sampleResultsByCategoryId: {
-      ...(draft.sampleResultsByCategoryId || {}),
-    },
-  };
-}
-
-function updateKeywordInsightState(updates = {}, platform = "") {
-  const normalizedPlatform = resolveBatchDraftPlatform(platform);
-  const currentDraft = getBatchDraftForPlatform(normalizedPlatform);
-  batchDraftByPlatform[normalizedPlatform] = normalizeBatchDraftEntry({
-    ...currentDraft,
-    ...updates,
-  });
-  return batchDraftByPlatform[normalizedPlatform];
-}
-
-function getKeywordOpportunityDraft(platform = "") {
-  const draft = getBatchDraftForPlatform(platform);
-  return normalizeKeywordOpportunityDraft(draft.keywordOpportunityDraft);
-}
-
-function updateKeywordOpportunityDraft(updates = {}, platform = "") {
-  const normalizedPlatform = resolveBatchDraftPlatform(platform);
-  const currentDraft = getBatchDraftForPlatform(normalizedPlatform);
-  const nextOpportunityDraft = normalizeKeywordOpportunityDraft({
-    ...currentDraft.keywordOpportunityDraft,
-    ...updates,
-  });
-  batchDraftByPlatform[normalizedPlatform] = normalizeBatchDraftEntry({
-    ...currentDraft,
-    keywordOpportunityDraft: nextOpportunityDraft,
-  });
-  return nextOpportunityDraft;
-}
-
-function clearKeywordOpportunityDraft(platform = "") {
-  return updateKeywordOpportunityDraft(
-    createEmptyKeywordOpportunityDraft(),
-    platform,
-  );
-}
-
-async function persistBatchDraftStore() {
-  await chrome.storage.session.set({
-    [BATCH_DRAFT_SESSION_KEY]: batchDraftByPlatform,
-  });
-}
-
-async function loadBatchDraftStore() {
-  const session = await chrome.storage.session.get([
-    BATCH_DRAFT_SESSION_KEY,
-    ...BATCH_DRAFT_LEGACY_KEYS,
-  ]);
-
-  batchDraftByPlatform = normalizeBatchDraftStore(
-    session[BATCH_DRAFT_SESSION_KEY],
-  );
-
-  const legacyExpandedKeywords = Array.isArray(session.expandedKeywords)
-    ? session.expandedKeywords
-        .map((item) => String(item || "").trim())
-        .filter(Boolean)
-    : [];
-  const legacySeedKeyword = String(session.expandedSeedKeyword || "").trim();
-  const hasLegacyDraft = legacyExpandedKeywords.length > 0 || legacySeedKeyword;
-
-  if (!hasLegacyDraft) {
-    return;
-  }
-
-  const currentPlatform = getCurrentBatchDraftPlatform();
-  const currentDraft = getBatchDraftForPlatform(currentPlatform);
-  const shouldMigrate =
-    currentDraft.expandedKeywords.length === 0 && !currentDraft.seedKeyword;
-  if (!shouldMigrate) {
-    return;
-  }
-
-  batchDraftByPlatform[currentPlatform] = normalizeBatchDraftEntry({
-    ...currentDraft,
-    seedKeyword: legacySeedKeyword || currentDraft.seedKeyword,
-    expandedKeywords:
-      legacyExpandedKeywords.length > 0
-        ? legacyExpandedKeywords
-        : currentDraft.expandedKeywords,
-  });
-
-  await persistBatchDraftStore();
-  await chrome.storage.session.remove(BATCH_DRAFT_LEGACY_KEYS);
-}
-
-async function persistBatchDraftForPlatform(platform = "") {
-  const normalizedPlatform = resolveBatchDraftPlatform(platform);
-  const textareaLinks = document.getElementById("textareaBatchLinks");
-  const textareaBloggers = document.getElementById("textareaBatchBloggers");
-  const textareaBatchKeywords = document.getElementById(
-    "textareaBatchKeywords",
-  );
-  const currentDraft = getBatchDraftForPlatform(normalizedPlatform);
-  const runtime = getCurrentRuntime();
-  const seedKeyword = getKeywordInsightSeedKeyword({
-    runtime,
-    preferStored: true,
-    platform: normalizedPlatform,
-  });
-
-  const nextDraft = normalizeBatchDraftEntry({
-    links: textareaLinks?.value || "",
-    bloggers: textareaBloggers?.value || "",
-    batchKeywordsText: textareaBatchKeywords?.value || "",
-    seedKeyword,
-    expandedKeywords: [...expandedKeywordsBuffer],
-    analysisVersion: currentDraft.analysisVersion,
-    analysisStatus: currentDraft.analysisStatus,
-    analysisErrorMessage: currentDraft.analysisErrorMessage,
-    analysisResult: currentDraft.analysisResult,
-    selectedCategoryIds: currentDraft.selectedCategoryIds,
-    selectedKeywords: currentDraft.selectedKeywords,
-    sampleStatusByCategoryId: currentDraft.sampleStatusByCategoryId,
-    sampleResultsByCategoryId: currentDraft.sampleResultsByCategoryId,
-    keywordOpportunityDraft: currentDraft.keywordOpportunityDraft,
-  });
-  const prevDraft = currentDraft;
-
-  if (JSON.stringify(prevDraft) === JSON.stringify(nextDraft)) {
-    return;
-  }
-
-  batchDraftByPlatform[normalizedPlatform] = nextDraft;
-  await persistBatchDraftStore();
-}
-
-function applyBatchDraftToInputs(platform = "", {force = false} = {}) {
-  const normalizedPlatform = resolveBatchDraftPlatform(platform);
-  if (!force && normalizedPlatform === activeBatchDraftPlatform) {
-    return;
-  }
-
-  const draft = getBatchDraftForPlatform(normalizedPlatform);
-  const textareaLinks = document.getElementById("textareaBatchLinks");
-  const textareaBloggers = document.getElementById("textareaBatchBloggers");
-  const textareaBatchKeywords = document.getElementById(
-    "textareaBatchKeywords",
-  );
-
-  if (textareaLinks && textareaLinks.value !== draft.links) {
-    textareaLinks.value = draft.links;
-  }
-  if (textareaBloggers && textareaBloggers.value !== draft.bloggers) {
-    textareaBloggers.value = draft.bloggers;
-  }
-  if (
-    textareaBatchKeywords &&
-    textareaBatchKeywords.value !== draft.batchKeywordsText
-  ) {
-    textareaBatchKeywords.value = draft.batchKeywordsText;
-  }
-
-  expandedKeywordsBuffer = [...draft.expandedKeywords];
-  renderExpandedKeywords();
-  renderKeywordInsightState();
-  updateBatchKeywordInputState();
-  updateExpandKeywordsButtonState();
-  activeBatchDraftPlatform = normalizedPlatform;
-}
-
-function syncBatchDraftForPlatform(platform = "") {
-  const nextPlatform = resolveBatchDraftPlatform(platform);
-  const previousPlatform = activeBatchDraftPlatform;
-
-  if (previousPlatform && previousPlatform !== nextPlatform) {
-    void persistBatchDraftForPlatform(previousPlatform).catch((error) => {
-      console.warn(
-        "[Sidebar] Persist batch draft before platform switch failed:",
-        error,
-      );
-    });
-  }
-
-  applyBatchDraftToInputs(nextPlatform, {
-    force: previousPlatform !== nextPlatform,
-  });
-}
-
-function persistCurrentBatchDraft() {
-  const platform = activeBatchDraftPlatform || getCurrentBatchDraftPlatform();
-  void persistBatchDraftForPlatform(platform).catch((error) => {
-    console.warn("[Sidebar] Persist batch draft failed:", error);
-  });
-}
-
-function getCurrentSearchKeyword(runtime = getCurrentRuntime()) {
-  if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
-    return "";
-  }
-  return extractKeywordFromUrl(runtime?.lastPageUrl || "");
-}
-
-function getStoredKeywordInsightSeedKeyword(platform = "") {
-  return String(
-    getBatchDraftForPlatform(resolveBatchDraftPlatform(platform)).seedKeyword ||
-      "",
-  ).trim();
-}
-
-function getKeywordInsightSeedKeyword({
-  runtime = getCurrentRuntime(),
-  preferStored = false,
-  platform = "",
-} = {}) {
-  const currentKeyword = getCurrentSearchKeyword(runtime);
-  if (currentKeyword) {
-    return currentKeyword;
-  }
-  return preferStored ? getStoredKeywordInsightSeedKeyword(platform) : "";
-}
-
-function clearKeywordOpportunityState(
-  {preservePanel = false, preserveDraft = false} = {},
-) {
-  keywordOpportunityInFlight = false;
-  keywordOpportunityStartedAt = 0;
-  keywordOpportunityResult = null;
-  keywordOpportunityErrorMessage = "";
-  if (!preserveDraft) {
-    clearKeywordOpportunityDraft();
-    persistCurrentBatchDraft();
-  }
-  if (!preservePanel) {
-    keywordStrategyPanelVisible = false;
-  }
-}
-
-function getKeywordOpportunityKeyword() {
-  return String(keywordOpportunityResult?.keyword || "").trim();
-}
-
-function clearBenchmarkDiscoveryState({preservePanel = false} = {}) {
-  keywordBenchmarkInFlight = false;
-  keywordBenchmarkStartedAt = 0;
-  keywordBenchmarkResult = null;
-  keywordBenchmarkErrorMessage = "";
-  keywordBenchmarkAnalysisStatus = "idle";
-  keywordBenchmarkLoadingTitle = "";
-  keywordBenchmarkLoadingMeta = "";
-  if (!preservePanel) {
-    keywordStrategyPanelVisible = false;
-  }
-}
-
-function clearBenchmarkDiscoveryResult({showFeedback = true} = {}) {
-  const hasAnything =
-    !!keywordBenchmarkResult ||
-    !!String(keywordBenchmarkErrorMessage || "").trim() ||
-    keywordBenchmarkAnalysisStatus === "loading";
-  if (!hasAnything) {
-    return;
-  }
-
-  clearBenchmarkDiscoveryState({preservePanel: true});
-  renderKeywordStrategyPanel();
-  if (showFeedback) {
-    showMessage("已清空找对标账号结果", "success");
-  }
-}
-
-function clearKeywordOpportunityResult({showFeedback = true} = {}) {
-  const hasAnything =
-    !!keywordOpportunityResult ||
-    !!String(keywordOpportunityErrorMessage || "").trim();
-  if (!hasAnything) {
-    return;
-  }
-
-  clearKeywordOpportunityState({preservePanel: true});
-  renderKeywordStrategyPanel();
-  if (showFeedback) {
-    showMessage("已清空判断赛道机会结果", "success");
-  }
-}
-
-function maybeResetKeywordOpportunityForCurrentSearch(
-  runtime = getCurrentRuntime(),
-) {
-  const currentKeyword = getCurrentSearchKeyword(runtime);
-  const draftKeyword = String(getKeywordOpportunityDraft().keyword || "").trim();
-  if (draftKeyword && currentKeyword && draftKeyword !== currentKeyword) {
-    clearKeywordOpportunityDraft();
-    persistCurrentBatchDraft();
-  }
-  if (keywordOpportunityResult) {
-    renderKeywordStrategyPanel();
-  }
-}
-
-function syncSeedKeywordFromCurrentSearch(
-  keyword = "",
-  {autoFillOnly = true} = {},
-) {
-  const nextKeyword = String(keyword || "").trim();
-  if (!nextKeyword) {
-    updateExpandKeywordsButtonState();
-    return {seedKeyword: "", changed: false};
-  }
-  const currentDraft = getBatchDraftForPlatform();
-  const prevKeyword = String(currentDraft.seedKeyword || "").trim();
-  const hasStoredResults =
-    currentDraft.expandedKeywords.length > 0 ||
-    Boolean(currentDraft.analysisResult) ||
-    currentDraft.analysisStatus === "loading" ||
-    currentDraft.analysisStatus === "success";
-  if (autoFillOnly && prevKeyword && hasStoredResults) {
-    updateExpandKeywordsButtonState();
-    return {seedKeyword: prevKeyword, changed: false, skipped: true};
-  }
-  const changed = prevKeyword !== nextKeyword;
-
-  if (changed) {
-    expandedKeywordsBuffer = [];
-    expandedKeywordsPanelVisible = false;
-    invalidateKeywordInsightDraft();
-  }
-
-  updateExpandKeywordsButtonState();
-  renderKeywordInsightState();
-  persistCurrentBatchDraft();
-
-  return {seedKeyword: nextKeyword, changed};
-}
-
-function getBatchKeywordsFromTextarea() {
-  const textarea = document.getElementById("textareaBatchKeywords");
-  return parseKeywordsFromMultilineInput(textarea?.value || "");
-}
-
-function normalizeKeywordPlanMode(value) {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (normalized === "holidays") {
-    return "custom_dates";
-  }
-  return KEYWORD_PLAN_MODES.has(normalized) ? normalized : "daily";
-}
-
-function normalizeKeywordPlanScope(scope = "modal") {
-  return scope === "search" ? "search" : "modal";
-}
-
-function getKeywordPlanControl(scope, name) {
-  const normalizedScope = normalizeKeywordPlanScope(scope);
-  const id = KEYWORD_PLAN_CONTROL_IDS[normalizedScope]?.[name];
-  return id ? document.getElementById(id) : null;
-}
-
-function normalizeSearchFilterPlatform(platform = "") {
-  const normalized = String(platform || "").trim().toLowerCase();
-  return normalized === "douyin" ? "douyin" : "xiaohongshu";
-}
-
-function getSearchFilterConfig(platform = "") {
-  return PLATFORM_SEARCH_FILTER_OPTIONS[normalizeSearchFilterPlatform(platform)] ||
-    PLATFORM_SEARCH_FILTER_OPTIONS.xiaohongshu;
-}
-
-function isDefaultSearchFilterValue(field, value) {
-  const meta = SEARCH_FILTER_FIELD_META[field] || {};
-  const normalized = String(value || "").trim();
-  return (
-    !normalized ||
-    normalized === String(meta.defaultValue || "") ||
-    normalized === String(meta.storageDefault || "")
-  );
-}
-
-function normalizeSearchFilterValueForStorage(field, value) {
-  return isDefaultSearchFilterValue(field, value)
-    ? ""
-    : String(value || "").trim().toLowerCase();
-}
-
-function renderSearchFilterSelectOptions(select, options = [], preferredValue = "") {
-  if (!select) {
-    return "";
-  }
-  const safeOptions = Array.isArray(options) ? options : [];
-  const fallbackValue = safeOptions[0]?.value || "";
-  const preferred = String(preferredValue || "").trim();
-  const hasPreferred = safeOptions.some((option) => option.value === preferred);
-  const nextValue = hasPreferred ? preferred : fallbackValue;
-
-  select.textContent = "";
-  safeOptions.forEach((option) => {
-    const optionEl = document.createElement("option");
-    optionEl.value = option.value;
-    optionEl.textContent = option.label;
-    select.appendChild(optionEl);
-  });
-  select.value = nextValue;
-  return nextValue;
-}
-
-function getSearchFilterSelectValue(scope, field) {
-  const control = getKeywordPlanControl(scope, field);
-  const meta = SEARCH_FILTER_FIELD_META[field] || {};
-  return String(control?.value || meta.defaultValue || "").trim();
-}
-
-function collectSearchFiltersFromControls(scope = "modal") {
-  const normalizedScope = normalizeKeywordPlanScope(scope);
-  return Object.keys(SEARCH_FILTER_FIELD_META).reduce((filters, field) => {
-    const value = normalizeSearchFilterValueForStorage(
-      field,
-      getSearchFilterSelectValue(normalizedScope, field),
-    );
-    if (value) {
-      filters[field] = value;
-    }
-    return filters;
-  }, {});
-}
-
-function populateSearchFilterControlsFromFilters(
-  scope = "modal",
-  filters = {},
-  platform = "",
-) {
-  syncSearchFilterControlsForPlatform(platform, {
-    scope,
-    values: filters,
-  });
-}
-
-function syncSearchFilterControlsForPlatform(
-  platform = "",
-  {scope = null, values = null} = {},
-) {
-  const runtime = getCurrentRuntime();
-  const normalizedPlatform = normalizeSearchFilterPlatform(
-    platform || getViewPlatform(runtime),
-  );
-  const config = getSearchFilterConfig(normalizedPlatform);
-  const scopes = typeof scope === "string" ? [normalizeKeywordPlanScope(scope)] : ["search", "modal"];
-
-  scopes.forEach((itemScope) => {
-    const currentValues = values || {};
-    Object.keys(SEARCH_FILTER_FIELD_META).forEach((field) => {
-      const options = config[field] || [];
-      const control = getKeywordPlanControl(itemScope, field);
-      const preferred =
-        currentValues[field] ||
-        control?.value ||
-        SEARCH_FILTER_FIELD_META[field]?.defaultValue ||
-        "";
-      renderSearchFilterSelectOptions(control, options, preferred);
-    });
-
-    const meta = SEARCH_FILTER_SCOPE_META[itemScope] || {};
-    const hintEl = meta.hint ? document.getElementById(meta.hint) : null;
-    if (hintEl) {
-      hintEl.textContent = `${config.platformLabel}筛选项 · 采集前自动切换`;
-    }
-    const contentTypeLabel = meta.contentTypeLabel
-      ? document.getElementById(meta.contentTypeLabel)
-      : null;
-    if (contentTypeLabel) {
-      contentTypeLabel.textContent = config.contentTypeLabel || "内容类型";
-    }
-
-    [
-      ["contentTypeField", config.contentType],
-      ["searchScopeField", config.searchScope],
-      ["distanceField", config.distance],
-      ["videoDurationField", config.videoDuration],
-    ].forEach(([metaKey, options]) => {
-      const fieldEl = meta[metaKey] ? document.getElementById(meta[metaKey]) : null;
-      if (fieldEl) {
-        fieldEl.hidden = !Array.isArray(options) || options.length === 0;
-      }
-    });
-  });
-}
-
-function forEachKeywordPlanScope(callback) {
-  ["search", "modal"].forEach((scope) => callback(scope));
-}
-
-function normalizeCalendarDate(value) {
-  const match = String(value || "").trim().match(
-    /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/,
-  );
-  if (!match) return "";
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  if (month < 1 || month > 12 || day < 1) return "";
-  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const daysInMonth = [
-    31,
-    leapYear ? 29 : 28,
-    31,
-    30,
-    31,
-    30,
-    31,
-    31,
-    30,
-    31,
-    30,
-    31,
-  ][month - 1];
-  if (day > daysInMonth) return "";
-  return `${match[1]}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-}
-
-function normalizeDateListText(value) {
-  return Array.from(
-    new Set(
-      String(value || "")
-        .split(/[\s,，;；]+/g)
-        .map(normalizeCalendarDate)
-        .filter(Boolean),
-    ),
-  ).join("\n");
-}
-
-function getDateListFromText(value) {
-  const normalized = normalizeDateListText(value);
-  return normalized ? normalized.split("\n").filter(Boolean) : [];
-}
-
-function renderSearchKeywordPlanDateChips() {
-  const chipsEl = document.getElementById("searchKeywordPlanDateChips");
-  const textarea = getKeywordPlanControl("search", "customDates");
-  if (!chipsEl || !textarea) {
-    return;
-  }
-  const dates = getDateListFromText(textarea.value);
-  chipsEl.textContent = "";
-  if (dates.length === 0) {
-    const empty = document.createElement("span");
-    empty.className = "keyword-plan-date-empty";
-    empty.textContent = "暂无指定日期";
-    chipsEl.appendChild(empty);
-    return;
-  }
-  dates.forEach((date) => {
-    const chip = document.createElement("span");
-    chip.className = "keyword-plan-date-chip";
-    chip.textContent = date;
-
-    const removeButton = document.createElement("button");
-    removeButton.type = "button";
-    removeButton.dataset.keywordPlanDateRemove = date;
-    removeButton.setAttribute("aria-label", `移除 ${date}`);
-    removeButton.textContent = "×";
-    chip.appendChild(removeButton);
-    chipsEl.appendChild(chip);
-  });
-}
-
-function setSearchKeywordPlanDateList(dates = []) {
-  const textarea = getKeywordPlanControl("search", "customDates");
-  if (!textarea) {
-    return;
-  }
-  textarea.value = normalizeDateListText(dates.join("\n"));
-  renderSearchKeywordPlanDateChips();
-  renderKeywordPlanStatus(keywordPlanState, "search");
-}
-
-function addSearchKeywordPlanDateFromPicker() {
-  const input = document.getElementById("inputSearchKeywordPlanDatePicker");
-  const value = String(input?.value || "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    showMessage("请选择要加入无人值守计划的运行日期", "warning");
-    return;
-  }
-  const textarea = getKeywordPlanControl("search", "customDates");
-  const dates = getDateListFromText(textarea?.value || "");
-  setSearchKeywordPlanDateList([...dates, value]);
-  if (input) {
-    input.value = "";
-  }
-}
-
-function handleSearchKeywordPlanDateChipClick(event) {
-  const target = event.target;
-  if (!(target instanceof HTMLElement)) {
-    return;
-  }
-  const button = target.closest("[data-keyword-plan-date-remove]");
-  if (!(button instanceof HTMLElement)) {
-    return;
-  }
-  const removeDate = String(button.dataset.keywordPlanDateRemove || "").trim();
-  const textarea = getKeywordPlanControl("search", "customDates");
-  const dates = getDateListFromText(textarea?.value || "").filter(
-    (date) => date !== removeDate,
-  );
-  setSearchKeywordPlanDateList(dates);
-}
-
-function parseSearchManualScheduledStart(value = "") {
-  const raw = String(value || "").trim();
-  if (!raw) {
-    return null;
-  }
-
-  const timeOnlyMatch = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  if (timeOnlyMatch) {
-    const hours = Number(timeOnlyMatch[1]);
-    const minutes = Number(timeOnlyMatch[2]);
-    const seconds = Number(timeOnlyMatch[3] || 0);
-    if (
-      hours >= 0 &&
-      hours <= 23 &&
-      minutes >= 0 &&
-      minutes <= 59 &&
-      seconds >= 0 &&
-      seconds <= 59
-    ) {
-      const target = new Date();
-      target.setHours(hours, minutes, seconds, 0);
-      return {
-        targetMs: target.getTime(),
-        label: `今天 ${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`,
-      };
-    }
-  }
-
-  const targetMs = new Date(raw).getTime();
-  if (!Number.isFinite(targetMs)) {
-    return {targetMs: NaN, label: raw};
-  }
-  return {
-    targetMs,
-    label: new Date(targetMs).toLocaleString("zh-CN"),
-  };
-}
-
-function setSearchExecutionMode(mode = "manual") {
-  const normalizedMode = mode === "plan" ? "plan" : "manual";
-  document
-    .querySelectorAll("[data-search-execution-mode]")
-    .forEach((tab) => {
-      const isActive = tab.getAttribute("data-search-execution-mode") === normalizedMode;
-      tab.classList.toggle("is-active", isActive);
-      tab.setAttribute("aria-selected", isActive ? "true" : "false");
-    });
-  const manualPane = document.getElementById("searchManualExecutionPane");
-  const planPane = document.getElementById("searchPlanExecutionPane");
-  const manualActionRow = document.getElementById("searchManualActionRow");
-  if (manualPane) {
-    manualPane.hidden = normalizedMode !== "manual";
-  }
-  if (planPane) {
-    planPane.hidden = normalizedMode !== "plan";
-  }
-  if (manualActionRow) {
-    manualActionRow.hidden = normalizedMode !== "manual";
-  }
-}
-
-function readNonNegativeNumberInput(inputId, fallback = 0) {
-  const raw = document.getElementById(inputId)?.value;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return fallback;
-  }
-  return Math.floor(parsed);
-}
-
-function readPositiveNumberInput(inputId, fallback = 1) {
-  const raw = document.getElementById(inputId)?.value;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return fallback;
-  }
-  return Math.floor(parsed);
-}
-
-function collectKeywordPlanFromInputs(scope = "modal") {
-  const normalizedScope = normalizeKeywordPlanScope(scope);
-  const runtime = getCurrentRuntime();
-  const selectedPlatform = getViewPlatform(runtime);
-  const roundGapMin = readNonNegativeNumberInput(
-    KEYWORD_PLAN_CONTROL_IDS[normalizedScope].roundGap,
-    10,
-  );
-  const maxRounds = readPositiveNumberInput(
-    KEYWORD_PLAN_CONTROL_IDS[normalizedScope].maxRounds,
-    1,
-  );
-  const keywords =
-    normalizedScope === "search"
-      ? dedupeKeywords(getSearchBatchKeywordsFromTextarea())
-      : dedupeKeywords(getBatchKeywordsFromTextarea());
-  return {
-    enabled: Boolean(
-      getKeywordPlanControl(normalizedScope, "enabled")?.checked,
-    ),
-    platform:
-      selectedPlatform && selectedPlatform !== "unknown"
-        ? selectedPlatform
-        : "xiaohongshu",
-    mode: normalizeKeywordPlanMode(
-      getKeywordPlanControl(normalizedScope, "mode")?.value,
-    ),
-    startTime:
-      getKeywordPlanControl(normalizedScope, "startTime")?.value || "09:00",
-    randomOffsetMin: readNonNegativeNumberInput(
-      KEYWORD_PLAN_CONTROL_IDS[normalizedScope].jitter,
-      20,
-    ),
-    keywords: keywords.slice(0, MAX_BATCH_KEYWORDS),
-    searchFilters: collectSearchFiltersFromControls(normalizedScope),
-    autoLoop: maxRounds > 1,
-    roundGapMin,
-    maxRounds,
-    holidayDates: "",
-    customDates: normalizeDateListText(
-      getKeywordPlanControl(normalizedScope, "customDates")?.value,
-    ),
-  };
-}
-
-function syncKeywordPlanDateFields(scope = null) {
-  const scopes = typeof scope === "string" ? [scope] : ["search", "modal"];
-  scopes.forEach((itemScope) => {
-    const normalizedScope = normalizeKeywordPlanScope(itemScope);
-    const mode = normalizeKeywordPlanMode(
-      getKeywordPlanControl(normalizedScope, "mode")?.value,
-    );
-    const customGroup = getKeywordPlanControl(normalizedScope, "customGroup");
-    if (customGroup) {
-      customGroup.hidden = mode !== "custom_dates";
-    }
-    if (normalizedScope === "search") {
-      renderSearchKeywordPlanDateChips();
-    }
-  });
-}
-
-function formatKeywordPlanRunTime(value) {
-  const timestamp = Date.parse(value || "");
-  if (!Number.isFinite(timestamp)) {
-    return "";
-  }
-  return new Date(timestamp).toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-function isExplicitUserUnattendedCancellationMessage(message = "") {
-  return /用户手动|手动中止/.test(String(message || "").trim());
-}
-
-function renderKeywordPlanStatus(plan = keywordPlanState, scope = null) {
-  const scopes = typeof scope === "string" ? [scope] : ["search", "modal"];
-  scopes.forEach((itemScope) => {
-    const normalizedScope = normalizeKeywordPlanScope(itemScope);
-    const statusEl = getKeywordPlanControl(normalizedScope, "status");
-    if (!statusEl) {
-      return;
-    }
-    const checked = Boolean(
-      getKeywordPlanControl(normalizedScope, "enabled")?.checked,
-    );
-    if (checked !== Boolean(plan?.enabled)) {
-      statusEl.textContent = checked ? "保存后启用计划" : "保存后关闭计划";
-      return;
-    }
-    if (!plan?.enabled) {
-      statusEl.textContent = "计划未启用";
-      return;
-    }
-    const keywordCount = Array.isArray(plan.keywords) ? plan.keywords.length : 0;
-    const modeLabel =
-      KEYWORD_PLAN_MODE_LABELS[normalizeKeywordPlanMode(plan.mode)] || "每天";
-    const lastRunStatus = String(plan.lastRunStatus || "");
-    const isRunningPlan = ["started", "running", "recovering"].includes(
-      lastRunStatus,
-    );
-    const nextRunText = isRunningPlan
-      ? ""
-      : formatKeywordPlanRunTime(plan.nextRunAt);
-    const nextPart = isRunningPlan
-      ? "当前运行中"
-      : nextRunText
-        ? `下次 ${nextRunText}`
-        : "暂无可运行日期";
-    const ambiguousCanceled =
-      lastRunStatus === "canceled" &&
-      !isExplicitUserUnattendedCancellationMessage(plan.lastRunMessage);
-    const lastRunStatusLabel = ambiguousCanceled
-      ? "异常中断"
-      : KEYWORD_PLAN_STATUS_LABELS[lastRunStatus] || lastRunStatus;
-    const lastRunMessage = ambiguousCanceled
-      ? "运行状态异常中断（非用户操作）"
-      : String(plan.lastRunMessage || "");
-    const lastPart = plan.lastRunStatus
-      ? `；${isRunningPlan ? "当前" : "上次"} ${lastRunStatusLabel}${lastRunMessage ? `：${lastRunMessage}` : ""}`
-      : "";
-    statusEl.textContent = `已启用 · ${modeLabel} · ${keywordCount} 个关键词 · ${nextPart}${lastPart}`;
-  });
-  syncKeywordPlanProgressPanel(buildKeywordRunDisplayPlan(plan));
-  // 无人值守的暗色任务页不能依赖 native Debug 已经 attach。计划一进入
-  // started/running，就先用计划进度渲染启动态；后台接管成功后 runtime 中
-  // 的真实 captureDebugSession 会无缝替换该启动态。
-  renderCaptureDebugSession(getCurrentRuntime() || {});
-}
-
-function isKeywordPlanRunning(plan = {}) {
-  const status = String(plan?.lastRunStatus || "").trim();
-  return ["pending", "claimed", "started", "running", "recovering"].includes(
-    status,
-  );
-}
-
-function getKeywordExecutionCopy(source = {}) {
-  const executionMode =
-    String(source?.executionMode || "").trim() === "one_time"
-      ? "one_time"
-      : "unattended_plan";
-  const oneTime = executionMode === "one_time";
-  return {
-    executionMode,
-    taskLabel: oneTime ? "一次性采集任务" : "无人值守计划",
-    captureLabel: oneTime ? "一次性采集" : "无人值守采集",
-  };
-}
-
-function normalizeUnattendedSearchPasses(plan = {}) {
-  const allowed = new Set(["all", "image", "video"]);
-  const fallback = allowed.has(String(plan?.searchFilters?.contentType || ""))
-    ? String(plan.searchFilters.contentType)
-    : "all";
-  const requested = [];
-  const seen = new Set();
-  for (const rawValue of Array.isArray(plan?.searchPasses)
-    ? plan.searchPasses
-    : []) {
-    const value = String(rawValue || "").trim().toLowerCase();
-    if (!allowed.has(value) || seen.has(value)) continue;
-    seen.add(value);
-    requested.push(value);
-    if (requested.length >= 3) break;
-  }
-  if (requested.length === 0) return [fallback];
-  if (requested.length === 1) return requested;
-  if (requested.includes("all")) {
-    const supplement = requested.find(
-      (value) => value === "image" || value === "video",
-    );
-    return supplement ? ["all", supplement] : ["all"];
-  }
-  return [requested[0]];
-}
-
-function unattendedSearchPassLabel(value = "") {
-  return {
-    all: "综合巡检",
-    image: "图文巡检",
-    video: "视频巡检",
-  }[String(value || "").trim()] || "巡检";
-}
-
-function buildKeywordRunDisplayPlan(
-  plan = keywordPlanState,
-  request = activeKeywordRunState,
-) {
-  if (!request || typeof request !== "object") {
-    return plan;
-  }
-  const requestId = String(request.id || "").trim();
-  const status = String(request.status || "").trim().toLowerCase();
-  const shouldDisplayRequest = Boolean(
-    requestId &&
-      (isKeywordPlanRunning({lastRunStatus: status}) ||
-        KEYWORD_PLAN_TERMINAL_STATUSES.has(status)),
-  );
-  if (!shouldDisplayRequest) {
-    return plan;
-  }
-  const snapshot =
-    request.planSnapshot && typeof request.planSnapshot === "object"
-      ? request.planSnapshot
-      : {};
-  const progress =
-    request.progress && typeof request.progress === "object"
-      ? request.progress
-      : {};
-  const executionMode =
-    String(request.executionMode || "").trim() === "one_time"
-      ? "one_time"
-      : "unattended_plan";
-  return {
-    ...snapshot,
-    enabled: true,
-    lastRunStatus: status,
-    lastRunMessage:
-      String(request.message || progress.message || "").trim() ||
-      (status === "pending" || status === "claimed"
-        ? "任务已领取，正在准备采集页面"
-        : "当前采集任务运行中"),
-    lastRunAt: String(
-      request.finishedAt ||
-        request.updatedAt ||
-        request.startedAt ||
-        request.claimedAt ||
-        request.createdAt ||
-        "",
-    ),
-    lastRunRequestId: requestId,
-    lastRunProgress: {
-      ...progress,
-      unattendedRequestId: requestId,
-      unattendedAttemptId: String(request.attemptId || "").trim(),
-      runnerTabId: progress.runnerTabId ?? request.runnerTabId ?? null,
-      updatedAt: String(
-        progress.updatedAt || request.updatedAt || request.createdAt || "",
-      ),
-    },
-    executionMode,
-    cloudAssigned: request.cloudAssigned === true,
-  };
-}
-
-function clearKeywordPlanProgressCountdown() {
-  keywordPlanProgressCountdownToken += 1;
-  if (keywordPlanProgressCountdownTimer) {
-    clearInterval(keywordPlanProgressCountdownTimer);
-    keywordPlanProgressCountdownTimer = null;
-  }
-}
-
-function buildKeywordPlanProgressText(plan = {}) {
-  const progress =
-    plan?.lastRunProgress && typeof plan.lastRunProgress === "object"
-      ? plan.lastRunProgress
-      : {};
-  const executionCopy = getKeywordExecutionCopy(plan);
-  const message =
-    String(progress.message || plan?.lastRunMessage || "").trim() ||
-    `${executionCopy.taskLabel}运行中`;
-  const round = Number(progress.round);
-  const maxRounds = Number(plan?.maxRounds);
-  const keyword = String(progress.keyword || "").trim();
-  const keywords = Array.isArray(plan?.keywords)
-    ? plan.keywords.map((item) => String(item || "").trim()).filter(Boolean)
-    : [];
-  const explicitKeywordCurrent = Number(progress.keywordCurrent);
-  const explicitKeywordTotal = Number(progress.keywordTotal);
-  const keywordIndex = keyword ? keywords.indexOf(keyword) : -1;
-  const keywordTotal =
-    Number.isFinite(explicitKeywordTotal) && explicitKeywordTotal > 0
-      ? Math.floor(explicitKeywordTotal)
-      : keywords.length;
-  const keywordCurrent =
-    Number.isFinite(explicitKeywordCurrent) && explicitKeywordCurrent > 0
-      ? Math.floor(explicitKeywordCurrent)
-      : keywordIndex >= 0
-        ? keywordIndex + 1
-        : 0;
-  const itemCurrent = Number(progress.itemCurrent);
-  const itemTotal = Number(progress.itemTotal);
-  const parts = [executionCopy.captureLabel];
-  const shouldShowRound =
-    Number.isFinite(round) &&
-    round > 0 &&
-    ((Number.isFinite(maxRounds) && maxRounds > 1) || round > 1);
-
-  if (shouldShowRound) {
-    parts.push(`第 ${round} 轮`);
-  }
-  if (keywordTotal > 0) {
-    parts.push(
-      `关键词 ${Math.min(Math.max(0, keywordCurrent), keywordTotal)}/${keywordTotal}`,
-    );
-  }
-  if (keyword) {
-    parts.push(`「${keyword}」`);
-  }
-  if (Number.isFinite(itemTotal) && itemTotal > 0) {
-    const normalizedItemCurrent =
-      Number.isFinite(itemCurrent) && itemCurrent > 0
-        ? Math.min(Math.floor(itemCurrent), Math.floor(itemTotal))
-        : 0;
-    parts.push(
-      `当前词内作品 ${normalizedItemCurrent}/${Math.floor(itemTotal)}`,
-    );
-  }
-
-  return `${parts.join(" · ")}：${message}`;
-}
-
-function renderKeywordPlanProgressText(progressText, plan = {}) {
-  const text = buildKeywordPlanProgressText(plan);
-  const progress =
-    plan?.lastRunProgress && typeof plan.lastRunProgress === "object"
-      ? plan.lastRunProgress
-      : {};
-  const remainingMs = Number(progress.remainingMs);
-  const canCountdown =
-    Number.isFinite(remainingMs) &&
-    remainingMs > 0 &&
-    /秒后/.test(text);
-
-  clearKeywordPlanProgressCountdown();
-  if (!canCountdown) {
-    progressText.textContent = text;
-    return;
-  }
-
-  const token = keywordPlanProgressCountdownToken;
-  // 以「上报时刻」为锚(updatedAt 是测得 remainingMs 的时刻),得到绝对截止时刻;
-  // 这样即便 5 秒一次的 reconcile / storage 用陈旧的相对 remainingMs 反复重调,
-  // deadline 也恒指向同一真实时刻——底部条平滑走到 0、不再循环(词2也不再"假卡")。
-  // updatedAt 缺失/非法时回退旧行为,绝不更差。
-  const reportedAt = Date.parse(progress.updatedAt);
-  const deadline =
-    (Number.isFinite(reportedAt) ? reportedAt : Date.now()) + remainingMs;
-  const render = () => {
-    if (token !== keywordPlanProgressCountdownToken) {
-      return;
-    }
-    const seconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-    if (seconds > 0) {
-      progressText.textContent = text.replace(/\d+\s*秒后/g, `${seconds} 秒后`);
-      return;
-    }
-    progressText.textContent = text.replace(
-      /\d+\s*秒后再搜下一个关键词\(防风控·随机间隔\)[…\.]*/g,
-      "正在切换到下一个关键词...",
-    );
-    clearKeywordPlanProgressCountdown();
-  };
-  render();
-  keywordPlanProgressCountdownTimer = setInterval(render, 1000);
-}
-
-function hasVisibleLocalCaptureProgress() {
-  return (
-    sidebarTaskController.readBatchKeywordCaptureInFlight() ||
-    sidebarTaskController.readBatchUrlCaptureInFlight() ||
-    sidebarTaskController.readDetailBatchCaptureInFlight() ||
-    sidebarTaskController.readMonitorRunInFlight() ||
-    keywordBenchmarkInFlight ||
-    keywordOpportunityInFlight ||
-    keywordExpandInFlight ||
-    [
-      "network_paused",
-      "network_resumed",
-      "system_resumed",
-      "capture_recovering",
-      "capture_canceling",
-    ].includes(String(sidebarTaskController.readActiveRecoveryProgress()?.phase || ""))
-  );
-}
-
-function hideKeywordPlanProgressPanelIfOwned(plan = keywordPlanState) {
-  const progressContainer = document.getElementById("progressContainer");
-  if (!progressContainer) {
-    return;
-  }
-  const status = String(plan?.lastRunStatus || "").trim().toLowerCase();
-  const terminal = KEYWORD_PLAN_TERMINAL_STATUSES.has(status);
-  const progressSource = String(
-    progressContainer.dataset.progressSource || "",
-  );
-  const unattendedState = String(
-    progressContainer.dataset.unattendedProgressState || "",
-  );
-  const ownedByKeywordPlan =
-    progressSource === "keyword-plan" ||
-    unattendedState === "running" ||
-    unattendedState === "terminal" ||
-    (terminal && Boolean(sidebarTaskController.readActiveUnattendedRunRequestId()));
-  if (!ownedByKeywordPlan) {
-    return;
-  }
-  clearKeywordPlanProgressCountdown();
-  progressContainer.style.display = "none";
-  delete progressContainer.dataset.progressSource;
-  if (terminal) {
-    progressContainer.dataset.unattendedProgressState = "terminal";
-  } else {
-    delete progressContainer.dataset.unattendedProgressState;
-  }
-  const btnCancel = document.getElementById("btnCancel");
-  if (btnCancel) {
-    btnCancel.textContent = "中止任务";
-    btnCancel.hidden = true;
-    btnCancel.disabled = true;
-    btnCancel.style.display = "none";
-  }
-}
-
-function syncKeywordPlanProgressPanel(plan = keywordPlanState) {
-  // runner tab(无人值守聚焦页,URL 带 unattendedRun=xxx):它自身就是批量采集执行页,
-  // 「词间随机延迟」阶段全局底部条(#progressContainer)是空闲的,需要用它显示倒计时,
-  // 故不再对 runner tab 整体提前 return。观察侧栏(无该 query)行为完全不变。
-  const isUnattendedRunnerTab = Boolean(getUnattendedRunRequestIdFromUrl());
-  if (!plan?.enabled || !isKeywordPlanRunning(plan)) {
-    hideKeywordPlanProgressPanelIfOwned(plan);
-    return;
-  }
-  // 观察侧栏:本地有可见采集进度时让位给本地进度条;
-  // runner tab 的本地采集就是这次计划本身,不让位(否则又整轮不显示)。
-  if (
-    (!isUnattendedRunnerTab && hasVisibleLocalCaptureProgress()) ||
-    isUnsupportedPlatformCoverVisible()
-  ) {
-    return;
-  }
-
-  const progressContainer = document.getElementById("progressContainer");
-  const progressText = document.getElementById("progressText");
-  if (!progressContainer || !progressText) {
-    return;
-  }
-  resetCaptureRecoveryUI({hidePanel: false, clearState: true});
-  progressContainer.dataset.progressSource = "keyword-plan";
-  progressContainer.dataset.unattendedProgressState = "running";
-  progressContainer.style.display = "block";
-  renderKeywordPlanProgressText(progressText, plan);
-  const progressBar = document.getElementById("progressBar");
-  if (progressBar) {
-    progressBar.className = "status-bar is-info";
-  }
-  const btnCancel = document.getElementById("btnCancel");
-  if (btnCancel) {
-    btnCancel.textContent = "中止任务";
-    btnCancel.hidden = false;
-    btnCancel.disabled = false;
-    btnCancel.style.display = "inline-block";
-  }
-}
-
-function populateKeywordPlanUI(plan = {}) {
-  keywordPlanState = plan || null;
-  forEachKeywordPlanScope((scope) => {
-    const enabledInput = getKeywordPlanControl(scope, "enabled");
-    if (enabledInput) {
-      enabledInput.checked = Boolean(plan?.enabled);
-    }
-    const modeInput = getKeywordPlanControl(scope, "mode");
-    if (modeInput) {
-      modeInput.value = normalizeKeywordPlanMode(plan?.mode);
-    }
-    const startInput = getKeywordPlanControl(scope, "startTime");
-    if (startInput) {
-      startInput.value = String(plan?.startTime || "09:00");
-    }
-    const jitterInput = getKeywordPlanControl(scope, "jitter");
-    if (jitterInput) {
-      jitterInput.value = String(Number(plan?.randomOffsetMin) || 0);
-    }
-    const autoLoopInput = getKeywordPlanControl(scope, "autoLoop");
-    if (autoLoopInput) {
-      autoLoopInput.checked = true;
-    }
-    const roundGapInput = getKeywordPlanControl(scope, "roundGap");
-    if (roundGapInput) {
-      roundGapInput.value = String(Math.max(0, Number(plan?.roundGapMin) || 10));
-    }
-    const maxRoundsInput = getKeywordPlanControl(scope, "maxRounds");
-    if (maxRoundsInput) {
-      maxRoundsInput.value = String(Math.max(1, Number(plan?.maxRounds) || 1));
-    }
-    const customTextarea = getKeywordPlanControl(scope, "customDates");
-    if (customTextarea) {
-      customTextarea.value = normalizeDateListText(
-        plan?.customDates || plan?.holidayDates,
-      );
-    }
-  });
-
-  const keywords = Array.isArray(plan?.keywords) ? plan.keywords : [];
-  const planPlatform =
-    plan?.platform ||
-    getViewPlatform(getCurrentRuntime()) ||
-    "xiaohongshu";
-  forEachKeywordPlanScope((scope) => {
-    const textarea = getKeywordPlanControl(scope, "keywords");
-    if (textarea && !textarea.value.trim() && keywords.length > 0) {
-      textarea.value = keywords.join("\n");
-    }
-    populateSearchFilterControlsFromFilters(
-      scope,
-      plan?.searchFilters || {},
-      planPlatform,
-    );
-  });
-  updateBatchKeywordInputState();
-
-  syncKeywordPlanDateFields();
-  renderKeywordPlanStatus(plan);
-}
-
-async function loadKeywordPlanUI({preserveInputs = false} = {}) {
-  try {
-    const response = await chrome.runtime.sendMessage({
-      type: "onstarvoice:get-unattended-keyword-plan",
-    });
-    if (!response?.ok) {
-      throw new Error(response?.error?.message || "读取计划失败");
-    }
-    const plan = response.data || {};
-    if (preserveInputs) {
-      keywordPlanState = plan;
-      renderKeywordPlanStatus(plan);
-    } else {
-      populateKeywordPlanUI(plan);
-    }
-    return plan;
-  } catch (error) {
-    console.warn("[Sidebar] Load unattended keyword plan failed:", error);
-    renderKeywordPlanStatus(null);
-    return null;
-  }
-}
-
-function renderActiveKeywordRunState(request) {
-  activeKeywordRunState =
-    request && typeof request === "object" ? request : null;
-  const displayPlan = buildKeywordRunDisplayPlan(keywordPlanState);
-  syncKeywordPlanProgressPanel(displayPlan);
-  renderCaptureDebugSession(getCurrentRuntime() || {});
-}
-
-async function loadActiveKeywordRunState() {
-  try {
-    const response = await chrome.runtime.sendMessage({
-      type: "onstarvoice:get-unattended-keyword-run-state",
-    });
-    if (!response?.ok) {
-      throw new Error(response?.error?.message || "读取当前采集任务失败");
-    }
-    renderActiveKeywordRunState(response.data || null);
-    return activeKeywordRunState;
-  } catch (error) {
-    console.warn("[Sidebar] Load active keyword run failed:", error);
-    return activeKeywordRunState;
-  }
-}
-
-function shouldRefreshDataPoolForKeywordPlan(plan = {}) {
-  const status = String(plan?.lastRunStatus || "").trim();
-  return (
-    status === "started" ||
-    status === "running" ||
-    status === "recovering" ||
-    status === "completed" ||
-    status === "completed_with_failures" ||
-    status === "needs_action" ||
-    status === "failed" ||
-    status === "canceled"
-  );
-}
-
-async function reconcileKeywordPlanFromSidebar() {
-  if (
-    keywordPlanReconcileInFlight ||
-    getUnattendedRunRequestIdFromUrl() ||
-    getTargetedPostRunRequestIdFromUrl()
-  ) {
-    return;
-  }
-  keywordPlanReconcileInFlight = true;
-  try {
-    const [plan] = await Promise.all([
-      loadKeywordPlanUI({preserveInputs: true}),
-      loadActiveKeywordRunState(),
-    ]);
-    if (shouldRefreshDataPoolForKeywordPlan(plan)) {
-      await refreshDataPoolThrottled();
-    }
-    await maybeClaimAndRunUnattendedKeywordPlan({allowPending: true});
-  } finally {
-    keywordPlanReconcileInFlight = false;
-  }
-}
-
-function startKeywordPlanReconcileTimer() {
-  stopKeywordPlanReconcileTimer();
-  if (
-    getUnattendedRunRequestIdFromUrl() ||
-    getTargetedPostRunRequestIdFromUrl()
-  ) {
-    return;
-  }
-  keywordPlanReconcileTimer = setInterval(() => {
-    reconcileKeywordPlanFromSidebar().catch((error) => {
-      console.warn("[Sidebar] Reconcile unattended keyword plan failed:", error);
-    });
-  }, KEYWORD_PLAN_RECONCILE_INTERVAL_MS);
-}
-
-function stopKeywordPlanReconcileTimer() {
-  if (keywordPlanReconcileTimer) {
-    clearInterval(keywordPlanReconcileTimer);
-    keywordPlanReconcileTimer = null;
-  }
-}
-
-function setupKeywordPlanStorageListener() {
-  if (!chrome?.storage?.onChanged) {
-    return;
-  }
-  chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== "local") {
-      return;
-    }
-    if (changes?.[KEYWORD_PLAN_STORAGE_KEY]) {
-      const plan = changes[KEYWORD_PLAN_STORAGE_KEY].newValue || null;
-      keywordPlanState = plan;
-      renderKeywordPlanStatus(plan);
-      if (shouldRefreshDataPoolForKeywordPlan(plan)) {
-        refreshDataPoolThrottled().catch((error) => {
-          console.warn(
-            "[Sidebar] Failed to refresh pool during keyword plan update:",
-            error,
-          );
-        });
-      }
-    }
-    if (changes?.[KEYWORD_RUN_REQUEST_STORAGE_KEY]) {
-      const request =
-        changes[KEYWORD_RUN_REQUEST_STORAGE_KEY].newValue || null;
-      renderActiveKeywordRunState(request);
-      handleUnattendedRunRequestStorageChange(request);
-    }
-    if (changes?.[TARGETED_POST_RUN_REQUEST_STORAGE_KEY]) {
-      const request =
-        changes[TARGETED_POST_RUN_REQUEST_STORAGE_KEY].newValue || null;
-      handleTargetedPostRunRequestStorageChange(request);
-    }
-    if (
-      Object.keys(changes || {}).some((key) =>
-        key.startsWith(UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX),
-      )
-    ) {
-      void reconcilePendingUnattendedFinalFlushIntents().catch((error) => {
-        console.warn(
-          "[Sidebar] Reconcile unattended final flush intents failed:",
-          error,
-        );
-      });
-    }
-  });
-}
-
-async function handleSaveKeywordPlan(scope = "modal") {
-  try {
-    const plan = collectKeywordPlanFromInputs(scope);
-    if (plan.enabled && plan.keywords.length === 0) {
-      showMessage("启用无人值守计划前，请先填写至少一个关键词", "warning");
-      return;
-    }
-    if (plan.enabled && plan.mode === "custom_dates" && !plan.customDates) {
-      showMessage("指定日期清单需要填写至少一个运行日期", "warning");
-      return;
-    }
-
-    const response = await chrome.runtime.sendMessage({
-      type: "onstarvoice:save-unattended-keyword-plan",
-      plan,
-    });
-    if (!response?.ok) {
-      throw new Error(response?.error?.message || "保存计划失败");
-    }
-    populateKeywordPlanUI(response.data || plan);
-    showMessage(plan.enabled ? "无人值守计划已保存" : "无人值守计划已关闭", "success");
-  } catch (error) {
-    console.error("[Sidebar] Save unattended keyword plan failed:", error);
-    showMessage("保存无人值守计划失败: " + error.message, "error");
-  }
-}
 
 function updateBatchKeywordInputState() {
   const hintEl = document.getElementById("batchKeywordLimitHint");
@@ -2393,7 +774,7 @@ export async function initSidebar() {
     await loadBatchDraftStore();
   } catch (error) {
     console.warn("[Sidebar] Load batch drafts failed:", error);
-    batchDraftByPlatform = {};
+    sidebarTaskController.replaceBatchDraftByPlatform({});
   }
 
   // 更新 UI
@@ -2433,8 +814,8 @@ export async function initSidebar() {
   updateExpandKeywordsButtonState();
 
   const runtime = getCurrentRuntime();
-  lastRuntimePageTypeForKeywordSort = runtime?.pageType || PAGE_TYPE.UNKNOWN;
-  lastRuntimePageUrlForKeywordSort = String(runtime?.lastPageUrl || "");
+  sidebarTaskController.replaceLastRuntimePageTypeForKeywordSort(runtime?.pageType || PAGE_TYPE.UNKNOWN);
+  sidebarTaskController.replaceLastRuntimePageUrlForKeywordSort(String(runtime?.lastPageUrl || ""));
   syncKeywordSortDimensionByRuntime(runtime).catch((error) => {
     console.warn("[Sidebar] Initial keyword sort sync failed:", error);
   });
@@ -2513,10 +894,10 @@ function setupStateSubscriptions() {
     const currentPageType = runtime?.pageType || PAGE_TYPE.UNKNOWN;
     const currentPageUrl = String(runtime?.lastPageUrl || "");
     const shouldSyncKeywordSort =
-      currentPageType !== lastRuntimePageTypeForKeywordSort ||
-      currentPageUrl !== lastRuntimePageUrlForKeywordSort;
-    lastRuntimePageTypeForKeywordSort = currentPageType;
-    lastRuntimePageUrlForKeywordSort = currentPageUrl;
+      currentPageType !== sidebarTaskController.readLastRuntimePageTypeForKeywordSort() ||
+      currentPageUrl !== sidebarTaskController.readLastRuntimePageUrlForKeywordSort();
+    sidebarTaskController.replaceLastRuntimePageTypeForKeywordSort(currentPageType);
+    sidebarTaskController.replaceLastRuntimePageUrlForKeywordSort(currentPageUrl);
     if (shouldSyncKeywordSort) {
       syncKeywordSortDimensionByRuntime(runtime).catch((error) => {
         console.warn("[Sidebar] Failed to sync keyword sort dimension:", error);
@@ -3685,7 +2066,7 @@ function renderCaptureTaskWorkers(progress = {}) {
 
 function buildUnattendedSyntheticDebugSession(
   runtime = {},
-  plan = buildKeywordRunDisplayPlan(keywordPlanState),
+  plan = buildKeywordRunDisplayPlan(sidebarTaskController.readKeywordPlanState()),
 ) {
   const status = String(plan?.lastRunStatus || "").trim().toLowerCase();
   const running = isKeywordPlanRunning(plan);
@@ -4063,7 +2444,7 @@ function renderCaptureDebugSession(runtime = {}) {
     nativeSession?.state === "attached" &&
     Number.isSafeInteger(nativeSessionTabId) &&
     nativeSessionTabId > 0;
-  const displayPlan = buildKeywordRunDisplayPlan(keywordPlanState);
+  const displayPlan = buildKeywordRunDisplayPlan(sidebarTaskController.readKeywordPlanState());
   const planStatus = String(
     displayPlan?.lastRunStatus || "",
   ).trim().toLowerCase();
@@ -4515,7 +2896,7 @@ async function persistTerminalCaptureSummaryAcknowledgements() {
 }
 
 async function dismissAllTerminalCaptureSummaries() {
-  const displayPlan = buildKeywordRunDisplayPlan(keywordPlanState);
+  const displayPlan = buildKeywordRunDisplayPlan(sidebarTaskController.readKeywordPlanState());
   const planStatus = String(
     displayPlan?.lastRunStatus || "",
   ).trim().toLowerCase();
@@ -4612,7 +2993,7 @@ function setupDebugSessionPanelControls() {
       }
       const stoppingUnattended =
         panel?.dataset?.unattended === "true" ||
-        isKeywordPlanRunning(buildKeywordRunDisplayPlan(keywordPlanState));
+        isKeywordPlanRunning(buildKeywordRunDisplayPlan(sidebarTaskController.readKeywordPlanState()));
       if (stoppingUnattended) {
         await cancelUnattendedKeywordPlanFromSidebar(
           panel?.dataset?.unattendedRequestId || "",
@@ -6344,12 +4725,12 @@ function setupUIEventListeners() {
   document
     .getElementById("chkKeywordPlanEnabled")
     ?.addEventListener("change", () =>
-      renderKeywordPlanStatus(keywordPlanState, "modal"),
+      renderKeywordPlanStatus(sidebarTaskController.readKeywordPlanState(), "modal"),
     );
   document
     .getElementById("chkSearchKeywordPlanEnabled")
     ?.addEventListener("change", () =>
-      renderKeywordPlanStatus(keywordPlanState, "search"),
+      renderKeywordPlanStatus(sidebarTaskController.readKeywordPlanState(), "search"),
     );
   // 轮次设置已合并进「无人值守计划」:执行轮数 > 1 即循环,不再单独暴露第二个开关。
   const bindAutoLoopFields = (chkId, fieldsId) => {
@@ -6406,9 +4787,9 @@ function setupUIEventListeners() {
   document
     .getElementById("textareaExpandedKeywords")
     ?.addEventListener("input", () => {
-      expandedKeywordsBuffer = parseKeywordsFromMultilineInput(
+      sidebarTaskController.replaceExpandedKeywordsBuffer(parseKeywordsFromMultilineInput(
         document.getElementById("textareaExpandedKeywords")?.value || "",
-      );
+      ));
       updateExpandedKeywordsSummary();
       invalidateKeywordInsightDraft();
       renderKeywordInsightState();
@@ -6801,2417 +5182,6 @@ async function handlePlatformMenuSwitch(targetPlatform) {
 
 // 搜索页:在当前激活 tab 应用排序/范围筛选(复用 content 的 applyBatchSearchFilters,失败不阻断采集)
 
-function setKeywordStrategyTab(tab = "opportunity") {
-  keywordStrategyActiveTab =
-    tab === "longtail" || tab === "benchmark" ? tab : "opportunity";
-  if (keywordStrategyActiveTab === "longtail") {
-    const runtime = getCurrentRuntime();
-    const pagePlatform = getPagePlatform(runtime);
-    const selectedPlatform = getViewPlatform(runtime);
-    if (
-      runtime?.pageType === PAGE_TYPE.SEARCH_RESULTS &&
-      selectedPlatform === pagePlatform &&
-      getPlatformCapabilities(pagePlatform).captureSearch
-    ) {
-      syncSeedKeywordFromCurrentSearch(getCurrentSearchKeyword(runtime));
-    } else {
-      updateExpandKeywordsButtonState();
-    }
-    renderKeywordInsightState();
-  }
-  renderKeywordStrategyPanel();
-}
-
-function toggleKeywordStrategyPanel(forceVisible) {
-  keywordStrategyPanelVisible =
-    typeof forceVisible === "boolean"
-      ? forceVisible
-      : !keywordStrategyPanelVisible;
-  renderKeywordStrategyPanel();
-}
-
-function formatOpportunityMetric(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) {
-    return "0";
-  }
-  if (numeric >= 10000) {
-    return `${(numeric / 10000).toFixed(numeric >= 100000 ? 0 : 1)}w`;
-  }
-  return `${Math.round(numeric)}`;
-}
-
-function normalizeKeywordOpportunityTitleForMatch(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[【】\[\]()（）"'“”‘’`]/g, "")
-    .replace(/[，。！？、；：,.!?;:|｜/\\-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function buildKeywordOpportunityTitleCandidates(result) {
-  const candidates = [];
-  const append = (title, url) => {
-    const normalizedTitle = normalizeKeywordOpportunityTitleForMatch(title);
-    const normalizedUrl = String(url || "").trim();
-    if (!normalizedTitle || !normalizedUrl) {
-      return;
-    }
-    candidates.push({
-      title: String(title || "").trim(),
-      normalizedTitle,
-      url: normalizedUrl,
-    });
-  };
-
-  const storedListItems = Array.isArray(result?._listItems) ? result._listItems : [];
-  storedListItems.forEach((item) => {
-    append(item?.title, item?.url || item?.detailPageUrl || item?.noteUrl);
-  });
-
-  const representativeSamples = Array.isArray(result?._representativeSamples)
-    ? result._representativeSamples
-    : [];
-  representativeSamples.forEach((item) => {
-    append(item?.title, item?.url || item?.detailPageUrl || item?.noteUrl);
-  });
-
-  return candidates;
-}
-
-function resolveKeywordOpportunityTitleUrl(result, title) {
-  const normalizedTitle = normalizeKeywordOpportunityTitleForMatch(title);
-  if (!normalizedTitle) {
-    return "";
-  }
-
-  const candidates = buildKeywordOpportunityTitleCandidates(result);
-  const exactMatch = candidates.find(
-    (item) => item.normalizedTitle === normalizedTitle,
-  );
-  if (exactMatch?.url) {
-    return exactMatch.url;
-  }
-
-  const inclusiveMatch = candidates.find(
-    (item) =>
-      item.normalizedTitle.includes(normalizedTitle) ||
-      normalizedTitle.includes(item.normalizedTitle),
-  );
-  return inclusiveMatch?.url || "";
-}
-
-function normalizeBenchmarkDiscoveryItems(items = []) {
-  return items
-    .map((item) => {
-      const authorName = String(
-        item?.authorName || item?.author || item?.nickname || "",
-      ).trim();
-      return {
-        noteId: String(item?.noteId || "").trim(),
-        url: String(item?.url || item?.noteUrl || item?.detailPageUrl || "").trim(),
-        title: String(item?.title || "").trim(),
-        summary: String(
-          item?.summary ||
-            item?.desc ||
-            item?.description ||
-            item?.content ||
-            item?.text ||
-            "",
-        )
-          .trim()
-          .slice(0, 240),
-        authorName,
-        authorProfileUrl: String(
-          item?.authorProfileUrl ||
-            item?.profileUrl ||
-            item?.authorUrl ||
-            item?.bloggerUrl ||
-            "",
-        ).trim(),
-        publishTime: String(
-          item?.publishTime || item?.publishDate || item?.lastEditedAt || "",
-        ).trim(),
-        likes: Number(item?.likes) || 0,
-        comments: Number(item?.comments) || 0,
-        collects: Number(item?.collects) || 0,
-        noteType: String(item?.noteType || "").trim(),
-        cover: String(item?.cover || item?.coverImageUrl || "").trim(),
-      };
-    })
-    .filter((item) => item.url && item.authorName);
-}
-
-function calculateBenchmarkEngagement(item) {
-  return (
-    (Number(item?.likes) || 0) +
-    (Number(item?.comments) || 0) +
-    (Number(item?.collects) || 0)
-  );
-}
-
-function averageBenchmarkValues(values = []) {
-  return values.length === 0
-    ? 0
-    : Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
-}
-
-function normalizeBenchmarkProfilePayload(profile) {
-  if (!profile || typeof profile !== "object") {
-    return null;
-  }
-  const followersCount =
-    Number(profile.followersCount ?? profile.bloggerFollowersCount) || 0;
-  const likedAndCollectedCount =
-    Number(
-      profile.likedAndCollectedCount ??
-        profile.bloggerLikedAndCollectedCount,
-    ) || 0;
-  const normalized = {
-    bloggerName: String(profile.bloggerName || "").trim(),
-    bloggerId: String(profile.bloggerId || "").trim(),
-    bloggerUrl: String(
-      profile.bloggerUrl || profile.bloggerProfileUrl || "",
-    ).trim(),
-    avatarUrl: String(profile.avatarUrl || "").trim(),
-    description: String(profile.description || "").trim(),
-    followersCount,
-    likedAndCollectedCount,
-    bloggerAccountType: String(profile.bloggerAccountType || "").trim(),
-    captureStatus: String(profile.bloggerMetricsCaptureStatus || "").trim(),
-    captureError: String(profile.bloggerMetricsCaptureError || "").trim(),
-  };
-
-  if (
-    !normalized.description &&
-    !normalized.followersCount &&
-    !normalized.likedAndCollectedCount &&
-    !normalized.bloggerName
-  ) {
-    return null;
-  }
-  return normalized;
-}
-
-function buildBenchmarkDiscoveryRuleReason(candidate) {
-  const followersCount = Number(candidate.profile?.followersCount) || 0;
-  const isLowFollower = followersCount > 0 && followersCount <= 50000;
-  const hasHighPerformance =
-    candidate.maxLikes >= 5000 || candidate.averageLikes >= 800;
-  const likeFollowerRatio =
-    followersCount > 0 ? candidate.maxLikes / followersCount : 0;
-  const isLowFollowerBreakout =
-    isLowFollower && (hasHighPerformance || likeFollowerRatio >= 0.1);
-  let judgment = "可作为观察对象";
-  if (isLowFollowerBreakout) {
-    judgment = "有低粉爆款信号，适合优先对标它的选题切口";
-  } else if (candidate.performanceDensity === "stable") {
-    judgment = "多篇内容表现稳定，适合看它如何持续切同一类需求";
-  } else if (candidate.performanceDensity === "spike") {
-    judgment = "有明显爆款样本，适合拆解单篇选题为什么成立";
-  } else {
-    judgment = "在当前搜索词下重复露出，可以先作为备选对标";
-  }
-
-  return `${judgment}。`;
-}
-
-function buildBenchmarkDiscoveryFocusAssessment(candidate) {
-  const description = String(candidate.profile?.description || "").trim();
-  const titles = Array.isArray(candidate.topItems)
-    ? candidate.topItems.map((item) => item.title).filter(Boolean)
-    : [];
-  if (!description) {
-    return titles.length > 1
-      ? "当前先按代表内容判断方向关联，主页资料不足时需要打开主页复核。"
-      : "当前只能按搜索样本判断，方向关联需要打开主页复核。";
-  }
-  if (titles.length > 1) {
-    return "已结合主页定位和代表内容判断账号是否围绕同一类需求持续产出。";
-  }
-  return "已结合主页定位判断账号是否适合作为这个方向的对标。";
-}
-
-function buildBenchmarkDiscoveryDecisionAngle(candidate, analysis = {}) {
-  const followersCount = Number(candidate.profile?.followersCount) || 0;
-  const likeFollowerRatio =
-    followersCount > 0 && Number(candidate.maxLikes) > 0
-      ? candidate.maxLikes / followersCount
-      : 0;
-  const isLowFollowerBreakout =
-    followersCount > 0 &&
-    followersCount <= 50000 &&
-    (candidate.maxLikes >= 5000 ||
-      candidate.averageLikes >= 800 ||
-      likeFollowerRatio >= 0.1);
-  if (analysis.growthPotential === "high" || isLowFollowerBreakout) {
-    return "判断角度：低粉爆款信号、普通账号可复制性";
-  }
-  if (candidate.performanceDensity === "stable") {
-    return "判断角度：持续产出能力、赛道聚焦度";
-  }
-  if (candidate.performanceDensity === "spike") {
-    return "判断角度：单篇爆款选题、内容切口可拆解性";
-  }
-  return "判断角度：方向相关性、是否值得持续观察";
-}
-
-function buildBenchmarkDiscoveryFallbackAnalysis(candidate) {
-  return {
-    key: candidate.key,
-    recommendationReason: buildBenchmarkDiscoveryRuleReason(candidate),
-    focusAssessment: buildBenchmarkDiscoveryFocusAssessment(candidate),
-    growthPotential:
-      (Number(candidate.profile?.followersCount) || 0) > 0 &&
-      (Number(candidate.profile?.followersCount) || 0) <= 50000 &&
-      candidate.averageLikes >= 800
-        ? "high"
-        : candidate.performanceDensity === "stable"
-          ? "medium"
-          : "low",
-    tags: [
-      candidate.performanceDensity === "stable" ? "多篇稳定" : "样本重复",
-      (Number(candidate.profile?.followersCount) || 0) > 0 &&
-      (Number(candidate.profile?.followersCount) || 0) <= 50000
-        ? "低粉爆款观察"
-        : "方向相关",
-    ],
-  };
-}
-
-function buildBenchmarkDiscoveryCandidates(
-  items = [],
-  {keyword = "", platform = ""} = {},
-) {
-  const normalizedItems = normalizeBenchmarkDiscoveryItems(items);
-  const groups = new Map();
-
-  normalizedItems.forEach((item) => {
-    const key = String(item.authorProfileUrl || item.authorName).trim();
-    if (!key) {
-      return;
-    }
-    const previous = groups.get(key) || {
-      key,
-      authorName: item.authorName,
-      authorProfileUrl: item.authorProfileUrl,
-      items: [],
-    };
-    if (!previous.authorProfileUrl && item.authorProfileUrl) {
-      previous.authorProfileUrl = item.authorProfileUrl;
-    }
-    previous.items.push(item);
-    groups.set(key, previous);
-  });
-
-  const grouped = Array.from(groups.values());
-  const twoPlusCount = grouped.filter((group) => group.items.length >= 2).length;
-  let minOccurrence = twoPlusCount > BENCHMARK_DISCOVERY_RESULT_LIMIT ? 3 : 2;
-  if (!grouped.some((group) => group.items.length >= minOccurrence)) {
-    minOccurrence = 2;
-  }
-
-  const candidates = grouped
-    .filter((group) => group.items.length >= minOccurrence)
-    .map((group) => {
-      const sortedItems = [...group.items].sort(
-        (left, right) =>
-          calculateBenchmarkEngagement(right) -
-          calculateBenchmarkEngagement(left),
-      );
-      const likes = sortedItems.map((item) => Number(item.likes) || 0);
-      const comments = sortedItems.map((item) => Number(item.comments) || 0);
-      const collects = sortedItems.map((item) => Number(item.collects) || 0);
-      const totalEngagement = sortedItems.reduce(
-        (sum, item) => sum + calculateBenchmarkEngagement(item),
-        0,
-      );
-      const avgEngagement = Math.round(totalEngagement / sortedItems.length);
-      const maxLikes = Math.max(...likes, 0);
-      const averageLikes = averageBenchmarkValues(likes);
-      const averageComments = averageBenchmarkValues(comments);
-      const averageCollects = averageBenchmarkValues(collects);
-      const performanceDensity =
-        sortedItems.length >= 3 && averageLikes >= 100
-          ? "stable"
-          : maxLikes >= Math.max(averageLikes * 2, 200)
-            ? "spike"
-            : "observed";
-      const score =
-        sortedItems.length * 1000000 +
-        Math.min(maxLikes, 999999) +
-        avgEngagement * 0.2 +
-        (performanceDensity === "stable" ? 50000 : 0);
-      const candidate = {
-        key: group.key,
-        keyword,
-        platform,
-        authorName: group.authorName,
-        authorProfileUrl: group.authorProfileUrl,
-        occurrenceCount: sortedItems.length,
-        minOccurrence,
-        maxLikes,
-        averageLikes,
-        averageComments,
-        averageCollects,
-        avgEngagement,
-        totalEngagement,
-        performanceDensity,
-        profile: null,
-        profileCaptureStatus: group.authorProfileUrl ? "pending" : "missing_url",
-        profileCaptureError: "",
-        topItems: sortedItems.slice(0, 4),
-        score,
-      };
-      return {
-        ...candidate,
-        analysis: buildBenchmarkDiscoveryFallbackAnalysis(candidate),
-      };
-    })
-    .sort((left, right) => right.score - left.score)
-    .slice(0, BENCHMARK_DISCOVERY_RESULT_LIMIT);
-
-  return {
-    keyword,
-    platform,
-    sampleCount: normalizedItems.length,
-    candidateCount: candidates.length,
-    minOccurrence,
-    profileLimit: BENCHMARK_DISCOVERY_PROFILE_LIMIT,
-    generatedAt: Date.now(),
-    aiStatus: "not_run",
-    aiError: "",
-    candidates,
-  };
-}
-
-function mergeBenchmarkProfilesIntoResult(result, profileByKey) {
-  const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
-  return {
-    ...result,
-    candidates: candidates.map((candidate) => {
-      const patch = profileByKey.get(candidate.key);
-      const next = patch
-        ? {
-            ...candidate,
-            ...patch,
-          }
-        : candidate;
-      return {
-        ...next,
-        analysis: buildBenchmarkDiscoveryFallbackAnalysis(next),
-      };
-    }),
-  };
-}
-
-function mergeBenchmarkAiAnalysisIntoResult(result, aiData) {
-  const analyses = Array.isArray(aiData?.candidateAnalyses)
-    ? aiData.candidateAnalyses
-    : [];
-  const analysisByKey = new Map(
-    analyses
-      .filter((item) => item?.key)
-      .map((item) => [String(item.key), item]),
-  );
-
-  return {
-    ...result,
-    aiStatus: analyses.length > 0 ? "done" : "empty",
-    aiError: "",
-    candidates: (Array.isArray(result?.candidates) ? result.candidates : []).map(
-      (candidate) => {
-        const ai = analysisByKey.get(candidate.key);
-        if (!ai) {
-          return candidate;
-        }
-        return {
-          ...candidate,
-          analysis: {
-            ...candidate.analysis,
-            recommendationReason:
-              String(ai.recommendationReason || "").trim() ||
-              candidate.analysis?.recommendationReason ||
-              buildBenchmarkDiscoveryRuleReason(candidate),
-            focusAssessment:
-              String(ai.focusAssessment || "").trim() ||
-              candidate.analysis?.focusAssessment ||
-              buildBenchmarkDiscoveryFocusAssessment(candidate),
-            growthPotential:
-              ai.growthPotential === "high" ||
-              ai.growthPotential === "medium" ||
-              ai.growthPotential === "low"
-                ? ai.growthPotential
-                : candidate.analysis?.growthPotential || "medium",
-            tags: Array.isArray(ai.tags) && ai.tags.length > 0
-              ? ai.tags.slice(0, 4)
-              : candidate.analysis?.tags || [],
-          },
-        };
-      },
-    ),
-  };
-}
-
-function renderKeywordStrategyLoadingState({
-  title = "正在分析",
-  meta = "正在整理数据并生成判断，请稍候",
-} = {}) {
-  return `
-    <div class="keyword-insight-summary-card keyword-strategy-loading-card is-loading">
-      <div class="keyword-insight-summary-title">
-        <span class="keyword-insight-loading-spinner" aria-hidden="true"></span>
-        ${escapeHtml(title)}
-      </div>
-      <div class="keyword-insight-summary-meta">${escapeHtml(meta)}</div>
-    </div>
-  `;
-}
-
-function setKeywordBenchmarkLoading(title, meta) {
-  keywordBenchmarkAnalysisStatus = "loading";
-  keywordBenchmarkLoadingTitle = title;
-  keywordBenchmarkLoadingMeta = meta;
-  renderKeywordStrategyPanel();
-}
-
-function renderBenchmarkDiscoveryResult() {
-  if (keywordBenchmarkAnalysisStatus === "loading") {
-    return renderKeywordStrategyLoadingState({
-      title: keywordBenchmarkLoadingTitle || "正在找对标账号",
-      meta:
-        keywordBenchmarkLoadingMeta ||
-        "正在采集样本、补采账号主页并生成推荐判断",
-    });
-  }
-
-  const result = keywordBenchmarkResult;
-  if (!result) {
-    return "";
-  }
-  const candidates = Array.isArray(result.candidates) ? result.candidates : [];
-  const potentialLabels = {
-    high: "优先对标",
-    medium: "可观察",
-    low: "先复核",
-  };
-  const candidateHtml =
-    candidates.length > 0
-      ? candidates
-          .map((candidate, index) => {
-            const profile = candidate.profile || null;
-            const analysis = candidate.analysis || buildBenchmarkDiscoveryFallbackAnalysis(candidate);
-            const recommendationReason =
-              analysis.recommendationReason ||
-              buildBenchmarkDiscoveryRuleReason(candidate);
-            const decisionAngle = buildBenchmarkDiscoveryDecisionAngle(
-              candidate,
-              analysis,
-            );
-            const evidenceItems = buildBenchmarkDiscoveryCandidateEvidence(
-              candidate,
-            );
-            const representativeWorks =
-              buildBenchmarkDiscoveryRepresentativeWorks(candidate, 3);
-            return `
-              <div class="keyword-benchmark-card">
-                <div class="keyword-benchmark-card-head">
-                  <div class="keyword-benchmark-rank">#${index + 1}</div>
-                  <div class="keyword-benchmark-account">
-                    <div class="keyword-benchmark-name">${escapeHtml(profile?.bloggerName || candidate.authorName || "未知账号")}</div>
-                    <div class="keyword-benchmark-conclusion">${escapeHtml(recommendationReason)}</div>
-                    <div class="keyword-benchmark-angle">${escapeHtml(decisionAngle)}</div>
-                  </div>
-                </div>
-                <div class="keyword-benchmark-tags">
-                  <span class="keyword-benchmark-potential keyword-benchmark-potential-${escapeHtml(analysis.growthPotential || "medium")}">${escapeHtml(potentialLabels[analysis.growthPotential] || "观察")}</span>
-                  ${(Array.isArray(analysis.tags) ? analysis.tags : [])
-                    .map((tag) => `<span>${escapeHtml(tag)}</span>`)
-                    .join("")}
-                </div>
-                <div class="keyword-benchmark-evidence">
-                  <div class="keyword-benchmark-section-title">判断依据</div>
-                  ${analysis.focusAssessment ? `<p>${escapeHtml(analysis.focusAssessment)}</p>` : ""}
-                  <ul>
-                    ${evidenceItems
-                      .map((item) => `<li>${escapeHtml(item)}</li>`)
-                      .join("")}
-                  </ul>
-                </div>
-                ${
-                  representativeWorks.length > 0
-                    ? `<div class="keyword-benchmark-work-list">
-                        <div class="keyword-benchmark-section-title">代表作品</div>
-                        <ul>
-                          ${representativeWorks
-                            .map(
-                              (item) => `
-                                <li>
-                                  ${
-                                    item.url
-                                      ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener">${escapeHtml(item.title)}</a>`
-                                      : `<span>${escapeHtml(item.title)}</span>`
-                                  }
-                                  <em>赞 ${escapeHtml(formatOpportunityMetric(item.likes))}${item.collects ? ` · 藏 ${escapeHtml(formatOpportunityMetric(item.collects))}` : ""}</em>
-                                </li>
-                              `,
-                            )
-                            .join("")}
-                        </ul>
-                      </div>`
-                    : ""
-                }
-                <div class="keyword-benchmark-actions">
-                  ${
-                    candidate.authorProfileUrl
-                      ? `<button type="button" class="keyword-benchmark-action keyword-benchmark-action-primary" data-action="monitor-benchmark-account" data-url="${escapeHtml(candidate.authorProfileUrl)}" data-name="${escapeHtml(profile?.bloggerName || candidate.authorName || "")}">纳入监控</button>`
-                      : ""
-                  }
-                  ${
-                    candidate.authorProfileUrl
-                      ? `<button type="button" class="keyword-benchmark-action" data-action="open-benchmark-profile" data-url="${escapeHtml(candidate.authorProfileUrl)}">打开主页</button>`
-                      : ""
-                  }
-                </div>
-              </div>
-            `;
-          })
-          .join("")
-      : `<div class="keyword-benchmark-empty">当前样本里还没有出现 ${Number(result.minOccurrence) || 2} 次以上的账号。可以换一个更明确的主词，或扩大采样后再试。</div>`;
-
-  return `
-    <section class="keyword-benchmark-summary">
-      <div class="keyword-benchmark-summary-head">
-        <div>
-          <div class="keyword-opportunity-keyword">${escapeHtml(result.keyword || "")}</div>
-          <div class="keyword-benchmark-summary-text">
-            已从 ${Number(result.sampleCount) || 0} 条搜索结果中筛出 ${Number(result.candidateCount) || 0} 个候选账号；当前入围门槛为样本出现 ${Number(result.minOccurrence) || 2} 次，优先结合账号主页、粉丝量级和代表内容判断是否值得对标。
-          </div>
-        </div>
-        <div class="keyword-insight-share-wrap">
-          <button type="button" class="keyword-insight-share-btn">
-            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>
-            去分享
-          </button>
-          <div class="keyword-insight-share-menu">
-            <div class="keyword-insight-share-menu-inner">
-              <button type="button" class="keyword-insight-share-menu-item" data-action="copy-benchmark">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                复制文本
-              </button>
-              <button type="button" class="keyword-insight-share-menu-item" data-action="share-benchmark-as-image">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
-                分享图片
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-    <section class="keyword-opportunity-block">
-      <div class="keyword-opportunity-block-title">候选账号</div>
-      <div class="keyword-benchmark-list">${candidateHtml}</div>
-    </section>
-  `;
-}
-
-function renderKeywordOpportunityResult() {
-  const result = keywordOpportunityResult;
-  if (!result) {
-    return "";
-  }
-
-  const ruleMetrics = result.ruleMetrics || {};
-  const topicDirections = Array.isArray(result.hotTopicDirections)
-    ? result.hotTopicDirections
-    : [];
-  const recommendedAngles = Array.isArray(result.recommendedAngles)
-    ? result.recommendedAngles
-    : [];
-  const subtopics = Array.isArray(result.coreWinningSubtopics)
-    ? result.coreWinningSubtopics
-    : [];
-
-  const metrics = [
-    {
-      label: "热度",
-      value:
-        ruleMetrics.heatLevel === "high"
-          ? "高"
-          : ruleMetrics.heatLevel === "medium"
-            ? "中"
-            : "低",
-      desc:
-        "看这个词里最能打的一批内容，整体大概能冲到多高。越高，说明这个词更容易出大爆款。",
-    },
-    {
-      label: "高位区间",
-      value:
-        ruleMetrics.highBandEnd > 0
-          ? `${ruleMetrics.highBandStart}-${ruleMetrics.highBandEnd}`
-          : "未识别",
-      desc:
-        "表示前几名内容明显更强，通常是第几名到第几名。比如 1-6，就是前 6 条表现特别突出。",
-    },
-    {
-      label: "断层跌幅",
-      value:
-        ruleMetrics.cliffDropRatio > 0
-          ? `${Math.round(ruleMetrics.cliffDropRatio * 100)}%`
-          : "不明显",
-      desc:
-        "看前排内容和后面内容差得有多大。越大，说明流量越集中在少数几条爆款上。",
-    },
-    {
-      label: "高位均赞",
-      value: formatOpportunityMetric(ruleMetrics.highBandAvgLikes),
-      desc:
-        "前排爆款内容的平均点赞数，可以理解为这个词做得好的内容，通常能拿到多少赞。",
-    },
-    {
-      label: "中位赞",
-      value: formatOpportunityMetric(ruleMetrics.medianLikes),
-      desc:
-        "把所有内容按点赞从高到低排，取中间那条的点赞数。可以理解为普通内容大概是什么水平。",
-    },
-  ];
-
-  const bandPresenceLabels = {
-    high: "高赞区",
-    mid: "中赞区",
-    low: "低赞区",
-    high_mid: "高赞区+中赞区",
-    mid_low: "中赞区+低赞区",
-    all: "高赞区+中赞区+低赞区",
-  };
-
-  const organicViabilityLabels = {
-    high: "自然流可行性高",
-    medium: "自然流可行性中",
-    low: "自然流可行性低",
-  };
-
-  const topicHtml =
-    topicDirections.length > 0
-      ? topicDirections
-          .map((direction) => {
-            const titles = Array.isArray(direction.representativeTitles)
-              ? direction.representativeTitles
-              : [];
-            const bandLabel = bandPresenceLabels[direction.bandPresence] || "";
-            const viability = direction.organicViability || "medium";
-            const viabilityLabel = organicViabilityLabels[viability] || "";
-            const avgLikesValue = Number(direction.avgLikes) || 0;
-            return `
-              <div class="keyword-opportunity-topic-card">
-                <div class="keyword-opportunity-topic-name">${escapeHtml(direction.name || "未命名类目")}</div>
-                <div class="keyword-opportunity-topic-meta">
-                  ${bandLabel ? `<span class="keyword-opportunity-band-tag keyword-opportunity-band-${escapeHtml(direction.bandPresence || "all")}">${escapeHtml(bandLabel)}</span>` : ""}
-                  <span class="keyword-opportunity-organic-tag keyword-opportunity-organic-${escapeHtml(viability)}">${escapeHtml(viabilityLabel)}</span>
-                  <span class="keyword-opportunity-topic-stats">${Number(direction.sampleCount) || 0} 篇 · ${Math.round((Number(direction.shareRatio) || 0) * 100)}%${avgLikesValue > 0 ? ` · 均赞 ${formatOpportunityMetric(avgLikesValue)}` : ""}</span>
-                </div>
-                ${direction.userIntent ? `<div class="keyword-opportunity-topic-intent"><span class="keyword-opportunity-topic-intent-label">用户意图</span>${escapeHtml(direction.userIntent)}</div>` : ""}
-                <div class="keyword-opportunity-topic-reason">${escapeHtml(direction.whyItWorks || "")}</div>
-                ${direction.organicNote ? `<div class="keyword-opportunity-topic-organic-note">${escapeHtml(direction.organicNote)}</div>` : ""}
-                ${
-                  titles.length > 0
-                    ? `<div class="keyword-opportunity-topic-titles">
-                        <div class="keyword-opportunity-topic-titles-label">代表标题</div>
-                        <ul class="keyword-opportunity-topic-title-list">
-                          ${titles
-                            .map((t) => {
-                              const matchUrl = resolveKeywordOpportunityTitleUrl(
-                                result,
-                                t,
-                              );
-                              return matchUrl
-                                ? `<li><a href="${escapeHtml(matchUrl)}" class="keyword-opportunity-title-link" target="_blank" rel="noopener">${escapeHtml(t)}</a></li>`
-                                : `<li>${escapeHtml(t)}</li>`;
-                            })
-                            .join("")}
-                        </ul>
-                      </div>`
-                    : ""
-                }
-              </div>
-            `;
-          })
-          .join("")
-      : `<div class="keyword-opportunity-topic-card"><div class="keyword-opportunity-topic-reason">当前样本中还没有稳定聚合出足够清晰的内容类目，建议结合长尾词继续下钻。</div></div>`;
-
-  const angleHtml =
-    recommendedAngles.length > 0
-      ? recommendedAngles
-          .map(
-            (angle) => `
-              <div class="keyword-opportunity-angle-card">
-                <div class="keyword-opportunity-angle-head">
-                  <div class="keyword-opportunity-angle-title">${escapeHtml(angle.title || "未命名选题")}</div>
-                </div>
-                <div class="keyword-opportunity-angle-body">
-                  ${angle.audiencePainPoint ? `<div class="keyword-opportunity-angle-field">${escapeHtml(angle.audiencePainPoint)}</div>` : ""}
-                  ${angle.formatSuggestion ? `<div class="keyword-opportunity-angle-field"><span class="keyword-opportunity-angle-field-label">形式建议</span>${escapeHtml(angle.formatSuggestion)}</div>` : ""}
-                  ${angle.executionHint ? `<div class="keyword-opportunity-angle-field"><span class="keyword-opportunity-angle-field-label">执行提示</span>${escapeHtml(angle.executionHint)}</div>` : ""}
-                </div>
-              </div>
-            `,
-          )
-          .join("")
-      : `<div class="keyword-opportunity-angle-card"><div class="keyword-opportunity-angle-body">当前还没有生成可执行选题，建议先用分析长尾需求验证更具体的切口。</div></div>`;
-
-  const subtopicHtml =
-    subtopics.length > 0
-      ? subtopics
-          .map(
-            (item) =>
-              `<span class="keyword-opportunity-chip">${escapeHtml(item)}</span>`,
-          )
-          .join("")
-      : `<span class="keyword-opportunity-chip">暂无明确细分切口</span>`;
-
-  return `
-    <section class="keyword-opportunity-summary">
-      <div class="keyword-opportunity-summary-head">
-        <div class="keyword-opportunity-summary-head-left">
-          <div class="keyword-opportunity-keyword">${escapeHtml(result.keyword || "")}</div>
-        </div>
-        <div class="keyword-insight-share-wrap">
-          <button type="button" class="keyword-insight-share-btn">
-            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>
-            去分享
-          </button>
-          <div class="keyword-insight-share-menu">
-            <div class="keyword-insight-share-menu-inner">
-              <button type="button" class="keyword-insight-share-menu-item" data-action="copy-opportunity">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                复制文本
-              </button>
-              <button type="button" class="keyword-insight-share-menu-item" data-action="share-opportunity-as-image">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
-                分享图片
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="keyword-opportunity-summary-distribution">${escapeHtml(result.distributionSummary || "")}</div>
-      <div class="keyword-opportunity-metrics">
-        ${metrics
-          .map(
-            (metric) => `
-              <div class="keyword-opportunity-metric">
-                <div class="keyword-opportunity-metric-label-row">
-                  <div class="keyword-opportunity-metric-label">${escapeHtml(metric.label)}</div>
-                  <span class="auth-help-popover-wrap keyword-opportunity-help-wrap">
-                    <button
-                      type="button"
-                      class="auth-help-trigger keyword-opportunity-help-trigger"
-                      aria-label="查看${escapeHtml(metric.label)}说明">
-                      ?
-                    </button>
-                    <span
-                      class="auth-help-popover keyword-opportunity-help-popover"
-                      role="tooltip">
-                      ${escapeHtml(metric.desc)}
-                    </span>
-                  </span>
-                </div>
-                <div class="keyword-opportunity-metric-value">${escapeHtml(metric.value)}</div>
-              </div>
-            `,
-          )
-          .join("")}
-      </div>
-    </section>
-    <section class="keyword-opportunity-block">
-      <div class="keyword-opportunity-block-title">内容分布全景</div>
-      <div class="keyword-opportunity-topic-list">${topicHtml}</div>
-    </section>
-    <section class="keyword-opportunity-block">
-      <div class="keyword-opportunity-block-title">核心爆款细分词</div>
-      <div class="keyword-opportunity-chip-list">${subtopicHtml}</div>
-    </section>
-    <section class="keyword-opportunity-block">
-      <div class="keyword-opportunity-block-title">新号优先选题</div>
-      <div class="keyword-opportunity-angle-list">${angleHtml}</div>
-    </section>
-  `;
-}
-
-function renderKeywordStrategyPanel() {
-  const overlay = document.getElementById("keywordStrategyModalOverlay");
-  const btnToggle = document.getElementById("btnToggleKeywordStrategy");
-  const btnRun = document.getElementById("btnRunKeywordOpportunity");
-  const btnBenchmarkRun = document.getElementById("btnRunBenchmarkDiscovery");
-  const btnBenchmarkTab = document.getElementById(
-    "btnKeywordStrategyTabBenchmark",
-  );
-  const btnOpportunityTab = document.getElementById(
-    "btnKeywordStrategyTabOpportunity",
-  );
-  const btnLongtailTab = document.getElementById(
-    "btnKeywordStrategyTabLongtail",
-  );
-  const opportunityPane = document.getElementById(
-    "keywordStrategyOpportunityPane",
-  );
-  const benchmarkPane = document.getElementById("keywordStrategyBenchmarkPane");
-  const longtailPane = document.getElementById("keywordStrategyLongtailPane");
-  const longtailHint = document.getElementById("keywordStrategyLongtailHint");
-  const benchmarkErrorEl = document.getElementById("keywordBenchmarkError");
-  const benchmarkResultEl = document.getElementById("keywordBenchmarkResult");
-  const errorEl = document.getElementById("keywordOpportunityError");
-  const resultEl = document.getElementById("keywordOpportunityResult");
-  if (!overlay) {
-    return;
-  }
-
-  const runtime = getCurrentRuntime();
-  const currentKeyword = getCurrentSearchKeyword(runtime);
-  const pagePlatform = getPagePlatform(runtime);
-  const selectedPlatform = getViewPlatform(runtime);
-  const visible =
-    keywordStrategyPanelVisible &&
-    runtime?.pageType === PAGE_TYPE.SEARCH_RESULTS &&
-    selectedPlatform === pagePlatform &&
-    getPlatformCapabilities(pagePlatform).captureSearch;
-  overlay.classList.toggle("is-active", visible);
-  overlay.ariaHidden = visible ? "false" : "true";
-
-  if (btnToggle) {
-    btnToggle.disabled =
-      runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS ||
-      selectedPlatform !== pagePlatform ||
-      !getPlatformCapabilities(pagePlatform).captureSearch;
-    btnToggle.classList.toggle("is-disabled", btnToggle.disabled);
-    btnToggle.title = "赛道策略";
-  }
-
-  if (!visible) {
-    return;
-  }
-
-  const isBenchmark = keywordStrategyActiveTab === "benchmark";
-  const isOpportunity = keywordStrategyActiveTab === "opportunity";
-  const isLongtail = keywordStrategyActiveTab === "longtail";
-  if (btnBenchmarkTab) {
-    btnBenchmarkTab.classList.toggle("is-active", isBenchmark);
-    btnBenchmarkTab.setAttribute(
-      "aria-selected",
-      isBenchmark ? "true" : "false",
-    );
-  }
-  if (btnOpportunityTab) {
-    btnOpportunityTab.classList.toggle("is-active", isOpportunity);
-    btnOpportunityTab.setAttribute(
-      "aria-selected",
-      isOpportunity ? "true" : "false",
-    );
-  }
-  if (btnLongtailTab) {
-    btnLongtailTab.classList.toggle("is-active", isLongtail);
-    btnLongtailTab.setAttribute(
-      "aria-selected",
-      isLongtail ? "true" : "false",
-    );
-  }
-  if (benchmarkPane) {
-    benchmarkPane.hidden = !isBenchmark;
-  }
-  if (opportunityPane) {
-    opportunityPane.hidden = !isOpportunity;
-  }
-  if (longtailPane) {
-    longtailPane.hidden = !isLongtail;
-  }
-
-  if (longtailHint) {
-    const resultKeyword = getKeywordOpportunityKeyword();
-    if (currentKeyword && resultKeyword && currentKeyword !== resultKeyword) {
-      longtailHint.textContent = `当前搜索词是「${currentKeyword}」，当前判断结果保留自「${resultKeyword}」。`;
-    } else if (isBenchmark && currentKeyword) {
-      longtailHint.textContent = `当前搜索词「${currentKeyword}」可用来找对标账号，也可以继续判断赛道机会和分析长尾需求。`;
-    } else if (currentKeyword) {
-      longtailHint.textContent = `当前搜索词「${currentKeyword}」可以判断赛道机会、找对标账号和分析长尾需求。`;
-    } else if (resultKeyword) {
-      longtailHint.textContent = `当前判断结果保留自「${resultKeyword}」，切回搜索页后可重新分析。`;
-    } else {
-      longtailHint.textContent = "先判断赛道机会，再找对标账号和分析长尾需求。";
-    }
-  }
-  const btnBenchmarkCancel = document.getElementById("btnCancelBenchmarkDiscovery");
-  const btnBenchmarkClear = document.getElementById(
-    "btnClearBenchmarkDiscoveryResult",
-  );
-  if (btnBenchmarkRun) {
-    btnBenchmarkRun.disabled =
-      keywordBenchmarkInFlight || keywordOpportunityInFlight || !currentKeyword;
-    btnBenchmarkRun.classList.toggle("is-disabled", btnBenchmarkRun.disabled);
-    btnBenchmarkRun.textContent = keywordBenchmarkInFlight
-      ? "查找中..."
-      : "开始找对标账号";
-    btnBenchmarkRun.style.display = keywordBenchmarkInFlight
-      ? "none"
-      : "inline-flex";
-  }
-  if (btnBenchmarkCancel) {
-    btnBenchmarkCancel.style.display = keywordBenchmarkInFlight
-      ? "inline-flex"
-      : "none";
-  }
-  if (btnBenchmarkClear) {
-    btnBenchmarkClear.hidden =
-      (!keywordBenchmarkResult &&
-        !String(keywordBenchmarkErrorMessage || "").trim() &&
-        keywordBenchmarkAnalysisStatus !== "loading") ||
-      keywordBenchmarkInFlight;
-  }
-  if (benchmarkErrorEl) {
-    benchmarkErrorEl.hidden = !keywordBenchmarkErrorMessage;
-    benchmarkErrorEl.textContent = keywordBenchmarkErrorMessage;
-  }
-  const benchmarkIntroTextEl = document.getElementById(
-    "keywordBenchmarkIntroText",
-  );
-  if (benchmarkIntroTextEl) {
-    benchmarkIntroTextEl.hidden =
-      !!keywordBenchmarkResult || keywordBenchmarkAnalysisStatus === "loading";
-  }
-  if (benchmarkResultEl) {
-    benchmarkResultEl.innerHTML = renderBenchmarkDiscoveryResult();
-  }
-  const btnCancel = document.getElementById("btnCancelKeywordOpportunity");
-  const btnClear = document.getElementById("btnClearKeywordOpportunityResult");
-  if (btnRun) {
-    btnRun.disabled = keywordOpportunityInFlight || !currentKeyword;
-    btnRun.classList.toggle("is-disabled", btnRun.disabled);
-    btnRun.textContent = keywordOpportunityInFlight
-      ? "分析中..."
-      : "开始判断赛道机会";
-    btnRun.style.display = keywordOpportunityInFlight ? "none" : "inline-flex";
-  }
-  if (btnCancel) {
-    btnCancel.style.display = keywordOpportunityInFlight
-      ? "inline-flex"
-      : "none";
-  }
-  if (btnClear) {
-    btnClear.hidden =
-      (!keywordOpportunityResult &&
-        !String(keywordOpportunityErrorMessage || "").trim()) ||
-      keywordOpportunityInFlight;
-  }
-  if (errorEl) {
-    errorEl.hidden = !keywordOpportunityErrorMessage;
-    errorEl.textContent = keywordOpportunityErrorMessage;
-  }
-  const introTextEl = document.getElementById("keywordOpportunityIntroText");
-  if (introTextEl) {
-    introTextEl.hidden = !!keywordOpportunityResult || keywordOpportunityInFlight;
-  }
-  if (resultEl) {
-    resultEl.innerHTML =
-      keywordOpportunityInFlight && !keywordOpportunityResult
-        ? renderKeywordStrategyLoadingState({
-            title: "正在判断赛道机会",
-            meta:
-              "正在采集主词样本并生成内容机会判断，通常需要 1-2 分钟",
-          })
-        : renderKeywordOpportunityResult();
-  }
-}
-
-function buildKeywordOpportunityInputItems(items = []) {
-  return items
-    .map((item) => ({
-      noteId: String(item?.noteId || "").trim(),
-      url: String(item?.url || "").trim(),
-      title: String(item?.title || "").trim(),
-      authorName: String(
-        item?.authorName || item?.author || item?.nickname || "",
-      ).trim(),
-      publishTime: String(
-        item?.publishTime || item?.publishDate || item?.lastEditedAt || "",
-      ).trim(),
-      likes: Number(item?.likes) || 0,
-      comments: Number(item?.comments) || 0,
-      collects: Number(item?.collects) || 0,
-      noteType: String(item?.noteType || "").trim(),
-      cover: String(item?.cover || item?.coverImageUrl || "").trim(),
-    }))
-    .filter((item) => item.url);
-}
-
-function analyzeKeywordOpportunityRules(items = []) {
-  const normalizedItems = buildKeywordOpportunityInputItems(items).sort(
-    (left, right) => right.likes - left.likes,
-  );
-  const likes = normalizedItems.map((item) =>
-    Math.max(0, Number(item.likes) || 0),
-  );
-  const average = (values) =>
-    values.length === 0
-      ? 0
-      : Math.round(
-          values.reduce((sum, value) => sum + value, 0) / values.length,
-        );
-  const percentile = (values, p) => {
-    if (values.length === 0) {
-      return 0;
-    }
-    const sorted = [...values].sort((left, right) => left - right);
-    const index = Math.min(
-      sorted.length - 1,
-      Math.max(0, Math.ceil(sorted.length * p) - 1),
-    );
-    return sorted[index] || 0;
-  };
-
-  const maxLikes = likes[0] || 0;
-  const top5AvgLikes = average(likes.slice(0, 5));
-  const top10AvgLikes = average(likes.slice(0, 10));
-  const medianLikes = percentile(likes, 0.5);
-  const p80Likes = percentile(likes, 0.8);
-  const p90Likes = percentile(likes, 0.9);
-
-  let cliffIndex = 0;
-  let cliffDropRatio = 0;
-  likes.slice(0, Math.min(20, likes.length) - 1).forEach((current, index) => {
-    const next = likes[index + 1] || 0;
-    if (current <= 0) {
-      return;
-    }
-    const dropRatio = (current - next) / current;
-    const prefixCount = index + 1;
-    const prefixAvg = average(likes.slice(0, prefixCount));
-    if (prefixCount < 3) {
-      return;
-    }
-    if (prefixAvg < Math.max(medianLikes * 1.5, 200)) {
-      return;
-    }
-    if (dropRatio >= 0.25 && dropRatio > cliffDropRatio) {
-      cliffDropRatio = dropRatio;
-      cliffIndex = prefixCount;
-    }
-  });
-
-  const fallbackHighBandCount = Math.min(
-    12,
-    Math.max(5, Math.ceil(normalizedItems.length * 0.1)),
-  );
-  const highBandCount =
-    cliffIndex > 0
-      ? cliffIndex
-      : Math.min(normalizedItems.length, fallbackHighBandCount);
-
-  return {
-    sortedItems: normalizedItems,
-    highBandCount,
-    cliffIndex,
-    cliffDropRatio,
-    maxLikes,
-    top5AvgLikes,
-    top10AvgLikes,
-    medianLikes,
-    p80Likes,
-    p90Likes,
-    highBandAvgLikes: average(likes.slice(0, highBandCount)),
-    midBandAvgLikes: average(
-      likes.slice(
-        highBandCount,
-        Math.min(normalizedItems.length, highBandCount * 2),
-      ),
-    ),
-  };
-}
-
-function selectKeywordOpportunitySamples(items = []) {
-  const analysis = analyzeKeywordOpportunityRules(items);
-  const all = analysis.sortedItems;
-  const highEnd = analysis.highBandCount;
-  const midEnd = Math.max(highEnd, Math.ceil(all.length / 2));
-
-  const highBand = all.slice(0, highEnd);
-  const midBand = all.slice(highEnd, midEnd);
-  const lowBand = all.slice(midEnd);
-
-  const selectedIndexes = new Set();
-  const selected = [];
-  const pick = (item) => {
-    const key = item?.noteId || item?.url || "";
-    if (!key || selectedIndexes.has(key)) {
-      return;
-    }
-    selectedIndexes.add(key);
-    selected.push(item);
-  };
-
-  for (let i = 0; i < Math.min(5, highBand.length); i += 1) {
-    pick(highBand[i]);
-  }
-  if (highBand.length > 6) {
-    pick(highBand[Math.floor(highBand.length / 2)]);
-    pick(highBand[highBand.length - 1]);
-  }
-
-  for (let i = 0; i < Math.min(3, midBand.length); i += 1) {
-    pick(midBand[i]);
-  }
-  if (midBand.length > 4) {
-    pick(midBand[Math.floor(midBand.length / 2)]);
-  }
-
-  for (let i = 0; i < Math.min(2, lowBand.length); i += 1) {
-    pick(lowBand[i]);
-  }
-  if (lowBand.length > 3) {
-    pick(lowBand[Math.floor(lowBand.length / 2)]);
-  }
-
-  return selected.slice(0, 15);
-}
-
-async function waitForTabComplete(
-  tabId,
-  {timeoutMs = 15000, settleMs = 1200} = {},
-) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab?.status === "complete") {
-      if (settleMs > 0) {
-        await wait(settleMs);
-      }
-      return tab;
-    }
-    await wait(250);
-  }
-  throw new Error("页面加载超时，请稍后重试");
-}
-
-async function prepareKeywordStrategyCapture(tabId) {
-  const response = await chrome.runtime.sendMessage({
-    type: MESSAGE_TYPE.RELAY_TO_CONTENT,
-    tabId,
-    payload: {
-      action: "prepareKeywordStrategyCapture",
-    },
-  });
-
-  const result =
-    response?.data && typeof response.data === "object" && "ok" in response.data
-      ? response.data
-      : response;
-
-  if (!response?.ok || !result?.ok) {
-    throw new Error(
-      result?.error?.message ||
-        response?.error?.message ||
-        "页面筛选条件切换失败",
-    );
-  }
-
-  return result?.data || {};
-}
-
-async function captureKeywordOpportunitySamples({
-  sourceTabId,
-  sourceTabUrl,
-  sampleItems,
-  initialSamples = [],
-  onSampleCaptured = null,
-  shouldStop = null,
-}) {
-  if (!sourceTabUrl) {
-    throw new Error("未找到当前搜索页链接");
-  }
-  if (!Number.isFinite(Number(sourceTabId)) || Number(sourceTabId) <= 0) {
-    throw new Error("未找到当前搜索页标签");
-  }
-
-  const sampleKeyFor = (item) => String(item?.noteId || item?.url || "").trim();
-  const samples = normalizeRepresentativeSampleItems(initialSamples);
-  const completedSampleKeys = new Set(samples.map((item) => sampleKeyFor(item)));
-  try {
-    for (let index = 0; index < sampleItems.length; index += 1) {
-      const item = sampleItems[index];
-      if (typeof shouldStop === "function" && shouldStop()) {
-        throw new Error("已取消判断赛道机会");
-      }
-      const sampleKey = sampleKeyFor(item);
-      if (sampleKey && completedSampleKeys.has(sampleKey)) {
-        continue;
-      }
-      const completedCount = completedSampleKeys.size;
-      showProgress(
-        `正在当前页面采集代表爆款详情（${completedCount + 1}/${sampleItems.length}）...`,
-      );
-      await chrome.tabs.update(sourceTabId, {
-        url: item.url,
-        active: true,
-      });
-      await waitForTabComplete(sourceTabId, {
-        timeoutMs: 20000,
-        settleMs: 1800,
-      });
-      const result = await captureTabContent(sourceTabId, {
-        mode: "single",
-        captureParams: {},
-      });
-      const detail =
-        result?.data && typeof result.data === "object" ? result.data : null;
-      if (!detail) {
-        continue;
-      }
-      const normalizedSample = {
-        noteId: String(detail.noteId || item.noteId || "").trim(),
-        url: String(detail.url || item.url || "").trim(),
-        title: String(detail.title || item.title || "").trim(),
-        authorName: String(detail.author || item.authorName || "").trim(),
-        publishTime: String(
-          detail.lastEditedAt || detail.publishDate || item.publishTime || "",
-        ).trim(),
-        likes: Number(detail.likes ?? item.likes) || 0,
-        comments: Number(detail.comments ?? item.comments) || 0,
-        collects: Number(detail.collects ?? item.collects) || 0,
-        noteType: String(detail.noteType || item.noteType || "").trim(),
-        cover: String(detail.coverImageUrl || item.cover || "").trim(),
-        content: String(detail.content || "").trim(),
-        tags: Array.isArray(detail.tags)
-          ? detail.tags.map((tag) => String(tag || "").trim()).filter(Boolean)
-          : [],
-        authorFollowerCount:
-          Number(detail.bloggerFollowersCount || detail.authorFollowerCount) ||
-          0,
-      };
-      samples.push(normalizedSample);
-      if (sampleKey) {
-        completedSampleKeys.add(sampleKey);
-      }
-      if (typeof onSampleCaptured === "function") {
-        onSampleCaptured([...samples], normalizedSample);
-      }
-      await wait(500);
-    }
-  } finally {
-    try {
-      await chrome.tabs.update(sourceTabId, {
-        url: sourceTabUrl,
-        active: true,
-      });
-      await waitForTabComplete(sourceTabId, {
-        timeoutMs: 20000,
-        settleMs: 1500,
-      });
-    } catch (error) {
-      console.warn(
-        "[Sidebar] Restore keyword strategy search page failed:",
-        error,
-      );
-    }
-  }
-
-  return samples;
-}
-
-async function handleCancelKeywordOpportunity() {
-  if (!keywordOpportunityInFlight) {
-    return;
-  }
-  keywordOpportunityCancelRequested = true;
-  await requestCaptureCancelSignal();
-  showProgress("正在停止判断赛道机会...", "warning");
-}
-
-async function handleCancelBenchmarkDiscovery() {
-  if (!keywordBenchmarkInFlight) {
-    return;
-  }
-  keywordBenchmarkCancelRequested = true;
-  await requestCaptureCancelSignal();
-  showProgress("正在停止找对标账号...", "warning");
-}
-
-async function captureBenchmarkCandidateProfiles({
-  sourceTabId,
-  sourceTabUrl,
-  candidates = [],
-  shouldStop = null,
-}) {
-  const profileTargets = candidates
-    .filter((candidate) => candidate.authorProfileUrl)
-    .slice(0, BENCHMARK_DISCOVERY_PROFILE_LIMIT);
-  const profileByKey = new Map();
-
-  if (!profileTargets.length) {
-    return profileByKey;
-  }
-
-  try {
-    for (let index = 0; index < profileTargets.length; index += 1) {
-      if (typeof shouldStop === "function" && shouldStop()) {
-        throw new Error("已取消找对标账号");
-      }
-      const candidate = profileTargets[index];
-      showProgress(
-        `正在补采候选账号主页（${index + 1}/${profileTargets.length}）...`,
-      );
-      try {
-        await chrome.tabs.update(sourceTabId, {
-          url: candidate.authorProfileUrl,
-          active: true,
-        });
-        await waitForTabComplete(sourceTabId, {
-          timeoutMs: 20000,
-          settleMs: 1600,
-        });
-        const result = await captureTabContent(sourceTabId, {
-          mode: "blogger_profile",
-          captureParams: {},
-        });
-        const profile = normalizeBenchmarkProfilePayload(result?.data);
-        if (!result?.ok || !profile) {
-          throw new Error(
-            result?.error?.message || "账号主页资料采集失败",
-          );
-        }
-        profileByKey.set(candidate.key, {
-          profile,
-          profileCaptureStatus: "done",
-          profileCaptureError: "",
-          authorProfileUrl:
-            profile.bloggerUrl || candidate.authorProfileUrl || "",
-          authorName:
-            profile.bloggerName || candidate.authorName || "",
-        });
-      } catch (error) {
-        profileByKey.set(candidate.key, {
-          profile: null,
-          profileCaptureStatus: "failed",
-          profileCaptureError:
-            error?.message || "账号主页资料采集失败",
-        });
-      }
-      await wait(400);
-    }
-  } finally {
-    try {
-      await chrome.tabs.update(sourceTabId, {
-        url: sourceTabUrl,
-        active: true,
-      });
-      await waitForTabComplete(sourceTabId, {
-        timeoutMs: 20000,
-        settleMs: 1200,
-      });
-    } catch (error) {
-      console.warn("[Sidebar] Restore benchmark search page failed:", error);
-    }
-  }
-
-  return profileByKey;
-}
-
-function buildBenchmarkDiscoveryAiCandidates(result) {
-  const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
-  return candidates.slice(0, BENCHMARK_DISCOVERY_PROFILE_LIMIT).map((candidate) => ({
-    key: candidate.key,
-    authorName: candidate.profile?.bloggerName || candidate.authorName || "",
-    authorProfileUrl: candidate.authorProfileUrl || "",
-    occurrenceCount: Number(candidate.occurrenceCount) || 0,
-    maxLikes: Number(candidate.maxLikes) || 0,
-    averageLikes: Number(candidate.averageLikes) || 0,
-    averageComments: Number(candidate.averageComments) || 0,
-    averageCollects: Number(candidate.averageCollects) || 0,
-    avgEngagement: Number(candidate.avgEngagement) || 0,
-    totalEngagement: Number(candidate.totalEngagement) || 0,
-    performanceDensity: candidate.performanceDensity || "",
-    ruleReason:
-      candidate.analysis?.recommendationReason ||
-      buildBenchmarkDiscoveryRuleReason(candidate),
-    profile: candidate.profile
-      ? {
-          bloggerName: candidate.profile.bloggerName || "",
-          description: candidate.profile.description || "",
-          followersCount: Number(candidate.profile.followersCount) || 0,
-          likedAndCollectedCount:
-            Number(candidate.profile.likedAndCollectedCount) || 0,
-          bloggerAccountType: candidate.profile.bloggerAccountType || "",
-        }
-      : null,
-    topItems: (Array.isArray(candidate.topItems) ? candidate.topItems : [])
-      .slice(0, 4)
-      .map((item) => ({
-        title: item.title || "",
-        summary: item.summary || "",
-        url: item.url || "",
-        likes: Number(item.likes) || 0,
-        comments: Number(item.comments) || 0,
-        collects: Number(item.collects) || 0,
-      })),
-  }));
-}
-
-async function enrichBenchmarkDiscoveryWithAi({
-  keyword,
-  platform,
-  result,
-  taskContext = null,
-}) {
-  if (!isAuthVerified(getCurrentAuth())) {
-    void recordDiagnosticAction({
-      taskContext,
-      source: "sidebar",
-      action: "benchmark_ai_skipped",
-      status: "skipped",
-      metadata: {
-        reason: "auth_not_verified",
-        keyword,
-        platform,
-      },
-    }).catch(() => null);
-    return {
-      ...result,
-      aiStatus: "skipped",
-      aiError: "auth_not_verified",
-    };
-  }
-
-  const candidates = buildBenchmarkDiscoveryAiCandidates(result);
-  if (!candidates.length) {
-    void recordDiagnosticAction({
-      taskContext,
-      source: "sidebar",
-      action: "benchmark_ai_skipped",
-      status: "skipped",
-      metadata: {
-        reason: "empty_candidates",
-        keyword,
-        platform,
-      },
-    }).catch(() => null);
-    return {
-      ...result,
-      aiStatus: "empty",
-      aiError: "",
-    };
-  }
-
-  try {
-    showProgress("正在判断账号对标价值...");
-    void recordDiagnosticAction({
-      taskContext,
-      source: "sidebar",
-      action: "benchmark_ai_start",
-      status: "started",
-      metadata: {
-        keyword,
-        platform,
-        candidateCount: candidates.length,
-      },
-    }).catch(() => null);
-    const response = await analyzeBenchmarkDiscovery({
-      keyword,
-      platform,
-      candidates,
-    });
-    if (!response?.ok || !response?.data) {
-      const error = new Error(
-        response?.error?.message ||
-          response?.message ||
-          "对标账号判断暂时不可用",
-      );
-      error.reason = response?.error?.reason || response?.reason || "";
-      error.data = response?.error?.data || response?.data || null;
-      throw error;
-    }
-    void recordDiagnosticAction({
-      taskContext,
-      source: "sidebar",
-      action: "benchmark_ai_finish",
-      status: "completed",
-      metadata: {
-        keyword,
-        platform,
-        candidateCount: candidates.length,
-        analysisCount: Array.isArray(response.data?.candidateAnalyses)
-          ? response.data.candidateAnalyses.length
-          : 0,
-      },
-    }).catch(() => null);
-    return mergeBenchmarkAiAnalysisIntoResult(result, response.data);
-  } catch (error) {
-    const reason = String(
-      error?.reason || error?.error?.reason || "",
-    ).toLowerCase();
-    if (reason === "insufficient_balance") {
-      void refreshVerifiedAuthSnapshot();
-    }
-    void recordDiagnosticError({
-      taskContext,
-      source: "sidebar",
-      action: "benchmark_ai_finish",
-      status: "failed",
-      error: {
-        reason: reason || "benchmark_ai_failed",
-        message: error?.message || "benchmark ai analysis failed",
-      },
-      metadata: {
-        keyword,
-        platform,
-        candidateCount: candidates.length,
-      },
-    }).catch(() => null);
-    return {
-      ...result,
-      aiStatus: "failed",
-      aiError: error?.message || reason || "benchmark_ai_failed",
-    };
-  }
-}
-
-async function handleRunBenchmarkDiscovery() {
-  const runtime = getCurrentRuntime();
-  const selectedPlatform = getViewPlatform(runtime);
-  const pagePlatform = getPagePlatform(runtime);
-  if (selectedPlatform !== pagePlatform) {
-    const platformCopy = getPlatformCopy(selectedPlatform);
-    showMessage(
-      `当前数据视图是${platformCopy.label}，请切换到对应平台页面后再发现`,
-      "error",
-    );
-    return;
-  }
-  if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
-    showMessage("请先切换到搜索页", "error");
-    return;
-  }
-  if (
-    !ensureAuthVerifiedOrWarn({
-      message: getBenchmarkDiscoveryAuthRequiredMessage(),
-    })
-  ) {
-    return;
-  }
-
-  const keyword = getCurrentSearchKeyword(runtime);
-  if (!keyword) {
-    showMessage("未检测到当前搜索词，请先完成搜索后再发现", "warning");
-    return;
-  }
-  if (keywordBenchmarkInFlight || keywordOpportunityInFlight) {
-    showMessage("赛道策略分析进行中，请稍候", "warning");
-    return;
-  }
-
-  keywordStrategyPanelVisible = true;
-  keywordStrategyActiveTab = "benchmark";
-  keywordBenchmarkInFlight = true;
-  keywordBenchmarkCancelRequested = false;
-  keywordBenchmarkStartedAt = Date.now();
-  keywordBenchmarkErrorMessage = "";
-  keywordBenchmarkResult = null;
-  keywordBenchmarkAnalysisStatus = "loading";
-  keywordBenchmarkLoadingTitle = "正在查找候选账号";
-  keywordBenchmarkLoadingMeta =
-    "会先采集前 80 条搜索结果，再补采入围账号主页";
-  renderKeywordStrategyPanel();
-
-  const taskContext = beginSidebarTask({
-    taskType: "analysis",
-    featureKey: "benchmark.account_discovery",
-    metadata: {
-      platform: pagePlatform,
-      pageType: runtime?.pageType || "",
-      keyword,
-    },
-  });
-  let taskStatus = "completed";
-  let taskError = null;
-
-  try {
-    const [sourceTab] = await chrome.tabs.query({
-      active: true,
-      currentWindow: true,
-    });
-    if (!sourceTab?.id || !sourceTab.url) {
-      throw new Error("未找到当前搜索页标签");
-    }
-
-    const settings = await getCaptureSettings();
-    setKeywordBenchmarkLoading(
-      "正在整理搜索样本",
-      "正在切换到最近半年和最多点赞，准备采集高表现内容",
-    );
-    showProgress("正在切换到最近半年 + 最多点赞...");
-    await prepareKeywordStrategyCapture(sourceTab.id);
-    if (keywordBenchmarkCancelRequested) {
-      throw new Error("已取消找对标账号");
-    }
-
-    const refreshedSourceTab = await chrome.tabs.get(sourceTab.id);
-    const sourceTabUrl = String(
-      refreshedSourceTab?.url || sourceTab.url || "",
-    ).trim();
-    setKeywordBenchmarkLoading(
-      "正在筛选候选账号",
-      "正在采集主词前 80 条高表现搜索结果",
-    );
-    showProgress("正在采集主词前 80 条搜索结果...");
-    const captureResult = await captureTabContent(sourceTab.id, {
-      mode: "keyword",
-      captureParams: {
-        keyword,
-        minLikes: 0,
-        sortDimension: "likes",
-        maxDetectedItems: 80,
-        maxScrollTimes: 40,
-        waitMinMs: settings.sharedWaitMinMs,
-        waitMaxMs: settings.sharedWaitMaxMs,
-        stallTimeoutMs: settings.sharedStallTimeoutMs,
-        maxDurationMs: settings.sharedMaxDurationMs,
-      },
-    });
-    if (keywordBenchmarkCancelRequested) {
-      throw new Error("已取消找对标账号");
-    }
-
-    const payload =
-      captureResult?.data && typeof captureResult.data === "object"
-        ? captureResult.data
-        : null;
-    const listItems = normalizeBenchmarkDiscoveryItems(payload?.items || []);
-    if (listItems.length < 5) {
-      throw new Error("有效搜索结果不足，暂时无法找对标账号");
-    }
-
-    let result = buildBenchmarkDiscoveryCandidates(listItems, {
-      keyword,
-      platform: pagePlatform,
-    });
-    if (result.candidateCount === 0) {
-      keywordBenchmarkResult = result;
-      keywordBenchmarkErrorMessage = "";
-      keywordBenchmarkAnalysisStatus = "success";
-      keywordBenchmarkLoadingTitle = "";
-      keywordBenchmarkLoadingMeta = "";
-      renderKeywordStrategyPanel();
-      showMessage("当前样本暂未发现重复出现的候选账号", "warning");
-      return;
-    }
-
-    setKeywordBenchmarkLoading(
-      "正在补采账号主页",
-      `已筛出 ${result.candidateCount} 个候选账号，正在补充简介、粉丝数和赞藏数据`,
-    );
-    const profileByKey = await captureBenchmarkCandidateProfiles({
-      sourceTabId: sourceTab.id,
-      sourceTabUrl,
-      candidates: result.candidates,
-      shouldStop: () => keywordBenchmarkCancelRequested,
-    });
-    if (keywordBenchmarkCancelRequested) {
-      throw new Error("已取消找对标账号");
-    }
-    result = mergeBenchmarkProfilesIntoResult(result, profileByKey);
-
-    setKeywordBenchmarkLoading(
-      "正在生成对标账号判断",
-      "正在结合账号主页、粉丝量级和代表作品生成推荐理由",
-    );
-    result = await enrichBenchmarkDiscoveryWithAi({
-      keyword,
-      platform: pagePlatform,
-      result,
-      taskContext,
-    });
-    keywordBenchmarkResult = result;
-    keywordBenchmarkErrorMessage = "";
-    keywordBenchmarkAnalysisStatus = "success";
-    keywordBenchmarkLoadingTitle = "";
-    keywordBenchmarkLoadingMeta = "";
-    renderKeywordStrategyPanel();
-
-    showMessage(`已发现 ${result.candidateCount} 个候选对标账号`, "success");
-  } catch (error) {
-    const message =
-      error?.message || "找对标账号失败，请稍后重试";
-    keywordBenchmarkErrorMessage = message;
-    keywordBenchmarkAnalysisStatus = "error";
-    keywordBenchmarkLoadingTitle = "";
-    keywordBenchmarkLoadingMeta = "";
-    taskStatus = "failed";
-    taskError = error;
-    showMessage(message, "warning");
-    renderKeywordStrategyPanel();
-  } finally {
-    keywordBenchmarkInFlight = false;
-    keywordBenchmarkStartedAt = 0;
-    finishSidebarTask(taskContext, {
-      status: taskStatus,
-      error: taskError,
-      metadata: {
-        platform: pagePlatform,
-        keyword,
-        candidateCount: keywordBenchmarkResult?.candidateCount || 0,
-        aiStatus: keywordBenchmarkResult?.aiStatus || "unknown",
-        aiError: keywordBenchmarkResult?.aiError || "",
-      },
-    });
-    hideProgress();
-    renderKeywordStrategyPanel();
-  }
-}
-
-async function handleRunKeywordOpportunity() {
-  const runtime = getCurrentRuntime();
-  const selectedPlatform = getViewPlatform(runtime);
-  const pagePlatform = getPagePlatform(runtime);
-  if (selectedPlatform !== pagePlatform) {
-    const platformCopy = getPlatformCopy(selectedPlatform);
-    showMessage(
-      `当前数据视图是${platformCopy.label}，请切换到对应平台页面后再分析`,
-      "error",
-    );
-    return;
-  }
-  if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
-    showMessage("请先切换到搜索页", "error");
-    return;
-  }
-  if (
-    !ensureAuthVerifiedOrWarn({
-      message: getKeywordOpportunityAuthRequiredMessage(),
-    })
-  ) {
-    return;
-  }
-
-  const keyword = getCurrentSearchKeyword(runtime);
-  if (!keyword) {
-    showMessage("未检测到当前搜索词，请先完成搜索后再分析", "warning");
-    return;
-  }
-  if (keywordOpportunityInFlight) {
-    showMessage("赛道策略分析进行中，请稍候", "warning");
-    return;
-  }
-
-  keywordStrategyPanelVisible = true;
-  keywordStrategyActiveTab = "opportunity";
-  keywordOpportunityInFlight = true;
-  keywordOpportunityCancelRequested = false;
-  keywordOpportunityStartedAt = Date.now();
-  keywordOpportunityErrorMessage = "";
-  keywordOpportunityResult = null;
-  renderKeywordStrategyPanel();
-
-  try {
-    const existingDraft = getKeywordOpportunityDraft();
-    const canResumeDraft =
-      existingDraft.keyword === keyword &&
-      existingDraft.listItems.length >= 10 &&
-      existingDraft.sampleItems.length > 0 &&
-      existingDraft.representativeSamples.length <=
-        existingDraft.sampleItems.length;
-
-    const [sourceTab] = await chrome.tabs.query({
-      active: true,
-      currentWindow: true,
-    });
-    if (!sourceTab?.id || !sourceTab.url) {
-      throw new Error("未找到当前搜索页标签");
-    }
-
-    const settings = await getCaptureSettings();
-    let sourceTabUrl = String(sourceTab.url || "").trim();
-    let listItems = [];
-    let sampleItems = [];
-    let representativeSamples = [];
-
-    if (canResumeDraft) {
-      sourceTabUrl = existingDraft.sourceTabUrl || sourceTabUrl;
-      listItems = [...existingDraft.listItems];
-      sampleItems = [...existingDraft.sampleItems];
-      representativeSamples = [...existingDraft.representativeSamples];
-      const remainingSampleCount = Math.max(
-        0,
-        sampleItems.length - representativeSamples.length,
-      );
-      showMessage(
-        remainingSampleCount > 0
-          ? `已恢复上次进度，继续采集剩余 ${remainingSampleCount} 条代表爆款`
-          : "已恢复上次进度，直接继续生成赛道机会建议",
-        "success",
-      );
-    } else {
-      clearKeywordOpportunityDraft();
-      persistCurrentBatchDraft();
-      showProgress("正在切换到最近半年 + 最多点赞...");
-      await prepareKeywordStrategyCapture(sourceTab.id);
-      const refreshedSourceTab = await chrome.tabs.get(sourceTab.id);
-      sourceTabUrl = String(refreshedSourceTab?.url || sourceTab.url || "").trim();
-      showProgress("正在采集主词前 80 条搜索结果...");
-      const captureResult = await captureTabContent(sourceTab.id, {
-        mode: "keyword",
-        captureParams: {
-          keyword,
-          minLikes: 0,
-          sortDimension: "likes",
-          maxDetectedItems: 80,
-          maxScrollTimes: 40,
-          waitMinMs: settings.sharedWaitMinMs,
-          waitMaxMs: settings.sharedWaitMaxMs,
-          stallTimeoutMs: settings.sharedStallTimeoutMs,
-          maxDurationMs: settings.sharedMaxDurationMs,
-        },
-      });
-      const payload =
-        captureResult?.data && typeof captureResult.data === "object"
-          ? captureResult.data
-          : null;
-      listItems = buildKeywordOpportunityInputItems(payload?.items || []);
-      if (listItems.length < 10) {
-        throw new Error("有效搜索结果不足，暂时无法判断赛道机会");
-      }
-
-      sampleItems = selectKeywordOpportunitySamples(listItems);
-      if (sampleItems.length === 0) {
-        throw new Error("未找到可用于详情采样的代表爆款");
-      }
-      updateKeywordOpportunityDraft({
-        keyword,
-        sourceTabUrl,
-        listItems,
-        sampleItems,
-        representativeSamples: [],
-      });
-      persistCurrentBatchDraft();
-    }
-
-    showProgress("正在采集代表爆款详情...");
-    representativeSamples = await captureKeywordOpportunitySamples({
-      sourceTabId: sourceTab.id,
-      sourceTabUrl,
-      sampleItems,
-      initialSamples: representativeSamples,
-      onSampleCaptured: (nextSamples) => {
-        updateKeywordOpportunityDraft({
-          keyword,
-          sourceTabUrl,
-          listItems,
-          sampleItems,
-          representativeSamples: nextSamples,
-        });
-        persistCurrentBatchDraft();
-      },
-      shouldStop: () => keywordOpportunityCancelRequested,
-    });
-    if (representativeSamples.length === 0) {
-      throw new Error("代表爆款详情采集失败，请稍后重试");
-    }
-    updateKeywordOpportunityDraft({
-      keyword,
-      sourceTabUrl,
-      listItems,
-      sampleItems,
-      representativeSamples,
-    });
-    persistCurrentBatchDraft();
-
-    showProgress("正在生成赛道机会建议...");
-    const response = await analyzeKeywordOpportunity({
-      keyword,
-      listItems,
-      representativeSamples,
-      platform: pagePlatform,
-    });
-    if (!response?.ok || !response?.data) {
-      const requestError = new Error(
-        response?.error?.message ||
-          response?.message ||
-          "判断赛道机会暂时不可用",
-      );
-      requestError.reason =
-        response?.error?.reason || response?.reason || "server_error";
-      requestError.data = response?.error?.data || response?.data || null;
-      throw requestError;
-    }
-
-    keywordOpportunityResult = response.data;
-    keywordOpportunityResult._listItems = listItems;
-    keywordOpportunityResult._representativeSamples = representativeSamples;
-    keywordOpportunityErrorMessage = "";
-    clearKeywordOpportunityDraft();
-    persistCurrentBatchDraft();
-    renderKeywordStrategyPanel();
-    showMessage("判断赛道机会已完成", "success");
-  } catch (error) {
-    const errorReason = String(
-      error?.reason || error?.error?.reason || "",
-    )
-      .trim()
-      .toLowerCase();
-    if (errorReason === "insufficient_balance") {
-      const requiredCredits = Number(error?.data?.requiredCredits);
-      const requiredCreditsLabel =
-        Number.isInteger(requiredCredits) && requiredCredits > 0
-          ? requiredCredits
-          : KEYWORD_OPPORTUNITY_ANALYSIS_COST_CREDITS;
-      keywordOpportunityErrorMessage = "";
-      showMessage(
-        `配额不足：关键词策略完整分析需 ${requiredCreditsLabel} 配额。获取更多配额后可继续分析。`,
-        "warning",
-      );
-      void refreshVerifiedAuthSnapshot();
-    } else {
-      const formattedError = formatKeywordStrategyAccessError(
-        error,
-        getKeywordOpportunityAuthRequiredMessage(),
-      );
-      const message =
-        formattedError.message || "判断赛道机会失败，请稍后重试";
-      keywordOpportunityErrorMessage = message;
-      showMessage(message, "warning");
-    }
-    renderKeywordStrategyPanel();
-  } finally {
-    keywordOpportunityInFlight = false;
-    keywordOpportunityStartedAt = 0;
-    hideProgress();
-    renderKeywordStrategyPanel();
-  }
-}
-
-function handleOpenKeywordLongtail() {
-  const currentKeyword = getCurrentSearchKeyword(getCurrentRuntime());
-  syncSeedKeywordFromCurrentSearch(currentKeyword, {autoFillOnly: true});
-  keywordStrategyPanelVisible = true;
-  setKeywordStrategyTab("longtail");
-}
-
-function handleBenchmarkDiscoveryResultActions(event) {
-  const target = event.target;
-  if (!(target instanceof HTMLElement)) {
-    return;
-  }
-  const actionTarget = target.closest("[data-action]");
-  const action = actionTarget?.dataset?.action || "";
-  const url = String(actionTarget?.dataset?.url || "").trim();
-
-  if (action === "copy-benchmark") {
-    handleCopyBenchmarkDiscovery(actionTarget);
-    return;
-  }
-
-  if (action === "share-benchmark-as-image") {
-    handleShareBenchmarkDiscoveryAsImage();
-    return;
-  }
-
-  if (action === "open-benchmark-profile") {
-    if (!url) {
-      showMessage("暂未找到可打开的链接", "warning");
-      return;
-    }
-    chrome.tabs.create({url}).catch((error) => {
-      console.warn("[Sidebar] Open benchmark url failed:", error);
-      showMessage("打开链接失败，请稍后重试", "warning");
-    });
-    return;
-  }
-
-  if (action === "monitor-benchmark-account") {
-    if (!isMonitorAuthReady()) {
-      showMessage(MONITOR_REQUIRED_MESSAGE, "warning");
-      return;
-    }
-    if (!url) {
-      showMessage("候选账号缺少主页链接，暂时无法纳入监控", "warning");
-      return;
-    }
-    const platform = getPagePlatform(getCurrentRuntime());
-    const platformBloggerId = extractPlatformMonitorBloggerId(platform, url, "");
-    if (!platformBloggerId) {
-      showMessage("候选账号缺少主页 ID，暂时无法纳入监控", "warning");
-      return;
-    }
-    addMonitorSubscriptionByCandidate({
-      platform,
-      platformBloggerId,
-      bloggerNameSnapshot: String(actionTarget?.dataset?.name || "").trim(),
-      bloggerUrl: url,
-      bloggerAvatarSnapshot: "",
-    }).catch((error) => {
-      showMessage(`纳入监控失败：${error.message}`, "error");
-    });
-  }
-}
-
-function buildBenchmarkDiscoveryCandidateEvidence(candidate) {
-  const profile = candidate?.profile || null;
-  const followersCount = Number(profile?.followersCount) || 0;
-  const maxLikes = Number(candidate?.maxLikes) || 0;
-  const likeFollowerRatio =
-    followersCount > 0 && maxLikes > 0 ? maxLikes / followersCount : 0;
-  const evidenceItems = [
-    `样本出现 ${Number(candidate?.occurrenceCount) || 0} 次，最高赞 ${formatOpportunityMetric(maxLikes)}，均赞 ${formatOpportunityMetric(candidate?.averageLikes)}`,
-  ];
-  if (followersCount > 0) {
-    evidenceItems.push(
-      likeFollowerRatio >= 0.1
-        ? `粉丝 ${formatOpportunityMetric(followersCount)}，最高赞约为粉丝数 ${Math.max(1, Math.round(likeFollowerRatio * 10) / 10)} 倍，有低粉高表现信号`
-        : `粉丝 ${formatOpportunityMetric(followersCount)}，可结合代表内容判断是否适合普通账号学习`,
-    );
-  }
-  if (Number(profile?.likedAndCollectedCount) > 0) {
-    evidenceItems.push(
-      `主页累计赞藏 ${formatOpportunityMetric(profile.likedAndCollectedCount)}`,
-    );
-  }
-  return evidenceItems;
-}
-
-function buildBenchmarkDiscoveryRepresentativeWorks(candidate, limit = 3) {
-  return (Array.isArray(candidate?.topItems) ? candidate.topItems : [])
-    .map((item) => ({
-      title: String(item?.title || "").trim(),
-      url: String(item?.url || "").trim(),
-      likes: Number(item?.likes) || 0,
-      collects: Number(item?.collects) || 0,
-    }))
-    .filter((item) => item.title)
-    .slice(0, limit);
-}
-
-function buildBenchmarkDiscoveryShareText() {
-  const result = keywordBenchmarkResult;
-  if (!result) {
-    return "";
-  }
-  const candidates = Array.isArray(result.candidates) ? result.candidates : [];
-  const lines = [
-    `【找对标账号】${String(result.keyword || "").trim()}`,
-    `从 ${Number(result.sampleCount) || 0} 条搜索结果中筛出 ${Number(result.candidateCount) || 0} 个候选账号，入围门槛为样本出现 ${Number(result.minOccurrence) || 2} 次。`,
-  ];
-
-  candidates.slice(0, 5).forEach((candidate, index) => {
-    const profile = candidate.profile || null;
-    const analysis =
-      candidate.analysis || buildBenchmarkDiscoveryFallbackAnalysis(candidate);
-    const name =
-      String(profile?.bloggerName || candidate.authorName || "").trim() ||
-      `候选账号 ${index + 1}`;
-    const works = buildBenchmarkDiscoveryRepresentativeWorks(candidate, 3);
-    lines.push("");
-    lines.push(`${index + 1}. ${name}`);
-    if (analysis.recommendationReason) {
-      lines.push(String(analysis.recommendationReason).trim());
-    }
-    if (analysis.focusAssessment) {
-      lines.push(`判断依据：${String(analysis.focusAssessment).trim()}`);
-    }
-    buildBenchmarkDiscoveryCandidateEvidence(candidate).forEach((item) => {
-      lines.push(`- ${item}`);
-    });
-    if (works.length > 0) {
-      lines.push("代表作品：");
-      works.forEach((work) => {
-        lines.push(
-          `- ${work.title}（赞 ${formatOpportunityMetric(work.likes)}）${work.url ? ` ${work.url}` : ""}`,
-        );
-      });
-    }
-    if (candidate.authorProfileUrl) {
-      lines.push(`主页：${candidate.authorProfileUrl}`);
-    }
-  });
-
-  return lines.join("\n").trim();
-}
-
-function handleCopyBenchmarkDiscovery(btn) {
-  const text = buildBenchmarkDiscoveryShareText();
-  if (!text || !btn) {
-    showMessage("暂无对标账号结果可复制", "warning");
-    return;
-  }
-
-  navigator.clipboard
-    .writeText(text)
-    .then(() => {
-      const original = btn.innerHTML;
-      btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> 已复制`;
-      setTimeout(() => {
-        btn.innerHTML = original;
-      }, 1500);
-    })
-    .catch(() => {
-      showMessage("复制失败，请稍后重试", "error");
-    });
-}
-
-function buildBenchmarkDiscoveryShareData() {
-  const result = keywordBenchmarkResult;
-  if (!result) {
-    return null;
-  }
-  const candidates = Array.isArray(result.candidates) ? result.candidates : [];
-  return {
-    keyword: String(result.keyword || "").trim(),
-    sampleCount: Number(result.sampleCount) || 0,
-    candidateCount: Number(result.candidateCount) || 0,
-    minOccurrence: Number(result.minOccurrence) || 2,
-    candidates: candidates.slice(0, 4).map((candidate, index) => {
-      const profile = candidate.profile || null;
-      const analysis =
-        candidate.analysis || buildBenchmarkDiscoveryFallbackAnalysis(candidate);
-      return {
-        rank: index + 1,
-        name:
-          String(profile?.bloggerName || candidate.authorName || "").trim() ||
-          `候选账号 ${index + 1}`,
-        recommendationReason: String(
-          analysis.recommendationReason || "",
-        ).trim(),
-        focusAssessment: String(analysis.focusAssessment || "").trim(),
-        growthPotential: String(analysis.growthPotential || "medium").trim(),
-        tags: Array.isArray(analysis.tags)
-          ? analysis.tags.filter(Boolean).slice(0, 4).map((item) => String(item))
-          : [],
-        evidence: buildBenchmarkDiscoveryCandidateEvidence(candidate),
-        works: buildBenchmarkDiscoveryRepresentativeWorks(candidate, 2),
-      };
-    }),
-    ts: Date.now(),
-  };
-}
-
-function handleShareBenchmarkDiscoveryAsImage() {
-  const data = buildBenchmarkDiscoveryShareData();
-  if (!data) {
-    showMessage("暂无对标账号结果可分享", "warning");
-    return;
-  }
-  renderBenchmarkDiscoveryCardToImage(data);
-}
-
-function handleKeywordOpportunityResultActions(event) {
-  const target = event.target;
-  if (!(target instanceof HTMLElement)) {
-    return;
-  }
-  const action =
-    target.dataset?.action ||
-    target.closest("[data-action]")?.dataset?.action ||
-    "";
-
-  if (action === "copy-opportunity") {
-    handleCopyKeywordOpportunity(target.closest("[data-action]"));
-    return;
-  }
-  if (action === "share-opportunity-as-image") {
-    handleShareKeywordOpportunityAsImage();
-    return;
-  }
-}
-
-function handleCopyKeywordOpportunity(btn) {
-  const text = buildKeywordOpportunityShareText();
-  if (!text || !btn) {
-    return;
-  }
-
-  navigator.clipboard
-    .writeText(text)
-    .then(() => {
-      const original = btn.innerHTML;
-      btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> 已复制`;
-      setTimeout(() => {
-        btn.innerHTML = original;
-      }, 1500);
-    })
-    .catch(() => {});
-}
-
-function buildKeywordOpportunityShareText() {
-  const result = keywordOpportunityResult;
-  if (!result) {
-    return "";
-  }
-
-  const topicDirections = Array.isArray(result.hotTopicDirections)
-    ? result.hotTopicDirections
-    : [];
-  const recommendedAngles = Array.isArray(result.recommendedAngles)
-    ? result.recommendedAngles
-    : [];
-  const subtopics = Array.isArray(result.coreWinningSubtopics)
-    ? result.coreWinningSubtopics
-    : [];
-  const ruleMetrics = result.ruleMetrics || {};
-  const metrics = [
-    `热度：${ruleMetrics.heatLevel === "high" ? "高" : ruleMetrics.heatLevel === "medium" ? "中" : "低"}`,
-    `高位区间：${
-      ruleMetrics.highBandEnd > 0
-        ? `${ruleMetrics.highBandStart}-${ruleMetrics.highBandEnd}`
-        : "未识别"
-    }`,
-    `断层跌幅：${
-      ruleMetrics.cliffDropRatio > 0
-        ? `${Math.round(ruleMetrics.cliffDropRatio * 100)}%`
-        : "不明显"
-    }`,
-    `高位均赞：${formatOpportunityMetric(ruleMetrics.highBandAvgLikes)}`,
-    `中位赞：${formatOpportunityMetric(ruleMetrics.medianLikes)}`,
-  ];
-
-  const lines = [
-    `【判断赛道机会】${String(result.keyword || "").trim()}`,
-  ];
-  if (result.distributionSummary) {
-    lines.push(`分布：${String(result.distributionSummary).trim()}`);
-  }
-  lines.push(`指标：${metrics.join("｜")}`);
-
-  if (subtopics.length > 0) {
-    lines.push("");
-    lines.push("【核心爆款细分词】");
-    lines.push(subtopics.join("、"));
-  }
-
-  if (topicDirections.length > 0) {
-    lines.push("");
-    lines.push("【爆款主题方向】");
-    const bandLabels = {
-      high: "高赞区",
-      mid: "中赞区",
-      low: "低赞区",
-      high_mid: "高赞区+中赞区",
-      mid_low: "中赞区+低赞区",
-      all: "高赞区+中赞区+低赞区",
-    };
-    topicDirections.forEach((direction, index) => {
-      const name = String(direction?.name || "").trim() || `方向 ${index + 1}`;
-      const sampleCount = Number(direction?.sampleCount) || 0;
-      const shareRatio = `${Math.round((Number(direction?.shareRatio) || 0) * 100)}%`;
-      const bandLabel = bandLabels[direction?.bandPresence] || "";
-      const titles = Array.isArray(direction?.representativeTitles)
-        ? direction.representativeTitles.filter(Boolean)
-        : [];
-      lines.push(
-        `${index + 1}. ${name}${bandLabel ? `【${bandLabel}】` : ""}｜${sampleCount} 篇｜占比 ${shareRatio}`,
-      );
-      if (direction?.whyItWorks) {
-        lines.push(String(direction.whyItWorks).trim());
-      }
-      if (titles.length > 0) {
-        titles.forEach((t) => lines.push(`  · ${String(t).trim()}`));
-      }
-    });
-  }
-
-  if (recommendedAngles.length > 0) {
-    lines.push("");
-    lines.push("【新号优先选题】");
-    recommendedAngles.forEach((angle, index) => {
-      lines.push(
-        `${index + 1}. ${String(angle?.title || "").trim() || `选题 ${index + 1}`}`,
-      );
-      if (angle?.audiencePainPoint) {
-        lines.push(`  ${String(angle.audiencePainPoint).trim()}`);
-      }
-      if (angle?.formatSuggestion) {
-        lines.push(`  形式建议：${String(angle.formatSuggestion).trim()}`);
-      }
-      if (angle?.executionHint) {
-        lines.push(`  执行提示：${String(angle.executionHint).trim()}`);
-      }
-    });
-  }
-
-  return lines.join("\n").trim();
-}
-
-function buildKeywordOpportunityShareData() {
-  const result = keywordOpportunityResult;
-  if (!result) {
-    return null;
-  }
-
-  const ruleMetrics = result.ruleMetrics || {};
-  return {
-    keyword: String(result.keyword || "").trim(),
-    distributionSummary: String(result.distributionSummary || "").trim(),
-    metrics: [
-      {
-        label: "热度",
-        value:
-          ruleMetrics.heatLevel === "high"
-            ? "高"
-            : ruleMetrics.heatLevel === "medium"
-              ? "中"
-              : "低",
-      },
-      {
-        label: "高位区间",
-        value:
-          ruleMetrics.highBandEnd > 0
-            ? `${ruleMetrics.highBandStart}-${ruleMetrics.highBandEnd}`
-            : "未识别",
-      },
-      {
-        label: "断层跌幅",
-        value:
-          ruleMetrics.cliffDropRatio > 0
-            ? `${Math.round(ruleMetrics.cliffDropRatio * 100)}%`
-            : "不明显",
-      },
-      {
-        label: "高位均赞",
-        value: formatOpportunityMetric(ruleMetrics.highBandAvgLikes),
-      },
-      {
-        label: "中位赞",
-        value: formatOpportunityMetric(ruleMetrics.medianLikes),
-      },
-    ],
-    subtopics: Array.isArray(result.coreWinningSubtopics)
-      ? result.coreWinningSubtopics.filter(Boolean).map((item) => String(item))
-      : [],
-    directions: Array.isArray(result.hotTopicDirections)
-      ? result.hotTopicDirections.map((direction) => ({
-          name: String(direction?.name || "").trim(),
-          shareRatio: Math.round((Number(direction?.shareRatio) || 0) * 100),
-          sampleCount: Number(direction?.sampleCount) || 0,
-          whyItWorks: String(direction?.whyItWorks || "").trim(),
-          bandPresence: String(direction?.bandPresence || "all").trim(),
-        }))
-      : [],
-    angles: Array.isArray(result.recommendedAngles)
-      ? result.recommendedAngles.map((angle) => ({
-          title: String(angle?.title || "").trim(),
-          audiencePainPoint: String(angle?.audiencePainPoint || "").trim(),
-          formatSuggestion: String(angle?.formatSuggestion || "").trim(),
-          executionHint: String(angle?.executionHint || "").trim(),
-        }))
-      : [],
-    ts: Date.now(),
-  };
-}
-
-function handleShareKeywordOpportunityAsImage() {
-  const data = buildKeywordOpportunityShareData();
-  if (!data) {
-    showMessage("暂无判断赛道机会结果可分享", "warning");
-    return;
-  }
-  renderKeywordOpportunityCardToImage(data);
-}
-
 // ==================== 关键词裂变 ====================
 
 function escapeHtml(value) {
@@ -9221,2114 +5191,6 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
-}
-
-function getSelectedRecommendedKeywords(draft = getKeywordInsightState()) {
-  return Array.isArray(draft.selectedKeywords)
-    ? [...draft.selectedKeywords]
-    : [];
-}
-
-function invalidateKeywordInsightDraft(platform = "") {
-  keywordInsightRunToken += 1;
-  keywordAnalysisInFlight = false;
-  keywordAnalysisStartedAt = 0;
-  keywordInsightSampleInFlight = false;
-  const currentDraft = getBatchDraftForPlatform(platform);
-  updateKeywordInsightState(
-    {
-      ...createEmptyKeywordInsightState(),
-      analysisVersion: (currentDraft.analysisVersion || 0) + 1,
-    },
-    platform,
-  );
-}
-
-function toggleExpandedKeywordsVisibility() {
-  expandedKeywordsPanelVisible = !expandedKeywordsPanelVisible;
-  renderExpandedKeywords();
-  if (expandedKeywordsPanelVisible) {
-    document
-      .getElementById("expandedKeywordsPanel")
-      ?.scrollIntoView({behavior: "smooth", block: "nearest"});
-  }
-}
-
-function renderExpandedKeywords() {
-  const panel = document.getElementById("expandedKeywordsPanel");
-  const countEl = document.getElementById("expandedKeywordsCount");
-  const textarea = document.getElementById("textareaExpandedKeywords");
-  const btnView = document.getElementById("btnViewExpandedKeywords");
-  const btnClear = document.getElementById("btnClearKeywordInsightResult");
-  const introEl = document.getElementById("keywordInsightIntro");
-  const btnHeaderRun = document.getElementById("btnExpandKeywords");
-  const btnIntroRun = document.getElementById("btnRunKeywordInsight");
-  const actionRowEl = document.getElementById("keywordInsightActionRow");
-
-  if (!panel) return;
-
-  const hasKeywords = expandedKeywordsBuffer.length > 0;
-  panel.hidden = !hasKeywords || !expandedKeywordsPanelVisible;
-  if (introEl) {
-    introEl.hidden = hasKeywords;
-  }
-
-  if (countEl) {
-    countEl.textContent = `扩展词: ${expandedKeywordsBuffer.length} 词`;
-  }
-
-  if (btnView) {
-    btnView.hidden = !hasKeywords;
-    btnView.textContent = expandedKeywordsPanelVisible
-      ? "收起扩展词"
-      : `查看全部扩展词 (${expandedKeywordsBuffer.length})`;
-  }
-  if (btnClear) {
-    btnClear.hidden = !hasKeywords;
-  }
-  if (btnHeaderRun) {
-    btnHeaderRun.hidden = !hasKeywords;
-  }
-  if (btnIntroRun) {
-    btnIntroRun.hidden = hasKeywords;
-  }
-  if (actionRowEl) {
-    actionRowEl.classList.toggle("is-result-mode", hasKeywords);
-  }
-
-  if (textarea) {
-    const nextValue = expandedKeywordsBuffer.join("\n");
-    if (textarea.value !== nextValue) {
-      textarea.value = nextValue;
-    }
-  }
-}
-
-function updateExpandedKeywordsSummary() {
-  renderExpandedKeywords();
-}
-
-function clearKeywordInsightResult({showFeedback = true} = {}) {
-  const hasAnything = expandedKeywordsBuffer.length > 0;
-  if (!hasAnything) {
-    return;
-  }
-
-  expandedKeywordsBuffer = [];
-  expandedKeywordsPanelVisible = false;
-  invalidateKeywordInsightDraft();
-  renderKeywordInsightState();
-  persistCurrentBatchDraft();
-  updateExpandKeywordsButtonState();
-  if (showFeedback) {
-    showMessage("已清空扩展词和分析结果", "success");
-  }
-}
-
-function renderInsightLoadingState() {
-  return `
-    <div class="keyword-insight-summary-card is-loading">
-      <div class="keyword-insight-summary-title">
-        <span class="keyword-insight-loading-spinner" aria-hidden="true"></span>
-        正在分析需求方向
-      </div>
-      <div class="keyword-insight-summary-meta">已扩展 ${expandedKeywordsBuffer.length} 个关键词，通常需要 1-2 分钟</div>
-    </div>
-  `;
-}
-
-function renderInsightSummaryCard(draft) {
-  const analysis = draft.analysisResult;
-  if (!analysis) {
-    return "";
-  }
-
-  const categoryCount = Array.isArray(analysis.categories)
-    ? analysis.categories.length
-    : 0;
-  const selectedKeywords = getSelectedRecommendedKeywords(draft);
-  return `
-    <div class="keyword-insight-summary-card">
-      <div class="keyword-insight-summary-header">
-        <div class="keyword-insight-summary-title">需求洞察</div>
-        <div class="keyword-insight-share-wrap">
-          <button type="button" class="keyword-insight-share-btn">
-            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/></svg>
-            去分享
-          </button>
-          <div class="keyword-insight-share-menu">
-            <div class="keyword-insight-share-menu-inner">
-              <button type="button" class="keyword-insight-share-menu-item" data-action="copy-insight">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                复制文本
-              </button>
-              <button type="button" class="keyword-insight-share-menu-item" data-action="share-as-image">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
-                分享图片
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="keyword-insight-summary-meta">共 ${expandedKeywordsBuffer.length} 词 · ${categoryCount} 个方向 · 已选 ${selectedKeywords.length}/10 个词采集</div>
-      <div class="keyword-insight-summary-text">${escapeHtml(analysis.summary || "")}</div>
-    </div>
-  `;
-}
-
-function renderInsightSampleBlock(sampleStatus, sampleResult) {
-  if (sampleStatus === "loading") {
-    return `<div class="keyword-insight-sample-hint">正在抓取该方向样本...</div>`;
-  }
-  if (sampleStatus === "error") {
-    return `<div class="keyword-insight-sample-hint is-error">${escapeHtml(sampleResult?.errorMessage || "样本获取失败，可重试分析后再次查看")}</div>`;
-  }
-  const samples = Array.isArray(sampleResult?.samples)
-    ? sampleResult.samples
-    : [];
-  if (samples.length === 0) {
-    return `<div class="keyword-insight-sample-hint">暂无样本</div>`;
-  }
-
-  const sourceLabel = sampleResult?.usedKeyword
-    ? `<div class="keyword-insight-sample-source">样本来自：${escapeHtml(sampleResult.usedKeyword)}</div>`
-    : "";
-  const itemsHtml = samples
-    .map((sample) => {
-      const title = escapeHtml(sample?.title || "未命名样本");
-      const author = escapeHtml(sample?.author || "未知作者");
-      const likes = Number(sample?.likes) || 0;
-      const titleHtml = sample?.url
-        ? `<a href="${escapeHtml(sample.url)}" target="_blank" style="color: inherit; text-decoration: underline;">${title}</a>`
-        : `<span class="sample-title">${title}</span>`;
-      return `<li>${titleHtml}<span class="sample-meta">${author} · ❤️ ${likes}</span></li>`;
-    })
-    .join("");
-  return `${sourceLabel}<ul class="keyword-insight-sample-list">${itemsHtml}</ul>`;
-}
-
-function renderInsightCategories(draft) {
-  const analysis = draft.analysisResult;
-  const categories = Array.isArray(analysis?.categories)
-    ? analysis.categories
-    : [];
-  const selectedKeywordSet = new Set(draft.selectedKeywords || []);
-
-  if (categories.length === 0) {
-    return "";
-  }
-
-  const totalKeywords = expandedKeywordsBuffer.length || 1;
-
-  return categories
-    .map((category) => {
-      const categoryId = String(category?.id || "").trim();
-      const isExpanded = expandedKeywordInsightCategoryIds.has(categoryId);
-      const sampleStatus =
-        draft.sampleStatusByCategoryId?.[categoryId] || "idle";
-      const sampleResult =
-        draft.sampleResultsByCategoryId?.[categoryId] || null;
-      const keywordList = Array.isArray(category?.keywords)
-        ? category.keywords
-        : [];
-      const pct = Math.round((keywordList.length / totalKeywords) * 100);
-
-      return `
-        <article class="keyword-insight-category-card">
-          <div class="keyword-insight-category-head">
-            <span class="keyword-insight-category-title">${escapeHtml(category?.icon || "📌")} ${escapeHtml(category?.name || "未命名方向")}</span>
-            <button type="button" class="btn-text" data-action="toggle-expand-category" data-category-id="${escapeHtml(categoryId)}">
-              ${isExpanded ? "收起" : "展开"}
-            </button>
-          </div>
-          <div class="keyword-insight-category-meta">
-            <span>${keywordList.length} 词</span>
-            <span class="keyword-density-pct">${pct}%</span>
-            <span class="keyword-density-bar-wrap"><span class="keyword-density-bar-fill" style="width:${Math.min(pct, 100)}%"></span></span>
-          </div>
-          <div class="keyword-insight-category-insight">${escapeHtml(category?.insight || "")}</div>
-          <div class="keyword-insight-category-samples">
-            ${renderInsightSampleBlock(sampleStatus, sampleResult)}
-          </div>
-          ${
-            isExpanded
-              ? `<div class="keyword-insight-keywords">${keywordList
-                  .map((keyword) => {
-                    return `<span class="keyword-chip" data-action="toggle-keyword" data-keyword="${escapeHtml(keyword)}" title="点击复制">${escapeHtml(keyword)}</span>`;
-                  })
-                  .join("")}</div>`
-              : ""
-          }
-        </article>
-      `;
-    })
-    .join("");
-}
-
-function renderKeywordInsightState() {
-  const draft = getKeywordInsightState();
-  const insightContainer = document.getElementById("keywordInsightContainer");
-  const summaryEl = document.getElementById("keywordInsightSummary");
-  const categoriesEl = document.getElementById("keywordInsightCategories");
-  const errorEl = document.getElementById("keywordInsightError");
-  const errorMessageEl = document.getElementById("keywordInsightErrorMessage");
-  const btnRetry = document.getElementById("btnRetryKeywordAnalysis");
-  const btnCapture = document.getElementById("btnInsightBatchCapture");
-  const introEl = document.getElementById("keywordInsightIntro");
-
-  renderExpandedKeywords();
-
-  if (
-    !insightContainer ||
-    !summaryEl ||
-    !categoriesEl ||
-    !errorEl
-  ) {
-    return;
-  }
-
-  const hasKeywords = expandedKeywordsBuffer.length > 0;
-  const analysisStatus = draft.analysisStatus || "idle";
-  insightContainer.hidden = !hasKeywords;
-  if (introEl) {
-    introEl.hidden = hasKeywords;
-  }
-
-  if (!hasKeywords) {
-    summaryEl.innerHTML = "";
-    categoriesEl.innerHTML = "";
-    errorEl.hidden = true;
-    return;
-  }
-
-  if (analysisStatus === "loading") {
-    summaryEl.innerHTML = renderInsightLoadingState();
-    categoriesEl.innerHTML = "";
-    errorEl.hidden = true;
-    if (btnRetry) {
-      btnRetry.disabled = true;
-    }
-    return;
-  }
-
-  if (analysisStatus === "error") {
-    summaryEl.innerHTML = "";
-    categoriesEl.innerHTML = "";
-    errorEl.hidden = false;
-    if (errorMessageEl) {
-      errorMessageEl.textContent =
-        draft.analysisErrorMessage ||
-        "当前智能分析暂时不可用，已保留扩展词，可稍后重试或先查看扩展词。";
-    }
-    if (btnRetry) {
-      btnRetry.disabled =
-        keywordAnalysisInFlight && !isKeywordAnalysisLockStale();
-    }
-    return;
-  }
-
-  if (analysisStatus === "success" && draft.analysisResult) {
-    summaryEl.innerHTML = renderInsightSummaryCard(draft);
-    categoriesEl.innerHTML = renderInsightCategories(draft);
-    errorEl.hidden = true;
-    return;
-  }
-
-  summaryEl.innerHTML = "";
-  categoriesEl.innerHTML = "";
-  errorEl.hidden = true;
-  btnCapture.hidden = true;
-}
-
-function isKeywordAnalysisLockStale() {
-  if (!keywordAnalysisInFlight || keywordAnalysisStartedAt <= 0) {
-    return false;
-  }
-  return Date.now() - keywordAnalysisStartedAt > KEYWORD_ANALYSIS_STALE_LOCK_MS;
-}
-
-function releaseKeywordAnalysisLock() {
-  keywordAnalysisInFlight = false;
-  keywordAnalysisStartedAt = 0;
-}
-
-function updateCategorySampleResult(categoryId, result) {
-  const draft = getKeywordInsightState();
-  updateKeywordInsightState({
-    sampleStatusByCategoryId: {
-      ...draft.sampleStatusByCategoryId,
-      [categoryId]: result?.status === "success" ? "success" : "error",
-    },
-    sampleResultsByCategoryId: {
-      ...draft.sampleResultsByCategoryId,
-      [categoryId]: result,
-    },
-  });
-  renderKeywordInsightState();
-  persistCurrentBatchDraft();
-}
-
-async function runKeywordInsightSampling({
-  analysisResult,
-  baseSearchUrl,
-  runToken,
-}) {
-  const categories = Array.isArray(analysisResult?.categories)
-    ? analysisResult.categories
-    : [];
-  if (categories.length === 0) {
-    return;
-  }
-
-  keywordInsightSampleInFlight = true;
-  const sampleStatusByCategoryId = {};
-  categories.forEach((category) => {
-    sampleStatusByCategoryId[category.id] = "loading";
-  });
-  updateKeywordInsightState({
-    sampleStatusByCategoryId,
-    sampleResultsByCategoryId: {},
-  });
-  renderKeywordInsightState();
-  persistCurrentBatchDraft();
-
-  try {
-    const runtime = getCurrentRuntime();
-    const pagePlatform = getPagePlatform(runtime);
-    await lightSampleByKeywords({
-      categorySamples: categories.map((category) => {
-        const candidates =
-          Array.isArray(category.sampleCandidateKeywords) &&
-          category.sampleCandidateKeywords.length > 0
-            ? category.sampleCandidateKeywords
-            : Array.isArray(category.keywords) && category.keywords.length > 0
-              ? [category.keywords[0]]
-              : [];
-        return {
-          categoryId: category.id,
-          candidateKeywords: candidates,
-        };
-      }),
-      platform: pagePlatform,
-      baseSearchUrl,
-      onProgress: (progress) => {
-        if (runToken !== keywordInsightRunToken) {
-          return;
-        }
-        if (progress?.phase === "category_done" && progress?.result) {
-          updateCategorySampleResult(progress.categoryId, progress.result);
-        }
-      },
-      shouldStop: () => runToken !== keywordInsightRunToken,
-    });
-  } catch (error) {
-    console.warn("[Sidebar] Keyword insight sampling failed:", error);
-  } finally {
-    if (runToken === keywordInsightRunToken) {
-      keywordInsightSampleInFlight = false;
-      renderKeywordInsightState();
-    }
-  }
-}
-
-async function startKeywordAnalysis({force = false} = {}) {
-  if (keywordAnalysisInFlight) {
-    if (force && isKeywordAnalysisLockStale()) {
-      console.warn(
-        "[Sidebar] Keyword analysis lock stale, force releasing lock",
-      );
-      releaseKeywordAnalysisLock();
-      renderKeywordInsightState();
-    } else {
-      return;
-    }
-  }
-
-  const seedKeyword = getKeywordInsightSeedKeyword({preferStored: true});
-  if (!seedKeyword) {
-    if (force) {
-      showMessage(
-        "未检测到页面回填关键词，请先进入搜索结果页后再重试",
-        "warning",
-      );
-    }
-    return;
-  }
-  if (expandedKeywordsBuffer.length === 0) {
-    if (force) {
-      showMessage("未检测到扩展词，请先扩词后再重试", "warning");
-    }
-    return;
-  }
-  if (
-    !ensureAuthVerifiedOrWarn({
-      message: getKeywordInsightAuthRequiredMessage(),
-    })
-  ) {
-    return;
-  }
-
-  const draft = getKeywordInsightState();
-  if (!force && draft.analysisStatus === "success" && draft.analysisResult) {
-    renderKeywordInsightState();
-    return;
-  }
-
-  keywordAnalysisInFlight = true;
-  keywordAnalysisStartedAt = Date.now();
-  keywordInsightRunToken += 1;
-  const runToken = keywordInsightRunToken;
-
-  updateKeywordInsightState({
-    analysisVersion: (draft.analysisVersion || 0) + 1,
-    analysisStatus: "loading",
-    analysisErrorMessage: "",
-    analysisResult: null,
-    selectedCategoryIds: [],
-    sampleStatusByCategoryId: {},
-    sampleResultsByCategoryId: {},
-  });
-  renderKeywordInsightState();
-  persistCurrentBatchDraft();
-
-  try {
-    const runtime = getCurrentRuntime();
-    const pagePlatform = getPagePlatform(runtime);
-    let baseSearchUrl = runtime?.lastPageUrl || "";
-    try {
-      const [tab] = await chrome.tabs.query({
-        active: true,
-        currentWindow: true,
-      });
-      if (tab?.url) {
-        baseSearchUrl = tab.url;
-      }
-    } catch {
-      // ignore
-    }
-
-    const analysisKeywords = dedupeKeywords(
-      expandedKeywordsBuffer
-        .map((item) => String(item || "").trim())
-        .filter(Boolean),
-    );
-    const dedupedCount =
-      expandedKeywordsBuffer.length - analysisKeywords.length;
-    if (dedupedCount > 0) {
-      showMessage(
-        `分析前已去重 ${dedupedCount} 个重复词，实际分析 ${analysisKeywords.length} 个词`,
-        "warning",
-      );
-    }
-
-    const response = await analyzeKeywords({
-      seedKeyword,
-      keywords: analysisKeywords,
-      platform: pagePlatform,
-    });
-    if (!response?.ok || !response?.data) {
-      const requestError = new Error(
-        response?.error?.message || response?.message || "智能分析暂时不可用",
-      );
-      requestError.reason =
-        response?.error?.reason || response?.reason || "server_error";
-      requestError.data = response?.error?.data || response?.data || null;
-      throw requestError;
-    }
-    if (runToken !== keywordInsightRunToken) {
-      return;
-    }
-
-    const analysisResult = response.data;
-
-    updateKeywordInsightState({
-      analysisStatus: "success",
-      analysisErrorMessage: "",
-      analysisResult,
-      selectedCategoryIds: [],
-      selectedKeywords: [],
-      sampleStatusByCategoryId: {},
-      sampleResultsByCategoryId: {},
-    });
-    renderKeywordInsightState();
-    persistCurrentBatchDraft();
-
-    if (runToken === keywordInsightRunToken) {
-      await runKeywordInsightSampling({
-        analysisResult,
-        baseSearchUrl,
-        runToken,
-      });
-    }
-  } catch (error) {
-    if (runToken !== keywordInsightRunToken) {
-      return;
-    }
-    const errorReason = String(error?.reason || "")
-      .trim()
-      .toLowerCase();
-    if (errorReason === "insufficient_balance") {
-      const requiredCredits = Number(error?.data?.requiredCredits);
-      const requiredCreditsLabel =
-        Number.isInteger(requiredCredits) && requiredCredits > 0
-          ? requiredCredits
-          : KEYWORD_INSIGHT_ANALYSIS_COST_CREDITS;
-      updateKeywordInsightState({
-        analysisStatus: "idle",
-        analysisErrorMessage: "",
-        analysisResult: null,
-        selectedCategoryIds: [],
-        selectedKeywords: [],
-        sampleStatusByCategoryId: {},
-        sampleResultsByCategoryId: {},
-      });
-      renderKeywordInsightState();
-      persistCurrentBatchDraft();
-      showMessage(
-        `配额不足：不影响采集扩展词，但智能分析需 ${requiredCreditsLabel} 配额。获取更多配额后可继续完整分析。`,
-        "warning",
-      );
-      void refreshVerifiedAuthSnapshot();
-      return;
-    }
-    const formattedError = formatKeywordStrategyAccessError(
-      error,
-      getKeywordInsightAuthRequiredMessage(),
-    );
-    const rawErrorMessage =
-      formattedError.message || "智能分析暂时不可用，已保留扩展词，可稍后重试";
-    const isTimeoutError =
-      formattedError.kind === "generic" &&
-      /timeout/i.test(String(rawErrorMessage));
-    const displayMessage = isTimeoutError
-      ? "请求超时（模型响应较慢或服务繁忙），可稍后重试"
-      : rawErrorMessage;
-    updateKeywordInsightState({
-      analysisStatus: "error",
-      analysisErrorMessage: displayMessage,
-      analysisResult: null,
-      selectedCategoryIds: [],
-      sampleStatusByCategoryId: {},
-      sampleResultsByCategoryId: {},
-    });
-    renderKeywordInsightState();
-    persistCurrentBatchDraft();
-    showMessage(`智能分析不可用：${displayMessage}`, "warning");
-  } finally {
-    if (runToken === keywordInsightRunToken) {
-      releaseKeywordAnalysisLock();
-      renderKeywordInsightState();
-    }
-  }
-}
-
-async function retryKeywordAnalysis() {
-  if (keywordAnalysisInFlight && !isKeywordAnalysisLockStale()) {
-    showMessage("智能分析进行中，请稍候", "warning");
-    return;
-  }
-  if (keywordAnalysisInFlight && isKeywordAnalysisLockStale()) {
-    releaseKeywordAnalysisLock();
-  }
-  await startKeywordAnalysis({force: true});
-}
-
-function handleKeywordInsightSummaryActions(event) {
-  const target = event.target;
-  if (!(target instanceof HTMLElement)) return;
-
-  const actionEl = target.closest("[data-action]");
-  const action = actionEl?.dataset?.action || "";
-
-  if (action === "copy-insight") {
-    handleCopyInsight(actionEl);
-    return;
-  }
-  if (action === "share-as-image") {
-    handleShareAsImage();
-    return;
-  }
-}
-
-function handleCopyInsight(btn) {
-  const draft = getKeywordInsightState();
-  const analysis = draft.analysisResult;
-  if (!analysis || !btn) return;
-
-  const lines = [];
-  const summary = String(analysis.summary || "").trim();
-  if (summary) {
-    lines.push("【需求洞察】");
-    lines.push(summary);
-  }
-  const categories = Array.isArray(analysis.categories)
-    ? analysis.categories
-    : [];
-  for (const category of categories) {
-    const name = String(category?.name || "").trim();
-    const icon = String(category?.icon || "").trim();
-    const insight = String(category?.insight || "").trim();
-    const keywords = Array.isArray(category?.keywords) ? category.keywords : [];
-    lines.push("");
-    lines.push(`${icon} ${name}`.trim());
-    if (insight) lines.push(insight);
-    if (keywords.length > 0) lines.push(keywords.join("、"));
-  }
-
-  const text = lines.join("\n").trim();
-  if (!text) return;
-
-  navigator.clipboard
-    .writeText(text)
-    .then(() => {
-      const original = btn.innerHTML;
-      btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> 已复制`;
-      setTimeout(() => {
-        btn.innerHTML = original;
-      }, 1500);
-    })
-    .catch(() => {});
-}
-
-function buildInsightShareData() {
-  const draft = getKeywordInsightState();
-  const batchDraft = getBatchDraftForPlatform();
-  const analysis = draft.analysisResult;
-  if (!analysis) return null;
-  const categories = Array.isArray(analysis.categories)
-    ? analysis.categories
-    : [];
-  return {
-    seedKeyword: batchDraft.seedKeyword || "",
-    totalKeywords: expandedKeywordsBuffer.length,
-    summary: analysis.summary || "",
-    categories: categories.map((cat) => {
-      const result = {
-        id: cat.id || "",
-        icon: cat.icon || "",
-        name: cat.name || "",
-        insight: cat.insight || "",
-        keywords: Array.isArray(cat.keywords) ? cat.keywords : [],
-      };
-      const sampleResult = draft.sampleResultsByCategoryId?.[cat.id];
-      if (sampleResult?.samples?.length) {
-        result.sampleKeyword = sampleResult.usedKeyword || "";
-        result.samples = sampleResult.samples.map((s) => ({
-          title: s.title || "",
-          author: s.author || "",
-          likes: s.likes || 0,
-        }));
-      }
-      return result;
-    }),
-    ts: Date.now(),
-  };
-}
-
-function handleShareAsImage() {
-  const data = buildInsightShareData();
-  if (!data) {
-    showMessage("暂无洞察结果可分享", "warning");
-    return;
-  }
-
-  renderInsightCardToImage(data);
-}
-
-function renderInsightCardToImage(data) {
-  const dpr = window.devicePixelRatio || 2;
-  const W = 640;
-  const PAD = 32;
-  const CONTENT_W = W - PAD * 2;
-
-  const catColors = [
-    {
-      accent: "#4F8BF5",
-      light: "#eef3ff",
-      chip: "#dbeafe",
-      chipText: "#2563eb",
-      bar: ["#4F8BF5", "#93bbfd"],
-    },
-    {
-      accent: "#8B5CF6",
-      light: "#f0eeff",
-      chip: "#ede9fe",
-      chipText: "#6d28d9",
-      bar: ["#8B5CF6", "#c4b5fd"],
-    },
-    {
-      accent: "#EC4899",
-      light: "#fdf2f8",
-      chip: "#fce7f3",
-      chipText: "#be185d",
-      bar: ["#EC4899", "#f9a8d4"],
-    },
-    {
-      accent: "#F97316",
-      light: "#fff7ed",
-      chip: "#ffedd5",
-      chipText: "#c2410c",
-      bar: ["#F97316", "#fdba74"],
-    },
-  ];
-
-  const logoImg = new Image();
-  logoImg.src = chrome.runtime.getURL("images/icon128.png");
-
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-
-  ctx.textBaseline = "top";
-
-  function measureLines(text, fontSize, maxWidth) {
-    ctx.font = `${fontSize}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
-    const words = text.split("");
-    const lines = [];
-    let currentLine = "";
-    for (const char of words) {
-      const test = currentLine + char;
-      if (ctx.measureText(test).width > maxWidth && currentLine) {
-        lines.push(currentLine);
-        currentLine = char;
-      } else {
-        currentLine = test;
-      }
-    }
-    if (currentLine) lines.push(currentLine);
-    return lines;
-  }
-
-  function preCalcHeight() {
-    let h = 0;
-    h += 100;
-    const summaryLines = measureLines(data.summary || "", 14, CONTENT_W);
-    h += 30 + summaryLines.length * 22 + 20;
-    h += 24;
-    for (const cat of data.categories) {
-      h += 44;
-      const insightLines = measureLines(cat.insight || "", 13, CONTENT_W - 24);
-      h += insightLines.length * 20 + 8;
-      const keywords = cat.keywords || [];
-      if (keywords.length > 0) {
-        let rowW = 0;
-        let rows = 1;
-        ctx.font = `12px -apple-system, "PingFang SC", sans-serif`;
-        for (const kw of keywords) {
-          const chipW = ctx.measureText(kw).width + 22;
-          if (rowW + chipW + 6 > CONTENT_W - 24 && rowW > 0) {
-            rows++;
-            rowW = chipW + 6;
-          } else {
-            rowW += chipW + 6;
-          }
-        }
-        h += rows * 28 + 10;
-      }
-      h += 16;
-    }
-    h += 36;
-    return h;
-  }
-
-  function drawCard() {
-    const H = preCalcHeight();
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.textBaseline = "top";
-
-    const gradient = ctx.createLinearGradient(0, 0, W, H);
-    gradient.addColorStop(0, "#f8f6ff");
-    gradient.addColorStop(0.4, "#fdf2f8");
-    gradient.addColorStop(0.7, "#eef3ff");
-    gradient.addColorStop(1, "#fff7ed");
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, W, H);
-
-    ctx.fillStyle = "#ffffff";
-    roundRect(ctx, 16, 16, W - 32, H - 32, 16);
-    ctx.fill();
-    ctx.save();
-    ctx.shadowColor = "rgba(99,102,241,0.08)";
-    ctx.shadowBlur = 24;
-    ctx.restore();
-
-    let y = 16;
-
-    const headerH = 88;
-    const hGrad = ctx.createLinearGradient(16, y, W - 16, y);
-    hGrad.addColorStop(0, "#4F8BF5");
-    hGrad.addColorStop(0.4, "#8B5CF6");
-    hGrad.addColorStop(0.75, "#EC4899");
-    hGrad.addColorStop(1, "#F43F5E");
-    ctx.fillStyle = hGrad;
-    roundRectTop(ctx, 16, y, W - 32, headerH, 16);
-    ctx.fill();
-
-    ctx.fillStyle = "rgba(255,255,255,0.2)";
-    const seedText = `🔍 ${data.seedKeyword}`;
-    ctx.font = `500 14px -apple-system, "PingFang SC", sans-serif`;
-    const seedW = ctx.measureText(seedText).width + 24;
-    roundRect(ctx, PAD, y + 16, seedW, 28, 14);
-    ctx.fill();
-    ctx.fillStyle = "#ffffff";
-    ctx.fillText(seedText, PAD + 12, y + 22);
-
-    ctx.fillStyle = "#ffffff";
-    ctx.font = `bold 20px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText("关键词需求洞察", PAD, y + 56);
-
-    const totalKw = data.categories.reduce(
-      (s, c) => s + (c.keywords?.length || 0),
-      0,
-    );
-    ctx.fillStyle = "rgba(255,255,255,0.85)";
-    ctx.font = `500 12px -apple-system, "PingFang SC", sans-serif`;
-    const statsText = `${totalKw} 个关联词 · ${data.categories.length} 个需求方向`;
-    const statsW = ctx.measureText(statsText).width;
-    ctx.fillText(statsText, W - PAD - 16 - statsW, y + 60);
-
-    y += headerH + 20;
-
-    ctx.fillStyle = "#8B5CF6";
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText("洞察摘要", PAD, y);
-    y += 20;
-
-    ctx.fillStyle = "#374151";
-    ctx.font = `14px -apple-system, "PingFang SC", sans-serif`;
-    const summaryLines = measureLines(data.summary || "", 14, CONTENT_W);
-    for (const line of summaryLines) {
-      ctx.fillText(line, PAD, y);
-      y += 22;
-    }
-    y += 16;
-
-    ctx.fillStyle = "#EC4899";
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText("需求方向", PAD, y);
-    y += 24;
-
-    for (let ci = 0; ci < data.categories.length; ci++) {
-      const cat = data.categories[ci];
-      const cc = catColors[ci % catColors.length];
-      const keywords = cat.keywords || [];
-      const pct =
-        totalKw > 0 ? Math.round((keywords.length / totalKw) * 100) : 0;
-
-      ctx.fillStyle = "#1a1a2e";
-      ctx.font = `600 14px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText(`${cat.icon || "📌"} ${cat.name}`, PAD + 4, y);
-
-      ctx.fillStyle = cc.accent;
-      ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-      const pctText = `${keywords.length} 词 · ${pct}%`;
-      const pctW = ctx.measureText(pctText).width;
-      ctx.fillText(pctText, W - PAD - 16 - pctW, y + 2);
-      y += 22;
-
-      ctx.fillStyle = "#f3f4f6";
-      roundRect(ctx, PAD + 4, y, CONTENT_W - 8, 4, 2);
-      ctx.fill();
-      const barGrad = ctx.createLinearGradient(
-        PAD + 4,
-        y,
-        PAD + 4 + (CONTENT_W - 8),
-        y,
-      );
-      barGrad.addColorStop(0, cc.bar[0]);
-      barGrad.addColorStop(1, cc.bar[1]);
-      ctx.fillStyle = barGrad;
-      roundRect(
-        ctx,
-        PAD + 4,
-        y,
-        Math.max(((CONTENT_W - 8) * pct) / 100, 2),
-        4,
-        2,
-      );
-      ctx.fill();
-      y += 12;
-
-      if (cat.insight) {
-        ctx.fillStyle = "#6b7280";
-        ctx.font = `13px -apple-system, "PingFang SC", sans-serif`;
-        const insightLines = measureLines(cat.insight, 13, CONTENT_W - 24);
-        for (const line of insightLines) {
-          ctx.fillText(line, PAD + 12, y);
-          y += 20;
-        }
-        y += 4;
-      }
-
-      if (keywords.length > 0) {
-        let rowX = PAD + 12;
-        ctx.font = `12px -apple-system, "PingFang SC", sans-serif`;
-        for (const kw of keywords) {
-          const chipW = ctx.measureText(kw).width + 22;
-          if (rowX + chipW > W - PAD - 12 && rowX > PAD + 12) {
-            rowX = PAD + 12;
-            y += 28;
-          }
-          ctx.fillStyle = cc.chip;
-          roundRect(ctx, rowX, y, chipW, 24, 12);
-          ctx.fill();
-          ctx.fillStyle = cc.chipText;
-          ctx.fillText(kw, rowX + 11, y + 6);
-          rowX += chipW + 6;
-        }
-        y += 34;
-      }
-
-      y += 8;
-    }
-
-    y += 8;
-    ctx.fillStyle = "#e5e7eb";
-    ctx.fillRect(PAD, y, CONTENT_W, 0.5);
-    y += 36;
-
-    const logoSize = 16;
-    const gap = 6;
-    const brandText = "StarVoice 星语";
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    const brandTW = ctx.measureText(brandText).width;
-    const urlText = "https://voice.minilife.online";
-    ctx.font = `500 10px -apple-system, "PingFang SC", sans-serif`;
-    const urlTW = ctx.measureText(urlText).width;
-    const pillPadX = 8;
-    const pillPadY = 3;
-    const pillW = urlTW + pillPadX * 2;
-    const pillH = 16;
-    const urlGap = 10;
-    const line1W = logoSize + gap + brandTW + urlGap + pillW;
-    const line1X = (W - line1W) / 2;
-
-    ctx.globalAlpha = 0.8;
-    if (logoImg.complete && logoImg.naturalWidth > 0) {
-      ctx.save();
-      roundRect(ctx, line1X, y - 1, logoSize, logoSize, 3);
-      ctx.clip();
-      ctx.drawImage(logoImg, line1X, y - 1, logoSize, logoSize);
-      ctx.restore();
-    }
-
-    ctx.fillStyle = "#9ca3af";
-    ctx.font = `500 11px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText(brandText, line1X + logoSize + gap, y);
-
-    const pillX = line1X + logoSize + gap + brandTW + urlGap;
-    const pillY = y - 1;
-    ctx.fillStyle = "#f5f3ff";
-    roundRect(ctx, pillX, pillY, pillW, pillH, 8);
-    ctx.fill();
-    ctx.fillStyle = "#a78bfa";
-    ctx.font = `400 10px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText(urlText, pillX + pillPadX, pillY + pillPadY);
-
-    y += 20;
-    const features =
-      "账号监控｜低粉爆款筛选｜搜索词洞察｜数据采集｜评论分析｜客资线索";
-    ctx.fillStyle = "#c0c0c0";
-    ctx.font = `400 9px -apple-system, "PingFang SC", sans-serif`;
-    ctx.globalAlpha = 1.0;
-    const featW = ctx.measureText(features).width;
-    ctx.fillText(features, (W - featW) / 2, y);
-
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        showMessage("图片生成失败", "error");
-        return;
-      }
-      showInsightImagePreview(blob, data.seedKeyword || "share");
-    }, "image/png");
-  }
-
-  if (logoImg.complete) {
-    drawCard();
-  } else {
-    logoImg.onload = drawCard;
-    logoImg.onerror = drawCard;
-  }
-}
-
-function renderKeywordOpportunityCardToImage(data) {
-  const dpr = window.devicePixelRatio || 2;
-  const W = 640;
-  const PAD = 32;
-  const CONTENT_W = W - PAD * 2;
-  const logoImg = new Image();
-  logoImg.src = chrome.runtime.getURL("images/icon128.png");
-
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-
-  ctx.textBaseline = "top";
-
-  function measureLines(text, fontSize, maxWidth) {
-    ctx.font = `${fontSize}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
-    const chars = String(text || "").split("");
-    const lines = [];
-    let currentLine = "";
-    for (const char of chars) {
-      const test = currentLine + char;
-      if (ctx.measureText(test).width > maxWidth && currentLine) {
-        lines.push(currentLine);
-        currentLine = char;
-      } else {
-        currentLine = test;
-      }
-    }
-    if (currentLine) {
-      lines.push(currentLine);
-    }
-    return lines;
-  }
-
-  function calcChipRows(items, maxWidth, baseX, gap = 6) {
-    if (!Array.isArray(items) || items.length === 0) {
-      return 0;
-    }
-    let rows = 1;
-    let rowX = baseX;
-    ctx.font = `12px -apple-system, "PingFang SC", sans-serif`;
-    for (const item of items) {
-      const text = String(item || "").trim();
-      if (!text) continue;
-      const chipW = ctx.measureText(text).width + 22;
-      if (rowX + chipW > W - PAD - 12 && rowX > baseX) {
-        rows += 1;
-        rowX = baseX + chipW + gap;
-      } else {
-        rowX += chipW + gap;
-      }
-    }
-    return rows;
-  }
-
-  function preCalcHeight() {
-    let h = 0;
-    h += 122;
-    const distributionLines = measureLines(
-      data.distributionSummary || "",
-      14,
-      CONTENT_W,
-    );
-    h += distributionLines.length * 22 + 30;
-    h += Math.ceil((data.metrics.length || 0) / 2) * 82 + 22;
-    h += 28;
-    const subtopicRows = calcChipRows(data.subtopics || [], CONTENT_W, PAD);
-    h += Math.max(subtopicRows, 1) * 30 + 24;
-    h += 24;
-    if (Array.isArray(data.directions) && data.directions.length > 0) {
-      for (const direction of data.directions || []) {
-        h += 52;
-        const whyLines = measureLines(
-          direction.whyItWorks || "",
-          13,
-          CONTENT_W - 24,
-        );
-        h += whyLines.length * 20 + 14;
-      }
-    } else {
-      h += 34;
-    }
-    h += 24;
-    if (Array.isArray(data.angles) && data.angles.length > 0) {
-      for (const angle of data.angles || []) {
-        const body = [
-          directionSafeText(angle.audiencePainPoint),
-          angle.formatSuggestion
-            ? `形式建议：${directionSafeText(angle.formatSuggestion)}`
-            : "",
-          angle.executionHint
-            ? `执行提示：${directionSafeText(angle.executionHint)}`
-            : "",
-        ]
-          .filter(Boolean)
-          .join(" · ");
-        const titleLines = measureLines(angle.title || "", 14, CONTENT_W - 24);
-        const bodyLines = measureLines(body, 13, CONTENT_W - 24);
-        h += 34 + titleLines.length * 20 + bodyLines.length * 19 + 18;
-      }
-    } else {
-      h += 34;
-    }
-    h += 68;
-    return h;
-  }
-
-  function directionSafeText(value) {
-    return String(value || "").trim();
-  }
-
-  function drawCard() {
-    const H = preCalcHeight();
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.textBaseline = "top";
-
-    const bg = ctx.createLinearGradient(0, 0, W, H);
-    bg.addColorStop(0, "#fff8ef");
-    bg.addColorStop(0.4, "#fffdf7");
-    bg.addColorStop(0.75, "#f4f7ff");
-    bg.addColorStop(1, "#eef9ff");
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, W, H);
-
-    ctx.fillStyle = "#ffffff";
-    roundRect(ctx, 16, 16, W - 32, H - 32, 18);
-    ctx.fill();
-
-    let y = 16;
-    const headerH = 104;
-    const headerGrad = ctx.createLinearGradient(16, y, W - 16, y);
-    headerGrad.addColorStop(0, "#F97316");
-    headerGrad.addColorStop(0.55, "#F59E0B");
-    headerGrad.addColorStop(1, "#FB7185");
-    ctx.fillStyle = headerGrad;
-    roundRectTop(ctx, 16, y, W - 32, headerH, 18);
-    ctx.fill();
-
-    ctx.fillStyle = "rgba(255,255,255,0.22)";
-    ctx.font = `500 14px -apple-system, "PingFang SC", sans-serif`;
-    const keywordText = `主词 ${data.keyword || "未命名"}`;
-    const keywordW = ctx.measureText(keywordText).width + 24;
-    roundRect(ctx, PAD, y + 18, keywordW, 28, 14);
-    ctx.fill();
-    ctx.fillStyle = "#ffffff";
-    ctx.fillText(keywordText, PAD + 12, y + 24);
-
-    ctx.font = `bold 22px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText("判断赛道机会", PAD, y + 58);
-
-    y += headerH + 24;
-
-    if (data.distributionSummary) {
-      ctx.fillStyle = "#6b7280";
-      ctx.font = `14px -apple-system, "PingFang SC", sans-serif`;
-      const summaryLines = measureLines(
-        data.distributionSummary,
-        14,
-        CONTENT_W,
-      );
-      for (const line of summaryLines) {
-        ctx.fillText(line, PAD, y);
-        y += 22;
-      }
-      y += 16;
-    }
-
-    const metricCols = 2;
-    const metricGap = 12;
-    const metricW = (CONTENT_W - metricGap) / metricCols;
-    const metricH = 70;
-    (data.metrics || []).forEach((metric, index) => {
-      const col = index % metricCols;
-      const row = Math.floor(index / metricCols);
-      const x = PAD + col * (metricW + metricGap);
-      const my = y + row * (metricH + 12);
-      ctx.fillStyle = "#fff7ed";
-      roundRect(ctx, x, my, metricW, metricH, 16);
-      ctx.fill();
-      ctx.fillStyle = "#9a3412";
-      ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText(metric.label || "", x + 16, my + 14);
-      ctx.fillStyle = "#111827";
-      ctx.font = `bold 18px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText(metric.value || "-", x + 16, my + 34);
-    });
-    y +=
-      Math.ceil((data.metrics.length || 0) / metricCols) * (metricH + 12) + 8;
-
-    ctx.fillStyle = "#f59e0b";
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText("核心爆款细分词", PAD, y);
-    y += 22;
-
-    if (Array.isArray(data.subtopics) && data.subtopics.length > 0) {
-      let rowX = PAD;
-      ctx.font = `12px -apple-system, "PingFang SC", sans-serif`;
-      for (const item of data.subtopics) {
-        const text = String(item || "").trim();
-        if (!text) continue;
-        const chipW = ctx.measureText(text).width + 22;
-        if (rowX + chipW > W - PAD && rowX > PAD) {
-          rowX = PAD;
-          y += 30;
-        }
-        ctx.fillStyle = "#ffedd5";
-        roundRect(ctx, rowX, y, chipW, 24, 12);
-        ctx.fill();
-        ctx.fillStyle = "#c2410c";
-        ctx.fillText(text, rowX + 11, y + 6);
-        rowX += chipW + 6;
-      }
-      y += 34;
-    } else {
-      ctx.fillStyle = "#9ca3af";
-      ctx.font = `13px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText("暂无明确细分切口", PAD, y);
-      y += 26;
-    }
-
-    ctx.fillStyle = "#ef4444";
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText("爆款主题方向", PAD, y);
-    y += 24;
-
-    if (Array.isArray(data.directions) && data.directions.length > 0) {
-      for (const direction of data.directions || []) {
-        ctx.fillStyle = "#fffaf5";
-        roundRect(ctx, PAD, y, CONTENT_W, 72, 16);
-        ctx.fill();
-        ctx.fillStyle = "#111827";
-        ctx.font = `600 14px -apple-system, "PingFang SC", sans-serif`;
-        ctx.fillText(direction.name || "未命名方向", PAD + 14, y + 14);
-        const metaText = `${direction.sampleCount || 0} 篇 · ${direction.shareRatio || 0}%`;
-        ctx.fillStyle = "#f97316";
-        ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-        const metaW = ctx.measureText(metaText).width;
-        ctx.fillText(metaText, PAD + CONTENT_W - 14 - metaW, y + 16);
-        const whyLines = measureLines(
-          direction.whyItWorks || "",
-          13,
-          CONTENT_W - 28,
-        );
-        ctx.fillStyle = "#6b7280";
-        ctx.font = `13px -apple-system, "PingFang SC", sans-serif`;
-        let innerY = y + 38;
-        for (const line of whyLines) {
-          ctx.fillText(line, PAD + 14, innerY);
-          innerY += 20;
-        }
-        y = Math.max(y + 72, innerY + 12);
-      }
-    } else {
-      ctx.fillStyle = "#9ca3af";
-      ctx.font = `13px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText("当前样本中还没有稳定聚合出足够清晰的主题方向", PAD, y);
-      y += 26;
-    }
-
-    y += 8;
-    ctx.fillStyle = "#6366f1";
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText("新号优先选题", PAD, y);
-    y += 24;
-
-    if (Array.isArray(data.angles) && data.angles.length > 0) {
-      for (const angle of data.angles || []) {
-        const body = [
-          directionSafeText(angle.audiencePainPoint),
-          angle.formatSuggestion
-            ? `形式建议：${directionSafeText(angle.formatSuggestion)}`
-            : "",
-          angle.executionHint
-            ? `执行提示：${directionSafeText(angle.executionHint)}`
-            : "",
-        ]
-          .filter(Boolean)
-          .join(" · ");
-        const titleLines = measureLines(angle.title || "", 14, CONTENT_W - 28);
-        const bodyLines = measureLines(body, 13, CONTENT_W - 28);
-        const cardH =
-          18 + titleLines.length * 20 + 8 + bodyLines.length * 19 + 16;
-        ctx.fillStyle = "#f5f3ff";
-        roundRect(ctx, PAD, y, CONTENT_W, cardH, 16);
-        ctx.fill();
-        ctx.fillStyle = "#312e81";
-        ctx.font = `600 14px -apple-system, "PingFang SC", sans-serif`;
-        let innerY = y + 14;
-        for (const line of titleLines) {
-          ctx.fillText(line, PAD + 14, innerY);
-          innerY += 20;
-        }
-        ctx.fillStyle = "#5b5f97";
-        ctx.font = `13px -apple-system, "PingFang SC", sans-serif`;
-        innerY += 4;
-        for (const line of bodyLines) {
-          ctx.fillText(line, PAD + 14, innerY);
-          innerY += 19;
-        }
-        y += cardH + 10;
-      }
-    } else {
-      ctx.fillStyle = "#9ca3af";
-      ctx.font = `13px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText("当前还没有生成可直接执行的主词选题", PAD, y);
-      y += 26;
-    }
-
-    y += 8;
-    ctx.fillStyle = "#e5e7eb";
-    ctx.fillRect(PAD, y, CONTENT_W, 0.5);
-    y += 18;
-
-    const brandText = "StarVoice 星语";
-    const urlText = "https://voice.minilife.online";
-    const logoSize = 16;
-    const gap = 6;
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    const brandW = ctx.measureText(brandText).width;
-    ctx.font = `500 10px -apple-system, "PingFang SC", sans-serif`;
-    const urlW = ctx.measureText(urlText).width;
-    const pillW = urlW + 16;
-    const lineW = logoSize + gap + brandW + 10 + pillW;
-    const startX = (W - lineW) / 2;
-
-    if (logoImg.complete && logoImg.naturalWidth > 0) {
-      ctx.save();
-      roundRect(ctx, startX, y - 1, logoSize, logoSize, 3);
-      ctx.clip();
-      ctx.drawImage(logoImg, startX, y - 1, logoSize, logoSize);
-      ctx.restore();
-    }
-    ctx.fillStyle = "#9ca3af";
-    ctx.font = `500 11px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText(brandText, startX + logoSize + gap, y);
-    const pillX = startX + logoSize + gap + brandW + 10;
-    ctx.fillStyle = "#eef2ff";
-    roundRect(ctx, pillX, y - 1, pillW, 16, 8);
-    ctx.fill();
-    ctx.fillStyle = "#818cf8";
-    ctx.font = `400 10px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText(urlText, pillX + 8, y + 2);
-
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        showMessage("图片生成失败", "error");
-        return;
-      }
-      showInsightImagePreview(blob, data.keyword || "opportunity");
-    }, "image/png");
-  }
-
-  if (logoImg.complete) {
-    drawCard();
-  } else {
-    logoImg.onload = drawCard;
-    logoImg.onerror = drawCard;
-  }
-}
-
-function renderBenchmarkDiscoveryCardToImage(data) {
-  const dpr = window.devicePixelRatio || 2;
-  const W = 640;
-  const PAD = 32;
-  const CONTENT_W = W - PAD * 2;
-  const logoImg = new Image();
-  logoImg.src = chrome.runtime.getURL("images/icon128.png");
-
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-
-  ctx.textBaseline = "top";
-
-  function measureLines(text, fontSize, maxWidth) {
-    ctx.font = `${fontSize}px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif`;
-    const chars = String(text || "").split("");
-    const lines = [];
-    let currentLine = "";
-    for (const char of chars) {
-      const test = currentLine + char;
-      if (ctx.measureText(test).width > maxWidth && currentLine) {
-        lines.push(currentLine);
-        currentLine = char;
-      } else {
-        currentLine = test;
-      }
-    }
-    if (currentLine) {
-      lines.push(currentLine);
-    }
-    return lines;
-  }
-
-  function measureChipRows(tags, maxWidth) {
-    if (!Array.isArray(tags) || tags.length === 0) {
-      return 0;
-    }
-    let rows = 1;
-    let rowW = 0;
-    ctx.font = `12px -apple-system, "PingFang SC", sans-serif`;
-    tags.forEach((tag) => {
-      const text = String(tag || "").trim();
-      if (!text) return;
-      const chipW = ctx.measureText(text).width + 22;
-      if (rowW + chipW + 6 > maxWidth && rowW > 0) {
-        rows += 1;
-        rowW = chipW + 6;
-      } else {
-        rowW += chipW + 6;
-      }
-    });
-    return rows;
-  }
-
-  function candidateHeight(candidate) {
-    const innerW = CONTENT_W - 28;
-    const reasonLines = measureLines(
-      candidate.recommendationReason || "",
-      14,
-      innerW,
-    );
-    const focusLines = measureLines(candidate.focusAssessment || "", 12, innerW);
-    const tagRows = measureChipRows(candidate.tags || [], innerW);
-    const evidenceLines = (candidate.evidence || [])
-      .slice(0, 3)
-      .flatMap((item) => measureLines(item, 12, innerW - 12));
-    const workLines = (candidate.works || [])
-      .slice(0, 2)
-      .flatMap((item) =>
-        measureLines(
-          `${item.title}  赞 ${formatOpportunityMetric(item.likes)}`,
-          12,
-          innerW - 12,
-        ),
-      );
-    return (
-      52 +
-      reasonLines.length * 21 +
-      focusLines.length * 19 +
-      Math.max(tagRows, 1) * 25 +
-      28 +
-      evidenceLines.length * 18 +
-      (workLines.length > 0 ? 28 + workLines.length * 18 : 0) +
-      24
-    );
-  }
-
-  function preCalcHeight() {
-    const candidates = Array.isArray(data.candidates) ? data.candidates : [];
-    let h = 0;
-    h += 122;
-    const summaryLines = measureLines(
-      `从 ${data.sampleCount || 0} 条搜索结果中筛出 ${data.candidateCount || 0} 个候选账号，入围门槛为样本出现 ${data.minOccurrence || 2} 次。`,
-      14,
-      CONTENT_W,
-    );
-    h += summaryLines.length * 22 + 28;
-    candidates.forEach((candidate) => {
-      h += candidateHeight(candidate) + 12;
-    });
-    h += 68;
-    return h;
-  }
-
-  function drawPill(text, x, y, color, bg) {
-    const safeText = String(text || "").trim();
-    if (!safeText) return 0;
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    const w = ctx.measureText(safeText).width + 22;
-    ctx.fillStyle = bg;
-    roundRect(ctx, x, y, w, 23, 12);
-    ctx.fill();
-    ctx.fillStyle = color;
-    ctx.fillText(safeText, x + 11, y + 6);
-    return w;
-  }
-
-  function drawCard() {
-    const H = preCalcHeight();
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.textBaseline = "top";
-
-    const bg = ctx.createLinearGradient(0, 0, W, H);
-    bg.addColorStop(0, "#f0fdfa");
-    bg.addColorStop(0.46, "#ffffff");
-    bg.addColorStop(1, "#eef2ff");
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, W, H);
-
-    ctx.fillStyle = "#ffffff";
-    roundRect(ctx, 16, 16, W - 32, H - 32, 18);
-    ctx.fill();
-
-    let y = 16;
-    const headerH = 104;
-    const headerGrad = ctx.createLinearGradient(16, y, W - 16, y);
-    headerGrad.addColorStop(0, "#0F766E");
-    headerGrad.addColorStop(0.58, "#14B8A6");
-    headerGrad.addColorStop(1, "#6366F1");
-    ctx.fillStyle = headerGrad;
-    roundRectTop(ctx, 16, y, W - 32, headerH, 18);
-    ctx.fill();
-
-    ctx.fillStyle = "rgba(255,255,255,0.22)";
-    ctx.font = `500 14px -apple-system, "PingFang SC", sans-serif`;
-    const keywordText = `关键词 ${data.keyword || "未命名"}`;
-    const keywordW = ctx.measureText(keywordText).width + 24;
-    roundRect(ctx, PAD, y + 18, keywordW, 28, 14);
-    ctx.fill();
-    ctx.fillStyle = "#ffffff";
-    ctx.fillText(keywordText, PAD + 12, y + 24);
-
-    ctx.font = `bold 22px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText("对标账号推荐", PAD, y + 58);
-    y += headerH + 24;
-
-    const summary = `从 ${data.sampleCount || 0} 条搜索结果中筛出 ${data.candidateCount || 0} 个候选账号，入围门槛为样本出现 ${data.minOccurrence || 2} 次。`;
-    ctx.fillStyle = "#4b5563";
-    ctx.font = `14px -apple-system, "PingFang SC", sans-serif`;
-    measureLines(summary, 14, CONTENT_W).forEach((line) => {
-      ctx.fillText(line, PAD, y);
-      y += 22;
-    });
-    y += 18;
-
-    const candidates = Array.isArray(data.candidates) ? data.candidates : [];
-    candidates.forEach((candidate) => {
-      const cardH = candidateHeight(candidate);
-      ctx.fillStyle = "#f8fafc";
-      roundRect(ctx, PAD, y, CONTENT_W, cardH, 16);
-      ctx.fill();
-
-      let innerY = y + 16;
-      const rankBg =
-        candidate.growthPotential === "high"
-          ? "#dcfce7"
-          : candidate.growthPotential === "low"
-            ? "#e5e7eb"
-            : "#fef3c7";
-      const rankColor =
-        candidate.growthPotential === "high"
-          ? "#047857"
-          : candidate.growthPotential === "low"
-            ? "#475569"
-            : "#92400e";
-      ctx.fillStyle = rankBg;
-      roundRect(ctx, PAD + 14, innerY, 34, 34, 10);
-      ctx.fill();
-      ctx.fillStyle = rankColor;
-      ctx.font = `bold 15px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText(`#${candidate.rank || ""}`, PAD + 21, innerY + 8);
-
-      ctx.fillStyle = "#111827";
-      ctx.font = `700 17px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText(candidate.name || "未知账号", PAD + 58, innerY + 3);
-      innerY += 46;
-
-      ctx.fillStyle = "#111827";
-      ctx.font = `14px -apple-system, "PingFang SC", sans-serif`;
-      measureLines(
-        candidate.recommendationReason || "",
-        14,
-        CONTENT_W - 28,
-      ).forEach((line) => {
-        ctx.fillText(line, PAD + 14, innerY);
-        innerY += 21;
-      });
-
-      if (candidate.focusAssessment) {
-        ctx.fillStyle = "#6b7280";
-        ctx.font = `12px -apple-system, "PingFang SC", sans-serif`;
-        measureLines(candidate.focusAssessment, 12, CONTENT_W - 28).forEach(
-          (line) => {
-            ctx.fillText(line, PAD + 14, innerY + 2);
-            innerY += 19;
-          },
-        );
-      }
-
-      innerY += 8;
-      let chipX = PAD + 14;
-      (candidate.tags || []).forEach((tag) => {
-        const text = String(tag || "").trim();
-        if (!text) return;
-        ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-        const w = ctx.measureText(text).width + 22;
-        if (chipX + w > W - PAD - 14) {
-          chipX = PAD + 14;
-          innerY += 25;
-        }
-        drawPill(text, chipX, innerY, "#0f766e", "#ccfbf1");
-        chipX += w + 6;
-      });
-      innerY += 32;
-
-      ctx.fillStyle = "#0f766e";
-      ctx.font = `700 12px -apple-system, "PingFang SC", sans-serif`;
-      ctx.fillText("判断依据", PAD + 14, innerY);
-      innerY += 20;
-      ctx.fillStyle = "#4b5563";
-      ctx.font = `12px -apple-system, "PingFang SC", sans-serif`;
-      (candidate.evidence || []).slice(0, 3).forEach((item) => {
-        measureLines(item, 12, CONTENT_W - 40).forEach((line, index) => {
-          ctx.fillText(index === 0 ? `- ${line}` : `  ${line}`, PAD + 18, innerY);
-          innerY += 18;
-        });
-      });
-
-      const works = Array.isArray(candidate.works) ? candidate.works : [];
-      if (works.length > 0) {
-        innerY += 8;
-        ctx.fillStyle = "#6366f1";
-        ctx.font = `700 12px -apple-system, "PingFang SC", sans-serif`;
-        ctx.fillText("代表作品", PAD + 14, innerY);
-        innerY += 20;
-        ctx.fillStyle = "#4b5563";
-        ctx.font = `12px -apple-system, "PingFang SC", sans-serif`;
-        works.slice(0, 2).forEach((work) => {
-          const text = `${work.title}  赞 ${formatOpportunityMetric(work.likes)}`;
-          measureLines(text, 12, CONTENT_W - 40).forEach((line, index) => {
-            ctx.fillText(index === 0 ? `- ${line}` : `  ${line}`, PAD + 18, innerY);
-            innerY += 18;
-          });
-        });
-      }
-
-      y += cardH + 12;
-    });
-
-    y += 6;
-    ctx.fillStyle = "#e5e7eb";
-    ctx.fillRect(PAD, y, CONTENT_W, 0.5);
-    y += 18;
-
-    const brandText = "StarVoice（社媒虾）";
-    const urlText = "https://voice.minilife.online";
-    const logoSize = 16;
-    const gap = 6;
-    ctx.font = `600 12px -apple-system, "PingFang SC", sans-serif`;
-    const brandW = ctx.measureText(brandText).width;
-    ctx.font = `500 10px -apple-system, "PingFang SC", sans-serif`;
-    const urlW = ctx.measureText(urlText).width;
-    const pillW = urlW + 16;
-    const lineW = logoSize + gap + brandW + 10 + pillW;
-    const startX = (W - lineW) / 2;
-
-    if (logoImg.complete && logoImg.naturalWidth > 0) {
-      ctx.save();
-      roundRect(ctx, startX, y - 1, logoSize, logoSize, 3);
-      ctx.clip();
-      ctx.drawImage(logoImg, startX, y - 1, logoSize, logoSize);
-      ctx.restore();
-    }
-    ctx.fillStyle = "#9ca3af";
-    ctx.font = `500 11px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText(brandText, startX + logoSize + gap, y);
-    const pillX = startX + logoSize + gap + brandW + 10;
-    ctx.fillStyle = "#ecfeff";
-    roundRect(ctx, pillX, y - 1, pillW, 16, 8);
-    ctx.fill();
-    ctx.fillStyle = "#14b8a6";
-    ctx.font = `400 10px -apple-system, "PingFang SC", sans-serif`;
-    ctx.fillText(urlText, pillX + 8, y + 2);
-
-    canvas.toBlob((blob) => {
-      if (!blob) {
-        showMessage("图片生成失败", "error");
-        return;
-      }
-      showInsightImagePreview(blob, data.keyword || "benchmark");
-    }, "image/png");
-  }
-
-  if (logoImg.complete) {
-    drawCard();
-  } else {
-    logoImg.onload = drawCard;
-    logoImg.onerror = drawCard;
-  }
-}
-
-function showInsightImagePreview(blob, seedKeyword) {
-  const existing = document.getElementById("insightImagePreviewOverlay");
-  if (existing) existing.remove();
-
-  const blobUrl = URL.createObjectURL(blob);
-
-  const overlay = document.createElement("div");
-  overlay.id = "insightImagePreviewOverlay";
-  overlay.className = "insight-preview-overlay";
-  overlay.innerHTML = `
-    <div class="insight-preview-dialog">
-      <div class="insight-preview-header">
-        <span class="insight-preview-title">图片预览</span>
-        <button type="button" class="insight-preview-close" id="insightPreviewClose" title="关闭">
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" x2="6" y1="6" y2="18"/><line x1="6" x2="18" y1="6" y2="18"/></svg>
-        </button>
-      </div>
-      <div class="insight-preview-body" id="insightPreviewBody">
-        <img src="${blobUrl}" class="insight-preview-img" id="insightPreviewImg" alt="洞察分享图片" />
-      </div>
-      <div class="insight-preview-footer">
-        <span class="insight-preview-zoom-hint">滚轮缩放 · 双击还原</span>
-        <div class="insight-preview-actions">
-          <button type="button" class="btn btn-secondary" id="insightPreviewCopy">复制</button>
-          <button type="button" class="btn btn-secondary" id="insightPreviewDownload">下载</button>
-        </div>
-      </div>
-    </div>
-  `;
-
-  document.body.appendChild(overlay);
-
-  const body = overlay.querySelector("#insightPreviewBody");
-  const img = overlay.querySelector("#insightPreviewImg");
-  let scale = 1;
-  let tx = 0,
-    ty = 0;
-  let dragging = false,
-    startX = 0,
-    startY = 0,
-    startTx = 0,
-    startTy = 0;
-
-  const applyTransform = () => {
-    img.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
-  };
-
-  const resetZoom = () => {
-    scale = 1;
-    tx = 0;
-    ty = 0;
-    applyTransform();
-  };
-
-  body.addEventListener(
-    "wheel",
-    (e) => {
-      e.preventDefault();
-      const delta = e.deltaY > 0 ? -0.15 : 0.15;
-      scale = Math.min(5, Math.max(0.5, scale + delta));
-      if (scale <= 1) {
-        tx = 0;
-        ty = 0;
-      }
-      applyTransform();
-    },
-    {passive: false},
-  );
-
-  body.addEventListener("dblclick", (e) => {
-    e.preventDefault();
-    if (scale !== 1) {
-      resetZoom();
-    } else {
-      scale = 2.5;
-      applyTransform();
-    }
-  });
-
-  body.addEventListener("mousedown", (e) => {
-    if (scale <= 1) return;
-    dragging = true;
-    startX = e.clientX;
-    startY = e.clientY;
-    startTx = tx;
-    startTy = ty;
-    body.classList.add("is-dragging");
-    e.preventDefault();
-  });
-
-  const onMouseMove = (e) => {
-    if (!dragging) return;
-    tx = startTx + (e.clientX - startX);
-    ty = startTy + (e.clientY - startY);
-    applyTransform();
-  };
-
-  const onMouseUp = () => {
-    if (!dragging) return;
-    dragging = false;
-    body.classList.remove("is-dragging");
-  };
-
-  document.addEventListener("mousemove", onMouseMove);
-  document.addEventListener("mouseup", onMouseUp);
-
-  const close = () => {
-    document.removeEventListener("mousemove", onMouseMove);
-    document.removeEventListener("mouseup", onMouseUp);
-    overlay.remove();
-    URL.revokeObjectURL(blobUrl);
-  };
-
-  overlay
-    .querySelector("#insightPreviewClose")
-    .addEventListener("click", close);
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) close();
-  });
-
-  overlay
-    .querySelector("#insightPreviewDownload")
-    .addEventListener("click", () => {
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = `onstarvoice-insight-${seedKeyword}.png`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      showMessage("图片已保存", "success");
-    });
-
-  overlay
-    .querySelector("#insightPreviewCopy")
-    .addEventListener("click", async () => {
-      if (
-        typeof navigator === "undefined" ||
-        !navigator.clipboard ||
-        typeof navigator.clipboard.write !== "function" ||
-        typeof window.ClipboardItem !== "function"
-      ) {
-        showMessage("当前环境暂不支持复制图片，请使用下载", "warning");
-        return;
-      }
-
-      try {
-        await navigator.clipboard.write([
-          new ClipboardItem({
-            [blob.type || "image/png"]: blob,
-          }),
-        ]);
-        showMessage("图片已复制到剪贴板", "success");
-      } catch (error) {
-        console.warn("[Sidebar] Failed to copy image", error);
-        showMessage("复制图片失败，请尝试下载", "error");
-      }
-    });
-}
-
-function roundRect(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
-}
-
-function roundRectTop(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h);
-  ctx.lineTo(x, y + h);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
-}
-
-function handleKeywordInsightCategoryActions(event) {
-  const target = event.target;
-  if (!(target instanceof HTMLElement)) {
-    return;
-  }
-
-  const action =
-    target.dataset?.action ||
-    target.closest("[data-action]")?.dataset?.action ||
-    "";
-
-  if (action === "toggle-expand-category") {
-    const categoryId = String(
-      target.dataset?.categoryId ||
-        target.closest("[data-category-id]")?.dataset?.categoryId ||
-        "",
-    ).trim();
-    if (!categoryId) return;
-    if (expandedKeywordInsightCategoryIds.has(categoryId)) {
-      expandedKeywordInsightCategoryIds.delete(categoryId);
-    } else {
-      expandedKeywordInsightCategoryIds.add(categoryId);
-    }
-    renderKeywordInsightState();
-    return;
-  }
-
-  if (action === "toggle-keyword") {
-    const chip = target.closest("[data-keyword]");
-    const keyword = String(
-      chip?.dataset?.keyword || target.dataset?.keyword || "",
-    ).trim();
-    if (!keyword) return;
-
-    navigator.clipboard.writeText(keyword).then(() => {
-      showMessage(`已复制: ${keyword}`, "success");
-    }).catch((err) => {
-      console.error("[Sidebar] copy failed:", err);
-      showMessage("复制失败", "error");
-    });
-  }
-}
-
-async function handleExpandKeywords() {
-  if (keywordExpandInFlight) {
-    await requestKeywordExpandCancel();
-    return;
-  }
-
-  const runtime = getCurrentRuntime();
-  const seedKeyword = getKeywordInsightSeedKeyword({runtime});
-  if (!seedKeyword) {
-    showMessage(
-      "仅支持分析当前页面回填的关键词，请先进入搜索结果页",
-      "warning",
-    );
-    return;
-  }
-
-  if (runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS) {
-    showMessage("请先切换到搜索页", "error");
-    return;
-  }
-
-  keywordExpandInFlight = true;
-  keywordExpandCancelRequested = false;
-  updateExpandKeywordsButtonState();
-
-  // 扩词期间暂停排序检测轮询，避免频繁消息影响搜索框状态。
-  stopKeywordSortSyncTimer();
-
-  try {
-    showProgress(`正在扩展关键词「${seedKeyword}」...`);
-
-    const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
-    if (!tab?.id) {
-      showMessage("未找到当前活动标签页", "error");
-      return;
-    }
-
-    const response = await chrome.runtime.sendMessage({
-      type: MESSAGE_TYPE.RELAY_TO_CONTENT,
-      tabId: tab.id,
-      payload: {
-        action: "expandKeywordSuggestions",
-        seedKeyword,
-        platform: detectPlatformFromUrl(tab.url || ""),
-      },
-    });
-
-    const expandResult =
-      response?.data &&
-      typeof response.data === "object" &&
-      "ok" in response.data
-        ? response.data
-        : response;
-
-    if (!response?.ok || !expandResult?.ok) {
-      throw new Error(
-        expandResult?.error?.message ||
-          response?.error?.message ||
-          response?.data?.error?.message ||
-          "扩词失败，请确认当前页面是搜索页",
-      );
-    }
-
-    const data = expandResult?.data || {};
-    expandedKeywordsBuffer = Array.isArray(data.expandedKeywords)
-      ? data.expandedKeywords
-      : [];
-    expandedKeywordsPanelVisible = false;
-    invalidateKeywordInsightDraft();
-    console.info("[Sidebar] Expand keyword result received", {
-      totalFound: data?.stats?.totalFound ?? 0,
-      uniqueCount: expandedKeywordsBuffer.length,
-    });
-
-    await persistBatchDraftForPlatform();
-
-    const stats = data?.stats || {totalFound: 0, duplicatesRemoved: 0};
-    renderExpandedKeywords();
-    showMessage(
-      `扩词完成：共发现 ${stats.totalFound} 个联想词，去重后 ${expandedKeywordsBuffer.length} 个`,
-      "success",
-    );
-    void startKeywordAnalysis({force: true});
-  } catch (error) {
-    console.error("[Sidebar] Expand keywords failed:", error);
-    if (String(error?.message || "") === "扩词已取消") {
-      showMessage("扩词已取消", "warning");
-    } else {
-      showMessage("扩词失败: " + error.message, "error");
-    }
-  } finally {
-    hideProgress();
-    keywordExpandInFlight = false;
-    keywordExpandCancelRequested = false;
-    updateExpandKeywordsButtonState();
-    syncKeywordSortDimensionByRuntime(getCurrentRuntime()).catch((error) => {
-      console.warn("[Sidebar] Resume keyword sort sync failed:", error);
-    });
-  }
-}
-
-function updateExpandKeywordsButtonState() {
-  const btnExpand = document.getElementById("btnExpandKeywords");
-  const btnIntroRun = document.getElementById("btnRunKeywordInsight");
-  const currentKeyword = getKeywordInsightSeedKeyword();
-  const hasResult = expandedKeywordsBuffer.length > 0;
-  if (!btnExpand) {
-    return;
-  }
-
-  if (keywordExpandInFlight) {
-    btnExpand.disabled = false;
-    btnExpand.textContent = keywordExpandCancelRequested
-      ? "停止中..."
-      : "停止分析";
-    btnExpand.classList.remove("btn-secondary");
-    btnExpand.classList.add("btn-danger");
-    if (btnIntroRun) {
-      btnIntroRun.disabled = false;
-      btnIntroRun.textContent = keywordExpandCancelRequested
-        ? "停止中..."
-        : "停止分析";
-      btnIntroRun.classList.remove("btn-primary");
-      btnIntroRun.classList.add("btn-danger");
-    }
-    return;
-  }
-
-  btnExpand.disabled = !currentKeyword;
-  btnExpand.textContent = hasResult ? "重新分析" : "开始分析长尾需求";
-  btnExpand.classList.add("btn-secondary");
-  btnExpand.classList.remove("btn-danger");
-  if (btnIntroRun) {
-    btnIntroRun.disabled = !currentKeyword;
-    btnIntroRun.textContent = "开始分析长尾需求";
-    btnIntroRun.classList.add("btn-primary");
-    btnIntroRun.classList.remove("btn-danger");
-  }
-}
-
-async function requestKeywordExpandCancel() {
-  if (keywordExpandCancelRequested) {
-    return;
-  }
-
-  keywordExpandCancelRequested = true;
-  updateExpandKeywordsButtonState();
-
-  try {
-    const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
-    if (tab?.id) {
-      await chrome.runtime.sendMessage({
-        type: MESSAGE_TYPE.RELAY_TO_CONTENT,
-        tabId: tab.id,
-        payload: {action: "cancelCapture"},
-      });
-    }
-  } catch (error) {
-    console.warn("[Sidebar] Expand keyword cancel failed:", error);
-  }
-
-  showMessage("正在停止扩词...", "warning");
 }
 
 // 可中断睡眠:每秒检查 shouldStop,用于循环采集的轮次间隔
@@ -11775,1333 +5637,6 @@ async function pickBindingForReplacement(candidates) {
   });
 }
 
-function isMonitorAuthReady() {
-  const auth = getCurrentAuth() || {};
-  return auth.status === AUTH_STATUS.VERIFIED && Boolean(auth.credential?.code);
-}
-
-async function loadMonitorSubscriptions({force = false} = {}) {
-  const currentMonitor = getCurrentMonitor() || {};
-  if (currentMonitor.isLoading && !force) {
-    return currentMonitor.items || [];
-  }
-
-  if (!isMonitorAuthReady()) {
-    await resetCurrentMonitor();
-    return [];
-  }
-
-  const runtime = getCurrentRuntime();
-  const runtimePlatform = runtime?.platform || "douyin";
-  const datasetSelectedPlatform = document.body.dataset.selectedPlatform;
-  const platform =
-    datasetSelectedPlatform && datasetSelectedPlatform !== "unknown"
-      ? datasetSelectedPlatform
-      : runtimePlatform;
-
-  const status = MONITOR_STATUS.ALL;
-  await setCurrentMonitor({
-    isLoading: true,
-    error: null,
-    filters: {
-      ...(currentMonitor.filters || {}),
-      status,
-      platform,
-    },
-  });
-
-  const result = await listMonitorSubscriptions({status, platform});
-  if (!result?.ok) {
-    const monitorErrorMsg =
-      ERROR_MESSAGE_MAP[result?.reason] ||
-      result?.message ||
-      "加载监控列表失败";
-    await setCurrentMonitor({
-      items: [],
-      isLoading: false,
-      error: monitorErrorMsg,
-    });
-    showMessage(monitorErrorMsg, "error");
-    return [];
-  }
-
-  const items = Array.isArray(result.data?.items) ? result.data.items : [];
-
-  await setCurrentMonitor({
-    items,
-    isLoading: false,
-    error: null,
-    lastFetchedAt: Date.now(),
-    filters: {
-      ...(currentMonitor.filters || {}),
-      status,
-      platform,
-    },
-  });
-
-  return items;
-}
-
-async function loadMonitorExecutions({force = false, limit = 50} = {}) {
-  const currentMonitor = getCurrentMonitor() || {};
-  if (currentMonitor.isLoadingExecutions && !force) {
-    return currentMonitor.executions || [];
-  }
-
-  if (!isMonitorAuthReady()) {
-    await setCurrentMonitor({
-      executions: [],
-      isLoadingExecutions: false,
-      executionsError: null,
-      executionsLastFetchedAt: null,
-    });
-    return [];
-  }
-
-  await setCurrentMonitor({
-    isLoadingExecutions: true,
-    executionsError: null,
-  });
-
-  const result = await listMonitorExecutions({limit});
-  if (!result?.ok) {
-    const monitorErrorMsg =
-      ERROR_MESSAGE_MAP[result?.reason] ||
-      result?.message ||
-      "加载监控执行记录失败";
-    await setCurrentMonitor({
-      executions: [],
-      isLoadingExecutions: false,
-      executionsError: monitorErrorMsg,
-    });
-    return [];
-  }
-
-  const items = Array.isArray(result.data?.items)
-    ? result.data.items
-    : Array.isArray(result.data?.executions)
-      ? result.data.executions
-      : Array.isArray(result.executions)
-        ? result.executions
-        : Array.isArray(result.items)
-          ? result.items
-          : [];
-  await setCurrentMonitor({
-    executions: items,
-    isLoadingExecutions: false,
-    executionsError: null,
-    executionsLastFetchedAt: Date.now(),
-  });
-
-  return items;
-}
-
-async function loadExecutionDetails({force = false} = {}) {
-  if (!isMonitorAuthReady()) {
-    await setCurrentMonitor({
-      executions: [],
-      isLoadingExecutions: false,
-      executionsError: null,
-      executionsLastFetchedAt: null,
-    });
-    return [];
-  }
-
-  await Promise.all([
-    loadMonitorSubscriptions({force}),
-    loadMonitorExecutions({force}),
-  ]);
-  return getCurrentMonitor()?.executions || [];
-}
-
-function getMonitorSettingsElements() {
-  const publishWindow = document.getElementById("inputMonitorPublishWindow");
-  const likeThreshold = document.getElementById("inputMonitorLikeThreshold");
-  const runTimes = document.getElementById("inputMonitorRunTimes");
-  const observeWindowHours = document.getElementById(
-    "inputMonitorObserveWindowHours",
-  );
-
-  if (!publishWindow || !likeThreshold || !runTimes || !observeWindowHours) {
-    return null;
-  }
-
-  return {
-    publishWindow,
-    likeThreshold,
-    runTimes,
-    observeWindowHours,
-  };
-}
-
-function normalizeMonitorSettingsInput(input = {}) {
-  const likeThreshold = Number(
-    input.likeThreshold ?? DEFAULT_MONITOR_SETTINGS.likeThreshold,
-  );
-  const observeWindowHours = Number(
-    input.observeWindowHours ?? DEFAULT_MONITOR_SETTINGS.observeWindowHours,
-  );
-  const rawPublishWindow = String(
-    input.publishWindow || DEFAULT_MONITOR_SETTINGS.publishWindow,
-  ).trim();
-  const normalizedPublishWindow =
-    rawPublishWindow === "recent_activity"
-      ? DEFAULT_MONITOR_SETTINGS.publishWindow
-      : rawPublishWindow;
-  const publishWindow = MONITOR_PUBLISH_WINDOW_OPTIONS.has(normalizedPublishWindow)
-    ? normalizedPublishWindow
-    : DEFAULT_MONITOR_SETTINGS.publishWindow;
-  const runTimes = (
-    Array.isArray(input.runTimes)
-      ? input.runTimes
-      : String(input.runTimes || "")
-          .split(",")
-          .map((item) => item.trim())
-          .filter(Boolean)
-  ).filter((item) => MONITOR_RUN_TIME_OPTIONS.includes(item));
-
-  const normalizedObserveWindowHours =
-    Number.isFinite(observeWindowHours) && observeWindowHours > 0
-      ? Math.trunc(observeWindowHours)
-      : DEFAULT_MONITOR_SETTINGS.observeWindowHours;
-  const safeObserveWindowHours = MONITOR_OBSERVE_WINDOW_OPTIONS.includes(
-    normalizedObserveWindowHours,
-  )
-    ? normalizedObserveWindowHours
-    : DEFAULT_MONITOR_SETTINGS.observeWindowHours;
-
-  return {
-    publishWindow,
-    likeThreshold:
-      Number.isFinite(likeThreshold) && likeThreshold >= 0
-        ? Math.trunc(likeThreshold)
-        : DEFAULT_MONITOR_SETTINGS.likeThreshold,
-    runTimes:
-      runTimes.length > 0 ? runTimes : [...DEFAULT_MONITOR_SETTINGS.runTimes],
-    observeWindowHours: safeObserveWindowHours,
-    timezone: DEFAULT_MONITOR_SETTINGS.timezone,
-  };
-}
-
-function populateMonitorSettingsForm(settings = {}) {
-  const elements = getMonitorSettingsElements();
-  if (!elements) {
-    return;
-  }
-
-  const normalized = normalizeMonitorSettingsInput(settings);
-  elements.publishWindow.value = normalized.publishWindow;
-  elements.likeThreshold.value = String(normalized.likeThreshold);
-  elements.runTimes.value =
-    normalized.runTimes[0] || DEFAULT_MONITOR_SETTINGS.runTimes[0];
-  elements.observeWindowHours.value = String(normalized.observeWindowHours);
-}
-
-function readMonitorSettingsForm() {
-  const elements = getMonitorSettingsElements();
-  if (!elements) {
-    return {...DEFAULT_MONITOR_SETTINGS};
-  }
-
-  return normalizeMonitorSettingsInput({
-    publishWindow: elements.publishWindow.value,
-    likeThreshold: elements.likeThreshold.value,
-    runTimes: elements.runTimes.value,
-    observeWindowHours: elements.observeWindowHours.value,
-  });
-}
-
-async function loadMonitorSettings() {
-  if (!isMonitorAuthReady()) {
-    await setCurrentMonitor({
-      settings: {...DEFAULT_MONITOR_SETTINGS},
-    });
-    populateMonitorSettingsForm(DEFAULT_MONITOR_SETTINGS);
-    return DEFAULT_MONITOR_SETTINGS;
-  }
-
-  const result = await getMonitorSettings();
-  if (!result?.ok) {
-    populateMonitorSettingsForm(DEFAULT_MONITOR_SETTINGS);
-    await setCurrentMonitor({
-      settings: {...DEFAULT_MONITOR_SETTINGS},
-    });
-    return DEFAULT_MONITOR_SETTINGS;
-  }
-
-  const settings = normalizeMonitorSettingsInput(result.data?.settings || {});
-  await setCurrentMonitor({
-    settings,
-  });
-  populateMonitorSettingsForm(settings);
-  return settings;
-}
-
-function resolveMonitorDisplayName(item) {
-  return (
-    String(
-      item?.displayName ||
-        item?.display_name ||
-        item?.bloggerNameSnapshot ||
-        item?.bloggerName ||
-        "",
-    ).trim() ||
-    String(
-      item?.accountNo ||
-        item?.account_no ||
-        item?.profileInternalId ||
-        item?.profile_internal_id ||
-        item?.platformBloggerId ||
-        "",
-    ).trim() ||
-    "未命名博主"
-  );
-}
-
-function normalizeMonitorSubjectType(value) {
-  return String(value || "")
-    .trim()
-    .toLowerCase() === MONITOR_SUBJECT_TYPE.OFFICIAL
-    ? MONITOR_SUBJECT_TYPE.OFFICIAL
-    : MONITOR_SUBJECT_TYPE.CREATOR;
-}
-
-function getMonitorSubjectType() {
-  const selectedButton = document.querySelector(
-    '.monitor-subject-option[aria-pressed="true"]',
-  );
-  return normalizeMonitorSubjectType(selectedButton?.dataset?.subjectType);
-}
-
-function getMonitorSubjectLabel(subjectType) {
-  return normalizeMonitorSubjectType(subjectType) ===
-    MONITOR_SUBJECT_TYPE.OFFICIAL
-    ? "官方账号"
-    : "关注博主";
-}
-
-function setMonitorSubjectType(subjectType) {
-  const normalized = normalizeMonitorSubjectType(subjectType);
-  document.querySelectorAll(".monitor-subject-option").forEach((button) => {
-    const isSelected =
-      normalizeMonitorSubjectType(button.dataset.subjectType) === normalized;
-    button.classList.toggle("is-selected", isSelected);
-    button.setAttribute("aria-pressed", String(isSelected));
-  });
-  window.getMonitorSubjectType = () => normalized;
-  window.refreshMonitorSubjectAction?.();
-}
-
-function extractPlatformMonitorBloggerId(platform, url, fallbackId = "") {
-  const normalizedPlatform = String(platform || "")
-    .trim()
-    .toLowerCase();
-  const normalizedUrl = String(url || "").trim();
-
-  if (normalizedPlatform === "xiaohongshu" && normalizedUrl) {
-    const profileMatch = normalizedUrl.match(
-      /\/user\/profile\/([a-zA-Z0-9_-]+)/i,
-    );
-    if (profileMatch?.[1]) {
-      return profileMatch[1];
-    }
-  }
-
-  if (normalizedPlatform === "weibo" && normalizedUrl) {
-    const weiboMatch =
-      normalizedUrl.match(/weibo\.com\/u\/(\d+)/i) ||
-      normalizedUrl.match(/weibo\.com\/(\d{5,})(?:[/?#]|$)/i);
-    if (weiboMatch?.[1]) {
-      return weiboMatch[1];
-    }
-  }
-
-  if (normalizedPlatform === "douyin" && normalizedUrl) {
-    const douyinMatch = normalizedUrl.match(
-      /\/user\/([a-zA-Z0-9._-]+)(?:[/?#]|$)/i,
-    );
-    if (douyinMatch?.[1]) {
-      return douyinMatch[1];
-    }
-  }
-
-  return String(fallbackId || "").trim();
-}
-
-function resolveMonitorAccountNo(platform, payload = {}, profileInternalId = "") {
-  const normalizedPlatform = String(platform || "")
-    .trim()
-    .toLowerCase();
-  const candidates =
-    normalizedPlatform === "xiaohongshu"
-      ? [
-          payload.accountNo,
-          payload.account_no,
-          payload.bloggerUserId,
-          payload.redId,
-          payload.xiaohongshuId,
-          payload.bloggerId,
-        ]
-      : normalizedPlatform === "douyin"
-        ? [
-            payload.accountNo,
-            payload.account_no,
-            payload.douyinId,
-            payload.uniqueId,
-            payload.authorUsername,
-          ]
-        : normalizedPlatform === "weibo"
-          ? [
-              payload.accountNo,
-              payload.account_no,
-              payload.weiboId,
-              payload.bloggerId,
-            ]
-          : [payload.accountNo, payload.account_no, payload.bloggerId];
-
-  for (const candidate of candidates) {
-    const normalized = String(candidate || "").trim();
-    if (!normalized) continue;
-    if (
-      normalizedPlatform !== "weibo" &&
-      normalized === String(profileInternalId || "").trim()
-    ) {
-      continue;
-    }
-    return normalized;
-  }
-  return "";
-}
-
-function buildMonitorSubjectCandidate({
-  platform,
-  subjectType = MONITOR_SUBJECT_TYPE.CREATOR,
-  profileInternalId = "",
-  accountNo = "",
-  displayName = "",
-  profileUrl = "",
-  avatarUrl = "",
-  assignedAgentId = "",
-} = {}) {
-  const normalizedSubjectType = normalizeMonitorSubjectType(subjectType);
-  const normalizedProfileInternalId = String(profileInternalId || "").trim();
-  const normalizedAccountNo = String(accountNo || "").trim();
-  const normalizedDisplayName = String(displayName || "").trim();
-  const normalizedProfileUrl = String(profileUrl || "").trim();
-  const normalizedAvatarUrl = String(avatarUrl || "").trim();
-  const normalizedAssignedAgentId = String(assignedAgentId || "").trim();
-  const platformBloggerId =
-    normalizedProfileInternalId || normalizedAccountNo;
-
-  if (!platformBloggerId) {
-    return null;
-  }
-
-  return {
-    platform: String(platform || "")
-      .trim()
-      .toLowerCase(),
-    subjectType: normalizedSubjectType,
-    profileInternalId: normalizedProfileInternalId,
-    accountNo: normalizedAccountNo,
-    displayName: normalizedDisplayName,
-    profileUrl: normalizedProfileUrl,
-    avatarUrl: normalizedAvatarUrl,
-    assignedAgentId: normalizedAssignedAgentId,
-    // Backward-compatible fields consumed by the existing monitor API.
-    platformBloggerId,
-    bloggerNameSnapshot: normalizedDisplayName,
-    bloggerUrl: normalizedProfileUrl,
-    bloggerAvatarSnapshot: normalizedAvatarUrl,
-  };
-}
-
-function buildMonitorCandidateFromRecord(
-  record,
-  subjectType = MONITOR_SUBJECT_TYPE.CREATOR,
-) {
-  if (!record || record.type !== "blogger_profile") {
-    return null;
-  }
-
-  const platform = resolveRecordPlatform(record);
-  if (
-    platform !== "douyin" &&
-    platform !== "xiaohongshu" &&
-    platform !== "weibo"
-  ) {
-    return null;
-  }
-
-  const payload = record.payload || {};
-  const profileUrl = String(
-    payload.profileUrl ||
-      payload.bloggerUrl ||
-      payload.bloggerProfileUrl ||
-      "",
-  ).trim();
-  const profileInternalId = extractPlatformMonitorBloggerId(
-    platform,
-    profileUrl,
-    payload.profileInternalId || payload.bloggerId,
-  );
-  const accountNo = resolveMonitorAccountNo(
-    platform,
-    payload,
-    profileInternalId,
-  );
-  return buildMonitorSubjectCandidate({
-    platform,
-    subjectType,
-    profileInternalId,
-    accountNo,
-    displayName: payload.displayName || payload.bloggerName,
-    profileUrl,
-    avatarUrl: payload.avatarUrl || payload.bloggerAvatarSnapshot,
-    assignedAgentId: getCurrentAuth()?.captureAgent?.id || "",
-  });
-}
-
-async function addMonitorSubscriptionByCandidate(candidate) {
-  const result = await createMonitorSubscription(candidate);
-
-  if (!result?.ok) {
-    throw new Error(result?.message || "纳入监控失败");
-  }
-
-  await loadMonitorSubscriptions({force: true});
-
-  const subjectType = normalizeMonitorSubjectType(candidate?.subjectType);
-  const isOfficial = subjectType === MONITOR_SUBJECT_TYPE.OFFICIAL;
-  if (result.data?.created) {
-    showMessage(
-      isOfficial ? "已登记为官方账号" : "已将当前账号加入关注博主",
-      "success",
-    );
-  } else if (result.data?.restored) {
-    showMessage(
-      isOfficial ? "已恢复官方账号登记" : "当前账号已恢复到关注博主",
-      "success",
-    );
-  } else {
-    showMessage(
-      isOfficial ? "该官方账号已登记" : "当前账号已在关注博主中",
-      "info",
-    );
-  }
-}
-
-async function captureCurrentMonitorCandidate(
-  subjectType = getMonitorSubjectType(),
-) {
-  const runtime = getCurrentRuntime();
-  const pageUrl = String(runtime?.lastPageUrl || "").trim();
-  const pagePlatform = detectPlatformFromUrl(pageUrl);
-
-  if (
-    (pagePlatform !== "douyin" &&
-      pagePlatform !== "xiaohongshu" &&
-      pagePlatform !== "weibo") ||
-    runtime?.pageType !== PAGE_TYPE.BLOGGER_PROFILE
-  ) {
-    throw new Error("请先切换到抖音、小红书或微博账号主页");
-  }
-
-  const [tab] = await chrome.tabs.query({
-    active: true,
-    currentWindow: true,
-  });
-
-  if (!tab?.id) {
-    throw new Error("未找到当前活动页");
-  }
-
-  const response = await chrome.runtime.sendMessage({
-    type: MESSAGE_TYPE.RELAY_TO_CONTENT,
-    tabId: tab.id,
-    payload: {
-      action: "captureBloggerProfile",
-    },
-  });
-
-  const captureResult = response?.data;
-  if (!response?.ok || !captureResult?.ok || !captureResult?.data) {
-    const errorText =
-      captureResult?.error?.message ||
-      response?.error?.message ||
-      "账号主页识别失败";
-    throw new Error(errorText);
-  }
-
-  const profile = captureResult.data || {};
-  const profileUrl = String(
-    profile.profileUrl ||
-      profile.bloggerUrl ||
-      profile.bloggerProfileUrl ||
-      pageUrl,
-  ).trim();
-  const profileInternalId = extractPlatformMonitorBloggerId(
-    pagePlatform,
-    profileUrl,
-    profile.profileInternalId || profile.bloggerId,
-  );
-  const accountNo = resolveMonitorAccountNo(
-    pagePlatform,
-    profile,
-    profileInternalId,
-  );
-  const candidate = buildMonitorSubjectCandidate({
-    platform: pagePlatform,
-    subjectType,
-    profileInternalId,
-    accountNo,
-    displayName: profile.displayName || profile.bloggerName,
-    profileUrl,
-    avatarUrl: profile.avatarUrl || profile.bloggerAvatarSnapshot,
-    assignedAgentId: getCurrentAuth()?.captureAgent?.id || "",
-  });
-
-  if (!candidate) {
-    throw new Error("未识别到账号唯一 ID");
-  }
-
-  return candidate;
-}
-
-async function handleAddCurrentMonitor() {
-  if (!isMonitorAuthReady()) {
-    showMessage(MONITOR_REQUIRED_MESSAGE, "warning");
-    return;
-  }
-
-  const subjectType = getMonitorSubjectType();
-  const subjectLabel = getMonitorSubjectLabel(subjectType);
-  showProgress(`正在识别并登记${subjectLabel}...`);
-
-  try {
-    const candidate = await captureCurrentMonitorCandidate(subjectType);
-    await addMonitorSubscriptionByCandidate(candidate);
-  } catch (error) {
-    console.error("[Sidebar] Add current monitor failed:", error);
-    showMessage(`${subjectLabel}登记失败: ${error.message}`, "error");
-  } finally {
-    hideProgress();
-  }
-}
-
-function resolveMonitorRunHistoryState(item) {
-  const status = String(item?.status || "")
-    .trim()
-    .toLowerCase();
-  const hitCount = Math.max(0, Number(item?.hitCount || 0));
-  const scannedCount = Math.max(0, Number(item?.scannedCount || 0));
-  const errorCode = String(item?.errorCode || "").trim();
-  const errorMessage = String(item?.errorMessage || "").trim();
-
-  if (status === "skipped_no_balance") {
-    return {
-      monitorStatus: "credit_insufficient",
-      monitorStatusLabel: "配额不足",
-      monitorSyncLabel: "",
-      monitorSummary: "未执行扫描（配额不足）",
-      isSuccess: false,
-      reason: errorCode || "insufficient_balance",
-      message: errorMessage || "insufficient credential credits",
-    };
-  }
-
-  if (status === "queued" || status === "pending" || status === "running") {
-    return {
-      monitorStatus: "queued",
-      monitorStatusLabel: "已排队",
-      monitorSyncLabel: "",
-      monitorSummary: status === "running" ? "扫描任务执行中" : "扫描任务已排队",
-      isSuccess: true,
-      reason: ERROR_REASON.NONE,
-      message: status === "running" ? "监控任务执行中" : "已创建监控执行任务",
-    };
-  }
-
-  if (status === "no_hit") {
-    return {
-      monitorStatus: "no_hit",
-      monitorStatusLabel: "未命中",
-      monitorSyncLabel: "",
-      monitorSummary: `已扫描 ${scannedCount} / 命中 0`,
-      isSuccess: true,
-      reason: ERROR_REASON.NONE,
-      message: "监控执行完成",
-    };
-  }
-
-  if (status === "success") {
-    return {
-      monitorStatus: "hit_synced",
-      monitorStatusLabel: "已命中",
-      monitorSyncLabel: "已同步",
-      monitorSummary: `命中 ${hitCount} / 已同步`,
-      isSuccess: true,
-      reason: ERROR_REASON.NONE,
-      message: "监控执行完成",
-    };
-  }
-
-  if (status === "failed" && hitCount > 0) {
-    return {
-      monitorStatus: "hit_sync_failed",
-      monitorStatusLabel: "已命中",
-      monitorSyncLabel: "同步失败",
-      monitorSummary: `命中 ${hitCount} / 同步失败`,
-      isSuccess: false,
-      reason: errorCode || "sync_failed",
-      message: errorMessage || "监控同步失败",
-    };
-  }
-
-  return {
-    monitorStatus: "execution_failed",
-    monitorStatusLabel: "执行失败",
-    monitorSyncLabel: "",
-    monitorSummary: errorMessage || "扫描失败",
-    isSuccess: false,
-    reason: errorCode || "provider_request_failed",
-    message: errorMessage || "监控执行失败",
-  };
-}
-
-function normalizeMonitorRunnerPlatform(value = "") {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-  return normalized === "douyin" ||
-    normalized === "xiaohongshu" ||
-    normalized === "weibo"
-    ? normalized
-    : "unknown";
-}
-
-function resolveMonitorRunnerAccountUrl(runItem = {}, monitorItem = {}) {
-  return String(
-    runItem.bloggerUrl ||
-      runItem.monitorBloggerUrl ||
-      runItem.accountUrl ||
-      monitorItem.bloggerUrl ||
-      monitorItem.monitorBloggerUrl ||
-      monitorItem.accountUrl ||
-      "",
-  ).trim();
-}
-
-function resolveMonitorRunnerName(runItem = {}, monitorItem = {}) {
-  return (
-    String(
-      runItem.monitorBloggerName ||
-        runItem.bloggerNameSnapshot ||
-        runItem.bloggerName ||
-        monitorItem.bloggerNameSnapshot ||
-        monitorItem.bloggerName ||
-        monitorItem.platformBloggerId ||
-        "",
-    ).trim() || "未命名博主"
-  );
-}
-
-function resolveMonitorRunnerCaptureParams(
-  monitorSettings = {},
-  captureSettings = {},
-) {
-  const observeWindowHours =
-    MONITOR_OBSERVE_WINDOW_OPTIONS.includes(
-      Number(monitorSettings.observeWindowHours),
-    )
-      ? Number(monitorSettings.observeWindowHours)
-      : DEFAULT_MONITOR_SETTINGS.observeWindowHours;
-  const defaultMaxDetectedItems =
-    MONITOR_RECENT_SCAN_LIMIT_BY_WINDOW[observeWindowHours] ||
-    MONITOR_RECENT_SCAN_LIMIT_BY_WINDOW[
-      DEFAULT_MONITOR_SETTINGS.observeWindowHours
-    ];
-  const requestedPostsLimit = Number(monitorSettings.postsLimit);
-  const normalizedPostsLimit =
-    Number.isSafeInteger(requestedPostsLimit) && requestedPostsLimit > 0
-      ? requestedPostsLimit
-      : defaultMaxDetectedItems;
-  const verifyPublishDateFromDetail =
-    captureSettings.verifyPublishDateFromDetail === true;
-  const scanLatestPostsByCount =
-    captureSettings.scanLatestPostsByCount === true;
-  const maxDetectedItems =
-    scanLatestPostsByCount
-      ? Math.min(MONITOR_LATEST_POSTS_LIMIT_MAX, normalizedPostsLimit)
-      : verifyPublishDateFromDetail
-      ? Math.min(
-          MONITOR_DETAIL_DATE_DISCOVERY_MAX,
-          Math.max(
-            MONITOR_DETAIL_DATE_DISCOVERY_MIN,
-            normalizedPostsLimit * MONITOR_DETAIL_DATE_DISCOVERY_MULTIPLIER,
-          ),
-        )
-      : Math.min(defaultMaxDetectedItems, normalizedPostsLimit);
-  const publishBounds = resolveMonitorPublishWindowBounds(monitorSettings);
-  const publishWindow = publishBounds.key;
-  const isStrictPublishWindow = publishBounds.strict === true;
-  const monitorScanLimit = scanLatestPostsByCount
-    ? maxDetectedItems
-    : verifyPublishDateFromDetail
-    ? maxDetectedItems
-    : isStrictPublishWindow
-      ? Math.min(
-          maxDetectedItems,
-          publishWindow === MONITOR_PUBLISH_WINDOW.PREVIOUS_DAY ? 20 : 12,
-        )
-      : maxDetectedItems;
-  const likeThreshold = Math.max(
-    0,
-    Number(monitorSettings.likeThreshold) ||
-      DEFAULT_MONITOR_SETTINGS.likeThreshold,
-  );
-
-  return {
-    includeBloggerProfileRecord: false,
-    // 监控先纳入最近动态；点赞阈值用于后续判断，不在采集阶段过滤。
-    minLikes: 0,
-    maxDetectedItems: Math.floor(monitorScanLimit),
-    monitorLikeThreshold: Math.floor(likeThreshold),
-    // 账号作品列表不一定提供可信发布时间。官方账号评论巡查先把列表当作
-    // 候选来源，进入详情页核实日期后再筛选，避免在列表阶段误判。
-    monitorPublishWindow:
-      verifyPublishDateFromDetail || scanLatestPostsByCount
-        ? ""
-        : publishWindow,
-    monitorObserveWindowHours: observeWindowHours,
-    waitMinMs:
-      Number(captureSettings.sharedWaitMinMs) ||
-      DEFAULT_CAPTURE_SETTINGS.sharedWaitMinMs,
-    waitMaxMs:
-      Number(captureSettings.sharedWaitMaxMs) ||
-      DEFAULT_CAPTURE_SETTINGS.sharedWaitMaxMs,
-    stallTimeoutMs:
-      Number(captureSettings.sharedStallTimeoutMs) ||
-      DEFAULT_CAPTURE_SETTINGS.sharedStallTimeoutMs,
-    maxDurationMs:
-      Number(captureSettings.sharedMaxDurationMs) ||
-      DEFAULT_CAPTURE_SETTINGS.sharedMaxDurationMs,
-    maxScrollTimes:
-      scanLatestPostsByCount
-        ? Math.max(
-            20,
-            Math.min(60, Math.ceil(Math.floor(monitorScanLimit) / 2)),
-          )
-        : verifyPublishDateFromDetail || !isStrictPublishWindow
-          ? 20
-          : 6,
-  };
-}
-
-function summarizeMonitorSyncResult(syncResult = {}) {
-  const results = Array.isArray(syncResult.results) ? syncResult.results : [];
-  const successCount = results.filter((item) => item?.success).length;
-  const failedCount = results.length - successCount;
-  const actionCounts = results.reduce(
-    (acc, item) => {
-      const raw = item?.rawResponse || {};
-      const action = String(raw.action || item?.action || "")
-        .trim()
-        .toLowerCase();
-      if (action === "inserted") {
-        acc.inserted += 1;
-      } else if (action === "updated") {
-        acc.updated += 1;
-      }
-      const negative = Number(raw?.commentStats?.negative || 0);
-      if (Number.isFinite(negative) && negative > 0) {
-        acc.negative += negative;
-      }
-      return acc;
-    },
-    {inserted: 0, updated: 0, negative: 0},
-  );
-
-  return {
-    successCount,
-    failedCount,
-    insertedCount: actionCounts.inserted,
-    updatedCount: actionCounts.updated,
-    negativeCount: actionCounts.negative,
-  };
-}
-
-function getShanghaiDayStartMs(timestamp = Date.now()) {
-  const normalized = Number(timestamp);
-  const safeTimestamp = Number.isFinite(normalized) ? normalized : Date.now();
-  return (
-    Math.floor((safeTimestamp + MONITOR_SHANGHAI_OFFSET_MS) / MONITOR_DAY_MS) *
-      MONITOR_DAY_MS -
-    MONITOR_SHANGHAI_OFFSET_MS
-  );
-}
-
-function getShanghaiDateParts(timestamp = Date.now()) {
-  const date = new Date(Number(timestamp) + MONITOR_SHANGHAI_OFFSET_MS);
-  return {
-    year: date.getUTCFullYear(),
-    month: date.getUTCMonth() + 1,
-    day: date.getUTCDate(),
-  };
-}
-
-function buildShanghaiTimestamp({
-  year,
-  month,
-  day,
-  hour = 0,
-  minute = 0,
-  second = 0,
-  millisecond = 0,
-}) {
-  const timestamp =
-    Date.UTC(
-      Number(year),
-      Number(month) - 1,
-      Number(day),
-      Number(hour),
-      Number(minute),
-      Number(second),
-      Number(millisecond),
-    ) - MONITOR_SHANGHAI_OFFSET_MS;
-  return Number.isFinite(timestamp) ? timestamp : NaN;
-}
-
-function parseMonitorCalendarDateStartMs(value) {
-  const match = String(value || "")
-    .trim()
-    .match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!match) {
-    return NaN;
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const timestamp = buildShanghaiTimestamp({year, month, day});
-  if (!Number.isFinite(timestamp)) {
-    return NaN;
-  }
-  const parts = getShanghaiDateParts(timestamp);
-  return parts.year === year && parts.month === month && parts.day === day
-    ? timestamp
-    : NaN;
-}
-
-function resolveMonitorPublishWindowBounds(
-  publishWindowOrSettings,
-  nowMs = Date.now(),
-) {
-  const settings =
-    publishWindowOrSettings &&
-    typeof publishWindowOrSettings === "object" &&
-    !Array.isArray(publishWindowOrSettings)
-      ? publishWindowOrSettings
-      : {publishWindow: publishWindowOrSettings};
-  const publishDateFrom = String(settings.publishDateFrom || "").trim();
-  const publishDateTo = String(settings.publishDateTo || "").trim();
-  const customStartMs = parseMonitorCalendarDateStartMs(publishDateFrom);
-  const customEndStartMs = parseMonitorCalendarDateStartMs(publishDateTo);
-  if (
-    Number.isFinite(customStartMs) &&
-    Number.isFinite(customEndStartMs) &&
-    customStartMs <= customEndStartMs
-  ) {
-    return {
-      key: "custom",
-      label:
-        publishDateFrom === publishDateTo
-          ? `${publishDateFrom} 发布`
-          : `${publishDateFrom} 至 ${publishDateTo} 发布`,
-      strict: true,
-      startMs: customStartMs,
-      endMs: customEndStartMs + MONITOR_DAY_MS,
-    };
-  }
-
-  const normalized = MONITOR_PUBLISH_WINDOW_OPTIONS.has(settings.publishWindow)
-    ? settings.publishWindow
-    : DEFAULT_MONITOR_SETTINGS.publishWindow;
-
-  if (normalized === MONITOR_PUBLISH_WINDOW.PREVIOUS_DAY) {
-    const todayStartMs = getShanghaiDayStartMs(nowMs);
-    return {
-      key: normalized,
-      label: "昨天发布",
-      strict: true,
-      startMs: todayStartMs - MONITOR_DAY_MS,
-      endMs: todayStartMs,
-    };
-  }
-
-  if (normalized === MONITOR_PUBLISH_WINDOW.LAST_24H) {
-    return {
-      key: normalized,
-      label: "最近 24 小时发布",
-      strict: true,
-      startMs: nowMs - MONITOR_DAY_MS,
-      endMs: nowMs,
-    };
-  }
-
-  return resolveMonitorPublishWindowBounds(
-    DEFAULT_MONITOR_SETTINGS.publishWindow,
-    nowMs,
-  );
-}
-
-function cleanMonitorPublishText(value) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .replace(/^发布时间[:：]?\s*/i, "")
-    .replace(/^发布于[:：]?\s*/i, "")
-    .replace(/^编辑于\s*/i, "")
-    .replace(/^·\s*/, "")
-    .trim();
-}
-
-function createMonitorPublishMoment(
-  timestamp,
-  {precision = "exact", raw = ""} = {},
-) {
-  const normalized = Number(timestamp);
-  if (!Number.isFinite(normalized) || normalized <= 0) {
-    return null;
-  }
-  if (precision === "date") {
-    const startMs = getShanghaiDayStartMs(normalized);
-    return {
-      ok: true,
-      raw,
-      precision: "date",
-      timestampMs: startMs,
-      startMs,
-      endMs: startMs + MONITOR_DAY_MS,
-    };
-  }
-  return {
-    ok: true,
-    raw,
-    precision: "exact",
-    timestampMs: normalized,
-    startMs: normalized,
-    endMs: normalized,
-  };
-}
-
-function parseMonitorNumericPublishMoment(value, raw = "") {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) {
-    return null;
-  }
-  const timestampMs = numeric < 100000000000 ? numeric * 1000 : numeric;
-  return createMonitorPublishMoment(timestampMs, {raw});
-}
-
-function resolveYearForMonthDay(month, day, nowMs, hour = 0, minute = 0) {
-  const {year} = getShanghaiDateParts(nowMs);
-  const timestamp = buildShanghaiTimestamp({year, month, day, hour, minute});
-  if (Number.isFinite(timestamp) && timestamp > nowMs + MONITOR_DAY_MS) {
-    return year - 1;
-  }
-  return year;
-}
-
-function parseMonitorPublishMoment(value, nowMs = Date.now()) {
-  if (value instanceof Date) {
-    return createMonitorPublishMoment(value.getTime(), {
-      raw: value.toISOString(),
-    });
-  }
-  if (typeof value === "number") {
-    return parseMonitorNumericPublishMoment(value, String(value));
-  }
-
-  const text = cleanMonitorPublishText(value);
-  if (!text) {
-    return null;
-  }
-
-  if (/^\d{10,13}$/.test(text)) {
-    return parseMonitorNumericPublishMoment(text, text);
-  }
-
-  if (/^\d{4}-\d{2}-\d{2}T/i.test(text)) {
-    const parsed = Date.parse(text);
-    if (Number.isFinite(parsed)) {
-      return createMonitorPublishMoment(parsed, {raw: text});
-    }
-  }
-
-  let match = text.match(
-    /(\d{4})[年\-/.](\d{1,2})[月\-/.](\d{1,2})日?(?:\s+|T)?(\d{1,2})[:：](\d{2})/,
-  );
-  if (match) {
-    const [, year, month, day, hour, minute] = match;
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day, hour, minute}),
-      {raw: text},
-    );
-  }
-
-  match = text.match(/(\d{4})[年\-/.](\d{1,2})[月\-/.](\d{1,2})日?/);
-  if (match) {
-    const [, year, month, day] = match;
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day}),
-      {precision: "date", raw: text},
-    );
-  }
-
-  match = text.match(/(\d{1,2})月(\d{1,2})日\s*(\d{1,2})[:：](\d{2})/);
-  if (match) {
-    const [, month, day, hour, minute] = match;
-    const year = resolveYearForMonthDay(month, day, nowMs, hour, minute);
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day, hour, minute}),
-      {raw: text},
-    );
-  }
-
-  match = text.match(/(\d{1,2})[-/.](\d{1,2})\s*(\d{1,2})[:：](\d{2})/);
-  if (match) {
-    const [, month, day, hour, minute] = match;
-    const year = resolveYearForMonthDay(month, day, nowMs, hour, minute);
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day, hour, minute}),
-      {raw: text},
-    );
-  }
-
-  match = text.match(/(\d{1,2})月(\d{1,2})日/);
-  if (match) {
-    const [, month, day] = match;
-    const year = resolveYearForMonthDay(month, day, nowMs);
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day}),
-      {precision: "date", raw: text},
-    );
-  }
-
-  match = text.match(/(\d{1,2})[-/.](\d{1,2})/);
-  if (match) {
-    const [, month, day] = match;
-    const year = resolveYearForMonthDay(month, day, nowMs);
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day}),
-      {precision: "date", raw: text},
-    );
-  }
-
-  match = text.match(/今天\s*(\d{1,2})[:：](\d{2})/);
-  if (match) {
-    const [, hour, minute] = match;
-    const {year, month, day} = getShanghaiDateParts(nowMs);
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day, hour, minute}),
-      {raw: text},
-    );
-  }
-
-  match = text.match(/昨天\s*(?:(\d{1,2})[:：](\d{2}))?/);
-  if (match) {
-    const {year, month, day} = getShanghaiDateParts(nowMs);
-    const hour = match[1] || 0;
-    const minute = match[2] || 0;
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day: day - 1, hour, minute}),
-      {precision: match[1] ? "exact" : "date", raw: text},
-    );
-  }
-
-  match = text.match(/前天\s*(?:(\d{1,2})[:：](\d{2}))?/);
-  if (match) {
-    const {year, month, day} = getShanghaiDateParts(nowMs);
-    const hour = match[1] || 0;
-    const minute = match[2] || 0;
-    return createMonitorPublishMoment(
-      buildShanghaiTimestamp({year, month, day: day - 2, hour, minute}),
-      {precision: match[1] ? "exact" : "date", raw: text},
-    );
-  }
-
-  match = text.match(/(\d+)\s*分钟前/);
-  if (match) {
-    return createMonitorPublishMoment(nowMs - Number(match[1]) * 60 * 1000, {
-      raw: text,
-    });
-  }
-
-  match = text.match(/(\d+)\s*小时前/);
-  if (match) {
-    return createMonitorPublishMoment(nowMs - Number(match[1]) * 60 * 60 * 1000, {
-      raw: text,
-    });
-  }
-
-  match = text.match(/(\d+)\s*天前\s*(?:(\d{1,2})[:：](\d{2}))?/);
-  if (match) {
-    const days = Number(match[1]) || 0;
-    if (match[2]) {
-      const {year, month, day} = getShanghaiDateParts(nowMs);
-      return createMonitorPublishMoment(
-        buildShanghaiTimestamp({
-          year,
-          month,
-          day: day - days,
-          hour: match[2],
-          minute: match[3] || 0,
-        }),
-        {raw: text},
-      );
-    }
-    const dayStartMs = getShanghaiDayStartMs(nowMs - days * MONITOR_DAY_MS);
-    return createMonitorPublishMoment(dayStartMs, {
-      precision: "date",
-      raw: text,
-    });
-  }
-
-  if (/刚刚|刚才|现在/.test(text)) {
-    return createMonitorPublishMoment(nowMs, {raw: text});
-  }
-
-  const parsed = Date.parse(text);
-  if (Number.isFinite(parsed)) {
-    return createMonitorPublishMoment(parsed, {raw: text});
-  }
-
-  return null;
-}
-
-function collectMonitorPublishCandidates(
-  record = {},
-  {detailOnly = false} = {},
-) {
-  const payload =
-    record?.payload && typeof record.payload === "object" ? record.payload : {};
-  const item =
-    Array.isArray(payload.items) &&
-    payload.items[0] &&
-    typeof payload.items[0] === "object"
-      ? payload.items[0]
-      : {};
-  const detail =
-    payload.detailPayload && typeof payload.detailPayload === "object"
-      ? payload.detailPayload
-      : {};
-
-  const detailCandidates = [
-    {value: detail.publishTimestamp, source: "detail.publishTimestamp"},
-    {value: detail.publishTime, source: "detail.publishTime"},
-    {value: detail.publishDateRaw, source: "detail.publishDateRaw"},
-    {value: detail.lastEditedAt, source: "detail.lastEditedAt"},
-    {value: detail.publishDate, source: "detail.publishDate"},
-  ];
-  if (detailOnly) {
-    return detailCandidates;
-  }
-
-  return [
-    ...detailCandidates,
-    {value: item.publishTimestamp, source: "item.publishTimestamp"},
-    {value: item.publishTime, source: "item.publishTime"},
-    {value: item.publishDateRaw, source: "item.publishDateRaw"},
-    {value: item.lastEditedAt, source: "item.lastEditedAt"},
-    {value: item.publishDate, source: "item.publishDate"},
-    {value: payload.publishTimestamp, source: "payload.publishTimestamp"},
-    {value: payload.publishTime, source: "payload.publishTime"},
-    {value: payload.publishDateRaw, source: "payload.publishDateRaw"},
-    {value: payload.lastEditedAt, source: "payload.lastEditedAt"},
-    {value: payload.publishDate, source: "payload.publishDate"},
-  ];
-}
-
-function isLikelyFallbackCaptureTime(
-  record,
-  candidate,
-  moment,
-  {detailOnly = false} = {},
-) {
-  const source = String(candidate?.source || "");
-  if (!/lastEditedAt/i.test(source) || !moment?.timestampMs) {
-    return false;
-  }
-
-  const rawDateSignals = collectMonitorPublishCandidates(record, {
-    detailOnly,
-  }).some((item) => {
-    const candidateSource = String(item.source || "");
-    return (
-      !/lastEditedAt/i.test(candidateSource) &&
-      cleanMonitorPublishText(item.value)
-    );
-  });
-  if (rawDateSignals) {
-    return false;
-  }
-
-  const payload =
-    record?.payload && typeof record.payload === "object" ? record.payload : {};
-  const detail =
-    payload.detailPayload && typeof payload.detailPayload === "object"
-      ? payload.detailPayload
-      : {};
-  const captureTimestamp = Number(
-    detail.captureTimestamp ||
-      payload.detailCaptureFinishedAt ||
-      payload.captureTimestamp ||
-      record.updatedAt ||
-      0,
-  );
-  return (
-    Number.isFinite(captureTimestamp) &&
-    captureTimestamp > 0 &&
-    Math.abs(moment.timestampMs - captureTimestamp) <= 2 * 60 * 1000
-  );
-}
-
-function resolveMonitorRecordPublishMoment(
-  record,
-  nowMs = Date.now(),
-  {detailOnly = false} = {},
-) {
-  const candidates = collectMonitorPublishCandidates(record, {detailOnly});
-  for (const candidate of candidates) {
-    const moment = parseMonitorPublishMoment(candidate.value, nowMs);
-    if (!moment) {
-      continue;
-    }
-    if (
-      isLikelyFallbackCaptureTime(record, candidate, moment, {detailOnly})
-    ) {
-      continue;
-    }
-    return {
-      ...moment,
-      source: candidate.source,
-    };
-  }
-  return null;
-}
-
-function isMonitorPublishMomentInWindow(moment, bounds) {
-  if (!bounds?.strict) {
-    return true;
-  }
-  if (!moment?.ok) {
-    return false;
-  }
-  if (moment.precision === "date") {
-    return moment.startMs >= bounds.startMs && moment.endMs <= bounds.endMs;
-  }
-  return moment.timestampMs >= bounds.startMs && moment.timestampMs < bounds.endMs;
-}
-
 function refreshVerifiedAuthSnapshot(options = {}) {
   if (authRefreshPromise) return authRefreshPromise;
   const pending = queueAuthVerification(() => refreshVerifiedAuthSnapshotImpl(options));
@@ -13199,59 +5734,6 @@ async function refreshVerifiedAuthSnapshotImpl({showFeedback = false} = {}) {
   }
 }
 
-async function handleAddMonitorFromRecord(recordId) {
-  if (!isMonitorAuthReady()) {
-    showMessage(MONITOR_REQUIRED_MESSAGE, "warning");
-    return;
-  }
-
-  const dataPool = getCurrentDataPool();
-  const records = Array.isArray(dataPool?.records) ? dataPool.records : [];
-  const record = records.find((item) => item?.id === recordId) || null;
-  const candidate = buildMonitorCandidateFromRecord(record);
-
-  if (!candidate) {
-    showMessage("当前博主卡缺少可用信息，无法纳入监控", "error");
-    return;
-  }
-
-  showProgress("正在将博主卡纳入监控...");
-
-  try {
-    await addMonitorSubscriptionByCandidate(candidate);
-  } catch (error) {
-    console.error("[Sidebar] Add monitor from record failed:", error);
-    showMessage(`纳入监控失败: ${error.message}`, "error");
-  } finally {
-    hideProgress();
-  }
-}
-
-function resolveMonitorSettingsSaveErrorMessage(message) {
-  const raw = String(message || "").trim();
-  if (!raw) {
-    return "保存监控规则失败";
-  }
-
-  if (raw.includes("monitor tables are missing in database")) {
-    return "保存失败：本地数据库缺少监控相关表，请先执行数据库迁移。";
-  }
-
-  if (raw.includes("monitor table columns are out of date")) {
-    return "保存失败：本地数据库表结构版本过旧，请执行最新数据库迁移。";
-  }
-
-  if (raw.includes("credential owner user is missing in database")) {
-    return "保存失败：当前激活码关联用户不存在，请重新验证激活码。";
-  }
-
-  if (raw.includes("failed to save monitor settings")) {
-    return "保存失败：后端未能写入监控设置，请检查本地后端日志。";
-  }
-
-  return raw;
-}
-
 function authResponseValue(result, key, fallback = null) {
   if (result?.data && Object.prototype.hasOwnProperty.call(result.data, key)) {
     return result.data[key];
@@ -13271,101 +5753,6 @@ function authSnapshotFromVerifyResult(result, currentAuth = {}) {
     binding: authResponseValue(result, "binding", currentAuth.binding ?? null),
     captureAgent: authResponseValue(result, "captureAgent", currentAuth.captureAgent ?? null),
   };
-}
-
-async function handleSaveMonitorSettings() {
-  const settings = readMonitorSettingsForm();
-  if (!isMonitorAuthReady()) {
-    await setCurrentMonitor({
-      settings,
-    });
-    return;
-  }
-
-  await setCurrentMonitor({isSavingSettings: true});
-  const result = await saveMonitorSettings(settings);
-  await setCurrentMonitor({isSavingSettings: false});
-
-  if (!result?.ok) {
-    showMessage(
-      resolveMonitorSettingsSaveErrorMessage(result?.message),
-      "error",
-    );
-    return;
-  }
-
-  const savedSettings = normalizeMonitorSettingsInput(
-    result.data?.settings || settings,
-  );
-  await setCurrentMonitor({
-    settings: savedSettings,
-  });
-  populateMonitorSettingsForm(savedSettings);
-  await loadMonitorSubscriptions({force: true});
-  showMessage("监控规则已保存", "success");
-}
-
-async function handleMonitorListClick(event) {
-  const actionButton = event.target.closest(
-    ".btn-monitor-toggle, .btn-monitor-delete",
-  );
-  if (!actionButton) {
-    return;
-  }
-
-  const subscriptionId = String(actionButton.dataset.id || "").trim();
-  if (!subscriptionId) {
-    return;
-  }
-
-  const monitor = getCurrentMonitor() || {};
-  const subscription = Array.isArray(monitor.items)
-    ? monitor.items.find((item) => item.id === subscriptionId)
-    : null;
-
-  if (!subscription) {
-    showMessage("监控项不存在，请刷新后重试", "error");
-    return;
-  }
-
-  if (actionButton.classList.contains("btn-monitor-toggle")) {
-    const nextStatus = String(
-      actionButton.dataset.nextStatus || MONITOR_STATUS.PAUSED,
-    ).trim();
-    const result = await updateMonitorSubscription(subscription.id, {
-      status: nextStatus,
-    });
-    if (!result?.ok) {
-      showMessage(result?.message || "更新监控状态失败", "error");
-      return;
-    }
-    await loadMonitorSubscriptions({force: true});
-    showMessage(
-      nextStatus === MONITOR_STATUS.ACTIVE ? "监控已恢复" : "监控已暂停",
-      "success",
-    );
-    return;
-  }
-
-  if (actionButton.classList.contains("btn-monitor-delete")) {
-    const confirmed = window.confirm?.(
-      "删除后该监控项将从当前列表移除，是否继续？",
-    );
-    if (!confirmed) {
-      return;
-    }
-
-    const result = await updateMonitorSubscription(subscription.id, {
-      status: MONITOR_STATUS.DELETED,
-    });
-    if (!result?.ok) {
-      showMessage(result?.message || "删除监控失败", "error");
-      return;
-    }
-
-    await loadMonitorSubscriptions({force: true});
-    showMessage("监控已删除", "success");
-  }
 }
 
 /**
@@ -13680,7 +6067,7 @@ async function initCaptureSettingsUI() {
     if (inputKeywordMinLikes) {
       inputKeywordMinLikes.value = String(settings.keywordMinLikes);
     }
-    applyKeywordSortDimensionToUI(keywordSortDimension);
+    applyKeywordSortDimensionToUI(sidebarTaskController.readKeywordSortDimension());
 
     const inputKeywordMaxDetectedItems = document.getElementById(
       "inputKeywordMaxDetectedItems",
@@ -15398,172 +7785,6 @@ function readKeywordMaxDetectedItemsFromInput(
   return Math.floor(parsed);
 }
 
-function normalizeKeywordSortDimension(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
-  if (normalized === KEYWORD_SORT_DIMENSION.COLLECTS) {
-    return KEYWORD_SORT_DIMENSION.COLLECTS;
-  }
-  if (normalized === KEYWORD_SORT_DIMENSION.COMMENTS) {
-    return KEYWORD_SORT_DIMENSION.COMMENTS;
-  }
-  return KEYWORD_SORT_DIMENSION.LIKES;
-}
-
-function getKeywordSortDimensionLabel(dimension) {
-  const normalized = normalizeKeywordSortDimension(dimension);
-  return KEYWORD_SORT_DIMENSION_LABEL[normalized] || "点赞";
-}
-
-function applyKeywordSortDimensionToUI(dimension) {
-  const normalized = normalizeKeywordSortDimension(dimension);
-  const label = getKeywordSortDimensionLabel(normalized);
-  const labelNode = document.getElementById("labelKeywordMinThreshold");
-  if (labelNode) {
-    labelNode.textContent = `达到以下${label}数才会被采集`;
-  }
-
-  const inputNode = document.getElementById("inputKeywordMinLikes");
-  if (inputNode && !String(inputNode.placeholder || "").trim()) {
-    inputNode.placeholder = "例如 0";
-  }
-}
-
-async function syncKeywordSortDimensionByRuntime(runtime = null) {
-  const pageType = runtime?.pageType || getCurrentRuntime()?.pageType;
-  const pageUrl =
-    runtime?.lastPageUrl || getCurrentRuntime()?.lastPageUrl || "";
-  const pagePlatform = detectPlatformFromUrl(pageUrl);
-  if (
-    pageType !== PAGE_TYPE.SEARCH_RESULTS ||
-    !getPlatformCapabilities(pagePlatform).captureSearch
-  ) {
-    keywordSortDimension = KEYWORD_SORT_DIMENSION.LIKES;
-    applyKeywordSortDimensionToUI(keywordSortDimension);
-    stopKeywordSortSyncTimer();
-    return {
-      dimension: keywordSortDimension,
-      source: "default",
-    };
-  }
-
-  startKeywordSortSyncTimer();
-  return await syncKeywordSortDimensionFromPage({
-    fallbackDimension: keywordSortDimension,
-  });
-}
-
-function startKeywordSortSyncTimer() {
-  if (keywordSortSyncTimer) {
-    return;
-  }
-
-  keywordSortSyncTimer = setInterval(() => {
-    const runtime = getCurrentRuntime();
-    const pagePlatform = detectPlatformFromUrl(runtime?.lastPageUrl || "");
-    if (
-      runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS ||
-      !getPlatformCapabilities(pagePlatform).captureSearch
-    ) {
-      stopKeywordSortSyncTimer();
-      return;
-    }
-
-    syncKeywordSortDimensionFromPage({
-      fallbackDimension: keywordSortDimension,
-    }).catch((error) => {
-      console.warn("[Sidebar] Keyword sort sync tick failed:", error);
-    });
-  }, KEYWORD_SORT_SYNC_INTERVAL_MS);
-}
-
-function stopKeywordSortSyncTimer() {
-  if (!keywordSortSyncTimer) {
-    return;
-  }
-  clearInterval(keywordSortSyncTimer);
-  keywordSortSyncTimer = null;
-}
-
-async function syncKeywordSortDimensionFromPage({
-  force = false,
-  fallbackDimension = KEYWORD_SORT_DIMENSION.LIKES,
-} = {}) {
-  const runtime = getCurrentRuntime();
-  const pagePlatform = detectPlatformFromUrl(runtime?.lastPageUrl || "");
-  if (
-    runtime?.pageType !== PAGE_TYPE.SEARCH_RESULTS ||
-    !getPlatformCapabilities(pagePlatform).captureSearch
-  ) {
-    const fallback = normalizeKeywordSortDimension(fallbackDimension);
-    keywordSortDimension = fallback;
-    applyKeywordSortDimensionToUI(fallback);
-    return {
-      dimension: fallback,
-      source: "default",
-    };
-  }
-
-  try {
-    const detected = await detectKeywordSortDimensionFromActiveTab();
-    const normalized = normalizeKeywordSortDimension(
-      detected?.dimension || fallbackDimension,
-    );
-    if (force || normalized !== keywordSortDimension) {
-      keywordSortDimension = normalized;
-      applyKeywordSortDimensionToUI(normalized);
-    }
-    return {
-      dimension: normalized,
-      source: detected?.source || "default",
-    };
-  } catch (error) {
-    console.warn("[Sidebar] Detect keyword sort dimension failed:", error);
-    const fallback = normalizeKeywordSortDimension(fallbackDimension);
-    if (force) {
-      keywordSortDimension = fallback;
-      applyKeywordSortDimensionToUI(fallback);
-    }
-    return {
-      dimension: fallback,
-      source: "fallback",
-    };
-  }
-}
-
-async function detectKeywordSortDimensionFromActiveTab() {
-  const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
-  if (!tab?.id) {
-    return {
-      dimension: KEYWORD_SORT_DIMENSION.LIKES,
-      source: "default",
-    };
-  }
-
-  const response = await chrome.runtime.sendMessage({
-    type: MESSAGE_TYPE.RELAY_TO_CONTENT,
-    tabId: tab.id,
-    payload: {
-      action: "detectSearchSortDimension",
-    },
-  });
-
-  if (!response?.ok || !response?.data?.ok) {
-    return {
-      dimension: KEYWORD_SORT_DIMENSION.LIKES,
-      source: "default",
-    };
-  }
-
-  return (
-    response.data.data || {
-      dimension: KEYWORD_SORT_DIMENSION.LIKES,
-      source: "default",
-    }
-  );
-}
-
 function extractKeywordFromUrl(url) {
   const normalizedUrl = String(url || "").trim();
   if (!normalizedUrl) return "";
@@ -17002,12 +9223,12 @@ function updatePageTypeUI(pageType) {
   });
 
   if (isSearch && selectedCapabilities.captureSearch) {
-    applyKeywordSortDimensionToUI(keywordSortDimension);
+    applyKeywordSortDimensionToUI(sidebarTaskController.readKeywordSortDimension());
     startKeywordSortSyncTimer();
   } else {
     stopKeywordSortSyncTimer();
-    keywordSortDimension = KEYWORD_SORT_DIMENSION.LIKES;
-    applyKeywordSortDimensionToUI(keywordSortDimension);
+    sidebarTaskController.replaceKeywordSortDimension(KEYWORD_SORT_DIMENSION.LIKES);
+    applyKeywordSortDimensionToUI(sidebarTaskController.readKeywordSortDimension());
   }
   maybeResetKeywordOpportunityForCurrentSearch(runtime);
   renderKeywordStrategyPanel();
@@ -17841,84 +10062,7 @@ function isUnsupportedPlatformCoverVisible() {
 /**
  * 显示进度
  */
-function showProgress(message, showUI = true) {
-  if (
-    document.getElementById("progressContainer")?.dataset.progressSource ===
-    "keyword-plan"
-  ) {
-    clearKeywordPlanProgressCountdown();
-  }
-  resetCaptureRecoveryUI({hidePanel: false, clearState: true});
-  const showPanel = Boolean(showUI) && !isUnsupportedPlatformCoverVisible();
-  const progressContainer = document.getElementById("progressContainer");
-  if (progressContainer) {
-    progressContainer.dataset.progressSource = "capture";
-    if (sidebarTaskController.readActiveUnattendedRunRequestId()) {
-      progressContainer.dataset.unattendedProgressState = "running";
-    } else {
-      delete progressContainer.dataset.unattendedProgressState;
-    }
-    progressContainer.style.display = showPanel ? "block" : "none";
-  }
 
-  const progressText = document.getElementById("progressText");
-  const progressBar = document.getElementById("progressBar");
-  if (progressText && showPanel) {
-    progressText.textContent = message;
-    if (progressBar) {
-      progressBar.className = "status-bar capture-recovery-status is-info";
-    }
-  }
-
-  setCaptureButtonsDisabled(true);
-
-  // 显示取消按钮
-  const btnCancel = document.getElementById("btnCancel");
-  if (btnCancel && showPanel) {
-    btnCancel.hidden = false;
-    btnCancel.disabled = false;
-    btnCancel.style.display = "inline-block";
-  } else if (btnCancel) {
-    btnCancel.style.display = "none";
-  }
-}
-
-function hideProgressPanelOnly({
-  force = false,
-  preserveUnattendedTerminalState = false,
-} = {}) {
-  const progressContainer = document.getElementById("progressContainer");
-  if (
-    !force &&
-    progressContainer?.dataset.progressSource === "capture-recovery" &&
-    progressContainer?.dataset.recoveryPinned === "true"
-  ) {
-    return;
-  }
-  const wasRecovery =
-    progressContainer?.dataset.progressSource === "capture-recovery";
-  const keepUnattendedTerminalState = Boolean(
-    preserveUnattendedTerminalState ||
-      progressContainer?.dataset?.unattendedProgressState === "terminal",
-  );
-  if (progressContainer) {
-    progressContainer.style.display = "none";
-    delete progressContainer.dataset.progressSource;
-    if (!keepUnattendedTerminalState) {
-      delete progressContainer.dataset.unattendedProgressState;
-    }
-  }
-
-  const btnCancel = document.getElementById("btnCancel");
-  if (btnCancel) {
-    btnCancel.hidden = true;
-    btnCancel.disabled = true;
-    btnCancel.style.display = "none";
-  }
-  if (wasRecovery) {
-    resetCaptureRecoveryUI({hidePanel: false, clearState: true});
-  }
-}
 
 function isTerminalProgressPhase(phase) {
   const normalized = String(phase || "")
@@ -18117,30 +10261,303 @@ function updateBatchProgress(progress, scope = "modal") {
 
 // Assemble after all original constants/inputs initialize, before either startup
 // path can invoke a command. No task is started by controller construction.
+const legacyKeywordView = createLegacyKeywordView({
+  ports: {
+    createClipboardItem: items => new ClipboardItem(items),
+    DEFAULT_MONITOR_SETTINGS,
+    HTMLElement,
+    createImage: () => new Image(),
+    KEYWORD_PLAN_CONTROL_IDS,
+    KEYWORD_PLAN_MODE_LABELS,
+    KEYWORD_PLAN_STATUS_LABELS,
+    KEYWORD_PLAN_TERMINAL_STATUSES,
+    KEYWORD_SORT_DIMENSION_LABEL,
+    MAX_BATCH_KEYWORDS,
+    MONITOR_REQUIRED_MESSAGE,
+    MONITOR_SUBJECT_TYPE,
+    PAGE_TYPE,
+    SEARCH_FILTER_FIELD_META,
+    SEARCH_FILTER_SCOPE_META,
+    chrome,
+    clearInterval,
+    console,
+    document,
+    escapeHtml,
+    getCurrentRuntime,
+    getPagePlatform,
+    getPlatformCapabilities,
+    getViewPlatform,
+    isUnsupportedPlatformCoverVisible,
+    navigator,
+    renderCaptureDebugSession,
+    setInterval,
+    setTimeout,
+    showMessage,
+    window,
+  },
+  application: Object.freeze({
+    selectKeywordStrategyTab: (...args) => sidebarTaskController.selectKeywordStrategyTab(...args),
+    openKeywordLongtail: (...args) => sidebarTaskController.openKeywordLongtail(...args),
+    renderKeywordPlanStatus: (...args) => sidebarTaskController.renderKeywordPlanStatus(...args),
+    handleLegacyMonitorAction: (...args) => sidebarTaskController.handleLegacyMonitorAction(...args),
+    monitorLegacyBenchmarkCandidate: (...args) => sidebarTaskController.monitorLegacyBenchmarkCandidate(...args),
+    addMonitorSubscriptionByCandidate: (...args) => sidebarTaskController.addMonitorSubscriptionByCandidate(...args),
+    buildBenchmarkDiscoveryDecisionAngle: (...args) => sidebarTaskController.buildBenchmarkDiscoveryDecisionAngle(...args),
+    buildBenchmarkDiscoveryFallbackAnalysis: (...args) => sidebarTaskController.buildBenchmarkDiscoveryFallbackAnalysis(...args),
+    buildBenchmarkDiscoveryRuleReason: (...args) => sidebarTaskController.buildBenchmarkDiscoveryRuleReason(...args),
+    buildKeywordRunDisplayPlan: (...args) => sidebarTaskController.buildKeywordRunDisplayPlan(...args),
+    dedupeKeywords: (...args) => sidebarTaskController.dedupeKeywords(...args),
+    extractPlatformMonitorBloggerId: (...args) => sidebarTaskController.extractPlatformMonitorBloggerId(...args),
+    getBatchDraftForPlatform: (...args) => sidebarTaskController.getBatchDraftForPlatform(...args),
+    getCurrentSearchKeyword: (...args) => sidebarTaskController.getCurrentSearchKeyword(...args),
+    getDateListFromText: (...args) => sidebarTaskController.getDateListFromText(...args),
+    getKeywordInsightSeedKeyword: (...args) => sidebarTaskController.getKeywordInsightSeedKeyword(...args),
+    getKeywordInsightState: (...args) => sidebarTaskController.getKeywordInsightState(...args),
+    getKeywordOpportunityKeyword: (...args) => sidebarTaskController.getKeywordOpportunityKeyword(...args),
+    getSearchBatchKeywordsFromTextarea: (...args) => sidebarTaskController.getSearchBatchKeywordsFromTextarea(...args),
+    getSearchFilterConfig: (...args) => sidebarTaskController.getSearchFilterConfig(...args),
+    getSelectedRecommendedKeywords: (...args) => sidebarTaskController.getSelectedRecommendedKeywords(...args),
+    getUnattendedRunRequestIdFromUrl: (...args) => sidebarTaskController.getUnattendedRunRequestIdFromUrl(...args),
+    hasVisibleLocalCaptureProgress: (...args) => sidebarTaskController.hasVisibleLocalCaptureProgress(...args),
+    isExplicitUserUnattendedCancellationMessage: (...args) => sidebarTaskController.isExplicitUserUnattendedCancellationMessage(...args),
+    isKeywordAnalysisLockStale: (...args) => sidebarTaskController.isKeywordAnalysisLockStale(...args),
+    isKeywordPlanRunning: (...args) => sidebarTaskController.isKeywordPlanRunning(...args),
+    isMonitorAuthReady: (...args) => sidebarTaskController.isMonitorAuthReady(...args),
+    normalizeDateListText: (...args) => sidebarTaskController.normalizeDateListText(...args),
+    normalizeKeywordPlanMode: (...args) => sidebarTaskController.normalizeKeywordPlanMode(...args),
+    normalizeKeywordSortDimension: (...args) => sidebarTaskController.normalizeKeywordSortDimension(...args),
+    normalizeMonitorSettingsInput: (...args) => sidebarTaskController.normalizeMonitorSettingsInput(...args),
+    normalizeMonitorSubjectType: (...args) => sidebarTaskController.normalizeMonitorSubjectType(...args),
+    normalizeSearchFilterPlatform: (...args) => sidebarTaskController.normalizeSearchFilterPlatform(...args),
+    normalizeSearchFilterValueForStorage: (...args) => sidebarTaskController.normalizeSearchFilterValueForStorage(...args),
+    parseKeywordsFromMultilineInput: (...args) => sidebarTaskController.parseKeywordsFromMultilineInput(...args),
+    resetCaptureRecoveryUI: (...args) => sidebarTaskController.resetCaptureRecoveryUI(...args),
+    syncSeedKeywordFromCurrentSearch: (...args) => sidebarTaskController.syncSeedKeywordFromCurrentSearch(...args),
+  }),
+  keywordModel: Object.freeze({
+    activeUnattendedRunRequestId: () => sidebarTaskController.readActiveUnattendedRunRequestId(),
+    expandedKeywordsBuffer: () => sidebarTaskController.readExpandedKeywordsBuffer(),
+    keywordAnalysisInFlight: () => sidebarTaskController.readKeywordAnalysisInFlight(),
+    keywordBenchmarkAnalysisStatus: () => sidebarTaskController.readKeywordBenchmarkAnalysisStatus(),
+    keywordBenchmarkErrorMessage: () => sidebarTaskController.readKeywordBenchmarkErrorMessage(),
+    keywordBenchmarkInFlight: () => sidebarTaskController.readKeywordBenchmarkInFlight(),
+    keywordBenchmarkLoadingMeta: () => sidebarTaskController.readKeywordBenchmarkLoadingMeta(),
+    keywordBenchmarkLoadingTitle: () => sidebarTaskController.readKeywordBenchmarkLoadingTitle(),
+    keywordBenchmarkResult: () => sidebarTaskController.readKeywordBenchmarkResult(),
+    keywordExpandCancelRequested: () => sidebarTaskController.readKeywordExpandCancelRequested(),
+    keywordExpandInFlight: () => sidebarTaskController.readKeywordExpandInFlight(),
+    keywordOpportunityErrorMessage: () => sidebarTaskController.readKeywordOpportunityErrorMessage(),
+    keywordOpportunityInFlight: () => sidebarTaskController.readKeywordOpportunityInFlight(),
+    keywordOpportunityResult: () => sidebarTaskController.readKeywordOpportunityResult(),
+    keywordPlanState: () => sidebarTaskController.readKeywordPlanState(),
+    keywordSortDimension: () => sidebarTaskController.readKeywordSortDimension(),
+    lastRuntimePageTypeForKeywordSort: () => sidebarTaskController.readLastRuntimePageTypeForKeywordSort(),
+    lastRuntimePageUrlForKeywordSort: () => sidebarTaskController.readLastRuntimePageUrlForKeywordSort(),
+  }),
+});
+const {
+  addSearchKeywordPlanDateFromPicker,
+  applyKeywordSortDimensionToUI,
+  buildBenchmarkDiscoveryCandidateEvidence,
+  buildBenchmarkDiscoveryRepresentativeWorks,
+  buildBenchmarkDiscoveryShareData,
+  buildBenchmarkDiscoveryShareText,
+  buildInsightShareData,
+  buildKeywordOpportunityShareData,
+  buildKeywordOpportunityShareText,
+  buildKeywordOpportunityTitleCandidates,
+  buildKeywordPlanProgressText,
+  clearKeywordPlanProgressCountdown,
+  collectKeywordPlanFromInputs,
+  collectSearchFiltersFromControls,
+  forEachKeywordPlanScope,
+  formatKeywordPlanRunTime,
+  formatOpportunityMetric,
+  getBatchKeywordsFromTextarea,
+  getKeywordExecutionCopy,
+  getKeywordPlanControl,
+  getKeywordSortDimensionLabel,
+  getMonitorSettingsElements,
+  getMonitorSubjectLabel,
+  getMonitorSubjectType,
+  getSearchFilterSelectValue,
+  handleBenchmarkDiscoveryResultActions,
+  handleCopyBenchmarkDiscovery,
+  handleCopyInsight,
+  handleCopyKeywordOpportunity,
+  handleKeywordInsightCategoryActions,
+  handleKeywordInsightSummaryActions,
+  handleKeywordOpportunityResultActions,
+  handleOpenKeywordLongtail,
+  handleMonitorListClick,
+  handleSearchKeywordPlanDateChipClick,
+  handleShareAsImage,
+  handleShareBenchmarkDiscoveryAsImage,
+  handleShareKeywordOpportunityAsImage,
+  hideKeywordPlanProgressPanelIfOwned,
+  normalizeKeywordOpportunityTitleForMatch,
+  normalizeKeywordPlanScope,
+  populateMonitorSettingsForm,
+  populateSearchFilterControlsFromFilters,
+  readMonitorSettingsForm,
+  readNonNegativeNumberInput,
+  readPositiveNumberInput,
+  renderBenchmarkDiscoveryCardToImage,
+  renderBenchmarkDiscoveryResult,
+  renderExpandedKeywords,
+  renderInsightCardToImage,
+  renderInsightCategories,
+  renderInsightLoadingState,
+  renderInsightSampleBlock,
+  renderInsightSummaryCard,
+  renderKeywordInsightState,
+  renderKeywordOpportunityCardToImage,
+  renderKeywordOpportunityResult,
+  renderKeywordPlanProgressText,
+  renderKeywordStrategyLoadingState,
+  renderKeywordStrategyPanel,
+  renderSearchFilterSelectOptions,
+  renderSearchKeywordPlanDateChips,
+  resolveKeywordOpportunityTitleUrl,
+  resolveMonitorDisplayName,
+  roundRect,
+  roundRectTop,
+  setKeywordStrategyTab,
+  setMonitorSubjectType,
+  setSearchExecutionMode,
+  setSearchKeywordPlanDateList,
+  showInsightImagePreview,
+  syncKeywordPlanDateFields,
+  syncSearchFilterControlsForPlatform,
+  toggleExpandedKeywordsVisibility,
+  toggleKeywordStrategyPanel,
+  unattendedSearchPassLabel,
+  updateExpandKeywordsButtonState,
+  updateExpandedKeywordsSummary,
+} = legacyKeywordView;
+const legacyTaskViewCapabilities = Object.freeze({
+  ...legacyKeywordView,
+  ...createLegacyCaptureInputsView({document, window, updateBatchKeywordInputState}),
+  ...createLegacyKeywordInputsView({document}),
+  ...createLegacyProgressVisibilityView({document, clearKeywordPlanProgressCountdown, setCaptureButtonsDisabled}),
+  ...createLegacyCaptureProgressView({
+    document, buildCaptureRecoveryAnnouncementKey, getKeywordSortDimensionLabel,
+    normalizeKeywordSortDimension: (...args) => sidebarTaskController.normalizeKeywordSortDimension(...args),
+    ERROR_MESSAGE_MAP, showMessage,
+  }),
+  isUnsupportedPlatformCoverVisible,
+});
+// Only semantic task capabilities cross this boundary. Node-returning legacy
+// helpers remain host/view-only, and are not new-UI authorization capabilities.
+const taskView = Object.freeze({
+  clearKeywordPlanCountdownForCaptureProgress: legacyTaskViewCapabilities.clearKeywordPlanCountdownForCaptureProgress,
+  showCaptureProgressPresentation: legacyTaskViewCapabilities.showCaptureProgressPresentation,
+  hideCaptureProgressPresentation: legacyTaskViewCapabilities.hideCaptureProgressPresentation,
+  applyKeywordSortDimensionToUI: legacyTaskViewCapabilities.applyKeywordSortDimensionToUI,
+  applyUnattendedKeywords: legacyTaskViewCapabilities.applyUnattendedKeywords,
+  applyUnattendedLoopSettings: legacyTaskViewCapabilities.applyUnattendedLoopSettings,
+  beginUnattendedCancelPresentation: legacyTaskViewCapabilities.beginUnattendedCancelPresentation,
+  buildCaptureProgressText: legacyTaskViewCapabilities.buildCaptureProgressText,
+  collectKeywordPlanFromInputs: legacyTaskViewCapabilities.collectKeywordPlanFromInputs,
+  confirmMonitorRemoval: legacyTaskViewCapabilities.confirmMonitorRemoval,
+  getMonitorSubjectLabel: legacyTaskViewCapabilities.getMonitorSubjectLabel,
+  getMonitorSubjectType: legacyTaskViewCapabilities.getMonitorSubjectType,
+  hideKeywordPlanProgressPanelIfOwned: legacyTaskViewCapabilities.hideKeywordPlanProgressPanelIfOwned,
+  isUnsupportedPlatformCoverVisible: legacyTaskViewCapabilities.isUnsupportedPlatformCoverVisible,
+  normalizeProgressCount: legacyTaskViewCapabilities.normalizeProgressCount,
+  openBatchDraftInputs: legacyTaskViewCapabilities.openBatchDraftInputs,
+  openCaptureProgressPresentation: legacyTaskViewCapabilities.openCaptureProgressPresentation,
+  openCaptureRecoveryPresentation: legacyTaskViewCapabilities.openCaptureRecoveryPresentation,
+  openKeywordPlanProgress: legacyTaskViewCapabilities.openKeywordPlanProgress,
+  openUrlBatchControls: legacyTaskViewCapabilities.openUrlBatchControls,
+  populateKeywordPlanKeywords: legacyTaskViewCapabilities.populateKeywordPlanKeywords,
+  populateKeywordPlanSchedule: legacyTaskViewCapabilities.populateKeywordPlanSchedule,
+  populateMonitorSettingsForm: legacyTaskViewCapabilities.populateMonitorSettingsForm,
+  readBatchLoopGapMinutesInput: legacyTaskViewCapabilities.readBatchLoopGapMinutesInput,
+  readBatchLoopRoundsInput: legacyTaskViewCapabilities.readBatchLoopRoundsInput,
+  readBatchScheduledStart: legacyTaskViewCapabilities.readBatchScheduledStart,
+  readCaptureCancelingMessage: legacyTaskViewCapabilities.readCaptureCancelingMessage,
+  readExpandedKeywordsInput: legacyTaskViewCapabilities.readExpandedKeywordsInput,
+  readMonitorSelectedPlatform: legacyTaskViewCapabilities.readMonitorSelectedPlatform,
+  readMonitorSettingsForm: legacyTaskViewCapabilities.readMonitorSettingsForm,
+  readRunnerLocationSearch: legacyTaskViewCapabilities.readRunnerLocationSearch,
+  readSearchBatchKeywordsText: legacyTaskViewCapabilities.readSearchBatchKeywordsText,
+  readSearchBatchMode: legacyTaskViewCapabilities.readSearchBatchMode,
+  readSearchScheduledStart: legacyTaskViewCapabilities.readSearchScheduledStart,
+  renderExpandedKeywords: legacyTaskViewCapabilities.renderExpandedKeywords,
+  renderKeywordInsightState: legacyTaskViewCapabilities.renderKeywordInsightState,
+  renderKeywordPlanStatusLabels: legacyTaskViewCapabilities.renderKeywordPlanStatusLabels,
+  renderKeywordStrategyPanel: legacyTaskViewCapabilities.renderKeywordStrategyPanel,
+  resetCaptureRecoveryPresentation: legacyTaskViewCapabilities.resetCaptureRecoveryPresentation,
+  setExpandedKeywordsVisible: legacyTaskViewCapabilities.setExpandedKeywordsVisible,
+  setStrategyActiveTab: legacyTaskViewCapabilities.setStrategyActiveTab,
+  setStrategyPanelVisible: legacyTaskViewCapabilities.setStrategyPanelVisible,
+  showBatchKeywordIdle: legacyTaskViewCapabilities.showBatchKeywordIdle,
+  showBatchKeywordRunning: legacyTaskViewCapabilities.showBatchKeywordRunning,
+  showBatchKeywordStopping: legacyTaskViewCapabilities.showBatchKeywordStopping,
+  showCaptureActionError: legacyTaskViewCapabilities.showCaptureActionError,
+  showCaptureActionException: legacyTaskViewCapabilities.showCaptureActionException,
+  showCaptureCancelPending: legacyTaskViewCapabilities.showCaptureCancelPending,
+  showCaptureCancelSignalFailure: legacyTaskViewCapabilities.showCaptureCancelSignalFailure,
+  showCaptureSuccess: legacyTaskViewCapabilities.showCaptureSuccess,
+  showEmptyCaptureResult: legacyTaskViewCapabilities.showEmptyCaptureResult,
+  showMissingRecoveryRecordNotice: legacyTaskViewCapabilities.showMissingRecoveryRecordNotice,
+  showPersistentCaptureReleaseWarning: legacyTaskViewCapabilities.showPersistentCaptureReleaseWarning,
+  syncKeywordPlanDateFields: legacyTaskViewCapabilities.syncKeywordPlanDateFields,
+  updateExpandKeywordsButtonState: legacyTaskViewCapabilities.updateExpandKeywordsButtonState,
+});
 const sidebarTaskController = createSidebarTaskController({
   ACTIVE_COMMENT_PROGRESS_PHASES,
+  AUTH_STATUS,
+  BATCH_DRAFT_LEGACY_KEYS,
+  BATCH_DRAFT_PLATFORMS,
+  BATCH_DRAFT_SESSION_KEY,
+  BENCHMARK_DISCOVERY_PROFILE_LIMIT,
+  BENCHMARK_DISCOVERY_RESULT_LIMIT,
   CAPTURE_EXECUTION_LOCK_HEARTBEAT_INTERVAL_MS,
   CAPTURE_EXECUTION_LOCK_HOLDER_ID,
   CAPTURE_RECOVERY_PHASES,
   CAPTURE_RECOVERY_UI_STALE_MS,
   CAPTURE_TASK_OWNER_PORT_NAME,
   COMMENT_PHASE_TO_TERMINAL_STATUS,
+  DEFAULT_CAPTURE_SETTINGS,
   DEFAULT_MONITOR_SETTINGS,
   DETAIL_CAPTURE_SCOPE_ALL,
   DETAIL_ITEM_SETTLED_PHASES,
   ERROR_MESSAGE_MAP,
   ERROR_REASON,
+  KEYWORD_ANALYSIS_STALE_LOCK_MS,
+  KEYWORD_INSIGHT_ANALYSIS_COST_CREDITS,
+  KEYWORD_OPPORTUNITY_ANALYSIS_COST_CREDITS,
+  KEYWORD_PLAN_MODES,
+  KEYWORD_PLAN_RECONCILE_INTERVAL_MS,
+  KEYWORD_PLAN_STORAGE_KEY,
   KEYWORD_PLAN_TERMINAL_STATUSES,
   KEYWORD_RUN_REQUEST_STORAGE_KEY,
+  KEYWORD_SORT_DIMENSION,
+  KEYWORD_SORT_SYNC_INTERVAL_MS,
   MAX_BATCH_KEYWORDS,
   MAX_SYNC_RECORDS_PER_BATCH,
   MESSAGE_TYPE,
+  MONITOR_DAY_MS,
+  MONITOR_DETAIL_DATE_DISCOVERY_MAX,
+  MONITOR_DETAIL_DATE_DISCOVERY_MIN,
+  MONITOR_DETAIL_DATE_DISCOVERY_MULTIPLIER,
+  MONITOR_LATEST_POSTS_LIMIT_MAX,
+  MONITOR_OBSERVE_WINDOW_OPTIONS,
+  MONITOR_PUBLISH_WINDOW,
+  MONITOR_PUBLISH_WINDOW_OPTIONS,
+  MONITOR_RECENT_SCAN_LIMIT_BY_WINDOW,
   MONITOR_REQUIRED_MESSAGE,
+  MONITOR_RUN_TIME_OPTIONS,
+  MONITOR_SHANGHAI_OFFSET_MS,
   MONITOR_STATUS,
   MONITOR_SUBJECT_TYPE,
   OPTIONAL_CAPTURE_ASSIST_SESSION_CODES,
   PAGE_ENHANCE_AUTH_REQUIRED_MESSAGE,
   PAGE_TYPE,
+  PLATFORM_SEARCH_FILTER_OPTIONS,
+  SEARCH_FILTER_FIELD_META,
   SYNC_BATCH_LIMIT_MESSAGE,
   SYNC_SCOPE_ALL,
   SYNC_SCOPE_PENDING,
@@ -18148,6 +10565,7 @@ const sidebarTaskController = createSidebarTaskController({
   TARGETED_POST_RUN_ATTEMPT_QUERY_KEY,
   TARGETED_POST_RUN_HEARTBEAT_INTERVAL_MS,
   TARGETED_POST_RUN_QUERY_KEY,
+  TARGETED_POST_RUN_REQUEST_STORAGE_KEY,
   UNATTENDED_BOOTSTRAP_GATE_MAX_WAIT_MS,
   UNATTENDED_CAPTURE_SESSION_MAX_ATTEMPTS,
   UNATTENDED_CAPTURE_SESSION_RETRYABLE_CODES,
@@ -18176,6 +10594,9 @@ const sidebarTaskController = createSidebarTaskController({
   UNATTENDED_TERMINAL_REPORT_RETRY_DELAYS_MS,
   addSyncHistoryEntry,
   advanceUnattendedCheckpointRound,
+  analyzeBenchmarkDiscovery,
+  analyzeKeywordOpportunity,
+  analyzeKeywords,
   batchCaptureByKeywords,
   batchCaptureByUrls,
   batchCaptureDetailsForRecords,
@@ -18187,29 +10608,27 @@ const sidebarTaskController = createSidebarTaskController({
   buildDetailCaptureBlockerMessage,
   buildDetailCaptureFailureSummaryText,
   buildDetailCaptureSyncWarningMessage,
-  buildKeywordRunDisplayPlan,
   buildStreamingSyncCompletionNotice,
   buildStreamingSyncTaskIssue,
   buildStreamingSyncTaskMetadata,
   buildSyncReconciliationError,
   captureAndSync,
   captureNoteWithOptionalComments,
+  captureTabContent,
   checkBeforeSync,
   chrome,
   clearInterval,
-  clearKeywordPlanProgressCountdown,
   clearTimeout,
   closeBatchModal,
   cloudTargetedPostApi,
   collectBatchRecordIds,
-  collectSearchFiltersFromControls,
   completeTaskContext,
   confirm,
   console,
+  createMonitorSubscription,
   createRecordSyncQueue,
   detectPlatformFromUrl,
   discardUnattendedCheckpointReports,
-  document,
   endCaptureTaskSession,
   enqueueUnattendedCheckpointReport,
   ensureAuthVerifiedOrWarn,
@@ -18218,11 +10637,12 @@ const sidebarTaskController = createSidebarTaskController({
   findUnattendedResumeKeyword,
   finishMonitorExecution,
   flushUnattendedCheckpointReportOutbox,
+  formatKeywordStrategyAccessError,
   formatStreamingSyncSummary,
   getActiveTaskContext,
   getAuthRequiredMessage,
-  getBatchKeywordsFromTextarea,
   getBatchRetryDetailRecordIds,
+  getBenchmarkDiscoveryAuthRequiredMessage,
   getCaptureBloggerMetricsChecked,
   getCaptureCommentsChecked,
   getCaptureSettings,
@@ -18234,8 +10654,9 @@ const sidebarTaskController = createSidebarTaskController({
   getCurrentRuntime,
   getCurrentTarget,
   getDetailCaptureTargetRecords,
-  getKeywordExecutionCopy,
-  getKeywordSortDimensionLabel,
+  getKeywordInsightAuthRequiredMessage,
+  getKeywordOpportunityAuthRequiredMessage,
+  getMonitorSettings,
   getPagePlatform,
   getPlatformCapabilities,
   getPlatformCopy,
@@ -18245,13 +10666,10 @@ const sidebarTaskController = createSidebarTaskController({
   getViewPlatform,
   hasSyncReconciliationSignal,
   hideProgress,
-  hideProgressPanelOnly,
+  hideProgressPanelOnly: (...args) => sidebarTaskController.hideProgressPanelOnly(...args),
   isAuthVerified,
   isDetailCaptureDone,
   isDetailCaptureRecord,
-  isExplicitUserUnattendedCancellationMessage,
-  isMonitorAuthReady,
-  isMonitorPublishMomentInWindow,
   isNoteDetailPending,
   isStorageQuotaError,
   isStreamingSyncReconciliationRequired,
@@ -18260,18 +10678,11 @@ const sidebarTaskController = createSidebarTaskController({
   isUnattendedSafetyBlock,
   isUnattendedTerminalProgressPhase,
   isUnsupportedPlatformCoverVisible,
-  loadActiveKeywordRunState,
-  loadKeywordPlanUI,
-  loadMonitorSubscriptions,
+  lightSampleByKeywords,
+  listMonitorExecutions,
+  listMonitorSubscriptions,
   loadStorageModule: () => import("../utils/storage.js"),
-  normalizeKeywordSortDimension,
-  normalizeMonitorRunnerPlatform,
-  normalizeMonitorSettingsInput,
-  normalizeMonitorSubjectType,
   normalizeUnattendedKeywordCheckpoint,
-  normalizeUnattendedSearchPasses,
-  parseSearchManualScheduledStart,
-  persistCurrentBatchDraft,
   readBloggerKeywordFilterFromInput,
   readBloggerMaxDetectedItemsFromInput,
   readBloggerMinLikesFromInput,
@@ -18282,6 +10693,7 @@ const sidebarTaskController = createSidebarTaskController({
   readKeywordMinLikesFromInput,
   readRequiredCommentsMaxDetectedItemsFromInput,
   readSyncScopeFromInput,
+  recordDiagnosticAction,
   recordDiagnosticError,
   recordDiagnosticTask,
   refreshDataPool,
@@ -18291,17 +10703,13 @@ const sidebarTaskController = createSidebarTaskController({
   renderCaptureDebugSession,
   repairInterruptedCommentPayload,
   repairInterruptedDetailCaptureRecords,
+  resetCurrentMonitor,
   resolveCaptureRecoveryView,
   resolveCompletedCheckpointKeywords,
   resolveCurrentDetailCaptureSettings,
-  resolveMonitorPublishWindowBounds,
-  resolveMonitorRecordPublishMoment,
-  resolveMonitorRunHistoryState,
-  resolveMonitorRunnerAccountUrl,
-  resolveMonitorRunnerCaptureParams,
-  resolveMonitorRunnerName,
   resolveNoteBatchCaptureSettings,
   resolveNoteDetailPendingText,
+  resolveRecordPlatform,
   resolveSyncInputForRecord,
   resolveTaskCaptureSettingsOverrides,
   resolveTaskKeywordMaxDetectedItems,
@@ -18309,52 +10717,88 @@ const sidebarTaskController = createSidebarTaskController({
   runEnhancementWithSingleRetry,
   runMonitorNow,
   runUnattendedKeywordAttempts,
+  saveMonitorSettings,
   setBatchProgressDetail,
   setBatchProgressVisible,
   setCancelFlag,
+  setCurrentMonitor,
   setInterval,
   setTimeout,
   settleUnattendedKeywordCheckpoint,
   shouldHideNoteBloggerMetricsToggle,
   showMessage,
-  showProgress,
+  showProgress: (...args) => sidebarTaskController.showProgress(...args),
   sleep,
   startMonitorExecution,
   summarizeDetailCaptureBlockers,
-  summarizeMonitorSyncResult,
   summarizeUnattendedKeywordCheckpoint,
   syncDetailCaptureControlsFromStoredSettings,
-  syncKeywordSortDimensionFromPage,
   syncRecordBatch,
-  syncSearchFilterControlsForPlatform,
-  unattendedSearchPassLabel,
   updateBatchKeywordInputState,
   updateBatchProgress,
   updateCaptureTaskSession,
   updateDataPoolUI,
+  updateMonitorSubscription,
   updatePageTypeUI,
   wait,
-  window,
-}, Object.freeze({
-  get keywordSortDimension() { return keywordSortDimension; },
-  get expandedKeywordsBuffer() { return expandedKeywordsBuffer; },
-  get keywordPlanState() { return keywordPlanState; },
-  set keywordPlanState(value) { keywordPlanState = value; },
-  get activeKeywordRunState() { return activeKeywordRunState; },
-  set activeKeywordRunState(value) { activeKeywordRunState = value; },
-}));
+  buildKeywordRunDisplayPlan: (...args) => sidebarTaskController.buildKeywordRunDisplayPlan(...args),
+  isExplicitUserUnattendedCancellationMessage: (...args) => sidebarTaskController.isExplicitUserUnattendedCancellationMessage(...args),
+  isMonitorAuthReady: (...args) => sidebarTaskController.isMonitorAuthReady(...args),
+  isMonitorPublishMomentInWindow: (...args) => sidebarTaskController.isMonitorPublishMomentInWindow(...args),
+  loadActiveKeywordRunState: (...args) => sidebarTaskController.loadActiveKeywordRunState(...args),
+  loadKeywordPlanUI: (...args) => sidebarTaskController.loadKeywordPlanUI(...args),
+  loadMonitorSubscriptions: (...args) => sidebarTaskController.loadMonitorSubscriptions(...args),
+  normalizeKeywordSortDimension: (...args) => sidebarTaskController.normalizeKeywordSortDimension(...args),
+  normalizeMonitorRunnerPlatform: (...args) => sidebarTaskController.normalizeMonitorRunnerPlatform(...args),
+  normalizeMonitorSettingsInput: (...args) => sidebarTaskController.normalizeMonitorSettingsInput(...args),
+  normalizeMonitorSubjectType: (...args) => sidebarTaskController.normalizeMonitorSubjectType(...args),
+  normalizeUnattendedSearchPasses: (...args) => sidebarTaskController.normalizeUnattendedSearchPasses(...args),
+  parseSearchManualScheduledStart: (...args) => sidebarTaskController.parseSearchManualScheduledStart(...args),
+  persistCurrentBatchDraft: (...args) => sidebarTaskController.persistCurrentBatchDraft(...args),
+  resolveMonitorPublishWindowBounds: (...args) => sidebarTaskController.resolveMonitorPublishWindowBounds(...args),
+  resolveMonitorRecordPublishMoment: (...args) => sidebarTaskController.resolveMonitorRecordPublishMoment(...args),
+  resolveMonitorRunHistoryState: (...args) => sidebarTaskController.resolveMonitorRunHistoryState(...args),
+  resolveMonitorRunnerAccountUrl: (...args) => sidebarTaskController.resolveMonitorRunnerAccountUrl(...args),
+  resolveMonitorRunnerCaptureParams: (...args) => sidebarTaskController.resolveMonitorRunnerCaptureParams(...args),
+  resolveMonitorRunnerName: (...args) => sidebarTaskController.resolveMonitorRunnerName(...args),
+  summarizeMonitorSyncResult: (...args) => sidebarTaskController.summarizeMonitorSyncResult(...args),
+  syncKeywordSortDimensionFromPage: (...args) => sidebarTaskController.syncKeywordSortDimensionFromPage(...args),
+  clearKeywordPlanProgressCountdown,
+  collectSearchFiltersFromControls,
+  getBatchKeywordsFromTextarea,
+  getKeywordExecutionCopy,
+  getKeywordSortDimensionLabel,
+  syncSearchFilterControlsForPlatform,
+  unattendedSearchPassLabel,
+  taskView,
+});
 const {
   acquireCaptureExecutionLock,
   activateTargetedPostInvocation,
   activateUnattendedRunRequest,
+  addMonitorSubscriptionByCandidate,
   adoptUnattendedCaptureExecutionLock,
+  analyzeKeywordOpportunityRules,
   appendStreamingSyncSummary,
+  applyBatchDraftToInputs,
   applyCaptureTaskCancellation,
   applySearchFiltersOnActiveTab,
+  averageBenchmarkValues,
   beginSidebarTask,
   bindCaptureTaskOwner,
+  buildBenchmarkDiscoveryAiCandidates,
+  buildBenchmarkDiscoveryCandidates,
+  buildBenchmarkDiscoveryDecisionAngle,
+  buildBenchmarkDiscoveryFallbackAnalysis,
+  buildBenchmarkDiscoveryFocusAssessment,
+  buildBenchmarkDiscoveryRuleReason,
   buildCaptureProgressText,
   buildCaptureRecoverySuppressionKey,
+  buildKeywordOpportunityInputItems,
+  buildKeywordRunDisplayPlan,
+  buildMonitorCandidateFromRecord,
+  buildMonitorSubjectCandidate,
+  buildShanghaiTimestamp,
   buildSidebarKeywordSearchUrl,
   buildSidebarTaskRun,
   buildTargetedProfileCaptureTaskContext,
@@ -18362,80 +10806,169 @@ const {
   buildUnattendedLocalClosureReadyStorageKey,
   buildUnattendedTaskCounts,
   buildUnattendedTerminalProgress,
+  calculateBenchmarkEngagement,
   cancelTargetedPostRunFromSidebar,
   cancelUnattendedKeywordPlanFromSidebar,
+  captureBenchmarkCandidateProfiles,
+  captureCurrentMonitorCandidate,
+  captureKeywordOpportunitySamples,
+  cleanMonitorPublishText,
   clearActiveUnattendedRunRequest,
+  clearBenchmarkDiscoveryResult,
+  clearBenchmarkDiscoveryState,
   clearCaptureTaskProgressContext,
   clearCommentCaptureTerminalStatus,
+  clearKeywordInsightResult,
+  clearKeywordOpportunityDraft,
+  clearKeywordOpportunityResult,
+  clearKeywordOpportunityState,
   clearSuppressedCaptureRecoveryForRecord,
   clearUnattendedFinalFlushRetryTimer,
+  collectMonitorPublishCandidates,
   collectTargetedPostRecordIds,
   confirmTargetedPostInvocationBinding,
   connectCaptureTaskOwnerPort,
+  createEmptyBatchDraft,
+  createEmptyKeywordInsightState,
+  createEmptyKeywordOpportunityDraft,
+  createMonitorPublishMoment,
   createStreamingDetailAutoSyncQueue,
   createTargetedPostInvocationError,
   createTargetedPostInvocationToken,
   createUnattendedKeywordCheckpointReporter,
   createUnattendedKeywordProgressReporter,
   dedupeKeywords,
+  detectKeywordSortDimensionFromActiveTab,
   drainStreamingDetailSyncQueue,
+  enrichBenchmarkDiscoveryWithAi,
   ensureUnattendedFinalFlushIntent,
   executeMonitorRunItem,
+  extractPlatformMonitorBloggerId,
   finalizeInterruptedDetailCaptureAfterCancel,
   finalizeUnattendedLocalClosureAfterFlush,
   finishMonitorExecutionSafely,
   finishSidebarTask,
   flushPendingUnattendedCheckpointReports,
+  getBatchDraftForPlatform,
+  getCurrentBatchDraftPlatform,
+  getCurrentSearchKeyword,
+  getDateListFromText,
   getExpandedKeywordsFromTextarea,
+  getKeywordInsightSeedKeyword,
+  getKeywordInsightState,
+  getKeywordOpportunityDraft,
+  getKeywordOpportunityKeyword,
   getKnownDetailRunnerTabIds,
   getSearchBatchKeywordsFromTextarea,
+  getSearchFilterConfig,
+  getSelectedRecommendedKeywords,
+  getShanghaiDateParts,
+  getShanghaiDayStartMs,
+  getStoredKeywordInsightSeedKeyword,
   getTargetedPostInvocationOwnership,
   getTargetedPostInvocationTokenFromRequest,
   getTargetedPostRunAttemptIdFromUrl,
   getTargetedPostRunRequestIdFromUrl,
   getUnattendedRunAttemptIdFromUrl,
   getUnattendedRunRequestIdFromUrl,
+  handleAddCurrentMonitor,
+  handleAddMonitorFromRecord,
   handleBatchKeywordCapture,
   handleCancel,
+  handleCancelBenchmarkDiscovery,
+  handleCancelKeywordOpportunity,
   handleCaptureBloggerData,
   handleCaptureExecutionLockLost,
   handleCaptureNoteData,
   handleCaptureSearchData,
   handleDismissRecovery,
+  handleExpandKeywords,
   handleProgress,
   handleRetryCommentsCapture,
   handleRetryDetailCapture,
   handleRetryRecovery,
   handleRunBatchBloggers,
   handleRunBatchLinks,
+  handleRunBenchmarkDiscovery,
+  handleRunKeywordOpportunity,
   handleRunMonitorNow,
+  handleSaveKeywordPlan,
+  showProgress,
+  hideProgressPanelOnly,
+  syncKeywordPlanProgressPanel,
+  renderKeywordPlanStatus,
+  handleSaveMonitorSettings,
   handleStopCommentsCapture,
   handleSyncAll,
   handleTargetedPostRunRequestStorageChange,
   handleUnattendedRunRequestStorageChange,
-  handoffRecoveryFocus,
   hasActiveSearchFilters,
+  hasVisibleLocalCaptureProgress,
+  invalidateKeywordInsightDraft,
   isActiveTargetedPostInvocation,
   isCaptureRecoveryPhase,
   isCaptureTaskDetailPhase,
   isCaptureTaskSyncPhase,
   isCaptureTaskWaitPhase,
   isCommentCaptureTerminal,
-  isRecoveryActionAvailable,
+  isDefaultSearchFilterValue,
+  isExplicitUserUnattendedCancellationMessage,
+  isKeywordAnalysisLockStale,
+  isKeywordPlanRunning,
+  isLikelyFallbackCaptureTime,
+  isMonitorAuthReady,
+  isMonitorPublishMomentInWindow,
   isSameTargetedPostInvocationToken,
   isTransientStreamingSyncFailure,
+  loadActiveKeywordRunState,
+  loadBatchDraftStore,
+  loadExecutionDetails,
+  loadKeywordPlanUI,
+  loadMonitorExecutions,
+  loadMonitorSettings,
+  loadMonitorSubscriptions,
   loadTargetedPostRunStateForDisplay,
   markCommentCaptureTerminalStatus,
   maybeClaimAndRunTargetedPostWorkflow,
   maybeClaimAndRunUnattendedKeywordPlan,
+  maybeResetKeywordOpportunityForCurrentSearch,
   maybeRunAutoDetailCaptureAfterListCapture,
   maybeRunAutoSyncAfterDetailCapture,
+  mergeBenchmarkAiAnalysisIntoResult,
+  mergeBenchmarkProfilesIntoResult,
   navigateActiveTabToKeywordSearchForPlan,
+  normalizeBatchDraftEntry,
+  normalizeBatchDraftPlatform,
+  normalizeBatchDraftStore,
+  normalizeBenchmarkDiscoveryItems,
+  normalizeBenchmarkProfilePayload,
+  normalizeCalendarDate,
+  normalizeDateListText,
+  normalizeKeywordOpportunityDraft,
+  normalizeKeywordOpportunitySampleItems,
+  normalizeKeywordPlanMode,
+  normalizeKeywordSortDimension,
+  normalizeMonitorRunnerPlatform,
+  normalizeMonitorSettingsInput,
+  normalizeMonitorSubjectType,
   normalizeProgressCount,
+  normalizeRepresentativeSampleItems,
+  normalizeSearchFilterPlatform,
+  normalizeSearchFilterValueForStorage,
   normalizeTaskCenterStatus,
+  normalizeUnattendedSearchPasses,
   parseKeywordsFromMultilineInput,
+  parseMonitorCalendarDateStartMs,
+  parseMonitorNumericPublishMoment,
+  parseMonitorPublishMoment,
+  parseSearchManualScheduledStart,
+  persistBatchDraftForPlatform,
+  persistBatchDraftStore,
+  persistCurrentBatchDraft,
   persistUnattendedLocalClosureReadyMarker,
+  populateKeywordPlanUI,
   postCaptureTaskOwnerMessage,
+  prepareKeywordStrategyCapture,
   prioritizeRecordsForSync,
   projectCaptureTaskProgress,
   publishCommentProgressToRuntime,
@@ -18443,12 +10976,15 @@ const {
   readProgressText,
   rebuildCaptureTaskSessionForEnhancementRetry,
   reconcileCommentCaptureTerminalState,
+  reconcileKeywordPlanFromSidebar,
   reconcilePendingUnattendedFinalFlushIntents,
   recordUnattendedFinalFlushFailure,
   refreshDataPoolThrottled,
   releaseCaptureExecutionLock,
   releaseCaptureTaskOwner,
+  releaseKeywordAnalysisLock,
   rememberCaptureTaskProgressContext,
+  renderActiveKeywordRunState,
   renderCaptureRecoveryUI,
   renewCaptureExecutionLock,
   repairInterruptedDetailCaptureRecordsBeforeSync,
@@ -18463,50 +10999,80 @@ const {
   reportUnattendedTerminalRun,
   requestCaptureCancelSignal,
   requestDetailRunnerCancelSignals,
+  requestKeywordExpandCancel,
   resetCaptureRecoveryUI,
+  resolveBatchDraftPlatform,
   resolveCaptureExecutionLockRunnerTabId,
   resolveCaptureTaskSourceTabId,
   resolveCaptureTaskTerminalStatus,
   resolveCommentTerminalStatusFromPhase,
+  resolveMonitorAccountNo,
+  resolveMonitorPublishWindowBounds,
   resolveMonitorRecordIdsForPublishWindow,
+  resolveMonitorRecordPublishMoment,
+  resolveMonitorRunHistoryState,
+  resolveMonitorRunnerAccountUrl,
+  resolveMonitorRunnerCaptureParams,
+  resolveMonitorRunnerName,
+  resolveMonitorSettingsSaveErrorMessage,
   resolveTargetedPostRunBinding,
   resolveTaskCenterTitle,
   resolveUnattendedBootstrapStartGate,
   resolveUnattendedCancellationTerminal,
   resolveUnattendedEnhanceCancellation,
   resolveUnattendedProtectedWaitUntilMs,
+  resolveYearForMonthDay,
+  retryKeywordAnalysis,
   routeDetailItemToStreamingSync,
   runCaptureAction,
   runDetailCaptureForRecordIds,
+  runKeywordInsightSampling,
   runMonitorCommentPatrolWithCaptureTaskSession,
   runUnattendedKeywordPlanRequest,
   scheduleUnattendedFinalFlushRetry,
+  selectKeywordOpportunitySamples,
   sendUnattendedRuntimeMessage,
-  setRecoveryCopy,
+  setKeywordBenchmarkLoading,
   setUnattendedLocalClosureControlState,
   settleKeywordRecordsForStreamingSync,
   settleTargetedPostRunnerTab,
+  setupKeywordPlanStorageListener,
+  shouldRefreshDataPoolForKeywordPlan,
   sleepWithStop,
   startCaptureAssistSessionStrict,
   startCaptureExecutionLockHeartbeat,
+  startKeywordAnalysis,
+  startKeywordPlanReconcileTimer,
+  startKeywordSortSyncTimer,
   startOptionalCaptureAssistSession,
   startTargetedPostRunHeartbeat,
   startUnattendedKeywordRunHeartbeat,
   stopCaptureExecutionLockHeartbeat,
   stopDetailCaptureAndReleaseForSync,
+  stopKeywordPlanReconcileTimer,
+  stopKeywordSortSyncTimer,
   stopRejectedUnattendedAttempt,
   stopTargetedPostRunnerForInvalidBinding,
+  summarizeMonitorSyncResult,
   supportsPersistentCaptureTaskPlatform,
+  syncBatchDraftForPlatform,
   syncCaptureTaskOwnerFromRuntime,
   syncCommentProgressToRecord,
+  syncKeywordSortDimensionByRuntime,
+  syncKeywordSortDimensionFromPage,
   syncRuntimeCaptureProgress,
   syncRuntimeCommentProgress,
+  syncSeedKeywordFromCurrentSearch,
   unattendedFinalFlushIdentity,
   updateActiveCommentCaptureIdentity,
+  updateCategorySampleResult,
+  updateKeywordInsightState,
+  updateKeywordOpportunityDraft,
   updateTargetedPostRun,
   validateAdoptedUnattendedCaptureExecutionLock,
   waitForActiveTabReady,
   waitForRuntimeSearchPage,
+  waitForTabComplete,
   waitForTargetedPostRunnerTab,
   waitForUnattendedProtectedStart,
 } = sidebarTaskController;

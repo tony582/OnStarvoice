@@ -1,5 +1,5 @@
 // L3-A progress: original control flow, explicit state and compatibility ports.
-export function createProgressController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createProgressController({controllerState, controllerPorts, controllerOperations}) {
   const {
     ACTIVE_COMMENT_PROGRESS_PHASES,
     COMMENT_PHASE_TO_TERMINAL_STATUS,
@@ -7,15 +7,13 @@ export function createProgressController({controllerState, controllerBindings, c
     UNATTENDED_CONTENT_PROGRESS_MIN_INTERVAL_MS,
     chrome,
     console,
-    document,
+    taskView,
     getActiveTaskContext,
-    getKeywordSortDimensionLabel,
     hideProgressPanelOnly,
     isTerminalProgressPhase,
     isUnattendedTerminalProgressPhase,
     isUnsupportedPlatformCoverVisible,
     loadStorageModule,
-    normalizeKeywordSortDimension,
     refreshDataPool,
     setBatchProgressDetail,
     updateCaptureTaskSession,
@@ -307,17 +305,17 @@ export function createProgressController({controllerState, controllerBindings, c
     if (progressRecordId && ACTIVE_COMMENT_PROGRESS_PHASES.has(phase)) {
       clearSuppressedCaptureRecoveryForRecord(progressRecordId);
     }
-    const progressContainer = document.getElementById("progressContainer");
+    const presentation = taskView.openCaptureProgressPresentation();
     const unattendedScoped = Boolean(
       controllerState.activeUnattendedRunRequestId ||
         progress?.unattendedRequestId ||
-        progressContainer?.dataset?.unattendedProgressState,
+        presentation.readUnattendedState(),
     );
     const isTerminalPhase = unattendedScoped
       ? isUnattendedTerminalProgressPhase(phase)
       : isTerminalProgressPhase(phase);
     const unattendedProgressState = String(
-      progressContainer?.dataset?.unattendedProgressState || "",
+      presentation.readUnattendedState() || "",
     );
     const suppressLateUnattendedUi =
       unattendedProgressState === "terminal" && !isTerminalPhase;
@@ -327,10 +325,10 @@ export function createProgressController({controllerState, controllerBindings, c
     publishCommentProgressToRuntime(progress);
     if (
       isTerminalPhase &&
-      progressContainer &&
+      presentation.hasPanel &&
       (controllerState.activeUnattendedRunRequestId || unattendedProgressState === "running")
     ) {
-      progressContainer.dataset.unattendedProgressState = "terminal";
+      presentation.markUnattendedTerminal();
     }
     if (isTerminalPhase && !recoveryRendered) {
       hideProgressPanelOnly({
@@ -354,43 +352,31 @@ export function createProgressController({controllerState, controllerBindings, c
     }
 
     if (phase.startsWith("comments_") && !recoveryRendered) {
-      if (progressContainer?.dataset.progressSource === "capture-recovery") {
+      if (presentation.isRecoveryPresentation()) {
         resetCaptureRecoveryUI({hidePanel: true, clearState: true});
-      } else if (progressContainer) {
-        progressContainer.style.display = "none";
+      } else if (presentation.hasPanel) {
+        presentation.hideCaptureProgress();
       }
     } else if (
       !recoveryRendered &&
       !isTerminalPhase &&
       !suppressLateUnattendedUi
     ) {
-      if (progressContainer?.dataset.progressSource === "capture-recovery") {
+      if (presentation.isRecoveryPresentation()) {
         resetCaptureRecoveryUI({hidePanel: false, clearState: true});
-        progressContainer.dataset.progressSource = "capture";
+        presentation.useCaptureSource();
       }
-      if (progressContainer && !isUnsupportedPlatformCoverVisible()) {
+      if (presentation.hasPanel && !isUnsupportedPlatformCoverVisible()) {
         if (controllerState.activeUnattendedRunRequestId) {
-          progressContainer.dataset.unattendedProgressState = "running";
+          presentation.markUnattendedRunning();
         }
-        progressContainer.style.display = "block";
+        presentation.showCaptureProgress();
       }
-      const btnCancel = document.getElementById("btnCancel");
-      if (btnCancel && progressContainer?.style.display !== "none") {
-        btnCancel.hidden = false;
-        btnCancel.disabled = false;
-        btnCancel.textContent = "中止任务";
-        btnCancel.style.display = "inline-flex";
-      }
+      presentation.showCancelActionIfPanelVisible();
       // 否则正常更新全局进度消息
-      const progressText = document.getElementById("progressText");
-      const progressBar = document.getElementById("progressBar");
+      const messagePresentation = presentation.openMessagePresentation();
       const nextMessage = buildCaptureProgressText(progress);
-      if (progressText && nextMessage) {
-        progressText.textContent = nextMessage;
-        if (progressBar) {
-          progressBar.className = "status-bar is-info";
-        }
-      }
+      messagePresentation.render(nextMessage);
     }
 
     const isCommentProgress =
@@ -526,9 +512,9 @@ export function createProgressController({controllerState, controllerBindings, c
   function syncRuntimeCaptureProgress(runtime) {
     const progress = runtime?.lastCaptureProgress;
     if (!progress) {
-      const progressContainer = document.getElementById("progressContainer");
+      const presentation = taskView.openCaptureProgressPresentation();
       if (
-        progressContainer?.dataset.progressSource === "capture-recovery" &&
+        presentation.isRecoveryPresentation() &&
         String(controllerState.activeRecoveryProgress?.phase || "") !== "interrupted_repaired"
       ) {
         resetCaptureRecoveryUI({hidePanel: true, clearState: true});
@@ -583,17 +569,17 @@ export function createProgressController({controllerState, controllerBindings, c
     if (!phase) {
       return;
     }
-    const progressContainer = document.getElementById("progressContainer");
+    const presentation = taskView.openCaptureProgressPresentation();
     const unattendedScoped = Boolean(
       controllerState.activeUnattendedRunRequestId ||
         progress?.unattendedRequestId ||
-        progressContainer?.dataset?.unattendedProgressState,
+        presentation.readUnattendedState(),
     );
     const terminalForCurrentScope = unattendedScoped
       ? isUnattendedTerminalProgressPhase(phase)
       : isTerminalProgressPhase(phase);
     if (
-      progressContainer?.dataset?.unattendedProgressState === "terminal" &&
+      presentation.readUnattendedState() === "terminal" &&
       !terminalForCurrentScope
     ) {
       return;
@@ -604,11 +590,11 @@ export function createProgressController({controllerState, controllerBindings, c
     }
     if (terminalForCurrentScope) {
       if (
-        progressContainer &&
+        presentation.hasPanel &&
         (controllerState.activeUnattendedRunRequestId ||
-          progressContainer.dataset.unattendedProgressState === "running")
+          presentation.readUnattendedState() === "running")
       ) {
-        progressContainer.dataset.unattendedProgressState = "terminal";
+        presentation.markUnattendedTerminal();
       }
       hideProgressPanelOnly({
         force: true,
@@ -628,8 +614,8 @@ export function createProgressController({controllerState, controllerBindings, c
       return;
     }
 
-    const progressText = document.getElementById("progressText");
-    if (!progressContainer || !progressText) {
+    const messagePresentation = presentation.openRuntimeMessagePresentation();
+    if (!messagePresentation) {
       return;
     }
 
@@ -640,7 +626,7 @@ export function createProgressController({controllerState, controllerBindings, c
 
     // 仅在本次会话已经主动展示进度面板时，才继续用 runtime 进度刷新。
     // 避免旧任务遗留的 progress 在空闲状态下重新弹出。
-    if (progressContainer.style.display === "none" && !isRecoveryPhase) {
+    if (presentation.isPanelHidden() && !isRecoveryPhase) {
       return;
     }
 
@@ -649,72 +635,23 @@ export function createProgressController({controllerState, controllerBindings, c
       return;
     }
 
-    if (progressContainer.dataset.progressSource === "capture-recovery") {
+    if (presentation.isRecoveryPresentation()) {
       resetCaptureRecoveryUI({hidePanel: false, clearState: true});
     }
-    progressContainer.dataset.progressSource = "capture";
+    presentation.useCaptureSource();
     if (controllerState.activeUnattendedRunRequestId) {
-      progressContainer.dataset.unattendedProgressState = "running";
+      presentation.markUnattendedRunning();
     }
-    progressContainer.style.display = "block";
-    progressText.textContent = nextMessage;
-    const btnCancel = document.getElementById("btnCancel");
-    if (btnCancel) {
-      btnCancel.hidden = false;
-      btnCancel.disabled = false;
-      btnCancel.textContent = "中止任务";
-      btnCancel.style.display = "inline-flex";
-    }
-    const progressBar = document.getElementById("progressBar");
-    if (progressBar) {
-      progressBar.className = "status-bar is-info";
-    }
+    presentation.showCaptureProgress();
+    messagePresentation.render(nextMessage);
   }
 
   function buildCaptureProgressText(progress) {
-    const message = String(progress?.message || "").trim();
-    const detectedCount = normalizeProgressCount(progress?.detectedCount);
-    const filteredCount = normalizeProgressCount(progress?.filteredCount);
-    const minLikes = normalizeProgressCount(progress?.minLikes);
-    const sortDimension = normalizeKeywordSortDimension(progress?.sortDimension);
-    const sortLabel = getKeywordSortDimensionLabel(sortDimension);
-    const maxDetectedItems = normalizeProgressCount(
-      progress?.maxDetectedItems ?? progress?.maxItems,
-    );
-    const markedCount = normalizeProgressCount(progress?.markedCount);
-
-    if (detectedCount === null || filteredCount === null) {
-      if (markedCount === null) {
-        return message;
-      }
-      const markedText = `页面已标记 ${markedCount} 条`;
-      return message ? `${message} · ${markedText}` : markedText;
-    }
-
-    const detailParts = [];
-    if (minLikes !== null) {
-      detailParts.push(`${sortLabel}≥${minLikes}`);
-    }
-    if (maxDetectedItems !== null) {
-      detailParts.push(`探测上限 ${maxDetectedItems}`);
-    }
-
-    const statsText = `已探测 ${detectedCount} 条，已筛选 ${filteredCount} 条${
-      markedCount !== null ? `，页面已标记 ${markedCount} 条` : ""
-    }${detailParts.length > 0 ? `（${detailParts.join("，")}）` : ""}`;
-
-    if (!message) {
-      return statsText;
-    }
-    return `${message} · ${statsText}`;
+    return taskView.buildCaptureProgressText(progress);
   }
 
   function normalizeProgressCount(value) {
-    const num = Number(value);
-    if (!Number.isFinite(num)) {
-      return null;
-    }
-    return Math.max(0, Math.floor(num));
+    return taskView.normalizeProgressCount(value);
   }
 
   async function syncCommentProgressToRecord(recordId, collectedCount) {

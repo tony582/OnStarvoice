@@ -2,6 +2,8 @@ import {readSidebarFunction, readSidebarSection, readSidebarControllerSources, a
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
+import {createLegacyCaptureInputsView} from '../../sidebar/legacy-view/capture-inputs.js';
+import {createLegacyKeywordView} from '../../sidebar/legacy-view/coordinator.js';
 
 import {
   beginCaptureTaskSession,
@@ -82,8 +84,25 @@ test("one-time cloud runs keep one-time copy and never enable a hidden extra rou
   assert.match(runnerSection, /getKeywordExecutionCopy\(request\)/u);
   assert.match(
     runnerSection,
-    /autoLoopInput\.checked = plannedRounds > 1/u,
+    /taskView\.applyUnattendedLoopSettings\(\{\s*plannedRounds,/u,
   );
+  // Exercise the real presentation endpoint rather than looking for its DOM
+  // implementation in the application controller.
+  for (const plannedRounds of [1, 2]) {
+    const toggles = [];
+    const nodes = {
+      chkAutoLoop: {checked: true},
+      batchLoopFields: {classList: {toggle: (...args) => toggles.push(args)}},
+      inputLoopRounds: {value: ''},
+      inputBatchScheduledStart: {value: 'previous schedule'},
+    };
+    const view = createLegacyCaptureInputsView({document: {getElementById: id => nodes[id] || null}});
+    view.applyUnattendedLoopSettings({plannedRounds, readGapMinutes: () => {throw Error('missing gap control must not read business input');}});
+    assert.equal(nodes.chkAutoLoop.checked, plannedRounds > 1);
+    assert.equal(nodes.inputLoopRounds.value, String(plannedRounds));
+    assert.equal(nodes.inputBatchScheduledStart.value, '');
+    assert.deepEqual(toggles, [['is-disabled', plannedRounds <= 1]]);
+  }
   assert.match(
     runnerSection,
     /captureExecutionLabel:\s*executionCopy\.captureLabel/u,
@@ -2576,7 +2595,7 @@ test("capture progress rejects stale owners before forwarding into local UI", ()
   );
   const updateIndex = section.indexOf("void updateCaptureTaskSession({");
   const localPhaseIndex = section.indexOf("const phase = incomingPhase");
-  const domIndex = section.indexOf("document.getElementById(");
+  const presentationIndex = section.indexOf("taskView.openCaptureProgressPresentation()");
 
   assert.ok(ownerGuardIndex > -1 && ownerGuardIndex < rememberIndex);
   assert.match(
@@ -2584,7 +2603,10 @@ test("capture progress rejects stale owners before forwarding into local UI", ()
     /incomingCaptureTaskId !== currentCaptureTaskId[\s\S]*?return progress/,
   );
   assert.ok(updateIndex > rememberIndex && updateIndex < localPhaseIndex);
-  assert.ok(updateIndex < domIndex);
+  assert.ok(presentationIndex > -1 && updateIndex < presentationIndex);
+  assert.doesNotMatch(section, /document\.getElementById/u);
+  const progressView = readSidebarControllerSources().find(entry => entry.path === 'sidebar/legacy-view/capture-progress.js').source;
+  assert.match(progressView, /function openCaptureProgressPresentation\(\) \{\s*const progressContainer = document\.getElementById\("progressContainer"\)/u);
   assert.match(
     section.slice(updateIndex, localPhaseIndex),
     /taskId:\s*incomingCaptureTaskId\s*\|\|\s*controllerState\.captureTaskOwnerTaskId/,
@@ -2697,8 +2719,10 @@ test("unattended plan renders startup and durable terminal task surfaces", () =>
     statusSection,
     /renderCaptureDebugSession\(getCurrentRuntime\(\) \|\| \{\}\)/,
   );
-  assert.match(statusSection, /ambiguousCanceled/);
-  assert.match(statusSection, /"运行状态异常中断（非用户操作）"/);
+  assert.match(statusSection, /controllerPorts\.taskView\.renderKeywordPlanStatusLabels\(plan, scope\)/u);
+  const labels = createLegacyKeywordView({ports: {}, application: {}, keywordModel: {}}).renderKeywordPlanStatusLabels.toString();
+  assert.match(labels, /ambiguousCanceled/);
+  assert.match(labels, /"运行状态异常中断（非用户操作）"/);
 });
 
 test("dark task surface stops an active unattended request through its real cancel endpoint", () => {
@@ -2708,7 +2732,7 @@ test("dark task surface stops an active unattended request through its real canc
   );
   assert.match(
     controlsSection,
-    /panel\?\.dataset\?\.unattended === "true" \|\|\s+isKeywordPlanRunning\(buildKeywordRunDisplayPlan\(keywordPlanState\)\)/,
+    /panel\?\.dataset\?\.unattended === "true" \|\|\s+isKeywordPlanRunning\(buildKeywordRunDisplayPlan\(sidebarTaskController\.readKeywordPlanState\(\)\)\)/,
   );
   assert.match(
     controlsSection,

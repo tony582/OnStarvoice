@@ -1,19 +1,15 @@
 // L3-A capture-action-cancel: original control flow, explicit state and compatibility ports.
-export function createCaptureActionCancelController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createCaptureActionCancelController({controllerState, controllerPorts, controllerOperations}) {
   const {
-    ERROR_MESSAGE_MAP,
     captureAndSync,
     chrome,
     console,
-    document,
+    taskView,
     getCurrentRuntime,
-    getKeywordSortDimensionLabel,
     hideProgress,
     hideProgressPanelOnly,
-    normalizeKeywordSortDimension,
     refreshDataPool,
     setCancelFlag,
-    showMessage,
     showProgress,
   } = controllerPorts;
   const cancelUnattendedKeywordPlanFromSidebar = (...args) => controllerOperations.cancelUnattendedKeywordPlanFromSidebar(...args);
@@ -47,29 +43,9 @@ export function createCaptureActionCancelController({controllerState, controller
             ? 1
             : 0;
         if (savedCount === 0) {
-          const payload = result.captureResult?.data || {};
-          const detectedCount = Number(payload.rawTotalCount || 0);
-          const filteredBeforeLimitCount = Number(
-            payload.filteredBeforeLimitCount || 0,
-          );
-          const minLikes = Number(payload.minLikes || 0);
-          const sortDimension = normalizeKeywordSortDimension(
-            payload.sortDimension,
-          );
-          const sortLabel = getKeywordSortDimensionLabel(sortDimension);
-          if (detectedCount > 0 && filteredBeforeLimitCount <= 0) {
-            showMessage(
-              `已探测 ${detectedCount} 条，但按${sortLabel}阈值（≥${minLikes}）筛选后为 0 条，请降低筛选阈值后重试`,
-              "warning",
-            );
-          } else {
-            showMessage(
-              "采集完成，但未获取到可入池数据（可能因筛选条件过高或当前页暂无结果）",
-              "warning",
-            );
-          }
+          taskView.showEmptyCaptureResult(result);
         } else {
-          showMessage(successMessage, "success");
+          taskView.showCaptureSuccess(successMessage);
         }
         await refreshDataPool();
         return {
@@ -79,14 +55,7 @@ export function createCaptureActionCancelController({controllerState, controller
           recordIds: Array.isArray(result.recordIds) ? result.recordIds : [],
         };
       } else {
-        const rawErrorCode = String(result.error?.code || "").trim();
-        const rawErrorMessage = String(result.error?.message || "").trim();
-        const errorMsg =
-          (rawErrorCode === "UNEXPECTED_ERROR" && rawErrorMessage) ||
-          ERROR_MESSAGE_MAP[rawErrorCode] ||
-          rawErrorMessage ||
-          "采集失败";
-        showMessage(errorMsg, "error");
+        taskView.showCaptureActionError(result);
         return {
           ok: false,
           result,
@@ -95,7 +64,7 @@ export function createCaptureActionCancelController({controllerState, controller
       }
     } catch (error) {
       console.error("[Sidebar] Capture action failed:", error);
-      showMessage("操作失败: " + error.message, "error");
+      taskView.showCaptureActionException(error);
       return {
         ok: false,
         result: null,
@@ -111,18 +80,18 @@ export function createCaptureActionCancelController({controllerState, controller
 
   async function handleCancel() {
     console.log("[Sidebar] Cancel clicked");
-    const progressContainer = document.getElementById("progressContainer");
-    if (progressContainer?.dataset.progressSource === "keyword-plan") {
+    const presentation = taskView.openCaptureProgressPresentation();
+    if (presentation.isKeywordPlanPresentation()) {
       await cancelUnattendedKeywordPlanFromSidebar();
       return;
     }
     const isRecoveryCancel =
-      progressContainer?.dataset.progressSource === "capture-recovery" &&
-      progressContainer?.dataset.recoveryCancelable === "true";
+      presentation.isRecoveryPresentation() &&
+      presentation.isRecoveryCancelable();
     const recoveryRequestId = isRecoveryCancel
       ? String(
           controllerState.activeRecoveryProgress?.captureRequestId ||
-            progressContainer?.dataset.captureRequestId ||
+            presentation.readRecoveryRequestId() ||
             "",
         ).trim()
       : "";
@@ -156,7 +125,7 @@ export function createCaptureActionCancelController({controllerState, controller
       renderCaptureRecoveryUI({
         ...recoverySnapshot,
         phase: "capture_canceling",
-        message: "正在取消当前任务并保存可用结果…",
+        message: taskView.readCaptureCancelingMessage(),
         updatedAt: Date.now(),
       });
     } else {
@@ -221,7 +190,7 @@ export function createCaptureActionCancelController({controllerState, controller
         } else {
           resetCaptureRecoveryUI({hidePanel: true, clearState: true});
         }
-        showMessage("取消请求发送失败，请检查网络后再试", "error");
+        taskView.showCaptureCancelSignalFailure();
       }
     }
 
@@ -239,14 +208,14 @@ export function createCaptureActionCancelController({controllerState, controller
         }
       } catch (error) {
         console.warn("[Sidebar] Persistent capture task stop failed:", error);
-        showMessage("采集取消信号已发送，但采集辅助仍在释放，请再点一次停止", "warning");
+        taskView.showPersistentCaptureReleaseWarning();
       }
     }
 
     if (shouldFinalizeDetailCapture) {
       await finalizeInterruptedDetailCaptureAfterCancel();
     } else if (!shouldShowCancelingProgress) {
-      showMessage("正在取消...", "info");
+      taskView.showCaptureCancelPending();
     }
   }
 
