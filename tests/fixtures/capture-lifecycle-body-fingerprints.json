@@ -1,0 +1,276 @@
+{
+  "baseline": "d5b243f0c6e6e9b3f920ab8264264553a6141411",
+  "normalization": "line-trim; candidate state and API aliases reverse-mapped; preserves all statements and comments",
+  "entries": [
+    {
+      "module": "leases",
+      "name": "pruneCaptureTaskReplacementTabs",
+      "sha256": "db0453fa81f940ad0822db9a153d641439af0dccd8c20999ce915b1b9128b2c4"
+    },
+    {
+      "module": "leases",
+      "name": "rememberCaptureTaskReplacementTab",
+      "sha256": "3bc2b2d3c8ac9201ede66e41f03dbb8fc679f659c976bbd3bffd18b169769803"
+    },
+    {
+      "module": "leases",
+      "name": "resolveCaptureTaskReplacementLease",
+      "sha256": "c1cd01ade0a078a7e3bd9ebfb0632731986258d60a308c426b2002691f3adb3e"
+    },
+    {
+      "module": "leases",
+      "name": "resolveCaptureTaskReplacementTab",
+      "sha256": "ff14d47181700284613644062913f4f274ac1be82461393cacac0414b0956d33"
+    },
+    {
+      "module": "restore",
+      "name": "cleanupStaleCaptureRuntimeSession",
+      "sha256": "6673c45481dc242051d0d8a01a19355645d6bfab34b2e5041d7d9e603ec55a1d"
+    },
+    {
+      "module": "restore",
+      "name": "clearPersistedCaptureRuntimeSnapshot",
+      "sha256": "37b45f2a7069a8b6d468c94abbeea8322145959c63cea1eb506bbc527c3305b3"
+    },
+    {
+      "module": "restore",
+      "name": "publishRestoredCaptureRuntimeSnapshot",
+      "sha256": "46909a679c75442cb399693c4c64f65f13bc994758e1883779f0a2ec57990d12"
+    },
+    {
+      "module": "restore",
+      "name": "restorePersistedCaptureRuntimeSession",
+      "sha256": "7d7afb7dca6d23ebfb068816de23b460126b5a320d62dc69dc9913ffcf1fa663"
+    },
+    {
+      "module": "admission",
+      "name": "createCaptureTaskError",
+      "sha256": "205b479f42f97c9188115e2eab77361401c45011bc2edb1779edf69fdf38805d"
+    },
+    {
+      "module": "admission",
+      "name": "createCaptureTaskDebugOwnershipError",
+      "sha256": "102e06f7fec6ffb1d9ea35313ad938161fde638cb2f2108ec997710859a6672c"
+    },
+    {
+      "module": "admission",
+      "name": "getCaptureTaskRequest",
+      "sha256": "1c39a8539756e287b7afc97a4bc3a40e24046f0d7361304fc8a134942e8b5606"
+    },
+    {
+      "module": "admission",
+      "name": "requireCaptureTaskId",
+      "sha256": "046d6124c819b702f7bd1fa7a4b05403342f7e5655d9849a3321f02f322b5ad8"
+    },
+    {
+      "module": "admission",
+      "name": "requireConnectedCaptureTaskOwner",
+      "sha256": "85c4c274b08ab92efb7a2017c6e5bd4cb6f6b9b6ad134dfed788f5a20d6c58a0"
+    },
+    {
+      "module": "admission",
+      "name": "isRecentActiveCaptureTaskLedgerRun",
+      "sha256": "73c0fc5d07fb203e2844595e58c7b2b08a79af86b3779e2ff6cb8b9a1287d125"
+    },
+    {
+      "module": "admission",
+      "name": "inspectCaptureTaskGroupLiveness",
+      "sha256": "30b41f79b88c6a73dddbbc59e3b0915974b3a7e57906ee70995c5082ba7a7669"
+    },
+    {
+      "module": "admission",
+      "name": "releaseConfirmedStaleCaptureTaskGroupsForBegin",
+      "sha256": "ad21e4fbcb02e647944d4e5166378944f5bf1fd621b33aaa3c30ca6057aefa46"
+    },
+    {
+      "module": "begin",
+      "name": "beginCaptureTask",
+      "sha256": "77c935fb3c0326d4327d27372bfb7d219367530dfbb1da065f6070c9f8c127a3"
+    },
+    {
+      "module": "begin",
+      "name": "beginCaptureTaskNow",
+      "sha256": "19713989c5287975ac0895dbc621a74579c529e598b4e68a22aa626f81d3ec6b"
+    },
+    {
+      "module": "progress",
+      "name": "updateCaptureTask",
+      "sha256": "a0a1901a715a33df36a61fed99f4e9287021b0930f7b254e16ae677b7a20c0c2"
+    },
+    {
+      "module": "progress",
+      "name": "registerCaptureTaskTab",
+      "sha256": "d35335bf9c367bd370ae0f204d35922dd7b07d273dd1bfe58d6fef89dc3c47e8"
+    },
+    {
+      "module": "progress",
+      "name": "setCaptureTaskMinimized",
+      "sha256": "8e3085c0088805e40fc3aaef8a1c9000aaac4d0ee2ea706cac7724385ad7f751"
+    },
+    {
+      "module": "cleanup",
+      "name": "closeCaptureTaskWorkerTabs",
+      "sha256": "acfc41f06d7682e9e20b7aef9f0b4a2e3cfd71ae7785a7f56a0959ed42f4e5e8"
+    },
+    {
+      "module": "cleanup",
+      "name": "closeTrackedCaptureTaskWorkerTabs",
+      "sha256": "a48866d698eac88bdda932fb8ad6bfd6c54dcd9b1a203c3cbb942c9254956447"
+    },
+    {
+      "module": "cleanup",
+      "name": "getTrackedCaptureTaskWorkers",
+      "sha256": "dbd27afe76cfb601432cc9441485c58c28c9d0f12cc8e050a97ae467a771ac47"
+    },
+    {
+      "module": "cleanup",
+      "name": "replaceTrackedCaptureTaskWorkerTab",
+      "sha256": "6853fcf85bbde19272b9ca1d90820cd028c8d85b94f0ccb23a4d35e5e2115871"
+    },
+    {
+      "module": "cleanup",
+      "name": "buildCaptureTaskWorkerSnapshot",
+      "sha256": "900153ab8c34a74c82d3461d98d4d766dd9aa4200a2b7b96525384a9e9ac25b0"
+    },
+    {
+      "module": "cleanup",
+      "name": "reportCaptureTaskCancellationPublishError",
+      "sha256": "37e13e1d3aec2bced6a9f5e6aa3fb67c73f4eaa91847575a347ba7b6955809f9"
+    },
+    {
+      "module": "cleanup",
+      "name": "writeCaptureTaskCancellationFailSoft",
+      "sha256": "056602831ac78ea3bb53ff51e18bd7b54b593a967805c309acc594fa1351d935"
+    },
+    {
+      "module": "cleanup",
+      "name": "clearCaptureTaskTraceOverlayFailSoft",
+      "sha256": "23fff0125ac866c8a866045a8d22a1c036bc125794b7761c8620c6e5e89231c8"
+    },
+    {
+      "module": "cleanup",
+      "name": "buildCaptureTaskCancellation",
+      "sha256": "60a31e74a03cd8bcb5c0b06a279bce49cbc5c64d131d5833778915a758c17f92"
+    },
+    {
+      "module": "cleanup",
+      "name": "publishCaptureTaskCancellation",
+      "sha256": "e8306235851a32b2fc8da9145b7f3cd93e7059de6226fadbfe71bb625a39a89a"
+    },
+    {
+      "module": "cleanup",
+      "name": "relayCaptureTaskCancellation",
+      "sha256": "20d6f874332c6bf579879c7792d18d52576ed646979be4b77bd25fd255bbbdc5"
+    },
+    {
+      "module": "cleanup",
+      "name": "releaseCaptureTaskResources",
+      "sha256": "29af0bd2fa84cbfda5885a630422a16d7e6411c1454d40025e472a94399cecb1"
+    },
+    {
+      "module": "cleanup",
+      "name": "releaseCaptureTaskResourcesWithRetry",
+      "sha256": "ea7309326cba7efe5c48876ffe144db3d59e37200f20dfd4701ea0e6b7ed39d3"
+    },
+    {
+      "module": "attempts",
+      "name": "inspectStableUnattendedCaptureTask",
+      "sha256": "28ea5cf67203f01a012b29c03e59e72831e0040ec11f92bdf47ff1ea13584109"
+    },
+    {
+      "module": "attempts",
+      "name": "releaseStableUnattendedCaptureTaskResourcesOnly",
+      "sha256": "7f0e916ebc047363e118798836816189b6803c778621875f644472d0c4334d23"
+    },
+    {
+      "module": "attempts",
+      "name": "readUnattendedParentForCaptureTask",
+      "sha256": "cef99aec12a82febcb0c4cca2e1c54dc1499adbc6441403cad05a8a7135adb7f"
+    },
+    {
+      "module": "attempts",
+      "name": "inspectUnattendedCaptureTaskAttempt",
+      "sha256": "aadd278656cb248046e177c968be66a55406efcdf74bbfaee165b61adc55bc1f"
+    },
+    {
+      "module": "attempts",
+      "name": "matchesUnattendedBeginLease",
+      "sha256": "0130f861cefd97acd3fd4f5d4155abaa5ecc7893b47cf503a7745fa1a8323293"
+    },
+    {
+      "module": "attempts",
+      "name": "describeUnattendedBeginFenceMismatch",
+      "sha256": "4e992c3d5adbad991a3ee6c93cdabf941a275e8cbc2ed86ff8d599bded94c060"
+    },
+    {
+      "module": "attempts",
+      "name": "clearUnattendedCaptureTaskLockBinding",
+      "sha256": "7cc32cf11a345596fb0cd8f1c1c8ab8faed816dc06bc42f98ef17a5d24332c63"
+    },
+    {
+      "module": "attempts",
+      "name": "releaseUnattendedCaptureTaskResourcesForRecovery",
+      "sha256": "1b0c3b82647523e76d03f951f49de7f26e9c35aa97570fe7c6d126aed421ce32"
+    },
+    {
+      "module": "attempts",
+      "name": "recoverUnattendedCaptureTaskInterruption",
+      "sha256": "acb9f118a9aba8d15e34817664d1bb04360ffb6f5fed771c28f4e7114fcb6015"
+    },
+    {
+      "module": "attempts",
+      "name": "readUnattendedRequestIdFromSender",
+      "sha256": "9377d010dcddf4436a06c17d559deaa3ac444f1033466becd1926ff6445fc6c7"
+    },
+    {
+      "module": "attempts",
+      "name": "assertUnattendedBeginCleanupFence",
+      "sha256": "576007e6321ff8d457b5b39f761e012f8ac5ff4f5bce5c25e952d5a458a88a17"
+    },
+    {
+      "module": "attempts",
+      "name": "reclaimSupersededUnattendedCaptureTaskForBegin",
+      "sha256": "501e2da9d3b5b6e09b82713a3e1ee419c92d1db5c62b36d20c783179972941cc"
+    },
+    {
+      "module": "end",
+      "name": "endCaptureTask",
+      "sha256": "caa371002131f9614e35bf6ad6f50e48520b7dbf02687650c18d484f1db2a2db"
+    },
+    {
+      "module": "end",
+      "name": "performEndCaptureTask",
+      "sha256": "f13ff1c2a7da9531cf85bab5c3fde127063383557ef86dc7d9efc6c15d71e2fc"
+    },
+    {
+      "module": "end",
+      "name": "handleUnexpectedCaptureDebugDetach",
+      "sha256": "1f8095f05d38a1a7bb782c59f4e50c28c781b8324722fe981ef545c5cb8244e9"
+    },
+    {
+      "module": "end",
+      "name": "handleAbandonedCaptureTask",
+      "sha256": "d7515579f2c54b3bbadd6c338c7f2bc1fdc214ec006eda05dba7be0af2d22db9"
+    },
+    {
+      "module": "tabs",
+      "name": "replaceCaptureExecutionLockTabId",
+      "sha256": "1369cf6127e1fe0331b386348b02ca909b3ebcd6879431dc64962a29d73128da"
+    },
+    {
+      "module": "tabs",
+      "name": "replaceUnattendedRunnerTabId",
+      "sha256": "caabced357863150ee0fedec365f60f4b92cdbce7fd440a3409f5a64cbd8727b"
+    },
+    {
+      "module": "tabs",
+      "name": "handleCaptureRuntimeTabReplaced",
+      "sha256": "a357c44981cb6996cb5fd1f4ec3222aa81997e93c084874e3c3a740c00693593"
+    },
+    {
+      "module": "tabs",
+      "name": "handleCaptureRuntimeTabRemoved",
+      "sha256": "57a93f8cb50a1e6c39206a28e465f0beabec28dd616619b7f694e6ef41ad6952"
+    }
+  ]
+}
