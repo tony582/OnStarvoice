@@ -615,9 +615,10 @@ test('extension profile scan reuses monitor execution and renders distinct dark 
 });
 
 test('official comment patrol enhances the selected latest account posts without skipping old records', () => {
-  assert.match(sidebar, /scanLatestPostsByCount/u);
-  assert.match(sidebar, /MONITOR_LATEST_POSTS_LIMIT_MAX/u);
-  assert.match(sidebar, /postsLimit/u);
+  const params = readSidebarFunction('resolveMonitorRunnerCaptureParams');
+  assert.match(params, /captureSettings\.scanLatestPostsByCount === true/u);
+  assert.match(params, /Math\.min\(MONITOR_LATEST_POSTS_LIMIT_MAX, normalizedPostsLimit\)/u);
+  assert.match(params, /Number\(monitorSettings\.postsLimit\)/u);
   const monitor = readSidebarFunction('executeMonitorRunItem');
   assert.match(monitor, /正在巡查账号评论/u);
   assert.match(monitor, /includeComments:\s*true/u);

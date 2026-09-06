@@ -1,5 +1,5 @@
 // L3-A unattended-run: original control flow, explicit state and compatibility ports.
-export function createUnattendedRunController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createUnattendedRunController({controllerState, controllerPorts, controllerOperations}) {
   const {
     CAPTURE_EXECUTION_LOCK_HOLDER_ID,
     MAX_BATCH_KEYWORDS,
@@ -20,7 +20,7 @@ export function createUnattendedRunController({controllerState, controllerBindin
     completeTaskContext,
     console,
     detectPlatformFromUrl,
-    document,
+    taskView,
     endCaptureTaskSession,
     findUnattendedResumeKeyword,
     getCaptureSettings,
@@ -42,9 +42,7 @@ export function createUnattendedRunController({controllerState, controllerBindin
     syncDetailCaptureControlsFromStoredSettings,
     syncSearchFilterControlsForPlatform,
     unattendedSearchPassLabel,
-    updateBatchKeywordInputState,
     updateCaptureTaskSession,
-    window,
   } = controllerPorts;
   const activateUnattendedRunRequest = (...args) => controllerOperations.activateUnattendedRunRequest(...args);
   const adoptUnattendedCaptureExecutionLock = (...args) => controllerOperations.adoptUnattendedCaptureExecutionLock(...args);
@@ -1422,9 +1420,9 @@ export function createUnattendedRunController({controllerState, controllerBindin
       };
       throw error;
     }
-    controllerBindings.keywordPlanState = {
-      ...(controllerBindings.keywordPlanState && typeof controllerBindings.keywordPlanState === "object"
-        ? controllerBindings.keywordPlanState
+    controllerState.keywordPlanState = {
+      ...(controllerState.keywordPlanState && typeof controllerState.keywordPlanState === "object"
+        ? controllerState.keywordPlanState
         : {}),
       ...plan,
       executionMode,
@@ -1671,11 +1669,7 @@ export function createUnattendedRunController({controllerState, controllerBindin
       await sleepWithStop(1200, () => false);
       closeBatchModal();
 
-      const textarea = document.getElementById("textareaBatchKeywords");
-      if (textarea) {
-        textarea.value = keywords.join("\n");
-        updateBatchKeywordInputState();
-      }
+      taskView.applyUnattendedKeywords(keywords);
       syncSearchFilterControlsForPlatform(platform, {
         scope: "modal",
         values: plan.searchFilters || {},
@@ -1684,27 +1678,11 @@ export function createUnattendedRunController({controllerState, controllerBindin
         platform,
       });
 
-      const autoLoopInput = document.getElementById("chkAutoLoop");
-      if (autoLoopInput) {
-        autoLoopInput.checked = plannedRounds > 1;
-        document
-          .getElementById("batchLoopFields")
-          ?.classList.toggle("is-disabled", plannedRounds <= 1);
-      }
-      const loopGapInput = document.getElementById("inputLoopGapMin");
-      if (loopGapInput) {
-        loopGapInput.value = String(
+      taskView.applyUnattendedLoopSettings({
+        plannedRounds,
+        readGapMinutes: () =>
           sequentialSearchEnabled ? 0 : Math.max(0, Number(plan.roundGapMin) || 0),
-        );
-      }
-      const loopRoundsInput = document.getElementById("inputLoopRounds");
-      if (loopRoundsInput) {
-        loopRoundsInput.value = String(plannedRounds);
-      }
-      const scheduledInput = document.getElementById("inputBatchScheduledStart");
-      if (scheduledInput) {
-        scheduledInput.value = "";
-      }
+      });
 
       const navigationResult = await navigateActiveTabToKeywordSearchForPlan({
         keyword: resumeKeyword,

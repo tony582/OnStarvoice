@@ -76,10 +76,8 @@ test("monitor subject payload carries stable and human-readable identity togethe
 });
 
 test("sidebar recognition routes the same profile through an explicit subject type", async () => {
-  const [logic, ui] = await Promise.all([
-    read("sidebar/sidebar-logic.js"),
-    read("sidebar/sidebar-ui.js"),
-  ]);
+  const ui = await read("sidebar/sidebar-ui.js");
+  const logic = readSidebarFunction('buildMonitorSubjectCandidate');
 
   assert.match(logic, /function buildMonitorSubjectCandidate/);
   assert.match(logic, /subjectType:\s*normalizedSubjectType/);
@@ -90,10 +88,10 @@ test("sidebar recognition routes the same profile through an explicit subject ty
   assert.match(logic, /avatarUrl:\s*normalizedAvatarUrl/);
   assert.match(logic, /assignedAgentId:\s*normalizedAssignedAgentId/);
   assert.match(
-    logic,
+    readSidebarFunction('captureCurrentMonitorCandidate'),
     /assignedAgentId:\s*getCurrentAuth\(\)\?\.captureAgent\?\.id \|\| ""/u,
   );
-  assert.match(logic, /captureCurrentMonitorCandidate\(subjectType\)/);
+  assert.match(readSidebarFunction('handleAddCurrentMonitor'), /captureCurrentMonitorCandidate\(subjectType\)/);
   assert.match(
     readSidebarFunction('handleRunMonitorNow'),
     /runMonitorNow\(\{\s*subjectType:\s*MONITOR_SUBJECT_TYPE\.CREATOR,/,

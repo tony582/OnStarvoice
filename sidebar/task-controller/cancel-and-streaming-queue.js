@@ -1,12 +1,12 @@
 // L3-A cancel-and-streaming-queue: original control flow, explicit state and compatibility ports.
-export function createCancelAndStreamingQueueController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createCancelAndStreamingQueueController({controllerState, controllerPorts, controllerOperations}) {
   const {
     MESSAGE_TYPE,
     chrome,
     clearInterval,
     console,
     createRecordSyncQueue,
-    document,
+    taskView,
     formatStreamingSyncSummary,
     refreshDataPool,
     refreshSyncHistory,
@@ -100,10 +100,10 @@ export function createCancelAndStreamingQueueController({controllerState, contro
   }
 
   function getExpandedKeywordsFromTextarea({dedupe = false} = {}) {
-    const textarea = document.getElementById("textareaExpandedKeywords");
-    const keywords = textarea
-      ? parseKeywordsFromMultilineInput(textarea.value)
-      : [...controllerBindings.expandedKeywordsBuffer];
+    const input = taskView.readExpandedKeywordsInput();
+    const keywords = input.present
+      ? parseKeywordsFromMultilineInput(input.value)
+      : [...controllerState.expandedKeywordsBuffer];
     return dedupe ? dedupeKeywords(keywords) : keywords;
   }
 

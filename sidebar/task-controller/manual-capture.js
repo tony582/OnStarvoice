@@ -1,5 +1,5 @@
 // L3-A manual-capture: original control flow, explicit state and compatibility ports.
-export function createManualCaptureController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createManualCaptureController({controllerState, controllerPorts, controllerOperations}) {
   const {
     ERROR_MESSAGE_MAP,
     MAX_BATCH_KEYWORDS,
@@ -17,7 +17,7 @@ export function createManualCaptureController({controllerState, controllerBindin
     chrome,
     collectSearchFiltersFromControls,
     console,
-    document,
+    taskView,
     endCaptureTaskSession,
     ensureAuthVerifiedOrWarn,
     extractKeywordFromUrl,
@@ -430,7 +430,7 @@ export function createManualCaptureController({controllerState, controllerBindin
   }
 
   function getSearchBatchKeywordsFromTextarea() {
-    return String(document.getElementById("textareaSearchBatchKeywords")?.value || "")
+    return String(taskView.readSearchBatchKeywordsText() || "")
       .split(/\r?\n/)
       .map((s) => s.trim())
       .filter(Boolean);
@@ -472,7 +472,7 @@ export function createManualCaptureController({controllerState, controllerBindin
     }
 
     // 批量多词模式:从文本框读多个关键词;否则单词:从当前搜索页读
-    const searchBatchMode = !!document.getElementById("chkSearchBatchMode")?.checked;
+    const searchBatchMode = taskView.readSearchBatchMode();
     let searchKeywords = [];
     let keyword = "";
     if (searchBatchMode) {
@@ -543,7 +543,7 @@ export function createManualCaptureController({controllerState, controllerBindin
       }
       const sortContext = await syncKeywordSortDimensionFromPage({
         force: true,
-        fallbackDimension: controllerBindings.keywordSortDimension,
+        fallbackDimension: controllerState.keywordSortDimension,
       });
       const sortLabel = getKeywordSortDimensionLabel(sortContext.dimension);
       const keywordMinLikes = readKeywordMinLikesFromInput(
@@ -559,7 +559,7 @@ export function createManualCaptureController({controllerState, controllerBindin
       const searchAutoLoop = false;
 
       // 手动延迟启动:只支持今天的 HH:mm,老版本 datetime-local 值仍兼容。
-      const searchScheduledStr = document.getElementById("inputSearchScheduledStart")?.value || "";
+      const searchScheduledStr = taskView.readSearchScheduledStart();
       const scheduledStart = parseSearchManualScheduledStart(searchScheduledStr);
       if (scheduledStart) {
         const {targetMs, label: targetLabel} = scheduledStart;

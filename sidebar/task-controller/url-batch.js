@@ -1,12 +1,12 @@
 // L3-A url-batch: original control flow, explicit state and compatibility ports.
-export function createUrlBatchController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createUrlBatchController({controllerState, controllerPorts, controllerOperations}) {
   const {
     PAGE_ENHANCE_AUTH_REQUIRED_MESSAGE,
     batchCaptureByUrls,
     chrome,
     collectBatchRecordIds,
     console,
-    document,
+    taskView,
     ensureAuthVerifiedOrWarn,
     getCaptureSettings,
     readBloggerKeywordFilterFromInput,
@@ -25,11 +25,8 @@ export function createUrlBatchController({controllerState, controllerBindings, c
   const requestCaptureCancelSignal = (...args) => controllerOperations.requestCaptureCancelSignal(...args);
 
   async function handleRunBatchLinks() {
-    const textarea = document.getElementById("textareaBatchLinks");
-    if (!textarea) return;
-
-    const btn = document.getElementById("btnRunBatchLinks");
-    if (!btn) return;
+    const controls = taskView.openUrlBatchControls("links");
+    if (!controls) return;
     if (controllerState.batchUrlCaptureInFlight) {
       if (controllerState.batchUrlCaptureMode !== "links") {
         showMessage("已有批量任务执行中，请先停止当前任务", "warning");
@@ -40,7 +37,7 @@ export function createUrlBatchController({controllerState, controllerBindings, c
         return;
       }
       controllerState.batchUrlCancelRequested = true;
-      btn.textContent = "停止中...";
+      controls.showStopping();
       try {
         await requestCaptureCancelSignal(controllerState.activeBatchRunnerTabId);
       } catch (error) {
@@ -55,7 +52,7 @@ export function createUrlBatchController({controllerState, controllerBindings, c
       return;
     }
 
-    const urls = textarea.value
+    const urls = controls.readUrlsText()
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean);
@@ -83,9 +80,7 @@ export function createUrlBatchController({controllerState, controllerBindings, c
       controllerState.batchUrlCaptureInFlight = true;
       controllerState.batchUrlCancelRequested = false;
       controllerState.batchUrlCaptureMode = "links";
-      btn.textContent = "停止批量采集";
-      btn.classList.remove("btn-primary");
-      btn.classList.add("btn-danger");
+      controls.showRunning();
       setBatchProgressVisible("modal", true);
 
       const res = await batchCaptureByUrls({
@@ -126,18 +121,13 @@ export function createUrlBatchController({controllerState, controllerBindings, c
       if (executionLock) {
         await releaseCaptureExecutionLock(executionLock.id);
       }
-      btn.textContent = "启动批量采集";
-      btn.classList.add("btn-primary");
-      btn.classList.remove("btn-danger");
+      controls.showIdle();
     }
   }
 
   async function handleRunBatchBloggers() {
-    const textarea = document.getElementById("textareaBatchBloggers");
-    if (!textarea) return;
-
-    const btn = document.getElementById("btnRunBatchBloggers");
-    if (!btn) return;
+    const controls = taskView.openUrlBatchControls("bloggers");
+    if (!controls) return;
     if (controllerState.batchUrlCaptureInFlight) {
       if (controllerState.batchUrlCaptureMode !== "bloggers") {
         showMessage("已有批量任务执行中，请先停止当前任务", "warning");
@@ -148,7 +138,7 @@ export function createUrlBatchController({controllerState, controllerBindings, c
         return;
       }
       controllerState.batchUrlCancelRequested = true;
-      btn.textContent = "停止中...";
+      controls.showStopping();
       try {
         await requestCaptureCancelSignal(controllerState.activeBatchRunnerTabId);
       } catch (error) {
@@ -163,7 +153,7 @@ export function createUrlBatchController({controllerState, controllerBindings, c
       return;
     }
 
-    const urls = textarea.value
+    const urls = controls.readUrlsText()
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean);
@@ -208,9 +198,7 @@ export function createUrlBatchController({controllerState, controllerBindings, c
       controllerState.batchUrlCaptureInFlight = true;
       controllerState.batchUrlCancelRequested = false;
       controllerState.batchUrlCaptureMode = "bloggers";
-      btn.textContent = "停止批量采集";
-      btn.classList.remove("btn-primary");
-      btn.classList.add("btn-danger");
+      controls.showRunning();
       setBatchProgressVisible("modal", true);
 
       const res = await batchCaptureByUrls({
@@ -257,9 +245,7 @@ export function createUrlBatchController({controllerState, controllerBindings, c
       if (executionLock) {
         await releaseCaptureExecutionLock(executionLock.id);
       }
-      btn.textContent = "启动批量采集";
-      btn.classList.add("btn-primary");
-      btn.classList.remove("btn-danger");
+      controls.showIdle();
     }
   }
 

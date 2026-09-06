@@ -1,5 +1,5 @@
 // L3-A detail-sync: original control flow, explicit state and compatibility ports.
-export function createDetailSyncController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createDetailSyncController({controllerState, controllerPorts, controllerOperations}) {
   const {
     DETAIL_CAPTURE_SCOPE_ALL,
     DETAIL_ITEM_SETTLED_PHASES,

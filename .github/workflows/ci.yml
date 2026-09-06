@@ -105,6 +105,18 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up test-tooling runtime
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web/admin/package-lock.json
+
+      - name: Install locked AST test tooling
+        # The source-equivalence tests use the existing admin lockfile's parsers.
+        # Install tooling without lifecycle scripts, then run the suite on Node 18.
+        run: npm --prefix web/admin ci --ignore-scripts
+
       - name: Set up production Node.js runtime
         uses: actions/setup-node@v7
         with:

@@ -1,19 +1,28 @@
 import assert from 'node:assert/strict';
 import {readFileSync, readdirSync} from 'node:fs';
 import vm, {Script, runInNewContext} from 'node:vm';
+import {createKeywordTaskState} from '../../sidebar/task-controller/keyword-state.js';
+import {createKeywordPlanView} from '../../sidebar/legacy-view/keyword-plan.js';
+import {createKeywordStrategyView} from '../../sidebar/legacy-view/keyword-strategy.js';
+import {createKeywordSharingView} from '../../sidebar/legacy-view/keyword-sharing.js';
+import {createMonitorSettingsView} from '../../sidebar/legacy-view/monitor-settings.js';
+import {createLegacyCaptureInputsView} from '../../sidebar/legacy-view/capture-inputs.js';
+import {createLegacyKeywordInputsView} from '../../sidebar/legacy-view/keyword-inputs.js';
+import {createLegacyCaptureProgressView} from '../../sidebar/legacy-view/capture-progress.js';
+import {createLegacyProgressVisibilityView} from '../../sidebar/legacy-view/progress-visibility.js';
 
 const root = new URL('../../', import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL('tests/fixtures/sidebar-controller-migration.json', root), 'utf8'));
 const entries = manifest.entries;
 const owners = new Map(entries.map(entry => [entry.name, entry]));
 const preparedScopes = new WeakSet();
+// These two existing public operations deliberately delegate to view-owned
+// formatting. Every other historical declaration must have exactly one owner.
+const presentationDelegates = new Set(['buildCaptureProgressText', 'normalizeProgressCount']);
 assert.equal(owners.size, entries.length, 'Sidebar function ownership must be unique');
 
 export function readSidebarFunction(name) {
-  const owner = owners.get(name);
-  assert.ok(owner, `unknown Sidebar function: ${name}`);
-  const path = owner.module ? `sidebar/task-controller/${owner.module}.js` : 'sidebar/sidebar-logic.js';
-  const source = readFileSync(new URL(path, root), 'utf8');
+  const {path, source} = readSidebarFunctionOwner(name);
   const matches = [...source.matchAll(new RegExp(`^( *)(?:export )?(?:async )?function ${name}\\s*\\(`, 'gm'))];
   assert.equal(matches.length, 1, `${path}: expected one real declaration of ${name}`);
   const [{index: start, 1: indent}] = matches;
@@ -27,6 +36,24 @@ export function readSidebarFunction(name) {
     .replace(/^export /, '');
   new Script(`(${body})`, {filename: `${path}#${name}`});
   return body;
+}
+
+// L3-A's manifest is historical evidence and retains the original source order.
+// L3-B moves some of those declarations again, so resolve the actual owner rather
+// than changing old hashes or pretending those functions still live in the host.
+export function readSidebarFunctionOwner(name) {
+  assert.ok(owners.has(name), `unknown Sidebar function: ${name}`);
+  const declaration = new RegExp(`^ *(?:export )?(?:async )?function ${name}\\s*\\(`, 'gm');
+  const matches = readSidebarRuntimeSources().flatMap(entry =>
+    [...entry.source.matchAll(declaration)].map(() => entry));
+  if (presentationDelegates.has(name)) {
+    assert.deepEqual(matches.map(entry => entry.path).sort(), [
+      'sidebar/legacy-view/capture-progress.js', 'sidebar/task-controller/progress.js',
+    ], `expected only the explicit presentation implementation and controller delegate for ${name}`);
+    return matches.find(entry => entry.path === 'sidebar/task-controller/progress.js');
+  }
+  assert.equal(matches.length, 1, `expected one actual Sidebar owner for ${name}`);
+  return matches[0];
 }
 
 export function readSidebarFunctions(names) {
@@ -58,42 +85,75 @@ export function readSidebarSection(startMarker, endMarker) {
 }
 
 export function readSidebarControllerSources() {
-  const directory = new URL('sidebar/task-controller/', root);
+  // Existing whole-runtime safety assertions must not lose migrated view code.
+  return [...readSidebarDirectorySources('task-controller'), ...readSidebarDirectorySources('legacy-view')];
+}
+
+function readSidebarDirectorySources(directoryName) {
+  const directory = new URL(`sidebar/${directoryName}/`, root);
   const files = readdirSync(directory).filter(name => name.endsWith('.js')).sort();
-  assert.ok(files.includes('coordinator.js'));
-  return files.map(name => ({path: `sidebar/task-controller/${name}`, source: readFileSync(new URL(name, directory), 'utf8')}));
+  return files.map(name => ({path: `sidebar/${directoryName}/${name}`, source: readFileSync(new URL(name, directory), 'utf8')}));
+}
+
+export function readSidebarRuntimeSources() {
+  return [{path: 'sidebar/sidebar-logic.js', source: readFileSync(new URL('sidebar/sidebar-logic.js', root), 'utf8')},
+    ...readSidebarControllerSources()];
+}
+
+function readActualStateInitializer(path, name, context = {}) {
+  const source = readFileSync(new URL(path, root), 'utf8');
+  const marker = `  const ${name} = {`;
+  const start = source.indexOf(marker);
+  const end = source.indexOf('\n  };', start);
+  assert.ok(start >= 0 && end > start, `missing actual ${name} initializer`);
+  return runInNewContext(`${source.slice(start, end + 5)}\n${name};`, context);
 }
 
 export function createSidebarTestScope(input = {}) {
   if (preparedScopes.has(input)) return input;
-  const coordinator = readFileSync(new URL('sidebar/task-controller/coordinator.js', root), 'utf8');
-  const marker = '  const controllerState = {';
-  const start = coordinator.indexOf(marker);
-  const end = coordinator.indexOf('\n  };', start);
-  assert.ok(start >= 0 && end > start, 'missing actual controller state initializer');
-  const defaults = runInNewContext(`${coordinator.slice(start, end + 5)}\ncontrollerState;`);
+  const defaults = readActualStateInitializer('sidebar/task-controller/coordinator.js', 'controllerState', {createKeywordTaskState});
+  const viewDefaults = readActualStateInitializer('sidebar/legacy-view/coordinator.js', 'legacyViewState');
   const controllerState = {...defaults, ...input.controllerState};
-  const controllerBindings = {...input.controllerBindings};
+  const legacyViewState = {...viewDefaults, ...input.legacyViewState};
   // Move explicitly supplied test fields into their real production namespace.
   // No production source is rewritten and no global compatibility getters exist.
-  for (const {name} of manifest.state) {
+  for (const name of Object.keys(defaults)) {
     if (Object.hasOwn(input, name)) { controllerState[name] = input[name]; delete input[name]; }
   }
-  for (const name of manifest.shared) {
-    if (Object.hasOwn(input, name)) {
-      Object.defineProperty(controllerBindings, name, {
-        enumerable: true, configurable: true,
-        get: () => input[name], set: value => { input[name] = value; },
-      });
-    }
+  for (const name of Object.keys(viewDefaults)) {
+    if (Object.hasOwn(input, name)) { legacyViewState[name] = input[name]; delete input[name]; }
   }
   input.controllerState = controllerState;
-  input.controllerBindings = controllerBindings;
+  input.legacyViewState = legacyViewState;
   input.sidebarTaskController ??= {};
-  for (const name of manifest.readStates) {
-    const read = `read${name[0].toUpperCase()}${name.slice(1)}`;
+  const coordinator = readFileSync(new URL('sidebar/task-controller/coordinator.js', root), 'utf8');
+  const model = {};
+  for (const [, read, name] of coordinator.matchAll(/\b(read\w+): \(\) => controllerState\.(\w+)/gu)) {
     input.sidebarTaskController[read] ??= () => controllerState[name];
+    model[name] = () => controllerState[name];
   }
+  for (const [, replace, name] of coordinator.matchAll(/\b(replace\w+): value => \(controllerState\.(\w+) = value\)/gu)) {
+    input.sidebarTaskController[replace] ??= value => (controllerState[name] = value);
+  }
+  input.keywordModel ??= model;
+  const application = new Proxy({}, {get: (_target, name) => (...args) => {
+    assert.equal(typeof input[name], 'function', `missing explicit test application port ${String(name)}`);
+    return input[name](...args);
+  }});
+  input.controllerOperations ??= application;
+  // These are real legacy view factories, not duplicated DOM logic. Explicit
+  // test ports win; application callbacks resolve only when the test calls them.
+  const taskView = {};
+  for (const factory of [createKeywordPlanView, createKeywordStrategyView, createKeywordSharingView, createMonitorSettingsView]) {
+    Object.assign(taskView, factory({legacyViewState, ports: input, application, keywordModel: input.keywordModel, viewOperations: taskView}));
+  }
+  Object.assign(taskView, createLegacyCaptureInputsView(input), createLegacyKeywordInputsView(input),
+    createLegacyCaptureProgressView(input), createLegacyProgressVisibilityView({...input,
+      clearKeywordPlanProgressCountdown: application.clearKeywordPlanProgressCountdown,
+      setCaptureButtonsDisabled: application.setCaptureButtonsDisabled,
+    }), {isUnsupportedPlatformCoverVisible: application.isUnsupportedPlatformCoverVisible}, input.taskView);
+  input.taskView = taskView;
+  input.controllerPorts ??= {...input, taskView};
   preparedScopes.add(input);
   return input;
 }

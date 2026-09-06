@@ -1,5 +1,5 @@
 // L3-A task-ledger-assist: original control flow, explicit state and compatibility ports.
-export function createTaskLedgerAssistController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createTaskLedgerAssistController({controllerState, controllerPorts, controllerOperations}) {
   const {
     OPTIONAL_CAPTURE_ASSIST_SESSION_CODES,
     beginCaptureTaskSession,

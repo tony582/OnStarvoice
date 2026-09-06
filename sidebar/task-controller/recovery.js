@@ -1,19 +1,17 @@
 // L3-A recovery: original control flow, explicit state and compatibility ports.
-export function createRecoveryController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createRecoveryController({controllerState, controllerPorts, controllerOperations}) {
   const {
     CAPTURE_RECOVERY_PHASES,
     CAPTURE_RECOVERY_UI_STALE_MS,
     MESSAGE_TYPE,
-    buildCaptureRecoveryAnnouncementKey,
     chrome,
     clearKeywordPlanProgressCountdown,
     clearTimeout,
     console,
-    document,
+    taskView,
     isUnsupportedPlatformCoverVisible,
     resolveCaptureRecoveryView,
     setTimeout,
-    showMessage,
   } = controllerPorts;
   const handleRetryCommentsCapture = (...args) => controllerOperations.handleRetryCommentsCapture(...args);
 
@@ -61,89 +59,12 @@ export function createRecoveryController({controllerState, controllerBindings, c
     }
   }
 
-  function setRecoveryCopy(elementId, value) {
-    const element = document.getElementById(elementId);
-    if (!element) return;
-    const text = String(value || "").trim();
-    if (element.textContent !== text) {
-      element.textContent = text;
-    }
-    const shouldHide = !text;
-    if (element.hidden !== shouldHide) {
-      element.hidden = shouldHide;
-    }
-  }
-
-  function isRecoveryActionAvailable(button) {
-    return Boolean(
-      button &&
-        !button.hidden &&
-        !button.disabled &&
-        button.style.display !== "none",
-    );
-  }
-
-  function handoffRecoveryFocus({
-    previousActiveElement,
-    progressContainer,
-    btnRetry,
-    btnDismiss,
-    btnCancel,
-  }) {
-    const recoveryActions = [btnRetry, btnDismiss, btnCancel].filter(Boolean);
-    if (!recoveryActions.includes(previousActiveElement)) return;
-    if (isRecoveryActionAvailable(previousActiveElement)) return;
-
-    const nextAction = [btnRetry, btnDismiss, btnCancel].find(
-      isRecoveryActionAvailable,
-    );
-    const nextFocus = nextAction || progressContainer;
-    try {
-      nextFocus?.focus({preventScroll: true});
-    } catch {
-      nextFocus?.focus();
-    }
-  }
-
   function resetCaptureRecoveryUI({hidePanel = false, clearState = true} = {}) {
     if (controllerState.captureRecoveryFreshnessTimer) {
       clearTimeout(controllerState.captureRecoveryFreshnessTimer);
       controllerState.captureRecoveryFreshnessTimer = null;
     }
-    const progressContainer = document.getElementById("progressContainer");
-    if (progressContainer) {
-      if (
-        hidePanel &&
-        progressContainer.dataset.progressSource === "capture-recovery"
-      ) {
-        progressContainer.style.display = "none";
-        delete progressContainer.dataset.progressSource;
-      }
-      delete progressContainer.dataset.recoveryPinned;
-      delete progressContainer.dataset.recoveryCancelable;
-      delete progressContainer.dataset.recordId;
-      delete progressContainer.dataset.captureRequestId;
-      delete progressContainer.dataset.recoveryAnnouncementKey;
-    }
-
-    setRecoveryCopy("progressBadge", "");
-    setRecoveryCopy("progressReason", "");
-    setRecoveryCopy("progressNextStep", "");
-
-    for (const id of ["btnRetryRecovery", "btnDismissRecovery"]) {
-      const button = document.getElementById(id);
-      if (button) {
-        button.hidden = true;
-        button.disabled = false;
-      }
-    }
-
-    const btnCancel = document.getElementById("btnCancel");
-    if (btnCancel) {
-      btnCancel.hidden = false;
-      btnCancel.textContent = "中止任务";
-      btnCancel.disabled = false;
-    }
+    taskView.resetCaptureRecoveryPresentation({hidePanel});
 
     if (clearState) {
       controllerState.activeRecoveryProgress = null;
@@ -205,80 +126,14 @@ export function createRecoveryController({controllerState, controllerBindings, c
       controllerState.captureRecoveryFreshnessTimer = null;
     }
 
-    const progressContainer = document.getElementById("progressContainer");
-    const progressBar = document.getElementById("progressBar");
-    const progressText = document.getElementById("progressText");
-    if (!progressContainer || !progressBar || !progressText) {
+    const presentation = taskView.openCaptureRecoveryPresentation();
+    if (!presentation) {
       return false;
     }
-    if (progressContainer.dataset.progressSource === "keyword-plan") {
+    if (presentation.isKeywordPlanPresentation()) {
       clearKeywordPlanProgressCountdown();
     }
-
-    const tone = ["info", "success", "warning", "error", "danger"].includes(
-      view.tone,
-    )
-      ? view.tone
-      : "info";
-    const announcementKey = buildCaptureRecoveryAnnouncementKey(view);
-    const shouldUpdateAnnouncement =
-      progressContainer.dataset.recoveryAnnouncementKey !== announcementKey;
-    const previousActiveElement = document.activeElement;
-    progressContainer.dataset.progressSource = "capture-recovery";
-    progressContainer.dataset.recoveryPinned = view.pinned ? "true" : "false";
-    progressContainer.dataset.recoveryCancelable = view.showCancel
-      ? "true"
-      : "false";
-    if (view.recordId) {
-      progressContainer.dataset.recordId = view.recordId;
-    } else {
-      delete progressContainer.dataset.recordId;
-    }
-    if (view.captureRequestId) {
-      progressContainer.dataset.captureRequestId = view.captureRequestId;
-    } else {
-      delete progressContainer.dataset.captureRequestId;
-    }
-    progressContainer.style.display = "block";
-
-    const btnRetry = document.getElementById("btnRetryRecovery");
-    const btnDismiss = document.getElementById("btnDismissRecovery");
-    const btnCancel = document.getElementById("btnCancel");
-    if (shouldUpdateAnnouncement) {
-      progressContainer.dataset.recoveryAnnouncementKey = announcementKey;
-      progressBar.className = `status-bar capture-recovery-status is-${tone}`;
-      if (progressText.textContent !== view.title) {
-        progressText.textContent = view.title;
-      }
-      progressText.hidden = false;
-      setRecoveryCopy("progressBadge", view.statusLabel);
-      setRecoveryCopy("progressReason", view.detail);
-      setRecoveryCopy("progressNextStep", view.nextStep);
-
-      if (btnRetry) {
-        btnRetry.hidden = !view.showRetry;
-        btnRetry.disabled = !view.showRetry;
-        btnRetry.textContent = view.retryLabel || "继续当前项";
-      }
-      if (btnDismiss) {
-        btnDismiss.hidden = !view.showDismiss;
-        btnDismiss.disabled = false;
-        btnDismiss.textContent = view.dismissLabel || "保留结果";
-      }
-      if (btnCancel) {
-        btnCancel.hidden = !view.showCancel;
-        btnCancel.style.display = view.showCancel ? "inline-flex" : "none";
-        btnCancel.disabled = false;
-        btnCancel.textContent = view.cancelLabel || "取消并保留";
-      }
-      handoffRecoveryFocus({
-        previousActiveElement,
-        progressContainer,
-        btnRetry,
-        btnDismiss,
-        btnCancel,
-      });
-    }
+    presentation.render(view);
 
     controllerState.activeRecoveryProgress = {...normalizedProgress, ...view};
     const runnerTabId = Number(
@@ -330,14 +185,14 @@ export function createRecoveryController({controllerState, controllerBindings, c
   }
 
   async function handleRetryRecovery() {
-    const progressContainer = document.getElementById("progressContainer");
+    const presentation = taskView.openCaptureProgressPresentation();
     const recordId = String(
       controllerState.activeRecoveryProgress?.recordId ||
-        progressContainer?.dataset.recordId ||
+        presentation.readRecoveryRecordId() ||
         "",
     ).trim();
     if (!recordId) {
-      showMessage("当前提示没有可继续的评论记录，请从记录卡片重试", "warning");
+      taskView.showMissingRecoveryRecordNotice();
       return;
     }
     const snapshot = controllerState.activeRecoveryProgress
@@ -397,9 +252,6 @@ export function createRecoveryController({controllerState, controllerBindings, c
     buildCaptureRecoverySuppressionKey,
     clearSuppressedCaptureRecoveryForRecord,
     updateActiveCommentCaptureIdentity,
-    setRecoveryCopy,
-    isRecoveryActionAvailable,
-    handoffRecoveryFocus,
     resetCaptureRecoveryUI,
     renderCaptureRecoveryUI,
     handleRetryRecovery,

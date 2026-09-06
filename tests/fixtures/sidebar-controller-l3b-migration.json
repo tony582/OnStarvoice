@@ -1,0 +1,1587 @@
+{
+  "baseline": "2c997709c0a4223784901aeaa461fab46108ba8b",
+  "historicalFixture": "sidebar-controller-migration.json",
+  "historicalFixtureSha256": "a658643e3b297b197dd5f0d03817581e4a46e2206ec43c73691ba883bae34b04",
+  "proofScope": "Pins the exact authorized baseline and actual ownership. Default CI verifies 202 normalized ASTs; 14 semantic-port transitions and two separately recorded in-scope host progress transitions remain explicitly non-equivalent and require behavior tests.",
+  "normalizedAstAudit": {
+    "version": "l3b-owner-normalization-v1",
+    "normalization": "Only approved free state qualification and exact identity bridges; ignores positions and ordinary Literal.raw only. Preserves template raw/cooked, regex pattern/flags, control flow and evaluation order. No arbitrary read-prefix, optional/computed access, shadowed binding or call-receiver normalization.",
+    "equivalentCount": 202,
+    "semanticTransitions": {
+      "persistBatchDraftForPlatform": "captured-draft-input-session",
+      "applyBatchDraftToInputs": "draft-input-presentation-port",
+      "renderKeywordPlanStatus": "application-progress-and-debug-ownership-with-pure-status-label-view",
+      "syncKeywordPlanProgressPanel": "application-recovery-reset-with-captured-progress-presentation",
+      "populateKeywordPlanUI": "plan-schedule-and-keyword-input-presentation",
+      "setKeywordStrategyTab": "view-event-to-named-application-selection",
+      "handleOpenKeywordLongtail": "view-event-to-named-application-longtail-command",
+      "handleBenchmarkDiscoveryResultActions": "view-event-to-named-application-monitor-action",
+      "renderInsightCardToImage": "lazy-image-factory",
+      "renderKeywordOpportunityCardToImage": "lazy-image-factory",
+      "renderBenchmarkDiscoveryCardToImage": "lazy-image-factory",
+      "showInsightImagePreview": "lazy-clipboard-item-factory",
+      "loadMonitorSubscriptions": "selected-monitor-platform-input-port",
+      "handleMonitorListClick": "view-event-to-named-application-monitor-action"
+    }
+  },
+  "additionalHostTransitions": [
+    {
+      "name": "showProgress",
+      "owner": "sidebar/task-controller/progress-visibility.js",
+      "transition": "progress-visibility-semantic-presentation-port",
+      "baselineSha256": "66225b35c81d83ab46e59d2e74d5a3629db1cbf4e9ebb4195803f6e2ce91b053",
+      "baselineNormalizedAstSha256": "30baa5f30cc50d0eb8132432b99025801e3686d19c736bb64f039e39865a18df",
+      "scope": "Separately recorded in-scope progress-visibility follow-up; excluded from the original 216-function batch."
+    },
+    {
+      "name": "hideProgressPanelOnly",
+      "owner": "sidebar/task-controller/progress-visibility.js",
+      "transition": "progress-visibility-semantic-presentation-port",
+      "baselineSha256": "8aa71cad61a5881988227cea91f29133c688a1fb638a175ef363be2936053baf",
+      "baselineNormalizedAstSha256": "f76dbdf5d5ec56c114bced3332dc37a43ef965e9151f07a52eebe245ce44129e",
+      "scope": "Separately recorded in-scope progress-visibility follow-up; excluded from the original 216-function batch."
+    }
+  ],
+  "l3aTransitions": {
+    "cancelUnattendedKeywordPlanFromSidebar": "controller-owned-keyword-state-and-cancel-presentation",
+    "getSearchBatchKeywordsFromTextarea": "semantic-input-port",
+    "handleCaptureSearchData": "semantic-input-port",
+    "getExpandedKeywordsFromTextarea": "controller-owned-expansion-state-and-input",
+    "handleBatchKeywordCapture": "controller-owned-keyword-state-and-input-presentation",
+    "getUnattendedRunRequestIdFromUrl": "runner-location-input-port",
+    "getUnattendedRunAttemptIdFromUrl": "runner-location-input-port",
+    "getTargetedPostRunRequestIdFromUrl": "runner-location-input-port",
+    "getTargetedPostRunAttemptIdFromUrl": "runner-location-input-port",
+    "runUnattendedKeywordPlanRequest": "controller-owned-keyword-state-and-input-presentation",
+    "runCaptureAction": "capture-action-presentation-port",
+    "handleCancel": "capture-action-presentation-port",
+    "setRecoveryCopy": "unchanged-body-now-view-private",
+    "isRecoveryActionAvailable": "unchanged-body-now-view-private",
+    "handoffRecoveryFocus": "unchanged-body-now-view-private",
+    "resetCaptureRecoveryUI": "recovery-semantic-presentation-port",
+    "renderCaptureRecoveryUI": "recovery-semantic-presentation-port",
+    "handleRetryRecovery": "recovery-semantic-presentation-port",
+    "handleProgress": "progress-semantic-presentation-port",
+    "syncRuntimeCaptureProgress": "progress-semantic-presentation-port",
+    "buildCaptureProgressText": "public-delegate-to-unchanged-view-body",
+    "normalizeProgressCount": "public-delegate-to-unchanged-view-body",
+    "handleRunBatchLinks": "captured-input-presentation-session",
+    "handleRunBatchBloggers": "captured-input-presentation-session"
+  },
+  "state": [
+    {
+      "name": "keywordSortDimension",
+      "kind": "let",
+      "initializer": "KEYWORD_SORT_DIMENSION.LIKES",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordSortSyncTimer",
+      "kind": "let",
+      "initializer": "null",
+      "owner": "controllerState"
+    },
+    {
+      "name": "lastRuntimePageUrlForKeywordSort",
+      "kind": "let",
+      "initializer": "\"\"",
+      "owner": "controllerState"
+    },
+    {
+      "name": "expandedKeywordsBuffer",
+      "kind": "let",
+      "initializer": "[]",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordExpandInFlight",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordExpandCancelRequested",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordAnalysisInFlight",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordInsightSampleInFlight",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordInsightRunToken",
+      "kind": "let",
+      "initializer": "0",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordAnalysisStartedAt",
+      "kind": "let",
+      "initializer": "0",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordStrategyPanelVisible",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "legacyViewState"
+    },
+    {
+      "name": "keywordStrategyActiveTab",
+      "kind": "let",
+      "initializer": "\"opportunity\"",
+      "owner": "legacyViewState"
+    },
+    {
+      "name": "keywordBenchmarkInFlight",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordBenchmarkCancelRequested",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordBenchmarkStartedAt",
+      "kind": "let",
+      "initializer": "0",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordBenchmarkResult",
+      "kind": "let",
+      "initializer": "null",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordBenchmarkErrorMessage",
+      "kind": "let",
+      "initializer": "\"\"",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordBenchmarkAnalysisStatus",
+      "kind": "let",
+      "initializer": "\"idle\"",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordBenchmarkLoadingTitle",
+      "kind": "let",
+      "initializer": "\"\"",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordBenchmarkLoadingMeta",
+      "kind": "let",
+      "initializer": "\"\"",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordOpportunityInFlight",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordOpportunityCancelRequested",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordOpportunityStartedAt",
+      "kind": "let",
+      "initializer": "0",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordOpportunityResult",
+      "kind": "let",
+      "initializer": "null",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordOpportunityErrorMessage",
+      "kind": "let",
+      "initializer": "\"\"",
+      "owner": "controllerState"
+    },
+    {
+      "name": "expandedKeywordsPanelVisible",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "legacyViewState"
+    },
+    {
+      "name": "expandedKeywordInsightCategoryIds",
+      "kind": "const",
+      "initializer": "new Set()",
+      "owner": "legacyViewState"
+    },
+    {
+      "name": "lastRuntimePageTypeForKeywordSort",
+      "kind": "let",
+      "initializer": "PAGE_TYPE.UNKNOWN",
+      "owner": "controllerState"
+    },
+    {
+      "name": "batchDraftByPlatform",
+      "kind": "let",
+      "initializer": "{}",
+      "owner": "controllerState"
+    },
+    {
+      "name": "activeBatchDraftPlatform",
+      "kind": "let",
+      "initializer": "\"\"",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordPlanState",
+      "kind": "let",
+      "initializer": "null",
+      "owner": "controllerState"
+    },
+    {
+      "name": "activeKeywordRunState",
+      "kind": "let",
+      "initializer": "null",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordPlanReconcileTimer",
+      "kind": "let",
+      "initializer": "null",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordPlanReconcileInFlight",
+      "kind": "let",
+      "initializer": "false",
+      "owner": "controllerState"
+    },
+    {
+      "name": "keywordPlanProgressCountdownTimer",
+      "kind": "let",
+      "initializer": "null",
+      "owner": "legacyViewState"
+    },
+    {
+      "name": "keywordPlanProgressCountdownToken",
+      "kind": "let",
+      "initializer": "0",
+      "owner": "legacyViewState"
+    }
+  ],
+  "entries": [
+    {
+      "name": "createEmptyKeywordInsightState",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "6938a2a7b079ca34ee637b0cdb6f5403d0f22e1f8a1cf53ce4c1dca1975a43c3",
+      "baselineNormalizedAstSha256": "67e3e361cf998c17d76a762f741a77b0414cdc114670fe2068884b566a91e45d"
+    },
+    {
+      "name": "createEmptyKeywordOpportunityDraft",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "96e7321243c9303fdf12e62718368cd57625441ae0bdda4f6c34461efc02f408",
+      "baselineNormalizedAstSha256": "87c78e60109c024485b7d5a98af343a1980414b80c483413768c9d8acc06795c"
+    },
+    {
+      "name": "normalizeKeywordOpportunitySampleItems",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "9dc693d929535962a73078b324d66f6bbfa844d0da116a04d6008c94e9621537",
+      "baselineNormalizedAstSha256": "678bcc3b2ce2f1a490ba356bfda499b1267b65de490ce389c8bb883fbb8b1850"
+    },
+    {
+      "name": "normalizeRepresentativeSampleItems",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "64c283c966ccf3387ac208d136beeeee9ddea67a04c35fa7df9b7fbe7764a161",
+      "baselineNormalizedAstSha256": "01a0f52295a7cac2cdf90541ff063de772ffb68a4f543ab46227c2a94fba8188"
+    },
+    {
+      "name": "normalizeKeywordOpportunityDraft",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "89cc7b3c3eabab5a9a5b6b0cc0f7179d50b190bef3cfd265b5f251b5796e3818",
+      "baselineNormalizedAstSha256": "21e7162f049ffac8e8f1a64a4d0820ab6772bd076b33f47769183e3168f508ee"
+    },
+    {
+      "name": "normalizeBatchDraftPlatform",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "b8197095297223cb55652700c43b89e118bc6f27467bcfe4b397354c55f79594",
+      "baselineNormalizedAstSha256": "fce50fbe0f56432ecd0b70e08644a898993de358f46e2d6a96badcddf0ee5822"
+    },
+    {
+      "name": "createEmptyBatchDraft",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "78bcd21ff9683510fafdb9b541f5e798d240c4423ed1ba486219d6f8ba2664a0",
+      "baselineNormalizedAstSha256": "575e2c79f4a6b67f706de2451116e8fe4d7254b222012e7673bbe5be9a1f5798"
+    },
+    {
+      "name": "normalizeBatchDraftEntry",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "ff9fc352d0a5fa10fb03d44fcf3ff87f8c4a16adb82daf9d3a73dc2221f7a101",
+      "baselineNormalizedAstSha256": "e2cdbb2d09d2322d63c6723306ba08c563d5c6f743507cbcf4a65e70cd26fab2"
+    },
+    {
+      "name": "normalizeBatchDraftStore",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "261f58a4deb9b669f670e293acaed5487307bb33c49b2797d88f534b8fab9126",
+      "baselineNormalizedAstSha256": "709594c2afb8725063ee0b97684f13f54737c05bd23b617d5783257d68a78f31"
+    },
+    {
+      "name": "getCurrentBatchDraftPlatform",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "8702fbbf2fb0c80906065140cc833662c8dbc62424878ae712a0c3c494f05dda",
+      "baselineNormalizedAstSha256": "1db7a7678f43a1ac4b9456d31e0e316e5cac17c104e2ad68bb43967d3750a576"
+    },
+    {
+      "name": "resolveBatchDraftPlatform",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "0a284d9fa38c873bdd6f1884e579f57ff33d40250539dcf43c3ece448df544b6",
+      "baselineNormalizedAstSha256": "a9962269629e3ed681b2b3a16394739cb403647a9d36fe3811eea5486d890707"
+    },
+    {
+      "name": "getBatchDraftForPlatform",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "9fc69d687b5aa2d6995067aa40dda18dee96cb01a1f53110e7c9f4bf98262e1d",
+      "baselineNormalizedAstSha256": "119e5342034cd1afee6be06bedc8428edc6a543650f253c30794e1ad3913cce5"
+    },
+    {
+      "name": "getKeywordInsightState",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "33b64a51ad76bf0e317511c8557737ac13d14790d6835b16a92f3c4401b0f1f1",
+      "baselineNormalizedAstSha256": "c3d29be54f695cd2b5424ba64daf9208568357b1d7cd2c0264e5d16cba35a6a8"
+    },
+    {
+      "name": "updateKeywordInsightState",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "256773f0c5c217c1ccfb936b9f3ee0b3febb1947b17cdbe35b8377dbd021c666",
+      "baselineNormalizedAstSha256": "39de9f5b6eb13900e7373237124ea46897cdc1aa661672caae657e38756d7e59"
+    },
+    {
+      "name": "getKeywordOpportunityDraft",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "fb697a368ed09010925e06b6a7be758fa8290691d2d00f1436f2c94a6542f140",
+      "baselineNormalizedAstSha256": "aed0e981de0d9ed5bccd65d6ff02389106e32b4a2eefb872f842430107d4d6c7"
+    },
+    {
+      "name": "updateKeywordOpportunityDraft",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "628340f4976631363056ff77fa64c01b2c2578ca5804556b64b1e2dc3ef479df",
+      "baselineNormalizedAstSha256": "c38a3331459d8b6bd15d9add7ac577de1407538a39a84cdf9ba419ab1d9de424"
+    },
+    {
+      "name": "clearKeywordOpportunityDraft",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "a5ab2ebf05ed3cd6c422a703bf4d1153e5c79ccbe1a154beaf782d5a6b684376",
+      "baselineNormalizedAstSha256": "2a8b0e2c777a85f54ea039ab44f9c8a95be1d7c6c4dd78f6edd2ad389a5c029f"
+    },
+    {
+      "name": "persistBatchDraftStore",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "3bc5d29c7a27c89f1e39b6f7d92d4e3bb52c7e78624d8d0ad800d50526a00f0c",
+      "baselineNormalizedAstSha256": "8d86b591c3dc700e8c5e020ce398c9735dd93a334fdfafb64d00beaaaa9d761f"
+    },
+    {
+      "name": "loadBatchDraftStore",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "4cad19fee3b8d110625d77e988796d81174010316746e8798740656f519839c6",
+      "baselineNormalizedAstSha256": "bde27d0d6489fd76d4050162e803e40665ef905aca4c6078b559cdad4368273c"
+    },
+    {
+      "name": "persistBatchDraftForPlatform",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "a79690e28e5ab48ab7b09a99dbca65a40ab4f4d6004867880df6a95fc263fb00",
+      "baselineNormalizedAstSha256": "a867c050fe805d3688fd236404e86266ec657f1bc3c7c0cefb89c50cc84ad28b"
+    },
+    {
+      "name": "applyBatchDraftToInputs",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "9d1efc1c8f0c5c85107edf89dcf3986a4b35b878a55d41404193c152e0399179",
+      "baselineNormalizedAstSha256": "c3c4b87bf05588263523d918161685a5d066f7ab809c2c1d67fb2354e2d49169"
+    },
+    {
+      "name": "syncBatchDraftForPlatform",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "f39d57972bb2b92324a77876882d41c351758f9168e532faf74c6de61c6a742c",
+      "baselineNormalizedAstSha256": "005a8f534ec83278ede165c4a26aca6d985e09b5f3ab361a963e4ffa58bf49b9"
+    },
+    {
+      "name": "persistCurrentBatchDraft",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "87fe1565a43882ce6d1cf7388ceb986480b158dbbb7da7335f2907550ad3bc2b",
+      "baselineNormalizedAstSha256": "4c3b8ae0567dc152cd782d4bce5941d606bc2cd994377f1dac76482750838fad"
+    },
+    {
+      "name": "getCurrentSearchKeyword",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "d8db5dfce40e2ab01cce613272a510f770be79b1892a48d1844d91027fbc0cd5",
+      "baselineNormalizedAstSha256": "2c9e8cc6c3efac47794e9a032fdff631ed3569644ae9afd1f791c861139fb1ad"
+    },
+    {
+      "name": "getStoredKeywordInsightSeedKeyword",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "c40d0458b7d103f6df88f06a5e54b20d0496103b21fdfda21a6d60555a32bef6",
+      "baselineNormalizedAstSha256": "2ab883eae8fc242663bdd8e629710d34817f1747b360cdf375257c537afddfe7"
+    },
+    {
+      "name": "getKeywordInsightSeedKeyword",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "2ed13a277c553398e2b1d9fbe88f32465eadc61edcbda3f1d45ab8248ea00ad8",
+      "baselineNormalizedAstSha256": "57cc1bf4037fa4adaa226e4a6b98699e3905cd8117f7d6393cbc3b4aab519f15"
+    },
+    {
+      "name": "clearKeywordOpportunityState",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "edb1e361f3d2b27fdf19d8a4d9f6a19386e44e66b21da81b26b63780fef1eb45",
+      "baselineNormalizedAstSha256": "c2cd18b4d07f5b45d1adb1b338edf0804a1f487b492ceb67ff93490074c673a3"
+    },
+    {
+      "name": "getKeywordOpportunityKeyword",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "4e368d341417cd400eac86ba2b0016f6f8f5036d620249e04f4ed5b7115a78cd",
+      "baselineNormalizedAstSha256": "66f7c261cc7866422bc803df9c92baff4a7b7156e8f3914a566517b6e057e7a5"
+    },
+    {
+      "name": "clearBenchmarkDiscoveryState",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "08cfac5bc92685ddb310c3e7006e05187ca0db994d58e2231a57cc2b073ec44b",
+      "baselineNormalizedAstSha256": "4537da0eb32f3bde5149a626d1bd986ea43fb4b7389d4e6a30bedc272d8d185f"
+    },
+    {
+      "name": "clearBenchmarkDiscoveryResult",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "13ec108986ebbd851b2f9503f20027a56954a62e4698e1faf54dd5703a0d1abe",
+      "baselineNormalizedAstSha256": "8d9c90e3e95559446c644717ec3d5c8d330804da3390d5ebc4d84440b6badb1e"
+    },
+    {
+      "name": "clearKeywordOpportunityResult",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "a982e0f44b9d924a529a4e78abd3e032575f8d5697282b85269544cdf2e49db9",
+      "baselineNormalizedAstSha256": "ea6c66140f7279ab078cde057eda10e1b518a03f6d3e91e73fe60870d6ebf78d"
+    },
+    {
+      "name": "maybeResetKeywordOpportunityForCurrentSearch",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "38e684a99550a92fcdf9ceb4c2fd8cb03ef2b744b15fb40b7f248a16f041c712",
+      "baselineNormalizedAstSha256": "88dc8905c9ec328ae2803d650db7543bb9371dccd6a0bdfe57eccc46467957b3"
+    },
+    {
+      "name": "syncSeedKeywordFromCurrentSearch",
+      "owner": "sidebar/task-controller/keyword-drafts.js",
+      "baselineSha256": "5fe605e29caecbc007211fd4f7f272ace2dd3bfe580eb6cfe5da6cb7f7bc0ad1",
+      "baselineNormalizedAstSha256": "a6c1b054086c9735d92f6fcda66e5cb50a167f7ac4203b240b774a59d586afd3"
+    },
+    {
+      "name": "getBatchKeywordsFromTextarea",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "8e5b5cd24451d4671ba056f5248d3237c7ad29f5f0d999e411de9013e1a6cb51",
+      "baselineNormalizedAstSha256": "6f95cffcd8c03eaab31cb6afa763c1f527eb05a5ce752a5cc53c2ef594b0983c"
+    },
+    {
+      "name": "normalizeKeywordPlanMode",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "9a2779e172bebeb3c22f85a35055d70b01cfa5b6f2f354d3eae9728195274be0",
+      "baselineNormalizedAstSha256": "de3ea91b42b153723da1cca4011803dee2f315da4c557266fd5426b57cb7f434"
+    },
+    {
+      "name": "normalizeKeywordPlanScope",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "a137b984e33b5af9d59431efcd03e99f8c2df552248b3e0355bf8e72d2b8cf3a",
+      "baselineNormalizedAstSha256": "07e3bddfbb62b59e4809e050400e0abf2c89e4a0d549a8294e30dd6593b9d50f"
+    },
+    {
+      "name": "getKeywordPlanControl",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "6dab21cde87ed2f1e11305c3ed3bd2aca451752bfdca4f26ecdba9e9a5f470dc",
+      "baselineNormalizedAstSha256": "de1244aff3fc89a7493f946a12fc201a80f7afd46ef345ac67cc6b40f81bb562"
+    },
+    {
+      "name": "normalizeSearchFilterPlatform",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "b45fbe266ba1493406d91fc1e5f53acb0a7556b9dbaec785ac9e94398d394e48",
+      "baselineNormalizedAstSha256": "a0d5eec23719ce1997fc6a57ed0c0893aa28f2ffea3699c9975ee450901067b7"
+    },
+    {
+      "name": "getSearchFilterConfig",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "1b9d3b2e093d108d47f4e7b927679350ba08db065040e02dad213525242a6b8e",
+      "baselineNormalizedAstSha256": "5bb57dab4f713b507ae93217c95eb0d1d39ae3d57649aa5231c8a92056456b00"
+    },
+    {
+      "name": "isDefaultSearchFilterValue",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "d4b558e43f417acfd2f9c659f36c9016f2cb930ca50827ea9e8969faa18c15cd",
+      "baselineNormalizedAstSha256": "2f39b86484f15ac11ac97bfcac5735add85e8649f132cd330fe6352f67ade431"
+    },
+    {
+      "name": "normalizeSearchFilterValueForStorage",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "231c163b892d1c7a606438cef331d03a53800c251a45306efaa5afe962a31096",
+      "baselineNormalizedAstSha256": "c13909d9eaf5ceb9488b5938ba40e5c0f432b6813bf957384a1ff5799d79420f"
+    },
+    {
+      "name": "renderSearchFilterSelectOptions",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "4dae1c3cd43d3be835fb85e1fd70f9b3f2545670422d30b760c36cd625520468",
+      "baselineNormalizedAstSha256": "83ad8442edcc031c569bc8fce14b85be9181e58338f7a6b39606a9fe0a0fea45"
+    },
+    {
+      "name": "getSearchFilterSelectValue",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "3b1fb43ea84d0e933b24ad365a05cb4dc560e96718fdd25f31442459e6fe291d",
+      "baselineNormalizedAstSha256": "9f1ddf49660480b2dbeee57278a2016d626c7fddb3d7d527e76b860596c6485b"
+    },
+    {
+      "name": "collectSearchFiltersFromControls",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "fe0ca2f4e5e8331b959892eb15f44135702e56f92d4cf05bab6491ca4b7e2b33",
+      "baselineNormalizedAstSha256": "45bb8ee0013ff0c8bea84e1199125621690e97d3cf0d98eee886d6de71f3bc4d"
+    },
+    {
+      "name": "populateSearchFilterControlsFromFilters",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "de4383ad4d29cea4842ecd4c943b4efdff45e33d8f241316b7d7743db96f01ca",
+      "baselineNormalizedAstSha256": "f00a6a0cbf3aef74b6709a1b3d12058cbde8684baa9c16231f4c8ed5e98a330d"
+    },
+    {
+      "name": "syncSearchFilterControlsForPlatform",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "9967026caae2a7c7328fdf41fcaeb83b8f69092fdda3ee9b9f30d331b50a65ab",
+      "baselineNormalizedAstSha256": "9f81e60a3e913bc0952b9258e501e25100ca626274089dca4844b165811c448b"
+    },
+    {
+      "name": "forEachKeywordPlanScope",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "ca52c3bbeb22b903eb514cd7e69b92a5b25d6688ef4a7b124eca63972e12b0be",
+      "baselineNormalizedAstSha256": "7e3eaf92d7fa78efdb2d8857071ecd5dc8c4c7a02b897a6ff158afa2168b384f"
+    },
+    {
+      "name": "normalizeCalendarDate",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "084e3b288a7d80bc7da2a7cfbd1655dcf154f1d8576d4dec464a6230a99212f8",
+      "baselineNormalizedAstSha256": "d3457f533b2f2ef3d5d24a15943e7f59e8ee595fe58407fa36c2cb7e93d64e50"
+    },
+    {
+      "name": "normalizeDateListText",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "27e1a8d189c8b27c6521a31143988f580fc350d90ff8892cbda92dd64da1577a",
+      "baselineNormalizedAstSha256": "402e16f0ba532d0e6a7c3e120448adadaaf75e5a2a3318ddbffba0dbbb0ef241"
+    },
+    {
+      "name": "getDateListFromText",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "f3798101eef63f6e053e74b0570ac5cb5fcb47c32fec5a47543474bfe1e80ffa",
+      "baselineNormalizedAstSha256": "9ce404c1f292416b14c2e0fc89a855b52e5dae1c655bcddb51508eda8d21c284"
+    },
+    {
+      "name": "renderSearchKeywordPlanDateChips",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "5c4f08226c9879130275bb83642c6aa3171931e016a2c2ea8934fe731df17d3b",
+      "baselineNormalizedAstSha256": "71de737144d13952bf77eee67006b327835bc8c8d15b5435bea84f5e6ce056c4"
+    },
+    {
+      "name": "setSearchKeywordPlanDateList",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "833d53f7677148f2cd241b18eed0c3d23e7929d3ed94fb6c419443afa9135bb2",
+      "baselineNormalizedAstSha256": "8a9a6d38d3d896a293d128dc6fa42e47efd0ed47bd4b9b8c558a4beed25678cc"
+    },
+    {
+      "name": "addSearchKeywordPlanDateFromPicker",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "f15a823f71d14cb8120207a06cef4e60e6b36fb83ce640c34050cfcc48063328",
+      "baselineNormalizedAstSha256": "de7428406c6892fe6fffa9b6652422d8f1bd5169751f07038458e857b6d0d4e2"
+    },
+    {
+      "name": "handleSearchKeywordPlanDateChipClick",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "b487b8376126be78ad59eb5a40fa1998a0127d2d6ff51339e910246408f7a91a",
+      "baselineNormalizedAstSha256": "5ec779c52b3cf1d6d8be7e1b4878401b4fe7a131de2be2754b29ac7bbb0d4169"
+    },
+    {
+      "name": "parseSearchManualScheduledStart",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "7e86b3ef38c30787c590ba2ca6608c320ab6c3b379cd9741f27f46ffe0258b58",
+      "baselineNormalizedAstSha256": "167dfe74e2a98b4e8f822e75c4b25bdf4d0170ff4b5805a8264a0dddaaeb982c"
+    },
+    {
+      "name": "setSearchExecutionMode",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "4bfe67996baafb87741445131cc3a53fb221bd17b57f5e12d273ea63e5dfc184",
+      "baselineNormalizedAstSha256": "39e5a11a4be00f062fe3d31681c8520c18c53792acf4cd11543a30cd47015a15"
+    },
+    {
+      "name": "readNonNegativeNumberInput",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "18ec8cab69092532739d5e03fefcba9414699d87e72f75edf39c2cd67d9c832a",
+      "baselineNormalizedAstSha256": "b9533441fa96f53bb1cdb96f8d54f61c1e8f176fdfa4f8ac0d8d1a90d89a9cee"
+    },
+    {
+      "name": "readPositiveNumberInput",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "860419a65304cbd7d8c2b34a90d19db8056404f272b1f4faa98251f01f8f8c11",
+      "baselineNormalizedAstSha256": "916308a9c469a30944e2dba8910cd852aaf9555704daef4bcb0d10c81e52c043"
+    },
+    {
+      "name": "collectKeywordPlanFromInputs",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "feb9e04e5be54cc916d0c0adb2411a27e03ab5d3fcf21106b65fc21a45b49ed1",
+      "baselineNormalizedAstSha256": "90175d27a6003c4611d2f3c2f5a1d5fecfe1f826fb83292f927eaf2d3de0bdae"
+    },
+    {
+      "name": "syncKeywordPlanDateFields",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "2870f3f74dd94e6028cce5449e56ec31a940abfc1e97b06adce54a23a8995f5f",
+      "baselineNormalizedAstSha256": "c000d161c2d9d55b282ffa3944e3f7d262ce841e8e6e9c0aea62926f3dfa5c6b"
+    },
+    {
+      "name": "formatKeywordPlanRunTime",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "fc19ef407e68749f10a9a5861344f6fc79723182b0200d2d33e1021cac327e05",
+      "baselineNormalizedAstSha256": "6bfdd4268692d3140172dc39359b6f14041d445aa5c6358ae22239ae83dfc2a6"
+    },
+    {
+      "name": "isExplicitUserUnattendedCancellationMessage",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "767a82c047ca748c5f8a288b3a60ec3c50afed0e0d6c9a264025e2115b25809a",
+      "baselineNormalizedAstSha256": "4e4cd67c04e27f8414a30dfdec770f5173b9122490887f4a35e92f8335dcdf72"
+    },
+    {
+      "name": "renderKeywordPlanStatus",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "83018893c7b8d11019d6343b89ef983771a7c6738d5d8ac29d03d9a7437015c4",
+      "baselineNormalizedAstSha256": "36558261c670ce7d2a05c9946dd9ddd2a043da9f324097759166a7a1b41000f2"
+    },
+    {
+      "name": "isKeywordPlanRunning",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "98e2be9fd9e13caea608f8c8ce630072cca21fbc1d8ef6c1d70fe72e3293fb00",
+      "baselineNormalizedAstSha256": "8d642c511bfd25f505e855d58f6b65f2167605f7f92297f9d4f6f88bf9e63268"
+    },
+    {
+      "name": "getKeywordExecutionCopy",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "cd10cc46bd9add36b8884ca5269c7433f2b5c7800572a6e7121f187cfc67eb58",
+      "baselineNormalizedAstSha256": "765b6195a0c6d03299c3bfc6e359b47d90341ae5995dc9fd3e3b18abc2372ebe"
+    },
+    {
+      "name": "normalizeUnattendedSearchPasses",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "f776dddd3de26e18ec3a1f5ae2e6a0ac1f6ed55c6c557232cfb936a30eef0f95",
+      "baselineNormalizedAstSha256": "7bca435ff1f8767962e1dda764f7dbd9b1cd145fa7fc5457fc5d4e056cbb9ff8"
+    },
+    {
+      "name": "unattendedSearchPassLabel",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "4fadd97fcfa8fac56b8480821c55d4f6295b938fc5d87c68b13536c1142207cc",
+      "baselineNormalizedAstSha256": "276d6ce8115b3dac7156d4d217e3c5ed399e0ee05f70b1808980db463ccd1c98"
+    },
+    {
+      "name": "buildKeywordRunDisplayPlan",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "cedc1c5190c72ab5745d51551f17faba27766bcf5aabaf95f74382e9d07d1958",
+      "baselineNormalizedAstSha256": "8f3c066d15dc7c29c0cae46d4f6c278b3bbff942acbc5279e769b5edbc17032f"
+    },
+    {
+      "name": "clearKeywordPlanProgressCountdown",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "d83f726132c8670aa099b907423a9231d3241bffdd4371a4c14a1b5681ddecc9",
+      "baselineNormalizedAstSha256": "a1e3426bb9afafbcb1fa5e31c004dadb6f001fba82d882decf42e8b1e8c081a7"
+    },
+    {
+      "name": "buildKeywordPlanProgressText",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "5288006e0e034d614e4990e80971305034df21c411e57477a8fc4bcadc962823",
+      "baselineNormalizedAstSha256": "9826b14ac67c440b491f3c4c469523b61d40da06b7a8ba38eb877cab88dd7f37"
+    },
+    {
+      "name": "renderKeywordPlanProgressText",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "1667bcd336c52767edb2879b332f55f68aee073b12122d34eeaf5234694d8590",
+      "baselineNormalizedAstSha256": "f41056e10a4b99f756dfe2f01413a24abcd096004d64ad2dd8b752ed5f0e30be"
+    },
+    {
+      "name": "hasVisibleLocalCaptureProgress",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "87db823e5ffc5613cd33a8cd80fa3110d7c2ac39bd7434c68107111a145abd91",
+      "baselineNormalizedAstSha256": "6a17e9f8649ee1aa7b2dcf063d55e9041736cab07359c04bdc7106621ec44c04"
+    },
+    {
+      "name": "hideKeywordPlanProgressPanelIfOwned",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "9127af3b7c5cb0bae982c066c02f779f81b853d7a8757a2ef0845e1e80a460e2",
+      "baselineNormalizedAstSha256": "df2d6676abc1d5d1a1cb1f79975507823834c39dee6aa8e0697477e454b4dda1"
+    },
+    {
+      "name": "syncKeywordPlanProgressPanel",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "d273dcc426aeaee53e254263fd723d4a307ad9efe3a3832b5fd3857db64eeac7",
+      "baselineNormalizedAstSha256": "f6f172a313abf1ae8c4814619582c729c688ca037684f5b47f4d06f9f56bc514"
+    },
+    {
+      "name": "populateKeywordPlanUI",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "c04e663fb2d2d2a49adeb3f56cdf34d1778705a99758d98da8469fbc2f538457",
+      "baselineNormalizedAstSha256": "34f72c6d73a2e9cc38bac3061d0a84ebfd9ca6a6eaaf5d4b4a27ee4c49c4622c"
+    },
+    {
+      "name": "loadKeywordPlanUI",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "1a6cbb317985a551271317659ee4a908cf55a62bba618bf9e41a56e2873348a0",
+      "baselineNormalizedAstSha256": "35fb3e50ea76fa2e71425b5106e1de344d2bb99134b5cda7fac531b261eaf2e0"
+    },
+    {
+      "name": "renderActiveKeywordRunState",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "095f2914495b50c4a0976402016292af57073a4c889941a63a256d3744cbc578",
+      "baselineNormalizedAstSha256": "99ff15da7a12a79b253ba32a4c12cf18589ca283b967a0f5a0c43b1fadf5f657"
+    },
+    {
+      "name": "loadActiveKeywordRunState",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "b90a0d4637692226b3aa4c16f88833bf3ab4f6c36115692148ec22c68ea48686",
+      "baselineNormalizedAstSha256": "3f4eb18a1f80a299b68227d9a6f8624974327fc17d1c0d6b77236c6f61bb87e1"
+    },
+    {
+      "name": "shouldRefreshDataPoolForKeywordPlan",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "24e5e0ba067f68421de312c97aa0be91632f2347856773e98c5b664eed12981b",
+      "baselineNormalizedAstSha256": "7fb303b8441f6a5290092565d571e66d34f01e6002810c8a3982b0c7a3a5b68a"
+    },
+    {
+      "name": "reconcileKeywordPlanFromSidebar",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "e370d8c25269f187242491467910f509bd22b67fe6c3ac663bcd987705c2c8fd",
+      "baselineNormalizedAstSha256": "fa64902c61a28164bc21e7e615af75ff5c7c7b9c483e629d7d5e201ad902988b"
+    },
+    {
+      "name": "startKeywordPlanReconcileTimer",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "970f431cfa0741dad7a5285cd239b0e17ea3b603b08d3e5ec6d9ab7a89b6968a",
+      "baselineNormalizedAstSha256": "60d16000f113661079fe1e8c7a50b2e00212ccdfabddf9cfa4d623bc00e9b67d"
+    },
+    {
+      "name": "stopKeywordPlanReconcileTimer",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "c6a5504d39be5648ebb8d5c83f9099fa617c47ecb553f86f5269bc2bd639c1cc",
+      "baselineNormalizedAstSha256": "e0b6f09d612cc14b457ab5e8f7e7e7934c599acac5560d21be96b84c5ee45b71"
+    },
+    {
+      "name": "setupKeywordPlanStorageListener",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "97ae149f3f4940e5cc4b308dee34b5155f742bbcd18cea85915c404eaa24d899",
+      "baselineNormalizedAstSha256": "d2ae12c5300138fbb7827637b60bb4f439a52b4b975e848d720659261551d195"
+    },
+    {
+      "name": "handleSaveKeywordPlan",
+      "owner": "sidebar/task-controller/keyword-plan.js",
+      "baselineSha256": "8daecb9ca9c08217044aa5efe2f06d601a57587f6b6c09bb84d30c9ea9471f0c",
+      "baselineNormalizedAstSha256": "84f8563cb1fd9986f2b2f02938121daeaf21c05ad9223b4d3d5ba1e7af638a5d"
+    },
+    {
+      "name": "setKeywordStrategyTab",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "9bad03e5324efe377f10cd6e996eafd5fcde3bed797a90f76af6be8a7760cf76",
+      "baselineNormalizedAstSha256": "0509ceb3d8d76a617bfb81c59f1ce421be9b02f5836ec9c84a104185ad6a8a40"
+    },
+    {
+      "name": "toggleKeywordStrategyPanel",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "e385918c7d48bbcaf4750e7f3e3071a9641c2c7babe258b1711f3c58699167dd",
+      "baselineNormalizedAstSha256": "951f72be22af406f1535b3d0dbbad40ea545003fae0590b009f3896675a7d8e7"
+    },
+    {
+      "name": "formatOpportunityMetric",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "ae6bbd1deb7346031727dcf4c6743697fadcc1e63f9abea6cdb0550c328b7683",
+      "baselineNormalizedAstSha256": "43082c7081ae47050ece58a652214b1210a99967478e4f35f93f6d64d4871dc2"
+    },
+    {
+      "name": "normalizeKeywordOpportunityTitleForMatch",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "4998d1194863ff05b07c320e050ddaa6ad17ef29a78eeb163895f701235b1c28",
+      "baselineNormalizedAstSha256": "8dd865cbe645e6e07d6e7cfcd785effd1df3a39eec2a33cf2dc97126d8cd1272"
+    },
+    {
+      "name": "buildKeywordOpportunityTitleCandidates",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "632afc6dda0d3e3c16a35fa1942cf144243ee6a4fa9e0e76b5cef89c93acfc43",
+      "baselineNormalizedAstSha256": "bc98f3fba685caef17a42a3d6b688889a73c6b2b088389a8caf417d179aeb918"
+    },
+    {
+      "name": "resolveKeywordOpportunityTitleUrl",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "1421ec275716877929bd1228a0a29bef24c4e1d27835ebf5afae40236dbda1d8",
+      "baselineNormalizedAstSha256": "40a786ac9f4f3aa63485ab495553b5008a60cebe615dda422d7d922cf5239a84"
+    },
+    {
+      "name": "normalizeBenchmarkDiscoveryItems",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "37cd8aba64b2cd8d3524691ed01f1b2b0043375f473e3b95f8bf170ea21f50ad",
+      "baselineNormalizedAstSha256": "5d4185a988e5ea6998eac69e58a17a2aa27c1297c8e4210c19537090f6731dcc"
+    },
+    {
+      "name": "calculateBenchmarkEngagement",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "7ceb7c340ac3abae7a8512aa970355e6888e8765ba740e36039f62c89ce7abf4",
+      "baselineNormalizedAstSha256": "8a50b22e4740b5a78563636b59e0ede6ffc01bf4b62918807b548cc4ec55c6da"
+    },
+    {
+      "name": "averageBenchmarkValues",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "f9457df01a4ea2d7707ed399576d0579cbbcd8cbb7ac6f19ad01feb10afa66b4",
+      "baselineNormalizedAstSha256": "1519b08f2a2aa44c030f98d301d06bfeeeb1d45642180ca98f5f870a7681209d"
+    },
+    {
+      "name": "normalizeBenchmarkProfilePayload",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "3782fbcaaacf1d0360a6dff3b6073d29ab008a7f9c5a1a4411a72ff6f39db99f",
+      "baselineNormalizedAstSha256": "41291093c5b70d9af41d6c72538f0f74bd2060890156e9d2b9a6d9f2ce5389ac"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryRuleReason",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "55e43dd761c8d89c2287ab4f8fc364015bacf04fe5f45268823931583d8fe88b",
+      "baselineNormalizedAstSha256": "aef5362592b09a51afd58d1b97b961c8a32863f54bdcfe12e668346b3f586a81"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryFocusAssessment",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "f942bb189f180189b149d81459f7d1b40536c9125e245bcfaceebe3fb8cc96f6",
+      "baselineNormalizedAstSha256": "e7372e43b928d9d63d896d9ef6447f4f2510640d3cff4856677714d00b7ca3c6"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryDecisionAngle",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "8a7d20ad6f09ec4e62b113504d92599eb7ee98acd118d216da38577fa3003edf",
+      "baselineNormalizedAstSha256": "8c753832218cda75073925b0250c96bc108fba1c5b69acf12a2785fe299134a3"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryFallbackAnalysis",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "432f537ae42e3e2ff37eb7585be83bd73960745e30d05d1a3c97a44d9882ecec",
+      "baselineNormalizedAstSha256": "9b00cf228f57f3c1779790d5e9a85ba3212538e48e3e842cfdbdf6b30400c9f1"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryCandidates",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "89c5c8744b77be9e3e88cff51c27028b668b928808d453cce01c2fed00697964",
+      "baselineNormalizedAstSha256": "5687066055ab85c1e3af8022739f88a8311b911a12b9025b452e6dc3a27be442"
+    },
+    {
+      "name": "mergeBenchmarkProfilesIntoResult",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "53ad4580a1e6a2faef304f926303dc348b864f7977244ce810e122a58395f8c8",
+      "baselineNormalizedAstSha256": "a11ffc76d236fa43cb45fa482cb6db2b76ab31bf45e97dd786a56fef67045fc1"
+    },
+    {
+      "name": "mergeBenchmarkAiAnalysisIntoResult",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "505a446d5be7174bdce8ffaaa2d9a1f3f64ef447d1205fbe015cb4aa03be4ea9",
+      "baselineNormalizedAstSha256": "759f85574cc4fac02542f48de822e08c58933aabbaa301cce0e3460c0d5e5ec2"
+    },
+    {
+      "name": "renderKeywordStrategyLoadingState",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "4afe55737c1db8c6ebd24f97aa2aa3b89ee5c4fe05964f3957ac98b1f3a24d11",
+      "baselineNormalizedAstSha256": "5af7f00a2af84aab3dadabf72d996f0c1e412b240c00fdfa236f5e44b0cedcc4"
+    },
+    {
+      "name": "setKeywordBenchmarkLoading",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "0f1430d6e0c51395a8e8a162b63159602d878835b82361d1c1339faef9d0d8d7",
+      "baselineNormalizedAstSha256": "61f4d32c73e11546014f2d094d0f21c5b54bbd23eaac958a8c7176b164516a0f"
+    },
+    {
+      "name": "renderBenchmarkDiscoveryResult",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "472cf7cbf7de692989de2dbadb4099607986d2ef66cb31e657897b2697001a8c",
+      "baselineNormalizedAstSha256": "f369856a8ef08ac965ca76d75613d78cbacee05aa13cdf834f72b835de110c21"
+    },
+    {
+      "name": "renderKeywordOpportunityResult",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "29578031b0749979fbf6dfe734a7e2860e7c561198993a4c9d2385c8a27de401",
+      "baselineNormalizedAstSha256": "6c5aec1e7d26deabe18b878033f76dc98f5ee388b6b0d1cd17586ad9e094479e"
+    },
+    {
+      "name": "renderKeywordStrategyPanel",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "413179bffaeb10cea62736a3f4c252d052c0b6772c17130ef4bbd5f8f5ca0770",
+      "baselineNormalizedAstSha256": "5a993abb556e312487183e902c44e1228f709bf3f5306b2a49d509e1e6cdf939"
+    },
+    {
+      "name": "buildKeywordOpportunityInputItems",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "115afd66c7afe1f67b29f44b78fe8f39ac217cf83659ce0a668d2f56b008f239",
+      "baselineNormalizedAstSha256": "156928677ca6c0e708a6ed219da0f202c08ebf92fc8399bcd6fe81b047ab8a61"
+    },
+    {
+      "name": "analyzeKeywordOpportunityRules",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "00265cd494b71b72696ad90a98ad251a59255d43af0cc86e49178757d43c11f3",
+      "baselineNormalizedAstSha256": "6e42193f1c8e99f5e64193ca0f4edd2ecf586ba7e7872d78b7fcf4d467b7150c"
+    },
+    {
+      "name": "selectKeywordOpportunitySamples",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "fc96e0283198afb19517efcb9570ca8cf820f7fa6a66c885ef68dff016df3e0a",
+      "baselineNormalizedAstSha256": "66ab369ca21cf01512704952e8bc85909051a94a0ad78efe83cb0570879f0e97"
+    },
+    {
+      "name": "waitForTabComplete",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "e7ae35b2aae49c7ee35b72323f2d363d9236b92387e774f6482e89029410df6b",
+      "baselineNormalizedAstSha256": "09c33ab6bf50bd04d59c19a1782b0dbe3c8b717f8b4de9193379980a0da79063"
+    },
+    {
+      "name": "prepareKeywordStrategyCapture",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "1b3f4eb4b8f025384a08654ea3b32f2a2e2277f5dae942d8bf8b17d89eb05eaf",
+      "baselineNormalizedAstSha256": "6c32c0ca233123e0cc0347032de38f6028994c5ac86e6205e8670252944290fd"
+    },
+    {
+      "name": "captureKeywordOpportunitySamples",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "2e62aa4cc5559f0616509c9acea1cf010964b241f6b049d247e32057b66f3f0b",
+      "baselineNormalizedAstSha256": "64359709fbf38b8e535c51da3731ebb8c4b6975365d65c86c5e32fb6d8e150ae"
+    },
+    {
+      "name": "handleCancelKeywordOpportunity",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "bd9316d4e052403e674e3f9436de86670cad968ce11ec8b049ad09b18c55c45b",
+      "baselineNormalizedAstSha256": "efa96bb4e958e0b61f3318a6bf548c0f3f3daafe621888ef6a505850f4b63524"
+    },
+    {
+      "name": "handleCancelBenchmarkDiscovery",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "99a8a0e66a0d075f433251d476b69a899971e63bdfdff01545c7dadbe59b77a4",
+      "baselineNormalizedAstSha256": "6977ce60a156109786a5769d0bd7cb84995e2342ef04c806f263e9c4d135c0ca"
+    },
+    {
+      "name": "captureBenchmarkCandidateProfiles",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "3cd31633844da4aaba54ed48f2269fb3c748d34e3882973a25a952e8436bdabb",
+      "baselineNormalizedAstSha256": "d55af005cdb6bd88f3c06d1c239fbfe1eb9d16b0fe8398a6c876cbb7ca858404"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryAiCandidates",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "2ae05f23b47ef19d51b40e295d0c35b054eeb7ac7a2c104c3375be877049f6e8",
+      "baselineNormalizedAstSha256": "4754e47d8d467d755d7b10a912be0b9e04600e0887d69c29f56288d925273cad"
+    },
+    {
+      "name": "enrichBenchmarkDiscoveryWithAi",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "9c36702995c9b0837ecec89c757e255c55075799bdb5c9b0228b243ac1d1f4a3",
+      "baselineNormalizedAstSha256": "cfd8b23716f8c5a462ffda2572f8b258b120b1c447906b7b42f52a5d1587a89d"
+    },
+    {
+      "name": "handleRunBenchmarkDiscovery",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "351a64f63637788f3012f2a61a63186c8a839030ad0d42d2961c5fa7a16ffbbc",
+      "baselineNormalizedAstSha256": "f68a794c54fefe3333741e4f336db14e1f6655b7cd1236bccbcc47de6c18660f"
+    },
+    {
+      "name": "handleRunKeywordOpportunity",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "baselineSha256": "282fc0cf3be87916f6dd8d63479e7a9ace775dd3cd7cb5bcee6871b896189a82",
+      "baselineNormalizedAstSha256": "7173f4904d820a5d41d27f4e9b4bc69c8bd96b6b7e1a56456917e12d148fcdcc"
+    },
+    {
+      "name": "handleOpenKeywordLongtail",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "9a2b7fd821f22f68c96aba1c394cb30d4bb6ae1d0034e46b1ae7a05ab6650454",
+      "baselineNormalizedAstSha256": "ee13c383ffe783998782728263a7f56d77a2af823567f136e0f810f75f46a809"
+    },
+    {
+      "name": "handleBenchmarkDiscoveryResultActions",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "c02b28653dc91e3484ed7839f34ba7c9286b5e2f0788ff95e0bc56b14adc6aad",
+      "baselineNormalizedAstSha256": "b7101e3e23fa5dad7673e9c620033bd0162b744df24d696034d8382a095d0647"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryCandidateEvidence",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "343fd0b6b7c3b3d2f6d50f12ae9f99a52a81a6487a1d2fc1b799940d3aa7e644",
+      "baselineNormalizedAstSha256": "ab20dbf98bb7c52c06fccce3e29c0f69260d2e7b464c738eaa74463aed5bb5b2"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryRepresentativeWorks",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "c4f55c185f728504d976c8e10d957ba681770723d6335a7795df2c06a5b802e0",
+      "baselineNormalizedAstSha256": "6ae31bf12c066ca2d86c6a1a0339dddbe7f667580b2a22f4f5109c6c450fe6ef"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryShareText",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "5d14e777334bf05577b4cc783d598a3f48f74adf46a41e06cbfb58a48b26282c",
+      "baselineNormalizedAstSha256": "0e5566c891857a53caf11c74a251ceadb372a3d478b0ae47cbdcdcd6f817e789"
+    },
+    {
+      "name": "handleCopyBenchmarkDiscovery",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "35b625cf04396a4541d25d10182c32ff75a9853f333d930182811cd41d776ea3",
+      "baselineNormalizedAstSha256": "5e8088f6b0210274ef95d922def11b8b15b29ff446c44868b8d1d98a59c7de9c"
+    },
+    {
+      "name": "buildBenchmarkDiscoveryShareData",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "864ca001caa13c07d1c6d11fc1c6418e477ec62fda83ba765eab2df7de9de219",
+      "baselineNormalizedAstSha256": "a80936712c08409f1bcd0fa9cf7a3807b6ffda95670326b2c561af85daa0f283"
+    },
+    {
+      "name": "handleShareBenchmarkDiscoveryAsImage",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "311880be552510c6b51f4f49150a0f7110dd84db8001d18e237309fad6e4f679",
+      "baselineNormalizedAstSha256": "b06e4d48f5e10be02cf8984948a77ba102e0fa7057b6af9c945a55138a91e7ab"
+    },
+    {
+      "name": "handleKeywordOpportunityResultActions",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "025b3e9c1c1149c0a27d556e8c8ab838c9783b41f3a7d9b784fbad30575cede9",
+      "baselineNormalizedAstSha256": "3aa963ab083c050a4af90020b6c44aa42f8e856bb7db0da0251d1caa76de64eb"
+    },
+    {
+      "name": "handleCopyKeywordOpportunity",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "8e8d49e7fb48b06cfabba1f5338f38c7636a94d67f08d67b119ce85f77d939ea",
+      "baselineNormalizedAstSha256": "128197742638f64913dea976dcbba66d2059e47e4589ad97150c966103127d2b"
+    },
+    {
+      "name": "buildKeywordOpportunityShareText",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "6fba78afe697b597510ed3df5ef463ecd6c779c96fda3250e57c0238c687d9d7",
+      "baselineNormalizedAstSha256": "5a17b23d5be6a7ab9c6203796a87f3474a41c4ea90853204278f058b21f0500f"
+    },
+    {
+      "name": "buildKeywordOpportunityShareData",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "7f15a3df8692f6cd0396a9ad325d10a39c853ff1c0bf0c203d02df92015eae1f",
+      "baselineNormalizedAstSha256": "fff0867f5eaca2d6515070989156d9946be778ea5edf021a900d0e1fceeb53d3"
+    },
+    {
+      "name": "handleShareKeywordOpportunityAsImage",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "a95ed4ba7d8cdecf85b2b3923d6b7b7cc1e9b34906e3541b52acc6a30197d8e9",
+      "baselineNormalizedAstSha256": "f8d01a9673bae33cfefffcf47aaf5eb53473a752d094b52ee412d63a92bdbb03"
+    },
+    {
+      "name": "getSelectedRecommendedKeywords",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "847d8ffaba5880f251cb74f001454aa7176a0ff72dc633a566697f375f63ce18",
+      "baselineNormalizedAstSha256": "d682c50cc1c60874958b1cf745cb1589482496eb5c69df07c00138d9e4ced080"
+    },
+    {
+      "name": "invalidateKeywordInsightDraft",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "3f448d672b9631ecd24349e68fdb2403efce7412a9a16e1dc409ea5b45555e81",
+      "baselineNormalizedAstSha256": "c19d589d16379f4bb1ea422a107f677c0ccfbe31aec37b991b024c827fd06295"
+    },
+    {
+      "name": "toggleExpandedKeywordsVisibility",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "79cde9f6eac81cdcb6be5696ec9139ed2208d6dea1c2fc272105ccea43cd6e41",
+      "baselineNormalizedAstSha256": "84232caf1959596fa59e4144cbddb3684e82fe7f7f680fa4f934e7449f1e3dee"
+    },
+    {
+      "name": "renderExpandedKeywords",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "04e6aac323f00f17015175da63d2b64dce87be7f7212fc72a54f64de7a42d9c7",
+      "baselineNormalizedAstSha256": "985264830a00079570fd50c8d23e16317213143d95de0d73f1f77e139672664a"
+    },
+    {
+      "name": "updateExpandedKeywordsSummary",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "022a0176040fea93a7443fca0cbe8434586598cee26a7035028396bf231b3eca",
+      "baselineNormalizedAstSha256": "5d1a4786239fac5ccf732abd63ea036d2260f59421d7f60981931ae3abaf5899"
+    },
+    {
+      "name": "clearKeywordInsightResult",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "431c24eb08cf6a6834ad50bc9b488e965ebd3a49d51ab2a20f48c42a5aa56294",
+      "baselineNormalizedAstSha256": "e7291ef34c7135311f9ab23690d9180e5448724f510a1a0da6dcdb41a157df2e"
+    },
+    {
+      "name": "renderInsightLoadingState",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "153b01b2bc905d901fc81b8f727e8e61d42af4c4e28fbdd113eea4eeb3a6286d",
+      "baselineNormalizedAstSha256": "0967d789abe6ced5883346300dd6d9424a8ad0708fa5a946e7fa96782b143d8a"
+    },
+    {
+      "name": "renderInsightSummaryCard",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "e7f3ab140dd331dc624e6d693d7c476734cd0853b88d173df2de1bb55e58211b",
+      "baselineNormalizedAstSha256": "0614a4fb86ba76887dbe8aacdd9dbcf8c775754ab40ea378b3ecc63e701d5a19"
+    },
+    {
+      "name": "renderInsightSampleBlock",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "7e1ccd21464c93edd39e9b3accc9fd55af84ad341ec658b02e73034d58af5736",
+      "baselineNormalizedAstSha256": "bb097c0b9d360e51e9a21aeac935347d8286254aaeabc0bd9cf1c4828ac43c7c"
+    },
+    {
+      "name": "renderInsightCategories",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "0745536c7602f763517b4821fefde3e6a0411d53531dae6da031e2a41eb2d001",
+      "baselineNormalizedAstSha256": "1f0062d1e1a0174f086eb5ebf9af28aa48cd095288afe7098cd28fcca8a6171e"
+    },
+    {
+      "name": "renderKeywordInsightState",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "b890ea0c2a03ef860e99fe2e922eaa233181a6d22573d2796e4eb768d20aabb7",
+      "baselineNormalizedAstSha256": "28429ebe101b42fe914f720f6de79471aba5e08d042e04b228205e2916169fca"
+    },
+    {
+      "name": "isKeywordAnalysisLockStale",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "d4a32746244b70a220dfc15c0181c8a15e3d275e5095998e9c7a93c594c9fee3",
+      "baselineNormalizedAstSha256": "53b869d1ab4d4edb74597a79aa3d5e4c4758407863dd56310947b3564023f873"
+    },
+    {
+      "name": "releaseKeywordAnalysisLock",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "729a55baeff80515311a540f602074b0af7cee9b0d2ef2755ed7d8b0d2a5287b",
+      "baselineNormalizedAstSha256": "f4fee88c85a97a3f89d08a94277f876a202b62de2671a8eeb1627a74a674b3e5"
+    },
+    {
+      "name": "updateCategorySampleResult",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "0761605810bb8b585b8a3239a032952adff77584ff08e169053c5e0ec6ddc148",
+      "baselineNormalizedAstSha256": "83b9ba658483156e799a2daeb43e345914739b3ffeb35a74b722c05470f7d729"
+    },
+    {
+      "name": "runKeywordInsightSampling",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "a9329d7561aa1bd8c70c3edb3950a6de876a8c2d8846ef8a8a70f85460bb0386",
+      "baselineNormalizedAstSha256": "d4131d47d276df342ddb0af9d510443dd97a85b1bfc54e6e9115b2d66c8eacd1"
+    },
+    {
+      "name": "startKeywordAnalysis",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "dc47dba036125ef25de9e85ad14804252fdd65afe0a64809524dc72e2be51524",
+      "baselineNormalizedAstSha256": "d120acf3c9ae1ba655e19f4a6482061bed67e0ab06aa7f3e4ad751b3a1987231"
+    },
+    {
+      "name": "retryKeywordAnalysis",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "0e50a958fa0435073b394087fd123a7c1a665291ad5dc2534adf59ad47f20932",
+      "baselineNormalizedAstSha256": "d98201ed729f9c51cf3a5f5887f42f63831e224c32ad92e95a727cea2a93944f"
+    },
+    {
+      "name": "handleKeywordInsightSummaryActions",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "6fd37a4fbf2005501ac4f817cadff3234aee92d6d9eda8cc29d2ba59ede2b623",
+      "baselineNormalizedAstSha256": "4acae9354506aaf96db38928638abf614b69c30cf328db096bc2110a5efdb961"
+    },
+    {
+      "name": "handleCopyInsight",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "6f99ea30435cfdd3ea31502d87ef1142044b4034003864ed3ef1183ce3d3ea3b",
+      "baselineNormalizedAstSha256": "302a4ba7ab70d1efb029a139ee0c81662fd1635ad2b8ae2175c92992d5021260"
+    },
+    {
+      "name": "buildInsightShareData",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "587394c491cffdf0a5e66f9e625d2bbbaaa43f019a31c02542ba113c7a6ece72",
+      "baselineNormalizedAstSha256": "50ef4ea1ed8c6511889eb7eeb83d9db8bf094b6fb8eb4ac61be5252ec66de30b"
+    },
+    {
+      "name": "handleShareAsImage",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "2cd061fe0e7dfa32b59357e71c7a1d9dc7618d17f3df788cfbccdd3daa5395dc",
+      "baselineNormalizedAstSha256": "e9c98edc682cdd3df76c5755c910cdfd54ca3cf9e1d0f0cf9f6688afde77cee2"
+    },
+    {
+      "name": "renderInsightCardToImage",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "ae8e4c4c76fc142dfa069ed66c4eadf589e47abef93639a70dd7c1fb4a7a07c8",
+      "baselineNormalizedAstSha256": "924f8f5c71975155f7b42166e2e2c49a955682de2c5dc577db18ee3ce13c227b"
+    },
+    {
+      "name": "renderKeywordOpportunityCardToImage",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "6aaaf42fab42f52a42ff49222385612f9b9f97485f6c8c2eca024d321e35e8d0",
+      "baselineNormalizedAstSha256": "9c1306458e78fbb651f8439984b578802ccd277c177abe68dd8c46cf3424a870"
+    },
+    {
+      "name": "renderBenchmarkDiscoveryCardToImage",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "a950cb0109022fa4664543a9a33928312b1951b39560096b7b74e193de4c4a3f",
+      "baselineNormalizedAstSha256": "f29d73c2f8d58107ef1ee613cf16f439402bf12ccc12384ea5e025768c37a6b0"
+    },
+    {
+      "name": "showInsightImagePreview",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "17dd12575f7260dfef875cc7e35d801ecd6597e01bb1aaa8216e49255302a4a9",
+      "baselineNormalizedAstSha256": "770f9b5518c9c8897aabae64e89bb95c99b95af37940a1ccbbe83c6e7f741c64"
+    },
+    {
+      "name": "roundRect",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "2dd3a5e075ec662b3594f024aec22ecdca3f00a5ddc150a30724629879e7ae1d",
+      "baselineNormalizedAstSha256": "8c95d6a34479910d32fb4ed6fd463f5695addb8eeff325294e2b4f9385e66c75"
+    },
+    {
+      "name": "roundRectTop",
+      "owner": "sidebar/legacy-view/keyword-sharing.js",
+      "baselineSha256": "e93b5249bdd6ff519102ee3184c09442a30daed4454636f86b9364be1fc0acc3",
+      "baselineNormalizedAstSha256": "ed629d0109e95e0ffa313dc5ce016cea02d04019507909fef56c84d1291d41ef"
+    },
+    {
+      "name": "handleKeywordInsightCategoryActions",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "a9e8e2f70d6b36ab65bc0c6483072bc96744456bccbcbefde907ab8c07d8bc2e",
+      "baselineNormalizedAstSha256": "6d9bcc7e5ff811a582670aec7400604829575d3f9820543ddb3c8951ce32f2db"
+    },
+    {
+      "name": "handleExpandKeywords",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "d18d8381208bd61111ea5e43dcaeb9e267e901543ad2fc6f763b835ae90c17f2",
+      "baselineNormalizedAstSha256": "60be41f9dc47f97e6e5c2a5194a1d091f624a24718935e15bfaff1d8a993ba3e"
+    },
+    {
+      "name": "updateExpandKeywordsButtonState",
+      "owner": "sidebar/legacy-view/keyword-strategy.js",
+      "baselineSha256": "b0b114139b9f835fd4eca389bab16624261ea8bb042ad69faeac15ee38cf84c7",
+      "baselineNormalizedAstSha256": "6f30e70701385899808817a9f6d091416b8d519d821c76f8f8cd8785a64bcc2c"
+    },
+    {
+      "name": "requestKeywordExpandCancel",
+      "owner": "sidebar/task-controller/keyword-analysis.js",
+      "baselineSha256": "de8b03d1f82ec763cb2509b3e7606ae4cc3a8eceaee8995914a0c1c493a42613",
+      "baselineNormalizedAstSha256": "a46ce6f4619dae2a26babc0557c52ca999bd24ef704f6f1ab28729bc87c53160"
+    },
+    {
+      "name": "isMonitorAuthReady",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "e9e7e37eeb7189855549574b3425cbcc83b661f70f6852f044bb3ff72b329206",
+      "baselineNormalizedAstSha256": "76beb5dd45320668cf82dcd0710cf3684c1898a5830406d734c290baf73a7d3e"
+    },
+    {
+      "name": "loadMonitorSubscriptions",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "6a05add87575ea8a3bec31d1342af4c63a3ded88283177abcd6a64340d5c047f",
+      "baselineNormalizedAstSha256": "8a5bbcccb9e6c2fbb4874a57090e71e3bbc1e1af6c86ca11ea842028e7c15ef6"
+    },
+    {
+      "name": "loadMonitorExecutions",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "7d6ab4f444799c8983db82028377c4285f511a99a8bf56d1a46663b715f58259",
+      "baselineNormalizedAstSha256": "3f16e1e0f18706fdfa925cc3ea24f249d954c058d5ff6face2f4c1a18e390e81"
+    },
+    {
+      "name": "loadExecutionDetails",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "19d4d64ce4463b377fe78b6c923e0c487562aaf9b01a95fcdd34540bb1f9ca12",
+      "baselineNormalizedAstSha256": "ca8438cc160a876f640721f7e064c533f7fd19fb7ad9e132277dacab0225303f"
+    },
+    {
+      "name": "getMonitorSettingsElements",
+      "owner": "sidebar/legacy-view/monitor-settings.js",
+      "baselineSha256": "243f947c036c3ed2fe940f333bd1535557247a5f11761a7a6bdf8418f8a1cf66",
+      "baselineNormalizedAstSha256": "4f97b5d2449b925321cd8504a205fa4e56ea7246b3f86865366ad3e81027f370"
+    },
+    {
+      "name": "normalizeMonitorSettingsInput",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "825322b333ba2aabfb3b2f8ea857dd118bd791f3531e57f7b5cf2795e0e582fd",
+      "baselineNormalizedAstSha256": "d5858777aa2a2cf9a673268bd37d01e5c654bf7eadeb31ea263d0846abd06e46"
+    },
+    {
+      "name": "populateMonitorSettingsForm",
+      "owner": "sidebar/legacy-view/monitor-settings.js",
+      "baselineSha256": "4db59968db74499ac1ad1944ba41ea0749ce045b153feadb550df1e56a813920",
+      "baselineNormalizedAstSha256": "9682bdc4589f28e440b8b09ec151248f6706a587a3c5d0fa1850e79b5282edb0"
+    },
+    {
+      "name": "readMonitorSettingsForm",
+      "owner": "sidebar/legacy-view/monitor-settings.js",
+      "baselineSha256": "3046b7bc513b6fd3813f613e0b45041b77d17e04153281bcda079795d169ce22",
+      "baselineNormalizedAstSha256": "859532749300db86957fa973b5d6cffeaceb5eed21124d3e4d6473d661a2668f"
+    },
+    {
+      "name": "loadMonitorSettings",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "0897eca684cec158ce52a22ec8c381d93f2db54ade387e22cf4d7101c8874f87",
+      "baselineNormalizedAstSha256": "931df8e5ab40261bf0c056f8d3cf5763e934d7c150785e330d205e51f1027c35"
+    },
+    {
+      "name": "resolveMonitorDisplayName",
+      "owner": "sidebar/legacy-view/monitor-settings.js",
+      "baselineSha256": "791a9005fab30581d2e6f886463d692978c9c97cd29e960838b07ecddb4389a8",
+      "baselineNormalizedAstSha256": "25f7ae3194032291ca3baf453926601cbe3559044692bdd5bd888cb6e587276d"
+    },
+    {
+      "name": "normalizeMonitorSubjectType",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "a31382cca8885ef60678afded64e9258ee72137cd5a12862fc5af32dee4868c8",
+      "baselineNormalizedAstSha256": "073f7465e447027803f188044607be8c7a014d34d2a3c41698d74da97165b665"
+    },
+    {
+      "name": "getMonitorSubjectType",
+      "owner": "sidebar/legacy-view/monitor-settings.js",
+      "baselineSha256": "8ee8c8ee1cd00b5d610187b59af5597a1775eb9da593b635f02ac607570d5619",
+      "baselineNormalizedAstSha256": "d1a0f077c53b4c124d1cd43d6229d178fb69ecd149cd8cb3aa141fa1acd7a466"
+    },
+    {
+      "name": "getMonitorSubjectLabel",
+      "owner": "sidebar/legacy-view/monitor-settings.js",
+      "baselineSha256": "e816e4d1500620b53bab9fca87706d75a402214f5bef8858f161128f547fb222",
+      "baselineNormalizedAstSha256": "71f2cb350477640eb742e474cacb271567987415ada50109a78e7ddba1c1291e"
+    },
+    {
+      "name": "setMonitorSubjectType",
+      "owner": "sidebar/legacy-view/monitor-settings.js",
+      "baselineSha256": "6de7f76ed56d7e89b641079432225f0ebc3f26f8c85defa6c601243b58a2c3fe",
+      "baselineNormalizedAstSha256": "bf8e0c01f8c4f06ce6f50f8fc772e135f1dbb5d970988f5df4d28365317a9ef2"
+    },
+    {
+      "name": "extractPlatformMonitorBloggerId",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "d50c5adb4d851c3911c39d82d258dd287bf3cc8217d9e7ffe8d3a8f805dd5c78",
+      "baselineNormalizedAstSha256": "a3668be285c1794212741b1ffde32b0f592c8500cfa45d4e5b25346be9b6ff4b"
+    },
+    {
+      "name": "resolveMonitorAccountNo",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "79a07db21ebe117eb9e6df9dae8e46cf948b4bea01420e00128bf79182a4a65f",
+      "baselineNormalizedAstSha256": "e4b96ad55fe30228160536634661c0ceb7c113f7f7fdf6f1a4e1e95e7c6502c4"
+    },
+    {
+      "name": "buildMonitorSubjectCandidate",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "9255b45c8c5dab1dbc80dd772a8f666dcdf3f2bc3bf7d6a86f32088e9d64895a",
+      "baselineNormalizedAstSha256": "503f32bdc7722661c5acf698bddeaf98c23e446cf82b8fbb35e28205b518a78d"
+    },
+    {
+      "name": "buildMonitorCandidateFromRecord",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "d70da3ed8348a0ff685dcdf93a3d1f0ec918ea28f705951b7fe7b7b1ff33b4b9",
+      "baselineNormalizedAstSha256": "0dd1674410e2db04a83df2934ede64c7dd7cd8b5d5ee6926ae4ab1954c65e0fc"
+    },
+    {
+      "name": "addMonitorSubscriptionByCandidate",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "2aa07ee1090e359d293b969e670cffc8f1675e18729c2194ae4fdc05d6e72115",
+      "baselineNormalizedAstSha256": "0a2d69feb5ca01d001115f6eb596da4359566d44fe8f3fb18aaeaf3fb37d564e"
+    },
+    {
+      "name": "captureCurrentMonitorCandidate",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "7fd2723c249eaa8f4750391f08a451d3afe308c820c8a530fbd584515fd8ba04",
+      "baselineNormalizedAstSha256": "bd315d9b7167ff2f980c04a5a84f03b5fadd9b19e46c7d744a626ec385f7af19"
+    },
+    {
+      "name": "handleAddCurrentMonitor",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "11bdec66c960e2f15da5ff16a0a3cb7db2efd1f490b3c72664d9689df30bde6e",
+      "baselineNormalizedAstSha256": "acf1d595e3f38700ba7e21bbc3946dc08127b5d24e919f79598f1d1f1b92599d"
+    },
+    {
+      "name": "resolveMonitorRunHistoryState",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "333ebd2db2f988423f81a2702aa4bcf0a893c1c6f23b9ef3ca039285df0e52ec",
+      "baselineNormalizedAstSha256": "8ca5d55e07e402381cbe4a586432b6d623f24e54c3e21784d36735729e509122"
+    },
+    {
+      "name": "normalizeMonitorRunnerPlatform",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "f401fd37db74810660329e1b7d13e1abcdbdb7d3ef2f2887cec29e563cfa2a6e",
+      "baselineNormalizedAstSha256": "c380ec00b558421d581f496a7c1e911093a8bc8ec7f72c00ef305260bd7342b0"
+    },
+    {
+      "name": "resolveMonitorRunnerAccountUrl",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "237b6d012ea7e1657dcae0ea0ea2f6095b27ab5bf9a509f17d81f404c65ba3ae",
+      "baselineNormalizedAstSha256": "8e4bc201376d2fbc6c01c2a561a064c3a5cc04ba55b6bc92ccf540c6f5380714"
+    },
+    {
+      "name": "resolveMonitorRunnerName",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "a506a1ae58512af50d91d53b12632399fd8658ab805cd31c57ca30b6ee986085",
+      "baselineNormalizedAstSha256": "eff8cf64d3cea91fd30f3756843bf3e93f9fb7b087a03824ceb8103e0c89968e"
+    },
+    {
+      "name": "resolveMonitorRunnerCaptureParams",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "f0c5309be97822c76b189baf89c71e5375eb5dcb825c75fbfbd74a2e503c51d1",
+      "baselineNormalizedAstSha256": "80c61b8883798bc17340bbf33993f2ed23062d5ae66d61da47a77ee282f8f3b2"
+    },
+    {
+      "name": "summarizeMonitorSyncResult",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "f8eca2a43040426edcd5dfe30aefe6b884daef7705223e3c33f91f17f36405a3",
+      "baselineNormalizedAstSha256": "236c6d94dd43855925a3fd2e657ca3827faaf7e9343fc1838a8d42253772cf50"
+    },
+    {
+      "name": "getShanghaiDayStartMs",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "ad25317859604ef671992a4d695dd0a214ba4461660e7178dae551fda9932fac",
+      "baselineNormalizedAstSha256": "b262cd915e60bef02fd6a1ecd572af75e7b42cee84fe981ed9b859dc8ce2f5f2"
+    },
+    {
+      "name": "getShanghaiDateParts",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "945fbb99f75865220a96f81abc0fb90eca497fb7e8ab1a24be15801c0095aa0d",
+      "baselineNormalizedAstSha256": "454329e3dd37e0e42f313f267ae78e67f436fae65fee1f886f207f7dd520a224"
+    },
+    {
+      "name": "buildShanghaiTimestamp",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "c197abd86994f1b23a2f4a43eef3e58bb568ca373ed0614d8b4440bb8dace34d",
+      "baselineNormalizedAstSha256": "15524f8849d37d59ec7724684dc9c7e7df7cc1a45179fa3492243fce9e44829f"
+    },
+    {
+      "name": "parseMonitorCalendarDateStartMs",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "18140b0e0c11fe6852b770780ba179050192ab0143b3452f3b4c8d2d9214d87f",
+      "baselineNormalizedAstSha256": "82bd201232ef25c2d42d4dfe5976ed6cd178d3793e7b7ccd1ec4ae3fed82d2c1"
+    },
+    {
+      "name": "resolveMonitorPublishWindowBounds",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "f96af1fe6a425c98d0a64169a889126428b3aea54894f300a46e443a223c4920",
+      "baselineNormalizedAstSha256": "a5b41e9392840ea848bcd05b6504c21d1b6996b0d71edccf4f77ad84a3a51414"
+    },
+    {
+      "name": "cleanMonitorPublishText",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "9c9272171b1821eccb7c830a41dc42c9064e44f3ea3914bcdaee8e3c70853603",
+      "baselineNormalizedAstSha256": "036ecac95452a8f7df92fe7a609e963353b3d1f3d0bb721beb5bf082d6f3905e"
+    },
+    {
+      "name": "createMonitorPublishMoment",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "bf21563f9d3b7294b172bb6a66bb0a9d9bf14b191b328f4d439ea317663ee980",
+      "baselineNormalizedAstSha256": "96ad0faa8ec08de779169871035f56b9be390f6a70f450aa90927cb4c13677a0"
+    },
+    {
+      "name": "parseMonitorNumericPublishMoment",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "1c0c007f749beac3f083662980cae4ac199bc6314422ef1389b7f05e5278270e",
+      "baselineNormalizedAstSha256": "243f984e0dcd66cfaeeed2d2c33a21d4b71c1d9fd6640dac14f9bf64a6ecadbb"
+    },
+    {
+      "name": "resolveYearForMonthDay",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "877aeb5a9bea7d1302194cb7112b89b0a3861319367deb364e37e093ed96440b",
+      "baselineNormalizedAstSha256": "b2275f6122d5f45538c9e46d30613e90d2e5602a19a0e8701159fbc1cb642584"
+    },
+    {
+      "name": "parseMonitorPublishMoment",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "688fde89ee8f8ff48af5e81409c12184b2ffab067a74651f77071ee2ea301920",
+      "baselineNormalizedAstSha256": "4cb1ef6873216a91d1f38b2fefdb5ddfa31dd07ed557d63c188491390ad66cd0"
+    },
+    {
+      "name": "collectMonitorPublishCandidates",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "420f675e07a820858620b0ab9549afc425fc5568befe3a1de07efc0dc048f23c",
+      "baselineNormalizedAstSha256": "50ccd26f19d5bd2f99e227e770ac72bcd79de72d42aab21a7d543f4c17444d7a"
+    },
+    {
+      "name": "isLikelyFallbackCaptureTime",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "fc85fcfd2f11c3839e0ecaf1d295381812e936c7e9025fa10dcb213f21fb28e5",
+      "baselineNormalizedAstSha256": "dce98d9f0ec36e08fd009756717f78c16a8b5225a2a279336f59f92b97628296"
+    },
+    {
+      "name": "resolveMonitorRecordPublishMoment",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "4d6043c53c5348cdf640a2709eb9701153e65390e3a26cc9fb30079dd94f7248",
+      "baselineNormalizedAstSha256": "d70817112cc253a70723d9cd5e75c67c37af222d60e8d5910a65ed3b5f7b2ad3"
+    },
+    {
+      "name": "isMonitorPublishMomentInWindow",
+      "owner": "sidebar/task-controller/monitor-policy.js",
+      "baselineSha256": "a525fde0e95a65ad991db7b4c5f4c4780782f96844ae3d1bcc6fe9b1e614e635",
+      "baselineNormalizedAstSha256": "6ddf68eb278645846f92d5ae318d0c810942e33acbd185d74d100e92805b6611"
+    },
+    {
+      "name": "handleAddMonitorFromRecord",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "614200c047c054361aaf3426df775df8e240f62732bec2fddd6c892df4b3bfdc",
+      "baselineNormalizedAstSha256": "5dae809686822db7a4046f8ca637ec7b4381c8f5264ad7b6d5bd9928bdf29e60"
+    },
+    {
+      "name": "resolveMonitorSettingsSaveErrorMessage",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "3453010b71cc6be504ca674eac1bd277b1af1876476d6863a410d20c6d18ce1b",
+      "baselineNormalizedAstSha256": "e73bcf94ee8fbb0ce283bc01fbc1196f19c104263aa7483200969655f48cd3ba"
+    },
+    {
+      "name": "handleSaveMonitorSettings",
+      "owner": "sidebar/task-controller/monitor-subscriptions.js",
+      "baselineSha256": "d931bf03111a23c392a4aab976866bbc193eae631c604c206133967f0a8da778",
+      "baselineNormalizedAstSha256": "80302ab81d93a199e2e44f1b98b67869482cb1d075c7be755b06ac49bafc8cb2"
+    },
+    {
+      "name": "handleMonitorListClick",
+      "owner": "sidebar/legacy-view/monitor-settings.js",
+      "baselineSha256": "2699a5e9715aca57e59dcfef0b7c74f6c47fd09f82224792e27f2cbe386edbef",
+      "baselineNormalizedAstSha256": "2abd2c2b726055e5e472f65bf06c36a3f05f12217366789173a5c8f52879ef44"
+    },
+    {
+      "name": "normalizeKeywordSortDimension",
+      "owner": "sidebar/task-controller/keyword-sort.js",
+      "baselineSha256": "8dba13138d2ae0ae14619be6272b0bb8184350749285945b527a5f1e62a9248f",
+      "baselineNormalizedAstSha256": "facd7f108b3d6dda7c43c3b3049fc6f4b0fe90934dfcb8007cad973b2d4d21e2"
+    },
+    {
+      "name": "getKeywordSortDimensionLabel",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "c48c0c04930dc0f35943041f974d30a06160ec76a245ffbd14fa17c922564bf7",
+      "baselineNormalizedAstSha256": "5483fe90374f41700c1d38d70b1d92673f8ffd10ca850b9c0430f8fcd82071e5"
+    },
+    {
+      "name": "applyKeywordSortDimensionToUI",
+      "owner": "sidebar/legacy-view/keyword-plan.js",
+      "baselineSha256": "99d1feeb0766c89f64ed2c61a4cc02740ecb0474987adc50382cb56f1de08943",
+      "baselineNormalizedAstSha256": "0667365a47b68b8ac697522773e37f06c68fccfa6fc6852d7f5026a4bf1451b6"
+    },
+    {
+      "name": "syncKeywordSortDimensionByRuntime",
+      "owner": "sidebar/task-controller/keyword-sort.js",
+      "baselineSha256": "e3b23e5547331f9c1587f1269ac63546ee93f63005c8e2117a2987232c001ab6",
+      "baselineNormalizedAstSha256": "5be0bba9c1b616e68ba8facabcabba13a8621449996c75f4bc2b9085f352fd71"
+    },
+    {
+      "name": "startKeywordSortSyncTimer",
+      "owner": "sidebar/task-controller/keyword-sort.js",
+      "baselineSha256": "b4f1f2a9633f8b4bbf1c71f70ab4f7a6d1cf27249c7e8a1ffa7ce6c63c0c1648",
+      "baselineNormalizedAstSha256": "5b686394d2d1c8b6beb908601f1b209e9433d86d2e711b88dbd07fe29bd8c3e9"
+    },
+    {
+      "name": "stopKeywordSortSyncTimer",
+      "owner": "sidebar/task-controller/keyword-sort.js",
+      "baselineSha256": "22c6bb0bc2cdd5ad7152835d557c26a0f20fd485a274e2c7d7e54f0c1b4dd065",
+      "baselineNormalizedAstSha256": "33c3cc6ddaeef58603ee0956685ec3975d4907c4474928d3fcb150bb5cea8438"
+    },
+    {
+      "name": "syncKeywordSortDimensionFromPage",
+      "owner": "sidebar/task-controller/keyword-sort.js",
+      "baselineSha256": "7e914125cc631d58910612c5c913df8bd2ced997427a6a35e66861fa6a6d2809",
+      "baselineNormalizedAstSha256": "86a53e4537e7777a65c05644e57edc7f252895ae74abdbf57216e9dd27275c0c"
+    },
+    {
+      "name": "detectKeywordSortDimensionFromActiveTab",
+      "owner": "sidebar/task-controller/keyword-sort.js",
+      "baselineSha256": "7dc71785aba99f5a75c6b06af7083eac5b0bff97659e12a1182a6ab5268f3aeb",
+      "baselineNormalizedAstSha256": "0dcb422024a79de8e40f9b63fddf4b4b4030d627ef1392dc56ca2b38893455f3"
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 // L3-A monitor-execution: original control flow, explicit state and compatibility ports.
-export function createMonitorExecutionController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createMonitorExecutionController({controllerState, controllerPorts, controllerOperations}) {
   const {
     DEFAULT_MONITOR_SETTINGS,
     ERROR_REASON,

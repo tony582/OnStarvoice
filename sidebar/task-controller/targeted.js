@@ -1,5 +1,5 @@
 // L3-A targeted: original control flow, explicit state and compatibility ports.
-export function createTargetedController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createTargetedController({controllerState, controllerPorts, controllerOperations}) {
   const {
     TARGETED_POST_RUN_ATTEMPT_QUERY_KEY,
     TARGETED_POST_RUN_HEARTBEAT_INTERVAL_MS,
@@ -14,7 +14,7 @@ export function createTargetedController({controllerState, controllerBindings, c
     clearTimeout,
     cloudTargetedPostApi,
     console,
-    document,
+    taskView,
     getCaptureSettings,
     getCurrentRuntime,
     getRecords,
@@ -27,7 +27,6 @@ export function createTargetedController({controllerState, controllerBindings, c
     setTimeout,
     showMessage,
     syncRecordBatch,
-    window,
   } = controllerPorts;
   const acquireCaptureExecutionLock = (...args) => controllerOperations.acquireCaptureExecutionLock(...args);
   const executeMonitorRunItem = (...args) => controllerOperations.executeMonitorRunItem(...args);
@@ -36,7 +35,7 @@ export function createTargetedController({controllerState, controllerBindings, c
 
   function getUnattendedRunRequestIdFromUrl() {
     try {
-      return new URLSearchParams(window.location.search).get(
+      return new URLSearchParams(taskView.readRunnerLocationSearch()).get(
         UNATTENDED_RUN_QUERY_KEY,
       );
     } catch {
@@ -47,7 +46,7 @@ export function createTargetedController({controllerState, controllerBindings, c
   function getUnattendedRunAttemptIdFromUrl() {
     try {
       return (
-        new URLSearchParams(window.location.search).get(
+        new URLSearchParams(taskView.readRunnerLocationSearch()).get(
           UNATTENDED_RUN_ATTEMPT_QUERY_KEY,
         ) || ""
       ).trim();
@@ -59,7 +58,7 @@ export function createTargetedController({controllerState, controllerBindings, c
   function getTargetedPostRunRequestIdFromUrl() {
     try {
       return (
-        new URLSearchParams(window.location.search).get(
+        new URLSearchParams(taskView.readRunnerLocationSearch()).get(
           TARGETED_POST_RUN_QUERY_KEY,
         ) || ""
       ).trim();
@@ -71,7 +70,7 @@ export function createTargetedController({controllerState, controllerBindings, c
   function getTargetedPostRunAttemptIdFromUrl() {
     try {
       return (
-        new URLSearchParams(window.location.search).get(
+        new URLSearchParams(taskView.readRunnerLocationSearch()).get(
           TARGETED_POST_RUN_ATTEMPT_QUERY_KEY,
         ) || ""
       ).trim();

@@ -1,5 +1,5 @@
 // L3-A owner: original control flow, explicit state and compatibility ports.
-export function createOwnerController({controllerState, controllerBindings, controllerPorts, controllerOperations}) {
+export function createOwnerController({controllerState, controllerPorts, controllerOperations}) {
   const {
     CAPTURE_TASK_OWNER_PORT_NAME,
     chrome,
