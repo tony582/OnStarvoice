@@ -5,6 +5,7 @@
  */
 
 import "./control-storage-reserve.js";
+import "./control/state-fence.js";
 
 import {
   STORAGE_KEY,
@@ -284,7 +285,9 @@ export async function getAuth() {
  * 设置 auth 状态
  */
 export async function setAuth(auth) {
-  return await setItem(STORAGE_KEY.AUTH, auth);
+  return await globalThis.OnStarvoiceControlStateFence.runAuth(() =>
+    globalThis.OnStarvoiceControlStateFence.run(() => setItem(STORAGE_KEY.AUTH, auth)),
+  );
 }
 
 /**
@@ -301,15 +304,18 @@ export async function updateAuth(updates, options = {}) {
       return {accepted: false, auth: current};
     }
     const auth = {...current, ...updates};
-    const saved = await setAuth(auth);
+    // Already inside Auth -> Q: never call the public (locking) setter here.
+    const saved = await setItem(STORAGE_KEY.AUTH, auth);
     if (!saved) return {accepted: false, auth: current, error: 'write_failed'};
     return {accepted: true, auth};
   };
+  // Keep the established auth CAS lock; Q is its final shared storage stage.
   const locks = globalThis.navigator?.locks;
+  const commit = () => globalThis.OnStarvoiceControlStateFence.run(mutate);
   if (typeof locks?.request === 'function') {
-    return await locks.request('onstarvoice:auth-state', {mode: 'exclusive'}, mutate);
+    return await locks.request('onstarvoice:auth-state', {mode: 'exclusive'}, commit);
   }
-  return await mutate();
+  return await commit();
 }
 
 /**
@@ -1189,15 +1195,32 @@ export async function clearDataPool() {
  * 清除所有数据（用于测试或重置）
  */
 export async function clearAll() {
+  // Reset the related control roots together. Otherwise the surviving request
+  // or archive can repair the just-deleted ledger and resurrect old history.
+  await globalThis.OnStarvoiceControlStateFence.runAuth(() =>
+    globalThis.OnStarvoiceControlStateFence.run(async () => {
+      const stored = await chrome.storage.local.get(STORAGE_KEY.TASK_LEDGER);
+      const previous = Date.parse(stored[STORAGE_KEY.TASK_LEDGER]?.clearedAt || '');
+      const now = new Date(Math.max(Date.now(), Number.isFinite(previous) ? previous + 1 : 0)).toISOString();
+      // Reuse the ledger's existing clear marker: delayed producers after a
+      // service-worker restart must not recreate pre-reset rows from old work.
+      await chrome.storage.local.set({
+        [STORAGE_KEY.TASK_LEDGER]: {version: 1, runs: [], clearedAt: now, updatedAt: now},
+      });
+      await chrome.storage.local.remove([
+        STORAGE_KEY.AUTH,
+        STORAGE_KEY.UNATTENDED_KEYWORD_RUN_REQUEST,
+        STORAGE_KEY.UNATTENDED_KEYWORD_RUN_ARCHIVE,
+      ]);
+    }),
+  );
   await removeItem(STORAGE_KEY.RUNTIME);
-  await removeItem(STORAGE_KEY.AUTH);
   await removeItem(STORAGE_KEY.TARGET);
   await removeItem(STORAGE_KEY.CAPTURE);
   await removeItem(STORAGE_KEY.SYNC);
   await removeItem(STORAGE_KEY.MONITOR);
   await removeItem(STORAGE_KEY.DATA_POOL);
   await removeItem(STORAGE_KEY.SYNC_HISTORY);
-  await removeItem(STORAGE_KEY.TASK_LEDGER);
   return true;
 }
 

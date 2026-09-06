@@ -11,7 +11,7 @@ function getSessionToken(req) {
   return req.cookies?.osv_session || req.headers['x-session-token'] || '';
 }
 
-function getCaptureAgentToken(req) {
+export function getCaptureAgentToken(req) {
   const authHeader = String(req.headers.authorization || '');
   return authHeader.startsWith('Bearer ')
     ? authHeader.slice(7).trim()

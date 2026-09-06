@@ -26,6 +26,8 @@ try {
 
 importScripts(
   'utils/control-storage-reserve.js',
+  'utils/control/state-fence.js',
+  'utils/control/terminal-authority.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
   'utils/capture/execution-identity.js',
@@ -1051,10 +1053,22 @@ async function readArchivedUnattendedKeywordRunRequest(requestId) {
 }
 
 async function archiveUnattendedKeywordRunRequest(request) {
-  return await runUnattendedRunArchiveMutation(async () => {
+  return await runUnattendedRunArchiveMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const normalized = normalizeUnattendedRunRequest(request);
     if (!isRetryableUnattendedRunRequest(normalized)) {
       return null;
+    }
+    if (globalThis.OnStarvoiceControlStateFence) {
+      const raw = await chrome.storage.local.get([
+        STORAGE_KEYS.unattendedKeywordRunRequest, STORAGE_KEYS.taskLedger,
+      ]);
+      const current = raw[STORAGE_KEYS.unattendedKeywordRunRequest];
+      const fence = globalThis.OnStarvoiceControlStateFence;
+      if (!fence.sameLegacyRequestVersion(current, request) || current.recoveryDismissedAt ||
+          (fence.sourcePredatesClear(request, raw[STORAGE_KEYS.taskLedger]) &&
+            !raw[STORAGE_KEYS.taskLedger]?.runs?.some(run => run.id === request.id &&
+              run.attemptId === request.attemptId))) return null;
     }
     const credential = await readCloudTaskAgentCredential();
     const currentAgentScopeId = String(credential.id || '').trim();
@@ -1090,7 +1104,7 @@ async function archiveUnattendedKeywordRunRequest(request) {
       [STORAGE_KEYS.unattendedKeywordRunArchive]: next,
     });
     return next.requests[scopedRequest.id] || null;
-  });
+  }));
 }
 
 function strictUnattendedControlRejection(reason) {
@@ -1126,6 +1140,144 @@ function rejectUnavailableStrictUnattendedControl(message) {
   };
 }
 
+// Private command host. No legacy UI event supplies this capability. A current
+// same-document connection is required, and the module never starts/stops work.
+let terminalMetadataAuthority = null;
+const terminalMetadataCallers = new Map();
+
+function invalidateTerminalMetadataAuthority() {
+  terminalMetadataAuthority?.invalidateAll();
+  terminalMetadataAuthority = null;
+}
+
+function handleTerminalMetadataConnection(port) {
+  if (port?.name !== 'onstarvoice:terminal-control-client-v1') return false;
+  const sender = port.sender;
+  const allowedUrl = chrome.runtime.getURL('sidebar/sidebar.html');
+  if (sender?.id !== chrome.runtime.id || sender.url !== allowedUrl ||
+      typeof sender.documentId !== 'string' || !sender.documentId ||
+      sender.documentLifecycle !== 'active' ||
+      (sender.frameId !== undefined && sender.frameId !== 0) ||
+      terminalMetadataCallers.size >= 32) {
+    port.disconnect();
+    return true;
+  }
+  // Replacing a connection rotates private capabilities, including in-flight
+  // commands. Disconnecting an older port cannot unregister its successor.
+  if (terminalMetadataCallers.has(sender.documentId)) invalidateTerminalMetadataAuthority();
+  terminalMetadataCallers.set(sender.documentId, port);
+  port.onDisconnect.addListener(() => {
+    if (terminalMetadataCallers.get(sender.documentId) !== port) return;
+    terminalMetadataCallers.delete(sender.documentId);
+    terminalMetadataAuthority?.invalidateCaller({documentId: sender.documentId});
+  });
+  return true;
+}
+
+async function readTerminalMetadataState() {
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.unattendedKeywordRunRequest, STORAGE_KEYS.taskLedger,
+    STORAGE_KEYS.unattendedKeywordRunArchive,
+  ]);
+  return {request: stored[STORAGE_KEYS.unattendedKeywordRunRequest] ?? null,
+    ledger: stored[STORAGE_KEYS.taskLedger] ?? null,
+    archive: stored[STORAGE_KEYS.unattendedKeywordRunArchive] ?? null};
+}
+
+async function readTerminalMetadataCredential() {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.auth);
+  return stored[STORAGE_KEYS.auth] ?? null;
+}
+
+function buildTerminalMetadataProjection(request) {
+  const run = getUnattendedTaskCenterCore().normalizeTaskRun(
+    buildUnattendedTaskRun(request, null), {now: request.updatedAt},
+  );
+  return {run, snapshot: cloudTaskAgentApi.buildTaskSnapshot(
+    run, request.id, {}, {allowLiveHealth: false},
+  )};
+}
+
+async function queryTerminalMetadataAuthority(body, {rawAuth, signal}) {
+  const configured = globalThis.__ONSTARVOICE_API_BASE_URL__;
+  const base = new URL(configured || 'https://voice.minilife.online');
+  const development = globalThis.__ONSTARVOICE_BUILD_TARGET__ === 'local' &&
+    base.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(base.hostname);
+  if ((!development && base.origin !== 'https://voice.minilife.online') ||
+      base.username || base.password || base.pathname !== '/' || base.search || base.hash) {
+    throw new Error('authority_denied');
+  }
+  // Dedicated SELECT-only route. Never call /verify, heartbeat or full sync as
+  // a permission check; redirects/retries/legacy fallbacks are not permitted.
+  const response = await fetch(new URL('/api/capture-cloud/agent/control-authority', base), {
+    method: 'POST', signal, redirect: 'error', credentials: 'omit', cache: 'no-store',
+    headers: {'Content-Type': 'application/json',
+      Authorization: `Bearer ${rawAuth.captureAgent.token}`},
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error('authority_denied');
+  return await response.json();
+}
+
+async function commitAuthorizedTerminalMetadata({validateCurrent} = {}) {
+  const fence = globalThis.OnStarvoiceControlStateFence;
+  if (!fence?.available() || typeof validateCurrent !== 'function') {
+    return {accepted: false, persisted: false, reason: 'strict_shared_lock_unavailable'};
+  }
+  const persist = () => fence.runAuth(() => runUnattendedRunMutation(() =>
+    runTaskLedgerMutation(() => runUnattendedRunArchiveMutation(() => fence.run(async () => {
+      const stored = await chrome.storage.local.get([
+        STORAGE_KEYS.auth, STORAGE_KEYS.unattendedKeywordRunRequest,
+        STORAGE_KEYS.taskLedger, STORAGE_KEYS.unattendedKeywordRunArchive,
+      ]);
+      const state = {request: stored[STORAGE_KEYS.unattendedKeywordRunRequest] ?? null,
+        ledger: stored[STORAGE_KEYS.taskLedger] ?? null,
+        archive: stored[STORAGE_KEYS.unattendedKeywordRunArchive] ?? null};
+      // This closure belongs to the background-private consumed handle. It
+      // rechecks current caller, raw auth/source and expiry AFTER all waits.
+      const verdict = validateCurrent(state, stored[STORAGE_KEYS.auth] ?? null);
+      if (verdict?.accepted !== true) return {...verdict, persisted: false};
+      const current = state.request, ledger = state.ledger;
+      const now = new Date(Math.max(Date.now(), Date.parse(current.updatedAt) + 1)).toISOString();
+      const nextRequest = {...current, recoveryDismissedAt: now,
+        recoveryDismissedMessage: '已撤销这次任务的本地恢复建议；已有结果和同步状态不变',
+        updatedAt: now};
+      const nextLedger = {...ledger,
+        updatedAt: Date.parse(ledger.updatedAt) > Date.parse(now) ? ledger.updatedAt : now,
+        runs: ledger.runs.map(run => run.id === current.id ? {...run, updatedAt: now} : run)};
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
+        [STORAGE_KEYS.taskLedger]: nextLedger,
+      });
+      return {accepted: true, persisted: true, reason: 'terminal_metadata_persisted'};
+    }, {strict: true})))), {strict: true});
+  try {return await persist();} catch (error) {
+    if (!controlStorageReserveApi.isStorageQuotaError(error)) throw error;
+    // Exactly one fresh attempt; no reserve cleanup, network or stale replay.
+    return await persist();
+  }
+}
+
+function getTerminalMetadataAuthority() {
+  if (!terminalMetadataAuthority) {
+    terminalMetadataAuthority = globalThis.OnStarvoiceTerminalAuthority.createTerminalAuthority({
+      extensionId: chrome.runtime.id, generation: crypto.randomUUID(),
+      readState: readTerminalMetadataState, readCredential: readTerminalMetadataCredential,
+      buildProjection: buildTerminalMetadataProjection,
+      checkOnlineAuthority: queryTerminalMetadataAuthority,
+      commitTerminalMetadata: commitAuthorizedTerminalMetadata,
+      isReady: () => globalThis.OnStarvoiceControlStateFence?.available() === true,
+      isCallerCurrent: caller => {
+        const port = terminalMetadataCallers.get(caller.documentId);
+        return port?.sender?.id === caller.id && port.sender.url === caller.url &&
+          (port.sender.tab?.id ?? null) === caller.tabId &&
+          (port.sender.frameId ?? null) === caller.frameId;
+      },
+    });
+  }
+  return terminalMetadataAuthority;
+}
+
 // Internal, offline-validated metadata primitive; not a stop, recovery, resource
 // release or permission check. No production caller supplies this capability.
 // Acquire U here (never call while holding U), then the existing ledger queue.
@@ -1147,7 +1299,7 @@ async function persistStrictUnattendedTerminalMetadata(request, {strictSource} =
     recoveryDismissedAt: candidate.updatedAt,
     recoveryDismissedMessage: request.recoveryDismissedMessage});
   const expectedStatus = request.status;
-  const persist = () => runUnattendedRunMutation(() => runTaskLedgerMutation(async () => {
+  const persist = () => runUnattendedRunMutation(() => runTaskLedgerMutation(() => (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.unattendedKeywordRunRequest, STORAGE_KEYS.taskLedger, STORAGE_KEYS.auth,
     ]);
@@ -1176,7 +1328,7 @@ async function persistStrictUnattendedTerminalMetadata(request, {strictSource} =
     });
     return {accepted: true, persisted: true, reason: 'strict_terminal_metadata_persisted',
       request: nextRequest, ledger: nextLedger, plan: null};
-  }));
+  })));
   // Reserve restoration itself writes later. This kernel deliberately does not
   // use that legacy wrapper: at most one retry, with fresh U + ledger reads.
   try {
@@ -1193,7 +1345,8 @@ async function removeArchivedUnattendedKeywordRunRequest(requestId, options = {}
   if (strict && (!expected || requestId !== expected.requestId)) {
     return strictUnattendedControlRejection('strict_source_invalid');
   }
-  return await runUnattendedRunArchiveMutation(async () => {
+  return await runUnattendedRunArchiveMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     if (strict) {
       const stored = await chrome.storage.local.get([
         STORAGE_KEYS.unattendedKeywordRunArchive, STORAGE_KEYS.auth,
@@ -1231,16 +1384,17 @@ async function removeArchivedUnattendedKeywordRunRequest(requestId, options = {}
       },
     });
     return true;
-  });
+  }));
 }
 
 async function clearUnattendedKeywordRunArchive() {
-  return await runUnattendedRunArchiveMutation(async () => {
+  return await runUnattendedRunArchiveMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     await chrome.storage.local.remove(
       STORAGE_KEYS.unattendedKeywordRunArchive,
     );
     return true;
-  });
+  }));
 }
 
 function isTerminalUnattendedRunStatus(status) {
@@ -1797,18 +1951,54 @@ async function persistUnattendedRunMutation(
     allowAttemptTransition = false,
     event = null,
     mirrorPlan = true,
+    creationSource,
+    creationClearedAt,
   } = {},
 ) {
-  const normalized = normalizeUnattendedRunRequest(request);
+  let normalized = normalizeUnattendedRunRequest(request);
   if (!normalized) {
     return {request: null, plan: null, ledger: null};
   }
-  const persist = () => runTaskLedgerMutation(async () => {
-    const now = String(normalized.updatedAt || new Date().toISOString());
+  const persist = () => runTaskLedgerMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.unattendedKeywordPlan,
       STORAGE_KEYS.taskLedger,
+      STORAGE_KEYS.unattendedKeywordRunRequest,
     ]);
+    const current = stored[STORAGE_KEYS.unattendedKeywordRunRequest];
+    const fence = globalThis.OnStarvoiceControlStateFence;
+    if (fence) {
+      const isCreation = creationSource !== undefined;
+      const currentClearMarker = String(stored[STORAGE_KEYS.taskLedger]?.clearedAt || '');
+      const currentCreationWitness = isCreation && creationClearedAt === currentClearMarker;
+      const expected = isCreation ? creationSource : previousRequest;
+      const retainedRun = stored[STORAGE_KEYS.taskLedger]?.runs?.some(run =>
+        run.id === request.id && run.attemptId === request.attemptId);
+      const retainedPredecessor = allowAttemptTransition && previousRequest &&
+        fence.sameLegacyRequestVersion(current, previousRequest) &&
+        current.id === normalized.id &&
+        stored[STORAGE_KEYS.taskLedger]?.runs?.some(run =>
+          run.id === current.id && run.attemptId === String(current.attemptId || `legacy-${current.id}`));
+      if ((!retainedRun && !retainedPredecessor && !currentCreationWitness && fence.sourcePredatesClear(request, stored[STORAGE_KEYS.taskLedger])) ||
+          (isCreation && !currentCreationWitness) ||
+          (expected && !fence.sameLegacyRequestVersion(current, expected)) ||
+          (isCreation && !fence.sameLegacyRequestVersion(current, creationSource)) ||
+          (!isCreation && (!current || current.id !== normalized.id ||
+            (!allowAttemptTransition && String(current.attemptId || `legacy-${current.id}`) !== normalized.attemptId)))) {
+        throw fence.sourceChanged();
+      }
+      // A delayed same-Attempt writer cannot retract a committed user decision.
+      if (current?.id === normalized.id && current.attemptId === normalized.attemptId &&
+          current.recoveryDismissedAt) {
+        normalized = {...normalized,
+          recoveryDismissedAt: current.recoveryDismissedAt,
+          recoveryDismissedMessage: current.recoveryDismissedMessage,
+          updatedAt: Date.parse(current.updatedAt) > Date.parse(normalized.updatedAt)
+            ? current.updatedAt : normalized.updatedAt};
+      }
+    }
+    const now = String(normalized.updatedAt || new Date().toISOString());
     const plan = normalizeUnattendedKeywordPlan(
       stored[STORAGE_KEYS.unattendedKeywordPlan],
     );
@@ -1817,6 +2007,10 @@ async function persistUnattendedRunMutation(
       normalized,
       {previousRequest, allowAttemptTransition, event, now},
     );
+    const storedLedgerVersion = stored[STORAGE_KEYS.taskLedger]?.updatedAt;
+    if (ledgerResult.ledger && Date.parse(storedLedgerVersion) > Date.parse(ledgerResult.ledger.updatedAt)) {
+      ledgerResult.ledger = {...ledgerResult.ledger, updatedAt: storedLedgerVersion};
+    }
     const shouldMirrorPlan = mirrorPlan && normalized.cloudAssigned !== true;
     if (ledgerResult.accepted === false) {
       if (
@@ -1859,7 +2053,6 @@ async function persistUnattendedRunMutation(
           terminalValues[STORAGE_KEYS.unattendedKeywordPlan] = preservedPlan;
         }
         await chrome.storage.local.set(terminalValues);
-        scheduleCloudTaskAgentSync('unattended_terminal_reconciled');
         return {
           request: preservedRequest,
           plan: preservedPlan,
@@ -1886,7 +2079,6 @@ async function persistUnattendedRunMutation(
       values[STORAGE_KEYS.unattendedKeywordPlan] = nextPlan;
     }
     await chrome.storage.local.set(values);
-    scheduleCloudTaskAgentSync('unattended_state_changed');
     return {
       request: normalized,
       plan: nextPlan,
@@ -1894,6 +2086,10 @@ async function persistUnattendedRunMutation(
       ledgerAccepted: ledgerResult.accepted,
       ledgerReason: ledgerResult.reason,
     };
+  })).then(result => {
+    scheduleCloudTaskAgentSync(result.alreadyTerminal
+      ? 'unattended_terminal_reconciled' : 'unattended_state_changed');
+    return result;
   });
   return isTerminalUnattendedRunStatus(normalized.status)
     ? await runAuthoritativeControlStorageMutation(persist)
@@ -1901,7 +2097,8 @@ async function persistUnattendedRunMutation(
 }
 
 async function readTaskLedger() {
-  return await runTaskLedgerMutation(async () => {
+  return await runTaskLedgerMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.taskLedger,
       STORAGE_KEYS.unattendedKeywordRunRequest,
@@ -1917,6 +2114,7 @@ async function readTaskLedger() {
       const targetedRequestId = targetedPostPhysicalRunId(targetedRequest);
       if (
         targetedRequestId &&
+        !globalThis.OnStarvoiceControlStateFence?.sourcePredatesClear(targetedRequest, rawLedger) &&
         isSupportedCloudTargetedPostWorkflow(targetedRequest?.workflow) &&
         !normalized.runs.some((run) => run?.id === targetedRequestId)
       ) {
@@ -1969,7 +2167,7 @@ async function readTaskLedger() {
           updatedAt: String(rawLedger.updatedAt || ''),
         }
       : {version: 1, runs: [], updatedAt: ''};
-  });
+  }));
 }
 
 let cloudTaskAgentSyncInFlight = false;
@@ -3079,14 +3277,16 @@ function buildTargetedPostTaskCenterRun(request, existingRun = null) {
   };
 }
 
-async function persistTargetedPostRunRequest(request) {
+async function persistTargetedPostRunRequest(request, {creationClearedAt} = {}) {
   if (!request || typeof request !== 'object') {
     await chrome.storage.local.remove(STORAGE_KEYS.targetedPostRunRequest);
     return null;
   }
   const normalized = normalizeStoredTargetedPostRunRequest(request);
   const requestToPersist = normalized.request || request;
-  const persist = () => runTaskLedgerMutation(async () => {
+  let shouldScheduleSync = false;
+  const persist = () => runTaskLedgerMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
     const core = getUnattendedTaskCenterCore();
     const now = new Date().toISOString();
@@ -3102,6 +3302,12 @@ async function persistTargetedPostRunRequest(request) {
           (item) => item?.id === targetedPostPhysicalRunId(requestToPersist),
         ) || null
       : null;
+    if (globalThis.OnStarvoiceControlStateFence && (
+      (!existingRun && creationClearedAt === undefined && globalThis.OnStarvoiceControlStateFence.sourcePredatesClear(
+        request, stored[STORAGE_KEYS.taskLedger])) ||
+      (creationClearedAt !== undefined && creationClearedAt !==
+        String(stored[STORAGE_KEYS.taskLedger]?.clearedAt || ''))
+    )) throw globalThis.OnStarvoiceControlStateFence.sourceChanged();
     const taskRun = buildTargetedPostTaskCenterRun(
       requestToPersist,
       existingRun,
@@ -3132,8 +3338,11 @@ async function persistTargetedPostRunRequest(request) {
       [STORAGE_KEYS.targetedPostRunRequest]: requestToPersist,
       [STORAGE_KEYS.taskLedger]: ledger,
     });
-    scheduleCloudTaskAgentSync('targeted_post_state_changed');
+    shouldScheduleSync = true;
     return requestToPersist;
+  })).then(result => {
+    if (shouldScheduleSync) scheduleCloudTaskAgentSync('targeted_post_state_changed');
+    return result;
   });
   return cloudTargetedPostApi?.isTerminalRunStatus?.(
     String(requestToPersist.status || ''),
@@ -3143,6 +3352,8 @@ async function persistTargetedPostRunRequest(request) {
 }
 
 async function createOrResumeTargetedPostRun(command, payload) {
+  const creationLedger = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+  const creationClearedAt = String(creationLedger[STORAGE_KEYS.taskLedger]?.clearedAt || '');
   if (!cloudTargetedPostApi?.normalizeCommandPayload) {
     const error = new Error('当前扩展缺少定向作品采集协议');
     error.code = 'TARGET_PROTOCOL_UNAVAILABLE';
@@ -3284,7 +3495,7 @@ async function createOrResumeTargetedPostRun(command, payload) {
       ...request,
       executionFingerprint,
     };
-    await persistTargetedPostRunRequest(request);
+    await persistTargetedPostRunRequest(request, {creationClearedAt});
     if (supersededRequest) {
       const closed = await closeSupersededTargetedPostRunnerTabs(
         supersededRequest,
@@ -4357,7 +4568,8 @@ function storedRecordTimestamp(value = {}) {
 }
 
 async function compactExpiredTaskLedger(now) {
-  return await runTaskLedgerMutation(async () => {
+  return await runTaskLedgerMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
     const raw = stored[STORAGE_KEYS.taskLedger];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -4412,11 +4624,12 @@ async function compactExpiredTaskLedger(now) {
       },
     });
     return {changed: true};
-  });
+  }));
 }
 
 async function compactExpiredUnattendedArchive(now) {
-  return await runUnattendedRunArchiveMutation(async () => {
+  return await runUnattendedRunArchiveMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.unattendedKeywordRunArchive,
       STORAGE_KEYS.auth,
@@ -4444,7 +4657,7 @@ async function compactExpiredUnattendedArchive(now) {
       [STORAGE_KEYS.unattendedKeywordRunArchive]: compacted,
     });
     return {changed: true};
-  });
+  }));
 }
 
 async function compactExpiredAuxiliaryHistory(now) {
@@ -4567,7 +4780,8 @@ function isTaskRunActuallyActive(
 }
 
 async function clearTaskCenterRecords() {
-  return await runTaskLedgerMutation(async () => {
+  return await runTaskLedgerMutation(() => runUnattendedRunArchiveMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.taskLedger,
       STORAGE_KEYS.unattendedKeywordPlan,
@@ -4576,7 +4790,8 @@ async function clearTaskCenterRecords() {
     ]);
     const core = getUnattendedTaskCenterCore();
     const now = Date.now();
-    const nowIso = new Date(now).toISOString();
+    const previousClear = Date.parse(stored[STORAGE_KEYS.taskLedger]?.clearedAt || '');
+    const nowIso = new Date(Math.max(now, Number.isFinite(previousClear) ? previousClear + 1 : 0)).toISOString();
     const unattendedRequest =
       stored[STORAGE_KEYS.unattendedKeywordRunRequest] &&
       typeof stored[STORAGE_KEYS.unattendedKeywordRunRequest] === 'object'
@@ -4643,7 +4858,7 @@ async function clearTaskCenterRecords() {
         lastUpdatedAt: now,
       },
     });
-    await clearUnattendedKeywordRunArchive();
+    await chrome.storage.local.remove(STORAGE_KEYS.unattendedKeywordRunArchive);
     let clearedUnattendedRequest = false;
     if (!unattendedRequestActive) {
       if (unattendedRequestId) {
@@ -4686,7 +4901,7 @@ async function clearTaskCenterRecords() {
       clearedUnattendedRequest,
       clearedTargetedRequest,
     };
-  });
+  })));
 }
 
 async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}) {
@@ -4698,7 +4913,8 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
   const requestedStatus = String(
     sourcePatch.status || sourceRun.status || '',
   ).trim().toLowerCase();
-  const persist = () => runTaskLedgerMutation(async () => {
+  const persist = () => runTaskLedgerMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
     const core = getUnattendedTaskCenterCore();
     const now = new Date().toISOString();
@@ -4711,6 +4927,10 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
     const existing = Array.isArray(ledger?.runs)
       ? ledger.runs.find((item) => item?.id === taskId) || null
       : null;
+    if (globalThis.OnStarvoiceControlStateFence && !existing && ledger.clearedAt &&
+        (!sourceRun.id || globalThis.OnStarvoiceControlStateFence.sourcePredatesClear(
+          sourceRun, stored[STORAGE_KEYS.taskLedger],
+        ))) return {accepted: false, reason: 'source_missing_or_cleared', data: null, ledger};
     let nextRun = {...(existing || {}), ...sourceRun, ...sourcePatch, id: taskId};
     const cloudAgentScopeId = existing
       ? String(existing?.metadata?.cloudAgentScopeId || '')
@@ -4749,7 +4969,6 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
         });
     if (result.accepted) {
       await chrome.storage.local.set({[STORAGE_KEYS.taskLedger]: result.ledger});
-      scheduleCloudTaskAgentSync('task_ledger_changed');
     }
     return {
       accepted: Boolean(result.accepted),
@@ -4757,6 +4976,9 @@ async function upsertTaskLedgerRun({run = null, patch = null, event = null} = {}
       data: result.run || null,
       ledger: result.ledger,
     };
+  })).then(result => {
+    if (result.accepted) scheduleCloudTaskAgentSync('task_ledger_changed');
+    return result;
   });
   return AUTHORITATIVE_CONTROL_TERMINAL_STATUSES.has(requestedStatus)
     ? await runAuthoritativeControlStorageMutation(persist)
@@ -5262,7 +5484,8 @@ async function cleanupTerminalUnattendedRuntime(
   if (!normalizedRequest) return {request: null, relayedCount: 0};
   const expectedRequestId = String(normalizedRequest.id || '').trim();
   const expectedAttemptId = String(normalizedRequest.attemptId || '').trim();
-  const persistCleanupState = () => runUnattendedRunMutation(async () => {
+  const persistCleanupState = () => runUnattendedRunMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
     const current = await readUnattendedKeywordRunRequest();
     const plan = requirePlanDisabled
       ? await readUnattendedKeywordPlan()
@@ -5298,7 +5521,7 @@ async function cleanupTerminalUnattendedRuntime(
       [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciled,
     });
     return reconciled;
-  });
+  }));
   const reconciledRequest =
     await runAuthoritativeControlStorageMutation(persistCleanupState);
   if (!reconciledRequest) {
@@ -6268,12 +6491,13 @@ async function persistUnattendedStopConfirmationWithinMutation(
     ...(stage === 'runtime_released' ? {runtimeReleasedAt: now} : {}),
   };
   const next = {...current, localClosureStopConfirmation: confirmation};
-  await runAuthoritativeControlStorageMutation(() =>
-    chrome.storage.local.set({
-      [STORAGE_KEYS.unattendedKeywordRunRequest]: next,
-    }),
+  return await runAuthoritativeControlStorageMutation(() =>
+    globalThis.OnStarvoiceControlStateFence
+      ? globalThis.OnStarvoiceControlStateFence.writeRequestDelta(
+          chrome.storage.local, STORAGE_KEYS.unattendedKeywordRunRequest, current, next,
+        )
+      : chrome.storage.local.set({[STORAGE_KEYS.unattendedKeywordRunRequest]: next}).then(() => next),
   );
-  return next;
 }
 
 async function retryUnattendedLocalClosureCleanup(request) {
@@ -6677,7 +6901,7 @@ async function persistUnattendedLocalClosureEvidence(predicate) {
   const expectedRequestId = String(predicate.request.id || '').trim();
   const expectedAttemptId = String(predicate.request.attemptId || '').trim();
   const persist = () => runUnattendedRunMutation(async () =>
-    runTaskLedgerMutation(async () => {
+    runTaskLedgerMutation(() => (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
       const stored = await chrome.storage.local.get([
         STORAGE_KEYS.unattendedKeywordRunRequest,
         STORAGE_KEYS.taskLedger,
@@ -6809,7 +7033,7 @@ async function persistUnattendedLocalClosureEvidence(predicate) {
       const nextLedger = {
         ...(ledger && typeof ledger === 'object' ? ledger : {}),
         runs,
-        updatedAt: now,
+        updatedAt: Date.parse(ledger.updatedAt) > Date.parse(now) ? ledger.updatedAt : now,
       };
       await chrome.storage.local.set({
         [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
@@ -6821,7 +7045,7 @@ async function persistUnattendedLocalClosureEvidence(predicate) {
         evidence,
         evidences,
       };
-    }),
+    })),
   );
   return await runAuthoritativeControlStorageMutation(persist);
 }
@@ -7328,7 +7552,8 @@ async function cancelUnattendedKeywordRunFromControl({
       const expectedAttemptId = String(
         reconciledTerminalRequest.attemptId || '',
       ).trim();
-      const persistDismissal = () => runUnattendedRunMutation(async () => {
+      const persistDismissal = () => runUnattendedRunMutation(() =>
+        (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
         const current = await readUnattendedKeywordRunRequest();
         if (
           !current ||
@@ -7348,7 +7573,7 @@ async function cancelUnattendedKeywordRunFromControl({
           [STORAGE_KEYS.unattendedKeywordRunRequest]: dismissed,
         });
         return dismissed;
-      });
+      }));
       const dismissedRequest =
         await runAuthoritativeControlStorageMutation(persistDismissal);
       if (!dismissedRequest) {
@@ -7494,9 +7719,13 @@ async function cleanupDisabledUnattendedKeywordPlanRuntime({
           remainingMs: null,
         },
       });
-      await chrome.storage.local.set({
-        [STORAGE_KEYS.unattendedKeywordRunRequest]: reconciledRequest,
-      });
+      if (globalThis.OnStarvoiceControlStateFence) {
+        await globalThis.OnStarvoiceControlStateFence.writeRequestDelta(
+          chrome.storage.local, STORAGE_KEYS.unattendedKeywordRunRequest, request, reconciledRequest,
+        );
+      } else {
+        await chrome.storage.local.set({[STORAGE_KEYS.unattendedKeywordRunRequest]: reconciledRequest});
+      }
       await cancelAndReleaseUnattendedExecutionTargets(lockSnapshot, [
         request.runnerTabId,
         progress?.runnerTabId,
@@ -8207,6 +8436,8 @@ async function createUnattendedKeywordRunRequest(
     checkpoint = null,
   } = {},
 ) {
+  const creationLedger = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+  const creationClearedAt = String(creationLedger[STORAGE_KEYS.taskLedger]?.clearedAt || '');
   return await runUnattendedRunMutation(async () => {
     const existing = await readUnattendedKeywordRunRequest();
     if (existing && !isTerminalUnattendedRunStatus(existing.status)) {
@@ -8253,6 +8484,8 @@ async function createUnattendedKeywordRunRequest(
       message: `已创建${executionCopy.taskLabel}，等待运行页领取`,
     };
     await persistUnattendedRunMutation(request, {
+      creationSource: existing,
+      creationClearedAt,
       event: {
         type: 'created',
         message: `已创建${executionCopy.taskLabel}`,
@@ -9879,6 +10112,8 @@ async function manuallyRecoverUnattendedKeywordRun({
   cloudCommandId = '',
   allowedKeywords = [],
 } = {}) {
+  const creationLedger = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+  const creationClearedAt = String(creationLedger[STORAGE_KEYS.taskLedger]?.clearedAt || '');
   const normalizedMode = new Set(['remaining', 'failed', 'skip_current']).has(mode)
     ? mode
     : 'remaining';
@@ -10156,6 +10391,8 @@ async function manuallyRecoverUnattendedKeywordRun({
     delete nextRequest.localClosureEvidences;
     delete nextRequest.localClosureStopConfirmation;
     await persistUnattendedRunMutation(nextRequest, {
+      creationSource: currentRequest,
+      creationClearedAt,
       event: {
         type: 'manual_recovery',
         message: labels[normalizedMode],
@@ -11818,6 +12055,9 @@ chrome.storage.onChanged?.addListener?.((changes, areaName) => {
     });
   }
   if (!changes[STORAGE_KEYS.auth]) return;
+  // Any auth field change invalidates prepared handles, including same-agent
+  // binding/token replacements. Final raw-auth comparison remains authoritative.
+  invalidateTerminalMetadataAuthority();
   const previousAgentId = String(
     changes[STORAGE_KEYS.auth]?.oldValue?.captureAgent?.id || '',
   );
@@ -11898,9 +12138,22 @@ chrome.runtime.onConnect.addListener((port) => {
   captureTaskOwnerCoordinator.attachPort(port);
 });
 
+chrome.runtime.onConnect.addListener(handleTerminalMetadataConnection);
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const action = message?.action;
   const type = message?.type;
+
+  if (type === 'onstarvoice:prepare-terminal-recovery-dismissal' ||
+      type === 'onstarvoice:execute-terminal-recovery-dismissal') {
+    Promise.resolve().then(() => {
+      const authority = getTerminalMetadataAuthority();
+      return type === 'onstarvoice:prepare-terminal-recovery-dismissal'
+        ? authority.prepare(message, sender) : authority.execute(message, sender);
+    }).then(sendResponse, () => sendResponse({ok: false, accepted: false,
+      persisted: false, reason: 'control_unavailable'}));
+    return true;
+  }
 
   if (
     action === 'captureProgress' ||
