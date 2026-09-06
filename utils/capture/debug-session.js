@@ -955,7 +955,14 @@
         publishState = true,
         bestEffort = false,
       } = {}) {
+        const strictRequested = Object.hasOwn(arguments[0] || {}, "strictResources");
         return enqueue(async () => {
+          // No native atomic document-bound detach exists. Reject inside the
+          // manager queue before timers, session state or Debug can be touched.
+          if (strictRequested) {
+            return {released: false, rejected: true, strict: true, mutated: false,
+              reason: "strict_document_bound_debug_detach_unavailable"};
+          }
           const normalizedTabId = normalizeTabId(tabId);
           const normalizedTaskId = cleanText(taskId, 320);
           const session = normalizedTabId
@@ -1229,10 +1236,16 @@
         degradeTabReplacement,
         discardRestoredSession,
         stop,
-        stopByTab(tabId, reason = "capture_cancelled") {
+        stopByTab(tabId, reason = "capture_cancelled", options = {}) {
+          if (Object.hasOwn(options || {}, "strictResources")) {
+            return stop({tabId, reason, strictResources: options.strictResources});
+          }
           return stop({tabId, reason, force: true});
         },
-        stopByTaskId(taskId, reason = "capture_task_finished") {
+        stopByTaskId(taskId, reason = "capture_task_finished", options = {}) {
+          if (Object.hasOwn(options || {}, "strictResources")) {
+            return stop({taskId, reason, strictResources: options.strictResources});
+          }
           return stop({taskId, reason, force: true});
         },
         updateTask,

@@ -95,7 +95,7 @@ function createCaptureOwnerPort() {
   };
 }
 
-function createHarness() {
+function createHarness({fetchHandler = fetch} = {}) {
   const storage = {};
   const sentTabMessages = [];
   const reloadedTabIds = [];
@@ -375,7 +375,7 @@ function createHarness() {
     btoa: globalThis.btoa,
     clearInterval,
     clearTimeout,
-    fetch,
+    fetch: fetchHandler,
     setInterval,
     setTimeout: unrefSetTimeout,
     importScripts() {},
@@ -472,6 +472,8 @@ function createHarness() {
       `  assessUnattendedRunHealth,\n` +
       `  recoverUnattendedKeywordRunRequest,\n` +
       `  manuallyRecoverUnattendedKeywordRun,\n` +
+      `  persistStrictUnattendedTerminalMetadata,\n` +
+      `  removeArchivedUnattendedKeywordRunRequest,\n` +
       `  reportTargetedPostTerminalToCloud,\n` +
       `  persistTargetedPostRunRequest,\n` +
       `  executeCloudTaskAgentCommand,\n` +
@@ -7247,6 +7249,313 @@ test("risk and login failures trip a circuit breaker without automatic retries",
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, request.attemptId);
+});
+
+const STRICT_CONTROL_MESSAGE_TYPES = [
+  'onstarvoice:cancel-unattended-keyword-run',
+  'onstarvoice:recover-unattended-keyword-run',
+];
+
+function strictControlHostFixture({terminal = false} = {}) {
+  const effects = [];
+  const harness = createHarness({
+    async fetchHandler() {
+      effects.push('network.fetch');
+      throw new Error('Strict control tests prohibit network access');
+    },
+  });
+  const updatedAt = '2026-09-06T00:00:00.000Z';
+  const request = seedUnattendedRequest(harness, {
+    cloudAgentScopeId: 'strict-agent',
+    updatedAt,
+    ...(terminal ? {status: 'failed', finishedAt: updatedAt} : {}),
+  });
+  harness.storage['onstarvoice.auth'] = {
+    token: 'synthetic-not-a-credential',
+    verified: true,
+    permissions: ['capture:cancel', 'capture:recover'],
+    captureAgent: {id: 'strict-agent'},
+  };
+  harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+    version: 1,
+    agentScopeId: 'strict-agent',
+    requests: {[request.id]: {...request, status: 'failed'}},
+  };
+  harness.storage[TASK_LEDGER_KEY] = {
+    version: 1,
+    runs: [{
+      id: request.id, attemptId: request.attemptId, status: request.status, updatedAt,
+      metadata: {cloudAgentScopeId: 'strict-agent'},
+    }],
+  };
+  harness.storage[LOCK_KEY] = {
+    id: 'strict-lock', owner: 'unattended_keyword_plan',
+    holderId: 'strict-holder', holderDocumentId: 'strict-document',
+    holderTabId: 42, captureTaskId: `unattended-capture:${request.id}`,
+    captureTaskAttemptId: request.attemptId,
+  };
+  const strictControl = {
+    version: 1, requestId: request.id, attemptId: request.attemptId,
+    updatedAt, agentScopeId: 'strict-agent',
+  };
+  const storageBefore = JSON.stringify(harness.storage);
+  const alarmsBefore = JSON.stringify([...harness.alarmDefinitions]);
+  // Observe the actual host dependencies, not mocked versions of the command
+  // function. Any call remains visible even if its error is caught downstream.
+  for (const [group, methods] of Object.entries({
+    storage: ['set', 'remove'],
+    tabs: ['sendMessage', 'create', 'update', 'remove', 'reload', 'group', 'ungroup'],
+    debugger: ['attach', 'detach', 'sendCommand'],
+    scripting: ['executeScript'],
+    windows: ['update'],
+    tabGroups: ['update'],
+    alarms: ['create', 'clear'],
+  })) {
+    const api = group === 'storage' ? harness.chrome.storage.local : harness.chrome[group];
+    for (const method of methods) {
+      const original = api[method];
+      api[method] = async (...args) => {
+        effects.push(`${group}.${method}`);
+        return await original.apply(api, args);
+      };
+    }
+  }
+  async function assertUntouched() {
+    await Promise.all([
+      harness.api.flush(), harness.api.flushRuntime(),
+      harness.api.flushUnattended(), harness.api.flushTaskLedger(),
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(effects, [], 'strict listener must not initiate any mutation, resource effect, schedule or network call');
+    for (const name of [
+      'storageSetCalls', 'storageRemoveCalls', 'sentTabMessages', 'createdTabs',
+      'updatedTabs', 'removedTabIds', 'reloadedTabIds', 'cloudHeartbeats',
+      'cloudCommandCompletions', 'alarmCreateHistory', 'badgeTextHistory',
+    ]) {
+      assert.equal(harness[name].length, 0, `no host effects: ${name}`);
+    }
+    assert.equal(JSON.stringify(harness.storage), storageBefore, 'source/ledger/archive/auth/lock remain unchanged');
+    assert.equal(JSON.stringify([...harness.alarmDefinitions]), alarmsBefore);
+  }
+  return {harness, request, strictControl, assertUntouched, effects};
+}
+
+function assertStrictHostRejection(response, reason) {
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), {
+    ok: false, accepted: false, reason, data: null,
+    strictControl: {version: 1, accepted: false, reason},
+  });
+}
+
+for (const type of STRICT_CONTROL_MESSAGE_TYPES) {
+  const invalidSources = [
+    ['undefined', () => undefined],
+    ['null', () => null],
+    ['false', () => false],
+    ['true', () => true],
+    ['string', () => 'strict'],
+    ['array', () => []],
+    ['empty object', () => ({})],
+    ['unknown version', (source) => ({...source, version: 2})],
+    ['missing attempt', (source) => ({...source, attemptId: ''})],
+    ['numeric version timestamp', (source) => ({...source, updatedAt: 100})],
+    ['invalid timestamp', (source) => ({...source, updatedAt: 'not-a-date'})],
+    ['missing scope', (source) => ({...source, agentScopeId: ''})],
+    ['inherited source fields', (source) => Object.create(source)],
+  ];
+  for (const [label, buildSource] of invalidSources) {
+    test(`strict full-host ${type}: explicit ${label} cannot fall through to legacy`, async () => {
+      const fixture = strictControlHostFixture();
+      const response = await fixture.harness.sendBackgroundMessage({
+        type, requestId: fixture.request.id,
+        strictControl: buildSource(fixture.strictControl),
+      });
+      assertStrictHostRejection(response, 'strict_source_invalid');
+      await fixture.assertUntouched();
+    });
+  }
+
+  test(`strict full-host ${type}: complete source still requires a real current permission provider`, async () => {
+    const fixture = strictControlHostFixture();
+    const response = await fixture.harness.sendBackgroundMessage({
+      type, requestId: fixture.request.id, strictControl: fixture.strictControl,
+    }, buildUnattendedRunnerSender(fixture.request, 'strict-document'));
+    assertStrictHostRejection(response, 'strict_permission_provider_unavailable');
+    await fixture.assertUntouched();
+  });
+
+  const callerClaims = [
+    ['verified flags', {verified: true, authenticated: true, authorized: true}],
+    ['permission list', {permissions: ['capture:cancel', 'capture:recover'], canCancel: true, canRecover: true}],
+    ['tokens', {token: 'synthetic-token', accessToken: 'synthetic-access-token', authorization: 'Bearer synthetic'}],
+    ['historical read grant', {historyReadAllowed: true, source: 'diagnostics', trusted: true, scopeVerified: true}],
+  ];
+  for (const [label, claim] of callerClaims) {
+    test(`strict full-host ${type}: caller ${label} cannot authorize command effects`, async () => {
+      const fixture = strictControlHostFixture();
+      const response = await fixture.harness.sendBackgroundMessage({
+        type, requestId: fixture.request.id, ...claim,
+        strictControl: {...fixture.strictControl, ...claim},
+      }, {
+        ...buildUnattendedRunnerSender(fixture.request, 'strict-document'),
+        ...claim,
+      });
+      assertStrictHostRejection(response, 'strict_permission_provider_unavailable');
+      await fixture.assertUntouched();
+    });
+  }
+
+  test(`strict full-host ${type}: differing outer request cannot select a different task`, async () => {
+    const fixture = strictControlHostFixture();
+    const response = await fixture.harness.sendBackgroundMessage({
+      type, requestId: 'other-request', strictControl: fixture.strictControl,
+    });
+    assertStrictHostRejection(response, 'strict_source_invalid');
+    await fixture.assertUntouched();
+  });
+
+  test(`strict full-host ${type}: a stale but well-formed Attempt is not acted on before authorization`, async () => {
+    const fixture = strictControlHostFixture();
+    const response = await fixture.harness.sendBackgroundMessage({
+      type, requestId: fixture.request.id,
+      strictControl: {...fixture.strictControl, attemptId: 'older-attempt'},
+    });
+    assertStrictHostRejection(response, 'strict_permission_provider_unavailable');
+    await fixture.assertUntouched();
+  });
+}
+
+test('full-host legacy cancel remains executable only when strictControl is absent', async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness);
+  const response = await harness.sendBackgroundMessage({
+    type: 'onstarvoice:cancel-unattended-keyword-run', requestId: request.id,
+  });
+  assert.equal(response.ok, true);
+  assert.equal(Object.hasOwn(response, 'strictControl'), false);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, 'canceled');
+  assert.ok(harness.storageSetCalls.length > 0, 'control proves original cancellation path actually ran');
+});
+
+test('full-host legacy recover remains executable only when strictControl is absent', async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {status: 'failed', finishedAt: new Date().toISOString()});
+  const response = await harness.sendBackgroundMessage({
+    type: 'onstarvoice:recover-unattended-keyword-run', requestId: request.id, mode: 'remaining',
+  });
+  assert.equal(response.ok, true);
+  assert.equal(Object.hasOwn(response, 'strictControl'), false);
+  assert.notEqual(harness.storage[UNATTENDED_REQUEST_KEY].id, request.id);
+  assert.ok(harness.createdTabs.length > 0, 'control proves original recovery startup actually ran');
+});
+
+async function assertStrictKernelHostEffects(fixture, {storageSetCount}) {
+  const {harness, effects} = fixture;
+  await Promise.all([
+    harness.api.flush(), harness.api.flushRuntime(),
+    harness.api.flushUnattended(), harness.api.flushTaskLedger(),
+  ]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(effects, Array.from({length: storageSetCount}, () => 'storage.set'));
+  assert.equal(harness.storageSetCalls.length, storageSetCount);
+  for (const name of [
+    'storageRemoveCalls', 'sentTabMessages', 'createdTabs', 'updatedTabs',
+    'removedTabIds', 'reloadedTabIds', 'cloudHeartbeats', 'cloudCommandCompletions',
+    'alarmCreateHistory', 'badgeTextHistory',
+  ]) {
+    assert.equal(harness[name].length, 0, `strict storage kernel has no external command effects: ${name}`);
+  }
+}
+
+test('strict full-host storage kernel persists exact terminal dismissal metadata without enabling a command or cloud sync', async () => {
+  const fixture = strictControlHostFixture({terminal: true});
+  const {harness, request, strictControl} = fixture;
+  const nextAt = '2026-09-06T00:00:01.000Z';
+  const previousLedger = JSON.parse(JSON.stringify(harness.storage[TASK_LEDGER_KEY]));
+  const previousPlan = JSON.stringify(harness.storage[UNATTENDED_PLAN_KEY]);
+  const result = await harness.api.persistStrictUnattendedTerminalMetadata({
+    ...request, updatedAt: nextAt,
+    recoveryDismissedAt: nextAt, recoveryDismissedMessage: 'synthetic dismissal',
+  }, {strictSource: strictControl});
+  assert.equal(result.accepted, true);
+  assert.equal(result.persisted, true);
+  assert.equal(result.request.id, request.id);
+  assert.equal(result.request.attemptId, request.attemptId);
+  assert.equal(result.request.updatedAt, nextAt);
+  assert.equal(result.request.status, 'failed');
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.storage[UNATTENDED_REQUEST_KEY])), {
+    ...JSON.parse(JSON.stringify(request)), updatedAt: nextAt,
+    recoveryDismissedAt: nextAt, recoveryDismissedMessage: 'synthetic dismissal',
+  });
+  const persistedRun = harness.storage[TASK_LEDGER_KEY].runs.find((run) => run.id === request.id);
+  assert.equal(persistedRun.attemptId, request.attemptId);
+  assert.equal(persistedRun.updatedAt, nextAt);
+  assert.equal(persistedRun.status, 'failed');
+  assert.equal(persistedRun.metadata.cloudAgentScopeId, strictControl.agentScopeId);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.storage[TASK_LEDGER_KEY])), {
+    ...previousLedger, updatedAt: nextAt,
+    runs: previousLedger.runs.map((run) => ({...run, updatedAt: nextAt})),
+  });
+  assert.equal(JSON.stringify(harness.storage[UNATTENDED_PLAN_KEY]), previousPlan);
+  assert.deepEqual(Object.keys(harness.storageSetCalls[0]).sort(), [TASK_LEDGER_KEY, UNATTENDED_REQUEST_KEY].sort());
+  await assertStrictKernelHostEffects(fixture, {storageSetCount: 1});
+});
+
+for (const changedSource of ['replaced Attempt', 'missing request']) {
+  test(`strict full-host storage kernel refuses ${changedSource} without resurrecting or modifying state`, async () => {
+    const fixture = strictControlHostFixture({terminal: true});
+    const {harness, request, strictControl} = fixture;
+    const candidate = {
+      ...request, updatedAt: '2026-09-06T00:00:01.000Z',
+      recoveryDismissedAt: '2026-09-06T00:00:01.000Z', recoveryDismissedMessage: 'synthetic dismissal',
+    };
+    if (changedSource === 'missing request') delete harness.storage[UNATTENDED_REQUEST_KEY];
+    else harness.storage[UNATTENDED_REQUEST_KEY] = {...request, attemptId: 'new-attempt'};
+    const before = JSON.stringify(harness.storage);
+    const result = await harness.api.persistStrictUnattendedTerminalMetadata(candidate, {strictSource: strictControl});
+    assert.equal(result.accepted, false);
+    assert.equal(result.persisted, false);
+    assert.equal(result.reason, 'strict_source_changed');
+    assert.equal(JSON.stringify(harness.storage), before);
+    await assertStrictKernelHostEffects(fixture, {storageSetCount: 0});
+  });
+}
+
+test('strict full-host archive kernel deletes only the exact archived source and preserves unrelated raw data', async () => {
+  const fixture = strictControlHostFixture();
+  const {harness, request, strictControl} = fixture;
+  harness.storage[UNATTENDED_ARCHIVE_KEY].requests['unrelated-legacy'] = {
+    legacyFormat: true, nested: {mustKeep: ['unknown', 'fields']},
+  };
+  const unrelated = JSON.stringify(harness.storage[UNATTENDED_ARCHIVE_KEY].requests['unrelated-legacy']);
+  const active = JSON.stringify(harness.storage[UNATTENDED_REQUEST_KEY]);
+  const ledger = JSON.stringify(harness.storage[TASK_LEDGER_KEY]);
+  const result = await harness.api.removeArchivedUnattendedKeywordRunRequest(request.id, {strictSource: strictControl});
+  assert.equal(result.accepted, true);
+  assert.equal(result.persisted, true);
+  assert.equal(result.removed, true);
+  assert.equal(result.reason, 'strict_archive_removed');
+  assert.equal(Object.hasOwn(harness.storage[UNATTENDED_ARCHIVE_KEY].requests, request.id), false);
+  assert.equal(JSON.stringify(harness.storage[UNATTENDED_ARCHIVE_KEY].requests['unrelated-legacy']), unrelated);
+  assert.equal(JSON.stringify(harness.storage[UNATTENDED_REQUEST_KEY]), active);
+  assert.equal(JSON.stringify(harness.storage[TASK_LEDGER_KEY]), ledger);
+  assert.deepEqual(Object.keys(harness.storageSetCalls[0]), [UNATTENDED_ARCHIVE_KEY]);
+  await assertStrictKernelHostEffects(fixture, {storageSetCount: 1});
+});
+
+test('strict full-host archive kernel refuses a same-ID replacement without deleting any archive entry', async () => {
+  const fixture = strictControlHostFixture();
+  const {harness, request, strictControl} = fixture;
+  harness.storage[UNATTENDED_ARCHIVE_KEY].requests[request.id] = {
+    ...request, attemptId: 'replacement-attempt', status: 'completed',
+  };
+  const before = JSON.stringify(harness.storage);
+  const result = await harness.api.removeArchivedUnattendedKeywordRunRequest(request.id, {strictSource: strictControl});
+  assert.equal(result.accepted, false);
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, 'strict_source_changed');
+  assert.equal(JSON.stringify(harness.storage), before);
+  await assertStrictKernelHostEffects(fixture, {storageSetCount: 0});
 });
 
 test("manual recovery creates a new linked request and opens one runner", async () => {

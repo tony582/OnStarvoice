@@ -137,7 +137,13 @@
         return {unbound: true, taskId: normalizedTaskId};
       }
 
-      function clearTask(taskId) {
+      function clearTask(taskId, options = {}) {
+        // A stable taskId is not an owner generation or Attempt capability.
+        // Keep strict active cleanup disabled until the full chain is fenced.
+        if (Object.hasOwn(options || {}, "strictResources")) {
+          return {cleared: false, rejected: true, strict: true, mutated: false,
+            reason: "strict_owner_generation_cleanup_unavailable"};
+        }
         const normalizedTaskId = normalizeTaskId(taskId);
         if (!normalizedTaskId) {
           return {cleared: false, reason: "invalid_task"};

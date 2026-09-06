@@ -114,6 +114,59 @@
       );
     }
 
+    // Strict control identities are data snapshots, not authorization. Never
+    // coerce display IDs, inherited properties or accessors into command scope.
+    function readStrictIdentityString(source, key) {
+      if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+      const field = Object.getOwnPropertyDescriptor(source, key);
+      const value = field && Object.hasOwn(field, 'value') ? field.value : null;
+      return typeof value === 'string' && value && value === value.trim()
+        ? value : null;
+    }
+
+    function parseStrictUnattendedControlSource(source) {
+      const version = source && Object.getOwnPropertyDescriptor(source, 'version');
+      if (!version || version.value !== 1) return null;
+      const result = {version: 1};
+      for (const key of ['requestId', 'attemptId', 'updatedAt', 'agentScopeId']) {
+        const value = readStrictIdentityString(source, key);
+        if (!value) return null;
+        result[key] = value;
+      }
+      if (!Number.isFinite(Date.parse(result.updatedAt))) return null;
+      return Object.freeze(result);
+    }
+
+    function strictUnattendedControlSourceMatches(request, expected) {
+      const source = parseStrictUnattendedControlSource(expected);
+      return Boolean(source &&
+        readStrictIdentityString(request, 'id') === source.requestId &&
+        readStrictIdentityString(request, 'attemptId') === source.attemptId &&
+        readStrictIdentityString(request, 'updatedAt') === source.updatedAt &&
+        readStrictIdentityString(request, 'cloudAgentScopeId') === source.agentScopeId);
+    }
+
+    function buildStrictCaptureExecutionLockIdentity(lock) {
+      const result = {};
+      for (const key of ['id', 'owner', 'holderId', 'holderDocumentId',
+        'captureTaskId', 'captureTaskAttemptId']) {
+        const value = readStrictIdentityString(lock, key);
+        if (!value) return null;
+        result[key] = value;
+      }
+      const field = Object.getOwnPropertyDescriptor(lock, 'holderTabId');
+      if (!field || !Number.isSafeInteger(field.value) || field.value <= 0) return null;
+      result.holderTabId = field.value;
+      return Object.freeze(result);
+    }
+
+    function strictCaptureExecutionLockMatches(lock, expected) {
+      const actual = buildStrictCaptureExecutionLockIdentity(lock);
+      const snapshot = buildStrictCaptureExecutionLockIdentity(expected);
+      return Boolean(actual && snapshot &&
+        captureExecutionLockMatchesStopIdentity(actual, snapshot));
+    }
+
     return {
       resolveCaptureTaskTabId,
       buildUnattendedCaptureTaskId,
@@ -122,6 +175,10 @@
       buildCaptureExecutionLockStopIdentity,
       captureExecutionLockMatchesStopIdentity,
       captureRuntimeSnapshotMatches,
+      parseStrictUnattendedControlSource,
+      strictUnattendedControlSourceMatches,
+      buildStrictCaptureExecutionLockIdentity,
+      strictCaptureExecutionLockMatches,
     };
   },
 );

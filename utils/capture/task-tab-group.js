@@ -534,7 +534,13 @@
         groupId = null,
         reason = "capture_task_finished",
       } = {}) {
+        const strictRequested = Object.hasOwn(arguments[0] || {}, "strictResources");
         return enqueue(async () => {
+          // Snapshot checks cannot make tab reuse atomic with native ungroup.
+          if (strictRequested) {
+            return {released: false, rejected: true, strict: true, mutated: false,
+              reason: "strict_document_bound_group_release_unavailable"};
+          }
           const normalizedTaskId = cleanText(taskId, 320);
           if (!normalizedTaskId) {
             return {released: false, reason: "invalid_task"};
