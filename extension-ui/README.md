@@ -61,3 +61,11 @@
 ## 本地验证（2026-09-06）
 
 测试、基线对照、版本差异和交付状态见 [U1 实施记录](../docs/architecture/extension-u1-independent-presentation-20260906.md)。该记录区分本地验证与后续远端 CI；不把核心模块测试称为界面或客户验收。
+
+## U2：不依赖视觉稿的只读会话
+
+`application/result-read-session.mjs` 新增 `createResultReadSession`，通过可信注入源读取有限摘要页和当前页的精确 ID 详情。`domain/read-contract.mjs` 校验固定 tenant/task/execution 范围、快照、查询和分页一致性；不把响应回声当鉴权。
+
+刷新/取消/关闭会失效旧请求与选择；未来视图即使拿到了已完成结果，也必须在更新前检查 `session.isCurrent(result.requestToken)`。会话既不连接真实存储，也不修改旧运行链路；设计方案尚未定稿，不增加 UI 入口或最终用语。
+
+完整输入/输出、源侧责任、范围与快照要求、未接线边界见 [U2 接入契约](../docs/architecture/extension-u2-scoped-read-session-20260906.md)。本层只保留当前页 ID，不是现有大数组存储的性能修复；不用于直接更新客户包。
