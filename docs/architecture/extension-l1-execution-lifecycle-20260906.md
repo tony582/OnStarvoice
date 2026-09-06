@@ -7,6 +7,7 @@
 真实浏览器、长期运行及客户验收未执行，不据此关闭 G7 或宣布整个 Extension 架构完成。
 
 - 精确父提交：E1i / PR #48，`d5b243f0c6e6e9b3f920ab8264264553a6141411`。
+- 运行源码候选：`6b15935f581c340b324e7175a46e476ede63042d`，已推送并创建 [Draft PR #54](https://github.com/tony582/OnStarvoice/pull/54)。
 - 隔离分支：`codex/extension-l1-execution-lifecycle-20260906`。
 - 主计划：[Extension 核心架构主执行计划](extension-architecture-roadmap.md)。
 - 同基线后台从 **15,989 行降至 12,534 行，净减少 3,455 行**。
@@ -93,12 +94,14 @@
 | 全量 Node 24.12.0 | 2,135/2,135，无失败/跳过；含上述专项 |
 | 全量 Node 18.20.8 | 2,135/2,135，无失败/跳过；含上述专项 |
 | 独立复审 | 未发现阻断隔离提交/Draft 的迁移问题；另复跑 60 个模块/契约及 50 个恢复/标签/BEGIN-END 场景 |
-| 无上下文文档复核 | 正确识别候选/发布边界及下一阶段；按反馈统一代码审阅状态、补足剩余后台职责归宿；精确 head/CI 待 Draft 创建后补入 |
-| 语法、仓库卫生、隔离构建快照 | 通过；最后提交仍需 diff 空白检查及精确 head CI |
+| 无上下文文档复核 | 正确识别候选/发布边界及下一阶段；按反馈统一代码审阅状态、补足剩余后台职责归宿及精确候选/CI 链接 |
+| 语法、仓库卫生、diff 空白、隔离构建快照 | 通过；仓库卫生检查 786 个文件 |
+| 运行源码候选 CI | `6b15935` 的 [push 6/6](https://github.com/tony582/OnStarvoice/actions/runs/34014208892) 与 [PR 6/6](https://github.com/tony582/OnStarvoice/actions/runs/34014240128) 通过；其中数据库任务为 CI 的隔离容器，不是生产迁移 |
 
 全量日志：`/tmp/onstarvoice-l1-node24-final-20260906.log`、`/tmp/onstarvoice-l1-node18-final-20260906.log`。
 基点配对日志：`/tmp/onstarvoice-l1-baseline-paired-20260906.log`；AST 日志：`/tmp/onstarvoice-l1-equivalence.log`。
 持久的逐函数基线指纹在 `tests/fixtures/capture-lifecycle-body-fingerprints.json`，回归测试按显式 state/API 限定替换核对；这不是任意语义变更的通行证。
+上述精确 CI 归属于运行源码提交；本次文档补记不修改运行源码，但仍重新触发并等待最终 head CI。最终提交门以 PR #54 的最新 head 与相应 checks 复核，不沿用旧 head 的绿色。
 
 第一遍全量有两个验证问题，已修正后完整重跑：构建快照与回归并发导致测试读取缺文件；旧 unattended 台账测试仍查找原文件里的 END 正文。
 前者改为先完成快照再测试；后者保留原两项台账断言、改读真实 end 模块，并增加导入/装配/alias/调用/旧体退出断言，没有跳过或放宽业务场景。
