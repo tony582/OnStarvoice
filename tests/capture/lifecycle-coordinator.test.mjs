@@ -201,13 +201,28 @@ test('manager detach callback remains observational, while the explicit END owns
   assert.deepEqual(events,['debug','group','owner','terminal']);
 });
 
-test('all 54 migrated function bodies preserve the pinned baseline except explicit state/API qualification', () => {
+test('all 54 migrated legacy bodies preserve the pinned baseline; three exact strict preambles are independently pinned', () => {
   const {api}=harness();
   assert.equal(fingerprints.baseline,'d5b243f0c6e6e9b3f920ab8264264553a6141411');
   assert.equal(fingerprints.entries.length,54);
   const globals={taskRuntimeApi:'OnStarvoiceCaptureTaskRuntime',taskTabGroupApi:'OnStarvoiceCaptureTaskTabGroup',debugSessionApi:'OnStarvoiceCaptureDebugSession',taskOwnerApi:'OnStarvoiceCaptureTaskOwner'};
+  // This does not refresh the historical fixture or skip changed functions.
+  // Only these exact additive guards are removed before checking the complete
+  // legacy body; their behavior is covered by strict-resource-guards.test.mjs.
+  const strictPreambles={
+    releaseCaptureTaskResources:'e0615cbd26f80c3aed4752f29994a0d40d8ec9ee72a5fbb2e38d6f3be0d98b77',
+    releaseStableUnattendedCaptureTaskResourcesOnly:'7043742e611318544feddee4716e5763c79bad4ced9b1b42f9fbae3fe725b4f7',
+    releaseUnattendedCaptureTaskResourcesForRecovery:'1f90fc97ce57ad170ce5f0c2d9fc364d519cfa8bf9b9379341df78cde0745fd0',
+  };
   for(const {name,sha256} of fingerprints.entries) {
-    let source=api[name].toString().replace(/\bstate\.(captureTaskLifecycleQueue|captureRuntimeRestorePromise|captureTaskBeginInFlight|captureTaskReplacementTabIds|captureTaskPendingWorkerTabIds|captureTaskCleanupInProgress|captureDebugSessionManager|captureTaskTabGroupManager|captureTaskOwnerCoordinator)\b/gu,'$1');
+    let source=api[name].toString();
+    const guards=[...source.matchAll(/^[ \t]*\/\/ STRICT_RESOURCE_FENCE_BEGIN:[\s\S]*?^[ \t]*\/\/ STRICT_RESOURCE_FENCE_END\r?\n/gmu)];
+    assert.equal(guards.length,Object.hasOwn(strictPreambles,name)?1:0,name);
+    if(guards.length) {
+      assert.equal(createHash('sha256').update(guards[0][0]).digest('hex'),strictPreambles[name],`${name} strict preamble`);
+      source=source.replace(guards[0][0],'');
+    }
+    source=source.replace(/\bstate\.(captureTaskLifecycleQueue|captureRuntimeRestorePromise|captureTaskBeginInFlight|captureTaskReplacementTabIds|captureTaskPendingWorkerTabIds|captureTaskCleanupInProgress|captureDebugSessionManager|captureTaskTabGroupManager|captureTaskOwnerCoordinator)\b/gu,'$1');
     for(const [alias,global] of Object.entries(globals)) source=source.replace(new RegExp(`\\b${alias}\\.`,'gu'),`globalThis.${global}.`);
     source=source.split('\n').map(line=>line.trim()).join('\n');
     assert.equal(createHash('sha256').update(source).digest('hex'),sha256,name);

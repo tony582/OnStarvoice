@@ -30,7 +30,7 @@ const lock = Object.freeze({
   captureTaskAttemptId: "attempt-current",
 });
 
-test("execution identity exposes only the seven extracted pure helpers", () => {
+test("execution identity retains seven legacy helpers and four separate strict predicates", () => {
   assert.deepEqual(Object.keys(identity).sort(), [
     "buildCaptureExecutionLockStopIdentity",
     "buildUnattendedCaptureTaskId",
@@ -39,8 +39,77 @@ test("execution identity exposes only the seven extracted pure helpers", () => {
     "isCaptureExecutionLockOwnedByUnattendedAttempt",
     "parseStableUnattendedCaptureTaskId",
     "resolveCaptureTaskTabId",
+    "parseStrictUnattendedControlSource",
+    "strictUnattendedControlSourceMatches",
+    "buildStrictCaptureExecutionLockIdentity",
+    "strictCaptureExecutionLockMatches",
   ].sort());
   for (const helper of Object.values(identity)) assert.equal(typeof helper, "function");
+});
+
+const strictSource = Object.freeze({
+  version: 1, requestId: 'request-current', attemptId: 'attempt-current',
+  updatedAt: '2026-09-06T00:00:00.000Z', agentScopeId: 'scope-current',
+});
+const rawSource = Object.freeze({id: strictSource.requestId,
+  attemptId: strictSource.attemptId, updatedAt: strictSource.updatedAt,
+  cloudAgentScopeId: strictSource.agentScopeId});
+
+test('strict source is an immutable exact snapshot, not a legacy identity fallback', () => {
+  const parsed = identity.parseStrictUnattendedControlSource(strictSource);
+  assert.deepEqual(parsed, strictSource);
+  assert.ok(Object.isFrozen(parsed));
+  assert.notEqual(parsed, strictSource);
+  assert.equal(identity.strictUnattendedControlSourceMatches(rawSource, parsed), true);
+  for (const value of [null, undefined, false, 1, 'source', [], {}, {version: 2},
+    {...strictSource, updatedAt: 'not-a-date'}, Object.create(strictSource)]) {
+    assert.equal(identity.parseStrictUnattendedControlSource(value), null);
+  }
+});
+
+for (const field of ['requestId', 'attemptId', 'updatedAt', 'agentScopeId']) {
+  test(`strict source rejects missing, coerced, inherited and getter ${field}`, () => {
+    for (const value of ['', ' ', null, undefined, 1, {}, ` ${strictSource[field]}`]) {
+      assert.equal(identity.parseStrictUnattendedControlSource({...strictSource, [field]: value}), null);
+    }
+    const absent = {...strictSource};
+    delete absent[field];
+    Object.setPrototypeOf(absent, {[field]: strictSource[field]});
+    assert.equal(identity.parseStrictUnattendedControlSource(absent), null);
+    Object.defineProperty(absent, field, {get() {throw new Error('must not invoke accessor');}});
+    assert.equal(identity.parseStrictUnattendedControlSource(absent), null);
+  });
+}
+
+for (const field of ['id', 'attemptId', 'updatedAt', 'cloudAgentScopeId']) {
+  test(`strict stored source rejects changed or synthesized ${field}`, () => {
+    assert.equal(identity.strictUnattendedControlSourceMatches({...rawSource, [field]: 'replacement'}, strictSource), false);
+    const absent = {...rawSource};
+    delete absent[field];
+    assert.equal(identity.strictUnattendedControlSourceMatches(absent, strictSource), false);
+    Object.setPrototypeOf(absent, {[field]: rawSource[field]});
+    assert.equal(identity.strictUnattendedControlSourceMatches(absent, strictSource), false);
+  });
+}
+
+test('strict lock requires all seven own fields; the old attemptless rule stays separate', () => {
+  assert.deepEqual(identity.buildStrictCaptureExecutionLockIdentity(lock), lock);
+  assert.equal(identity.strictCaptureExecutionLockMatches(lock, {...lock}), true);
+  for (const field of Object.keys(lock)) {
+    const absent = {...lock};
+    delete absent[field];
+    assert.equal(identity.buildStrictCaptureExecutionLockIdentity(absent), null, field);
+    assert.equal(identity.strictCaptureExecutionLockMatches(lock, absent), false, field);
+    assert.equal(identity.strictCaptureExecutionLockMatches(absent, lock), false, field);
+    const changed = {...lock, [field]: field === 'holderTabId' ? 99 : 'replacement'};
+    assert.equal(identity.strictCaptureExecutionLockMatches(lock, changed), false, field);
+  }
+  for (const value of [null, false, {}, [], {holderTabId: '41'}, {...lock, holderTabId: '41'}]) {
+    assert.equal(identity.buildStrictCaptureExecutionLockIdentity(value), null);
+  }
+  assert.equal(identity.strictCaptureExecutionLockMatches(null, null), false);
+  assert.equal(isCaptureExecutionLockOwnedByUnattendedAttempt({...lock, captureTaskAttemptId: ''}, request), true);
+  assert.equal(identity.strictCaptureExecutionLockMatches({...lock, captureTaskAttemptId: ''}, lock), false);
 });
 
 test("tab identity selects the first positive safe integer, including a serialized tab number", () => {

@@ -1093,8 +1093,130 @@ async function archiveUnattendedKeywordRunRequest(request) {
   });
 }
 
-async function removeArchivedUnattendedKeywordRunRequest(requestId) {
+function strictUnattendedControlRejection(reason) {
+  return {
+    accepted: false, persisted: false, reason,
+    request: null, plan: null, ledger: null,
+  };
+}
+
+// This is a storage fence only, NOT a permission provider or an executable UI
+// command. Its raw source must not pass through legacy attempt/scope synthesis.
+function captureStrictUnattendedControlSource(value) {
+  return globalThis.OnStarvoiceCaptureExecutionIdentity
+    ?.parseStrictUnattendedControlSource(value) || null;
+}
+
+function strictUnattendedStoredSourceMatches(request, expected) {
+  return globalThis.OnStarvoiceCaptureExecutionIdentity
+    ?.strictUnattendedControlSourceMatches(request, expected) === true;
+}
+
+// Strict commands are deliberately not enabled until C supplies current trusted
+// command permissions and the full content/resource/runner chain is fenced.
+// A token, cached verified flag or caller-supplied permission is not that proof.
+function rejectUnavailableStrictUnattendedControl(message) {
+  const source = captureStrictUnattendedControlSource(message?.strictControl);
+  const reason = !source || message?.requestId !== source.requestId
+    ? 'strict_source_invalid'
+    : 'strict_permission_provider_unavailable';
+  return {
+    ok: false, accepted: false, reason, data: null,
+    strictControl: {version: 1, accepted: false, reason},
+  };
+}
+
+// Internal, offline-validated metadata primitive; not a stop, recovery, resource
+// release or permission check. No production caller supplies this capability.
+// Acquire U here (never call while holding U), then the existing ledger queue.
+async function persistStrictUnattendedTerminalMetadata(request, {strictSource} = {}) {
+  const expected = captureStrictUnattendedControlSource(strictSource);
+  const candidate = expected && captureStrictUnattendedControlSource({
+    version: 1, requestId: request?.id, attemptId: request?.attemptId,
+    updatedAt: request?.updatedAt, agentScopeId: request?.cloudAgentScopeId,
+  });
+  if (!candidate || candidate.requestId !== expected.requestId ||
+      candidate.attemptId !== expected.attemptId || candidate.agentScopeId !== expected.agentScopeId ||
+      Date.parse(candidate.updatedAt) <= Date.parse(expected.updatedAt) ||
+      !isTerminalUnattendedRunStatus(request.status) || request.status === 'needs_action' ||
+      request.recoveryDismissedAt !== candidate.updatedAt ||
+      typeof request.recoveryDismissedMessage !== 'string') {
+    return strictUnattendedControlRejection('strict_source_invalid');
+  }
+  const patch = Object.freeze({updatedAt: candidate.updatedAt,
+    recoveryDismissedAt: candidate.updatedAt,
+    recoveryDismissedMessage: request.recoveryDismissedMessage});
+  const expectedStatus = request.status;
+  const persist = () => runUnattendedRunMutation(() => runTaskLedgerMutation(async () => {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.unattendedKeywordRunRequest, STORAGE_KEYS.taskLedger, STORAGE_KEYS.auth,
+    ]);
+    const current = stored[STORAGE_KEYS.unattendedKeywordRunRequest];
+    const ledger = stored[STORAGE_KEYS.taskLedger];
+    const matches = Array.isArray(ledger?.runs)
+      ? ledger.runs.filter((run) => run?.id === expected.requestId) : [];
+    const run = matches.length === 1 ? matches[0] : null;
+    if (!strictUnattendedStoredSourceMatches(current, expected) ||
+        stored[STORAGE_KEYS.auth]?.captureAgent?.id !== expected.agentScopeId ||
+        current.status !== expectedStatus || !run || run.status !== expectedStatus ||
+        run.attemptId !== expected.attemptId || run.updatedAt !== expected.updatedAt ||
+        run.metadata?.cloudAgentScopeId !== expected.agentScopeId) {
+      return strictUnattendedControlRejection('strict_source_changed');
+    }
+    const nextRequest = {...current, ...patch};
+    // Other tasks may have advanced the shared ledger more recently than this
+    // target. Advancing the target version must never rewind the global ledger.
+    const ledgerUpdatedAt = Date.parse(ledger.updatedAt) > Date.parse(patch.updatedAt)
+      ? ledger.updatedAt : patch.updatedAt;
+    const nextLedger = {...ledger, updatedAt: ledgerUpdatedAt,
+      runs: ledger.runs.map((item) => item === run ? {...item, updatedAt: patch.updatedAt} : item)};
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.unattendedKeywordRunRequest]: nextRequest,
+      [STORAGE_KEYS.taskLedger]: nextLedger,
+    });
+    return {accepted: true, persisted: true, reason: 'strict_terminal_metadata_persisted',
+      request: nextRequest, ledger: nextLedger, plan: null};
+  }));
+  // Reserve restoration itself writes later. This kernel deliberately does not
+  // use that legacy wrapper: at most one retry, with fresh U + ledger reads.
+  try {
+    return await persist();
+  } catch (error) {
+    if (!controlStorageReserveApi.isStorageQuotaError(error)) throw error;
+    return await persist();
+  }
+}
+
+async function removeArchivedUnattendedKeywordRunRequest(requestId, options = {}) {
+  const strict = Object.hasOwn(options, 'strictSource');
+  const expected = strict ? captureStrictUnattendedControlSource(options.strictSource) : null;
+  if (strict && (!expected || requestId !== expected.requestId)) {
+    return strictUnattendedControlRejection('strict_source_invalid');
+  }
   return await runUnattendedRunArchiveMutation(async () => {
+    if (strict) {
+      const stored = await chrome.storage.local.get([
+        STORAGE_KEYS.unattendedKeywordRunArchive, STORAGE_KEYS.auth,
+      ]);
+      const archive = stored[STORAGE_KEYS.unattendedKeywordRunArchive];
+      const requests = archive?.requests;
+      const source = requests && Object.hasOwn(requests, expected.requestId)
+        ? requests[expected.requestId] : null;
+      if (archive?.agentScopeId !== expected.agentScopeId ||
+          stored[STORAGE_KEYS.auth]?.captureAgent?.id !== expected.agentScopeId ||
+          !strictUnattendedStoredSourceMatches(source, expected)) {
+        return strictUnattendedControlRejection('strict_source_changed');
+      }
+      // Preserve every unrelated raw entry, including old/unknown formats.
+      const nextRequests = {...requests};
+      delete nextRequests[expected.requestId];
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.unattendedKeywordRunArchive]: {
+          ...archive, requests: nextRequests, updatedAt: new Date().toISOString(),
+        },
+      });
+      return {accepted: true, persisted: true, removed: true, reason: 'strict_archive_removed'};
+    }
     const normalizedRequestId = String(requestId || '').trim();
     if (!normalizedRequestId) return false;
     const archive = await readUnattendedKeywordRunArchive();
@@ -12159,6 +12281,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:recover-unattended-keyword-run') {
+        if (Object.hasOwn(message, 'strictControl')) {
+          sendResponse(rejectUnavailableStrictUnattendedControl(message));
+          return;
+        }
         const result = await manuallyRecoverUnattendedKeywordRun({
           requestId: String(message?.requestId || '').trim(),
           mode: String(message?.mode || 'remaining').trim(),
@@ -12173,6 +12299,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:cancel-unattended-keyword-run') {
+        if (Object.hasOwn(message, 'strictControl')) {
+          sendResponse(rejectUnavailableStrictUnattendedControl(message));
+          return;
+        }
         const reason =
           String(message?.message || '').trim() ||
           '用户手动中止当前采集任务';

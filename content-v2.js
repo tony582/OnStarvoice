@@ -2113,6 +2113,28 @@ async function handleCaptureComments(request, sendResponse) {
  */
 function handleCancelCapture(request, sendResponse) {
   try {
+    if (Object.prototype.hasOwnProperty.call(request || {}, "strictControl")) {
+      // The legacy tracker omits unnamed invocations and has no document/Attempt
+      // ownership. A matching capture ID, list overlay, or activeCount === 1
+      // therefore cannot prove exclusive ownership of the page-wide cancelFlag.
+      // Until lifecycle identity is available, every explicit strict envelope
+      // (including malformed/unknown versions) must fail before any legacy read
+      // or cancellation effect. Callers must not retry with a legacy message.
+      sendResponse({
+        ok: false,
+        matched: false,
+        strictControl: {
+          version: 1,
+          accepted: false,
+          reason: "CONTENT_ACTIVITY_IDENTITY_UNPROVEN",
+        },
+        error: {
+          code: "STRICT_CONTENT_CONTROL_REJECTED",
+          message: "当前页面尚不能核验独占采集身份，未执行严格取消",
+        },
+      });
+      return;
+    }
     const targetRequestId = String(request?.captureRequestId || "").trim();
     const listCaptureRunId = normalizeListCaptureRunId(
       request?.listCaptureRunId,

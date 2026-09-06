@@ -7,6 +7,7 @@
       relayToContentWithRetry,
       resolveCaptureTaskTabId,
       setTimeout,
+      STORAGE_KEYS,
       taskRuntimeApi,
       writeRuntimeState,
     } = ports;
@@ -179,6 +180,48 @@
       reason,
       debugSnapshot = null,
     } = {}) {
+      // STRICT_RESOURCE_FENCE_BEGIN: the pinned legacy tail below is unchanged.
+      if (Object.hasOwn(arguments[0] || {}, 'strictResources')) {
+        const reject = () => ({released: false, observed: false, rejected: true,
+          strict: true, mutated: false, reason: 'strict_resource_inspection_unavailable'});
+        if (
+          typeof chrome?.storage?.local?.get !== 'function' ||
+          typeof STORAGE_KEYS?.runtime !== 'string' || !STORAGE_KEYS.runtime ||
+          typeof taskRuntimeApi.snapshotStrictResourceExpectation !== 'function' ||
+          typeof taskRuntimeApi.inspectStrictResourceAbsence !== 'function' ||
+          typeof state.captureDebugSessionManager?.getSessionByTaskId !== 'function' ||
+          typeof state.captureTaskTabGroupManager?.getTask !== 'function' ||
+          typeof state.captureTaskOwnerCoordinator?.getOwner !== 'function'
+        ) return reject();
+        try {
+          const strictDescriptor = Object.getOwnPropertyDescriptor(arguments[0], 'strictResources');
+          const strictResources = taskRuntimeApi.snapshotStrictResourceExpectation(
+            strictDescriptor && Object.hasOwn(strictDescriptor, 'value') ? strictDescriptor.value : null,
+            taskId,
+          );
+          if (!strictResources) return {...reject(), reason: 'strict_resource_identity_invalid'};
+          // Do not use readRuntimeState: its defaults manufacture an explicit
+          // null from missing persisted evidence. Snapshot the expected target
+          // before this await, and require raw storage's own data field.
+          const stored = await chrome.storage.local.get(STORAGE_KEYS.runtime);
+          const runtimeDescriptor = Object.getOwnPropertyDescriptor(stored, STORAGE_KEYS.runtime);
+          if (!runtimeDescriptor || !Object.hasOwn(runtimeDescriptor, 'value')) return reject();
+          const runtimeSnapshot = runtimeDescriptor.value;
+          // Read in-memory ownership after the await, never from a stale caller
+          // debugSnapshot. This observation performs no cleanup or lock release.
+          return taskRuntimeApi.inspectStrictResourceAbsence({
+            taskId, strictResources, runtimeSnapshot,
+            debugSnapshot: state.captureDebugSessionManager.getSessionByTaskId(taskId),
+            groupSnapshot: state.captureTaskTabGroupManager.getTask(taskId),
+            ownerSnapshot: state.captureTaskOwnerCoordinator.getOwner(taskId),
+            pendingWorkerTabIds: state.captureTaskPendingWorkerTabIds.get(taskId) || [],
+            cleanupInProgress: state.captureTaskCleanupInProgress.has(taskId),
+          });
+        } catch {
+          return reject();
+        }
+      }
+      // STRICT_RESOURCE_FENCE_END
       const activeDebugSnapshot =
         debugSnapshot || state.captureDebugSessionManager.getSessionByTaskId(taskId);
       const groupSnapshot = state.captureTaskTabGroupManager.getTask(taskId);

@@ -30,6 +30,87 @@
       );
     }
 
+    function snapshotStrictResourceExpectation(value, taskId) {
+      const fields = [
+        "version", "taskId", "attemptId", "runId", "debug", "group",
+        "owner", "runtime", "workerTabIds",
+      ];
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const expected = {};
+      try {
+        for (const key of fields) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, key);
+          if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
+          expected[key] = descriptor.value;
+        }
+        const workersLength = Array.isArray(expected.workerTabIds)
+          ? Object.getOwnPropertyDescriptor(expected.workerTabIds, "length")
+          : null;
+        if (!workersLength || workersLength.value !== 0) return null;
+      } catch {
+        return null;
+      }
+      if (
+        expected.version !== 1 ||
+        !["taskId", "attemptId", "runId"].every((key) =>
+          typeof expected[key] === "string" && expected[key].trim() === expected[key] &&
+          expected[key].length > 0,
+        ) ||
+        expected.taskId !== taskId ||
+        expected.debug !== null || expected.group !== null ||
+        expected.owner !== null || expected.runtime !== null
+      ) return null;
+      return Object.freeze({...expected, workerTabIds: Object.freeze([])});
+    }
+
+    // A pure, task-scoped resource observation, not permission to mutate or a
+    // lease spanning awaits, and not proof that every page has no collection.
+    // Native detach/ungroup/remove have no atomic document identity condition.
+    function inspectStrictResourceAbsence({
+      taskId,
+      strictResources,
+      debugSnapshot,
+      groupSnapshot,
+      ownerSnapshot,
+      runtimeSnapshot,
+      pendingWorkerTabIds,
+      cleanupInProgress,
+    } = {}) {
+      const reject = (reason) => ({
+        observed: false, released: false, rejected: true,
+        strict: true, mutated: false, reason,
+      });
+      const expected = snapshotStrictResourceExpectation(strictResources, taskId);
+      if (!expected) return reject("strict_resource_identity_invalid");
+      if (
+        !runtimeSnapshot || typeof runtimeSnapshot !== "object" ||
+        Array.isArray(runtimeSnapshot) || !Array.isArray(pendingWorkerTabIds) ||
+        typeof cleanupInProgress !== "boolean" ||
+        debugSnapshot === undefined || groupSnapshot === undefined ||
+        ownerSnapshot === undefined
+      ) return reject("strict_resource_inspection_unavailable");
+      let runtimeSession;
+      try {
+        runtimeSession = Object.getOwnPropertyDescriptor(runtimeSnapshot, "captureDebugSession");
+      } catch {
+        return reject("strict_resource_inspection_unavailable");
+      }
+      if (!runtimeSession || !Object.hasOwn(runtimeSession, "value") ||
+          runtimeSession.value === undefined) {
+        return reject("strict_resource_inspection_unavailable");
+      }
+      if (
+        debugSnapshot !== null || groupSnapshot !== null || ownerSnapshot !== null ||
+        runtimeSession.value !== null ||
+        pendingWorkerTabIds.length !== 0 || cleanupInProgress
+      ) return reject("strict_active_resource_cleanup_unavailable");
+      return {
+        observed: true, released: false, rejected: false,
+        strict: true, mutated: false, reason: "strict_resources_absent",
+        taskId, attemptId: expected.attemptId, runId: expected.runId,
+      };
+    }
+
     function isBenignTabRemovalError(error) {
       const message = String(error?.message || error || "");
       return /no tab with id|not found|does not exist|invalid tab id/iu.test(
@@ -41,6 +122,10 @@
       workerTabIds,
       {removeTab, attempts = 2, retryDelayMs = 120, wait = null} = {},
     ) {
+      if (Object.hasOwn(arguments[1] || {}, "strictResources")) {
+        return {released: false, rejected: true, strict: true, mutated: false,
+          reason: "strict_document_bound_tab_removal_unavailable"};
+      }
       if (typeof removeTab !== "function") {
         throw new TypeError("removeTab must be a function");
       }
@@ -137,6 +222,10 @@
       endGroup,
       closeWorkerTabs,
     } = {}) {
+      if (Object.hasOwn(arguments[0] || {}, "strictResources")) {
+        return {released: false, rejected: true, strict: true, mutated: false,
+          reason: "strict_active_resource_cleanup_unavailable"};
+      }
       if (typeof stopDebug !== "function") {
         throw new TypeError("stopDebug must be a function");
       }
@@ -182,6 +271,8 @@
     return Object.freeze({
       collectWorkerTabIds,
       debugOwnershipReleased,
+      snapshotStrictResourceExpectation,
+      inspectStrictResourceAbsence,
       closeWorkerTabsIndividually,
       publishCancellationFailSoft,
       endTaskResources,

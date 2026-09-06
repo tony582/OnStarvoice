@@ -44,6 +44,14 @@
       inspection,
       {reason = 'unattended_wrapper_cleanup', debugSnapshot = null} = {},
     ) {
+      // STRICT_RESOURCE_FENCE_BEGIN: the pinned legacy tail below is unchanged.
+      if (Object.hasOwn(arguments[1] || {}, 'strictResources')) {
+        return await releaseCaptureTaskResourcesWithRetry({
+          taskId: inspection?.taskId, reason,
+          strictResources: arguments[1].strictResources,
+        }, {attempts: 1});
+      }
+      // STRICT_RESOURCE_FENCE_END
       if (!inspection?.unattended || !inspection?.taskId) {
         return {released: false, reason: 'not_unattended_stable_task'};
       }
@@ -278,6 +286,14 @@
         preserveLockBinding = false,
       } = {},
     ) {
+      // STRICT_RESOURCE_FENCE_BEGIN: the pinned legacy tail below is unchanged.
+      if (Object.hasOwn(arguments[1] || {}, 'strictResources')) {
+        return await releaseCaptureTaskResourcesWithRetry({
+          taskId: lock?.captureTaskId, reason,
+          strictResources: arguments[1].strictResources,
+        }, {attempts: 1});
+      }
+      // STRICT_RESOURCE_FENCE_END
       // Recovery can clear the persisted lock binding before every asynchronous
       // Debug/group/worker cleanup callback has finished.  The replacement runner
       // still uses the stable request task id, so an empty captureTaskId must not
