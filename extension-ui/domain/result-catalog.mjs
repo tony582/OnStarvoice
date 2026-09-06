@@ -2,6 +2,7 @@ import { exactRecordId } from './record-id.mjs';
 import { exactReadIdentity } from './read-identity.mjs';
 import { readScope, readQuery } from './read-contract.mjs';
 import { presentResult } from './result-presenter.mjs';
+import { RESULT_FILTERS, matchesResultFilter } from './result-review.mjs';
 
 const ABSENT = Symbol('absent');
 const TEXT_FIELDS = { title: 180, author: 80, summary: 240 };
@@ -89,8 +90,9 @@ export function buildResultCatalog(manifest) {
   const length = own(entries, 'length', true);
   if (!Number.isSafeInteger(length) || length < 0 || length > MAX_ENTRIES) return invalid();
   const identities = new Map();
-  const all = [];
-  const attention = [];
+  const indexes = new Map(RESULT_FILTERS.map(filter => [filter, []]));
+  const all = indexes.get('all');
+  const attention = indexes.get('attention');
   for (let index = 0; index < length; index += 1) {
     const entry = own(entries, String(index), true);
     const recordId = exactRecordId(own(entry, 'recordId'));
@@ -98,11 +100,12 @@ export function buildResultCatalog(manifest) {
     if (!recordId || recordVersion === null || identities.has(recordId)) return invalid();
     const summary = copySummary(own(entry, 'summary'), recordId);
     identities.set(recordId, Object.freeze({ recordId, recordVersion }));
-    all.push(summary);
-    if (presentResult(summary).needsAttention) attention.push(summary);
+    const projected = presentResult(summary);
+    for (const [filter, entries] of indexes) {
+      if (matchesResultFilter(projected, filter)) entries.push(summary);
+    }
   }
-  Object.freeze(all);
-  Object.freeze(attention);
+  for (const entries of indexes.values()) Object.freeze(entries);
 
   return Object.freeze({
     scope,
@@ -111,7 +114,7 @@ export function buildResultCatalog(manifest) {
     readPage(value) {
       const query = readQuery(value);
       if (!query) return invalid();
-      const matching = query.filter === 'attention' ? attention : all;
+      const matching = indexes.get(query.filter);
       const items = Object.freeze(matching.slice(query.offset, query.offset + query.limit));
       return Object.freeze({
         scope,

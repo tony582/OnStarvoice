@@ -1,4 +1,5 @@
 import { exactRecordId } from './record-id.mjs';
+import { reviewResultSignals } from './result-review.mjs';
 
 // Independent StarVoice presentation contract: values are text, never markup or actions.
 const UNREADABLE = Symbol('unreadable');
@@ -112,7 +113,10 @@ export function presentResult(record) {
   const platform = read(record, 'platform');
   const capture = captureState(read(read(record, 'capture'), 'status'));
   const deliveryValue = read(record, 'delivery');
-  const delivery = deliveryState(read(deliveryValue, 'remote'), read(deliveryValue, 'local'), read(record, 'reconciliationRequired'));
+  const remote = read(deliveryValue, 'remote');
+  const local = read(deliveryValue, 'local');
+  const reconciliation = read(record, 'reconciliationRequired');
+  const delivery = deliveryState(remote, local, reconciliation);
   return {
     id,
     title: text(read(record, 'title'), LIMITS.title, kind === 'profile' ? '未命名作者主页' : '未命名内容'),
@@ -124,6 +128,7 @@ export function presentResult(record) {
     capture,
     delivery,
     needsAttention: !id || !['pending', 'running', 'completed'].includes(capture.key) || ['warning', 'danger'].includes(delivery.tone),
+    review: reviewResultSignals(id, capture.key, remote, local, reconciliation),
   };
 }
 

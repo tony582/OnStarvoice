@@ -1,6 +1,7 @@
 import { exactRecordId } from './record-id.mjs';
 import { exactReadIdentity } from './read-identity.mjs';
 import { presentResult, presentResultDetail } from './result-presenter.mjs';
+import { RESULT_FILTERS, matchesResultFilter } from './result-review.mjs';
 
 // Proposed read-side envelope only. Matching these fields is not authorization.
 const ABSENT = Symbol('absent');
@@ -55,7 +56,7 @@ export function readQuery(value = undefined) {
   const filter = supplied.filter === ABSENT ? 'all' : supplied.filter;
   const offset = supplied.offset === ABSENT ? 0 : supplied.offset;
   const limit = supplied.limit === ABSENT ? 50 : supplied.limit;
-  if ((filter !== 'all' && filter !== 'attention') || !count(offset) || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) return null;
+  if (!RESULT_FILTERS.includes(filter) || !count(offset) || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) return null;
   return Object.freeze({ filter, offset, limit });
 }
 
@@ -80,7 +81,10 @@ export function decodeResultPage(response, expectedScope, query) {
   const all = own(sourceCounts, 'all');
   const attention = own(sourceCounts, 'attention');
   const matching = own(sourceCounts, 'matching');
-  if (![all, attention, matching].every(count) || attention > all || matching !== (request.filter === 'attention' ? attention : all)) return null;
+  if (![all, attention, matching].every(count) || attention > all || matching > all) return null;
+  // New review filters are overlapping subsets of the unchanged legacy attention set.
+  if (request.filter === 'all' ? matching !== all :
+    request.filter === 'attention' ? matching !== attention : matching > attention) return null;
   const sourceItems = own(response, 'items');
   try { if (!Array.isArray(sourceItems)) return null; } catch { return null; }
   const length = own(sourceItems, 'length', true);
@@ -92,7 +96,7 @@ export function decodeResultPage(response, expectedScope, query) {
     if (!object(sourceItem)) return null;
     const item = presentResult(sourceItem);
     if (item.needsAttention) visibleAttention += 1;
-    else if (request.filter === 'attention') return null;
+    if (!matchesResultFilter(item, request.filter)) return null;
     items.push(item);
   }
   // These are necessary page-local constraints, not verification of unseen rows.
