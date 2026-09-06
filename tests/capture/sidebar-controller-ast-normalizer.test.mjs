@@ -24,6 +24,11 @@ test('AST dependencies come from the existing locked admin installation without 
   for (const name of ['espree', 'eslint-scope']) {
     assert.equal(requireAdmin(`${name}/package.json`).version, lock.packages[`node_modules/${name}`].version, name);
   }
+  const workflow = readFileSync(new URL('.github/workflows/ci.yml', root), 'utf8');
+  const compatibility = workflow.match(/^  production-runtime-compatibility:\n([\s\S]*?)(?=^  [\w-]+:|$(?![\s\S]))/mu)?.[1];
+  assert.ok(compatibility, 'the clean production-runtime job must prepare AST tooling');
+  assert.match(compatibility, /node-version-file: \.nvmrc[\s\S]*npm --prefix web\/admin ci --ignore-scripts[\s\S]*node-version: 18\.20\.8[\s\S]*npm --prefix server ci[\s\S]*npm --prefix server test/u);
+  assert.doesNotMatch(compatibility, /continue-on-error|--test-skip-pattern/u);
 });
 
 test('normalizer removes only approved free state-owner qualification and exact named bridge calls', () => {

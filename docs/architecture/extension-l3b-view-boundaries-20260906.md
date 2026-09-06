@@ -41,6 +41,8 @@ L3-A 基点旧 `handleTaskCenterAction` 只拿 action/taskId/raw 历史项；sto
 
 隔离源码已接线，本地最终回归和独立审查通过；源码 `87d0551b975fbbe56df653ad09670112675d73fa` 已普通推送并创建 [Draft PR #57](https://github.com/tony582/OnStarvoice/pull/57)，base 仍为 #56 精确 `2c997709c0a4223784901aeaa461fab46108ba8b`。本次状态补记只改三份计划；最终 head 的 push/PR 两组 CI 单独核验，结果记录在该 PR 正文及任务交付，不能沿用父提交或旧 head。
 
+CI 收口补记：文档 head `63c2e95` 两组各 5/6，Node 18 均因新 AST 测试缺少 `espree` 安装而失败，不能记作通过。本地已有 admin 依赖掩盖了干净 CI 的安装缺口；干净源码目录已复现。最小修正仅为 CI 先用 Node 24 按既有 admin lock 安装测试工具（`--ignore-scripts`），再切回原 Node 18.20.8 安装 server 依赖并执行原完整测试；既有 AST 测试增加准备顺序断言，不减项、不跳过、不改任何 manifest/lock 或运行源码。解析工具的声明引擎为 Node 20 以上，Node 18 实际可用性只由本次完整测试证明，不声称厂商支持；纯 JS 工具不涉及跨 Node 原生构建。干净目录补齐依赖后 Node 18 全量 2,205/2,205，最终修正 head 的远端结果仍须独立核验。
+
 | 职责 | 当前 owner 与边界 | 验证状态 / 尚未完成 |
 | --- | --- | --- |
 | 平台草稿、关键词分析/机会/对标、扩词、计划/run、排序 | `task-controller/keyword-{drafts,analysis,strategy,plan,sort}.js`；30 项任务状态移入 `keyword-state.js`，与原 62 项由同一 controller 实例拥有 | 4 项宿主 live bindings 已退出；草稿控件用冻结会话保留原节点及晚读取时机；仍是旧流程的兼容读口，不是深不可变新 UI DTO |
