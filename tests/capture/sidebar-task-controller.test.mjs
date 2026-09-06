@@ -11,6 +11,8 @@ import {createLegacyCaptureInputsView} from '../../sidebar/legacy-view/capture-i
 import {createLegacyKeywordInputsView} from '../../sidebar/legacy-view/keyword-inputs.js';
 import {createLegacyCaptureProgressView} from '../../sidebar/legacy-view/capture-progress.js';
 import {createLegacyProgressVisibilityView} from '../../sidebar/legacy-view/progress-visibility.js';
+import {createLegacyTaskCenterActions} from '../../sidebar/legacy-application/task-center-actions.js';
+import {createLegacyTaskCenterActionView} from '../../sidebar/legacy-view/task-center-actions.js';
 import {readSidebarFunction, readSidebarFunctionOwner} from '../helpers/sidebar-controller-source.mjs';
 import * as constants from '../../utils/constants.js';
 import {DEFAULT_CAPTURE_SETTINGS} from '../../utils/capture-settings.js';
@@ -252,6 +254,7 @@ function hostHarness(source = hostSource, readyState = 'loading') {
   const context = vm.createContext({...imports, ...constants, DEFAULT_CAPTURE_SETTINGS, KEYWORD_SORT_DIMENSION,
     AUTH_CODE_VIEW_MODE: {ENCRYPTED: 'encrypted'}, createSidebarTaskController,
     createLegacyKeywordView, createLegacyCaptureInputsView, createLegacyKeywordInputsView, createLegacyCaptureProgressView, createLegacyProgressVisibilityView,
+    createLegacyTaskCenterActions, createLegacyTaskCenterActionView,
     HTMLElement: class HTMLElement {}, navigator: {},
     console: silence, URL, URLSearchParams, TextEncoder,
     crypto: {randomUUID: () => 'synthetic-holder'},

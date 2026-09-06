@@ -57,8 +57,11 @@ test('L3-B pins 216 actual single owners without rewriting L3-A evidence or reco
   }
   const host = runtimeSources.find(entry => entry.path === 'sidebar/sidebar-logic.js').source;
   const remaining = [...host.matchAll(/^(?:export )?(?:async )?function\s+(\w+)\s*\(/gmu)].map(match => match[1]).filter(name => originalHostNames.has(name));
-  assert.equal(remaining.length, originalHostNames.size - 216 - 2);
-  assert.equal(remaining.length, 294);
+  // The subsequent legacy-command batch separately migrates this one host
+  // event adapter; keep the original 216 + 2 migration ledger unchanged.
+  assert.equal(readSidebarFunctionOwner('handleTaskCenterAction').path, 'sidebar/legacy-view/task-center-actions.js');
+  assert.equal(remaining.length, originalHostNames.size - 216 - 2 - 1);
+  assert.equal(remaining.length, 293);
 });
 
 test('default CI compares 202 current normalized ASTs to the exact parent hashes and explicitly excludes 14 semantic transitions', () => {
