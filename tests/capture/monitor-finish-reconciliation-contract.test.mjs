@@ -1,3 +1,4 @@
+import {readSidebarControllerSources} from '../helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
@@ -330,5 +331,8 @@ test('monitor prototype cannot dispatch, persist, mutate server state or enter s
   for (const file of ['sidebar/sidebar-logic.js', 'background.js', 'utils/capture-sync.js',
     'utils/api.js', 'server/routes/monitor.js', 'server/services/profile-patrol-dispatch.js']) {
     assert.doesNotMatch(source(file), /monitor-finish-contract\.mjs|planMonitorFinish\s*\(/, file);
+  }
+  for (const {path, source: actual} of readSidebarControllerSources()) {
+    assert.doesNotMatch(actual, /monitor-finish-contract\.mjs|planMonitorFinish\s*\(/, path);
   }
 });

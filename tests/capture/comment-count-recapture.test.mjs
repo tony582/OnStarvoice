@@ -1,3 +1,4 @@
+import {readSidebarControllerSources} from '../helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readCaptureFunction, readCaptureDeliverySources} from '../helpers/capture-delivery-source.mjs';
 import {readFile} from "node:fs/promises";
@@ -26,7 +27,8 @@ const serverSync = await readFile(
 
 test("obsolete comment-count recapture setting stays fully removed", () => {
   for (const source of [sidebarHtml, sidebarLogic, captureSettings, captureSync,
-    ...readCaptureDeliverySources().map(({source}) => source)]) {
+    ...readCaptureDeliverySources().map(({source}) => source),
+    ...readSidebarControllerSources().map(({source}) => source)]) {
     assert.doesNotMatch(source, /comment-count-recheck/);
     assert.doesNotMatch(source, /recaptureCommentsOnCountIncrease/);
     assert.doesNotMatch(source, /RECAPTURE_COMMENTS_ON_COUNT_INCREASE/);

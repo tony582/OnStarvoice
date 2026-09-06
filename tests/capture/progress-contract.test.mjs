@@ -1,7 +1,7 @@
+import {readSidebarFunction, readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
-import vm from "node:vm";
 
 const sidebarSource = await readFile(
   new URL("../../sidebar/sidebar-logic.js", import.meta.url),
@@ -13,6 +13,7 @@ const backgroundSource = await readFile(
 );
 
 function readSection(source, startMarker, endMarker) {
+  if (source === sidebarSource && /function\s+\w+\s*\(/.test(startMarker)) return readSidebarSection(startMarker, endMarker);
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
   const end = source.indexOf(endMarker, start + startMarker.length);
@@ -122,11 +123,7 @@ function evaluateKeywordPlanProgressText() {
 }
 
 function evaluateTerminalProgressPhase() {
-  const source = readSection(
-    sidebarSource,
-    "function isTerminalProgressPhase(phase)",
-    "/**\n * 隐藏进度",
-  );
+  const source = readSidebarFunction('isTerminalProgressPhase');
   const context = {};
   vm.createContext(context);
   vm.runInContext(
@@ -892,7 +889,7 @@ test("terminal progress fences late unattended UI updates without blocking a new
   );
   assert.match(
     showSection,
-    /if \(activeUnattendedRunRequestId\)[\s\S]*unattendedProgressState = "running"[\s\S]*else \{[\s\S]*delete progressContainer\.dataset\.unattendedProgressState/,
+    /if \(sidebarTaskController\.readActiveUnattendedRunRequestId\(\)\)[\s\S]*unattendedProgressState = "running"[\s\S]*else \{[\s\S]*delete progressContainer\.dataset\.unattendedProgressState/,
   );
 
   const planCleanupSection = readSection(

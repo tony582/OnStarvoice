@@ -1,3 +1,4 @@
+import {readSidebarFunction} from './helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
@@ -599,24 +600,27 @@ test('Profile terminal paths keep task rows before subscriptions and executions'
 });
 
 test('extension profile scan reuses monitor execution and renders distinct dark task copy', () => {
-  assert.match(sidebar, /isTargetedProfileDiscoveryWorkflow/u);
-  assert.match(sidebar, /executeMonitorRunItem\(\{/u);
-  assert.match(sidebar, /runnerTabId: targetTabId/u);
-  assert.match(sidebar, /executionPreclaimed:\s*true/u);
-  assert.match(sidebar, /if \(!executionPreclaimed\) \{/u);
+  const targeted = readSidebarFunction('maybeClaimAndRunTargetedPostWorkflow');
+  const monitor = readSidebarFunction('executeMonitorRunItem');
+  assert.match(targeted, /isTargetedProfileDiscoveryWorkflow/u);
+  assert.match(targeted, /executeMonitorRunItem\(\{/u);
+  assert.match(targeted, /runnerTabId: targetTabId/u);
+  assert.match(targeted, /executionPreclaimed:\s*true/u);
+  assert.match(monitor, /if \(!executionPreclaimed\) \{/u);
   assert.match(sidebar, /关注博主作品扫描/u);
   assert.match(sidebar, /官方账号作品发现/u);
   assert.match(sidebar, /扫描当前账号作品/u);
-  assert.match(sidebar, /monitor_execution_not_claimable/u);
-  assert.match(sidebar, /该账号扫描已被其他执行端领取或已结束/u);
+  assert.match(monitor, /monitor_execution_not_claimable/u);
+  assert.match(monitor, /该账号扫描已被其他执行端领取或已结束/u);
 });
 
 test('official comment patrol enhances the selected latest account posts without skipping old records', () => {
   assert.match(sidebar, /scanLatestPostsByCount/u);
   assert.match(sidebar, /MONITOR_LATEST_POSTS_LIMIT_MAX/u);
   assert.match(sidebar, /postsLimit/u);
-  assert.match(sidebar, /正在巡查账号评论/u);
-  assert.match(sidebar, /includeComments:\s*true/u);
-  assert.match(sidebar, /skipAlreadyCaptured:\s*false/u);
-  assert.match(sidebar, /comment_capture_failed/u);
+  const monitor = readSidebarFunction('executeMonitorRunItem');
+  assert.match(monitor, /正在巡查账号评论/u);
+  assert.match(monitor, /includeComments:\s*true/u);
+  assert.match(monitor, /skipAlreadyCaptured:\s*false/u);
+  assert.match(monitor, /comment_capture_failed/u);
 });

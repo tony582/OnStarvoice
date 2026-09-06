@@ -1,7 +1,7 @@
+import {readSidebarFunction, readSidebarSection, readSidebarControllerSources, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import test from 'node:test';
-import vm from 'node:vm';
 import * as policy from '../../prototypes/extension-sync-confirmation/recovery-policy.mjs';
 import {hasSyncReconciliationSignal} from '../../utils/capture/sync-reconciliation-state.js';
 import {projectElasticKeywordRecoveryStatus} from '../../server/modules/capture/application/control-outcome-projection.js';
@@ -21,6 +21,7 @@ const sidebarSource = readFileSync(new URL('../../sidebar/sidebar-logic.js', imp
 const monitorRouteSource = readFileSync(new URL('../../server/routes/monitor.js', import.meta.url), 'utf8');
 
 function uniqueRange(source, startMarker, endMarker) {
+  if (source === sidebarSource && /function\s+\w+\s*\(/.test(startMarker)) return readSidebarSection(startMarker, endMarker);
   const start = source.indexOf(startMarker);
   assert.ok(start >= 0, `source marker exists: ${startMarker}`);
   assert.equal(source.indexOf(startMarker, start + 1), -1, `source marker is unique: ${startMarker}`);
@@ -31,7 +32,7 @@ function uniqueRange(source, startMarker, endMarker) {
 
 const monitorSyncSummarySource = uniqueRange(sidebarSource,
   'function summarizeMonitorSyncResult(', 'function getShanghaiDayStartMs(');
-const monitorOutcomeSource = uniqueRange(sidebarSource,
+const monitorOutcomeSource = uniqueRange(readSidebarFunction('executeMonitorRunItem'),
   '    const syncStats = summarizeMonitorSyncResult(syncResult);',
   '    const errorMessage = hasCommentCaptureFailure');
 const monitorFinishRouteSource = uniqueRange(monitorRouteSource,
@@ -213,6 +214,9 @@ test('recovery prototype remains disconnected from runtime entry points and cann
     '../../server/modules/capture/application/control-outcome-projection.js', '../../server/routes/monitor.js']) {
     const source = readFileSync(new URL(file, import.meta.url), 'utf8');
     assert.doesNotMatch(source, /recovery-policy\.mjs|projectSyncReconciliationRecovery\s*\(/, file);
+  }
+  for (const {path, source} of readSidebarControllerSources()) {
+    assert.doesNotMatch(source, /recovery-policy\.mjs|projectSyncReconciliationRecovery\s*\(/, path);
   }
   const prototypeSource = readFileSync(new URL('../../prototypes/extension-sync-confirmation/recovery-policy.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(prototypeSource, /\b(?:fetch|setTimeout|setInterval|markRecordSynced|updateRecord|setDataPool|createRecordSyncQueue)\s*\(/);

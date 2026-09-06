@@ -1,3 +1,4 @@
+import {readSidebarFunction} from './helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test, {after} from "node:test";
@@ -12570,27 +12571,18 @@ test("the unattended supervisor alarm is installed as a one-minute heartbeat", a
 test("sidebar acquisition fails closed when background messaging fails", () => {
   return readFile(resolve(repoRoot, "sidebar/sidebar-logic.js"), "utf8").then(
     (source) => {
-      const acquireBlock = source.slice(
-        source.indexOf("async function acquireCaptureExecutionLock"),
-        source.indexOf("function stopCaptureExecutionLockHeartbeat"),
-      );
+      const acquireBlock = readSidebarFunction('acquireCaptureExecutionLock');
       assert.doesNotMatch(acquireBlock, /degraded\s*:\s*true/);
       assert.match(acquireBlock, /return null;/);
-      assert.match(source, /onstarvoice:renew-capture-lock/);
-      const lostLockBlock = source.slice(
-        source.indexOf("function handleCaptureExecutionLockLost"),
-        source.indexOf("async function renewCaptureExecutionLock"),
-      );
+      assert.match(readSidebarFunction('renewCaptureExecutionLock'), /onstarvoice:renew-capture-lock/);
+      const lostLockBlock = readSidebarFunction('handleCaptureExecutionLockLost');
       assert.match(lostLockBlock, /setCancelFlag\(true\)/);
       assert.match(lostLockBlock, /detailBatchCancelRequested\s*=\s*true/);
       assert.match(
         lostLockBlock,
         /requestCaptureCancelSignal\(relayTabId\)/,
       );
-      const runnerResolverBlock = source.slice(
-        source.indexOf("function resolveCaptureExecutionLockRunnerTabId"),
-        source.indexOf("function handleCaptureExecutionLockLost"),
-      );
+      const runnerResolverBlock = readSidebarFunction('resolveCaptureExecutionLockRunnerTabId');
       assert.ok(
         runnerResolverBlock.indexOf("detailBatchRunnerTabId") <
           runnerResolverBlock.indexOf("activeBatchRunnerTabId"),
@@ -12598,12 +12590,9 @@ test("sidebar acquisition fails closed when background messaging fails", () => {
       assert.match(acquireBlock, /captureExecutionLockReleasePendingId/);
       assert.match(
         acquireBlock,
-        /await releaseCaptureExecutionLock\(\s*captureExecutionLockReleasePendingId/,
+        /await releaseCaptureExecutionLock\(\s*controllerState\.captureExecutionLockReleasePendingId/,
       );
-      const releaseBlock = source.slice(
-        source.indexOf("async function releaseCaptureExecutionLock"),
-        source.indexOf("function getUnattendedRunRequestIdFromUrl"),
-      );
+      const releaseBlock = readSidebarFunction('releaseCaptureExecutionLock');
       assert.match(releaseBlock, /for \(const delayMs of \[0, 120, 360\]\)/);
       assert.match(releaseBlock, /captureExecutionLockReleasePendingId = lockId/);
       assert.doesNotMatch(releaseBlock, /finally \{/);

@@ -1,7 +1,7 @@
+import {readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
-import vm from "node:vm";
 import {runEnhancementWithSingleRetry} from "../../utils/capture/enhancement-retry.js";
 
 const sidebarSource = await readFile(
@@ -13,6 +13,7 @@ const WINDOW_START_MS = Date.parse("2026-07-22T00:00:00+08:00");
 const WINDOW_END_MS = Date.parse("2026-07-29T00:00:00+08:00");
 
 function readSourceSection(source, startMarker, endMarker) {
+  if (source === sidebarSource && /function\s+\w+\s*\(/.test(startMarker)) return readSidebarSection(startMarker, endMarker);
   const start = source.indexOf(startMarker);
   assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
   const end = source.indexOf(endMarker, start + startMarker.length);

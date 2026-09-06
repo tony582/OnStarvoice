@@ -1,3 +1,4 @@
+import {readSidebarFunction} from './helpers/sidebar-controller-source.mjs';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
@@ -133,7 +134,7 @@ test('Extension advertises and executes watched-content patrol through the share
   assert.match(background, /workflow === 'watched_content_patrol'/u);
   assert.match(background, /title: String\(request\?\.title \|\| ''\)\.trim\(\) \|\| '关注内容巡查'/u);
   assert.match(sidebar, /normalized === "watched_content_patrol"/u);
-  assert.match(sidebar, /"negative_post_patrol",\s*"watched_content_patrol"/u);
+  assert.match(readSidebarFunction('maybeClaimAndRunTargetedPostWorkflow'), /"negative_post_patrol",\s*"watched_content_patrol"/u);
 });
 
 test('admin exposes watched content as a scope and groups both patrol handoffs in the batch bar', async () => {

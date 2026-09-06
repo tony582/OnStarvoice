@@ -1,3 +1,4 @@
+import {readSidebarFunction, assertSidebarRuntimeDoesNotMatch} from './helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
@@ -660,12 +661,12 @@ test("round-level orchestration cannot start a second enhancement retry budget",
     new URL("../sidebar/sidebar-logic.js", import.meta.url),
     "utf8",
   );
-  assert.doesNotMatch(
+  assertSidebarRuntimeDoesNotMatch(
     source,
     /retryFailedEnhancementsAfterRound|collectFailedEnhanceRecordIds/,
-    "all enhancement retries must stay inside runEnhancementWithSingleRetry",
   );
-  assert.match(source, /runEnhancementWithSingleRetry\(\{/);
+  assert.match(readSidebarFunction('runDetailCaptureForRecordIds'), /runEnhancementWithSingleRetry\(\{/);
+  assert.match(readSidebarFunction('executeMonitorRunItem'), /runEnhancementWithSingleRetry\(\{/);
 });
 
 test("a stale attempt never emits an unscoped content cancel that can hit its successor", async () => {
@@ -673,11 +674,7 @@ test("a stale attempt never emits an unscoped content cancel that can hit its su
     new URL("../sidebar/sidebar-logic.js", import.meta.url),
     "utf8",
   );
-  const start = source.indexOf("function stopRejectedUnattendedAttempt");
-  const end = source.indexOf("async function reportUnattendedKeywordRun", start);
-  const functionSource = source.slice(start, end);
-
-  assert.ok(start >= 0 && end > start);
+  const functionSource = readSidebarFunction('stopRejectedUnattendedAttempt');
   assert.doesNotMatch(functionSource, /requestCaptureCancelSignal/);
   assert.match(functionSource, /batchKeywordCancelRequested = true/);
 });
@@ -687,13 +684,12 @@ test("content capture progress refreshes the active unattended business clock", 
     new URL("../sidebar/sidebar-logic.js", import.meta.url),
     "utf8",
   );
-  const handlerStart = source.indexOf("function handleProgress(progress)");
-  const handlerEnd = source.indexOf("\n}", handlerStart) + 2;
-  const handlerSource = source.slice(handlerStart, handlerEnd);
+  const handlerSource = readSidebarFunction('handleProgress');
 
-  assert.match(source, /function reportActiveUnattendedContentProgress/);
+  const reporter = readSidebarFunction('reportActiveUnattendedContentProgress');
+  assert.match(reporter, /function reportActiveUnattendedContentProgress/);
   assert.match(handlerSource, /reportActiveUnattendedContentProgress\(progress\)/);
-  assert.match(source, /progressSeq: activeUnattendedProgressSeq/);
+  assert.match(reporter, /progressSeq: controllerState\.activeUnattendedProgressSeq/);
 });
 
 test("unattended lock loss never emits an unscoped cancel into a successor attempt", async () => {
@@ -701,11 +697,9 @@ test("unattended lock loss never emits an unscoped cancel into a successor attem
     new URL("../sidebar/sidebar-logic.js", import.meta.url),
     "utf8",
   );
-  const start = source.indexOf("function handleCaptureExecutionLockLost");
-  const end = source.indexOf("async function renewCaptureExecutionLock", start);
-  const functionSource = source.slice(start, end);
+  const functionSource = readSidebarFunction('handleCaptureExecutionLockLost');
 
-  assert.match(functionSource, /if \(!activeUnattendedRunRequestId\)/);
+  assert.match(functionSource, /if \(!controllerState\.activeUnattendedRunRequestId\)/);
   assert.match(functionSource, /requestCaptureCancelSignal/);
 });
 
@@ -715,12 +709,12 @@ test("attempt replacement between navigation and delegation stops before batch c
     "utf8",
   );
   assert.match(
-    source,
+    readSidebarFunction('runUnattendedKeywordPlanRequest'),
     /const delegatedReport = await reportUnattendedKeywordRun[\s\S]*if \(!delegatedReport\?\.accepted\)/,
   );
   assert.match(
-    source,
-    /executionLockOwner === "unattended_keyword_plan" &&\s*activeUnattendedAttemptRejected/,
+    readSidebarFunction('handleBatchKeywordCapture'),
+    /executionLockOwner === "unattended_keyword_plan" &&\s*controllerState\.activeUnattendedAttemptRejected/,
   );
 });
 
@@ -729,14 +723,13 @@ test("runner refresh honors the durable wait boundary before restarting the batc
     new URL("../sidebar/sidebar-logic.js", import.meta.url),
     "utf8",
   );
-  const claimStart = source.indexOf("async function maybeClaimAndRunUnattendedKeywordPlan");
-  const claimEnd = source.indexOf("function buildSidebarKeywordSearchUrl", claimStart);
-  const claimSource = source.slice(claimStart, claimEnd);
+  const claimSource = readSidebarFunction('maybeClaimAndRunUnattendedKeywordPlan');
 
-  assert.match(source, /async function waitForUnattendedProtectedStart/);
+  const protectedWait = readSidebarFunction('waitForUnattendedProtectedStart');
+  assert.match(protectedWait, /async function waitForUnattendedProtectedStart/);
   assert.match(claimSource, /await waitForUnattendedProtectedStart\(response\.data/);
-  assert.match(source, /waitUntil:\s*Number\.isFinite/);
-  assert.match(source, /phase: "protected_wait_complete"/);
+  assert.match(readSidebarFunction('reportUnattendedProtectedWaitState'), /waitUntil:\s*Number\.isFinite/);
+  assert.match(protectedWait, /phase: "protected_wait_complete"/);
   assert.match(
     claimSource,
     /holderId:\s*CAPTURE_EXECUTION_LOCK_HOLDER_ID/,
@@ -745,15 +738,10 @@ test("runner refresh honors the durable wait boundary before restarting the batc
     claimSource,
     /adoptUnattendedCaptureExecutionLock\(response\.lock\)/,
   );
-  const acquireStart = source.indexOf("async function acquireCaptureExecutionLock");
-  const acquireEnd = source.indexOf(
-    "function stopCaptureExecutionLockHeartbeat",
-    acquireStart,
-  );
-  const acquireSource = source.slice(acquireStart, acquireEnd);
+  const acquireSource = readSidebarFunction('acquireCaptureExecutionLock');
   assert.match(
     acquireSource,
-    /adoptedUnattendedCaptureExecutionLockId === activeCaptureExecutionLockId/,
+    /controllerState\.adoptedUnattendedCaptureExecutionLockId === controllerState\.activeCaptureExecutionLockId/,
   );
   assert.match(
     acquireSource,
@@ -771,9 +759,7 @@ test("canceled request storage changes only stop local orchestration", async () 
     new URL("../sidebar/sidebar-logic.js", import.meta.url),
     "utf8",
   );
-  const start = source.indexOf("function handleUnattendedRunRequestStorageChange");
-  const end = source.indexOf("async function handleSaveKeywordPlan", start);
-  const functionSource = source.slice(start, end);
+  const functionSource = readSidebarFunction('handleUnattendedRunRequestStorageChange');
 
   assert.match(functionSource, /batchKeywordCancelRequested = true/);
   assert.doesNotMatch(functionSource, /requestCaptureCancelSignal/);

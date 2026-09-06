@@ -1,3 +1,4 @@
+import {readSidebarFunction} from './helpers/sidebar-controller-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
@@ -94,7 +95,7 @@ test("sidebar recognition routes the same profile through an explicit subject ty
   );
   assert.match(logic, /captureCurrentMonitorCandidate\(subjectType\)/);
   assert.match(
-    logic,
+    readSidebarFunction('handleRunMonitorNow'),
     /runMonitorNow\(\{\s*subjectType:\s*MONITOR_SUBJECT_TYPE\.CREATOR,/,
   );
   assert.match(ui, /resolveMonitorSubscriptionSubjectType/);
