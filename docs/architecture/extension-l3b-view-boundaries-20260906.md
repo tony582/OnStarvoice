@@ -39,7 +39,7 @@ L3-A 基点旧 `handleTaskCenterAction` 只拿 action/taskId/raw 历史项；sto
 
 ## 实际进度
 
-隔离源码已接线，本地最终回归和独立审查通过，进入提交/普通推送/新 stacked Draft 及精确 head CI 阶段；远端结果单独记录，不能沿用父提交 CI 作为本批通过证据。
+隔离源码已接线，本地最终回归和独立审查通过；源码 `87d0551b975fbbe56df653ad09670112675d73fa` 已普通推送并创建 [Draft PR #57](https://github.com/tony582/OnStarvoice/pull/57)，base 仍为 #56 精确 `2c997709c0a4223784901aeaa461fab46108ba8b`。本次状态补记只改三份计划；最终 head 的 push/PR 两组 CI 单独核验，结果记录在该 PR 正文及任务交付，不能沿用父提交或旧 head。
 
 | 职责 | 当前 owner 与边界 | 验证状态 / 尚未完成 |
 | --- | --- | --- |
@@ -59,6 +59,6 @@ L3-A 基点旧 `handleTaskCenterAction` 只拿 action/taskId/raw 历史项；sto
 
 本地快照（均为 v0.4.5；相对路径排序后逐文件 SHA256 清单再取 SHA256）：候选 164 文件 `fefb16e176589b101332a2b7ce8beed37ef17c6e9e868e0313d000b61163eb4c`；原客户参考 95 文件仍为 `554479f7e01198ba0e6f7c2eb3d16e58c55db773aaadad90ecea5d6b039d1f87`。没有安装、Reload 或更改客户包；后台、平台采集、服务端、管理端、manifest、同步实现与精确父无差异。
 
-下一步：提交/普通推送新 stacked Draft 并等待精确 head CI；本结构候选达到 Draft 门也不关闭 B 的命令边界缺口。后续先列旧命令 adapter 与后台原子围栏的精确实施范围，行为收紧须单独审批；不提前进入 C/L4，不对客户发布。
+下一步：保持 #57 Draft，按其最终 head 独立核验 CI；本结构候选达到 Draft 门也不关闭 B 的命令边界缺口。后续先列旧命令 adapter 与后台原子围栏的精确实施范围，行为收紧须单独审批；不提前进入 C/L4，不对客户发布。
 
 文档独立读者核对：现有独立审阅者（非全新无上下文实例）按三份计划回答完成范围、发布、来源/设计和后续授权问题，无阻断本结构候选的遗漏；按反馈澄清了未迁出的 legacy command adapter、旧界面语义端口并非新 UI 接线、原 216 项之外追加 2 个入口，以及服务端/G8 收尾仍保留。
