@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {readCaptureFunctions, readCaptureDeliverySources} from '../helpers/capture-delivery-source.mjs';
 import {execFileSync} from "node:child_process";
 import {readFileSync} from "node:fs";
 import test from "node:test";
@@ -27,6 +28,14 @@ test("capture-sync requires the six classifier imports and has no duplicate impl
   for (const name of ["RATE_LIMIT_SYNC_REASONS", "INDETERMINATE_SYNC_REASONS"]) {
     assert.doesNotMatch(source, new RegExp(`\\b${name}\\b`));
     assert.equal([...moduleSource.matchAll(new RegExp(`const\\s+${name}\\s*=`, "g"))].length, 1, name);
+  }
+  for (const delivery of readCaptureDeliverySources()) {
+    for (const name of [...publicNames, ...privateNames]) {
+      assert.doesNotMatch(delivery.source, new RegExp(`function\\s+${name}\\s*\\(`), delivery.path);
+    }
+    for (const name of ["RATE_LIMIT_SYNC_REASONS", "INDETERMINATE_SYNC_REASONS"]) {
+      assert.doesNotMatch(delivery.source, new RegExp(`\\b${name}\\b`), delivery.path);
+    }
   }
   assert.equal([...moduleSource.matchAll(/\bimport\b/g)].length, 1);
   assert.match(moduleSource, /^import\s*\{\s*ERROR_REASON\s*\}\s*from\s*['"]\.\.\/constants\.js['"];$/m);
@@ -78,12 +87,18 @@ function section(start, end) {
 // only seams: chunking, retry decisions, result mapping and apply ordering stay real.
 const bridgeSource = [
   section("const MAX_SYNC_RECORDS_PER_REQUEST =", "const DEFAULT_CHECK_SYNC_TYPES ="),
-  section("function isSyncCancellationRequested(", "function buildCanceledSyncResult("),
-  section("function extractDebugUrl(", "async function appendSingleSyncHistoryEntry("),
-  section("async function syncGroupRecordsWithRetry({", "function stripCommentCollectionsForContentSync("),
-  section("function buildSyncRecordResultItem(", "function extendSyncPausedMetadata("),
-  section("function normalizeSyncDelayMs(", "function buildWorkflowSyncGroups("),
-  section("function getSingleNoteType(", "function pickBatchDebugUrl("),
+  readCaptureFunctions([
+    'isSyncCancellationRequested', 'extractDebugUrl',
+    'syncGroupRecordsWithRetry', 'runSyncBatchRequest', 'buildSyncBatchRecordInput',
+    'buildSyncBatchRecordRequestShape', 'buildSyncRequestPayload',
+    'buildSyncRecordResultItem', 'applySyncRecordResultItem', 'getSyncBatchItems',
+    'collectQueuedSyncRecords', 'buildSyncPausedMetadata',
+    'normalizeSyncDelayMs', 'normalizeSyncAttemptCount', 'resolveRateLimitRetryDelayMs',
+    'sleep', 'waitForCancelableSyncDelay', 'waitForSyncRequestSlot',
+    'canContinueAfterIsolatedSyncPause', 'isIsolatedHeavySyncRecord',
+    'chunkSyncRecordsForRequest', 'isCommentRichSyncRecord',
+    'countPayloadCommentItems', 'estimateJsonBytes', 'getSingleNoteType', 'normalizeDebugUrl',
+  ]),
 ].join("\n");
 const NOW = 1_788_566_400_000;
 const plain = (value) => JSON.parse(JSON.stringify(value));

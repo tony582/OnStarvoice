@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {readCaptureFunction} from '../helpers/capture-delivery-source.mjs';
 import {readFile} from "node:fs/promises";
 import test from "node:test";
 
@@ -6,14 +7,6 @@ const source = await readFile(
   new URL("../../utils/capture-sync.js", import.meta.url),
   "utf8",
 );
-
-function sourceBlock(startMarker, endMarker) {
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker, start + startMarker.length);
-  assert.ok(start >= 0, `missing source marker: ${startMarker}`);
-  assert.ok(end > start, `missing end marker: ${endMarker}`);
-  return source.slice(start, end);
-}
 
 test("a failed non-empty comment load becomes a retryable detail failure", () => {
   const applyIndex = source.indexOf("applyCommentResultToSingleNotePayload(");
@@ -140,10 +133,7 @@ test("Douyin permanent unavailability stays item-scoped while identity mismatch 
 });
 
 test("a fresh detail payload inherits saved comments before Douyin comment preflight", () => {
-  const batchBlock = sourceBlock(
-    "export async function batchCaptureDetailsForRecords",
-    "export async function syncRecord",
-  );
+  const batchBlock = readCaptureFunction('batchCaptureDetailsForRecords');
   const inheritedItemsAt = batchBlock.indexOf(
     "const previouslySavedCommentItems",
   );
@@ -179,10 +169,7 @@ test("a fresh detail payload inherits saved comments before Douyin comment prefl
 });
 
 test("a thrown comment-only retry marks both layers failed and retains saved comments", () => {
-  const retryBlock = sourceBlock(
-    "async function captureCommentsForHydratedDetailRecord",
-    "export function applyCommentResultToSingleNotePayload",
-  );
+  const retryBlock = readCaptureFunction('captureCommentsForHydratedDetailRecord');
   const captureAt = retryBlock.indexOf(
     "result = await captureCommentsForCurrentNote(",
   );
@@ -216,10 +203,7 @@ test("a thrown comment-only retry marks both layers failed and retains saved com
 });
 
 test("comment-only retry restores detail done only after a complete result", () => {
-  const retryBlock = sourceBlock(
-    "async function captureCommentsForHydratedDetailRecord",
-    "export function applyCommentResultToSingleNotePayload",
-  );
+  const retryBlock = readCaptureFunction('captureCommentsForHydratedDetailRecord');
   const statusAt = retryBlock.indexOf(
     "const failed = mergeResult.status === COMMENT_CAPTURE_STATUS.FAILED",
   );
@@ -240,10 +224,7 @@ test("comment-only retry restores detail done only after a complete result", () 
 });
 
 test("Douyin commit guard rejects either an active-work conflict or a real route mismatch", () => {
-  const batchBlock = sourceBlock(
-    "export async function batchCaptureDetailsForRecords",
-    "export async function syncRecord",
-  );
+  const batchBlock = readCaptureFunction('batchCaptureDetailsForRecords');
   const commitAt = batchBlock.indexOf("activeStage = 'commit_guard'");
   const finalWriteAt = batchBlock.indexOf(
     "const latestRecord = (await getRecord(recordId)) || record",
@@ -251,10 +232,7 @@ test("Douyin commit guard rejects either an active-work conflict or a real route
   );
   const commitBlock = batchBlock.slice(commitAt, finalWriteAt);
   const compactCommitBlock = commitBlock.replace(/\s+/gu, " ");
-  const identityHelper = sourceBlock(
-    "function buildDouyinDetailIdentityError",
-    "function isDouyinIdentityIntegrityError",
-  );
+  const identityHelper = readCaptureFunction('buildDouyinDetailIdentityError');
 
   assert.ok(commitAt >= 0);
   assert.ok(finalWriteAt > commitAt);

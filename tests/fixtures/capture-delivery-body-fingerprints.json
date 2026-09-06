@@ -1,0 +1,883 @@
+{
+  "baseline": "5f774ebfcaed24b79bfe84369d9b9c483da38f66",
+  "normalization": "line-trim; reverse only explicit checkpoint state qualification",
+  "publicExports": [
+    "appendFrontendSyncFailureHistory",
+    "applyCommentLeadsToPayload",
+    "applyCommentResultToSingleNotePayload",
+    "batchCaptureByKeywords",
+    "batchCaptureByUrls",
+    "batchCaptureDetailsForRecords",
+    "beginCaptureTaskSession",
+    "beginDouyinSearchResultTransitionInTab",
+    "buildCommentLeadsConfigFromSettings",
+    "buildCommentLeadsPayloadForRecord",
+    "buildDouyinCommentRecoveryCandidates",
+    "buildDouyinDetailNavigationCandidates",
+    "captureAndSync",
+    "captureAndSyncBloggerNotes",
+    "captureAndSyncBloggerProfile",
+    "captureAndSyncComments",
+    "captureAndSyncKeywordNotes",
+    "captureAndSyncSingleNote",
+    "captureNoteWithOptionalComments",
+    "captureOnly",
+    "captureTabContent",
+    "checkBeforeSync",
+    "endCaptureTaskSession",
+    "evaluateDetailKeywordFilter",
+    "getActiveListCaptureCheckpointStats",
+    "inspectDouyinRecordDetailIdentity",
+    "isListMetricExplicitlyKnown",
+    "lightSampleByKeywords",
+    "pickMoreCompleteCapturedText",
+    "processListCaptureCheckpointProgress",
+    "readDouyinSearchDocumentGenerationInTab",
+    "refreshListCaptureSourceUrlInPlace",
+    "registerCaptureTaskTab",
+    "repairInterruptedCommentCaptureRecords",
+    "repairInterruptedDetailCaptureRecords",
+    "resetCaptureAndSyncState",
+    "resolveKnownCommentsCountForDetailCapture",
+    "resolveRecordDetailNoteId",
+    "resolveRecordDetailNotePath",
+    "resolveSyncInputForRecord",
+    "retryCommentsForRecord",
+    "retryDetailCaptureForRecord",
+    "syncRecord",
+    "syncRecordBatch",
+    "updateCaptureTaskSession"
+  ],
+  "entries": [
+    {
+      "module": "checkpoint",
+      "name": "createListCaptureCheckpointSession",
+      "sha256": "026047bc46b5afc16cd7c3fe6b095bc867d610c4cff83d3172fd176df1d91182"
+    },
+    {
+      "module": "checkpoint",
+      "name": "beginListCaptureCheckpointSession",
+      "sha256": "7b47b28e43d67093d6ca3e60d73330495ac9881c87db50b64627f35820d39389"
+    },
+    {
+      "module": "checkpoint",
+      "name": "finishListCaptureCheckpointSession",
+      "sha256": "b31e620d413595cc1aad05cef3b768c10df1364896837b9989dcb38cae291641"
+    },
+    {
+      "module": "checkpoint",
+      "name": "collectListCaptureSessionRecordIds",
+      "sha256": "0e9dbc5cac1f24c8fe953bd7696bf890967a063ce89262279542b8c641b464ff"
+    },
+    {
+      "module": "checkpoint",
+      "name": "getActiveListCaptureCheckpointStats",
+      "sha256": "5017f1468c7607d9017f5952c5564b4b265758e45b927eefd8c3619bb05dfc1a"
+    },
+    {
+      "module": "checkpoint",
+      "name": "processListCaptureCheckpointProgress",
+      "sha256": "95be98fb4986316eae04f5dc346ea3df5b231e0ed2078d0b7633c07663388ab7"
+    },
+    {
+      "module": "cache",
+      "name": "isListCaptureRecordType",
+      "sha256": "b2e645e348c35952fdb78417b3b4c755a8780e49f5871cee6379d2a4f173f589"
+    },
+    {
+      "module": "cache",
+      "name": "normalizeIdentityUrl",
+      "sha256": "0e506b7f0b8276ad619b775ab4e8756c1b6fa902fbe39421536f0615d7827391"
+    },
+    {
+      "module": "cache",
+      "name": "resolveRecordIdentityPlatform",
+      "sha256": "79c4caec9b299474a67560fa11aab41e75b50f54c37f96c1eb28569c63e70e3f"
+    },
+    {
+      "module": "cache",
+      "name": "resolveRecordIdentityKeys",
+      "sha256": "f62d298bc6751edc7f84c64cccbd2f3d5dae5221e6f98b0a29b63db9814dae46"
+    },
+    {
+      "module": "cache",
+      "name": "buildDataPoolIdentityIndex",
+      "sha256": "fe58907473edf00835981045df7d074ab95ac1e5612936eff5cda4576d8ac022"
+    },
+    {
+      "module": "cache",
+      "name": "pushUnique",
+      "sha256": "09e86b60f35753a35de3436cdd87ba903f977c6191651f91e811d620b7dbf083"
+    },
+    {
+      "module": "cache",
+      "name": "createListCaptureCacheStats",
+      "sha256": "efedc7d098668fda0390931b7277ec7113aacdb9da2b3e05a82721a93232d43a"
+    },
+    {
+      "module": "cache",
+      "name": "refreshListCaptureMetricsInPlace",
+      "sha256": "d523f2536bcf1f613ff7853b41cd665775475863071258674696bbd7756c6e16"
+    },
+    {
+      "module": "cache",
+      "name": "validatedFreshXhsCaptureUrl",
+      "sha256": "4f05e7cac9993929b9ad51c0a0c43330eac27644467bf4cc8ba0be5eaffc02e8"
+    },
+    {
+      "module": "cache",
+      "name": "refreshListCaptureSourceUrlInPlace",
+      "sha256": "498fa8f177b9afb43c794c769bfacac6a5bc1f92c5a808cfca0bdddd87772ca2"
+    },
+    {
+      "module": "cache",
+      "name": "normalizeListMetricDimension",
+      "sha256": "5a052f62e220d7f4093cf488c863cce3e1a7242b567ffa55ef4c3ff25a7c5849"
+    },
+    {
+      "module": "cache",
+      "name": "isListMetricExplicitlyKnown",
+      "sha256": "5920aebb15dd199ccd76523fbb9ebbd7ce9cc5eac28cd03604ccdb2e7b7a942d"
+    },
+    {
+      "module": "cache",
+      "name": "hasMetricValue",
+      "sha256": "6dd6d9e18a892be3187c381e68164418f29cc04a86d895a32e8b9cf993c9dbca"
+    },
+    {
+      "module": "cache",
+      "name": "collectKeywordMatchLabels",
+      "sha256": "4854c2aada82ae2d168b8afd0cb1f184cfff5aa427cced422e48ed15e685a432"
+    },
+    {
+      "module": "cache",
+      "name": "mergeKeywordMatchLabelsInPlace",
+      "sha256": "b0ab68f27667eb110c79afe4a4e7bbaacc5b40f74d78500baf996bbb9085987a"
+    },
+    {
+      "module": "cache",
+      "name": "mergeCaptureTraceIntoExistingRecord",
+      "sha256": "ca555ff7ac74d56c6d8c089b987eeb679e51b0b8987c3ab55ee84e5ca654b0db"
+    },
+    {
+      "module": "cache",
+      "name": "uniqueRecordsById",
+      "sha256": "f81d2cbc7f88d77aeac8f6e3cbed037444fb6f3c4be6ff54f28f641b0c510445"
+    },
+    {
+      "module": "cache",
+      "name": "saveRecordsWithCacheDedupe",
+      "sha256": "0c4bd7891bb89ec65ecf1a03394f4408410854e023e790c970cdf8dbafc78ced"
+    },
+    {
+      "module": "cache",
+      "name": "saveCaptureResultRecords",
+      "sha256": "815d3135c95a5e950609db98bd2bb7ae1364a1977e5a3554edf63b39ca8693e3"
+    },
+    {
+      "module": "payload",
+      "name": "applySyncPreferencesToPayload",
+      "sha256": "910f2b6cf6924ee7a3197bf9cce3170033197a96e49e069687b0ab0ebd3e136e"
+    },
+    {
+      "module": "payload",
+      "name": "compactPayloadForBackendSync",
+      "sha256": "74104cac974d1f1d76abac3265dc5bcf7e3a2321b65f050358089e945f31d1dd"
+    },
+    {
+      "module": "payload",
+      "name": "trimMediaUrlList",
+      "sha256": "7f613de55a1f6ad43a5cce89890fcf095ac6741649c28864f5065bf1cc3d43e6"
+    },
+    {
+      "module": "payload",
+      "name": "compactSyncItemForBackend",
+      "sha256": "a948b55c2f6cd8ae7612d1e9067487aff934cb36b21f9a9ffe450ab56c6cea8a"
+    },
+    {
+      "module": "payload",
+      "name": "resolveSyncInputForRecord",
+      "sha256": "adf7b1a80dbb0d7e4d492e5af334977c9ef4c24dadfc192bb90a76ae9c3f8837"
+    },
+    {
+      "module": "payload",
+      "name": "isRecordHydratedAsSingleNote",
+      "sha256": "34e4a7e299ff8b87d962b308a110201c9df9e3d411fae9776ddac6d81d80b2bf"
+    },
+    {
+      "module": "payload",
+      "name": "normalizeSingleNotePayloadForSync",
+      "sha256": "a66aec56ee24d7bafe0db384eaf3e96afa24c03bee84581ded98ccf8165f276f"
+    },
+    {
+      "module": "payload",
+      "name": "sanitizeMediaFieldsForStorage",
+      "sha256": "362932b77f0c115747a1f61bf3d2b8d47f892e390c6ee75e1d1cb9507d1d2a8f"
+    },
+    {
+      "module": "payload",
+      "name": "normalizeDetailPayloadAgainstRecord",
+      "sha256": "3d362f9e8196717dfa816aff681d124ad27e256692431715dea3a94574097983"
+    },
+    {
+      "module": "payload",
+      "name": "protectDouyinDetailAuthorAgainstListItem",
+      "sha256": "48cf4c8ba9a60c958c97bb4ffeebdc8f417473a1c769355774263d17614fa6c0"
+    },
+    {
+      "module": "payload",
+      "name": "pickTrustedDouyinAuthorUrl",
+      "sha256": "6dedee0ae33ef1fc606f6d33f8fde68dce3cc3f7a1ac86b735d775f14103ca3c"
+    },
+    {
+      "module": "payload",
+      "name": "sanitizeDouyinPayloadAuthorsForSync",
+      "sha256": "d708196c4a589b233080d67b30dc154e6d1afea2e9064aa15533e565c62150d4"
+    },
+    {
+      "module": "payload",
+      "name": "clearPlayableMediaFields",
+      "sha256": "21e6c6ed20dd9aa39c51edc731713d3b5daa48ef02942a445124843ec7c066a0"
+    },
+    {
+      "module": "payload",
+      "name": "resolvePayloadPlatform",
+      "sha256": "0c3d9a34cdd66e91bbbdd3be95385b6b13089400348a29aa3f4ee79aa4b1add4"
+    },
+    {
+      "module": "payload",
+      "name": "normalizeMediaUrlForStorage",
+      "sha256": "758347f332e37463edc1ae23bb573e05898650ba918e932b748f84fe7ef1ea10"
+    },
+    {
+      "module": "payload",
+      "name": "isLikelyDownloadableDouyinMediaUrlForStorage",
+      "sha256": "535eeae58ea3f3aaede4fb1917adeed3edf49c092fdf5f9a189485bd7057adf2"
+    },
+    {
+      "module": "payload",
+      "name": "mergeHydratedDetailIntoRecordPayload",
+      "sha256": "0f249363c48c6464b59dee876d5d2a064318858c4df49cb31bb1775ee9271e21"
+    },
+    {
+      "module": "payload",
+      "name": "pickMoreCompleteCapturedText",
+      "sha256": "d2fa64b2cc6207a652b10255fca43e07755713a63266d0cecde5fe792b81fd0b"
+    },
+    {
+      "module": "trace-model",
+      "name": "normalizeCaptureTraceSequence",
+      "sha256": "0350ca89daab1522f66ecee159d62645d3319ad584be782edcc78d181be3317c"
+    },
+    {
+      "module": "trace-model",
+      "name": "normalizeCaptureTrace",
+      "sha256": "35f9486f909c6662d07cbd6cc815d91792415c1a9981333f88b829fdc2093c23"
+    },
+    {
+      "module": "trace-model",
+      "name": "normalizeCompleteCaptureTrace",
+      "sha256": "2954d78d6ad25d78e24aecc96949fba6c4d8a99dafc1a663232d8dca6c07736e"
+    },
+    {
+      "module": "trace-model",
+      "name": "selectBestCaptureTrace",
+      "sha256": "f97ae107c92bf2d04cb48b919a9b06f4a4703c174687eb7a736b9e90ed4c07b2"
+    },
+    {
+      "module": "trace-model",
+      "name": "resolveCaptureTraceFromPayload",
+      "sha256": "b6ea0ba358de870354ceb62a276c00cc1a800ae08e50bb312cd8702582f6fccc"
+    },
+    {
+      "module": "trace-model",
+      "name": "resolveCaptureTraceFromRecord",
+      "sha256": "775d4e1fe43e981628e5752890a7b5041017f9b413aacc3eb6512e1ae9e189db"
+    },
+    {
+      "module": "trace-model",
+      "name": "bindCaptureTrace",
+      "sha256": "0e9ffd8581b2cc508227adcce3ae6c35273968b9671dd21f066e1ff9336e2022"
+    },
+    {
+      "module": "trace-model",
+      "name": "applyCaptureTraceToPayload",
+      "sha256": "76772cfe6a6cf38b67effb26b40d8b586b40907bd55ea263374f948722946108"
+    },
+    {
+      "module": "trace-model",
+      "name": "applyCaptureTraceToRecord",
+      "sha256": "de4069912bb996031b5ed0dec4091a0380828fb3e16c93082c8bddf038c22ab3"
+    },
+    {
+      "module": "trace-model",
+      "name": "buildCaptureTraceBinding",
+      "sha256": "a975fa0d5ea218f63d4e135aded382941d0d0ad355cf795a1ecd7add6e59feee"
+    },
+    {
+      "module": "trace-model",
+      "name": "compareCaptureTraceBindings",
+      "sha256": "ac67398e9b950a5c9d180bf8d4132c7ddd400b239f54a1d1086b270d3222af5f"
+    },
+    {
+      "module": "trace-model",
+      "name": "mergeCaptureTraceBinding",
+      "sha256": "00e8c0509b8b646d978f9bc6f18a10c8477f3be50136a4df3aba6c480ab4d48f"
+    },
+    {
+      "module": "trace-model",
+      "name": "sortCaptureTraceBindings",
+      "sha256": "1aec327005d371e61ef0b43a8b3c1b7b7eec19a52ac3bd3f5c43285a4b608b63"
+    },
+    {
+      "module": "trace-model",
+      "name": "upsertCaptureTraceBindings",
+      "sha256": "6711f0b82fa209fbc43d0386e810caeb5231e63c03b1fcfa4534774a75db8cc9"
+    },
+    {
+      "module": "trace-model",
+      "name": "orderRecordIdsByCaptureTrace",
+      "sha256": "4f2b01817374742dba0a2a006e95b53eb9b7adda7b868a6ddf28973d93340f0e"
+    },
+    {
+      "module": "comment-model",
+      "name": "sanitizeCommentLeadItems",
+      "sha256": "f6b3a7801325574ef89eb6d77d2f592a1162ba33680c1685e47b43ec672956af"
+    },
+    {
+      "module": "comment-model",
+      "name": "normalizeCommentLeadSyncStatus",
+      "sha256": "a17a24ba3c7544b398e59a1723cdc3a6259c917889d873b79a270ae3e6f2f8dd"
+    },
+    {
+      "module": "comment-model",
+      "name": "applyCommentStatusToPayload",
+      "sha256": "b2bcb4e3d1e83d24335fe0a8bf1375e7a96af28200cbd43834e547b26b5304c0"
+    },
+    {
+      "module": "comment-model",
+      "name": "createCommentStatusPatch",
+      "sha256": "8b523eb044569be4985cd77a62455d36777949c45451444e3ced92a7d3ab2ab1"
+    },
+    {
+      "module": "comment-model",
+      "name": "cleanCommentsItems",
+      "sha256": "bb55097f65c0aa7af29ea8fcb50a9db6f2b17486558a22f94d3f9d0951c960a1"
+    },
+    {
+      "module": "comment-model",
+      "name": "buildCommentsMergedText",
+      "sha256": "e2e57e81058b03f0f853f2fcf8b58ad627ea044e66954e1b35204024081ca8a5"
+    },
+    {
+      "module": "comment-model",
+      "name": "splitCommentLeadRules",
+      "sha256": "200ad5b8cf0f5ff5c69a432a0511aae343f067d74c9905b1daceee8436e2d919"
+    },
+    {
+      "module": "comment-model",
+      "name": "buildCommentLeadsConfigFromSettings",
+      "sha256": "5286dae1d71a0b2c4426a346d480636e15dcd7105b1d9cf0da5b66c0e1ff30c1"
+    },
+    {
+      "module": "comment-model",
+      "name": "normalizeCommentLeadsConfig",
+      "sha256": "95502dfae3917f6f05d498d9b5b85331f99046d3cc071266c78e4f64ce8e1a76"
+    },
+    {
+      "module": "comment-model",
+      "name": "normalizeCommentItemForLead",
+      "sha256": "13557fd6a9d3bad37ac98b54395893dc24d0d057ba70112a7b05a46d2aab5169"
+    },
+    {
+      "module": "comment-model",
+      "name": "pickFirstNonEmptyString",
+      "sha256": "e799e9d8d7e97e2df871757463b0b61b1fd29a5070992b4e38e503344c3e536b"
+    },
+    {
+      "module": "comment-model",
+      "name": "extractUserIdFromProfileUrl",
+      "sha256": "dff4cc4a562c8c177342ea8e8b76b2514508f094365090eab725410abbedbc87"
+    },
+    {
+      "module": "comment-model",
+      "name": "resolveCommentUserName",
+      "sha256": "1dc706f9b75e65aa56057a5b91feec4cdbf62a5ffcc3ccfb0a5b1083934bdb0f"
+    },
+    {
+      "module": "comment-model",
+      "name": "resolveCommentIpLocation",
+      "sha256": "c1bdfe31efa55ffa7d4d26b29346adf19760f981796a2c92e22197407a75ea68"
+    },
+    {
+      "module": "comment-model",
+      "name": "resolveCommentUserUrl",
+      "sha256": "d5a48d74d69fe80bca84473b576e1d557739dd53c586ee1db33272e16bc81d07"
+    },
+    {
+      "module": "comment-model",
+      "name": "resolveCommentUserId",
+      "sha256": "a74f1ce8bb20d11020035be927ea1d9767c620319593966d1c74570cadfdd439"
+    },
+    {
+      "module": "comment-model",
+      "name": "getLeadSourceFromSyncPayload",
+      "sha256": "e0558a3edcb134e1f46b7793278399591551e058656dda1d715d10e33dabdc23"
+    },
+    {
+      "module": "comment-model",
+      "name": "evaluateCommentLeadItem",
+      "sha256": "544a207cdbd40340cbe0bcfe02447995b4367b99310c053de362032f634b537e"
+    },
+    {
+      "module": "comment-model",
+      "name": "getStoredCommentLeadsState",
+      "sha256": "ad73437b7445121781d87609370d25b2fe97e246f4c60ea9a953152b711ae7b8"
+    },
+    {
+      "module": "comment-model",
+      "name": "hasStoredCommentLeadsPayload",
+      "sha256": "ec802cdaf50a06af71313f5ad6aa43525092a7baf3dc82d1329cb5550ae708c2"
+    },
+    {
+      "module": "comment-model",
+      "name": "buildCommentLeadsPayloadForRecord",
+      "sha256": "e8e1b5d2458c8ff7ce905669c6a20eafb6e7fb64c0b0a22fa9e7ab8e56a177d3"
+    },
+    {
+      "module": "comment-model",
+      "name": "applyCommentLeadsSyncState",
+      "sha256": "89ef4fdd792502a29c103ce000f3929e3a996230512ab2f6c4c50a51edea95a7"
+    },
+    {
+      "module": "comment-model",
+      "name": "applyCommentResultToSingleNotePayload",
+      "sha256": "9dbfc523ff83e3c685d52a76f2456fdec2d09664e9c42203ed932fad4a125ab7"
+    },
+    {
+      "module": "comment-model",
+      "name": "applyCommentLeadsToPayload",
+      "sha256": "aa569d72dbaa8cf4ca008f0ff12a1cdeae81e940086ce417e108423403710e78"
+    },
+    {
+      "module": "metrics-model",
+      "name": "normalizeBloggerAccountType",
+      "sha256": "0c9742025cfd85677854f90903d7a163b01b176d9a0a01fb0f858a8b9e28c858"
+    },
+    {
+      "module": "metrics-model",
+      "name": "normalizeNonNegativeNumber",
+      "sha256": "2866a1031c3f20a356ba13b45257f7b8393dc2c5d9aa23df4454ee6d9407be96"
+    },
+    {
+      "module": "metrics-model",
+      "name": "normalizeOptionalCount",
+      "sha256": "e0616c894f65e7d05faf6efbca8e6cacb58e9b8558e015aa9172171c8786f919"
+    },
+    {
+      "module": "metrics-model",
+      "name": "isExplicitCountValue",
+      "sha256": "ac51f8b29c0cdc3199547694707fc5a895a39bd18c521f4f43c38b36e0f79471"
+    },
+    {
+      "module": "metrics-model",
+      "name": "resolveProvenBloggerMetricCount",
+      "sha256": "6d7bec9927f6995d788fc1fff2890070c85c84f5144ef0a1cc56be1ef2d0c68d"
+    },
+    {
+      "module": "metrics-model",
+      "name": "resolveProvenBloggerFollowersCount",
+      "sha256": "91cbcd18467c95e6541b379b2a1433a1cb724e9cb289999f3dd7ec6126b64549"
+    },
+    {
+      "module": "metrics-model",
+      "name": "resolveProvenBloggerLikedAndCollectedCount",
+      "sha256": "26795f3dbba941935edba7b528d5e23d2a2b5ccc77a8f793067dea8ef8c99838"
+    },
+    {
+      "module": "metrics-model",
+      "name": "pickFirstCountFromSources",
+      "sha256": "e84ca6ad5be567083187af913055bd9fafcd0402545a1690aafe238e0b894fa7"
+    },
+    {
+      "module": "metrics-model",
+      "name": "resolveRecordListCommentsCount",
+      "sha256": "7278562a721c8954dce02c44271dbe3dcbc28831c2a0c58963ec1f8479b90bb7"
+    },
+    {
+      "module": "metrics-model",
+      "name": "resolveKnownCommentsCountForDetailCapture",
+      "sha256": "c1b800eaf282bbe742d81b184dd103cc7f575473f2fba095de80f0ee3cd05344"
+    },
+    {
+      "module": "metrics-model",
+      "name": "isValidBloggerMetricsStatus",
+      "sha256": "a66db950e3a36312c47eb063b76154e86beab8f50a7719c1d9fb2a5b7630918d"
+    },
+    {
+      "module": "metrics-model",
+      "name": "isFiniteNonNegativeNumber",
+      "sha256": "4da20c6dd2a2348e53db005a90885112a16a022a7e65f1a0a06dc44c515f15a2"
+    },
+    {
+      "module": "metrics-model",
+      "name": "ensureBloggerMetricsFields",
+      "sha256": "bd5d9b77cb42cb3d5bd40117097fa5933b6a4fbc823c1876f29152945b1975e1"
+    },
+    {
+      "module": "metrics-model",
+      "name": "applyBloggerMetricsPatch",
+      "sha256": "d37878b03c6515cad830c487fd87f20cc7345fbf7504eaea65c8e15447500880"
+    },
+    {
+      "module": "metrics-model",
+      "name": "createBloggerMetricsPatch",
+      "sha256": "001dbef33b2d62521a2304fc60643164b526aca35ee5a7d7c81b8bb05bd3203a"
+    },
+    {
+      "module": "metrics-model",
+      "name": "isInternalAccountNo",
+      "sha256": "be8288cb79fc9bbb8ba7b9bb4890841e9918af0c3a6516e44fd40b606cd2c6dc"
+    },
+    {
+      "module": "metrics-model",
+      "name": "pickHumanAccountNo",
+      "sha256": "009d063510d34a108c2d17a72d37167c58fb12746b5fbc785395178e0ae3d95e"
+    },
+    {
+      "module": "metrics-model",
+      "name": "resolveBloggerMetricsFromProfilePayload",
+      "sha256": "2d8a27c33222ec018c84fe1eb0b8ebeff92da4a1d778c998df76ec749e36af40"
+    },
+    {
+      "module": "metrics-model",
+      "name": "resolveBloggerMetricsPatchFromCurrentPayload",
+      "sha256": "659b138480a072b3388512758deea760b20937e73fc9364f97be0c851e1f5261"
+    },
+    {
+      "module": "metrics-model",
+      "name": "applyBloggerMetricsResultToPayload",
+      "sha256": "de17339b0940982a5f21db864564ed8dfdb12ecfbb2bed4005ef2046b853cbb6"
+    },
+    {
+      "module": "metrics-model",
+      "name": "resolveBloggerProfileUrlFromPayload",
+      "sha256": "ae5f9fefc24a57e042ff39c20db60bb81da1ab4bb803c3c5c01eba121ee8ad7c"
+    },
+    {
+      "module": "record-model",
+      "name": "resolveDetailRecordItemMetricsStatus",
+      "sha256": "09c48dec5f99274e9d1422974f57148637edca5427bd1f07db215269454a5208"
+    },
+    {
+      "module": "record-model",
+      "name": "normalizeDetailRecordItem",
+      "sha256": "6a1ce71351845a53a59f080942491439b5cef854f5a7c97760c9be9073397223"
+    },
+    {
+      "module": "record-model",
+      "name": "truncateStorageString",
+      "sha256": "de423aaf5d97f13808cb70d330630fbc91c8e961ad177828f691b11a76434eec"
+    },
+    {
+      "module": "record-model",
+      "name": "trimStorageStringList",
+      "sha256": "fe1cfc88c4adf38e3848c3dab190071e6c4f813b31364058ed9d5c346d01cd97"
+    },
+    {
+      "module": "record-model",
+      "name": "sanitizeDomLocatorForStorage",
+      "sha256": "ebf60d362dc18aa07c3ee08bc95dcd32defebaafc15250b3e702e386e775cdca"
+    },
+    {
+      "module": "record-model",
+      "name": "sanitizeDomMatchHintsForStorage",
+      "sha256": "8b14bad23a88992921cca253fbf0d21c4252aadbd7636e02dcfb96a5e60650df"
+    },
+    {
+      "module": "record-model",
+      "name": "sanitizeListItemForStorage",
+      "sha256": "4fb85b04028b9e8e98120919487402d6d832539f60815454ef78960c4f3f8ff6"
+    },
+    {
+      "module": "record-model",
+      "name": "ensureDetailCaptureFields",
+      "sha256": "633147c55374f3101e1d62ab12890c5a809a3829f13f3f9825e8c35c2a887764"
+    },
+    {
+      "module": "record-model",
+      "name": "applyDetailCapturePatch",
+      "sha256": "4d8b4a5ce6cb190634306c672c4d288d58238e06720f2cb1f843a6752c3edda0"
+    },
+    {
+      "module": "record-model",
+      "name": "createDetailCapturePatch",
+      "sha256": "b3cf5e3b288a780a0cfd2a0b19639a18a4b388df5005b9d70324336a378b1111"
+    },
+    {
+      "module": "record-model",
+      "name": "buildRecordsForStorage",
+      "sha256": "6634c0e76b0511133a1723fbdd11e9b3acf46c921a363c3bdca64a959f4dcbc6"
+    },
+    {
+      "module": "record-model",
+      "name": "buildRecordPreview",
+      "sha256": "a459a56edcdca2f5033ecf8c469fe460d597e59096b52bc701ceb0542f4b3bad"
+    },
+    {
+      "module": "history",
+      "name": "isCommentLeadsEligibleSyncType",
+      "sha256": "07fd46a1826c2f8808850861de2ed77d9e9e10bef9a7d8ba798b79adef664a79"
+    },
+    {
+      "module": "history",
+      "name": "hasCommentLeadsEligibleType",
+      "sha256": "cb7a96b3867b33d170f00ce278d4b2f30243e9316aaa172df7d7e5ee7ae4de3e"
+    },
+    {
+      "module": "history",
+      "name": "truncateFrontendSyncText",
+      "sha256": "e0996494101fedc48f66f042c2e451921f1ec85299ac5b9c4f1cbb9c26575f77"
+    },
+    {
+      "module": "history",
+      "name": "normalizeFrontendSyncError",
+      "sha256": "6940abe44590ca7e4ace0dde460ee28ca37ed75104e97ffe28524478d743a5d3"
+    },
+    {
+      "module": "history",
+      "name": "resolveFrontendFailurePlatform",
+      "sha256": "32110fd97d5204b9f79e2b9168451d1121e050f127509c9f01768605f934dc48"
+    },
+    {
+      "module": "history",
+      "name": "resolveFrontendFailureSyncType",
+      "sha256": "b039dfa2d510f255e2fcdb6adaa1d3025abf8fbdd41d6d6a2865a073736a7c8f"
+    },
+    {
+      "module": "history",
+      "name": "buildFrontendFailureItems",
+      "sha256": "9ef8064759ef5eaa9d2cc2892232c475321eee98232173e044a696d12a960e35"
+    },
+    {
+      "module": "history",
+      "name": "appendFrontendSyncFailureHistory",
+      "sha256": "fcb567ca98f0ec76e597585ecafeb920fdfd0f45baa9a08d8201b1a89726cc98"
+    },
+    {
+      "module": "history",
+      "name": "appendSingleSyncHistoryEntry",
+      "sha256": "3f09185b3d09eeb2356129c7f19ee09560a63cc6f3490a035d275887737b03ea"
+    },
+    {
+      "module": "cancellation",
+      "name": "isSyncCancellationRequested",
+      "sha256": "3bccfb1bd1561941d4cb2ff23a38d69ccc4e42d3f8e1fb8fbbf9a33f8fa73d3d"
+    },
+    {
+      "module": "cancellation",
+      "name": "buildCanceledSyncResult",
+      "sha256": "6520017f69e6ccdf76290a425a2a5d5aca9fc877b407e2985a0598051000c220"
+    },
+    {
+      "module": "cancellation",
+      "name": "resetCanceledSyncState",
+      "sha256": "b043b44b6a53e0739bebaa6670bcf82ebc187dc068e5263e0972d724b7a000e3"
+    },
+    {
+      "module": "cancellation",
+      "name": "buildCanceledBatchSyncResult",
+      "sha256": "ae41cc8f83533a089b658b07bf6ef8a168707d741066e30eb19f7ceb13da3154"
+    },
+    {
+      "module": "single",
+      "name": "syncRecord",
+      "sha256": "71cd9c4f49b594642ae7db5c9f3d6cb3ca56395953e326e2761ecece7f895024"
+    },
+    {
+      "module": "batch",
+      "name": "syncRecordBatch",
+      "sha256": "fc467bb540377e1d0c9c14c623bc570097d30700fe9f24e779ca8ca3218e7e47"
+    },
+    {
+      "module": "batch",
+      "name": "runSyncRecordBatch",
+      "sha256": "f73ec9151dbfde279dc4e450b8812d3b4de4a8a9903f5c06e61316a650470f55"
+    },
+    {
+      "module": "requests",
+      "name": "syncGroupRecordsWithRetry",
+      "sha256": "1887505823e57c01e298bbfae77bea0eeef83b6d4cbd7f8b3a4c59ba7470adb0"
+    },
+    {
+      "module": "requests",
+      "name": "runSyncBatchRequest",
+      "sha256": "180ff73c2130b541b5a0bd9c5238936d3a1d774c64da4d17f9ffa19567abebbc"
+    },
+    {
+      "module": "results",
+      "name": "extractDebugUrl",
+      "sha256": "4f24505922db32b765634128242121c984c943294d53a520989bb9683383cf84"
+    },
+    {
+      "module": "results",
+      "name": "buildSyncRecordResultItem",
+      "sha256": "6fb5ed0a2972db33f3a6bd2f18fd300decbdab26b193ca0ee93f1fd20512b141"
+    },
+    {
+      "module": "results",
+      "name": "applySyncRecordResultItem",
+      "sha256": "1efad458b178143bf9639982a07ae14bee0e6cfbad1563050da78771843c7fac"
+    },
+    {
+      "module": "results",
+      "name": "getSyncBatchItems",
+      "sha256": "01230d8a661058f494342965584ba458156c10ad8a0550ee74fb829bf7dddffb"
+    },
+    {
+      "module": "results",
+      "name": "collectQueuedSyncRecords",
+      "sha256": "800ef8ceaba006ab5754d62ebd19a3cca24c34636ae142ac543c1fca4ee5c499"
+    },
+    {
+      "module": "results",
+      "name": "buildSyncPausedMetadata",
+      "sha256": "822693b76cead2a7951fe5299d33f07804296ebb7ebc09b4cf78e398584037f6"
+    },
+    {
+      "module": "results",
+      "name": "extendSyncPausedMetadata",
+      "sha256": "88c35144d66fe8ae5c5f8e90af2b9e29b4fe30081bce2d087cbb89e8f9d12560"
+    },
+    {
+      "module": "results",
+      "name": "mergeSyncPausedMetadata",
+      "sha256": "541245de5105d52b0b03ea2f102add240df122166dfa57bb7e162fd6656ee861"
+    },
+    {
+      "module": "results",
+      "name": "formatSyncPausedMessage",
+      "sha256": "bd628124189a8262940b37d314fc4c4ea2cb306519506e1721151480109a812d"
+    },
+    {
+      "module": "results",
+      "name": "normalizeDebugUrl",
+      "sha256": "5aaf5a33e99275b150bfcd3cc1c315ace870cba05ca4ce70928258dd090b4e63"
+    },
+    {
+      "module": "results",
+      "name": "pickBatchDebugUrl",
+      "sha256": "e74c885a2b0a036a5c375001857eb6c780c685f715167e2f259a8bcfabc2d97b"
+    },
+    {
+      "module": "batch-plan",
+      "name": "buildSyncBatchRecordInput",
+      "sha256": "0c0d3d3792ac0ca234f3796632a64788326a68799c336dab1a9ec1bcef88fa1c"
+    },
+    {
+      "module": "batch-plan",
+      "name": "buildSyncBatchRecordRequestShape",
+      "sha256": "230f76b1e737740f0fb14c5150babd1159c682109b8ea30fdd7dffc066f5fa28"
+    },
+    {
+      "module": "batch-plan",
+      "name": "buildSyncRequestPayload",
+      "sha256": "a3a77f5f3e770d29af3f9edd4fec7ca50f8eff002fc65715d45c2834cbadf907"
+    },
+    {
+      "module": "batch-plan",
+      "name": "stripCommentCollectionsForContentSync",
+      "sha256": "5e5a798501d2b59b4a353ad749faabab1ea91b3341f8c70bcb4a28d3a460d40e"
+    },
+    {
+      "module": "batch-plan",
+      "name": "normalizeSyncDelayMs",
+      "sha256": "6b18eeddb611ecaf93bae989cf19ea7767219a2d9a956e47c2350eb8f9d5975c"
+    },
+    {
+      "module": "batch-plan",
+      "name": "normalizeSyncAttemptCount",
+      "sha256": "5c43bf888d23144cdf76239f9e63299260c45c5f13db3609a6fbd62a670d883a"
+    },
+    {
+      "module": "batch-plan",
+      "name": "resolveRateLimitRetryDelayMs",
+      "sha256": "715e5779374fe3fa41521a0353e84a777655439c64d2d7f1a5569c52dac917a1"
+    },
+    {
+      "module": "batch-plan",
+      "name": "sleep",
+      "sha256": "302b12bc78ea86e5748dc5ba4294e0f44e5d5e7cbb3b95d04a9aa96e9ec21799"
+    },
+    {
+      "module": "batch-plan",
+      "name": "waitForCancelableSyncDelay",
+      "sha256": "89ee30d254d4a1c8c6cf40e2b260879f34244513ca9134657ec56f7ea311bee7"
+    },
+    {
+      "module": "batch-plan",
+      "name": "waitForSyncRequestSlot",
+      "sha256": "21b060e9e39ccb4d086f53334016ebfba55e260fbaa54acede5d1ebaca58767b"
+    },
+    {
+      "module": "batch-plan",
+      "name": "canContinueAfterIsolatedSyncPause",
+      "sha256": "86ef0a84c0562fc5a0bd57d67126a30a3c2f8b2b7d3fa2227632e692d9d43b6b"
+    },
+    {
+      "module": "batch-plan",
+      "name": "isIsolatedHeavySyncRecord",
+      "sha256": "b4c727b60506c4a520e7d35a52a51c933080a69c33cad23842e20654050fc1a6"
+    },
+    {
+      "module": "batch-plan",
+      "name": "chunkSyncRecordsForRequest",
+      "sha256": "1fbe87f9f7d68070872d16b06659cc68944c745ddca176e1bb02a61ebaa020db"
+    },
+    {
+      "module": "batch-plan",
+      "name": "isCommentRichSyncRecord",
+      "sha256": "75091f1a7054cf54ab8de571d9b92f02a383d2088a32e7085cc35b37717d8fba"
+    },
+    {
+      "module": "batch-plan",
+      "name": "countPayloadCommentItems",
+      "sha256": "3b02aa752cf8b05dd9a21d50d86d2280ee76ecf4f58a3619b8a5bdbabf1a6e1f"
+    },
+    {
+      "module": "batch-plan",
+      "name": "estimateJsonBytes",
+      "sha256": "a4d90301c73be3a91ce63f634194951d06d1b12b9c33da29e35ce01f0d2a42a7"
+    },
+    {
+      "module": "batch-plan",
+      "name": "buildWorkflowSyncGroups",
+      "sha256": "fe481c31b9b3d929ac18c9c510bdd220175a245e519a026e566ae4308c8f9f2a"
+    },
+    {
+      "module": "batch-plan",
+      "name": "buildSyncBatchRecord",
+      "sha256": "87b809e50d15e6601b3557aa8d99d6936b5f4c5ca5706b694abd85116f9b8c7e"
+    },
+    {
+      "module": "batch-plan",
+      "name": "estimateSyncBatchRecordBytes",
+      "sha256": "d45b3737d4d85049a44249276c7e792341b81c6d9ba5c4f262b75d411626df01"
+    },
+    {
+      "module": "batch-plan",
+      "name": "getSingleNoteType",
+      "sha256": "5f71b08c71fea49bd488f47ce98ec8a12e5dd17be0402c1ee15544a927c0bcbc"
+    },
+    {
+      "module": "preflight",
+      "name": "checkBeforeSync",
+      "sha256": "b4cd4b9f4fcf962b4063013fe103e61f0b470804cc92e21a6b21a3c2c01ff27a"
+    },
+    {
+      "module": "preflight",
+      "name": "buildSyncTargetPayload",
+      "sha256": "ce02951f40918e689ea731faa9b2ee72eb5914bbc225d384208b3626a43088c7"
+    }
+  ]
+}
