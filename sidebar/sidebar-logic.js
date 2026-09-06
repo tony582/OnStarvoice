@@ -1,3 +1,5 @@
+import {createLegacyTaskCenterActions} from './legacy-application/task-center-actions.js';
+import {createLegacyTaskCenterActionView} from './legacy-view/task-center-actions.js';
 import {KEYWORD_SORT_DIMENSION} from './task-controller/keyword-state.js';
 import {createLegacyKeywordView} from './legacy-view/coordinator.js';
 import {createLegacyCaptureInputsView} from './legacy-view/capture-inputs.js';
@@ -4335,112 +4337,6 @@ async function renderAuthCodeInput(auth = getCurrentAuth()) {
 }
 
 // ==================== UI 事件监听 ====================
-
-async function handleTaskCenterAction(event) {
-  const detail = event?.detail && typeof event.detail === "object"
-    ? event.detail
-    : {};
-  const rawAction = String(detail.action || "").trim();
-  const action =
-    rawAction === "stop_keep"
-      ? "stop"
-      : rawAction === "resume_remaining"
-        ? "continue_remaining"
-        : rawAction;
-  const taskId = String(detail.taskId || detail.id || "").trim();
-  if (!action) return;
-
-  if (action === "view_results") {
-    window.activateSidebarTab?.("searchTab");
-    return;
-  }
-
-  if (action === "keep_results") {
-    if (!taskId) {
-      showMessage("未找到要保留的任务，请刷新任务中心后重试", "warning");
-      return;
-    }
-    try {
-      const response = await chrome.runtime.sendMessage({
-        type: "onstarvoice:cancel-unattended-keyword-run",
-        requestId: taskId,
-        message: "用户选择保留已有结果，不再自动恢复",
-      });
-      if (!response?.ok) {
-        throw new Error(response?.reason || response?.error?.message || "任务状态更新失败");
-      }
-      showMessage("已保留当前结果，任务不会自动重试", "success");
-    } catch (error) {
-      showMessage("保留结果失败: " + error.message, "error");
-    }
-    return;
-  }
-
-  if (action === "stop") {
-    if (taskId) {
-      try {
-        const unattendedResponse = await chrome.runtime.sendMessage({
-          type: "onstarvoice:cancel-unattended-keyword-run",
-          requestId: taskId,
-          message: "用户从任务中心停止任务并保留已有结果",
-        });
-        if (unattendedResponse?.ok) {
-          showMessage("正在停止任务并保留已有结果...", "warning");
-          return;
-        }
-      } catch (error) {
-        console.warn("[Sidebar] Cancel task center unattended run failed:", error);
-      }
-    }
-    const activeTask = getActiveTaskContext();
-    if (!taskId || activeTask?.taskId === taskId) {
-      await handleCancel();
-      showMessage("正在停止任务并保留已有结果...", "warning");
-      return;
-    }
-    showMessage("这条任务已不在当前页面执行，已刷新任务状态", "warning");
-    return;
-  }
-
-  const recoveryModeByAction = {
-    continue_remaining: "remaining",
-    retry_failed: "failed",
-    skip_current: "skip_current",
-  };
-  const mode = recoveryModeByAction[action];
-  if (!mode || !taskId) return;
-  if (
-    action === "continue_remaining" &&
-    isUnattendedSafetyBlock(detail.task || {}) &&
-    !window.confirm(
-      "请先在抖音页面人工完成安全验证。确认页面已经恢复正常后，再继续剩余关键词。",
-    )
-  ) {
-    return;
-  }
-
-  try {
-    const response = await chrome.runtime.sendMessage({
-      type: "onstarvoice:recover-unattended-keyword-run",
-      requestId: taskId,
-      mode,
-    });
-    if (!response?.ok) {
-      throw new Error(response?.reason || response?.error?.message || "无法恢复任务");
-    }
-    showMessage(
-      mode === "failed"
-        ? "已安排仅重试失败关键词"
-        : mode === "skip_current"
-          ? "已跳过当前项并继续剩余任务"
-          : "已从检查点继续剩余任务",
-      "success",
-    );
-    await loadKeywordPlanUI();
-  } catch (error) {
-    showMessage("恢复任务失败: " + error.message, "error");
-  }
-}
 
 /**
  * 设置 UI 事件监听
@@ -11076,6 +10972,28 @@ const {
   waitForTargetedPostRunnerTab,
   waitForUnattendedProtectedStart,
 } = sidebarTaskController;
+
+// Keep legacy task-center compatibility separate from the task controller's API.
+// All ports remain lazy: construction neither reads a task nor sends a command.
+const legacyTaskCenterView = createLegacyTaskCenterActionView({
+  window,
+  showMessage: (message, type) => showMessage(message, type),
+  executeLegacyAction: detail => legacyTaskCenterApplication.executeLegacyTaskCenterAction(detail),
+});
+const legacyTaskCenterApplication = createLegacyTaskCenterActions({
+  sendRuntimeMessage: message => chrome.runtime.sendMessage(message),
+  getActiveTaskContext: () => getActiveTaskContext(),
+  handleCancel: () => handleCancel(),
+  isUnattendedSafetyBlock: task => isUnattendedSafetyBlock(task),
+  loadKeywordPlanUI: () => loadKeywordPlanUI(),
+  presentation: Object.freeze({
+    activateResultsTab: () => legacyTaskCenterView.activateResultsTab(),
+    confirmSafetyBlock: () => legacyTaskCenterView.confirmSafetyBlock(),
+    notify: (message, type) => legacyTaskCenterView.notify(message, type),
+  }),
+  warnCancelFailure: error => console.warn("[Sidebar] Cancel task center unattended run failed:", error),
+});
+const {handleTaskCenterAction} = legacyTaskCenterView;
 
 // Keep exactly the original bootstrap and listener registration order.
 if (document.readyState === "loading") {

@@ -86,7 +86,7 @@ export function readSidebarSection(startMarker, endMarker) {
 
 export function readSidebarControllerSources() {
   // Existing whole-runtime safety assertions must not lose migrated view code.
-  return [...readSidebarDirectorySources('task-controller'), ...readSidebarDirectorySources('legacy-view')];
+  return [...readSidebarDirectorySources('task-controller'), ...readSidebarDirectorySources('legacy-view'), ...readSidebarDirectorySources('legacy-application')];
 }
 
 function readSidebarDirectorySources(directoryName) {

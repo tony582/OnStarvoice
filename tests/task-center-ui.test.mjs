@@ -666,11 +666,13 @@ test("a safety interruption offers human-confirmed continuation or a clean stop"
     {id: "keep_results", label: "结束并保留"},
   ]);
 
-  const logic = await read("sidebar/sidebar-logic.js");
+  const logic = await read("sidebar/legacy-application/task-center-actions.js");
   assert.match(
     logic,
-    /isUnattendedSafetyBlock\(detail\.task \|\| \{\}\)[\s\S]*请先在抖音页面人工完成安全验证/,
+    /isUnattendedSafetyBlock\(detail\.task \|\| \{\}\)[\s\S]*presentation\.confirmSafetyBlock\(\)/,
   );
+  const view = await read("sidebar/legacy-view/task-center-actions.js");
+  assert.match(view, /confirmSafetyBlock: \(\) => window\.confirm\([\s\S]*请先在抖音页面人工完成安全验证/u);
 });
 
 test("sidebar state subscribes to task ledger and legacy unattended records", async () => {
