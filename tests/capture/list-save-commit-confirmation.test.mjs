@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
-import {readFileSync} from "node:fs";
+import {readCaptureConstant, readCaptureFunctions} from '../helpers/capture-delivery-source.mjs';
 import test from "node:test";
 import vm from "node:vm";
 import {SYNC_TYPE} from "../../utils/constants.js";
 import {detectPlatformFromUrl, extractNoteId, parseInteractionCount} from "../../utils/helpers.js";
 
 const POOL_KEY = "onstarvoice.data_pool";
-const source = readFileSync(new URL("../../utils/capture-sync.js", import.meta.url), "utf8");
 const copy = (value) => structuredClone(value);
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
@@ -194,17 +193,26 @@ test("persistent checkpoint and final-save failure cannot escape as an empty suc
   assert.equal((await harness.storageApi.getDataPool()).records.length, 0);
 });
 
-function section(start, end) {
-  const from = source.indexOf(start);
-  const to = source.indexOf(end, from + start.length);
-  assert.ok(from >= 0 && to > from, `actual source section unavailable: ${start}`);
-  return source.slice(from, to).replace(/^export /gm, "");
-}
-
 const saveBridgeSource = [
-  section("const LIST_CAPTURE_RECORD_TYPES =", "function applySyncPreferencesToPayload("),
-  section("function normalizeCaptureTraceSequence(", "function buildCaptureTraceEventFields("),
-  section("function createListCaptureCheckpointSession(", "async function saveCaptureResultRecords("),
+  readCaptureConstant('LIST_CAPTURE_RECORD_TYPES'),
+  readCaptureConstant('LIST_METRIC_KNOWN_FLAG_KEYS'),
+  readCaptureFunctions([
+    'isListCaptureRecordType', 'normalizeCaptureTraceSequence', 'normalizeCaptureTrace',
+    'normalizeCompleteCaptureTrace', 'selectBestCaptureTrace', 'resolveCaptureTraceFromPayload',
+    'resolveCaptureTraceFromRecord', 'bindCaptureTrace', 'applyCaptureTraceToPayload',
+    'applyCaptureTraceToRecord', 'buildCaptureTraceBinding', 'compareCaptureTraceBindings',
+    'mergeCaptureTraceBinding', 'sortCaptureTraceBindings', 'upsertCaptureTraceBindings',
+    'orderRecordIdsByCaptureTrace', 'createListCaptureCheckpointSession',
+    'beginListCaptureCheckpointSession', 'finishListCaptureCheckpointSession',
+    'collectListCaptureSessionRecordIds', 'getActiveListCaptureCheckpointStats',
+    'normalizeIdentityUrl', 'resolveRecordIdentityPlatform', 'resolveRecordIdentityKeys',
+    'buildDataPoolIdentityIndex', 'pushUnique', 'createListCaptureCacheStats',
+    'refreshListCaptureMetricsInPlace', 'validatedFreshXhsCaptureUrl',
+    'refreshListCaptureSourceUrlInPlace', 'normalizeListMetricDimension',
+    'isListMetricExplicitlyKnown', 'hasMetricValue', 'collectKeywordMatchLabels',
+    'mergeKeywordMatchLabelsInPlace', 'mergeCaptureTraceIntoExistingRecord',
+    'uniqueRecordsById', 'saveRecordsWithCacheDedupe',
+  ]),
 ].join("\n");
 
 function createSaveBridge({initial = [], persist = async () => true} = {}) {
@@ -212,6 +220,7 @@ function createSaveBridge({initial = [], persist = async () => true} = {}) {
   const writes = [];
   const context = vm.createContext({
     SYNC_TYPE, URL, detectPlatformFromUrl, extractNoteId, parseInteractionCount,
+    state: {activeListCaptureCheckpointSession: null},
     runDataPoolMutation: async (mutation) => await mutation(),
     getDataPool: async () => copy(pool),
     setDataPool: async (candidate) => {

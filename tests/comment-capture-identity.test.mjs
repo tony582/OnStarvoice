@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {readCaptureFunction} from './helpers/capture-delivery-source.mjs';
 import {readFile} from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
@@ -334,11 +335,7 @@ test("Douyin comment capture carries and checks the expected work identity befor
     /record\.payload\?\.detailPayload\s*\|\|\s*record\.payload/,
   );
 
-  const hydratedRecordBlock = sourceBlock(
-    captureSyncSource,
-    "async function captureCommentsForHydratedDetailRecord",
-    "export function applyCommentResultToSingleNotePayload",
-  );
+  const hydratedRecordBlock = readCaptureFunction('captureCommentsForHydratedDetailRecord');
   assert.match(
     hydratedRecordBlock,
     /verifiedNoteId:\s*providedVerifiedNoteId = ''/,

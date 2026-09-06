@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {readCaptureFunction} from '../helpers/capture-delivery-source.mjs';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 
@@ -143,26 +144,16 @@ test('local URL refresh does not rewrite a mismatched detail URL', () => {
 });
 
 test('sync payload keeps item.url while identity normalization alone strips xsec fields', async () => {
-  const captureSyncSource = await readFile(
-    new URL('../../utils/capture-sync.js', import.meta.url),
-    'utf8',
-  );
-  const identityStart = captureSyncSource.indexOf('function normalizeIdentityUrl');
-  const identityEnd = captureSyncSource.indexOf('\nfunction resolveRecordIdentityPlatform', identityStart);
-  const identitySection = captureSyncSource.slice(identityStart, identityEnd);
-  const compactStart = captureSyncSource.indexOf('function compactSyncItemForBackend');
-  const compactEnd = captureSyncSource.indexOf('\nfunction normalizeCaptureTraceSequence', compactStart);
-  const compactSection = captureSyncSource.slice(compactStart, compactEnd);
-  const requestStart = captureSyncSource.indexOf('function buildSyncRequestPayload');
-  const requestEnd = captureSyncSource.indexOf('\nfunction stripCommentCollectionsForContentSync', requestStart);
-  const requestSection = captureSyncSource.slice(requestStart, requestEnd);
+  const identitySection = readCaptureFunction('normalizeIdentityUrl');
+  const compactSection = readCaptureFunction('compactSyncItemForBackend');
+  const requestSection = readCaptureFunction('buildSyncRequestPayload');
 
   assert.match(identitySection, /'xsec_token'/);
   assert.match(identitySection, /'xsec_source'/);
   assert.doesNotMatch(compactSection, /delete next\.(?:url|noteUrl)/);
   assert.match(requestSection, /return payload;/);
   assert.match(
-    captureSyncSource,
+    readCaptureFunction('saveRecordsWithCacheDedupe'),
     /const sourceUrlChanged\s*=\s*refreshListCaptureSourceUrlInPlace\(existingRecord, record\)/,
   );
 });

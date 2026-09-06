@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {readCaptureFunction, readCaptureDeliverySources} from '../helpers/capture-delivery-source.mjs';
 import {readFile} from "node:fs/promises";
 import test from "node:test";
 
@@ -24,7 +25,8 @@ const serverSync = await readFile(
 );
 
 test("obsolete comment-count recapture setting stays fully removed", () => {
-  for (const source of [sidebarHtml, sidebarLogic, captureSettings, captureSync]) {
+  for (const source of [sidebarHtml, sidebarLogic, captureSettings, captureSync,
+    ...readCaptureDeliverySources().map(({source}) => source)]) {
     assert.doesNotMatch(source, /comment-count-recheck/);
     assert.doesNotMatch(source, /recaptureCommentsOnCountIncrease/);
     assert.doesNotMatch(source, /RECAPTURE_COMMENTS_ON_COUNT_INCREASE/);
@@ -53,10 +55,12 @@ test("comment-count baseline remains compatibility metadata only", () => {
     /nextPayloadBase\.detailCommentCountBaseline = nextCommentBaseline/,
   );
   assert.match(
-    captureSync,
+    readCaptureFunction('refreshListCaptureMetricsInPlace'),
     /existingRecord\.payload\.detailCommentCountBaseline = previous/,
   );
   assert.match(serverSync, /detail_comment_count_baseline/);
-  assert.doesNotMatch(captureSync, /resolveCapturedCommentBaseline/);
-  assert.doesNotMatch(captureSync, /buildCapturedCommentStatus/);
+  for (const source of [captureSync, ...readCaptureDeliverySources().map(({source}) => source)]) {
+    assert.doesNotMatch(source, /resolveCapturedCommentBaseline/);
+    assert.doesNotMatch(source, /buildCapturedCommentStatus/);
+  }
 });

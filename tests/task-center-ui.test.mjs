@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {readCaptureFunction} from './helpers/capture-delivery-source.mjs';
 import {readFile} from "node:fs/promises";
 import test from "node:test";
 
@@ -272,17 +273,18 @@ test("task center hides capture child syncs but keeps user initiated sync tasks"
 
 test("single-record capture auto sync keeps its internal trigger in history", async () => {
   const captureSync = await read("utils/capture-sync.js");
+  const singleSync = readCaptureFunction('syncRecord');
 
   assert.match(
     captureSync,
     /syncRecord\(syncRecordIds\[0\], onProgress, \{\s*trigger: 'capture_auto'/,
   );
   assert.match(
-    captureSync,
+    singleSync,
     /const historyTrigger = String\(options\?\.trigger \|\| 'single'\)/,
   );
   assert.equal(
-    captureSync.match(/trigger: historyTrigger/g)?.length,
+    singleSync.match(/trigger: historyTrigger/g)?.length,
     4,
   );
 });

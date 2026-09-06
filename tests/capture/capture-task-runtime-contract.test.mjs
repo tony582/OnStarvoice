@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {readCaptureFunction} from '../helpers/capture-delivery-source.mjs';
 import {readFile} from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
@@ -92,16 +93,7 @@ test("capture lifecycle is required, composed once and owns the migrated impleme
 });
 
 function readDetailBatchFunctionSource() {
-  const start = captureSyncSource.indexOf(
-    "export async function batchCaptureDetailsForRecords",
-  );
-  const end = captureSyncSource.indexOf(
-    "export function resolveSyncInputForRecord",
-    start,
-  );
-  assert.ok(start >= 0, "missing batchCaptureDetailsForRecords");
-  assert.ok(end > start, "missing detail batch end marker");
-  return captureSyncSource.slice(start, end);
+  return readCaptureFunction('batchCaptureDetailsForRecords');
 }
 
 test("capture task runtime declares native tab-group permissions and worker module", () => {
@@ -897,22 +889,20 @@ test("persistent native assist detach never publishes a task tombstone or stops 
 });
 
 test("batch sync cancellation reaches spacing, retry, content and lead writes", () => {
-  const start = captureSyncSource.indexOf("async function runSyncRecordBatch");
-  const end = captureSyncSource.indexOf("function buildSyncBatchRecordInput", start);
-  const body = captureSyncSource.slice(start, end);
+  const body = readCaptureFunction('runSyncRecordBatch');
+  const retryBody = readCaptureFunction('syncGroupRecordsWithRetry');
+  const requestBody = readCaptureFunction('runSyncBatchRequest');
   assert.match(body, /const shouldStop = options\?\.shouldStop/u);
   assert.match(body, /const signal = options\?\.signal \|\| null/u);
   assert.match(body, /syncGroupRecordsWithRetry\(\{[\s\S]*shouldStop,[\s\S]*signal/u);
-  assert.match(body, /waitForSyncRequestSlot\([\s\S]*shouldStop,[\s\S]*signal/u);
-  assert.match(body, /waitForCancelableSyncDelay\([\s\S]*shouldStop,[\s\S]*signal/u);
-  assert.match(body, /syncBatch\([\s\S]*\{shouldStop, signal\}/u);
+  assert.match(retryBody, /waitForSyncRequestSlot\([\s\S]*shouldStop,[\s\S]*signal/u);
+  assert.match(retryBody, /waitForCancelableSyncDelay\([\s\S]*shouldStop,[\s\S]*signal/u);
+  assert.match(requestBody, /syncBatch\([\s\S]*\{shouldStop, signal\}/u);
   assert.match(body, /COMMENT_LEADS_SYNC_CANCELED/u);
 });
 
 test("profile recovery lineage survives the final batch request builder", () => {
-  const start = captureSyncSource.indexOf("function buildSyncBatchRecordInput");
-  const end = captureSyncSource.indexOf("function buildSyncRequestPayload", start);
-  const body = captureSyncSource.slice(start, end);
+  const body = readCaptureFunction('buildSyncBatchRecordInput');
   assert.match(body, /platform: record\.platform \|\| ''/u);
   assert.match(body, /workflow: record\.workflow \|\| ''/u);
   assert.match(

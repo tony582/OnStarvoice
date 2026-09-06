@@ -1,23 +1,9 @@
 import assert from "node:assert/strict";
-import {readFile} from "node:fs/promises";
+import {readCaptureFunction} from '../helpers/capture-delivery-source.mjs';
 import test from "node:test";
 
-const captureSyncSource = await readFile(
-  new URL("../../utils/capture-sync.js", import.meta.url),
-  "utf8",
-);
-
 function readFunctionBody() {
-  const start = captureSyncSource.indexOf(
-    "export async function batchCaptureDetailsForRecords",
-  );
-  const end = captureSyncSource.indexOf(
-    "export function resolveSyncInputForRecord",
-    start,
-  );
-  assert.ok(start >= 0, "missing batchCaptureDetailsForRecords");
-  assert.ok(end > start, "missing batchCaptureDetailsForRecords end marker");
-  return captureSyncSource.slice(start, end);
+  return readCaptureFunction('batchCaptureDetailsForRecords');
 }
 
 test("Douyin runner contract uses one dedicated worker and never the source tab", () => {
