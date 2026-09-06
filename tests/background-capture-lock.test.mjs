@@ -82,7 +82,20 @@ function createCaptureOwnerPort() {
   };
 }
 
-function createHarness() {
+function createHarness({nowMs} = {}) {
+  // Only explicitly dated scenarios replace the VM clock. The host clock and
+  // real timers stay untouched, and production retention logic is still used.
+  if (nowMs !== undefined) assert.ok(Number.isFinite(nowMs), "Invalid harness clock");
+  const clock = nowMs === undefined ? {} : {
+    Date: class extends Date {
+      constructor(...args) {
+        super(...(args.length ? args : [nowMs]));
+      }
+      static now() {
+        return nowMs;
+      }
+    },
+  };
   const storage = {};
   const sentTabMessages = [];
   const reloadedTabIds = [];
@@ -339,6 +352,7 @@ function createHarness() {
   };
 
   const context = vm.createContext({
+    ...clock,
     chrome,
     console: {
       error() {},
@@ -3565,7 +3579,7 @@ test("a terminal targeted-post update reports its cloud command before the messa
 });
 
 test("official patrol promotes a representative target failure to the request, task ledger, and cloud result", async () => {
-  const harness = createHarness();
+  const harness = createHarness({nowMs: Date.parse("2026-08-03T05:10:01.000Z")});
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {
       id: "agent-official-error",
@@ -7608,7 +7622,7 @@ test("normal persistent task end directly terminalizes its task-center run", asy
 });
 
 test("targeted native task end releases resources without absorbing a later sync failure", async () => {
-  const harness = createHarness();
+  const harness = createHarness({nowMs: Date.parse("2026-08-03T05:10:01.000Z")});
   const request = buildTargetedPostRequest({
     workflow: "official_account_comment_patrol",
     id: "official-sync-failure-request",
@@ -7703,6 +7717,36 @@ test("targeted native task end releases resources without absorbing a later sync
   assert.equal(matchingRuns[0].status, "failed");
   assert.equal(matchingRuns[0].error.code, "SYNC_RECORD_BATCH_FAILED");
   assert.equal(matchingRuns[0].error.message, "评论巡查结果同步失败");
+});
+
+test("the injected harness clock preserves the real thirty-day task ledger retention boundary", async () => {
+  const nowMs = Date.parse("2026-08-03T05:10:01.000Z");
+  const harness = createHarness({nowMs});
+  const retentionMs = 30 * 24 * 60 * 60 * 1000;
+  for (const [id, ageMs] of [
+    ["recent-finished", 1000],
+    ["cutoff-finished", retentionMs],
+    ["expired-finished", retentionMs + 1],
+  ]) {
+    const finishedAt = new Date(nowMs - ageMs).toISOString();
+    const result = await harness.api.upsertTaskLedgerRun({
+      run: {
+        id,
+        taskType: "capture",
+        status: "completed",
+        startedAt: finishedAt,
+        updatedAt: finishedAt,
+        finishedAt,
+      },
+    });
+    assert.equal(result.accepted, true);
+  }
+  const retained = harness.storage[TASK_LEDGER_KEY].runs;
+  assert.equal(retained.length, 2);
+  assert.equal(retained.some((run) => run.id === "recent-finished"), true);
+  assert.equal(retained.some((run) => run.id === "cutoff-finished"), true);
+  assert.equal(retained.some((run) => run.id === "expired-finished"), false);
+  assert.equal(harness.storage[TASK_LEDGER_KEY].updatedAt, new Date(nowMs).toISOString());
 });
 
 test("unexpected native Debug detach clears badge and group before the next task starts", async () => {
