@@ -483,13 +483,15 @@ async function realEntryHarness(t) {
       network.push({url:String(url),body:JSON.parse(options.body)});
       return await fetch(url,options);
     }});
-  for(const file of ['utils/task-center.js','utils/cloud-task-agent.js','utils/capture/task-owner.js','utils/control/state-fence.js','utils/control/terminal-authority.js']) {
+  for(const file of ['utils/task-center.js','utils/cloud-task-agent.js','utils/capture/task-owner.js','utils/control/state-fence.js','utils/control/terminal-authority.js','utils/control/stop-journal.js','utils/control/active-stop-authority.js','utils/capture/lifecycle/strict-control.js']) {
     vm.runInContext(read(file),context,{filename:file});
   }
   const functions=['runUnattendedRunMutation','runTaskLedgerMutation','runUnattendedRunArchiveMutation',
     'invalidateTerminalMetadataAuthority','handleTerminalMetadataConnection','readTerminalMetadataState',
     'readTerminalMetadataCredential','buildTerminalMetadataProjection','queryTerminalMetadataAuthority',
-    'commitAuthorizedTerminalMetadata','getTerminalMetadataAuthority','getUnattendedTaskCenterCore'];
+    'commitAuthorizedTerminalMetadata','getTerminalMetadataAuthority','getUnattendedTaskCenterCore',
+    'hasStrictCaptureStopControl','assertLegacyCaptureControlAvailable',
+    'strictLifecycleGuard','getStrictCaptureControl','queryActiveStopAuthority'];
   const keysStart=background.indexOf('const STORAGE_KEYS = {');
   const keysSource=background.slice(keysStart,background.indexOf('\n};',keysStart)+3);
   // Register the unchanged, complete real runtime listeners. Unused legacy
@@ -501,6 +503,7 @@ async function realEntryHarness(t) {
       setTimeoutFn:()=>{throw new Error('strict control must not start old owner timers');},
       onAbandoned:()=>{throw new Error('strict control must not abandon a legacy owner');}});
     let terminalMetadataAuthority=null;
+    let strictCaptureControl=null;
     const terminalMetadataCallers=new Map();
     let unattendedRunMutationQueue=Promise.resolve(),taskLedgerMutationQueue=Promise.resolve(),unattendedRunArchiveMutationQueue=Promise.resolve();
     ${functions.map(name=>declaration(background,name)).join('\n')}

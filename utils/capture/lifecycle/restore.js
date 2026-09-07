@@ -1,6 +1,13 @@
 // L1: restore responsibility. Existing behavior, explicit host ports, one shared lifecycle owner.
 (function register(root) {
   function create({state, ports, operations}) {
+    const strictPending = () => ({ok: false, accepted: false, restored: false,
+      released: false, resourcesReleased: false, cleanupPending: true,
+      cleanupCompleted: false, reason: 'strict_capture_control_retained'});
+    const strictRetained = async () => {
+      if (typeof ports.hasStrictCaptureStopControl !== 'function') return false;
+      try { return await ports.hasStrictCaptureStopControl() !== false; } catch { return true; }
+    };
     const {
       CAPTURE_TASK_GROUP_TITLE,
       captureRuntimeSnapshotMatches,
@@ -19,6 +26,7 @@
     const matchesUnattendedBeginLease = (...args) => operations.matchesUnattendedBeginLease(...args);
 
     async function cleanupStaleCaptureRuntimeSession(session) {
+      if (await strictRetained()) return strictPending();
       if (!session || typeof session !== 'object') return;
       const sourceTabId = resolveCaptureTaskTabId(
         session.sourceTabId,
@@ -148,6 +156,7 @@
         }
       }
 
+      if (await strictRetained()) return strictPending();
       await Promise.allSettled(
         [...new Set([sourceTabId, ...workerTabIds].filter(Boolean))].map((tabId) =>
           clearCaptureTaskTraceOverlayFailSoft({
@@ -157,9 +166,11 @@
         ),
       );
 
+      if (await strictRetained()) return strictPending();
       if (chrome.action?.setBadgeText) {
         await chrome.action.setBadgeText({text: ''}).catch(() => null);
       }
+      if (await strictRetained()) return strictPending();
       if (
         sourceTab &&
         !pendingNativeGroupSetup &&
@@ -173,9 +184,11 @@
           throw error;
         });
       }
+      if (await strictRetained()) return strictPending();
       if (verifiedWorkerTabIds.length > 0) {
         await closeCaptureTaskWorkerTabs(verifiedWorkerTabIds);
       }
+      if (await strictRetained()) return strictPending();
       if (!sourceTab) return;
       if (Number.isSafeInteger(originalGroupId) && originalGroupId >= 0) {
         try {
@@ -185,6 +198,7 @@
           });
           return;
         } catch {
+          if (await strictRetained()) return strictPending();
           // The user's former group no longer exists; ungroup below.
         }
       }
@@ -204,6 +218,7 @@
     }
 
     async function clearPersistedCaptureRuntimeSnapshot(expected) {
+      if (await strictRetained()) return false;
       let cleared = false;
       await writeRuntimeState((current) => {
         if (!captureRuntimeSnapshotMatches(current.captureDebugSession, expected)) {
@@ -216,6 +231,7 @@
     }
 
     async function publishRestoredCaptureRuntimeSnapshot(expected, session) {
+      if (await strictRetained()) return false;
       let published = false;
       await writeRuntimeState((current) => {
         if (!captureRuntimeSnapshotMatches(current.captureDebugSession, expected)) {
@@ -224,6 +240,7 @@
         published = true;
         return {captureDebugSession: session};
       });
+      if (await strictRetained()) return false;
       if (published && chrome.action?.setBadgeText) {
         await Promise.allSettled([
           chrome.action.setBadgeText({
@@ -239,6 +256,7 @@
     }
 
     async function restorePersistedCaptureRuntimeSession(runtime) {
+      if (await strictRetained()) return strictPending();
       const snapshot = runtime?.captureDebugSession;
       if (
         !snapshot ||
@@ -258,6 +276,7 @@
       if (state.captureRuntimeRestorePromise) return await state.captureRuntimeRestorePromise;
 
       state.captureRuntimeRestorePromise = (async () => {
+        if (await strictRetained()) return strictPending();
         const taskId = String(snapshot.taskId || '').trim();
         if (!taskId) return {restored: false, reason: 'missing_task_id'};
         const restoreDetachedAssist =
@@ -271,6 +290,7 @@
           taskId,
           attemptId,
         });
+        if (await strictRetained()) return strictPending();
         const restoreSnapshot = {...snapshot, attemptId};
         const cleanupPending = Boolean(
           restoreSnapshot.cleanupPending === true ||
@@ -304,6 +324,7 @@
             // so an old attempt cannot close or forget resources after a new
             // attempt has already claimed the same stable task id.
             await cleanupStaleCaptureRuntimeSession(restoreSnapshot);
+            if (await strictRetained()) return strictPending();
             const cleanupCompleted =
               await clearPersistedCaptureRuntimeSnapshot(restoreSnapshot);
             return {
@@ -332,11 +353,13 @@
         }
 
         const restoreFenceStillCurrent = async () => {
+          if (await strictRetained()) return false;
           if (!initialFence.unattended) return true;
           const currentFence = await inspectUnattendedCaptureTaskAttempt({
             taskId,
             attemptId,
           });
+          if (await strictRetained()) return false;
           return Boolean(
             currentFence.active &&
               currentFence.lockMatchesTaskAttempt &&
@@ -355,6 +378,7 @@
         let group = null;
         let session = null;
         const discardRestoreAttempt = async () => {
+          if (await strictRetained()) return false;
           const activeSession =
             state.captureDebugSessionManager.getSessionByTaskId(taskId);
           const exactActiveSession = Boolean(
@@ -391,6 +415,7 @@
             }
           }
           const currentGroup = state.captureTaskTabGroupManager.getTask(taskId);
+          if (await strictRetained()) return false;
           if (
             group &&
             currentGroup &&
@@ -406,6 +431,7 @@
                   currentGroup.workerTabIds,
                 );
               }
+              if (await strictRetained()) return false;
               const groupResult = await state.captureTaskTabGroupManager.end({
                 taskId,
                 attemptId,
@@ -432,6 +458,7 @@
         const discardRestoreOrKeepPending = async (
           reason = 'stale_unattended_attempt',
         ) => {
+          if (await strictRetained()) return strictPending();
           if (await discardRestoreAttempt()) return staleRestoreResult(reason);
           return {
             restored: false,
@@ -482,6 +509,8 @@
         }
 
         const validateRestoreSource = async () => {
+          if (await strictRetained()) throw createCaptureTaskError(
+            'strict_capture_control_retained', '严格停止控制记录仍保留，未恢复旧运行资源');
           let restoreSourceTab;
           try {
             restoreSourceTab = await chrome.tabs.get(restoreSourceTabId);
@@ -492,6 +521,8 @@
               error,
             );
           }
+          if (await strictRetained()) throw createCaptureTaskError(
+            'strict_capture_control_retained', '严格停止控制记录仍保留，未恢复旧运行资源');
           const restorePlatform = detectPlatformFromUrl(
             restoreSourceTab?.url || '',
           );
@@ -516,6 +547,7 @@
         try {
           await validateRestoreSource();
         } catch (error) {
+          if (await strictRetained()) return strictPending();
           const normalizedError = error?.code
             ? error
             : createCaptureTaskError(
@@ -535,6 +567,7 @@
           };
         }
         if (!(await restoreFenceStillCurrent())) {
+          if (await strictRetained()) return strictPending();
           return staleRestoreResult();
         }
 
@@ -562,6 +595,7 @@
             return await discardRestoreOrKeepPending();
           }
           await validateRestoreSource();
+          if (await strictRetained()) return strictPending();
           const verifiedWorkerTabIds = group?.workerTabIds || [];
           const normalizedRestoreSnapshot = {
             ...restoreSnapshot,
@@ -592,6 +626,7 @@
               return await discardRestoreOrKeepPending();
             }
             await validateRestoreSource();
+            if (await strictRetained()) return strictPending();
             session = await state.captureDebugSessionManager.restore(
               {
                 ...normalizedRestoreSnapshot,
@@ -604,6 +639,7 @@
             return await discardRestoreOrKeepPending();
           }
           await validateRestoreSource();
+          if (await strictRetained()) return strictPending();
           const published = await publishRestoredCaptureRuntimeSnapshot(
             restoreSnapshot,
             session,
@@ -623,6 +659,7 @@
             assistDegraded,
           };
         } catch (error) {
+          if (await strictRetained()) return strictPending();
           if (!(await discardRestoreAttempt())) {
             return {
               restored: false,

@@ -691,6 +691,7 @@ export function createUnattendedRunController({controllerState, controllerPorts,
                 ])
               : [null, null];
           if (
+            !controllerPorts.strictCaptureClient &&
             Number.isFinite(Number(targetTab.windowId)) &&
             Number(targetTab.windowId) >= 0
           ) {
@@ -1161,8 +1162,15 @@ export function createUnattendedRunController({controllerState, controllerPorts,
   }
 
   async function runUnattendedKeywordPlanRequest(request) {
+    const strictClient = controllerPorts.strictCaptureClient;
     const requestId = String(request?.id || "").trim();
     const requestAttemptId = String(request?.attemptId || "").trim();
+    if (strictClient && (strictClient.strictControl.requestId !== requestId ||
+        strictClient.strictControl.attemptId !== requestAttemptId)) {
+      const error = new Error('strict_producer_identity_mismatch');
+      error.code = 'strict_producer_identity_mismatch';
+      throw error;
+    }
     const executionCopy = getKeywordExecutionCopy(request);
     const executionMode = executionCopy.executionMode;
     const isCurrentRequestAttempt = () =>
@@ -1330,7 +1338,11 @@ export function createUnattendedRunController({controllerState, controllerPorts,
           : {}),
       },
     };
-    const runStartedAt = new Date().toISOString();
+    const strictContinuation = strictClient &&
+      controllerPorts.strictCaptureContinuation?.requestId === requestId &&
+      controllerPorts.strictCaptureContinuation?.attemptId === requestAttemptId
+      ? controllerPorts.strictCaptureContinuation : null;
+    const runStartedAt = strictContinuation?.runStartedAt || new Date().toISOString();
     startingProgress.runStartedAt = runStartedAt;
     const createTerminalProgress = ({
       status,
@@ -1368,7 +1380,7 @@ export function createUnattendedRunController({controllerState, controllerPorts,
       throw error;
     }
     rememberCaptureTaskProgressContext(startingProgress);
-    const startReport = await reportInitialUnattendedKeywordRun(
+    const startReport = strictContinuation?.startReport || await reportInitialUnattendedKeywordRun(
       requestId,
       {
         status: "running",
@@ -1419,6 +1431,17 @@ export function createUnattendedRunController({controllerState, controllerPorts,
         platformSearchStarted: false,
       };
       throw error;
+    }
+    if (request?.strictControlCandidate === true && !strictClient) {
+      // Admission follows the existing accepted running checkpoint, but occurs
+      // before platform switching, native assist setup or any page producer.
+      // Continue through the same function with private ports; preserve this
+      // accepted report and start clock instead of submitting either twice.
+      return controllerOperations.runStrictCaptureProducer(request,
+        (scope) => scope.operations.runUnattendedKeywordPlanRequest(request),
+        'unattended-keyword-producer', Object.freeze({
+          requestId, attemptId: requestAttemptId, runStartedAt, startReport,
+        }));
     }
     controllerState.keywordPlanState = {
       ...(controllerState.keywordPlanState && typeof controllerState.keywordPlanState === "object"
@@ -1498,12 +1521,14 @@ export function createUnattendedRunController({controllerState, controllerPorts,
           remainingMs: bootstrapGate.waitMs,
         });
         await sleepWithStop(bootstrapGate.waitMs, () =>
+          strictClient?.shouldStop() ||
           controllerState.activeUnattendedAttemptRejected ||
           !isCurrentRequestAttempt() ||
           controllerState.batchKeywordCancelRequested ||
           Boolean(controllerState.activeCaptureTaskCancellationReason),
         );
         if (
+          strictClient?.shouldStop() ||
           controllerState.activeUnattendedAttemptRejected ||
           !isCurrentRequestAttempt() ||
           controllerState.batchKeywordCancelRequested ||
@@ -1622,12 +1647,14 @@ export function createUnattendedRunController({controllerState, controllerPorts,
               retried: attempt,
             });
             await sleepWithStop(delayMs, () =>
+              strictClient?.shouldStop() ||
               controllerState.activeUnattendedAttemptRejected ||
               !isCurrentRequestAttempt() ||
               controllerState.batchKeywordCancelRequested ||
               Boolean(controllerState.activeCaptureTaskCancellationReason),
             );
             if (
+              strictClient?.shouldStop() ||
               controllerState.activeUnattendedAttemptRejected ||
               !isCurrentRequestAttempt() ||
               controllerState.batchKeywordCancelRequested ||
@@ -1693,6 +1720,7 @@ export function createUnattendedRunController({controllerState, controllerPorts,
         ).trim(),
         maxAttempts: localBootstrapMaxAttempts,
         shouldStop: () =>
+          strictClient?.shouldStop() ||
           controllerState.activeUnattendedAttemptRejected ||
           !isCurrentRequestAttempt() ||
           controllerState.batchKeywordCancelRequested ||
@@ -1730,6 +1758,7 @@ export function createUnattendedRunController({controllerState, controllerPorts,
         unattendedSourceTabId = finalSourceTabId;
       }
       if (
+        strictClient?.shouldStop() ||
         controllerState.activeUnattendedAttemptRejected ||
         !isCurrentRequestAttempt() ||
         controllerState.batchKeywordCancelRequested ||

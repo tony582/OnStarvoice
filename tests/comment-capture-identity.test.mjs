@@ -84,8 +84,8 @@ test("a comment runner stays bound when the active tab changes", async () => {
 test("opening and capturing progress expose the relay identity before the task starts", () => {
   const retryBlock = sourceBlock(
     captureSyncSource,
-    "export async function retryCommentsForRecord",
-    "export async function retryDetailCaptureForRecord",
+    "async function retryCommentsForRecord",
+    "async function retryDetailCaptureForRecord",
   );
   assert.ok(
     retryBlock.indexOf("ensureCommentCaptureIdentity") <

@@ -24,7 +24,7 @@ function deferred() {let resolve;const promise=new Promise(r=>{resolve=r;});retu
 // Execute the actual host body and actual ESM coordinator with only imported
 // I/O capabilities substituted. No concatenated reconstruction of moved code.
 // This also exercises EOF composition and host-to-stage compatibility aliases.
-function createHostHarness({source=hostSource, records=[], responses=[], rejectWrite=false}={}) {
+function createHostHarness({source=hostSource, records=[], responses=[], rejectWrite=false, pipelineFactory=createResultDeliveryPipeline}={}) {
   let pool={records:clone(records)};let sequence=0;let queue=Promise.resolve();
   const events=[];const controls={rejectWrite,responses:[...responses]};
   const tidy=value=>JSON.parse(JSON.stringify(value, (key,v)=>
@@ -34,7 +34,7 @@ function createHostHarness({source=hostSource, records=[], responses=[], rejectW
   const persistRecords=records=>{recordEvent('save-many',records);pool.records.unshift(...clone(records));return Promise.resolve(records);};
   const context=vm.createContext({
     ...constants,...helpers,...classification,...dedupe,...recovery,...author,
-    createResultDeliveryPipeline,URL,TextEncoder,Date,Math,console:{log(){},warn(){},error(){}},
+    createResultDeliveryPipeline:pipelineFactory,URL,TextEncoder,Date,Math,console:{log(){},warn(){},error(){}},
     buildPlatformSyncInput:router.buildSyncInput,
     buildSyncHistoryTarget:router.buildSyncHistoryTarget,
     resolveSyncTableName:router.resolveSyncTableName,
@@ -58,7 +58,17 @@ function createHostHarness({source=hostSource, records=[], responses=[], rejectW
   let executable=source.replace(/^import\s*(?:\{[^}]*\}\s*from\s*)?['"][^'"]+['"];[^\S\n]*\n/gmu,'');
   executable=executable.replace(/^export \{[^}]*\};/gmu,'').replace(/^export (?=(?:async )?function\b)/gmu,'');
   assert.doesNotMatch(executable,/^import\b|^export\b/mu);
-  vm.runInContext(`${executable}\nglobalThis.deliveryTestApi = {${functionNames.join(',')}};`,context,{filename:'actual-capture-sync-host',timeout:1000});
+  const expose = `globalThis.deliveryTestApi = {${functionNames.join(',')}};`;
+  if (source.includes('export function createCaptureSyncScope(')) {
+    const boundary = 'return Object.freeze({\n  beginCaptureTaskSession: scopedCaptureEntry(beginCaptureTaskSession),';
+    assert.equal(executable.split(boundary).length, 2, 'one actual private host assembly');
+    executable = executable.replace(boundary, `${expose}\n${boundary}`);
+    executable += '\ncreateCaptureSyncScope({chromeApi:{}});';
+  } else {
+    // Exact historical Git objects predate the private capability scope.
+    executable += `\n${expose}`;
+  }
+  vm.runInContext(executable,context,{filename:'actual-capture-sync-host',timeout:1000});
   return {api:context.deliveryTestApi,controls,events,context,get pool(){return clone(pool);},progress:event=>recordEvent('progress',event),tidy};
 }
 
@@ -127,21 +137,29 @@ test('cancelled batch cannot issue a request or confirm any record',async()=>{
 });
 
 test('separate batch requests are not serialized through an invented global submission queue',async()=>{
-  const a=createHostHarness({records:[keyword('a')]});const b=createHostHarness({records:[keyword('b')]});const gate=deferred();const entered=deferred();
+  const gate=deferred();const entered=deferred();
   // An I/O seam is captured during assembly, so create a fresh real host realm
   // with a delayed response rather than mutating any stage's operation table.
   const original=createResultDeliveryPipeline;let blockedApi;
   const wrapped=ports=>{const api=original({...ports,syncBatch:async(...args)=>{entered.resolve();await gate.promise;return ports.syncBatch(...args);}});blockedApi=api;return api;};
-  a.context.createResultDeliveryPipeline=wrapped;
+  const a=createHostHarness({records:[keyword('a')],pipelineFactory:wrapped});const b=createHostHarness({records:[keyword('b')]});
   const portsSource=hostSource.slice(hostSource.indexOf('const resultDelivery = createResultDeliveryPipeline('),hostSource.indexOf('\nconst {\n  appendFrontendSyncFailureHistory,',hostSource.indexOf('const resultDelivery ='))).replace('const resultDelivery =','globalThis.delayedDelivery =');
-  assert.ok(portsSource.includes('waitMs,'));vm.runInContext(portsSource,a.context);
+  assert.ok(portsSource.includes('waitMs,'));assert.equal(typeof a.api.syncRecordBatch,'function');
   const waiting=blockedApi.syncRecordBatch(['a'],null,{captureSettings:{},requestSpacingMs:0});await entered.promise;
   const other=await b.api.syncRecordBatch(['b'],null,{captureSettings:{},requestSpacingMs:0});assert.equal(other.ok,true);gate.resolve();assert.equal((await waiting).ok,true);
 });
 
 test('all original host export names remain present and old migrated bodies are absent',async()=>{
-  const api=await import('../../utils/capture-sync.js');assert.equal(fixture.publicExports.length,45);assert.deepEqual(Object.keys(api).sort(),fixture.publicExports);
-  for(const name of functionNames)assert.doesNotMatch(hostSource,new RegExp(`\\bfunction ${name}\\(`,'u'));
+  const api=await import('../../utils/capture-sync.js');assert.equal(fixture.publicExports.length,45);
+  assert.deepEqual(Object.keys(api).sort(),[...fixture.publicExports,'createCaptureSyncScope'].sort());
+  assert.deepEqual(Object.keys(api.createCaptureSyncScope({chromeApi:{}})).sort(),fixture.publicExports);
+  const privateHost = hostSource.slice(0,hostSource.indexOf('\nconst legacyChromeApi ='));
+  assert.ok(privateHost.length>0);
+  for(const name of functionNames){
+    assert.doesNotMatch(privateHost,new RegExp(`\\bfunction ${name}\\(`,'u'));
+    if(fixture.publicExports.includes(name))assert.match(api[name].toString(),new RegExp(`^(?:async )?function ${name}\\(\\.\\.\\.args\\) \\{\\s*return getLegacyCaptureSyncScope\\(\\)\\.${name}\\(\\.\\.\\.args\\);\\s*\\}$`,'u'));
+    else assert.doesNotMatch(hostSource,new RegExp(`\\bfunction ${name}\\(`,'u'));
+  }
   assert.match(hostSource,/addRecord as persistRecord/u);assert.match(hostSource,/savePreparedRecord: addRecord/u);assert.match(hostSource,/savePreparedRecords: addRecords/u);
   assert.doesNotMatch(hostSource,/\b(?:let|const) activeListCaptureCheckpointSession\b/u);
 });

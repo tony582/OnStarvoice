@@ -730,6 +730,16 @@ export function createTargetedController({controllerState, controllerPorts, cont
       renderCaptureDebugSession(getCurrentRuntime() || {});
       return;
     }
+    if (binding.request?.strictControlCandidate === true && !controllerPorts.strictCaptureClient) {
+      return controllerOperations.runStrictCaptureProducer(binding.request,
+        (scope) => scope.operations.maybeClaimAndRunTargetedPostWorkflow(),
+        'targeted-post-producer');
+    }
+    if (controllerPorts.strictCaptureClient &&
+        (controllerPorts.strictCaptureClient.strictControl.requestId !== requestId ||
+         controllerPorts.strictCaptureClient.strictControl.attemptId !== attemptId)) {
+      throw createTargetedPostInvocationError('strict_producer_identity_mismatch');
+    }
     if (
       controllerState.activeTargetedPostInvocationToken &&
       !isSameTargetedPostInvocationToken(
@@ -819,6 +829,7 @@ export function createTargetedController({controllerState, controllerPorts, cont
       await targetedBusinessProgressInFlight;
     };
     const shouldStop = () =>
+      controllerPorts.strictCaptureClient?.shouldStop() ||
       !isActiveTargetedPostInvocation(invocationToken) ||
       (isSameTargetedPostInvocationToken(
         controllerState.targetedPostRunInFlightOwnerToken,

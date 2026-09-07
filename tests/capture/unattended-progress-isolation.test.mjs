@@ -262,7 +262,7 @@ test("the awaited unattended start report cannot erase cancellation of the activ
     "runUnattendedKeywordPlanRequest",
   );
   const startReportAt = runSource.indexOf(
-    "const startReport = await reportInitialUnattendedKeywordRun(",
+    "const startReport = strictContinuation?.startReport || await reportInitialUnattendedKeywordRun(",
   );
   const keywordPlanCommitAt = runSource.indexOf(
     "keywordPlanState =",

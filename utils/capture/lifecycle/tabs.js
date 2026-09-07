@@ -1,6 +1,13 @@
 // L1: tabs responsibility. Existing behavior, explicit host ports, one shared lifecycle owner.
 (function register(root) {
   function create({state, ports, operations}) {
+    const strictPending = () => ({ok: false, accepted: false, released: false,
+      resourcesReleased: false, cleanupPending: true, ignored: true,
+      reason: 'strict_capture_control_retained'});
+    const strictRetained = async () => {
+      if (typeof ports.hasStrictCaptureStopControl !== 'function') return false;
+      try { return await ports.hasStrictCaptureStopControl() !== false; } catch { return true; }
+    };
     const {
       STORAGE_KEYS,
       chrome,
@@ -30,7 +37,9 @@
     const replaceTrackedCaptureTaskWorkerTab = (...args) => operations.replaceTrackedCaptureTaskWorkerTab(...args);
 
     async function replaceCaptureExecutionLockTabId(removedTabId, addedTabId) {
+      if (await strictRetained()) return false;
       return await runCaptureExecutionLockOperation(async () => {
+        if (await strictRetained()) return false;
         const stored = await chrome.storage.local.get(
           STORAGE_KEYS.captureExecutionLock,
         );
@@ -41,6 +50,7 @@
         if (!lock || Number(lock.holderTabId) !== Number(removedTabId)) {
           return false;
         }
+        if (await strictRetained()) return false;
         await chrome.storage.local.set({
           [STORAGE_KEYS.captureExecutionLock]: {
             ...lock,
@@ -53,7 +63,9 @@
     }
 
     async function replaceUnattendedRunnerTabId(removedTabId, addedTabId) {
+      if (await strictRetained()) return false;
       return await runUnattendedRunMutation(async () => {
+        if (await strictRetained()) return false;
         const request = await readUnattendedKeywordRunRequest();
         if (
           !request ||
@@ -68,6 +80,7 @@
           runnerTabId: Number(addedTabId),
           updatedAt: now,
         };
+        if (await strictRetained()) return false;
         await persistUnattendedRunMutation(nextRequest, {
           previousRequest: request,
           event: {
@@ -81,6 +94,7 @@
     }
 
     async function handleCaptureRuntimeTabReplaced(addedTabId, removedTabId) {
+      if (await strictRetained()) return false;
       const normalizedAddedTabId = resolveCaptureTaskTabId(addedTabId);
       const normalizedRemovedTabId = resolveCaptureTaskTabId(removedTabId);
       if (!normalizedAddedTabId || !normalizedRemovedTabId) return false;
@@ -122,6 +136,7 @@
 
       if (!taskId) {
         const unattendedRequest = await readUnattendedKeywordRunRequest();
+        if (await strictRetained()) return false;
         const replacesUnattendedRunner = Boolean(
           unattendedRequest &&
             !isTerminalUnattendedRunStatus(unattendedRequest.status) &&
@@ -140,6 +155,7 @@
         } catch {
           return false;
         }
+        if (await strictRetained()) return false;
         if (
           expectedPlatform === 'unknown' ||
           String(replacementTab?.status || '').trim().toLowerCase() !== 'complete' ||
@@ -161,6 +177,7 @@
       }
 
       const failAuthoritativeReplacement = async (error) => {
+        if (await strictRetained()) return false;
         const message = `浏览器替换采集页面后任务迁移失败：${String(
           error?.message || error || '未知错误',
         )}`;
@@ -168,6 +185,7 @@
           taskId,
           reason: 'source_tab_replace_failed',
         });
+        if (await strictRetained()) return false;
         if (unattendedRecovery.handled) {
           return Boolean(unattendedRecovery.recovery?.recovered);
         }
@@ -175,10 +193,12 @@
           taskId,
           'source_tab_replace_failed',
         );
+        if (await strictRetained()) return false;
         await terminalizeCaptureTaskLedgerRun(taskId, {
           reason: 'source_tab_replace_failed',
           message,
         });
+        if (await strictRetained()) return false;
         const latestSession =
           state.captureDebugSessionManager.getSessionByTaskId(taskId) ||
           previousDebugSession;
@@ -186,6 +206,7 @@
           latestSession,
           'source_tab_replace_failed',
         );
+        if (await strictRetained()) return false;
         try {
           await releaseCaptureTaskResourcesWithRetry(
             {
@@ -223,6 +244,7 @@
         // unattended/manual recovery semantics for that authoritative failure.
         return await failAuthoritativeReplacement(error);
       }
+      if (await strictRetained()) return false;
       if (replacementRole === 'source') {
         const explicitExpectedPlatform = normalizePlatformId(
           previousDebugSession?.platform || pendingBegin?.platform,
@@ -308,6 +330,7 @@
         }
       }
 
+      if (await strictRetained()) return false;
       let debugResult = null;
       let debugMigrationError = null;
       let debugAssistDegraded =
@@ -333,6 +356,7 @@
         }
       }
 
+      if (await strictRetained()) return false;
       const replacementWorkerTabIds = getTrackedCaptureTaskWorkers(
         taskId,
         previousDebugSession,
@@ -366,14 +390,16 @@
               groupId: Number(forgottenGroup.originalGroupId),
               tabIds: [normalizedAddedTabId],
             })
-            .catch(() =>
-              chrome.tabs.ungroup([normalizedAddedTabId]).catch(() => null),
-            );
+            .catch(async () => {
+              if (await strictRetained()) return false;
+              return chrome.tabs.ungroup([normalizedAddedTabId]).catch(() => null);
+            });
         } else {
           await chrome.tabs.ungroup([normalizedAddedTabId]).catch(() => null);
         }
       }
 
+      if (await strictRetained()) return false;
       if (previousDebugSession && debugAssistDegraded) {
         try {
           debugResult = await state.captureDebugSessionManager.degradeTabReplacement({
@@ -406,6 +432,7 @@
           });
       }
 
+      if (await strictRetained()) return false;
       if (
         replacementRole === 'worker' ||
         groupResult?.role === 'worker' ||
@@ -433,6 +460,7 @@
         return await failAuthoritativeReplacement(error);
       }
 
+      if (await strictRetained()) return false;
       rememberCaptureTaskReplacementTab({
         removedTabId: normalizedRemovedTabId,
         addedTabId: normalizedAddedTabId,
@@ -459,16 +487,19 @@
     }
 
     async function handleCaptureRuntimeTabRemoved(tabId) {
+      if (await strictRetained()) return strictPending();
       const session = state.captureDebugSessionManager.getSession(tabId);
       if (session?.persistent && session.taskId) {
         const stableUnattended = await inspectStableUnattendedCaptureTask(
           session.taskId,
         );
+        if (await strictRetained()) return strictPending();
         if (stableUnattended.active) {
           const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
             taskId: session.taskId,
             reason: 'source_tab_removed',
           });
+          if (await strictRetained()) return strictPending();
           if (unattendedRecovery.handled) return;
         }
         if (stableUnattended.unattended) {
@@ -482,11 +513,14 @@
           return;
         }
         await publishCaptureTaskCancellation(session.taskId, 'source_tab_removed');
+        if (await strictRetained()) return strictPending();
         await terminalizeCaptureTaskLedgerRun(session.taskId, {
           reason: 'source_tab_removed',
           message: '采集来源页面已关闭，任务已停止',
         });
+        if (await strictRetained()) return strictPending();
         await relayCaptureTaskCancellation(session, 'source_tab_removed');
+        if (await strictRetained()) return strictPending();
         try {
           await releaseCaptureTaskResourcesWithRetry(
             {
@@ -502,6 +536,7 @@
         return;
       }
       await state.captureDebugSessionManager.handleTabRemoved(tabId);
+      if (await strictRetained()) return strictPending();
       await state.captureTaskTabGroupManager.handleTabRemoved(tabId);
     }
 

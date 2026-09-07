@@ -6,6 +6,7 @@
 
 import "./control-storage-reserve.js";
 import "./control/state-fence.js";
+import "./control/stop-journal.js";
 
 import {
   STORAGE_KEY,
@@ -1199,6 +1200,11 @@ export async function clearAll() {
   // or archive can repair the just-deleted ledger and resurrect old history.
   await globalThis.OnStarvoiceControlStateFence.runAuth(() =>
     globalThis.OnStarvoiceControlStateFence.run(async () => {
+      const stopKey = globalThis.OnStarvoiceStopJournal.KEY;
+      if ((await chrome.storage.local.get(stopKey))[stopKey] != null) {
+        throw Object.assign(new Error('严格任务仍需停止确认，未清除结果或控制记录'),
+          {code: 'strict_capture_control_retained'});
+      }
       const stored = await chrome.storage.local.get(STORAGE_KEY.TASK_LEDGER);
       const previous = Date.parse(stored[STORAGE_KEY.TASK_LEDGER]?.clearedAt || '');
       const now = new Date(Math.max(Date.now(), Number.isFinite(previous) ? previous + 1 : 0)).toISOString();

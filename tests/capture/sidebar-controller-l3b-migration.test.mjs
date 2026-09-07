@@ -24,6 +24,34 @@ const historical = JSON.parse(historicalSource);
 const runtimeSources = readSidebarRuntimeSources();
 const runtimeAsts = new Map(runtimeSources.map(entry => [entry.path, parseSidebarAst(entry.source)]));
 const hash = source => createHash('sha256').update(source.split('\n').map(line => line.trim()).join('\n')).digest('hex');
+const activeStopDeltaSource = readFileSync(new URL('tests/fixtures/sidebar-controller-active-stop-delta.json', root), 'utf8');
+const activeStopDelta = JSON.parse(activeStopDeltaSource);
+assert.equal(activeStopDelta.baseline, '3c19c5ea14c9ac1f68a21da8b8caf30353b459d1');
+assert.equal(createHash('sha256').update(activeStopDeltaSource).digest('hex'),
+  '71f5a4b27e36cb306aa92c2b24af2fae7a6f6f40f7364739f6f33c1d21bad923');
+assert.equal(activeStopDelta.entries.length, 12);
+const activeStopChanges = new Map(activeStopDelta.entries.map(entry => [entry.name, entry]));
+assert.equal(activeStopChanges.size, 12);
+function rawSidebarFunction(name) {
+  const owner = readSidebarFunctionOwner(name);
+  const node = findSidebarFunctionAst(runtimeAsts.get(owner.path), name);
+  return owner.source.slice(...node.range);
+}
+function withoutVerifiedActiveStopDelta(name, source) {
+  const change = activeStopChanges.get(name);
+  if (!change) return source;
+  assert.equal(readSidebarFunctionOwner(name).path, change.owner, `${name}: strict delta owner`);
+  assert.equal(createHash('sha256').update(source).digest('hex'), change.sha256,
+    `${name}: exact strict body before inverse verification`);
+  const lines = source.split('\n');
+  for (const patch of [...change.reverse].reverse()) {
+    assert.equal(Number.isSafeInteger(patch.at) && patch.at >= 0, true);
+    assert.deepEqual(lines.slice(patch.at, patch.at + patch.remove.length), patch.remove,
+      `${name}: exact strict delta at ${patch.at}`);
+    lines.splice(patch.at, patch.remove.length, ...patch.insert);
+  }
+  return lines.join('\n');
+}
 const privateNames = ['setRecoveryCopy', 'isRecoveryActionAvailable', 'handoffRecoveryFocus'];
 const delegateNames = ['buildCaptureProgressText', 'normalizeProgressCount'];
 const names = entries => entries.map(entry => entry.name).sort();
@@ -64,7 +92,7 @@ test('L3-B pins 216 actual single owners without rewriting L3-A evidence or reco
   assert.equal(remaining.length, 293);
 });
 
-test('default CI compares 202 current normalized ASTs to the exact parent hashes and explicitly excludes 14 semantic transitions', () => {
+test('default CI verifies the exact strict delta then compares 202 normalized ASTs to unchanged parent hashes and excludes 14 semantic transitions', () => {
   assert.equal(manifest.normalizedAstAudit.version, AST_AUDIT_VERSION);
   assert.equal(manifest.normalizedAstAudit.equivalentCount, 202);
   const semantic = Object.keys(manifest.normalizedAstAudit.semanticTransitions).sort();
@@ -78,7 +106,8 @@ test('default CI compares 202 current normalized ASTs to the exact parent hashes
   let equivalents = 0;
   for (const entry of manifest.entries) {
     assert.match(entry.baselineNormalizedAstSha256, /^[a-f0-9]{64}$/u, entry.name);
-    const actual = hashSidebarFunctionAst(findSidebarFunctionAst(runtimeAsts.get(entry.owner), entry.name));
+    const verifiedSource = withoutVerifiedActiveStopDelta(entry.name, rawSidebarFunction(entry.name));
+    const actual = hashSidebarFunctionAst(findSidebarFunctionAst(parseSidebarAst(verifiedSource), entry.name));
     if (semantic.includes(entry.name)) {
       assert.notEqual(actual, entry.baselineNormalizedAstSha256, `${entry.name}: semantic change must not claim AST equivalence`);
     } else {
@@ -100,13 +129,13 @@ test('two separately recorded in-scope host progress transitions keep explicit p
   }
 });
 
-test('all 165 L3-A operations retain historical hashes except the explicitly categorized 21 semantic-port changes', () => {
+test('all 165 L3-A operations retain historical hashes after exact strict-delta verification except the 21 categorized semantic-port changes', () => {
   const moved = historical.entries.filter(entry => entry.module);
   assert.equal(moved.length, 165);
   assert.equal(Object.keys(manifest.l3aTransitions).length, 24);
   const changed = [];
   for (const entry of moved) {
-    const actualHash = hash(readSidebarFunction(entry.name));
+    const actualHash = hash(withoutVerifiedActiveStopDelta(entry.name, rawSidebarFunction(entry.name)));
     const transition = manifest.l3aTransitions[entry.name];
     if (!transition || transition === 'unchanged-body-now-view-private') {
       assert.equal(actualHash, entry.migratedSha256, `${entry.name}: no undeclared body change`);

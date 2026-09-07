@@ -5,6 +5,7 @@
 
 import { PAGE_TYPE, SYNC_TYPE, DEFAULT_CONFIG } from "../constants.js";
 import { cleanText, extractNoteId } from "../helpers.js";
+import {pageActivity} from "./content-activity.js";
 import {
   autoScrollLoad,
   isCanceled,
@@ -228,7 +229,7 @@ export async function captureDouyinKeywordNotes({
   };
   const waitWithPageGuard = async (promise) => {
     const outcome = await Promise.race([
-      Promise.resolve(promise).then(
+      pageActivity.trackChild(Promise.resolve(promise), {kind: 'douyin-page-guard'}).then(
         (value) => ({value}),
         (error) => ({error}),
       ),

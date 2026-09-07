@@ -4,6 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
+import {createContentActivityRegistry} from "../utils/capture/content-activity.js";
 import {
   buildCommentLoadStage,
   resolveCommentCaptureStatus,
@@ -13,6 +14,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const source = (await readFile(resolve(repoRoot, "utils/scroll.js"), "utf8"))
   .replace("import { randomScrollDistance } from './helpers.js';", "")
   .replace("import { DEFAULT_CONFIG } from './constants.js';", "")
+  .replace("import { pageActivity } from './capture/content-activity.js';", "")
   .replace(/\bexport\s+(?=(?:async\s+)?function\b)/g, "");
 const xiaohongshuCommentsSource = await readFile(
   resolve(repoRoot, "utils/capture/comments.js"),
@@ -53,6 +55,7 @@ function createHarness({
     },
   };
   const context = vm.createContext({
+    pageActivity: createContentActivityRegistry({createActivationId: () => 'scroll-fixture-activation'}),
     DEFAULT_CONFIG: {
       MAX_SCROLL_TIMES: 50,
       NO_NEW_CONTENT_THRESHOLD: 3,

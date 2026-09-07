@@ -234,7 +234,14 @@ test("all task-level runtime messages are wired in the service worker", () => {
     ["onstarvoice:set-capture-task-minimized", "setCaptureTaskMinimized", "message"],
   ]) {
     assert.equal(backgroundSource.includes(`type === '${type}'`), true, type);
-    assert.match(backgroundSource, new RegExp(
+    const strictEndGate = "        const strict = await strictLifecycleGuard('end', message, sender);\n        if (strict) {sendResponse({ok: true, data: strict}); return;}\n";
+    const legacySource = type === 'onstarvoice:end-capture-task'
+      ? backgroundSource.replace(strictEndGate, '') : backgroundSource;
+    if (type === 'onstarvoice:end-capture-task') {
+      assert.equal(backgroundSource.split(strictEndGate).length - 1, 1,
+        'only the exact strict END branch may precede the unchanged legacy delegate');
+    }
+    assert.match(legacySource, new RegExp(
       `if \\(type === '${type}'\\) \\{\\s*const data = await ${handler}\\(${parameters}\\);\\s*sendResponse\\(\\{ok: true, data\\}\\);\\s*return;\\s*\\}`,
       "u",
     ), `${type} delegates to its composed lifecycle alias and preserves the response`);
@@ -377,7 +384,7 @@ test("task-level Debug trusts the source URL and rejects unsupported or spoofed 
 
 test("A/B detail preloading requires an explicit persistent task and two remaining items", () => {
   const start = captureSyncSource.indexOf(
-    "export async function batchCaptureDetailsForRecords",
+    "async function batchCaptureDetailsForRecords",
   );
   const end = captureSyncSource.indexOf(
     "const shouldStopDetailBatch",
@@ -472,7 +479,7 @@ test("Xiaohongshu and Douyin interrupted detail workers are recreated with finit
     "a rebuilt Douyin worker must retain a real expected work ID",
   );
   assert.match(helperBody, /previousPipeline\?\.stop/u);
-  assert.match(helperBody, /closeOwnedDetailRunnerTabs\(previousContexts\)/u);
+  assert.match(helperBody, /closeOwnedDetailRunnerTabs\(previousContexts, \{chromeApi: chrome\}\)/u);
   assert.match(helperBody, /prepareDetailBatchRunnerContext/u);
   assert.match(helperBody, /registerCaptureTaskTab/u);
   assert.match(helperBody, /taskId: normalizedCaptureTaskId/u);

@@ -23,6 +23,7 @@ import {findXhsSourceNote} from "./utils/capture/keyword-search.js";
 
 import {detectPageType, detectPlatformFromUrl} from "./utils/helpers.js";
 import {setCancelFlag, resetCancelFlag} from "./utils/scroll.js";
+import {pageActivity} from "./utils/capture/content-activity.js";
 import {normalizeTaskContext} from "./utils/task-context.js";
 import {buildContentDiagnostics} from "./utils/diagnostics.js";
 import {startContentPageStateReporting} from "./utils/content-page-state.js";
@@ -170,7 +171,7 @@ function beginListCaptureFeedback(request, {captureKind, label}) {
   }
 
   const isSupersededRun = () =>
-    Boolean(overlayRunScope && !overlayRunScope.isCurrent());
+    pageActivity.isStopped() || Boolean(overlayRunScope && !overlayRunScope.isCurrent());
 
   const readFeedbackState = () => {
     try {
@@ -366,7 +367,7 @@ function attachContentResponseDiagnostics(request, response) {
   };
 }
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+function dispatchContentRequest(request, sender, sendResponse) {
   if (request?.action !== "detectSearchSortDimension") {
     console.log("[Content] Received message:", request.action);
   }
@@ -393,81 +394,66 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
 
     case "smartCapture":
-      runTrackedCaptureRequest(request, () =>
+      return runTrackedCaptureRequest(request, () =>
         handleSmartCapture(request, sendResponseWithDiagnostics),
       );
-      return true;
 
     case "captureSingleNote":
-      runTrackedCaptureRequest(request, () =>
+      return runTrackedCaptureRequest(request, () =>
         handleCaptureSingleNote(request, sendResponseWithDiagnostics),
       );
-      return true;
 
     case "captureBloggerProfile":
-      runTrackedCaptureRequest(request, () =>
+      return runTrackedCaptureRequest(request, () =>
         handleCaptureBloggerProfile(request, sendResponseWithDiagnostics),
       );
-      return true;
 
     case "captureBloggerNotes":
-      runTrackedCaptureRequest(request, () =>
+      return runTrackedCaptureRequest(request, () =>
         handleCaptureBloggerNotes(request, sendResponseWithDiagnostics),
       );
-      return true;
 
     case "captureKeywordNotes":
-      runTrackedCaptureRequest(request, () =>
+      return runTrackedCaptureRequest(request, () =>
         handleCaptureKeywordNotes(request, sendResponseWithDiagnostics),
       );
-      return true;
 
     case "findXhsSourceNote":
-      handleFindXhsSourceNote(request, sendResponseWithDiagnostics);
-      return true;
+      return handleFindXhsSourceNote(request, sendResponseWithDiagnostics);
 
     case "updateListCaptureTraceBindings":
-      handleUpdateListCaptureTraceBindings(request, sendResponseWithDiagnostics);
-      return true;
+      return handleUpdateListCaptureTraceBindings(request, sendResponseWithDiagnostics);
 
     case "restoreListCaptureTraceOverlay":
-      handleRestoreListCaptureTraceOverlay(
+      return handleRestoreListCaptureTraceOverlay(
         request,
         sendResponseWithDiagnostics,
       );
-      return true;
 
     case "setCaptureTaskTakeover":
-      handleSetCaptureTaskTakeover(request, sendResponseWithDiagnostics);
-      return true;
+      return handleSetCaptureTaskTakeover(request, sendResponseWithDiagnostics);
 
     case "prepareKeywordStrategyCapture":
-      handlePrepareKeywordStrategyCapture(sendResponseWithDiagnostics);
-      return true;
+      return handlePrepareKeywordStrategyCapture(sendResponseWithDiagnostics);
 
     case "applyBatchSearchFilters":
-      handleApplyBatchSearchFilters(request, sendResponseWithDiagnostics);
-      return true;
+      return handleApplyBatchSearchFilters(request, sendResponseWithDiagnostics);
 
     case "assertNoDouyinSearchServiceAbnormal":
-      handleAssertNoDouyinSearchServiceAbnormal(sendResponseWithDiagnostics);
-      return true;
+      return handleAssertNoDouyinSearchServiceAbnormal(sendResponseWithDiagnostics);
 
     case "expandKeywordSuggestions":
-      runTrackedCaptureRequest(request, () =>
+      return runTrackedCaptureRequest(request, () =>
         handleExpandKeywordSuggestions(request, sendResponseWithDiagnostics),
       );
-      return true;
 
     case "detectSearchSortDimension":
-      handleDetectSearchSortDimension(sendResponseWithDiagnostics);
-      return true;
+      return handleDetectSearchSortDimension(sendResponseWithDiagnostics);
 
     case "captureComments":
-      runTrackedCaptureRequest(request, () =>
+      return runTrackedCaptureRequest(request, () =>
         handleCaptureComments(request, sendResponseWithDiagnostics),
       );
-      return true;
 
     case "cancelCapture":
       handleCancelCapture(request, sendResponseWithDiagnostics);
@@ -480,6 +466,78 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         error: {code: "UNKNOWN_ACTION", message: "未知操作"},
       });
       return false;
+  }
+}
+
+function isTrustedPageControlSender(sender) {
+  const extensionOrigin = `chrome-extension://${chrome.runtime?.id}`;
+  return Boolean(chrome.runtime?.id && sender?.id === chrome.runtime.id
+    && !sender.tab && !sender.documentId
+    && (!sender.origin || sender.origin === extensionOrigin)
+    && (!sender.url || sender.url === `${extensionOrigin}/background.js`));
+}
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  const action = String(request?.action || '');
+  const hasPageControl = Object.prototype.hasOwnProperty.call(request || {}, 'pageControl');
+  const controlAction = action.startsWith('onstarvoice:page-control-');
+  const reject = (error) => sendResponse({
+    ok: false,
+    error: {code: error?.code || 'PAGE_CONTROL_REJECTED', message: String(error?.message || error)},
+  });
+  try {
+    if (hasPageControl || controlAction) {
+      if (!isTrustedPageControlSender(sender)) {
+        throw Object.assign(new Error('PAGE_CONTROL_UNTRUSTED_SENDER'), {code: 'PAGE_CONTROL_UNTRUSTED_SENDER'});
+      }
+    }
+    if (controlAction) {
+      const envelope = request.pageControl;
+      let snapshot;
+      if (action === 'onstarvoice:page-control-handshake') snapshot = pageActivity.handshake(envelope);
+      else if (action === 'onstarvoice:page-control-stop') snapshot = pageActivity.cancel(envelope);
+      else if (action === 'onstarvoice:page-control-inspect') snapshot = pageActivity.inspectStrict(envelope);
+      else if (action === 'onstarvoice:page-control-reserve') snapshot = pageActivity.reserve(envelope);
+      else if (action === 'onstarvoice:page-control-settle') {
+        void pageActivity.settle(envelope).then(
+          (value) => sendResponse({ok: true, pageControl: value}), reject,
+        );
+        return true;
+      } else if (action === 'onstarvoice:page-control-navigate') {
+        const target = new URL(String(request.payload?.url || ''));
+        const current = new URL(window.location.href);
+        if (target.protocol !== 'https:' || target.origin !== window.location.origin
+          || target.username || target.password
+          || (target.pathname === current.pathname && target.search === current.search)) {
+          throw Object.assign(new Error('PAGE_CONTROL_NAVIGATION_REJECTED'), {code: 'PAGE_CONTROL_NAVIGATION_REJECTED'});
+        }
+        const snapshot = pageActivity.navigate(envelope, () => {
+          window.location.assign(target.href);
+        });
+        sendResponse({ok: true, navigationDispatched: true, pageControl: snapshot});
+        return false;
+      }
+      else throw Object.assign(new Error('PAGE_CONTROL_UNKNOWN_ACTION'), {code: 'PAGE_CONTROL_UNKNOWN_ACTION'});
+      sendResponse({ok: true, pageControl: snapshot});
+      return false;
+    }
+    // Only harmless liveness/legacy observation stays available without a ticket.
+    if (!hasPageControl && (action === 'ping' || action === 'inspectCaptureActivity')) {
+      dispatchContentRequest(request, sender, sendResponse);
+      return false;
+    }
+    if (hasPageControl && action === 'cancelCapture') {
+      throw Object.assign(new Error('PAGE_CONTROL_USE_STRICT_STOP'), {code: 'PAGE_CONTROL_USE_STRICT_STOP'});
+    }
+    const execute = () => dispatchContentRequest(request, sender, sendResponse);
+    const completion = hasPageControl
+      ? pageActivity.run(request.pageControl, execute, {kind: action})
+      : pageActivity.runLegacy(execute, {kind: action});
+    void completion.catch(reject);
+    return true;
+  } catch (error) {
+    reject(error);
+    return false;
   }
 });
 
@@ -517,7 +575,7 @@ function runTrackedCaptureRequest(request, handler) {
     throw error;
   }
 
-  void Promise.resolve(result)
+  return Promise.resolve(result)
     .catch((error) => {
       console.error("[Content] Tracked capture handler failed:", error);
     })
@@ -546,6 +604,7 @@ function handleInspectCaptureActivity(request, sendResponse) {
 }
 
 function reportCaptureProgress(request, progress = {}) {
+  if (pageActivity.isStopped()) return;
   const source = progress && typeof progress === "object" ? progress : {};
   const normalizedProgress = {
     ...source,
@@ -1964,6 +2023,7 @@ async function waitForStrategyOptionActive(
 }
 
 function clickStrategyElement(node) {
+  pageActivity.assertCanProduce();
   const clickable =
     node.closest(
       'button, [role="button"], [role="tab"], [role="option"], a, li',
@@ -2031,6 +2091,7 @@ async function waitForKeywordStrategyUi(ms = 300) {
   const total = Math.max(0, Number(ms) || 0);
   const deadline = Date.now() + total;
   do {
+    pageActivity.assertCanProduce();
     assertNoDouyinSearchSecurityChallengePage();
     assertNoDouyinSearchServiceAbnormalPage();
     const remainingMs = Math.max(0, deadline - Date.now());
@@ -2039,6 +2100,7 @@ async function waitForKeywordStrategyUi(ms = 300) {
       window.setTimeout(resolve, Math.min(100, remainingMs)),
     );
   } while (Date.now() < deadline);
+  pageActivity.assertCanProduce();
   assertNoDouyinSearchSecurityChallengePage();
   assertNoDouyinSearchServiceAbnormalPage();
 }
@@ -2184,3 +2246,7 @@ function handleCancelCapture(request, sendResponse) {
 startContentPageStateReporting({
   sendMessage: safeRuntimeSendMessage,
 });
+
+// BFCache preserves this module: returning to the same Document cannot silently
+// reactivate an old strict cohort, even though a navigation message was lost.
+window.addEventListener('pagehide', () => pageActivity.invalidate());

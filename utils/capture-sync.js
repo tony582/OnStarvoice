@@ -113,6 +113,31 @@ import {
   RELEVANCE_PREFILTER_LIST_PROMPT_VERSION,
 } from './capture/relevance-prefilter.js';
 import './capture/target-page-availability.js';
+
+// All page side effects resolve against this explicit per-owner capability.
+// The legacy facade below keeps its shared state and late-bound browser API.
+export function createCaptureSyncScope({chromeApi, pageOperations = null} = {}) {
+const chrome = chromeApi;
+if (!chrome) throw new Error('capture_scope_chrome_required');
+const scopedShouldStop = (legacyStop) => pageOperations
+  ? () => pageOperations.shouldStop() || Boolean(legacyStop?.())
+  : legacyStop;
+const scopedPageChild = (callback) => pageOperations
+  ? (...args) => pageOperations.runProducer('detail-prefetch-navigation', () => callback(...args))
+  : callback;
+const scopedProgressCallback = (callback) => !pageOperations || typeof callback !== 'function'
+  ? callback : (...args) => {
+    const result = callback(...args);
+    return result?.then ? pageOperations.track(result) : result;
+  };
+const scopedCaptureEntry = (callback) => !pageOperations ? callback : (...args) => {
+  const supplied = args.map(value => typeof value === 'function'
+    ? scopedProgressCallback(value)
+    : value && typeof value === 'object' && !Array.isArray(value) && typeof value.onProgress === 'function'
+      ? {...value, onProgress: scopedProgressCallback(value.onProgress)} : value);
+  const result = callback(...supplied);
+  return result?.then ? pageOperations.track(result) : result;
+};
 // StarVoice 未启用福利中心（welfare-usage.js）；相关 welfare 埋点已移除，见下方 no-op。
 
 const targetPageAvailabilityApi =
@@ -221,7 +246,7 @@ function resolveActiveCaptureTaskSession(taskId = '') {
 async function sendCaptureTaskLifecycleMessage(
   type,
   payload,
-  {chromeApi = globalThis.chrome} = {},
+  {chromeApi = chrome} = {},
 ) {
   if (!chromeApi?.runtime || typeof chromeApi.runtime.sendMessage !== 'function') {
     return {ok: false, skipped: true, reason: 'runtime_unavailable'};
@@ -313,7 +338,7 @@ async function setCaptureTaskTakeoverStateInTab(
     label = '采集辅助运行中',
     clearTrace = false,
   } = {},
-  {chromeApi = globalThis.chrome} = {},
+  {chromeApi = chrome} = {},
 ) {
   const normalizedTabId = Number(tabId);
   if (
@@ -346,7 +371,7 @@ async function setCaptureTaskTakeoverStateInTab(
   }
 }
 
-export async function beginCaptureTaskSession(
+async function beginCaptureTaskSession(
   {
     taskId = '',
     tabId = null,
@@ -490,7 +515,7 @@ export async function beginCaptureTaskSession(
   };
 }
 
-export async function updateCaptureTaskSession(
+async function updateCaptureTaskSession(
   {taskId = '', progress = {}} = {},
   options = {},
 ) {
@@ -511,7 +536,7 @@ export async function updateCaptureTaskSession(
   );
 }
 
-export async function registerCaptureTaskTab(
+async function registerCaptureTaskTab(
   {taskId = '', tabId = null, role = 'worker'} = {},
   options = {},
 ) {
@@ -539,7 +564,7 @@ export async function registerCaptureTaskTab(
   );
 }
 
-export async function endCaptureTaskSession(
+async function endCaptureTaskSession(
   {taskId = '', reason = 'completed', status = 'completed'} = {},
   options = {},
 ) {
@@ -1017,7 +1042,7 @@ const LIST_METRIC_KNOWN_FLAG_KEYS = Object.freeze({
  * @param {Object} options.captureParams - 采集参数透传
  * @returns {Promise<Object>} 结果
  */
-export async function captureAndSync({
+async function captureAndSync({
   mode = 'auto',
   onProgress = null,
   autoSync = true,
@@ -1025,6 +1050,7 @@ export async function captureAndSync({
   shouldStop = null,
   signal = null,
 } = {}) {
+  shouldStop = scopedShouldStop(shouldStop);
   let savedRecords = [];
   let recordIds = [];
   let syncRecordIds = [];
@@ -1489,7 +1515,7 @@ async function captureAndSaveInTab({
 /**
  * 单条笔记采集（可选评论），并将评论合并回同一条 single_note 记录
  */
-export async function captureNoteWithOptionalComments({
+async function captureNoteWithOptionalComments({
   includeComments = false,
   includeBloggerMetrics = false,
   enableCommentLeadsFilter = null,
@@ -1701,7 +1727,7 @@ export async function captureNoteWithOptionalComments({
 /**
  * 仅重试某条记录的评论采集与合并
  */
-export async function retryCommentsForRecord(
+async function retryCommentsForRecord(
   recordId,
   {
     commentsMaxDetectedItems = null,
@@ -1814,7 +1840,7 @@ export async function retryCommentsForRecord(
 /**
  * 仅重试某条 blogger_notes / keyword_notes 记录的详情补采
  */
-export async function retryDetailCaptureForRecord(
+async function retryDetailCaptureForRecord(
   recordId,
   {
     onProgress = null,
@@ -1999,7 +2025,7 @@ function attachPartialDetailPayload(error, detailPayload) {
 /**
  * 批量补采博主/关键词记录的笔记详情，回填到原记录 payload
  */
-export async function batchCaptureDetailsForRecords(
+async function batchCaptureDetailsForRecords(
   recordIds,
   {
     onProgress = null,
@@ -2021,6 +2047,7 @@ export async function batchCaptureDetailsForRecords(
     enableAiRelevancePrefilter = null,
   } = {},
 ) {
+  shouldStop = scopedShouldStop(shouldStop);
   const uniqueRecordIds = Array.isArray(recordIds)
     ? [...new Set(recordIds.filter((id) => typeof id === 'string' && id.trim()))]
     : [];
@@ -2867,6 +2894,7 @@ export async function batchCaptureDetailsForRecords(
         error?.message || '第二个工作页不可用，已降级为单工作页';
       if (standbyContext) {
         await closeOwnedDetailRunnerTab({
+          chromeApi: chrome,
           runnerTabId: standbyContext.runnerTabId,
           sourceTabId: standbyContext.sourceTabId,
           ownsRunnerTab: standbyContext.ownsRunnerTab,
@@ -2898,7 +2926,7 @@ export async function batchCaptureDetailsForRecords(
     stopTimeoutMs: DETAIL_PREFETCH_STOP_TIMEOUT_MS,
     shouldStop,
     isFatalError: isDetailSecurityBlockError,
-    navigate: async ({
+    navigate: scopedPageChild(async ({
       tabId,
       recordId,
       url,
@@ -3015,7 +3043,7 @@ export async function batchCaptureDetailsForRecords(
       }
 
       throw lastRecoverableError || new Error('抖音详情页未完成加载');
-    },
+    }),
     onTransition: ({type, slot, snapshot, error}) => {
       const fatalNavigationFailure =
         (type === 'navigation_failed' ||
@@ -3145,7 +3173,7 @@ export async function batchCaptureDetailsForRecords(
     const previousPipeline = detailPrefetchPipeline;
     await previousPipeline?.stop?.().catch(() => null);
     try {
-      await closeOwnedDetailRunnerTabs(previousContexts);
+      await closeOwnedDetailRunnerTabs(previousContexts, {chromeApi: chrome});
     } catch (error) {
       console.warn(
         '[CaptureSync] close interrupted detail workers failed:',
@@ -3186,6 +3214,7 @@ export async function batchCaptureDetailsForRecords(
         replacementError = error;
         if (replacementContext) {
           await closeOwnedDetailRunnerTab({
+            chromeApi: chrome,
             runnerTabId: replacementContext.runnerTabId,
             sourceTabId: replacementContext.sourceTabId,
             ownsRunnerTab: replacementContext.ownsRunnerTab,
@@ -5213,6 +5242,7 @@ export async function batchCaptureDetailsForRecords(
             sourceTabId: context.sourceTabId,
             ownsRunnerTab: true,
           })),
+          {chromeApi: chrome},
         );
         const closedCount = closedResults.filter((item) => item.closed).length;
         await reportProgressFailSoft(onProgress, {
@@ -5253,7 +5283,7 @@ export async function batchCaptureDetailsForRecords(
         }, 'detail runners cleanup failed');
       }
     } else if (runnerContext?.shouldRestoreSourcePage) {
-      void restoreSourcePageIfNeeded(
+      const restoration = restoreSourcePageIfNeeded(
         runnerContext.runnerTabId,
         runnerContext.sourcePageUrl,
         runnerContext.sourcePageScrollY,
@@ -5261,8 +5291,9 @@ export async function batchCaptureDetailsForRecords(
       ).catch((error) => {
         console.warn('[CaptureSync] restore source page failed:', error);
       });
+      if (pageOperations) pageOperations.track(restoration);
     } else if (runnerContext?.shouldRestoreRuntimeContext) {
-      void restoreSourceRuntimeContextIfNeeded({
+      const restoration = restoreSourceRuntimeContextIfNeeded({
         tabId: runnerContext.runnerTabId,
         sourcePageUrl: runnerContext.sourcePageUrl,
         sourcePlatform: runnerContext.sourcePlatform,
@@ -5270,6 +5301,7 @@ export async function batchCaptureDetailsForRecords(
       }).catch((error) => {
         console.warn('[CaptureSync] restore source runtime context failed:', error);
       });
+      if (pageOperations) pageOperations.track(restoration);
     }
   }
 
@@ -5429,7 +5461,7 @@ export async function batchCaptureDetailsForRecords(
  * @param {Function} onProgress - 进度回调
  * @returns {Promise<Object>} 结果
  */
-export async function captureAndSyncSingleNote(onProgress = null) {
+async function captureAndSyncSingleNote(onProgress = null) {
   return await captureAndSync({
     mode: 'single',
     onProgress,
@@ -5442,7 +5474,7 @@ export async function captureAndSyncSingleNote(onProgress = null) {
  * @param {Function} onProgress - 进度回调
  * @returns {Promise<Object>} 结果
  */
-export async function captureAndSyncBloggerProfile(onProgress = null) {
+async function captureAndSyncBloggerProfile(onProgress = null) {
   return await captureAndSync({
     mode: 'blogger_profile',
     onProgress,
@@ -5455,7 +5487,7 @@ export async function captureAndSyncBloggerProfile(onProgress = null) {
  * @param {Function} onProgress - 进度回调
  * @returns {Promise<Object>} 结果
  */
-export async function captureAndSyncBloggerNotes(onProgress = null) {
+async function captureAndSyncBloggerNotes(onProgress = null) {
   return await captureAndSync({
     mode: 'blogger_notes',
     onProgress,
@@ -5468,7 +5500,7 @@ export async function captureAndSyncBloggerNotes(onProgress = null) {
  * @param {Function} onProgress - 进度回调
  * @returns {Promise<Object>} 结果
  */
-export async function captureAndSyncKeywordNotes(onProgress = null) {
+async function captureAndSyncKeywordNotes(onProgress = null) {
   return await captureAndSync({
     mode: 'keyword',
     onProgress,
@@ -5481,7 +5513,7 @@ export async function captureAndSyncKeywordNotes(onProgress = null) {
  * @param {Function} onProgress - 进度回调
  * @returns {Promise<Object>} 结果
  */
-export async function captureAndSyncComments(onProgress = null) {
+async function captureAndSyncComments(onProgress = null) {
   return await captureAndSync({
     mode: 'comments',
     onProgress,
@@ -5496,7 +5528,7 @@ export async function captureAndSyncComments(onProgress = null) {
  * @param {Object} options - 配置选项
  * @returns {Promise<Object>} 结果
  */
-export async function captureOnly(options = {}) {
+async function captureOnly(options = {}) {
   return await captureAndSync({
     ...options,
     autoSync: false,
@@ -5506,7 +5538,7 @@ export async function captureOnly(options = {}) {
 /**
  * 重置采集和同步状态
  */
-export async function resetCaptureAndSyncState() {
+async function resetCaptureAndSyncState() {
   await resetCapture();
   await resetSync();
 }
@@ -6709,7 +6741,7 @@ function buildDetailKeywordSearchText(record, detailPayload) {
     .toLowerCase();
 }
 
-export function evaluateDetailKeywordFilter(record, detailPayload) {
+function evaluateDetailKeywordFilter(record, detailPayload) {
   const rules = getDetailKeywordFilterRules(record);
   if (rules.length === 0) {
     return {
@@ -6964,7 +6996,7 @@ function classifyDetailCaptureFailure(error, { stage = 'unknown' } = {}) {
   );
 }
 
-export async function repairInterruptedDetailCaptureRecords() {
+async function repairInterruptedDetailCaptureRecords() {
   const dataPool = await getDataPool();
   const records = Array.isArray(dataPool?.records) ? dataPool.records : [];
   const repairedRecordIds = [];
@@ -7014,7 +7046,7 @@ export async function repairInterruptedDetailCaptureRecords() {
   };
 }
 
-export async function repairInterruptedCommentCaptureRecords() {
+async function repairInterruptedCommentCaptureRecords() {
   const dataPool = await getDataPool();
   const records = Array.isArray(dataPool?.records) ? dataPool.records : [];
   const repairedRecordIds = [];
@@ -7186,7 +7218,7 @@ function buildDouyinRecordSearchModalUrl(record, noteId) {
   return '';
 }
 
-export function inspectDouyinRecordDetailIdentity(record) {
+function inspectDouyinRecordDetailIdentity(record) {
   const payload =
     record?.payload && typeof record.payload === 'object'
       ? record.payload
@@ -7239,7 +7271,7 @@ export function inspectDouyinRecordDetailIdentity(record) {
   };
 }
 
-export function resolveRecordDetailNoteId(record) {
+function resolveRecordDetailNoteId(record) {
   const payload =
     record?.payload && typeof record.payload === 'object'
       ? record.payload
@@ -7285,7 +7317,7 @@ export function resolveRecordDetailNoteId(record) {
   return '';
 }
 
-export function resolveRecordDetailNotePath(record) {
+function resolveRecordDetailNotePath(record) {
   const payload =
     record?.payload && typeof record.payload === 'object'
       ? record.payload
@@ -7386,7 +7418,7 @@ function normalizeDouyinDetailUrlAgainstRecord(record, url) {
   }
 }
 
-export function buildDouyinDetailNavigationCandidates(
+function buildDouyinDetailNavigationCandidates(
   targetUrl,
   sourcePageUrl = '',
   preferredPath = 'unknown',
@@ -7442,7 +7474,7 @@ export function buildDouyinDetailNavigationCandidates(
   return candidates;
 }
 
-export function buildDouyinCommentRecoveryCandidates(
+function buildDouyinCommentRecoveryCandidates(
   record,
   targetUrl,
   sourcePageUrl = '',
@@ -7567,6 +7599,7 @@ async function prepareDetailBatchRunnerContext({
     const runnerTab = await createDedicatedDetailRunnerTab({
       sourceTab,
       indexOffset,
+      chromeApi: chrome,
     });
     return {
       sourceTabId,
@@ -7710,7 +7743,7 @@ async function probeDetailPreloadSafety(
     timeoutMs = 8000,
   } = {},
 ) {
-  if (!globalThis.chrome?.scripting?.executeScript) {
+  if (!chrome?.scripting?.executeScript) {
     if (waitForDouyinReady) {
       const error = new Error('当前浏览器无法确认抖音详情页是否加载完成');
       error.code = 'DOUYIN_DETAIL_NOT_READY';
@@ -8865,6 +8898,7 @@ async function waitMsWithStopAndTick(
 }
 
 async function activateTabForReliableTimer(tabId) {
+  if (pageOperations) return false;
   const numericTabId = Number(tabId);
   if (!Number.isFinite(numericTabId) || numericTabId <= 0) {
     return false;
@@ -9728,7 +9762,7 @@ async function probeDouyinDetailPreloadBeforeCapture(tabId, options = {}) {
  * @param {Function} [options.shouldStop] - 取消检测函数
  * @returns {Promise<{ ok: boolean, results: Array, stats: Object }>}
  */
-export async function batchCaptureByUrls({
+async function batchCaptureByUrls({
   urls = [],
   mode = "single",
   captureParams = {},
@@ -9736,6 +9770,7 @@ export async function batchCaptureByUrls({
   onProgress = null,
   shouldStop = null,
 } = {}) {
+  shouldStop = scopedShouldStop(shouldStop);
   if (!urls.length) {
     return { ok: true, results: [], stats: { total: 0, success: 0, failed: 0 } };
   }
@@ -10445,7 +10480,7 @@ function buildInterKeywordDelayMessage({
   return `已采「${keyword}」，采集增强未执行，${seconds} 秒后再搜下一个关键词(防风控·随机间隔)…`;
 }
 
-export async function batchCaptureByKeywords({
+async function batchCaptureByKeywords({
   keywords = [],
   platform = '',
   baseSearchUrl = '',
@@ -10462,6 +10497,7 @@ export async function batchCaptureByKeywords({
   onProgress = null,
   shouldStop = null,
 } = {}) {
+  shouldStop = scopedShouldStop(shouldStop);
   if (!keywords.length) {
     return { ok: true, results: [], stats: { total: 0, success: 0, failed: 0 } };
   }
@@ -11871,13 +11907,14 @@ export async function batchCaptureByKeywords({
   }
 }
 
-export async function lightSampleByKeywords({
+async function lightSampleByKeywords({
   categorySamples = [],
   platform = '',
   baseSearchUrl = '',
   onProgress = null,
   shouldStop = null,
 } = {}) {
+  shouldStop = scopedShouldStop(shouldStop);
   if (!Array.isArray(categorySamples) || categorySamples.length === 0) {
     return {
       ok: true,
@@ -12080,7 +12117,7 @@ export async function lightSampleByKeywords({
   };
 }
 
-export async function captureTabContent(
+async function captureTabContent(
   tabId,
   {
     mode = 'auto',
@@ -12299,6 +12336,10 @@ async function submitKeywordSearchInTab(
           const witness = {
             nonce,
             keyword: expected,
+            lifecycleVersion: 1,
+            active: false,
+            retired: true,
+            timerId: null,
             submittedAt: Date.now(),
             baselineCount,
             mutationCount: 0,
@@ -12311,11 +12352,16 @@ async function submitKeywordSearchInTab(
             generationChanged: false,
             observer: null,
           };
-          try {
-            window[witnessKey]?.observer?.disconnect?.();
-          } catch {
-            // A stale page-owned marker must not block the new submission.
-          }
+          witness.stop = () => {
+            witness.active = false;
+            witness.observer?.disconnect();
+            if (witness.timerId !== null) clearTimeout(witness.timerId);
+            witness.timerId = null;
+            witness.retired = true;
+          };
+          const previousWitness = window[witnessKey];
+          if (typeof previousWitness?.stop === 'function') previousWitness.stop();
+          else previousWitness?.observer?.disconnect?.();
           window[witnessKey] = witness;
           if (
             typeof MutationObserver !== 'function' ||
@@ -12333,6 +12379,7 @@ async function submitKeywordSearchInTab(
             }
           };
           const observer = new MutationObserver((records) => {
+            if (!witness.active) return;
             const currentRoot = readRoot();
             const relevantRecords = Array.from(records || []).filter((record) => {
               if (isRelatedNode(record?.target, baselineRoot) ||
@@ -12381,6 +12428,8 @@ async function submitKeywordSearchInTab(
             );
           });
           witness.observer = observer;
+          witness.active = true;
+          witness.retired = false;
           observer.observe(document.body, {
             subtree: true,
             childList: true,
@@ -12388,7 +12437,7 @@ async function submitKeywordSearchInTab(
             attributeFilter: ['aria-busy'],
           });
           if (typeof setTimeout === 'function') {
-            setTimeout(() => observer.disconnect(), 90_000);
+            witness.timerId = setTimeout(witness.stop, 90_000);
           }
           return nonce;
         };
@@ -12586,7 +12635,7 @@ async function readDouyinSearchWorkIdsInTab(tabId) {
     .catch(() => ({captured: false, workIds: []}));
 }
 
-export async function beginDouyinSearchResultTransitionInTab(
+async function beginDouyinSearchResultTransitionInTab(
   tabId,
   keyword = '',
 ) {
@@ -12631,6 +12680,10 @@ export async function beginDouyinSearchResultTransitionInTab(
         const witness = {
           nonce,
           keyword: String(expectedKeyword || '').trim(),
+          lifecycleVersion: 1,
+          active: false,
+          retired: true,
+          timerId: null,
           submittedAt: Date.now(),
           baselineCount,
           baselineBusy,
@@ -12643,11 +12696,16 @@ export async function beginDouyinSearchResultTransitionInTab(
           generationChanged: false,
           observer: null,
         };
-        try {
-          window[witnessKey]?.observer?.disconnect?.();
-        } catch {
-          // A stale page-owned marker cannot block the next exact operation.
-        }
+        witness.stop = () => {
+          witness.active = false;
+          witness.observer?.disconnect();
+          if (witness.timerId !== null) clearTimeout(witness.timerId);
+          witness.timerId = null;
+          witness.retired = true;
+        };
+        const previousWitness = window[witnessKey];
+        if (typeof previousWitness?.stop === 'function') previousWitness.stop();
+        else previousWitness?.observer?.disconnect?.();
         window[witnessKey] = witness;
         if (typeof MutationObserver !== 'function' || !document.body) {
           return nonce;
@@ -12662,6 +12720,7 @@ export async function beginDouyinSearchResultTransitionInTab(
           }
         };
         const observer = new MutationObserver((records) => {
+          if (!witness.active) return;
           const currentRoot = readRoot();
           const relevantRecords = Array.from(records || []).filter((record) => {
             if (
@@ -12712,6 +12771,8 @@ export async function beginDouyinSearchResultTransitionInTab(
           );
         });
         witness.observer = observer;
+        witness.active = true;
+        witness.retired = false;
         observer.observe(document.body, {
           subtree: true,
           childList: true,
@@ -12719,7 +12780,7 @@ export async function beginDouyinSearchResultTransitionInTab(
           attributeFilter: ['aria-busy'],
         });
         if (typeof setTimeout === 'function') {
-          setTimeout(() => observer.disconnect(), 90_000);
+          witness.timerId = setTimeout(witness.stop, 90_000);
         }
         return nonce;
       },
@@ -12734,7 +12795,7 @@ export async function beginDouyinSearchResultTransitionInTab(
   });
 }
 
-export async function readDouyinSearchDocumentGenerationInTab(tabId) {
+async function readDouyinSearchDocumentGenerationInTab(tabId) {
   const normalizedTabId = Number(tabId);
   if (!Number.isFinite(normalizedTabId) || normalizedTabId <= 0) {
     return null;
@@ -14960,20 +15021,195 @@ const {
   savePreparedRecord: addRecord,
   savePreparedRecords: addRecords,
 } = resultDelivery;
-export {
-  getActiveListCaptureCheckpointStats,
-  refreshListCaptureSourceUrlInPlace,
-  isListMetricExplicitlyKnown,
-  processListCaptureCheckpointProgress,
-  appendFrontendSyncFailureHistory,
-  resolveSyncInputForRecord,
-  pickMoreCompleteCapturedText,
-  syncRecord,
-  syncRecordBatch,
-  checkBeforeSync,
-  buildCommentLeadsConfigFromSettings,
-  buildCommentLeadsPayloadForRecord,
-  resolveKnownCommentsCountForDetailCapture,
-  applyCommentResultToSingleNotePayload,
-  applyCommentLeadsToPayload,
-};
+return Object.freeze({
+  beginCaptureTaskSession: scopedCaptureEntry(beginCaptureTaskSession),
+  updateCaptureTaskSession: scopedCaptureEntry(updateCaptureTaskSession),
+  registerCaptureTaskTab: scopedCaptureEntry(registerCaptureTaskTab),
+  endCaptureTaskSession: scopedCaptureEntry(endCaptureTaskSession),
+  captureAndSync: scopedCaptureEntry(captureAndSync),
+  captureNoteWithOptionalComments: scopedCaptureEntry(captureNoteWithOptionalComments),
+  retryCommentsForRecord: scopedCaptureEntry(retryCommentsForRecord),
+  retryDetailCaptureForRecord: scopedCaptureEntry(retryDetailCaptureForRecord),
+  batchCaptureDetailsForRecords: scopedCaptureEntry(batchCaptureDetailsForRecords),
+  captureAndSyncSingleNote: scopedCaptureEntry(captureAndSyncSingleNote),
+  captureAndSyncBloggerProfile: scopedCaptureEntry(captureAndSyncBloggerProfile),
+  captureAndSyncBloggerNotes: scopedCaptureEntry(captureAndSyncBloggerNotes),
+  captureAndSyncKeywordNotes: scopedCaptureEntry(captureAndSyncKeywordNotes),
+  captureAndSyncComments: scopedCaptureEntry(captureAndSyncComments),
+  captureOnly: scopedCaptureEntry(captureOnly),
+  resetCaptureAndSyncState: scopedCaptureEntry(resetCaptureAndSyncState),
+  evaluateDetailKeywordFilter: scopedCaptureEntry(evaluateDetailKeywordFilter),
+  repairInterruptedDetailCaptureRecords: scopedCaptureEntry(repairInterruptedDetailCaptureRecords),
+  repairInterruptedCommentCaptureRecords: scopedCaptureEntry(repairInterruptedCommentCaptureRecords),
+  inspectDouyinRecordDetailIdentity: scopedCaptureEntry(inspectDouyinRecordDetailIdentity),
+  resolveRecordDetailNoteId: scopedCaptureEntry(resolveRecordDetailNoteId),
+  resolveRecordDetailNotePath: scopedCaptureEntry(resolveRecordDetailNotePath),
+  buildDouyinDetailNavigationCandidates: scopedCaptureEntry(buildDouyinDetailNavigationCandidates),
+  buildDouyinCommentRecoveryCandidates: scopedCaptureEntry(buildDouyinCommentRecoveryCandidates),
+  batchCaptureByUrls: scopedCaptureEntry(batchCaptureByUrls),
+  batchCaptureByKeywords: scopedCaptureEntry(batchCaptureByKeywords),
+  lightSampleByKeywords: scopedCaptureEntry(lightSampleByKeywords),
+  captureTabContent: scopedCaptureEntry(captureTabContent),
+  beginDouyinSearchResultTransitionInTab: scopedCaptureEntry(beginDouyinSearchResultTransitionInTab),
+  readDouyinSearchDocumentGenerationInTab: scopedCaptureEntry(readDouyinSearchDocumentGenerationInTab),
+  getActiveListCaptureCheckpointStats: scopedCaptureEntry(getActiveListCaptureCheckpointStats),
+  refreshListCaptureSourceUrlInPlace: scopedCaptureEntry(refreshListCaptureSourceUrlInPlace),
+  isListMetricExplicitlyKnown: scopedCaptureEntry(isListMetricExplicitlyKnown),
+  processListCaptureCheckpointProgress: scopedCaptureEntry(processListCaptureCheckpointProgress),
+  appendFrontendSyncFailureHistory: scopedCaptureEntry(appendFrontendSyncFailureHistory),
+  resolveSyncInputForRecord: scopedCaptureEntry(resolveSyncInputForRecord),
+  pickMoreCompleteCapturedText: scopedCaptureEntry(pickMoreCompleteCapturedText),
+  syncRecord: scopedCaptureEntry(syncRecord),
+  syncRecordBatch: scopedCaptureEntry(syncRecordBatch),
+  checkBeforeSync: scopedCaptureEntry(checkBeforeSync),
+  buildCommentLeadsConfigFromSettings: scopedCaptureEntry(buildCommentLeadsConfigFromSettings),
+  buildCommentLeadsPayloadForRecord: scopedCaptureEntry(buildCommentLeadsPayloadForRecord),
+  resolveKnownCommentsCountForDetailCapture: scopedCaptureEntry(resolveKnownCommentsCountForDetailCapture),
+  applyCommentResultToSingleNotePayload: scopedCaptureEntry(applyCommentResultToSingleNotePayload),
+  applyCommentLeadsToPayload: scopedCaptureEntry(applyCommentLeadsToPayload),
+});
+}
+
+const legacyChromeApi = new Proxy(Object.create(null), {
+  get(_target, key) { return globalThis.chrome?.[key]; },
+});
+let legacyCaptureSyncScope;
+function getLegacyCaptureSyncScope() {
+  return legacyCaptureSyncScope ||= createCaptureSyncScope({chromeApi: legacyChromeApi});
+}
+
+export async function beginCaptureTaskSession(...args) {
+  return getLegacyCaptureSyncScope().beginCaptureTaskSession(...args);
+}
+export async function updateCaptureTaskSession(...args) {
+  return getLegacyCaptureSyncScope().updateCaptureTaskSession(...args);
+}
+export async function registerCaptureTaskTab(...args) {
+  return getLegacyCaptureSyncScope().registerCaptureTaskTab(...args);
+}
+export async function endCaptureTaskSession(...args) {
+  return getLegacyCaptureSyncScope().endCaptureTaskSession(...args);
+}
+export async function captureAndSync(...args) {
+  return getLegacyCaptureSyncScope().captureAndSync(...args);
+}
+export async function captureNoteWithOptionalComments(...args) {
+  return getLegacyCaptureSyncScope().captureNoteWithOptionalComments(...args);
+}
+export async function retryCommentsForRecord(...args) {
+  return getLegacyCaptureSyncScope().retryCommentsForRecord(...args);
+}
+export async function retryDetailCaptureForRecord(...args) {
+  return getLegacyCaptureSyncScope().retryDetailCaptureForRecord(...args);
+}
+export async function batchCaptureDetailsForRecords(...args) {
+  return getLegacyCaptureSyncScope().batchCaptureDetailsForRecords(...args);
+}
+export async function captureAndSyncSingleNote(...args) {
+  return getLegacyCaptureSyncScope().captureAndSyncSingleNote(...args);
+}
+export async function captureAndSyncBloggerProfile(...args) {
+  return getLegacyCaptureSyncScope().captureAndSyncBloggerProfile(...args);
+}
+export async function captureAndSyncBloggerNotes(...args) {
+  return getLegacyCaptureSyncScope().captureAndSyncBloggerNotes(...args);
+}
+export async function captureAndSyncKeywordNotes(...args) {
+  return getLegacyCaptureSyncScope().captureAndSyncKeywordNotes(...args);
+}
+export async function captureAndSyncComments(...args) {
+  return getLegacyCaptureSyncScope().captureAndSyncComments(...args);
+}
+export async function captureOnly(...args) {
+  return getLegacyCaptureSyncScope().captureOnly(...args);
+}
+export async function resetCaptureAndSyncState(...args) {
+  return getLegacyCaptureSyncScope().resetCaptureAndSyncState(...args);
+}
+export function evaluateDetailKeywordFilter(...args) {
+  return getLegacyCaptureSyncScope().evaluateDetailKeywordFilter(...args);
+}
+export async function repairInterruptedDetailCaptureRecords(...args) {
+  return getLegacyCaptureSyncScope().repairInterruptedDetailCaptureRecords(...args);
+}
+export async function repairInterruptedCommentCaptureRecords(...args) {
+  return getLegacyCaptureSyncScope().repairInterruptedCommentCaptureRecords(...args);
+}
+export function inspectDouyinRecordDetailIdentity(...args) {
+  return getLegacyCaptureSyncScope().inspectDouyinRecordDetailIdentity(...args);
+}
+export function resolveRecordDetailNoteId(...args) {
+  return getLegacyCaptureSyncScope().resolveRecordDetailNoteId(...args);
+}
+export function resolveRecordDetailNotePath(...args) {
+  return getLegacyCaptureSyncScope().resolveRecordDetailNotePath(...args);
+}
+export function buildDouyinDetailNavigationCandidates(...args) {
+  return getLegacyCaptureSyncScope().buildDouyinDetailNavigationCandidates(...args);
+}
+export function buildDouyinCommentRecoveryCandidates(...args) {
+  return getLegacyCaptureSyncScope().buildDouyinCommentRecoveryCandidates(...args);
+}
+export async function batchCaptureByUrls(...args) {
+  return getLegacyCaptureSyncScope().batchCaptureByUrls(...args);
+}
+export async function batchCaptureByKeywords(...args) {
+  return getLegacyCaptureSyncScope().batchCaptureByKeywords(...args);
+}
+export async function lightSampleByKeywords(...args) {
+  return getLegacyCaptureSyncScope().lightSampleByKeywords(...args);
+}
+export async function captureTabContent(...args) {
+  return getLegacyCaptureSyncScope().captureTabContent(...args);
+}
+export async function beginDouyinSearchResultTransitionInTab(...args) {
+  return getLegacyCaptureSyncScope().beginDouyinSearchResultTransitionInTab(...args);
+}
+export async function readDouyinSearchDocumentGenerationInTab(...args) {
+  return getLegacyCaptureSyncScope().readDouyinSearchDocumentGenerationInTab(...args);
+}
+export function getActiveListCaptureCheckpointStats(...args) {
+  return getLegacyCaptureSyncScope().getActiveListCaptureCheckpointStats(...args);
+}
+export function refreshListCaptureSourceUrlInPlace(...args) {
+  return getLegacyCaptureSyncScope().refreshListCaptureSourceUrlInPlace(...args);
+}
+export function isListMetricExplicitlyKnown(...args) {
+  return getLegacyCaptureSyncScope().isListMetricExplicitlyKnown(...args);
+}
+export function processListCaptureCheckpointProgress(...args) {
+  return getLegacyCaptureSyncScope().processListCaptureCheckpointProgress(...args);
+}
+export function appendFrontendSyncFailureHistory(...args) {
+  return getLegacyCaptureSyncScope().appendFrontendSyncFailureHistory(...args);
+}
+export function resolveSyncInputForRecord(...args) {
+  return getLegacyCaptureSyncScope().resolveSyncInputForRecord(...args);
+}
+export function pickMoreCompleteCapturedText(...args) {
+  return getLegacyCaptureSyncScope().pickMoreCompleteCapturedText(...args);
+}
+export function syncRecord(...args) {
+  return getLegacyCaptureSyncScope().syncRecord(...args);
+}
+export function syncRecordBatch(...args) {
+  return getLegacyCaptureSyncScope().syncRecordBatch(...args);
+}
+export function checkBeforeSync(...args) {
+  return getLegacyCaptureSyncScope().checkBeforeSync(...args);
+}
+export function buildCommentLeadsConfigFromSettings(...args) {
+  return getLegacyCaptureSyncScope().buildCommentLeadsConfigFromSettings(...args);
+}
+export function buildCommentLeadsPayloadForRecord(...args) {
+  return getLegacyCaptureSyncScope().buildCommentLeadsPayloadForRecord(...args);
+}
+export function resolveKnownCommentsCountForDetailCapture(...args) {
+  return getLegacyCaptureSyncScope().resolveKnownCommentsCountForDetailCapture(...args);
+}
+export function applyCommentResultToSingleNotePayload(...args) {
+  return getLegacyCaptureSyncScope().applyCommentResultToSingleNotePayload(...args);
+}
+export function applyCommentLeadsToPayload(...args) {
+  return getLegacyCaptureSyncScope().applyCommentLeadsToPayload(...args);
+}

@@ -568,7 +568,7 @@ test("Douyin comment readiness trusts a verified direct route but keeps search m
 
 test("Douyin extractor failure continues only from the next verified entry", () => {
   const batchStart = captureSyncSource.indexOf(
-    "export async function batchCaptureDetailsForRecords",
+    "async function batchCaptureDetailsForRecords",
   );
   const batchEnd = captureSyncSource.indexOf(
     "export async function syncRecord",
@@ -691,7 +691,7 @@ test("targeted Douyin preflight defers only detail loading to the existing captu
   );
 
   const batchStart = captureSyncSource.indexOf(
-    "export async function batchCaptureByUrls({",
+    "async function batchCaptureByUrls({",
   );
   const batchEnd = captureSyncSource.indexOf(
     "async function applySearchFiltersInTab",

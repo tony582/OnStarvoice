@@ -11,6 +11,7 @@
 
 import { randomScrollDistance } from './helpers.js';
 import { DEFAULT_CONFIG } from './constants.js';
+import { pageActivity } from './capture/content-activity.js';
 
 // ==================== 取消控制器 ====================
 
@@ -29,6 +30,8 @@ const NETWORK_PAUSE_MAX_MS = 2 * 60 * 1000;
  * 设置取消标志
  */
 export function setCancelFlag(value = true) {
+  // A legacy reset can never clear a strict generation's stop fence.
+  if (pageActivity.isStopped() && !value) return;
   cancelFlag = value;
 }
 
@@ -36,13 +39,14 @@ export function setCancelFlag(value = true) {
  * 检查是否已取消
  */
 export function isCanceled() {
-  return cancelFlag;
+  return pageActivity.isStopped() || cancelFlag;
 }
 
 /**
  * 重置取消标志
  */
 export function resetCancelFlag() {
+  if (pageActivity.isStopped()) return;
   cancelFlag = false;
 }
 
@@ -55,6 +59,7 @@ export function resetCancelFlag() {
  * @returns {Promise<void>}
  */
 export async function smoothScrollTo(targetY, duration = 500) {
+  pageActivity.assertCanProduce();
   const normalizedTargetY = Number.isFinite(Number(targetY))
     ? Number(targetY)
     : Number(window.scrollY) || 0;
@@ -85,7 +90,7 @@ export async function smoothScrollTo(targetY, duration = 500) {
         clearTimeout(fallbackTimer);
       }
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      if (snapToTarget) {
+      if (snapToTarget && !pageActivity.isStopped()) {
         window.scrollTo(0, normalizedTargetY);
       }
       resolve();
@@ -186,6 +191,7 @@ export async function randomScroll(
  * @returns {Promise<void>}
  */
 export async function wait(ms) {
+  pageActivity.assertCanProduce();
   const delay = Math.max(0, Number(ms) || 0);
   if (delay <= 0 || isCanceled()) return;
 
@@ -270,7 +276,10 @@ async function runCaptureStepWithTimeout(step, timeoutMs = CAPTURE_STEP_TIMEOUT_
   let timer = null;
   try {
     return await Promise.race([
-      Promise.resolve().then(step),
+      pageActivity.trackChild(Promise.resolve().then(() => {
+        pageActivity.assertCanProduce();
+        return step();
+      }), {kind: 'scroll-step'}),
       new Promise((_, reject) => {
         timer = setTimeout(
           () => reject(createCaptureStepTimeoutError(timeoutMs)),

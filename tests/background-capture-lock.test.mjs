@@ -30,6 +30,11 @@ const controlStorageReserveSource = await readFile(
 );
 const phase5RuntimeSources = await Promise.all(
   [
+    "utils/control/state-fence.js",
+    "utils/control/terminal-authority.js",
+    "utils/control/stop-journal.js",
+    "utils/control/active-stop-authority.js",
+    "utils/capture/lifecycle/strict-control.js",
     "utils/runtime-tab-policy.js",
     "utils/capture/execution-identity.js",
     "utils/capture/task-center-projection.js",

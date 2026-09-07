@@ -1,6 +1,13 @@
 // L1: end responsibility. Existing behavior, explicit host ports, one shared lifecycle owner.
 (function register(root) {
   function create({state, ports, operations}) {
+    const strictPending = () => ({ok: false, accepted: false, released: false,
+      resourcesReleased: false, cleanupPending: true, ignored: true,
+      reason: 'strict_capture_control_retained'});
+    const strictRetained = async () => {
+      if (typeof ports.hasStrictCaptureStopControl !== 'function') return false;
+      try { return await ports.hasStrictCaptureStopControl() !== false; } catch { return true; }
+    };
     const {
       console,
       inspectTargetedPostCaptureTaskAttempt,
@@ -22,6 +29,7 @@
     const runCaptureTaskLifecycleOperation = (...args) => operations.runCaptureTaskLifecycleOperation(...args);
 
     async function endCaptureTask(message) {
+      if (await strictRetained()) return strictPending();
       // BEGIN and END share one lifecycle queue. In particular, a replacement
       // attempt cannot create new Debug/group ownership after an older END has
       // passed its attempt fence but before that END finishes its final cleanup.
@@ -31,6 +39,7 @@
     }
 
     async function performEndCaptureTask(message) {
+      if (await strictRetained()) return strictPending();
       const request = getCaptureTaskRequest(message);
       const taskId = requireCaptureTaskId(request);
       const attemptFence = await inspectUnattendedCaptureTaskAttempt({
@@ -51,6 +60,7 @@
             taskId,
             attemptId: request.attemptId,
           });
+      if (await strictRetained()) return strictPending();
       if (targetedAttempt.targeted && !targetedAttempt.current) {
         return {
           taskId,
@@ -69,9 +79,12 @@
       if (canceled) {
         const session = state.captureDebugSessionManager.getSessionByTaskId(taskId);
         await publishCaptureTaskCancellation(taskId, reason);
+        if (await strictRetained()) return strictPending();
         await relayCaptureTaskCancellation(session, reason);
       }
+      if (await strictRetained()) return strictPending();
       const result = await releaseCaptureTaskResourcesWithRetry({taskId, reason});
+      if (await strictRetained()) return strictPending();
       const terminalStatus = status || (canceled ? 'canceled' : 'completed');
       if (terminalStatus === 'recovering') {
         // 无人值守 request root 是唯一公开任务台账；其 Debug wrapper 只管理
@@ -129,6 +142,7 @@
     }
 
     async function handleUnexpectedCaptureDebugDetach({session, reason} = {}) {
+      if (await strictRetained()) return strictPending();
       if (!session) return;
       if (!session.persistent || !session.taskId) {
         // Legacy transient assist sessions are observational as well. Losing
@@ -158,16 +172,19 @@
     }
 
     async function handleAbandonedCaptureTask({taskId} = {}) {
+      if (await strictRetained()) return strictPending();
       const normalizedTaskId = String(taskId || '').trim();
       if (!normalizedTaskId) return;
       const stableUnattended = await inspectStableUnattendedCaptureTask(
         normalizedTaskId,
       );
+      if (await strictRetained()) return strictPending();
       if (stableUnattended.active) {
         const unattendedRecovery = await recoverUnattendedCaptureTaskInterruption({
           taskId: normalizedTaskId,
           reason: 'runner_owner_disconnected',
         });
+        if (await strictRetained()) return strictPending();
         if (unattendedRecovery.handled) return;
       }
       if (stableUnattended.unattended) {
@@ -180,6 +197,7 @@
         taskId: normalizedTaskId,
         reason: 'runner_owner_disconnected',
       });
+      if (await strictRetained()) return strictPending();
       if (unattendedRecovery.handled) return;
       const session = state.captureDebugSessionManager.getSessionByTaskId(normalizedTaskId);
       const group = state.captureTaskTabGroupManager.getTask(normalizedTaskId);
@@ -196,11 +214,14 @@
         normalizedTaskId,
         'sidebar_owner_disconnected',
       );
+      if (await strictRetained()) return strictPending();
       await terminalizeCaptureTaskLedgerRun(normalizedTaskId, {
         reason: 'sidebar_owner_disconnected',
         message: '控制面板已关闭，采集任务已停止',
       });
+      if (await strictRetained()) return strictPending();
       await relayCaptureTaskCancellation(session, 'sidebar_owner_disconnected');
+      if (await strictRetained()) return strictPending();
       try {
         await releaseCaptureTaskResourcesWithRetry(
           {

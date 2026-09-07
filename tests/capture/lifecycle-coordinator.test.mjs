@@ -12,13 +12,30 @@ const sources = Object.fromEntries(await Promise.all(names.map(async name => [na
 const runtimeSource = await readFile(new URL('utils/capture/task-runtime.js', root), 'utf8');
 const identitySource = await readFile(new URL('utils/capture/execution-identity.js', root), 'utf8');
 const fingerprints = JSON.parse(await readFile(new URL('tests/fixtures/capture-lifecycle-body-fingerprints.json', root), 'utf8'));
+const activeStopDeltaSource = await readFile(new URL('tests/fixtures/capture-lifecycle-active-stop-delta.json', root), 'utf8');
+const activeStopDelta = JSON.parse(activeStopDeltaSource);
 const plain = value => JSON.parse(JSON.stringify(value));
 function deferred() { let resolve; let reject; const promise = new Promise((a,b) => {resolve=a; reject=b;}); return {promise,resolve,reject}; }
 
-function load() {
+function load({captureFactories=false} = {}) {
   const context = vm.createContext({setTimeout, clearTimeout});
+  if(captureFactories)context.actualLifecycleFactoryOperations=Object.create(null);
   for (const [name, source] of [['runtime',runtimeSource],['identity',identitySource],...Object.entries(sources)]) {
     vm.runInContext(source, context, {filename: name});
+    if(captureFactories && names.includes(name) && name!=='coordinator') {
+      const globalName=`OnStarvoiceCaptureLifecycle${name[0].toUpperCase()}${name.slice(1)}`;
+      const actualModule=context[globalName];
+      assert.equal(typeof actualModule?.create,'function',`${name}: actual module factory`);
+      context[globalName]={...actualModule,create(...args){
+        const api=actualModule.create(...args);
+        for(const [operation,implementation] of Object.entries(api)) {
+          assert.equal(Object.hasOwn(context.actualLifecycleFactoryOperations,operation),false,
+            `${operation}: only one real lifecycle implementation`);
+          context.actualLifecycleFactoryOperations[operation]=implementation;
+        }
+        return api;
+      }};
+    }
   }
   return context;
 }
@@ -201,10 +218,20 @@ test('manager detach callback remains observational, while the explicit END owns
   assert.deepEqual(events,['debug','group','owner','terminal']);
 });
 
-test('all 54 migrated legacy bodies preserve the pinned baseline; three exact strict preambles are independently pinned', () => {
-  const {api}=harness();
+test('all 54 historical bodies remain pinned behind exact verified active-stop deltas and strict resource preambles', () => {
+  // Observe original module factory returns during real coordinator assembly.
+  // The public facade may add admission tracking, but no production raw escape
+  // or historical function reconstruction is introduced for this audit.
+  const context=load({captureFactories:true});
+  const {api}=harness(context);
   assert.equal(fingerprints.baseline,'d5b243f0c6e6e9b3f920ab8264264553a6141411');
   assert.equal(fingerprints.entries.length,54);
+  assert.equal(activeStopDelta.baseline, '3c19c5ea14c9ac1f68a21da8b8caf30353b459d1');
+  assert.equal(createHash('sha256').update(activeStopDeltaSource).digest('hex'),
+    '3470eec3a536738289d161cf0a8972f6e2685b27cfc106894cc576ff9902ab0a');
+  assert.equal(activeStopDelta.entries.length, 31);
+  const changes = new Map(activeStopDelta.entries.map(entry => [entry.name, entry]));
+  assert.equal(changes.size, 31);
   const globals={taskRuntimeApi:'OnStarvoiceCaptureTaskRuntime',taskTabGroupApi:'OnStarvoiceCaptureTaskTabGroup',debugSessionApi:'OnStarvoiceCaptureDebugSession',taskOwnerApi:'OnStarvoiceCaptureTaskOwner'};
   // This does not refresh the historical fixture or skip changed functions.
   // Only these exact additive guards are removed before checking the complete
@@ -215,13 +242,30 @@ test('all 54 migrated legacy bodies preserve the pinned baseline; three exact st
     releaseUnattendedCaptureTaskResourcesForRecovery:'1f90fc97ce57ad170ce5f0c2d9fc364d519cfa8bf9b9379341df78cde0745fd0',
   };
   for(const {name,sha256} of fingerprints.entries) {
-    let source=api[name].toString();
+    assert.equal(typeof api[name],'function',`${name}: actual public facade`);
+    assert.equal(typeof context.actualLifecycleFactoryOperations[name],'function',`${name}: actual factory implementation`);
+    let source=context.actualLifecycleFactoryOperations[name].toString();
     const guards=[...source.matchAll(/^[ \t]*\/\/ STRICT_RESOURCE_FENCE_BEGIN:[\s\S]*?^[ \t]*\/\/ STRICT_RESOURCE_FENCE_END\r?\n/gmu)];
     assert.equal(guards.length,Object.hasOwn(strictPreambles,name)?1:0,name);
     if(guards.length) {
       assert.equal(createHash('sha256').update(guards[0][0]).digest('hex'),strictPreambles[name],`${name} strict preamble`);
-      source=source.replace(guards[0][0],'');
     }
+    const change = changes.get(name);
+    if (change) {
+      const lines = source.split('\n').map(line => line.trim());
+      assert.equal(createHash('sha256').update(lines.join('\n')).digest('hex'), change.sha256,
+        `${name}: exact active-stop body before reverse verification`);
+      // This is non-executable inverse patch data, not a replacement function.
+      // Exact positions AND exact current lines must match. No regex is allowed
+      // to swallow arbitrary changed logic or to refresh the historical hashes.
+      for (const patch of [...change.reverse].reverse()) {
+        assert.deepEqual(lines.slice(patch.at, patch.at + patch.remove.length), patch.remove,
+          `${name}: exact authorized delta at ${patch.at}`);
+        lines.splice(patch.at, patch.remove.length, ...patch.insert);
+      }
+      source = lines.join('\n');
+    }
+    source = source.replace(/^[ \t]*\/\/ STRICT_RESOURCE_FENCE_BEGIN:[\s\S]*?^[ \t]*\/\/ STRICT_RESOURCE_FENCE_END\r?\n/gmu, '');
     source=source.replace(/\bstate\.(captureTaskLifecycleQueue|captureRuntimeRestorePromise|captureTaskBeginInFlight|captureTaskReplacementTabIds|captureTaskPendingWorkerTabIds|captureTaskCleanupInProgress|captureDebugSessionManager|captureTaskTabGroupManager|captureTaskOwnerCoordinator)\b/gu,'$1');
     for(const [alias,global] of Object.entries(globals)) source=source.replace(new RegExp(`\\b${alias}\\.`,'gu'),`globalThis.${global}.`);
     source=source.split('\n').map(line=>line.trim()).join('\n');

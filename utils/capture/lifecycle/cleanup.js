@@ -1,6 +1,17 @@
 // L1: cleanup responsibility. Existing behavior, explicit host ports, one shared lifecycle owner.
 (function register(root) {
   function create({state, ports, operations}) {
+    const strictPending = () => ({ok: false, accepted: false, released: false,
+      resourcesReleased: false, cleanupPending: true, ignored: true,
+      reason: 'strict_capture_control_retained'});
+    const strictRetained = async () => {
+      if (typeof ports.hasStrictCaptureStopControl !== 'function') return false;
+      try { return await ports.hasStrictCaptureStopControl() !== false; } catch { return true; }
+    };
+    const assertLegacyCleanup = async () => {
+      if (await strictRetained()) throw Object.assign(new Error('strict_capture_control_retained'),
+        {code: 'strict_capture_control_retained'});
+    };
     const {
       chrome,
       console,
@@ -14,20 +25,24 @@
 
 
     async function closeCaptureTaskWorkerTabs(workerTabIds = []) {
+      if (await strictRetained()) return strictPending();
       return await taskRuntimeApi.closeWorkerTabsIndividually(
         workerTabIds,
         {
-          removeTab: (tabId) => chrome.tabs.remove(tabId),
+          removeTab: async (tabId) => { await assertLegacyCleanup(); return chrome.tabs.remove(tabId); },
         },
       );
     }
 
     async function closeTrackedCaptureTaskWorkerTabs(taskId, workerTabIds = []) {
+      if (await strictRetained()) return strictPending();
       try {
         const result = await closeCaptureTaskWorkerTabs(workerTabIds);
+        if (await strictRetained()) return strictPending();
         state.captureTaskPendingWorkerTabIds.delete(taskId);
         return result;
       } catch (error) {
+        if (await strictRetained()) return strictPending();
         const failedTabIds = Array.isArray(error?.failedTabIds)
           ? error.failedTabIds
           : workerTabIds;
@@ -84,12 +99,13 @@
     }
 
     async function writeCaptureTaskCancellationFailSoft(cancellation, patch) {
+      if (await strictRetained()) return strictPending();
       return await taskRuntimeApi.publishCancellationFailSoft({
         cancellation,
         notify: (value) => {
           state.captureTaskOwnerCoordinator?.notifyCanceled(value.taskId, value);
         },
-        writeState: writeRuntimeState,
+        writeState: async (...args) => { await assertLegacyCleanup(); return writeRuntimeState(...args); },
         patch,
         onError: reportCaptureTaskCancellationPublishError,
       });
@@ -99,6 +115,7 @@
       taskId = '',
       tabId = null,
     } = {}) {
+      if (await strictRetained()) return false;
       const normalizedTabId = resolveCaptureTaskTabId(tabId);
       if (!normalizedTabId) return false;
       try {
@@ -128,6 +145,7 @@
     }
 
     async function publishCaptureTaskCancellation(taskId, reason) {
+      if (await strictRetained()) return strictPending();
       const cancellation = buildCaptureTaskCancellation(taskId, reason);
       await writeCaptureTaskCancellationFailSoft(cancellation, {
         captureTaskCancellation: cancellation,
@@ -145,6 +163,7 @@
     }
 
     async function relayCaptureTaskCancellation(session, reason) {
+      if (await strictRetained()) return strictPending();
       if (!session) return [];
       const cancelListRunId = session.persistent
         ? session.activeListRunId
@@ -222,6 +241,7 @@
         }
       }
       // STRICT_RESOURCE_FENCE_END
+      if (await strictRetained()) return strictPending();
       const activeDebugSnapshot =
         debugSnapshot || state.captureDebugSessionManager.getSessionByTaskId(taskId);
       const groupSnapshot = state.captureTaskTabGroupManager.getTask(taskId);
@@ -266,6 +286,7 @@
         taskId,
         tabId: cleanupSnapshot.sourceTabId,
       });
+      if (await strictRetained()) return strictPending();
 
       try {
         const result = await taskRuntimeApi.endTaskResources({
@@ -273,24 +294,32 @@
           reason,
           debugSnapshot: activeDebugSnapshot,
           groupSnapshot: workerSnapshot,
-          stopDebug: ({taskId: activeTaskId, reason: stopReason}) =>
-            state.captureDebugSessionManager.stopByTaskId(activeTaskId, stopReason),
-          endGroup: ({taskId: activeTaskId, reason: stopReason}) =>
-            state.captureTaskTabGroupManager.end({
+          stopDebug: async ({taskId: activeTaskId, reason: stopReason}) => {
+            await assertLegacyCleanup();
+            return state.captureDebugSessionManager.stopByTaskId(activeTaskId, stopReason);
+          },
+          endGroup: async ({taskId: activeTaskId, reason: stopReason}) => {
+            await assertLegacyCleanup();
+            return state.captureTaskTabGroupManager.end({
               taskId: activeTaskId,
               reason: stopReason,
-            }),
+            });
+          },
           closeWorkerTabs: (workerTabIds) =>
             closeTrackedCaptureTaskWorkerTabs(taskId, workerTabIds),
         });
+        if (await strictRetained()) return strictPending();
         state.captureTaskPendingWorkerTabIds.delete(taskId);
         state.captureTaskOwnerCoordinator?.clearTask(taskId);
         await writeRuntimeState({captureDebugSession: null}).catch((error) => {
           console.warn('[CaptureTask] failed to clear cleanup snapshot:', error);
         });
         return result;
+      } catch (error) {
+        if (await strictRetained()) return strictPending();
+        throw error;
       } finally {
-        state.captureTaskCleanupInProgress.delete(taskId);
+        if (!await strictRetained()) state.captureTaskCleanupInProgress.delete(taskId);
       }
     }
 
@@ -298,12 +327,14 @@
       options,
       {attempts = 2, retryDelayMs = 250} = {},
     ) {
+      if (await strictRetained()) return strictPending();
       const maxAttempts = Math.max(1, Math.floor(Number(attempts) || 1));
       let lastError = null;
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
           return await releaseCaptureTaskResources(options);
         } catch (error) {
+          if (await strictRetained()) return strictPending();
           lastError = error;
           if (attempt + 1 < maxAttempts) {
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
