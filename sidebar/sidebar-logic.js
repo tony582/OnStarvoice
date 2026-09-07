@@ -7,6 +7,7 @@ import {createLegacyKeywordInputsView} from './legacy-view/keyword-inputs.js';
 import {createLegacyCaptureProgressView} from './legacy-view/capture-progress.js';
 import {createLegacyProgressVisibilityView} from './legacy-view/progress-visibility.js';
 import {createSidebarTaskController} from './task-controller/coordinator.js';
+import {getLocalRecoveryRunnerGate} from './recovery-runner-gate.js';
 
 /**
  * onstarvoice V2.0 Sidebar Business Logic
@@ -703,6 +704,17 @@ async function handleCopyDiagnostics() {
  * 初始化侧边栏
  */
 export async function initSidebar() {
+  const recoveryRunnerGate = getLocalRecoveryRunnerGate();
+  if (recoveryRunnerGate.isRecoveryRunner) {
+    try {
+      const handoff = await recoveryRunnerGate.waitForActivation({holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID});
+      recoveryRunnerGate.assertActive();
+      sidebarTaskController.adoptLocalRecoveryRunnerOwner(handoff);
+    } catch (error) {
+      console.warn('[Sidebar] Local recovery shell remains inactive:', error);
+      return;
+    }
+  }
   console.log("[Sidebar] Initializing...");
 
   // 先恢复用户已经确认关闭的终态摘要，避免 initAllStates 首屏短暂复活旧任务。
@@ -10403,6 +10415,7 @@ const taskView = Object.freeze({
   updateExpandKeywordsButtonState: legacyTaskViewCapabilities.updateExpandKeywordsButtonState,
 });
 const sidebarTaskController = createSidebarTaskController({
+  localRecoveryRunnerGate: getLocalRecoveryRunnerGate(),
   ACTIVE_COMMENT_PROGRESS_PHASES,
   AUTH_STATUS,
   BATCH_DRAFT_LEGACY_KEYS,

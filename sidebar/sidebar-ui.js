@@ -12,6 +12,7 @@ import {
   refreshTaskLedger,
   refreshTaskCenterLegacyState,
 } from "./state.js";
+import {getLocalRecoveryRunnerGate} from './recovery-runner-gate.js';
 import {
   initializeTaskCenterInteractions,
   renderTaskCenterPanel,
@@ -269,7 +270,17 @@ function initInstantTooltips() {
   });
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
+  const recoveryRunnerGate = getLocalRecoveryRunnerGate();
+  if (recoveryRunnerGate.isRecoveryRunner) {
+    try {
+      await recoveryRunnerGate.waitForActivation();
+      recoveryRunnerGate.assertActive();
+    } catch (error) {
+      console.warn('[Sidebar UI] Local recovery shell remains inactive:', error);
+      return;
+    }
+  }
   initInstantTooltips();
 
   const tabPanes = Array.from(

@@ -70,6 +70,11 @@ export function createUnattendedRunController({controllerState, controllerPorts,
   const waitForUnattendedProtectedStart = (...args) => controllerOperations.waitForUnattendedProtectedStart(...args);
 
   async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}) {
+    const isLocalRecoveryRunner = controllerPorts.localRecoveryRunnerGate?.isRecoveryRunner === true;
+    if (isLocalRecoveryRunner && !controllerPorts.strictCaptureClient) {
+      return controllerOperations.runLocalRecoveryClaimedProducer(scope =>
+        scope.operations.maybeClaimAndRunUnattendedKeywordPlan({allowPending}));
+    }
     if (getTargetedPostRunRequestIdFromUrl()) {
       return;
     }
@@ -89,7 +94,11 @@ export function createUnattendedRunController({controllerState, controllerPorts,
     let claimedRunAccepted = false;
     let claimedExecutionCopy = getKeywordExecutionCopy();
     try {
-      const response = await chrome.runtime.sendMessage({
+      const response = isLocalRecoveryRunner
+        ? controllerOperations.takeLocalRecoveryRunnerClaim({
+          requestId, attemptId: requestAttemptId, holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
+        })
+        : await chrome.runtime.sendMessage({
         type: "onstarvoice:claim-unattended-keyword-run",
         requestId,
         attemptId: requestAttemptId,

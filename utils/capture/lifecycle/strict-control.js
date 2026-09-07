@@ -17,6 +17,11 @@
       createTab, admitWhileLegacyIdle, now = Date.now, randomId = () => root.crypto.randomUUID(),
       pause = ms => new Promise(resolve => root.setTimeout(resolve, ms))} = ports;
     const api = root.OnStarvoiceActiveStopAuthority;
+    const localSource = ports.localSource;
+    const candidate = (state, options) => localSource && state.origin?.request?.requestId === state.request?.id
+      ? localSource.candidate(state, options) : api.candidate(state, options);
+    const evaluate = (current, action) => current.local ? localSource.evaluate(current, action) : authority.evaluate(current);
+    const stopAction = j => j?.originKind === 'local-v1' ? 'stop_local_capture' : api.ACTION;
     const sameScope = root.OnStarvoiceStopJournal.sameScope;
     const valid = root.OnStarvoiceStopJournal.valid;
     const connections = new Map(), handles = new Map(), inflight = new Map();
@@ -46,8 +51,8 @@
       if (result) void signalStop().catch(() => {});
       return result;
     }
-    function attachPort(port) {
-      if (port?.name !== PORT) return false;
+    function attachPort(port, localHandoff = false) {
+      if (port?.name !== PORT && !(localHandoff && port?.name === 'onstarvoice:local-recovery-runner-v1')) return false;
       const c = caller(port.sender);
       if (!c || connections.size >= 32) {port.disconnect?.(); return true;}
       const old = connections.get(c.documentId);
@@ -69,6 +74,10 @@
       const r = state.request;
       let lock;
       try {lock = api.lockIdentity(state.lock, r);} catch {return false;}
+      if (j.originKind === 'local-v1') return !!localSource && localSource.matches(state, j) &&
+        state.auth && api.canonical(state.auth) === j.authWitness &&
+        api.canonical(lock) === api.canonical(j.lockIdentity) &&
+        (!state.ledger?.clearedAt || Date.parse(state.ledger.clearedAt) < Date.parse(j.createdAt));
       const rows = state.ledger?.runs?.filter(row => row?.id === j.requestId);
       if (rows?.length !== 1 || rows[0].attemptId !== j.attemptId || rows[0].updatedAt !== r?.updatedAt ||
           rows[0].status !== r?.status || rows[0].metadata?.cloudCommandId !== j.cloudCommandId ||
@@ -84,25 +93,26 @@
     }
     function producerSourceCurrent(state, j) {
       try {
-        const current = api.candidate(state);
+        const current = candidate(state);
         return sameLiveSource(state, j) && current.source.platform === j.platform &&
           Number.isFinite(state.lock.expiresAt) && state.lock.expiresAt > now();
       } catch {return false;}
     }
     // authWitness is kept only in memory. Never persist bearer tokens.
     const authWitnesses = new Map();
-    function witness(j) { return {...j, authWitness: authWitnesses.get(j.generation)}; }
+    const originWitnesses = new Map();
+    function witness(j) { return {...j, authWitness: authWitnesses.get(j.generation), originWitness: originWitnesses.get(j.generation)}; }
     async function bind(message, c) {
       if (!connected(c) || !id(message.requestId) || !id(message.attemptId)) return deny('strict_owner_unavailable');
       const state = await journal.read();
       if (state.journal) return deny('strict_generation_already_retained');
-      const current = api.candidate(state, {allowReservation: true});
+      const current = candidate(state, {allowReservation: true});
       if (current.source.clientTaskId !== message.requestId || current.source.clientAttemptId !== message.attemptId ||
           state.lock.holderDocumentId !== c.documentId || !Number.isFinite(state.lock.expiresAt) ||
           state.lock.expiresAt <= now() || !Number.isSafeInteger(c.tabId) || c.tabId <= 0 ||
           state.request.runnerTabId !== c.tabId) return deny('strict_owner_mismatch');
       const credentialFingerprint = await api.credentialFingerprint(current.auth);
-      const evaluation = await authority.evaluate(current);
+      const evaluation = await evaluate(current, 'start_local_capture');
       const generation = 1;
       const boundLock = {...state.lock, captureTaskId: `unattended-capture:${message.requestId}`,
         captureTaskAttemptId: message.attemptId};
@@ -111,6 +121,7 @@
         phase: 'active', createdAt: new Date(now()).toISOString(), updatedAt: new Date(now()).toISOString(),
         cloudCommandId: current.source.cloudCommandId, agentId: current.auth.captureAgent.id,
         platform: current.source.platform, source: current.source, lockIdentity: api.lockIdentity(boundLock, state.request),
+        ...(current.local ? {originKind: 'local-v1', originId: current.proof.originId, originProof: copy(current.proof)} : {}),
         pages: [], operations: [], activities: [], operationWatermark: 0, activityWatermark: 0,
         retainedTabs: [c.tabId], ownerTabId: c.tabId,
         runnerQuiesced: false, pendingUploads: null, receipt: null};
@@ -119,10 +130,11 @@
       // Install the private witness before publication so our own atomic bind
       // cannot be mistaken for an unauthenticated post-restart generation.
       authWitnesses.set(generation, api.canonical(current.auth));
+      if (current.local) originWitnesses.set(generation, api.canonical(current.proof));
       const result = await admitWhileLegacyIdle(() => journal.transact(fresh => {
         if (fresh.journal || !connected(c) || now() >= evaluation.deadline ||
             api.canonical(fresh.auth) !== api.canonical(current.auth) ||
-            api.candidate(fresh, {allowReservation: true}).fingerprint !== current.fingerprint ||
+            candidate(fresh, {allowReservation: true}).fingerprint !== current.fingerprint ||
             fresh.lock.expiresAt <= now()) return {result: deny('strict_source_changed')};
         return {next: j, ...(!fresh.lock.captureTaskId ? {bindLock: {...fresh.lock,
           captureTaskId: boundLock.captureTaskId, captureTaskAttemptId: boundLock.captureTaskAttemptId}} : {}),
@@ -360,34 +372,35 @@
       return result;
     }
     async function prepare(message, c) {
-      if (!connected(c) || message.action !== api.ACTION) return deny('strict_caller_invalid');
+      if (!connected(c)) return deny('strict_caller_invalid');
       const state = await journal.read(), j = state.journal;
+      if (message.action !== stopAction(j)) return deny('strict_caller_invalid');
       if (!valid(j) || j.workerEpoch !== workerEpoch || j.phase !== 'active') return deny('strict_cohort_unavailable');
-      const current = api.candidate(state);
+      const current = candidate(state);
       if (!sameLiveSource(state, witness(j))) return deny('strict_source_changed');
-      const evaluation = await authority.evaluate(current);
+      const evaluation = await evaluate(current, stopAction(j));
       if (!connected(c)) return deny('strict_caller_changed');
       for (const [key, entry] of handles) if (entry.deadline <= now()) handles.delete(key);
       if (handles.size >= 64) return deny('strict_handle_capacity');
       const handle = randomId();
       handles.set(handle, {caller: c.documentId, connection: connections.get(c.documentId), source: current, generation: j.generation,
-        deadline: evaluation.deadline, used: false});
-      return {ok: true, accepted: true, action: api.ACTION, handle, expiresAt: new Date(evaluation.deadline).toISOString()};
+        action: stopAction(j), deadline: evaluation.deadline, used: false});
+      return {ok: true, accepted: true, action: stopAction(j), handle, expiresAt: new Date(evaluation.deadline).toISOString()};
     }
     async function execute(message, c) {
       const entry = handles.get(message.handle);
-      if (!connected(c) || message.action !== api.ACTION || !entry || entry.caller !== c.documentId ||
+      if (!connected(c) || !entry || message.action !== entry.action || entry.caller !== c.documentId ||
           entry.connection !== connections.get(c.documentId) || entry.used || now() >= entry.deadline) return deny('strict_handle_invalid');
       entry.used = true;
-      const current = api.candidate(await journal.read());
+      const current = candidate(await journal.read());
       if (api.canonical(current.auth) !== api.canonical(entry.source.auth) || current.fingerprint !== entry.source.fingerprint) return deny('strict_source_changed');
-      const evaluation = await authority.evaluate(current);
+      const evaluation = await evaluate(current, entry.action);
       const deadline = Math.min(entry.deadline, evaluation.deadline);
       const result = await dispatchGate(() => journal.transact(state => {
         const j = state.journal;
         if (!valid(j) || j.workerEpoch !== workerEpoch || j.generation !== entry.generation ||
             j.phase !== 'active' || !connected(c) || now() >= deadline ||
-            api.canonical(state.auth) !== api.canonical(current.auth) || api.candidate(state).fingerprint !== current.fingerprint) {
+            api.canonical(state.auth) !== api.canonical(current.auth) || candidate(state).fingerprint !== current.fingerprint) {
           return {result: deny('strict_source_changed')};
         }
         return {next: {...j, phase: 'stop_requested', stopId: randomId(), stopRequestedAt: new Date(now()).toISOString(),
@@ -395,7 +408,7 @@
       }));
       if (!result?.ok) return result;
       void signalStop().catch(() => {});
-      return {ok: true, accepted: true, action: api.ACTION, phase: 'stop_requested',
+      return {ok: true, accepted: true, action: entry.action, phase: 'stop_requested',
         sourceStopped: false, resourcesReleased: false, successorAllowed: false};
     }
     async function signalStop() {
@@ -447,7 +460,7 @@
         const pageStopped = current.pages.every(page => page.stopped && page.quiesced);
         const sourceStopped = current.runnerQuiesced === true && pageStopped && !pending && current.phase !== 'quarantined';
         const retainedTabs = [...new Set([...(current.retainedTabs || []), ...current.pages.map(page => page.tabId)])];
-        const receipt = {ok: true, accepted: true, action: api.ACTION, requestId: current.requestId,
+        const receipt = {ok: true, accepted: true, action: stopAction(current), requestId: current.requestId,
           attemptId: current.attemptId, generation: current.generation, sourceStopped,
           runnerQuiesced: current.runnerQuiesced === true, pendingUploads: current.pendingUploads,
           resourcesReleased: false, successorAllowed: false, retainedTabs,
@@ -475,7 +488,22 @@
         }
       } catch (error) {return deny(String(error?.message || 'strict_control_failed'));}
     }
-    return Object.freeze({handle, attachPort, stopLocally,
+    return Object.freeze({handle, attachPort, stopLocally, localJournal: journal,
+      // Private background-only handoff ports, never selected by a renderer
+      // message. Exact authorization and storage CAS belong to local recovery.
+      async localRecoverySource() {
+        const state = await journal.read(), j = state.journal;
+        if (!valid(j) || j.originKind !== 'local-v1' || j.workerEpoch !== workerEpoch ||
+            !sameLiveSource(state, witness(j))) throw new Error('local_stop_witness_unavailable');
+        return state;
+      },
+      async adoptLocalSuccessor({auth, proof, generation, port}, commit) {
+        if (generation !== 2 || !caller(port?.sender) || !localSource) throw new Error('local_handoff_invalid');
+        if (!attachPort(port, true)) throw new Error('local_owner_connection_invalid');
+        authWitnesses.set(generation, api.canonical(auth));
+        originWitnesses.set(generation, api.canonical(proof));
+        return dispatchGate(commit);
+      },
       async reconcileWitness() {
         const state = await journal.read();
         if (valid(state.journal) && (state.journal.workerEpoch !== workerEpoch ||

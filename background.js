@@ -30,7 +30,10 @@ importScripts(
   'utils/control/terminal-authority.js',
   'utils/control/stop-journal.js',
   'utils/control/active-stop-authority.js',
+  'utils/control/local-capture-authority.js',
+  'utils/control/local-capture-source.js',
   'utils/capture/lifecycle/strict-control.js',
+  'utils/capture/lifecycle/local-recovery.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
   'utils/capture/execution-identity.js',
@@ -1193,10 +1196,13 @@ async function readTerminalMetadataCredential() {
 }
 
 let strictCaptureControl = null;
+let localRecoveryControl = null;
 
 async function hasStrictCaptureStopControl() {
   const key = globalThis.OnStarvoiceStopJournal.KEY;
-  const retained = (await chrome.storage.local.get(key))[key] != null;
+  const launchKey = globalThis.OnStarvoiceStopJournal.LAUNCH_KEY;
+  const stored = await chrome.storage.local.get([key, ...(launchKey ? [launchKey] : [])]);
+  const retained = stored[key] != null || (launchKey && stored[launchKey] != null);
   if (retained) getStrictCaptureControl();
   return retained;
 }
@@ -1228,9 +1234,12 @@ function getStrictCaptureControl() {
     runReservationOperation: runCaptureExecutionLockOperation,
     keys: {auth: STORAGE_KEYS.auth, request: STORAGE_KEYS.unattendedKeywordRunRequest,
       ledger: STORAGE_KEYS.taskLedger, archive: STORAGE_KEYS.unattendedKeywordRunArchive,
-      lock: STORAGE_KEYS.captureExecutionLock}});
+      lock: STORAGE_KEYS.captureExecutionLock, plan: STORAGE_KEYS.unattendedKeywordPlan}});
   strictCaptureControl = globalThis.OnStarvoiceStrictCaptureControl.create({
     journal, authority: globalThis.OnStarvoiceActiveStopAuthority.create({query: queryActiveStopAuthority}),
+    localSource: globalThis.OnStarvoiceLocalCaptureSource && globalThis.OnStarvoiceLocalCaptureSource.create({
+      authority: globalThis.OnStarvoiceLocalCaptureAuthority.create({query: queryLocalCaptureAuthority}),
+    }),
     extensionId: chrome.runtime.id, workerEpoch: crypto.randomUUID(),
     resolveDocument: async tabId => {
       // A read-only browser execution result supplies documentId. No new
@@ -1245,6 +1254,51 @@ function getStrictCaptureControl() {
   });
   void strictCaptureControl.reconcileWitness().catch(() => {});
   return strictCaptureControl;
+}
+
+async function queryLocalCaptureAuthority(body, {rawAuth, signal}) {
+  const base = new URL(globalThis.__ONSTARVOICE_API_BASE_URL__ || 'https://voice.minilife.online');
+  const local = globalThis.__ONSTARVOICE_BUILD_TARGET__ === 'local' && base.protocol === 'http:' &&
+    ['127.0.0.1', 'localhost'].includes(base.hostname);
+  if ((!local && base.origin !== 'https://voice.minilife.online') || base.username || base.password ||
+      base.pathname !== '/' || base.search || base.hash) throw new Error('local_authority_denied');
+  const response = await fetch(new URL('/api/capture-cloud/agent/local-control-authority', base), {
+    method: 'POST', signal, redirect: 'error', credentials: 'omit', cache: 'no-store',
+    headers: {'Content-Type': 'application/json', Authorization: `Bearer ${rawAuth.captureAgent.token}`},
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error('local_authority_denied');
+  return response.json();
+}
+
+function getLocalRecoveryControl() {
+  if (localRecoveryControl) return localRecoveryControl;
+  const control = getStrictCaptureControl();
+  localRecoveryControl = globalThis.OnStarvoiceLocalRecovery.create({
+    journal: control.localJournal,
+    authority: globalThis.OnStarvoiceLocalCaptureAuthority.create({query: queryLocalCaptureAuthority}),
+    captureControl: control, extensionId: chrome.runtime.id,
+    normalizePlan: (plan, {updatedAt}) => {
+      const normalized = normalizeUnattendedKeywordPlan({...plan, updatedAt});
+      return {...normalized, nextRunAt: computeNextUnattendedRunAt(normalized, new Date())};
+    },
+    buildOriginal: buildUnattendedKeywordRequest,
+    buildRecovery: buildLocalRecoveryRequest,
+    lockLeaseMs: CAPTURE_EXECUTION_LOCK_LEASE_MS,
+    project: (ledger, request, previousRequest) => {
+      const result = upsertUnattendedTaskLedger(ledger, request, {previousRequest,
+        event: {type: request.status, message: request.message, at: request.updatedAt}});
+      if (!result.accepted) throw new Error('local_recovery_ledger_rejected');
+      return result.ledger;
+    },
+    afterPlanSaved: plan => syncUnattendedKeywordAlarm(plan),
+    createRunner: (request, launchId) => {
+      const url = new URL(buildUnattendedRunnerUrl(request.id, request.attemptId));
+      url.searchParams.set('localRecoveryIntent', launchId);
+      return chrome.tabs.create({url: url.href, active: false});
+    },
+  });
+  return localRecoveryControl;
 }
 
 async function strictLifecycleGuard(kind, message, sender) {
@@ -7733,6 +7787,7 @@ async function cancelUnattendedKeywordRunFromControl({
         nextRunAt: '',
       },
       {recomputeNext: true, from: buildScheduleReferenceAfterDate(now)},
+      LOCAL_PLAN_SCHEDULE_WRITE,
     );
   }
 
@@ -7866,6 +7921,10 @@ function normalizeScheduleReference(value) {
   return new Date();
 }
 
+// Private capability for the audited internal schedule/progress projections.
+// Renderer JSON and ordinary author/cloud saves cannot supply this identity.
+const LOCAL_PLAN_SCHEDULE_WRITE = Object.freeze({});
+
 async function saveUnattendedKeywordPlan(
   plan,
   {
@@ -7874,6 +7933,7 @@ async function saveUnattendedKeywordPlan(
     preserveRunState = true,
     confirmCloudScope = false,
   } = {},
+  scheduleWriteToken = null,
 ) {
   const normalized = normalizeUnattendedKeywordPlan({
     ...plan,
@@ -7882,10 +7942,12 @@ async function saveUnattendedKeywordPlan(
   const nextRunAt = recomputeNext
     ? computeNextUnattendedRunAt(normalized, normalizeScheduleReference(from))
     : normalized.nextRunAt;
-  const nextPlan = await runTaskLedgerMutation(async () => {
-    const stored = await chrome.storage.local.get(
-      STORAGE_KEYS.unattendedKeywordPlan,
-    );
+  const nextPlan = await runTaskLedgerMutation(() =>
+    (globalThis.OnStarvoiceControlStateFence?.run || (operation => operation()))(async () => {
+    const originKey = 'onstarvoice.localCaptureOrigin.v1';
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.unattendedKeywordPlan, originKey,
+    ]);
     const currentPlan = normalizeUnattendedKeywordPlan(
       stored[STORAGE_KEYS.unattendedKeywordPlan],
     );
@@ -7903,11 +7965,38 @@ async function saveUnattendedKeywordPlan(
       ...preservedRunState,
       nextRunAt,
     };
+    const origin = stored[originKey];
+    const preserveOrigin = scheduleWriteToken === LOCAL_PLAN_SCHEDULE_WRITE;
+    if (preserveOrigin && origin != null) {
+      const source = globalThis.OnStarvoiceLocalCaptureSource;
+      const authority = globalThis.OnStarvoiceLocalCaptureAuthority;
+      const proof = origin.plan;
+      const unproven = () => {
+        const error = new Error('local_plan_schedule_origin_unproven');
+        error.code = 'local_plan_schedule_origin_unproven';
+        throw error;
+      };
+      // null is an explicit author/cloud revocation, not a missing proof that
+      // an automatic scheduler is permitted to erase or downgrade to legacy.
+      if (origin.version !== 1 || !Object.hasOwn(origin, 'plan')) unproven();
+      if (proof !== null) {
+        if (!source || !authority || !source.validProof(proof)) unproven();
+        const identity = source.planIdentity(proof.planSnapshot);
+        const expected = authority.canonical(identity);
+        if (authority.canonical(source.planIdentity(stored[STORAGE_KEYS.unattendedKeywordPlan])) !== expected ||
+            authority.canonical(source.planIdentity(next)) !== expected ||
+            await authority.hash(identity) !== proof.planFingerprint) unproven();
+      }
+    }
     await chrome.storage.local.set({
       [STORAGE_KEYS.unattendedKeywordPlan]: next,
+      // Ordinary UI, imported and cloud-authored plans cannot inherit a strict
+      // local author's witness, even if their normalized fields happen to match.
+      // An already admitted request keeps its separate immutable source proof.
+      ...(origin && !preserveOrigin ? {[originKey]: {...origin, plan: null}} : {}),
     });
     return next;
-  });
+  }));
   await syncUnattendedKeywordAlarm(nextPlan);
   if (confirmCloudScope) {
     const credential = await readCloudTaskAgentCredential();
@@ -8508,6 +8597,48 @@ async function openUnattendedRunnerTab(
   });
 }
 
+function buildUnattendedKeywordRequest(plan, {reason = 'alarm', requestId = '', cloudCommandId = '',
+  cloudAssigned = false, executionMode = '', orchestrationContext = null, checkpoint = null} = {},
+  auth = {}, now = new Date().toISOString()) {
+  const cloudCredential = auth.captureAgent || {};
+  const normalizedOrchestrationContext =
+    normalizeOrchestrationExecutionContext(orchestrationContext);
+  const executionCopy = getUnattendedExecutionCopy({
+    executionMode,
+    orchestrationContext: normalizedOrchestrationContext,
+  });
+  const request = {
+    schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
+    id: String(requestId || '').trim() || createUuid(),
+    attemptId: createUuid(),
+    attemptNumber: 1,
+    progressSeq: 0,
+    recoveryCount: 0,
+    type: 'keyword_batch',
+    status: 'pending',
+    reason,
+    cloudCommandId: String(cloudCommandId || '').trim(),
+    cloudAssigned: cloudAssigned === true,
+    executionMode: executionCopy.executionMode,
+    ...(normalizedOrchestrationContext
+      ? {orchestrationContext: normalizedOrchestrationContext}
+      : {}),
+    cloudAgentScopeId: String(cloudCredential.id || ''),
+    createdAt: now,
+    updatedAt: now,
+    heartbeatAt: now,
+    businessProgressAt: now,
+    planSnapshot: normalizeUnattendedKeywordPlan(plan),
+    ...(checkpoint && typeof checkpoint === 'object'
+      ? {checkpoint: JSON.parse(JSON.stringify(checkpoint))}
+      : {}),
+    progress: null,
+    error: null,
+    message: `已创建${executionCopy.taskLabel}，等待运行页领取`,
+  };
+  return request;
+}
+
 async function createUnattendedKeywordRunRequest(
   plan,
   {
@@ -8520,6 +8651,15 @@ async function createUnattendedKeywordRunRequest(
     checkpoint = null,
   } = {},
 ) {
+  if (globalThis.OnStarvoiceLocalRecovery && !cloudAssigned && !cloudCommandId && !orchestrationContext) {
+    const originKey = globalThis.OnStarvoiceLocalCaptureSource.KEY;
+    if ((await chrome.storage.local.get(originKey))[originKey]?.plan) {
+      const local = await getLocalRecoveryControl().maybeCreateOriginal(plan, {
+        reason, requestId, cloudCommandId, cloudAssigned, executionMode, orchestrationContext, checkpoint,
+      });
+      if (local.handled) return local.request;
+    }
+  }
   const creationLedger = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
   await assertLegacyCaptureControlAvailable();
   const creationClearedAt = String(creationLedger[STORAGE_KEYS.taskLedger]?.clearedAt || '');
@@ -8533,41 +8673,8 @@ async function createUnattendedKeywordRunRequest(
     }
     const cloudCredential = await readCloudTaskAgentCredential();
     const now = new Date().toISOString();
-    const normalizedOrchestrationContext =
-      normalizeOrchestrationExecutionContext(orchestrationContext);
-    const executionCopy = getUnattendedExecutionCopy({
-      executionMode,
-      orchestrationContext: normalizedOrchestrationContext,
-    });
-    const request = {
-      schemaVersion: UNATTENDED_RUN_SCHEMA_VERSION,
-      id: String(requestId || '').trim() || createUuid(),
-      attemptId: createUuid(),
-      attemptNumber: 1,
-      progressSeq: 0,
-      recoveryCount: 0,
-      type: 'keyword_batch',
-      status: 'pending',
-      reason,
-      cloudCommandId: String(cloudCommandId || '').trim(),
-      cloudAssigned: cloudAssigned === true,
-      executionMode: executionCopy.executionMode,
-      ...(normalizedOrchestrationContext
-        ? {orchestrationContext: normalizedOrchestrationContext}
-        : {}),
-      cloudAgentScopeId: String(cloudCredential.id || ''),
-      createdAt: now,
-      updatedAt: now,
-      heartbeatAt: now,
-      businessProgressAt: now,
-      planSnapshot: normalizeUnattendedKeywordPlan(plan),
-      ...(checkpoint && typeof checkpoint === 'object'
-        ? {checkpoint: JSON.parse(JSON.stringify(checkpoint))}
-        : {}),
-      progress: null,
-      error: null,
-      message: `已创建${executionCopy.taskLabel}，等待运行页领取`,
-    };
+    const request = buildUnattendedKeywordRequest(plan, {reason, requestId, cloudCommandId, cloudAssigned, executionMode, orchestrationContext, checkpoint}, {captureAgent: cloudCredential}, now);
+    const executionCopy = getUnattendedExecutionCopy(request);
     await persistUnattendedRunMutation(request, {
       creationSource: existing,
       creationClearedAt,
@@ -10194,6 +10301,144 @@ async function prepareUnattendedManualRecoverySource(requestId = '') {
   return {ready: true, request: confirmed, closureKey: confirmedKey};
 }
 
+function buildUnattendedManualRecoveryPlan(current, normalizedMode, allowedKeywords = []) {
+  let checkpoint = buildManualRecoveryCheckpoint(current, normalizedMode);
+  let planSnapshot = normalizeUnattendedKeywordPlan(current.planSnapshot || {});
+  if (normalizedMode === 'failed') {
+    const taskCheckpoint = buildTaskCenterCheckpointFromUnattendedRequest(current);
+    const failedKeywords = taskCheckpoint.failedKeywords.filter(Boolean);
+    if (failedKeywords.length === 0) {
+      return {
+        accepted: false,
+        reason: 'no_failed_keywords',
+        request: current,
+      };
+    }
+    planSnapshot = normalizeUnattendedKeywordPlan({
+      ...planSnapshot,
+      keywords: failedKeywords,
+      // “仅重试失败项”是一次有界补偿，不继承原多轮循环；否则第 N 轮的
+      // 单个失败词会从第 1 轮重新跑满全部轮次，造成重复采集和风控风险。
+      autoLoop: false,
+      maxRounds: 1,
+      roundGapMin: 0,
+    });
+  } else if (normalizedMode === 'skip_current') {
+    const skippedKeyword = String(
+      current.checkpoint?.activeKeyword ||
+        current.checkpoint?.currentKeyword ||
+        current.progress?.keyword ||
+        '',
+    ).trim();
+    if (!skippedKeyword) {
+      return {
+        accepted: false,
+        reason: 'no_current_keyword',
+        request: current,
+      };
+    }
+    planSnapshot = normalizeUnattendedKeywordPlan({
+      ...planSnapshot,
+      keywords: planSnapshot.keywords.filter(
+        (keyword) => keyword !== skippedKeyword,
+      ),
+    });
+    if (planSnapshot.keywords.length === 0) {
+      return {
+        accepted: false,
+        reason: 'no_remaining_keywords',
+        request: current,
+      };
+    }
+  }
+  const scopedKeywords = Array.from(
+    new Set(
+      (Array.isArray(allowedKeywords) ? allowedKeywords : [])
+        .map((keyword) => String(keyword || '').trim())
+        .filter(Boolean),
+    ),
+  ).slice(0, 30);
+  if (scopedKeywords.length > 0) {
+    const allowedSet = new Set(scopedKeywords);
+    const planKeywords = planSnapshot.keywords.filter((keyword) =>
+      allowedSet.has(keyword),
+    );
+    if (planKeywords.length === 0) {
+      return {
+        accepted: false,
+        reason: 'no_allowed_keywords',
+        request: current,
+      };
+    }
+    const indexByKeyword = new Map(
+      planKeywords.map((keyword, index) => [keyword, index]),
+    );
+    const activeKeyword = String(
+      checkpoint.activeKeyword || checkpoint.currentKeyword || '',
+    ).trim();
+    const retainedActiveKeyword = allowedSet.has(activeKeyword)
+      ? activeKeyword
+      : planKeywords[0];
+    checkpoint = {
+      ...checkpoint,
+      round: 1,
+      activeKeywordIndex: indexByKeyword.get(retainedActiveKeyword) || 0,
+      keywordIndex: indexByKeyword.get(retainedActiveKeyword) || 0,
+      activeKeyword: retainedActiveKeyword,
+      currentKeyword: retainedActiveKeyword,
+      keywordResults: checkpoint.keywordResults
+        .filter((entry) => allowedSet.has(String(entry?.keyword || '').trim()))
+        .map((entry) => ({
+          ...entry,
+          round: 1,
+          index:
+            indexByKeyword.get(String(entry?.keyword || '').trim()) || 0,
+        })),
+      completedKeywords: checkpoint.completedKeywords.filter((keyword) =>
+        allowedSet.has(keyword),
+      ),
+      failedKeywords: checkpoint.failedKeywords.filter((keyword) =>
+        allowedSet.has(keyword),
+      ),
+      skippedKeywords: checkpoint.skippedKeywords.filter((keyword) =>
+        allowedSet.has(keyword),
+      ),
+      attempts: Object.fromEntries(
+        Object.entries(checkpoint.attempts).filter(([keyword]) =>
+          allowedSet.has(keyword),
+        ),
+      ),
+      updatedAt: new Date().toISOString(),
+    };
+    planSnapshot = normalizeUnattendedKeywordPlan({
+      ...planSnapshot,
+      keywords: planKeywords,
+      autoLoop: false,
+      maxRounds: 1,
+      roundGapMin: 0,
+    });
+  }
+  return {accepted: true, checkpoint, planSnapshot, scopedKeywords};
+}
+
+function buildLocalRecoveryRequest(current, mode, now = new Date().toISOString()) {
+  const plan = buildUnattendedManualRecoveryPlan(current, mode);
+  if (!plan.accepted) throw new Error(plan.reason);
+  return {
+    ...current,
+    id: createUuid(), attemptId: createUuid(), parentRequestId: current.id,
+    cloudAssigned: false, cloudCommandId: '', attemptNumber: 2,
+    progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,
+    recoveryCount: 0, manualRecoveryCount: Math.max(0, Number(current.manualRecoveryCount) || 0) + 1,
+    recoveryMode: mode, recoveryReason: 'manual_recovery', recoveryPendingLaunch: false,
+    recoveryLaunchFailures: 0, recoveryWaitUntil: '', status: 'recovering', reason: 'manual_recovery',
+    createdAt: now, updatedAt: now, heartbeatAt: now, businessProgressAt: now,
+    claimedAt: '', startedAt: '', finishedAt: '', runnerTabId: null,
+    planSnapshot: plan.planSnapshot, checkpoint: plan.checkpoint, progress: null, error: null,
+    message: {remaining: '继续采集剩余关键词', failed: '仅重试失败关键词', skip_current: '跳过当前项并继续'}[mode],
+  };
+}
+
 async function manuallyRecoverUnattendedKeywordRun({
   requestId = '',
   mode = 'remaining',
@@ -10292,122 +10537,9 @@ async function manuallyRecoverUnattendedKeywordRun({
     }
 
     const now = new Date().toISOString();
-    let checkpoint = buildManualRecoveryCheckpoint(current, normalizedMode);
-    let planSnapshot = normalizeUnattendedKeywordPlan(current.planSnapshot || {});
-    if (normalizedMode === 'failed') {
-      const taskCheckpoint = buildTaskCenterCheckpointFromUnattendedRequest(current);
-      const failedKeywords = taskCheckpoint.failedKeywords.filter(Boolean);
-      if (failedKeywords.length === 0) {
-        return {
-          accepted: false,
-          reason: 'no_failed_keywords',
-          request: current,
-        };
-      }
-      planSnapshot = normalizeUnattendedKeywordPlan({
-        ...planSnapshot,
-        keywords: failedKeywords,
-        // “仅重试失败项”是一次有界补偿，不继承原多轮循环；否则第 N 轮的
-        // 单个失败词会从第 1 轮重新跑满全部轮次，造成重复采集和风控风险。
-        autoLoop: false,
-        maxRounds: 1,
-        roundGapMin: 0,
-      });
-    } else if (normalizedMode === 'skip_current') {
-      const skippedKeyword = String(
-        current.checkpoint?.activeKeyword ||
-          current.checkpoint?.currentKeyword ||
-          current.progress?.keyword ||
-          '',
-      ).trim();
-      if (!skippedKeyword) {
-        return {
-          accepted: false,
-          reason: 'no_current_keyword',
-          request: current,
-        };
-      }
-      planSnapshot = normalizeUnattendedKeywordPlan({
-        ...planSnapshot,
-        keywords: planSnapshot.keywords.filter(
-          (keyword) => keyword !== skippedKeyword,
-        ),
-      });
-      if (planSnapshot.keywords.length === 0) {
-        return {
-          accepted: false,
-          reason: 'no_remaining_keywords',
-          request: current,
-        };
-      }
-    }
-    const scopedKeywords = Array.from(
-      new Set(
-        (Array.isArray(allowedKeywords) ? allowedKeywords : [])
-          .map((keyword) => String(keyword || '').trim())
-          .filter(Boolean),
-      ),
-    ).slice(0, 30);
-    if (scopedKeywords.length > 0) {
-      const allowedSet = new Set(scopedKeywords);
-      const planKeywords = planSnapshot.keywords.filter((keyword) =>
-        allowedSet.has(keyword),
-      );
-      if (planKeywords.length === 0) {
-        return {
-          accepted: false,
-          reason: 'no_allowed_keywords',
-          request: current,
-        };
-      }
-      const indexByKeyword = new Map(
-        planKeywords.map((keyword, index) => [keyword, index]),
-      );
-      const activeKeyword = String(
-        checkpoint.activeKeyword || checkpoint.currentKeyword || '',
-      ).trim();
-      const retainedActiveKeyword = allowedSet.has(activeKeyword)
-        ? activeKeyword
-        : planKeywords[0];
-      checkpoint = {
-        ...checkpoint,
-        round: 1,
-        activeKeywordIndex: indexByKeyword.get(retainedActiveKeyword) || 0,
-        keywordIndex: indexByKeyword.get(retainedActiveKeyword) || 0,
-        activeKeyword: retainedActiveKeyword,
-        currentKeyword: retainedActiveKeyword,
-        keywordResults: checkpoint.keywordResults
-          .filter((entry) => allowedSet.has(String(entry?.keyword || '').trim()))
-          .map((entry) => ({
-            ...entry,
-            round: 1,
-            index:
-              indexByKeyword.get(String(entry?.keyword || '').trim()) || 0,
-          })),
-        completedKeywords: checkpoint.completedKeywords.filter((keyword) =>
-          allowedSet.has(keyword),
-        ),
-        failedKeywords: checkpoint.failedKeywords.filter((keyword) =>
-          allowedSet.has(keyword),
-        ),
-        skippedKeywords: checkpoint.skippedKeywords.filter((keyword) =>
-          allowedSet.has(keyword),
-        ),
-        attempts: Object.fromEntries(
-          Object.entries(checkpoint.attempts).filter(([keyword]) =>
-            allowedSet.has(keyword),
-          ),
-        ),
-        updatedAt: new Date().toISOString(),
-      };
-      planSnapshot = normalizeUnattendedKeywordPlan({
-        ...planSnapshot,
-        keywords: planKeywords,
-        autoLoop: false,
-        maxRounds: 1,
-        roundGapMin: 0,
-      });
-    }
+    const recoveryPlan = buildUnattendedManualRecoveryPlan(current, normalizedMode, allowedKeywords);
+    if (recoveryPlan.accepted === false) return recoveryPlan;
+    const {checkpoint, planSnapshot, scopedKeywords} = recoveryPlan;
     const labels = {
       remaining: '继续采集剩余关键词',
       failed: '仅重试失败关键词',
@@ -10704,7 +10836,7 @@ async function handleUnattendedKeywordAlarm() {
     const now = new Date();
     const todayKey = formatLocalDateKey(now);
     if (!shouldRunPlanOnDate(now, plan)) {
-      await saveUnattendedKeywordPlan(plan, { recomputeNext: true });
+      await saveUnattendedKeywordPlan(plan, { recomputeNext: true }, LOCAL_PLAN_SCHEDULE_WRITE);
       return;
     }
 
@@ -10726,6 +10858,7 @@ async function handleUnattendedKeywordAlarm() {
             nextRunAt: retryAt,
           },
           {recomputeNext: false},
+          LOCAL_PLAN_SCHEDULE_WRITE,
         );
       }
       return;
@@ -10751,6 +10884,7 @@ async function handleUnattendedKeywordAlarm() {
             nextRunAt: '',
           },
           { recomputeNext: true, from: buildScheduleReferenceAfterDate(now) },
+          LOCAL_PLAN_SCHEDULE_WRITE,
         );
         return;
       } else {
@@ -10765,6 +10899,7 @@ async function handleUnattendedKeywordAlarm() {
             nextRunAt: retryAt.toISOString(),
           },
           {recomputeNext: false, preserveRunState: false},
+          LOCAL_PLAN_SCHEDULE_WRITE,
         );
         return;
       }
@@ -10781,6 +10916,7 @@ async function handleUnattendedKeywordAlarm() {
           nextRunAt: '',
         },
         { recomputeNext: true, from: buildScheduleReferenceAfterDate(now) },
+        LOCAL_PLAN_SCHEDULE_WRITE,
       );
     } catch (error) {
       await saveUnattendedKeywordPlan(
@@ -10792,6 +10928,7 @@ async function handleUnattendedKeywordAlarm() {
           nextRunAt: '',
         },
         { recomputeNext: true, from: buildScheduleReferenceAfterDate(now) },
+        LOCAL_PLAN_SCHEDULE_WRITE,
       );
       throw error;
     }
@@ -10825,6 +10962,7 @@ async function reconcileUnattendedKeywordPlanSchedule({ launchDue = false } = {}
           ).toISOString(),
         },
         {recomputeNext: false},
+        LOCAL_PLAN_SCHEDULE_WRITE,
       );
     }
     await syncUnattendedKeywordAlarm(plan);
@@ -10838,6 +10976,7 @@ async function reconcileUnattendedKeywordPlanSchedule({ launchDue = false } = {}
           nextRunAt: '',
         },
         { recomputeNext: false },
+        LOCAL_PLAN_SCHEDULE_WRITE,
       );
     }
     await syncUnattendedKeywordAlarm(plan);
@@ -10845,7 +10984,7 @@ async function reconcileUnattendedKeywordPlanSchedule({ launchDue = false } = {}
   }
 
   if (!plan.nextRunAt) {
-    return await saveUnattendedKeywordPlan(plan, { recomputeNext: true });
+    return await saveUnattendedKeywordPlan(plan, { recomputeNext: true }, LOCAL_PLAN_SCHEDULE_WRITE);
   }
 
   const nextRunAt = new Date(plan.nextRunAt).getTime();
@@ -10856,6 +10995,7 @@ async function reconcileUnattendedKeywordPlanSchedule({ launchDue = false } = {}
         nextRunAt: '',
       },
       { recomputeNext: true },
+      LOCAL_PLAN_SCHEDULE_WRITE,
     );
   }
 
@@ -10870,6 +11010,7 @@ async function reconcileUnattendedKeywordPlanSchedule({ launchDue = false } = {}
         nextRunAt: '',
       },
       { recomputeNext: true },
+      LOCAL_PLAN_SCHEDULE_WRITE,
     );
   }
 
@@ -12131,7 +12272,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.storage.onChanged?.addListener?.((changes, areaName) => {
   if (areaName !== 'local') return;
-  if ([STORAGE_KEYS.auth, STORAGE_KEYS.unattendedKeywordRunRequest, STORAGE_KEYS.taskLedger,
+  if ([STORAGE_KEYS.auth, 'onstarvoice.localCaptureOrigin.v1', STORAGE_KEYS.unattendedKeywordRunRequest, STORAGE_KEYS.taskLedger,
     STORAGE_KEYS.captureExecutionLock].some(key => changes[key])) {
     void strictCaptureControl?.reconcileWitness().catch(() => {});
   }
@@ -12239,11 +12380,19 @@ chrome.runtime.onConnect.addListener(handleTerminalMetadataConnection);
 
 chrome.runtime.onConnect.addListener(port => {
   if (port?.name === globalThis.OnStarvoiceStrictCaptureControl.PORT) getStrictCaptureControl().attachPort(port);
+  if (globalThis.OnStarvoiceLocalRecovery && [globalThis.OnStarvoiceLocalRecovery.CLIENT_PORT,
+    globalThis.OnStarvoiceLocalRecovery.RUNNER_PORT].includes(port?.name)) getLocalRecoveryControl().attachPort(port);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const action = message?.action;
   const type = message?.type;
+
+  if (type === 'onstarvoice:local-control-save-plan' || (typeof type === 'string' && type.startsWith('onstarvoice:local-recovery-'))) {
+    Promise.resolve().then(() => getLocalRecoveryControl().handle(message, sender))
+      .then(sendResponse, () => sendResponse({ok: false, accepted: false, reason: 'local_control_unavailable'}));
+    return true;
+  }
 
   if (typeof type === 'string' && (type.startsWith('onstarvoice:strict-') ||
       ['onstarvoice:prepare-active-capture-stop', 'onstarvoice:execute-active-capture-stop',
