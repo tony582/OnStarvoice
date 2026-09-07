@@ -1,0 +1,38 @@
+{
+  "baseline": "d4c716f41afceecbe97031ca2db490f82bb7d6bf",
+  "purpose": "Exact non-executable inverse delta for the local dormant-runner private producer scope and single-use claim. Restore the exact d4c716f function before applying the unchanged active-stop delta and original L3-A/L3-B hashes.",
+  "entries": [
+    {
+      "name": "maybeClaimAndRunUnattendedKeywordPlan",
+      "owner": "sidebar/task-controller/unattended-run.js",
+      "sha256": "525e5fd1424c24e83462df44fbd3385ec9aaf5e9d91c3c21cdf605fefdc0c017",
+      "baselineSha256": "abeb96208362153be80d702985ac204ee307848413bbaffcc2933a74304ad5fc",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "    const isLocalRecoveryRunner = controllerPorts.localRecoveryRunnerGate?.isRecoveryRunner === true;",
+            "    if (isLocalRecoveryRunner && !controllerPorts.strictCaptureClient) {",
+            "      return controllerOperations.runLocalRecoveryClaimedProducer(scope =>",
+            "        scope.operations.maybeClaimAndRunUnattendedKeywordPlan({allowPending}));",
+            "    }"
+          ],
+          "insert": []
+        },
+        {
+          "at": 25,
+          "remove": [
+            "      const response = isLocalRecoveryRunner",
+            "        ? controllerOperations.takeLocalRecoveryRunnerClaim({",
+            "          requestId, attemptId: requestAttemptId, holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,",
+            "        })",
+            "        : await chrome.runtime.sendMessage({"
+          ],
+          "insert": [
+            "      const response = await chrome.runtime.sendMessage({"
+          ]
+        }
+      ]
+    }
+  ]
+}

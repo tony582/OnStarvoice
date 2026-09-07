@@ -13,6 +13,7 @@ import {createLegacyCaptureProgressView} from '../../sidebar/legacy-view/capture
 import {createLegacyProgressVisibilityView} from '../../sidebar/legacy-view/progress-visibility.js';
 import {createLegacyTaskCenterActions} from '../../sidebar/legacy-application/task-center-actions.js';
 import {createLegacyTaskCenterActionView} from '../../sidebar/legacy-view/task-center-actions.js';
+import {createLocalRecoveryRunnerGate} from '../../sidebar/recovery-runner-gate.js';
 import {readSidebarFunction, readSidebarFunctionOwner} from '../helpers/sidebar-controller-source.mjs';
 import * as constants from '../../utils/constants.js';
 import {DEFAULT_CAPTURE_SETTINGS} from '../../utils/capture-settings.js';
@@ -244,6 +245,10 @@ test('controller-owned keyword state stays live and cancellation uses the latest
 // await so the test cannot start the original background/collection workflow.
 function hostHarness(source = hostSource, readyState = 'loading') {
   const events = []; const listeners = new Map(); const pending = deferred();
+  const location = {href: 'chrome-extension://synthetic/sidebar.html', search: ''};
+  // Use the real ordinary-page gate, without a dormant-runner URL or claim.
+  // It must preserve the existing startup/hook trace without opening a port.
+  const localRecoveryRunnerGate = createLocalRecoveryRunnerGate({location});
   const imports = {};
   for (const match of source.matchAll(/^import\s*\{([^}]+)\}\s*from\s*['"][^'"]+['"];?/gmu)) {
     for (const binding of match[1].split(',').map(v => v.trim()).filter(Boolean)) {
@@ -255,12 +260,13 @@ function hostHarness(source = hostSource, readyState = 'loading') {
     AUTH_CODE_VIEW_MODE: {ENCRYPTED: 'encrypted'}, createSidebarTaskController,
     createLegacyKeywordView, createLegacyCaptureInputsView, createLegacyKeywordInputsView, createLegacyCaptureProgressView, createLegacyProgressVisibilityView,
     createLegacyTaskCenterActions, createLegacyTaskCenterActionView,
+    getLocalRecoveryRunnerGate: () => localRecoveryRunnerGate,
     HTMLElement: class HTMLElement {}, navigator: {},
     console: silence, URL, URLSearchParams, TextEncoder,
     crypto: {randomUUID: () => 'synthetic-holder'},
     document: {readyState, getElementById: () => null,
       addEventListener: (name, callback) => {events.push(['document-listener', name]); listeners.set(name, callback);}},
-    window: {location: {href: 'chrome-extension://synthetic/sidebar.html', search: ''},
+    window: {location,
       addEventListener: (name, callback) => {events.push(['window-listener', name]); listeners.set(name, callback);}},
     chrome: {runtime: {id: 'synthetic'}, storage: {local: {get: key => {events.push(['storage-read', key]); return pending.promise;}}}},
     confirm: () => {throw Error('unexpected dialog');},

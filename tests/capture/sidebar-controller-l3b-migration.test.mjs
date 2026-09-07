@@ -32,6 +32,14 @@ assert.equal(createHash('sha256').update(activeStopDeltaSource).digest('hex'),
 assert.equal(activeStopDelta.entries.length, 12);
 const activeStopChanges = new Map(activeStopDelta.entries.map(entry => [entry.name, entry]));
 assert.equal(activeStopChanges.size, 12);
+const localRecoveryDeltaSource = readFileSync(new URL('tests/fixtures/sidebar-controller-local-recovery-delta.json', root), 'utf8');
+const localRecoveryDelta = JSON.parse(localRecoveryDeltaSource);
+assert.equal(localRecoveryDelta.baseline, 'd4c716f41afceecbe97031ca2db490f82bb7d6bf');
+assert.equal(createHash('sha256').update(localRecoveryDeltaSource).digest('hex'),
+  'b5972987b03692808648b89de54c6b38d58f1aeeeceb0e4ec2dcc62d6ba6c757');
+assert.equal(localRecoveryDelta.entries.length, 1);
+const localRecoveryChanges = new Map(localRecoveryDelta.entries.map(entry => [entry.name, entry]));
+assert.deepEqual([...localRecoveryChanges.keys()], ['maybeClaimAndRunUnattendedKeywordPlan']);
 function rawSidebarFunction(name) {
   const owner = readSidebarFunctionOwner(name);
   const node = findSidebarFunctionAst(runtimeAsts.get(owner.path), name);
@@ -52,6 +60,29 @@ function withoutVerifiedActiveStopDelta(name, source) {
   }
   return lines.join('\n');
 }
+function withoutVerifiedLocalRecoveryDelta(name, source) {
+  const change = localRecoveryChanges.get(name);
+  if (!change) return source;
+  assert.equal(readSidebarFunctionOwner(name).path, change.owner, `${name}: local recovery delta owner`);
+  assert.equal(createHash('sha256').update(source).digest('hex'), change.sha256,
+    `${name}: exact local recovery body before inverse verification`);
+  const lines = source.split('\n');
+  for (const patch of [...change.reverse].reverse()) {
+    assert.equal(Number.isSafeInteger(patch.at) && patch.at >= 0, true);
+    assert.deepEqual(lines.slice(patch.at, patch.at + patch.remove.length), patch.remove,
+      `${name}: exact local recovery delta at ${patch.at}`);
+    lines.splice(patch.at, patch.remove.length, ...patch.insert);
+  }
+  const previous = lines.join('\n');
+  assert.equal(createHash('sha256').update(previous).digest('hex'), change.baselineSha256,
+    `${name}: exact d4c716f parent body after inverse verification`);
+  return previous;
+}
+function withoutVerifiedSidebarDeltas(name, source) {
+  // Keep both historical boundaries explicit. Neither runtime readers nor the
+  // AST normalizer are taught to ignore this new branch or arbitrary calls.
+  return withoutVerifiedActiveStopDelta(name, withoutVerifiedLocalRecoveryDelta(name, source));
+}
 const privateNames = ['setRecoveryCopy', 'isRecoveryActionAvailable', 'handoffRecoveryFocus'];
 const delegateNames = ['buildCaptureProgressText', 'normalizeProgressCount'];
 const names = entries => entries.map(entry => entry.name).sort();
@@ -61,6 +92,31 @@ const canonical = value => {
   if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
   return value;
 };
+
+test('local recovery inverse permits only two exact claim/scope edits and rejects any other current-body change', () => {
+  const [change] = localRecoveryDelta.entries;
+  assert.equal(change.owner, 'sidebar/task-controller/unattended-run.js');
+  assert.deepEqual(change.reverse.map(patch => [patch.at, patch.remove.length, patch.insert.length]),
+    [[1, 5, 0], [25, 5, 1]]);
+  const current = rawSidebarFunction(change.name);
+  const parent = withoutVerifiedLocalRecoveryDelta(change.name, current);
+  assert.equal(current.split('\n').length, 133);
+  assert.equal(parent.split('\n').length, 124);
+  assert.notEqual(current, parent);
+  assert.doesNotMatch(parent, /isLocalRecoveryRunner|runLocalRecoveryClaimedProducer|takeLocalRecoveryRunnerClaim/u);
+  for (const mutated of [
+    current.replace('isLocalRecoveryRunner &&', '!isLocalRecoveryRunner &&'),
+    current.replace('takeLocalRecoveryRunnerClaim({', 'takeLocalRecoveryRunnerClaim(sideEffect(), {'),
+    current.replace('getTargetedPostRunRequestIdFromUrl()', 'getTargetedPostRunRequestIdFromUrl(sideEffect())'),
+    current + '\n',
+  ]) {
+    assert.notEqual(mutated, current);
+    assert.throws(() => withoutVerifiedLocalRecoveryDelta(change.name, mutated),
+      /exact local recovery body before inverse verification/u);
+  }
+  const untouched = rawSidebarFunction('waitForTabComplete');
+  assert.equal(withoutVerifiedLocalRecoveryDelta('waitForTabComplete', untouched), untouched);
+});
 
 test('L3-B pins 216 actual single owners without rewriting L3-A evidence or reconstructing its monolith', () => {
   assert.equal(manifest.baseline, '2c997709c0a4223784901aeaa461fab46108ba8b');
@@ -106,7 +162,7 @@ test('default CI verifies the exact strict delta then compares 202 normalized AS
   let equivalents = 0;
   for (const entry of manifest.entries) {
     assert.match(entry.baselineNormalizedAstSha256, /^[a-f0-9]{64}$/u, entry.name);
-    const verifiedSource = withoutVerifiedActiveStopDelta(entry.name, rawSidebarFunction(entry.name));
+    const verifiedSource = withoutVerifiedSidebarDeltas(entry.name, rawSidebarFunction(entry.name));
     const actual = hashSidebarFunctionAst(findSidebarFunctionAst(parseSidebarAst(verifiedSource), entry.name));
     if (semantic.includes(entry.name)) {
       assert.notEqual(actual, entry.baselineNormalizedAstSha256, `${entry.name}: semantic change must not claim AST equivalence`);
@@ -135,7 +191,7 @@ test('all 165 L3-A operations retain historical hashes after exact strict-delta 
   assert.equal(Object.keys(manifest.l3aTransitions).length, 24);
   const changed = [];
   for (const entry of moved) {
-    const actualHash = hash(withoutVerifiedActiveStopDelta(entry.name, rawSidebarFunction(entry.name)));
+    const actualHash = hash(withoutVerifiedSidebarDeltas(entry.name, rawSidebarFunction(entry.name)));
     const transition = manifest.l3aTransitions[entry.name];
     if (!transition || transition === 'unchanged-body-now-view-private') {
       assert.equal(actualHash, entry.migratedSha256, `${entry.name}: no undeclared body change`);
@@ -200,6 +256,19 @@ test('real module assembly exposes no old host binding, controller state bag or 
 
 // Optional exact-object verification is read-only and never fetches a missing
 // commit. Default CI checks above need no Git history (including shallow CI).
+if (process.env.ONSTARVOICE_LOCAL_RECOVERY_BASELINE_REF) {
+  assert.equal(process.env.ONSTARVOICE_LOCAL_RECOVERY_BASELINE_REF, localRecoveryDelta.baseline);
+  test('local recovery inverse restores the exact authorized d4c716f Git function', () => {
+    for (const change of localRecoveryDelta.entries) {
+      const source = execFileSync('git', ['show', `${localRecoveryDelta.baseline}:${change.owner}`],
+        {cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024});
+      const declaration = findSidebarFunctionAst(parseSidebarAst(source), change.name);
+      const expected = source.slice(...declaration.range);
+      assert.equal(createHash('sha256').update(expected).digest('hex'), change.baselineSha256);
+      assert.equal(withoutVerifiedLocalRecoveryDelta(change.name, rawSidebarFunction(change.name)), expected);
+    }
+  });
+}
 if (process.env.ONSTARVOICE_L3B_BASELINE_REF) {
   assert.equal(process.env.ONSTARVOICE_L3B_BASELINE_REF, manifest.baseline);
   const baseline = execFileSync('git', ['show', `${manifest.baseline}:sidebar/sidebar-logic.js`], {cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024});

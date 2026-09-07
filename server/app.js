@@ -34,6 +34,7 @@ import relevancePrefilterRouter from './routes/relevance-prefilter.js';
 import captureCloudRouter from './routes/capture-cloud.js';
 import captureControlAuthorityRouter from './routes/capture-control-authority.js';
 import captureStopAuthorityRouter from './routes/capture-stop-authority.js';
+import captureLocalControlAuthorityRouter from './routes/capture-local-control-authority.js';
 import captureOrchestrationsRouter from './routes/capture-orchestrations.js';
 import negativePatrolRouter from './routes/negative-patrol.js';
 import officialCommentPatrolRouter from './routes/official-comment-patrol.js';
@@ -175,6 +176,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.use('/api/relevance/prefilter', relevancePrefilterRouter);
   app.use('/api/capture-cloud', captureControlAuthorityRouter);
   app.use('/api/capture-cloud', captureStopAuthorityRouter);
+  app.use('/api/capture-cloud', captureLocalControlAuthorityRouter);
   app.use('/api/capture-cloud', captureCloudRouter);
   app.use('/api/capture-cloud', captureOrchestrationsRouter);
   app.use('/api/capture-cloud', negativePatrolRouter);

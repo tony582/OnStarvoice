@@ -1,4 +1,5 @@
 import {createPageOperationClient} from '../../utils/capture/page-operation-client.js';
+import {consumeLocalRecoveryOwnerHandoff} from '../recovery-runner-gate.js';
 import {createCaptureSyncScope} from '../../utils/capture-sync.js';
 import {createTaskLedgerAssistController} from './task-ledger-assist.js';
 import {createBatchKeywordController} from './batch-keyword.js';
@@ -165,6 +166,10 @@ export function createOwnerController({controllerState, controllerPorts, control
   async function runStrictCaptureProducer(request, producer, kind = 'capture-producer', continuation = null) {
     if (typeof producer !== 'function') throw strictError('strict_producer_required');
     const owner = await bindStrictCaptureOwner(request, continuation);
+    return runBoundCaptureProducer(owner, producer, kind);
+  }
+
+  async function runBoundCaptureProducer(owner, producer, kind) {
     try {
       return await owner.client.runProducer(kind, () => producer(owner.scope));
     } finally {
@@ -183,6 +188,52 @@ export function createOwnerController({controllerState, controllerPorts, control
         }
       }
     }
+  }
+
+  function adoptLocalRecoveryRunnerOwner(token) {
+    if (strictOwner) throw strictError('strict_owner_already_bound');
+    const handoff = consumeLocalRecoveryOwnerHandoff(token);
+    const owner = {port: handoff.port, client: null, scope: null, disconnected: false,
+      settling: null, localRecovery: handoff, localClaimConsumed: false, producerStarted: false};
+    strictOwner = owner;
+    owner.client = createPageOperationClient({
+      strictControl: handoff.claim.strictControl, chromeApi: chrome,
+      relayType: controllerPorts.MESSAGE_TYPE?.RELAY_TO_CONTENT,
+    });
+    owner.scope = createStrictProducerScope(owner.client);
+    handoff.attach({
+      onDisconnect() { owner.disconnected = true; owner.client.markDisconnected(); },
+      onStop(message) {
+        if (!owner.client.stop(message.strictControl, message.reason)) return;
+        void settleStrictCaptureOwner(owner).catch(error => {
+          console.warn('[Sidebar] Recovered owner drain remains unconfirmed:', error);
+        });
+      },
+    });
+  }
+
+  function takeLocalRecoveryRunnerClaim({requestId, attemptId, holderId}) {
+    const owner = strictOwner;
+    if (!owner?.localRecovery || owner.disconnected || owner.localClaimConsumed) {
+      throw strictError('local_recovery_claim_unavailable');
+    }
+    owner.localRecovery.assertActive();
+    const claim = owner.localRecovery.claim;
+    if (claim.data.id !== requestId || claim.data.attemptId !== attemptId || claim.lock.holderId !== holderId) {
+      throw strictError('local_recovery_claim_identity_mismatch');
+    }
+    owner.localClaimConsumed = true;
+    return claim;
+  }
+
+  async function runLocalRecoveryClaimedProducer(producer) {
+    const owner = strictOwner;
+    if (!owner?.localRecovery || owner.disconnected || owner.producerStarted || typeof producer !== 'function') {
+      throw strictError('local_recovery_producer_unavailable');
+    }
+    owner.localRecovery.assertActive();
+    owner.producerStarted = true;
+    return runBoundCaptureProducer(owner, producer, 'local-recovery-unattended-producer');
   }
 
   function postCaptureTaskOwnerMessage(message) {
@@ -317,6 +368,9 @@ export function createOwnerController({controllerState, controllerPorts, control
   }
 
   return Object.freeze({
+    adoptLocalRecoveryRunnerOwner,
+    takeLocalRecoveryRunnerClaim,
+    runLocalRecoveryClaimedProducer,
     bindStrictCaptureOwner,
     runStrictCaptureProducer,
     getStrictCaptureOwnerControl: () => strictOwner?.client?.strictControl || null,
