@@ -38,7 +38,7 @@ test("obsolete comment-count recapture setting stays fully removed", () => {
 
 test("skip-captured precheck has no comment-growth exception", () => {
   const start = captureSync.indexOf(
-    "export async function batchCaptureDetailsForRecords",
+    "async function batchCaptureDetailsForRecords",
   );
   const precheckStart = captureSync.indexOf("let skipRecordIdSet", start);
   const end = captureSync.indexOf("const bloggerMetricsCache", precheckStart);

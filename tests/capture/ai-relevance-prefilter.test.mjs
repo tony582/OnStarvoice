@@ -473,7 +473,7 @@ test('detail second stage uses one minimal request and can terminate expensive c
 
 test('detail batch invokes AI before creating a detail runner and only for keyword records', () => {
   const start = captureSyncSource.indexOf(
-    'export async function batchCaptureDetailsForRecords',
+    'async function batchCaptureDetailsForRecords',
   );
   const end = captureSyncSource.indexOf(
     'const shouldStopDetailBatch',

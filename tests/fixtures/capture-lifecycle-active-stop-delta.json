@@ -1,0 +1,1062 @@
+{
+  "baseline": "3c19c5ea14c9ac1f68a21da8b8caf30353b459d1",
+  "purpose": "Exact non-executable inverse delta for authorized active-stop guards. Original historical fingerprints are unchanged.",
+  "entries": [
+    {
+      "name": "cleanupStaleCaptureRuntimeSession",
+      "sha256": "f2dcea0643dc80d1a89e1c49ccea4ff943573adf11a88da4355aca0d6eaee5e2",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 131,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 141,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 145,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 159,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 163,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 173,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "clearPersistedCaptureRuntimeSnapshot",
+      "sha256": "37b3bd5e163b028db8894bda069cdfd22086d5292cc8f47a11c745a0585e12c1",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "publishRestoredCaptureRuntimeSnapshot",
+      "sha256": "de6b414198d076361db1bdae4c4c3cd0303c38c3914a904b3137496b4aa5699d",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 10,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "restorePersistedCaptureRuntimeSession",
+      "sha256": "80d4b7c54888025aa4a41511f4c951e9ea7d127d9cec0f079f22159c71435fb4",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 21,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 35,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 69,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 98,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 104,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 123,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 160,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 176,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 203,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 254,
+          "remove": [
+            "if (await strictRetained()) throw createCaptureTaskError(",
+            "'strict_capture_control_retained', '严格停止控制记录仍保留，未恢复旧运行资源');"
+          ],
+          "insert": []
+        },
+        {
+          "at": 266,
+          "remove": [
+            "if (await strictRetained()) throw createCaptureTaskError(",
+            "'strict_capture_control_retained', '严格停止控制记录仍保留，未恢复旧运行资源');"
+          ],
+          "insert": []
+        },
+        {
+          "at": 292,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 312,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 340,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 371,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 384,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 404,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "releaseConfirmedStaleCaptureTaskGroupsForBegin",
+      "sha256": "235294e807fedb4c96ce53628a0154f6eab68acafc7bbfaedc46f951a0532e8b",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 29,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 47,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 50,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "beginCaptureTask",
+      "sha256": "8d24e63534b296804cda6fed25984a03863ca0afd66b5f79a7840af41daaae8b",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (ports.strictLifecycleGuard) {",
+            "const strict = await ports.strictLifecycleGuard('begin', message, sender);",
+            "if (strict) return strict;",
+            "}"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "beginCaptureTaskNow",
+      "sha256": "21909edacb3f3bf78d737861139bdf44012c64a120356638aebdb21db029df74",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (ports.strictLifecycleGuard) {",
+            "const strict = await ports.strictLifecycleGuard('begin', message, sender);",
+            "if (strict) return strict;",
+            "}"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "updateCaptureTask",
+      "sha256": "f9fe5f7d3705c9718da5ffd2626ec23b597db755b33e184de13b6b9d24b8acc3",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 21,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 23,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "registerCaptureTaskTab",
+      "sha256": "12cc21beb4594b1735eec5781d76d8f9aec97f3d898ff397fd42ad689c980027",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 15,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 48,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 57,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "setCaptureTaskMinimized",
+      "sha256": "4f891cda422fa9086483f6c3d8cf9645551dcde5e7c676639d0849f69da0d065",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "closeCaptureTaskWorkerTabs",
+      "sha256": "b54e6c1abaf025d511197b8514541aaeb2a21a7e501c91aa1783b2c0509b90a4",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 5,
+          "remove": [
+            "removeTab: async (tabId) => { await assertLegacyCleanup(); return chrome.tabs.remove(tabId); },"
+          ],
+          "insert": [
+            "removeTab: (tabId) => chrome.tabs.remove(tabId),"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "closeTrackedCaptureTaskWorkerTabs",
+      "sha256": "d68bd742f6f4b6178633a0d0e1eab11c72801a14184e62151ca9048b9e2b3cf9",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 4,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 8,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "writeCaptureTaskCancellationFailSoft",
+      "sha256": "2ea7179a41d4ede21fef93494bf903c1c067b5dced7ad93d14205e55c1ebd447",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 7,
+          "remove": [
+            "writeState: async (...args) => { await assertLegacyCleanup(); return writeRuntimeState(...args); },"
+          ],
+          "insert": [
+            "writeState: writeRuntimeState,"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clearCaptureTaskTraceOverlayFailSoft",
+      "sha256": "d5431f9095b63181add843ee517ad42cbcc86aedbcf5e42ee2ab44f7276b7feb",
+      "reverse": [
+        {
+          "at": 4,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "publishCaptureTaskCancellation",
+      "sha256": "aa05f3e922319fb28539cd2bc15f676ca9b4ff6a5528b810392f3eb9c65fe4ea",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "relayCaptureTaskCancellation",
+      "sha256": "7fee8ffc11fa12a5d86147f6aaf98e6adea4cd54a9689e6bc1783623edc3885c",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "releaseCaptureTaskResources",
+      "sha256": "76f7a26a432fed4b2efa334347f919a7c9553fe383a5e8f7a6cd556176dd41f1",
+      "reverse": [
+        {
+          "at": 47,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 92,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 100,
+          "remove": [
+            "stopDebug: async ({taskId: activeTaskId, reason: stopReason}) => {",
+            "await assertLegacyCleanup();",
+            "return state.captureDebugSessionManager.stopByTaskId(activeTaskId, stopReason);",
+            "},",
+            "endGroup: async ({taskId: activeTaskId, reason: stopReason}) => {",
+            "await assertLegacyCleanup();",
+            "return state.captureTaskTabGroupManager.end({"
+          ],
+          "insert": [
+            "stopDebug: ({taskId: activeTaskId, reason: stopReason}) =>",
+            "state.captureDebugSessionManager.stopByTaskId(activeTaskId, stopReason),",
+            "endGroup: ({taskId: activeTaskId, reason: stopReason}) =>",
+            "state.captureTaskTabGroupManager.end({"
+          ]
+        },
+        {
+          "at": 109,
+          "remove": [
+            "});",
+            "},"
+          ],
+          "insert": [
+            "}),"
+          ]
+        },
+        {
+          "at": 114,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 121,
+          "remove": [
+            "} catch (error) {",
+            "if (await strictRetained()) return strictPending();",
+            "throw error;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 125,
+          "remove": [
+            "if (!await strictRetained()) state.captureTaskCleanupInProgress.delete(taskId);"
+          ],
+          "insert": [
+            "state.captureTaskCleanupInProgress.delete(taskId);"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "releaseCaptureTaskResourcesWithRetry",
+      "sha256": "b74e9bd05caf0d27ff63259433dc61f87c70f610e17c7f1cdf0813f5fd9e6387",
+      "reverse": [
+        {
+          "at": 4,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 11,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "releaseStableUnattendedCaptureTaskResourcesOnly",
+      "sha256": "551fa1762e1027eb418b63d67b5a5cb026eda76b2d7fc01425ca86717f6d05ab",
+      "reverse": [
+        {
+          "at": 12,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 18,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "clearUnattendedCaptureTaskLockBinding",
+      "sha256": "9abac30caae56651de8de2e4df34131c26cecdafa5be9178c0f160aee0d9e06c",
+      "reverse": [
+        {
+          "at": 9,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 14,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 38,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "releaseUnattendedCaptureTaskResourcesForRecovery",
+      "sha256": "fa2b425b2b4fbd1004d428b0470d4f16896b73edcf943dea70333431363d2cc6",
+      "reverse": [
+        {
+          "at": 16,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 32,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 37,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 44,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "recoverUnattendedCaptureTaskInterruption",
+      "sha256": "7839739abfa8dc1c971bd724eedaa965272a9a97f5c0dba9dfa0c80fee7b58a1",
+      "reverse": [
+        {
+          "at": 4,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 6,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "reclaimSupersededUnattendedCaptureTaskForBegin",
+      "sha256": "a5dec8c225fe1b798c1a700cac3949e6f74ebdc8ff7fb42fd0bf9df7960989fd",
+      "reverse": [
+        {
+          "at": 6,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 13,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 39,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 103,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 115,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "endCaptureTask",
+      "sha256": "fa65248491813ec64285854870993e7587627632ec0b66d5a218278f8bc044e4",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "performEndCaptureTask",
+      "sha256": "782f1adc2ded9e9e06c4540e64dadb991bbf88c7c1efc92a143b82df5f544fe3",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 22,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 41,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 44,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 46,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "handleUnexpectedCaptureDebugDetach",
+      "sha256": "f6c4a8198c1f56ecde4c4ef8a8f4bbeb942e49a7bbd07d47bc677466f8d1297b",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "handleAbandonedCaptureTask",
+      "sha256": "7244f4f5b78c7bb9cfff44c1f2c90a57f17f1234b918666fb9b1eb5f6b58f397",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 7,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 13,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 26,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 43,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 48,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 50,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "replaceCaptureExecutionLockTabId",
+      "sha256": "7eaff1fa8f75b160974df5185fc99368abf463a5cf1b5791b1c280d099d55768",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 3,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 14,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "replaceUnattendedRunnerTabId",
+      "sha256": "6b51323b9a742e37ae0ee1ac603aad60faa9d4f827bca7a9b0a71c72ce7dda4b",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 3,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 18,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "handleCaptureRuntimeTabReplaced",
+      "sha256": "2239e5eef3a273a04e38209587a8454a1aec92d318c85e9ca9023ec253a84a1d",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 43,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 62,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 84,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 92,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 100,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 105,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 113,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 151,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 237,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 263,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 297,
+          "remove": [
+            ".catch(async () => {",
+            "if (await strictRetained()) return false;",
+            "return chrome.tabs.ungroup([normalizedAddedTabId]).catch(() => null);",
+            "});"
+          ],
+          "insert": [
+            ".catch(() =>",
+            "chrome.tabs.ungroup([normalizedAddedTabId]).catch(() => null),",
+            ");"
+          ]
+        },
+        {
+          "at": 306,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 339,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 367,
+          "remove": [
+            "if (await strictRetained()) return false;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "handleCaptureRuntimeTabRemoved",
+      "sha256": "5f45a08d33f72efeff166f9e6978c9ef743051f9bf648aa89c7972e3d515bf78",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 7,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 13,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 27,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 32,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 34,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        },
+        {
+          "at": 50,
+          "remove": [
+            "if (await strictRetained()) return strictPending();"
+          ],
+          "insert": []
+        }
+      ]
+    }
+  ]
+}

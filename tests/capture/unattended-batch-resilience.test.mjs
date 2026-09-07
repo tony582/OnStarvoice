@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
+import {readCaptureConstant} from '../helpers/capture-delivery-source.mjs';
 import test from "node:test";
 import vm from "node:vm";
 import {DOUYIN_DOM_PROFILE} from "../../utils/platform/dom-profiles/douyin.js";
@@ -21,8 +22,8 @@ const douyinKeywordSearchSource = await readFile(
 );
 
 function readBatchFunctionSource() {
-  const startMarker = "export async function batchCaptureByKeywords({";
-  const endMarker = "export async function lightSampleByKeywords({";
+  const startMarker = "async function batchCaptureByKeywords({";
+  const endMarker = "async function lightSampleByKeywords({";
   const start = captureSyncSource.indexOf(startMarker);
   const end = captureSyncSource.indexOf(endMarker, start + startMarker.length);
   assert.notEqual(start, -1, "batch keyword function start marker missing");
@@ -1673,7 +1674,7 @@ function createBatchHarness({
   };
   const sandbox = vm.createContext(context);
   vm.runInContext(
-    `${readBatchFunctionSource()}\nglobalThis.__runBatch = batchCaptureByKeywords;`,
+    `const pageOperations = null;\n${readCaptureConstant('scopedShouldStop')}\n${readBatchFunctionSource()}\nglobalThis.__runBatch = batchCaptureByKeywords;`,
     sandbox,
   );
 

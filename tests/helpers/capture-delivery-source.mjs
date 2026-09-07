@@ -17,9 +17,21 @@ export function readCaptureFunction(name) {
   const owner = owners.get(name);
   const path = owner ? `utils/capture/delivery/${owner}.js` : 'utils/capture-sync.js';
   const source = readFileSync(new URL(path, root), 'utf8');
-  const matches = [...source.matchAll(new RegExp(
+  let matches = [...source.matchAll(new RegExp(
     `^( *)(?:export )?(?:async )?function ${name}\\s*\\(`, 'gm',
   ))];
+  if (!owner && source.includes('export function createCaptureSyncScope(')) {
+    const facadeStart = source.indexOf('\nconst legacyChromeApi =');
+    assert.ok(facadeStart > 0, 'capture scope must have an explicit legacy facade');
+    const facades = matches.filter((match) => match.index > facadeStart);
+    assert.ok(facades.length <= 1, `ambiguous legacy facade for ${name}`);
+    for (const facade of facades) {
+      const body = source.slice(facade.index, source.indexOf('\n}', facade.index) + 2);
+      assert.match(body, new RegExp(`^export (?:async )?function ${name}\\(\\.\\.\\.args\\) \\{\\n  return getLegacyCaptureSyncScope\\(\\)\\.${name}\\(\\.\\.\\.args\\);\\n\\}$`),
+        `legacy ${name} must remain only an exact same-name delegation`);
+    }
+    matches = matches.filter((match) => match.index < facadeStart);
+  }
   assert.equal(matches.length, 1, `${path}: expected exactly one real declaration of ${name}`);
   const [{index: start, 1: indent}] = matches;
   const closing = new RegExp(`^${indent}\\}(?=\\r?$)`, 'gm');

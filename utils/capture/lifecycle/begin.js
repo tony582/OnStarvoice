@@ -33,6 +33,10 @@
     const runCaptureTaskLifecycleOperation = (...args) => operations.runCaptureTaskLifecycleOperation(...args);
 
     async function beginCaptureTask(message, sender) {
+      if (ports.strictLifecycleGuard) {
+        const strict = await ports.strictLifecycleGuard('begin', message, sender);
+        if (strict) return strict;
+      }
       return await runCaptureTaskLifecycleOperation(async () => {
         const restoreResult = state.captureRuntimeRestorePromise
           ? await state.captureRuntimeRestorePromise
@@ -69,6 +73,10 @@
     }
 
     async function beginCaptureTaskNow(message, sender) {
+      if (ports.strictLifecycleGuard) {
+        const strict = await ports.strictLifecycleGuard('begin', message, sender);
+        if (strict) return strict;
+      }
       const request = getCaptureTaskRequest(message);
       const taskId = requireCaptureTaskId(request);
       const ownerRequired = request.ownerRequired === true;

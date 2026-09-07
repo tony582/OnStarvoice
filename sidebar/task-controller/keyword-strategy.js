@@ -570,6 +570,11 @@ export function createKeywordStrategyController({controllerState, controllerPort
   ) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMs) {
+      if (controllerPorts.strictCaptureClient?.shouldStop()) {
+        const error = new Error('capture_strict_stopped');
+        error.code = 'capture_strict_stopped';
+        throw error;
+      }
       const tab = await chrome.tabs.get(tabId);
       if (tab?.status === "complete") {
         if (settleMs > 0) {
@@ -613,6 +618,11 @@ export function createKeywordStrategyController({controllerState, controllerPort
     onSampleCaptured = null,
     shouldStop = null,
   }) {
+    if (controllerPorts.strictCaptureClient) {
+      const originalShouldStop = shouldStop;
+      shouldStop = () => controllerPorts.strictCaptureClient.shouldStop() ||
+        Boolean(originalShouldStop?.());
+    }
     if (!sourceTabUrl) {
       throw new Error("未找到当前搜索页链接");
     }
@@ -680,7 +690,8 @@ export function createKeywordStrategyController({controllerState, controllerPort
           completedSampleKeys.add(sampleKey);
         }
         if (typeof onSampleCaptured === "function") {
-          onSampleCaptured([...samples], normalizedSample);
+          const checkpoint = onSampleCaptured([...samples], normalizedSample);
+          if (controllerPorts.strictCaptureClient) await checkpoint;
         }
         await wait(500);
       }
@@ -726,6 +737,11 @@ export function createKeywordStrategyController({controllerState, controllerPort
     candidates = [],
     shouldStop = null,
   }) {
+    if (controllerPorts.strictCaptureClient) {
+      const originalShouldStop = shouldStop;
+      shouldStop = () => controllerPorts.strictCaptureClient.shouldStop() ||
+        Boolean(originalShouldStop?.());
+    }
     const profileTargets = candidates
       .filter((candidate) => candidate.authorProfileUrl)
       .slice(0, BENCHMARK_DISCOVERY_PROFILE_LIMIT);

@@ -1,6 +1,14 @@
 // L1: attempts responsibility. Existing behavior, explicit host ports, one shared lifecycle owner.
 (function register(root) {
   function create({state, ports, operations}) {
+    const strictPending = () => ({ok: false, accepted: false, released: false,
+      reclaimed: false, handled: true, recovery: {recovered: false},
+      resourcesReleased: false, cleanupPending: true,
+      reason: 'strict_capture_control_retained'});
+    const strictRetained = async () => {
+      if (typeof ports.hasStrictCaptureStopControl !== 'function') return false;
+      try { return await ports.hasStrictCaptureStopControl() !== false; } catch { return true; }
+    };
     const {
       STORAGE_KEYS,
       UNATTENDED_RUNNER_QUERY_KEY,
@@ -52,11 +60,13 @@
         }, {attempts: 1});
       }
       // STRICT_RESOURCE_FENCE_END
+      if (await strictRetained()) return strictPending();
       if (!inspection?.unattended || !inspection?.taskId) {
         return {released: false, reason: 'not_unattended_stable_task'};
       }
       const taskId = inspection.taskId;
       const storedLock = await readStoredCaptureExecutionLock();
+      if (await strictRetained()) return strictPending();
       const lockOwnsTask = Boolean(
         storedLock &&
           String(storedLock.owner || '') === 'unattended_keyword_plan' &&
@@ -238,10 +248,12 @@
         expectedHolderTabId = null,
       } = {},
     ) {
+      if (await strictRetained()) return false;
       const normalizedLockId = String(lockId || '').trim();
       const normalizedTaskId = String(taskId || '').trim();
       if (!normalizedLockId || !normalizedTaskId) return false;
       const clearBinding = () => runCaptureExecutionLockOperation(async () => {
+        if (await strictRetained()) return false;
         const stored = await chrome.storage.local.get(
           STORAGE_KEYS.captureExecutionLock,
         );
@@ -265,6 +277,7 @@
         ) {
           return false;
         }
+        if (await strictRetained()) return false;
         await chrome.storage.local.set({
           [STORAGE_KEYS.captureExecutionLock]: {
             ...lock,
@@ -294,6 +307,7 @@
         }, {attempts: 1});
       }
       // STRICT_RESOURCE_FENCE_END
+      if (await strictRetained()) return strictPending();
       // Recovery can clear the persisted lock binding before every asynchronous
       // Debug/group/worker cleanup callback has finished.  The replacement runner
       // still uses the stable request task id, so an empty captureTaskId must not
@@ -309,16 +323,19 @@
           {taskId, reason, debugSnapshot},
           {attempts: 3},
         );
+        if (await strictRetained()) return strictPending();
       } else {
         state.captureTaskOwnerCoordinator?.clearTask(taskId);
       }
       if (!preserveLockBinding) {
+        if (await strictRetained()) return strictPending();
         await clearUnattendedCaptureTaskLockBinding(lock?.id, taskId, {
           expectedHolderId: lock?.holderId,
           expectedHolderDocumentId: lock?.holderDocumentId,
           expectedHolderTabId: lock?.holderTabId,
         });
       }
+      if (await strictRetained()) return strictPending();
 
       // 0.3.43 及更早版本为每次 runner 生成随机 child task。只收口这类
       // 旧记录；新版使用同一 request 的稳定 taskId，恢复后仍是同一项任务。
@@ -336,7 +353,9 @@
       taskId = '',
       reason = 'runtime_interrupted',
     } = {}) {
+      if (await strictRetained()) return strictPending();
       const parent = await readUnattendedParentForCaptureTask(taskId);
+      if (await strictRetained()) return strictPending();
       if (!parent) return {handled: false, reason: 'not_unattended'};
       const recovery = await recoverUnattendedKeywordRunRequest(parent.request, {
         healthy: false,
@@ -421,12 +440,14 @@
       attemptId,
       sender,
     } = {}) {
+      if (await strictRetained()) return strictPending();
       const normalizedTaskId = String(taskId || '').trim();
       const normalizedSourceTabId = resolveCaptureTaskTabId(sourceTabId);
       const [lock, request] = await Promise.all([
         readStoredCaptureExecutionLock(),
         readUnattendedKeywordRunRequest(),
       ]);
+      if (await strictRetained()) return strictPending();
       if (
         !normalizedTaskId ||
         !normalizedSourceTabId ||
@@ -452,6 +473,7 @@
         taskId: normalizedTaskId,
         attemptId,
       });
+      if (await strictRetained()) return strictPending();
       if (attemptFence.unattended && !attemptFence.current) {
         throw createCaptureTaskError(
           'stale_unattended_attempt',
@@ -515,6 +537,7 @@
           requestId: request.id,
           attemptId,
         });
+        if (await strictRetained()) return strictPending();
         await releaseUnattendedCaptureTaskResourcesForRecovery(
           {...cleanupFence.lock, captureTaskId: recoveryTaskId},
           {
@@ -526,6 +549,7 @@
             preserveLockBinding: true,
           },
         );
+        if (await strictRetained()) return strictPending();
       }
       return {
         unattended: true,

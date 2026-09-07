@@ -69,7 +69,7 @@ test("Douyin comment click candidates reject a combined tab wrapper", () => {
 
 test("targeted single-note batches verify the requested Douyin identity before capture", () => {
   const start = captureSyncSource.indexOf(
-    "export async function batchCaptureByUrls({",
+    "async function batchCaptureByUrls({",
   );
   const end = captureSyncSource.indexOf(
     "async function applySearchFiltersInTab",

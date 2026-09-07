@@ -28,6 +28,9 @@ importScripts(
   'utils/control-storage-reserve.js',
   'utils/control/state-fence.js',
   'utils/control/terminal-authority.js',
+  'utils/control/stop-journal.js',
+  'utils/control/active-stop-authority.js',
+  'utils/capture/lifecycle/strict-control.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
   'utils/capture/execution-identity.js',
@@ -1187,6 +1190,79 @@ async function readTerminalMetadataState() {
 async function readTerminalMetadataCredential() {
   const stored = await chrome.storage.local.get(STORAGE_KEYS.auth);
   return stored[STORAGE_KEYS.auth] ?? null;
+}
+
+let strictCaptureControl = null;
+
+async function hasStrictCaptureStopControl() {
+  const key = globalThis.OnStarvoiceStopJournal.KEY;
+  const retained = (await chrome.storage.local.get(key))[key] != null;
+  if (retained) getStrictCaptureControl();
+  return retained;
+}
+
+async function assertLegacyCaptureControlAvailable() {
+  if (await hasStrictCaptureStopControl()) throw Object.assign(
+    new Error('严格采集控制记录仍保留，未执行旧启动或清理'), {code: 'strict_capture_control_retained'});
+}
+
+async function queryActiveStopAuthority(body, {rawAuth, signal}) {
+  const base = new URL(globalThis.__ONSTARVOICE_API_BASE_URL__ || 'https://voice.minilife.online');
+  const local = globalThis.__ONSTARVOICE_BUILD_TARGET__ === 'local' && base.protocol === 'http:' &&
+    ['127.0.0.1', 'localhost'].includes(base.hostname);
+  if ((!local && base.origin !== 'https://voice.minilife.online') || base.username || base.password ||
+      base.pathname !== '/' || base.search || base.hash) throw new Error('stop_authority_denied');
+  const response = await fetch(new URL('/api/capture-cloud/agent/stop-authority', base), {
+    method: 'POST', signal, redirect: 'error', credentials: 'omit', cache: 'no-store',
+    headers: {'Content-Type': 'application/json', Authorization: `Bearer ${rawAuth.captureAgent.token}`},
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error('stop_authority_denied');
+  return response.json();
+}
+
+function getStrictCaptureControl() {
+  if (strictCaptureControl) return strictCaptureControl;
+  const journal = globalThis.OnStarvoiceStopJournal.create({storage: chrome.storage.local,
+    fence: globalThis.OnStarvoiceControlStateFence,
+    runReservationOperation: runCaptureExecutionLockOperation,
+    keys: {auth: STORAGE_KEYS.auth, request: STORAGE_KEYS.unattendedKeywordRunRequest,
+      ledger: STORAGE_KEYS.taskLedger, archive: STORAGE_KEYS.unattendedKeywordRunArchive,
+      lock: STORAGE_KEYS.captureExecutionLock}});
+  strictCaptureControl = globalThis.OnStarvoiceStrictCaptureControl.create({
+    journal, authority: globalThis.OnStarvoiceActiveStopAuthority.create({query: queryActiveStopAuthority}),
+    extensionId: chrome.runtime.id, workerEpoch: crypto.randomUUID(),
+    resolveDocument: async tabId => {
+      // A read-only browser execution result supplies documentId. No new
+      // permission or page self-reported document identity is required.
+      const results = await chrome.scripting.executeScript({target: {tabId, frameIds: [0]}, func: () => null});
+      if (results?.length !== 1 || results[0].frameId !== 0 || !results[0].documentId) return null;
+      return {documentId: results[0].documentId};
+    },
+    sendPage: (tabId, payload, documentId) => chrome.tabs.sendMessage(tabId, payload, {documentId}),
+    createTab: properties => chrome.tabs.create(properties),
+    admitWhileLegacyIdle: operation => captureLifecycle.admitStrictCaptureCohort(operation),
+  });
+  void strictCaptureControl.reconcileWitness().catch(() => {});
+  return strictCaptureControl;
+}
+
+async function strictLifecycleGuard(kind, message, sender) {
+  if (!await hasStrictCaptureStopControl()) return null;
+  const control = message?.strictControl || message?.task?.strictControl;
+  const accepted = control && await getStrictCaptureControl().guardScope(control, sender,
+    {allowStopped: kind === 'end'});
+  if (!accepted) throw Object.assign(new Error('严格采集代次仍需确认停止，未执行旧资源操作'),
+    {code: 'strict_capture_control_retained'});
+  const request = message?.task || message || {};
+  // Strict cohorts use existing ordinary content capture, not native debugger
+  // ownership. END never detaches/closes a tab by a recyclable native tab ID.
+  return {ok: true, accepted: true, strictControl: control,
+    taskId: request.taskId, scopeMode: 'cooperative', assistMode: 'cooperative',
+    session: {taskId: request.taskId, attemptId: control.attemptId, persistent: true,
+      tabId: request.tabId || request.sourceTabId || null, sourceTabId: request.sourceTabId || request.tabId || null,
+      workerTabIds: [], state: kind === 'end' ? 'stopping' : 'active', assistMode: 'cooperative'},
+    resourcesReleased: false, cleanupPending: true};
 }
 
 function buildTerminalMetadataProjection(request) {
@@ -7938,6 +8014,7 @@ async function getCaptureExecutionLockHolderState(lock) {
 }
 
 async function removeStaleCaptureExecutionLock(lock, reason) {
+  await assertLegacyCaptureControlAvailable();
   const stopResult = await stopPreviousUnattendedCaptureForResume(lock);
   if (!stopResult.ok) {
     console.warn('[Background] Kept stale capture lock because its page could not be stopped:', {
@@ -7962,6 +8039,7 @@ async function readActiveCaptureExecutionLockUnsafe() {
   if (!storedLock) {
     return null;
   }
+  if (await hasStrictCaptureStopControl()) return storedLock;
 
   const activeLock = normalizeCaptureExecutionLock(storedLock, {
     allowExpired: true,
@@ -8092,6 +8170,7 @@ async function acquireCaptureExecutionLock({
   holderTabId = null,
 } = {}) {
   return await runCaptureExecutionLockOperation(async () => {
+    await assertLegacyCaptureControlAvailable();
     const activeLock = await readActiveCaptureExecutionLockUnsafe();
     if (activeLock) {
       return {
@@ -8138,6 +8217,7 @@ async function transferOrReserveUnattendedCaptureExecutionLock({
     return null;
   }
   return await runCaptureExecutionLockOperation(async () => {
+    await assertLegacyCaptureControlAvailable();
     const stored = await chrome.storage.local.get(STORAGE_KEYS.captureExecutionLock);
     let lock = normalizeCaptureExecutionLock(
       stored[STORAGE_KEYS.captureExecutionLock],
@@ -8231,6 +8311,7 @@ async function releaseCaptureExecutionLock(
   {holderId = '', holderDocumentId = '', requireHolder = false} = {},
 ) {
   const release = () => runCaptureExecutionLockOperation(async () => {
+    if (await hasStrictCaptureStopControl()) return false;
     if (!lockId) {
       return false;
     }
@@ -8325,6 +8406,7 @@ function isMissingBrowserWindowError(error) {
 }
 
 async function createRunnerTab(createOptions, concreteWindowId) {
+  await assertLegacyCaptureControlAvailable();
   if (concreteWindowId === null) {
     return await chrome.tabs.create(createOptions);
   }
@@ -8395,6 +8477,7 @@ async function openUnattendedRunnerTab(
   {windowId = null, attemptId = ''} = {},
 ) {
   return await runUnattendedRunnerTabLifecycle(async () => {
+    await assertLegacyCaptureControlAvailable();
     const runnerUrl = buildUnattendedRunnerUrl(requestId, attemptId);
     const allTabs = await chrome.tabs.query({});
     const existingRunner = allTabs.find((tab) =>
@@ -8402,6 +8485,7 @@ async function openUnattendedRunnerTab(
     );
 
     if (existingRunner?.id) {
+      await assertLegacyCaptureControlAvailable();
       return await chrome.tabs.update(existingRunner.id, {
         url: runnerUrl,
         active: true,
@@ -8437,6 +8521,7 @@ async function createUnattendedKeywordRunRequest(
   } = {},
 ) {
   const creationLedger = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+  await assertLegacyCaptureControlAvailable();
   const creationClearedAt = String(creationLedger[STORAGE_KEYS.taskLedger]?.clearedAt || '');
   return await runUnattendedRunMutation(async () => {
     const existing = await readUnattendedKeywordRunRequest();
@@ -8549,6 +8634,7 @@ async function claimUnattendedKeywordRun({
   holderId = '',
 } = {}) {
   return await runUnattendedRunMutation(async () => {
+    await assertLegacyCaptureControlAvailable();
     const request = await readUnattendedKeywordRunRequest();
     if (!request || (requestId && request.id !== requestId)) {
       return {accepted: false, reason: 'not_found', data: null};
@@ -9439,6 +9525,7 @@ function unattendedManualRecoveryHasAdoptionReceipt(request) {
 }
 
 async function launchPendingUnattendedRecovery(request) {
+  await assertLegacyCaptureControlAvailable();
   if (!unattendedManualRecoveryHasAdoptionReceipt(request)) {
     scheduleCloudTaskAgentSync('manual_recovery_adoption_pending', 0);
     return {
@@ -9647,6 +9734,7 @@ async function launchPendingUnattendedRecovery(request) {
 }
 
 async function recoverUnattendedKeywordRunRequest(request, health) {
+  await assertLegacyCaptureControlAvailable();
   const recoveryBlock = getUnattendedRecoveryBlockReason(request);
   const blockReason = String(recoveryBlock?.message || '').trim();
   // request.runnerTabId 指向扩展自己的 runner 页面，不是注入 content script 的平台页；
@@ -11048,6 +11136,7 @@ async function findExistingPlatformTab(platform) {
 }
 
 async function activateOrCreatePlatformTab(platform) {
+  await assertLegacyCaptureControlAvailable();
   const normalizedPlatform = normalizePlatformId(platform);
   const homeUrl = getPlatformHomeUrl(normalizedPlatform);
   if (!homeUrl) {
@@ -11710,6 +11799,7 @@ async function cancelTimedOutContentCapture(tabId, captureRequestId = '') {
 }
 
 async function reloadStalledCaptureTab(tabId, { shouldAbort = null } = {}) {
+  await assertLegacyCaptureControlAvailable();
   if (typeof chrome.tabs.reload === 'function') {
     await chrome.tabs.reload(tabId);
   } else {
@@ -11742,6 +11832,7 @@ async function reloadStalledCaptureTab(tabId, { shouldAbort = null } = {}) {
 }
 
 async function relayToContentWithRetry(tabId, payload) {
+  await assertLegacyCaptureControlAvailable();
   const timeoutMs = getContentRelayTimeoutMs(payload);
   const requestId = getCaptureRequestId(payload);
   if (requestId) {
@@ -11821,6 +11912,8 @@ async function relayToContentWithRetry(tabId, payload) {
 
 // Composition root: one capture lifecycle, shared by messages, MV3 restore and tab events.
 const captureLifecycle = globalThis.OnStarvoiceCaptureLifecycle.create({
+  strictLifecycleGuard,
+  hasStrictCaptureStopControl,
   CAPTURE_TASK_GROUP_TITLE,
   CAPTURE_TASK_REPLACEMENT_TAB_TTL_MS,
   STORAGE_KEYS,
@@ -12038,6 +12131,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.storage.onChanged?.addListener?.((changes, areaName) => {
   if (areaName !== 'local') return;
+  if ([STORAGE_KEYS.auth, STORAGE_KEYS.unattendedKeywordRunRequest, STORAGE_KEYS.taskLedger,
+    STORAGE_KEYS.captureExecutionLock].some(key => changes[key])) {
+    void strictCaptureControl?.reconcileWitness().catch(() => {});
+  }
   const readyMarkerChange = Object.entries(changes).find(
     ([key, change]) =>
       key.startsWith(UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX) &&
@@ -12140,9 +12237,21 @@ chrome.runtime.onConnect.addListener((port) => {
 
 chrome.runtime.onConnect.addListener(handleTerminalMetadataConnection);
 
+chrome.runtime.onConnect.addListener(port => {
+  if (port?.name === globalThis.OnStarvoiceStrictCaptureControl.PORT) getStrictCaptureControl().attachPort(port);
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const action = message?.action;
   const type = message?.type;
+
+  if (typeof type === 'string' && (type.startsWith('onstarvoice:strict-') ||
+      ['onstarvoice:prepare-active-capture-stop', 'onstarvoice:execute-active-capture-stop',
+        'onstarvoice:inspect-active-capture-stop'].includes(type))) {
+    Promise.resolve().then(() => getStrictCaptureControl().handle(message, sender))
+      .then(sendResponse, () => sendResponse({ok: false, accepted: false, reason: 'strict_control_unavailable'}));
+    return true;
+  }
 
   if (type === 'onstarvoice:prepare-terminal-recovery-dismissal' ||
       type === 'onstarvoice:execute-terminal-recovery-dismissal') {
@@ -12253,6 +12362,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   (async () => {
     try {
+      if (['onstarvoice:cancel-unattended-keyword-run', 'onstarvoice:recover-unattended-keyword-run',
+        'onstarvoice:relay-to-content', 'onstarvoice:cancel-capture', 'onstarvoice:switch-platform-tab',
+        'onstarvoice:register-capture-task-tab', 'onstarvoice:set-capture-task-minimized'] .includes(type)) {
+        await assertLegacyCaptureControlAvailable();
+      }
       if (type === 'onstarvoice:open-side-panel') {
         const tabId = message?.tabId ?? sender?.tab?.id;
         const data = await openSidePanelForTab(tabId);
@@ -12590,11 +12704,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:renew-capture-lock') {
+        let retainedLock = null;
+        if (await hasStrictCaptureStopControl()) {
+          if (!await getStrictCaptureControl().guardScope(message.strictControl, sender)) {
+            sendResponse({ok: false, reason: 'strict_capture_control_retained'}); return;
+          }
+          retainedLock = (await chrome.storage.local.get(STORAGE_KEYS.captureExecutionLock))[STORAGE_KEYS.captureExecutionLock];
+        }
         const result = await renewCaptureExecutionLock({
           lockId: message?.lockId,
           holderId: message?.holderId,
           holderDocumentId: sender?.documentId,
-          holderTabId: message?.holderTabId ?? sender?.tab?.id,
+          holderTabId: retainedLock?.holderTabId ?? message?.holderTabId ?? sender?.tab?.id,
         });
         sendResponse({
           ok: result.ok,
@@ -12645,6 +12766,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:end-capture-task') {
+        const strict = await strictLifecycleGuard('end', message, sender);
+        if (strict) {sendResponse({ok: true, data: strict}); return;}
         const data = await endCaptureTask(message);
         sendResponse({ok: true, data});
         return;

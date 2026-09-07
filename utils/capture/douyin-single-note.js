@@ -15,6 +15,7 @@ import {
   extractNoteId,
 } from "../helpers.js";
 import { wait, waitUntil } from "../scroll.js";
+import {pageActivity} from "./content-activity.js";
 import { getDomProfile } from "../platform/dom-profiles/index.js";
 import {
   ensureDetailPageReady,
@@ -279,21 +280,56 @@ async function requestDouyinApiDetailFromMainWorld(
     return null;
   }
 
+  pageActivity.assertCanProduce();
+
   const cached = readDouyinApiCache(normalizedId);
   if (cached && !forceRefresh && (!acceptDetail || acceptDetail(cached))) {
     return cached;
   }
 
+  const pageControl = pageActivity.getInvocation();
+  const requestKey = globalThis.crypto.randomUUID();
+  const statusEvent = '__onstarvoice_dy_detail_status_v1__';
+  const controlEvent = '__onstarvoice_dy_detail_control_v1__';
+  let started = false;
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const onStatus = (event) => {
+    const detail = event?.detail;
+    if (detail?.version !== 1 || detail.requestKey !== requestKey
+      || detail.awemeId !== normalizedId) return;
+    if (pageControl) {
+      if (!['version', 'requestId', 'attemptId', 'generation', 'ownerDocumentId',
+        'documentId', 'activationId', 'operationId'].every((key) =>
+        detail.pageControl?.[key] === pageControl[key])) return;
+    } else if (detail.pageControl) return;
+    if (detail.phase === 'started') started = true;
+    if (detail.phase !== 'settled' || !started) return;
+    window.removeEventListener(statusEvent, onStatus);
+    release();
+  };
+  window.addEventListener(statusEvent, onStatus);
+  pageActivity.trackChild(pending, {
+    kind: 'main-detail', invocation: pageControl,
+    cancel: () => window.dispatchEvent(new CustomEvent(controlEvent, {detail: {
+      version: 1, action: 'cancel', requestKey, awemeId: normalizedId, pageControl,
+    }})),
+  });
+
   try {
+    pageActivity.assertCanProduce();
     window.dispatchEvent(
       new CustomEvent(_DETAIL_REQUEST_EVENT, {
         detail: {
+          version: 1, requestKey, pageControl,
           awemeId: normalizedId,
           requestedAt: Date.now(),
         },
       }),
     );
   } catch (error) {
+    // An uncertain dispatch may already have started MAIN work. Keep the child
+    // pending without a matching started/settled pair; never time it out to zero.
     console.warn("[Douyin][SingleNote] detail request dispatch failed:", normalizedId, error);
     return null;
   }

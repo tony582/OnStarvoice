@@ -394,6 +394,13 @@ export function createTaskLedgerAssistController({controllerState, controllerPor
   }
 
   async function startCaptureAssistSessionStrict(options = {}) {
+    const strictClient = controllerPorts.strictCaptureClient;
+    if (strictClient && (strictClient.shouldStop() ||
+        String(options.attemptId || '') !== strictClient.strictControl.attemptId)) {
+      const error = new Error('strict_capture_assist_identity_rejected');
+      error.code = 'strict_capture_assist_identity_rejected';
+      throw error;
+    }
     const taskId = String(options?.taskId || "").trim();
     const platform = String(options?.platform || "").trim().toLowerCase();
     const ownerRequired = options?.ownerRequired !== false;
@@ -409,6 +416,11 @@ export function createTaskLedgerAssistController({controllerState, controllerPor
       ...options,
       ownerRequired,
     });
+    if (strictClient && result?.data?.scopeMode !== 'cooperative') {
+      const error = new Error('strict_cooperative_session_confirmation_required');
+      error.code = 'strict_cooperative_session_confirmation_required';
+      throw error;
+    }
     if (result?.ok === true && result?.active === true) {
       return result;
     }
@@ -440,6 +452,7 @@ export function createTaskLedgerAssistController({controllerState, controllerPor
       return await startCaptureAssistSessionStrict(options);
     } catch (error) {
       const code = String(error?.code || "").trim();
+      if (controllerPorts.strictCaptureClient) throw error;
       if (!OPTIONAL_CAPTURE_ASSIST_SESSION_CODES.has(code)) {
         // Attempt identity, execution-lock, platform and source-page errors are
         // authoritative task fences rather than optional assist failures. Never

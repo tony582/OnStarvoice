@@ -1,0 +1,324 @@
+{
+  "baseline": "3c19c5ea14c9ac1f68a21da8b8caf30353b459d1",
+  "purpose": "Exact non-executable inverse delta for explicit strict candidate owner and page capabilities. Original L3-A/L3-B fingerprints are unchanged.",
+  "entries": [
+    {
+      "name": "waitForTabComplete",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "sha256": "3197726c99187a393c3f07940dc7e9a8a26a0fbc53e512dabba9eca83bb48fc0",
+      "reverse": [
+        {
+          "at": 6,
+          "remove": [
+            "      if (controllerPorts.strictCaptureClient?.shouldStop()) {",
+            "        const error = new Error('capture_strict_stopped');",
+            "        error.code = 'capture_strict_stopped';",
+            "        throw error;",
+            "      }"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "captureKeywordOpportunitySamples",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "sha256": "fcca90d357fd3f2752bf811c1cd5ccb4cf1469949672b8c102d0f2c69969a2bb",
+      "reverse": [
+        {
+          "at": 8,
+          "remove": [
+            "    if (controllerPorts.strictCaptureClient) {",
+            "      const originalShouldStop = shouldStop;",
+            "      shouldStop = () => controllerPorts.strictCaptureClient.shouldStop() ||",
+            "        Boolean(originalShouldStop?.());",
+            "    }"
+          ],
+          "insert": []
+        },
+        {
+          "at": 80,
+          "remove": [
+            "          const checkpoint = onSampleCaptured([...samples], normalizedSample);",
+            "          if (controllerPorts.strictCaptureClient) await checkpoint;"
+          ],
+          "insert": [
+            "          onSampleCaptured([...samples], normalizedSample);"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "captureBenchmarkCandidateProfiles",
+      "owner": "sidebar/task-controller/keyword-strategy.js",
+      "sha256": "faf8fbe4af4b458e14510cb666339423217aeba1fd9567798bdb6d0e97a64502",
+      "reverse": [
+        {
+          "at": 6,
+          "remove": [
+            "    if (controllerPorts.strictCaptureClient) {",
+            "      const originalShouldStop = shouldStop;",
+            "      shouldStop = () => controllerPorts.strictCaptureClient.shouldStop() ||",
+            "        Boolean(originalShouldStop?.());",
+            "    }"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "bindCaptureTaskOwner",
+      "owner": "sidebar/task-controller/owner.js",
+      "sha256": "17e6e715fa637b2eeb64cd6f1495886501ce0b2a7b7257c83a2bfa5880fec085",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "    if (strictOwner) return;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "releaseCaptureTaskOwner",
+      "owner": "sidebar/task-controller/owner.js",
+      "sha256": "b90b734e623df718531fe8dd65222f6e405140c9e8ae64a22546a0bce0dcfcfa",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "    if (strictOwner) return;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "applyCaptureTaskCancellation",
+      "owner": "sidebar/task-controller/owner.js",
+      "sha256": "84828bd8090ec246c801ee4bebbd68b9630f64bfd5faa3de34545c41c39449f3",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "    // A task-id-only legacy signal cannot mutate strict cancellation flags or",
+            "    // cancel workers belonging to the current or any successor generation.",
+            "    if (strictOwner) return;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "connectCaptureTaskOwnerPort",
+      "owner": "sidebar/task-controller/owner.js",
+      "sha256": "af50024dbcfdac0b7264c47a96bed98066c49170c959c6c2bde39ce13fc5d67b",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "    if (strictOwner) return;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "maybeClaimAndRunTargetedPostWorkflow",
+      "owner": "sidebar/task-controller/targeted.js",
+      "sha256": "bd2c1c18581b0c2089a90841f343ef4566a51fac0eab73ec49db6ae08f0ab143",
+      "reverse": [
+        {
+          "at": 41,
+          "remove": [
+            "    if (binding.request?.strictControlCandidate === true && !controllerPorts.strictCaptureClient) {",
+            "      return controllerOperations.runStrictCaptureProducer(binding.request,",
+            "        (scope) => scope.operations.maybeClaimAndRunTargetedPostWorkflow(),",
+            "        'targeted-post-producer');",
+            "    }",
+            "    if (controllerPorts.strictCaptureClient &&",
+            "        (controllerPorts.strictCaptureClient.strictControl.requestId !== requestId ||",
+            "         controllerPorts.strictCaptureClient.strictControl.attemptId !== attemptId)) {",
+            "      throw createTargetedPostInvocationError('strict_producer_identity_mismatch');",
+            "    }"
+          ],
+          "insert": []
+        },
+        {
+          "at": 140,
+          "remove": [
+            "      controllerPorts.strictCaptureClient?.shouldStop() ||"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "startCaptureAssistSessionStrict",
+      "owner": "sidebar/task-controller/task-ledger-assist.js",
+      "sha256": "8c2ff557789190a073ba89fb0c6da7a32913ae3b8a28c8510cc3c83d7bb0b8ed",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "    const strictClient = controllerPorts.strictCaptureClient;",
+            "    if (strictClient && (strictClient.shouldStop() ||",
+            "        String(options.attemptId || '') !== strictClient.strictControl.attemptId)) {",
+            "      const error = new Error('strict_capture_assist_identity_rejected');",
+            "      error.code = 'strict_capture_assist_identity_rejected';",
+            "      throw error;",
+            "    }"
+          ],
+          "insert": []
+        },
+        {
+          "at": 23,
+          "remove": [
+            "    if (strictClient && result?.data?.scopeMode !== 'cooperative') {",
+            "      const error = new Error('strict_cooperative_session_confirmation_required');",
+            "      error.code = 'strict_cooperative_session_confirmation_required';",
+            "      throw error;",
+            "    }"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "startOptionalCaptureAssistSession",
+      "owner": "sidebar/task-controller/task-ledger-assist.js",
+      "sha256": "836b2d16c0f3b36bf0e9853bc2014a1e753874792bbeebc4fe1d8b8579ebeddf",
+      "reverse": [
+        {
+          "at": 5,
+          "remove": [
+            "      if (controllerPorts.strictCaptureClient) throw error;"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "navigateActiveTabToKeywordSearchForPlan",
+      "owner": "sidebar/task-controller/unattended-run.js",
+      "sha256": "fbeda86d2c6d08b8eeb1c5da609f2ecfd53d7f6745ad6c4935a2e1d342c158a4",
+      "reverse": [
+        {
+          "at": 123,
+          "remove": [
+            "            !controllerPorts.strictCaptureClient &&"
+          ],
+          "insert": []
+        }
+      ]
+    },
+    {
+      "name": "runUnattendedKeywordPlanRequest",
+      "owner": "sidebar/task-controller/unattended-run.js",
+      "sha256": "a869d1de81c6fafd9b757d0b02ba1dc278fd9f432555abb94a357f2a663927fd",
+      "reverse": [
+        {
+          "at": 1,
+          "remove": [
+            "    const strictClient = controllerPorts.strictCaptureClient;"
+          ],
+          "insert": []
+        },
+        {
+          "at": 4,
+          "remove": [
+            "    if (strictClient && (strictClient.strictControl.requestId !== requestId ||",
+            "        strictClient.strictControl.attemptId !== requestAttemptId)) {",
+            "      const error = new Error('strict_producer_identity_mismatch');",
+            "      error.code = 'strict_producer_identity_mismatch';",
+            "      throw error;",
+            "    }"
+          ],
+          "insert": []
+        },
+        {
+          "at": 177,
+          "remove": [
+            "    const strictContinuation = strictClient &&",
+            "      controllerPorts.strictCaptureContinuation?.requestId === requestId &&",
+            "      controllerPorts.strictCaptureContinuation?.attemptId === requestAttemptId",
+            "      ? controllerPorts.strictCaptureContinuation : null;",
+            "    const runStartedAt = strictContinuation?.runStartedAt || new Date().toISOString();"
+          ],
+          "insert": [
+            "    const runStartedAt = new Date().toISOString();"
+          ]
+        },
+        {
+          "at": 219,
+          "remove": [
+            "    const startReport = strictContinuation?.startReport || await reportInitialUnattendedKeywordRun("
+          ],
+          "insert": [
+            "    const startReport = await reportInitialUnattendedKeywordRun("
+          ]
+        },
+        {
+          "at": 271,
+          "remove": [
+            "    if (request?.strictControlCandidate === true && !strictClient) {",
+            "      // Admission follows the existing accepted running checkpoint, but occurs",
+            "      // before platform switching, native assist setup or any page producer.",
+            "      // Continue through the same function with private ports; preserve this",
+            "      // accepted report and start clock instead of submitting either twice.",
+            "      return controllerOperations.runStrictCaptureProducer(request,",
+            "        (scope) => scope.operations.runUnattendedKeywordPlanRequest(request),",
+            "        'unattended-keyword-producer', Object.freeze({",
+            "          requestId, attemptId: requestAttemptId, runStartedAt, startReport,",
+            "        }));",
+            "    }"
+          ],
+          "insert": []
+        },
+        {
+          "at": 360,
+          "remove": [
+            "          strictClient?.shouldStop() ||"
+          ],
+          "insert": []
+        },
+        {
+          "at": 367,
+          "remove": [
+            "          strictClient?.shouldStop() ||"
+          ],
+          "insert": []
+        },
+        {
+          "at": 486,
+          "remove": [
+            "              strictClient?.shouldStop() ||"
+          ],
+          "insert": []
+        },
+        {
+          "at": 493,
+          "remove": [
+            "              strictClient?.shouldStop() ||"
+          ],
+          "insert": []
+        },
+        {
+          "at": 559,
+          "remove": [
+            "          strictClient?.shouldStop() ||"
+          ],
+          "insert": []
+        },
+        {
+          "at": 597,
+          "remove": [
+            "        strictClient?.shouldStop() ||"
+          ],
+          "insert": []
+        }
+      ]
+    }
+  ]
+}

@@ -23,10 +23,29 @@
   var CACHE_KEY_PREFIX = '__mc_dy_detail_';
   var MEDIA_CACHE_KEY = '__mc_dy_media_requests__';
   var DETAIL_REQUEST_EVENT = '__mc_dy_request_detail__';
+  var DETAIL_CONTROL_EVENT = '__onstarvoice_dy_detail_control_v1__';
+  var DETAIL_STATUS_EVENT = '__onstarvoice_dy_detail_status_v1__';
   var MAX_CACHE_ENTRIES = 30;
   var MAX_MEDIA_CACHE_ENTRIES = 80;
   var CACHE_TTL_MS = 30 * 60 * 1000; // 30 分钟
   var pendingDetailRequests = Object.create(null);
+  var controlledDetailRequests = Object.create(null);
+
+  function emitDetailStatus(request, phase) {
+    window.dispatchEvent(new CustomEvent(DETAIL_STATUS_EVENT, {detail: {
+      version: 1, requestKey: request.requestKey, awemeId: request.awemeId,
+      pageControl: request.pageControl || null, phase: phase,
+    }}));
+  }
+
+  function sameDetailControl(left, right) {
+    if (!left && !right) return true;
+    if (!left || !right) return false;
+    return ['version', 'requestId', 'attemptId', 'generation', 'ownerDocumentId',
+      'documentId', 'activationId', 'operationId'].every(function (key) {
+      return left[key] === right[key];
+    });
+  }
 
   var INTERCEPT_PATHS = [
     '/aweme/v1/aweme/detail/',
@@ -167,14 +186,15 @@
     }
   }
 
-  function fetchDetailViaApi(awemeId) {
+  function fetchDetailViaApi(awemeId, control) {
     var normalizedId = String(awemeId || '').trim();
     if (!normalizedId) {
       return Promise.resolve(false);
     }
 
-    if (pendingDetailRequests[normalizedId]) {
-      return pendingDetailRequests[normalizedId];
+    var pendingKey = control && control.pageControl ? control.requestKey : normalizedId;
+    if (pendingDetailRequests[pendingKey]) {
+      return pendingDetailRequests[pendingKey];
     }
 
     var endpoints = [
@@ -183,21 +203,29 @@
       '/aweme/v2/aweme/detail/?aweme_id=' + encodeURIComponent(normalizedId),
     ];
 
-    pendingDetailRequests[normalizedId] = (async function () {
+    pendingDetailRequests[pendingKey] = (async function () {
       for (var i = 0; i < endpoints.length; i += 1) {
+        if (control && control.canceled) return false;
         var endpoint = endpoints[i];
         try {
-          var response = await window.fetch(endpoint, {
+          // Preserve the current page fetch chain (including any platform
+          // wrappers). Our passive Proxy recognizes this owned detail below.
+          var fetchPort = window.fetch;
+          var options = {
             credentials: 'include',
             headers: {
               'accept': 'application/json, text/plain, */*',
             },
-          });
+          };
+          if (control) options.signal = control.controller.signal;
+          var response = await fetchPort.call(window, endpoint, options);
+          if (control && control.canceled) return false;
           if (!response || !response.ok) {
             continue;
           }
 
           var json = await response.clone().json();
+          if (control && control.canceled) return false;
           processApiJson(json);
 
           var detail =
@@ -211,6 +239,7 @@
             return true;
           }
         } catch (error) {
+          if (control && control.canceled) return false;
           try {
             console.warn('[StarVoice][DouyinInterceptor] detail request failed:', normalizedId, endpoint, error);
           } catch (_) {}
@@ -218,10 +247,10 @@
       }
       return false;
     })().finally(function () {
-      delete pendingDetailRequests[normalizedId];
+      delete pendingDetailRequests[pendingKey];
     });
 
-    return pendingDetailRequests[normalizedId];
+    return pendingDetailRequests[pendingKey];
   }
 
   function readCache(awemeId) {
@@ -315,7 +344,12 @@
         var promise = Reflect.apply(target, thisArg, args);
         appendMediaRequest(url);
 
-        if (isAwemeApiUrl(url)) {
+        var ownedDetail = Object.keys(controlledDetailRequests).some(function (key) {
+          var active = controlledDetailRequests[key];
+          return active && new RegExp('[?&]aweme_id=' + encodeURIComponent(active.awemeId)
+            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:&|$)').test(url);
+        });
+        if (isAwemeApiUrl(url) && !ownedDetail) {
           try {
             console.debug('[StarVoice][DouyinInterceptor] fetch hit:', url);
           } catch (_) {}
@@ -375,10 +409,40 @@
 
   window.addEventListener(DETAIL_REQUEST_EVENT, function (event) {
     try {
-      var awemeId = event && event.detail ? event.detail.awemeId : '';
+      var detail = event && event.detail;
+      var awemeId = detail ? detail.awemeId : '';
       if (!awemeId) return;
+      if (detail.version === 1 && typeof detail.requestKey === 'string'
+        && detail.requestKey.length > 0 && detail.requestKey.length <= 320) {
+        if (controlledDetailRequests[detail.requestKey]) return;
+        var control = {
+          requestKey: detail.requestKey, awemeId: String(awemeId),
+          pageControl: detail.pageControl || null,
+          canceled: false, controller: new AbortController(),
+        };
+        controlledDetailRequests[control.requestKey] = control;
+        emitDetailStatus(control, 'started');
+        fetchDetailViaApi(awemeId, control).catch(function () {}).finally(function () {
+          delete controlledDetailRequests[control.requestKey];
+          emitDetailStatus(control, 'settled');
+        });
+        return;
+      }
       fetchDetailViaApi(awemeId).catch(function () {});
     } catch (_) {}
+  });
+
+  // These DOM events provide cooperation, never an authorization grant. Only
+  // the isolated content listener accepts trusted background control commands.
+  window.addEventListener(DETAIL_CONTROL_EVENT, function (event) {
+    var detail = event && event.detail;
+    if (!detail || detail.version !== 1 || detail.action !== 'cancel') return;
+    var control = controlledDetailRequests[detail.requestKey];
+    if (!control || detail.awemeId !== control.awemeId
+      || !sameDetailControl(detail.pageControl, control.pageControl)) return;
+    control.canceled = true;
+    control.controller.abort();
+    // Abort is a request, not an acknowledgement. The finally above owns it.
   });
 
   try {

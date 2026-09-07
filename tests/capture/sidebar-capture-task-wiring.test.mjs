@@ -184,7 +184,7 @@ test("targeted patrol owns the dark task surface and exact stop binding", () => 
 
   const batchSection = readSourceSection(
     captureSyncSource,
-    "export async function batchCaptureByUrls({",
+    "async function batchCaptureByUrls({",
     "/**\n * 批量关键词采集",
   );
   assert.match(
@@ -2141,8 +2141,8 @@ test("unattended final source tab stays pinned through the batch runner", () => 
 
   const captureSyncBatchSection = readSourceSection(
     captureSyncSource,
-    "export async function batchCaptureByKeywords({",
-    "export async function lightSampleByKeywords({",
+    "async function batchCaptureByKeywords({",
+    "async function lightSampleByKeywords({",
   );
   assert.match(captureSyncBatchSection, /sourceTabId\s*=\s*null/);
   const captureSyncPinnedLookupIndex = captureSyncBatchSection.indexOf(

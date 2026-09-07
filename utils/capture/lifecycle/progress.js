@@ -1,6 +1,13 @@
 // L1: progress responsibility. Existing behavior, explicit host ports, one shared lifecycle owner.
 (function register(root) {
   function create({state, ports, operations}) {
+    const strictPending = () => ({ok: false, accepted: false, released: false,
+      resourcesReleased: false, cleanupPending: true, ignored: true,
+      reason: 'strict_capture_control_retained'});
+    const strictRetained = async () => {
+      if (typeof ports.hasStrictCaptureStopControl !== 'function') return false;
+      try { return await ports.hasStrictCaptureStopControl() !== false; } catch { return true; }
+    };
     const {
       chrome,
       console,
@@ -13,6 +20,7 @@
     const requireCaptureTaskId = (...args) => operations.requireCaptureTaskId(...args);
 
     async function updateCaptureTask(message) {
+      if (await strictRetained()) return strictPending();
       const request = getCaptureTaskRequest(message);
       const taskId = requireCaptureTaskId(request);
       const attemptFence = await inspectUnattendedCaptureTaskAttempt({
@@ -32,7 +40,9 @@
           update[field] = request[field];
         }
       }
+      if (await strictRetained()) return strictPending();
       const session = await state.captureDebugSessionManager.updateTask(update);
+      if (await strictRetained()) return strictPending();
       const sourceTabId = resolveCaptureTaskTabId(
         session?.sourceTabId,
         session?.tabId,
@@ -61,6 +71,7 @@
     }
 
     async function registerCaptureTaskTab(message, sender) {
+      if (await strictRetained()) return strictPending();
       const request = getCaptureTaskRequest(message);
       const taskId = requireCaptureTaskId(request);
       const attemptFence = await inspectUnattendedCaptureTaskAttempt({
@@ -74,6 +85,7 @@
           reason: 'stale_unattended_attempt',
         };
       }
+      if (await strictRetained()) return strictPending();
       const role = taskTabGroupApi.normalizeTaskTabRole(
         request.role,
       );
@@ -106,6 +118,7 @@
         tabId: workerTabId,
         role,
       });
+      if (await strictRetained()) return strictPending();
       let session;
       try {
         session = await state.captureDebugSessionManager.registerWorkerTab({
@@ -114,6 +127,7 @@
           groupId: group.groupId,
         });
       } catch (error) {
+        if (await strictRetained()) return strictPending();
         await state.captureTaskTabGroupManager.unregister({
           taskId,
           tabId: workerTabId,
@@ -124,6 +138,7 @@
     }
 
     async function setCaptureTaskMinimized(message) {
+      if (await strictRetained()) return strictPending();
       const request = getCaptureTaskRequest(message);
       const taskId = requireCaptureTaskId(request);
       const session = await state.captureDebugSessionManager.setMinimized({

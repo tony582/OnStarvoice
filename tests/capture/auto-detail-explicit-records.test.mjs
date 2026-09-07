@@ -1,4 +1,5 @@
 import {readSidebarSection, sidebarVm as vm} from '../helpers/sidebar-controller-source.mjs';
+import {readCaptureConstant} from '../helpers/capture-delivery-source.mjs';
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
@@ -28,7 +29,7 @@ function compileFunction({source, startMarker, endMarker, functionName, context}
   );
   const sandbox = vm.createContext({...context});
   vm.runInContext(
-    `${section}\nglobalThis.__compiledFunction = ${functionName};`,
+    `${section.includes('scopedShouldStop(') ? `const pageOperations = null;\n${readCaptureConstant('scopedShouldStop')}\n` : ''}${section}\nglobalThis.__compiledFunction = ${functionName};`,
     sandbox,
   );
   return sandbox.__compiledFunction;
@@ -270,8 +271,8 @@ test("each keyword invokes enhancement even when its record ids duplicate an alr
 
   const run = compileFunction({
     source: captureSyncSource,
-    startMarker: "export async function batchCaptureByKeywords({",
-    endMarker: "export async function lightSampleByKeywords({",
+    startMarker: "async function batchCaptureByKeywords({",
+    endMarker: "async function lightSampleByKeywords({",
     functionName: "batchCaptureByKeywords",
     context: {
       BATCH_INTER_KEYWORD_DELAY_MAX_MS: 0,

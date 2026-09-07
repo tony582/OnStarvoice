@@ -1,6 +1,14 @@
 // L1: admission responsibility. Existing behavior, explicit host ports, one shared lifecycle owner.
 (function register(root) {
   function create({state, ports, operations}) {
+    const strictPending = () => ({ok: false, accepted: false, released: false,
+      resourcesReleased: false, cleanupPending: true, releasedTaskIds: [],
+      protectedTasks: [{reason: 'strict_capture_control_retained'}],
+      reason: 'strict_capture_control_retained'});
+    const strictRetained = async () => {
+      if (typeof ports.hasStrictCaptureStopControl !== 'function') return false;
+      try { return await ports.hasStrictCaptureStopControl() !== false; } catch { return true; }
+    };
     const {
       STORAGE_KEYS,
       TASK_LEDGER_STALE_ACTIVE_MS,
@@ -214,6 +222,7 @@
     }
 
     async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
+      if (await strictRetained()) return strictPending();
       const releasedTaskIds = [];
       const protectedTasks = [];
       const candidatesByTaskId = new Map(
@@ -241,6 +250,7 @@
       );
       for (const group of candidates) {
         const liveness = await inspectCaptureTaskGroupLiveness(group);
+        if (await strictRetained()) return strictPending();
         if (liveness.active) {
           protectedTasks.push({
             taskId: group.taskId,
@@ -258,8 +268,10 @@
             },
             {attempts: 3},
           );
+          if (await strictRetained()) return strictPending();
           releasedTaskIds.push(group.taskId);
         } catch (error) {
+          if (await strictRetained()) return strictPending();
           console.warn(
             '[CaptureTask] confirmed stale group cleanup remains pending:',
             {
