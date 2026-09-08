@@ -22,7 +22,9 @@ test('negative patrol fair claiming uses real PostgreSQL dispatch and durable as
   const {runMigrations} = await import('../../../server/db/migrate.js');
   const {getPool, closePool} = await import('../../../server/db/pool.js');
   const {withTransaction} = await import('../../../server/db/init.js');
-  const {dispatchNextElasticWorkItem, projectNegativePatrolSnapshot} = await import('../../../server/routes/capture-cloud.js');
+  const {dispatchNextElasticWorkItem, mirrorTaskSnapshot, projectNegativePatrolSnapshot} = await import('../../../server/routes/capture-cloud.js');
+  const {normalizeCloudTaskSnapshot} = await import('../../../server/services/capture-cloud.js');
+  await import('../../../utils/cloud-task-agent.js');
   await runMigrations();
   const pool = getPool();
   t.after(closePool);
@@ -111,6 +113,85 @@ test('negative patrol fair claiming uses real PostgreSQL dispatch and durable as
     }
     return {tenant, agents, parent, items, claim, settle, assertDispatched};
   }
+
+  async function mirrorRunningClaim(f, claimed, metadata = {}) {
+    const command = (await pool.query('SELECT * FROM capture_agent_commands WHERE id=$1', [claimed.commandId])).rows[0];
+    const child = (await pool.query('SELECT * FROM capture_tasks WHERE id=$1', [claimed.childTaskId])).rows[0];
+    const now = new Date().toISOString();
+    // Use the shipped Extension's real snapshot builder. The browser knows its
+    // running request, but it does not own the server's queue-admission flags.
+    const payload = globalThis.OnStarvoiceCloudTaskAgent.buildHeartbeatPayload({
+      runtime: {appVersion: '0.4.7'},
+      ledger: {runs: []},
+      targetedPostRequest: {
+        id: child.client_task_id, taskId: child.id, cloudCommandId: command.id,
+        attemptId: command.payload.attemptIdentity, attemptNumber: 1,
+        workflow: 'negative_post_patrol', platform: 'douyin', status: 'running',
+        targets: command.payload.targets, metadata, progressSeq: 1,
+        checkpoint: {nextOrdinal: 1},
+        createdAt: now, updatedAt: now, startedAt: now, heartbeatAt: now,
+      },
+    });
+    assert.equal(payload.tasks.length, 1);
+    const snapshot = normalizeCloudTaskSnapshot(payload.tasks[0]);
+    assert.equal(snapshot.status, 'running');
+    assert.equal(snapshot.clientTaskId, child.client_task_id);
+    assert.equal(snapshot.attemptId, command.payload.attemptIdentity);
+    const agent = f.agents.find(candidate => candidate.id === command.agent_id);
+    const mirrored = await withTransaction(tx => mirrorTaskSnapshot(tx, agent, snapshot));
+    assert.equal(mirrored.id, child.id, 'Heartbeat must update the dispatched child, not create an unrelated local task');
+    assert.equal(mirrored.status, 'running');
+    assert.equal(mirrored.metadata.createCommandId, command.id);
+    return {snapshot, mirrored};
+  }
+
+  for (const browserMetadata of [{}, {
+    perItemAdmissionV1: false, cloudWorkQueue: false,
+    distributionMode: 'fixed_batch', claimUnit: 'keyword',
+  }]) {
+    await t.test(`a running Extension heartbeat ${Object.keys(browserMetadata).length ? 'cannot overwrite' : 'cannot erase'} admission metadata or block another idle peer`, async st => {
+      const f = await fixture(st);
+      const first = await f.claim();
+      await f.assertDispatched(first, f.agents[0]);
+      const {snapshot, mirrored} = await mirrorRunningClaim(f, first, browserMetadata);
+      assert.equal(snapshot.metadata.perItemAdmissionV1, browserMetadata.perItemAdmissionV1);
+      // Keep A genuinely running, with its command admitted and unreleased.
+      // Only age its 10s pacing timestamp, so B tests concurrent admission.
+      await pool.query("UPDATE capture_agent_commands SET admitted_at=now()-interval '11 seconds' WHERE id=$1", [first.commandId]);
+      const second = await f.claim(f.agents[1]);
+      await f.assertDispatched(second, f.agents[1]);
+      assert.equal(second.itemId, f.items[1].id);
+      assert.equal(mirrored.metadata.perItemAdmissionV1, true);
+      assert.equal(mirrored.metadata.cloudWorkQueue, true);
+      assert.equal(mirrored.metadata.distributionMode, 'elastic_pool');
+      assert.equal(mirrored.metadata.claimUnit, 'negative_post');
+      assert.equal((await pool.query('SELECT status FROM capture_tasks WHERE id=$1', [first.childTaskId])).rows[0].status, 'running');
+      assert.equal((await pool.query('SELECT admission_released_at FROM capture_agent_commands WHERE id=$1', [first.commandId])).rows[0].admission_released_at, null);
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM capture_task_item_attempts WHERE parent_task_id=$1', [f.parent.id])).rows[0].n, 2);
+    });
+  }
+
+  await t.test('a genuine legacy multi-target running pack still blocks concurrent negative admission after heartbeat', async st => {
+    const f = await fixture(st);
+    const first = await f.claim();
+    // Simulate an already-admitted pre-079 pack. The current admission trigger
+    // correctly rejects new multi-target commands; bypass it only on this
+    // validated isolated database and only in this fixture transaction.
+    await withTransaction(async tx => {
+      await tx.execute('SET LOCAL session_replication_role = replica');
+      await tx.execute(`UPDATE capture_agent_commands SET
+        payload=jsonb_set(payload, '{targets}', (payload->'targets') || (payload->'targets')),
+        admitted_at=now()-interval '11 seconds' WHERE id=$1`, [first.commandId]);
+    });
+    await pool.query("UPDATE capture_tasks SET metadata=metadata-'perItemAdmissionV1' WHERE id=$1", [first.childTaskId]);
+    const {mirrored} = await mirrorRunningClaim(f, first, {perItemAdmissionV1: true});
+    const blocked = await f.claim(f.agents[1]);
+    assert.equal(blocked?.deferred, true);
+    assert.equal(blocked?.reason, 'legacy_active_pack');
+    assert.notEqual(mirrored.metadata.perItemAdmissionV1, true, 'A browser cannot mint a server admission flag for a legacy pack');
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM capture_agent_commands WHERE tenant_id=$1', [f.tenant.id])).rows[0].n, 1);
+    assert.equal((await pool.query('SELECT status FROM capture_task_items WHERE id=$1', [f.items[1].id])).rows[0].status, 'pending');
+  });
 
   await t.test('five quick posts reach five of six idle peers despite one fast polling browser', async st => {
     const f = await fixture(st, {agentCount: 6, itemCount: 5});

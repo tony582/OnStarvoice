@@ -6123,6 +6123,7 @@ export async function mirrorTaskSnapshot(
   const agentSnapshotMetadata = {...safeJson(snapshot.metadata)};
   delete agentSnapshotMetadata.requiresLocalClosureReuseFenceV1;
   delete agentSnapshotMetadata.stoppedBeforeDispatch;
+  delete agentSnapshotMetadata.perItemAdmissionV1;
   delete agentSnapshotMetadata.itemAttempts;
   delete agentSnapshotMetadata.attemptIdentity;
   delete agentSnapshotMetadata.localRecoveryClientAttemptId;
@@ -6255,6 +6256,10 @@ export async function mirrorTaskSnapshot(
             'parentTaskId', capture_tasks.metadata->'parentTaskId',
             'orchestrationRevision', capture_tasks.metadata->'orchestrationRevision',
             'itemIds', capture_tasks.metadata->'itemIds',
+            'perItemAdmissionV1', capture_tasks.metadata->'perItemAdmissionV1',
+            'cloudWorkQueue', capture_tasks.metadata->'cloudWorkQueue',
+            'distributionMode', capture_tasks.metadata->'distributionMode',
+            'claimUnit', capture_tasks.metadata->'claimUnit',
             'attemptIdentity', capture_tasks.metadata->'attemptIdentity',
             'requiresLocalClosureReuseFenceV1', capture_tasks.metadata->'requiresLocalClosureReuseFenceV1',
             'stoppedBeforeDispatch', capture_tasks.metadata->'stoppedBeforeDispatch',
