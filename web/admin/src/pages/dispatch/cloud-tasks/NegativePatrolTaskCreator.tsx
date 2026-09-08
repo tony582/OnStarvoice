@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, Loader2,
+  CalendarDays, Check, ChevronLeft, ChevronRight, Loader2,
   MessageSquareText, RefreshCw, Search, Send, Sparkles, Users,
 } from 'lucide-react'
 import { api } from '@/lib/api'
