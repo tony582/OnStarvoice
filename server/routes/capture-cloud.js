@@ -5206,8 +5206,10 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
     WHERE tenant_id = $1
       AND task_id = $2
       AND execution_task_id = $3
+      AND assigned_agent_id = $4
+      AND assignment_revision = $5
     ORDER BY ordinal, id
-  `, [agent.tenant_id, itemOwnerTaskId, task.id]);
+  `, [agent.tenant_id, itemOwnerTaskId, task.id, agent.id, executionRevision]);
   if (items.length === 0) return null;
   const aggregate = aggregateParentTaskItems(items);
   if (task.task_type === 'official_account_comment_patrol') {
@@ -6747,10 +6749,15 @@ async function negativePatrolFairClaimWait(tx, {agent, candidate, resourcePolicy
   return null;
 }
 
-export async function dispatchNextElasticWorkItem(tx, {
+export async function dispatchNextElasticWorkItem(tx, options = {}) {
+  return dispatchNextElasticWorkItemWithinBudget(tx, options, 10);
+}
+
+async function dispatchNextElasticWorkItemWithinBudget(tx, {
   agent,
   capabilities = {},
-} = {}) {
+} = {}, remainingSkipBudget) {
+  if (remainingSkipBudget <= 0) return null;
   const freshCapabilities = safeJson(capabilities);
   const canClaimKeyword =
     freshCapabilities.remoteTaskCreate === true &&
@@ -7089,6 +7096,63 @@ export async function dispatchNextElasticWorkItem(tx, {
     Array.from(CROSS_DEVICE_RETRY_SAFETY_CODES),
   ]);
   if (!candidate) return null;
+
+  if (candidate.item_type === 'negative_post') {
+    // Archiving uses this same record lock. Acquire it without waiting, then
+    // read triage in a fresh statement so an archive committed while we were
+    // selecting the queue item cannot be hidden by the earlier snapshot.
+    const record = await tx.queryOne(`
+      SELECT id FROM records WHERE tenant_id = $1 AND id = $2
+      FOR UPDATE SKIP LOCKED
+    `, [agent.tenant_id, candidate.record_id]);
+    const existingRecord = record || (candidate.record_id
+      ? await tx.queryOne(`
+          SELECT id FROM records WHERE tenant_id = $1 AND id = $2
+        `, [agent.tenant_id, candidate.record_id])
+      : null);
+    if (!record && existingRecord) {
+      return {deferred: true, reason: 'record_lifecycle_busy', retryAfterMs: 1000};
+    }
+    const lifecycle = record ? await tx.queryOne(`
+        SELECT archived_at FROM record_triage WHERE tenant_id = $1 AND record_id = $2
+      `, [agent.tenant_id, candidate.record_id]) : null;
+    if (!existingRecord || lifecycle?.archived_at) {
+      const skipReason = existingRecord ? 'archived' : 'record_missing';
+      const skipMessage = existingRecord
+        ? '帖子已归档，已跳过巡查'
+        : '原帖子记录已不存在，已跳过巡查';
+      // Invalidate receipts from a prior attempt without changing its history.
+      await tx.execute(`
+        UPDATE capture_task_items
+        SET status = 'skipped', finished_at = now(), updated_at = now(),
+          assignment_revision = assignment_revision + 1,
+          metadata = metadata || jsonb_build_object(
+            'skipReason', $6::text, 'skipMessage', $7::text,
+            'eligibilityCheckedAt', now()::text
+          )
+        WHERE id = $1 AND tenant_id = $2 AND task_id = $3
+          AND status = $4 AND assignment_revision = $5
+      `, [candidate.item_id, agent.tenant_id, candidate.parent_id,
+        candidate.item_status, Number(candidate.assignment_revision || 0),
+        skipReason, skipMessage]);
+      await refreshOrchestrationParentTask(tx, {
+        tenantId: agent.tenant_id, parentTaskId: candidate.parent_id,
+        actorType: 'system', actorName: '云端弹性调度器', eventAgentId: agent.id,
+      });
+      await appendEvent(tx, {
+        tenantId: agent.tenant_id, taskId: candidate.parent_id, agentId: agent.id,
+        eventType: existingRecord
+          ? 'negative_patrol_archived_item_skipped'
+          : 'negative_patrol_missing_record_skipped', actorType: 'system',
+        actorName: '云端弹性调度器', status: 'skipped',
+        message: skipMessage,
+        payload: {itemId: candidate.item_id, recordId: candidate.record_id},
+      });
+      return dispatchNextElasticWorkItemWithinBudget(
+        tx, {agent, capabilities}, remainingSkipBudget - 1,
+      );
+    }
+  }
 
   const parentMetadata = safeJson(candidate.parent_metadata);
   const queueDistributionMode = text(

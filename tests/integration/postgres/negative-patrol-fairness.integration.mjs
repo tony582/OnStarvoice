@@ -22,7 +22,7 @@ test('negative patrol fair claiming uses real PostgreSQL dispatch and durable as
   const {runMigrations} = await import('../../../server/db/migrate.js');
   const {getPool, closePool} = await import('../../../server/db/pool.js');
   const {withTransaction} = await import('../../../server/db/init.js');
-  const {dispatchNextElasticWorkItem} = await import('../../../server/routes/capture-cloud.js');
+  const {dispatchNextElasticWorkItem, projectNegativePatrolSnapshot} = await import('../../../server/routes/capture-cloud.js');
   await runMigrations();
   const pool = getPool();
   t.after(closePool);
@@ -294,4 +294,190 @@ test('negative patrol fair claiming uses real PostgreSQL dispatch and durable as
       assert.equal(claimed.itemId, item.id);
     });
   }
+
+  async function archive(f, items = f.items) {
+    await pool.query(`INSERT INTO record_triage (tenant_id, record_id, archived_at, archived_by_name)
+      SELECT $1, id, now(), 'Integration customer' FROM records WHERE id=ANY($2::uuid[])`,
+    [f.tenant.id, items.map(item => item.record_id)]);
+  }
+
+  await t.test('posts archived after creation all settle without creating browser attempts', async st => {
+    const f = await fixture(st);
+    await archive(f);
+    assert.ok(!(await f.claim())?.commandId);
+    const items = (await pool.query(`SELECT status, attempt_count, assignment_revision, metadata
+      FROM capture_task_items WHERE task_id=$1 ORDER BY ordinal`, [f.parent.id])).rows;
+    assert.ok(items.every(item => item.status === 'skipped' && item.metadata.skipReason === 'archived'));
+    assert.ok(items.every(item => item.attempt_count === 0 && item.assignment_revision === 1));
+    const parent = (await pool.query('SELECT status, counts FROM capture_tasks WHERE id=$1', [f.parent.id])).rows[0];
+    assert.equal(parent.status, 'completed_with_warnings');
+    assert.equal(parent.counts.skipped, 2);
+    const counts = (await pool.query(`SELECT
+      (SELECT count(*)::int FROM capture_agent_commands WHERE tenant_id=$1) AS commands,
+      (SELECT count(*)::int FROM capture_task_item_attempts WHERE tenant_id=$1) AS attempts,
+      (SELECT count(*)::int FROM capture_task_events WHERE tenant_id=$1
+        AND event_type='negative_patrol_archived_item_skipped') AS skip_events`, [f.tenant.id])).rows[0];
+    assert.deepEqual(counts, {commands: 0, attempts: 0, skip_events: 2});
+  });
+
+  await t.test('an archived first post is skipped and the next normal post is dispatched in the same claim', async st => {
+    const f = await fixture(st);
+    await archive(f, [f.items[0]]);
+    const claimed = await f.claim();
+    await f.assertDispatched(claimed, f.agents[0]);
+    assert.equal(claimed.itemId, f.items[1].id);
+    const skipped = (await pool.query(`SELECT status, attempt_count, metadata FROM capture_task_items
+      WHERE id=$1`, [f.items[0].id])).rows[0];
+    assert.equal(skipped.status, 'skipped');
+    assert.equal(skipped.attempt_count, 0);
+    assert.equal(skipped.metadata.skipReason, 'archived');
+    const commandCount = (await pool.query('SELECT count(*)::int AS n FROM capture_agent_commands WHERE tenant_id=$1', [f.tenant.id])).rows[0].n;
+    assert.equal(commandCount, 1);
+  });
+
+  await t.test('a deleted first record is skipped and cannot block the next normal post', async st => {
+    const f = await fixture(st);
+    await pool.query('DELETE FROM records WHERE tenant_id=$1 AND id=$2', [f.tenant.id, f.items[0].record_id]);
+    const claimed = await f.claim();
+    await f.assertDispatched(claimed, f.agents[0]);
+    assert.equal(claimed.itemId, f.items[1].id);
+    const skipped = (await pool.query('SELECT status, record_id, attempt_count, metadata FROM capture_task_items WHERE id=$1', [f.items[0].id])).rows[0];
+    assert.equal(skipped.record_id, null);
+    assert.equal(skipped.status, 'skipped');
+    assert.equal(skipped.attempt_count, 0);
+    assert.equal(skipped.metadata.skipReason, 'record_missing');
+    const counts = (await pool.query(`SELECT
+      (SELECT count(*)::int FROM capture_task_item_attempts WHERE item_id=$1) AS attempts,
+      (SELECT count(*)::int FROM capture_task_events WHERE task_id=$2
+        AND event_type='negative_patrol_missing_record_skipped') AS skip_events`,
+    [f.items[0].id, f.parent.id])).rows[0];
+    assert.deepEqual(counts, {attempts: 0, skip_events: 1});
+  });
+
+  await t.test('archiving a retryable post preserves its existing failure and complete attempt history', async st => {
+    const f = await fixture(st, {itemCount: 1});
+    const first = await f.claim();
+    await f.settle(first);
+    const failure = JSON.stringify({code: 'DETAIL_CAPTURE_TIMEOUT', message: 'Original failure must remain available'});
+    await pool.query(`UPDATE capture_task_item_attempts SET status='failed', error=$2 WHERE execution_task_id=$1`, [first.childTaskId, failure]);
+    await pool.query(`UPDATE capture_tasks SET status='failed', error=$2 WHERE id=$1`, [first.childTaskId, failure]);
+    await pool.query(`UPDATE capture_task_items SET status='retryable', error=$2 WHERE id=$1`, [first.itemId, failure]);
+    await pool.query("UPDATE capture_tasks SET status='running' WHERE id=$1", [f.parent.id]);
+    async function history() {
+      return {
+        attempts: (await pool.query('SELECT *, xmin::text AS row_version FROM capture_task_item_attempts WHERE tenant_id=$1', [f.tenant.id])).rows,
+        commands: (await pool.query('SELECT *, xmin::text AS row_version FROM capture_agent_commands WHERE tenant_id=$1', [f.tenant.id])).rows,
+        child: (await pool.query('SELECT *, xmin::text AS row_version FROM capture_tasks WHERE id=$1', [first.childTaskId])).rows[0],
+      };
+    }
+    const before = await history();
+    await archive(f);
+    assert.ok(!(await f.claim(f.agents[1]))?.commandId);
+    assert.deepEqual(await history(), before);
+    const item = (await pool.query('SELECT status, attempt_count, error, metadata FROM capture_task_items WHERE id=$1', [first.itemId])).rows[0];
+    assert.equal(item.status, 'skipped');
+    assert.equal(item.attempt_count, 1);
+    assert.equal(item.error.code, 'DETAIL_CAPTURE_TIMEOUT');
+    assert.equal(item.metadata.skipReason, 'archived');
+  });
+
+  for (const parentStillPending of [false, true]) {
+    await t.test(`late failed and successful results cannot overwrite an archived skip; remaining work=${parentStillPending}`, async st => {
+      const f = await fixture(st, {itemCount: parentStillPending ? 2 : 1});
+      const first = await f.claim();
+      await f.settle(first);
+      const failure = JSON.stringify({code: 'DETAIL_CAPTURE_TIMEOUT', message: 'Original failed attempt'});
+      await pool.query(`UPDATE capture_task_item_attempts SET status='failed', error=$2 WHERE execution_task_id=$1`, [first.childTaskId, failure]);
+      await pool.query(`UPDATE capture_tasks SET status='failed', error=$2 WHERE id=$1`, [first.childTaskId, failure]);
+      await pool.query(`UPDATE capture_task_items SET status='retryable', error=$2 WHERE id=$1`, [first.itemId, failure]);
+      if (parentStillPending) {
+        // The peer can reconcile the archived retry, but the other item remains
+        // explicitly assigned to the first browser and keeps the parent open.
+        await pool.query(`UPDATE capture_task_items SET metadata=metadata || jsonb_build_object('pinnedAgentId', $2::text)
+          WHERE id=$1`, [f.items[1].id, f.agents[0].id]);
+      }
+      await archive(f, [f.items[0]]);
+      assert.ok(!(await f.claim(f.agents[1]))?.commandId);
+      async function saved() {
+        return {
+          item: (await pool.query('SELECT *, xmin::text AS row_version FROM capture_task_items WHERE id=$1', [first.itemId])).rows[0],
+          attempts: (await pool.query('SELECT *, xmin::text AS row_version FROM capture_task_item_attempts WHERE tenant_id=$1', [f.tenant.id])).rows,
+          commands: (await pool.query('SELECT *, xmin::text AS row_version FROM capture_agent_commands WHERE tenant_id=$1', [f.tenant.id])).rows,
+          child: (await pool.query('SELECT *, xmin::text AS row_version FROM capture_tasks WHERE id=$1', [first.childTaskId])).rows[0],
+        };
+      }
+      const before = await saved();
+      assert.equal(before.item.status, 'skipped');
+      assert.equal(before.item.metadata.skipReason, 'archived');
+      assert.equal(before.item.assignment_revision, before.child.orchestration_revision + 1);
+      const parent = (await pool.query('SELECT status FROM capture_tasks WHERE id=$1', [f.parent.id])).rows[0];
+      assert.equal(parent.status, parentStillPending ? 'pending' : 'completed_with_warnings');
+      for (const status of ['failed', 'completed']) {
+        await withTransaction(tx => projectNegativePatrolSnapshot(tx, f.agents[0], before.child, {
+          status: status === 'failed' ? 'needs_action' : 'completed',
+          targetResults: [{
+            itemId: first.itemId, recordId: f.items[0].record_id, externalId: f.items[0].external_id,
+            ordinal: 0, status, startedAt: '2026-09-08T04:00:00.000Z',
+            finishedAt: '2026-09-08T04:01:00.000Z', error: status === 'failed' ? JSON.parse(failure) : {},
+          }],
+        }));
+        assert.deepEqual(await saved(), before, `late ${status} must not rewrite the skip or its historical execution`);
+      }
+    });
+  }
+
+  await t.test('the negative-only archive check does not change watched-content dispatch', async st => {
+    const f = await fixture(st, {itemCount: 1});
+    await pool.query(`UPDATE capture_tasks SET feature_key='watched_content_patrol',
+      metadata=jsonb_set(metadata, '{workflow}', '"watched_content_patrol"') WHERE id=$1`, [f.parent.id]);
+    await pool.query("UPDATE capture_task_items SET item_type='watched_content' WHERE task_id=$1", [f.parent.id]);
+    await pool.query(`UPDATE capture_agents SET capabilities=capabilities || '{"watchedContentPatrol":true}' WHERE tenant_id=$1`, [f.tenant.id]);
+    await archive(f);
+    const claimed = await f.claim();
+    assert.ok(claimed?.commandId);
+    assert.equal(claimed.itemId, f.items[0].id);
+    const command = (await pool.query('SELECT payload FROM capture_agent_commands WHERE id=$1', [claimed.commandId])).rows[0];
+    assert.equal(command.payload.workflow, 'watched_content_patrol');
+    assert.equal(command.payload.targets.length, 1);
+    assert.equal((await pool.query('SELECT status FROM capture_task_items WHERE id=$1', [claimed.itemId])).rows[0].status, 'dispatched');
+  });
+
+  await t.test('archive reconciliation skips at most ten posts in one claim', async st => {
+    const f = await fixture(st, {itemCount: 11});
+    await archive(f);
+    assert.ok(!(await f.claim())?.commandId);
+    const first = (await pool.query(`SELECT status, count(*)::int AS n FROM capture_task_items
+      WHERE task_id=$1 GROUP BY status ORDER BY status`, [f.parent.id])).rows;
+    assert.deepEqual(first, [{status: 'pending', n: 1}, {status: 'skipped', n: 10}]);
+    assert.ok(!(await f.claim())?.commandId);
+    assert.equal((await pool.query("SELECT count(*)::int AS n FROM capture_task_items WHERE task_id=$1 AND status='skipped'", [f.parent.id])).rows[0].n, 11);
+    assert.equal((await pool.query('SELECT status FROM capture_tasks WHERE id=$1', [f.parent.id])).rows[0].status, 'completed_with_warnings');
+  });
+
+  await t.test('an in-progress customer archive defers the claim until its record transaction commits', async st => {
+    const f = await fixture(st, {itemCount: 1});
+    let releaseArchive;
+    let recordAcquired;
+    const holdArchive = new Promise(resolve => { releaseArchive = resolve; });
+    const ready = new Promise(resolve => { recordAcquired = resolve; });
+    const archiving = withTransaction(async tx => {
+      await tx.queryOne('SELECT id FROM records WHERE id=$1 FOR UPDATE', [f.items[0].record_id]);
+      await tx.execute('INSERT INTO record_triage (tenant_id, record_id, archived_at) VALUES ($1,$2,now())',
+        [f.tenant.id, f.items[0].record_id]);
+      recordAcquired();
+      await holdArchive;
+    });
+    try {
+      await Promise.race([ready, archiving]);
+      const blocked = await f.claim();
+      assert.equal(blocked?.deferred, true);
+      assert.equal(blocked?.reason, 'record_lifecycle_busy');
+    } finally {
+      releaseArchive();
+      await archiving;
+    }
+    assert.ok(!(await f.claim())?.commandId);
+    assert.equal((await pool.query('SELECT status FROM capture_task_items WHERE id=$1', [f.items[0].id])).rows[0].status, 'skipped');
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM capture_agent_commands WHERE tenant_id=$1', [f.tenant.id])).rows[0].n, 0);
+  });
 });
