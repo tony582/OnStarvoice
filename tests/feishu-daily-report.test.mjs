@@ -150,6 +150,51 @@ test('writes checkpoint before each append/merge and completed documents are nev
   assert.equal(h.requests.length, requestCount);
 });
 
+test('new empty Feishu document with only its page root and omitted children accepts the complete report', async () => {
+  const saved = savedProgress();
+  let emptyReads = 0;
+  const h = harness({ after(request, { blocks, response }) {
+    if (request.method !== 'GET' || !request.url.pathname.endsWith('/blocks') || blocks.length !== 1) return response;
+    emptyReads++;
+    // Actual create-then-list response shape: one page root, no children property.
+    return ok({ has_more: false, items: [{ block_id: 'doc_one', block_type: 1, parent_id: '',
+      page: { elements: [{ text_run: { content: '客户验收测试日报', text_element_style: {
+        bold: false, inline_code: false, italic: false, strikethrough: false, underline: false,
+      } } }], style: { align: 1 } } }] });
+  } });
+  const result = await h.client.writeDocument({ documentId: 'doc_one', snapshot: snapshot(), onProgress: saved.save });
+  assert.equal(emptyReads, 2); // Initial inventory and the read immediately before the first append.
+  assert.deepEqual(result.baseRootIds, []);
+  assert.equal(result.done, true);
+  assert.equal(result.completed.filter(step => step.key.startsWith('merge:')).length, 6);
+  assert.equal(mutations(h).length, 7);
+  assert.ok(h.blocks.some(block => block.block_type === 31));
+});
+
+test('an absent or malformed root is not mistaken for the empty-document response', async t => {
+  const root = { block_id: 'doc_one', block_type: 1 };
+  const cases = [
+    ['missing root', []],
+    ['different document root', [{ block_id: 'doc_other', block_type: 1 }]],
+    ['wrong root type', [{ block_id: 'doc_one', block_type: 2 }]],
+    ['null children', [{ ...root, children: null }]],
+    ['object children', [{ ...root, children: {} }]],
+    ['string children', [{ ...root, children: '' }]],
+    ['boolean children', [{ ...root, children: false }]],
+    ['omitted children with another block', [root, { block_id: 'existing_text', block_type: 2 }]],
+  ];
+  for (const [label, items] of cases) await t.test(label, async () => {
+    const h = harness({ before(request) {
+      if (request.method === 'GET' && request.url.pathname.endsWith('/blocks')) return ok({ items, has_more: false });
+    } });
+    const saved = savedProgress();
+    await assert.rejects(h.client.writeDocument({ documentId: 'doc_one', snapshot: snapshot(), onProgress: saved.save }),
+      error => error.code === 'FEISHU_RESULT_UNKNOWN' && error.ambiguous === true);
+    assert.equal(mutations(h).length, 0);
+    assert.equal(saved.get(), undefined);
+  });
+});
+
 test('failed pre-write checkpoint performs no remote mutation and redacts callback details', async () => {
   const h = harness();
   await assert.rejects(h.client.writeDocument({ documentId: 'doc_one', snapshot: snapshot(), onProgress: async () => { throw new Error('private db details'); } }),

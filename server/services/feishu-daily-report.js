@@ -188,6 +188,8 @@ function shape(blockId, map, depth = 0) {
 }
 function rootIds(blocks, documentId) {
   const root = blocks.find(block => block.block_id === documentId && block.block_type === 1);
+  // Feishu omits children on a newly created document containing only its page root.
+  if (root && blocks.length === 1 && !Object.hasOwn(root, 'children')) return [];
   if (!root || !Array.isArray(root.children)) throw uncertain('无法读取飞书文档根节点，未继续写入');
   return root.children;
 }
