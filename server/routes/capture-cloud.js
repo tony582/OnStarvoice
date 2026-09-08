@@ -6633,6 +6633,120 @@ export async function mirrorTaskSnapshot(
   return task;
 }
 
+// Idle browsers poll once a minute, while a completing browser reports sooner.
+// Give less-used peers one polling window to claim fresh posts before allowing
+// the same browser to take over again. The deadline is anchored to an actual
+// assignment, never extended by heartbeats or unsuccessful claim attempts.
+const NEGATIVE_PATROL_FAIR_CLAIM_WINDOW_MS = 90 * 1000;
+
+async function negativePatrolFairClaimWait(tx, {agent, candidate, resourcePolicy}) {
+  const metadata = safeJson(candidate.parent_metadata);
+  if (
+    candidate.item_type !== 'negative_post' ||
+    metadata.distributionMode !== 'elastic_pool' ||
+    candidate.item_status !== 'pending' ||
+    Number(candidate.attempt_count) > 0 ||
+    text(safeJson(candidate.item_metadata).pinnedAgentId, 100)
+  ) return null;
+  const eligibleIds = captureResourceAgentIds({eligibleAgentIds: metadata.eligibleAgentIds});
+  if (eligibleIds.length < 2) return null;
+  const platform = candidate.item_platform || candidate.parent_platform;
+  const usage = await tx.queryAll(`
+    SELECT attempt.agent_id, COUNT(*)::integer AS assignments,
+      MAX(attempt.assigned_at) AS last_assigned_at
+    FROM capture_task_item_attempts attempt
+    JOIN capture_task_items item ON item.id = attempt.item_id
+      AND item.tenant_id = attempt.tenant_id
+    WHERE attempt.tenant_id = $1 AND attempt.parent_task_id = $2
+      AND item.platform = $3
+    GROUP BY attempt.agent_id
+  `, [agent.tenant_id, candidate.parent_id, platform]);
+  const currentAssignments = Number(usage.find(row => row.agent_id === agent.id)?.assignments || 0);
+  if (currentAssignments === 0) return null;
+  const lastAssignedAt = Math.max(0, ...usage.map(row => new Date(row.last_assigned_at).getTime() || 0));
+  const remainingMs = lastAssignedAt + NEGATIVE_PATROL_FAIR_CLAIM_WINDOW_MS - Date.now();
+  if (remainingMs <= 0) return null;
+  const lessUsedIds = eligibleIds.filter(id => id !== agent.id &&
+    Number(usage.find(row => row.agent_id === id)?.assignments || 0) < currentAssignments);
+  if (lessUsedIds.length === 0) return null;
+  // Do not lock peer Agent rows: each heartbeat already holds its own Agent
+  // lock before acquiring this parent lock. Locking peers would invert that
+  // order. Freshness and the finite deadline provide the fallback instead.
+  const peers = await tx.queryAll(`
+    SELECT peer.*, recovery.status AS recovery_status,
+      recovery.error AS recovery_error, recovery.checkpoint AS recovery_checkpoint,
+      recovery.finished_at AS recovery_finished_at,
+      recovery.updated_at AS recovery_updated_at,
+      recovery.created_at AS recovery_created_at,
+      recovery.execution_finished_at AS recovery_execution_finished_at
+    FROM capture_agents peer
+    JOIN tenants tenant ON tenant.id = peer.tenant_id AND tenant.status = 'active'
+    JOIN auth_codes code ON code.id = peer.auth_code_id
+      AND code.tenant_id = peer.tenant_id AND code.status = 'active'
+      AND (code.expires_at IS NULL OR code.expires_at > now())
+    JOIN auth_bindings binding ON binding.id = peer.auth_binding_id AND binding.code_id = code.id
+    LEFT JOIN LATERAL (
+      SELECT attempt.status, attempt.error, attempt.checkpoint,
+        attempt.finished_at, attempt.updated_at, attempt.created_at,
+        execution.finished_at AS execution_finished_at
+      FROM capture_task_item_attempts attempt
+      JOIN capture_tasks parent ON parent.id = attempt.parent_task_id AND parent.tenant_id = attempt.tenant_id
+      LEFT JOIN capture_tasks execution ON execution.id = attempt.execution_task_id AND execution.tenant_id = attempt.tenant_id
+      WHERE attempt.tenant_id = peer.tenant_id AND attempt.agent_id = peer.id
+        AND attempt.status IN ('retryable', 'needs_action', 'failed')
+        AND attempt.updated_at > now() - interval '30 minutes'
+        AND (parent.metadata->>'distributionMode' = 'elastic_pool'
+          OR (parent.metadata->>'workflow' = 'negative_post_patrol' AND parent.metadata->>'perItemAdmissionV1' = 'true'))
+      ORDER BY COALESCE(attempt.finished_at, execution.finished_at, attempt.created_at) DESC, attempt.id DESC
+      LIMIT 1
+    ) recovery ON true
+    WHERE peer.tenant_id = $1 AND peer.id = ANY($2::uuid[]) AND peer.status = 'active'
+      AND EXISTS (
+        SELECT 1 FROM capture_agent_tokens token
+        WHERE token.agent_id = peer.id AND token.auth_code_id = peer.auth_code_id
+          AND token.auth_binding_id = peer.auth_binding_id AND token.revoked_at IS NULL
+      )
+      AND COALESCE(peer.last_full_heartbeat_at, peer.last_heartbeat_at) > now() - interval '2 minutes'
+      AND peer.capabilities->>'taskStateKnown' IS DISTINCT FROM 'false'
+      AND peer.capabilities @> '{"remoteTaskCreate":true,"remoteTargetedPostCaptureV1":true,"negativePostPatrol":true,"negativePatrolTerminalReceiptV1":true}'::jsonb
+      AND (cardinality(peer.allowed_platforms) = 0 OR $3 = ANY(peer.allowed_platforms))
+      AND NOT EXISTS (
+        SELECT 1 FROM capture_tasks busy
+        WHERE busy.tenant_id = peer.tenant_id
+          AND COALESCE(busy.assigned_agent_id, busy.origin_agent_id) = peer.id
+          AND busy.task_type <> 'capture_orchestration' AND busy.status = ANY($4::text[])
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM capture_agent_commands command
+        WHERE command.tenant_id = peer.tenant_id AND command.agent_id = peer.id
+          AND command.status IN ('pending', 'acknowledged')
+          AND (command.expires_at IS NULL OR command.expires_at > now())
+      )
+    ORDER BY peer.id
+  `, [agent.tenant_id, lessUsedIds, platform, CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES]);
+  for (const peer of peers) {
+    const capabilities = safeJson(peer.capabilities);
+    const supported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
+    if (supported.length > 0 && !supported.includes(platform)) continue;
+    if (Array.isArray(safeJson(metadata.planSnapshot).searchPasses) && metadata.planSnapshot.searchPasses.length > 1 && capabilities.remoteSequentialSearchPassesV1 !== true) continue;
+    if (safeJson(candidate.item_metadata).singleRelayV1 === true && capabilities.singleRelayV1 !== true) continue;
+    if (safeJson(safeJson(metadata.planSnapshot).recoveryPolicy).singleRelayV1 === true && capabilities.singleRelayV1 !== true) continue;
+    if (elasticRecoveryHoldRemainingMs({
+      status: peer.recovery_status, error: peer.recovery_error,
+      checkpoint: peer.recovery_checkpoint, finished_at: peer.recovery_finished_at,
+      updated_at: peer.recovery_updated_at, created_at: peer.recovery_created_at,
+      execution_finished_at: peer.recovery_execution_finished_at,
+    }) > 0) continue;
+    const admission = await reserveCaptureResourceAdmission(tx, {
+      tenantId: agent.tenant_id, parentTaskId: candidate.parent_id,
+      agent: peer, platform, resourcePolicy, expectedSearches: 0,
+    });
+    if (!admission.allowed) continue;
+    return {deferred: true, reason: 'negative_patrol_fair_turn', retryAfterMs: Math.min(10000, Math.ceil(remainingMs))};
+  }
+  return null;
+}
+
 export async function dispatchNextElasticWorkItem(tx, {
   agent,
   capabilities = {},
@@ -7009,6 +7123,10 @@ export async function dispatchNextElasticWorkItem(tx, {
   });
   if (!resourceAdmission.allowed) return null;
   if (negativePost) {
+    const fairWait = await negativePatrolFairClaimWait(tx, {
+      agent, candidate, resourcePolicy: planSnapshot.resourcePolicy,
+    });
+    if (fairWait) return fairWait;
     const patrolAdmission = await reserveNegativePatrolFirstAdmission(tx, {
       tenantId: agent.tenant_id,
     });
