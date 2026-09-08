@@ -58,12 +58,12 @@ function validFeishuBase(value) {
   } catch { return false; }
 }
 
-export function validateDailyConfig(config, {send = false} = {}) {
+export function validateDailyConfig(config, {send = false, automatic = false} = {}) {
   if (!config.appId || !config.appSecretEncrypted || !config.folderToken || !validFeishuBase(config.documentBaseUrl)) {
     throw dailyError('请配置飞书应用、密钥、日报目标目录和文档域名。');
   }
   if (!config.editorId || !['email','openid','openchat'].includes(config.editorType)) throw dailyError('请指定客户编辑者或客户协作群。');
-  if (send && !config.customerEditVerified) throw dailyError('请先用客户账号完成一次编辑、保存和留存测试，再启用群发送。');
+  if (automatic && !config.customerEditVerified) throw dailyError('开启自动发送前，请先用客户账号确认文档可以编辑、保存和留存。',400,'daily_customer_edit_verification_required');
   if (send && config.channel === 'app' && !config.chatId) throw dailyError('请填写接收日报的飞书群 ID。');
   if (send && config.channel === 'webhook' && (!config.webhookUrlEncrypted || !config.webhookSecretEncrypted)) throw dailyError('请配置群机器人的 Webhook 和签名密钥。');
 }
@@ -99,7 +99,7 @@ export function mergeDailyConfig(existing = {}, patch, tenantId, env) {
   }
   const ownershipFields = ['appId','folderToken','documentBaseUrl','editorType','editorId'];
   if (ownershipFields.some(key => next[key] !== existing[key])) next.customerEditVerified = false;
-  if (next.autoEnabled) validateDailyConfig(next, {send:true});
+  if (next.autoEnabled) validateDailyConfig(next, {send:true,automatic:true});
   return next;
 }
 

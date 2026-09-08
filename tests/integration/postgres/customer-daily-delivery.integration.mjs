@@ -582,6 +582,82 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
     assert.equal(f.counts('write'), 1);
   });
 
+  await t.test('explicit manual sending does not fabricate customer acceptance and still verifies permissions', async subtest => {
+    const f = await fixture(subtest, { configured: false });
+    await f.service.saveSettings(f.tenantId, CONFIG);
+    assert.equal((await f.rawConfig()).config.customerEditVerified, false);
+    const report = await f.service.generate(f.tenantId);
+    await Promise.all([
+      f.service.enqueue(f.tenantId, report.id, { send: true }),
+      f.service.enqueue(f.tenantId, report.id, { send: true }),
+    ]);
+    await f.service.processDue();
+    assert.equal((await f.service.report(f.tenantId, report.id)).delivery.status, 'sent');
+    assert.equal(f.counts('create'), 1);
+    assert.equal(f.counts('grant'), 1);
+    assert.equal(f.counts('verify'), 1);
+    assert.equal(f.counts('send'), 1);
+    assert.deepEqual(f.calls.filter(call => ['grant','verify','send'].includes(call.type)).map(call => call.type), ['grant','verify','send']);
+    await f.service.enqueue(f.tenantId, report.id, { send: true });
+    await f.restart().processDue();
+    assert.equal(f.counts('send'), 1, 'Repeated explicit requests must not duplicate the group message');
+    const config = (await f.rawConfig()).config;
+    assert.equal(config.customerEditVerified, false);
+    assert.equal(config.autoEnabled, false);
+  });
+
+  await t.test('unverified manual delivery never sends when either permission grant or final verification fails', async subtest => {
+    for (const phase of ['grant', 'verify']) {
+      const f = await fixture(subtest, { configured: false });
+      await f.service.saveSettings(f.tenantId, CONFIG);
+      const report = await f.service.generate(f.tenantId);
+      if (phase === 'verify') {
+        await f.service.enqueue(f.tenantId, report.id);
+        await f.service.processDue();
+        assert.equal((await f.service.report(f.tenantId, report.id)).delivery.status, 'document_ready');
+      }
+      f.failures[phase] = [new FeishuDailyError('FEISHU_PERMISSION_REQUIRED', '客户编辑或留存权限验证失败', { needsAttention: true })];
+      await f.service.enqueue(f.tenantId, report.id, { send: true });
+      await f.service.processDue();
+      const current = await f.service.report(f.tenantId, report.id);
+      assert.equal(current.delivery.status, 'needs_attention');
+      assert.match(current.delivery.error, /权限验证失败/);
+      assert.equal((await f.service.list(f.tenantId))[0].delivery.status, 'needs_attention', 'A blocked document must take precedence over a still-queued message');
+      assert.equal(f.counts('send'), 0);
+      await f.restart().processDue();
+      assert.equal(f.counts('send'), 0);
+      assert.equal((await f.rawConfig()).config.customerEditVerified, false);
+    }
+  });
+
+  await t.test('customer acceptance remains required to enable or enqueue automatic sending', async subtest => {
+    const f = await fixture(subtest, { configured: false });
+    await f.service.saveSettings(f.tenantId, CONFIG);
+    const report = await f.service.generate(f.tenantId);
+    await assert.rejects(f.service.saveSettings(f.tenantId, { autoEnabled: true }), { code: 'daily_customer_edit_verification_required' });
+    await assert.rejects(f.service.enqueue(f.tenantId, report.id, { send: true, automatic: true }), { code: 'daily_customer_edit_verification_required' });
+    assert.equal((await f.rawConfig()).config.autoEnabled, false);
+    assert.equal((await f.rawConfig()).config.customerEditVerified, false);
+    assert.equal(Number((await db.queryOne('SELECT count(*) FROM customer_daily_documents WHERE tenant_id=$1', [f.tenantId])).count), 0);
+    assert.equal(Number((await db.queryOne('SELECT count(*) FROM customer_daily_deliveries WHERE tenant_id=$1', [f.tenantId])).count), 0);
+    assert.equal(f.calls.length, 0);
+  });
+
+  await t.test('an already-queued automatic message with unverified frozen configuration is blocked again by the worker', async subtest => {
+    const f = await fixture(subtest, { configured: false });
+    await f.service.saveSettings(f.tenantId, CONFIG);
+    const report = await f.service.generate(f.tenantId);
+    await f.service.enqueue(f.tenantId, report.id, { send: true });
+    // Simulate a legacy or interrupted automatic queue entry to exercise the
+    // worker boundary independently from the enqueue/configuration boundaries.
+    await db.execute('UPDATE customer_daily_deliveries SET automatic=true WHERE tenant_id=$1 AND report_id=$2', [f.tenantId, report.id]);
+    await f.service.processDue();
+    assert.equal(f.counts('send'), 0);
+    assert.equal(f.counts('verify'), 0);
+    assert.match((await f.service.report(f.tenantId, report.id)).delivery.error, /自动发送前/);
+    assert.equal((await f.rawConfig()).config.customerEditVerified, false);
+  });
+
   await t.test('tenant report/config isolation and composite delivery foreign keys hold', async subtest => {
     const a = await fixture(subtest);
     const b = await fixture(subtest);

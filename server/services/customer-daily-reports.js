@@ -185,7 +185,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     const row = await db.queryOne('SELECT snapshot,mode,version,report_date::text AS report_date FROM customer_daily_reports WHERE tenant_id=$1 AND id=$2', [tenantId,id]);
     if (!row) throw dailyError('日报不存在',404);
     const config = explicitConfig || await rawConfig(tenantId);
-    validateDailyConfig(config,{send});
+    validateDailyConfig(config,{send,automatic});
     if (!allowIncomplete && row.snapshot.warnings?.some(w => w.blocking)) throw dailyError('日报仍有待同步或待识别内容，请生成新版，或明确选择按当前数据交付。',409,'daily_data_incomplete');
     const resolved = resolvedDailyConfig(config,tenantId,env);
     const targetKey = dailyTargetKey(resolved);
@@ -282,7 +282,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     if (!row) return false;
     try {
       const data = await db.queryOne('SELECT r.snapshot,d.document_id,d.document_url,d.progress,d.config AS document_config FROM customer_daily_reports r JOIN customer_daily_documents d ON d.report_id=r.id AND d.tenant_id=r.tenant_id WHERE r.tenant_id=$1 AND r.id=$2',[row.tenant_id,row.report_id]);
-      validateDailyConfig(row.config,{send:true});
+      validateDailyConfig(row.config,{send:true,automatic:row.automatic});
       if (['editorType','editorId'].some(key => data.document_config[key] !== row.config[key])) throw dailyError('当前接收方与文档已授权客户不同，请先完成新接收方的文档交付配置。',409,'daily_document_owner_changed');
       const documentClient = clientFactory(await executionConfig(data.document_config,row.tenant_id));
       // Read permissions again immediately before each delivery; a prior success is not perpetual access.

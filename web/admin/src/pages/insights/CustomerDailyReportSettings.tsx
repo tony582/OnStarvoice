@@ -105,7 +105,7 @@ export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
       </fieldset>
       <div className="rounded-lg bg-blue-50/70 p-4">
         <label className="flex items-start gap-2.5 text-sm text-slate-800"><input type="checkbox" className="mt-1 accent-blue-600" checked={form.customerEditVerified} disabled={saving} onChange={e => update('customerEditVerified', e.target.checked)} />
-          <span>已用客户账号验证：能修改正文和表格、保存，并按约定下载或留存副本。<small className="mt-1 block text-xs leading-6 text-slate-500">首次接入或权限变化时验证一次，日常无需客户先编辑再发送。若客户禁止编辑外部文档，请使用客户组织内的接入方式。</small></span>
+          <span>开启自动发送前已用客户账号验证：能修改正文和表格、保存，并按约定下载或留存副本。<small className="mt-1 block text-xs leading-6 text-slate-500">此项用于开启自动发送，手动生成文档或发送无需勾选；系统仍会检查文档编辑权限。首次接入或权限变化时验证一次。</small></span>
         </label>
       </div>
       <fieldset disabled={saving} className="grid gap-4 sm:grid-cols-2">

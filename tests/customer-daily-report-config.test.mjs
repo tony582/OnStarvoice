@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mergeDailyConfig,publicDailyConfig,resolvedDailyConfig,sealDailySecret,openDailySecret,nextDailySendAt,dailyTargetKey} from '../server/services/customer-daily-report-config.js';
+import {mergeDailyConfig,publicDailyConfig,resolvedDailyConfig,sealDailySecret,openDailySecret,nextDailySendAt,dailyTargetKey,validateDailyConfig} from '../server/services/customer-daily-report-config.js';
 import {buildCustomerDailyMetricEvidence,observationPayloadWithDailyEvidence} from '../server/services/customer-daily-metric-evidence.js';
 const env = {CUSTOMER_DAILY_REPORT_ENCRYPTION_KEY:'a1'.repeat(32)};
 
@@ -37,6 +37,17 @@ test('Feishu targets reject unsafe origins and use stable per-group message iden
   for(const webhookUrl of ['http://open.feishu.cn/open-apis/bot/v2/hook/abc','https://127.0.0.1/hook','https://open.feishu.cn/open-apis/bot/v2/hook/abc?token=hidden']) assert.throws(()=>mergeDailyConfig({}, {webhookUrl},'t',env));
   assert.equal(dailyTargetKey({channel:'app',appId:'a',chatId:'b'}),dailyTargetKey({channel:'app',appId:'a',chatId:'b'}));
   assert.notEqual(dailyTargetKey({channel:'app',appId:'a',chatId:'b'}),dailyTargetKey({channel:'app',appId:'a',chatId:'c'}));
+});
+
+test('manual delivery can verify live permissions before customer acceptance while automatic delivery requires acceptance', () => {
+  const config=mergeDailyConfig({}, {appId:'cli_test',appSecret:'secret',folderToken:'folder',documentBaseUrl:'https://example.feishu.cn',editorType:'openchat',editorId:'oc_editor',chatId:'oc_chat'},'tenant',env);
+  assert.equal(config.customerEditVerified,false);
+  assert.doesNotThrow(()=>validateDailyConfig(config,{send:true}));
+  assert.throws(()=>validateDailyConfig(config,{send:true,automatic:true}),{code:'daily_customer_edit_verification_required'});
+  assert.throws(()=>mergeDailyConfig(config,{autoEnabled:true},'tenant',env),{code:'daily_customer_edit_verification_required'});
+  assert.throws(()=>validateDailyConfig({...config,chatId:''},{send:true}),/群 ID/);
+  assert.throws(()=>validateDailyConfig({...config,editorId:''},{send:true}),/编辑者/);
+  assert.throws(()=>validateDailyConfig({...config,appSecretEncrypted:''},{send:true}),/密钥/);
 });
 
 test('automatic send starts with next Shanghai occurrence and handles month/year edges', () => {
