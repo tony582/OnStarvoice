@@ -884,9 +884,7 @@ export function NegativePatrolTaskCreator({
     await runSubmission(freshSubmission, false)
   }
 
-  const disabled = !writable
-    || selectedPlatforms.length === 0
-    || submissionLocked
+  const disabled = !writable || submissionLocked
   const submitDisabled = submissionBusy || !writable || (!submission && (
     loadedSubmissionScope !== scopeKey
     || !scopeKey
@@ -924,22 +922,30 @@ export function NegativePatrolTaskCreator({
               className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-primary disabled:opacity-60" />
           </label>
           <fieldset className="block text-xs font-medium text-muted-foreground">
-            <legend>执行平台</legend>
-            <div className="mt-1.5 grid h-10 grid-cols-2 gap-1 rounded-lg bg-muted p-0.5">
+            <legend>执行平台（可多选）</legend>
+            <div className="mt-1.5 grid grid-cols-2 gap-2">
               {availablePlatforms.map(value => {
                 const checked = selectedPlatforms.includes(value)
                 return (
-                  <button key={value} type="button" aria-pressed={checked} disabled={disabled}
-                    onClick={() => {
-                      setPlatforms(current => checked ? current.filter(item => item !== value) : [...current, value])
-                      clearPreview()
-                    }}
-                    className={`rounded-md px-2 text-xs font-semibold transition-colors ${checked ? 'bg-background text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
-                    {PLATFORM_LABELS[value] || value}
-                  </button>
+                  <label key={value}
+                    className={`flex min-h-11 items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition-colors ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'} ${checked ? 'border-primary bg-primary/5 text-primary' : 'border-border bg-background text-foreground'}`}>
+                    <input type="checkbox" checked={checked} disabled={disabled}
+                      onChange={event => {
+                        const nextChecked = event.target.checked
+                        setPlatforms(current => nextChecked ? [...current, value] : current.filter(item => item !== value))
+                        clearPreview()
+                      }}
+                      className="h-4 w-4 shrink-0 accent-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" />
+                    <span>{PLATFORM_LABELS[value] || value}</span>
+                  </label>
                 )
               })}
             </div>
+            <p role="status" className={`mt-1.5 text-xs leading-5 ${selectedPlatforms.length > 0 ? 'text-foreground' : 'text-status-red'}`}>
+              {selectedPlatforms.length > 0
+                ? `已选：${selectedPlatforms.map(value => PLATFORM_LABELS[value] || value).join('、')}`
+                : '尚未选择平台，请至少勾选一个'}
+            </p>
           </fieldset>
           <div className="block text-xs font-medium text-muted-foreground">
             预览与下发上限
@@ -981,7 +987,7 @@ export function NegativePatrolTaskCreator({
 
         <div className="flex items-center justify-between gap-3 border-t border-border/70 bg-muted/25 px-4 py-3 sm:px-5">
           <p className="text-[11px] leading-4 text-muted-foreground">{stableInitialIds.length > 0 ? '已带入当前勾选清单；系统仍会校验负面状态与原帖定位。' : '筛选只用于圈定对象；Extension 会逐条打开原帖并补采最新详情。'}</p>
-          <Button type="button" variant="outline" size="sm" onClick={() => preview({recordIds: stableInitialIds})} disabled={disabled || previewing} className="shrink-0">
+          <Button type="button" variant="outline" size="sm" onClick={() => preview({recordIds: stableInitialIds})} disabled={disabled || selectedPlatforms.length === 0 || previewing} className="shrink-0">
             {previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : previewed ? <RefreshCw className="h-4 w-4" /> : <Search className="h-4 w-4" />}
             {previewed ? '重新加载' : stableInitialIds.length > 0 ? '加载清单' : '预览候选'}
           </Button>
