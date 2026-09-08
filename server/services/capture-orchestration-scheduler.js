@@ -9,6 +9,10 @@ import {
   normalizeCaptureAgentPlatforms,
   normalizeRemoteTaskInput,
 } from './capture-cloud.js';
+import {
+  loadUnattendedNegativePatrolCandidates,
+  normalizeUnattendedNegativePatrolScope,
+} from './unattended-negative-patrol.js';
 
 export const SCHEDULE_OVERLAP_RUN_STATUSES = Object.freeze([
   'pending',
@@ -276,6 +280,46 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     return {kind: 'skipped_late', scheduleId: schedule.id, ...advanced};
   }
 
+  // Unclaimed optional revisits belong to this occurrence's spare capacity.
+  // At the next occurrence, leave an audit trail and let the persisted
+  // rotation choose them again inside the new window. They must not suppress
+  // every future keyword run while no compatible browser is available.
+  const rolledItems = await tx.queryAll(`
+    UPDATE capture_task_items item SET status = 'skipped', finished_at = now(),
+      assignment_revision = assignment_revision + 1, updated_at = now(),
+      metadata = item.metadata || jsonb_build_object('skipReason', 'next_run_rollover')
+    FROM capture_tasks run
+    WHERE run.id = item.task_id AND run.tenant_id = item.tenant_id
+      AND run.tenant_id = $1 AND run.orchestration_schedule_id = $2
+      AND run.id <> $3 AND run.scheduled_for < $4
+      AND run.status IN ('pending', 'running', 'needs_action')
+      AND item.metadata->>'unattendedNegativePatrol' = 'true'
+      AND item.status IN ('pending', 'retryable')
+      AND NOT EXISTS (SELECT 1 FROM capture_tasks child
+        WHERE child.tenant_id = item.tenant_id AND child.id = item.execution_task_id
+          AND child.status = ANY($5::text[]))
+      AND NOT EXISTS (SELECT 1 FROM capture_agent_commands command
+        WHERE command.tenant_id = item.tenant_id AND command.task_id = item.execution_task_id
+          AND command.status IN ('pending', 'acknowledged'))
+    RETURNING item.task_id
+  `, [schedule.tenant_id, schedule.id, schedule.template_task_id,
+    schedulerNow.toISOString(), SCHEDULE_OVERLAP_RUN_STATUSES]);
+  for (const parentId of new Set(rolledItems.map(item => item.task_id))) {
+    const oldItems = await tx.queryAll(`SELECT status FROM capture_task_items
+      WHERE tenant_id = $1 AND task_id = $2`, [schedule.tenant_id, parentId]);
+    const aggregate = aggregateParentTaskItems(oldItems);
+    if (aggregate.terminal) await tx.execute(`UPDATE capture_tasks
+      SET status = $3, counts = $4::jsonb, progress = $5::jsonb,
+        finished_at = now(), updated_at = now(),
+        message = '上一轮未领取的负面巡查已留档，下一轮按新范围接续轮查'
+      WHERE tenant_id = $1 AND id = $2
+        AND NOT EXISTS (SELECT 1 FROM capture_tasks child
+          WHERE child.tenant_id = $1 AND child.parent_task_id = $2
+            AND child.status = ANY($6::text[]))`,
+    [schedule.tenant_id, parentId, aggregate.status, JSON.stringify(aggregate.counts),
+      JSON.stringify(aggregate.progress), SCHEDULE_OVERLAP_RUN_STATUSES]);
+  }
+
   const overlapping = await tx.queryOne(`
     SELECT run.id
     FROM capture_tasks run
@@ -425,7 +469,22 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     schedule.platform === 'douyin' &&
     searchPasses.length > 1
   );
-  const runItemTotal = templateItems.length;
+  const negativePatrolScope = object(planSnapshot.negativePatrol).enabled === true &&
+      distributionMode === 'elastic_pool'
+    ? normalizeUnattendedNegativePatrolScope({
+        tenantId: schedule.tenant_id,
+        platforms: [schedule.platform],
+        keywords: templateItems.map(item => item.keyword),
+        runStartedAt: schedulerNow.toISOString(),
+        timezone: schedule.timezone || 'Asia/Shanghai',
+      })
+    : null;
+  const negativePatrol = negativePatrolScope
+    ? await loadUnattendedNegativePatrolCandidates(tx, {
+        ...negativePatrolScope, persistCandidates: true,
+      })
+    : null;
+  const runItemTotal = templateItems.length + (negativePatrol?.candidates.length || 0);
   const elasticScheduleAgents = distributionMode === 'elastic_pool'
     ? await tx.queryAll(`
         SELECT agent_id
@@ -478,6 +537,12 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     claimUnit: distributionMode === 'elastic_pool' ? 'keyword' : 'fixed_batch',
     executionMode: 'one_time',
     planSnapshot,
+    ...(negativePatrol ? {
+      negativePatrolRun: {
+        ...negativePatrolScope,
+        summary: negativePatrol.summary,
+      },
+    } : {}),
     ...(sequentialSearchEnabled
       ? {
           sequentialSearch: {
@@ -586,6 +651,39 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
               requireVerifiedFilters: true,
             }
           : {}),
+      }),
+    ]);
+    runItems.push(item);
+  }
+
+  for (const [index, candidate] of (negativePatrol?.candidates || []).entries()) {
+    const item = await tx.queryOne(`
+      INSERT INTO capture_task_items (
+        id, tenant_id, task_id, item_key, ordinal, keyword, platform,
+        item_type, record_id, external_id, url_snapshot, status, metadata
+      ) VALUES (
+        $1, $2, $3, $4, $5, '', $6,
+        'negative_post', $7, $8, $9, 'pending', $10::jsonb
+      ) RETURNING *
+    `, [
+      crypto.randomUUID(), schedule.tenant_id, runTaskId,
+      `negative:${candidate.platform}:${candidate.externalId}`,
+      templateItems.length + index, candidate.platform,
+      candidate.recordId, candidate.externalId, candidate.url,
+      JSON.stringify({
+        unattendedNegativePatrol: true,
+        sourceRecord: candidate.sourceRecord,
+        baseline: candidate.baseline,
+        cadenceDays: candidate.cadenceDays,
+        lastSuccessAt: candidate.lastSuccessAt || null,
+        nextDueDate: candidate.nextDueDate || null,
+        dueReason: candidate.dueReason,
+        // A revisit must open the original post, even when keyword capture
+        // uses skip-known-content optimizations. Do not copy those settings.
+        captureSettings: {
+          skipAlreadyCapturedOnDetailCapture: false,
+          autoSyncAfterDetailCapture: true,
+        },
       }),
     ]);
     runItems.push(item);

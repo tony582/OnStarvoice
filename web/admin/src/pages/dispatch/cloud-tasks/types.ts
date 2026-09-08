@@ -6,6 +6,8 @@ export type OrchestrationLaunchIntent = {
   agentIds: string[]
   lockExecutionMode?: boolean
   minimumAgentCount?: number
+  initialNegativePatrolEnabled?: boolean
+  lockAgentSelection?: boolean
 }
 
 // CaptureEnhancementSettings 统一以 lib.ts 的定义为准（字段全可选），此处仅 re-export 保持既有 import 兼容。
@@ -225,6 +227,8 @@ export type OrchestrationComposerDrawerProps = {
   lockExecutionMode?: boolean
   /** 多节点入口要求平台兼容过滤后仍保留至少两个节点；直接入口仍可使用一个。 */
   minimumAgentCount?: number
+  initialNegativePatrolEnabled?: boolean
+  lockAgentSelection?: boolean
   /** 兼容直接打开编排器时的预选节点；统一向导的多节点链路不再提前选节点。 */
   initialAgentIds?: string[]
   /** 传入已发布的云端计划详情时，复用同一配置器编辑原计划，不创建新计划。 */

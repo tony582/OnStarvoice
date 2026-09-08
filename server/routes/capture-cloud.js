@@ -42,6 +42,11 @@ import {
 } from '../services/capture-attention-notifier.js';
 import {getTenantAiAdmissionSnapshot} from '../services/ai-admission.js';
 import {
+  claimUnattendedNegativePatrolItem,
+  completeUnattendedNegativePatrolItem,
+  failUnattendedNegativePatrolItem,
+} from '../services/unattended-negative-patrol.js';
+import {
   processSocialAccountHeartbeat,
 } from '../services/social-account-usage.js';
 import {
@@ -546,6 +551,10 @@ const EXPLICIT_USER_CANCELLATION_CODES = new Set([
   'USER_CANCEL_REQUESTED',
 ]);
 const CROSS_DEVICE_RETRY_MESSAGES = Object.freeze({
+  retry_items_managed_by_elastic_dispatcher: [
+    'retry_items_managed_by_elastic_dispatcher',
+    '请在本轮负面巡查列表中恢复失败巡查，系统会按逐帖队列重新核对并派发',
+  ],
   task_not_found: ['task_not_found', '任务不存在'],
   task_cross_device_retry_unsupported: [
     'task_cross_device_retry_unsupported',
@@ -4342,7 +4351,7 @@ async function refreshOrchestrationParentTask(tx, {
   const reportedBusinessProgressAt = orchestrationCheckpointTimestamp(
     snapshot.businessProgressAt,
   );
-  const message = operatorStopped
+  let message = operatorStopped
     ? operatorStopPendingCount > 0
       ? '已停止新领取，等待设备确认当前执行轮次已停止'
       : '整个任务已停止；已完成结果保留，未完成项不再自动接力'
@@ -4377,6 +4386,13 @@ async function refreshOrchestrationParentTask(tx, {
           : profilePatrol
             ? '账号巡查项已重新分配，等待执行节点处理'
           : '关键词工作项已分配，等待执行节点处理';
+  if (!operatorStopped && parentMetadata.negativePatrolRun) {
+    message = aggregate.terminal
+      ? '本轮关键词采集与负面巡查已结算'
+      : aggregate.status === 'needs_action'
+        ? '本轮有未完成工作项需要处理，已完成结果保留'
+        : '关键词优先执行，空闲节点接续巡查近7天负面内容';
+  }
 
   const updated = await tx.queryOne(`
     UPDATE capture_tasks
@@ -4623,7 +4639,9 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
       : null;
     const serverAttemptCount = Math.max(
       0,
-      Number(currentItemState?.attempt_count) || 0,
+      Number(safeJson(currentItemState?.metadata).unattendedNegativePatrol === true
+        ? safeJson(currentItemState?.metadata).elasticAttemptBudgetUsed ?? currentItemState?.attempt_count
+        : currentItemState?.attempt_count) || 0,
     );
     const recoveryDisposition = classifyCaptureRecoveryDisposition({
       status: entry.status,
@@ -4636,7 +4654,7 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
       : recoveryDisposition.automatic
         ? 'retryable'
         : 'failed';
-    const projectedStatus = elasticPool && entry.status === 'failed'
+    let projectedStatus = elasticPool && entry.status === 'failed'
       ? recoveryDisposition.kind === 'manual_current' || recoveryDisposition.automatic
         ? projectElasticKeywordRecoveryStatus({
             elasticPool,
@@ -4650,12 +4668,35 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
         : 'failed'
       : entry.status;
     let resultObservationId = null;
+    const unattendedNegativePatrol =
+      safeJson(currentItemState?.metadata).unattendedNegativePatrol === true;
     if (
       !isProfilePatrol &&
       NEGATIVE_PATROL_SUCCESS_STATUSES.has(entry.status) &&
       entry.startedAt
     ) {
-      const observation = await tx.queryOne(`
+      const observation = unattendedNegativePatrol ? await tx.queryOne(`
+        SELECT observation.id
+        FROM record_observations observation
+        JOIN capture_task_item_attempts attempt
+          ON attempt.id = observation.capture_task_item_attempt_id
+          AND attempt.tenant_id = observation.tenant_id
+        JOIN capture_task_items current_item
+          ON current_item.id = attempt.item_id
+          AND current_item.tenant_id = attempt.tenant_id
+        WHERE observation.tenant_id = $1 AND observation.record_id = $2
+          AND observation.capture_task_id = $3
+          AND observation.capture_task_item_id = $4
+          AND attempt.execution_task_id = $3
+          AND attempt.item_id = $4
+          AND attempt.agent_id = $5
+          AND attempt.assignment_revision = $6
+          AND current_item.assignment_revision = $6
+          AND current_item.execution_task_id = $3
+          AND attempt.request_hash = current_item.request_hash
+        ORDER BY observation.captured_at DESC, observation.id DESC LIMIT 1
+      `, [agent.tenant_id, entry.recordId, task.id, entry.itemId,
+        agent.id, executionRevision]) : await tx.queryOne(`
         SELECT id
         FROM record_observations
         WHERE tenant_id = $1
@@ -4665,6 +4706,19 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
         LIMIT 1
       `, [agent.tenant_id, entry.recordId, entry.startedAt]);
       resultObservationId = observation?.id || null;
+    }
+    if (unattendedNegativePatrol &&
+        NEGATIVE_PATROL_SUCCESS_STATUSES.has(projectedStatus) && !resultObservationId) {
+      projectedStatus = 'needs_action';
+      entry.error = {
+        code: 'patrol_durable_result_missing',
+        message: '设备回报完成，但尚无本次巡查的入库结果，未推进轮查',
+      };
+      await tx.execute(`UPDATE unattended_negative_patrol_state
+        SET needs_action = true, updated_at = now()
+        WHERE tenant_id = $1 AND lease_item_id = $2
+          AND lease_execution_task_id = $3 AND lease_assignment_revision = $4`,
+      [agent.tenant_id, entry.itemId, task.id, executionRevision]);
     }
 
     const checkpoint = {
@@ -4852,6 +4906,33 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
       agent.id,
       item.assignment_revision,
     ]);
+
+    if (unattendedNegativePatrol) {
+      if (NEGATIVE_PATROL_SUCCESS_STATUSES.has(projectedStatus)) {
+        const rotation = await completeUnattendedNegativePatrolItem(tx, {
+          tenantId: agent.tenant_id, itemId: item.id, executionTaskId: task.id,
+          assignmentRevision: item.assignment_revision,
+          resultObservationId: item.result_observation_id,
+          finishedAt: entry.finishedAt || new Date().toISOString(),
+          timezone: safeJson(orchestrationParent?.metadata?.negativePatrolRun).timezone || 'Asia/Shanghai',
+        });
+        if (rotation.updated) await tx.execute(`UPDATE capture_task_items item
+          SET metadata = item.metadata || jsonb_build_object(
+            'lastSuccessAt', state.last_success_at::text,
+            'nextDueDate', state.next_due_date::text,
+            'cadenceDays', state.cadence_days)
+          FROM unattended_negative_patrol_state state
+          WHERE item.tenant_id = $1 AND item.id = $2
+            AND state.tenant_id = item.tenant_id AND state.last_success_item_id = item.id`,
+        [agent.tenant_id, item.id]);
+      } else if (!NEGATIVE_PATROL_SUCCESS_STATUSES.has(entry.status)) {
+        await failUnattendedNegativePatrolItem(tx, {
+          tenantId: agent.tenant_id, itemId: item.id, executionTaskId: task.id,
+          assignmentRevision: item.assignment_revision,
+          now: new Date().toISOString(), needsAction: projectedStatus === 'needs_action',
+        });
+      }
+    }
 
     if (isProfilePatrol && UUID_PATTERN.test(text(entry.executionId, 100))) {
       const monitorStatus =
@@ -5045,7 +5126,9 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
     for (const unresolvedItem of unresolvedItems) {
       const attemptCount = Math.max(
         0,
-        Number(unresolvedItem.attempt_count) || 0,
+        Number(safeJson(unresolvedItem.metadata).unattendedNegativePatrol === true
+          ? safeJson(unresolvedItem.metadata).elasticAttemptBudgetUsed ?? unresolvedItem.attempt_count
+          : unresolvedItem.attempt_count) || 0,
       );
       const unresolvedStatus = snapshotStatus === 'canceled'
         ? 'canceled'
@@ -5146,6 +5229,13 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
         agent.id,
         unresolvedItem.assignment_revision,
       ]);
+      if (safeJson(unresolvedItem.metadata).unattendedNegativePatrol === true) {
+        await failUnattendedNegativePatrolItem(tx, {
+          tenantId: agent.tenant_id, itemId: unresolvedItem.id,
+          executionTaskId: task.id, assignmentRevision: unresolvedItem.assignment_revision,
+          now: new Date().toISOString(), needsAction: unresolvedStatus === 'needs_action',
+        });
+      }
     }
     if (isProfilePatrol) {
       const fallbackExecutions = await tx.queryAll(`
@@ -6666,6 +6756,7 @@ async function negativePatrolFairClaimWait(tx, {agent, candidate, resourcePolicy
       AND item.tenant_id = attempt.tenant_id
     WHERE attempt.tenant_id = $1 AND attempt.parent_task_id = $2
       AND item.platform = $3
+      AND item.item_type = 'negative_post'
     GROUP BY attempt.agent_id
   `, [agent.tenant_id, candidate.parent_id, platform]);
   const currentAssignments = Number(usage.find(row => row.agent_id === agent.id)?.assignments || 0);
@@ -6735,9 +6826,7 @@ async function negativePatrolFairClaimWait(tx, {agent, candidate, resourcePolicy
     const capabilities = safeJson(peer.capabilities);
     const supported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
     if (supported.length > 0 && !supported.includes(platform)) continue;
-    if (Array.isArray(safeJson(metadata.planSnapshot).searchPasses) && metadata.planSnapshot.searchPasses.length > 1 && capabilities.remoteSequentialSearchPassesV1 !== true) continue;
     if (safeJson(candidate.item_metadata).singleRelayV1 === true && capabilities.singleRelayV1 !== true) continue;
-    if (safeJson(safeJson(metadata.planSnapshot).recoveryPolicy).singleRelayV1 === true && capabilities.singleRelayV1 !== true) continue;
     if (elasticRecoveryHoldRemainingMs({
       status: peer.recovery_status, error: peer.recovery_error,
       checkpoint: peer.recovery_checkpoint, finished_at: peer.recovery_finished_at,
@@ -6761,8 +6850,17 @@ export async function dispatchNextElasticWorkItem(tx, options = {}) {
 async function dispatchNextElasticWorkItemWithinBudget(tx, {
   agent,
   capabilities = {},
+  excludedItemIds = [],
+  targetedOnly = false,
+  allowTargetedFallback = false,
 } = {}, remainingSkipBudget) {
-  if (remainingSkipBudget <= 0) return null;
+  if (remainingSkipBudget <= 0) {
+    // Keep heartbeat work bounded without repeatedly scanning the same busy
+    // keyword head on every heartbeat and starving spare-capacity revisits.
+    return targetedOnly || !allowTargetedFallback ? null : dispatchNextElasticWorkItemWithinBudget(tx, {
+      agent, capabilities, excludedItemIds, targetedOnly: true,
+    }, 10);
+  }
   const freshCapabilities = safeJson(capabilities);
   const canClaimKeyword =
     freshCapabilities.remoteTaskCreate === true &&
@@ -6926,6 +7024,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       ) configured_agents
     ) agent_policy
     WHERE item.tenant_id = $1
+      AND NOT (item.id = ANY($12::uuid[]))
       AND parent.task_type = 'capture_orchestration'
       AND parent.status IN ('pending', 'running', 'needs_action')
       AND (
@@ -6961,7 +7060,16 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         OR (item.item_type = 'watched_content' AND $8::boolean)
       )
       AND item.status IN ('pending', 'retryable')
+      AND (item.item_type <> 'keyword' OR $13::boolean
+        OR COALESCE(parent.metadata->'planSnapshot'->'captureSettings', '{}'::jsonb) = '{}'::jsonb)
+      AND (item.metadata->>'unattendedNegativePatrol' IS DISTINCT FROM 'true'
+        OR NOT EXISTS (SELECT 1 FROM unattended_negative_patrol_state rotation
+          WHERE rotation.tenant_id = item.tenant_id AND rotation.platform = item.platform
+            AND rotation.external_id = item.external_id
+            AND (rotation.cooldown_until > now() OR rotation.needs_action)))
       AND (
+        item.item_type <> 'keyword'
+        OR
         COALESCE(jsonb_array_length(parent.metadata->'planSnapshot'->'searchPasses'), 0) <= 1
         OR $9::boolean
       )
@@ -6974,7 +7082,9 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         item.attempt_count
       ) < agent_policy.agent_attempt_limit * $10::integer
       AND item.attempt_count <
-        agent_policy.agent_attempt_limit * $10::integer
+        agent_policy.agent_attempt_limit * $10::integer +
+        CASE WHEN item.metadata->>'manualRetryBaseAttemptCount' ~ '^[0-9]+$'
+          THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END
       AND (cardinality($4::text[]) = 0 OR item.platform = ANY($4::text[]))
       AND (cardinality($5::text[]) = 0 OR item.platform = ANY($5::text[]))
       AND (
@@ -7008,6 +7118,9 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         WHERE safety_attempt.tenant_id = item.tenant_id
           AND safety_attempt.item_id = item.id
           AND safety_attempt.agent_id = $2::uuid
+          AND safety_attempt.attempt_number >
+            CASE WHEN item.metadata->>'manualRetryBaseAttemptCount' ~ '^[0-9]+$'
+              THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END
           AND (
             UPPER(COALESCE(
               safety_attempt.error->>'code',
@@ -7068,13 +7181,17 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         ) current_round_attempt
         WHERE current_round_attempt.agent_id = $2::uuid
           AND current_round_attempt.reverse_attempt_ordinal <=
-            MOD(item.attempt_count, agent_policy.agent_attempt_limit)
+            MOD(item.attempt_count -
+              CASE WHEN item.metadata->>'manualRetryBaseAttemptCount' ~ '^[0-9]+$'
+                THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END,
+              agent_policy.agent_attempt_limit)
       )
       AND (
         agent_policy.agent_attempt_limit = 1
         OR item.assigned_agent_id IS DISTINCT FROM $2::uuid
       )
     ORDER BY
+      CASE WHEN item.item_type = 'keyword' THEN 0 ELSE 1 END,
       CASE WHEN item.status = 'pending' THEN 0 ELSE 1 END,
       CASE
         WHEN item.metadata->>'waitingForSourceClosure' = 'true' THEN 1
@@ -7093,14 +7210,21 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT,
     allowedPlatforms,
     supportedPlatforms,
-    canClaimKeyword,
+    canClaimKeyword && !targetedOnly,
     canClaimNegativePost,
     canClaimWatchedContent,
     canClaimSequentialSearch,
     ELASTIC_TECHNICAL_RETRY_ROUNDS,
     Array.from(CROSS_DEVICE_RETRY_SAFETY_CODES),
+    excludedItemIds,
+    freshCapabilities.remoteTaskEnhancementOptions === true,
   ]);
   if (!candidate) return null;
+  const nextCandidate = () => dispatchNextElasticWorkItemWithinBudget(tx, {
+    agent, capabilities, targetedOnly,
+    allowTargetedFallback: allowTargetedFallback || candidate.item_type === 'keyword',
+    excludedItemIds: [...excludedItemIds, candidate.item_id],
+  }, remainingSkipBudget - 1);
 
   if (candidate.item_type === 'negative_post') {
     // Archiving uses this same record lock. Acquire it without waiting, then
@@ -7116,7 +7240,9 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         `, [agent.tenant_id, candidate.record_id])
       : null);
     if (!record && existingRecord) {
-      return {deferred: true, reason: 'record_lifecycle_busy', retryAfterMs: 1000};
+      return (await nextCandidate()) || {
+        deferred: true, reason: 'record_lifecycle_busy', retryAfterMs: 1000,
+      };
     }
     const lifecycle = record ? await tx.queryOne(`
         SELECT archived_at FROM record_triage WHERE tenant_id = $1 AND record_id = $2
@@ -7154,7 +7280,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         payload: {itemId: candidate.item_id, recordId: candidate.record_id},
       });
       return dispatchNextElasticWorkItemWithinBudget(
-        tx, {agent, capabilities}, remainingSkipBudget - 1,
+        tx, {agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback}, remainingSkipBudget - 1,
       );
     }
   }
@@ -7169,13 +7295,40 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   const previousExecutionTaskId = text(candidate.execution_task_id, 100);
   const requiresSingleRelay =
     itemMetadata.singleRelayV1 === true ||
-    safeJson(planSnapshot.recoveryPolicy).singleRelayV1 === true;
+    (candidate.item_type === 'keyword' &&
+      safeJson(planSnapshot.recoveryPolicy).singleRelayV1 === true);
   if (requiresSingleRelay && freshCapabilities.singleRelayV1 !== true) {
-    return null;
+    return nextCandidate();
   }
   const negativePost = candidate.item_type === 'negative_post';
   const watchedContent = candidate.item_type === 'watched_content';
   const targetedContent = negativePost || watchedContent;
+  if (targetedContent) {
+    const identityLock = await tx.queryOne(
+      'SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS locked',
+      [agent.tenant_id, `${candidate.item_platform}:${candidate.external_id}`],
+    );
+    if (!identityLock?.locked) return nextCandidate();
+    const activePost = await tx.queryOne(`
+      SELECT other.id FROM capture_task_items other
+      JOIN capture_tasks execution ON execution.id = other.execution_task_id
+        AND execution.tenant_id = other.tenant_id
+      WHERE other.tenant_id = $1 AND other.platform = $2
+        AND other.external_id = $3 AND other.id <> $4
+        AND other.item_type IN ('negative_post', 'watched_content')
+        AND (
+          execution.status IN ('pending', 'waiting_device', 'claimed', 'running',
+            'recovering', 'resume_requested', 'stop_requested')
+          OR execution.metadata->>'stopPending' = 'true'
+          OR execution.metadata->>'legacyPackStopPending' = 'true'
+          OR execution.metadata->>'stopIdentityUnavailable' = 'true'
+          OR EXISTS (SELECT 1 FROM capture_agent_commands command
+            WHERE command.tenant_id = execution.tenant_id AND command.task_id = execution.id
+              AND command.status IN ('pending', 'acknowledged'))
+        ) LIMIT 1
+    `, [agent.tenant_id, candidate.item_platform, candidate.external_id, candidate.item_id]);
+    if (activePost) return nextCandidate();
+  }
   const resourceAdmission = await reserveCaptureResourceAdmission(tx, {
     tenantId: agent.tenant_id,
     parentTaskId: candidate.parent_id,
@@ -7190,17 +7343,17 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
           keyword: candidate.keyword,
         }),
   });
-  if (!resourceAdmission.allowed) return null;
+  if (!resourceAdmission.allowed) return nextCandidate();
   if (negativePost) {
     const fairWait = await negativePatrolFairClaimWait(tx, {
       agent, candidate, resourcePolicy: planSnapshot.resourcePolicy,
     });
-    if (fairWait) return fairWait;
+    if (fairWait) return (await nextCandidate()) || fairWait;
     const patrolAdmission = await reserveNegativePatrolFirstAdmission(tx, {
       tenantId: agent.tenant_id,
     });
     if (!patrolAdmission.allowed) {
-      return {
+      return (await nextCandidate()) || {
         deferred: true,
         reason: patrolAdmission.reason || 'server_busy',
         retryAfterMs: Math.max(500, Number(patrolAdmission.retryAfterMs) || 1000),
@@ -7244,7 +7397,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     Object.keys(safeJson(planSnapshot.captureSettings)).length > 0 &&
     freshCapabilities.remoteTaskEnhancementOptions !== true
   ) {
-    return null;
+    return nextCandidate();
   }
   const sequentialResumeCheckpoint = targetedContent
     ? null
@@ -7258,6 +7411,37 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   const commandId = crypto.randomUUID();
   const assignmentRevision =
     Math.max(0, Number(candidate.assignment_revision) || 0) + 1;
+  if (itemMetadata.unattendedNegativePatrol === true) {
+    const claimed = await claimUnattendedNegativePatrolItem(tx, {
+      ...safeJson(parentMetadata.negativePatrolRun),
+      tenantId: agent.tenant_id,
+      recordId: candidate.record_id,
+      itemId: candidate.item_id,
+      executionTaskId: childTaskId,
+      assignmentRevision,
+      now: new Date().toISOString(),
+    });
+    if (!claimed.claimed) {
+      if (!['already_claimed', 'active_claim', 'cooldown', 'record_busy', 'content_execution_active'].includes(claimed.reason)) {
+        await tx.execute(`
+          UPDATE capture_task_items SET status = 'skipped', finished_at = now(),
+            updated_at = now(), assignment_revision = assignment_revision + 1,
+            metadata = metadata || jsonb_build_object('skipReason', $3::text) || $4::jsonb
+          WHERE tenant_id = $1 AND id = $2
+        `, [agent.tenant_id, candidate.item_id, claimed.reason || 'no_longer_eligible',
+          JSON.stringify({
+            sharedResultObservationId: claimed.sharedResultObservationId || null,
+            lastSuccessAt: claimed.lastSuccessAt || null,
+            nextDueDate: claimed.nextDueDate || null,
+          })]);
+        await refreshOrchestrationParentTask(tx, {
+          tenantId: agent.tenant_id, parentTaskId: candidate.parent_id,
+          actorType: 'system', actorName: '云端轮查', eventAgentId: agent.id,
+        });
+      }
+      return nextCandidate();
+    }
+  }
   const attempt = await tx.queryOne(`
     SELECT COALESCE(MAX(attempt_number), 0) + 1 AS next_attempt_number
     FROM capture_task_item_attempts
@@ -7284,7 +7468,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   let commandPayload = {};
   if (targetedContent) {
     const sourceRecord = safeJson(itemMetadata.sourceRecord);
-    const captureSettings = safeJson(parentMetadata.captureSettings);
+    const captureSettings = safeJson(itemMetadata.captureSettings || parentMetadata.captureSettings);
     const target = {
       itemId: candidate.item_id,
       recordId: candidate.record_id,
@@ -7347,7 +7531,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         autoLoop: false,
         maxRounds: 1,
         roundGapMin: 0,
-        platform: candidate.parent_platform,
+        platform: candidate.item_platform || candidate.parent_platform,
         keywords: [candidate.keyword],
         searchFilters: {
           ...safeJson(planSnapshot.searchFilters),
@@ -7442,7 +7626,8 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
           protocolVersion: 1,
           filter: safeJson(parentMetadata.filter),
           selectedRecordIds: [candidate.record_id],
-          captureSettings: safeJson(parentMetadata.captureSettings),
+          captureSettings: safeJson(itemMetadata.captureSettings || parentMetadata.captureSettings),
+          planSnapshot: {resourcePolicy: safeJson(planSnapshot.resourcePolicy)},
         }
       : {planSnapshot: childPlan}),
     orchestrationChild: true,
@@ -7451,7 +7636,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     itemIds: [candidate.item_id],
     cloudWorkQueue: true,
     distributionMode: queueDistributionMode,
-    perItemAdmissionV1: targetedWorkflow === 'negative_post_patrol',
+    perItemAdmissionV1: negativePost,
     claimUnit,
     attemptIdentity,
     ...(bootstrapPacing ? {bootstrapPacing} : {}),
@@ -7523,7 +7708,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     childTaskType,
     childFeatureKey,
     childTitle,
-    targetedContent ? candidate.item_platform : candidate.parent_platform,
+    candidate.item_platform || candidate.parent_platform,
     JSON.stringify({current: 0, total: 1, percent: 0, phase: 'queued'}),
     JSON.stringify(childCheckpoint),
     JSON.stringify({
@@ -7619,7 +7804,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     childTaskId,
     JSON.stringify(commandPayload),
     new Date(Date.now() + ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS).toISOString(),
-    targetedWorkflow === 'negative_post_patrol',
+    negativePost,
   ]);
   await refreshOrchestrationParentTask(tx, {
     tenantId: agent.tenant_id,
@@ -13372,6 +13557,10 @@ export async function dispatchCrossDeviceRetry(options = {}) {
             text(item.id, 100).toLowerCase(),
           ))
         : items;
+      if (safeJson(parentMetadata.planSnapshot?.negativePatrol).enabled === true &&
+          scopedItems.some(item => item.item_type === 'negative_post')) {
+        abortCrossDeviceRetry('retry_items_managed_by_elastic_dispatcher');
+      }
       if (
         itemScopeProvided &&
         scopedItems.length !== requestedItemIds.length
@@ -15370,7 +15559,7 @@ async function cascadeStopNegativePatrolParent(tx, {
   const parentMetadata = safeJson(parent.metadata);
   if (
     parent.task_type !== 'capture_orchestration' ||
-    parentMetadata.workflow !== 'negative_post_patrol'
+    (parentMetadata.workflow !== 'negative_post_patrol' && !parentMetadata.negativePatrolRun)
   ) return null;
   if (parent.status === 'canceled') {
     return {

@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { hasUnattendedNegativePatrol } from './unattendedNegativePatrol.mjs'
 import {
   Archive, BadgeCheck, Bot, ChevronDown, ChevronUp, Loader2, MessagesSquare, Network, Play, RefreshCw, ShieldAlert, Square,
   Radar,
@@ -52,6 +53,7 @@ export function TaskCard({
   const progress = taskProgress(task)
   const diagnostics = taskDiagnostics(task)
   const orchestration = task.task_type === 'capture_orchestration'
+  const unattendedNegativePatrol = orchestration && hasUnattendedNegativePatrol(task.metadata?.planSnapshot)
   const negativePatrol = task.task_type === 'negative_post_patrol'
     || task.feature_key === 'negative_post_patrol'
     || task.feature_key === 'capture.negative_post_patrol'
@@ -271,7 +273,7 @@ export function TaskCard({
               {orchestration
                 ? contentPatrol
                   ? `${safeNumber(task.counts?.total ?? task.progress?.total)} 条帖子`
-                  : `${safeNumber(task.counts?.total ?? task.progress?.total)} 个关键词`
+                  : `${safeNumber(task.counts?.total ?? task.progress?.total)} ${unattendedNegativePatrol ? '个工作项 · 含近7天负面巡查' : '个关键词'}`
                 : `${task.agent_host_label || '未分配设备'} › ${task.agent_display_name || '未分配 Agent'}`}
             </span>
             {!orchestration && (
@@ -476,7 +478,7 @@ export function TaskCard({
             </>
             ) : orchestration ? (
             <>
-              <div>关键词工作项：<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 项</span></div>
+              <div>{unattendedNegativePatrol ? '关键词与负面工作项：' : '关键词工作项：'}<span className="text-foreground">{safeNumber(task.counts?.total ?? task.progress?.total)} 项</span></div>
               <div>已结算：<span className="text-foreground">{safeNumber(task.progress?.current)} 项</span></div>
               <div>分配版本：<span className="text-foreground">第 {task.orchestration_revision || 0} 版</span></div>
               {scheduleTemplate && <div>下次运行：<span className="text-foreground">{formatTime(String(task.metadata?.nextRunAt || ''))}</span></div>}

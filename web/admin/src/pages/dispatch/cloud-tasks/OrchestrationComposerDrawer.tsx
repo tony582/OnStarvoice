@@ -19,6 +19,8 @@ import {
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { ScheduledDatesPicker } from './ScheduledDatesPicker'
+import { NegativePatrolScheduleOption } from './NegativePatrolScheduleOption'
+import { hasUnattendedNegativePatrol, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable } from './unattendedNegativePatrol.mjs'
 import { Drawer } from '@/components/shared/Drawer'
 import { shanghaiToday } from './lib'
 import type {
@@ -225,6 +227,7 @@ function agentBlockReason(
   platform: OrchestrationPlatform,
   enhancementEnabled: boolean,
   sequentialSearchEnabled = false,
+  negativePatrolEnabled = false,
 ) {
   if (agent.status !== 'active') return agent.status === 'paused' ? '节点已暂停接单' : '节点已撤销'
   if (agent.capabilities?.remoteTaskCreate !== true) return 'Extension 版本不支持云端任务'
@@ -238,6 +241,7 @@ function agentBlockReason(
   if (sequentialSearchEnabled && agent.capabilities?.remoteSequentialSearchPassesV1 !== true) {
     return 'Extension 版本不支持同一关键词串行补充巡检'
   }
+  if (negativePatrolEnabled && (!negativePatrolCapabilityAvailable(agent.capabilities) || agent.capabilities?.singleRelayV1 !== true)) return '节点版本不支持关键词与负面巡查接续，请更新扩展'
   return ''
 }
 
@@ -355,6 +359,8 @@ export function OrchestrationComposerDrawer({
   lockExecutionMode = false,
   minimumAgentCount = 1,
   initialAgentIds,
+  initialNegativePatrolEnabled = false,
+  lockAgentSelection = false,
   editingPlan,
   copyingPlan,
   onClose,
@@ -372,6 +378,8 @@ export function OrchestrationComposerDrawer({
   const [title, setTitle] = useState('')
   const [platform, setPlatform] = useState<OrchestrationPlatform>('xiaohongshu')
   const [executionMode, setExecutionMode] = useState<OrchestrationExecutionMode>(initialExecutionMode)
+  const [negativePatrolEnabled, setNegativePatrolEnabled] = useState(false)
+  const includeNegativePatrol = executionMode === 'unattended_plan' && negativePatrolEnabled
   const [planMode, setPlanMode] = useState<PlanMode>('daily')
   const [startTime, setStartTime] = useState('09:00')
   const [randomOffsetMin, setRandomOffsetMin] = useState(20)
@@ -396,6 +404,10 @@ export function OrchestrationComposerDrawer({
   const [distributionMode, setDistributionMode] = useState<DistributionMode>('elastic_pool')
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([])
   const [selectionNotice, setSelectionNotice] = useState('')
+  const [negativePreview, setNegativePreview] = useState<{windowStart?: string; windowEnd?: string; summary: Record<string, unknown>} | null>(null)
+  const [negativePreviewLoading, setNegativePreviewLoading] = useState(false)
+  const [negativePreviewError, setNegativePreviewError] = useState('')
+  const negativePreviewVersion = useRef(0)
   const [createResult, setCreateResult] = useState<CreateResponse | null>(null)
   const [createFingerprint, setCreateFingerprint] = useState('')
   const [preview, setPreview] = useState<AllocationPreviewResponse | null>(null)
@@ -439,19 +451,19 @@ export function OrchestrationComposerDrawer({
     () => SORT_OPTIONS.filter(option => !option.platform || option.platform === platform),
     [platform],
   )
-  const sortedAgents = useMemo(() => [...agents].sort((left, right) => {
-    const leftBlocked = Boolean(agentBlockReason(left, platform, enhancementEnabled, sequentialSearchEnabled))
-    const rightBlocked = Boolean(agentBlockReason(right, platform, enhancementEnabled, sequentialSearchEnabled))
+  const sortedAgents = useMemo(() => agents.filter(agent => !lockAgentSelection || initialAgentIds?.includes(agent.id)).sort((left, right) => {
+    const leftBlocked = Boolean(agentBlockReason(left, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol))
+    const rightBlocked = Boolean(agentBlockReason(right, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol))
     if (leftBlocked !== rightBlocked) return leftBlocked ? 1 : -1
     if (left.online !== right.online) return left.online ? -1 : 1
     return `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN')
-  }), [agents, enhancementEnabled, platform, sequentialSearchEnabled])
+  }), [agents, enhancementEnabled, platform, sequentialSearchEnabled, includeNegativePatrol, initialAgentIds, lockAgentSelection])
   const validSelectedAgentIds = useMemo(
     () => selectedAgentIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
-      return agent ? !agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled) : false
+      return agent ? !agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol) : false
     }),
-    [agents, enhancementEnabled, platform, selectedAgentIds, sequentialSearchEnabled],
+    [agents, enhancementEnabled, platform, selectedAgentIds, sequentialSearchEnabled, includeNegativePatrol],
   )
   const selectedAgents = useMemo(
     () => validSelectedAgentIds
@@ -479,8 +491,9 @@ export function OrchestrationComposerDrawer({
       ? 'douyin'
       : 'xiaohongshu'
     const editingEnhancementEnabled = enhancementSettings.autoDetailCaptureAfterListCapture === true
+    const targetNegativePatrol = sourcePlan ? hasUnattendedNegativePatrol(planSnapshot) : initialNegativePatrolEnabled
     const editingDistributionMode: DistributionMode =
-      (schedule?.distribution_mode || metadata.distributionMode) === 'fixed_batch'
+      !targetNegativePatrol && (schedule?.distribution_mode || metadata.distributionMode) === 'fixed_batch'
         ? 'fixed_batch'
         : 'elastic_pool'
     const rawEditingSearchPasses = stringList(planSnapshot.searchPasses)
@@ -498,7 +511,8 @@ export function OrchestrationComposerDrawer({
       ? stringList(metadata.eligibleAgentIds)
       : (sourcePlan?.agents || []).map(agent => agent.id)
     const candidateAgentIds = sourcePlan ? editingAgentIds : (initialAgentIds ?? [])
-    const targetPlatform = sourcePlan ? editingPlatform : 'xiaohongshu'
+    const firstSelectedAgent = agents.find(agent => candidateAgentIds.includes(agent.id))
+    const targetPlatform = sourcePlan ? editingPlatform : firstSelectedAgent ? agentPlatforms(firstSelectedAgent)[0] || 'xiaohongshu' : 'xiaohongshu'
     const targetEnhancementEnabled = sourcePlan ? editingEnhancementEnabled : false
     const targetSequentialSearchEnabled = sourcePlan ? editingSequentialSearchEnabled : false
     const compatibleInitialAgentIds = candidateAgentIds.filter(agentId => {
@@ -508,12 +522,18 @@ export function OrchestrationComposerDrawer({
         targetPlatform,
         targetEnhancementEnabled,
         targetSequentialSearchEnabled,
+        targetNegativePatrol,
       )
     })
 
+    negativePreviewVersion.current += 1
+    setNegativePreview(null)
+    setNegativePreviewLoading(false)
+    setNegativePreviewError('')
     setStage('define')
     setTitle(copyMode ? `${sourcePlan?.orchestration.title || '无人值守计划'}（副本）` : sourcePlan?.orchestration.title || '')
     setPlatform(targetPlatform)
+    setNegativePatrolEnabled(targetNegativePatrol)
     setExecutionMode(editMode ? 'unattended_plan' : initialExecutionMode)
     if (copyMode && initialExecutionMode !== 'unattended_plan') {
       setExecutionMode('unattended_plan')
@@ -554,12 +574,12 @@ export function OrchestrationComposerDrawer({
     setCommentLimit(safeCount(enhancementSettings.detailCommentsMaxDetectedItems) || 50)
     setSkipCaptured(enhancementSettings.skipAlreadyCapturedOnDetailCapture !== false)
     setDistributionMode(editingDistributionMode)
-    setSelectedAgentIds(compatibleInitialAgentIds)
+    setSelectedAgentIds(lockAgentSelection ? candidateAgentIds : compatibleInitialAgentIds)
     setSelectionNotice(
       compatibleInitialAgentIds.length < candidateAgentIds.length
         ? sourcePlan
           ? '原计划中有节点当前不可用或不兼容，已移除；保存前请重新确认 Agent 小队。'
-          : '已移除与默认小红书平台不兼容的预选节点，请重新确认 Agent 小队。'
+          : '预选节点当前不兼容，请确认平台和采集能力。'
         : '',
     )
     setCreateResult(null)
@@ -573,7 +593,7 @@ export function OrchestrationComposerDrawer({
     setDispatchResult(null)
     setUpdateResult(null)
     requestKeyRef.current = randomRequestKey()
-  }, [agents, copyMode, editMode, initialAgentIds, initialExecutionMode, sourcePlan])
+  }, [agents, copyMode, editMode, initialAgentIds, initialExecutionMode, sourcePlan, initialNegativePatrolEnabled, lockAgentSelection])
 
   useEffect(() => {
     if (open && !previouslyOpenRef.current) reset()
@@ -653,6 +673,10 @@ export function OrchestrationComposerDrawer({
   }
 
   const markDefinitionChanged = () => {
+    negativePreviewVersion.current += 1
+    setNegativePreview(null)
+    setNegativePreviewLoading(false)
+    setNegativePreviewError('')
     setError('')
     clearCreatedDraftState()
     if (draftIdsRef.current.size > 0) void discardCreatedDrafts()
@@ -669,6 +693,7 @@ export function OrchestrationComposerDrawer({
     targetPlatform: OrchestrationPlatform,
     targetEnhancementEnabled: boolean,
     targetSequentialSearchEnabled = false,
+    targetNegativePatrol = includeNegativePatrol,
   ) => {
     const compatibleIds = candidateIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
@@ -677,15 +702,18 @@ export function OrchestrationComposerDrawer({
         targetPlatform,
         targetEnhancementEnabled,
         targetSequentialSearchEnabled,
+        targetNegativePatrol,
       )
     })
     const removedNames = candidateIds
       .filter(agentId => !compatibleIds.includes(agentId))
       .map(agentId => agents.find(candidate => candidate.id === agentId)?.display_name || `Agent ${agentId.slice(0, 8)}`)
-    setSelectedAgentIds(compatibleIds)
+    setSelectedAgentIds(lockAgentSelection ? candidateIds : compatibleIds)
     setSelectionNotice(
       removedNames.length > 0
-        ? `已移除不兼容节点：${removedNames.join('、')}。请按当前平台和采集设置补选。`
+        ? lockAgentSelection
+          ? `指定节点当前不兼容：${removedNames.join('、')}。请检查平台设置或更新扩展。`
+          : `已移除不兼容节点：${removedNames.join('、')}。请按当前平台和采集设置补选。`
         : '',
     )
   }
@@ -719,11 +747,35 @@ export function OrchestrationComposerDrawer({
   }
 
   const changeDistributionMode = (value: DistributionMode) => {
+    if (includeNegativePatrol && value === 'fixed_batch') return
     markDefinitionChanged()
     setDistributionMode(value)
     const nextSequentialSearchEnabled = sequentialSearchEnabled && value === 'elastic_pool'
     if (value !== 'elastic_pool') setSupplementalContentType('')
     keepCompatibleAgents(selectedAgentIds, platform, enhancementEnabled, nextSequentialSearchEnabled)
+  }
+
+  const loadNegativePreview = async () => {
+    const version = ++negativePreviewVersion.current
+    setNegativePreviewLoading(true)
+    setNegativePreviewError('')
+    try {
+      const result = await api.post<{windowStart?: string; windowEnd?: string; summary: Record<string, unknown>}>(
+        '/capture-cloud/orchestrations/negative-patrol-preview', {platform, keywords},
+      )
+      if (negativePreviewVersion.current === version) setNegativePreview(result)
+    } catch (err) {
+      if (negativePreviewVersion.current === version) setNegativePreviewError(err instanceof Error ? err.message : '读取负面巡查预估失败')
+    } finally {
+      if (negativePreviewVersion.current === version) setNegativePreviewLoading(false)
+    }
+  }
+
+  const changeNegativePatrol = (value: boolean) => {
+    markDefinitionChanged()
+    setNegativePatrolEnabled(value)
+    if (value) setDistributionMode('elastic_pool')
+    keepCompatibleAgents(selectedAgentIds, platform, enhancementEnabled, sequentialSearchEnabled, value)
   }
 
   const togglePatrolType = (value: 'all' | 'image' | 'video', checked: boolean) => {
@@ -767,6 +819,7 @@ export function OrchestrationComposerDrawer({
   }
 
   const toggleAgent = (agentId: string) => {
+    if (lockAgentSelection) return
     setError('')
     setSelectionNotice('')
     setPreview(null)
@@ -794,6 +847,7 @@ export function OrchestrationComposerDrawer({
     title: title.trim(),
     platform,
     executionMode,
+    ...unattendedNegativePatrolRequest(includeNegativePatrol, executionMode),
     ...(executionMode === 'unattended_plan'
       ? {
           planMode,
@@ -911,6 +965,7 @@ export function OrchestrationComposerDrawer({
           title: title.trim(),
           platform,
           executionMode,
+          ...unattendedNegativePatrolRequest(includeNegativePatrol, executionMode),
           distributionMode,
           agentIds: validSelectedAgentIds,
           ...(executionMode === 'unattended_plan'
@@ -997,6 +1052,7 @@ export function OrchestrationComposerDrawer({
             title: title.trim(),
             platform,
             executionMode: 'unattended_plan',
+            negativePatrol: includeNegativePatrol ? {enabled: true, lookbackDays: 7} : {enabled: false},
             distributionMode,
             agentIds: validSelectedAgentIds,
             schedule: {
@@ -1207,6 +1263,31 @@ export function OrchestrationComposerDrawer({
                           </p>
                         </div>
                       </div>
+                      <NegativePatrolScheduleOption checked={includeNegativePatrol} disabled={busy} onChange={changeNegativePatrol} />
+                      {includeNegativePatrol && <p className="text-[11px] leading-5 text-muted-foreground">启用后使用云端逐项领取，仍只使用下方已选节点；固定分配计划会改为逐项领取。每轮动态选取当前平台的帖子，负面清单在运行时生成。</p>}
+                      {includeNegativePatrol && (
+                        <div className="rounded-xl border border-border/70 bg-card px-3 py-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-[11px] text-muted-foreground">按当前平台和关键词预估，实际清单在每轮开始时确定。</span>
+                            <Button type="button" variant="outline" size="sm" disabled={busy || negativePreviewLoading || keywords.length === 0} onClick={() => void loadNegativePreview()}>
+                              {negativePreviewLoading ? '正在预估…' : '预估巡查范围'}
+                            </Button>
+                          </div>
+                          {negativePreview && <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                            <span>可巡查 <strong className="text-foreground">{safeCount(negativePreview.summary?.eligible)}</strong> 篇</span>
+                            <span>首次待巡 {safeCount(negativePreview.summary?.firstPending)}</span>
+                            <span>到期复查 {safeCount(negativePreview.summary?.due)}</span>
+                            <span>未到期 {safeCount(negativePreview.summary?.notDue)}</span>
+                            <span>冷却中 {safeCount(negativePreview.summary?.coolingDown)}</span>
+                            <span>需处理 {safeCount(negativePreview.summary?.needsAction)}</span>
+                            <span>已排除 {safeCount(negativePreview.summary?.excluded)}</span>
+                            {safeCount(negativePreview.summary?.unknownPublishTime) > 0 && <span>发布时间缺失 {safeCount(negativePreview.summary?.unknownPublishTime)}</span>}
+                            {safeCount(negativePreview.summary?.expiringUncovered) > 0 && <span className="text-status-orange">即将移出窗口且尚未覆盖 {safeCount(negativePreview.summary?.expiringUncovered)}</span>}
+                          </div>}
+                          {negativePreviewError && <p role="alert" className="mt-2 text-[11px] text-status-red">{negativePreviewError}</p>}
+                        </div>
+                      )}
+                      {lockAgentSelection && <p className="text-[11px] leading-5 text-muted-foreground">本计划固定使用所选的一个节点；离线时等待它上线，不会交给其他节点。已有设备本地计划会保留，请避免相同关键词重复定时。</p>}
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="block text-xs font-medium text-muted-foreground">
                           运行日期
@@ -1496,7 +1577,7 @@ export function OrchestrationComposerDrawer({
                             key={option.value}
                             type="button"
                             aria-pressed={active}
-                            disabled={busy}
+                            disabled={busy || (includeNegativePatrol && option.value === 'fixed_batch')}
                             onClick={() => {
                               if (active) return
                               changeDistributionMode(option.value)
@@ -1522,10 +1603,10 @@ export function OrchestrationComposerDrawer({
                   <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground">✓</span>
                   <span>
                     <span className="block text-xs font-semibold text-foreground">
-                      {distributionMode === 'elastic_pool' ? '离线不会拖住整批任务' : '保留固定分配方式'}
+                      {lockAgentSelection ? '只使用指定节点' : distributionMode === 'elastic_pool' ? '离线不会拖住整批任务' : '保留固定分配方式'}
                     </span>
                     <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
-                      {distributionMode === 'elastic_pool'
+                      {lockAgentSelection ? '关键词与负面帖子由同一节点逐项执行，节点离线时等待上线。' : distributionMode === 'elastic_pool'
                         ? '创建指令 3 分钟未确认会退回队列；执行节点持续离线 10 分钟也会回收。验证码或登录验证只暂停当前关键词，不会自动扩散到其他节点。'
                         : '关键词会均衡后固定给各节点；某台设备较慢或离线时，其他设备不会自动领取它的关键词。'}
                     </span>
@@ -1540,7 +1621,7 @@ export function OrchestrationComposerDrawer({
                 ) : (
                   <div className="mt-3 max-h-[520px] space-y-2 overflow-y-auto pr-1">
                     {sortedAgents.map(agent => {
-                      const blockReason = agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled)
+                      const blockReason = agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol)
                       const checked = validSelectedAgentIds.includes(agent.id)
                       const workloadKnown = agent.active_task_count !== undefined || agent.queued_task_count !== undefined
                       const activeTasks = safeCount(agent.active_task_count)
@@ -1553,7 +1634,7 @@ export function OrchestrationComposerDrawer({
                           <input
                             type="checkbox"
                             checked={checked}
-                            disabled={Boolean(blockReason) || busy}
+                            disabled={Boolean(blockReason) || busy || lockAgentSelection}
                             onChange={() => toggleAgent(agent.id)}
                             className="mt-1 h-4 w-4 shrink-0 accent-primary"
                           />
@@ -1643,7 +1724,7 @@ export function OrchestrationComposerDrawer({
                     </div>
                     <h3 className="mt-1 text-base font-bold text-foreground">{title}</h3>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {preview.itemCount} 个关键词工作项 · {selectedAgents.length} 个执行节点 · {distributionMode === 'elastic_pool' ? '一次领取 1 项' : '按当前顺序均衡固定分配'}
+                      {preview.itemCount} 个关键词工作项{includeNegativePatrol ? ' + 每轮近7天负面巡查' : ''} · {selectedAgents.length} 个执行节点 · {distributionMode === 'elastic_pool' ? '一次领取 1 项' : '按当前顺序均衡固定分配'}
                       {sequentialSearchEnabled ? ` · 每项串行执行 ${patrolPathLabel}` : ''}
                       {executionMode === 'unattended_plan'
                         ? ` · ${planMode === 'daily' ? '每天' : `${parseCustomDates(customDates).dates.length} 个指定日期`} ${startTime}`
@@ -1749,6 +1830,7 @@ export function OrchestrationComposerDrawer({
                           {` · ${distributionMode === 'elastic_pool' ? '弹性节点池' : '固定分配'} · 每个关键词${sequentialSearchEnabled ? `按“${patrolPathLabel}”串行执行` : '执行 1 次'}`}
                         </span>
                       </div>
+                      {includeNegativePatrol && <div className="mt-1">负面巡查：近7天发布的负面内容；关键词优先，空闲接续，沿用处理状态。</div>}
                       <div className="mt-1">
                         下次运行：<span className="font-semibold text-foreground">{formatScheduleTime(nextScheduleRunAt)}</span>
                       </div>

@@ -110,7 +110,8 @@ test('mixed content patrol is claimed by item platform, never by the mixed paren
   assert.match(claim, /item\.platform = ANY\(\$4::text\[\]\)/u);
   assert.match(claim, /item\.platform = ANY\(\$5::text\[\]\)/u);
   assert.match(claim, /platform: candidate\.item_platform/u);
-  assert.match(claim, /targetedContent \? candidate\.item_platform : candidate\.parent_platform/u);
+  assert.match(claim, /candidate\.item_platform \|\| candidate\.parent_platform/u);
+  assert.doesNotMatch(claim, /platform: candidate\.parent_platform,/u);
   assert.doesNotMatch(
     claim,
     /cardinality\(\$4::text\[\]\) = 0 OR parent\.platform = ANY/u,

@@ -1,3 +1,4 @@
+import { negativeInteractionClass } from '@/lib/negativeInteraction.mjs'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   CalendarDays, Check, ChevronLeft, ChevronRight, Loader2,
@@ -1045,7 +1046,7 @@ export function NegativePatrolTaskCreator({
                           {PLATFORM_LABELS[candidate.platform] || candidate.platform}
                         </span>
                         <span className="text-[11px] text-muted-foreground">{formatPublishDate(candidate)}</span>
-                        <span className="text-[11px] text-muted-foreground">互动 {candidateInteraction(candidate)}</span>
+                        <span className={`text-[11px] ${negativeInteractionClass(candidate.effectiveSentiment, candidateInteraction(candidate))}`}>互动 {candidateInteraction(candidate)}</span>
                         {sentiment && <span className="text-[11px] font-medium text-status-red">{sentiment}</span>}
                       </span>
                       <span className="mt-1.5 line-clamp-2 block text-sm font-semibold leading-5 text-foreground">

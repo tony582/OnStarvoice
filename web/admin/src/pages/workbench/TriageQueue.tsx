@@ -1,3 +1,4 @@
+import { negativeInteractionClass } from '@/lib/negativeInteraction.mjs'
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
@@ -1785,7 +1786,7 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
       </div>
 
       <div className={cn('mt-3 grid grid-cols-3 divide-x divide-border/60 rounded-lg bg-muted/35 px-1 py-2', canWrite && 'ml-10')}>
-        <MobileMetric label="互动" value={formatNumber(interactions)} />
+        <MobileMetric label="互动" value={formatNumber(interactions)} valueClassName={negativeInteractionClass(r.sentiment, interactions, 'text-foreground')} />
         <MobileMetric label="发布" value={r.publish_display || '—'} />
         <MobileMetric label="最近采集" value={formatDateCompact(r.last_seen_at)} />
       </div>
@@ -1816,10 +1817,10 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
   )
 }
 
-function MobileMetric({ label, value }: { label: string; value: string }) {
+function MobileMetric({ label, value, valueClassName = 'text-foreground' }: { label: string; value: string; valueClassName?: string }) {
   return (
     <div className="min-w-0 px-2 text-center">
-      <div className="truncate text-[11px] font-semibold tabular-nums text-foreground">{value}</div>
+      <div className={`truncate text-[11px] font-semibold tabular-nums ${valueClassName}`}>{value}</div>
       <div className="mt-0.5 text-[9.5px] text-muted-foreground">{label}</div>
     </div>
   )
@@ -1894,7 +1895,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
       </td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
       {!narrow && <td className="px-3 py-3.5 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} /></td>}
-      {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(interactions)}</td>}
+      {!narrow && <td className={`px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums ${negativeInteractionClass(r.sentiment, interactions, 'text-foreground')}`}>{formatNumber(interactions)}</td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(r.comments_count)}</td>}
       {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(r.likes)}</td>}
       {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}

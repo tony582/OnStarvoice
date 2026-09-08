@@ -3124,7 +3124,7 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   );
   assert.match(claim, /ELASTIC_TECHNICAL_RETRY_ROUNDS/u);
   assert.match(claim, /FROM capture_task_item_attempts safety_attempt/u);
-  assert.match(claim, /MOD\(item\.attempt_count, agent_policy\.agent_attempt_limit\)/u);
+  assert.match(claim, /MOD\(item\.attempt_count -[\s\S]*manualRetryBaseAttemptCount[\s\S]*agent_policy\.agent_attempt_limit\)/u);
   assert.match(claim, /item\.assigned_agent_id IS DISTINCT FROM \$2::uuid/u);
   assert.match(claim, /COUNT\(DISTINCT configured_agent_id\)/u);
   assert.match(claim, /CROSS JOIN LATERAL/u);
@@ -3171,8 +3171,8 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   assert.match(claim, /capture_task_item_attempts recent_attempt/u);
   assert.match(
     claim,
-    /MOD\(item\.attempt_count, agent_policy\.agent_attempt_limit\)/u,
-    'technical attempts reset only after the whole pool pass is exhausted',
+    /MOD\(item\.attempt_count -[\s\S]*manualRetryBaseAttemptCount[\s\S]*agent_policy\.agent_attempt_limit\)/u,
+    'technical attempts rotate within the pool; explicit manual recovery starts a new bounded budget',
   );
   assert.match(
     claim,
@@ -4807,7 +4807,9 @@ test("every new negative create is one admitted post with an exact attempt", () 
   assert.match(claim, /itemIds: \[candidate\.item_id\]/u);
   assert.match(claim, /attemptIdentity/u);
   assert.match(claim, /requested_by_name, expires_at, admitted_at/u);
-  assert.match(claim, /targetedWorkflow === 'negative_post_patrol'/u);
+  assert.match(claim, /const negativePost = candidate\.item_type === 'negative_post'/u);
+  assert.match(claim, /perItemAdmissionV1: negativePost/u);
+  assert.match(claim, /ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS\)\.toISOString\(\),\s*negativePost/u);
 
   const retry = readRouteSection(
     "export async function dispatchCrossDeviceRetry",

@@ -1,3 +1,4 @@
+import { negativeInteractionClass } from '@/lib/negativeInteraction.mjs'
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import cloud from 'd3-cloud'
 import {
@@ -1230,7 +1231,7 @@ function TopContent({ rows }: { rows: any[] }) {
               <span className="truncate">{row.author_name || '未知作者'}</span>
             </div>
           </div>
-          <span className="text-xs font-semibold tabular-nums text-muted-foreground">{formatNumber(interactions(row))}</span>
+          <span className={`text-xs font-semibold tabular-nums ${negativeInteractionClass(row.sentiment, interactions(row))}`}>{formatNumber(interactions(row))}</span>
         </div>
       ))}
     </div>
@@ -1505,7 +1506,7 @@ function RiskItems({ rows }: { rows: any[] }) {
               <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                 <StatusBadge tone="neutral">{platformName(row.platform)}</StatusBadge>
                 <span>{row.author_name || row.record_author_name || '未知作者'}</span>
-                <span>{formatNumber(interactions(row))} 互动</span>
+                <span className={negativeInteractionClass(row.sentiment, interactions(row))}>{formatNumber(interactions(row))} 互动</span>
                 {row.negative_comment_count > 0 && <StatusBadge tone="negative">负评 {formatNumber(row.negative_comment_count)}</StatusBadge>}
               </div>
             </div>

@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Drawer } from '@/components/shared/Drawer'
 import { AgentPicker } from './AgentPicker'
 import { AgentTaskCreator } from './AgentTaskCreator'
+import { NegativePatrolScheduleOption } from './NegativePatrolScheduleOption'
 import { NegativePatrolTaskCreator } from './NegativePatrolTaskCreator'
 import { WatchedContentTaskCreator } from './WatchedContentTaskCreator'
 import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCreator'
@@ -103,9 +104,10 @@ export function CreateTaskDrawer({
           : intent.taskType === 'watched_content'
             ? 'watched_content'
             : null
-  const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType)
+  const startsAtConfigure = editingExisting || Boolean(presetAgentId && presetTaskType && presetTaskType !== 'unattended_plan')
 
-  const [step, setStep] = useState<WizardStep>(startsAtConfigure ? 'configure' : 'type')
+  const [step, setStep] = useState<WizardStep>(startsAtConfigure ? 'configure' : presetAgentId && presetTaskType === 'unattended_plan' ? 'method' : 'type')
+  const [negativePatrolEnabled, setNegativePatrolEnabled] = useState(false)
   const [taskType, setTaskType] = useState<TaskType>(presetTaskType || 'keyword')
   const [method, setMethod] = useState<ExecutionMethod>(() => (
     ['negative_patrol', 'watched_content'].includes(presetTaskType || '') ? 'multi' : 'single'
@@ -120,7 +122,7 @@ export function CreateTaskDrawer({
   // 已选节点里当前仍可接单的（任务类型回退修改后，原选择可能因能力/平台不符被阻断）。
   const selectedAssignableIds = selectedAgentIds.filter(id => {
     const agent = agents.find(candidate => candidate.id === id)
-    return agent ? !agentTaskTypeBlockReason(agent, taskType, mode) : false
+    return agent ? !agentTaskTypeBlockReason(agent, taskType, negativePatrolEnabled && taskType === 'unattended_plan' ? 'one_time' : mode) : false
   })
   const showIndicator = !editingExisting
   const atFirstStep = step === 'type' || (step === 'configure' && startsAtConfigure)
@@ -149,24 +151,39 @@ export function CreateTaskDrawer({
     return onClose()
   }
 
+  const launchSingleCloudPlan = () => onLaunchOrchestration({
+    executionMode: 'unattended_plan',
+    agentIds: selectedAgentIds.slice(0, 1),
+    lockExecutionMode: true,
+    minimumAgentCount: 1,
+    lockAgentSelection: true,
+    initialNegativePatrolEnabled: true,
+  })
+
   const goNext = () => {
     if (step === 'type') {
       if (taskType === 'negative_patrol') return setStep('configure')
-      if (presetAgentId) return setStep('configure')
+      if (presetAgentId) return setStep(taskType === 'unattended_plan' ? 'method' : 'configure')
       return setStep('method')
     }
     if (step === 'method') {
+      if (presetAgentId) {
+        if (taskType === 'unattended_plan' && negativePatrolEnabled) return launchSingleCloudPlan()
+        return setStep('configure')
+      }
       if (method === 'multi' && !contentPatrolTask) {
         return onLaunchOrchestration({
           executionMode: mode,
           agentIds: [],
           lockExecutionMode: true,
           minimumAgentCount: 2,
+          initialNegativePatrolEnabled: taskType === 'unattended_plan' && negativePatrolEnabled,
         })
       }
       return setStep('agents')
     }
     if (step === 'agents') {
+      if (taskType === 'unattended_plan' && negativePatrolEnabled && method === 'single') return launchSingleCloudPlan()
       return setStep('configure')
     }
   }
@@ -220,6 +237,18 @@ export function CreateTaskDrawer({
       </header>
 
       <div className="flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6">
+        {!editingExisting && taskType === 'unattended_plan' && step !== 'configure' && (
+          <div className="mx-auto mb-4 max-w-2xl space-y-2">
+            <NegativePatrolScheduleOption checked={negativePatrolEnabled} disabled={!writable} onChange={setNegativePatrolEnabled} />
+            {negativePatrolEnabled && <p className="text-[11px] leading-5 text-muted-foreground">接下来配置云端计划，每个计划时间执行一轮；选择固定节点时仍只由该节点执行。已有设备本地计划会保留，请避免重复设置相同关键词和时间。</p>}
+          </div>
+        )}
+        {editingExisting && taskType === 'unattended_plan' && (
+          <div className="mx-auto mb-4 max-w-2xl rounded-xl border border-border bg-muted/30 p-3 text-xs leading-5">
+            <p>当前编辑的是设备本地计划。附带负面巡查需要另建云端计划并重新配置关键词与时间；原计划会保留，请先在计划列表处理重复的本地计划。</p>
+            <Button type="button" variant="outline" size="sm" className="mt-2" disabled={!writable} onClick={launchSingleCloudPlan}>另建含负面巡查的云端计划</Button>
+          </div>
+        )}
         {step === 'type' && (
           <div className="mx-auto max-w-2xl">
             <div className="mb-4">
@@ -267,7 +296,7 @@ export function CreateTaskDrawer({
               <p className="mt-1 text-sm leading-6 text-muted-foreground">固定节点适合必须保留同一浏览器现场的任务；弹性池适合可拆分的批量工作。</p>
             </div>
             <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="执行方式">
-              {EXECUTION_METHODS.map(item => {
+              {EXECUTION_METHODS.filter(item => !presetAgentId || item.value === 'single').map(item => {
                 const Icon = item.icon
                 const selected = method === item.value
                 const unavailable = ['comment_patrol', 'creator_patrol'].includes(taskType) && item.value === 'multi'
@@ -329,7 +358,7 @@ export function CreateTaskDrawer({
             <AgentPicker
               agents={agents}
               tasks={tasks}
-              mode={mode}
+              mode={negativePatrolEnabled && taskType === 'unattended_plan' ? 'one_time' : mode}
               taskType={taskType}
               multiple={method === 'multi'}
               selectedIds={selectedAgentIds}

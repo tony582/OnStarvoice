@@ -42,6 +42,10 @@ import {
 import {
   normalizeCaptureResourcePolicy,
 } from '../services/capture-resource-policy.js';
+import {
+  loadUnattendedNegativePatrolCandidates,
+  normalizeUnattendedNegativePatrolScope,
+} from '../services/unattended-negative-patrol.js';
 
 const router = Router();
 const UUID_PATTERN =
@@ -280,6 +284,9 @@ function normalizeCreateRequest(body) {
         planSnapshot: {
           ...remoteTaskInput.planSnapshot,
           keywords: normalized.keywords,
+          ...(normalized.taskInput.negativePatrol
+            ? {negativePatrol: normalized.taskInput.negativePatrol}
+            : {}),
         },
       },
     };
@@ -328,6 +335,9 @@ function normalizeScheduleUpdate(
   );
   const normalized = normalizeCreateRequest({
     ...safeBody,
+    ...(!Object.hasOwn(safeBody, 'negativePatrol') &&
+        safeJson(existingPlanSnapshot.negativePatrol).enabled === true
+      ? {negativePatrol: existingPlanSnapshot.negativePatrol} : {}),
     ...(
       rawDistributionMode === 'elastic_pool' &&
         !carriesResourcePolicy &&
@@ -442,6 +452,15 @@ function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
     };
   }
   const capabilities = safeJson(agent.capabilities);
+  if (safeJson(planSnapshot.negativePatrol).enabled === true &&
+      !(capabilities.remoteTargetedPostCaptureV1 === true &&
+        capabilities.negativePostPatrol === true &&
+        capabilities.negativePatrolTerminalReceiptV1 === true)) {
+    return {
+      code: 'agent_negative_patrol_capability_missing',
+      message: '附带负面巡查的节点需要支持逐帖巡查和结果确认，请先更新扩展',
+    };
+  }
   if (capabilities.remoteTaskCreate !== true) {
     return {
       code: 'agent_capability_missing',
@@ -825,6 +844,33 @@ function mapAllocationGroups(allocation, items, agentsById) {
     },
   );
 }
+
+router.post(
+  '/orchestrations/negative-patrol-preview',
+  requireTenantAccess,
+  requireSessionUser,
+  async (req, res, next) => {
+    try {
+      const scope = normalizeUnattendedNegativePatrolScope({
+        tenantId: req.tenantId,
+        platforms: [req.body?.platform],
+        keywords: req.body?.keywords,
+        runStartedAt: new Date().toISOString(),
+        timezone: 'Asia/Shanghai',
+      });
+      const result = await withTransaction(async tx => {
+        await tx.execute('SET TRANSACTION READ ONLY');
+        return loadUnattendedNegativePatrolCandidates(tx, scope);
+      });
+      return res.json({ok: true, ...result, candidates: result.candidates.slice(0, 20)});
+    } catch (error) {
+      if (error?.code === 'invalid_negative_patrol_scope') {
+        return sendRequestError(res, requestError(error.code, error.message));
+      }
+      next(error);
+    }
+  },
+);
 
 router.post(
   '/orchestrations',
@@ -3623,7 +3669,8 @@ router.post(
           req.tenantId,
           parent.id,
           ORCHESTRATION_STOPPABLE_EXECUTION_STATUSES,
-          negativePatrolUsesDedicatedPerItemQueue(parent),
+          negativePatrolUsesDedicatedPerItemQueue(parent) ||
+            safeJson(parent.metadata?.planSnapshot?.negativePatrol).enabled === true,
         ]);
         const executionTaskIdsForControl = executionTasks.map(task => task.id);
         const activeCommands = executionTaskIdsForControl.length > 0
@@ -5175,6 +5222,95 @@ router.post(
 );
 
 router.post(
+  '/orchestrations/:id/negative-patrol/retry',
+  requireTenantAccess,
+  requireSessionUser,
+  requireTenantWriter,
+  async (req, res, next) => {
+    try {
+      const parentId = orchestrationRouteId(req, res);
+      if (!parentId) return;
+      const itemIds = [...new Set((Array.isArray(req.body?.itemIds) ? req.body.itemIds : [])
+        .map(normalizedUuid).filter(Boolean))];
+      if (!itemIds.length || itemIds.length > 300) {
+        return sendRequestError(res, requestError('invalid_retry_items', '请选择需要恢复的负面巡查项'));
+      }
+      const result = await withTransaction(async tx => {
+        const sources = await tx.queryAll(`SELECT child.id, child.status FROM capture_tasks child
+          WHERE child.tenant_id = $1 AND child.parent_task_id = $2
+            AND child.id IN (SELECT execution_task_id FROM capture_task_items
+              WHERE tenant_id = $1 AND task_id = $2 AND id = ANY($3::uuid[]))
+          ORDER BY child.id FOR UPDATE`, [req.tenantId, parentId, itemIds]);
+        const parent = await tx.queryOne(parentSelect({lock: true}), [parentId, req.tenantId]);
+        if (!parent?.metadata?.negativePatrolRun || parent.metadata.operatorStopped === true ||
+            ['canceled', 'superseded'].includes(parent.status)) {
+          return {failure: requestError('patrol_not_recoverable', '当前轮不能恢复负面巡查', 409)};
+        }
+        if (Number(parent.orchestration_revision) !== Number(req.body?.expectedRevision)) {
+          return {failure: requestError('revision_conflict', '任务已更新，请刷新后重试', 409)};
+        }
+        const items = await tx.queryAll(`SELECT * FROM capture_task_items
+          WHERE tenant_id = $1 AND task_id = $2 AND id = ANY($3::uuid[])
+          ORDER BY id FOR UPDATE`, [req.tenantId, parentId, itemIds]);
+        if (items.length !== itemIds.length || items.some(item =>
+          item.metadata?.unattendedNegativePatrol !== true ||
+          !['failed', 'needs_action'].includes(item.status))) {
+          return {failure: requestError('invalid_retry_items', '只能恢复本轮失败或需处理的负面巡查项', 409)};
+        }
+        if (items.some(itemRequiresManualSafetyAction) && req.body?.confirmSafety !== true) {
+          return {failure: requestError('retry_requires_safety_confirmation', '请先处理设备验证或登录问题，再确认恢复巡查', 409)};
+        }
+        const command = await tx.queryOne(`SELECT id FROM capture_agent_commands
+          WHERE tenant_id = $1 AND task_id = ANY($2::uuid[])
+            AND status IN ('pending', 'acknowledged') LIMIT 1`,
+        [req.tenantId, sources.map(source => source.id)]);
+        if (command || sources.some(source => !HANDOFF_SOURCE_FINAL_STATUSES.has(source.status))) {
+          return {failure: requestError('retry_source_not_settled', '原执行尚未结束，请等待设备确认后恢复', 409)};
+        }
+        await tx.execute(`UPDATE unattended_negative_patrol_state state
+          SET needs_action = false, cooldown_until = NULL, failure_count = 0,
+            lease_item_id = NULL, lease_execution_task_id = NULL,
+            lease_assignment_revision = NULL, lease_started_at = NULL,
+            last_failure_item_id = NULL, last_failure_execution_task_id = NULL,
+            updated_at = now()
+          WHERE state.tenant_id = $1 AND state.record_id = ANY($2::uuid[])
+            AND (state.lease_item_id IS NULL OR state.lease_item_id = ANY($3::uuid[]))`,
+        [req.tenantId, items.map(item => item.record_id), itemIds]);
+        await tx.execute(`UPDATE capture_task_items SET status = 'pending',
+          assigned_agent_id = NULL, execution_task_id = NULL,
+          assignment_revision = assignment_revision + 1,
+          started_at = NULL, finished_at = NULL, error = '{}'::jsonb,
+          metadata = (metadata - 'checkpoint' - 'targetResult') || jsonb_build_object(
+            'manualRetryBaseAttemptCount', attempt_count,
+            'elasticAttemptBudgetUsed', 0, 'manualRetryAt', now()::text),
+          updated_at = now()
+          WHERE tenant_id = $1 AND task_id = $2 AND id = ANY($3::uuid[])`,
+        [req.tenantId, parentId, itemIds]);
+        const revision = Number(parent.orchestration_revision) + 1;
+        const currentItems = await tx.queryAll(`SELECT status FROM capture_task_items
+          WHERE tenant_id = $1 AND task_id = $2`, [req.tenantId, parentId]);
+        const aggregate = aggregateParentTaskItems(currentItems);
+        await tx.execute(`UPDATE capture_tasks SET status = 'running',
+          orchestration_revision = $3, finished_at = NULL, updated_at = now(),
+          counts = $4::jsonb, progress = $5::jsonb,
+          message = '失败巡查已恢复到原队列，空闲节点将重新核对范围后领取'
+          WHERE tenant_id = $1 AND id = $2`, [req.tenantId, parentId, revision,
+          JSON.stringify(aggregate.counts), JSON.stringify(aggregate.progress)]);
+        await appendEvent(tx, {
+          tenantId: req.tenantId, taskId: parentId, actorType: 'user',
+          actorId: req.user?.id || '', actorName: req.actorName,
+          eventType: 'unattended_negative_patrol_requeued', status: 'running',
+          message: '恢复失败负面巡查，保留原执行历史', payload: {itemIds, revision},
+        });
+        return {revision, itemCount: items.length};
+      });
+      if (result.failure) return sendRequestError(res, result.failure);
+      res.json({ok: true, ...result});
+    } catch (error) { next(error); }
+  },
+);
+
+router.post(
   '/orchestrations/:id/retry-items',
   requireTenantAccess,
   requireSessionUser,
@@ -5414,6 +5550,10 @@ router.post(
         );
         const itemById = new Map(items.map(item => [String(item.id), item]));
         const retryItems = normalized.itemIds.map(itemId => itemById.get(itemId));
+        if (retryItems.some(item => item?.metadata?.unattendedNegativePatrol === true)) {
+          return {failure: requestError('negative_patrol_per_item_queue_required',
+            '请使用负面巡查列表的恢复操作，不能将逐帖巡查作为关键词重试', 409)};
+        }
         if (retryItems.some(item => !item)) {
           return {failure: requestError(
             'retry_item_not_found',

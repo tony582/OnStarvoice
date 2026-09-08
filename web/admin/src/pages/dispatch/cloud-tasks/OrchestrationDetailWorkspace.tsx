@@ -1,3 +1,4 @@
+import { hasUnattendedNegativePatrol } from './unattendedNegativePatrol.mjs'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
@@ -367,6 +368,7 @@ export function OrchestrationDetailWorkspace({
   const [attentionAction, setAttentionAction] = useState<'resume' | 'stop' | ''>('')
   const [keywordRetryAgentOverrides, setKeywordRetryAgentOverrides] = useState<Record<string, string>>({})
   const [keywordRetrying, setKeywordRetrying] = useState(false)
+  const [scheduledNegativeRetrying, setScheduledNegativeRetrying] = useState(false)
   const [negativeReassignOpen, setNegativeReassignOpen] = useState(false)
   const [negativeReassigning, setNegativeReassigning] = useState(false)
   const [negativeReassignAgentIds, setNegativeReassignAgentIds] = useState<Set<string>>(new Set())
@@ -475,7 +477,7 @@ export function OrchestrationDetailWorkspace({
   const keywordRetryItems = useMemo(() => {
     if (!detail || contentPatrol || isScheduleTemplate) return []
     return sortedItems.filter(item => {
-      if (!KEYWORD_RETRY_STATUSES.has(item.status)) return false
+      if (item.item_type !== 'keyword' || !KEYWORD_RETRY_STATUSES.has(item.status)) return false
       if (safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata)) {
         // 弹性池第一次命中验证码会自动换 Agent；此时 item 已被服务端明确
         // 标为 retryable，不应提前显示成人工待办。
@@ -612,6 +614,7 @@ export function OrchestrationDetailWorkspace({
   const attentionContext = useMemo(() => {
     if (!detail || contentPatrol) return null
     const item = sortedItems.find(candidate =>
+      candidate.item_type === 'keyword' &&
       Boolean(candidate.execution_task_id) &&
       candidate.status === 'needs_action' &&
       (
@@ -622,6 +625,7 @@ export function OrchestrationDetailWorkspace({
     const execution = item
       ? detail.executions.find(candidate => executionTaskId(candidate) === item.execution_task_id)
       : detail.executions.find(candidate => {
+          if (!sortedItems.some(item => item.item_type === 'keyword' && item.execution_task_id === executionTaskId(candidate))) return false
           const metadata = candidate.metadata && typeof candidate.metadata === 'object'
             ? candidate.metadata as Record<string, unknown>
             : {}
@@ -1211,6 +1215,40 @@ export function OrchestrationDetailWorkspace({
   const planSnapshot = metadata.planSnapshot && typeof metadata.planSnapshot === 'object'
     ? metadata.planSnapshot as Record<string, unknown>
     : {}
+  const unattendedNegativePatrol = hasUnattendedNegativePatrol(scheduleTemplate ? schedule?.plan_snapshot || planSnapshot : planSnapshot)
+  const keywordItems = sortedItems.filter(item => item.item_type === 'keyword')
+  const scheduledNegativeItems = sortedItems.filter(item => item.item_type === 'negative_post')
+  const negativeRun = metadata.negativePatrolRun && typeof metadata.negativePatrolRun === 'object' ? metadata.negativePatrolRun as Record<string, unknown> : null
+  const negativeRunSummary = negativeRun?.summary && typeof negativeRun.summary === 'object' ? negativeRun.summary as Record<string, unknown> : {}
+  const negativeCompleted = scheduledNegativeItems.filter(item => ['completed', 'completed_with_warnings'].includes(item.status)).length
+  const negativeFailed = scheduledNegativeItems.filter(item => item.status === 'failed').length
+  const negativeNeedsAction = scheduledNegativeItems.filter(item => item.status === 'needs_action').length
+  const negativeSkipped = scheduledNegativeItems.filter(item => ['skipped', 'canceled'].includes(item.status)).length
+  const scheduledNegativeRetryItems = scheduledNegativeItems.filter(item => ['failed', 'needs_action'].includes(item.status))
+  const retryScheduledNegativeItems = async () => {
+    if (!writable || scheduledNegativeRetrying || scheduledNegativeRetryItems.length === 0) return
+    const requiresSafetyConfirmation = scheduledNegativeRetryItems.some(item => safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata))
+    if (!window.confirm(requiresSafetyConfirmation
+      ? `这 ${scheduledNegativeRetryItems.length} 篇负面内容中包含平台验证受阻项。请先在对应节点完成验证码或登录验证，再确认恢复。已完成的关键词与帖子不会重跑。`
+      : `将 ${scheduledNegativeRetryItems.length} 篇失败或待处理的负面内容恢复到本轮队列吗？仍优先执行关键词，已完成的内容不会重跑。`)) return
+    setScheduledNegativeRetrying(true)
+    setActionError('')
+    setActionFeedback('')
+    try {
+      const result = await api.post<{ok: true; revision: number; itemCount: number}>(`/capture-cloud/orchestrations/${orchestration.id}/negative-patrol/retry`, {
+        expectedRevision: Number(orchestration.revision || orchestration.orchestration_revision || 0),
+        itemIds: scheduledNegativeRetryItems.map(item => item.id),
+        confirmSafety: requiresSafetyConfirmation,
+      })
+      setActionFeedback(`已将 ${result.itemCount} 篇负面内容恢复到本轮队列，等待节点空闲后执行。`)
+      await load(true)
+      await onChanged?.()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '恢复负面巡查失败')
+    } finally {
+      setScheduledNegativeRetrying(false)
+    }
+  }
   const keywordLimit = Number(planSnapshot.keywordMaxDetectedItems)
   const searchFilters = planSnapshot.searchFilters && typeof planSnapshot.searchFilters === 'object'
     ? planSnapshot.searchFilters as Record<string, unknown>
@@ -1792,6 +1830,22 @@ export function OrchestrationDetailWorkspace({
             </div>
           </section>
         )}
+        {unattendedNegativePatrol && (
+          <section className="mb-4 rounded-xl border border-primary/20 bg-primary/[0.035] p-4" aria-label="附带负面巡查">
+            <h3 className="text-sm font-semibold">同时巡查近7天负面内容</h3>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">每轮选取当前平台此前 7 天发布的负面内容；关键词采集优先，节点空闲后逐篇接续，沿用现有处理状态。</p>
+            {!scheduleTemplate && <div className="mt-2 space-y-1 text-xs">
+              <p>本轮关键词 <strong>{keywordItems.length}</strong> 项 · 负面巡查 <strong>{scheduledNegativeItems.length}</strong> 篇</p>
+              <p className="text-muted-foreground">负面已完成 {negativeCompleted} · 失败 {negativeFailed} · 需人工 {negativeNeedsAction} · 跳过/取消 {negativeSkipped} · 其余等待或执行中 {scheduledNegativeItems.length - negativeCompleted - negativeFailed - negativeNeedsAction - negativeSkipped}</p>
+              {negativeRun && <>
+                <p className="text-muted-foreground">入选窗口：{formatTime(String(negativeRun.windowStart || ''))} 至 {formatTime(String(negativeRun.windowEnd || ''))}</p>
+                <p className="text-muted-foreground">本轮启动时的候选状态：首次待查 {Number(negativeRunSummary.firstPending) || 0} · 已到期 {Number(negativeRunSummary.due) || 0} · 未到期 {Number(negativeRunSummary.notDue) || 0} · 冷却中 {Number(negativeRunSummary.coolingDown) || 0} · 已排除 {Number(negativeRunSummary.excluded) || 0}</p>
+                <p className="text-muted-foreground">发布时间缺失 {Number(negativeRunSummary.unknownPublishTime) || 0} · 即将出窗未查 {Number(negativeRunSummary.expiringUncovered) || 0} · 超窗未覆盖 {Number(negativeRunSummary.outOfWindowUncovered) || 0}</p>
+                <p className="text-[11px] text-muted-foreground">入选候选不代表已完成巡查；本轮执行结果以上方工作项状态为准。</p>
+              </>}
+            </div>}
+          </section>
+        )}
         <ol className="mb-4 flex items-center gap-2 overflow-x-auto pb-1" aria-label="编排任务结构">
           <li className="flex min-w-36 items-center gap-2 rounded-xl border border-primary/25 bg-primary/[0.045] px-3 py-2">
             <ClipboardList className="h-4 w-4 shrink-0 text-primary" />
@@ -1877,11 +1931,42 @@ export function OrchestrationDetailWorkspace({
         {!contentPatrol && !scheduleTemplate ? (
           <div className="mt-4">
             <KeywordExecutionReport
-              items={sortedItems}
+              items={unattendedNegativePatrol ? keywordItems : sortedItems}
               executions={executions}
               agents={agents}
               attempts={attempts}
             />
+            {unattendedNegativePatrol && (
+              <section className="mt-4 overflow-hidden rounded-2xl border border-border/70 bg-card" aria-label="本轮负面巡查结果">
+                <div className="border-b border-border/70 px-4 py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="text-sm font-semibold">负面巡查工作项 · {scheduledNegativeItems.length} 篇</h3>{scheduledNegativeRetryItems.length > 0 && <Button type="button" variant="outline" size="sm" disabled={!writable || scheduledNegativeRetrying} onClick={() => void retryScheduledNegativeItems()}>{scheduledNegativeRetrying ? '正在恢复…' : `恢复失败巡查 ${scheduledNegativeRetryItems.length} 篇`}</Button>}</div>
+                  <p className="mt-1 text-[11px] text-muted-foreground">逐篇展示执行状态；帖子处理状态继续保留在内容工作台。</p>
+                </div>
+                {scheduledNegativeItems.length === 0
+                  ? <p className="px-4 py-6 text-xs text-muted-foreground">{negativeRun ? '本轮没有可执行的负面巡查工作项；未到期、冷却中或已排除的内容不重复采集。' : '本轮尚无负面巡查工作项；候选清单在运行时生成。'}</p>
+                  : <div className="divide-y divide-border/70">{scheduledNegativeItems.map(item => {
+                    const assignedAgent = agentsById.get(itemAssignedAgentId(item, executions, attempts))
+                    const errorMessage = dataMessage(item.error)
+                    const lastSuccessAt = String(item.metadata?.lastSuccessAt || '')
+                    const nextDueDate = String(item.metadata?.nextDueDate || '')
+                    const skipReason = String(item.metadata?.skipReason || '')
+                    const skipLabel = skipReason === 'next_run_rollover' ? '留待下一轮'
+                      : skipReason === 'not_due' ? '已覆盖，未到复查日期'
+                        : skipReason.startsWith('triage_') ? '当前处理状态已排除'
+                          : skipReason ? '本轮未执行，已跳过' : ''
+                    return <article key={item.id} className="px-4 py-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h4 className="min-w-0 text-sm font-medium">{keywordForItem(item)}</h4>
+                        <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusTone(item.status)}`}>{itemAvailabilityLabel(item) || statusLabel(item.status)}</span>
+                      </div>
+                      <p className="mt-1 text-[11px] text-muted-foreground">{PLATFORM_LABELS[item.platform] || item.platform} · {agentName(assignedAgent)} · 更新 {formatTime(item.updated_at)}</p>
+                      <p className="mt-1 text-[11px] text-muted-foreground">最近成功：{lastSuccessAt ? formatTime(lastSuccessAt) : '尚无成功巡查记录'}{nextDueDate ? ` · 下次复查：${nextDueDate.slice(0, 10)}` : ''}</p>
+                      {skipLabel && <p className="mt-1 text-[11px] text-muted-foreground">{skipLabel}</p>}
+                      {errorMessage && <p className="mt-1 text-[11px] text-status-red">{errorMessage}</p>}
+                    </article>
+                  })}</div>}
+              </section>
+            )}
           </div>
         ) : <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
           <section className="overflow-hidden rounded-2xl border border-border/70 bg-card">

@@ -744,6 +744,8 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
           lockExecutionMode={orchestrationLaunchIntent.lockExecutionMode}
           minimumAgentCount={orchestrationLaunchIntent.minimumAgentCount}
           initialAgentIds={orchestrationLaunchIntent.agentIds}
+          initialNegativePatrolEnabled={orchestrationLaunchIntent.initialNegativePatrolEnabled}
+          lockAgentSelection={orchestrationLaunchIntent.lockAgentSelection}
           onClose={closeOrchestrationComposer}
           onChanged={async () => {
             setOrchestrationRefreshKey(value => value + 1)

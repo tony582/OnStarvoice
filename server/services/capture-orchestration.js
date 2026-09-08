@@ -496,6 +496,14 @@ export function normalizeOrchestrationRequest(
   const distributionMode = rawDistributionMode === 'elastic_pool'
     ? 'elastic_pool'
     : 'fixed_batch';
+  const negativePatrolEnabled = object(source.negativePatrol).enabled === true;
+  if (negativePatrolEnabled &&
+      !(executionMode === 'unattended_plan' && distributionMode === 'elastic_pool')) {
+    throw scheduleError(
+      'negative_patrol_requires_cloud_schedule',
+      '附带负面巡查需要使用云端无人值守计划，可选择一个或多个执行节点',
+    );
+  }
   if (
     Object.keys(resourcePolicy).length > 0 &&
     !(executionMode === 'unattended_plan' && distributionMode === 'elastic_pool')
@@ -567,6 +575,9 @@ export function normalizeOrchestrationRequest(
       roundGapMin: schedule?.roundGapMin || 10,
       ...(sequentialSearchEnabled ? {searchPasses: effectiveSearchPasses} : {}),
       recoveryPolicy,
+      ...(negativePatrolEnabled
+        ? {negativePatrol: {enabled: true, lookbackDays: 7}}
+        : {}),
       ...(Object.keys(resourcePolicy).length > 0 ? {resourcePolicy} : {}),
       ...(schedule ? schedule : {}),
       ...(hasCaptureSettings

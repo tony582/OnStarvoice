@@ -326,7 +326,9 @@ export async function getNegativePatrolAnalytics({
         AND COALESCE(item.finished_at, item.started_at, item.updated_at, item.created_at) >= $2
         AND COALESCE(item.finished_at, item.started_at, item.updated_at, item.created_at) < $3
         AND (${NEGATIVE_PATROL_TASK_SQL('parent_task')}
-          OR ${NEGATIVE_PATROL_TASK_SQL('execution_task')})
+          OR ${NEGATIVE_PATROL_TASK_SQL('execution_task')}
+          OR (item.item_type = 'negative_post'
+            AND item.metadata->>'unattendedNegativePatrol' = 'true'))
     ),
     latest_items AS (
       SELECT DISTINCT ON (scoped_record_id)

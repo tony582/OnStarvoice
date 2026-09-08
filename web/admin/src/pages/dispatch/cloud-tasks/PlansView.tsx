@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { hasUnattendedNegativePatrol } from './unattendedNegativePatrol.mjs'
 import {
   Archive,
   Bot,
@@ -236,6 +237,7 @@ function TemplateCard({
             <PlatformChip platform={task.platform} />
             <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${chip.className}`}>{chip.label}</span>
           </div>
+          {hasUnattendedNegativePatrol(task.metadata?.planSnapshot) && <span className="text-[11px] font-medium text-primary">含近7天负面巡查</span>}
           <h4 className="mt-1.5 truncate text-[14px] font-semibold text-foreground">{task.title || '未命名编排计划'}</h4>
         </div>
         <div className="flex shrink-0 flex-wrap gap-2">
@@ -269,6 +271,7 @@ function TemplateCard({
         <span>{archived ? '归档前排期' : '下次运行'} <span className="text-foreground">{archived ? '已停止' : nextRun}</span></span>
         <span>分配版本 <span className="tabular-nums text-foreground">v{revision}</span></span>
       </div>
+      {hasUnattendedNegativePatrol(task.metadata?.planSnapshot) && <p className="mt-2 text-[11px] leading-5 text-muted-foreground">按发布时间滚动选取近 7 天负面内容，关键词优先，节点空闲接续；沿用现有处理状态。</p>}
       {archived && <p className="mt-2 text-[11px] leading-4 text-muted-foreground">历史批次、执行摘要和采集结果均保留；复制新建不会改变此归档计划。</p>}
     </div>
   )
