@@ -46,7 +46,7 @@ const STEP_LABELS: Array<{ step: WizardStep; label: string }> = [
 function StepIndicator({ step, labels, canBack, onBack }: { step: WizardStep; labels: typeof STEP_LABELS; canBack: (target: WizardStep) => boolean; onBack: (target: WizardStep) => void }) {
   const currentIndex = labels.findIndex(item => item.step === step)
   return (
-    <ol className="grid grid-cols-4 gap-2" aria-label="创建任务步骤">
+    <ol className={`grid gap-2 ${labels.length === 2 ? 'grid-cols-2' : 'grid-cols-4'}`} aria-label="创建任务步骤">
       {labels.map((item, index) => {
         const done = index < currentIndex
         const current = index === currentIndex
@@ -126,7 +126,9 @@ export function CreateTaskDrawer({
   const atFirstStep = step === 'type' || (step === 'configure' && startsAtConfigure)
   const contentPatrolTask = ['negative_patrol', 'watched_content'].includes(taskType)
   const orchestrationPath = method === 'multi' && !contentPatrolTask
-  const stepLabels = orchestrationPath
+  const stepLabels = taskType === 'negative_patrol'
+    ? [{step: 'type' as const, label: '任务类型'}, {step: 'configure' as const, label: '帖子与执行节点'}]
+    : orchestrationPath
     ? [
         { step: 'type' as const, label: '任务类型' },
         { step: 'method' as const, label: '执行范围' },
@@ -138,6 +140,7 @@ export function CreateTaskDrawer({
   const goBack = () => {
     if (step === 'configure') {
       if (startsAtConfigure) return onClose()
+      if (taskType === 'negative_patrol') return setStep('type')
       if (presetAgentId) return setStep('type')
       return setStep('agents')
     }
@@ -148,6 +151,7 @@ export function CreateTaskDrawer({
 
   const goNext = () => {
     if (step === 'type') {
+      if (taskType === 'negative_patrol') return setStep('configure')
       if (presetAgentId) return setStep('configure')
       return setStep('method')
     }
@@ -186,7 +190,7 @@ export function CreateTaskDrawer({
     )
 
   const nextLabel = step === 'type'
-    ? (presetAgentId ? '下一步：任务配置' : '下一步：执行方式')
+    ? (taskType === 'negative_patrol' ? '下一步：选择帖子' : presetAgentId ? '下一步：任务配置' : '下一步：执行方式')
     : step === 'method'
       ? method === 'multi' && !contentPatrolTask
         ? '配置多节点任务'
@@ -206,7 +210,9 @@ export function CreateTaskDrawer({
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               {editingExisting
                 ? '更新该设备的无人值守计划，保存后覆盖原计划。'
-                : '先选择任务类型，再决定固定给一个节点，还是交给弹性节点池。'}
+                : taskType === 'negative_patrol'
+                  ? '先选择巡查帖子，再按帖子平台匹配执行节点。'
+                  : '先选择任务类型，再决定固定给一个节点，还是交给弹性节点池。'}
             </p>
           </div>
         </div>
@@ -338,7 +344,17 @@ export function CreateTaskDrawer({
         )}
 
         {step === 'configure' && (
-          selectedAgent ? (
+          taskType === 'negative_patrol' ? (
+            <div className="mx-auto max-w-2xl">
+              <NegativePatrolTaskCreator
+                agents={agents}
+                writable={writable}
+                initialRecordIds={intent.recordIds}
+                initialAgentIds={presetAgentId ? [presetAgentId] : []}
+                onCreated={async () => { await onCreated(taskType); onClose() }}
+              />
+            </div>
+          ) : selectedAgent ? (
             <div className="mx-auto max-w-2xl">
               {/* 步骤上下文摘要条：任务类型 · 执行方式 · 已选节点；可点击回退修改 */}
               <div className="mb-4 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-border/70 bg-muted/35 px-3 py-2 text-xs text-muted-foreground">
@@ -348,8 +364,6 @@ export function CreateTaskDrawer({
                     ? '无人值守计划'
                     : taskType === 'creator_patrol'
                       ? '关注博主扫描'
-                    : taskType === 'negative_patrol'
-                      ? '负面帖子巡查'
                     : taskType === 'watched_content'
                       ? '关注内容巡查'
                       : taskType === 'comment_patrol'
@@ -371,18 +385,7 @@ export function CreateTaskDrawer({
                   </button>
                 )}
               </div>
-              {taskType === 'negative_patrol' ? (
-                <NegativePatrolTaskCreator
-                  key={`${selectedAgentIds.join(':')}:negative-patrol`}
-                  agents={method === 'multi' ? selectedAgents : [selectedAgent]}
-                  writable={writable}
-                  initialRecordIds={intent.recordIds}
-                  onCreated={async () => {
-                    await onCreated(taskType)
-                    onClose()
-                  }}
-                />
-              ) : taskType === 'watched_content' ? (
+              {taskType === 'watched_content' ? (
                 <WatchedContentTaskCreator
                   key={`${selectedAgentIds.join(':')}:watched-content`}
                   agents={method === 'multi' ? selectedAgents : [selectedAgent]}

@@ -4968,7 +4968,7 @@ test("recovery verification and replay clocks require exact business evidence", 
   );
   assert.match(
     recoverySource,
-    /if \(!item\) continue;\s*projectedItemIds\.push\(item\.id\);/u,
+    /if \(replayedItem\) verifiedReplayItemIds\.push\(replayedItem\.id\);/u,
   );
   assert.match(
     recoverySource,

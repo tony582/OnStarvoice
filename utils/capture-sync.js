@@ -10172,6 +10172,7 @@ async function captureBloggerMetricsForSingleNoteRecord(
     preferWorksTabForBloggerMetrics = null,
     detailNavTimeoutMs = DETAIL_CAPTURE_NAV_TIMEOUT_MS,
     profileAfterNavWaitMs = PROFILE_AFTER_NAV_WAIT_MS,
+    runnerTabId = null,
     shouldStop = null,
     onProgress = null,
   } = {},
@@ -10215,7 +10216,11 @@ async function captureBloggerMetricsForSingleNoteRecord(
       throw new Error('BATCH_CAPTURE_CANCELED');
     }
 
-    tab = await getCurrentActiveTab();
+    const normalizedRunnerTabId = Number(runnerTabId);
+    tab =
+      Number.isSafeInteger(normalizedRunnerTabId) && normalizedRunnerTabId > 0
+        ? await chrome.tabs.get(normalizedRunnerTabId)
+        : await getCurrentActiveTab();
 
     if (directPatch) {
       const donePayload = applyBloggerMetricsPatch(latestPayload, directPatch);
@@ -15224,8 +15229,8 @@ async function runBatchSingleNoteEnhancements(
     includeBloggerMetrics = false,
     enableCommentLeadsFilter = null,
     commentsMaxDetectedItems = null,
-    detailNavTimeoutMs = null,
-    profileAfterNavWaitMs = null,
+    detailNavTimeoutMs = DETAIL_CAPTURE_NAV_TIMEOUT_MS,
+    profileAfterNavWaitMs = PROFILE_AFTER_NAV_WAIT_MS,
     preferWorksTabForBloggerMetrics = null,
     runnerTabId = null,
     shouldStop = null,
@@ -15279,8 +15284,9 @@ async function runBatchSingleNoteEnhancements(
         recordId,
         {
           preferWorksTabForBloggerMetrics,
-          detailNavTimeoutMs,
-          profileAfterNavWaitMs,
+          detailNavTimeoutMs: detailNavTimeoutMs ?? DETAIL_CAPTURE_NAV_TIMEOUT_MS,
+          profileAfterNavWaitMs: profileAfterNavWaitMs ?? PROFILE_AFTER_NAV_WAIT_MS,
+          runnerTabId,
           shouldStop,
           onProgress: emitProgress,
         },

@@ -60,6 +60,8 @@ test('admin waits visibly, retries one safety challenge across Agents, and escal
   assert.match(orchestration, /系统正在按词分配后续/u)
   assert.match(orchestration, /其他未开始关键词仍会自动分配/u)
   assert.match(orchestration, /自动恢复实时状态/u)
+  assert.match(orchestration, /failureMessage: dataMessage\(itemError\)/u)
+  assert.match(orchestration, /上次失败：\{state\.failureMessage\}/u)
   assert.match(orchestration, /formatRecoveryState/u)
   assert.match(orchestration, /executionAwaitingCommandStatus/u)
   assert.match(orchestration, /指令已处于/u)

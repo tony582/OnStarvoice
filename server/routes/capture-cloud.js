@@ -4562,7 +4562,7 @@ async function refreshOrchestrationParentTask(tx, {
   return updated;
 }
 
-async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
+export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
   if (
     !task ||
     !isTargetedPostTaskType(task.task_type) ||
@@ -4601,6 +4601,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
   );
   const isProfilePatrol = isProfilePatrolTask(task);
   const projectedItemIds = [];
+  const verifiedReplayItemIds = [];
   for (const entry of negativePatrolTargetResults(snapshot)) {
     const currentItemState = elasticPool
       ? await tx.queryOne(`
@@ -4779,7 +4780,28 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       executionRevision,
       isProfilePatrol,
     ]);
-    if (!item) continue;
+    if (!item) {
+      // A verified identical replay must not be relabeled as a missing result.
+      const replayedItem = await tx.queryOne(`
+        SELECT id
+        FROM capture_task_items
+        WHERE tenant_id = $1 AND task_id = $2
+          AND execution_task_id = $3 AND assigned_agent_id = $4
+          AND id = $5::uuid AND assignment_revision = $6
+          AND external_id = $7
+          AND metadata->'targetResult' = $8::jsonb
+          AND (
+            ($9::boolean AND metadata->>'subscriptionId' = $10)
+            OR (NOT $9::boolean AND record_id = $10::uuid)
+          )
+      `, [
+        agent.tenant_id, itemOwnerTaskId, task.id, agent.id,
+        entry.itemId, executionRevision, entry.externalId,
+        JSON.stringify(result), isProfilePatrol, entry.recordId,
+      ]);
+      if (replayedItem) verifiedReplayItemIds.push(replayedItem.id);
+      continue;
+    }
     projectedItemIds.push(item.id);
 
     await tx.execute(`
@@ -5006,6 +5028,7 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
         AND execution_task_id = $3
         AND assigned_agent_id = $4
         AND NOT (id = ANY($5::uuid[]))
+        AND assignment_revision = $6
         AND status NOT IN (
           'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
         )
@@ -5016,7 +5039,8 @@ async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = {}) {
       itemOwnerTaskId,
       task.id,
       agent.id,
-      projectedItemIds,
+      [...projectedItemIds, ...verifiedReplayItemIds],
+      executionRevision,
     ]);
     for (const unresolvedItem of unresolvedItems) {
       const attemptCount = Math.max(

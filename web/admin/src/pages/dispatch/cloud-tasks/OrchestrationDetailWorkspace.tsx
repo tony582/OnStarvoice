@@ -717,6 +717,7 @@ export function OrchestrationDetailWorkspace({
       id: string
       label: string
       message: string
+      failureMessage?: string
       waitUntil: number
       agentLabel: string
       commandStatus: string
@@ -814,6 +815,7 @@ export function OrchestrationDetailWorkspace({
         id: `item:${item.id}`,
         label,
         message,
+        failureMessage: dataMessage(itemError),
         waitUntil,
         agentLabel: `原 Agent：${agentName(agentsById.get(String(recovery.sourceAgentId || item.assigned_agent_id || '')))}`,
         commandStatus,
@@ -1368,6 +1370,7 @@ export function OrchestrationDetailWorkspace({
                           </span>
                         </div>
                         <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{state.message}</p>
+                        {state.failureMessage && <p className="mt-1 text-[11px] leading-4 text-status-red">上次失败：{state.failureMessage}</p>}
                         <p className="mt-1 text-[10px] text-muted-foreground">
                           {state.agentLabel}
                           {!state.commandStatus && !state.blockingStatusText && state.waitUntil > nowMs

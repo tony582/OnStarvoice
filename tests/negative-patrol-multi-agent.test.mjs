@@ -265,7 +265,7 @@ test('elastic negative patrol keeps posts unassigned until an eligible idle Agen
   assert.match(route, /requiredPlatforms[\s\S]*loadCompatibleAgents/u);
 });
 
-test('multi-Agent patrol UI requires two nodes but allows fewer posts than pool nodes', async () => {
+test('negative patrol matches dispatch nodes to selected posts and allows fewer posts than pool nodes', async () => {
   const [drawer, creator] = await Promise.all([
     read('web/admin/src/pages/dispatch/cloud-tasks/CreateTaskDrawer.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/NegativePatrolTaskCreator.tsx'),
@@ -276,16 +276,55 @@ test('multi-Agent patrol UI requires two nodes but allows fewer posts than pool 
     /method === 'multi'[\s\S]*selectedAssignableIds\.length < 2/u,
   );
   assert.match(drawer, /多 Agent 模式至少选择 2 个可用节点/u);
-  assert.match(creator, /const eligibleAgents = agents\.filter\(agent => selectedCandidatePlatforms\.some/u);
+  assert.match(
+    creator,
+    /const dispatchAgents = agents\.filter\(agent => selectedCandidatePlatforms\.some\(\s*platform => agentCreatePlatforms\(agent\)\.includes\(platform\),\s*\)\)/u,
+  );
+  assert.match(creator, /const eligibleAgents = dispatchAgents\b/u);
   assert.match(creator, /agentIds:\s*eligibleAgents\.map\(agent => agent\.id\)/u);
-  assert.match(creator, /const elasticPool = multiAgent \|\| selectedPlatforms\.length > 1/u);
+  assert.match(creator, /const elasticPool = dispatchAgents\.length > 1 \|\| selectedCandidatePlatforms\.length > 1/u);
+  assert.match(creator, /const onlineAgentCount = dispatchAgents\.filter\(agent => agent\.online\)\.length/u);
+  assert.match(creator, /\{dispatchAgents\.length\}<\/strong>/u);
   assert.match(creator, /selectedCandidatePlatforms[\s\S]*selectedCandidates\.map\(candidate => candidate\.platform\)/u);
+  assert.match(
+    creator,
+    /const taskInput[^=]*= \{\s*\.\.\.filters,\s*platform: selectedCandidatePlatforms\.length === 1 \? selectedCandidatePlatforms\[0\] : 'mixed',\s*platforms: \[\.\.\.selectedCandidatePlatforms\]\.sort\(\),/u,
+    'the server must receive actual selected-post platforms so a broad preview cannot force a fixed-node request into mixed-platform elastic mode',
+  );
   assert.match(creator, /distributionMode: elasticPool \? 'elastic_pool' : 'fixed_batch'/u);
   assert.doesNotMatch(creator, /allocationInvalid/u);
   assert.doesNotMatch(creator, /帖子数少于节点数/u);
   assert.match(creator, /每个空闲 Agent 一次只领 1 条/u);
   assert.match(creator, /平台覆盖与固定节点/u);
   assert.match(creator, /节点离线时原地等待，不自动转交/u);
+});
+
+test('negative patrol previews before selecting nodes and preserves an explicit entry node', async () => {
+  const [drawer, creator] = await Promise.all([
+    read('web/admin/src/pages/dispatch/cloud-tasks/CreateTaskDrawer.tsx'),
+    read('web/admin/src/pages/dispatch/cloud-tasks/NegativePatrolTaskCreator.tsx'),
+  ]);
+  assert.match(drawer, /if \(step === 'type'\) \{\s*if \(taskType === 'negative_patrol'\) return setStep\('configure'\)/u);
+  assert.match(drawer, /initialAgentIds=\{presetAgentId \? \[presetAgentId\] : \[\]\}/u);
+  assert.match(creator, /initialAgentIds\.length > 0 \? new Set\(initialAgentIds\) : null/u);
+  assert.match(creator, /compatibleAgents\.filter\(agent => \(!explicitAgentIds \|\| explicitAgentIds\.has\(agent\.id\)\)\)/u);
+
+  const filterValidation = creator.slice(
+    creator.indexOf('const validateFilters ='),
+    creator.indexOf('const preview ='),
+  );
+  assert.ok(filterValidation.length > 0);
+  assert.doesNotMatch(filterValidation, /agents\.length|supportsPatrol|agent\.status/u);
+  assert.match(creator, /const missingCoverage = platformCoverage\.filter\(entry => entry\.agents === 0\)/u);
+  assert.match(creator, /if \(missingCoverage\.length > 0\) \{[\s\S]*?setError\([\s\S]*?return/u);
+  assert.match(creator, /const submitDisabled =[\s\S]*?dispatchAgents\.length === 0[\s\S]*?missingCoverage\.length > 0/u);
+
+  const nodeToggleStart = creator.indexOf('onChange={event => setExplicitAgentIds');
+  const nodeToggle = creator.slice(nodeToggleStart, creator.indexOf('})}', nodeToggleStart));
+  assert.ok(nodeToggleStart >= 0 && nodeToggle.length > 0);
+  assert.match(nodeToggle, /if \(event\.target\.checked\) next\.add\(agent\.id\)/u);
+  assert.match(nodeToggle, /else next\.delete\(agent\.id\)/u);
+  assert.doesNotMatch(nodeToggle, /clearPreview|setSelectedIds|setPreviewPages/u);
 });
 
 test('negative patrol detail can reassign only unfinished posts to an explicit online Agent team', async () => {

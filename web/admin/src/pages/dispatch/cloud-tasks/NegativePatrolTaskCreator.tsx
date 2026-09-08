@@ -7,7 +7,7 @@ import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
 import { Button } from '@/components/ui/button'
 import type { CloudAgent } from './lib'
-import { PLATFORM_LABELS, agentCreatePlatforms } from './lib'
+import { PLATFORM_LABELS, agentCreatePlatforms, agentTaskTypeBlockReason } from './lib'
 import {
   classifySubmissionFailure,
   confirmedSubmissionTaskId,
@@ -261,14 +261,16 @@ function discardSubmission(key: string) {
 }
 
 export function NegativePatrolTaskCreator({
-  agents,
+  agents: allAgents,
   writable,
   initialRecordIds = [],
+  initialAgentIds = [],
   onCreated,
 }: {
   agents: CloudAgent[]
   writable: boolean
   initialRecordIds?: string[]
+  initialAgentIds?: string[]
   onCreated: () => Promise<void>
 }) {
   const {user, tenantId} = useAuth()
@@ -276,9 +278,14 @@ export function NegativePatrolTaskCreator({
   const stableInitialIds = useMemo(() => Array.from(new Set(
     initialRecordIds.map(value => String(value || '').trim()).filter(Boolean),
   )).slice(0, NEGATIVE_PATROL_MAX_SELECTED), [initialRecordIds])
-  const availablePlatforms = useMemo(() => Array.from(new Set(
-    agents.flatMap(agent => agentCreatePlatforms(agent)),
-  )), [agents])
+  const availablePlatforms = ['xiaohongshu', 'douyin']
+  const [explicitAgentIds, setExplicitAgentIds] = useState<Set<string> | null>(() =>
+    initialAgentIds.length > 0 ? new Set(initialAgentIds) : null)
+  const compatibleAgents = allAgents.filter(agent => !agentTaskTypeBlockReason(agent, 'negative_patrol', 'one_time')
+    && agent.capabilities?.negativePostPatrol === true
+    && agent.capabilities?.negativePatrolTerminalReceiptV1 === true
+    && agent.capabilities?.remoteTargetedPostCaptureV1 === true)
+  const agents = compatibleAgents.filter(agent => (!explicitAgentIds || explicitAgentIds.has(agent.id)))
   const [title, setTitle] = useState('负面帖子巡查')
   const [platforms, setPlatforms] = useState<string[]>(availablePlatforms)
   const [publishDateFrom, setPublishDateFrom] = useState(initialRange.from)
@@ -309,15 +316,7 @@ export function NegativePatrolTaskCreator({
   const activeScope = useRef('')
   const activeSubmissionRequest = useRef('')
 
-  const supportsPatrol = agents.length > 0
-    && agents.every(agent =>
-      agent.capabilities?.negativePostPatrol === true
-      && agent.capabilities?.negativePatrolTerminalReceiptV1 === true
-      && agent.capabilities?.remoteTargetedPostCaptureV1 === true,
-    )
-  const multiAgent = agents.length > 1
   const selectedPlatforms = platforms.filter(platform => availablePlatforms.includes(platform))
-  const elasticPool = multiAgent || selectedPlatforms.length > 1
   const scopeKey = user?.id && tenantId ? `${user.id}:${tenantId}` : ''
   const currentPage = previewPages[pageIndex] || null
   const candidates = currentPage?.candidates || []
@@ -332,11 +331,15 @@ export function NegativePatrolTaskCreator({
   const selectablePageIds = candidates.filter(canDispatchCandidate).map(candidate => candidate.id)
   const allSelected = selectablePageIds.length > 0
     && selectablePageIds.every(id => selectedIds.has(id))
-  const onlineAgentCount = agents.filter(agent => agent.online).length
   const selectedCandidates = loadedCandidates.filter(candidate => selectedIds.has(candidate.id))
   const selectedCandidatePlatforms = Array.from(new Set(
     selectedCandidates.map(candidate => candidate.platform).filter(Boolean),
   ))
+  const dispatchAgents = agents.filter(agent => selectedCandidatePlatforms.some(
+    platform => agentCreatePlatforms(agent).includes(platform),
+  ))
+  const elasticPool = dispatchAgents.length > 1 || selectedCandidatePlatforms.length > 1
+  const onlineAgentCount = dispatchAgents.filter(agent => agent.online).length
   const platformCoverage = selectedCandidatePlatforms.map(platform => ({
     platform,
     items: selectedCandidates.filter(candidate => candidate.platform === platform).length,
@@ -384,9 +387,6 @@ export function NegativePatrolTaskCreator({
   }
 
   const validateFilters = () => {
-    if (agents.length === 0) return '请至少选择一个执行节点。'
-    if (!supportsPatrol) return '部分节点版本尚不支持负面帖子巡查，请先升级 Extension。'
-    if (agents.some(agent => agent.status !== 'active')) return '已选节点中包含暂停或停用节点，请返回重新选择。'
     if (selectedPlatforms.length === 0) return '请至少选择一个执行平台。'
     if (!publishDateFrom || !publishDateTo) return '发布时间范围不能为空。'
     if (publishDateFrom > publishDateTo) return '发布时间的开始日期不能晚于结束日期。'
@@ -808,18 +808,18 @@ export function NegativePatrolTaskCreator({
       return
     }
     if (missingCoverage.length > 0) {
-      setError(`已选节点未覆盖${missingCoverage.map(entry => PLATFORM_LABELS[entry.platform] || entry.platform).join('、')}，请返回补选对应平台 Agent。`)
+      setError(`已选节点未覆盖${missingCoverage.map(entry => PLATFORM_LABELS[entry.platform] || entry.platform).join('、')}，请在下方补选对应平台节点；若没有可用节点，请启用或升级该平台的采集设备。`)
       return
     }
-    const eligibleAgents = agents.filter(agent => selectedCandidatePlatforms.some(
-      platform => agentCreatePlatforms(agent).includes(platform),
-    ))
+    const eligibleAgents = dispatchAgents
     if (!user?.id || !tenantId || loadedSubmissionScope !== scopeKey) {
       setError('登录信息尚未就绪，无法安全保存提交恢复信息。')
       return
     }
     const taskInput: Record<string, unknown> = {
       ...filters,
+      platform: selectedCandidatePlatforms.length === 1 ? selectedCandidatePlatforms[0] : 'mixed',
+      platforms: [...selectedCandidatePlatforms].sort(),
       agentIds: eligibleAgents.map(agent => agent.id),
       ...(eligibleAgents.length === 1 ? { agentId: eligibleAgents[0].id } : {}),
       distributionMode: elasticPool ? 'elastic_pool' : 'fixed_batch',
@@ -885,15 +885,13 @@ export function NegativePatrolTaskCreator({
   }
 
   const disabled = !writable
-    || agents.length === 0
-    || agents.some(agent => agent.status !== 'active')
     || selectedPlatforms.length === 0
     || submissionLocked
   const submitDisabled = submissionBusy || !writable || (!submission && (
     loadedSubmissionScope !== scopeKey
     || !scopeKey
-    || agents.length === 0
-    || agents.some(agent => agent.status !== 'active')
+    || dispatchAgents.length === 0
+    || dispatchAgents.some(agent => agent.status !== 'active')
     || selectedPlatforms.length === 0
     || previewing
     || !previewed
@@ -901,20 +899,6 @@ export function NegativePatrolTaskCreator({
     || selectedIds.size === 0
     || missingCoverage.length > 0
   ))
-
-  if (!supportsPatrol) {
-    return (
-      <div className="rounded-2xl border border-status-orange/25 bg-status-orange/8 p-4 text-sm leading-6 text-amber-700 dark:text-amber-300">
-        <div className="flex items-start gap-3">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
-          <div>
-            <div className="font-semibold">部分 Extension 还不能执行负面帖子巡查</div>
-            <p className="mt-1 text-xs leading-5">升级并重新加载 Extension 后，Agent 会自动上报定向逐帖采集能力。</p>
-          </div>
-        </div>
-      </div>
-    )
-  }
 
   return (
     <div className="space-y-5">
@@ -1130,6 +1114,32 @@ export function NegativePatrolTaskCreator({
       )}
 
       {previewed && selectedIds.size > 0 && (
+        <>
+        <section className="rounded-2xl border border-border p-4 sm:p-5">
+          <h3 className="text-sm font-bold">按帖子平台选择执行节点</h3>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">按所选帖子的平台展示可用节点。可以在此调整，帖子清单会保留；不同平台分别领取对应帖子。</p>
+          <div className="mt-3 space-y-3">
+            {platformCoverage.map(entry => (
+              <fieldset key={entry.platform} className="rounded-lg border border-border p-3">
+                <legend className="px-1 text-xs font-semibold">{PLATFORM_LABELS[entry.platform]} · {entry.items} 条帖子</legend>
+                {compatibleAgents.filter(agent => agentCreatePlatforms(agent).includes(entry.platform)).map(agent => (
+                  <label key={agent.id} className="flex min-h-10 items-center gap-2 text-xs">
+                    <input type="checkbox" checked={(!explicitAgentIds || explicitAgentIds.has(agent.id))} disabled={submissionLocked || !writable}
+                      onChange={event => setExplicitAgentIds(current => {
+                        const next = new Set(current || compatibleAgents.map(candidate => candidate.id))
+                        if (event.target.checked) next.add(agent.id)
+                        else next.delete(agent.id)
+                        return next
+                      })} />
+                    <span>{agent.display_name}</span>
+                    <span className="text-muted-foreground">{agent.online ? '在线' : '离线，待上线领取'}</span>
+                  </label>
+                ))}
+                {entry.agents === 0 && <p role="alert" className="mt-2 text-xs text-status-orange">缺少{PLATFORM_LABELS[entry.platform]}执行节点，请在此选择节点或启用对应平台设备。已选帖子会保留。</p>}
+              </fieldset>
+            ))}
+          </div>
+        </section>
         <section className="rounded-2xl border border-primary/20 bg-primary/[0.035] p-4 sm:p-5">
           <div className="flex items-start gap-3">
             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
@@ -1142,7 +1152,7 @@ export function NegativePatrolTaskCreator({
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
                 {elasticPool
                   ? `${selectedIds.size} 条帖子保留在云端；每个空闲 Agent 一次只领 1 条，完成后再领取下一条。`
-                  : `${selectedIds.size} 条帖子固定交给 ${agents[0]?.display_name || '所选 Agent'}；节点离线时原地等待，不自动转交。`}
+                  : `${selectedIds.size} 条帖子固定交给 ${dispatchAgents[0]?.display_name || '所选 Agent'}；节点离线时原地等待，不自动转交。`}
               </p>
               <div className="mt-3 grid gap-2 text-[11px] leading-4 text-muted-foreground sm:grid-cols-2">
                 {platformCoverage.map(entry => (
@@ -1151,7 +1161,7 @@ export function NegativePatrolTaskCreator({
                   </span>
                 ))}
                 <span className="rounded-lg border border-border/70 bg-background px-2.5 py-2">
-                  {elasticPool ? '候选节点' : '执行节点'} <strong className="font-semibold text-foreground">{agents.length}</strong> 个 · 当前在线 {onlineAgentCount} 个
+                  {elasticPool ? '候选节点' : '执行节点'} <strong className="font-semibold text-foreground">{dispatchAgents.length}</strong> 个 · 当前在线 {onlineAgentCount} 个
                 </span>
                 <span className="rounded-lg border border-border/70 bg-background px-2.5 py-2">
                   {elasticPool
@@ -1165,6 +1175,7 @@ export function NegativePatrolTaskCreator({
             </div>
           </div>
         </section>
+        </>
       )}
 
       {error && <p role="alert" className="text-xs leading-5 text-status-red">{error}</p>}
@@ -1195,9 +1206,11 @@ export function NegativePatrolTaskCreator({
           ? '刷新任务列表'
           : submission
             ? submitting ? '正在确认上次提交' : '确认上次提交'
-            : elasticPool
-              ? `把 ${selectedIds.size || ''} 条帖子放入弹性队列`
-              : agents[0]?.online
+            : !previewed
+              ? '请先预览候选帖子'
+              : elasticPool
+              ? `把 ${selectedIds.size} 条帖子放入弹性队列`
+              : dispatchAgents[0]?.online
                 ? `下发 ${selectedIds.size || ''} 条定向采集`
                 : `创建 ${selectedIds.size || ''} 条任务并排队`}
       </Button>

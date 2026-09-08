@@ -238,14 +238,18 @@ export function projectCaptureResourceAdmission({
 
 export function normalizeNegativePatrolAdmissionPolicy(env = process.env) {
   return Object.freeze({
+    // Browser execution occupies each Agent's own slot. Protect the server by
+    // spacing admissions and bounding post-processing, not by serializing an
+    // entire customer's browsers for the lifetime of a post. Positive values
+    // remain available as optional emergency limits; zero means no such cap.
     globalActiveLimit: boundedPositiveInteger(
       env.NEGATIVE_PATROL_GLOBAL_ACTIVE_LIMIT,
-      2,
+      0,
       50,
     ),
     tenantActiveLimit: boundedPositiveInteger(
       env.NEGATIVE_PATROL_TENANT_ACTIVE_LIMIT,
-      1,
+      0,
       20,
     ),
     globalFirstAdmissionIntervalMs: boundedPositiveInteger(
@@ -325,10 +329,16 @@ export function projectNegativePatrolAdmission({
       retryAfterMs: 10000,
     };
   }
-  if (Math.max(0, Number(globalActive) || 0) >= policy.globalActiveLimit) {
+  if (
+    policy.globalActiveLimit > 0 &&
+    Math.max(0, Number(globalActive) || 0) >= policy.globalActiveLimit
+  ) {
     return {allowed: false, reason: 'global_active_limit', retryAfterMs: 5000};
   }
-  if (Math.max(0, Number(tenantActive) || 0) >= policy.tenantActiveLimit) {
+  if (
+    policy.tenantActiveLimit > 0 &&
+    Math.max(0, Number(tenantActive) || 0) >= policy.tenantActiveLimit
+  ) {
     return {allowed: false, reason: 'tenant_active_limit', retryAfterMs: 5000};
   }
   const globalWait = Math.max(

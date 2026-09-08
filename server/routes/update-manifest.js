@@ -3,12 +3,44 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.6',
+  latestVersion: '0.4.7',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-09-08',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.6-20260908.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.7-20260908.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.7',
+      releaseDate: '2026-09-08',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '修复博主补采超时与页面定位',
+              desc: '恢复博主补采的正常等待时间，始终使用本次巡查所属页面，避免因等待参数为空或切换当前页面导致采集失败。',
+            },
+            {
+              title: '巡查失败显示真实原因',
+              desc: '按执行轮次保留帖子结果，重复回传不再覆盖已确认结果；失败和等待恢复时展示实际错误，便于判断下一步处理。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '先选巡查帖子，再选对应平台节点',
+              desc: '新建巡查先筛选和确认帖子，再按帖子实际平台选择兼容节点，避免选好节点后被混入的其他平台帖子阻挡。',
+            },
+            {
+              title: '同客户多节点可并行巡查',
+              desc: '取消默认每客户仅执行一帖的限制，每个节点仍一次处理一帖，下发至少间隔 10 秒，并保留数据库容量、后处理积压和退避保护。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.6',
       releaseDate: '2026-09-08',

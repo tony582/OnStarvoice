@@ -70,7 +70,16 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.6<span class="date">2026-09-08</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.7<span class="date">2026-09-08</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>博主补采恢复：</strong>恢复正常等待时间，使用本次巡查所属页面，避免空等待参数或切换页面导致失败。</li>
+            <li><strong>真实失败原因：</strong>保留已确认的帖子结果，重复回传不会覆盖；失败和等待恢复时显示实际错误。</li>
+            <li><strong>先选帖子再选节点：</strong>先确认巡查帖子，再按实际平台选择兼容节点，避免混合平台阻挡下发。</li>
+            <li><strong>同客户多节点并行：</strong>每个节点一次处理一帖，下发至少间隔 10 秒，并保留数据库容量与后处理积压保护。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.6<span class="date">2026-09-08</span></h3>
           <ul>
             <li><strong>真实负面筛选：</strong>预览按发布时间范围和客户当前情感筛选，已改中性或正面的帖子排除，改为负面的帖子可入选，下发前再次验证。</li>
             <li><strong>巡查页面自动回收：</strong>完成、失败和取消后精确关闭本次任务页面，异常回执与关页可重试；验证码等人工处理页面保留。</li>
