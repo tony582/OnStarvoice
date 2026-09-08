@@ -37,7 +37,7 @@ Report = `{id,reportDate,mode,version,generatedAt,snapshot?,delivery?:{status,do
 
 Settings = `{appId,appSecret?(write only),folderToken,documentBaseUrl,channel:'app'|'webhook',chatId,chatName,webhookUrl?(write only),webhookSecret?(write only),editorType:'email'|'openid'|'openchat',editorId,customerEditVerified:boolean,autoEnabled:boolean,sendTime:'HH:mm',hasAppSecret?,hasWebhook?,hasWebhookSecret?}`。
 
-默认appId空（页面提示可复用现有接入），文档域名须 https://*.feishu.cn，需用户明确目标目录，默认禁止全网编辑。editor用于明确外部客户成员/群编辑权限。customerEditVerified是一次真实账号测试的人工验收，配置关键项变更自动清除，正常每日不再人工验收。appSecret按服务端独立环境密钥加密，不进入普通tenant_settings或日志。
+默认appId空（页面提示可复用现有接入），文档域名须 https://*.feishu.cn，需用户明确目标目录，默认禁止全网编辑。editor用于明确外部客户成员/群编辑权限。customerEditVerified是开启自动发送前的真实账号人工验收，配置关键项变更自动清除。手动发送不受此标记拦截，创建文档及发送前仍通过飞书接口检查指定协作者编辑、跨组织与留存权限，失败不发群。appSecret按服务端独立环境密钥加密，不进入普通tenant_settings或日志。
 
 自动发送初次启用从下一次发送时间开始，不回补历史；服务重启按持久化next_run_at补发漏过日期。默认前日正式版，已有当天手动发送正式版优先复用，实时版不阻止正式版。更新设置或另发群不会重新写已生成文档。
 

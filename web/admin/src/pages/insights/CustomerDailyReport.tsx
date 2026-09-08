@@ -15,7 +15,7 @@ type SummaryDraft = Record<'day' | 'mtd', Record<SummaryField, string>>
 const summaryLabels: Record<SummaryField, string> = { monitor: '监控数量', sdb: 'SDB范畴', positive: '正向', neutral: '中性', cold: '冷处理', inProgress: '处理中', processed: '已处理' }
 const pendingStatuses = new Set(['queued', 'working', 'retry_wait'])
 const deliveryLabels: Record<string, string> = {
-  none: '尚未交付', queued: '等待准备', working: '正在准备文档与发送', retry_wait: '等待继续处理',
+  none: '尚未交付', queued: '已提交，通常在下一分钟开始准备', working: '已提交，正在准备文档与发送', retry_wait: '等待继续处理',
   needs_attention: '需要处理', document_ready: '飞书文档已就绪', sent: '已发送到群',
 }
 const platforms: Record<string, string> = { xiaohongshu: '小红书', xhs: '小红书', douyin: '抖音', weibo: '微博', bilibili: '哔哩哔哩', wechat: '微信', zhihu: '知乎', kuaishou: '快手', toutiao: '今日头条' }
@@ -36,6 +36,7 @@ function CustomerDailyReportWorkspace() {
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState('')
   const [notice, setNotice] = useState<Notice | null>(null)
+  const [deliveryNotice, setDeliveryNotice] = useState<Notice | null>(null)
   const [pollError, setPollError] = useState('')
   const [settings, setSettings] = useState<DailySettings | null>(null)
   const [settingsError, setSettingsError] = useState('')
@@ -94,6 +95,7 @@ function CustomerDailyReportWorkspace() {
     async function loadDate() {
       setLoading(true)
       setNotice(null)
+      setDeliveryNotice(null)
       setPollError('')
       setAllowIncomplete(false)
       setSendCorrection(false)
@@ -171,6 +173,7 @@ function CustomerDailyReportWorkspace() {
       const detail = await api.get<ReportResponse>(`${DAILY_API}/${encodeURIComponent(data.report.id)}`)
       if (!mounted.current) return
       setCurrent(detail)
+      setDeliveryNotice(null)
       setAllowIncomplete(false)
       setSendCorrection(false)
       setNotice({ kind: 'success', text: '日报已更新，尚未发送到群。' })
@@ -207,6 +210,7 @@ function CustomerDailyReportWorkspace() {
       const detail = await api.get<ReportResponse>(`${DAILY_API}/${encodeURIComponent(data.report.id)}`)
       if (!mounted.current) return
       setCurrent(detail)
+      setDeliveryNotice(null)
       setReports(items => [data.report, ...items.filter(item => item.id !== data.report.id)])
       setSummaryDraft(null)
       summaryRequest.current = null
@@ -230,6 +234,7 @@ function CustomerDailyReportWorkspace() {
     operation.current = true
     setBusy(action)
     setNotice(null)
+    setDeliveryNotice(null)
     try {
       const data = await api.post<{ report: DailyReport }>(`${DAILY_API}/${encodeURIComponent(report.id)}/${action}`, { allowIncomplete, ...(action === 'send' && sendCorrection ? { correction: true } : {}) })
       if (!mounted.current) return
@@ -239,14 +244,14 @@ function CustomerDailyReportWorkspace() {
         setCurrent(detail)
         setSendCorrection(false)
         setAllowIncomplete(false)
-        setNotice({ kind: 'success', text: '已沿用本日已有的正式日报，避免重复发送。' })
+        setDeliveryNotice({ kind: 'success', text: '已沿用本日已有的正式日报，避免重复发送。' })
       } else {
         setCurrent(value => value?.report.id === data.report.id ? { ...value, report: { ...data.report, snapshot: data.report.snapshot || value.report.snapshot } } : value)
       }
       setReports(items => items.some(item => item.id === data.report.id) ? items.map(item => item.id === data.report.id ? data.report : item) : [data.report, ...items])
       setPollError('')
     } catch (error) {
-      if (mounted.current) setNotice({ kind: 'error', text: dailyError(error, action === 'document' ? '文档准备失败，请查看发送配置。' : '发送未完成，请检查当前状态。') })
+      if (mounted.current) setDeliveryNotice({ kind: 'error', text: dailyError(error, action === 'document' ? '文档准备失败，请查看发送配置。' : '发送未完成，请检查当前状态。') })
       try {
         const detail = await api.get<ReportResponse>(`${DAILY_API}/${encodeURIComponent(report.id)}`)
         if (mounted.current) setCurrent(detail)
@@ -368,8 +373,11 @@ function CustomerDailyReportWorkspace() {
             <Button onClick={() => void deliver('send')} disabled={disabled || processing || unknownResult || deliveryStatus === 'sent' || !canWrite() || (blocked && !allowIncomplete) || (!!previousFormalDelivery && !sendCorrection)}>{busy === 'send' || processing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}{deliveryStatus === 'sent' ? '已发送到群' : deliveryStatus === 'needs_attention' ? '继续发送' : sendCorrection ? '发送更正版' : '发送到飞书群'}</Button>
           </div>
         </div>
+        {deliveryNotice && <div role={deliveryNotice.kind === 'error' ? 'alert' : 'status'} className={`mt-3 flex items-start gap-2 rounded-lg border px-3 py-2 text-sm ${deliveryNotice.kind === 'error' ? 'border-rose-200 bg-rose-50 text-rose-800' : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}>
+          {deliveryNotice.kind === 'error' ? <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /> : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />}<span>{deliveryNotice.text}</span>
+        </div>}
         <p role="status" aria-live="polite" className={`mt-3 flex items-center gap-2 text-xs ${deliveryStatus === 'needs_attention' ? 'text-rose-700' : deliveryStatus === 'sent' ? 'text-emerald-700' : 'text-slate-500'}`}>{processing && <Loader2 className="h-3.5 w-3.5 animate-spin" />}{deliveryLabels[deliveryStatus]}{delivery?.sentAt ? ` · ${dailyTime(delivery.sentAt)}` : ''}{processing ? '，页面会自动更新状态。' : ''}</p>
-        {delivery?.error && <p role="alert" className="mt-2 text-xs leading-6 text-rose-700">{delivery.error}</p>}
+        {delivery?.error && delivery.error !== deliveryNotice?.text && <p role="alert" className="mt-2 text-xs leading-6 text-rose-700">{delivery.error}</p>}
         {unknownResult && <p className="mt-2 text-xs leading-6 text-slate-500">请管理员核对交付结果；当前暂停重复发送，避免出现重复文档或群消息。</p>}
         {pollError && <p role="alert" className="mt-2 text-xs leading-6 text-amber-800">{pollError} 正在继续查询，请勿重复发送。</p>}
         {blocked && canWrite() && <label className="mt-4 flex items-start gap-2 rounded-lg bg-amber-50 p-3 text-xs leading-6 text-amber-900"><input type="checkbox" className="mt-1.5 accent-blue-600" checked={allowIncomplete} disabled={disabled || processing} onChange={e => setAllowIncomplete(e.target.checked)} /><span>已查看<button type="button" className="mx-1 font-medium underline" onClick={() => setShowDataStatus(true)}>数据说明</button>，仍交付当前已知数据。</span></label>}
