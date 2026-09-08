@@ -99,7 +99,10 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   const [orchestrationRefreshKey, setOrchestrationRefreshKey] = useState(0)
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0)
   const [historyTotal, setHistoryTotal] = useState<number | null>(null)
-  const loadGeneration = useRef(0)
+  const overviewLoadInFlight = useRef<Promise<void> | null>(null)
+  const overviewLoadFollowUp = useRef(false)
+  const overviewLoadWaiters = useRef<Array<() => void>>([])
+  const overviewLoadFailureCount = useRef(0)
   const orchestrationDetailDialogRef = useRef<HTMLDivElement | null>(null)
 
   const closeOrchestrationComposer = useCallback(() => {
@@ -119,32 +122,93 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
     })
   }, [mobile])
 
-  const load = useCallback(async (quiet = false) => {
-    const generation = ++loadGeneration.current
+  const fetchOverview = useCallback(async (quiet = false) => {
     if (quiet) setRefreshing(true)
     else setLoading(true)
     try {
       const data = await api.get<Overview & { ok: boolean }>('/capture-cloud/overview')
-      if (generation !== loadGeneration.current) return
       setOverview({ agents: data.agents || [], tasks: data.tasks || [], summary: data.summary })
       setError('')
+      overviewLoadFailureCount.current = 0
     } catch (err) {
-      if (generation !== loadGeneration.current) return
+      overviewLoadFailureCount.current = Math.min(
+        4,
+        overviewLoadFailureCount.current + 1,
+      )
       setError(err instanceof Error ? err.message : '读取云端任务中心失败')
     } finally {
-      if (generation === loadGeneration.current) {
-        setLoading(false)
-        setRefreshing(false)
-      }
+      setLoading(false)
+      setRefreshing(false)
     }
   }, [])
 
+  const load = useCallback((
+    quiet = false,
+    { queueIfBusy = true }: { queueIfBusy?: boolean } = {},
+  ): Promise<void> => {
+    const current = overviewLoadInFlight.current
+    if (current) {
+      if (!queueIfBusy) return current
+      overviewLoadFollowUp.current = true
+      return new Promise(resolve => {
+        overviewLoadWaiters.current.push(resolve)
+      })
+    }
+
+    const cycle = async () => {
+      let nextQuiet = quiet
+      do {
+        overviewLoadFollowUp.current = false
+        await fetchOverview(nextQuiet)
+        nextQuiet = true
+      } while (overviewLoadFollowUp.current)
+    }
+    const request = cycle().finally(() => {
+      overviewLoadInFlight.current = null
+      const waiters = overviewLoadWaiters.current.splice(0)
+      waiters.forEach(resolve => resolve())
+    })
+    overviewLoadInFlight.current = request
+    return request
+  }, [fetchOverview])
+
   useEffect(() => {
-    const initialTimer = window.setTimeout(() => void load(), 0)
-    const timer = window.setInterval(() => void load(true), 15_000)
+    let disposed = false
+    let timer: number | null = null
+
+    const clearTimer = () => {
+      if (timer !== null) window.clearTimeout(timer)
+      timer = null
+    }
+    const schedule = (delayMs: number, quiet = true) => {
+      if (disposed || document.hidden) return
+      clearTimer()
+      timer = window.setTimeout(() => {
+        timer = null
+        void run(quiet)
+      }, delayMs)
+    }
+    const run = async (quiet: boolean) => {
+      if (disposed || document.hidden) return
+      await load(quiet, { queueIfBusy: false })
+      if (disposed || document.hidden) return
+      const retryMultiplier = 2 ** overviewLoadFailureCount.current
+      schedule(Math.min(120_000, 15_000 * retryMultiplier))
+    }
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        clearTimer()
+        return
+      }
+      schedule(0)
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    schedule(0, false)
     return () => {
-      window.clearTimeout(initialTimer)
-      window.clearInterval(timer)
+      disposed = true
+      clearTimer()
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
   }, [load])
 

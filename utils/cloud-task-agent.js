@@ -1189,6 +1189,7 @@
           localClosureReuseFenceV1: true,
           remoteOrchestrationRecoveryMergeV1: true,
           negativePostPatrol: true,
+          negativePatrolTerminalReceiptV1: true,
           watchedContentPatrol: true,
           officialAccountCommentPatrol: true,
           officialAccountCommentPatrolProfileV1: true,
@@ -1314,6 +1315,15 @@
             status: response.status,
             reason: data?.error || data?.reason || "request_failed",
             message: data?.message || "云端任务中心请求失败",
+            details: {
+              ...objectValue(data?.details),
+              ...(data?.expectedRequestId
+                ? {expectedRequestId: text(data.expectedRequestId, 240)}
+                : {}),
+              ...(data?.expectedAttemptId
+                ? {expectedAttemptId: text(data.expectedAttemptId, 240)}
+                : {}),
+            },
           };
         }
         rememberCloudRequestObservation({
@@ -1357,15 +1367,38 @@
     });
   }
 
-  async function completeCommand({commandId, success, result = {}, ...options}) {
+  async function completeCommand({
+    commandId,
+    success,
+    result = {},
+    completionIdentity = null,
+    ...options
+  }) {
     const normalizedCommandId = text(commandId, 240);
     if (!normalizedCommandId) {
       return {ok: false, skipped: true, reason: "missing_command_id"};
     }
+    const identity = objectValue(completionIdentity);
+    const normalizedIdentity = {
+      requestId: text(identity.requestId, 240),
+      attemptId: text(identity.attemptId, 240),
+      resultHash: text(identity.resultHash, 128).toLowerCase(),
+    };
+    const hasCompletionIdentity = Boolean(
+      normalizedIdentity.requestId &&
+        normalizedIdentity.attemptId &&
+        /^[0-9a-f]{64}$/u.test(normalizedIdentity.resultHash),
+    );
     return await requestJson({
       ...options,
       endpoint: `/api/capture-cloud/agent/commands/${encodeURIComponent(normalizedCommandId)}/complete`,
-      body: {success: success === true, result: objectValue(result)},
+      body: {
+        success: success === true,
+        result: objectValue(result),
+        ...(hasCompletionIdentity
+          ? {completionIdentity: normalizedIdentity}
+          : {}),
+      },
     });
   }
 

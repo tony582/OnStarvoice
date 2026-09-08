@@ -145,7 +145,9 @@ function createChildEnvironment({
     ALLOW_RESET_MIGRATIONS: '0',
     PG_CONNECT_TIMEOUT_MS: '1000',
     PG_IDLE_TIMEOUT_MS: '1000',
-    PG_POOL_MAX: '2',
+    // Three shared capacity categories need at least three connections per role.
+    PG_POOL_MAX: '9',
+    PG_DATABASE_INSTANCE_COUNT: '3',
     PGAPPNAME: pgApplicationName,
     PGOPTIONS: `-c search_path=${guardSchema}`,
     HOST: '127.0.0.1',

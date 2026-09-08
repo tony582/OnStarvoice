@@ -246,6 +246,7 @@ test("builds resumable item results and checkpoint in target order", () => {
     successCount: 1,
     warningCount: 0,
     failedCount: 0,
+    manualActionCount: 0,
     unavailableCount: 0,
     capturedCount: 1,
     skippedCount: 0,
@@ -300,6 +301,7 @@ test("settles a deleted or unavailable post without retrying it", () => {
     successCount: 0,
     warningCount: 0,
     failedCount: 0,
+    manualActionCount: 0,
     unavailableCount: 1,
     capturedCount: 0,
     skippedCount: 1,
@@ -355,6 +357,36 @@ test("a deleted post advances the patrol cursor instead of stopping later posts"
   assert.equal(checkpoint.failedCount, 0);
   assert.equal(checkpoint.unavailableCount, 1);
   assert.deepEqual(plain(checkpoint.completedItemIds), ["item-deleted-first"]);
+});
+
+test("a platform verification challenge settles the target as manual action", () => {
+  const targets = [{
+    workflow: "negative_post_patrol",
+    itemId: "item-captcha",
+    recordId: "record-captcha",
+    externalId: "note-captcha",
+    ordinal: 1,
+  }];
+  const result = targeted.buildTargetResult({
+    target: targets[0],
+    batchResult: {
+      results: [{
+        ok: false,
+        error: {
+          code: "SECURITY_VERIFICATION_REQUIRED",
+          message: "请完成平台验证",
+        },
+      }],
+    },
+  });
+  const checkpoint = targeted.buildCheckpoint(targets, [result]);
+
+  assert.equal(result.status, "needs_action");
+  assert.equal(result.error.requiresManualAction, true);
+  assert.equal(result.error.retryable, false);
+  assert.equal(checkpoint.processedCount, 1);
+  assert.equal(checkpoint.manualActionCount, 1);
+  assert.equal(checkpoint.nextOrdinal, 2);
 });
 
 test("upgrades an older QR unavailable result to deleted", () => {

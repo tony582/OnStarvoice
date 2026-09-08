@@ -26,6 +26,13 @@ const NEGATIVE_KEYWORDS = [
 ];
 
 const CRITICAL_KEYWORDS = ['事故', '失控', '刹车', '起火', '死亡', '伤亡', '泄露', '隐私', '召回'];
+const COMMENT_WORKFLOW_WORKER_ID = `comment-workflow:${process.pid}:${crypto.randomUUID()}`;
+const COMMENT_WORKFLOW_LEASE_SECONDS = 5 * 60;
+const COMMENT_WORKFLOW_RENEW_SECONDS = 60;
+const COMMENT_WORKFLOW_PROCESSOR_LEASE_SECONDS = 10 * 60;
+const COMMENT_WORKFLOW_PROCESSOR_RENEW_SECONDS = 60;
+const COMMENT_WORKFLOW_RECEIPT_BATCH_LIMIT = 25;
+const COMMENT_WORKFLOW_LEGACY_REPROCESS_BATCH_LIMIT = 25;
 const POSITIVE_PATTERNS = [
   /不算贵/, /不贵/, /不收费/, /免费/, /可以/, /有用/, /挺有用/, /好用/, /不会不提供服务/,
   /一直免费/, /没问题/, /还行/, /划算/, /值得/, /正常/, /能用/, /可以用/,
@@ -42,6 +49,92 @@ const HARD_NEGATIVE_PATTERNS = [
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+async function acquireCommentWorkflowProcessorLease() {
+  const claimToken = crypto.randomUUID();
+  const lease = await queryOne(`
+    INSERT INTO comment_workflow_processor_leases (
+      lease_key, claim_token, worker_id, lease_expires_at, updated_at
+    ) VALUES (
+      'global', $1::uuid, $2,
+      now() + ($3::integer * interval '1 second'), now()
+    )
+    ON CONFLICT (lease_key) DO UPDATE
+    SET claim_token = excluded.claim_token,
+      worker_id = excluded.worker_id,
+      lease_expires_at = excluded.lease_expires_at,
+      updated_at = now()
+    WHERE comment_workflow_processor_leases.claim_token IS NULL
+      OR comment_workflow_processor_leases.lease_expires_at <= now()
+    RETURNING claim_token
+  `, [
+    claimToken,
+    COMMENT_WORKFLOW_WORKER_ID,
+    COMMENT_WORKFLOW_PROCESSOR_LEASE_SECONDS,
+  ]);
+  return lease?.claim_token === claimToken ? claimToken : '';
+}
+
+async function renewCommentWorkflowProcessorLease(claimToken) {
+  if (!claimToken) return false;
+  const renewed = await queryOne(`
+    UPDATE comment_workflow_processor_leases
+    SET lease_expires_at = now() + ($2::integer * interval '1 second'),
+      updated_at = now()
+    WHERE lease_key = 'global'
+      AND claim_token = $1::uuid
+      AND worker_id = $3
+    RETURNING claim_token
+  `, [
+    claimToken,
+    COMMENT_WORKFLOW_PROCESSOR_LEASE_SECONDS,
+    COMMENT_WORKFLOW_WORKER_ID,
+  ]);
+  return renewed?.claim_token === claimToken;
+}
+
+async function releaseCommentWorkflowProcessorLease(claimToken) {
+  if (!claimToken) return;
+  await execute(`
+    UPDATE comment_workflow_processor_leases
+    SET claim_token = NULL,
+      worker_id = '',
+      lease_expires_at = NULL,
+      updated_at = now()
+    WHERE lease_key = 'global'
+      AND claim_token = $1::uuid
+      AND worker_id = $2
+  `, [claimToken, COMMENT_WORKFLOW_WORKER_ID]);
+}
+
+async function withCommentWorkflowProcessorLease(work, busyValue) {
+  const claimToken = await acquireCommentWorkflowProcessorLease();
+  if (!claimToken) return busyValue;
+  let leaseLost = false;
+  const renew = async () => {
+    if (leaseLost) return false;
+    const retained = await renewCommentWorkflowProcessorLease(claimToken);
+    if (!retained) leaseLost = true;
+    return retained;
+  };
+  const renewTimer = setInterval(() => {
+    void renew().catch(error => {
+      leaseLost = true;
+      console.warn('[CommentWorkflow] global processor lease renewal failed:', error.message);
+    });
+  }, COMMENT_WORKFLOW_PROCESSOR_RENEW_SECONDS * 1000);
+  renewTimer.unref?.();
+  try {
+    return await work({claimToken, renew, leaseLost: () => leaseLost});
+  } finally {
+    clearInterval(renewTimer);
+    try {
+      await releaseCommentWorkflowProcessorLease(claimToken);
+    } catch (error) {
+      console.warn('[CommentWorkflow] global processor lease release failed:', error.message);
+    }
+  }
 }
 
 function normalizeText(value) {
@@ -577,7 +670,10 @@ export async function upsertRecordComments(recordId, record, context) {
 // Phase B(后台 AI 精炼):捞出待精炼(ai_classified_at IS NULL)的非官方评论,按帖分组、
 // 分批并发走批量 LLM,精炼结果回填评论,据此生成客资 + 重算该帖事实计数/提醒。
 // LLM 整批失败 → 这批保持 NULL,下轮重试;评论早已入库可见,绝不会因 AI 失败丢成 0 条。
-export async function refineCommentsWithAI({ limit = 300 } = {}) {
+async function refineCommentsWithAIUnderLease(
+  {limit = 300} = {},
+  processorLease,
+) {
   const pending = await queryAll(`
     SELECT rc.id, rc.record_id, rc.tenant_id, rc.content, rc.author_name, rc.like_count, rc.ip_location,
            rc.ai_result, rc.updated_at,
@@ -608,6 +704,7 @@ export async function refineCommentsWithAI({ limit = 300 } = {}) {
 
   let refined = 0;
   for (const [recordId, rows] of groups) {
+    if (!(await processorLease.renew())) break;
     const tenantId = rows[0].tenant_id;
     const record = {
       title: rows[0].r_title, content: rows[0].r_content, platform: rows[0].r_platform,
@@ -706,11 +803,28 @@ export async function refineCommentsWithAI({ limit = 300 } = {}) {
   return refined;
 }
 
+export async function refineCommentsWithAI(options = {}) {
+  return withCommentWorkflowProcessorLease(
+    lease => refineCommentsWithAIUnderLease(options, lease),
+    0,
+  );
+}
+
 // 自愈:把"payload 里有评论、但 record_comments 还没入库"的记录重新走一遍入库。
 // 评论数据本就安全存在 records.payload(关键词采集嵌在 items[0].commentsCleanedItems,
 // 单篇在顶层)。给"异步队列因 LLM 挂死卡死 / 进程重启丢失内存队列"兜底。
-// 由 index.js 启动后非阻塞调用;LLM 调用已加超时,不会再卡死。
-export async function reprocessPendingComments({ limit = 2000 } = {}) {
+// 兼容进程按小批次周期调用，并与收据入库/AI 精炼共享全局数据库租约。
+async function reprocessPendingCommentsUnderLease(
+  {limit = COMMENT_WORKFLOW_LEGACY_REPROCESS_BATCH_LIMIT} = {},
+  processorLease,
+) {
+  const boundedLimit = Math.max(
+    1,
+    Math.min(
+      COMMENT_WORKFLOW_LEGACY_REPROCESS_BATCH_LIMIT,
+      Number(limit) || COMMENT_WORKFLOW_LEGACY_REPROCESS_BATCH_LIMIT,
+    ),
+  );
   const rows = await queryAll(`
     SELECT r.id, r.tenant_id, r.platform, r.title, r.content, r.author_name, r.author_id,
            r.author_account_no,
@@ -737,11 +851,12 @@ export async function reprocessPendingComments({ limit = 2000 } = {}) {
       )
     ORDER BY r.created_at DESC
     LIMIT $1
-  `, [limit]);
+  `, [boundedLimit]);
   if (!rows.length) return 0;
   console.log(`[Reprocess] 自愈:发现 ${rows.length} 条积压记录待补评论入库`);
   let fixed = 0;
   for (const r of rows) {
+    if (!(await processorLease.renew())) break;
     try {
       await upsertRecordComments(r.id, {
         platform: r.platform, title: r.title, content: r.content,
@@ -759,15 +874,34 @@ export async function reprocessPendingComments({ limit = 2000 } = {}) {
   return fixed;
 }
 
-export async function reprocessPendingCommentWorkflowReceipts({
+export async function reprocessPendingComments(options = {}) {
+  return withCommentWorkflowProcessorLease(
+    lease => reprocessPendingCommentsUnderLease(options, lease),
+    0,
+  );
+}
+
+async function reprocessPendingCommentWorkflowReceiptsUnderLease({
   limit = 100,
-} = {}) {
-  const boundedLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+  queuedGraceSeconds = 15,
+} = {}, processorLease) {
+  const boundedLimit = Math.max(
+    1,
+    Math.min(
+      COMMENT_WORKFLOW_RECEIPT_BATCH_LIMIT,
+      Number(limit) || COMMENT_WORKFLOW_RECEIPT_BATCH_LIMIT,
+    ),
+  );
+  const boundedQueuedGraceSeconds = Math.max(
+    0,
+    Math.min(300, Number(queuedGraceSeconds) || 0),
+  );
   const rows = await queryAll(`
     SELECT observation.id AS observation_id,
       observation.tenant_id, observation.record_id,
       observation.comment_workflow_expected_count,
       observation.comment_workflow_updated_at,
+      observation.comment_workflow_retry_count,
       record.platform, record.title, record.content,
       record.author_name, record.author_id, record.author_account_no,
       record.url, record.keyword,
@@ -807,22 +941,39 @@ export async function reprocessPendingCommentWorkflowReceipts({
       AND record.tenant_id = observation.tenant_id
     WHERE (
       observation.comment_workflow_status = 'queued'
-        AND observation.comment_workflow_updated_at < now() - interval '15 seconds'
+        AND observation.comment_workflow_updated_at
+          <= now() - ($2::integer * interval '1 second')
     ) OR (
       observation.comment_workflow_status = 'running'
-        AND observation.comment_workflow_updated_at < now() - interval '2 minutes'
+        AND COALESCE(
+          observation.comment_workflow_lease_expires_at,
+          observation.comment_workflow_updated_at
+        ) <= now()
     ) OR (
       observation.comment_workflow_status = 'failed'
-        AND observation.comment_workflow_updated_at < now() - interval '30 seconds'
+        AND COALESCE(
+          observation.comment_workflow_next_retry_at,
+          observation.comment_workflow_updated_at
+        ) <= now()
     )
     ORDER BY observation.comment_workflow_updated_at, observation.id
     LIMIT $1
-  `, [boundedLimit]);
+  `, [boundedLimit, boundedQueuedGraceSeconds]);
   const summary = {claimed: 0, persisted: 0, failed: 0};
   for (const row of rows) {
+    if (!(await processorLease.renew())) {
+      summary.leaseLost = true;
+      break;
+    }
     const claimed = await queryOne(`
       UPDATE record_observations
       SET comment_workflow_status = 'running',
+        comment_workflow_claim_token = gen_random_uuid(),
+        comment_workflow_worker_id = $4,
+        comment_workflow_lease_expires_at =
+          now() + ($5::integer * interval '1 second'),
+        comment_workflow_retry_count = comment_workflow_retry_count + 1,
+        comment_workflow_next_retry_at = NULL,
         comment_workflow_started_at = COALESCE(
           comment_workflow_started_at,
           now()
@@ -832,10 +983,38 @@ export async function reprocessPendingCommentWorkflowReceipts({
       WHERE id = $1 AND tenant_id = $2
         AND comment_workflow_status IN ('queued', 'running', 'failed')
         AND comment_workflow_updated_at = $3::timestamptz
-      RETURNING id
-    `, [row.observation_id, row.tenant_id, row.comment_workflow_updated_at]);
+      RETURNING id, comment_workflow_claim_token, comment_workflow_retry_count
+    `, [
+      row.observation_id,
+      row.tenant_id,
+      row.comment_workflow_updated_at,
+      COMMENT_WORKFLOW_WORKER_ID,
+      COMMENT_WORKFLOW_LEASE_SECONDS,
+    ]);
     if (!claimed) continue;
     summary.claimed += 1;
+    const renewTimer = setInterval(() => {
+      void execute(`
+        UPDATE record_observations
+        SET comment_workflow_lease_expires_at =
+            now() + ($4::integer * interval '1 second'),
+          comment_workflow_updated_at = now()
+        WHERE id = $1 AND tenant_id = $2
+          AND comment_workflow_status = 'running'
+          AND comment_workflow_claim_token = $3::uuid
+      `, [
+        row.observation_id,
+        row.tenant_id,
+        claimed.comment_workflow_claim_token,
+        COMMENT_WORKFLOW_LEASE_SECONDS,
+      ]).catch(error => {
+        console.warn(
+          `[CommentReceipt] lease renewal failed for ${row.observation_id}:`,
+          error.message,
+        );
+      });
+    }, COMMENT_WORKFLOW_RENEW_SECONDS * 1000);
+    renewTimer.unref?.();
     try {
       const stats = await upsertRecordComments(row.record_id, {
         platform: row.platform,
@@ -849,40 +1028,71 @@ export async function reprocessPendingCommentWorkflowReceipts({
         comments_cleaned_items: row.cleaned || [],
         official_reply_items: row.official_reply || [],
       }, {tenantId: row.tenant_id, authCode: ''});
-      await execute(`
+      const settled = await execute(`
         UPDATE record_observations
         SET comment_workflow_status = 'persisted',
           comment_workflow_processed_count = $3,
           comment_workflow_error = '',
+          comment_workflow_claim_token = NULL,
+          comment_workflow_worker_id = '',
+          comment_workflow_lease_expires_at = NULL,
+          comment_workflow_next_retry_at = NULL,
           comment_workflow_finished_at = now(),
           comment_workflow_updated_at = now()
         WHERE id = $1 AND tenant_id = $2
           AND comment_workflow_status = 'running'
+          AND comment_workflow_claim_token = $4::uuid
       `, [
         row.observation_id,
         row.tenant_id,
         Math.max(0, Number(stats.inserted || 0) + Number(stats.updated || 0)),
+        claimed.comment_workflow_claim_token,
       ]);
-      summary.persisted += 1;
+      if (settled.rowCount === 1) summary.persisted += 1;
     } catch (error) {
-      await execute(`
+      const retryCount = Math.max(
+        1,
+        Number(claimed.comment_workflow_retry_count) || 1,
+      );
+      const retryDelaySeconds = Math.min(
+        30 * (2 ** Math.min(6, retryCount - 1)),
+        30 * 60,
+      );
+      const failed = await execute(`
         UPDATE record_observations
         SET comment_workflow_status = 'failed',
           comment_workflow_error = $3,
+          comment_workflow_claim_token = NULL,
+          comment_workflow_worker_id = '',
+          comment_workflow_lease_expires_at = NULL,
+          comment_workflow_next_retry_at =
+            now() + ($5::integer * interval '1 second'),
           comment_workflow_finished_at = now(),
           comment_workflow_updated_at = now()
         WHERE id = $1 AND tenant_id = $2
           AND comment_workflow_status = 'running'
+          AND comment_workflow_claim_token = $4::uuid
       `, [
         row.observation_id,
         row.tenant_id,
         String(error?.message || error || 'comment_workflow_failed')
           .slice(0, 1000),
+        claimed.comment_workflow_claim_token,
+        retryDelaySeconds,
       ]);
-      summary.failed += 1;
+      if (failed.rowCount === 1) summary.failed += 1;
+    } finally {
+      clearInterval(renewTimer);
     }
   }
   return summary;
+}
+
+export async function reprocessPendingCommentWorkflowReceipts(options = {}) {
+  return withCommentWorkflowProcessorLease(
+    lease => reprocessPendingCommentWorkflowReceiptsUnderLease(options, lease),
+    {claimed: 0, persisted: 0, failed: 0, busy: true},
+  );
 }
 
 export async function getRecordComments(tenantId, recordId) {

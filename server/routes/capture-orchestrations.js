@@ -1,7 +1,13 @@
 import crypto from 'crypto';
 import { Router } from 'express';
-import { queryAll, queryOne, withTransaction } from '../db/init.js';
 import {
+  isDbCapacityError,
+  queryAll,
+  queryOne,
+  withTransaction,
+} from '../db/init.js';
+import {
+  requireCriticalTenantAccess,
   requireSessionUser,
   requireTenantAccess,
   requireTenantWriter,
@@ -20,6 +26,8 @@ import {
 } from '../services/capture-cloud.js';
 import {
   crossDeviceRetryAgentDailyUsageEligible,
+  legacyAcknowledgedNegativePatrolPackStopEligible,
+  legacyNegativePatrolTargetCount,
 } from './capture-cloud.js';
 import {
   aggregateParentTaskItems,
@@ -95,10 +103,14 @@ const ORCHESTRATION_STOPPABLE_EXECUTION_STATUSES = [
   'recovering',
   'interrupted',
   'resume_requested',
-  'needs_action',
-  'failed',
-  'completed_with_failures',
 ];
+const TARGETED_POST_TASK_TYPES = new Set([
+  'negative_post_patrol',
+  'watched_content_patrol',
+  'official_account_comment_patrol',
+  'followed_creator_post_patrol',
+  'official_account_post_discovery',
+]);
 
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
@@ -112,6 +124,21 @@ function safeJson(value) {
 function elasticQueueOwnsRetry(parent) {
   const metadata = safeJson(parent?.metadata);
   return metadata.distributionMode === 'elastic_pool';
+}
+
+function negativePatrolUsesDedicatedPerItemQueue(parent) {
+  const metadata = safeJson(parent?.metadata);
+  return parent?.feature_key === 'negative_post_patrol' ||
+    metadata.workflow === 'negative_post_patrol' ||
+    metadata.businessTaskType === 'negative_post_patrol';
+}
+
+function negativePatrolPerItemQueueFailure() {
+  return requestError(
+    'negative_patrol_per_item_queue_required',
+    '负面巡查只能通过逐帖队列分配或重试，请刷新任务后操作',
+    409,
+  );
 }
 
 function itemRequiresManualSafetyAction(item) {
@@ -1087,6 +1114,9 @@ router.post(
           '编排任务不存在',
           404,
         ));
+      }
+      if (negativePatrolUsesDedicatedPerItemQueue(parent)) {
+        return sendRequestError(res, negativePatrolPerItemQueueFailure());
       }
       const items = await listParentItems(
         {queryAll},
@@ -2710,6 +2740,9 @@ router.post(
             404,
           )};
         }
+        if (negativePatrolUsesDedicatedPerItemQueue(parent)) {
+          return {failure: negativePatrolPerItemQueueFailure()};
+        }
         const currentRevision = Number(parent.orchestration_revision || 0);
         const parentExecutionMode =
           parent.metadata?.executionMode === 'unattended_plan'
@@ -3461,7 +3494,7 @@ router.post(
 
 router.post(
   '/orchestrations/:id/stop',
-  requireTenantAccess,
+  requireCriticalTenantAccess,
   requireSessionUser,
   requireTenantWriter,
   async (req, res, next) => {
@@ -3472,10 +3505,17 @@ router.post(
         // Negative-patrol reassignment has to lock Agent rows before items.
         // A parent-scoped advisory fence serializes it with operator stop and
         // prevents the two valid row-lock orders from deadlocking each other.
-        await tx.execute(
-          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+        const controlLock = await tx.queryOne(
+          'SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS locked',
           ['capture_orchestration_control', orchestrationId],
         );
+        if (controlLock?.locked !== true) {
+          return {failure: requestError(
+            'orchestration_control_busy',
+            '任务正在处理其它控制操作，请稍后重试',
+            409,
+          )};
+        }
         const parent = await tx.queryOne(
           parentSelect({lock: true}),
           [orchestrationId, req.tenantId],
@@ -3502,25 +3542,19 @@ router.post(
             FROM capture_tasks
             WHERE tenant_id = $1
               AND parent_task_id = $2
-              AND status = ANY($3::text[])
             ORDER BY id
           `, [
             req.tenantId,
             parent.id,
-            ORCHESTRATION_STOPPABLE_EXECUTION_STATUSES,
           ]);
           return rows.map(row => row.id);
         };
 
-        if (parent.status === 'canceled') {
-          return {
-            parent,
-            existing: true,
-            canceledItemCount: 0,
-            executionTaskIds: await loadExecutionTaskIds(),
-          };
-        }
-        if (!ORCHESTRATION_STOPPABLE_STATUSES.has(parent.status)) {
+        const parentAlreadyCanceled = parent.status === 'canceled';
+        if (
+          !parentAlreadyCanceled &&
+          !ORCHESTRATION_STOPPABLE_STATUSES.has(parent.status)
+        ) {
           return {failure: requestError(
             'orchestration_not_stoppable',
             '编排任务当前状态不能停止',
@@ -3528,18 +3562,306 @@ router.post(
             {status: parent.status},
           )};
         }
+        if (parentAlreadyCanceled) {
+          return {
+            parent,
+            existing: true,
+            canceledItemCount: 0,
+            executionTaskIds: [],
+            stopCommandIds: [],
+            stopUnconfirmedTaskIds: [],
+          };
+        }
+
+        // Lock every child before its commands.  This is the same task ->
+        // command order used by heartbeat completion and prevents a child
+        // create from being acknowledged while the parent is being stopped.
+        const executionTasks = await tx.queryAll(`
+          SELECT child.*,
+            durable_attempt.client_attempt_id AS durable_client_attempt_id,
+            agent.status AS agent_status,
+            agent.auth_code_id AS agent_auth_code_id,
+            agent.auth_binding_id AS agent_auth_binding_id,
+            agent.capabilities AS agent_capabilities,
+            auth_code.status AS auth_code_status,
+            auth_code.expires_at AS auth_code_expires_at,
+            binding.id AS active_auth_binding_id
+          FROM capture_tasks child
+          LEFT JOIN capture_agents agent
+            ON agent.id = child.assigned_agent_id
+            AND agent.tenant_id = child.tenant_id
+          LEFT JOIN auth_codes auth_code
+            ON auth_code.id = agent.auth_code_id
+            AND auth_code.tenant_id = child.tenant_id
+          LEFT JOIN auth_bindings binding
+            ON binding.id = agent.auth_binding_id
+            AND binding.code_id = auth_code.id
+          LEFT JOIN LATERAL (
+            SELECT NULLIF(attempt.client_attempt_id, '') AS client_attempt_id
+            FROM capture_task_attempts attempt
+            WHERE attempt.tenant_id = child.tenant_id
+              AND attempt.task_id = child.id
+              AND attempt.agent_id = child.assigned_agent_id
+              AND NULLIF(attempt.client_attempt_id, '') IS NOT NULL
+            ORDER BY attempt.attempt_number DESC,
+              attempt.updated_at DESC, attempt.id DESC
+            LIMIT 1
+          ) durable_attempt ON true
+          WHERE child.tenant_id = $1
+            AND child.parent_task_id = $2
+            AND (
+              child.status = ANY($3::text[])
+              OR (
+                $4::boolean
+                AND child.task_type = 'negative_post_patrol'
+                AND child.status = 'needs_action'
+              )
+            )
+          ORDER BY child.id
+          FOR UPDATE OF child
+        `, [
+          req.tenantId,
+          parent.id,
+          ORCHESTRATION_STOPPABLE_EXECUTION_STATUSES,
+          negativePatrolUsesDedicatedPerItemQueue(parent),
+        ]);
+        const executionTaskIdsForControl = executionTasks.map(task => task.id);
+        const activeCommands = executionTaskIdsForControl.length > 0
+          ? await tx.queryAll(`
+              SELECT *
+              FROM capture_agent_commands
+              WHERE tenant_id = $1
+                AND task_id = ANY($2::uuid[])
+                AND command_type IN ('create', 'resume', 'stop')
+                AND status IN ('pending', 'acknowledged')
+              ORDER BY task_id, created_at DESC, id DESC
+              FOR UPDATE
+            `, [req.tenantId, executionTaskIdsForControl])
+          : [];
+        const activeCreateByTask = new Map();
+        const activeStopByTask = new Map();
+        for (const command of activeCommands) {
+          const taskId = String(command.task_id);
+          if (
+            command.command_type === 'create' &&
+            !activeCreateByTask.has(taskId)
+          ) activeCreateByTask.set(taskId, command);
+          if (
+            command.command_type === 'stop' &&
+            !activeStopByTask.has(taskId)
+          ) activeStopByTask.set(taskId, command);
+        }
+        if (executionTaskIdsForControl.length > 0) {
+          await tx.execute(`
+            UPDATE capture_agent_commands
+            SET status = 'expired',
+              result = jsonb_build_object(
+                'reason', CASE WHEN status = 'acknowledged'
+                  THEN 'superseded_by_stop'
+                  ELSE 'stopped_before_dispatch'
+                END,
+                'parentStop', true,
+                'commandStatusBefore', status
+              ),
+              finished_at = now(), updated_at = now()
+            WHERE tenant_id = $1
+              AND task_id = ANY($2::uuid[])
+              AND command_type IN ('create', 'resume')
+              AND status IN ('pending', 'acknowledged')
+          `, [req.tenantId, executionTaskIdsForControl]);
+        }
+
+        const stopCommandIds = [];
+        const stopUnconfirmedTaskIds = [];
+        const retainedExecutionTaskIds = [];
+        for (const child of executionTasks) {
+          const metadata = safeJson(child.metadata);
+          const agentId = text(child.assigned_agent_id, 100);
+          const activeCreate = activeCreateByTask.get(String(child.id));
+          const activeCreateItemAttempts = Array.isArray(
+            activeCreate?.payload?.orchestration?.itemAttempts,
+          ) ? activeCreate.payload.orchestration.itemAttempts : [];
+          const requestId = text(
+            child.control_task_id ||
+              child.client_task_id ||
+              activeCreate?.payload?.clientTaskId,
+            240,
+          );
+          const attemptId = text(
+            child.durable_client_attempt_id ||
+              metadata.attemptIdentity ||
+              activeCreate?.payload?.attemptIdentity ||
+              activeCreate?.payload?.attemptId ||
+              activeCreateItemAttempts[0]?.attemptId,
+            240,
+          );
+          const targeted = TARGETED_POST_TASK_TYPES.has(
+            text(child.task_type, 80),
+          );
+          const legacyAttemptlessStop =
+            legacyAcknowledgedNegativePatrolPackStopEligible({
+              task: child,
+              command: activeCreate,
+              requestId,
+              attemptId,
+            });
+          let stopCommand = activeStopByTask.get(String(child.id)) || null;
+          const createNeverDelivered = activeCreate?.status === 'pending' &&
+            !child.started_at && !child.heartbeat_at;
+          const authCodeExpired = child.auth_code_expires_at &&
+            new Date(child.auth_code_expires_at) < new Date();
+          const mayQueueStop = Boolean(
+            !createNeverDelivered &&
+            agentId &&
+            requestId &&
+            (!targeted || attemptId || legacyAttemptlessStop) &&
+            child.agent_status === 'active' &&
+            child.auth_code_status === 'active' &&
+            child.active_auth_binding_id &&
+            !authCodeExpired &&
+            safeJson(child.agent_capabilities).remoteStop === true
+          );
+          const stopIdentityUnavailable = Boolean(
+            !createNeverDelivered &&
+            (!requestId || (targeted && !attemptId && !legacyAttemptlessStop))
+          );
+          if (stopCommand) {
+            stopCommand = await tx.queryOne(`
+              UPDATE capture_agent_commands
+              SET payload = payload || $1::jsonb,
+                updated_at = now()
+              WHERE id = $2 AND tenant_id = $3
+              RETURNING id
+            `, [
+              JSON.stringify({
+                terminalDisposition: 'canceled',
+                terminalReason: 'parent_orchestration_stopped',
+                ...(attemptId ? {attemptId} : {}),
+                ...(legacyAttemptlessStop
+                  ? {
+                      legacyNegativePackStopV1: true,
+                      legacyTargetCount:
+                        legacyNegativePatrolTargetCount(activeCreate.payload),
+                    }
+                  : {}),
+                ...(activeCreate?.status === 'acknowledged'
+                  ? {supersededCreateCommandId: activeCreate.id}
+                  : {}),
+              }),
+              stopCommand.id,
+              req.tenantId,
+            ]);
+          } else if (mayQueueStop) {
+            stopCommand = await tx.queryOne(`
+              INSERT INTO capture_agent_commands (
+                tenant_id, agent_id, task_id, command_type, payload,
+                requested_by_user_id, requested_by_name
+              ) VALUES ($1, $2, $3, 'stop', $4::jsonb, $5, $6)
+              RETURNING id
+            `, [
+              req.tenantId,
+              agentId,
+              child.id,
+              JSON.stringify({
+                controlTaskId: requestId,
+                previousStatus: child.status,
+                terminalDisposition: 'canceled',
+                terminalReason: 'parent_orchestration_stopped',
+                ...(attemptId ? {attemptId} : {}),
+                ...(legacyAttemptlessStop
+                  ? {
+                      legacyNegativePackStopV1: true,
+                      legacyTargetCount:
+                        legacyNegativePatrolTargetCount(activeCreate.payload),
+                    }
+                  : {}),
+                ...(activeCreate?.status === 'acknowledged'
+                  ? {supersededCreateCommandId: activeCreate.id}
+                  : {}),
+                authCodeId: child.agent_auth_code_id,
+                authBindingId: child.agent_auth_binding_id,
+                platform: child.platform,
+              }),
+              req.user?.id || null,
+              text(req.actorName, 240),
+            ]);
+          }
+          const stopPending = Boolean(stopCommand?.id);
+          const terminalNoticeFallback = !createNeverDelivered && !stopPending;
+          if (!createNeverDelivered) retainedExecutionTaskIds.push(child.id);
+          if (stopPending) stopCommandIds.push(stopCommand.id);
+          else if (!createNeverDelivered && requestId) {
+            stopUnconfirmedTaskIds.push(child.id);
+          }
+          await tx.execute(`
+            UPDATE capture_tasks
+            SET status = CASE WHEN $4::boolean THEN 'canceled' ELSE status END,
+              message = CASE
+                WHEN $4::boolean THEN '父任务已在设备领取前取消'
+                WHEN $5::boolean
+                  THEN '父任务已停止，等待设备确认当前执行轮次已停止'
+                ELSE '父任务已停止，等待设备确认终态通知'
+              END,
+              metadata = (metadata
+                - 'resumeCommandId' - 'resumePreviousStatus') || $1::jsonb,
+              finished_at = CASE
+                WHEN $4::boolean THEN COALESCE(finished_at, now())
+                ELSE finished_at
+              END,
+              updated_at = now(),
+              source_updated_at = now()
+            WHERE id = $2 AND tenant_id = $3
+          `, [
+            JSON.stringify({
+              ...(createNeverDelivered || terminalNoticeFallback
+                ? {
+                    terminalDisposition: 'canceled',
+                    terminalReason: 'parent_orchestration_stopped',
+                    terminalDispositionAt: new Date().toISOString(),
+                  }
+                : {}),
+              ...(stopPending
+                ? {
+                    stopCommandId: stopCommand.id,
+                    stopPreviousStatus: child.status,
+                    stopPending: true,
+                  }
+                : {}),
+              ...(stopIdentityUnavailable
+                ? {
+                    stopPending: true,
+                    stopIdentityUnavailable: true,
+                  }
+                : {}),
+              ...(createNeverDelivered ? {stoppedBeforeDispatch: true} : {}),
+            }),
+            child.id,
+            req.tenantId,
+            createNeverDelivered,
+            stopPending,
+          ]);
+        }
 
         // Parent -> item is the same lock order used by dispatch/retry and
         // heartbeat projection. Once the parent is locked, no new handoff can
         // enter this orchestration while the operator stop is settling it.
         await listParentItems(tx, req.tenantId, parent.id, {lock: true});
-        const canceledItems = await tx.queryAll(`
+        await tx.execute(`
           UPDATE capture_task_items
-          SET status = 'canceled',
-            metadata = metadata || jsonb_build_object(
+          SET metadata = metadata || jsonb_build_object(
               'operatorStopped', true,
               'operatorStoppedAt', now()
             ),
+            updated_at = now()
+          WHERE tenant_id = $1
+            AND task_id = $2
+            AND status NOT IN (
+              'completed', 'completed_with_warnings', 'skipped', 'canceled'
+            )
+        `, [req.tenantId, parent.id]);
+        const canceledItems = await tx.queryAll(`
+          UPDATE capture_task_items
+          SET status = 'canceled',
             finished_at = COALESCE(finished_at, now()),
             updated_at = now()
           WHERE tenant_id = $1
@@ -3547,8 +3869,12 @@ router.post(
             AND status NOT IN (
               'completed', 'completed_with_warnings', 'skipped', 'canceled'
             )
+            AND (
+              execution_task_id IS NULL
+              OR NOT (execution_task_id = ANY($3::uuid[]))
+            )
           RETURNING id
-        `, [req.tenantId, parent.id]);
+        `, [req.tenantId, parent.id, retainedExecutionTaskIds]);
         await tx.execute(`
           UPDATE capture_task_item_attempts attempt
           SET status = 'canceled',
@@ -3560,11 +3886,15 @@ router.post(
             AND item.task_id = $2
             AND item.status = 'canceled'
             AND attempt.parent_task_id = $2
+            AND (
+              attempt.execution_task_id IS NULL
+              OR NOT (attempt.execution_task_id = ANY($3::uuid[]))
+            )
             AND attempt.status NOT IN (
               'completed', 'completed_with_warnings',
               'failed', 'skipped', 'canceled'
             )
-        `, [req.tenantId, parent.id]);
+        `, [req.tenantId, parent.id, retainedExecutionTaskIds]);
         const settledItems = await tx.queryAll(`
           SELECT status
           FROM capture_task_items
@@ -3573,9 +3903,16 @@ router.post(
         `, [req.tenantId, parent.id]);
         const aggregate = aggregateParentTaskItems(settledItems);
         const stoppedAt = new Date().toISOString();
+        // Every delivered execution remains live until its exact stop or
+        // terminal acknowledgement settles the child. An offline/missing
+        // command channel cannot make the parent appear fully stopped.
+        const stopPendingCount = retainedExecutionTaskIds.length;
+        const parentStopStatus = stopPendingCount > 0
+          ? 'waiting_device'
+          : 'canceled';
         const parentUpdate = await tx.queryOne(`
           UPDATE capture_tasks
-          SET status = 'canceled',
+          SET status = $8,
             progress = $1::jsonb,
             counts = $2::jsonb,
             metadata = metadata || jsonb_build_object(
@@ -3583,25 +3920,39 @@ router.post(
               'operatorStoppedAt', $3::text,
               'operatorStoppedByUserId', $4::text,
               'operatorStoppedByName', $5::text,
-              'automaticRetryDisabled', true
+              'automaticRetryDisabled', true,
+              'stopPendingCount', $9::integer
             ),
-            message = '任务已停止，已完成结果保留，未完成项不再自动接力',
-            orchestration_revision = orchestration_revision + 1,
+            message = CASE WHEN $8 = 'canceled'
+              THEN '任务已停止，已完成结果保留，未完成项不再自动接力'
+              ELSE '已停止新领取，等待设备确认当前执行轮次已停止'
+            END,
+            orchestration_revision = orchestration_revision +
+              CASE WHEN $10::boolean THEN 0 ELSE 1 END,
             attention_dismissed_at = COALESCE(attention_dismissed_at, now()),
-            finished_at = COALESCE(finished_at, now()),
+            finished_at = CASE WHEN $8 = 'canceled'
+              THEN COALESCE(finished_at, now()) ELSE NULL END,
             updated_at = now(),
             source_updated_at = now()
           WHERE id = $6 AND tenant_id = $7
           RETURNING id, status, progress, counts, metadata,
             orchestration_revision, finished_at
         `, [
-          JSON.stringify({...aggregate.progress, phase: 'canceled'}),
+          JSON.stringify({
+            ...aggregate.progress,
+            phase: parentStopStatus === 'canceled'
+              ? 'canceled'
+              : 'stop_requested',
+          }),
           JSON.stringify(aggregate.counts),
           stoppedAt,
           text(req.user?.id, 240),
           text(req.actorName, 240),
           parent.id,
           req.tenantId,
+          parentStopStatus,
+          stopPendingCount,
+          parentAlreadyCanceled,
         ]);
         const executionTaskIds = await loadExecutionTaskIds();
 
@@ -3611,8 +3962,11 @@ router.post(
         ) {
           const schedule = await tx.queryOne(`
             UPDATE capture_orchestration_schedules
-            SET last_run_at = COALESCE(last_run_at, now()),
-              last_run_status = 'canceled',
+            SET last_run_at = CASE WHEN $4 = 'canceled'
+                THEN COALESCE(last_run_at, now())
+                ELSE last_run_at
+              END,
+              last_run_status = $4,
               last_error = '{}'::jsonb,
               updated_at = now()
             WHERE id = $1
@@ -3623,6 +3977,7 @@ router.post(
             parent.orchestration_schedule_id,
             req.tenantId,
             parent.id,
+            parentStopStatus,
           ]);
           if (schedule) {
             await tx.execute(`
@@ -3631,10 +3986,13 @@ router.post(
                   'scheduleStatus', $1::text,
                   'nextRunAt', COALESCE($2::timestamptz::text, ''),
                   'lastRunAt', COALESCE($3::timestamptz::text, ''),
-                  'lastRunStatus', 'canceled',
+                  'lastRunStatus', $7::text,
                   'lastRunTaskId', $4::uuid::text
                 ),
-                message = '上一轮多 Agent 任务已停止，计划等待下一次运行',
+                message = CASE WHEN $7 = 'canceled'
+                  THEN '上一轮多 Agent 任务已停止，计划等待下一次运行'
+                  ELSE '上一轮多 Agent 任务正在停止，等待设备确认'
+                END,
                 updated_at = now(),
                 source_updated_at = now()
               WHERE id = $5 AND tenant_id = $6
@@ -3645,6 +4003,7 @@ router.post(
               parent.id,
               schedule.template_task_id,
               req.tenantId,
+              parentStopStatus,
             ]);
           }
         }
@@ -3655,8 +4014,10 @@ router.post(
           eventType: 'orchestration_stopped',
           actorId: req.user?.id || '',
           actorName: req.actorName,
-          status: 'canceled',
-          message: '运营人员已停止整个编排任务，未完成项不再自动接力',
+          status: parentStopStatus,
+          message: parentStopStatus === 'canceled'
+            ? '运营人员已停止整个编排任务，未完成项不再自动接力'
+            : '运营人员已停止新领取，等待设备确认当前执行轮次',
           payload: {
             previousStatus: parent.status,
             revision: parentUpdate.orchestration_revision,
@@ -3666,24 +4027,53 @@ router.post(
         });
         return {
           parent: parentUpdate,
-          existing: false,
+          existing: parentAlreadyCanceled,
           canceledItemCount: canceledItems.length,
           executionTaskIds,
+          stopCommandIds,
+          stopUnconfirmedTaskIds,
+          stopPendingCount,
         };
+      }, {
+        category: 'critical',
+        waitTimeoutMs: 500,
+        statementTimeoutMs: 8000,
+        lockTimeoutMs: 1000,
       });
       if (result.failure) return sendRequestError(res, result.failure);
       return res.json({
         ok: true,
         existing: result.existing === true,
-        status: 'canceled',
+        status: result.parent.status,
         revision: Number(result.parent.orchestration_revision || 0),
         canceledItemCount: result.canceledItemCount,
         executionTaskIds: result.executionTaskIds,
-        message: result.existing
+        stopCommandIds: result.stopCommandIds || [],
+        stopPendingCount: result.stopPendingCount || 0,
+        stopUnconfirmedTaskIds: result.stopUnconfirmedTaskIds || [],
+        message: result.parent.status !== 'canceled'
+          ? '已停止新领取，等待设备确认当前执行轮次已停止'
+          : result.existing
           ? '任务已经停止'
           : '整个任务已停止；已完成结果保留，未完成项不再自动接力',
       });
     } catch (error) {
+      if (
+        isDbCapacityError(error) ||
+        ['57014', '55P03', '40P01'].includes(error?.code)
+      ) {
+        const retryAfterMs = Math.max(
+          250,
+          Number(error.retryAfterMs) || 1000,
+        );
+        res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+        return res.status(503).json({
+          ok: false,
+          error: 'server_busy',
+          message: '停止请求通道繁忙，请稍后重试',
+          retryAfterMs,
+        });
+      }
       return next(error);
     }
   },
@@ -4832,6 +5222,9 @@ router.post(
             404,
           )};
         }
+        if (negativePatrolUsesDedicatedPerItemQueue(parentPreview)) {
+          return {failure: negativePatrolPerItemQueueFailure()};
+        }
         const existingTasks = await tx.queryAll(`
           SELECT id, parent_task_id, assigned_agent_id, status, metadata
           FROM capture_tasks
@@ -4990,6 +5383,9 @@ router.post(
             '编排任务不存在',
             404,
           )};
+        }
+        if (negativePatrolUsesDedicatedPerItemQueue(parent)) {
+          return {failure: negativePatrolPerItemQueueFailure()};
         }
         const currentRevision = Number(parent.orchestration_revision || 0);
         if (currentRevision !== normalized.expectedRevision) {
@@ -5720,6 +6116,9 @@ router.post(
             '编排任务不存在',
             404,
           )};
+        }
+        if (negativePatrolUsesDedicatedPerItemQueue(parent)) {
+          return {failure: negativePatrolPerItemQueueFailure()};
         }
         const currentRevision = Number(parent.orchestration_revision || 0);
         if (currentRevision !== normalized.expectedRevision) {

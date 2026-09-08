@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 import {Router} from 'express';
-import {queryAll, queryOne, withTransaction} from '../db/init.js';
+import {
+  isDbCapacityError,
+  queryAll,
+  queryOne,
+  withTransaction,
+} from '../db/init.js';
 import {
   requireSessionUser,
   requireTenantAccess,
@@ -73,8 +78,13 @@ function requestError(error, message, status = 400, details = {}) {
 }
 
 function sendRequestError(res, failure) {
+  const submissionConflict = failure.error === 'idempotency_key_conflict';
   return res.status(failure.status || 400).json({
     ok: false,
+    created: submissionConflict ? undefined : false,
+    submissionState: submissionConflict
+      ? 'conflict'
+      : 'rejected_before_create',
     error: failure.error,
     message: failure.message,
     ...safeJson(failure.details),
@@ -157,6 +167,32 @@ function boundedInteger(value, fallback, minimum, maximum) {
   if (!Number.isSafeInteger(parsed)) return null;
   if (parsed < minimum || parsed > maximum) return null;
   return parsed;
+}
+
+function decodeCandidateCursor(value) {
+  const raw = text(value, 1000);
+  if (!raw) return {cursor: null};
+  try {
+    const decoded = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
+    const publishedAt = text(decoded?.publishedAt, 80);
+    const id = normalizedUuid(decoded?.id);
+    const instant = new Date(publishedAt);
+    if (!id || Number.isNaN(instant.getTime())) throw new Error('invalid');
+    return {cursor: {publishedAt: instant.toISOString(), id}};
+  } catch {
+    return {failure: requestError(
+      'invalid_candidate_cursor',
+      '候选列表游标无效，请刷新后重试',
+    )};
+  }
+}
+
+function encodeCandidateCursor(row) {
+  if (!row?.id || !row?.published_ts) return null;
+  return Buffer.from(JSON.stringify({
+    publishedAt: new Date(row.published_ts).toISOString(),
+    id: row.id,
+  }), 'utf8').toString('base64url');
 }
 
 function normalizeRecordIds(value) {
@@ -246,6 +282,20 @@ export function normalizeNegativePatrolFilter(body = {}) {
       'minInteractions 必须是非负整数',
     )};
   }
+  const pageSize = boundedInteger(
+    source.pageSize,
+    limit,
+    1,
+    MAX_CANDIDATES,
+  );
+  if (pageSize == null) {
+    return {failure: requestError(
+      'invalid_page_size',
+      `pageSize 必须是 1-${MAX_CANDIDATES} 的整数`,
+    )};
+  }
+  const normalizedCursor = decodeCandidateCursor(source.cursor);
+  if (normalizedCursor.failure) return normalizedCursor;
 
   return {
     filter: {
@@ -256,6 +306,8 @@ export function normalizeNegativePatrolFilter(body = {}) {
       query: text(source.query, 200),
       minInteractions,
       limit,
+      pageSize,
+      cursor: normalizedCursor.cursor,
       timezone: 'Asia/Shanghai',
       sentiment: 'negative',
       excludePendingFalsePositive: true,
@@ -394,14 +446,6 @@ function candidateWhere(tenantId, filter, recordIds = []) {
   let where = `
     WHERE r.tenant_id = $1
       AND r.platform = ANY($2::text[])
-      AND r.sentiment = 'negative'
-      AND r.record_type <> 'official_content'
-      AND r.business_visibility = 'eligible'
-      AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
-      AND r.content_availability_status NOT IN (
-        'deleted',
-        'page_unavailable'
-      )
       AND NULLIF(BTRIM(r.publish_time), '') IS NOT NULL
       AND r.published_ts IS NOT NULL
       AND r.published_ts >= (
@@ -412,14 +456,28 @@ function candidateWhere(tenantId, filter, recordIds = []) {
           AT TIME ZONE 'Asia/Shanghai'
       )
       AND (r.likes + r.comments_count + r.collects + r.shares) >= $5
-      AND r.external_id ~ '^[[:alnum:]_-]{5,200}$'
-      AND NOT EXISTS (
-        SELECT 1
-        FROM record_feedback rf
-        WHERE rf.tenant_id = r.tenant_id
-          AND rf.record_id = r.id
-          AND rf.feedback_type = 'false_positive'
-          AND rf.review_status = 'pending'
+      AND (
+        (
+          NOT (COALESCE(r.manual_overrides, '{}'::jsonb) ? 'sentiment')
+          AND LOWER(BTRIM(COALESCE(r.sentiment, ''))) = 'negative'
+        )
+        OR (
+          COALESCE(r.manual_overrides, '{}'::jsonb) ? 'sentiment'
+          AND LOWER(BTRIM(CASE
+            WHEN jsonb_typeof(r.manual_overrides->'sentiment') = 'object'
+              THEN r.manual_overrides->'sentiment'->>'value'
+            ELSE r.manual_overrides->>'sentiment'
+          END)) = 'negative'
+        )
+        OR (
+          COALESCE(r.manual_overrides, '{}'::jsonb) ? 'sentiment'
+          AND LOWER(BTRIM(COALESCE(CASE
+            WHEN jsonb_typeof(r.manual_overrides->'sentiment') = 'object'
+              THEN r.manual_overrides->'sentiment'->>'value'
+            ELSE r.manual_overrides->>'sentiment'
+          END, ''))) NOT IN ('negative', 'neutral', 'positive')
+          AND LOWER(BTRIM(COALESCE(r.sentiment, ''))) = 'negative'
+        )
       )
   `;
   if (filter.query) {
@@ -438,8 +496,207 @@ function candidateWhere(tenantId, filter, recordIds = []) {
   return {where, params};
 }
 
-function publicCandidate(row) {
+function negativeCandidateQualificationSql(
+  where,
+  {includeBaseline = false, lock = false} = {},
+) {
+  return `
+    WITH candidate_records AS (
+      SELECT
+        r.*,
+        triage.archived_at,
+        CASE
+          WHEN jsonb_typeof(r.manual_overrides->'sentiment') = 'object'
+            THEN r.manual_overrides->'sentiment'->>'value'
+          ELSE r.manual_overrides->>'sentiment'
+        END AS manual_sentiment_raw,
+        COALESCE(r.manual_overrides, '{}'::jsonb) ? 'sentiment'
+          AS manual_sentiment_present,
+        CASE
+          WHEN jsonb_typeof(r.manual_overrides->'relevance') = 'object'
+            THEN r.manual_overrides->'relevance'->>'value'
+          ELSE r.manual_overrides->>'relevance'
+        END AS manual_relevance_raw,
+        COALESCE(r.manual_overrides, '{}'::jsonb) ? 'relevance'
+          AS manual_relevance_present,
+        EXISTS (
+          SELECT 1
+          FROM record_feedback feedback
+          WHERE feedback.tenant_id = r.tenant_id
+            AND feedback.record_id = r.id
+            AND feedback.feedback_type = 'false_positive'
+            AND feedback.review_status = 'pending'
+        ) AS false_positive_pending
+        ${includeBaseline ? `,
+          baseline.id AS baseline_observation_id,
+          baseline.captured_at AS baseline_captured_at,
+          baseline.likes AS baseline_likes,
+          baseline.comments_count AS baseline_comments_count,
+          baseline.collects AS baseline_collects,
+          baseline.shares AS baseline_shares
+        ` : ''}
+      FROM records r
+      LEFT JOIN record_triage triage
+        ON triage.tenant_id = r.tenant_id AND triage.record_id = r.id
+      ${includeBaseline ? `LEFT JOIN LATERAL (
+        SELECT observation.id, observation.captured_at,
+          observation.likes, observation.comments_count,
+          observation.collects, observation.shares
+        FROM record_observations observation
+        WHERE observation.tenant_id = r.tenant_id
+          AND observation.record_id = r.id
+        ORDER BY observation.captured_at DESC, observation.id DESC
+        LIMIT 1
+      ) baseline ON true` : ''}
+      ${where}
+      ${lock ? 'FOR SHARE OF r' : ''}
+    ), effective_records AS (
+      SELECT candidate_records.*,
+        LOWER(BTRIM(COALESCE(manual_sentiment_raw, '')))
+          AS normalized_manual_sentiment,
+        LOWER(BTRIM(COALESCE(manual_relevance_raw, '')))
+          AS normalized_manual_relevance,
+        CASE
+          WHEN manual_sentiment_present THEN
+            LOWER(BTRIM(COALESCE(manual_sentiment_raw, '')))
+          ELSE LOWER(BTRIM(COALESCE(sentiment, '')))
+        END AS effective_sentiment,
+        CASE
+          WHEN manual_sentiment_present AND
+            LOWER(BTRIM(COALESCE(manual_sentiment_raw, ''))) IN (
+              'negative', 'neutral', 'positive'
+            ) THEN 'manual_override'
+          WHEN manual_sentiment_present THEN 'manual_override_invalid'
+          ELSE 'record'
+        END AS sentiment_source
+      FROM candidate_records
+    ), qualified_records AS (
+      SELECT effective_records.*,
+        CASE
+          WHEN manual_sentiment_present
+            AND normalized_manual_sentiment NOT IN (
+              'negative', 'neutral', 'positive'
+            ) THEN false
+          WHEN manual_relevance_present
+            AND normalized_manual_relevance NOT IN (
+              'relevant', 'irrelevant', 'uncertain'
+            ) THEN false
+          WHEN archived_at IS NOT NULL THEN false
+          WHEN manual_relevance_present
+            AND normalized_manual_relevance = 'irrelevant' THEN false
+          WHEN record_type IN ('official_content', 'blogger_profile') THEN false
+          WHEN content_availability_status IN (
+            'deleted', 'page_unavailable'
+          ) THEN false
+          WHEN COALESCE(external_id, '') !~ '^[[:alnum:]_-]{5,200}$'
+            THEN false
+          WHEN false_positive_pending
+            AND NOT (
+              manual_sentiment_present
+              AND normalized_manual_sentiment = 'negative'
+            ) THEN false
+          WHEN NOT (
+            manual_sentiment_present
+            AND normalized_manual_sentiment = 'negative'
+          )
+            AND NOT (
+              manual_relevance_present
+              AND normalized_manual_relevance IN ('relevant', 'uncertain')
+            )
+            AND (
+              COALESCE(business_visibility, '') <> 'eligible'
+              OR ai_result->>'relevance' = 'irrelevant'
+            ) THEN false
+          ELSE true
+        END AS can_dispatch,
+        CASE
+          WHEN manual_sentiment_present
+            AND normalized_manual_sentiment NOT IN (
+              'negative', 'neutral', 'positive'
+            ) THEN 'manual_sentiment_invalid'
+          WHEN manual_relevance_present
+            AND normalized_manual_relevance NOT IN (
+              'relevant', 'irrelevant', 'uncertain'
+            ) THEN 'manual_relevance_invalid'
+          WHEN archived_at IS NOT NULL THEN 'archived'
+          WHEN manual_relevance_present
+            AND normalized_manual_relevance = 'irrelevant'
+            THEN 'manual_irrelevant'
+          WHEN record_type IN ('official_content', 'blogger_profile')
+            THEN 'official_content'
+          WHEN content_availability_status IN (
+            'deleted', 'page_unavailable'
+          ) THEN 'content_unavailable'
+          WHEN COALESCE(external_id, '') !~ '^[[:alnum:]_-]{5,200}$'
+            THEN 'source_unresolvable'
+          WHEN false_positive_pending
+            AND NOT (
+              manual_sentiment_present
+              AND normalized_manual_sentiment = 'negative'
+            ) THEN 'false_positive_pending'
+          WHEN NOT (
+            manual_sentiment_present
+            AND normalized_manual_sentiment = 'negative'
+          )
+            AND NOT (
+              manual_relevance_present
+              AND normalized_manual_relevance IN ('relevant', 'uncertain')
+            )
+            AND (
+              COALESCE(business_visibility, '') <> 'eligible'
+              OR ai_result->>'relevance' = 'irrelevant'
+            ) THEN 'automatic_relevance_filtered'
+          ELSE 'eligible'
+        END AS eligibility_code
+      FROM effective_records
+    )
+  `;
+}
+
+const ELIGIBILITY_REASON = Object.freeze({
+  eligible: '可以下发',
+  manual_sentiment_invalid: '人工情感格式异常，请先核对',
+  manual_relevance_invalid: '人工相关性格式异常，请先核对',
+  archived: '帖子已归档，暂不下发',
+  manual_irrelevant: '帖子已被人工标记为无关',
+  official_content: '官方内容不执行负面巡查',
+  content_unavailable: '原帖已删除或不可访问',
+  source_unresolvable: '无法定位原帖地址',
+  false_positive_pending: '误报反馈待复核，暂不下发',
+  automatic_relevance_filtered: '自动相关性判断暂缓下发',
+});
+
+function candidateEffectiveSentiment(row = {}) {
+  if (row.manual_sentiment_present === true) {
+    return text(
+      row.effective_sentiment ?? row.manual_sentiment_raw,
+      40,
+    ).toLowerCase();
+  }
+  return text(row.effective_sentiment ?? row.sentiment, 40).toLowerCase();
+}
+
+export function publicNegativePatrolCandidate(
+  row,
+  {includeBaseline = true} = {},
+) {
   const url = negativePatrolTargetUrl(row);
+  const manualNegative = row.manual_sentiment_present === true &&
+    text(
+      row.normalized_manual_sentiment ?? row.manual_sentiment_raw,
+      40,
+    ).toLowerCase() === 'negative';
+  const falsePositiveBlocks = row.false_positive_pending === true &&
+    !manualNegative;
+  const canDispatchFromQualification = row.can_dispatch == null
+    ? Boolean(url)
+    : row.can_dispatch === true && Boolean(url);
+  const canDispatch = canDispatchFromQualification && !falsePositiveBlocks;
+  const eligibilityCode = !url
+    ? 'source_unresolvable'
+    : falsePositiveBlocks
+      ? 'false_positive_pending'
+      : row.eligibility_code || 'eligible';
   const interactions =
     Number(row.likes || 0) +
     Number(row.comments_count || 0) +
@@ -458,6 +715,15 @@ function publicCandidate(row) {
     publishedAt: row.published_ts,
     keyword: row.keyword,
     sentiment: row.sentiment,
+    effectiveSentiment: candidateEffectiveSentiment(row),
+    sentimentSource: row.sentiment_source || 'record',
+    canDispatch,
+    dispatchable: canDispatch,
+    eligible: canDispatch,
+    eligibilityCode,
+    eligibilityReason: ELIGIBILITY_REASON[eligibilityCode] ||
+      '当前状态暂不允许下发',
+    falsePositivePending: row.false_positive_pending === true,
     interactions,
     metrics: {
       likes: Number(row.likes || 0),
@@ -465,18 +731,22 @@ function publicCandidate(row) {
       collects: Number(row.collects || 0),
       shares: Number(row.shares || 0),
     },
-    baseline: {
-      observationId: row.baseline_observation_id || null,
-      capturedAt: row.baseline_captured_at || row.last_seen_at || null,
-      metrics: {
-        likes: Number(row.baseline_likes ?? row.likes ?? 0),
-        comments: Number(
-          row.baseline_comments_count ?? row.comments_count ?? 0,
-        ),
-        collects: Number(row.baseline_collects ?? row.collects ?? 0),
-        shares: Number(row.baseline_shares ?? row.shares ?? 0),
-      },
-    },
+    ...(includeBaseline
+      ? {
+          baseline: {
+            observationId: row.baseline_observation_id || null,
+            capturedAt: row.baseline_captured_at || row.last_seen_at || null,
+            metrics: {
+              likes: Number(row.baseline_likes ?? row.likes ?? 0),
+              comments: Number(
+                row.baseline_comments_count ?? row.comments_count ?? 0,
+              ),
+              collects: Number(row.baseline_collects ?? row.collects ?? 0),
+              shares: Number(row.baseline_shares ?? row.shares ?? 0),
+            },
+          },
+        }
+      : {}),
   };
 }
 
@@ -484,47 +754,73 @@ async function loadCandidates(
   executor,
   tenantId,
   filter,
-  {recordIds = [], lock = false} = {},
+  {
+    recordIds = [],
+    lock = false,
+    includeTotal = true,
+    includeBaseline = true,
+  } = {},
 ) {
   const {where, params} = candidateWhere(tenantId, filter, recordIds);
-  const totalRow = await executor.queryOne(`
-    SELECT COUNT(*) AS total
-    FROM records r
-    ${where}
-  `, params);
-  const queryLimit = recordIds.length > 0 ? recordIds.length : filter.limit;
-  const rowParams = [...params, queryLimit];
-  const rows = await executor.queryAll(`
+  const qualificationSql = negativeCandidateQualificationSql(where, {
+    includeBaseline,
+    lock,
+  });
+  const totalRow = includeTotal ? await executor.queryOne(`
+      ${negativeCandidateQualificationSql(where)}
+      SELECT COUNT(*) AS matched_count,
+        COUNT(*) FILTER (WHERE can_dispatch) AS dispatchable_count,
+        COUNT(*) FILTER (WHERE NOT can_dispatch) AS deferred_count
+      FROM qualified_records
+    `, params) : null;
+  const queryLimit = recordIds.length > 0
+    ? recordIds.length
+    : filter.pageSize || filter.limit;
+  const rowParams = [...params];
+  let cursorWhere = '';
+  if (recordIds.length === 0 && filter.cursor) {
+    rowParams.push(filter.cursor.publishedAt, filter.cursor.id);
+    cursorWhere = `WHERE (
+      published_ts < $${rowParams.length - 1}::timestamptz
+      OR (
+        published_ts = $${rowParams.length - 1}::timestamptz
+        AND id > $${rowParams.length}::uuid
+      )
+    )`;
+  }
+  rowParams.push(queryLimit + (recordIds.length > 0 ? 0 : 1));
+  const loadedRows = await executor.queryAll(`
+    ${qualificationSql}
     SELECT
-      r.id, r.platform, r.external_id, r.title, r.content,
-      r.author_name, r.url, r.canonical_url, r.note_type,
-      r.publish_time, r.published_ts, r.keyword, r.sentiment,
-      r.likes, r.comments_count, r.collects, r.shares, r.last_seen_at,
-      baseline.id AS baseline_observation_id,
-      baseline.captured_at AS baseline_captured_at,
-      baseline.likes AS baseline_likes,
-      baseline.comments_count AS baseline_comments_count,
-      baseline.collects AS baseline_collects,
-      baseline.shares AS baseline_shares
-    FROM records r
-    LEFT JOIN LATERAL (
-      SELECT ro.id, ro.captured_at, ro.likes, ro.comments_count,
-        ro.collects, ro.shares
-      FROM record_observations ro
-      WHERE ro.tenant_id = r.tenant_id AND ro.record_id = r.id
-      ORDER BY ro.captured_at DESC, ro.id DESC
-      LIMIT 1
-    ) baseline ON true
-    ${where}
-    ORDER BY r.published_ts DESC, r.id
+      *
+    FROM qualified_records
+    ${cursorWhere}
+    ORDER BY published_ts DESC, id
     LIMIT $${rowParams.length}
-    ${lock ? 'FOR SHARE OF r' : ''}
   `, rowParams);
+  const hasMore = recordIds.length === 0 && loadedRows.length > queryLimit;
+  const rows = hasMore ? loadedRows.slice(0, queryLimit) : loadedRows;
+  const total = includeTotal
+    ? Number(totalRow?.matched_count || 0)
+    : rows.length;
   return {
     rows,
-    candidates: rows.map(publicCandidate),
-    total: Number(totalRow?.total || 0),
-    limited: Number(totalRow?.total || 0) > rows.length,
+    candidates: rows.map(row => publicNegativePatrolCandidate(
+      row,
+      {includeBaseline},
+    )),
+    total,
+    matchedCount: total,
+    dispatchableCount: includeTotal
+      ? Number(totalRow?.dispatchable_count || 0)
+      : rows.filter(row => row.can_dispatch === true).length,
+    deferredCount: includeTotal
+      ? Number(totalRow?.deferred_count || 0)
+      : rows.filter(row => row.can_dispatch !== true).length,
+    pageCount: rows.length,
+    nextCursor: hasMore ? encodeCandidateCursor(rows.at(-1)) : null,
+    hasMore,
+    limited: hasMore,
   };
 }
 
@@ -608,7 +904,7 @@ async function loadWatchedCandidates(
     ${lock ? 'FOR SHARE OF r, watch' : ''}
   `, rowParams);
   const candidates = rows.map(row => ({
-    ...publicCandidate(row),
+    ...publicNegativePatrolCandidate(row),
     watchedAt: row.watched_at,
     watchedByName: row.watched_by_name,
   }));
@@ -778,6 +1074,16 @@ async function loadCompatibleAgent(
     )};
   }
   if (
+    workflow === 'negative_post_patrol' &&
+    capabilities.negativePatrolTerminalReceiptV1 !== true
+  ) {
+    return {failure: requestError(
+      'agent_negative_patrol_terminal_receipt_capability_missing',
+      '目标执行节点版本尚不支持负面巡查终态回执，请先升级扩展',
+      409,
+    )};
+  }
+  if (
     workflow === 'watched_content_patrol' &&
     capabilities.watchedContentPatrol !== true
   ) {
@@ -943,19 +1249,6 @@ async function loadCompatibleAgents(
   return {agents: agentIds.map(agentId => byId.get(agentId)).filter(Boolean)};
 }
 
-function candidateTarget(candidate, itemId) {
-  return {
-    itemId,
-    recordId: candidate.id,
-    externalId: candidate.externalId,
-    url: candidate.url,
-    title: candidate.title,
-    publishedAt: candidate.publishedAt,
-    noteType: candidate.noteType,
-    baseline: candidate.baseline,
-  };
-}
-
 function patrolRequestHash({
   agentIds = [],
   title,
@@ -1010,11 +1303,18 @@ async function createElasticPatrolTask(tx, {
   openedMessage = '负面帖子已进入云端弹性队列',
   openedEventType = 'negative_patrol_elastic_pool_opened',
   auditAction = 'negative_patrol.create_elastic_pool',
+  distributionMode = 'elastic_pool',
+  pinnedAssignments = [],
+  allocation = [],
 }) {
   const selectedRecordIds = candidates.map(candidate => candidate.id);
   const eligibleAgentIds = agents.map(agent => agent.id);
+  const fixedPinned = distributionMode === 'fixed_batch';
+  const pinnedByRecordId = new Map(
+    pinnedAssignments.map(entry => [entry.recordId, entry.agentId]),
+  );
   const recoveryPolicy = {
-    allowIdleAgentHandoff: true,
+    allowIdleAgentHandoff: !fixedPinned,
     platformSafetyMode: 'manual_confirmed',
   };
   const metadata = {
@@ -1022,9 +1322,11 @@ async function createElasticPatrolTask(tx, {
     businessTaskType: workflow,
     protocolVersion: 3,
     multiAgent: true,
-    allocationMode: 'elastic_pool',
-    distributionMode: 'elastic_pool',
+    allocationMode: fixedPinned ? 'fixed_pinned' : 'elastic_pool',
+    distributionMode,
     cloudWorkQueue: true,
+    serverPerItemDispatchV1: workflow === 'negative_post_patrol',
+    perItemAdmissionV1: workflow === 'negative_post_patrol',
     claimUnit: itemType,
     remoteCreated: true,
     remoteRequestHash: requestHash,
@@ -1034,6 +1336,7 @@ async function createElasticPatrolTask(tx, {
     selectedRecordIds,
     selectedAgentIds: eligibleAgentIds,
     eligibleAgentIds,
+    ...(allocation.length > 0 ? {allocation} : {}),
     captureSettings,
     planSnapshot: {recoveryPolicy},
     recoveryPolicy,
@@ -1066,7 +1369,7 @@ async function createElasticPatrolTask(tx, {
     }),
     JSON.stringify({
       total: candidates.length,
-      assigned: 0,
+      assigned: fixedPinned ? candidates.length : 0,
       processed: 0,
       success: 0,
       failed: 0,
@@ -1079,45 +1382,70 @@ async function createElasticPatrolTask(tx, {
     queuedMessage,
   ]);
 
-  for (let ordinal = 0; ordinal < candidates.length; ordinal += 1) {
-    const candidate = candidates[ordinal];
-    await tx.execute(`
-      INSERT INTO capture_task_items (
-        id, tenant_id, task_id, item_key, ordinal,
-        platform, item_type, record_id, external_id, url_snapshot,
-        status, assigned_agent_id, execution_task_id,
-        assignment_revision, request_hash, metadata
-      ) VALUES (
-        $1, $2, $3, $4, $5,
-        $6, $11, $7, $8, $9,
-        'pending', NULL, NULL,
-        0, '', $10::jsonb
-      )
-    `, [
-      crypto.randomUUID(),
-      tenantId,
-      parent.id,
-      `record:${candidate.id}`,
-      ordinal,
-      candidate.platform,
-      candidate.id,
-      candidate.externalId,
-      candidate.url,
-      JSON.stringify({
-        sourceRecord: {
-          title: candidate.title,
-          content: text(candidate.content, 1000),
-          authorName: candidate.authorName,
-          publishedAt: candidate.publishedAt,
-          publishTime: candidate.publishTime,
-          keyword: candidate.keyword,
-          noteType: candidate.noteType,
-        },
-        baseline: candidate.baseline,
-      }),
-      itemType,
-    ]);
-  }
+  const itemRows = candidates.map((candidate, ordinal) => ({
+    id: crypto.randomUUID(),
+    itemKey: `record:${candidate.id}`,
+    ordinal,
+    platform: candidate.platform,
+    recordId: candidate.id,
+    externalId: candidate.externalId,
+    urlSnapshot: candidate.url,
+    itemType,
+    metadata: {
+      sourceRecord: {
+        title: candidate.title,
+        content: text(candidate.content, 1000),
+        authorName: candidate.authorName,
+        publishedAt: candidate.publishedAt,
+        publishTime: candidate.publishTime,
+        keyword: candidate.keyword,
+        noteType: candidate.noteType,
+      },
+      baseline: candidate.baseline,
+      ...(fixedPinned
+        ? {pinnedAgentId: pinnedByRecordId.get(candidate.id) || ''}
+        : {}),
+    },
+  }));
+  await tx.execute(`
+    INSERT INTO capture_task_items (
+      id, tenant_id, task_id, item_key, ordinal,
+      platform, item_type, record_id, external_id, url_snapshot,
+      status, assigned_agent_id, execution_task_id,
+      assignment_revision, request_hash, metadata
+    )
+    SELECT
+      input.id, $1, $2, input.item_key, input.ordinal,
+      input.platform, input.item_type, input.record_id,
+      input.external_id, input.url_snapshot,
+      'pending', NULL, NULL, 0, '', input.metadata
+    FROM jsonb_to_recordset($3::jsonb) AS input(
+      id uuid,
+      item_key text,
+      ordinal integer,
+      platform text,
+      item_type text,
+      record_id uuid,
+      external_id text,
+      url_snapshot text,
+      metadata jsonb
+    )
+    ORDER BY input.ordinal
+  `, [
+    tenantId,
+    parent.id,
+    JSON.stringify(itemRows.map(row => ({
+      id: row.id,
+      item_key: row.itemKey,
+      ordinal: row.ordinal,
+      platform: row.platform,
+      item_type: row.itemType,
+      record_id: row.recordId,
+      external_id: row.externalId,
+      url_snapshot: row.urlSnapshot,
+      metadata: row.metadata,
+    }))),
+  ]);
 
   await appendTaskEvent(tx, {
     tenantId,
@@ -1133,6 +1461,8 @@ async function createElasticPatrolTask(tx, {
       candidateCount: candidates.length,
       eligibleAgentIds,
       claimUnit: itemType,
+      distributionMode,
+      allocation,
       requestHash,
     },
   });
@@ -1154,6 +1484,8 @@ async function createElasticPatrolTask(tx, {
       platform: filter.platform,
       candidateCount: candidates.length,
       eligibleAgentIds,
+      distributionMode,
+      allocation,
       requestHash,
     }),
     auditAction,
@@ -1167,20 +1499,10 @@ async function createElasticPatrolTask(tx, {
       captureAgentOnline(agent.last_heartbeat_at),
     ),
     agentCount: agents.length,
-    allocation: [],
+    allocation,
     executions: [],
     existing: false,
   };
-}
-
-function patrolGroupRequestHash(parentRequestHash, agentId, recordIds) {
-  return crypto.createHash('sha256').update(JSON.stringify({
-    workflow: 'negative_post_patrol',
-    protocolVersion: 2,
-    parentRequestHash,
-    agentId,
-    recordIds,
-  })).digest('hex');
 }
 
 export function negativePatrolReassignmentRequestHash({
@@ -1249,362 +1571,6 @@ function watchedContentPatrolExistingRequestMatches(
   );
 }
 
-async function createMultiAgentPatrolTask(tx, {
-  tenantId,
-  requestKey,
-  title,
-  filter,
-  candidates,
-  agents,
-  captureSettings,
-  requestHash,
-  actorId,
-  actorName,
-}) {
-  const {groups, assignments} = allocateNegativePatrolCandidates(
-    candidates,
-    agents.map(agent => agent.id),
-  );
-  if (groups.length < 2 || assignments.length !== candidates.length) {
-    return {failure: requestError(
-      'multi_agent_allocation_failed',
-      '多节点巡查分配未覆盖全部帖子，请刷新后重试',
-      409,
-    )};
-  }
-  const selectedRecordIds = candidates.map(candidate => candidate.id);
-  const allocation = groups.map(group => {
-    const agent = agents.find(candidate => candidate.id === group.agentId);
-    return {
-      agentId: group.agentId,
-      agentName: text(
-        agent?.display_name || agent?.client_label || group.agentId,
-        160,
-      ),
-      count: group.candidates.length,
-      startOrdinal: group.startOrdinal,
-      endOrdinal: group.endOrdinal,
-    };
-  });
-  const metadata = {
-    workflow: 'negative_post_patrol',
-    businessTaskType: 'negative_post_patrol',
-    protocolVersion: 2,
-    multiAgent: true,
-    allocationMode: 'balanced_contiguous',
-    remoteCreated: true,
-    remoteRequestHash: requestHash,
-    requestedByUserId: actorId || '',
-    requestedByName: text(actorName, 240),
-    filter,
-    selectedRecordIds,
-    selectedAgentIds: agents.map(agent => agent.id),
-    allocation,
-    captureSettings,
-  };
-  const parent = await tx.queryOne(`
-    INSERT INTO capture_tasks (
-      id, tenant_id, client_task_id, task_type, feature_key,
-      title, platform, source, trigger_type, status,
-      progress, checkpoint, counts, metadata, message,
-      orchestration_revision, source_updated_at
-    ) VALUES (
-      $1::uuid, $2, $1::uuid::text, 'capture_orchestration',
-      'negative_post_patrol', $3, $4, 'cloud',
-      'negative_patrol_multi_agent', 'pending',
-      $5::jsonb, '{}'::jsonb, $6::jsonb, $7::jsonb,
-      '负面帖子已均衡分配，等待多个执行节点领取',
-      1, now()
-    )
-    RETURNING *
-  `, [
-    requestKey,
-    tenantId,
-    title,
-    filter.platform,
-    JSON.stringify({
-      current: 0,
-      total: candidates.length,
-      percent: 0,
-      phase: 'queued',
-    }),
-    JSON.stringify({
-      total: candidates.length,
-      assigned: candidates.length,
-      processed: 0,
-      success: 0,
-      failed: 0,
-      skipped: 0,
-      agents: groups.length,
-    }),
-    JSON.stringify(metadata),
-  ]);
-
-  const commands = [];
-  const executionTasks = [];
-  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
-    const group = groups[groupIndex];
-    const agent = agents.find(candidate => candidate.id === group.agentId);
-    if (!agent) {
-      return {failure: requestError(
-        'multi_agent_allocation_failed',
-        '多节点巡查分配引用了不存在的执行节点',
-        409,
-      )};
-    }
-    const childTaskId = crypto.randomUUID();
-    const commandId = crypto.randomUUID();
-    const groupRecordIds = group.candidates.map(candidate => candidate.id);
-    const groupRequestHash = patrolGroupRequestHash(
-      requestHash,
-      agent.id,
-      groupRecordIds,
-    );
-    const itemIds = group.candidates.map(() => crypto.randomUUID());
-    const childTitle = `${title} · ${groupIndex + 1}/${groups.length}`;
-    const childMetadata = {
-      workflow: 'negative_post_patrol',
-      taskKind: 'negative_post_patrol',
-      // Multi-Agent orchestration is a server-side v2 concern. Each browser
-      // still receives the established targeted-post v1 protocol so existing
-      // Extension runtimes can execute their exclusive slice.
-      protocolVersion: 1,
-      orchestrationChild: true,
-      parentTaskId: parent.id,
-      orchestrationRevision: 1,
-      remoteCreated: true,
-      remoteRequestHash: groupRequestHash,
-      createCommandId: commandId,
-      requestedByUserId: actorId || '',
-      requestedByName: text(actorName, 240),
-      filter,
-      selectedRecordIds: groupRecordIds,
-      itemIds,
-      captureSettings,
-    };
-    const child = await tx.queryOne(`
-      INSERT INTO capture_tasks (
-        id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
-        client_task_id, task_type, feature_key, title, platform,
-        source, trigger_type, status, progress, checkpoint, counts,
-        metadata, message, orchestration_revision, source_updated_at
-      ) VALUES (
-        $1::uuid, $2, $3, $4, $4,
-        $1::uuid::text, 'negative_post_patrol',
-        'negative_post_patrol', $5, $6,
-        'cloud', 'negative_patrol_multi_agent_child', 'pending',
-        $7::jsonb, jsonb_build_object('targetIndex', 0),
-        $8::jsonb, $9::jsonb,
-        '已分配负面帖子，等待执行节点领取',
-        1, now()
-      )
-      RETURNING *
-    `, [
-      childTaskId,
-      tenantId,
-      parent.id,
-      agent.id,
-      childTitle,
-      filter.platform,
-      JSON.stringify({
-        current: 0,
-        total: group.candidates.length,
-        percent: 0,
-        phase: 'queued',
-      }),
-      JSON.stringify({
-        total: group.candidates.length,
-        assigned: group.candidates.length,
-        processed: 0,
-        success: 0,
-        failed: 0,
-        skipped: 0,
-      }),
-      JSON.stringify(childMetadata),
-    ]);
-
-    const targets = [];
-    for (let offset = 0; offset < group.candidates.length; offset += 1) {
-      const candidate = group.candidates[offset];
-      const itemId = itemIds[offset];
-      const ordinal = group.startOrdinal + offset;
-      const itemMetadata = {
-        sourceRecord: {
-          title: candidate.title,
-          content: text(candidate.content, 1000),
-          authorName: candidate.authorName,
-          publishedAt: candidate.publishedAt,
-          publishTime: candidate.publishTime,
-          keyword: candidate.keyword,
-          noteType: candidate.noteType,
-        },
-        baseline: candidate.baseline,
-      };
-      await tx.execute(`
-        INSERT INTO capture_task_items (
-          id, tenant_id, task_id, item_key, ordinal,
-          platform, item_type, record_id, external_id, url_snapshot,
-          status, assigned_agent_id, execution_task_id,
-          assignment_revision, request_hash, assigned_at, dispatched_at,
-          metadata
-        ) VALUES (
-          $1, $2, $3, $4, $5,
-          $6, 'negative_post', $7, $8, $9,
-          'dispatched', $10, $11, 1, $12, now(), now(), $13::jsonb
-        )
-      `, [
-        itemId,
-        tenantId,
-        parent.id,
-        `record:${candidate.id}`,
-        ordinal,
-        candidate.platform,
-        candidate.id,
-        candidate.externalId,
-        candidate.url,
-        agent.id,
-        child.id,
-        groupRequestHash,
-        JSON.stringify(itemMetadata),
-      ]);
-      await tx.execute(`
-        INSERT INTO capture_task_item_attempts (
-          id, tenant_id, item_id, parent_task_id,
-          execution_task_id, agent_id, attempt_number,
-          assignment_revision, status, request_hash,
-          checkpoint, result, error, dispatched_at
-        ) VALUES (
-          $1, $2, $3, $4,
-          $5, $6, 1,
-          1, 'dispatched', $7,
-          '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
-        )
-      `, [
-        crypto.randomUUID(),
-        tenantId,
-        itemId,
-        parent.id,
-        child.id,
-        agent.id,
-        groupRequestHash,
-      ]);
-      targets.push(candidateTarget(candidate, itemId));
-    }
-
-    const payload = {
-      taskId: child.id,
-      clientTaskId: child.id,
-      parentTaskId: parent.id,
-      title: child.title,
-      executionMode: 'one_time',
-      platform: child.platform,
-      workflow: 'negative_post_patrol',
-      taskKind: 'negative_post_patrol',
-      protocolVersion: 1,
-      targets,
-      items: targets,
-      captureSettings,
-      requestHash: groupRequestHash,
-      authCodeId: agent.auth_code_id,
-      authBindingId: agent.auth_binding_id,
-    };
-    const command = await tx.queryOne(`
-      INSERT INTO capture_agent_commands (
-        id, tenant_id, agent_id, task_id, command_type, payload,
-        requested_by_user_id, requested_by_name
-      ) VALUES (
-        $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
-      )
-      RETURNING id, status, expires_at, created_at
-    `, [
-      commandId,
-      tenantId,
-      agent.id,
-      child.id,
-      JSON.stringify(payload),
-      actorId || null,
-      text(actorName, 240),
-    ]);
-    commands.push(command);
-    executionTasks.push({
-      taskId: child.id,
-      agentId: agent.id,
-      agentName: text(
-        agent.display_name || agent.client_label || agent.id,
-        160,
-      ),
-      itemCount: targets.length,
-      commandId: command.id,
-    });
-  }
-
-  const commandIds = commands.map(command => command.id);
-  const updatedParent = await tx.queryOne(`
-    UPDATE capture_tasks
-    SET metadata = metadata || jsonb_build_object(
-        'createCommandIds', $1::jsonb,
-        'executionTaskIds', $2::jsonb
-      ),
-      updated_at = now()
-    WHERE id = $3 AND tenant_id = $4
-    RETURNING *
-  `, [
-    JSON.stringify(commandIds),
-    JSON.stringify(executionTasks.map(execution => execution.taskId)),
-    parent.id,
-    tenantId,
-  ]);
-  await appendTaskEvent(tx, {
-    tenantId,
-    taskId: parent.id,
-    actorId,
-    actorName,
-    status: parent.status,
-    message: '负面帖子已均衡拆分并分别下发多个执行节点',
-    payload: {
-      platform: filter.platform,
-      candidateCount: candidates.length,
-      agentCount: groups.length,
-      allocation,
-      commandIds,
-      requestHash,
-    },
-  });
-  await tx.execute(`
-    INSERT INTO audit_logs (
-      tenant_id, actor_type, actor_id, actor_user_id,
-      action, target_type, target_id, metadata
-    ) VALUES (
-      $1, 'user', $2, $3,
-      'negative_patrol.create_multi_agent',
-      'capture_task', $4, $5::jsonb
-    )
-  `, [
-    tenantId,
-    text(actorId, 240),
-    actorId || null,
-    parent.id,
-    JSON.stringify({
-      platform: filter.platform,
-      candidateCount: candidates.length,
-      agentCount: groups.length,
-      allocation,
-      requestHash,
-    }),
-  ]);
-  return {
-    task: updatedParent || parent,
-    commandId: commandIds[0] || null,
-    commandIds,
-    commandExpiresAt: commands[0]?.expires_at || null,
-    agentOnline: true,
-    agentCount: groups.length,
-    allocation,
-    executions: executionTasks,
-    existing: false,
-  };
-}
-
 async function appendTaskEvent(tx, {
   tenantId,
   taskId,
@@ -1652,20 +1618,54 @@ router.post(
       if (normalizedIds.failure) {
         return sendRequestError(res, normalizedIds.failure);
       }
-      const result = await loadCandidates(
-        {queryAll, queryOne},
+      const result = await withTransaction(tx => loadCandidates(
+        tx,
         req.tenantId,
         normalized.filter,
-        {recordIds: normalizedIds.recordIds},
-      );
+        {
+          recordIds: normalizedIds.recordIds,
+          includeTotal: true,
+          includeBaseline: false,
+        },
+      ), {
+        category: 'reporting',
+        waitTimeoutMs: 250,
+        statementTimeoutMs: 2000,
+        lockTimeoutMs: 100,
+        jitOff: true,
+        isolationLevel: 'repeatable_read',
+        readOnly: true,
+      });
       return res.json({
         ok: true,
         candidates: result.candidates,
+        records: result.candidates,
         total: result.total,
+        matchedCount: result.matchedCount,
+        dispatchableCount: result.dispatchableCount,
+        eligibleCount: result.dispatchableCount,
+        deferredCount: result.deferredCount,
+        pageCount: result.pageCount,
+        currentPageCount: result.pageCount,
+        nextCursor: result.nextCursor,
+        hasMore: result.hasMore,
         limited: result.limited,
         filter: normalized.filter,
       });
     } catch (error) {
+      if (isDbCapacityError(error) || error?.code === '57014') {
+        const retryAfterMs = Math.max(
+          250,
+          Number(error?.retryAfterMs) || 1000,
+        );
+        res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+        return res.status(503).json({
+          ok: false,
+          error: 'server_busy',
+          message: '负面帖子预览查询繁忙，请稍后重试',
+          retryAfterMs,
+        });
+      }
       return next(error);
     }
   },
@@ -1984,6 +1984,9 @@ router.post(
       }
       return res.status(result.existing ? 200 : 201).json({
         ok: true,
+        created: result.existing !== true,
+        submissionState: 'confirmed',
+        taskId: result.task.id,
         task: result.task,
         agentCount: result.agentCount || 0,
         existing: result.existing,
@@ -2011,6 +2014,12 @@ router.post(
       const normalizedIds = normalizeRecordIds(req.body?.recordIds);
       if (normalizedIds.failure) {
         return sendRequestError(res, normalizedIds.failure);
+      }
+      if (normalizedIds.recordIds.length === 0) {
+        return sendRequestError(res, requestError(
+          'negative_patrol_record_ids_required',
+          '请先在预览中明确选择要巡查的帖子',
+        ));
       }
       const normalizedAgents = normalizeNegativePatrolAgentIds(req.body);
       if (normalizedAgents.failure) {
@@ -2134,6 +2143,8 @@ router.post(
           {
             recordIds: normalizedIds.recordIds,
             lock: true,
+            includeTotal: false,
+            includeBaseline: true,
           },
         );
         if (selection.candidates.length === 0) {
@@ -2161,6 +2172,26 @@ router.post(
             },
           )};
         }
+        const deferredSelection = selection.candidates.filter(candidate =>
+          candidate.canDispatch !== true,
+        );
+        if (deferredSelection.length > 0) {
+          return {failure: requestError(
+            'candidate_selection_changed',
+            '部分已选帖子当前暂不能下发，请刷新候选列表',
+            409,
+            {
+              invalidRecordIds: deferredSelection.map(candidate => candidate.id),
+              invalidCandidates: deferredSelection.map(candidate => ({
+                id: candidate.id,
+                eligibilityCode: candidate.eligibilityCode,
+                eligibilityReason: candidate.eligibilityReason,
+                effectiveSentiment: candidate.effectiveSentiment,
+                sentimentSource: candidate.sentimentSource,
+              })),
+            },
+          )};
+        }
         const selectedRecordIds = selection.candidates.map(
           candidate => candidate.id,
         );
@@ -2173,40 +2204,25 @@ router.post(
           distributionMode,
         });
 
-        if (distributionMode === 'elastic_pool') {
+        // The kill switch pauses creation. It must never fall back to the old
+        // multi-target browser command because that path bypasses admission.
+        if (process.env.NEGATIVE_PATROL_SERVER_PER_ITEM_DISABLED === 'true') {
+          return {failure: requestError(
+            'negative_patrol_dispatch_paused',
+            '负面巡查下发暂时暂停，请稍后重试',
+            503,
+            {retryAfterMs: 10000},
+          )};
+        }
           if (agentIds.length === 0) {
             return {failure: requestError(
               'negative_patrol_agents_required',
-              '混合平台或弹性巡查请至少选择一个执行节点',
+              '请至少选择一个执行节点',
               409,
             )};
           }
-          const requiredPlatforms = [...new Set(
-            selection.candidates.map(candidate => candidate.platform),
-          )];
-          const compatible = await loadCompatibleAgents(
-            tx,
-            req.tenantId,
-            agentIds,
-            requiredPlatforms,
-          );
-          if (compatible.failure) return {failure: compatible.failure};
-          return createElasticPatrolTask(tx, {
-            tenantId: req.tenantId,
-            requestKey,
-            title,
-            filter: normalized.filter,
-            candidates: selection.candidates,
-            agents: compatible.agents,
-            captureSettings,
-            requestHash,
-            actorId: req.user?.id || '',
-            actorName: req.actorName,
-          });
-        }
-
-        if (agentIds.length > 1) {
           if (
+            distributionMode === 'fixed_batch' &&
             selection.candidates.length < agentIds.length
           ) {
             return {failure: requestError(
@@ -2219,15 +2235,41 @@ router.post(
               },
             )};
           }
+          const requiredPlatforms = [...new Set(
+            selection.candidates.map(candidate => candidate.platform),
+          )];
           const compatible = await loadCompatibleAgents(
             tx,
             req.tenantId,
             agentIds,
-            normalized.filter.platform,
-            {requireOnline: true},
+            requiredPlatforms,
           );
           if (compatible.failure) return {failure: compatible.failure};
-          return createMultiAgentPatrolTask(tx, {
+
+          const fixedAllocation = distributionMode === 'fixed_batch'
+            ? allocateNegativePatrolCandidates(
+                selection.candidates,
+                compatible.agents.map(agent => agent.id),
+              )
+            : {groups: [], assignments: []};
+          const allocation = fixedAllocation.groups.map(group => {
+            const assignedAgent = compatible.agents.find(
+              agent => agent.id === group.agentId,
+            );
+            return {
+              agentId: group.agentId,
+              agentName: text(
+                assignedAgent?.display_name ||
+                  assignedAgent?.client_label ||
+                  group.agentId,
+                160,
+              ),
+              count: group.candidates.length,
+              startOrdinal: group.startOrdinal,
+              endOrdinal: group.endOrdinal,
+            };
+          });
+          return createElasticPatrolTask(tx, {
             tenantId: req.tenantId,
             requestKey,
             title,
@@ -2238,259 +2280,29 @@ router.post(
             requestHash,
             actorId: req.user?.id || '',
             actorName: req.actorName,
+            distributionMode,
+            pinnedAssignments: fixedAllocation.assignments.map(entry => ({
+              recordId: entry.candidate.id,
+              agentId: entry.agentId,
+            })),
+            allocation,
+            triggerType: distributionMode === 'fixed_batch'
+              ? 'negative_patrol_fixed_queue'
+              : 'negative_patrol_elastic_pool',
+            queuedMessage: distributionMode === 'fixed_batch'
+              ? '帖子已固定到指定节点，等待服务器逐篇准入'
+              : '帖子保留在云端，等待弹性节点逐篇领取',
+            openedMessage: distributionMode === 'fixed_batch'
+              ? '负面帖子已按固定节点进入逐帖队列'
+              : '负面帖子已进入云端弹性队列',
+            openedEventType: distributionMode === 'fixed_batch'
+              ? 'negative_patrol_fixed_queue_opened'
+              : 'negative_patrol_elastic_pool_opened',
+            auditAction: distributionMode === 'fixed_batch'
+              ? 'negative_patrol.create_fixed_queue'
+              : 'negative_patrol.create_elastic_pool',
           });
-        }
 
-        const compatible = await loadCompatibleAgent(
-          tx,
-          req.tenantId,
-          agentId,
-          normalized.filter.platform,
-        );
-        if (compatible.failure) return {failure: compatible.failure};
-        const agent = compatible.agent;
-        const commandId = agent ? crypto.randomUUID() : null;
-        const itemStatus = agent ? 'dispatched' : 'pending';
-        const taskStatus = agent ? 'pending' : 'waiting_device';
-        const metadata = {
-          workflow: 'negative_post_patrol',
-          protocolVersion: 1,
-          distributionMode: 'fixed_batch',
-          automaticRetryDisabled:
-            req.body?.recoveryPolicy?.allowIdleAgentHandoff === false,
-          remoteCreated: true,
-          remoteRequestHash: requestHash,
-          createCommandId: commandId || '',
-          requestedByUserId: req.user?.id || '',
-          requestedByName: text(req.actorName, 240),
-          filter: normalized.filter,
-          selectedRecordIds,
-          selectedAgentIds: agent ? [agent.id] : [],
-          captureSettings,
-        };
-        const task = await tx.queryOne(`
-          INSERT INTO capture_tasks (
-            id, tenant_id, origin_agent_id, assigned_agent_id,
-            client_task_id, task_type, feature_key, title, platform,
-            source, trigger_type, status, progress, checkpoint, counts,
-            metadata, message, orchestration_revision, source_updated_at
-          ) VALUES (
-            $1::uuid, $2, $3, $3,
-            $1::uuid::text, 'negative_post_patrol',
-            'negative_post_patrol', $4, $5,
-            'cloud', 'negative_patrol_manual', $6,
-            $7::jsonb, $8::jsonb, $9::jsonb,
-            $10::jsonb, $11, $12, now()
-          )
-          RETURNING *
-        `, [
-          requestKey,
-          req.tenantId,
-          agent?.id || null,
-          title,
-          normalized.filter.platform,
-          taskStatus,
-          JSON.stringify({
-            current: 0,
-            total: selection.candidates.length,
-            percent: 0,
-            phase: agent ? 'queued' : 'unassigned',
-          }),
-          JSON.stringify({targetIndex: 0}),
-          JSON.stringify({
-            total: selection.candidates.length,
-            assigned: agent ? selection.candidates.length : 0,
-            processed: 0,
-            success: 0,
-            failed: 0,
-            skipped: 0,
-          }),
-          JSON.stringify(metadata),
-          agent
-            ? '负面帖子巡查任务已创建，等待目标设备领取'
-            : '负面帖子巡查任务已创建，等待分配执行节点',
-          agent ? 1 : 0,
-        ]);
-
-        const targets = [];
-        for (
-          let ordinal = 0;
-          ordinal < selection.candidates.length;
-          ordinal += 1
-        ) {
-          const candidate = selection.candidates[ordinal];
-          const itemId = crypto.randomUUID();
-          const itemMetadata = {
-            sourceRecord: {
-              title: candidate.title,
-              content: text(candidate.content, 1000),
-              authorName: candidate.authorName,
-              publishedAt: candidate.publishedAt,
-              publishTime: candidate.publishTime,
-              keyword: candidate.keyword,
-              noteType: candidate.noteType,
-            },
-            baseline: candidate.baseline,
-          };
-          await tx.execute(`
-            INSERT INTO capture_task_items (
-              id, tenant_id, task_id, item_key, ordinal,
-              platform, item_type, record_id, external_id, url_snapshot,
-              status, assigned_agent_id, execution_task_id,
-              assignment_revision, request_hash, assigned_at, dispatched_at,
-              metadata
-            ) VALUES (
-              $1, $2, $3, $4, $5,
-              $6, 'negative_post', $7, $8, $9,
-              $10, $11, $12, $13, $14,
-              CASE WHEN $11::uuid IS NULL THEN NULL ELSE now() END,
-              CASE WHEN $11::uuid IS NULL THEN NULL ELSE now() END,
-              $15::jsonb
-            )
-          `, [
-            itemId,
-            req.tenantId,
-            task.id,
-            `record:${candidate.id}`,
-            ordinal,
-            candidate.platform,
-            candidate.id,
-            candidate.externalId,
-            candidate.url,
-            itemStatus,
-            agent?.id || null,
-            agent ? task.id : null,
-            agent ? 1 : 0,
-            agent ? requestHash : '',
-            JSON.stringify(itemMetadata),
-          ]);
-          if (agent) {
-            await tx.execute(`
-              INSERT INTO capture_task_item_attempts (
-                id, tenant_id, item_id, parent_task_id,
-                execution_task_id, agent_id, attempt_number,
-                assignment_revision, status, request_hash,
-                checkpoint, result, error, dispatched_at
-              ) VALUES (
-                $1, $2, $3, $4,
-                $4, $5, 1,
-                1, 'dispatched', $6,
-                '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
-              )
-            `, [
-              crypto.randomUUID(),
-              req.tenantId,
-              itemId,
-              task.id,
-              agent.id,
-              requestHash,
-            ]);
-          }
-          targets.push(candidateTarget(candidate, itemId));
-        }
-
-        let command = null;
-        if (agent) {
-          const payload = {
-            taskId: task.id,
-            clientTaskId: task.id,
-            title: task.title,
-            executionMode: 'one_time',
-            platform: task.platform,
-            workflow: 'negative_post_patrol',
-            taskKind: 'negative_post_patrol',
-            protocolVersion: 1,
-            targets,
-            items: targets,
-            captureSettings,
-            requestHash,
-            authCodeId: agent.auth_code_id,
-            authBindingId: agent.auth_binding_id,
-          };
-          command = await tx.queryOne(`
-            INSERT INTO capture_agent_commands (
-              id, tenant_id, agent_id, task_id, command_type, payload,
-              requested_by_user_id, requested_by_name
-            ) VALUES (
-              $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
-            )
-            RETURNING id, status, expires_at, created_at
-          `, [
-            commandId,
-            req.tenantId,
-            agent.id,
-            task.id,
-            JSON.stringify(payload),
-            req.user?.id || null,
-            text(req.actorName, 240),
-          ]);
-        }
-
-        const eventMessage = agent
-          ? '后台已向指定节点创建负面帖子巡查任务'
-          : '后台已创建负面帖子巡查任务，等待分配执行节点';
-        await appendTaskEvent(tx, {
-          tenantId: req.tenantId,
-          taskId: task.id,
-          agentId: agent?.id || null,
-          actorId: req.user?.id || '',
-          actorName: req.actorName,
-          status: task.status,
-          message: eventMessage,
-          payload: {
-            commandId: command?.id || '',
-            platform: task.platform,
-            candidateCount: targets.length,
-            publishDateFrom: normalized.filter.publishDateFrom,
-            publishDateTo: normalized.filter.publishDateTo,
-            requestHash,
-          },
-        });
-        await tx.execute(`
-          INSERT INTO audit_logs (
-            tenant_id, actor_type, actor_id, actor_user_id,
-            action, target_type, target_id, metadata
-          ) VALUES (
-            $1, 'user', $2, $3,
-            'negative_patrol.create', 'capture_task', $4, $5::jsonb
-          )
-        `, [
-          req.tenantId,
-          text(req.user?.id || '', 240),
-          req.user?.id || null,
-          task.id,
-          JSON.stringify({
-            agentId: agent?.id || '',
-            platform: task.platform,
-            candidateCount: targets.length,
-            publishDateFrom: normalized.filter.publishDateFrom,
-            publishDateTo: normalized.filter.publishDateTo,
-            requestHash,
-          }),
-        ]);
-        return {
-          task,
-          commandId: command?.id || null,
-          commandIds: command?.id ? [command.id] : [],
-          commandExpiresAt: command?.expires_at || null,
-          agentOnline: agent
-            ? captureAgentOnline(agent.last_heartbeat_at)
-            : false,
-          agentCount: agent ? 1 : 0,
-          allocation: agent
-            ? [{
-                agentId: agent.id,
-                agentName: text(
-                  agent.display_name || agent.client_label || agent.id,
-                  160,
-                ),
-                count: targets.length,
-                startOrdinal: 0,
-                endOrdinal: Math.max(0, targets.length - 1),
-              }]
-            : [],
-          existing: false,
-        };
       });
 
       if (result.failure) {
@@ -2499,10 +2311,15 @@ router.post(
       const resultMetadata = safeJson(result.task?.metadata);
       const elasticPool =
         resultMetadata.distributionMode === 'elastic_pool';
+      const fixedPerItemQueue =
+        resultMetadata.serverPerItemDispatchV1 === true &&
+        resultMetadata.distributionMode === 'fixed_batch';
       const message = result.existing
         ? '相同请求已存在，已返回原任务状态'
         : elasticPool
           ? `${result.task?.counts?.total || 0} 条帖子已进入云端队列，空闲节点将逐篇领取`
+        : fixedPerItemQueue
+          ? `${result.task?.counts?.total || 0} 条帖子已固定到指定节点，服务器将逐篇准入`
         : result.agentCount > 1
           ? `任务已均衡分配给 ${result.agentCount} 个在线节点`
         : result.task.assigned_agent_id
@@ -2512,6 +2329,9 @@ router.post(
           : '任务已创建，等待分配执行节点';
       return res.status(result.existing ? 200 : 201).json({
         ok: true,
+        created: result.existing !== true,
+        submissionState: 'confirmed',
+        taskId: result.task.id,
         task: result.task,
         commandId: result.commandId,
         commandIds: result.commandIds || (
@@ -2623,678 +2443,373 @@ router.post(
           )};
         }
 
-        const existingChildren = await tx.queryAll(`
-          SELECT child.*,
-            command.id AS create_command_id,
-            command.status AS create_command_status,
-            command.expires_at AS create_command_expires_at,
-            agent.display_name AS agent_display_name,
-            agent.client_label AS agent_client_label
-          FROM capture_tasks child
-          LEFT JOIN capture_agent_commands command
-            ON command.id::text = child.metadata->>'createCommandId'
-            AND command.task_id = child.id
-            AND command.tenant_id = child.tenant_id
-          LEFT JOIN capture_agents agent
-            ON agent.id = child.assigned_agent_id
-            AND agent.tenant_id = child.tenant_id
-          WHERE child.tenant_id = $1
-            AND child.parent_task_id = $2
-            AND child.metadata->>'reassignmentRequestKey' = $3
-          ORDER BY child.created_at, child.id
-        `, [req.tenantId, parent.id, requestKey]);
-        if (existingChildren.length > 0) {
-          if (
-            existingChildren.some(child =>
-              !negativePatrolReassignmentExistingRequestMatches(
-                child,
-                reassignmentRequestHash,
-              )
-            )
-          ) {
+          const previousRequestKey = text(
+            parentMetadata.lastReassignmentRequestKey,
+            100,
+          );
+          if (previousRequestKey === requestKey) {
+            if (
+              parentMetadata.lastReassignmentRequestHash !==
+              reassignmentRequestHash
+            ) {
+              return {failure: requestError(
+                'idempotency_key_conflict',
+                '该 requestKey 已用于不同的负面巡查重分配请求',
+                409,
+              )};
+            }
+            const storedAllocation = Array.isArray(
+              parentMetadata.lastReassignmentAllocation,
+            ) ? parentMetadata.lastReassignmentAllocation : [];
+            return {
+              existing: true,
+              orchestrationId: parent.id,
+              revision: Number(parent.orchestration_revision || 0),
+              eligibleCount: Number(
+                parentMetadata.lastReassignmentItemCount || 0,
+              ),
+              allocation: storedAllocation,
+              executions: [],
+              message: '相同重分配请求已存在，已返回当前逐帖队列',
+            };
+          }
+
+          const currentRevision = Number(parent.orchestration_revision || 0);
+          if (currentRevision !== expectedRevision) {
             return {failure: requestError(
-              'idempotency_key_conflict',
-              '该 requestKey 已用于不同的负面巡查重分配请求',
+              'revision_conflict',
+              '负面巡查任务已被更新，请刷新后重新选择执行节点',
+              409,
+              {currentRevision},
+            )};
+          }
+          if (parent.status === 'canceled') {
+            return {failure: requestError(
+              'negative_patrol_reassignment_stopped',
+              '已停止的负面巡查不能重新分配',
               409,
             )};
           }
-          const allocation = existingChildren.map(child => {
-            const metadata = safeJson(child.metadata);
-            const stored = safeJson(metadata.reassignmentAllocation);
-            const itemIds = Array.isArray(metadata.itemIds)
-              ? metadata.itemIds
-              : [];
-            return {
-              agentId: child.assigned_agent_id,
-              agentName: text(
-                stored.agentName ||
-                  child.agent_display_name ||
-                  child.agent_client_label ||
-                  child.assigned_agent_id,
-                160,
-              ),
-              count: itemIds.length,
-              startOrdinal: Number(stored.startOrdinal || 0),
-              endOrdinal: Number(
-                stored.endOrdinal ??
-                  Math.max(0, itemIds.length - 1),
-              ),
-            };
-          });
-          const executions = existingChildren.map(child => {
-            const metadata = safeJson(child.metadata);
-            const itemIds = Array.isArray(metadata.itemIds)
-              ? metadata.itemIds
-              : [];
-            return {
-              taskId: child.id,
-              agentId: child.assigned_agent_id,
-              agentName: text(
-                child.agent_display_name ||
-                  child.agent_client_label ||
-                  child.assigned_agent_id,
-                160,
-              ),
-              itemCount: itemIds.length,
-              commandId:
-                child.create_command_id ||
-                text(metadata.createCommandId, 100) ||
-                null,
-            };
-          });
-          return {
-            existing: true,
-            orchestrationId: parent.id,
-            revision: Number(
-              existingChildren[0].orchestration_revision ||
-                safeJson(existingChildren[0].metadata)
-                  .orchestrationRevision ||
-                expectedRevision + 1,
-            ),
-            eligibleCount: allocation.reduce(
-              (sum, entry) => sum + entry.count,
-              0,
-            ),
-            allocation,
-            executions,
-            message: '相同重分配请求已存在，已返回原执行任务',
-          };
-        }
 
-        const currentRevision = Number(parent.orchestration_revision || 0);
-        if (currentRevision !== expectedRevision) {
-          return {failure: requestError(
-            'revision_conflict',
-            '负面巡查任务已被更新，请刷新后重新选择执行节点',
-            409,
-            {currentRevision},
-          )};
-        }
-        const activeChild = await tx.queryOne(`
-          SELECT id, status
-          FROM capture_tasks
-          WHERE tenant_id = $1
-            AND parent_task_id = $2
-            AND status = ANY($3::text[])
-          ORDER BY created_at, id
-          LIMIT 1
-        `, [
-          req.tenantId,
-          parent.id,
-          NEGATIVE_PATROL_ACTIVE_CHILD_STATUSES,
-        ]);
-        if (activeChild) {
-          return {failure: requestError(
-            'negative_patrol_reassignment_execution_active',
-            '仍有负面巡查执行任务在运行或等待设备，请先停止后再重新分配',
-            409,
-            {
-              blockingTaskId: activeChild.id,
-              blockingTaskStatus: activeChild.status,
-            },
-          )};
-        }
-
-        // Keep the same lock order as Agent heartbeat/completion:
-        // Agent rows (stable UUID order) -> task items -> parent revision CAS.
-        // Reversing Agent/item locks can deadlock when a heartbeat settles an
-        // old execution while an operator reassigns its unfinished items.
-        const compatible = await loadCompatibleAgents(
-          tx,
-          req.tenantId,
-          agentIds,
-          Array.isArray(safeJson(parentMetadata.filter).platforms)
-            ? safeJson(parentMetadata.filter).platforms
-            : parent.platform,
-          {requireOnline: true, requireIdle: true},
-        );
-        if (compatible.failure) return {failure: compatible.failure};
-        const agents = compatible.agents;
-
-        const items = await tx.queryAll(`
-          SELECT item.*,
-            record.content_availability_status,
-            record.title AS record_title,
-            record.published_ts AS record_published_at,
-            record.note_type AS record_note_type
-          FROM capture_task_items item
-          JOIN records record
-            ON record.id = item.record_id
-            AND record.tenant_id = item.tenant_id
-          WHERE item.tenant_id = $1
-            AND item.task_id = $2
-            AND item.item_type = 'negative_post'
-            AND item.status = ANY($3::text[])
-            AND record.content_availability_status NOT IN (
-              'deleted',
-              'page_unavailable'
-            )
-          ORDER BY item.ordinal, item.id
-          FOR UPDATE OF item
-        `, [
-          req.tenantId,
-          parent.id,
-          [...NEGATIVE_PATROL_REASSIGNABLE_ITEM_STATUSES],
-        ]);
-        const eligibleItems = items.filter(negativePatrolItemReassignable);
-        if (eligibleItems.length === 0) {
-          return {failure: requestError(
-            'negative_patrol_reassignment_empty',
-            '没有可重新分配的未完成帖子；已完成、已删除或不可访问的帖子不会重复执行',
-            409,
-          )};
-        }
-        if (eligibleItems.length < agentIds.length) {
-          return {failure: requestError(
-            'negative_patrol_reassignment_items_fewer_than_agents',
-            `当前只有 ${eligibleItems.length} 条帖子可重分配，少于 ${agentIds.length} 个执行节点`,
-            409,
-            {
-              eligibleCount: eligibleItems.length,
-              agentCount: agentIds.length,
-            },
-          )};
-        }
-        const sourceExecutionTaskIds = Array.from(new Set(
-          eligibleItems
-            .map(item => normalizedUuid(item.execution_task_id))
-            .filter(Boolean),
-        ));
-        if (sourceExecutionTaskIds.length > 0) {
-          const activeCommand = await tx.queryOne(`
-            SELECT id, task_id, command_type, status
-            FROM capture_agent_commands
+          const activeChild = await tx.queryOne(`
+            SELECT id, status
+            FROM capture_tasks
             WHERE tenant_id = $1
-              AND task_id = ANY($2::uuid[])
-              AND status IN ('pending', 'acknowledged')
+              AND parent_task_id = $2
+              AND status = ANY($3::text[])
             ORDER BY created_at, id
             LIMIT 1
-          `, [req.tenantId, sourceExecutionTaskIds]);
-          if (activeCommand) {
+          `, [
+            req.tenantId,
+            parent.id,
+            NEGATIVE_PATROL_ACTIVE_CHILD_STATUSES,
+          ]);
+          if (activeChild) {
             return {failure: requestError(
-              'negative_patrol_reassignment_command_active',
-              '原执行任务仍有待完成指令，请等待设备确认停止后重试',
+              'negative_patrol_reassignment_execution_active',
+              '仍有负面巡查执行任务在运行或等待设备，请先停止后再重新分配',
               409,
               {
-                commandId: activeCommand.id,
-                taskId: activeCommand.task_id,
-                commandType: activeCommand.command_type,
+                blockingTaskId: activeChild.id,
+                blockingTaskStatus: activeChild.status,
               },
             )};
           }
-        }
 
-        const {groups, assignments} = allocateNegativePatrolCandidates(
-          eligibleItems,
-          agents.map(agent => agent.id),
-        );
-        if (
-          groups.length !== agents.length ||
-          assignments.length !== eligibleItems.length
-        ) {
-          return {failure: requestError(
-            'negative_patrol_reassignment_allocation_failed',
-            '未完成帖子未能完整分配，请刷新后重试',
-            409,
-          )};
-        }
-
-        const nextRevision = currentRevision + 1;
-        const captureSettings = sanitizeCloudStructuredObject(
-          parentMetadata.captureSettings,
-        );
-        const filter = safeJson(parentMetadata.filter);
-        const executionTasks = [];
-        const commandIds = [];
-        const allocation = [];
-
-        for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
-          const group = groups[groupIndex];
-          const agent = agents.find(entry => entry.id === group.agentId);
-          if (!agent) {
+          const compatible = await loadCompatibleAgents(
+            tx,
+            req.tenantId,
+            agentIds,
+            Array.isArray(safeJson(parentMetadata.filter).platforms)
+              ? safeJson(parentMetadata.filter).platforms
+              : parent.platform,
+          );
+          if (compatible.failure) return {failure: compatible.failure};
+          const items = await tx.queryAll(`
+            SELECT item.*, record.content_availability_status
+            FROM capture_task_items item
+            JOIN records record
+              ON record.id = item.record_id
+              AND record.tenant_id = item.tenant_id
+            WHERE item.tenant_id = $1
+              AND item.task_id = $2
+              AND item.item_type = 'negative_post'
+              AND item.status = ANY($3::text[])
+              AND record.content_availability_status NOT IN (
+                'deleted', 'page_unavailable'
+              )
+            ORDER BY item.ordinal, item.id
+            FOR UPDATE OF item
+          `, [
+            req.tenantId,
+            parent.id,
+            [...NEGATIVE_PATROL_REASSIGNABLE_ITEM_STATUSES],
+          ]);
+          const eligibleItems = items.filter(negativePatrolItemReassignable);
+          if (eligibleItems.length === 0) {
             return {failure: requestError(
-              'negative_patrol_reassignment_allocation_failed',
-              '重分配引用了不存在的执行节点',
+              'negative_patrol_reassignment_empty',
+              '没有可重新分配的未完成帖子',
               409,
             )};
           }
-          const childTaskId = crypto.randomUUID();
-          const commandId = crypto.randomUUID();
-          const itemIds = group.candidates.map(item => item.id);
-          const groupRecordIds = group.candidates.map(item => item.record_id);
-          const groupRequestHash = patrolGroupRequestHash(
-            reassignmentRequestHash,
-            agent.id,
-            groupRecordIds,
-          );
-          const agentName = text(
-            agent.display_name || agent.client_label || agent.id,
-            160,
-          );
-          const childTitle =
-            `${parent.title} · 重分配 ${groupIndex + 1}/${groups.length}`;
-          const groupAllocation = {
-            agentId: agent.id,
-            agentName,
-            count: itemIds.length,
-            startOrdinal: group.startOrdinal,
-            endOrdinal: group.endOrdinal,
-          };
-          const childMetadata = {
-            workflow: 'negative_post_patrol',
-            taskKind: 'negative_post_patrol',
-            protocolVersion: 1,
-            orchestrationChild: true,
-            parentTaskId: parent.id,
-            orchestrationRevision: nextRevision,
-            remoteCreated: true,
-            remoteRequestHash: groupRequestHash,
-            createCommandId: commandId,
-            requestedByUserId: req.user?.id || '',
-            requestedByName: text(req.actorName, 240),
-            filter,
-            selectedRecordIds: groupRecordIds,
-            itemIds,
-            captureSettings,
-            reassignment: true,
-            reassignmentRequestKey: requestKey,
-            reassignmentRequestHash,
-            reassignmentAllocation: groupAllocation,
-          };
-          const child = await tx.queryOne(`
-            INSERT INTO capture_tasks (
-              id, tenant_id, parent_task_id,
-              origin_agent_id, assigned_agent_id,
-              client_task_id, task_type, feature_key, title, platform,
-              source, trigger_type, status, progress, checkpoint, counts,
-              metadata, message, orchestration_revision, source_updated_at
-            ) VALUES (
-              $1::uuid, $2, $3,
-              $4, $4,
-              $1::uuid::text, 'negative_post_patrol',
-              'negative_post_patrol', $5, $6,
-              'cloud', 'negative_patrol_reassignment', 'pending',
-              $7::jsonb, jsonb_build_object('targetIndex', 0),
-              $8::jsonb, $9::jsonb,
-              '未完成负面帖子已重新分配，等待执行节点领取',
-              $10, now()
-            )
-            RETURNING *
-          `, [
-            childTaskId,
-            req.tenantId,
-            parent.id,
-            agent.id,
-            childTitle,
-            parent.platform,
-            JSON.stringify({
-              current: 0,
-              total: itemIds.length,
-              percent: 0,
-              phase: 'queued',
-            }),
-            JSON.stringify({
-              total: itemIds.length,
-              assigned: itemIds.length,
-              processed: 0,
-              success: 0,
-              failed: 0,
-              skipped: 0,
-            }),
-            JSON.stringify(childMetadata),
-            nextRevision,
-          ]);
-
-          const targets = [];
-          for (const item of group.candidates) {
-            const itemMetadata = safeJson(item.metadata);
-            const sourceRecord = safeJson(itemMetadata.sourceRecord);
-            const sourceExecutionTaskId = normalizedUuid(
-              item.execution_task_id,
-            );
-            await tx.execute(`
-              UPDATE capture_task_item_attempts
-              SET status = 'canceled',
-                error = jsonb_build_object(
-                  'code', 'negative_patrol_reassigned',
-                  'message', '该帖子已重新分配给新的执行任务',
-                  'successorExecutionTaskId', $1::uuid::text,
-                  'previousError', error
-                ),
-                finished_at = COALESCE(finished_at, now()),
-                updated_at = now()
-              WHERE tenant_id = $2
-                AND item_id = $3
-                AND execution_task_id = $4
-                AND assignment_revision = $5
-                AND status <> ALL($6::text[])
-            `, [
-              child.id,
-              req.tenantId,
-              item.id,
-              sourceExecutionTaskId || null,
-              Number(item.assignment_revision || 0),
-              NEGATIVE_PATROL_TERMINAL_ATTEMPT_STATUSES,
-            ]);
-            const attemptSequence = await tx.queryOne(`
-              SELECT COALESCE(MAX(attempt_number), 0) + 1
-                AS next_attempt_number
-              FROM capture_task_item_attempts
-              WHERE tenant_id = $1 AND item_id = $2
-            `, [req.tenantId, item.id]);
-            const nextAttemptNumber = Math.max(
-              1,
-              Number(attemptSequence?.next_attempt_number || 1),
-            );
-            const updatedItem = await tx.queryOne(`
-              UPDATE capture_task_items
-              SET status = 'dispatched',
-                attempt_count = $12,
-                assigned_agent_id = $1,
-                execution_task_id = $2,
-                assignment_revision = $3,
-                request_hash = $4,
-                result_record_id = NULL,
-                result_observation_id = NULL,
-                error = '{}'::jsonb,
-                metadata = (
-                  metadata - 'checkpoint' - 'targetResult'
-                ) || jsonb_build_object(
-                  'reassignmentSourceExecutionTaskId', COALESCE($5::text, ''),
-                  'reassignmentRequestKey', $6::uuid::text,
-                  'reassignmentRevision', $3::integer
-                ),
-                assigned_at = now(),
-                dispatched_at = now(),
-                started_at = NULL,
-                finished_at = NULL,
-                updated_at = now()
-              WHERE id = $7
-                AND tenant_id = $8
-                AND task_id = $9
-                AND execution_task_id IS NOT DISTINCT FROM $5::uuid
-                AND assignment_revision = $10
-                AND status = ANY($11::text[])
-                AND EXISTS (
-                  SELECT 1
-                  FROM records record
-                  WHERE record.id = capture_task_items.record_id
-                    AND record.tenant_id = capture_task_items.tenant_id
-                    AND record.content_availability_status NOT IN (
-                      'deleted',
-                      'page_unavailable'
-                    )
-                )
-              RETURNING id, attempt_count, assignment_revision
-            `, [
-              agent.id,
-              child.id,
-              nextRevision,
-              groupRequestHash,
-              sourceExecutionTaskId || null,
-              requestKey,
-              item.id,
-              req.tenantId,
-              parent.id,
-              Number(item.assignment_revision || 0),
-              [...NEGATIVE_PATROL_REASSIGNABLE_ITEM_STATUSES],
-              nextAttemptNumber,
-            ]);
-            if (!updatedItem) {
-              const conflict = new Error(
-                'negative_patrol_reassignment_item_conflict',
-              );
-              conflict.code = 'negative_patrol_reassignment_item_conflict';
-              throw conflict;
+          if (eligibleItems.length < agentIds.length) {
+            return {failure: requestError(
+              'negative_patrol_reassignment_items_fewer_than_agents',
+              `当前只有 ${eligibleItems.length} 条帖子可重分配，少于 ${agentIds.length} 个执行节点`,
+              409,
+              {eligibleCount: eligibleItems.length, agentCount: agentIds.length},
+            )};
+          }
+          const sourceExecutionTaskIds = Array.from(new Set(
+            eligibleItems
+              .map(item => normalizedUuid(item.execution_task_id))
+              .filter(Boolean),
+          ));
+          if (sourceExecutionTaskIds.length > 0) {
+            const activeCommand = await tx.queryOne(`
+              SELECT id, task_id, command_type, status
+              FROM capture_agent_commands
+              WHERE tenant_id = $1
+                AND task_id = ANY($2::uuid[])
+                AND status IN ('pending', 'acknowledged')
+              ORDER BY created_at, id
+              LIMIT 1
+            `, [req.tenantId, sourceExecutionTaskIds]);
+            if (activeCommand) {
+              return {failure: requestError(
+                'negative_patrol_reassignment_command_active',
+                '原执行任务仍有待完成指令，请等待设备确认停止后重试',
+                409,
+                {commandId: activeCommand.id, taskId: activeCommand.task_id},
+              )};
             }
             await tx.execute(`
-              INSERT INTO capture_task_item_attempts (
-                id, tenant_id, item_id, parent_task_id,
-                execution_task_id, agent_id, attempt_number,
-                assignment_revision, status, request_hash,
-                checkpoint, result, error, dispatched_at
-              ) VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7,
-                $8, 'dispatched', $9,
-                '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now()
-              )
-            `, [
-              crypto.randomUUID(),
-              req.tenantId,
-              item.id,
-              parent.id,
-              child.id,
-              agent.id,
-              Number(updatedItem.attempt_count),
-              Number(updatedItem.assignment_revision),
-              groupRequestHash,
-            ]);
-            targets.push(candidateTarget({
-              id: item.record_id,
-              externalId: item.external_id,
-              url: item.url_snapshot,
-              title: sourceRecord.title || item.record_title,
-              publishedAt:
-                sourceRecord.publishedAt || item.record_published_at,
-              noteType: sourceRecord.noteType || item.record_note_type,
-              baseline: safeJson(itemMetadata.baseline),
-            }, item.id));
+              UPDATE capture_tasks
+              SET status = 'superseded',
+                metadata = metadata || jsonb_build_object(
+                  'terminalDisposition', 'superseded',
+                  'terminalReason', 'negative_patrol_reassigned',
+                  'terminalDispositionAt', now()::text
+                ),
+                message = '该执行轮次已被人工重新分配',
+                finished_at = COALESCE(finished_at, now()),
+                updated_at = now(),
+                source_updated_at = now()
+              WHERE tenant_id = $1
+                AND id = ANY($2::uuid[])
+                AND task_type = 'negative_post_patrol'
+                AND status NOT IN ('completed', 'completed_with_warnings')
+            `, [req.tenantId, sourceExecutionTaskIds]);
           }
 
-          const payload = {
-            taskId: child.id,
-            clientTaskId: child.id,
-            parentTaskId: parent.id,
-            title: child.title,
-            executionMode: 'one_time',
-            platform: child.platform,
-            workflow: 'negative_post_patrol',
-            taskKind: 'negative_post_patrol',
-            protocolVersion: 1,
-            targets,
-            items: targets,
-            captureSettings,
-            requestHash: groupRequestHash,
-            authCodeId: agent.auth_code_id,
-            authBindingId: agent.auth_binding_id,
-          };
-          const command = await tx.queryOne(`
-            INSERT INTO capture_agent_commands (
-              id, tenant_id, agent_id, task_id, command_type, payload,
-              requested_by_user_id, requested_by_name
-            ) VALUES (
-              $1, $2, $3, $4, 'create', $5::jsonb, $6, $7
-            )
-            RETURNING id, status, expires_at, created_at
-          `, [
-            commandId,
-            req.tenantId,
-            agent.id,
-            child.id,
-            JSON.stringify(payload),
-            req.user?.id || null,
-            text(req.actorName, 240),
-          ]);
-          commandIds.push(command.id);
-          allocation.push(groupAllocation);
-          executionTasks.push({
-            taskId: child.id,
-            agentId: agent.id,
-            agentName,
-            itemCount: targets.length,
-            commandId: command.id,
+          const {groups, assignments} = allocateNegativePatrolCandidates(
+            eligibleItems,
+            compatible.agents.map(agent => agent.id),
+          );
+          if (assignments.length !== eligibleItems.length) {
+            return {failure: requestError(
+              'negative_patrol_reassignment_allocation_failed',
+              '未完成帖子未能完整分配，请刷新后重试',
+              409,
+            )};
+          }
+          const allocation = groups.map(group => {
+            const assignedAgent = compatible.agents.find(
+              agent => agent.id === group.agentId,
+            );
+            return {
+              agentId: group.agentId,
+              agentName: text(
+                assignedAgent?.display_name ||
+                  assignedAgent?.client_label ||
+                  group.agentId,
+                160,
+              ),
+              count: group.candidates.length,
+              startOrdinal: group.startOrdinal,
+              endOrdinal: group.endOrdinal,
+            };
           });
+          const assignmentRows = assignments.map(entry => ({
+            item_id: entry.candidate.id,
+            pinned_agent_id: entry.agentId,
+          }));
+          const itemIds = eligibleItems.map(item => item.id);
+          await tx.execute(`
+            UPDATE capture_task_item_attempts
+            SET status = 'canceled',
+              error = jsonb_build_object(
+                'code', 'negative_patrol_reassigned_to_queue',
+                'message', '该帖子已重新绑定到逐帖准入队列',
+                'previousError', error
+              ),
+              finished_at = COALESCE(finished_at, now()),
+              updated_at = now()
+            WHERE tenant_id = $1
+              AND item_id = ANY($2::uuid[])
+              AND status <> ALL($3::text[])
+          `, [
+            req.tenantId,
+            itemIds,
+            NEGATIVE_PATROL_TERMINAL_ATTEMPT_STATUSES,
+          ]);
+          const updatedItems = await tx.queryAll(`
+            UPDATE capture_task_items item
+            SET status = 'pending',
+              assigned_agent_id = NULL,
+              execution_task_id = NULL,
+              assignment_revision = item.assignment_revision + 1,
+              request_hash = '',
+              result_record_id = NULL,
+              result_observation_id = NULL,
+              error = '{}'::jsonb,
+              metadata = (
+                item.metadata - 'checkpoint' - 'targetResult' -
+                'waitingForSourceClosure' - 'sourceClosureBlockedAt' -
+                'sourceClosureBlockedReason' - 'sourceClosureBlockedAttemptId'
+              ) || jsonb_build_object(
+                'pinnedAgentId', assignment.pinned_agent_id,
+                'reassignmentRequestKey', $2::uuid::text,
+                'reassignmentRequestHash', $3::text,
+                'reassignmentAt', now()::text
+              ),
+              assigned_at = NULL,
+              dispatched_at = NULL,
+              started_at = NULL,
+              finished_at = NULL,
+              updated_at = now()
+            FROM jsonb_to_recordset($4::jsonb) AS assignment(
+              item_id uuid,
+              pinned_agent_id text
+            )
+            WHERE item.id = assignment.item_id
+              AND item.tenant_id = $1
+              AND item.task_id = $5
+            RETURNING item.id
+          `, [
+            req.tenantId,
+            requestKey,
+            reassignmentRequestHash,
+            JSON.stringify(assignmentRows),
+            parent.id,
+          ]);
+          if (updatedItems.length !== eligibleItems.length) {
+            const conflict = new Error(
+              'negative_patrol_reassignment_item_conflict',
+            );
+            conflict.code = 'negative_patrol_reassignment_item_conflict';
+            throw conflict;
+          }
+
+          const refreshedItems = await tx.queryAll(`
+            SELECT status
+            FROM capture_task_items
+            WHERE tenant_id = $1 AND task_id = $2
+            ORDER BY ordinal, id
+          `, [req.tenantId, parent.id]);
+          const aggregate = aggregateParentTaskItems(refreshedItems);
+          const nextRevision = currentRevision + 1;
+          const updatedParent = await tx.queryOne(`
+            UPDATE capture_tasks
+            SET orchestration_revision = $1,
+              status = $2,
+              progress = $3::jsonb,
+              counts = $4::jsonb,
+              metadata = metadata || jsonb_build_object(
+                'serverPerItemDispatchV1', true,
+                'perItemAdmissionV1', true,
+                'distributionMode', 'fixed_batch',
+                'allocationMode', 'fixed_pinned',
+                'selectedAgentIds', $5::jsonb,
+                'eligibleAgentIds', $5::jsonb,
+                'allocation', $6::jsonb,
+                'lastReassignmentAt', now(),
+                'lastReassignmentRequestKey', $7::uuid::text,
+                'lastReassignmentRequestHash', $8::text,
+                'lastReassignmentAgentIds', $5::jsonb,
+                'lastReassignmentItemCount', $9::integer,
+                'lastReassignmentAllocation', $6::jsonb
+              ),
+              message = '未完成帖子已重新绑定，等待服务器逐篇准入',
+              finished_at = NULL,
+              updated_at = now(),
+              source_updated_at = now()
+            WHERE id = $10
+              AND tenant_id = $11
+              AND orchestration_revision = $12
+            RETURNING id, orchestration_revision, status
+          `, [
+            nextRevision,
+            aggregate.status,
+            JSON.stringify(aggregate.progress),
+            JSON.stringify({...aggregate.counts, agents: groups.length}),
+            JSON.stringify(agentIds),
+            JSON.stringify(allocation),
+            requestKey,
+            reassignmentRequestHash,
+            eligibleItems.length,
+            parent.id,
+            req.tenantId,
+            currentRevision,
+          ]);
+          if (!updatedParent) {
+            const conflict = new Error(
+              'negative_patrol_reassignment_revision_conflict',
+            );
+            conflict.code = 'negative_patrol_reassignment_revision_conflict';
+            throw conflict;
+          }
           await appendTaskEvent(tx, {
             tenantId: req.tenantId,
-            taskId: child.id,
-            agentId: agent.id,
+            taskId: parent.id,
             actorId: req.user?.id || '',
             actorName: req.actorName,
-            status: child.status,
-            message: '未完成负面帖子已重新分配给该执行节点',
-            eventType: 'negative_patrol_reassignment_dispatched',
+            status: updatedParent.status,
+            message: `已将 ${eligibleItems.length} 条未完成帖子重新绑定到逐帖队列`,
+            eventType: 'negative_patrol_reassigned_to_queue',
             payload: {
-              parentTaskId: parent.id,
               requestKey,
+              requestHash: reassignmentRequestHash,
+              previousRevision: currentRevision,
               revision: nextRevision,
-              itemIds,
-              commandId: command.id,
-              sourceExecutionTaskIds: Array.from(new Set(
-                group.candidates
-                  .map(item => normalizedUuid(item.execution_task_id))
-                  .filter(Boolean),
-              )),
+              eligibleCount: eligibleItems.length,
+              allocation,
             },
           });
-        }
-
-        const refreshedItems = await tx.queryAll(`
-          SELECT status
-          FROM capture_task_items
-          WHERE tenant_id = $1 AND task_id = $2
-          ORDER BY ordinal, id
-        `, [req.tenantId, parent.id]);
-        const aggregate = aggregateParentTaskItems(refreshedItems);
-        const parentCounts = {
-          ...aggregate.counts,
-          agents: groups.length,
-        };
-        const updatedParent = await tx.queryOne(`
-          UPDATE capture_tasks
-          SET orchestration_revision = $1,
-            status = $2,
-            progress = $3::jsonb,
-            counts = $4::jsonb,
-            metadata = metadata || jsonb_build_object(
-              'lastReassignmentAt', now(),
-              'lastReassignmentRequestKey', $5::uuid::text,
-              'lastReassignmentRequestHash', $6::text,
-              'lastReassignmentAgentIds', $7::jsonb,
-              'lastReassignmentItemCount', $8::integer,
-              'executionTaskIds',
-                COALESCE(metadata->'executionTaskIds', '[]'::jsonb)
-                  || $9::jsonb,
-              'createCommandIds',
-                COALESCE(metadata->'createCommandIds', '[]'::jsonb)
-                  || $10::jsonb
-            ),
-            message = '未完成负面帖子已重新分配，等待执行节点领取',
-            finished_at = NULL,
-            updated_at = now(),
-            source_updated_at = now()
-          WHERE id = $11
-            AND tenant_id = $12
-            AND task_type = 'capture_orchestration'
-            AND orchestration_revision = $13
-          RETURNING id, orchestration_revision, status
-        `, [
-          nextRevision,
-          aggregate.status,
-          JSON.stringify(aggregate.progress),
-          JSON.stringify(parentCounts),
-          requestKey,
-          reassignmentRequestHash,
-          JSON.stringify(agentIds),
-          eligibleItems.length,
-          JSON.stringify(executionTasks.map(entry => entry.taskId)),
-          JSON.stringify(commandIds),
-          parent.id,
-          req.tenantId,
-          currentRevision,
-        ]);
-        if (!updatedParent) {
-          const conflict = new Error(
-            'negative_patrol_reassignment_revision_conflict',
-          );
-          conflict.code = 'negative_patrol_reassignment_revision_conflict';
-          throw conflict;
-        }
-
-        await appendTaskEvent(tx, {
-          tenantId: req.tenantId,
-          taskId: parent.id,
-          actorId: req.user?.id || '',
-          actorName: req.actorName,
-          status: updatedParent.status,
-          message: `已将 ${eligibleItems.length} 条未完成帖子重新分配给 ${groups.length} 个在线节点`,
-          eventType: 'negative_patrol_reassigned',
-          payload: {
-            requestKey,
-            requestHash: reassignmentRequestHash,
-            previousRevision: currentRevision,
+          await tx.execute(`
+            INSERT INTO audit_logs (
+              tenant_id, actor_type, actor_id, actor_user_id,
+              action, target_type, target_id, metadata
+            ) VALUES (
+              $1, 'user', $2, $3,
+              'negative_patrol.reassign_per_item_queue',
+              'capture_task', $4, $5::jsonb
+            )
+          `, [
+            req.tenantId,
+            text(req.user?.id || '', 240),
+            req.user?.id || null,
+            parent.id,
+            JSON.stringify({
+              requestKey,
+              requestHash: reassignmentRequestHash,
+              previousRevision: currentRevision,
+              revision: nextRevision,
+              eligibleCount: eligibleItems.length,
+              agentIds,
+              allocation,
+            }),
+          ]);
+          return {
+            existing: false,
+            orchestrationId: parent.id,
             revision: nextRevision,
             eligibleCount: eligibleItems.length,
-            excludedTerminalStatuses: [
-              'completed',
-              'completed_with_warnings',
-              'skipped',
-              'canceled',
-            ],
-            excludedAvailabilityStatuses: [
-              'deleted',
-              'page_unavailable',
-            ],
             allocation,
-            executions: executionTasks,
-          },
-        });
-        await tx.execute(`
-          INSERT INTO audit_logs (
-            tenant_id, actor_type, actor_id, actor_user_id,
-            action, target_type, target_id, metadata
-          ) VALUES (
-            $1, 'user', $2, $3,
-            'negative_patrol.reassign_unfinished',
-            'capture_task', $4, $5::jsonb
-          )
-        `, [
-          req.tenantId,
-          text(req.user?.id || '', 240),
-          req.user?.id || null,
-          parent.id,
-          JSON.stringify({
-            requestKey,
-            requestHash: reassignmentRequestHash,
-            previousRevision: currentRevision,
-            revision: nextRevision,
-            eligibleCount: eligibleItems.length,
-            agentIds,
-            allocation,
-            executions: executionTasks,
-            sourceExecutionTaskIds,
-          }),
-        ]);
-
-        return {
-          existing: false,
-          orchestrationId: parent.id,
-          revision: nextRevision,
-          eligibleCount: eligibleItems.length,
-          allocation,
-          executions: executionTasks,
-          message: `已重新分配 ${eligibleItems.length} 条未完成帖子`,
-        };
+            executions: [],
+            message: `已重新绑定 ${eligibleItems.length} 条未完成帖子，服务器将逐篇准入`,
+          };
       });
 
       if (result.failure) {
@@ -3331,6 +2846,7 @@ router.post(
 
 export const __negativePatrolRouteInternals = {
   normalizeAnalyticsPeriod,
+  loadCandidates,
 };
 
 export default router;

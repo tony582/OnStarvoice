@@ -203,26 +203,21 @@ test('negative patrol reassignment requestKey is semantic and replay-safe', () =
   );
 });
 
-test('multi-Agent patrol uses a parent business task and one execution child per Agent', async () => {
+test('multi-Agent patrol creates one parent queue and no browser batch', async () => {
   const route = await read('server/routes/negative-patrol.js');
 
-  assert.match(route, /'capture_orchestration',\s*'negative_post_patrol'/u);
-  assert.match(route, /negative_patrol_multi_agent_child/u);
-  assert.match(route, /parent_task_id, origin_agent_id, assigned_agent_id/u);
+  assert.match(route, /'capture_orchestration',[\s\S]*\$8/u);
+  assert.match(route, /serverPerItemDispatchV1/u);
+  assert.match(route, /perItemAdmissionV1/u);
   assert.match(route, /task_id, item_key, ordinal[\s\S]*execution_task_id/u);
   assert.match(
     route,
-    /const metadata = \{[\s\S]*protocolVersion:\s*2[\s\S]*multiAgent:\s*true/u,
+    /const metadata = \{[\s\S]*protocolVersion:\s*3[\s\S]*multiAgent:\s*true/u,
   );
   assert.match(
     route,
-    /const childMetadata = \{[\s\S]*protocolVersion:\s*1/u,
+    /'pending', NULL, NULL, 0, '', input\.metadata/u,
   );
-  assert.match(
-    route,
-    /const payload = \{[\s\S]*workflow: 'negative_post_patrol',[\s\S]*protocolVersion:\s*1/u,
-  );
-  assert.match(route, /requireOnline:\s*true/u);
   assert.match(route, /negative_patrol_candidates_fewer_than_agents/u);
   assert.match(
     route,
@@ -233,6 +228,12 @@ test('multi-Agent patrol uses a parent business task and one execution child per
     /sourceRecord:\s*\{[\s\S]*content: text\(candidate\.content, 1000\)/u,
   );
   assert.match(route, /capture_orchestration_control/u);
+  const creator = route.slice(
+    route.indexOf('async function createElasticPatrolTask'),
+    route.indexOf('export function negativePatrolReassignmentRequestHash'),
+  );
+  assert.doesNotMatch(creator, /INSERT INTO capture_agent_commands/u);
+  assert.doesNotMatch(creator, /INSERT INTO capture_task_item_attempts/u);
   assert.match(
     route,
     /negativePatrolExistingRequestMatches\(existing, requestHash\)/u,
@@ -243,17 +244,17 @@ test('multi-Agent patrol uses a parent business task and one execution child per
 test('elastic negative patrol keeps posts unassigned until an eligible idle Agent claims one', async () => {
   const route = await read('server/routes/negative-patrol.js');
   const start = route.indexOf('async function createElasticPatrolTask');
-  const end = route.indexOf('async function createMultiAgentPatrolTask');
+  const end = route.indexOf('export function negativePatrolReassignmentRequestHash');
   assert.ok(start >= 0 && end > start);
   const elastic = route.slice(start, end);
 
-  assert.match(elastic, /distributionMode: 'elastic_pool'/u);
+  assert.match(elastic, /distributionMode = 'elastic_pool'/u);
   assert.match(elastic, /itemType = 'negative_post'/u);
   assert.match(elastic, /claimUnit: itemType/u);
   assert.match(elastic, /eligibleAgentIds/u);
   assert.match(
     elastic,
-    /'pending', NULL, NULL,[\s\S]*0, '', \$10::jsonb/u,
+    /'pending', NULL, NULL, 0, '', input\.metadata/u,
   );
   assert.doesNotMatch(elastic, /INSERT INTO capture_agent_commands/u);
   assert.match(elastic, /negative_patrol_elastic_pool_opened/u);
@@ -347,7 +348,7 @@ test('negative patrol detail can reassign only unfinished posts to an explicit o
   );
 });
 
-test('negative patrol backend reassigns unfinished items with CAS and stale-child fencing', async () => {
+test('negative patrol backend requeues unfinished items with CAS and stale-child fencing', async () => {
   const [route, projection] = await Promise.all([
     read('server/routes/negative-patrol.js'),
     read('server/routes/capture-cloud.js'),
@@ -364,24 +365,19 @@ test('negative patrol backend reassigns unfinished items with CAS and stale-chil
   assert.match(reassign, /pg_advisory_xact_lock/u);
   assert.match(
     reassign,
-    /negativePatrolReassignmentExistingRequestMatches/u,
+    /lastReassignmentRequestKey[\s\S]*lastReassignmentRequestHash/u,
   );
   assert.match(reassign, /currentRevision !== expectedRevision/u);
   assert.match(
     reassign,
     /negative_patrol_reassignment_execution_active/u,
   );
-  assert.match(reassign, /requireOnline:\s*true/u);
-  assert.match(reassign, /requireIdle:\s*true/u);
-  assert.match(route, /await lockCaptureAgentExecutionSlot\(tx, tenantId, agentId\)/u);
-  assert.match(route, /findCaptureAgentExecutionSlotBlocker/u);
-  assert.match(route, /CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES/u);
   const agentLockIndex = reassign.indexOf(
     'const compatible = await loadCompatibleAgents(',
   );
   const itemLockIndex = reassign.indexOf('FOR UPDATE OF item');
   const parentCasIndex = reassign.indexOf(
-    'AND orchestration_revision = $13',
+    'AND orchestration_revision = $12',
   );
   assert.ok(agentLockIndex >= 0, 'reassignment must lock selected Agents');
   assert.ok(itemLockIndex >= 0, 'reassignment must lock eligible item rows');
@@ -402,30 +398,23 @@ test('negative patrol backend reassigns unfinished items with CAS and stale-chil
     reassign,
     /item\.status = ANY\(\$3::text\[\]\)[\s\S]*content_availability_status NOT IN \(\s*'deleted',\s*'page_unavailable'/u,
   );
-  assert.match(reassign, /protocolVersion:\s*1/u);
   assert.match(reassign, /negative_patrol_reassignment/u);
   assert.match(
     reassign,
-    /MAX\(attempt_number\)[\s\S]*next_attempt_number/u,
+    /UPDATE capture_task_item_attempts[\s\S]*negative_patrol_reassigned_to_queue/u,
   );
   assert.match(
     reassign,
-    /attempt_count = \$12/u,
+    /status = 'pending'[\s\S]*'pinnedAgentId', assignment\.pinned_agent_id/u,
   );
   assert.match(
     reassign,
-    /execution_task_id IS NOT DISTINCT FROM \$5::uuid[\s\S]*assignment_revision = \$10/u,
+    /orchestration_revision = \$1[\s\S]*AND orchestration_revision = \$12/u,
   );
-  assert.match(
-    reassign,
-    /INSERT INTO capture_task_item_attempts[\s\S]*assignment_revision/u,
-  );
-  assert.match(
-    reassign,
-    /orchestration_revision = \$1[\s\S]*AND orchestration_revision = \$13/u,
-  );
-  assert.match(reassign, /eventType: 'negative_patrol_reassigned'/u);
-  assert.match(reassign, /negative_patrol\.reassign_unfinished/u);
+  assert.match(reassign, /eventType: 'negative_patrol_reassigned_to_queue'/u);
+  assert.match(reassign, /negative_patrol\.reassign_per_item_queue/u);
+  assert.doesNotMatch(reassign, /INSERT INTO capture_agent_commands/u);
+  assert.doesNotMatch(reassign, /INSERT INTO capture_tasks/u);
   assert.doesNotMatch(
     reassign,
     /SELECT \*[\s\S]{0,160}FROM capture_tasks[\s\S]{0,160}FOR UPDATE/u,

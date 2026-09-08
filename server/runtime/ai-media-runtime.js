@@ -95,7 +95,7 @@ export function startAiMediaRuntime({
 
   async function reprocessCommentsAndSafetyLabels() {
     const workflow = await jobs.loadCommentWorkflow();
-    await workflow.reprocessPendingComments();
+    await workflow.reprocessPendingComments({ limit: 25 });
 
     const flag = 'comment_safety_semantic_reclassify_v1';
     const done = await jobs.queryOne(
@@ -130,7 +130,7 @@ export function startAiMediaRuntime({
   async function drainCommentAi() {
     const workflow = await jobs.loadCommentWorkflow();
     const receipts = await workflow.reprocessPendingCommentWorkflowReceipts({
-      limit: 100,
+      limit: 25,
     });
     if (receipts.persisted || receipts.failed) {
       safeLog(
@@ -192,7 +192,12 @@ export function startAiMediaRuntime({
   // They stay compatibility-only until Maintenance/P2-D gives them one owner.
   if (compatibilityMode) {
     void runTracked('OpinionAnalysis', () => jobs.failStaleAnalyses());
-    schedule(15_000, () => runTracked('Reprocess', reprocessCommentsAndSafetyLabels));
+    scheduleRecurring(
+      15_000,
+      60_000,
+      'Reprocess',
+      reprocessCommentsAndSafetyLabels,
+    );
     schedule(25_000, () => runTracked('MediaBackfill', backfillRecentMedia));
     schedule(25_000, () => runTracked('Relabel', relabelSaicgmScope));
   }

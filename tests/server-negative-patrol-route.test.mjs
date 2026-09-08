@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   negativePatrolTargetUrl,
   normalizeNegativePatrolFilter,
+  publicNegativePatrolCandidate,
 } from '../server/routes/negative-patrol.js';
 
 const route = await readFile(
@@ -53,6 +54,8 @@ test('negative patrol filters require a real publish date range and platform', (
       query: '门店',
       minInteractions: 50,
       limit: 80,
+      pageSize: 80,
+      cursor: null,
       timezone: 'Asia/Shanghai',
       sentiment: 'negative',
       excludePendingFalsePositive: true,
@@ -106,6 +109,67 @@ test('negative patrol filters require a real publish date range and platform', (
     }).filter.platforms,
     ['xiaohongshu', 'douyin'],
   );
+});
+
+test('manual negative confirmation wins over a pending false-positive review', () => {
+  const base = {
+    id: '018f04cc-74d8-7000-8000-000000000001',
+    platform: 'xiaohongshu',
+    external_id: '64abcdeffedcba9876543210',
+    sentiment: 'negative',
+    false_positive_pending: true,
+  };
+  const confirmed = publicNegativePatrolCandidate({
+    ...base,
+    manual_sentiment_present: true,
+    manual_sentiment_raw: 'negative',
+    normalized_manual_sentiment: 'negative',
+    effective_sentiment: 'negative',
+    sentiment_source: 'manual_override',
+    can_dispatch: true,
+    eligibility_code: 'eligible',
+  }, {includeBaseline: false});
+  assert.equal(confirmed.canDispatch, true);
+  assert.equal(confirmed.eligibilityCode, 'eligible');
+  assert.equal(confirmed.falsePositivePending, true);
+
+  const unconfirmed = publicNegativePatrolCandidate({
+    ...base,
+    manual_sentiment_present: false,
+    effective_sentiment: 'negative',
+    sentiment_source: 'record',
+    // Defensively enforce the pending-review rule even if a stale row were
+    // projected with an incorrect database flag.
+    can_dispatch: true,
+    eligibility_code: 'eligible',
+  }, {includeBaseline: false});
+  assert.equal(unconfirmed.canDispatch, false);
+  assert.equal(unconfirmed.eligibilityCode, 'false_positive_pending');
+});
+
+test('invalid manual sentiment never falls back to the stored base sentiment', () => {
+  const invalidEmpty = publicNegativePatrolCandidate({
+    id: '018f04cc-74d8-7000-8000-000000000002',
+    platform: 'douyin',
+    external_id: '7123456789012345678',
+    sentiment: 'negative',
+    manual_sentiment_present: true,
+    manual_sentiment_raw: '',
+    effective_sentiment: '',
+    sentiment_source: 'manual_override_invalid',
+    can_dispatch: false,
+    eligibility_code: 'manual_sentiment_invalid',
+  }, {includeBaseline: false});
+  assert.equal(invalidEmpty.effectiveSentiment, '');
+  assert.equal(invalidEmpty.sentimentSource, 'manual_override_invalid');
+  assert.equal(invalidEmpty.canDispatch, false);
+
+  const invalidValue = publicNegativePatrolCandidate({
+    ...invalidEmpty,
+    manual_sentiment_raw: 'NEGATIV',
+    effective_sentiment: 'negativ',
+  }, {includeBaseline: false});
+  assert.equal(invalidValue.effectiveSentiment, 'negativ');
 });
 
 test('target URLs are bound to the selected platform and record identity', () => {
@@ -189,7 +253,7 @@ test('xiaohongshu profile URLs must bind the record id to the note segment', () 
   );
 });
 
-test('preview and create are tenant-writer routes with identical candidate SQL', () => {
+test('preview and create share current-sentiment qualification and tenant scope', () => {
   for (const marker of [
     "'/negative-patrol/candidates/preview'",
     "'/negative-patrol/tasks'",
@@ -203,7 +267,14 @@ test('preview and create are tenant-writer routes with identical candidate SQL',
   }
   assert.match(route, /r\.tenant_id = \$1/u);
   assert.match(route, /r\.platform = ANY\(\$2::text\[\]\)/u);
-  assert.match(route, /r\.sentiment = 'negative'/u);
+  assert.match(route, /manual_sentiment_present/u);
+  assert.match(route, /normalized_manual_sentiment/u);
+  assert.match(route, /effective_sentiment/u);
+  assert.match(route, /sentiment_source/u);
+  assert.match(route, /LOWER\(BTRIM\(COALESCE\(r\.sentiment, ''\)\)\) = 'negative'/u);
+  assert.match(route, /manual_relevance_present/u);
+  assert.match(route, /automatic_relevance_filtered/u);
+  assert.match(route, /COALESCE\(external_id, ''\) !~/u);
   assert.match(route, /NULLIF\(BTRIM\(r\.publish_time\), ''\) IS NOT NULL/u);
   assert.match(route, /r\.published_ts IS NOT NULL/u);
   assert.match(route, /r\.published_ts >=/u);
@@ -213,36 +284,42 @@ test('preview and create are tenant-writer routes with identical candidate SQL',
   assert.match(route, /r\.author_name ILIKE/u);
   assert.match(route, /r\.keyword ILIKE/u);
   assert.match(route, /r\.likes \+ r\.comments_count \+ r\.collects \+ r\.shares/u);
-  assert.match(route, /record_feedback rf/u);
-  assert.match(route, /rf\.review_status = 'pending'/u);
+  assert.match(route, /record_feedback feedback/u);
+  assert.match(route, /feedback\.review_status = 'pending'/u);
   assert.equal(
-    route.match(/WHERE rf\.tenant_id = r\.tenant_id/gu)?.length,
+    route.match(/WHERE feedback\.tenant_id = r\.tenant_id/gu)?.length,
     1,
     'the record_feedback subquery must contain exactly one WHERE clause',
   );
 });
 
-test('create snapshots records into item rows and emits the versioned agent protocol', () => {
+test('create writes a per-item server queue without publishing a browser batch', () => {
   const create = section(
     "router.post(\n  '/negative-patrol/tasks'",
     'export default router',
   );
+  const queueWriter = section(
+    'async function createElasticPatrolTask',
+    'export function negativePatrolReassignmentRequestHash',
+  );
   assert.match(create, /pg_advisory_xact_lock/u);
-  assert.match(create, /remoteRequestHash/u);
+  assert.match(create, /const requestHash = patrolRequestHash/u);
   assert.match(create, /candidate_selection_changed/u);
-  assert.match(create, /INSERT INTO capture_tasks/u);
-  assert.match(create, /'negative_post_patrol'/u);
-  assert.match(create, /INSERT INTO capture_task_items/u);
-  assert.match(create, /'negative_post'/u);
-  assert.match(create, /record_id, external_id, url_snapshot/u);
-  assert.match(create, /INSERT INTO capture_task_item_attempts/u);
-  assert.match(create, /INSERT INTO capture_agent_commands/u);
-  assert.match(create, /workflow: 'negative_post_patrol'/u);
-  assert.match(create, /taskKind: 'negative_post_patrol'/u);
-  assert.match(create, /protocolVersion: 1/u);
-  assert.match(create, /targets,/u);
-  assert.match(create, /items: targets/u);
+  assert.match(create, /createElasticPatrolTask\(tx/u);
+  assert.match(queueWriter, /INSERT INTO capture_tasks/u);
+  assert.match(queueWriter, /workflow = 'negative_post_patrol'/u);
+  assert.match(queueWriter, /INSERT INTO capture_task_items/u);
+  assert.match(queueWriter, /itemType = 'negative_post'/u);
+  assert.match(queueWriter, /record_id, external_id, url_snapshot/u);
+  assert.match(queueWriter, /serverPerItemDispatchV1/u);
+  assert.match(queueWriter, /perItemAdmissionV1/u);
+  assert.match(queueWriter, /pinnedAgentId/u);
+  assert.doesNotMatch(queueWriter, /INSERT INTO capture_task_item_attempts/u);
+  assert.doesNotMatch(queueWriter, /INSERT INTO capture_agent_commands/u);
+  assert.match(create, /negative_patrol_dispatch_paused/u);
+  assert.doesNotMatch(create, /serverPerItemDispatchEnabled/u);
   assert.match(route, /capabilities\.negativePostPatrol !== true/u);
+  assert.match(route, /negativePatrolTerminalReceiptV1/u);
   assert.match(route, /INSERT INTO capture_task_events/u);
   assert.match(create, /INSERT INTO audit_logs/u);
   assert.doesNotMatch(
@@ -250,4 +327,48 @@ test('create snapshots records into item rows and emits the versioned agent prot
     /patrolRequestHash\(\{[\s\S]*?title,\s*title,/u,
     'idempotency hashing must include the title exactly once per call',
   );
+});
+
+test('preview pagination and counts use one repeatable-read reporting snapshot', () => {
+  const preview = section(
+    "router.post(\n  '/negative-patrol/candidates/preview'",
+    "router.post(\n  '/watched-content/candidates/preview'",
+  );
+  assert.match(preview, /withTransaction\(tx => loadCandidates/u);
+  assert.match(preview, /category: 'reporting'/u);
+  assert.match(preview, /isolationLevel: 'repeatable_read'/u);
+  assert.match(preview, /readOnly: true/u);
+  assert.match(preview, /isDbCapacityError\(error\) \|\| error\?\.code === '57014'/u);
+  assert.match(preview, /res\.set\('Retry-After'/u);
+  assert.match(preview, /res\.status\(503\)\.json/u);
+  for (const field of [
+    'matchedCount',
+    'dispatchableCount',
+    'deferredCount',
+    'nextCursor',
+    'hasMore',
+  ]) assert.match(preview, new RegExp(`${field}:`, 'u'));
+  assert.match(route, /ORDER BY published_ts DESC, id/u);
+  assert.match(route, /published_ts < \$/u);
+});
+
+test('create rejects candidates whose current dispatch eligibility changed', () => {
+  const create = section(
+    "router.post(\n  '/negative-patrol/tasks'",
+    "router.post(\n  '/negative-patrol/orchestrations/:id/reassign'",
+  );
+  assert.match(create, /includeTotal: false/u);
+  assert.match(create, /includeBaseline: true/u);
+  assert.match(create, /candidate\.canDispatch !== true/u);
+  assert.match(create, /invalidRecordIds/u);
+  assert.match(create, /invalidCandidates/u);
+  assert.match(create, /submissionState: 'confirmed'/u);
+  assert.match(create, /created: result\.existing !== true/u);
+  assert.match(create, /taskId: result\.task\.id/u);
+
+  const watched = section(
+    "router.post(\n  '/watched-content/tasks'",
+    "router.post(\n  '/negative-patrol/tasks'",
+  );
+  assert.doesNotMatch(watched, /deferredSelection/u);
 });

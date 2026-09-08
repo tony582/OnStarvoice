@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.5',
+  latestVersion: '0.4.6',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-02',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.5-20260902.zip',
+  releaseDate: '2026-09-08',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.6-20260908.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.6',
+      releaseDate: '2026-09-08',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '负面巡查按当前情感预览和下发',
+              desc: '在所选发布时间范围内，按客户当前确认的情感筛选帖子；已改为中性或正面的帖子不再入选，改为负面的帖子可正常入选，下发前再次核对状态。',
+            },
+            {
+              title: '巡查结束自动关闭所属页面',
+              desc: '完成、失败或取消后，按本次任务身份回收平台页和执行资源；回执与关页失败可重试，验证码等需要人工操作的页面保留。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '负面巡查逐帖排队，降低集中下发负载',
+              desc: '巡查按全局和客户容量逐帖下发，后台查询与评论后处理增加限流、超时和退避保护；常规关键词采集不套用巡查并发限制。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.5',
       releaseDate: '2026-09-02',

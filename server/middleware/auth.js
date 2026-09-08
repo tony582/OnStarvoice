@@ -1,4 +1,10 @@
-import { execute, getDefaultTenantId, getTenantByAuthCode, queryOne } from '../db/init.js';
+import {
+  execute,
+  getDefaultTenantId,
+  getTenantByAuthCode,
+  isDbCapacityError,
+  queryOne,
+} from '../db/init.js';
 import { resolveSession } from '../services/auth-service.js';
 import { hashCaptureAgentToken } from '../services/capture-cloud.js';
 
@@ -18,7 +24,7 @@ function getCaptureAgentToken(req) {
     : String(req.headers['x-capture-agent-token'] || '').trim();
 }
 
-async function loadCaptureAgentByToken(token) {
+async function loadCaptureAgentByToken(token, {category = 'general'} = {}) {
   if (!token) return null;
   return await queryOne(`
     SELECT ca.*,
@@ -43,7 +49,19 @@ async function loadCaptureAgentByToken(token) {
       AND ab.code_id = ac.id
     WHERE cat.token_hash = $1 AND cat.revoked_at IS NULL
     LIMIT 1
-  `, [hashCaptureAgentToken(token)]);
+  `, [hashCaptureAgentToken(token)], null, {category});
+}
+
+function sendDbCapacityResponse(res, error) {
+  const retryAfterMs = Math.max(100, Number(error?.retryAfterMs) || 500);
+  res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+  return res.status(503).json({
+    ok: false,
+    error: 'server_busy',
+    code: 'database_capacity_unavailable',
+    retryAfterMs,
+    message: '服务当前繁忙，请稍后重试',
+  });
 }
 
 function captureAgentEntitlementError(agent) {
@@ -150,6 +168,60 @@ export async function requireTenantAccess(req, res, next) {
 }
 
 /**
+ * Operator control actions use the reserved critical database category.  The
+ * authorization semantics stay identical to requireTenantAccess; only the
+ * execution budget differs so a reporting backlog cannot starve stop.
+ */
+export async function requireCriticalTenantAccess(req, res, next) {
+  try {
+    const resolved = await resolveSession(getSessionToken(req), {
+      category: 'critical',
+    });
+    if (resolved) {
+      req.session = resolved.session;
+      req.user = resolved.user;
+      req.actorType = 'user';
+      req.actorName = resolved.user.name || resolved.user.email;
+
+      let tenantId = requestedTenantId(req) || firstTenantId(resolved.user);
+      if (!tenantId && INTERNAL_ROLES.has(resolved.user.global_role)) {
+        const tenant = await queryOne(
+          "SELECT id FROM tenants WHERE name = 'OnStar' ORDER BY created_at LIMIT 1",
+          [],
+          null,
+          {category: 'critical'},
+        );
+        tenantId = tenant?.id || '';
+      }
+      if (!tenantId || !userCanUseTenant(resolved.user, tenantId)) {
+        return res.status(403).json({ok: false, error: 'tenant_forbidden', message: '无权访问该租户'});
+      }
+      const tenant = await queryOne(
+        'SELECT id, name FROM tenants WHERE id = $1 AND status <> $2',
+        [tenantId, 'deleted'],
+        null,
+        {category: 'critical'},
+      );
+      if (!tenant) {
+        return res.status(404).json({ok: false, error: 'tenant_not_found', message: '租户不存在'});
+      }
+      req.tenantId = tenant.id;
+      req.tenantName = tenant.name;
+      req.tenantRole = tenantRoleFor(resolved.user, tenant.id);
+      req.canCrossTenant = INTERNAL_ROLES.has(resolved.user.global_role);
+      return next();
+    }
+
+    // The stop routes add requireSessionUser immediately after this middleware,
+    // but retaining the activation-code fallback preserves middleware parity.
+    return requireAuth(req, res, next);
+  } catch (err) {
+    if (isDbCapacityError(err)) return sendDbCapacityResponse(res, err);
+    return next(err);
+  }
+}
+
+/**
  * 浏览器采集节点专用鉴权。节点令牌由 /api/verify 在环境绑定成功后签发，
  * 只用于心跳、任务镜像与命令回执，不复用后台会话或长期暴露激活码。
  */
@@ -159,7 +231,7 @@ export async function requireCaptureAgent(req, res, next) {
     if (!token) {
       return res.status(401).json({ ok: false, error: 'missing_agent_token', message: '缺少采集节点令牌' });
     }
-    const agent = await loadCaptureAgentByToken(token);
+    const agent = await loadCaptureAgentByToken(token, {category: 'critical'});
     const entitlementError = captureAgentEntitlementError(agent);
     if (entitlementError) {
       const [status, error, message] = entitlementError;
@@ -173,6 +245,7 @@ export async function requireCaptureAgent(req, res, next) {
     req.actorName = agent.display_name || agent.client_label || agent.client_uuid;
     return next();
   } catch (err) {
+    if (isDbCapacityError(err)) return sendDbCapacityResponse(res, err);
     return next(err);
   }
 }

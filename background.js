@@ -59,6 +59,11 @@ const STORAGE_KEYS = {
   cloudCommandResults: 'onstarvoice.cloudCommandResults',
   cloudAgentStatus: 'onstarvoice.cloudTaskAgentStatus',
   targetedPostRunRequest: 'onstarvoice.targetedPostRunRequest',
+  targetedPostPlatformTab: 'onstarvoice.targetedPostPlatformTab.v1',
+  targetedPostPlatformTabCleanup:
+    'onstarvoice.targetedPostPlatformTabCleanup.v1',
+  negativePatrolTerminalOutbox:
+    'onstarvoice.targetedTerminalOutbox.v1',
   observedSocialAccounts: 'onstarvoice.observedSocialAccounts',
   socialAccountUsageQueue: 'onstarvoice.socialAccountUsageQueue',
   diagnostics: 'onstarvoice.diagnostics',
@@ -74,6 +79,7 @@ const AUTHORITATIVE_CONTROL_TERMINAL_STATUSES = new Set([
   'completed_with_failures',
   'failed',
   'canceled',
+  'superseded',
   'skipped',
   'needs_action',
 ]);
@@ -133,6 +139,20 @@ const UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION = 2;
 const UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION = 1;
 const TARGETED_POST_RUNNER_QUERY_KEY = 'targetedPostRun';
 const TARGETED_POST_RUNNER_ATTEMPT_QUERY_KEY = 'targetedPostAttempt';
+const TARGETED_POST_PLATFORM_TAB_CLEANUP_ALARM_NAME =
+  'onstarvoice:targeted-post-platform-tab-cleanup';
+const TARGETED_POST_PLATFORM_TAB_CLEANUP_RETRY_BASE_MS = 30 * 1000;
+const TARGETED_POST_PLATFORM_TAB_CLEANUP_RETRY_MAX_MS = 5 * 60 * 1000;
+const NEGATIVE_PATROL_TERMINAL_OUTBOX_SCHEMA_VERSION = 1;
+const NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_ENTRIES = 64;
+const NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_BYTES = 8 * 1024 * 1024;
+// 新任务开始前预留一份单帖终态回执的空间。实际写入仍会再次按 8 MiB
+// 硬上限校验；这里用于在队列接近上限时先阻止采集，避免采完后无处落证据。
+const NEGATIVE_PATROL_TERMINAL_OUTBOX_ADMISSION_RESERVE_BYTES = 128 * 1024;
+const NEGATIVE_PATROL_TERMINAL_OUTBOX_FAILURE_RESERVE_BYTES = 64 * 1024;
+const NEGATIVE_PATROL_TERMINAL_RESULT_MAX_BYTES = 96 * 1024;
+// 启动、闹钟和心跳每次只补发一个旧回执，避免恢复时形成新的服务端尖峰。
+const NEGATIVE_PATROL_TERMINAL_OUTBOX_REPLAY_LIMIT = 1;
 const SCHEDULE_MODES = new Set([
   'daily',
   'custom_dates',
@@ -836,6 +856,8 @@ let taskLedgerMutationQueue = Promise.resolve();
 let captureTaskLifecycleQueue = Promise.resolve();
 let targetedPostRunMutationQueue = Promise.resolve();
 let cloudCommandResultsMutationQueue = Promise.resolve();
+let negativePatrolTerminalOutboxMutationQueue = Promise.resolve();
+let targetedPostPlatformTabCleanupMutationQueue = Promise.resolve();
 
 function runUnattendedRunMutation(operation) {
   const pending = unattendedRunMutationQueue.then(operation, operation);
@@ -876,6 +898,24 @@ function runTargetedPostRunMutation(operation) {
 function runCloudCommandResultsMutation(operation) {
   const pending = cloudCommandResultsMutationQueue.then(operation, operation);
   cloudCommandResultsMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runNegativePatrolTerminalOutboxMutation(operation) {
+  const pending = negativePatrolTerminalOutboxMutationQueue.then(
+    operation,
+    operation,
+  );
+  negativePatrolTerminalOutboxMutationQueue = pending.catch(() => null);
+  return pending;
+}
+
+function runTargetedPostPlatformTabCleanupMutation(operation) {
+  const pending = targetedPostPlatformTabCleanupMutationQueue.then(
+    operation,
+    operation,
+  );
+  targetedPostPlatformTabCleanupMutationQueue = pending.catch(() => null);
   return pending;
 }
 
@@ -2747,6 +2787,7 @@ function targetedPostTaskCenterStatus(value) {
       'completed_with_failures',
       'failed',
       'canceled',
+      'superseded',
       'skipped',
     ].includes(status)
   ) {
@@ -2964,6 +3005,8 @@ async function closeOwnedTargetedPostRunnerTabs(target, expectedCurrent) {
     isTargetedPostRunnerTabForAttempt(tab, target),
   );
   const removedTabIds = [];
+  const pendingTabIds = [];
+  const closeWarnings = [];
   for (const tab of candidates) {
     current = await readTargetedPostRunRequest({
       persistNormalized: false,
@@ -2981,37 +3024,1253 @@ async function closeOwnedTargetedPostRunnerTabs(target, expectedCurrent) {
     try {
       await chrome.tabs.remove(tabId);
       removedTabIds.push(tabId);
-    } catch (_error) {
-      // 页面可能已由用户关闭；不影响新的执行轮次继续领取。
+    } catch (error) {
+      let liveTab = null;
+      try {
+        liveTab = await chrome.tabs.get(tabId);
+      } catch (_missingError) {
+        // The user closed it while cleanup was running.
+        continue;
+      }
+      if (!isTargetedPostRunnerTabForAttempt(liveTab, target)) {
+        // A reused tab id is no longer owned by this attempt.
+        continue;
+      }
+      pendingTabIds.push(tabId);
+      closeWarnings.push(String(error?.message || error || '').slice(0, 500));
     }
   }
   return {
-    ok: true,
+    ok: pendingTabIds.length === 0,
     current,
     removedTabIds,
     removedCount: removedTabIds.length,
+    ...(pendingTabIds.length > 0
+      ? {
+          pendingTabIds,
+          reason: 'targeted_post_runner_tab_close_pending',
+          warning:
+            closeWarnings.find(Boolean) ||
+            'task-owned runner tab is still open',
+        }
+      : {}),
   };
 }
 
 async function closeTerminalTargetedPostRunnerTabs(request) {
   const status = String(request?.status || '').trim().toLowerCase();
-  if (
-    status === 'needs_action' ||
-    !cloudTargetedPostApi?.isTerminalRunStatus?.(status)
-  ) {
+  if (!cloudTargetedPostApi?.isTerminalRunStatus?.(status)) {
     return {
       ok: true,
       current: await readTargetedPostRunRequest({persistNormalized: false}),
       removedTabIds: [],
       removedCount: 0,
       skipped: true,
-      reason:
-        status === 'needs_action'
-          ? 'targeted_post_needs_action_preserved'
-          : 'targeted_post_not_terminal',
+      reason: 'targeted_post_not_terminal',
     };
   }
   return await closeOwnedTargetedPostRunnerTabs(request, request);
+}
+
+function normalizeTargetedPostPlatformTab(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const tabId = Number(value.tabId);
+  const requestId = String(value.requestId || '').trim();
+  const attemptId = String(value.attemptId || '').trim();
+  const sessionId = String(value.sessionId || '').trim();
+  if (!Number.isSafeInteger(tabId) || tabId <= 0 || !requestId || !attemptId || !sessionId) {
+    return null;
+  }
+  return {
+    schemaVersion: 1,
+    requestId,
+    attemptId,
+    cloudCommandId: String(value.cloudCommandId || '').trim(),
+    sessionId,
+    tabId,
+    workflow: String(value.workflow || '').trim(),
+    platform: String(value.platform || '').trim(),
+    externalId: String(value.externalId || '').trim().slice(0, 500),
+    url: String(value.url || '').trim(),
+    placeholderUrl: String(value.placeholderUrl || '').trim().slice(0, 1000),
+    openedAt: String(value.openedAt || ''),
+  };
+}
+
+function targetedPostPlatformTabMatchesRequest(registration, request) {
+  const normalized = normalizeTargetedPostPlatformTab(registration);
+  const commandId = String(request?.cloudCommandId || '').trim();
+  return Boolean(
+    normalized &&
+      normalized.requestId === targetedPostLogicalRequestId(request) &&
+      normalized.attemptId === String(request?.attemptId || '').trim() &&
+      commandId &&
+      normalized.cloudCommandId === commandId
+  );
+}
+
+async function clearTargetedPostPlatformTabRegistration(sessionId) {
+  const expectedSessionId = String(sessionId || '').trim();
+  if (!expectedSessionId) return false;
+  return await runAuthoritativeControlStorageMutation(async () => {
+    const stored = await chrome.storage.local.get(
+      STORAGE_KEYS.targetedPostPlatformTab,
+    );
+    const latest = normalizeTargetedPostPlatformTab(
+      stored[STORAGE_KEYS.targetedPostPlatformTab],
+    );
+    if (latest?.sessionId !== expectedSessionId) return false;
+    await chrome.storage.local.remove(STORAGE_KEYS.targetedPostPlatformTab);
+    return true;
+  });
+}
+
+function normalizeTargetedPostPlatformTabCleanup(value) {
+  const registration = normalizeTargetedPostPlatformTab(value);
+  if (!registration) return null;
+  return {
+    ...registration,
+    schemaVersion: 1,
+    cleanupReason: String(value.cleanupReason || '').trim().slice(0, 120),
+    attempts: Math.max(0, Math.floor(Number(value.attempts) || 0)),
+    lastAttemptAt: String(value.lastAttemptAt || ''),
+    nextRetryAt: String(value.nextRetryAt || ''),
+    lastFailure: String(value.lastFailure || '').slice(0, 500),
+  };
+}
+
+async function readTargetedPostPlatformTabCleanup() {
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.targetedPostPlatformTabCleanup,
+  );
+  return normalizeTargetedPostPlatformTabCleanup(
+    stored[STORAGE_KEYS.targetedPostPlatformTabCleanup],
+  );
+}
+
+async function scheduleTargetedPostPlatformTabCleanup(record) {
+  const normalized = normalizeTargetedPostPlatformTabCleanup(record);
+  if (!normalized) return false;
+  const retryAt = Date.parse(normalized.nextRetryAt);
+  const when = Number.isFinite(retryAt)
+    ? Math.max(Date.now() + 1000, retryAt)
+    : Date.now() + TARGETED_POST_PLATFORM_TAB_CLEANUP_RETRY_BASE_MS;
+  await chrome.alarms.create(
+    TARGETED_POST_PLATFORM_TAB_CLEANUP_ALARM_NAME,
+    {when},
+  );
+  return true;
+}
+
+async function persistTargetedPostPlatformTabCleanup(
+  registration,
+  {reason = 'targeted_post_platform_tab_open_failed'} = {},
+) {
+  const prepared = normalizeTargetedPostPlatformTabCleanup({
+    ...registration,
+    cleanupReason: reason,
+    attempts: 0,
+    lastAttemptAt: '',
+    nextRetryAt: new Date(
+      Date.now() + TARGETED_POST_PLATFORM_TAB_CLEANUP_RETRY_BASE_MS,
+    ).toISOString(),
+    lastFailure: '',
+  });
+  if (!prepared) {
+    return {ok: false, reason: 'targeted_post_platform_cleanup_invalid'};
+  }
+  const result = await runTargetedPostPlatformTabCleanupMutation(async () => {
+    const current = await readTargetedPostPlatformTabCleanup();
+    if (current && current.sessionId !== prepared.sessionId) {
+      return {
+        ok: false,
+        retained: true,
+        reason: 'targeted_post_platform_cleanup_busy',
+        entry: current,
+      };
+    }
+    await runAuthoritativeControlStorageMutation(
+      () => chrome.storage.local.set({
+        [STORAGE_KEYS.targetedPostPlatformTabCleanup]: current || prepared,
+      }),
+      {relieveStoragePressure: true},
+    );
+    return {ok: true, retained: true, entry: current || prepared};
+  });
+  if (result.ok) {
+    await scheduleTargetedPostPlatformTabCleanup(result.entry).catch(() => false);
+  }
+  return result;
+}
+
+async function clearTargetedPostPlatformTabCleanup(sessionId) {
+  const expectedSessionId = String(sessionId || '').trim();
+  if (!expectedSessionId) return false;
+  const cleared = await runTargetedPostPlatformTabCleanupMutation(async () => {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.targetedPostPlatformTabCleanup,
+      STORAGE_KEYS.targetedPostPlatformTab,
+    ]);
+    const cleanup = normalizeTargetedPostPlatformTabCleanup(
+      stored[STORAGE_KEYS.targetedPostPlatformTabCleanup],
+    );
+    if (cleanup?.sessionId !== expectedSessionId) return false;
+    const registration = normalizeTargetedPostPlatformTab(
+      stored[STORAGE_KEYS.targetedPostPlatformTab],
+    );
+    const keys = [STORAGE_KEYS.targetedPostPlatformTabCleanup];
+    if (registration?.sessionId === expectedSessionId) {
+      keys.push(STORAGE_KEYS.targetedPostPlatformTab);
+    }
+    await runAuthoritativeControlStorageMutation(() =>
+      chrome.storage.local.remove(keys));
+    return true;
+  });
+  if (cleared) {
+    await chrome.alarms
+      .clear(TARGETED_POST_PLATFORM_TAB_CLEANUP_ALARM_NAME)
+      .catch(() => false);
+  }
+  return cleared;
+}
+
+async function rememberTargetedPostPlatformTabCleanupFailure(
+  expected,
+  error,
+) {
+  const normalizedExpected = normalizeTargetedPostPlatformTabCleanup(expected);
+  if (!normalizedExpected) return null;
+  const updated = await runTargetedPostPlatformTabCleanupMutation(async () => {
+    const current = await readTargetedPostPlatformTabCleanup();
+    if (current?.sessionId !== normalizedExpected.sessionId) return null;
+    const attempts = current.attempts + 1;
+    const retryDelayMs = Math.min(
+      TARGETED_POST_PLATFORM_TAB_CLEANUP_RETRY_MAX_MS,
+      TARGETED_POST_PLATFORM_TAB_CLEANUP_RETRY_BASE_MS *
+        2 ** Math.min(attempts - 1, 4),
+    );
+    const next = normalizeTargetedPostPlatformTabCleanup({
+      ...current,
+      attempts,
+      lastAttemptAt: new Date().toISOString(),
+      nextRetryAt: new Date(Date.now() + retryDelayMs).toISOString(),
+      lastFailure: String(error?.message || error || '').slice(0, 500),
+    });
+    await runAuthoritativeControlStorageMutation(
+      () => chrome.storage.local.set({
+        [STORAGE_KEYS.targetedPostPlatformTabCleanup]: next,
+      }),
+      {relieveStoragePressure: true},
+    );
+    return next;
+  });
+  if (updated) {
+    await scheduleTargetedPostPlatformTabCleanup(updated).catch(() => false);
+  }
+  return updated;
+}
+
+function targetedPostPlatformCleanupOwnsUrl(url, record) {
+  const candidateUrl = String(url || '').trim();
+  const normalized = normalizeTargetedPostPlatformTabCleanup(record);
+  if (!candidateUrl || !normalized) return false;
+  if (
+    normalized.placeholderUrl &&
+    candidateUrl === normalized.placeholderUrl
+  ) {
+    return true;
+  }
+  try {
+    const expected = cloudTargetedPostApi.canonicalizeTargetUrl(
+      normalized.url,
+      normalized.platform,
+      normalized.externalId,
+    );
+    cloudTargetedPostApi.canonicalizeTargetUrl(
+      candidateUrl,
+      normalized.platform,
+      normalized.externalId || expected.externalId,
+    );
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function recoverTargetedPostPlatformTabCleanup({force = false} = {}) {
+  const pending = await readTargetedPostPlatformTabCleanup();
+  if (!pending) {
+    return {ok: true, skipped: true, reason: 'no_pending_platform_tab_cleanup'};
+  }
+  const retryAt = Date.parse(pending.nextRetryAt);
+  if (!force && Number.isFinite(retryAt) && retryAt > Date.now()) {
+    await scheduleTargetedPostPlatformTabCleanup(pending).catch(() => false);
+    return {ok: true, deferred: true, retained: true, entry: pending};
+  }
+
+  let tab;
+  try {
+    tab = await chrome.tabs.get(pending.tabId);
+  } catch (error) {
+    if (isExplicitMissingTargetedPostTabError(error)) {
+      await clearTargetedPostPlatformTabCleanup(pending.sessionId);
+      return {ok: true, removedCount: 0, alreadyClosed: true};
+    }
+    const entry = await rememberTargetedPostPlatformTabCleanupFailure(
+      pending,
+      error,
+    );
+    return {
+      ok: false,
+      retained: true,
+      reason: 'targeted_post_platform_tab_cleanup_pending',
+      entry: entry || pending,
+    };
+  }
+
+  const liveUrl = String(tab?.pendingUrl || tab?.url || '').trim();
+  if (!targetedPostPlatformCleanupOwnsUrl(liveUrl, pending)) {
+    await clearTargetedPostPlatformTabCleanup(pending.sessionId);
+    return {
+      ok: true,
+      removedCount: 0,
+      skipped: true,
+      reason: 'targeted_post_platform_tab_identity_changed',
+    };
+  }
+
+  try {
+    await chrome.tabs.remove(pending.tabId);
+  } catch (error) {
+    try {
+      tab = await chrome.tabs.get(pending.tabId);
+    } catch (lookupError) {
+      if (isExplicitMissingTargetedPostTabError(lookupError)) {
+        await clearTargetedPostPlatformTabCleanup(pending.sessionId);
+        return {ok: true, removedCount: 0, alreadyClosed: true};
+      }
+      const entry = await rememberTargetedPostPlatformTabCleanupFailure(
+        pending,
+        lookupError,
+      );
+      return {
+        ok: false,
+        retained: true,
+        reason: 'targeted_post_platform_tab_cleanup_pending',
+        entry: entry || pending,
+      };
+    }
+    if (
+      !targetedPostPlatformCleanupOwnsUrl(
+        String(tab?.pendingUrl || tab?.url || '').trim(),
+        pending,
+      )
+    ) {
+      await clearTargetedPostPlatformTabCleanup(pending.sessionId);
+      return {
+        ok: true,
+        removedCount: 0,
+        skipped: true,
+        reason: 'targeted_post_platform_tab_identity_changed',
+      };
+    }
+    const entry = await rememberTargetedPostPlatformTabCleanupFailure(
+      pending,
+      error,
+    );
+    return {
+      ok: false,
+      retained: true,
+      reason: 'targeted_post_platform_tab_cleanup_pending',
+      entry: entry || pending,
+    };
+  }
+
+  await clearTargetedPostPlatformTabCleanup(pending.sessionId);
+  return {ok: true, removedCount: 1, tabId: pending.tabId};
+}
+
+async function forgetRemovedTargetedPostPlatformTabCleanup(tabId) {
+  const pending = await readTargetedPostPlatformTabCleanup();
+  if (pending?.tabId !== Number(tabId)) return false;
+  return await clearTargetedPostPlatformTabCleanup(pending.sessionId);
+}
+
+function targetedPostPlatformUrlBelongsToRequest(url, request) {
+  const platform = String(request?.platform || '').trim();
+  for (const target of Array.isArray(request?.targets) ? request.targets : []) {
+    try {
+      cloudTargetedPostApi.canonicalizeTargetUrl(
+        url,
+        platform,
+        String(target?.externalId || '').trim(),
+      );
+      return true;
+    } catch (_error) {
+      // Keep checking the remaining targets from this exact attempt.
+    }
+  }
+  return false;
+}
+
+function isExplicitMissingTargetedPostTabError(error) {
+  const message = String(error?.message || error || '').trim();
+  return /^No tab with id(?::\s*\d+)?\.?$/iu.test(message);
+}
+
+async function openOwnedTargetedPostPlatformTab({
+  requestId = '',
+  attemptId = '',
+  url = '',
+} = {}) {
+  const expected = {
+    id: String(requestId || '').trim(),
+    attemptId: String(attemptId || '').trim(),
+  };
+  const current = await readTargetedPostRunRequest({persistNormalized: false});
+  if (!isSameTargetedPostAttempt(current, expected)) {
+    return {ok: false, reason: 'stale_targeted_post_attempt'};
+  }
+  if (String(current.workflow || '').trim() !== 'negative_post_patrol') {
+    return {ok: false, reason: 'targeted_post_platform_tab_not_supported'};
+  }
+  const targetUrl = String(url || '').trim();
+  const target = (Array.isArray(current.targets) ? current.targets : []).find(
+    (candidate) => String(candidate?.url || '').trim() === targetUrl,
+  );
+  if (!target || !targetUrl) {
+    return {ok: false, reason: 'targeted_post_url_not_owned'};
+  }
+
+  // A single durable registration owns the task platform page. Reconcile a
+  // crash-pending terminal owner before opening another page, then either
+  // reuse the exact current-attempt page or fail closed instead of overwriting
+  // another attempt's registration and orphaning its tab.
+  await recoverNegativePatrolTerminalOutboxCleanup().catch(() => null);
+  const pendingCleanup = await recoverTargetedPostPlatformTabCleanup({
+    force: true,
+  }).catch((error) => ({
+    ok: false,
+    retained: true,
+    reason: 'targeted_post_platform_tab_cleanup_pending',
+    message: String(error?.message || error || '').slice(0, 500),
+  }));
+  if (!pendingCleanup.ok) {
+    return {
+      ok: false,
+      reason: 'targeted_post_platform_tab_cleanup_pending',
+      message: pendingCleanup.message || '上一张巡查页面仍在收尾，请稍后重试',
+    };
+  }
+  if (await readTargetedPostPlatformTabCleanup()) {
+    return {
+      ok: false,
+      reason: 'targeted_post_platform_tab_cleanup_pending',
+      message: '上一张巡查页面仍在收尾，请稍后重试',
+    };
+  }
+  const storedRegistration = await chrome.storage.local.get(
+    STORAGE_KEYS.targetedPostPlatformTab,
+  );
+  const existingRegistration = normalizeTargetedPostPlatformTab(
+    storedRegistration[STORAGE_KEYS.targetedPostPlatformTab],
+  );
+  if (existingRegistration) {
+    let existingTab = null;
+    try {
+      existingTab = await chrome.tabs.get(existingRegistration.tabId);
+    } catch (error) {
+      if (!isExplicitMissingTargetedPostTabError(error)) {
+        return {
+          ok: false,
+          reason: 'targeted_post_platform_tab_state_unavailable',
+          message: String(error?.message || error || '').slice(0, 500),
+        };
+      }
+      await clearTargetedPostPlatformTabRegistration(
+        existingRegistration.sessionId,
+      );
+    }
+    if (existingTab) {
+      if (!targetedPostPlatformTabMatchesRequest(existingRegistration, current)) {
+        return {
+          ok: false,
+          reason: 'targeted_post_platform_tab_busy',
+          message: '上一轮巡查页面仍在收尾，请稍后重试',
+        };
+      }
+      if (!targetedPostPlatformUrlBelongsToRequest(existingTab.url, current)) {
+        await clearTargetedPostPlatformTabRegistration(
+          existingRegistration.sessionId,
+        );
+      } else {
+        const reusedRegistration = {
+          ...existingRegistration,
+          workflow: String(current.workflow || '').trim(),
+          platform: String(current.platform || target.platform || '').trim(),
+          externalId: String(target.externalId || '').trim().slice(0, 500),
+          url: targetUrl,
+        };
+        try {
+          await runAuthoritativeControlStorageMutation(() =>
+            chrome.storage.local.set({
+              [STORAGE_KEYS.targetedPostPlatformTab]: reusedRegistration,
+            }));
+          await chrome.tabs.update(existingRegistration.tabId, {
+            url: targetUrl,
+            active: true,
+          });
+          return {ok: true, data: reusedRegistration, reused: true};
+        } catch (error) {
+          return {
+            ok: false,
+            reason: 'targeted_post_platform_tab_reuse_failed',
+            message: String(error?.message || error || '').slice(0, 500),
+          };
+        }
+      }
+    }
+  }
+
+  const sessionId = createUuid();
+  const placeholderUrl =
+    `about:blank#onstarvoice-targeted-post=${encodeURIComponent(sessionId)}`;
+  const tab = await chrome.tabs.create({url: placeholderUrl, active: true});
+  const tabId = Number(tab?.id);
+  if (!Number.isSafeInteger(tabId) || tabId <= 0) {
+    return {ok: false, reason: 'targeted_post_platform_tab_create_failed'};
+  }
+  const registration = {
+    schemaVersion: 1,
+    requestId: targetedPostLogicalRequestId(current),
+    attemptId: String(current.attemptId || '').trim(),
+    cloudCommandId: String(current.cloudCommandId || '').trim(),
+    sessionId,
+    tabId,
+    workflow: String(current.workflow || '').trim(),
+    platform: String(current.platform || target.platform || '').trim(),
+    externalId: String(target.externalId || '').trim().slice(0, 500),
+    url: targetUrl,
+    placeholderUrl,
+    openedAt: new Date().toISOString(),
+  };
+  try {
+    await runAuthoritativeControlStorageMutation(() => chrome.storage.local.set({
+      [STORAGE_KEYS.targetedPostPlatformTab]: registration,
+    }));
+    await chrome.tabs.update(tabId, {url: targetUrl, active: true});
+    return {ok: true, data: registration};
+  } catch (error) {
+    let durableCleanup = null;
+    try {
+      durableCleanup = await persistTargetedPostPlatformTabCleanup(
+        registration,
+      );
+    } catch (_persistError) {
+      durableCleanup = null;
+    }
+    let closeSettled = false;
+    let closeError = null;
+    try {
+      await chrome.tabs.remove(tabId);
+      closeSettled = true;
+    } catch (removeError) {
+      closeError = removeError;
+      try {
+        const liveTab = await chrome.tabs.get(tabId);
+        if (
+          !targetedPostPlatformCleanupOwnsUrl(
+            String(liveTab?.pendingUrl || liveTab?.url || '').trim(),
+            registration,
+          )
+        ) {
+          closeSettled = true;
+        }
+      } catch (lookupError) {
+        if (isExplicitMissingTargetedPostTabError(lookupError)) {
+          closeSettled = true;
+        } else {
+          closeError = lookupError;
+        }
+      }
+    }
+    if (closeSettled) {
+      if (durableCleanup?.entry) {
+        await clearTargetedPostPlatformTabCleanup(
+          durableCleanup.entry.sessionId,
+        ).catch(() => false);
+      } else {
+        await clearTargetedPostPlatformTabRegistration(
+          registration.sessionId,
+        ).catch(() => false);
+      }
+    } else {
+      if (!durableCleanup?.ok) {
+        try {
+          durableCleanup = await persistTargetedPostPlatformTabCleanup(
+            registration,
+          );
+        } catch (_persistError) {
+          durableCleanup = null;
+        }
+      }
+      if (durableCleanup?.entry) {
+        await rememberTargetedPostPlatformTabCleanupFailure(
+          durableCleanup.entry,
+          closeError || error,
+        ).catch(() => null);
+      }
+    }
+    return {
+      ok: false,
+      reason: 'targeted_post_platform_tab_open_failed',
+      message: String(error?.message || error || '').slice(0, 500),
+      cleanupPending: !closeSettled,
+      cleanupDurable: Boolean(!closeSettled && durableCleanup?.ok),
+    };
+  }
+}
+
+async function closeTerminalTargetedPostPlatformTab(request) {
+  const status = String(request?.status || '').trim().toLowerCase();
+  if (status === 'needs_action' || !cloudTargetedPostApi?.isTerminalRunStatus?.(status)) {
+    return {
+      ok: true,
+      removedCount: 0,
+      skipped: true,
+      reason: status === 'needs_action'
+        ? 'targeted_post_needs_action_preserved'
+        : 'targeted_post_not_terminal',
+    };
+  }
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.targetedPostPlatformTab,
+  );
+  const registration = normalizeTargetedPostPlatformTab(
+    stored[STORAGE_KEYS.targetedPostPlatformTab],
+  );
+  if (!targetedPostPlatformTabMatchesRequest(registration, request)) {
+    return {
+      ok: true,
+      removedCount: 0,
+      skipped: true,
+      reason: 'targeted_post_platform_tab_not_owned',
+    };
+  }
+
+  let liveTab = null;
+  try {
+    liveTab = await chrome.tabs.get(registration.tabId);
+  } catch (error) {
+    if (!isExplicitMissingTargetedPostTabError(error)) {
+      return {
+        ok: false,
+        removedCount: 0,
+        reason: 'targeted_post_platform_tab_state_unavailable',
+        warning: String(error?.message || error || '').slice(0, 500),
+      };
+    }
+    await clearTargetedPostPlatformTabRegistration(registration.sessionId);
+    return {
+      ok: true,
+      removedCount: 0,
+      skipped: true,
+      reason: 'targeted_post_platform_tab_already_closed',
+    };
+  }
+  if (!targetedPostPlatformUrlBelongsToRequest(liveTab?.url, request)) {
+    await clearTargetedPostPlatformTabRegistration(registration.sessionId);
+    return {
+      ok: false,
+      removedCount: 0,
+      skipped: true,
+      reason: 'targeted_post_platform_tab_identity_changed',
+    };
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: {tabId: registration.tabId},
+      func: () => {
+        for (const media of document.querySelectorAll('audio, video')) {
+          try {
+            media.pause();
+          } catch (_error) {
+            // Best effort before closing the task-owned page.
+          }
+        }
+      },
+    });
+  } catch (_error) {
+    // Restricted or already closed pages still proceed to the exact close.
+  }
+  let removedCount = 0;
+  try {
+    await chrome.tabs.remove(registration.tabId);
+    removedCount = 1;
+  } catch (error) {
+    try {
+      liveTab = await chrome.tabs.get(registration.tabId);
+    } catch (missingError) {
+      if (!isExplicitMissingTargetedPostTabError(missingError)) {
+        return {
+          ok: false,
+          removedCount: 0,
+          reason: 'targeted_post_platform_tab_close_pending',
+          warning: String(
+            missingError?.message || missingError || error || '',
+          ).slice(0, 500),
+        };
+      }
+      // The user may already have closed the task-owned page.
+      await clearTargetedPostPlatformTabRegistration(registration.sessionId);
+      return {
+        ok: true,
+        removedCount: 0,
+        skipped: true,
+        reason: 'targeted_post_platform_tab_already_closed',
+      };
+    }
+    if (!targetedPostPlatformUrlBelongsToRequest(liveTab?.url, request)) {
+      await clearTargetedPostPlatformTabRegistration(registration.sessionId);
+      return {
+        ok: false,
+        removedCount: 0,
+        skipped: true,
+        reason: 'targeted_post_platform_tab_identity_changed',
+      };
+    }
+    return {
+      ok: false,
+      removedCount: 0,
+      reason: 'targeted_post_platform_tab_close_pending',
+      warning: String(error?.message || error || '').slice(0, 500),
+    };
+  }
+  await clearTargetedPostPlatformTabRegistration(registration.sessionId);
+  return {ok: true, removedCount, tabId: registration.tabId};
+}
+
+async function forgetRemovedTargetedPostPlatformTab(tabId) {
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.targetedPostPlatformTab,
+  );
+  const registration = normalizeTargetedPostPlatformTab(
+    stored[STORAGE_KEYS.targetedPostPlatformTab],
+  );
+  if (registration?.tabId !== Number(tabId)) return false;
+  return await clearTargetedPostPlatformTabRegistration(
+    registration.sessionId,
+  );
+}
+
+const TARGETED_POST_TERMINAL_NOTICE_ACKS_STORAGE_KEY =
+  'onstarvoice.targetedPostTerminalNoticeAcks.v1';
+const TARGETED_POST_TERMINAL_NOTICE_ACKS_MAX_ENTRIES = 50;
+const TARGETED_POST_CANCEL_RELAY_TIMEOUT_MS = 1500;
+
+function normalizeTargetedPostTerminalNotice(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const requestId = String(value.requestId || '').trim().slice(0, 240);
+  const attemptId = String(value.attemptId || '').trim().slice(0, 240);
+  const serverStatus = String(value.status || '').trim().toLowerCase().slice(0, 80);
+  const localStatus = serverStatus === 'revoked' ? 'superseded' : serverStatus;
+  if (
+    !requestId ||
+    !attemptId ||
+    !['canceled', 'superseded', 'failed'].includes(localStatus)
+  ) {
+    return null;
+  }
+  return {
+    requestId,
+    attemptId,
+    status: serverStatus,
+    localStatus,
+    reason: String(value.reason || '').trim().slice(0, 120),
+    message: String(value.message || '').trim().slice(0, 2000),
+    finishedAt: String(value.finishedAt || '').trim().slice(0, 80),
+  };
+}
+
+function targetedPostTerminalNoticeKey(value) {
+  const notice = normalizeTargetedPostTerminalNotice(value);
+  return notice
+    ? `${notice.requestId}::${notice.attemptId}::${notice.status}`
+    : '';
+}
+
+async function readTargetedPostTerminalNoticeAcks() {
+  const stored = await chrome.storage.local.get(
+    TARGETED_POST_TERMINAL_NOTICE_ACKS_STORAGE_KEY,
+  );
+  const entries = Array.isArray(
+    stored[TARGETED_POST_TERMINAL_NOTICE_ACKS_STORAGE_KEY],
+  )
+    ? stored[TARGETED_POST_TERMINAL_NOTICE_ACKS_STORAGE_KEY]
+    : [];
+  return entries
+    .map(normalizeTargetedPostTerminalNotice)
+    .filter(Boolean)
+    .slice(-TARGETED_POST_TERMINAL_NOTICE_ACKS_MAX_ENTRIES)
+    .map(({requestId, attemptId, status}) => ({requestId, attemptId, status}));
+}
+
+async function rememberTargetedPostTerminalNoticeAck(value) {
+  const notice = normalizeTargetedPostTerminalNotice(value);
+  if (!notice) return false;
+  return await runAuthoritativeControlStorageMutation(async () => {
+    const current = await readTargetedPostTerminalNoticeAcks();
+    const nextByKey = new Map(
+      current.map((entry) => [targetedPostTerminalNoticeKey(entry), entry]),
+    );
+    const ack = {
+      requestId: notice.requestId,
+      attemptId: notice.attemptId,
+      status: notice.status,
+    };
+    nextByKey.set(targetedPostTerminalNoticeKey(ack), ack);
+    const next = [...nextByKey.values()].slice(
+      -TARGETED_POST_TERMINAL_NOTICE_ACKS_MAX_ENTRIES,
+    );
+    await chrome.storage.local.set({
+      [TARGETED_POST_TERMINAL_NOTICE_ACKS_STORAGE_KEY]: next,
+    });
+    return true;
+  });
+}
+
+async function clearDeliveredTargetedPostTerminalNoticeAcks(delivered = []) {
+  const deliveredKeys = new Set(
+    (Array.isArray(delivered) ? delivered : [])
+      .map(targetedPostTerminalNoticeKey)
+      .filter(Boolean),
+  );
+  if (deliveredKeys.size === 0) return false;
+  return await runAuthoritativeControlStorageMutation(async () => {
+    const current = await readTargetedPostTerminalNoticeAcks();
+    const next = current.filter(
+      (entry) => !deliveredKeys.has(targetedPostTerminalNoticeKey(entry)),
+    );
+    if (next.length === current.length) return false;
+    if (next.length > 0) {
+      await chrome.storage.local.set({
+        [TARGETED_POST_TERMINAL_NOTICE_ACKS_STORAGE_KEY]: next,
+      });
+    } else {
+      await chrome.storage.local.remove(
+        TARGETED_POST_TERMINAL_NOTICE_ACKS_STORAGE_KEY,
+      );
+    }
+    return true;
+  });
+}
+
+async function readTargetedPostPlatformTabForAttempt(request, current = null) {
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.targetedPostPlatformTab,
+  );
+  const registration = normalizeTargetedPostPlatformTab(
+    stored[STORAGE_KEYS.targetedPostPlatformTab],
+  );
+  if (targetedPostPlatformTabMatchesRequest(registration, request)) {
+    return {...registration, legacy: false};
+  }
+  if (!isSameTargetedPostAttempt(request, current)) return null;
+  const legacyTabId = Number(
+    current?.progress?.targetTabId || current?.targetTabId,
+  );
+  if (!Number.isSafeInteger(legacyTabId) || legacyTabId <= 0) return null;
+  try {
+    const tab = await chrome.tabs.get(legacyTabId);
+    if (!targetedPostPlatformUrlBelongsToRequest(tab?.url, current)) {
+      return null;
+    }
+    return {
+      schemaVersion: 0,
+      requestId: targetedPostLogicalRequestId(current),
+      attemptId: String(current.attemptId || '').trim(),
+      sessionId: '',
+      tabId: legacyTabId,
+      workflow: String(current.workflow || '').trim(),
+      platform: String(current.platform || '').trim(),
+      url: String(tab?.url || '').trim(),
+      legacy: true,
+    };
+  } catch (error) {
+    if (isExplicitMissingTargetedPostTabError(error)) return null;
+    throw error;
+  }
+}
+
+async function readExactTargetedPostPlatformTabRegistration(identity) {
+  const requestId = targetedPostLogicalRequestId(identity);
+  const attemptId = String(identity?.attemptId || '').trim();
+  if (!requestId || !attemptId) return null;
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.targetedPostPlatformTab,
+  );
+  const registration = normalizeTargetedPostPlatformTab(
+    stored[STORAGE_KEYS.targetedPostPlatformTab],
+  );
+  return registration?.requestId === requestId &&
+    registration.attemptId === attemptId
+    ? registration
+    : null;
+}
+
+function buildTargetedPostTerminalNoticeCleanupRequest(
+  request,
+  registration,
+) {
+  const normalized = normalizeTargetedPostPlatformTab(registration);
+  if (
+    !normalized ||
+    !normalized.cloudCommandId ||
+    !normalized.platform ||
+    !normalized.url
+  ) {
+    return null;
+  }
+  let externalId = normalized.externalId;
+  try {
+    const expected = cloudTargetedPostApi.canonicalizeTargetUrl(
+      normalized.url,
+      normalized.platform,
+      externalId,
+    );
+    externalId = externalId || expected.externalId;
+  } catch (_error) {
+    return null;
+  }
+  if (!externalId) return null;
+  return {
+    ...(request && typeof request === 'object' ? request : {}),
+    id: normalized.requestId,
+    requestId: normalized.requestId,
+    attemptId: normalized.attemptId,
+    cloudCommandId: normalized.cloudCommandId,
+    workflow: normalized.workflow || 'negative_post_patrol',
+    platform: normalized.platform,
+    targets: [{
+      url: normalized.url,
+      externalId,
+    }],
+  };
+}
+
+async function closeLegacyTargetedPostPlatformTab(registration, request) {
+  if (!registration?.legacy || !isSameTargetedPostAttempt(registration, request)) {
+    return {ok: true, removedCount: 0, skipped: true};
+  }
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(registration.tabId);
+  } catch (error) {
+    if (isExplicitMissingTargetedPostTabError(error)) {
+      return {ok: true, removedCount: 0, skipped: true};
+    }
+    return {
+      ok: false,
+      removedCount: 0,
+      reason: 'targeted_post_platform_tab_state_unavailable',
+      warning: String(error?.message || error || '').slice(0, 500),
+    };
+  }
+  if (!targetedPostPlatformUrlBelongsToRequest(tab?.url, request)) {
+    return {
+      ok: false,
+      removedCount: 0,
+      skipped: true,
+      reason: 'targeted_post_platform_tab_identity_changed',
+    };
+  }
+  try {
+    await chrome.tabs.remove(registration.tabId);
+    return {ok: true, removedCount: 1, tabId: registration.tabId};
+  } catch (error) {
+    try {
+      tab = await chrome.tabs.get(registration.tabId);
+    } catch (missingError) {
+      if (isExplicitMissingTargetedPostTabError(missingError)) {
+        return {ok: true, removedCount: 0, skipped: true};
+      }
+      return {
+        ok: false,
+        removedCount: 0,
+        reason: 'targeted_post_platform_tab_close_pending',
+        warning: String(
+          missingError?.message || missingError || error || '',
+        ).slice(0, 500),
+      };
+    }
+    if (!targetedPostPlatformUrlBelongsToRequest(tab?.url, request)) {
+      return {
+        ok: false,
+        removedCount: 0,
+        skipped: true,
+        reason: 'targeted_post_platform_tab_identity_changed',
+      };
+    }
+    return {
+      ok: false,
+      removedCount: 0,
+      reason: 'targeted_post_platform_tab_close_pending',
+      warning: String(error?.message || error || '').slice(0, 500),
+    };
+  }
+}
+
+async function relayTargetedPostCancelWithTimeout(
+  tabId,
+  {captureRequestId = ''} = {},
+) {
+  const normalizedTabId = Number(tabId);
+  if (!Number.isSafeInteger(normalizedTabId) || normalizedTabId <= 0) {
+    return 0;
+  }
+  try {
+    const response = await Promise.race([
+      relayToContentWithRetry(normalizedTabId, {
+        action: 'cancelCapture',
+        ...(String(captureRequestId || '').trim()
+          ? {captureRequestId: String(captureRequestId).trim()}
+          : {}),
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => {
+          const error = new Error('targeted post cancel relay timeout');
+          error.code = 'TARGETED_POST_CANCEL_RELAY_TIMEOUT';
+          reject(error);
+        }, TARGETED_POST_CANCEL_RELAY_TIMEOUT_MS),
+      ),
+    ]);
+    return response?.ok === false ? 0 : 1;
+  } catch (error) {
+    console.warn(
+      '[Background] Targeted post cancel relay unavailable; closing owned tab:',
+      error,
+    );
+    return 0;
+  }
+}
+
+async function stopTargetedPostAttemptResources(
+  request,
+  {signalCapture = false} = {},
+) {
+  const latestCurrent = await readTargetedPostRunRequest({
+    persistNormalized: false,
+  });
+  const cleanupCurrent = latestCurrent;
+  const registration = await readTargetedPostPlatformTabForAttempt(
+    request,
+    cleanupCurrent,
+  );
+  let cancelRelayedCount = 0;
+  if (signalCapture && registration?.tabId) {
+    cancelRelayedCount = await relayTargetedPostCancelWithTimeout(
+      registration.tabId,
+      {
+        captureRequestId: String(
+          request?.progress?.captureRequestId || '',
+        ).trim(),
+      },
+    );
+  }
+
+  const cleanupRequest =
+    registration && !registration.legacy &&
+    (!Array.isArray(request?.targets) || request.targets.length === 0)
+      ? {
+          ...request,
+          workflow: registration.workflow,
+          platform: registration.platform,
+          targets: [{url: registration.url}],
+        }
+      : request;
+  const platformCleanup = registration?.legacy
+    ? await closeLegacyTargetedPostPlatformTab(registration, request)
+    : await closeTerminalTargetedPostPlatformTab(cleanupRequest);
+  const lockBeforeRelease = await readStoredCaptureExecutionLock();
+  const currentReusesAttemptIdentity = isSameTargetedPostAttempt(
+    cleanupCurrent,
+    request,
+  );
+  const cleanupCommandStillOwnsAttempt =
+    !currentReusesAttemptIdentity ||
+    isOwnedTargetedPostAttempt(cleanupCurrent, request);
+  const ownedLockBeforeRelease = Boolean(
+    cleanupCommandStillOwnsAttempt &&
+      isCaptureExecutionLockOwnedByTargetedPostAttempt(
+        lockBeforeRelease,
+        request,
+      ),
+  );
+  const executionLockReleased = ownedLockBeforeRelease
+    ? await releaseTargetedPostCaptureExecutionLock(request)
+    : false;
+  let executionLockSettled = !ownedLockBeforeRelease || executionLockReleased;
+  if (!executionLockSettled) {
+    const lockAfterRelease = await readStoredCaptureExecutionLock();
+    executionLockSettled = !isCaptureExecutionLockOwnedByTargetedPostAttempt(
+      lockAfterRelease,
+      request,
+    );
+  }
+  const runnerCleanup = isSameTargetedPostAttempt(request, cleanupCurrent)
+    ? await closeTerminalTargetedPostRunnerTabs(request)
+    : await closeSupersededTargetedPostRunnerTabs(request, cleanupCurrent);
+  return {
+    cancelRelayedCount,
+    platformCleanup,
+    executionLockReleased,
+    executionLockSettled,
+    runnerCleanup,
+  };
+}
+
+async function applyTargetedPostTerminalNotice(value) {
+  const notice = normalizeTargetedPostTerminalNotice(value);
+  if (!notice) {
+    return {accepted: false, reason: 'invalid_targeted_post_terminal_notice'};
+  }
+  const identity = {
+    id: notice.requestId,
+    attemptId: notice.attemptId,
+    status: notice.localStatus,
+    finishedAt: notice.finishedAt || new Date().toISOString(),
+  };
+  const transition = await runTargetedPostRunMutation(async () => {
+    const current = await readTargetedPostRunRequest({persistNormalized: false});
+    if (!isSameTargetedPostAttempt(current, identity)) {
+      return {current, request: identity, matchedCurrent: false};
+    }
+    const finishedAt = notice.finishedAt || new Date().toISOString();
+    const terminal = cloudTargetedPostApi.mergeRunPatch(current, {
+      status: notice.localStatus,
+      cancelRequested: true,
+      finishedAt,
+      message:
+        notice.message ||
+        (notice.localStatus === 'superseded'
+          ? '该轮巡查已由其他采集节点接力'
+          : '该轮巡查已在服务器停止'),
+      error: {
+        ...(current?.error && typeof current.error === 'object'
+          ? current.error
+          : {}),
+        code:
+          notice.reason ||
+          (notice.localStatus === 'superseded'
+            ? 'attempt_superseded'
+            : 'operator_stopped'),
+        message:
+          notice.message ||
+          (notice.localStatus === 'superseded'
+            ? '服务器已撤销该轮执行权'
+            : '服务器已停止该轮巡查'),
+        retryable: false,
+        serverTerminalStatus: notice.status,
+      },
+    });
+    const persisted = await persistTargetedPostRunRequest(terminal);
+    return {current: persisted, request: persisted, matchedCurrent: true};
+  });
+
+  if (!transition.matchedCurrent) {
+    await terminalizeCaptureTaskLedgerRun(
+      targetedPostPhysicalRunId(identity),
+      {
+        reason: notice.reason || 'attempt_superseded',
+        message:
+          notice.message || '旧巡查轮次已由服务器收口',
+        status: notice.localStatus,
+      },
+    );
+  }
+  let cleanupRequest = transition.request;
+  const exactPlatformRegistration =
+    await readExactTargetedPostPlatformTabRegistration(identity);
+  if (exactPlatformRegistration) {
+    cleanupRequest = buildTargetedPostTerminalNoticeCleanupRequest(
+      transition.request,
+      exactPlatformRegistration,
+    );
+    if (!cleanupRequest) {
+      cloudTaskAgentSyncPending = true;
+      return {
+        accepted: false,
+        cleanupPending: true,
+        reason: 'targeted_post_terminal_notice_cleanup_identity_unavailable',
+        matchedCurrent: transition.matchedCurrent,
+        request: transition.matchedCurrent
+          ? transition.request
+          : transition.current,
+        cleanup: null,
+      };
+    }
+  }
+  let cleanup;
+  try {
+    cleanup = await stopTargetedPostAttemptResources(cleanupRequest);
+  } catch (error) {
+    cloudTaskAgentSyncPending = true;
+    return {
+      accepted: false,
+      cleanupPending: true,
+      reason: 'targeted_post_terminal_notice_cleanup_pending',
+      message: String(error?.message || error || '').slice(0, 500),
+      matchedCurrent: transition.matchedCurrent,
+      request: transition.matchedCurrent
+        ? transition.request
+        : transition.current,
+      cleanup: null,
+    };
+  }
+  if (!targetedPostTerminalResourceCleanupSettled(cleanup)) {
+    cloudTaskAgentSyncPending = true;
+    return {
+      accepted: false,
+      cleanupPending: true,
+      reason: 'targeted_post_terminal_notice_cleanup_pending',
+      matchedCurrent: transition.matchedCurrent,
+      request: transition.matchedCurrent
+        ? transition.request
+        : transition.current,
+      cleanup,
+    };
+  }
+  await rememberTargetedPostTerminalNoticeAck(notice);
+  cloudTaskAgentSyncPending = true;
+  return {
+    accepted: true,
+    reason: notice.reason || notice.localStatus,
+    matchedCurrent: transition.matchedCurrent,
+    request: transition.matchedCurrent ? transition.request : transition.current,
+    cleanup,
+    ack: {
+      requestId: notice.requestId,
+      attemptId: notice.attemptId,
+      status: notice.status,
+    },
+  };
+}
+
+async function applyTargetedPostTerminalNotices(values = []) {
+  const results = [];
+  for (const value of (Array.isArray(values) ? values : []).slice(0, 50)) {
+    try {
+      results.push(await applyTargetedPostTerminalNotice(value));
+    } catch (error) {
+      results.push({
+        accepted: false,
+        reason: String(error?.code || 'targeted_post_terminal_notice_failed'),
+        message: String(error?.message || error || '').slice(0, 500),
+      });
+    }
+  }
+  return results;
 }
 
 function buildTargetedPostTaskCenterRun(request, existingRun = null) {
@@ -3207,6 +4466,1308 @@ async function persistTargetedPostRunRequest(request) {
     : await persist();
 }
 
+function isNegativePatrolWorkflow(value) {
+  return String(value?.workflow || value || '').trim() ===
+    'negative_post_patrol';
+}
+
+function negativePatrolTerminalOutboxSerializedBytes(value) {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+function negativePatrolTerminalOutboxEntryKey({
+  commandId = '',
+  requestId = '',
+  attemptId = '',
+  resultHash = '',
+} = {}) {
+  return JSON.stringify([
+    String(commandId || '').trim(),
+    String(requestId || '').trim(),
+    String(attemptId || '').trim(),
+    String(resultHash || '').trim().toLowerCase(),
+  ]);
+}
+
+function normalizeNegativePatrolTerminalCleanupRequest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const requestId = targetedPostLogicalRequestId(value);
+  const attemptId = String(value.attemptId || '').trim().slice(0, 240);
+  const cloudCommandId = String(value.cloudCommandId || '')
+    .trim()
+    .slice(0, 240);
+  const status = String(value.status || '').trim().toLowerCase().slice(0, 80);
+  if (
+    !requestId ||
+    !attemptId ||
+    !cloudCommandId ||
+    !cloudTargetedPostApi?.isTerminalRunStatus?.(status)
+  ) {
+    return null;
+  }
+  const progress =
+    value.progress &&
+    typeof value.progress === 'object' &&
+    !Array.isArray(value.progress)
+      ? value.progress
+      : {};
+  const activeUrl = String(progress.url || '').trim().slice(0, 3000);
+  const activeTarget = activeUrl
+    ? (Array.isArray(value.targets) ? value.targets : []).find(
+        (target) => String(target?.url || '').trim() === activeUrl,
+      )
+    : null;
+  return {
+    id: requestId.slice(0, 240),
+    attemptId,
+    cloudCommandId,
+    workflow: 'negative_post_patrol',
+    status,
+    platform: String(value.platform || '').trim().slice(0, 40),
+    runnerTabId: resolveCaptureTaskTabId(value.runnerTabId),
+    signalCapture: value.terminalCleanupSignalCapture === true,
+    progress: {
+      targetTabId: resolveCaptureTaskTabId(progress.targetTabId),
+      captureRequestId: String(progress.captureRequestId || '')
+        .trim()
+        .slice(0, 240),
+      url: activeUrl,
+    },
+    targets: activeUrl
+      ? [{
+          url: activeUrl,
+          externalId: String(activeTarget?.externalId || '')
+            .trim()
+            .slice(0, 500),
+        }]
+      : [],
+  };
+}
+
+function buildNegativePatrolTerminalCleanupRequest(request) {
+  if (!isNegativePatrolWorkflow(request?.workflow)) return null;
+  return normalizeNegativePatrolTerminalCleanupRequest(request);
+}
+
+function normalizeNegativePatrolStopSupersession(value, expected = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const stopCommandId = String(value.stopCommandId || '').trim();
+  const supersededCreateCommandId = String(
+    value.supersededCreateCommandId || '',
+  ).trim();
+  const requestId = String(value.requestId || '').trim();
+  const attemptId = String(value.attemptId || '').trim();
+  const result =
+    value.result && typeof value.result === 'object' &&
+    !Array.isArray(value.result)
+      ? value.result
+      : {};
+  if (
+    !stopCommandId ||
+    !supersededCreateCommandId ||
+    stopCommandId === supersededCreateCommandId ||
+    !requestId ||
+    !attemptId ||
+    value.success !== true ||
+    result.accepted !== true ||
+    String(result.requestId || '').trim() !== requestId ||
+    String(result.attemptId || '').trim() !== attemptId ||
+    (expected.commandId &&
+      supersededCreateCommandId !== String(expected.commandId).trim()) ||
+    (expected.requestId && requestId !== String(expected.requestId).trim()) ||
+    (expected.attemptId && attemptId !== String(expected.attemptId).trim())
+  ) {
+    return null;
+  }
+  return {
+    stopCommandId,
+    supersededCreateCommandId,
+    requestId,
+    attemptId,
+    success: true,
+    result: {
+      state: 'completed',
+      accepted: true,
+      reason: String(result.reason || '').trim().slice(0, 120),
+      requestId,
+      attemptId,
+      message: String(result.message || '').slice(0, 1000),
+    },
+    preparedAt: String(value.preparedAt || ''),
+    acknowledgedAt: String(value.acknowledgedAt || ''),
+    attempts: Math.max(0, Math.floor(Number(value.attempts) || 0)),
+    lastAttemptAt: String(value.lastAttemptAt || ''),
+    nextRetryAt: String(value.nextRetryAt || ''),
+    lastFailure: String(value.lastFailure || '').slice(0, 240),
+  };
+}
+
+function normalizeNegativePatrolTerminalOutboxEntry(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const commandId = String(value.commandId || '').trim();
+  const requestId = String(value.requestId || '').trim();
+  const attemptId = String(value.attemptId || '').trim();
+  const resultHash = String(value.resultHash || '').trim().toLowerCase();
+  if (
+    !commandId ||
+    !requestId ||
+    !attemptId ||
+    !/^[0-9a-f]{64}$/u.test(resultHash) ||
+    !isNegativePatrolWorkflow(value.workflow) ||
+    !value.result ||
+    typeof value.result !== 'object' ||
+    Array.isArray(value.result)
+  ) {
+    return null;
+  }
+  const key = negativePatrolTerminalOutboxEntryKey({
+    commandId,
+    requestId,
+    attemptId,
+    resultHash,
+  });
+  const lastFailure =
+    value.lastFailure &&
+    typeof value.lastFailure === 'object' &&
+    !Array.isArray(value.lastFailure)
+      ? {
+          status: Number(value.lastFailure.status) || 0,
+          reason: String(value.lastFailure.reason || '').slice(0, 240),
+          message: String(value.lastFailure.message || '').slice(0, 500),
+          details: {
+            expectedRequestId: String(
+              value.lastFailure.details?.expectedRequestId || '',
+            ).slice(0, 240),
+            expectedAttemptId: String(
+              value.lastFailure.details?.expectedAttemptId || '',
+            ).slice(0, 240),
+          },
+          at: String(value.lastFailure.at || ''),
+        }
+      : null;
+  const cleanupRequest = normalizeNegativePatrolTerminalCleanupRequest(
+    value.cleanupRequest,
+  );
+  const stopSupersession = normalizeNegativePatrolStopSupersession(
+    value.stopSupersession,
+    {commandId, requestId, attemptId},
+  );
+  return {
+    schemaVersion: NEGATIVE_PATROL_TERMINAL_OUTBOX_SCHEMA_VERSION,
+    key,
+    workflow: 'negative_post_patrol',
+    commandId,
+    requestId,
+    attemptId,
+    resultHash,
+    success: value.success === true,
+    result: value.result,
+    agentId: String(value.agentId || '').trim(),
+    storedAt: String(value.storedAt || ''),
+    updatedAt: String(value.updatedAt || value.storedAt || ''),
+    attempts: Math.max(0, Math.floor(Number(value.attempts) || 0)),
+    lastAttemptAt: String(value.lastAttemptAt || ''),
+    nextRetryAt: String(value.nextRetryAt || ''),
+    blocked: value.blocked === true,
+    blockedAt: String(value.blockedAt || ''),
+    ...(stopSupersession ? {stopSupersession} : {}),
+    supersededByStopCommandId: stopSupersession?.stopCommandId || '',
+    supersededByStopAcknowledgedAt:
+      stopSupersession?.acknowledgedAt || '',
+    ...(cleanupRequest ? {cleanupRequest} : {}),
+    completionConfirmedAt: String(value.completionConfirmedAt || ''),
+    cleanupCompletedAt: String(value.cleanupCompletedAt || ''),
+    lastFailure,
+  };
+}
+
+function normalizeNegativePatrolTerminalOutbox(value) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const entries = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(source.entries) ? source.entries : []) {
+    const entry = normalizeNegativePatrolTerminalOutboxEntry(raw);
+    if (!entry || seen.has(entry.key)) continue;
+    seen.add(entry.key);
+    entries.push(entry);
+  }
+  return {
+    schemaVersion: NEGATIVE_PATROL_TERMINAL_OUTBOX_SCHEMA_VERSION,
+    entries,
+    updatedAt: String(source.updatedAt || ''),
+  };
+}
+
+async function readNegativePatrolTerminalOutbox() {
+  const stored = await chrome.storage.local.get(
+    STORAGE_KEYS.negativePatrolTerminalOutbox,
+  );
+  return normalizeNegativePatrolTerminalOutbox(
+    stored[STORAGE_KEYS.negativePatrolTerminalOutbox],
+  );
+}
+
+async function inspectNegativePatrolTerminalOutboxCapacity() {
+  try {
+    const outbox = await readNegativePatrolTerminalOutbox();
+    const serializedBytes = negativePatrolTerminalOutboxSerializedBytes(outbox);
+    const available = Boolean(
+      outbox.entries.length < NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_ENTRIES &&
+        serializedBytes +
+          NEGATIVE_PATROL_TERMINAL_OUTBOX_ADMISSION_RESERVE_BYTES <=
+          NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_BYTES,
+    );
+    return {
+      ok: true,
+      available,
+      entryCount: outbox.entries.length,
+      serializedBytes,
+      maxEntries: NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_ENTRIES,
+      maxBytes: NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_BYTES,
+      reason: available
+        ? ''
+        : 'negative_patrol_terminal_outbox_capacity_exhausted',
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      available: false,
+      reason: 'negative_patrol_terminal_outbox_capacity_unavailable',
+      message: String(error?.message || error || '').slice(0, 500),
+    };
+  }
+}
+
+async function sha256Hex(value) {
+  if (!crypto?.subtle?.digest) {
+    const error = new Error('当前浏览器不支持终态回执哈希');
+    error.code = 'NEGATIVE_PATROL_RESULT_HASH_UNAVAILABLE';
+    throw error;
+  }
+  const bytes = new TextEncoder().encode(String(value || ''));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, '0')).join('');
+}
+
+function normalizeNegativePatrolCompletionResult(result) {
+  const normalized = JSON.parse(JSON.stringify(
+    result && typeof result === 'object' && !Array.isArray(result)
+      ? result
+      : {},
+  ));
+  delete normalized.storedAt;
+  return normalized;
+}
+
+async function buildNegativePatrolTerminalOutboxEntry({
+  commandId,
+  result,
+  agentId = '',
+  cleanupRequest = null,
+} = {}) {
+  const normalizedResult = normalizeNegativePatrolCompletionResult(result);
+  const normalizedCommandId = String(commandId || '').trim();
+  const requestId = String(normalizedResult.requestId || '').trim();
+  const attemptId = String(normalizedResult.attemptId || '').trim();
+  if (
+    !normalizedCommandId ||
+    !requestId ||
+    !attemptId ||
+    !isNegativePatrolWorkflow(normalizedResult.workflow)
+  ) {
+    return {
+      ok: false,
+      reason: 'negative_patrol_terminal_identity_incomplete',
+    };
+  }
+  const success = normalizedResult.accepted === true;
+  const hashPayload = JSON.stringify({
+    success,
+    result: normalizedResult,
+  });
+  const resultBytes = new TextEncoder().encode(
+    JSON.stringify(normalizedResult),
+  ).byteLength;
+  if (resultBytes > NEGATIVE_PATROL_TERMINAL_RESULT_MAX_BYTES) {
+    return {
+      ok: false,
+      reason: 'negative_patrol_terminal_result_too_large',
+      resultBytes,
+      maxResultBytes: NEGATIVE_PATROL_TERMINAL_RESULT_MAX_BYTES,
+    };
+  }
+  const resultHash = await sha256Hex(hashPayload);
+  const now = new Date().toISOString();
+  const entry = normalizeNegativePatrolTerminalOutboxEntry({
+    workflow: 'negative_post_patrol',
+    commandId: normalizedCommandId,
+    requestId,
+    attemptId,
+    resultHash,
+    success,
+    result: normalizedResult,
+    agentId,
+    storedAt: now,
+    updatedAt: now,
+    cleanupRequest: buildNegativePatrolTerminalCleanupRequest(cleanupRequest),
+  });
+  return entry
+    ? {ok: true, entry}
+    : {ok: false, reason: 'negative_patrol_terminal_entry_invalid'};
+}
+
+async function persistNegativePatrolTerminalOutboxEntry(entry) {
+  const normalized = normalizeNegativePatrolTerminalOutboxEntry(entry);
+  if (!normalized) {
+    return {ok: false, reason: 'negative_patrol_terminal_entry_invalid'};
+  }
+  return await runNegativePatrolTerminalOutboxMutation(async () => {
+    const current = await readNegativePatrolTerminalOutbox();
+    const existing = current.entries.find((item) => item.key === normalized.key);
+    if (existing) {
+      if (!existing.cleanupRequest && normalized.cleanupRequest) {
+        const enriched = normalizeNegativePatrolTerminalOutboxEntry({
+          ...existing,
+          cleanupRequest: normalized.cleanupRequest,
+          updatedAt: new Date().toISOString(),
+        });
+        const next = {
+          ...current,
+          entries: current.entries.map((item) =>
+            item.key === existing.key ? enriched : item),
+          updatedAt: new Date().toISOString(),
+        };
+        await runAuthoritativeControlStorageMutation(() =>
+          chrome.storage.local.set({
+            [STORAGE_KEYS.negativePatrolTerminalOutbox]: next,
+          }));
+        return {ok: true, entry: enriched, duplicate: true, enriched: true};
+      }
+      return {ok: true, entry: existing, duplicate: true};
+    }
+
+    if (current.entries.length >= NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_ENTRIES) {
+      return {
+        ok: false,
+        reason: 'negative_patrol_terminal_outbox_full',
+        entryCount: current.entries.length,
+      };
+    }
+    const now = new Date().toISOString();
+    const next = {
+      schemaVersion: NEGATIVE_PATROL_TERMINAL_OUTBOX_SCHEMA_VERSION,
+      entries: [...current.entries, normalized],
+      updatedAt: now,
+    };
+    const serializedBytes = negativePatrolTerminalOutboxSerializedBytes(next);
+    if (
+      serializedBytes >
+        NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_BYTES -
+          NEGATIVE_PATROL_TERMINAL_OUTBOX_FAILURE_RESERVE_BYTES
+    ) {
+      return {
+        ok: false,
+        reason: 'negative_patrol_terminal_outbox_too_large',
+        serializedBytes,
+      };
+    }
+    try {
+      await runAuthoritativeControlStorageMutation(
+        () => chrome.storage.local.set({
+          [STORAGE_KEYS.negativePatrolTerminalOutbox]: next,
+        }),
+        {relieveStoragePressure: true},
+      );
+      return {ok: true, entry: normalized, serializedBytes};
+    } catch (error) {
+      return {
+        ok: false,
+        reason: 'negative_patrol_terminal_outbox_write_failed',
+        message: String(error?.message || error || '').slice(0, 500),
+      };
+    }
+  });
+}
+
+function matchingNegativePatrolCompletionAcknowledgement(response, entry) {
+  const acknowledgement = response?.data?.acknowledgedCompletion;
+  return Boolean(
+    response?.ok === true &&
+      acknowledgement &&
+      String(acknowledgement.commandId || '').trim() === entry.commandId &&
+      String(acknowledgement.requestId || '').trim() === entry.requestId &&
+      String(acknowledgement.attemptId || '').trim() === entry.attemptId &&
+      String(acknowledgement.resultHash || '').trim().toLowerCase() ===
+        entry.resultHash,
+  );
+}
+
+async function removeConfirmedNegativePatrolTerminalOutboxEntry(entry) {
+  return await runNegativePatrolTerminalOutboxMutation(async () => {
+    const current = await readNegativePatrolTerminalOutbox();
+    if (!current.entries.some((item) => item.key === entry.key)) return false;
+    const next = {
+      ...current,
+      entries: current.entries.filter((item) => item.key !== entry.key),
+      updatedAt: new Date().toISOString(),
+    };
+    await runAuthoritativeControlStorageMutation(() =>
+      next.entries.length > 0
+        ? chrome.storage.local.set({
+            [STORAGE_KEYS.negativePatrolTerminalOutbox]: next,
+          })
+        : chrome.storage.local.remove(
+            STORAGE_KEYS.negativePatrolTerminalOutbox,
+          ));
+    return true;
+  });
+}
+
+async function patchNegativePatrolTerminalOutboxEntry(entry, patch = {}) {
+  const normalized = normalizeNegativePatrolTerminalOutboxEntry(entry);
+  if (!normalized) return null;
+  return await runNegativePatrolTerminalOutboxMutation(async () => {
+    const current = await readNegativePatrolTerminalOutbox();
+    const index = current.entries.findIndex((item) => item.key === normalized.key);
+    if (index < 0) return null;
+    const updated = normalizeNegativePatrolTerminalOutboxEntry({
+      ...current.entries[index],
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    });
+    if (!updated) return null;
+    const next = {
+      ...current,
+      entries: current.entries.map((item, itemIndex) =>
+        itemIndex === index ? updated : item),
+      updatedAt: new Date().toISOString(),
+    };
+    await runAuthoritativeControlStorageMutation(() =>
+      chrome.storage.local.set({
+        [STORAGE_KEYS.negativePatrolTerminalOutbox]: next,
+      }));
+    return updated;
+  });
+}
+
+function targetedPostTerminalResourceCleanupSettled(cleanup) {
+  const platformCleanup = cleanup?.platformCleanup;
+  const runnerCleanup = cleanup?.runnerCleanup;
+  const platformSettled = Boolean(
+    platformCleanup &&
+      (platformCleanup.ok !== false ||
+        platformCleanup.reason === 'targeted_post_platform_tab_identity_changed'),
+  );
+  return Boolean(
+    platformSettled &&
+      cleanup?.executionLockSettled === true &&
+      runnerCleanup &&
+      runnerCleanup.ok !== false &&
+      !runnerCleanup.warning,
+  );
+}
+
+async function completeNegativePatrolTerminalOutboxCleanup(entry) {
+  const normalized = normalizeNegativePatrolTerminalOutboxEntry(entry);
+  if (!normalized) {
+    return {ok: false, reason: 'negative_patrol_terminal_entry_invalid'};
+  }
+  if (!normalized.cleanupRequest || normalized.cleanupCompletedAt) {
+    return {
+      ok: true,
+      skipped: true,
+      cleanupCompleted: Boolean(normalized.cleanupCompletedAt),
+    };
+  }
+  if (
+    targetedPostLogicalRequestId(normalized.cleanupRequest) !==
+        normalized.requestId ||
+    String(normalized.cleanupRequest.attemptId || '').trim() !==
+        normalized.attemptId ||
+    String(normalized.cleanupRequest.cloudCommandId || '').trim() !==
+        normalized.commandId
+  ) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_terminal_cleanup_identity_mismatch',
+    };
+  }
+  let cleanup;
+  try {
+    cleanup = await stopTargetedPostAttemptResources(
+      normalized.cleanupRequest,
+      {signalCapture: normalized.cleanupRequest.signalCapture === true},
+    );
+  } catch (error) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_terminal_cleanup_pending',
+      message: String(error?.message || error || '').slice(0, 500),
+    };
+  }
+  if (!targetedPostTerminalResourceCleanupSettled(cleanup)) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_terminal_cleanup_pending',
+      cleanup,
+    };
+  }
+  const cleanupCompletedAt = new Date().toISOString();
+  const updated = await patchNegativePatrolTerminalOutboxEntry(normalized, {
+    cleanupCompletedAt,
+  });
+  return {
+    ok: true,
+    cleanupCompleted: true,
+    cleanupCompletedAt,
+    cleanup,
+    entry: updated || normalized,
+  };
+}
+
+async function rememberNegativePatrolTerminalCleanupCompleted(request, cleanup) {
+  if (
+    !isNegativePatrolWorkflow(request?.workflow) ||
+    !targetedPostTerminalResourceCleanupSettled(cleanup)
+  ) {
+    return false;
+  }
+  const commandId = String(request.cloudCommandId || '').trim();
+  const requestId = targetedPostLogicalRequestId(request);
+  const attemptId = String(request.attemptId || '').trim();
+  if (!commandId || !requestId || !attemptId) return false;
+  const outbox = await readNegativePatrolTerminalOutbox();
+  const entry = outbox.entries.find((candidate) =>
+    candidate.commandId === commandId &&
+    candidate.requestId === requestId &&
+    candidate.attemptId === attemptId);
+  if (!entry || entry.cleanupCompletedAt) return Boolean(entry);
+  return Boolean(
+    await patchNegativePatrolTerminalOutboxEntry(entry, {
+      cleanupCompletedAt: new Date().toISOString(),
+    }),
+  );
+}
+
+async function recoverNegativePatrolTerminalOutboxCleanup({limit = 4} = {}) {
+  const outbox = await readNegativePatrolTerminalOutbox();
+  const candidates = outbox.entries
+    .filter((entry) => entry.cleanupRequest && !entry.cleanupCompletedAt)
+    .slice(0, Math.max(1, Math.floor(Number(limit) || 1)));
+  const results = [];
+  for (const entry of candidates) {
+    try {
+      results.push(await completeNegativePatrolTerminalOutboxCleanup(entry));
+    } catch (error) {
+      results.push({
+        ok: false,
+        retained: true,
+        reason: 'negative_patrol_terminal_cleanup_pending',
+        message: String(error?.message || error || '').slice(0, 500),
+      });
+    }
+  }
+  return {
+    ok: results.every((result) => result?.ok === true),
+    attempted: results.length,
+    completed: results.filter((result) => result?.cleanupCompleted).length,
+    results,
+  };
+}
+
+async function rememberNegativePatrolTerminalOutboxFailure(
+  entry,
+  response,
+) {
+  return await runNegativePatrolTerminalOutboxMutation(async () => {
+    const current = await readNegativePatrolTerminalOutbox();
+    const index = current.entries.findIndex((item) => item.key === entry.key);
+    if (index < 0) return false;
+    const now = new Date();
+    const attempts = current.entries[index].attempts + 1;
+    const conflict = Number(response?.status) === 409;
+    const retryDelayMs = Math.min(
+      CLOUD_TASK_AGENT_FAILURE_BACKOFF_MAX_MS,
+      Math.round(
+        CLOUD_TASK_AGENT_FAILURE_BACKOFF_BASE_MS *
+          2 ** Math.min(attempts - 1, 5) *
+          (0.9 + Math.random() * 0.2),
+      ),
+    );
+    const updated = {
+      ...current.entries[index],
+      attempts,
+      updatedAt: now.toISOString(),
+      lastAttemptAt: now.toISOString(),
+      nextRetryAt: conflict
+        ? ''
+        : new Date(now.getTime() + retryDelayMs).toISOString(),
+      blocked: conflict,
+      blockedAt: conflict ? now.toISOString() : '',
+      lastFailure: {
+        status: Number(response?.status) || 0,
+        reason: String(
+          response?.reason ||
+            (response?.ok
+              ? 'completion_ack_missing_or_mismatched'
+              : 'negative_patrol_terminal_report_failed'),
+        ).slice(0, 240),
+        message: String(response?.message || '').slice(0, 500),
+        details: {
+          expectedRequestId: String(
+            response?.details?.expectedRequestId || '',
+          ).slice(0, 240),
+          expectedAttemptId: String(
+            response?.details?.expectedAttemptId || '',
+          ).slice(0, 240),
+        },
+        at: now.toISOString(),
+      },
+    };
+    let next = {
+      ...current,
+      entries: current.entries.map((item, itemIndex) =>
+        itemIndex === index ? updated : item),
+      updatedAt: now.toISOString(),
+    };
+    if (
+      negativePatrolTerminalOutboxSerializedBytes(next) >
+      NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_BYTES
+    ) {
+      const compactFailure = {
+        ...updated,
+        lastFailure: {
+          status: Number(response?.status) || 0,
+          reason: String(
+            response?.reason || 'negative_patrol_terminal_report_failed',
+          ).slice(0, 120),
+          message: '',
+          details: {
+            expectedRequestId: '',
+            expectedAttemptId: '',
+          },
+          at: now.toISOString(),
+        },
+      };
+      next = {
+        ...current,
+        entries: current.entries.map((item, itemIndex) =>
+          itemIndex === index ? compactFailure : item),
+        updatedAt: now.toISOString(),
+      };
+    }
+    if (
+      negativePatrolTerminalOutboxSerializedBytes(next) >
+      NEGATIVE_PATROL_TERMINAL_OUTBOX_MAX_BYTES
+    ) {
+      return false;
+    }
+    await runAuthoritativeControlStorageMutation(() =>
+      chrome.storage.local.set({
+        [STORAGE_KEYS.negativePatrolTerminalOutbox]: next,
+      }));
+    return true;
+  });
+}
+
+async function sendNegativePatrolTerminalOutboxEntry(entry, {
+  token,
+} = {}) {
+  const response = await cloudTaskAgentApi.completeCommand({
+    token,
+    commandId: entry.commandId,
+    success: entry.success,
+    result: entry.result,
+    completionIdentity: {
+      requestId: entry.requestId,
+      attemptId: entry.attemptId,
+      resultHash: entry.resultHash,
+    },
+  }).catch((error) => ({
+    ok: false,
+    reason: 'negative_patrol_terminal_report_failed',
+    message: String(error?.message || error || '').slice(0, 500),
+  }));
+  if (matchingNegativePatrolCompletionAcknowledgement(response, entry)) {
+    let confirmedEntry = null;
+    try {
+      confirmedEntry = await patchNegativePatrolTerminalOutboxEntry(entry, {
+        completionConfirmedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        confirmed: false,
+        retained: true,
+        reason: 'negative_patrol_terminal_ack_persist_failed',
+        message: String(error?.message || error || '').slice(0, 500),
+        resultHash: entry.resultHash,
+      };
+    }
+    if (!confirmedEntry) {
+      return {
+        ok: false,
+        confirmed: false,
+        retained: true,
+        reason: 'negative_patrol_terminal_ack_persist_failed',
+        resultHash: entry.resultHash,
+      };
+    }
+    const cleanup = await completeNegativePatrolTerminalOutboxCleanup(
+      confirmedEntry,
+    );
+    if (!cleanup.ok) {
+      return {
+        ...response,
+        ok: false,
+        confirmed: true,
+        retained: true,
+        cleanupPending: true,
+        reason: cleanup.reason,
+        resultHash: entry.resultHash,
+      };
+    }
+    try {
+      await removeConfirmedNegativePatrolTerminalOutboxEntry(
+        cleanup.entry || confirmedEntry,
+      );
+      return {
+        ...response,
+        confirmed: true,
+        cleanupCompleted: true,
+        cleanup: cleanup.cleanup || null,
+        resultHash: entry.resultHash,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        confirmed: true,
+        retained: true,
+        cleanupCompleted: true,
+        reason: 'negative_patrol_terminal_ack_cleanup_failed',
+        message: String(error?.message || error || '').slice(0, 500),
+        resultHash: entry.resultHash,
+      };
+    }
+  }
+  await rememberNegativePatrolTerminalOutboxFailure(entry, response)
+    .catch(() => false);
+  return {
+    ...(response && typeof response === 'object' ? response : {}),
+    ok: false,
+    confirmed: false,
+    retained: true,
+    reason: Number(response?.status) === 409
+      ? 'negative_patrol_terminal_conflict'
+      : response?.ok
+        ? 'completion_ack_missing_or_mismatched'
+        : String(
+            response?.reason || 'negative_patrol_terminal_report_failed',
+          ),
+    resultHash: entry.resultHash,
+  };
+}
+
+async function findNegativePatrolTerminalOutboxEntry({
+  commandId = '',
+  requestId = '',
+  agentId = '',
+} = {}) {
+  const normalizedCommandId = String(commandId || '').trim();
+  const normalizedRequestId = String(requestId || '').trim();
+  if (!normalizedCommandId) return null;
+  const outbox = await readNegativePatrolTerminalOutbox();
+  return outbox.entries.find((entry) =>
+    entry.commandId === normalizedCommandId &&
+    (!normalizedRequestId || entry.requestId === normalizedRequestId) &&
+    (!agentId || !entry.agentId || entry.agentId === agentId)) || null;
+}
+
+function matchingNegativePatrolStopAcknowledgement(response, expected) {
+  const acknowledgement = response?.data?.acknowledgedStop;
+  return Boolean(
+    response?.ok === true &&
+    acknowledgement &&
+    String(acknowledgement.commandId || '').trim() ===
+      String(expected?.stopCommandId || '').trim() &&
+    String(acknowledgement.supersededCreateCommandId || '').trim() ===
+      String(expected?.supersededCreateCommandId || '').trim() &&
+    String(acknowledgement.requestId || '').trim() ===
+      String(expected?.requestId || '').trim() &&
+    String(acknowledgement.attemptId || '').trim() ===
+      String(expected?.attemptId || '').trim()
+  );
+}
+
+async function prepareNegativePatrolTerminalOutboxStopSupersession({
+  stopCommandId = '',
+  supersededCreateCommandId = '',
+  requestId = '',
+  attemptId = '',
+  success = false,
+  result = null,
+} = {}) {
+  const prepared = normalizeNegativePatrolStopSupersession({
+    stopCommandId,
+    supersededCreateCommandId,
+    requestId,
+    attemptId,
+    success: success === true,
+    result,
+    preparedAt: new Date().toISOString(),
+  });
+  if (!prepared) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_stop_supersession_identity_incomplete',
+    };
+  }
+
+  const outbox = await readNegativePatrolTerminalOutbox();
+  let entry = outbox.entries.find((candidate) =>
+    candidate.commandId === prepared.supersededCreateCommandId &&
+    candidate.requestId === prepared.requestId &&
+    candidate.attemptId === prepared.attemptId) || null;
+  if (!entry) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'negative_patrol_superseded_terminal_receipt_not_found',
+    };
+  }
+  if (
+    entry.stopSupersession &&
+    (
+      entry.stopSupersession.stopCommandId !== prepared.stopCommandId ||
+      entry.stopSupersession.supersededCreateCommandId !==
+        prepared.supersededCreateCommandId ||
+      entry.stopSupersession.requestId !== prepared.requestId ||
+      entry.stopSupersession.attemptId !== prepared.attemptId
+    )
+  ) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_stop_supersession_identity_conflict',
+    };
+  }
+  const stopSupersession = entry.stopSupersession || prepared;
+  entry = await patchNegativePatrolTerminalOutboxEntry(entry, {
+    stopSupersession,
+  });
+  if (!entry) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_stop_supersession_persist_failed',
+    };
+  }
+
+  return {ok: true, prepared: true, entry};
+}
+
+async function rememberNegativePatrolStopSupersessionFailure(
+  expected,
+  response,
+) {
+  const prepared = normalizeNegativePatrolStopSupersession({
+    ...expected,
+    success: true,
+    result: expected?.result,
+  });
+  if (!prepared) return false;
+  const outbox = await readNegativePatrolTerminalOutbox();
+  const entry = outbox.entries.find((candidate) =>
+    candidate.commandId === prepared.supersededCreateCommandId &&
+    candidate.requestId === prepared.requestId &&
+    candidate.attemptId === prepared.attemptId &&
+    candidate.stopSupersession?.stopCommandId === prepared.stopCommandId) || null;
+  if (!entry || entry.stopSupersession?.acknowledgedAt) return false;
+
+  const now = new Date();
+  const attempts = entry.stopSupersession.attempts + 1;
+  const retryDelayMs = Math.min(
+    CLOUD_TASK_AGENT_FAILURE_BACKOFF_MAX_MS,
+    Math.round(
+      CLOUD_TASK_AGENT_FAILURE_BACKOFF_BASE_MS *
+        2 ** Math.min(attempts - 1, 5) *
+        (0.9 + Math.random() * 0.2),
+    ),
+  );
+  const reason = String(
+    response?.reason ||
+      (response?.ok
+        ? 'negative_patrol_stop_ack_missing_or_mismatched'
+        : 'negative_patrol_stop_report_failed'),
+  ).slice(0, 120);
+  const message = String(response?.message || '').slice(0, 100);
+  return Boolean(await patchNegativePatrolTerminalOutboxEntry(entry, {
+    stopSupersession: {
+      ...entry.stopSupersession,
+      attempts,
+      lastAttemptAt: now.toISOString(),
+      nextRetryAt: new Date(now.getTime() + retryDelayMs).toISOString(),
+      lastFailure: [reason, message].filter(Boolean).join(': ').slice(0, 240),
+    },
+  }));
+}
+
+async function settleSupersededNegativePatrolTerminalOutboxAfterStopAck(
+  expected,
+) {
+  const prepared = normalizeNegativePatrolStopSupersession({
+    ...expected,
+    success: true,
+    result: expected?.result,
+  });
+  if (!prepared) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_stop_supersession_identity_incomplete',
+    };
+  }
+  const outbox = await readNegativePatrolTerminalOutbox();
+  let entry = outbox.entries.find((candidate) =>
+    candidate.commandId === prepared.supersededCreateCommandId &&
+    candidate.requestId === prepared.requestId &&
+    candidate.attemptId === prepared.attemptId &&
+    candidate.stopSupersession?.stopCommandId === prepared.stopCommandId) || null;
+  if (!entry) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'negative_patrol_superseded_terminal_receipt_not_found',
+    };
+  }
+  const acknowledgedAt =
+    entry.stopSupersession.acknowledgedAt || new Date().toISOString();
+  entry = await patchNegativePatrolTerminalOutboxEntry(entry, {
+    blocked: false,
+    nextRetryAt: '',
+    stopSupersession: {
+      ...entry.stopSupersession,
+      acknowledgedAt,
+      nextRetryAt: '',
+      lastFailure: '',
+    },
+  });
+  if (!entry) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_stop_ack_persist_failed',
+    };
+  }
+
+  if (!entry.cleanupRequest && !entry.cleanupCompletedAt) {
+    const current = await readTargetedPostRunRequest({persistNormalized: false});
+    if (
+      current &&
+      isNegativePatrolWorkflow(current.workflow) &&
+      cloudTargetedPostApi?.isTerminalRunStatus?.(current.status) &&
+      targetedPostLogicalRequestId(current) === prepared.requestId &&
+      String(current.attemptId || '').trim() === prepared.attemptId &&
+      String(current.cloudCommandId || '').trim() ===
+        prepared.supersededCreateCommandId
+    ) {
+      entry = await patchNegativePatrolTerminalOutboxEntry(entry, {
+        cleanupRequest: buildNegativePatrolTerminalCleanupRequest(current),
+      });
+    }
+  }
+  if (!entry || (!entry.cleanupRequest && !entry.cleanupCompletedAt)) {
+    return {
+      ok: false,
+      retained: true,
+      reason: 'negative_patrol_stop_supersession_cleanup_identity_missing',
+    };
+  }
+
+  const cleanup = await completeNegativePatrolTerminalOutboxCleanup(entry);
+  if (!cleanup.ok) {
+    return {
+      ...cleanup,
+      retained: true,
+      supersededByStop: true,
+    };
+  }
+  await removeConfirmedNegativePatrolTerminalOutboxEntry(
+    cleanup.entry || entry,
+  );
+  return {
+    ok: true,
+    removed: true,
+    supersededByStop: true,
+    cleanupCompleted: true,
+    cleanup: cleanup.cleanup || null,
+  };
+}
+
+async function queueAndSendNegativePatrolTerminalResult({
+  commandId,
+  result,
+  token,
+  agentId = '',
+  cleanupRequest = null,
+} = {}) {
+  let built;
+  try {
+    built = await buildNegativePatrolTerminalOutboxEntry({
+      commandId,
+      result,
+      agentId,
+      cleanupRequest,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      reason: String(
+        error?.code || 'negative_patrol_terminal_hash_failed',
+      ),
+      message: String(error?.message || error || '').slice(0, 500),
+      outboxFailure: true,
+    };
+  }
+  if (!built.ok) return {...built, outboxFailure: true};
+  const persisted = await persistNegativePatrolTerminalOutboxEntry(built.entry);
+  if (!persisted.ok) return {...persisted, outboxFailure: true};
+  if (persisted.entry.blocked) {
+    return {
+      ok: false,
+      retained: true,
+      blocked: true,
+      reason: 'negative_patrol_terminal_conflict',
+      resultHash: persisted.entry.resultHash,
+    };
+  }
+  if (!token || !cloudTaskAgentApi?.completeCommand) {
+    return {
+      ok: false,
+      retained: true,
+      reason: token ? 'cloud_agent_unavailable' : 'missing_agent_credential',
+      resultHash: built.entry.resultHash,
+    };
+  }
+  return await sendNegativePatrolTerminalOutboxEntry(
+    persisted.entry,
+    {token},
+  );
+}
+
+async function replayNegativePatrolTerminalOutbox({
+  token,
+  agentId = '',
+  commandId = '',
+  limit = NEGATIVE_PATROL_TERMINAL_OUTBOX_REPLAY_LIMIT,
+} = {}) {
+  const cloudAvailable = Boolean(token && cloudTaskAgentApi?.completeCommand);
+  const outbox = await readNegativePatrolTerminalOutbox();
+  const now = Date.now();
+  const candidates = outbox.entries
+    .filter((entry) => {
+      if (
+        (agentId && entry.agentId && entry.agentId !== agentId) ||
+        (commandId && entry.commandId !== commandId)
+      ) {
+        return false;
+      }
+      if (
+        entry.stopSupersession?.acknowledgedAt ||
+        entry.completionConfirmedAt
+      ) {
+        return true;
+      }
+      if (entry.stopSupersession) {
+        return Boolean(
+          cloudAvailable &&
+          (
+            !entry.stopSupersession.nextRetryAt ||
+            Date.parse(entry.stopSupersession.nextRetryAt) <= now
+          )
+        );
+      }
+      return Boolean(
+        cloudAvailable &&
+        !entry.blocked &&
+        (!entry.nextRetryAt || Date.parse(entry.nextRetryAt) <= now)
+      );
+    })
+    .sort((left, right) => {
+      const priority = (entry) => {
+        if (entry.stopSupersession?.acknowledgedAt) return 0;
+        if (entry.completionConfirmedAt) return 1;
+        if (entry.stopSupersession) return 2;
+        return 3;
+      };
+      return priority(left) - priority(right);
+    })
+    .slice(0, Math.max(1, Math.floor(Number(limit) || 1)));
+  const results = [];
+  for (const entry of candidates) {
+    if (entry.stopSupersession?.acknowledgedAt) {
+      const settled =
+        await settleSupersededNegativePatrolTerminalOutboxAfterStopAck(
+          entry.stopSupersession,
+        ).catch((error) => ({
+          ok: false,
+          retained: true,
+          reason: 'negative_patrol_stop_supersession_cleanup_failed',
+          message: String(error?.message || error || '').slice(0, 500),
+        }));
+      if (!settled.ok) {
+        results.push({
+          ok: false,
+          confirmed: false,
+          retained: true,
+          cleanupPending: true,
+          supersededByStop: true,
+          stopAcknowledged: true,
+          reason: settled.reason,
+          resultHash: entry.resultHash,
+        });
+        continue;
+      }
+      results.push({
+        ok: true,
+        confirmed: true,
+        cleanupCompleted: true,
+        supersededByStop: true,
+        resultHash: entry.resultHash,
+      });
+      continue;
+    }
+    if (entry.stopSupersession) {
+      const response = await cloudTaskAgentApi.completeCommand({
+        token,
+        commandId: entry.stopSupersession.stopCommandId,
+        success: entry.stopSupersession.success,
+        result: entry.stopSupersession.result,
+      }).catch((error) => ({
+        ok: false,
+        reason: 'negative_patrol_stop_report_failed',
+        message: String(error?.message || error || '').slice(0, 500),
+      }));
+      if (
+        !matchingNegativePatrolStopAcknowledgement(
+          response,
+          entry.stopSupersession,
+        )
+      ) {
+        await rememberNegativePatrolStopSupersessionFailure(
+          entry.stopSupersession,
+          response,
+        ).catch(() => false);
+        results.push({
+          ...(response && typeof response === 'object' ? response : {}),
+          ok: false,
+          confirmed: false,
+          retained: true,
+          supersededByStop: true,
+          reason: response?.ok
+            ? 'negative_patrol_stop_ack_missing_or_mismatched'
+            : String(
+                response?.reason || 'negative_patrol_stop_report_failed',
+              ),
+          resultHash: entry.resultHash,
+        });
+        continue;
+      }
+      const settled =
+        await settleSupersededNegativePatrolTerminalOutboxAfterStopAck(
+          entry.stopSupersession,
+        ).catch((error) => ({
+          ok: false,
+          retained: true,
+          reason: 'negative_patrol_stop_supersession_cleanup_failed',
+          message: String(error?.message || error || '').slice(0, 500),
+        }));
+      results.push({
+        ...response,
+        ok: settled.ok === true,
+        confirmed: settled.ok === true,
+        retained: settled.ok !== true,
+        cleanupPending: settled.ok !== true,
+        stopAcknowledged: true,
+        supersededByStop: true,
+        reason: settled.ok
+          ? String(response?.reason || '')
+          : settled.reason,
+        resultHash: entry.resultHash,
+      });
+      continue;
+    }
+    if (entry.completionConfirmedAt) {
+      const cleanup = await completeNegativePatrolTerminalOutboxCleanup(entry);
+      if (!cleanup.ok) {
+        results.push({
+          ok: false,
+          confirmed: true,
+          retained: true,
+          cleanupPending: true,
+          reason: cleanup.reason,
+          resultHash: entry.resultHash,
+        });
+        continue;
+      }
+      await removeConfirmedNegativePatrolTerminalOutboxEntry(
+        cleanup.entry || entry,
+      );
+      results.push({
+        ok: true,
+        confirmed: true,
+        cleanupCompleted: true,
+        replayedConfirmedReceipt: true,
+        resultHash: entry.resultHash,
+      });
+      continue;
+    }
+    const cleanup = await completeNegativePatrolTerminalOutboxCleanup(entry);
+    if (!cleanup.ok) {
+      results.push({
+        ok: false,
+        confirmed: false,
+        retained: true,
+        cleanupPending: true,
+        reason: cleanup.reason,
+        resultHash: entry.resultHash,
+      });
+      continue;
+    }
+    results.push(await sendNegativePatrolTerminalOutboxEntry(
+      cleanup.entry || entry,
+      {token},
+    ));
+  }
+  const remaining = await readNegativePatrolTerminalOutbox();
+  if (results.length === 0 && !cloudAvailable) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'cloud_agent_unavailable',
+      attempted: 0,
+      confirmed: 0,
+      remaining: remaining.entries.length,
+      blocked: remaining.entries.filter((item) => item.blocked).length,
+      results,
+    };
+  }
+  return {
+    ok: results.every((item) => item?.confirmed === true),
+    attempted: results.length,
+    confirmed: results.filter((item) => item?.confirmed === true).length,
+    remaining: remaining.entries.length,
+    blocked: remaining.entries.filter((item) => item.blocked).length,
+    results,
+  };
+}
+
 async function createOrResumeTargetedPostRun(command, payload) {
   if (!cloudTargetedPostApi?.normalizeCommandPayload) {
     const error = new Error('当前扩展缺少定向作品采集协议');
@@ -3214,9 +5775,19 @@ async function createOrResumeTargetedPostRun(command, payload) {
     throw error;
   }
   const commandId = String(command?.id || '').trim();
+  const commandAttemptIdentity = String(
+    payload?.attemptIdentity ||
+      payload?.attempt_id ||
+      payload?.orchestration?.attemptIdentity ||
+      payload?.orchestration?.itemAttempts?.[0]?.attemptId ||
+      payload?.targets?.[0]?.captureTaskItemAttemptId ||
+      payload?.items?.[0]?.captureTaskItemAttemptId ||
+      '',
+  ).trim();
   const normalized = cloudTargetedPostApi.normalizeCommandPayload(payload, {
     taskId: command?.task_id || command?.client_task_id,
     clientTaskId: command?.client_task_id,
+    attemptId: commandAttemptIdentity,
   });
   const requestId = String(
     normalized.clientTaskId || normalized.taskId,
@@ -3301,6 +5872,24 @@ async function createOrResumeTargetedPostRun(command, payload) {
       return current;
     }
 
+    if (isNegativePatrolWorkflow(normalized.workflow)) {
+      const outboxCapacity =
+        await inspectNegativePatrolTerminalOutboxCapacity();
+      if (!outboxCapacity.available) {
+        await rememberCloudTaskAgentError(
+          outboxCapacity.reason ||
+            'negative_patrol_terminal_outbox_capacity_unavailable',
+        ).catch(() => {});
+        return {
+          deferred: true,
+          reason:
+            outboxCapacity.reason ||
+            'negative_patrol_terminal_outbox_capacity_unavailable',
+          outboxCapacity,
+        };
+      }
+    }
+
     if (
       current &&
       !sameRequest &&
@@ -3321,7 +5910,8 @@ async function createOrResumeTargetedPostRun(command, payload) {
     const attemptNumber = sameRequest
       ? Math.max(1, Number(current?.attemptNumber) || 1) + 1
       : 1;
-    const nextAttemptId = createUuid();
+    const nextAttemptId = String(normalized.attemptId || '').trim() ||
+      createUuid();
     let supersededRequest = null;
     if (
       sameRequest &&
@@ -3445,12 +6035,55 @@ function summarizeTargetedPostRunForCloud(request, commandId) {
   };
 }
 
-async function reportTargetedPostTerminalToCloud(request) {
+async function reportTargetedPostTerminalToCloud(
+  request,
+  {signalCapture = false} = {},
+) {
   if (
     !request ||
     !cloudTargetedPostApi?.isTerminalRunStatus?.(request.status)
   ) {
     return {ok: false, skipped: true, reason: 'targeted_post_not_terminal'};
+  }
+  if (isNegativePatrolWorkflow(request.workflow)) {
+    const commandId = String(request.cloudCommandId || '').trim();
+    if (!commandId) {
+      return {
+        ok: false,
+        skipped: true,
+        outboxFailure: true,
+        reason: 'missing_command_id',
+      };
+    }
+    const credential = await readCloudTaskAgentCredential();
+    const result = summarizeTargetedPostRunForCloud(request, commandId);
+    await rememberCloudCommandResult(commandId, result).catch(() => null);
+    const response = await queueAndSendNegativePatrolTerminalResult({
+      commandId,
+      result,
+      token: credential.token,
+      agentId: credential.id,
+      cleanupRequest: {
+        ...request,
+        terminalCleanupSignalCapture: signalCapture === true,
+      },
+    });
+    if (response?.confirmed) {
+      clearCloudTaskAgentFailureBackoff();
+      scheduleCloudTaskAgentSync('negative_patrol_terminal_confirmed', 0);
+      return response;
+    }
+    if (!response?.outboxFailure) {
+      const retryDelay = recordCloudTaskAgentFailure();
+      scheduleCloudTaskAgentSync(
+        'negative_patrol_terminal_outbox_retry',
+        retryDelay,
+      );
+    }
+    await rememberCloudTaskAgentError(
+      response?.message || response?.reason || '负面巡查终态回传待确认',
+    ).catch(() => null);
+    return response;
   }
   return await runTargetedPostRunMutation(async () => {
     const current = await readTargetedPostRunRequest({
@@ -3525,7 +6158,23 @@ async function executeCloudTargetedPostCreateCommand(
 ) {
   const commandId = String(command?.id || '').trim();
   if (commandResult?.state === 'completed') {
-    return {commandResult};
+    const current = await readTargetedPostRunRequest({
+      persistNormalized: false,
+    });
+    const requestId = String(
+      commandResult.requestId || payload?.clientTaskId || command?.client_task_id || '',
+    ).trim();
+    const attemptId = String(commandResult.attemptId || '').trim();
+    const request = Boolean(
+      current &&
+        current.id === requestId &&
+        String(current.cloudCommandId || '').trim() === commandId &&
+        (!attemptId || String(current.attemptId || '').trim() === attemptId) &&
+        cloudTargetedPostApi.isTerminalRunStatus(current.status)
+    )
+      ? current
+      : null;
+    return {commandResult, request};
   }
   let request;
   try {
@@ -3567,11 +6216,12 @@ async function executeCloudTargetedPostCreateCommand(
       commandId,
       summarizeTargetedPostRunForCloud(request, commandId),
     ),
+    request,
   };
 }
 
 async function cancelTargetedPostRunFromControl(requestId, attemptId = '') {
-  return await runTargetedPostRunMutation(async () => {
+  const transition = await runTargetedPostRunMutation(async () => {
     const request = await readTargetedPostRunRequest({
       persistNormalized: false,
     });
@@ -3605,25 +6255,298 @@ async function cancelTargetedPostRunFromControl(requestId, attemptId = '') {
         accepted: true,
         reason: 'already_terminal',
         request,
+        terminalized: false,
       };
     }
+    const negativePatrol = isNegativePatrolWorkflow(request.workflow);
     const pending = String(request.status || '') === 'pending';
     const next = cloudTargetedPostApi.mergeRunPatch(request, {
-      status: pending ? 'canceled' : 'cancel_requested',
+      status: negativePatrol || pending ? 'canceled' : 'cancel_requested',
       cancelRequested: true,
-      finishedAt: pending ? new Date().toISOString() : '',
+      finishedAt: negativePatrol || pending ? new Date().toISOString() : '',
       message: pending
         ? '定向作品任务已在执行前停止'
-        : '后台已请求停止定向作品任务，正在保留已有结果',
+        : negativePatrol
+          ? '负面帖子巡查已停止，已有结果已保留'
+          : '后台已请求停止定向作品任务，正在保留已有结果',
     });
-    await persistTargetedPostRunRequest(next);
+    const persisted = await persistTargetedPostRunRequest(next);
     return {
       matched: true,
       accepted: true,
-      reason: pending ? 'stopped_before_dispatch' : 'cancel_requested',
-      request: next,
+      reason:
+        pending
+          ? 'stopped_before_dispatch'
+          : negativePatrol
+            ? 'canceled'
+            : 'cancel_requested',
+      request: persisted,
+      terminalized: negativePatrol,
     };
   });
+  if (!transition.accepted || !transition.terminalized) {
+    return transition;
+  }
+
+  const cloudReport = await reportTargetedPostTerminalToCloud(
+    transition.request,
+    {signalCapture: true},
+  );
+  let finalRequest = transition.request;
+  if (
+    isNegativePatrolWorkflow(finalRequest?.workflow) &&
+    cloudReport?.outboxFailure === true
+  ) {
+    finalRequest = await runTargetedPostRunMutation(async () => {
+      const current = await readTargetedPostRunRequest({
+        persistNormalized: false,
+      });
+      if (!isOwnedTargetedPostAttempt(current, transition.request)) {
+        return current || transition.request;
+      }
+      return await persistTargetedPostRunRequest(
+        cloudTargetedPostApi.mergeRunPatch(current, {
+          status: 'needs_action',
+          finishedAt:
+            String(current.finishedAt || '') || new Date().toISOString(),
+          message: '巡查已停止，但终态回执无法安全落盘',
+          error: {
+            code: String(
+              cloudReport.reason ||
+                'NEGATIVE_PATROL_TERMINAL_OUTBOX_WRITE_FAILED',
+            ).toUpperCase(),
+            message: String(
+              cloudReport.message ||
+                '终态回执队列容量不足或写入失败，需要人工处理',
+            ).slice(0, 1000),
+            retryable: false,
+          },
+        }),
+      );
+    });
+  }
+  if (cloudReport?.outboxFailure === true) {
+    return {
+      ...transition,
+      request: finalRequest,
+      accepted: false,
+      reason: String(
+        cloudReport.reason || 'negative_patrol_terminal_outbox_failed',
+      ),
+      cleanup: null,
+      cloudReported: false,
+      terminalOutboxQueued: false,
+    };
+  }
+  // The negative patrol terminal payload is now either confirmed by the
+  // server or durably retained in the bounded local outbox. Only after that
+  // evidence fence may the task-owned page, lock and runner be released.
+  const cleanup =
+    cloudReport?.cleanupCompleted === true && cloudReport?.cleanup
+      ? cloudReport.cleanup
+      : await stopTargetedPostAttemptResources(
+          transition.request,
+          {signalCapture: true},
+        );
+  await rememberNegativePatrolTerminalCleanupCompleted(
+    transition.request,
+    cleanup,
+  ).catch(() => false);
+  return {
+    ...transition,
+    request: finalRequest,
+    cleanup,
+    reason: transition.reason,
+    cloudReported: isNegativePatrolWorkflow(finalRequest?.workflow)
+      ? cloudReport?.confirmed === true
+      : cloudReport?.ok === true,
+    terminalOutboxQueued: cloudReport?.retained === true,
+  };
+}
+
+async function resolveCloudTargetedPostStopAttemptId({
+  requestId = '',
+  attemptId = '',
+  legacyNegativePackStopV1 = false,
+  supersededCreateCommandId = '',
+} = {}) {
+  const explicitAttemptId = String(attemptId || '').trim();
+  if (explicitAttemptId) return explicitAttemptId;
+  const expectedRequestId = String(requestId || '').trim();
+  const expectedCreateCommandId = String(
+    supersededCreateCommandId || '',
+  ).trim();
+  // Legacy acknowledged negative-pack stop commands did not carry the server
+  // attempt id. The superseded create-command id is their explicit migration
+  // fence: infer only from the exact local negative run created by that command.
+  // Every other attempt-less targeted stop remains rejected by the normal
+  // request+attempt control path.
+  if (
+    legacyNegativePackStopV1 !== true ||
+    !expectedRequestId ||
+    !expectedCreateCommandId
+  ) {
+    return '';
+  }
+  const current = await readTargetedPostRunRequest({persistNormalized: false});
+  if (
+    !current ||
+    targetedPostLogicalRequestId(current) !== expectedRequestId ||
+    !isNegativePatrolWorkflow(current.workflow) ||
+    String(current.cloudCommandId || '').trim() !== expectedCreateCommandId
+  ) {
+    return '';
+  }
+  return String(current.attemptId || '').trim();
+}
+
+function findExactTargetedPostLedgerRun(ledger, request) {
+  const requestId = targetedPostLogicalRequestId(request);
+  const attemptId = String(request?.attemptId || '').trim();
+  const commandId = String(request?.cloudCommandId || '').trim();
+  const physicalRunId = targetedPostPhysicalRunId(request);
+  if (!requestId || !attemptId) return null;
+  return (Array.isArray(ledger?.runs) ? ledger.runs : []).find((run) => {
+    const metadata =
+      run?.metadata && typeof run.metadata === 'object' ? run.metadata : {};
+    const runAttemptId = String(
+      run?.attemptId || metadata.attemptId || '',
+    ).trim();
+    const runRequestId = String(
+      metadata.logicalRequestId ||
+        (String(run?.id || '') === physicalRunId ? requestId : run?.id) ||
+        '',
+    ).trim();
+    const runCommandId = String(metadata.cloudCommandId || '').trim();
+    const physicalRunIdMatches = String(run?.id || '') === physicalRunId;
+    return Boolean(
+      runRequestId === requestId &&
+        // A ledger written by newer clients carries an explicit attempt. Once
+        // present it is authoritative, even when a stale row accidentally
+        // retained the current physical id. Legacy rows without that field may
+        // still prove identity through the request::attempt physical id.
+        (runAttemptId ? runAttemptId === attemptId : physicalRunIdMatches) &&
+        (!runCommandId || !commandId || runCommandId === commandId)
+    );
+  }) || null;
+}
+
+async function inspectTargetedPostAttemptOwnershipEvidence(request) {
+  let tabs;
+  let lock;
+  let registration;
+  try {
+    [tabs, lock, registration] = await Promise.all([
+      chrome.tabs.query({}),
+      readStoredCaptureExecutionLock(),
+      readTargetedPostPlatformTabForAttempt(request, request),
+    ]);
+  } catch (error) {
+    return {
+      known: false,
+      reason: 'targeted_post_resource_inventory_unavailable',
+      message: String(error?.message || error || '').slice(0, 500),
+    };
+  }
+  const runnerOwned = (Array.isArray(tabs) ? tabs : []).some((tab) =>
+    isTargetedPostRunnerTabForAttempt(tab, request),
+  );
+  let platformOwned = false;
+  if (registration?.tabId) {
+    try {
+      const tab = await chrome.tabs.get(registration.tabId);
+      platformOwned = targetedPostPlatformUrlBelongsToRequest(tab?.url, request);
+      if (!platformOwned && !registration.legacy) {
+        await clearTargetedPostPlatformTabRegistration(
+          registration.sessionId,
+        ).catch(() => false);
+      }
+    } catch (_error) {
+      if (!registration.legacy) {
+        await clearTargetedPostPlatformTabRegistration(
+          registration.sessionId,
+        ).catch(() => false);
+      }
+    }
+  }
+  return {
+    known: true,
+    runnerOwned,
+    platformOwned,
+    executionLockOwned: isCaptureExecutionLockOwnedByTargetedPostAttempt(
+      lock,
+      request,
+    ),
+  };
+}
+
+async function reconcileStrandedNegativePatrolCancellation() {
+  const request = await readTargetedPostRunRequest({persistNormalized: false});
+  if (
+    !request ||
+    !isNegativePatrolWorkflow(request.workflow) ||
+    String(request.status || '').trim() !== 'cancel_requested'
+  ) {
+    return {
+      accepted: false,
+      reconciled: false,
+      reason: 'negative_patrol_cancel_reconcile_not_required',
+      request,
+    };
+  }
+  const ledger = await readTaskLedger();
+  const ledgerRun = findExactTargetedPostLedgerRun(ledger, request);
+  if (!['canceled', 'failed'].includes(String(ledgerRun?.status || '').trim())) {
+    return {
+      accepted: false,
+      reconciled: false,
+      reason: 'negative_patrol_cancel_ledger_not_terminal',
+      request,
+      ledgerRun,
+    };
+  }
+  const ownership = await inspectTargetedPostAttemptOwnershipEvidence(request);
+  if (
+    ownership.known !== true ||
+    ownership.runnerOwned ||
+    ownership.platformOwned ||
+    ownership.executionLockOwned
+  ) {
+    return {
+      accepted: false,
+      reconciled: false,
+      reason: ownership.known === true
+        ? 'negative_patrol_cancel_resources_still_owned'
+        : ownership.reason,
+      request,
+      ledgerRun,
+      ownership,
+    };
+  }
+  const latest = await readTargetedPostRunRequest({persistNormalized: false});
+  if (
+    !isOwnedTargetedPostAttempt(latest, request) ||
+    String(latest?.status || '').trim() !== 'cancel_requested'
+  ) {
+    return {
+      accepted: false,
+      reconciled: false,
+      reason: 'stale_targeted_post_attempt',
+      request: latest,
+      ledgerRun,
+      ownership,
+    };
+  }
+  const stopped = await cancelTargetedPostRunFromControl(
+    targetedPostLogicalRequestId(latest),
+    String(latest.attemptId || '').trim(),
+  );
+  return {
+    ...stopped,
+    reconciled: stopped.accepted === true,
+    ledgerRun,
+    ownership,
+  };
 }
 
 async function executeCloudTaskAgentCommand(command, token) {
@@ -3650,6 +6573,7 @@ async function executeCloudTaskAgentCommand(command, token) {
       command.client_attempt_id ||
       '',
   ).trim();
+  let negativeStopSupersession = null;
 
   if (
     commandType === 'create' &&
@@ -3669,6 +6593,77 @@ async function executeCloudTaskAgentCommand(command, token) {
   }
 
   if (commandType === 'create' && isCloudTargetedPostPayload(payload)) {
+    const targetedWorkflow = resolveCloudTargetedPostWorkflow(payload);
+    if (isNegativePatrolWorkflow(targetedWorkflow)) {
+      const credential = await readCloudTaskAgentCredential();
+      let queuedTerminal =
+        await findNegativePatrolTerminalOutboxEntry({
+          commandId,
+          requestId: String(
+            payload.clientTaskId || command.client_task_id || '',
+          ).trim(),
+          agentId: credential.id,
+        });
+      if (queuedTerminal) {
+        if (!queuedTerminal.cleanupRequest) {
+          const current = await readTargetedPostRunRequest({
+            persistNormalized: false,
+          });
+          if (
+            current &&
+            isNegativePatrolWorkflow(current.workflow) &&
+            cloudTargetedPostApi.isTerminalRunStatus(current.status) &&
+            targetedPostLogicalRequestId(current) === queuedTerminal.requestId &&
+            String(current.attemptId || '').trim() === queuedTerminal.attemptId &&
+            String(current.cloudCommandId || '').trim() === queuedTerminal.commandId
+          ) {
+            const enriched = await persistNegativePatrolTerminalOutboxEntry({
+              ...queuedTerminal,
+              cleanupRequest: buildNegativePatrolTerminalCleanupRequest(current),
+            });
+            if (enriched?.entry) queuedTerminal = enriched.entry;
+          }
+        }
+        if (queuedTerminal.blocked) {
+          return {
+            ok: false,
+            deferred: true,
+            retained: true,
+            reason: 'negative_patrol_terminal_conflict',
+            commandId,
+          };
+        }
+        if (
+          queuedTerminal.nextRetryAt &&
+          Date.parse(queuedTerminal.nextRetryAt) > Date.now()
+        ) {
+          return {
+            ok: true,
+            deferred: true,
+            retained: true,
+            reason: 'negative_patrol_terminal_retry_backoff',
+            commandId,
+          };
+        }
+        const cleanup = await completeNegativePatrolTerminalOutboxCleanup(
+          queuedTerminal,
+        );
+        if (!cleanup.ok) {
+          return {
+            ok: false,
+            deferred: true,
+            retained: true,
+            cleanupPending: true,
+            reason: cleanup.reason,
+            commandId,
+          };
+        }
+        return await sendNegativePatrolTerminalOutboxEntry(
+          cleanup.entry || queuedTerminal,
+          {token},
+        );
+      }
+    }
     const targeted = await executeCloudTargetedPostCreateCommand(
       command,
       payload,
@@ -3683,6 +6678,18 @@ async function executeCloudTaskAgentCommand(command, token) {
       };
     }
     commandResult = targeted.commandResult;
+    if (isNegativePatrolWorkflow(targetedWorkflow)) {
+      const credential = await readCloudTaskAgentCredential();
+      const report = await queueAndSendNegativePatrolTerminalResult({
+        commandId,
+        result: commandResult,
+        token,
+        agentId: credential.id,
+        cleanupRequest: targeted.request,
+      });
+      await recoverNegativePatrolTerminalOutboxCleanup().catch(() => null);
+      return report;
+    }
     return await cloudTaskAgentApi.completeCommand({
       token,
       commandId,
@@ -3935,15 +6942,25 @@ async function executeCloudTaskAgentCommand(command, token) {
     }
   } else if (commandType === 'stop') {
     if (!commandResult || commandResult.state === 'executing') {
+      const effectiveTargetedAttemptId =
+        await resolveCloudTargetedPostStopAttemptId({
+          requestId,
+          attemptId: targetedAttemptId,
+          legacyNegativePackStopV1: payload.legacyNegativePackStopV1,
+          supersededCreateCommandId: payload.supersededCreateCommandId,
+        });
       await rememberCloudCommandResult(commandId, {
         state: 'executing',
         accepted: false,
         reason: 'executing',
         requestId,
-        attemptId: targetedAttemptId,
+        attemptId: effectiveTargetedAttemptId,
       });
       const targetedStop = cloudTargetedPostApi?.mergeRunPatch
-        ? await cancelTargetedPostRunFromControl(requestId, targetedAttemptId)
+        ? await cancelTargetedPostRunFromControl(
+            requestId,
+            effectiveTargetedAttemptId,
+          )
         : {matched: false};
       const stopped = targetedStop.matched
         ? targetedStop
@@ -3951,12 +6968,41 @@ async function executeCloudTaskAgentCommand(command, token) {
             requestId,
             message: '后台远程中止当前采集任务',
           });
+      const supersededCreateCommandId = String(
+        payload.supersededCreateCommandId || '',
+      ).trim();
+      const stoppedRequest = targetedStop?.request;
+      if (
+        targetedStop.matched === true &&
+        targetedStop.accepted === true &&
+        isNegativePatrolWorkflow(stoppedRequest?.workflow) &&
+        supersededCreateCommandId &&
+        targetedPostLogicalRequestId(stoppedRequest) === requestId &&
+        String(stoppedRequest?.attemptId || '').trim() ===
+          effectiveTargetedAttemptId &&
+        String(stoppedRequest?.cloudCommandId || '').trim() ===
+          supersededCreateCommandId
+      ) {
+        negativeStopSupersession = {
+          stopCommandId: commandId,
+          supersededCreateCommandId,
+          requestId,
+          attemptId: effectiveTargetedAttemptId,
+        };
+      }
       commandResult = await rememberCloudCommandResult(commandId, {
         state: 'completed',
         accepted: stopped.accepted === true,
         reason: stopped.reason,
         requestId,
-        attemptId: targetedAttemptId,
+        attemptId: effectiveTargetedAttemptId,
+        ...(negativeStopSupersession
+          ? {
+              workflow: 'negative_post_patrol',
+              supersededCreateCommandId:
+                negativeStopSupersession.supersededCreateCommandId,
+            }
+          : {}),
         message:
           stopped.accepted === true
             ? stopped.reason === 'already_terminal'
@@ -4079,12 +7125,120 @@ async function executeCloudTaskAgentCommand(command, token) {
     }
   }
 
-  return await cloudTaskAgentApi.completeCommand({
+  if (
+    !negativeStopSupersession &&
+    commandType === 'stop' &&
+    commandResult?.accepted === true &&
+    isNegativePatrolWorkflow(commandResult?.workflow) &&
+    String(commandResult.requestId || '').trim() === requestId &&
+    String(commandResult.attemptId || '').trim() &&
+    (!targetedAttemptId ||
+      String(commandResult.attemptId || '').trim() === targetedAttemptId) &&
+    String(commandResult.supersededCreateCommandId || '').trim() ===
+      String(payload.supersededCreateCommandId || '').trim()
+  ) {
+    negativeStopSupersession = {
+      stopCommandId: commandId,
+      supersededCreateCommandId: String(
+        commandResult.supersededCreateCommandId || '',
+      ).trim(),
+      requestId,
+      attemptId: String(commandResult.attemptId || '').trim(),
+    };
+  }
+
+  let preparedStopSupersession = null;
+  if (
+    commandType === 'stop' &&
+    commandResult.accepted === true &&
+    negativeStopSupersession
+  ) {
+    const prepared =
+      await prepareNegativePatrolTerminalOutboxStopSupersession({
+        ...negativeStopSupersession,
+        success: true,
+        result: commandResult,
+      }).catch((error) => ({
+        ok: false,
+        retained: true,
+        reason: 'negative_patrol_stop_supersession_persist_failed',
+        message: String(error?.message || error || '').slice(0, 500),
+      }));
+    if (!prepared.ok) {
+      cloudTaskAgentSyncPending = true;
+      scheduleCloudTaskAgentSync(
+        'negative_patrol_stop_supersession_prepare_retry',
+        1000,
+      );
+      return {
+        ok: true,
+        deferred: true,
+        retained: true,
+        reason: prepared.reason,
+        commandId,
+      };
+    }
+    preparedStopSupersession = prepared.entry?.stopSupersession || null;
+  }
+
+  const completion = await cloudTaskAgentApi.completeCommand({
     token,
     commandId,
     success: commandResult.accepted === true,
     result: commandResult,
   });
+  if (
+    commandType === 'stop' &&
+    commandResult.accepted === true &&
+    preparedStopSupersession
+  ) {
+    if (
+      !matchingNegativePatrolStopAcknowledgement(
+        completion,
+        preparedStopSupersession,
+      )
+    ) {
+      await rememberNegativePatrolStopSupersessionFailure(
+        preparedStopSupersession,
+        completion,
+      ).catch(() => false);
+      cloudTaskAgentSyncPending = true;
+      scheduleCloudTaskAgentSync(
+        'negative_patrol_stop_ack_retry',
+        1000,
+      );
+      return {
+        ...(completion && typeof completion === 'object' ? completion : {}),
+        ok: false,
+        retained: true,
+        localCleanupPending: true,
+        localCleanupReason:
+          'negative_patrol_stop_ack_missing_or_mismatched',
+      };
+    }
+    const settled =
+      await settleSupersededNegativePatrolTerminalOutboxAfterStopAck(
+        preparedStopSupersession,
+      ).catch((error) => ({
+        ok: false,
+        retained: true,
+        reason: 'negative_patrol_stop_supersession_cleanup_failed',
+        message: String(error?.message || error || '').slice(0, 500),
+      }));
+    if (!settled.ok) {
+      cloudTaskAgentSyncPending = true;
+      scheduleCloudTaskAgentSync(
+        'negative_patrol_stop_supersession_cleanup_retry',
+        1000,
+      );
+      return {
+        ...completion,
+        localCleanupPending: true,
+        localCleanupReason: settled.reason,
+      };
+    }
+  }
+  return completion;
 }
 
 async function executeXhsSourceOpenCommand(command, payload, cachedResult) {
@@ -4189,6 +7343,14 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       console.warn('[CloudTaskAgent] local closure reconcile failed:', error);
       markDegraded('local_closure_reconcile_failed');
     });
+    await reconcileStrandedNegativePatrolCancellation().catch((error) => {
+      console.warn('[CloudTaskAgent] negative patrol cancel reconcile failed:', error);
+      markDegraded('negative_patrol_cancel_reconcile_failed');
+    });
+    await recoverNegativePatrolTerminalOutboxCleanup().catch((error) => {
+      console.warn('[CloudTaskAgent] negative patrol cleanup reconcile failed:', error);
+      markDegraded('negative_patrol_cleanup_reconcile_failed');
+    });
     let agentStatus = {};
     let agentScopeKnown = true;
     try {
@@ -4277,6 +7439,17 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
     const reportedLastError = normalizeCloudTaskAgentError(
       agentStatus.lastError || cloudTaskAgentLastError,
     );
+    let targetedPostTerminalNoticeAcks = [];
+    try {
+      targetedPostTerminalNoticeAcks =
+        await readTargetedPostTerminalNoticeAcks();
+    } catch (error) {
+      markDegraded('targeted_post_terminal_notice_ack_state_unavailable');
+      console.warn(
+        '[CloudTaskAgent] targeted terminal notice acknowledgements unavailable:',
+        error,
+      );
+    }
     const degradedLastError = degradedHealth.length > 0
       ? `LOCAL_HEARTBEAT_DEGRADED:${degradedHealth.join(',')}`
       : '';
@@ -4305,6 +7478,9 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       socialUsageEventsKnown,
       degradedHealth,
     });
+    if (targetedPostTerminalNoticeAcks.length > 0) {
+      payload.terminalNoticeAcks = targetedPostTerminalNoticeAcks;
+    }
     const response = await cloudTaskAgentApi.sendHeartbeat({
       token: credential.token,
       body: payload,
@@ -4321,6 +7497,39 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
 
     clearCloudTaskAgentFailureBackoff();
     cloudTaskAgentLastSyncAt = Date.now();
+    if (targetedPostTerminalNoticeAcks.length > 0) {
+      await clearDeliveredTargetedPostTerminalNoticeAcks(
+        targetedPostTerminalNoticeAcks,
+      ).catch((error) => {
+        console.warn(
+          '[CloudTaskAgent] terminal notice acknowledgement cleanup failed:',
+          error,
+        );
+      });
+    }
+    const targetedPostTerminalNoticeResults =
+      await applyTargetedPostTerminalNotices(response.terminalNotices);
+    if (
+      targetedPostTerminalNoticeResults.some(
+        (result) => result?.accepted === false,
+      )
+    ) {
+      markDegraded('targeted_post_terminal_notice_apply_failed');
+      cloudTaskAgentSyncPending = true;
+    }
+    const negativePatrolOutboxReplay =
+      await replayNegativePatrolTerminalOutbox({
+        token: credential.token,
+        agentId: credential.id,
+      }).catch((error) => ({
+        ok: false,
+        reason: 'negative_patrol_terminal_outbox_replay_failed',
+        message: String(error?.message || error || '').slice(0, 500),
+      }));
+    if (Number(negativePatrolOutboxReplay?.blocked) > 0) {
+      cloudTaskAgentLastError =
+        'negative_patrol_terminal_outbox_conflict_needs_action';
+    }
     // A successful heartbeat is one transaction on the server. Remember only
     // the exact terminal attempt + closure-v2 identity set that this request
     // carried, so an in-heartbeat resume command can safely reuse the receipt
@@ -6279,6 +9488,35 @@ async function releaseExactCaptureExecutionLockSnapshot(lockSnapshot) {
   return await runAuthoritativeControlStorageMutation(release);
 }
 
+function isCaptureExecutionLockOwnedByTargetedPostAttempt(lock, request) {
+  if (!lock || String(lock.owner || '') !== 'cloud_targeted_post_capture') {
+    return false;
+  }
+  const taskId = String(lock.captureTaskId || '').trim();
+  const attemptId = String(lock.captureTaskAttemptId || '').trim();
+  if (taskId || attemptId) {
+    return Boolean(
+      taskId === targetedPostPhysicalRunId(request) &&
+        attemptId === String(request?.attemptId || '').trim()
+    );
+  }
+  // v0.4.5 did not persist request/attempt on this lock. During an in-place
+  // hotfix upgrade, release that legacy lock only when its holder is the exact
+  // runner shell recorded on the still-current request. Never apply this
+  // fallback to a stale server notice after a newer attempt has taken over.
+  const holderTabId = resolveCaptureTaskTabId(lock.holderTabId);
+  const runnerTabId = resolveCaptureTaskTabId(request?.runnerTabId);
+  return Boolean(holderTabId && runnerTabId && holderTabId === runnerTabId);
+}
+
+async function releaseTargetedPostCaptureExecutionLock(request) {
+  const lock = await readStoredCaptureExecutionLock();
+  if (!isCaptureExecutionLockOwnedByTargetedPostAttempt(lock, request)) {
+    return false;
+  }
+  return await releaseExactCaptureExecutionLockSnapshot(lock);
+}
+
 function readExactUnattendedStopConfirmation(request) {
   const confirmation = request?.localClosureStopConfirmation;
   if (
@@ -7989,6 +11227,8 @@ async function bindCaptureExecutionLockToTask(
 async function acquireCaptureExecutionLock({
   owner = 'unknown',
   label = '采集任务',
+  captureTaskId = '',
+  captureTaskAttemptId = '',
   holderId = '',
   holderDocumentId = '',
   holderTabId = null,
@@ -8004,10 +11244,20 @@ async function acquireCaptureExecutionLock({
 
     const now = Date.now();
     const normalizedHolderTabId = Number(holderTabId);
+    const normalizedCaptureTaskId = String(captureTaskId || '').trim();
+    const normalizedCaptureTaskAttemptId = String(
+      captureTaskAttemptId || '',
+    ).trim();
     const lock = {
       id: createUuid(),
       owner: String(owner || 'unknown'),
       label: String(label || '采集任务'),
+      ...(normalizedCaptureTaskId
+        ? {captureTaskId: normalizedCaptureTaskId}
+        : {}),
+      ...(normalizedCaptureTaskAttemptId
+        ? {captureTaskAttemptId: normalizedCaptureTaskAttemptId}
+        : {}),
       startedAt: new Date(now).toISOString(),
       updatedAt: new Date(now).toISOString(),
       expiresAt: now + CAPTURE_EXECUTION_LOCK_LEASE_MS,
@@ -15237,6 +18487,9 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
   resetObservedAccounts
     .then(() => ensureRuntimeState())
     .then(() => retryCurrentTerminalUnattendedLocalClosure())
+    .then(() => recoverTargetedPostPlatformTabCleanup({force: true}))
+    .then(() => reconcileStrandedNegativePatrolCancellation())
+    .then(() => recoverNegativePatrolTerminalOutboxCleanup())
     .catch((error) => {
       console.error('[onstarvoice] failed to initialize runtime on install', error);
     });
@@ -15258,6 +18511,9 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
 chrome.runtime.onStartup.addListener(() => {
   ensureRuntimeState()
     .then(() => retryCurrentTerminalUnattendedLocalClosure())
+    .then(() => recoverTargetedPostPlatformTabCleanup({force: true}))
+    .then(() => reconcileStrandedNegativePatrolCancellation())
+    .then(() => recoverNegativePatrolTerminalOutboxCleanup())
     .catch((error) => {
       console.error('[onstarvoice] failed to initialize runtime on startup', error);
     });
@@ -15280,6 +18536,12 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm?.name === TARGETED_POST_PLATFORM_TAB_CLEANUP_ALARM_NAME) {
+    recoverTargetedPostPlatformTabCleanup({force: true}).catch((error) => {
+      console.error('[onstarvoice] targeted platform tab cleanup retry failed', error);
+    });
+    return;
+  }
   if (alarm?.name === UNATTENDED_LOCAL_CLOSURE_ALARM_NAME) {
     retryCurrentTerminalUnattendedLocalClosure({
       retryFailureCountFloor:
@@ -15413,6 +18675,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  forgetRemovedTargetedPostPlatformTabCleanup(tabId).catch((error) => {
+    console.warn('[onstarvoice] pending targeted platform tab cleanup failed', error);
+  });
+  forgetRemovedTargetedPostPlatformTab(tabId).catch((error) => {
+    console.warn('[onstarvoice] targeted platform tab cleanup failed', error);
+  });
   handleCaptureRuntimeTabRemoved(tabId).catch((error) => {
     console.warn('[onstarvoice] capture task tab cleanup failed', error);
   });
@@ -15621,7 +18889,86 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      if (type === 'onstarvoice:reconcile-targeted-post-run-state') {
+        const requestId = String(message?.requestId || '').trim();
+        const attemptId = String(message?.attemptId || '').trim();
+        const beforeReconcile = await readTargetedPostRunRequest({
+          persistNormalized: false,
+        });
+        if (
+          !beforeReconcile ||
+          !isNegativePatrolWorkflow(beforeReconcile.workflow)
+        ) {
+          sendResponse({
+            ok: true,
+            accepted: true,
+            reconciled: true,
+            reason: 'targeted_post_server_reconcile_not_required',
+            data: beforeReconcile,
+          });
+          return;
+        }
+        const reconciliation = await syncCloudTaskAgent({
+          reason: 'targeted_post_sidebar_reconcile',
+          force: true,
+        });
+        const request = await readTargetedPostRunRequest({
+          persistNormalized: false,
+        });
+        const reconciled = reconciliation?.ok === true;
+        if (requestId && !attemptId) {
+          sendResponse({
+            ok: false,
+            accepted: false,
+            reconciled,
+            reason: 'targeted_post_attempt_required',
+            data: request,
+          });
+          return;
+        }
+        if (
+          requestId &&
+          (!request ||
+            request.id !== requestId ||
+            String(request.attemptId || '') !== attemptId)
+        ) {
+          sendResponse({
+            ok: false,
+            accepted: false,
+            reconciled,
+            reason: 'stale_targeted_post_attempt',
+            data: request,
+          });
+          return;
+        }
+        sendResponse({
+          ok: reconciled,
+          accepted: true,
+          reconciled,
+          reason: reconciled
+            ? ''
+            : String(
+                reconciliation?.reason ||
+                  'targeted_post_server_reconcile_unavailable',
+              ),
+          data: request,
+        });
+        return;
+      }
+
       if (type === 'onstarvoice:get-targeted-post-run-state') {
+        await reconcileStrandedNegativePatrolCancellation().catch((error) => {
+          console.warn(
+            '[Background] targeted post cancel reconcile failed:',
+            error,
+          );
+        });
+        await recoverNegativePatrolTerminalOutboxCleanup().catch((error) => {
+          console.warn(
+            '[Background] targeted post cleanup reconcile failed:',
+            error,
+          );
+        });
         const request = await readTargetedPostRunRequest();
         const requestId = String(message?.requestId || '').trim();
         const attemptId = String(message?.attemptId || '').trim();
@@ -15658,6 +19005,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           accepted: true,
           reason: '',
           data: request,
+        });
+        return;
+      }
+
+      if (type === 'onstarvoice:cancel-targeted-post-run') {
+        const result = await cancelTargetedPostRunFromControl(
+          String(message?.requestId || '').trim(),
+          String(message?.attemptId || '').trim(),
+        );
+        sendResponse({
+          ok: result.accepted === true,
+          accepted: result.accepted === true,
+          matched: result.matched === true,
+          reason: result.reason,
+          data: {
+            request: result.request || null,
+            cleanup: result.cleanup || null,
+            cloudReported: result.cloudReported === true,
+            terminalOutboxQueued: result.terminalOutboxQueued === true,
+          },
         });
         return;
       }
@@ -15710,7 +19077,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           };
         });
         let cloudReport = null;
-        let runnerCleanup = null;
+        let resourceCleanup = null;
         if (
           result.ok &&
           cloudTargetedPostApi.isTerminalRunStatus(result.data?.status)
@@ -15719,16 +19086,69 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // 可能在计时器执行前休眠。直接等待指令回执，确保云端工作项、
           // 父任务和帖子可用性在同一次消息生命周期内完成结算。
           cloudReport = await reportTargetedPostTerminalToCloud(result.data);
-          // 运行页只能在终态 request 与任务账本已经原子落盘、终态报告
-          // 已完成本地记账/云端尝试之后关闭。needs_action 必须保留现场，
-          // 且清理始终按 requestId + attemptId 精确匹配任务自有 shell。
-          runnerCleanup = await closeTerminalTargetedPostRunnerTabs(
-            result.data,
-          );
+          if (
+            isNegativePatrolWorkflow(result.data?.workflow) &&
+            cloudReport?.outboxFailure === true
+          ) {
+            const failedTerminalReceipt =
+              await runTargetedPostRunMutation(async () => {
+                const current = await readTargetedPostRunRequest({
+                  persistNormalized: false,
+                });
+                if (!isOwnedTargetedPostAttempt(current, result.data)) {
+                  return current;
+                }
+                const needsAction = cloudTargetedPostApi.mergeRunPatch(
+                  current,
+                  {
+                    status: 'needs_action',
+                    finishedAt:
+                      String(current.finishedAt || '') ||
+                      new Date().toISOString(),
+                    message: '负面巡查已停止：终态回执无法安全落盘',
+                    error: {
+                      code: String(
+                        cloudReport.reason ||
+                          'NEGATIVE_PATROL_TERMINAL_OUTBOX_WRITE_FAILED',
+                      ).toUpperCase(),
+                      message: String(
+                        cloudReport.message ||
+                          '终态回执队列容量不足或写入失败，需要人工处理',
+                      ).slice(0, 1000),
+                      retryable: false,
+                    },
+                  },
+                );
+                return await persistTargetedPostRunRequest(needsAction);
+              });
+            if (failedTerminalReceipt) result.data = failedTerminalReceipt;
+            result.reason = cloudReport.reason || result.reason;
+          }
+          // 运行页只能在终态 request 与任务账本已经原子落盘、终态回执
+          // 也已确认或进入本地 outbox 后关闭。needs_action 保留平台现场，
+          // 但关闭任务自有 runner shell，避免终态执行页持续累积。
+          if (cloudReport?.outboxFailure !== true) {
+            resourceCleanup =
+              cloudReport?.cleanupCompleted === true && cloudReport?.cleanup
+                ? cloudReport.cleanup
+                : await stopTargetedPostAttemptResources(result.data);
+            await rememberNegativePatrolTerminalCleanupCompleted(
+              result.data,
+              resourceCleanup,
+            ).catch(() => false);
+          }
         }
+        const platformCleanup = resourceCleanup?.platformCleanup || null;
+        const executionLockReleased =
+          resourceCleanup?.executionLockReleased === true;
+        const runnerCleanup = resourceCleanup?.runnerCleanup || null;
         sendResponse({
           ...result,
-          cloudReported: cloudReport?.ok === true,
+          cloudReported: isNegativePatrolWorkflow(result.data?.workflow)
+            ? cloudReport?.confirmed === true
+            : cloudReport?.ok === true,
+          platformTabClosed: Number(platformCleanup?.removedCount) > 0,
+          executionLockReleased,
           runnerClosed: Number(runnerCleanup?.removedCount) > 0,
         });
         return;
@@ -15856,11 +19276,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const result = await acquireCaptureExecutionLock({
           owner: message?.owner,
           label: message?.label,
+          captureTaskId: message?.captureTaskId,
+          captureTaskAttemptId: message?.captureTaskAttemptId,
           holderId: message?.holderId,
           holderDocumentId: sender?.documentId,
           holderTabId: message?.holderTabId ?? sender?.tab?.id,
         });
         sendResponse({ ok: result.ok, data: result.lock });
+        return;
+      }
+
+      if (type === 'onstarvoice:open-targeted-post-platform-tab') {
+        const result = await openOwnedTargetedPostPlatformTab({
+          requestId: message?.requestId,
+          attemptId: message?.attemptId,
+          url: message?.url,
+        });
+        sendResponse(result);
         return;
       }
 

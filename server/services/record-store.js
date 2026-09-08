@@ -351,6 +351,55 @@ function jsonText(value, fallback) {
   return JSON.stringify(value);
 }
 
+function boundedPositiveInteger(value, fallback, maximum) {
+  const parsed = Math.floor(Number(value));
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(maximum, parsed);
+}
+
+function commentWorkflowCapacityError() {
+  const error = new Error('评论后处理队列已满，请稍后重试本条数据');
+  error.code = 'comment_workflow_capacity';
+  error.retryable = true;
+  error.statusCode = 503;
+  return error;
+}
+
+async function reserveGlobalCommentWorkflowCapacity(tx, payloadJson) {
+  const maxPending = boundedPositiveInteger(
+    process.env.COMMENT_WORKFLOW_GLOBAL_HARD_LIMIT_COUNT,
+    2_000,
+    2_000,
+  );
+  const maxPendingBytes = boundedPositiveInteger(
+    process.env.COMMENT_WORKFLOW_GLOBAL_HARD_LIMIT_BYTES,
+    256 * 1024 * 1024,
+    256 * 1024 * 1024,
+  );
+  // This one small row is the serialization point for every tenant. The
+  // observation status trigger updates it in the same transaction, so a
+  // rollback releases the reservation and concurrent tenants cannot each
+  // consume the full machine budget.
+  const capacity = await tx.queryOne(`
+    SELECT pending_count, pending_bytes,
+      pg_column_size($1::jsonb)::bigint AS incoming_bytes
+    FROM comment_workflow_capacity_budget
+    WHERE budget_key = 'global'
+    FOR UPDATE
+  `, [payloadJson]);
+  if (!capacity) throw commentWorkflowCapacityError();
+  const pendingCount = Math.max(0, Number(capacity.pending_count) || 0);
+  const pendingBytes = Math.max(0, Number(capacity.pending_bytes) || 0);
+  const incomingBytes = Math.max(0, Number(capacity.incoming_bytes) || 0);
+  if (
+    pendingCount + 1 > maxPending ||
+    pendingBytes + incomingBytes > maxPendingBytes
+  ) {
+    throw commentWorkflowCapacityError();
+  }
+  return {pendingCount, pendingBytes, incomingBytes};
+}
+
 function cleanNumber(value) {
   return parseMetricNumber(value, 0);
 }
@@ -866,6 +915,7 @@ async function insertObservation(tx, {
   commentWorkflowExpectedCount = 0,
   record,
 }) {
+  const payloadJson = jsonText(record.payload, '{}');
   const lineageContext = {
     tenantId,
     captureTaskId,
@@ -882,10 +932,76 @@ async function insertObservation(tx, {
     lineageContext,
     await loadCaptureObservationLineage(tx, lineageContext),
   );
+  const observationSourceKey = lineage?.capture_task_item_attempt_id
+    ? sha256([
+        tenantId,
+        recordId,
+        lineage.capture_task_item_attempt_id,
+      ].join('|'))
+    : '';
+  if (observationSourceKey) {
+    // The same captured item may be retried after an unknown HTTP outcome.
+    // Fence that retry before the capacity check so it reuses the durable
+    // observation instead of consuming another queue slot.
+    await tx.execute(`
+      SELECT pg_advisory_xact_lock(
+        hashtextextended('capture-observation:' || $1::text, 0)
+      )
+    `, [observationSourceKey]);
+    const existingObservation = await tx.queryOne(`
+      SELECT id, comment_workflow_status
+      FROM record_observations
+      WHERE tenant_id = $1 AND source_ingestion_key = $2
+      LIMIT 1
+    `, [tenantId, observationSourceKey]);
+    if (existingObservation) {
+      let commentWorkflowStatus =
+        existingObservation.comment_workflow_status || 'not_required';
+      if (
+        commentWorkflowStatus === 'not_required' &&
+        Math.max(0, Number(commentWorkflowExpectedCount) || 0) > 0
+      ) {
+        await reserveGlobalCommentWorkflowCapacity(tx, payloadJson);
+        const upgraded = await tx.queryOne(`
+          UPDATE record_observations
+          SET payload = $3::jsonb,
+            comment_workflow_status = 'queued',
+            comment_workflow_expected_count = $4::integer,
+            comment_workflow_processed_count = 0,
+            comment_workflow_error = '',
+            comment_workflow_finished_at = NULL,
+            comment_workflow_updated_at = now()
+          WHERE id = $1 AND tenant_id = $2
+            AND comment_workflow_status = 'not_required'
+          RETURNING comment_workflow_status
+        `, [
+          existingObservation.id,
+          tenantId,
+          payloadJson,
+          Math.max(0, Number(commentWorkflowExpectedCount) || 0),
+        ]);
+        commentWorkflowStatus =
+          upgraded?.comment_workflow_status || commentWorkflowStatus;
+      }
+      await tx.execute(
+        'UPDATE records SET latest_observation_id = $1, updated_at = now() WHERE id = $2',
+        [existingObservation.id, recordId],
+      );
+      return {
+        id: existingObservation.id,
+        reused: true,
+        commentWorkflowStatus,
+      };
+    }
+  }
+  if (Math.max(0, Number(commentWorkflowExpectedCount) || 0) > 0) {
+    await reserveGlobalCommentWorkflowCapacity(tx, payloadJson);
+  }
   const result = await tx.queryOne(`
     INSERT INTO record_observations (
       tenant_id, record_id, monitor_execution_id, source_auth_code,
       capture_task_id, capture_task_item_id, capture_task_item_attempt_id,
+      source_ingestion_key,
       comment_workflow_status, comment_workflow_expected_count,
       platform, keyword, rank_position,
       likes, comments_count, collects, shares,
@@ -893,11 +1009,12 @@ async function insertObservation(tx, {
     ) VALUES (
       $1, $2, $3, $4,
       $5, $6, $7,
-      CASE WHEN $8::integer > 0 THEN 'queued' ELSE 'not_required' END,
-      $8::integer,
-      $9, $10, $11,
-      $12, $13, $14, $15,
-      now(), $16::jsonb
+      NULLIF($8, ''),
+      CASE WHEN $9::integer > 0 THEN 'queued' ELSE 'not_required' END,
+      $9::integer,
+      $10, $11, $12,
+      $13, $14, $15, $16,
+      now(), $17::jsonb
     )
     RETURNING id
   `, [
@@ -905,10 +1022,11 @@ async function insertObservation(tx, {
     lineage?.capture_task_id || null,
     lineage?.capture_task_item_id || null,
     lineage?.capture_task_item_attempt_id || null,
+    observationSourceKey,
     Math.max(0, Number(commentWorkflowExpectedCount) || 0),
     record.platform || 'unknown', record.keyword || '', record.rank_position || null,
     cleanNumber(record.likes), cleanNumber(record.comments_count), cleanNumber(record.collects), cleanNumber(record.shares),
-    jsonText(record.payload, '{}'),
+    payloadJson,
   ]);
 
   await tx.execute(
@@ -916,7 +1034,14 @@ async function insertObservation(tx, {
     [result.id, recordId]
   );
 
-  return result.id;
+  return {
+    id: result.id,
+    reused: false,
+    commentWorkflowStatus:
+      Math.max(0, Number(commentWorkflowExpectedCount) || 0) > 0
+        ? 'queued'
+        : 'not_required',
+  };
 }
 
 async function loadOfficialAccountCandidates(tx, tenantId, monitorExecutionId) {
@@ -1160,7 +1285,7 @@ export async function upsertCapturedRecord(record, context) {
         officialAccountId: officialResolution.officialAccount?.id,
       });
 
-      const observationId = await insertObservation(tx, {
+      const observation = await insertObservation(tx, {
         tenantId,
         recordId: existing.id,
         authCode,
@@ -1192,7 +1317,9 @@ export async function upsertCapturedRecord(record, context) {
         id: existing.id,
         action: 'updated',
         businessVisibility,
-        observationId,
+        observationId: observation.id,
+        observationReused: observation.reused,
+        commentWorkflowStatus: observation.commentWorkflowStatus,
         shouldRelabel: Boolean(relabelReason),
         relabelReason,
         changedFields,
@@ -1249,7 +1376,7 @@ export async function upsertCapturedRecord(record, context) {
       businessVisibility,
     ]);
 
-    const observationId = await insertObservation(tx, {
+    const observation = await insertObservation(tx, {
       tenantId,
       recordId: inserted.id,
       authCode,
@@ -1275,7 +1402,9 @@ export async function upsertCapturedRecord(record, context) {
       id: inserted.id,
       action: 'inserted',
       businessVisibility,
-      observationId,
+      observationId: observation.id,
+      observationReused: observation.reused,
+      commentWorkflowStatus: observation.commentWorkflowStatus,
       officialContent: officialResolution.officialContent,
       officialContentSource: officialResolution.source,
     };

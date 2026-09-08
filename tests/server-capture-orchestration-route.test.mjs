@@ -47,7 +47,12 @@ test('all orchestration mutations require a tenant-scoped writer session', () =>
     const start = route.indexOf(marker);
     assert.notEqual(start, -1);
     const middleware = route.slice(start, start + 260);
-    assert.match(middleware, /requireTenantAccess/u);
+    assert.match(
+      middleware,
+      marker === "'/orchestrations/:id/stop'"
+        ? /requireCriticalTenantAccess/u
+        : /requireTenantAccess/u,
+    );
     assert.match(middleware, /requireSessionUser/u);
     assert.match(middleware, /requireTenantWriter/u);
   }
@@ -240,7 +245,7 @@ test('unattended dispatch stores either fixed assignments or an elastic cloud po
   assert.doesNotMatch(unattended, /INSERT INTO capture_task_item_attempts/u);
 });
 
-test('operator stop atomically settles the parent and disables automatic relay', () => {
+test('operator stop disables new work and waits for every delivered child', () => {
   const stop = section(
     "router.post(\n  '/orchestrations/:id/stop'",
     "router.post(\n  '/orchestrations/:id/schedule/pause'",
@@ -254,7 +259,12 @@ test('operator stop atomically settles the parent and disables automatic relay',
   assert.match(stop, /capture_orchestration_control/u);
   assert.match(route, /ORCHESTRATION_STOPPABLE_STATUSES[\s\S]*'waiting_device'/u);
   assert.match(stop, /orchestrationScheduleTemplate_stop_unsupported|orchestration_schedule_template_stop_unsupported/u);
-  assert.match(stop, /SET status = 'canceled'/u);
+  assert.match(stop, /parentAlreadyCanceled[\s\S]*existing: true/u);
+  assert.match(stop, /createNeverDelivered/u);
+  assert.match(stop, /retainedExecutionTaskIds/u);
+  assert.match(stop, /stopPendingCount = retainedExecutionTaskIds\.length/u);
+  assert.match(stop, /parentStopStatus = stopPendingCount > 0[\s\S]*'waiting_device'[\s\S]*'canceled'/u);
+  assert.match(stop, /status = CASE WHEN \$4::boolean THEN 'canceled' ELSE status END/u);
   assert.match(
     stop,
     /'completed', 'completed_with_warnings', 'skipped', 'canceled'/u,
@@ -262,9 +272,38 @@ test('operator stop atomically settles the parent and disables automatic relay',
   assert.match(stop, /'automaticRetryDisabled', true/u);
   assert.match(stop, /attention_dismissed_at = COALESCE/u);
   assert.match(stop, /orchestration_revision = orchestration_revision \+ 1/u);
-  assert.match(stop, /last_run_status = 'canceled'/u);
+  assert.match(stop, /last_run_status = \$4/u);
   assert.match(stop, /eventType: 'orchestration_stopped'/u);
   assert.match(stop, /executionTaskIds/u);
+  assert.match(stop, /'reason', CASE WHEN status = 'acknowledged'[\s\S]*'superseded_by_stop'/u);
+  assert.match(stop, /durable_attempt\.client_attempt_id/u);
+  assert.match(stop, /TARGETED_POST_TASK_TYPES\.has/u);
+  assert.match(
+    stop,
+    /\$4::boolean[\s\S]*child\.task_type = 'negative_post_patrol'[\s\S]*child\.status = 'needs_action'/u,
+  );
+  assert.match(
+    stop,
+    /legacyAttemptlessStop[\s\S]*legacyNegativePackStopV1: true[\s\S]*legacyNegativePatrolTargetCount/u,
+  );
+  assert.match(
+    stop,
+    /activeCreate\?\.payload\?\.clientTaskId[\s\S]*activeCreate\?\.payload\?\.attemptIdentity/u,
+  );
+  assert.match(
+    stop,
+    /stopIdentityUnavailable[\s\S]*stopPending: true[\s\S]*stopIdentityUnavailable: true/u,
+  );
+  assert.match(
+    stop,
+    /if \(stopCommand\)[\s\S]*supersededCreateCommandId: activeCreate\.id/u,
+  );
+  assert.match(stop, /停止请求通道繁忙/u);
+  assert.match(
+    stop,
+    /\['57014', '55P03', '40P01'\]\.includes\(error\?\.code\)[\s\S]*res\.status\(503\)/u,
+  );
+  assert.doesNotMatch(stop, /FOR UPDATE OF t\s+FOR UPDATE/u);
 });
 
 test('schedule edit updates the same template with revision protection and leaves generated runs untouched', () => {

@@ -892,15 +892,19 @@ test('guarded recovery ledger is tenant-scoped, attempt-aware and restart-safe i
   const acknowledgedCreate = await queryOne(`
     INSERT INTO capture_agent_commands (
       tenant_id, agent_id, task_id, command_type, status,
-      payload, acknowledged_at
+      payload, acknowledged_at, admitted_at
     ) VALUES (
       $1, $2, $3, 'create', 'acknowledged',
       jsonb_build_object(
         'authCodeId', $4::uuid,
         'authBindingId', $5::uuid,
-        'platform', 'douyin'
+        'platform', 'douyin',
+        'workflow', 'negative_post_patrol',
+        'targets', jsonb_build_array(jsonb_build_object(
+          'platform', 'douyin', 'externalId', $3::uuid::text
+        ))
       ),
-      now()
+      now(), now()
     )
     RETURNING id
   `, [tenant.id, agent.id, stopChild.id, authCode.id, authBinding.id]);

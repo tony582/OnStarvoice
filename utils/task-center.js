@@ -19,6 +19,7 @@
     "completed_with_failures",
     "failed",
     "canceled",
+    "superseded",
     "skipped",
   ]);
 
@@ -52,6 +53,8 @@
     cancelled: "canceled",
     canceled: "canceled",
     stopped: "canceled",
+    superseded: "superseded",
+    revoked: "superseded",
     skipped: "skipped",
     skipped_no_balance: "skipped",
   });

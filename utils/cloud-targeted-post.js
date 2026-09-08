@@ -25,6 +25,7 @@
     "completed_with_warnings",
     "failed",
     "canceled",
+    "superseded",
     "needs_action",
   ]);
   const SETTLED_TARGET_STATUSES = new Set([
@@ -33,6 +34,7 @@
     "failed",
     "skipped",
     "canceled",
+    "needs_action",
   ]);
   const ALLOWED_RUN_STATUSES = new Set([
     "pending",
@@ -834,15 +836,16 @@
       };
     }
     if (!itemResult?.ok) {
+      const error = projectCaptureFailure([itemResult, batchResult], {
+        fallbackCode: "TARGET_CAPTURE_FAILED",
+        stage: "capture",
+        fallbackMessage: "作品采集失败",
+      });
       return {
         ...base,
-        status: "failed",
+        status: error.requiresManualAction === true ? "needs_action" : "failed",
         recordIds,
-        error: projectCaptureFailure([itemResult, batchResult], {
-          fallbackCode: "TARGET_CAPTURE_FAILED",
-          stage: "capture",
-          fallbackMessage: "作品采集失败",
-        }),
+        error,
       };
     }
     if (itemResult.partial === true || itemResult.scanComplete === false) {
@@ -1111,6 +1114,9 @@
     const skippedCount = normalizedResults.filter(
       (result) => result.status === "skipped",
     ).length;
+    const manualActionCount = normalizedResults.filter(
+      (result) => result.status === "needs_action",
+    ).length;
     const unavailableCount = normalizedResults.filter(
       (result) =>
         result.businessOutcome === "post_unavailable" ||
@@ -1127,6 +1133,7 @@
       successCount,
       warningCount,
       failedCount,
+      manualActionCount,
       unavailableCount,
       capturedCount: successCount,
       skippedCount,

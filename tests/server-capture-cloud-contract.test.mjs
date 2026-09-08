@@ -26,12 +26,15 @@ import {
 } from "../server/services/capture-cloud.js";
 import {
   captureTaskBusinessRootVisibilitySql,
+  captureCommandCompletionResultSizeBytes,
   captureCreateCommandExpiryEligible,
   captureCreateCommandExpiredBeforeOpen,
   captureExecutionNeverOpened,
   captureItemRequiresLocalClosureReuseFence,
   captureAgentRemovalBlockerMessage,
   captureTaskSnapshotFingerprint,
+  clearCaptureOverviewProjectionCache,
+  countOperatorStoppedPendingChildren,
   buildSequentialSearchResumeCheckpoint,
   buildElasticRecoveryMetadata,
   classifyCaptureRecoveryDisposition,
@@ -47,8 +50,12 @@ import {
   projectElasticBootstrapPacing,
   elasticRecoveryHoldRemainingMs,
   evaluateObservedCompletionCandidate,
+  hashCaptureCommandCompletion,
   isProfilePatrolTask,
   isExplicitUserCancellationSnapshot,
+  legacyAcknowledgedNegativePatrolPackStopEligible,
+  lateStoppedNegativeCreateReceiptEligible,
+  loadCachedCaptureOverviewProjection,
   lockActiveCaptureAgentSession,
   mirrorTaskSnapshot,
   negativePatrolTargetResults,
@@ -56,6 +63,8 @@ import {
   orchestrationCheckpointInteger,
   orchestrationCheckpointTimestamp,
   orchestrationParentAcceptsProjection,
+  operatorStoppedChildRequiresSettlement,
+  projectOperatorStoppedParentState,
   projectElasticKeywordRecoveryStatus,
   projectCanceledChildItemStatus,
   reconcileAutomaticCaptureRetries,
@@ -73,6 +82,13 @@ const cronSource = await readFile(
   new URL("../server/cron.js", import.meta.url),
   "utf8",
 );
+const negativeAdmissionMigration = await readFile(
+  new URL(
+    "../server/db/migrations/079_negative_patrol_admission.sql",
+    import.meta.url,
+  ),
+  "utf8",
+);
 
 function readRouteSection(startMarker, endMarker) {
   const start = captureCloudRouteSource.indexOf(startMarker);
@@ -84,6 +100,350 @@ function readRouteSection(startMarker, endMarker) {
   assert.notEqual(end, -1, `missing route marker: ${endMarker}`);
   return captureCloudRouteSource.slice(start, end);
 }
+
+test("targeted completion receipts hash the exact bounded raw JSON", () => {
+  const raw = {status: "canceled", detail: "界".repeat(40_000)};
+  const expected = crypto.createHash("sha256")
+    .update(JSON.stringify({success: false, result: raw}))
+    .digest("hex");
+  assert.equal(hashCaptureCommandCompletion(false, raw), expected);
+  assert.equal(
+    captureCommandCompletionResultSizeBytes(raw),
+    Buffer.byteLength(JSON.stringify(raw), "utf8"),
+  );
+  assert.ok(captureCommandCompletionResultSizeBytes(raw) > 96 * 1024);
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/late-evidence-candidates'",
+  );
+  assert.match(completion, /resultSizeBytes > MAX_COMMAND_COMPLETION_RESULT_BYTES/u);
+  assert.ok(
+    completion.indexOf("resultSizeBytes >") <
+      completion.indexOf("sanitizeCloudStructuredObject(rawResultPayload)"),
+    "oversized raw results must be rejected before sanitization",
+  );
+  assert.match(completion, /acknowledgedCompletion/u);
+  assert.match(completion, /指令回执通道繁忙/u);
+});
+
+test("only an exact canceled negative create may acknowledge after stop fencing", () => {
+  const eligible = {
+    command: {
+      command_type: "create",
+      status: "expired",
+      payload: {workflow: "negative_post_patrol"},
+      result: {reason: "superseded_by_stop"},
+    },
+    task: {task_type: "negative_post_patrol"},
+    completionIdentityProvided: true,
+    result: {status: "canceled"},
+  };
+  assert.equal(lateStoppedNegativeCreateReceiptEligible(eligible), true);
+  assert.equal(lateStoppedNegativeCreateReceiptEligible({
+    ...eligible,
+    result: {status: "completed"},
+  }), false);
+  assert.equal(lateStoppedNegativeCreateReceiptEligible({
+    ...eligible,
+    command: {...eligible.command, result: {reason: "expired"}},
+  }), false);
+  assert.equal(lateStoppedNegativeCreateReceiptEligible({
+    ...eligible,
+    completionIdentityProvided: false,
+  }), false);
+});
+
+test("operator-stopped parents wait for every delivered child", () => {
+  assert.deepEqual(projectOperatorStoppedParentState(2), {
+    status: "waiting_device",
+    terminal: false,
+    phase: "stop_requested",
+    stopPendingCount: 2,
+  });
+  assert.deepEqual(projectOperatorStoppedParentState(1), {
+    status: "waiting_device",
+    terminal: false,
+    phase: "stop_requested",
+    stopPendingCount: 1,
+  });
+  assert.deepEqual(projectOperatorStoppedParentState(0), {
+    status: "canceled",
+    terminal: true,
+    phase: "canceled",
+    stopPendingCount: 0,
+  });
+
+  const stopPendingNeedsAction = {
+    status: "needs_action",
+    control_task_id: "negative-request-1",
+    metadata: {
+      attemptIdentity: "negative-attempt-1",
+      stopPending: true,
+    },
+  };
+  assert.equal(
+    operatorStoppedChildRequiresSettlement(stopPendingNeedsAction),
+    true,
+  );
+  assert.equal(
+    countOperatorStoppedPendingChildren([stopPendingNeedsAction]),
+    1,
+  );
+  assert.equal(
+    operatorStoppedChildRequiresSettlement({
+      ...stopPendingNeedsAction,
+      metadata: {
+        ...stopPendingNeedsAction.metadata,
+        terminalDisposition: "canceled",
+        stopLastFailure: {reason: "stop_command_failed"},
+      },
+    }),
+    true,
+    "a failed stop keeps the execution pending until cleanup is acknowledged",
+  );
+  assert.equal(
+    projectOperatorStoppedParentState(
+      countOperatorStoppedPendingChildren([stopPendingNeedsAction]),
+    ).status,
+    "waiting_device",
+  );
+
+  const terminalNoticePending = {
+    status: "needs_action",
+    control_task_id: "negative-request-2",
+    metadata: {
+      attemptIdentity: "negative-attempt-2",
+      terminalDisposition: "canceled",
+    },
+  };
+  assert.equal(
+    operatorStoppedChildRequiresSettlement(terminalNoticePending),
+    true,
+  );
+  assert.equal(
+    operatorStoppedChildRequiresSettlement({
+      ...terminalNoticePending,
+      metadata: {
+        ...terminalNoticePending.metadata,
+        terminalNoticeAcknowledgement: {
+          requestId: "negative-request-2",
+          attemptId: "negative-attempt-2",
+          status: "canceled",
+        },
+      },
+    }),
+    true,
+    "an acknowledgement cannot settle a child unless the child is terminal",
+  );
+  const terminalNoticeSettled = {
+    ...terminalNoticePending,
+    status: "canceled",
+    metadata: {
+      ...terminalNoticePending.metadata,
+      terminalNoticeAcknowledgement: {
+        requestId: "negative-request-2",
+        attemptId: "negative-attempt-2",
+        status: "canceled",
+      },
+    },
+  };
+  assert.equal(
+    operatorStoppedChildRequiresSettlement(terminalNoticeSettled),
+    false,
+  );
+
+  const firstSettledChild = {status: "canceled", metadata: {}};
+  assert.equal(
+    countOperatorStoppedPendingChildren([
+      firstSettledChild,
+      stopPendingNeedsAction,
+    ]),
+    1,
+    "one exact stop acknowledgement must not hide another pending child",
+  );
+  assert.equal(
+    projectOperatorStoppedParentState(
+      countOperatorStoppedPendingChildren([
+        firstSettledChild,
+        stopPendingNeedsAction,
+      ]),
+    ).status,
+    "waiting_device",
+  );
+  assert.equal(
+    countOperatorStoppedPendingChildren([
+      firstSettledChild,
+      {status: "canceled", metadata: {}},
+    ]),
+    0,
+  );
+  assert.equal(
+    projectOperatorStoppedParentState(
+      countOperatorStoppedPendingChildren([
+        firstSettledChild,
+        {status: "canceled", metadata: {}},
+      ]),
+    ).status,
+    "canceled",
+  );
+});
+
+test("operator stop fences failed stop commands until exact cleanup", () => {
+  const refresh = readRouteSection(
+    "async function refreshOrchestrationParentTask",
+    "async function projectNegativePatrolSnapshot",
+  );
+  assert.match(
+    refresh,
+    /child\.metadata->>'stopPending' = 'true'[\s\S]*child\.status NOT IN[\s\S]*'needs_action'/u,
+  );
+  assert.match(
+    refresh,
+    /terminalNoticeAcknowledgement'[\s\S]*requestId'[\s\S]*attemptId'[\s\S]*status'/u,
+  );
+
+  const heartbeatControl = readRouteSection(
+    "async function claimPriorityAgentControl",
+    "router.post('/agent/liveness'",
+  );
+  assert.match(
+    heartbeatControl,
+    /task\.metadata[\s\S]*- 'stopCommandId' - 'stopPreviousStatus'[\s\S]*- 'stopPending' - 'legacyPackStopPending'[\s\S]*terminalNoticeAcknowledgement/u,
+  );
+  assert.match(
+    heartbeatControl,
+    /GREATEST\([\s\S]*task\.finished_at[\s\S]*task\.updated_at[\s\S]*\) >= now\(\) - interval '7 days'/u,
+    "a fresh stop fallback must be delivered even when needs_action finished_at is old",
+  );
+
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/late-evidence-candidates'",
+  );
+  assert.match(
+    completion,
+    /metadata = CASE WHEN \$3::boolean[\s\S]*- 'stopPending'[\s\S]*ELSE metadata \|\| \$7::jsonb/u,
+  );
+  assert.match(
+    completion,
+    /stopPending: true,[\s\S]*stopLastFailure:[\s\S]*terminalDisposition: 'canceled'/u,
+  );
+  assert.match(
+    completion,
+    /command\.command_type === 'stop'[\s\S]*success[\s\S]*projectOrchestrationChildControlOutcome[\s\S]*status: 'canceled'/u,
+  );
+
+  const reconciliation = readRouteSection(
+    "async function expireStaleCommands",
+    "let pendingCommandReconciliation",
+  );
+  const firstStopFailure = reconciliation.indexOf(
+    "if (command.command_type === 'stop')",
+  );
+  const unavailableCommands = reconciliation.indexOf(
+    "const unavailable = await tx.queryAll",
+  );
+  const secondStopFailure = reconciliation.indexOf(
+    "if (command.command_type === 'stop')",
+    unavailableCommands,
+  );
+  const obsoleteCommands = reconciliation.indexOf(
+    "const obsolete = await tx.queryAll",
+  );
+  const expiredStop = reconciliation.slice(
+    firstStopFailure,
+    unavailableCommands,
+  );
+  const unavailableStop = reconciliation.slice(
+    secondStopFailure,
+    obsoleteCommands,
+  );
+  assert.match(
+    expiredStop,
+    /'stopPending', true[\s\S]*stop_command_expired[\s\S]*'terminalDisposition', 'canceled'/u,
+  );
+  assert.match(
+    unavailableStop,
+    /'stopPending', true[\s\S]*stop_agent_unavailable[\s\S]*'terminalDisposition', 'canceled'/u,
+  );
+  assert.doesNotMatch(
+    `${expiredStop}\n${unavailableStop}`,
+    /metadata = metadata - 'stopCommandId'/u,
+  );
+
+  const parentCascade = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf('async function cascadeStopNegativePatrolParent'),
+    captureCloudRouteSource.indexOf("router.post('/tasks/:id/stop'"),
+  );
+  assert.match(
+    parentCascade,
+    /createCommand\?\.payload\?\.clientTaskId[\s\S]*createCommand\?\.payload\?\.attemptIdentity/u,
+  );
+  assert.match(
+    parentCascade,
+    /stopIdentityUnavailable[\s\S]*stopPending: true[\s\S]*stopIdentityUnavailable: true/u,
+  );
+});
+
+test("only an exact acknowledged legacy negative pack may stop without a server attempt", () => {
+  const task = {
+    task_type: "negative_post_patrol",
+    metadata: {},
+  };
+  const command = {
+    id: "22222222-2222-4222-8222-222222222222",
+    command_type: "create",
+    status: "acknowledged",
+    payload: {
+      workflow: "negative_post_patrol",
+      clientTaskId: "11111111-1111-4111-8111-111111111111",
+      targets: [{id: "a"}, {id: "b"}],
+    },
+  };
+  const input = {
+    task,
+    command,
+    requestId: command.payload.clientTaskId,
+    attemptId: "",
+  };
+  assert.equal(
+    legacyAcknowledgedNegativePatrolPackStopEligible(input),
+    true,
+  );
+  for (const override of [
+    {attemptId: "33333333-3333-4333-8333-333333333333"},
+    {requestId: "wrong-request"},
+    {command: {...command, status: "pending"}},
+    {command: {...command, payload: {...command.payload, targets: [{}]}}},
+    {command: {
+      ...command,
+      payload: {...command.payload, perItemAdmissionV1: true},
+    }},
+    {task: {...task, task_type: "watched_content_patrol"}},
+  ]) {
+    assert.equal(
+      legacyAcknowledgedNegativePatrolPackStopEligible({
+        ...input,
+        ...override,
+      }),
+      false,
+    );
+  }
+
+  const receipt = resolveStopCommandOutcome({
+    reportedSuccess: true,
+    expectedRequestId: command.payload.clientTaskId,
+    actualRequestId: command.payload.clientTaskId,
+    expectedAttemptId: "",
+    actualAttemptId: "44444444-4444-4444-8444-444444444444",
+    supersededCreateCommandId: command.id,
+    previousStatus: "running",
+  });
+  assert.equal(receipt.success, true);
+  assert.equal(receipt.taskStatus, "canceled");
+  assert.equal(projectOperatorStoppedParentState(1).status, "waiting_device");
+  assert.equal(projectOperatorStoppedParentState(0).status, "canceled");
+});
 
 test("capture agents distinguish browser profiles while retaining their environment", () => {
   assert.deepEqual(
@@ -1995,7 +2355,7 @@ test("historical local-closure evidence never participates in Agent allocation",
     /async function loadCaptureAgentLocalClosureReuseGate/u,
   );
   const claim = readRouteSection(
-    "async function dispatchNextElasticWorkItem",
+    "export async function dispatchNextElasticWorkItem",
     "router.post('/agent/heartbeat'",
   );
   const retrySelection = readRouteSection(
@@ -2120,7 +2480,7 @@ test("late Agent heartbeat and command receipts are absorbed after retirement wi
   const completionGuard = completion.indexOf(
     "await lockActiveCaptureAgentSession(",
   );
-  const commandRead = completion.indexOf("SELECT task_id");
+  const commandRead = completion.indexOf("SELECT * FROM capture_agent_commands");
   assert.ok(completionGuard >= 0 && completionGuard < commandRead);
   assert.match(
     completion,
@@ -2171,7 +2531,9 @@ test("overview separates execution load from attention history and technical tas
 test("overview hides only exact legacy targeted mirror roots", () => {
   const assigned = captureTaskBusinessRootVisibilitySql("assigned");
   assert.match(assigned, /assigned\.client_task_id\s*=\s*[\s\S]*logicalRequestId[\s\S]*'::'[\s\S]*attemptId/u);
-  assert.match(assigned, /canonical\.id::text = assigned\.metadata->>'logicalRequestId'/u);
+  assert.match(assigned, /canonical\.id = CASE[\s\S]*logicalRequestId[\s\S]*::uuid[\s\S]*ELSE NULL/u);
+  assert.match(assigned, /\{8\}.*\{4\}.*\{4\}.*\{4\}.*\{12\}/u);
+  assert.doesNotMatch(assigned, /\[1-5\][\s\S]*\[89ab\]/u);
   assert.match(assigned, /canonical\.client_task_id = assigned\.metadata->>'logicalRequestId'/u);
   assert.match(assigned, /canonical\.origin_agent_id IS NOT DISTINCT FROM assigned\.origin_agent_id/u);
   assert.match(assigned, /canonical\.task_type = assigned\.task_type/u);
@@ -2189,6 +2551,74 @@ test("overview hides only exact legacy targeted mirror roots", () => {
     3,
     "agent load, visible task rows, and summary counts must share the filter",
   );
+});
+
+test("overview coalesces equal tenant reads and expires its display-only cache", async () => {
+  clearCaptureOverviewProjectionCache();
+  let nowMs = 1_000;
+  let loads = 0;
+  let releaseFirst;
+  const firstLoader = () => {
+    loads += 1;
+    return new Promise(resolve => {
+      releaseFirst = resolve;
+    });
+  };
+  const input = {
+    tenantId: "11111111-1111-4111-8111-111111111111",
+    limit: 100,
+    loader: firstLoader,
+    now: () => nowMs,
+  };
+  const first = loadCachedCaptureOverviewProjection(input);
+  const duplicate = loadCachedCaptureOverviewProjection(input);
+  await Promise.resolve();
+  assert.equal(loads, 1);
+  releaseFirst({agents: [], tasks: [], taskSummary: {running_tasks: 0}});
+  assert.deepEqual(await first, await duplicate);
+
+  const cached = await loadCachedCaptureOverviewProjection({
+    ...input,
+    loader: async () => {
+      loads += 1;
+      return {unexpected: true};
+    },
+  });
+  assert.equal(loads, 1);
+  assert.deepEqual(cached.agents, []);
+
+  nowMs += 1_001;
+  await loadCachedCaptureOverviewProjection({
+    ...input,
+    loader: async () => {
+      loads += 1;
+      return {agents: ["fresh"], tasks: [], taskSummary: {}};
+    },
+  });
+  assert.equal(loads, 2);
+
+  let failureLoads = 0;
+  const failureKey = {
+    tenantId: "22222222-2222-4222-8222-222222222222",
+    limit: 50,
+    now: () => nowMs,
+  };
+  await assert.rejects(loadCachedCaptureOverviewProjection({
+    ...failureKey,
+    loader: async () => {
+      failureLoads += 1;
+      throw new Error("reporting busy");
+    },
+  }), /reporting busy/u);
+  await loadCachedCaptureOverviewProjection({
+    ...failureKey,
+    loader: async () => {
+      failureLoads += 1;
+      return {agents: [], tasks: [], taskSummary: {}};
+    },
+  });
+  assert.equal(failureLoads, 2, "failed loads must never poison the short cache");
+  clearCaptureOverviewProjectionCache();
 });
 
 test("agent removal blockers explain every unsafe dependency", () => {
@@ -3039,6 +3469,76 @@ test("targeted stop commands and receipts are fenced to the current attempt", ()
     /expectedAttemptId: command\.payload\?\.attemptId[\s\S]*actualAttemptId: resultPayload\.attemptId/u,
   );
   assert.match(completion, /stop_attempt_id_mismatch/u);
+  assert.match(
+    completion,
+    /acknowledgedStop = \{[\s\S]*supersededCreateCommandId,[\s\S]*requestId:[\s\S]*attemptId:/u,
+  );
+  assert.match(
+    completion,
+    /data: \{[\s\S]*acknowledgedStop: commandResult\.acknowledgedStop/u,
+  );
+
+  const parentCascade = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf('async function cascadeStopNegativePatrolParent'),
+    captureCloudRouteSource.indexOf("router.post('/tasks/:id/stop'"),
+  );
+  assert.match(
+    parentCascade,
+    /legacyAttemptlessStop[\s\S]*legacyNegativePackStopV1: true[\s\S]*supersededCreateCommandId/u,
+  );
+  assert.match(
+    parentCascade,
+    /'failed', 'canceled', 'skipped', 'superseded'\s*\)/u,
+  );
+  assert.doesNotMatch(
+    parentCascade,
+    /'superseded', 'needs_action'/u,
+  );
+});
+
+test("parent stop and child completion share orchestration control lock order", () => {
+  const stopRoute = readRouteSection(
+    "router.post('/tasks/:id/stop'",
+    "router.get('/tasks/:id/snapshots'",
+  );
+  const controlLockIndex = stopRoute.indexOf(
+    "'capture_orchestration_control', orchestrationControlId",
+  );
+  const parentTaskLockIndex = stopRoute.indexOf('FOR UPDATE OF t');
+  assert.notEqual(controlLockIndex, -1);
+  assert.notEqual(parentTaskLockIndex, -1);
+  assert.ok(controlLockIndex < parentTaskLockIndex);
+  assert.match(
+    stopRoute,
+    /SELECT id, parent_task_id[\s\S]*stopTarget\.parent_task_id \|\| stopTarget\.id/u,
+  );
+  assert.match(
+    stopRoute,
+    /\['57014', '55P03', '40P01'\]\.includes\(err\?\.code\)[\s\S]*res\.status\(503\)/u,
+  );
+
+  const completion = readRouteSection(
+    "router.post('/agent/commands/:id/complete'",
+    "router.get('/overview'",
+  );
+  const completionControlLockIndex = completion.indexOf(
+    "'capture_orchestration_control', commandRef.parent_task_id",
+  );
+  const completionChildLockIndex = completion.indexOf(
+    '// Match heartbeat and expiry ordering: task first, then its command.',
+  );
+  assert.notEqual(completionControlLockIndex, -1);
+  assert.notEqual(completionChildLockIndex, -1);
+  assert.ok(completionControlLockIndex < completionChildLockIndex);
+  const completionParentRowLockIndex = completion.indexOf(
+    'SELECT id\n          FROM capture_tasks',
+  );
+  assert.ok(completionParentRowLockIndex > completionControlLockIndex);
+  assert.ok(completionParentRowLockIndex < completionChildLockIndex);
+  assert.match(
+    completion,
+    /\['57014', '55P03', '40P01'\]\.includes\(err\?\.code\)[\s\S]*res\.status\(503\)/u,
+  );
 });
 
 test("overview reports child-inclusive agent load but root-only task summary", () => {
@@ -3785,7 +4285,7 @@ test("remote keyword post limits are optional, normalized, and fail safely", () 
 test("remote request identity changes when only the keyword post limit changes", () => {
   const safeJsonSource = readRouteSection(
     "function safeJson(value)",
-    "function remoteTaskRequestHash(",
+    "export function hashCaptureCommandCompletion(",
   );
   const hashSource = readRouteSection(
     "function remoteTaskRequestHash(",
@@ -4277,7 +4777,8 @@ test("resource admission serializes plan and shared-host capacity before dispatc
     "async function reserveCaptureResourceAdmission",
     "function dutyRecoveryGlobalActionsEnabled",
   );
-  assert.match(admission, /pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
+  assert.match(admission, /pg_try_advisory_xact_lock\(hashtext\(\$1\), hashtext\(\$2\)\)/u);
+  assert.match(admission, /resource_admission_busy/u);
   assert.match(admission, /plan:\$\{parentTaskId\}/u);
   assert.match(admission, /host:\$\{hostLabel\}/u);
   assert.match(admission, /group:\$\{capacityGroup\}/u);
@@ -4296,6 +4797,87 @@ test("resource admission serializes plan and shared-host capacity before dispatc
   assert.match(admission, /todaySearches: counts\?\.today_searches/u);
   assert.match(admission, /expectedSearches/u);
   assert.match(admission, /dailySearchLimit: counts\?\.daily_search_limit/u);
+});
+
+test("every new negative create is one admitted post with an exact attempt", () => {
+  const claim = readRouteSection(
+    "async function dispatchNextElasticWorkItem",
+    "function legacyNegativePatrolTargetCount",
+  );
+  assert.match(claim, /itemIds: \[candidate\.item_id\]/u);
+  assert.match(claim, /attemptIdentity/u);
+  assert.match(claim, /requested_by_name, expires_at, admitted_at/u);
+  assert.match(claim, /targetedWorkflow === 'negative_post_patrol'/u);
+
+  const retry = readRouteSection(
+    "export async function dispatchCrossDeviceRetry",
+    "export async function reconcileElasticCaptureLeases",
+  );
+  assert.match(
+    retry,
+    /businessTaskType === 'negative_post_patrol'[\s\S]*retryItems\.length > 1[\s\S]*\.slice\(0, 1\)/u,
+  );
+  assert.match(
+    retry,
+    /primaryAttemptIdentity[\s\S]*attemptIdentity: primaryAttemptIdentity/u,
+  );
+  assert.match(retry, /perItemAdmissionV1: true/u);
+  assert.match(
+    retry,
+    /reserveNegativePatrolFirstAdmission\(tx,[\s\S]*requested_by_user_id, requested_by_name, admitted_at/u,
+  );
+  assert.match(
+    negativeAdmissionMigration,
+    /enforce_negative_patrol_command_admission[\s\S]*NEW\.admitted_at IS NULL OR target_count <> 1/u,
+  );
+});
+
+test("targeted terminal notices derive the durable local attempt and settle all workflows", () => {
+  const priority = readRouteSection(
+    "async function claimPriorityAgentControl",
+    "router.post('/agent/liveness'",
+  );
+  assert.match(
+    priority,
+    /NULLIF\(attempt\.client_attempt_id, ''\)[\s\S]*ORDER BY attempt\.attempt_number DESC/u,
+  );
+  for (const taskType of [
+    "negative_post_patrol",
+    "watched_content_patrol",
+    "official_account_comment_patrol",
+    "followed_creator_post_patrol",
+    "official_account_post_discovery",
+  ]) {
+    assert.match(priority, new RegExp(`'${taskType}'`, "u"));
+  }
+  assert.match(
+    priority,
+    /projectOrchestrationChildControlOutcome\(tx,[\s\S]*status: 'canceled'/u,
+  );
+});
+
+test("legacy negative packs keep admission until exact stop settlement", () => {
+  const legacy = readRouteSection(
+    "async function reconcileLegacyNegativePatrolPacksForAgent",
+    "async function claimPriorityAgentControl",
+  );
+  assert.match(
+    legacy,
+    /command\.status === 'pending'[\s\S]*admission_released_at = COALESCE\(admission_released_at, now\(\)\)/u,
+  );
+  assert.match(legacy, /'reason', 'superseded_by_stop'/u);
+  assert.match(legacy, /legacyMigrationReason', 'legacy_negative_pack_revoked'/u);
+  assert.match(legacy, /legacyNegativePackStopV1: true/u);
+  assert.match(legacy, /durableTaskAttempt\?\.client_attempt_id/u);
+  assert.equal(
+    (legacy.match(/admission_released_at = COALESCE/gu) || []).length,
+    1,
+    "only the never-delivered pending migration releases admission immediately",
+  );
+  assert.ok(
+    legacy.indexOf("admission_released_at = COALESCE") <
+      legacy.indexOf("'reason', 'superseded_by_stop'"),
+  );
 });
 
 test("duty recovery dispatch is one-item, fenced, idempotent, and auditable", () => {

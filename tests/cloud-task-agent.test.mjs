@@ -88,6 +88,10 @@ test("heartbeat mirrors the newest local tasks and marks the active control requ
 
   assert.equal(payload.agent.clientUuid, "browser-profile-a");
   assert.equal(payload.agent.capabilities.parallelSlots, 1);
+  assert.equal(
+    payload.agent.capabilities.negativePatrolTerminalReceiptV1,
+    true,
+  );
   assert.deepEqual(
     plain(payload.tasks.map(task => task.id)),
     ["task-new", "task-old"],
@@ -1212,4 +1216,75 @@ test("runtime targets select exactly one trusted production or local heartbeat o
     assert.equal(result.ok, true);
     assert.deepEqual(calls, [expectedUrl]);
   }
+});
+
+test("completeCommand sends a bounded terminal identity separately from the result", async () => {
+  const calls = [];
+  const resultHash = "a".repeat(64);
+  const response = await agent.completeCommand({
+    token: "agent-secret",
+    commandId: "negative-command-1",
+    success: true,
+    result: {
+      workflow: "negative_post_patrol",
+      requestId: "negative-request-1",
+      attemptId: "negative-attempt-1",
+    },
+    completionIdentity: {
+      requestId: "negative-request-1",
+      attemptId: "negative-attempt-1",
+      resultHash,
+    },
+    baseUrls: ["https://voice.example"],
+    fetchImpl: async (url, options) => {
+      calls.push({url, body: JSON.parse(options.body)});
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ok: true}),
+      };
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(
+    calls[0].url,
+    "https://voice.example/api/capture-cloud/agent/commands/negative-command-1/complete",
+  );
+  assert.deepEqual(calls[0].body.completionIdentity, {
+    requestId: "negative-request-1",
+    attemptId: "negative-attempt-1",
+    resultHash,
+  });
+  assert.equal(Object.hasOwn(calls[0].body.result, "resultHash"), false);
+});
+
+test("requestJson preserves bounded conflict details for terminal evidence", async () => {
+  const response = await agent.completeCommand({
+    token: "agent-secret",
+    commandId: "negative-command-conflict",
+    success: false,
+    result: {},
+    completionIdentity: {
+      requestId: "negative-request-conflict",
+      attemptId: "negative-attempt-conflict",
+      resultHash: "b".repeat(64),
+    },
+    baseUrls: ["https://voice.example"],
+    fetchImpl: async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        ok: false,
+        error: "completion_identity_conflict",
+        message: "terminal identity conflicts with saved evidence",
+        details: {field: "resultHash"},
+      }),
+    }),
+  });
+
+  assert.equal(response.ok, false);
+  assert.equal(response.status, 409);
+  assert.equal(response.reason, "completion_identity_conflict");
+  assert.deepEqual(plain(response.details), {field: "resultHash"});
 });

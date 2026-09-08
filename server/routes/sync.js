@@ -2,22 +2,27 @@ import { Router } from 'express';
 import { optionalCaptureAgent, requireAuth } from '../middleware/auth.js';
 import { labelRecord } from '../services/ai-labeler.js';
 import { upsertCapturedRecord } from '../services/record-store.js';
-import { upsertRecordComments } from '../services/comment-workflow.js';
+import {
+  reprocessPendingCommentWorkflowReceipts,
+  upsertRecordComments,
+} from '../services/comment-workflow.js';
 import {
   parseMetricNumber,
   resolveCommentCountEvidenceFromPayload,
   resolveMetricUpdateFromPayload,
 } from '../utils/metrics.js';
 import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
-import { execute, queryAll } from '../db/init.js';
+import { queryAll } from '../db/init.js';
 import {
   runProcessBackgroundWork,
   scheduleProcessBackgroundWork,
 } from '../runtime/process-background-work.js';
 
 const router = Router();
-const commentWorkflowQueue = [];
+const COMMENT_WORKFLOW_DRAIN_LIMIT = 25;
+let commentWorkflowDrainRequested = false;
 let commentWorkflowRunning = false;
+let commentWorkflowScheduled = false;
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
@@ -105,10 +110,14 @@ function queuedCommentStats(total) {
   };
 }
 
-function enqueueCommentWorkflow(task) {
-  if (typeof task !== 'function') return;
-  commentWorkflowQueue.push(task);
-  void runProcessBackgroundWork(drainCommentWorkflowQueue, {
+function enqueueCommentWorkflow() {
+  commentWorkflowDrainRequested = true;
+  if (commentWorkflowRunning || commentWorkflowScheduled) return;
+  commentWorkflowScheduled = true;
+  void runProcessBackgroundWork(async () => {
+    commentWorkflowScheduled = false;
+    await drainCommentWorkflowQueue();
+  }, {
     label: 'SyncCommentWorkflow',
   });
 }
@@ -117,16 +126,22 @@ async function drainCommentWorkflowQueue() {
   if (commentWorkflowRunning) return;
   commentWorkflowRunning = true;
   try {
-    while (commentWorkflowQueue.length > 0) {
-      const task = commentWorkflowQueue.shift();
-      try {
-        await task();
-      } catch (err) {
-        console.error('[Sync] Queued comment workflow error:', err.message);
-      }
+    commentWorkflowDrainRequested = false;
+    const summary = await reprocessPendingCommentWorkflowReceipts({
+      limit: COMMENT_WORKFLOW_DRAIN_LIMIT,
+      queuedGraceSeconds: 0,
+    });
+    // Bound one background turn. Re-queueing yields to heartbeats, stop
+    // commands and sync responses instead of draining an arbitrarily large
+    // backlog in one process callback.
+    if (summary.claimed >= COMMENT_WORKFLOW_DRAIN_LIMIT) {
+      commentWorkflowDrainRequested = true;
     }
+  } catch (err) {
+    console.error('[Sync] Persistent comment workflow drain error:', err.message);
   } finally {
     commentWorkflowRunning = false;
+    if (commentWorkflowDrainRequested) enqueueCommentWorkflow();
   }
 }
 
@@ -275,16 +290,6 @@ export function buildSyncAiJob(result = {}) {
   return null;
 }
 
-async function labelRecordsNow(jobs) {
-  for (const job of jobs) {
-    try {
-      await labelRecord(job.id, { force: job.force === true });
-    } catch (err) {
-      console.error(`[Sync] AI label error for record ${job.id}:`, err.message);
-    }
-  }
-}
-
 function queueAiJobs(jobs) {
   if (!jobs.length) return Promise.resolve();
   return scheduleProcessBackgroundWork(async () => {
@@ -310,81 +315,31 @@ async function applyCommentWorkflow(record, result, req) {
   }
 }
 
-async function updateCommentWorkflowReceipt({
-  tenantId,
-  observationId,
-  status,
-  expectedCount = 0,
-  processedCount = 0,
-  error = '',
-} = {}) {
-  const update = await execute(`
-    UPDATE record_observations
-    SET comment_workflow_status = $3,
-      comment_workflow_expected_count = GREATEST(
-        comment_workflow_expected_count,
-        $4::integer
-      ),
-      comment_workflow_processed_count = GREATEST(0, $5::integer),
-      comment_workflow_error = $6,
-      comment_workflow_started_at = CASE
-        WHEN $3 IN ('running', 'persisted', 'failed')
-          THEN COALESCE(comment_workflow_started_at, now())
-        ELSE comment_workflow_started_at
-      END,
-      comment_workflow_finished_at = CASE
-        WHEN $3 IN ('persisted', 'failed') THEN now()
-        ELSE NULL
-      END,
-      comment_workflow_updated_at = now()
-    WHERE id = $1::uuid AND tenant_id = $2
-  `, [
-    observationId,
-    tenantId,
-    status,
-    Math.max(0, Number(expectedCount) || 0),
-    Math.max(0, Number(processedCount) || 0),
-    String(error || '').slice(0, 1000),
-  ]);
-  if (update.rowCount !== 1) {
-    throw new Error('comment_workflow_observation_receipt_missing');
-  }
-}
-
-async function queueCommentWorkflow(record, result, context) {
+async function queueCommentWorkflow(record, result) {
   const total = countCommentWorkflowItems(record);
-  await updateCommentWorkflowReceipt({
-    tenantId: context.tenantId,
-    observationId: context.observationId,
-    status: 'queued',
-    expectedCount: total,
-  });
-  enqueueCommentWorkflow(async () => {
-    await updateCommentWorkflowReceipt({
-      tenantId: context.tenantId,
-      observationId: context.observationId,
-      status: 'running',
-      expectedCount: total,
-    });
-    const commentStats = await applyCommentWorkflow(record, result, context);
-    const processedCount = Math.max(
-      0,
-      Number(commentStats.inserted || 0) + Number(commentStats.updated || 0),
-    );
-    await updateCommentWorkflowReceipt({
-      tenantId: context.tenantId,
-      observationId: context.observationId,
-      status: commentStats.error ? 'failed' : 'persisted',
-      expectedCount: total,
-      processedCount,
-      error: commentStats.error || '',
-    });
+  // The observation and its queued receipt are committed atomically by
+  // upsertCapturedRecord. Do not add a second write after that transaction:
+  // losing the HTTP response between those writes would make a retry create
+  // duplicate durable work.
+  const receiptStatus = String(
+    result.commentWorkflowStatus || 'queued',
+  ).trim();
+  const receiptPending = ['queued', 'running', 'failed'].includes(
+    receiptStatus,
+  );
+  if (receiptPending) enqueueCommentWorkflow();
+  // An exact capture-attempt retry reuses the original receipt. Do not enqueue
+  // a second record-label job for the same unknown HTTP outcome.
+  if (!result.observationReused) {
     const aiJob = buildSyncAiJob(result);
-    if (aiJob && !commentStats.officialContent) {
-      await labelRecordsNow([aiJob]);
-    }
-  });
-  return queuedCommentStats(total);
+    if (aiJob) queueAiJobs([aiJob]);
+  }
+  return {
+    ...queuedCommentStats(total),
+    queued: receiptPending,
+    reused: result.observationReused === true,
+    receiptStatus,
+  };
 }
 
 async function applyOrQueueCommentWorkflow(record, result, context) {
@@ -426,7 +381,13 @@ router.post('/', requireAuth, optionalCaptureAgent, async (req, res) => {
     });
 
     const aiJob = buildSyncAiJob(result);
-    if (aiJob && !commentStats.queued && !commentStats.officialContent) queueAiJobs([aiJob]);
+    if (
+      aiJob &&
+      !result.observationReused &&
+      !commentStats.queued &&
+      !commentStats.reused &&
+      !commentStats.officialContent
+    ) queueAiJobs([aiJob]);
 
     return res.json({
       ok: true,
@@ -437,6 +398,14 @@ router.post('/', requireAuth, optionalCaptureAgent, async (req, res) => {
     });
   } catch (err) {
     console.error('[Sync] Error:', err);
+    if (err?.code === 'comment_workflow_capacity') {
+      return res.status(503).json({
+        ok: false,
+        error: 'comment_workflow_capacity',
+        message: err.message,
+        retryable: true,
+      });
+    }
     if (err?.code === 'stale_attempt') {
       return res.status(409).json({
         ok: false,
@@ -488,11 +457,19 @@ router.post('/batch', requireAuth, optionalCaptureAgent, async (req, res) => {
         commentStats,
       });
       const aiJob = buildSyncAiJob(result);
-      if (aiJob && !commentStats.queued && !commentStats.officialContent) aiJobs.push(aiJob);
+      if (
+        aiJob &&
+        !result.observationReused &&
+        !commentStats.queued &&
+        !commentStats.reused &&
+        !commentStats.officialContent
+      ) aiJobs.push(aiJob);
     } catch (err) {
       const message = err?.message || '同步失败';
-      const reason = err?.code === 'stale_attempt'
-        ? 'stale_attempt'
+      const reason = ['stale_attempt', 'comment_workflow_capacity'].includes(
+        err?.code,
+      )
+        ? err.code
         : 'server_error';
       results.push({
         ok: false,
@@ -503,6 +480,7 @@ router.post('/batch', requireAuth, optionalCaptureAgent, async (req, res) => {
         error: {
           reason,
           message,
+          retryable: err?.retryable === true,
         },
       });
     }

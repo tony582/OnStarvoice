@@ -1,8 +1,14 @@
 import crypto from 'crypto';
 import { Router } from 'express';
-import { queryAll, queryOne, withTransaction } from '../db/init.js';
+import {
+  isDbCapacityError,
+  queryAll,
+  queryOne,
+  withTransaction,
+} from '../db/init.js';
 import {
   requireCaptureAgent,
+  requireCriticalTenantAccess,
   requireSessionUser,
   requireTenantAccess,
   requireTenantWriter,
@@ -52,11 +58,17 @@ import {
 import {
   captureResourceAgentIds,
   normalizeCaptureResourcePolicy,
+  normalizeNegativePatrolAdmissionPolicy,
+  projectNegativePatrolAdmission,
   projectCaptureResourceAdmission,
 } from '../services/capture-resource-policy.js';
 
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
+const MAX_COMMAND_COMPLETION_RESULT_BYTES = 96 * 1024;
+const CAPTURE_OVERVIEW_CACHE_TTL_MS = 1_000;
+const CAPTURE_OVERVIEW_CACHE_MAX_ENTRIES = 100;
+const captureOverviewProjectionCache = new Map();
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const RECOVERABLE_STATUSES = new Set([
   'interrupted',
@@ -119,6 +131,76 @@ const CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES = new Set([
   'superseded',
   'needs_action',
 ]);
+
+function pruneCaptureOverviewProjectionCache(nowMs) {
+  for (const [key, entry] of captureOverviewProjectionCache) {
+    if (!entry.promise && entry.expiresAt <= nowMs) {
+      captureOverviewProjectionCache.delete(key);
+    }
+  }
+  while (
+    captureOverviewProjectionCache.size >=
+    CAPTURE_OVERVIEW_CACHE_MAX_ENTRIES
+  ) {
+    const settledKey = [...captureOverviewProjectionCache.entries()].find(
+      ([, entry]) => !entry.promise,
+    )?.[0];
+    const oldestKey = settledKey || captureOverviewProjectionCache.keys().next().value;
+    if (!oldestKey) break;
+    captureOverviewProjectionCache.delete(oldestKey);
+  }
+}
+
+/**
+ * Coalesce duplicate dashboard reads without letting cached data influence
+ * permissions or dispatch. Authentication runs before this helper and the key
+ * contains every input that changes the tenant-level projection.
+ */
+export async function loadCachedCaptureOverviewProjection({
+  tenantId,
+  limit,
+  loader,
+  now = Date.now,
+}) {
+  if (typeof loader !== 'function') {
+    throw new TypeError('capture_overview_loader_required');
+  }
+  const key = `${String(tenantId || '')}:${Number(limit) || 0}`;
+  const startedAt = Number(now());
+  const existing = captureOverviewProjectionCache.get(key);
+  if (existing?.promise) return existing.promise;
+  if (existing && existing.expiresAt > startedAt) return existing.value;
+  if (existing) captureOverviewProjectionCache.delete(key);
+  pruneCaptureOverviewProjectionCache(startedAt);
+
+  const promise = Promise.resolve().then(loader);
+  captureOverviewProjectionCache.set(key, {
+    promise,
+    createdAt: startedAt,
+    expiresAt: 0,
+  });
+  try {
+    const value = await promise;
+    if (captureOverviewProjectionCache.get(key)?.promise === promise) {
+      captureOverviewProjectionCache.set(key, {
+        promise: null,
+        value,
+        createdAt: startedAt,
+        expiresAt: Number(now()) + CAPTURE_OVERVIEW_CACHE_TTL_MS,
+      });
+    }
+    return value;
+  } catch (err) {
+    if (captureOverviewProjectionCache.get(key)?.promise === promise) {
+      captureOverviewProjectionCache.delete(key);
+    }
+    throw err;
+  }
+}
+
+export function clearCaptureOverviewProjectionCache() {
+  captureOverviewProjectionCache.clear();
+}
 // One normal execution plus one different-Agent relay. More generations make
 // a congested host or weak network noisier without improving the real result.
 const AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT = 2;
@@ -197,10 +279,13 @@ async function reserveCaptureResourceAdmission(tx, {
       : []),
   ].sort((left, right) => left.localeCompare(right));
   for (const lockKey of lockKeys) {
-    await tx.execute(
-      'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+    const lock = await tx.queryOne(
+      'SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS locked',
       ['capture_resource_admission', `${tenantId}:${lockKey}`],
     );
+    if (lock?.locked !== true) {
+      return {allowed: false, reason: 'resource_admission_busy'};
+    }
   }
   const usagePlatform = text(platform, 40).toLowerCase();
   const counts = await tx.queryOne(`
@@ -296,6 +381,107 @@ async function reserveCaptureResourceAdmission(tx, {
     todaySearches: counts?.today_searches,
     expectedSearches,
     dailySearchLimit: counts?.daily_search_limit,
+  });
+}
+
+async function reserveNegativePatrolFirstAdmission(tx, {tenantId} = {}) {
+  const globalLock = await tx.queryOne(`
+    SELECT pg_try_advisory_xact_lock(
+      hashtext('negative_patrol_admission'),
+      hashtext('global')
+    ) AS locked
+  `);
+  if (globalLock?.locked !== true) {
+    return {allowed: false, reason: 'admission_lock_busy', retryAfterMs: 1000};
+  }
+  const tenantLock = await tx.queryOne(`
+    SELECT pg_try_advisory_xact_lock(
+      hashtext('negative_patrol_admission'),
+      hashtext($1)
+    ) AS locked
+  `, [tenantId]);
+  if (tenantLock?.locked !== true) {
+    return {allowed: false, reason: 'admission_lock_busy', retryAfterMs: 1000};
+  }
+
+  const snapshot = await tx.queryOne(`
+    WITH active AS (
+      SELECT DISTINCT command.tenant_id, command.task_id
+      FROM capture_agent_commands command
+      JOIN capture_tasks task
+        ON task.id = command.task_id
+        AND task.tenant_id = command.tenant_id
+      WHERE command.command_type = 'create'
+        AND command.payload->>'workflow' = 'negative_post_patrol'
+        AND command.admitted_at IS NOT NULL
+        AND command.admission_released_at IS NULL
+        AND task.status NOT IN (
+          'completed', 'completed_with_warnings', 'completed_with_failures',
+          'failed', 'canceled', 'skipped', 'superseded', 'needs_action'
+        )
+    ), latest AS (
+      SELECT
+        MAX(command.admitted_at) AS global_admitted_at,
+        MAX(command.admitted_at) FILTER (
+          WHERE command.tenant_id = $1
+        ) AS tenant_admitted_at
+      FROM capture_agent_commands command
+      WHERE command.command_type = 'create'
+        AND command.payload->>'workflow' = 'negative_post_patrol'
+        AND command.admitted_at IS NOT NULL
+    ), post_processing AS (
+      SELECT budget_key, pending_count, pending_bytes
+      FROM comment_workflow_capacity_budget
+      WHERE budget_key = 'global'
+    )
+    SELECT
+      (SELECT COUNT(*)::integer FROM active) AS global_active,
+      (
+        SELECT COUNT(*)::integer FROM active WHERE tenant_id = $1
+      ) AS tenant_active,
+      latest.global_admitted_at,
+      latest.tenant_admitted_at,
+      COALESCE(post_processing.pending_count, 0)
+        AS post_processing_pending_count,
+      COALESCE(post_processing.pending_bytes, 0)
+        AS post_processing_pending_bytes,
+      post_processing.budget_key IS NOT NULL AS post_processing_observed,
+      EXISTS (
+        SELECT 1
+        FROM capture_agent_commands legacy_command
+        JOIN capture_tasks legacy_task
+          ON legacy_task.id = legacy_command.task_id
+          AND legacy_task.tenant_id = legacy_command.tenant_id
+        WHERE legacy_command.command_type = 'create'
+          AND legacy_command.payload->>'workflow' = 'negative_post_patrol'
+          AND legacy_command.admitted_at IS NOT NULL
+          AND legacy_command.admission_released_at IS NULL
+          AND legacy_task.status NOT IN (
+            'completed', 'completed_with_warnings',
+            'completed_with_failures', 'failed', 'canceled', 'skipped',
+            'superseded', 'needs_action'
+          )
+          AND (
+            legacy_task.metadata->>'perItemAdmissionV1' IS DISTINCT FROM 'true'
+            OR CASE
+              WHEN jsonb_typeof(legacy_command.payload->'targets') = 'array'
+              THEN jsonb_array_length(legacy_command.payload->'targets')
+              ELSE 0
+            END > 1
+          )
+      ) AS legacy_active_pack
+    FROM latest LEFT JOIN post_processing ON true
+  `, [tenantId]);
+  return projectNegativePatrolAdmission({
+    policy: normalizeNegativePatrolAdmissionPolicy(),
+    globalActive: snapshot?.global_active,
+    tenantActive: snapshot?.tenant_active,
+    lastGlobalAdmittedAt: snapshot?.global_admitted_at,
+    lastTenantAdmittedAt: snapshot?.tenant_admitted_at,
+    legacyActivePack: snapshot?.legacy_active_pack === true,
+    postProcessingObserved: snapshot?.post_processing_observed === true,
+    postProcessingPendingCount: snapshot?.post_processing_pending_count,
+    postProcessingPendingBytes: snapshot?.post_processing_pending_bytes,
   });
 }
 
@@ -513,7 +699,12 @@ export function captureTaskBusinessRootVisibilitySql(alias = 't') {
       SELECT 1
       FROM capture_tasks canonical
       WHERE canonical.tenant_id = ${alias}.tenant_id
-        AND canonical.id::text = ${alias}.metadata->>'logicalRequestId'
+        AND canonical.id = CASE
+          WHEN (${alias}.metadata->>'logicalRequestId') ~*
+            '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          THEN (${alias}.metadata->>'logicalRequestId')::uuid
+          ELSE NULL
+        END
         AND canonical.client_task_id = ${alias}.metadata->>'logicalRequestId'
         AND canonical.task_type = ${alias}.task_type
         AND canonical.origin_agent_id IS NOT DISTINCT FROM ${alias}.origin_agent_id
@@ -703,6 +894,39 @@ export function evaluateObservedCompletionCandidate(row = {}) {
 
 function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+export function hashCaptureCommandCompletion(success, result = {}) {
+  const rawResult = result && typeof result === 'object' &&
+    !Array.isArray(result) ? result : {};
+  return crypto.createHash('sha256')
+    .update(JSON.stringify({success: success === true, result: rawResult}))
+    .digest('hex');
+}
+
+export function captureCommandCompletionResultSizeBytes(result = {}) {
+  const rawResult = result && typeof result === 'object' &&
+    !Array.isArray(result) ? result : {};
+  return Buffer.byteLength(JSON.stringify(rawResult), 'utf8');
+}
+
+export function lateStoppedNegativeCreateReceiptEligible({
+  command = {},
+  task = {},
+  completionIdentityProvided = false,
+  result = {},
+} = {}) {
+  const payload = safeJson(command.payload);
+  const storedResult = safeJson(command.result);
+  return Boolean(
+    completionIdentityProvided &&
+    command.command_type === 'create' &&
+    command.status === 'expired' &&
+    storedResult.reason === 'superseded_by_stop' &&
+    (task.task_type === 'negative_post_patrol' ||
+      payload.workflow === 'negative_post_patrol') &&
+    text(safeJson(result).status, 80).toLowerCase() === 'canceled'
+  );
 }
 
 function hasConfiguredAgentPlan(value) {
@@ -1451,7 +1675,8 @@ export function crossDeviceRetryAgentSupportsTask(
 
   if (capabilities.remoteTargetedPostCaptureV1 !== true) return false;
   if (taskType === 'negative_post_patrol') {
-    return capabilities.negativePostPatrol === true;
+    return capabilities.negativePostPatrol === true &&
+      capabilities.negativePatrolTerminalReceiptV1 === true;
   }
   if (taskType === 'watched_content_patrol') {
     return capabilities.watchedContentPatrol === true;
@@ -1770,13 +1995,23 @@ export function captureItemRequiresLocalClosureReuseFence({
     safeJson(sourceExecutionMetadata).requiresLocalClosureReuseFenceV1 === true;
 }
 
-async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) {
+async function expireStaleCommands(
+  tx,
+  tenantId,
+  taskId = null,
+  agentId = null,
+  taskLimit = 50,
+) {
   const scopedTaskId = text(taskId, 100);
   const scopedAgentId = text(agentId, 100);
+  const boundedTaskLimit = Math.max(
+    1,
+    Math.min(200, Math.floor(Number(taskLimit) || 50)),
+  );
   // Every path that can mutate both records locks the task before its command.
   // Lock candidate tasks in a deterministic order before the bulk command
   // updates below, preventing heartbeat/receipt expiry races from deadlocking.
-  await tx.queryAll(`
+  const lockedTasks = await tx.queryAll(`
     SELECT t.id
     FROM capture_tasks t
     WHERE t.tenant_id = $1
@@ -1788,8 +2023,11 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
           AND ($3 = '' OR c.agent_id::text = $3)
       )
     ORDER BY t.id
-    FOR UPDATE
-  `, [tenantId, scopedTaskId, scopedAgentId]);
+    LIMIT $4
+    FOR UPDATE SKIP LOCKED
+  `, [tenantId, scopedTaskId, scopedAgentId, boundedTaskLimit]);
+  const lockedTaskIds = lockedTasks.map(task => task.id);
+  if (lockedTaskIds.length === 0) return [];
   // An acknowledged create may already be running locally even when its full
   // task snapshot is delayed. Candidate selection therefore uses the cheap
   // liveness lease; pending creates and non-create commands keep their normal
@@ -1819,6 +2057,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     WHERE c.tenant_id = $1
       AND ($2 = '' OR c.task_id::text = $2)
       AND ($3 = '' OR c.agent_id::text = $3)
+      AND c.task_id = ANY($5::uuid[])
       AND c.status IN ('pending', 'acknowledged')
       AND c.expires_at <= now()
       AND (
@@ -1850,6 +2089,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     scopedTaskId,
     scopedAgentId,
     ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
+    lockedTaskIds,
   ]);
   const expiryCandidateIds = expiryCandidates
     .filter(command => captureCreateCommandExpiryEligible({
@@ -1877,6 +2117,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
       AND ($2 = '' OR task_id::text = $2)
       AND ($3 = '' OR agent_id::text = $3)
       AND id = ANY($4::uuid[])
+      AND task_id = ANY($6::uuid[])
       AND status IN ('pending', 'acknowledged')
       AND expires_at <= now()
       AND (
@@ -1918,6 +2159,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     scopedAgentId,
     expiryCandidateIds,
     ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
+    lockedTaskIds,
   ]) : [];
 
   for (const command of expired) {
@@ -1985,16 +2227,53 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     }
     if (command.command_type === 'stop') {
       const restoredStatus = stopFailureStatus(command.payload?.previousStatus);
+      const commandItemAttempts = Array.isArray(
+        command.payload?.orchestration?.itemAttempts,
+      ) ? command.payload.orchestration.itemAttempts : [];
+      const commandAttemptId = text(
+        command.payload?.attemptIdentity ||
+          command.payload?.attemptId ||
+          commandItemAttempts[0]?.attemptId,
+        240,
+      );
       const restored = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = $1,
-          message = '远程停止指令已过期，可重新下发',
-          metadata = metadata - 'stopCommandId' - 'stopPreviousStatus',
+          message = '远程停止指令已过期，已转入设备终态对账',
+          metadata = metadata || jsonb_build_object(
+              'stopPending', true,
+              'stopLastFailure', jsonb_build_object(
+                'commandId', $4::text,
+                'reason', 'stop_command_expired',
+                'failedAt', now()::text
+              )
+            ) || CASE WHEN task_type IN (
+              'negative_post_patrol',
+              'watched_content_patrol',
+              'official_account_comment_patrol',
+              'followed_creator_post_patrol',
+              'official_account_post_discovery'
+            ) THEN jsonb_strip_nulls(jsonb_build_object(
+              'attemptIdentity', NULLIF($5::text, ''),
+              'terminalDisposition', 'canceled',
+              'terminalReason', COALESCE(
+                NULLIF($6::text, ''),
+                'stop_command_expired_reconcile'
+              ),
+              'terminalDispositionAt', now()::text
+            )) ELSE '{}'::jsonb END,
           updated_at = now()
         WHERE id = $2 AND tenant_id = $3
           AND metadata->>'stopCommandId' = $4
         RETURNING id
-      `, [restoredStatus, command.task_id, tenantId, command.id]);
+      `, [
+        restoredStatus,
+        command.task_id,
+        tenantId,
+        command.id,
+        commandAttemptId,
+        text(command.payload?.terminalReason, 120),
+      ]);
       if (restored) {
         await appendEvent(tx, {
           tenantId,
@@ -2002,7 +2281,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
           agentId: command.agent_id,
           eventType: 'stop_command_expired',
           status: restoredStatus,
-          message: '远程停止指令已过期，可重新下发',
+          message: '远程停止指令已过期，已转入设备终态对账',
           payload: {commandId: command.id, commandType: command.command_type},
         });
       }
@@ -2056,6 +2335,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     WHERE c.tenant_id = $1
       AND ($2 = '' OR c.task_id::text = $2)
       AND ($3 = '' OR c.agent_id::text = $3)
+      AND c.task_id = ANY($4::uuid[])
       AND c.command_type IN ('resume', 'stop', 'create')
       AND c.status IN ('pending', 'acknowledged')
       AND NOT EXISTS (
@@ -2106,7 +2386,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
       )
     RETURNING id, task_id, agent_id, command_type, payload,
       result->>'commandStatusBefore' AS command_status_before
-  `, [tenantId, scopedTaskId, scopedAgentId]);
+  `, [tenantId, scopedTaskId, scopedAgentId, lockedTaskIds]);
   for (const command of unavailable) {
     if (command.command_type === 'create') {
       const commandStatusBefore = text(
@@ -2169,16 +2449,53 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     }
     if (command.command_type === 'stop') {
       const restoredStatus = stopFailureStatus(command.payload?.previousStatus);
+      const commandItemAttempts = Array.isArray(
+        command.payload?.orchestration?.itemAttempts,
+      ) ? command.payload.orchestration.itemAttempts : [];
+      const commandAttemptId = text(
+        command.payload?.attemptIdentity ||
+          command.payload?.attemptId ||
+          commandItemAttempts[0]?.attemptId,
+        240,
+      );
       const restored = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = $1,
-          message = '原执行节点授权或平台职责已变化，停止指令已取消',
-          metadata = metadata - 'stopCommandId' - 'stopPreviousStatus',
+          message = '原执行节点暂不可用，已保留停止请求等待终态对账',
+          metadata = metadata || jsonb_build_object(
+              'stopPending', true,
+              'stopLastFailure', jsonb_build_object(
+                'commandId', $4::text,
+                'reason', 'stop_agent_unavailable',
+                'failedAt', now()::text
+              )
+            ) || CASE WHEN task_type IN (
+              'negative_post_patrol',
+              'watched_content_patrol',
+              'official_account_comment_patrol',
+              'followed_creator_post_patrol',
+              'official_account_post_discovery'
+            ) THEN jsonb_strip_nulls(jsonb_build_object(
+              'attemptIdentity', NULLIF($5::text, ''),
+              'terminalDisposition', 'canceled',
+              'terminalReason', COALESCE(
+                NULLIF($6::text, ''),
+                'stop_agent_unavailable_reconcile'
+              ),
+              'terminalDispositionAt', now()::text
+            )) ELSE '{}'::jsonb END,
           updated_at = now()
         WHERE id = $2 AND tenant_id = $3
           AND metadata->>'stopCommandId' = $4
         RETURNING id
-      `, [restoredStatus, command.task_id, tenantId, command.id]);
+      `, [
+        restoredStatus,
+        command.task_id,
+        tenantId,
+        command.id,
+        commandAttemptId,
+        text(command.payload?.terminalReason, 120),
+      ]);
       if (restored) {
         await appendEvent(tx, {
           tenantId,
@@ -2186,7 +2503,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
           agentId: command.agent_id,
           eventType: 'stop_command_canceled_agent_unavailable',
           status: restoredStatus,
-          message: '原执行节点授权或平台职责已变化，停止指令已取消',
+          message: '原执行节点暂不可用，已保留停止请求等待终态对账',
           payload: {commandId: command.id, commandType: command.command_type},
         });
       }
@@ -2229,6 +2546,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
     WHERE c.tenant_id = $1
       AND ($2 = '' OR c.task_id::text = $2)
       AND ($3 = '' OR c.agent_id::text = $3)
+      AND c.task_id = ANY($4::uuid[])
       AND c.status IN ('pending', 'acknowledged')
       AND (
         (
@@ -2263,7 +2581,7 @@ async function expireStaleCommands(tx, tenantId, taskId = null, agentId = null) 
         )
       )
     RETURNING id, task_id, agent_id, command_type
-  `, [tenantId, scopedTaskId, scopedAgentId]);
+  `, [tenantId, scopedTaskId, scopedAgentId, lockedTaskIds]);
   for (const command of obsolete) {
     if (command.command_type === 'stop') {
       await tx.execute(`
@@ -2498,6 +2816,84 @@ const ORCHESTRATION_PARENT_TERMINAL_STATUSES = new Set([
 
 export function orchestrationParentAcceptsProjection(status) {
   return !ORCHESTRATION_PARENT_TERMINAL_STATUSES.has(text(status, 80));
+}
+
+export function projectOperatorStoppedParentState(pendingChildCount = 0) {
+  const stopPendingCount = Math.max(
+    0,
+    Math.floor(Number(pendingChildCount) || 0),
+  );
+  return Object.freeze({
+    status: stopPendingCount > 0 ? 'waiting_device' : 'canceled',
+    terminal: stopPendingCount === 0,
+    phase: stopPendingCount > 0 ? 'stop_requested' : 'canceled',
+    stopPendingCount,
+  });
+}
+
+const OPERATOR_STOP_SETTLED_CHILD_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+  'superseded',
+  'needs_action',
+]);
+const OPERATOR_STOP_TERMINAL_DISPOSITIONS = new Set([
+  'canceled',
+  'revoked',
+  'superseded',
+]);
+
+export function operatorStoppedChildRequiresSettlement(child = {}) {
+  const metadata = safeJson(child.metadata);
+  if (
+    metadata.stopPending === true ||
+    metadata.legacyPackStopPending === true
+  ) {
+    return true;
+  }
+  const disposition = text(metadata.terminalDisposition, 80);
+  if (
+    OPERATOR_STOP_TERMINAL_DISPOSITIONS.has(disposition) &&
+    metadata.stoppedBeforeDispatch !== true
+  ) {
+    const acknowledgement = safeJson(
+      metadata.terminalNoticeAcknowledgement,
+    );
+    const requestId = text(
+      child.control_task_id || child.client_task_id,
+      240,
+    );
+    const attemptId = text(
+      child.durable_client_attempt_id || metadata.attemptIdentity,
+      240,
+    );
+    const exactAcknowledgement = Boolean(
+      requestId &&
+      attemptId &&
+      acknowledgement.requestId === requestId &&
+      acknowledgement.attemptId === attemptId &&
+      acknowledgement.status === disposition
+    );
+    if (
+      !exactAcknowledgement ||
+      !['canceled', 'superseded'].includes(text(child.status, 80))
+    ) {
+      return true;
+    }
+  }
+  return !OPERATOR_STOP_SETTLED_CHILD_STATUSES.has(
+    text(child.status, 80),
+  );
+}
+
+export function countOperatorStoppedPendingChildren(children = []) {
+  return (Array.isArray(children) ? children : [])
+    .filter(operatorStoppedChildRequiresSettlement)
+    .length;
 }
 const NEGATIVE_PATROL_RESULT_STATUSES = new Set([
   'completed',
@@ -3853,6 +4249,79 @@ async function refreshOrchestrationParentTask(tx, {
     aggregate.status = 'running';
     aggregate.terminal = false;
   }
+  const operatorStopped = parentMetadata.operatorStopped === true;
+  let operatorStopPendingCount = 0;
+  if (operatorStopped) {
+    const pendingStop = await tx.queryOne(`
+      SELECT COUNT(*)::integer AS pending_count
+      FROM capture_tasks child
+      LEFT JOIN LATERAL (
+        SELECT NULLIF(attempt.client_attempt_id, '') AS client_attempt_id
+        FROM capture_task_attempts attempt
+        WHERE attempt.tenant_id = child.tenant_id
+          AND attempt.task_id = child.id
+          AND attempt.agent_id = child.assigned_agent_id
+          AND NULLIF(attempt.client_attempt_id, '') IS NOT NULL
+        ORDER BY attempt.attempt_number DESC,
+          attempt.updated_at DESC, attempt.id DESC
+        LIMIT 1
+      ) durable_attempt ON true
+      WHERE child.tenant_id = $1
+        AND child.parent_task_id = $2
+        AND (
+          child.metadata->>'stopPending' = 'true'
+          OR child.metadata->>'legacyPackStopPending' = 'true'
+          OR child.status NOT IN (
+            'completed', 'completed_with_warnings',
+            'completed_with_failures', 'failed', 'canceled', 'skipped',
+            'superseded', 'needs_action'
+          )
+          OR (
+            child.metadata->>'terminalDisposition' IN (
+              'canceled', 'revoked', 'superseded'
+            )
+            AND child.metadata->>'stoppedBeforeDispatch'
+              IS DISTINCT FROM 'true'
+            AND (
+              child.status NOT IN ('canceled', 'superseded')
+              OR COALESCE(
+                NULLIF(child.control_task_id, ''),
+                child.client_task_id
+              ) IS NULL
+              OR COALESCE(
+                durable_attempt.client_attempt_id,
+                NULLIF(child.metadata->>'attemptIdentity', '')
+              ) IS NULL
+              OR child.metadata->'terminalNoticeAcknowledgement'->>'requestId'
+                IS DISTINCT FROM COALESCE(
+                  NULLIF(child.control_task_id, ''),
+                  child.client_task_id
+                )
+              OR child.metadata->'terminalNoticeAcknowledgement'->>'attemptId'
+                IS DISTINCT FROM COALESCE(
+                  durable_attempt.client_attempt_id,
+                  NULLIF(child.metadata->>'attemptIdentity', '')
+                )
+              OR child.metadata->'terminalNoticeAcknowledgement'->>'status'
+                IS DISTINCT FROM child.metadata->>'terminalDisposition'
+            )
+          )
+        )
+    `, [tenantId, parentTaskId]);
+    operatorStopPendingCount = Math.max(
+      0,
+      Number(pendingStop?.pending_count) || 0,
+    );
+    const operatorStopState = projectOperatorStoppedParentState(
+      operatorStopPendingCount,
+    );
+    aggregate.status = operatorStopState.status;
+    aggregate.terminal = operatorStopState.terminal;
+    aggregate.progress = {
+      ...aggregate.progress,
+      phase: operatorStopState.phase,
+    };
+  }
   const negativePatrol =
     parent.feature_key === 'negative_post_patrol' ||
     parentMetadata.workflow === 'negative_post_patrol';
@@ -3873,7 +4342,11 @@ async function refreshOrchestrationParentTask(tx, {
   const reportedBusinessProgressAt = orchestrationCheckpointTimestamp(
     snapshot.businessProgressAt,
   );
-  const message = aggregate.status === 'running'
+  const message = operatorStopped
+    ? operatorStopPendingCount > 0
+      ? '已停止新领取，等待设备确认当前执行轮次已停止'
+      : '整个任务已停止；已完成结果保留，未完成项不再自动接力'
+    : aggregate.status === 'running'
     ? elasticPool && Number(aggregate.counts.retryable || 0) > 0
       ? contentPatrol
         ? `部分${contentPatrolLabel}正在自动恢复，等待空闲节点逐篇接力`
@@ -3931,6 +4404,17 @@ async function refreshOrchestrationParentTask(tx, {
         WHEN $9::timestamptz IS NULL THEN source_updated_at
         ELSE GREATEST(source_updated_at, $9::timestamptz)
       END,
+      metadata = CASE WHEN $12::boolean
+        THEN metadata || jsonb_build_object(
+          'stopPendingCount', $13::integer,
+          'operatorStopSettledAt', CASE WHEN $13::integer = 0
+            THEN now()::text ELSE COALESCE(
+              metadata->>'operatorStopSettledAt',
+              ''
+            ) END
+        )
+        ELSE metadata
+      END,
       updated_at = now()
     WHERE id = $10 AND tenant_id = $11
     RETURNING *
@@ -3946,6 +4430,8 @@ async function refreshOrchestrationParentTask(tx, {
     orchestrationCheckpointTimestamp(snapshot.updatedAt || snapshot.heartbeatAt),
     parentTaskId,
     tenantId,
+    operatorStopped,
+    operatorStopPendingCount,
   ]);
 
   if (
@@ -6135,7 +6621,8 @@ export async function dispatchNextElasticWorkItem(tx, {
   const canClaimNegativePost =
     freshCapabilities.remoteTaskCreate === true &&
     freshCapabilities.remoteTargetedPostCaptureV1 === true &&
-    freshCapabilities.negativePostPatrol === true;
+    freshCapabilities.negativePostPatrol === true &&
+    freshCapabilities.negativePatrolTerminalReceiptV1 === true;
   const canClaimWatchedContent =
     freshCapabilities.remoteTaskCreate === true &&
     freshCapabilities.remoteTargetedPostCaptureV1 === true &&
@@ -6171,7 +6658,13 @@ export async function dispatchNextElasticWorkItem(tx, {
       AND attempt.agent_id = $2
       AND attempt.status IN ('retryable', 'needs_action', 'failed')
       AND attempt.updated_at > now() - interval '30 minutes'
-      AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+      AND (
+        COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+        OR (
+          parent.metadata->>'workflow' = 'negative_post_patrol'
+          AND parent.metadata->>'perItemAdmissionV1' = 'true'
+        )
+      )
     ORDER BY COALESCE(
       attempt.finished_at,
       execution.finished_at,
@@ -6243,21 +6736,25 @@ export async function dispatchNextElasticWorkItem(tx, {
         END,
         item.attempt_count
       ) AS attempt_budget_used,
-      (
-        SELECT COUNT(*)
-        FROM capture_task_items all_items
-        WHERE all_items.tenant_id = parent.tenant_id
-          AND all_items.task_id = parent.id
-      ) AS parent_item_count
+      CASE
+        WHEN (parent.counts->>'total') ~ '^[0-9]+$'
+        THEN (parent.counts->>'total')::integer
+        ELSE 1
+      END AS parent_item_count
     FROM capture_task_items item
     JOIN capture_tasks parent
       ON parent.id = item.task_id
       AND parent.tenant_id = item.tenant_id
     CROSS JOIN LATERAL (
-      SELECT GREATEST(
-        1,
-        COALESCE(NULLIF(COUNT(DISTINCT configured_agent_id), 0), $3)
-      )::integer AS agent_attempt_limit
+      SELECT CASE
+        WHEN item.metadata->>'pinnedAgentId' ~*
+          '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        THEN 1
+        ELSE GREATEST(
+          1,
+          COALESCE(NULLIF(COUNT(DISTINCT configured_agent_id), 0), $3)
+        )::integer
+      END AS agent_attempt_limit
       FROM (
         SELECT jsonb_array_elements_text(
           CASE
@@ -6281,18 +6778,31 @@ export async function dispatchNextElasticWorkItem(tx, {
     WHERE item.tenant_id = $1
       AND parent.task_type = 'capture_orchestration'
       AND parent.status IN ('pending', 'running', 'needs_action')
-      AND COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+      AND (
+        COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+        OR (
+          parent.metadata->>'workflow' = 'negative_post_patrol'
+          AND parent.metadata->>'perItemAdmissionV1' = 'true'
+          AND COALESCE(parent.metadata->>'distributionMode', '') = 'fixed_batch'
+        )
+      )
       AND COALESCE(parent.metadata->>'orchestrationTemplate', 'false') <> 'true'
       AND (
-        parent.metadata @> jsonb_build_object(
-          'eligibleAgentIds', jsonb_build_array($2::text)
-        )
+        item.metadata->>'pinnedAgentId' = $2::text
         OR (
-          item.status = 'retryable'
-          AND parent.metadata->'planSnapshot'->'resourcePolicy' @>
-            jsonb_build_object(
-              'relayAgentIds', jsonb_build_array($2::text)
+          COALESCE(item.metadata->>'pinnedAgentId', '') = ''
+          AND (
+            parent.metadata @> jsonb_build_object(
+              'eligibleAgentIds', jsonb_build_array($2::text)
             )
+            OR (
+              item.status = 'retryable'
+              AND parent.metadata->'planSnapshot'->'resourcePolicy' @>
+                jsonb_build_object(
+                  'relayAgentIds', jsonb_build_array($2::text)
+                )
+            )
+          )
         )
       )
       AND (
@@ -6443,6 +6953,10 @@ export async function dispatchNextElasticWorkItem(tx, {
   if (!candidate) return null;
 
   const parentMetadata = safeJson(candidate.parent_metadata);
+  const queueDistributionMode = text(
+    parentMetadata.distributionMode,
+    40,
+  ) === 'fixed_batch' ? 'fixed_batch' : 'elastic_pool';
   const planSnapshot = safeJson(parentMetadata.planSnapshot);
   const itemMetadata = safeJson(candidate.item_metadata);
   const previousExecutionTaskId = text(candidate.execution_task_id, 100);
@@ -6470,6 +6984,18 @@ export async function dispatchNextElasticWorkItem(tx, {
         }),
   });
   if (!resourceAdmission.allowed) return null;
+  if (negativePost) {
+    const patrolAdmission = await reserveNegativePatrolFirstAdmission(tx, {
+      tenantId: agent.tenant_id,
+    });
+    if (!patrolAdmission.allowed) {
+      return {
+        deferred: true,
+        reason: patrolAdmission.reason || 'server_busy',
+        retryAfterMs: Math.max(500, Number(patrolAdmission.retryAfterMs) || 1000),
+      };
+    }
+  }
   let bootstrapPacing = null;
   if (!targetedContent) {
     const recentBootstrapHealth = await tx.queryOne(`
@@ -6594,7 +7120,7 @@ export async function dispatchNextElasticWorkItem(tx, {
         parentTaskId: candidate.parent_id,
         revision: assignmentRevision,
         itemIds: [candidate.item_id],
-        distributionMode: 'elastic_pool',
+        distributionMode: queueDistributionMode,
         ...(bootstrapPacing || {}),
       },
       attemptIdentity,
@@ -6713,7 +7239,8 @@ export async function dispatchNextElasticWorkItem(tx, {
     orchestrationRevision: assignmentRevision,
     itemIds: [candidate.item_id],
     cloudWorkQueue: true,
-    distributionMode: 'elastic_pool',
+    distributionMode: queueDistributionMode,
+    perItemAdmissionV1: targetedWorkflow === 'negative_post_patrol',
     claimUnit,
     attemptIdentity,
     ...(bootstrapPacing ? {bootstrapPacing} : {}),
@@ -6739,9 +7266,13 @@ export async function dispatchNextElasticWorkItem(tx, {
           'handoffSuccessorTaskId', $1::uuid::text,
           'handoffReason', 'elastic_retry_claimed',
           'handoffAt', now()::text,
-          'handoffSuccessorAttemptIdentity', $5::text
+          'handoffSuccessorAttemptIdentity', $5::text,
+          'terminalDisposition', 'superseded',
+          'terminalReason', 'elastic_retry_claimed',
+          'terminalDispositionAt', now()::text
         ),
         message = '当前工作项已由其它 Agent 自动接力',
+        finished_at = COALESCE(finished_at, now()),
         updated_at = now()
       WHERE id = $2
         AND tenant_id = $3
@@ -6864,10 +7395,11 @@ export async function dispatchNextElasticWorkItem(tx, {
   await tx.execute(`
     INSERT INTO capture_agent_commands (
       id, tenant_id, agent_id, task_id, command_type, payload,
-      requested_by_name, expires_at
+      requested_by_name, expires_at, admitted_at
     ) VALUES (
       $1, $2, $3, $4, 'create', $5::jsonb,
-      '云端弹性调度器', $6
+      '云端弹性调度器', $6,
+      CASE WHEN $7::boolean THEN now() ELSE NULL END
     )
   `, [
     commandId,
@@ -6876,6 +7408,7 @@ export async function dispatchNextElasticWorkItem(tx, {
     childTaskId,
     JSON.stringify(commandPayload),
     new Date(Date.now() + ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS).toISOString(),
+    targetedWorkflow === 'negative_post_patrol',
   ]);
   await refreshOrchestrationParentTask(tx, {
     tenantId: agent.tenant_id,
@@ -6922,6 +7455,544 @@ export async function dispatchNextElasticWorkItem(tx, {
   };
 }
 
+function normalizeTerminalNoticeAcks(value) {
+  return (Array.isArray(value) ? value : [])
+    .slice(0, 50)
+    .map(item => ({
+      requestId: text(item?.requestId, 240),
+      attemptId: text(item?.attemptId, 240),
+      status: text(item?.status, 80).toLowerCase(),
+    }))
+    .filter(item => item.requestId && item.attemptId && item.status);
+}
+
+export function legacyNegativePatrolTargetCount(payload = {}) {
+  const normalized = safeJson(payload);
+  const targets = Array.isArray(normalized.targets) ? normalized.targets : [];
+  const items = Array.isArray(normalized.items) ? normalized.items : [];
+  return Math.max(targets.length, items.length);
+}
+
+export function legacyAcknowledgedNegativePatrolPackStopEligible({
+  task = {},
+  command = {},
+  requestId = '',
+  attemptId = '',
+} = {}) {
+  const payload = safeJson(command.payload);
+  const metadata = safeJson(task.metadata);
+  const workflow = text(
+    payload.workflow || payload.taskKind || task.task_type,
+    80,
+  );
+  const expectedRequestId = text(payload.clientTaskId, 240);
+  return Boolean(
+    !text(attemptId, 240) &&
+    task.task_type === 'negative_post_patrol' &&
+    workflow === 'negative_post_patrol' &&
+    command.command_type === 'create' &&
+    command.status === 'acknowledged' &&
+    UUID_PATTERN.test(text(command.id, 100)) &&
+    legacyNegativePatrolTargetCount(payload) > 1 &&
+    payload.perItemAdmissionV1 !== true &&
+    metadata.perItemAdmissionV1 !== true &&
+    expectedRequestId &&
+    expectedRequestId === text(requestId, 240)
+  );
+}
+
+async function reconcileLegacyNegativePatrolPacksForAgent(tx, agent) {
+  const refs = await tx.queryAll(`
+    SELECT command.id, command.task_id
+    FROM capture_agent_commands command
+    JOIN capture_tasks task
+      ON task.id = command.task_id AND task.tenant_id = command.tenant_id
+    WHERE command.tenant_id = $1
+      AND command.agent_id = $2
+      AND command.command_type = 'create'
+      AND command.status IN ('pending', 'acknowledged')
+      AND COALESCE(
+        command.payload->>'workflow',
+        command.payload->>'taskKind',
+        task.task_type
+      ) = 'negative_post_patrol'
+      AND GREATEST(
+        CASE WHEN jsonb_typeof(command.payload->'targets') = 'array'
+          THEN jsonb_array_length(command.payload->'targets') ELSE 0 END,
+        CASE WHEN jsonb_typeof(command.payload->'items') = 'array'
+          THEN jsonb_array_length(command.payload->'items') ELSE 0 END
+      ) > 1
+    ORDER BY command.created_at, command.id
+    LIMIT 1
+  `, [agent.tenant_id, agent.id]);
+  let migrated = 0;
+  let revoked = 0;
+  for (const ref of refs) {
+    const task = await tx.queryOne(`
+      SELECT *
+      FROM capture_tasks
+      WHERE id = $1 AND tenant_id = $2
+      FOR UPDATE
+    `, [ref.task_id, agent.tenant_id]);
+    if (!task) continue;
+    const command = await tx.queryOne(`
+      SELECT *
+      FROM capture_agent_commands
+      WHERE id = $1 AND tenant_id = $2 AND agent_id = $3
+        AND command_type = 'create'
+        AND status IN ('pending', 'acknowledged')
+      FOR UPDATE
+    `, [ref.id, agent.tenant_id, agent.id]);
+    if (!command || legacyNegativePatrolTargetCount(command.payload) <= 1) {
+      continue;
+    }
+
+    if (command.status === 'pending') {
+      await tx.execute(`
+        UPDATE capture_agent_commands
+        SET status = 'expired',
+          admission_released_at = COALESCE(admission_released_at, now()),
+          result = jsonb_build_object(
+            'reason', 'legacy_negative_pack_migrated_to_queue',
+            'targetCount', $2::integer
+          ),
+          finished_at = now(), updated_at = now()
+        WHERE id = $1 AND status = 'pending'
+      `, [command.id, legacyNegativePatrolTargetCount(command.payload)]);
+      const parentTaskId = task.parent_task_id || task.id;
+      await tx.execute(`
+        UPDATE capture_task_item_attempts attempt
+        SET status = 'canceled',
+          error = jsonb_build_object(
+            'code', 'legacy_negative_pack_migrated_to_queue'
+          ),
+          finished_at = COALESCE(attempt.finished_at, now()),
+          updated_at = now()
+        FROM capture_task_items item
+        WHERE item.id = attempt.item_id
+          AND item.tenant_id = $1
+          AND item.task_id = $2
+          AND (
+            $3::uuid = $2::uuid
+            OR item.execution_task_id = $3::uuid
+          )
+          AND attempt.status NOT IN (
+            'completed', 'completed_with_warnings',
+            'failed', 'skipped', 'canceled'
+          )
+      `, [agent.tenant_id, parentTaskId, task.id]);
+      await tx.execute(`
+        UPDATE capture_task_items
+        SET status = 'pending',
+          assigned_agent_id = NULL,
+          execution_task_id = NULL,
+          request_hash = '',
+          error = '{}'::jsonb,
+          metadata = (metadata - 'checkpoint') || jsonb_build_object(
+            'pinnedAgentId', $4::text,
+            'legacyPackMigratedAt', now()::text
+          ),
+          assigned_at = NULL,
+          dispatched_at = NULL,
+          started_at = NULL,
+          finished_at = NULL,
+          updated_at = now()
+        WHERE tenant_id = $1
+          AND task_id = $2
+          AND ($3::uuid = $2::uuid OR execution_task_id = $3::uuid)
+          AND status NOT IN (
+            'completed', 'completed_with_warnings', 'skipped', 'canceled'
+          )
+      `, [agent.tenant_id, parentTaskId, task.id, agent.id]);
+      if (task.parent_task_id) {
+        await tx.execute(`
+          UPDATE capture_tasks
+          SET status = 'canceled',
+            message = '旧批量指令未送达，已迁回父任务逐帖队列',
+            metadata = (metadata - 'createCommandId') || jsonb_build_object(
+              'stoppedBeforeDispatch', true,
+              'legacyPackMigratedAt', now()::text
+            ),
+            finished_at = COALESCE(finished_at, now()),
+            updated_at = now()
+          WHERE id = $1 AND tenant_id = $2
+        `, [task.id, agent.tenant_id]);
+        await tx.execute(`
+          UPDATE capture_tasks
+          SET status = CASE WHEN status = 'canceled' THEN status ELSE 'running' END,
+            metadata = metadata || jsonb_build_object(
+              'workflow', 'negative_post_patrol',
+              'serverPerItemDispatchV1', true,
+              'perItemAdmissionV1', true,
+              'distributionMode', 'fixed_batch',
+              'eligibleAgentIds', jsonb_build_array($3::text),
+              'legacyPackMigratedAt', now()::text
+            ),
+            finished_at = NULL,
+            updated_at = now()
+          WHERE id = $1 AND tenant_id = $2
+        `, [task.parent_task_id, agent.tenant_id, agent.id]);
+      } else {
+        await tx.execute(`
+          UPDATE capture_tasks
+          SET task_type = 'capture_orchestration',
+            assigned_agent_id = NULL,
+            status = 'pending',
+            metadata = (metadata - 'createCommandId') || jsonb_build_object(
+              'workflow', 'negative_post_patrol',
+              'serverPerItemDispatchV1', true,
+              'perItemAdmissionV1', true,
+              'distributionMode', 'fixed_batch',
+              'eligibleAgentIds', jsonb_build_array($3::text),
+              'legacyPackMigratedAt', now()::text
+            ),
+            message = '旧批量指令已转换为服务器逐帖队列',
+            finished_at = NULL,
+            updated_at = now()
+          WHERE id = $1 AND tenant_id = $2
+        `, [task.id, agent.tenant_id, agent.id]);
+      }
+      migrated += 1;
+      continue;
+    }
+
+    await tx.execute(`
+      UPDATE capture_agent_commands
+      SET status = 'expired',
+        result = jsonb_build_object(
+          'reason', 'superseded_by_stop',
+          'legacyMigrationReason', 'legacy_negative_pack_revoked',
+          'targetCount', $2::integer
+        ),
+        finished_at = now(), updated_at = now()
+      WHERE id = $1 AND status = 'acknowledged'
+    `, [command.id, legacyNegativePatrolTargetCount(command.payload)]);
+    const durableTaskAttempt = await tx.queryOne(`
+      SELECT NULLIF(client_attempt_id, '') AS client_attempt_id
+      FROM capture_task_attempts
+      WHERE tenant_id = $1
+        AND task_id = $2
+        AND agent_id = $3
+        AND NULLIF(client_attempt_id, '') IS NOT NULL
+      ORDER BY attempt_number DESC, updated_at DESC, id DESC
+      LIMIT 1
+    `, [agent.tenant_id, task.id, agent.id]);
+    const legacyAttemptId = text(
+      durableTaskAttempt?.client_attempt_id ||
+        safeJson(task.metadata).attemptIdentity,
+      240,
+    );
+    const legacyStopPayload = {
+      controlTaskId: text(task.control_task_id || task.client_task_id, 240),
+      previousStatus: task.status,
+      terminalDisposition: 'revoked',
+      terminalReason: 'legacy_negative_pack_revoked',
+      supersededCreateCommandId: command.id,
+      legacyNegativePackStopV1: true,
+      legacyTargetCount: legacyNegativePatrolTargetCount(command.payload),
+      ...(legacyAttemptId ? {attemptId: legacyAttemptId} : {}),
+      authCodeId: command.payload?.authCodeId,
+      authBindingId: command.payload?.authBindingId,
+      platform: task.platform,
+    };
+    let stopCommand = await tx.queryOne(`
+      SELECT id, payload
+      FROM capture_agent_commands
+      WHERE tenant_id = $1 AND task_id = $2 AND agent_id = $3
+        AND command_type = 'stop'
+        AND status IN ('pending', 'acknowledged')
+        AND expires_at > now()
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+      FOR UPDATE
+    `, [agent.tenant_id, task.id, agent.id]);
+    if (!stopCommand) {
+      stopCommand = await tx.queryOne(`
+        INSERT INTO capture_agent_commands (
+          tenant_id, agent_id, task_id, command_type, payload,
+          requested_by_name
+        ) VALUES ($1, $2, $3, 'stop', $4::jsonb, '服务器批量指令保护')
+        RETURNING id
+      `, [
+        agent.tenant_id,
+        agent.id,
+        task.id,
+        JSON.stringify(legacyStopPayload),
+      ]);
+    } else {
+      stopCommand = await tx.queryOne(`
+        UPDATE capture_agent_commands
+        SET payload = payload || $1::jsonb,
+          updated_at = now()
+        WHERE id = $2 AND tenant_id = $3
+        RETURNING id, payload
+      `, [
+        JSON.stringify(legacyStopPayload),
+        stopCommand.id,
+        agent.tenant_id,
+      ]);
+    }
+    await tx.execute(`
+      UPDATE capture_tasks
+      SET message = '旧批量巡查指令正在撤销，等待设备确认停止',
+        metadata = metadata || jsonb_build_object(
+          'stopCommandId', $3::uuid::text,
+          'stopPreviousStatus', status,
+          'legacyPackStopPending', true,
+          'legacyPackStopReason', 'legacy_negative_pack_revoked'
+        ),
+        updated_at = now()
+      WHERE id = $1 AND tenant_id = $2
+    `, [task.id, agent.tenant_id, stopCommand.id]);
+    revoked += 1;
+  }
+  return {migrated, revoked};
+}
+
+async function claimPriorityAgentControl(tx, {
+  agent,
+  terminalNoticeAcks = [],
+}) {
+  const currentAgent = await lockActiveCaptureAgentSession(tx, agent);
+  if (!currentAgent) return {agentInactive: true};
+  await tx.execute(`
+    UPDATE capture_agents
+    SET last_liveness_at = now(), updated_at = now()
+    WHERE id = $1 AND tenant_id = $2
+  `, [agent.id, agent.tenant_id]);
+
+  const legacyPacks = await reconcileLegacyNegativePatrolPacksForAgent(
+    tx,
+    agent,
+  );
+
+  if (terminalNoticeAcks.length > 0) {
+    const acknowledgedTerminalTasks = await tx.queryAll(`
+      UPDATE capture_tasks task
+      SET metadata = (
+          task.metadata
+            - 'stopCommandId' - 'stopPreviousStatus'
+            - 'stopPending' - 'legacyPackStopPending'
+            - 'stopIdentityUnavailable'
+        ) || jsonb_build_object(
+          'attemptIdentity', acknowledgement.attempt_id,
+          'terminalNoticeAcknowledgement', jsonb_build_object(
+            'requestId', acknowledgement.request_id,
+            'attemptId', acknowledgement.attempt_id,
+            'status', acknowledgement.status,
+            'acknowledgedAt', now()::text
+          )
+        ),
+        status = CASE
+          WHEN acknowledgement.status IN ('canceled', 'revoked')
+            THEN 'canceled'
+          WHEN acknowledgement.status = 'superseded'
+            THEN 'superseded'
+          ELSE task.status
+        END,
+        finished_at = CASE
+          WHEN acknowledgement.status IN (
+            'canceled', 'revoked', 'superseded'
+          ) THEN COALESCE(task.finished_at, now())
+          ELSE task.finished_at
+        END,
+        updated_at = now(),
+        source_updated_at = now()
+      FROM jsonb_to_recordset($3::jsonb) AS acknowledgement(
+        request_id text,
+        attempt_id text,
+        status text
+      )
+      WHERE task.tenant_id = $1
+        AND task.assigned_agent_id = $2
+        AND COALESCE(NULLIF(task.control_task_id, ''), task.client_task_id) =
+          acknowledgement.request_id
+        AND COALESCE(
+          (
+            SELECT NULLIF(attempt.client_attempt_id, '')
+            FROM capture_task_attempts attempt
+            WHERE attempt.tenant_id = task.tenant_id
+              AND attempt.task_id = task.id
+              AND attempt.agent_id = task.assigned_agent_id
+              AND NULLIF(attempt.client_attempt_id, '') IS NOT NULL
+            ORDER BY attempt.attempt_number DESC,
+              attempt.updated_at DESC, attempt.id DESC
+            LIMIT 1
+          ),
+          NULLIF(task.metadata->>'attemptIdentity', '')
+        ) = acknowledgement.attempt_id
+        AND COALESCE(
+          NULLIF(task.metadata->>'terminalDisposition', ''),
+          task.status
+        ) = acknowledgement.status
+      RETURNING task.id, task.parent_task_id, task.status,
+        task.assigned_agent_id, task.task_type
+    `, [
+      agent.tenant_id,
+      agent.id,
+      JSON.stringify(terminalNoticeAcks.map(item => ({
+        request_id: item.requestId,
+        attempt_id: item.attemptId,
+        status: item.status,
+      }))),
+    ]);
+    for (const acknowledgedTask of acknowledgedTerminalTasks) {
+      if (!acknowledgedTask.parent_task_id) continue;
+      await projectOrchestrationChildControlOutcome(tx, {
+        tenantId: agent.tenant_id,
+        childTask: acknowledgedTask,
+        agentId: acknowledgedTask.assigned_agent_id || agent.id,
+        status: 'canceled',
+        actorType: 'capture_agent',
+        actorId: agent.id,
+        actorName: agent.display_name || agent.client_label,
+      });
+    }
+  }
+
+  const terminalNotices = await tx.queryAll(`
+    SELECT
+      COALESCE(NULLIF(task.control_task_id, ''), task.client_task_id) AS request_id,
+      COALESCE(
+        durable_attempt.client_attempt_id,
+        NULLIF(task.metadata->>'attemptIdentity', '')
+      ) AS attempt_id,
+      COALESCE(
+        NULLIF(task.metadata->>'terminalDisposition', ''),
+        task.status
+      ) AS status,
+      COALESCE(
+        NULLIF(task.metadata->>'terminalReason', ''),
+        NULLIF(task.error->>'code', ''),
+        CASE WHEN task.status = 'superseded'
+          THEN 'attempt_superseded'
+          ELSE 'operator_stopped'
+        END
+      ) AS reason,
+      task.message,
+      GREATEST(
+        COALESCE(task.finished_at, '-infinity'::timestamptz),
+        COALESCE(task.updated_at, '-infinity'::timestamptz)
+      ) AS finished_at
+    FROM capture_tasks task
+    LEFT JOIN LATERAL (
+      SELECT NULLIF(attempt.client_attempt_id, '') AS client_attempt_id
+      FROM capture_task_attempts attempt
+      WHERE attempt.tenant_id = task.tenant_id
+        AND attempt.task_id = task.id
+        AND attempt.agent_id = task.assigned_agent_id
+        AND NULLIF(attempt.client_attempt_id, '') IS NOT NULL
+      ORDER BY attempt.attempt_number DESC,
+        attempt.updated_at DESC, attempt.id DESC
+      LIMIT 1
+    ) durable_attempt ON true
+    WHERE task.tenant_id = $1
+      AND task.assigned_agent_id = $2
+      AND task.task_type IN (
+        'negative_post_patrol',
+        'watched_content_patrol',
+        'official_account_comment_patrol',
+        'followed_creator_post_patrol',
+        'official_account_post_discovery'
+      )
+      AND COALESCE(
+        durable_attempt.client_attempt_id,
+        NULLIF(task.metadata->>'attemptIdentity', '')
+      ) IS NOT NULL
+      AND (
+        task.status IN ('canceled', 'superseded')
+        OR task.metadata->>'terminalDisposition' IN (
+          'canceled', 'superseded', 'revoked'
+        )
+      )
+      AND GREATEST(
+        COALESCE(task.finished_at, '-infinity'::timestamptz),
+        COALESCE(task.updated_at, '-infinity'::timestamptz)
+      ) >= now() - interval '7 days'
+      AND (
+        task.metadata->'terminalNoticeAcknowledgement'->>'requestId'
+          IS DISTINCT FROM
+            COALESCE(NULLIF(task.control_task_id, ''), task.client_task_id)
+        OR task.metadata->'terminalNoticeAcknowledgement'->>'attemptId'
+          IS DISTINCT FROM COALESCE(
+            durable_attempt.client_attempt_id,
+            NULLIF(task.metadata->>'attemptIdentity', '')
+          )
+        OR task.metadata->'terminalNoticeAcknowledgement'->>'status'
+          IS DISTINCT FROM COALESCE(
+              NULLIF(task.metadata->>'terminalDisposition', ''),
+              task.status
+            )
+      )
+    ORDER BY GREATEST(
+      COALESCE(task.finished_at, '-infinity'::timestamptz),
+      COALESCE(task.updated_at, '-infinity'::timestamptz)
+    ) ASC, task.id
+    LIMIT 50
+    FOR UPDATE OF task SKIP LOCKED
+  `, [agent.tenant_id, agent.id]);
+
+  const commands = await tx.queryAll(`
+    SELECT c.id, c.command_type, c.payload, c.status, c.created_at,
+      task.id AS task_id, task.client_task_id, task.control_task_id,
+      task.task_type, task.platform, task.title, task.status AS task_status
+    FROM capture_agent_commands c
+    JOIN capture_tasks task
+      ON task.id = c.task_id AND task.tenant_id = c.tenant_id
+    WHERE c.agent_id = $1
+      AND c.tenant_id = $2
+      AND c.command_type = 'stop'
+      AND c.status IN ('pending', 'acknowledged')
+      AND c.expires_at > now()
+      AND c.payload->>'authCodeId' = $3
+      AND c.payload->>'authBindingId' = $4
+      AND c.payload->>'platform' = task.platform
+      AND (
+        c.payload->>'terminalDisposition' IN (
+          'canceled', 'superseded', 'revoked'
+        )
+        OR (
+          task.status NOT IN (
+            'completed', 'completed_with_warnings', 'canceled',
+            'skipped', 'superseded'
+          )
+          AND task.metadata->>'stopCommandId' = c.id::text
+        )
+      )
+    ORDER BY c.created_at, c.id
+    LIMIT 10
+    FOR UPDATE OF c SKIP LOCKED
+  `, [
+    agent.id,
+    agent.tenant_id,
+    agent.auth_code_id,
+    agent.auth_binding_id,
+  ]);
+  if (commands.length > 0) {
+    await tx.execute(`
+      UPDATE capture_agent_commands
+      SET status = 'acknowledged',
+        acknowledged_at = COALESCE(acknowledged_at, now()),
+        updated_at = now()
+      WHERE id = ANY($1::uuid[]) AND status = 'pending'
+    `, [commands.map(command => command.id)]);
+  }
+  return {
+    agentInactive: false,
+    commands,
+    terminalNotices: terminalNotices.map(notice => ({
+      requestId: text(notice.request_id, 240),
+      attemptId: text(notice.attempt_id, 240),
+      status: text(notice.status, 80),
+      reason: text(notice.reason, 120),
+      message: text(notice.message, 2000),
+      finishedAt: notice.finished_at || null,
+    })),
+    legacyPacks,
+    fullHeartbeatAt: captureAgentFullHeartbeatAt(currentAgent),
+  };
+}
+
 // Keep the short online lease independent from the full state reconciliation.
 // A capture snapshot, account probe, or command can legitimately take longer
 // than one heartbeat interval; that work must never make a healthy browser look
@@ -6943,6 +8014,11 @@ router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
         agentInactive: false,
         fullHeartbeatAt: captureAgentFullHeartbeatAt(currentAgent),
       };
+    }, {
+      category: 'critical',
+      waitTimeoutMs: 500,
+      statementTimeoutMs: 2000,
+      lockTimeoutMs: 500,
     });
     if (result.agentInactive) {
       return res.status(403).json({
@@ -6961,6 +8037,16 @@ router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
       },
     });
   } catch (err) {
+    if (isDbCapacityError(err)) {
+      const retryAfterMs = Math.max(250, Number(err.retryAfterMs) || 1000);
+      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(503).json({
+        ok: false,
+        error: 'server_busy',
+        message: '关键心跳通道繁忙，请稍后重试',
+        retryAfterMs,
+      });
+    }
     return next(err);
   }
 });
@@ -7023,6 +8109,50 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
     const taskStateIncomplete = !taskStateKnown;
     const heartbeatDegraded =
       heartbeatCapabilities.heartbeatDegraded === true || taskStateIncomplete;
+    const priorityControl = await withTransaction(tx =>
+      claimPriorityAgentControl(tx, {
+        agent,
+        terminalNoticeAcks: normalizeTerminalNoticeAcks(
+          req.body?.terminalNoticeAcks,
+        ),
+      }), {
+      category: 'critical',
+      waitTimeoutMs: 500,
+      statementTimeoutMs: 2000,
+      lockTimeoutMs: 500,
+    });
+    if (priorityControl.agentInactive) {
+      return res.status(403).json({
+        ok: false,
+        error: 'agent_inactive',
+        message: '采集节点已撤销或授权已变更，请重新验证扩展',
+      });
+    }
+    if (
+      priorityControl.commands.length > 0 ||
+      priorityControl.terminalNotices.length > 0
+    ) {
+      return res.json({
+        ok: true,
+        priorityControlOnly: true,
+        agent: {
+          id: agent.id,
+          livenessAt: new Date().toISOString(),
+          heartbeatAt: priorityControl.fullHeartbeatAt,
+          fullHeartbeatAt: priorityControl.fullHeartbeatAt,
+        },
+        heartbeatDegraded,
+        taskStateKnown,
+        tasksAccepted: 0,
+        observedAccountsAccepted: 0,
+        acceptedSocialUsageEventIds: [],
+        elasticWorkItemClaimed: false,
+        workQueueAdmission: null,
+        localRecoveryAdoptions: [],
+        terminalNotices: priorityControl.terminalNotices,
+        commands: priorityControl.commands,
+      });
+    }
     const result = await withTransaction(async tx => {
       const currentAgent = await lockActiveCaptureAgentSession(tx, agent);
       if (!currentAgent) return {agentInactive: true};
@@ -7133,6 +8263,20 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
             OR c.payload->>'executionMode' <> 'source_open'
             OR $7::boolean = true
           )
+          AND NOT (
+            c.command_type = 'create'
+            AND COALESCE(
+              c.payload->>'workflow',
+              c.payload->>'taskKind',
+              t.task_type
+            ) = 'negative_post_patrol'
+            AND GREATEST(
+              CASE WHEN jsonb_typeof(c.payload->'targets') = 'array'
+                THEN jsonb_array_length(c.payload->'targets') ELSE 0 END,
+              CASE WHEN jsonb_typeof(c.payload->'items') = 'array'
+                THEN jsonb_array_length(c.payload->'items') ELSE 0 END
+            ) > 1
+          )
           AND (
             c.command_type <> 'resume'
             OR (
@@ -7145,6 +8289,13 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
             OR (
               t.status IN ('pending', 'claimed')
               AND t.metadata->>'createCommandId' = c.id::text
+              AND NOT EXISTS (
+                SELECT 1
+                FROM capture_tasks parent
+                WHERE parent.id = t.parent_task_id
+                  AND parent.tenant_id = t.tenant_id
+                  AND parent.status IN ('canceled', 'superseded')
+              )
             )
           )
           AND (
@@ -7247,11 +8398,29 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         result.socialAccountResult.observedAccountCount,
       acceptedSocialUsageEventIds:
         result.socialAccountResult.acceptedUsageEventIds,
-      elasticWorkItemClaimed: Boolean(result.elasticClaim),
+      elasticWorkItemClaimed: Boolean(result.elasticClaim?.childTaskId),
+      workQueueAdmission: result.elasticClaim?.deferred === true
+        ? {
+            status: 'server_busy',
+            reason: result.elasticClaim.reason,
+            retryAfterMs: result.elasticClaim.retryAfterMs,
+          }
+        : null,
       localRecoveryAdoptions: result.localRecoveryAdoptions,
+      terminalNotices: [],
       commands: result.commands,
     });
   } catch (err) {
+    if (isDbCapacityError(err)) {
+      const retryAfterMs = Math.max(250, Number(err.retryAfterMs) || 1000);
+      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(503).json({
+        ok: false,
+        error: 'server_busy',
+        message: '心跳对账通道繁忙，请稍后重试',
+        retryAfterMs,
+      });
+    }
     return next(err);
   }
 });
@@ -7259,20 +8428,65 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
 router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res, next) => {
   try {
     const reportedSuccess = req.body?.success === true;
-    const resultPayload = sanitizeCloudStructuredObject(req.body?.result);
+    const rawResultPayload = req.body?.result &&
+      typeof req.body.result === 'object' &&
+      !Array.isArray(req.body.result)
+      ? req.body.result
+      : {};
+    const resultSizeBytes = captureCommandCompletionResultSizeBytes(
+      rawResultPayload,
+    );
+    if (resultSizeBytes > MAX_COMMAND_COMPLETION_RESULT_BYTES) {
+      return res.status(413).json({
+        ok: false,
+        error: 'command_result_too_large',
+        message: '指令完成结果超过 96 KiB，请缩小结果后重试',
+        maxResultBytes: MAX_COMMAND_COMPLETION_RESULT_BYTES,
+        resultSizeBytes,
+      });
+    }
+    const resultPayload = sanitizeCloudStructuredObject(rawResultPayload);
+    const suppliedCompletionIdentity = sanitizeCloudStructuredObject(
+      req.body?.completionIdentity,
+    );
+    const completionIdentityProvided = Object.keys(
+      suppliedCompletionIdentity,
+    ).length > 0;
+    const computedResultHash = hashCaptureCommandCompletion(
+      reportedSuccess,
+      rawResultPayload,
+    );
     const commandResult = await withTransaction(async tx => {
+      const commandRef = await tx.queryOne(`
+        SELECT command.task_id, task.parent_task_id
+        FROM capture_agent_commands command
+        JOIN capture_tasks task
+          ON task.id = command.task_id
+          AND task.tenant_id = command.tenant_id
+        WHERE command.id = $1
+          AND command.tenant_id = $2
+          AND command.agent_id = $3
+      `, [req.params.id, req.tenantId, req.captureAgent.id]);
+      if (!commandRef) return {notFound: true};
+
+      if (commandRef.parent_task_id) {
+        await tx.queryOne(
+          'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+          ['capture_orchestration_control', commandRef.parent_task_id],
+        );
+        await tx.queryOne(`
+          SELECT id
+          FROM capture_tasks
+          WHERE id = $1 AND tenant_id = $2
+          FOR UPDATE
+        `, [commandRef.parent_task_id, req.tenantId]);
+      }
+
       const currentAgent = await lockActiveCaptureAgentSession(
         tx,
         req.captureAgent,
       );
       if (!currentAgent) return {agentInactive: true};
-
-      const commandRef = await tx.queryOne(`
-        SELECT task_id
-        FROM capture_agent_commands
-        WHERE id = $1 AND tenant_id = $2 AND agent_id = $3
-      `, [req.params.id, req.tenantId, req.captureAgent.id]);
-      if (!commandRef) return {notFound: true};
 
       // Match heartbeat and expiry ordering: task first, then its command.
       const lockedTask = await tx.queryOne(`
@@ -7289,8 +8503,188 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
       `, [req.params.id, req.tenantId, req.captureAgent.id]);
       if (!command) return {notFound: true};
 
+      const commandExpectedRequestId = text(
+        command.command_type === 'stop'
+          ? command.payload?.controlTaskId
+          : command.payload?.clientTaskId,
+        240,
+      );
+      const commandItemAttempts = Array.isArray(
+        command.payload?.orchestration?.itemAttempts,
+      ) ? command.payload.orchestration.itemAttempts : [];
+      let commandExpectedAttemptId = text(
+        command.payload?.attemptIdentity ||
+          command.payload?.attemptId ||
+          commandItemAttempts[0]?.attemptId,
+        240,
+      );
+      const suppliedRequestId = text(
+        suppliedCompletionIdentity.requestId,
+        240,
+      );
+      const suppliedAttemptId = text(
+        suppliedCompletionIdentity.attemptId,
+        240,
+      );
+      const suppliedResultHash = text(
+        suppliedCompletionIdentity.resultHash,
+        100,
+      ).toLowerCase();
+      const targetedCompletion = Boolean(
+        isTargetedPostTaskType(lockedTask?.task_type) ||
+        isTargetedPostTaskType(command.payload?.workflow),
+      );
+      if (!commandExpectedAttemptId && targetedCompletion) {
+        const durableAttempt = await tx.queryOne(`
+          SELECT NULLIF(client_attempt_id, '') AS client_attempt_id
+          FROM capture_task_attempts
+          WHERE tenant_id = $1
+            AND task_id = $2
+            AND agent_id = $3
+            AND NULLIF(client_attempt_id, '') IS NOT NULL
+          ORDER BY attempt_number DESC, updated_at DESC, id DESC
+          LIMIT 1
+        `, [req.tenantId, command.task_id, req.captureAgent.id]);
+        commandExpectedAttemptId = text(
+          durableAttempt?.client_attempt_id ||
+            safeJson(lockedTask?.metadata).attemptIdentity,
+          240,
+        );
+      }
+      if (
+        !commandExpectedAttemptId &&
+        completionIdentityProvided &&
+        UUID_PATTERN.test(suppliedAttemptId)
+      ) {
+        const legacyStoppedCreate =
+          command.command_type === 'create' &&
+          command.status === 'expired' &&
+          safeJson(command.result).reason === 'superseded_by_stop' &&
+          legacyNegativePatrolTargetCount(command.payload) > 1;
+        let legacyMarkedStop = false;
+        const supersededCreateCommandId = text(
+          command.payload?.supersededCreateCommandId,
+          100,
+        );
+        if (
+          command.command_type === 'stop' &&
+          command.payload?.legacyNegativePackStopV1 === true &&
+          UUID_PATTERN.test(supersededCreateCommandId)
+        ) {
+          const legacyCreate = await tx.queryOne(`
+            SELECT id
+            FROM capture_agent_commands
+            WHERE id = $1::uuid
+              AND tenant_id = $2
+              AND agent_id = $3
+              AND task_id = $4
+              AND command_type = 'create'
+              AND status = 'expired'
+              AND result->>'reason' = 'superseded_by_stop'
+            LIMIT 1
+          `, [
+            supersededCreateCommandId,
+            req.tenantId,
+            req.captureAgent.id,
+            command.task_id,
+          ]);
+          legacyMarkedStop = Boolean(legacyCreate);
+        }
+        if (legacyStoppedCreate || legacyMarkedStop) {
+          // v0.4.5 generated its local attempt only after receiving a legacy
+          // multi-target command, so some old rows have no server-side copy.
+          // The command endpoint, authenticated Agent, exact request, linked
+          // superseded create, result attempt and completion hash still fence
+          // this one compatibility backfill.
+          commandExpectedAttemptId = suppliedAttemptId;
+        }
+      }
+      if (completionIdentityProvided) {
+        const resultRequestId = text(resultPayload.requestId, 240);
+        const resultAttemptId = text(resultPayload.attemptId, 240);
+        const identityValid = Boolean(
+          suppliedRequestId &&
+          suppliedAttemptId &&
+          /^[0-9a-f]{64}$/u.test(suppliedResultHash) &&
+          suppliedResultHash === computedResultHash &&
+          suppliedRequestId === commandExpectedRequestId &&
+          suppliedAttemptId === commandExpectedAttemptId &&
+          (!resultRequestId || resultRequestId === suppliedRequestId) &&
+          (!resultAttemptId || resultAttemptId === suppliedAttemptId)
+        );
+        if (!identityValid) {
+          return {
+            invalidCompletionIdentity: true,
+            expectedRequestId: commandExpectedRequestId,
+            expectedAttemptId: commandExpectedAttemptId,
+          };
+        }
+      }
+
+      const acknowledgedCompletion = completionIdentityProvided
+        ? {
+            commandId: command.id,
+            requestId: suppliedRequestId,
+            attemptId: suppliedAttemptId,
+            resultHash: suppliedResultHash,
+          }
+        : null;
+
+      if (lateStoppedNegativeCreateReceiptEligible({
+        command,
+        task: lockedTask,
+        completionIdentityProvided,
+        result: resultPayload,
+      })) {
+        const storedIdentityExists = Boolean(
+          command.completion_request_id ||
+          command.completion_attempt_id ||
+          command.completion_result_hash,
+        );
+        const storedIdentityMatches =
+          command.completion_request_id === suppliedRequestId &&
+          command.completion_attempt_id === suppliedAttemptId &&
+          command.completion_result_hash === suppliedResultHash;
+        if (storedIdentityExists && !storedIdentityMatches) {
+          return {command, completionIdentityConflict: true};
+        }
+        if (!storedIdentityExists) {
+          await tx.execute(`
+            UPDATE capture_agent_commands
+            SET result = result || jsonb_build_object(
+                'lateTerminalReceipt', $1::jsonb,
+                'lateTerminalReceiptAcceptedAt', now()::text
+              ),
+              completion_request_id = $2,
+              completion_attempt_id = $3,
+              completion_result_hash = $4,
+              updated_at = now()
+            WHERE id = $5
+              AND tenant_id = $6
+              AND agent_id = $7
+              AND status = 'expired'
+              AND result->>'reason' = 'superseded_by_stop'
+          `, [
+            JSON.stringify(resultPayload),
+            suppliedRequestId,
+            suppliedAttemptId,
+            suppliedResultHash,
+            command.id,
+            req.tenantId,
+            req.captureAgent.id,
+          ]);
+        }
+        return {
+          command,
+          idempotent: true,
+          acknowledgedCompletion,
+          lateStoppedTerminalReceipt: true,
+        };
+      }
+
       let success = reportedSuccess;
       let stopOutcome = null;
+      let acknowledgedStop = null;
       const requestedCreateExecutionMode = text(
         command.payload?.executionMode,
         80,
@@ -7369,13 +8763,61 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           };
         }
         success = stopOutcome.success;
+        const supersededCreateCommandId = text(
+          command.payload?.supersededCreateCommandId,
+          100,
+        );
+        if (
+          success &&
+          UUID_PATTERN.test(supersededCreateCommandId) &&
+          text(resultPayload.requestId, 240) &&
+          text(resultPayload.attemptId, 240)
+        ) {
+          acknowledgedStop = {
+            commandId: command.id,
+            supersededCreateCommandId,
+            requestId: text(resultPayload.requestId, 240),
+            attemptId: text(resultPayload.attemptId, 240),
+          };
+        }
       }
       const desiredCommandStatus = success ? 'completed' : 'failed';
       if (command.status === 'completed' || command.status === 'failed') {
+        const storedIdentityExists = Boolean(
+          command.completion_request_id ||
+          command.completion_attempt_id ||
+          command.completion_result_hash,
+        );
+        const storedIdentityMatches = !completionIdentityProvided || (
+          command.completion_request_id === suppliedRequestId &&
+          command.completion_attempt_id === suppliedAttemptId &&
+          command.completion_result_hash === suppliedResultHash
+        );
+        if (storedIdentityExists && !storedIdentityMatches) {
+          return {command, completionIdentityConflict: true};
+        }
+        if (completionIdentityProvided && !storedIdentityExists) {
+          await tx.execute(`
+            UPDATE capture_agent_commands
+            SET completion_request_id = $1,
+              completion_attempt_id = $2,
+              completion_result_hash = $3,
+              updated_at = now()
+            WHERE id = $4
+              AND completion_result_hash IS NULL
+          `, [
+            suppliedRequestId,
+            suppliedAttemptId,
+            suppliedResultHash,
+            command.id,
+          ]);
+        }
         return {
           command,
           idempotent: command.status === desiredCommandStatus,
           conflict: command.status !== desiredCommandStatus,
+          acknowledgedCompletion,
+          acknowledgedStop,
         };
       }
       if (command.status === 'expired' && !allowLateCreateSuccess) {
@@ -7390,9 +8832,19 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
       await tx.execute(`
         UPDATE capture_agent_commands
         SET status = $1, result = $2::jsonb,
+          completion_request_id = $4,
+          completion_attempt_id = $5,
+          completion_result_hash = $6,
           finished_at = now(), updated_at = now()
         WHERE id = $3 AND status IN ('pending', 'acknowledged', 'expired')
-      `, [desiredCommandStatus, JSON.stringify(resultPayload), command.id]);
+      `, [
+        desiredCommandStatus,
+        JSON.stringify(resultPayload),
+        command.id,
+        completionIdentityProvided ? suppliedRequestId : null,
+        completionIdentityProvided ? suppliedAttemptId : null,
+        completionIdentityProvided ? suppliedResultHash : null,
+      ]);
 
       let nextStatus = 'needs_action';
       let eventMessage = '';
@@ -7580,9 +9032,16 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           UPDATE capture_tasks
           SET status = $1,
             message = $2,
-            metadata = metadata
-              - 'stopCommandId' - 'stopPreviousStatus'
-              - 'resumeCommandId' - 'resumePreviousStatus',
+            metadata = CASE WHEN $3::boolean
+              THEN metadata
+                - 'stopCommandId' - 'stopPreviousStatus'
+                - 'resumeCommandId' - 'resumePreviousStatus'
+                - 'stopPending' - 'legacyPackStopPending'
+                - 'stopIdentityUnavailable'
+                - 'terminalDisposition' - 'terminalReason'
+                - 'terminalDispositionAt'
+              ELSE metadata || $7::jsonb
+            END,
             finished_at = CASE WHEN $3 THEN now() ELSE finished_at END,
             updated_at = now()
           WHERE id = $4 AND tenant_id = $5
@@ -7595,6 +9054,24 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           command.task_id,
           req.tenantId,
           command.id,
+          JSON.stringify({
+            stopPending: true,
+            stopLastFailure: {
+              commandId: command.id,
+              reason: text(resultPayload.reason, 120) || 'stop_command_failed',
+              failedAt: new Date().toISOString(),
+            },
+            ...(targetedCompletion
+              ? {
+                  terminalDisposition: 'canceled',
+                  terminalReason: text(
+                    command.payload?.terminalReason,
+                    120,
+                  ) || 'stop_command_failed_reconcile',
+                  terminalDispositionAt: new Date().toISOString(),
+                }
+              : {}),
+          }),
         ]);
         if (success) {
           await cancelProfileDiscoveryWork(tx, {
@@ -7604,6 +9081,33 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
             payload: command.payload,
             message: eventMessage,
           });
+          if (lockedTask?.parent_task_id) {
+            await tx.execute(`
+              UPDATE capture_task_items
+              SET status = 'canceled',
+                finished_at = COALESCE(finished_at, now()),
+                updated_at = now()
+              WHERE tenant_id = $1
+                AND task_id = $2
+                AND execution_task_id = $3
+                AND status NOT IN (
+                  'completed', 'completed_with_warnings', 'skipped', 'canceled'
+                )
+            `, [req.tenantId, lockedTask.parent_task_id, command.task_id]);
+            await tx.execute(`
+              UPDATE capture_task_item_attempts
+              SET status = 'canceled',
+                finished_at = COALESCE(finished_at, now()),
+                updated_at = now()
+              WHERE tenant_id = $1
+                AND parent_task_id = $2
+                AND execution_task_id = $3
+                AND status NOT IN (
+                  'completed', 'completed_with_warnings',
+                  'failed', 'skipped', 'canceled'
+                )
+            `, [req.tenantId, lockedTask.parent_task_id, command.task_id]);
+          }
         }
       }
       if (updatedTask && targetedPostCreate) {
@@ -7717,7 +9221,17 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
             req.captureAgent.display_name || req.captureAgent.client_label,
         });
       }
-      return {command: {...command, status: desiredCommandStatus}, taskUpdated: Boolean(updatedTask)};
+      return {
+        command: {...command, status: desiredCommandStatus},
+        taskUpdated: Boolean(updatedTask),
+        acknowledgedCompletion,
+        acknowledgedStop,
+      };
+    }, {
+      category: 'critical',
+      waitTimeoutMs: 500,
+      statementTimeoutMs: 8000,
+      lockTimeoutMs: 1000,
     });
 
     if (commandResult.agentInactive) {
@@ -7735,6 +9249,22 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
     }
     if (commandResult.conflict) {
       return res.status(409).json({ ok: false, error: 'command_result_conflict', message: '远程指令已提交相反结果' });
+    }
+    if (
+      commandResult.invalidCompletionIdentity ||
+      commandResult.completionIdentityConflict
+    ) {
+      return res.status(409).json({
+        ok: false,
+        error: commandResult.completionIdentityConflict
+          ? 'command_completion_identity_conflict'
+          : 'command_completion_identity_mismatch',
+        message: commandResult.completionIdentityConflict
+          ? '该指令已用不同的完成回执确认'
+          : '完成回执与云端指令的任务或执行轮次不一致',
+        expectedRequestId: commandResult.expectedRequestId,
+        expectedAttemptId: commandResult.expectedAttemptId,
+      });
     }
     if (commandResult.invalidCreateResult) {
       return res.status(409).json({
@@ -7762,8 +9292,29 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
       ok: true,
       commandId: commandResult.command.id,
       idempotent: commandResult.idempotent === true,
+      data: {
+        ...(commandResult.acknowledgedCompletion
+          ? {acknowledgedCompletion: commandResult.acknowledgedCompletion}
+          : {}),
+        ...(commandResult.acknowledgedStop
+          ? {acknowledgedStop: commandResult.acknowledgedStop}
+          : {}),
+      },
     });
   } catch (err) {
+    if (
+      isDbCapacityError(err) ||
+      ['57014', '55P03', '40P01'].includes(err?.code)
+    ) {
+      const retryAfterMs = Math.max(250, Number(err.retryAfterMs) || 1000);
+      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(503).json({
+        ok: false,
+        error: 'server_busy',
+        message: '指令回执通道繁忙，请稍后重试',
+        retryAfterMs,
+      });
+    }
     return next(err);
   }
 });
@@ -8072,9 +9623,14 @@ router.get('/history', requireTenantAccess, requireSessionUser, async (req, res,
 router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res, next) => {
   try {
     const limit = Math.min(200, Math.max(10, Number(req.query.limit) || 100));
-    await withTransaction(async tx => expireStaleCommands(tx, req.tenantId));
-    const [agents, tasks, taskSummary] = await Promise.all([
-      queryAll(`
+    // Command expiry is maintained by the bounded scheduler reconciliation.
+    // Keep this display endpoint read-only and on one reporting connection so
+    // a refresh cannot consume three pool slots or become an accidental cron.
+    const {agents, tasks, taskSummary} = await loadCachedCaptureOverviewProjection({
+      tenantId: req.tenantId,
+      limit,
+      loader: () => withTransaction(async tx => {
+      const agents = await tx.queryAll(`
         WITH task_load AS (
           SELECT
             COALESCE(assigned.assigned_agent_id, assigned.origin_agent_id)
@@ -8136,8 +9692,8 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
         WHERE ca.tenant_id = $1
           AND ca.status IN ('active', 'paused')
         ORDER BY ca.host_label, ca.display_name, ca.created_at
-      `, [req.tenantId, CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES]),
-      queryAll(`
+      `, [req.tenantId, CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES]);
+      const tasks = await tx.queryAll(`
         SELECT t.*,
           ca.display_name AS agent_display_name,
           ca.host_label AS agent_host_label,
@@ -8211,8 +9767,8 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           CASE WHEN t.status IN ('running', 'recovering', 'resume_requested', 'needs_action', 'interrupted') THEN 0 ELSE 1 END,
           t.updated_at DESC
         LIMIT $2
-      `, [req.tenantId, limit]),
-      queryOne(`
+      `, [req.tenantId, limit]);
+      const taskSummary = await tx.queryOne(`
         SELECT
           COUNT(*) FILTER (
             WHERE t.status IN ('running', 'recovering')
@@ -8261,8 +9817,16 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             AND t.orchestration_revision = 0
             AND t.metadata->>'draft' = 'true'
           )
-      `, [req.tenantId]),
-    ]);
+      `, [req.tenantId]);
+        return {agents, tasks, taskSummary};
+      }, {
+        category: 'reporting',
+        waitTimeoutMs: 250,
+        statementTimeoutMs: 2000,
+        lockTimeoutMs: 100,
+        jitOff: true,
+      }),
+    });
 
     const aiAdmission = getTenantAiAdmissionSnapshot(req.tenantId);
     const publicAgents = agents.map(agent => ({
@@ -8299,6 +9863,16 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
       },
     });
   } catch (err) {
+    if (isDbCapacityError(err) || err?.code === '57014') {
+      const retryAfterMs = Math.max(250, Number(err?.retryAfterMs) || 1000);
+      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(503).json({
+        ok: false,
+        error: 'server_busy',
+        message: '任务看板查询繁忙，请稍后重试',
+        retryAfterMs,
+      });
+    }
     return next(err);
   }
 });
@@ -11630,6 +13204,17 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
           .slice(0, 1);
       }
+      // Legacy/manual retry callers could select several negative posts. Keep
+      // the public request compatible, but admit only the first deterministic
+      // item; the remainder stays retryable for a later bounded admission.
+      if (
+        businessTaskType === 'negative_post_patrol' &&
+        retryItems.length > 1
+      ) {
+        retryItems = retryItems
+          .sort((left, right) => Number(left.ordinal) - Number(right.ordinal))
+          .slice(0, 1);
+      }
       if (retryItems.length === 0) {
         if (dutyRecovery && sourceExecutionPending) {
           abortCrossDeviceRetry('duty_recovery_source_execution_active', {
@@ -11797,6 +13382,13 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         safetyHandoff: Boolean(dutySafetyHandoffPolicy),
       })).digest('hex');
       const commandId = crypto.randomUUID();
+      const itemAttemptIdByItemId = new Map(
+        retryItems.map(item => [String(item.id), crypto.randomUUID()]),
+      );
+      const primaryAttemptIdentity =
+        businessTaskType === 'negative_post_patrol'
+          ? itemAttemptIdByItemId.get(String(retryItems[0]?.id)) || ''
+          : '';
 
       let commandPayload;
       let childPlan = {};
@@ -11864,6 +13456,24 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           requestHash,
           authCodeId: targetAgent.auth_code_id,
           authBindingId: targetAgent.auth_binding_id,
+          ...(primaryAttemptIdentity
+            ? {
+                attemptIdentity: primaryAttemptIdentity,
+                orchestration: {
+                  parentTaskId: parent.id,
+                  revision: nextRevision,
+                  itemIds: [retryItems[0].id],
+                  itemAttempts: [{
+                    itemId: retryItems[0].id,
+                    attemptId: primaryAttemptIdentity,
+                    requestHash,
+                    assignmentRevision: nextRevision,
+                    recordId: text(retryItems[0].record_id, 100),
+                    externalId: text(retryItems[0].external_id, 160),
+                  }],
+                },
+              }
+            : {}),
         };
       }
       if (dutyRecovery) {
@@ -11898,6 +13508,12 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         crossDeviceRetryRequestKey: requestKey,
         crossDeviceRetrySourceExecutionTaskIds: sourceExecutionTaskIds,
         automaticRecovery: automatic,
+        ...(primaryAttemptIdentity
+          ? {
+              perItemAdmissionV1: true,
+              attemptIdentity: primaryAttemptIdentity,
+            }
+          : {}),
         ...(dutyRecovery
           ? {
               dutyRecovery: true,
@@ -12066,6 +13682,19 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           });
         }
       }
+      if (businessTaskType === 'negative_post_patrol') {
+        const admission = await reserveNegativePatrolFirstAdmission(tx, {
+          tenantId: req.tenantId,
+        });
+        if (admission.allowed !== true) {
+          abortCrossDeviceRetry('negative_patrol_admission_deferred', {
+            code: 'SERVER_BUSY',
+            reason: admission.reason,
+            retryAfterMs: admission.retryAfterMs,
+            deferred: true,
+          });
+        }
+      }
       const child = await tx.queryOne(`
         INSERT INTO capture_tasks (
           id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
@@ -12111,8 +13740,11 @@ export async function dispatchCrossDeviceRetry(options = {}) {
       const command = await tx.queryOne(`
         INSERT INTO capture_agent_commands (
           id, tenant_id, agent_id, task_id, command_type, payload,
-          requested_by_user_id, requested_by_name
-        ) VALUES ($1, $2, $3, $4, 'create', $5::jsonb, $6, $7)
+          requested_by_user_id, requested_by_name, admitted_at
+        ) VALUES (
+          $1, $2, $3, $4, 'create', $5::jsonb, $6, $7,
+          CASE WHEN $8::boolean THEN now() ELSE NULL END
+        )
         RETURNING id, status, expires_at
       `, [
         commandId,
@@ -12122,6 +13754,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         JSON.stringify(commandPayload),
         req.user?.id || null,
         text(req.actorName, 240),
+        businessTaskType === 'negative_post_patrol',
       ]);
 
       const dispatchedItemAttempts = [];
@@ -12199,7 +13832,7 @@ export async function dispatchCrossDeviceRetry(options = {}) {
           conflict.code = 'cross_device_retry_item_conflict';
           throw conflict;
         }
-        const itemAttemptId = crypto.randomUUID();
+        const itemAttemptId = itemAttemptIdByItemId.get(String(item.id));
         await tx.execute(`
           INSERT INTO capture_task_item_attempts (
             id, tenant_id, item_id, parent_task_id, execution_task_id,
@@ -12501,6 +14134,15 @@ export async function dispatchCrossDeviceRetry(options = {}) {
   } catch (error) {
     if (
       error?.crossDeviceRetryError ===
+        'negative_patrol_admission_deferred'
+    ) {
+      return {
+        error: 'negative_patrol_admission_deferred',
+        ...safeJson(error.details),
+      };
+    }
+    if (
+      error?.crossDeviceRetryError ===
         'idle_compatible_agent_unavailable'
     ) {
       return noIdleAgentResult();
@@ -12748,6 +14390,20 @@ export async function reconcileElasticCaptureLeases(input = 50) {
             child.assigned_agent_id,
           ])
         : null;
+      const durableTaskAttempt = await tx.queryOne(`
+        SELECT NULLIF(client_attempt_id, '') AS client_attempt_id
+        FROM capture_task_attempts
+        WHERE tenant_id = $1
+          AND task_id = $2
+          AND agent_id = $3
+          AND NULLIF(client_attempt_id, '') IS NOT NULL
+        ORDER BY attempt_number DESC, updated_at DESC, id DESC
+        LIMIT 1
+      `, [
+        candidate.tenant_id,
+        child.id,
+        child.assigned_agent_id,
+      ]);
       const requiresSourceLocalClosure =
         captureItemRequiresLocalClosureReuseFence({
           itemType: sourceItem?.item_type,
@@ -12772,9 +14428,23 @@ export async function reconcileElasticCaptureLeases(input = 50) {
       const failed = await tx.queryOne(`
         UPDATE capture_tasks
         SET status = 'failed',
-          metadata = metadata - 'waitingForSourceClosure' -
-            'sourceClosureBlockedAt' - 'sourceClosureBlockedReason' -
-            'sourceClosureBlockedAttemptId',
+          metadata = (
+            metadata - 'waitingForSourceClosure' -
+              'sourceClosureBlockedAt' - 'sourceClosureBlockedReason' -
+              'sourceClosureBlockedAttemptId'
+          ) || jsonb_strip_nulls(jsonb_build_object(
+            'attemptIdentity', COALESCE(
+              NULLIF($6::text, ''),
+              NULLIF(metadata->>'attemptIdentity', ''),
+              $7::text
+            ),
+            'terminalDisposition', CASE
+              WHEN $5::boolean THEN 'revoked'
+              ELSE 'superseded'
+            END,
+            'terminalReason', $3::text,
+            'terminalDispositionAt', now()::text
+          )),
           error = jsonb_build_object(
             'code', $3::text,
             'message', $4::text,
@@ -12792,6 +14462,8 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         timeoutCode,
         timeoutMessage,
         agentOffline,
+        durableTaskAttempt?.client_attempt_id || '',
+        sourceAttempt?.id || null,
       ]);
       await projectOrchestrationChildControlOutcome(tx, {
         tenantId: candidate.tenant_id,
@@ -13472,10 +15144,413 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
   }
 });
 
-router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+async function cascadeStopNegativePatrolParent(tx, {
+  parent,
+  tenantId,
+  actorId = '',
+  actorName = '',
+}) {
+  const parentMetadata = safeJson(parent.metadata);
+  if (
+    parent.task_type !== 'capture_orchestration' ||
+    parentMetadata.workflow !== 'negative_post_patrol'
+  ) return null;
+  if (parent.status === 'canceled') {
+    return {
+      task: parent,
+      parentCascade: true,
+      existing: true,
+      canceledItemCount: 0,
+      stopCommandIds: [],
+      stopUnconfirmedTaskIds: [],
+      status: 'canceled',
+    };
+  }
+
+  const children = await tx.queryAll(`
+    SELECT child.*,
+      durable_attempt.client_attempt_id AS durable_client_attempt_id,
+      agent.status AS agent_status,
+      agent.capabilities AS agent_capabilities,
+      agent.auth_code_id AS agent_auth_code_id,
+      agent.auth_binding_id AS agent_auth_binding_id,
+      auth_code.status AS auth_code_status,
+      auth_code.expires_at AS auth_code_expires_at,
+      binding.id AS active_auth_binding_id
+    FROM capture_tasks child
+    LEFT JOIN capture_agents agent
+      ON agent.id = child.assigned_agent_id
+      AND agent.tenant_id = child.tenant_id
+    LEFT JOIN auth_codes auth_code
+      ON auth_code.id = agent.auth_code_id
+      AND auth_code.tenant_id = child.tenant_id
+    LEFT JOIN auth_bindings binding
+      ON binding.id = agent.auth_binding_id
+      AND binding.code_id = auth_code.id
+    LEFT JOIN LATERAL (
+      SELECT NULLIF(attempt.client_attempt_id, '') AS client_attempt_id
+      FROM capture_task_attempts attempt
+      WHERE attempt.tenant_id = child.tenant_id
+        AND attempt.task_id = child.id
+        AND attempt.agent_id = child.assigned_agent_id
+        AND NULLIF(attempt.client_attempt_id, '') IS NOT NULL
+      ORDER BY attempt.attempt_number DESC,
+        attempt.updated_at DESC, attempt.id DESC
+      LIMIT 1
+    ) durable_attempt ON true
+    WHERE child.tenant_id = $1
+      AND child.parent_task_id = $2
+      AND child.status NOT IN (
+        'completed', 'completed_with_warnings', 'completed_with_failures',
+        'failed', 'canceled', 'skipped', 'superseded'
+      )
+    ORDER BY child.id
+    FOR UPDATE OF child
+  `, [tenantId, parent.id]);
+  const childIds = children.map(child => child.id);
+  const activeCommands = childIds.length > 0 ? await tx.queryAll(`
+    SELECT *
+    FROM capture_agent_commands
+    WHERE tenant_id = $1
+      AND task_id = ANY($2::uuid[])
+      AND command_type IN ('create', 'resume', 'stop')
+      AND status IN ('pending', 'acknowledged')
+    ORDER BY task_id, created_at DESC, id DESC
+    FOR UPDATE
+  `, [tenantId, childIds]) : [];
+  const activeCreateByTask = new Map();
+  const activeStopByTask = new Map();
+  for (const command of activeCommands) {
+    const taskId = String(command.task_id);
+    if (command.command_type === 'create' && !activeCreateByTask.has(taskId)) {
+      activeCreateByTask.set(taskId, command);
+    }
+    if (command.command_type === 'stop' && !activeStopByTask.has(taskId)) {
+      activeStopByTask.set(taskId, command);
+    }
+  }
+  if (childIds.length > 0) {
+    await tx.execute(`
+      UPDATE capture_agent_commands
+      SET status = 'expired',
+        result = jsonb_build_object(
+          'reason', CASE WHEN status = 'acknowledged'
+            THEN 'superseded_by_stop'
+            ELSE 'stopped_before_dispatch'
+          END,
+          'parentStop', true,
+          'commandStatusBefore', status
+        ),
+        finished_at = now(), updated_at = now()
+      WHERE tenant_id = $1
+        AND task_id = ANY($2::uuid[])
+        AND command_type IN ('create', 'resume')
+        AND status IN ('pending', 'acknowledged')
+    `, [tenantId, childIds]);
+  }
+
+  const stopCommandIds = [];
+  const stopUnconfirmedTaskIds = [];
+  const retainedExecutionTaskIds = [];
+  for (const child of children) {
+    const metadata = safeJson(child.metadata);
+    const createCommand = activeCreateByTask.get(String(child.id));
+    const createCommandItemAttempts = Array.isArray(
+      createCommand?.payload?.orchestration?.itemAttempts,
+    ) ? createCommand.payload.orchestration.itemAttempts : [];
+    const createNeverDelivered = createCommand?.status === 'pending' &&
+      !child.started_at && !child.heartbeat_at;
+    const requestId = text(
+      child.control_task_id ||
+        child.client_task_id ||
+        createCommand?.payload?.clientTaskId,
+      240,
+    );
+    const attemptId = text(
+      child.durable_client_attempt_id ||
+        metadata.attemptIdentity ||
+        createCommand?.payload?.attemptIdentity ||
+        createCommand?.payload?.attemptId ||
+        createCommandItemAttempts[0]?.attemptId,
+      240,
+    );
+    const legacyAttemptlessStop =
+      legacyAcknowledgedNegativePatrolPackStopEligible({
+        task: child,
+        command: createCommand,
+        requestId,
+        attemptId,
+      });
+    const authExpired = child.auth_code_expires_at &&
+      new Date(child.auth_code_expires_at) < new Date();
+    const mayQueueStop = Boolean(
+      !createNeverDelivered &&
+      child.assigned_agent_id &&
+      requestId &&
+      (attemptId || legacyAttemptlessStop) &&
+      child.agent_status === 'active' &&
+      child.auth_code_status === 'active' &&
+      child.active_auth_binding_id &&
+      !authExpired &&
+      safeJson(child.agent_capabilities).remoteStop === true
+    );
+    const stopIdentityUnavailable = Boolean(
+      !createNeverDelivered &&
+      (!requestId || (!attemptId && !legacyAttemptlessStop))
+    );
+    let stopCommand = activeStopByTask.get(String(child.id)) || null;
+    if (stopCommand) {
+      stopCommand = await tx.queryOne(`
+        UPDATE capture_agent_commands
+        SET payload = payload || $1::jsonb,
+          updated_at = now()
+        WHERE id = $2 AND tenant_id = $3
+        RETURNING id
+      `, [
+        JSON.stringify({
+          terminalDisposition: 'canceled',
+          terminalReason: 'parent_orchestration_stopped',
+          ...(attemptId ? {attemptId} : {}),
+          ...(legacyAttemptlessStop
+            ? {
+                legacyNegativePackStopV1: true,
+                legacyTargetCount:
+                  legacyNegativePatrolTargetCount(createCommand.payload),
+              }
+            : {}),
+          ...(createCommand?.status === 'acknowledged'
+            ? {supersededCreateCommandId: createCommand.id}
+            : {}),
+        }),
+        stopCommand.id,
+        tenantId,
+      ]);
+    } else if (mayQueueStop) {
+      stopCommand = await tx.queryOne(`
+        INSERT INTO capture_agent_commands (
+          tenant_id, agent_id, task_id, command_type, payload,
+          requested_by_user_id, requested_by_name
+        ) VALUES ($1, $2, $3, 'stop', $4::jsonb, $5, $6)
+        RETURNING id
+      `, [
+        tenantId,
+        child.assigned_agent_id,
+        child.id,
+        JSON.stringify({
+          controlTaskId: requestId,
+          previousStatus: child.status,
+          ...(attemptId ? {attemptId} : {}),
+          terminalDisposition: 'canceled',
+          terminalReason: 'parent_orchestration_stopped',
+          ...(legacyAttemptlessStop
+            ? {
+                legacyNegativePackStopV1: true,
+                legacyTargetCount:
+                  legacyNegativePatrolTargetCount(createCommand.payload),
+              }
+            : {}),
+          ...(createCommand?.status === 'acknowledged'
+            ? {supersededCreateCommandId: createCommand.id}
+            : {}),
+          authCodeId: child.agent_auth_code_id,
+          authBindingId: child.agent_auth_binding_id,
+          platform: child.platform,
+        }),
+        actorId || null,
+        text(actorName, 240),
+      ]);
+    }
+    const stopPending = Boolean(stopCommand?.id);
+    const terminalNoticeFallback = !createNeverDelivered && !stopPending;
+    if (!createNeverDelivered) retainedExecutionTaskIds.push(child.id);
+    if (stopPending) stopCommandIds.push(stopCommand.id);
+    else if (!createNeverDelivered && requestId) {
+      stopUnconfirmedTaskIds.push(child.id);
+    }
+    await tx.execute(`
+      UPDATE capture_tasks
+      SET status = CASE WHEN $4::boolean THEN 'canceled' ELSE status END,
+        message = CASE
+          WHEN $4::boolean THEN '父任务已在设备领取前取消'
+          WHEN $5::boolean THEN '父任务已停止，等待设备确认当前执行轮次已停止'
+          ELSE '父任务已停止，等待设备确认终态通知'
+        END,
+        metadata = (metadata
+          - 'resumeCommandId' - 'resumePreviousStatus') || $1::jsonb,
+        finished_at = CASE
+          WHEN $4::boolean THEN COALESCE(finished_at, now())
+          ELSE finished_at
+        END,
+        updated_at = now(), source_updated_at = now()
+      WHERE id = $2 AND tenant_id = $3
+    `, [
+      JSON.stringify({
+        ...(createNeverDelivered || terminalNoticeFallback
+          ? {
+              terminalDisposition: 'canceled',
+              terminalReason: 'parent_orchestration_stopped',
+              terminalDispositionAt: new Date().toISOString(),
+            }
+          : {}),
+            ...(stopPending
+              ? {
+                  stopCommandId: stopCommand.id,
+                  stopPreviousStatus: child.status,
+                  stopPending: true,
+                }
+              : {}),
+            ...(stopIdentityUnavailable
+              ? {
+                  stopPending: true,
+                  stopIdentityUnavailable: true,
+                }
+              : {}),
+            ...(createNeverDelivered ? {stoppedBeforeDispatch: true} : {}),
+      }),
+      child.id,
+      tenantId,
+      createNeverDelivered,
+      stopPending,
+    ]);
+  }
+
+  await tx.execute(`
+    UPDATE capture_task_items
+    SET metadata = metadata || jsonb_build_object(
+        'operatorStopped', true,
+        'operatorStoppedAt', now()
+      ),
+      updated_at = now()
+    WHERE tenant_id = $1 AND task_id = $2
+      AND status NOT IN (
+        'completed', 'completed_with_warnings', 'skipped', 'canceled'
+      )
+  `, [tenantId, parent.id]);
+  const canceledItems = await tx.queryAll(`
+    UPDATE capture_task_items
+    SET status = 'canceled',
+      finished_at = COALESCE(finished_at, now()),
+      updated_at = now()
+    WHERE tenant_id = $1 AND task_id = $2
+      AND status NOT IN (
+        'completed', 'completed_with_warnings', 'skipped', 'canceled'
+      )
+      AND (
+        execution_task_id IS NULL
+        OR NOT (execution_task_id = ANY($3::uuid[]))
+      )
+    RETURNING id
+  `, [tenantId, parent.id, retainedExecutionTaskIds]);
+  await tx.execute(`
+    UPDATE capture_task_item_attempts attempt
+    SET status = 'canceled',
+      finished_at = COALESCE(attempt.finished_at, now()),
+      updated_at = now()
+    FROM capture_task_items item
+    WHERE item.id = attempt.item_id
+      AND item.tenant_id = $1 AND item.task_id = $2
+      AND item.status = 'canceled'
+      AND (
+        attempt.execution_task_id IS NULL
+        OR NOT (attempt.execution_task_id = ANY($3::uuid[]))
+      )
+      AND attempt.status NOT IN (
+        'completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled'
+      )
+  `, [tenantId, parent.id, retainedExecutionTaskIds]);
+  const items = await tx.queryAll(`
+    SELECT status
+    FROM capture_task_items
+    WHERE tenant_id = $1 AND task_id = $2
+    ORDER BY ordinal, id
+  `, [tenantId, parent.id]);
+  const aggregate = aggregateParentTaskItems(items);
+  // A delivered execution continues to hold admission until its exact stop
+  // receipt or terminal notice acknowledgement settles the child. Command
+  // availability alone does not prove the local runner has stopped.
+  const stopPendingCount = retainedExecutionTaskIds.length;
+  const parentStopStatus = stopPendingCount > 0
+    ? 'waiting_device'
+    : 'canceled';
+  const updatedParent = await tx.queryOne(`
+    UPDATE capture_tasks
+    SET status = $6,
+      progress = $1::jsonb,
+      counts = $2::jsonb,
+      metadata = metadata || jsonb_build_object(
+        'operatorStopped', true,
+        'operatorStoppedAt', now()::text,
+        'automaticRetryDisabled', true,
+        'stopPendingCount', $3::integer
+      ),
+      message = CASE WHEN $6 = 'canceled'
+        THEN '整个负面巡查已停止，未完成帖子不再领取'
+        ELSE '已停止新领取，等待设备确认当前执行轮次已停止'
+      END,
+      finished_at = CASE
+        WHEN $6 = 'canceled' THEN COALESCE(finished_at, now())
+        ELSE NULL
+      END,
+      updated_at = now(), source_updated_at = now()
+    WHERE id = $4 AND tenant_id = $5
+    RETURNING *
+  `, [
+    JSON.stringify({
+      ...aggregate.progress,
+      phase: parentStopStatus === 'canceled'
+        ? 'canceled'
+        : 'stop_requested',
+    }),
+    JSON.stringify(aggregate.counts),
+    stopPendingCount,
+    parent.id,
+    tenantId,
+    parentStopStatus,
+  ]);
+  await appendEvent(tx, {
+    tenantId,
+    taskId: parent.id,
+    eventType: 'negative_patrol_parent_stopped',
+    actorType: 'user',
+    actorId,
+    actorName,
+    status: parentStopStatus,
+    message: parentStopStatus === 'canceled'
+      ? '运营人员已停止整个负面巡查任务'
+      : '运营人员已停止新领取，等待设备确认当前执行轮次',
+    payload: {
+      canceledItemCount: canceledItems.length,
+      stopCommandIds,
+      stopUnconfirmedTaskIds,
+    },
+  });
+  return {
+    task: updatedParent,
+    parentCascade: true,
+    existing: parent.status === 'canceled',
+    canceledItemCount: canceledItems.length,
+    stopCommandIds,
+    stopUnconfirmedTaskIds,
+    stopPendingCount,
+    status: parentStopStatus,
+  };
+}
+
+router.post('/tasks/:id/stop', requireCriticalTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
   try {
     const result = await withTransaction(async tx => {
-      await expireStaleCommands(tx, req.tenantId, req.params.id);
+      const stopTarget = await tx.queryOne(`
+        SELECT id, parent_task_id
+        FROM capture_tasks
+        WHERE id = $1 AND tenant_id = $2
+      `, [req.params.id, req.tenantId]);
+      if (!stopTarget) return {error: 'task_not_found'};
+      const orchestrationControlId =
+        stopTarget.parent_task_id || stopTarget.id;
+      await tx.queryOne(
+        'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+        ['capture_orchestration_control', orchestrationControlId],
+      );
       const task = await tx.queryOne(`
         SELECT t.*, ca.status AS agent_status, ca.last_heartbeat_at,
           ca.allowed_platforms AS agent_allowed_platforms,
@@ -13498,6 +15573,14 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
         FOR UPDATE OF t
       `, [req.params.id, req.tenantId]);
       if (!task) return {error: 'task_not_found'};
+
+      const parentCascade = await cascadeStopNegativePatrolParent(tx, {
+        parent: task,
+        tenantId: req.tenantId,
+        actorId: req.user?.id || '',
+        actorName: req.actorName,
+      });
+      if (parentCascade) return parentCascade;
 
       const agentId = task.assigned_agent_id || task.origin_agent_id;
       const targetedStop = isTargetedPostTaskType(task.task_type);
@@ -13544,7 +15627,7 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
         SELECT id, status
         FROM capture_agent_commands
         WHERE task_id = $1 AND agent_id = $2 AND command_type = 'create'
-          AND status IN ('pending', 'acknowledged') AND expires_at > now()
+          AND status IN ('pending', 'acknowledged')
         ORDER BY created_at DESC
         LIMIT 1
         FOR UPDATE
@@ -13701,6 +15784,11 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
         payload: {commandId: command.id, controlTaskId},
       });
       return {task, command, existing: false};
+    }, {
+      category: 'critical',
+      waitTimeoutMs: 500,
+      statementTimeoutMs: 5000,
+      lockTimeoutMs: 1000,
     });
 
     const messages = {
@@ -13721,6 +15809,22 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
         existing: true,
         status: 'canceled',
         message: '任务已经停止',
+      });
+    }
+    if (result.parentCascade) {
+      return res.json({
+        ok: true,
+        existing: result.existing === true,
+        status: result.status,
+        canceledItemCount: result.canceledItemCount,
+        stopCommandIds: result.stopCommandIds,
+        stopPendingCount: result.stopPendingCount,
+        stopUnconfirmedTaskIds: result.stopUnconfirmedTaskIds,
+        message: result.status !== 'canceled'
+          ? '已停止新帖子领取，等待设备确认当前执行轮次已停止'
+          : result.existing
+          ? '整个负面巡查已经停止，子任务停止状态已重新对账'
+          : '整个负面巡查已停止，未完成帖子不再领取',
       });
     }
     if (result.immediate) {
@@ -13744,6 +15848,19 @@ router.post('/tasks/:id/stop', requireTenantAccess, requireSessionUser, requireT
         : '设备当前离线，停止指令会排队等待设备上线',
     });
   } catch (err) {
+    if (
+      isDbCapacityError(err) ||
+      ['57014', '55P03', '40P01'].includes(err?.code)
+    ) {
+      const retryAfterMs = Math.max(250, Number(err.retryAfterMs) || 1000);
+      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(503).json({
+        ok: false,
+        error: 'server_busy',
+        message: '停止请求通道繁忙，请稍后重试',
+        retryAfterMs,
+      });
+    }
     return next(err);
   }
 });

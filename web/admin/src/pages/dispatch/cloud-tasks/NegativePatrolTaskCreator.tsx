@@ -1,12 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  AlertTriangle, CalendarDays, Check, Loader2, MessageSquareText,
-  RefreshCw, Search, Send, Sparkles, Users,
+  AlertTriangle, CalendarDays, Check, ChevronLeft, ChevronRight, Loader2,
+  MessageSquareText, RefreshCw, Search, Send, Sparkles, Users,
 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { useAuth } from '@/lib/auth'
 import { Button } from '@/components/ui/button'
 import type { CloudAgent } from './lib'
 import { PLATFORM_LABELS, agentCreatePlatforms } from './lib'
+import {
+  classifySubmissionFailure,
+  confirmedSubmissionTaskId,
+  createSubmissionRecord,
+  isCurrentPreviewRequest,
+  listSubmissionRecords,
+  NEGATIVE_PATROL_MAX_SELECTED,
+  NEGATIVE_PATROL_PREVIEW_PAGE_SIZE,
+  recoverInterruptedSubmission,
+  removeSubmissionRecord,
+  stableStringify,
+  submissionScopeLockName,
+  submissionStorageKey,
+  updatePageSelection,
+  updateSubmissionRecord,
+  writeSubmissionRecord,
+  type NegativePatrolSubmissionRecord,
+} from './negativePatrolSubmission'
 
 type NegativePatrolCandidate = {
   id: string
@@ -26,6 +45,14 @@ type NegativePatrolCandidate = {
     shares?: number
   }
   risk_level?: string
+  effectiveSentiment?: string
+  sentimentSource?: string
+  canDispatch?: boolean
+  dispatchable?: boolean
+  eligible?: boolean
+  eligibilityReason?: unknown
+  eligibilityCode?: string
+  falsePositivePending?: boolean
 }
 
 type PreviewResponse = {
@@ -34,8 +61,107 @@ type PreviewResponse = {
   records?: NegativePatrolCandidate[]
   total?: number
   matchedCount?: number
+  dispatchableCount?: number
+  eligibleCount?: number
+  deferredCount?: number
+  pageCount?: number
+  currentPageCount?: number
+  nextCursor?: string | null
+  hasMore?: boolean
   limited?: boolean
   message?: string
+  counts?: {
+    matched?: number
+    dispatchable?: number
+    eligible?: number
+    deferred?: number
+    page?: number
+  }
+}
+
+type PreviewPage = {
+  cursor: string | null
+  candidates: NegativePatrolCandidate[]
+  nextCursor: string | null
+  hasMore: boolean
+}
+
+type TaskCreateResponse = {
+  ok?: boolean
+  message?: string
+  existing?: boolean
+  taskId?: string
+  task?: {id?: string}
+}
+
+type TaskFailureBody = {
+  error?: string
+  code?: string
+  message?: string
+  submissionState?: string
+  created?: boolean
+  invalidRecordIds?: string[]
+}
+
+class TaskCreationResponseError extends Error {
+  readonly status: number
+  readonly code: string
+  readonly submissionState: string
+  readonly created: boolean | undefined
+  readonly invalidRecordIds: string[]
+
+  constructor(status: number, body: TaskFailureBody) {
+    super(body.message || body.error || '创建负面帖子巡查任务失败')
+    this.name = 'TaskCreationResponseError'
+    this.status = status
+    this.code = String(body.error || body.code || '')
+    this.submissionState = String(body.submissionState || '')
+    this.created = body.created
+    this.invalidRecordIds = Array.isArray(body.invalidRecordIds)
+      ? body.invalidRecordIds.map(String)
+      : []
+  }
+}
+
+async function postNegativePatrolTask(
+  input: Record<string, unknown>,
+  requestKey: string,
+  tenantId: string,
+) {
+  const controller = new AbortController()
+  const timeoutId = window.setTimeout(() => controller.abort(), 30_000)
+  try {
+    const response = await fetch('/api/capture-cloud/negative-patrol/tasks', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(tenantId ? {'x-tenant-id': tenantId} : {}),
+      },
+      body: JSON.stringify({...input, requestKey}),
+      signal: controller.signal,
+    })
+    let body: TaskCreateResponse & TaskFailureBody
+    try {
+      body = await response.json() as TaskCreateResponse & TaskFailureBody
+    } catch {
+      throw new Error('服务器返回格式异常，提交结果需要确认。')
+    }
+    if (!response.ok) throw new TaskCreationResponseError(response.status, body)
+    if (!confirmedSubmissionTaskId(body)) {
+      throw new Error('服务器未返回可确认的任务编号，提交结果需要确认。')
+    }
+    return body
+  } catch (error) {
+    if (controller.signal.aborted) {
+      const timeoutError = new Error('请求超时，服务端是否已创建任务尚未确认。') as Error & {cause?: unknown}
+      timeoutError.cause = error
+      throw timeoutError
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timeoutId)
+  }
 }
 
 function localDateKey(date: Date) {
@@ -86,6 +212,54 @@ function platformTone(platform: string) {
     : 'bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300'
 }
 
+function eligibilityReason(candidate: NegativePatrolCandidate) {
+  if (typeof candidate.eligibilityReason === 'string') return candidate.eligibilityReason.trim()
+  if (candidate.eligibilityReason && typeof candidate.eligibilityReason === 'object') {
+    const source = candidate.eligibilityReason as Record<string, unknown>
+    return String(source.message || source.reason || '').trim()
+  }
+  return ''
+}
+
+function canDispatchCandidate(candidate: NegativePatrolCandidate) {
+  return candidate.canDispatch === true
+}
+
+function sentimentLabel(candidate: NegativePatrolCandidate) {
+  const source = String(candidate.sentimentSource || '').toLowerCase()
+  if (String(candidate.effectiveSentiment || '').toLowerCase() !== 'negative') return ''
+  if (source.includes('invalid')) return ''
+  if (source.includes('manual') || source.includes('human')) return '人工负面'
+  if (source.includes('ai')) return 'AI 负面'
+  return candidate.effectiveSentiment === 'negative' ? '当前负面' : ''
+}
+
+function uniqueCandidates(rows: NegativePatrolCandidate[], excluded = new Set<string>()) {
+  const seen = new Set(excluded)
+  return rows.filter(candidate => {
+    if (!candidate || typeof candidate.id !== 'string' || !candidate.id || seen.has(candidate.id)) return false
+    seen.add(candidate.id)
+    return true
+  })
+}
+
+function persistSubmission(key: string, record: NegativePatrolSubmissionRecord) {
+  try {
+    writeSubmissionRecord(window.localStorage, key, record)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function discardSubmission(key: string) {
+  try {
+    removeSubmissionRecord(window.localStorage, key)
+  } catch {
+    // A retained record is safer than losing an unresolved submission.
+  }
+}
+
 export function NegativePatrolTaskCreator({
   agents,
   writable,
@@ -97,10 +271,11 @@ export function NegativePatrolTaskCreator({
   initialRecordIds?: string[]
   onCreated: () => Promise<void>
 }) {
+  const {user, tenantId} = useAuth()
   const initialRange = useMemo(() => initialDateRange(), [])
   const stableInitialIds = useMemo(() => Array.from(new Set(
     initialRecordIds.map(value => String(value || '').trim()).filter(Boolean),
-  )).slice(0, 100), [initialRecordIds])
+  )).slice(0, NEGATIVE_PATROL_MAX_SELECTED), [initialRecordIds])
   const availablePlatforms = useMemo(() => Array.from(new Set(
     agents.flatMap(agent => agentCreatePlatforms(agent)),
   )), [agents])
@@ -110,33 +285,55 @@ export function NegativePatrolTaskCreator({
   const [publishDateTo, setPublishDateTo] = useState(initialRange.to)
   const [query, setQuery] = useState('')
   const [minInteractions, setMinInteractions] = useState(0)
-  const [limit, setLimit] = useState(Math.max(stableInitialIds.length, 50))
   const [includeComments, setIncludeComments] = useState(false)
   const [includeBloggerMetrics, setIncludeBloggerMetrics] = useState(false)
-  const [candidates, setCandidates] = useState<NegativePatrolCandidate[]>([])
+  const [previewPages, setPreviewPages] = useState<PreviewPage[]>([])
+  const [pageIndex, setPageIndex] = useState(0)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [matchedCount, setMatchedCount] = useState(0)
+  const [dispatchableCount, setDispatchableCount] = useState(0)
+  const [deferredCount, setDeferredCount] = useState(0)
   const [limited, setLimited] = useState(false)
   const [handoffMissingCount, setHandoffMissingCount] = useState(0)
   const [previewed, setPreviewed] = useState(false)
   const [previewing, setPreviewing] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
+  const [submission, setSubmission] = useState<NegativePatrolSubmissionRecord | null>(null)
+  const [submissionBusy, setSubmissionBusy] = useState(false)
+  const [loadedSubmissionScope, setLoadedSubmissionScope] = useState('')
   const [error, setError] = useState('')
   const [feedback, setFeedback] = useState('')
-  const loadedInitial = useRef(false)
-  const pendingSubmission = useRef<{ fingerprint: string; requestKey: string } | null>(null)
+  const loadedInitialScope = useRef('')
+  const previewGeneration = useRef(0)
+  const activePreviewCriteria = useRef('')
+  const previewSnapshotCriteria = useRef('')
+  const activeScope = useRef('')
+  const activeSubmissionRequest = useRef('')
 
   const supportsPatrol = agents.length > 0
     && agents.every(agent =>
       agent.capabilities?.negativePostPatrol === true
+      && agent.capabilities?.negativePatrolTerminalReceiptV1 === true
       && agent.capabilities?.remoteTargetedPostCaptureV1 === true,
     )
   const multiAgent = agents.length > 1
   const selectedPlatforms = platforms.filter(platform => availablePlatforms.includes(platform))
   const elasticPool = multiAgent || selectedPlatforms.length > 1
-  const allSelected = candidates.length > 0 && selectedIds.size === candidates.length
+  const scopeKey = user?.id && tenantId ? `${user.id}:${tenantId}` : ''
+  const currentPage = previewPages[pageIndex] || null
+  const candidates = currentPage?.candidates || []
+  const loadedCandidates = useMemo(() => {
+    const seen = new Set<string>()
+    return previewPages.flatMap(page => page.candidates).filter(candidate => {
+      if (seen.has(candidate.id)) return false
+      seen.add(candidate.id)
+      return true
+    })
+  }, [previewPages])
+  const selectablePageIds = candidates.filter(canDispatchCandidate).map(candidate => candidate.id)
+  const allSelected = selectablePageIds.length > 0
+    && selectablePageIds.every(id => selectedIds.has(id))
   const onlineAgentCount = agents.filter(agent => agent.online).length
-  const selectedCandidates = candidates.filter(candidate => selectedIds.has(candidate.id))
+  const selectedCandidates = loadedCandidates.filter(candidate => selectedIds.has(candidate.id))
   const selectedCandidatePlatforms = Array.from(new Set(
     selectedCandidates.map(candidate => candidate.platform).filter(Boolean),
   ))
@@ -151,21 +348,39 @@ export function NegativePatrolTaskCreator({
     publishDateFrom,
     publishDateTo,
     platform: selectedPlatforms.length === 1 ? selectedPlatforms[0] : 'mixed',
-    platforms: selectedPlatforms,
+    platforms: [...selectedPlatforms].sort(),
     query: query.trim(),
     minInteractions,
-    limit,
+    limit: NEGATIVE_PATROL_MAX_SELECTED,
+    timezone: 'Asia/Shanghai',
   }
+  const previewCriteriaKey = stableStringify({
+    scopeKey,
+    publishDateFrom,
+    publishDateTo,
+    platforms: [...selectedPlatforms].sort(),
+    query: query.trim(),
+    minInteractions,
+    recordIds: stableInitialIds,
+  })
+  const submissionLocked = submission !== null
+  const submitting = submission?.status === 'submitting' && submissionBusy
 
   const clearPreview = () => {
-    setCandidates([])
+    previewGeneration.current += 1
+    previewSnapshotCriteria.current = ''
+    setPreviewing(false)
+    setPreviewPages([])
+    setPageIndex(0)
     setSelectedIds(new Set())
     setMatchedCount(0)
+    setDispatchableCount(0)
+    setDeferredCount(0)
     setLimited(false)
     setHandoffMissingCount(0)
     setPreviewed(false)
     setFeedback('')
-    pendingSubmission.current = null
+    setError('')
   }
 
   const validateFilters = () => {
@@ -178,83 +393,405 @@ export function NegativePatrolTaskCreator({
     if (!Number.isSafeInteger(minInteractions) || minInteractions < 0) {
       return '最低互动量必须是大于等于 0 的整数。'
     }
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
-      return '候选上限必须是 1–100 的整数。'
-    }
     return ''
   }
 
-  const preview = async (recordIds = stableInitialIds) => {
+  const preview = async ({
+    recordIds = stableInitialIds,
+    cursor = null,
+    append = false,
+  }: {
+    recordIds?: string[]
+    cursor?: string | null
+    append?: boolean
+  } = {}) => {
     setError('')
     setFeedback('')
+    if (submissionLocked) {
+      setError('上次提交结果尚未确认，请先完成恢复。')
+      return
+    }
     const validationError = validateFilters()
     if (validationError) {
       setError(validationError)
       return
     }
+    if (append && previewSnapshotCriteria.current !== previewCriteriaKey) {
+      clearPreview()
+      setError('筛选条件已经变化，请重新预览。')
+      return
+    }
+    const generation = ++previewGeneration.current
+    const responseCriteriaKey = previewCriteriaKey
+    if (!append) {
+      previewSnapshotCriteria.current = ''
+      setPreviewPages([])
+      setPageIndex(0)
+      setSelectedIds(new Set())
+      setMatchedCount(0)
+      setDispatchableCount(0)
+      setDeferredCount(0)
+      setLimited(false)
+      setHandoffMissingCount(0)
+      setPreviewed(false)
+    }
     setPreviewing(true)
     try {
+      const pageSize = recordIds.length > 0
+        ? Math.min(NEGATIVE_PATROL_MAX_SELECTED, Math.max(NEGATIVE_PATROL_PREVIEW_PAGE_SIZE, recordIds.length))
+        : NEGATIVE_PATROL_PREVIEW_PAGE_SIZE
       const result = await api.post<PreviewResponse>(
         '/capture-cloud/negative-patrol/candidates/preview',
-        { ...filters, ...(recordIds.length > 0 ? { recordIds } : {}) },
+        {
+          ...filters,
+          limit: pageSize,
+          pageSize,
+          ...(cursor ? {cursor} : {}),
+          ...(recordIds.length > 0 ? {recordIds} : {}),
+        },
       )
-      const rows = (result.candidates || result.records || [])
-        .filter(item => item && typeof item.id === 'string')
+      if (!isCurrentPreviewRequest({
+        activeGeneration: previewGeneration.current,
+        responseGeneration: generation,
+        activeCriteriaKey: activePreviewCriteria.current,
+        responseCriteriaKey,
+      })) return
+      const existingIds = append
+        ? new Set(previewPages.flatMap(page => page.candidates.map(candidate => candidate.id)))
+        : new Set<string>()
+      const rows = uniqueCandidates(result.candidates || result.records || [], existingIds)
       const missingCount = recordIds.length > 0 ? Math.max(0, recordIds.length - rows.length) : 0
-      setCandidates(rows)
-      setSelectedIds(new Set(rows.map(item => item.id)))
-      setMatchedCount(safeCount(result.total ?? result.matchedCount ?? rows.length))
+      const nextCursor = typeof result.nextCursor === 'string' && result.nextCursor
+        ? result.nextCursor
+        : null
+      const page: PreviewPage = {
+        cursor,
+        candidates: rows,
+        nextCursor,
+        hasMore: result.hasMore === true || nextCursor !== null,
+      }
+      if (append) {
+        setPreviewPages(current => [...current, page])
+        setPageIndex(previewPages.length)
+      } else {
+        setPreviewPages([page])
+        setPageIndex(0)
+        setSelectedIds(new Set(
+          rows.filter(canDispatchCandidate)
+            .slice(0, NEGATIVE_PATROL_MAX_SELECTED)
+            .map(item => item.id),
+        ))
+      }
+      const matched = safeCount(result.matchedCount ?? result.counts?.matched ?? result.total ?? rows.length)
+      const dispatchable = safeCount(
+        result.dispatchableCount
+          ?? result.eligibleCount
+          ?? result.counts?.dispatchable
+          ?? result.counts?.eligible
+          ?? matched,
+      )
+      setMatchedCount(matched)
+      setDispatchableCount(dispatchable)
+      setDeferredCount(safeCount(
+        result.deferredCount ?? result.counts?.deferred ?? Math.max(0, matched - dispatchable),
+      ))
       setLimited(result.limited === true)
       setHandoffMissingCount(missingCount)
       setPreviewed(true)
+      previewSnapshotCriteria.current = responseCriteriaKey
       if (missingCount > 0) {
         setError(`带入清单中有 ${missingCount} 条不符合负面巡查条件，请返回重新选择负面内容。`)
       } else {
         setFeedback(rows.length > 0
           ? recordIds.length > 0
             ? `已加载 ${rows.length} 条负面内容。`
-            : `已找到 ${result.total ?? result.matchedCount ?? rows.length} 条符合条件的负面帖子。`
+            : append
+              ? `已加载第 ${previewPages.length + 1} 页。跨页选择已保留。`
+              : `已找到 ${matched} 条当前负面帖子，其中 ${dispatchable} 条可下发。`
           : result.message || '当前范围内没有可巡查的负面帖子。')
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '读取负面候选失败')
+      if (isCurrentPreviewRequest({
+        activeGeneration: previewGeneration.current,
+        responseGeneration: generation,
+        activeCriteriaKey: activePreviewCriteria.current,
+        responseCriteriaKey,
+      })) {
+        setError(err instanceof Error ? err.message : '读取负面候选失败')
+      }
     } finally {
-      setPreviewing(false)
+      if (isCurrentPreviewRequest({
+        activeGeneration: previewGeneration.current,
+        responseGeneration: generation,
+        activeCriteriaKey: activePreviewCriteria.current,
+        responseCriteriaKey,
+      })) {
+        setPreviewing(false)
+      }
     }
   }
 
   useEffect(() => {
-    if (loadedInitial.current || stableInitialIds.length === 0) return
-    loadedInitial.current = true
-    void preview(stableInitialIds)
+    activeScope.current = scopeKey
+    activePreviewCriteria.current = previewCriteriaKey
+  }, [previewCriteriaKey, scopeKey])
+
+  useEffect(() => {
+    let cancelled = false
+    previewGeneration.current += 1
+    previewSnapshotCriteria.current = ''
+    loadedInitialScope.current = ''
+    queueMicrotask(() => {
+      if (cancelled) return
+      setPreviewing(false)
+      setLoadedSubmissionScope('')
+      setPreviewPages([])
+      setPageIndex(0)
+      setSelectedIds(new Set())
+      setMatchedCount(0)
+      setDispatchableCount(0)
+      setDeferredCount(0)
+      setLimited(false)
+      setHandoffMissingCount(0)
+      setPreviewed(false)
+      setError('')
+      setFeedback('')
+      if (!scopeKey || !user?.id || !tenantId) {
+        setSubmission(null)
+        return
+      }
+      let stored: NegativePatrolSubmissionRecord | null = null
+      try {
+        const records = listSubmissionRecords(window.localStorage, user.id, tenantId)
+        for (const record of records) {
+          const key = submissionStorageKey(record.userId, record.tenantId, record.requestKey)
+          if (record.status === 'rejected_before_create') {
+            discardSubmission(key)
+            continue
+          }
+          if (!stored) stored = record
+        }
+      } catch {
+        setSubmission(null)
+        setLoadedSubmissionScope('')
+        setError('无法安全读取提交恢复记录，请先检查浏览器本地存储。')
+        return
+      }
+      if (stored?.status === 'submitting') {
+        stored = recoverInterruptedSubmission(stored)
+        const key = submissionStorageKey(stored.userId, stored.tenantId, stored.requestKey)
+        if (!persistSubmission(key, stored)) {
+          setError('无法更新上次提交的本地恢复状态，请释放浏览器存储空间。')
+        }
+      }
+      setSubmission(stored)
+      if (!activeSubmissionRequest.current) setSubmissionBusy(false)
+      setLoadedSubmissionScope(scopeKey)
+      if (stored?.status === 'unknown') {
+        setError('上次提交的结果尚未确认，请使用原请求继续确认。')
+      } else if (stored?.status === 'conflict') {
+        setError(stored.message || '上次提交需要原用户重新登录后继续确认。')
+      } else if (stored?.status === 'confirmed') {
+        setFeedback('任务已经确认创建，只需刷新任务列表。')
+      }
+    })
+    return () => { cancelled = true }
+  }, [scopeKey, tenantId, user?.id])
+
+  useEffect(() => {
+    if (
+      stableInitialIds.length === 0
+      || !scopeKey
+      || loadedSubmissionScope !== scopeKey
+      || submissionLocked
+      || loadedInitialScope.current === scopeKey
+    ) return
+    loadedInitialScope.current = scopeKey
+    void preview({recordIds: stableInitialIds})
     // Initial handoff is consumed once; later filtering is explicitly user-driven.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [loadedSubmissionScope, scopeKey, submissionLocked])
 
-  const toggleCandidate = (id: string) => {
+  const toggleCandidate = (candidate: NegativePatrolCandidate) => {
+    if (submissionLocked || !canDispatchCandidate(candidate)) return
     setSelectedIds(current => {
       const next = new Set(current)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
+      if (next.has(candidate.id)) {
+        next.delete(candidate.id)
+      } else if (next.size >= NEGATIVE_PATROL_MAX_SELECTED) {
+        setError(`单次最多选择 ${NEGATIVE_PATROL_MAX_SELECTED} 条，请分批下发。`)
+      } else {
+        next.add(candidate.id)
+      }
       return next
     })
-    pendingSubmission.current = null
   }
 
   const toggleAll = () => {
-    setSelectedIds(allSelected ? new Set() : new Set(candidates.map(item => item.id)))
-    pendingSubmission.current = null
+    if (submissionLocked) return
+    setSelectedIds(current => {
+      const result = updatePageSelection(
+        current,
+        selectablePageIds,
+        !allSelected,
+        NEGATIVE_PATROL_MAX_SELECTED,
+      )
+      if (result.overflow > 0) {
+        setError(`单次最多选择 ${NEGATIVE_PATROL_MAX_SELECTED} 条，本页还有 ${result.overflow} 条未选，请分批下发。`)
+      } else {
+        setError('')
+      }
+      return result.selected
+    })
+  }
+
+  const showPage = async (nextIndex: number) => {
+    if (submissionLocked || previewing || nextIndex < 0) return
+    if (previewPages[nextIndex]) {
+      setPageIndex(nextIndex)
+      return
+    }
+    if (nextIndex !== pageIndex + 1 || !currentPage?.nextCursor) return
+    await preview({cursor: currentPage.nextCursor, append: true})
+  }
+
+  const finishConfirmedSubmission = async (record: NegativePatrolSubmissionRecord) => {
+    const actionKey = `refresh:${record.requestKey}`
+    if (activeSubmissionRequest.current) return
+    activeSubmissionRequest.current = actionKey
+    setSubmissionBusy(true)
+    try {
+      await onCreated()
+      const key = submissionStorageKey(record.userId, record.tenantId, record.requestKey)
+      discardSubmission(key)
+      if (activeScope.current === `${record.userId}:${record.tenantId}`) setSubmission(null)
+    } catch (err) {
+      setError(err instanceof Error ? `任务已创建，但列表刷新失败：${err.message}` : '任务已创建，但列表刷新失败。')
+    } finally {
+      if (activeSubmissionRequest.current === actionKey) {
+        activeSubmissionRequest.current = ''
+        setSubmissionBusy(false)
+      }
+    }
+  }
+
+  const runSubmission = async (record: NegativePatrolSubmissionRecord, recovery: boolean) => {
+    if (activeSubmissionRequest.current) return
+    const recordScope = `${record.userId}:${record.tenantId}`
+    const recordStorageKey = submissionStorageKey(record.userId, record.tenantId, record.requestKey)
+    const active = updateSubmissionRecord(record, 'submitting', {
+      message: recovery ? '正在使用原请求确认上次提交。' : '正在创建任务。',
+    })
+    if (!persistSubmission(recordStorageKey, active)) {
+      setError('浏览器无法保存提交恢复信息，本次没有下发。请释放本地存储空间后重试。')
+      return
+    }
+    activeSubmissionRequest.current = active.requestKey
+    if (activeScope.current === recordScope) setSubmission(active)
+    setSubmissionBusy(true)
+    setError('')
+    setFeedback(recovery ? '正在确认上次提交；将复用相同请求，不会另建一批。' : '')
+
+    let result: TaskCreateResponse
+    try {
+      result = await postNegativePatrolTask(active.input, active.requestKey, active.tenantId)
+    } catch (err) {
+      const responseError = err instanceof TaskCreationResponseError ? err : null
+      const failureStatus = classifySubmissionFailure({
+        httpStatus: responseError?.status,
+        code: responseError?.code,
+        submissionState: responseError?.submissionState,
+        created: responseError?.created,
+      })
+      if (failureStatus === 'rejected_before_create') {
+        const rejectedRecord = updateSubmissionRecord(active, 'rejected_before_create', {
+          message: responseError?.message,
+          errorCode: responseError?.code,
+        })
+        persistSubmission(recordStorageKey, rejectedRecord)
+        discardSubmission(recordStorageKey)
+        if (activeScope.current === recordScope) {
+          setSubmission(null)
+          if (['candidate_selection_changed', 'negative_candidates_empty'].includes(responseError?.code || '')) {
+            clearPreview()
+          }
+          setError(responseError?.message || '服务器明确拒绝了本次创建，请修改后重试。')
+        }
+      } else {
+        const unresolved = updateSubmissionRecord(active, failureStatus, {
+          message: err instanceof Error ? err.message : '提交结果尚未确认。',
+          errorCode: responseError?.code,
+        })
+        const unresolvedSaved = persistSubmission(recordStorageKey, unresolved)
+        if (activeScope.current === recordScope) {
+          setSubmission(unresolved)
+          setError(failureStatus === 'conflict'
+            ? unresolved.message || '请使用原用户和租户重新登录后继续确认。'
+            : `${unresolved.message || '提交结果尚未确认。'} 请点击“确认上次提交”，不要重新选择帖子。${unresolvedSaved ? '' : ' 浏览器未能更新恢复状态，请勿关闭此页。'}`)
+        }
+      }
+      if (activeSubmissionRequest.current === active.requestKey) {
+        activeSubmissionRequest.current = ''
+        setSubmissionBusy(false)
+      }
+      return
+    }
+
+    const taskId = confirmedSubmissionTaskId(result)
+    if (!taskId) {
+      const unresolved = updateSubmissionRecord(active, 'unknown', {
+        message: '服务器未返回可确认的任务编号，提交结果需要确认。',
+      })
+      persistSubmission(recordStorageKey, unresolved)
+      if (activeScope.current === recordScope) {
+        setSubmission(unresolved)
+        setError('服务器未返回可确认的任务编号，请使用原请求继续确认。')
+      }
+      if (activeSubmissionRequest.current === active.requestKey) {
+        activeSubmissionRequest.current = ''
+        setSubmissionBusy(false)
+      }
+      return
+    }
+    const confirmed = updateSubmissionRecord(active, 'confirmed', {
+      taskId,
+      message: result.message || (result.existing ? '已找到原任务。' : '任务已创建。'),
+    })
+    const confirmedSaved = persistSubmission(recordStorageKey, confirmed)
+    if (activeSubmissionRequest.current === active.requestKey) {
+      activeSubmissionRequest.current = ''
+      setSubmissionBusy(false)
+    }
+    if (activeScope.current !== recordScope) return
+    setSubmission(confirmed)
+    setFeedback(result.message || (
+      result.existing
+        ? '已确认上次提交并找到原任务，没有重复创建。'
+        : `已创建 ${Array.isArray(active.input.recordIds) ? active.input.recordIds.length : 0} 条定向采集任务。`
+    ))
+    if (!confirmedSaved) {
+      setError('任务已确认创建，但浏览器未能保存确认状态；请立即刷新任务列表。')
+    }
+    await finishConfirmedSubmission(confirmed)
   }
 
   const submit = async () => {
     setError('')
     setFeedback('')
+    if (submission?.status === 'confirmed') {
+      await finishConfirmedSubmission(submission)
+      return
+    }
+    if (submission) {
+      await runSubmission(submission, true)
+      return
+    }
     const validationError = validateFilters()
     if (validationError) {
       setError(validationError)
       return
     }
-    if (!previewed) {
+    if (!previewed || previewSnapshotCriteria.current !== previewCriteriaKey) {
       setError('请先预览候选帖子，再确认下发。')
       return
     }
@@ -266,6 +803,10 @@ export function NegativePatrolTaskCreator({
       setError('请至少选择一条需要定向采集的帖子。')
       return
     }
+    if (selectedIds.size > NEGATIVE_PATROL_MAX_SELECTED) {
+      setError(`单次最多选择 ${NEGATIVE_PATROL_MAX_SELECTED} 条，请分批下发。`)
+      return
+    }
     if (missingCoverage.length > 0) {
       setError(`已选节点未覆盖${missingCoverage.map(entry => PLATFORM_LABELS[entry.platform] || entry.platform).join('、')}，请返回补选对应平台 Agent。`)
       return
@@ -273,7 +814,11 @@ export function NegativePatrolTaskCreator({
     const eligibleAgents = agents.filter(agent => selectedCandidatePlatforms.some(
       platform => agentCreatePlatforms(agent).includes(platform),
     ))
-    const taskInput = {
+    if (!user?.id || !tenantId || loadedSubmissionScope !== scopeKey) {
+      setError('登录信息尚未就绪，无法安全保存提交恢复信息。')
+      return
+    }
+    const taskInput: Record<string, unknown> = {
       ...filters,
       agentIds: eligibleAgents.map(agent => agent.id),
       ...(eligibleAgents.length === 1 ? { agentId: eligibleAgents[0].id } : {}),
@@ -283,48 +828,79 @@ export function NegativePatrolTaskCreator({
         platformSafetyMode: 'manual_confirmed',
       },
       title: title.trim() || '负面帖子巡查',
-      recordIds: Array.from(selectedIds),
+      recordIds: Array.from(selectedIds).sort(),
       captureSettings: {
         autoSyncAfterDetailCapture: true,
         includeComments,
         includeBloggerMetrics,
       },
     }
-    const fingerprint = JSON.stringify(taskInput)
-    let submission = pendingSubmission.current
-    if (submission?.fingerprint !== fingerprint) {
-      submission = { fingerprint, requestKey: window.crypto.randomUUID() }
-      pendingSubmission.current = submission
-    }
-
-    setSubmitting(true)
+    let freshSubmission: NegativePatrolSubmissionRecord | null = null
+    let existingSubmission: NegativePatrolSubmissionRecord | null = null
     try {
-      const result = await api.post<{ message?: string }>(
-        '/capture-cloud/negative-patrol/tasks',
-        { ...taskInput, requestKey: submission.requestKey },
-        { timeoutMs: 30_000 },
-      )
-      pendingSubmission.current = null
-      setFeedback(result.message || (
-        elasticPool
-          ? `已把 ${selectedIds.size} 条帖子放入云端队列，由 ${eligibleAgents.length} 个候选 Agent 逐篇领取。`
-          : eligibleAgents[0]?.online
-            ? `已向 ${eligibleAgents[0].display_name} 下发 ${selectedIds.size} 条定向采集任务。`
-            : `已创建 ${selectedIds.size} 条定向采集任务，Agent 上线后自动领取。`
-      ))
-      await onCreated()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '创建负面帖子巡查任务失败')
-    } finally {
-      setSubmitting(false)
+      const lockName = submissionScopeLockName(user.id, tenantId)
+      if (!lockName || !navigator.locks?.request) throw new Error('submission_lock_unavailable')
+      await navigator.locks.request(lockName, {mode: 'exclusive'}, async () => {
+        const records = listSubmissionRecords(window.localStorage, user.id, tenantId)
+        for (const record of records) {
+          const key = submissionStorageKey(record.userId, record.tenantId, record.requestKey)
+          if (record.status === 'rejected_before_create') {
+            discardSubmission(key)
+            continue
+          }
+          existingSubmission = record.status === 'submitting'
+            ? recoverInterruptedSubmission(record)
+            : record
+          if (existingSubmission !== record && !persistSubmission(key, existingSubmission)) {
+            throw new Error('local_storage_write_failed')
+          }
+          break
+        }
+        if (existingSubmission) return
+        const created = createSubmissionRecord({
+          userId: user.id,
+          tenantId,
+          requestKey: window.crypto.randomUUID(),
+          input: taskInput,
+        })
+        const key = submissionStorageKey(created.userId, created.tenantId, created.requestKey)
+        if (!persistSubmission(key, created)) throw new Error('local_storage_write_failed')
+        freshSubmission = created
+      })
+    } catch {
+      setError('浏览器无法安全锁定并保存提交恢复信息，本次没有下发。请关闭重复后台页或检查本地存储后重试。')
+      return
     }
+    if (existingSubmission) {
+      setSubmission(existingSubmission)
+      setError('另一个后台页已有待确认的负面巡查提交，请先使用原请求确认结果。')
+      return
+    }
+    if (!freshSubmission) {
+      setError('没有生成可恢复的提交记录，本次没有下发。')
+      return
+    }
+    setSubmission(freshSubmission)
+    await runSubmission(freshSubmission, false)
   }
 
   const disabled = !writable
     || agents.length === 0
     || agents.some(agent => agent.status !== 'active')
     || selectedPlatforms.length === 0
-    || submitting
+    || submissionLocked
+  const submitDisabled = submissionBusy || !writable || (!submission && (
+    loadedSubmissionScope !== scopeKey
+    || !scopeKey
+    || agents.length === 0
+    || agents.some(agent => agent.status !== 'active')
+    || selectedPlatforms.length === 0
+    || previewing
+    || !previewed
+    || handoffMissingCount > 0
+    || selectedIds.size === 0
+    || missingCoverage.length > 0
+  ))
 
   if (!supportsPatrol) {
     return (
@@ -381,12 +957,12 @@ export function NegativePatrolTaskCreator({
               })}
             </div>
           </fieldset>
-          <label className="block text-xs font-medium text-muted-foreground">
-            候选上限
-            <input type="number" min={1} max={100} step={1} value={limit}
-              onChange={event => { setLimit(Number(event.target.value)); clearPreview() }} disabled={disabled}
-              className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-primary disabled:opacity-60" />
-          </label>
+          <div className="block text-xs font-medium text-muted-foreground">
+            预览与下发上限
+            <div className="mt-1.5 flex h-10 items-center rounded-lg border border-border bg-muted/25 px-3 text-xs text-foreground">
+              每页 {NEGATIVE_PATROL_PREVIEW_PAGE_SIZE} 条 · 单次最多选择 {NEGATIVE_PATROL_MAX_SELECTED} 条
+            </div>
+          </div>
           <div className="sm:col-span-2">
             <div className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-foreground">
               <CalendarDays className="h-3.5 w-3.5 text-status-red" />
@@ -403,7 +979,7 @@ export function NegativePatrolTaskCreator({
                 aria-label="发布时间结束日期"
                 className="h-10 min-w-0 rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-primary disabled:opacity-60" />
             </div>
-            <p className="mt-1.5 text-[11px] leading-4 text-muted-foreground">发布日期缺失的历史记录不会进入候选，也不会用采集时间代替。</p>
+            <p className="mt-1.5 text-[11px] leading-4 text-muted-foreground">按北京时间统计，开始日 00:00 起、截止日次日 00:00 前；发布日期缺失时不会用采集时间代替。</p>
           </div>
           <label className="block text-xs font-medium text-muted-foreground">
             内容关键词（可选）
@@ -421,7 +997,7 @@ export function NegativePatrolTaskCreator({
 
         <div className="flex items-center justify-between gap-3 border-t border-border/70 bg-muted/25 px-4 py-3 sm:px-5">
           <p className="text-[11px] leading-4 text-muted-foreground">{stableInitialIds.length > 0 ? '已带入当前勾选清单；系统仍会校验负面状态与原帖定位。' : '筛选只用于圈定对象；Extension 会逐条打开原帖并补采最新详情。'}</p>
-          <Button type="button" variant="outline" size="sm" onClick={() => preview(stableInitialIds)} disabled={disabled || previewing} className="shrink-0">
+          <Button type="button" variant="outline" size="sm" onClick={() => preview({recordIds: stableInitialIds})} disabled={disabled || previewing} className="shrink-0">
             {previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : previewed ? <RefreshCw className="h-4 w-4" /> : <Search className="h-4 w-4" />}
             {previewed ? '重新加载' : stableInitialIds.length > 0 ? '加载清单' : '预览候选'}
           </Button>
@@ -434,16 +1010,21 @@ export function NegativePatrolTaskCreator({
             <div>
               <h3 className="text-sm font-bold text-foreground">确认定向采集清单</h3>
               <p className="mt-0.5 text-[11px] text-muted-foreground">
-                命中 {matchedCount} 条{limited ? `，当前展示前 ${candidates.length} 条` : ''} · 已选 {selectedIds.size} 条
+                当前负面 {matchedCount} 条 · 可下发 {dispatchableCount} 条 · 暂缓 {deferredCount} 条 · 已选 {selectedIds.size} 条
               </p>
             </div>
-            {candidates.length > 0 && (
-              <button type="button" onClick={toggleAll}
+            {selectablePageIds.length > 0 && (
+              <button type="button" onClick={toggleAll} disabled={disabled}
                 className="min-h-8 rounded-lg px-2 text-xs font-semibold text-primary hover:bg-primary/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
-                {allSelected ? '取消全选' : '全选'}
+                {allSelected ? '取消本页全选' : '全选本页'}
               </button>
             )}
           </div>
+          {dispatchableCount > NEGATIVE_PATROL_MAX_SELECTED && (
+            <p className="border-b border-amber-300/30 bg-amber-50/60 px-4 py-2.5 text-[11px] leading-4 text-amber-700 dark:bg-amber-950/20 dark:text-amber-300 sm:px-5">
+              当前有 {dispatchableCount} 条可下发，单次最多选择 {NEGATIVE_PATROL_MAX_SELECTED} 条；请分批创建，系统不会自动生成第二批任务。
+            </p>
+          )}
           {candidates.length === 0 ? (
             <div className="px-5 py-10 text-center">
               <Sparkles className="mx-auto h-7 w-7 text-muted-foreground/50" />
@@ -454,10 +1035,18 @@ export function NegativePatrolTaskCreator({
             <div className="max-h-[420px] divide-y divide-border/70 overflow-y-auto overscroll-contain">
               {candidates.map(candidate => {
                 const selected = selectedIds.has(candidate.id)
+                const selectable = canDispatchCandidate(candidate)
+                const reason = eligibilityReason(candidate)
+                const sentiment = sentimentLabel(candidate)
+                const reviewHint = candidate.falsePositivePending
+                  ? '存在待复核的误报反馈；当前人工负面仍可下发。'
+                  : ''
                 return (
-                  <button key={candidate.id} type="button" onClick={() => toggleCandidate(candidate.id)}
-                    className={`flex w-full items-start gap-3 px-4 py-3.5 text-left transition-colors sm:px-5 ${selected ? 'bg-primary/[0.035]' : 'hover:bg-muted/35'}`}>
-                    <span className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border ${selected ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background'}`}>
+                  <button key={candidate.id} type="button" onClick={() => toggleCandidate(candidate)}
+                    disabled={disabled || !selectable}
+                    aria-describedby={reason || reviewHint ? `negative-patrol-reason-${candidate.id}` : undefined}
+                    className={`flex w-full items-start gap-3 px-4 py-3.5 text-left transition-colors sm:px-5 ${selected ? 'bg-primary/[0.035]' : selectable ? 'hover:bg-muted/35' : 'cursor-not-allowed bg-muted/20 opacity-75'}`}>
+                    <span className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border ${selected ? 'border-primary bg-primary text-primary-foreground' : selectable ? 'border-border bg-background' : 'border-border bg-muted'}`}>
                       {selected && <Check className="h-3.5 w-3.5" />}
                     </span>
                     <span className="min-w-0 flex-1">
@@ -467,6 +1056,7 @@ export function NegativePatrolTaskCreator({
                         </span>
                         <span className="text-[11px] text-muted-foreground">{formatPublishDate(candidate)}</span>
                         <span className="text-[11px] text-muted-foreground">互动 {candidateInteraction(candidate)}</span>
+                        {sentiment && <span className="text-[11px] font-medium text-status-red">{sentiment}</span>}
                       </span>
                       <span className="mt-1.5 line-clamp-2 block text-sm font-semibold leading-5 text-foreground">
                         {candidate.title || candidate.content || '未命名帖子'}
@@ -474,11 +1064,46 @@ export function NegativePatrolTaskCreator({
                       <span className="mt-1 block truncate text-[11px] text-muted-foreground">
                         {candidate.authorName || '作者未识别'}
                       </span>
+                      {!selectable && (
+                        <span id={`negative-patrol-reason-${candidate.id}`} className="mt-1.5 block text-[11px] font-medium leading-4 text-amber-700 dark:text-amber-300">
+                          暂不下发：{reason || candidate.eligibilityCode || '当前记录需要核对'}
+                        </span>
+                      )}
+                      {selectable && reviewHint && (
+                        <span id={`negative-patrol-reason-${candidate.id}`} className="mt-1.5 block text-[11px] font-medium leading-4 text-amber-700 dark:text-amber-300">
+                          {reviewHint}
+                        </span>
+                      )}
                     </span>
                   </button>
                 )
               })}
             </div>
+          )}
+          {previewed && candidates.length > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/70 bg-muted/20 px-4 py-3 sm:px-5">
+              <p className="text-[11px] text-muted-foreground">
+                第 {pageIndex + 1} 页 · 本页 {candidates.length} 条 · 跨页选择会保留
+              </p>
+              <div className="flex items-center gap-2">
+                <Button type="button" variant="outline" size="sm"
+                  onClick={() => void showPage(pageIndex - 1)}
+                  disabled={disabled || previewing || pageIndex === 0}>
+                  <ChevronLeft className="h-4 w-4" />上一页
+                </Button>
+                <Button type="button" variant="outline" size="sm"
+                  onClick={() => void showPage(pageIndex + 1)}
+                  disabled={disabled || previewing || (!previewPages[pageIndex + 1] && !currentPage?.nextCursor)}>
+                  {previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : <ChevronRight className="h-4 w-4" />}
+                  下一页
+                </Button>
+              </div>
+            </div>
+          )}
+          {(limited || currentPage?.hasMore) && !currentPage?.nextCursor && (
+            <p className="border-t border-amber-300/30 bg-amber-50/60 px-4 py-2.5 text-[11px] leading-4 text-amber-700 dark:bg-amber-950/20 dark:text-amber-300 sm:px-5">
+              当前服务仅返回了前 {candidates.length} 条，尚未提供稳定翻页游标；不能把这一页当作整个时间范围。
+            </p>
           )}
         </section>
       )}
@@ -545,15 +1170,36 @@ export function NegativePatrolTaskCreator({
       {error && <p role="alert" className="text-xs leading-5 text-status-red">{error}</p>}
       {feedback && <p role="status" className="text-xs leading-5 text-status-green">{feedback}</p>}
 
+      {submission && (
+        <section className="rounded-xl border border-amber-300/40 bg-amber-50/60 px-4 py-3 text-xs leading-5 text-amber-800 dark:bg-amber-950/20 dark:text-amber-200">
+          <div className="font-semibold">
+            {submission.status === 'confirmed'
+              ? '任务已确认创建'
+              : submission.status === 'submitting'
+                ? '正在提交，页面已冻结'
+                : '上次提交结果尚未完成确认'}
+          </div>
+          <p className="mt-1">
+            {submission.status === 'confirmed'
+              ? `任务编号 ${submission.taskId || submission.requestKey}，只需刷新列表。`
+              : '筛选、选帖和翻页暂时冻结；继续时会复用原请求和原清单，不会生成新的请求编号。'}
+          </p>
+        </section>
+      )}
+
       <Button type="button" onClick={submit}
-        disabled={disabled || !previewed || handoffMissingCount > 0 || selectedIds.size === 0 || missingCoverage.length > 0}
+        disabled={submitDisabled}
         className="min-h-11 w-full">
         {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-        {elasticPool
-          ? `把 ${selectedIds.size || ''} 条帖子放入弹性队列`
-          : agents[0]?.online
-            ? `下发 ${selectedIds.size || ''} 条定向采集`
-            : `创建 ${selectedIds.size || ''} 条任务并排队`}
+        {submission?.status === 'confirmed'
+          ? '刷新任务列表'
+          : submission
+            ? submitting ? '正在确认上次提交' : '确认上次提交'
+            : elasticPool
+              ? `把 ${selectedIds.size || ''} 条帖子放入弹性队列`
+              : agents[0]?.online
+                ? `下发 ${selectedIds.size || ''} 条定向采集`
+                : `创建 ${selectedIds.size || ''} 条任务并排队`}
       </Button>
     </div>
   )

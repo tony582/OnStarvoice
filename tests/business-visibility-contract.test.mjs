@@ -27,7 +27,10 @@ test('business-facing queues, dashboards, reports and AI workers require eligibl
 
   assert.ok((triage.match(/business_visibility = 'eligible'/gu) || []).length >= 4);
   assert.ok((workspace.match(/business_visibility = 'eligible'/gu) || []).length >= 10);
-  assert.ok((negativePatrol.match(/business_visibility = 'eligible'/gu) || []).length >= 2);
+  assert.ok((negativePatrol.match(/business_visibility = 'eligible'/gu) || []).length >= 1);
+  assert.match(negativePatrol, /function negativeCandidateQualificationSql\(/u);
+  assert.match(negativePatrol, /COALESCE\(business_visibility, ''\) <> 'eligible'/u);
+  assert.match(negativePatrol, /async function loadCandidates\(/u);
   assert.match(leads, /business_visibility <> 'eligible'/u);
   assert.match(report, /r\.business_visibility = 'eligible'/u);
   assert.match(report, /business_visibility = 'eligible'/u);

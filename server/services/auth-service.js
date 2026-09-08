@@ -41,11 +41,14 @@ export function sessionExpiry() {
   return new Date(Date.now() + SESSION_DAYS * 86400000);
 }
 
-export async function getUserWithMemberships(userId) {
+export async function getUserWithMemberships(userId, {category = 'general'} = {}) {
+  const dbOptions = {category};
   const user = await queryOne(
     `SELECT id, email, name, status, is_internal, global_role, must_change_password, last_login_at, created_at
      FROM users WHERE id = $1`,
-    [userId]
+    [userId],
+    null,
+    dbOptions,
   );
   if (!user) return null;
   const memberships = await queryAll(`
@@ -54,12 +57,13 @@ export async function getUserWithMemberships(userId) {
     JOIN tenants t ON t.id = um.tenant_id
     WHERE um.user_id = $1
     ORDER BY t.name ASC
-  `, [userId]);
+  `, [userId], null, dbOptions);
   return { ...user, memberships };
 }
 
-export async function resolveSession(token) {
+export async function resolveSession(token, {category = 'general'} = {}) {
   if (!token) return null;
+  const dbOptions = {category};
   const tokenHash = hashSessionToken(token);
   const session = await queryOne(`
     SELECT us.*, u.status AS user_status
@@ -69,9 +73,9 @@ export async function resolveSession(token) {
       AND us.revoked_at IS NULL
       AND us.expires_at > now()
       AND u.status = 'active'
-  `, [tokenHash]);
+  `, [tokenHash], null, dbOptions);
   if (!session) return null;
-  const user = await getUserWithMemberships(session.user_id);
+  const user = await getUserWithMemberships(session.user_id, {category});
   if (!user) return null;
   return { session, user };
 }

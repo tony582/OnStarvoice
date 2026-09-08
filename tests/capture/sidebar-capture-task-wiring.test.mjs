@@ -288,7 +288,7 @@ test("targeted runner is fenced by its URL attempt before adopting cloud state",
     'type: "onstarvoice:get-targeted-post-run-state"',
   );
   const bindingIndex = runnerSection.indexOf(
-    "const binding = resolveTargetedPostRunBinding(",
+    "let binding = resolveTargetedPostRunBinding(",
   );
   const rejectedBindingIndex = runnerSection.indexOf(
     "if (!binding.accepted)",
@@ -502,6 +502,105 @@ globalThis.__targetedAttemptHelpers = {
     runnerSection.slice(finallyIndex),
     /if \(latestOwnership\.active\)[\s\S]*?activeTargetedPostInvocationToken = null;/u,
   );
+});
+
+test("a pending targeted stop message has a bounded sidebar wait", async () => {
+  const section = readFunctionSection(
+    "async function sendTargetedPostControlMessage(",
+    "async function reconcileTargetedPostRunState(",
+  );
+  const context = {
+    TARGETED_POST_CONTROL_MESSAGE_TIMEOUT_MS: 5,
+    chrome: {
+      runtime: {
+        sendMessage: async () => await new Promise(() => {}),
+      },
+    },
+    setTimeout,
+    clearTimeout,
+  };
+  vm.runInNewContext(
+    `${section}\nglobalThis.__sendControl = sendTargetedPostControlMessage;`,
+    context,
+  );
+  const startedAt = Date.now();
+  await assert.rejects(
+    context.__sendControl({type: "onstarvoice:cancel-targeted-post-run"}, {
+      timeoutMs: 5,
+    }),
+    (error) => error?.code === "TARGETED_POST_CONTROL_TIMEOUT",
+  );
+  assert.ok(Date.now() - startedAt < 250);
+});
+
+test("server reconciliation gates only negative patrol runners", async () => {
+  const runnerSection = readFunctionSection(
+    "async function maybeClaimAndRunTargetedPostWorkflow()",
+    "async function maybeClaimAndRunUnattendedKeywordPlan(",
+  );
+  for (const workflow of [
+    "official_account_comment_patrol",
+    "followed_creator_post_patrol",
+    "watched_content_patrol",
+    "official_account_post_discovery",
+  ]) {
+    let reconcileCalls = 0;
+    const request = {
+      id: `${workflow}-request`,
+      attemptId: `${workflow}-attempt`,
+      workflow,
+      status: "running",
+    };
+    const context = {
+      getTargetedPostRunRequestIdFromUrl: () => request.id,
+      getTargetedPostRunAttemptIdFromUrl: () => request.attemptId,
+      createTargetedPostInvocationToken: (requestId, attemptId) => ({
+        requestId,
+        attemptId,
+      }),
+      targetedPostRunState: null,
+      targetedPostRunInFlight: false,
+      cloudTargetedPostApi: {
+        normalizeCommandPayload() {},
+        isTerminalRunStatus: () => false,
+      },
+      targetedPostReconciledAttemptKey: "",
+      targetedPostReconciledAt: 0,
+      chrome: {
+        runtime: {
+          sendMessage: async () => ({ok: true, accepted: true, data: request}),
+        },
+      },
+      resolveTargetedPostRunBinding: (response) => ({
+        accepted: response?.accepted === true,
+        reason: "",
+        request: response?.data,
+      }),
+      reconcileTargetedPostRunState: async () => {
+        reconcileCalls += 1;
+        throw new Error("network unavailable");
+      },
+      targetedPostReconcileRetryTimer: null,
+      clearTimeout,
+      activeTargetedPostInvocationToken: {
+        requestId: "another-request",
+        attemptId: "another-attempt",
+      },
+      isSameTargetedPostInvocationToken: (left, right) =>
+        left?.requestId === right?.requestId &&
+        left?.attemptId === right?.attemptId,
+      stopTargetedPostRunnerForInvalidBinding() {},
+      renderCaptureDebugSession() {},
+      getCurrentRuntime: () => ({}),
+      console,
+    };
+    vm.runInNewContext(
+      `${runnerSection}\nglobalThis.__runTargeted = maybeClaimAndRunTargetedPostWorkflow;`,
+      context,
+    );
+    await context.__runTargeted();
+    assert.equal(reconcileCalls, 0, workflow);
+  }
 });
 
 test("targeted patrol reads only the records returned by the current batch", () => {
@@ -881,6 +980,7 @@ test("a completed Douyin targeted patrol pauses media and closes its owned runne
   const scriptCalls = [];
   const removedTabIds = [];
   const context = {
+    URL,
     chrome: {
       tabs: {
         get: async () => ({
@@ -910,7 +1010,12 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   );
 
   assert.equal(
-    await context.__settleTargetedPostRunnerTab(77, "douyin"),
+    await context.__settleTargetedPostRunnerTab(77, "douyin", {
+      targets: [{
+        externalId: "766193585000000001",
+        url: "https://www.douyin.com/video/766193585000000001",
+      }],
+    }),
     true,
   );
   assert.equal(scriptCalls.length, 1);
@@ -939,6 +1044,7 @@ test("a completed Xiaohongshu targeted patrol closes its owned runner", async ()
   const scriptCalls = [];
   const removedTabIds = [];
   const context = {
+    URL,
     chrome: {
       tabs: {
         get: async () => ({
@@ -970,11 +1076,62 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   );
 
   assert.equal(
-    await context.__settleTargetedPostRunnerTab(88, "xiaohongshu"),
+    await context.__settleTargetedPostRunnerTab(88, "xiaohongshu", {
+      targets: [{
+        externalId: "note-1",
+        url: "https://www.xiaohongshu.com/explore/note-1",
+      }],
+    }),
     true,
   );
   assert.equal(scriptCalls.length, 1);
   assert.deepEqual(removedTabIds, [88]);
+});
+
+test("targeted patrol cleanup preserves a reused tab whose post identity changed", async () => {
+  const cleanupSection = readFunctionSection(
+    "async function settleTargetedPostRunnerTab(",
+    "async function waitForTargetedPostRunnerTab(",
+  );
+  const scriptCalls = [];
+  const removedTabIds = [];
+  const context = {
+    URL,
+    chrome: {
+      tabs: {
+        get: async () => ({
+          id: 89,
+          url: "https://www.xiaohongshu.com/explore/user-owned-note",
+        }),
+        remove: async (tabId) => removedTabIds.push(tabId),
+      },
+      scripting: {
+        executeScript: async (payload) => scriptCalls.push(payload),
+      },
+    },
+    detectPlatformFromUrl: () => "xiaohongshu",
+    console: {warn() {}},
+  };
+  vm.runInNewContext(
+    `${cleanupSection}
+globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
+    context,
+  );
+
+  const settled = await context.__settleTargetedPostRunnerTab(
+    89,
+    "xiaohongshu",
+    {
+      targets: [{
+        externalId: "task-owned-note",
+        url: "https://www.xiaohongshu.com/explore/task-owned-note",
+      }],
+    },
+  );
+
+  assert.equal(settled, false);
+  assert.deepEqual(scriptCalls, []);
+  assert.deepEqual(removedTabIds, []);
 });
 
 test("targeted patrol safety intervention pauses media without leaving the page", async () => {
@@ -985,6 +1142,7 @@ test("targeted patrol safety intervention pauses media without leaving the page"
   const scriptCalls = [];
   const removedTabIds = [];
   const context = {
+    URL,
     chrome: {
       tabs: {
         get: async () => ({
@@ -1015,6 +1173,10 @@ globalThis.__settleTargetedPostRunnerTab = settleTargetedPostRunnerTab;`,
   assert.equal(
     await context.__settleTargetedPostRunnerTab(99, "douyin", {
       returnHome: false,
+      targets: [{
+        externalId: "766193585000000002",
+        url: "https://www.douyin.com/video/766193585000000002",
+      }],
     }),
     true,
   );
@@ -1065,7 +1227,7 @@ test("a normal side panel without a runner query renders shared targeted state a
     "async function cancelTargetedPostRunFromSidebar(",
     "async function waitForTargetedPostRunnerTab(",
   );
-  const updateCalls = [];
+  const controlCalls = [];
   const cancelContext = {
     targetedPostRunState: sharedRequest,
     cloudTargetedPostApi: {isTerminalRunStatus: () => false},
@@ -1091,11 +1253,23 @@ test("a normal side panel without a runner query renders shared targeted state a
           left.attemptId === right.attemptId,
       ),
     isActiveTargetedPostInvocation: () => false,
-    updateTargetedPostRun: async (request, patch) => {
-      updateCalls.push({request, patch});
-      return {...request, ...patch};
+    sendTargetedPostControlMessage: async (message) => {
+      controlCalls.push(message);
+      return {
+        ok: true,
+        accepted: true,
+        data: {
+          request: {
+            ...sharedRequest,
+            status: "canceled",
+            cancelRequested: true,
+          },
+        },
+      };
     },
-    requestCaptureCancelSignal: async () => true,
+    renderCaptureDebugSession() {},
+    getCurrentRuntime: () => ({}),
+    showMessage() {},
     console,
   };
   vm.runInNewContext(
@@ -1103,14 +1277,15 @@ test("a normal side panel without a runner query renders shared targeted state a
     cancelContext,
   );
   assert.equal(await cancelContext.__cancelTargeted("another-request"), false);
-  assert.equal(updateCalls.length, 0);
+  assert.equal(controlCalls.length, 0);
   assert.equal(
     await cancelContext.__cancelTargeted("shared-targeted-request"),
     true,
   );
-  assert.equal(updateCalls.length, 1);
-  assert.equal(updateCalls[0].request.id, "shared-targeted-request");
-  assert.equal(updateCalls[0].patch.cancelRequested, true);
+  assert.equal(controlCalls.length, 1);
+  assert.equal(controlCalls[0].type, "onstarvoice:cancel-targeted-post-run");
+  assert.equal(controlCalls[0].requestId, "shared-targeted-request");
+  assert.equal(controlCalls[0].attemptId, "shared-targeted-attempt");
 
   const initSection = readFunctionSection(
     "export async function initSidebar()",

@@ -182,7 +182,7 @@ test('admin exposes watched content as a scope and groups both patrol handoffs i
   assert.match(creator, /distributionMode: 'elastic_pool'/u);
   assert.match(creator, /\/capture-cloud\/watched-content\/tasks/u);
   assert.match(negativeCreator, /initialRecordIds\?: string\[\]/u);
-  assert.match(negativeCreator, /preview\(stableInitialIds\)/u);
+  assert.match(negativeCreator, /preview\(\{recordIds: stableInitialIds\}\)/u);
   assert.match(negativeCreator, /带入的负面内容尚未完整加载，不能创建可能漏采的任务/u);
   const negativePreviewStart = route.indexOf("router.post(\n  '/negative-patrol/candidates/preview'");
   const watchedPreviewStart = route.indexOf("router.post(\n  '/watched-content/candidates/preview'");

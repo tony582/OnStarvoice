@@ -28,7 +28,7 @@ test("server mounts the tenant cloud task center and agent endpoints", async () 
   assert.match(route, /router\.post\('\/agent\/heartbeat', requireCaptureAgent/u);
   assert.match(route, /router\.post\(\s*'\/agents\/:id\/tasks'\s*,\s*requireTenantAccess\s*,\s*requireSessionUser\s*,\s*requireTenantWriter/u);
   assert.match(route, /router\.post\('\/tasks\/:id\/resume', requireTenantAccess, requireSessionUser, requireTenantWriter/u);
-  assert.match(route, /router\.post\('\/tasks\/:id\/stop', requireTenantAccess, requireSessionUser, requireTenantWriter/u);
+  assert.match(route, /router\.post\('\/tasks\/:id\/stop', requireCriticalTenantAccess, requireSessionUser, requireTenantWriter/u);
   assert.match(route, /status IN \('pending', 'acknowledged'\)/u);
   assert.match(route, /t\.status = 'resume_requested'[\s\S]*t\.metadata->>'resumeCommandId' = c\.id::text/u);
   assert.match(route, /WHEN EXCLUDED\.attempt_number > capture_tasks\.attempt_number[\s\S]*THEN EXCLUDED\.progress_seq/u);

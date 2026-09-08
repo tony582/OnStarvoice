@@ -16,6 +16,12 @@ function isPositiveIntegerWithin(value, maximum) {
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= maximum;
 }
 
+function boundedPositiveInteger(value, fallback, maximum) {
+  const parsed = Math.floor(Number(value));
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(maximum, parsed);
+}
+
 function normalizeAgentIds(value, limit = 100) {
   if (!Array.isArray(value)) return [];
   return Array.from(new Set(
@@ -228,4 +234,128 @@ export function projectCaptureResourceAdmission({
     return {allowed: false, reason: 'account_daily_search_capacity'};
   }
   return {allowed: true, reason: ''};
+}
+
+export function normalizeNegativePatrolAdmissionPolicy(env = process.env) {
+  return Object.freeze({
+    globalActiveLimit: boundedPositiveInteger(
+      env.NEGATIVE_PATROL_GLOBAL_ACTIVE_LIMIT,
+      2,
+      50,
+    ),
+    tenantActiveLimit: boundedPositiveInteger(
+      env.NEGATIVE_PATROL_TENANT_ACTIVE_LIMIT,
+      1,
+      20,
+    ),
+    globalFirstAdmissionIntervalMs: boundedPositiveInteger(
+      env.NEGATIVE_PATROL_GLOBAL_ADMISSION_INTERVAL_MS,
+      10000,
+      10 * 60 * 1000,
+    ),
+    tenantFirstAdmissionIntervalMs: boundedPositiveInteger(
+      env.NEGATIVE_PATROL_TENANT_ADMISSION_INTERVAL_MS,
+      10000,
+      10 * 60 * 1000,
+    ),
+    postProcessingHighWaterCount: boundedPositiveInteger(
+      env.NEGATIVE_PATROL_POST_PROCESSING_HIGH_WATER_COUNT,
+      1000,
+      2000,
+    ),
+    postProcessingHighWaterBytes: boundedPositiveInteger(
+      env.NEGATIVE_PATROL_POST_PROCESSING_HIGH_WATER_BYTES,
+      128 * 1024 * 1024,
+      256 * 1024 * 1024,
+    ),
+  });
+}
+
+function timestampMs(value) {
+  if (!value) return 0;
+  const parsed = value instanceof Date ? value.getTime() : Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Pure projection used after PostgreSQL has serialized the global and tenant
+ * admission ledgers. A denied decision keeps the item pending and never burns
+ * an attempt.
+ */
+export function projectNegativePatrolAdmission({
+  policy = normalizeNegativePatrolAdmissionPolicy(),
+  globalActive = 0,
+  tenantActive = 0,
+  lastGlobalAdmittedAt = null,
+  lastTenantAdmittedAt = null,
+  legacyActivePack = false,
+  postProcessingObserved = true,
+  postProcessingPendingCount = 0,
+  postProcessingPendingBytes = 0,
+  now = Date.now(),
+} = {}) {
+  const nowMs = timestampMs(now) || Date.now();
+  if (legacyActivePack) {
+    return {allowed: false, reason: 'legacy_active_pack', retryAfterMs: 10000};
+  }
+  if (postProcessingObserved !== true) {
+    return {
+      allowed: false,
+      reason: 'post_processing_metrics_unavailable',
+      retryAfterMs: 10000,
+    };
+  }
+  if (
+    Math.max(0, Number(postProcessingPendingCount) || 0) >=
+      policy.postProcessingHighWaterCount
+  ) {
+    return {
+      allowed: false,
+      reason: 'post_processing_count_high_water',
+      retryAfterMs: 10000,
+    };
+  }
+  if (
+    Math.max(0, Number(postProcessingPendingBytes) || 0) >=
+      policy.postProcessingHighWaterBytes
+  ) {
+    return {
+      allowed: false,
+      reason: 'post_processing_bytes_high_water',
+      retryAfterMs: 10000,
+    };
+  }
+  if (Math.max(0, Number(globalActive) || 0) >= policy.globalActiveLimit) {
+    return {allowed: false, reason: 'global_active_limit', retryAfterMs: 5000};
+  }
+  if (Math.max(0, Number(tenantActive) || 0) >= policy.tenantActiveLimit) {
+    return {allowed: false, reason: 'tenant_active_limit', retryAfterMs: 5000};
+  }
+  const globalWait = Math.max(
+    0,
+    timestampMs(lastGlobalAdmittedAt) +
+      policy.globalFirstAdmissionIntervalMs -
+      nowMs,
+  );
+  if (globalWait > 0) {
+    return {
+      allowed: false,
+      reason: 'global_admission_rate',
+      retryAfterMs: Math.ceil(globalWait),
+    };
+  }
+  const tenantWait = Math.max(
+    0,
+    timestampMs(lastTenantAdmittedAt) +
+      policy.tenantFirstAdmissionIntervalMs -
+      nowMs,
+  );
+  if (tenantWait > 0) {
+    return {
+      allowed: false,
+      reason: 'tenant_admission_rate',
+      retryAfterMs: Math.ceil(tenantWait),
+    };
+  }
+  return {allowed: true, reason: '', retryAfterMs: 0};
 }

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {createHash, webcrypto} from "node:crypto";
 import {readFile} from "node:fs/promises";
 import test, {after} from "node:test";
 import vm from "node:vm";
@@ -108,6 +109,7 @@ function createHarness() {
   let storageSetHandler = null;
   let storageRemoveHandler = null;
   let cloudHeartbeatHandler = null;
+  let cloudCommandCompletionHandler = null;
   const storageSetCalls = [];
   const storageRemoveCalls = [];
   let reloadHook = null;
@@ -348,6 +350,7 @@ function createHarness() {
       warn() {},
     },
     crypto: {
+      subtle: webcrypto.subtle,
       randomUUID() {
         uuidCounter += 1;
         return `lock-${uuidCounter}`;
@@ -412,6 +415,27 @@ function createHarness() {
       },
       async completeCommand(options = {}) {
         cloudCommandCompletions.push({...options});
+        if (typeof cloudCommandCompletionHandler === "function") {
+          return await cloudCommandCompletionHandler(
+            options,
+            cloudCommandCompletions.length,
+          );
+        }
+        const identity = options.completionIdentity;
+        if (identity) {
+          return {
+            ok: true,
+            commandId: options.commandId,
+            data: {
+              acknowledgedCompletion: {
+                commandId: options.commandId,
+                requestId: identity.requestId,
+                attemptId: identity.attemptId,
+                resultHash: identity.resultHash,
+              },
+            },
+          };
+        }
         return {ok: true, commandId: options.commandId};
       },
     },
@@ -449,7 +473,14 @@ function createHarness() {
       `  closeSupersededTargetedPostRunnerTabs,\n` +
       `  closeTerminalTargetedPostRunnerTabs,\n` +
       `  cancelTargetedPostRunFromControl,\n` +
+      `  reconcileStrandedNegativePatrolCancellation,\n` +
+      `  stopTargetedPostAttemptResources,\n` +
+      `  applyTargetedPostTerminalNotice,\n` +
+      `  applyTargetedPostTerminalNotices,\n` +
+      `  readTargetedPostTerminalNoticeAcks,\n` +
+      `  clearDeliveredTargetedPostTerminalNoticeAcks,\n` +
       `  openTargetedPostRunnerTab,\n` +
+      `  recoverTargetedPostPlatformTabCleanup,\n` +
       `  openUnattendedRunnerTab,\n` +
       `  bindUnattendedRunnerTab,\n` +
       `  saveUnattendedKeywordPlan,\n` +
@@ -460,6 +491,14 @@ function createHarness() {
       `  recoverUnattendedKeywordRunRequest,\n` +
       `  manuallyRecoverUnattendedKeywordRun,\n` +
       `  reportTargetedPostTerminalToCloud,\n` +
+      `  readNegativePatrolTerminalOutbox,\n` +
+      `  inspectNegativePatrolTerminalOutboxCapacity,\n` +
+      `  persistNegativePatrolTerminalOutboxEntry,\n` +
+      `  buildNegativePatrolTerminalOutboxEntry,\n` +
+      `  prepareNegativePatrolTerminalOutboxStopSupersession,\n` +
+      `  queueAndSendNegativePatrolTerminalResult,\n` +
+      `  replayNegativePatrolTerminalOutbox,\n` +
+      `  recoverNegativePatrolTerminalOutboxCleanup,\n` +
       `  persistTargetedPostRunRequest,\n` +
       `  executeCloudTaskAgentCommand,\n` +
       `  syncCloudTaskAgent,\n` +
@@ -492,6 +531,7 @@ function createHarness() {
       `  flushRuntime: () => runtimeMutationQueue,\n` +
       `  flushUnattended: () => unattendedRunMutationQueue,\n` +
       `  flushTaskLedger: () => taskLedgerMutationQueue,\n` +
+      `  flushNegativePatrolOutbox: () => negativePatrolTerminalOutboxMutationQueue,\n` +
       `};`,
     context,
     {filename: "background.js"},
@@ -574,6 +614,9 @@ function createHarness() {
     setCloudHeartbeatHandler(handler) {
       cloudHeartbeatHandler = handler;
     },
+    setCloudCommandCompletionHandler(handler) {
+      cloudCommandCompletionHandler = handler;
+    },
     setTabMissing(tabId, missing = true) {
       if (missing) missingTabIds.add(Number(tabId));
       else missingTabIds.delete(Number(tabId));
@@ -604,6 +647,15 @@ const LOCK_KEY = "onstarvoice.captureExecutionLock";
 const UNATTENDED_PLAN_KEY = "onstarvoice.unattendedKeywordPlan";
 const UNATTENDED_REQUEST_KEY = "onstarvoice.unattendedKeywordRunRequest";
 const TARGETED_POST_REQUEST_KEY = "onstarvoice.targetedPostRunRequest";
+const TARGETED_POST_PLATFORM_TAB_KEY = "onstarvoice.targetedPostPlatformTab.v1";
+const TARGETED_POST_PLATFORM_TAB_CLEANUP_KEY =
+  "onstarvoice.targetedPostPlatformTabCleanup.v1";
+const TARGETED_POST_PLATFORM_TAB_CLEANUP_ALARM =
+  "onstarvoice:targeted-post-platform-tab-cleanup";
+const TARGETED_POST_TERMINAL_NOTICE_ACKS_KEY =
+  "onstarvoice.targetedPostTerminalNoticeAcks.v1";
+const NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY =
+  "onstarvoice.targetedTerminalOutbox.v1";
 const UNATTENDED_ARCHIVE_KEY = "onstarvoice.unattendedKeywordRunArchive";
 const TASK_LEDGER_KEY = "onstarvoice.taskLedger";
 const SYNC_HISTORY_KEY = "onstarvoice.sync_history";
@@ -668,6 +720,26 @@ function buildTargetedPostRequest(overrides = {}) {
       completedItemIds: [],
       total: 1,
     },
+    ...overrides,
+  };
+}
+
+function buildNegativePatrolCompletionResult(overrides = {}) {
+  return {
+    state: "completed",
+    accepted: true,
+    reason: "targeted_post_capture_completed",
+    requestId: "negative-request",
+    taskId: "negative-task",
+    attemptId: "negative-attempt",
+    protocolVersion: 1,
+    workflow: "negative_post_patrol",
+    status: "completed",
+    cloudCommandId: "negative-command",
+    targetResults: [],
+    checkpoint: {processedCount: 1, total: 1},
+    message: "负面帖子巡查已完成",
+    error: null,
     ...overrides,
   };
 }
@@ -3573,6 +3645,11 @@ test("targeted stop accepts the current attempt", async () => {
     clientTaskId: "targeted-stop-request",
     attemptId: "targeted-stop-current",
     cloudCommandId: "targeted-stop-command",
+    targetResults: [{
+      itemId: "targeted-item-1",
+      status: "completed",
+      recordIds: ["record-before-stop"],
+    }],
   });
 
   const result = await harness.api.cancelTargetedPostRunFromControl(
@@ -3582,14 +3659,708 @@ test("targeted stop accepts the current attempt", async () => {
 
   assert.equal(result.matched, true);
   assert.equal(result.accepted, true);
-  assert.equal(result.reason, "cancel_requested");
+  assert.equal(result.reason, "canceled");
   assert.equal(
     harness.storage[TARGETED_POST_REQUEST_KEY].status,
-    "cancel_requested",
+    "canceled",
   );
   assert.equal(
     harness.storage[TARGETED_POST_REQUEST_KEY].attemptId,
     "targeted-stop-current",
+  );
+  assert.deepEqual(
+    harness.storage[TARGETED_POST_REQUEST_KEY].targetResults[0].recordIds,
+    ["record-before-stop"],
+  );
+  assert.ok(harness.storage[TARGETED_POST_REQUEST_KEY].finishedAt);
+});
+
+test("running non-negative targeted workflows keep their in-flight result settlement on stop", async () => {
+  for (const workflow of [
+    "official_account_comment_patrol",
+    "followed_creator_post_patrol",
+    "watched_content_patrol",
+  ]) {
+    const harness = createHarness();
+    const request = buildTargetedPostRequest({
+      id: `${workflow}-stop-request`,
+      clientTaskId: `${workflow}-stop-request`,
+      attemptId: `${workflow}-stop-attempt`,
+      cloudCommandId: `${workflow}-stop-command`,
+      workflow,
+      runnerTabId: 68,
+      targetResults: [{
+        itemId: "targeted-item-1",
+        status: "completed",
+        recordIds: [`${workflow}-record-before-stop`],
+      }],
+    });
+    harness.storage["onstarvoice.auth"] = {
+      captureAgent: {
+        id: `${workflow}-agent`,
+        token: `${workflow}-token`,
+      },
+    };
+    harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+    harness.setTabQueryHandler(async () => [{
+      id: request.runnerTabId,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?targetedPostRun=${request.id}` +
+        `&targetedPostAttempt=${request.attemptId}`,
+    }]);
+
+    const result = await harness.api.cancelTargetedPostRunFromControl(
+      request.id,
+      request.attemptId,
+    );
+
+    assert.equal(result.accepted, true, workflow);
+    assert.equal(result.reason, "cancel_requested", workflow);
+    assert.equal(result.request.status, "cancel_requested", workflow);
+    assert.equal(result.request.cancelRequested, true, workflow);
+    assert.equal(result.request.finishedAt || "", "", workflow);
+    assert.deepEqual(
+      result.request.targetResults[0].recordIds,
+      [`${workflow}-record-before-stop`],
+    );
+    assert.equal(harness.cloudCommandCompletions.length, 0, workflow);
+    assert.deepEqual(harness.removedTabIds, [], workflow);
+  }
+});
+
+test("a pending non-negative targeted workflow retains the baseline pre-dispatch stop semantics", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "official-pending-stop-request",
+    clientTaskId: "official-pending-stop-request",
+    attemptId: "official-pending-stop-attempt",
+    workflow: "official_account_comment_patrol",
+    status: "pending",
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+
+  const result = await harness.api.cancelTargetedPostRunFromControl(
+    request.id,
+    request.attemptId,
+  );
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.reason, "stopped_before_dispatch");
+  assert.equal(result.request.status, "canceled");
+  assert.equal(result.request.cancelRequested, true);
+  assert.ok(result.request.finishedAt);
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+  assert.deepEqual(harness.removedTabIds, []);
+});
+
+test("targeted stop survives a missing runner and a pending content reply after durable terminal evidence", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-stuck-request",
+    clientTaskId: "targeted-stuck-request",
+    taskId: "targeted-stuck-task",
+    attemptId: "targeted-stuck-attempt",
+    cloudCommandId: "targeted-stuck-command",
+    platform: "douyin",
+    runnerTabId: 71,
+    progress: {targetTabId: 99, phase: "target_opening"},
+    targetResults: [{
+      itemId: "targeted-item-1",
+      status: "completed_with_warnings",
+      recordIds: ["durable-record-before-stop"],
+    }],
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-stuck", token: "agent-stuck-token"},
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const lock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "targeted-stuck-holder",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(lock.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  // The extension runner shell has already disappeared. The platform content
+  // message never resolves either, matching the field failure after reload.
+  harness.setTabQueryHandler(async () => []);
+  harness.setTabMessageHandler(async () => await new Promise(() => {}));
+  let removalEvidence = null;
+  harness.setTabRemoveHandler(async (tabId) => {
+    removalEvidence = {
+      tabId: Number(tabId),
+      requestStatus: harness.storage[TARGETED_POST_REQUEST_KEY]?.status,
+      resultRecordIds:
+        harness.storage[TARGETED_POST_REQUEST_KEY]?.targetResults?.[0]
+          ?.recordIds,
+      terminalWasPersisted: harness.storageSetCalls.some((entry) =>
+        Object.hasOwn(entry, NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY)),
+    };
+  });
+
+  const startedAt = Date.now();
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:cancel-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.data.request.status, "canceled");
+  assert.ok(Date.now() - startedAt < 3000, "stop must not wait forever");
+  assert.deepEqual(harness.removedTabIds, [opened.data.tabId]);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.deepEqual(removalEvidence, {
+    tabId: opened.data.tabId,
+    requestStatus: "canceled",
+    resultRecordIds: ["durable-record-before-stop"],
+    terminalWasPersisted: true,
+  });
+});
+
+test("targeted stop keeps the platform page lock and runner when terminal evidence cannot be persisted", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-stop-outbox-failure",
+    clientTaskId: "targeted-stop-outbox-failure",
+    attemptId: "targeted-stop-outbox-attempt",
+    cloudCommandId: "targeted-stop-outbox-command",
+    runnerTabId: 78,
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "agent-stop-outbox-failure",
+      token: "agent-stop-outbox-failure-token",
+    },
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const lock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "targeted-stop-outbox-holder",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(lock.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () => [{
+    id: request.runnerTabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}` +
+      `&targetedPostAttempt=${request.attemptId}`,
+  }]);
+  harness.setStorageSetHandler(async (values) => {
+    if (Object.hasOwn(values, NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY)) {
+      throw new Error("outbox quota unavailable during stop");
+    }
+  });
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:cancel-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+  });
+
+  assert.equal(response.ok, false);
+  assert.equal(response.accepted, false);
+  assert.equal(
+    response.reason,
+    "negative_patrol_terminal_outbox_write_failed",
+  );
+  assert.equal(response.data.request.status, "needs_action");
+  assert.equal(response.data.cleanup, null);
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(
+    harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].tabId,
+    opened.data.tabId,
+  );
+  assert.equal(
+    harness.storage[LOCK_KEY].captureTaskAttemptId,
+    request.attemptId,
+  );
+});
+
+test("a server superseded notice terminalizes and cleans the exact current attempt", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-server-terminal",
+    clientTaskId: "targeted-server-terminal",
+    attemptId: "targeted-server-attempt",
+    runnerTabId: 81,
+    targetResults: [{
+      itemId: "targeted-item-1",
+      status: "completed",
+      recordIds: ["record-kept-after-supersede"],
+    }],
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "targeted-server-holder",
+    holderTabId: request.runnerTabId,
+  });
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () => [{
+    id: request.runnerTabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}` +
+      `&targetedPostAttempt=${request.attemptId}`,
+  }]);
+
+  const result = await harness.api.applyTargetedPostTerminalNotice({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    status: "superseded",
+    reason: "attempt_superseded",
+    message: "当前工作项已由其它 Agent 自动接力",
+    finishedAt: "2026-09-07T08:58:37.000Z",
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.matchedCurrent, true);
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "superseded");
+  assert.deepEqual(
+    harness.storage[TARGETED_POST_REQUEST_KEY].targetResults[0].recordIds,
+    ["record-kept-after-supersede"],
+  );
+  assert.deepEqual(
+    harness.removedTabIds,
+    [opened.data.tabId, request.runnerTabId],
+  );
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.equal(
+    JSON.stringify(harness.storage[TARGETED_POST_TERMINAL_NOTICE_ACKS_KEY]),
+    JSON.stringify([{
+      requestId: request.id,
+      attemptId: request.attemptId,
+      status: "superseded",
+    }]),
+  );
+});
+
+test("a server terminal notice is acknowledged only after platform, lock, and runner cleanup settle", async () => {
+  for (const failedResource of ["platform", "lock", "runner"]) {
+    const harness = createHarness();
+    const request = buildTargetedPostRequest({
+      id: `targeted-terminal-cleanup-retry-${failedResource}`,
+      clientTaskId: `targeted-terminal-cleanup-retry-${failedResource}`,
+      attemptId: `targeted-terminal-cleanup-retry-${failedResource}-attempt`,
+      runnerTabId:
+        failedResource === "platform"
+          ? 811
+          : failedResource === "lock"
+            ? 812
+            : 813,
+    });
+    harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+    const acquired = await harness.sendBackgroundMessage({
+      type: "onstarvoice:acquire-capture-lock",
+      owner: "cloud_targeted_post_capture",
+      label: "负面帖子巡查",
+      captureTaskId: `${request.id}::${request.attemptId}`,
+      captureTaskAttemptId: request.attemptId,
+      holderId: `targeted-terminal-cleanup-retry-${failedResource}-holder`,
+      holderTabId: request.runnerTabId,
+    });
+    assert.equal(acquired.ok, true, failedResource);
+    const opened = await harness.sendBackgroundMessage({
+      type: "onstarvoice:open-targeted-post-platform-tab",
+      requestId: request.id,
+      attemptId: request.attemptId,
+      url: request.targets[0].url,
+    });
+    assert.equal(opened.ok, true, failedResource);
+    const runnerUrl =
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}` +
+      `&targetedPostAttempt=${request.attemptId}`;
+    harness.setTabGetHandler(async (tabId) => ({
+      id: Number(tabId),
+      status: "complete",
+      windowId: 1,
+      url: Number(tabId) === request.runnerTabId
+        ? runnerUrl
+        : request.targets[0].url,
+    }));
+    harness.setTabQueryHandler(async () =>
+      harness.removedTabIds.includes(request.runnerTabId)
+        ? []
+        : [{id: request.runnerTabId, url: runnerUrl}]);
+    let removeFailurePending = true;
+    harness.setTabRemoveHandler(async (tabId) => {
+      const expectedTabId = failedResource === "platform"
+        ? opened.data.tabId
+        : request.runnerTabId;
+      if (
+        failedResource !== "lock" &&
+        removeFailurePending &&
+        Number(tabId) === expectedTabId
+      ) {
+        removeFailurePending = false;
+        throw new Error(`simulated ${failedResource} close failure`);
+      }
+    });
+    let lockFailurePending = failedResource === "lock";
+    harness.setStorageRemoveHandler(async (keys) => {
+      const normalizedKeys = Array.isArray(keys) ? keys : [keys];
+      if (lockFailurePending && normalizedKeys.includes(LOCK_KEY)) {
+        lockFailurePending = false;
+        throw new Error("simulated exact lock release failure");
+      }
+    });
+    const notice = {
+      requestId: request.id,
+      attemptId: request.attemptId,
+      status: "superseded",
+      reason: "attempt_superseded",
+      message: "当前工作项已由其它 Agent 自动接力",
+      finishedAt: "2026-09-07T09:00:00.000Z",
+    };
+
+    const first = await harness.api.applyTargetedPostTerminalNotice(notice);
+
+    assert.equal(first.accepted, false, failedResource);
+    assert.equal(first.cleanupPending, true, failedResource);
+    assert.equal(
+      first.reason,
+      "targeted_post_terminal_notice_cleanup_pending",
+      failedResource,
+    );
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        await harness.api.readTargetedPostTerminalNoticeAcks(),
+      )),
+      [],
+      `${failedResource} cleanup failure must not acknowledge the notice`,
+    );
+    assert.equal(
+      harness.storage[TARGETED_POST_REQUEST_KEY].status,
+      "superseded",
+      failedResource,
+    );
+
+    const second = await harness.api.applyTargetedPostTerminalNotice(notice);
+
+    assert.equal(second.accepted, true, failedResource);
+    assert.equal(
+      JSON.stringify(await harness.api.readTargetedPostTerminalNoticeAcks()),
+      JSON.stringify([{
+        requestId: request.id,
+        attemptId: request.attemptId,
+        status: "superseded",
+      }]),
+      failedResource,
+    );
+    assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+    assert.equal(harness.storage[LOCK_KEY], undefined);
+    assert.deepEqual(
+      [...harness.removedTabIds].sort((left, right) => left - right),
+      [opened.data.tabId, request.runnerTabId].sort((left, right) => left - right),
+      failedResource,
+    );
+  }
+});
+
+test("a server terminal notice closes an exact registered platform tab after the local request disappeared", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-terminal-missing-local-request",
+    clientTaskId: "targeted-terminal-missing-local-request",
+    attemptId: "targeted-terminal-missing-local-attempt",
+    cloudCommandId: "targeted-terminal-missing-local-command",
+    runnerTabId: 814,
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const acquired = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "targeted-terminal-missing-local-holder",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(acquired.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  delete harness.storage[TARGETED_POST_REQUEST_KEY];
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () => [{
+    id: request.runnerTabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}` +
+      `&targetedPostAttempt=${request.attemptId}`,
+  }]);
+  const notice = {
+    requestId: request.id,
+    attemptId: request.attemptId,
+    status: "superseded",
+    reason: "attempt_superseded",
+  };
+
+  const result = await harness.api.applyTargetedPostTerminalNotice(notice);
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  assert.equal(result.matchedCurrent, false);
+  assert.deepEqual(
+    harness.removedTabIds,
+    [opened.data.tabId, request.runnerTabId],
+  );
+  assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await harness.api.readTargetedPostTerminalNoticeAcks(),
+    )),
+    [{
+      requestId: request.id,
+      attemptId: request.attemptId,
+      status: "superseded",
+    }],
+  );
+});
+
+test("a server terminal notice preserves an exact tab now showing another post on the same platform", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-terminal-reused-platform-tab",
+    clientTaskId: "targeted-terminal-reused-platform-tab",
+    attemptId: "targeted-terminal-reused-platform-attempt",
+    cloudCommandId: "targeted-terminal-reused-platform-command",
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  delete harness.storage[TARGETED_POST_REQUEST_KEY];
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: "https://www.douyin.com/video/user-owned-post",
+  }));
+  harness.setTabQueryHandler(async () => []);
+
+  const result = await harness.api.applyTargetedPostTerminalNotice({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    status: "revoked",
+    reason: "server_lease_revoked",
+  });
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(
+    result.cleanup.platformCleanup.reason,
+    "targeted_post_platform_tab_identity_changed",
+  );
+  assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+});
+
+test("a reopened sidebar reconciles a server-terminal snapshot and acknowledges it without reviving the runner", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-reload-reconcile",
+    clientTaskId: "targeted-reload-reconcile",
+    attemptId: "targeted-reload-attempt",
+    runnerTabId: 87,
+    targetResults: [{
+      itemId: "targeted-item-1",
+      status: "completed_with_warnings",
+      recordIds: ["record-before-extension-reload"],
+    }],
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "agent-reload-reconcile",
+      token: "agent-reload-reconcile-token",
+    },
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  harness.setTabQueryHandler(async () => []);
+  harness.setCloudHeartbeatHandler(async (_options, heartbeatNumber) => ({
+    ok: true,
+    commands: [],
+    terminalNotices: heartbeatNumber === 1
+      ? [{
+          requestId: request.id,
+          attemptId: request.attemptId,
+          status: "superseded",
+          reason: "attempt_superseded",
+          message: "扩展重载期间该轮已由其它节点接力",
+          finishedAt: "2026-09-07T09:05:00.000Z",
+        }]
+      : [],
+  }));
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:reconcile-targeted-post-run-state",
+    requestId: request.id,
+    attemptId: request.attemptId,
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.reconciled, true);
+  assert.equal(response.data.status, "superseded");
+  assert.deepEqual(
+    response.data.targetResults[0].recordIds,
+    ["record-before-extension-reload"],
+  );
+  assert.equal(harness.createdTabs.length, 0);
+  assert.deepEqual(harness.removedTabIds, []);
+  await waitFor(
+    () => harness.cloudHeartbeats.length >= 2,
+    "the server terminal notice acknowledgement was not sent",
+  );
+  assert.equal(
+    JSON.stringify(harness.cloudHeartbeats[1].terminalNoticeAcks),
+    JSON.stringify([{
+      requestId: request.id,
+      attemptId: request.attemptId,
+      status: "superseded",
+    }]),
+  );
+  await waitFor(
+    () => harness.storage[TARGETED_POST_TERMINAL_NOTICE_ACKS_KEY] === undefined,
+    "the delivered terminal notice acknowledgement was not cleared",
+  );
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "superseded",
+  );
+});
+
+test("a late server notice closes only old attempt resources and cannot harm the replacement", async () => {
+  const harness = createHarness();
+  const requestId = "targeted-reused-request";
+  const current = buildTargetedPostRequest({
+    id: requestId,
+    clientTaskId: requestId,
+    attemptId: "targeted-new-attempt",
+    runnerTabId: 92,
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = current;
+  await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${current.id}::${current.attemptId}`,
+    captureTaskAttemptId: current.attemptId,
+    holderId: "targeted-new-holder",
+    holderTabId: current.runnerTabId,
+  });
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: current.id,
+    attemptId: current.attemptId,
+    url: current.targets[0].url,
+  });
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: current.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () => [
+    {
+      id: 91,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?targetedPostRun=${requestId}` +
+        "&targetedPostAttempt=targeted-old-attempt",
+    },
+    {
+      id: current.runnerTabId,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?targetedPostRun=${requestId}` +
+        `&targetedPostAttempt=${current.attemptId}`,
+    },
+  ]);
+
+  const result = await harness.api.applyTargetedPostTerminalNotice({
+    requestId,
+    attemptId: "targeted-old-attempt",
+    status: "revoked",
+    reason: "server_lease_revoked",
+    message: "旧轮次执行权已撤销",
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.matchedCurrent, false);
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].attemptId, current.attemptId);
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "running");
+  assert.deepEqual(harness.removedTabIds, [91]);
+  assert.equal(
+    harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].tabId,
+    opened.data.tabId,
+  );
+  assert.equal(
+    harness.storage[LOCK_KEY].captureTaskAttemptId,
+    current.attemptId,
   );
 });
 
@@ -3631,6 +4402,933 @@ test("targeted stop rejects a missing attempt", async () => {
   assert.equal(result.accepted, false);
   assert.equal(result.reason, "targeted_post_attempt_required");
   assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "running");
+});
+
+test("a legacy negative-pack stop derives its attempt only from the exact superseded create command", async () => {
+  const harness = createHarness();
+  const createCommandId = "10000000-0000-4000-8000-000000000021";
+  const request = buildTargetedPostRequest({
+    id: "legacy-negative-stop-request",
+    clientTaskId: "legacy-negative-stop-request",
+    attemptId: "legacy-negative-stop-attempt",
+    cloudCommandId: createCommandId,
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "legacy-negative-stop-agent",
+      token: "legacy-negative-stop-token",
+    },
+  };
+
+  await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "10000000-0000-4000-8000-000000000022",
+      command_type: "stop",
+      client_task_id: request.id,
+      payload: {
+        controlTaskId: request.id,
+        legacyNegativePackStopV1: true,
+        terminalReason: "legacy_negative_pack_revoked",
+        supersededCreateCommandId: createCommandId,
+      },
+    },
+    "legacy-negative-stop-token",
+  );
+
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "canceled");
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].attemptId,
+    request.attemptId,
+  );
+  const stopCompletion = harness.cloudCommandCompletions.find(
+    (completion) =>
+      completion.commandId === "10000000-0000-4000-8000-000000000022",
+  );
+  assert.equal(stopCompletion.success, true);
+  assert.equal(stopCompletion.result.reason, "canceled");
+  assert.equal(stopCompletion.result.attemptId, request.attemptId);
+});
+
+test("an acknowledged exact stop clears only its superseded conflicting negative completion after safe cleanup", async () => {
+  const harness = createHarness();
+  const createCommandId = "10000000-0000-4000-8000-000000000031";
+  const stopCommandId = "10000000-0000-4000-8000-000000000032";
+  let request = buildTargetedPostRequest({
+    id: "negative-stop-race-request",
+    clientTaskId: "negative-stop-race-request",
+    attemptId: "10000000-0000-4000-8000-000000000033",
+    cloudCommandId: createCommandId,
+    runnerTabId: 731,
+    status: "completed",
+    finishedAt: "2026-09-07T12:00:00.000Z",
+    message: "负面巡查已在本地完成",
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "negative-stop-race-agent",
+      token: "negative-stop-race-token",
+    },
+  };
+  await harness.api.persistTargetedPostRunRequest(request);
+  const acquired = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "negative-stop-race-holder",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(acquired.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  request = await harness.api.persistTargetedPostRunRequest({
+    ...request,
+    progress: {
+      targetTabId: opened.data.tabId,
+      url: request.targets[0].url,
+      phase: "completed",
+    },
+  });
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () => [{
+    id: request.runnerTabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}` +
+      `&targetedPostAttempt=${request.attemptId}`,
+  }]);
+  harness.setCloudCommandCompletionHandler(async (options) =>
+    options.commandId === createCommandId
+      ? {
+          ok: false,
+          status: 409,
+          reason: "completion_identity_conflict",
+          message: "create was superseded by stop",
+        }
+      : {
+          ok: true,
+          commandId: options.commandId,
+          data: {
+            acknowledgedStop: {
+              commandId: stopCommandId,
+              supersededCreateCommandId: createCommandId,
+              requestId: request.id,
+              attemptId: request.attemptId,
+            },
+          },
+        },
+  );
+
+  const conflicted = await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: createCommandId,
+    result: buildNegativePatrolCompletionResult({
+      requestId: request.id,
+      taskId: request.taskId,
+      attemptId: request.attemptId,
+      cloudCommandId: createCommandId,
+    }),
+    token: "negative-stop-race-token",
+    agentId: "negative-stop-race-agent",
+    cleanupRequest: request,
+  });
+  assert.equal(conflicted.reason, "negative_patrol_terminal_conflict");
+  let outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.equal(outbox.entries.length, 1);
+  assert.equal(outbox.entries[0].blocked, true);
+  assert.deepEqual(harness.removedTabIds, []);
+
+  const newer = await harness.api.buildNegativePatrolTerminalOutboxEntry({
+    commandId: "10000000-0000-4000-8000-000000000034",
+    result: buildNegativePatrolCompletionResult({
+      requestId: request.id,
+      attemptId: "10000000-0000-4000-8000-000000000035",
+      cloudCommandId: "10000000-0000-4000-8000-000000000034",
+    }),
+    agentId: "negative-stop-race-agent",
+  });
+  assert.equal(newer.ok, true);
+  await harness.api.persistNegativePatrolTerminalOutboxEntry(newer.entry);
+
+  const stopped = await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: stopCommandId,
+      command_type: "stop",
+      client_task_id: request.id,
+      payload: {
+        controlTaskId: request.id,
+        targetedAttemptId: request.attemptId,
+        supersededCreateCommandId: createCommandId,
+      },
+    },
+    "negative-stop-race-token",
+  );
+
+  assert.equal(stopped.ok, true);
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "completed",
+    "the acknowledged stop must not overwrite the already completed request",
+  );
+  outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.equal(outbox.entries.length, 1);
+  assert.equal(
+    outbox.entries[0].commandId,
+    "10000000-0000-4000-8000-000000000034",
+    "a newer attempt receipt must remain untouched",
+  );
+  assert.deepEqual(
+    harness.removedTabIds,
+    [opened.data.tabId, request.runnerTabId],
+  );
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+  const stopCompletion = harness.cloudCommandCompletions.find(
+    (completion) => completion.commandId === stopCommandId,
+  );
+  assert.equal(stopCompletion.success, true);
+  assert.equal(stopCompletion.result.reason, "already_terminal");
+  assert.equal(stopCompletion.result.attemptId, request.attemptId);
+});
+
+test("a stop response without an exact four-field acknowledgement retains the superseded create receipt", async () => {
+  for (const mismatchedField of [
+    "missing",
+    "commandId",
+    "supersededCreateCommandId",
+    "requestId",
+    "attemptId",
+  ]) {
+    const harness = createHarness();
+    const createCommandId = "20000000-0000-4000-8000-000000000001";
+    const stopCommandId = "20000000-0000-4000-8000-000000000002";
+    const request = buildTargetedPostRequest({
+      id: `negative-stop-ack-${mismatchedField}-request`,
+      clientTaskId: `negative-stop-ack-${mismatchedField}-request`,
+      attemptId: "20000000-0000-4000-8000-000000000003",
+      cloudCommandId: createCommandId,
+      status: "completed",
+      finishedAt: "2026-09-07T12:10:00.000Z",
+    });
+    await harness.api.persistTargetedPostRunRequest(request);
+    const exactAcknowledgement = {
+      commandId: stopCommandId,
+      supersededCreateCommandId: createCommandId,
+      requestId: request.id,
+      attemptId: request.attemptId,
+    };
+    harness.setCloudCommandCompletionHandler(async (options) => {
+      if (options.commandId === createCommandId) {
+        return {
+          ok: false,
+          status: 409,
+          reason: "completion_identity_conflict",
+        };
+      }
+      const acknowledgement = {...exactAcknowledgement};
+      if (mismatchedField !== "missing") {
+        acknowledgement[mismatchedField] = `wrong-${mismatchedField}`;
+      }
+      return {
+        ok: true,
+        commandId: stopCommandId,
+        data: mismatchedField === "missing"
+          ? {}
+          : {acknowledgedStop: acknowledgement},
+      };
+    });
+    const conflicted = await harness.api.queueAndSendNegativePatrolTerminalResult({
+      commandId: createCommandId,
+      result: buildNegativePatrolCompletionResult({
+        requestId: request.id,
+        attemptId: request.attemptId,
+        cloudCommandId: createCommandId,
+      }),
+      token: "negative-stop-ack-token",
+      agentId: "negative-stop-ack-agent",
+      cleanupRequest: request,
+    });
+    assert.equal(conflicted.reason, "negative_patrol_terminal_conflict");
+
+    const stopped = await harness.api.executeCloudTaskAgentCommand(
+      {
+        id: stopCommandId,
+        command_type: "stop",
+        client_task_id: request.id,
+        payload: {
+          controlTaskId: request.id,
+          targetedAttemptId: request.attemptId,
+          supersededCreateCommandId: createCommandId,
+        },
+      },
+      "negative-stop-ack-token",
+    );
+
+    assert.equal(stopped.ok, false, mismatchedField);
+    assert.equal(stopped.retained, true, mismatchedField);
+    assert.equal(
+      stopped.localCleanupReason,
+      "negative_patrol_stop_ack_missing_or_mismatched",
+      mismatchedField,
+    );
+    const outbox = await harness.api.readNegativePatrolTerminalOutbox();
+    assert.equal(outbox.entries.length, 1, mismatchedField);
+    assert.equal(outbox.entries[0].commandId, createCommandId, mismatchedField);
+    assert.equal(outbox.entries[0].blocked, true, mismatchedField);
+    assert.equal(
+      outbox.entries[0].stopSupersession.stopCommandId,
+      stopCommandId,
+      mismatchedField,
+    );
+    assert.equal(
+      outbox.entries[0].stopSupersession.acknowledgedAt,
+      "",
+      mismatchedField,
+    );
+    assert.equal(outbox.entries[0].stopSupersession.attempts, 1, mismatchedField);
+  }
+});
+
+test("a pending stop supersession survives restart and replays the exact stop instead of the create completion", async () => {
+  const harness = createHarness();
+  const createCommandId = "30000000-0000-4000-8000-000000000001";
+  const stopCommandId = "30000000-0000-4000-8000-000000000002";
+  const request = buildTargetedPostRequest({
+    id: "negative-stop-crash-request",
+    clientTaskId: "negative-stop-crash-request",
+    attemptId: "30000000-0000-4000-8000-000000000003",
+    cloudCommandId: createCommandId,
+    status: "completed",
+    finishedAt: "2026-09-07T12:20:00.000Z",
+  });
+  await harness.api.persistTargetedPostRunRequest(request);
+  harness.setCloudCommandCompletionHandler(async () => ({
+    ok: false,
+    status: 409,
+    reason: "completion_identity_conflict",
+  }));
+  await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: createCommandId,
+    result: buildNegativePatrolCompletionResult({
+      requestId: request.id,
+      attemptId: request.attemptId,
+      cloudCommandId: createCommandId,
+    }),
+    token: "negative-stop-crash-token",
+    agentId: "negative-stop-crash-agent",
+    cleanupRequest: request,
+  });
+  const stopResult = {
+    state: "completed",
+    accepted: true,
+    reason: "already_terminal",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    message: "任务已经结束，无需重复停止",
+  };
+  const prepared =
+    await harness.api.prepareNegativePatrolTerminalOutboxStopSupersession({
+      stopCommandId,
+      supersededCreateCommandId: createCommandId,
+      requestId: request.id,
+      attemptId: request.attemptId,
+      success: true,
+      result: stopResult,
+    });
+  assert.equal(prepared.ok, true);
+
+  const restarted = createHarness();
+  Object.assign(
+    restarted.storage,
+    JSON.parse(JSON.stringify(harness.storage)),
+  );
+  restarted.setCloudCommandCompletionHandler(async (options) => ({
+    ok: true,
+    commandId: options.commandId,
+    data: {
+      acknowledgedStop: {
+        commandId: stopCommandId,
+        supersededCreateCommandId: createCommandId,
+        requestId: request.id,
+        attemptId: request.attemptId,
+      },
+    },
+  }));
+
+  const replay = await restarted.api.replayNegativePatrolTerminalOutbox({
+    token: "negative-stop-crash-token",
+    agentId: "negative-stop-crash-agent",
+  });
+
+  assert.equal(replay.confirmed, 1, JSON.stringify(replay));
+  assert.equal(replay.remaining, 0, JSON.stringify(replay));
+  assert.equal(restarted.cloudCommandCompletions.length, 1);
+  assert.equal(restarted.cloudCommandCompletions[0].commandId, stopCommandId);
+  assert.equal(restarted.cloudCommandCompletions[0].success, true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(restarted.cloudCommandCompletions[0].result)),
+    stopResult,
+  );
+  assert.equal(
+    restarted.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY],
+    undefined,
+  );
+});
+
+test("an acknowledged stop retries failed local cleanup without a token or another server completion", async () => {
+  const harness = createHarness();
+  const createCommandId = "40000000-0000-4000-8000-000000000001";
+  const stopCommandId = "40000000-0000-4000-8000-000000000002";
+  let request = buildTargetedPostRequest({
+    id: "negative-stop-local-cleanup-request",
+    clientTaskId: "negative-stop-local-cleanup-request",
+    attemptId: "40000000-0000-4000-8000-000000000003",
+    cloudCommandId: createCommandId,
+    runnerTabId: 734,
+    status: "completed",
+    finishedAt: "2026-09-07T12:30:00.000Z",
+  });
+  await harness.api.persistTargetedPostRunRequest(request);
+  const acquired = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "negative-stop-local-cleanup-holder",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(acquired.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  request = await harness.api.persistTargetedPostRunRequest({
+    ...request,
+    progress: {
+      targetTabId: opened.data.tabId,
+      url: request.targets[0].url,
+      phase: "completed",
+    },
+  });
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () =>
+    harness.removedTabIds.includes(request.runnerTabId)
+      ? []
+      : [{
+          id: request.runnerTabId,
+          url:
+            "chrome-extension://test/sidebar/sidebar.html" +
+            `?targetedPostRun=${request.id}` +
+            `&targetedPostAttempt=${request.attemptId}`,
+        }]);
+  let failFirstPlatformClose = true;
+  harness.setTabRemoveHandler(async (tabId) => {
+    if (Number(tabId) === opened.data.tabId && failFirstPlatformClose) {
+      failFirstPlatformClose = false;
+      throw new Error("simulated first platform close failure");
+    }
+  });
+  harness.setCloudCommandCompletionHandler(async () => ({
+    ok: false,
+    status: 409,
+    reason: "completion_identity_conflict",
+  }));
+  await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: createCommandId,
+    result: buildNegativePatrolCompletionResult({
+      requestId: request.id,
+      attemptId: request.attemptId,
+      cloudCommandId: createCommandId,
+    }),
+    token: "negative-stop-local-cleanup-token",
+    agentId: "negative-stop-local-cleanup-agent",
+    cleanupRequest: request,
+  });
+  const stopResult = {
+    state: "completed",
+    accepted: true,
+    reason: "already_terminal",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    message: "任务已经结束，无需重复停止",
+  };
+  const prepared =
+    await harness.api.prepareNegativePatrolTerminalOutboxStopSupersession({
+      stopCommandId,
+      supersededCreateCommandId: createCommandId,
+      requestId: request.id,
+      attemptId: request.attemptId,
+      success: true,
+      result: stopResult,
+    });
+  assert.equal(prepared.ok, true);
+  harness.setCloudCommandCompletionHandler(async () => ({
+    ok: true,
+    commandId: stopCommandId,
+    data: {
+      acknowledgedStop: {
+        commandId: stopCommandId,
+        supersededCreateCommandId: createCommandId,
+        requestId: request.id,
+        attemptId: request.attemptId,
+      },
+    },
+  }));
+
+  const firstReplay = await harness.api.replayNegativePatrolTerminalOutbox({
+    token: "negative-stop-local-cleanup-token",
+    agentId: "negative-stop-local-cleanup-agent",
+  });
+  assert.equal(firstReplay.confirmed, 0, JSON.stringify(firstReplay));
+  assert.equal(firstReplay.remaining, 1, JSON.stringify(firstReplay));
+  let outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.ok(outbox.entries[0].stopSupersession.acknowledgedAt);
+  assert.equal(outbox.entries[0].blocked, false);
+  const completionCountAfterAck = harness.cloudCommandCompletions.length;
+
+  const secondReplay = await harness.api.replayNegativePatrolTerminalOutbox({
+    token: "",
+    agentId: "negative-stop-local-cleanup-agent",
+  });
+
+  assert.equal(secondReplay.confirmed, 1, JSON.stringify(secondReplay));
+  assert.equal(secondReplay.remaining, 0, JSON.stringify(secondReplay));
+  assert.equal(
+    harness.cloudCommandCompletions.length,
+    completionCountAfterAck,
+    "acknowledged local cleanup must not require or resend a cloud completion",
+  );
+  assert.equal(harness.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY], undefined);
+  assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.deepEqual(
+    [...harness.removedTabIds].sort((left, right) => left - right),
+    [opened.data.tabId, request.runnerTabId].sort((left, right) => left - right),
+  );
+});
+
+test("an attempt-less targeted stop stays rejected without every legacy negative-pack fence", async () => {
+  for (const [
+    variant,
+    workflow,
+    legacyNegativePackStopV1,
+    supersededCreateCommandId,
+  ] of [
+    ["missing-legacy-marker", "negative_post_patrol", false, "matched-create-command"],
+    ["missing-create-command", "negative_post_patrol", true, ""],
+    ["wrong-create-command", "negative_post_patrol", true, "another-create-command"],
+    ["non-negative-workflow", "watched_content_patrol", true, "matched-create-command"],
+  ]) {
+    const harness = createHarness();
+    const request = buildTargetedPostRequest({
+      id: `legacy-stop-rejected-${variant}`,
+      clientTaskId: `legacy-stop-rejected-${variant}`,
+      attemptId: `legacy-stop-rejected-${variant}-attempt`,
+      cloudCommandId: "matched-create-command",
+      workflow,
+    });
+    harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+    const stopCommandId = `legacy-stop-rejected-${variant}-command`;
+
+    await harness.api.executeCloudTaskAgentCommand(
+      {
+        id: stopCommandId,
+        command_type: "stop",
+        client_task_id: request.id,
+        payload: {
+          controlTaskId: request.id,
+          ...(legacyNegativePackStopV1
+            ? {legacyNegativePackStopV1: true}
+            : {}),
+          terminalReason: "legacy_negative_pack_revoked",
+          ...(supersededCreateCommandId
+            ? {supersededCreateCommandId}
+            : {}),
+        },
+      },
+      "legacy-stop-rejected-token",
+    );
+
+    assert.equal(
+      harness.storage[TARGETED_POST_REQUEST_KEY].status,
+      "running",
+      variant,
+    );
+    const stopCompletion = harness.cloudCommandCompletions.find(
+      (completion) => completion.commandId === stopCommandId,
+    );
+    assert.equal(stopCompletion.success, false, variant);
+    assert.equal(
+      stopCompletion.result.reason,
+      "targeted_post_attempt_required",
+      variant,
+    );
+    assert.equal(stopCompletion.result.attemptId, "", variant);
+  }
+});
+
+test("startup reconciliation closes a stranded negative cancel after its exact ledger is terminal and resources are gone", async () => {
+  for (const ledgerStatus of ["canceled", "failed"]) {
+    const harness = createHarness();
+    const request = buildTargetedPostRequest({
+      id: `negative-stranded-${ledgerStatus}-request`,
+      clientTaskId: `negative-stranded-${ledgerStatus}-request`,
+      attemptId: `negative-stranded-${ledgerStatus}-attempt`,
+      cloudCommandId: `negative-stranded-${ledgerStatus}-command`,
+      runnerTabId: 701,
+      status: "cancel_requested",
+      cancelRequested: true,
+      message: "正在停止负面帖子巡查",
+    });
+    harness.storage["onstarvoice.auth"] = {
+      captureAgent: {
+        id: `negative-stranded-${ledgerStatus}-agent`,
+        token: `negative-stranded-${ledgerStatus}-token`,
+      },
+    };
+    await harness.api.persistTargetedPostRunRequest(request);
+    const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+      (run) => run.id === `${request.id}::${request.attemptId}`,
+    );
+    Object.assign(ledgerRun, {
+      status: ledgerStatus,
+      finishedAt: "2026-09-07T11:00:00.000Z",
+      updatedAt: "2026-09-07T11:00:00.000Z",
+    });
+    harness.setTabQueryHandler(async () => []);
+
+    const reconciled =
+      await harness.api.reconcileStrandedNegativePatrolCancellation();
+
+    assert.equal(reconciled.accepted, true, ledgerStatus);
+    assert.equal(reconciled.reconciled, true, ledgerStatus);
+    assert.equal(reconciled.ledgerRun.status, ledgerStatus);
+    assert.equal(
+      harness.storage[TARGETED_POST_REQUEST_KEY].status,
+      "canceled",
+      ledgerStatus,
+    );
+    assert.equal(
+      harness.storage[TARGETED_POST_REQUEST_KEY].attemptId,
+      request.attemptId,
+      ledgerStatus,
+    );
+    assert.ok(harness.storage[TARGETED_POST_REQUEST_KEY].finishedAt);
+    assert.equal(
+      harness.cloudCommandCompletions.some(
+        (completion) => completion.commandId === request.cloudCommandId,
+      ),
+      true,
+      ledgerStatus,
+    );
+  }
+});
+
+test("stranded negative reconciliation rejects a physical ledger id with an explicit stale attempt", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "negative-stale-ledger-request",
+    clientTaskId: "negative-stale-ledger-request",
+    attemptId: "negative-current-attempt",
+    cloudCommandId: "negative-stale-ledger-command",
+    status: "cancel_requested",
+    cancelRequested: true,
+  });
+  await harness.api.persistTargetedPostRunRequest(request);
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === `${request.id}::${request.attemptId}`,
+  );
+  Object.assign(ledgerRun, {
+    attemptId: "negative-older-attempt",
+    status: "failed",
+    finishedAt: "2026-09-07T11:02:00.000Z",
+    updatedAt: "2026-09-07T11:02:00.000Z",
+  });
+  ledgerRun.metadata = {
+    ...(ledgerRun.metadata || {}),
+    attemptId: "negative-older-attempt",
+  };
+  harness.setTabQueryHandler(async () => []);
+
+  const reconciled =
+    await harness.api.reconcileStrandedNegativePatrolCancellation();
+
+  assert.equal(reconciled.accepted, false);
+  assert.equal(reconciled.reconciled, false);
+  assert.equal(reconciled.reason, "negative_patrol_cancel_ledger_not_terminal");
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "cancel_requested",
+  );
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+});
+
+test("stranded negative cancellation reconciliation waits while its exact runner page or lock still exists", async () => {
+  for (const ownershipKind of ["runner", "platform", "lock"]) {
+    const harness = createHarness();
+    const request = buildTargetedPostRequest({
+      id: `negative-owned-${ownershipKind}-request`,
+      clientTaskId: `negative-owned-${ownershipKind}-request`,
+      attemptId: `negative-owned-${ownershipKind}-attempt`,
+      cloudCommandId: `negative-owned-${ownershipKind}-command`,
+      runnerTabId: 711,
+      status: "cancel_requested",
+      cancelRequested: true,
+    });
+    await harness.api.persistTargetedPostRunRequest(request);
+    const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+      (run) => run.id === `${request.id}::${request.attemptId}`,
+    );
+    Object.assign(ledgerRun, {
+      status: "failed",
+      finishedAt: "2026-09-07T11:05:00.000Z",
+      updatedAt: "2026-09-07T11:05:00.000Z",
+    });
+    harness.setTabQueryHandler(async () =>
+      ownershipKind === "runner"
+        ? [{
+            id: request.runnerTabId,
+            url:
+              "chrome-extension://test/sidebar/sidebar.html" +
+              `?targetedPostRun=${request.id}` +
+              `&targetedPostAttempt=${request.attemptId}`,
+          }]
+        : [],
+    );
+    if (ownershipKind === "platform") {
+      const opened = await harness.sendBackgroundMessage({
+        type: "onstarvoice:open-targeted-post-platform-tab",
+        requestId: request.id,
+        attemptId: request.attemptId,
+        url: request.targets[0].url,
+      });
+      assert.equal(opened.ok, true);
+      harness.setTabGetHandler(async (tabId) => ({
+        id: Number(tabId),
+        status: "complete",
+        windowId: 1,
+        url: request.targets[0].url,
+      }));
+    }
+    if (ownershipKind === "lock") {
+      const acquired = await harness.sendBackgroundMessage({
+        type: "onstarvoice:acquire-capture-lock",
+        owner: "cloud_targeted_post_capture",
+        label: "负面帖子巡查",
+        captureTaskId: `${request.id}::${request.attemptId}`,
+        captureTaskAttemptId: request.attemptId,
+        holderId: `negative-owned-${ownershipKind}-holder`,
+        holderTabId: request.runnerTabId,
+      });
+      assert.equal(acquired.ok, true);
+    }
+
+    const reconciled =
+      await harness.api.reconcileStrandedNegativePatrolCancellation();
+
+    assert.equal(reconciled.accepted, false, ownershipKind);
+    assert.equal(reconciled.reconciled, false, ownershipKind);
+    assert.equal(
+      reconciled.reason,
+      "negative_patrol_cancel_resources_still_owned",
+      ownershipKind,
+    );
+    assert.equal(
+      harness.storage[TARGETED_POST_REQUEST_KEY].status,
+      "cancel_requested",
+      ownershipKind,
+    );
+    assert.equal(harness.cloudCommandCompletions.length, 0, ownershipKind);
+  }
+});
+
+test("stranded negative reconciliation preserves a v0.4.5 legacy target tab", async () => {
+  const harness = createHarness();
+  const legacyTargetTabId = 719;
+  const request = buildTargetedPostRequest({
+    id: "negative-legacy-tab-request",
+    clientTaskId: "negative-legacy-tab-request",
+    attemptId: "negative-legacy-tab-attempt",
+    cloudCommandId: "negative-legacy-tab-command",
+    status: "cancel_requested",
+    cancelRequested: true,
+    progress: {targetTabId: legacyTargetTabId},
+  });
+  await harness.api.persistTargetedPostRunRequest(request);
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === `${request.id}::${request.attemptId}`,
+  );
+  Object.assign(ledgerRun, {
+    status: "failed",
+    finishedAt: "2026-09-07T11:06:00.000Z",
+    updatedAt: "2026-09-07T11:06:00.000Z",
+  });
+  harness.setTabQueryHandler(async () => []);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+
+  const reconciled =
+    await harness.api.reconcileStrandedNegativePatrolCancellation();
+
+  assert.equal(reconciled.accepted, false);
+  assert.equal(reconciled.reconciled, false);
+  assert.equal(
+    reconciled.reason,
+    "negative_patrol_cancel_resources_still_owned",
+  );
+  assert.equal(reconciled.ownership.platformOwned, true);
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "cancel_requested",
+  );
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+});
+
+test("stranded negative reconciliation fails closed when a legacy target tab lookup is indeterminate", async () => {
+  const harness = createHarness();
+  const legacyTargetTabId = 720;
+  const request = buildTargetedPostRequest({
+    id: "negative-legacy-tab-lookup-error-request",
+    clientTaskId: "negative-legacy-tab-lookup-error-request",
+    attemptId: "negative-legacy-tab-lookup-error-attempt",
+    cloudCommandId: "negative-legacy-tab-lookup-error-command",
+    status: "cancel_requested",
+    cancelRequested: true,
+    progress: {targetTabId: legacyTargetTabId},
+  });
+  await harness.api.persistTargetedPostRunRequest(request);
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === `${request.id}::${request.attemptId}`,
+  );
+  Object.assign(ledgerRun, {
+    status: "failed",
+    finishedAt: "2026-09-07T11:06:30.000Z",
+    updatedAt: "2026-09-07T11:06:30.000Z",
+  });
+  harness.setTabQueryHandler(async () => [{
+    id: legacyTargetTabId,
+    url: request.targets[0].url,
+  }]);
+  harness.setTabGetHandler(async () => {
+    throw new Error("Tabs cannot be inspected right now");
+  });
+
+  const reconciled =
+    await harness.api.reconcileStrandedNegativePatrolCancellation();
+
+  assert.equal(reconciled.accepted, false);
+  assert.equal(reconciled.reconciled, false);
+  assert.equal(
+    reconciled.reason,
+    "targeted_post_resource_inventory_unavailable",
+  );
+  assert.equal(reconciled.ownership.known, false);
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "cancel_requested",
+  );
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+});
+
+test("stranded negative reconciliation treats only an explicit missing legacy tab as gone", async () => {
+  const harness = createHarness();
+  const legacyTargetTabId = 721;
+  const request = buildTargetedPostRequest({
+    id: "negative-legacy-tab-explicitly-gone-request",
+    clientTaskId: "negative-legacy-tab-explicitly-gone-request",
+    attemptId: "negative-legacy-tab-explicitly-gone-attempt",
+    cloudCommandId: "negative-legacy-tab-explicitly-gone-command",
+    status: "cancel_requested",
+    cancelRequested: true,
+    progress: {targetTabId: legacyTargetTabId},
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "negative-legacy-tab-explicitly-gone-agent",
+      token: "negative-legacy-tab-explicitly-gone-token",
+    },
+  };
+  await harness.api.persistTargetedPostRunRequest(request);
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === `${request.id}::${request.attemptId}`,
+  );
+  Object.assign(ledgerRun, {
+    status: "failed",
+    finishedAt: "2026-09-07T11:06:45.000Z",
+    updatedAt: "2026-09-07T11:06:45.000Z",
+  });
+  harness.setTabQueryHandler(async () => []);
+  harness.setTabMissing(legacyTargetTabId);
+
+  const reconciled =
+    await harness.api.reconcileStrandedNegativePatrolCancellation();
+
+  assert.equal(reconciled.accepted, true);
+  assert.equal(reconciled.reconciled, true);
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "canceled",
+  );
+});
+
+test("stranded negative reconciliation fails closed when resource inventory is unavailable", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "negative-inventory-error-request",
+    clientTaskId: "negative-inventory-error-request",
+    attemptId: "negative-inventory-error-attempt",
+    cloudCommandId: "negative-inventory-error-command",
+    status: "cancel_requested",
+    cancelRequested: true,
+  });
+  await harness.api.persistTargetedPostRunRequest(request);
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === `${request.id}::${request.attemptId}`,
+  );
+  Object.assign(ledgerRun, {
+    status: "failed",
+    finishedAt: "2026-09-07T11:07:00.000Z",
+    updatedAt: "2026-09-07T11:07:00.000Z",
+  });
+  harness.setTabQueryHandler(async () => {
+    throw new Error("tabs inventory unavailable");
+  });
+
+  const reconciled =
+    await harness.api.reconcileStrandedNegativePatrolCancellation();
+
+  assert.equal(reconciled.accepted, false);
+  assert.equal(reconciled.reconciled, false);
+  assert.equal(reconciled.reason, "targeted_post_resource_inventory_unavailable");
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].status,
+    "cancel_requested",
+  );
+  assert.equal(harness.cloudCommandCompletions.length, 0);
 });
 
 test("the exact unattended attempt runner stays non-discardable", async () => {
@@ -3770,7 +5468,284 @@ test("a settled targeted-post update closes only its exact runner after report a
   });
 });
 
-test("a needs-action targeted-post update preserves its exact runner for inspection", async () => {
+test("a terminal targeted patrol closes its registered platform tab before releasing the exact lock and runner", async () => {
+  const harness = createHarness();
+  const recentAt = new Date(Date.now() - 5_000).toISOString();
+  const request = buildTargetedPostRequest({
+    id: "targeted-platform-request",
+    clientTaskId: "targeted-platform-request",
+    taskId: "targeted-platform-task",
+    attemptId: "targeted-platform-attempt",
+    cloudCommandId: "targeted-platform-command",
+    platform: "douyin",
+    createdAt: recentAt,
+    updatedAt: recentAt,
+    heartbeatAt: recentAt,
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-platform-close", token: "platform-close-token"},
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+
+  const lock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "targeted-platform-holder",
+    holderTabId: 61,
+  });
+  assert.equal(lock.ok, true);
+
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true, JSON.stringify(opened));
+  assert.match(
+    harness.createdTabs[0].url,
+    /^about:blank#onstarvoice-targeted-post=/u,
+  );
+  assert.equal(harness.updatedTabs[0].url, request.targets[0].url);
+  assert.equal(
+    harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].tabId,
+    harness.createdTabs[0].id,
+  );
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    groupId: -1,
+    status: "complete",
+    url: request.targets[0].url,
+  }));
+
+  harness.setTabQueryHandler(async () => [{
+    id: 61,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}` +
+      `&targetedPostAttempt=${request.attemptId}`,
+  }]);
+  const terminal = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      status: "completed",
+      finishedAt: new Date().toISOString(),
+      message: "负面帖子巡查完成",
+    },
+  });
+
+  assert.equal(terminal.ok, true);
+  assert.equal(terminal.platformTabClosed, true);
+  assert.equal(terminal.executionLockReleased, true);
+  assert.equal(terminal.runnerClosed, true);
+  assert.deepEqual(harness.removedTabIds, [opened.data.tabId, 61]);
+  assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+});
+
+test("targeted platform cleanup never closes a tab id that now shows unrelated content", async () => {
+  const harness = createHarness();
+  const recentAt = new Date(Date.now() - 5_000).toISOString();
+  const request = buildTargetedPostRequest({
+    id: "targeted-reused-tab-request",
+    clientTaskId: "targeted-reused-tab-request",
+    attemptId: "targeted-reused-tab-attempt",
+    cloudCommandId: "targeted-reused-tab-command",
+    createdAt: recentAt,
+    updatedAt: recentAt,
+    heartbeatAt: recentAt,
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-reused-tab", token: "reused-tab-token"},
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    windowId: 1,
+    status: "complete",
+    url: "https://example.com/unrelated",
+  }));
+
+  const terminal = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      status: "failed",
+      finishedAt: new Date().toISOString(),
+      message: "巡查失败",
+    },
+  });
+
+  assert.equal(terminal.ok, true);
+  assert.equal(terminal.platformTabClosed, false);
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+});
+
+test("a failed platform registration and close persists bounded cleanup that survives restart", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-platform-open-crash-request",
+    clientTaskId: "targeted-platform-open-crash-request",
+    attemptId: "targeted-platform-open-crash-attempt",
+    cloudCommandId: "targeted-platform-open-crash-command",
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url:
+      harness.createdTabs[0]?.url ||
+      "about:blank#onstarvoice-targeted-post=pending",
+  }));
+  let registrationWritePending = true;
+  harness.setStorageSetHandler(async (values) => {
+    if (
+      registrationWritePending &&
+      Object.hasOwn(values, TARGETED_POST_PLATFORM_TAB_KEY)
+    ) {
+      registrationWritePending = false;
+      throw new Error("simulated platform registration write failure");
+    }
+  });
+  let initialClosePending = true;
+  harness.setTabRemoveHandler(async () => {
+    if (initialClosePending) {
+      initialClosePending = false;
+      throw new Error("simulated platform close failure");
+    }
+  });
+
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+
+  assert.equal(opened.ok, false);
+  assert.equal(opened.reason, "targeted_post_platform_tab_open_failed");
+  assert.equal(opened.cleanupPending, true);
+  assert.equal(opened.cleanupDurable, true);
+  assert.equal(harness.createdTabs.length, 1);
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+  const pending = harness.storage[TARGETED_POST_PLATFORM_TAB_CLEANUP_KEY];
+  assert.equal(pending.tabId, harness.createdTabs[0].id);
+  assert.equal(pending.requestId, request.id);
+  assert.equal(pending.attemptId, request.attemptId);
+  assert.equal(pending.attempts, 1);
+  const retryDelayMs = Date.parse(pending.nextRetryAt) - Date.now();
+  assert.ok(retryDelayMs > 0);
+  assert.ok(retryDelayMs <= 5 * 60 * 1000);
+  assert.ok(
+    harness.alarmDefinitions.has(TARGETED_POST_PLATFORM_TAB_CLEANUP_ALARM),
+  );
+
+  const reusedBlank = createHarness();
+  Object.assign(
+    reusedBlank.storage,
+    JSON.parse(JSON.stringify(harness.storage)),
+  );
+  reusedBlank.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: "about:blank",
+  }));
+  const preserved =
+    await reusedBlank.api.recoverTargetedPostPlatformTabCleanup({force: true});
+  assert.equal(
+    preserved.reason,
+    "targeted_post_platform_tab_identity_changed",
+  );
+  assert.deepEqual(reusedBlank.removedTabIds, []);
+  assert.equal(
+    reusedBlank.storage[TARGETED_POST_PLATFORM_TAB_CLEANUP_KEY],
+    undefined,
+  );
+
+  const restarted = createHarness();
+  Object.assign(restarted.storage, JSON.parse(JSON.stringify(harness.storage)));
+  restarted.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: pending.placeholderUrl,
+  }));
+
+  const recovered =
+    await restarted.api.recoverTargetedPostPlatformTabCleanup({force: true});
+
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(recovered.removedCount, 1);
+  assert.deepEqual(restarted.removedTabIds, [harness.createdTabs[0].id]);
+  assert.equal(
+    restarted.storage[TARGETED_POST_PLATFORM_TAB_CLEANUP_KEY],
+    undefined,
+  );
+  assert.equal(restarted.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+});
+
+test("opening a new patrol page never overwrites another live attempt registration", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "targeted-platform-new-request",
+    clientTaskId: "targeted-platform-new-request",
+    attemptId: "targeted-platform-new-attempt",
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  harness.storage[TARGETED_POST_PLATFORM_TAB_KEY] = {
+    schemaVersion: 1,
+    requestId: "targeted-platform-old-request",
+    attemptId: "targeted-platform-old-attempt",
+    sessionId: "targeted-platform-old-session",
+    tabId: 611,
+    workflow: "negative_post_patrol",
+    platform: "douyin",
+    url: "https://www.douyin.com/video/611",
+    openedAt: "2026-09-07T08:00:00.000Z",
+  };
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: "https://www.douyin.com/video/611",
+  }));
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+
+  assert.equal(response.ok, false);
+  assert.equal(response.reason, "targeted_post_platform_tab_busy");
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(
+    harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].sessionId,
+    "targeted-platform-old-session",
+  );
+  assert.deepEqual(harness.removedTabIds, []);
+});
+
+test("a needs-action targeted-post update preserves the platform page but closes its exact runner", async () => {
   const harness = createHarness();
   const request = buildTargetedPostRequest({
     id: "targeted-needs-action-request",
@@ -3786,6 +5761,19 @@ test("a needs-action targeted-post update preserves its exact runner for inspect
     },
   };
   harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
   harness.setTabQueryHandler(async () => [
     {
       id: 71,
@@ -3809,8 +5797,13 @@ test("a needs-action targeted-post update preserves its exact runner for inspect
 
   assert.equal(response.ok, true);
   assert.equal(response.cloudReported, true);
-  assert.equal(response.runnerClosed, false);
-  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(response.platformTabClosed, false);
+  assert.equal(response.runnerClosed, true);
+  assert.deepEqual(harness.removedTabIds, [71]);
+  assert.equal(
+    harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].tabId,
+    opened.data.tabId,
+  );
   assert.equal(
     harness.storage[TARGETED_POST_REQUEST_KEY].status,
     "needs_action",
@@ -3948,8 +5941,1169 @@ test("a terminal targeted-post update reports its cloud command before the messa
   assert.equal(Object.hasOwn(ledgerRun.metadata, "targetResults"), false);
 });
 
+test("negative patrol terminal evidence is removed only after the server echoes its exact hash identity", async () => {
+  const harness = createHarness();
+  const result = buildNegativePatrolCompletionResult({
+    requestId: "negative-confirm-request",
+    attemptId: "negative-confirm-attempt",
+    cloudCommandId: "negative-confirm-command",
+  });
+
+  const reported = await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: "negative-confirm-command",
+    result,
+    token: "negative-confirm-token",
+    agentId: "negative-confirm-agent",
+  });
+
+  assert.equal(reported.ok, true);
+  assert.equal(reported.confirmed, true);
+  assert.match(reported.resultHash, /^[0-9a-f]{64}$/u);
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  const completion = harness.cloudCommandCompletions[0];
+  const expectedHash = createHash("sha256")
+    .update(JSON.stringify({
+      success: completion.success,
+      result: completion.result,
+    }))
+    .digest("hex");
+  assert.equal(completion.completionIdentity.resultHash, expectedHash);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      completion.completionIdentity,
+    )),
+    {
+      requestId: "negative-confirm-request",
+      attemptId: "negative-confirm-attempt",
+      resultHash: reported.resultHash,
+    },
+  );
+  assert.equal(harness.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY], undefined);
+});
+
+test("a confirmed terminal receipt survives a cleanup crash and a reopened sidebar finishes exact resource cleanup", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "negative-cleanup-crash-request",
+    clientTaskId: "negative-cleanup-crash-request",
+    attemptId: "negative-cleanup-crash-attempt",
+    cloudCommandId: "negative-cleanup-crash-command",
+    runnerTabId: 612,
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const lock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "negative-cleanup-crash-holder",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(lock.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  const terminal = {
+    ...request,
+    status: "completed",
+    finishedAt: "2026-09-07T10:00:00.000Z",
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = terminal;
+  harness.setTabQueryHandler(async () => {
+    throw new Error("extension runner inventory unavailable during cleanup");
+  });
+
+  const reported = await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: terminal.cloudCommandId,
+    result: buildNegativePatrolCompletionResult({
+      requestId: terminal.id,
+      attemptId: terminal.attemptId,
+      cloudCommandId: terminal.cloudCommandId,
+    }),
+    token: "negative-cleanup-crash-token",
+    agentId: "negative-cleanup-crash-agent",
+    cleanupRequest: terminal,
+  });
+
+  assert.equal(reported.ok, false);
+  assert.equal(reported.confirmed, true);
+  assert.equal(reported.cleanupPending, true);
+  assert.deepEqual(harness.removedTabIds, [opened.data.tabId]);
+  let outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.equal(outbox.entries.length, 1);
+  assert.ok(outbox.entries[0].completionConfirmedAt);
+  assert.equal(outbox.entries[0].cleanupCompletedAt, "");
+
+  harness.setTabQueryHandler(async () => [{
+    id: terminal.runnerTabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${terminal.id}` +
+      `&targetedPostAttempt=${terminal.attemptId}`,
+  }]);
+  const reopened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:get-targeted-post-run-state",
+  });
+
+  assert.equal(reopened.ok, true);
+  assert.equal(reopened.data.status, "completed");
+  assert.deepEqual(
+    harness.removedTabIds,
+    [opened.data.tabId, terminal.runnerTabId],
+  );
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.ok(outbox.entries[0].cleanupCompletedAt);
+
+  const completionCallCount = harness.cloudCommandCompletions.length;
+  const replay = await harness.api.replayNegativePatrolTerminalOutbox({
+    token: "negative-cleanup-crash-token",
+    agentId: "negative-cleanup-crash-agent",
+  });
+  assert.equal(replay.confirmed, 1);
+  assert.equal(replay.remaining, 0);
+  assert.equal(
+    harness.cloudCommandCompletions.length,
+    completionCallCount,
+    "an already-confirmed receipt must not be sent again",
+  );
+  assert.equal(harness.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY], undefined);
+});
+
+test("a failed exact lock release retains the confirmed terminal receipt until recovery releases it", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "negative-lock-cleanup-request",
+    clientTaskId: "negative-lock-cleanup-request",
+    attemptId: "negative-lock-cleanup-attempt",
+    cloudCommandId: "negative-lock-cleanup-command",
+    runnerTabId: 621,
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const lock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "negative-lock-cleanup-holder",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(lock.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () => [{
+    id: request.runnerTabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}` +
+      `&targetedPostAttempt=${request.attemptId}`,
+  }]);
+  const terminal = {
+    ...request,
+    status: "completed",
+    finishedAt: "2026-09-07T10:05:00.000Z",
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = terminal;
+  let failExactLockRemoval = true;
+  harness.setStorageRemoveHandler(async (keys) => {
+    const normalizedKeys = Array.isArray(keys) ? keys : [keys];
+    if (failExactLockRemoval && normalizedKeys.includes(LOCK_KEY)) {
+      failExactLockRemoval = false;
+      throw new Error("simulated exact lock release failure");
+    }
+  });
+
+  const reported = await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: terminal.cloudCommandId,
+    result: buildNegativePatrolCompletionResult({
+      requestId: terminal.id,
+      attemptId: terminal.attemptId,
+      cloudCommandId: terminal.cloudCommandId,
+    }),
+    token: "negative-lock-cleanup-token",
+    agentId: "negative-lock-cleanup-agent",
+    cleanupRequest: terminal,
+  });
+
+  assert.equal(reported.ok, false);
+  assert.equal(reported.confirmed, true);
+  assert.equal(reported.cleanupPending, true);
+  assert.equal(harness.storage[LOCK_KEY].id, lock.data.id);
+  let outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.equal(outbox.entries.length, 1);
+  assert.ok(outbox.entries[0].completionConfirmedAt);
+  assert.equal(outbox.entries[0].cleanupCompletedAt, "");
+
+  const recovered = await harness.api.recoverNegativePatrolTerminalOutboxCleanup();
+
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(recovered.completed, 1);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.deepEqual(
+    harness.removedTabIds,
+    [opened.data.tabId, request.runnerTabId],
+  );
+  outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.ok(outbox.entries[0].cleanupCompletedAt);
+
+  const completionCallCount = harness.cloudCommandCompletions.length;
+  const replay = await harness.api.replayNegativePatrolTerminalOutbox({
+    token: "negative-lock-cleanup-token",
+    agentId: "negative-lock-cleanup-agent",
+  });
+  assert.equal(replay.remaining, 0);
+  assert.equal(
+    harness.cloudCommandCompletions.length,
+    completionCallCount,
+    "a confirmed receipt must only retry cleanup",
+  );
+});
+
+test("a task-owned tab that remains open after close failure keeps terminal cleanup retryable", async () => {
+  for (const resourceKind of ["platform", "runner"]) {
+    const harness = createHarness();
+    const request = buildTargetedPostRequest({
+      id: `negative-${resourceKind}-close-retry-request`,
+      clientTaskId: `negative-${resourceKind}-close-retry-request`,
+      attemptId: `negative-${resourceKind}-close-retry-attempt`,
+      cloudCommandId: `negative-${resourceKind}-close-retry-command`,
+      runnerTabId: 622,
+    });
+    harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+    let ownedTabId = request.runnerTabId;
+    if (resourceKind === "platform") {
+      const opened = await harness.sendBackgroundMessage({
+        type: "onstarvoice:open-targeted-post-platform-tab",
+        requestId: request.id,
+        attemptId: request.attemptId,
+        url: request.targets[0].url,
+      });
+      assert.equal(opened.ok, true);
+      ownedTabId = opened.data.tabId;
+      harness.setTabQueryHandler(async () => []);
+      harness.setTabGetHandler(async (tabId) => ({
+        id: Number(tabId),
+        status: "complete",
+        windowId: 1,
+        url: request.targets[0].url,
+      }));
+    } else {
+      const runnerUrl =
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?targetedPostRun=${request.id}` +
+        `&targetedPostAttempt=${request.attemptId}`;
+      harness.setTabQueryHandler(async () => [{
+        id: request.runnerTabId,
+        url: runnerUrl,
+      }]);
+      harness.setTabGetHandler(async (tabId) => ({
+        id: Number(tabId),
+        status: "complete",
+        windowId: 1,
+        url: runnerUrl,
+      }));
+    }
+    const terminal = {
+      ...request,
+      status: "completed",
+      finishedAt: "2026-09-07T10:08:00.000Z",
+    };
+    harness.storage[TARGETED_POST_REQUEST_KEY] = terminal;
+    let failOwnedTabClose = true;
+    harness.setTabRemoveHandler(async (tabId) => {
+      if (failOwnedTabClose && Number(tabId) === Number(ownedTabId)) {
+        throw new Error(`simulated ${resourceKind} close failure`);
+      }
+    });
+
+    const reported = await harness.api.queueAndSendNegativePatrolTerminalResult({
+      commandId: terminal.cloudCommandId,
+      result: buildNegativePatrolCompletionResult({
+        requestId: terminal.id,
+        attemptId: terminal.attemptId,
+        cloudCommandId: terminal.cloudCommandId,
+      }),
+      token: `negative-${resourceKind}-close-retry-token`,
+      agentId: `negative-${resourceKind}-close-retry-agent`,
+      cleanupRequest: terminal,
+    });
+
+    assert.equal(reported.ok, false, resourceKind);
+    assert.equal(reported.confirmed, true, resourceKind);
+    assert.equal(reported.cleanupPending, true, resourceKind);
+    assert.deepEqual(harness.removedTabIds, [], resourceKind);
+    let outbox = await harness.api.readNegativePatrolTerminalOutbox();
+    assert.ok(outbox.entries[0].completionConfirmedAt, resourceKind);
+    assert.equal(outbox.entries[0].cleanupCompletedAt, "", resourceKind);
+    if (resourceKind === "platform") {
+      assert.equal(
+        harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].tabId,
+        ownedTabId,
+      );
+    }
+
+    failOwnedTabClose = false;
+    const recovered =
+      await harness.api.recoverNegativePatrolTerminalOutboxCleanup();
+
+    assert.equal(recovered.ok, true, `${resourceKind}: ${JSON.stringify(recovered)}`);
+    assert.equal(recovered.completed, 1, resourceKind);
+    assert.deepEqual(harness.removedTabIds, [ownedTabId], resourceKind);
+    outbox = await harness.api.readNegativePatrolTerminalOutbox();
+    assert.ok(outbox.entries[0].cleanupCompletedAt, resourceKind);
+  }
+});
+
+test("an old negative cleanup snapshot only removes resources owned by its exact attempt", async () => {
+  const harness = createHarness();
+  const newRequest = buildTargetedPostRequest({
+    id: "negative-shared-cleanup-request",
+    clientTaskId: "negative-shared-cleanup-request",
+    attemptId: "negative-new-cleanup-attempt",
+    cloudCommandId: "negative-new-cleanup-command",
+    runnerTabId: 632,
+    targets: [{
+      workflow: "negative_post_patrol",
+      itemId: "negative-new-item",
+      recordId: "negative-new-record",
+      externalId: "456",
+      ordinal: 1,
+      url: "https://www.douyin.com/video/456",
+    }],
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = newRequest;
+  const newLock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${newRequest.id}::${newRequest.attemptId}`,
+    captureTaskAttemptId: newRequest.attemptId,
+    holderId: "negative-new-cleanup-holder",
+    holderTabId: newRequest.runnerTabId,
+  });
+  assert.equal(newLock.ok, true);
+  const newPlatform = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: newRequest.id,
+    attemptId: newRequest.attemptId,
+    url: newRequest.targets[0].url,
+  });
+  assert.equal(newPlatform.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: newRequest.targets[0].url,
+  }));
+  const oldRequest = buildTargetedPostRequest({
+    id: newRequest.id,
+    clientTaskId: newRequest.id,
+    attemptId: "negative-old-cleanup-attempt",
+    cloudCommandId: "negative-old-cleanup-command",
+    runnerTabId: 631,
+    status: "superseded",
+    finishedAt: "2026-09-07T10:10:00.000Z",
+  });
+  harness.setTabQueryHandler(async () => [
+    {
+      id: oldRequest.runnerTabId,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?targetedPostRun=${oldRequest.id}` +
+        `&targetedPostAttempt=${oldRequest.attemptId}`,
+    },
+    {
+      id: newRequest.runnerTabId,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?targetedPostRun=${newRequest.id}` +
+        `&targetedPostAttempt=${newRequest.attemptId}`,
+    },
+  ]);
+  const queued = await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: oldRequest.cloudCommandId,
+    result: buildNegativePatrolCompletionResult({
+      accepted: false,
+      reason: "targeted_post_capture_superseded",
+      requestId: oldRequest.id,
+      attemptId: oldRequest.attemptId,
+      cloudCommandId: oldRequest.cloudCommandId,
+      status: "superseded",
+    }),
+    token: "",
+    agentId: "negative-old-cleanup-agent",
+    cleanupRequest: oldRequest,
+  });
+  assert.equal(queued.retained, true);
+
+  const recovered = await harness.api.recoverNegativePatrolTerminalOutboxCleanup();
+
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(recovered.completed, 1);
+  assert.deepEqual(harness.removedTabIds, [oldRequest.runnerTabId]);
+  assert.equal(harness.storage[LOCK_KEY].id, newLock.data.id);
+  assert.equal(
+    harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].tabId,
+    newPlatform.data.tabId,
+  );
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].attemptId,
+    newRequest.attemptId,
+  );
+  const outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.ok(outbox.entries[0].cleanupCompletedAt);
+});
+
+test("a cleanup snapshot with another command cannot release replacement resources that reuse its request and attempt", async () => {
+  const harness = createHarness();
+  const replacement = buildTargetedPostRequest({
+    id: "negative-command-fence-request",
+    clientTaskId: "negative-command-fence-request",
+    attemptId: "negative-command-fence-attempt",
+    cloudCommandId: "negative-command-fence-new-command",
+    runnerTabId: 642,
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = replacement;
+  const lock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${replacement.id}::${replacement.attemptId}`,
+    captureTaskAttemptId: replacement.attemptId,
+    holderId: "negative-command-fence-new-holder",
+    holderTabId: replacement.runnerTabId,
+  });
+  assert.equal(lock.ok, true);
+  const platform = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: replacement.id,
+    attemptId: replacement.attemptId,
+    url: replacement.targets[0].url,
+  });
+  assert.equal(platform.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: replacement.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () => [{
+    id: replacement.runnerTabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${replacement.id}` +
+      `&targetedPostAttempt=${replacement.attemptId}`,
+  }]);
+  const oldCommand = {
+    ...replacement,
+    cloudCommandId: "negative-command-fence-old-command",
+    status: "superseded",
+    finishedAt: "2026-09-07T10:12:00.000Z",
+  };
+  const queued = await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: oldCommand.cloudCommandId,
+    result: buildNegativePatrolCompletionResult({
+      accepted: false,
+      requestId: oldCommand.id,
+      attemptId: oldCommand.attemptId,
+      cloudCommandId: oldCommand.cloudCommandId,
+      status: "superseded",
+    }),
+    token: "",
+    agentId: "negative-command-fence-agent",
+    cleanupRequest: oldCommand,
+  });
+  assert.equal(queued.retained, true);
+
+  const recovered = await harness.api.recoverNegativePatrolTerminalOutboxCleanup();
+
+  assert.equal(recovered.ok, false);
+  assert.equal(recovered.completed, 0);
+  assert.equal(
+    recovered.results[0].reason,
+    "negative_patrol_terminal_cleanup_pending",
+  );
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(harness.storage[LOCK_KEY].id, lock.data.id);
+  assert.equal(
+    harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].tabId,
+    platform.data.tabId,
+  );
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].cloudCommandId,
+    replacement.cloudCommandId,
+  );
+  const outbox = await harness.api.readNegativePatrolTerminalOutbox();
+  assert.equal(outbox.entries[0].cleanupCompletedAt, "");
+});
+
+test("a legacy ok response without the exact completion acknowledgement keeps terminal evidence", async () => {
+  const harness = createHarness();
+  harness.setCloudCommandCompletionHandler(async (options) => ({
+    ok: true,
+    commandId: options.commandId,
+  }));
+
+  const reported = await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: "negative-legacy-command",
+    result: buildNegativePatrolCompletionResult({
+      requestId: "negative-legacy-request",
+      attemptId: "negative-legacy-attempt",
+      cloudCommandId: "negative-legacy-command",
+    }),
+    token: "negative-legacy-token",
+    agentId: "negative-legacy-agent",
+  });
+  const outbox = await harness.api.readNegativePatrolTerminalOutbox();
+
+  assert.equal(reported.ok, false);
+  assert.equal(reported.retained, true);
+  assert.equal(reported.reason, "completion_ack_missing_or_mismatched");
+  assert.equal(outbox.entries.length, 1);
+  assert.equal(
+    outbox.entries[0].lastFailure.reason,
+    "completion_ack_missing_or_mismatched",
+  );
+});
+
+test("offline negative terminal evidence replays after the current request was replaced", async () => {
+  const harness = createHarness();
+  harness.setCloudCommandCompletionHandler(async () => ({
+    ok: false,
+    reason: "network_error",
+    message: "offline",
+  }));
+  await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: "negative-offline-command",
+    result: buildNegativePatrolCompletionResult({
+      requestId: "negative-offline-request",
+      attemptId: "negative-offline-attempt",
+      cloudCommandId: "negative-offline-command",
+    }),
+    token: "negative-offline-token",
+    agentId: "negative-offline-agent",
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = buildTargetedPostRequest({
+    id: "replacement-request",
+    clientTaskId: "replacement-request",
+    attemptId: "replacement-attempt",
+    cloudCommandId: "replacement-command",
+  });
+  harness.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY]
+    .entries[0].nextRetryAt = "2020-01-01T00:00:00.000Z";
+  harness.setCloudCommandCompletionHandler(async (options) => ({
+    ok: true,
+    data: {
+      acknowledgedCompletion: {
+        commandId: options.commandId,
+        ...options.completionIdentity,
+      },
+    },
+  }));
+
+  const replay = await harness.api.replayNegativePatrolTerminalOutbox({
+    token: "negative-offline-token",
+    agentId: "negative-offline-agent",
+  });
+
+  assert.equal(replay.confirmed, 1);
+  assert.equal(replay.remaining, 0);
+  assert.equal(harness.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY], undefined);
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].attemptId,
+    "replacement-attempt",
+  );
+});
+
+test("a 409 terminal conflict remains as blocked evidence and is not automatically replayed", async () => {
+  const harness = createHarness();
+  harness.setCloudCommandCompletionHandler(async () => ({
+    ok: false,
+    status: 409,
+    reason: "completion_identity_conflict",
+    message: "saved terminal evidence differs",
+    details: {
+      expectedRequestId: "negative-conflict-request",
+      expectedAttemptId: "server-attempt",
+    },
+  }));
+  const reported = await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: "negative-conflict-command",
+    result: buildNegativePatrolCompletionResult({
+      requestId: "negative-conflict-request",
+      attemptId: "negative-conflict-attempt",
+      cloudCommandId: "negative-conflict-command",
+    }),
+    token: "negative-conflict-token",
+    agentId: "negative-conflict-agent",
+  });
+  const firstOutbox = await harness.api.readNegativePatrolTerminalOutbox();
+  const callsBeforeReplay = harness.cloudCommandCompletions.length;
+  const replay = await harness.api.replayNegativePatrolTerminalOutbox({
+    token: "negative-conflict-token",
+    agentId: "negative-conflict-agent",
+  });
+
+  assert.equal(reported.ok, false);
+  assert.equal(reported.reason, "negative_patrol_terminal_conflict");
+  assert.equal(firstOutbox.entries[0].blocked, true);
+  assert.equal(firstOutbox.entries[0].lastFailure.status, 409);
+  assert.equal(
+    firstOutbox.entries[0].lastFailure.details.expectedAttemptId,
+    "server-attempt",
+  );
+  assert.equal(replay.attempted, 0);
+  assert.equal(replay.blocked, 1);
+  assert.equal(harness.cloudCommandCompletions.length, callsBeforeReplay);
+  assert.equal(harness.createdTabs.length, 0);
+});
+
+test("a redelivered command with blocked terminal evidence never starts capture again", async () => {
+  const harness = createHarness();
+  harness.setCloudCommandCompletionHandler(async () => ({
+    ok: false,
+    status: 409,
+    reason: "completion_identity_conflict",
+  }));
+  await harness.api.queueAndSendNegativePatrolTerminalResult({
+    commandId: "negative-blocked-command",
+    result: buildNegativePatrolCompletionResult({
+      requestId: "negative-blocked-request",
+      attemptId: "10000000-0000-4000-8000-000000000002",
+      cloudCommandId: "negative-blocked-command",
+    }),
+    token: "negative-blocked-token",
+    agentId: "negative-blocked-agent",
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "negative-blocked-agent",
+      token: "negative-blocked-token",
+    },
+  };
+
+  const response = await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "negative-blocked-command",
+      command_type: "create",
+      task_id: "negative-blocked-task",
+      client_task_id: "negative-blocked-request",
+      payload: {
+        protocolVersion: 1,
+        workflow: "negative_post_patrol",
+        taskId: "negative-blocked-task",
+        clientTaskId: "negative-blocked-request",
+        platform: "xiaohongshu",
+        attemptIdentity: "10000000-0000-4000-8000-000000000002",
+        planSnapshot: {
+          targets: [{
+            recordId: "negative-blocked-record",
+            externalId: "negative-blocked-note",
+            captureTaskItemAttemptId:
+              "10000000-0000-4000-8000-000000000002",
+            captureTaskItemRequestHash: "e".repeat(64),
+            url:
+              "https://www.xiaohongshu.com/explore/negative-blocked-note",
+          }],
+        },
+      },
+    },
+    "negative-blocked-token",
+  );
+
+  assert.equal(response.deferred, true);
+  assert.equal(response.reason, "negative_patrol_terminal_conflict");
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY], undefined);
+});
+
+test("a redelivered terminal create restores exact cleanup identity for missing and legacy outbox entries", async () => {
+  for (const [variant, attemptId] of [
+    ["missing", "10000000-0000-4000-8000-000000000011"],
+    ["legacy", "10000000-0000-4000-8000-000000000012"],
+  ]) {
+    const harness = createHarness();
+    const commandId = `negative-redelivery-${variant}-command`;
+    const requestId = `negative-redelivery-${variant}-request`;
+    const taskId = `negative-redelivery-${variant}-task`;
+    const targetUrl =
+      `https://www.xiaohongshu.com/explore/negative-redelivery-${variant}`;
+    const command = {
+      id: commandId,
+      command_type: "create",
+      task_id: taskId,
+      client_task_id: requestId,
+      payload: {
+        protocolVersion: 1,
+        workflow: "negative_post_patrol",
+        taskId,
+        clientTaskId: requestId,
+        platform: "xiaohongshu",
+        attemptIdentity: attemptId,
+        planSnapshot: {
+          targets: [{
+            recordId: `negative-redelivery-${variant}-record`,
+            externalId: `negative-redelivery-${variant}`,
+            captureTaskItemAttemptId: attemptId,
+            captureTaskItemRequestHash: "a".repeat(64),
+            url: targetUrl,
+          }],
+        },
+      },
+    };
+    let request = await harness.api.createOrResumeTargetedPostRun(
+      command,
+      command.payload,
+    );
+    assert.equal(request.attemptId, attemptId);
+    harness.storage["onstarvoice.auth"] = {
+      captureAgent: {
+        id: `negative-redelivery-${variant}-agent`,
+        token: `negative-redelivery-${variant}-token`,
+      },
+    };
+    const lock = await harness.sendBackgroundMessage({
+      type: "onstarvoice:acquire-capture-lock",
+      owner: "cloud_targeted_post_capture",
+      label: "负面帖子巡查",
+      captureTaskId: `${request.id}::${request.attemptId}`,
+      captureTaskAttemptId: request.attemptId,
+      holderId: `negative-redelivery-${variant}-holder`,
+      holderTabId: request.runnerTabId,
+    });
+    assert.equal(lock.ok, true);
+    const opened = await harness.sendBackgroundMessage({
+      type: "onstarvoice:open-targeted-post-platform-tab",
+      requestId: request.id,
+      attemptId: request.attemptId,
+      url: request.targets[0].url,
+    });
+    assert.equal(opened.ok, true);
+    harness.setTabGetHandler(async (tabId) => ({
+      id: Number(tabId),
+      status: "complete",
+      windowId: 1,
+      url: targetUrl,
+    }));
+    harness.setTabQueryHandler(async () => [{
+      id: request.runnerTabId,
+      url:
+        "chrome-extension://test/sidebar/sidebar.html" +
+        `?targetedPostRun=${request.id}` +
+        `&targetedPostAttempt=${request.attemptId}`,
+    }]);
+    request = await harness.api.persistTargetedPostRunRequest({
+      ...request,
+      status: "completed",
+      finishedAt: "2026-09-07T10:15:00.000Z",
+      message: "负面帖子巡查已完成",
+    });
+    if (variant === "legacy") {
+      const built = await harness.api.buildNegativePatrolTerminalOutboxEntry({
+        commandId,
+        result: buildNegativePatrolCompletionResult({
+          requestId,
+          taskId,
+          attemptId,
+          cloudCommandId: commandId,
+        }),
+        agentId: `negative-redelivery-${variant}-agent`,
+      });
+      assert.equal(built.ok, true);
+      const persisted =
+        await harness.api.persistNegativePatrolTerminalOutboxEntry(built.entry);
+      assert.equal(persisted.ok, true);
+      assert.equal(persisted.entry.cleanupRequest, undefined);
+    }
+    harness.setCloudCommandCompletionHandler(async () => ({
+      ok: false,
+      reason: "network_error",
+      message: "offline during terminal redelivery",
+    }));
+
+    const response = await harness.api.executeCloudTaskAgentCommand(
+      command,
+      `negative-redelivery-${variant}-token`,
+    );
+
+    assert.equal(response.retained, true, `${variant}: ${JSON.stringify(response)}`);
+    const outbox = await harness.api.readNegativePatrolTerminalOutbox();
+    assert.equal(outbox.entries.length, 1);
+    assert.deepEqual(
+      JSON.parse(JSON.stringify({
+        commandId: outbox.entries[0].cleanupRequest?.cloudCommandId,
+        requestId: outbox.entries[0].cleanupRequest?.id,
+        attemptId: outbox.entries[0].cleanupRequest?.attemptId,
+      })),
+      {commandId, requestId, attemptId},
+    );
+    assert.ok(outbox.entries[0].cleanupCompletedAt);
+    assert.equal(harness.storage[LOCK_KEY], undefined);
+    assert.deepEqual(
+      harness.removedTabIds,
+      [opened.data.tabId, request.runnerTabId],
+    );
+  }
+});
+
+test("one heartbeat replay sends at most one old negative terminal receipt", async () => {
+  const harness = createHarness();
+  for (const suffix of ["one", "two"]) {
+    const built = await harness.api.buildNegativePatrolTerminalOutboxEntry({
+      commandId: `negative-replay-${suffix}-command`,
+      result: buildNegativePatrolCompletionResult({
+        requestId: `negative-replay-${suffix}-request`,
+        attemptId: `negative-replay-${suffix}-attempt`,
+        cloudCommandId: `negative-replay-${suffix}-command`,
+      }),
+      agentId: "negative-replay-agent",
+    });
+    await harness.api.persistNegativePatrolTerminalOutboxEntry(built.entry);
+  }
+
+  const replay = await harness.api.replayNegativePatrolTerminalOutbox({
+    token: "negative-replay-token",
+    agentId: "negative-replay-agent",
+  });
+
+  assert.equal(replay.attempted, 1);
+  assert.equal(replay.confirmed, 1);
+  assert.equal(replay.remaining, 1);
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+});
+
+test("a mismatched attempt acknowledgement cannot remove either terminal round", async () => {
+  const harness = createHarness();
+  const resultA = buildNegativePatrolCompletionResult({
+    requestId: "negative-round-request",
+    attemptId: "negative-round-a",
+    cloudCommandId: "negative-round-command-a",
+  });
+  const resultB = buildNegativePatrolCompletionResult({
+    requestId: "negative-round-request",
+    attemptId: "negative-round-b",
+    cloudCommandId: "negative-round-command-b",
+  });
+  const builtA = await harness.api.buildNegativePatrolTerminalOutboxEntry({
+    commandId: "negative-round-command-a",
+    result: resultA,
+    agentId: "negative-round-agent",
+  });
+  const builtB = await harness.api.buildNegativePatrolTerminalOutboxEntry({
+    commandId: "negative-round-command-b",
+    result: resultB,
+    agentId: "negative-round-agent",
+  });
+  await harness.api.persistNegativePatrolTerminalOutboxEntry(builtA.entry);
+  await harness.api.persistNegativePatrolTerminalOutboxEntry(builtB.entry);
+  harness.setCloudCommandCompletionHandler(async (options) => ({
+    ok: true,
+    data: {
+      acknowledgedCompletion: {
+        commandId: options.commandId,
+        requestId: options.completionIdentity.requestId,
+        attemptId: "negative-round-b",
+        resultHash: options.completionIdentity.resultHash,
+      },
+    },
+  }));
+
+  const replay = await harness.api.replayNegativePatrolTerminalOutbox({
+    token: "negative-round-token",
+    agentId: "negative-round-agent",
+    commandId: "negative-round-command-a",
+    limit: 1,
+  });
+  const outbox = await harness.api.readNegativePatrolTerminalOutbox();
+
+  assert.equal(replay.confirmed, 0);
+  assert.equal(outbox.entries.length, 2);
+  assert.equal(
+    outbox.entries.some((entry) => entry.attemptId === "negative-round-a"),
+    true,
+  );
+  assert.equal(
+    outbox.entries.some((entry) => entry.attemptId === "negative-round-b"),
+    true,
+  );
+});
+
+test("a new negative patrol adopts the server attempt identity for its terminal receipt", async () => {
+  const harness = createHarness();
+  const serverAttemptId = "10000000-0000-4000-8000-000000000003";
+  const request = await harness.api.createOrResumeTargetedPostRun(
+    {
+      id: "negative-attempt-command",
+      task_id: "negative-attempt-task",
+      client_task_id: "negative-attempt-request",
+    },
+    {
+      protocolVersion: 1,
+      workflow: "negative_post_patrol",
+      taskId: "negative-attempt-task",
+      clientTaskId: "negative-attempt-request",
+      platform: "xiaohongshu",
+      attemptIdentity: serverAttemptId,
+      orchestration: {
+        itemAttempts: [{
+          itemId: "negative-attempt-item",
+          attemptId: serverAttemptId,
+        }],
+      },
+      targets: [{
+        itemId: "negative-attempt-item",
+        recordId: "negative-attempt-record",
+        externalId: "negative-attempt-note",
+        captureTaskItemAttemptId: serverAttemptId,
+        captureTaskItemRequestHash: "f".repeat(64),
+        url: "https://www.xiaohongshu.com/explore/negative-attempt-note",
+      }],
+    },
+  );
+
+  assert.equal(request.id, "negative-attempt-request");
+  assert.equal(request.attemptId, serverAttemptId);
+  assert.equal(
+    harness.storage[TARGETED_POST_REQUEST_KEY].attemptId,
+    serverAttemptId,
+  );
+  assert.match(harness.createdTabs[0].url, new RegExp(serverAttemptId, "u"));
+});
+
+test("a full negative terminal outbox blocks a new patrol before opening a runner", async () => {
+  const harness = createHarness();
+  harness.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY] = {
+    schemaVersion: 1,
+    entries: Array.from({length: 64}, (_, index) => ({
+      schemaVersion: 1,
+      workflow: "negative_post_patrol",
+      commandId: `queued-command-${index}`,
+      requestId: `queued-request-${index}`,
+      attemptId: `queued-attempt-${index}`,
+      resultHash: index.toString(16).padStart(64, "0"),
+      success: true,
+      result: buildNegativePatrolCompletionResult({
+        requestId: `queued-request-${index}`,
+        attemptId: `queued-attempt-${index}`,
+        cloudCommandId: `queued-command-${index}`,
+      }),
+      agentId: "negative-capacity-agent",
+      storedAt: "2026-09-07T00:00:00.000Z",
+    })),
+  };
+  const request = await harness.api.createOrResumeTargetedPostRun(
+    {
+      id: "negative-capacity-command",
+      task_id: "negative-capacity-task",
+      client_task_id: "negative-capacity-request",
+    },
+    {
+      protocolVersion: 1,
+      workflow: "negative_post_patrol",
+      taskId: "negative-capacity-task",
+      clientTaskId: "negative-capacity-request",
+      platform: "xiaohongshu",
+      planSnapshot: {
+        targets: [{
+          recordId: "negative-capacity-record",
+          externalId: "negative-capacity-note",
+          captureTaskItemAttemptId:
+            "10000000-0000-4000-8000-000000000001",
+          captureTaskItemRequestHash: "c".repeat(64),
+          url:
+            "https://www.xiaohongshu.com/explore/negative-capacity-note",
+        }],
+      },
+    },
+  );
+
+  assert.equal(request.deferred, true);
+  assert.equal(
+    request.reason,
+    "negative_patrol_terminal_outbox_capacity_exhausted",
+  );
+  assert.equal(harness.createdTabs.length, 0);
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY], undefined);
+});
+
+test("a negative terminal result above 96 KiB fails before hashing or persistence", async () => {
+  const harness = createHarness();
+  const built = await harness.api.buildNegativePatrolTerminalOutboxEntry({
+    commandId: "negative-oversized-command",
+    result: buildNegativePatrolCompletionResult({
+      requestId: "negative-oversized-request",
+      attemptId: "negative-oversized-attempt",
+      cloudCommandId: "negative-oversized-command",
+      message: "负".repeat(40 * 1024),
+    }),
+    agentId: "negative-oversized-agent",
+  });
+  assert.equal(built.ok, false);
+  assert.equal(built.reason, "negative_patrol_terminal_result_too_large");
+  assert.equal(harness.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY], undefined);
+});
+
+test("a bounded multilingual terminal result fits the admission reservation", async () => {
+  const harness = createHarness();
+  const built = await harness.api.buildNegativePatrolTerminalOutboxEntry({
+    commandId: "negative-bounded-command",
+    result: buildNegativePatrolCompletionResult({
+      requestId: "negative-bounded-request",
+      attemptId: "negative-bounded-attempt",
+      cloudCommandId: "negative-bounded-command",
+      message: "负".repeat(30 * 1024),
+    }),
+    agentId: "negative-bounded-agent",
+  });
+  const persisted = built.ok
+    ? await harness.api.persistNegativePatrolTerminalOutboxEntry(built.entry)
+    : built;
+  const capacity = await harness.api.inspectNegativePatrolTerminalOutboxCapacity();
+
+  assert.equal(built.ok, true);
+  assert.equal(persisted.ok, true);
+  assert.equal(capacity.available, true);
+  assert.equal(capacity.serializedBytes < 128 * 1024, true);
+});
+
+test("the negative terminal outbox refuses a serialized queue above eight MiB", async () => {
+  const harness = createHarness();
+  const persisted = await harness.api.persistNegativePatrolTerminalOutboxEntry(
+    {
+      workflow: "negative_post_patrol",
+      commandId: "negative-oversized-command",
+      requestId: "negative-oversized-request",
+      attemptId: "negative-oversized-attempt",
+      resultHash: "d".repeat(64),
+      success: true,
+      result: buildNegativePatrolCompletionResult({
+        requestId: "negative-oversized-request",
+        attemptId: "negative-oversized-attempt",
+        cloudCommandId: "negative-oversized-command",
+        message: "x".repeat(8 * 1024 * 1024),
+      }),
+      agentId: "negative-oversized-agent",
+      storedAt: "2026-09-07T00:00:00.000Z",
+    },
+  );
+
+  assert.equal(persisted.ok, false);
+  assert.equal(persisted.reason, "negative_patrol_terminal_outbox_too_large");
+  assert.equal(harness.storage[NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY], undefined);
+});
+
+test("an outbox write failure terminalizes the negative patrol as needs action", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "negative-write-failure-request",
+    clientTaskId: "negative-write-failure-request",
+    attemptId: "negative-write-failure-attempt",
+    cloudCommandId: "negative-write-failure-command",
+    runnerTabId: 79,
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {
+      id: "negative-write-failure-agent",
+      token: "negative-write-failure-token",
+    },
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const lock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "负面帖子巡查",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "negative-write-failure-holder",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(lock.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId),
+    status: "complete",
+    windowId: 1,
+    url: request.targets[0].url,
+  }));
+  harness.setTabQueryHandler(async () => [{
+    id: request.runnerTabId,
+    url:
+      "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}` +
+      `&targetedPostAttempt=${request.attemptId}`,
+  }]);
+  harness.setStorageSetHandler(async (values) => {
+    if (Object.hasOwn(values, NEGATIVE_PATROL_TERMINAL_OUTBOX_KEY)) {
+      throw new Error("outbox quota unavailable");
+    }
+  });
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      status: "completed",
+      finishedAt: "2026-09-07T00:00:01.000Z",
+      message: "负面巡查完成",
+    },
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.cloudReported, false);
+  assert.equal(response.data.status, "needs_action");
+  assert.equal(
+    response.reason,
+    "negative_patrol_terminal_outbox_write_failed",
+  );
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "needs_action");
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+  assert.equal(response.platformTabClosed, false);
+  assert.equal(response.executionLockReleased, false);
+  assert.equal(response.runnerClosed, false);
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(
+    harness.storage[TARGETED_POST_PLATFORM_TAB_KEY].tabId,
+    opened.data.tabId,
+  );
+  assert.equal(
+    harness.storage[LOCK_KEY].captureTaskAttemptId,
+    request.attemptId,
+  );
+});
+
 test("official patrol promotes a representative target failure to the request, task ledger, and cloud result", async () => {
   const harness = createHarness();
+  const recentAt = new Date(Date.now() - 5_000).toISOString();
   harness.storage["onstarvoice.auth"] = {
     captureAgent: {
       id: "agent-official-error",
@@ -3966,8 +7120,8 @@ test("official patrol promotes a representative target failure to the request, t
     cloudCommandId: "official-error-command",
     platform: "xiaohongshu",
     status: "running",
-    createdAt: "2026-08-03T05:00:00.000Z",
-    updatedAt: "2026-08-03T05:00:01.000Z",
+    createdAt: recentAt,
+    updatedAt: recentAt,
     error: null,
     targets: [
       {
@@ -3997,7 +7151,7 @@ test("official patrol promotes a representative target failure to the request, t
     attemptId: "official-error-attempt",
     patch: {
       status: "completed_with_warnings",
-      finishedAt: "2026-08-03T05:00:05.000Z",
+      finishedAt: new Date().toISOString(),
       message: "官方账号评论巡查已完成，部分账号采集失败",
       targetResults: [
         {
@@ -7993,6 +11147,7 @@ test("normal persistent task end directly terminalizes its task-center run", asy
 
 test("targeted native task end releases resources without absorbing a later sync failure", async () => {
   const harness = createHarness();
+  const recentAt = new Date(Date.now() - 5_000).toISOString();
   const request = buildTargetedPostRequest({
     workflow: "official_account_comment_patrol",
     id: "official-sync-failure-request",
@@ -8002,6 +11157,9 @@ test("targeted native task end releases resources without absorbing a later sync
     cloudCommandId: "official-sync-failure-command",
     platform: "xiaohongshu",
     title: "官方账号评论巡查",
+    createdAt: recentAt,
+    updatedAt: recentAt,
+    heartbeatAt: recentAt,
     targets: [
       {
         workflow: "official_account_comment_patrol",
@@ -8055,7 +11213,7 @@ test("targeted native task end releases resources without absorbing a later sync
     attemptId: request.attemptId,
     patch: {
       status: "failed",
-      finishedAt: "2026-08-03T05:10:00.000Z",
+      finishedAt: new Date().toISOString(),
       message: "官方账号评论巡查同步失败",
       targetResults: [
         {

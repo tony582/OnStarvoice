@@ -989,6 +989,9 @@ let targetedPostCancelRequested = false;
 let targetedPostRunInFlight = false;
 let targetedPostRunState = null;
 let targetedPostRunBindingStopReason = "";
+let targetedPostReconcileRetryTimer = null;
+let targetedPostReconciledAttemptKey = "";
+let targetedPostReconciledAt = 0;
 let activeTargetedPostInvocationToken = null;
 let targetedPostRunInFlightOwnerToken = null;
 let targetedPostBatchStateOwnerToken = null;
@@ -1203,6 +1206,7 @@ const TARGETED_POST_RUN_ATTEMPT_QUERY_KEY = "targetedPostAttempt";
 const TARGETED_POST_RUN_REQUEST_STORAGE_KEY =
   "onstarvoice.targetedPostRunRequest";
 const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
+const TARGETED_POST_CONTROL_MESSAGE_TIMEOUT_MS = 12 * 1000;
 const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
 const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
 const KEYWORD_PLAN_RECONCILE_INTERVAL_MS = 5 * 1000;
@@ -3725,7 +3729,7 @@ function resolveCaptureTaskStep(progress = {}) {
   const phase = String(progress?.phase || "debug_session_attached").toLowerCase();
   if (
     /^(?:unattended|targeted)_/.test(phase) &&
-    /completed|failed|canceled|skipped|needs_action/.test(phase)
+    /completed|failed|canceled|superseded|skipped|needs_action/.test(phase)
   ) {
     return 5;
   }
@@ -3775,7 +3779,7 @@ function isTerminalCaptureTaskView(progress = {}, session = {}) {
   const phase = String(progress?.phase || "").trim().toLowerCase();
   return Boolean(
     /^(?:unattended|targeted)_/.test(phase) &&
-      /(?:completed(?:_with_(?:failures|warnings))?|failed|canceled|cancelled|needs_action)$/.test(
+      /(?:completed(?:_with_(?:failures|warnings))?|failed|canceled|cancelled|superseded|needs_action)$/.test(
         phase,
       ),
   );
@@ -16265,6 +16269,8 @@ async function waitForUnattendedProtectedStart(
 async function acquireCaptureExecutionLock({
   owner = "manual",
   label = "采集任务",
+  captureTaskId = "",
+  captureTaskAttemptId = "",
 } = {}) {
   if (captureExecutionLockReleasePendingId) {
     const released = await releaseCaptureExecutionLock(
@@ -16304,6 +16310,8 @@ async function acquireCaptureExecutionLock({
       type: "onstarvoice:acquire-capture-lock",
       owner,
       label,
+      captureTaskId,
+      captureTaskAttemptId,
       holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
       holderTabId,
     });
@@ -16783,6 +16791,51 @@ function stopTargetedPostRunnerForInvalidBinding(reason = "") {
   showMessage(message, "warning");
 }
 
+async function sendTargetedPostControlMessage(message, {
+  timeoutMs = TARGETED_POST_CONTROL_MESSAGE_TIMEOUT_MS,
+} = {}) {
+  let timeoutId = null;
+  try {
+    return await Promise.race([
+      chrome.runtime.sendMessage(message),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          const error = new Error("定向作品任务后台响应超时");
+          error.code = "TARGETED_POST_CONTROL_TIMEOUT";
+          reject(error);
+        }, Math.max(10, Number(timeoutMs) || TARGETED_POST_CONTROL_MESSAGE_TIMEOUT_MS));
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
+async function reconcileTargetedPostRunState(requestId = "", attemptId = "") {
+  const response = await sendTargetedPostControlMessage({
+    type: "onstarvoice:reconcile-targeted-post-run-state",
+    requestId: String(requestId || "").trim(),
+    attemptId: String(attemptId || "").trim(),
+  });
+  if (response?.ok && response?.reconciled === true) {
+    const reconciledRequest =
+      response?.data && typeof response.data === "object"
+        ? response.data
+        : null;
+    const reconciledToken = getTargetedPostInvocationTokenFromRequest(
+      reconciledRequest,
+    );
+    if (reconciledToken) {
+      targetedPostReconciledAttemptKey =
+        `${reconciledToken.requestId}::${reconciledToken.attemptId}`;
+      targetedPostReconciledAt = Date.now();
+    }
+  }
+  return response;
+}
+
 async function loadTargetedPostRunStateForDisplay() {
   try {
     const requestId = getTargetedPostRunRequestIdFromUrl();
@@ -16800,10 +16853,34 @@ async function loadTargetedPostRunStateForDisplay() {
       return null;
     }
 
-    const response = await chrome.runtime.sendMessage({
+    let response = await chrome.runtime.sendMessage({
       type: "onstarvoice:get-targeted-post-run-state",
       ...(requestId ? {requestId, attemptId} : {}),
     });
+    const localRequest =
+      response?.data && typeof response.data === "object"
+        ? response.data
+        : null;
+    if (
+      String(localRequest?.workflow || "").trim() ===
+        "negative_post_patrol" &&
+      !cloudTargetedPostApi?.isTerminalRunStatus?.(localRequest?.status)
+    ) {
+      try {
+        const reconciledResponse = await reconcileTargetedPostRunState(
+          requestId,
+          attemptId,
+        );
+        if (reconciledResponse?.reconciled === true) {
+          response = reconciledResponse;
+        }
+      } catch (error) {
+        console.warn(
+          "[Sidebar] Targeted post server reconciliation unavailable:",
+          error,
+        );
+      }
+    }
     if (requestId) {
       const binding = resolveTargetedPostRunBinding(
         response,
@@ -16989,47 +17066,49 @@ async function cancelTargetedPostRunFromSidebar(requestId = "") {
   }
   targetedPostCancelRequested = true;
   batchUrlCancelRequested = true;
-  const workflowLabel =
-    current.workflow === "official_account_comment_patrol"
-      ? "官方账号评论巡查"
-      : current.workflow === "followed_creator_post_patrol"
-        ? "关注博主作品扫描"
-        : current.workflow === "official_account_post_discovery"
-          ? "官方账号作品发现"
-          : "负面帖子巡查";
-  await updateTargetedPostRun(current, {
-    status:
-      String(current.status || "") === "pending"
-        ? "canceled"
-        : "cancel_requested",
-    cancelRequested: true,
-    finishedAt:
-      String(current.status || "") === "pending"
-        ? new Date().toISOString()
-        : "",
-    message:
-      String(current.status || "") === "pending"
-        ? `${workflowLabel}已在执行前停止`
-        : `正在停止${workflowLabel}并保留已有结果`,
-  }, runnerRequestId ? runnerToken : null);
-  if (
-    activeBatchRunnerTabId &&
-    (!runnerRequestId ||
-      isSameTargetedPostInvocationToken(
-        targetedPostRunnerTabOwnerToken,
-        runnerToken,
-      ))
-  ) {
-    await requestCaptureCancelSignal(activeBatchRunnerTabId).catch(
-      (error) => {
-        console.warn(
-          "[Sidebar] Targeted post cancellation signal failed:",
-          error,
-        );
-      },
+  try {
+    const response = await sendTargetedPostControlMessage({
+      type: "onstarvoice:cancel-targeted-post-run",
+      requestId: currentToken.requestId,
+      attemptId: currentToken.attemptId,
+    });
+    const responseRequest =
+      response?.data?.request && typeof response.data.request === "object"
+        ? response.data.request
+        : response?.data && typeof response.data === "object"
+          ? response.data
+          : null;
+    const responseToken = getTargetedPostInvocationTokenFromRequest(
+      responseRequest,
     );
+    if (
+      responseRequest &&
+      isSameTargetedPostInvocationToken(responseToken, currentToken)
+    ) {
+      targetedPostRunState = responseRequest;
+      renderCaptureDebugSession(getCurrentRuntime() || {});
+    }
+    if (!response?.ok || response?.accepted === false) {
+      showMessage(
+        response?.reason === "stale_targeted_post_attempt"
+          ? "该轮巡查已被新任务接替"
+          : "停止巡查失败，请稍后重试",
+        "warning",
+      );
+      return false;
+    }
+    return true;
+  } catch (error) {
+    if (String(error?.code || "") === "TARGETED_POST_CONTROL_TIMEOUT") {
+      // Promise.race 只限制显示侧栏的等待；后台仍会继续按精确 attempt
+      // 收口。当前 runner（如果仍在）已经看到本地取消旗标并停止进入下一条。
+      showMessage("停止操作正在后台收尾，已有结果会保留", "warning");
+      return true;
+    }
+    console.warn("[Sidebar] Targeted post cancellation failed:", error);
+    showMessage(`停止巡查失败：${error?.message || error}`, "error");
+    return false;
   }
-  return true;
 }
 
 async function confirmTargetedPostInvocationBinding(invocationToken) {
@@ -17052,7 +17131,7 @@ async function confirmTargetedPostInvocationBinding(invocationToken) {
 async function settleTargetedPostRunnerTab(
   tabId,
   platform = "",
-  {returnHome = true} = {},
+  {returnHome = true, targets = []} = {},
 ) {
   const normalizedTabId = Number(tabId);
   if (!Number.isSafeInteger(normalizedTabId) || normalizedTabId <= 0) {
@@ -17063,6 +17142,63 @@ async function settleTargetedPostRunnerTab(
   try {
     runnerTab = await chrome.tabs.get(normalizedTabId);
   } catch {
+    return false;
+  }
+
+  const liveUrl = String(runnerTab?.pendingUrl || runnerTab?.url || "").trim();
+  const expectedPlatform = String(platform || "").trim();
+  const livePlatform = detectPlatformFromUrl(liveUrl);
+  const normalizedTargets = (Array.isArray(targets) ? targets : [])
+    .filter((target) => target && typeof target === "object")
+    .map((target) => ({
+      url: String(target.url || "").trim(),
+      externalId: String(target.externalId || "").trim(),
+    }))
+    .filter((target) => target.url);
+  const matchesOwnedTarget = normalizedTargets.some((target) => {
+    const canonicalizeTargetUrl =
+      globalThis.OnStarvoiceCloudTargetedPost?.canonicalizeTargetUrl;
+    if (canonicalizeTargetUrl) {
+      try {
+        const expected = canonicalizeTargetUrl(
+          target.url,
+          expectedPlatform,
+          target.externalId,
+        );
+        canonicalizeTargetUrl(
+          liveUrl,
+          expectedPlatform,
+          target.externalId || expected.externalId,
+        );
+        return true;
+      } catch {
+        // Profile workflows use non-detail URLs; compare their exact route below.
+      }
+    }
+    try {
+      const live = new URL(liveUrl);
+      const expected = new URL(target.url);
+      const normalizePath = (value) =>
+        String(value || "/").replace(/\/+$/u, "") || "/";
+      return (
+        live.protocol === "https:" &&
+        live.origin === expected.origin &&
+        normalizePath(live.pathname) === normalizePath(expected.pathname)
+      );
+    } catch {
+      return false;
+    }
+  });
+  if (
+    !liveUrl ||
+    !expectedPlatform ||
+    livePlatform !== expectedPlatform ||
+    !matchesOwnedTarget
+  ) {
+    console.warn(
+      "[Sidebar] Preserve targeted tab whose platform URL no longer matches the task",
+      {tabId: normalizedTabId, platform: livePlatform},
+    );
     return false;
   }
 
@@ -17179,6 +17315,16 @@ function buildTargetedProfileCaptureTaskContext(
   });
 }
 
+function scheduleTargetedPostReconcileRetry() {
+  if (targetedPostReconcileRetryTimer !== null) return;
+  targetedPostReconcileRetryTimer = setTimeout(() => {
+    targetedPostReconcileRetryTimer = null;
+    void maybeClaimAndRunTargetedPostWorkflow().catch((error) => {
+      console.warn("[Sidebar] Targeted post reconciliation retry failed:", error);
+    });
+  }, 5000);
+}
+
 async function maybeClaimAndRunTargetedPostWorkflow() {
   const requestId = getTargetedPostRunRequestIdFromUrl();
   if (!requestId) {
@@ -17204,12 +17350,16 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     throw new Error("当前扩展缺少定向作品采集协议");
   }
 
-  const stateResponse = await chrome.runtime.sendMessage({
+  const reconciliationKey = `${requestId}::${attemptId}`;
+  const recentlyReconciled =
+    targetedPostReconciledAttemptKey === reconciliationKey &&
+    Date.now() - targetedPostReconciledAt < 30 * 1000;
+  let stateResponse = await chrome.runtime.sendMessage({
     type: "onstarvoice:get-targeted-post-run-state",
     requestId,
     attemptId,
   });
-  const binding = resolveTargetedPostRunBinding(
+  let binding = resolveTargetedPostRunBinding(
     stateResponse,
     requestId,
     attemptId,
@@ -17219,6 +17369,47 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     stopTargetedPostRunnerForInvalidBinding(binding.reason);
     renderCaptureDebugSession(getCurrentRuntime() || {});
     return;
+  }
+  const requiresServerReconciliation =
+    String(binding.request?.workflow || "").trim() ===
+      "negative_post_patrol" &&
+    !cloudTargetedPostApi.isTerminalRunStatus(binding.request?.status) &&
+    !recentlyReconciled;
+  if (requiresServerReconciliation) {
+    try {
+      stateResponse = await reconcileTargetedPostRunState(
+        requestId,
+        attemptId,
+      );
+    } catch (error) {
+      console.warn(
+        "[Sidebar] Targeted post execution held for server reconciliation:",
+        error,
+      );
+      showMessage("正在核对巡查任务状态，确认后会自动继续", "warning");
+      scheduleTargetedPostReconcileRetry();
+      return;
+    }
+    if (stateResponse?.reconciled !== true) {
+      showMessage("正在核对巡查任务状态，确认后会自动继续", "warning");
+      scheduleTargetedPostReconcileRetry();
+      return;
+    }
+    binding = resolveTargetedPostRunBinding(
+      stateResponse,
+      requestId,
+      attemptId,
+    );
+    if (!binding.accepted) {
+      targetedPostRunState = null;
+      stopTargetedPostRunnerForInvalidBinding(binding.reason);
+      renderCaptureDebugSession(getCurrentRuntime() || {});
+      return;
+    }
+  }
+  if (targetedPostReconcileRetryTimer !== null) {
+    clearTimeout(targetedPostReconcileRetryTimer);
+    targetedPostReconcileRetryTimer = null;
   }
   if (
     activeTargetedPostInvocationToken &&
@@ -17326,6 +17517,8 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     executionLock = await acquireCaptureExecutionLock({
       owner: "cloud_targeted_post_capture",
       label: workflowLabel,
+      captureTaskId: `${String(request.id || "").trim()}::${String(request.attemptId || "").trim()}`,
+      captureTaskAttemptId: String(request.attemptId || "").trim(),
     });
     if (!executionLock) {
       request = await updateTargetedPostRun(request, {
@@ -17363,16 +17556,36 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       : []
     ).filter((target) => !settledItemIds.has(String(target?.itemId || "")));
     if (pendingTargets.length > 0 && !shouldStop()) {
-      const targetTab = await chrome.tabs.create({
-        url: pendingTargets[0].url,
-        active: true,
-      });
-      if (!targetTab?.id) {
-        const error = new Error("无法创建定向作品采集页");
-        error.code = "TARGET_RUNNER_TAB_CREATE_FAILED";
-        throw error;
+      if (targetedWorkflow === "negative_post_patrol") {
+        const targetTabResponse = await chrome.runtime.sendMessage({
+          type: "onstarvoice:open-targeted-post-platform-tab",
+          requestId: String(request.id || "").trim(),
+          attemptId: String(request.attemptId || "").trim(),
+          url: pendingTargets[0].url,
+        });
+        const openedTabId = Number(targetTabResponse?.data?.tabId);
+        if (!targetTabResponse?.ok || !Number.isSafeInteger(openedTabId)) {
+          const error = new Error(
+            targetTabResponse?.message || "无法创建定向作品采集页",
+          );
+          error.code = String(
+            targetTabResponse?.reason || "TARGET_RUNNER_TAB_CREATE_FAILED",
+          );
+          throw error;
+        }
+        targetTabId = openedTabId;
+      } else {
+        const targetTab = await chrome.tabs.create({
+          url: pendingTargets[0].url,
+          active: true,
+        });
+        if (!targetTab?.id) {
+          const error = new Error("无法创建定向作品采集页");
+          error.code = "TARGET_RUNNER_TAB_CREATE_FAILED";
+          throw error;
+        }
+        targetTabId = Number(targetTab.id);
       }
-      targetTabId = Number(targetTab.id);
       if (!isActiveTargetedPostInvocation(invocationToken)) {
         throw createTargetedPostInvocationError();
       }
@@ -17728,9 +17941,22 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
         shouldStop() ||
         batchResult?.canceled ||
         targetResult.status === "canceled";
+      const requiresManualAction =
+        targetResult.status === "needs_action" ||
+        targetResult?.error?.requiresManualAction === true;
       request = await updateTargetedPostRun(request, {
-        status: canceled ? "cancel_requested" : "running",
+        status: requiresManualAction
+          ? "needs_action"
+          : canceled
+            ? "cancel_requested"
+            : "running",
         cancelRequested: canceled,
+        ...(requiresManualAction
+          ? {
+              finishedAt: new Date().toISOString(),
+              error: targetResult.error,
+            }
+          : {}),
         heartbeatAt: new Date().toISOString(),
         targetResults,
         progress: {
@@ -17745,13 +17971,17 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
           availabilityStatus: String(
             targetResult?.availabilityStatus || "",
           ),
-          phase: canceled
+          phase: requiresManualAction
+            ? "needs_action"
+            : canceled
             ? "target_canceling"
             : targetResult?.businessOutcome === "post_unavailable"
               ? "target_unavailable"
               : "target_settled",
         },
-        message: canceled
+        message: requiresManualAction
+          ? `${workflowLabel}需要人工处理：${String(targetResult?.error?.message || "平台要求验证").slice(0, 300)}`
+          : canceled
           ? `${workflowLabel}正在停止并保留已有结果`
           : targetResult?.businessOutcome === "post_unavailable"
             ? `第 ${target.ordinal}/${request.targets.length} 条帖子已确认删除或不可用`
@@ -17762,11 +17992,16 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       targetResults = Array.isArray(request.targetResults)
         ? request.targetResults.slice()
         : targetResults;
-      if (canceled) break;
+      if (canceled || requiresManualAction) break;
     }
 
     if (!isActiveTargetedPostInvocation(invocationToken)) {
       throw createTargetedPostInvocationError();
+    }
+    if (String(request?.status || "") === "needs_action") {
+      stopTargetedPostHeartbeat();
+      await flushTargetedBusinessProgress();
+      return;
     }
     const checkpoint = cloudTargetedPostApi.buildCheckpoint(
       request.targets,
@@ -17872,6 +18107,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     ) {
       await settleTargetedPostRunnerTab(targetTabId, request?.platform, {
         returnHome: String(request?.status || "") !== "needs_action",
+        targets: request?.targets,
       });
     }
     const latestOwnership =

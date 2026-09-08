@@ -4,7 +4,9 @@ import test from 'node:test';
 import {
   captureResourceAgentIds,
   normalizeCaptureResourcePolicy,
+  normalizeNegativePatrolAdmissionPolicy,
   projectCaptureResourceAdmission,
+  projectNegativePatrolAdmission,
   validateCaptureResourcePolicy,
 } from '../server/services/capture-resource-policy.js';
 
@@ -131,4 +133,48 @@ test('host-bound plans fail closed when the Agent host label is missing', () => 
     resourcePolicy: {maxActivePerHost: 1},
     hostLabel: '',
   }), {allowed: false, reason: 'host_unknown'});
+});
+
+test('negative patrol admission uses conservative bounded defaults', () => {
+  assert.deepEqual(normalizeNegativePatrolAdmissionPolicy({}), {
+    globalActiveLimit: 2,
+    tenantActiveLimit: 1,
+    globalFirstAdmissionIntervalMs: 10000,
+    tenantFirstAdmissionIntervalMs: 10000,
+    postProcessingHighWaterCount: 1000,
+    postProcessingHighWaterBytes: 128 * 1024 * 1024,
+  });
+  const bounded = normalizeNegativePatrolAdmissionPolicy({
+    NEGATIVE_PATROL_POST_PROCESSING_HIGH_WATER_COUNT: '999999',
+    NEGATIVE_PATROL_POST_PROCESSING_HIGH_WATER_BYTES: '999999999999',
+  });
+  assert.equal(bounded.postProcessingHighWaterCount, 2000);
+  assert.equal(bounded.postProcessingHighWaterBytes, 256 * 1024 * 1024);
+});
+
+test('negative patrol admission pauses before the durable post-processing cap', () => {
+  const policy = normalizeNegativePatrolAdmissionPolicy({});
+  const now = new Date('2026-09-07T08:00:00.000Z');
+  assert.equal(projectNegativePatrolAdmission({
+    policy,
+    postProcessingObserved: false,
+    now,
+  }).reason, 'post_processing_metrics_unavailable');
+  assert.equal(projectNegativePatrolAdmission({
+    policy,
+    postProcessingPendingCount: 1000,
+    now,
+  }).reason, 'post_processing_count_high_water');
+  assert.equal(projectNegativePatrolAdmission({
+    policy,
+    postProcessingPendingCount: 999,
+    postProcessingPendingBytes: 128 * 1024 * 1024,
+    now,
+  }).reason, 'post_processing_bytes_high_water');
+  assert.deepEqual(projectNegativePatrolAdmission({
+    policy,
+    postProcessingPendingCount: 999,
+    postProcessingPendingBytes: 128 * 1024 * 1024 - 1,
+    now,
+  }), {allowed: true, reason: '', retryAfterMs: 0});
 });

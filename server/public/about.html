@@ -70,7 +70,15 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.5<span class="date">2026-09-02</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.6<span class="date">2026-09-08</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>真实负面筛选：</strong>预览按发布时间范围和客户当前情感筛选，已改中性或正面的帖子排除，改为负面的帖子可入选，下发前再次验证。</li>
+            <li><strong>巡查页面自动回收：</strong>完成、失败和取消后精确关闭本次任务页面，异常回执与关页可重试；验证码等人工处理页面保留。</li>
+            <li><strong>降低集中下发负载：</strong>负面巡查逐帖排队，查询和评论后处理增加容量保护；常规关键词采集不使用巡查并发限制。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.5<span class="date">2026-09-02</span></h3>
           <ul>
             <li><strong>AI Debug 仅作辅助：</strong>启动失败、被占用或运行中断开时，当前页面和主采集继续执行，不再触发 Agent 冷却、关键词转交、返回首页或停采。</li>
             <li><strong>精确任务所有权：</strong>调试会话、任务页、worker 与标签组按 task、attempt、平台和来源页隔离，旧尝试及后台重启不会误清理或复活新任务。</li>

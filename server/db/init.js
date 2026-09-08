@@ -1,6 +1,14 @@
 import { listMigrationVersions, runMigrations } from './migrate.js';
 import { assertDbConnection, closePool } from './pool.js';
-import { queryAll, queryOne, execute, withTransaction } from './query.js';
+import {
+  DbCapacityError,
+  execute,
+  getDbExecutionSnapshot,
+  isDbCapacityError,
+  queryAll,
+  queryOne,
+  withTransaction,
+} from './query.js';
 import { ensureBootstrapAdmin } from '../services/auth-service.js';
 
 let initialized = false;
@@ -152,8 +160,11 @@ export async function getAllSettings(tenantId = null) {
 }
 
 export {
+  DbCapacityError,
   queryAll,
   queryOne,
   execute,
+  getDbExecutionSnapshot,
+  isDbCapacityError,
   withTransaction,
 };
