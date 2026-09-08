@@ -58,6 +58,7 @@ function safeJobs(overrides = {}) {
     async generateDailyReport() {},
     async generateMonthlyReport() {},
     async generateWeeklyReport() {},
+    async processCustomerDailyReports() { return {processed:0}; },
     async getSetting() {
       return '';
     },
@@ -173,7 +174,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
 
   assert.deepEqual(
     fakeCron.registrations.map(item => item.expression),
-    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '*/5 * * * *'],
+    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *', '*/5 * * * *'],
   );
   assert.deepEqual(
     fakeCron.registrations.map(item => item.options.name),
@@ -182,11 +183,12 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
       'onstarvoice:profile-patrol',
       'onstarvoice:capture-orchestration-recovery',
       'onstarvoice:capture-attention-notifications',
+      'onstarvoice:customer-daily-delivery',
       'onstarvoice:ops-control-observer',
     ],
   );
   assert.ok(fakeCron.registrations.every(item => item.options.noOverlap === true));
-  assert.ok(fakeCron.registrations.every(item => !/ai|report/u.test(item.options.name)));
+  assert.ok(fakeCron.registrations.every(item => !/batch-ai|configured-reports/u.test(item.options.name)));
 
   await fakeCron.registrations[1].task.fire();
   assert.equal(reconcileCalls, 1);
@@ -300,7 +302,7 @@ test('compatibility cron composes both groups without duplicate lifecycle calls'
     jobs: safeJobs(),
   });
 
-  assert.equal(fakeCron.registrations.length, 7);
+  assert.equal(fakeCron.registrations.length, 8);
   assert.deepEqual(runtime.runtimes.map(item => item.groupName), ['scheduler', 'ai']);
   assert.deepEqual(messages, ['[Cron] Scheduled jobs started']);
   assert.equal(runtime.stop(), true);

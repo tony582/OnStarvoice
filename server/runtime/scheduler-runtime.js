@@ -6,6 +6,7 @@ export const SCHEDULER_RUNTIME_RESPONSIBILITIES = Object.freeze([
   'profile-patrol-scheduling',
   'capture-orchestration-recovery',
   'capture-attention-notifications',
+  'customer-daily-delivery',
   'ops-control-observation-and-guarded-recovery',
   'ops-control-event-wakeup',
 ]);

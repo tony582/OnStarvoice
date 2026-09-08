@@ -18,6 +18,7 @@ import adminRouter from './routes/admin.js';
 import userRouter from './routes/user.js';
 import issuesRouter from './routes/issues.js';
 import reportsRouter from './routes/reports.js';
+import customerDailyReportsRouter from './routes/customer-daily-reports.js';
 import recordsRouter from './routes/records.js';
 import commentsRouter from './routes/comments.js';
 import triageRouter from './routes/triage.js';
@@ -156,6 +157,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.use('/api/user', userRouter);
   app.use('/api/issues', issuesRouter);
   app.use('/api/reports', reportsRouter);
+  app.use('/api/customer-daily-reports', customerDailyReportsRouter);
   app.use('/api/records', recordsRouter);
   app.use('/api/comments', commentsRouter);
   app.use('/api/triage', triageRouter);

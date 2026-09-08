@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { useAuth } from '@/lib/auth'
+import { CustomerDailyReport } from './CustomerDailyReport'
 
 type ReportRun = {
   id: string
@@ -60,6 +61,32 @@ function previewHtml(preview: ReportPreview, tab: PreviewTab) {
 }
 
 export function ReportsTab() {
+  const [section, setSection] = useState<'general' | 'customer'>('general')
+  return <div className="space-y-5">
+    <div className="flex flex-wrap items-center gap-3">
+      <div className="inline-flex rounded-lg border border-border bg-muted p-1" role="tablist" aria-label="报告类型">
+        {([{ id: 'general', label: '综合报告' }, { id: 'customer', label: '客户日报' }] as const).map(item => <button
+          key={item.id} id={`report-tab-${item.id}`} type="button" role="tab" aria-selected={section === item.id}
+          aria-controls={`report-panel-${item.id}`} tabIndex={section === item.id ? 0 : -1} onClick={() => setSection(item.id)}
+          onKeyDown={event => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+            event.preventDefault()
+            const next = event.key === 'Home' ? 'general' : event.key === 'End' ? 'customer' : section === 'general' ? 'customer' : 'general'
+            setSection(next)
+            document.getElementById(`report-tab-${next}`)?.focus()
+          }}
+          className={`rounded-md px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${section === item.id ? 'bg-white text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+        >{item.label}</button>)}
+      </div>
+      {section === 'customer' && <span className="text-xs text-muted-foreground">客户表格 · 可编辑交付</span>}
+    </div>
+    <div id={`report-panel-${section}`} role="tabpanel" aria-labelledby={`report-tab-${section}`}>
+      {section === 'customer' ? <CustomerDailyReport /> : <ComprehensiveReportsTab />}
+    </div>
+  </div>
+}
+
+function ComprehensiveReportsTab() {
   const { canWrite } = useAuth()
   const [reports, setReports] = useState<ReportRun[]>([])
   const [loading, setLoading] = useState(true)

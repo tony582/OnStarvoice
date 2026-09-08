@@ -8,6 +8,7 @@ import {
   resolveCommentCountEvidenceFromPayload,
 } from '../utils/metrics.js';
 import {resolveCapturedRecordType} from './official-account-identity.js';
+import {buildCustomerDailyMetricEvidence,observationPayloadWithDailyEvidence} from './customer-daily-metric-evidence.js';
 
 const VERSION_FIELDS = [
   'title', 'content', 'author_name', 'author_id', 'author_avatar', 'url', 'cover_url',
@@ -913,9 +914,10 @@ async function insertObservation(tx, {
   captureTaskItemAttemptId,
   captureTaskItemRequestHash,
   commentWorkflowExpectedCount = 0,
+  dailyMetricEvidence,
   record,
 }) {
-  const payloadJson = jsonText(record.payload, '{}');
+  const payloadJson = observationPayloadWithDailyEvidence(record.payload,dailyMetricEvidence);
   const lineageContext = {
     tenantId,
     captureTaskId,
@@ -1143,6 +1145,7 @@ export function resolveRecordBusinessVisibility(record = {}, existing = {}) {
 
 export async function upsertCapturedRecord(record, context) {
   record = normalizeCapturedRecordLinks(record);
+  const incomingMetricRecord = {...record};
   const tenantId = context.tenantId;
   const authCode = context.authCode || '';
   const monitorExecutionId = context.monitorExecutionId || null;
@@ -1188,6 +1191,7 @@ export async function upsertCapturedRecord(record, context) {
     });
     record = {...record, record_type: officialResolution.recordType};
 
+    const dailyMetricEvidence = buildCustomerDailyMetricEvidence(incomingMetricRecord,resolveGuardedCommentsCount(incomingMetricRecord,existing || {}));
     record = guardRecordCommentCount(record, existing || {});
     record = guardRecordTextCompleteness(record, existing || {});
     payload = jsonText(record.payload, '{}');
@@ -1297,6 +1301,7 @@ export async function upsertCapturedRecord(record, context) {
         captureTaskItemAttemptId,
         captureTaskItemRequestHash,
         commentWorkflowExpectedCount,
+        dailyMetricEvidence,
         record: mergeObservationMetrics({...record, payload}, existing),
       });
 
@@ -1388,6 +1393,7 @@ export async function upsertCapturedRecord(record, context) {
       captureTaskItemAttemptId,
       captureTaskItemRequestHash,
       commentWorkflowExpectedCount,
+      dailyMetricEvidence,
       record: {...record, payload},
     });
     await appendOfficialContentAudit(tx, {

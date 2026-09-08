@@ -6,6 +6,7 @@ import cron from 'node-cron';
 import { queryAll, getSetting } from './db/init.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
+import {processCustomerDailyReports} from './services/customer-daily-reports.js';
 import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
@@ -31,6 +32,7 @@ const DEFAULT_JOBS = Object.freeze({
   getSetting,
   labelPendingRecords,
   processCaptureAttentionNotifications,
+  processCustomerDailyReports,
   queryAll,
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
@@ -218,6 +220,17 @@ function schedulerDefinitions(jobs, logger) {
           }
         } catch (err) {
           safeLog(logger, 'error', '[Cron] Capture attention notification error:', err.message);
+        }
+      },
+    },
+    {
+      name: 'customer-daily-delivery',
+      expression: '* * * * *',
+      run: async () => {
+        try {
+          await jobs.processCustomerDailyReports({limit:5});
+        } catch {
+          safeLog(logger, 'error', '[Cron] Customer daily report queue could not complete this cycle.');
         }
       },
     },
