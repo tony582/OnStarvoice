@@ -7752,6 +7752,7 @@ async function reconcileLegacyNegativePatrolPacksForAgent(tx, agent) {
 async function claimPriorityAgentControl(tx, {
   agent,
   terminalNoticeAcks = [],
+  supportsTerminalNotices = false,
 }) {
   const currentAgent = await lockActiveCaptureAgentSession(tx, agent);
   if (!currentAgent) return {agentInactive: true};
@@ -7766,7 +7767,7 @@ async function claimPriorityAgentControl(tx, {
     agent,
   );
 
-  if (terminalNoticeAcks.length > 0) {
+  if (supportsTerminalNotices && terminalNoticeAcks.length > 0) {
     const acknowledgedTerminalTasks = await tx.queryAll(`
       UPDATE capture_tasks task
       SET metadata = (
@@ -7850,7 +7851,10 @@ async function claimPriorityAgentControl(tx, {
     }
   }
 
-  const terminalNotices = await tx.queryAll(`
+  // Older extensions cannot ACK this protocol. Returning their historical
+  // notices as priority-only forever would starve full heartbeat and ordinary
+  // keyword dispatch, even though every HTTP request succeeds.
+  const terminalNotices = supportsTerminalNotices ? await tx.queryAll(`
     SELECT
       COALESCE(NULLIF(task.control_task_id, ''), task.client_task_id) AS request_id,
       COALESCE(
@@ -7930,7 +7934,7 @@ async function claimPriorityAgentControl(tx, {
     ) ASC, task.id
     LIMIT 50
     FOR UPDATE OF task SKIP LOCKED
-  `, [agent.tenant_id, agent.id]);
+  `, [agent.tenant_id, agent.id]) : [];
 
   const commands = await tx.queryAll(`
     SELECT c.id, c.command_type, c.payload, c.status, c.created_at,
@@ -8112,6 +8116,8 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
     const priorityControl = await withTransaction(tx =>
       claimPriorityAgentControl(tx, {
         agent,
+        supportsTerminalNotices:
+          heartbeatCapabilities.negativePatrolTerminalReceiptV1 === true,
         terminalNoticeAcks: normalizeTerminalNoticeAcks(
           req.body?.terminalNoticeAcks,
         ),
