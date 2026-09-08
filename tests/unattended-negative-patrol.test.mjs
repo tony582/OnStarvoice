@@ -3,7 +3,6 @@ import test from 'node:test';
 import {
   normalizeUnattendedNegativePatrolScope,
   negativePatrolCalendarDate,
-  unattendedNegativePatrolCadence,
   unattendedNegativePatrolTargetUrl,
   evaluateUnattendedNegativePatrolRecord,
   negativePatrolStableEvidence,
@@ -44,6 +43,7 @@ test('window is precisely 168 hours, immutable across timezones and rejects ambi
   const normalized = normalizeUnattendedNegativePatrolScope(scope);
   assert.equal(normalized.windowStart, '2026-09-01T01:00:00.000Z');
   assert.equal(normalized.windowEnd, scope.runStartedAt);
+  assert.equal(normalized.windowBasis, 'first_collected_at');
   assert.equal(normalizeUnattendedNegativePatrolScope({...scope,
     timezone: 'America/New_York'}).windowStart, normalized.windowStart);
   assert.throws(() => normalizeUnattendedNegativePatrolScope({...scope, tenantId: ''}));
@@ -53,17 +53,29 @@ test('window is precisely 168 hours, immutable across timezones and rejects ambi
   assert.throws(() => normalizeUnattendedNegativePatrolScope({...scope, keywordIds: ['not-uuid']}));
 });
 
-test('publication and first discovery have exact boundaries; missing publication never uses collection time', () => {
-  assert.equal(evaluateUnattendedNegativePatrolRecord(record({published_ts: '2026-09-01T01:00:00Z'}), scope).eligible, true);
-  for (const published_ts of ['2026-09-01T00:59:59.999Z', scope.runStartedAt]) {
-    assert.equal(evaluateUnattendedNegativePatrolRecord(record({published_ts}), scope).reason, 'outside_window');
-  }
+test('first collection has exact inclusive-start and exclusive-end boundaries independent of publication', () => {
+  assert.equal(evaluateUnattendedNegativePatrolRecord(record({created_at: '2026-09-01T01:00:00Z'}), scope).eligible, true);
+  assert.equal(evaluateUnattendedNegativePatrolRecord(record({created_at: '2026-09-01T00:59:59.999Z'}), scope).reason, 'outside_window');
   assert.equal(evaluateUnattendedNegativePatrolRecord(record({created_at: scope.runStartedAt}), scope).reason, 'discovered_this_run');
-  assert.equal(evaluateUnattendedNegativePatrolRecord(record({published_ts: null}), scope).reason, 'publish_time_unknown');
-  assert.equal(evaluateUnattendedNegativePatrolRecord(record({publish_time: ''}), scope).reason, 'publish_time_unknown');
+  for (const published_ts of ['2020-01-01T00:00:00Z', scope.runStartedAt, null]) {
+    assert.equal(evaluateUnattendedNegativePatrolRecord(record({published_ts, publish_time: ''}), scope).eligible, true);
+  }
   const fractional = {...scope, runStartedAt: '2026-09-08T01:00:00.500Z'};
-  assert.equal(evaluateUnattendedNegativePatrolRecord(record({published_ts: new Date('2026-09-01T01:00:00.500Z')}), fractional).eligible, true);
+  assert.equal(evaluateUnattendedNegativePatrolRecord(record({created_at: new Date('2026-09-01T01:00:00.500Z')}), fractional).eligible, true);
   assert.equal(evaluateUnattendedNegativePatrolRecord(record({created_at: new Date(fractional.runStartedAt)}), fractional).reason, 'discovered_this_run');
+});
+
+test('cross-midnight windows remain 168 hours and later captures never renew old first collection', () => {
+  const midnightRun = {...scope, runStartedAt: '2026-09-07T16:00:00Z'}; // September 8 midnight Shanghai
+  assert.equal(negativePatrolCalendarDate(midnightRun.runStartedAt), '2026-09-08');
+  const normalized = normalizeUnattendedNegativePatrolScope(midnightRun);
+  assert.equal(normalized.windowStart, '2026-08-31T16:00:00.000Z');
+  assert.equal(evaluateUnattendedNegativePatrolRecord(record({created_at: normalized.windowStart}), midnightRun).due, true);
+  const old = record({created_at: '2026-08-31T15:59:59.999Z',
+    published_ts: '2026-09-07T15:00:00Z', last_seen_at: '2026-09-07T15:00:00Z',
+    updated_at: '2026-09-07T15:00:00Z', latest_formal_success_at: '2026-09-07T15:00:00Z'});
+  assert.equal(evaluateUnattendedNegativePatrolRecord(old, midnightRun,
+    state({last_success_at: '2026-09-07T15:00:00Z'})).reason, 'outside_window');
 });
 
 test('human exclusion, archive, availability and business visibility dominate first-time eligibility', () => {
@@ -96,32 +108,29 @@ test('manual corrected negative and relevance follow existing patrol override se
     triage_status: 'reviewed_non_monitor'}, scope).eligible, false);
 });
 
-test('daily means next calendar day, not another 24 hours; high priority shortens a low cadence', () => {
-  const last = '2026-09-07T15:50:00Z'; // 23:50 Shanghai
-  const midnightRun = {...scope, runStartedAt: '2026-09-07T16:30:00Z'};
-  assert.equal(negativePatrolCalendarDate(last), '2026-09-07');
-  const next = evaluateUnattendedNegativePatrolRecord(record(), midnightRun, state({last_success_at: last}));
-  assert.equal(next.nextDueDate, '2026-09-08');
-  assert.equal(next.due, true);
-  assert.equal(evaluateUnattendedNegativePatrolRecord(record(), scope,
-    state({last_success_at: '2026-09-08T00:01:00Z'})).due, false);
-  const reviewed = record({triage_status: 'reviewed'});
-  assert.equal(evaluateUnattendedNegativePatrolRecord(reviewed, scope,
-    state({last_success_at: last, stable_success_count: 1})).due, false);
-  assert.equal(evaluateUnattendedNegativePatrolRecord({...reviewed, triage_priority: 'high'}, scope,
-    state({last_success_at: last, stable_success_count: 1})).due, true);
+test('every eligible handling state remains executable after same-day success and ignores legacy cadence dates', () => {
+  for (const triage_status of ['unhandled', 'replied', 'negative_feishu', 'official_responded', 'reviewed', 'negative_cold']) {
+    for (const triage_priority of ['normal', 'high', 'urgent']) {
+      const source = record({triage_status, triage_priority});
+      const result = evaluateUnattendedNegativePatrolRecord(source, scope, state({
+        last_success_at: '2026-09-08T00:01:00Z', stable_success_count: 3,
+        next_due_date: '2026-09-15', cadence_days: 7,
+      }));
+      assert.equal(result.due, true, `${triage_status}/${triage_priority}`);
+      assert.equal(result.reason, 'due');
+      assert.equal(result.nextDueDate, null);
+      assert.equal(source.triage_status, triage_status);
+    }
+  }
 });
 
-test('cold/reviewed get an immediate first opportunity and slow only after measured stability', () => {
+test('cold/reviewed get a first opportunity and measured stability remains audit evidence only', () => {
   for (const status of ['negative_cold', 'reviewed']) {
     const cold = record({triage_status: status});
     assert.equal(evaluateUnattendedNegativePatrolRecord(cold, scope).reason, 'first_patrol');
-    assert.equal(unattendedNegativePatrolCadence(cold), 1);
-    assert.equal(unattendedNegativePatrolCadence(cold, {stable_success_count: 1}), 7);
-    assert.equal(unattendedNegativePatrolCadence({...cold, triage_priority: 'urgent'}, {stable_success_count: 1}), 1);
+    assert.equal(evaluateUnattendedNegativePatrolRecord(cold, scope,
+      state({stable_success_count: 1, last_success_at: '2026-09-08T00:30:00Z'})).due, true);
   }
-  assert.equal(unattendedNegativePatrolCadence(record({triage_status: 'negative_feishu'})), 3);
-  assert.equal(unattendedNegativePatrolCadence(record({triage_status: 'replied'})), 3);
   const baseline = {id: 'a', likes: 10, comments_count: 2, collects: 0, shares: 0};
   assert.equal(negativePatrolStableEvidence(baseline, {...baseline, id: 'b'}), true);
   assert.equal(negativePatrolStableEvidence(baseline, {...baseline, id: 'b', likes: 9}), false);
@@ -130,16 +139,16 @@ test('cold/reviewed get an immediate first opportunity and slow only after measu
   assert.equal(negativePatrolStableEvidence(baseline, {...baseline, id: 'b', shares: null}), false);
 });
 
-test('prior exact formal negative/watch success shares calendar coverage without inventing stability', () => {
+test('prior exact formal negative/watch success preserves evidence without suppressing another run', () => {
   const todayFormal = record({latest_formal_success_at: '2026-09-08T00:30:00Z',
     latest_formal_observation_id: observationId, latest_formal_stable: false});
-  assert.equal(evaluateUnattendedNegativePatrolRecord(todayFormal, scope).reason, 'not_due');
+  assert.equal(evaluateUnattendedNegativePatrolRecord(todayFormal, scope).reason, 'due');
   assert.equal(evaluateUnattendedNegativePatrolRecord(todayFormal, scope).sharedResultObservationId, observationId);
   const coldYesterday = record({triage_status: 'negative_cold',
     latest_formal_success_at: '2026-09-07T01:00:00Z', latest_formal_stable: false});
   assert.equal(evaluateUnattendedNegativePatrolRecord(coldYesterday, scope).due, true);
   assert.equal(evaluateUnattendedNegativePatrolRecord({...coldYesterday,
-    latest_formal_stable: true}, scope).due, false);
+    latest_formal_stable: true}, scope).due, true);
   const newerState = state({last_success_at: '2026-09-08T00:45:00Z', stable_success_count: 0});
   assert.equal(negativePatrolEffectiveRotationState(newerState, todayFormal), newerState);
 });
@@ -152,8 +161,9 @@ test('formal coverage query requires targeted work, successful current attempt a
     assert.match(sql, /formal_attempt\.status IN \('completed', 'completed_with_warnings'\)/);
     return [record({latest_formal_success_at: '2026-09-08T00:30:00Z'})];
   }}, scope);
-  assert.equal(result.candidates.length, 0);
-  assert.equal(result.summary.notDue, 1);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.summary.notDue, 0);
+  assert.equal(result.summary.due, 1);
   assert.equal(result.summary.firstPending, 0);
 });
 
@@ -171,7 +181,7 @@ test('candidate loading does not truncate at 100, rotates old first and never br
   assert.equal(queries, 0);
   const records = Array.from({length: 130}, (_, i) => record({
     id: `record-${i}`, external_id: String(123450000 + i),
-    published_ts: `2026-09-0${i % 6 + 1}T02:00:00Z`,
+    created_at: `2026-09-0${i % 6 + 1}T02:00:00Z`,
   }));
   records.push(record({id: 'already-success', last_success_at: '2026-09-06T02:00:00Z'}));
   const result = await loadUnattendedNegativePatrolCandidates({
@@ -179,7 +189,7 @@ test('candidate loading does not truncate at 100, rotates old first and never br
     async queryAll(sql) { assert.doesNotMatch(sql, /LIMIT\s+100/); return records; },
   }, scope);
   assert.equal(result.candidates.length, 131);
-  assert.equal(result.candidates[0].publishedAt, '2026-09-01T02:00:00Z');
+  assert.equal(result.candidates[0].firstCollectedAt, '2026-09-01T02:00:00Z');
   assert.equal(result.candidates.at(-1).recordId, 'already-success');
   assert.equal(result.summary.firstPending, 130);
   assert.equal(result.summary.due, 1);
@@ -189,7 +199,7 @@ test('candidate summary preserves never-covered expiration and persists history 
   const writes = [];
   const result = await loadUnattendedNegativePatrolCandidates({
     async queryOne() { return {total: 0}; },
-    async queryAll() { return [record({published_ts: '2026-08-31T01:00:00Z',
+    async queryAll() { return [record({created_at: '2026-08-31T01:00:00Z',
       first_eligible_at: '2026-09-06T01:00:00Z'})]; },
     async execute(sql, params) { writes.push({sql, params}); },
   }, {...scope, persistCandidates: true});
@@ -206,10 +216,10 @@ test('formal shared success is covered in both near-expiry and expired summaries
   const result = await loadUnattendedNegativePatrolCandidates({
     async queryOne() { return {total: 0}; },
     async queryAll() { return [
-      record({...common, ...shared, external_id: '100000001', published_ts: '2026-09-01T02:00:00Z'}),
-      record({...common, ...shared, external_id: '100000002', published_ts: '2026-08-31T02:00:00Z'}),
-      record({...common, external_id: '100000003', published_ts: '2026-09-01T02:00:00Z'}),
-      record({...common, external_id: '100000004', published_ts: '2026-08-31T02:00:00Z'}),
+      record({...common, ...shared, external_id: '100000001', created_at: '2026-09-01T02:00:00Z'}),
+      record({...common, ...shared, external_id: '100000002', created_at: '2026-08-31T02:00:00Z'}),
+      record({...common, external_id: '100000003', created_at: '2026-09-01T02:00:00Z'}),
+      record({...common, external_id: '100000004', created_at: '2026-08-31T02:00:00Z'}),
     ]; },
     async execute(sql, params) { writes.push({sql, params}); },
   }, {...scope, persistCandidates: true});
@@ -220,23 +230,20 @@ test('formal shared success is covered in both near-expiry and expired summaries
   assert.equal(expiredWrites[0].params[2], '100000004');
 });
 
-test('unknown publication history is only counted; bulk detail query prefilters negative and known publication', async () => {
+test('bulk candidates use first collection and include otherwise eligible records with unknown publication', async () => {
   const result = await loadUnattendedNegativePatrolCandidates({
-    async queryOne(sql) {
-      assert.match(sql, /SELECT COUNT\(\*\) AS total FROM records r/);
-      assert.doesNotMatch(sql, /LATERAL|SELECT r\.\*/);
-      assert.match(sql, /r\.published_ts IS NULL/);
-      assert.match(sql, /END, ''\)\)\) = 'negative'/);
-      return {total: '12500'};
-    },
+    async queryOne() { throw new Error('must not scan unknown publication history'); },
     async queryAll(sql) {
-      assert.match(sql, /r\.published_ts IS NOT NULL AND NULLIF\(BTRIM\(r\.publish_time\), ''\) IS NOT NULL/);
-      assert.doesNotMatch(sql, /AND \(r\.published_ts IS NULL/);
-      return [];
+      assert.match(sql, /r\.created_at >= \$4::timestamptz AND r\.created_at < \$3::timestamptz/);
+      assert.match(sql, /END, ''\)\)\) = 'negative'/);
+      assert.doesNotMatch(sql, /r\.published_ts (?:IS|>=|<)|BTRIM\(r\.publish_time\)/);
+      return [record({published_ts: null, publish_time: ''})];
     },
   }, scope);
-  assert.equal(result.summary.unknownPublishTime, 12500);
-  assert.equal(result.candidates.length, 0);
+  assert.equal(result.summary.unknownPublishTime, 0);
+  assert.equal(result.summary.exclusionReasons.publish_time_unknown, undefined);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.candidates[0].firstCollectedAt, '2026-09-07T00:00:00.000Z');
 });
 
 function claimDb({row = record(), stored = state(), owner = null, active = null} = {}) {
@@ -254,17 +261,18 @@ function claimDb({row = record(), stored = state(), owner = null, active = null}
   };
 }
 
-test('claim checks live state and same-day success, while unrelated posters remain claimable', async () => {
+test('claim preserves live exclusions and failure controls while same-day success remains claimable', async () => {
   for (const options of [
     {row: record({triage_status: 'unavailable'})},
-    {stored: state({last_success_at: '2026-09-08T00:00:00Z'})},
     {stored: state({cooldown_until: '2026-09-08T01:30:00Z'})},
+    {stored: state({needs_action: true})},
   ]) {
     const db = claimDb(options);
     assert.equal((await claimUnattendedNegativePatrolItem(db, claim)).claimed, false);
     assert.equal(db.writes.some(write => /SET lease_item_id = \$4/.test(write.sql)), false);
   }
-  const db = claimDb();
+  const db = claimDb({stored: state({last_success_at: '2026-09-08T00:00:00Z',
+    cadence_days: 7, next_due_date: '2026-09-15'})});
   const result = await claimUnattendedNegativePatrolItem(db, claim);
   assert.equal(result.claimed, true);
   assert.ok(db.writes.some(write => /pg_try_advisory_xact_lock/.test(write.sql)));
@@ -300,7 +308,7 @@ test('all existing unconfirmed-stop flags fence both prior owners and other targ
   assert.equal(inspected, 2);
 });
 
-test('watched success committed during claim is refreshed before assigning another execution', async () => {
+test('formal success committed during claim is refreshed without suppressing the current run', async () => {
   const db = claimDb();
   const read = db.queryOne.bind(db);
   let recordReads = 0;
@@ -312,10 +320,10 @@ test('watched success committed during claim is refreshed before assigning anoth
     return read(sql);
   };
   const result = await claimUnattendedNegativePatrolItem(db, claim);
-  assert.equal(result.claimed, false);
-  assert.equal(result.reason, 'not_due');
-  assert.equal(result.sharedResultObservationId, observationId);
-  assert.equal(db.writes.some(write => /SET lease_item_id = \$4/.test(write.sql)), false);
+  assert.equal(result.claimed, true);
+  assert.equal(result.candidate.sharedResultObservationId, observationId);
+  assert.equal(result.candidate.nextDueDate, null);
+  assert.equal(db.writes.some(write => /SET lease_item_id = \$4/.test(write.sql)), true);
 });
 
 function completionDb({result = {}, stored = leased()} = {}) {
@@ -339,7 +347,7 @@ function completionDb({result = {}, stored = leased()} = {}) {
   };
 }
 
-test('only durable current attempt result advances rotation; stable success stores the next calendar date', async () => {
+test('only durable current attempt result advances rotation; stable success never schedules an interval', async () => {
   const input = {...claim, resultObservationId: observationId, finishedAt: scope.runStartedAt};
   const missing = completionDb({result: null});
   assert.equal((await completeUnattendedNegativePatrolItem(missing, input)).updated, false);
@@ -349,15 +357,17 @@ test('only durable current attempt result advances rotation; stable success stor
   assert.equal(stale.writes.length, 0);
   const good = completionDb();
   assert.deepEqual(await completeUnattendedNegativePatrolItem(good, input), {
-    updated: true, nextDueDate: '2026-09-15', cadenceDays: 7, stable: true,
+    updated: true, nextDueDate: null, cadenceDays: 1, stable: true,
   });
   assert.match(good.writes[0].sql, /last_result_observation_id/);
+  assert.equal(good.writes[0].params[6], null);
+  assert.equal(good.writes[0].params[7], 1);
   const growing = completionDb({result: {likes: 11}});
   assert.equal((await completeUnattendedNegativePatrolItem(growing, input)).cadenceDays, 1);
   const wrongClock = completionDb();
   const future = await completeUnattendedNegativePatrolItem(wrongClock,
     {...input, finishedAt: '2099-09-08T01:00:00Z'});
-  assert.equal(future.nextDueDate, '2026-09-15');
+  assert.equal(future.nextDueDate, null);
   assert.equal(wrongClock.writes[0].params[3], scope.runStartedAt);
 });
 

@@ -75,7 +75,7 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'eligible',$10,$11) RETURNING *`,
       [tenant.id, externalId, platform, label, options.keyword || KEYWORD,
         options.sentiment || 'negative', publishedAt || '', publishedAt,
-        options.createdAt || new Date(Date.parse(runStartedAt) - 8 * DAY).toISOString(),
+        options.createdAt || new Date(Date.parse(runStartedAt) - DAY).toISOString(),
         JSON.stringify(options.overrides || {}), options.availability || 'unknown'])).rows[0];
       if (options.status || options.archived || options.priority) await pool.query(`INSERT INTO record_triage
         (tenant_id,record_id,status,priority,archived_at)
@@ -139,7 +139,22 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
       [tenant.id, source.id, source.platform, KEYWORD, at, likes,
         graph?.child.id || null, graph?.item.id || null, graph?.attempt.id || null])).rows[0];
     }
-    return {tenant, scope, agents, record, parent, item, claim, state, execution, observation};
+    async function formalSuccess(source, {at = runStartedAt, watched = false} = {}) {
+      const graph = await execution(source);
+      const endpoint = await observation(source, {graph, at});
+      await pool.query(`UPDATE capture_task_items SET status='completed',result_observation_id=$2,
+        finished_at=$3,item_type=$4 WHERE id=$1`,
+      [graph.item.id, endpoint.id, endpoint.captured_at, watched ? 'watched_content' : 'negative_post']);
+      await pool.query(`UPDATE capture_tasks SET status='completed',task_type=$2,feature_key=$2,
+        finished_at=$3 WHERE id=$1`, [graph.child.id,
+        watched ? 'watched_content_patrol' : 'negative_post_patrol', endpoint.captured_at]);
+      await pool.query("UPDATE capture_task_item_attempts SET status='completed',finished_at=$2 WHERE id=$1",
+        [graph.attempt.id, endpoint.captured_at]);
+      await pool.query("UPDATE capture_tasks SET status='completed',finished_at=$2 WHERE id=$1",
+        [graph.owner.id, endpoint.captured_at]);
+      return {graph, endpoint};
+    }
+    return {tenant, scope, agents, record, parent, item, claim, state, execution, observation, formalSuccess};
   }
 
   async function authenticatedHttp(st, f) {
@@ -178,29 +193,36 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     };
   }
 
-  await t.test('the frozen 168-hour window, existing triage, keyword and tenant scope produce the complete ordered candidate set', async st => {
+  await t.test('the frozen 168-hour first-ingestion window retains triage, keyword and tenant scope independently of publication dates', async st => {
     const f = await fixture(st);
-    const start = await f.record('inclusive-start', {publishedAt: f.scope.windowStart});
+    const start = await f.record('inclusive-start', {createdAt: f.scope.windowStart});
     const cold = await f.record('cold-first-visit', {status: 'negative_cold'});
     const feishu = await f.record('feishu-first-visit', {status: 'negative_feishu'});
     const privacy = await f.record('privacy-is-still-visible', {status: 'privacy_unreachable'});
     const xhs = await f.record('independent-platform', {platform: 'xiaohongshu'});
-    await f.record('before-start', {publishedAt: new Date(Date.parse(f.scope.windowStart) - 1).toISOString()});
-    await f.record('exclusive-end', {publishedAt: f.scope.windowEnd});
+    await f.record('before-start', {createdAt: new Date(Date.parse(f.scope.windowStart) - 1).toISOString()});
+    await f.record('exclusive-end', {createdAt: f.scope.windowEnd});
     await f.record('created-in-this-run', {createdAt: f.scope.windowEnd});
     await f.record('not-monitored', {status: 'reviewed_non_monitor'});
     await f.record('not-visible', {status: 'unavailable'});
     await f.record('archived', {archived: true});
     await f.record('other-keyword', {keyword: '其他品牌'});
     await f.record('positive', {sentiment: 'positive'});
-    await f.record('missing-date', {publishedAt: null});
+    const missingDate = await f.record('missing-publication-date', {publishedAt: null});
+    const oldPublication = await f.record('old-post-newly-collected', {publishedAt: '2020-01-01T00:00:00Z'});
+    const refreshedOldRecord = await f.record('old-intake-recently-rechecked', {
+      createdAt: new Date(Date.parse(f.scope.windowStart) - DAY).toISOString(),
+    });
+    await f.observation(refreshedOldRecord, {at: '2026-09-08T00:30:00Z'});
+    await pool.query('UPDATE records SET updated_at=$2 WHERE id=$1', [refreshedOldRecord.id, FIXED_RUN]);
     const other = await fixture(st);
     await other.record('other-tenant');
     const loaded = await withTransaction(tx => loadCandidates(tx, {...f.scope, persistCandidates: true}));
-    assert.deepEqual(new Set(loaded.candidates.map(row => row.recordId)), new Set([start.id, cold.id, feishu.id, privacy.id, xhs.id]));
+    assert.deepEqual(new Set(loaded.candidates.map(row => row.recordId)),
+      new Set([start.id, cold.id, feishu.id, privacy.id, xhs.id, missingDate.id, oldPublication.id]));
     assert.equal(loaded.candidates.filter(row => row.platform === 'douyin')[0].recordId, start.id);
-    assert.equal(loaded.summary.firstPending, 5);
-    assert.equal(loaded.summary.unknownPublishTime, 1);
+    assert.equal(loaded.summary.firstPending, 7);
+    assert.equal(loaded.summary.unknownPublishTime, 0);
     assert.equal(loaded.summary.exclusionReasons.triage_reviewed_non_monitor, 1);
     assert.equal(loaded.summary.exclusionReasons.triage_unavailable, 1);
     assert.equal(loaded.candidates.find(row => row.recordId === cold.id).dueReason, 'first_patrol');
@@ -340,6 +362,23 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     assert.equal((await pool.query('SELECT COUNT(*)::integer AS n FROM capture_agent_commands WHERE tenant_id=$1', [f.tenant.id])).rows[0].n, 0);
   });
 
+  await t.test('a formal success after preview does not withdraw a queued post when an idle node claims it', async st => {
+    const f = await fixture(st, {runStartedAt: new Date().toISOString()});
+    const source = await f.record('preview-then-manual-success');
+    const preview = await withTransaction(tx => loadCandidates(tx, f.scope));
+    assert.deepEqual(preview.candidates.map(row => row.recordId), [source.id]);
+    const owner = await f.parent();
+    const target = await f.item(owner, {record: source});
+    await f.formalSuccess(source, {at: new Date().toISOString(), watched: true});
+    const dispatched = await f.claim();
+    assert.equal(dispatched?.itemId, target.id, JSON.stringify(dispatched));
+    const saved = (await pool.query('SELECT * FROM capture_task_items WHERE id=$1', [target.id])).rows[0];
+    assert.equal(saved.status, 'dispatched');
+    assert.equal(saved.attempt_count, 1);
+    assert.equal(saved.metadata.skipReason, undefined);
+    assert.equal((await pool.query('SELECT COUNT(*)::integer AS n FROM capture_agent_commands WHERE tenant_id=$1', [f.tenant.id])).rows[0].n, 1);
+  });
+
   await t.test('a completion heartbeat with only an unrelated keyword snapshot cannot settle or advance the patrol', async st => {
     const f = await fixture(st);
     const source = await f.record('no-patrol-observation');
@@ -357,7 +396,7 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     assert.equal((await f.state(source)).last_success_at, null);
   });
 
-  await t.test('only exact persisted attempt evidence advances rotation, once, to the next calendar batch', async st => {
+  await t.test('only exact persisted attempt evidence records a success once and leaves later same-day runs eligible', async st => {
     const f = await fixture(st);
     const source = await f.record('calendar-and-lineage');
     const graph = await f.execution(source);
@@ -376,20 +415,27 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     assert.equal((await complete({resultObservationId: endpoint.id, assignmentRevision: 2})).updated, false);
     const success = await complete({resultObservationId: endpoint.id, finishedAt: '2099-01-01T00:00:00Z'});
     assert.equal(success.updated, true);
-    assert.equal(success.nextDueDate, '2026-09-09');
+    assert.equal(success.nextDueDate, null);
     const saved = await f.state(source);
     assert.equal(saved.last_success_at.toISOString(), endpoint.captured_at.toISOString(),
-      'An incorrect device completion clock cannot postpone the server-observed next patrol');
+      'Success ordering uses the durable server observation instead of an incorrect device clock');
+    assert.equal(saved.next_due_date, null);
     assert.equal((await complete({resultObservationId: endpoint.id})).updated, false);
     assert.deepEqual(await f.state(source), saved, 'Replays do not advance the rotation clock');
     const sameDay = await withTransaction(tx => loadCandidates(tx, {...f.scope, runStartedAt: '2026-09-08T05:00:00Z'}));
-    assert.equal(sameDay.candidates.length, 0);
+    assert.deepEqual(sameDay.candidates.map(row => row.recordId), [source.id]);
+    await pool.query("UPDATE capture_tasks SET status='completed' WHERE id=$1", [graph.child.id]);
+    await pool.query("UPDATE capture_task_item_attempts SET status='completed' WHERE id=$1", [graph.attempt.id]);
+    const nextGraph = await f.execution(source);
+    assert.equal((await withTransaction(tx => claimRotation(tx, {...nextGraph.input,
+      runStartedAt: '2026-09-08T05:00:00Z', now: '2026-09-08T05:00:00Z'}))).claimed, true,
+    'The completed first run releases its post lease for a distinct same-day run');
     const nextMorning = await withTransaction(tx => loadCandidates(tx, {...f.scope, runStartedAt: '2026-09-09T01:00:00Z'}));
     assert.equal(nextMorning.candidates[0]?.recordId, source.id,
       '09:20 completion must not miss the next day 09:00 batch');
   });
 
-  await t.test('stable cold treatment gets a first patrol, then seven-day cadence; failures preserve first-patrol eligibility', async st => {
+  await t.test('stable cold treatment remains eligible after success, while failures still impose retry cooldown', async st => {
     const f = await fixture(st);
     const cold = await f.record('stable-cold', {status: 'negative_cold'});
     const baseline = await f.observation(cold, {at: '2026-09-07T05:00:00Z'});
@@ -400,8 +446,11 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     const success = await withTransaction(tx => completeRotation(tx, {...graph.input,
       resultObservationId: endpoint.id, finishedAt: '2026-09-08T02:00:00Z'}));
     assert.equal(success.updated, true);
-    assert.equal(success.cadenceDays, 7);
-    assert.equal(success.nextDueDate, '2026-09-15');
+    assert.equal(success.nextDueDate, null);
+    const afterSuccess = await withTransaction(tx => loadCandidates(tx, {...f.scope,
+      runStartedAt: '2026-09-08T02:10:00Z'}));
+    assert.deepEqual(afterSuccess.candidates.map(row => row.recordId), [cold.id]);
+    assert.equal((await f.state(cold)).next_due_date, null);
     const failedSource = await f.record('failed-first-patrol');
     const failed = await f.execution(failedSource);
     assert.equal((await withTransaction(tx => claimRotation(tx, failed.input))).claimed, true);
@@ -473,7 +522,7 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     assert.equal((await pool.query('SELECT COUNT(*)::integer AS n FROM capture_task_item_attempts WHERE item_id=$1', [graph.item.id])).rows[0].n, 9);
   });
 
-  await t.test('formal watched patrol evidence shares the daily clock, while keyword captures and failed attempts never count as success', async st => {
+  await t.test('formal watched patrol evidence only affects ordering, while keyword captures and failed attempts never count as success', async st => {
     const f = await fixture(st);
     const sources = [];
     const endpoints = [];
@@ -496,17 +545,43 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
       endpoints.push(endpoint);
     }
     const today = await withTransaction(tx => loadCandidates(tx, f.scope));
-    assert.deepEqual(new Set(today.candidates.map(row => row.recordId)), new Set(sources.slice(1).map(row => row.id)));
-    assert.ok(today.candidates.every(row => row.dueReason === 'first_patrol'));
-    assert.equal(today.summary.notDue, 1);
+    assert.deepEqual(new Set(today.candidates.map(row => row.recordId)), new Set(sources.map(row => row.id)));
+    assert.ok(today.candidates.filter(row => row.recordId !== sources[0].id).every(row => row.dueReason === 'first_patrol'));
+    assert.equal(today.candidates.at(-1).recordId, sources[0].id, 'Previously successful content follows never-checked content');
+    assert.equal(today.candidates.at(-1).sharedResultObservationId, endpoints[0].id);
+    assert.equal(today.summary.notDue, 0);
     const watchedClaim = await withTransaction(tx => claimRotation(tx, {...f.scope, recordId: sources[0].id,
       itemId: randomUUID(), executionTaskId: randomUUID(), assignmentRevision: 1, now: FIXED_RUN}));
-    assert.equal(watchedClaim.claimed, false);
-    assert.equal(watchedClaim.reason, 'not_due');
-    assert.equal(watchedClaim.sharedResultObservationId, endpoints[0].id);
-    assert.equal(watchedClaim.nextDueDate, '2026-09-09');
+    assert.equal(watchedClaim.claimed, true);
     const tomorrow = await withTransaction(tx => loadCandidates(tx, {...f.scope, runStartedAt: '2026-09-09T01:00:00Z'}));
     assert.equal(tomorrow.candidates.find(row => row.recordId === sources[0].id)?.dueReason, 'due');
+  });
+
+  await t.test('existing one-, three- and seven-day rotation rows never impose handling-status intervals on a later run', async st => {
+    const f = await fixture(st);
+    const sources = [];
+    for (const [status, cadence, stable] of [
+      ['unhandled', 1, 0], ['replied', 3, 0], ['negative_feishu', 3, 0],
+      ['reviewed', 7, 1], ['negative_cold', 7, 1],
+    ]) {
+      const source = await f.record(`legacy-frequency-${status}`, {status});
+      const {endpoint} = await f.formalSuccess(source, {at: '2026-09-08T00:30:00Z'});
+      await pool.query(`INSERT INTO unattended_negative_patrol_state
+        (tenant_id,platform,external_id,record_id,first_eligible_at,last_eligible_at,last_success_at,
+          last_result_observation_id,cadence_days,next_due_date,stable_success_count)
+        VALUES ($1,$2,$3,$4,$5,$5,$5,$6,$7,'2026-09-15',$8)`,
+      [f.tenant.id, source.platform, source.external_id, source.id, endpoint.captured_at, endpoint.id, cadence, stable]);
+      sources.push(source);
+    }
+    const loaded = await withTransaction(tx => loadCandidates(tx, f.scope));
+    assert.deepEqual(new Set(loaded.candidates.map(row => row.recordId)), new Set(sources.map(row => row.id)));
+    assert.equal(loaded.summary.notDue, 0);
+    assert.ok(loaded.candidates.every(row => row.nextDueDate === null));
+    for (const source of sources) {
+      const claim = await withTransaction(tx => claimRotation(tx, {...f.scope, recordId: source.id,
+        itemId: randomUUID(), executionTaskId: randomUUID(), assignmentRevision: 1, now: FIXED_RUN}));
+      assert.equal(claim.claimed, true, `${source.title}: ${JSON.stringify(claim)}`);
+    }
   });
 
   await t.test('HTTP creation saves the negative switch, ordinary schedule edits retain it, and explicit disable removes it', async st => {
@@ -569,7 +644,7 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     });
     assert.equal(restored.status, 200, JSON.stringify(restored.body));
     await pool.query("INSERT INTO record_triage (tenant_id,record_id,status) VALUES ($1,$2,'reviewed_non_monitor')", [f.tenant.id, excluded.id]);
-    await pool.query('UPDATE records SET published_ts=$2 WHERE id=$1',
+    await pool.query('UPDATE records SET created_at=$2 WHERE id=$1',
       [expired.id, new Date(Date.parse(f.scope.windowStart) - 1).toISOString()]);
     assert.equal(await f.claim(), null);
     const saved = (await pool.query('SELECT * FROM capture_task_items WHERE task_id=$1 ORDER BY ordinal', [owner.id])).rows;
@@ -647,9 +722,10 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     }
   });
 
-  await t.test('the real HTTP run-now route materializes one mixed run idempotently and leaves an unchecked schedule keyword-only', async st => {
+  await t.test('the real HTTP run-now route queues a same-day successful post once per occurrence and leaves an unchecked schedule keyword-only', async st => {
     const f = await fixture(st, {runStartedAt: new Date().toISOString()});
     const source = await f.record('http-materialized-negative');
+    await f.formalSuccess(source, {at: new Date(Date.parse(f.scope.runStartedAt) - 60_000).toISOString()});
     const http = await authenticatedHttp(st, f);
     async function schedule(enabled) {
       const template = await f.parent({metadata: {orchestrationTemplate: true, executionMode: 'unattended_plan'}});
@@ -697,7 +773,8 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
       assert.equal(rolled.status, 'skipped');
       assert.equal(rolled.metadata.skipReason, 'next_run_rollover');
       assert.equal(rolled.attempt_count, 0);
-      assert.equal((await f.state(source)).last_success_at, null);
+      assert.equal((await f.state(source)).last_success_at, null,
+        'Materializing or rolling over a pending queue must not invent an unattended success');
       const nextItems = (await pool.query('SELECT * FROM capture_task_items WHERE task_id=$1 ORDER BY ordinal', [next.body.runTaskId])).rows;
       assert.deepEqual(nextItems.map(row => row.item_type), ['keyword', 'negative_post']);
       assert.equal(nextItems[1].record_id, source.id);

@@ -271,7 +271,7 @@ function TemplateCard({
         <span>{archived ? '归档前排期' : '下次运行'} <span className="text-foreground">{archived ? '已停止' : nextRun}</span></span>
         <span>分配版本 <span className="tabular-nums text-foreground">v{revision}</span></span>
       </div>
-      {hasUnattendedNegativePatrol(task.metadata?.planSnapshot) && <p className="mt-2 text-[11px] leading-5 text-muted-foreground">按发布时间滚动选取近 7 天负面内容，关键词优先，节点空闲接续；沿用现有处理状态。</p>}
+      {hasUnattendedNegativePatrol(task.metadata?.planSnapshot) && <p className="mt-2 text-[11px] leading-5 text-muted-foreground">每轮选取启动前 7 天首次采集入库的负面内容，窗口内每轮可查；关键词优先，节点空闲接续，保留现有处理状态。</p>}
       {archived && <p className="mt-2 text-[11px] leading-4 text-muted-foreground">历史批次、执行摘要和采集结果均保留；复制新建不会改变此归档计划。</p>}
     </div>
   )

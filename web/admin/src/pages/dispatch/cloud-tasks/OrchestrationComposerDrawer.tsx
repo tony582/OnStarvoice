@@ -1274,14 +1274,12 @@ export function OrchestrationComposerDrawer({
                             </Button>
                           </div>
                           {negativePreview && <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-                            <span>可巡查 <strong className="text-foreground">{safeCount(negativePreview.summary?.eligible)}</strong> 篇</span>
+                            <span>可巡查 <strong className="text-foreground">{safeCount(negativePreview.summary?.firstPending) + safeCount(negativePreview.summary?.due)}</strong> 篇</span>
                             <span>首次待巡 {safeCount(negativePreview.summary?.firstPending)}</span>
-                            <span>到期复查 {safeCount(negativePreview.summary?.due)}</span>
-                            <span>未到期 {safeCount(negativePreview.summary?.notDue)}</span>
-                            <span>冷却中 {safeCount(negativePreview.summary?.coolingDown)}</span>
+                            <span>本轮复查 {safeCount(negativePreview.summary?.due)}</span>
+                            <span>失败冷却中 {safeCount(negativePreview.summary?.coolingDown)}</span>
                             <span>需处理 {safeCount(negativePreview.summary?.needsAction)}</span>
                             <span>已排除 {safeCount(negativePreview.summary?.excluded)}</span>
-                            {safeCount(negativePreview.summary?.unknownPublishTime) > 0 && <span>发布时间缺失 {safeCount(negativePreview.summary?.unknownPublishTime)}</span>}
                             {safeCount(negativePreview.summary?.expiringUncovered) > 0 && <span className="text-status-orange">即将移出窗口且尚未覆盖 {safeCount(negativePreview.summary?.expiringUncovered)}</span>}
                           </div>}
                           {negativePreviewError && <p role="alert" className="mt-2 text-[11px] text-status-red">{negativePreviewError}</p>}
@@ -1830,7 +1828,7 @@ export function OrchestrationComposerDrawer({
                           {` · ${distributionMode === 'elastic_pool' ? '弹性节点池' : '固定分配'} · 每个关键词${sequentialSearchEnabled ? `按“${patrolPathLabel}”串行执行` : '执行 1 次'}`}
                         </span>
                       </div>
-                      {includeNegativePatrol && <div className="mt-1">负面巡查：近7天发布的负面内容；关键词优先，空闲接续，沿用处理状态。</div>}
+                      {includeNegativePatrol && <div className="mt-1">负面巡查：启动前7天首次采集入库的负面内容，每轮可查；关键词优先，空闲接续，保留处理状态。</div>}
                       <div className="mt-1">
                         下次运行：<span className="font-semibold text-foreground">{formatScheduleTime(nextScheduleRunAt)}</span>
                       </div>

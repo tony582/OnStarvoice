@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 import ts from 'typescript';
-import {hasUnattendedNegativePatrol, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable} from './unattendedNegativePatrol.mjs';
+import {hasUnattendedNegativePatrol, hasFirstCollectedNegativePatrolWindow, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable} from './unattendedNegativePatrol.mjs';
 
 const componentSource = readFileSync(new URL('./NegativePatrolScheduleOption.tsx', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(componentSource, {compilerOptions: {
@@ -45,12 +45,22 @@ test('negative patrol requires targeted capture plus a durable terminal receipt 
   }
 });
 
-test('checkbox renders the published-date window and continuation behavior, and forwards explicit changes', () => {
+test('historical runs retain their original window semantics unless first-collection scope is explicitly recorded', () => {
+  assert.equal(hasFirstCollectedNegativePatrolWindow(undefined), false);
+  assert.equal(hasFirstCollectedNegativePatrolWindow({windowStart: '2026-09-01T12:30:00.100Z', summary: {notDue: 14}}), false);
+  assert.equal(hasFirstCollectedNegativePatrolWindow({windowBasis: 'published_at'}), false);
+  assert.equal(hasFirstCollectedNegativePatrolWindow({windowBasis: 'first_collected_at', summary: {due: 14}}), true);
+});
+
+test('checkbox renders the first-collection window and every-run behavior, and forwards explicit changes', () => {
   const rendered = renderToStaticMarkup(React.createElement(Option, {checked: false, onChange() {}}));
   assert.match(rendered, /同时巡查近7天负面内容/);
-  assert.match(rendered, /帖子发布时间/);
+  assert.match(rendered, /启动前 7 天首次采集入库/);
+  assert.match(rendered, /复查不刷新起算时间/);
+  assert.match(rendered, /当天查过也可再次巡查/);
   assert.match(rendered, /关键词采集优先/);
-  assert.match(rendered, /沿用现有处理状态/);
+  assert.match(rendered, /保留现有处理状态/);
+  assert.doesNotMatch(rendered, /发布时间|未到期|复查间隔/);
   assert.doesNotMatch(rendered, /checked=""/);
   const disabled = renderToStaticMarkup(React.createElement(Option, {checked: true, disabled: true, onChange() {}}));
   assert.match(disabled, /checked=""/);

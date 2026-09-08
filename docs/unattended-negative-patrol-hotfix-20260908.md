@@ -1,5 +1,7 @@
 # 无人巡检附带近 7 天负面巡查
 
+> 2026-09-08 后续修正见 [7 天范围修正](unattended-negative-patrol-window-correction-20260908.md)：改按首次采集入库时间选取，取消全部复查间隔和当天成功跳过。下文记录初版实现及其当时的验证，发布时间与 1/3/7 天频率描述不再代表修正后的规则。
+
 分支：`codex/hotfix-unattended-negative-patrol-20260908`。
 
 基线：2026-09-08 只读核实生产 `v0.4.7 / fd74954427b9d83eec2e87429ad5e8e631562808`。`RELEASE_COMMIT`、发布清单、PM2 运行目录/入口，以及 capture-cloud、capture-resource-policy、capture-orchestration-scheduler、negative-patrol 四个实际服务文件哈希一致。独立 worktree 开发，原架构目录不变。

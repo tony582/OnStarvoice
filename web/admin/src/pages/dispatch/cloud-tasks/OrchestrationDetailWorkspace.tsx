@@ -1,4 +1,4 @@
-import { hasUnattendedNegativePatrol } from './unattendedNegativePatrol.mjs'
+import { hasUnattendedNegativePatrol, hasFirstCollectedNegativePatrolWindow } from './unattendedNegativePatrol.mjs'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
@@ -1219,6 +1219,7 @@ export function OrchestrationDetailWorkspace({
   const keywordItems = sortedItems.filter(item => item.item_type === 'keyword')
   const scheduledNegativeItems = sortedItems.filter(item => item.item_type === 'negative_post')
   const negativeRun = metadata.negativePatrolRun && typeof metadata.negativePatrolRun === 'object' ? metadata.negativePatrolRun as Record<string, unknown> : null
+  const legacyNegativePatrolRun = negativeRun !== null && !hasFirstCollectedNegativePatrolWindow(negativeRun)
   const negativeRunSummary = negativeRun?.summary && typeof negativeRun.summary === 'object' ? negativeRun.summary as Record<string, unknown> : {}
   const negativeCompleted = scheduledNegativeItems.filter(item => ['completed', 'completed_with_warnings'].includes(item.status)).length
   const negativeFailed = scheduledNegativeItems.filter(item => item.status === 'failed').length
@@ -1833,14 +1834,14 @@ export function OrchestrationDetailWorkspace({
         {unattendedNegativePatrol && (
           <section className="mb-4 rounded-xl border border-primary/20 bg-primary/[0.035] p-4" aria-label="附带负面巡查">
             <h3 className="text-sm font-semibold">同时巡查近7天负面内容</h3>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">每轮选取当前平台此前 7 天发布的负面内容；关键词采集优先，节点空闲后逐篇接续，沿用现有处理状态。</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">{legacyNegativePatrolRun ? '本轮按当时规则选取此前 7 天发布的负面内容，并按复查间隔筛选。' : '每轮选取启动前 7 天首次采集入库的负面内容，复查不刷新起算时间；窗口内每轮可查，当天查过也可再次巡查。'}关键词采集优先，节点空闲后逐篇接续，保留现有处理状态。</p>
             {!scheduleTemplate && <div className="mt-2 space-y-1 text-xs">
               <p>本轮关键词 <strong>{keywordItems.length}</strong> 项 · 负面巡查 <strong>{scheduledNegativeItems.length}</strong> 篇</p>
               <p className="text-muted-foreground">负面已完成 {negativeCompleted} · 失败 {negativeFailed} · 需人工 {negativeNeedsAction} · 跳过/取消 {negativeSkipped} · 其余等待或执行中 {scheduledNegativeItems.length - negativeCompleted - negativeFailed - negativeNeedsAction - negativeSkipped}</p>
               {negativeRun && <>
-                <p className="text-muted-foreground">入选窗口：{formatTime(String(negativeRun.windowStart || ''))} 至 {formatTime(String(negativeRun.windowEnd || ''))}</p>
-                <p className="text-muted-foreground">本轮启动时的候选状态：首次待查 {Number(negativeRunSummary.firstPending) || 0} · 已到期 {Number(negativeRunSummary.due) || 0} · 未到期 {Number(negativeRunSummary.notDue) || 0} · 冷却中 {Number(negativeRunSummary.coolingDown) || 0} · 已排除 {Number(negativeRunSummary.excluded) || 0}</p>
-                <p className="text-muted-foreground">发布时间缺失 {Number(negativeRunSummary.unknownPublishTime) || 0} · 即将出窗未查 {Number(negativeRunSummary.expiringUncovered) || 0} · 超窗未覆盖 {Number(negativeRunSummary.outOfWindowUncovered) || 0}</p>
+                <p className="text-muted-foreground">{legacyNegativePatrolRun ? '当时的发布时间窗口' : '首次采集入库窗口'}：{formatTime(String(negativeRun.windowStart || ''))} 至 {formatTime(String(negativeRun.windowEnd || ''))}</p>
+                <p className="text-muted-foreground">本轮启动时的候选状态：首次待查 {Number(negativeRunSummary.firstPending) || 0} · {legacyNegativePatrolRun ? '当时已到期' : '本轮复查'} {Number(negativeRunSummary.due) || 0}{legacyNegativePatrolRun && <> · 当时未到期 {Number(negativeRunSummary.notDue) || 0}</>} · 失败冷却中 {Number(negativeRunSummary.coolingDown) || 0} · 已排除 {Number(negativeRunSummary.excluded) || 0}</p>
+                <p className="text-muted-foreground">{legacyNegativePatrolRun && <>当时发布时间缺失 {Number(negativeRunSummary.unknownPublishTime) || 0} · </>}即将出窗未查 {Number(negativeRunSummary.expiringUncovered) || 0} · 超窗未覆盖 {Number(negativeRunSummary.outOfWindowUncovered) || 0}</p>
                 <p className="text-[11px] text-muted-foreground">入选候选不代表已完成巡查；本轮执行结果以上方工作项状态为准。</p>
               </>}
             </div>}
@@ -1943,15 +1944,15 @@ export function OrchestrationDetailWorkspace({
                   <p className="mt-1 text-[11px] text-muted-foreground">逐篇展示执行状态；帖子处理状态继续保留在内容工作台。</p>
                 </div>
                 {scheduledNegativeItems.length === 0
-                  ? <p className="px-4 py-6 text-xs text-muted-foreground">{negativeRun ? '本轮没有可执行的负面巡查工作项；未到期、冷却中或已排除的内容不重复采集。' : '本轮尚无负面巡查工作项；候选清单在运行时生成。'}</p>
+                  ? <p className="px-4 py-6 text-xs text-muted-foreground">{negativeRun ? (legacyNegativePatrolRun ? '本轮没有可执行的负面巡查工作项；按当时规则，未到期、失败冷却中或已排除的内容未入队。' : '本轮没有可执行的负面巡查工作项，请查看上方候选范围及异常状态。') : '本轮尚无负面巡查工作项；候选清单在运行时生成。'}</p>
                   : <div className="divide-y divide-border/70">{scheduledNegativeItems.map(item => {
                     const assignedAgent = agentsById.get(itemAssignedAgentId(item, executions, attempts))
                     const errorMessage = dataMessage(item.error)
                     const lastSuccessAt = String(item.metadata?.lastSuccessAt || '')
-                    const nextDueDate = String(item.metadata?.nextDueDate || '')
+                    const nextDueDate = legacyNegativePatrolRun ? String(item.metadata?.nextDueDate || '') : ''
                     const skipReason = String(item.metadata?.skipReason || '')
                     const skipLabel = skipReason === 'next_run_rollover' ? '留待下一轮'
-                      : skipReason === 'not_due' ? '已覆盖，未到复查日期'
+                      : skipReason === 'not_due' && legacyNegativePatrolRun ? '按当时规则：已覆盖，未到复查日期'
                         : skipReason.startsWith('triage_') ? '当前处理状态已排除'
                           : skipReason ? '本轮未执行，已跳过' : ''
                     return <article key={item.id} className="px-4 py-3">
@@ -1960,7 +1961,7 @@ export function OrchestrationDetailWorkspace({
                         <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusTone(item.status)}`}>{itemAvailabilityLabel(item) || statusLabel(item.status)}</span>
                       </div>
                       <p className="mt-1 text-[11px] text-muted-foreground">{PLATFORM_LABELS[item.platform] || item.platform} · {agentName(assignedAgent)} · 更新 {formatTime(item.updated_at)}</p>
-                      <p className="mt-1 text-[11px] text-muted-foreground">最近成功：{lastSuccessAt ? formatTime(lastSuccessAt) : '尚无成功巡查记录'}{nextDueDate ? ` · 下次复查：${nextDueDate.slice(0, 10)}` : ''}</p>
+                      <p className="mt-1 text-[11px] text-muted-foreground">最近成功：{lastSuccessAt ? formatTime(lastSuccessAt) : '尚无成功巡查记录'}{nextDueDate ? ` · 当时预计下次复查：${nextDueDate.slice(0, 10)}` : ''}</p>
                       {skipLabel && <p className="mt-1 text-[11px] text-muted-foreground">{skipLabel}</p>}
                       {errorMessage && <p className="mt-1 text-[11px] text-status-red">{errorMessage}</p>}
                     </article>

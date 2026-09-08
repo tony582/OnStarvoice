@@ -51,7 +51,7 @@ export function normalizeUnattendedNegativePatrolScope(input = {}) {
     tenantId, platforms: [...new Set(platforms)], keywords: strings(input.keywords),
     keywordIds, timezone, runStartedAt: end.toISOString(),
     windowStart: new Date(end.getTime() - 7 * DAY_MS).toISOString(),
-    windowEnd: end.toISOString(), lookbackDays: 7,
+    windowEnd: end.toISOString(), lookbackDays: 7, windowBasis: 'first_collected_at',
   };
 }
 
@@ -61,10 +61,6 @@ export function negativePatrolCalendarDate(value, timezone = 'Asia/Shanghai') {
   }).formatToParts(instant(value, 'date'));
   const fields = Object.fromEntries(parts.map(part => [part.type, part.value]));
   return `${fields.year}-${fields.month}-${fields.day}`;
-}
-
-function addCalendarDays(date, days) {
-  return new Date(Date.parse(`${date}T00:00:00Z`) + days * DAY_MS).toISOString().slice(0, 10);
 }
 
 function override(record, key) {
@@ -99,15 +95,6 @@ export function unattendedNegativePatrolTargetUrl(record = {}) {
   return `https://www.douyin.com/${['image', 'images', 'note', '图文'].includes(lower(record.note_type)) ? 'note' : 'video'}/${encodeURIComponent(externalId)}`;
 }
 
-export function unattendedNegativePatrolCadence(record = {}, state = {}) {
-  if (['high', 'urgent'].includes(lower(record.triage_priority || record.priority))) return 1;
-  const status = lower(record.triage_status || 'unhandled');
-  if (['replied', 'negative_feishu', 'official_responded'].includes(status)) return 3;
-  if (['reviewed', 'negative_cold'].includes(status)
-    && Number(state.stable_success_count || 0) > 0) return 7;
-  return 1;
-}
-
 export function negativePatrolEffectiveRotationState(state = {}, record = {}) {
   const formalAt = record.latest_formal_success_at;
   if (!formalAt || (state.last_success_at
@@ -124,13 +111,14 @@ export function evaluateUnattendedNegativePatrolRecord(record, scopeInput, state
   const fail = reason => ({eligible: false, due: false, reason});
   if (text(record.tenant_id) !== scope.tenantId) return fail('tenant_mismatch');
   if (!scope.platforms.includes(lower(record.platform))) return fail('platform_out_of_scope');
-  if (!(timestamp(record.created_at) < timestamp(scope.windowEnd))) return fail('discovered_this_run');
+  // created_at is set at first insert; repeat captures only advance last_seen_at
+  // and updated_at. Publication dates and later observations never renew scope.
+  const firstCollectedAt = timestamp(record.created_at);
+  if (!(firstCollectedAt < timestamp(scope.windowEnd))) return fail('discovered_this_run');
+  if (firstCollectedAt < timestamp(scope.windowStart)) return fail('outside_window');
   const sentiment = override(record, 'sentiment');
   if (sentiment.present && !['negative', 'neutral', 'positive'].includes(sentiment.value)) return fail('manual_sentiment_invalid');
   if ((sentiment.present ? sentiment.value : lower(record.sentiment)) !== 'negative') return fail('not_negative');
-  const publishedAt = timestamp(record.published_ts);
-  if (!text(record.publish_time) || !Number.isFinite(publishedAt)) return fail('publish_time_unknown');
-  if (publishedAt < timestamp(scope.windowStart) || publishedAt >= timestamp(scope.windowEnd)) return fail('outside_window');
   if (['official_content', 'blogger_profile'].includes(record.record_type)) return fail('official_content');
   if (record.archived_at) return fail('archived');
   if (EXCLUDED_TRIAGE.has(lower(record.triage_status))) return fail(`triage_${lower(record.triage_status)}`);
@@ -147,19 +135,15 @@ export function evaluateUnattendedNegativePatrolRecord(record, scopeInput, state
     || lower(object(record.ai_result).relevance) === 'irrelevant')) return fail('business_ineligible');
   const url = unattendedNegativePatrolTargetUrl(record);
   if (!url) return fail('source_unresolvable');
-  const cadenceDays = unattendedNegativePatrolCadence(record, state);
   const lastSuccessAt = state.last_success_at || null;
-  const nextDueDate = lastSuccessAt
-    ? addCalendarDays(negativePatrolCalendarDate(lastSuccessAt, scope.timezone), cadenceDays) : null;
-  const currentDate = negativePatrolCalendarDate(checkedAt, scope.timezone);
-  const dateDue = !nextDueDate || currentDate >= nextDueDate;
   const cooldown = state.cooldown_until && timestamp(state.cooldown_until) > checkedAt.getTime();
-  const due = dateDue && !cooldown && !state.needs_action;
+  const due = !cooldown && !state.needs_action;
   return {
-    eligible: true, due, url, cadenceDays, nextDueDate, lastSuccessAt,
+    // Keep legacy response/storage fields compatible without a calendar gate.
+    eligible: true, due, url, cadenceDays: 1, nextDueDate: null, lastSuccessAt,
     sharedResultObservationId: record.latest_formal_observation_id || null,
     reason: state.needs_action ? 'needs_action' : cooldown ? 'cooldown'
-      : !dateDue ? 'not_due' : lastSuccessAt ? 'due' : 'first_patrol',
+      : lastSuccessAt ? 'due' : 'first_patrol',
   };
 }
 
@@ -238,10 +222,9 @@ function recordSelectSql({single = false} = {}) {
     AND r.created_at < $3::timestamptz
     AND ${KEYWORD_SCOPE_SQL}
     ${single ? 'AND r.id = $6::uuid AND $4::timestamptz IS NOT NULL' : `AND ${EFFECTIVE_NEGATIVE_SQL}
-      AND r.published_ts IS NOT NULL AND NULLIF(BTRIM(r.publish_time), '') IS NOT NULL
-      AND ((r.published_ts >= $4::timestamptz AND r.published_ts < $3::timestamptz)
+      AND ((r.created_at >= $4::timestamptz AND r.created_at < $3::timestamptz)
         OR (state.first_eligible_at IS NOT NULL AND state.last_success_at IS NULL))`}
-  ORDER BY r.platform, r.published_ts ASC NULLS LAST, r.id
+  ORDER BY r.platform, r.created_at ASC, r.id
   ${single ? 'FOR SHARE OF r' : ''}`;
 }
 
@@ -256,6 +239,7 @@ function publicCandidate(row, qualification) {
   return {
     id: row.id, recordId: row.id, platform: row.platform, externalId: row.external_id,
     url: qualification.url, title: row.title, publishedAt: row.published_ts,
+    firstCollectedAt: row.created_at,
     noteType: row.note_type, keyword: row.keyword, dueReason: qualification.reason,
     cadenceDays: qualification.cadenceDays, nextDueDate: qualification.nextDueDate,
     lastSuccessAt: qualification.lastSuccessAt,
@@ -290,17 +274,6 @@ export async function loadUnattendedNegativePatrolCandidates(tx, input = {}) {
     expiringUncovered: 0, outOfWindowUncovered: 0, platforms: {}, exclusionReasons: {}};
   const candidates = [];
   if (!keywords.length) return {...scope, candidates, summary};
-  // Unknown publication dates cannot be assigned to the seven-day window.
-  // Count them separately without materializing historical payloads or running
-  // per-record baseline/formal-result joins on that unbounded history.
-  const unknown = await tx.queryOne(`SELECT COUNT(*) AS total FROM records r
-    WHERE r.tenant_id = $1 AND r.platform = ANY($2::text[])
-      AND r.created_at < $3::timestamptz AND $4::timestamptz IS NOT NULL
-      AND ${EFFECTIVE_NEGATIVE_SQL} AND ${KEYWORD_SCOPE_SQL}
-      AND (r.published_ts IS NULL OR NULLIF(BTRIM(r.publish_time), '') IS NULL)`,
-  [scope.tenantId, scope.platforms, scope.windowEnd, scope.windowStart, keywords]);
-  summary.unknownPublishTime = Number(unknown?.total || 0);
-  if (summary.unknownPublishTime) summary.exclusionReasons.publish_time_unknown = summary.unknownPublishTime;
   const rows = await tx.queryAll(recordSelectSql(), [scope.tenantId, scope.platforms,
     scope.windowEnd, scope.windowStart, keywords]);
   for (const row of rows) {
@@ -314,16 +287,14 @@ export async function loadUnattendedNegativePatrolCandidates(tx, input = {}) {
           SET last_withdrawal_reason = 'window_expired_uncovered', last_withdrawal_at = $4, updated_at = now()
           WHERE tenant_id = $1 AND platform = $2 AND external_id = $3`,
         [scope.tenantId, row.platform, row.external_id, scope.runStartedAt]);
-      } else if (result.reason === 'publish_time_unknown') summary.unknownPublishTime++;
-      else summary.excluded++;
+      } else summary.excluded++;
       summary.exclusionReasons[result.reason] = (summary.exclusionReasons[result.reason] || 0) + 1;
       continue;
     }
     summary.eligible++;
     summary.platforms[row.platform] = (summary.platforms[row.platform] || 0) + 1;
-    if (!rotationState.last_success_at && timestamp(row.published_ts) < timestamp(scope.windowStart) + DAY_MS) summary.expiringUncovered++;
-    if (result.reason === 'not_due') summary.notDue++;
-    else if (result.reason === 'cooldown') summary.coolingDown++;
+    if (!rotationState.last_success_at && timestamp(row.created_at) < timestamp(scope.windowStart) + DAY_MS) summary.expiringUncovered++;
+    if (result.reason === 'cooldown') summary.coolingDown++;
     else if (result.reason === 'needs_action') summary.needsAction++;
     else if (result.reason === 'first_patrol') summary.firstPending++;
     else if (result.reason === 'due') summary.due++;
@@ -332,7 +303,7 @@ export async function loadUnattendedNegativePatrolCandidates(tx, input = {}) {
   }
   candidates.sort((a, b) => a.platform.localeCompare(b.platform)
     || Number(Boolean(a.lastSuccessAt)) - Number(Boolean(b.lastSuccessAt))
-    || timestamp(a.lastSuccessAt || a.publishedAt) - timestamp(b.lastSuccessAt || b.publishedAt)
+    || timestamp(a.lastSuccessAt || a.firstCollectedAt) - timestamp(b.lastSuccessAt || b.firstCollectedAt)
     || a.recordId.localeCompare(b.recordId));
   return {...scope, candidates, summary};
 }
@@ -482,8 +453,10 @@ export async function completeUnattendedNegativePatrolItem(tx, input = {}) {
   {id: result.observation_id, likes: result.likes, comments_count: result.comments_count,
     collects: result.collects, shares: result.shares});
   const stableSuccessCount = stable ? Number(state.stable_success_count || 0) + 1 : 0;
-  const cadenceDays = unattendedNegativePatrolCadence(result, {stable_success_count: stableSuccessCount});
-  const nextDueDate = addCalendarDays(negativePatrolCalendarDate(succeededAt, input.timezone), cadenceDays);
+  // The existing schema restricts cadence_days to 1/3/7. Use 1 solely as its
+  // compatibility value; successful patrols never set a future eligibility date.
+  const cadenceDays = 1;
+  const nextDueDate = null;
   await tx.execute(`UPDATE unattended_negative_patrol_state SET last_success_at = $4,
     last_success_item_id = $5, last_result_observation_id = $6, next_due_date = $7,
     cadence_days = $8, stable_success_count = $9, failure_count = 0, cooldown_until = NULL,

@@ -2,6 +2,10 @@ export function hasUnattendedNegativePatrol(planSnapshot) {
   return planSnapshot?.negativePatrol?.enabled === true;
 }
 
+export function hasFirstCollectedNegativePatrolWindow(run) {
+  return run?.windowBasis === 'first_collected_at';
+}
+
 export function unattendedNegativePatrolRequest(enabled, executionMode) {
   return enabled === true && executionMode === 'unattended_plan'
     ? {negativePatrol: {enabled: true, lookbackDays: 7}}
