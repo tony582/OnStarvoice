@@ -40,6 +40,7 @@ export const LEGACY_PAGE_MAP: Record<string, { page: string; params?: PageParams
   'official-accounts': { page: 'official-comments' },
   analytics: { page: 'insights', params: { tab: 'dashboard' } },
   reports: { page: 'insights', params: { tab: 'reports' } },
+  'customer-daily-reports': { page: 'insights', params: { tab: 'daily' } },
 }
 
 export function normalizePage(page: string, params?: PageParams): { page: string; params: PageParams | null } {

@@ -133,7 +133,7 @@ test('one-day observations never substitute task deltas, carry-forward values, n
   const report = await collectCustomerDailyReport({...opts, db: fakeDb({heatPosts: [record(1)], observations: [incomplete, midnight, old]})});
   assert.equal(report.highHeat[0].heat, 500);
   assert.equal(report.highHeat[0].stale, true);
-  assert.equal(report.highHeat[0].comparisonText, '');
+  assert.equal(report.highHeat[0].comparisonText, '暂无本日数据');
   assert.equal(report.highHeat[0].previousHeat, null);
 });
 
@@ -154,13 +154,42 @@ test('observation quality permits explicit legacy totals but never legacy percen
   assert.equal(assessCustomerDailyObservation(mismatched).heat, null);
 });
 
+test('legacy and unverified measurement times retain heat but show a brief comparison placeholder', async () => {
+  const legacy = observation(1, 320, d(7), {payload: {syncType: 'single_note', likes: 290, comments: 10, collects: 10, shares: 10}});
+  const unverifiedTime = observation(2, 320, d(7));
+  unverifiedTime.payload.customerDailyMetricEvidence.observedAt = null;
+  unverifiedTime.payload.customerDailyMetricEvidence.timeSource = 'ingested_at';
+  const report = await collectCustomerDailyReport({...opts, db: fakeDb({heatPosts: [record(1), record(2)],
+    observations: [legacy, unverifiedTime, observation(1, 300, d(6)), observation(2, 300, d(6))]})});
+  assert.deepEqual(report.highHeat.map(post => post.heat), [320, 320]);
+  assert.deepEqual(new Set(report.highHeat.map(post => post.quality)), new Set(['legacy_unverified', 'measured_ingestion_time']));
+  for (const post of report.highHeat) {
+    assert.equal(post.comparisonText, '暂无可比数据');
+    assert.equal(post.previousHeat, null);
+    assert.equal(post.previousObservedAt, null);
+  }
+});
+
+test('a fully measured decrease remains negative while a later guarded correction cannot replace it', async () => {
+  const previous = observation(1, 500, d(6), {id: ID(600)});
+  const measured = observation(1, 450, d(7, '10:00:00'), {id: ID(700)});
+  const guarded = observation(1, 30, d(7, '12:00:00'), {id: ID(701)});
+  guarded.payload.customerDailyMetricEvidence.allMeasured = false;
+  guarded.payload.customerDailyMetricEvidence.metrics.comments_count = {value:null, measured:false, reason:'preserved'};
+  const report = await collectCustomerDailyReport({...opts, db: fakeDb({heatPosts: [record(1)], observations: [guarded, measured, previous]})});
+  assert.equal(report.highHeat[0].heat, 450);
+  assert.equal(report.highHeat[0].comparisonText, '↓10%');
+  assert.equal(report.highHeat[0].previousHeat, 500);
+  assert.equal(report.highHeat[0].observationId, measured.id);
+});
+
 test('observation timestamp rather than upload day governs day comparison', async () => {
   const delayed = observation(1, 320, d(7));
   delayed.payload.customerDailyMetricEvidence.observedAt = d(6);
   const report = await collectCustomerDailyReport({...opts, db: fakeDb({heatPosts: [record(1)], observations: [delayed]})});
   assert.equal(report.highHeat[0].stale, true);
   assert.equal(report.highHeat[0].observedAt, new Date(d(6)).toISOString());
-  assert.equal(report.highHeat[0].comparisonText, '');
+  assert.equal(report.highHeat[0].comparisonText, '暂无本日数据');
 });
 
 test('cold parser accepts true single and batch transitions; same state and missing prior state are not new', () => {
@@ -190,7 +219,7 @@ test('zero records is a report; unknown historical audit coverage never claims c
   assert.equal(report.summary.day.monitor, 0);
   assert.equal(report.summary.day.inProgress, null);
   assert.equal(report.evidence.cold.coverageComplete, false);
-  assert.ok(renderCustomerDailyReportText(report).includes('暂未检出，历史标记记录不完整'));
+  assert.ok(renderCustomerDailyReportText(report).includes('暂未检出。'));
   assert.ok(!renderCustomerDailyReportText(report).includes('当日无新增冷处理负面帖子'));
   const complete = await collectCustomerDailyReport({...opts, db: fakeDb()});
   assert.ok(renderCustomerDailyReportText(complete).includes('当日无新增冷处理负面帖子'));
@@ -229,22 +258,22 @@ test('HTML, copy text and editable workbook preserve counts, all links, blanks a
   assert.ok(html.includes('&lt;script&gt;')); assert.ok(!html.includes('<script>'));
   assert.ok(html.includes('TOP4')); assert.ok(copied.includes('TOP4'));
   assert.ok(copied.includes('9月7日\t4\t4\t0\t0\t4\t\t'));
-  assert.ok(copied.includes('复核及冷处理状态截至2026-09-08 11:00'));
+  assert.doesNotMatch(copied, /复核及冷处理状态截至|观测质量|数据说明/);
   for (const row of rows) { assert.ok(copied.includes(row.url)); assert.ok(html.includes(row.url)); }
   const workbook = buildCustomerDailyReportWorkbook(report);
   assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '新增冷处理']);
   const summary = workbook.getWorksheet('日报');
-  assert.equal(summary.getCell('B8').value, 4);
-  for (const cell of ['G8', 'H8', 'G9', 'H9']) assert.equal(summary.getCell(cell).value, null);
-  assert.equal(summary.getCell('F6').value, '负面');
-  assert.ok(summary.getCell('H6').isMerged);
-  assert.equal(workbook.getWorksheet('高热负面').getCell('B6').value.text, injectedTitle);
-  assert.equal(workbook.getWorksheet('高热负面').getCell('B6').value.formula, undefined);
-  assert.equal(workbook.getWorksheet('高热负面').getCell('H9').value.hyperlink, rows[3].url);
-  assert.equal(workbook.getWorksheet('新增冷处理').getCell('E9').value.hyperlink, rows[3].url);
+  assert.equal(summary.getCell('B6').value, 4);
+  for (const cell of ['G6', 'H6', 'G7', 'H7']) assert.equal(summary.getCell(cell).value, null);
+  assert.equal(summary.getCell('F4').value, '负面');
+  assert.ok(summary.getCell('H4').isMerged);
+  assert.equal(workbook.getWorksheet('高热负面').getCell('B5').value.text, injectedTitle);
+  assert.equal(workbook.getWorksheet('高热负面').getCell('B5').value.formula, undefined);
+  assert.equal(workbook.getWorksheet('高热负面').getCell('B8').value.hyperlink, rows[3].url);
+  assert.equal(workbook.getWorksheet('新增冷处理').getCell('B8').value.hyperlink, rows[3].url);
   const buffer = await workbook.xlsx.writeBuffer();
   const roundTrip = new workbook.constructor(); await roundTrip.xlsx.load(buffer);
-  assert.equal(roundTrip.getWorksheet('日报').getCell('B8').value, 4);
-  assert.equal(roundTrip.getWorksheet('日报').getCell('G8').value, null);
-  assert.equal(roundTrip.getWorksheet('高热负面').getCell('B6').value.text, injectedTitle);
+  assert.equal(roundTrip.getWorksheet('日报').getCell('B6').value, 4);
+  assert.equal(roundTrip.getWorksheet('日报').getCell('G6').value, null);
+  assert.equal(roundTrip.getWorksheet('高热负面').getCell('B5').value.text, injectedTitle);
 });

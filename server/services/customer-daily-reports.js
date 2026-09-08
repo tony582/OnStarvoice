@@ -14,6 +14,46 @@ const safeFailure = error => {
   return error?.ambiguous ? '飞书操作结果尚未确认，已停止自动重试。请核对目标文档或群消息后处理。' : '日报交付暂未完成，请检查飞书应用、目录、编辑权限和群配置。';
 };
 
+const SUMMARY_FIELDS = ['monitor','sdb','positive','neutral','cold','inProgress','processed'];
+const SUMMARY_PERIODS = ['day','mtd'];
+const summarySignature = summary => JSON.stringify(SUMMARY_PERIODS.map(period => SUMMARY_FIELDS.map(field => summary[period][field])));
+
+export function mergeCustomerDailySummary(current, patch) {
+  const object = value => value && typeof value === 'object' && !Array.isArray(value);
+  if (!object(patch) || !Object.keys(patch).length || Object.keys(patch).some(key => !SUMMARY_PERIODS.includes(key))) throw dailyError('请提交当日或月累计监控汇总。',400,'daily_summary_invalid');
+  if (!SUMMARY_PERIODS.every(period => object(current?.[period]))) throw dailyError('原日报汇总不可编辑，请重新生成日报。',409,'daily_summary_invalid');
+  const next = structuredClone(current);
+  let changedFields = 0;
+  for (const period of SUMMARY_PERIODS) {
+    if (Object.hasOwn(patch,period)) {
+      const values = patch[period];
+      if (!object(values) || Object.keys(values).some(field => !SUMMARY_FIELDS.includes(field))) throw dailyError('只能编辑监控汇总中的数量，不能修改日期或系统分类。',400,'daily_summary_invalid');
+      for (const [field,value] of Object.entries(values)) {
+        if (value !== null || !['inProgress','processed'].includes(field)) {
+          if (!Number.isSafeInteger(value) || value < 0) throw dailyError('汇总数量须为非负整数；处理中、已处理可留空。',400,'daily_summary_invalid');
+        }
+        next[period][field] = value;
+        changedFields++;
+      }
+    }
+    const row = next[period];
+    for (const field of SUMMARY_FIELDS) {
+      if (['inProgress','processed'].includes(field) && row[field] == null) row[field] = null;
+      else if (!Number.isSafeInteger(row[field]) || row[field] < 0) throw dailyError('原汇总数量格式无法核实，请重新生成日报。',409,'daily_summary_invalid');
+    }
+    if (row.sdb > row.monitor) throw dailyError('SDB范畴不能大于监控数量。',400,'daily_summary_invalid');
+    // Keep room for unclassified posts. Stored AI-negative totals are not a manual-edit ceiling.
+    let available = row.sdb;
+    for (const field of ['positive','neutral','cold','inProgress','processed']) {
+      if ((row[field] ?? 0) > available) throw dailyError('正向、中性和负面处理数量合计不能大于SDB范畴。',400,'daily_summary_invalid');
+      available -= row[field] ?? 0;
+    }
+  }
+  if (!changedFields) throw dailyError('请至少填写一个要保存的汇总数量。',400,'daily_summary_invalid');
+  for (const field of SUMMARY_FIELDS) if (next.day[field] !== null && next.mtd[field] !== null && next.day[field] > next.mtd[field]) throw dailyError('月累计数量不能小于当日对应数量。',400,'daily_summary_invalid');
+  return next;
+}
+
 export function createCustomerDailyReportService({db = defaultDb, collect = collectCustomerDailyReport, clientFactory = createFeishuDailyClient, now = () => new Date(), env = process.env} = {}) {
   async function rawConfig(tenantId) {
     return (await db.queryOne('SELECT config FROM customer_daily_report_settings WHERE tenant_id=$1', [tenantId]))?.config || {...DAILY_DEFAULTS};
@@ -107,8 +147,42 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
       }
     }
   }
+  async function saveSummary(tenantId,id,{summary:patch,requestId = randomUUID()} = {},actor = {}) {
+    if (typeof requestId !== 'string' || !/^[a-zA-Z0-9:_-]{1,160}$/.test(requestId)) throw dailyError('保存请求标识无效');
+    const source = await db.queryOne('SELECT snapshot,mode,report_date::text AS report_date FROM customer_daily_reports WHERE tenant_id=$1 AND id=$2',[tenantId,id]);
+    if (!source) throw dailyError('日报不存在',404);
+    const summary = mergeCustomerDailySummary(source.snapshot.summary,patch);
+    const savedAt = now().toISOString();
+    const requestKey = `summary:${requestId}`;
+    for (let retry = 0; retry < 3; retry++) {
+      try {
+        const savedId = await db.withTransaction(async tx => {
+          await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`customer-daily:${tenantId}:${source.report_date}`]);
+          const previous = await tx.queryOne('SELECT id,snapshot FROM customer_daily_reports WHERE tenant_id=$1 AND request_key=$2',[tenantId,requestKey]);
+          if (previous) {
+            if (previous.snapshot.summaryEdit?.sourceReportId !== id || summarySignature(previous.snapshot.summary) !== summarySignature(summary)) throw dailyError('同一保存请求不能用于不同的日报或修改内容。',409,'daily_summary_request_conflict');
+            return previous.id;
+          }
+          const latest = await tx.queryOne('SELECT id FROM customer_daily_reports WHERE tenant_id=$1 AND report_date=$2 ORDER BY version DESC LIMIT 1',[tenantId,source.report_date]);
+          if (latest?.id !== id) throw dailyError('日报已更新，请刷新后再编辑。',409,'daily_summary_stale');
+          const version = Number((await tx.queryOne('SELECT COALESCE(MAX(version),0)+1 AS version FROM customer_daily_reports WHERE tenant_id=$1 AND report_date=$2',[tenantId,source.report_date])).version);
+          const reportId = randomUUID();
+          const frozen = {...structuredClone(source.snapshot),id:reportId,version,summary,
+            systemSummary:structuredClone(source.snapshot.systemSummary || source.snapshot.summary),summaryEdited:true,
+            summaryEditedAt:savedAt,summaryEdit:{sourceReportId:id,actorId:actor?.id || null,editedAt:savedAt}};
+          await tx.execute('INSERT INTO customer_daily_reports (id,tenant_id,report_date,mode,version,request_key,snapshot,generated_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)',
+            [reportId,tenantId,source.report_date,source.mode,version,requestKey,JSON.stringify(frozen),savedAt]);
+          return reportId;
+        },{category:'reporting',isolationLevel:'repeatable_read',statementTimeoutMs:15000,lockTimeoutMs:1000,jitOff:true});
+        return report(tenantId,savedId);
+      } catch (error) {
+        if (retry < 2 && ['40001','23505','55P03'].includes(error.code)) continue;
+        throw error;
+      }
+    }
+  }
   async function enqueue(tenantId,id,{send = false,allowIncomplete = false,correction = false,automatic = false,config: explicitConfig} = {}) {
-    const row = await db.queryOne('SELECT snapshot,mode,report_date::text AS report_date FROM customer_daily_reports WHERE tenant_id=$1 AND id=$2', [tenantId,id]);
+    const row = await db.queryOne('SELECT snapshot,mode,version,report_date::text AS report_date FROM customer_daily_reports WHERE tenant_id=$1 AND id=$2', [tenantId,id]);
     if (!row) throw dailyError('日报不存在',404);
     const config = explicitConfig || await rawConfig(tenantId);
     validateDailyConfig(config,{send});
@@ -120,13 +194,24 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
         const current = await tx.queryOne('SELECT config FROM customer_daily_report_settings WHERE tenant_id=$1 FOR UPDATE',[tenantId]);
         if (current?.config.autoEnabled !== true) throw dailyError('自动发送已关闭',409,'daily_auto_disabled');
       }
+      // Match settings' document-before-delivery lock order. Delivery row locks also
+      // serialize replacement with the worker's FOR UPDATE SKIP LOCKED claim.
+      const document = await tx.queryOne('SELECT * FROM customer_daily_documents WHERE tenant_id=$1 AND report_id=$2 FOR UPDATE',[tenantId,id]);
       if (send && row.mode === 'formal') {
         await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`daily-delivery:${tenantId}:${row.report_date}:${targetKey}`]);
-        const existing = await tx.queryOne(`SELECT d.report_id,d.status FROM customer_daily_deliveries d JOIN customer_daily_reports r ON r.tenant_id=d.tenant_id AND r.id=d.report_id
-          WHERE d.tenant_id=$1 AND r.report_date=$2 AND r.mode='formal' AND d.target_key=$3 AND (d.status<>'canceled' OR d.ambiguous) ORDER BY r.version DESC LIMIT 1`,[tenantId,row.report_date,targetKey]);
-        if (existing && existing.report_id !== id && (!correction || existing.status !== 'sent')) return existing.report_id;
+        const deliveries = await tx.queryAll(`SELECT d.id,d.report_id,d.status,d.ambiguous,r.version FROM customer_daily_deliveries d JOIN customer_daily_reports r ON r.tenant_id=d.tenant_id AND r.id=d.report_id
+          WHERE d.tenant_id=$1 AND r.report_date=$2 AND r.mode='formal' AND d.target_key=$3 AND (d.status<>'canceled' OR d.ambiguous) ORDER BY r.version DESC FOR UPDATE OF d`,[tenantId,row.report_date,targetKey]);
+        const existing = deliveries[0];
+        if (existing && existing.report_id !== id) {
+          // An automatic collection must not displace an explicit manual delivery.
+          // Only a newer saved customer summary can replace its unsent predecessor.
+          if (automatic && (!row.snapshot.summaryEdited || row.version <= existing.version)) return existing.report_id;
+          if (deliveries.some(item => item.ambiguous || item.status === 'working')) throw dailyError('同日旧版正在发送或发送结果待核实，请先核对群消息，再发送新版。',409,'daily_delivery_in_flight');
+          if (row.version <= existing.version) throw dailyError('同日已有更新版本待发送，请刷新后选择最新版本。',409,'daily_delivery_stale');
+          if (deliveries.some(item => item.status === 'sent') && (automatic || !correction)) throw dailyError('同日日报已经发送，请明确选择发送更正版。',409,'daily_delivery_correction_required');
+          await tx.execute("UPDATE customer_daily_deliveries SET status='canceled',error_message='已由更新版本替代。',updated_at=now() WHERE tenant_id=$1 AND id=ANY($2::uuid[]) AND status IN ('queued','retry_wait','needs_attention') AND NOT ambiguous",[tenantId,deliveries.filter(item => item.report_id !== id).map(item => item.id)]);
+        }
       }
-      const document = await tx.queryOne('SELECT * FROM customer_daily_documents WHERE tenant_id=$1 AND report_id=$2 FOR UPDATE',[tenantId,id]);
       if (document && ['appId','editorType','editorId'].some(key => document.config[key] !== config[key])) {
         throw dailyError('这份文档的应用或客户编辑者与当前配置不同。请保留原文档，按新配置生成新版后交付。',409,'daily_document_owner_changed');
       }
@@ -203,7 +288,12 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
       // Read permissions again immediately before each delivery; a prior success is not perpetual access.
       await documentClient.ensureEditable({documentId:data.document_id,progress:data.progress?.permissions,verifyOnly:true});
       const client = clientFactory(await executionConfig(row.config,row.tenant_id));
-      const result = await client.sendReport({documentUrl:data.document_url,snapshot:data.snapshot,uuid:row.id});
+      const result = await client.sendReport({documentUrl:data.document_url,snapshot:data.snapshot,uuid:row.id,
+        summaryImageProgress:data.progress?.summaryImage,
+        onSummaryImageProgress:async progress => {
+          const saved=await db.queryOne("UPDATE customer_daily_documents SET progress=jsonb_set(COALESCE(progress,'{}'::jsonb),'{summaryImage}',$4::jsonb),updated_at=now() WHERE tenant_id=$1 AND report_id=$2 AND document_id=$3 RETURNING report_id",[row.tenant_id,row.report_id,data.document_id,JSON.stringify(progress)]);
+          if (!saved) throw dailyError('日报图片进度保存失败');
+        }});
       await db.execute("UPDATE customer_daily_deliveries SET status='sent',message_id=$3,sent_at=now(),error_message=NULL,claim_token=NULL,claimed_at=NULL,updated_at=now() WHERE id=$1 AND claim_token=$2",[row.id,row.claim_token,result.messageId]);
     } catch (error) {
       if (!error.safeMessage && !error.code?.startsWith('daily_')) error.ambiguous = true;
@@ -228,12 +318,16 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     for (const row of rows) {
       try {
         const targetKey = dailyTargetKey(resolvedDailyConfig(row.config,row.tenant_id,env));
-        // A manually enqueued/sent formal report owns this date; a realtime report never does.
-        const existing = await db.queryOne(`SELECT r.id FROM customer_daily_reports r JOIN customer_daily_deliveries d ON d.report_id=r.id AND d.tenant_id=r.tenant_id
-          WHERE r.tenant_id=$1 AND r.report_date=$2 AND r.mode='formal' AND d.target_key=$3 AND (d.status<>'canceled' OR d.ambiguous) ORDER BY (d.status='sent') DESC,r.version DESC LIMIT 1`,[row.tenant_id,row.report_date,targetKey]);
-        const generated = existing ? await report(row.tenant_id,existing.id) : await generate(row.tenant_id,{date:dateText(row.report_date),requestId:`auto:${row.id}:${row.attempts}`});
+        // Sent/in-flight ownership is final. Known-unsent ownership may advance
+        // to the latest customer-edited version through enqueue's locked checks.
+        const existing = await db.queryOne(`SELECT r.id,r.version,d.status,d.ambiguous FROM customer_daily_reports r JOIN customer_daily_deliveries d ON d.report_id=r.id AND d.tenant_id=r.tenant_id
+          WHERE r.tenant_id=$1 AND r.report_date=$2 AND r.mode='formal' AND d.target_key=$3 AND (d.status<>'canceled' OR d.ambiguous) ORDER BY (d.ambiguous OR d.status='working') DESC,(d.status='sent') DESC,r.version DESC LIMIT 1`,[row.tenant_id,row.report_date,targetKey]);
+        const latest = await db.queryOne("SELECT id,version,snapshot->>'summaryEdited' AS summary_edited FROM customer_daily_reports WHERE tenant_id=$1 AND report_date=$2 AND mode='formal' ORDER BY version DESC LIMIT 1",[row.tenant_id,row.report_date]);
+        const replaceUnsent = latest?.summary_edited === 'true' && (!existing || (latest.version > existing.version && !existing.ambiguous && ['queued','retry_wait','needs_attention'].includes(existing.status)));
+        const preservedId = replaceUnsent ? latest.id : existing?.id;
+        const generated = preservedId ? await report(row.tenant_id,preservedId) : await generate(row.tenant_id,{date:dateText(row.report_date),requestId:`auto:${row.id}:${row.attempts}`});
         // Existing delivery already carries the user's incomplete-data decision. Do not revoke it.
-        const queued = existing ? generated : await enqueue(row.tenant_id,generated.id,{send:true,automatic:true,config:row.config});
+        const queued = existing && !replaceUnsent ? generated : await enqueue(row.tenant_id,generated.id,{send:true,automatic:true,config:row.config});
         await db.execute("UPDATE customer_daily_occurrences SET status='enqueued',report_id=$2,error_message=NULL WHERE id=$1 AND status='pending'",[row.id,queued.id]);
       } catch (error) {
         const incomplete = error?.code === 'daily_data_incomplete';
@@ -256,7 +350,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     }
     return {processed};
   }
-  return {settings,saveSettings,report,list,generate,enqueue,processDue,processDocument,processMessage,reserveOccurrences,processOccurrences};
+  return {settings,saveSettings,report,list,generate,saveSummary,enqueue,processDue,processDocument,processMessage,reserveOccurrences,processOccurrences};
 }
 
 export const customerDailyReports = createCustomerDailyReportService();

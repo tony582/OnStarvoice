@@ -108,6 +108,10 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(detail.report.snapshot.summary.day.positive,1,'saved snapshot is immutable');
   assert.match(detail.text,/https:\/\/www.douyin.com/);
   assert.ok(!detail.html.includes('绝不能混入的客户B帖子'));
+  assert.match(detail.messageHtml,/二、7天内热度值≥200的负面帖子/);
+  assert.match(detail.messageText,/三、冷处理负面帖链接/);
+  assert.ok(!detail.messageHtml.includes('<table'));
+  assert.ok(!detail.messageText.includes('MTD'));
   const newer=await (await request('/generate',{method:'POST',body:{date:period.reportDate,requestId:randomUUID()}})).json();
   assert.equal(newer.report.version,2);
   assert.equal(newer.report.snapshot.summary.day.positive,0);
@@ -131,4 +135,73 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(config.settings.autoEnabled,false);
   assert.equal('appSecret' in config.settings,false);
   assert.equal((await request(`/${generated.id}/send`,{method:'POST'})).status,400,'missing configuration never attempts network');
+
+  // A customer may already have changed the original working document: summary saves must leave it alone.
+  await pool.query(`INSERT INTO customer_daily_documents (report_id,tenant_id,config,status,phase,document_id,document_url,progress)
+    VALUES($1,$2,'{}','ready','ready','existing_customer_doc','https://example.feishu.cn/docx/existing_customer_doc','{"body":{"customerText":"客户已填写"}}')`,[generated.id,tenantA]);
+  await pool.query(`INSERT INTO customer_daily_deliveries (id,tenant_id,report_id,target_key,config,status,message_id,sent_at)
+    VALUES($1,$2,$3,'existing-group','{}','sent','existing_message',now())`,[randomUUID(),tenantA,generated.id]);
+  const editKey=randomUUID();
+  const edit={summary:{day:{cold:0,inProgress:1,processed:0},mtd:{cold:0,inProgress:1,processed:1}},requestId:editKey};
+  const stale=await request(`/${generated.id}/summary`,{method:'POST',body:edit});
+  assert.equal(stale.status,409);
+  assert.equal((await stale.json()).error,'daily_summary_stale');
+  const source=newer.report;
+  await pool.query("UPDATE records SET sentiment='positive' WHERE id=$1",[positive]);
+  const concurrent=await Promise.all([request(`/${source.id}/summary`,{method:'POST',body:edit}),request(`/${source.id}/summary`,{method:'POST',body:edit})]);
+  const savedResponses=await Promise.all(concurrent.map(async response=>({status:response.status,body:await response.json()})));
+  assert.ok(savedResponses.every(result=>result.status===200),JSON.stringify(savedResponses));
+  const edited=savedResponses[0].body.report;
+  assert.equal(savedResponses[1].body.report.id,edited.id,'one version per repeated request, including concurrent submissions');
+  assert.equal(edited.version,3);
+  assert.notEqual(edited.id,generated.id);
+  assert.equal(edited.reportDate,generated.reportDate);
+  assert.equal(edited.mode,generated.mode);
+  assert.equal(edited.snapshot.assessedAt,source.snapshot.assessedAt,'editing counts is not a new data assessment');
+  assert.deepEqual(edited.snapshot.systemSummary,source.snapshot.summary);
+  assert.equal(edited.snapshot.summaryEdited,true);
+  assert.equal(edited.snapshot.summaryEdit.sourceReportId,source.id);
+  assert.equal(edited.snapshot.summaryEdit.actorId,writer.id);
+  assert.equal(edited.snapshot.summary.day.inProgress,1);
+  assert.equal(edited.snapshot.summary.day.processed,0);
+  assert.equal(edited.snapshot.summary.day.negative,generated.snapshot.summary.day.negative);
+  assert.equal(edited.snapshot.summary.day.positive,0,'editing an immutable source must not recollect later record corrections');
+  assert.deepEqual(edited.snapshot.highHeat,generated.snapshot.highHeat);
+  assert.deepEqual(edited.snapshot.coldMarked,generated.snapshot.coldMarked);
+  assert.deepEqual((await (await request(`/${generated.id}`)).json()).report.snapshot.summary,generated.snapshot.summary);
+  const originalDoc=(await pool.query('SELECT status,document_id,progress FROM customer_daily_documents WHERE report_id=$1',[generated.id])).rows[0];
+  assert.equal(originalDoc.status,'ready');
+  assert.equal(originalDoc.progress.body.customerText,'客户已填写');
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM customer_daily_documents WHERE tenant_id=$1',[tenantA])).rows[0].count,1);
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM customer_daily_deliveries WHERE tenant_id=$1',[tenantA])).rows[0].count,1,'summary saves do not enqueue messages');
+  const conflict=await request(`/${source.id}/summary`,{method:'POST',body:{...edit,summary:{day:{processed:null}}}});
+  assert.equal(conflict.status,409);
+  assert.equal((await conflict.json()).error,'daily_summary_request_conflict');
+  const distinctEdits=[
+    {summary:{day:{inProgress:0,processed:1},mtd:{inProgress:0,processed:2}},requestId:randomUUID()},
+    {summary:{day:{inProgress:0,processed:0},mtd:{inProgress:0,processed:0}},requestId:randomUUID()},
+  ];
+  const competing=await Promise.all(distinctEdits.map(body=>request(`/${edited.id}/summary`,{method:'POST',body})));
+  const competingResults=await Promise.all(competing.map(async response=>({status:response.status,body:await response.json()})));
+  assert.deepEqual(competingResults.map(result=>result.status).sort(),[200,409],JSON.stringify(competingResults));
+  assert.equal(competingResults.find(result=>result.status===409).body.error,'daily_summary_stale');
+  const revised=competingResults.find(result=>result.status===200).body.report;
+  assert.equal(revised.version,4);
+  assert.deepEqual(revised.snapshot.systemSummary,source.snapshot.summary,'the first system result survives repeated customer edits');
+  assert.equal((await pool.query('SELECT count(*)::int AS count FROM customer_daily_reports WHERE tenant_id=$1',[tenantA])).rows[0].count,4,'the stale competing edit must not create another version');
+  const originalReplay=await (await request(`/${source.id}/summary`,{method:'POST',body:edit})).json();
+  assert.equal(originalReplay.report.id,edited.id,'a successful request still replays after newer edits exist');
+  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',auth:viewerToken,body:edit})).status,403);
+  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',tenantId:tenantB,body:edit})).status,403);
+  assert.equal((await request(`/${randomUUID()}/summary`,{method:'POST',body:edit})).status,404);
+  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{day:{processed:-1}},requestId:randomUUID()}})).status,400);
+  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{day:{sdb:4}},requestId:randomUUID()}})).status,400);
+  const png=await request(`/${edited.id}/summary.png`,{auth:viewerToken});
+  assert.equal(png.status,200);
+  assert.match(png.headers.get('content-type'),/^image\/png/);
+  assert.equal(png.headers.get('cache-control'),'no-store');
+  assert.ok(png.headers.get('content-disposition').includes(encodeURIComponent(`客户日报_${generated.reportDate}_汇总.png`)));
+  assert.deepEqual(Buffer.from(await png.arrayBuffer()).subarray(0,8),Buffer.from([137,80,78,71,13,10,26,10]));
+  assert.equal((await request(`/${generated.id}/summary.png`,{tenantId:tenantB})).status,403);
+  assert.equal((await request(`/${randomUUID()}/summary.png`)).status,404);
 });

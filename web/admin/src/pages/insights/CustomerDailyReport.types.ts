@@ -5,8 +5,8 @@ export type DailyCounts = {
   neutral: number
   negative: number
   cold: number
-  inProgress: null
-  processed: null
+  inProgress: number | null
+  processed: number | null
   unclassified: number
   nonMonitor: number
 }
@@ -42,8 +42,10 @@ export type DailySnapshot = {
   monthStart: string
   heatStart: string
   summary: { day: DailyCounts; mtd: DailyCounts }
+  summaryEdited?: boolean
   highHeat: DailyPost[]
   coldMarked: DailyPost[]
+  evidence?: { cold?: { coverageComplete?: boolean } }
   warnings: Array<{ code: string; message: string; blocking: boolean }>
 }
 

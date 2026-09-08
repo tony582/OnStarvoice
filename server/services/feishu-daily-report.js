@@ -1,15 +1,16 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
+import {renderCustomerDailySummaryPng} from './customer-daily-report-image.js';
+import {buildFeishuDailyPost, FEISHU_DAILY_POST_IMAGE_PLACEHOLDER} from './feishu-daily-report-message.js';
+import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform} from './customer-daily-report-presentation.js';
 
 // Official contracts: /document/develop-robots/add-bot-to-external-group,
 // docx-v1/document-block-descendant/create, document-block/patch,
 // drive-v2/permission-public/get and drive-v1/permission-member/{create,list}.
 const API_ORIGIN = 'https://open.feishu.cn';
 const ID = /^[A-Za-z0-9_-]{1,200}$/;
+const IMAGE_KEY = /^img_[A-Za-z0-9_-]{1,196}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const EDIT = new Set(['edit', 'full_access']);
-const PLATFORM = { xhs: '小红书', xiaohongshu: '小红书', dy: '抖音', douyin: '抖音', weibo: '微博' };
-const QUALITY = { measured: '可靠实测', measured_ingestion_time: '指标已核实，实测时间未核实',
-  legacy_unverified: '历史入库记录，实测时间及可靠性未核实' };
 const TEXT_KEY = { 2: 'text', 3: 'heading1', 4: 'heading2' };
 const MERGES = [
   ...Array.from({ length: 5 }, (_, column) => [0, 2, column, column + 1]),
@@ -68,13 +69,6 @@ function webhookUrl(value) {
   }
   return url.href;
 }
-function shanghai(value) {
-  if (!value) return '未记录';
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return '未记录';
-  return new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit',
-    day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(date);
-}
 function run(content, url, bold = false) {
   const style = {};
   if (bold) style.bold = true;
@@ -83,9 +77,6 @@ function run(content, url, bold = false) {
 }
 function textNode(content, type = 2) {
   return { block_type: type, [TEXT_KEY[type]]: { elements: Array.isArray(content) ? content : [run(content)] } };
-}
-function warningText(snapshot) {
-  return (snapshot.warnings || []).map(w => plain(w.message)).filter(Boolean);
 }
 
 /** Pure document plan. Every table cell, including unknown counts, is editable text. */
@@ -96,11 +87,7 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
   const rows = [
     ['日期', '监控数量', 'SDB范畴', '正向', '中性', '负面', '', ''],
     ['', '', '', '', '', '冷处理', '处理中', '已处理'],
-    ...[[snapshot.reportDate, snapshot.summary.day], ['MTD', snapshot.summary.mtd]].map(([label, counts]) =>
-      [label, ...['monitor', 'sdb', 'positive', 'neutral', 'cold'].map(key => {
-        if (!Number.isFinite(counts[key]) || counts[key] < 0) throw invalid('日报统计值无效');
-        return String(counts[key]);
-      }), '', '']),
+    ...customerDailySummaryRows(snapshot).map(row => row.map(value => value === null ? '' : String(value))),
   ];
   const table = { block_type: 31, table: { property: { row_size: 4, column_size: 8,
     column_width: [120, 100, 100, 80, 80, 100, 100, 100], header_row: true } },
@@ -108,41 +95,27 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
     nodes: [textNode([run(value, null, rowIndex < 2)])] }))) };
   const nodes = [
     textNode(`${snapshot.tenantName || '客户'}舆情日报｜${snapshot.reportDate}${snapshot.mode === 'realtime' ? ' · 实时版' : ''}` , 3),
-    textNode(`系统初始版本 v${snapshot.version || 1}；新增/互动统计截至 ${shanghai(snapshot.cutoffAt)}；复核及冷处理状态截至 ${shanghai(snapshot.assessedAt)}。`),
-    textNode('一、监控汇总', 4), table,
-    textNode(`负面共 ${snapshot.summary.day.negative} 条，其中冷处理 ${snapshot.summary.day.cold} 条。处理中、已处理由客户维护，系统生成时留空，可编辑补填。`),
-    textNode('监控数量仅统计系统首次成功入库的新主帖；SDB仅扣除已复核非监控内容。MTD为本月首次入库集合，按本版复核结果分类。'),
-    ...warningText(snapshot).map(value => textNode(`数据说明：${value}`)),
-    textNode('二、近7天发布、热度≥200的负面帖子', 4),
-    textNode(`发布时间范围：${shanghai(snapshot.heatStart)} 至 ${shanghai(snapshot.cutoffAt)}（不含上界）。热度为点赞、评论、收藏与分享的互动总量；按最近有效观测排序。`),
+    textNode(CUSTOMER_DAILY_SECTIONS.summary, 4), table,
+    textNode(CUSTOMER_DAILY_SECTIONS.heat, 4),
   ];
   const high = snapshot.highHeat || [];
-  if (!high.length) nodes.push(textNode('本版未检出达到阈值的负面帖子；数据缺口请参见说明。'));
+  if (!high.length) nodes.push(textNode('暂未检出。'));
   high.forEach((post, index) => {
     const url = validHttpUrl(post.url);
-    const description = ` — ${PLATFORM[post.platform] || post.platform || '未知平台'}｜${post.stale ? '最近热度' : '热度'} ${post.heat ?? '未记录'}`
-      + (post.comparisonText ? `｜${post.comparisonText.startsWith('暂无') ? '' : '较昨日'}${plain(post.comparisonText)}` : '')
-      + `｜${post.timeSource === 'capture_timestamp' ? '实测' : '入库'}时间 ${shanghai(post.observedAt)}`
-      + `｜${QUALITY[post.quality] || '观测质量未确认'}`
-      + (post.previousObservedAt ? `｜昨日实测时间 ${shanghai(post.previousObservedAt)}` : '')
-      + (post.stale ? '｜本日未更新' : '') + (post.status === 'unavailable' ? '｜已不可见' : '')
+    const description = ` - ${customerDailyPostPlatform(post)} | 热度 ${post.heat ?? '—'} | ${customerDailyPostComparison(post)}`
       + (url ? '' : '｜原帖链接待补');
-    nodes.push(textNode([run(`TOP${index + 1}：`), run(post.title || '未命名帖子', url), run(description)]));
+    nodes.push(textNode([run(`TOP${index + 1}：`), run(String(post.title || '未命名帖子').replace(/\s+/g,' ').trim(), url), run(description)]));
   });
-  nodes.push(textNode('三、当天新增冷处理负面帖链接', 4));
-  nodes.push(textNode(`标记动作日期：${snapshot.reportDate}；包括此前采集、本日新标冷处理且本版仍有效的负面帖子。`));
+  nodes.push(textNode(CUSTOMER_DAILY_SECTIONS.cold, 4));
   const cold = snapshot.coldMarked || [];
   if (!cold.length) {
-    const incomplete = (snapshot.warnings || []).some(w => /cold.*(?:coverage|history)|(?:coverage|history).*cold/i.test(w.code || '')
-      || /历史.*(?:标记|记录).*不完整|标记.*覆盖/.test(w.message || ''));
-    nodes.push(textNode(incomplete ? '暂未检出，历史标记记录不完整。' : '当日无新增冷处理负面帖子。'));
+    nodes.push(textNode('暂未检出。'));
   }
   cold.forEach((post, index) => {
     const url = validHttpUrl(post.url);
-    nodes.push(textNode([run(`${index + 1}、`), run(post.title || '未命名帖子', url),
-      run(` — ${PLATFORM[post.platform] || post.platform || '未知平台'}｜标记于 ${shanghai(post.markedAt)}${url ? '' : '｜原帖链接待补'}`)]));
+    nodes.push(textNode([run(`${index + 1}、`), run(String(post.title || '未命名帖子').replace(/\s+/g,' ').trim(), url),
+      run(` - ${customerDailyPostPlatform(post)}${url ? '' : '｜原帖链接待补'}`)]));
   });
-  nodes.push(textNode('本文件为可编辑工作文档。客户修改保存在飞书中；StarVoice页面与导出Excel保留系统初始版本，不自动同步客户修改。'));
   let sequence = 0;
   function flatten(node, descendants) {
     const block = { block_id: `daily_${sequence++}`, ...node };
@@ -194,7 +167,7 @@ function rootIds(blocks, documentId) {
   return root.children;
 }
 
-export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, timeoutMs = 15000, now = () => Date.now(), minWriteIntervalMs = 350 } = {}) {
+export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, timeoutMs = 15000, now = () => Date.now(), minWriteIntervalMs = 350, renderSummaryImage = renderCustomerDailySummaryPng } = {}) {
   if (typeof fetchImpl !== 'function') throw invalid();
   // Capture a private copy; never include config, endpoint, response body or cause in errors.
   const settings = { ...config };
@@ -205,10 +178,10 @@ export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, 
   let authPending;
   let previousDocWrite = 0;
 
-  async function request(path, { method = 'GET', body, auth = true, mutation = method !== 'GET', webhook = false } = {}) {
+  async function request(path, { method = 'GET', body, form, auth = true, mutation = method !== 'GET', webhook = false } = {}) {
     const url = webhook ? webhookUrl(path) : `${API_ORIGIN}${path}`;
     if (!webhook && (!path.startsWith('/open-apis/') || path.includes('#') || new URL(url).origin !== API_ORIGIN)) throw invalid();
-    const headers = { 'Content-Type': 'application/json; charset=utf-8' };
+    const headers = form ? {} : { 'Content-Type': 'application/json; charset=utf-8' };
     if (auth) headers.Authorization = `Bearer ${await accessToken()}`;
     if (mutation && path.startsWith('/open-apis/docx/')) {
       const wait = Math.min(1000, Math.max(0, Number(minWriteIntervalMs) || 0)) - (Date.now() - previousDocWrite);
@@ -222,7 +195,7 @@ export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, 
     });
     try {
       const response = await Promise.race([fetchImpl(url, { method, headers, redirect: 'error', signal: controller.signal,
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }) }), timeout]);
+        ...(form ? {body:form} : body === undefined ? {} : { body: JSON.stringify(body) }) }), timeout]);
       const status = response.status;
       if (status >= 500 || status === 408 || (status >= 300 && status < 400)) {
         throw new FeishuDailyError('FEISHU_REMOTE_UNCERTAIN', '飞书暂时无法确认操作结果',
@@ -295,7 +268,9 @@ export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, 
     id(documentId);
     if (typeof onProgress !== 'function') throw invalid('文档写入必须配置持久化进度回调');
     const plan = buildFeishuDailyDocumentPlan(snapshot);
-    const planHash = digest(plan);
+    // Report identity stays bound to the checkpoint even when version labels are hidden from customers.
+    const planHash = digest({plan,reportId:snapshot.id || null,tenantId:snapshot.tenantId || null,
+      reportDate:snapshot.reportDate,version:snapshot.version || 1,mode:snapshot.mode});
     let state = progress && Object.keys(progress).length ? clone(progress) : { schemaVersion: 1, documentId, planHash, completed: [], pending: null, baseRootIds: null, done: false };
     if (state.schemaVersion !== 1 || state.documentId !== documentId || state.planHash !== planHash || !Array.isArray(state.completed)) throw uncertain('日报写入进度与版本不一致');
     if (state.done) return state; // Do not read or overwrite the customer's completed working document.
@@ -458,35 +433,65 @@ export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, 
     return { editable: true, retentionAllowed: true, external: editor.external_label !== false, progress: state };
   }
 
-  async function sendReport({ documentUrl, snapshot, uuid }) {
+  async function prepareSummaryImage({snapshot, progress, onProgress}) {
+    const png = Buffer.from(await renderSummaryImage(snapshot));
+    if (png.length > 10 * 1024 * 1024 || png.length < 24 || !png.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw invalid('日报表格图片生成失败');
+    const imageHash = createHash('sha256').update(png).digest('hex');
+    if (progress?.imageHash === imageHash && IMAGE_KEY.test(progress.imageKey || '') && progress.imageKey !== FEISHU_DAILY_POST_IMAGE_PLACEHOLDER) return progress;
+    const form = new FormData();
+    form.append('image_type','message');
+    form.append('image',new Blob([png],{type:'image/png'}),'daily-summary.png');
+    let response;
+    try {
+      response = await request('/open-apis/im/v1/images',{method:'POST',form});
+    } catch (error) {
+      if (error.apiCode === 99991672) throw new FeishuDailyError('FEISHU_IMAGE_PERMISSION_MISSING','请在飞书应用中添加「上传图片和附件」权限并发布版本。',{needsAttention:true});
+      // An unconfirmed image upload can leave an unused asset, but no chat message was attempted.
+      if (error.ambiguous) throw new FeishuDailyError('FEISHU_IMAGE_UPLOAD_UNCONFIRMED','表格图片上传结果未确认，可稍后重试。',{retryable:true});
+      throw error;
+    }
+    const imageKey = response.data?.image_key;
+    if (!IMAGE_KEY.test(imageKey || '') || imageKey === FEISHU_DAILY_POST_IMAGE_PLACEHOLDER) throw new FeishuDailyError('FEISHU_IMAGE_UPLOAD_UNCONFIRMED','表格图片上传结果未确认，可稍后重试。',{retryable:true});
+    const result = {imageHash,imageKey};
+    if (onProgress) {
+      try {await onProgress(result);} catch {throw new FeishuDailyError('FEISHU_IMAGE_CHECKPOINT_FAILED','图片发送进度未保存，请稍后重试。',{retryable:true});}
+    }
+    return result;
+  }
+
+  async function sendReport({ documentUrl, snapshot, uuid, summaryImageProgress, onSummaryImageProgress }) {
     let url;
     try { url = new URL(documentUrl); } catch { throw invalid('日报文档链接无效'); }
     if (url.origin !== origin || !/^\/docx\/[A-Za-z0-9_-]+$/.test(url.pathname) || url.search || url.hash || url.username || url.password) throw invalid('日报文档链接与配置不符');
     const reportDate = plain(snapshot?.reportDate, 30);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(reportDate)) throw invalid('日报日期无效');
-    const realtime = snapshot?.mode === 'realtime';
-    const version = Number.isInteger(snapshot?.version) && snapshot.version > 0 ? snapshot.version : 1;
-    // No business counts: the customer may edit the linked working document later.
-    const card = { config: { wide_screen_mode: true }, header: { template: 'blue',
-      title: { tag: 'plain_text', content: `舆情日报｜${reportDate}${realtime ? ' · 实时版' : ' · 正式日报'} · v${version}` } }, elements: [
-      { tag: 'div', text: { tag: 'plain_text', content: `日报已生成，可编辑完善。\n${realtime ? `统计截至：${shanghai(snapshot.cutoffAt)}\n` : ''}系统初始生成时间：${shanghai(snapshot.assessedAt)}\n客户当前稿以飞书文档为准。${version > 1 ? '\n旧版文档保留；如作为更正版交付，请按需合并客户已有修改。' : ''}` } },
-      { tag: 'action', actions: [{ tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '打开日报' }, url: url.href }] },
-    ] };
+    if (settings.channel === 'app') {
+      if (!UUID.test(uuid || '')) throw invalid('群消息缺少持久化发送标识或通道无效');
+      id(settings.chatId);
+    } else if (settings.channel === 'webhook') {
+      webhookUrl(settings.webhookUrl);
+      if (!settings.webhookSecret) throw invalid('请配置群机器人签名密钥');
+    } else throw invalid('群发送通道无效');
+    // Validate content before any upload; the image is uploaded separately from the rich-text payload.
+    try {buildFeishuDailyPost({snapshot,documentUrl:url.href});}
+    catch {throw invalid('日报图文内容无法生成，请检查帖子内容或使用飞书文档交付。');}
+    const picture = await prepareSummaryImage({snapshot,progress:summaryImageProgress,onProgress:onSummaryImageProgress});
+    const post = buildFeishuDailyPost({snapshot,imageKey:picture.imageKey,documentUrl:url.href});
     if (settings.channel === 'webhook') {
       const hook = webhookUrl(settings.webhookUrl);
       if (!settings.webhookSecret) throw invalid('请配置群机器人签名密钥');
       const timestamp = String(Math.floor(now() / 1000));
       const sign = createHmac('sha256', `${timestamp}\n${settings.webhookSecret}`).update('').digest('base64');
       const response = await request(hook, { method: 'POST', auth: false, webhook: true,
-        body: { timestamp, sign, msg_type: 'interactive', card } });
+        body: { timestamp, sign, msg_type: 'post', content:post } });
       return { messageId: null, acknowledged: true, channel: 'webhook', apiCode: response.code ?? response.StatusCode };
     }
     if (settings.channel !== 'app' || !UUID.test(uuid || '')) throw invalid('群消息缺少持久化发送标识或通道无效');
     const response = await request('/open-apis/im/v1/messages?receive_id_type=chat_id', { method: 'POST',
-      body: { receive_id: id(settings.chatId), msg_type: 'interactive', content: JSON.stringify(card), uuid } });
+      body: { receive_id: id(settings.chatId), msg_type: 'post', content: JSON.stringify(post), uuid } });
     const messageId = response.data?.message_id;
     if (!ID.test(messageId || '')) throw uncertain('飞书可能已发送群消息，但未返回消息标识');
     return { messageId, acknowledged: true, channel: 'app' };
   }
-  return { createDocument, writeDocument, ensureEditable, sendReport };
+  return { createDocument, writeDocument, ensureEditable, prepareSummaryImage, sendReport };
 }

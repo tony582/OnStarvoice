@@ -7,6 +7,8 @@ const CONFIG = { appId: 'cli_test', appSecret: 'private-app-secret', folderToken
   documentBaseUrl: 'https://example.feishu.cn', channel: 'app', chatId: 'oc_customer', editorType: 'openid', editorId: 'ou_customer' };
 const UUID = '82ac15ac-069c-44b9-b3ed-d9d9ff8cf623';
 const counts = { monitor: 100, sdb: 80, positive: 30, neutral: 35, negative: 15, cold: 6, inProgress: null, processed: null, unclassified: 0, nonMonitor: 20 };
+const TEST_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jAZkAAAAASUVORK5CYII=', 'base64');
+const renderTestPng = () => TEST_PNG;
 function snapshot(overrides = {}) {
   return { id: 'report_one', schemaVersion: 1, tenantId: 'tenant_one', tenantName: '客户', version: 1,
     reportDate: '2026-09-07', mode: 'formal', cutoffAt: '2026-09-07T16:00:00.000Z', assessedAt: '2026-09-08T02:00:00.000Z',
@@ -18,14 +20,15 @@ function snapshot(overrides = {}) {
 }
 const ok = data => ({ status: 200, json: async () => ({ code: 0, data }) });
 const auth = () => ({ status: 200, json: async () => ({ code: 0, tenant_access_token: 'secret-token', expire: 7200 }) });
-function harness({ members = [], permissions = {}, before, after } = {}) {
+function harness({ members = [], permissions = {}, before, after, renderSummaryImage = renderTestPng } = {}) {
   const requests = [];
   const root = { block_id: 'doc_one', block_type: 1, children: [] };
   const blocks = [root];
   let nextId = 0;
   const policy = { external_access_entity: 'open', link_share_entity: 'closed', security_entity: 'anyone_can_edit', copy_entity: 'anyone_can_edit', ...permissions };
   const fetchImpl = async (url, options) => {
-    const request = { url: new URL(url), method: options.method, options, body: options.body ? JSON.parse(options.body) : undefined };
+    const form = options.body instanceof FormData ? options.body : undefined;
+    const request = { url: new URL(url), method: options.method, options, form, body: options.body && !form ? JSON.parse(options.body) : undefined };
     requests.push(request);
     const early = await before?.(request, { blocks, members });
     if (early) return early;
@@ -58,15 +61,18 @@ function harness({ members = [], permissions = {}, before, after } = {}) {
       if (existing) Object.assign(existing, member); else members.push(member);
       response = ok({ member });
     } else if (path.endsWith('/public')) response = ok({ permission_public: policy });
+    else if (path.endsWith('/images')) response = ok({ image_key: 'img_v3_summary' });
     else if (path.endsWith('/messages')) response = ok({ message_id: 'om_message' });
     else if (path.includes('/bot/v2/hook/')) response = ok({});
     else throw new Error(`Unhandled request ${path}`);
     return await after?.(request, { blocks, members, response }) || response;
   };
   return { requests, blocks, members, policy, fetchImpl,
-    client: createFeishuDailyClient(CONFIG, { fetchImpl, minWriteIntervalMs: 0 }) };
+    client: createFeishuDailyClient(CONFIG, { fetchImpl, minWriteIntervalMs: 0, renderSummaryImage }) };
 }
 function mutations(h) { return h.requests.filter(r => r.method !== 'GET' && !r.url.pathname.includes('/auth/')); }
+function messages(h) { return mutations(h).filter(r => r.url.pathname.endsWith('/messages') || r.url.pathname.includes('/bot/v2/hook/')); }
+function images(h) { return mutations(h).filter(r => r.url.pathname.endsWith('/images')); }
 function savedProgress() {
   let progress;
   return { get: () => structuredClone(progress), save: async value => { progress = structuredClone(value); } };
@@ -91,6 +97,17 @@ test('native table preserves grouped headers and empty unknown cells; links rema
   assert.equal(plan.merges.length, 6);
 });
 
+test('native table preserves explicitly edited handling values including zero', () => {
+  const plan = buildFeishuDailyDocumentPlan(snapshot({summary: {
+    day: {...counts, inProgress: 0, processed: 8}, mtd: {...counts, inProgress: 17, processed: 28},
+  }}));
+  const blocks = plan.batches.flatMap(batch => batch.descendants);
+  const table = blocks.find(block => block.block_type === 31);
+  const map = new Map(blocks.map(block => [block.block_id, block]));
+  const cellText = index => map.get(map.get(table.children[index]).children[0]).text.elements[0].text_run.content;
+  assert.deepEqual([22, 23, 30, 31].map(cellText), ['0', '8', '17', '28']);
+});
+
 test('full lists are batched within API descendant limit, including large multi-page reports', () => {
   const rows = Array.from({ length: 650 }, (_, index) => ({ ...snapshot().highHeat[0], recordId: `r${index}`, title: `帖子${index}` }));
   const plan = buildFeishuDailyDocumentPlan(snapshot({ highHeat: rows }));
@@ -99,7 +116,7 @@ test('full lists are batched within API descendant limit, including large multi-
   assert.ok(JSON.stringify(plan).includes('TOP650'));
 });
 
-test('each hot post distinguishes measured observations from ingestion evidence and identifies comparison timestamp', () => {
+test('document keeps platform, heat and comparison in short report rows without technical observation prose', () => {
   const base = snapshot().highHeat[0];
   const plan = buildFeishuDailyDocumentPlan(snapshot({ highHeat: [
     { ...base, quality: 'measured', timeSource: 'capture_timestamp', comparisonText: '↑180%', previousObservedAt: '2026-09-06T03:00:00Z' },
@@ -108,11 +125,10 @@ test('each hot post distinguishes measured observations from ingestion evidence 
   ] }));
   const top = plan.batches.flatMap(batch => batch.descendants).filter(block => block.text?.elements?.[0]?.text_run?.content?.startsWith('TOP'))
     .map(block => block.text.elements.map(element => element.text_run.content).join(''));
-  assert.match(top[0], /较昨日↑180%.*实测时间 2026\/09\/07 12:00.*可靠实测.*昨日实测时间 2026\/09\/06 11:00/);
-  assert.match(top[1], /最近热度.*暂无昨日数据.*入库时间 2026\/09\/07 12:00.*历史入库记录，实测时间及可靠性未核实.*本日未更新/);
-  assert.doesNotMatch(top[1], /较昨日暂无/);
-  assert.match(top[2], /入库时间 未记录.*指标已核实，实测时间未核实/);
-  assert.doesNotMatch(top.join(''), /更新于|1970/);
+  assert.match(top[0], /小红书 \| 热度 320 \| 较昨日 ↑180%/);
+  assert.match(top[1], /小红书 \| 热度 320 \| 较昨日 暂无昨日数据/);
+  assert.match(top[2], /较昨日 暂无昨日数据/);
+  assert.doesNotMatch(JSON.stringify(plan), /实测时间|可靠实测|入库时间|历史入库记录|数据说明|1970/);
 });
 
 test('untrusted URL is not inserted as an executable link; history gap is not zero cold posts', () => {
@@ -120,7 +136,8 @@ test('untrusted URL is not inserted as an executable link; history gap is not ze
     coldMarked: [], warnings: [{ code: 'cold_history_incomplete', message: '历史标记记录不完整' }] }));
   assert.ok(!JSON.stringify(plan).includes('javascript:'));
   assert.ok(JSON.stringify(plan).includes('原帖链接待补'));
-  assert.ok(JSON.stringify(plan).includes('暂未检出，历史标记记录不完整'));
+  assert.ok(JSON.stringify(plan).includes('暂未检出。'));
+  assert.ok(!JSON.stringify(plan).includes('历史标记记录不完整'));
 });
 
 test('create uses exact specified folder; no default root; secrets go only to fixed official endpoint', async () => {
@@ -266,6 +283,8 @@ test('snapshot or document checkpoint mismatch cannot mutate', async () => {
   await h.client.writeDocument({ documentId: 'doc_one', snapshot: snapshot(), onProgress: saved.save });
   const size = h.requests.length;
   await assert.rejects(h.client.writeDocument({ documentId: 'doc_one', snapshot: snapshot({ version: 2 }), progress: saved.get(), onProgress: saved.save }), error => error.ambiguous);
+  await assert.rejects(h.client.writeDocument({ documentId: 'doc_one', snapshot: snapshot({ id: 'report_other' }), progress: saved.get(), onProgress: saved.save }), error => error.ambiguous);
+  await assert.rejects(h.client.writeDocument({ documentId: 'doc_one', snapshot: snapshot({ tenantId: 'tenant_other' }), progress: saved.get(), onProgress: saved.save }), error => error.ambiguous);
   await assert.rejects(h.client.writeDocument({ documentId: 'doc_two', snapshot: snapshot(), progress: saved.get(), onProgress: saved.save }), error => error.ambiguous);
   assert.equal(h.requests.length, size);
 });
@@ -350,43 +369,61 @@ test('email authorization persists canonical openid for later read-only verifica
   assert.equal(mutations(h).length, 1);
 });
 
-test('app message uses persisted UUID and includes editable document link without business counts or mentions', async () => {
+test('app message uploads a real multipart PNG then sends one post with image, links and persisted UUID', async () => {
   const h = harness();
-  const sent = await h.client.sendReport({ documentUrl: 'https://example.feishu.cn/docx/doc_one', snapshot: snapshot(), uuid: UUID });
+  const saved = savedProgress();
+  const sent = await h.client.sendReport({ documentUrl: 'https://example.feishu.cn/docx/doc_one', snapshot: snapshot(), uuid: UUID, onSummaryImageProgress: saved.save });
   assert.equal(sent.messageId, 'om_message');
-  const write = mutations(h)[0];
+  const upload = images(h)[0];
+  assert.ok(upload.form instanceof FormData);
+  assert.equal(upload.form.get('image_type'), 'message');
+  assert.equal(upload.form.get('image').name, 'daily-summary.png');
+  assert.equal(upload.form.get('image').type, 'image/png');
+  assert.deepEqual(Buffer.from(await upload.form.get('image').arrayBuffer()), TEST_PNG);
+  assert.equal(upload.options.headers['Content-Type'], undefined); // fetch supplies the multipart boundary.
+  assert.equal(upload.options.headers.Authorization, 'Bearer secret-token');
+  assert.match(saved.get().imageHash, /^[0-9a-f]{64}$/);
+  assert.equal(saved.get().imageKey, 'img_v3_summary');
+  const write = messages(h)[0];
+  assert.ok(h.requests.indexOf(upload) < h.requests.indexOf(write));
   assert.equal(write.body.uuid, UUID);
   assert.equal(write.body.receive_id, 'oc_customer');
-  const card = JSON.parse(write.body.content);
-  assert.match(card.header.title.content, /正式日报 · v1$/);
-  assert.equal(card.elements[1].actions[0].url, 'https://example.feishu.cn/docx/doc_one');
-  assert.ok(!write.body.content.includes('320'));
+  assert.equal(write.body.msg_type, 'post');
+  const post = JSON.parse(write.body.content);
+  assert.match(post.zh_cn.title, /客户.*2026-09-07/);
+  assert.deepEqual(post.zh_cn.content[0], [{tag:'img', image_key:'img_v3_summary'}]);
+  assert.equal(post.zh_cn.content.at(-1)[0].href, 'https://example.feishu.cn/docx/doc_one');
+  assert.ok(write.body.content.includes('320'));
   assert.ok(!write.body.content.includes('监控数量'));
   assert.ok(!write.body.content.includes('<at'));
+  assert.equal(messages(h).length, 1);
 });
 
-test('updated version card preserves old-document context without copying business counts', async () => {
+test('updated version remains concise and uses its own document link', async () => {
   const h = harness();
-  await h.client.sendReport({ documentUrl: 'https://example.feishu.cn/docx/doc_one', snapshot: snapshot({ version: 3 }), uuid: UUID });
-  const content = mutations(h)[0].body.content;
-  const card = JSON.parse(content);
-  assert.match(card.header.title.content, /v3$/);
-  assert.match(card.elements[0].text.content, /旧版文档保留.*更正版交付.*合并客户已有修改/);
-  assert.doesNotMatch(content, /320|监控数量|处理中|<at/);
+  await h.client.sendReport({ documentUrl: 'https://example.feishu.cn/docx/doc_version_three', snapshot: snapshot({ version: 3 }), uuid: UUID });
+  const content = messages(h)[0].body.content;
+  const post = JSON.parse(content);
+  assert.equal(post.zh_cn.content.at(-1)[0].href, 'https://example.feishu.cn/docx/doc_version_three');
+  assert.doesNotMatch(content, /旧版文档保留|更正版交付|合并客户已有修改|监控数量|处理中|<at/);
 });
 
 test('signed webhook sends only to official hook, contains correct signature, and returns explicit acknowledgment', async () => {
   const h = harness();
   const timestamp = 1700000000;
   const client = createFeishuDailyClient({ ...CONFIG, channel: 'webhook', webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/12345678-1234-1234-1234-123456789012',
-    webhookSecret: 'private-signing-key' }, { fetchImpl: h.fetchImpl, now: () => timestamp * 1000 });
+    webhookSecret: 'private-signing-key' }, { fetchImpl: h.fetchImpl, now: () => timestamp * 1000, renderSummaryImage: renderTestPng });
   assert.deepEqual(await client.sendReport({ documentUrl: 'https://example.feishu.cn/docx/doc_one', snapshot: snapshot() }),
     { messageId: null, acknowledged: true, channel: 'webhook', apiCode: 0 });
-  const write = mutations(h)[0];
+  const write = messages(h)[0];
   assert.equal(write.body.timestamp, String(timestamp));
   assert.equal(write.body.sign, createHmac('sha256', `${timestamp}\nprivate-signing-key`).update('').digest('base64'));
   assert.equal(write.options.headers.Authorization, undefined);
-  assert.equal(h.requests.length, 1);
+  assert.equal(write.body.msg_type, 'post');
+  assert.deepEqual(write.body.content.zh_cn.content[0], [{tag:'img',image_key:'img_v3_summary'}]);
+  assert.equal(images(h).length, 1);
+  assert.equal(messages(h).length, 1);
+  assert.equal(h.requests.length, 3); // App authentication and image upload precede the signed hook.
 });
 
 test('unsafe endpoint, injected document origin, absent webhook signature fail before network', async () => {
@@ -432,11 +469,130 @@ test('network failure, 5xx, invalid result and request timeout are ambiguous wit
 });
 
 test('unknown webhook delivery is surfaced for confirmation and never automatically resent', async () => {
-  let calls = 0;
+  const h = harness({before(request) {
+    if (request.url.pathname.includes('/bot/v2/hook/')) return {status:502,json:async()=>({msg:'unknown private-token'})};
+  }});
   const client = createFeishuDailyClient({ ...CONFIG, channel: 'webhook',
     webhookUrl: 'https://open.feishu.cn/open-apis/bot/v2/hook/123456789012', webhookSecret: 'private-signing-key' },
-  { fetchImpl: async () => { calls++; return { status: 502, json: async () => ({ msg: 'unknown' }) }; } });
+  { fetchImpl: h.fetchImpl, renderSummaryImage: renderTestPng });
   await assert.rejects(client.sendReport({ documentUrl: 'https://example.feishu.cn/docx/doc_one', snapshot: snapshot() }),
     error => error.ambiguous && error.needsAttention && !error.retryable);
-  assert.equal(calls, 1);
+  assert.equal(messages(h).length, 1);
+  assert.equal(images(h).length, 1);
+});
+
+test('a matching image checkpoint is reused before the first message without another upload', async () => {
+  const h = harness();
+  const saved = savedProgress();
+  const progress = await h.client.prepareSummaryImage({snapshot: snapshot(), onProgress: saved.save});
+  assert.deepEqual(progress, saved.get());
+  assert.equal(messages(h).length, 0);
+  await h.client.sendReport({documentUrl:'https://example.feishu.cn/docx/doc_one', snapshot:snapshot(), uuid:UUID,
+    summaryImageProgress:progress, onSummaryImageProgress:async()=>{throw new Error('a persisted key should not need another checkpoint');}});
+  assert.equal(images(h).length, 1);
+  assert.equal(messages(h).length, 1);
+});
+
+test('stale image content hash requires a new upload before message delivery', async () => {
+  const h = harness();
+  await h.client.sendReport({documentUrl:'https://example.feishu.cn/docx/doc_one', snapshot:snapshot(), uuid:UUID,
+    summaryImageProgress:{imageHash:'0'.repeat(64), imageKey:'img_v3_previous'}});
+  assert.equal(images(h).length, 1);
+  assert.equal(JSON.parse(messages(h)[0].body.content).zh_cn.content[0][0].image_key, 'img_v3_summary');
+});
+
+test('image checkpoint failure is known before any message and does not leak storage details', async () => {
+  const h = harness();
+  await assert.rejects(h.client.sendReport({documentUrl:'https://example.feishu.cn/docx/doc_one', snapshot:snapshot(), uuid:UUID,
+    onSummaryImageProgress:async()=>{throw new Error('private-db-url private-app-secret');}}), error => {
+    assert.equal(error.code, 'FEISHU_IMAGE_CHECKPOINT_FAILED');
+    assert.equal(error.retryable, true);
+    assert.equal(error.ambiguous, false);
+    assert.doesNotMatch(error.message, /private/);
+    return true;
+  });
+  assert.equal(images(h).length, 1);
+  assert.equal(messages(h).length, 0);
+});
+
+test('missing image upload scope gives an actionable publish instruction and sends zero messages', async () => {
+  const h = harness({before(request) {
+    if (request.url.pathname.endsWith('/images')) return {status:400,json:async()=>({code:99991672,msg:'private-app-secret permission missing'})};
+  }});
+  await assert.rejects(h.client.sendReport({documentUrl:'https://example.feishu.cn/docx/doc_one',snapshot:snapshot(),uuid:UUID}), error => {
+    assert.equal(error.code, 'FEISHU_IMAGE_PERMISSION_MISSING');
+    assert.equal(error.needsAttention, true);
+    assert.equal(error.ambiguous, false);
+    assert.match(error.message, /权限.*发布/);
+    assert.doesNotMatch(error.message, /private/);
+    return true;
+  });
+  assert.equal(messages(h).length, 0);
+});
+
+test('missing, malformed or uncertain upload results never fall back to a text-only message', async t => {
+  const cases = [
+    ['missing key', () => ok({})],
+    ['non-image key', () => ok({image_key:'not_an_image_key'})],
+    ['connection lost', () => {throw new Error('private-upload-path');}],
+    ['5xx upload', () => ({status:503,json:async()=>({code:1})})],
+  ];
+  for (const [label, response] of cases) await t.test(label, async () => {
+    const h = harness({before(request) {if (request.url.pathname.endsWith('/images')) return response();}});
+    await assert.rejects(h.client.sendReport({documentUrl:'https://example.feishu.cn/docx/doc_one',snapshot:snapshot(),uuid:UUID}), error => {
+      assert.equal(error.code, 'FEISHU_IMAGE_UPLOAD_UNCONFIRMED');
+      assert.equal(error.retryable, true);
+      assert.equal(error.ambiguous, false);
+      return true;
+    });
+    assert.equal(images(h).length, 1);
+    assert.equal(messages(h).length, 0);
+  });
+});
+
+test('invalid generated PNG fails before authentication, upload or message', async () => {
+  const h = harness({renderSummaryImage:()=>Buffer.from('<svg>bad image</svg>')});
+  await assert.rejects(h.client.sendReport({documentUrl:'https://example.feishu.cn/docx/doc_one',snapshot:snapshot(),uuid:UUID}),
+    error=>error.code==='FEISHU_CONFIG_INVALID' && !error.ambiguous);
+  assert.equal(h.requests.length, 0);
+});
+
+test('app identifiers and unsigned webhook configuration are checked before rendering or uploading', async () => {
+  let renderCalls = 0;
+  let networkCalls = 0;
+  const options = {renderSummaryImage:()=>{renderCalls++;return TEST_PNG;},fetchImpl:async()=>{networkCalls++;throw new Error('unexpected');}};
+  const variants = [
+    [{...CONFIG,chatId:'bad/id'},UUID],
+    [CONFIG,'not-a-uuid'],
+    [{...CONFIG,channel:'webhook',webhookUrl:'https://evil.test/hook',webhookSecret:'key'},undefined],
+    [{...CONFIG,channel:'webhook',webhookUrl:'https://open.feishu.cn/open-apis/bot/v2/hook/123456789012',webhookSecret:''},undefined],
+  ];
+  for (const [config,uuid] of variants) await assert.rejects(createFeishuDailyClient(config,options).sendReport({
+    documentUrl:'https://example.feishu.cn/docx/doc_one',snapshot:snapshot(),uuid,
+  }),{code:'FEISHU_CONFIG_INVALID'});
+  assert.equal(renderCalls,0);
+  assert.equal(networkCalls,0);
+});
+
+test('an uncertain app message remains ambiguous after successful image checkpoint and is attempted only once', async t => {
+  const cases = [
+    ['network lost',()=>{throw new Error('private-token');}],
+    ['HTTP 503',()=>({status:503,json:async()=>({code:0})})],
+    ['missing message id',()=>ok({})],
+    ['timeout',()=>new Promise(()=>{})],
+  ];
+  for (const [label,response] of cases) await t.test(label,async()=>{
+    const saved=savedProgress();
+    const h=harness({before(request){if(request.url.pathname.endsWith('/messages'))return response();}});
+    const client=createFeishuDailyClient(CONFIG,{fetchImpl:h.fetchImpl,timeoutMs:15,renderSummaryImage:renderTestPng});
+    await assert.rejects(client.sendReport({documentUrl:'https://example.feishu.cn/docx/doc_one',snapshot:snapshot(),uuid:UUID,onSummaryImageProgress:saved.save}),error=>{
+      assert.equal(error.ambiguous,true);
+      assert.equal(error.retryable,false);
+      assert.doesNotMatch(error.message,/private/);
+      return true;
+    });
+    assert.equal(saved.get().imageKey,'img_v3_summary');
+    assert.equal(images(h).length,1);
+    assert.equal(messages(h).length,1);
+  });
 });

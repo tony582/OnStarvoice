@@ -692,6 +692,7 @@ interface DirectoryItem {
 const MORE_GROUPS: Array<{ label: string; items: DirectoryItem[] }> = [
   { label: '数据与导出', items: [
     { title: '数据底座', subtitle: '六类数据集、筛选、详情与下载', icon: Database, page: 'data' },
+    { title: '客户日报', subtitle: '每日汇总、负面链接与飞书交付', icon: FileText, page: 'insights', params: { tab: 'daily' } },
     { title: '报告中心', subtitle: '生成、预览、发送与历史记录', icon: FileText, page: 'insights', params: { tab: 'reports' } },
   ] },
   { label: '业务能力', items: [

@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { useBadges } from '@/lib/badges'
+import { CustomerDailyReportSettingsSection } from '@/pages/insights/CustomerDailyReportSettings'
 
 /* ==================== TenantsPage ==================== */
 export function TenantsPage() {
@@ -855,6 +856,8 @@ export function SettingsPage() {
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 space-y-6 duration-300">
+      <CustomerDailyReportSettingsSection />
+
       <SettingsCard title="AI 模型" description="配置舆情分析模型，并在主模型拥堵时自动切到备用模型。" onSave={() => save('llm')}>
         <div className="grid gap-3 lg:grid-cols-2">
           <Field label="提供商"><Input value={settings.llm_provider || ''} onChange={e => u('llm_provider', e.target.value)} /></Field>

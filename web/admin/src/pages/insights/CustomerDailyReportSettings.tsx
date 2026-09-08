@@ -1,10 +1,34 @@
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { ChevronDown, Loader2, Settings2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { useAuth } from '@/lib/auth'
 import { DAILY_API, dailyError, dailyTime, type DailySettings } from './CustomerDailyReport.types'
 
 const inputClass = 'mt-1.5 h-10 w-full rounded-lg border border-border bg-white px-3 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary/30 disabled:bg-slate-50'
+
+export function CustomerDailyReportSettingsSection() {
+  const { tenantId, user } = useAuth()
+  const canManage = ['platform_admin', 'internal_operator'].includes(user?.globalRole || '')
+  return canManage ? <CustomerDailyReportSettingsLoader key={tenantId} /> : null
+}
+
+function CustomerDailyReportSettingsLoader() {
+  const [settings, setSettings] = useState<DailySettings | null>(null)
+  const [error, setError] = useState('')
+  const [reload, setReload] = useState(0)
+  useEffect(() => {
+    let active = true
+    void api.get<{ settings: DailySettings }>(`${DAILY_API}/settings`).then(data => {
+      if (active) { setSettings(data.settings); setError('') }
+    }).catch(error => {
+      if (active) setError(dailyError(error, '飞书接入配置暂时无法读取。'))
+    })
+    return () => { active = false }
+  }, [reload])
+  if (settings) return <CustomerDailyReportSettings settings={settings} canManage onSaved={setSettings} />
+  return <section className="rounded-xl border border-slate-200 bg-white p-5"><h3 className="text-sm font-semibold">飞书接入与自动发送</h3>{error ? <div className="mt-3 flex flex-wrap items-center gap-3"><p role="alert" className="text-xs text-amber-800">{error}</p><Button size="sm" variant="outline" onClick={() => setReload(value => value + 1)}>重新读取</Button></div> : <p role="status" className="mt-3 text-xs text-slate-500">正在读取配置…</p>}</section>
+}
 
 export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
   settings: DailySettings

@@ -123,7 +123,7 @@ export function assessCustomerDailyObservation(row = {}) {
 }
 
 function compareObservations(today, yesterday) {
-  if (!today?.comparable) return '';
+  if (!today?.comparable) return '暂无可比数据';
   if (!yesterday?.comparable) return '暂无昨日数据';
   if (yesterday.heat === 0) return today.heat === 0 ? '持平' : `由0增至${today.heat}`;
   const change = (today.heat - yesterday.heat) / yesterday.heat * 100;
@@ -247,7 +247,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     if (latest.heat < 200) continue;
     highHeat.push({...post(row), heat: latest.heat, observedAt: latest.observedAt, ingestedAt: latest.ingestedAt,
       quality: latest.quality, timeSource: latest.timeSource, stale,
-      comparisonText: !stale && sameMeasuredCurrent ? compareObservations(latest, yesterday) : '',
+      comparisonText: stale ? '暂无本日数据' : sameMeasuredCurrent ? compareObservations(latest, yesterday) : '暂无可比数据',
       previousHeat: !stale && sameMeasuredCurrent && yesterday ? yesterday.heat : null,
       previousObservedAt: !stale && sameMeasuredCurrent && yesterday ? yesterday.observedAt : null,
       publishedAt: iso(row.published_ts), observationId: latest.observationId});

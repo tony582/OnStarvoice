@@ -153,26 +153,97 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
     assert.equal(f.calls.length, 0);
   });
 
-  await t.test('concurrent same-day formal enqueues reuse first owner; explicit correction waits until previous sent', async subtest => {
+  await t.test('concurrent formal requests leave only the newest unsent owner; sent versions require correction', async subtest => {
     const f = await fixture(subtest);
     const a = await f.service.generate(f.tenantId, { requestId: 'formal-a' });
     const b = await f.service.generate(f.tenantId, { requestId: 'formal-b' });
-    const enqueued = await Promise.all([
+    const results = await Promise.allSettled([
       f.service.enqueue(f.tenantId, a.id, { send: true }), f.service.enqueue(f.tenantId, b.id, { send: true }),
     ]);
-    assert.equal(enqueued[0].id, enqueued[1].id);
-    const owner = enqueued[0].id;
-    const other = owner === a.id ? b.id : a.id;
-    assert.equal((await f.service.enqueue(f.tenantId, other, { send: true, correction: true })).id, owner);
+    for (const result of results) if (result.status === 'rejected') assert.equal(result.reason.code,'daily_delivery_stale');
+    const active = await db.queryAll("SELECT report_id FROM customer_daily_deliveries WHERE tenant_id=$1 AND status='queued'",[f.tenantId]);
+    assert.deepEqual(active.map(row=>row.report_id),[b.id]);
     await f.service.processDue();
-    assert.equal(f.counts('create'), 1);
-    assert.equal(f.counts('write'), 1);
-    assert.equal(f.counts('send'), 1);
-    assert.equal((await f.service.enqueue(f.tenantId, other, { send: true })).id, owner);
-    assert.equal((await f.service.enqueue(f.tenantId, other, { send: true, correction: true })).id, other);
+    assert.equal(f.counts('send'),1);
+    assert.equal(f.calls.find(call=>call.type==='send').reportId,b.id);
+    const c = await f.service.generate(f.tenantId,{requestId:'formal-correction'});
+    await assert.rejects(f.service.enqueue(f.tenantId,c.id,{send:true}),{code:'daily_delivery_correction_required'});
+    assert.equal((await f.service.enqueue(f.tenantId,c.id,{send:true,correction:true})).id,c.id);
     await f.service.processDue();
-    assert.equal(f.counts('send'), 2);
-    assert.equal(f.counts('create'), 2);
+    assert.equal(f.counts('send'),2);
+    assert.equal((await db.queryOne('SELECT status FROM customer_daily_deliveries WHERE report_id=$1',[b.id])).status,'sent');
+  });
+
+  await t.test('a newer saved summary replaces every known-unsent state without rewriting the old document', async subtest => {
+    for (const state of ['queued','retry_wait','needs_attention']) {
+      const f = await fixture(subtest);
+      const source = await f.service.generate(f.tenantId);
+      await f.service.enqueue(f.tenantId,source.id,{send:true});
+      await f.service.processDocument();
+      if (state !== 'queued') {
+        f.failures.send = [new FeishuDailyError('FEISHU_IMAGE_PERMISSION_MISSING','请启用上传图片权限',{needsAttention:state==='needs_attention',retryable:state==='retry_wait'})];
+        await f.service.processMessage();
+      }
+      const before = await db.queryOne('SELECT document_id,progress FROM customer_daily_documents WHERE report_id=$1',[source.id]);
+      assert.equal((await db.queryOne('SELECT status FROM customer_daily_deliveries WHERE report_id=$1',[source.id])).status,state);
+      const edited = await f.service.saveSummary(f.tenantId,source.id,{summary:{day:{positive:2,inProgress:2},mtd:{positive:2,inProgress:2}}});
+      assert.equal((await f.service.enqueue(f.tenantId,edited.id,{send:true})).id,edited.id);
+      assert.equal((await db.queryOne('SELECT status FROM customer_daily_deliveries WHERE report_id=$1',[source.id])).status,'canceled');
+      await f.service.processDue();
+      assert.equal(f.calls.filter(call=>call.type==='send').at(-1).reportId,edited.id);
+      assert.deepEqual(await db.queryOne('SELECT document_id,progress FROM customer_daily_documents WHERE report_id=$1',[source.id]),before);
+      assert.equal(f.calls.filter(call=>call.type==='write' && call.reportId===source.id).length,1);
+      assert.equal((await f.service.report(f.tenantId,edited.id)).snapshot.summary.day.inProgress,2);
+    }
+  });
+
+  await t.test('replacement locks exclude message claims and only the edited version reaches the group', async subtest => {
+    const f = await fixture(subtest);
+    const source = await f.service.generate(f.tenantId);
+    await f.service.enqueue(f.tenantId,source.id,{send:true});
+    await f.service.processDocument();
+    const edited = await f.service.saveSummary(f.tenantId,source.id,{summary:{day:{positive:3,inProgress:1},mtd:{positive:3,inProgress:1}}});
+    let locked, resume;
+    const acquired = new Promise(resolve=>{locked=resolve;});
+    const release = new Promise(resolve=>{resume=resolve;});
+    const replacement = f.serviceWith({db:{...db,withTransaction:callback=>db.withTransaction(tx=>callback({...tx,queryAll:async(sql,params)=>{
+      const result=await tx.queryAll(sql,params);
+      if(sql.includes('FOR UPDATE OF d')) { locked(); await release; }
+      return result;
+    }}))}}).enqueue(f.tenantId,edited.id,{send:true});
+    await acquired;
+    try { assert.equal(await f.service.processMessage(),false); }
+    finally { resume(); }
+    await replacement;
+    await f.service.processDue();
+    assert.deepEqual(f.calls.filter(call=>call.type==='send').map(call=>call.reportId),[edited.id]);
+  });
+
+  await t.test('a worker that claims first blocks replacement; ambiguous or sent deliveries are never canceled', async subtest => {
+    for (const state of ['working','ambiguous','sent']) {
+      const f=await fixture(subtest);
+      const source=await f.service.generate(f.tenantId);
+      await f.service.enqueue(f.tenantId,source.id,{send:true});
+      await f.service.processDocument();
+      const edited=await f.service.saveSummary(f.tenantId,source.id,{summary:{day:{positive:3,inProgress:1},mtd:{positive:3,inProgress:1}}});
+      let claimed, resume;
+      const acquired=new Promise(resolve=>{claimed=resolve;});
+      const release=new Promise(resolve=>{resume=resolve;});
+      let worker;
+      if(state==='working') {
+        worker=f.serviceWith({clientFactory:config=>({...f.clientFactory(config),sendReport:async args=>{claimed();await release;return f.clientFactory(config).sendReport(args);}})}).processMessage();
+        await acquired;
+      } else {
+        if(state==='ambiguous') f.failures.send=[new FeishuDailyError('FEISHU_RESULT_UNKNOWN','结果未知',{ambiguous:true})];
+        await f.service.processMessage();
+      }
+      try { await assert.rejects(f.service.enqueue(f.tenantId,edited.id,{send:true}),{code:state==='sent'?'daily_delivery_correction_required':'daily_delivery_in_flight'}); }
+      finally { if(worker) {resume();await worker;} }
+      const old=await db.queryOne('SELECT status,ambiguous FROM customer_daily_deliveries WHERE report_id=$1',[source.id]);
+      assert.equal(old.status,state==='ambiguous'?'needs_attention':'sent');
+      assert.equal(old.ambiguous,state==='ambiguous');
+      assert.equal((await db.queryOne('SELECT count(*)::int AS count FROM customer_daily_deliveries WHERE report_id=$1',[edited.id])).count,0);
+    }
   });
 
   await t.test('durable automatic occurrence and manual formal report share ownership', async subtest => {
@@ -189,6 +260,66 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
     assert.equal(occurrence.status, 'enqueued');
     assert.equal(f.counts('create'), 1);
     assert.equal(f.counts('send'), 1);
+  });
+
+  await t.test('automatic first delivery uses the latest customer-edited formal summary without collecting again', async subtest => {
+    const f = await fixture(subtest);
+    const source = await f.service.generate(f.tenantId,{requestId:'before-customer-edit'});
+    const first = await f.service.saveSummary(f.tenantId,source.id,{summary:{day:{positive:3,inProgress:1},mtd:{positive:3,inProgress:1}},requestId:'customer-edit-one'});
+    const latest = await f.service.saveSummary(f.tenantId,first.id,{summary:{day:{positive:2,inProgress:2},mtd:{positive:2,inProgress:2}},requestId:'customer-edit-two'});
+    await f.service.saveSettings(f.tenantId,{autoEnabled:true,sendTime:'09:00'});
+    await db.execute("UPDATE customer_daily_report_settings SET next_run_at='2026-09-08T01:00:00Z' WHERE tenant_id=$1",[f.tenantId]);
+    const automatic = f.serviceWith({collect:async()=>{throw new Error('Automatic delivery must not recalculate a saved customer summary');}});
+    await automatic.processDue();
+    const occurrence = await db.queryOne('SELECT status,report_id FROM customer_daily_occurrences WHERE tenant_id=$1',[f.tenantId]);
+    assert.equal(occurrence.status,'enqueued');
+    assert.equal(occurrence.report_id,latest.id);
+    assert.equal(f.calls.find(call=>call.type==='send').reportId,latest.id);
+    assert.equal(f.counts('send'),1);
+    assert.equal((await f.service.report(f.tenantId,latest.id)).snapshot.summary.day.inProgress,2);
+    assert.equal((await db.queryOne('SELECT count(*)::int AS count FROM customer_daily_reports WHERE tenant_id=$1',[f.tenantId])).count,3);
+  });
+
+  await t.test('automatic delivery replaces an older known-unsent version with the latest saved summary', async subtest => {
+    for (const state of ['queued','retry_wait','needs_attention']) {
+      const f=await fixture(subtest);
+      const source=await f.service.generate(f.tenantId);
+      await f.service.enqueue(f.tenantId,source.id,{send:true});
+      await f.service.processDocument();
+      if(state!=='queued') {
+        f.failures.send=[new FeishuDailyError('FEISHU_IMAGE_PERMISSION_MISSING','上传权限未配置',{needsAttention:state==='needs_attention',retryable:state==='retry_wait'})];
+        await f.service.processMessage();
+      }
+      const edited=await f.service.saveSummary(f.tenantId,source.id,{summary:{day:{positive:2,processed:2},mtd:{positive:2,processed:2}}});
+      await f.service.saveSettings(f.tenantId,{autoEnabled:true,sendTime:'09:00'});
+      await db.execute("UPDATE customer_daily_report_settings SET next_run_at='2026-09-08T01:00:00Z' WHERE tenant_id=$1",[f.tenantId]);
+      await f.serviceWith({collect:async()=>{throw new Error('Latest saved summary must be used without recollection');}}).processDue();
+      const occurrence=await db.queryOne('SELECT report_id,status FROM customer_daily_occurrences WHERE tenant_id=$1',[f.tenantId]);
+      assert.equal(occurrence.report_id,edited.id);
+      assert.equal(occurrence.status,'enqueued');
+      assert.equal((await db.queryOne('SELECT status FROM customer_daily_deliveries WHERE report_id=$1',[source.id])).status,'canceled');
+      assert.equal(f.calls.filter(call=>call.type==='send').at(-1).reportId,edited.id);
+      assert.equal((await db.queryOne('SELECT count(*)::int AS count FROM customer_daily_reports WHERE tenant_id=$1',[f.tenantId])).count,2);
+    }
+  });
+
+  await t.test('automatic reuse of a customer summary still respects its frozen incomplete-data gate', async subtest => {
+    const f = await fixture(subtest);
+    f.warnings([{code:'unclassified',message:'仍有待识别内容',blocking:true}]);
+    const source = await f.service.generate(f.tenantId,{requestId:'incomplete-before-edit'});
+    const edited = await f.service.saveSummary(f.tenantId,source.id,{summary:{day:{positive:3,inProgress:1},mtd:{positive:3,inProgress:1}},requestId:'incomplete-edited'});
+    await f.service.saveSettings(f.tenantId,{autoEnabled:true,sendTime:'09:00'});
+    await db.execute("UPDATE customer_daily_report_settings SET next_run_at='2026-09-08T01:00:00Z' WHERE tenant_id=$1",[f.tenantId]);
+    const automatic = f.serviceWith({collect:async()=>{throw new Error('Do not silently replace customer input or bypass its original warnings');}});
+    await automatic.processDue();
+    const occurrence = await db.queryOne('SELECT status,error_message,attempts FROM customer_daily_occurrences WHERE tenant_id=$1',[f.tenantId]);
+    assert.equal(occurrence.status,'pending');
+    assert.equal(occurrence.attempts,1);
+    assert.match(occurrence.error_message,/待同步或待识别/);
+    assert.equal(f.counts('create'),0);
+    assert.equal(f.counts('send'),0);
+    assert.equal((await f.service.report(f.tenantId,edited.id)).snapshot.summary.day.inProgress,1);
+    assert.equal((await db.queryOne('SELECT count(*)::int AS count FROM customer_daily_reports WHERE tenant_id=$1',[f.tenantId])).count,2);
   });
 
   await t.test('today realtime delivery does not suppress tomorrow formal delivery for that report date', async subtest => {
@@ -218,7 +349,7 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
     const continueRead = new Promise(resolve => { resumeRead = resolve; });
     const racing = f.serviceWith({ db: { ...db, queryOne: async (sql, params) => {
       const result = await db.queryOne(sql, params);
-      if (sql.includes('SELECT r.id FROM customer_daily_reports r JOIN customer_daily_deliveries')) {
+      if (sql.includes('FROM customer_daily_reports r JOIN customer_daily_deliveries d')) {
         assert.equal(result, null);
         notifyRead();
         await continueRead;
