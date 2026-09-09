@@ -2,7 +2,7 @@ import { AlertTriangle, Bot } from 'lucide-react'
 import type { OrchestrationAttemptRecord, OrchestrationCloudAgent, OrchestrationExecutionRecord, OrchestrationItemRecord } from './types'
 import { PLATFORM_LABELS, STATUS_LABELS, formatTime } from './lib'
 import { TaskResultRecordButton, TaskResultSyncSummary, TaskResultTimes } from './TaskResultSections'
-import { historicalItemStatus, orchestrationCurrentExecution, orchestrationResultEvidence, resultCount, resultMessage, resultObject } from './task-result-presentation.mjs'
+import { historicalItemStatus, orchestrationCurrentExecution, orchestrationItemTiming, orchestrationResultEvidence, resultCount, resultMessage, resultObject } from './task-result-presentation.mjs'
 
 type Props = {
   items: OrchestrationItemRecord[]
@@ -51,13 +51,16 @@ export function OrchestrationResultReport({ items, executions, agents, attempts,
         const source = item as OrchestrationItemRecord & {record_id?: string; result_record_id?: string}
         const agent = agentsById.get(String(item.assigned_agent_id || execution?.agentId || execution?.agent_id || execution?.assigned_agent_id || ''))
         const history = attempts.filter(attempt => String(attempt.itemId || attempt.item_id || '') === item.id)
+        const timing = orchestrationItemTiming(item, execution, history)
+        const timingLabel = timing.source === 'attempt' ? '本次尝试' : timing.source === 'execution' ? '节点执行' : '工作项'
         const steps = orchestrationResultEvidence(item, execution, expectedSearchPasses).steps
         const checkpoint = resultObject(item.metadata?.checkpoint)
         const issues = unfinishedEvidence(item, execution, expectedSearchPasses)
         const error = resultMessage(item.error)
         return <article key={item.id} className="p-4">
           <div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0 flex-1"><span className="text-[10px] text-muted-foreground">{index + 1} · {itemType(item)} · {PLATFORM_LABELS[item.platform] || item.platform}</span><h4 className="mt-1 break-words text-sm font-semibold">{itemLabel(item)}</h4></div><span className="rounded-md bg-muted px-2 py-1 text-[11px]">{historicalItemStatus(item.status) || STATUS_LABELS[item.status] || item.status}</span></div>
-          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground"><span>执行节点：{agent?.display_name || execution?.agent_display_name || '未保留名称'}</span><span>开始：{formatTime(item.started_at)}</span><span>结束：{formatTime(item.finished_at)}</span><span>尝试：{item.attempt_count ?? history.length} 次</span>{resultCount(checkpoint.savedCount) !== null && <span>设备报告保存：{resultCount(checkpoint.savedCount)}</span>}</div>
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground"><span>执行节点：{agent?.display_name || execution?.agent_display_name || '未保留名称'}</span><span>{timingLabel}开始：{timing.startedAt ? formatTime(timing.startedAt) : '未记录'}</span><span>{timingLabel}结束：{timing.finishedAt ? formatTime(timing.finishedAt) : '未记录'}</span><span>尝试：{item.attempt_count ?? history.length} 次</span>{resultCount(checkpoint.savedCount) !== null && <span>设备报告保存：{resultCount(checkpoint.savedCount)}</span>}</div>
+          {timing.note && <p className="mt-2 text-xs leading-5 text-amber-800">{timing.note}</p>}
           {error && <p className="mt-2 text-xs leading-5 text-status-red">{error}</p>}
           {issues.length > 0 && <p className="mt-2 text-xs leading-5 text-amber-800">结果核对：{issues.join('；')}</p>}
           <TaskResultRecordButton recordId={source.result_record_id || source.record_id} />

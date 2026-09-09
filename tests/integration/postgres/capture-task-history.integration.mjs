@@ -117,6 +117,28 @@ test('task history preserves business roots and clears only terminal visibility 
     assert.deepEqual(filtered.body.tasks.map(row => row.id), [morning.id]);
   });
 
+  await t.test('orchestration result details expose the same persisted times as history without modifying them', async () => {
+    const before = (await pool.query(`UPDATE capture_tasks
+      SET started_at = now() - interval '40 minutes', finished_at = now() - interval '6 minutes'
+      WHERE tenant_id = $1 AND id = $2 RETURNING *`, [tenantId, morning.id])).rows[0];
+    const detail = await request(`/orchestrations/${morning.id}`);
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.orchestration.started_at, before.started_at.toISOString());
+    assert.equal(detail.body.orchestration.finished_at, before.finished_at.toISOString());
+    assert.notEqual(detail.body.orchestration.finished_at, detail.body.orchestration.updated_at,
+      'the result must use the real completion time, not the mutable row update time');
+    const taskDetail = (await request(`/tasks/${morning.id}`)).body.task;
+    const historical = (await request(`/history?q=${encodeURIComponent(morning.client_task_id)}`)).body.tasks[0];
+    for (const timestamp of ['started_at', 'finished_at']) {
+      assert.equal(detail.body.orchestration[timestamp], taskDetail[timestamp]);
+      assert.equal(detail.body.orchestration[timestamp], historical[timestamp]);
+    }
+    const after = (await pool.query('SELECT * FROM capture_tasks WHERE tenant_id = $1 AND id = $2', [tenantId, morning.id])).rows[0];
+    assert.deepEqual(after, before, 'reading result times must not change the task lifecycle');
+    const unstarted = (await request(`/orchestrations/${revZero.id}`)).body.orchestration;
+    assert.equal(unstarted.started_at, null, 'an absent start time remains absent');
+  });
+
   const record = (await pool.query(`INSERT INTO records (tenant_id, platform, title) VALUES ($1, 'douyin', 'Durable result') RETURNING id`, [tenantId])).rows[0];
   const unrelatedRecord = (await pool.query(`INSERT INTO records (tenant_id, title) VALUES ($1, 'Unrelated result') RETURNING id`, [tenantId])).rows[0];
   await pool.query(`INSERT INTO record_observations (tenant_id, record_id, capture_task_id)

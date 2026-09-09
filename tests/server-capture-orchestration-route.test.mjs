@@ -834,6 +834,9 @@ test('an active unattended plan can be started immediately from the cloud', () =
 test('detail reader is tenant scoped and returns the complete orchestration projection', () => {
   const detail = route.slice(route.indexOf("router.get(\n  '/orchestrations/:id'"));
   assert.match(detail, /parentSelect\(\)/u);
+  const parentProjection = section('function parentSelect(', 'async function loadOrchestrationSchedule(');
+  assert.match(parentProjection, /created_at, updated_at,\s*started_at, finished_at/u,
+    'completed result details must expose persisted execution times as well as row timestamps');
   assert.match(detail, /SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY/u);
   assert.match(
     detail,

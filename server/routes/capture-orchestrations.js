@@ -756,7 +756,8 @@ function parentSelect({lock = false} = {}) {
       task_type, feature_key, title, platform, source, trigger_type,
       status, progress, checkpoint, counts, metadata, error, message,
       orchestration_revision, orchestration_schedule_id, scheduled_for,
-      schedule_revision, attention_dismissed_at, created_at, updated_at
+      schedule_revision, attention_dismissed_at, created_at, updated_at,
+      started_at, finished_at
     FROM capture_tasks
     WHERE id = $1 AND tenant_id = $2 AND task_type = 'capture_orchestration'
     ${lock ? 'FOR UPDATE' : ''}
