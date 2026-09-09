@@ -52,9 +52,10 @@ function postLine(post, index, heat) {
   const item = post && typeof post === 'object' ? post : {};
   const title = oneLine(item.title, '未命名帖子');
   const url = safeUrl(item.url);
-  const nodes = [text(heat ? `TOP${index + 1}：` : `${index + 1}、`),
-    url ? { tag: 'a', text: title, href: url } : text(`${title}（原帖链接待补）`),
-    text(` - ${oneLine(customerDailyPostPlatform(item), '未知平台', 40)}`)];
+  // Raw URLs let Feishu resolve the native title and hover preview. Keep them
+  // untruncated and separated from surrounding text; parsed titles include the platform.
+  const nodes = [text(heat ? `TOP${index + 1}： ` : `${index + 1}、 `),
+    text(url || `${title}（原帖链接待补） - ${oneLine(customerDailyPostPlatform(item), '未知平台', 40)}`)];
   if (heat) nodes.push(text(` | 热度 ${heatLabel(item)} | ${comparisonLabel(item)}`));
   return nodes;
 }

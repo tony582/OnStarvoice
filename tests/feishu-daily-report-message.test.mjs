@@ -11,25 +11,32 @@ const build = input => buildFeishuDailyPost({snapshot: snapshot(input), imageKey
 const nodes = post => post.zh_cn.content.flat();
 const words = post => nodes(post).map(node => node.text || '').join('\n');
 const links = post => nodes(post).filter(node => node.tag === 'a');
+const isPostUrl = node => node.tag === 'text' && /^https?:\/\//.test(node.text);
+const postUrls = post => nodes(post).filter(isPostUrl).map(node => node.text);
 
 test('daily post renders an actual top image and all 11 post links plus editable document', () => {
   const post = build({highHeat: Array.from({length: 7}, (_, i) => item(i)), coldMarked: Array.from({length: 4}, (_, i) => item(20 + i))});
   assert.equal(post.zh_cn.title, '安吉星 · 舆情日报 2026-09-07');
   assert.deepEqual(post.zh_cn.content[0], [{tag: 'img', image_key: imageKey}]);
-  assert.equal(links(post).length, 12);
+  assert.deepEqual(postUrls(post), [...Array.from({length: 7}, (_, i) => item(i).url), ...Array.from({length: 4}, (_, i) => item(20 + i).url)]);
+  assert.equal(links(post).length, 1);
   assert.equal(links(post).at(-1).href, documentUrl);
   assert.match(words(post), /TOP7：/);
   assert.match(words(post), /热度 320 \| 较昨日 ↑180%/);
-  assert.match(words(post), / - 小红书/);
+  assert.equal(post.zh_cn.content[2].map(node => node.text).join(''), `TOP1： ${item(0).url} | 热度 320 | 较昨日 ↑180%`);
+  assert.ok(post.zh_cn.content.some(row => row.map(node => node.text).join('') === `1、 ${item(20).url}`));
+  assert.doesNotMatch(words(post), / - 小红书/);
   assert.doesNotMatch(words(post), /另有|测试|数据说明|截至/);
 });
 
 test('untrusted titles remain ordinary nodes and unsafe or credential-bearing URLs are not linked', () => {
   const maliciousTitle = '[](<at user_id="all">) **标题** <script>&amp;';
   const urls = ['javascript:alert(1)', 'data:text/html,test', 'https://user:password@example.com/post', 'https://example.com/\npost'];
-  const post = build({highHeat: [{...item(1), title: maliciousTitle, url: 'https://example.com/post?q=%5Btest%5D&x=1'}, ...urls.map((url, i) => ({...item(i + 2), url}))]});
-  assert.equal(links(post)[0].text, maliciousTitle);
-  assert.equal(links(post).length, 2);
+  const validUrl = `https://example.com/post?q=%5Btest%5D&xsec_token=${'a'.repeat(250)}%3D&xsec_source=pc_search`;
+  const post = build({highHeat: [{...item(1), title: maliciousTitle, url: validUrl}, ...urls.map((url, i) => ({...item(i + 2), title: maliciousTitle, url}))]});
+  assert.deepEqual(postUrls(post), [validUrl]);
+  assert.equal(links(post).length, 1);
+  assert.ok(nodes(post).some(node => node.tag === 'text' && node.text === `${maliciousTitle}（原帖链接待补） - 小红书`));
   assert.equal(nodes(post).filter(node => !['text', 'a', 'img'].includes(node.tag)).length, 0);
   assert.match(words(post), /原帖链接待补/);
   assert.equal(JSON.stringify(post).includes('user:password'), false);
@@ -60,8 +67,8 @@ test('overflow stays within the final serialized app request budget with both se
   const post = build({highHeat: records, coldMarked: records});
   assert.ok(feishuDailyPostRequestBytes(post) <= FEISHU_DAILY_POST_MAX_BYTES);
   const firstCold = post.zh_cn.content.findIndex(row => row.some(node => node.text === '三、冷处理负面帖链接'));
-  const heatDisplayed = post.zh_cn.content.slice(0, firstCold).flat().filter(node => node.tag === 'a').length;
-  const coldDisplayed = post.zh_cn.content.slice(firstCold, -1).flat().filter(node => node.tag === 'a').length;
+  const heatDisplayed = post.zh_cn.content.slice(0, firstCold).flat().filter(isPostUrl).length;
+  const coldDisplayed = post.zh_cn.content.slice(firstCold, -1).flat().filter(isPostUrl).length;
   assert.ok(heatDisplayed > 0 && heatDisplayed < records.length);
   assert.ok(coldDisplayed > 0 && coldDisplayed < records.length);
   assert.match(words(post), new RegExp(`另有 ${records.length - heatDisplayed} 条高热负面帖子`));
@@ -71,8 +78,8 @@ test('overflow stays within the final serialized app request budget with both se
 
 test('large high-heat section cannot exclude a short cold section', () => {
   const post = build({highHeat: Array.from({length: 400}, (_, i) => ({...item(i), title: '标题'.repeat(100)})), coldMarked: [item('cold-one'), item('cold-two')]});
-  assert.ok(links(post).some(link => link.href.endsWith('/cold-one')));
-  assert.ok(links(post).some(link => link.href.endsWith('/cold-two')));
+  assert.ok(postUrls(post).some(url => url.endsWith('/cold-one')));
+  assert.ok(postUrls(post).some(url => url.endsWith('/cold-two')));
   assert.doesNotMatch(words(post), /另有 \d+ 条冷处理/);
 });
 
