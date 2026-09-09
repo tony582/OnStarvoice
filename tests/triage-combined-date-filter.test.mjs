@@ -62,15 +62,35 @@ test('content triage UI keeps each date range and sends it to list and export qu
   const filter = source('web/admin/src/components/shared/DateRangeFilter.tsx');
 
   assert.match(queue, /<CombinedDateRangeFilter value=\{dateRanges\} onChange=\{setDateRanges\}/);
-  for (const key of ['publishFrom', 'publishTo', 'recentFrom', 'recentTo', 'firstFrom', 'firstTo']) {
+  for (const key of ['publishFrom', 'publishTo', 'recentFrom', 'recentTo', 'firstFrom', 'firstTo', 'handledFrom', 'handledTo']) {
     assert.match(queue, new RegExp(`params\\.set\\('${key}'`));
   }
   assert.match(filter, /\['publish', '发布时间'\]/);
   assert.match(filter, /\['first', '首次发现'\]/);
   assert.match(filter, /\['recent', '最近采集'\]/);
+  assert.match(filter, /\['handled', '处理时间'\]/);
   assert.match(filter, /label: '今日'/);
   assert.match(filter, /label: '本周'/);
   assert.match(filter, /label: '本月'/);
   assert.match(filter, /各自保留区间/);
   assert.doesNotMatch(filter, /组合日期筛选/);
+});
+
+test('handled date filtering stays combined-only and follows initial, clear, selection and export paths', () => {
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const filter = source('web/admin/src/components/shared/DateRangeFilter.tsx');
+  const legacyOrder = filter.match(/const BASIS_ORDER:[^\n]+/)?.[0];
+  assert.ok(legacyOrder);
+  assert.doesNotMatch(legacyOrder, /handled/);
+  assert.match(filter, /export type CombinedDateBasis = DateBasis \| 'handled'/);
+  assert.match(filter, /COMBINED_BASIS_ORDER\.map/);
+  assert.match(filter, /筛选此期间人工更改过处理状态的帖子/);
+  assert.match(queue, /handled: \{ from: '', to: '' \}/);
+  assert.match(queue, /handled: \{ from: initial\?\.handledFrom \|\| '', to: initial\?\.handledTo \|\| '' \}/);
+  const selection = queue.match(/const sel = useSelection\([^\n]+/)?.[0];
+  assert.ok(selection);
+  assert.match(selection, /dateRanges\.handled\.from/);
+  assert.match(selection, /dateRanges\.handled\.to/);
+  assert.match(queue, /setDateRanges\(emptyDateRanges\(\)\)/);
+  assert.match(queue, /api\.download\('\/triage\/records\/export\?' \+ filterParams\(\)\.toString\(\)/);
 });

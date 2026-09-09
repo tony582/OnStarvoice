@@ -122,6 +122,7 @@ const emptyDateRanges = (): CombinedDateRanges => ({
   publish: { from: '', to: '' },
   recent: { from: '', to: '' },
   first: { from: '', to: '' },
+  handled: { from: '', to: '' },
 })
 
 function initialDateRanges(initial?: Record<string, string>): CombinedDateRanges {
@@ -129,6 +130,7 @@ function initialDateRanges(initial?: Record<string, string>): CombinedDateRanges
     publish: { from: initial?.publishFrom || '', to: initial?.publishTo || '' },
     recent: { from: initial?.recentFrom || '', to: initial?.recentTo || '' },
     first: { from: initial?.firstFrom || '', to: initial?.firstTo || '' },
+    handled: { from: initial?.handledFrom || '', to: initial?.handledTo || '' },
   }
 }
 
@@ -402,7 +404,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
-  const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${watchedFilter}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${pageSize}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${watchedFilter}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${dateRanges.handled.from}|${dateRanges.handled.to}|${pageSize}|${pagination?.page ?? 1}`)
 
   const batchRemovalCatalog = (() => {
     const tagsById = new Map<string, CustomTag>()
@@ -458,6 +460,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.recent.to) params.set('recentTo', dateRanges.recent.to)
     if (dateRanges.first.from) params.set('firstFrom', dateRanges.first.from)
     if (dateRanges.first.to) params.set('firstTo', dateRanges.first.to)
+    if (dateRanges.handled.from) params.set('handledFrom', dateRanges.handled.from)
+    if (dateRanges.handled.to) params.set('handledTo', dateRanges.handled.to)
     return params
   }, [archiveView, triageStatuses, risk, identity, sentiment, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
@@ -1301,7 +1305,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             'w-full flex-wrap items-center gap-2 rounded-xl bg-muted/30 p-3',
             mobileFiltersOpen ? 'flex' : 'hidden',
             'lg:flex lg:min-h-8 lg:rounded-none lg:bg-transparent lg:p-0',
-            view === 'list' && 'xl:grid xl:grid-cols-[232px_repeat(6,minmax(0,1fr))_58px]',
+            view === 'list' && 'xl:grid xl:grid-cols-[232px_repeat(7,minmax(0,1fr))_58px]',
           )}
         >
           <div className="contents lg:hidden">

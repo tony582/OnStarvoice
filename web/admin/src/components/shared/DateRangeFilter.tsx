@@ -10,12 +10,14 @@ function ymd(d: Date) {
 }
 
 export type DateBasis = 'publish' | 'recent' | 'first'
+export type CombinedDateBasis = DateBasis | 'handled'
 export type DateRangeValue = { from: string; to: string }
-export type CombinedDateRanges = Record<DateBasis, DateRangeValue>
+export type CombinedDateRanges = Record<CombinedDateBasis, DateRangeValue>
 
-const BASIS_FULL: Record<DateBasis, string> = { publish: '发布时间', recent: '最近采集', first: '首次发现' }
+const BASIS_FULL: Record<CombinedDateBasis, string> = { publish: '发布时间', recent: '最近采集', first: '首次发现', handled: '处理时间' }
 const BASIS_SHORT: Record<DateBasis, string> = { publish: '发布', recent: '最近', first: '首次' }
 const BASIS_ORDER: [DateBasis, string][] = [['publish', '发布时间'], ['first', '首次发现'], ['recent', '最近采集']]
+const COMBINED_BASIS_ORDER: [CombinedDateBasis, string][] = [...BASIS_ORDER, ['handled', '处理时间']]
 
 function DateRangeEditor({ from, to, onChange, onPreset }: {
   from: string
@@ -129,7 +131,7 @@ export function DateRangeFilter({ from, to, onChange, basis, onBasisChange, trig
 }
 
 /**
- * 内容分诊用独立日期筛选组。三个日期维度直接展示，各自保留区间；
+ * 内容分诊用独立日期筛选组。四个日期维度直接展示，各自保留区间；
  * 同时设置多个维度时由服务端按 AND 组合。
  */
 export function CombinedDateRangeFilter({ value, onChange, triggerClassName }: {
@@ -139,7 +141,7 @@ export function CombinedDateRangeFilter({ value, onChange, triggerClassName }: {
 }) {
   return (
     <>
-      {BASIS_ORDER.map(([basis]) => (
+      {COMBINED_BASIS_ORDER.map(([basis]) => (
         <IndependentDateRangeFilter
           key={basis}
           basis={basis}
@@ -153,7 +155,7 @@ export function CombinedDateRangeFilter({ value, onChange, triggerClassName }: {
 }
 
 function IndependentDateRangeFilter({ basis, value, onChange, triggerClassName }: {
-  basis: DateBasis
+  basis: CombinedDateBasis
   value: DateRangeValue
   onChange: (from: string, to: string) => void
   triggerClassName?: string
@@ -193,6 +195,7 @@ function IndependentDateRangeFilter({ basis, value, onChange, triggerClassName }
           'responsive-filter-popover absolute top-full z-50 mt-1.5 w-[264px] rounded-xl border border-border bg-card p-3.5 shadow-lg',
           basis === 'publish' ? 'left-0' : 'right-0',
         )}>
+          {basis === 'handled' && <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">筛选此期间人工更改过处理状态的帖子。</p>}
           <DateRangeEditor from={value.from} to={value.to} onChange={onChange} onPreset={() => setOpen(false)} />
           {active && (
             <button

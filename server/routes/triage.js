@@ -413,18 +413,65 @@ function appendDateBounds(where, params, query, { from, to, column }) {
   return where;
 }
 
-// 发布时间、最近采集、首次采集可分别设置区间；多个已设置区间按 AND 组合。
+function appendHandledDateFilter(where, params, query) {
+  const invalid = () => Object.assign(new Error('处理时间须为有效日期，开始日期不能晚于结束日期'), { status: 400, code: 'invalid_handled_date_range' });
+  function date(value) {
+    if (value === undefined || value === '') return '';
+    if (typeof value !== 'string' || !DATE_ONLY_RE.test(value) || Number(value.slice(0, 4)) === 0) throw invalid();
+    const parsed = new Date(`${value}T00:00:00Z`);
+    if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) throw invalid();
+    return value;
+  }
+  const from = date(query.handledFrom);
+  const to = date(query.handledTo);
+  if (from && to && from > to) throw invalid();
+  if (!from && !to) return where;
+  let bounds = '';
+  if (from) {
+    params.push(from);
+    bounds += ` AND handled.created_at >= ($${params.length}::date::timestamp AT TIME ZONE 'Asia/Shanghai')`;
+  }
+  if (to) {
+    params.push(to);
+    bounds += ` AND handled.created_at < (($${params.length}::date + INTERVAL '1 day') AT TIME ZONE 'Asia/Shanghai')`;
+  }
+  // Search transitions in the selected period, not the latest record update:
+  // recapture, notes and later status changes must not erase a past handling day.
+  // Missing previous states in old audit rows cannot prove an actual transition.
+  // List and export bind tenant ID first. Build the matching ID set once rather
+  // than re-scanning the day's audit rows for every post in the tenant.
+  return `${where} AND r.id::text IN (
+    SELECT handled.target_id FROM audit_logs handled
+    WHERE handled.tenant_id = $1${bounds}
+      AND handled.target_type = 'record'
+      AND handled.action IN ('record.triage_updated', 'record.ticket_created', 'record.official_response_marked')
+      AND handled.metadata->>'nextStatus' <> handled.metadata->>'previousStatus'
+    UNION ALL
+    SELECT changed.record_id FROM audit_logs handled
+    CROSS JOIN LATERAL jsonb_array_elements_text(
+      CASE WHEN jsonb_typeof(handled.metadata->'recordIds') = 'array'
+        THEN handled.metadata->'recordIds' ELSE '[]'::jsonb END
+    ) changed(record_id)
+    WHERE handled.tenant_id = $1${bounds}
+      AND handled.target_type = 'record'
+      AND handled.action = 'record.triage_batch_updated'
+      AND handled.metadata->>'status' <> (handled.metadata->'previous'->changed.record_id->>'status')
+  )`;
+}
+
+// 发布时间、最近采集、首次采集及处理时间可分别设置区间；多个区间按 AND 组合。
 // dateFrom/dateTo/dateBasis 是旧客户端参数，只有未携带新组合参数时才使用。
 export function appendTriageDateFilters(where, params, query = {}) {
-  const hasCombinedParams = COMBINED_DATE_FILTERS.some(({ from, to }) => (
+  const hasCombinedParams = [...COMBINED_DATE_FILTERS, { from: 'handledFrom', to: 'handledTo' }].some(({ from, to }) => (
     Object.prototype.hasOwnProperty.call(query, from)
     || Object.prototype.hasOwnProperty.call(query, to)
   ));
   if (hasCombinedParams) {
-    return COMBINED_DATE_FILTERS.reduce(
+    const datedWhere = COMBINED_DATE_FILTERS.reduce(
       (nextWhere, definition) => appendDateBounds(nextWhere, params, query, definition),
       where,
     );
+    return appendHandledDateFilter(datedWhere, params, query);
   }
 
   const basis = String(query.dateBasis || 'publish');

@@ -143,7 +143,7 @@ test('toolbar and header filter the eight handling states without ticket filters
   assert.doesNotMatch(secondary, /关注状态筛选|未关注/);
   assert.match(secondary, /<CombinedDateRangeFilter/);
   assert.match(secondary, /<MultiSelect label="风险信号"/);
-  assert.match(secondary, /xl:grid-cols-\[232px_repeat\(6,minmax\(0,1fr\)\)_58px\]/);
+  assert.match(secondary, /xl:grid-cols-\[232px_repeat\(7,minmax\(0,1fr\)\)_58px\]/);
   assert.doesNotMatch(queue, /TicketStatusFilter|工单状态筛选/);
 
   assert.match(header, /label="平台"[\s\S]*value=\{platform\}[\s\S]*onChange=\{setPlatform\}/);

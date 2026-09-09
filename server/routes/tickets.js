@@ -313,13 +313,33 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
           }
         }
         if (sourceType === 'content') {
-          await markContentRecordNegativeFeishu(tx, {
+          const previousStatus = await markContentRecordNegativeFeishu(tx, {
             tenantId: req.tenantId,
             recordId: sourceId,
             userId: req.user?.id,
             userName: req.user?.name || req.user?.email || '',
             feishuTableNo: existing.external_ticket_no || externalTicketNo,
           });
+          if (previousStatus !== 'negative_feishu') {
+            await tx.execute(`
+              INSERT INTO audit_logs (
+                tenant_id, actor_type, actor_id, actor_user_id,
+                action, target_type, target_id, metadata
+              ) VALUES ($1, $2, $3, $4, 'record.triage_updated', 'record', $5, $6::jsonb)
+            `, [
+              req.tenantId,
+              req.actorType || 'user',
+              req.user?.id || req.authCode || '',
+              req.user?.id || null,
+              sourceId,
+              JSON.stringify({
+                previousStatus,
+                nextStatus: 'negative_feishu',
+                source: 'existing_ticket',
+                ticketId: existing.id,
+              }),
+            ]);
+          }
         }
         return { ticket: existing, existed: true };
       }
