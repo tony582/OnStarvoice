@@ -2329,8 +2329,8 @@ test("server-owned local closure metadata survives snapshots without Agent injec
   );
   assert.match(
     mirror,
-    /metadata = \(\s*EXCLUDED\.metadata\s*- 'requiresLocalClosureReuseFenceV1'\s*- 'stoppedBeforeDispatch'\s*\)/u,
-    "an Agent snapshot must not mint either server-owned fence field",
+    /metadata = \(\s*EXCLUDED\.metadata\s*- 'requiresLocalClosureReuseFenceV1'\s*- 'stoppedBeforeDispatch'\s*- 'historyClearedAt'\s*- 'historyClearedBy'\s*\)/u,
+    "an Agent snapshot must not mint server-owned fence or history fields",
   );
   assert.match(
     mirror,
@@ -2340,6 +2340,8 @@ test("server-owned local closure metadata survives snapshots without Agent injec
   for (const field of [
     "requiresLocalClosureReuseFenceV1",
     "stoppedBeforeDispatch",
+    "historyClearedAt",
+    "historyClearedBy",
   ]) {
     assert.match(
       mirror,
@@ -3564,7 +3566,7 @@ test("overview reports child-inclusive agent load but root-only task summary", (
   );
   assert.equal(
     [...overview.matchAll(
-      /t\.orchestration_revision = 0[\s\S]*?t\.metadata->>'draft' = 'true'/gu,
+      /t\.orchestration_revision = 0[\s\S]*?COALESCE\(t\.metadata->>'draft', 'false'\) = 'true'/gu,
     )].length,
     2,
   );

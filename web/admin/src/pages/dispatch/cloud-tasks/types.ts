@@ -243,6 +243,7 @@ export type OrchestrationComposerDrawerProps = {
 
 export type OrchestrationDetailWorkspaceProps = {
   orchestrationId: string | null
+  resultView?: boolean
   writable?: boolean
   availableAgents?: OrchestrationCloudAgent[]
   onClose?: () => void

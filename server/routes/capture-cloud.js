@@ -47,6 +47,12 @@ import {
   failUnattendedNegativePatrolItem,
 } from '../services/unattended-negative-patrol.js';
 import {
+  captureTaskHistoryEligibilitySql,
+  captureTaskResultTreeSql,
+  normalizeHistoryClearTaskIds,
+  readCaptureTaskResultSummary,
+} from '../services/capture-task-history.js';
+import {
   processSocialAccountHeartbeat,
 } from '../services/social-account-usage.js';
 import {
@@ -6214,6 +6220,8 @@ export async function mirrorTaskSnapshot(
   delete agentSnapshotMetadata.requiresLocalClosureReuseFenceV1;
   delete agentSnapshotMetadata.stoppedBeforeDispatch;
   delete agentSnapshotMetadata.perItemAdmissionV1;
+  delete agentSnapshotMetadata.historyClearedAt;
+  delete agentSnapshotMetadata.historyClearedBy;
   delete agentSnapshotMetadata.itemAttempts;
   delete agentSnapshotMetadata.attemptIdentity;
   delete agentSnapshotMetadata.localRecoveryClientAttemptId;
@@ -6322,7 +6330,13 @@ export async function mirrorTaskSnapshot(
           EXCLUDED.metadata
           - 'requiresLocalClosureReuseFenceV1'
           - 'stoppedBeforeDispatch'
+          - 'historyClearedAt'
+          - 'historyClearedBy'
         )
+        || jsonb_strip_nulls(jsonb_build_object(
+          'historyClearedAt', capture_tasks.metadata->'historyClearedAt',
+          'historyClearedBy', capture_tasks.metadata->'historyClearedBy'
+        ))
         || CASE
           WHEN capture_tasks.status = 'resume_requested'
             AND EXCLUDED.status IN ('needs_action', 'failed', 'interrupted', 'completed_with_failures')
@@ -9920,24 +9934,7 @@ router.get('/history', requireTenantAccess, requireSessionUser, async (req, res,
       t.tenant_id = $1
       AND t.parent_task_id IS NULL
       AND ${captureTaskBusinessRootVisibilitySql('t')}
-      AND t.task_type NOT IN ('unattended_plan_configuration', 'sync')
-      AND RIGHT(t.task_type, 5) <> '_sync'
-      AND t.status <> 'superseded'
-      AND NOT (
-        t.task_type = 'capture_orchestration'
-        AND (
-          (t.orchestration_revision = 0 AND t.metadata->>'draft' = 'true')
-          OR t.metadata->>'orchestrationTemplate' = 'true'
-        )
-      )
-      AND t.status NOT IN (
-        'pending', 'waiting_device', 'claimed', 'running', 'recovering',
-        'resume_requested'
-      )
-      AND NOT (
-        t.status IN ('interrupted', 'needs_action', 'failed', 'completed_with_failures')
-        AND t.attention_dismissed_at IS NULL
-      )
+      AND ${captureTaskHistoryEligibilitySql('t')}
     `];
     if (queryText) {
       params.push(`%${queryText}%`);
@@ -10016,6 +10013,87 @@ router.get('/history', requireTenantAccess, requireSessionUser, async (req, res,
         totalPages,
       },
       filters: {q: queryText, platform, status, from, to, days},
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/history/clear', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const taskIds = normalizeHistoryClearTaskIds(req.body?.taskIds);
+    if (!taskIds) {
+      return res.status(400).json({ok: false, error: 'invalid_task_ids', message: '请选择 1 至 100 个有效的历史任务'});
+    }
+    const result = await withTransaction(async tx => {
+      // Lock every requested root before validating any write. This serializes
+      // against normal resume/stop/projection operations on the same task tree.
+      const tasks = await tx.queryAll(`
+        SELECT t.id, t.status, t.parent_task_id, t.metadata,
+          (${captureTaskBusinessRootVisibilitySql('t')}) AS business_root_visible,
+          (${captureTaskHistoryEligibilitySql('t', {includeCleared: true})}) AS history_eligible
+        FROM capture_tasks t
+        WHERE t.tenant_id = $1 AND t.id = ANY($2::uuid[])
+        ORDER BY t.id
+        FOR UPDATE OF t
+      `, [req.tenantId, taskIds]);
+      if (tasks.length !== taskIds.length) return {error: 'task_not_found'};
+      if (tasks.some(task => task.parent_task_id || task.business_root_visible !== true
+        || task.history_eligible !== true || ['needs_action', 'interrupted'].includes(task.status))) {
+        return {error: 'task_not_clearable'};
+      }
+      const blocker = await tx.queryOne(`
+        WITH RECURSIVE task_tree AS (
+          SELECT id FROM capture_tasks WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+          UNION
+          SELECT child.id FROM capture_tasks child
+          JOIN task_tree parent ON child.parent_task_id = parent.id
+          WHERE child.tenant_id = $1
+        )
+        SELECT EXISTS (
+          SELECT 1 FROM capture_tasks child JOIN task_tree tree ON tree.id = child.id
+          WHERE child.tenant_id = $1 AND child.status IN (
+            'pending', 'waiting_device', 'claimed', 'running', 'recovering',
+            'resume_requested'
+          )
+        ) OR EXISTS (
+          SELECT 1 FROM capture_task_items item JOIN task_tree tree ON tree.id = item.task_id
+          WHERE item.tenant_id = $1 AND item.status IN (
+            'pending', 'assigned', 'dispatch_pending', 'dispatched',
+            'waiting_device', 'running', 'retryable', 'needs_action'
+          )
+        ) OR EXISTS (
+          SELECT 1 FROM capture_agent_commands command JOIN task_tree tree ON tree.id = command.task_id
+          WHERE command.tenant_id = $1 AND command.status IN ('pending', 'acknowledged')
+            AND command.expires_at > now()
+        ) AS blocked
+      `, [req.tenantId, taskIds]);
+      if (blocker?.blocked) return {error: 'task_not_clearable'};
+      const alreadyClearedTaskIds = tasks.filter(task => text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
+      const clearedTaskIds = tasks.filter(task => !text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
+      if (clearedTaskIds.length > 0) {
+        await tx.execute(`
+          UPDATE capture_tasks
+          SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+            'historyClearedAt', now(), 'historyClearedBy', $3::text
+          )
+          WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+        `, [req.tenantId, clearedTaskIds, req.user.id]);
+      }
+      return {clearedTaskIds, alreadyClearedTaskIds};
+    });
+    if (result.error) {
+      return res.status(result.error === 'task_not_found' ? 404 : 409).json({
+        ok: false,
+        error: result.error,
+        message: result.error === 'task_not_found' ? '任务不存在或无权访问' : '仅可清除已结束且无需处理的历史主任务，请先处理仍在执行或等待恢复的任务',
+      });
+    }
+    clearCaptureOverviewProjectionCache();
+    return res.json({
+      ok: true, ...result,
+      clearedCount: result.clearedTaskIds.length + result.alreadyClearedTaskIds.length,
+      message: '已从历史列表移除，任务详情、采集内容和结果仍保留',
     });
   } catch (err) {
     return next(err);
@@ -10160,10 +10238,14 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
         WHERE t.tenant_id = $1
           AND t.parent_task_id IS NULL
           AND ${captureTaskBusinessRootVisibilitySql('t')}
+          AND (
+            NULLIF(t.metadata->>'historyClearedAt', '') IS NULL
+            OR NOT (${captureTaskHistoryEligibilitySql('t', {includeCleared: true})})
+          )
           AND NOT (
             t.task_type = 'capture_orchestration'
             AND t.orchestration_revision = 0
-            AND t.metadata->>'draft' = 'true'
+            AND COALESCE(t.metadata->>'draft', 'false') = 'true'
           )
         ORDER BY
           CASE WHEN t.status IN ('running', 'recovering', 'resume_requested', 'needs_action', 'interrupted') THEN 0 ELSE 1 END,
@@ -10191,20 +10273,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
               AND t.attention_dismissed_at IS NULL
           ) AS attention_tasks,
           COUNT(*) FILTER (
-            WHERE t.status NOT IN (
-              'pending', 'waiting_device', 'claimed', 'running', 'recovering',
-              'resume_requested', 'superseded'
-            )
-              AND NOT (
-                t.status IN ('interrupted', 'needs_action', 'failed', 'completed_with_failures')
-                AND t.attention_dismissed_at IS NULL
-              )
-              AND t.task_type NOT IN ('unattended_plan_configuration', 'sync')
-              AND RIGHT(t.task_type, 5) <> '_sync'
-              AND NOT (
-                t.task_type = 'capture_orchestration'
-                AND t.metadata->>'orchestrationTemplate' = 'true'
-              )
+            WHERE ${captureTaskHistoryEligibilitySql('t')}
               AND COALESCE(t.finished_at, t.updated_at, t.created_at) >= now() - interval '30 days'
           ) AS history_tasks
         FROM capture_tasks t
@@ -10217,7 +10286,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           AND NOT (
             t.task_type = 'capture_orchestration'
             AND t.orchestration_revision = 0
-            AND t.metadata->>'draft' = 'true'
+            AND COALESCE(t.metadata->>'draft', 'false') = 'true'
           )
       `, [req.tenantId]);
         return {agents, tasks, taskSummary};
@@ -16267,6 +16336,61 @@ router.post('/tasks/:id/stop', requireCriticalTenantAccess, requireSessionUser, 
         retryAfterMs,
       });
     }
+    return next(err);
+  }
+});
+
+router.get('/tasks/:id', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    if (!UUID_PATTERN.test(req.params.id)) {
+      return res.status(400).json({ok: false, error: 'invalid_task_id', message: '任务标识无效'});
+    }
+    const task = await queryOne(`
+      SELECT t.*, ca.display_name AS agent_display_name,
+        ca.host_label AS agent_host_label, ca.browser_name AS agent_browser_name,
+        ca.operating_system AS agent_operating_system, t.status AS effective_status
+      FROM capture_tasks t
+      LEFT JOIN capture_agents ca ON ca.id = COALESCE(t.assigned_agent_id, t.origin_agent_id)
+        AND ca.tenant_id = t.tenant_id
+      WHERE t.id = $1 AND t.tenant_id = $2
+    `, [req.params.id, req.tenantId]);
+    if (!task) return res.status(404).json({ok: false, error: 'task_not_found', message: '任务不存在'});
+    const resultSummary = await readCaptureTaskResultSummary({queryOne}, task.id, req.tenantId);
+    return res.json({ok: true, task, resultSummary});
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/tasks/:id/results', requireTenantAccess, requireSessionUser, async (req, res, next) => {
+  try {
+    if (!UUID_PATTERN.test(req.params.id)) {
+      return res.status(400).json({ok: false, error: 'invalid_task_id', message: '任务标识无效'});
+    }
+    const task = await queryOne('SELECT id FROM capture_tasks WHERE id = $1 AND tenant_id = $2', [req.params.id, req.tenantId]);
+    if (!task) return res.status(404).json({ok: false, error: 'task_not_found', message: '任务不存在'});
+    const page = Math.max(1, Math.floor(Number(req.query.page) || 1));
+    const pageSize = Math.min(100, Math.max(1, Math.floor(Number(req.query.pageSize) || 20)));
+    const [summary, records] = await Promise.all([
+      readCaptureTaskResultSummary({queryOne}, task.id, req.tenantId),
+      queryAll(`${captureTaskResultTreeSql}, linked_records AS (
+        SELECT observation.record_id, COUNT(*)::integer AS observation_count,
+          MAX(observation.captured_at) AS latest_captured_at
+        FROM record_observations observation
+        JOIN task_tree task ON task.id = observation.capture_task_id
+        WHERE observation.tenant_id = $2
+        GROUP BY observation.record_id
+      )
+      SELECT record.id, record.title, record.platform, record.keyword, record.created_at,
+        linked.observation_count AS "observationCount", linked.latest_captured_at AS "latestCapturedAt"
+      FROM linked_records linked
+      JOIN records record ON record.id = linked.record_id AND record.tenant_id = $2
+      ORDER BY linked.latest_captured_at DESC, record.id DESC
+      LIMIT $3 OFFSET $4
+      `, [task.id, req.tenantId, pageSize, (page - 1) * pageSize]),
+    ]);
+    return res.json({ok: true, records, total: summary.recordCount, page, pageSize});
+  } catch (err) {
     return next(err);
   }
 });

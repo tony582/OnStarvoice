@@ -15,6 +15,7 @@ import { AgentRail } from './cloud-tasks/AgentRail'
 import { CreateTaskDrawer } from './cloud-tasks/CreateTaskDrawer'
 import { PlansView } from './cloud-tasks/PlansView'
 import { HistoryView } from './cloud-tasks/HistoryView'
+import { TaskResultDetailWorkspace } from './cloud-tasks/TaskResultDetailWorkspace'
 import { TaskCard } from './cloud-tasks/TaskCard'
 import type {
   CloudAgent,
@@ -63,7 +64,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   const [templateActionId, setTemplateActionId] = useState('')
   const [agentActionId, setAgentActionId] = useState('')
   const [taskView, setTaskView] = useState<TaskView>(
-    () => params?.view === 'attention' ? 'attention' : 'active',
+    () => params?.view === 'history' ? 'history' : params?.view === 'plans' ? 'plans' : params?.view === 'attention' ? 'attention' : 'active',
   )
   const [mobileWorkspace, setMobileWorkspace] = useState<'tasks' | 'agents'>('tasks')
   const [composerIntent, setComposerIntent] = useState<ComposerIntent | null>(
@@ -97,6 +98,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
       : null,
   )
   const [orchestrationRefreshKey, setOrchestrationRefreshKey] = useState(0)
+  const [selectedResultTask, setSelectedResultTask] = useState<CloudTask | null>(null)
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0)
   const [historyTotal, setHistoryTotal] = useState<number | null>(null)
   const overviewLoadInFlight = useRef<Promise<void> | null>(null)
@@ -111,6 +113,17 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
 
   const closeOrchestrationDetail = useCallback(() => {
     setSelectedOrchestrationId(null)
+    setSelectedResultTask(null)
+  }, [])
+
+  const openTaskResult = useCallback((task: CloudTask) => {
+    if (task.task_type === 'capture_orchestration') {
+      setSelectedResultTask(null)
+      setSelectedOrchestrationId(task.id)
+    } else {
+      setSelectedOrchestrationId(null)
+      setSelectedResultTask(task)
+    }
   }, [])
 
   const focusMobileTaskView = useCallback((view: TaskView) => {
@@ -213,7 +226,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   }, [load])
 
   useEffect(() => {
-    if (!selectedOrchestrationId) return
+    if (!selectedOrchestrationId && !selectedResultTask) return
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
     const previousOverflow = document.body.style.overflow
     document.body.style.overflow = 'hidden'
@@ -225,13 +238,16 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
     }, 0)
 
     const onKeyDown = (event: KeyboardEvent) => {
+      const nestedDialog = orchestrationDetailDialogRef.current?.querySelector<HTMLElement>('[role="dialog"]')
       if (event.key === 'Escape') {
+        if (nestedDialog) return
         event.preventDefault()
         closeOrchestrationDetail()
         return
       }
       if (event.key !== 'Tab' || !orchestrationDetailDialogRef.current) return
-      const focusable = Array.from(orchestrationDetailDialogRef.current.querySelectorAll<HTMLElement>(
+      const focusScope = nestedDialog || orchestrationDetailDialogRef.current
+      const focusable = Array.from(focusScope.querySelectorAll<HTMLElement>(
         'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
       )).filter(element => !element.hasAttribute('hidden') && element.getAttribute('aria-hidden') !== 'true')
       if (focusable.length === 0) {
@@ -257,7 +273,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
       document.body.style.overflow = previousOverflow
       previouslyFocused?.focus()
     }
-  }, [closeOrchestrationDetail, selectedOrchestrationId])
+  }, [closeOrchestrationDetail, selectedOrchestrationId, selectedResultTask])
 
   const businessTasks = useMemo(
     () => (overview?.tasks || []).filter(isBusinessVisibleTask),
@@ -590,7 +606,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div className={mobile ? 'hidden' : 'min-w-0'}>
                 <div className="flex items-center gap-2"><ListChecks className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">任务队列</h3></div>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">{taskView === 'plans' ? '集中管理多 Agent 编排模板与各设备的无人值守计划' : '按创建时间倒序，新任务在最前'}</p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">{taskView === 'plans' ? '集中管理多 Agent 编排模板与各设备的无人值守计划' : taskView === 'history' ? '查看所有任务的运行结果，最近结束的任务在最前' : '按创建时间倒序，新任务在最前'}</p>
                 {Number(overview?.summary.aiConcurrencyLimit || 0) > 0 && (
                   <p className="mt-0.5 text-[11px] leading-5 text-muted-foreground">
                     AI 处理中 {Number(overview?.summary.aiActive || 0)}/{Number(overview?.summary.aiConcurrencyLimit || 0)}
@@ -650,6 +666,8 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
                 onDismissAttention={dismissAttention}
                 onOpenOrchestration={task => setSelectedOrchestrationId(task.id)}
                 onTotalChange={setHistoryTotal}
+                onOpenResult={openTaskResult}
+                onCleared={() => load(true)}
               />
             ) : (
               <>
@@ -680,6 +698,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
                       <TaskCard key={task.id} task={task} surface={surface} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
                         onRetryOnIdleAgent={retryOnIdleAgent}
                         onDismissAttention={dismissAttention}
+                        onOpenResult={openTaskResult}
                         onOpenOrchestration={selected => setSelectedOrchestrationId(selected.id)} />
                     ))}
                   </div>
@@ -807,16 +826,18 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
         />
       )}
 
-      {selectedOrchestrationId && (
+      {(selectedOrchestrationId || selectedResultTask) && (
         <div ref={orchestrationDetailDialogRef}
           className="fixed inset-0 z-[60] overflow-y-auto bg-black/35 p-0 outline-none sm:p-4 lg:p-8"
-          role="dialog" aria-modal="true" aria-labelledby="orchestration-detail-title" tabIndex={-1}
+          role="dialog" aria-modal="true" aria-labelledby={selectedOrchestrationId ? 'orchestration-detail-title' : 'task-result-detail-title'} tabIndex={-1}
           onMouseDown={event => {
             if (event.target === event.currentTarget) closeOrchestrationDetail()
           }}>
           <div className="mx-auto max-w-6xl">
+            {selectedOrchestrationId ? (
             <OrchestrationDetailWorkspace
               orchestrationId={selectedOrchestrationId}
+              resultView={taskView === 'history'}
               refreshKey={orchestrationRefreshKey}
               writable={canWrite()}
               availableAgents={operationalAgents}
@@ -830,6 +851,14 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
                 await load(true)
               }}
             />
+            ) : selectedResultTask && (
+              <TaskResultDetailWorkspace
+                key={selectedResultTask.id}
+                taskId={selectedResultTask.id}
+                initialTask={selectedResultTask}
+                onClose={closeOrchestrationDetail}
+              />
+            )}
           </div>
         </div>
       )}

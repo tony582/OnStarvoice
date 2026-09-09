@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { hasUnattendedNegativePatrol } from './unattendedNegativePatrol.mjs'
 import {
-  Archive, BadgeCheck, Bot, ChevronDown, ChevronUp, Loader2, MessagesSquare, Network, Play, RefreshCw, ShieldAlert, Square,
+  Archive, BadgeCheck, Bot, ChevronDown, ChevronUp, Eye, Loader2, MessagesSquare, Network, Play, RefreshCw, ShieldAlert, Square,
   Radar,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { KeywordProgressSummary, TaskDiagnosticsPanel } from './TaskDiagnostics'
 import type { CloudTask } from './lib'
+import { resultCount, resultTiming } from './task-result-presentation.mjs'
 import {
   PLATFORM_LABELS,
   STATUS_LABELS,
@@ -36,6 +37,8 @@ export function TaskCard({
   onStop,
   onDismissAttention,
   onOpenOrchestration,
+  onOpenResult,
+  history = false,
 }: {
   task: CloudTask
   surface?: 'desktop' | 'mobile'
@@ -46,6 +49,8 @@ export function TaskCard({
   onStop: (task: CloudTask) => Promise<void>
   onDismissAttention: (task: CloudTask) => Promise<void>
   onOpenOrchestration: (task: CloudTask) => void
+  onOpenResult?: (task: CloudTask) => void
+  history?: boolean
 }) {
   const mobile = surface === 'mobile'
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -210,6 +215,28 @@ export function TaskCard({
     : Array.isArray(task.metadata?.eligibleAgentIds)
       ? task.metadata.eligibleAgentIds.length
       : safeNumber(task.counts?.agents)
+
+  if (history) {
+    const openResult = () => onOpenResult ? onOpenResult(task) : orchestration ? onOpenOrchestration(task) : undefined
+    const timing = resultTiming({createdAt: task.created_at, startedAt: task.started_at, finishedAt: task.finished_at})
+    return <article className={`rounded-2xl border border-border/70 bg-card shadow-xs ${mobile ? 'p-3.5' : 'p-4'}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1"><div className="text-[11px] text-muted-foreground">{PLATFORM_LABELS[task.platform] || task.platform} · {taskMode}</div><h4 className="mt-1.5 break-words text-[15px] font-bold leading-5">{task.title || `${taskMode}结果`}</h4></div>
+        <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${displayedStatusTone}`}>{displayedStatus}</span>
+      </div>
+      <dl className="mt-3 grid gap-x-4 gap-y-2 text-[11px] sm:grid-cols-2">
+        <div><dt className="inline text-muted-foreground">{task.started_at ? '开始' : '创建'}：</dt><dd className="inline">{formatTime(task.started_at || task.created_at)}</dd></div>
+        <div><dt className="inline text-muted-foreground">结束：</dt><dd className="inline">{formatTime(task.finished_at)}</dd></div>
+        {task.finished_at && <div><dt className="inline text-muted-foreground">{timing.label}：</dt><dd className="inline">{timing.duration}</dd></div>}
+        <div><dt className="inline text-muted-foreground">执行节点：</dt><dd className="inline">{orchestration ? orchestrationAgentCount > 0 ? `${orchestrationAgentCount} 个节点` : '未记录' : [task.agent_host_label, task.agent_display_name].filter(Boolean).join(' · ') || '未保留节点名称'}</dd></div>
+      </dl>
+      {taskError && <p className="mt-2 line-clamp-2 text-xs leading-5 text-status-red">{taskError}</p>}
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-3">
+        <span className="text-[11px] text-muted-foreground">{resultCount(task.counts?.total) !== null ? `${resultCount(task.counts?.total)} 个工作项 · ` : ''}执行结果已保留</span>
+        <Button size="sm" className={mobile ? 'min-h-11' : ''} onClick={openResult} disabled={!onOpenResult && !orchestration}><Eye className="h-4 w-4" />查看结果</Button>
+      </div>
+    </article>
+  }
 
   return (
     <article className={`rounded-2xl border border-border/70 bg-card shadow-xs ${mobile ? 'p-3.5' : 'p-4'} ${orchestration ? 'border-l-2 border-l-primary/40' : ''}`}>

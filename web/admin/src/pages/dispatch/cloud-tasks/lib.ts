@@ -93,6 +93,7 @@ export type CloudTask = {
   heartbeat_at?: string | null
   business_progress_at?: string | null
   created_at?: string | null
+  started_at?: string | null
   updated_at?: string | null
   finished_at?: string | null
   attention_dismissed_at?: string | null

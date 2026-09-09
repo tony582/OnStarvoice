@@ -782,6 +782,10 @@ export function normalizeCloudTaskSnapshot(input = {}) {
   const metadata = removeCloudTaskHealthMetadataAliases(
     sanitizeCloudStructuredObject(task.metadata),
   );
+  // History visibility belongs to the server user action, never to a device
+  // snapshot (including the first insert and later heartbeat mirrors).
+  delete metadata.historyClearedAt;
+  delete metadata.historyClearedBy;
   // Local closure has exactly one authoritative top-level channel. Metadata
   // aliases are removed before strictly normalized single/array reports are
   // promoted. The legacy object remains supported for rolling upgrades.

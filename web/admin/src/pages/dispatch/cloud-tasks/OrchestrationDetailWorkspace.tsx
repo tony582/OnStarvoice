@@ -35,6 +35,9 @@ import type {
 // 平台/状态文案与时间格式化统一以 lib.ts 为准，避免两处定义漂移。
 import { PLATFORM_LABELS, STATUS_LABELS, formatTime } from './lib'
 import { KeywordExecutionReport } from './KeywordExecutionReport'
+import { OrchestrationResultReport } from './OrchestrationResultReport'
+import { TaskResultTimes } from './TaskResultSections'
+import { TaskResultRecords } from './TaskResultDetailWorkspace'
 import {
   allocateKeywordRetryItems,
   buildKeywordRetryAssignments,
@@ -351,6 +354,7 @@ function agentSupportsKeywordRetry(
 
 export function OrchestrationDetailWorkspace({
   orchestrationId,
+  resultView = false,
   writable = false,
   availableAgents = [],
   onClose,
@@ -460,6 +464,7 @@ export function OrchestrationDetailWorkspace({
   const isScheduleTemplate =
     detail?.orchestration.metadata?.orchestrationTemplate === true
   const metadata = detail?.orchestration.metadata || {}
+  const detailFinal = FINAL_ORCHESTRATION_STATUSES.has(String(detail?.orchestration.status || ''))
   const elasticPool = metadata.distributionMode === 'elastic_pool'
     || detail?.schedule?.distribution_mode === 'elastic_pool'
   const negativePatrol = detail?.orchestration.feature_key === 'negative_post_patrol'
@@ -830,7 +835,7 @@ export function OrchestrationDetailWorkspace({
   }, [agentsById, contentPatrol, detail, executionsById, isScheduleTemplate, nowMs, sortedItems])
 
   useEffect(() => {
-    if (!orchestrationId) return
+    if (!orchestrationId || resultView || detailFinal) return
     const refreshWhenVisible = () => {
       if (document.visibilityState === 'visible') void load(true, false)
     }
@@ -840,13 +845,13 @@ export function OrchestrationDetailWorkspace({
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', refreshWhenVisible)
     }
-  }, [load, orchestrationId])
+  }, [detailFinal, load, orchestrationId, resultView])
 
   useEffect(() => {
-    if (!orchestrationId) return
+    if (!orchestrationId || resultView || detailFinal) return
     const timer = window.setInterval(() => setNowMs(Date.now()), 1_000)
     return () => window.clearInterval(timer)
-  }, [orchestrationId])
+  }, [detailFinal, orchestrationId, resultView])
 
   const stopAllExecutions = async () => {
     if (!writable || stopping || !canStopOrchestration) return
@@ -1274,6 +1279,7 @@ export function OrchestrationDetailWorkspace({
   const orchestrationFinal = FINAL_ORCHESTRATION_STATUSES.has(
     String(orchestration.status || ''),
   )
+  const resultPresentation = !scheduleTemplate && (resultView || orchestrationFinal)
   const automaticKeywordRecoveryActive = Boolean(
     elasticPool &&
     idleHandoffAllowed &&
@@ -1303,10 +1309,10 @@ export function OrchestrationDetailWorkspace({
               </span>
             </div>
             <h2 id="orchestration-detail-title" className="mt-2.5 truncate text-lg font-bold text-foreground">{orchestration.title || '未命名编排任务'}</h2>
-            <p className="mt-1 text-xs text-muted-foreground">创建于 {formatTime(orchestration.created_at)} · 版本 {orchestration.revision ?? orchestration.orchestration_revision ?? '—'}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{resultPresentation ? '任务结果 · ' : ''}创建于 {formatTime(orchestration.created_at)} · 版本 {orchestration.revision ?? orchestration.orchestration_revision ?? '—'}</p>
           </div>
           <div className="flex w-full flex-wrap items-center justify-start gap-2 sm:w-auto sm:shrink-0 sm:justify-end">
-            {scheduleTemplate && schedule && ['active', 'paused', 'completed'].includes(schedule.status) ? (
+            {!resultView && scheduleTemplate && schedule && ['active', 'paused', 'completed'].includes(schedule.status) ? (
               <>
                 <Button
                   variant="outline"
@@ -1348,14 +1354,14 @@ export function OrchestrationDetailWorkspace({
                   </Button>
                 )}
               </>
-            ) : (
+            ) : !resultView && !orchestrationFinal ? (
               <Button variant="destructive" size="sm" onClick={() => void stopAllExecutions()}
                 disabled={!writable || stopping || !canStopOrchestration}
                 title={!writable ? '当前账号为只读权限' : !canStopOrchestration ? '当前任务已经结束或不能停止' : '停止整个父任务、自动接力和仍可控制的 Agent 子任务'}>
                 {stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5 fill-current" />}
                 停止全部
               </Button>
-            )}
+            ) : null}
             <Button variant="outline" size="icon" onClick={() => void load(true)} disabled={refreshing} aria-label="刷新编排任务详情">
               <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
             </Button>
@@ -1370,7 +1376,7 @@ export function OrchestrationDetailWorkspace({
       </header>
 
       <div className="p-4 sm:p-5">
-        {automaticRecoveryStates.length > 0 && (
+        {!resultView && !orchestrationFinal && automaticRecoveryStates.length > 0 && (
           <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4" aria-label="恢复与阻塞实时状态">
             <div className="flex items-start gap-3">
               <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
@@ -1424,7 +1430,7 @@ export function OrchestrationDetailWorkspace({
             </div>
           </section>
         )}
-        {attentionContext && (
+        {!resultView && attentionContext && (
           <section className="mb-4 rounded-2xl border border-status-red/25 bg-status-red/[0.035] p-4" role="alert">
             <div className="flex items-start gap-3">
               <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-status-red/10 text-status-red">
@@ -1499,7 +1505,7 @@ export function OrchestrationDetailWorkspace({
             </div>
           </section>
         )}
-        {keywordRetryItems.length > 0 && (
+        {!resultView && keywordRetryItems.length > 0 && (
           <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex min-w-0 items-start gap-3">
@@ -1645,7 +1651,7 @@ export function OrchestrationDetailWorkspace({
             )}
           </section>
         )}
-        {negativePatrol && negativeReassignItems.length > 0 && (
+        {!resultView && negativePatrol && negativeReassignItems.length > 0 && (
           <section className="mb-4 overflow-hidden rounded-2xl border border-primary/20 bg-primary/[0.025]">
             <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-start sm:justify-between">
               <div className="flex min-w-0 items-start gap-3">
@@ -1864,7 +1870,7 @@ export function OrchestrationDetailWorkspace({
                     : `${sortedItems.length} 个关键词已分配`
                   : [
                       `${settledCount} 已结算`,
-                      `${activeCount} 进行/等待`,
+                      `${activeCount} ${resultPresentation ? '未完成' : '进行/等待'}`,
                       automaticRecoveryCount > 0 ? `${automaticRecoveryCount} 自动恢复` : '',
                       manualCount > 0 ? `${manualCount} 需人工` : '',
                       failedCount > 0 ? `${failedCount} 失败` : '',
@@ -1883,25 +1889,28 @@ export function OrchestrationDetailWorkspace({
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-primary">Task</div>
-              <h3 className="mt-1 text-sm font-bold text-foreground">{scheduleTemplate ? '计划分配' : '父任务进度'}</h3>
+              <h3 className="mt-1 text-sm font-bold text-foreground">{scheduleTemplate ? '计划分配' : resultPresentation ? '本次任务结果' : '父任务进度'}</h3>
               <p className="mt-1 text-xs text-muted-foreground">
                 {scheduleTemplate
                   ? elasticPool
                     ? '这里展示后续每轮都会沿用的关键词和弹性节点池；实际领取量由节点空闲速度决定。'
                     : '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
+                  : resultPresentation
+                    ? '汇总本次任务的完成情况，逐项结果和异常见下方。'
                   : contentPatrol
                     ? '按每条帖子的真实巡查结果汇总，并展示它由哪个 Agent 执行。'
                     : '只按服务端返回的工作项状态统计，不推测 Extension 当前页面步骤。'}
               </p>
             </div>
             {!scheduleTemplate && <div className="flex flex-wrap gap-2 text-[11px]">
-              <span className="rounded-md bg-status-green/10 px-2 py-1 font-medium text-status-green">成功 {completedCount}</span>
-              <span className="rounded-md bg-primary/8 px-2 py-1 font-medium text-primary">进行/等待 {activeCount}</span>
+              <span className="rounded-md bg-status-green/10 px-2 py-1 font-medium text-status-green">{resultPresentation ? '工作项已完成' : '成功'} {completedCount}</span>
+              {(!resultPresentation || activeCount > 0) && <span className="rounded-md bg-primary/8 px-2 py-1 font-medium text-primary">{resultPresentation ? '未完成' : '进行/等待'} {activeCount}</span>}
               {automaticRecoveryCount > 0 && <span className="rounded-md bg-primary/8 px-2 py-1 font-medium text-primary">自动恢复 {automaticRecoveryCount}</span>}
               {manualCount > 0 && <span className="rounded-md bg-status-orange/8 px-2 py-1 font-medium text-status-orange">需人工 {manualCount}</span>}
               {failedCount > 0 && <span className="rounded-md bg-status-red/8 px-2 py-1 font-medium text-status-red">失败 {failedCount}</span>}
             </div>}
           </div>
+          {resultPresentation && <div className="mt-4 border-t border-border/70 pt-3"><TaskResultTimes createdAt={orchestration.created_at} startedAt={[...executions.map(execution => typeof execution.started_at === 'string' ? execution.started_at : ''), ...sortedItems.map(item => item.started_at || '')].filter(value => Number.isFinite(Date.parse(value))).sort((left, right) => Date.parse(left) - Date.parse(right))[0]} finishedAt={orchestration.finished_at} /><p className="mt-2 text-[10px] text-muted-foreground">开始时间取已保留的最早工作项或节点执行记录。</p></div>}
           {!scheduleTemplate && <div className="mt-4 flex items-center gap-3">
             <div
               className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-muted"
@@ -1929,7 +1938,7 @@ export function OrchestrationDetailWorkspace({
           )}
         </section>
 
-        {!contentPatrol && !scheduleTemplate ? (
+        {resultPresentation ? <><OrchestrationResultReport items={sortedItems} executions={executions} agents={agents} attempts={attempts} expectedSearchPasses={searchPasses.length || 1} /><div className="mt-4"><TaskResultRecords key={orchestration.id} taskId={orchestration.id} refreshKey={refreshKey} /></div></> : !contentPatrol && !scheduleTemplate ? (
           <div className="mt-4">
             <KeywordExecutionReport
               items={unattendedNegativePatrol ? keywordItems : sortedItems}
