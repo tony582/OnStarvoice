@@ -109,7 +109,7 @@ test('manual corrected negative and relevance follow existing patrol override se
 });
 
 test('every eligible handling state remains executable after same-day success and ignores legacy cadence dates', () => {
-  for (const triage_status of ['unhandled', 'replied', 'negative_feishu', 'official_responded', 'reviewed', 'negative_cold']) {
+  for (const triage_status of ['unhandled', 'replied', 'negative_feishu', 'official_responded', 'reviewed', 'negative_cold', 'negative_comment']) {
     for (const triage_priority of ['normal', 'high', 'urgent']) {
       const source = record({triage_status, triage_priority});
       const result = evaluateUnattendedNegativePatrolRecord(source, scope, state({
@@ -125,7 +125,7 @@ test('every eligible handling state remains executable after same-day success an
 });
 
 test('cold/reviewed get a first opportunity and measured stability remains audit evidence only', () => {
-  for (const status of ['negative_cold', 'reviewed']) {
+  for (const status of ['negative_cold', 'reviewed', 'negative_comment']) {
     const cold = record({triage_status: status});
     assert.equal(evaluateUnattendedNegativePatrolRecord(cold, scope).reason, 'first_patrol');
     assert.equal(evaluateUnattendedNegativePatrolRecord(cold, scope,

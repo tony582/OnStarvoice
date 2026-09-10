@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import {renderCustomerDailySummaryPng} from './customer-daily-report-image.js';
 import {buildFeishuDailyPost, FEISHU_DAILY_POST_IMAGE_PLACEHOLDER} from './feishu-daily-report-message.js';
-import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform,
+import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryHeaders, isMonthlyDailyReport, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform,
   customerDailyColdTitle, customerDailyColdPostLabel, customerDailyColdEmpty} from './customer-daily-report-presentation.js';
 
 // Official contracts: /document/develop-robots/add-bot-to-external-group,
@@ -85,15 +85,17 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
   if (!snapshot || !/^\d{4}-\d{2}-\d{2}$/.test(snapshot.reportDate || '') || !snapshot.summary?.day || !snapshot.summary?.mtd) {
     throw invalid('日报快照不完整');
   }
+  const modern = isMonthlyDailyReport(snapshot);
   const rows = [
+    ...(modern ? [customerDailySummaryHeaders(snapshot)] : [
     ['日期', '监控数量', 'SDB范畴', '正向', '中性', '负面', '', ''],
-    ['', '', '', '', '', '冷处理', '处理中', '已处理'],
+    ['', '', '', '', '', '冷处理', '处理中', '已处理']]),
     ...customerDailySummaryRows(snapshot).map(row => row.map(value => value === null ? '' : String(value))),
   ];
-  const table = { block_type: 31, table: { property: { row_size: 4, column_size: 8,
-    column_width: [120, 100, 100, 80, 80, 100, 100, 100], header_row: true } },
+  const table = { block_type: 31, table: { property: { row_size: rows.length, column_size: rows[0].length,
+    column_width: modern ? [130, 110, 100, 80, 80, 120, 150, 170, 110] : [120, 100, 100, 80, 80, 100, 100, 100], header_row: true } },
   nodes: rows.flatMap((row, rowIndex) => row.map(value => ({ block_type: 32, table_cell: {},
-    nodes: [textNode([run(value, null, rowIndex < 2)])] }))) };
+    nodes: [textNode([run(value, null, rowIndex < (modern ? 1 : 2))])] }))) };
   const nodes = [
     textNode(`${snapshot.tenantName || '客户'}舆情日报｜${snapshot.reportDate}${snapshot.mode === 'realtime' ? ' · 实时版' : ''}` , 3),
     textNode(CUSTOMER_DAILY_SECTIONS.summary, 4), table,
@@ -140,7 +142,7 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
     batch.descendants.push(...descendants);
   }
   if (batch.descendants.length) batches.push(batch);
-  return { schemaVersion: 1, batches, merges: MERGES };
+  return { schemaVersion: 1, batches, merges: modern ? [] : MERGES };
 }
 
 function normalizedText(block) {

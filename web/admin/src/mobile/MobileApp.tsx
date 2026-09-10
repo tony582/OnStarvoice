@@ -102,7 +102,7 @@ export default function MobileApp() {
 function MobileRouter() {
   const routerNavigate = useRouterNavigate()
   const location = useLocation()
-  const { navigate } = useNav()
+  const { navigate, page, params } = useNav()
   const { tenantId } = useAuth()
 
   const openPage = useCallback<OpenPage>((page, params) => {
@@ -116,6 +116,8 @@ function MobileRouter() {
   }, [location.pathname, location.search])
 
   const activeRoot = rootFromPath(location.pathname, location.search)
+  const initialPageQuery = new URLSearchParams(params || {}).toString()
+  const initialPagePath = `/m/page/${page}${initialPageQuery ? `?${initialPageQuery}` : ''}`
 
   return (
     <div className="mobile-shell flex h-dvh min-h-[520px] flex-col overflow-hidden bg-background text-foreground">
@@ -127,7 +129,7 @@ function MobileRouter() {
           <Route path="/m/insights" element={<InsightsHub openPage={openPage} />} />
           <Route path="/m/more" element={<MoreHub openPage={openPage} />} />
           <Route path="/m/page/:pageId" element={<MobilePageSurface />} />
-          <Route path="*" element={<Navigate replace to="/m/today" />} />
+          <Route path="*" element={<Navigate replace to={initialPagePath} />} />
         </Routes>
       </main>
       <BottomNav active={activeRoot} />
@@ -421,10 +423,11 @@ function TodayPage({ openPage }: { openPage: OpenPage }) {
         <section className="rounded-2xl border border-border bg-card p-4">
           <SectionHeading label="状态处理进度" meta={`${handled} / ${active}`} />
           <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-status-green" style={{ width: `${handledPct}%` }} /></div>
-          <div className="mt-3 grid grid-cols-3 divide-x divide-border text-center">
+          <div className="mt-3 grid grid-cols-2 gap-y-3 text-center">
             <MiniMetric label="待处理" value={k.unhandled} />
             <MiniMetric label="飞书表" value={k.negative_feishu} />
             <MiniMetric label="冷处理" value={k.negative_cold} />
+            <MiniMetric label="负面-评论区留言" value={k.negative_comment} />
           </div>
         </section>
 

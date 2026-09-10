@@ -9,7 +9,7 @@ import {
   type FeishuTableNumberSaveResult,
 } from '@/components/shared/FeishuTableNumberControl'
 
-type ColKey = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'privacy_unreachable' | 'negative_feishu' | 'negative_cold'
+type ColKey = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'privacy_unreachable' | 'negative_feishu' | 'negative_cold' | 'negative_comment'
 type BoardColumn = { key: ColKey; label: string; dot: string; ring: string }
 
 const COLUMNS: BoardColumn[] = [
@@ -21,6 +21,7 @@ const COLUMNS: BoardColumn[] = [
   { key: 'privacy_unreachable', label: '负面–隐私设置无法触达', dot: 'bg-status-red', ring: 'ring-status-red/40 bg-status-red/[0.04]' },
   { key: 'negative_feishu', label: '负面-飞书表', dot: 'bg-status-red', ring: 'ring-status-red/40 bg-status-red/[0.04]' },
   { key: 'negative_cold', label: '负面-冷处理', dot: 'bg-status-red', ring: 'ring-status-red/40 bg-status-red/[0.04]' },
+  { key: 'negative_comment', label: '负面-评论区留言', dot: 'bg-status-red', ring: 'ring-status-red/40 bg-status-red/[0.04]' },
 ]
 
 const PER_COL = 60
@@ -35,6 +36,7 @@ function emptyColumns(): Record<ColKey, any[]> {
     privacy_unreachable: [],
     negative_feishu: [],
     negative_cold: [],
+    negative_comment: [],
   }
 }
 
@@ -173,7 +175,7 @@ function BoardCard({ record: r, canWrite, dragging, onOpen, onSaveFeishuTableNo,
     ? 'border-l-status-orange'
     : r.triage_status === 'replied' || r.triage_status === 'reviewed'
       ? 'border-l-status-green'
-      : r.triage_status === 'negative_feishu' || r.triage_status === 'negative_cold'
+      : r.triage_status === 'negative_feishu' || r.triage_status === 'negative_cold' || r.triage_status === 'negative_comment'
         ? 'border-l-status-red'
         : 'border-l-status-grey'
   return (

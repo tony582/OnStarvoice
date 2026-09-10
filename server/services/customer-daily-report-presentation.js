@@ -6,10 +6,20 @@ export const CUSTOMER_DAILY_SECTIONS = Object.freeze({
   cold: '三、本期冷处理负面帖',
 });
 export const CUSTOMER_DAILY_SUMMARY_HEADERS = Object.freeze(['日期', '监控数量', 'SDB范畴', '正向', '中性', '冷处理', '处理中', '已处理']);
+export const CUSTOMER_DAILY_MONTHLY_HEADERS = Object.freeze(['舆情处理日期', '平台监控量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-负面处理流程', '负面-其他']);
+export const isMonthlyDailyReport = snapshot => snapshot?.summary?.format === 'daily_disposition_v2' && Array.isArray(snapshot.summary.rows);
+export const customerDailySummaryHeaders = snapshot => isMonthlyDailyReport(snapshot) ? CUSTOMER_DAILY_MONTHLY_HEADERS : CUSTOMER_DAILY_SUMMARY_HEADERS;
 
 function count(value) { return Number(value) || 0; }
 
 export function customerDailySummaryRows(snapshot) {
+  if (isMonthlyDailyReport(snapshot)) {
+    const values = (label, counts = {}, working = true) => [label, ...['monitor', 'sdb', 'positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther'].map(field => working ? counts[field] : null)];
+    return [...snapshot.summary.rows.map(row => {
+      const [year, month, day] = row.date.split('-');
+      return values(`${year}/${Number(month)}/${Number(day)}`, row.counts, row.isWorkingDay !== false);
+    }), values('MTD', snapshot.summary.mtd)];
+  }
   const [, month, day] = String(snapshot.reportDate || '').split('-');
   const handling = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
   const values = (label, counts = {}) => [label, count(counts.monitor), count(counts.sdb), count(counts.positive), count(counts.neutral), count(counts.cold), handling(counts.inProgress), handling(counts.processed)];

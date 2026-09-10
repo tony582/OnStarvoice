@@ -9,6 +9,9 @@ export type DailyCounts = {
   processed: number | null
   unclassified: number
   nonMonitor: number
+  comment?: number
+  negativeProcess?: number
+  negativeOther?: number
 }
 
 export type DailyPost = {
@@ -45,7 +48,13 @@ export type DailySnapshot = {
   assessedAt: string
   monthStart: string
   heatStart: string
-  summary: { day: DailyCounts; mtd: DailyCounts }
+  summary: {
+    format?: 'daily_disposition_v2'
+    dayDate?: string
+    rows?: Array<{ date: string; isWorkingDay: boolean; counts: DailyCounts }>
+    day: DailyCounts
+    mtd: DailyCounts
+  }
   summaryEdited?: boolean
   highHeat: DailyPost[]
   coldMarked: DailyPost[]
@@ -70,6 +79,14 @@ export type DailyReport = {
     chatName?: string
     canRetry?: boolean
   }
+  emailDelivery?: {
+    status: 'none' | 'queued' | 'working' | 'failed' | 'sent'
+    recipients?: string
+    sentAt?: string | null
+    error?: string | null
+    ambiguous?: boolean
+    canRetry?: boolean
+  }
 }
 
 export type DailySettings = {
@@ -91,6 +108,9 @@ export type DailySettings = {
   nextRunAt?: string | null
   calendarPendingYear?: number | null
   calendarError?: string | null
+  emailRecipients?: string
+  emailReady?: boolean
+  emailConfigError?: string | null
   lastAutomaticRun?: {
     date: string
     status: 'pending' | 'enqueued' | 'needs_attention' | 'canceled'
@@ -103,6 +123,20 @@ export type DailyCalendar = {
   isWorkingDay: boolean
   nextWorkingDate: string
   collectionBoundaryTime: string
+  revision: string
+}
+
+export type DailyCalendarMonth = {
+  month: string
+  days: Array<{
+    date: string
+    isWorkingDay: boolean
+    kind: 'workday' | 'weekend' | 'holiday' | 'makeup'
+    reportDate: string | null
+    calendarPending?: boolean
+    hasReport: boolean
+    latestReportId?: string
+  }>
   revision: string
 }
 

@@ -90,6 +90,7 @@ export const LABELS = {
     reviewed_non_monitor: '已复核-非监控内容', unavailable: '已不可见',
     privacy_unreachable: '负面–隐私设置无法触达',
     negative_feishu: '负面-飞书表', negative_cold: '负面-冷处理',
+    negative_comment: '负面-评论区留言',
     // 历史处理记录兼容标签。
     reviewing: '负面流程', issue_linked: '已关联事件', ticketed: '已转工单',
     official_responded: '官方已评', no_action: '无需操作', archived: '已归档', false_positive: '误报',

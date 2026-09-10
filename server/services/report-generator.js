@@ -60,6 +60,7 @@ const TRIAGE_LABEL = {
   privacy_unreachable: '负面–隐私设置无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
+  negative_comment: '负面-评论区留言',
   // 历史状态兼容。
   reviewing: '待复核',
   issue_linked: '已关联事件',
@@ -741,6 +742,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'privacy_unreachable') as privacy_unreachable,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu') as negative_feishu,
        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold') as negative_cold,
+       COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_comment') as negative_comment,
        COUNT(*) FILTER (
          WHERE COALESCE(rt.status, 'unhandled') <> 'unhandled'
            AND rt.archived_at IS NULL
@@ -852,6 +854,7 @@ export async function getReportStats(tenantId, periodStart, periodEnd, keywords 
       privacy_unreachable: rowNum(workflowStats, 'privacy_unreachable'),
       negative_feishu: rowNum(workflowStats, 'negative_feishu'),
       negative_cold: rowNum(workflowStats, 'negative_cold'),
+      negative_comment: rowNum(workflowStats, 'negative_comment'),
       handled_total: rowNum(workflowStats, 'handled_total'),
       status_total: rowNum(workflowStats, 'status_total'),
       reviewing: rowNum(workflowStats, 'reviewing'),

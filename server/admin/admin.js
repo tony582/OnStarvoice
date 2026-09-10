@@ -78,6 +78,7 @@ const LABELS = {
     privacy_unreachable: '负面–隐私设置无法触达',
     negative_feishu: '负面-飞书表',
     negative_cold: '负面-冷处理',
+    negative_comment: '负面-评论区留言',
     // 历史状态兼容。
     reviewing: '负面流程',
     issue_linked: '已关联事件',
@@ -297,6 +298,7 @@ async function renderTriage() {
     { value: 'privacy_unreachable', label: '负面–隐私设置无法触达' },
     { value: 'negative_feishu', label: '负面-飞书表' },
     { value: 'negative_cold', label: '负面-冷处理' },
+    { value: 'negative_comment', label: '负面-评论区留言' },
   ];
   el.innerHTML = `
     <div class="page-intro">
@@ -648,6 +650,7 @@ function triageActions(r) {
         <button onclick="updateTriage('${escAttr(r.id)}','privacy_unreachable'); this.closest('.action-dropdown').classList.remove('open')">负面–隐私设置无法触达</button>
         <button onclick="updateTriage('${escAttr(r.id)}','negative_feishu'); this.closest('.action-dropdown').classList.remove('open')">负面-飞书表</button>
         <button onclick="updateTriage('${escAttr(r.id)}','negative_cold'); this.closest('.action-dropdown').classList.remove('open')">负面-冷处理</button>
+        <button onclick="updateTriage('${escAttr(r.id)}','negative_comment'); this.closest('.action-dropdown').classList.remove('open')">负面-评论区留言</button>
         <button onclick="archiveRecord('${escAttr(r.id)}'); this.closest('.action-dropdown').classList.remove('open')">归档</button>
       </div>
     </div>

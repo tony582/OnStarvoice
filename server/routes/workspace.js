@@ -171,6 +171,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'privacy_unreachable' AND rt.archived_at IS NULL) AS privacy_unreachable,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_feishu' AND rt.archived_at IS NULL) AS negative_feishu,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_cold' AND rt.archived_at IS NULL) AS negative_cold,
+        COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'negative_comment' AND rt.archived_at IS NULL) AS negative_comment,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') <> 'unhandled' AND rt.archived_at IS NULL) AS handled_total,
         COUNT(*) FILTER (WHERE rt.archived_at IS NULL) AS status_total,
         -- 旧客户端字段兼容。

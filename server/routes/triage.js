@@ -35,6 +35,7 @@ const TRIAGE_STATUS_CN = {
   privacy_unreachable: '负面–隐私设置无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
+  negative_comment: '负面-评论区留言',
   // 仅用于历史导出与审计展示；059 迁移后不会再作为当前状态写入。
   reviewing: '负面流程',
   issue_linked: '已关联事件',
@@ -129,6 +130,7 @@ const TRIAGE_STATUSES = new Set([
   'privacy_unreachable',
   'negative_feishu',
   'negative_cold',
+  'negative_comment',
 ]);
 const PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -157,7 +159,7 @@ const TRIAGE_CONTENT_CONDITION = `
   )
   AND COALESCE(rt.status, 'unhandled') IN (
     'unhandled', 'replied', 'reviewed', 'reviewed_non_monitor',
-    'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold'
+    'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold', 'negative_comment'
   )
 `;
 

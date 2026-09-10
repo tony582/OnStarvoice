@@ -13,6 +13,7 @@ const DIMENSION_VALUES = {
     'privacy_unreachable',
     'negative_feishu',
     'negative_cold',
+    'negative_comment',
   ]),
 };
 
@@ -29,12 +30,13 @@ const VALUE_LABELS = {
     privacy_unreachable: '负面–隐私设置无法触达',
     negative_feishu: '负面-飞书表',
     negative_cold: '负面-冷处理',
+    negative_comment: '负面-评论区留言',
   },
 };
 
 const STATUS_SQL = `(
   'unhandled', 'replied', 'reviewed', 'reviewed_non_monitor',
-  'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold'
+  'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold', 'negative_comment'
 )`;
 
 function num(value) {

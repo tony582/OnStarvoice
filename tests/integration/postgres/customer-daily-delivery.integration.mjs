@@ -71,6 +71,7 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
   pool = new Pool({ connectionString: target.rawUrl, max: 12, options: `-c search_path=${schema},public` });
   await pool.query('CREATE TABLE tenants (LIKE public.tenants INCLUDING ALL)');
   await pool.query(await readFile(new URL('../../../server/db/migrations/081_customer_daily_reports.sql', import.meta.url), 'utf8'));
+  await pool.query(await readFile(new URL('../../../server/db/migrations/083_customer_daily_email_deliveries.sql', import.meta.url), 'utf8'));
   const db = scopedDatabase(pool);
 
   async function fixture(subtest, { configured = true } = {}) {

@@ -49,7 +49,7 @@ test('deleted-post risk stays separate from the manually selected unavailable st
   assert.match(drawer, /value: 'unavailable', label: '已不可见'/);
 });
 
-test('drawer and batch expose all eight states with shared status-change prompts', () => {
+test('drawer and batch expose all nine states with shared status-change prompts', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const feishuControl = source('web/admin/src/components/shared/FeishuTableNumberControl.tsx');
@@ -66,6 +66,7 @@ test('drawer and batch expose all eight states with shared status-change prompts
     ['privacy_unreachable', '负面–隐私设置无法触达'],
     ['negative_feishu', '负面-飞书表'],
     ['negative_cold', '负面-冷处理'],
+    ['negative_comment', '负面-评论区留言'],
   ]) {
     assert.match(drawer, new RegExp(`value: '${value}'[^\\n]+label: '${label}'`));
     assert.match(queue, new RegExp(`value: '${value}'[^\\n]+label: '${label}'`));

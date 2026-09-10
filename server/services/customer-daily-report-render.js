@@ -1,6 +1,6 @@
 import ExcelJS from 'exceljs';
 import {
-  CUSTOMER_DAILY_SECTIONS, CUSTOMER_DAILY_SUMMARY_HEADERS as HEADERS,
+  CUSTOMER_DAILY_SECTIONS, customerDailySummaryHeaders, isMonthlyDailyReport,
   customerDailySummaryRows as summaryRows,
   customerDailyPostPlatform as sourceLabel, customerDailyPostComparison, customerDailyColdEmpty as coldEmpty,
   customerDailyColdTitle, customerDailyColdPostLabel,
@@ -27,7 +27,7 @@ export function customerDailyReportNotes(snapshot) {
     `新增/互动统计截至${customerDailyTime(snapshot.cutoffAt)}；复核及冷处理状态截至${customerDailyTime(snapshot.assessedAt)}（北京时间）。`,
     `监控按首次成功入库的唯一主帖计数；复采不重复计数。SDB仅扣除「已复核-非监控内容」。MTD为本月1日至报表日的首次入库集合。`,
     `负面共${n(snapshot.summary?.day?.negative)}条，其中冷处理${n(snapshot.summary?.day?.cold)}条；MTD负面共${n(snapshot.summary?.mtd?.negative)}条，其中冷处理${n(snapshot.summary?.mtd?.cold)}条。`,
-    '处理中、已处理初始为空，空白不代表0。可在本页编辑汇总并保存，也可在飞书文档或Excel中填写。',
+    isMonthlyDailyReport(snapshot) ? '评论区留言对应同名负面状态；负面处理流程对应负面-飞书表；其他仅计负面且已不可见或隐私设置无法触达。休息日留空并入下一工作日，MTD 按每日数量加总。' : '处理中、已处理初始为空，空白不代表0。可在本页编辑汇总并保存，也可在飞书文档或Excel中填写。',
     '本页保存后，导出和交付使用已保存的汇总。飞书文档或Excel中的修改不会自动同步回本页。',
   ];
 }
@@ -37,7 +37,7 @@ function heatDescription(post) {
 
 export function renderCustomerDailyReportText(snapshot) {
   const lines = [customerDailyReportTitle(snapshot), '', CUSTOMER_DAILY_SECTIONS.summary,
-    ['日期', '监控数量', 'SDB范畴', '正向', '中性', '负面·冷处理', '负面·处理中', '负面·已处理'].join('\t'),
+    (isMonthlyDailyReport(snapshot) ? customerDailySummaryHeaders(snapshot) : ['日期', '监控数量', 'SDB范畴', '正向', '中性', '负面·冷处理', '负面·处理中', '负面·已处理']).join('\t'),
     ...summaryRows(snapshot).map(row => row.map(value => value ?? '').join('\t')),
     '', renderCustomerDailyReportMessageText(snapshot),
   ];
@@ -72,10 +72,14 @@ export function renderCustomerDailyReportMessageHtml(snapshot) {
 }
 
 export function renderCustomerDailyReportHtml(snapshot) {
+  const HEADERS = customerDailySummaryHeaders(snapshot);
+  const header = isMonthlyDailyReport(snapshot)
+    ? `<tr>${HEADERS.map(label => `<th scope="col">${esc(label)}</th>`).join('')}</tr>`
+    : `<tr>${HEADERS.slice(0, 5).map(label => `<th rowspan="2" scope="col">${esc(label)}</th>`).join('')}<th colspan="3" scope="colgroup">负面</th></tr><tr>${HEADERS.slice(5).map(label => `<th scope="col">${esc(label)}</th>`).join('')}</tr>`;
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(customerDailyReportTitle(snapshot))}</title><style>
     :root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#fff;color:#20252b;font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}main{max-width:1000px;padding:32px 28px 48px;margin:auto}h1{font-size:24px;line-height:1.4;margin:0 0 12px}h2{font-size:18px;margin:32px 0 12px}p{margin:8px 0}a{color:#2563eb;text-decoration:underline;text-underline-offset:3px}.meta,.notes{font-size:12px;color:#66717e}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}th,td{border:1px solid #bcc3cb;padding:10px 9px;text-align:center}th{background:#101316;color:white;font-weight:600}td{font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}article{padding:14px 0;border-bottom:1px solid #e4e7eb}article h3{font-size:15px;margin:0 0 5px;font-weight:600}.source-url{font-weight:400;font-size:11px;color:#687684;overflow-wrap:anywhere}.missing{color:#9a4c12;font-size:12px}.data-notes{margin-top:28px;padding:14px 18px;background:#f5f7fa;border-left:3px solid #95a5b9}.data-notes ul{padding-left:20px;margin:6px 0}.empty{color:#687684}.foot{margin-top:24px;border-top:1px solid #e4e7eb;padding-top:12px}@media(max-width:600px){main{padding:20px 14px}h1{font-size:21px}}@media print{main{max-width:none;padding:0}body{font-size:11px}th{print-color-adjust:exact;-webkit-print-color-adjust:exact}article{break-inside:avoid}a{color:inherit}h2{break-after:avoid}.table-wrap{overflow:visible}}
   </style></head><body><main><h1>${esc(customerDailyReportTitle(snapshot))}</h1>
-    <h2>${CUSTOMER_DAILY_SECTIONS.summary}</h2><div class="table-wrap"><table aria-label="客户日报监控汇总"><thead><tr>${HEADERS.slice(0, 5).map(label => `<th rowspan="2" scope="col">${esc(label)}</th>`).join('')}<th colspan="3" scope="colgroup">负面</th></tr><tr>${HEADERS.slice(5).map(label => `<th scope="col">${esc(label)}</th>`).join('')}</tr></thead><tbody>${summaryRows(snapshot).map(row => `<tr>${row.map(value => `<td>${value === null ? '' : esc(value)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+    <h2>${CUSTOMER_DAILY_SECTIONS.summary}</h2><div class="table-wrap"><table aria-label="客户日报监控汇总"><thead>${header}</thead><tbody>${summaryRows(snapshot).map(row => `<tr>${row.map(value => `<td>${value === null ? '' : esc(value)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
     ${renderCustomerDailyReportMessageHtml(snapshot)}
     </main></body></html>`;
 }
@@ -128,16 +132,37 @@ export function buildCustomerDailyReportWorkbook(snapshot) {
   workbook.created = new Date(snapshot.assessedAt);
   workbook.modified = new Date(snapshot.assessedAt);
   const sheet = workbook.addWorksheet('日报');
-  configureSheet(sheet, 8);
-  mergedText(sheet, 1, 8, customerDailyReportTitle(snapshot), {title: true});
-  mergedText(sheet, 2, 8, CUSTOMER_DAILY_SECTIONS.summary);
-  for (let i = 1; i <= 5; i++) { sheet.mergeCells(4, i, 5, i); sheet.getCell(4, i).value = HEADERS[i - 1]; }
-  sheet.mergeCells('F4:H4'); sheet.getCell('F4').value = '负面';
-  HEADERS.slice(5).forEach((value, i) => { sheet.getCell(5, i + 6).value = value; });
-  headerRow(sheet, 4); headerRow(sheet, 5);
-  for (const values of summaryRows(snapshot)) bodyRow(sheet, values);
-  sheet.views = [{state: 'frozen', ySplit: 5}];
-  sheet.pageSetup.printTitlesRow = '4:5';
+  const modern = isMonthlyDailyReport(snapshot);
+  const HEADERS = customerDailySummaryHeaders(snapshot);
+  configureSheet(sheet, HEADERS.length);
+  mergedText(sheet, 1, HEADERS.length, customerDailyReportTitle(snapshot), {title: true});
+  mergedText(sheet, 2, HEADERS.length, CUSTOMER_DAILY_SECTIONS.summary);
+  if (modern) {
+    sheet.getRow(4).values = HEADERS;
+    headerRow(sheet, 4);
+    sheet.getRow(4).height = 42;
+    [19, 17, 15, 12, 12, 20, 24, 27, 19].forEach((width, i) => { sheet.getColumn(i + 1).width = width; });
+  } else {
+    for (let i = 1; i <= 5; i++) { sheet.mergeCells(4, i, 5, i); sheet.getCell(4, i).value = HEADERS[i - 1]; }
+    sheet.mergeCells('F4:H4'); sheet.getCell('F4').value = '负面';
+    HEADERS.slice(5).forEach((value, i) => { sheet.getCell(5, i + 6).value = value; });
+    headerRow(sheet, 4); headerRow(sheet, 5);
+  }
+  const firstDataRow = modern ? 5 : 6;
+  const rows = summaryRows(snapshot);
+  for (const values of rows) {
+    const row = bodyRow(sheet, values);
+    row.height = modern ? 28 : 42;
+    if (modern && values[0] === 'MTD') {
+      for (let column = 2; column <= HEADERS.length; column++) {
+        const cell = row.getCell(column);
+        cell.value = {formula: `SUM(${cell.address.replace(/\d+$/, '')}${firstDataRow}:${cell.address.replace(/\d+$/, '')}${row.number - 1})`, result: values[column - 1]};
+        cell.font = {...cell.font, bold: true};
+      }
+    }
+  }
+  sheet.views = [{state: 'frozen', ySplit: modern ? 4 : 5}];
+  sheet.pageSetup.printTitlesRow = modern ? '4:4' : '4:5';
 
   const heat = workbook.addWorksheet('高热负面');
   configureSheet(heat, 5);

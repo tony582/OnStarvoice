@@ -15,7 +15,7 @@ interface NavContextValue {
 
 /** 每个工作区的默认首页 */
 export const WORKSPACE_HOME: Record<Workspace, string> = {
-  opinion: 'overview',
+  opinion: 'insights',
   content: 'content-home',
 }
 

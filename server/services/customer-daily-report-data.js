@@ -1,5 +1,6 @@
 import {resolveMetricUpdateFromPayload} from '../utils/metrics.js';
 import {recoverCustomerDailyObservationTime} from './customer-daily-metric-evidence.js';
+import {buildMonthlySummary} from './customer-daily-monthly-summary.js';
 
 export {
   renderCustomerDailyReportHtml,
@@ -10,7 +11,7 @@ export {
 const DAY = 86_400_000;
 const ZONE_OFFSET = 8 * 3_600_000;
 const SENTIMENTS = new Set(['positive', 'neutral', 'negative']);
-const NEGATIVE_STATES = new Set(['negative_cold', 'negative_feishu', 'privacy_unreachable']);
+const NEGATIVE_STATES = new Set(['negative_cold', 'negative_comment', 'negative_feishu', 'privacy_unreachable']);
 const NON_POST_TYPES = new Set(['official_content', 'blogger_profile', 'comment', 'comments', 'record_comment', 'comment_detail']);
 const POST_SQL = "r.record_type NOT IN ('official_content', 'blogger_profile', 'comment', 'comments', 'record_comment', 'comment_detail')";
 // Match both lifecycle tabs of customer content triage. Archiving a reviewed post
@@ -75,7 +76,7 @@ export function dailyPeriod(date, now = new Date()) {
 }
 
 function emptyCounts() {
-  return {monitor: 0, sdb: 0, positive: 0, neutral: 0, negative: 0, cold: 0, inProgress: null, processed: null, unclassified: 0, nonMonitor: 0};
+  return {monitor: 0, sdb: 0, positive: 0, neutral: 0, negative: 0, cold: 0, comment: 0, negativeProcess: 0, negativeOther: 0, inProgress: null, processed: null, unclassified: 0, nonMonitor: 0};
 }
 function count(rows) {
   const c = emptyCounts();
@@ -86,6 +87,9 @@ function count(rows) {
     if (SENTIMENTS.has(row.sentiment)) c[row.sentiment]++;
     else c.unclassified++;
     if (row.sentiment === 'negative' && status(row) === 'negative_cold') c.cold++;
+    if (row.sentiment === 'negative' && status(row) === 'negative_comment') c.comment++;
+    if (row.sentiment === 'negative' && status(row) === 'negative_feishu') c.negativeProcess++;
+    if (row.sentiment === 'negative' && ['unavailable', 'privacy_unreachable'].includes(status(row))) c.negativeOther++;
   }
   return c;
 }
@@ -222,7 +226,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   const dayRows = uniqueRows.filter(row => ms(row.first_seen_at) >= ms(collectionStart));
   const warnings = [];
   const warn = (code, message, blocking = false) => warnings.push({code, message, blocking});
-  const summary = {day: count(dayRows), mtd: count(uniqueRows)};
+  const summary = buildMonthlySummary(uniqueRows, period, count);
   const conflicts = uniqueRows.filter(row => NEGATIVE_STATES.has(status(row)) && row.sentiment !== 'negative' && status(row) !== 'reviewed_non_monitor');
   if (summary.mtd.unclassified) warn('unclassified', `本月截至报表日有${summary.mtd.unclassified}条SDB内容尚未完成情感识别（日新增${summary.day.unclassified}条），未自动归为中性。`, true);
   if (conflicts.length) warn('sentiment_status_conflict', `本月内容中${conflicts.length}条情感结论与负面处理状态不一致，按有效情感统计，需核对。`, true);
@@ -350,7 +354,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   const activeCaptures = captureRows.map(assessCustomerDailyCaptureReadiness).filter(Boolean);
   if (activeCaptures.length) warn('capture_not_settled', `报表日创建的${activeCaptures.length}个普通采集任务存在未完成、失败或同步缺口，监控数量仅包含已成功入库主帖。`, true);
   return {
-    schemaVersion: 1, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, warnings,
+    schemaVersion: 2, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, warnings,
     evidence: {
       scope: '当前租户首次入库且进入客户内容分诊清单的主帖；排除系统过滤和判为无关的内容，保留客户主动关注的帖子；同帖复采不重复计数；SDB再扣除客户标记的非监控内容',
       firstSeenField: 'records.created_at', timeZone: 'Asia/Shanghai', reviewBasis: '本版生成时有效情感及人工处理状态',

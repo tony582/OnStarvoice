@@ -1,0 +1,16 @@
+.daily-calendar .rdp-root { --rdp-accent-color: #2563eb; --rdp-accent-background-color: #eff6ff; --rdp-day-height: 36px; --rdp-day-width: 36px; --rdp-day_button-height: 34px; --rdp-day_button-width: 34px; --rdp-day_button-border-radius: 7px; --rdp-selected-border: 1px solid #2563eb; font-size: 12px; margin: 0; }
+.daily-calendar .rdp-month { width: 100%; }
+.daily-calendar .rdp-month_grid { width: 100%; }
+.daily-calendar .rdp-months { max-width: none; }
+.daily-calendar .rdp-month_caption { height: 38px; font-size: 13px; padding-left: 5px; }
+.daily-calendar .rdp-nav { height: 38px; }
+.daily-calendar .rdp-weekday { font-size: 11px; padding-block: 7px; }
+.daily-calendar .rdp-day { font-size: 12px; }
+.daily-calendar .rdp-day_button { position: relative; margin: auto; gap: 0; font: inherit; }
+.daily-calendar .rdp-day_button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+.daily-calendar .rdp-day_button:hover:not(:disabled) { background: #eff6ff; }
+.daily-calendar .rdp-selected .rdp-day_button { color: #1d4ed8; background: #eff6ff; font-weight: 700; }
+.daily-calendar .rdp-disabled { opacity: 0.52; }
+.daily-calendar-tag { position: absolute; top: -1px; right: 1px; font-size: 8px; line-height: 10px; font-weight: 500; }
+.daily-calendar-report-dot { position: absolute; bottom: 2px; left: calc(50% - 2px); width: 4px; height: 4px; border-radius: 50%; background: #2563eb; }
+@media (max-width: 1279px) { .daily-calendar .rdp-root { --rdp-day-width: 42px; --rdp-day-height: 40px; --rdp-day_button-width: 38px; --rdp-day_button-height: 38px; max-width: 360px; margin-inline: auto; } }

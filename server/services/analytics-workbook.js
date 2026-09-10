@@ -47,10 +47,11 @@ const HANDLING_LABELS = {
   privacy_unreachable: '负面–隐私设置无法触达',
   negative_feishu: '负面-飞书表',
   negative_cold: '负面-冷处理',
+  negative_comment: '负面-评论区留言',
 };
 const HANDLING_STATUS_SQL = `(
   'unhandled', 'replied', 'reviewed', 'reviewed_non_monitor',
-  'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold'
+  'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold', 'negative_comment'
 )`;
 
 const CONTENT_COLUMNS = [
@@ -466,13 +467,14 @@ function addMonthlySummary(workbook, { periodLabel, periodStart, periodEnd, gene
     denominatorCell: '$A$6', color: COLORS.amber,
   });
 
-  sheet.mergeCells('A19:K20');
-  sheet.getCell('A19').value = '说明：导出仅保留月报基础分析及对应的内容分诊数据源；浅蓝色统计值均为跨 Sheet 公式，可直接追溯和复核。';
-  sheet.getCell('A19').alignment = { wrapText: true, vertical: 'middle' };
-  sheet.getCell('A19').font = { color: { argb: COLORS.muted }, italic: true, size: 9 };
-  sheet.getCell('A19').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.paleSlate } };
+  const explanationRow = 11 + Math.max(platformLabels.length, sentimentLabels.length, handlingLabels.length);
+  sheet.mergeCells(`A${explanationRow}:K${explanationRow + 1}`);
+  sheet.getCell(`A${explanationRow}`).value = '说明：导出仅保留月报基础分析及对应的内容分诊数据源；浅蓝色统计值均为跨 Sheet 公式，可直接追溯和复核。';
+  sheet.getCell(`A${explanationRow}`).alignment = { wrapText: true, vertical: 'middle' };
+  sheet.getCell(`A${explanationRow}`).font = { color: { argb: COLORS.muted }, italic: true, size: 9 };
+  sheet.getCell(`A${explanationRow}`).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: COLORS.paleSlate } };
 
-  forEachRangeCell(sheet, 'A1:K20', cell => {
+  forEachRangeCell(sheet, `A1:K${explanationRow + 1}`, cell => {
     cell.font = { ...(cell.font || {}), name: 'Microsoft YaHei' };
   });
   return sheet;

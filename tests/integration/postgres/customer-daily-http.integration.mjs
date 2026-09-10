@@ -137,11 +137,21 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   const sheet=workbook.worksheets[0];
   const dayRow=sheet.getRows(1,sheet.rowCount).find(row=>row.getCell(2).value===3 && row.getCell(3).value===2);
   assert.ok(dayRow);
-  assert.equal(dayRow.getCell(7).value,null);
-  assert.equal(dayRow.getCell(8).value,null);
+  assert.equal(dayRow.getCell(7).value,0);
+  assert.equal(dayRow.getCell(8).value,0);
+  assert.equal(dayRow.getCell(9).value,0);
+  const monthResponse = await request(`/calendar-month?month=${period.reportDate.slice(0,7)}`);
+  assert.equal(monthResponse.status,200);
+  const monthCalendar = (await monthResponse.json()).calendar;
+  assert.equal(monthCalendar.days.find(day=>day.date===period.reportDate).latestReportId,newer.report.id);
+  assert.equal((await request('/calendar-month?month=2026-99')).status,400);
+  assert.equal((await request('/calendar-month?month=2027-01')).status,503);
+  assert.equal((await request('/calendar-month?month=2026-09',{tenantId:tenantB})).status,403);
   assert.equal((await request(`/${generated.id}`,{tenantId:tenantB})).status,403);
   assert.equal((await request('/generate',{method:'POST',auth:viewerToken,body:{date:period.reportDate}})).status,403);
   assert.equal((await request(`/${generated.id}/send`,{method:'POST',auth:viewerToken})).status,403);
+  assert.equal((await request(`/${generated.id}/email`,{method:'POST',auth:viewerToken})).status,403);
+  assert.equal((await request(`/${generated.id}/email`,{method:'POST',tenantId:tenantB})).status,403);
   assert.equal((await request('/settings',{method:'PUT',body:{chatId:'oc_unauthorized'}})).status,403);
   assert.equal((await request(`/${generated.id}`,{auth:viewerToken})).status,200);
   assert.equal((await request('/generate',{method:'POST',body:{date:'2026-02-30'}})).status,400);
@@ -149,6 +159,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(config.settings.autoEnabled,false);
   assert.equal('appSecret' in config.settings,false);
   assert.equal((await request(`/${generated.id}/send`,{method:'POST'})).status,400,'missing configuration never attempts network');
+  assert.equal((await request(`/${generated.id}/email`,{method:'POST'})).status,409,'missing email configuration never queues mail');
 
   // A customer may already have changed the original working document: summary saves must leave it alone.
   await pool.query(`INSERT INTO customer_daily_documents (report_id,tenant_id,config,status,phase,document_id,document_url,progress)
@@ -156,7 +167,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   await pool.query(`INSERT INTO customer_daily_deliveries (id,tenant_id,report_id,target_key,config,status,message_id,sent_at)
     VALUES($1,$2,$3,'existing-group','{}','sent','existing_message',now())`,[randomUUID(),tenantA,generated.id]);
   const editKey=randomUUID();
-  const edit={summary:{day:{cold:0,inProgress:1,processed:0},mtd:{cold:0,inProgress:1,processed:1}},requestId:editKey};
+  const edit={summary:{rows:{[period.reportDate]:{cold:0,comment:1,negativeProcess:0}}},requestId:editKey};
   const stale=await request(`/${generated.id}/summary`,{method:'POST',body:edit});
   assert.equal(stale.status,409);
   assert.equal((await stale.json()).error,'daily_summary_stale');
@@ -176,8 +187,8 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(edited.snapshot.summaryEdited,true);
   assert.equal(edited.snapshot.summaryEdit.sourceReportId,source.id);
   assert.equal(edited.snapshot.summaryEdit.actorId,writer.id);
-  assert.equal(edited.snapshot.summary.day.inProgress,1);
-  assert.equal(edited.snapshot.summary.day.processed,0);
+  assert.equal(edited.snapshot.summary.day.comment,1);
+  assert.equal(edited.snapshot.summary.day.negativeProcess,0);
   assert.equal(edited.snapshot.summary.day.negative,generated.snapshot.summary.day.negative);
   assert.equal(edited.snapshot.summary.day.positive,0,'editing an immutable source must not recollect later record corrections');
   assert.deepEqual(edited.snapshot.highHeat,generated.snapshot.highHeat);
@@ -188,12 +199,12 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(originalDoc.progress.body.customerText,'客户已填写');
   assert.equal((await pool.query('SELECT count(*)::int AS count FROM customer_daily_documents WHERE tenant_id=$1',[tenantA])).rows[0].count,1);
   assert.equal((await pool.query('SELECT count(*)::int AS count FROM customer_daily_deliveries WHERE tenant_id=$1',[tenantA])).rows[0].count,1,'summary saves do not enqueue messages');
-  const conflict=await request(`/${source.id}/summary`,{method:'POST',body:{...edit,summary:{day:{processed:null}}}});
+  const conflict=await request(`/${source.id}/summary`,{method:'POST',body:{...edit,summary:{rows:{[period.reportDate]:{comment:0}}}}});
   assert.equal(conflict.status,409);
   assert.equal((await conflict.json()).error,'daily_summary_request_conflict');
   const distinctEdits=[
-    {summary:{day:{inProgress:0,processed:1},mtd:{inProgress:0,processed:2}},requestId:randomUUID()},
-    {summary:{day:{inProgress:0,processed:0},mtd:{inProgress:0,processed:0}},requestId:randomUUID()},
+    {summary:{rows:{[period.reportDate]:{comment:0,negativeProcess:1}}},requestId:randomUUID()},
+    {summary:{rows:{[period.reportDate]:{comment:0,negativeProcess:0}}},requestId:randomUUID()},
   ];
   const competing=await Promise.all(distinctEdits.map(body=>request(`/${edited.id}/summary`,{method:'POST',body})));
   const competingResults=await Promise.all(competing.map(async response=>({status:response.status,body:await response.json()})));
@@ -208,8 +219,8 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal((await request(`/${generated.id}/summary`,{method:'POST',auth:viewerToken,body:edit})).status,403);
   assert.equal((await request(`/${generated.id}/summary`,{method:'POST',tenantId:tenantB,body:edit})).status,403);
   assert.equal((await request(`/${randomUUID()}/summary`,{method:'POST',body:edit})).status,404);
-  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{day:{processed:-1}},requestId:randomUUID()}})).status,400);
-  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{day:{sdb:4}},requestId:randomUUID()}})).status,400);
+  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{rows:{[period.reportDate]:{negativeProcess:-1}}},requestId:randomUUID()}})).status,400);
+  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{rows:{[period.reportDate]:{sdb:4}}},requestId:randomUUID()}})).status,400);
   const png=await request(`/${edited.id}/summary.png`,{auth:viewerToken});
   assert.equal(png.status,200);
   assert.match(png.headers.get('content-type'),/^image\/png/);

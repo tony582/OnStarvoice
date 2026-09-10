@@ -197,7 +197,7 @@ test('overview metrics report current handling states instead of work-order cove
   const dashboard = source('web/admin/src/pages/insights/DashboardTab.tsx');
   const workbench = source('web/admin/src/pages/WorkbenchPage.tsx');
 
-  for (const status of ['unhandled', 'replied', 'reviewed', 'reviewed_non_monitor', 'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold']) {
+  for (const status of ['unhandled', 'replied', 'reviewed', 'reviewed_non_monitor', 'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold', 'negative_comment']) {
     assert.match(workspace, new RegExp(status));
     assert.match(report, new RegExp(status));
   }

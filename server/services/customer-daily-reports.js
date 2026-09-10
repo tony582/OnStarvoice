@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import {queryAll, queryOne, execute, withTransaction} from '../db/init.js';
 import {collectCustomerDailyReport, dailyPeriod} from './customer-daily-report-data.js';
 import {customerDailyBusinessPeriod, dailyBusinessCalendar} from './customer-daily-business-period.js';
-import {isWorkingDate} from './china-work-calendar.js';
+import {isWorkingDate, workCalendarMonth} from './china-work-calendar.js';
+import {isMonthlySummary, mergeMonthlySummary, monthlySummarySignature} from './customer-daily-monthly-summary.js';
 import {createFeishuDailyClient} from './feishu-daily-report.js';
+import {createCustomerDailyEmailService,publicDailyEmailDelivery} from './customer-daily-email.js';
 import {DAILY_DEFAULTS, dailyError, mergeDailyConfig, publicDailyConfig, resolvedDailyConfig, openDailySecret, validateDailyConfig, dailyTargetKey, nextDailySendAt} from './customer-daily-report-config.js';
 
 const defaultDb = {queryAll, queryOne, execute, withTransaction};
@@ -18,9 +20,10 @@ const safeFailure = error => {
 
 const SUMMARY_FIELDS = ['monitor','sdb','positive','neutral','cold','inProgress','processed'];
 const SUMMARY_PERIODS = ['day','mtd'];
-const summarySignature = summary => JSON.stringify(SUMMARY_PERIODS.map(period => SUMMARY_FIELDS.map(field => summary[period][field])));
+const summarySignature = summary => isMonthlySummary(summary) ? monthlySummarySignature(summary) : JSON.stringify(SUMMARY_PERIODS.map(period => SUMMARY_FIELDS.map(field => summary[period][field])));
 
 export function mergeCustomerDailySummary(current, patch) {
+  if (isMonthlySummary(current)) return mergeMonthlySummary(current, patch);
   const object = value => value && typeof value === 'object' && !Array.isArray(value);
   if (!object(patch) || !Object.keys(patch).length || Object.keys(patch).some(key => !SUMMARY_PERIODS.includes(key))) throw dailyError('请提交当日或月累计监控汇总。',400,'daily_summary_invalid');
   if (!SUMMARY_PERIODS.every(period => object(current?.[period]))) throw dailyError('原日报汇总不可编辑，请重新生成日报。',409,'daily_summary_invalid');
@@ -56,7 +59,8 @@ export function mergeCustomerDailySummary(current, patch) {
   return next;
 }
 
-export function createCustomerDailyReportService({db = defaultDb, collect = collectCustomerDailyReport, clientFactory = createFeishuDailyClient, now = () => new Date(), env = process.env} = {}) {
+export function createCustomerDailyReportService({db = defaultDb, collect = collectCustomerDailyReport, clientFactory = createFeishuDailyClient, now = () => new Date(), env = process.env, emailOptions = {}} = {}) {
+  const emailService = createCustomerDailyEmailService({...emailOptions,db});
   async function rawConfig(tenantId) {
     return (await db.queryOne('SELECT config FROM customer_daily_report_settings WHERE tenant_id=$1', [tenantId]))?.config || {...DAILY_DEFAULTS};
   }
@@ -65,10 +69,18 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     const latest = await db.queryOne('SELECT report_date::text AS date,status,error_message AS error FROM customer_daily_occurrences WHERE tenant_id=$1 ORDER BY report_date DESC LIMIT 1',[tenantId]);
     const visible = publicDailyConfig(row?.config);
     // A blocked next_run_at is a durable retry cursor, not a promised send time.
-    return {...visible,nextRunAt:visible.calendarPendingYear ? null : iso(row?.next_run_at),lastAutomaticRun:latest || null};
+    return {...visible,...await emailService.configuration(tenantId),nextRunAt:visible.calendarPendingYear ? null : iso(row?.next_run_at),lastAutomaticRun:latest || null};
   }
   async function calendar(tenantId,date) {
     return dailyBusinessCalendar(date,now(),await rawConfig(tenantId));
+  }
+  async function calendarMonth(tenantId, month) {
+    const calendar = workCalendarMonth(month);
+    const reports = await db.queryAll(`SELECT DISTINCT ON (report_date) report_date::text AS date,id
+      FROM customer_daily_reports WHERE tenant_id=$1 AND report_date >= $2::date
+        AND report_date < ($2::date + interval '1 month') ORDER BY report_date,version DESC`, [tenantId, `${month}-01`]);
+    const byDate = new Map(reports.map(row => [dateText(row.date), row.id]));
+    return {...calendar, days: calendar.days.map(day => ({...day, hasReport: byDate.has(day.date), ...(byDate.has(day.date) ? {latestReportId: byDate.get(day.date)} : {})}))};
   }
   async function executionConfig(frozen,tenantId) {
     const current = await rawConfig(tenantId);
@@ -107,7 +119,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     const blockingDoc = doc && doc.status !== 'ready';
     const state = blockingDoc ? doc : delivery || doc;
     const status = state?.status === 'ready' ? 'document_ready' : state?.status === 'canceled' ? 'needs_attention' : state?.status || 'none';
-    return {id:row.id,reportDate:dateText(row.report_date),mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),...(includeSnapshot ? {snapshot:row.snapshot} : {}),delivery:{status,documentId:doc?.document_id,documentUrl:doc?.document_url,messageId:delivery?.message_id,sentAt:iso(delivery?.sent_at),error:state?.error_message,ambiguous:state?.ambiguous || false,canRetry:!!state && !state.ambiguous && !['working','sent'].includes(status),chatName:delivery?.config?.chatName || config.chatName || ''}};
+    return {id:row.id,reportDate:dateText(row.report_date),mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),...(includeSnapshot ? {snapshot:row.snapshot} : {}),emailDelivery:await emailService.delivery(tenantId,id),delivery:{status,documentId:doc?.document_id,documentUrl:doc?.document_url,messageId:delivery?.message_id,sentAt:iso(delivery?.sent_at),error:state?.error_message,ambiguous:state?.ambiguous || false,canRetry:!!state && !state.ambiguous && !['working','sent'].includes(status),chatName:delivery?.config?.chatName || config.chatName || ''}};
   }
   async function list(tenantId, date) {
     if (date) dailyPeriod(date, now());
@@ -120,12 +132,13 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
       FROM customer_daily_reports r LEFT JOIN customer_daily_documents d ON d.report_id=r.id AND d.tenant_id=r.tenant_id
       LEFT JOIN customer_daily_deliveries m ON m.report_id=r.id AND m.tenant_id=r.tenant_id AND m.target_key=$3
       WHERE r.tenant_id=$1 AND ($2::date IS NULL OR r.report_date=$2::date) ORDER BY r.report_date DESC,r.version DESC LIMIT 50`,[tenantId,date || null,targetKey]);
+    const emailDeliveries = await emailService.deliveries(tenantId,rows.map(row => row.id));
     return rows.map(row => {
       const blockingDoc=row.document_status && row.document_status !== 'ready';
       const rawStatus=blockingDoc ? row.document_status : row.message_status || row.document_status || 'none';
       const status=rawStatus === 'ready' ? 'document_ready' : rawStatus === 'canceled' ? 'needs_attention' : rawStatus;
       const ambiguous=Boolean(blockingDoc ? row.document_ambiguous : row.message_ambiguous || row.document_ambiguous);
-      return {id:row.id,reportDate:row.report_date,mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),delivery:{status,documentId:row.document_id,documentUrl:row.document_url,messageId:row.message_id,sentAt:iso(row.sent_at),error:blockingDoc ? row.document_error : row.message_error || row.document_error,ambiguous,canRetry:status !== 'none' && !ambiguous && !['working','sent'].includes(status),chatName:row.chat_name || config.chatName || ''}};
+      return {id:row.id,reportDate:row.report_date,mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),emailDelivery:emailDeliveries.get(row.id) || publicDailyEmailDelivery(null),delivery:{status,documentId:row.document_id,documentUrl:row.document_url,messageId:row.message_id,sentAt:iso(row.sent_at),error:blockingDoc ? row.document_error : row.message_error || row.document_error,ambiguous,canRetry:status !== 'none' && !ambiguous && !['working','sent'].includes(status),chatName:row.chat_name || config.chatName || ''}};
     });
   }
   async function generate(tenantId, options = {}) {
@@ -364,21 +377,27 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     }
     return rows.length;
   }
+  async function sendEmail(tenantId,id) {
+    await emailService.enqueue(tenantId,id);
+    return report(tenantId,id);
+  }
   async function processDue({limit = 5} = {}) {
     // A process can die after a remote success. Expired claims are deliberately NOT replayed.
     for (const table of ['customer_daily_documents','customer_daily_deliveries']) await db.execute(`UPDATE ${table} SET status='needs_attention',ambiguous=true,error_message='上次操作中断，远端结果待核实；为避免重复交付，已停止自动重试。',claim_token=NULL,updated_at=now() WHERE status='working' AND claimed_at<now()-interval '10 minutes'`);
+    await emailService.recoverStale();
     await reserveOccurrences();
     await processOccurrences();
     let processed = 0;
     for (let i=0;i<Math.min(10,Math.max(1,limit));i++) {
       const document = await processDocument();
       const message = await processMessage();
-      processed += Number(document)+Number(message);
-      if (!document && !message) break;
+      const email = await emailService.processOne();
+      processed += Number(document)+Number(message)+Number(email);
+      if (!document && !message && !email) break;
     }
     return {processed};
   }
-  return {settings,calendar,saveSettings,report,list,generate,saveSummary,enqueue,processDue,processDocument,processMessage,reserveOccurrences,processOccurrences};
+  return {settings,calendar,calendarMonth,saveSettings,report,list,generate,saveSummary,enqueue,sendEmail,processDue,processDocument,processMessage,reserveOccurrences,processOccurrences};
 }
 
 export const customerDailyReports = createCustomerDailyReportService();

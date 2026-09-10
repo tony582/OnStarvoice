@@ -10,7 +10,7 @@ type Tab = 'daily' | 'dashboard' | 'patrol' | 'reports'
 
 export function InsightsPage() {
   const { params } = useNav()
-  const initialTab: Tab = params?.tab === 'daily' ? 'daily' : params?.tab === 'reports' ? 'reports' : params?.tab === 'patrol' ? 'patrol' : 'dashboard'
+  const initialTab: Tab = params?.tab === 'dashboard' ? 'dashboard' : params?.tab === 'reports' ? 'reports' : params?.tab === 'patrol' ? 'patrol' : 'daily'
   const [tab, setTab] = useState<Tab>(initialTab)
 
   return (

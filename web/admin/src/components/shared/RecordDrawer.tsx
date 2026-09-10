@@ -379,6 +379,7 @@ function RecordDrawerContent({
     { value: 'privacy_unreachable', label: '负面–隐私设置无法触达', icon: CircleOff },
     { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
     { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
+    { value: 'negative_comment', label: '负面-评论区留言', icon: MessageCircle },
   ]
   const currentModeLabel = LABELS.triage[triageStatus] || triageStatus || '待处理'
 

@@ -54,7 +54,7 @@ test('row accent reflects handling state and sentiment without work-order lifecy
   const badge = source('web/admin/src/components/ui/badge.tsx');
   const accent = between(queue, 'function recordAccentClass', 'function getPaginationItems');
 
-  assert.match(accent, /triage_status === 'negative_feishu' \|\| record\.triage_status === 'negative_cold' \|\| record\.triage_status === 'privacy_unreachable'\) return 'bg-status-red'/);
+  assert.match(accent, /triage_status === 'negative_feishu' \|\| record\.triage_status === 'negative_cold' \|\| record\.triage_status === 'negative_comment' \|\| record\.triage_status === 'privacy_unreachable'\) return 'bg-status-red'/);
   assert.match(accent, /triage_status === 'replied'/);
   assert.match(accent, /sentiment === 'negative'/);
   assert.match(accent, /sentiment === 'positive'/);
@@ -63,9 +63,11 @@ test('row accent reflects handling state and sentiment without work-order lifecy
   assert.match(functionBlock(queue, 'RecordRow'), /recordAccentClass\(r\)/);
   assert.match(board, /key: 'negative_feishu'[^\n]+bg-status-red/);
   assert.match(board, /key: 'negative_cold'[^\n]+bg-status-red/);
+  assert.match(board, /key: 'negative_comment'[^\n]+bg-status-red/);
   assert.match(board, /key: 'privacy_unreachable'[^\n]+bg-status-red/);
   assert.match(badge, /negative_feishu: 'red'/);
   assert.match(badge, /negative_cold: 'red'/);
+  assert.match(badge, /negative_comment: 'red'/);
   assert.match(badge, /privacy_unreachable: 'red'/);
 });
 
@@ -118,7 +120,7 @@ test('empty list keeps filters and the table header usable', () => {
   assert.doesNotMatch(queue, /records\.length === 0 \? \(\s*<EmptyState[\s\S]{0,300}\) : \(\s*<div className="isolate/);
 });
 
-test('toolbar and header filter the eight handling states without ticket filters', () => {
+test('toolbar and header filter the nine handling states without ticket filters', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const primary = between(queue, 'data-triage-toolbar="primary"', 'data-triage-toolbar="secondary"');
   const secondary = between(queue, 'data-triage-toolbar="secondary"', '{/* Board view */}');

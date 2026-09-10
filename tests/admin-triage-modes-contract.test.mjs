@@ -13,6 +13,7 @@ const STATUSES = [
   ['privacy_unreachable', '负面–隐私设置无法触达'],
   ['negative_feishu', '负面-飞书表'],
   ['negative_cold', '负面-冷处理'],
+  ['negative_comment', '负面-评论区留言'],
 ];
 
 function between(text, start, end) {
@@ -23,19 +24,19 @@ function between(text, start, end) {
   return text.slice(startAt, endAt);
 }
 
-test('content handling exposes exactly the eight customer-maintained states', () => {
+test('content handling exposes exactly the nine customer-maintained states', () => {
   const labels = source('web/admin/src/lib/utils.ts');
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const route = source('server/routes/triage.js');
-  const privacyMigration = source('server/db/migrations/064_content_privacy_unreachable_status.sql');
+  const statusMigration = source('server/db/migrations/082_content_negative_comment_status.sql');
 
   const statusSet = between(route, 'const TRIAGE_STATUSES = new Set([', ']);');
   const queueModes = between(queue, 'const CONTENT_TRIAGE_MODES', 'const PLATFORM_BADGE_CLASS');
   const boardColumns = between(board, 'const COLUMNS', 'const PER_COL');
   const drawerModes = between(drawer, 'const modeActions', 'const currentModeLabel');
-  const constraint = between(privacyMigration, 'ADD CONSTRAINT record_triage_status_check', '));');
+  const constraint = between(statusMigration, 'ADD CONSTRAINT record_triage_status_check', '));');
 
   for (const [value, label] of STATUSES) {
     for (const block of [labels, queueModes, boardColumns, drawerModes, route]) {

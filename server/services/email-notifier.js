@@ -9,6 +9,15 @@ import { getSetting } from '../db/init.js';
 const transporterCache = new Map();
 const MAX_TRANSPORTER_CACHE_SIZE = 20;
 
+// Configuration inspection does not connect to the mail server or expose secrets.
+export async function tenantEmailReadiness(tenantId, {readSetting = getSetting, env = process.env} = {}) {
+  const keys = ['smtp_host','smtp_port','smtp_user','smtp_pass'];
+  const values = await Promise.all(keys.map(key => readSetting(key,tenantId)));
+  const [host,rawPort,user,pass] = values.map((value,index) => value || env[keys[index].toUpperCase()]);
+  const port = Number(rawPort || 465);
+  return {ready:!!(host && user && pass && Number.isInteger(port) && port > 0 && port <= 65535)};
+}
+
 export class EmailConfigurationError extends Error {
   constructor(message, code = 'SMTP_NOT_CONFIGURED') {
     super(message);
@@ -106,6 +115,8 @@ export async function sendTenantEmail({
   to,
   subject,
   html,
+  text,
+  attachments,
   messageId = '',
 }) {
   const transporter = await getTransporter(tenantId);
@@ -132,6 +143,8 @@ export async function sendTenantEmail({
     to: recipient,
     subject: String(subject || ''),
     html: String(html || ''),
+    ...(text === undefined ? {} : {text:String(text)}),
+    ...(Array.isArray(attachments) ? {attachments} : {}),
     ...(String(messageId || '').trim()
       ? {messageId: String(messageId).trim()}
       : {}),

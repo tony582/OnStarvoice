@@ -99,7 +99,7 @@ const RISK_OPTIONS = [
   { value: 'deleted', label: '已删帖' },
 ]
 const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
-type TriageMode = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'privacy_unreachable' | 'negative_feishu' | 'negative_cold'
+type TriageMode = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'privacy_unreachable' | 'negative_feishu' | 'negative_cold' | 'negative_comment'
 type ArchiveView = 'active' | 'archived'
 const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: React.ElementType }> = [
   { value: 'unhandled', label: '待处理', icon: Inbox },
@@ -110,6 +110,7 @@ const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: Reac
   { value: 'privacy_unreachable', label: '负面–隐私设置无法触达', icon: CircleOff },
   { value: 'negative_feishu', label: '负面-飞书表', icon: FileText },
   { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
+  { value: 'negative_comment', label: '负面-评论区留言', icon: MessageSquareText },
 ]
 const PLATFORM_BADGE_CLASS = 'w-14 justify-center dark:text-white'
 const TRIAGE_MODE_BADGE_CLASS = 'w-[112px] justify-center overflow-hidden dark:text-white'
@@ -276,7 +277,7 @@ function HeaderMultiFilter({ label, value, options, onChange }: {
 }
 
 function recordAccentClass(record: Record<string, unknown>) {
-  if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold' || record.triage_status === 'privacy_unreachable') return 'bg-status-red'
+  if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold' || record.triage_status === 'negative_comment' || record.triage_status === 'privacy_unreachable') return 'bg-status-red'
   if (record.triage_status === 'replied' || record.triage_status === 'reviewed') return 'bg-status-green'
   if (record.sentiment === 'negative') return 'bg-status-red'
   if (record.sentiment === 'positive') return 'bg-status-green'

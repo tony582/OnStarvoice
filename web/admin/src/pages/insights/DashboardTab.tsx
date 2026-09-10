@@ -125,6 +125,7 @@ const HANDLING_STATUS_ROWS = [
   { key: 'privacy_unreachable', label: '负面–隐私设置无法触达', color: '#DC2626' },
   { key: 'negative_feishu', label: '负面-飞书表', color: '#DC2626' },
   { key: 'negative_cold', label: '负面-冷处理', color: '#DC2626' },
+  { key: 'negative_comment', label: '负面-评论区留言', color: '#DC2626' },
 ] as const
 
 const PLATFORM_COLOR: Record<string, string> = {

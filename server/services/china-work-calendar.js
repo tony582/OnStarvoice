@@ -65,6 +65,32 @@ export function isWorkingDate(value) {
   return date.getUTCDay() !== 0 && date.getUTCDay() !== 6;
 }
 
+/** Month-view metadata comes from the same approved calendar as report ownership. */
+export function workCalendarMonth(month) {
+  if (typeof month !== 'string' || !/^\d{4}-\d{2}$/.test(month)) {
+    throw Object.assign(new RangeError('日历月份须为 YYYY-MM'), {code: 'INVALID_CALENDAR_DATE', status: 400});
+  }
+  const first = parseDate(`${month}-01`);
+  const calendar = calendarForYear(first.getUTCFullYear());
+  const lastDay = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
+  const days = Array.from({length: lastDay}, (_, index) => {
+    const date = `${month}-${String(index + 1).padStart(2, '0')}`;
+    const working = isWorkingDate(date);
+    const kind = calendar.workDays.has(date) ? 'makeup' : calendar.offDays.has(date) ? 'holiday' : working ? 'workday' : 'weekend';
+    let reportDate = working ? date : null;
+    let calendarPending = false;
+    if (!working) {
+      try { reportDate = nextWorkingDate(date); }
+      catch (error) {
+        if (!(error instanceof ChinaWorkCalendarUnavailableError)) throw error;
+        calendarPending = true;
+      }
+    }
+    return {date, isWorkingDay: working, kind, reportDate, ...(calendarPending ? {calendarPending} : {})};
+  });
+  return {month, days, revision: `china-work-calendar-v1:${calendar.revision}`};
+}
+
 function adjacentWorkingDate(value, direction, inclusive) {
   if (typeof inclusive !== 'boolean') throw new TypeError('inclusive 必须为布尔值');
   const anchorIsWorking = isWorkingDate(value);

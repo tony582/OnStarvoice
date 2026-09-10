@@ -22,12 +22,12 @@ function CustomerDailyReportSettingsLoader() {
     void api.get<{ settings: DailySettings }>(`${DAILY_API}/settings`).then(data => {
       if (active) { setSettings(data.settings); setError('') }
     }).catch(error => {
-      if (active) setError(dailyError(error, '飞书接入配置暂时无法读取。'))
+      if (active) setError(dailyError(error, '日报交付配置暂时无法读取。'))
     })
     return () => { active = false }
   }, [reload])
   if (settings) return <CustomerDailyReportSettings settings={settings} canManage onSaved={setSettings} />
-  return <section className="rounded-xl border border-slate-200 bg-white p-5"><h3 className="text-sm font-semibold">飞书接入与自动发送</h3>{error ? <div className="mt-3 flex flex-wrap items-center gap-3"><p role="alert" className="text-xs text-amber-800">{error}</p><Button size="sm" variant="outline" onClick={() => setReload(value => value + 1)}>重新读取</Button></div> : <p role="status" className="mt-3 text-xs text-slate-500">正在读取配置…</p>}</section>
+  return <section className="rounded-xl border border-slate-200 bg-white p-5"><h3 className="text-sm font-semibold">日报交付设置</h3>{error ? <div className="mt-3 flex flex-wrap items-center gap-3"><p role="alert" className="text-xs text-amber-800">{error}</p><Button size="sm" variant="outline" onClick={() => setReload(value => value + 1)}>重新读取</Button></div> : <p role="status" className="mt-3 text-xs text-slate-500">正在读取配置…</p>}</section>
 }
 
 export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
@@ -57,6 +57,7 @@ export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
       editorType: form.editorType, editorId: form.editorId, customerEditVerified: form.customerEditVerified,
       autoEnabled: form.autoEnabled, sendTime: form.sendTime,
       collectionBoundaryTime: form.collectionBoundaryTime || '18:00',
+      emailRecipients: form.emailRecipients || '',
     }
     try {
       const data = await api.put<{ settings: DailySettings }>(`${DAILY_API}/settings`, {
@@ -86,13 +87,19 @@ export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
 
   return <details className="group rounded-xl border border-slate-200 bg-white">
     <summary className="flex cursor-pointer list-none items-center gap-2 px-5 py-4 text-sm font-medium text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
-      <Settings2 className="h-4 w-4 text-slate-500" /> 飞书接入与自动发送
+      <Settings2 className="h-4 w-4 text-slate-500" /> 日报交付设置
       <span className={`ml-auto text-xs font-normal ${settings.lastAutomaticRun?.status === 'needs_attention' ? 'text-rose-700' : 'text-slate-500'}`}>{settings.lastAutomaticRun?.status === 'needs_attention' ? '自动发送需处理' : settings.autoEnabled ? `工作日 ${settings.sendTime}` : '未开启自动发送'}</span>
       <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
     </summary>
     <form onSubmit={save} className="space-y-6 border-t border-slate-200 p-5">
       <AutomaticRunStatus settings={settings} />
       <p className="text-xs leading-6 text-slate-500">可复用已有「文档写入助手」和客户群。配置仅供管理员使用；已保存的密钥不会显示，留空会保留原值。</p>
+      <fieldset disabled={saving} className="space-y-3">
+        <legend className="mb-3 text-sm font-semibold text-slate-900">日报邮件收件人</legend>
+        <Field label="收件人邮箱"><textarea aria-label="日报邮件收件人" className={`${inputClass} !h-24 py-2`} value={form.emailRecipients || ''} onChange={e => update('emailRecipients', e.target.value)} placeholder="多个邮箱用逗号、分号或换行分隔" autoComplete="off" /></Field>
+        <p className="text-xs leading-6 text-slate-500">共用系统设置「邮件发送」中的发送账号；这里单独关联日报收件人。在日报页面点击发送邮件，将发送当前已保存版本的正文和 Excel 附件。</p>
+        <p role="status" className={`text-xs leading-6 ${settings.emailReady ? 'text-emerald-700' : 'text-amber-800'}`}>{settings.emailReady ? '日报邮件已配置，可在日报页面手动发送。' : settings.emailConfigError || '保存收件人，并检查系统邮件发送配置。'}</p>
+      </fieldset>
       <fieldset disabled={saving} className="space-y-3">
         <legend className="mb-3 text-sm font-semibold text-slate-900">日报采集归属</legend>
         <Field label="夜间采集归属切分时间"><input aria-label="夜间采集归属切分时间" className={`${inputClass} !w-32 block`} type="time" value={form.collectionBoundaryTime || '18:00'} required onChange={e => update('collectionBoundaryTime', e.target.value)} /></Field>
@@ -124,8 +131,8 @@ export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
         </>}
       </fieldset>
       <fieldset disabled={saving} className="space-y-3 border-t border-slate-200 pt-5">
-        <legend className="sr-only">工作日自动发送</legend>
-        <label className="flex items-center gap-2.5 text-sm font-medium text-slate-900"><input type="checkbox" className="accent-blue-600" checked={form.autoEnabled} onChange={e => update('autoEnabled', e.target.checked)} />每个工作日自动发送当天日报</label>
+        <legend className="sr-only">工作日自动发送到飞书</legend>
+        <label className="flex items-center gap-2.5 text-sm font-medium text-slate-900"><input type="checkbox" className="accent-blue-600" checked={form.autoEnabled} onChange={e => update('autoEnabled', e.target.checked)} />每个工作日自动发送当天日报到飞书群</label>
         <label className="flex items-center gap-3 text-sm text-slate-600">北京时间<input aria-label="工作日发送时间（北京时间）" className={`${inputClass} !mt-0 !w-32`} type="time" value={form.sendTime || '09:00'} disabled={!form.autoEnabled} onChange={e => update('sendTime', e.target.value)} /></label>
         {settings.calendarError && <p role="status" className="text-xs leading-6 text-amber-800">{settings.calendarError}</p>}
         <p className="text-xs leading-6 text-slate-500">保存启用后，从下一次发送时间开始，不补发历史日期。关闭页面不影响发送；同日已手动发送的正式日报不会重复发送。关闭自动发送后，尚未开始的自动群发送会停止，手动任务继续执行。</p>

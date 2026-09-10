@@ -2,8 +2,25 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
 import {isWorkingDate, nextWorkingDate} from './china-work-calendar.js';
 
 const SECRET_FIELDS = ['appSecret', 'webhookUrl', 'webhookSecret'];
-const PUBLIC_FIELDS = ['appId','folderToken','documentBaseUrl','channel','chatId','chatName','editorType','editorId','customerEditVerified','autoEnabled','sendTime','collectionBoundaryTime'];
-export const DAILY_DEFAULTS = Object.freeze({appId:'',folderToken:'',documentBaseUrl:'',channel:'app',chatId:'',chatName:'',editorType:'email',editorId:'',customerEditVerified:false,autoEnabled:false,sendTime:'09:00',collectionBoundaryTime:'18:00'});
+const PUBLIC_FIELDS = ['appId','folderToken','documentBaseUrl','channel','chatId','chatName','editorType','editorId','customerEditVerified','autoEnabled','sendTime','collectionBoundaryTime','emailRecipients'];
+export const DAILY_DEFAULTS = Object.freeze({appId:'',folderToken:'',documentBaseUrl:'',channel:'app',chatId:'',chatName:'',editorType:'email',editorId:'',customerEditVerified:false,autoEnabled:false,sendTime:'09:00',collectionBoundaryTime:'18:00',emailRecipients:''});
+
+export function normalizeDailyEmailRecipients(value = '') {
+  if (typeof value !== 'string' || value.length > 5000) throw dailyError('日报收件人格式无效或过长。',400,'daily_email_recipients_invalid');
+  const addresses = value.split(/[,;\n\r，；]+/).map(address => address.trim()).filter(Boolean);
+  if (addresses.length > 50 || addresses.some(address => address.length > 254 || !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/.test(address))) {
+    throw dailyError('请填写有效邮箱，多个收件人用逗号、分号或换行分隔，最多50个。',400,'daily_email_recipients_invalid');
+  }
+  const seen = new Set();
+  const normalized = addresses.filter(address => {
+    const key = address.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).join(', ');
+  if (normalized.length > 5000) throw dailyError('日报收件人内容过长。',400,'daily_email_recipients_invalid');
+  return normalized;
+}
 
 export function dailyError(message, status = 400, code = 'daily_report_invalid') {
   return Object.assign(new Error(message), {status, code});
@@ -79,6 +96,7 @@ export function mergeDailyConfig(existing = {}, patch, tenantId, env) {
   const next = {...DAILY_DEFAULTS, ...existing};
   for (const key of PUBLIC_FIELDS) {
     if (!Object.hasOwn(patch, key)) continue;
+    if (key === 'emailRecipients') { next.emailRecipients = normalizeDailyEmailRecipients(patch[key]); continue; }
     if (typeof DAILY_DEFAULTS[key] === 'boolean') {
       if (typeof patch[key] !== 'boolean') throw dailyError('开关值必须为布尔值');
       next[key] = patch[key];

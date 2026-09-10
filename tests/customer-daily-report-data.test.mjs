@@ -73,7 +73,7 @@ test('day and MTD count customer-visible first inserts once and subtract custome
     record(12,{relevance:'irrelevant'}),record(13,{relevance:'irrelevant',watched:true,sentiment:'neutral'})];
   const db = fakeDb({month});
   const report = await collectCustomerDailyReport({...opts, db});
-  assert.deepEqual(report.summary.day, {monitor: 4, sdb: 3, positive: 1, neutral: 1, negative: 1, cold: 1, nonMonitor: 1, unclassified: 0, inProgress: null, processed: null});
+  assert.deepEqual(report.summary.day, {monitor: 4, sdb: 3, positive: 1, neutral: 1, negative: 1, cold: 1, comment: 0, negativeProcess: 0, negativeOther: 0, nonMonitor: 1, unclassified: 0, inProgress: null, processed: null});
   assert.equal(report.summary.mtd.monitor, 5);
   assert.equal(report.summary.mtd.cold, 2);
   assert.equal(report.summary.mtd.sdb, report.summary.mtd.positive + report.summary.mtd.neutral + report.summary.mtd.negative + report.summary.mtd.unclassified);
@@ -280,7 +280,7 @@ test('real generic capture, unattended children and keyword parents expose sync 
   assert.ok(assessCustomerDailyCaptureReadiness({...parent, status: 'completed', unsettled_keyword_items: 2}).reasons.includes('keyword_items_incomplete'));
 });
 
-test('HTML, copy text and editable workbook preserve counts, all links, blanks and external text safely', async () => {
+test('HTML, copy text and editable monthly workbook preserve counts, all links and external text safely', async () => {
   const injectedTitle = '=HYPERLINK("https://bad.example","<script>alert(1)</script>")';
   const rows = [1, 2, 3, 4].map(i => record(i, {status: 'negative_cold', title: i === 1 ? injectedTitle : `帖子${i}`}));
   const report = await collectCustomerDailyReport({...opts, db: fakeDb({month: rows, heatPosts: rows,
@@ -290,23 +290,25 @@ test('HTML, copy text and editable workbook preserve counts, all links, blanks a
   const copied = renderCustomerDailyReportText(report);
   assert.ok(html.includes('&lt;script&gt;')); assert.ok(!html.includes('<script>'));
   assert.ok(html.includes('TOP4')); assert.ok(copied.includes('TOP4'));
-  assert.ok(copied.includes('9月7日\t4\t4\t0\t0\t4\t\t'));
+  assert.ok(copied.includes('2026/9/7\t4\t4\t0\t0\t4\t0\t0\t0'));
   assert.doesNotMatch(copied, /复核及冷处理状态截至|观测质量|数据说明/);
   for (const row of rows) { assert.ok(copied.includes(row.url)); assert.ok(html.includes(row.url)); }
   const workbook = buildCustomerDailyReportWorkbook(report);
   assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '本期冷处理']);
   const summary = workbook.getWorksheet('日报');
-  assert.equal(summary.getCell('B6').value, 4);
-  for (const cell of ['G6', 'H6', 'G7', 'H7']) assert.equal(summary.getCell(cell).value, null);
-  assert.equal(summary.getCell('F4').value, '负面');
-  assert.ok(summary.getCell('H4').isMerged);
+  assert.equal(summary.getCell('B11').value, 4);
+  for (const cell of ['G11', 'H11', 'I11']) assert.equal(summary.getCell(cell).value, 0);
+  assert.equal(summary.getCell('F4').value, '负面-冷处理');
+  assert.equal(summary.getCell('H4').value, '负面-负面处理流程');
+  assert.equal(summary.getCell('H4').isMerged, false);
+  assert.deepEqual(summary.getCell('B12').value, {formula: 'SUM(B5:B11)', result: 4});
   assert.equal(workbook.getWorksheet('高热负面').getCell('B5').value.text, injectedTitle);
   assert.equal(workbook.getWorksheet('高热负面').getCell('B5').value.formula, undefined);
   assert.equal(workbook.getWorksheet('高热负面').getCell('B8').value.hyperlink, rows[3].url);
   assert.equal(workbook.getWorksheet('本期冷处理').getCell('B8').value.hyperlink, rows[3].url);
   const buffer = await workbook.xlsx.writeBuffer();
   const roundTrip = new workbook.constructor(); await roundTrip.xlsx.load(buffer);
-  assert.equal(roundTrip.getWorksheet('日报').getCell('B6').value, 4);
-  assert.equal(roundTrip.getWorksheet('日报').getCell('G6').value, null);
+  assert.equal(roundTrip.getWorksheet('日报').getCell('B11').value, 4);
+  assert.equal(roundTrip.getWorksheet('日报').getCell('G11').value, 0);
   assert.equal(roundTrip.getWorksheet('高热负面').getCell('B5').value.text, injectedTitle);
 });
