@@ -70,7 +70,16 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.7<span class="date">2026-09-08</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.8<span class="date">2026-09-10</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>小红书时间筛选与日期来源：</strong>确认筛选已生效后再采集，优先读取明确日期，避免把标题中的数字误当作发布时间。</li>
+            <li><strong>双平台入库时间复核：</strong>小红书、抖音按本次任务实际选择的时间范围复核，明确超出范围的帖子记为已排除；半年内、不限时间按各自范围处理，巡查更新保留原有行为。</li>
+            <li><strong>日报处理状态与月历：</strong>汇总区分评论区留言、负面处理流程和其他情况，通过月历查看每日记录和交付情况。</li>
+            <li><strong>日报邮件发送：</strong>日报页提供发送入口，收件人及邮件服务在设置中配置，清楚显示发送中、已发送和失败状态。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.7<span class="date">2026-09-08</span></h3>
           <ul>
             <li><strong>博主补采恢复：</strong>恢复正常等待时间，使用本次巡查所属页面，避免空等待参数或切换页面导致失败。</li>
             <li><strong>真实失败原因：</strong>保留已确认的帖子结果，重复回传不会覆盖；失败和等待恢复时显示实际错误。</li>

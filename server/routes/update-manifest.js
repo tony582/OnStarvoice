@@ -3,12 +3,40 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.7',
+  latestVersion: '0.4.8',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-08',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.7-20260908.zip',
+  releaseDate: '2026-09-10',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.8-20260910.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.8',
+      releaseDate: '2026-09-10',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {
+              title: '小红书时间筛选与日期来源校验',
+              desc: '确认时间筛选已生效后再采集，优先读取明确的日期元素，避免把标题中的数字误识别为发布时间。',
+            },
+            {
+              title: '双平台入库按本次任务时间范围复核',
+              desc: '小红书和抖音在后台入库时，按本次任务实际选择的发布时间范围复核，明确超出范围的帖子单独记录为已排除；半年内和不限时间按各自范围处理，巡查更新保留原有行为。',
+            },
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {
+              title: '客户日报新增处理状态、月历与邮件发送',
+              desc: '日报汇总区分评论区留言、负面处理流程和其他情况，通过月历查看每日记录和交付情况；日报页提供邮件发送入口，收件人及邮件服务在设置中配置，发送中、已发送和失败状态分别展示。',
+            },
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.7',
       releaseDate: '2026-09-08',
