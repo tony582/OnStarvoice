@@ -16,6 +16,7 @@ export function createCustomerDailyReportRouter(service = customerDailyReports) 
     }
   };
   router.get('/settings',handle(async (req,res) => res.json({ok:true,settings:await service.settings(req.tenantId)})));
+  router.get('/calendar',handle(async (req,res) => res.json({ok:true,calendar:await service.calendar(req.tenantId,req.query.date)})));
   router.put('/settings',requireAdmin,handle(async (req,res) => res.json({ok:true,settings:await service.saveSettings(req.tenantId,req.body)})));
   router.get('/',handle(async (req,res) => res.json({ok:true,reports:await service.list(req.tenantId,req.query.date)})));
   router.post('/generate',requireTenantWriter,handle(async (req,res) => res.json({ok:true,report:await service.generate(req.tenantId,{date:req.body?.date,requestId:req.body?.requestId})})));

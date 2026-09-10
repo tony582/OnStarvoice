@@ -56,6 +56,7 @@ export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
       channel: form.channel, chatId: form.chatId, chatName: form.chatName,
       editorType: form.editorType, editorId: form.editorId, customerEditVerified: form.customerEditVerified,
       autoEnabled: form.autoEnabled, sendTime: form.sendTime,
+      collectionBoundaryTime: form.collectionBoundaryTime || '18:00',
     }
     try {
       const data = await api.put<{ settings: DailySettings }>(`${DAILY_API}/settings`, {
@@ -81,17 +82,22 @@ export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
     }
   }
 
-  if (!canManage) return <div className="space-y-3"><p className="text-xs leading-6 text-slate-500">飞书接入与自动发送由管理员配置。当前{settings.autoEnabled ? `每天 ${settings.sendTime} 自动发送昨天日报` : '未开启自动发送'}。</p><AutomaticRunStatus settings={settings} /></div>
+  if (!canManage) return <div className="space-y-3"><p className="text-xs leading-6 text-slate-500">飞书接入与自动发送由管理员配置。当前{settings.autoEnabled ? `每个工作日 ${settings.sendTime} 自动发送当天日报` : '未开启自动发送'}。</p><AutomaticRunStatus settings={settings} /></div>
 
   return <details className="group rounded-xl border border-slate-200 bg-white">
     <summary className="flex cursor-pointer list-none items-center gap-2 px-5 py-4 text-sm font-medium text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
       <Settings2 className="h-4 w-4 text-slate-500" /> 飞书接入与自动发送
-      <span className={`ml-auto text-xs font-normal ${settings.lastAutomaticRun?.status === 'needs_attention' ? 'text-rose-700' : 'text-slate-500'}`}>{settings.lastAutomaticRun?.status === 'needs_attention' ? '自动发送需处理' : settings.autoEnabled ? `每日 ${settings.sendTime}` : '未开启自动发送'}</span>
+      <span className={`ml-auto text-xs font-normal ${settings.lastAutomaticRun?.status === 'needs_attention' ? 'text-rose-700' : 'text-slate-500'}`}>{settings.lastAutomaticRun?.status === 'needs_attention' ? '自动发送需处理' : settings.autoEnabled ? `工作日 ${settings.sendTime}` : '未开启自动发送'}</span>
       <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
     </summary>
     <form onSubmit={save} className="space-y-6 border-t border-slate-200 p-5">
       <AutomaticRunStatus settings={settings} />
       <p className="text-xs leading-6 text-slate-500">可复用已有「文档写入助手」和客户群。配置仅供管理员使用；已保存的密钥不会显示，留空会保留原值。</p>
+      <fieldset disabled={saving} className="space-y-3">
+        <legend className="mb-3 text-sm font-semibold text-slate-900">日报采集归属</legend>
+        <Field label="夜间采集归属切分时间"><input aria-label="夜间采集归属切分时间" className={`${inputClass} !w-32 block`} type="time" value={form.collectionBoundaryTime || '18:00'} required onChange={e => update('collectionBoundaryTime', e.target.value)} /></Field>
+        <p className="text-xs leading-6 text-slate-500">此时间之后的新采集计入下一工作日日报；周末和法定节假日合并，调休上班日正常出报。</p>
+      </fieldset>
       <fieldset disabled={saving} className="grid gap-4 sm:grid-cols-2">
         <legend className="mb-3 text-sm font-semibold text-slate-900">文档存放与客户编辑</legend>
         <Field label="应用 ID"><input className={inputClass} value={form.appId} onChange={e => update('appId', e.target.value)} placeholder="已有文档写入助手的应用 ID" autoComplete="off" /></Field>
@@ -118,9 +124,10 @@ export function CustomerDailyReportSettings({ settings, canManage, onSaved }: {
         </>}
       </fieldset>
       <fieldset disabled={saving} className="space-y-3 border-t border-slate-200 pt-5">
-        <legend className="sr-only">每日自动发送</legend>
-        <label className="flex items-center gap-2.5 text-sm font-medium text-slate-900"><input type="checkbox" className="accent-blue-600" checked={form.autoEnabled} onChange={e => update('autoEnabled', e.target.checked)} />每天自动发送前一天日报</label>
-        <label className="flex items-center gap-3 text-sm text-slate-600">北京时间<input aria-label="每天发送时间（北京时间）" className={`${inputClass} !mt-0 !w-32`} type="time" value={form.sendTime || '09:00'} disabled={!form.autoEnabled} onChange={e => update('sendTime', e.target.value)} /></label>
+        <legend className="sr-only">工作日自动发送</legend>
+        <label className="flex items-center gap-2.5 text-sm font-medium text-slate-900"><input type="checkbox" className="accent-blue-600" checked={form.autoEnabled} onChange={e => update('autoEnabled', e.target.checked)} />每个工作日自动发送当天日报</label>
+        <label className="flex items-center gap-3 text-sm text-slate-600">北京时间<input aria-label="工作日发送时间（北京时间）" className={`${inputClass} !mt-0 !w-32`} type="time" value={form.sendTime || '09:00'} disabled={!form.autoEnabled} onChange={e => update('sendTime', e.target.value)} /></label>
+        {settings.calendarError && <p role="status" className="text-xs leading-6 text-amber-800">{settings.calendarError}</p>}
         <p className="text-xs leading-6 text-slate-500">保存启用后，从下一次发送时间开始，不补发历史日期。关闭页面不影响发送；同日已手动发送的正式日报不会重复发送。关闭自动发送后，尚未开始的自动群发送会停止，手动任务继续执行。</p>
       </fieldset>
       {notice && <p role={notice.error ? 'alert' : 'status'} className={`text-sm ${notice.error ? 'text-rose-700' : 'text-emerald-700'}`}>{notice.message}</p>}

@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import {queryAll, queryOne, execute, withTransaction} from '../db/init.js';
 import {collectCustomerDailyReport, dailyPeriod} from './customer-daily-report-data.js';
+import {customerDailyBusinessPeriod, dailyBusinessCalendar} from './customer-daily-business-period.js';
+import {isWorkingDate} from './china-work-calendar.js';
 import {createFeishuDailyClient} from './feishu-daily-report.js';
 import {DAILY_DEFAULTS, dailyError, mergeDailyConfig, publicDailyConfig, resolvedDailyConfig, openDailySecret, validateDailyConfig, dailyTargetKey, nextDailySendAt} from './customer-daily-report-config.js';
 
@@ -61,7 +63,12 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
   async function settings(tenantId) {
     const row = await db.queryOne('SELECT config,next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1',[tenantId]);
     const latest = await db.queryOne('SELECT report_date::text AS date,status,error_message AS error FROM customer_daily_occurrences WHERE tenant_id=$1 ORDER BY report_date DESC LIMIT 1',[tenantId]);
-    return {...publicDailyConfig(row?.config),nextRunAt:iso(row?.next_run_at),lastAutomaticRun:latest || null};
+    const visible = publicDailyConfig(row?.config);
+    // A blocked next_run_at is a durable retry cursor, not a promised send time.
+    return {...visible,nextRunAt:visible.calendarPendingYear ? null : iso(row?.next_run_at),lastAutomaticRun:latest || null};
+  }
+  async function calendar(tenantId,date) {
+    return dailyBusinessCalendar(date,now(),await rawConfig(tenantId));
   }
   async function executionConfig(frozen,tenantId) {
     const current = await rawConfig(tenantId);
@@ -78,6 +85,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
       const row = await tx.queryOne('SELECT * FROM customer_daily_report_settings WHERE tenant_id=$1 FOR UPDATE', [tenantId]);
       const config = mergeDailyConfig(row.config, patch, tenantId, env);
       const nextRun = !config.autoEnabled ? null : (!row.config.autoEnabled || row.config.sendTime !== config.sendTime || !row.next_run_at) ? nextDailySendAt(config.sendTime, now()) : row.next_run_at;
+      if (!config.autoEnabled || row.config.sendTime !== config.sendTime) delete config.calendarPending;
       await tx.execute('UPDATE customer_daily_report_settings SET config=$2::jsonb,next_run_at=$3,updated_at=now() WHERE tenant_id=$1', [tenantId,JSON.stringify(config),nextRun]);
       if (!config.autoEnabled) {
         await tx.queryAll('SELECT report_id FROM customer_daily_documents WHERE tenant_id=$1 ORDER BY report_id FOR UPDATE',[tenantId]);
@@ -120,10 +128,15 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
       return {id:row.id,reportDate:row.report_date,mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),delivery:{status,documentId:row.document_id,documentUrl:row.document_url,messageId:row.message_id,sentAt:iso(row.sent_at),error:blockingDoc ? row.document_error : row.message_error || row.document_error,ambiguous,canRetry:status !== 'none' && !ambiguous && !['working','sent'].includes(status),chatName:row.chat_name || config.chatName || ''}};
     });
   }
-  async function generate(tenantId, {date,requestId = randomUUID()} = {}) {
+  async function generate(tenantId, options = {}) {
+    return generateWithBusinessConfig(tenantId,options,await rawConfig(tenantId));
+  }
+  // Only internal occurrences may supply frozen business settings. The public
+  // method always resolves this tenant's current settings itself.
+  async function generateWithBusinessConfig(tenantId, {date,requestId = randomUUID()} = {}, config) {
     if (typeof requestId !== 'string' || !/^[a-zA-Z0-9:_-]{1,160}$/.test(requestId)) throw dailyError('生成请求标识无效');
     const generationTime = now();
-    const period = dailyPeriod(date,generationTime);
+    const period = customerDailyBusinessPeriod(date,generationTime,config);
     for (let retry = 0; retry < 3; retry++) {
       try {
         const id = await db.withTransaction(async tx => {
@@ -133,7 +146,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
             if (dateText(previous.report_date) !== period.reportDate) throw dailyError('同一生成请求不能用于不同日期');
             return previous.id;
           }
-          const snapshot = await collect({tenantId,date:period.reportDate,now:generationTime,db:tx});
+          const snapshot = await collect({tenantId,date:period.reportDate,now:generationTime,db:tx,businessPeriod:period});
           const version = Number((await tx.queryOne('SELECT COALESCE(MAX(version),0)+1 AS version FROM customer_daily_reports WHERE tenant_id=$1 AND report_date=$2', [tenantId,period.reportDate])).version);
           const reportId = randomUUID();
           const frozen = {...snapshot,id:reportId,version};
@@ -303,12 +316,27 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
   }
   async function reserveOccurrences() {
     return db.withTransaction(async tx => {
-      const rows = await tx.queryAll("SELECT s.* FROM customer_daily_report_settings s JOIN tenants t ON t.id=s.tenant_id AND t.status='active' WHERE s.config->>'autoEnabled'='true' AND s.next_run_at<=$1 ORDER BY s.next_run_at FOR UPDATE OF s SKIP LOCKED LIMIT 10",[now()]);
+      const rows = await tx.queryAll("SELECT s.* FROM customer_daily_report_settings s JOIN tenants t ON t.id=s.tenant_id AND t.status='active' WHERE s.config->>'autoEnabled'='true' AND s.next_run_at<=$1 ORDER BY (s.config ? 'calendarPending'),s.next_run_at FOR UPDATE OF s SKIP LOCKED LIMIT 10",[now()]);
       for (const row of rows) {
         const due = new Date(row.next_run_at);
-        const reportDate = new Date(due.getTime()+8*3600000-86400000).toISOString().slice(0,10);
-        await tx.execute('INSERT INTO customer_daily_occurrences (id,tenant_id,report_date,config) VALUES ($1,$2,$3,$4::jsonb) ON CONFLICT (tenant_id,report_date) DO NOTHING',[randomUUID(),row.tenant_id,reportDate,JSON.stringify(row.config)]);
-        await tx.execute("UPDATE customer_daily_report_settings SET next_run_at=next_run_at+interval '1 day' WHERE tenant_id=$1",[row.tenant_id]);
+        const reportDate = new Date(due.getTime()+8*3600000).toISOString().slice(0,10);
+        const config = {...row.config};
+        delete config.calendarPending;
+        try {
+          // Reserve the known current workday even when finding its successor
+          // reaches an unavailable year. The retained cursor is safe to revisit.
+          if (isWorkingDate(reportDate)) await tx.execute('INSERT INTO customer_daily_occurrences (id,tenant_id,report_date,config) VALUES ($1,$2,$3,$4::jsonb) ON CONFLICT (tenant_id,report_date) DO NOTHING',[randomUUID(),row.tenant_id,reportDate,JSON.stringify(config)]);
+          const nextRun = nextDailySendAt(config.sendTime || DAILY_DEFAULTS.sendTime,due);
+          await tx.execute('UPDATE customer_daily_report_settings SET next_run_at=$2,config=$3::jsonb,updated_at=now() WHERE tenant_id=$1',[row.tenant_id,nextRun,JSON.stringify(config)]);
+        } catch (error) {
+          if (error?.code !== 'CHINA_WORK_CALENDAR_UNAVAILABLE') throw error;
+          // Never guess an unknown working date or stop processing other queues.
+          // Once the local calendar is updated, this same cursor resumes naturally.
+          if (row.config.calendarPending?.year !== error.year) {
+            config.calendarPending = {year:error.year};
+            await tx.execute('UPDATE customer_daily_report_settings SET config=$2::jsonb,updated_at=now() WHERE tenant_id=$1',[row.tenant_id,JSON.stringify(config)]);
+          }
+        }
       }
       return rows.length;
     });
@@ -325,7 +353,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
         const latest = await db.queryOne("SELECT id,version,snapshot->>'summaryEdited' AS summary_edited FROM customer_daily_reports WHERE tenant_id=$1 AND report_date=$2 AND mode='formal' ORDER BY version DESC LIMIT 1",[row.tenant_id,row.report_date]);
         const replaceUnsent = latest?.summary_edited === 'true' && (!existing || (latest.version > existing.version && !existing.ambiguous && ['queued','retry_wait','needs_attention'].includes(existing.status)));
         const preservedId = replaceUnsent ? latest.id : existing?.id;
-        const generated = preservedId ? await report(row.tenant_id,preservedId) : await generate(row.tenant_id,{date:dateText(row.report_date),requestId:`auto:${row.id}:${row.attempts}`});
+        const generated = preservedId ? await report(row.tenant_id,preservedId) : await generateWithBusinessConfig(row.tenant_id,{date:dateText(row.report_date),requestId:`auto:${row.id}:${row.attempts}`},row.config);
         // Existing delivery already carries the user's incomplete-data decision. Do not revoke it.
         const queued = existing && !replaceUnsent ? generated : await enqueue(row.tenant_id,generated.id,{send:true,automatic:true,config:row.config});
         await db.execute("UPDATE customer_daily_occurrences SET status='enqueued',report_id=$2,error_message=NULL WHERE id=$1 AND status='pending'",[row.id,queued.id]);
@@ -350,7 +378,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     }
     return {processed};
   }
-  return {settings,saveSettings,report,list,generate,saveSummary,enqueue,processDue,processDocument,processMessage,reserveOccurrences,processOccurrences};
+  return {settings,calendar,saveSettings,report,list,generate,saveSummary,enqueue,processDue,processDocument,processMessage,reserveOccurrences,processOccurrences};
 }
 
 export const customerDailyReports = createCustomerDailyReportService();

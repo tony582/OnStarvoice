@@ -1,7 +1,8 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import {renderCustomerDailySummaryPng} from './customer-daily-report-image.js';
 import {buildFeishuDailyPost, FEISHU_DAILY_POST_IMAGE_PLACEHOLDER} from './feishu-daily-report-message.js';
-import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform} from './customer-daily-report-presentation.js';
+import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform,
+  customerDailyColdTitle, customerDailyColdPostLabel, customerDailyColdEmpty} from './customer-daily-report-presentation.js';
 
 // Official contracts: /document/develop-robots/add-bot-to-external-group,
 // docx-v1/document-block-descendant/create, document-block/patch,
@@ -106,15 +107,15 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
       + (url ? '' : '｜原帖链接待补');
     nodes.push(textNode([run(`TOP${index + 1}：`), run(String(post.title || '未命名帖子').replace(/\s+/g,' ').trim(), url), run(description)]));
   });
-  nodes.push(textNode(CUSTOMER_DAILY_SECTIONS.cold, 4));
+  nodes.push(textNode(customerDailyColdTitle(snapshot), 4));
   const cold = snapshot.coldMarked || [];
   if (!cold.length) {
-    nodes.push(textNode('暂未检出。'));
+    nodes.push(textNode(customerDailyColdEmpty(snapshot)));
   }
   cold.forEach((post, index) => {
     const url = validHttpUrl(post.url);
     nodes.push(textNode([run(`${index + 1}、`), run(String(post.title || '未命名帖子').replace(/\s+/g,' ').trim(), url),
-      run(` - ${customerDailyPostPlatform(post)}${url ? '' : '｜原帖链接待补'}`)]));
+      run(`${customerDailyColdPostLabel(post) ? '【历史帖】' : ''} - ${customerDailyPostPlatform(post)}${url ? '' : '｜原帖链接待补'}`)]));
   });
   let sequence = 0;
   function flatten(node, descendants) {

@@ -4,6 +4,22 @@ import {mergeDailyConfig,publicDailyConfig,resolvedDailyConfig,sealDailySecret,o
 import {buildCustomerDailyMetricEvidence,observationPayloadWithDailyEvidence} from '../server/services/customer-daily-metric-evidence.js';
 const env = {CUSTOMER_DAILY_REPORT_ENCRYPTION_KEY:'a1'.repeat(32)};
 
+test('calendar waiting state is safe read-only metadata and does not fabricate a next working date', () => {
+  const configured=mergeDailyConfig({}, {appId:'cli_test',appSecret:'secret',folderToken:'folder',documentBaseUrl:'https://example.feishu.cn',editorType:'openchat',editorId:'oc_editor',chatId:'oc_chat'},'tenant',env);
+  const enabled=mergeDailyConfig(configured,{customerEditVerified:true,autoEnabled:true},'tenant',env);
+  const waiting={...enabled,calendarPending:{year:2027,untrustedExtra:'do-not-expose'}};
+  const visible=publicDailyConfig(waiting);
+  assert.equal(visible.calendarPendingYear,2027);
+  assert.match(visible.calendarError,/2027.*日历待更新/);
+  assert.equal(visible.calendarPending,undefined);
+  assert.equal(JSON.stringify(visible).includes('do-not-expose'),false);
+  const patched=mergeDailyConfig(waiting,{calendarPending:null,calendarPendingYear:null,calendarError:null},'tenant',env);
+  assert.equal(publicDailyConfig(patched).calendarPendingYear,2027);
+  assert.equal(publicDailyConfig({...waiting,autoEnabled:false}).calendarPendingYear,null);
+  assert.equal(publicDailyConfig({...waiting,autoEnabled:false}).calendarError,null);
+  assert.throws(()=>nextDailySendAt('09:00',new Date('2026-12-31T01:00:00Z')),{code:'CHINA_WORK_CALENDAR_UNAVAILABLE',year:2027});
+});
+
 test('daily secrets are authenticated, tenant-bound, omitted from reads and retained on blank form submission', () => {
   const sealed = sealDailySecret('private-secret','tenant-a','appSecret',env);
   assert.ok(!sealed.includes('private-secret'));
@@ -53,7 +69,7 @@ test('manual delivery can verify live permissions before customer acceptance whi
 test('automatic send starts with next Shanghai occurrence and handles month/year edges', () => {
   assert.equal(nextDailySendAt('09:00',new Date('2026-09-08T00:59:59Z')),'2026-09-08T01:00:00.000Z');
   assert.equal(nextDailySendAt('09:00',new Date('2026-09-08T01:00:00Z')),'2026-09-09T01:00:00.000Z');
-  assert.equal(nextDailySendAt('00:00',new Date('2026-12-31T16:00:00Z')),'2027-01-01T16:00:00.000Z');
+  assert.throws(()=>nextDailySendAt('00:00',new Date('2026-12-31T16:00:00Z')),{code:'CHINA_WORK_CALENDAR_UNAVAILABLE'});
 });
 
 test('daily metric evidence distinguishes measured zero, missing, carried-forward and unproven timestamps', () => {

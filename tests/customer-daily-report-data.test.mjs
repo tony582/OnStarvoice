@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {customerDailyBusinessPeriod} from '../server/services/customer-daily-business-period.js';
 import {
   dailyPeriod, collectCustomerDailyReport, assessCustomerDailyObservation, parseCustomerDailyColdEvents, assessCustomerDailyCaptureReadiness,
   renderCustomerDailyReportHtml, renderCustomerDailyReportText, buildCustomerDailyReportWorkbook,
@@ -61,27 +62,29 @@ test('Shanghai report date defaults to yesterday; realtime ends now and rolls ac
   for (const invalid of ['2026-02-30', '2026-9-7', 'junk', '2026-09-09']) assert.throws(() => dailyPeriod(invalid, now));
 });
 
-test('day and MTD count first inserts once, retain AI-filtered posts, and only subtract non-monitor', async () => {
+test('day and MTD count customer-visible first inserts once and subtract customer non-monitor decisions', async () => {
   const month = [record(1, {sentiment: 'positive'}), record(2, {status: 'negative_cold'}),
     record(3, {sentiment: 'neutral', business_visibility: 'filtered_out'}), record(4, {status: 'reviewed_non_monitor'}),
     record(5, {first_seen_at: d(2), status: 'negative_cold'}),
     record(6, {first_seen_at: '2026-08-31T10:00:00Z'}),
     record(7, {first_seen_at: '2026-09-07T16:00:00Z'}),
     record(8, {record_type: 'official_content'}), record(9, {record_type: 'blogger_profile'}), record(10, {record_type: 'comment'}),
-    record(11, {sentiment: '', business_visibility: 'deferred'}), record(1, {sentiment: 'positive'})];
+    record(11, {sentiment: '', business_visibility: 'deferred'}), record(1, {sentiment: 'positive'}),
+    record(12,{relevance:'irrelevant'}),record(13,{relevance:'irrelevant',watched:true,sentiment:'neutral'})];
   const db = fakeDb({month});
   const report = await collectCustomerDailyReport({...opts, db});
-  assert.deepEqual(report.summary.day, {monitor: 5, sdb: 4, positive: 1, neutral: 1, negative: 1, cold: 1, nonMonitor: 1, unclassified: 1, inProgress: null, processed: null});
-  assert.equal(report.summary.mtd.monitor, 6);
+  assert.deepEqual(report.summary.day, {monitor: 4, sdb: 3, positive: 1, neutral: 1, negative: 1, cold: 1, nonMonitor: 1, unclassified: 0, inProgress: null, processed: null});
+  assert.equal(report.summary.mtd.monitor, 5);
   assert.equal(report.summary.mtd.cold, 2);
   assert.equal(report.summary.mtd.sdb, report.summary.mtd.positive + report.summary.mtd.neutral + report.summary.mtd.negative + report.summary.mtd.unclassified);
   assert.equal(report.summary.day.monitor, report.summary.day.sdb + report.summary.day.nonMonitor);
-  assert.ok(report.warnings.some(w => w.code === 'unclassified' && w.blocking));
-  assert.ok(report.warnings.some(w => w.code === 'audit_visible_posts_included'));
+  assert.ok(!report.warnings.some(w => w.code === 'unclassified' || w.code === 'audit_visible_posts_included'));
   assert.equal(report.evidence.firstSeenField, 'records.created_at');
   const query = db.calls.find(q => q.sql.includes('customer_daily:month'));
   assert.equal(query.params[0], tenantId);
-  assert.doesNotMatch(query.sql, /ai_result|business_visibility\s*=/);
+  assert.match(query.sql, /r.business_visibility = 'eligible'/);
+  assert.match(query.sql, /relevance.*IS DISTINCT FROM 'irrelevant'/);
+  assert.match(query.sql, /daily_watched.tenant_id=r.tenant_id/);
 });
 
 test('morning new posts belong to today realtime and G corrections apply to yesterday without moving posts', async () => {
@@ -208,6 +211,7 @@ test('cold list includes older posts, deduplicates reentry, excludes corrections
     coldPosts: [record(1, {first_seen_at: '2026-08-20T01:00:00Z', status: 'negative_cold'}), record(2, {status: 'replied'}), record(3, {status: 'negative_cold', sentiment: 'positive'}), record(4, {status: 'negative_cold'})]})});
   assert.equal(report.coldMarked.length, 1);
   assert.equal(report.coldMarked[0].eventId, e1again.id);
+  assert.equal(report.coldMarked[0].isHistorical, true);
   assert.equal(report.summary.day.cold, 0);
   assert.deepEqual(report.evidence.cold.withdrawnRecordIds, [ID(2), ID(3)]);
   assert.equal(report.evidence.cold.transitions.length, 4);
@@ -220,9 +224,38 @@ test('zero records is a report; unknown historical audit coverage never claims c
   assert.equal(report.summary.day.inProgress, null);
   assert.equal(report.evidence.cold.coverageComplete, false);
   assert.ok(renderCustomerDailyReportText(report).includes('暂未检出。'));
-  assert.ok(!renderCustomerDailyReportText(report).includes('当日无新增冷处理负面帖子'));
+  assert.ok(!renderCustomerDailyReportText(report).includes('本期无冷处理负面帖子'));
   const complete = await collectCustomerDailyReport({...opts, db: fakeDb()});
-  assert.ok(renderCustomerDailyReportText(complete).includes('当日无新增冷处理负面帖子'));
+  assert.ok(renderCustomerDailyReportText(complete).includes('本期无冷处理负面帖子'));
+});
+
+test('Monday cold list includes weekend changes and coverage must span the whole merged interval', async () => {
+  const businessPeriod=customerDailyBusinessPeriod('2026-09-14','2026-09-14T03:00:00Z');
+  const db=fakeDb({coverage:'2026-09-13T16:00:00Z',
+    events:[event(1,'reviewed','negative_cold',{created_at:'2026-09-12T02:00:00Z'}),
+      event(2,'reviewed','negative_cold',{created_at:'2026-09-13T02:00:00Z'})],
+    coldPosts:[record(1,{status:'negative_cold',first_seen_at:'2026-09-12T01:00:00Z'}),record(2,{status:'negative_cold',first_seen_at:'2026-09-10T01:00:00Z'})]});
+  const report=await collectCustomerDailyReport({...opts,db,businessPeriod});
+  assert.equal(report.coldMarked.length,2);
+  assert.equal(report.coldMarked.find(p=>p.recordId===ID(1)).isHistorical,false,'weekend arrival belongs to Monday collection cohort');
+  assert.equal(report.coldMarked.find(p=>p.recordId===ID(2)).isHistorical,true);
+  assert.equal(report.evidence.cold.coverageComplete,false,'coverage starting Monday cannot prove the entire weekend');
+  assert.equal(db.calls.find(q=>q.sql.includes('customer_daily:cold_events')).params[1],'2026-09-11T16:00:00.000Z');
+});
+
+test('historical cold labels use the collection start boundary and do not guess missing first-ingest times', async () => {
+  const businessPeriod=customerDailyBusinessPeriod('2026-09-14','2026-09-14T03:00:00Z');
+  const posts=[
+    record(1,{status:'negative_cold',first_seen_at:'2026-09-11T09:59:59.999Z'}),
+    record(2,{status:'negative_cold',first_seen_at:businessPeriod.collectionStartAt}),
+    record(3,{status:'negative_cold',first_seen_at:undefined}),
+  ];
+  const report=await collectCustomerDailyReport({...opts,businessPeriod,db:fakeDb({
+    coldPosts:posts,events:posts.map((_,i)=>event(i+1,'reviewed','negative_cold',{created_at:'2026-09-14T01:00:00Z'})),
+  })});
+  assert.equal(report.coldMarked.find(p=>p.recordId===ID(1)).isHistorical,true);
+  assert.equal(report.coldMarked.find(p=>p.recordId===ID(2)).isHistorical,false);
+  assert.equal(Object.hasOwn(report.coldMarked.find(p=>p.recordId===ID(3)),'isHistorical'),false);
 });
 
 test('missing source links and unsettled keyword capture are visible blockers, heat gaps are not', async () => {
@@ -261,7 +294,7 @@ test('HTML, copy text and editable workbook preserve counts, all links, blanks a
   assert.doesNotMatch(copied, /复核及冷处理状态截至|观测质量|数据说明/);
   for (const row of rows) { assert.ok(copied.includes(row.url)); assert.ok(html.includes(row.url)); }
   const workbook = buildCustomerDailyReportWorkbook(report);
-  assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '新增冷处理']);
+  assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '本期冷处理']);
   const summary = workbook.getWorksheet('日报');
   assert.equal(summary.getCell('B6').value, 4);
   for (const cell of ['G6', 'H6', 'G7', 'H7']) assert.equal(summary.getCell(cell).value, null);
@@ -270,7 +303,7 @@ test('HTML, copy text and editable workbook preserve counts, all links, blanks a
   assert.equal(workbook.getWorksheet('高热负面').getCell('B5').value.text, injectedTitle);
   assert.equal(workbook.getWorksheet('高热负面').getCell('B5').value.formula, undefined);
   assert.equal(workbook.getWorksheet('高热负面').getCell('B8').value.hyperlink, rows[3].url);
-  assert.equal(workbook.getWorksheet('新增冷处理').getCell('B8').value.hyperlink, rows[3].url);
+  assert.equal(workbook.getWorksheet('本期冷处理').getCell('B8').value.hyperlink, rows[3].url);
   const buffer = await workbook.xlsx.writeBuffer();
   const roundTrip = new workbook.constructor(); await roundTrip.xlsx.load(buffer);
   assert.equal(roundTrip.getWorksheet('日报').getCell('B6').value, 4);

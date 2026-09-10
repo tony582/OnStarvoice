@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildCustomerDailyReportWorkbook, renderCustomerDailyReportHtml, renderCustomerDailyReportText, renderCustomerDailyReportMessageHtml, renderCustomerDailyReportMessageText } from '../server/services/customer-daily-report-render.js';
-import { customerDailySummaryRows, customerDailyPostComparison } from '../server/services/customer-daily-report-presentation.js';
+import { customerDailySummaryRows, customerDailyPostComparison, customerDailyColdTitle } from '../server/services/customer-daily-report-presentation.js';
 
 function fixture() {
   const counts = {monitor: 126, sdb: 112, positive: 16, neutral: 75, negative: 18, cold: 8, inProgress: null, processed: null};
@@ -16,7 +16,7 @@ test('customer exports contain the summary and two linked lists, excluding opera
   const plain = renderCustomerDailyReportText(snapshot);
   for (const content of [html, plain]) {
     assert.match(content, /二、7天内热度值≥200的负面帖子/);
-    assert.match(content, /三、冷处理负面帖链接/);
+    assert.match(content, /三、本期冷处理负面帖：1 条/);
     assert.match(content, /热度 320｜较昨日 暂无对比/);
     assert.doesNotMatch(content, /实测|入库|数据说明|观测质量|标记时间|负面总数|系统生成版本|本日未更新|不可见/);
   }
@@ -25,12 +25,12 @@ test('customer exports contain the summary and two linked lists, excluding opera
   assert.match(plain, /https:\/\/example.test\/post\?a=1&b=2/);
   const workbook = buildCustomerDailyReportWorkbook(snapshot);
   assert.equal(workbook.getWorksheet('高热负面').columnCount, 5);
-  assert.equal(workbook.getWorksheet('新增冷处理').columnCount, 3);
+  assert.equal(workbook.getWorksheet('本期冷处理').columnCount, 3);
   for (const sheet of workbook.worksheets) sheet.eachRow(row => row.eachCell(cell => {
     assert.doesNotMatch(cell.text, /内部核对事项|实测|入库|观测质量|标记时间|负面总数/);
   }));
   assert.equal(workbook.getWorksheet('高热负面').getCell('E5').value, '暂无对比');
-  assert.equal(workbook.getWorksheet('新增冷处理').getCell('B5').value.hyperlink, snapshot.coldMarked[0].url);
+  assert.equal(workbook.getWorksheet('本期冷处理').getCell('B5').value.hyperlink, snapshot.coldMarked[0].url);
   const serialized = await workbook.xlsx.writeBuffer();
   const reopened = new workbook.constructor();
   await reopened.xlsx.load(serialized);
@@ -71,11 +71,44 @@ test('copy body contains only the two link sections while document exports retai
   const text = renderCustomerDailyReportMessageText(snapshot);
   for (const content of [html, text]) {
     assert.match(content, /二、7天内热度值≥200的负面帖子/);
-    assert.match(content, /三、冷处理负面帖链接/);
+    assert.match(content, /三、本期冷处理负面帖：1 条/);
     assert.match(content, /TOP1/);
     assert.match(content, /example.test\/post/);
     assert.doesNotMatch(content, /<table|监控汇总|监控数量|MTD|内部核对事项|2026-09-07/);
   }
   assert.match(renderCustomerDailyReportHtml(snapshot), /<table/);
   assert.match(renderCustomerDailyReportText(snapshot), /一、监控汇总/);
+});
+
+test('current collection summary and historical handling are distinguished consistently without changing totals', async () => {
+  const snapshot = fixture();
+  snapshot.summary.day.cold = 0;
+  const base = snapshot.coldMarked[0];
+  snapshot.coldMarked = [{...base, title: '昨天采集今天冷处理', isHistorical: true},
+    {...base, title: '本期采集本期冷处理', isHistorical: false}];
+  for (const content of [renderCustomerDailyReportHtml(snapshot), renderCustomerDailyReportText(snapshot)]) {
+    assert.match(content, /一、监控汇总（本期新增）/);
+    assert.match(content, /三、本期冷处理负面帖：2 条（含历史帖 1 条）/);
+    assert.equal((content.match(/【历史帖】/g) || []).length, 1);
+    assert.doesNotMatch(content, /2026-09-07T11:00|入库时间|标记时间/);
+  }
+  const workbook = buildCustomerDailyReportWorkbook(snapshot);
+  const reopened = new workbook.constructor();
+  await reopened.xlsx.load(await workbook.xlsx.writeBuffer());
+  assert.equal(reopened.getWorksheet('日报').getCell('F6').value, 0);
+  assert.equal(reopened.getWorksheet('日报').getCell('A2').value, '一、监控汇总（本期新增）');
+  const cold = reopened.getWorksheet('本期冷处理');
+  assert.equal(cold.getCell('A2').value, '三、本期冷处理负面帖：2 条（含历史帖 1 条）');
+  assert.deepEqual(cold.getCell('B5').value, {text: '昨天采集今天冷处理【历史帖】', hyperlink: base.url});
+  assert.deepEqual(cold.getCell('B6').value, {text: '本期采集本期冷处理', hyperlink: base.url});
+});
+
+test('old or partly classified snapshots show list totals without inventing a historical split', () => {
+  const old = fixture();
+  assert.equal(customerDailyColdTitle(old), '三、本期冷处理负面帖：1 条');
+  assert.doesNotMatch(renderCustomerDailyReportText(old), /历史帖/);
+  old.coldMarked.push({...old.coldMarked[0], isHistorical: true});
+  assert.equal(customerDailyColdTitle(old), '三、本期冷处理负面帖：2 条');
+  assert.equal(customerDailyColdTitle({coldMarked: [{isHistorical: false}]}), '三、本期冷处理负面帖：1 条');
+  assert.equal(customerDailyColdTitle({coldMarked: []}), '三、本期冷处理负面帖：0 条');
 });

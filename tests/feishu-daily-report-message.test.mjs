@@ -17,13 +17,14 @@ const postUrls = post => nodes(post).filter(isPostUrl).map(node => node.text);
 test('daily post renders an actual top image and all 11 post links plus editable document', () => {
   const post = build({highHeat: Array.from({length: 7}, (_, i) => item(i)), coldMarked: Array.from({length: 4}, (_, i) => item(20 + i))});
   assert.equal(post.zh_cn.title, '安吉星 · 舆情日报 2026-09-07');
-  assert.deepEqual(post.zh_cn.content[0], [{tag: 'img', image_key: imageKey}]);
+  assert.deepEqual(post.zh_cn.content[0], [{tag: 'text', text: '一、监控汇总（本期新增）', style: ['bold']}]);
+  assert.deepEqual(post.zh_cn.content[1], [{tag: 'img', image_key: imageKey}]);
   assert.deepEqual(postUrls(post), [...Array.from({length: 7}, (_, i) => item(i).url), ...Array.from({length: 4}, (_, i) => item(20 + i).url)]);
   assert.equal(links(post).length, 1);
   assert.equal(links(post).at(-1).href, documentUrl);
   assert.match(words(post), /TOP7：/);
   assert.match(words(post), /热度 320 \| 较昨日 ↑180%/);
-  assert.equal(post.zh_cn.content[2].map(node => node.text).join(''), `TOP1： ${item(0).url} | 热度 320 | 较昨日 ↑180%`);
+  assert.equal(post.zh_cn.content[3].map(node => node.text).join(''), `TOP1： ${item(0).url} | 热度 320 | 较昨日 ↑180%`);
   assert.ok(post.zh_cn.content.some(row => row.map(node => node.text).join('') === `1、 ${item(20).url}`));
   assert.doesNotMatch(words(post), / - 小红书/);
   assert.doesNotMatch(words(post), /另有|测试|数据说明|截至/);
@@ -43,10 +44,10 @@ test('untrusted titles remain ordinary nodes and unsafe or credential-bearing UR
 });
 
 test('cold empty states preserve known empty versus unavailable history', () => {
-  assert.match(words(build({})), /当日无新增冷处理负面帖子。/);
+  assert.match(words(build({})), /本期无冷处理负面帖子。/);
   const unknown = build({evidence: {cold: {coverageComplete: false}}});
   assert.match(words(unknown), /暂未检出。/);
-  assert.doesNotMatch(words(unknown), /当日无新增|冷处理 0/);
+  assert.doesNotMatch(words(unknown), /本期无冷处理|冷处理 0/);
 });
 
 test('comparison placeholders stay explicit and numeric heat is never invented', () => {
@@ -63,14 +64,15 @@ test('comparison placeholders stay explicit and numeric heat is never invented',
 });
 
 test('overflow stays within the final serialized app request budget with both sections represented', () => {
-  const records = Array.from({length: 600}, (_, i) => ({...item(i), title: `长标题${'舆情😀'.repeat(50)}${i}`, url: `https://example.com/posts/${i}?q=${'x'.repeat(700)}`}));
+  const records = Array.from({length: 600}, (_, i) => ({...item(i), title: `长标题${'舆情😀'.repeat(50)}${i}`, url: `https://example.com/posts/${i}?q=${'x'.repeat(700)}`, isHistorical: i % 2 === 0}));
   const post = build({highHeat: records, coldMarked: records});
   assert.ok(feishuDailyPostRequestBytes(post) <= FEISHU_DAILY_POST_MAX_BYTES);
-  const firstCold = post.zh_cn.content.findIndex(row => row.some(node => node.text === '三、冷处理负面帖链接'));
+  const firstCold = post.zh_cn.content.findIndex(row => row.some(node => node.text?.startsWith('三、本期冷处理负面帖：')));
   const heatDisplayed = post.zh_cn.content.slice(0, firstCold).flat().filter(isPostUrl).length;
   const coldDisplayed = post.zh_cn.content.slice(firstCold, -1).flat().filter(isPostUrl).length;
   assert.ok(heatDisplayed > 0 && heatDisplayed < records.length);
   assert.ok(coldDisplayed > 0 && coldDisplayed < records.length);
+  assert.match(words(post), /三、本期冷处理负面帖：600 条（含历史帖 300 条）/);
   assert.match(words(post), new RegExp(`另有 ${records.length - heatDisplayed} 条高热负面帖子`));
   assert.match(words(post), new RegExp(`另有 ${records.length - coldDisplayed} 条冷处理负面帖子`));
   assert.equal(links(post).at(-1).href, documentUrl);
@@ -86,7 +88,7 @@ test('large high-heat section cannot exclude a short cold section', () => {
 test('preflight reserves the maximum image key without substituting a text table', () => {
   const post = buildFeishuDailyPost({snapshot: snapshot({}), documentUrl});
   assert.equal(FEISHU_DAILY_POST_IMAGE_PLACEHOLDER.length, 256);
-  assert.deepEqual(post.zh_cn.content[0], [{tag: 'img', image_key: FEISHU_DAILY_POST_IMAGE_PLACEHOLDER}]);
+  assert.deepEqual(post.zh_cn.content[1], [{tag: 'img', image_key: FEISHU_DAILY_POST_IMAGE_PLACEHOLDER}]);
   assert.throws(() => buildFeishuDailyPost({snapshot: snapshot({}), documentUrl, imageKey: '<img>'}), /图片标识/);
   assert.throws(() => buildFeishuDailyPost({snapshot: snapshot({}), documentUrl: 'https://user:password@example.com/doc', imageKey}), /文档链接/);
 });
@@ -97,4 +99,19 @@ test('builder keeps immutable source arrays intact and only reflects explicit te
   const post = buildFeishuDailyPost({snapshot: source, documentUrl, imageKey});
   assert.equal(JSON.stringify(source), before);
   assert.match(post.zh_cn.title, /【测试】/);
+});
+
+test('historical labels remain separate from raw URLs and legacy snapshots do not invent history counts', () => {
+  const historical = {...item('historical'), isHistorical: true};
+  const current = {...item('current'), isHistorical: false};
+  const post = build({coldMarked: [historical, current]});
+  assert.match(words(post), /三、本期冷处理负面帖：2 条（含历史帖 1 条）/);
+  const historicalLine = post.zh_cn.content.find(row => row.some(node => node.text === historical.url));
+  assert.deepEqual(historicalLine, [{tag: 'text', text: '1、 '}, {tag: 'text', text: historical.url}, {tag: 'text', text: ' 【历史帖】'}]);
+  assert.deepEqual(postUrls(post), [historical.url, current.url]);
+  const currentLine = post.zh_cn.content.find(row => row.some(node => node.text === current.url));
+  assert.equal(currentLine.length, 2);
+  const old = words(build({coldMarked: [item('old')]}));
+  assert.match(old, /三、本期冷处理负面帖：1 条/);
+  assert.doesNotMatch(old, /历史帖/);
 });

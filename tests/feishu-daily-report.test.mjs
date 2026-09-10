@@ -108,6 +108,27 @@ test('native table preserves explicitly edited handling values including zero', 
   assert.deepEqual([22, 23, 30, 31].map(cellText), ['0', '8', '17', '28']);
 });
 
+test('editable document distinguishes collection totals from handling historical posts without adding timestamps', () => {
+  const source = snapshot();
+  source.summary.day.cold = 0;
+  source.coldMarked = [{...source.coldMarked[0], isHistorical: true},
+    {...source.coldMarked[0], title: '本期帖子', isHistorical: false}];
+  const plan = buildFeishuDailyDocumentPlan(source);
+  const blocks = plan.batches.flatMap(batch => batch.descendants);
+  const headings = blocks.flatMap(block => block.heading2?.elements || []).map(element => element.text_run.content);
+  assert.ok(headings.includes('一、监控汇总（本期新增）'));
+  assert.ok(headings.includes('三、本期冷处理负面帖：2 条（含历史帖 1 条）'));
+  const cold = blocks.filter(block => /^\d+、$/.test(block.text?.elements?.[0]?.text_run.content || ''));
+  assert.equal(cold.length, 2);
+  assert.match(cold[0].text.elements.map(element => element.text_run.content).join(''), /【历史帖】/);
+  assert.doesNotMatch(cold[1].text.elements.map(element => element.text_run.content).join(''), /历史帖/);
+  assert.equal(cold[0].text.elements[1].text_run.text_element_style.link.url, encodeURIComponent(source.coldMarked[0].url));
+  assert.doesNotMatch(JSON.stringify(plan), /标记时间|入库时间|2026-09-07T05/);
+  const legacy = JSON.stringify(buildFeishuDailyDocumentPlan(snapshot()));
+  assert.match(legacy, /三、本期冷处理负面帖：1 条/);
+  assert.doesNotMatch(legacy, /含历史帖|【历史帖】/);
+});
+
 test('full lists are batched within API descendant limit, including large multi-page reports', () => {
   const rows = Array.from({ length: 650 }, (_, index) => ({ ...snapshot().highHeat[0], recordId: `r${index}`, title: `帖子${index}` }));
   const plan = buildFeishuDailyDocumentPlan(snapshot({ highHeat: rows }));
@@ -391,7 +412,7 @@ test('app message uploads a real multipart PNG then sends one post with image, l
   assert.equal(write.body.msg_type, 'post');
   const post = JSON.parse(write.body.content);
   assert.match(post.zh_cn.title, /客户.*2026-09-07/);
-  assert.deepEqual(post.zh_cn.content[0], [{tag:'img', image_key:'img_v3_summary'}]);
+  assert.deepEqual(post.zh_cn.content[1], [{tag:'img', image_key:'img_v3_summary'}]);
   assert.equal(post.zh_cn.content.at(-1)[0].href, 'https://example.feishu.cn/docx/doc_one');
   assert.ok(write.body.content.includes('320'));
   assert.ok(!write.body.content.includes('监控数量'));
@@ -420,7 +441,7 @@ test('signed webhook sends only to official hook, contains correct signature, an
   assert.equal(write.body.sign, createHmac('sha256', `${timestamp}\nprivate-signing-key`).update('').digest('base64'));
   assert.equal(write.options.headers.Authorization, undefined);
   assert.equal(write.body.msg_type, 'post');
-  assert.deepEqual(write.body.content.zh_cn.content[0], [{tag:'img',image_key:'img_v3_summary'}]);
+  assert.deepEqual(write.body.content.zh_cn.content[1], [{tag:'img',image_key:'img_v3_summary'}]);
   assert.equal(images(h).length, 1);
   assert.equal(messages(h).length, 1);
   assert.equal(h.requests.length, 3); // App authentication and image upload precede the signed hook.
@@ -498,7 +519,7 @@ test('stale image content hash requires a new upload before message delivery', a
   await h.client.sendReport({documentUrl:'https://example.feishu.cn/docx/doc_one', snapshot:snapshot(), uuid:UUID,
     summaryImageProgress:{imageHash:'0'.repeat(64), imageKey:'img_v3_previous'}});
   assert.equal(images(h).length, 1);
-  assert.equal(JSON.parse(messages(h)[0].body.content).zh_cn.content[0][0].image_key, 'img_v3_summary');
+  assert.equal(JSON.parse(messages(h)[0].body.content).zh_cn.content[1][0].image_key, 'img_v3_summary');
 });
 
 test('image checkpoint failure is known before any message and does not leak storage details', async () => {

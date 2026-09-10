@@ -7,8 +7,11 @@ import {runMigrations} from '../../../server/db/migrate.js';
 import {getPool,closePool} from '../../../server/db/pool.js';
 import {createApp} from '../../../server/app.js';
 import {hashPassword} from '../../../server/services/auth-service.js';
-import {dailyPeriod} from '../../../server/services/customer-daily-report-data.js';
+import {customerDailyBusinessPeriod} from '../../../server/services/customer-daily-business-period.js';
+import {previousWorkingDate} from '../../../server/services/china-work-calendar.js';
 import {buildCustomerDailyMetricEvidence} from '../../../server/services/customer-daily-metric-evidence.js';
+import {collectCustomerDailyReport} from '../../../server/services/customer-daily-report-data.js';
+import {normalizeRecord} from '../../../server/routes/sync.js';
 const require = createRequire(new URL('../../../server/package.json',import.meta.url));
 const ExcelJS = require('exceljs');
 
@@ -29,32 +32,39 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   const tenantA=(await pool.query("INSERT INTO tenants(name) VALUES($1) RETURNING id",[`日报测试 ${randomUUID()}`])).rows[0].id;
   const tenantB=(await pool.query("INSERT INTO tenants(name) VALUES($1) RETURNING id",[`隔离客户 ${randomUUID()}`])).rows[0].id;
   tenantIds.push(tenantA,tenantB);
-  const period=dailyPeriod();
+  const today=new Date(Date.now()+8*3600000).toISOString().slice(0,10);
+  const period=customerDailyBusinessPeriod(previousWorkingDate(today));
   const at=(offset)=>new Date(new Date(period.periodStart).getTime()+offset*3600000).toISOString();
   const oldAt=new Date(new Date(period.monthStart).getTime()-86400000).toISOString();
-  async function record({tenantId=tenantA,title='测试原帖',created=at(1),published=at(-48),sentiment='negative',triage='unhandled',businessVisibility='eligible',type='single_note'}={}) {
+  async function record({tenantId=tenantA,title='测试原帖',created=at(1),published=at(-48),sentiment='negative',triage='unhandled',businessVisibility='eligible',type='single_note',relevance='relevant'}={}) {
     const id=randomUUID();
     await pool.query(`INSERT INTO records(id,tenant_id,platform,external_id,title,url,record_type,sentiment,created_at,first_seen_at,published_ts,business_visibility,ai_result)
-      VALUES($1,$2,'douyin',$3,$4,$5,$6,$7,$8,$8,$9,$10,'{"relevance":"irrelevant"}')`,[id,tenantId,String(Math.floor(Math.random()*1e15)),title,`https://www.douyin.com/video/${String(Math.floor(Math.random()*1e15))}`,type,sentiment,created,published,businessVisibility]);
+      VALUES($1,$2,'douyin',$3,$4,$5,$6,$7,$8,$8,$9,$10,$11::jsonb)`,[id,tenantId,String(Math.floor(Math.random()*1e15)),title,`https://www.douyin.com/video/${String(Math.floor(Math.random()*1e15))}`,type,sentiment,created,published,businessVisibility,JSON.stringify({relevance})]);
     if(triage !== 'unhandled') await pool.query('INSERT INTO record_triage(tenant_id,record_id,status) VALUES($1,$2,$3)',[tenantId,id,triage]);
     return id;
   }
-  const hot=await record({title:'真正高热负面',created:at(-50)});
+  const hot=await record({title:'真正高热负面',created:new Date(new Date(period.collectionStartAt).getTime()-3600000).toISOString()});
   const cold=await record({title:'低于门槛的当日冷处理',triage:'negative_cold'});
-  const positive=await record({title:'AI无关但仍属SDB的新帖',sentiment:'positive',businessVisibility:'filtered_out'});
+  const positive=await record({title:'进入客户清单的正向新帖',sentiment:'positive'});
+  await record({title:'系统过滤不计客户监控',businessVisibility:'filtered_out'});
+  await record({title:'无关内容不计客户监控',relevance:'irrelevant'});
   await record({sentiment:'neutral',triage:'reviewed_non_monitor'});
   const historicalCold=await record({title:'旧帖今天新标冷处理',created:oldAt,published:oldAt,triage:'negative_cold'});
   await record({tenantId:tenantB,title:'绝不能混入的客户B帖子'});
   await record({type:'blogger_profile'});
   await record({type:'official_content'});
-  await record({created:period.cutoffAt}); // midnight belongs to the next date
-  async function observe(recordId,heat,when) {
+  await record({created:period.collectionEndAt}); // the evening boundary belongs to the next working date
+  async function observe(recordId,heat,when,{historicalMilliseconds=false,rawPayload={}}={}) {
     const raw={likes:heat,comments_count:0,collects:0,shares:0,capture_timestamp:when};
     const evidence=buildCustomerDailyMetricEvidence(raw,{preserved:false},new Date(when));
-    await pool.query('INSERT INTO record_observations(tenant_id,record_id,captured_at,likes,comments_count,collects,shares,payload) VALUES($1,$2,$3,$4,0,0,0,$5::jsonb)',[tenantA,recordId,when,heat,JSON.stringify({customerDailyMetricEvidence:evidence})]);
+    // Match the persisted shape before numeric capture timestamps were accepted.
+    // SQL projection must retain observedAt:null for safe historical recovery.
+    if(historicalMilliseconds) Object.assign(evidence,{observedAt:null,timeSource:'ingested_at'});
+    const payload={customerDailyMetricEvidence:evidence,...(historicalMilliseconds ? {captureTimestamp:String(Date.parse(when))} : {}),...rawPayload};
+    await pool.query('INSERT INTO record_observations(tenant_id,record_id,captured_at,likes,comments_count,collects,shares,payload) VALUES($1,$2,$3,$4,0,0,0,$5::jsonb)',[tenantA,recordId,when,heat,JSON.stringify(payload)]);
   }
-  await observe(hot,400,at(-20));
-  await observe(hot,320,at(3));
+  await observe(hot,400,at(-20),{historicalMilliseconds:true});
+  await observe(hot,320,at(3),{historicalMilliseconds:true});
   await observe(hot,900,period.cutoffAt); // must not leak into yesterday's heat
   await observe(cold,85,at(3));
   for(const [recordId,previousStatus] of [[cold,'unhandled'],[historicalCold,'unhandled'],[historicalCold,'negative_cold']]) await pool.query(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,action,target_type,target_id,metadata,created_at)
@@ -99,8 +109,11 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(generated.snapshot.summary.mtd.processed,null);
   assert.deepEqual(generated.snapshot.highHeat.map(row=>row.recordId),[hot]);
   assert.equal(generated.snapshot.highHeat[0].heat,320);
-  assert.match(generated.snapshot.highHeat[0].comparisonText,/20/);
+  assert.equal(generated.snapshot.highHeat[0].comparisonText,'↓20%');
+  assert.equal(generated.snapshot.highHeat[0].previousHeat,400);
   assert.deepEqual(new Set(generated.snapshot.coldMarked.map(row=>row.recordId)),new Set([cold,historicalCold]));
+  assert.equal(generated.snapshot.coldMarked.find(row=>row.recordId===cold).isHistorical,false);
+  assert.equal(generated.snapshot.coldMarked.find(row=>row.recordId===historicalCold).isHistorical,true);
   const duplicate=await (await request('/generate',{method:'POST',body:{date:period.reportDate,requestId:key}})).json();
   assert.equal(duplicate.report.id,generated.id);
   await pool.query("UPDATE records SET sentiment='neutral' WHERE id=$1",[positive]);
@@ -109,7 +122,8 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.match(detail.text,/https:\/\/www.douyin.com/);
   assert.ok(!detail.html.includes('绝不能混入的客户B帖子'));
   assert.match(detail.messageHtml,/二、7天内热度值≥200的负面帖子/);
-  assert.match(detail.messageText,/三、冷处理负面帖链接/);
+  assert.match(detail.messageText,/三、本期冷处理负面帖：2 条（含历史帖 1 条）/);
+  assert.match(detail.html,/一、监控汇总（本期新增）/);
   assert.ok(!detail.messageHtml.includes('<table'));
   assert.ok(!detail.messageText.includes('MTD'));
   const newer=await (await request('/generate',{method:'POST',body:{date:period.reportDate,requestId:randomUUID()}})).json();
@@ -204,4 +218,46 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.deepEqual(Buffer.from(await png.arrayBuffer()).subarray(0,8),Buffer.from([137,80,78,71,13,10,26,10]));
   assert.equal((await request(`/${generated.id}/summary.png`,{tenantId:tenantB})).status,403);
   assert.equal((await request(`/${randomUUID()}/summary.png`)).status,404);
+
+  await t.test('real observation projection preserves normalization precedence and the original null timestamp stamp', async () => {
+    const outer=Date.parse(at(1)), list=Date.parse(at(2)), nested=Date.parse(at(3));
+    const nestedItem={captureTimestamp:list,detailPayload:{captureTimestamp:nested,notNeeded:'discard me'}};
+    const cases=[
+      [{captureTimestamp:outer,items:[nestedItem]},nested],
+      [{captureTimestamp:outer,detailPayload:{},items:[nestedItem]},list],
+      ...[null,false,0,''].map(detailPayload=>[{captureTimestamp:outer,detailPayload,items:[nestedItem]},nested]),
+      [{captureTimestamp:outer,detailPayload:'truthy',items:[nestedItem]},list],
+      [{captureTimestamp:outer,items:[null,'ignored',nestedItem]},nested],
+      [{captureTimestamp:outer,detailPayload:{captureTimestamp:0},items:[nestedItem]},outer],
+      [{captureTimestamp:outer,detailPayload:{captureTimestamp:'invalid'},items:[nestedItem]},null],
+      [{captureTimestamp:null,capture_timestamp:nested},null],
+      [{captureTimestamp:at(3)},null],
+    ];
+    const expected=new Map();
+    for(const [payload,time] of cases) {
+      const id=await record({title:'观测投影边界测试'});
+      if(time!==null) assert.equal(normalizeRecord({payload})[0].capture_timestamp,String(time));
+      await observe(id,300,at(4),{historicalMilliseconds:true,rawPayload:{...payload,notNeeded:'discard me'}});
+      expected.set(id,time===null ? null : new Date(time).toISOString());
+    }
+    let projected=[];
+    const db={
+      async queryAll(sql,values) {
+        const rows=(await pool.query(sql,values)).rows;
+        if(sql.includes('customer_daily:observations')) projected=rows;
+        return rows;
+      },
+      async queryOne(sql,values) {return (await pool.query(sql,values)).rows[0]||null;},
+    };
+    const actual=await collectCustomerDailyReport({tenantId:tenantA,date:period.reportDate,now:new Date(period.assessedAt),businessPeriod:period,db});
+    for(const [id,time] of expected) {
+      const evidence=actual.evidence.heat.selected.find(item=>item.recordId===id)?.selected;
+      assert.ok(evidence,id);
+      assert.equal(evidence.comparable,time!==null,id);
+      if(time!==null) assert.equal(evidence.observedAt,time,id);
+      const row=projected.find(item=>item.record_id===id);
+      assert.equal(row.payload.customerDailyMetricEvidence.observedAt,null,'null server stamp survives JSON projection');
+      assert.ok(!JSON.stringify(row.payload).includes('discard me'),'projection must not return unneeded source fields');
+    }
+  });
 });

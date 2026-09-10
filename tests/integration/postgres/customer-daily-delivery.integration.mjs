@@ -5,7 +5,6 @@ import { createRequire } from 'node:module';
 import test from 'node:test';
 import { validatePostgresIntegrationTarget } from '../../../scripts/lib/postgres-integration-target.mjs';
 import { createCustomerDailyReportService } from '../../../server/services/customer-daily-reports.js';
-import { dailyPeriod } from '../../../server/services/customer-daily-report-data.js';
 import { resolvedDailyConfig } from '../../../server/services/customer-daily-report-config.js';
 import { FeishuDailyError } from '../../../server/services/feishu-daily-report.js';
 
@@ -39,8 +38,10 @@ function scopedDatabase(pool) {
   } };
 }
 
-function fakeSnapshot({ tenantId, date, now }, monitor) {
-  const period = dailyPeriod(date, now);
+function fakeSnapshot({ tenantId, date, businessPeriod }, monitor) {
+  assert.equal(businessPeriod?.reportDate, date, 'service must pass its frozen business period to collection');
+  assert.equal(businessPeriod?.mode, 'formal');
+  const period = businessPeriod;
   const counts = { monitor, sdb: monitor, positive: monitor, neutral: 0, negative: 0, cold: 0,
     nonMonitor: 0, unclassified: 0, inProgress: null, processed: null };
   return { schemaVersion: 1, tenantId, tenantName: '集成测试客户', ...period,
@@ -145,11 +146,11 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
     assert.equal(changed.snapshot.summary.day.monitor, 9);
     assert.equal((await f.service.report(f.tenantId, first.id)).snapshot.summary.day.monitor, 4);
     const concurrent = await Promise.all([
-      f.service.generate(f.tenantId, { date: '2026-09-06', requestId: 'concurrent-a' }),
-      f.service.generate(f.tenantId, { date: '2026-09-06', requestId: 'concurrent-b' }),
+      f.service.generate(f.tenantId, { date: '2026-09-04', requestId: 'concurrent-a' }),
+      f.service.generate(f.tenantId, { date: '2026-09-04', requestId: 'concurrent-b' }),
     ]);
     assert.deepEqual(concurrent.map(r => r.version).sort(), [1, 2]);
-    await assert.rejects(f.service.generate(f.tenantId, { date: '2026-09-06', requestId: 'same-request' }), /不同日期/);
+    await assert.rejects(f.service.generate(f.tenantId, { date: '2026-09-04', requestId: 'same-request' }), /不同日期/);
     assert.equal(f.calls.length, 0);
   });
 
@@ -322,18 +323,27 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
     assert.equal((await db.queryOne('SELECT count(*)::int AS count FROM customer_daily_reports WHERE tenant_id=$1',[f.tenantId])).count,2);
   });
 
-  await t.test('today realtime delivery does not suppress tomorrow formal delivery for that report date', async subtest => {
+  await t.test('today is formal immediately; later regeneration requires correction while the next workday has separate ownership', async subtest => {
     const f = await fixture(subtest);
-    const live = await f.service.generate(f.tenantId, { date: '2026-09-08', requestId: 'live' });
-    assert.equal(live.mode, 'realtime');
-    await f.service.enqueue(f.tenantId, live.id, { send: true });
+    const today = await f.service.generate(f.tenantId, { date: '2026-09-08', requestId: 'today-formal' });
+    assert.equal(today.mode, 'formal');
+    assert.equal(today.snapshot.mode, 'formal');
+    assert.equal(today.snapshot.collectionStartAt, '2026-09-07T10:00:00.000Z');
+    assert.equal(today.snapshot.collectionCutoffAt, AT);
+    await f.service.enqueue(f.tenantId, today.id, { send: true });
     await f.service.processDue();
     f.clock('2026-09-09T02:00:00Z');
-    const formal = await f.service.generate(f.tenantId, { date: '2026-09-08', requestId: 'formal' });
-    assert.equal(formal.mode, 'formal');
-    assert.notEqual(formal.id, live.id);
-    await f.service.enqueue(f.tenantId, formal.id, { send: true });
+    const regenerated = await f.service.generate(f.tenantId, { date: '2026-09-08', requestId: 'later-same-day' });
+    assert.equal(regenerated.mode, 'formal');
+    assert.notEqual(regenerated.id, today.id);
+    await assert.rejects(f.service.enqueue(f.tenantId, regenerated.id, { send: true }), { code: 'daily_delivery_correction_required' });
+    const next = await f.service.generate(f.tenantId, { requestId: 'next-workday' });
+    assert.equal(next.reportDate, '2026-09-09');
+    assert.equal(next.mode, 'formal');
+    await f.service.enqueue(f.tenantId, next.id, { send: true });
     await f.service.processDue();
+    assert.deepEqual(f.calls.filter(call => call.type === 'send').map(call => call.reportId), [today.id, next.id]);
+    assert.equal((await f.service.report(f.tenantId, today.id)).snapshot.collectionCutoffAt, AT, 'later generation does not rewrite the delivered snapshot');
     assert.equal(f.counts('send'), 2);
   });
 
@@ -514,7 +524,8 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
     const restarted = f.restart();
     for (let index = 0; index < 4; index++) await restarted.reserveOccurrences();
     const rows = await db.queryAll('SELECT report_date::text AS date FROM customer_daily_occurrences WHERE tenant_id=$1 ORDER BY report_date', [f.tenantId]);
-    assert.deepEqual(rows.map(row => row.date), ['2026-09-08', '2026-09-09', '2026-09-10']);
+    assert.deepEqual(rows.map(row => row.date), ['2026-09-09', '2026-09-10', '2026-09-11']);
+    assert.equal((await db.queryOne('SELECT next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1', [f.tenantId])).next_run_at.toISOString(), '2026-09-14T01:00:00.000Z');
     assert.equal(await restarted.reserveOccurrences(), 0);
     await restarted.processOccurrences();
     const generated = await db.queryAll(`SELECT o.report_date::text AS scheduled_date,r.report_date::text AS generated_date,r.snapshot->>'reportDate' AS snapshot_date
@@ -526,6 +537,240 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
     assert.equal(f.counts('send'), 3);
     await restarted.processDue();
     assert.equal(f.counts('send'), 3);
+  });
+
+  await t.test('PostgreSQL schedule reservations skip ordinary weekends and freeze Monday weekend coverage once', async subtest => {
+    const f = await fixture(subtest);
+    f.clock('2026-09-11T00:30:00Z');
+    await f.service.saveSettings(f.tenantId, { autoEnabled: true, sendTime: '09:00' });
+    assert.equal(await f.service.reserveOccurrences(), 0);
+    f.clock('2026-09-11T02:00:00Z');
+    assert.equal(await f.service.reserveOccurrences(), 1);
+    assert.equal((await db.queryOne('SELECT next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1', [f.tenantId])).next_run_at.toISOString(), '2026-09-14T01:00:00.000Z');
+    for (const date of ['2026-09-12', '2026-09-13']) {
+      f.clock(`${date}T02:00:00Z`);
+      assert.equal(await f.restart().reserveOccurrences(), 0, date);
+    }
+    f.clock('2026-09-14T02:00:00Z');
+    await Promise.all([f.restart().reserveOccurrences(), f.restart().reserveOccurrences()]);
+    assert.equal(await f.service.reserveOccurrences(), 0);
+    const occurrences = await db.queryAll('SELECT report_date::text AS date FROM customer_daily_occurrences WHERE tenant_id=$1 ORDER BY report_date', [f.tenantId]);
+    assert.deepEqual(occurrences.map(row => row.date), ['2026-09-11', '2026-09-14']);
+    await f.service.processDue();
+    const reports = await db.queryAll('SELECT report_date::text AS date,mode,snapshot FROM customer_daily_reports WHERE tenant_id=$1 ORDER BY report_date', [f.tenantId]);
+    assert.deepEqual(reports.map(row => row.date), ['2026-09-11', '2026-09-14']);
+    assert.ok(reports.every(row => row.mode === 'formal' && row.snapshot.mode === 'formal'));
+    assert.equal(reports[0].snapshot.collectionEndAt, reports[1].snapshot.collectionStartAt);
+    assert.equal(reports[1].snapshot.collectionStartAt, '2026-09-11T10:00:00.000Z');
+    assert.equal(reports[1].snapshot.collectionCutoffAt, '2026-09-14T02:00:00.000Z');
+    assert.equal(reports[1].snapshot.handlingStartAt, '2026-09-11T16:00:00.000Z');
+    assert.equal(f.counts('send'), 2);
+    await f.restart().processDue();
+    assert.equal(f.counts('send'), 2);
+  });
+
+  await t.test('PostgreSQL scheduling runs September 20 make-up Sunday and keeps Monday a separate occurrence', async subtest => {
+    const f = await fixture(subtest);
+    f.clock('2026-09-19T00:30:00Z');
+    await f.service.saveSettings(f.tenantId, { autoEnabled: true, sendTime: '09:00' });
+    assert.equal((await db.queryOne('SELECT next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1', [f.tenantId])).next_run_at.toISOString(), '2026-09-20T01:00:00.000Z');
+    assert.equal(await f.service.reserveOccurrences(), 0);
+    f.clock('2026-09-20T00:59:59Z');
+    assert.equal(await f.service.reserveOccurrences(), 0);
+    f.clock('2026-09-20T01:00:00Z');
+    assert.equal(await f.service.reserveOccurrences(), 1);
+    assert.equal((await db.queryOne('SELECT next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1', [f.tenantId])).next_run_at.toISOString(), '2026-09-21T01:00:00.000Z');
+    await f.service.processDue();
+    assert.equal(f.counts('send'), 1);
+    f.clock('2026-09-21T02:00:00Z');
+    await f.restart().processDue();
+    const rows = await db.queryAll(`SELECT o.report_date::text AS date,o.status,r.snapshot
+      FROM customer_daily_occurrences o JOIN customer_daily_reports r ON r.id=o.report_id AND r.tenant_id=o.tenant_id
+      WHERE o.tenant_id=$1 ORDER BY o.report_date`, [f.tenantId]);
+    assert.deepEqual(rows.map(row => row.date), ['2026-09-20', '2026-09-21']);
+    assert.ok(rows.every(row => row.status === 'enqueued'));
+    assert.equal(rows[0].snapshot.collectionStartAt, '2026-09-18T10:00:00.000Z');
+    assert.equal(rows[0].snapshot.collectionEndAt, rows[1].snapshot.collectionStartAt);
+    assert.equal(f.counts('send'), 2);
+    await f.restart().processDue();
+    assert.equal(f.counts('send'), 2);
+  });
+
+  await t.test('restart catches every missed workday across National Day without creating holiday reports or losing the holiday window', async subtest => {
+    const f = await fixture(subtest);
+    f.clock('2026-09-30T00:30:00Z');
+    await f.service.saveSettings(f.tenantId, { autoEnabled: true, sendTime: '09:00' });
+    assert.equal(await f.service.reserveOccurrences(), 0);
+    f.clock('2026-10-10T02:00:00Z');
+    const restarted = f.restart();
+    let reserved = 0;
+    for (let iteration = 0; iteration < 6; iteration++) reserved += await restarted.reserveOccurrences();
+    assert.equal(reserved, 4);
+    assert.equal(await restarted.reserveOccurrences(), 0);
+    const dates = await db.queryAll('SELECT report_date::text AS date FROM customer_daily_occurrences WHERE tenant_id=$1 ORDER BY report_date', [f.tenantId]);
+    assert.deepEqual(dates.map(row => row.date), ['2026-09-30', '2026-10-08', '2026-10-09', '2026-10-10']);
+    assert.equal((await db.queryOne('SELECT next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1', [f.tenantId])).next_run_at.toISOString(), '2026-10-12T01:00:00.000Z');
+    await restarted.processDue();
+    const reports = await db.queryAll(`SELECT o.report_date::text AS scheduled_date,o.status,r.report_date::text AS report_date,r.snapshot
+      FROM customer_daily_occurrences o JOIN customer_daily_reports r ON r.id=o.report_id AND r.tenant_id=o.tenant_id
+      WHERE o.tenant_id=$1 ORDER BY o.report_date`, [f.tenantId]);
+    assert.equal(reports.length, 4);
+    for (const row of reports) {
+      assert.equal(row.status, 'enqueued');
+      assert.equal(row.report_date, row.scheduled_date);
+      assert.equal(row.snapshot.reportDate, row.scheduled_date);
+      assert.equal(row.snapshot.mode, 'formal');
+    }
+    const holidayReport = reports.find(row => row.report_date === '2026-10-08').snapshot;
+    assert.equal(holidayReport.collectionStartAt, '2026-09-30T10:00:00.000Z');
+    assert.equal(holidayReport.collectionCutoffAt, '2026-10-08T10:00:00.000Z');
+    assert.equal(holidayReport.monthStart, holidayReport.collectionStartAt);
+    assert.equal(holidayReport.handlingStartAt, '2026-09-30T16:00:00.000Z');
+    assert.equal(holidayReport.calendarRevision, 'china-work-calendar-v1:cn-mainland-2026-20251104-v1');
+    for (let index = 1; index < reports.length; index++) assert.equal(reports[index - 1].snapshot.collectionEndAt, reports[index].snapshot.collectionStartAt);
+    assert.equal(f.counts('send'), 4);
+    await f.restart().processDue();
+    assert.equal(f.counts('send'), 4);
+  });
+
+  await t.test('a legacy next-run timestamp inside a holiday advances to the next workday without losing its accumulated coverage', async subtest => {
+    const f = await fixture(subtest);
+    await f.service.saveSettings(f.tenantId, { autoEnabled: true, sendTime: '09:00' });
+    await db.execute("UPDATE customer_daily_report_settings SET next_run_at='2026-10-01T01:00:00Z' WHERE tenant_id=$1", [f.tenantId]);
+    f.clock('2026-10-07T02:00:00Z');
+    assert.equal(await f.service.reserveOccurrences(), 1);
+    assert.equal((await db.queryOne('SELECT count(*)::int AS count FROM customer_daily_occurrences WHERE tenant_id=$1', [f.tenantId])).count, 0);
+    assert.equal((await db.queryOne('SELECT next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1', [f.tenantId])).next_run_at.toISOString(), '2026-10-08T01:00:00.000Z');
+    assert.equal(await f.service.reserveOccurrences(), 0);
+    f.clock('2026-10-08T02:00:00Z');
+    await f.restart().processDue();
+    const rows = await db.queryAll(`SELECT o.report_date::text AS date,o.status,r.snapshot
+      FROM customer_daily_occurrences o JOIN customer_daily_reports r ON r.id=o.report_id AND r.tenant_id=o.tenant_id
+      WHERE o.tenant_id=$1`, [f.tenantId]);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].date, '2026-10-08');
+    assert.equal(rows[0].status, 'enqueued');
+    assert.equal(rows[0].snapshot.collectionStartAt, '2026-09-30T10:00:00.000Z');
+    assert.equal(rows[0].snapshot.collectionCutoffAt, '2026-10-08T02:00:00.000Z');
+    assert.equal(f.counts('send'), 1);
+    await f.restart().processDue();
+    assert.equal(f.counts('send'), 1);
+  });
+
+  await t.test('a reserved automatic occurrence freezes the collection boundary while public generation cannot inject one', async subtest => {
+    const f = await fixture(subtest);
+    f.clock('2026-09-08T00:30:00Z');
+    await f.service.saveSettings(f.tenantId,{autoEnabled:true,sendTime:'09:00',collectionBoundaryTime:'18:00'});
+    f.clock('2026-09-08T02:00:00Z');
+    assert.equal(await f.service.reserveOccurrences(),1);
+    await f.service.saveSettings(f.tenantId,{collectionBoundaryTime:'20:00'});
+    const reserved = await db.queryOne('SELECT config FROM customer_daily_occurrences WHERE tenant_id=$1',[f.tenantId]);
+    assert.equal(reserved.config.collectionBoundaryTime,'18:00');
+    await f.restart().processDue();
+    const automatic = await db.queryOne(`SELECT r.id,r.snapshot FROM customer_daily_occurrences o
+      JOIN customer_daily_reports r ON r.id=o.report_id AND r.tenant_id=o.tenant_id WHERE o.tenant_id=$1`,[f.tenantId]);
+    assert.equal(automatic.snapshot.collectionBoundaryTime,'18:00');
+    assert.equal(automatic.snapshot.collectionStartAt,'2026-09-07T10:00:00.000Z');
+    const publicReport = await f.service.generate(f.tenantId,{date:'2026-09-08',requestId:'manual-after-boundary-change',
+      config:{collectionBoundaryTime:'12:00'},businessConfig:{collectionBoundaryTime:'12:00'},collectionBoundaryTime:'12:00'});
+    assert.equal(publicReport.snapshot.collectionBoundaryTime,'20:00');
+    assert.equal(publicReport.snapshot.collectionStartAt,'2026-09-07T12:00:00.000Z');
+    assert.equal(f.service.generateWithBusinessConfig,undefined);
+    assert.equal((await f.service.report(f.tenantId,automatic.id)).snapshot.collectionBoundaryTime,'18:00');
+    assert.equal(f.counts('send'),1);
+    await f.restart().processDue();
+    assert.equal(f.counts('send'),1);
+  });
+
+  await t.test('missing next-year calendar preserves December 31 occurrence and does not block queued manual delivery', async subtest => {
+    const f = await fixture(subtest);
+    f.clock('2026-12-31T00:30:00Z');
+    const manual = await f.service.generate(f.tenantId, {date:'2026-12-30',requestId:'year-end-manual'});
+    await f.service.enqueue(f.tenantId,manual.id,{send:true});
+    await f.service.saveSettings(f.tenantId,{autoEnabled:true,sendTime:'09:00'});
+    f.clock('2026-12-31T02:00:00Z');
+    await f.service.processDue();
+    const occurrences = await db.queryAll('SELECT report_date::text AS date,status,report_id FROM customer_daily_occurrences WHERE tenant_id=$1',[f.tenantId]);
+    assert.equal(occurrences.length,1);
+    assert.equal(occurrences[0].date,'2026-12-31');
+    assert.equal(occurrences[0].status,'enqueued');
+    assert.equal((await f.service.report(f.tenantId,occurrences[0].report_id)).delivery.status,'sent');
+    assert.equal((await f.service.report(f.tenantId,manual.id)).delivery.status,'sent');
+    assert.equal(f.counts('send'),2);
+    const stored = await db.queryOne('SELECT config,next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1',[f.tenantId]);
+    assert.equal(stored.next_run_at.toISOString(),'2026-12-31T01:00:00.000Z','keep the durable retry cursor until the successor can be resolved');
+    assert.equal(stored.config.calendarPending.year,2027);
+    const visible = await f.service.settings(f.tenantId);
+    assert.equal(visible.calendarPendingYear,2027);
+    assert.match(visible.calendarError,/2027.*日历待更新/);
+    assert.equal(visible.nextRunAt,null,'a retry cursor must not masquerade as the next send time');
+    assert.equal(visible.lastAutomaticRun.date,'2026-12-31');
+    assert.equal(visible.lastAutomaticRun.status,'enqueued');
+    await f.restart().processDue();
+    f.clock('2027-01-04T02:00:00Z');
+    await f.restart().processDue();
+    assert.equal(f.counts('send'),2);
+    assert.equal((await db.queryOne('SELECT count(*)::int AS count FROM customer_daily_occurrences WHERE tenant_id=$1',[f.tenantId])).count,1);
+    await f.service.saveSettings(f.tenantId,{autoEnabled:false});
+    assert.equal((await f.rawConfig()).config.calendarPending,undefined);
+    assert.equal((await f.service.settings(f.tenantId)).calendarError,null);
+  });
+
+  await t.test('an unknown-year legacy cursor never fabricates an occurrence and leaves other tenant queues operational', async subtest => {
+    const blocked = await fixture(subtest);
+    const other = await fixture(subtest);
+    const manual = await other.service.generate(other.tenantId,{requestId:'other-tenant-manual'});
+    await other.service.enqueue(other.tenantId,manual.id,{send:true});
+    await blocked.service.saveSettings(blocked.tenantId,{autoEnabled:true,sendTime:'09:00'});
+    await db.execute("UPDATE customer_daily_report_settings SET next_run_at='2027-01-01T01:00:00Z' WHERE tenant_id=$1",[blocked.tenantId]);
+    blocked.clock('2027-01-04T02:00:00Z');
+    // The worker is shared across tenants; every external effect remains the mock.
+    await blocked.service.processDue();
+    assert.equal((await db.queryOne('SELECT count(*)::int AS count FROM customer_daily_occurrences WHERE tenant_id=$1',[blocked.tenantId])).count,0);
+    assert.equal((await blocked.service.settings(blocked.tenantId)).calendarPendingYear,2027);
+    assert.equal((await other.service.report(other.tenantId,manual.id)).delivery.status,'sent');
+    assert.equal(blocked.calls.filter(call=>call.type==='send' && call.reportId===manual.id).length,1);
+    assert.equal((await db.queryOne('SELECT next_run_at FROM customer_daily_report_settings WHERE tenant_id=$1',[blocked.tenantId])).next_run_at.toISOString(),'2027-01-01T01:00:00.000Z');
+  });
+
+  await t.test('a persisted waiting cursor resumes automatically once its year is present, retaining missed workdays without duplicates', async subtest => {
+    const f = await fixture(subtest);
+    f.clock('2026-09-11T00:30:00Z');
+    await f.service.saveSettings(f.tenantId,{autoEnabled:true,sendTime:'09:00'});
+    // Model a cursor left by a previous runtime that lacked this now-loaded year.
+    await db.execute("UPDATE customer_daily_report_settings SET config=jsonb_set(config,'{calendarPending}',$2::jsonb) WHERE tenant_id=$1",[f.tenantId,JSON.stringify({year:2026})]);
+    f.clock('2026-09-14T02:00:00Z');
+    assert.equal((await f.service.settings(f.tenantId)).calendarPendingYear,2026);
+    await f.restart().processDue();
+    assert.equal((await f.rawConfig()).config.calendarPending,undefined);
+    assert.equal((await f.service.settings(f.tenantId)).calendarError,null);
+    assert.equal((await f.service.settings(f.tenantId)).nextRunAt,'2026-09-14T01:00:00.000Z');
+    await f.restart().processDue();
+    const dates = await db.queryAll('SELECT report_date::text AS date,status FROM customer_daily_occurrences WHERE tenant_id=$1 ORDER BY report_date',[f.tenantId]);
+    assert.deepEqual(dates.map(row=>row.date),['2026-09-11','2026-09-14']);
+    assert.ok(dates.every(row=>row.status==='enqueued'));
+    assert.equal(f.counts('send'),2);
+    await f.restart().processDue();
+    assert.equal(f.counts('send'),2);
+    assert.equal((await f.service.settings(f.tenantId)).nextRunAt,'2026-09-15T01:00:00.000Z');
+  });
+
+  await t.test('ten calendar-blocked tenants cannot starve a new known-workday reservation behind the batch limit', async subtest => {
+    for (let index=0;index<10;index++) {
+      const f = await fixture(subtest);
+      f.clock('2026-12-31T00:00:00Z');
+      await f.service.saveSettings(f.tenantId,{autoEnabled:true,sendTime:'08:30'});
+      await db.execute("UPDATE customer_daily_report_settings SET config=jsonb_set(config,'{calendarPending}',$2::jsonb) WHERE tenant_id=$1",[f.tenantId,JSON.stringify({year:2027})]);
+    }
+    const newest = await fixture(subtest);
+    newest.clock('2026-12-31T00:30:00Z');
+    await newest.service.saveSettings(newest.tenantId,{autoEnabled:true,sendTime:'09:00'});
+    newest.clock('2026-12-31T02:00:00Z');
+    assert.equal(await newest.service.reserveOccurrences(),10);
+    const own = await db.queryAll('SELECT report_date::text AS date FROM customer_daily_occurrences WHERE tenant_id=$1',[newest.tenantId]);
+    assert.deepEqual(own.map(row=>row.date),['2026-12-31']);
+    assert.equal((await newest.service.settings(newest.tenantId)).calendarPendingYear,2027);
+    assert.equal(newest.calls.length,0,'reservation alone must not contact Feishu');
   });
 
   await t.test('disabling automatic sends cancels pending or retry work, preserves manual work, and allows explicit manual recovery', async subtest => {
@@ -540,7 +785,7 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
         await f.service.processDue();
       }
       const automatic = await db.queryOne('SELECT report_id FROM customer_daily_occurrences WHERE tenant_id=$1', [f.tenantId]);
-      const manual = await f.service.generate(f.tenantId, { date: '2026-09-06' });
+      const manual = await f.service.generate(f.tenantId, { date: '2026-09-04' });
       await f.service.enqueue(f.tenantId, manual.id, { send: true });
       const sentBeforeDisable = f.calls.filter(call => call.type === 'send' && call.reportId === automatic.report_id).length;
       await f.service.saveSettings(f.tenantId, { autoEnabled: false });

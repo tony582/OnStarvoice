@@ -3,6 +3,7 @@ import {
   CUSTOMER_DAILY_SECTIONS, CUSTOMER_DAILY_SUMMARY_HEADERS as HEADERS,
   customerDailySummaryRows as summaryRows,
   customerDailyPostPlatform as sourceLabel, customerDailyPostComparison, customerDailyColdEmpty as coldEmpty,
+  customerDailyColdTitle, customerDailyColdPostLabel,
 } from './customer-daily-report-presentation.js';
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char])); }
@@ -49,10 +50,11 @@ export function renderCustomerDailyReportMessageText(snapshot) {
   for (const [index, post] of (snapshot.highHeat || []).entries()) {
     lines.push(`TOP${index + 1}：${oneLine(post.title)} — ${sourceLabel(post)}｜${heatDescription(post)}`, url(post.url) || '原帖链接待补');
   }
-  lines.push('', CUSTOMER_DAILY_SECTIONS.cold);
+  lines.push('', customerDailyColdTitle(snapshot));
   if (!snapshot.coldMarked?.length) lines.push(coldEmpty(snapshot));
   for (const [index, post] of (snapshot.coldMarked || []).entries()) {
-    lines.push(`${index + 1}、${oneLine(post.title)} — ${sourceLabel(post)}`, url(post.url) || '原帖链接待补');
+    const historical = customerDailyColdPostLabel(post);
+    lines.push(`${index + 1}、${oneLine(post.title)}${historical ? `【${historical}】` : ''} — ${sourceLabel(post)}`, url(post.url) || '原帖链接待补');
   }
   return lines.join('\n');
 }
@@ -65,8 +67,8 @@ function linkedTitle(post) {
 export function renderCustomerDailyReportMessageHtml(snapshot) {
   return `<h2>${CUSTOMER_DAILY_SECTIONS.heat}</h2>
     ${(snapshot.highHeat || []).map((post, index) => `<article><h3>TOP${index + 1}：${linkedTitle(post)}</h3><p>${esc(sourceLabel(post))}｜${esc(heatDescription(post))}</p></article>`).join('') || '<p class="empty">暂未检出符合条件的帖子。</p>'}
-    <h2>${CUSTOMER_DAILY_SECTIONS.cold}</h2>
-    ${(snapshot.coldMarked || []).map((post, index) => `<article><h3>${index + 1}、${linkedTitle(post)}</h3><p>${esc(sourceLabel(post))}</p></article>`).join('') || `<p class="empty">${esc(coldEmpty(snapshot))}</p>`}`;
+    <h2>${customerDailyColdTitle(snapshot)}</h2>
+    ${(snapshot.coldMarked || []).map((post, index) => `<article><h3>${index + 1}、${linkedTitle(post)}${customerDailyColdPostLabel(post) ? '<span class="historical">【历史帖】</span>' : ''}</h3><p>${esc(sourceLabel(post))}</p></article>`).join('') || `<p class="empty">${esc(coldEmpty(snapshot))}</p>`}`;
 }
 
 export function renderCustomerDailyReportHtml(snapshot) {
@@ -151,15 +153,16 @@ export function buildCustomerDailyReportWorkbook(snapshot) {
   if (!snapshot.highHeat?.length) mergedText(heat, 5, 5, '暂未检出符合条件的帖子。');
   heat.views = [{state: 'frozen', ySplit: 4}]; heat.pageSetup.printTitlesRow = '4:4';
 
-  const cold = workbook.addWorksheet('新增冷处理');
+  const cold = workbook.addWorksheet('本期冷处理');
   configureSheet(cold, 3);
   [9, 72, 18].forEach((width, i) => { cold.getColumn(i + 1).width = width; });
   mergedText(cold, 1, 3, customerDailyReportTitle(snapshot), {title: true});
-  mergedText(cold, 2, 3, CUSTOMER_DAILY_SECTIONS.cold);
+  mergedText(cold, 2, 3, customerDailyColdTitle(snapshot));
   cold.getRow(4).values = ['序号', '标题', '平台']; headerRow(cold, 4);
   for (const [index, post] of (snapshot.coldMarked || []).entries()) {
-    const row = bodyRow(cold, [index + 1, text(post.title), sourceLabel(post)]);
-    hyperlink(row.getCell(2), post.title, post.url);
+    const title = `${text(post.title)}${customerDailyColdPostLabel(post) ? '【历史帖】' : ''}`;
+    const row = bodyRow(cold, [index + 1, title, sourceLabel(post)]);
+    hyperlink(row.getCell(2), title, post.url);
   }
   if (!snapshot.coldMarked?.length) mergedText(cold, 5, 3, coldEmpty(snapshot));
   cold.views = [{state: 'frozen', ySplit: 4}]; cold.pageSetup.printTitlesRow = '4:4';

@@ -3,6 +3,8 @@ import {
   customerDailyPostPlatform,
   customerDailyPostComparison,
   customerDailyColdEmpty,
+  customerDailyColdTitle,
+  customerDailyColdPostLabel,
 } from './customer-daily-report-presentation.js';
 
 // Feishu caps the complete serialized post request at 30 KB. Reserve room for
@@ -57,6 +59,7 @@ function postLine(post, index, heat) {
   const nodes = [text(heat ? `TOP${index + 1}： ` : `${index + 1}、 `),
     text(url || `${title}（原帖链接待补） - ${oneLine(customerDailyPostPlatform(item), '未知平台', 40)}`)];
   if (heat) nodes.push(text(` | 热度 ${heatLabel(item)} | ${comparisonLabel(item)}`));
+  else if (customerDailyColdPostLabel(item)) nodes.push(text(' 【历史帖】'));
   return nodes;
 }
 
@@ -83,11 +86,11 @@ export function buildFeishuDailyPost({ snapshot, imageKey, documentUrl }) {
   const title = `${oneLine(snapshot.tenantName, '客户', 80)} · 舆情日报 ${oneLine(snapshot.reportDate, '', 20)}`.trim();
 
   function build(heatCount, coldCount) {
-    const content = [[{ tag: 'img', image_key: image }], heading(CUSTOMER_DAILY_SECTIONS.heat)];
+    const content = [heading(CUSTOMER_DAILY_SECTIONS.summary), [{ tag: 'img', image_key: image }], heading(CUSTOMER_DAILY_SECTIONS.heat)];
     if (!heat.length) content.push([text('暂未检出符合条件的帖子。')]);
     for (let index = 0; index < heatCount; index++) content.push(postLine(heat[index], index, true));
     if (heatCount < heat.length) content.push([text(`另有 ${heat.length - heatCount} 条高热负面帖子，见底部完整日报。`)]);
-    content.push(heading(CUSTOMER_DAILY_SECTIONS.cold));
+    content.push(heading(customerDailyColdTitle(snapshot)));
     if (!cold.length) content.push([text(customerDailyColdEmpty(snapshot))]);
     for (let index = 0; index < coldCount; index++) content.push(postLine(cold[index], index, false));
     if (coldCount < cold.length) content.push([text(`另有 ${cold.length - coldCount} 条冷处理负面帖子，见底部完整日报。`)]);

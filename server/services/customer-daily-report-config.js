@@ -1,8 +1,9 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import {isWorkingDate, nextWorkingDate} from './china-work-calendar.js';
 
 const SECRET_FIELDS = ['appSecret', 'webhookUrl', 'webhookSecret'];
-const PUBLIC_FIELDS = ['appId','folderToken','documentBaseUrl','channel','chatId','chatName','editorType','editorId','customerEditVerified','autoEnabled','sendTime'];
-export const DAILY_DEFAULTS = Object.freeze({appId:'',folderToken:'',documentBaseUrl:'',channel:'app',chatId:'',chatName:'',editorType:'email',editorId:'',customerEditVerified:false,autoEnabled:false,sendTime:'09:00'});
+const PUBLIC_FIELDS = ['appId','folderToken','documentBaseUrl','channel','chatId','chatName','editorType','editorId','customerEditVerified','autoEnabled','sendTime','collectionBoundaryTime'];
+export const DAILY_DEFAULTS = Object.freeze({appId:'',folderToken:'',documentBaseUrl:'',channel:'app',chatId:'',chatName:'',editorType:'email',editorId:'',customerEditVerified:false,autoEnabled:false,sendTime:'09:00',collectionBoundaryTime:'18:00'});
 
 export function dailyError(message, status = 400, code = 'daily_report_invalid') {
   return Object.assign(new Error(message), {status, code});
@@ -43,6 +44,11 @@ export function publicDailyConfig(config = {}) {
   for (const key of PUBLIC_FIELDS) if (config[key] !== undefined) result[key] = config[key];
   for (const key of SECRET_FIELDS) result[`has${key[0].toUpperCase()}${key.slice(1)}`] = !!config[`${key}Encrypted`];
   result.hasWebhook = !!config.webhookUrlEncrypted;
+  // Read-only scheduler metadata; clients cannot set or clear it via config patches.
+  const pendingYear = config.autoEnabled && config.calendarPending?.year;
+  result.calendarPendingYear = Number.isInteger(pendingYear) && pendingYear > 0 ? pendingYear : null;
+  result.calendarError = result.calendarPendingYear
+    ? `${result.calendarPendingYear} 年工作日日历待更新；已知日报继续处理，补齐日历后自动恢复。` : null;
   return result;
 }
 
@@ -82,6 +88,7 @@ export function mergeDailyConfig(existing = {}, patch, tenantId, env) {
     }
   }
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(next.sendTime)) throw dailyError('发送时间应为 HH:mm');
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(next.collectionBoundaryTime)) throw dailyError('采集归属切分时间应为 HH:mm');
   if (!['app','webhook'].includes(next.channel)) throw dailyError('群发送方式无效');
   if (!['email','openid','openchat'].includes(next.editorType)) throw dailyError('编辑者类型无效');
   if (next.documentBaseUrl && !validFeishuBase(next.documentBaseUrl)) throw dailyError('文档域名应为 https://企业域名.feishu.cn');
@@ -111,7 +118,8 @@ export function dailyTargetKey(config) {
 export function nextDailySendAt(sendTime, now = new Date()) {
   const current = new Date(now);
   const localDate = new Date(current.getTime() + 8 * 3600000).toISOString().slice(0,10);
-  let due = new Date(`${localDate}T${sendTime}:00+08:00`);
-  if (due <= current) due = new Date(due.getTime() + 86400000);
+  let date = isWorkingDate(localDate) ? localDate : nextWorkingDate(localDate);
+  let due = new Date(`${date}T${sendTime}:00+08:00`);
+  if (due <= current) { date = nextWorkingDate(date); due = new Date(`${date}T${sendTime}:00+08:00`); }
   return due.toISOString();
 }

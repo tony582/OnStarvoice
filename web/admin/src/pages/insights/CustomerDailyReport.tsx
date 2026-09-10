@@ -5,7 +5,7 @@ import { useAuth } from '@/lib/auth'
 import { Button } from '@/components/ui/button'
 import { useNav } from '@/lib/navigation'
 import * as Dialog from '@radix-ui/react-dialog'
-import { DAILY_API, dailyError, dailyTime, safeReportUrl, shanghaiDate, type DailyCounts, type DailyPost, type DailyReport, type DailySettings, type DailySnapshot } from './CustomerDailyReport.types'
+import { DAILY_API, dailyError, dailyTime, safeReportUrl, shanghaiDate, type DailyCalendar, type DailyCounts, type DailyPost, type DailyReport, type DailySettings, type DailySnapshot } from './CustomerDailyReport.types'
 
 type ReportResponse = { report: DailyReport; html: string; text: string; messageHtml: string; messageText: string }
 type Notice = { kind: 'success' | 'error'; text: string }
@@ -30,7 +30,10 @@ function CustomerDailyReportWorkspace() {
   const { canWrite, user } = useAuth()
   const { navigate } = useNav()
   const canManage = ['platform_admin', 'internal_operator'].includes(user?.globalRole || '')
-  const [date, setDate] = useState(() => shanghaiDate(-1))
+  const [date, setDate] = useState(() => shanghaiDate())
+  const [calendar, setCalendar] = useState<{ date: string; value: DailyCalendar } | null>(null)
+  const [calendarError, setCalendarError] = useState('')
+  const calendarDefaultPending = useRef(true)
   const [reports, setReports] = useState<DailyReport[]>([])
   const [current, setCurrent] = useState<ReportResponse | null>(null)
   const [loading, setLoading] = useState(true)
@@ -53,6 +56,8 @@ function CustomerDailyReportWorkspace() {
   const operation = useRef(false)
   const mounted = useRef(true)
   const today = shanghaiDate()
+  const selectedCalendar = calendar?.date === date ? calendar.value : null
+  const canGenerate = selectedCalendar?.isWorkingDay === true
   const report = current?.report
   const snapshot = report?.snapshot
   const delivery = report?.delivery
@@ -88,6 +93,29 @@ function CustomerDailyReportWorkspace() {
   }, [])
 
   useEffect(() => { void Promise.resolve().then(loadSettings) }, [loadSettings])
+
+  useEffect(() => {
+    let cancelled = false
+    async function loadCalendar() {
+      try {
+        const data = await api.get<{ calendar: DailyCalendar }>(`${DAILY_API}/calendar?date=${encodeURIComponent(date)}`)
+        if (cancelled || !mounted.current) return
+        setCalendarError('')
+        setCalendar({ date, value: data.calendar })
+        if (calendarDefaultPending.current) {
+          calendarDefaultPending.current = false
+          if (data.calendar.defaultReportDate !== date) setDate(data.calendar.defaultReportDate)
+        }
+      } catch (error) {
+        if (!cancelled && mounted.current) {
+          setCalendar(null)
+          setCalendarError(dailyError(error, '工作日历暂时无法读取，请刷新重试。'))
+        }
+      }
+    }
+    void loadCalendar()
+    return () => { cancelled = true }
+  }, [date, reload])
 
   useEffect(() => {
     const sequence = ++requestSequence.current
@@ -152,13 +180,14 @@ function CustomerDailyReportWorkspace() {
 
   function chooseDate(value: string) {
     if (!value || value > today || operation.current || summaryDraft) return
+    calendarDefaultPending.current = false
     generationRequest.current = null
     versionToReload.current = null
     setDate(value)
   }
 
   async function generate() {
-    if (!canWrite() || operation.current || summaryDraft) return
+    if (!canWrite() || operation.current || summaryDraft || !canGenerate) return
     operation.current = true
     setBusy('generate')
     setNotice(null)
@@ -317,18 +346,20 @@ function CustomerDailyReportWorkspace() {
     <section className="rounded-xl border border-slate-200 bg-white p-5 sm:p-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div><h2 className="text-xl font-semibold tracking-tight">客户舆情日报</h2><p className="mt-2 text-sm leading-6 text-slate-500">每日汇总、重点负面和冷处理记录。</p></div>
-        <span className="rounded-full bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700">{date === today ? '今天 · 实时日报' : '按日归档'}</span>
+        <span className="rounded-full bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700">{date === today ? '今天' : '按日归档'}</span>
       </div>
       <div className="mt-5 flex flex-wrap items-center gap-2">
         <label className="flex min-w-0 items-center gap-3 text-sm text-slate-600">报表日期<input aria-label="报表日期" className="h-10 min-w-0 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-primary/30" type="date" value={date} max={today} disabled={disabled} onChange={e => chooseDate(e.target.value)} /></label>
         <Button variant="ghost" disabled={disabled} onClick={() => chooseDate(shanghaiDate(-1))}>昨天</Button>
-        <Button variant="ghost" disabled={disabled} onClick={() => chooseDate(today)}>今天实时</Button>
+        <Button variant="ghost" disabled={disabled} onClick={() => chooseDate(today)}>今天</Button>
         <div className="flex flex-wrap gap-2 sm:ml-auto">
           <Button variant="outline" onClick={() => { setReload(value => value + 1); void loadSettings() }} disabled={disabled}><RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />刷新</Button>
-          <Button onClick={() => { if (snapshot?.summaryEdited) setConfirmRegenerate(true); else void generate() }} disabled={disabled || !canWrite()}>{busy === 'generate' ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}{reports.length ? '更新日报' : '生成日报'}</Button>
+          <Button onClick={() => { if (snapshot?.summaryEdited) setConfirmRegenerate(true); else void generate() }} disabled={disabled || !canWrite() || !canGenerate}>{busy === 'generate' ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}{reports.length ? '更新日报' : '生成日报'}</Button>
         </div>
       </div>
-      <p className="mt-3 text-xs leading-6 text-slate-500">北京时间 · 默认查看昨天。</p>
+      <p className="mt-3 text-xs leading-6 text-slate-500">北京时间 · 默认查看最近工作日日报。</p>
+      {selectedCalendar?.isWorkingDay === false && <p role="status" className="mt-1 text-xs leading-6 text-slate-500">非工作日，采集内容合并至 {selectedCalendar.nextWorkingDate} 日报。</p>}
+      {calendarError && <p role="alert" className="mt-1 text-xs leading-6 text-amber-800">{calendarError}</p>}
     </section>
 
     {notice && <div role={notice.kind === 'error' ? 'alert' : 'status'} className={`flex items-start gap-2 rounded-lg border px-4 py-3 text-sm ${notice.kind === 'error' ? 'border-rose-200 bg-rose-50 text-rose-800' : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}>
@@ -336,7 +367,7 @@ function CustomerDailyReportWorkspace() {
     </div>}
 
     {loading ? <div role="status" className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-20 text-sm text-slate-500"><Loader2 className="h-5 w-5 animate-spin" />正在读取日报…</div> : !snapshot ? <div className="rounded-xl border border-slate-200 bg-white px-6 py-16 text-center">
-      <FileText className="mx-auto h-8 w-8 text-blue-500" /><h3 className="mt-4 text-base font-semibold">{reports.length ? '选择一个日报版本查看' : '这一天尚未生成日报'}</h3><p className="mt-2 text-sm text-slate-500">{canWrite() ? '点击「生成日报」，查看这一天的监控汇总和帖子清单。' : '有生成权限的同事生成后，即可在这里查看和导出。'}</p>
+      <FileText className="mx-auto h-8 w-8 text-blue-500" /><h3 className="mt-4 text-base font-semibold">{reports.length ? '日报暂时无法读取' : '这一天尚未生成日报'}</h3><p className="mt-2 text-sm text-slate-500">{selectedCalendar?.isWorkingDay === false ? `采集内容将合并至 ${selectedCalendar.nextWorkingDate} 日报。` : canWrite() ? '点击「生成日报」，查看这一天的监控汇总和帖子清单。' : '有生成权限的同事生成后，即可在这里查看和导出。'}</p>
     </div> : <>
       <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50/70 px-5 py-3">
@@ -358,7 +389,7 @@ function CustomerDailyReportWorkspace() {
           <ReportSection title="二、7天内热度值≥200的负面帖子">
             <PostList posts={snapshot.highHeat} kind="heat" />
           </ReportSection>
-          <ReportSection title="三、冷处理负面帖链接">
+          <ReportSection title={coldSectionTitle(snapshot.coldMarked)}>
             <PostList posts={snapshot.coldMarked} kind="cold" incomplete={snapshot.evidence?.cold?.coverageComplete !== true} />
           </ReportSection>
         </article>
@@ -390,9 +421,13 @@ function CustomerDailyReportWorkspace() {
           <div className="mb-5 pr-7"><Dialog.Title className="text-base font-semibold text-slate-900">数据说明</Dialog.Title><Dialog.Description className="mt-2 text-xs text-slate-500">用于发送前核对，不加入客户日报正文。</Dialog.Description></div>
           <Dialog.Close aria-label="关闭数据说明" className="absolute right-4 top-4 rounded-lg p-2 text-slate-500 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"><X className="h-4 w-4" /></Dialog.Close>
           <div className="space-y-4 text-xs leading-6 text-slate-600">
-            <p>新增 / 互动统计截至 {dailyTime(snapshot.cutoffAt)}；复核及冷处理状态截至 {dailyTime(snapshot.assessedAt)}。北京时间。</p>
+            <p>{snapshot.collectionCutoffAt ? <>新增统计截至 {dailyTime(snapshot.collectionCutoffAt)}；互动统计截至 {dailyTime(snapshot.cutoffAt)}</> : <>新增 / 互动统计截至 {dailyTime(snapshot.cutoffAt)}</>}；复核及冷处理状态截至 {dailyTime(snapshot.assessedAt)}。北京时间。</p>
             {!!snapshot.warnings.length && <ul className="list-disc space-y-1 pl-5 text-amber-800">{snapshot.warnings.map((warning, index) => <li key={`${warning.code}-${index}`}>{warning.message}</li>)}</ul>}
-            <p>监控仅计首次成功入库的新帖，复采不重复计数；SDB 仅扣除已复核的非监控内容。MTD 为月初至报表截止时间的首次入库集合。冷处理数量与当天标记清单可能不同。</p>
+            {snapshot.collectionStartAt && snapshot.collectionCutoffAt ? <>
+              <p>采集归属范围：{dailyTime(snapshot.collectionStartAt)} 至 {dailyTime(snapshot.collectionCutoffAt)}。前夜采集归当天，周末和法定节假日合并至下一工作日，调休上班日正常出报。</p>
+              <p>监控仅计进入客户内容分诊清单的新增帖子，复采和后续修改状态不重复计数；SDB 扣除已复核的非监控内容。MTD 按日报归属月份累计。</p>
+              {snapshot.calendarRevision && <p>工作日历：中国法定节假日及调休安排 · {snapshot.calendarRevision}。</p>}
+            </> : <p>此日报按生成时的原统计范围展示：监控为首次成功入库的新帖，复采不重复计数；SDB 扣除已复核的非监控内容。</p>}
             <p>系统统计负面：当日 {snapshot.summary.day.negative} 条，MTD {snapshot.summary.mtd.negative} 条。待识别或核对：当日 {snapshot.summary.day.unclassified} 条，MTD {snapshot.summary.mtd.unclassified} 条。客户补填的汇总与系统统计分别保存。</p>
             <p>处理中、已处理初始为空，空白不代表 0。可在本页填写并保存；飞书文档里的修改不会自动同步回本页。</p>
             <p>7 天发布时间：{dailyTime(snapshot.heatStart)} 至 {dailyTime(snapshot.cutoffAt)}。热度为点赞、评论、收藏、分享之和。</p>
@@ -429,7 +464,7 @@ function SummaryTable({ snapshot, draft, canEdit, busy, onEdit, onChange, onCanc
     { key: 'mtd', label: 'MTD', values: snapshot.summary.mtd },
   ]
   return <section>
-    <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><h4 className="text-base font-semibold text-slate-900">一、监控汇总</h4>{canEdit && <div className="flex gap-2">{draft ? <><Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>取消</Button><Button size="sm" disabled={busy} onClick={onSave}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存汇总</Button></> : <Button size="sm" variant="ghost" disabled={busy} onClick={onEdit}><Pencil className="h-3.5 w-3.5" />编辑汇总</Button>}</div>}</div>
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><h4 className="text-base font-semibold text-slate-900">一、监控汇总（本期新增）</h4>{canEdit && <div className="flex gap-2">{draft ? <><Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>取消</Button><Button size="sm" disabled={busy} onClick={onSave}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存汇总</Button></> : <Button size="sm" variant="ghost" disabled={busy} onClick={onEdit}><Pencil className="h-3.5 w-3.5" />编辑汇总</Button>}</div>}</div>
     <div className="overflow-x-auto rounded-lg border border-slate-200">
       <table className="w-full min-w-[660px] border-collapse text-center text-sm tabular-nums" aria-label="监控汇总与月累计">
         <thead className="bg-blue-50/70 text-slate-700"><tr className="[&>th]:border-b [&>th]:border-r [&>th]:border-slate-200 [&>th]:px-3 [&>th]:py-3 [&>th]:font-medium [&>th:last-child]:border-r-0"><th rowSpan={2} scope="col">日期</th><th rowSpan={2} scope="col">监控数量</th><th rowSpan={2} scope="col">SDB范畴</th><th rowSpan={2} scope="col">正向</th><th rowSpan={2} scope="col">中性</th><th colSpan={3} scope="colgroup">负面</th></tr><tr className="[&>th]:border-b [&>th]:border-r [&>th]:border-slate-200 [&>th]:px-3 [&>th]:py-2.5 [&>th]:font-medium [&>th:last-child]:border-r-0"><th scope="col">冷处理</th><th scope="col">处理中</th><th scope="col">已处理</th></tr></thead>
@@ -444,15 +479,21 @@ function ReportSection({ title, children }: { title: string; children: ReactNode
   return <section><h4 className="mb-4 text-base font-semibold text-slate-900">{title}</h4>{children}</section>
 }
 
+function coldSectionTitle(posts: DailyPost[]) {
+  const historicalCount = posts.every(post => typeof post.isHistorical === 'boolean')
+    ? posts.filter(post => post.isHistorical).length : null
+  return `三、本期冷处理负面帖：${posts.length} 条${historicalCount ? `（含历史帖 ${historicalCount} 条）` : ''}`
+}
+
 function PostList({ posts, kind, incomplete = false }: { posts: DailyPost[]; kind: 'heat' | 'cold'; incomplete?: boolean }) {
-  if (!posts.length) return <p className="rounded-lg bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-500">{kind === 'heat' ? '暂未检出符合条件的帖子。' : incomplete ? '暂未检出。' : '当日无新增冷处理负面帖子。'}</p>
+  if (!posts.length) return <p className="rounded-lg bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-500">{kind === 'heat' ? '暂未检出符合条件的帖子。' : incomplete ? '暂未检出。' : '本期无冷处理负面帖子。'}</p>
   return <ol className="divide-y divide-slate-200 border-y border-slate-200">{posts.map((post, index) => {
     const url = safeReportUrl(post.url)
     return <li key={`${post.recordId}-${index}`} className="flex gap-3 py-4 sm:gap-4">
       <span className="min-w-8 pt-0.5 text-xs font-semibold tabular-nums text-blue-700">{kind === 'heat' ? `TOP${index + 1}` : index + 1}</span>
       <div className="min-w-0 flex-1">
         {url ? <a href={url} target="_blank" rel="noopener noreferrer" className="break-words text-sm font-medium leading-6 text-blue-700 underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{post.title || '查看原帖'}<ExternalLink className="ml-1 inline h-3 w-3" /></a> : <p className="text-sm font-medium leading-6">{post.title || '标题待补'}<span className="ml-2 text-xs font-normal text-amber-800">原帖链接待补</span></p>}
-        <p className="mt-1.5 text-xs leading-5 text-slate-500">{platforms[post.platform] || post.platform || '未知平台'}{kind === 'heat' && <>｜热度 {post.heat?.toLocaleString() ?? '待核对'}｜较昨日 {(post.comparisonText || '暂无对比').replace(/^较昨日\s*[:：]?\s*/, '').trim() || '暂无对比'}</>}</p>
+        <p className="mt-1.5 text-xs leading-5 text-slate-500">{platforms[post.platform] || post.platform || '未知平台'}{kind === 'cold' && post.isHistorical === true && <span className="ml-2 inline-flex rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">历史帖</span>}{kind === 'heat' && <>｜热度 {post.heat?.toLocaleString() ?? '待核对'}｜较昨日 {(post.comparisonText || '暂无对比').replace(/^较昨日\s*[:：]?\s*/, '').trim() || '暂无对比'}</>}</p>
       </div>
     </li>
   })}</ol>

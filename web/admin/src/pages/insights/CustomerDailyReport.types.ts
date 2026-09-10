@@ -22,6 +22,7 @@ export type DailyPost = {
   previousHeat?: number
   previousObservedAt?: string
   markedAt?: string
+  isHistorical?: boolean
   stale?: boolean
   status?: string
   quality?: 'measured' | 'measured_ingestion_time' | 'legacy_unverified'
@@ -38,6 +39,9 @@ export type DailySnapshot = {
   mode: 'formal' | 'realtime'
   periodStart: string
   cutoffAt: string
+  collectionStartAt?: string
+  collectionCutoffAt?: string
+  calendarRevision?: string
   assessedAt: string
   monthStart: string
   heatStart: string
@@ -80,15 +84,26 @@ export type DailySettings = {
   customerEditVerified: boolean
   autoEnabled: boolean
   sendTime: string
+  collectionBoundaryTime?: string
   hasAppSecret?: boolean
   hasWebhook?: boolean
   hasWebhookSecret?: boolean
   nextRunAt?: string | null
+  calendarPendingYear?: number | null
+  calendarError?: string | null
   lastAutomaticRun?: {
     date: string
     status: 'pending' | 'enqueued' | 'needs_attention' | 'canceled'
     error?: string
   } | null
+}
+
+export type DailyCalendar = {
+  defaultReportDate: string
+  isWorkingDay: boolean
+  nextWorkingDate: string
+  collectionBoundaryTime: string
+  revision: string
 }
 
 export const DAILY_API = '/customer-daily-reports'

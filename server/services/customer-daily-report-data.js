@@ -1,4 +1,5 @@
 import {resolveMetricUpdateFromPayload} from '../utils/metrics.js';
+import {recoverCustomerDailyObservationTime} from './customer-daily-metric-evidence.js';
 
 export {
   renderCustomerDailyReportHtml,
@@ -12,6 +13,11 @@ const SENTIMENTS = new Set(['positive', 'neutral', 'negative']);
 const NEGATIVE_STATES = new Set(['negative_cold', 'negative_feishu', 'privacy_unreachable']);
 const NON_POST_TYPES = new Set(['official_content', 'blogger_profile', 'comment', 'comments', 'record_comment', 'comment_detail']);
 const POST_SQL = "r.record_type NOT IN ('official_content', 'blogger_profile', 'comment', 'comments', 'record_comment', 'comment_detail')";
+// Match both lifecycle tabs of customer content triage. Archiving a reviewed post
+// must not remove its original contribution to monitoring volume.
+const CUSTOMER_POST_SQL = `${POST_SQL} AND r.business_visibility = 'eligible'
+  AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant' OR EXISTS (
+    SELECT 1 FROM record_watchlist daily_watched WHERE daily_watched.tenant_id=r.tenant_id AND daily_watched.record_id=r.id))`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ACTIVE_CAPTURE = new Set(['pending', 'waiting_device', 'claimed', 'running', 'recovering', 'interrupted', 'resume_requested', 'needs_action']);
 const PATROL_WORKFLOWS = new Set(['negative_post_patrol', 'watched_content_patrol', 'followed_creator_post_patrol', 'official_account_comment_patrol', 'official_account_post_discovery']);
@@ -22,7 +28,7 @@ const METRICS = {
   shares: ['shares', 'shareCount', 'share_count', 'reposts', 'repostCount', 'repost_count', 'repostsCount', 'reposts_count'],
 };
 const PROJECTION_KEYS = [...new Set([
-  ...Object.values(METRICS).flat(), 'syncType', 'detailCaptureStatus', 'captureTimestamp',
+  ...Object.values(METRICS).flat(), 'syncType', 'detailCaptureStatus', 'captureTimestamp', 'capture_timestamp',
   'displayMetricDimension', 'displayMetricCount', 'displayMetricKnown', 'metricKnown',
   'likesKnown', 'likeCountKnown', 'commentsKnown', 'commentsCountKnown', 'commentCountKnown',
   'collectsKnown', 'collectsCountKnown', 'collectCountKnown', 'sharesKnown', 'sharesCountKnown',
@@ -43,6 +49,7 @@ function iso(value) { const n = ms(value); return Number.isFinite(n) ? new Date(
 function shanghaiDate(value) { return new Date(ms(value) + ZONE_OFFSET).toISOString().slice(0, 10); }
 function number(value) { if (value === null || value === undefined || value === '') return null; const n = Number(value); return Number.isFinite(n) && n >= 0 ? n : null; }
 function mainPost(row) { return !NON_POST_TYPES.has(row.record_type); }
+function customerPost(row) { return mainPost(row) && row.business_visibility === 'eligible' && (row.relevance !== 'irrelevant' || row.watched === true); }
 function status(row) { return row.status || row.triage_status || 'unhandled'; }
 function safeUrl(value) {
   try { const url = new URL(String(value || '')); return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password ? url.href : ''; }
@@ -83,11 +90,18 @@ function count(rows) {
   return c;
 }
 
-function projectedObjectSql(ref) {
-  return `jsonb_strip_nulls(jsonb_build_object(${PROJECTION_KEYS.map(key => `'${key}', ${ref}->'${key}'`).join(', ')}))`;
+function projectedObjectSql(ref, preserveTruthiness = false) {
+  const projected = `jsonb_strip_nulls(jsonb_build_object(${PROJECTION_KEYS.map(key => `'${key}', ${ref}->'${key}'`).join(', ')}))`;
+  // normalizeRecord chooses outer.detailPayload || firstItem.detailPayload.
+  // Keep falsey absence separate from an existing empty (truthy) detail object.
+  return preserveTruthiness ? `CASE WHEN ${ref} IS NULL OR ${ref} IN ('null'::jsonb,'false'::jsonb,'0'::jsonb,'""'::jsonb) THEN 'null'::jsonb ELSE ${projected} END` : projected;
 }
 function observationPayloadSql() {
-  return `(${projectedObjectSql('ro.payload')} || jsonb_build_object('detailPayload', ${projectedObjectSql("(ro.payload->'detailPayload')")}, 'items', jsonb_build_array(${projectedObjectSql("(ro.payload->'items'->0)")} || jsonb_build_object('detailPayload', ${projectedObjectSql("(ro.payload->'items'->0->'detailPayload')")}))))`;
+  // Preserve the server stamp verbatim: observedAt:null identifies historical
+  // observations whose numeric capture timestamp can be recovered safely. The
+  // first object item (not necessarily index zero) matches normalizeRecord.
+  return `(SELECT ${projectedObjectSql('ro.payload')} || jsonb_build_object('customerDailyMetricEvidence', ro.payload->'customerDailyMetricEvidence', 'detailPayload', ${projectedObjectSql("(ro.payload->'detailPayload')", true)}, 'items', jsonb_build_array(${projectedObjectSql('daily_first.item')} || jsonb_build_object('detailPayload', ${projectedObjectSql("(daily_first.item->'detailPayload')", true)})))
+    FROM (SELECT CASE WHEN jsonb_typeof(ro.payload->'items') = 'array' THEN jsonb_path_query_first(ro.payload->'items', '$[*] ? (@.type() == "object")') ELSE NULL END AS item) daily_first)`;
 }
 
 /** Only service-stamped, completely measured metrics can support daily change.
@@ -105,12 +119,14 @@ export function assessCustomerDailyObservation(row = {}) {
       const field = object(fields[key]);
       return field.measured !== true || number(field.value) !== values[key];
     })) return {...result, reason: 'partial_or_preserved_metrics'};
-    const observedAt = iso(stamp.observedAt);
-    const trustedTime = stamp.timeSource === 'capture_timestamp' && observedAt && ms(observedAt) <= ms(ingestedAt);
+    const recovered = recoverCustomerDailyObservationTime(row);
+    const observedAt = recovered?.observedAt || iso(stamp.observedAt);
+    const trustedTime = (recovered || stamp.timeSource === 'capture_timestamp') && observedAt && ms(observedAt) <= ms(ingestedAt);
     return {...result, heat: Object.values(values).reduce((a, b) => a + b, 0),
       observedAt: trustedTime ? observedAt : ingestedAt,
       timeSource: trustedTime ? 'capture_timestamp' : 'ingested_at',
-      quality: trustedTime ? 'measured' : 'measured_ingestion_time', comparable: Boolean(trustedTime)};
+      quality: trustedTime ? 'measured' : 'measured_ingestion_time', comparable: Boolean(trustedTime),
+      ...(recovered ? {timestampRecovery: recovered.sourcePath} : {})};
   }
   // The existing metric resolver distinguishes proven zero from a list placeholder.
   // Guarded old payloads can contain preserved values, hence even full legacy data
@@ -185,36 +201,40 @@ export function assessCustomerDailyCaptureReadiness(task) {
   return reasons.length ? {id: task.id, status: task.status, taskType: task.task_type || 'capture', reasons: [...new Set(reasons)]} : null;
 }
 
-export async function collectCustomerDailyReport({tenantId, date, now = new Date(), db, auditCoverageFrom = null}) {
+export async function collectCustomerDailyReport({tenantId, date, now = new Date(), db, auditCoverageFrom = null, businessPeriod = null}) {
   if (!tenantId) throw Object.assign(new Error('缺少租户'), {statusCode: 400});
   if (!db?.queryAll || !db?.queryOne) throw new TypeError('日报聚合需要数据库事务');
-  const period = dailyPeriod(date, now);
+  const period = businessPeriod || dailyPeriod(date, now);
   const {periodStart, cutoffAt, monthStart, heatStart} = period;
+  const collectionStart = period.collectionStartAt || periodStart;
+  const collectionCutoff = period.collectionCutoffAt || cutoffAt;
   const tenant = await db.queryOne('/* customer_daily:tenant */ SELECT name FROM tenants WHERE id = $1', [tenantId]);
   if (!tenant) throw Object.assign(new Error('租户不存在'), {statusCode: 404});
   const monthRows = await db.queryAll(`/* customer_daily:month */
     SELECT r.id, r.created_at AS first_seen_at, r.record_type, r.sentiment, r.business_visibility,
+      r.ai_result->>'relevance' AS relevance,
+      EXISTS (SELECT 1 FROM record_watchlist w WHERE w.tenant_id=r.tenant_id AND w.record_id=r.id) AS watched,
       COALESCE(rt.status, 'unhandled') AS status
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
-    WHERE r.tenant_id = $1 AND r.created_at >= $2::timestamptz AND r.created_at < $3::timestamptz AND ${POST_SQL}
-    ORDER BY r.created_at, r.id`, [tenantId, monthStart, cutoffAt]);
-  const uniqueRows = [...new Map(monthRows.filter(row => mainPost(row) && ms(row.first_seen_at) >= ms(monthStart) && ms(row.first_seen_at) < ms(cutoffAt)).map(row => [row.id, row])).values()];
-  const dayRows = uniqueRows.filter(row => ms(row.first_seen_at) >= ms(periodStart));
+    WHERE r.tenant_id = $1 AND r.created_at >= $2::timestamptz AND r.created_at < $3::timestamptz AND ${CUSTOMER_POST_SQL}
+    ORDER BY r.created_at, r.id`, [tenantId, monthStart, collectionCutoff]);
+  const uniqueRows = [...new Map(monthRows.filter(row => customerPost(row) && ms(row.first_seen_at) >= ms(monthStart) && ms(row.first_seen_at) < ms(collectionCutoff)).map(row => [row.id, row])).values()];
+  const dayRows = uniqueRows.filter(row => ms(row.first_seen_at) >= ms(collectionStart));
   const warnings = [];
   const warn = (code, message, blocking = false) => warnings.push({code, message, blocking});
   const summary = {day: count(dayRows), mtd: count(uniqueRows)};
   const conflicts = uniqueRows.filter(row => NEGATIVE_STATES.has(status(row)) && row.sentiment !== 'negative' && status(row) !== 'reviewed_non_monitor');
   if (summary.mtd.unclassified) warn('unclassified', `本月截至报表日有${summary.mtd.unclassified}条SDB内容尚未完成情感识别（日新增${summary.day.unclassified}条），未自动归为中性。`, true);
   if (conflicts.length) warn('sentiment_status_conflict', `本月内容中${conflicts.length}条情感结论与负面处理状态不一致，按有效情感统计，需核对。`, true);
-  const hiddenRows = uniqueRows.filter(row => row.business_visibility && row.business_visibility !== 'eligible');
-  if (hiddenRows.length) warn('audit_visible_posts_included', `${hiddenRows.length}条已入库主帖暂未进入普通业务列表，仍计入监控数量；SDB只扣除已复核-非监控内容。`);
+  const pendingReview = dayRows.filter(row => status(row) === 'unhandled').length;
+  if (businessPeriod && pendingReview) warn('review_pending', `本次采集清单还有${pendingReview}条待复核。`, true);
 
   const heatRows = await db.queryAll(`/* customer_daily:heat_posts */
     SELECT r.id, r.title, r.platform, r.url, r.canonical_url, r.record_type, r.sentiment,
       r.published_ts, r.created_at AS first_seen_at, COALESCE(rt.status, 'unhandled') AS status
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
     WHERE r.tenant_id = $1 AND r.published_ts >= $2::timestamptz AND r.published_ts < $3::timestamptz
-      AND r.created_at < $3::timestamptz AND r.sentiment = 'negative' AND ${POST_SQL}
+      AND r.created_at < $3::timestamptz AND r.sentiment = 'negative' AND ${CUSTOMER_POST_SQL}
       AND COALESCE(rt.status, 'unhandled') <> 'reviewed_non_monitor'
     ORDER BY r.published_ts DESC, r.id`, [tenantId, heatStart, cutoffAt]);
   const heatCandidates = heatRows.filter(row => mainPost(row) && row.sentiment === 'negative' && status(row) !== 'reviewed_non_monitor' && ms(row.first_seen_at) < ms(cutoffAt) && ms(row.published_ts) >= ms(heatStart) && ms(row.published_ts) < ms(cutoffAt));
@@ -262,7 +282,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     SELECT COUNT(*)::int AS count FROM records r
     LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
     WHERE r.tenant_id = $1 AND r.created_at >= $2::timestamptz AND r.created_at < $3::timestamptz
-      AND r.published_ts IS NULL AND r.sentiment = 'negative' AND ${POST_SQL}
+      AND r.published_ts IS NULL AND r.sentiment = 'negative' AND ${CUSTOMER_POST_SQL}
       AND COALESCE(rt.status, 'unhandled') <> 'reviewed_non_monitor'`, [tenantId, heatStart, cutoffAt]);
   if (Number(missingPublished?.count) > 0) warn('published_time_missing', `近7天入库的负面帖子中${Number(missingPublished.count)}篇缺少发布时间，无法确认是否落在热度窗口。`);
 
@@ -274,14 +294,15 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     WHERE tenant_id = $1 AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
       AND action IN ('record.triage_updated', 'record.triage_batch_updated')
       AND (metadata->>'nextStatus' = 'negative_cold' OR metadata->>'status' = 'negative_cold')
-    ORDER BY created_at, id`, [tenantId, periodStart, cutoffAt]);
-  const {transitions, malformed} = parseCustomerDailyColdEvents(auditRows.filter(row => ms(row.created_at) >= ms(periodStart) && ms(row.created_at) < ms(cutoffAt)));
+    ORDER BY created_at, id`, [tenantId, period.handlingStartAt || periodStart, cutoffAt]);
+  const {transitions, malformed} = parseCustomerDailyColdEvents(auditRows.filter(row => ms(row.created_at) >= ms(period.handlingStartAt || periodStart) && ms(row.created_at) < ms(cutoffAt)));
   const ids = [...new Set(transitions.map(t => t.recordId))];
   const coldRows = ids.length ? await db.queryAll(`/* customer_daily:cold_posts */
     SELECT r.id, r.title, r.platform, r.url, r.canonical_url, r.record_type, r.sentiment,
+      r.created_at AS first_seen_at,
       COALESCE(rt.status, 'unhandled') AS status
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
-    WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[])`, [tenantId, ids]) : [];
+    WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[]) AND ${CUSTOMER_POST_SQL}`, [tenantId, ids]) : [];
   const coldById = new Map(coldRows.map(row => [row.id, row]));
   const latestTransition = new Map();
   for (const t of transitions) {
@@ -290,12 +311,19 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   }
   const coldMarked = [...latestTransition.values()].filter(t => currentCold(coldById.get(t.recordId)))
     .sort((a, b) => ms(a.markedAt) - ms(b.markedAt) || String(a.recordId).localeCompare(String(b.recordId)))
-    .map(t => ({...post(coldById.get(t.recordId)), markedAt: t.markedAt, eventId: t.eventId}));
+    .map(t => {
+      const row = coldById.get(t.recordId);
+      const firstSeen = ms(row.first_seen_at);
+      // Historical is relative to this report's collection cohort, so weekend
+      // arrivals in a merged Monday report are still this period's new posts.
+      return {...post(row), markedAt: t.markedAt, eventId: t.eventId,
+        ...(Number.isFinite(firstSeen) ? {isHistorical:firstSeen < ms(collectionStart)} : {})};
+    });
   const withdrawn = [...latestTransition.values()].filter(t => !currentCold(coldById.get(t.recordId))).map(t => t.recordId);
   if (withdrawn.length) warn('cold_withdrawn_or_corrected', `${withdrawn.length}篇当日曾标冷处理的帖子已撤销、更正或不再属于有效负面范围，本版主清单不再列出。`);
   const coverage = auditCoverageFrom || (await db.queryOne(`/* customer_daily:audit_coverage */
     SELECT applied_at FROM schema_migrations WHERE version = $1`, ['081_customer_daily_reports.sql']))?.applied_at;
-  const coverageComplete = Boolean(iso(coverage) && ms(coverage) <= ms(periodStart) && malformed.length === 0);
+  const coverageComplete = Boolean(iso(coverage) && ms(coverage) <= ms(period.handlingStartAt || periodStart) && malformed.length === 0);
   if (!coverageComplete) warn('cold_history_incomplete', `${coldMarked.length ? '历史标记记录不完整，以下为可核实内容。' : '暂未检出，历史标记记录不完整。'}${malformed.length ? `有${malformed.length}条旧审计事件缺少变更前状态。` : ''}`);
   const missingLinks = [...highHeat, ...coldMarked].filter(row => !row.url);
   if (missingLinks.length) warn('source_link_missing', `${new Set(missingLinks.map(row => row.recordId)).size}篇清单帖子缺少可用原帖链接，需补齐。`, true);
@@ -318,13 +346,13 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
         AND i.tenant_id = t.tenant_id AND i.task_id = t.id AND i.item_type = 'keyword'
     ) keyword_items ON true
     WHERE t.tenant_id = $1 AND t.created_at >= $2::timestamptz AND t.created_at < $3::timestamptz
-      AND t.task_type IN ('capture', 'keyword_capture', 'unattended_keyword_capture', 'capture_orchestration')`, [tenantId, periodStart, cutoffAt]);
+      AND t.task_type IN ('capture', 'keyword_capture', 'unattended_keyword_capture', 'capture_orchestration')`, [tenantId, collectionStart, collectionCutoff]);
   const activeCaptures = captureRows.map(assessCustomerDailyCaptureReadiness).filter(Boolean);
   if (activeCaptures.length) warn('capture_not_settled', `报表日创建的${activeCaptures.length}个普通采集任务存在未完成、失败或同步缺口，监控数量仅包含已成功入库主帖。`, true);
   return {
     schemaVersion: 1, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, warnings,
     evidence: {
-      scope: '当前租户首次成功入库的普通主帖；不计官方内容、博主资料、评论和复采次数；SDB只扣除已复核-非监控内容',
+      scope: '当前租户首次入库且进入客户内容分诊清单的主帖；排除系统过滤和判为无关的内容，保留客户主动关注的帖子；同帖复采不重复计数；SDB再扣除客户标记的非监控内容',
       firstSeenField: 'records.created_at', timeZone: 'Asia/Shanghai', reviewBasis: '本版生成时有效情感及人工处理状态',
       monthRecords: uniqueRows.map(row => ({recordId: row.id, firstSeenAt: iso(row.first_seen_at), sentiment: row.sentiment || '', status: status(row), businessVisibility: row.business_visibility || 'eligible'})),
       dayRecordIds: dayRows.map(row => row.id), conflictRecordIds: conflicts.map(row => row.id),
