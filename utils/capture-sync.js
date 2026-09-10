@@ -79,6 +79,11 @@ import {
   resolveCommentMergeLimit,
 } from './comment-dedupe.js';
 import {isUnattendedSafetyBlock} from './unattended-keyword-run.js';
+import {isXhsPublishTimeWindow} from './capture/xhs-publish-window.js';
+import {
+  createXhsSearchTimeFilterError,
+  isXhsSearchTimeFilterVerified,
+} from './capture/xhs-search-filter-evidence.js';
 import {
   isDouyinOwnProfileUrl,
   pickDouyinAuthorName,
@@ -16065,8 +16070,10 @@ function createSearchFilterApplicationError(result = null) {
 async function applySearchFiltersInTab(
   tabId,
   searchFilters = {},
-  {requireVerifiedFilters = false} = {},
+  {requireVerifiedFilters = false, platform = ''} = {},
 ) {
+  const requireXhsTimeFilter = platform === 'xiaohongshu' &&
+    isXhsPublishTimeWindow(searchFilters?.publishTime);
   try {
     await assertNoDouyinSearchSecurityChallengeInTab(tabId);
     const response = await chrome.runtime.sendMessage({
@@ -16076,6 +16083,7 @@ async function applySearchFiltersInTab(
         action: 'applyBatchSearchFilters',
         ...searchFilters,
         verifyDefaults: requireVerifiedFilters,
+        ...(requireXhsTimeFilter ? {verifyXhsTimeFilter: true} : {}),
       },
     });
     const contentResponse = response?.data;
@@ -16085,6 +16093,10 @@ async function applySearchFiltersInTab(
         : contentResponse?.ok === false
           ? contentResponse?.error
           : null;
+    if (requireXhsTimeFilter && responseError?.code === 'XHS_SECURITY_BLOCK' &&
+      responseError?.securityEvidence?.confirmed === true) {
+      throw createXhsSecurityBlockError(responseError.securityEvidence);
+    }
     if (isDouyinSearchServiceAbnormalError(responseError)) {
       throw createDouyinSearchServiceAbnormalError({
         message: responseError?.message,
@@ -16099,11 +16111,15 @@ async function applySearchFiltersInTab(
       if (requireVerifiedFilters) {
         throw createSearchFilterApplicationError(responseError);
       }
+      if (requireXhsTimeFilter) throw createXhsSearchTimeFilterError(responseError);
       return null;
     }
     const result = contentResponse?.data ?? contentResponse ?? null;
     if (requireVerifiedFilters && result?.complete !== true) {
       throw createSearchFilterApplicationError(result);
+    }
+    if (requireXhsTimeFilter && !isXhsSearchTimeFilterVerified(result, searchFilters.publishTime)) {
+      throw createXhsSearchTimeFilterError(result);
     }
     return result;
   } catch (error) {
@@ -16118,6 +16134,11 @@ async function applySearchFiltersInTab(
       'SEARCH_FILTER_APPLICATION_FAILED'
     ) {
       throw error;
+    }
+    if (requireXhsTimeFilter) {
+      if (error?.code === 'XHS_SECURITY_BLOCK' && error?.securityEvidence?.confirmed === true) throw error;
+      if (error?.code === 'XHS_SEARCH_TIME_FILTER_UNVERIFIED') throw error;
+      throw createXhsSearchTimeFilterError({reason: 'content_message_failed'});
     }
     return null;
   }
@@ -16190,6 +16211,14 @@ export async function batchCaptureByKeywords({
   if (!keywords.length) {
     return { ok: true, results: [], stats: { total: 0, success: 0, failed: 0 } };
   }
+  const xhsPublishTimeWindow = platform === 'xiaohongshu' &&
+    isXhsPublishTimeWindow(searchFilters?.publishTime)
+      ? searchFilters.publishTime
+      : '';
+  const isPublishWindowEmptyResult = (result) => Boolean(
+    xhsPublishTimeWindow && result?.ok && Array.isArray(result?.data?.items) &&
+    result.data.items.length === 0 && Number(result.data.publishWindowExcludedCount) > 0,
+  );
 
   const preferredSourceTabId = Number(sourceTabId);
   let sourceTab = null;
@@ -16676,9 +16705,19 @@ export async function batchCaptureByKeywords({
             runnerTabId,
             searchFilters,
             {
-            requireVerifiedFilters,
+              requireVerifiedFilters,
+              platform,
             },
           );
+          if (xhsPublishTimeWindow) {
+            if (!isXhsSearchTimeFilterVerified(filterApplication, xhsPublishTimeWindow)) {
+              throw createXhsSearchTimeFilterError(filterApplication);
+            }
+            throwConfirmedEmptySearchResult(keyword, {
+              confirmedEmpty: filterApplication.xhsTimeFilterEvidence.confirmedEmpty === true,
+              emptyMessage: filterApplication.xhsTimeFilterEvidence.emptyMessage || '',
+            });
+          }
           if (
             isDouyinPlatform(platform) &&
             filterApplication?.complete !== true
@@ -16773,6 +16812,7 @@ export async function batchCaptureByKeywords({
           mode: 'keyword',
           captureParams: {
             ...captureParams,
+            ...(xhsPublishTimeWindow ? {publishTimeWindow: xhsPublishTimeWindow} : {}),
             keyword,
             listCaptureRunId,
           },
@@ -16795,6 +16835,7 @@ export async function batchCaptureByKeywords({
       let captureResult = captureRunResult?.captureResult || null;
       if (
         isEmptyKeywordCaptureResult(captureResult) &&
+        !isPublishWindowEmptyResult(captureResult) &&
         !disableAutomaticSearchRetry
       ) {
         if (onProgress) {
@@ -16994,6 +17035,22 @@ export async function batchCaptureByKeywords({
             recordIds,
             candidateCount: recordIds.length,
             scanComplete: true,
+            captureCacheStats: captureRunResult.captureCacheStats || null,
+          };
+          results.push(keywordResult);
+          successCount++;
+        } else if (isPublishWindowEmptyResult(captureResult)) {
+          keywordResult = {
+            keyword,
+            ok: true,
+            noResults: true,
+            emptyResult: true,
+            resultKind: 'no_matching_results',
+            candidateCount: 0,
+            scanComplete: true,
+            recordIds: [],
+            publishWindowExcludedCount: Number(captureResult.data.publishWindowExcludedCount),
+            message: `「${keyword}」采到的内容均早于所选发布时间范围，已按 0 条完成`,
             captureCacheStats: captureRunResult.captureCacheStats || null,
           };
           results.push(keywordResult);
@@ -20409,6 +20466,7 @@ function buildContentRequest(mode, captureParams = {}) {
         keyword: captureParams.keyword || '',
         minLikes: captureParams.minLikes,
         sortDimension: captureParams.sortDimension,
+        publishTimeWindow: captureParams.publishTimeWindow,
         maxDetectedItems:
           captureParams.maxDetectedItems ?? captureParams.maxItems,
         maxDurationMs: captureParams.maxDurationMs,

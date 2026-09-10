@@ -20,6 +20,9 @@ import {
 
 import {expandKeywordViaSuggestions} from "./utils/capture/keyword-expansion.js";
 import {findXhsSourceNote} from "./utils/capture/keyword-search.js";
+import {isXhsPublishTimeWindow} from "./utils/capture/xhs-publish-window.js";
+import {beginXhsSearchFilterEvidence} from "./utils/capture/xhs-search-filter-evidence.js";
+import {createXhsSecurityBlockError, detectXhsSecurityPage} from "./utils/capture/xiaohongshu-security.js";
 
 import {detectPageType, detectPlatformFromUrl} from "./utils/helpers.js";
 import {setCancelFlag, resetCancelFlag} from "./utils/scroll.js";
@@ -969,6 +972,7 @@ async function handleCaptureKeywordNotes(request, sendResponse) {
       },
       minLikes: request.minLikes,
       sortDimension: request.sortDimension,
+      publishTimeWindow: request.publishTimeWindow,
       maxDetectedItems: request.maxDetectedItems ?? request.maxItems,
       maxDurationMs: request.maxDurationMs,
       waitMinMs: request.waitMinMs,
@@ -1131,6 +1135,7 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
       distance: request?.distance || "",
       videoDuration: request?.videoDuration || "",
       verifyDefaults: request?.verifyDefaults === true,
+      verifyXhsTimeFilter: request?.verifyXhsTimeFilter === true,
     });
     sendResponse({ ok: true, data: result });
   } catch (error) {
@@ -1148,6 +1153,8 @@ async function handleApplyBatchSearchFilters(request, sendResponse) {
         requiresManualAction: Boolean(error?.requiresManualAction),
         retryable:
           typeof error?.retryable === "boolean" ? error.retryable : true,
+        ...(error?.securityEvidence?.confirmed === true
+          ? {securityEvidence: error.securityEvidence} : {}),
       },
     });
   }
@@ -1247,6 +1254,15 @@ function isBatchFilterOptionActive({field, labels, platform} = {}) {
 
 // 复用「找对标账号」的筛选点击能力(ensureKeywordStrategyFilterPanelOpen + applyStrategyFilterInSection),
 // 给批量采集在采集前按需切「排序 / 范围」。默认值则不改,直接返回。
+function assertNoXhsSearchFilterSecurityPage() {
+  const evidence = detectXhsSecurityPage({
+    title: document.title || "",
+    text: document.body?.innerText || "",
+    url: window.location.href,
+  });
+  if (evidence?.confirmed === true) throw createXhsSecurityBlockError(evidence);
+}
+
 async function applyBatchSearchFilters({
   sort = "",
   publishTime = "",
@@ -1255,7 +1271,16 @@ async function applyBatchSearchFilters({
   distance = "",
   videoDuration = "",
   verifyDefaults = false,
+  verifyXhsTimeFilter = false,
 } = {}) {
+  const platform = /douyin\.com/i.test(window.location.href)
+    ? "douyin"
+    : /xiaohongshu\.com/i.test(window.location.href)
+      ? "xiaohongshu"
+      : "unknown";
+  const requireXhsTimeFilter = platform === "xiaohongshu" &&
+    verifyXhsTimeFilter && isXhsPublishTimeWindow(publishTime);
+  if (requireXhsTimeFilter) assertNoXhsSearchFilterSecurityPage();
   const pageType = detectPageType(window.location.href);
   if (pageType !== "search_results") {
     return {
@@ -1268,11 +1293,6 @@ async function applyBatchSearchFilters({
       results: [],
     };
   }
-  const platform = /douyin\.com/i.test(window.location.href)
-    ? "douyin"
-    : /xiaohongshu\.com/i.test(window.location.href)
-      ? "xiaohongshu"
-      : "unknown";
   if (platform === "douyin") {
     assertNoDouyinSearchSecurityChallengePage();
     assertNoDouyinSearchServiceAbnormalPage();
@@ -1341,6 +1361,7 @@ async function applyBatchSearchFilters({
   const notes = [];
   const opened = await ensureKeywordStrategyFilterPanelOpen(notes);
   if (!opened) {
+    if (requireXhsTimeFilter) assertNoXhsSearchFilterSecurityPage();
     return {
       applied: false,
       complete: false,
@@ -1357,24 +1378,50 @@ async function applyBatchSearchFilters({
     };
   }
   const results = [];
-  for (const request of filterRequests) {
-    const alreadyActive = isBatchFilterOptionActive({
-      ...request,
+  let timeWitness = null;
+  let xhsTimeFilterEvidence = null;
+  try {
+    for (const request of filterRequests) {
+      if (requireXhsTimeFilter && request.field === "publishTime") {
+        timeWitness = beginXhsSearchFilterEvidence();
+      }
+      const alreadyActive = isBatchFilterOptionActive({
+        ...request,
+        platform,
+      });
+      const ok = alreadyActive || await applyBatchFilterOption({
+        ...request,
+        notes,
+        platform,
+      });
+      results.push({
+        field: request.field,
+        value: request.value,
+        applied: ok,
+        changed: ok && !alreadyActive,
+      });
+    }
+    // Later filter options can reset the time choice. Check it again before
+    // closing the panel instead of trusting the earlier click acknowledgement.
+    const timeResult = results.find((item) => item.field === "publishTime");
+    const timeActive = requireXhsTimeFilter && isBatchFilterOptionActive({
+      field: "publishTime",
+      labels: BATCH_TIME_LABELS[publishTime],
       platform,
     });
-    const ok = alreadyActive || await applyBatchFilterOption({
-      ...request,
-      notes,
-      platform,
-    });
-    results.push({
-      field: request.field,
-      value: request.value,
-      applied: ok,
-      changed: ok && !alreadyActive,
-    });
+    await closeKeywordStrategyFilterPanel(notes);
+    if (requireXhsTimeFilter) {
+      xhsTimeFilterEvidence = timeActive && timeResult?.applied && timeWitness
+        ? {...await timeWitness.waitForSettled({
+            changed: timeResult.changed === true,
+            wait: waitForKeywordStrategyUi,
+          }), active: true}
+        : {verified: false, active: false, reason: "time_option_unverified"};
+      assertNoXhsSearchFilterSecurityPage();
+    }
+  } finally {
+    timeWitness?.disconnect();
   }
-  await closeKeywordStrategyFilterPanel(notes);
   const appliedCount = results.filter((item) => item.applied).length;
   const failedFields = results
     .filter((item) => !item.applied)
@@ -1387,6 +1434,7 @@ async function applyBatchSearchFilters({
     failedFields,
     results,
     notes,
+    ...(requireXhsTimeFilter ? {xhsTimeFilterEvidence} : {}),
   };
 }
 

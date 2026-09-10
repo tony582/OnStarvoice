@@ -24,6 +24,10 @@ import {
   countMissingMetric,
 } from "./stage-diagnostics.js";
 import {detectXhsSecurityPage} from "./xiaohongshu-security.js";
+import {
+  isOutsideXhsPublishWindow,
+  isXhsPublishTimeWindow,
+} from "./xhs-publish-window.js";
 
 const KEYWORD_SORT_DIMENSION = {
   LIKES: "likes",
@@ -170,6 +174,7 @@ export async function captureKeywordNotes({
   maxScrollTimes = 50,
   minLikes = 0,
   sortDimension = "",
+  publishTimeWindow = "",
   maxDetectedItems = null,
   maxItems = null,
   waitMinMs = DEFAULT_CONFIG.SCROLL_DELAY_MIN,
@@ -178,6 +183,7 @@ export async function captureKeywordNotes({
   maxDurationMs = DEFAULT_CONFIG.MAX_CAPTURE_DURATION_MS,
 } = {}) {
   const captureStartedAt = new Date().toISOString();
+  const publishWindowReferenceTimestamp = Date.now();
   resetCancelFlag();
 
   try {
@@ -196,6 +202,9 @@ export async function captureKeywordNotes({
     await wait(1500);
 
     const normalizedMinLikes = normalizeNonNegativeInteger(minLikes, 0);
+    const normalizedPublishTimeWindow = isXhsPublishTimeWindow(publishTimeWindow)
+      ? String(publishTimeWindow).trim()
+      : "";
     const requestedSortDimension = normalizeSortDimension(sortDimension);
     const detectedSort = detectKeywordSortDimension();
     const resolvedSortDimension =
@@ -237,6 +246,7 @@ export async function captureKeywordNotes({
       detectedCount: 0,
       qualifiedCount: 0,
       filteredCount: 0,
+      publishWindowExcludedCount: 0,
     };
     let lastGrowthAt = Date.now();
     let lastObservedCount = 0;
@@ -250,6 +260,7 @@ export async function captureKeywordNotes({
         detectedCount: progressStats.detectedCount,
         qualifiedCount: progressStats.qualifiedCount,
         filteredCount: progressStats.filteredCount,
+        publishWindowExcludedCount: progressStats.publishWindowExcludedCount,
         minLikes: normalizedMinLikes,
         minInteraction: normalizedMinLikes,
         sortDimension: resolvedSortDimension,
@@ -259,13 +270,18 @@ export async function captureKeywordNotes({
       });
     };
 
+    const isOutsidePublishWindow = (item) => isOutsideXhsPublishWindow(
+      item,
+      normalizedPublishTimeWindow,
+      publishWindowReferenceTimestamp,
+    );
+    const isQualifiedItem = (item) =>
+      getKeywordMetricCountByDimension(item, resolvedSortDimension) >=
+        normalizedMinLikes && !isOutsidePublishWindow(item);
+
     const buildFilteredItems = () => {
       const allItems = Array.from(noteMap.values());
-      const filteredItems = allItems.filter(
-        (item) =>
-          getKeywordMetricCountByDimension(item, resolvedSortDimension) >=
-          normalizedMinLikes,
-      );
+      const filteredItems = allItems.filter(isQualifiedItem);
       return filteredItems.slice(0, normalizedMaxDetectedItems);
     };
 
@@ -299,6 +315,9 @@ export async function captureKeywordNotes({
             maxDetectedItems: normalizedMaxDetectedItems,
             filteredCount: checkpointItems.length,
             filteredBeforeLimitCount: progressStats.qualifiedCount,
+            publishTimeWindow: normalizedPublishTimeWindow,
+            publishWindowReferenceTimestamp,
+            publishWindowExcludedCount: progressStats.publishWindowExcludedCount,
             items: checkpointItems,
             captureTimestamp: Date.now(),
           },
@@ -318,15 +337,12 @@ export async function captureKeywordNotes({
         normalizedMaxDetectedItems,
       );
       const allItems = Array.from(noteMap.values());
-      const qualifiedCount = allItems.filter(
-        (item) =>
-          getKeywordMetricCountByDimension(item, resolvedSortDimension) >=
-          normalizedMinLikes,
-      ).length;
+      const qualifiedCount = allItems.filter(isQualifiedItem).length;
       progressStats = {
         detectedCount: allItems.length,
         qualifiedCount,
         filteredCount: Math.min(qualifiedCount, normalizedMaxDetectedItems),
+        publishWindowExcludedCount: allItems.filter(isOutsidePublishWindow).length,
       };
       emitListCheckpoint();
       return progressStats.detectedCount;
@@ -390,12 +406,11 @@ export async function captureKeywordNotes({
     // 提取全量笔记后按条件筛选入池
     collectDetectedNotes();
     const allItems = Array.from(noteMap.values());
-    const filteredItems = allItems.filter(
-      (item) =>
-        getKeywordMetricCountByDimension(item, resolvedSortDimension) >=
-        normalizedMinLikes,
-    );
+    const filteredItems = allItems.filter(isQualifiedItem);
     const items = buildFilteredItems();
+    const publishWindowExcludedCount = progressStats.publishWindowExcludedCount;
+    const allItemsOutsidePublishWindow = allItems.length > 0 &&
+      publishWindowExcludedCount === allItems.length;
     const missingMetricCount = countMissingMetric(
       allItems,
       normalizeSortDimension(resolvedSortDimension),
@@ -427,7 +442,9 @@ export async function captureKeywordNotes({
         missingMetricCount,
       }),
       buildFilterApplyStage({
-        label: "搜索互动阈值筛选",
+        label: normalizedPublishTimeWindow
+          ? "搜索时间与互动阈值筛选"
+          : "搜索互动阈值筛选",
         rawTotalCount: allItems.length,
         filteredBeforeLimitCount: filteredItems.length,
         filteredCount: items.length,
@@ -441,6 +458,14 @@ export async function captureKeywordNotes({
         metricExtractionSuspicious,
       }),
     ];
+    if (normalizedPublishTimeWindow) {
+      Object.assign(stageTrace[stageTrace.length - 1].metrics, {
+        publishTimeWindow: normalizedPublishTimeWindow,
+        publishWindowReferenceTimestamp,
+        publishWindowExcludedCount,
+        allItemsOutsidePublishWindow,
+      });
+    }
 
     if (items.length === 0) {
       const sample = allItems.slice(0, 3).map((item) => ({
@@ -462,6 +487,9 @@ export async function captureKeywordNotes({
           sortDimensionLabel,
           sortDimensionSource,
           maxDetectedItems: normalizedMaxDetectedItems,
+          publishTimeWindow: normalizedPublishTimeWindow,
+          publishWindowExcludedCount,
+          allItemsOutsidePublishWindow,
           sample,
         },
       );
@@ -481,6 +509,9 @@ export async function captureKeywordNotes({
       maxDetectedItems: normalizedMaxDetectedItems,
       filteredCount: items.length,
       filteredBeforeLimitCount: filteredItems.length,
+      publishTimeWindow: normalizedPublishTimeWindow,
+      publishWindowReferenceTimestamp,
+      publishWindowExcludedCount,
       items,
       captureTimestamp: Date.now(),
     };
@@ -506,6 +537,12 @@ export async function captureKeywordNotes({
       },
       diagnostics: {
         stageTrace,
+        publishTimeWindow: normalizedPublishTimeWindow,
+        publishWindowReferenceTimestamp,
+        publishWindowExcludedCount,
+        emptyReason: allItemsOutsidePublishWindow
+          ? "all_items_outside_publish_window"
+          : "",
       },
       error: null,
     };
@@ -703,7 +740,8 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
       const cover = extractCoverImageFromCard(item);
 
       // 提取最近编辑时间
-      const publishDateRaw = extractPublishDateFromCard(item);
+      const publishDateEvidence = extractPublishDateEvidenceFromCard(item);
+      const publishDateRaw = publishDateEvidence.raw;
       const publishTimestamp = parsePublishTimestamp(publishDateRaw);
       const publishDate = publishTimestamp
         ? formatDateFromTimestamp(publishTimestamp)
@@ -787,6 +825,7 @@ function extractNoteCards(sortDimension = KEYWORD_SORT_DIMENSION.LIKES) {
         noteType,
         publishDate,
         publishDateRaw,
+        publishDateSource: publishDateEvidence.source,
         publishTimestamp,
         likes: metricFields.likes,
         collects: metricFields.collects,
@@ -1024,8 +1063,12 @@ function detectKeywordNoteType(cardNode) {
   return "image";
 }
 
-function extractPublishDateFromCard(cardNode) {
-  if (!cardNode) return "";
+export function extractPublishDateFromCard(cardNode) {
+  return extractPublishDateEvidenceFromCard(cardNode).raw;
+}
+
+export function extractPublishDateEvidenceFromCard(cardNode) {
+  if (!cardNode) return {raw: "", source: "unknown"};
 
   const candidates = [];
   const selectors = SEARCH_RESULTS_SELECTORS.noteCard.publishDate || [];
@@ -1044,10 +1087,21 @@ function extractPublishDateFromCard(cardNode) {
     }
   });
 
-  const rawText = cleanText(cardNode.textContent || "");
-  candidates.push(...extractDateTextCandidates(rawText));
+  const explicitDate = pickDateTextCandidate(candidates);
+  if (explicitDate) return {raw: explicitDate, source: "date_element"};
 
-  return pickDateTextCandidate(candidates);
+  // 仅兼容作者行末尾拼接的日期。整张卡片正文可能含“9-10月”等标题，
+  // 不能将这类数字当成发布日期，也不能覆盖明确日期节点中的相对时间。
+  const authorSelectors = SEARCH_RESULTS_SELECTORS.noteCard.author || [];
+  for (const selector of authorSelectors) {
+    const elements = cardNode.querySelectorAll(selector);
+    for (const element of elements) {
+      const dateText = extractTrailingDateText(element.textContent || "");
+      if (dateText) return {raw: dateText, source: "author_line"};
+    }
+  }
+
+  return {raw: "", source: "unknown"};
 }
 
 function getDateTextFromElement(element) {
@@ -1066,28 +1120,11 @@ function getDateTextFromElement(element) {
   return "";
 }
 
-function extractDateTextCandidates(text) {
-  if (!text) return [];
-
-  const patterns = [
-    /\d{4}[./-]\d{1,2}[./-]\d{1,2}/g,
-    /\d{1,2}[./-]\d{1,2}/g,
-    /\d+\s*分钟前/g,
-    /\d+\s*小时前/g,
-    /\d+\s*天前/g,
-    /刚刚/g,
-    /昨天/g,
-  ];
-
-  const results = [];
-  patterns.forEach((pattern) => {
-    const matches = text.match(pattern);
-    if (Array.isArray(matches)) {
-      results.push(...matches.map((item) => cleanText(item)));
-    }
-  });
-
-  return [...new Set(results.filter((item) => looksLikePublishDate(item)))];
+function extractTrailingDateText(text) {
+  const match = cleanText(text || "").match(
+    /(?:\d{4}[./-]\d{1,2}[./-]\d{1,2}|\d{1,2}[./-]\d{1,2}|\d+\s*(?:分钟前|小时前|天前)|刚刚|昨天)$/,
+  );
+  return match && looksLikePublishDate(match[0]) ? match[0] : "";
 }
 
 function looksLikePublishDate(text) {

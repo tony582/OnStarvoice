@@ -3,6 +3,8 @@ import {readFile} from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 import {DOUYIN_DOM_PROFILE} from "../../utils/platform/dom-profiles/douyin.js";
+import {isXhsPublishTimeWindow} from "../../utils/capture/xhs-publish-window.js";
+import {createXhsSearchTimeFilterError, isXhsSearchTimeFilterVerified} from "../../utils/capture/xhs-search-filter-evidence.js";
 
 const captureSyncSource = await readFile(
   new URL("../../utils/capture-sync.js", import.meta.url),
@@ -1498,6 +1500,7 @@ function createBatchHarness({
   waitForResults = null,
   hasActiveFilters = false,
   assertNoSecurityChallenge = null,
+  applyFilters = null,
 } = {}) {
   const captureCalls = [];
   const filterCalls = [];
@@ -1567,6 +1570,7 @@ function createBatchHarness({
       captureCalls.push({
         keyword: options.captureParams.keyword,
         tabId: options.tabId,
+        publishTimeWindow: options.captureParams.publishTimeWindow,
       });
       return await captureKeyword(options, captureCalls.length);
     },
@@ -1593,6 +1597,9 @@ function createBatchHarness({
           ),
       ),
     isDouyinPlatform: (platform) => platform === "douyin",
+    isXhsPublishTimeWindow,
+    createXhsSearchTimeFilterError,
+    isXhsSearchTimeFilterVerified,
     isDouyinSearchSecurityChallengeError: (error) =>
       String(error?.code || "").toUpperCase() ===
       "DOUYIN_SEARCH_SECURITY_CHALLENGE",
@@ -1605,10 +1612,15 @@ function createBatchHarness({
       ),
     applySearchFiltersInTab: async (tabId, filters, applyOptions = {}) => {
       filterCalls.push({tabId, filters, applyOptions});
+      if (typeof applyFilters === "function") return await applyFilters({tabId, filters, applyOptions, call: filterCalls.length});
       return {
         applied: true,
         complete: true,
-        results: [{field: "sort", applied: true, changed: true}],
+        results: [
+          {field: "sort", applied: true, changed: true},
+          ...(filters?.publishTime ? [{field: "publishTime", value: filters.publishTime, applied: true, changed: true}] : []),
+        ],
+        xhsTimeFilterEvidence: {verified: true, active: true, confirmedEmpty: false},
       };
     },
     beginDouyinSearchResultTransitionInTab: async () => ({
@@ -2032,6 +2044,75 @@ test("verified sequential-patrol filters fail closed instead of falling through 
   assert.match(contentSource, /verifyDefaults[\s\S]*item\.platforms\.includes\(platform\)/u);
   assert.match(contentSource, /const alreadyActive = isBatchFilterOptionActive/u);
   assert.match(contentSource, /changed: ok && !alreadyActive/u);
+});
+
+test("XHS unverified time filter fails only its keyword and never captures or resubmits old results", async () => {
+  const harness = createBatchHarness({
+    hasActiveFilters: true,
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    applyFilters: async ({call}) => call === 1 ? null : {
+      complete: false,
+      failedFields: ["sort"],
+      results: [{field: "publishTime", value: "day", applied: true}],
+      xhsTimeFilterEvidence: {verified: true, active: true},
+    },
+  });
+  const result = await harness.run({keywords: ["词1", "词2"], searchFilters: {sort: "latest", publishTime: "day"}});
+  assert.deepEqual(harness.captureCalls.map(call => call.keyword), ["词2"]);
+  assert.equal(harness.captureCalls[0].publishTimeWindow, "day");
+  assert.equal(result.stats.processed, 2);
+  assert.equal(result.stats.failed, 1);
+  assert.equal(result.stats.success, 1);
+  assert.equal(result.results[0].errorCode, "XHS_SEARCH_TIME_FILTER_UNVERIFIED");
+  assert.equal(result.results[0].fatal, false);
+  assert.equal(harness.submitCalls.length, 0);
+  assert.equal(harness.filterCalls.length, 2);
+  assert.equal(result.canceled, false);
+});
+
+test("XHS verified empty filtered results finish with zero candidates without list capture or retry", async () => {
+  const harness = createBatchHarness({
+    hasActiveFilters: true,
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    applyFilters: async () => ({
+      complete: true,
+      results: [{field: "publishTime", value: "day", applied: true}],
+      xhsTimeFilterEvidence: {verified: true, active: true, confirmedEmpty: true, emptyMessage: "没有找到相关笔记"},
+    }),
+  });
+  const result = await harness.run({keywords: ["词1", "词2"], searchFilters: {publishTime: "day"}});
+  assert.equal(result.stats.success, 2);
+  assert.equal(harness.captureCalls.length, 0);
+  assert.equal(harness.submitCalls.length, 0);
+  assert.ok(result.results.every(item => item.noResults && item.candidateCount === 0));
+});
+
+test("XHS all items outside the publish window finish normally and do not trigger an empty-list retry", async () => {
+  const harness = createBatchHarness({
+    hasActiveFilters: true,
+    captureKeyword: async () => ({
+      ok: true,
+      captureResult: {ok: true, data: {items: [], publishWindowExcludedCount: 3}},
+      recordIds: [], savedRecords: [],
+    }),
+  });
+  const result = await harness.run({keywords: ["词1", "词2"], searchFilters: {publishTime: "day"}});
+  assert.equal(result.stats.success, 2);
+  assert.equal(harness.captureCalls.length, 2);
+  assert.equal(harness.submitCalls.length, 0);
+  assert.ok(result.results.every(item => item.noResults && item.publishWindowExcludedCount === 3));
+});
+
+test("XHS no-window and Douyin keyword runs retain their capture parameters", async () => {
+  for (const platform of ["xiaohongshu", "douyin"]) {
+    const harness = createBatchHarness({
+      hasActiveFilters: true,
+      captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    });
+    const result = await harness.run({platform, keywords: ["词1"], searchFilters: {publishTime: platform === "douyin" ? "day" : "all"}});
+    assert.equal(result.stats.success, 1);
+    assert.equal(harness.captureCalls[0].publishTimeWindow, undefined);
+  }
 });
 
 test("a drifted Douyin search page fails only the current keyword and continues", async () => {

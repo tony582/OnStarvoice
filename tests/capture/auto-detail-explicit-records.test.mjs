@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
+import {isXhsPublishTimeWindow} from "../../utils/capture/xhs-publish-window.js";
 
 const sidebarSource = await readFile(
   new URL("../../sidebar/sidebar-logic.js", import.meta.url),
@@ -25,7 +26,7 @@ function compileFunction({source, startMarker, endMarker, functionName, context}
     /^export\s+/,
     "",
   );
-  const sandbox = vm.createContext({...context});
+  const sandbox = vm.createContext({isXhsPublishTimeWindow, ...context});
   vm.runInContext(
     `${section}\nglobalThis.__compiledFunction = ${functionName};`,
     sandbox,
