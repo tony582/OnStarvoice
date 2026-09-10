@@ -833,7 +833,10 @@ async function persistPrefilterOutcome({
       if (sourceItem.externalId) {
         await tx.execute(`
           UPDATE records
-          SET business_visibility = $4,
+          SET business_visibility = CASE
+                WHEN payload->'serverPublishWindow'->>'status' = 'out_of_range'
+                  THEN 'filtered_out'
+                ELSE $4 END,
               relevance_disposition_updated_at = now(),
               updated_at = now()
           WHERE tenant_id = $1

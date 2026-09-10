@@ -1,3 +1,5 @@
+import {isCapturePublishWindowExclusion} from './capture-publish-window-exclusion.js';
+
 function normalizeRecordId(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -26,6 +28,8 @@ export function createRecordSyncQueue({
   const enqueuedIds = new Set();
   const excludedIds = new Set();
   const succeededIds = new Set();
+  const terminalExcludedIds = new Set();
+  const settledCountsById = new Map();
   const dirtyIds = new Set();
   const latestMetaById = new Map();
   let activeJob = null;
@@ -47,6 +51,7 @@ export function createRecordSyncQueue({
     failedCount: 0,
     skippedCount: 0,
     retryCount: 0,
+    excludedCount: 0,
   };
 
   const getStats = () => ({
@@ -135,7 +140,7 @@ export function createRecordSyncQueue({
 
   const markExcluded = (recordId) => {
     const normalizedId = normalizeRecordId(recordId);
-    if (!normalizedId) {
+    if (!normalizedId || terminalExcludedIds.has(normalizedId)) {
       return false;
     }
     seenIds.add(normalizedId);
@@ -155,7 +160,7 @@ export function createRecordSyncQueue({
       return false;
     }
     const normalizedId = normalizeRecordId(recordId);
-    if (!normalizedId) {
+    if (!normalizedId || terminalExcludedIds.has(normalizedId)) {
       return false;
     }
 
@@ -209,6 +214,7 @@ export function createRecordSyncQueue({
       result?.blocked ||
       result?.skipped ||
       result?.canceled ||
+      isCapturePublishWindowExclusion(result) ||
       syncCancellationState()
     ) {
       return false;
@@ -295,18 +301,48 @@ export function createRecordSyncQueue({
       });
     }
 
+    if (isCapturePublishWindowExclusion(result)) {
+      // Reclassify this record into the same closure bucket as a pre-upload
+      // exclusion. A list upload may have succeeded before detail proves old;
+      // its earlier business-success counts must not survive the exclusion.
+      const previous = settledCountsById.get(job.recordId) || {};
+      stats.enqueuedCount -= (previous.processedCount || 0) + 1;
+      for (const key of ['processedCount', 'successCount', 'failedCount', 'skippedCount']) {
+        stats[key] -= previous[key] || 0;
+      }
+      stats.excludedCount += 1;
+      settledCountsById.delete(job.recordId);
+      terminalExcludedIds.add(job.recordId);
+      excludedIds.add(job.recordId);
+      enqueuedIds.delete(job.recordId);
+      succeededIds.delete(job.recordId);
+      dirtyIds.delete(job.recordId);
+      latestMetaById.delete(job.recordId);
+      activeJob = null;
+      emitState('excluded', {recordId: job.recordId, meta: latestMeta, result});
+      return;
+    }
+
     stats.processedCount += 1;
+    const counts = settledCountsById.get(job.recordId) || {
+      processedCount: 0, successCount: 0, failedCount: 0, skippedCount: 0,
+    };
+    counts.processedCount += 1;
     if (result?.blocked) {
       blockedError = result.error || new Error("自动同步前检查失败");
     }
     if (result?.skipped) {
       stats.skippedCount += 1;
+      counts.skippedCount += 1;
     } else if (result?.ok === false) {
       stats.failedCount += 1;
+      counts.failedCount += 1;
     } else {
       stats.successCount += 1;
+      counts.successCount += 1;
       succeededIds.add(job.recordId);
     }
+    settledCountsById.set(job.recordId, counts);
 
     emitState("settled", {
       recordId: job.recordId,

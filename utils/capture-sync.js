@@ -10,6 +10,12 @@
  */
 
 import { sync, syncBatch, checkCapturedExternalIds } from './api.js';
+import {
+  CAPTURE_PUBLISH_WINDOW_EXCLUSION,
+  hasNewCaptureAfterPublishWindowExclusion,
+  isCapturePublishWindowExclusion,
+  isStoredCapturePublishWindowExclusion,
+} from './capture-publish-window-exclusion.js';
 
 import {
   addRecord,
@@ -160,6 +166,15 @@ function resolveActiveCloudCaptureTaskId(context = getActiveTaskContext()) {
     ? rawTaskId.slice('unattended-capture:'.length)
     : rawTaskId;
   return CLOUD_CAPTURE_TASK_ID_PATTERN.test(taskId) ? taskId.toLowerCase() : '';
+}
+
+function resolveRecordSyncCaptureTaskId(record = {}, options = {}) {
+  // A manual pending upload may contain older records while another task is
+  // active. Only an explicit call scope or this record's own binding applies.
+  return resolveActiveCloudCaptureTaskId({taskId: options?.captureTaskId}) ||
+    resolveActiveCloudCaptureTaskId({taskId:
+      record?.captureTaskId || record?.meta?.captureTaskId || record?.payload?.captureTaskId,
+    });
 }
 
 function buildCaptureTaskProgressActivityKey(progress = {}) {
@@ -1884,11 +1899,31 @@ async function saveRecordsWithCacheDedupe(records = [], {session = null} = {}) {
           mergeKeywordMatchLabelsInPlace(existingRecord, record);
         const sourceUrlChanged =
           refreshListCaptureSourceUrlInPlace(existingRecord, record);
+        const recapturedAfterExclusion = hasNewCaptureAfterPublishWindowExclusion(
+          existingRecord, record.payload,
+        );
+        if (recapturedAfterExclusion) {
+          existingRecord.payload.captureTimestamp = record.payload.captureTimestamp;
+          // A fresh capture must not retain the rejected run's time-window
+          // binding. Its caller supplies the new cloud scope when one exists.
+          for (const [previous, fresh] of [
+            [existingRecord, record],
+            [existingRecord.payload, record.payload],
+            [existingRecord.meta, record.meta],
+          ]) {
+            if (!previous || typeof previous !== 'object') continue;
+            for (const field of ['captureTaskId', 'captureTaskItemAttemptId', 'captureTaskItemRequestHash']) {
+              delete previous[field];
+              if (fresh?.[field]) previous[field] = fresh[field];
+            }
+          }
+        }
         if (
           refreshListCaptureMetricsInPlace(existingRecord, record) ||
           keywordLabelsChanged ||
           sourceUrlChanged ||
-          traceMerge.changed
+          traceMerge.changed ||
+          recapturedAfterExclusion
         ) {
           refreshedRecords.push(existingRecord);
         } else if (existingId) {
@@ -2577,20 +2612,24 @@ export async function captureAndSync({
       syncRecordIds.length === 1
         ? await syncRecord(syncRecordIds[0], onProgress, {
             trigger: 'capture_auto',
+            captureTaskId: resolveActiveCloudCaptureTaskId(),
             commentLeadsConfig,
             shouldStop,
             signal,
           })
         : await syncRecordBatch(syncRecordIds, onProgress, {
             trigger: 'capture_auto',
+            captureTaskId: resolveActiveCloudCaptureTaskId(),
             commentLeadsConfig,
             shouldStop,
             signal,
           });
 
+    const syncExcluded = isCapturePublishWindowExclusion(syncResult);
     return {
-      ok: syncResult.ok,
-      phase: syncResult.ok ? 'synced' : 'sync_failed',
+      ok: syncResult.ok || syncExcluded,
+      phase: syncExcluded ? 'sync_excluded' : syncResult.ok ? 'synced' : 'sync_failed',
+      ...(syncExcluded ? {excluded: true, excludedCount: syncResult.excludedCount || 1} : {}),
       captureResult,
       syncResult,
       recordId,
@@ -7424,14 +7463,17 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
     });
 
     // 调用后端 sync API
-    const syncResult = await sync(
+    const captureTaskId = resolveRecordSyncCaptureTaskId(record, options);
+    const syncResult = isStoredCapturePublishWindowExclusion(record,
+      resolveActiveCloudCaptureTaskId({taskId: options?.captureTaskId}))
+      ? {ok: false, reason: CAPTURE_PUBLISH_WINDOW_EXCLUSION,
+          message: '发布时间超出原采集范围，已排除；新任务可按新范围重新校验'}
+      : await sync(
       {
         syncType: syncInput.syncType,
         target: requestTarget,
         payload: syncInput.payload,
-        captureTaskId:
-          String(options?.captureTaskId || '').trim() ||
-          resolveActiveCloudCaptureTaskId(),
+        captureTaskId,
         captureTaskItemAttemptId: String(
           options?.captureTaskItemAttemptId || '',
         ).trim(),
@@ -7448,6 +7490,24 @@ export async function syncRecord(recordId, onProgress = null, options = {}) {
     }
 
     const debugUrl = extractDebugUrl(syncResult);
+
+    if (isCapturePublishWindowExclusion(syncResult)) {
+      await applySyncRecordResultItem({recordId, success: false, excluded: true,
+        reason: CAPTURE_PUBLISH_WINDOW_EXCLUSION});
+      await updateSync({status: SYNC_STATUS.SUCCESS, error: null});
+      const result = {
+        ok: false, skipped: true, excluded: true, retryable: false,
+        successCount: 0, failedCount: 0, excludedCount: 1,
+        recordId, platform: syncInput.platform, type: syncInput.syncType,
+        workflow: syncInput.workflow, reason: CAPTURE_PUBLISH_WINDOW_EXCLUSION,
+        message: syncResult.message || '发布时间超出本次采集范围，已排除',
+        rawResponse: syncResult, error: null,
+      };
+      onProgress?.({phase: 'sync_excluded', recordId, message: result.message, excludedCount: 1});
+      await appendSingleSyncHistoryEntry({requestTarget, syncInput, recordId,
+        result, startedAt, trigger: historyTrigger});
+      return result;
+    }
 
     // 检查同步是否成功
     if (syncResult.ok) {
@@ -7799,7 +7859,8 @@ async function appendSingleSyncHistoryEntry({
           payload: {},
         };
   const safeResult = result && typeof result === 'object' ? result : {};
-  const success = Boolean(safeResult.ok);
+  const excluded = isCapturePublishWindowExclusion(safeResult);
+  const success = Boolean(safeResult.ok) && !excluded;
   const payload = safeSyncInput.payload && typeof safeSyncInput.payload === 'object'
     ? safeSyncInput.payload
     : {};
@@ -7811,9 +7872,10 @@ async function appendSingleSyncHistoryEntry({
     finishedAt: Date.now(),
     totalCount: 1,
     requestedTotalCount: 1,
-    skippedCount: 0,
+    skippedCount: excluded ? 1 : 0,
+    excludedCount: excluded ? 1 : 0,
     successCount: success ? 1 : 0,
-    failedCount: success ? 0 : 1,
+    failedCount: success || excluded ? 0 : 1,
     debugUrl: safeResult.debugUrl || null,
     platform: safeSyncInput.platform || 'unknown',
     syncType: safeSyncInput.syncType || '',
@@ -7832,6 +7894,7 @@ async function appendSingleSyncHistoryEntry({
             ? getSingleNoteType(payload)
             : null,
         success,
+        excluded,
         reason: safeResult.reason || (success ? ERROR_REASON.NONE : 'SYNC_ERROR'),
         message: safeResult.message || (success ? '同步成功' : '同步失败'),
         debugUrl: safeResult.debugUrl || null,
@@ -7891,10 +7954,6 @@ export async function syncRecordBatch(recordIds, onProgress = null, options = {}
 
 async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
   const startedAt = Date.now();
-  const captureTaskId =
-    resolveActiveCloudCaptureTaskId({
-      taskId: String(options?.captureTaskId || '').trim(),
-    }) || resolveActiveCloudCaptureTaskId();
   const shouldStop = options?.shouldStop;
   const signal = options?.signal || null;
   const requestedRecordIds = Array.isArray(recordIds)
@@ -7957,7 +8016,7 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       workflow: syncInput.workflow,
       sourceType: record.type,
       monitorExecutionId,
-      captureTaskId,
+      captureTaskId: resolveRecordSyncCaptureTaskId(record, options),
       captureTaskItemAttemptId:
         batchCaptureTaskItemAttemptId ||
         String(record?.captureTaskItemAttemptId || '').trim(),
@@ -7973,9 +8032,17 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
         ].includes(String(record?.lastSyncReason || '').trim().toUpperCase()),
     };
   });
-  const results = [];
+  const results = preparedRecordsToSync
+    .filter((record) => isStoredCapturePublishWindowExclusion(record,
+      resolveActiveCloudCaptureTaskId({taskId: options?.captureTaskId})))
+    .map((record) => buildSyncRecordResultItem(record, {
+      ok: false, reason: CAPTURE_PUBLISH_WINDOW_EXCLUSION,
+      message: '发布时间超出原采集范围，已排除；新任务可按新范围重新校验',
+    }, null));
   const contentRecordsToSync = preparedRecordsToSync.filter(
-    (record) => !record.retryCommentLeadsOnly,
+    (record) => !record.retryCommentLeadsOnly &&
+      !isStoredCapturePublishWindowExclusion(record,
+        resolveActiveCloudCaptureTaskId({taskId: options?.captureTaskId})),
   );
   const leadsRetryRecords = preparedRecordsToSync.filter(
     (record) => record.retryCommentLeadsOnly,
@@ -8098,7 +8165,8 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       requestedTotalCount: group.records.length,
       skippedCount: 0,
       successCount: groupResults.filter((result) => result.success).length,
-      failedCount: groupResults.filter((result) => !result.success).length,
+      failedCount: groupResults.filter((result) => !result.success && !result.excluded).length,
+      excludedCount: groupResults.filter((result) => result.excluded).length,
       debugUrl: pickBatchDebugUrl(groupResults) || null,
       platform: group.platform || 'unknown',
       syncType: group.syncType || '',
@@ -8444,8 +8512,9 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
 
   // 统计结果
   const successCount = results.filter((r) => r.success).length;
+  const excludedCount = results.filter((r) => r.excluded === true).length;
   const failedCount = results.filter(
-    (r) => r.success !== true && r.reason !== 'SYNC_BATCH_PAUSED',
+    (r) => r.success !== true && !r.excluded && r.reason !== 'SYNC_BATCH_PAUSED',
   ).length;
   const pausedCount = Number(syncPaused?.pausedCount || 0);
 
@@ -8481,9 +8550,10 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       message:
         pausedCount > 0
           ? `批量同步已暂停：成功 ${successCount}，待继续 ${pausedCount}`
-          : `批量同步完成：成功 ${successCount}，失败 ${failedCount}`,
+          : `批量同步完成：成功 ${successCount}，失败 ${failedCount}${excludedCount ? `，已排除 ${excludedCount}` : ''}`,
       successCount,
       failedCount,
+      excludedCount,
       pausedCount,
     });
   }
@@ -8499,6 +8569,7 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
       skippedCount: skippedRecordIds.length,
       successCount,
       failedCount,
+      excludedCount,
       debugUrl: pickBatchDebugUrl(results) || null,
       platform: 'unknown',
       syncType: '',
@@ -8522,9 +8593,13 @@ async function runSyncRecordBatch(recordIds, onProgress = null, options = {}) {
 
   return {
     ok: failedCount === 0 && pausedCount === 0,
+    ...(excludedCount > 0 && excludedCount === results.length && skippedRecordIds.length === 0
+      ? {excluded: true, skipped: true, reason: CAPTURE_PUBLISH_WINDOW_EXCLUSION}
+      : {}),
     results,
     successCount,
     failedCount,
+    excludedCount,
     pausedCount,
     pausedRecordIds: Array.isArray(syncPaused?.pausedRecordIds)
       ? syncPaused.pausedRecordIds
@@ -8975,6 +9050,7 @@ function buildSyncRecordResultItem(record, item, batchResult) {
     normalizeDebugUrl(item?.debugUrl) ||
     (batchResult?.ok ? extractDebugUrl(batchResult) : '');
   const success = item?.ok === true;
+  const excluded = isCapturePublishWindowExclusion(item);
   const reason =
     item?.reason ||
     (success
@@ -9000,11 +9076,13 @@ function buildSyncRecordResultItem(record, item, batchResult) {
         ? getSingleNoteType(record.syncPayload || record.payload)
         : null,
     success,
+    excluded,
+    ...(excluded ? {skipped: true, retryable: false} : {}),
     reason,
     message,
     debugUrl: debugUrl || null,
     rawResponse: item?.rawResponse || batchResult,
-    error: success
+    error: success || excluded
       ? null
       : {
           reason,
@@ -9015,6 +9093,16 @@ function buildSyncRecordResultItem(record, item, batchResult) {
 
 async function applySyncRecordResultItem(resultItem) {
   if (!resultItem?.recordId) return;
+
+  if (isCapturePublishWindowExclusion(resultItem)) {
+    await updateRecord(resultItem.recordId, {
+      status: RECORD_STATUS.DRAFT,
+      lastSyncedAt: Date.now(),
+      lastSyncReason: CAPTURE_PUBLISH_WINDOW_EXCLUSION,
+      lastSyncDebugUrl: null,
+    });
+    return;
+  }
 
   if (resultItem.success) {
     await markRecordSynced(resultItem.recordId, resultItem.debugUrl || null);
@@ -9197,7 +9285,7 @@ function isRateLimitedBatchResult(batchResult) {
 }
 
 function isRateLimitedSyncItem(item, batchResult) {
-  if (item?.ok === true) {
+  if (item?.ok === true || isCapturePublishWindowExclusion(item)) {
     return false;
   }
   return isRateLimitedSyncReason(
@@ -9233,7 +9321,7 @@ function isIndeterminateBatchResult(batchResult) {
 }
 
 function isIndeterminateSyncItem(item, batchResult) {
-  if (item?.ok === true || isRateLimitedSyncItem(item, batchResult)) {
+  if (item?.ok === true || isCapturePublishWindowExclusion(item) || isRateLimitedSyncItem(item, batchResult)) {
     return false;
   }
   return isIndeterminateSyncReason(

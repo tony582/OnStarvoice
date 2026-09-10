@@ -374,6 +374,13 @@ router.post('/', requireAuth, optionalCaptureAgent, async (req, res) => {
       captureAgentAuthBindingId: req.captureAgent?.auth_binding_id || null,
       commentWorkflowExpectedCount,
     });
+    if (result.action === 'skipped') {
+      return res.status(422).json({
+        ok: false, action: 'skipped', error: result.reason,
+        reason: result.reason, message: result.message, retryable: false,
+        publishWindowCheck: result.publishWindowCheck,
+      });
+    }
     const commentStats = await applyOrQueueCommentWorkflow(record, result, {
       tenantId: req.tenantId,
       authCode: req.authCode,
@@ -444,6 +451,13 @@ router.post('/batch', requireAuth, optionalCaptureAgent, async (req, res) => {
         captureAgentAuthBindingId: req.captureAgent?.auth_binding_id || null,
         commentWorkflowExpectedCount: countCommentWorkflowItems(record),
       });
+      if (result.action === 'skipped') {
+        results.push({
+          ok: false, ...result, recordId: originalRecordId, backendRecordId: null,
+          error: {reason: result.reason, message: result.message, retryable: false},
+        });
+        continue;
+      }
       const commentStats = await applyOrQueueCommentWorkflow(record, result, {
         tenantId: req.tenantId,
         authCode: req.authCode,
@@ -491,6 +505,7 @@ router.post('/batch', requireAuth, optionalCaptureAgent, async (req, res) => {
   const inserted = results.filter(r => r.action === 'inserted').length;
   const updated = results.filter(r => r.action === 'updated').length;
   const failed = results.filter(r => !r.ok).length;
+  const excluded = results.filter(r => r.reason === 'capture_publish_time_out_of_range').length;
 
   return res.json({
     ok: true,
@@ -500,6 +515,7 @@ router.post('/batch', requireAuth, optionalCaptureAgent, async (req, res) => {
       inserted,
       updated,
       failed,
+      excluded,
     },
   });
 });

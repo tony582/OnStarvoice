@@ -283,7 +283,7 @@ test("single-record capture auto sync keeps its internal trigger in history", as
   );
   assert.equal(
     captureSync.match(/trigger: historyTrigger/g)?.length,
-    4,
+    5, // The time-window exclusion outcome also preserves the internal trigger.
   );
 });
 

@@ -9,6 +9,7 @@ import {
 } from '../utils/metrics.js';
 import {resolveCapturedRecordType} from './official-account-identity.js';
 import {buildCustomerDailyMetricEvidence,observationPayloadWithDailyEvidence} from './customer-daily-metric-evidence.js';
+import {evaluateCapturePublishWindow} from './capture-publish-window.js';
 
 const VERSION_FIELDS = [
   'title', 'content', 'author_name', 'author_id', 'author_avatar', 'url', 'cover_url',
@@ -1166,6 +1167,26 @@ export async function upsertCapturedRecord(record, context) {
   let payload = jsonText(record.payload, '{}');
 
   const runUpsertTransaction = () => withTransaction(async tx => {
+    // Only the saved task can supply the search window. Never infer it from a
+    // current schedule (which may have changed) or trust an upload's window.
+    const captureTask = record.record_type === 'keyword_notes'
+      && ['xiaohongshu', 'douyin'].includes(record.platform)
+      && UUID_PATTERN.test(String(captureTaskId || ''))
+      ? await tx.queryOne(`
+          SELECT task.id, task.tenant_id, task.task_type, task.feature_key,
+            task.platform, task.metadata, task.started_at, task.created_at,
+            task.parent_task_id,
+            COALESCE(task.metadata->'planSnapshot', task.metadata->'plan_snapshot',
+              parent.metadata->'planSnapshot', parent.metadata->'plan_snapshot') AS plan_snapshot
+          FROM capture_tasks task
+          LEFT JOIN capture_tasks parent ON parent.id = task.parent_task_id
+            AND parent.tenant_id = task.tenant_id
+          WHERE task.id = $1 AND task.tenant_id = $2
+            AND ($3::uuid IS NULL OR COALESCE(task.assigned_agent_id, task.origin_agent_id) = $3)
+        `, [captureTaskId, tenantId,
+          UUID_PATTERN.test(String(captureAgentId || '')) ? captureAgentId : null])
+      : null;
+    let publishWindowCheck = evaluateCapturePublishWindow({record, task: captureTask});
     let existing = null;
     if (record.external_id) {
       existing = await tx.queryOne(
@@ -1178,6 +1199,137 @@ export async function upsertCapturedRecord(record, context) {
         'SELECT * FROM records WHERE tenant_id = $1 AND platform = $2 AND content_hash = $3',
         [tenantId, record.platform, contentHash]
       );
+    }
+
+    // Serialize later detail evidence with other writes for this scoped record.
+    // Unrelated manual capture and patrol retain their existing path.
+    if (existing && (publishWindowCheck.applies || recordPayloadObject(existing.payload).serverPublishWindow)) {
+      existing = await tx.queryOne('SELECT * FROM records WHERE id = $1 FOR UPDATE', [existing.id]);
+    }
+    const previousWindow = recordPayloadObject(existing?.payload).serverPublishWindow;
+    const receivedAt = Date.now();
+    const incomingCaptureTimestamp = Number(recordPayloadObject(record.payload).captureTimestamp);
+    const newUnscopedCapture = !captureTask && !captureTaskId
+      && record.record_type === 'keyword_notes'
+      && previousWindow?.status === 'out_of_range'
+      && Number.isSafeInteger(previousWindow.checkedAt)
+      && Number.isSafeInteger(incomingCaptureTimestamp)
+      && incomingCaptureTimestamp > previousWindow.checkedAt
+      && incomingCaptureTimestamp <= receivedAt + 60000;
+    // A genuinely new standalone capture has no saved time condition. Ordinary
+    // replays keep their original capture time and cannot clear the old result.
+    const unrestrictedWindow = publishWindowCheck.reason === 'time_window_unrestricted' || newUnscopedCapture;
+    let widerWindowReleasesUpperBound = false;
+    let establishedUpperBoundUsed = false;
+    if (previousWindow?.status === 'out_of_range'
+      && publishWindowCheck.applies
+      && publishWindowCheck.status !== 'out_of_range'
+      && !(publishWindowCheck.status === 'in_range'
+        && publishWindowCheck.source?.includes('detailPayload.'))) {
+      // A later search card can repeat the original bad date. Keep the already
+      // established publication date until fresh detail evidence corrects it,
+      // or a wider task window admits it. Stored bounds must never be reparsed
+      // against a later capture year (e.g. 09-02 would silently become newer).
+      const upperOnly = Number.isFinite(previousWindow.upperBoundTimestamp);
+      const end = upperOnly ? previousWindow.upperBoundTimestamp : previousWindow.publishEndTimestamp;
+      if (Number.isFinite(end) && Number.isFinite(publishWindowCheck.cutoffTimestamp)) {
+        const exact = !upperOnly && end === previousWindow.publishTimestamp;
+        const outside = exact ? end < publishWindowCheck.cutoffTimestamp : end <= publishWindowCheck.cutoffTimestamp;
+        widerWindowReleasesUpperBound = upperOnly && !outside
+          && publishWindowCheck.cutoffTimestamp < previousWindow.cutoffTimestamp;
+        establishedUpperBoundUsed = upperOnly;
+        publishWindowCheck = {
+          ...publishWindowCheck,
+          status: outside ? 'out_of_range' : upperOnly ? 'unverified' : 'in_range',
+          reason: outside ? 'established_publish_time_before_window' : upperOnly
+            ? 'established_upper_bound_within_wider_window' : 'established_publish_time_within_window',
+          publishTimeRaw: previousWindow.publishTimeRaw,
+          publishTimestamp: previousWindow.publishTimestamp,
+          publishEndTimestamp: previousWindow.publishEndTimestamp,
+          upperBoundTimestamp: previousWindow.upperBoundTimestamp,
+          upperBoundBasis: previousWindow.upperBoundBasis,
+          source: previousWindow.source, precision: previousWindow.precision,
+        };
+      }
+    }
+    const incomingPayload = {...recordPayloadObject(record.payload)};
+    // This marker is server-owned, including when a caller replays old payloads.
+    delete incomingPayload.serverPublishWindow;
+    if (previousWindow) incomingPayload.serverPublishWindow = previousWindow;
+    if (publishWindowCheck.applies || (previousWindow && unrestrictedWindow)) {
+      incomingPayload.serverPublishWindow = {
+        ...publishWindowCheck,
+        version: 1,
+        checkedAt: receivedAt,
+        taskId: captureTask?.id || null,
+        originTaskId: existing ? previousWindow?.originTaskId || null : captureTask.id,
+        originAttemptId: existing ? previousWindow?.originAttemptId || null : captureTaskItemAttemptId,
+      };
+    }
+    const remainsExcluded = previousWindow?.status === 'out_of_range'
+      && publishWindowCheck.status !== 'in_range' && !unrestrictedWindow && !widerWindowReleasesUpperBound;
+    if (remainsExcluded && publishWindowCheck.status !== 'out_of_range') {
+      incomingPayload.serverPublishWindow = previousWindow;
+      record.publish_time = previousWindow.publishTimeRaw || existing.publish_time;
+    }
+    record = {...record, payload: JSON.stringify(incomingPayload)};
+    if (establishedUpperBoundUsed && publishWindowCheck.status === 'unverified') {
+      record.publish_time = existing.publish_time;
+    }
+    if (publishWindowCheck.status === 'in_range' && publishWindowCheck.publishTimeRaw) {
+      record.publish_time = publishWindowCheck.publishTimeRaw;
+    }
+
+    if (publishWindowCheck.status === 'out_of_range') {
+      const lineageContext = {
+        tenantId, captureTaskId, captureAgentId, captureAgentAuthCodeId,
+        captureAgentAuthBindingId, captureTaskItemAttemptId, captureTaskItemRequestHash,
+        recordId: existing?.id || null, monitorExecutionId, record,
+      };
+      assertCaptureAttemptLineage(lineageContext,
+        await loadCaptureObservationLineage(tx, lineageContext));
+      // A delayed detail can reveal an old date after the list was stored. Hide
+      // only this run's newly created, untouched record; never alter an older
+      // customer record or erase an operator's edits/status.
+      let hiddenRecordId = null;
+      if (existing && previousWindow?.originTaskId === captureTask.id) {
+        const hidden = await tx.queryOne(`
+          UPDATE records r SET business_visibility = 'filtered_out',
+            relevance_disposition_updated_at = now(), updated_at = now(),
+            publish_time = $3,
+            payload = COALESCE(r.payload, '{}'::jsonb)
+              || jsonb_build_object('serverPublishWindow', $4::jsonb)
+          WHERE r.id = $1 AND r.tenant_id = $2
+            AND COALESCE(r.manual_overrides, '{}'::jsonb) = '{}'::jsonb
+            AND r.manual_updated_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM record_triage t WHERE t.record_id = r.id)
+            AND NOT EXISTS (
+              SELECT 1 FROM record_observations o WHERE o.record_id = r.id
+                AND (o.capture_task_id IS DISTINCT FROM $5::uuid
+                  AND (o.capture_task_id IS NOT NULL
+                    OR o.payload->'serverPublishWindow'->>'taskId' IS DISTINCT FROM $5::text))
+            )
+          RETURNING r.id
+        `, [existing.id, tenantId, Number.isFinite(publishWindowCheck.publishTimestamp)
+          ? publishWindowCheck.publishTimeRaw || record.publish_time : existing.publish_time,
+          JSON.stringify(incomingPayload.serverPublishWindow), captureTask.id]);
+        hiddenRecordId = hidden?.id || null;
+      }
+      // Rejection is a durable, deterministic outcome, not a transient sync
+      // failure. Do not create an observation or enqueue comments/AI/media.
+      await tx.execute(`
+        INSERT INTO capture_task_events (tenant_id, task_id, event_type, status, message, payload)
+        VALUES ($1, $2, 'capture_publish_time_out_of_range', 'skipped', $3, $4::jsonb)
+      `, [tenantId, captureTask.id, '发布时间超出本次关键词采集范围，已拦截', JSON.stringify({
+        externalId: record.external_id || '', platform: record.platform,
+        keyword: record.keyword || '', existingRecordId: existing?.id || null,
+        hiddenRecordId, publishTime: publishWindowCheck.publishTimeRaw || record.publish_time || '', ...publishWindowCheck,
+      })]);
+      return {
+        id: null, action: 'skipped', reason: 'capture_publish_time_out_of_range',
+        message: '发布时间超出本次关键词采集范围，已拦截', retryable: false,
+        businessVisibility: 'filtered_out', publishWindowCheck,
+      };
     }
 
     const incomingRecordType = record.record_type || existing?.record_type || 'single_note';
@@ -1195,7 +1347,12 @@ export async function upsertCapturedRecord(record, context) {
     record = guardRecordCommentCount(record, existing || {});
     record = guardRecordTextCompleteness(record, existing || {});
     payload = jsonText(record.payload, '{}');
-    const businessVisibility = resolveRecordBusinessVisibility(record, existing || {});
+    const releasedWindowExclusion = previousWindow?.status === 'out_of_range'
+      && (publishWindowCheck.status === 'in_range' || unrestrictedWindow || widerWindowReleasesUpperBound);
+    const businessVisibility = remainsExcluded
+      ? 'filtered_out'
+      : resolveRecordBusinessVisibility(record, releasedWindowExclusion
+        ? {...existing, business_visibility: 'eligible'} : existing || {});
 
     if (existing) {
       const changedFields = detectChangedFields(existing, { ...record, tags, image_urls: imageUrls, payload });
@@ -1240,11 +1397,13 @@ export async function upsertCapturedRecord(record, context) {
           capture_timestamp = COALESCE(NULLIF($28, ''), capture_timestamp),
           keyword = COALESCE(NULLIF($29, ''), keyword),
           source_type = COALESCE(NULLIF($30, ''), source_type),
-          payload = CASE
+          payload = (CASE
             WHEN ($31::jsonb->>'detailCaptureStatus') = 'done' THEN $31::jsonb
             WHEN (payload->>'detailCaptureStatus') = 'done' THEN payload
             ELSE $31::jsonb
-          END,
+          END) || CASE WHEN $31::jsonb ? 'serverPublishWindow'
+            THEN jsonb_build_object('serverPublishWindow', $31::jsonb->'serverPublishWindow')
+            ELSE '{}'::jsonb END,
           auth_code = COALESCE(NULLIF($32, ''), auth_code),
           author_account_no = COALESCE(NULLIF($34, ''), author_account_no),
           publish_location = COALESCE(NULLIF($35, ''), publish_location),

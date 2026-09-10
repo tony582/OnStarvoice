@@ -13648,14 +13648,16 @@ function settleKeywordRecordsForStreamingSync(
 }
 
 function formatStreamingSyncSummary(stats = {}) {
-  if (!stats?.enabled || Number(stats.enqueuedCount || 0) === 0) {
+  if (!stats?.enabled || (Number(stats.enqueuedCount || 0) === 0 && Number(stats.excludedCount || 0) === 0)) {
     return "";
   }
   const retryNote =
     Number(stats.retryCount || 0) > 0
       ? `，瞬时重试 ${Number(stats.retryCount || 0)}`
       : "";
-  return `同步成功 ${Number(stats.successCount || 0)}，失败 ${Number(stats.failedCount || 0)}，待上传 ${Number(stats.remainingCount || 0)}${retryNote}`;
+  const excludedNote = Number(stats.excludedCount || 0) > 0
+    ? `，超出时间范围已排除 ${Number(stats.excludedCount)}` : "";
+  return `同步成功 ${Number(stats.successCount || 0)}，失败 ${Number(stats.failedCount || 0)}，待上传 ${Number(stats.remainingCount || 0)}${excludedNote}${retryNote}`;
 }
 
 function buildStreamingSyncTaskIssue(stats = {}) {
@@ -13682,6 +13684,7 @@ function buildStreamingSyncTaskMetadata(stats = {}) {
     syncSuccessCount: Number(stats?.successCount || 0),
     syncFailedCount: Number(stats?.failedCount || 0),
     syncSkippedCount: Number(stats?.skippedCount || 0),
+    syncExcludedCount: Number(stats?.excludedCount || 0),
     syncRemainingCount: Number(stats?.remainingCount || 0),
     syncRetryCount: Number(stats?.retryCount || 0),
     syncBlocked: Boolean(stats?.blocked),
@@ -13729,9 +13732,10 @@ async function drainStreamingDetailSyncQueue(
     syncSuccessCount: Number(result.successCount || 0),
     syncFailedCount: Number(result.failedCount || 0),
     syncSkippedCount: Number(result.skippedCount || 0),
+    syncExcludedCount: Number(result.excludedCount || 0),
     syncRemainingCount: Number(result.remainingCount || 0),
     syncRetryCount: Number(result.retryCount || 0),
-    message: `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}${Number(result.retryCount || 0) > 0 ? `，瞬时重试 ${Number(result.retryCount || 0)}` : ""}`,
+    message: `边采边同步完成：成功 ${Number(result.successCount || 0)}，失败 ${Number(result.failedCount || 0)}，跳过 ${Number(result.skippedCount || 0)}${Number(result.excludedCount || 0) > 0 ? `，超出时间范围已排除 ${Number(result.excludedCount)}` : ""}${Number(result.retryCount || 0) > 0 ? `，瞬时重试 ${Number(result.retryCount || 0)}` : ""}`,
   };
   updateProgress?.(doneProgress);
   notifyProgress?.(doneProgress);
@@ -24779,7 +24783,9 @@ async function handleSyncAll() {
       : "";
 
     if (result.ok && remainingCount <= 0) {
-      const successMessage = hasLeadsSkippedOnly
+      const successMessage = Number(result.excludedCount || 0) > 0
+        ? `同步完成：已入库 ${result.successCount} 条，超出时间范围已排除 ${result.excludedCount} 条${leadsSummary}`
+        : hasLeadsSkippedOnly
         ? `全部同步成功！共 ${result.successCount} 条。客资 0 条，已跳过${leadsSummary}`
         : `全部同步成功！共 ${result.successCount} 条${leadsSummary}`;
       showMessage(successMessage, "success");
@@ -25401,7 +25407,7 @@ async function maybeRunAutoSyncAfterDetailCapture(
     if (!silent) {
       if (result.ok) {
         showMessage(
-          `${sourceLabel}已自动同步后台：${result.successCount} 条${skippedMessage}${leadsSummary}`,
+          `${sourceLabel}已自动同步后台：${result.successCount} 条${Number(result.excludedCount || 0) > 0 ? `，超出时间范围已排除 ${result.excludedCount} 条` : ""}${skippedMessage}${leadsSummary}`,
           "success",
         );
       } else {
