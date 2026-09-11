@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import {persistCapturedContentAvailability} from './capture-content-availability.js';
 import { withTransaction } from '../db/init.js';
 import { queueCoverLocalization, queueRecordImagesLocalization } from './media-store.js';
 import {
@@ -1439,6 +1440,8 @@ export async function upsertCapturedRecord(record, context) {
         businessVisibility,
       ]);
 
+      await persistCapturedContentAvailability(tx, {tenantId, recordId: existing.id, record});
+
       await appendOfficialContentAudit(tx, {
         tenantId,
         recordId: existing.id,
@@ -1539,6 +1542,8 @@ export async function upsertCapturedRecord(record, context) {
       record.publish_location || '',
       businessVisibility,
     ]);
+
+    await persistCapturedContentAvailability(tx, {tenantId, recordId: inserted.id, record});
 
     const observation = await insertObservation(tx, {
       tenantId,

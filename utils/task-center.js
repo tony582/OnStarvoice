@@ -350,6 +350,40 @@
     return progress;
   }
 
+  // Keep only the internal identities needed to compare a BEGIN fence. Arbitrary
+  // error payloads may contain page content or credentials and are not copied.
+  function normalizeCaptureFenceErrorDetails(error = null) {
+    if (error?.code !== "unattended_begin_fence_changed") return null;
+    const details = error.details;
+    if (!details || typeof details !== "object" || Array.isArray(details)) return null;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+    const identity = (value, pattern = uuid) =>
+      typeof value === "string" && pattern.test(value) ? value : "";
+    const lock = (value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      return {
+        lockId: identity(value.lockId),
+        owner: value.owner === "unattended_keyword_plan" ? value.owner : "",
+        holderId: identity(value.holderId),
+        holderDocumentId: identity(value.holderDocumentId, /^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu),
+        holderTabId: Number.isSafeInteger(value.holderTabId) && value.holderTabId > 0
+          ? value.holderTabId
+          : null,
+        captureTaskId: identity(value.captureTaskId, /^unattended-capture:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu),
+        attemptId: identity(value.attemptId),
+      };
+    };
+    return {
+      current: typeof details.current === "boolean" ? details.current : null,
+      active: typeof details.active === "boolean" ? details.active : null,
+      lockMatchesTaskAttempt: typeof details.lockMatchesTaskAttempt === "boolean"
+        ? details.lockMatchesTaskAttempt
+        : null,
+      expected: lock(details.expected),
+      actual: lock(details.actual),
+    };
+  }
+
   function normalizeError(value) {
     if (!value) return null;
     if (typeof value === "string") {
@@ -367,6 +401,7 @@
       input.category || input.errorCategory,
       100,
     );
+    const fenceDetails = normalizeCaptureFenceErrorDetails(input);
     const securityEvidence = sanitizeStructuredValue(
       input.securityEvidence || input.security_evidence || {},
     );
@@ -375,6 +410,7 @@
       reason,
       message,
       ...(category ? {category} : {}),
+      ...(fenceDetails ? {details: fenceDetails} : {}),
       ...(input.securityBlocked === true ? {securityBlocked: true} : {}),
       ...(input.platformSafetyBlocked === true
         ? {platformSafetyBlocked: true}
@@ -1231,6 +1267,7 @@
     TERMINAL_STATUSES,
     isTerminalTaskStatus,
     normalizeTaskRun,
+    normalizeCaptureFenceErrorDetails,
     normalizeTaskLedger,
     reconcileStaleTaskLedger,
     mergeTaskRun,

@@ -527,6 +527,7 @@ function createHarness() {
       `  inspectUnattendedLocalClosurePredicate,\n` +
       `  reloadTabAndWaitForDocumentReplacement,\n` +
       `  reconcileUnattendedLocalClosureEvidence,\n` +
+      `  finalizeTerminalUnattendedAttemptExact,\n` +
       `  flush: () => captureExecutionLockOperationQueue,\n` +
       `  flushRuntime: () => runtimeMutationQueue,\n` +
       `  flushUnattended: () => unattendedRunMutationQueue,\n` +
@@ -5331,7 +5332,7 @@ test("stranded negative reconciliation fails closed when resource inventory is u
   assert.equal(harness.cloudCommandCompletions.length, 0);
 });
 
-test("the exact unattended attempt runner stays non-discardable", async () => {
+test("the exact unattended attempt runner is reused without navigation", async () => {
   const harness = createHarness();
   harness.setTabQueryHandler(async () => [
     {
@@ -5348,7 +5349,6 @@ test("the exact unattended attempt runner stays non-discardable", async () => {
   assert.deepEqual(harness.updatedTabs, [
     {
       id: 77,
-      url: "chrome-extension://test/sidebar/sidebar.html?unattendedRun=request-reuse&unattendedAttempt=request-reuse-attempt",
       active: true,
       autoDiscardable: false,
     },
@@ -15753,4 +15753,205 @@ test("sidebar acquisition fails closed when background messaging fails", () => {
       assert.doesNotMatch(releaseBlock, /finally \{/);
     },
   );
+});
+
+async function createUnattendedRunnerSourceFixture() {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    id: "runner-source-race",
+    attemptId: "runner-source-attempt",
+    runnerTabId: 42,
+    planSnapshot: buildUnattendedPlan({platform: "douyin"}),
+  });
+  const taskId = `unattended-capture:${request.id}`;
+  const holderId = "runner-source-holder";
+  const holderDocumentId = "runner-source-document";
+  const sender = buildUnattendedRunnerSender(request, holderDocumentId);
+  const runnerTab = {
+    id: 42, windowId: 1, groupId: -1, status: "complete", url: sender.tab.url,
+  };
+  harness.setTabGetHandler(async (tabId) => Number(tabId) === 42
+    ? runnerTab
+    : {id: Number(tabId), windowId: 1, groupId: -1, status: "complete",
+      url: "https://www.douyin.com/search/test?type=general"});
+  harness.setTabQueryHandler(async () =>
+    harness.removedTabIds.includes(42) ? [] : [runnerTab]);
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan", holderId, holderDocumentId, holderTabId: 42,
+  });
+  assert.equal(acquired.ok, true);
+  const begin = () => harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task", taskId,
+    attemptId: request.attemptId, sourceTabId: 41, platform: "douyin",
+    ownerRequired: false,
+  }, sender);
+  const renew = (holderTabId) => harness.api.renewCaptureExecutionLock({
+    lockId: acquired.lock.id, holderId, holderDocumentId, holderTabId,
+  });
+  const terminalizeWithCorruptRunnerBinding = ({attemptId = request.attemptId} = {}) => {
+    const terminal = seedTerminalUnattendedClosureCandidate(harness, {
+      id: request.id, attemptId, status: "failed", runnerTabId: 42,
+      recoveryCount: 0,
+      error: {code: "unattended_begin_fence_changed"},
+      progress: {current: 0, total: 2, phase: "unattended_failed"},
+    });
+    harness.storage[LOCK_KEY] = {
+      ...harness.storage[LOCK_KEY], captureTaskId: taskId,
+      captureTaskAttemptId: attemptId, holderTabId: 42,
+    };
+    seedUnattendedLocalClosureReadyMarker(harness, terminal);
+    return terminal;
+  };
+  const finalize = (terminal = request) =>
+    harness.api.finalizeTerminalUnattendedAttemptExact({
+      requestId: terminal.id, attemptId: terminal.attemptId,
+      scheduleRetry: false, syncOnSuccess: false,
+    });
+  return {harness, request, taskId, acquired, begin, renew,
+    terminalizeWithCorruptRunnerBinding, finalize};
+}
+
+test("an initial runner heartbeat during BEGIN cannot overwrite the bound platform source", async () => {
+  const {harness, taskId, begin, renew} = await createUnattendedRunnerSourceFixture();
+  let renewedDuringBegin = false;
+  harness.setStorageSetHandler(async (values) => {
+    const runtime = values?.["onstarvoice.runtime"];
+    if (renewedDuringBegin || runtime?.captureDebugSession?.taskId !== taskId ||
+        runtime?.captureTaskCancellation !== null) return;
+    renewedDuringBegin = true;
+    assert.equal(harness.storage[LOCK_KEY].holderTabId, 41);
+    const renewed = await renew(42);
+    assert.equal(renewed.ok, true);
+    assert.equal(renewed.lock.holderTabId, 41);
+  });
+  const begun = await begin();
+  assert.equal(renewedDuringBegin, true);
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(harness.storage[LOCK_KEY].holderTabId, 41);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskId).tabId, 41);
+  assert.deepEqual(harness.reloadedTabIds, []);
+});
+
+test("a late heartbeat cannot undo the exact browser source replacement", async () => {
+  const {harness, request, begin, renew} = await createUnattendedRunnerSourceFixture();
+  assert.equal((await begin()).ok, true);
+  assert.equal(await harness.api.handleCaptureRuntimeTabReplaced(44, 41), true);
+  const renewed = await renew(41);
+  assert.equal(renewed.ok, true);
+  assert.equal(renewed.lock.holderTabId, 44);
+  assert.equal(renewed.lock.captureTaskAttemptId, request.attemptId);
+});
+
+test("manual and unbound unattended heartbeats retain their existing tab update behavior", async () => {
+  for (const owner of ["manual_search_capture", "unattended_keyword_plan"]) {
+    const harness = createHarness();
+    const acquired = await harness.api.acquireCaptureExecutionLock({
+      owner, holderId: "holder", holderDocumentId: "document", holderTabId: 42,
+    });
+    const renewed = await harness.api.renewCaptureExecutionLock({
+      lockId: acquired.lock.id, holderId: "holder", holderDocumentId: "document",
+      holderTabId: 41,
+    });
+    assert.equal(renewed.ok, true, owner);
+    assert.equal(renewed.lock.holderTabId, 41, owner);
+  }
+});
+
+test("terminal cleanup and stale lock reads never reload an extension runner without source evidence", async () => {
+  const {harness, terminalizeWithCorruptRunnerBinding} =
+    await createUnattendedRunnerSourceFixture();
+  const terminal = terminalizeWithCorruptRunnerBinding();
+  for (let repeat = 0; repeat < 3; repeat += 1) {
+    const result = await harness.api.finalizeTerminalUnattendedAttemptExact({
+      requestId: terminal.id, attemptId: terminal.attemptId,
+      scheduleRetry: true, syncOnSuccess: false,
+    });
+    assert.equal(result.persisted, false);
+    assert.equal(result.reason, "source_identity_unverifiable");
+    assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "failed");
+    assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
+    assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation, undefined);
+    assert.equal(harness.storage[LOCK_KEY].holderTabId, 42);
+  }
+  harness.setContextMode("gone");
+  for (let repeat = 0; repeat < 3; repeat += 1) {
+    const retained = await harness.api.readActiveCaptureExecutionLock();
+    assert.equal(retained.holderTabId, 42);
+  }
+  assert.deepEqual(harness.reloadedTabIds, []);
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(harness.sentTabMessages.some(({tabId}) => tabId === 42), false);
+  assert.equal(harness.alarmDefinitions.has(UNATTENDED_LOCAL_CLOSURE_ALARM), false);
+});
+
+test("a corrupt runner binding closes safely through its exact committed platform source", async () => {
+  const {harness, begin, terminalizeWithCorruptRunnerBinding, finalize} =
+    await createUnattendedRunnerSourceFixture();
+  assert.equal((await begin()).ok, true);
+  const terminal = terminalizeWithCorruptRunnerBinding();
+  const result = await finalize(terminal);
+  assert.equal(result.persisted, true, JSON.stringify(result));
+  assert.deepEqual(harness.reloadedTabIds, [41]);
+  assert.deepEqual(harness.removedTabIds, [42]);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation.stage,
+    "runtime_released");
+});
+
+test("a corrupt runner binding stays blocked when its exact platform source cannot stop", async () => {
+  const {harness, begin, terminalizeWithCorruptRunnerBinding, finalize} =
+    await createUnattendedRunnerSourceFixture();
+  assert.equal((await begin()).ok, true);
+  const terminal = terminalizeWithCorruptRunnerBinding();
+  harness.setReloadHook(async (tabId) => {
+    assert.equal(tabId, 41);
+    throw new Error("platform reload not confirmed");
+  });
+  const result = await finalize(terminal);
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "previous_capture_stop_unconfirmed");
+  assert.deepEqual(harness.reloadedTabIds, [41]);
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(harness.storage[LOCK_KEY].holderTabId, 42);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation, undefined);
+});
+
+test("a corrupt binding never uses another attempt's Debug or group source to close", async () => {
+  const {harness, begin, taskId, terminalizeWithCorruptRunnerBinding, finalize} =
+    await createUnattendedRunnerSourceFixture();
+  assert.equal((await begin()).ok, true);
+  const terminal = terminalizeWithCorruptRunnerBinding({attemptId: "different-attempt"});
+  const sentBefore = harness.sentTabMessages.length;
+  const result = await finalize(terminal);
+  assert.equal(result.persisted, false);
+  assert.equal(result.reason, "source_identity_unverifiable");
+  assert.deepEqual(harness.reloadedTabIds, []);
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(harness.sentTabMessages.length, sentBefore);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskId).attemptId,
+    "runner-source-attempt");
+});
+
+test("stale source cleanup rechecks an extension navigation before its reload fallback", async () => {
+  const {harness, request, begin} = await createUnattendedRunnerSourceFixture();
+  assert.equal((await begin()).ok, true);
+  let sourceBecameExtension = false;
+  harness.setTabGetHandler(async (tabId) => ({
+    id: Number(tabId), windowId: 1, groupId: -1, status: "complete",
+    url: sourceBecameExtension
+      ? buildUnattendedRunnerSender(request, "old-document").tab.url
+      : "https://www.douyin.com/search/test?type=general",
+  }));
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload?.action === "cancelCapture") sourceBecameExtension = true;
+    return payload?.action === "inspectCaptureActivity"
+      ? {ok: true, targetActive: false, activeCount: 0}
+      : {ok: true};
+  });
+  harness.setContextMode("gone");
+  const retained = await harness.api.readActiveCaptureExecutionLock();
+  assert.equal(sourceBecameExtension, true);
+  assert.equal(retained.holderTabId, 41);
+  assert.deepEqual(harness.reloadedTabIds, []);
+  assert.deepEqual(harness.removedTabIds, []);
 });

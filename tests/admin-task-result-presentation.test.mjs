@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { orchestrationCurrentExecution, orchestrationItemTiming, orchestrationResultEvidence, resultSyncEvidence, resultTiming } from '../web/admin/src/pages/dispatch/cloud-tasks/task-result-presentation.mjs'
+import { orchestrationCurrentExecution, orchestrationItemTiming, orchestrationResultEvidence, orchestrationResultRecovery, orchestrationSearchStepLabel, resultSyncEvidence, resultTiming } from '../web/admin/src/pages/dispatch/cloud-tasks/task-result-presentation.mjs'
 
 test('a resumed two-step keyword retains its failed current execution even when the first step was completed earlier', () => {
   const item = {id: 'keyword', keyword: '凯迪拉克壁纸', item_type: 'keyword', execution_task_id: 'second-attempt', status: 'completed'}
@@ -96,4 +96,106 @@ test('reversed fallback item timestamps also suppress the invalid finish', () =>
   assert.equal(timing.source, 'item')
   assert.equal(timing.finishedAt, null)
   assert.equal(timing.invalidOrder, true)
+})
+
+test('incomplete sequential results name the actual missing search pass from the server completion contract', () => {
+  const item = {id: 'keyword', keyword: '品牌', item_type: 'keyword', status: 'retryable', metadata: {checkpoint: {
+    searchPassResults: [{keyword: '品牌', round: 1, status: 'completed'}],
+    searchPassCompletion: {expected: 2, completed: [1], missing: [2], complete: false},
+  }}}
+  const before = structuredClone(item)
+  const evidence = orchestrationResultEvidence(item, undefined, 2, ['all', 'image'])
+  assert.equal(evidence.completedStepCount, 1)
+  assert.equal(evidence.missingCompletedSteps, true)
+  assert.deepEqual(evidence.unfinishedStepLabels, ['第 2 步（图文）'])
+  const fromError = {...item, metadata: {}, error: {searchPassCompletion: {expected: 2, completed: [1], missing: [2], complete: false}}}
+  assert.deepEqual(orchestrationResultEvidence(fromError, undefined, 1, ['all', 'image']).unfinishedStepLabels, ['第 2 步（图文）'])
+  assert.equal(orchestrationSearchStepLabel(1, ['all', 'image']), '第 1 步（综合）')
+  assert.equal(orchestrationSearchStepLabel(2, ['all', 'video']), '第 2 步（视频）')
+  assert.equal(orchestrationSearchStepLabel(2), '第 2 步', 'do not invent an absent plan label')
+  assert.deepEqual(item, before)
+})
+
+test('successful retry of the same pass suppresses older failure evidence and stale error messages', () => {
+  const item = {id: 'keyword', keyword: '品牌', item_type: 'keyword', status: 'completed', error: {message: '旧启动错误'}, metadata: {checkpoint: {
+    searchPassResults: [{keyword: '品牌', round: 1, status: 'completed'}, {keyword: '品牌', round: 2, status: 'failed'}],
+  }}}
+  const execution = {id: 'new', status: 'completed', error: {message: '旧错误字段'}, checkpoint: {keywordResults: [
+    {keyword: '品牌', round: 2, status: 'completed', finishedAt: '2026-09-10T08:10:00+08:00'},
+    {keyword: '其他词', round: 1, status: 'failed'},
+    {keyword: '品牌', round: 2, status: 'failed', finishedAt: '2026-09-10T08:00:00+08:00'},
+  ]}}
+  const evidence = orchestrationResultEvidence(item, execution, 2, ['all', 'image'])
+  assert.equal(evidence.steps.length, 2)
+  assert.equal(evidence.failedStepCount, 0)
+  assert.equal(evidence.completedStepCount, 2)
+  assert.equal(evidence.childIncomplete, false)
+  assert.deepEqual(evidence.unfinishedStepLabels, [])
+  assert.deepEqual(orchestrationResultRecovery(item, execution, {parentStatus: 'completed', evidence}), {
+    state: 'completed', label: '已完成', message: '', currentError: '',
+  })
+  assert.equal(item.error.message, '旧启动错误', 'the persisted audit history stays intact')
+})
+
+test('a later failed pass remains incomplete even if an earlier result of that pass succeeded', () => {
+  const item = {id: 'keyword', keyword: '品牌', item_type: 'keyword', status: 'completed'}
+  const execution = {id: 'current', status: 'failed', checkpoint: {keywordResults: [
+    {keyword: '品牌', round: 1, status: 'completed'},
+    {keyword: '品牌', round: 2, status: 'completed', finishedAt: '2026-09-10T08:00:00+08:00'},
+    {keyword: '品牌', round: 2, status: 'partial', finishedAt: '2026-09-10T08:10:00+08:00'},
+  ]}}
+  const evidence = orchestrationResultEvidence(item, execution, 2, ['all', 'image'])
+  assert.equal(evidence.failedStepCount, 1)
+  assert.deepEqual(evidence.unfinishedStepLabels, ['第 2 步（图文）'])
+  assert.equal(orchestrationResultRecovery(item, execution, {parentStatus: 'completed', evidence}).state, 'unfinished')
+})
+
+test('recovery queue is shown only for an active automatic task whose prior execution no longer owns work', () => {
+  const item = {id: 'keyword', status: 'retryable', execution_task_id: 'old', error: {message: '启动失败', recovery: {state: 'released_for_handoff'}}}
+  const old = {id: 'old', status: 'failed'}
+  const options = {parentStatus: 'running', automaticRecovery: true}
+  assert.equal(orchestrationResultRecovery(item, old, options).state, 'queued')
+  assert.match(orchestrationResultRecovery(item, old, options).message, /尚未派发/)
+  assert.equal(orchestrationResultRecovery(item, {...old, status: 'running'}, options).state, 'blocked')
+  assert.equal(orchestrationResultRecovery(item, undefined, options).state, 'blocked')
+  assert.equal(orchestrationCurrentExecution({...item, execution_task_id: 'new-missing'}, [{...old, itemIds: [item.id]}]), undefined, 'an explicit missing current execution never falls back to old history')
+  for (const parentStatus of ['completed', 'failed', 'canceled', 'paused', 'unknown', '']) {
+    assert.notEqual(orchestrationResultRecovery(item, old, {...options, parentStatus}).state, 'queued', parentStatus)
+  }
+  assert.notEqual(orchestrationResultRecovery(item, old, {...options, automaticRecovery: false}).state, 'queued')
+  assert.notEqual(orchestrationResultRecovery({...item, status: 'failed'}, old, options).state, 'queued', 'recovery metadata alone never places a failed item in the queue')
+})
+
+test('a still-live old command blocks a handoff claim until its actual expiry', () => {
+  const now = Date.parse('2026-09-10T08:10:00+08:00')
+  const item = {id: 'keyword', status: 'retryable', execution_task_id: 'old'}
+  const old = {id: 'old', status: 'failed', command_id: 'command', command_status: 'pending', command_expires_at: '2026-09-10T08:11:00+08:00'}
+  const options = {parentStatus: 'running', automaticRecovery: true, now}
+  assert.equal(orchestrationResultRecovery(item, old, options).label, '等待原指令结算')
+  assert.equal(orchestrationResultRecovery(item, {...old, command_status: 'acknowledged'}, options).state, 'blocked')
+  assert.equal(orchestrationResultRecovery(item, {...old, command_expires_at: 'invalid'}, options).state, 'blocked')
+  assert.equal(orchestrationResultRecovery(item, {...old, command_expires_at: '2026-09-10T08:09:00+08:00'}, options).state, 'queued')
+})
+
+test('executing, verification and exhaustion labels require their corresponding current state evidence', () => {
+  const options = {parentStatus: 'running', automaticRecovery: true}
+  const running = {id: 'keyword', status: 'running', attempt_count: 2}
+  assert.equal(orchestrationResultRecovery(running, {status: 'running'}, options).label, '恢复执行中')
+  assert.notEqual(orchestrationResultRecovery(running, {status: 'failed'}, options).state, 'running')
+  assert.equal(orchestrationResultRecovery({...running, attempt_count: 1}, {status: 'running'}, options).label, '执行中')
+  const safety = {id: 'keyword', status: 'needs_action', error: {code: 'XHS_SECURITY_CHALLENGE', message: '请完成安全验证'}}
+  assert.equal(orchestrationResultRecovery(safety, {status: 'needs_action'}, options).state, 'verification')
+  const failed = {id: 'keyword', status: 'failed', attempt_count: 999, error: {message: '启动失败'}}
+  assert.equal(orchestrationResultRecovery(failed, {status: 'failed'}, options).state, 'failed', 'attempt counts cannot prove exhaustion across different recovery policies')
+  assert.equal(orchestrationResultRecovery({...failed, error: {...failed.error, recoveryLimitReached: true}}, {status: 'failed'}, options).state, 'exhausted')
+})
+
+test('legacy completed pages remain completed without fabricating missing step evidence', () => {
+  for (const status of ['completed', 'completed_with_warnings']) {
+    const item = {id: 'legacy', item_type: 'keyword', status}
+    const evidence = orchestrationResultEvidence(item, {status}, 2, ['all', 'image'])
+    assert.equal(evidence.missingCompletedSteps, false)
+    assert.deepEqual(evidence.unfinishedStepLabels, [])
+    assert.equal(orchestrationResultRecovery(item, {status}, {parentStatus: status, evidence}).state, 'completed')
+  }
 })

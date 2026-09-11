@@ -508,6 +508,7 @@ const ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES = new Set([
   'CREATE_COMMAND_EXPIRED',
   'CREATE_AGENT_UNAVAILABLE',
   'UNATTENDED_BEGIN_FENCE_CHANGED',
+  'STALE_UNATTENDED_ATTEMPT',
   'UNATTENDED_ATTEMPT_REPLACED',
   'UNATTENDED_STATUS_REPORT_TIMEOUT',
   'UNATTENDED_STATUS_REPORT_REJECTED',
@@ -1465,6 +1466,22 @@ function elasticParentAgentAttemptLimit(metadata = {}) {
   return distinctAgentCount > 0
     ? Math.min(20, distinctAgentCount)
     : AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT;
+}
+
+function elasticItemAgentAttemptLimit(parentMetadata, itemMetadata) {
+  return UUID_PATTERN.test(text(safeJson(itemMetadata).pinnedAgentId, 100))
+    ? 1 : elasticParentAgentAttemptLimit(parentMetadata);
+}
+
+function annotateSearchPassRecoveryLimit(error, {status, checkpoint, attemptCount, agentAttemptLimit}) {
+  if (!['failed', 'needs_action'].includes(status)) return;
+  const safety = crossDeviceRetryItemNeedsManualSafety({status, error, metadata: {checkpoint}});
+  const total = agentAttemptLimit * (safety ? 1 : ELASTIC_TECHNICAL_RETRY_ROUNDS);
+  if (attemptCount >= total) Object.assign(error, {
+    recoveryLimitReached: true,
+    recoveryAttemptCurrent: attemptCount,
+    recoveryAttemptTotal: total,
+  });
 }
 
 export function elasticRecoveryHoldRemainingMs(
@@ -3553,7 +3570,33 @@ function targetResultContentAvailability(entry = {}) {
   return null;
 }
 
-export function orchestrationCheckpointEntries(snapshot) {
+export function sequentialKeywordCompletionEvidence(snapshot, planSnapshot, keyword) {
+  const plan = safeJson(planSnapshot);
+  const expected = text(plan.platform, 40).toLowerCase() === 'douyin' &&
+    Array.isArray(plan.searchPasses) && plan.searchPasses.length > 1
+    ? plan.searchPasses.length
+    : 1;
+  const rows = Array.isArray(snapshot?.checkpoint?.keywordResults)
+    ? snapshot.checkpoint.keywordResults
+    : [];
+  const latest = new Map();
+  for (const row of rows) {
+    const entry = safeJson(row);
+    if (text(entry.keyword, 120) !== text(keyword, 120)) continue;
+    const round = Math.max(1, Number(entry.round) || 1);
+    if (Number.isInteger(round) && round <= expected) latest.set(round, entry);
+  }
+  const completed = [];
+  const missing = [];
+  for (let round = 1; round <= expected; round += 1) {
+    const status = checkpointEntryToItemStatus(latest.get(round) || {});
+    (['completed', 'completed_with_warnings'].includes(status)
+      ? completed : missing).push(round);
+  }
+  return {expected, completed, missing, complete: missing.length === 0};
+}
+
+export function orchestrationCheckpointEntries(snapshot, {planSnapshot} = {}) {
   const checkpoint = safeJson(snapshot?.checkpoint);
   const progress = safeJson(snapshot?.progress);
   const entries = Array.isArray(checkpoint.keywordResults)
@@ -3641,7 +3684,51 @@ export function orchestrationCheckpointEntries(snapshot) {
       ),
     });
   }
-  return Array.from(byKeyword.values());
+  const plan = safeJson(planSnapshot || safeJson(snapshot?.metadata).planSnapshot);
+  return Array.from(byKeyword.values(), entry => {
+    const completion = sequentialKeywordCompletionEvidence(snapshot, plan, entry.keyword);
+    if (completion.expected <= 1 || completion.complete) return entry;
+
+    // A successful prefix is evidence for that step, never for the complete
+    // keyword. A resumed runner can fail before it writes the missing step;
+    // preserve the real prefix and use its current failure for recovery.
+    const latestByRound = new Map((entry.searchPassResults || []).map(result =>
+      [Math.max(1, Number(result.round) || 1), result]));
+    const unsettled = completion.missing.map(round => latestByRound.get(round)).find(result =>
+      result && ['retryable', 'needs_action', 'failed', 'canceled', 'skipped']
+        .includes(checkpointEntryToItemStatus(result)));
+    const hasFailure = Boolean(unsettled);
+    const terminalCancellation = text(snapshot?.status, 80) === 'canceled';
+    const source = hasFailure ? unsettled : entry;
+    const error = {
+      ...safeJson(hasFailure ? unsettled.error : snapshot?.error),
+      code: text(hasFailure
+        ? unsettled.errorCode || unsettled.error_code || unsettled.error?.code
+        : snapshot?.error?.code, 100) || 'INCOMPLETE_SEARCH_PASSES',
+      message: text(hasFailure
+        ? unsettled.error?.message || unsettled.error
+        : snapshot?.error?.message || snapshot?.message, 1000) ||
+        '计划中的搜索步骤尚未全部完成',
+      searchPassCompletion: completion,
+    };
+    return {
+      ...entry,
+      ...(hasFailure ? source : {}),
+      searchPassResults: entry.searchPassResults,
+      round: completion.missing[0],
+      status: terminalCancellation ? 'canceled'
+        : hasFailure ? source.status
+        : taskIsActivelyExecuting ? 'running' : 'failed',
+      // A previous pass's finish time cannot finish the successor attempt.
+      finishedAt: hasFailure ? source.finishedAt
+        : taskIsActivelyExecuting ? null : snapshot?.finishedAt || null,
+      ...(!taskIsActivelyExecuting || hasFailure ? {
+        error,
+        errorCode: error.code,
+      } : {error: '', errorCode: ''}),
+      searchPassCompletion: completion,
+    };
+  });
 }
 
 function sequentialSearchResumeEntry(entry = {}, keyword = '') {
@@ -3732,6 +3819,160 @@ export function buildSequentialSearchResumeCheckpoint({
     keywordResults: completedPrefix,
     updatedAt,
   };
+}
+
+export function evaluateIncompleteSequentialItemRepair({parent, item, child, attempt} = {}) {
+  const skip = reason => ({eligible: false, reason, itemId: item?.id || ''});
+  if (!parent || !item || !child || !attempt) return skip('missing_lineage');
+  const parentMetadata = safeJson(parent.metadata);
+  const itemMetadata = safeJson(item.metadata);
+  const childMetadata = safeJson(child.metadata);
+  if (!parent.tenant_id || [item, child, attempt].some(row => row.tenant_id !== parent.tenant_id)) return skip('tenant_mismatch');
+  if (parentMetadata.distributionMode !== 'elastic_pool' || item.item_type !== 'keyword') return skip('unsupported_scope');
+  if (!['completed', 'completed_with_warnings', 'completed_with_failures', 'running', 'needs_action'].includes(parent.status)) return skip('parent_not_repairable');
+  if (parent.attention_dismissed_at || parentMetadata.historyClearedAt) return skip('parent_hidden_by_user');
+  if (parentMetadata.operatorStopped === true || parentMetadata.stopPending === true ||
+    parentMetadata.orchestrationTemplate === true ||
+    childMetadata.stopPending === true || isExplicitUserCancellationSnapshot(child, child) ||
+    ['canceled', 'skipped', 'superseded'].includes(parent.status) ||
+    ['canceled', 'revoked', 'superseded'].includes(childMetadata.terminalDisposition)) return skip('operator_or_terminal_fence');
+  if (!['completed', 'completed_with_warnings'].includes(item.status)) return skip('item_not_false_completion_candidate');
+  if (!['failed', 'needs_action', 'interrupted', 'completed_with_failures'].includes(child.status)) return skip('child_not_failed_terminal');
+  if (!['completed', 'completed_with_warnings', 'failed', 'needs_action', 'retryable'].includes(attempt.status)) return skip('attempt_not_settled');
+  if (child.id !== item.execution_task_id || child.parent_task_id !== parent.id ||
+    attempt.execution_task_id !== child.id || attempt.item_id !== item.id ||
+    attempt.parent_task_id !== parent.id || child.assigned_agent_id !== item.assigned_agent_id ||
+    attempt.agent_id !== item.assigned_agent_id ||
+    Number(attempt.assignment_revision) !== Number(item.assignment_revision) ||
+    Number(attempt.attempt_number) !== Number(item.attempt_count)) return skip('lineage_changed');
+  const completion = sequentialKeywordCompletionEvidence(child, parentMetadata.planSnapshot, item.keyword);
+  if (completion.expected <= 1 || completion.complete || completion.completed.length === 0) return skip('no_incomplete_successful_prefix');
+  const entry = orchestrationCheckpointEntries({...child, finishedAt: child.finished_at}, {planSnapshot: parentMetadata.planSnapshot})
+    .find(row => row.keyword === item.keyword);
+  if (!entry) return skip('missing_keyword_evidence');
+  const error = {...safeJson(entry.error)};
+  const checkpoint = {...entry};
+  const budget = projectElasticAttemptBudget(item, {error, checkpoint}, child.id);
+  const agentAttemptLimit = elasticItemAgentAttemptLimit(parentMetadata, itemMetadata);
+  let status = projectElasticKeywordRecoveryStatus({
+    elasticPool: true, status: checkpointEntryToItemStatus(entry), error, checkpoint,
+    attemptCount: item.attempt_count, technicalLimitReached: budget.technicalLimitReached,
+    agentAttemptLimit,
+  });
+  if (status === 'retryable' && (parentMetadata.automaticRetryDisabled === true ||
+    safeJson(safeJson(parentMetadata.planSnapshot).recoveryPolicy).allowIdleAgentHandoff === false)) {
+    status = 'needs_action';
+    error.automaticRetrySuppressed = true;
+  }
+  annotateSearchPassRecoveryLimit(error, {status, checkpoint,
+    attemptCount: Number(item.attempt_count) || 0, agentAttemptLimit});
+  const recovery = buildElasticRecoveryMetadata({status, error, checkpoint,
+    attemptCount: item.attempt_count, sourceAgentId: item.assigned_agent_id,
+    existingRecovery: elasticRecoveryMetadataForItem(item), agentAttemptLimit});
+  if (Object.keys(recovery).length) checkpoint.recovery = recovery;
+  return {eligible: true, itemId: item.id, parentTaskId: parent.id,
+    executionTaskId: child.id, attemptId: attempt.id, status, completion,
+    error, checkpoint, metadataPatch: budget.metadataPatch};
+}
+
+// Explicit, bounded maintenance only. Preview and apply use the same row locks
+// and evaluation; applying requires the fingerprint of the reviewed preview.
+// This function never dispatches work or grants an additional attempt budget.
+export async function repairIncompleteSequentialCompletions({
+  tenantId, parentTaskIds, itemIds = [], apply = false, expectedFingerprint = '',
+} = {}) {
+  const validIds = value => Array.isArray(value) && value.length <= 50 &&
+    new Set(value).size === value.length && value.every(id => UUID_PATTERN.test(String(id)));
+  if (!UUID_PATTERN.test(String(tenantId)) || !validIds(parentTaskIds) ||
+    parentTaskIds.length === 0 || !validIds(itemIds)) throw new Error('Explicit tenant and bounded parent/item UUID scope required');
+  if (apply && !/^[a-f0-9]{64}$/.test(expectedFingerprint)) throw new Error('Apply requires the reviewed preview fingerprint');
+  return withTransaction(async tx => {
+    const candidates = await tx.queryAll(`
+      SELECT item.id, item.execution_task_id
+      FROM capture_task_items item
+      WHERE item.tenant_id=$1 AND item.task_id=ANY($2::uuid[])
+        AND (cardinality($3::uuid[])=0 OR item.id=ANY($3::uuid[]))
+        AND item.item_type='keyword' AND item.status IN ('completed','completed_with_warnings')
+      ORDER BY item.id LIMIT 51
+    `, [tenantId, parentTaskIds, itemIds]);
+    if (candidates.length > 50) throw new Error('Repair scope exceeds 50 items; narrow the preview');
+    // Match live snapshot order: child, parent, item, current item attempt.
+    const children = await tx.queryAll(`SELECT * FROM capture_tasks
+      WHERE tenant_id=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR UPDATE`,
+    [tenantId, candidates.map(row => row.execution_task_id).filter(Boolean)]);
+    const parents = await tx.queryAll(`SELECT * FROM capture_tasks
+      WHERE tenant_id=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR UPDATE`, [tenantId, parentTaskIds]);
+    const items = await tx.queryAll(`SELECT * FROM capture_task_items
+      WHERE tenant_id=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR UPDATE`, [tenantId, candidates.map(row => row.id)]);
+    const attempts = await tx.queryAll(`SELECT * FROM capture_task_item_attempts
+      WHERE tenant_id=$1 AND item_id=ANY($2::uuid[]) ORDER BY item_id,attempt_number DESC FOR UPDATE`,
+    [tenantId, items.map(row => row.id)]);
+    const activeCommands = await tx.queryAll(`SELECT task_id FROM capture_agent_commands
+      WHERE tenant_id=$1 AND task_id=ANY($2::uuid[]) AND status IN ('pending','acknowledged') ORDER BY id FOR UPDATE`,
+    [tenantId, children.map(row => row.id)]);
+    const activeRecovery = await tx.queryAll(`SELECT item_id FROM capture_recovery_intents
+      WHERE tenant_id=$1 AND item_id=ANY($2::uuid[]) AND lease_expires_at>now()`,
+    [tenantId, items.map(row => row.id)]);
+    const evaluations = items.map(item => {
+      const parent = parents.find(row => row.id === item.task_id);
+      const child = children.find(row => row.id === item.execution_task_id);
+      const attempt = attempts.find(row => row.item_id === item.id);
+      const evaluation = activeCommands.some(row => row.task_id === child?.id)
+        ? {eligible: false, itemId: item.id, reason: 'active_command'}
+        : activeRecovery.some(row => row.item_id === item.id)
+          ? {eligible: false, itemId: item.id, reason: 'active_recovery_lease'}
+        : evaluateIncompleteSequentialItemRepair({parent, item, child, attempt});
+      return {item, parent, child, attempt, evaluation};
+    });
+    const fingerprint = crypto.createHash('sha256').update(JSON.stringify(evaluations.map(row => ({
+      item: row.item, parent: row.parent, child: row.child, attempt: row.attempt,
+      eligible: row.evaluation.eligible, reason: row.evaluation.reason,
+      status: row.evaluation.status,
+    })))).digest('hex');
+    if (apply && fingerprint !== expectedFingerprint) throw new Error('Repair preview changed; generate and review a fresh preview');
+    const results = evaluations.map(({item, child, attempt, evaluation}) => ({
+      itemId: item.id, parentTaskId: item.task_id, executionTaskId: item.execution_task_id,
+      eligible: evaluation.eligible, reason: evaluation.reason || '',
+      previousStatus: item.status, nextStatus: evaluation.status || item.status,
+      completion: evaluation.completion || null, error: evaluation.error || null,
+      attemptCount: item.attempt_count, previousFinishedAt: item.finished_at,
+      attemptStartedAt: attempt?.started_at || null, attemptFinishedAt: attempt?.finished_at || null,
+      sourceChildStatus: child?.status || '',
+    }));
+    if (!apply) return {applied: false, fingerprint, results};
+    const repairedParents = new Set();
+    for (const {item, parent, child, attempt, evaluation: fix} of evaluations) {
+      if (!fix.eligible) continue;
+      const terminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(fix.status);
+      const finishValues = [child.finished_at, attempt.started_at].filter(Boolean).map(value => new Date(value).getTime()).filter(Number.isFinite);
+      const finishedAt = terminal && finishValues.length ? new Date(Math.max(...finishValues)).toISOString() : null;
+      await tx.execute(`UPDATE capture_task_items SET status=$2,error=$3::jsonb,
+        metadata=metadata || $4::jsonb || jsonb_build_object('checkpoint',$5::jsonb),
+        finished_at=$6,updated_at=now() WHERE id=$1 AND tenant_id=$7`,
+      [item.id, fix.status, JSON.stringify(fix.error), JSON.stringify(fix.metadataPatch),
+        JSON.stringify(fix.checkpoint), finishedAt, tenantId]);
+      await tx.execute(`UPDATE capture_task_item_attempts SET status=$2,error=$3::jsonb,
+        checkpoint=$4::jsonb,finished_at=$5,updated_at=now() WHERE id=$1 AND tenant_id=$6`,
+      [attempt.id, orchestrationItemAttemptStatus(fix.status), JSON.stringify(fix.error),
+        JSON.stringify(fix.checkpoint), finishedAt, tenantId]);
+      await appendEvent(tx, {tenantId, taskId: parent.id, eventType: 'incomplete_search_pass_completion_repaired',
+        actorType: 'system', actorName: 'reviewed_completion_repair', status: fix.status,
+        message: `关键词「${item.keyword}」缺少计划步骤，已纠正完成状态`,
+        payload: {fingerprint, itemId: item.id, sourceExecutionTaskId: child.id, sourceAttemptId: attempt.id,
+          completion: fix.completion, previousItemStatus: item.status,
+          previousItemFinishedAt: item.finished_at, previousAttemptFinishedAt: attempt.finished_at,
+          nextStatus: fix.status, error: fix.error}});
+      repairedParents.add(parent.id);
+    }
+    for (const parentId of repairedParents) {
+      // A reviewed false completion is the only exception to the ordinary
+      // terminal-parent fence. The same transaction immediately recomputes it.
+      const parent = await tx.queryOne(`UPDATE capture_tasks SET status='running',finished_at=NULL
+        WHERE id=$1 AND tenant_id=$2 RETURNING *`, [parentId, tenantId]);
+      await refreshOrchestrationParentTask(tx, {tenantId, parentTaskId: parentId, parent});
+    }
+    return {applied: true, fingerprint, repairedCount: evaluations.filter(row => row.evaluation.eligible).length, results};
+  });
 }
 
 export function expectedElasticKeywordSearches({
@@ -5600,7 +5841,9 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       snapshotCheckpoint.activeKeyword,
     120,
   );
-  for (const entry of orchestrationCheckpointEntries(snapshot)) {
+  for (const entry of orchestrationCheckpointEntries(snapshot, {
+    planSnapshot: safeJson(parent.metadata).planSnapshot,
+  })) {
     const keyword = text(entry.keyword, 120);
     const entryErrorCode = text(
       entry.errorCode || entry.error_code || entry?.error?.code,
@@ -5680,6 +5923,9 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       status: keywordServiceAbnormal ? 'completed' : text(entry.status, 80),
       attemptCount,
       savedCount,
+      ...(entry.searchPassCompletion
+        ? {searchPassCompletion: entry.searchPassCompletion}
+        : {}),
       ...(
         keywordServiceAbnormal
         || entry.noResults === true
@@ -5782,7 +6028,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       attemptCount: serverAttemptCount,
       safetyHandoffCount: currentItemState?.safety_handoff_count,
       technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
-      agentAttemptLimit: elasticAgentAttemptLimit,
+      agentAttemptLimit: elasticItemAgentAttemptLimit(parent.metadata, currentItemState?.metadata),
     });
     const recovery = buildElasticRecoveryMetadata({
       status,
@@ -5791,8 +6037,14 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       attemptCount: serverAttemptCount,
       sourceAgentId: agent.id,
       existingRecovery: elasticRecoveryMetadataForItem(currentItemState),
-      agentAttemptLimit: elasticAgentAttemptLimit,
+      agentAttemptLimit: elasticItemAgentAttemptLimit(parent.metadata, currentItemState?.metadata),
     });
+    if (elasticPool && entry.searchPassCompletion) {
+      annotateSearchPassRecoveryLimit(error, {
+        status, checkpoint, attemptCount: serverAttemptCount,
+        agentAttemptLimit: elasticItemAgentAttemptLimit(parent.metadata, currentItemState?.metadata),
+      });
+    }
     if (Object.keys(recovery).length > 0) {
       checkpoint.recovery = recovery;
     }
@@ -12050,7 +12302,7 @@ async function synthesizePromotedKeywordItems(tx, task, sourceTaskId) {
       platform: task.platform,
     },
   });
-  const checkpointEntries = orchestrationCheckpointEntries(task);
+  const checkpointEntries = orchestrationCheckpointEntries(task, {planSnapshot});
   const checkpointByKeyword = new Map(
     checkpointEntries.map(entry => [text(entry.keyword, 120), entry]),
   );

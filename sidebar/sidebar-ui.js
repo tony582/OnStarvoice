@@ -3059,6 +3059,10 @@ function resolveDetailCaptureStatusRow(record) {
     return null;
   }
 
+  if (status === "unavailable" && payload.detailAvailability) {
+    return {text: "帖子已不可查看 · 已保留列表数据，自动跳过增强", textClass: "is-partial", actions: ""};
+  }
+
   // 增量采集:这条之前已采过、本次自动跳过(数据已在库/本地),显示"已采过"而非"未执行"
   if (payload.detailAlreadyCaptured) {
     return {

@@ -8422,7 +8422,40 @@ async function reloadTabAndWaitForDocumentReplacement(
   });
 }
 
+async function inspectUnattendedCaptureStopTarget(holderTabId) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(holderTabId);
+  } catch (error) {
+    return /no tab with id|not found|does not exist|invalid tab id/iu.test(
+      String(error?.message || error || ''),
+    )
+      ? {ok: true, method: 'tab_missing'}
+      : {ok: false, method: 'stop_unconfirmed', error};
+  }
+  try {
+    const target = new URL(String(tab?.url || ''));
+    const extension = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
+    if (target.protocol === extension.protocol && target.host === extension.host) {
+      // A runner is an orchestrator, never a content-script target. Legacy
+      // heartbeats could overwrite a bound source with this tab; reloading it
+      // cannot prove that the separate platform capture stopped.
+      return {
+        ok: false,
+        method: 'stop_unconfirmed',
+        reason: 'source_identity_unverifiable',
+        error: new Error('采集锁指向扩展运行页，无法确认原平台采集页面；已保留任务锁且未刷新运行页'),
+      };
+    }
+  } catch {
+    // Preserve the existing platform-stop checks for an unavailable URL.
+  }
+  return null;
+}
+
 async function reloadUnattendedCaptureTabAndConfirm(holderTabId) {
+  const targetState = await inspectUnattendedCaptureStopTarget(holderTabId);
+  if (targetState) return targetState;
   try {
     // tabs.reload only confirms that navigation was requested. A stale old
     // document may still answer `ping` while the tab also reports `complete`, so
@@ -8454,6 +8487,36 @@ async function stopPreviousUnattendedCaptureForResume(lock) {
   const holderTabId = Number(lock?.holderTabId);
   if (!Number.isFinite(holderTabId) || holderTabId <= 0) {
     return {ok: true, method: 'no_target'};
+  }
+  const targetState = await inspectUnattendedCaptureStopTarget(holderTabId);
+  if (targetState) {
+    if (targetState.reason === 'source_identity_unverifiable') {
+      const taskId = String(lock?.captureTaskId || '').trim();
+      const attemptId = String(lock?.captureTaskAttemptId || '').trim();
+      // Recover a legacy corrupt binding only from this exact attempt's
+      // committed source inventory. Never infer the source from the active tab.
+      const sources = taskId && attemptId
+        ? [
+            captureDebugSessionManager?.getSessionByTaskId(taskId),
+            captureTaskTabGroupManager?.getTask(taskId),
+          ].filter((snapshot) =>
+            String(snapshot?.taskId || '').trim() === taskId &&
+            String(snapshot?.attemptId || '').trim() === attemptId,
+          ).map((snapshot) => ({
+            holderTabId: snapshot.sourceTabId || snapshot.tabId,
+            captureRequestId: String(
+              snapshot.progress?.captureRequestId || lock?.captureRequestId || '',
+            ).trim(),
+          })).filter((source) =>
+            resolveCaptureTaskTabId(source.holderTabId) &&
+            Number(source.holderTabId) !== holderTabId,
+          )
+        : [];
+      if (sources.length > 0) {
+        return await stopUnattendedCaptureTargetsForRecovery(sources);
+      }
+    }
+    return targetState;
   }
 
   const captureRequestId = String(lock?.captureRequestId || '').trim();
@@ -8499,19 +8562,34 @@ async function stopUnattendedCaptureTargetsForRecovery(targets = []) {
     uniqueTargets.set(holderTabId, {
       holderTabId,
       captureRequestId: String(source.captureRequestId || '').trim(),
+      captureTaskId: String(source.captureTaskId || '').trim(),
+      captureTaskAttemptId: String(source.captureTaskAttemptId || '').trim(),
       allowReload: source.allowReload !== false,
     });
   }
+  let unverifiableSource = null;
+  const stoppedTabIds = new Set();
   for (const target of uniqueTargets.values()) {
+    if (stoppedTabIds.has(target.holderTabId)) continue;
     const result = await stopPreviousUnattendedCaptureForResume(target);
     if (!result.ok) {
+      if (result.reason === 'source_identity_unverifiable') {
+        // A corrupt runner binding must not prevent stopping the independently
+        // tracked Debug/group source, but neither is it proof of safe closure.
+        unverifiableSource = {...result, holderTabId: target.holderTabId};
+        continue;
+      }
       return {...result, holderTabId: target.holderTabId};
     }
+    for (const tabId of result.targetTabIds || [target.holderTabId]) {
+      stoppedTabIds.add(tabId);
+    }
   }
+  if (unverifiableSource) return unverifiableSource;
   return {
     ok: true,
     method: uniqueTargets.size ? 'all_stopped' : 'no_target',
-    targetTabIds: [...uniqueTargets.keys()],
+    targetTabIds: [...stoppedTabIds],
   };
 }
 
@@ -9539,6 +9617,17 @@ function collectExactUnattendedSourceStopTargets({
   debugSnapshot,
   groupSnapshot,
 } = {}) {
+  const taskId = String(
+    exactLock?.captureTaskId || buildUnattendedCaptureTaskId(request?.id),
+  ).trim();
+  const attemptId = String(request?.attemptId || '').trim();
+  const matchesAttempt = (snapshot) => Boolean(
+    taskId && attemptId &&
+    String(snapshot?.taskId || '').trim() === taskId &&
+    String(snapshot?.attemptId || '').trim() === attemptId,
+  );
+  debugSnapshot = matchesAttempt(debugSnapshot) ? debugSnapshot : null;
+  groupSnapshot = matchesAttempt(groupSnapshot) ? groupSnapshot : null;
   const captureRequestId = String(
     debugSnapshot?.progress?.captureRequestId ||
       request?.progress?.captureRequestId ||
@@ -9551,6 +9640,8 @@ function collectExactUnattendedSourceStopTargets({
     targets.push({
       holderTabId: exactLock.holderTabId,
       captureRequestId,
+      captureTaskId: exactLock.captureTaskId,
+      captureTaskAttemptId: exactLock.captureTaskAttemptId,
       ownership: 'bound_execution_lock',
     });
   }
@@ -9740,7 +9831,7 @@ async function retryUnattendedLocalClosureCleanup(request) {
       if (!stopResult.ok) {
         return {
           cleaned: false,
-          reason: 'previous_capture_stop_unconfirmed',
+          reason: stopResult.reason || 'previous_capture_stop_unconfirmed',
           stopResult,
         };
       }
@@ -11358,6 +11449,11 @@ async function renewCaptureExecutionLock({
 
     const now = Date.now();
     const normalizedHolderTabId = Number(holderTabId);
+    // BEGIN owns the unattended source binding. A runner heartbeat may still
+    // carry its initial extension tab while BEGIN is starting, or an old tab
+    // after tabs.onReplaced. Neither is authority to move the bound source.
+    const preserveUnattendedSource =
+      lock.owner === 'unattended_keyword_plan' && Boolean(lock.captureTaskId);
     const renewedLock = {
       ...lock,
       schemaVersion: CAPTURE_EXECUTION_LOCK_SCHEMA_VERSION,
@@ -11365,6 +11461,7 @@ async function renewCaptureExecutionLock({
       holderDocumentId:
         lock.holderDocumentId || String(holderDocumentId || ''),
       holderTabId:
+        !preserveUnattendedSource &&
         Number.isFinite(normalizedHolderTabId) && normalizedHolderTabId > 0
           ? normalizedHolderTabId
           : lock.holderTabId,
@@ -11555,7 +11652,6 @@ async function openUnattendedRunnerTab(
 
     if (existingRunner?.id) {
       return await chrome.tabs.update(existingRunner.id, {
-        url: runnerUrl,
         active: true,
         autoDiscardable: false,
       });

@@ -538,6 +538,7 @@ export async function checkCapturedExternalIds({ platform = '', externalIds = []
   return {
     ok: Boolean(result?.ok),
     captured: Array.isArray(result?.captured) ? result.captured : [],
+    unavailable: Array.isArray(result?.unavailable) ? result.unavailable : [],
     items: Array.isArray(result?.items) ? result.items : [],
   };
 }

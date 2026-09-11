@@ -72,6 +72,7 @@ import {
   normalizeDetailRunnerMode,
 } from './capture/detail-runner.js';
 import {createDetailPrefetchPipeline} from './capture/detail-prefetch-pipeline.js';
+import {normalizeDetailAvailability, unavailableDetailPayload, unavailableDetailResult, readDetailAvailabilitySnapshot, classifyDetailAvailabilitySnapshot} from './capture/detail-availability.js';
 import {
   clearInterruptedCommentObservation,
   repairInterruptedCommentPayload,
@@ -3418,6 +3419,7 @@ export async function batchCaptureDetailsForRecords(
     };
   }
 
+  const unavailableByRecordId = new Map();
   const buildSetupFailureResult = async ({
     code,
     message,
@@ -3501,13 +3503,14 @@ export async function batchCaptureDetailsForRecords(
           skipped: true,
           reason: 'already_captured',
           message: `${markerLabel} 之前已采过，自动跳过`,
+          ...(unavailableByRecordId.has(recordId) ? unavailableDetailResult(recordId, unavailableByRecordId.get(recordId)) : {}),
           ...captureTraceFields,
         };
         results.push(item);
         await reportProgressFailSoft(onProgress, {
           ...item,
           phase: 'detail_item_skipped',
-          message: `${progressLabel}：之前已采过，跳过（增量采集）`,
+          message: unavailableByRecordId.has(recordId) ? `${progressLabel}：帖子已不可查看，跳过增强` : `${progressLabel}：之前已采过，跳过（增量采集）`,
           current: index + 1,
           total: uniqueRecordIds.length,
           successCount: 0,
@@ -3701,30 +3704,57 @@ export async function batchCaptureDetailsForRecords(
       // ① 本地已采全(detailCaptureStatus=done)的 external_id —— 覆盖「循环内 / 同会话」重复,
       //    不依赖同步到后台(无人值守循环不会每轮自动同步,所以第2轮跳第1轮要靠这个)。
       const localDone = new Set();
+      const localDoneAt = new Map();
+      const localUnavailable = new Map();
       try {
         const pool = await getDataPool();
         for (const rec of pool?.records || []) {
+          if (resolveRecordIdentityPlatform(rec) !== probePlatform) continue;
+          const externalId = String(resolveRecordDetailNoteId(rec) || '');
+          const unavailable = normalizeDetailAvailability(rec?.payload?.detailCaptureStatus === 'unavailable' ? rec.payload.detailAvailability : null, {
+            externalId, platform: resolveRecordIdentityPlatform(rec),
+          });
+          const previous = localUnavailable.get(externalId);
+          if (unavailable && candidateExtIds.has(externalId) && (!previous || Date.parse(previous.observedAt) < Date.parse(unavailable.observedAt))) localUnavailable.set(externalId, unavailable);
           if (String(rec?.payload?.detailCaptureStatus || '') !== 'done') continue;
           const ext = resolveRecordDetailNoteId(rec);
           if (ext && candidateExtIds.has(String(ext))) {
             const normalizedExt = String(ext);
             localDone.add(normalizedExt);
+            localDoneAt.set(normalizedExt, Math.max(localDoneAt.get(normalizedExt) || 0, Number(rec.payload.detailCaptureFinishedAt) || 0));
           }
         }
       } catch (poolError) {
         console.warn('[CaptureSync] 本地已采预检失败(忽略):', poolError);
       }
 
+      for (const [externalId, availability] of localUnavailable) {
+        if ((localDoneAt.get(externalId) || 0) >= Date.parse(availability.observedAt)) localUnavailable.delete(externalId);
+      }
+
       // ② 后台已采全的 —— 覆盖「跨夜 / 跨会话」(需之前同步过)
-      const {captured} = await checkCapturedExternalIds({
+      const {captured, items = [], unavailable = []} = await checkCapturedExternalIds({
         platform: probePlatform,
         externalIds: idPairs.map((p) => p.externalId),
       });
       const capturedSet = new Set(captured);
+      for (const item of items) {
+        const previous = localUnavailable.get(item.externalId);
+        if (previous && Number(item.capturedAt) >= Date.parse(previous.observedAt)) localUnavailable.delete(item.externalId);
+      }
+      for (const value of unavailable) {
+        const normalized = normalizeDetailAvailability(value, {externalId: value.externalId, platform: probePlatform});
+        const previous = localUnavailable.get(value.externalId);
+        if (normalized && (!previous || Date.parse(normalized.observedAt) >= Date.parse(previous.observedAt))) {
+          localUnavailable.set(value.externalId, normalized);
+        }
+      }
 
       const nextSkipRecordIds = [];
       idPairs.forEach((p) => {
-        const isCaptured =
+        const unavailable = localUnavailable.get(p.externalId);
+        if (unavailable) unavailableByRecordId.set(p.recordId, unavailable);
+        const isCaptured = unavailable ||
           capturedSet.has(p.externalId) || localDone.has(p.externalId);
         if (!isCaptured) return;
         nextSkipRecordIds.push(p.recordId);
@@ -3734,14 +3764,19 @@ export async function batchCaptureDetailsForRecords(
 
       // 给跳过的记录打「已采过」标记,卡片据此显示"已采过"而非"未执行采集增强"
       for (const p of idPairs) {
+        const unavailable = unavailableByRecordId.get(p.recordId);
+        if (unavailable) {
+          await updateRecord(p.recordId, {payload: unavailableDetailPayload(p.payload, unavailable)});
+          continue;
+        }
         if (
           skipRecordIdSet.has(p.recordId) &&
           p.payload &&
-          !p.payload.detailAlreadyCaptured
+          (!p.payload.detailAlreadyCaptured || p.payload.detailAvailability)
         ) {
           try {
             await updateRecord(p.recordId, {
-              payload: { ...p.payload, detailAlreadyCaptured: true },
+              payload: { ...p.payload, detailAlreadyCaptured: true, detailAvailability: null },
             });
           } catch (markError) {
             console.warn('[CaptureSync] 标记已采过失败(忽略):', markError);
@@ -4029,12 +4064,13 @@ export async function batchCaptureDetailsForRecords(
           ok: true,
           reason: 'already_captured',
           message: `${markerLabel} 已采过，跳过`,
+          ...(unavailableByRecordId.has(recordId) ? unavailableDetailResult(recordId, unavailableByRecordId.get(recordId)) : {}),
           ...captureTraceFields,
         });
         if (onProgress) {
           await reportProgressFailSoft(onProgress, {
             phase: 'detail_item_skipped',
-            message: `${progressLabel}：之前已采过，跳过（增量采集）`,
+            message: unavailableByRecordId.has(recordId) ? `${progressLabel}：帖子已不可查看，跳过增强` : `${progressLabel}：之前已采过，跳过（增量采集）`,
             recordId,
             current: index + 1,
             total: uniqueRecordIds.length,
@@ -4321,6 +4357,7 @@ export async function batchCaptureDetailsForRecords(
               : normalizedDetailNavTimeoutMs,
             shouldStop: pipelineShouldStop,
             active: isDouyinDetailNavigation,
+            detectDetailUnavailable: detectPlatformFromUrl(candidateUrl) === 'xiaohongshu',
           });
           const remainingProbeBudgetMs = isDouyinDetailNavigation
             ? Math.max(0, douyinNavigationDeadline - Date.now())
@@ -4809,12 +4846,13 @@ export async function batchCaptureDetailsForRecords(
           ok: true,
           reason: 'already_captured',
           message: `${markerLabel} 之前已采过，自动跳过`,
+          ...(unavailableByRecordId.has(recordId) ? unavailableDetailResult(recordId, unavailableByRecordId.get(recordId)) : {}),
           ...captureTraceFields,
         });
         if (onProgress) {
           await reportProgressFailSoft(onProgress, {
             phase: 'detail_item_skipped',
-            message: `${progressLabel}：之前已采过，跳过（增量采集）`,
+            message: unavailableByRecordId.has(recordId) ? `${progressLabel}：帖子已不可查看，跳过增强` : `${progressLabel}：之前已采过，跳过（增量采集）`,
             recordId,
             current,
             total: uniqueRecordIds.length,
@@ -5177,6 +5215,12 @@ export async function batchCaptureDetailsForRecords(
         const shouldCaptureBloggerMetricsForRecord =
           includeBloggerMetrics || shouldApplyLowFollowerHitFilter;
 
+        if (recordPlatform === 'xiaohongshu') {
+          const availability = await probeDetailUnavailableInTab(runnerContext.runnerTabId, noteUrl);
+          if (availability) throw Object.assign(new Error('平台提示该帖子已不可查看'), {
+            code: 'TARGET_POST_UNAVAILABLE', detailAvailability: availability,
+          });
+        }
         activeStage = 'note_capture';
         activeDetailItemContext.activeStage = activeStage;
         const noteCaptureWorkerSnapshot = detailPrefetchPipeline.snapshot();
@@ -6177,6 +6221,27 @@ export async function batchCaptureDetailsForRecords(
         if (canceledByUser) {
           canceled = true;
         }
+        const availabilityTabId = effectiveError?.detailWorkerTabId || detailWorkerLease?.tabId;
+        const unavailable = !securityBlocked && !integrityBlocked && !canceledByUser && recordPlatform === 'xiaohongshu'
+          ? normalizeDetailAvailability(effectiveError?.detailAvailability, {externalId: extractNoteId(noteUrl), platform: recordPlatform}) || (availabilityTabId ? await probeDetailUnavailableInTab(availabilityTabId, noteUrl) : null)
+          : null;
+        if (unavailable && !shouldStopDetailBatch()) {
+          runnerContext = runnerContexts.find(context => context.runnerTabId === availabilityTabId) || runnerContext;
+          const latestRecord = (await getRecord(recordId)) || record;
+          const transition = transitionRecordCaptureTrace(latestRecord,
+            unavailableDetailPayload(latestRecord.payload, unavailable), 'skipped');
+          await updateRecord(recordId, {status: RECORD_STATUS.DRAFT, payload: transition.payload});
+          await sendCaptureTraceBindingsToTab(runnerContext.sourceTabId, [transition.binding]);
+          skippedCount += 1;
+          results.push({...unavailableDetailResult(recordId, unavailable), ...captureTraceFields});
+          await reportProgressFailSoft(onProgress, {phase: 'detail_item_skipped', recordId, current,
+            total: uniqueRecordIds.length, successCount, failedCount, skippedCount,
+            message: `${progressLabel}：帖子已不可查看，保留列表数据并继续下一条`,
+            businessOutcome: 'post_unavailable', runnerTabId: runnerContext.runnerTabId,
+            ...captureTraceFields}, 'detail unavailable settled');
+          activeDetailItemContext = null;
+          continue;
+        }
         const failure = classifyDetailCaptureFailure(effectiveError, {
           stage: activeStage,
         });
@@ -6695,7 +6760,8 @@ export async function batchCaptureDetailsForRecords(
   }).catch(() => null);
 
   if (onProgress) {
-    const skipNote = skippedCount > 0 ? `，跳过 ${skippedCount} 条(之前已采过)` : '';
+    const unavailableCount = results.filter(item => item.unavailable === true).length;
+    const skipNote = skippedCount > 0 ? `，跳过 ${skippedCount} 条（已采过或不可查看${unavailableCount ? `，其中不可查看 ${unavailableCount} 条` : ''}）` : '';
     const deferNote = deferredCount > 0 ? `，延迟增强 ${deferredCount} 条` : '';
     await reportProgressFailSoft(onProgress, {
       phase: canceled
@@ -12309,6 +12375,7 @@ function applyDetailCapturePatch(payload, patch) {
   const base = ensureDetailCaptureFields(payload);
   return {
     ...base,
+    ...(patch.detailCaptureStatus === DETAIL_CAPTURE_STATUS.DONE ? {detailAvailability: null} : {}),
     detailCaptureStatus: patch.detailCaptureStatus ?? base.detailCaptureStatus,
     detailCaptureError: patch.detailCaptureError ?? base.detailCaptureError,
     detailCaptureFailureCode:
@@ -13239,6 +13306,7 @@ async function openUrlInTab(
     timeoutMs = DETAIL_CAPTURE_NAV_TIMEOUT_MS,
     shouldStop = null,
     active = true,
+    detectDetailUnavailable = false,
   } = {},
 ) {
   const navUrl = ensureXhsNoteUrlSource(targetUrl);
@@ -13251,6 +13319,7 @@ async function openUrlInTab(
   await waitForOpenedUrlInTab(tabId, targetUrl, {
     timeoutMs,
     shouldStop,
+    detectDetailUnavailable,
   });
 }
 
@@ -13260,6 +13329,7 @@ async function waitForOpenedUrlInTab(
   {
     timeoutMs = DETAIL_CAPTURE_NAV_TIMEOUT_MS,
     shouldStop = null,
+    detectDetailUnavailable = false,
   } = {},
 ) {
   const targetNoteId = extractNoteId(targetUrl);
@@ -13289,6 +13359,12 @@ async function waitForOpenedUrlInTab(
     const noteMatched =
       targetIdentityMatched &&
       isTargetNoteOpened(currentUrl, targetUrl, targetNoteId);
+    if (detectDetailUnavailable && status === 'complete') {
+      const availability = await probeDetailUnavailableInTab(tabId, targetUrl);
+      if (availability) throw Object.assign(new Error('平台提示该帖子已不可查看'), {
+        code: 'TARGET_POST_UNAVAILABLE', detailAvailability: availability,
+      });
+    }
     if (status === 'complete' && noteMatched) {
       return;
     }
@@ -15478,6 +15554,18 @@ async function classifyTargetPageAvailabilityInTab(tabId, targetUrl) {
     );
     return null;
   }
+}
+
+async function probeDetailUnavailableInTab(tabId, targetUrl) {
+  if (detectPlatformFromUrl(targetUrl) !== 'xiaohongshu') return null;
+  try {
+    const [execution] = await chrome.scripting.executeScript({
+      target: {tabId: Number(tabId)}, func: readDetailAvailabilitySnapshot,
+    });
+    return classifyDetailAvailabilitySnapshot(execution?.result, {
+      targetUrl, classifySnapshot: targetPageAvailabilityApi?.classifySnapshot,
+    });
+  } catch { return null; }
 }
 
 function buildUnavailableBatchCaptureResult(url, unavailablePage = null) {

@@ -1,3 +1,4 @@
+import {loadUnavailableCapturedExternalIds} from '../services/capture-content-availability.js';
 import { Router } from 'express';
 import { optionalCaptureAgent, requireAuth } from '../middleware/auth.js';
 import { labelRecord } from '../services/ai-labeler.js';
@@ -546,10 +547,13 @@ router.post('/captured', requireAuth, async (req, res) => {
     }
     sql += ' ORDER BY external_id, updated_at DESC';
     const rows = await queryAll(sql, params);
+    const unavailable = await loadUnavailableCapturedExternalIds({queryAll}, {tenantId: req.tenantId, platform, externalIds});
+    const unavailableIds = new Set(unavailable.map(item => item.externalId));
     return res.json({
       ok: true,
-      captured: rows.map((r) => r.external_id),
-      items: rows.map((r) => {
+      unavailable,
+      captured: rows.filter(r => !unavailableIds.has(r.external_id)).map((r) => r.external_id),
+      items: rows.filter(r => !unavailableIds.has(r.external_id)).map((r) => {
         const payloadCapturedAt = Number(r.detail_capture_finished_at || 0);
         const rowUpdatedAt = Date.parse(String(r.updated_at || ''));
         return {

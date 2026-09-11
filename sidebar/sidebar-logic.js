@@ -107,6 +107,7 @@ import {setCancelFlag, wait} from "../utils/scroll.js";
 import {repairInterruptedCommentPayload} from "../utils/capture-recovery.js";
 import {
   buildDiagnosticsText,
+  normalizeCaptureFenceErrorDetails,
   recordDiagnosticAction,
   recordDiagnosticError,
   recordDiagnosticTask,
@@ -18963,6 +18964,7 @@ function buildUnattendedTerminalProgress({
   keyword = "",
   keywords = [],
   roundTotal = 1,
+  roundCurrent = null,
   streamingSync = null,
   captureTaskId = "",
   requestId = "",
@@ -18980,6 +18982,14 @@ function buildUnattendedTerminalProgress({
   const processed = Math.min(
     Math.max(0, Number(taskTotal) || 0),
     completed + partial + failed + skipped,
+  );
+  const total = Math.max(0, Number(taskTotal) || 0);
+  const terminalRound = Math.min(
+    Math.max(1, Number(roundTotal) || 1),
+    Math.max(
+      1,
+      Number(roundCurrent ?? previous.roundCurrent ?? previous.round) || 1,
+    ),
   );
   const sync =
     streamingSync && typeof streamingSync === "object" ? streamingSync : {};
@@ -19031,12 +19041,14 @@ function buildUnattendedTerminalProgress({
     nextKeyword: "",
     progressScope: "terminal",
     phase: `unattended_${String(status || "completed").trim()}`,
-    lastBusinessPhase: "streaming_sync_done",
-    progressPercent: 100,
+    lastBusinessPhase: sync.drainCompleted === true
+      ? "streaming_sync_done"
+      : String(previous.lastBusinessPhase || previous.phase || ""),
+    progressPercent: total > 0 ? Math.round((processed / total) * 100) : null,
     remainingMs: 0,
     waitUntil: "",
-    round: Math.max(1, Number(roundTotal) || 1),
-    roundCurrent: Math.max(1, Number(roundTotal) || 1),
+    round: terminalRound,
+    roundCurrent: terminalRound,
     roundTotal: Math.max(1, Number(roundTotal) || 1),
     runStartedAt: String(runStartedAt || previous.runStartedAt || ""),
     finishedAt: String(finishedAt || ""),
@@ -19346,6 +19358,7 @@ async function runUnattendedKeywordPlanRequest(request) {
           keyword: checkpoint.activeKeyword || "",
           keywords,
           roundTotal: plannedRounds,
+          roundCurrent: checkpoint.round,
           requestId,
           attemptId: requestAttemptId,
           runStartedAt: request?.startedAt || "",
@@ -19417,6 +19430,7 @@ async function runUnattendedKeywordPlanRequest(request) {
       keyword: checkpoint.activeKeyword || startingProgress.keyword,
       keywords,
       roundTotal: plannedRounds,
+      roundCurrent: checkpoint.round,
       streamingSync,
       captureTaskId: unattendedCaptureTaskContext?.taskId || "",
       requestId,
@@ -20227,6 +20241,7 @@ async function runUnattendedKeywordPlanRequest(request) {
         terminalStatus === "canceled" || needsAction ? "warning" : "error",
       );
       const finishedAt = new Date().toISOString();
+      const fenceDetails = normalizeCaptureFenceErrorDetails(error);
       await reportUnattendedTerminalRun(
         requestId,
         {
@@ -20253,6 +20268,7 @@ async function runUnattendedKeywordPlanRequest(request) {
                     ? "PLATFORM_SAFETY_BLOCK"
                     : error?.code || "",
                   message: terminalMessage,
+                  ...(fenceDetails ? {details: fenceDetails} : {}),
                   ...(cloudTechnicalRecovery
                     ? {
                         retryable: true,

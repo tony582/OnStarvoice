@@ -1276,16 +1276,28 @@ export function OrchestrationDetailWorkspace({
     .map(value => value === 'all' ? '综合' : CONTENT_TYPE_LABELS[value] || value)
     .join(' → ')
   const idleHandoffAllowed = elasticPool || recoveryPolicy.allowIdleAgentHandoff !== false
+  const automaticRecoveryAllowed = elasticPool
+    && metadata.automaticRetryDisabled !== true
+    && recoveryPolicy.allowIdleAgentHandoff !== false
   const orchestrationFinal = FINAL_ORCHESTRATION_STATUSES.has(
     String(orchestration.status || ''),
   )
   const resultPresentation = !scheduleTemplate && (resultView || orchestrationFinal)
   const automaticKeywordRecoveryActive = Boolean(
-    elasticPool &&
-    idleHandoffAllowed &&
+    automaticRecoveryAllowed &&
     !orchestrationFinal &&
     keywordRetryItems.some(item => item.status === 'retryable'),
   )
+  const resultRecoveryActions: Record<string, {label: string; href: string}> = {}
+  if (!resultView && writable && !automaticKeywordRecoveryActive && !keywordRetrying) {
+    for (const item of keywordRetryItems) {
+      if (item.error?.recoveryLimitReached === true) continue
+      resultRecoveryActions[item.id] = {label: '前往“重试失败关键词”', href: `#keyword-retry-${orchestration.id}`}
+    }
+  }
+  if (!resultView && writable && !attentionAction && attentionContext?.currentItem && !attentionContext.sourceEnded) {
+    resultRecoveryActions[attentionContext.currentItem.id] = {label: '前往验证后的恢复操作', href: `#keyword-verification-${orchestration.id}`}
+  }
   return (
     <section className={cn('overflow-hidden rounded-[22px] border border-border/70 bg-card shadow-sm', className)}>
       <header className="border-b border-border/70 px-4 py-4 sm:px-5">
@@ -1431,7 +1443,7 @@ export function OrchestrationDetailWorkspace({
           </section>
         )}
         {!resultView && attentionContext && (
-          <section className="mb-4 rounded-2xl border border-status-red/25 bg-status-red/[0.035] p-4" role="alert">
+          <section id={`keyword-verification-${orchestration.id}`} className="mb-4 rounded-2xl border border-status-red/25 bg-status-red/[0.035] p-4" role="alert">
             <div className="flex items-start gap-3">
               <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-status-red/10 text-status-red">
                 <ShieldAlert className="h-4.5 w-4.5" />
@@ -1506,7 +1518,7 @@ export function OrchestrationDetailWorkspace({
           </section>
         )}
         {!resultView && keywordRetryItems.length > 0 && (
-          <section className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4">
+          <section id={`keyword-retry-${orchestration.id}`} className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex min-w-0 items-start gap-3">
                 <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
@@ -1938,7 +1950,7 @@ export function OrchestrationDetailWorkspace({
           )}
         </section>
 
-        {resultPresentation ? <><OrchestrationResultReport items={sortedItems} executions={executions} agents={agents} attempts={attempts} expectedSearchPasses={searchPasses.length || 1} /><div className="mt-4"><TaskResultRecords key={orchestration.id} taskId={orchestration.id} refreshKey={refreshKey} /></div></> : !contentPatrol && !scheduleTemplate ? (
+        {resultPresentation ? <><OrchestrationResultReport items={sortedItems} executions={executions} agents={agents} attempts={attempts} expectedSearchPasses={searchPasses.length || 1} searchPasses={searchPasses} parentStatus={orchestration.status} automaticRecovery={automaticRecoveryAllowed} now={nowMs} recoveryActions={resultRecoveryActions} /><div className="mt-4"><TaskResultRecords key={orchestration.id} taskId={orchestration.id} refreshKey={refreshKey} /></div></> : !contentPatrol && !scheduleTemplate ? (
           <div className="mt-4">
             <KeywordExecutionReport
               items={unattendedNegativePatrol ? keywordItems : sortedItems}

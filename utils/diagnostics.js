@@ -1,3 +1,4 @@
+import "./task-center.js";
 import {STORAGE_KEY} from "./constants.js";
 import {
   getAuth,
@@ -696,6 +697,10 @@ function sanitizeStageMetrics(metrics = {}, depth = 0) {
   return safe;
 }
 
+export function normalizeCaptureFenceErrorDetails(error = null) {
+  return globalThis.OnStarvoiceTaskCenterCore.normalizeCaptureFenceErrorDetails(error);
+}
+
 function normalizeError(error = null, fallbackCode = "unknown_error") {
   const source = error && typeof error === "object" ? error : {};
   const code = normalizeText(
@@ -712,9 +717,11 @@ function normalizeError(error = null, fallbackCode = "unknown_error") {
       (typeof error === "string" ? error : ""),
   );
 
+  const fenceDetails = normalizeCaptureFenceErrorDetails(source);
   return {
     code: healthCode(code, 120, fallbackCode),
     message: sanitizeDiagnosticText(message),
+    ...(fenceDetails ? {details: fenceDetails} : {}),
   };
 }
 
