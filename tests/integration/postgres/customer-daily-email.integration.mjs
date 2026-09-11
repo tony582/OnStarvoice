@@ -35,6 +35,7 @@ test('daily email PostgreSQL queue freezes reports and recipients, deduplicates 
   for(const migration of ['081_customer_daily_reports','083_customer_daily_email_deliveries']) {
     await pool.query(await readFile(new URL(`../../../server/db/migrations/${migration}.sql`,import.meta.url),'utf8'));
   }
+  await pool.query("CREATE TABLE audit_logs (tenant_id UUID,actor_type TEXT,actor_id TEXT,action TEXT,target_type TEXT,target_id TEXT,metadata JSONB)");
   const db=database(pool);
 
   async function fixture(subtest,{ready=true,sendResult}={}) {
@@ -72,6 +73,29 @@ test('daily email PostgreSQL queue freezes reports and recipients, deduplicates 
     assert.equal((await f.service.enqueue(f.tenantId,f.reportId)).status,'sent');
     assert.equal(await f.restart().processOne(),false);
     assert.equal(f.calls.length,1);
+  });
+
+  await t.test('explicit resends rotate identity once, retain receipts and reject stale replay after completion',async subtest=>{
+    const f=await fixture(subtest);
+    await f.service.enqueue(f.tenantId,f.reportId);await f.service.processOne();
+    const first=await f.service.delivery(f.tenantId,f.reportId);
+    assert.ok(first.sendId);
+    await db.execute('UPDATE customer_daily_report_settings SET config=$2::jsonb WHERE tenant_id=$1',[f.tenantId,JSON.stringify({emailRecipients:'changed@example.test'})]);
+    await Promise.all(Array.from({length:5},()=>f.service.enqueue(f.tenantId,f.reportId,{resendOf:first.sendId,actorId:'tester'})));
+    await Promise.all([f.service.processOne(),f.restart().processOne()]);
+    assert.equal(f.calls.length,2);
+    assert.notEqual(f.calls[0].messageId,f.calls[1].messageId);
+    assert.equal(f.calls[1].to,f.calls[0].to);
+    await f.service.enqueue(f.tenantId,f.reportId,{resendOf:first.sendId});
+    assert.equal(await f.service.processOne(),false);
+    const second=await f.service.delivery(f.tenantId,f.reportId);
+    assert.notEqual(second.sendId,first.sendId);
+    await f.service.enqueue(f.tenantId,f.reportId,{resendOf:second.sendId});await f.service.processOne();
+    assert.equal(f.calls.length,3);
+    const history=await db.queryAll('SELECT metadata FROM audit_logs WHERE tenant_id=$1',[f.tenantId]);
+    assert.equal(history.length,2);assert.equal(history[0].metadata.previousDeliveryId,first.sendId);
+    assert.equal(history[0].metadata.messageId,'smtp-accepted');
+    await assert.rejects(f.service.enqueue(f.tenantId,f.reportId,{resendOf:'bad'}),{code:'daily_resend_invalid'});
   });
 
   await t.test('tenant boundaries hold for enqueue, reads and the composite foreign key',async subtest=>{

@@ -270,7 +270,7 @@ function CustomerDailyReportWorkspace() {
     setNotice(null)
     setDeliveryNotice(null)
     try {
-      const data = await api.post<{ report: DailyReport }>(`${DAILY_API}/${encodeURIComponent(report.id)}/${action}`, { allowIncomplete: true, ...(action === 'send' && previousFormalDelivery ? { correction: true } : {}) })
+      const data = await api.post<{ report: DailyReport }>(`${DAILY_API}/${encodeURIComponent(report.id)}/${action}`, { allowIncomplete: true, ...(action === 'send' && deliveryStatus === 'sent' ? { resendOf: delivery?.sendId } : {}), ...(action === 'send' && previousFormalDelivery ? { correction: true } : {}) })
       if (!mounted.current) return
       if (data.report.id !== report.id) {
         const detail = await api.get<ReportResponse>(`${DAILY_API}/${encodeURIComponent(data.report.id)}`)
@@ -295,12 +295,12 @@ function CustomerDailyReportWorkspace() {
   }
 
   async function sendEmail() {
-    if (!report || !canWrite() || operation.current || emailProcessing || emailUnknown || emailStatus === 'sent' || summaryDraft || !settings?.emailReady) return
+    if (!report || !canWrite() || operation.current || emailProcessing || emailUnknown || (emailStatus === 'sent' && !emailDelivery?.sendId) || summaryDraft || !settings?.emailReady) return
     operation.current = true
     setBusy('email')
     setDeliveryNotice(null)
     try {
-      const data = await api.post<{ report: DailyReport }>(`${DAILY_API}/${encodeURIComponent(report.id)}/email`)
+      const data = await api.post<{ report: DailyReport }>(`${DAILY_API}/${encodeURIComponent(report.id)}/email`, emailStatus === 'sent' ? { resendOf: emailDelivery?.sendId } : {})
       if (!mounted.current) return
       setCurrent(value => value?.report.id === data.report.id ? { ...value, report: { ...data.report, snapshot: data.report.snapshot || value.report.snapshot } } : value)
       setReports(items => items.map(item => item.id === data.report.id ? data.report : item))
@@ -393,12 +393,12 @@ function CustomerDailyReportWorkspace() {
           <div className="min-w-0"><p className="text-xs font-medium text-slate-700">飞书群 · {settings?.chatName || delivery?.chatName || '尚未配置'}</p><p role="status" aria-live="polite" className={`mt-1 text-xs ${deliveryStatus === 'needs_attention' ? 'text-rose-700' : deliveryStatus === 'sent' ? 'text-emerald-700' : 'text-slate-500'}`}>{deliveryLabels[deliveryStatus]}{delivery?.sentAt ? ` · ${dailyTime(delivery.sentAt)}` : ''}</p></div>
           <div className="flex flex-wrap gap-2">
             {documentUrl ? <a className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 px-3 text-xs font-medium text-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary" href={documentUrl} target="_blank" rel="noopener noreferrer">飞书工作文档<ExternalLink className="h-3.5 w-3.5" /></a> : <Button size="sm" variant="outline" onClick={() => void deliver('document')} disabled={!report || disabled || processing || unknownResult || !canWrite()}>{busy === 'document' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileText className="h-3.5 w-3.5" />}生成飞书文档</Button>}
-            <Button size="sm" onClick={() => void deliver('send')} disabled={!report || disabled || processing || unknownResult || deliveryStatus === 'sent' || !canWrite()}>{busy === 'send' || processing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}{deliveryStatus === 'sent' ? '已发送到群' : previousFormalDelivery ? '发送更正版' : deliveryStatus === 'needs_attention' ? '继续发送' : '发送到飞书群'}</Button>
+            <Button size="sm" onClick={() => void deliver('send')} disabled={!report || disabled || processing || unknownResult || (deliveryStatus === 'sent' && !delivery?.sendId) || !canWrite()}>{busy === 'send' || processing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}{deliveryStatus === 'sent' ? '再次发送到群' : previousFormalDelivery ? '发送更正版' : deliveryStatus === 'needs_attention' ? '继续发送' : '发送到飞书群'}</Button>
           </div>
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0"><p className="break-all text-xs font-medium text-slate-700">邮件 · {emailDelivery?.recipients || settings?.emailRecipients || '尚未配置收件人'}</p><p role="status" aria-live="polite" className={`mt-1 text-xs ${emailStatus === 'failed' ? 'text-rose-700' : emailStatus === 'sent' ? 'text-emerald-700' : 'text-slate-500'}`}>{emailStatus === 'sent' ? '已发送邮件' : emailStatus === 'working' ? '正在发送邮件' : emailStatus === 'queued' ? '邮件已提交，等待发送' : emailStatus === 'failed' ? emailUnknown ? '发送结果待确认' : '邮件发送失败' : '尚未发送邮件'}{emailDelivery?.sentAt ? ` · ${dailyTime(emailDelivery.sentAt)}` : ''}</p></div>
-          <Button size="sm" variant="outline" onClick={() => void sendEmail()} disabled={!report || disabled || emailProcessing || emailUnknown || emailStatus === 'sent' || !canWrite() || !settings?.emailReady}>{busy === 'email' || emailProcessing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Mail className="h-3.5 w-3.5" />}{emailStatus === 'sent' ? '邮件已发送' : emailStatus === 'failed' && !emailUnknown ? '重试邮件发送' : '发送邮件'}</Button>
+          <Button size="sm" variant="outline" onClick={() => void sendEmail()} disabled={!report || disabled || emailProcessing || emailUnknown || (emailStatus === 'sent' && !emailDelivery?.sendId) || !canWrite() || !settings?.emailReady}>{busy === 'email' || emailProcessing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Mail className="h-3.5 w-3.5" />}{emailStatus === 'sent' ? '再次发送邮件' : emailStatus === 'failed' && !emailUnknown ? '重试邮件发送' : '发送邮件'}</Button>
         </div>
         {deliveryNotice && <p role={deliveryNotice.kind === 'error' ? 'alert' : 'status'} className={`rounded-lg px-3 py-2 text-xs leading-5 ${deliveryNotice.kind === 'error' ? 'bg-rose-50 text-rose-800' : 'bg-emerald-50 text-emerald-800'}`}>{deliveryNotice.text}</p>}
         {delivery?.error && delivery.error !== deliveryNotice?.text && <p role="alert" className="text-xs leading-5 text-rose-700">{delivery.error}</p>}

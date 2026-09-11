@@ -27,7 +27,7 @@ export function createCustomerDailyReportRouter(service = customerDailyReports) 
     return res.json({ok:true,report});
   }));
   router.post('/:id/email',requireTenantWriter,handle(async (req,res) => {
-    const report = await service.sendEmail(req.tenantId,req.params.id);
+    const report = await service.sendEmail(req.tenantId,req.params.id,{resendOf:req.body?.resendOf,actorId:req.user?.id});
     return res.status(202).json({ok:true,report});
   }));
   router.get('/:id',handle(async (req,res) => {
@@ -57,7 +57,7 @@ export function createCustomerDailyReportRouter(service = customerDailyReports) 
     return res.send(buffer);
   }));
   for (const action of ['document','send']) router.post(`/:id/${action}`,requireTenantWriter,handle(async (req,res) => {
-    const report = await service.enqueue(req.tenantId,req.params.id,{send:action === 'send',allowIncomplete:req.body?.allowIncomplete === true,correction:action === 'send' && req.body?.correction === true});
+    const report = await service.enqueue(req.tenantId,req.params.id,{send:action === 'send',allowIncomplete:req.body?.allowIncomplete === true,correction:action === 'send' && req.body?.correction === true,resendOf:action === 'send' ? req.body?.resendOf : undefined,actorId:req.user?.id});
     return res.status(202).json({ok:true,report});
   }));
   return router;

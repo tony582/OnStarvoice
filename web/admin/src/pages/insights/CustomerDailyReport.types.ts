@@ -70,6 +70,7 @@ export type DailyReport = {
   generatedAt: string
   snapshot?: DailySnapshot
   delivery?: {
+    sendId?: string
     status: 'none' | 'queued' | 'working' | 'retry_wait' | 'needs_attention' | 'document_ready' | 'sent'
     documentId?: string
     documentUrl?: string
@@ -80,6 +81,7 @@ export type DailyReport = {
     canRetry?: boolean
   }
   emailDelivery?: {
+    sendId?: string
     status: 'none' | 'queued' | 'working' | 'failed' | 'sent'
     recipients?: string
     sentAt?: string | null

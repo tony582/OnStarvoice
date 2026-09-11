@@ -1,3 +1,4 @@
+import {requeueDailySuccess,validateDailyResend} from './customer-daily-resend.js';
 import {randomUUID} from 'node:crypto';
 import {queryAll,queryOne,execute,withTransaction} from '../db/init.js';
 import {sendTenantEmail,tenantEmailReadiness} from './email-notifier.js';
@@ -9,7 +10,7 @@ const iso = value => value ? new Date(value).toISOString() : null;
 
 export function publicDailyEmailDelivery(row) {
   if (!row) return {status:'none',canRetry:false,ambiguous:false};
-  return {status:row.status,recipients:row.recipients,sentAt:iso(row.sent_at),error:row.error_message || null,
+  return {sendId:row.id,status:row.status,recipients:row.recipients,sentAt:iso(row.sent_at),error:row.error_message || null,
     ambiguous:!!row.ambiguous,canRetry:row.status === 'failed' && !row.ambiguous};
 }
 
@@ -47,21 +48,27 @@ export function createCustomerDailyEmailService({db = defaultDb,send = sendTenan
   }
 
   async function delivery(tenantId,reportId) {
-    return publicDailyEmailDelivery(await db.queryOne('SELECT status,recipients,sent_at,error_message,ambiguous FROM customer_daily_email_deliveries WHERE tenant_id=$1 AND report_id=$2',[tenantId,reportId]));
+    return publicDailyEmailDelivery(await db.queryOne('SELECT id,status,recipients,sent_at,error_message,ambiguous FROM customer_daily_email_deliveries WHERE tenant_id=$1 AND report_id=$2',[tenantId,reportId]));
   }
 
   async function deliveries(tenantId,reportIds) {
     if (!reportIds.length) return new Map();
-    const rows = await db.queryAll('SELECT report_id,status,recipients,sent_at,error_message,ambiguous FROM customer_daily_email_deliveries WHERE tenant_id=$1 AND report_id=ANY($2::uuid[])',[tenantId,reportIds]);
+    const rows = await db.queryAll('SELECT id,report_id,status,recipients,sent_at,error_message,ambiguous FROM customer_daily_email_deliveries WHERE tenant_id=$1 AND report_id=ANY($2::uuid[])',[tenantId,reportIds]);
     return new Map(rows.map(row => [row.report_id,publicDailyEmailDelivery(row)]));
   }
 
-  async function enqueue(tenantId,reportId) {
+  async function enqueue(tenantId,reportId,{resendOf,actorId} = {}) {
+    validateDailyResend(resendOf);
     await db.withTransaction(async tx => {
       await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`daily-email:${tenantId}:${reportId}`]);
       const report = await tx.queryOne('SELECT snapshot,report_date::text AS report_date,version FROM customer_daily_reports WHERE tenant_id=$1 AND id=$2',[tenantId,reportId]);
       if (!report) throw dailyError('日报不存在',404,'daily_report_not_found');
       const previous = await tx.queryOne('SELECT * FROM customer_daily_email_deliveries WHERE tenant_id=$1 AND report_id=$2 FOR UPDATE',[tenantId,reportId]);
+      if (previous?.status === 'sent' && resendOf) {
+        if (!(await readiness(tenantId)).ready) throw dailyError('邮件服务尚未配置。',409,'daily_email_not_configured');
+        await requeueDailySuccess(tx,{table:'customer_daily_email_deliveries',tenantId,reportId,resendOf,actorId});
+        return;
+      }
       if (previous && !(previous.status === 'failed' && !previous.ambiguous)) return;
       if (!(await readiness(tenantId)).ready) throw dailyError('邮件服务尚未配置，请联系管理员在设置中配置。',409,'daily_email_not_configured');
       if (previous) {

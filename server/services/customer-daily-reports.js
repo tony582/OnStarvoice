@@ -1,3 +1,4 @@
+import {requeueDailySuccess,validateDailyResend} from './customer-daily-resend.js';
 import { randomUUID } from 'node:crypto';
 import {queryAll, queryOne, execute, withTransaction} from '../db/init.js';
 import {collectCustomerDailyReport, dailyPeriod} from './customer-daily-report-data.js';
@@ -115,11 +116,11 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     const config = await rawConfig(tenantId);
     let targetKey = null;
     try { targetKey = dailyTargetKey(resolvedDailyConfig(config, tenantId, env)); } catch { /* Missing encryption key must not block reading snapshots. */ }
-    const delivery = targetKey ? await db.queryOne('SELECT status,message_id,sent_at,error_message,ambiguous,config FROM customer_daily_deliveries WHERE tenant_id=$1 AND report_id=$2 AND target_key=$3', [tenantId,id,targetKey]) : null;
+    const delivery = targetKey ? await db.queryOne('SELECT id,status,message_id,sent_at,error_message,ambiguous,config FROM customer_daily_deliveries WHERE tenant_id=$1 AND report_id=$2 AND target_key=$3', [tenantId,id,targetKey]) : null;
     const blockingDoc = doc && doc.status !== 'ready';
     const state = blockingDoc ? doc : delivery || doc;
     const status = state?.status === 'ready' ? 'document_ready' : state?.status === 'canceled' ? 'needs_attention' : state?.status || 'none';
-    return {id:row.id,reportDate:dateText(row.report_date),mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),...(includeSnapshot ? {snapshot:row.snapshot} : {}),emailDelivery:await emailService.delivery(tenantId,id),delivery:{status,documentId:doc?.document_id,documentUrl:doc?.document_url,messageId:delivery?.message_id,sentAt:iso(delivery?.sent_at),error:state?.error_message,ambiguous:state?.ambiguous || false,canRetry:!!state && !state.ambiguous && !['working','sent'].includes(status),chatName:delivery?.config?.chatName || config.chatName || ''}};
+    return {id:row.id,reportDate:dateText(row.report_date),mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),...(includeSnapshot ? {snapshot:row.snapshot} : {}),emailDelivery:await emailService.delivery(tenantId,id),delivery:{status,sendId:delivery?.id,documentId:doc?.document_id,documentUrl:doc?.document_url,messageId:delivery?.message_id,sentAt:iso(delivery?.sent_at),error:state?.error_message,ambiguous:state?.ambiguous || false,canRetry:!!state && !state.ambiguous && !['working','sent'].includes(status),chatName:delivery?.config?.chatName || config.chatName || ''}};
   }
   async function list(tenantId, date) {
     if (date) dailyPeriod(date, now());
@@ -128,7 +129,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     try { targetKey=dailyTargetKey(resolvedDailyConfig(config,tenantId,env)); } catch { /* Snapshots stay readable with missing credentials. */ }
     const rows = await db.queryAll(`SELECT r.id,r.report_date::text AS report_date,r.mode,r.version,r.generated_at,
       d.status AS document_status,d.document_id,d.document_url,d.error_message AS document_error,d.ambiguous AS document_ambiguous,
-      m.status AS message_status,m.message_id,m.sent_at,m.error_message AS message_error,m.ambiguous AS message_ambiguous,m.config->>'chatName' AS chat_name
+      m.id AS message_delivery_id,m.status AS message_status,m.message_id,m.sent_at,m.error_message AS message_error,m.ambiguous AS message_ambiguous,m.config->>'chatName' AS chat_name
       FROM customer_daily_reports r LEFT JOIN customer_daily_documents d ON d.report_id=r.id AND d.tenant_id=r.tenant_id
       LEFT JOIN customer_daily_deliveries m ON m.report_id=r.id AND m.tenant_id=r.tenant_id AND m.target_key=$3
       WHERE r.tenant_id=$1 AND ($2::date IS NULL OR r.report_date=$2::date) ORDER BY r.report_date DESC,r.version DESC LIMIT 50`,[tenantId,date || null,targetKey]);
@@ -138,7 +139,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
       const rawStatus=blockingDoc ? row.document_status : row.message_status || row.document_status || 'none';
       const status=rawStatus === 'ready' ? 'document_ready' : rawStatus === 'canceled' ? 'needs_attention' : rawStatus;
       const ambiguous=Boolean(blockingDoc ? row.document_ambiguous : row.message_ambiguous || row.document_ambiguous);
-      return {id:row.id,reportDate:row.report_date,mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),emailDelivery:emailDeliveries.get(row.id) || publicDailyEmailDelivery(null),delivery:{status,documentId:row.document_id,documentUrl:row.document_url,messageId:row.message_id,sentAt:iso(row.sent_at),error:blockingDoc ? row.document_error : row.message_error || row.document_error,ambiguous,canRetry:status !== 'none' && !ambiguous && !['working','sent'].includes(status),chatName:row.chat_name || config.chatName || ''}};
+      return {id:row.id,reportDate:row.report_date,mode:row.mode,version:row.version,generatedAt:iso(row.generated_at),emailDelivery:emailDeliveries.get(row.id) || publicDailyEmailDelivery(null),delivery:{status,sendId:row.message_delivery_id,documentId:row.document_id,documentUrl:row.document_url,messageId:row.message_id,sentAt:iso(row.sent_at),error:blockingDoc ? row.document_error : row.message_error || row.document_error,ambiguous,canRetry:status !== 'none' && !ambiguous && !['working','sent'].includes(status),chatName:row.chat_name || config.chatName || ''}};
     });
   }
   async function generate(tenantId, options = {}) {
@@ -207,7 +208,8 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
       }
     }
   }
-  async function enqueue(tenantId,id,{send = false,allowIncomplete = false,correction = false,automatic = false,config: explicitConfig} = {}) {
+  async function enqueue(tenantId,id,{send = false,allowIncomplete = false,correction = false,automatic = false,config: explicitConfig,resendOf,actorId} = {}) {
+    validateDailyResend(resendOf);
     const row = await db.queryOne('SELECT snapshot,mode,version,report_date::text AS report_date FROM customer_daily_reports WHERE tenant_id=$1 AND id=$2', [tenantId,id]);
     if (!row) throw dailyError('日报不存在',404);
     const config = explicitConfig || await rawConfig(tenantId);
@@ -248,6 +250,7 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
       if (send) await tx.execute(`INSERT INTO customer_daily_deliveries (id,tenant_id,report_id,target_key,config,automatic) VALUES ($1,$2,$3,$4,$5::jsonb,$6)
         ON CONFLICT (tenant_id,report_id,target_key) DO UPDATE SET status='queued',next_attempt_at=now(),error_message=NULL,config=excluded.config
         WHERE customer_daily_deliveries.status IN ('retry_wait','needs_attention','canceled') AND NOT customer_daily_deliveries.ambiguous`, [randomUUID(),tenantId,id,targetKey,JSON.stringify(config),automatic]);
+      if (send && !automatic && resendOf) await requeueDailySuccess(tx,{table:'customer_daily_deliveries',tenantId,reportId:id,resendOf,targetKey,actorId});
       if (send && !automatic) await tx.execute('UPDATE customer_daily_deliveries SET automatic=false WHERE tenant_id=$1 AND report_id=$2 AND target_key=$3',[tenantId,id,targetKey]);
       // Credential rotation may repair the same app's existing document without rewriting its content.
       if (document?.document_id && document.config.appId === config.appId && document.status !== 'working') await tx.execute("UPDATE customer_daily_documents SET config=jsonb_set(config,'{appSecretEncrypted}',$3::jsonb),updated_at=now() WHERE tenant_id=$1 AND report_id=$2",[tenantId,id,JSON.stringify(config.appSecretEncrypted)]);
@@ -377,8 +380,8 @@ export function createCustomerDailyReportService({db = defaultDb, collect = coll
     }
     return rows.length;
   }
-  async function sendEmail(tenantId,id) {
-    await emailService.enqueue(tenantId,id);
+  async function sendEmail(tenantId,id,options = {}) {
+    await emailService.enqueue(tenantId,id,options);
     return report(tenantId,id);
   }
   async function processDue({limit = 5} = {}) {
