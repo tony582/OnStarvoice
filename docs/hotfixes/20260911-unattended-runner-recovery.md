@@ -1,6 +1,6 @@
 # 无人值守运行页、分步恢复与不可查看帖子 Hotfix
 
-日期：2026-09-11。当前为本地实现与验证结果，尚未提交、推送或部署。
+日期：2026-09-11。本文记录 Hotfix 实现与发布前验证。用户已授权统一提交部署，目标版本为 v0.4.9；最终上线状态与提交以生产 RELEASE_MANIFEST 和发布验收记录为准。
 
 ## 分支与边界
 
@@ -73,3 +73,7 @@ node scripts/repair-incomplete-search-passes.js --tenant UUID --parent UUID --it
 本地完整回归日志位于 `/private/tmp/starvoice-runner-hotfix-node24-final.log`、`/private/tmp/starvoice-runner-hotfix-node18-final.log`、`/private/tmp/starvoice-runner-hotfix-pg-final.log`。生产设备尚未加载此 Hotfix，因此这些测试不能替代发布后的真实设备验收。
 
 后续发布需要同时交付服务器与扩展。扩展负责识别并上报，服务器负责跨设备记忆；只更新一端不能完成全链路修复。验收应使用新的小范围任务，核对不可查看帖的终态和其他帖的正常入库，不复活用户已取消的原任务。
+
+## 合并发布范围
+
+已合入日报主动重发提交 `deb6d6551231fe9d972279b8161f7c1d9cc7e07f`（本分支对应 `7448b3d`）。飞书和邮件保留历史回执、原文档与现有收件人，并发点击及旧请求去重。没有新增迁移、配置或依赖。统一构建本分支 Admin，不能使用该提交单独基线上的旧构建。上线验证只检查按钮及记录，不实际发送客户消息，不调整日报统计。

@@ -70,7 +70,16 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.8<span class="date">2026-09-10</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.9<span class="date">2026-09-11</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>无人值守稳定性：</strong>保留平台页面身份，复用同次任务运行页，避免启动失败和反复刷新。</li>
+            <li><strong>按剩余步骤恢复：</strong>保留已完成步骤，按真实进度结算和继续派发，尊重取消与恢复次数限制。</li>
+            <li><strong>不可查看帖子：</strong>保留搜索列表数据并跳过增强，后台共享结果，避免多个设备重复采集同一不可查看帖子。</li>
+            <li><strong>日报再次发送：</strong>已发送的飞书和邮件支持主动重发，保留历史回执及原文档，重复点击不会重复投递。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.8<span class="date">2026-09-10</span></h3>
           <ul>
             <li><strong>小红书时间筛选与日期来源：</strong>确认筛选已生效后再采集，优先读取明确日期，避免把标题中的数字误当作发布时间。</li>
             <li><strong>双平台入库时间复核：</strong>小红书、抖音按本次任务实际选择的时间范围复核，明确超出范围的帖子记为已排除；半年内、不限时间按各自范围处理，巡查更新保留原有行为。</li>

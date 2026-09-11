@@ -3,12 +3,32 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.8',
+  latestVersion: '0.4.9',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-10',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.8-20260910.zip',
+  releaseDate: '2026-09-11',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.9-20260911.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.9',
+      releaseDate: '2026-09-11',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {title: '无人值守启动与运行页恢复', desc: '保留本次采集所属的平台页面，重复打开同次任务时复用运行页，避免心跳改写页面身份和收尾反复刷新。'},
+            {title: '多步采集保留已完成进度', desc: '所有计划步骤完成后才结算关键词；临时失败按剩余步骤恢复，展示实际完成量和派发状态，并尊重用户取消与恢复次数限制。'},
+            {title: '不可查看帖子停止重复增强', desc: '小红书搜索后的增强识别明确不可查看页面，保留列表数据并共享结果，避免同一帖子在多设备之间重复失败；登录、验证码和网络问题仍单独处理。'},
+          ],
+        },
+        {
+          tag: '优化',
+          notes: [
+            {title: '日报支持主动再次发送', desc: '飞书和邮件成功发送后可再次发送，保留历史回执、已有文档及收件人；并发点击和旧请求不会造成重复投递。'},
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.8',
       releaseDate: '2026-09-10',
