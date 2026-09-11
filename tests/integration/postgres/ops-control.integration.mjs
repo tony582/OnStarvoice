@@ -4,6 +4,7 @@ import test from 'node:test';
 import { closeDb, execute, queryAll, queryOne } from '../../../server/db/init.js';
 import { runMigrations } from '../../../server/db/migrate.js';
 import {
+  OPS_CONTROL_RUNTIME_BASELINE_VERSION,
   maybeDeliverOpsControlIncidentAlerts,
   normalizeOpsControlSettings,
   runOpsControlCycle,
@@ -241,7 +242,7 @@ test('observe-only control plane reconciles a historical failure to final succes
           (SELECT COUNT(*)::int FROM capture_task_item_attempts WHERE item_id = $2) AS attempt_count
       `, [runTask.id, item.id]),
     ]);
-    assert.equal(run.runtime_baseline_version, '0.4.8');
+    assert.equal(run.runtime_baseline_version, OPS_CONTROL_RUNTIME_BASELINE_VERSION);
     assert.equal(run.snapshot_count, 2);
     assert.equal(run.verdict, 'healthy');
     assert.equal(snapshots.length, 2);

@@ -13,7 +13,7 @@ type Props = {
   searchPasses?: string[]
   parentStatus?: string
   automaticRecovery?: boolean
-  now?: number
+  now: number
   recoveryActions?: Record<string, {label: string; href: string}>
 }
 
@@ -33,7 +33,7 @@ function unfinishedEvidence(item: OrchestrationItemRecord, execution: Orchestrat
   return reasons
 }
 
-export function OrchestrationResultReport({ items, executions, agents, attempts, expectedSearchPasses, searchPasses = [], parentStatus = '', automaticRecovery = false, now = Date.now(), recoveryActions = {} }: Props) {
+export function OrchestrationResultReport({ items, executions, agents, attempts, expectedSearchPasses, searchPasses = [], parentStatus = '', automaticRecovery = false, now, recoveryActions = {} }: Props) {
   const agentsById = new Map(agents.map(agent => [agent.id, agent]))
   const executionFor = (item: OrchestrationItemRecord) => orchestrationCurrentExecution(item, executions)
   const currentExecutionIds = new Set(items.map(item => executionFor(item)).filter(Boolean).map(execution => executionId(execution!)))
