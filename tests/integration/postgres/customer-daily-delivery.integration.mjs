@@ -72,6 +72,7 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
   await pool.query('CREATE TABLE tenants (LIKE public.tenants INCLUDING ALL)');
   await pool.query(await readFile(new URL('../../../server/db/migrations/081_customer_daily_reports.sql', import.meta.url), 'utf8'));
   await pool.query(await readFile(new URL('../../../server/db/migrations/083_customer_daily_email_deliveries.sql', import.meta.url), 'utf8'));
+  await pool.query("CREATE TABLE audit_logs (tenant_id UUID,actor_type TEXT,actor_id TEXT,action TEXT,target_type TEXT,target_id TEXT,metadata JSONB)");
   const db = scopedDatabase(pool);
 
   async function fixture(subtest, { configured = true } = {}) {
@@ -129,6 +130,27 @@ test('customer daily delivery persists ownership, checkpoints, schedules and ten
       warnings: value => { warnings = value; },
       rawConfig: () => db.queryOne('SELECT config FROM customer_daily_report_settings WHERE tenant_id=$1', [tenant.id]) };
   }
+
+  await t.test('manual Feishu resend sends the same document again with a new UUID and deduplicates stale clicks',async subtest=>{
+    const f=await fixture(subtest);const report=await f.service.generate(f.tenantId,{date:'2026-09-07'});
+    await f.service.enqueue(f.tenantId,report.id,{send:true});await f.service.processDue();
+    const first=await f.service.report(f.tenantId,report.id);
+    assert.equal(first.delivery.status,'sent');assert.ok(first.delivery.sendId);
+    await Promise.all(Array.from({length:4},()=>f.service.enqueue(f.tenantId,report.id,{send:true,resendOf:first.delivery.sendId})));
+    await f.service.processDue();
+    const second=await f.service.report(f.tenantId,report.id);
+    assert.equal(second.delivery.status,'sent');assert.notEqual(first.delivery.sendId,second.delivery.sendId);
+    assert.equal(f.counts('send'),2);assert.equal(f.counts('create'),1);assert.equal(f.counts('write'),1);
+    assert.equal(first.delivery.documentId,second.delivery.documentId);
+    assert.equal(new Set(f.calls.filter(c=>c.type==='send').map(c=>c.uuid)).size,2);
+    await f.service.enqueue(f.tenantId,report.id,{send:true,resendOf:first.delivery.sendId});await f.service.processDue();
+    assert.equal(f.counts('send'),2);
+    await f.service.saveSettings(f.tenantId,{autoEnabled:true});
+    await f.service.enqueue(f.tenantId,report.id,{send:true,resendOf:second.delivery.sendId,automatic:true});await f.service.processDue();
+    assert.equal(f.counts('send'),2);
+    const history=await db.queryAll('SELECT metadata FROM audit_logs WHERE tenant_id=$1',[f.tenantId]);
+    assert.equal(history.length,1);assert.equal(history[0].metadata.messageId,first.delivery.messageId);
+  });
 
   await t.test('immutable generated versions and concurrent idempotent request keys', async subtest => {
     const f = await fixture(subtest);
