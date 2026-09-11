@@ -151,7 +151,7 @@ test('control plane defaults to tenant-off observe-only mode with an explicit gl
   assert.equal(defaults.actionsEnabled, false);
   assert.equal(defaults.actionsGlobalEnabled, false);
   assert.equal(defaults.llmEnabled, false);
-  assert.equal(defaults.runtimeBaselineVersion, '0.4.8');
+  assert.equal(defaults.runtimeBaselineVersion, OPS_CONTROL_RUNTIME_BASELINE_VERSION);
   assert.equal(resolveOpsControlGlobalEnabled({OPS_CONTROL_GLOBAL_ENABLED: 'off'}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({}), false);
   assert.equal(resolveOpsControlActionsGlobalEnabled({OPS_CONTROL_ACTIONS_GLOBAL_ENABLED: 'true'}), true);
