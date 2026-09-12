@@ -7,6 +7,7 @@ import { queryAll, getSetting } from './db/init.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
 import {processCustomerDailyReports} from './services/customer-daily-reports.js';
+import {processCustomerAssistant} from './services/customer-assistant-service.js';
 import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
@@ -33,6 +34,7 @@ const DEFAULT_JOBS = Object.freeze({
   labelPendingRecords,
   processCaptureAttentionNotifications,
   processCustomerDailyReports,
+  processCustomerAssistant,
   queryAll,
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
@@ -232,6 +234,14 @@ function schedulerDefinitions(jobs, logger) {
         } catch {
           safeLog(logger, 'error', '[Cron] Customer daily report queue could not complete this cycle.');
         }
+      },
+    },
+    {
+      name:'customer-group-assistant',
+      expression:'*/5 * * * * *',
+      run:async()=>{
+        try {await jobs.processCustomerAssistant();}
+        catch {safeLog(logger,'error','[Cron] Customer assistant queue could not complete this cycle.');}
       },
     },
     {

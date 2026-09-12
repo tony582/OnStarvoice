@@ -1001,6 +1001,23 @@ test("a generic numeric data-id wrapper cannot hide a stable Douyin service erro
   );
 });
 
+test("Douyin explicit search-results-empty copy is recognized as a terminal empty state", () => {
+  for (const text of ["搜索结果为空", "搜索结果为空。", "搜索结果 为空"]) {
+    const empty = createDouyinSemanticStateProbe({text});
+    assert.equal(empty.confirmedEmpty, true, text);
+  }
+});
+
+test("quoted empty-result copy inside a real Douyin result is not a terminal empty state", () => {
+  for (const input of [
+    {text: "搜索结果为空", wrapperAttributes: {"data-e2e-aweme-id": "766193585000009991"}},
+    {text: "为什么搜索结果为空"},
+    {text: "搜索结果为空怎么办"},
+  ]) {
+    assert.equal(createDouyinSemanticStateProbe(input).confirmedEmpty, false);
+  }
+});
+
 test("a generic numeric data-item-id wrapper cannot hide a confirmed empty state", () => {
   const empty = createDouyinSemanticStateProbe({
     text: "暂无相关搜索结果",
@@ -2150,8 +2167,7 @@ test("a confirmed empty Douyin result settles as a successful zero-result keywor
       keyword === "词1"
         ? {
             ready: false,
-            confirmedEmpty: true,
-            emptyMessage: "暂无相关内容",
+            ...createDouyinSemanticStateProbe({text: "搜索结果为空"}),
             pageUrl: "https://www.douyin.com/search/%E8%AF%8D1?type=general",
           }
         : {ready: true, confirmedEmpty: false},

@@ -3,12 +3,30 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.9',
+  latestVersion: '0.4.10',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-11',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.9-20260911.zip',
+  releaseDate: '2026-09-12',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.10-20260912.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.10',
+      releaseDate: '2026-09-12',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {title: '抖音明确空结果正常结束', desc: '识别“搜索结果为空”，在确认当前关键词和筛选后按 0 条完成并继续下一个关键词，避免失败重试；帖子引用该文案不会被误判。'},
+          ],
+        },
+        {
+          tag: '新增',
+          notes: [
+            {title: '客户群助手试用', desc: '管理后台新增客户助手，可配置飞书群和授权成员，查询负面、获取已有日报及请求日报邮件，支持连续追问。默认关闭，聊天试用只预览，完成应用接入后可启用。'},
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.9',
       releaseDate: '2026-09-11',

@@ -19,6 +19,7 @@ import { KeywordsPage } from '@/pages/KeywordsPage'
 import { ContentHomePage } from '@/pages/ContentHomePage'
 import { HitsPage } from '@/pages/HitsPage'
 import { OwnedAccountExclusionsPage } from '@/pages/OwnedAccountExclusionsPage'
+import { CustomerAssistantPage } from '@/pages/CustomerAssistantPage'
 import { OfficialCommentPatrolTab } from '@/pages/monitoring/OfficialCommentPatrolTab'
 import { ComingSoon } from '@/pages/ComingSoon'
 import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
@@ -47,6 +48,7 @@ const PAGE_CONFIG: Record<string, { eyebrow: string; title: string }> = {
   review: { eyebrow: 'Content Studio', title: '内容复盘' },
   'official-comments': { eyebrow: 'Official Social', title: '官方社媒' },
   'owned-account-exclusions': { eyebrow: 'Administration', title: '自营内容排除' },
+  'customer-assistant': { eyebrow: 'Customer Assistant', title: '客户助手' },
   tenants: { eyebrow: 'Administration', title: '租户管理' },
   users: { eyebrow: 'Administration', title: '用户账号' },
   'auth-codes': { eyebrow: 'Administration', title: '激活码' },
@@ -72,6 +74,7 @@ const PAGE_COMPONENTS: Record<string, React.ComponentType> = {
   hits: HitsPage,
   'official-comments': OfficialCommentPatrolTab,
   'owned-account-exclusions': OwnedAccountExclusionsPage,
+  'customer-assistant': CustomerAssistantPage,
   tenants: TenantsPage,
   users: UsersPage,
   'auth-codes': AuthCodesPage,

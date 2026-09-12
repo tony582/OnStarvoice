@@ -19,6 +19,7 @@ import userRouter from './routes/user.js';
 import issuesRouter from './routes/issues.js';
 import reportsRouter from './routes/reports.js';
 import customerDailyReportsRouter from './routes/customer-daily-reports.js';
+import {createCustomerAssistantRouter,createCustomerAssistantWebhookRouter} from './routes/customer-assistant.js';
 import recordsRouter from './routes/records.js';
 import commentsRouter from './routes/comments.js';
 import triageRouter from './routes/triage.js';
@@ -109,6 +110,8 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
     allowedHeaders: ['Content-Type', 'x-auth-code', 'x-admin-token', 'x-tenant-id', 'x-session-token', 'x-capture-agent-token', 'x-llm-relay-agent-token', 'Authorization'],
   }));
 
+  // The signed callback must see the original bytes, before global JSON parsing.
+  app.use('/api/customer-assistant/feishu',createCustomerAssistantWebhookRouter());
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));
 
@@ -158,6 +161,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.use('/api/issues', issuesRouter);
   app.use('/api/reports', reportsRouter);
   app.use('/api/customer-daily-reports', customerDailyReportsRouter);
+  app.use('/api/customer-assistant',createCustomerAssistantRouter());
   app.use('/api/records', recordsRouter);
   app.use('/api/comments', commentsRouter);
   app.use('/api/triage', triageRouter);

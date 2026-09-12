@@ -4,7 +4,7 @@ import {
   Sparkles, TrendingUp, Flame, Users2, Lightbulb, LineChart,
   Building2, Users, KeyRound, Settings, ChevronRight,
   ShieldHalf, ShieldCheck, Wand2, PanelLeftClose, HandCoins, X, ScanSearch,
-  Megaphone, LogOut, ChevronsUpDown,
+  Megaphone, LogOut, ChevronsUpDown, Bot,
 } from 'lucide-react'
 import { cn, LABELS } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
@@ -64,6 +64,7 @@ const NAV_BY_WORKSPACE: Record<Workspace, NavItem[]> = {
 }
 
 const ADMIN_NAV: NavItem[] = [
+  { id: 'customer-assistant', label: '客户助手', icon: Bot },
   { id: 'owned-account-exclusions', label: '自营内容排除', icon: ShieldCheck },
   { id: 'tenants', label: '租户管理', icon: Building2 },
   { id: 'users', label: '用户账号', icon: Users, platformAdmin: true },

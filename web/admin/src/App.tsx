@@ -8,6 +8,7 @@ import { LoginPage } from '@/pages/LoginPage'
 
 const DesktopApp = lazy(() => import('@/desktop/DesktopApp'))
 const MobileApp = lazy(() => import('@/mobile/MobileApp'))
+const CustomerAssistantDemo = import.meta.env.DEV ? lazy(() => import('@/pages/customer-assistant/CustomerAssistantDemo')) : null
 function FullScreenLoading() {
   return <div className="flex min-h-dvh items-center justify-center"><Loader2 className="h-7 w-7 animate-spin text-primary" /></div>
 }
@@ -48,6 +49,9 @@ function AdaptiveApp() {
 }
 
 export default function App() {
+  if (CustomerAssistantDemo && new URLSearchParams(window.location.search).get('preview') === 'customer-assistant') {
+    return <Suspense fallback={<FullScreenLoading />}><CustomerAssistantDemo /></Suspense>
+  }
   return (
     <AuthProvider>
       <NavProvider>

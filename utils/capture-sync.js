@@ -19852,6 +19852,7 @@ async function waitForKeywordSearchResultsInTab(
                   text,
                 );
               const confirmedEmptyMatched =
+                /^搜索结果为空[。！!]?$/u.test(text) ||
                 /^(?:暂无)(?:相关)?(?:搜索)?(?:结果|内容|作品)[。！!]?$/u.test(text) ||
                 /^(?:没有找到|没有搜索到|未找到|未搜索到)(?:相关)?(?:搜索)?(?:结果|内容|作品)[。！!]?$/u.test(text) ||
                 /^(?:暂无|没有)(?:符合)?(?:当前)?筛选条件的?(?:结果|内容|作品)[。！!]?$/u.test(text);
