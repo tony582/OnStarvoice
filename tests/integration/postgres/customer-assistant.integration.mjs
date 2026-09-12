@@ -43,6 +43,7 @@ test('customer assistant real PostgreSQL callbacks, tools, queues and authorizat
 
   const {createCustomerAssistantService}=await import('../../../server/services/customer-assistant-service.js');
   const {createCustomerAssistantTools}=await import('../../../server/services/customer-assistant-tools.js');
+  const queryAdapter=await import('../../../server/db/query.js');
   const {createCustomerAssistantEmailService}=await import('../../../server/services/customer-assistant-email.js');
   const {createCustomerDailyReportService}=await import('../../../server/services/customer-daily-reports.js');
   const {createCustomerAssistantWebhookRouter}=await import('../../../server/routes/customer-assistant.js');
@@ -71,7 +72,8 @@ test('customer assistant real PostgreSQL callbacks, tools, queues and authorizat
     let smtpHandler=async message=>({accepted:[message.to],rejected:[],messageId:'mock-smtp-accepted'});
     const email=createCustomerAssistantEmailService({db,now:fixed,send:async message=>{calls.smtp.push(message);return smtpHandler(message);}});
     const dailyReports=createCustomerDailyReportService({db,now:fixed,env});
-    const tools=createCustomerAssistantTools({db,dailyReports,email,now:fixed});
+    // Query tools must use the production adapter: the fixture wrapper drops extra query arguments.
+    const tools=createCustomerAssistantTools({db:queryAdapter,dailyReports,email,now:fixed});
     const makeModel=()=>async ({messages})=>{
       calls.model.push(structuredClone(messages));
       const last=messages.at(-1);
@@ -121,6 +123,32 @@ test('customer assistant real PostgreSQL callbacks, tools, queues and authorizat
     if(row.watched) await db.execute('INSERT INTO record_watchlist(tenant_id,record_id) VALUES($1,$2)',[tenantId,id]);
     return id;
   }
+
+  await t.test('negative queries use the production adapter with effective read-only reporting limits',async subtest=>{
+    const tenantId=randomUUID();
+    await db.execute('INSERT INTO tenants(id,name) VALUES($1,$2)',[tenantId,'Assistant production-adapter regression']);
+    subtest.after(()=>db.execute('DELETE FROM tenants WHERE id=$1',[tenantId]));
+    const expected=await record(tenantId);
+    await record(tenantId,{sentiment:''});
+    await record(tenantId,{platform:'xiaohongshu'});
+    const context={tenantId,chatId:'local-adapter-chat',senderId:'local-adapter-sender',requestId:randomUUID(),dryRun:true};
+    // Exercise the unchanged default import path used in production before inspecting its transaction.
+    const defaultResult=await createCustomerAssistantTools({now:fixed}).executeTool('query_negative',{},context);
+    assert.equal(defaultResult.total,2);assert.equal(defaultResult.monitored,3);assert.equal(defaultResult.pendingAnalysis,1);
+
+    const transactions=[];
+    const observedAdapter={...queryAdapter,withTransaction:(callback,options)=>queryAdapter.withTransaction(async tx=>{
+      transactions.push({category:tx.category,...await tx.queryOne(`SELECT current_database() AS database_name,
+        current_setting('transaction_read_only') AS read_only,current_setting('statement_timeout') AS statement_timeout,
+        current_setting('lock_timeout') AS lock_timeout,current_setting('jit') AS jit`)});
+      return callback(tx);
+    },options)};
+    const result=await createCustomerAssistantTools({db:observedAdapter,now:fixed})
+      .executeTool('query_negative',{platform:'douyin',limit:1},context);
+    assert.equal(result.total,1);assert.equal(result.monitored,2);assert.equal(result.pendingAnalysis,1);
+    assert.deepEqual(result.details.map(item=>item.id),[expected]);
+    assert.deepEqual(transactions,[{category:'reporting',database_name:databaseName,read_only:'on',statement_timeout:'15s',lock_timeout:'1s',jit:'off'}]);
+  });
 
   await t.test('signed HTTP callback queues once, runs real negative SQL and replies once',async subtest=>{
     const f=await fixture(subtest),foreign=await fixture(subtest);

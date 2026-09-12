@@ -68,8 +68,9 @@ export function createCustomerAssistantTools({db = defaultDb,dailyReports = cust
     if (!PLATFORMS.has(platform)) throw fail('assistant_platform_invalid','不支持这个平台筛选。');
     if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw fail('assistant_limit_invalid','明细数量应为 1 至 20。');
     const cutoff = new Date(Math.min(end,timestamp.getTime())).toISOString();
+    // Apply reporting limits to the transaction; queryOne's third argument is a client, not options.
     // One statement gives counts and examples the same database snapshot. EXISTS avoids watchlist duplicates.
-    const row = await db.queryOne(`WITH scoped AS MATERIALIZED (
+    const row = await db.withTransaction(tx => tx.queryOne(`WITH scoped AS MATERIALIZED (
       SELECT r.id,r.platform,r.title,r.url,r.canonical_url,r.created_at,r.sentiment
       FROM records r LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id
       WHERE r.tenant_id=$1 AND r.created_at >= $2::timestamptz AND r.created_at < $3::timestamptz
@@ -89,7 +90,8 @@ export function createCustomerAssistantTools({db = defaultDb,dailyReports = cust
       COUNT(*) FILTER (WHERE sentiment IS NULL OR sentiment NOT IN ('positive','neutral','negative')) AS pending_analysis,
       COALESCE((SELECT jsonb_agg(platform_counts ORDER BY platform) FROM platform_counts),'[]'::jsonb) AS by_platform,
       COALESCE((SELECT jsonb_agg(recent ORDER BY created_at DESC,id DESC) FROM recent),'[]'::jsonb) AS details
-      FROM scoped`,[context.tenantId,new Date(start).toISOString(),cutoff,platform,limit],{category:'reporting',statementTimeoutMs:15000,jitOff:true});
+      FROM scoped`,[context.tenantId,new Date(start).toISOString(),cutoff,platform,limit]),
+      {category:'reporting',readOnly:true,statementTimeoutMs:15000,lockTimeoutMs:1000,jitOff:true});
     return {status:'available',total:num(row?.total),monitored:num(row?.monitored),pendingAnalysis:num(row?.pending_analysis),
       dateFrom,dateTo,platform,cutoffAt:cutoff,assessedAt:timestamp.toISOString(),timeZone:'Asia/Shanghai',
       basis:'首次入库自然日内的有效监控主帖，按当前有效情感统计；排除非监控内容，同帖复采不重复计数。',
