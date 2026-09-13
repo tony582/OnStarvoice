@@ -14,6 +14,7 @@ import syncRouter from './routes/sync.js';
 import targetRouter from './routes/target.js';
 import monitorRouter from './routes/monitor.js';
 import updateManifestRouter from './routes/update-manifest.js';
+import { createPublicDownloadsRouter } from './routes/public-downloads.js';
 import adminRouter from './routes/admin.js';
 import userRouter from './routes/user.js';
 import issuesRouter from './routes/issues.js';
@@ -137,10 +138,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.use('/admin', express.static(join(__dirname, 'admin')));
   app.use('/dashboard', express.static(join(__dirname, 'dashboard')));
   app.use('/images', express.static(join(__dirname, '..', 'images')));
-  app.use('/downloads', express.static(join(__dirname, '..', 'releases'), {
-    maxAge: '1h',
-    fallthrough: true,
-  }));
+  app.use('/downloads', createPublicDownloadsRouter(join(__dirname, '..', 'public-downloads')));
   app.use('/media', express.static(MEDIA_DIR, { maxAge: '7d' }));
 
   app.get(['/about', '/contact', '/changelog', '/pricing'], (req, res) => {

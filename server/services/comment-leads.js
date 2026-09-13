@@ -1,7 +1,8 @@
 import { parsePublishTimestamp } from './publish-date.js';
+import { normalizeSalesLeadJudgment } from './comment-sales-judgment.js';
 
 const LEAD_TYPE_KEYWORDS = {
-  // 销售客资:购买意向 / 询价 / 留联系方式(优先识别,归到「销售客资」)
+  // 仅用于展示命中线索；销售归类必须通过语义判断和原文证据核验。
   sales_intent: [
     '多少钱', '价格', '报价', '怎么买', '哪里买', '哪买', '在哪买', '求链接',
     '优惠', '团购', '想买', '入手', '下单', '购买', '试驾', '预约', '门店', '经销商',
@@ -63,12 +64,10 @@ function matchedKeywordsFor(comment, record = {}) {
 
 export function resolveLeadType(comment) {
   const text = normalizeText(comment.content).toLowerCase();
-  // 购买意向以 AI 判断为准(salesIntent);AI 未判过时才退回(已收紧的)关键词。
-  // 这样"客服打电话让续费""不续费给我关闭"这类投诉不会被误收进销售客资。
-  const ai = normalizeAiResult(comment.ai_result);
-  const aiJudged = ai && typeof ai === 'object' && Object.prototype.hasOwnProperty.call(ai, 'salesIntent');
-  const isSales = aiJudged ? ai.salesIntent === true : hasAnyKeyword(text, LEAD_TYPE_KEYWORDS.sales_intent);
-  if (isSales) return 'sales_intent';
+  // A sales keyword, seller promotion or an unsubstantiated legacy boolean is
+  // never sufficient. Single, batch and historical rejudgment share this gate.
+  const sales = normalizeSalesLeadJudgment(comment.ai_result, {comment});
+  if (sales.salesIntent) return 'sales_intent';
 
   const category = normalizeText(comment.category);
   if (category === 'safety_rescue' || category === 'privacy') return 'safety_privacy';
@@ -95,11 +94,11 @@ export function resolvePriority(comment) {
   return 'low';
 }
 
-function shouldCreateLead(comment) {
+export function shouldCreateLead(comment) {
   if (!comment || comment.is_official) return false;
   // 真实购买意向也要建线索(进销售客资),即便情绪正向/中性
-  const ai = normalizeAiResult(comment.ai_result);
-  if (ai && ai.salesIntent === true) return true;
+  const sales = normalizeSalesLeadJudgment(comment.ai_result, {comment});
+  if (sales.salesIntent || sales.salesIntentStatus === 'needs_review') return true;
   const risk = normalizeText(comment.risk_level);
   return Boolean(
     comment.is_negative ||
@@ -109,8 +108,12 @@ function shouldCreateLead(comment) {
 }
 
 export function leadReason(comment) {
-  const aiResult = normalizeAiResult(comment.ai_result);
+  const aiResult = {
+    ...normalizeAiResult(comment.ai_result),
+    ...normalizeSalesLeadJudgment(comment.ai_result, {comment}),
+  };
   return normalizeText(
+    (['confirmed', 'needs_review'].includes(aiResult.salesIntentStatus) && aiResult.salesIntentReason) ||
     comment.ai_summary ||
     aiResult.reason ||
     aiResult.summary ||
@@ -119,14 +122,30 @@ export function leadReason(comment) {
 }
 
 export async function upsertCommentLeadForComment(tx, { tenantId, record = {}, comment = {} }) {
-  if (!shouldCreateLead(comment)) return null;
-
   const leadType = resolveLeadType(comment);
   const priority = resolvePriority(comment);
   const matchedKeywords = matchedKeywordsFor(comment, record);
-  const aiResult = normalizeAiResult(comment.ai_result);
+  const aiResult = {
+    ...normalizeAiResult(comment.ai_result),
+    ...normalizeSalesLeadJudgment(comment.ai_result, {comment}),
+  };
   const recordTitle = normalizeText(record.title || record.content || '').slice(0, 240);
   const commentPublishedTs = String(comment.published_at || '').trim() ? parsePublishTimestamp(comment.published_at, comment.last_seen_at || comment.created_at) : null;
+
+  if (!shouldCreateLead(comment)) {
+    // A rejudged neutral/non-buyer comment should not create a new risk lead,
+    // but an existing lead must lose its stale AI sales route. Preserve human
+    // classification, status, notes and history for review; never delete it.
+    return await tx.queryOne(`
+      UPDATE comment_leads
+      SET lead_type = COALESCE(manual_lead_type, $3),
+          reason = $4, ai_result = $5::jsonb,
+          comment_content = $6, comment_like_count = $7, updated_at = now()
+      WHERE tenant_id = $1 AND comment_id = $2
+      RETURNING *
+    `, [tenantId, comment.id, leadType, leadReason(comment), JSON.stringify(aiResult),
+      comment.content || '', cleanNumber(comment.like_count)]);
+  }
 
   return await tx.queryOne(`
     INSERT INTO comment_leads (
@@ -144,7 +163,7 @@ export async function upsertCommentLeadForComment(tx, { tenantId, record = {}, c
     DO UPDATE SET
       record_id = excluded.record_id,
       platform = excluded.platform,
-      lead_type = excluded.lead_type,
+      lead_type = COALESCE(comment_leads.manual_lead_type, excluded.lead_type),
       -- 复发:已归档(resolved/ignored)或已转工单(ticketed,且无在途工单)的评论,
       -- 二次采集时点赞较上次明显上涨(>+10),自动回到待处理(new)并记复发时间
       status = CASE

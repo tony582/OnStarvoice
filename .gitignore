@@ -32,3 +32,6 @@ StarVoice-extension.zip
 
 # 扩展打包产物(本地生成,不入库)
 *.zip
+
+# Only immutable public extension packages; internal releases stay outside this tree.
+public-downloads/

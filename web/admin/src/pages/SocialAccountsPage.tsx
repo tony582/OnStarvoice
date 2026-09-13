@@ -10,6 +10,8 @@ import {
   Link2,
   Loader2,
   MonitorCheck,
+  Plus,
+  UserRound,
   RefreshCw,
   Search,
   ShieldAlert,
@@ -53,6 +55,8 @@ type LinkedAccount = {
 }
 
 type SocialAccount = {
+  identity_source?: string
+  agent_binding_mode?: string
   id: string
   platform: SocialPlatform
   display_name: string
@@ -63,6 +67,7 @@ type SocialAccount = {
   bindings: Array<{
     id: string
     agent_id: string
+    agent_display_name?: string
     status: string
   }>
 }
@@ -206,6 +211,11 @@ export function SocialAccountsPage() {
   const [editingAgent, setEditingAgent] = useState<SocialAgent | null>(null)
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
+  const [editingAccount, setEditingAccount] = useState<SocialAccount | 'new' | null>(null)
+  const [linkingAccount, setLinkingAccount] = useState<SocialAccount | null>(null)
+  const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([])
+  const [accountError, setAccountError] = useState('')
+  const [referencesOpen, setReferencesOpen] = useState(false)
 
   const load = useCallback(async (quiet = false) => {
     if (quiet) setRefreshing(true)
@@ -251,10 +261,10 @@ export function SocialAccountsPage() {
   }, [tenantId, load])
 
   useEffect(() => {
-    if (!editingAgent) return
+    if (!editingAgent && !editingAccount && !linkingAccount) return
     const previousOverflow = document.body.style.overflow
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setEditingAgent(null)
+      if (event.key === 'Escape' && !saving) { setEditingAgent(null); setEditingAccount(null); setLinkingAccount(null) }
     }
     document.body.style.overflow = 'hidden'
     window.addEventListener('keydown', onKeyDown)
@@ -262,7 +272,7 @@ export function SocialAccountsPage() {
       document.body.style.overflow = previousOverflow
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [editingAgent])
+  }, [editingAgent, editingAccount, linkingAccount, saving])
 
   const today = overview?.today || ''
   const visibleAgents = useMemo(() => {
@@ -337,9 +347,52 @@ export function SocialAccountsPage() {
   }
 
   const summary = overview?.summary
+  const registeredAccounts = (overview?.accounts || []).filter(account => account.identity_source === 'manual')
+  const observedAccounts = (overview?.accounts || []).filter(account => account.identity_source !== 'manual')
+  const openManualEditor = (account: SocialAccount | 'new') => {
+    setAccountError(''); setFeedback(''); setEditingAccount(account)
+  }
+  const openAgentLinks = (account: SocialAccount) => {
+    setAccountError(''); setFeedback(''); setLinkingAccount(account)
+    setSelectedAgentIds((account.bindings || []).filter(binding => binding.status === 'current').map(binding => binding.agent_id))
+  }
+  const saveManualAccount = async (draft: AccountDraft) => {
+    if (!editingAccount || !canWrite() || saving) return
+    setSaving(true); setAccountError('')
+    try {
+      const body = { ...draft, identitySource: 'manual', agentBindingMode: 'manual' }
+      const creating = editingAccount === 'new'
+      const result = creating
+        ? await api.post<{ account: SocialAccount }>('/social-accounts', body)
+        : await api.patch<{ account: SocialAccount }>(`/social-accounts/${editingAccount.id}`, body)
+      setEditingAccount(null)
+      setFeedback(creating ? '账号已创建，可以继续关联 Agent 节点。' : '账号资料已保存，以本次人工登记信息为准。')
+      await load(true)
+      if (creating) { setLinkingAccount({ ...result.account, bindings: result.account.bindings || [] }); setSelectedAgentIds([]) }
+    } catch (saveError) { setAccountError(saveError instanceof Error ? saveError.message : '账号保存失败，请重试') }
+    finally { setSaving(false) }
+  }
+  const saveAgentLinks = async () => {
+    if (!linkingAccount || !canWrite() || saving) return
+    setSaving(true); setAccountError('')
+    try {
+      await api.put(`/social-accounts/${linkingAccount.id}/bindings`, { agentIds: selectedAgentIds, bindingMode: 'manual' })
+      setLinkingAccount(null); setFeedback('Agent 关联已保存。')
+      await load(true)
+    } catch (saveError) { setAccountError(saveError instanceof Error ? saveError.message : '账号已保留，节点关联失败，请重试') }
+    finally { setSaving(false) }
+  }
 
   return (
     <div className="mx-auto w-full max-w-[1580px] space-y-5">
+      <section aria-label="手工登记社交账号" className="rounded-2xl border border-border bg-card p-4 sm:p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div><h2 className="flex items-center gap-2 text-[18px] font-bold"><UserRound className="h-5 w-5 text-primary" />已登记账号 <span className="text-[12px] font-medium text-muted-foreground">{registeredAccounts.length} 个</span></h2><p className="mt-1 text-[12px] leading-5 text-muted-foreground">先填写账号昵称、绑定手机等资料，再手动关联使用该账号的 Agent 节点。</p></div>
+          {canWrite() && <Button onClick={() => openManualEditor('new')}><Plus className="h-4 w-4" />创建账号</Button>}
+        </div>
+        {registeredAccounts.length === 0 ? <div className="mt-4 rounded-xl border border-dashed border-border py-8 text-center text-[13px] text-muted-foreground">尚未手工登记账号，点击“创建账号”填写资料。</div> : <div className="mt-4 grid gap-3 xl:grid-cols-2">{registeredAccounts.map(account => <RegisteredAccountCard key={account.id} account={account} agents={overview?.agents || []} writable={canWrite()} onEdit={() => openManualEditor(account)} onLink={() => openAgentLinks(account)} />)}</div>}
+        {observedAccounts.length > 0 && <div className="mt-4 border-t border-border pt-3"><button type="button" aria-expanded={referencesOpen} onClick={() => setReferencesOpen(!referencesOpen)} className="text-[12px] font-semibold text-muted-foreground">{referencesOpen ? '收起' : '查看'}历史识别参考（{observedAccounts.length} 个）</button><p className="mt-1 text-[11px] leading-5 text-muted-foreground">以下资料未经人工登记，识别结果仅供参考。核对并确认登记后，才作为可选择的账号资料。</p>{referencesOpen && <div className="mt-3 space-y-2">{observedAccounts.map(account => <div key={account.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-muted/35 px-3 py-2.5"><div className="min-w-0"><p className="text-[12px] font-medium">{platformLabel(account.platform)} · {account.display_name || account.account_handle || '未识别昵称'}</p><p className="mt-0.5 text-[11px] text-muted-foreground">{account.account_handle || account.platform_account_id || '缺少账号标识'} · 待人工核对</p></div>{canWrite() && <Button variant="outline" size="sm" onClick={() => openManualEditor(account)}>确认并登记</Button>}</div>)}</div>}</div>}
+      </section>
       <section className="overflow-hidden rounded-2xl border border-border bg-card">
         <div className="flex flex-col gap-5 px-5 py-5 lg:flex-row lg:items-center lg:justify-between lg:px-6">
           <div className="min-w-0">
@@ -446,6 +499,8 @@ export function SocialAccountsPage() {
         )}
       </section>
 
+      {editingAccount && <ManualAccountDialog key={editingAccount === 'new' ? 'new' : editingAccount.id} account={editingAccount === 'new' ? null : editingAccount} saving={saving} error={accountError} onClose={() => { if (!saving) setEditingAccount(null) }} onSave={draft => void saveManualAccount(draft)} />}
+      {linkingAccount && <AccountAgentsDialog account={linkingAccount} agents={overview?.agents || []} selectedAgentIds={selectedAgentIds} onChange={setSelectedAgentIds} saving={saving} error={accountError} onClose={() => { if (!saving) setLinkingAccount(null) }} onSave={() => void saveAgentLinks()} />}
       {editingAgent && (
         <AccountLinkDialog
           agent={editingAgent}
@@ -454,7 +509,7 @@ export function SocialAccountsPage() {
           setSelectedAccountIds={setSelectedAccountIds}
           writable={canWrite()}
           saving={saving}
-          onClose={() => setEditingAgent(null)}
+          onClose={() => { if (!saving) setEditingAgent(null) }}
           onSave={() => void saveAccountLinks()}
         />
       )}
@@ -579,9 +634,9 @@ function AccountLinkDialog({
     (agent.allowed_platforms || []).filter(platform => PLATFORM_META[platform as SocialPlatform]),
   )
   const availableAccounts = accounts.filter(account =>
-    currentAccountIds.has(account.id) ||
-    supportedPlatforms.size === 0 ||
-    supportedPlatforms.has(account.platform),
+    currentAccountIds.has(account.id) || (account.identity_source === 'manual' && (
+      supportedPlatforms.size === 0 || supportedPlatforms.has(account.platform)
+    )),
   )
 
   const toggle = (accountId: string) => {
@@ -610,7 +665,7 @@ function AccountLinkDialog({
           <div className="min-w-0 flex-1">
             <div className="text-[10px] font-bold uppercase tracking-[0.15em] text-primary">Optional account info</div>
             <h2 className="truncate text-[18px] font-extrabold">{agentName(agent)}</h2>
-            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">账号只是设备登录信息，可登记、可不登记；每个平台最多一个，解绑不会清空 Agent 今日用量。</p>
+            <p className="mt-1 text-[11px] leading-4 text-muted-foreground">选择已手工登记的账号关联此节点，每个平台最多一个。已有历史关联会保留显示。</p>
           </div>
           <button type="button" onClick={onClose} className="flex h-10 w-10 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground" aria-label="关闭账号信息">
             <X className="h-5 w-5" />
@@ -621,8 +676,8 @@ function AccountLinkDialog({
           {availableAccounts.length === 0 ? (
             <div className="rounded-xl border border-dashed border-border px-4 py-10 text-center">
               <Unlink className="mx-auto h-6 w-6 text-muted-foreground" />
-              <p className="mt-2 text-sm font-semibold">暂无可登记的社交账号</p>
-              <p className="mt-1 text-xs text-muted-foreground">保持未绑定即可，Agent 用量仍会正常统计。</p>
+              <p className="mt-2 text-sm font-semibold">暂无可关联的已登记账号</p>
+              <p className="mt-1 text-xs text-muted-foreground">请先在页面上方创建账号并填写昵称、绑定手机等资料。</p>
             </div>
           ) : (
             <div className="space-y-2">
@@ -632,8 +687,8 @@ function AccountLinkDialog({
                   <button
                     key={account.id}
                     type="button"
-                    onClick={() => writable && toggle(account.id)}
-                    disabled={!writable}
+                    onClick={() => writable && !saving && account.identity_source === 'manual' && toggle(account.id)}
+                    disabled={!writable || saving || account.identity_source !== 'manual'}
                     className={cn(
                       'flex w-full items-start gap-3 rounded-xl border px-3.5 py-3 text-left transition-colors',
                       selected ? 'border-primary bg-primary/[0.045] ring-2 ring-primary/10' : 'border-border hover:bg-muted/35',
@@ -654,6 +709,7 @@ function AccountLinkDialog({
                         {[account.account_handle, account.platform_account_id, maskPhone(account.registered_phone)].filter(Boolean).join(' · ') || '没有补充资料'}
                       </span>
                       {account.notes && <span className="mt-1 block truncate text-[10px] text-muted-foreground">{account.notes}</span>}
+                      {account.identity_source !== 'manual' && <span className="mt-1 block text-[10px] text-amber-600">历史识别关联，请先在页面上方核对并登记账号资料</span>}
                     </span>
                   </button>
                 )
@@ -706,4 +762,79 @@ function CardMetric({ label, value, alert = false }: { label: string; value: num
       <div className={cn('mt-0.5 text-[16px] font-extrabold tabular-nums', alert && 'text-status-red')}>{value}</div>
     </div>
   )
+}
+
+type AccountDraft = {
+  platform: SocialPlatform
+  displayName: string
+  registeredPhone: string
+  accountHandle: string
+  platformAccountId: string
+  notes: string
+}
+
+function RegisteredAccountCard({ account, agents, writable, onEdit, onLink }: { account: SocialAccount; agents: SocialAgent[]; writable: boolean; onEdit: () => void; onLink: () => void }) {
+  const linkedIds = new Set((account.bindings || []).filter(binding => binding.status === 'current').map(binding => binding.agent_id))
+  const linkedAgents = agents.filter(agent => linkedIds.has(agent.id))
+  return <article className="rounded-xl border border-border p-3.5">
+    <div className="flex flex-wrap items-center justify-between gap-2"><div className="flex min-w-0 items-center gap-2"><span className={cn('shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold', PLATFORM_META[account.platform]?.className)}>{platformLabel(account.platform)}</span><h3 className="truncate text-[14px] font-bold">{account.display_name || account.account_handle || '未填写昵称'}</h3></div>{writable && <button type="button" onClick={onEdit} className="flex items-center gap-1 text-[12px] font-semibold text-primary"><Edit3 className="h-3.5 w-3.5" />编辑资料</button>}</div>
+    <dl className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-[12px]"><div><dt className="text-[10px] text-muted-foreground">绑定手机</dt><dd className="mt-0.5">{maskPhone(account.registered_phone) || '未填写'}</dd></div><div><dt className="text-[10px] text-muted-foreground">平台账号 / ID</dt><dd className="mt-0.5 break-all">{account.account_handle || account.platform_account_id || '未填写'}</dd></div></dl>
+    {account.notes && <p className="mt-2 line-clamp-2 whitespace-pre-wrap text-[11px] leading-5 text-muted-foreground">{account.notes}</p>}
+    <div className="mt-3 flex items-start justify-between gap-3 border-t border-border pt-3"><div className="min-w-0"><p className="text-[10px] text-muted-foreground">关联 Agent 节点</p>{linkedAgents.length ? <div className="mt-1 flex flex-wrap gap-1.5">{linkedAgents.map(agent => <span key={agent.id} className="max-w-full truncate rounded bg-muted px-2 py-1 text-[11px]">{agentName(agent)} · {agent.online ? '在线' : '离线'}</span>)}</div> : <p className="mt-1 text-[12px] text-muted-foreground">尚未关联节点</p>}</div>{writable && <Button variant="outline" size="sm" onClick={onLink}><Link2 className="h-3.5 w-3.5" />关联节点</Button>}</div>
+  </article>
+}
+
+function ManualAccountDialog({ account, saving, error, onClose, onSave }: { account: SocialAccount | null; saving: boolean; error: string; onClose: () => void; onSave: (draft: AccountDraft) => void }) {
+  const [draft, setDraft] = useState<AccountDraft>(() => ({ platform: account?.platform || 'xiaohongshu', displayName: account?.display_name || '', registeredPhone: account?.registered_phone || '', accountHandle: account?.account_handle || '', platformAccountId: account?.platform_account_id || '', notes: account?.notes || '' }))
+  const controlClass = 'mt-1.5 h-10 w-full rounded-lg border border-input bg-background px-3 text-[13px] outline-none focus:border-primary focus:ring-2 focus:ring-primary/15 disabled:opacity-60'
+  const title = !account ? '创建社交账号' : account.identity_source === 'manual' ? '编辑账号资料' : '确认并登记账号'
+  const update = (key: keyof AccountDraft, value: string) => setDraft(previous => ({ ...previous, [key]: value }))
+  return <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/35 sm:items-center sm:p-5" onMouseDown={event => { if (event.target === event.currentTarget && !saving) onClose() }}>
+    <form role="dialog" aria-modal="true" aria-label={title} onSubmit={event => { event.preventDefault(); if (!saving && draft.displayName.trim()) onSave({ ...draft, displayName: draft.displayName.trim(), registeredPhone: draft.registeredPhone.trim(), accountHandle: draft.accountHandle.trim(), platformAccountId: draft.platformAccountId.trim(), notes: draft.notes.trim() }) }} className="flex max-h-[90dvh] w-full max-w-xl flex-col overflow-hidden rounded-t-2xl border border-border bg-card shadow-xl sm:rounded-2xl">
+      <header className="flex items-start justify-between gap-3 border-b border-border p-4 sm:px-5"><div><h2 className="text-[17px] font-bold">{title}</h2><p className="mt-1 text-[12px] leading-5 text-muted-foreground">填写实际使用的社交账号资料，保存后再关联 Agent 节点。</p></div><button type="button" onClick={onClose} disabled={saving} aria-label="关闭账号资料" className="rounded-lg p-2 text-muted-foreground hover:bg-muted"><X className="h-5 w-5" /></button></header>
+      <div className="space-y-4 overflow-y-auto p-4 sm:p-5">
+        {account && account.identity_source !== 'manual' && <p className="rounded-lg bg-amber-500/10 p-3 text-[12px] leading-5 text-amber-800 dark:text-amber-200">当前内容来自历史识别，请逐项核对。保存后将以人工登记资料为准。</p>}
+        <div className="grid grid-cols-2 gap-3"><label className="text-[12px] font-semibold" htmlFor="social-account-platform">平台<select id="social-account-platform" value={draft.platform} disabled={saving || Boolean(account)} onChange={event => update('platform', event.target.value)} className={controlClass}>{Object.entries(PLATFORM_META).map(([value, meta]) => <option key={value} value={value}>{meta.label}</option>)}</select></label><label className="text-[12px] font-semibold" htmlFor="social-account-nickname">账号昵称 <span className="text-destructive">*</span><input id="social-account-nickname" autoFocus required maxLength={160} value={draft.displayName} disabled={saving} onChange={event => update('displayName', event.target.value)} placeholder="填写账号实际昵称" className={controlClass} /></label></div>
+        <label className="block text-[12px] font-semibold" htmlFor="social-account-phone">绑定手机 <span className="font-normal text-muted-foreground">选填</span><input id="social-account-phone" type="tel" inputMode="tel" autoComplete="off" maxLength={40} value={draft.registeredPhone} disabled={saving} onChange={event => update('registeredPhone', event.target.value)} placeholder="该社交账号绑定的手机号码" className={controlClass} /></label>
+        <div className="grid gap-3 sm:grid-cols-2"><label className="text-[12px] font-semibold" htmlFor="social-account-handle">平台账号 <span className="font-normal text-muted-foreground">选填</span><input id="social-account-handle" maxLength={160} value={draft.accountHandle} disabled={saving} onChange={event => update('accountHandle', event.target.value)} placeholder="小红书号 / 抖音号等" className={controlClass} /></label><label className="text-[12px] font-semibold" htmlFor="social-account-id">平台用户 ID <span className="font-normal text-muted-foreground">选填</span><input id="social-account-id" maxLength={240} value={draft.platformAccountId} disabled={saving} onChange={event => update('platformAccountId', event.target.value)} placeholder="已确认的用户 ID" className={controlClass} /></label></div>
+        <label className="block text-[12px] font-semibold" htmlFor="social-account-notes">备注 <span className="font-normal text-muted-foreground">选填</span><textarea id="social-account-notes" maxLength={2000} rows={3} value={draft.notes} disabled={saving} onChange={event => update('notes', event.target.value)} placeholder="账号用途、归属人或补充说明" className="mt-1.5 w-full resize-none rounded-lg border border-input bg-background px-3 py-2 text-[13px] leading-6 outline-none focus:border-primary focus:ring-2 focus:ring-primary/15" /></label>
+        {error && <p role="alert" className="rounded-lg bg-destructive/5 px-3 py-2 text-[12px] text-destructive">{error}</p>}
+      </div>
+      <footer className="flex justify-end gap-2 border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))]"><Button type="button" variant="outline" disabled={saving} onClick={onClose}>取消</Button><Button type="submit" disabled={saving || !draft.displayName.trim()}>{saving && <Loader2 className="h-4 w-4 animate-spin" />}{account ? '保存资料' : '创建并关联节点'}</Button></footer>
+    </form>
+  </div>
+}
+
+function AccountAgentsDialog({ account, agents, selectedAgentIds, onChange, saving, error, onClose, onSave }: { account: SocialAccount; agents: SocialAgent[]; selectedAgentIds: string[]; onChange: (ids: string[]) => void; saving: boolean; error: string; onClose: () => void; onSave: () => void }) {
+  const eligibleAgents = agents.filter(agent => ['active', 'paused'].includes(agent.status) && (!agent.allowed_platforms?.length || agent.allowed_platforms.includes(account.platform)))
+  const conflicts = eligibleAgents.filter(agent => selectedAgentIds.includes(agent.id) && agent.accounts.some(current => current.platform === account.platform && current.id !== account.id))
+  const eligibleIds = new Set(eligibleAgents.map(agent => agent.id))
+  const unavailableIds = Array.from(new Set([
+    ...(account.bindings || []).filter(binding => binding.status === 'current').map(binding => binding.agent_id),
+    ...selectedAgentIds,
+  ])).filter(id => !eligibleIds.has(id))
+  const selectedUnavailable = unavailableIds.filter(id => selectedAgentIds.includes(id))
+  const toggle = (id: string) => onChange(selectedAgentIds.includes(id) ? selectedAgentIds.filter(value => value !== id) : [...selectedAgentIds, id])
+  return <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/35 sm:items-center sm:p-5" onMouseDown={event => { if (event.target === event.currentTarget && !saving) onClose() }}>
+    <section role="dialog" aria-modal="true" aria-label="关联 Agent 节点" className="flex max-h-[90dvh] w-full max-w-xl flex-col overflow-hidden rounded-t-2xl border border-border bg-card shadow-xl sm:rounded-2xl">
+      <header className="flex items-start justify-between gap-3 border-b border-border p-4 sm:px-5"><div><h2 className="text-[17px] font-bold">关联 Agent 节点</h2><p className="mt-1 text-[12px] leading-5 text-muted-foreground">{platformLabel(account.platform)} · {account.display_name || account.account_handle}。选择实际使用此账号的节点。</p></div><button type="button" onClick={onClose} disabled={saving} aria-label="关闭节点关联" className="rounded-lg p-2 text-muted-foreground hover:bg-muted"><X className="h-5 w-5" /></button></header>
+      <div className="space-y-3 overflow-y-auto p-4 sm:p-5"><p className="text-[11px] leading-5 text-muted-foreground">每个节点在同一平台最多关联一个账号；可以稍后关联，账号资料已保存。</p>
+        {!eligibleAgents.length ? <p className="rounded-lg border border-dashed border-border p-5 text-center text-[12px] text-muted-foreground">暂无支持此平台的可选节点。</p> : eligibleAgents.map(agent => {
+          const selected = selectedAgentIds.includes(agent.id)
+          const existing = agent.accounts.find(current => current.platform === account.platform && current.id !== account.id)
+          return <label key={agent.id} className={cn('flex cursor-pointer items-start gap-3 rounded-xl border p-3', selected ? 'border-primary bg-primary/[0.035]' : 'border-border')}><input type="checkbox" checked={selected} disabled={saving} onChange={() => toggle(agent.id)} className="mt-1 h-4 w-4 accent-primary" /><span className="min-w-0 flex-1"><span className="block text-[13px] font-semibold">{agentName(agent)} <span className="font-normal text-muted-foreground">· {agent.online ? '在线' : '离线'}</span></span><span className="mt-1 block text-[11px] text-muted-foreground">{[agent.host_label, agent.browser_name, agent.operating_system].filter(Boolean).join(' · ') || '设备信息待上报'}</span>{existing && <span className={cn('mt-1 block text-[11px] leading-5', selected ? 'text-amber-700 dark:text-amber-300' : 'text-muted-foreground')}>当前账号：{existing.display_name || existing.account_handle || existing.platform_account_id || '未命名账号'}{selected ? '；保存后将替换为本账号' : ''}</span>}</span></label>
+        })}
+        {unavailableIds.length > 0 && <div className="space-y-2 rounded-xl border border-amber-500/25 p-3"><h3 className="text-[12px] font-semibold">当前已关联但不可用的节点</h3><p className="text-[11px] leading-5 text-muted-foreground">这些节点已不可用或不再支持此平台。取消勾选并保存会解除对应关联；取消本次操作则保持原状。</p>{unavailableIds.map(id => {
+          const selected = selectedAgentIds.includes(id)
+          const agent = agents.find(item => item.id === id)
+          const binding = account.bindings.find(item => item.agent_id === id)
+          return <label key={id} className="flex items-start gap-2 rounded-lg bg-muted/40 p-2.5 text-[12px]"><input type="checkbox" checked={selected} disabled={saving || !selected} onChange={() => toggle(id)} className="mt-0.5 h-4 w-4 accent-primary" /><span>{agent ? agentName(agent) : binding?.agent_display_name || `节点 ${id.slice(0, 8)}`}<span className="mt-1 block text-[10px] text-muted-foreground">{selected ? '当前关联，无法继续提交为新关联' : '保存后解除关联'}</span></span></label>
+        })}</div>}
+        {conflicts.length > 0 && <p className="rounded-lg bg-amber-500/10 p-3 text-[12px] leading-5 text-amber-800 dark:text-amber-200">保存后，将替换所选 {conflicts.length} 个节点在{platformLabel(account.platform)}的当前账号关联，请确认节点上实际登录的是本账号。</p>}
+        {selectedAgentIds.length === 0 && (account.bindings || []).some(binding => binding.status === 'current') && <p className="text-[12px] text-amber-700 dark:text-amber-300">当前未选择节点，保存后将解除本账号的所有节点关联。</p>}
+        {error && <p role="alert" className="rounded-lg bg-destructive/5 px-3 py-2 text-[12px] text-destructive">{error}。账号资料已保留，可重试关联。</p>}
+      </div>
+      <footer className="flex items-center justify-between gap-3 border-t border-border p-4 pb-[max(1rem,env(safe-area-inset-bottom))]"><span className="text-[11px] text-muted-foreground">已选 {selectedAgentIds.length} 个节点</span><div className="flex gap-2"><Button variant="outline" disabled={saving} onClick={onClose}>稍后关联</Button><Button disabled={saving || selectedUnavailable.length > 0} onClick={onSave}>{saving && <Loader2 className="h-4 w-4 animate-spin" />}保存关联</Button></div></footer>
+    </section>
+  </div>
 }

@@ -254,6 +254,22 @@ function classificationSummary(classification) {
   return classification.ai_summary || classification.ai_result?.summary || classification.ai_result?.reason || '';
 }
 
+// The model runs outside the transaction. Only publish its result while the
+// exact input revision is still pending; a recapture or newer rejudgment wins.
+export async function persistPendingCommentAiClassification(tx, {tenantId, comment, classification}) {
+  if (!comment?.ai_input_version) return null;
+  return await tx.queryOne(`
+    UPDATE record_comments
+    SET sentiment = $1, is_negative = $2, category = $3, risk_level = $4,
+        ai_summary = $5, ai_result = $6::jsonb, ai_classified_at = now(), updated_at = now()
+    WHERE id = $7 AND tenant_id = $8 AND ai_classified_at IS NULL
+      AND updated_at = $9::timestamptz
+    RETURNING *
+  `, [classification.sentiment, classification.is_negative, classification.category,
+    classification.risk_level, classificationSummary(classification), JSON.stringify(classification.ai_result || {}),
+    comment.id, tenantId, comment.ai_input_version]);
+}
+
 function classificationChanged(comment, next, includeAiResult = false) {
   const baseChanged =
     Boolean(comment.is_negative) !== Boolean(next.is_negative) ||
@@ -389,7 +405,7 @@ async function upsertOfficialResponse(tx, { tenantId, recordId, platform, commen
   ]);
 }
 
-async function aggregateRecordComments(tx, tenantId, recordId) {
+export async function aggregateRecordComments(tx, tenantId, recordId) {
   const aggregate = await tx.queryOne(`
     SELECT
       COUNT(*) FILTER (WHERE is_negative AND NOT is_official) AS negative_count,
@@ -528,7 +544,7 @@ async function mapLimit(items, limit, fn) {
 
 // 评论写库后:重算事实计数与官方回复状态，只追加提醒，绝不改人工处理状态。
 // Phase A(规则入库后)与 Phase B(AI 精炼后)共用。
-async function finalizeRecordAggregate(tx, { tenantId, recordId, previousAggregate }) {
+export async function finalizeRecordAggregate(tx, { tenantId, recordId, previousAggregate }) {
   const aggregate = await aggregateRecordComments(tx, tenantId, recordId);
   const responseFacts = resolveOfficialResponseFacts(aggregate);
   await tx.execute(`
@@ -676,7 +692,12 @@ async function refineCommentsWithAIUnderLease(
 ) {
   const pending = await queryAll(`
     SELECT rc.id, rc.record_id, rc.tenant_id, rc.content, rc.author_name, rc.like_count, rc.ip_location,
-           rc.ai_result, rc.updated_at,
+           rc.parent_comment_id,
+           (SELECT parent.content FROM record_comments parent
+            WHERE parent.tenant_id = rc.tenant_id AND parent.record_id = rc.record_id
+              AND parent.external_comment_id = rc.parent_comment_id AND rc.parent_comment_id <> ''
+            LIMIT 1) AS parent_comment_content,
+           rc.ai_result, rc.updated_at, rc.updated_at::text AS ai_input_version,
            r.title AS r_title, r.content AS r_content, r.platform AS r_platform,
            r.sentiment AS r_sentiment, r.category AS r_category, r.record_type AS r_type,
            r.negative_comment_count AS r_neg
@@ -720,7 +741,8 @@ async function refineCommentsWithAIUnderLease(
       try {
         ai = await classifyCommentsBatch({
           tenantId, record,
-          comments: batch.map(c => ({ author_name: c.author_name, content: c.content, like_count: c.like_count, ip_location: c.ip_location })),
+          comments: batch.map(c => ({ author_name: c.author_name, content: c.content, like_count: c.like_count, ip_location: c.ip_location,
+            parent_comment_id: c.parent_comment_id, parent_comment_content: c.parent_comment_content })),
         });
       } catch (err) {
         console.error('[CommentRefine] 批量分类失败,留待下轮:', err.message);
@@ -755,14 +777,16 @@ async function refineCommentsWithAIUnderLease(
                 commentAiRuleFallbackReason: 'permanent_failure_limit',
               } : {}),
             };
-            await tx.execute(`
+            const settled = await tx.queryOne(`
               UPDATE record_comments
               SET ai_result = COALESCE(ai_result, '{}'::jsonb) || $1::jsonb,
                   ai_classified_at = CASE WHEN $2 THEN now() ELSE ai_classified_at END,
                   updated_at = now()
-              WHERE id = $3 AND ai_classified_at IS NULL
-            `, [JSON.stringify(errorMetadata), settleWithRuleFallback, comment.id]);
-            if (settleWithRuleFallback) changed += 1;
+              WHERE id = $3 AND tenant_id = $4 AND ai_classified_at IS NULL
+                AND updated_at = $5::timestamptz
+              RETURNING id
+            `, [JSON.stringify(errorMetadata), settleWithRuleFallback, comment.id, tenantId, comment.ai_input_version]);
+            if (settled && settleWithRuleFallback) changed += 1;
           }
           if (isPermanentCommentAiFailure(error)
               && batch.some(comment => commentAiRetryAttempts(comment) + 1 >= COMMENT_AI_PERMANENT_FAILURE_LIMIT)) {
@@ -778,13 +802,10 @@ async function refineCommentsWithAIUnderLease(
         for (let j = 0; j < batch.length; j++) {
           const cls = ai[j];
           if (!cls) continue; // 单条缺失:留待下轮
-          const updatedRow = await tx.queryOne(`
-            UPDATE record_comments
-            SET sentiment = $1, is_negative = $2, category = $3, risk_level = $4,
-                ai_summary = $5, ai_result = $6::jsonb, ai_classified_at = now(), updated_at = now()
-            WHERE id = $7
-            RETURNING *
-          `, [cls.sentiment, cls.is_negative, cls.category, cls.risk_level, classificationSummary(cls), JSON.stringify(cls.ai_result || {}), batch[j].id]);
+          const updatedRow = await persistPendingCommentAiClassification(tx, {
+            tenantId, comment: batch[j], classification: cls,
+          });
+          if (!updatedRow) continue;
           if (updatedRow && recForLead) {
             await upsertCommentLeadForComment(tx, { tenantId, record: recForLead, comment: updatedRow });
           }

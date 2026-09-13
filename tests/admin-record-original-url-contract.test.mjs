@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {readFileSync} from 'node:fs';
+import { createRequire } from 'node:module';
+
+const ts = createRequire(new URL('../web/admin/package.json', import.meta.url))('typescript');
+const compiled = ts.transpileModule(readFileSync(new URL('../web/admin/src/lib/comment-leads.ts', import.meta.url), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+}).outputText;
+const { commentLeadSource } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 
 const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
@@ -75,9 +82,9 @@ test('all record-centric admin surfaces avoid stale Xiaohongshu hrefs', () => {
   const ticketDrawer = source('web/admin/src/components/shared/TicketDrawer.tsx');
   const data = source('web/admin/src/pages/DataPage.tsx');
   assert.doesNotMatch(leads, /href=\{lead\.record_url\}/);
-  assert.match(leads, /id: lead\.record_id, platform: lead\.platform, url: lead\.record_url/);
+  assert.match(leads, /record=\{commentLeadSource\(lead\)\}/);
   assert.doesNotMatch(commentLeadDrawer, /href=\{lead\.record_url\}/);
-  assert.match(commentLeadDrawer, /id: lead\.record_id, platform: lead\.platform, url: lead\.record_url/);
+  assert.match(commentLeadDrawer, /record=\{detail\.record \|\| commentLeadSource\(lead\)\}/);
   assert.doesNotMatch(ticketDrawer, /href=\{postUrl\}/);
   assert.match(ticketDrawer, /id: rec\?\.id \|\| t\.source_record_id \|\| cmt\?\.record_id/);
   assert.match(data, /const sourceRecord = mobileSourceRecord\(row, table\)/);
@@ -96,4 +103,25 @@ test('admin workbench distinguishes titleless Xiaohongshu notes from failed deta
   assert.match(helper, /failed && \(placeholder \|\| \(!title && !content\)\)/);
   assert.match(helper, /return String\(record\.title \|\| record\.content \|\| fallback\)/);
   assert.match(data, /col\('title', '标题', \(r, ctx\) => longCell\(recordDisplayTitle\(r\), 180, ctx\)\)/);
+});
+
+
+test('comment source uses the current parent URL and preserves Xiaohongshu token and identity', () => {
+  const currentUrl = 'https://www.xiaohongshu.com/explore/66abcdef1234567890abcdef?xsec_token=current%2Btoken&xsec_source=pc_search';
+  const lead = {
+    id: 'lead-1', record_id: 'record-1', status: 'new', lead_type: 'sales_intent', priority: 'normal',
+    platform: 'xiaohongshu',
+    record_url: 'https://www.xiaohongshu.com/explore/66abcdef1234567890abcdef?xsec_token=old-token',
+    record_current_url: currentUrl,
+    record_canonical_url: 'https://www.xiaohongshu.com/explore/66abcdef1234567890abcdef',
+    record_external_id: '66abcdef1234567890abcdef',
+  };
+  const resolved = commentLeadSource(lead);
+  assert.equal(resolved.url, currentUrl);
+  assert.equal(new URL(resolved.url).searchParams.get('xsec_token'), 'current+token');
+  assert.equal(resolved.external_id, lead.record_external_id);
+  assert.equal(resolved.canonical_url, lead.record_canonical_url);
+  assert.equal(resolved.id, 'record-1');
+  assert.equal(commentLeadSource({ ...lead, record_current_url: '' }).url, lead.record_url);
+  assert.equal(commentLeadSource({ ...lead, record_current_url: undefined }).url, lead.record_url);
 });

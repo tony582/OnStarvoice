@@ -63,6 +63,43 @@ async function findOtherActiveTicket(tx, ticket, tenantId) {
   );
 }
 
+// The caller already holds the comment source lock before its ticket lock.
+// Closing a ticket completes only its own still-ticketed source. Reopening may
+// reverse that completion, but never a later independent human disposition.
+async function updateCommentLeadForTicketLifecycle(tx, { ticket, tenantId, action, actorId, actorName, note = '' }) {
+  if (ticket.source_type !== 'comment' || !ticket.source_comment_id) return null;
+  const lead = await tx.queryOne('SELECT id, status FROM comment_leads WHERE tenant_id = $1 AND id = $2', [tenantId, ticket.source_comment_id]);
+  if (!lead) return null;
+  const otherActive = await findOtherActiveTicket(tx, ticket, tenantId);
+  let nextStatus = lead.status;
+  if (action === 'close' && lead.status === 'ticketed' && !otherActive) nextStatus = 'resolved';
+  if (action === 'reopen' && !otherActive && lead.status === 'resolved') {
+    const latestTransition = await tx.queryOne(`
+      SELECT action, metadata FROM comment_lead_activities
+      WHERE tenant_id = $1 AND lead_id = $2 AND status_from IS NOT NULL AND status_to IS NOT NULL
+        AND status_from <> status_to
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    `, [tenantId, lead.id]);
+    if (latestTransition?.action === 'ticket_closed' && latestTransition.metadata?.ticket_id === ticket.id) nextStatus = 'ticketed';
+  }
+  const changed = nextStatus !== lead.status;
+  if (changed) {
+    await tx.execute(`UPDATE comment_leads SET status = $3, handled_by = $4,
+      handled_name = $5, handled_at = now(), updated_at = now()
+      WHERE tenant_id = $1 AND id = $2`, [tenantId, lead.id, nextStatus, actorId, actorName]);
+  }
+  await tx.execute(`
+    INSERT INTO comment_lead_activities
+      (tenant_id, lead_id, action, status_from, status_to, note, actor_id, actor_name, metadata)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+  `, [tenantId, lead.id, action === 'close' ? 'ticket_closed' : 'ticket_reopened', lead.status, nextStatus,
+    `${action === 'close' ? '工单已结案' : '工单已重开'}${ticket.external_ticket_no ? `：${ticket.external_ticket_no}` : ''}${note ? `；${note}` : ''}`,
+    actorId, actorName, JSON.stringify({ ticket_id: ticket.id, ticket_status: ticket.status,
+      external_ticket_no: ticket.external_ticket_no || '', workflow_changed: changed,
+      blocking_ticket_id: otherActive?.id || null })]);
+  return { leadId: lead.id, status: nextStatus, changed, blockedByActiveTicket: Boolean(otherActive) };
+}
+
 async function archiveContentRecordForTicketClose(tx, {
   ticket,
   tenantId,
@@ -260,6 +297,7 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
     if (!snap) return res.status(404).json({ ok: false, error: 'not_found', message: '来源不存在' });
 
     const ticketResult = await withTransaction(async (tx) => {
+      let previousCommentStatus = null;
       if (sourceType === 'content') {
         const lifecycle = await getRecordLifecycle({
           tenantId: req.tenantId,
@@ -271,10 +309,11 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
         if (lifecycle.archived_at) return { archived: true };
       } else {
         const lockedComment = await tx.queryOne(
-          `SELECT id FROM comment_leads WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+          `SELECT id, status FROM comment_leads WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
           [sourceId, req.tenantId],
         );
         if (!lockedComment) return { notFound: true };
+        previousCommentStatus = lockedComment.status;
       }
 
       // 锁住来源后再防重，避免并发请求为同一来源创建两张在途工单。
@@ -398,6 +437,14 @@ router.post('/', requireTenantAccess, requireTenantWriter, async (req, res, next
            WHERE id = $1 AND tenant_id = $2`,
           [sourceId, req.tenantId],
         );
+        await tx.execute(`
+          INSERT INTO comment_lead_activities
+            (tenant_id, lead_id, action, status_from, status_to, note, actor_id, actor_name, metadata)
+          VALUES ($1, $2, 'ticket_created', $3, 'ticketed', $4, $5, $6, $7::jsonb)
+        `, [req.tenantId, sourceId, previousCommentStatus,
+          `已转工单${row.external_ticket_no ? `：${row.external_ticket_no}` : ''}${dispatchNote ? `；${dispatchNote}` : ''}`,
+          req.user?.id || null, req.user?.name || req.user?.email || '',
+          JSON.stringify({ ticket_id: row.id, external_ticket_no: row.external_ticket_no || '', assignee_name: row.assignee_name || '' })]);
       }
       return { ticket: row };
     });
@@ -1003,7 +1050,10 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
             actorName: req.actorName || actor,
           })
         : null;
-      return { row, recordArchive, idempotent: false };
+      const commentLead = ['close', 'reopen'].includes(action)
+        ? await updateCommentLeadForTicketLifecycle(tx, { ticket: row, tenantId: req.tenantId, action, actorId, actorName: actor, note: note || result })
+        : null;
+      return { row, recordArchive, commentLead, idempotent: false };
     });
 
     if (outcome.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在' });
@@ -1029,6 +1079,7 @@ router.patch('/:id', requireTenantAccess, requireTenantWriter, async (req, res, 
       });
     }
     const response = { ok: true, ticket: outcome.row };
+    if (outcome.commentLead) response.commentLead = outcome.commentLead;
     if (outcome.recordArchive) {
       response.recordArchived = outcome.recordArchive.archived;
       response.recordArchiveChanged = outcome.recordArchive.changed;
@@ -1075,6 +1126,10 @@ router.patch('/:id/review', requireTenantAccess, requireTenantWriter, async (req
       if (decision === 'reopen' && current.source_type === 'content') {
         return { invalidState: 'content_reopen_not_allowed' };
       }
+      if (decision === 'reopen' && current.source_type === 'comment') {
+        const activeTicket = await findOtherActiveTicket(tx, current, req.tenantId);
+        if (activeTicket) return { activeTicket };
+      }
       const row = await tx.queryOne(
         `UPDATE tickets
          SET status = $3, feedback_status = $4, reviewed_by_user_id = $5, reviewed_by_name = $6,
@@ -1099,7 +1154,10 @@ router.patch('/:id/review', requireTenantAccess, requireTenantWriter, async (req
             actorName: req.actorName || actor,
           })
         : null;
-      return { row, recordArchive };
+      const commentLead = await updateCommentLeadForTicketLifecycle(tx, {
+        ticket: row, tenantId: req.tenantId, action: decision === 'confirm' ? 'close' : 'reopen', actorId, actorName: actor, note,
+      });
+      return { row, recordArchive, commentLead };
     });
     if (outcome.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '工单不存在或不在待确认状态' });
     if (outcome.invalidState === 'content_reopen_not_allowed') {
@@ -1109,7 +1167,9 @@ router.patch('/:id/review', requireTenantAccess, requireTenantWriter, async (req
         message: '内容工单不支持审核退回；如需再次处理，请确认结案后取消归档并新建工单',
       });
     }
+    if (outcome.activeTicket) return res.status(409).json({ ok: false, error: 'active_ticket_exists', message: '该评论已有另一张未结案工单，不能重开旧工单' });
     const response = { ok: true, ticket: outcome.row };
+    if (outcome.commentLead) response.commentLead = outcome.commentLead;
     if (outcome.recordArchive) {
       response.recordArchived = outcome.recordArchive.archived;
       response.recordArchiveChanged = outcome.recordArchive.changed;

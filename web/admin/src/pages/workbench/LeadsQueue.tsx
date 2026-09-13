@@ -1,11 +1,12 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import {
-  ChevronLeft, ChevronRight, Loader2, MessageSquareWarning,
-  RefreshCw, Search, CheckCheck, CircleSlash, Footprints, Sparkles, Download,
-  X, ArrowUp, ArrowDown, ChevronsUpDown,
+  ChevronLeft, ChevronRight, Loader2, MessageSquareWarning, RefreshCw, Search,
+  CheckCheck, CircleSlash, Footprints, Sparkles, Download, X, ArrowUp, ArrowDown,
+  ChevronsUpDown, History, ArchiveRestore, Square, FileText,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { compact, formatDateCompact, formatNumber, LABELS, platformName, cn } from '@/lib/utils'
+import { formatDateCompact, formatNumber, LABELS, platformName, cn } from '@/lib/utils'
+import { COMMENT_LEAD_TYPES, COMMENT_LEAD_STATUSES, commentLeadIsArchived, commentLeadSource, commentLeadJudgment, commentLeadStatusLabel, commentLeadTicketStatusLabel, type CommentLead } from '@/lib/comment-leads'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -14,7 +15,6 @@ import { WorkbenchSelect, WorkbenchTableShell, WorkbenchTabs, WorkbenchToolbar }
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import { MultiSelect } from '@/components/shared/MultiSelect'
 import { DateRangeFilter, type DateBasis } from '@/components/shared/DateRangeFilter'
-import { Tooltip } from '@/components/shared/Tooltip'
 import { BatchBar, Checkbox, useSelection } from '@/components/shared/BatchBar'
 import { CommentLeadDrawer } from '@/components/shared/CommentLeadDrawer'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
@@ -23,60 +23,29 @@ import { useTicketDispatch } from '@/components/shared/TicketDispatch'
 import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 
-const STATUS_OPTIONS = [
-  { value: '', label: '全部状态' },
-  { value: 'new', label: '新线索' },
-  { value: 'following', label: '跟进中' },
-  { value: 'resolved', label: '已处理' },
-  { value: 'ignored', label: '已忽略' },
-]
-// 评论分诊与内容分诊同构:两个 MECE 桶。转工单后离开分诊视图(在工单系统里跟踪)。
-const OPINION_TABS = [
-  { value: 'pending', label: '待处理' },
-  { value: 'archived', label: '已归档' },
-]
-const TYPE_OPTIONS = [
-  { value: '', label: '全部类型' },
-  { value: 'complaint', label: '投诉维权' },
-  { value: 'renewal_billing', label: '续费收费' },
-  { value: 'app_issue', label: 'App故障' },
-  { value: 'service_quality', label: '服务求助' },
-  { value: 'safety_privacy', label: '安全隐私' },
-  { value: 'brand_risk', label: '品牌风险' },
-  { value: 'other', label: '其他跟进' },
-]
-const PRIORITY_OPTIONS = [
-  { value: '', label: '全部优先级' },
-  { value: 'urgent', label: '紧急' },
-  { value: 'high', label: '高' },
-  { value: 'normal', label: '普通' },
-  { value: 'low', label: '低' },
-]
-const PLATFORM_OPTIONS = [
-  { value: '', label: '全部平台' },
-  { value: 'xiaohongshu', label: '小红书' },
-  { value: 'douyin', label: '抖音' },
-  { value: 'weibo', label: '微博' },
-]
-// 类型多选选项(去掉「全部」与 sales_intent)
-const LEAD_TYPE_MULTI = TYPE_OPTIONS.filter(o => o.value && o.value !== 'sales_intent').map(o => ({ value: o.value, label: o.label }))
 type LeadSortField = 'publish' | 'first_seen' | 'last_seen'
+type Pagination = { page: number; totalPages: number; total: number }
+type RejudgeResult = { scanned: number; changed: number; retained: number; failed: number; skipped: number; total: number; hasMore: boolean; nextCursor?: string }
 
 export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record<string, string>; category?: 'opinion' | 'sales' }) {
   const isSales = category === 'sales'
   const noun = isSales ? '销售客资' : '评论'
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
-  const [leads, setLeads] = useState<any[]>([])
-  const [pagination, setPagination] = useState<any>(null)
+  const writable = canWrite()
+  const [leads, setLeads] = useState<CommentLead[]>([])
+  const [pagination, setPagination] = useState<Pagination | null>(null)
+  const [pageSize, setPageSize] = useState(30)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [status, setStatus] = useState(initial?.status ?? (category === 'sales' ? '' : 'pending'))
+  const [bucket, setBucket] = useState(initial?.bucket === 'archived' || ['resolved', 'ignored'].includes(initial?.status || '') ? 'archived' : 'active')
+  const [status, setStatus] = useState(COMMENT_LEAD_STATUSES.some(option => option.value === initial?.status) ? initial!.status : '')
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [leadType, setLeadType] = useState<string[]>(initial?.leadType ? [initial.leadType] : [])
   const [priority, setPriority] = useState(initial?.priority ?? '')
   const [keyword, setKeyword] = useState(initial?.keyword ?? '')
-  const [sort, setSort] = useState<{ field: '' | LeadSortField; dir: 'asc' | 'desc' }>({ field: '', dir: 'desc' })
+  const [keywordDraft, setKeywordDraft] = useState(initial?.keyword ?? '')
+  const [sort, setSort] = useState<{ field: LeadSortField; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
   const [captureKeywords, setCaptureKeywords] = useState<string[]>([])
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
@@ -84,462 +53,217 @@ export function LeadsQueue({ initial, category = 'opinion' }: { initial?: Record
   const [koe, setKoe] = useState('')
   const [exporting, setExporting] = useState(false)
   const [rejudging, setRejudging] = useState(false)
+  const [rejudgeProgress, setRejudgeProgress] = useState<{ scanned: number; changed: number; failed: number; skipped: number; total: number } | null>(null)
   const [notice, setNotice] = useState('')
   const [batchBusy, setBatchBusy] = useState(false)
-  const [drawer, setDrawer] = useState<any>(null)
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [drawer, setDrawer] = useState<{ lead: CommentLead; tab: 'content' | 'history' | 'ticket' } | null>(null)
+  const requestSeq = useRef(0)
+  const currentListPage = useRef(1)
+  const stopRejudge = useRef(false)
+  const mounted = useRef(true)
   const { ask, dialog } = useNotePrompt()
   const { dispatch, dialog: dispatchDialog } = useTicketDispatch()
 
-  const sel = useSelection(`${status}|${platform}|${leadType}|${priority}|${keyword}|${pagination?.page ?? 1}`)
-
   const filterParams = useCallback(() => {
-    const params = new URLSearchParams({ category })
-    if (isSales) { if (status) params.set('status', status) }
-    else params.set('bucket', status || 'pending')
+    const params = new URLSearchParams({ category, bucket })
+    if (status) params.set('status', status)
     if (platform) params.set('platform', platform)
-    if (!isSales) leadType.forEach(t => params.append('leadType', t))
+    if (!isSales) leadType.forEach(type => params.append('leadType', type))
     if (priority) params.set('priority', priority)
-    if (keyword.trim()) params.set('keyword', keyword.trim())
-    if (sort.field) { params.set('sort', sort.field); params.set('dir', sort.dir) }
-    if (koe && !isSales) params.set('koe', koe)
-    captureKeywords.forEach(k => params.append('captureKeyword', k))
+    if (keyword) params.set('keyword', keyword)
+    params.set('sort', sort.field); params.set('dir', sort.dir)
+    if (koe) params.set('koe', koe)
+    captureKeywords.forEach(item => params.append('captureKeyword', item))
     if (dateFrom) params.set('dateFrom', dateFrom)
     if (dateTo) params.set('dateTo', dateTo)
     if (dateFrom || dateTo) params.set('dateBasis', dateBasis)
     return params
-  }, [status, platform, leadType, priority, keyword, sort, category, isSales, koe, captureKeywords, dateFrom, dateTo, dateBasis])
+  }, [bucket, status, platform, leadType, priority, keyword, sort, category, isSales, koe, captureKeywords, dateFrom, dateTo, dateBasis])
 
-  const load = useCallback((page = 1) => Promise.resolve().then(async () => {
-    setLoading(true)
-    setError('')
+  const sel = useSelection(`${filterParams().toString()}|${pageSize}|${pagination?.page ?? 1}`)
+  const load = useCallback(async (page = 1) => {
+    const seq = ++requestSeq.current
+    currentListPage.current = page
+    setLoading(true); setError('')
     try {
       const params = filterParams()
-      params.set('page', String(page))
-      params.set('pageSize', '30')
-      const data = await api.get<any>('/leads/comments?' + params.toString())
-      setLeads(data.leads || [])
-      setPagination(data.pagination || null)
+      params.set('page', String(page)); params.set('pageSize', String(pageSize))
+      const data = await api.get<{ leads: CommentLead[]; pagination: Pagination }>('/leads/comments?' + params.toString())
+      if (seq !== requestSeq.current) return
+      setLeads(data.leads || []); setPagination(data.pagination || null)
+      if (!data.leads?.length && page > 1 && data.pagination) {
+        params.set('page', String(Math.max(1, data.pagination.totalPages)))
+        const lastPage = await api.get<{ leads: CommentLead[]; pagination: Pagination }>('/leads/comments?' + params.toString())
+        if (seq === requestSeq.current) { currentListPage.current = lastPage.pagination?.page || 1; setLeads(lastPage.leads || []); setPagination(lastPage.pagination || null) }
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : `${noun}加载失败`)
-    } finally {
-      setLoading(false)
-    }
-  }), [filterParams, noun])
+      if (seq === requestSeq.current) setError(err instanceof Error ? err.message : `${noun}加载失败`)
+    } finally { if (seq === requestSeq.current) setLoading(false) }
+  }, [filterParams, pageSize, noun])
 
+  const latestLoad = useRef(load)
+  useEffect(() => { latestLoad.current = load }, [load])
+
+  useEffect(() => {
+    let active = true
+    stopRejudge.current = true
+    queueMicrotask(() => { if (active) void load(1) })
+    return () => { active = false }
+  }, [load])
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false; requestSeq.current += 1; stopRejudge.current = true }
+  }, [])
+
+  const reloadAfterMutation = useCallback(async () => { await latestLoad.current(currentListPage.current); refreshBadges() }, [refreshBadges])
+  const openDrawer = (lead: CommentLead, tab: 'content' | 'history' | 'ticket' = 'content') => {
+    stopRejudge.current = true
+    setDrawer({ lead, tab })
+  }
+  const updateLeadStatus = async (id: string, nextStatus: string): Promise<boolean> => {
+    const note = await ask({ title: `${noun}处理备注`, placeholder: '记录本次处理、恢复原因或后续安排', confirmLabel: '保存状态' })
+    if (note === null) return false
+    setBusyId(id)
+    try { await api.patch('/leads/comments/' + id, { status: nextStatus, ...(note.trim() ? { note: note.trim() } : {}) }); await reloadAfterMutation(); return true }
+    finally { setBusyId(null) }
+  }
+  const runRowStatus = async (id: string, nextStatus: string) => {
+    try { await updateLeadStatus(id, nextStatus) }
+    catch (err) { setError(err instanceof Error ? err.message : '处理失败，请重试') }
+  }
+  const dispatchTicket = async (lead: CommentLead): Promise<boolean> => {
+    const result = await dispatch({ sourceType: 'comment', summary: lead.comment_content || '', defaultPriority: lead.priority })
+    if (!result) return false
+    await api.post('/tickets', { sourceType: 'comment', sourceId: lead.id, externalTicketNo: result.externalTicketNo, priority: result.priority, assigneeUserId: result.assigneeUserId, assigneeName: result.assigneeName, note: result.note })
+    await reloadAfterMutation()
+    return true
+  }
+  const runBatch = async (nextStatus: string) => {
+    if (!sel.count || batchBusy) return
+    const note = await ask({ title: `批量${commentLeadStatusLabel(nextStatus)}`, helpText: `本次处理 ${sel.count} 条${noun}，备注将保存在每条跟进记录中。`, confirmLabel: '确认处理' })
+    if (note === null) return
+    setBatchBusy(true); setError('')
+    try {
+      const result = await api.patch<{ updated: number; skipped?: string[] }>('/leads/comments/batch', { ids: [...sel.selected], status: nextStatus, ...(note.trim() ? { note: note.trim() } : {}) })
+      setNotice(`已更新 ${result.updated} 条${result.skipped?.length ? `，${result.skipped.length} 条未更新，请刷新核对` : ''}`)
+      sel.clear(); await reloadAfterMutation()
+    } catch (err) { setError(err instanceof Error ? err.message : '批量处理失败，请重试') }
+    finally { setBatchBusy(false) }
+  }
+  const rejudgeSales = async () => {
+    if (rejudging) return
+    stopRejudge.current = false; setRejudging(true); setNotice(''); setRejudgeProgress(null); setError('')
+    let cursor: string | undefined
+    let scanned = 0, changed = 0, failed = 0, skipped = 0, total = 0
+    let failureMessage = ''
+    try {
+      while (!stopRejudge.current) {
+        const result = await api.post<RejudgeResult>('/leads/comments/rejudge-sales', { limit: 3, ...(cursor ? { cursor } : {}) })
+        scanned += result.scanned || 0; changed += result.changed || 0; failed += result.failed || 0; skipped += result.skipped || 0; total = Math.max(total, result.total || 0)
+        if (!mounted.current) return
+        setRejudgeProgress({ scanned, changed, failed, skipped, total })
+        if (!result.hasMore) break
+        if (!result.nextCursor || result.nextCursor === cursor) throw new Error('本批已完成，但未返回下一批位置，已停止重判。')
+        cursor = result.nextCursor
+      }
+      if (mounted.current) setNotice(`${stopRejudge.current ? '已停止后续重判' : '重判完成'}：检查 ${scanned} 条，移出非购买评论 ${changed} 条${failed ? `，${failed} 条判断失败、保留原结果` : ''}${skipped ? `，${skipped} 条处理期间数据发生变化或已有人工修正，已跳过、待核对` : ''}。`)
+    } catch (err) {
+      failureMessage = `${err instanceof Error ? err.message : '重判失败'}；已停止后续批次，可重新开始。`
+    } finally {
+      if (mounted.current) { setRejudging(false); await reloadAfterMutation(); if (failureMessage) setError(failureMessage) }
+    }
+  }
   const exportXlsx = async () => {
     setExporting(true)
     try { await api.download('/leads/comments/export?' + filterParams().toString(), `${noun}.xlsx`) }
-    catch { setNotice('导出失败,请稍后重试'); window.setTimeout(() => setNotice(''), 4000) }
+    catch (err) { setError(err instanceof Error ? err.message : '导出失败，请重试') }
     finally { setExporting(false) }
   }
+  const toggleSort = (field: LeadSortField) => setSort(value => value.field === field ? { field, dir: value.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
+  const hasFilters = Boolean(status || platform || leadType.length || priority || keyword || koe || captureKeywords.length || dateFrom || dateTo)
+  const clearFilters = () => { setStatus(''); setPlatform(''); setLeadType([]); setPriority(''); setKeyword(''); setKeywordDraft(''); setKoe(''); setCaptureKeywords([]); setDateFrom(''); setDateTo('') }
+  const allChecked = leads.length > 0 && leads.every(lead => sel.has(lead.id))
+  const someChecked = leads.some(lead => sel.has(lead.id))
+  const statusOptions = COMMENT_LEAD_STATUSES.filter(option => bucket === 'archived' ? ['resolved', 'ignored'].includes(option.value) : ['new', 'following', 'ticketed'].includes(option.value))
 
-  // 文本搜索保留“回车/按钮提交”，其余筛选项仍即时刷新。
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { void load(1) }, [status, platform, leadType, priority, category, sort, koe, captureKeywords, dateFrom, dateTo, dateBasis])
-
-  // 点表头排序:点未激活列 → 降序;再点 → 升/降切换
-  const toggleSort = (field: LeadSortField) =>
-    setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
-  const hasActiveFilters = Boolean(platform || leadType.length || priority || keyword || (!isSales && koe) || captureKeywords.length || sort.field || dateFrom || dateTo)
-  const clearFilters = () => {
-    setPlatform(''); setLeadType([]); setPriority(''); setKeyword(''); setKoe(''); setCaptureKeywords([]); setSort({ field: '', dir: 'desc' }); setDateFrom(''); setDateTo('')
-  }
-
-  const reloadAfterMutation = useCallback(async () => {
-    const page = pagination?.page || 1
-    const willEmpty = leads.length <= 1 && page > 1
-    await load(willEmpty ? page - 1 : page)
-    refreshBadges()
-  }, [load, pagination, leads.length, refreshBadges])
-
-  const rejudgeSales = async () => {
-    setRejudging(true); setNotice('')
-    try {
-      const r = await api.post<any>('/leads/comments/rejudge-sales', { limit: 100 })
-      const tail = (r.total || 0) > (r.scanned || 0) ? `(共 ${r.total} 条,可再点继续)` : ''
-      setNotice(`AI 重判完成:扫描 ${r.scanned} 条,移出 ${r.changed} 条非购买线索到评论分诊${tail}`)
-      await reloadAfterMutation()
-    } catch {
-      setNotice('重判失败,请稍后重试')
-    } finally {
-      setRejudging(false)
-      window.setTimeout(() => setNotice(''), 6000)
-    }
-  }
-
-  const updateLeadStatus = async (id: string, nextStatus: string): Promise<boolean> => {
-    const note = await ask({ title: `${noun}处理备注`, placeholder: '例如：已私信用户跟进 / 已转交销售 / 与本品牌无关' })
-    if (note === null) return false // 取消则不处理，避免误点即消失
-    await api.patch('/leads/comments/' + id, { status: nextStatus, note })
-    await reloadAfterMutation()
-    return true
-  }
-
-  const dispatchTicket = async (lead: any): Promise<boolean> => {
-    const r = await dispatch({ sourceType: 'comment', summary: lead.comment_content, defaultPriority: lead.priority })
-    if (!r) return false
-    await api.post('/tickets', { sourceType: 'comment', sourceId: lead.id, externalTicketNo: r.externalTicketNo, priority: r.priority, assigneeUserId: r.assigneeUserId, assigneeName: r.assigneeName, note: r.note })
-    await reloadAfterMutation()
-    return true
-  }
-
-  const runBatch = async (nextStatus: string) => {
-    if (sel.count === 0) return
-    setBatchBusy(true)
-    try {
-      await api.patch('/leads/comments/batch', { ids: [...sel.selected], status: nextStatus })
-      sel.clear()
-      await reloadAfterMutation()
-    } catch (err) { console.error(err) }
-    finally { setBatchBusy(false) }
-  }
-
-  const allChecked = leads.length > 0 && leads.every(l => sel.has(l.id))
-  const someChecked = leads.some(l => sel.has(l.id))
-
-  return (
-    <div className="space-y-3">
-      <WorkbenchTabs
-        tabs={(isSales ? STATUS_OPTIONS.map(o => ({ key: o.value, label: o.value ? o.label : '全部线索' })) : OPINION_TABS.map(o => ({ key: o.value, label: o.label })))}
-        activeKey={status}
-        onChange={setStatus}
-      />
-
-      <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? leads.length)} 条${noun}`}>
-        <WorkbenchSelect value={platform} onChange={e => setPlatform(e.target.value)}>
-          {PLATFORM_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </WorkbenchSelect>
-        {!isSales && (
-          <MultiSelect label="类型" options={LEAD_TYPE_MULTI} value={leadType} onChange={setLeadType} width="w-52" />
-        )}
-        {!isSales && (
-          <WorkbenchSelect value={koe} onChange={e => setKoe(e.target.value)}>
-            <option value="">全部来源</option>
-            <option value="hide">隐藏疑似KOE</option>
-            <option value="only">只看疑似KOE</option>
-          </WorkbenchSelect>
-        )}
-        <WorkbenchSelect value={priority} onChange={e => setPriority(e.target.value)}>
-          {PRIORITY_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </WorkbenchSelect>
-        <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
-        <DateRangeFilter from={dateFrom} to={dateTo} onChange={(f, t) => { setDateFrom(f); setDateTo(t) }} basis={dateBasis} onBasisChange={setDateBasis} />
-        {hasActiveFilters && (
-          <button onClick={clearFilters} title="清空所有筛选"
-            className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
-            <X className="h-3.5 w-3.5" />清空
-          </button>
-        )}
-        <div className="relative min-w-0 w-full flex-1 lg:min-w-[260px] lg:w-auto lg:flex-none">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={keyword}
-            onChange={e => setKeyword(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') load(1) }}
-            placeholder="搜索标题、评论、用户、IP"
-            className="h-8 pl-8 text-xs"
-          />
+  return <div className="space-y-3">
+    <WorkbenchTabs tabs={[{ key: 'active', label: '工作中' }, { key: 'archived', label: '已归档' }]} activeKey={bucket} onChange={value => { setBucket(value); setStatus('') }} />
+    <WorkbenchToolbar meta={`${formatNumber(pagination?.total ?? leads.length)} 条${noun}`}>
+      <WorkbenchSelect aria-label="处理状态筛选" value={status} onChange={event => setStatus(event.target.value)}><option value="">全部状态</option>{statusOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</WorkbenchSelect>
+      <WorkbenchSelect aria-label="平台筛选" value={platform} onChange={event => setPlatform(event.target.value)}><option value="">全部平台</option><option value="xiaohongshu">小红书</option><option value="douyin">抖音</option><option value="weibo">微博</option></WorkbenchSelect>
+      {!isSales && <MultiSelect label="类型" options={COMMENT_LEAD_TYPES.filter(option => option.value !== 'sales_intent')} value={leadType} onChange={setLeadType} width="w-48" />}
+      <WorkbenchSelect aria-label="来源筛选" value={koe} onChange={event => setKoe(event.target.value)}><option value="">全部来源</option><option value="hide">隐藏疑似 KOE</option><option value="only">只看疑似 KOE</option></WorkbenchSelect>
+      <WorkbenchSelect aria-label="优先级筛选" value={priority} onChange={event => setPriority(event.target.value)}><option value="">全部优先级</option><option value="urgent">紧急</option><option value="high">高</option><option value="normal">普通</option><option value="low">低</option></WorkbenchSelect>
+      <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
+      <DateRangeFilter from={dateFrom} to={dateTo} onChange={(from, to) => { setDateFrom(from); setDateTo(to) }} basis={dateBasis} onBasisChange={setDateBasis} />
+      {hasFilters && <button onClick={clearFilters} className="flex h-8 items-center gap-1 px-2 text-[12px] text-muted-foreground"><X className="h-3.5 w-3.5" />清空</button>}
+      <form className="relative min-w-0 flex w-full items-center gap-1 sm:w-64" onSubmit={event => { event.preventDefault(); setKeyword(keywordDraft.trim()); if (keywordDraft.trim() === keyword) void load(1) }}><Search className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground" /><Input aria-label="搜索评论、原帖、用户或 IP" value={keywordDraft} onChange={event => setKeywordDraft(event.target.value)} placeholder="搜索评论、原帖、用户、IP" className="h-8 pl-8 text-xs" /><Button type="submit" variant="outline" size="sm">搜索</Button></form>
+      <Button variant="outline" size="sm" disabled={loading} onClick={() => void load(pagination?.page || 1)}><RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />刷新</Button>
+      <Button variant="outline" size="sm" disabled={exporting} onClick={() => void exportXlsx()}><Download className="h-3.5 w-3.5" />{exporting ? '导出中…' : '导出'}</Button>
+      {isSales && writable && <Button variant="outline" size="sm" disabled={rejudging} onClick={() => void rejudgeSales()}><Sparkles className="h-3.5 w-3.5" />{rejudging ? 'AI 重判中…' : 'AI 重判'}</Button>}
+    </WorkbenchToolbar>
+    {rejudging && <div className="flex items-center justify-between gap-3 rounded-lg border border-primary/20 bg-primary/[0.04] px-4 py-2.5 text-[12px]"><span>逐批核对购买意向{rejudgeProgress ? `：已检查 ${rejudgeProgress.scanned} / ${rejudgeProgress.total} 条，移出 ${rejudgeProgress.changed} 条，失败 ${rejudgeProgress.failed} 条，跳过 ${rejudgeProgress.skipped} 条` : '，正在处理首批…'}</span><Button variant="outline" size="sm" onClick={() => { stopRejudge.current = true; setNotice('正在完成当前批次，随后停止重判。') }}><Square className="h-3 w-3" />停止</Button></div>}
+    {notice && <div role="status" className="rounded-lg border border-primary/20 bg-primary/[0.04] px-4 py-2.5 text-[12px]">{notice}</div>}
+    {error && <div role="alert" className="rounded-lg border border-destructive/20 bg-destructive/5 px-4 py-3 text-[13px] text-destructive">{error}</div>}
+    <WorkbenchTableShell mobileHint={false}>
+      {loading ? <div className="flex justify-center py-24"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div> : !leads.length ? <EmptyState icon={MessageSquareWarning} title={hasFilters ? '没有符合筛选条件的结果' : `暂无${bucket === 'archived' ? '已归档' : ''}${noun}`} description={hasFilters ? '调整筛选条件后重试。' : isSales ? '确认真实购买意向的评论会进入这里，可查看原帖、修正判断并记录跟进。' : '需要跟进的评论会进入这里，转工单后仍保留在工作中。'} /> : <>
+        <div className="space-y-2.5 bg-muted/20 p-2 lg:hidden">
+          {writable && <div className="flex items-center gap-2 rounded-xl bg-card p-3 text-[12px]"><Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(leads.map(lead => lead.id), !allChecked)} />全选本页<span className="ml-auto text-muted-foreground">已选 {sel.count} 条</span></div>}
+          {leads.map(lead => <article key={lead.id} className={cn('space-y-3 rounded-xl border border-border bg-card p-3.5', drawer?.lead.id === lead.id && 'ring-2 ring-primary/15')}>
+            <div className="flex items-center gap-2">{writable && <Checkbox checked={sel.has(lead.id)} onChange={() => sel.toggle(lead.id)} />}<StatusBadge tone="neutral">{platformName(lead.platform || '')}</StatusBadge><StatusBadge tone={lead.priority}>{LABELS.priority[lead.priority] || lead.priority}</StatusBadge><JudgmentBadge lead={lead} /><button onClick={() => openDrawer(lead)} className="ml-auto text-[12px] font-semibold text-primary">查看详情</button></div>
+            <button onClick={() => openDrawer(lead)} className="block w-full whitespace-pre-wrap break-words text-left text-[14px] leading-6">{lead.comment_content || '(无内容)'}</button>
+            <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground"><span>{lead.comment_author_name || '未知用户'}</span><span>IP {lead.comment_ip_location || '—'}</span><span>赞 {formatNumber(lead.comment_like_count)}</span><span>{lead.publish_display || '时间未知'}</span></div>
+            <div className="rounded-lg bg-muted/40 p-2.5"><div className="flex items-start gap-2"><span className="min-w-0 flex-1 text-[12px] leading-5">原帖：{lead.record_current_title || lead.record_title || '(无标题)'}</span><RecordSourceAction record={commentLeadSource(lead)} compact className="text-[11px]" /></div></div>
+            <LeadProgress lead={lead} onClick={() => openDrawer(lead, 'history')} />
+            <LeadActions lead={lead} canWrite={writable} busy={busyId === lead.id} onStatus={status => void runRowStatus(lead.id, status)} onNote={() => openDrawer(lead, 'history')} onTicket={() => openDrawer(lead, 'ticket')} />
+          </article>)}
         </div>
-        <Button variant="outline" size="sm" onClick={() => load(1)} disabled={loading}>
-          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-          刷新
-        </Button>
-        <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
-          <Download className={`h-3.5 w-3.5 ${exporting ? 'animate-pulse' : ''}`} />
-          {exporting ? '导出中…' : '导出'}
-        </Button>
-        {isSales && canWrite() && (
-          <Button variant="outline" size="sm" onClick={rejudgeSales} disabled={rejudging} title="用 AI 重新判断现有销售客资是否真为购买意向,非购买的移回评论分诊">
-            <Sparkles className={`h-3.5 w-3.5 ${rejudging ? 'animate-pulse' : ''}`} />
-            {rejudging ? 'AI 重判中…' : 'AI 重判'}
-          </Button>
-        )}
-      </WorkbenchToolbar>
-
-      {notice && <div className="rounded-lg border border-primary/20 bg-primary/[0.06] px-4 py-2.5 text-[13px] text-foreground">{notice}</div>}
-      {error && <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div>}
-
-      <WorkbenchTableShell mobileHint={false}>
-        {loading ? (
-          <div className="flex justify-center py-24"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
-        ) : !leads.length ? (
-          <EmptyState icon={MessageSquareWarning} title={`暂无${noun}`} description={isSales ? '采集评论后，含购买意向/询价/留联系方式的评论会沉淀到这里' : '采集评论并完成判断后，需跟进的负面/风险评论会沉淀到这里'} />
-        ) : (
-          <>
-            <div className="space-y-2.5 bg-muted/25 p-2 lg:hidden">
-              {canWrite() && (
-                <div className="flex min-h-11 items-center justify-between rounded-xl border border-border/60 bg-card px-3">
-                  <label className="flex cursor-pointer items-center gap-2 text-[12px] font-semibold text-foreground">
-                    <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(leads.map(l => l.id), !allChecked)} />
-                    全选本页
-                  </label>
-                  <span className="text-[11px] text-muted-foreground">已选 {sel.count} 条</span>
-                </div>
-              )}
-
-              {leads.map(lead => {
-                const isArchivedOpinion = !isSales && status === 'archived'
-                const nextAction = isSales
-                  ? lead.status === 'following'
-                    ? '正在跟进：完成沟通后记录处理结果'
-                    : lead.status === 'resolved'
-                      ? '已完成处理：可查看详情与处理留痕'
-                      : lead.status === 'ignored'
-                        ? '已忽略：如情况变化可重新开始跟进'
-                        : '下一步：尽快联系用户并确认购买需求'
-                  : isArchivedOpinion
-                    ? '已离开分诊：查看详情与历史处理留痕'
-                    : lead.priority === 'urgent' || lead.priority === 'high'
-                      ? '下一步：优先转工单，交给负责人闭环'
-                      : '下一步：判断是否转工单，或直接归档'
-
-                return (
-                  <article
-                    key={lead.id}
-                    onClick={() => setDrawer(lead)}
-                    className={cn(
-                      'relative overflow-hidden rounded-2xl border bg-card shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition-colors active:bg-accent/40',
-                      drawer?.id === lead.id ? 'border-primary/45 ring-2 ring-primary/10' : 'border-border/70',
-                      sel.has(lead.id) && 'border-primary/35 bg-primary/[0.025]',
-                    )}
-                  >
-                    <div className={cn(
-                      'absolute inset-y-0 left-0 w-1',
-                      lead.priority === 'urgent' ? 'bg-rose-500' : lead.priority === 'high' ? 'bg-amber-500' : lead.priority === 'low' ? 'bg-slate-300 dark:bg-slate-600' : 'bg-primary/60',
-                    )} />
-
-                    <div className="space-y-3 p-3.5 pl-4.5">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                          <StatusBadge tone={lead.priority}>{LABELS.priority[lead.priority] || lead.priority}</StatusBadge>
-                          <StatusBadge tone={lead.status}>{LABELS.leadStatus[lead.status] || lead.status}</StatusBadge>
-                          <StatusBadge tone="neutral">{platformName(lead.platform)}</StatusBadge>
-                          <StatusBadge tone="neutral">{LABELS.leadType[lead.lead_type] || lead.lead_type}</StatusBadge>
-                        </div>
-                        <div className="flex shrink-0 items-center gap-1.5">
-                          {canWrite() && (
-                            <span onClick={e => e.stopPropagation()}>
-                              <Checkbox checked={sel.has(lead.id)} onChange={() => sel.toggle(lead.id)} />
-                            </span>
-                          )}
-                          <button
-                            type="button"
-                            onClick={e => { e.stopPropagation(); setDrawer(lead) }}
-                            className="inline-flex h-8 items-center gap-0.5 rounded-lg px-1.5 text-[11px] font-semibold text-primary active:bg-primary/10"
-                          >
-                            详情<ChevronRight className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="whitespace-pre-wrap text-[14px] font-medium leading-6 text-foreground">
-                        {lead.comment_content || '(无内容)'}
-                      </div>
-
-                      <div className="flex items-center justify-between gap-3 text-[12px]">
-                        <div className="min-w-0">
-                          <div className="flex min-w-0 items-center gap-1.5">
-                            <span className="truncate font-semibold text-foreground">{lead.comment_author_name || '-'}</span>
-                            {(lead.comment_source_type === 'dealer' || lead.comment_source_type === 'employee') && (
-                              <span className="shrink-0 rounded bg-violet-500/15 px-1 py-0.5 text-[10px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
-                            )}
-                          </div>
-                          <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
-                            IP {lead.comment_ip_location || '-'} · 赞 {formatNumber(lead.comment_like_count)} · 采集 {formatNumber(lead.comment_seen_count || 1)} 次
-                          </div>
-                        </div>
-                        <span className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">{lead.publish_display || '时间未知'}</span>
-                      </div>
-
-                      <div className="rounded-xl bg-muted/45 p-2.5">
-                        <div className="flex items-start gap-2">
-                          <span className="mt-0.5 shrink-0 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">原帖</span>
-                          <div className="min-w-0 flex-1 text-[12px] leading-5 text-foreground">
-                            {compact(lead.record_title || '(无标题)', 62)}
-                          </div>
-                          <RecordSourceAction
-                            record={{ id: lead.record_id, platform: lead.platform, url: lead.record_url }}
-                            compact
-                            className="h-7 rounded-lg px-1.5 text-[11px] font-semibold active:bg-primary/10"
-                          />
-                        </div>
-                        <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 border-t border-border/40 pt-1.5 text-[10px] tabular-nums text-muted-foreground">
-                          <span>首次发现 {formatDateCompact(lead.comment_first_seen_at)}</span>
-                          <span>最近采集 {formatDateCompact(lead.comment_last_seen_at)}</span>
-                          {(lead.note || lead.handled_at) && <span className="font-semibold text-foreground">已有处理留痕</span>}
-                        </div>
-                      </div>
-
-                      <div className="border-t border-border/55 pt-2.5" onClick={e => e.stopPropagation()}>
-                        <div className="mb-2 text-[11px] font-semibold leading-5 text-muted-foreground">{nextAction}</div>
-                        {isSales ? (
-                          <div className="grid grid-cols-3 gap-2">
-                            <Button className="h-10" size="sm" disabled={!canWrite() || lead.status === 'following'} onClick={() => updateLeadStatus(lead.id, 'following')}>跟进</Button>
-                            <Button className="h-10" variant="outline" size="sm" disabled={!canWrite() || lead.status === 'resolved'} onClick={() => updateLeadStatus(lead.id, 'resolved')}>处理</Button>
-                            <Button className="h-10" variant="ghost" size="sm" disabled={!canWrite() || lead.status === 'ignored'} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
-                          </div>
-                        ) : isArchivedOpinion ? (
-                          <Button className="h-10 w-full" variant="outline" size="sm" onClick={() => setDrawer(lead)}>查看处理详情</Button>
-                        ) : (
-                          <div className="grid grid-cols-3 gap-2">
-                            <Button className="h-10" size="sm" disabled={!canWrite()} onClick={() => dispatchTicket(lead)}>转工单</Button>
-                            <Button className="h-10" variant="outline" size="sm" disabled={!canWrite()} onClick={() => updateLeadStatus(lead.id, 'resolved')}>归档</Button>
-                            <Button className="h-10" variant="ghost" size="sm" disabled={!canWrite()} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </article>
-                )
-              })}
-            </div>
-
-            <div className="hidden overflow-x-auto lg:block">
-            <table className="w-full min-w-[920px] text-sm">
-              <thead>
-                <tr className="border-b border-border/60 [&>th]:px-3 [&>th]:py-3 [&>th]:text-[11px] [&>th]:font-medium [&>th]:uppercase [&>th]:tracking-wider [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
-                  {canWrite() && (
-                    <th className="w-10 px-4 py-2.5">
-                      <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(leads.map(l => l.id), !allChecked)} />
-                    </th>
-                  )}
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">评论内容</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">用户</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">类型</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">优先级</th>
-                  <th className="px-4 py-2.5 text-left text-[12px] font-medium text-muted-foreground">状态</th>
-                  <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} />
-                  <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} />
-                  <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} />
-                  <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">采集次数</th>
-                  <th className="px-4 py-2.5 text-right text-[12px] font-medium text-muted-foreground">操作</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border/40">
-                {leads.map(lead => (
-                  <tr key={lead.id} onClick={() => setDrawer(lead)}
-                    className={`cursor-pointer transition-colors hover:bg-accent/45 ${drawer?.id === lead.id ? 'bg-accent' : sel.has(lead.id) ? 'bg-primary/[0.04]' : ''}`}>
-                    {canWrite() && (
-                      <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}><Checkbox checked={sel.has(lead.id)} onChange={() => sel.toggle(lead.id)} /></td>
-                    )}
-                    <td className="max-w-[440px] px-4 py-3 align-top">
-                      <div className="line-clamp-2 text-[13px] leading-5 text-foreground">{lead.comment_content || '(无内容)'}</div>
-                      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                        <StatusBadge tone="neutral">{platformName(lead.platform)}</StatusBadge>
-                        <span className="truncate">原帖：{compact(lead.record_title || '(无标题)', 26)}</span>
-                        {(lead.note || lead.handled_at) && <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">已留痕</span>}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 align-top text-xs">
-                      <div className="flex items-center gap-1.5">
-                        <span className="font-medium text-foreground">{lead.comment_author_name || '-'}</span>
-                        {(lead.comment_source_type === 'dealer' || lead.comment_source_type === 'employee') && (
-                          <Tooltip text="作者名含品牌/车型词,疑似经销商/员工软文,非真实车主 UGC,研判时建议剔除">
-                            <span className="shrink-0 cursor-help rounded bg-violet-500/15 px-1 py-0.5 text-[10px] font-semibold text-violet-700 dark:text-violet-300">疑似KOE</span>
-                          </Tooltip>
-                        )}
-                      </div>
-                      <div className="mt-0.5 whitespace-nowrap text-muted-foreground">IP {lead.comment_ip_location || '-'} · 赞 {formatNumber(lead.comment_like_count)}</div>
-                    </td>
-                    <td className="px-4 py-3 align-top"><StatusBadge tone="neutral">{LABELS.leadType[lead.lead_type] || lead.lead_type}</StatusBadge></td>
-                    <td className="px-4 py-3 align-top"><StatusBadge tone={lead.priority}>{LABELS.priority[lead.priority] || lead.priority}</StatusBadge></td>
-                    <td className="px-4 py-3 align-top"><StatusBadge tone={lead.status}>{LABELS.leadStatus[lead.status] || lead.status}</StatusBadge></td>
-                    <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{lead.publish_display || '—'}</td>
-                    <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{formatDateCompact(lead.comment_first_seen_at)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 align-top text-xs text-muted-foreground">{formatDateCompact(lead.comment_last_seen_at)}</td>
-                    <td className="px-4 py-3 text-right align-top text-xs font-semibold tabular-nums">{formatNumber(lead.comment_seen_count || 1)}</td>
-                    <td className="px-4 py-3 align-top" onClick={e => e.stopPropagation()}>
-                      <div className="flex justify-end gap-1">
-                        {isSales ? <>
-                          <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'following'} onClick={() => updateLeadStatus(lead.id, 'following')}>跟进</Button>
-                          <Button variant="outline" size="sm" disabled={!canWrite() || lead.status === 'resolved'} onClick={() => updateLeadStatus(lead.id, 'resolved')}>处理</Button>
-                          <Button variant="ghost" size="sm" disabled={!canWrite() || lead.status === 'ignored'} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
-                        </> : status === 'archived' ? (
-                          <span className="text-[11px] text-muted-foreground/60">已归档</span>
-                        ) : <>
-                          <Button size="sm" disabled={!canWrite()} onClick={() => dispatchTicket(lead)}>转工单</Button>
-                          <Button variant="outline" size="sm" disabled={!canWrite()} onClick={() => updateLeadStatus(lead.id, 'resolved')}>归档</Button>
-                          <Button variant="ghost" size="sm" disabled={!canWrite()} onClick={() => updateLeadStatus(lead.id, 'ignored')}>忽略</Button>
-                        </>}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            </div>
-          </>
-        )}
-
-        {pagination && pagination.totalPages > 1 && (
-          <div className="flex flex-col gap-2 border-t border-border px-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-4">
-            <span className="text-xs text-muted-foreground">共 {formatNumber(pagination.total)} 条{noun}</span>
-            <div className="grid w-full grid-cols-[1fr_auto_1fr] items-center gap-2 sm:flex sm:w-auto sm:gap-1">
-              <Button variant="outline" size="sm" className="h-10 justify-center sm:h-8 sm:w-8 sm:px-0" disabled={pagination.page <= 1} onClick={() => load(pagination.page - 1)}>
-                <ChevronLeft className="h-4 w-4" /><span className="sm:hidden">上一页</span>
-              </Button>
-              <span className="px-2 text-center text-sm tabular-nums text-muted-foreground sm:px-3">{pagination.page} / {pagination.totalPages}</span>
-              <Button variant="outline" size="sm" className="h-10 justify-center sm:h-8 sm:w-8 sm:px-0" disabled={pagination.page >= pagination.totalPages} onClick={() => load(pagination.page + 1)}>
-                <span className="sm:hidden">下一页</span><ChevronRight className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-        )}
-      </WorkbenchTableShell>
-
-      {canWrite() && (
-        <BatchBar
-          count={sel.count}
-          busy={batchBusy}
-          onClear={sel.clear}
-          onAction={key => runBatch(key)}
-          actions={isSales ? [
-            { key: 'following', label: '跟进', icon: Footprints },
-            { key: 'resolved', label: '处理', icon: CheckCheck },
-            { key: 'ignored', label: '忽略', icon: CircleSlash, tone: 'danger' },
-          ] : [
-            { key: 'resolved', label: '归档', icon: CheckCheck },
-            { key: 'ignored', label: '忽略', icon: CircleSlash, tone: 'danger' },
-          ]}
-        />
-      )}
-
-      {drawer && (
-        <CommentLeadDrawer
-          lead={drawer}
-          noun={noun}
-          canWrite={canWrite()}
-          isSales={isSales}
-          bucket={isSales ? '' : status}
-          onClose={() => setDrawer(null)}
-          onSetStatus={async (s) => { if (await updateLeadStatus(drawer.id, s)) setDrawer(null) }}
-          onDispatch={async () => { if (await dispatchTicket(drawer)) setDrawer(null) }}
-        />
-      )}
-      {dialog}
-      {dispatchDialog}
-    </div>
-  )
+        <div className="hidden overflow-x-auto lg:block"><table className="w-full min-w-[1120px] text-sm"><thead><tr className="border-b border-border/60 bg-muted/20 [&>th]:px-3 [&>th]:py-3 [&>th]:text-left [&>th]:text-[11px] [&>th]:font-medium [&>th]:whitespace-nowrap [&>th]:text-muted-foreground">
+          {writable && <th className="w-10"><Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(leads.map(lead => lead.id), !allChecked)} /></th>}
+          <th className="min-w-[280px]">评论与来源</th><th>评论者</th><th>类型 / 优先级</th><th className="min-w-[150px]">最近跟进</th>
+          <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} /><SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} /><SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} />
+          <th className="sticky right-0 z-20 min-w-[210px] border-l border-border bg-card">处理状态 / 跟进</th>
+        </tr></thead><tbody className="divide-y divide-border/50">{leads.map(lead => <tr key={lead.id} className={cn('group hover:bg-accent/35', drawer?.lead.id === lead.id && 'bg-accent/40', sel.has(lead.id) && 'bg-primary/[0.025]')}>
+          {writable && <td className="px-3 py-3 align-top"><Checkbox checked={sel.has(lead.id)} onChange={() => sel.toggle(lead.id)} /></td>}
+          <td className="max-w-[420px] px-3 py-3 align-top"><button onClick={() => openDrawer(lead)} className="block w-full text-left"><span className="line-clamp-3 whitespace-pre-wrap text-[13px] leading-6">{lead.comment_content || '(无内容)'}</span></button><div className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground"><StatusBadge tone="neutral">{platformName(lead.platform || '')}</StatusBadge><span className="min-w-0 truncate" title={lead.record_current_title || lead.record_title}>原帖：{lead.record_current_title || lead.record_title || '(无标题)'}</span><RecordSourceAction record={commentLeadSource(lead)} compact /></div></td>
+          <td className="px-3 py-3 align-top text-[12px]"><div className="max-w-32 truncate font-medium">{lead.comment_author_name || '—'}</div>{['dealer', 'employee'].includes(lead.comment_source_type || '') && <span className="mt-1 inline-block rounded bg-violet-500/10 px-1 py-0.5 text-[10px] text-violet-700 dark:text-violet-300">疑似 KOE</span>}<div className="mt-1 whitespace-nowrap text-[11px] text-muted-foreground">IP {lead.comment_ip_location || '—'} · 赞 {formatNumber(lead.comment_like_count)}</div></td>
+          <td className="px-3 py-3 align-top"><div className="flex flex-col items-start gap-1.5"><StatusBadge tone="neutral">{LABELS.leadType[lead.lead_type] || lead.lead_type}</StatusBadge><StatusBadge tone={lead.priority}>{LABELS.priority[lead.priority] || lead.priority}</StatusBadge><JudgmentBadge lead={lead} /></div></td>
+          <td className="max-w-[200px] px-3 py-3 align-top"><LeadProgress lead={lead} onClick={() => openDrawer(lead, 'history')} /></td>
+          <td className="whitespace-nowrap px-3 py-3 align-top text-[11px] text-muted-foreground">{lead.publish_display || '—'}</td><td className="whitespace-nowrap px-3 py-3 align-top text-[11px] text-muted-foreground">{formatDateCompact(lead.comment_first_seen_at)}</td><td className="whitespace-nowrap px-3 py-3 align-top text-[11px] text-muted-foreground">{formatDateCompact(lead.comment_last_seen_at)}<div className="mt-1 text-[10px]">采集 {formatNumber(lead.comment_seen_count || 1)} 次</div></td>
+          <td className="sticky right-0 z-10 border-l border-border bg-card px-3 py-3 align-top group-hover:bg-accent"><LeadActions lead={lead} canWrite={writable} busy={busyId === lead.id} onStatus={status => void runRowStatus(lead.id, status)} onNote={() => openDrawer(lead, 'history')} onTicket={() => openDrawer(lead, 'ticket')} /></td>
+        </tr>)}</tbody></table></div>
+      </>}
+      {pagination && <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-3"><div className="flex items-center gap-2 text-[12px] text-muted-foreground"><span>共 {formatNumber(pagination.total)} 条</span><select aria-label="每页条数" value={pageSize} onChange={event => setPageSize(Number(event.target.value))} className="h-8 rounded border border-border bg-background px-2">{[20, 30, 50, 100].map(size => <option key={size} value={size}>{size} 条/页</option>)}</select></div><div className="flex items-center gap-2"><Button variant="outline" size="sm" aria-label="上一页" disabled={loading || pagination.page <= 1} onClick={() => void load(pagination.page - 1)}><ChevronLeft className="h-4 w-4" /></Button><span className="text-[12px] tabular-nums text-muted-foreground">{pagination.page} / {Math.max(1, pagination.totalPages)}</span><Button variant="outline" size="sm" aria-label="下一页" disabled={loading || pagination.page >= pagination.totalPages} onClick={() => void load(pagination.page + 1)}><ChevronRight className="h-4 w-4" /></Button></div></div>}
+    </WorkbenchTableShell>
+    {writable && <BatchBar count={sel.count} busy={batchBusy} onClear={sel.clear} onAction={key => void runBatch(key)} actions={bucket === 'archived' ? [{ key: 'new', label: '恢复到待处理', icon: ArchiveRestore }] : [{ key: 'following', label: '跟进中', icon: Footprints }, { key: 'resolved', label: '已处理', icon: CheckCheck }, { key: 'ignored', label: '忽略', icon: CircleSlash }]} />}
+    {drawer && <CommentLeadDrawer lead={drawer.lead} initialTab={drawer.tab} noun={noun} canWrite={writable} onClose={() => setDrawer(null)} onSetStatus={status => updateLeadStatus(drawer.lead.id, status)} onDispatch={() => dispatchTicket(drawer.lead)} onUpdated={reloadAfterMutation} />}
+    {dialog}{dispatchDialog}
+  </div>
 }
 
-/* 可排序表头:点击切换该列升/降序,激活列实心箭头,未激活淡色双箭头 */
-function SortableTh({ label, field, sort, onSort, align = 'left', className = '' }: {
-  label: string
-  field: LeadSortField
-  sort: { field: string; dir: 'asc' | 'desc' }
-  onSort: (field: LeadSortField) => void
-  align?: 'left' | 'right'
-  className?: string
-}) {
+function LeadActions({ lead, canWrite, busy, onStatus, onNote, onTicket }: { lead: CommentLead; canWrite: boolean; busy: boolean; onStatus: (status: string) => void; onNote: () => void; onTicket: () => void }) {
+  const archived = commentLeadIsArchived(lead)
+  return <div className="flex flex-wrap items-center gap-2">
+    {canWrite && !archived ? <select aria-label={`${lead.comment_author_name || '评论'}的处理状态`} value={lead.status} disabled={busy} onChange={event => onStatus(event.target.value)} className="h-8 w-28 rounded-full border border-border bg-background px-2 text-[11px] font-semibold">{COMMENT_LEAD_STATUSES.filter(option => option.value !== 'ticketed' || lead.status === 'ticketed').map(option => <option key={option.value} value={option.value} disabled={option.value === 'ticketed'}>{option.label}</option>)}</select> : <StatusBadge tone={lead.status}>{commentLeadStatusLabel(lead.status)}</StatusBadge>}
+    {archived && canWrite ? <Button variant="outline" size="sm" disabled={busy} onClick={() => onStatus('new')}><ArchiveRestore className="h-3.5 w-3.5" />恢复</Button> : <Button variant="outline" size="sm" onClick={onNote}><History className="h-3.5 w-3.5" />{canWrite ? '跟进' : '记录'}</Button>}
+    {lead.ticket_id && <button type="button" onClick={onTicket} className="flex items-center gap-1 text-[10px] font-medium text-primary"><FileText className="h-3 w-3" />查看工单 · {commentLeadTicketStatusLabel(lead.ticket_status)}</button>}
+  </div>
+}
+
+function LeadProgress({ lead, onClick }: { lead: CommentLead; onClick: () => void }) {
+  const text = lead.progress_latest_body || lead.note || ''
+  const count = Number(lead.progress_count || (text ? 1 : 0))
+  return <button onClick={onClick} className="block w-full text-left text-[11px] leading-5"><span className={cn('line-clamp-2', text ? 'text-foreground' : 'text-muted-foreground')}>{text || '暂无跟进记录'}</span>{count > 0 && <span className="mt-1 block text-[10px] text-muted-foreground">{lead.progress_latest_author || lead.handled_name || ''} · {count} 条记录</span>}</button>
+}
+
+function SortableTh({ label, field, sort, onSort }: { label: string; field: LeadSortField; sort: { field: LeadSortField; dir: 'asc' | 'desc' }; onSort: (field: LeadSortField) => void }) {
   const active = sort.field === field
-  const Arrow = active ? (sort.dir === 'desc' ? ArrowDown : ArrowUp) : ChevronsUpDown
-  return (
-    <th className={cn('px-4 py-2.5 text-[12px] font-medium text-muted-foreground', align === 'right' ? 'text-right' : 'text-left', className)}>
-      <button onClick={() => onSort(field)} title="点击切换排序"
-        className={cn('inline-flex items-center gap-1 align-middle uppercase tracking-wider transition-colors hover:text-foreground', active && 'text-foreground')}>
-        {label}
-        <Arrow className={cn('h-3 w-3', active ? 'opacity-100' : 'opacity-30')} strokeWidth={2.5} />
-      </button>
-    </th>
-  )
+  const Arrow = active ? sort.dir === 'desc' ? ArrowDown : ArrowUp : ChevronsUpDown
+  return <th><button onClick={() => onSort(field)} className={cn('flex items-center gap-1', active && 'text-foreground')}>{label}<Arrow className={cn('h-3 w-3', !active && 'opacity-30')} /></button></th>
+}
+
+function JudgmentBadge({ lead }: { lead: CommentLead }) {
+  const judgment = commentLeadJudgment(lead)
+  return judgment.label ? <StatusBadge tone={judgment.needsReview ? 'high' : 'muted'}>{judgment.label}</StatusBadge> : null
 }

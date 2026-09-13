@@ -29,6 +29,7 @@ import {
   runLlmRelayPolicy,
 } from './llm-relay.js';
 import { requestLlmRelayAgentCompletion } from './llm-relay-jobs.js';
+import { COMMENT_SALES_PROMPT_RULES, normalizeSalesLeadJudgment } from './comment-sales-judgment.js';
 
 export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v4';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
@@ -1396,13 +1397,24 @@ export function buildCommentSystemPrompt(brand) {
 - “不算贵”“免费”“可以”“有用”“不会不提供服务”“开的不多用不了几次”“不用续”这类通常是中性或正向澄清，不应标为负面。
 - 如果评论只是客观说明、个人选择、轻微吐槽但没有明确问题或诉求，标为 neutral。
 - 如果评论在认可、解释、澄清、推荐，标为 positive 或 neutral。
-- salesIntent(是否真实购买/咨询意向):只有评论方在“想买/询价/求购买链接/问哪里买/问价格优惠/要门店或经销商/留联系方式求购/想试驾预约”等明确成交导向时才 true。注意:吐槽里提到“续费/收费/电话/不续费/贵”、抱怨被催续费、要求退费、对价格不满,都是投诉而非购买意向,salesIntent=false。
+
+${COMMENT_SALES_PROMPT_RULES}
 
 只输出 JSON：
 {
   "sentiment": "positive|neutral|negative",
   "isNegative": true|false,
   "salesIntent": true|false,
+  "salesIntentStatus": "confirmed|needs_review|rejected|none",
+  "salesActor": "buyer|seller|third_party|unknown",
+  "salesTargetMatch": "relevant|irrelevant|uncertain",
+  "salesIntentTarget": "实际购买对象",
+  "expressionType": "literal|sarcasm|rhetorical|negated|quoted|uncertain",
+  "salesIntentConfidence": 0.0-1.0,
+  "salesIntentEvidence": ["逐字摘录本条评论的意向证据"],
+  "salesIntentReason": "购买判断依据，不超过60字",
+  "followUpSuggestion": "人工跟进建议，不超过80字",
+  "suggestedReply": "供人工编辑的回复草稿，不超过80字",
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|official_response|other",
   "riskLevel": "none|low|medium|high|critical",
   "confidence": 0.0-1.0,
@@ -1411,13 +1423,15 @@ export function buildCommentSystemPrompt(brand) {
 }`;
 }
 
-function buildCommentUserMessage({ record = {}, comment = {} }) {
+export function buildCommentUserMessage({ record = {}, comment = {} }) {
   const lines = [];
   if (record.title) lines.push(`原帖标题：${record.title}`);
   if (record.content) lines.push(`原帖正文：${truncatePromptText(record.content, 1200)}`);
   if (record.category) lines.push(`原帖主题：${record.category}`);
   if (record.sentiment) lines.push(`原帖情绪：${record.sentiment}`);
   if (record.platform) lines.push(`平台：${record.platform}`);
+  if (comment.parent_comment_content) lines.push(`被回复评论（仅帮助理解本条语境，不是本条购买证据）：${truncatePromptText(comment.parent_comment_content, 1200)}`);
+  else if (comment.parent_comment_id) lines.push('本条为回复，但被回复评论原文缺失；依赖该语境才能确定购买意向时，请标 needs_review。');
   if (comment.author_name) lines.push(`评论作者：${comment.author_name}`);
   if (comment.content) lines.push(`评论内容：${comment.content}`);
   if (comment.like_count) lines.push(`评论点赞：${comment.like_count}`);
@@ -1436,7 +1450,7 @@ function normalizeBoolean(value, fallback = false) {
   return fallback;
 }
 
-function normalizeCommentAiResult(result, fallback) {
+export function normalizeCommentAiResult(result, fallback, {comment = {}} = {}) {
   const rawSentiment = ['positive', 'neutral', 'negative'].includes(String(result?.sentiment || '').toLowerCase())
     ? String(result.sentiment).toLowerCase()
     : (fallback?.sentiment || 'neutral');
@@ -1460,7 +1474,7 @@ function normalizeCommentAiResult(result, fallback) {
       ...result,
       sentiment,
       isNegative: isNegative && sentiment === 'negative',
-      salesIntent: normalizeBoolean(result?.salesIntent ?? result?.sales_intent, false),
+      ...normalizeSalesLeadJudgment(result, {comment}),
       category,
       riskLevel: isNegative ? riskLevel : 'none',
       confidence: Number(result?.confidence ?? fallback?.confidence ?? 0),
@@ -1481,24 +1495,29 @@ export function buildCommentBatchSystemPrompt(brand) {
 - 只有明确抱怨、投诉、故障、乱扣费、服务不满、安全/隐私风险、强烈负面情绪时,isNegative=true。
 - “不算贵/免费/可以/有用/不会不提供服务/开的不多用不了几次/不用续”通常中性或正向,不应判负面。
 - 仅客观说明、个人选择、轻微吐槽且无明确诉求 → neutral;认可、解释、澄清、推荐 → positive 或 neutral。
-- salesIntent:仅当评论方明确“想买/询价/求购买链接/问哪里买/问优惠/要门店或经销商/留联系方式求购/想试驾预约”等成交导向时才 true;吐槽续费/收费/退费/价格不满都是投诉,salesIntent=false。
+
+${COMMENT_SALES_PROMPT_RULES}
+- 每条评论独立判断，不得把同批另一条评论的购意、证据或作者身份移到本条。contentTruncated=true 表示评论不完整，购买结论最多 needs_review。
 
 只输出一个 JSON 对象(顶层不要是数组),格式:
-{"results":[{"i":0,"sentiment":"positive|neutral|negative","isNegative":true|false,"salesIntent":true|false,"category":"safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|official_response|other","riskLevel":"none|low|medium|high|critical","summary":"不超过30字"}]}
+{"results":[{"i":0,"sentiment":"positive|neutral|negative","isNegative":true|false,"salesIntent":true|false,"salesIntentStatus":"confirmed|needs_review|rejected|none","salesActor":"buyer|seller|third_party|unknown","salesTargetMatch":"relevant|irrelevant|uncertain","salesIntentTarget":"实际购买对象","expressionType":"literal|sarcasm|rhetorical|negated|quoted|uncertain","salesIntentConfidence":0.0-1.0,"salesIntentEvidence":["本条评论原句"],"salesIntentReason":"不超过60字","followUpSuggestion":"人工跟进建议，不超过80字","suggestedReply":"人工回复草稿，不超过80字","category":"safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|official_response|other","riskLevel":"none|low|medium|high|critical","confidence":0.0-1.0,"reason":"判断依据，不超过60字","summary":"不超过30字"}]}
 必须为输入里每一条 i 都返回一个对应结果,不得遗漏或改变 i。`;
 }
 
-function buildCommentBatchUserMessage({ record = {}, comments = [] }) {
+export function buildCommentBatchUserMessage({ record = {}, comments = [] }) {
   const head = [];
   if (record.title) head.push(`原帖标题：${record.title}`);
-  if (record.content) head.push(`原帖正文：${truncatePromptText(record.content, 800)}`);
+  if (record.content) head.push(`原帖正文：${truncatePromptText(record.content, 1200)}`);
   if (record.category) head.push(`原帖主题：${record.category}`);
   if (record.sentiment) head.push(`原帖情绪：${record.sentiment}`);
   if (record.platform) head.push(`平台：${record.platform}`);
   const arr = comments.map((c, i) => ({
     i,
     author: truncatePromptText(c.author_name, 40),
-    content: truncatePromptText(c.content, 300),
+    content: truncatePromptText(c.content, 1200),
+    contentTruncated: Array.from(String(c.content || '')).length > 1200,
+    parentComment: truncatePromptText(c.parent_comment_content, 1200),
+    parentContextMissing: Boolean(c.parent_comment_id && !c.parent_comment_content),
     likes: Number(c.like_count || 0),
     ip: truncatePromptText(c.ip_location, 20),
   }));
@@ -1517,17 +1536,29 @@ export async function classifyCommentsBatch({ tenantId, record = {}, comments = 
     tenantId,
     systemPrompt,
     userMessage,
-    {priority: 'background', kind: 'comment_batch_classification'},
+    {priority: 'background', kind: 'comment_batch_classification', maxTokens: Math.min(8192, 800 + comments.length * 700)},
   );
+  return normalizeCommentBatchAiResults(parsed, comments);
+}
+
+export function normalizeCommentBatchAiResults(parsed, comments = []) {
   const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.results) ? parsed.results : []);
   const byIndex = new Map();
+  const duplicateIndices = new Set();
   for (const item of list) {
     const idx = Number(item?.i ?? item?.index);
-    if (Number.isInteger(idx)) byIndex.set(idx, item);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= comments.length) continue;
+    if (byIndex.has(idx)) duplicateIndices.add(idx);
+    byIndex.set(idx, item);
   }
-  return comments.map((_, i) => {
+  return comments.map((comment, i) => {
     const raw = byIndex.get(i);
-    return raw ? normalizeCommentAiResult(raw, null) : null;
+    if (!raw || duplicateIndices.has(i)) return null;
+    const normalized = normalizeCommentAiResult(raw, null, {comment});
+    if (Array.from(String(comment.content || '')).length > 1200 && normalized.ai_result.salesIntent) {
+      return normalizeCommentAiResult({...raw, salesIntentStatus: 'needs_review'}, null, {comment});
+    }
+    return normalized;
   });
 }
 
@@ -1544,7 +1575,7 @@ export async function classifyCommentWithAI({ tenantId, record = {}, comment = {
       {priority: 'background', kind: 'comment_classification'},
     );
     if (!result) return null;
-    return normalizeCommentAiResult(result, fallback);
+    return normalizeCommentAiResult(result, fallback, {comment});
   } catch (err) {
     console.error('[AI] Comment classify error:', err.message);
     return null;

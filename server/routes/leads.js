@@ -1,60 +1,53 @@
 import { Router } from 'express';
-import { queryAll, queryOne, execute } from '../db/init.js';
+import { queryAll, queryOne } from '../db/init.js';
 import { requireTenantAccess, requireTenantWriter } from '../middleware/auth.js';
-import { resolveLeadType, resolvePriority, leadReason } from '../services/comment-leads.js';
-import { classifyCommentWithAI } from '../services/ai-labeler.js';
+import { mutateCommentLead, getCommentLeadActivities, buildCommentLeadSuggestion, validateCommentLeadMutation } from '../services/comment-lead-followup.js';
+import { rejudgeSalesLeadBatch } from '../services/comment-lead-rejudge.js';
 import { formatPublishDate } from '../services/publish-date.js';
 import { sendXlsx, fmtTs } from '../services/xlsx-export.js';
 
 const router = Router();
 
+const LEAD_DETAIL_COLUMNS = `comment_leads.*,
+  (SELECT content FROM records source WHERE source.id = comment_leads.record_id AND source.tenant_id = comment_leads.tenant_id) AS record_content,
+  (SELECT ai_summary FROM records source WHERE source.id = comment_leads.record_id AND source.tenant_id = comment_leads.tenant_id) AS record_ai_summary,
+  (SELECT sentiment FROM records source WHERE source.id = comment_leads.record_id AND source.tenant_id = comment_leads.tenant_id) AS record_sentiment,
+  (SELECT url FROM records source WHERE source.id = comment_leads.record_id AND source.tenant_id = comment_leads.tenant_id) AS record_current_url,
+  (SELECT canonical_url FROM records source WHERE source.id = comment_leads.record_id AND source.tenant_id = comment_leads.tenant_id) AS record_canonical_url,
+  (SELECT external_id FROM records source WHERE source.id = comment_leads.record_id AND source.tenant_id = comment_leads.tenant_id) AS record_external_id,
+  (SELECT title FROM records source WHERE source.id = comment_leads.record_id AND source.tenant_id = comment_leads.tenant_id) AS record_current_title,
+  (SELECT published_at FROM record_comments source WHERE source.id = comment_leads.comment_id AND source.tenant_id = comment_leads.tenant_id) AS comment_published_at,
+  (SELECT source_type FROM record_comments source WHERE source.id = comment_leads.comment_id AND source.tenant_id = comment_leads.tenant_id) AS comment_source_type,
+  (SELECT first_seen_at FROM record_comments source WHERE source.id = comment_leads.comment_id AND source.tenant_id = comment_leads.tenant_id) AS comment_first_seen_at,
+  (SELECT last_seen_at FROM record_comments source WHERE source.id = comment_leads.comment_id AND source.tenant_id = comment_leads.tenant_id) AS comment_last_seen_at,
+  (SELECT seen_count FROM record_comments source WHERE source.id = comment_leads.comment_id AND source.tenant_id = comment_leads.tenant_id) AS comment_seen_count,
+  (SELECT COUNT(*)::int FROM comment_lead_activities a WHERE a.lead_id = comment_leads.id AND a.tenant_id = comment_leads.tenant_id) AS progress_count,
+  (SELECT note FROM comment_lead_activities a WHERE a.lead_id = comment_leads.id AND a.tenant_id = comment_leads.tenant_id ORDER BY a.created_at DESC, a.id DESC LIMIT 1) AS progress_latest_body,
+  (SELECT created_at FROM comment_lead_activities a WHERE a.lead_id = comment_leads.id AND a.tenant_id = comment_leads.tenant_id ORDER BY a.created_at DESC, a.id DESC LIMIT 1) AS progress_latest_at,
+  (SELECT actor_name FROM comment_lead_activities a WHERE a.lead_id = comment_leads.id AND a.tenant_id = comment_leads.tenant_id ORDER BY a.created_at DESC, a.id DESC LIMIT 1) AS progress_latest_author,
+  (SELECT t.id FROM tickets t WHERE t.source_type = 'comment' AND t.source_comment_id = comment_leads.id AND t.tenant_id = comment_leads.tenant_id ORDER BY (t.status <> 'closed') DESC, t.created_at DESC, t.id DESC LIMIT 1) AS ticket_id,
+  (SELECT t.status FROM tickets t WHERE t.source_type = 'comment' AND t.source_comment_id = comment_leads.id AND t.tenant_id = comment_leads.tenant_id ORDER BY (t.status <> 'closed') DESC, t.created_at DESC, t.id DESC LIMIT 1) AS ticket_status`;
+
 // 导出用中文标签映射(MAP[v]||v||'')
 const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博' };
 const PRIORITY_CN = { low: '低', normal: '普通', high: '高', urgent: '紧急' };
-const LEAD_STATUS_CN = { new: '新线索', following: '跟进中', resolved: '已处理', ignored: '已忽略' };
+const LEAD_STATUS_CN = { new: '新线索', following: '跟进中', ticketed: '已转工单', resolved: '已处理', ignored: '已忽略' };
 const LEAD_TYPE_CN = { complaint: '投诉维权', renewal_billing: '续费收费', app_issue: 'App故障', service_quality: '服务求助', safety_privacy: '安全隐私', brand_risk: '品牌风险', sales_intent: '购买意向', other: '其他' };
 
-// AI 一键重判:对现有「销售客资」逐条重跑 AI 判购买意向,非购买的移回对应舆情类型。
+// A bounded, cursor-based pass; model calls never hold database locks.
 router.post('/comments/rejudge-sales', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
-    const limit = Math.min(300, Math.max(1, Number(req.body?.limit) || 100));
-    const totalRow = await queryOne(`SELECT COUNT(*)::int AS n FROM comment_leads WHERE tenant_id = $1 AND lead_type = 'sales_intent'`, [req.tenantId]);
-    const leads = await queryAll(`
-      SELECT cl.id, cl.platform, cl.comment_content, cl.comment_author_name, cl.comment_ip_location, cl.comment_like_count,
-             r.title AS record_title, r.content AS record_content
-      FROM comment_leads cl
-      LEFT JOIN records r ON r.id = cl.record_id AND r.tenant_id = cl.tenant_id
-      WHERE cl.tenant_id = $1 AND cl.lead_type = 'sales_intent'
-      ORDER BY cl.captured_at DESC
-      LIMIT $2
-    `, [req.tenantId, limit]);
-
-    let changed = 0;
-    for (const lead of leads) {
-      const comment = { content: lead.comment_content, author_name: lead.comment_author_name, ip_location: lead.comment_ip_location, like_count: lead.comment_like_count };
-      const record = { title: lead.record_title, content: lead.record_content, platform: lead.platform };
-      let ai = null;
-      try { ai = await classifyCommentWithAI({ tenantId: req.tenantId, record, comment }); } catch { ai = null; }
-      if (!ai) continue;
-      const newType = resolveLeadType({ content: lead.comment_content, category: ai.category, ai_result: ai.ai_result });
-      if (newType === 'sales_intent') continue; // AI 确认仍是购买意向 → 保留
-      await execute(
-        `UPDATE comment_leads SET lead_type = $3, priority = $4, ai_result = $5::jsonb, reason = $6, updated_at = now()
-         WHERE id = $1 AND tenant_id = $2`,
-        [
-          lead.id, req.tenantId, newType,
-          resolvePriority({ risk_level: ai.risk_level, like_count: lead.comment_like_count }),
-          JSON.stringify(ai.ai_result || {}),
-          leadReason({ ai_summary: ai.ai_summary, ai_result: ai.ai_result }),
-        ],
-      );
-      changed += 1;
-    }
-    return res.json({ ok: true, scanned: leads.length, changed, total: totalRow?.n || 0 });
-  } catch (err) { return next(err); }
+    const result = await rejudgeSalesLeadBatch({ tenantId: req.tenantId, limit: req.body?.limit, cursor: req.body?.cursor, actor: req.user });
+    return res.json({ ok: true, ...result });
+  } catch (err) { return leadError(res, next, err); }
 });
 
-const LEAD_STATUSES = new Set(['new', 'following', 'resolved', 'ignored']);
+function leadError(res, next, err) {
+  if (err.status >= 400 && err.status < 500) return res.status(err.status).json({ ok: false, error: err.code || 'invalid_request', message: err.message });
+  return next(err);
+}
+
+const LEAD_STATUSES = new Set(['new', 'following', 'ticketed', 'resolved', 'ignored']);
 const LEAD_PRIORITIES = new Set(['low', 'normal', 'high', 'urgent']);
 const LEAD_TYPES = new Set([
   'sales_intent',
@@ -90,7 +83,7 @@ function appendCommentDateRangeFilter(where, params, query) {
   const conds = [];
   if (dFrom) { params.push(dFrom); conds.push(`${col} >= $${params.length}::date`); }
   if (dTo) { params.push(dTo); conds.push(`${col} < ($${params.length}::date + INTERVAL '1 day')`); }
-  where += ` AND EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND ${conds.join(' AND ')})`;
+  where += ` AND EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.tenant_id = comment_leads.tenant_id AND ${conds.join(' AND ')})`;
   return where;
 }
 
@@ -108,14 +101,14 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
 
     const params = [req.tenantId];
     let where = 'WHERE tenant_id = $1';
-    // 评论分诊与内容分诊同构的两个 MECE 桶:待处理(new) / 已归档(resolved+ignored)。
-    // 已转工单(following)不在分诊视图,在工单系统里跟踪。
+    // 工作中保留新线索、跟进中及已转工单，状态筛选在桶内叠加。
     const bucket = String(req.query.bucket || '');
-    if (bucket === 'pending') {
-      where += ` AND status = 'new'`;
+    if (bucket === 'pending' || bucket === 'active') {
+      where += ` AND status IN ('new', 'following', 'ticketed')`;
     } else if (bucket === 'archived') {
       where += ` AND status IN ('resolved', 'ignored')`;
-    } else if (status && LEAD_STATUSES.has(String(status))) {
+    }
+    if (status && LEAD_STATUSES.has(String(status))) {
       params.push(status);
       where += ` AND status = $${params.length}`;
     }
@@ -160,9 +153,9 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
     // 疑似KOE(作者名命中品牌/车型词 → record_comments.source_type):only=只看,hide=隐藏
     const koe = String(req.query.koe || '');
     if (koe === 'only') {
-      where += ` AND EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.source_type IN ('dealer','employee'))`;
+      where += ` AND EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.tenant_id = comment_leads.tenant_id AND rc.source_type IN ('dealer','employee'))`;
     } else if (koe === 'hide') {
-      where += ` AND NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.source_type IN ('dealer','employee'))`;
+      where += ` AND NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.tenant_id = comment_leads.tenant_id AND rc.source_type IN ('dealer','employee'))`;
     }
     // 评论分诊只看「相关帖」的评论:父帖被判 irrelevant 的评论不算 lead
     // (否则竞品/跑题帖——如安吉星里命中关键词实为零跑、吉事桔香茶里误采的凯迪拉克——其评论会冒进客资)
@@ -179,15 +172,7 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
     params.push(limit, offset);
 
     const leads = await queryAll(`
-      SELECT *,
-        (SELECT content FROM records r WHERE r.id = comment_leads.record_id) AS record_content,
-        (SELECT ai_summary FROM records r WHERE r.id = comment_leads.record_id) AS record_ai_summary,
-        (SELECT sentiment FROM records r WHERE r.id = comment_leads.record_id) AS record_sentiment,
-        (SELECT published_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_published_at,
-        (SELECT source_type FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_source_type,
-        (SELECT first_seen_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_first_seen_at,
-        (SELECT last_seen_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_last_seen_at,
-        (SELECT seen_count FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_seen_count
+      SELECT ${LEAD_DETAIL_COLUMNS}
       FROM comment_leads
       ${where}
       ORDER BY ${leadsOrderSql(req.query.sort, req.query.dir)}
@@ -213,105 +198,58 @@ router.get('/comments', requireTenantAccess, async (req, res, next) => {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// 批量更新评论线索。注意:必须注册在 '/comments/:id' 之前,否则 'batch' 会被当作 id 解析。
+// Literal batch/export routes precede the parameterized detail route.
 router.patch('/comments/batch', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
     const rawIds = req.body?.ids;
     if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > 100) {
       return res.status(400).json({ ok: false, error: 'invalid_ids', message: 'ids 需为 1-100 个线索ID' });
     }
-    const ids = [...new Set(rawIds.map(id => String(id || '').trim().toLowerCase()).filter(Boolean))];
-    const validIds = ids.filter(id => UUID_RE.test(id));
-
-    const status = req.body?.status ? String(req.body.status) : null;
-    const priority = req.body?.priority ? String(req.body.priority) : null;
-    if (status !== null && !LEAD_STATUSES.has(status)) {
-      return res.status(400).json({ ok: false, error: 'invalid_status', message: '线索状态无效' });
+    const ids = [...new Set(rawIds.map(id => String(id || '').trim().toLowerCase()))];
+    const { status, priority, note } = req.body;
+    if (status !== undefined && (!LEAD_STATUSES.has(status) || status === 'ticketed')) {
+      return res.status(400).json({ ok: false, error: 'invalid_status', message: '线索状态无效，转工单请使用专用入口' });
     }
-    if (priority !== null && !LEAD_PRIORITIES.has(priority)) {
+    if (priority !== undefined && !LEAD_PRIORITIES.has(priority)) {
       return res.status(400).json({ ok: false, error: 'invalid_priority', message: '线索优先级无效' });
     }
-    if (status === null && priority === null) {
-      return res.status(400).json({ ok: false, error: 'empty_update', message: '没有要更新的字段' });
+    // Validate the shared note before the first row is changed: an invalid note
+    // must never produce a partially applied batch or silently lose its text.
+    validateCommentLeadMutation({ status, priority, note });
+    const skipped = [];
+    let updated = 0;
+    for (const id of ids) {
+      if (!UUID_RE.test(id)) { skipped.push(id); continue; }
+      try {
+        await mutateCommentLead({ tenantId: req.tenantId, id, status, priority, note, actor: req.user });
+        updated += 1;
+      } catch (err) {
+        if (err.status === 404 || err.status === 409) skipped.push(id);
+        else throw err;
+      }
     }
-
-    let updatedRows = [];
-    if (validIds.length) {
-      // following = 已转工单,批量置 following 仅对销售客资生效,舆情评论跳过(应走转工单)
-      const followingGuard = status === 'following' ? ` AND lead_type = 'sales_intent'` : '';
-      updatedRows = await queryAll(`
-        UPDATE comment_leads
-        SET status = COALESCE($3, status),
-          priority = COALESCE($4, priority),
-          updated_at = now()
-        WHERE tenant_id = $1 AND id = ANY($2::uuid[])${followingGuard}
-        RETURNING id
-      `, [req.tenantId, validIds, status, priority]);
-    }
-
-    const updatedSet = new Set(updatedRows.map(row => String(row.id).toLowerCase()));
-    const skipped = ids.filter(id => !updatedSet.has(id));
-    return res.json({ ok: true, updated: updatedSet.size, skipped });
-  } catch (err) {
-    return next(err);
-  }
+    return res.json({ ok: true, updated, skipped });
+  } catch (err) { return leadError(res, next, err); }
 });
 
 router.patch('/comments/:id', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
   try {
-    const status = String(req.body?.status || '');
-    const priority = String(req.body?.priority || '');
-    const updates = [];
-    const params = [];
-    if (status) {
-      if (!LEAD_STATUSES.has(status)) {
-        return res.status(400).json({ ok: false, error: 'invalid_status', message: '线索状态无效' });
-      }
-      // following = 已转工单,只能由 POST /tickets 设置;舆情评论不允许手动置 following
-      if (status === 'following') {
-        const row = await queryOne('SELECT lead_type FROM comment_leads WHERE id = $1 AND tenant_id = $2', [req.params.id, req.tenantId]);
-        if (row && row.lead_type !== 'sales_intent') {
-          return res.status(400).json({ ok: false, error: 'following_via_ticket_only', message: '舆情评论请用「转工单」流转,不要用跟进' });
-        }
-      }
-      params.push(status);
-      updates.push(`status = $${params.length}`);
-    }
-    if (priority) {
-      if (!LEAD_PRIORITIES.has(priority)) {
-        return res.status(400).json({ ok: false, error: 'invalid_priority', message: '线索优先级无效' });
-      }
-      params.push(priority);
-      updates.push(`priority = $${params.length}`);
-    }
-    // 处理备注留痕(选填):写入 note + 处理人 + 处理时间
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'note')) {
-      params.push(String(req.body.note || ''));
-      updates.push(`note = $${params.length}`);
-    }
-    if (status) {
-      params.push(req.user?.id || null);
-      updates.push(`handled_by = $${params.length}`);
-      params.push(req.user?.name || req.user?.email || '');
-      updates.push(`handled_name = $${params.length}`);
-      updates.push('handled_at = now()');
-    }
-    if (!updates.length) {
-      return res.status(400).json({ ok: false, error: 'empty_update', message: '没有要更新的字段' });
-    }
-    updates.push('updated_at = now()');
-    params.push(req.params.id, req.tenantId);
-    const lead = await queryOne(`
-      UPDATE comment_leads
-      SET ${updates.join(', ')}
-      WHERE id = $${params.length - 1} AND tenant_id = $${params.length}
-      RETURNING *
-    `, params);
-    if (!lead) return res.status(404).json({ ok: false, error: 'not_found', message: '线索不存在' });
+    if (!UUID_RE.test(req.params.id)) return res.status(400).json({ ok: false, error: 'invalid_id', message: '线索ID无效' });
+    const { status, priority, note, leadType, correctionReason } = req.body || {};
+    const lead = await mutateCommentLead({ tenantId: req.tenantId, id: req.params.id, status, priority, note, leadType, correctionReason, actor: req.user });
     return res.json({ ok: true, lead });
-  } catch (err) {
-    return next(err);
-  }
+  } catch (err) { return leadError(res, next, err); }
+});
+
+router.post('/comments/:id/notes', requireTenantAccess, requireTenantWriter, async (req, res, next) => {
+  try {
+    if (!UUID_RE.test(req.params.id)) return res.status(400).json({ ok: false, error: 'invalid_id', message: '线索ID无效' });
+    const body = req.body?.body;
+    if (typeof body !== 'string' || !body.trim()) return res.status(400).json({ ok: false, error: 'empty_note', message: '请填写跟进记录' });
+    const lead = await mutateCommentLead({ tenantId: req.tenantId, id: req.params.id, note: body, actor: req.user });
+    const activity = await getCommentLeadActivities({ tenantId: req.tenantId, id: req.params.id });
+    return res.json({ ok: true, lead, note: activity[0], activity });
+  } catch (err) { return leadError(res, next, err); }
 });
 
 // 导出当前筛选结果为 Excel(与 /comments 列表用同一套 where/params,但不分页)
@@ -328,11 +266,12 @@ router.get('/comments/export', requireTenantAccess, async (req, res, next) => {
     const params = [req.tenantId];
     let where = 'WHERE tenant_id = $1';
     const bucket = String(req.query.bucket || '');
-    if (bucket === 'pending') {
-      where += ` AND status = 'new'`;
+    if (bucket === 'pending' || bucket === 'active') {
+      where += ` AND status IN ('new', 'following', 'ticketed')`;
     } else if (bucket === 'archived') {
       where += ` AND status IN ('resolved', 'ignored')`;
-    } else if (status && LEAD_STATUSES.has(String(status))) {
+    }
+    if (status && LEAD_STATUSES.has(String(status))) {
       params.push(status);
       where += ` AND status = $${params.length}`;
     }
@@ -374,9 +313,9 @@ router.get('/comments/export', requireTenantAccess, async (req, res, next) => {
     }
     const koe = String(req.query.koe || '');
     if (koe === 'only') {
-      where += ` AND EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.source_type IN ('dealer','employee'))`;
+      where += ` AND EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.tenant_id = comment_leads.tenant_id AND rc.source_type IN ('dealer','employee'))`;
     } else if (koe === 'hide') {
-      where += ` AND NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.source_type IN ('dealer','employee'))`;
+      where += ` AND NOT EXISTS (SELECT 1 FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.tenant_id = comment_leads.tenant_id AND rc.source_type IN ('dealer','employee'))`;
     }
     // 与列表一致:父帖被判 irrelevant 的评论不导出
     where += ` AND NOT EXISTS (SELECT 1 FROM records r WHERE r.id = comment_leads.record_id AND r.tenant_id = comment_leads.tenant_id AND (r.ai_result->>'relevance' = 'irrelevant' OR r.business_visibility <> 'eligible'))`;
@@ -384,8 +323,8 @@ router.get('/comments/export', requireTenantAccess, async (req, res, next) => {
 
     const leads = await queryAll(`
       SELECT *,
-        (SELECT published_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_published_at,
-        (SELECT source_type FROM record_comments rc WHERE rc.id = comment_leads.comment_id) AS comment_source_type
+        (SELECT published_at FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.tenant_id = comment_leads.tenant_id) AS comment_published_at,
+        (SELECT source_type FROM record_comments rc WHERE rc.id = comment_leads.comment_id AND rc.tenant_id = comment_leads.tenant_id) AS comment_source_type
       FROM comment_leads
       ${where}
       ORDER BY captured_at DESC
@@ -435,6 +374,21 @@ router.get('/comments/export', requireTenantAccess, async (req, res, next) => {
   } catch (err) {
     return next(err);
   }
+});
+
+router.get('/comments/:id', requireTenantAccess, async (req, res, next) => {
+  try {
+    if (!UUID_RE.test(req.params.id)) return res.status(400).json({ ok: false, error: 'invalid_id', message: '线索ID无效' });
+    const lead = await queryOne(`SELECT ${LEAD_DETAIL_COLUMNS} FROM comment_leads WHERE id = $1 AND tenant_id = $2`, [req.params.id, req.tenantId]);
+    if (!lead) return res.status(404).json({ ok: false, error: 'not_found', message: '线索不存在' });
+    const record = await queryOne('SELECT * FROM records WHERE id = $1 AND tenant_id = $2', [lead.record_id, req.tenantId]);
+    lead.publish_display = formatPublishDate(lead.comment_published_at, lead.captured_at);
+    const activity = await getCommentLeadActivities({ tenantId: req.tenantId, id: lead.id });
+    const ticket = lead.ticket_id ? await queryOne(`SELECT * FROM tickets
+      WHERE id = $1 AND tenant_id = $2 AND source_type = 'comment' AND source_comment_id = $3`,
+    [lead.ticket_id, req.tenantId, lead.id]) : null;
+    return res.json({ ok: true, lead, record, ticket, activity, suggestion: buildCommentLeadSuggestion(lead, record || {}) });
+  } catch (err) { return leadError(res, next, err); }
 });
 
 export default router;

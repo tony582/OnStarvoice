@@ -84,6 +84,27 @@ function normalizeAccountBody(body = {}) {
   };
 }
 
+const ACCOUNT_PATCH_FIELDS = {
+  platformAccountId: 'platform_account_id', accountHandle: 'account_handle',
+  displayName: 'display_name', registeredPhone: 'registered_phone',
+  healthStatus: 'health_status', restUntil: 'rest_until', notes: 'notes',
+  dailySearchLimit: 'daily_search_limit', dailyEnhancementLimit: 'daily_enhancement_limit',
+  dailyCaptureLimit: 'daily_capture_limit',
+};
+const ACCOUNT_IDENTITY_FIELDS = ['platformAccountId', 'accountHandle', 'displayName', 'registeredPhone'];
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+
+function invalidProvidedAccountField(body) {
+  if (hasOwn(body, 'identitySource') && body.identitySource !== 'manual') return '人工登记只能确认手工身份';
+  if (body.identitySource === 'manual' && hasOwn(body, 'agentBindingMode') && body.agentBindingMode !== 'manual') return '人工登记请使用手工关联模式';
+  if (hasOwn(body, 'healthStatus') && !HEALTH_STATUSES.has(body.healthStatus)) return '账号健康状态不正确';
+  if (hasOwn(body, 'restUntil') && text(body.restUntil) && !optionalTimestamp(body.restUntil)) return '休息截止时间格式不正确';
+  for (const key of ['dailySearchLimit', 'dailyEnhancementLimit', 'dailyCaptureLimit']) {
+    if (hasOwn(body, key) && (!Number.isInteger(Number(body[key])) || Number(body[key]) < 0)) return '每日限额应为非负整数';
+  }
+  return '';
+}
+
 function normalizeAgentIds(value) {
   if (!Array.isArray(value)) {
     return {error: '请明确提交 Agent 列表；空列表表示解绑全部'};
@@ -133,13 +154,15 @@ async function bindAccountToAgent(
   const normalizedAgentId = uuid(agentId);
   if (!normalizedAgentId) return {invalidAgentId: true};
   const agent = await tx.queryOne(`
-    SELECT id
+    SELECT id, allowed_platforms
     FROM capture_agents
     WHERE id = $1 AND tenant_id = $2
       AND status IN ('active', 'paused')
     FOR UPDATE
   `, [normalizedAgentId, tenantId]);
   if (!agent) return {notFound: true};
+  if (Array.isArray(agent.allowed_platforms) && agent.allowed_platforms.length
+      && !agent.allowed_platforms.includes(platform)) return {unsupportedAgent: true};
   await tx.execute(`
     UPDATE social_account_bindings
     SET status = 'historical', ended_at = now(), updated_at = now()
@@ -157,8 +180,10 @@ async function bindAccountToAgent(
     DO UPDATE SET
       social_account_id = EXCLUDED.social_account_id,
       source = EXCLUDED.source,
-      last_login_state = 'unknown',
-      last_seen_at = now(),
+      last_login_state = CASE WHEN social_account_bindings.social_account_id = EXCLUDED.social_account_id
+        THEN social_account_bindings.last_login_state ELSE 'unknown' END,
+      last_seen_at = CASE WHEN social_account_bindings.social_account_id = EXCLUDED.social_account_id
+        THEN social_account_bindings.last_seen_at ELSE now() END,
       updated_at = now()
     RETURNING id, agent_id, social_account_id, platform, status
   `, [tenantId, normalizedAgentId, accountId, platform, source]);
@@ -449,7 +474,7 @@ router.post(
   async (req, res, next) => {
     try {
       const account = normalizeAccountBody(req.body);
-      const validationError = accountValidationError(account);
+      const validationError = invalidProvidedAccountField(req.body || {}) || accountValidationError(account);
       if (validationError) {
         return res.status(400).json({
           ok: false,
@@ -462,14 +487,17 @@ router.post(
       if (rawAgentId && !agentId) return sendInvalidId(res, 'Agent');
       const result = await withTransaction(async tx => {
         if (agentId) {
+          await lockCaptureAgentExecutionSlot(tx, req.tenantId, agentId);
           const agent = await tx.queryOne(`
-            SELECT id
+            SELECT id, allowed_platforms
             FROM capture_agents
             WHERE id = $1 AND tenant_id = $2
               AND status IN ('active', 'paused')
             FOR UPDATE
           `, [agentId, req.tenantId]);
           if (!agent) return {agentNotFound: true};
+          if (Array.isArray(agent.allowed_platforms) && agent.allowed_platforms.length
+              && !agent.allowed_platforms.includes(account.platform)) return {unsupportedAgent: true};
         }
         const created = await tx.queryOne(`
           INSERT INTO social_accounts (
@@ -526,6 +554,7 @@ router.post(
           message: '执行节点不存在或已撤销',
         });
       }
+      if (result.unsupportedAgent) return res.status(409).json({ok: false, error: 'agent_platform_unsupported', message: '所选 Agent 不支持该账号平台'});
       return res.status(201).json({ok: true, ...result});
     } catch (error) {
       if (error?.code === '23505') {
@@ -549,8 +578,8 @@ router.patch(
     try {
       const accountId = uuid(req.params.id);
       if (!accountId) return sendInvalidId(res);
-      const account = normalizeAccountBody(req.body);
-      const validationError = accountValidationError(account);
+      const body = req.body || {};
+      const validationError = invalidProvidedAccountField(body);
       if (validationError) {
         return res.status(400).json({
           ok: false,
@@ -558,53 +587,45 @@ router.patch(
           message: validationError,
         });
       }
-      const updated = await queryOne(`
-        UPDATE social_accounts
-        SET platform_account_id = $1,
-          account_handle = $2,
-          display_name = $3,
-          registered_phone = $4,
-          identity_source = CASE
-            WHEN identity_source <> 'manual'
-              AND (
-                platform_account_id IS DISTINCT FROM $1
-                OR account_handle IS DISTINCT FROM $2
-                OR display_name IS DISTINCT FROM $3
-              )
-              THEN 'manual'
-            ELSE identity_source
-          END,
-          health_status = $5,
-          rest_until = $6,
-          notes = $7,
-          daily_search_limit = $8,
-          daily_enhancement_limit = $9,
-          daily_capture_limit = $10,
-          updated_at = now()
-        WHERE id = $11 AND tenant_id = $12
-        RETURNING *
-      `, [
-        account.platformAccountId,
-        account.accountHandle,
-        account.displayName,
-        account.registeredPhone,
-        account.healthStatus,
-        account.restUntil,
-        account.notes,
-        account.dailySearchLimit,
-        account.dailyEnhancementLimit,
-        account.dailyCaptureLimit,
-        accountId,
-        req.tenantId,
-      ]);
-      if (!updated) {
+      const result = await withTransaction(async tx => {
+        const current = await tx.queryOne('SELECT * FROM social_accounts WHERE id = $1 AND tenant_id = $2 FOR UPDATE', [accountId, req.tenantId]);
+        if (!current) return {notFound: true};
+        if (hasOwn(body, 'platform') && normalizeSocialPlatform(body.platform) !== current.platform) {
+          return {validationError: '已登记账号的平台不能修改，请新建对应平台账号'};
+        }
+        const currentBody = {platform: current.platform};
+        for (const [key, column] of Object.entries(ACCOUNT_PATCH_FIELDS)) currentBody[key] = current[column];
+        const account = normalizeAccountBody({...currentBody, ...body, platform: current.platform});
+        const mergedError = accountValidationError(account);
+        if (mergedError) return {validationError: mergedError};
+        const values = [];
+        const updates = [];
+        for (const [key, column] of Object.entries(ACCOUNT_PATCH_FIELDS)) {
+          if (!hasOwn(body, key)) continue;
+          values.push(account[key]);
+          updates.push(`${column} = $${values.length}`);
+        }
+        const manualConfirmation = body.identitySource === 'manual' || ACCOUNT_IDENTITY_FIELDS.some(key =>
+          hasOwn(body, key) && account[key] !== current[ACCOUNT_PATCH_FIELDS[key]],
+        );
+        if (manualConfirmation) {
+          updates.push("identity_source = 'manual'", "agent_binding_mode = 'manual'");
+        }
+        if (!updates.length) return {validationError: '请提交要更新的账号资料'};
+        values.push(accountId, req.tenantId);
+        const updated = await tx.queryOne(`UPDATE social_accounts SET ${updates.join(', ')}, updated_at = now()
+          WHERE id = $${values.length - 1} AND tenant_id = $${values.length} RETURNING *`, values);
+        return {account: updated};
+      });
+      if (result.notFound) {
         return res.status(404).json({
           ok: false,
           error: 'social_account_not_found',
           message: '社交账号不存在',
         });
       }
-      return res.json({ok: true, account: updated});
+      if (result.validationError) return res.status(400).json({ok: false, error: 'invalid_social_account', message: result.validationError});
+      return res.json({ok: true, account: result.account});
     } catch (error) {
       if (error?.code === '23505') {
         return res.status(409).json({
@@ -642,17 +663,19 @@ router.post(
           FOR UPDATE
         `, [accountId, req.tenantId]);
         if (!account) return {accountNotFound: true};
-        await tx.execute(`
-          UPDATE social_accounts
-          SET agent_binding_mode = 'manual', updated_at = now()
-          WHERE id = $1 AND tenant_id = $2
-        `, [account.id, req.tenantId]);
-        return await bindAccountToAgent(tx, {
+        const bound = await bindAccountToAgent(tx, {
           tenantId: req.tenantId,
           accountId: account.id,
           platform: account.platform,
           agentId,
         });
+        if (!bound.binding) return bound;
+        await tx.execute(`
+          UPDATE social_accounts
+          SET agent_binding_mode = 'manual', updated_at = now()
+          WHERE id = $1 AND tenant_id = $2
+        `, [account.id, req.tenantId]);
+        return bound;
       });
       if (result.accountNotFound) {
         return res.status(404).json({
@@ -671,6 +694,7 @@ router.post(
       if (result.invalidAgentId) {
         return sendInvalidId(res, 'Agent');
       }
+      if (result.unsupportedAgent) return res.status(409).json({ok: false, error: 'agent_platform_unsupported', message: '所选 Agent 不支持该账号平台'});
       return res.json({ok: true, binding: result.binding});
     } catch (error) {
       return next(error);
