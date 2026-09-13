@@ -115,6 +115,11 @@ jobs:
       - name: Install locked server dependencies
         run: npm --prefix server ci
 
+      # Node 18 uses the locked TypeScript compiler for frontend helper tests.
+      # Vite itself is built by the Node 24 quality job above.
+      - name: Install locked Admin test dependencies
+        run: npm --prefix web/admin ci --ignore-scripts
+
       - name: Check server syntax on the production runtime
         run: npm --prefix server run check:syntax
 
