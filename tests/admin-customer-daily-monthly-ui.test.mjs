@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {dailyPostStatusLabel, isCollectionSummary, isHandlingSummary, isMonthlySummary, monthlyDraftFromRows, monthlyFields, monthlySummaryTotals, parseMonthlyDraft, sumMonthlyRows, visibleMonthlyRows} from '../web/admin/src/pages/insights/CustomerDailyReport.summary.mjs';
+import {dailyPostStatusLabel, isCollectionHandlingSummary, isCollectionSummary, isHandlingSummary, isMonthlySummary, monthlyDraftFromRows, monthlyFields, monthlySummaryTotals, parseMonthlyDraft, sumMonthlyRows, visibleMonthlyRows} from '../web/admin/src/pages/insights/CustomerDailyReport.summary.mjs';
 
 const counts = {monitor: 30, sdb: 25, positive: 3, neutral: 15, cold: 2, comment: 2, negativeProcess: 2, negativeOther: 1};
 const rows = [
@@ -139,6 +139,100 @@ test('v4 single-table presentation retains legacy dual-table visibility only for
   assert.match(view, /monthlySummaryTotals\(snapshot, draft\)/u);
   assert.match(view, /MTD 在原去重累计上增减对应修改差额/u);
   assert.match(view, /disabled=\{busy \|\| !!totalsError\}/u);
+});
+
+test('v5 collection and event-count schema never reinterprets frozen v4', () => {
+  const snapshot = {schemaVersion: 5, summary: {format: 'daily_collection_handling_v5', rows, mtd: counts}};
+  assert.equal(isCollectionHandlingSummary(snapshot), true);
+  assert.equal(isMonthlySummary(snapshot), true);
+  assert.equal(isHandlingSummary(snapshot), false);
+  assert.equal(isCollectionSummary(snapshot), false);
+  assert.equal(monthlySummaryTotals(snapshot, null), counts);
+  for (const [schemaVersion, format] of [[4, 'daily_collection_handling_v5'], [5, 'daily_collection_v4'], [5, 'daily_handling_v3']]) {
+    assert.equal(isCollectionHandlingSummary({schemaVersion, summary: {format, rows}}), false);
+  }
+  assert.equal(isCollectionHandlingSummary({...snapshot, summary: {format: snapshot.summary.format}}), false);
+});
+
+test('v5 daily negative event counts may exceed collection SDB while MTD keeps frozen distinct values', () => {
+  const day = {monitor: 280, sdb: 198, positive: 65, neutral: 122, cold: 0, comment: 2, negativeProcess: 9, negativeOther: 2};
+  const eventRows = [{date: '2026-09-14', isWorkingDay: true, counts: day}];
+  const mtd = {...counts, monitor: 1243, sdb: 933, positive: 357, neutral: 515, cold: 22, comment: 2, negativeProcess: 35, negativeOther: 5};
+  const snapshot = {schemaVersion: 5, summary: {format: 'daily_collection_handling_v5', rows: eventRows, mtd}};
+  const draft = monthlyDraftFromRows(eventRows, true);
+  assert.deepEqual(monthlySummaryTotals(snapshot, draft), mtd);
+  assert.deepEqual(parseMonthlyDraft(eventRows, draft, true).rows['2026-09-14'], day);
+  assert.throws(() => monthlySummaryTotals({...snapshot, schemaVersion: 4, summary: {...snapshot.summary, format: 'daily_collection_v4'}}, draft), /负面月累计之和不能大于/u);
+  draft['2026-09-14'].comment = '10';
+  const edited = monthlySummaryTotals(snapshot, draft);
+  assert.equal(edited.monitor, 1243);
+  assert.equal(edited.comment, 2);
+  assert.equal(edited.sdb, 933);
+  assert.throws(() => monthlySummaryTotals({...snapshot, schemaVersion: 4, summary: {...snapshot.summary, format: 'daily_collection_v4'}}, draft), /负面月累计之和不能大于/u);
+});
+
+test('v5 includes actual rest-day events in display and editing without changing distinct MTD posts', () => {
+  const zero = Object.fromEntries(monthlyFields.map(field => [field, 0]));
+  const eventRows = [
+    {date: '2026-09-05', isWorkingDay: false, counts: {...zero}},
+    {date: '2026-09-06', isWorkingDay: false, counts: {...zero, comment: 7}},
+    {date: '2026-09-07', isWorkingDay: true, counts: {...zero, monitor: 1, sdb: 1, positive: 1}},
+  ];
+  const mtd = {...zero, monitor: 1, sdb: 1, positive: 1, comment: 2};
+  const snapshot = {schemaVersion: 5, summary: {format: 'daily_collection_handling_v5', rows: eventRows, mtd}};
+  const draft = monthlyDraftFromRows(eventRows, true);
+  assert.deepEqual(Object.keys(draft), ['2026-09-06', '2026-09-07']);
+  assert.deepEqual(monthlySummaryTotals(snapshot, draft), mtd);
+  draft['2026-09-06'].comment = '8';
+  assert.equal(monthlySummaryTotals(snapshot, draft).comment, 2);
+  assert.equal(parseMonthlyDraft(eventRows, draft, true).rows['2026-09-06'].comment, 8);
+  draft['2026-09-06'].comment = '0';
+  assert.equal(monthlySummaryTotals(snapshot, draft).comment, 2);
+});
+
+test('v5 day three events to one event retains one distinct MTD post; collection edits still adjust MTD', () => {
+  const original = {...counts, comment: 3};
+  const eventRows = [{date: '2026-09-14', isWorkingDay: true, counts: original}];
+  const mtd = {...counts, comment: 1};
+  const snapshot = {schemaVersion: 5, summary: {format: 'daily_collection_handling_v5', rows: eventRows, mtd}};
+  const draft = monthlyDraftFromRows(eventRows, true);
+  draft['2026-09-14'].comment = '1';
+  assert.deepEqual(monthlySummaryTotals(snapshot, draft), mtd);
+  assert.equal(parseMonthlyDraft(eventRows, draft, true).rows['2026-09-14'].comment, 1);
+  assert.throws(() => monthlySummaryTotals({...snapshot, schemaVersion: 4, summary: {...snapshot.summary, format: 'daily_collection_v4'}}, draft), /月累计超出有效范围/u);
+  for (const field of ['cold', 'comment', 'negativeProcess', 'negativeOther']) draft['2026-09-14'][field] = '100';
+  draft['2026-09-14'].monitor = '32';
+  const edited = monthlySummaryTotals(snapshot, draft);
+  assert.equal(edited.monitor, 32);
+  for (const field of ['cold', 'comment', 'negativeProcess', 'negativeOther']) assert.equal(edited[field], mtd[field]);
+});
+
+test('v5 preserves collection relationships and integer limits without imposing cross-basis negative limits', () => {
+  const safeRows = rows.slice(0, 2);
+  const snapshot = {schemaVersion: 5, summary: {format: 'daily_collection_handling_v5', rows: safeRows, mtd: {...counts, cold: 80}}};
+  assert.equal(monthlySummaryTotals(snapshot, monthlyDraftFromRows(safeRows, true)).cold, 80);
+  for (const invalid of ['', '-1', '1.5', '1e2', '9007199254740992']) {
+    const draft = monthlyDraftFromRows(safeRows, true);
+    draft['2026-09-01'].comment = invalid;
+    assert.throws(() => monthlySummaryTotals(snapshot, draft), /评论区留言.*非负整数/u);
+  }
+  const sdb = monthlyDraftFromRows(safeRows, true);
+  sdb['2026-09-01'].sdb = '31';
+  assert.throws(() => monthlySummaryTotals(snapshot, sdb), /2026-09-01 SDB范畴不能大于平台监控量/u);
+  const sentiment = monthlyDraftFromRows(safeRows, true);
+  sentiment['2026-09-01'].positive = '11';
+  assert.throws(() => monthlySummaryTotals(snapshot, sentiment), /2026-09-01 正面和中性之和不能大于SDB范畴/u);
+  assert.throws(() => monthlySummaryTotals({...snapshot, summary: {...snapshot.summary, mtd: {...counts, positive: 11}}}, monthlyDraftFromRows(safeRows, true)), /正面和中性月累计之和不能大于SDB范畴/u);
+});
+
+test('v5 single table explains collection attribution, daily event counts and distinct latest-status MTD', () => {
+  const view = readFileSync(new URL('../web/admin/src/pages/insights/CustomerDailyReport.tsx', import.meta.url), 'utf8');
+  assert.match(view, /逐日采集与负面处理汇总及月累计/u);
+  assert.match(view, /负面四列按北京时间当日实际处理次数统计/u);
+  assert.match(view, /重复同状态及仅修改备注不计/u);
+  assert.match(view, /MTD 负面按每帖本月最后处理状态去重归类/u);
+  assert.match(view, /修改日处理次数不会改变MTD去重数量/u);
+  assert.match(view, /visibleMonthlyRows\(snapshot\.summary\.rows!, handling \|\| collectionHandling\)/u);
 });
 
 test('the empty insights entry defaults to daily while explicit dashboard navigation remains available', () => {

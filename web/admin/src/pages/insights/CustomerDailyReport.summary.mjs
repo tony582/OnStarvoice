@@ -1,5 +1,6 @@
 
 export const monthlyFields = ['monitor', 'sdb', 'positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther']
+const collectionFields = new Set(['monitor', 'sdb', 'positive', 'neutral'])
 export const monthlyLabels = {
   monitor: '平台监控量', sdb: 'SDB范畴', positive: '正面', neutral: '中性',
   cold: '负面-冷处理', comment: '负面-评论区留言', negativeProcess: '负面-负面处理流程', negativeOther: '负面-其他',
@@ -7,7 +8,7 @@ export const monthlyLabels = {
 
 export function isMonthlySummary(snapshot) {
   return Array.isArray(snapshot.summary.rows) && (
-    (snapshot.schemaVersion >= 2 && snapshot.summary.format === 'daily_disposition_v2') || isHandlingSummary(snapshot) || isCollectionSummary(snapshot)
+    (snapshot.schemaVersion >= 2 && snapshot.summary.format === 'daily_disposition_v2') || isHandlingSummary(snapshot) || isCollectionSummary(snapshot) || isCollectionHandlingSummary(snapshot)
   )
 }
 
@@ -17,6 +18,10 @@ export function isHandlingSummary(snapshot) {
 
 export function isCollectionSummary(snapshot) {
   return snapshot.schemaVersion >= 4 && snapshot.summary.format === 'daily_collection_v4' && Array.isArray(snapshot.summary.rows)
+}
+
+export function isCollectionHandlingSummary(snapshot) {
+  return snapshot.schemaVersion >= 5 && snapshot.summary.format === 'daily_collection_handling_v5' && Array.isArray(snapshot.summary.rows)
 }
 
 export function visibleMonthlyRows(rows, includeHandledNonWorkingDays = false) {
@@ -50,11 +55,21 @@ export function sumMonthlyRows(rows, draft, includeHandledNonWorkingDays = false
 export function monthlySummaryTotals(snapshot, draft) {
   if (!draft) return snapshot.summary.mtd
   const rows = snapshot.summary.rows || []
-  if (!isCollectionSummary(snapshot)) return sumMonthlyRows(rows, draft, isHandlingSummary(snapshot))
+  const collectionHandling = isCollectionHandlingSummary(snapshot)
+  if (!isCollectionSummary(snapshot) && !collectionHandling) return sumMonthlyRows(rows, draft, isHandlingSummary(snapshot))
+  if (collectionHandling) {
+    const parsed = parseMonthlyDraft(rows, draft, true)
+    for (const [date, counts] of Object.entries(parsed.rows)) {
+      if (counts.sdb > counts.monitor) throw new Error(`${date} SDB范畴不能大于平台监控量。`)
+      if (BigInt(counts.positive) + BigInt(counts.neutral) > BigInt(counts.sdb)) throw new Error(`${date} 正面和中性之和不能大于SDB范畴。`)
+    }
+  }
   const totals = Object.fromEntries(monthlyFields.map(field => {
     const original = snapshot.summary.mtd[field]
     if (!Number.isSafeInteger(original) || original < 0) throw new Error('原月累计数据需要核对，请先更新日报。')
-    const delta = visibleMonthlyRows(rows).reduce((sum, row) => {
+    // Daily handling events and monthly distinct posts have different units.
+    if (collectionHandling && !collectionFields.has(field)) return [field, original]
+    const delta = visibleMonthlyRows(rows, collectionHandling).reduce((sum, row) => {
       const value = String(draft[row.date]?.[field] ?? '').trim()
       const count = Number(value)
       const previous = row.counts[field] ?? 0
@@ -66,9 +81,10 @@ export function monthlySummaryTotals(snapshot, draft) {
     return [field, Number(total)]
   }))
   if (totals.sdb > totals.monitor) throw new Error('SDB月累计不能大于平台监控量，请调整每日修改值。')
-  const classified = ['positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther']
+  const classifiedFields = collectionHandling ? ['positive', 'neutral'] : ['positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther']
+  const classified = classifiedFields
     .reduce((sum, field) => sum + BigInt(totals[field]), 0n)
-  if (classified > BigInt(totals.sdb)) throw new Error('正面、中性及负面月累计之和不能大于SDB范畴，请调整每日修改值。')
+  if (classified > BigInt(totals.sdb)) throw new Error(collectionHandling ? '正面和中性月累计之和不能大于SDB范畴，请调整每日修改值。' : '正面、中性及负面月累计之和不能大于SDB范畴，请调整每日修改值。')
   return totals
 }
 

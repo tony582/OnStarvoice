@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { buildFeishuDailyDocumentPlan, createFeishuDailyClient, FeishuDailyError } from '../server/services/feishu-daily-report.js';
+import {collectionHandlingSnapshot} from './fixtures/customer-daily-v5.mjs';
 
 const CONFIG = { appId: 'cli_test', appSecret: 'private-app-secret', folderToken: 'folder_daily',
   documentBaseUrl: 'https://example.feishu.cn', channel: 'app', chatId: 'oc_customer', editorType: 'openid', editorId: 'ou_customer' };
@@ -710,6 +711,28 @@ test('v4 native document contains one nine-column collection table with frozen M
   const map = new Map(blocks.map(block => [block.block_id, block]));
   const cellText = index => map.get(map.get(tables[0].children[index]).children[0]).text.elements[0].text_run.content;
   assert.equal(cellText(4 * 9 + 1), '321');
+  const h = harness();
+  assert.equal((await h.client.writeDocument({documentId: 'doc_one', snapshot: source, onProgress: savedProgress().save})).done, true);
+  assert.equal(h.blocks.filter(block => block.block_type === 31).length, 1);
+  assert.equal(mutations(h).filter(request => request.method === 'PATCH').length, 7);
+  assert.equal(messages(h).length, 0);
+  assert.deepEqual(source, original);
+});
+
+test('v5 native document writes handling-event rows and distinct frozen MTD without mixing collection totals', async () => {
+  const source = collectionHandlingSnapshot(), original = structuredClone(source);
+  const plan = buildFeishuDailyDocumentPlan(source), blocks = plan.batches.flatMap(batch => batch.descendants);
+  const tables = blocks.filter(block => block.block_type === 31);
+  assert.equal(tables.length, 1);
+  assert.deepEqual([tables[0].table.property.column_size, tables[0].table.property.row_size], [9, 6]);
+  const map = new Map(blocks.map(block => [block.block_id, block]));
+  const cellText = (row, column) => map.get(map.get(tables[0].children[row * 9 + column]).children[0]).text.elements[0].text_run.content;
+  assert.deepEqual(Array.from({length: 9}, (_, i) => cellText(2, i)), ['2026/9/12', '0', '0', '0', '0', '2', '3', '0', '0']);
+  assert.deepEqual(Array.from({length: 9}, (_, i) => cellText(3, i)), ['2026/9/14', '280', '198', '65', '122', '0', '2', '9', '2']);
+  assert.deepEqual(Array.from({length: 9}, (_, i) => cellText(5, i)), ['MTD', '1243', '932', '357', '515', '19', '2', '35', '5']);
+  const value = JSON.stringify(plan);
+  for (const label of ['采集列按采集日期统计', '四项负面按实际处理日期计次数（含旧帖）', 'MTD 按帖去重', '处理状态：飞书表 · 202609-007']) assert.ok(value.includes(label));
+  assert.doesNotMatch(value, /2026\/9\/13|首次入库采集统计|实际采集量/);
   const h = harness();
   assert.equal((await h.client.writeDocument({documentId: 'doc_one', snapshot: source, onProgress: savedProgress().save})).done, true);
   assert.equal(h.blocks.filter(block => block.block_type === 31).length, 1);

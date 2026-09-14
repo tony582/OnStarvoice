@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {inflateSync} from 'node:zlib';
 import {renderCustomerDailySummaryPng,renderCustomerDailySummarySvg} from '../server/services/customer-daily-report-image.js';
+import {collectionHandlingSnapshot} from './fixtures/customer-daily-v5.mjs';
 
 const counts={monitor:100,sdb:80,positive:30,neutral:35,negative:15,cold:6,inProgress:null,processed:null};
 const snapshot=(day={},mtd={})=>({reportDate:'2026-09-07',summary:{day:{...counts,...day},mtd:{...counts,monitor:500,...mtd}}});
@@ -79,4 +80,19 @@ test('v4 PNG preserves the grouped nine-column layout for a single collection ta
   const png = renderCustomerDailySummaryPng(source);
   assert.equal(png.readUInt32BE(16), 1407);
   assert.equal(png.readUInt32BE(20), 354);
+});
+
+test('v5 image retains holiday handling events and independent frozen MTD in a single grouped table', () => {
+  const source = collectionHandlingSnapshot(), original = structuredClone(source);
+  const svg = renderCustomerDailySummarySvg(source);
+  for (const label of ['采集列按采集日期统计', '四项负面按实际处理日期计次数（含旧帖）', 'MTD 按帖去重', '本月去重累计', '2026/9/12', '2026/9/14']) assert.ok(svg.includes(label));
+  assert.doesNotMatch(svg, /2026\/9\/13|首次入库采集统计|实际采集量|>休<|NaN|undefined/);
+  assert.equal((svg.match(/>MTD</g) || []).length, 1);
+  for (const value of [280, 1243, 932]) assert.ok(svg.includes(`>${value}</text>`));
+  const png = renderCustomerDailySummaryPng(source);
+  assert.equal(png.readUInt32BE(16), 1407);
+  assert.equal(png.readUInt32BE(20), 404);
+  const changed = structuredClone(source); changed.summary.mtd.comment = 5;
+  assert.notDeepEqual(png, renderCustomerDailySummaryPng(changed), 'image uses frozen MTD comment=2 rather than recomputing daily 3+2');
+  assert.deepEqual(source, original);
 });

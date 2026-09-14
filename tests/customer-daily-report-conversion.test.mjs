@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {convertCustomerDailyV3ToCollectionSnapshot} from '../server/services/customer-daily-report-conversion.js';
+import {convertCustomerDailyV3ToCollectionSnapshot, convertCustomerDailyV4ToMixedSnapshot} from '../server/services/customer-daily-report-conversion.js';
+import {buildCustomerDailyNegativeHandlingSummary} from '../server/services/customer-daily-handling-summary.js';
 import {mergeCustomerDailySummary} from '../server/services/customer-daily-reports.js';
 
 const counts = (monitor, sdb, extra = {}) => ({monitor, sdb, positive: 0, neutral: 0, negative: 0, cold: 0, comment: 0,
@@ -107,4 +108,88 @@ test('conversion rejects incomplete or unrelated snapshots instead of recollecti
   assert.throws(() => convertCustomerDailyV3ToCollectionSnapshot({...source, id: undefined}), {code: 'daily_collection_conversion_invalid'});
   const converted = convertCustomerDailyV3ToCollectionSnapshot(source);
   assert.throws(() => convertCustomerDailyV3ToCollectionSnapshot(converted, {sourceReportId: 'new-report'}), {code: 'daily_collection_conversion_invalid'});
+});
+
+function collectionSource() {
+  return {...convertCustomerDailyV3ToCollectionSnapshot(sourceSnapshot()), id: 'frozen-v4-report', version: 8};
+}
+function actionsFor(source) {
+  return buildCustomerDailyNegativeHandlingSummary([{id: 'old-post-1', sentiment: 'negative'}, {id: 'old-post-2', sentiment: 'neutral'}], [
+    {recordId: 'old-post-1', eventId: 'event-1', handledAt: '2026-09-12T01:00:00Z', previousStatus: 'unhandled', nextStatus: 'negative_cold'},
+    {recordId: 'old-post-1', eventId: 'event-2', handledAt: '2026-09-14T04:00:00Z', previousStatus: 'negative_cold', nextStatus: 'negative_comment'},
+    {recordId: 'old-post-2', eventId: 'event-3', handledAt: '2026-09-14T05:00:00Z', previousStatus: 'negative_feishu', nextStatus: 'negative_comment'},
+  ], source, {coverageFrom: '2026-09-08T09:23:56.772Z'});
+}
+
+test('v4 to v5 preserves the exact frozen collection baseline and customer content while replacing only the four action columns', () => {
+  const source = collectionSource(), before = structuredClone(source);
+  const handling = actionsFor(source);
+  const converted = convertCustomerDailyV4ToMixedSnapshot(source, {handlingSummary: handling.summary, handlingEvidence: handling.evidence});
+  assert.equal(converted.schemaVersion, 5);
+  assert.equal(converted.summary.format, 'daily_collection_handling_v5');
+  for (const field of ['monitor', 'sdb', 'positive', 'neutral', 'negative', 'nonMonitor', 'unclassified']) {
+    assert.equal(converted.summary.day[field], source.summary.day[field]);
+    assert.equal(converted.summary.mtd[field], source.summary.mtd[field]);
+    for (const row of source.summary.rows) assert.equal(converted.summary.rows.find(item => item.date === row.date).counts[field], row.counts[field]);
+  }
+  assert.equal(converted.summary.day.comment, 2);
+  assert.equal(converted.summary.mtd.comment, 2);
+  const weekend = converted.summary.rows.find(row => row.date === '2026-09-12');
+  assert.equal(weekend.counts.monitor, 0);
+  assert.equal(weekend.counts.cold, 1);
+  assert.equal(weekend.isWorkingDay, false);
+  assert.equal(converted.summary.mtd.cold, 0, 'last comment state replaces a prior cold state for monthly dedup only');
+  assert.equal(converted.summary.mtd.monitor, 1243);
+  for (const field of ['notes', 'highHeat', 'coldMarked', 'assessedAt', 'cutoffAt', 'legacyHandling']) assert.deepEqual(converted[field], source[field], field);
+  assert.equal(Object.hasOwn(converted, 'id'), false);
+  assert.equal(Object.hasOwn(converted, 'version'), false);
+  assert.equal(converted.legacyCollection.sourceReportId, source.id);
+  assert.deepEqual(converted.legacyCollection.summary, source.summary);
+  assert.deepEqual(converted.evidence.handling, handling.evidence);
+  assert.ok(converted.warnings.some(warning => warning.code === 'handling_history_incomplete' && warning.blocking === false));
+  for (const warning of source.warnings) assert.ok(converted.warnings.some(item => item.code === warning.code));
+  converted.summary.rows[0].counts.comment = 999;
+  converted.evidence.handling.transitions[0].nextStatus = 'reviewed';
+  assert.deepEqual(source, before);
+  assert.equal(handling.evidence.transitions[0].nextStatus, 'negative_cold');
+});
+
+test('v4 to v5 retains top-level edit protection and converts the original system baseline without losing customer collection changes', () => {
+  const source = collectionSource();
+  source.systemSummary = structuredClone(source.summary);
+  source.summary.day.monitor = 281;
+  source.summary.rows.at(-1).counts.monitor = 281;
+  source.summary.mtd.monitor = 1244;
+  source.summaryEdited = true;
+  source.summaryEditedAt = '2026-09-14T09:00:00Z';
+  source.summaryEdit = {sourceReportId: 'earlier-v4', actorId: 'customer', editedAt: source.summaryEditedAt};
+  const before = structuredClone(source), handling = actionsFor(source);
+  const converted = convertCustomerDailyV4ToMixedSnapshot(source, {handlingSummary: handling.summary, handlingEvidence: handling.evidence});
+  assert.equal(converted.summary.day.monitor, 281);
+  assert.equal(converted.summary.mtd.monitor, 1244);
+  assert.equal(converted.systemSummary.day.monitor, 280);
+  assert.equal(converted.systemSummary.mtd.monitor, 1243);
+  assert.equal(converted.systemSummary.day.comment, 2);
+  assert.equal(converted.systemSummary.format, 'daily_collection_handling_v5');
+  for (const field of ['summaryEdited', 'summaryEditedAt', 'summaryEdit']) assert.deepEqual(converted[field], source[field]);
+  assert.deepEqual(converted.legacyCollection.systemSummary, source.systemSummary);
+  const edited = mergeCustomerDailySummary(converted.summary, {rows: {'2026-09-14': {monitor: 282, comment: 0}}});
+  assert.equal(edited.mtd.monitor, 1245);
+  assert.equal(edited.mtd.comment, 2);
+  assert.deepEqual(source, before);
+});
+
+test('v4 conversion rejects mismatched audit cutoffs, incomplete months, wrong sources and repeated conversion', () => {
+  const source = collectionSource(), handling = actionsFor(source);
+  const options = {sourceReportId: source.id, handlingSummary: handling.summary, handlingEvidence: handling.evidence};
+  for (const patch of [
+    {sourceReportId: 'wrong'},
+    {handlingEvidence: {...handling.evidence, cutoffAt: '2026-09-14T09:00:00Z'}},
+    {handlingEvidence: {...handling.evidence, monthStart: '2026-08-01T00:00:00Z'}},
+    {handlingSummary: {...handling.summary, dailyBasis: 'daily_unique_posts'}},
+    {handlingSummary: {...handling.summary, rows: handling.summary.rows.slice(1)}},
+    {handlingSummary: {...handling.summary, mtd: {...handling.summary.mtd, comment: -1}}},
+  ]) assert.throws(() => convertCustomerDailyV4ToMixedSnapshot(source, {...options, ...patch}), {code: 'daily_collection_conversion_invalid'});
+  const converted = convertCustomerDailyV4ToMixedSnapshot(source, options);
+  assert.throws(() => convertCustomerDailyV4ToMixedSnapshot(converted, options), {code: 'daily_collection_conversion_invalid'});
 });

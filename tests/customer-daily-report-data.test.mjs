@@ -75,9 +75,9 @@ test('collection day and MTD retain customer-visible first-insert counts once an
     record(12,{relevance:'irrelevant'}),record(13,{relevance:'irrelevant',watched:true,sentiment:'neutral'})];
   const db = fakeDb({month});
   const report = await collectCustomerDailyReport({...opts, db});
-  assert.deepEqual(report.summary.day, {monitor: 4, sdb: 3, positive: 1, neutral: 1, negative: 1, cold: 1, comment: 0, negativeProcess: 0, negativeOther: 0, nonMonitor: 1, unclassified: 0, inProgress: null, processed: null});
+  assert.deepEqual(report.summary.day, {monitor: 4, sdb: 3, positive: 1, neutral: 1, negative: 1, cold: 0, comment: 0, negativeProcess: 0, negativeOther: 0, nonMonitor: 1, unclassified: 0, inProgress: null, processed: null});
   assert.equal(report.summary.mtd.monitor, 5);
-  assert.equal(report.summary.mtd.cold, 2);
+  assert.equal(report.summary.mtd.cold, 0, 'current status alone is not a new processing event');
   assert.equal(report.summary.mtd.sdb, report.summary.mtd.positive + report.summary.mtd.neutral + report.summary.mtd.negative + report.summary.mtd.unclassified);
   assert.equal(report.summary.day.monitor, report.summary.day.sdb + report.summary.day.nonMonitor);
   assert.ok(!report.warnings.some(w => w.code === 'unclassified' || w.code === 'audit_visible_posts_included'));
@@ -94,17 +94,17 @@ test('morning new posts belong to today realtime and G corrections apply to yest
   const today = record(2, {first_seen_at: d(8, '01:00:00'), sentiment: 'positive'});
   const prior = await collectCustomerDailyReport({...opts, db: fakeDb({month: [yesterday, today]})});
   const realtime = await collectCustomerDailyReport({...opts, date: '2026-09-08', db: fakeDb({month: [yesterday, today]})});
-  assert.equal(prior.summary.day.monitor, 1); assert.equal(prior.summary.day.cold, 1);
+  assert.equal(prior.summary.day.monitor, 1); assert.equal(prior.summary.day.cold, 0);
   assert.equal(realtime.summary.day.monitor, 1); assert.equal(realtime.summary.day.positive, 1);
   assert.equal(realtime.summary.mtd.monitor, 2);
   const corrected = await collectCustomerDailyReport({...opts, db: fakeDb({month: [{...yesterday, sentiment: 'positive'}, today]})});
   assert.equal(corrected.summary.day.cold, 0);
   assert.equal(corrected.summary.day.positive, 1);
   assert.ok(corrected.warnings.some(w => w.code === 'sentiment_status_conflict' && w.blocking));
-  assert.equal(prior.summary.day.cold, 1, 'saved in-memory snapshot does not mutate');
+  assert.equal(prior.summary.day.cold, 0, 'saved in-memory snapshot does not mutate');
 });
 
-test('v4 uses only first-ingest collection cohorts and current negative dispositions, without monthly handling queries', async () => {
+test('v5 preserves collection cohorts while actual negative handling includes eligible older-month posts', async () => {
   const historical = record(1, {first_seen_at: '2026-08-01T00:00:00Z', status: 'negative_comment'});
   const current = record(2, {status: 'reviewed_non_monitor'});
   const untouched = record(3, {status: 'negative_cold', updated_at: d(7)});
@@ -117,16 +117,21 @@ test('v4 uses only first-ingest collection cohorts and current negative disposit
     handlingEvents: [event(1, 'unhandled'), event(3, 'unhandled', 'negative_feishu')],
     handlingPosts: [historical, untouched], coverage: '2026-08-31T16:00:00Z'});
   const report = await collectCustomerDailyReport({...opts, db});
-  assert.equal(report.schemaVersion, 4);
-  assert.equal(report.summary.format, 'daily_collection_v4');
+  assert.equal(report.schemaVersion, 5);
+  assert.equal(report.summary.format, 'daily_collection_handling_v5');
   assert.equal(report.summary.mtdBasis, 'distinct_records');
   assert.deepEqual(report.summary.day, {monitor: 7, sdb: 6, positive: 0, neutral: 0, negative: 6,
-    cold: 2, comment: 1, negativeProcess: 1, negativeOther: 2, inProgress: null, processed: null, unclassified: 0, nonMonitor: 1});
+    cold: 1, comment: 0, negativeProcess: 1, negativeOther: 0, inProgress: null, processed: null, unclassified: 0, nonMonitor: 1});
   assert.equal(report.summary.mtd.monitor, 7, 'collection MTD excludes earlier-month posts and duplicate records');
   assert.equal(Object.hasOwn(report, 'collectionSummary'), false);
-  assert.equal(Object.hasOwn(report.evidence, 'handling'), false);
+  assert.equal(report.evidence.handling.transitions.length, 2);
   assert.equal(Object.hasOwn(report.summary, 'coverageComplete'), false);
-  assert.ok(!db.calls.some(call => /customer_daily:handling_(events|posts)/.test(call.sql)));
+  const query = db.calls.find(call => call.sql.includes('customer_daily:handling_posts'));
+  assert.equal(query.params[0], tenantId);
+  assert.doesNotMatch(query.sql, /r\.created_at >=/);
+  assert.match(query.sql, /manual_overrides/);
+  assert.equal(report.summary.mtd.cold, 1);
+  assert.equal(report.summary.mtd.negativeProcess, 1);
   assert.ok(!report.warnings.some(warning => warning.code.startsWith('handling_')));
 });
 
@@ -147,12 +152,13 @@ test('Monday collection keeps the original window and deduplicates MTD despite r
   assert.equal(db.calls.find(call => call.sql.includes('customer_daily:month')).params[1], businessPeriod.monthStart);
 });
 
-test('missing status history affects only the cold list and does not block verified collection counts', async () => {
+test('missing status history flags incomplete action counts while preserving verified collection quantities', async () => {
   const report = await collectCustomerDailyReport({...opts, db: fakeDb({coverage: null, month: [record(1)]})});
   assert.equal(report.summary.day.monitor, 1);
   assert.equal(report.evidence.cold.coverageComplete, false);
   assert.ok(report.warnings.some(warning => warning.code === 'cold_history_incomplete' && !warning.blocking));
-  assert.ok(!report.warnings.some(warning => warning.code.startsWith('handling_')));
+  assert.ok(report.warnings.some(warning => warning.code === 'handling_history_incomplete' && !warning.blocking));
+  assert.equal(report.summary.handlingCoverageComplete, false);
   const malformed = await collectCustomerDailyReport({...opts, db: fakeDb({coverage: '2026-08-01T00:00:00Z',
     events: [event(1, undefined)], coldPosts: [record(1)], month: [record(1)]})});
   assert.equal(malformed.summary.mtd.monitor, 1);

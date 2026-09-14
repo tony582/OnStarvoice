@@ -6,6 +6,7 @@ export const monthlyLabels: Record<MonthlyField, string>;
 export function isMonthlySummary(snapshot: DailySnapshot): boolean;
 export function isHandlingSummary(snapshot: DailySnapshot): boolean;
 export function isCollectionSummary(snapshot: DailySnapshot): boolean;
+export function isCollectionHandlingSummary(snapshot: DailySnapshot): boolean;
 export function visibleMonthlyRows(rows: NonNullable<DailySnapshot['summary']['rows']>, includeHandledNonWorkingDays?: boolean): NonNullable<DailySnapshot['summary']['rows']>;
 export function monthlyDraftFromRows(rows: NonNullable<DailySnapshot['summary']['rows']>, includeHandledNonWorkingDays?: boolean): MonthlyDraft;
 export function parseMonthlyDraft(rows: NonNullable<DailySnapshot['summary']['rows']>, draft: MonthlyDraft, includeHandledNonWorkingDays?: boolean): {rows: Record<string, Record<MonthlyField, number>>};

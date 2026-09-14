@@ -110,18 +110,21 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(response.status,200,JSON.stringify(result));
   const generated=result.report;
   assert.equal(generated.reportDate,period.reportDate);
-  assert.equal(generated.snapshot.schemaVersion,4);
-  assert.equal(generated.snapshot.summary.format,'daily_collection_v4');
+  assert.equal(generated.snapshot.schemaVersion,5);
+  assert.equal(generated.snapshot.summary.format,'daily_collection_handling_v5');
   assert.equal(generated.snapshot.summary.day.monitor,3);
   assert.equal(generated.snapshot.summary.day.sdb,2);
   assert.equal(generated.snapshot.summary.day.positive,1);
-  assert.equal(generated.snapshot.summary.day.cold,1);
-  assert.equal(generated.snapshot.summary.day.negativeProcess,0);
+  assert.equal(generated.snapshot.summary.day.cold,2);
+  assert.equal(generated.snapshot.summary.day.negativeProcess,1);
   assert.equal(generated.snapshot.summary.mtd.monitor,4,'collection MTD deduplicates posts and excludes older-month handling');
   assert.equal(generated.snapshot.summary.mtd.negativeProcess,1,'the older collection-day hot post retains its current Feishu disposition');
   assert.equal(generated.snapshot.summary.mtdBasis,'distinct_records');
   assert.equal(Object.hasOwn(generated.snapshot,'collectionSummary'),false);
-  assert.equal(Object.hasOwn(generated.snapshot.evidence,'handling'),false);
+  assert.ok(generated.snapshot.evidence.handling.transitions.length > 0);
+  assert.equal(generated.snapshot.summary.negativeDailyBasis,'status_transition_events');
+  assert.equal(generated.snapshot.summary.negativeMtdBasis,'distinct_records_last_status');
+  assert.equal(generated.snapshot.summary.mtd.cold,2);
   assert.equal(generated.snapshot.summary.day.inProgress,null);
   assert.equal(generated.snapshot.summary.mtd.processed,null);
   assert.deepEqual(generated.snapshot.highHeat.map(row=>row.recordId),[hot]);
@@ -166,7 +169,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(mtdRows.length,1);
   assert.equal(mtdRows[0].getCell(2).value,4,'export uses frozen distinct MTD, never a daily SUM formula');
   assert.equal(dayRow.getCell(7).value,0);
-  assert.equal(dayRow.getCell(8).value,0);
+  assert.equal(dayRow.getCell(8).value,1);
   assert.equal(dayRow.getCell(9).value,0);
   const monthResponse = await request(`/calendar-month?month=${period.reportDate.slice(0,7)}`);
   assert.equal(monthResponse.status,200);
@@ -214,8 +217,8 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.deepEqual(edited.snapshot.systemSummary,source.snapshot.summary);
   assert.equal(Object.hasOwn(edited.snapshot,'collectionSummary'),false);
   assert.equal(edited.snapshot.summary.mtd.monitor,source.snapshot.summary.mtd.monitor,'editing dispositions keeps the frozen monthly distinct post total');
-  assert.equal(edited.snapshot.summary.mtd.cold,source.snapshot.summary.mtd.cold-1);
-  assert.equal(edited.snapshot.summary.mtd.comment,source.snapshot.summary.mtd.comment+1);
+  assert.equal(edited.snapshot.summary.mtd.cold,source.snapshot.summary.mtd.cold);
+  assert.equal(edited.snapshot.summary.mtd.comment,source.snapshot.summary.mtd.comment);
   assert.equal(edited.snapshot.summary.mtd.negativeProcess,source.snapshot.summary.mtd.negativeProcess);
   assert.equal(edited.snapshot.summaryEdited,true);
   assert.equal(edited.snapshot.summaryEdit.sourceReportId,source.id);
@@ -263,7 +266,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal((await request(`/${generated.id}/summary.png`,{tenantId:tenantB})).status,403);
   assert.equal((await request(`/${randomUUID()}/summary.png`)).status,404);
 
-  await t.test('real uppercase UUID and note PATCHes retain valid legacy audits while v4 counts the ingested post once', async () => {
+  await t.test('real uppercase UUID and note PATCHes retain valid legacy audits while v5 keeps collection and negative actions independent', async () => {
     const recordId = await record({title:'大写链接状态处理验证',sentiment:'neutral'});
     const path = `${base}/api/triage/records/${recordId.toUpperCase()}`;
     const headers = {authorization:`Bearer ${token}`,'x-tenant-id':tenantA,'content-type':'application/json'};
@@ -285,7 +288,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
     assert.equal(snapshot.evidence.dayRecordIds.filter(id=>id===recordId).length,1);
     assert.equal(snapshot.summary.day.monitor,4);
     assert.equal(snapshot.summary.mtd.monitor,5);
-    assert.equal(Object.hasOwn(snapshot.evidence,'handling'),false);
+    assert.equal(snapshot.evidence.handling.transitions.filter(event=>event.recordId===recordId).length,1);
   });
 
   await t.test('real observation projection preserves normalization precedence and the original null timestamp stamp', async () => {

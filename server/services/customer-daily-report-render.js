@@ -3,7 +3,7 @@ import {
   customerDailySummaryHeaders, isMonthlyDailyReport,
   customerDailySummaryRows as summaryRows,
   customerDailyPostPlatform as sourceLabel, customerDailyPostComparison, customerDailyColdEmpty as coldEmpty,
-  customerDailyColdTitle, customerDailyColdPostLabel, isHandlingDailyReport, isCollectionDailyReport, isGroupedDailyReport, customerDailySummaryBasis, customerDailySections, customerDailyTables, customerDailyPostStatus, customerDailyTableCaption,
+  customerDailyColdTitle, customerDailyColdPostLabel, isHandlingDailyReport, isCollectionDailyReport, isCollectionHandlingDailyReport, isGroupedDailyReport, customerDailySummaryBasis, customerDailySections, customerDailyTables, customerDailyPostStatus, customerDailyTableCaption,
 } from './customer-daily-report-presentation.js';
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char])); }
@@ -23,6 +23,12 @@ export function customerDailyReportTitle(snapshot) {
   return `${snapshot.tenantName ? `${oneLine(snapshot.tenantName)} · ` : ''}舆情日报 ${snapshot.reportDate}${time}`;
 }
 export function customerDailyReportNotes(snapshot) {
+  if (isCollectionHandlingDailyReport(snapshot)) return [
+    customerDailySummaryBasis(snapshot),
+    '平台监控量、SDB、正面和中性沿用首次入库采集集合。四项负面包含旧帖的真实状态变更，同帖当天不同有效变更多次计入；重复保存和备注修改不计次数。',
+    '四项负面 MTD 按本月实际处理的帖子去重，以月内最后有效状态归类；读取已保存的去重值，不将每日次数相加，也不与采集列混合核算总量。',
+    '高热负面帖保留已记录的处理状态和飞书表编号。',
+  ];
   if (isCollectionDailyReport(snapshot)) return [
     '按首次成功入库的唯一主帖统计采集量；复采不重复计数。MTD 为本月去重累计，使用已保存的数值。',
     'SDB 仅扣除已复核-非监控内容。高热负面帖保留已记录的处理状态和飞书表编号。',

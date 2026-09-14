@@ -1,6 +1,10 @@
 import {isWorkingDate} from './china-work-calendar.js';
 
 export const DAILY_HANDLING_SUMMARY_FORMAT = 'daily_handling_v3';
+export const DAILY_COLLECTION_HANDLING_SUMMARY_FORMAT = 'daily_collection_handling_v5';
+export const CUSTOMER_DAILY_NEGATIVE_HANDLING_FIELDS = Object.freeze(['cold', 'comment', 'negativeProcess', 'negativeOther']);
+const NEGATIVE_FIELD = Object.freeze({negative_cold: 'cold', negative_comment: 'comment', negative_feishu: 'negativeProcess', unavailable: 'negativeOther', privacy_unreachable: 'negativeOther'});
+const EXPLICIT_NEGATIVE_STATES = new Set(['negative_cold', 'negative_comment', 'negative_feishu']);
 const SINGLE_ACTIONS = new Set(['record.triage_updated', 'record.ticket_created', 'record.official_response_marked']);
 const STATUSES = new Set(['unhandled', 'replied', 'reviewed', 'reviewed_non_monitor', 'unavailable', 'privacy_unreachable', 'negative_feishu', 'negative_cold', 'negative_comment']);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -92,4 +96,82 @@ export function buildCustomerDailyHandlingSummary(records, transitions, period, 
       monthRecordIds: [...monthly.keys()],
       monthLastTransitions: [...monthly.values()].map(entry => entry.transition)},
   };
+}
+
+const emptyNegativeCounts = () => ({cold: 0, comment: 0, negativeProcess: 0, negativeOther: 0});
+const negativeActionField = (transition, record, knownNegativePrevious = false) => {
+  const field = NEGATIVE_FIELD[transition.nextStatus];
+  return field === 'negativeOther' && record?.sentiment !== 'negative' && !EXPLICIT_NEGATIVE_STATES.has(transition.previousStatus) && !knownNegativePrevious ? null : field;
+};
+
+/** A daily row measures actions; a month counts each eligible post only once.
+ * Current sentiment cannot erase an earlier action recorded in the audit log. */
+export function buildCustomerDailyNegativeHandlingSummary(records, transitions, period, {coverageFrom = null, malformedEventIds = []} = {}) {
+  const monthStart = customerDailyHandlingMonthStart(period);
+  const byRecord = new Map(records.map(record => [String(record.id).toLowerCase(), record]));
+  const byDate = new Map();
+  const latest = new Map();
+  const latestFields = new Map();
+  const seen = new Set();
+  const included = [];
+  const ordered = [...transitions].sort((a, b) => time(a.handledAt) - time(b.handledAt) || String(a.eventId).localeCompare(String(b.eventId)) || String(a.recordId).localeCompare(String(b.recordId)));
+  for (const transition of ordered) {
+    const recordId = String(transition.recordId).toLowerCase();
+    if (!byRecord.has(recordId) || !STATUSES.has(transition.nextStatus) || !transition.previousStatus || transition.previousStatus === transition.nextStatus ||
+        !Number.isFinite(time(transition.handledAt)) || time(transition.handledAt) < time(monthStart) || time(transition.handledAt) >= time(period.cutoffAt)) continue;
+    const date = dateOf(transition.handledAt);
+    if (date > period.reportDate) continue;
+    // A batch may contain equivalent UUIDs with different casing. The same
+    // audit event/post pair is one action, even if the query/input repeats it.
+    const key = `${transition.eventId}\u0000${recordId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const normalized = {...transition, recordId};
+    const previous = latest.get(recordId);
+    const field = negativeActionField(normalized, byRecord.get(recordId), previous?.nextStatus === transition.previousStatus && Boolean(latestFields.get(recordId)));
+    included.push(normalized);
+    latest.set(recordId, normalized);
+    latestFields.set(recordId, field);
+    if (!byDate.has(date)) byDate.set(date, emptyNegativeCounts());
+    if (field) byDate.get(date)[field]++;
+  }
+  const rows = [];
+  for (let day = 1; day <= Number(period.reportDate.slice(-2)); day++) {
+    const date = `${period.reportDate.slice(0, 8)}${String(day).padStart(2, '0')}`;
+    rows.push({date, isWorkingDay: isWorkingDate(date), counts: {...(byDate.get(date) || emptyNegativeCounts())}});
+  }
+  const mtd = emptyNegativeCounts();
+  for (const transition of latest.values()) {
+    const field = latestFields.get(transition.recordId);
+    if (field) mtd[field]++;
+  }
+  const coverageComplete = Number.isFinite(time(coverageFrom)) && time(coverageFrom) <= time(monthStart) && malformedEventIds.length === 0;
+  return {
+    summary: {dayDate: period.reportDate, rows, day: {...(byDate.get(period.reportDate) || emptyNegativeCounts())}, mtd,
+      dailyBasis: 'status_transition_events', mtdBasis: 'distinct_records_last_status',
+      coverageFrom: Number.isFinite(time(coverageFrom)) ? new Date(time(coverageFrom)).toISOString() : null, coverageComplete},
+    evidence: {source: 'audit_logs.status_transitions', timeZone: 'Asia/Shanghai', monthStart, cutoffAt: period.cutoffAt,
+      coverageFrom: Number.isFinite(time(coverageFrom)) ? new Date(time(coverageFrom)).toISOString() : null, coverageComplete,
+      malformedEventIds: [...malformedEventIds], transitions: included,
+      monthLastTransitions: [...latest.values()],
+      monthExcludedRecordIds: [...latest.values()].filter(transition => !latestFields.get(transition.recordId)).map(transition => transition.recordId)},
+  };
+}
+
+/** Overlay only four action columns; preserve the frozen collection baseline. */
+export function buildCustomerDailyMixedSummary(collectionSummary, handlingSummary) {
+  const rows = new Map(structuredClone(collectionSummary.rows).map(row => [row.date, row]));
+  for (const handlingRow of handlingSummary.rows) {
+    if (!rows.has(handlingRow.date)) rows.set(handlingRow.date, {date: handlingRow.date, isWorkingDay: handlingRow.isWorkingDay,
+      counts: {monitor: 0, sdb: 0, positive: 0, neutral: 0, negative: 0, ...emptyNegativeCounts(), nonMonitor: 0, unclassified: 0, inProgress: null, processed: null}});
+  }
+  const handlingByDate = new Map(handlingSummary.rows.map(row => [row.date, row.counts]));
+  for (const row of rows.values()) for (const field of CUSTOMER_DAILY_NEGATIVE_HANDLING_FIELDS) row.counts[field] = handlingByDate.get(row.date)?.[field] || 0;
+  const mtd = structuredClone(collectionSummary.mtd);
+  for (const field of CUSTOMER_DAILY_NEGATIVE_HANDLING_FIELDS) mtd[field] = handlingSummary.mtd[field];
+  return {...structuredClone(collectionSummary), format: DAILY_COLLECTION_HANDLING_SUMMARY_FORMAT, mtdBasis: 'distinct_records',
+    rows: [...rows.values()].sort((a, b) => a.date.localeCompare(b.date)),
+    day: structuredClone(rows.get(collectionSummary.dayDate).counts), mtd,
+    negativeDailyBasis: handlingSummary.dailyBasis, negativeMtdBasis: handlingSummary.mtdBasis,
+    handlingCoverageFrom: handlingSummary.coverageFrom, handlingCoverageComplete: handlingSummary.coverageComplete};
 }

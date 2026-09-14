@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildFeishuDailyPost, feishuDailyPostRequestBytes, FEISHU_DAILY_POST_MAX_BYTES,
   FEISHU_DAILY_POST_IMAGE_PLACEHOLDER } from '../server/services/feishu-daily-report-message.js';
+import {collectionHandlingSnapshot} from './fixtures/customer-daily-v5.mjs';
 
 const documentUrl = 'https://example.feishu.cn/docx/daily';
 const imageKey = 'img_v3_test-summary';
@@ -135,4 +136,13 @@ test('v4 rich message retains collection basis and high heat status with the sin
   for (const label of ['一、每日舆情处理量', '首次入库采集统计', '二、7天内热度值≥200', '三、本期冷处理', '处理状态：飞书表 · FS-003']) assert.ok(value.includes(label));
   assert.doesNotMatch(value, /实际采集量|四、本期/);
   assert.equal(result.zh_cn.content.flat().filter(node => node.tag === 'img').length, 1);
+});
+
+test('v5 rich message explains separate collection and handling bases and keeps saved high heat status', () => {
+  const source = collectionHandlingSnapshot(), original = structuredClone(source);
+  const result = build(source), value = words(result);
+  for (const label of ['一、每日舆情处理量', '采集列按采集日期统计', '四项负面按实际处理日期计次数（含旧帖）', 'MTD 按帖去重', '二、7天内热度值≥200', '三、本期冷处理', '处理状态：飞书表 · 202609-007']) assert.ok(value.includes(label));
+  assert.doesNotMatch(value, /首次入库采集统计|实际采集量|四、本期/);
+  assert.equal(result.zh_cn.content.flat().filter(node => node.tag === 'img').length, 1);
+  assert.deepEqual(source, original);
 });

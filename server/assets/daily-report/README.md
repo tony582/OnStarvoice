@@ -17,4 +17,6 @@ The daily-handling v3 update preserves all 51 prior characters and adds 15 chara
 
 The single-table v4 update preserves all 66 prior characters and adds 5 characters: `入库次统首`, for the short first-ingestion collection-basis note. The resulting subset has 71 characters. Source SHA-256, font weight and prior cmap coverage were verified.
 
-Subset SHA-256: 388d4a1531abeddc758de604cab28916826785988f67ee038f42c01bc8155baa
+The collection-and-handling v5 update preserves all 71 prior characters and adds 11 characters: `。列含四帖按旧项（）；`, for the collection-date, handling-event and deduplicated MTD basis note. The resulting subset has 82 characters. Source SHA-256, font weight and prior cmap coverage were verified.
+
+Subset SHA-256: 0422e0bc8d3ea4c25813f457a604b74707315cb7771ce933832bf8dba6ff5591

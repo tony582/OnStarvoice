@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildCustomerDailyReportWorkbook, renderCustomerDailyReportHtml, renderCustomerDailyReportText, renderCustomerDailyReportMessageHtml, renderCustomerDailyReportMessageText } from '../server/services/customer-daily-report-render.js';
 import { customerDailySummaryRows, customerDailyPostComparison, customerDailyColdTitle, customerDailyPostStatus } from '../server/services/customer-daily-report-presentation.js';
+import {collectionHandlingSnapshot} from './fixtures/customer-daily-v5.mjs';
 
 function fixture() {
   const counts = {monitor: 126, sdb: 112, positive: 16, neutral: 75, negative: 18, cold: 8, inProgress: null, processed: null};
@@ -199,5 +200,36 @@ test('v4 exports one full collection table in grouped styling with frozen distin
   assert.equal(mtdRows[0].getCell(2).value, 17);
   for (let column = 2; column <= 9; column++) assert.equal(typeof mtdRows[0].getCell(column).value, 'number', 'every frozen collection MTD cell remains a value, never SUM');
   assert.equal(reopened.getWorksheet('高热负面').getCell('F7').value, '飞书表 · FS-2026-08');
+  assert.deepEqual(source, original);
+});
+
+test('v5 exports collection columns alongside actual negative handling events and frozen distinct MTD', async () => {
+  const source = collectionHandlingSnapshot(), original = structuredClone(source);
+  const expected = [
+    ['2026/9/12', 0, 0, 0, 0, 2, 3, 0, 0],
+    ['2026/9/14', 280, 198, 65, 122, 0, 2, 9, 2],
+    ['MTD', 1243, 932, 357, 515, 19, 2, 35, 5],
+  ];
+  assert.deepEqual(customerDailySummaryRows(source), expected);
+  const html = renderCustomerDailyReportHtml(source), text = renderCustomerDailyReportText(source);
+  for (const output of [html, text]) {
+    for (const label of ['采集列按采集日期统计', '四项负面按实际处理日期计次数（含旧帖）', 'MTD 按帖去重', '本月去重累计', '处理状态：飞书表 · 202609-007']) assert.ok(output.includes(label));
+    assert.match(output, /2026\/9\/12/);
+    assert.doesNotMatch(output, /2026\/9\/13|首次入库采集统计|实际采集量|本月处理累计|>休</);
+  }
+  assert.equal((html.match(/<table\b/g) || []).length, 1);
+  assert.match(html, /colspan="4" scope="colgroup">负面/);
+  for (const row of expected) assert.ok(text.includes(row.join('\t')));
+  const workbook = buildCustomerDailyReportWorkbook(source), reopened = new workbook.constructor();
+  await reopened.xlsx.load(await workbook.xlsx.writeBuffer());
+  const sheet = reopened.getWorksheet('日报'), actual = [];
+  sheet.eachRow(row => {
+    if (/^(2026\/|MTD$)/.test(String(row.getCell(1).value))) actual.push(Array.from({length: 9}, (_, i) => row.getCell(i + 1).value));
+  });
+  assert.deepEqual(actual, expected, 'all daily and MTD cells remain snapshot numbers; MTD never uses SUM');
+  assert.match(sheet.getCell('A3').value, /按实际处理日期计次数/);
+  assert.equal(sheet.getCell('B4').value, '平台监控量');
+  assert.ok(sheet.model.merges.includes('F4:I4'));
+  assert.equal(reopened.getWorksheet('高热负面').getCell('F5').value, '飞书表 · 202609-007');
   assert.deepEqual(source, original);
 });

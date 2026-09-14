@@ -1,6 +1,6 @@
 import {customerDailyBusinessPeriod} from './customer-daily-business-period.js';
 import {isWorkingDate} from './china-work-calendar.js';
-import {DAILY_HANDLING_SUMMARY_FORMAT} from './customer-daily-handling-summary.js';
+import {DAILY_HANDLING_SUMMARY_FORMAT, DAILY_COLLECTION_HANDLING_SUMMARY_FORMAT} from './customer-daily-handling-summary.js';
 
 export const MONTHLY_SUMMARY_FIELDS = Object.freeze(['monitor', 'sdb', 'positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther']);
 export const MONTHLY_SUMMARY_FORMAT = 'daily_disposition_v2';
@@ -9,7 +9,7 @@ const invalid = (message, status = 400) => Object.assign(new Error(message), {st
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 
 export function isMonthlySummary(summary) {
-  return [MONTHLY_SUMMARY_FORMAT, DAILY_HANDLING_SUMMARY_FORMAT, DAILY_COLLECTION_SUMMARY_FORMAT].includes(summary?.format) && Array.isArray(summary.rows);
+  return [MONTHLY_SUMMARY_FORMAT, DAILY_HANDLING_SUMMARY_FORMAT, DAILY_COLLECTION_SUMMARY_FORMAT, DAILY_COLLECTION_HANDLING_SUMMARY_FORMAT].includes(summary?.format) && Array.isArray(summary.rows);
 }
 
 export function buildMonthlySummary(records, period, count) {
@@ -35,7 +35,9 @@ export function monthlySummarySignature(summary) {
 }
 
 export function mergeMonthlySummary(current, patch) {
-  const distinctMtd = current.format === DAILY_COLLECTION_SUMMARY_FORMAT;
+  const mixed = current.format === DAILY_COLLECTION_HANDLING_SUMMARY_FORMAT;
+  const distinctMtd = mixed || current.format === DAILY_COLLECTION_SUMMARY_FORMAT;
+  const allowRestDay = mixed || current.format === DAILY_HANDLING_SUMMARY_FORMAT;
   if (!object(patch) || Object.keys(patch).some(key => key !== 'rows') || !object(patch.rows) || !Object.keys(patch.rows).length) {
     throw invalid(distinctMtd ? '请提交需要修改的日期及汇总数量；月去重累计仅应用本次修改差额。' : '请提交需要修改的日期及汇总数量；MTD 按每日数量自动加总。');
   }
@@ -44,15 +46,17 @@ export function mergeMonthlySummary(current, patch) {
   let changed = 0;
   for (const [date, values] of Object.entries(patch.rows)) {
     const row = next.rows.find(item => item.date === date);
-    if (!row || (row.isWorkingDay === false && current.format !== DAILY_HANDLING_SUMMARY_FORMAT)) {
-      throw invalid(current.format === DAILY_HANDLING_SUMMARY_FORMAT ? '只能修改本份日报中已有日期的处理量。' : '只能修改本份日报中的工作日汇总。');
+    if (!row || (row.isWorkingDay === false && !allowRestDay)) {
+      throw invalid(allowRestDay ? '只能修改本份日报中已有日期的处理量。' : '只能修改本份日报中的工作日汇总。');
     }
     if (!object(values) || Object.keys(values).some(field => !MONTHLY_SUMMARY_FIELDS.includes(field))) throw invalid('只能修改汇总数量，不能修改日期或系统分类。');
     for (const [field, value] of Object.entries(values)) {
       if (!Number.isSafeInteger(value) || value < 0) throw invalid('汇总数量须为非负整数。');
       if (distinctMtd) {
         if (!Number.isSafeInteger(row.counts[field]) || row.counts[field] < 0) throw invalid('原汇总数量格式无法核实，请重新生成日报。', 409);
-        deltas[field] += BigInt(value) - BigInt(row.counts[field]);
+        // V5 negative day values are action counts; their MTD values are unique
+        // posts. Editing one unit must never manufacture or remove the other.
+        if (!mixed || MONTHLY_SUMMARY_FIELDS.slice(0, 4).includes(field)) deltas[field] += BigInt(value) - BigInt(row.counts[field]);
       }
       row.counts[field] = value;
       changed++;
@@ -63,8 +67,8 @@ export function mergeMonthlySummary(current, patch) {
     if (MONTHLY_SUMMARY_FIELDS.some(field => !Number.isSafeInteger(counts[field]) || counts[field] < 0)) throw invalid('原汇总数量格式无法核实，请重新生成日报。', 409);
     if (counts.sdb > counts.monitor) throw invalid('SDB范畴不能大于平台监控量。');
     let available = counts.sdb;
-    for (const field of MONTHLY_SUMMARY_FIELDS.slice(2)) {
-      if (counts[field] > available) throw invalid('正面、中性和四类负面处理数量合计不能大于 SDB 范畴。');
+    for (const field of (mixed ? ['positive', 'neutral'] : MONTHLY_SUMMARY_FIELDS.slice(2))) {
+      if (counts[field] > available) throw invalid(mixed ? '正面和中性数量合计不能大于 SDB 范畴。' : '正面、中性和四类负面处理数量合计不能大于 SDB 范畴。');
       available -= counts[field];
     }
   }
@@ -87,8 +91,8 @@ export function mergeMonthlySummary(current, patch) {
   if (distinctMtd) {
     if (next.mtd.sdb > next.mtd.monitor) throw invalid('月去重累计的 SDB 范畴不能大于平台监控量。');
     let available = next.mtd.sdb;
-    for (const field of MONTHLY_SUMMARY_FIELDS.slice(2)) {
-      if (next.mtd[field] > available) throw invalid('月去重累计的正面、中性和四类负面处理数量合计不能大于 SDB 范畴。');
+    for (const field of (mixed ? ['positive', 'neutral'] : MONTHLY_SUMMARY_FIELDS.slice(2))) {
+      if (next.mtd[field] > available) throw invalid(mixed ? '月去重累计的正面和中性数量合计不能大于 SDB 范畴。' : '月去重累计的正面、中性和四类负面处理数量合计不能大于 SDB 范畴。');
       available -= next.mtd[field];
     }
   }

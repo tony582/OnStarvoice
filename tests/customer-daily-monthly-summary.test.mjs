@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {inflateSync} from 'node:zlib';
-import {collectCustomerDailyReport} from '../server/services/customer-daily-report-data.js';
+import {collectCustomerDailyReport, buildCustomerDailyCollectionSummary} from '../server/services/customer-daily-report-data.js';
 import {customerDailyBusinessPeriod} from '../server/services/customer-daily-business-period.js';
 import {DAILY_COLLECTION_SUMMARY_FORMAT, MONTHLY_SUMMARY_FIELDS, monthlySummarySignature} from '../server/services/customer-daily-monthly-summary.js';
 import {mergeCustomerDailySummary} from '../server/services/customer-daily-reports.js';
@@ -34,7 +34,8 @@ async function collect(date, records = [], {now = new Date(`${date}T19:00:00+08:
   }});
   // These fixtures lock the already saved v2 collection tables and their exports.
   // New reports use the same collection data in the v4 single-table format.
-  return {...snapshot, schemaVersion: 2, summary: {...snapshot.summary, format: 'daily_disposition_v2'}};
+  const collection = buildCustomerDailyCollectionSummary(snapshot.evidence.monthRecords.map(row => ({first_seen_at: row.firstSeenAt, sentiment: row.sentiment, status: row.status})), snapshot);
+  return {...snapshot, schemaVersion: 2, summary: {...collection, format: 'daily_disposition_v2'}};
 }
 
 function assertMtdEqualsRows(snapshot) {
@@ -243,6 +244,28 @@ test('v4 rejects invalid frozen MTD, unsafe totals, and edits that would make di
   assert.throws(() => apply(rowWithRoom, {'2026-09-14': {sdb: 4}}), /月去重累计.*合计/);
   assert.throws(() => apply({...source, rows: source.rows.map(row => ({...row, isWorkingDay: false}))}, {'2026-09-14': {monitor: 5}}), /工作日汇总/);
   assert.throws(() => mergeCustomerDailySummary(source, {mtd: {monitor: 100}}), {code: 'daily_summary_invalid'});
+});
+
+test('v5 accepts independent old-post actions and freezes negative MTD when a customer changes daily event counts', async () => {
+  const source = await frozenCollectionSummary();
+  source.format = 'daily_collection_handling_v5';
+  source.rows[1].counts = {...source.rows[1].counts, monitor: 0, sdb: 0, positive: 0, neutral: 0, cold: 2, comment: 3};
+  source.rows[1].isWorkingDay = false;
+  source.day = structuredClone(source.rows[1].counts);
+  source.mtd.comment = 1;
+  const before = structuredClone(source);
+  const noOp = mergeCustomerDailySummary(source, {rows: {'2026-09-14': {comment: 3}}});
+  assert.deepEqual(noOp, source);
+  const changed = mergeCustomerDailySummary(source, {rows: {'2026-09-14': {comment: 1, cold: 20}, '2026-09-11': {monitor: 6}}});
+  assert.equal(changed.day.comment, 1);
+  assert.equal(changed.day.cold, 20);
+  assert.equal(changed.mtd.comment, 1, 'daily action correction cannot subtract from the count of unique posts');
+  assert.equal(changed.mtd.cold, source.mtd.cold);
+  assert.equal(changed.mtd.monitor, source.mtd.monitor + 1, 'collection corrections retain their existing delta semantics');
+  assert.deepEqual(source, before);
+  assert.throws(() => mergeCustomerDailySummary(source, {rows: {'2026-09-14': {sdb: 1}}}), /SDB/);
+  assert.throws(() => mergeCustomerDailySummary(source, {rows: {'2026-09-14': {monitor: 1, sdb: 1, positive: 1, neutral: 1}}}), /正面和中性/);
+  assert.throws(() => mergeCustomerDailySummary(source, {rows: {'2026-09-14': {comment: -1}}}), /非负整数/);
 });
 
 test('HTML, TSV, SVG/PNG, Excel and native Feishu table present identical nine-column rows', async () => {
