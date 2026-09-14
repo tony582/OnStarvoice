@@ -65,11 +65,6 @@ export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChange
     const seq = ++requestSeq.current
     requestAbort.current?.abort()
     setLoadError('')
-    if (new URLSearchParams(filterQuery).getAll('intent').includes('none')) {
-      setCols(emptyColumns())
-      setLoading(false)
-      return
-    }
     const controller = new AbortController()
     requestAbort.current = controller
     setLoading(true)
@@ -130,7 +125,6 @@ export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChange
   }
 
   if (loadError) return <div role="alert" className="flex flex-col items-center gap-3 rounded-xl border border-destructive/20 bg-card px-5 py-10 text-center"><AlertCircle className="h-6 w-6 text-destructive" /><p className="text-sm font-medium">{loadError}</p><p className="text-xs text-muted-foreground">看板暂未加载完整，当前筛选已保留。</p><Button size="sm" variant="outline" onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" />重试加载</Button></div>
-  if (new URLSearchParams(filterQuery).getAll('intent').includes('none')) return <div className="rounded-xl border border-border bg-card px-5 py-10 text-center"><p className="text-sm font-medium">未勾选意图</p><p className="mt-2 text-xs text-muted-foreground">勾选需要查看的意图，或点击全选恢复全部内容</p></div>
 
   return (
     <div className="overflow-x-auto pb-2">

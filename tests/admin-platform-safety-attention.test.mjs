@@ -24,13 +24,14 @@ test('admin task diagnostics retain the plan total and identify task-level platf
 })
 
 test('admin waits visibly, retries one safety challenge across Agents, and escalates repeated safety blocks', async () => {
-  const [card, diagnostics, page, orchestration, composer, navigation, admin] = await Promise.all([
+  const [card, diagnostics, page, orchestration, composer, navigation, publicParams, admin] = await Promise.all([
     read('web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/TaskDiagnostics.tsx'),
     read('web/admin/src/pages/dispatch/DispatchPage.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/OrchestrationDetailWorkspace.tsx'),
     read('web/admin/src/pages/dispatch/cloud-tasks/OrchestrationComposerDrawer.tsx'),
     read('web/admin/src/lib/navigation.tsx'),
+    read('web/admin/src/lib/navigation-public-params.ts'),
     read('web/admin/src/pages/AdminPages.tsx'),
   ])
 
@@ -99,7 +100,12 @@ test('admin waits visibly, retries one safety challenge across Agents, and escal
   assert.match(composer, /allowIdleAgentHandoff/u)
   assert.match(composer, /验证码或登录验证只暂停当前关键词/u)
   assert.match(navigation, /new URLSearchParams\(window\.location\.search\)/u)
-  assert.match(navigation, /publicLinkParams\.delete\('page'\)/u)
+  assert.match(navigation, /const params = normalizePublicPageParams\(publicLinkParams\)/u)
+  assert.match(navigation, /normalizePage\(publicLinkPage\.slice\(0, 80\), params\)/u)
+  assert.match(publicParams, /\.filter\(\(\[key\]\) => key !== 'page'\)/u)
+  assert.match(publicParams, /\['intent', 'relevance', 'relevanceConfidence'\]/u)
+  assert.match(publicParams, /entries\.filter\(\(\[name\]\) => name === key\)/u)
+  assert.match(publicParams, /params\[key\] = values\.join\(','\)\.slice\(0, 500\)/u)
   assert.match(admin, /任务需人工介入通知邮箱/u)
   assert.match(admin, /settings\.capture_attention_email_to/u)
 })

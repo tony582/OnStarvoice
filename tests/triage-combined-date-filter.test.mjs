@@ -89,8 +89,18 @@ test('handled date filtering stays combined-only and follows initial, clear, sel
   assert.match(queue, /handled: \{ from: initial\?\.handledFrom \|\| '', to: initial\?\.handledTo \|\| '' \}/);
   const selection = queue.match(/const sel = useSelection\([^\n]+/)?.[0];
   assert.ok(selection);
-  assert.match(selection, /dateRanges\.handled\.from/);
-  assert.match(selection, /dateRanges\.handled\.to/);
+  assert.match(selection, /\$\{filterParams\(\)\.toString\(\)\}/);
+  assert.match(selection, /\$\{pageSize\}/);
+  assert.match(selection, /\$\{pagination\?\.page \?\? 1\}/);
+  const commonFilters = queue.match(/const filterParams = useCallback\(\(\) => \{[\s\S]*?\}, \[[^\]]*\]\)/)?.[0];
+  assert.ok(commonFilters);
+  assert.match(commonFilters, /params\.set\('handledFrom', dateRanges\.handled\.from\)/);
+  assert.match(commonFilters, /params\.set\('handledTo', dateRanges\.handled\.to\)/);
+  assert.match(commonFilters, /appendPostIntentFilter\(params, intents\)/);
+  assert.match(commonFilters, /appendPostRelevanceFilters\(params, relevances, relevanceConfidences\)/);
+  for (const dependency of ['dateRanges', 'intents', 'relevances', 'relevanceConfidences']) {
+    assert.match(commonFilters, new RegExp(`\\}, \\[[^\\]]*\\b${dependency}\\b[^\\]]*\\]\\)$`));
+  }
   assert.match(queue, /setDateRanges\(emptyDateRanges\(\)\)/);
   assert.match(queue, /api\.download\('\/triage\/records\/export\?' \+ filterParams\(\)\.toString\(\)/);
 });

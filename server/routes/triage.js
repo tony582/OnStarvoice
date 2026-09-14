@@ -27,6 +27,7 @@ import {
   recordTriageAdmissionSql, recordEffectiveRelevanceSql,
   recordAdmissionSelectSql, withRecordAdmissionFields,
 } from '../services/record-triage-admission.js';
+import { appendRecordRelevanceFilters } from '../services/record-relevance-filter.js';
 
 const router = Router();
 
@@ -615,6 +616,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     where = appendPlatformFilter(where, params, platform);
     where = appendSentimentFilter(where, params, sentiment);
     where = appendRecordIntentFilter(where, params, req.query.intent);
+    where = appendRecordRelevanceFilters(where, params, req.query);
     const bucket = String(req.query.bucket || '');
     if (bucket && !['active', 'archived'].includes(bucket)) return res.status(400).json({ ok: false, error: 'invalid_bucket', message: '内容分诊范围无效' });
     // 先按 bucket/queue 圈定大范围,再叠加具体处置状态(status)与风险(risk)筛选。
@@ -1296,6 +1298,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     where = appendPlatformFilter(where, params, platform);
     where = appendSentimentFilter(where, params, sentiment);
     where = appendRecordIntentFilter(where, params, req.query.intent);
+    where = appendRecordRelevanceFilters(where, params, req.query);
     const bucket = String(req.query.bucket || '');
     if (bucket && !['active', 'archived'].includes(bucket)) return res.status(400).json({ ok: false, error: 'invalid_bucket', message: '内容分诊范围无效' });
     if (queue === 'triage') {
@@ -1346,7 +1349,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
         ) AS payload_account_no,
         r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.ai_summary,
         r.intent, ${recordIntentSql('r')} AS intent_display,
-        jsonb_build_object('relevance',r.ai_result->'relevance','relevanceReason',r.ai_result->'relevanceReason') AS ai_result,
+        jsonb_build_object('relevance',r.ai_result->'relevance','relevanceReason',r.ai_result->'relevanceReason','relevanceConfidence',r.ai_result->'relevanceConfidence') AS ai_result,
         ${recordAdmissionSelectSql('r', { admitted: true })},
         r.negative_comment_count, r.publish_time, r.published_ts, r.publish_location,
         r.manual_overrides, ${customTagsSelectSql('r')} AS custom_tags,
@@ -1495,9 +1498,11 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       { header: '转发', key: 'shares', width: 8 },
       { header: '情感', key: 'sentiment', width: 8 },
       { header: '意图', key: 'intent', width: 12 },
-      { header: '相关度', key: 'relevance', width: 12 },
+      { header: '相关性', key: 'relevance', width: 12 },
+      { header: 'AI置信度', key: 'relevance_confidence', width: 12 },
+      { header: '判断来源', key: 'relevance_source', width: 12 },
       { header: '分类', key: 'category', width: 12 },
-      { header: '相关度依据', key: 'relevance_reason', width: 50 },
+      { header: '相关性依据', key: 'relevance_reason', width: 50 },
       { header: '自定义标签', key: 'custom_tags', width: 28 },
       { header: '处理记录', key: 'processing_records', width: 50, style: { alignment: { wrapText: true, vertical: 'top' } } },
       { header: 'AI摘要', key: 'ai_summary', width: 40 },

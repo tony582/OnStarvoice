@@ -47,9 +47,9 @@ import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 import { useNav } from '@/lib/navigation'
 import { recordDisplayTitle } from '@/lib/record-display'
-import { ALL_POST_INTENTS, appendPostIntentFilter, initialPostIntentFilter } from '@/lib/post-judgment'
+import { appendPostIntentFilter, appendPostRelevanceFilters, initialPostIntentFilter, normalizePostRelevanceFilter, normalizePostConfidenceFilter } from '@/lib/post-judgment'
 import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
-import { PostIntentFilter, PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
+import { PostIntentFilter, PostRelevanceFilter, PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
 
 interface Pagination { page: number; totalPages: number; total: number }
 interface CustomTagsMutationResponse {
@@ -370,6 +370,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [archiveView, setArchiveView] = useState<ArchiveView>(initial?.bucket === 'archived' ? 'archived' : 'active')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
   const [intents, setIntents] = useState<string[]>(() => initialPostIntentFilter(initial?.intent))
+  const [relevances, setRelevances] = useState<string[]>(() => normalizePostRelevanceFilter(initial?.relevance))
+  const [relevanceConfidences, setRelevanceConfidences] = useState<string[]>(() => normalizePostConfidenceFilter(initial?.relevanceConfidence))
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [watchedFilter, setWatchedFilter] = useState(initial?.watched === 'watched' ? 'watched' : '')
   const [keyword, setKeyword] = useState(() => String(initial?.keyword ?? '').trim())
@@ -411,7 +413,33 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
-  const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${intents}|${watchedFilter}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${dateRanges.handled.from}|${dateRanges.handled.to}|${pageSize}|${pagination?.page ?? 1}`)
+  const filterParams = useCallback(() => {
+    const params = new URLSearchParams({ sentiment, platform, keyword })
+    if (watchedFilter) params.set('watched', watchedFilter)
+    if (archiveView !== 'active') params.set('bucket', archiveView)
+    else params.set('queue', 'triage')
+    appendPostIntentFilter(params, intents)
+    appendPostRelevanceFilters(params, relevances, relevanceConfidences)
+    triageStatuses.forEach(status => params.append('status', status))
+    risk.forEach(rk => params.append('risk', rk))
+    identity.forEach(id => params.append('identity', id))
+    params.set('sort', sort.field)
+    params.set('dir', sort.dir)
+    captureKeywords.forEach(k => params.append('captureKeyword', k))
+    customTagIds.forEach(id => params.append('customTag', id))
+    if (customTagIds.length) params.set('customTagMode', 'any')
+    if (dateRanges.publish.from) params.set('publishFrom', dateRanges.publish.from)
+    if (dateRanges.publish.to) params.set('publishTo', dateRanges.publish.to)
+    if (dateRanges.recent.from) params.set('recentFrom', dateRanges.recent.from)
+    if (dateRanges.recent.to) params.set('recentTo', dateRanges.recent.to)
+    if (dateRanges.first.from) params.set('firstFrom', dateRanges.first.from)
+    if (dateRanges.first.to) params.set('firstTo', dateRanges.first.to)
+    if (dateRanges.handled.from) params.set('handledFrom', dateRanges.handled.from)
+    if (dateRanges.handled.to) params.set('handledTo', dateRanges.handled.to)
+    return params
+  }, [archiveView, triageStatuses, risk, identity, sentiment, intents, relevances, relevanceConfidences, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
+
+  const sel = useSelection(`${filterParams().toString()}|${pageSize}|${pagination?.page ?? 1}`)
 
   const batchRemovalCatalog = (() => {
     const tagsById = new Map<string, CustomTag>()
@@ -448,30 +476,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     }
   }), [])
 
-  const filterParams = useCallback(() => {
-    const params = new URLSearchParams({ sentiment, platform, keyword })
-    if (watchedFilter) params.set('watched', watchedFilter)
-    if (archiveView !== 'active') params.set('bucket', archiveView)
-    else params.set('queue', 'triage')
-    appendPostIntentFilter(params, intents)
-    triageStatuses.forEach(status => params.append('status', status))
-    risk.forEach(rk => params.append('risk', rk))
-    identity.forEach(id => params.append('identity', id))
-    params.set('sort', sort.field)
-    params.set('dir', sort.dir)
-    captureKeywords.forEach(k => params.append('captureKeyword', k))
-    customTagIds.forEach(id => params.append('customTag', id))
-    if (customTagIds.length) params.set('customTagMode', 'any')
-    if (dateRanges.publish.from) params.set('publishFrom', dateRanges.publish.from)
-    if (dateRanges.publish.to) params.set('publishTo', dateRanges.publish.to)
-    if (dateRanges.recent.from) params.set('recentFrom', dateRanges.recent.from)
-    if (dateRanges.recent.to) params.set('recentTo', dateRanges.recent.to)
-    if (dateRanges.first.from) params.set('firstFrom', dateRanges.first.from)
-    if (dateRanges.first.to) params.set('firstTo', dateRanges.first.to)
-    if (dateRanges.handled.from) params.set('handledFrom', dateRanges.handled.from)
-    if (dateRanges.handled.to) params.set('handledTo', dateRanges.handled.to)
-    return params
-  }, [archiveView, triageStatuses, risk, identity, sentiment, intents, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
+
 
   // 看板与列表使用同一套筛选；看板逐列自行补 status，不能继承列表的状态多选。
   const boardFilterQuery = useMemo(() => {
@@ -489,12 +494,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     const requestSeq = ++listRequestSeq.current
     listAbort.current?.abort()
     setListError('')
-    if (intents.length === 0) {
-      setRecords([])
-      setPagination({ page: 1, totalPages: 1, total: 0 })
-      setLoading(false)
-      return
-    }
     const controller = new AbortController()
     listAbort.current = controller
     if (!options?.silent) setLoading(true)
@@ -512,7 +511,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     } finally {
       if (requestSeq === listRequestSeq.current) setLoading(false)
     }
-  }), [filterParams, pageSize, intents.length, view])
+  }), [filterParams, pageSize, view])
 
   const exportXlsx = async () => {
     setExporting(true)
@@ -528,13 +527,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
-  const activeIntentCount = intents.length === ALL_POST_INTENTS.length ? 0 : Math.max(1, intents.length)
+  const activeIntentCount = intents.length + relevances.length + relevanceConfidences.length
   const hasActiveFilters = Boolean(platform || sentiment || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment].filter(Boolean).length
     + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
     setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
-    setIntents([...ALL_POST_INTENTS])
+    setIntents([]); setRelevances([]); setRelevanceConfidences([])
     setSort({ field: 'publish', dir: 'desc' })
   }
   // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
@@ -1140,12 +1139,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     : []
   const viewingWatchlist = watchedFilter === 'watched'
   const emptyTitle = hasActiveFilters
-    ? intents.length === 0 ? '未勾选意图' : '没有搜索结果'
+    ? '没有搜索结果'
     : viewingWatchlist
       ? archiveView === 'archived' ? '已归档的关注清单暂无内容' : '关注清单暂无内容'
       : archiveView === 'archived' ? '暂无已归档内容' : '暂无记录'
   const emptyDescription = hasActiveFilters
-    ? intents.length === 0 ? '勾选需要查看的意图，或点击全选恢复全部内容' : '调整表头筛选或清空筛选条件后重试'
+    ? '调整表头筛选或清空筛选条件后重试'
     : viewingWatchlist
       ? archiveView === 'archived' ? '已关注内容归档后会保留在这里' : '点击内容旁的星标即可加入关注清单'
       : archiveView === 'archived' ? '客户主动归档的内容会显示在这里' : '暂无可处理内容'
@@ -1329,7 +1328,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             'w-full flex-wrap items-center gap-2 rounded-xl bg-muted/30 p-3',
             mobileFiltersOpen ? 'flex' : 'hidden',
             'lg:flex lg:min-h-8 lg:rounded-none lg:bg-transparent lg:p-0',
-            view === 'list' && !drawerRecord && 'xl:grid xl:grid-cols-[232px_repeat(8,minmax(0,1fr))_58px]',
+            view === 'list' && !drawerRecord && 'xl:grid xl:grid-cols-[232px_repeat(9,minmax(0,1fr))_58px]',
           )}
         >
           <div className="contents lg:hidden">
@@ -1360,6 +1359,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           <PostIntentFilter value={intents} onChange={setIntents} />
+          <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} />
 
           {view === 'list' && (
             <div className={cn('w-full shrink-0 lg:w-[160px]', !drawerRecord && 'xl:w-full')}>
@@ -1498,7 +1498,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   />
                 </th>
                 <th className="px-1.5 text-left"><PostIntentFilter header value={intents} onChange={setIntents} /></th>
-                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">相关度</th>
+                <th className="px-1.5 text-left"><PostRelevanceFilter header value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} /></th>
                 {!narrow && <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
                 {!narrow && <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>}
                 {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}

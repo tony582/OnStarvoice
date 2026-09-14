@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from 'react'
+import { normalizePublicPageParams } from './navigation-public-params'
 
 export type PageParams = Record<string, string>
 export type Workspace = 'opinion' | 'content'
@@ -57,12 +58,7 @@ function readInitial(): { workspace: Workspace; page: string; params: PageParams
   const publicLinkParams = new URLSearchParams(window.location.search)
   const publicLinkPage = String(publicLinkParams.get('page') || '').trim()
   if (publicLinkPage) {
-    publicLinkParams.delete('page')
-    const params = Object.fromEntries(
-      [...publicLinkParams.entries()]
-        .slice(0, 20)
-        .map(([key, value]) => [key.slice(0, 80), value.slice(0, 500)]),
-    )
+    const params = normalizePublicPageParams(publicLinkParams)
     const norm = normalizePage(publicLinkPage.slice(0, 80), params)
     const realWs = PAGE_WORKSPACE[norm.page] || workspace
     localStorage.setItem('osv_workspace', realWs)

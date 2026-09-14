@@ -4,6 +4,7 @@ import {
   POST_HASHTAG_PATTERN, SENTRY_SCOPE_KEYWORDS, MONITORING_EVIDENCE_VERSION,
   findRecordMonitoringEvidence, isSentryEvidenceScope, normalizeMonitoringEvidence, normalizePostIntent,
 } from './record-content-judgment.js';
+import { recordRelevanceExportFields } from './record-relevance-filter.js';
 
 export const POST_INTENT_LABELS = { share: '分享', other: '其他', complaint: '投诉/抱怨', inquiry: '咨询' };
 
@@ -155,15 +156,9 @@ export function withRecordAdmissionFields(record = {}) {
 
 export function recordJudgmentExportFields(record = {}) {
   const value = withRecordAdmissionFields(record);
-  const ai = object(record.ai_result);
-  const manual = manualRecordRelevance(record);
-  const relevance = manual || ai.relevance;
-  const override = object(record.manual_overrides).relevance;
-  const reason = (manual && override?.reason) || ai.relevanceReason || '';
   return {
     intent: POST_INTENT_LABELS[value.intent_display] || '待判断',
-    relevance: { relevant: '明确相关', uncertain: '待核实', irrelevant: '无关' }[relevance] || '待判断',
-    relevance_reason: reason,
+    ...recordRelevanceExportFields(record),
   };
 }
 

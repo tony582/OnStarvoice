@@ -145,7 +145,11 @@ test('toolbar and header filter the nine handling states without ticket filters'
   assert.doesNotMatch(secondary, /关注状态筛选|未关注/);
   assert.match(secondary, /<CombinedDateRangeFilter/);
   assert.match(secondary, /<MultiSelect label="风险信号"/);
-  assert.match(secondary, /xl:grid-cols-\[232px_repeat\(8,minmax\(0,1fr\)\)_58px\]/);
+  assert.match(secondary, /xl:grid-cols-\[232px_repeat\(9,minmax\(0,1fr\)\)_58px\]/);
+  for (const [surface, headerProp] of [[secondary, ''], [header, 'header ']]) {
+    assert.ok(surface.includes(`<PostIntentFilter ${headerProp}value={intents} onChange={setIntents}`));
+    assert.ok(surface.includes(`<PostRelevanceFilter ${headerProp}value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences}`));
+  }
   assert.doesNotMatch(queue, /TicketStatusFilter|工单状态筛选/);
 
   assert.match(header, /label="平台"[\s\S]*value=\{platform\}[\s\S]*onChange=\{setPlatform\}/);

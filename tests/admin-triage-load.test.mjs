@@ -38,17 +38,17 @@ test('capacity failure, timeouts and invalid responses have explicit actionable 
   assert.equal(triageLoadError(new Error('internal postgres query exception')), '内容暂时加载失败，请稍后重试。');
 });
 
-test('list and board cancel superseded reads, avoid empty-selection queries and expose retries instead of false empty results', () => {
+test('list and board cancel superseded reads, load unrestricted selections and expose retries instead of false empty results', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
   assert.match(queue, /if \(view !== 'list'\) return/);
-  assert.match(queue, /if \(intents\.length === 0\) \{[\s\S]{0,180}setLoading\(false\)[\s\S]{0,30}return/);
+  assert.doesNotMatch(queue, /if \(intents\.length === 0\)/);
   assert.match(queue, /listAbort\.current\?\.abort\(\)/);
   assert.match(queue, /withTriageReadDeadline\(signal => api\.request/);
   assert.match(queue, /listError \? \([\s\S]{0,100}role="alert"/);
   assert.match(queue, /setListError\(triageLoadError\(err\)\)/);
   assert.match(queue, /重试加载/);
-  assert.match(board, /getAll\('intent'\)\.includes\('none'\)/);
+  assert.doesNotMatch(board, /getAll\('intent'\)\.includes\('none'\)|未勾选意图/);
   assert.match(board, /start \+= 2/);
   assert.match(board, /requestAbort\.current\?\.abort\(\)/);
   assert.match(board, /if \(loadError\) return <div role="alert"/);

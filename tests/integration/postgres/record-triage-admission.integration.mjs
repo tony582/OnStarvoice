@@ -278,7 +278,7 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   assert.equal((await exportRows('bucket=archived')).rowCount, 2);
   const unjudgedSheet = await exportRows('');
   const headerValues = unjudgedSheet.getRow(1).values;
-  assert.ok(headerValues.includes('相关度依据'));
+  assert.ok(headerValues.includes('相关性依据'));
   const exportText = JSON.stringify(unjudgedSheet.getSheetValues());
   assert.ok(exportText.includes('CT50的哨兵功能演示'));
   assert.ok(exportText.includes('L7哨兵模式怎么开'));
@@ -291,7 +291,7 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   assert.ok(!exportText.includes('理想L7的哨兵功能'));
   assert.ok(!exportText.includes('哨兵模式行业开拓者'));
   assert.ok(exportText.includes('Existing decision'));
-  assert.deepEqual(headerValues.slice(headerValues.indexOf('情感'), headerValues.indexOf('情感') + 4), ['情感','意图','相关度','分类']);
+  assert.deepEqual(headerValues.slice(headerValues.indexOf('情感'), headerValues.indexOf('情感') + 6), ['情感','意图','相关性','AI置信度','判断来源','分类']);
   assert.ok(JSON.stringify(unjudgedSheet.getSheetValues()).includes('待判断'));
   assert.ok(JSON.stringify(unjudgedSheet.getSheetValues()).includes('投诉/抱怨'));
   const sheet = await exportRows('intent=other');
