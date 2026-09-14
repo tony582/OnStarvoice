@@ -45,6 +45,16 @@ test('relevance/confidence SQL matches JavaScript; HTTP list and Excel share fil
     assert.equal(row.relevance, expected.relevance, row.name);
     assert.equal(row.band, expected.confidenceBand, row.name);
   }
+  // Keep literal JSON numbers so PostgreSQL retains precision/exponents that
+  // the node JSON decoder rounds. Both paths must still classify identically.
+  const numericInput = ['0', '1', '0.595', '0.7949999999999999', '0.7949999999999998',
+    '1.00000000000000001', '1.0000000000000002', '1e9999', '1e-400', '-1e-400',
+    '1e-323', '-1e-323', '1e-324', '-1e-324', '3e-324', '-3e-324']
+    .map(score => `{"name":"${score}","ai_result":{"relevance":"relevant","relevanceConfidence":${score}}}`).join(',');
+  const numericExpected = JSON.parse(`[${numericInput}]`);
+  const numericActual = (await pool.query(`SELECT r.name, ${recordRelevanceConfidenceBandSql()} AS band
+    FROM jsonb_to_recordset($1::jsonb) AS r(name text, ai_result jsonb, manual_overrides jsonb)`, [`[${numericInput}]`])).rows;
+  for (const row of numericActual) assert.equal(row.band, recordRelevanceJudgment(numericExpected.find(item => item.name === row.name)).confidenceBand, `JSON number:${row.name}`);
   t.diagnostic(`SQL/JS parity verified for ${actual.length} numeric, malformed and manual cases.`);
 
   for (let index = 0; index < 2; index++) tenants.push((await pool.query('INSERT INTO tenants(name) VALUES($1) RETURNING id', [`Relevance ${randomUUID()}`])).rows[0].id);

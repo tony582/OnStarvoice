@@ -60,17 +60,41 @@ export function recordRelevanceSql(alias = 'r') {
 const HALF_MIN_DOUBLE_SIGNIFICAND = `0.${5n ** 1075n}`;
 const JS_TRIM_CHARS = '\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff';
 
-export function recordRelevanceConfidenceBandSql(alias = 'r') {
+function judgmentInputSql(alias) {
   const a = aliasName(alias);
+  // Materialize the extracted values, not the original toasted JSON document.
+  // The two filters and the numeric fast path then reuse these small values.
+  return `judgment_raw AS MATERIALIZED (
+    SELECT ${a}.manual_overrides->'relevance' AS manual,
+      ${a}.ai_result->>'relevance' AS ai_relevance,
+      ${a}.ai_result->'relevanceConfidence' AS score
+  ), judgment_input AS MATERIALIZED (
+    SELECT CASE WHEN jsonb_typeof(manual) = 'object' THEN manual->>'value' ELSE manual #>> '{}' END AS manual_relevance,
+      ai_relevance, jsonb_typeof(score) AS score_type, score #>> '{}' AS score_text,
+      CASE WHEN jsonb_typeof(score) = 'number' THEN (score #>> '{}')::numeric END AS numeric_score
+    FROM judgment_raw
+  )`;
+}
+
+function effectiveInputRelevanceSql() {
+  return `CASE WHEN manual_relevance IN ('relevant','uncertain','irrelevant') THEN manual_relevance
+    WHEN ai_relevance IN ('relevant','uncertain','irrelevant') THEN ai_relevance ELSE 'unjudged' END`;
+}
+
+function inputConfidenceBandSql() {
   // PostgreSQL 14 has no try_cast. Parse only decimal syntax, bound the exponent
   // before integer casts, and cast a bounded significand only in float8's safe
   // range. The sticky trailing digit preserves rounding for very long strings.
   // Subnormal positive values always display 0%; overflow is always missing.
-  return `(CASE WHEN ${manualRelevanceSql(a)} IS NOT NULL THEN 'manual'
-    WHEN COALESCE(${a}.ai_result->>'relevance','') NOT IN ('relevant','uncertain','irrelevant') THEN 'missing'
+  return `(CASE WHEN manual_relevance IN ('relevant','uncertain','irrelevant') THEN 'manual'
+    WHEN COALESCE(ai_relevance,'') NOT IN ('relevant','uncertain','irrelevant') THEN 'missing'
+    WHEN numeric_score BETWEEN 0 AND 1 THEN
+      CASE WHEN numeric_score < 0.5 THEN 'low'
+        WHEN numeric_score::double precision*100 >= 79.5 THEN 'high'
+        WHEN numeric_score::double precision*100 >= 59.5 THEN 'medium' ELSE 'low' END
     ELSE COALESCE((WITH input AS (
-      SELECT btrim(${a}.ai_result->>'relevanceConfidence', ${literal(JS_TRIM_CHARS)}) AS text
-      WHERE jsonb_typeof(${a}.ai_result->'relevanceConfidence') IN ('number','string')
+      SELECT btrim(score_text, ${literal(JS_TRIM_CHARS)}) AS text
+      WHERE score_type IN ('number','string')
     ), decimal_parts AS (
       SELECT text, regexp_replace(split_part(lower(text),'e',1),'^[+-]','','g') AS mantissa,
         split_part(lower(text),'e',2) AS exponent
@@ -99,6 +123,10 @@ export function recordRelevanceConfidenceBandSql(alias = 'r') {
     ) SELECT CASE WHEN value BETWEEN 0 AND 1 THEN CASE WHEN value*100 >= 79.5 THEN 'high' WHEN value*100 >= 59.5 THEN 'medium' ELSE 'low' END END FROM confidence), 'missing') END)`;
 }
 
+export function recordRelevanceConfidenceBandSql(alias = 'r') {
+  return `(WITH ${judgmentInputSql(alias)} SELECT ${inputConfidenceBandSql()} FROM judgment_input)`;
+}
+
 function selectedValues(value, allowed, name) {
   if (value === undefined) return [];
   const entries = Array.isArray(value) ? value : [value];
@@ -116,13 +144,19 @@ export function appendRecordRelevanceFilters(where, params, query = {}, alias = 
   // Validate both before mutating params, even when the other dimension is empty.
   const relevance = selectedValues(query.relevance, RELEVANCE_FILTER_VALUES, 'relevance');
   const confidence = selectedValues(query.relevanceConfidence, CONFIDENCE_FILTER_VALUES, 'relevanceConfidence');
+  if (confidence.length) {
+    const conditions = [];
+    if (relevance.length) {
+      params.push(relevance);
+      conditions.push(`(${effectiveInputRelevanceSql()}) = ANY($${params.length}::text[])`);
+    }
+    params.push(confidence);
+    conditions.push(`${inputConfidenceBandSql()} = ANY($${params.length}::text[])`);
+    return `${where} AND (WITH ${judgmentInputSql(alias)} SELECT ${conditions.join(' AND ')} FROM judgment_input)`;
+  }
   if (relevance.length) {
     params.push(relevance);
     where += ` AND ${recordRelevanceSql(alias)} = ANY($${params.length}::text[])`;
-  }
-  if (confidence.length) {
-    params.push(confidence);
-    where += ` AND ${recordRelevanceConfidenceBandSql(alias)} = ANY($${params.length}::text[])`;
   }
   return where;
 }
