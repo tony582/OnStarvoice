@@ -29,6 +29,7 @@ import {
 } from '@/components/shared/RecordLabels'
 import { tagsFromRecord, type CustomTag, type CustomTagPatch } from '@/lib/custom-tags'
 import { isRecordDetailDegraded, recordDisplayTitle } from '@/lib/record-display'
+import { PostIntentBadge, PostRelevanceBadge, PostJudgmentDetails } from '@/components/shared/PostJudgment'
 
 /**
  * 内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
@@ -436,6 +437,8 @@ function RecordDrawerContent({
                 <div className="mb-2 flex flex-wrap items-center gap-1.5">
                   <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
+                  <PostIntentBadge record={r} />
+                  <PostRelevanceBadge record={r} />
                   {r.content_availability_status === 'page_unavailable' && (
                     <StatusBadge tone="muted"><Ban className="h-3 w-3" />已删除或不可访问</StatusBadge>
                   )}
@@ -581,6 +584,7 @@ function RecordDrawerContent({
                         <p className="text-sm leading-relaxed text-muted-foreground">{r.ai_summary}</p>
                       </div>
                     )}
+                    <PostJudgmentDetails record={r} />
                     <section className="border-t border-border/50 pt-5">
                       <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
                         <div>

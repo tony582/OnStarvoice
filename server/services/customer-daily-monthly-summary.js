@@ -1,12 +1,15 @@
 import {customerDailyBusinessPeriod} from './customer-daily-business-period.js';
 import {isWorkingDate} from './china-work-calendar.js';
+import {DAILY_HANDLING_SUMMARY_FORMAT} from './customer-daily-handling-summary.js';
 
 export const MONTHLY_SUMMARY_FIELDS = Object.freeze(['monitor', 'sdb', 'positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther']);
 export const MONTHLY_SUMMARY_FORMAT = 'daily_disposition_v2';
 const invalid = (message, status = 400) => Object.assign(new Error(message), {status, code: 'daily_summary_invalid'});
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 
-export function isMonthlySummary(summary) { return summary?.format === MONTHLY_SUMMARY_FORMAT && Array.isArray(summary.rows); }
+export function isMonthlySummary(summary) {
+  return [MONTHLY_SUMMARY_FORMAT, DAILY_HANDLING_SUMMARY_FORMAT].includes(summary?.format) && Array.isArray(summary.rows);
+}
 
 export function buildMonthlySummary(records, period, count) {
   const rows = [];
@@ -38,7 +41,9 @@ export function mergeMonthlySummary(current, patch) {
   let changed = 0;
   for (const [date, values] of Object.entries(patch.rows)) {
     const row = next.rows.find(item => item.date === date);
-    if (!row || row.isWorkingDay === false) throw invalid('只能修改本份日报中的工作日汇总。');
+    if (!row || (row.isWorkingDay === false && current.format !== DAILY_HANDLING_SUMMARY_FORMAT)) {
+      throw invalid(current.format === DAILY_HANDLING_SUMMARY_FORMAT ? '只能修改本份日报中已有日期的处理量。' : '只能修改本份日报中的工作日汇总。');
+    }
     if (!object(values) || Object.keys(values).some(field => !MONTHLY_SUMMARY_FIELDS.includes(field))) throw invalid('只能修改汇总数量，不能修改日期或系统分类。');
     for (const [field, value] of Object.entries(values)) {
       if (!Number.isSafeInteger(value) || value < 0) throw invalid('汇总数量须为非负整数。');

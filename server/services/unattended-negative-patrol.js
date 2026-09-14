@@ -2,7 +2,18 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const PLATFORMS = new Set(['xiaohongshu', 'douyin']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UNAVAILABLE = new Set(['deleted', 'page_unavailable', 'unavailable', 'not_found']);
-const EXCLUDED_TRIAGE = new Set(['reviewed_non_monitor', 'unavailable', 'false_positive']);
+export const NEGATIVE_PATROL_TRIAGE_STATUSES = Object.freeze([
+  'unhandled', 'replied', 'reviewed', 'reviewed_non_monitor', 'unavailable',
+  'privacy_unreachable', 'negative_feishu', 'negative_cold', 'negative_comment',
+]);
+export const DEFAULT_NEGATIVE_PATROL_TRIAGE_STATUSES = Object.freeze(
+  NEGATIVE_PATROL_TRIAGE_STATUSES.filter(status => status !== 'reviewed_non_monitor'),
+);
+const LEGACY_TRIAGE_STATUSES = Object.freeze({
+  official_responded: 'replied', ticketed: 'negative_feishu', issue_linked: 'negative_feishu',
+  reviewing: 'negative_cold', no_action: 'reviewed_non_monitor',
+  false_positive: 'reviewed_non_monitor', archived: 'reviewed_non_monitor',
+});
 const TERMINAL_TASKS = [
   'completed', 'completed_with_warnings', 'completed_with_failures', 'failed',
   'canceled', 'skipped', 'superseded', 'interrupted', 'needs_action',
@@ -23,6 +34,19 @@ function instant(value, name) {
     });
   }
   return date;
+}
+
+// Omitted legacy settings use the visible defaults. An explicit empty list is
+// never widened to all statuses; saving and previewing it must fail together.
+export function normalizeNegativePatrolTriageStatuses(value) {
+  if (value === undefined) return [...DEFAULT_NEGATIVE_PATROL_TRIAGE_STATUSES];
+  if (!Array.isArray(value) || !value.length
+    || value.some(status => typeof status !== 'string' || !NEGATIVE_PATROL_TRIAGE_STATUSES.includes(status))) {
+    throw Object.assign(new Error('请至少选择一个有效的负面巡查处理状态'), {
+      code: 'invalid_negative_patrol_scope', status: 400,
+    });
+  }
+  return NEGATIVE_PATROL_TRIAGE_STATUSES.filter(status => value.includes(status));
 }
 
 export function normalizeUnattendedNegativePatrolScope(input = {}) {
@@ -49,6 +73,7 @@ export function normalizeUnattendedNegativePatrolScope(input = {}) {
   });
   return {
     tenantId, platforms: [...new Set(platforms)], keywords: strings(input.keywords),
+    triageStatuses: normalizeNegativePatrolTriageStatuses(input.triageStatuses),
     keywordIds, timezone, runStartedAt: end.toISOString(),
     windowStart: new Date(end.getTime() - 7 * DAY_MS).toISOString(),
     windowEnd: end.toISOString(), lookbackDays: 7, windowBasis: 'first_collected_at',
@@ -121,13 +146,15 @@ export function evaluateUnattendedNegativePatrolRecord(record, scopeInput, state
   if ((sentiment.present ? sentiment.value : lower(record.sentiment)) !== 'negative') return fail('not_negative');
   if (['official_content', 'blogger_profile'].includes(record.record_type)) return fail('official_content');
   if (record.archived_at) return fail('archived');
-  if (EXCLUDED_TRIAGE.has(lower(record.triage_status))) return fail(`triage_${lower(record.triage_status)}`);
+  const rawTriageStatus = lower(record.triage_status) || 'unhandled';
+  const triageStatus = LEGACY_TRIAGE_STATUSES[rawTriageStatus] || rawTriageStatus;
+  if (!scope.triageStatuses.includes(triageStatus)) return fail(`triage_${rawTriageStatus}`);
   if (UNAVAILABLE.has(lower(record.content_availability_status))) return fail('content_unavailable');
   const relevance = override(record, 'relevance');
   if (relevance.present && !['relevant', 'irrelevant', 'uncertain'].includes(relevance.value)) return fail('manual_relevance_invalid');
   if (relevance.present && relevance.value === 'irrelevant') return fail('manual_irrelevant');
   // Explicit administrator corrections follow the existing negative-patrol
-  // qualification rules; an exclusion triage state remains authoritative.
+  // qualification rules; the plan's selected handling states remain authoritative.
   const manuallyNegative = sentiment.present && sentiment.value === 'negative';
   const manuallyRelevant = relevance.present && ['relevant', 'uncertain'].includes(relevance.value);
   if (record.false_positive_pending && !manuallyNegative) return fail('false_positive_pending');

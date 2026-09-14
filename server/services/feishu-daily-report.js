@@ -2,7 +2,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import {renderCustomerDailySummaryPng} from './customer-daily-report-image.js';
 import {buildFeishuDailyPost, FEISHU_DAILY_POST_IMAGE_PLACEHOLDER} from './feishu-daily-report-message.js';
 import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryHeaders, isMonthlyDailyReport, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform,
-  customerDailyColdTitle, customerDailyColdPostLabel, customerDailyColdEmpty} from './customer-daily-report-presentation.js';
+  customerDailyColdTitle, customerDailyColdPostLabel, customerDailyColdEmpty, isHandlingDailyReport, customerDailyTables, customerDailySections, customerDailyPostStatus, customerDailyTableCaption} from './customer-daily-report-presentation.js';
 
 // Official contracts: /document/develop-robots/add-bot-to-external-group,
 // docx-v1/document-block-descendant/create, document-block/patch,
@@ -86,6 +86,21 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
     throw invalid('日报快照不完整');
   }
   const modern = isMonthlyDailyReport(snapshot);
+  const handling = isHandlingDailyReport(snapshot);
+  const mergeTargets = [];
+  const handlingTables = handling ? customerDailyTables(snapshot).map((item, tableIndex) => {
+    const headers = customerDailySummaryHeaders(item.snapshot);
+    const values = item.collection ? [headers] : [[...headers.slice(0, 5), '负面', '', '', ''], ['', '', '', '', '', ...headers.slice(5).map(label => label.replace(/^负面-/, ''))]];
+    for (const row of customerDailySummaryRows(item.snapshot, {hideRestDays: true})) {
+      if (row[0] === 'MTD') { mergeTargets.push({tableIndex, columns: headers.length, range: [values.length, values.length + 1, 0, headers.length]}); values.push([customerDailyTableCaption(item.snapshot), ...Array(headers.length - 1).fill('')]); }
+      values.push(row.map(value => value === null ? '' : String(value)));
+    }
+    if (!item.collection) {
+    for (let column = 0; column < 5; column++) mergeTargets.push({tableIndex, columns: 9, range: [0, 2, column, column + 1]});
+    mergeTargets.push({tableIndex, columns: 9, range: [0, 1, 5, 9]});
+    }
+    return {title: item.title, block: {block_type: 31, table: {property: {row_size: values.length, column_size: headers.length, column_width: item.collection ? [140, 110, 100, 100, 100, 100] : [140, 110, 100, 80, 80, 120, 150, 170, 110], header_row: true}}, nodes: values.flatMap((row, rowIndex) => row.map(value => ({block_type: 32, table_cell: {}, nodes: [textNode([run(value, null, rowIndex < (item.collection ? 1 : 2))])]})))}};
+  }) : [];
   const rows = [
     ...(modern ? [customerDailySummaryHeaders(snapshot)] : [
     ['日期', '监控数量', 'SDB范畴', '正向', '中性', '负面', '', ''],
@@ -98,15 +113,15 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
     nodes: [textNode([run(value, null, rowIndex < (modern ? 1 : 2))])] }))) };
   const nodes = [
     textNode(`${snapshot.tenantName || '客户'}舆情日报｜${snapshot.reportDate}${snapshot.mode === 'realtime' ? ' · 实时版' : ''}` , 3),
-    textNode(CUSTOMER_DAILY_SECTIONS.summary, 4), table,
-    textNode(CUSTOMER_DAILY_SECTIONS.heat, 4),
+    ...(handling ? handlingTables.flatMap(item => [textNode(item.title, 4), item.block]) : [textNode(CUSTOMER_DAILY_SECTIONS.summary, 4), table]),
+    textNode(customerDailySections(snapshot).heat, 4),
   ];
   const high = snapshot.highHeat || [];
   if (!high.length) nodes.push(textNode('暂未检出。'));
   high.forEach((post, index) => {
     const url = validHttpUrl(post.url);
     const description = ` - ${customerDailyPostPlatform(post)} | 热度 ${post.heat ?? '—'} | ${customerDailyPostComparison(post)}`
-      + (url ? '' : '｜原帖链接待补');
+      + (handling ? ` | 处理状态：${customerDailyPostStatus(post)}` : '') + (url ? '' : '｜原帖链接待补');
     nodes.push(textNode([run(`TOP${index + 1}：`), run(String(post.title || '未命名帖子').replace(/\s+/g,' ').trim(), url), run(description)]));
   });
   nodes.push(textNode(customerDailyColdTitle(snapshot), 4));
@@ -142,7 +157,7 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
     batch.descendants.push(...descendants);
   }
   if (batch.descendants.length) batches.push(batch);
-  return { schemaVersion: 1, batches, merges: modern ? [] : MERGES };
+  return { schemaVersion: 1, batches, merges: handling ? mergeTargets.map(target => target.range) : modern ? [] : MERGES, ...(handling ? {mergeTargets} : {}) };
 }
 
 function normalizedText(block) {
@@ -328,7 +343,7 @@ export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, 
           throw uncertain('飞书正文与待确认内容不一致，未继续写入');
         }
         await finish({ key, rootIds: added,
-          ...(added.find(root => actualMap.get(root)?.block_type === 31) ? { tableId: added.find(root => actualMap.get(root)?.block_type === 31) } : {}) });
+          ...(added.find(root => actualMap.get(root)?.block_type === 31) ? { tableId: added.find(root => actualMap.get(root)?.block_type === 31), ...(plan.mergeTargets ? {tableIds: added.filter(root => actualMap.get(root)?.block_type === 31)} : {}) } : {}) });
         continue;
       }
       if (JSON.stringify(roots) !== JSON.stringify(before)) throw uncertain('飞书文档结构已变化，未继续追加');
@@ -341,20 +356,24 @@ export function createFeishuDailyClient(config, { fetchImpl = globalThis.fetch, 
         const added = batch.children_id.map(root => ids.get(root));
         if (added.some(value => !ID.test(value || '')) || new Set(added).size !== added.length) throw uncertain('飞书正文标识无法核实');
         const table = batch.descendants.find(block => block.block_type === 31);
-        return { key, rootIds: added, ...(table ? { tableId: ids.get(table.block_id) } : {}) };
+        return { key, rootIds: added, ...(table ? { tableId: ids.get(table.block_id), ...(plan.mergeTargets ? {tableIds: batch.descendants.filter(block => block.block_type === 31).map(block => ids.get(block.block_id))} : {}) } : {}) };
       });
     }
-    const tableId = state.completed.find(step => step.tableId)?.tableId;
-    if (!tableId) throw uncertain('未找到日报原生表格');
+    const firstTableId = state.completed.find(step => step.tableId)?.tableId;
+    const tableIds = state.completed.flatMap(step => step.tableIds || (step.tableId ? [step.tableId] : []));
+    if (!firstTableId) throw uncertain('未找到日报原生表格');
     for (let index = 0; index < plan.merges.length; index++) {
       const key = `merge:${index}`;
       if (complete(key)) continue;
       const [rowStart, rowEnd, colStart, colEnd] = plan.merges[index];
+      const target = plan.mergeTargets?.[index];
+      const tableId = target ? tableIds[target.tableIndex] : firstTableId;
+      if (!tableId) throw uncertain('未找到日报原生表格');
       if (state.pending) {
         if (state.pending.key !== key) throw uncertain('表格写入进度不一致');
         const blocks = await allBlocks(documentId);
         const table = blocks.find(block => block.block_id === tableId);
-        const cell = table?.table?.property?.merge_info?.[rowStart * 8 + colStart];
+        const cell = table?.table?.property?.merge_info?.[rowStart * (target?.columns || 8) + colStart];
         if (cell?.row_span !== rowEnd - rowStart || cell?.col_span !== colEnd - colStart) throw uncertain('表头合并结果待确认，未重复修改');
         await finish({ key });
         continue;

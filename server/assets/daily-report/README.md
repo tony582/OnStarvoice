@@ -13,4 +13,6 @@ The September 2026 monthly-table update preserves all 37 Unicode characters from
 
 Rebuild procedure: verify the original SHA-256 above; instantiate the source variable font at `wght=500`; subset the union of the original 37-character cmap and the current fixed table headings/dates; retain source copyright and OFL metadata; rename family IDs 1/16 to `StarVoice Daily Table`, full name to `StarVoice Daily Table Regular`, and PostScript name to `StarVoiceDailyTable-Regular`. Verify that the old cmap is a subset of the new cmap, weight remains 500, and the output has no variable-font `fvar` table.
 
-Subset SHA-256: 2d5d5268f68a7fdb5e93ffb7a47deeda611c8e176ee795db669aaef7bcd74882
+The daily-handling v3 update preserves all 51 prior characters and adds 15 characters: `、一二去实报本每累计走采重际集`. The resulting 66-character subset covers both report tables, section headings, and the separate handling and collection MTD captions. Source SHA-256, font weight, and prior cmap coverage were verified.
+
+Subset SHA-256: 593df4709375d5778f05c4ac6340b94fbdea630c12fae778eecc08bcc299be7b

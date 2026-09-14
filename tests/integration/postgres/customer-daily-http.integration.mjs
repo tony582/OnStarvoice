@@ -8,7 +8,6 @@ import {getPool,closePool} from '../../../server/db/pool.js';
 import {createApp} from '../../../server/app.js';
 import {hashPassword} from '../../../server/services/auth-service.js';
 import {customerDailyBusinessPeriod} from '../../../server/services/customer-daily-business-period.js';
-import {previousWorkingDate} from '../../../server/services/china-work-calendar.js';
 import {buildCustomerDailyMetricEvidence} from '../../../server/services/customer-daily-metric-evidence.js';
 import {collectCustomerDailyReport} from '../../../server/services/customer-daily-report-data.js';
 import {normalizeRecord} from '../../../server/routes/sync.js';
@@ -32,8 +31,8 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   const tenantA=(await pool.query("INSERT INTO tenants(name) VALUES($1) RETURNING id",[`日报测试 ${randomUUID()}`])).rows[0].id;
   const tenantB=(await pool.query("INSERT INTO tenants(name) VALUES($1) RETURNING id",[`隔离客户 ${randomUUID()}`])).rows[0].id;
   tenantIds.push(tenantA,tenantB);
-  const today=new Date(Date.now()+8*3600000).toISOString().slice(0,10);
-  const period=customerDailyBusinessPeriod(previousWorkingDate(today));
+  // Fixed historical date keeps cross-day handling within the same month.
+  const period=customerDailyBusinessPeriod('2026-09-11',new Date('2026-09-12T01:00:00+08:00'));
   const at=(offset)=>new Date(new Date(period.periodStart).getTime()+offset*3600000).toISOString();
   const oldAt=new Date(new Date(period.monthStart).getTime()-86400000).toISOString();
   async function record({tenantId=tenantA,title='测试原帖',created=at(1),published=at(-48),sentiment='negative',triage='unhandled',businessVisibility='eligible',type='single_note',relevance='relevant'}={}) {
@@ -43,12 +42,13 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
     if(triage !== 'unhandled') await pool.query('INSERT INTO record_triage(tenant_id,record_id,status) VALUES($1,$2,$3)',[tenantId,id,triage]);
     return id;
   }
-  const hot=await record({title:'真正高热负面',created:new Date(new Date(period.collectionStartAt).getTime()-3600000).toISOString()});
+  const hot=await record({title:'真正高热负面',triage:'negative_feishu',created:new Date(new Date(period.collectionStartAt).getTime()-3600000).toISOString()});
+  await pool.query('UPDATE record_triage SET feishu_table_no=$2 WHERE record_id=$1', [hot,'202609-007']);
   const cold=await record({title:'低于门槛的当日冷处理',triage:'negative_cold'});
   const positive=await record({title:'进入客户清单的正向新帖',sentiment:'positive'});
   await record({title:'系统过滤不计客户监控',businessVisibility:'filtered_out'});
   await record({title:'无关内容不计客户监控',relevance:'irrelevant'});
-  await record({sentiment:'neutral',triage:'reviewed_non_monitor'});
+  const nonMonitor=await record({sentiment:'neutral',triage:'reviewed_non_monitor'});
   const historicalCold=await record({title:'旧帖今天新标冷处理',created:oldAt,published:oldAt,triage:'negative_cold'});
   await record({tenantId:tenantB,title:'绝不能混入的客户B帖子'});
   await record({type:'blogger_profile'});
@@ -69,6 +69,14 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   await observe(cold,85,at(3));
   for(const [recordId,previousStatus] of [[cold,'unhandled'],[historicalCold,'unhandled'],[historicalCold,'negative_cold']]) await pool.query(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,action,target_type,target_id,metadata,created_at)
     VALUES($1,'system','daily-test','record.triage_updated','record',$2,$3::jsonb,$4)`,[tenantA,recordId,JSON.stringify({previousStatus,nextStatus:'negative_cold'}),at(4)]);
+  for (const [recordId,previousStatus,nextStatus,when] of [
+    [hot,'unhandled','negative_cold',at(-20)],
+    [hot,'negative_cold','negative_feishu',at(2)],
+    [hot,'negative_feishu','negative_feishu',at(3)],
+    [positive,'unhandled','reviewed',at(4)],
+    [nonMonitor,'unhandled','reviewed_non_monitor',at(4)],
+  ]) await pool.query(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,action,target_type,target_id,metadata,created_at)
+    VALUES($1,'system','daily-test','record.triage_updated','record',$2,$3::jsonb,$4)`,[tenantA,recordId,JSON.stringify({previousStatus,nextStatus}),when]);
 
   async function user(role) {
     const email=`daily-${randomUUID()}@integration.invalid`;
@@ -101,16 +109,26 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(response.status,200,JSON.stringify(result));
   const generated=result.report;
   assert.equal(generated.reportDate,period.reportDate);
-  assert.equal(generated.snapshot.summary.day.monitor,3);
-  assert.equal(generated.snapshot.summary.day.sdb,2);
+  assert.equal(generated.snapshot.schemaVersion,3);
+  assert.equal(generated.snapshot.summary.format,'daily_handling_v3');
+  assert.equal(generated.snapshot.summary.day.monitor,5);
+  assert.equal(generated.snapshot.summary.day.sdb,4);
   assert.equal(generated.snapshot.summary.day.positive,1);
-  assert.equal(generated.snapshot.summary.day.cold,1);
+  assert.equal(generated.snapshot.summary.day.cold,2);
+  assert.equal(generated.snapshot.summary.day.negativeProcess,1);
+  assert.equal(generated.snapshot.summary.mtd.monitor,6,'the same hot post handled on two dates counts twice in processing MTD');
+  assert.equal(generated.snapshot.summary.mtdBasis,'daily_sum');
+  assert.equal(generated.snapshot.collectionSummary.day.monitor,3);
+  assert.equal(generated.snapshot.collectionSummary.day.sdb,2);
+  assert.equal(generated.snapshot.collectionSummary.mtd.monitor,4,'collection MTD deduplicates posts and excludes older-month handling');
   assert.equal(generated.snapshot.summary.day.inProgress,null);
   assert.equal(generated.snapshot.summary.mtd.processed,null);
   assert.deepEqual(generated.snapshot.highHeat.map(row=>row.recordId),[hot]);
   assert.equal(generated.snapshot.highHeat[0].heat,320);
   assert.equal(generated.snapshot.highHeat[0].comparisonText,'↓20%');
   assert.equal(generated.snapshot.highHeat[0].previousHeat,400);
+  assert.equal(generated.snapshot.highHeat[0].status,'negative_feishu');
+  assert.equal(generated.snapshot.highHeat[0].feishuTableNo,'202609-007');
   assert.deepEqual(new Set(generated.snapshot.coldMarked.map(row=>row.recordId)),new Set([cold,historicalCold]));
   assert.equal(generated.snapshot.coldMarked.find(row=>row.recordId===cold).isHistorical,false);
   assert.equal(generated.snapshot.coldMarked.find(row=>row.recordId===historicalCold).isHistorical,true);
@@ -121,9 +139,13 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(detail.report.snapshot.summary.day.positive,1,'saved snapshot is immutable');
   assert.match(detail.text,/https:\/\/www.douyin.com/);
   assert.ok(!detail.html.includes('绝不能混入的客户B帖子'));
-  assert.match(detail.messageHtml,/二、7天内热度值≥200的负面帖子/);
-  assert.match(detail.messageText,/三、本期冷处理负面帖：2 条（含历史帖 1 条）/);
-  assert.match(detail.html,/一、监控汇总（本期新增）/);
+  assert.match(detail.messageHtml,/三、7天内热度值≥200的负面帖子/);
+  assert.match(detail.messageText,/四、本期冷处理负面帖：2 条（含历史帖 1 条）/);
+  assert.match(detail.html,/一、每日舆情处理量/);
+  assert.match(detail.html,/二、实际采集量/);
+  assert.match(detail.html,/本月处理累计/);
+  assert.match(detail.html,/本月采集去重累计/);
+  assert.match(detail.messageText,/飞书表[^\n]*202609-007/);
   assert.ok(!detail.messageHtml.includes('<table'));
   assert.ok(!detail.messageText.includes('MTD'));
   const newer=await (await request('/generate',{method:'POST',body:{date:period.reportDate,requestId:randomUUID()}})).json();
@@ -135,10 +157,10 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   await workbook.xlsx.load(Buffer.from(await excel.arrayBuffer()));
   assert.equal(workbook.worksheets.length,3);
   const sheet=workbook.worksheets[0];
-  const dayRow=sheet.getRows(1,sheet.rowCount).find(row=>row.getCell(2).value===3 && row.getCell(3).value===2);
+  const dayRow=sheet.getRows(1,sheet.rowCount).find(row=>row.getCell(2).value===5 && row.getCell(3).value===4);
   assert.ok(dayRow);
   assert.equal(dayRow.getCell(7).value,0);
-  assert.equal(dayRow.getCell(8).value,0);
+  assert.equal(dayRow.getCell(8).value,1);
   assert.equal(dayRow.getCell(9).value,0);
   const monthResponse = await request(`/calendar-month?month=${period.reportDate.slice(0,7)}`);
   assert.equal(monthResponse.status,200);
@@ -184,6 +206,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(edited.mode,generated.mode);
   assert.equal(edited.snapshot.assessedAt,source.snapshot.assessedAt,'editing counts is not a new data assessment');
   assert.deepEqual(edited.snapshot.systemSummary,source.snapshot.summary);
+  assert.deepEqual(edited.snapshot.collectionSummary,source.snapshot.collectionSummary,'editing processing counts does not alter actual collection or deduplicated collection MTD');
   assert.equal(edited.snapshot.summaryEdited,true);
   assert.equal(edited.snapshot.summaryEdit.sourceReportId,source.id);
   assert.equal(edited.snapshot.summaryEdit.actorId,writer.id);
@@ -220,7 +243,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal((await request(`/${generated.id}/summary`,{method:'POST',tenantId:tenantB,body:edit})).status,403);
   assert.equal((await request(`/${randomUUID()}/summary`,{method:'POST',body:edit})).status,404);
   assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{rows:{[period.reportDate]:{negativeProcess:-1}}},requestId:randomUUID()}})).status,400);
-  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{rows:{[period.reportDate]:{sdb:4}}},requestId:randomUUID()}})).status,400);
+  assert.equal((await request(`/${generated.id}/summary`,{method:'POST',body:{summary:{rows:{[period.reportDate]:{sdb:6}}},requestId:randomUUID()}})).status,400);
   const png=await request(`/${edited.id}/summary.png`,{auth:viewerToken});
   assert.equal(png.status,200);
   assert.match(png.headers.get('content-type'),/^image\/png/);
@@ -229,6 +252,30 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.deepEqual(Buffer.from(await png.arrayBuffer()).subarray(0,8),Buffer.from([137,80,78,71,13,10,26,10]));
   assert.equal((await request(`/${generated.id}/summary.png`,{tenantId:tenantB})).status,403);
   assert.equal((await request(`/${randomUUID()}/summary.png`)).status,404);
+
+  await t.test('a real PATCH with an uppercase UUID counts once while a later note-only PATCH does not count', async () => {
+    const recordId = await record({title:'大写链接状态处理验证',sentiment:'neutral'});
+    const path = `${base}/api/triage/records/${recordId.toUpperCase()}`;
+    const headers = {authorization:`Bearer ${token}`,'x-tenant-id':tenantA,'content-type':'application/json'};
+    for (const body of [{status:'reviewed'},{note:'仅补充备注'}]) {
+      const response = await fetch(path,{method:'PATCH',headers,body:JSON.stringify(body)});
+      assert.equal(response.status,200,await response.text());
+    }
+    const written = (await pool.query("SELECT target_id,metadata FROM audit_logs WHERE tenant_id=$1 AND action='record.triage_updated' AND lower(target_id)=$2 ORDER BY created_at",[tenantA,recordId])).rows;
+    assert.equal(written.length,2);
+    assert.equal(written[0].target_id,recordId.toUpperCase());
+    assert.deepEqual(written.map(row=>[row.metadata.previousStatus,row.metadata.nextStatus]),[['unhandled','reviewed'],['reviewed','reviewed']]);
+    await pool.query("UPDATE audit_logs SET created_at=$3 WHERE tenant_id=$1 AND action='record.triage_updated' AND lower(target_id)=$2",[tenantA,recordId,at(8)]);
+    const snapshot = await collectCustomerDailyReport({tenantId:tenantA,date:period.reportDate,now:new Date(period.assessedAt),businessPeriod:period,db:{
+      async queryAll(sql,values) {return (await pool.query(sql,values)).rows;},
+      async queryOne(sql,values) {return (await pool.query(sql,values)).rows[0]||null;},
+    }});
+    assert.equal(snapshot.evidence.handling.dailyRecordIds[period.reportDate].filter(id=>id===recordId).length,1);
+    assert.equal(snapshot.evidence.handling.transitions.filter(event=>event.recordId===recordId).length,1);
+    assert.equal(snapshot.summary.day.monitor,6);
+    assert.equal(snapshot.summary.mtd.monitor,7);
+    assert.equal(snapshot.collectionSummary.mtd.monitor,5);
+  });
 
   await t.test('real observation projection preserves normalization precedence and the original null timestamp stamp', async () => {
     const outer=Date.parse(at(1)), list=Date.parse(at(2)), nested=Date.parse(at(3));

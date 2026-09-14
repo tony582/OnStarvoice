@@ -7,6 +7,7 @@ export type OrchestrationLaunchIntent = {
   lockExecutionMode?: boolean
   minimumAgentCount?: number
   initialNegativePatrolEnabled?: boolean
+  initialNegativePatrolStatuses?: string[]
   lockAgentSelection?: boolean
 }
 
@@ -228,6 +229,7 @@ export type OrchestrationComposerDrawerProps = {
   /** 多节点入口要求平台兼容过滤后仍保留至少两个节点；直接入口仍可使用一个。 */
   minimumAgentCount?: number
   initialNegativePatrolEnabled?: boolean
+  initialNegativePatrolStatuses?: string[]
   lockAgentSelection?: boolean
   /** 兼容直接打开编排器时的预选节点；统一向导的多节点链路不再提前选节点。 */
   initialAgentIds?: string[]

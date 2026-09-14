@@ -20,7 +20,7 @@ import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { ScheduledDatesPicker } from './ScheduledDatesPicker'
 import { NegativePatrolScheduleOption } from './NegativePatrolScheduleOption'
-import { hasUnattendedNegativePatrol, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable } from './unattendedNegativePatrol.mjs'
+import { hasUnattendedNegativePatrol, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable, DEFAULT_NEGATIVE_PATROL_STATUSES, negativePatrolTriageStatuses, validNegativePatrolStatuses, negativePatrolStatusSummary } from './unattendedNegativePatrol.mjs'
 import { Drawer } from '@/components/shared/Drawer'
 import { shanghaiToday } from './lib'
 import type {
@@ -360,6 +360,7 @@ export function OrchestrationComposerDrawer({
   minimumAgentCount = 1,
   initialAgentIds,
   initialNegativePatrolEnabled = false,
+  initialNegativePatrolStatuses,
   lockAgentSelection = false,
   editingPlan,
   copyingPlan,
@@ -379,6 +380,7 @@ export function OrchestrationComposerDrawer({
   const [platform, setPlatform] = useState<OrchestrationPlatform>('xiaohongshu')
   const [executionMode, setExecutionMode] = useState<OrchestrationExecutionMode>(initialExecutionMode)
   const [negativePatrolEnabled, setNegativePatrolEnabled] = useState(false)
+  const [negativePatrolStatuses, setNegativePatrolStatuses] = useState<string[]>(() => [...DEFAULT_NEGATIVE_PATROL_STATUSES])
   const includeNegativePatrol = executionMode === 'unattended_plan' && negativePatrolEnabled
   const [planMode, setPlanMode] = useState<PlanMode>('daily')
   const [startTime, setStartTime] = useState('09:00')
@@ -534,6 +536,7 @@ export function OrchestrationComposerDrawer({
     setTitle(copyMode ? `${sourcePlan?.orchestration.title || '无人值守计划'}（副本）` : sourcePlan?.orchestration.title || '')
     setPlatform(targetPlatform)
     setNegativePatrolEnabled(targetNegativePatrol)
+    setNegativePatrolStatuses(negativePatrolTriageStatuses(sourcePlan ? planSnapshot : {negativePatrol: {triageStatuses: initialNegativePatrolStatuses}}))
     setExecutionMode(editMode ? 'unattended_plan' : initialExecutionMode)
     if (copyMode && initialExecutionMode !== 'unattended_plan') {
       setExecutionMode('unattended_plan')
@@ -593,7 +596,7 @@ export function OrchestrationComposerDrawer({
     setDispatchResult(null)
     setUpdateResult(null)
     requestKeyRef.current = randomRequestKey()
-  }, [agents, copyMode, editMode, initialAgentIds, initialExecutionMode, sourcePlan, initialNegativePatrolEnabled, lockAgentSelection])
+  }, [agents, copyMode, editMode, initialAgentIds, initialExecutionMode, sourcePlan, initialNegativePatrolEnabled, initialNegativePatrolStatuses, lockAgentSelection])
 
   useEffect(() => {
     if (open && !previouslyOpenRef.current) reset()
@@ -756,12 +759,16 @@ export function OrchestrationComposerDrawer({
   }
 
   const loadNegativePreview = async () => {
+    if (!validNegativePatrolStatuses(negativePatrolStatuses)) {
+      setNegativePreviewError('请至少选择一种有效的处理状态。')
+      return
+    }
     const version = ++negativePreviewVersion.current
     setNegativePreviewLoading(true)
     setNegativePreviewError('')
     try {
       const result = await api.post<{windowStart?: string; windowEnd?: string; summary: Record<string, unknown>}>(
-        '/capture-cloud/orchestrations/negative-patrol-preview', {platform, keywords},
+        '/capture-cloud/orchestrations/negative-patrol-preview', {platform, keywords, ...unattendedNegativePatrolRequest(true, 'unattended_plan', negativePatrolStatuses)},
       )
       if (negativePreviewVersion.current === version) setNegativePreview(result)
     } catch (err) {
@@ -847,7 +854,7 @@ export function OrchestrationComposerDrawer({
     title: title.trim(),
     platform,
     executionMode,
-    ...unattendedNegativePatrolRequest(includeNegativePatrol, executionMode),
+    ...unattendedNegativePatrolRequest(includeNegativePatrol, executionMode, negativePatrolStatuses),
     ...(executionMode === 'unattended_plan'
       ? {
           planMode,
@@ -873,6 +880,10 @@ export function OrchestrationComposerDrawer({
 
   const generatePreview = async () => {
     setError('')
+    if (includeNegativePatrol && !validNegativePatrolStatuses(negativePatrolStatuses)) {
+      setError('请至少选择一种有效的负面巡查处理状态。')
+      return
+    }
     if (!writable) {
       setError(editMode ? '当前账号为只读权限，不能编辑计划。' : '当前账号为只读权限，不能创建编排任务。')
       return
@@ -965,7 +976,7 @@ export function OrchestrationComposerDrawer({
           title: title.trim(),
           platform,
           executionMode,
-          ...unattendedNegativePatrolRequest(includeNegativePatrol, executionMode),
+          ...unattendedNegativePatrolRequest(includeNegativePatrol, executionMode, negativePatrolStatuses),
           distributionMode,
           agentIds: validSelectedAgentIds,
           ...(executionMode === 'unattended_plan'
@@ -1026,6 +1037,10 @@ export function OrchestrationComposerDrawer({
 
   const dispatch = async () => {
     setError('')
+    if (includeNegativePatrol && !validNegativePatrolStatuses(negativePatrolStatuses)) {
+      setError('请至少选择一种有效的负面巡查处理状态。')
+      return
+    }
     if (!preview || (!editMode && !createResult)) {
       setError('当前队列预览已失效，请返回上一步重新生成。')
       return
@@ -1052,7 +1067,7 @@ export function OrchestrationComposerDrawer({
             title: title.trim(),
             platform,
             executionMode: 'unattended_plan',
-            negativePatrol: includeNegativePatrol ? {enabled: true, lookbackDays: 7} : {enabled: false},
+            negativePatrol: includeNegativePatrol ? unattendedNegativePatrolRequest(true, 'unattended_plan', negativePatrolStatuses).negativePatrol : {enabled: false},
             distributionMode,
             agentIds: validSelectedAgentIds,
             schedule: {
@@ -1263,13 +1278,13 @@ export function OrchestrationComposerDrawer({
                           </p>
                         </div>
                       </div>
-                      <NegativePatrolScheduleOption checked={includeNegativePatrol} disabled={busy} onChange={changeNegativePatrol} />
+                      <NegativePatrolScheduleOption checked={includeNegativePatrol} disabled={busy} onChange={changeNegativePatrol} triageStatuses={negativePatrolStatuses} onStatusesChange={statuses => { markDefinitionChanged(); setNegativePatrolStatuses(statuses) }} />
                       {includeNegativePatrol && <p className="text-[11px] leading-5 text-muted-foreground">启用后使用云端逐项领取，仍只使用下方已选节点；固定分配计划会改为逐项领取。每轮动态选取当前平台的帖子，负面清单在运行时生成。</p>}
                       {includeNegativePatrol && (
                         <div className="rounded-xl border border-border/70 bg-card px-3 py-3">
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <span className="text-[11px] text-muted-foreground">按当前平台和关键词预估，实际清单在每轮开始时确定。</span>
-                            <Button type="button" variant="outline" size="sm" disabled={busy || negativePreviewLoading || keywords.length === 0} onClick={() => void loadNegativePreview()}>
+                            <Button type="button" variant="outline" size="sm" disabled={busy || negativePreviewLoading || keywords.length === 0 || !validNegativePatrolStatuses(negativePatrolStatuses)} onClick={() => void loadNegativePreview()}>
                               {negativePreviewLoading ? '正在预估…' : '预估巡查范围'}
                             </Button>
                           </div>
@@ -1728,6 +1743,7 @@ export function OrchestrationComposerDrawer({
                         ? ` · ${planMode === 'daily' ? '每天' : `${parseCustomDates(customDates).dates.length} 个指定日期`} ${startTime}`
                         : ''}
                     </p>
+                    {includeNegativePatrol && <p className="mt-2 text-xs leading-5 text-muted-foreground">负面巡查处理状态：<span className="text-foreground">{negativePatrolStatusSummary(negativePatrolStatuses)}</span></p>}
                   </div>
                   <Button variant="outline" size="sm" onClick={() => { setStage('define'); setError('') }} disabled={busy}>{editMode ? '返回修改' : '调整节点池'}</Button>
                 </div>
@@ -1828,7 +1844,7 @@ export function OrchestrationComposerDrawer({
                           {` · ${distributionMode === 'elastic_pool' ? '弹性节点池' : '固定分配'} · 每个关键词${sequentialSearchEnabled ? `按“${patrolPathLabel}”串行执行` : '执行 1 次'}`}
                         </span>
                       </div>
-                      {includeNegativePatrol && <div className="mt-1">负面巡查：启动前7天首次采集入库的负面内容，每轮可查；关键词优先，空闲接续，保留处理状态。</div>}
+                      {includeNegativePatrol && <><div className="mt-1">负面巡查：启动前7天首次采集入库的负面内容，每轮可查；关键词优先，空闲接续，保留处理状态。</div><div className="mt-1 leading-5">巡查处理状态：{negativePatrolStatusSummary(negativePatrolStatuses)}</div></>}
                       <div className="mt-1">
                         下次运行：<span className="font-semibold text-foreground">{formatScheduleTime(nextScheduleRunAt)}</span>
                       </div>

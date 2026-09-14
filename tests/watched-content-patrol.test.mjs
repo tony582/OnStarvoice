@@ -67,11 +67,13 @@ test('watch state is tenant-scoped, independent from record classification, filt
   assert.match(triage, /AS watched_by_name/u);
   assert.match(triage, /record\.watch_batch_added/u);
   assert.match(triage, /record\.watch_batch_removed/u);
-  assert.match(
-    triage,
-    /ai_result->>'relevance' IS DISTINCT FROM 'irrelevant'[\s\S]*record_watchlist watched_override/u,
-    'a watched non-negative or relevance-filtered record must remain visible in content triage',
-  );
+  const contentCondition = triage.slice(triage.indexOf('const TRIAGE_CONTENT_CONDITION'), triage.indexOf('const TRIAGE_QUEUE_CONDITION'));
+  assert.match(contentCondition,
+    /AND \(\$\{recordTriageAdmissionSql\('r'\)\}\)\s+AND \(/u,
+    'sentry admission must stay outside the watch alternative so watching cannot bypass the sentry evidence gate');
+  assert.match(contentCondition,
+    /\$\{recordEffectiveRelevanceSql\('r'\)\} IS DISTINCT FROM 'irrelevant'\s+OR EXISTS \([\s\S]*record_watchlist watched_override[\s\S]*watched_override\.tenant_id = r\.tenant_id\s+AND watched_override\.record_id = r\.id/u,
+    'non-sentry watched records keep the tenant-scoped relevance override, using the effective human-first decision');
 });
 
 test('watched-content task creation revalidates live watch state and creates platform-bound elastic items', async () => {

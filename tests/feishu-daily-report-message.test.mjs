@@ -115,3 +115,16 @@ test('historical labels remain separate from raw URLs and legacy snapshots do no
   assert.match(old, /三、本期冷处理负面帖：1 条/);
   assert.doesNotMatch(old, /历史帖/);
 });
+
+test('v3 high heat message carries frozen status and feishu number below the combined summary image', () => {
+  const result = build({summary: {format: 'daily_handling_v3', rows: []}, highHeat: [
+    {...item(1), status: 'negative_cold'}, {...item(2), status: 'negative_comment'},
+    {...item(3), status: 'negative_feishu', feishuTableNo: 'FS-003'}, {...item(4)},
+  ]});
+  const value = words(result);
+  assert.match(value, /一、每日舆情处理量/);
+  assert.match(value, /三、7天内热度值≥200/);
+  assert.match(value, /四、本期冷处理/);
+  for (const label of ['处理状态：冷处理', '处理状态：评论区留言', '处理状态：飞书表 · FS-003', '处理状态：状态未记录']) assert.ok(value.includes(label));
+  assert.equal(result.zh_cn.content.flat().filter(node => node.tag === 'img').length, 1);
+});

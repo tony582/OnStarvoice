@@ -39,6 +39,8 @@ function fakeDb(seed = {}) {
     async queryAll(sql, params) {
       calls.push({sql, params});
       if (sql.includes('customer_daily:month')) return seed.month || [];
+      if (sql.includes('customer_daily:handling_events')) return seed.handlingEvents || [];
+      if (sql.includes('customer_daily:handling_posts')) return seed.handlingPosts || [];
       if (sql.includes('customer_daily:heat_posts')) return seed.heatPosts || [];
       if (sql.includes('customer_daily:observations')) return seed.observations || [];
       if (sql.includes('customer_daily:cold_events')) return seed.events || [];
@@ -62,7 +64,7 @@ test('Shanghai report date defaults to yesterday; realtime ends now and rolls ac
   for (const invalid of ['2026-02-30', '2026-9-7', 'junk', '2026-09-09']) assert.throws(() => dailyPeriod(invalid, now));
 });
 
-test('day and MTD count customer-visible first inserts once and subtract customer non-monitor decisions', async () => {
+test('collection day and MTD retain customer-visible first-insert counts once and subtract customer non-monitor decisions', async () => {
   const month = [record(1, {sentiment: 'positive'}), record(2, {status: 'negative_cold'}),
     record(3, {sentiment: 'neutral', business_visibility: 'filtered_out'}), record(4, {status: 'reviewed_non_monitor'}),
     record(5, {first_seen_at: d(2), status: 'negative_cold'}),
@@ -73,11 +75,11 @@ test('day and MTD count customer-visible first inserts once and subtract custome
     record(12,{relevance:'irrelevant'}),record(13,{relevance:'irrelevant',watched:true,sentiment:'neutral'})];
   const db = fakeDb({month});
   const report = await collectCustomerDailyReport({...opts, db});
-  assert.deepEqual(report.summary.day, {monitor: 4, sdb: 3, positive: 1, neutral: 1, negative: 1, cold: 1, comment: 0, negativeProcess: 0, negativeOther: 0, nonMonitor: 1, unclassified: 0, inProgress: null, processed: null});
-  assert.equal(report.summary.mtd.monitor, 5);
-  assert.equal(report.summary.mtd.cold, 2);
-  assert.equal(report.summary.mtd.sdb, report.summary.mtd.positive + report.summary.mtd.neutral + report.summary.mtd.negative + report.summary.mtd.unclassified);
-  assert.equal(report.summary.day.monitor, report.summary.day.sdb + report.summary.day.nonMonitor);
+  assert.deepEqual(report.collectionSummary.day, {monitor: 4, sdb: 3, positive: 1, neutral: 1, negative: 1, cold: 1, comment: 0, negativeProcess: 0, negativeOther: 0, nonMonitor: 1, unclassified: 0, inProgress: null, processed: null});
+  assert.equal(report.collectionSummary.mtd.monitor, 5);
+  assert.equal(report.collectionSummary.mtd.cold, 2);
+  assert.equal(report.collectionSummary.mtd.sdb, report.collectionSummary.mtd.positive + report.collectionSummary.mtd.neutral + report.collectionSummary.mtd.negative + report.collectionSummary.mtd.unclassified);
+  assert.equal(report.collectionSummary.day.monitor, report.collectionSummary.day.sdb + report.collectionSummary.day.nonMonitor);
   assert.ok(!report.warnings.some(w => w.code === 'unclassified' || w.code === 'audit_visible_posts_included'));
   assert.equal(report.evidence.firstSeenField, 'records.created_at');
   const query = db.calls.find(q => q.sql.includes('customer_daily:month'));
@@ -92,14 +94,99 @@ test('morning new posts belong to today realtime and G corrections apply to yest
   const today = record(2, {first_seen_at: d(8, '01:00:00'), sentiment: 'positive'});
   const prior = await collectCustomerDailyReport({...opts, db: fakeDb({month: [yesterday, today]})});
   const realtime = await collectCustomerDailyReport({...opts, date: '2026-09-08', db: fakeDb({month: [yesterday, today]})});
-  assert.equal(prior.summary.day.monitor, 1); assert.equal(prior.summary.day.cold, 1);
-  assert.equal(realtime.summary.day.monitor, 1); assert.equal(realtime.summary.day.positive, 1);
-  assert.equal(realtime.summary.mtd.monitor, 2);
+  assert.equal(prior.collectionSummary.day.monitor, 1); assert.equal(prior.collectionSummary.day.cold, 1);
+  assert.equal(realtime.collectionSummary.day.monitor, 1); assert.equal(realtime.collectionSummary.day.positive, 1);
+  assert.equal(realtime.collectionSummary.mtd.monitor, 2);
   const corrected = await collectCustomerDailyReport({...opts, db: fakeDb({month: [{...yesterday, sentiment: 'positive'}, today]})});
-  assert.equal(corrected.summary.day.cold, 0);
-  assert.equal(corrected.summary.day.positive, 1);
+  assert.equal(corrected.collectionSummary.day.cold, 0);
+  assert.equal(corrected.collectionSummary.day.positive, 1);
   assert.ok(corrected.warnings.some(w => w.code === 'sentiment_status_conflict' && w.blocking));
-  assert.equal(prior.summary.day.cold, 1, 'saved in-memory snapshot does not mutate');
+  assert.equal(prior.collectionSummary.day.cold, 1, 'saved in-memory snapshot does not mutate');
+});
+
+test('handling uses audited status changes including historical posts, while collection keeps first-insert counts', async () => {
+  const historical = record(1, {first_seen_at: '2026-08-01T00:00:00Z', status: 'negative_comment'});
+  const current = record(2, {status: 'reviewed_non_monitor'});
+  const untouched = record(3, {status: 'negative_cold', updated_at: d(7)});
+  const hidden = record(4, {business_visibility: 'filtered_out'});
+  const comment = record(5, {record_type: 'comment'});
+  const unrelated = record(6, {relevance: 'irrelevant'});
+  const blocked = record(7, {admission_allowed: false});
+  const watched = record(8, {relevance: 'irrelevant', watched: true});
+  const handlingEvents = [event(1, 'unhandled', 'negative_cold', {created_at: d(6)}),
+    event(1, 'negative_cold', 'negative_feishu', {action: 'record.ticket_created', id: ID(991)}),
+    event(1, 'negative_feishu', 'negative_feishu', {created_at: d(7, '05:00:00'), id: ID(992)}),
+    event(2, 'unhandled', 'reviewed_non_monitor'), event(4, 'unhandled'), event(5, 'unhandled'),
+    event(6, 'unhandled'), event(7, 'unhandled'), event(8, 'unhandled', 'reviewed'),
+    event(3, 'unhandled', 'negative_cold', {tenant_id: ID(998)})];
+  const db = fakeDb({month: [historical, current, untouched], handlingEvents,
+    handlingPosts: [historical, current, untouched, hidden, comment, unrelated, blocked, watched], coverage: '2026-08-31T16:00:00Z'});
+  const report = await collectCustomerDailyReport({...opts, db});
+  assert.equal(report.schemaVersion, 3);
+  assert.equal(report.summary.format, 'daily_handling_v3');
+  assert.deepEqual(report.summary.day, {monitor: 3, sdb: 2, positive: 0, neutral: 0, negative: 2,
+    cold: 0, comment: 0, negativeProcess: 1, negativeOther: 0, inProgress: null, processed: null, unclassified: 0, nonMonitor: 1});
+  assert.equal(report.summary.mtd.monitor, 4, 'same post handled on two dates contributes once per date');
+  assert.equal(report.summary.mtdBasis, 'daily_sum');
+  assert.equal(report.collectionSummary.day.monitor, 2);
+  assert.equal(report.collectionSummary.mtd.monitor, 2);
+  assert.equal(report.summary.coverageComplete, true);
+  assert.ok(!report.warnings.some(warning => warning.code === 'handling_history_incomplete'));
+  assert.deepEqual(report.evidence.handling.dailyRecordIds['2026-09-07'], [ID(2), ID(8), ID(1)]);
+  assert.equal(report.evidence.handling.transitions.length, 4);
+  const auditQuery = db.calls.find(call => call.sql.includes('customer_daily:handling_events'));
+  assert.deepEqual(auditQuery.params, [tenantId, '2026-08-31T16:00:00.000Z', '2026-09-07T16:00:00.000Z']);
+  assert.match(auditQuery.sql, /tenant_id = \$1 AND target_type = 'record'/);
+  assert.match(auditQuery.sql, /record\.ticket_created/);
+  const postQuery = db.calls.find(call => call.sql.includes('customer_daily:handling_posts'));
+  assert.equal(postQuery.params[0], tenantId);
+  assert.match(postQuery.sql, /r\.tenant_id = \$1 AND r\.id = ANY\(\$2::uuid\[\]\)/);
+  assert.doesNotMatch(postQuery.sql, /r\.created_at >=|rt\.updated_at/);
+  assert.match(postQuery.sql, /manual_overrides/);
+});
+
+test('natural handling dates remain separate from a Monday collection window and collection MTD deduplicates', async () => {
+  const businessPeriod = customerDailyBusinessPeriod('2026-09-14', '2026-09-14T03:00:00Z');
+  const collected = record(1, {first_seen_at: '2026-09-12T01:00:00Z', status: 'negative_feishu'});
+  const db = fakeDb({month: [collected, collected], handlingPosts: [collected], coverage: '2026-08-01T00:00:00Z', handlingEvents: [
+    event(1, 'unhandled', 'negative_cold', {created_at: '2026-09-12T02:00:00Z'}),
+    event(1, 'negative_cold', 'negative_feishu', {created_at: '2026-09-14T01:00:00Z', id: ID(991)}),
+  ]});
+  const report = await collectCustomerDailyReport({...opts, db, businessPeriod});
+  assert.equal(report.collectionSummary.day.monitor, 1);
+  assert.equal(report.collectionSummary.mtd.monitor, 1);
+  assert.equal(report.summary.day.monitor, 1);
+  assert.equal(report.summary.mtd.monitor, 2);
+  assert.equal(report.summary.rows.find(row => row.date === '2026-09-12').counts.cold, 1);
+  assert.equal(report.summary.rows.find(row => row.date === '2026-09-12').isWorkingDay, false);
+  assert.ok(!report.summary.rows.some(row => row.date === '2026-09-13'));
+  assert.equal(db.calls.find(call => call.sql.includes('customer_daily:handling_events')).params[1], '2026-08-31T16:00:00.000Z');
+  assert.equal(db.calls.find(call => call.sql.includes('customer_daily:month')).params[1], businessPeriod.monthStart);
+});
+
+test('missing monthly status audit coverage is a blocking incomplete-data warning and never certain zero', async () => {
+  const report = await collectCustomerDailyReport({...opts, db: fakeDb({coverage: null})});
+  assert.equal(report.summary.day.monitor, 0);
+  assert.equal(report.summary.coverageComplete, false);
+  assert.equal(report.evidence.handling.coverageComplete, false);
+  assert.ok(report.warnings.some(warning => warning.code === 'handling_history_incomplete' && warning.blocking));
+  const malformed = await collectCustomerDailyReport({...opts, db: fakeDb({coverage: '2026-08-01T00:00:00Z', handlingEvents: [event(1, undefined)], handlingPosts: [record(1)]})});
+  assert.equal(malformed.summary.coverageComplete, false);
+  assert.deepEqual(malformed.evidence.handling.malformedEventIds, [ID(801)]);
+});
+
+test('high-heat posts expose current handling status and only the active Feishu table number', async () => {
+  const heatPosts = [record(1, {status: 'negative_feishu', feishu_table_no: ' 表 001 '}),
+    record(2, {status: 'negative_cold', feishu_table_no: '旧表 002'}),
+    record(3, {status: 'negative_comment', feishu_table_no: '旧表 003'})];
+  const db = fakeDb({heatPosts, observations: heatPosts.map((row, index) => observation(index + 1, 320 - index, d(7)))});
+  const report = await collectCustomerDailyReport({...opts, db});
+  assert.equal(report.highHeat[0].status, 'negative_feishu');
+  assert.equal(report.highHeat[0].feishuTableNo, '表 001');
+  assert.equal(report.highHeat[1].status, 'negative_cold');
+  assert.equal(Object.hasOwn(report.highHeat[1], 'feishuTableNo'), false);
+  assert.equal(Object.hasOwn(report.highHeat[2], 'feishuTableNo'), false);
+  assert.match(db.calls.find(call => call.sql.includes('customer_daily:heat_posts')).sql, /rt\.feishu_table_no/);
 });
 
 test('heat includes every qualifying post (including first capture), enforces exact 168h and >=200', async () => {
@@ -112,7 +199,7 @@ test('heat includes every qualifying post (including first capture), enforces ex
   assert.deepEqual(report.highHeat.map(p => p.heat), [320, 250, 201, 200]);
   assert.equal(report.highHeat.find(p => p.recordId === ID(10)).status, 'unavailable');
   assert.equal(report.highHeat[0].comparisonText, '暂无昨日数据');
-  assert.equal(report.summary.day.monitor, 0, 'patrol heat does not affect first-insert summary');
+  assert.equal(report.collectionSummary.day.monitor, 0, 'patrol heat does not affect first-insert summary');
 });
 
 test('daily comparisons use measured same-day endpoints, permit falls, and handle zero baseline', async () => {
@@ -212,7 +299,7 @@ test('cold list includes older posts, deduplicates reentry, excludes corrections
   assert.equal(report.coldMarked.length, 1);
   assert.equal(report.coldMarked[0].eventId, e1again.id);
   assert.equal(report.coldMarked[0].isHistorical, true);
-  assert.equal(report.summary.day.cold, 0);
+  assert.equal(report.collectionSummary.day.cold, 0);
   assert.deepEqual(report.evidence.cold.withdrawnRecordIds, [ID(2), ID(3)]);
   assert.equal(report.evidence.cold.transitions.length, 4);
   assert.equal(report.evidence.cold.coverageComplete, true);
@@ -220,8 +307,8 @@ test('cold list includes older posts, deduplicates reentry, excludes corrections
 
 test('zero records is a report; unknown historical audit coverage never claims certain zero cold events', async () => {
   const report = await collectCustomerDailyReport({...opts, db: fakeDb({coverage: null})});
-  assert.equal(report.summary.day.monitor, 0);
-  assert.equal(report.summary.day.inProgress, null);
+  assert.equal(report.collectionSummary.day.monitor, 0);
+  assert.equal(report.collectionSummary.day.inProgress, null);
   assert.equal(report.evidence.cold.coverageComplete, false);
   assert.ok(renderCustomerDailyReportText(report).includes('暂未检出。'));
   assert.ok(!renderCustomerDailyReportText(report).includes('本期无冷处理负面帖子'));
@@ -283,7 +370,7 @@ test('real generic capture, unattended children and keyword parents expose sync 
 test('HTML, copy text and editable monthly workbook preserve counts, all links and external text safely', async () => {
   const injectedTitle = '=HYPERLINK("https://bad.example","<script>alert(1)</script>")';
   const rows = [1, 2, 3, 4].map(i => record(i, {status: 'negative_cold', title: i === 1 ? injectedTitle : `帖子${i}`}));
-  const report = await collectCustomerDailyReport({...opts, db: fakeDb({month: rows, heatPosts: rows,
+  const report = await collectCustomerDailyReport({...opts, db: fakeDb({month: rows, heatPosts: rows, handlingPosts: rows, handlingEvents: rows.map((r, i) => event(i + 1, 'unhandled')),
     observations: rows.map((r, i) => observation(i + 1, 320 - i, d(7))), events: rows.map((r, i) => event(i + 1, 'unhandled')), coldPosts: rows})});
   report.version = 2;
   const html = renderCustomerDailyReportHtml(report);
@@ -296,19 +383,30 @@ test('HTML, copy text and editable monthly workbook preserve counts, all links a
   const workbook = buildCustomerDailyReportWorkbook(report);
   assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '本期冷处理']);
   const summary = workbook.getWorksheet('日报');
-  assert.equal(summary.getCell('B11').value, 4);
-  for (const cell of ['G11', 'H11', 'I11']) assert.equal(summary.getCell(cell).value, 0);
-  assert.equal(summary.getCell('F4').value, '负面-冷处理');
-  assert.equal(summary.getCell('H4').value, '负面-负面处理流程');
-  assert.equal(summary.getCell('H4').isMerged, false);
-  assert.deepEqual(summary.getCell('B12').value, {formula: 'SUM(B5:B11)', result: 4});
+  const summaryDates = [], mtdRows = [];
+  summary.eachRow(row => {
+    if (row.getCell(1).value === '2026/9/7') summaryDates.push(row.number);
+    if (row.getCell(1).value === 'MTD') mtdRows.push(row.number);
+  });
+  assert.equal(summaryDates.length, 2, 'handling and collection have independent daily rows');
+  assert.equal(mtdRows.length, 2);
+  for (const rowNumber of summaryDates) assert.equal(summary.getCell(rowNumber, 2).value, 4);
+  for (const column of [7, 8, 9]) assert.equal(summary.getCell(summaryDates[0], column).value, 0);
+  assert.equal(summary.getCell('F4').value, '负面');
+  assert.equal(summary.getCell('F5').value, '冷处理');
+  assert.equal(summary.getCell('H5').value, '走负面处理流程');
+  for (const rowNumber of mtdRows) {
+    const value = summary.getCell(rowNumber, 2).value;
+    assert.equal(typeof value === 'number' ? value : value.result, 4);
+  }
+  assert.equal(summary.getCell(mtdRows[1], 2).value.formula, undefined, 'collection MTD is distinct, not a daily SUM formula');
   assert.equal(workbook.getWorksheet('高热负面').getCell('B5').value.text, injectedTitle);
   assert.equal(workbook.getWorksheet('高热负面').getCell('B5').value.formula, undefined);
   assert.equal(workbook.getWorksheet('高热负面').getCell('B8').value.hyperlink, rows[3].url);
   assert.equal(workbook.getWorksheet('本期冷处理').getCell('B8').value.hyperlink, rows[3].url);
   const buffer = await workbook.xlsx.writeBuffer();
   const roundTrip = new workbook.constructor(); await roundTrip.xlsx.load(buffer);
-  assert.equal(roundTrip.getWorksheet('日报').getCell('B11').value, 4);
-  assert.equal(roundTrip.getWorksheet('日报').getCell('G11').value, 0);
+  assert.equal(roundTrip.getWorksheet('日报').getCell(summaryDates[0], 2).value, 4);
+  assert.equal(roundTrip.getWorksheet('日报').getCell(summaryDates[0], 7).value, 0);
   assert.equal(roundTrip.getWorksheet('高热负面').getCell('B5').value.text, injectedTitle);
 });

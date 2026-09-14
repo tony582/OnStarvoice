@@ -85,7 +85,7 @@ test('至境哨兵不会扩展为所有至境车型舆情', () => {
 });
 
 test('后台最终标注以整体范围为准并保留当前关键词归属', () => {
-  assert.equal(RECORD_CLASSIFICATION_PROMPT_VERSION, 'record-topic-v4');
+  assert.equal(RECORD_CLASSIFICATION_PROMPT_VERSION, 'record-topic-v6');
   const intent = resolveMonitoringIntent('凯迪拉克OTA');
   const prompt = buildSystemPrompt(BRAND, intent);
   const userMessage = buildUserMessage({

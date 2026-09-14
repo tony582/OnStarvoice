@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildCustomerDailyReportWorkbook, renderCustomerDailyReportHtml, renderCustomerDailyReportText, renderCustomerDailyReportMessageHtml, renderCustomerDailyReportMessageText } from '../server/services/customer-daily-report-render.js';
-import { customerDailySummaryRows, customerDailyPostComparison, customerDailyColdTitle } from '../server/services/customer-daily-report-presentation.js';
+import { customerDailySummaryRows, customerDailyPostComparison, customerDailyColdTitle, customerDailyPostStatus } from '../server/services/customer-daily-report-presentation.js';
 
 function fixture() {
   const counts = {monitor: 126, sdb: 112, positive: 16, neutral: 75, negative: 18, cold: 8, inProgress: null, processed: null};
@@ -111,4 +111,59 @@ test('old or partly classified snapshots show list totals without inventing a hi
   assert.equal(customerDailyColdTitle(old), '三、本期冷处理负面帖：2 条');
   assert.equal(customerDailyColdTitle({coldMarked: [{isHistorical: false}]}), '三、本期冷处理负面帖：1 条');
   assert.equal(customerDailyColdTitle({coldMarked: []}), '三、本期冷处理负面帖：0 条');
+});
+
+function handlingFixture() {
+  const source = fixture();
+  const value = {monitor: 3, sdb: 2, positive: 1, neutral: 0, negative: 1, cold: 0, comment: 0, negativeProcess: 1, negativeOther: 0};
+  source.schemaVersion = 3;
+  source.summary = {format: 'daily_handling_v3', day: value, mtd: {...value, monitor: 6}, rows: [
+    {date: '2026-09-05', isWorkingDay: false, counts: {...value, monitor: 0}},
+    {date: '2026-09-06', isWorkingDay: false, counts: value},
+    {date: '2026-09-07', isWorkingDay: true, counts: value},
+  ]};
+  source.collectionSummary = {format: 'daily_disposition_v2', day: {...value, monitor: 10}, mtd: {...value, monitor: 17}, rows: [
+    {date: '2026-09-05', isWorkingDay: false, counts: {monitor: 0}},
+    {date: '2026-09-07', isWorkingDay: true, counts: {...value, monitor: 10}},
+  ]};
+  source.highHeat = ['negative_cold', 'negative_comment', 'negative_feishu', undefined].map((status, i) => ({...source.highHeat[0], status, feishuTableNo: i === 2 ? 'FS-2026-08' : undefined}));
+  return source;
+}
+
+test('v3 separates handling and collection counts, omits empty holidays, and exports actual high heat statuses', async () => {
+  const source = handlingFixture();
+  const saved = structuredClone(source);
+  const html = renderCustomerDailyReportHtml(source);
+  const text = renderCustomerDailyReportText(source);
+  for (const output of [html, text]) {
+    assert.ok(output.indexOf('每日舆情处理量') < output.indexOf('实际采集量'));
+    assert.ok(output.indexOf('实际采集量') < output.indexOf('三、7天内'));
+    assert.match(output, /冷处理/); assert.match(output, /评论区留言/);
+    assert.match(output, /处理状态：飞书表 · FS-2026-08/); assert.match(output, /处理状态：状态未记录/);
+    assert.doesNotMatch(output, /2026\/9\/5|休息日|休假|>休</);
+    assert.match(output, /2026\/9\/6/);
+  }
+  assert.match(html, /colspan="4" scope="colgroup">负面/);
+  assert.match(html, /本月处理累计/); assert.match(html, /本月采集去重累计/);
+  assert.match(text, /MTD\t6\t/); assert.match(text, /MTD\t17\t/);
+  const workbook = buildCustomerDailyReportWorkbook(source);
+  const reopened = new workbook.constructor();
+  await reopened.xlsx.load(await workbook.xlsx.writeBuffer());
+  const sheet = reopened.getWorksheet('日报');
+  const mtd = [];
+  sheet.eachRow(row => { if (row.getCell(1).value === 'MTD') mtd.push(row.getCell(2).value); });
+  assert.deepEqual(mtd, [{formula: 'SUM(B6:B7)', result: 6}, 17], 'handling uses daily SUM with saved result; collection retains its distinct saved MTD');
+  assert.ok(sheet.model.merges.includes('F4:I4'));
+  assert.equal(sheet.getCell('A6').value, '2026/9/6');
+  assert.equal(reopened.getWorksheet('高热负面').getCell('F7').value, '飞书表 · FS-2026-08');
+  assert.deepEqual(source, saved);
+});
+
+
+test('v3 status labels distinguish missing and unknown states and attach numbers only to feishu handling', () => {
+  assert.equal(customerDailyPostStatus({}), '状态未记录');
+  assert.equal(customerDailyPostStatus({status: 'future_state'}), '状态待核对');
+  assert.equal(customerDailyPostStatus({status: 'negative_feishu'}), '飞书表');
+  assert.equal(customerDailyPostStatus({status: 'negative_feishu', feishuTableNo: '  FS-001\n'}), '飞书表 · FS-001');
+  assert.equal(customerDailyPostStatus({status: 'negative_cold', feishuTableNo: 'old-number'}), '冷处理');
 });

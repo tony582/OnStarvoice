@@ -9,6 +9,8 @@ import {
   getCommentRiskAttentionPolicy,
 } from '../services/comment-risk-attention.js';
 
+import { recordTriageAdmissionSql } from '../services/record-triage-admission.js';
+
 const router = Router();
 
 // 侧边栏徽标计数:单次往返。triagePending 与收件箱「待处理队列」同条件。
@@ -118,6 +120,7 @@ router.get('/events', requireTenantAccess, async (req, res, next) => {
       LEFT JOIN records r ON r.id = ir.record_id
         AND r.tenant_id = i.tenant_id
         AND r.business_visibility = 'eligible'
+        AND (${recordTriageAdmissionSql('r')})
       ${where}
       GROUP BY i.id
       ORDER BY
@@ -149,7 +152,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE sentiment = '') AS pending_label,
         COALESCE(SUM(likes + comments_count + collects + shares), 0) AS total_interaction
       FROM records
-      WHERE tenant_id = $1 AND business_visibility = 'eligible'
+      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND (${recordTriageAdmissionSql('records')})
     `, [req.tenantId, since, todayStart.toISOString()]);
 
     const issueStats = await queryOne(`
@@ -183,6 +186,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       WHERE r.tenant_id = $1
         AND r.record_type NOT IN ('official_content', 'blogger_profile')
         AND r.business_visibility = 'eligible'
+        AND (${recordTriageAdmissionSql('r')})
     `, [req.tenantId]);
 
     const operationsStats = await queryOne(`
@@ -194,6 +198,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
            AND observed_record.tenant_id = ro.tenant_id
          WHERE ro.tenant_id = $1
            AND observed_record.business_visibility = 'eligible'
+           AND (${recordTriageAdmissionSql('observed_record')})
            AND ro.monitor_execution_id IS NOT NULL
            AND ro.captured_at >= $2) AS today_monitor_hits,
         (SELECT COUNT(*)
@@ -247,6 +252,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       WHERE r.tenant_id = $1
         AND r.record_type NOT IN ('official_content', 'blogger_profile')
         AND r.business_visibility = 'eligible'
+        AND (${recordTriageAdmissionSql('r')})
         AND COALESCE(rt.status, 'unhandled') = 'unhandled'
         AND rt.archived_at IS NULL
       ORDER BY
@@ -261,7 +267,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE created_at >= $2) AS period_new,
         MAX(last_seen_at) AS last_seen_at
       FROM records
-      WHERE tenant_id = $1 AND business_visibility = 'eligible'
+      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND (${recordTriageAdmissionSql('records')})
       GROUP BY platform
       ORDER BY count DESC
     `, [req.tenantId, since]);
@@ -271,7 +277,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) AS total,
         COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative
       FROM records
-      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND created_at >= $2
+      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND (${recordTriageAdmissionSql('records')}) AND created_at >= $2
       GROUP BY day
       ORDER BY day ASC
     `, [req.tenantId, since]);
@@ -280,7 +286,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       SELECT id, platform, record_type, title, content, author_name, url, likes,
         comments_count, collects, shares, sentiment, keyword, created_at, last_seen_at
       FROM records
-      WHERE tenant_id = $1 AND business_visibility = 'eligible'
+      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND (${recordTriageAdmissionSql('records')})
       ORDER BY created_at DESC
       LIMIT 8
     `, [req.tenantId]);
@@ -336,6 +342,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LEFT JOIN monitor_subscriptions ms ON ms.id = me.subscription_id AND ms.tenant_id = ro.tenant_id
       WHERE ro.tenant_id = $1
         AND r.business_visibility = 'eligible'
+        AND (${recordTriageAdmissionSql('r')})
         AND ro.monitor_execution_id IS NOT NULL
       ORDER BY ro.captured_at DESC
       LIMIT 8
@@ -348,7 +355,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE created_at >= $2) AS period_new,
         MAX(created_at) AS last_created_at
       FROM records
-      WHERE tenant_id = $1 AND business_visibility = 'eligible'
+      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND (${recordTriageAdmissionSql('records')})
       GROUP BY COALESCE(NULLIF(record_type, ''), 'single_note')
       ORDER BY count DESC
     `, [req.tenantId, since]);
@@ -396,7 +403,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) FILTER (WHERE COALESCE(sentiment, '') = '') AS unlabeled,
         COUNT(*) AS total
       FROM records
-      WHERE tenant_id = $1 AND business_visibility = 'eligible'
+      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND (${recordTriageAdmissionSql('records')})
     `, [req.tenantId]);
 
     // 分平台风险(各平台总量与负面数,指挥中心)
@@ -405,7 +412,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         COUNT(*) AS total,
         COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative
       FROM records
-      WHERE tenant_id = $1 AND business_visibility = 'eligible'
+      WHERE tenant_id = $1 AND business_visibility = 'eligible' AND (${recordTriageAdmissionSql('records')})
       GROUP BY platform
       ORDER BY negative DESC, total DESC
     `, [req.tenantId]);

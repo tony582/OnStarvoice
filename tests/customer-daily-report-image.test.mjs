@@ -47,3 +47,21 @@ test('invalid core summary values cannot generate a seemingly valid numeric imag
   assert.throws(()=>renderCustomerDailySummaryPng(snapshot({monitor:1.5})),/数值无效/);
   assert.throws(()=>renderCustomerDailySummaryPng({reportDate:'invalid'}),/尚未就绪/);
 });
+
+test('v3 PNG contains two distinct tables, grouped handling headers and no empty holiday rows', () => {
+  const value = {monitor: 2, sdb: 2, positive: 1, neutral: 0, negative: 1, cold: 1, comment: 0, negativeProcess: 0, negativeOther: 0};
+  const source = {reportDate: '2026-09-07', summary: {format: 'daily_handling_v3', day: value, mtd: value, rows: [
+    {date: '2026-09-05', isWorkingDay: false, counts: {monitor: 0}}, {date: '2026-09-06', isWorkingDay: false, counts: value},
+  ]}, collectionSummary: {format: 'daily_disposition_v2', day: value, mtd: {...value, monitor: 15}, rows: [
+    {date: '2026-09-05', isWorkingDay: false, counts: {monitor: 0}}, {date: '2026-09-07', isWorkingDay: true, counts: value},
+  ]}};
+  const svg = renderCustomerDailySummarySvg(source);
+  for (const label of ['每日舆情处理量', '实际采集量', '走负面处理流程', '本月处理累计', '本月采集去重累计', '2026/9/6', '采集量']) assert.ok(svg.includes(label));
+  assert.doesNotMatch(svg, /2026\/9\/5|休假|>休<|NaN|undefined/);
+  assert.equal((svg.match(/>MTD</g) || []).length, 2);
+  const png = renderCustomerDailySummaryPng(source);
+  assert.equal(png.readUInt32BE(16), 1407);
+  assert.equal(png.readUInt32BE(20), 606);
+  source.collectionSummary.mtd.monitor = -1;
+  assert.throws(() => renderCustomerDailySummaryPng(source), /数值无效/);
+});

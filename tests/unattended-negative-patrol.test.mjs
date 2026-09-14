@@ -11,7 +11,10 @@ import {
   claimUnattendedNegativePatrolItem,
   completeUnattendedNegativePatrolItem,
   failUnattendedNegativePatrolItem,
+  normalizeNegativePatrolTriageStatuses,
+  DEFAULT_NEGATIVE_PATROL_TRIAGE_STATUSES,
 } from '../server/services/unattended-negative-patrol.js';
+import { normalizeOrchestrationRequest, hashOrchestrationRequest } from '../server/services/capture-orchestration.js';
 
 const tenantId = '10000000-0000-4000-8000-000000000001';
 const recordId = '20000000-0000-4000-8000-000000000001';
@@ -53,6 +56,60 @@ test('window is precisely 168 hours, immutable across timezones and rejects ambi
   assert.throws(() => normalizeUnattendedNegativePatrolScope({...scope, keywordIds: ['not-uuid']}));
 });
 
+test('patrol handling-status settings validate explicit selections and preserve omitted legacy defaults', () => {
+  assert.equal(DEFAULT_NEGATIVE_PATROL_TRIAGE_STATUSES.length, 8);
+  assert.ok(!normalizeNegativePatrolTriageStatuses().includes('reviewed_non_monitor'));
+  assert.deepEqual(normalizeUnattendedNegativePatrolScope(scope).triageStatuses,
+    [...DEFAULT_NEGATIVE_PATROL_TRIAGE_STATUSES]);
+  assert.deepEqual(normalizeNegativePatrolTriageStatuses(['reviewed_non_monitor', 'replied', 'replied']),
+    ['replied', 'reviewed_non_monitor']);
+  for (const triageStatuses of [[], null, 'replied', ['unknown'], ['replied', 'unknown'], [null]]) {
+    assert.throws(() => normalizeUnattendedNegativePatrolScope({...scope, triageStatuses}),
+      {code: 'invalid_negative_patrol_scope', status: 400});
+  }
+});
+
+test('saved patrol selection is canonical and participates in request identity', () => {
+  const plan = {platform: 'douyin', executionMode: 'unattended_plan', distributionMode: 'elastic_pool',
+    keywords: ['OTA'], negativePatrol: {enabled: true}};
+  const legacy = normalizeOrchestrationRequest(plan);
+  assert.deepEqual(legacy.taskInput.negativePatrol.triageStatuses, [...DEFAULT_NEGATIVE_PATROL_TRIAGE_STATUSES]);
+  const selected = triageStatuses => normalizeOrchestrationRequest({...plan, negativePatrol: {enabled: true, triageStatuses}});
+  const first = selected(['replied', 'reviewed_non_monitor']);
+  assert.deepEqual(first.taskInput.negativePatrol.triageStatuses, ['replied', 'reviewed_non_monitor']);
+  assert.equal(hashOrchestrationRequest(first), hashOrchestrationRequest(selected(['reviewed_non_monitor', 'replied', 'replied'])));
+  assert.notEqual(hashOrchestrationRequest(first), hashOrchestrationRequest(selected(['replied'])));
+  assert.throws(() => selected([]), {code: 'invalid_negative_patrol_scope'});
+});
+
+test('selected statuses control preview and claims without bypassing independent source and human protections', async () => {
+  const selectedScope = {...scope, triageStatuses: ['reviewed_non_monitor']};
+  const selected = record({triage_status: 'reviewed_non_monitor'});
+  assert.equal(evaluateUnattendedNegativePatrolRecord(selected, scope).eligible, false);
+  assert.equal(evaluateUnattendedNegativePatrolRecord(selected, selectedScope).eligible, true);
+  assert.equal(evaluateUnattendedNegativePatrolRecord(record({}), selectedScope).eligible, false);
+  assert.equal(evaluateUnattendedNegativePatrolRecord(record({triage_status: 'unavailable'}), scope).eligible, true);
+  for (const changes of [{archived_at: '2026-09-07'}, {content_availability_status: 'deleted'},
+    {manual_overrides: {relevance: 'irrelevant'}}]) {
+    assert.equal(evaluateUnattendedNegativePatrolRecord({...selected, ...changes}, selectedScope).eligible, false);
+  }
+  const preview = await loadUnattendedNegativePatrolCandidates({async queryAll() { return [selected, record({})]; }}, selectedScope);
+  assert.deepEqual(preview.candidates.map(item => item.recordId), [selected.id]);
+  const result = await claimUnattendedNegativePatrolItem({
+    async queryOne(sql) {
+      if (sql.includes('FROM records r')) return record({});
+      if (sql.includes('pg_try_advisory')) return {locked: true};
+      if (sql.includes('FOR UPDATE')) return state({});
+      throw new Error(`Unexpected query: ${sql}`);
+    }, async execute() {},
+  }, {...claim, triageStatuses: ['reviewed_non_monitor']});
+  assert.equal(result.claimed, false);
+  assert.equal(result.reason, 'triage_unhandled');
+  const accepted = await claimUnattendedNegativePatrolItem(claimDb({row: selected}),
+    {...claim, triageStatuses: ['reviewed_non_monitor']});
+  assert.equal(accepted.claimed, true);
+});
+
 test('first collection has exact inclusive-start and exclusive-end boundaries independent of publication', () => {
   assert.equal(evaluateUnattendedNegativePatrolRecord(record({created_at: '2026-09-01T01:00:00Z'}), scope).eligible, true);
   assert.equal(evaluateUnattendedNegativePatrolRecord(record({created_at: '2026-09-01T00:59:59.999Z'}), scope).reason, 'outside_window');
@@ -81,7 +138,6 @@ test('cross-midnight windows remain 168 hours and later captures never renew old
 test('human exclusion, archive, availability and business visibility dominate first-time eligibility', () => {
   const exclusions = [
     [{triage_status: 'reviewed_non_monitor'}, 'triage_reviewed_non_monitor'],
-    [{triage_status: 'unavailable'}, 'triage_unavailable'],
     [{triage_status: 'false_positive'}, 'triage_false_positive'],
     [{archived_at: '2026-09-07'}, 'archived'],
     [{content_availability_status: 'deleted'}, 'content_unavailable'],
@@ -263,7 +319,7 @@ function claimDb({row = record(), stored = state(), owner = null, active = null}
 
 test('claim preserves live exclusions and failure controls while same-day success remains claimable', async () => {
   for (const options of [
-    {row: record({triage_status: 'unavailable'})},
+    {row: record({triage_status: 'unavailable', content_availability_status: 'unavailable'})},
     {stored: state({cooldown_until: '2026-09-08T01:30:00Z'})},
     {stored: state({needs_action: true})},
   ]) {

@@ -4,6 +4,7 @@ import { api } from '@/lib/api'
 import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { getCover } from '@/components/shared/RecordDrawer'
+import { PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
 import {
   FeishuTableNumberControl,
   type FeishuTableNumberSaveResult,
@@ -191,8 +192,10 @@ function BoardCard({ record: r, canWrite, dragging, onOpen, onSaveFeishuTableNo,
         dragging && 'opacity-40',
       )}
     >
-      <div className="mb-1.5 flex items-center gap-1.5">
+      <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
         <StatusBadge tone={tone}>{tone === 'negative' ? '负面' : tone === 'positive' ? '正面' : '中性'}</StatusBadge>
+        <PostIntentBadge record={r} />
+        <PostRelevanceBadge record={r} />
         {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
         {canWrite && <GripVertical className="ml-auto h-3.5 w-3.5 cursor-grab text-muted-foreground/40 opacity-0 transition-opacity group-hover:opacity-100" />}
       </div>

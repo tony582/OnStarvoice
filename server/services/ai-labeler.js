@@ -2,7 +2,7 @@
  * AI 标签引擎 — 多 LLM 提供商支持
  */
 
-import { queryOne, queryAll, getSetting } from '../db/init.js';
+import { queryOne, queryAll, getSetting, withTransaction } from '../db/init.js';
 import {runWithTenantAiAdmission} from './ai-admission.js';
 import {
   selectActiveActiveModel,
@@ -30,8 +30,12 @@ import {
 } from './llm-relay.js';
 import { requestLlmRelayAgentCompletion } from './llm-relay-jobs.js';
 import { COMMENT_SALES_PROMPT_RULES, normalizeSalesLeadJudgment } from './comment-sales-judgment.js';
+import { ONSTAR_SERVICE_AD_PROMPT_RULES, normalizeOnstarServiceAdJudgment } from './onstar-service-ad-judgment.js';
+import {
+  formatGmAliasesForPrompt, getRecordEvidenceSources, isSentryEvidenceScope, normalizeJudgmentConfidence, normalizeMonitoringEvidence, normalizePostIntent,
+} from './record-content-judgment.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v4';
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v6';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
 const LLM_PROVIDER_ALIASES = Object.freeze({
@@ -111,6 +115,13 @@ ${formatMonitoringIntentForPrompt(intent)}
 - relevant：内容有证据指向任一监测对象与任一监测主题的合理组合，不要求匹配本次采集关键词。
 - irrelevant：内容明确不属于全部监测关键词、对象和主题，或只是人名、地名、谐音、标签、作者名等噪声巧合。
 - uncertain：已经出现整体监控对象或主题的直接线索，但正文、图片、视频或评价对象仍不足以确认。
+${isSentryEvidenceScope({ keyword: intent.keyword }) ? `${formatGmAliasesForPrompt()}
+- 哨兵/驻车监控是跨品牌的通用功能。只有搜索任务叫“别克哨兵”或“至境哨兵”、正文只写“我的车”“哨兵失灵”“被开门杀”，不能确认属于通用品牌；缺乏明确品牌/车型证据时为 uncertain，明确讨论其他品牌时为 irrelevant。
+- 车型名称、简称和可从上下文理解的车型写法也是关联线索，例如“昂科威Plus哨兵没触发”“L7哨兵模式怎么开”“E5驻车监控异常”，不要求再重复品牌全称。L7、E5 等简称不能因跨品牌或未写品牌就一律判 uncertain/irrelevant；结合主帖全文、车辆功能与监控语境判断，能够指向通用相关车型时判 relevant。主帖明确讨论“理想L7”等其他品牌且与全部监控对象无关时仍判 irrelevant。
+- CT50 等疑似车型写法需结合全文理解，不因它不是标准全称、或模型引用不完整就否定原帖相关性。引用必须保留原文完整写法，不能把原文 CT50 截成 CT5，也不能擅自声明 CT50 是正式车型名。相关性结论与引用格式分别处理。只有标签或作者昵称提到品牌也不够；原帖图片/视频没有提供已核验的文字时，不得猜测自己看到了车标或车型。
+- 中英文全称、简称、历史车型及型号变体都应考虑，例如 LaCrosse/君越、Regal/君威、Monza/科鲁泽、CT5/CT 5/CT-5/ＣＴ５；参考表未收录不等于无关。若根据全文识别出表外的真实品牌或车型名称，应给出对应主帖 source、逐字 quote、原文完整 entity，entityType=brand 或 model，确认属于上汽通用时 manufacturer=saic_gm。不得把“我的车”“哨兵”“车型”等泛称作为名称；不得把其他品牌、SGMW/上汽通用五菱或单独 SAIC/上汽等同于上汽通用。
+- “凯迪”等口语简称、BK/KDLK/XFL等拼音首字母以及非标准拼写也须结合全文判断，不能仅凭首字母断定品牌；语境支持归属时使用上述逐字实体证据，不擅自改写原文或声明它们是官方品牌名称。
+- monitoringEvidence 逐字引用主帖标题、正文或提供的当前媒体逐字稿中的品牌/车型证据，不能引用采集关键词、评论、作者名或只附着的话题标签。不能确认时 status=needs_review，evidence=[]；这表示待核实，不等于已确认无关。` : ''}
 
 第二步单独判断 currentKeywordMatch：
 - relevant：符合本次搜索词的目标对象和目标主题。
@@ -125,6 +136,7 @@ ${formatMonitoringIntentForPrompt(intent)}
 - 明确的故障、失败、误拨、抱怨、指责、误导、收费争议或维权诉求判 negative；客观询问且无明显不满判 neutral + inquiry。
 - 内容相关与内容负面是两个独立结论；壁纸、教程、咨询可以 relevant 但 sentiment=neutral。
 - “安全”“安全感”“隐私”等普通词本身不代表负面或风险，必须结合完整上下文。
+${ONSTAR_SERVICE_AD_PROMPT_RULES}
 
 校准样例：
 - “凯迪拉克CT5经常莫名拨打紧急救援电话”：即使采集关键词是“凯迪拉克车机升级”，currentKeywordMatch=irrelevant；但属于上汽通用安全救援监测，relevance=relevant、sentiment=negative、category=safety_rescue。
@@ -141,13 +153,16 @@ ${formatMonitoringIntentForPrompt(intent)}
   "matchedTopics": ["命中的整体监测关键词或主题"],
   "relevanceConfidence": 0.0-1.0,
   "relevanceReason": "同时说明整体相关性与当前关键词关系",
+  "monitoringEvidence": {"status":"confirmed|needs_review","evidence":[{"source":"title|content|transcript","quote":"能在对应主帖来源核验的完整短句","entity":"原文中的完整品牌或车型名称","entityType":"brand|model","manufacturer":"saic_gm|other|unknown"}]},
   "noiseType": "none|place_name|person_name|real_estate|store|homophone|generic_word|other",
   "targetEntity": "内容实际讨论或评价的对象",
   "sentimentTarget": "情绪实际指向的对象",
   "evidence": ["支持判断的原文短语"],
   "sentiment": "positive|neutral|negative|null",
   "sentimentStatus": "classified|not_applicable",
-  "intent": "inquiry|complaint|share|suggestion|other",
+  "servicePromotion": {"type":"third_party_service_ad|mixed|not_ad|uncertain","speaker":"merchant|owner|quoted|other|uncertain","brandEvaluation":"none|positive|negative|uncertain","statements":[{"source":"title|content|transcript","quote":"对应主帖中的完整原句（保留句尾标点）","role":"service_offer|marketing_pain_point|marketing_benefit|call_to_action|contact_or_header|brand_evaluation|owner_experience|quoted_claim|other"}]},
+  "intent": "share|other|complaint|inquiry",
+  "intentReason": "说明发帖者的主要表达目的，不超过80字",
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|other",
   "subcategory": "具体子分类（中文）",
   "sourceType": "ugc|pgc|employee|dealer|other",
@@ -157,7 +172,8 @@ ${formatMonitoringIntentForPrompt(intent)}
 
 分类说明：
 - sentiment: positive(推荐、好评、感谢), neutral(普通分享、使用教程), negative(投诉、吐槽、故障)
-- intent: inquiry(咨询问题), complaint(投诉维权), share(分享体验), suggestion(建议改进), other
+- intent 独立于情感和相关性，按发帖者的主要目的四选一：share(分享：经历、体验、知识、教程或信息分享)，other(其他：纯营销、改进建议及无法归入其余三类的表达)，complaint(投诉/抱怨：诉说故障、不满、批评、质疑或维权，含暗讽和反问)，inquiry(咨询：真实寻求事实、方法、价格或购买/使用帮助)。不要把投诉中的“为什么这么差”“这也能用？”等反问当咨询；不要因为一句咨询带问号就忽略整篇的主要目的。
+- servicePromotion 专门核对第三方设备拆检/安保加装广告：只有作者自己是招揽服务的商家、全文没有实际品牌褒贬或车主经历时，type=third_party_service_ad、speaker=merchant、brandEvaluation=none，并按完整原句逐句列出全部主帖标题、正文及可信当前逐字稿（纯话题标签除外）的来源和角色。使用句号/问号/叹号/分号或换行断句，原样保留句尾标点。服务=service_offer；泛指二手车买家担心隐藏GPS/隐私、影响成交等营销痛点=marketing_pain_point；信任、增值等卖点=marketing_benefit；招揽联系=call_to_action；地址电话或服务标题=contact_or_header。不得遗漏广告外的实际故障、品牌攻击、引述批评等句子；这些情况必须填 mixed/not_ad，信息不足用 uncertain。只为需要核对的纯第三方服务广告列出 statements，最多20句，每句不超过400字、合计不超过6000字，超过限制则 uncertain、statements=[]，不截短或漏句。普通非广告及混合帖子 statements=[]，不要编造补全。该结构与 sentiment 分开判断。
 - category:
   - safety_rescue: SOS紧急救援、碰撞自动求助、道路救援
   - feature_usage: 远程启动、车况检测、车辆定位、OTA升级、车机流量
@@ -188,7 +204,7 @@ export function buildUserMessage(record) {
     text += `全部召回关键词（只用于归属，不覆盖整体相关性）：${observedKeywords.slice(0, 30).join('、')}\n`;
   }
   if (record.title) text += `标题：${record.title}\n`;
-  if (record.content) text += `正文：${truncatePromptText(record.content, 2000)}\n`;
+  if (record.content) text += `正文：${truncatePromptText(record.content, 8000)}\n`;
   if (record.author_name) text += `作者：${record.author_name}\n`;
   if (record.platform) text += `平台：${record.platform}\n`;
   if (record.tags) {
@@ -197,6 +213,8 @@ export function buildUserMessage(record) {
       if (tags.length > 0) text += `标签：${tags.join(', ')}\n`;
     } catch {}
   }
+  const transcript = getRecordEvidenceSources(record).find(source => source.source === 'transcript');
+  if (transcript) text += `当前媒体已完成的逐字稿：${truncatePromptText(transcript.text, 6000)}\n`;
   if (record.likes || record.comments_count || record.collects || record.shares) {
     text += `互动：${record.likes}赞 ${record.comments_count}评论 ${record.collects}收藏 ${record.shares || 0}转发\n`;
   }
@@ -1163,7 +1181,7 @@ export async function probeDeepSeekPrimaryModel({tenantId, model}) {
 function normalizeRelevance(value) {
   const normalized = String(value || '').trim().toLowerCase();
   if (['relevant', 'irrelevant', 'uncertain'].includes(normalized)) return normalized;
-  return 'relevant';
+  return 'uncertain';
 }
 
 function normalizeCurrentKeywordMatch(value) {
@@ -1186,6 +1204,8 @@ export function normalizeRecordClassificationResult(result) {
   const normalized = {
     ...result,
     relevance,
+    intent: normalizePostIntent(result?.intent),
+    intentReason: String(result?.intentReason || '').trim().slice(0, 500),
     currentKeywordMatch,
     matchedTopics: Array.isArray(result?.matchedTopics ?? result?.matched_topics)
       ? (result.matchedTopics ?? result.matched_topics)
@@ -1193,14 +1213,13 @@ export function normalizeRecordClassificationResult(result) {
         .filter(Boolean)
         .slice(0, 30)
       : [],
-    relevanceConfidence: Number(result?.relevanceConfidence ?? result?.relevance_confidence ?? result?.confidence ?? 0),
+    relevanceConfidence: normalizeJudgmentConfidence(result?.relevanceConfidence ?? result?.relevance_confidence),
     relevanceReason: String(result?.relevanceReason || result?.relevance_reason || ''),
     noiseType: String(result?.noiseType || result?.noise_type || (relevance === 'irrelevant' ? 'other' : 'none')),
   };
   if (relevance === 'irrelevant') {
     normalized.sentiment = '';
     normalized.sentimentStatus = 'not_applicable';
-    normalized.intent = 'other';
     normalized.category = 'other';
     normalized.subcategory = normalized.noiseType || '无关内容';
     normalized.summary = normalized.summary || normalized.relevanceReason || '与当前品牌无关';
@@ -1273,8 +1292,81 @@ function queuePostClassificationTasks({ recordId, tenantId, relevance, sentiment
   }, { label: 'AiPostClassification' });
 }
 
+// Model calls stay outside the transaction. Re-read and lock before persisting,
+// so a later human decision wins and stale text/model results cannot overwrite it.
+export async function persistRecordClassification({ record, labeled, observedKeywords = [] }) {
+  return withTransaction(async tx => {
+    const current = await tx.queryOne(`SELECT *, ai_labeled_at::text AS classification_version
+      FROM records WHERE id = $1 AND tenant_id = $2 FOR UPDATE`, [record.id, record.tenant_id]);
+    if (!current || current.business_visibility !== 'eligible'
+      || ['official_content', 'blogger_profile'].includes(current.record_type)) return null;
+    const modelInput = value => JSON.stringify({
+      message: buildUserMessage({ ...value, observed_keywords: observedKeywords }),
+      evidence: getRecordEvidenceSources(value),
+    });
+    if (modelInput(current) !== modelInput(record)
+      || (current.classification_version || null) !== (record.classification_version || null)) return null;
+    const manuallyProtectedResult = applyManualRelevanceOverride(labeled.result, current.manual_overrides);
+    let effectiveResult = normalizeOnstarServiceAdJudgment(normalizeRecordClassificationResult(manuallyProtectedResult), current, labeled.result);
+    const scoped = isSentryEvidenceScope({ ...current, observed_keywords: observedKeywords });
+    const monitoringEvidence = normalizeMonitoringEvidence(effectiveResult, current);
+    if (scoped && !effectiveResult.manualRelevanceOverride && effectiveResult.relevance === 'relevant'
+      && monitoringEvidence.status !== 'confirmed') {
+      effectiveResult = { ...effectiveResult, relevance: 'uncertain',
+        relevanceReason: `${monitoringEvidence.reason}${effectiveResult.relevanceReason ? `；模型说明：${effectiveResult.relevanceReason}` : ''}` };
+    }
+    const result = {
+      ...effectiveResult,
+      monitoringEvidence: scoped ? monitoringEvidence : undefined,
+      classifierMetadata: {
+        promptVersion: RECORD_CLASSIFICATION_PROMPT_VERSION,
+        provider: labeled.provider,
+        model: labeled.model,
+        monitoringIntentId: labeled.intent.intentId,
+        monitoringIntentVersion: labeled.intent.intentVersion,
+        monitoringObjective: labeled.intent.objective,
+        monitoringScopeId: labeled.tenantScope.scopeId,
+        monitoringScopeVersion: labeled.tenantScope.scopeVersion,
+        sentimentScope: 'main_post_only',
+        commentRiskScope: 'separate_classifier',
+        observedKeywords: observedKeywords.slice(0, 30),
+      },
+    };
+    const publishedTs = String(current.publish_time || '').trim() ? parsePublishTimestamp(current.publish_time, current.created_at) : null;
+    const persisted = await tx.queryOne(`
+      UPDATE records SET
+        sentiment = CASE
+          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'sentiment' THEN sentiment
+          ELSE $1
+        END,
+        intent = $2,
+        category = CASE
+          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'category' THEN category
+          ELSE $3
+        END,
+        subcategory = $4,
+        source_type = $5, ai_summary = $6, ai_confidence = $7,
+        ai_result = $8::jsonb,
+        published_ts = CASE
+          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'publish_time' THEN published_ts
+          ELSE COALESCE($9, published_ts)
+        END,
+        ai_labeled_at = now(), updated_at = now()
+      WHERE id = $10 AND tenant_id = $11
+      RETURNING tenant_id, sentiment
+    `, [
+      result.sentiment || '', result.intent || '', result.category || '', result.subcategory || '',
+      result.sourceType || result.source_type || '', result.summary || '', result.confidence || 0,
+      JSON.stringify(result),
+      publishedTs,
+      record.id, current.tenant_id,
+    ]);
+    return { result, persisted };
+  });
+}
+
 export async function labelRecord(recordId, options = {}) {
-  const record = await queryOne('SELECT * FROM records WHERE id = $1', [recordId]);
+  const record = await queryOne('SELECT *, ai_labeled_at::text AS classification_version FROM records WHERE id = $1', [recordId]);
   if (['official_content', 'blogger_profile'].includes(record?.record_type)) return null;
   if (record?.business_visibility && record.business_visibility !== 'eligible') return null;
   if (!record || (!options.force && record.ai_labeled_at && hasRelevanceResult(record))) return null;
@@ -1302,53 +1394,9 @@ export async function labelRecord(recordId, options = {}) {
       {priority: 'normal', kind: 'record_classification'},
     );
     if (!labeled?.result) return null;
-    const manuallyProtectedResult = applyManualRelevanceOverride(labeled.result, record.manual_overrides);
-    const effectiveResult = normalizeRecordClassificationResult(manuallyProtectedResult);
-    const result = {
-      ...effectiveResult,
-      classifierMetadata: {
-        promptVersion: RECORD_CLASSIFICATION_PROMPT_VERSION,
-        provider: labeled.provider,
-        model: labeled.model,
-        monitoringIntentId: labeled.intent.intentId,
-        monitoringIntentVersion: labeled.intent.intentVersion,
-        monitoringObjective: labeled.intent.objective,
-        monitoringScopeId: labeled.tenantScope.scopeId,
-        monitoringScopeVersion: labeled.tenantScope.scopeVersion,
-        sentimentScope: 'main_post_only',
-        commentRiskScope: 'separate_classifier',
-        observedKeywords: uniqueObservedKeywords.slice(0, 30),
-      },
-    };
-    const publishedTs = String(record.publish_time || '').trim() ? parsePublishTimestamp(record.publish_time, record.created_at) : null;
-    const persisted = await queryOne(`
-      UPDATE records SET
-        sentiment = CASE
-          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'sentiment' THEN sentiment
-          ELSE $1
-        END,
-        intent = $2,
-        category = CASE
-          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'category' THEN category
-          ELSE $3
-        END,
-        subcategory = $4,
-        source_type = $5, ai_summary = $6, ai_confidence = $7,
-        ai_result = $8::jsonb,
-        published_ts = CASE
-          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'publish_time' THEN published_ts
-          ELSE COALESCE($9, published_ts)
-        END,
-        ai_labeled_at = now(), updated_at = now()
-      WHERE id = $10
-      RETURNING tenant_id, sentiment
-    `, [
-      result.sentiment || '', result.intent || '', result.category || '', result.subcategory || '',
-      result.sourceType || result.source_type || '', result.summary || '', result.confidence || 0,
-      JSON.stringify(result),
-      publishedTs,
-      recordId,
-    ]);
+    const saved = await persistRecordClassification({ record, labeled, observedKeywords: uniqueObservedKeywords });
+    if (!saved) return null;
+    const { result, persisted } = saved;
     console.log(`[AI] Record ${recordId} labeled: ${result.relevance}/${result.sentiment}/${result.category}`);
     if (persisted) {
       queuePostClassificationTasks({

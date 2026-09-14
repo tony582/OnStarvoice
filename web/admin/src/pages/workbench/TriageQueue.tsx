@@ -47,6 +47,8 @@ import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 import { useNav } from '@/lib/navigation'
 import { recordDisplayTitle } from '@/lib/record-display'
+import { appendPostIntentFilter, normalizePostIntentFilter } from '@/lib/post-judgment'
+import { PostIntentFilter, PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
 
 interface Pagination { page: number; totalPages: number; total: number }
 interface CustomTagsMutationResponse {
@@ -366,6 +368,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [boardNonce, setBoardNonce] = useState(0)
   const [archiveView, setArchiveView] = useState<ArchiveView>(initial?.bucket === 'archived' ? 'archived' : 'active')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
+  const [intents, setIntents] = useState<string[]>(() => normalizePostIntentFilter(initial?.intent))
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [watchedFilter, setWatchedFilter] = useState(initial?.watched === 'watched' ? 'watched' : '')
   const [keyword, setKeyword] = useState(() => String(initial?.keyword ?? '').trim())
@@ -405,7 +408,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
-  const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${watchedFilter}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${dateRanges.handled.from}|${dateRanges.handled.to}|${pageSize}|${pagination?.page ?? 1}`)
+  const sel = useSelection(`${archiveView}|${triageStatuses}|${risk}|${identity}|${platform}|${sentiment}|${intents}|${watchedFilter}|${keyword}|${customTagIds}|${dateRanges.publish.from}|${dateRanges.publish.to}|${dateRanges.recent.from}|${dateRanges.recent.to}|${dateRanges.first.from}|${dateRanges.first.to}|${dateRanges.handled.from}|${dateRanges.handled.to}|${pageSize}|${pagination?.page ?? 1}`)
 
   const batchRemovalCatalog = (() => {
     const tagsById = new Map<string, CustomTag>()
@@ -445,8 +448,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
     if (watchedFilter) params.set('watched', watchedFilter)
-    if (archiveView === 'archived') params.set('bucket', 'archived')
+    if (archiveView !== 'active') params.set('bucket', archiveView)
     else params.set('queue', 'triage')
+    appendPostIntentFilter(params, intents)
     triageStatuses.forEach(status => params.append('status', status))
     risk.forEach(rk => params.append('risk', rk))
     identity.forEach(id => params.append('identity', id))
@@ -464,7 +468,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.handled.from) params.set('handledFrom', dateRanges.handled.from)
     if (dateRanges.handled.to) params.set('handledTo', dateRanges.handled.to)
     return params
-  }, [archiveView, triageStatuses, risk, identity, sentiment, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
+  }, [archiveView, triageStatuses, risk, identity, sentiment, intents, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
   // 看板与列表使用同一套筛选；看板逐列自行补 status，不能继承列表的状态多选。
   const boardFilterQuery = useMemo(() => {
@@ -509,11 +513,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
-  const hasActiveFilters = Boolean(platform || sentiment || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
+  const activeIntentCount = intents.length === 4 ? 0 : intents.length
+  const hasActiveFilters = Boolean(platform || sentiment || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment].filter(Boolean).length
-    + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
+    + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
     setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
+    setIntents([])
     setSort({ field: 'publish', dir: 'desc' })
   }
   // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
@@ -533,7 +539,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     await load(willEmpty ? page - 1 : page, { silent: true })
     refreshBadges()
   }, [load, pagination, records.length, refreshBadges])
-
   const markFalsePositive = async (recordId: string): Promise<boolean> => {
     if (archiveView === 'archived') return false
     const reason = await ask({
@@ -1169,7 +1174,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   onClick={() => {
                     setArchiveView(item.value)
                     setTriageStatuses([])
-                    if (item.value === 'archived') setView('list')
+                    if (item.value !== 'active') setView('list')
                   }}
                   role="tab"
                   aria-selected={archiveView === item.value}
@@ -1306,7 +1311,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             'w-full flex-wrap items-center gap-2 rounded-xl bg-muted/30 p-3',
             mobileFiltersOpen ? 'flex' : 'hidden',
             'lg:flex lg:min-h-8 lg:rounded-none lg:bg-transparent lg:p-0',
-            view === 'list' && 'xl:grid xl:grid-cols-[232px_repeat(7,minmax(0,1fr))_58px]',
+            view === 'list' && !drawerRecord && 'xl:grid xl:grid-cols-[232px_repeat(8,minmax(0,1fr))_58px]',
           )}
         >
           <div className="contents lg:hidden">
@@ -1326,7 +1331,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             />
           </div>
 
-          <div role="group" aria-label="情感筛选" className="mobile-table-scroll inline-flex h-10 max-w-full items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8 xl:w-full">
+          <div role="group" aria-label="情感筛选" className={cn('mobile-table-scroll inline-flex h-10 max-w-full shrink-0 items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8', !drawerRecord && 'xl:w-full')}>
             {([['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const).map(([value, label]) => (
               <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
                 className={cn('inline-flex h-9 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-2.5 text-[12px] font-medium transition-colors lg:h-7 xl:flex-1 xl:px-2',
@@ -1336,19 +1341,21 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             ))}
           </div>
 
+          <PostIntentFilter value={intents} onChange={setIntents} />
+
           {view === 'list' && (
-            <div className="w-full lg:w-[160px] xl:w-full">
+            <div className={cn('w-full shrink-0 lg:w-[160px]', !drawerRecord && 'xl:w-full')}>
               <MultiSelect
                 label="全部状态"
                 options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
                 value={triageStatuses}
                 onChange={setTriageStatuses}
-                triggerClassName="w-full justify-between"
+                triggerClassName="w-full shrink-0 justify-between whitespace-nowrap"
               />
             </div>
           )}
 
-          <div className="w-full lg:w-[108px] xl:w-full">
+          <div className={cn('w-full shrink-0 lg:w-[108px]', !drawerRecord && 'xl:w-full')}>
             <TriageSelect value={platform} onChange={e => setPlatform(e.target.value)}
               aria-label="平台筛选"
               className={cn('bg-muted font-medium hover:bg-muted/70', platform ? 'text-foreground' : 'text-muted-foreground')}>
@@ -1360,9 +1367,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             </TriageSelect>
           </div>
 
-          <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} triggerClassName="w-full justify-between lg:!w-[82px] lg:!px-2 xl:!w-full" />
+          <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} triggerClassName={cn('w-full shrink-0 justify-between whitespace-nowrap lg:!w-[82px] lg:!px-2', !drawerRecord && 'xl:!w-full')} />
           <div className="hidden shrink-0 lg:block">
-            <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} triggerClassName="xl:w-full xl:justify-between" />
+            <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} triggerClassName="shrink-0 whitespace-nowrap xl:w-full xl:justify-between" />
           </div>
 
           <button
@@ -1377,6 +1384,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </button>
         </div>
       </div>
+
 
       {/* Board view */}
       {view === 'board' ? (
@@ -1408,14 +1416,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
                 onSaveFeishuTableNo={(value: string) => saveFeishuTableNo(r, value)}
                 modeBusy={modeBusyId === r.id}
-                modeDisabled={archiveView === 'archived' || modeBusyId !== null || archiveBusyId !== null}
+                modeDisabled={Boolean(r.archived_at) || modeBusyId !== null || archiveBusyId !== null}
                 onAddNote={() => addRecordNote(r)}
                 noteBusy={noteBusyId === r.id}
-                onArchive={() => changeArchive(r.id, archiveView === 'active')}
+                onArchive={() => changeArchive(r.id, !r.archived_at)}
                 archiveBusy={archiveBusyId === r.id}
                 watchBusy={watchBusyId === r.id}
                 onToggleWatch={() => toggleWatch(r)}
-                archived={archiveView === 'archived'}
+                archived={Boolean(r.archived_at)}
                 onOpenDetail={() => openDrawer(r)}
                 interactions={interactions(r)}
               />
@@ -1425,7 +1433,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             data-triage-table-scroll
             className="relative hidden lg:block"
           >
-          <table className="w-full min-w-[1080px] text-sm xl:min-w-full">
+          <table className="w-full min-w-[1240px] text-sm xl:min-w-full">
             <thead data-sticky-header className="sticky top-0 z-40 bg-card [&_th]:!h-12 [&_th]:!py-0">
               <tr className="h-12 border-b border-border/60 [&>th]:whitespace-nowrap">
                 {canWrite() && (
@@ -1463,6 +1471,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                     ]}
                   />
                 </th>
+                <th className="px-1.5 text-left"><PostIntentFilter header value={intents} onChange={setIntents} /></th>
+                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">相关度</th>
                 {!narrow && <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
                 {!narrow && <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>}
                 {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}
@@ -1508,12 +1518,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
                   onSaveFeishuTableNo={(value: string) => saveFeishuTableNo(r, value)}
                   modeBusy={modeBusyId === r.id}
-                  modeDisabled={archiveView === 'archived' || modeBusyId !== null || archiveBusyId !== null}
-                  onArchive={() => changeArchive(r.id, archiveView === 'active')}
+                  modeDisabled={Boolean(r.archived_at) || modeBusyId !== null || archiveBusyId !== null}
+                  onArchive={() => changeArchive(r.id, !r.archived_at)}
                   archiveBusy={archiveBusyId === r.id}
                   watchBusy={watchBusyId === r.id}
                   onToggleWatch={() => toggleWatch(r)}
-                  archived={archiveView === 'archived'}
+                  archived={Boolean(r.archived_at)}
                   onOpenDetail={() => openDrawer(r)}
                   interactions={interactions(r)}
                 />
@@ -1768,6 +1778,9 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
 
       <div className={cn('mt-3 flex flex-wrap items-center gap-1.5', canWrite && 'pl-10')}>
         <StatusBadge tone={tone}>{r.sentiment ? (LABELS.sentiment[r.sentiment] || r.sentiment) : '—'}</StatusBadge>
+        <PostIntentBadge record={r} />
+        <PostRelevanceBadge record={r} />
+        {archived && <StatusBadge tone="muted">已归档</StatusBadge>}
         {r.triage_status === 'negative_feishu' && (
           <FeishuTableNumberControl
             value={r.feishu_table_no}
@@ -1876,6 +1889,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
               <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
               {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
               <RecordSourceAction record={r} compact />
+              {archived && <span className="text-[10px]">已归档</span>}
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}
             </div>
             {triageStatus === 'negative_feishu' && (
@@ -1898,6 +1912,8 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
           {availabilityLabel && <StatusBadge tone="muted"><CircleOff className="h-3 w-3" />{availabilityLabel}</StatusBadge>}
         </div>
       </td>
+      <td className="px-3 py-3.5 align-middle"><PostIntentBadge record={r} /></td>
+      <td className="px-3 py-3.5 align-middle"><PostRelevanceBadge record={r} /></td>
       {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
       {!narrow && <td className="px-3 py-3.5 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} /></td>}
       {!narrow && <td className={`px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums ${negativeInteractionClass(r.sentiment, interactions, 'text-foreground')}`}>{formatNumber(interactions)}</td>}
@@ -1926,7 +1942,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
               <span className="min-w-0 truncate" title={triageLabel}>{triageLabel}</span>
             </StatusBadge>
           )}
-          <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} />
+          {canWrite && !archived ? <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} /> : <button type="button" onClick={onOpenDetail} aria-label="查看内容详情" className="flex h-8 w-12 items-center justify-center rounded-md text-primary hover:bg-accent"><ChevronRight className="h-4 w-4" /></button>}
         </div>
       </td>
     </tr>

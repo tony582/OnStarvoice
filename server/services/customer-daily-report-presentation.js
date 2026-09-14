@@ -7,17 +7,30 @@ export const CUSTOMER_DAILY_SECTIONS = Object.freeze({
 });
 export const CUSTOMER_DAILY_SUMMARY_HEADERS = Object.freeze(['日期', '监控数量', 'SDB范畴', '正向', '中性', '冷处理', '处理中', '已处理']);
 export const CUSTOMER_DAILY_MONTHLY_HEADERS = Object.freeze(['舆情处理日期', '平台监控量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-负面处理流程', '负面-其他']);
-export const isMonthlyDailyReport = snapshot => snapshot?.summary?.format === 'daily_disposition_v2' && Array.isArray(snapshot.summary.rows);
-export const customerDailySummaryHeaders = snapshot => isMonthlyDailyReport(snapshot) ? CUSTOMER_DAILY_MONTHLY_HEADERS : CUSTOMER_DAILY_SUMMARY_HEADERS;
+export const isHandlingDailyReport = snapshot => snapshot?.summary?.format === 'daily_handling_v3' && Array.isArray(snapshot.summary.rows);
+export const isMonthlyDailyReport = snapshot => ['daily_disposition_v2', 'daily_handling_v3'].includes(snapshot?.summary?.format) && Array.isArray(snapshot.summary.rows);
+export const CUSTOMER_DAILY_HANDLING_HEADERS = Object.freeze(['舆情处理日期', '处理量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-走负面处理流程', '负面-其他']);
+export const customerDailySections = snapshot => isHandlingDailyReport(snapshot) ? {summary: '一、每日舆情处理量', collection: '二、实际采集量', heat: '三、7天内热度值≥200的负面帖子', cold: '四、本期冷处理负面帖'} : CUSTOMER_DAILY_SECTIONS;
+export const customerDailyCollectionSnapshot = snapshot => ({...snapshot, summary: snapshot.collectionSummary, collectionDisplay: true});
+export const customerDailyTables = snapshot => [{snapshot, title: customerDailySections(snapshot).summary}, ...(isHandlingDailyReport(snapshot) && snapshot.collectionSummary ? [{snapshot: customerDailyCollectionSnapshot(snapshot), title: customerDailySections(snapshot).collection, collection: true}] : [])];
+export const customerDailyTableCaption = snapshot => snapshot.collectionDisplay ? '本月采集去重累计' : '本月处理累计';
+export const customerDailySummaryHeaders = snapshot => snapshot.collectionDisplay ? ['日报日期', '采集量', 'SDB范畴', '正面', '中性', '负面'] : isHandlingDailyReport(snapshot) ? CUSTOMER_DAILY_HANDLING_HEADERS : isMonthlyDailyReport(snapshot) ? CUSTOMER_DAILY_MONTHLY_HEADERS : CUSTOMER_DAILY_SUMMARY_HEADERS;
 
 function count(value) { return Number(value) || 0; }
 
-export function customerDailySummaryRows(snapshot) {
+export function customerDailySummaryRows(snapshot, {hideRestDays = isHandlingDailyReport(snapshot)} = {}) {
+  if (snapshot.collectionDisplay) {
+    const values = (label, counts = {}) => [label, ...['monitor', 'sdb', 'positive', 'neutral', 'negative'].map(field => count(counts[field]))];
+    return [...snapshot.summary.rows.filter(row => row.isWorkingDay !== false || count(row.counts?.monitor) > 0).map(row => {
+      const [year, month, day] = row.date.split('-');
+      return values(`${year}/${Number(month)}/${Number(day)}`, row.counts);
+    }), values('MTD', snapshot.summary.mtd)];
+  }
   if (isMonthlyDailyReport(snapshot)) {
     const values = (label, counts = {}, working = true) => [label, ...['monitor', 'sdb', 'positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther'].map(field => working ? counts[field] : null)];
-    return [...snapshot.summary.rows.map(row => {
+    return [...snapshot.summary.rows.filter(row => !hideRestDays || row.isWorkingDay !== false || count(row.counts?.monitor) > 0).map(row => {
       const [year, month, day] = row.date.split('-');
-      return values(`${year}/${Number(month)}/${Number(day)}`, row.counts, row.isWorkingDay !== false);
+      return values(`${year}/${Number(month)}/${Number(day)}`, row.counts, hideRestDays || row.isWorkingDay !== false);
     }), values('MTD', snapshot.summary.mtd)];
   }
   const [, month, day] = String(snapshot.reportDate || '').split('-');
@@ -49,9 +62,18 @@ export function customerDailyColdTitle(snapshot) {
   const historicalCount = posts.filter(post => post?.isHistorical === true).length;
   // Saved reports created before cohort flags existed cannot prove a historical split.
   const knownSplit = posts.every(post => typeof post?.isHistorical === 'boolean');
-  return `${CUSTOMER_DAILY_SECTIONS.cold}：${posts.length} 条${knownSplit && historicalCount > 0 ? `（含历史帖 ${historicalCount} 条）` : ''}`;
+  return `${customerDailySections(snapshot).cold}：${posts.length} 条${knownSplit && historicalCount > 0 ? `（含历史帖 ${historicalCount} 条）` : ''}`;
 }
 
 export function customerDailyColdPostLabel(post) {
   return post?.isHistorical === true ? '历史帖' : '';
+}
+
+const POST_STATUS_LABELS = Object.freeze({unhandled: '待处理', reviewed: '已复核', reviewed_non_monitor: '已复核-非监控内容', replied: '已回复', unavailable: '已不可见', privacy_unreachable: '隐私设置无法触达', negative_feishu: '飞书表', negative_cold: '冷处理', negative_comment: '评论区留言'});
+export function customerDailyPostStatus(post) {
+  const label = POST_STATUS_LABELS[post?.status];
+  if (!post?.status) return '状态未记录';
+  if (!label) return '状态待核对';
+  const number = String(post.feishuTableNo ?? '').replace(/\p{Cc}/gu, ' ').replace(/\s+/g, ' ').trim();
+  return post.status === 'negative_feishu' && number ? `${label} · ${number}` : label;
 }

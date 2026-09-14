@@ -21,6 +21,12 @@ import {
   redactXhsRecordNavigation,
 } from '../services/xhs-source-open.js';
 
+import {
+  appendRecordIntentFilter, recordIntentSql, recordJudgmentExportFields,
+  recordTriageAdmissionSql, recordEffectiveRelevanceSql,
+  recordAdmissionSelectSql, withRecordAdmissionFields,
+} from '../services/record-triage-admission.js';
+
 const router = Router();
 
 // 导出用中文标签映射(MAP[v]||v||'')
@@ -140,7 +146,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export const ACTIVE_QUEUE_CONDITION = `
   r.record_type NOT IN ('official_content', 'blogger_profile')
   AND r.business_visibility = 'eligible'
-  AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant')
+  AND (${recordTriageAdmissionSql('r')})
+  AND (${recordEffectiveRelevanceSql('r')} IS DISTINCT FROM 'irrelevant')
   AND COALESCE(rt.status, 'unhandled') = 'unhandled'
   AND rt.archived_at IS NULL
 `;
@@ -149,8 +156,9 @@ export const ACTIVE_QUEUE_CONDITION = `
 const TRIAGE_CONTENT_CONDITION = `
   r.record_type NOT IN ('official_content', 'blogger_profile')
   AND r.business_visibility = 'eligible'
+  AND (${recordTriageAdmissionSql('r')})
   AND (
-    r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant'
+    ${recordEffectiveRelevanceSql('r')} IS DISTINCT FROM 'irrelevant'
     OR EXISTS (
       SELECT 1 FROM record_watchlist watched_override
       WHERE watched_override.tenant_id = r.tenant_id
@@ -605,7 +613,9 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     let where = "WHERE r.tenant_id = $1 AND r.business_visibility = 'eligible'";
     where = appendPlatformFilter(where, params, platform);
     where = appendSentimentFilter(where, params, sentiment);
+    where = appendRecordIntentFilter(where, params, req.query.intent);
     const bucket = String(req.query.bucket || '');
+    if (bucket && !['active', 'archived'].includes(bucket)) return res.status(400).json({ ok: false, error: 'invalid_bucket', message: '内容分诊范围无效' });
     // 先按 bucket/queue 圈定大范围,再叠加具体处置状态(status)与风险(risk)筛选。
     // 关键:bucket/queue 与 status 必须叠加而非互斥 —— 否则按状态筛选会丢掉 active 队列
     // 自带的相关性 / 已响应过滤,把无关内容也漏进来。
@@ -615,6 +625,8 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       where += ` AND (${TRIAGE_ARCHIVE_CONDITION})`;
     } else if (queue === 'active') {
       where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
+    } else {
+      where += ` AND (${recordTriageAdmissionSql('r')})`;
     }
     where = appendStatusFilter(where, params, status);
     // 风险信号只包含预警与负评；身份、处理状态分别使用独立筛选。
@@ -675,6 +687,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         r.content_availability_reason, r.content_availability_evidence,
         r.sentiment, r.category, r.source_type, r.identity_override, r.intent, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
         r.ai_result, r.manual_overrides, ${customTagsSelectSql('r')} AS custom_tags,
+        ${recordAdmissionSelectSql('r', { admitted: true })},
         r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority,
@@ -741,10 +754,10 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       ORDER BY ${orderBySql(sort, dir)}
     `, params);
 
-    const publicRecords = records.map(record => redactXhsRecordNavigation({
+    const publicRecords = records.map(record => redactXhsRecordNavigation(withRecordAdmissionFields({
       ...record,
       publish_display: formatPublishDate(record.publish_time, record.created_at),
-    }));
+    })));
 
     return res.json({
       ok: true,
@@ -1281,13 +1294,17 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     let where = "WHERE r.tenant_id = $1 AND r.business_visibility = 'eligible'";
     where = appendPlatformFilter(where, params, platform);
     where = appendSentimentFilter(where, params, sentiment);
+    where = appendRecordIntentFilter(where, params, req.query.intent);
     const bucket = String(req.query.bucket || '');
+    if (bucket && !['active', 'archived'].includes(bucket)) return res.status(400).json({ ok: false, error: 'invalid_bucket', message: '内容分诊范围无效' });
     if (queue === 'triage') {
       where += ` AND (${TRIAGE_QUEUE_CONDITION})`;
     } else if (bucket === 'archived') {
       where += ` AND (${TRIAGE_ARCHIVE_CONDITION})`;
     } else if (queue === 'active') {
       where += ` AND (${ACTIVE_QUEUE_CONDITION})`;
+    } else {
+      where += ` AND (${recordTriageAdmissionSql('r')})`;
     }
     where = appendStatusFilter(where, params, status);
     where += riskWhereClause(req.query.risk);
@@ -1327,6 +1344,9 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
           NULLIF(r.payload->'detailPayload'->>'douyinId',''), NULLIF(r.payload->'detailPayload'->>'bloggerId','')
         ) AS payload_account_no,
         r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.ai_summary,
+        r.intent, ${recordIntentSql('r')} AS intent_display,
+        jsonb_build_object('relevance',r.ai_result->'relevance','relevanceReason',r.ai_result->'relevanceReason') AS ai_result,
+        ${recordAdmissionSelectSql('r', { admitted: true })},
         r.negative_comment_count, r.publish_time, r.published_ts, r.publish_location,
         r.manual_overrides, ${customTagsSelectSql('r')} AS custom_tags,
         COALESCE((
@@ -1433,6 +1453,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       shares: r.shares,
       sentiment: SENTIMENT_CN[r.sentiment] || r.sentiment || '',
       category: CATEGORY_CN[r.category] || r.category || '',
+      ...recordJudgmentExportFields(r),
       custom_tags: (Array.isArray(r.custom_tags) ? r.custom_tags : [])
         .map(tag => String(tag?.name || '').trim())
         .filter(Boolean)
@@ -1472,7 +1493,10 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       { header: '收藏', key: 'collects', width: 8 },
       { header: '转发', key: 'shares', width: 8 },
       { header: '情感', key: 'sentiment', width: 8 },
+      { header: '意图', key: 'intent', width: 12 },
+      { header: '相关度', key: 'relevance', width: 12 },
       { header: '分类', key: 'category', width: 12 },
+      { header: '相关度依据', key: 'relevance_reason', width: 50 },
       { header: '自定义标签', key: 'custom_tags', width: 28 },
       { header: '处理记录', key: 'processing_records', width: 50, style: { alignment: { wrapText: true, vertical: 'top' } } },
       { header: 'AI摘要', key: 'ai_summary', width: 40 },

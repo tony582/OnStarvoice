@@ -3,6 +3,7 @@ import test from 'node:test';
 import {readFileSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import vm from 'node:vm';
+import * as recordAdmission from '../server/services/record-triage-admission.js';
 
 const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -20,6 +21,7 @@ function triageHarness() {
   const router = {get() {}, post() {}, patch(path, ...callbacks) {handlers.set(path, callbacks.at(-1));}};
   const middleware = () => {};
   const context = vm.createContext({
+    ...recordAdmission,
     Router: () => router,
     requireTenantAccess: middleware, requireTenantWriter: middleware, requireSessionUser: middleware,
     getRecordLifecycle: async () => ({id: recordIds[0], archived_at: null}),

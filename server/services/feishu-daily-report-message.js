@@ -1,5 +1,5 @@
 import {
-  CUSTOMER_DAILY_SECTIONS,
+  customerDailySections, isHandlingDailyReport, customerDailyPostStatus,
   customerDailyPostPlatform,
   customerDailyPostComparison,
   customerDailyColdEmpty,
@@ -50,7 +50,7 @@ function comparisonLabel(post) {
 const text = value => ({ tag: 'text', text: value });
 const heading = value => [{ ...text(value), style: ['bold'] }];
 
-function postLine(post, index, heat) {
+function postLine(post, index, heat, snapshot) {
   const item = post && typeof post === 'object' ? post : {};
   const title = oneLine(item.title, '未命名帖子');
   const url = safeUrl(item.url);
@@ -58,7 +58,7 @@ function postLine(post, index, heat) {
   // untruncated and separated from surrounding text; parsed titles include the platform.
   const nodes = [text(heat ? `TOP${index + 1}： ` : `${index + 1}、 `),
     text(url || `${title}（原帖链接待补） - ${oneLine(customerDailyPostPlatform(item), '未知平台', 40)}`)];
-  if (heat) nodes.push(text(` | 热度 ${heatLabel(item)} | ${comparisonLabel(item)}`));
+  if (heat) nodes.push(text(` | 热度 ${heatLabel(item)} | ${comparisonLabel(item)}${isHandlingDailyReport(snapshot) ? ` | 处理状态：${oneLine(customerDailyPostStatus(item), '未记录', 140)}` : ''}`));
   else if (customerDailyColdPostLabel(item)) nodes.push(text(' 【历史帖】'));
   return nodes;
 }
@@ -86,13 +86,13 @@ export function buildFeishuDailyPost({ snapshot, imageKey, documentUrl }) {
   const title = `${oneLine(snapshot.tenantName, '客户', 80)} · 舆情日报 ${oneLine(snapshot.reportDate, '', 20)}`.trim();
 
   function build(heatCount, coldCount) {
-    const content = [heading(CUSTOMER_DAILY_SECTIONS.summary), [{ tag: 'img', image_key: image }], heading(CUSTOMER_DAILY_SECTIONS.heat)];
+    const content = [heading(customerDailySections(snapshot).summary), [{ tag: 'img', image_key: image }], heading(customerDailySections(snapshot).heat)];
     if (!heat.length) content.push([text('暂未检出符合条件的帖子。')]);
-    for (let index = 0; index < heatCount; index++) content.push(postLine(heat[index], index, true));
+    for (let index = 0; index < heatCount; index++) content.push(postLine(heat[index], index, true, snapshot));
     if (heatCount < heat.length) content.push([text(`另有 ${heat.length - heatCount} 条高热负面帖子，见底部完整日报。`)]);
     content.push(heading(customerDailyColdTitle(snapshot)));
     if (!cold.length) content.push([text(customerDailyColdEmpty(snapshot))]);
-    for (let index = 0; index < coldCount; index++) content.push(postLine(cold[index], index, false));
+    for (let index = 0; index < coldCount; index++) content.push(postLine(cold[index], index, false, snapshot));
     if (coldCount < cold.length) content.push([text(`另有 ${cold.length - coldCount} 条冷处理负面帖子，见底部完整日报。`)]);
     content.push([{ tag: 'a', text: '打开完整日报（可编辑）', href: document }]);
     return { zh_cn: { title, content } };

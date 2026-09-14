@@ -19,7 +19,7 @@ const countsFor = (snapshot, date) => snapshot.summary.rows.find(row => row.date
 
 async function collect(date, records = [], {now = new Date(`${date}T19:00:00+08:00`)} = {}) {
   const businessPeriod = customerDailyBusinessPeriod(date, now);
-  return collectCustomerDailyReport({tenantId: id(999), date, now, businessPeriod, db: {
+  const snapshot = await collectCustomerDailyReport({tenantId: id(999), date, now, businessPeriod, db: {
     async queryOne(sql) {
       if (sql.includes('customer_daily:tenant')) return {name: '测试客户'};
       if (sql.includes('customer_daily:missing_published')) return {count: 0};
@@ -28,10 +28,13 @@ async function collect(date, records = [], {now = new Date(`${date}T19:00:00+08:
     },
     async queryAll(sql) {
       if (sql.includes('customer_daily:month')) return records;
-      if (/customer_daily:(heat_posts|cold_events|pending_capture)/.test(sql)) return [];
+      if (/customer_daily:(heat_posts|cold_events|handling_events|pending_capture)/.test(sql)) return [];
       throw new Error(`Unexpected queryAll ${sql}`);
     },
   }});
+  // These fixtures lock the already saved v2 collection tables and their exports.
+  // New reports carry that unchanged collection result below the handling table.
+  return {...snapshot, schemaVersion: 2, summary: snapshot.collectionSummary};
 }
 
 function assertMtdEqualsRows(snapshot) {
@@ -164,6 +167,30 @@ test('legacy v1 summaries retain editable in-progress and processed fields and t
   assert.deepEqual(customerDailySummaryHeaders(snapshot), ['日期', '监控数量', 'SDB范畴', '正向', '中性', '冷处理', '处理中', '已处理']);
   assert.deepEqual(customerDailySummaryRows(snapshot), [['9月10日', 20, 20, 3, 2, 4, 0, 5], ['MTD', 100, 100, 3, 2, 4, 10, 8]]);
   assert.equal(before.day.processed, null);
+});
+
+test('v3 processing edits sum daily workload, including holiday handling, without changing monthly collection deduplication', async () => {
+  const legacy = await collect('2026-09-14');
+  const counts = {...legacy.summary.day, monitor: 1, sdb: 1, negative: 1, cold: 1};
+  const source = {
+    format: 'daily_handling_v3', mtdBasis: 'daily_sum', dayDate: '2026-09-14',
+    rows: [{date: '2026-09-12', isWorkingDay: false, counts: {...counts}}, {date: '2026-09-14', isWorkingDay: true, counts: {...counts}}],
+    day: {...counts}, mtd: {...counts, monitor: 2, sdb: 2, negative: 2, cold: 2},
+    coverageComplete: true,
+  };
+  const collectionSummary = {...legacy.summary, mtd: {...counts}};
+  const snapshot = {summary: source, collectionSummary};
+  const before = structuredClone(snapshot);
+  const changed = mergeCustomerDailySummary(source, {rows: {'2026-09-12': {cold: 0, comment: 1}}});
+  assert.equal(changed.mtd.monitor, 2, 'a post processed on two dates contributes two units of handling');
+  assert.equal(changed.mtd.cold, 1);
+  assert.equal(changed.mtd.comment, 1);
+  assert.equal(changed.mtdBasis, 'daily_sum');
+  assert.equal(changed.coverageComplete, true);
+  assert.equal(snapshot.collectionSummary.mtd.monitor, 1, 'collection MTD counts the collected post once');
+  assert.deepEqual(snapshot, before);
+  assert.throws(() => mergeCustomerDailySummary(source, {rows: {'2026-09-13': {monitor: 1}}}), {code: 'daily_summary_invalid'});
+  assert.throws(() => mergeCustomerDailySummary(source, {mtd: {monitor: 1}}), {code: 'daily_summary_invalid'});
 });
 
 test('HTML, TSV, SVG/PNG, Excel and native Feishu table present identical nine-column rows', async () => {

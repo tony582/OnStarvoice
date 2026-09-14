@@ -108,7 +108,7 @@ test('desktop keeps one native scroll surface and sticky state-note cell', () =>
   assert.match(queue, /className="sticky left-0 z-30[^\"]*lg:w-\[calc\(100cqw-6px\)\]/);
   assert.match(queue, /className="isolate overflow-visible rounded-xl bg-card lg:-mx-6 lg:rounded-none"/);
   assert.doesNotMatch(queue, /data-triage-table-scroll[\s\S]{0,180}overflow-x-auto|tableHead\.style\.transform|ResizeObserver/);
-  assert.match(queue, /min-w-\[1080px\][^\"]*xl:min-w-full/);
+  assert.match(queue, /min-w-\[1240px\][^\"]*xl:min-w-full/);
   assert.match(queue, /<thead data-sticky-header className="[^"]*sticky top-0 z-40/);
   assert.match(queue, /sticky right-0 z-20 w-\[208px\] min-w-\[208px\][^\"]*before:inset-y-0/);
 });
@@ -145,7 +145,7 @@ test('toolbar and header filter the nine handling states without ticket filters'
   assert.doesNotMatch(secondary, /关注状态筛选|未关注/);
   assert.match(secondary, /<CombinedDateRangeFilter/);
   assert.match(secondary, /<MultiSelect label="风险信号"/);
-  assert.match(secondary, /xl:grid-cols-\[232px_repeat\(7,minmax\(0,1fr\)\)_58px\]/);
+  assert.match(secondary, /xl:grid-cols-\[232px_repeat\(8,minmax\(0,1fr\)\)_58px\]/);
   assert.doesNotMatch(queue, /TicketStatusFilter|工单状态筛选/);
 
   assert.match(header, /label="平台"[\s\S]*value=\{platform\}[\s\S]*onChange=\{setPlatform\}/);

@@ -333,8 +333,16 @@ function normalizeScheduleUpdate(
   const preservedResourcePolicy = normalizeCaptureResourcePolicy(
     safeJson(existingPlanSnapshot).resourcePolicy,
   );
+  const previousNegativePatrol = safeJson(existingPlanSnapshot.negativePatrol);
+  const requestedNegativePatrol = safeJson(safeBody.negativePatrol);
+  const preservePatrolStatuses = requestedNegativePatrol.enabled === true
+    && !Object.hasOwn(requestedNegativePatrol, 'triageStatuses')
+    && previousNegativePatrol.enabled === true;
   const normalized = normalizeCreateRequest({
     ...safeBody,
+    ...(preservePatrolStatuses ? {negativePatrol: {
+      ...requestedNegativePatrol, triageStatuses: previousNegativePatrol.triageStatuses,
+    }} : {}),
     ...(!Object.hasOwn(safeBody, 'negativePatrol') &&
         safeJson(existingPlanSnapshot.negativePatrol).enabled === true
       ? {negativePatrol: existingPlanSnapshot.negativePatrol} : {}),
@@ -856,6 +864,8 @@ router.post(
         tenantId: req.tenantId,
         platforms: [req.body?.platform],
         keywords: req.body?.keywords,
+        triageStatuses: Object.hasOwn(safeJson(req.body?.negativePatrol), 'triageStatuses')
+          ? req.body.negativePatrol.triageStatuses : req.body?.triageStatuses,
         runStartedAt: new Date().toISOString(),
         timezone: 'Asia/Shanghai',
       });

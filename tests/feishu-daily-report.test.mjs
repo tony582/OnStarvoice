@@ -47,9 +47,9 @@ function harness({ members = [], permissions = {}, before, after, renderSummaryI
       response = ok({ block_id_relations: relations });
     } else if (request.method === 'PATCH' && path.includes('/blocks/')) {
       const table = blocks.find(block => block.block_id === path.split('/').at(-1));
-      table.table.property.merge_info ||= Array.from({ length: 32 }, () => ({ row_span: 1, col_span: 1 }));
+      table.table.property.merge_info ||= Array.from({ length: table.table.property.row_size * table.table.property.column_size }, () => ({ row_span: 1, col_span: 1 }));
       const merge = request.body.merge_table_cells;
-      table.table.property.merge_info[merge.row_start_index * 8 + merge.column_start_index] = {
+      table.table.property.merge_info[merge.row_start_index * table.table.property.column_size + merge.column_start_index] = {
         row_span: merge.row_end_index - merge.row_start_index, col_span: merge.column_end_index - merge.column_start_index };
       response = ok({ block: structuredClone(table) });
     } else if (path.endsWith('/members') && request.method === 'GET') response = ok({ items: structuredClone(members) });
@@ -616,4 +616,76 @@ test('an uncertain app message remains ambiguous after successful image checkpoi
     assert.equal(images(h).length,1);
     assert.equal(messages(h).length,1);
   });
+});
+
+function handlingSnapshot() {
+  const day = {...counts, comment: 1, negativeProcess: 2, negativeOther: 0};
+  return snapshot({schemaVersion: 3, summary: {format: 'daily_handling_v3', day, mtd: {...day, monitor: 200}, rows: [
+    {date: '2026-09-05', isWorkingDay: false, counts: {monitor: 0}},
+    {date: '2026-09-06', isWorkingDay: false, counts: day}, {date: '2026-09-07', isWorkingDay: true, counts: day},
+  ]}, collectionSummary: {format: 'daily_disposition_v2', day, mtd: {...day, monitor: 321}, rows: [
+    {date: '2026-09-07', isWorkingDay: true, counts: day},
+  ]}, highHeat: [{...snapshot().highHeat[0], status: 'negative_feishu', feishuTableNo: 'FS-009'}]});
+}
+
+test('v3 native document has editable handling and collection tables with distinct MTD and frozen disposition', () => {
+  const source = handlingSnapshot();
+  const plan = buildFeishuDailyDocumentPlan(source);
+  const blocks = plan.batches.flatMap(batch => batch.descendants);
+  const tables = blocks.filter(block => block.block_type === 31);
+  assert.deepEqual(tables.map(table => [table.table.property.column_size, table.table.property.row_size]), [[9, 6], [6, 4]]);
+  assert.deepEqual(plan.mergeTargets.map(item => item.columns), [9, 9, 9, 9, 9, 9, 9, 6]);
+  const text = JSON.stringify(plan);
+  for (const label of ['每日舆情处理量', '实际采集量', '本月处理累计', '本月采集去重累计', '处理状态：飞书表 · FS-009']) assert.ok(text.includes(label));
+  assert.doesNotMatch(text, /2026\/9\/5|休假|休息日/);
+  assert.match(text, /2026\/9\/6/);
+  assert.ok(plan.batches.every(batch => batch.descendants.length < 1000));
+});
+
+test('v3 lost merge response resumes the correct table and column count without reappending or remerging', async () => {
+  let lost = false;
+  const saved = savedProgress();
+  const h = harness({after(request) {
+    if (request.method === 'PATCH' && request.body.merge_table_cells.column_end_index === 6 && !lost) {
+      lost = true;
+      throw new Error('network lost after collection caption merge');
+    }
+  }});
+  const source = handlingSnapshot();
+  await assert.rejects(h.client.writeDocument({documentId: 'doc_one', snapshot: source, onProgress: saved.save}), error => error.ambiguous);
+  const appends = mutations(h).filter(request => request.url.pathname.endsWith('/descendant')).length;
+  const patches = mutations(h).filter(request => request.method === 'PATCH').length;
+  const result = await h.client.writeDocument({documentId: 'doc_one', snapshot: source, progress: saved.get(), onProgress: saved.save});
+  assert.equal(result.done, true);
+  assert.equal(mutations(h).filter(request => request.url.pathname.endsWith('/descendant')).length, appends);
+  assert.equal(mutations(h).filter(request => request.method === 'PATCH').length, patches);
+  const tables = h.blocks.filter(block => block.block_type === 31);
+  assert.equal(tables[0].table.property.merge_info[4 * 9].col_span, 9);
+  assert.equal(tables[1].table.property.merge_info[2 * 6].col_span, 6);
+  assert.equal(messages(h).length, 0);
+});
+
+test('v3 full month dual tables remain under each Feishu descendant request limit', () => {
+  const source = handlingSnapshot();
+  source.reportDate = '2026-10-31';
+  const rows = Array.from({length: 31}, (_, i) => ({date: `2026-10-${String(i + 1).padStart(2, '0')}`, isWorkingDay: true, counts: source.summary.day}));
+  source.summary.rows = rows;
+  source.collectionSummary.rows = rows;
+  const plan = buildFeishuDailyDocumentPlan(source);
+  assert.ok(plan.batches.every(batch => batch.descendants.length < 1000));
+  assert.equal(plan.batches.flatMap(batch => batch.descendants).filter(block => block.block_type === 31).length, 2);
+});
+
+test('v3 lost body response recovers both table identities before applying table-specific merges', async () => {
+  let lost = false;
+  const saved = savedProgress();
+  const h = harness({after(request) { if (request.url.pathname.endsWith('/descendant') && !lost) { lost = true; throw new Error('lost body response'); } }});
+  const source = handlingSnapshot();
+  await assert.rejects(h.client.writeDocument({documentId: 'doc_one', snapshot: source, onProgress: saved.save}), error => error.ambiguous);
+  const result = await h.client.writeDocument({documentId: 'doc_one', snapshot: source, progress: saved.get(), onProgress: saved.save});
+  assert.equal(result.done, true);
+  assert.equal(h.blocks.filter(block => block.block_type === 31).length, 2);
+  assert.equal(result.completed.flatMap(step => step.tableIds || []).length, 2);
+  assert.equal(mutations(h).filter(request => request.url.pathname.endsWith('/descendant')).length, buildFeishuDailyDocumentPlan(source).batches.length);
+  assert.equal(messages(h).length, 0);
 });

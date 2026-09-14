@@ -9,6 +9,7 @@ import { Drawer } from '@/components/shared/Drawer'
 import { AgentPicker } from './AgentPicker'
 import { AgentTaskCreator } from './AgentTaskCreator'
 import { NegativePatrolScheduleOption } from './NegativePatrolScheduleOption'
+import { DEFAULT_NEGATIVE_PATROL_STATUSES, validNegativePatrolStatuses } from './unattendedNegativePatrol.mjs'
 import { NegativePatrolTaskCreator } from './NegativePatrolTaskCreator'
 import { WatchedContentTaskCreator } from './WatchedContentTaskCreator'
 import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCreator'
@@ -108,6 +109,7 @@ export function CreateTaskDrawer({
 
   const [step, setStep] = useState<WizardStep>(startsAtConfigure ? 'configure' : presetAgentId && presetTaskType === 'unattended_plan' ? 'method' : 'type')
   const [negativePatrolEnabled, setNegativePatrolEnabled] = useState(false)
+  const [negativePatrolStatuses, setNegativePatrolStatuses] = useState<string[]>(() => [...DEFAULT_NEGATIVE_PATROL_STATUSES])
   const [taskType, setTaskType] = useState<TaskType>(presetTaskType || 'keyword')
   const [method, setMethod] = useState<ExecutionMethod>(() => (
     ['negative_patrol', 'watched_content'].includes(presetTaskType || '') ? 'multi' : 'single'
@@ -158,9 +160,11 @@ export function CreateTaskDrawer({
     minimumAgentCount: 1,
     lockAgentSelection: true,
     initialNegativePatrolEnabled: true,
+    initialNegativePatrolStatuses: negativePatrolStatuses,
   })
 
   const goNext = () => {
+    if (taskType === 'unattended_plan' && negativePatrolEnabled && !validNegativePatrolStatuses(negativePatrolStatuses)) return
     if (step === 'type') {
       if (taskType === 'negative_patrol') return setStep('configure')
       if (presetAgentId) return setStep(taskType === 'unattended_plan' ? 'method' : 'configure')
@@ -178,6 +182,7 @@ export function CreateTaskDrawer({
           lockExecutionMode: true,
           minimumAgentCount: 2,
           initialNegativePatrolEnabled: taskType === 'unattended_plan' && negativePatrolEnabled,
+          initialNegativePatrolStatuses: negativePatrolStatuses,
         })
       }
       return setStep('agents')
@@ -199,6 +204,7 @@ export function CreateTaskDrawer({
   }
 
   const nextDisabled = !writable
+    || (taskType === 'unattended_plan' && negativePatrolEnabled && !validNegativePatrolStatuses(negativePatrolStatuses))
     || (step === 'agents' && selectedAssignableIds.length === 0)
     || (
       step === 'agents'
@@ -239,7 +245,7 @@ export function CreateTaskDrawer({
       <div className="flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6">
         {!editingExisting && taskType === 'unattended_plan' && step !== 'configure' && (
           <div className="mx-auto mb-4 max-w-2xl space-y-2">
-            <NegativePatrolScheduleOption checked={negativePatrolEnabled} disabled={!writable} onChange={setNegativePatrolEnabled} />
+            <NegativePatrolScheduleOption checked={negativePatrolEnabled} disabled={!writable} onChange={setNegativePatrolEnabled} triageStatuses={negativePatrolStatuses} onStatusesChange={setNegativePatrolStatuses} />
             {negativePatrolEnabled && <p className="text-[11px] leading-5 text-muted-foreground">接下来配置云端计划，每个计划时间执行一轮；选择固定节点时仍只由该节点执行。已有设备本地计划会保留，请避免重复设置相同关键词和时间。</p>}
           </div>
         )}

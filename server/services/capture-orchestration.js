@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { normalizeNegativePatrolTriageStatuses } from './unattended-negative-patrol.js';
 import {
   normalizeCaptureResourcePolicy,
   validateCaptureResourcePolicy,
@@ -576,7 +577,8 @@ export function normalizeOrchestrationRequest(
       ...(sequentialSearchEnabled ? {searchPasses: effectiveSearchPasses} : {}),
       recoveryPolicy,
       ...(negativePatrolEnabled
-        ? {negativePatrol: {enabled: true, lookbackDays: 7}}
+        ? {negativePatrol: {enabled: true, lookbackDays: 7,
+          triageStatuses: normalizeNegativePatrolTriageStatuses(source.negativePatrol.triageStatuses)}}
         : {}),
       ...(Object.keys(resourcePolicy).length > 0 ? {resourcePolicy} : {}),
       ...(schedule ? schedule : {}),

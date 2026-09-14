@@ -1,6 +1,6 @@
 # 客户日报实现接口
 
-当前统计口径：客户工作日，采用中国法定节假日及调休安排。
+当前新日报采用 v3：上表按北京时间自然日统计状态变更的处理量，下表保留客户工作日采集量。工作日使用中国法定节假日及调休安排。
 
 ## 服务边界
 
@@ -28,7 +28,19 @@ Post = {recordId,title,platform,url, heat?,observedAt?,comparisonText?,previousH
 
 Post保留平台代码，渲染显示中文。所有计数是number；未掌握列严格null。证据保存采集首次入库集合、状态、采用的观测与审计事件ID等。
 
-## 采集与处理归属
+## Snapshot JSON v3
+
+新生成的快照 `schemaVersion=3`。`summary.format=daily_handling_v3`，含 `rows:[{date,isWorkingDay,counts}]`、`dayDate`、`day`、`mtd`、`mtdBasis=daily_sum`、`coverageFrom`、`coverageComplete`。八个可编辑数量为 `monitor/sdb/positive/neutral/cold/comment/negativeProcess/negativeOther`。`collectionSummary` 保存原 `daily_disposition_v2` 采集汇总，原采集范围和月内去重口径不变。
+
+- 上表「每日舆情处理量」：读取北京时间月初零点至报告截止的有效状态变更审计，包含之前采集的旧帖；相同帖同一天多次变更只计一次，按该日末次变更后的状态归类。纯备注、同状态重复保存和巡查刷新不计处理量。
+- 上表 MTD 标为「本月处理累计」，是每日处理量之和；同帖跨天再次处理可以再计一次。处理量编辑保存后重新按日加总。
+- 下表「实际采集量」：展示日期、采集量、SDB、正面、中性、负面。下表 MTD 标为「本月采集去重累计」，按原月度采集集合的帖子 ID 去重，直接读取 `collectionSummary.mtd`，不受处理量编辑影响。
+- 处理表省略没有处理的非工作日；有处理的非工作日显示正常日期并允许编辑，不加「休」标记。采集表省略空休假行，采集仍归下一工作日；出报日历不变。
+- 处理证据保存在 `evidence.handling`，含原始跃迁、每日去重 ID 及每日末次跃迁。缺失或格式不完整的审计会标明不完整，不能把仅能核实的数量当完整处理量或确定的零。
+- 高热负面显示冻结快照中的中文处理状态（如冷处理、飞书表）；只有状态为 `negative_feishu` 时附有效 `feishuTableNo`。不重写客户已保存或已发送的旧日报。
+- 页面、HTML、文本、PNG、Excel 与飞书输出统一两张表。Excel 上表 MTD 保留每日求和公式，下表为去重结果。旧 v1/v2 快照维持原始统计含义与交付兼容。
+
+## 原采集与冷处理清单归属（v3 下表及旧快照）
 
 - 采集以系统首次入库时间为准。默认切分时间为北京时间 18:00，可在设置调整；一个工作日的完整区间为上个工作日 18:00（含）至本工作日 18:00（不含）。例如普通周一包含周五晚及整个周末；2026-09-20 是调休上班的周日，正常单独出报。
 - 当天生成仅包含生成时已经入库的帖子，之后至 18:00 的补采仍归当天，需要主动更新当天日报后交付，不自动移动到次日。生成后当天新标冷处理同样需要更新当天快照；已发送版本不随之后的数据变化而改写。此归属以入库时间窗口计算，不追溯迟到上传的任务原计划时间。
@@ -43,8 +55,8 @@ Post保留平台代码，渲染显示中文。所有计数是number；未掌握�
 - `GET /?date=YYYY-MM-DD` => `{ok,reports:Report[]}` (date可省略，最近50版)
 - `GET /calendar?date=YYYY-MM-DD` => `{ok,calendar:{defaultReportDate,isWorkingDay,nextWorkingDate,collectionBoundaryTime,revision}}`；默认当前工作日，休息日默认最近一个工作日，所选休息日另提示合并目标日期。
 - `POST /generate {date?,requestId?}` => `{ok,report}`；生成新不可变版，不发送。requestId幂等。
-- `GET /:id` => `{ok,report,html,text,messageHtml,messageText}`；后两字段仅含二、三部分，用于复制正文。`GET /:id/excel` => xlsx；`GET /:id/summary.png` => 带下载文件名的 PNG，均按租户校验会话。
-- `POST /:id/summary {summary:{day?,mtd?},requestId}` => `{ok,report}`；只允许修改每行的 monitor/sdb/positive/neutral/cold/inProgress/processed。非负整数，最后两列可为 null。按日期锁保存新不可变版本，重复请求幂等，旧版本或并发冲突返回 409。snapshot 保留 systemSummary、summaryEdited、summaryEdit。保存不触发群发；导出、表格图片与飞书交付使用保存后的汇总。
+- `GET /:id` => `{ok,report,html,text,messageHtml,messageText}`；后两字段仅含高热及冷处理帖子清单，用于复制正文。`GET /:id/excel` => xlsx；`GET /:id/summary.png` => 带下载文件名的 PNG，均按租户校验会话。
+- `POST /:id/summary {summary:{rows:{"YYYY-MM-DD":{field:number}}},requestId}` => `{ok,report}`；v2/v3 只允许修改已有日期行的八个数量，须为非负整数，MTD 自动求和。v3 允许已有非工作日处理行；采集表不能通过此接口修改。v1 仍支持 `{summary:{day?,mtd?},requestId}` 及原字段（`inProgress/processed` 可为 null）。按日期锁保存新不可变版本，重复请求幂等，旧版本或并发冲突返回 409。snapshot 保留 systemSummary、summaryEdited、summaryEdit 及原 collectionSummary。保存不触发群发；导出、表格图片与飞书交付使用保存后的汇总。
 - `POST /:id/document {allowIncomplete?:boolean}`、`POST /:id/send {allowIncomplete?:boolean}` => `{ok,report}`；入持久化队列并尝试交付，同步操作有时间上限，UI可轮询GET。重复发送同版同群幂等，不提供隐含重发。
 - `GET /settings` => `{ok,settings:Settings}`；`PUT /settings` => 同上。secret不返回，仅 `hasAppSecret/hasWebhook/hasWebhookSecret`。只admin可改配置；writer可生成/发送。
 

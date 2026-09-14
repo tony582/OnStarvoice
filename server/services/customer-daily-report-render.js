@@ -1,9 +1,9 @@
 import ExcelJS from 'exceljs';
 import {
-  CUSTOMER_DAILY_SECTIONS, customerDailySummaryHeaders, isMonthlyDailyReport,
+  customerDailySummaryHeaders, isMonthlyDailyReport,
   customerDailySummaryRows as summaryRows,
   customerDailyPostPlatform as sourceLabel, customerDailyPostComparison, customerDailyColdEmpty as coldEmpty,
-  customerDailyColdTitle, customerDailyColdPostLabel,
+  customerDailyColdTitle, customerDailyColdPostLabel, isHandlingDailyReport, customerDailySections, customerDailyTables, customerDailyPostStatus, customerDailyTableCaption,
 } from './customer-daily-report-presentation.js';
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char])); }
@@ -23,6 +23,12 @@ export function customerDailyReportTitle(snapshot) {
   return `${snapshot.tenantName ? `${oneLine(snapshot.tenantName)} · ` : ''}舆情日报 ${snapshot.reportDate}${time}`;
 }
 export function customerDailyReportNotes(snapshot) {
+  if (isHandlingDailyReport(snapshot)) return [
+    `每日处理量按北京时间当天发生状态变化的唯一主帖统计；同一帖子当天计一次，跨天再次处理分别计入，MTD 为每日处理量加总。`,
+    `实际采集量按首次成功入库主帖统计；采集 MTD 为本月唯一主帖数，复采不重复计数。`,
+    `无处理的休息日不单独展示；有处理时按实际处理日期显示。高热负面帖带出快照中的处理状态及已有飞书表编号。`,
+    `本页保存后，导出和交付使用已保存的汇总。飞书文档或Excel中的修改不会自动同步回本页。`,
+  ];
   return [
     `新增/互动统计截至${customerDailyTime(snapshot.cutoffAt)}；复核及冷处理状态截至${customerDailyTime(snapshot.assessedAt)}（北京时间）。`,
     `监控按首次成功入库的唯一主帖计数；复采不重复计数。SDB仅扣除「已复核-非监控内容」。MTD为本月1日至报表日的首次入库集合。`,
@@ -31,24 +37,24 @@ export function customerDailyReportNotes(snapshot) {
     '本页保存后，导出和交付使用已保存的汇总。飞书文档或Excel中的修改不会自动同步回本页。',
   ];
 }
-function heatDescription(post) {
-  return `热度 ${n(post.heat)}｜${oneLine(customerDailyPostComparison(post))}`;
+function heatDescription(post, snapshot) {
+  return `热度 ${n(post.heat)}｜${oneLine(customerDailyPostComparison(post))}${isHandlingDailyReport(snapshot) ? `｜处理状态：${oneLine(customerDailyPostStatus(post))}` : ''}`;
 }
 
 export function renderCustomerDailyReportText(snapshot) {
-  const lines = [customerDailyReportTitle(snapshot), '', CUSTOMER_DAILY_SECTIONS.summary,
-    (isMonthlyDailyReport(snapshot) ? customerDailySummaryHeaders(snapshot) : ['日期', '监控数量', 'SDB范畴', '正向', '中性', '负面·冷处理', '负面·处理中', '负面·已处理']).join('\t'),
-    ...summaryRows(snapshot).map(row => row.map(value => value ?? '').join('\t')),
-    '', renderCustomerDailyReportMessageText(snapshot),
+  const lines = [customerDailyReportTitle(snapshot), '', ...customerDailyTables(snapshot).flatMap(table => [table.title,
+    (isMonthlyDailyReport(table.snapshot) ? customerDailySummaryHeaders(table.snapshot) : ['日期', '监控数量', 'SDB范畴', '正向', '中性', '负面·冷处理', '负面·处理中', '负面·已处理']).join('\t'),
+    ...summaryRows(table.snapshot, {hideRestDays: isHandlingDailyReport(snapshot)}).flatMap(row => [...(isHandlingDailyReport(snapshot) && row[0] === 'MTD' ? [customerDailyTableCaption(table.snapshot)] : []), row.map(value => value ?? '').join('\t')]), '']),
+    renderCustomerDailyReportMessageText(snapshot),
   ];
   return lines.join('\n');
 }
 
 export function renderCustomerDailyReportMessageText(snapshot) {
-  const lines = [CUSTOMER_DAILY_SECTIONS.heat];
+  const lines = [customerDailySections(snapshot).heat];
   if (!snapshot.highHeat?.length) lines.push('暂未检出符合条件的帖子。');
   for (const [index, post] of (snapshot.highHeat || []).entries()) {
-    lines.push(`TOP${index + 1}：${oneLine(post.title)} — ${sourceLabel(post)}｜${heatDescription(post)}`, url(post.url) || '原帖链接待补');
+    lines.push(`TOP${index + 1}：${oneLine(post.title)} — ${sourceLabel(post)}｜${heatDescription(post, snapshot)}`, url(post.url) || '原帖链接待补');
   }
   lines.push('', customerDailyColdTitle(snapshot));
   if (!snapshot.coldMarked?.length) lines.push(coldEmpty(snapshot));
@@ -65,23 +71,29 @@ function linkedTitle(post) {
 }
 
 export function renderCustomerDailyReportMessageHtml(snapshot) {
-  return `<h2>${CUSTOMER_DAILY_SECTIONS.heat}</h2>
-    ${(snapshot.highHeat || []).map((post, index) => `<article><h3>TOP${index + 1}：${linkedTitle(post)}</h3><p>${esc(sourceLabel(post))}｜${esc(heatDescription(post))}</p></article>`).join('') || '<p class="empty">暂未检出符合条件的帖子。</p>'}
+  return `<h2>${customerDailySections(snapshot).heat}</h2>
+    ${(snapshot.highHeat || []).map((post, index) => `<article><h3>TOP${index + 1}：${linkedTitle(post)}</h3><p>${esc(sourceLabel(post))}｜${esc(heatDescription(post, snapshot))}</p></article>`).join('') || '<p class="empty">暂未检出符合条件的帖子。</p>'}
     <h2>${customerDailyColdTitle(snapshot)}</h2>
     ${(snapshot.coldMarked || []).map((post, index) => `<article><h3>${index + 1}、${linkedTitle(post)}${customerDailyColdPostLabel(post) ? '<span class="historical">【历史帖】</span>' : ''}</h3><p>${esc(sourceLabel(post))}</p></article>`).join('') || `<p class="empty">${esc(coldEmpty(snapshot))}</p>`}`;
 }
 
 export function renderCustomerDailyReportHtml(snapshot) {
-  const HEADERS = customerDailySummaryHeaders(snapshot);
-  const header = isMonthlyDailyReport(snapshot)
-    ? `<tr>${HEADERS.map(label => `<th scope="col">${esc(label)}</th>`).join('')}</tr>`
-    : `<tr>${HEADERS.slice(0, 5).map(label => `<th rowspan="2" scope="col">${esc(label)}</th>`).join('')}<th colspan="3" scope="colgroup">负面</th></tr><tr>${HEADERS.slice(5).map(label => `<th scope="col">${esc(label)}</th>`).join('')}</tr>`;
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(customerDailyReportTitle(snapshot))}</title><style>
-    :root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#fff;color:#20252b;font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}main{max-width:1000px;padding:32px 28px 48px;margin:auto}h1{font-size:24px;line-height:1.4;margin:0 0 12px}h2{font-size:18px;margin:32px 0 12px}p{margin:8px 0}a{color:#2563eb;text-decoration:underline;text-underline-offset:3px}.meta,.notes{font-size:12px;color:#66717e}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}th,td{border:1px solid #bcc3cb;padding:10px 9px;text-align:center}th{background:#101316;color:white;font-weight:600}td{font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}article{padding:14px 0;border-bottom:1px solid #e4e7eb}article h3{font-size:15px;margin:0 0 5px;font-weight:600}.source-url{font-weight:400;font-size:11px;color:#687684;overflow-wrap:anywhere}.missing{color:#9a4c12;font-size:12px}.data-notes{margin-top:28px;padding:14px 18px;background:#f5f7fa;border-left:3px solid #95a5b9}.data-notes ul{padding-left:20px;margin:6px 0}.empty{color:#687684}.foot{margin-top:24px;border-top:1px solid #e4e7eb;padding-top:12px}@media(max-width:600px){main{padding:20px 14px}h1{font-size:21px}}@media print{main{max-width:none;padding:0}body{font-size:11px}th{print-color-adjust:exact;-webkit-print-color-adjust:exact}article{break-inside:avoid}a{color:inherit}h2{break-after:avoid}.table-wrap{overflow:visible}}
+    :root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#fff;color:#20252b;font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}main{max-width:1000px;padding:32px 28px 48px;margin:auto}h1{font-size:24px;line-height:1.4;margin:0 0 12px}h2{font-size:18px;margin:32px 0 12px}p{margin:8px 0}a{color:#2563eb;text-decoration:underline;text-underline-offset:3px}.meta,.notes{font-size:12px;color:#66717e}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}th,td{border:1px solid #bcc3cb;padding:10px 9px;text-align:center}th{background:#101316;color:white;font-weight:600}td{font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}.monthly th:first-child,.monthly td:first-child{text-align:center}.mtd-caption td{background:#f1f1f1;text-align:center;font-size:12px}article{padding:14px 0;border-bottom:1px solid #e4e7eb}article h3{font-size:15px;margin:0 0 5px;font-weight:600}.source-url{font-weight:400;font-size:11px;color:#687684;overflow-wrap:anywhere}.missing{color:#9a4c12;font-size:12px}.data-notes{margin-top:28px;padding:14px 18px;background:#f5f7fa;border-left:3px solid #95a5b9}.data-notes ul{padding-left:20px;margin:6px 0}.empty{color:#687684}.foot{margin-top:24px;border-top:1px solid #e4e7eb;padding-top:12px}@media(max-width:600px){main{padding:20px 14px}h1{font-size:21px}}@media print{main{max-width:none;padding:0}body{font-size:11px}th{print-color-adjust:exact;-webkit-print-color-adjust:exact}article{break-inside:avoid}a{color:inherit}h2{break-after:avoid}.table-wrap{overflow:visible}}
   </style></head><body><main><h1>${esc(customerDailyReportTitle(snapshot))}</h1>
-    <h2>${CUSTOMER_DAILY_SECTIONS.summary}</h2><div class="table-wrap"><table aria-label="客户日报监控汇总"><thead>${header}</thead><tbody>${summaryRows(snapshot).map(row => `<tr>${row.map(value => `<td>${value === null ? '' : esc(value)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+    ${customerDailyTables(snapshot).map(table => renderSummaryHtml(table, isHandlingDailyReport(snapshot))).join('')}
     ${renderCustomerDailyReportMessageHtml(snapshot)}
     </main></body></html>`;
+}
+
+function renderSummaryHtml({snapshot, title}, handling) {
+  const headers = customerDailySummaryHeaders(snapshot);
+  const grouped = !snapshot.collectionDisplay && (handling || !isMonthlyDailyReport(snapshot));
+  const header = grouped
+    ? `<tr>${headers.slice(0, 5).map(label => `<th rowspan="2" scope="col">${esc(label)}</th>`).join('')}<th colspan="${headers.length - 5}" scope="colgroup">负面</th></tr><tr>${headers.slice(5).map(label => `<th scope="col">${esc(label.replace(/^负面-/, ''))}</th>`).join('')}</tr>`
+    : `<tr>${headers.map(label => `<th scope="col">${esc(label)}</th>`).join('')}</tr>`;
+  const body = summaryRows(snapshot, {hideRestDays: handling}).map(row => `${handling && row[0] === 'MTD' ? `<tr class="mtd-caption"><td colspan="${headers.length}">${customerDailyTableCaption(snapshot)}</td></tr>` : ''}<tr>${row.map(value => `<td>${value === null ? '' : esc(value)}</td>`).join('')}</tr>`).join('');
+  return `<h2>${esc(title)}</h2><div class="table-wrap"><table class="${handling ? 'monthly' : ''}" aria-label="${esc(title)}"><thead>${header}</thead><tbody>${body}</tbody></table></div>`;
 }
 
 function mergedText(sheet, row, lastColumn, value, options = {}) {
@@ -124,6 +136,36 @@ function configureSheet(sheet, columnCount) {
   sheet.headerFooter.oddFooter = '&R第 &P 页';
   for (let i = 1; i <= columnCount; i++) sheet.getColumn(i).width = 16;
 }
+function appendGroupedSummary(sheet, snapshot, headerStart) {
+  const headers = customerDailySummaryHeaders(snapshot);
+  if (snapshot.collectionDisplay) { sheet.getRow(headerStart).values = headers; headerRow(sheet, headerStart); } else {
+  for (let column = 1; column <= 5; column++) { sheet.mergeCells(headerStart, column, headerStart + 1, column); sheet.getCell(headerStart, column).value = headers[column - 1]; }
+  sheet.mergeCells(headerStart, 6, headerStart, headers.length); sheet.getCell(headerStart, 6).value = '负面';
+  headers.slice(5).forEach((label, index) => { sheet.getCell(headerStart + 1, index + 6).value = label.replace(/^负面-/, ''); });
+  headerRow(sheet, headerStart); headerRow(sheet, headerStart + 1);
+  }
+  for (const values of summaryRows(snapshot, {hideRestDays: true})) {
+    if (values[0] === 'MTD') {
+      const number = sheet.rowCount + 1;
+      mergedText(sheet, number, headers.length, customerDailyTableCaption(snapshot), {height: 28});
+      sheet.getCell(number, 1).fill = {type: 'pattern', pattern: 'solid', fgColor: {argb: 'FFF1F1F1'}};
+      sheet.getCell(number, 1).alignment = {vertical: 'middle', horizontal: 'center'};
+    }
+    const row = bodyRow(sheet, values);
+    row.height = 28;
+    if (!snapshot.collectionDisplay && values[0] === 'MTD' && row.number - 2 >= headerStart + 2) {
+      for (let column = 2; column <= headers.length; column++) {
+        const cell = row.getCell(column), letter = cell.address.replace(/\d+$/, '');
+        cell.value = {formula: `SUM(${letter}${headerStart + 2}:${letter}${row.number - 2})`, result: values[column - 1]};
+      }
+    }
+    row.eachCell({includeEmpty: true}, cell => {
+      cell.alignment = {vertical: 'middle', horizontal: 'center'};
+      cell.border = {top: {style: 'thin', color: {argb: 'FFBCC3CB'}}, bottom: {style: 'thin', color: {argb: 'FFBCC3CB'}}, left: {style: 'thin', color: {argb: 'FFBCC3CB'}}, right: {style: 'thin', color: {argb: 'FFBCC3CB'}}};
+    });
+  }
+}
+
 export function buildCustomerDailyReportWorkbook(snapshot) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'StarVoice';
@@ -133,10 +175,21 @@ export function buildCustomerDailyReportWorkbook(snapshot) {
   workbook.modified = new Date(snapshot.assessedAt);
   const sheet = workbook.addWorksheet('日报');
   const modern = isMonthlyDailyReport(snapshot);
+  const handling = isHandlingDailyReport(snapshot);
   const HEADERS = customerDailySummaryHeaders(snapshot);
   configureSheet(sheet, HEADERS.length);
   mergedText(sheet, 1, HEADERS.length, customerDailyReportTitle(snapshot), {title: true});
-  mergedText(sheet, 2, HEADERS.length, CUSTOMER_DAILY_SECTIONS.summary);
+  mergedText(sheet, 2, HEADERS.length, customerDailySections(snapshot).summary);
+  if (handling) {
+    [21, 17, 15, 12, 12, 20, 24, 27, 19].forEach((width, i) => { sheet.getColumn(i + 1).width = width; });
+    let startRow = 4;
+    for (const [index, table] of customerDailyTables(snapshot).entries()) {
+      if (index > 0) { startRow = sheet.rowCount + 3; mergedText(sheet, startRow, HEADERS.length, table.title); startRow += 2; }
+      appendGroupedSummary(sheet, table.snapshot, startRow);
+    }
+    sheet.views = [{state: 'frozen', ySplit: 5}];
+    sheet.pageSetup.printTitlesRow = '4:5';
+  } else {
   if (modern) {
     sheet.getRow(4).values = HEADERS;
     headerRow(sheet, 4);
@@ -163,19 +216,21 @@ export function buildCustomerDailyReportWorkbook(snapshot) {
   }
   sheet.views = [{state: 'frozen', ySplit: modern ? 4 : 5}];
   sheet.pageSetup.printTitlesRow = modern ? '4:4' : '4:5';
+  }
 
   const heat = workbook.addWorksheet('高热负面');
-  configureSheet(heat, 5);
+  configureSheet(heat, handling ? 6 : 5);
   [9, 64, 16, 14, 24].forEach((width, i) => { heat.getColumn(i + 1).width = width; });
-  mergedText(heat, 1, 5, customerDailyReportTitle(snapshot), {title: true});
-  mergedText(heat, 2, 5, CUSTOMER_DAILY_SECTIONS.heat);
-  heat.getRow(4).values = ['排名', '标题', '平台', '热度', '较昨日'];
+  if (handling) heat.getColumn(6).width = 30;
+  mergedText(heat, 1, handling ? 6 : 5, customerDailyReportTitle(snapshot), {title: true});
+  mergedText(heat, 2, handling ? 6 : 5, customerDailySections(snapshot).heat);
+  heat.getRow(4).values = ['排名', '标题', '平台', '热度', '较昨日', ...(handling ? ['处理状态'] : [])];
   headerRow(heat, 4);
   for (const [index, post] of (snapshot.highHeat || []).entries()) {
-    const row = bodyRow(heat, [`TOP${index + 1}`, text(post.title), sourceLabel(post), n(post.heat), customerDailyPostComparison(post).replace(/^较昨日 /, '')]);
+    const row = bodyRow(heat, [`TOP${index + 1}`, text(post.title), sourceLabel(post), n(post.heat), customerDailyPostComparison(post).replace(/^较昨日 /, ''), ...(handling ? [customerDailyPostStatus(post)] : [])]);
     hyperlink(row.getCell(2), post.title, post.url);
   }
-  if (!snapshot.highHeat?.length) mergedText(heat, 5, 5, '暂未检出符合条件的帖子。');
+  if (!snapshot.highHeat?.length) mergedText(heat, 5, handling ? 6 : 5, '暂未检出符合条件的帖子。');
   heat.views = [{state: 'frozen', ySplit: 4}]; heat.pageSetup.printTitlesRow = '4:4';
 
   const cold = workbook.addWorksheet('本期冷处理');

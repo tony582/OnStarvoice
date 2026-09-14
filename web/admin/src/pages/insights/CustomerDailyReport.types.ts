@@ -28,8 +28,18 @@ export type DailyPost = {
   isHistorical?: boolean
   stale?: boolean
   status?: string
+  feishuTableNo?: string | null
   quality?: 'measured' | 'measured_ingestion_time' | 'legacy_unverified'
   timeSource?: 'capture_timestamp' | 'ingested_at'
+}
+
+export type DailySummary = {
+  format?: 'daily_disposition_v2' | 'daily_handling_v3'
+  mtdBasis?: 'daily_sum'
+  dayDate?: string
+  rows?: Array<{ date: string; isWorkingDay: boolean; counts: DailyCounts }>
+  day: DailyCounts
+  mtd: DailyCounts
 }
 
 export type DailySnapshot = {
@@ -48,13 +58,8 @@ export type DailySnapshot = {
   assessedAt: string
   monthStart: string
   heatStart: string
-  summary: {
-    format?: 'daily_disposition_v2'
-    dayDate?: string
-    rows?: Array<{ date: string; isWorkingDay: boolean; counts: DailyCounts }>
-    day: DailyCounts
-    mtd: DailyCounts
-  }
+  summary: DailySummary
+  collectionSummary?: DailySummary
   summaryEdited?: boolean
   highHeat: DailyPost[]
   coldMarked: DailyPost[]

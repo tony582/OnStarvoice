@@ -31,6 +31,7 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     claimUnattendedNegativePatrolItem: claimRotation,
     completeUnattendedNegativePatrolItem: completeRotation,
     failUnattendedNegativePatrolItem: failRotation,
+    DEFAULT_NEGATIVE_PATROL_TRIAGE_STATUSES,
   } = await import('../../../server/services/unattended-negative-patrol.js');
   const {dispatchNextElasticWorkItem, projectNegativePatrolSnapshot} =
     await import('../../../server/routes/capture-cloud.js');
@@ -204,7 +205,7 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     await f.record('exclusive-end', {createdAt: f.scope.windowEnd});
     await f.record('created-in-this-run', {createdAt: f.scope.windowEnd});
     await f.record('not-monitored', {status: 'reviewed_non_monitor'});
-    await f.record('not-visible', {status: 'unavailable'});
+    const formerlyUnavailable = await f.record('currently-in-scope-status', {status: 'unavailable'});
     await f.record('archived', {archived: true});
     await f.record('other-keyword', {keyword: '其他品牌'});
     await f.record('positive', {sentiment: 'positive'});
@@ -219,12 +220,12 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     await other.record('other-tenant');
     const loaded = await withTransaction(tx => loadCandidates(tx, {...f.scope, persistCandidates: true}));
     assert.deepEqual(new Set(loaded.candidates.map(row => row.recordId)),
-      new Set([start.id, cold.id, feishu.id, privacy.id, xhs.id, missingDate.id, oldPublication.id]));
+      new Set([start.id, cold.id, feishu.id, privacy.id, xhs.id, missingDate.id, oldPublication.id, formerlyUnavailable.id]));
     assert.equal(loaded.candidates.filter(row => row.platform === 'douyin')[0].recordId, start.id);
-    assert.equal(loaded.summary.firstPending, 7);
+    assert.equal(loaded.summary.firstPending, 8);
     assert.equal(loaded.summary.unknownPublishTime, 0);
     assert.equal(loaded.summary.exclusionReasons.triage_reviewed_non_monitor, 1);
-    assert.equal(loaded.summary.exclusionReasons.triage_unavailable, 1);
+    assert.equal(loaded.summary.exclusionReasons.triage_unavailable, undefined);
     assert.equal(loaded.candidates.find(row => row.recordId === cold.id).dueReason, 'first_patrol');
     const next = await withTransaction(tx => loadCandidates(tx, {...f.scope,
       runStartedAt: '2026-09-09T01:00:00Z', persistCandidates: true}));
@@ -597,7 +598,8 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     });
     assert.equal(created.status, 201, JSON.stringify(created.body));
     const template = (await pool.query('SELECT * FROM capture_tasks WHERE id=$1', [requestKey])).rows[0];
-    assert.deepEqual(template.metadata.planSnapshot.negativePatrol, {enabled: true, lookbackDays: 7});
+    const defaultPatrol = {enabled: true, lookbackDays: 7, triageStatuses: [...DEFAULT_NEGATIVE_PATROL_TRIAGE_STATUSES]};
+    assert.deepEqual(template.metadata.planSnapshot.negativePatrol, defaultPatrol);
     const items = (await pool.query('SELECT * FROM capture_task_items WHERE task_id=$1', [template.id])).rows;
     const activated = await http.post(`/api/capture-cloud/orchestrations/${template.id}/dispatch`, {
       expectedRevision: 0, eligibleAgentIds: f.agents.map(agent => agent.id),
@@ -605,13 +607,13 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     });
     assert.ok([200, 201].includes(activated.status), JSON.stringify(activated.body));
     const schedule = (await pool.query('SELECT * FROM capture_orchestration_schedules WHERE template_task_id=$1', [template.id])).rows[0];
-    assert.deepEqual(schedule.plan_snapshot.negativePatrol, {enabled: true, lookbackDays: 7});
+    assert.deepEqual(schedule.plan_snapshot.negativePatrol, defaultPatrol);
     const edited = await http.patch(`/api/capture-cloud/orchestrations/${template.id}/schedule`, {
       ...plan, title: 'Title changed without touching patrol', expectedRevision: Number(schedule.revision),
     });
     assert.equal(edited.status, 200, JSON.stringify(edited.body));
     const retained = (await pool.query('SELECT * FROM capture_orchestration_schedules WHERE id=$1', [schedule.id])).rows[0];
-    assert.deepEqual(retained.plan_snapshot.negativePatrol, {enabled: true, lookbackDays: 7});
+    assert.deepEqual(retained.plan_snapshot.negativePatrol, defaultPatrol);
     const disabled = await http.patch(`/api/capture-cloud/orchestrations/${template.id}/schedule`, {
       ...plan, expectedRevision: Number(retained.revision), negativePatrol: {enabled: false, lookbackDays: 7},
     });
@@ -623,6 +625,78 @@ test('unattended negative patrol preserves real scheduling, dispatch and durable
     const materialized = await http.post(`/api/capture-cloud/orchestrations/${template.id}/schedule/run-now`, {requestKey: randomUUID()});
     assert.equal(materialized.status, 201, JSON.stringify(materialized.body));
     assert.deepEqual((await pool.query('SELECT item_type FROM capture_task_items WHERE task_id=$1', [materialized.body.runTaskId])).rows.map(row => row.item_type), ['keyword']);
+  });
+
+  await t.test('status selections match HTTP preview, saved plans and actual frozen run candidates; edits apply next round', async st => {
+    const f = await fixture(st, {runStartedAt: new Date().toISOString()});
+    const http = await authenticatedHttp(st, f);
+    const nonMonitor = await f.record('explicitly-selected-non-monitor', {status: 'reviewed_non_monitor'});
+    const replied = await f.record('replied-next-round', {status: 'replied'});
+    await f.record('unhandled-default');
+    await f.record('selected-but-deleted', {status: 'reviewed_non_monitor', availability: 'deleted'});
+    await f.record('selected-but-archived', {status: 'reviewed_non_monitor', archived: true});
+    const requestKey = randomUUID();
+    const plan = {requestKey, title: 'Selectable status patrol', platform: 'douyin',
+      executionMode: 'unattended_plan', distributionMode: 'elastic_pool', keywords: [KEYWORD],
+      agentIds: f.agents.map(agent => agent.id), schedule: {mode: 'daily', startTime: '09:00'},
+      keywordMaxDetectedItems: 2, maxRounds: 1};
+    const previewPath = '/api/capture-cloud/orchestrations/negative-patrol-preview';
+    const previewBody = {platform: 'douyin', keywords: [KEYWORD]};
+    const defaultPreview = await http.post(previewPath, previewBody);
+    assert.equal(defaultPreview.status, 200);
+    assert.ok(!defaultPreview.body.candidates.some(candidate => candidate.recordId === nonMonitor.id));
+    for (const triageStatuses of [[], ['bogus'], null]) {
+      const invalid = await http.post(previewPath, {...previewBody, negativePatrol: {enabled: true, triageStatuses}});
+      assert.equal(invalid.status, 400);
+      const invalidCreate = await http.post('/api/capture-cloud/orchestrations', {
+        ...plan, requestKey: randomUUID(), negativePatrol: {enabled: true, triageStatuses},
+      });
+      assert.equal(invalidCreate.status, 400);
+    }
+    const negativePatrol = {enabled: true, lookbackDays: 7, triageStatuses: ['reviewed_non_monitor']};
+    const preview = await http.post(previewPath, {...previewBody, negativePatrol});
+    assert.equal(preview.status, 200);
+    assert.deepEqual(preview.body.triageStatuses, negativePatrol.triageStatuses);
+    assert.deepEqual(preview.body.candidates.map(candidate => candidate.recordId), [nonMonitor.id]);
+    const created = await http.post('/api/capture-cloud/orchestrations', {...plan, negativePatrol});
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const templateItems = (await pool.query('SELECT * FROM capture_task_items WHERE task_id=$1', [requestKey])).rows;
+    const activated = await http.post(`/api/capture-cloud/orchestrations/${requestKey}/dispatch`, {
+      expectedRevision: 0, eligibleAgentIds: f.agents.map(agent => agent.id),
+      assignments: templateItems.map(item => ({itemId: item.id, agentId: f.agents[0].id})),
+    });
+    assert.ok([200, 201].includes(activated.status), JSON.stringify(activated.body));
+    const scheduleRow = async () => (await pool.query('SELECT * FROM capture_orchestration_schedules WHERE template_task_id=$1', [requestKey])).rows[0];
+    let saved = await scheduleRow();
+    assert.deepEqual(saved.plan_snapshot.negativePatrol, negativePatrol);
+    // An older editor that only knows the enable switch must not reset a saved selection.
+    const retained = await http.patch(`/api/capture-cloud/orchestrations/${requestKey}/schedule`, {
+      ...plan, expectedRevision: Number(saved.revision), negativePatrol: {enabled: true},
+    });
+    assert.equal(retained.status, 200, JSON.stringify(retained.body));
+    saved = await scheduleRow();
+    assert.deepEqual(saved.plan_snapshot.negativePatrol.triageStatuses, ['reviewed_non_monitor']);
+    const first = await http.post(`/api/capture-cloud/orchestrations/${requestKey}/schedule/run-now`, {requestKey: randomUUID()});
+    assert.equal(first.status, 201, JSON.stringify(first.body));
+    const firstItems = (await pool.query('SELECT * FROM capture_task_items WHERE task_id=$1 ORDER BY ordinal', [first.body.runTaskId])).rows;
+    assert.deepEqual(firstItems.filter(item => item.item_type === 'negative_post').map(item => item.record_id), [nonMonitor.id]);
+    saved = await scheduleRow();
+    const edited = await http.patch(`/api/capture-cloud/orchestrations/${requestKey}/schedule`, {
+      ...plan, expectedRevision: Number(saved.revision), negativePatrol: {enabled: true, triageStatuses: ['replied']},
+    });
+    assert.equal(edited.status, 200, JSON.stringify(edited.body));
+    const frozen = (await pool.query('SELECT metadata FROM capture_tasks WHERE id=$1', [first.body.runTaskId])).rows[0].metadata;
+    assert.deepEqual(frozen.negativePatrolRun.triageStatuses, ['reviewed_non_monitor']);
+    assert.deepEqual((await pool.query('SELECT record_id FROM capture_task_items WHERE task_id=$1 AND item_type=\'negative_post\'', [first.body.runTaskId])).rows.map(item => item.record_id), [nonMonitor.id]);
+    // Completing the keyword permits existing unclaimed patrols to roll over normally.
+    await pool.query("UPDATE capture_task_items SET status='completed',finished_at=now() WHERE task_id=$1 AND item_type='keyword'", [first.body.runTaskId]);
+    const next = await http.post(`/api/capture-cloud/orchestrations/${requestKey}/schedule/run-now`, {requestKey: randomUUID()});
+    assert.equal(next.status, 201, JSON.stringify(next.body));
+    assert.deepEqual((await pool.query("SELECT record_id FROM capture_task_items WHERE task_id=$1 AND item_type='negative_post'", [next.body.runTaskId])).rows.map(item => item.record_id), [replied.id]);
+    const nextRun = (await pool.query('SELECT metadata FROM capture_tasks WHERE id=$1', [next.body.runTaskId])).rows[0].metadata;
+    assert.deepEqual(nextRun.negativePatrolRun.triageStatuses, ['replied']);
+    const nextPreview = await http.post(previewPath, {...previewBody, negativePatrol: {enabled: true, triageStatuses: ['replied']}});
+    assert.deepEqual(nextPreview.body.candidates.map(candidate => candidate.recordId), [replied.id]);
   });
 
   await t.test('restoring failed items does not bypass the frozen window or a new non-monitoring decision', async st => {

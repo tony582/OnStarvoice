@@ -475,6 +475,7 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
         tenantId: schedule.tenant_id,
         platforms: [schedule.platform],
         keywords: templateItems.map(item => item.keyword),
+        triageStatuses: planSnapshot.negativePatrol.triageStatuses,
         runStartedAt: schedulerNow.toISOString(),
         timezone: schedule.timezone || 'Asia/Shanghai',
       })
