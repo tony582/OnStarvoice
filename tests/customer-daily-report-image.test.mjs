@@ -65,3 +65,18 @@ test('v3 PNG contains two distinct tables, grouped handling headers and no empty
   source.collectionSummary.mtd.monitor = -1;
   assert.throws(() => renderCustomerDailySummaryPng(source), /数值无效/);
 });
+
+test('v4 PNG preserves the grouped nine-column layout for a single collection table and one frozen MTD', () => {
+  const value = {monitor: 2, sdb: 2, positive: 1, neutral: 0, negative: 1, cold: 1, comment: 0, negativeProcess: 0, negativeOther: 0};
+  const source = {schemaVersion: 4, reportDate: '2026-09-07', summary: {format: 'daily_collection_v4', day: value, mtd: {...value, monitor: 15}, rows: [
+    {date: '2026-09-05', isWorkingDay: false, counts: {monitor: 0}}, {date: '2026-09-06', isWorkingDay: false, counts: value},
+  ]}};
+  const svg = renderCustomerDailySummarySvg(source);
+  for (const label of ['每日舆情处理量', '首次入库采集统计', '平台监控量', '走负面处理流程', '本月去重累计', '2026/9/6']) assert.ok(svg.includes(label));
+  assert.doesNotMatch(svg, /实际采集量|本月处理累计|本月采集去重累计|2026\/9\/5|休假|>休<|NaN|undefined/);
+  assert.equal((svg.match(/>MTD</g) || []).length, 1);
+  assert.match(svg, />15<\/text>/);
+  const png = renderCustomerDailySummaryPng(source);
+  assert.equal(png.readUInt32BE(16), 1407);
+  assert.equal(png.readUInt32BE(20), 354);
+});

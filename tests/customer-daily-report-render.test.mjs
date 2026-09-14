@@ -167,3 +167,37 @@ test('v3 status labels distinguish missing and unknown states and attach numbers
   assert.equal(customerDailyPostStatus({status: 'negative_feishu', feishuTableNo: '  FS-001\n'}), '飞书表 · FS-001');
   assert.equal(customerDailyPostStatus({status: 'negative_cold', feishuTableNo: 'old-number'}), '冷处理');
 });
+
+test('v4 exports one full collection table in grouped styling with frozen distinct MTD and high heat statuses', async () => {
+  const source = handlingFixture();
+  source.schemaVersion = 4;
+  source.summary = {...source.collectionSummary, format: 'daily_collection_v4'};
+  source.summary.rows.push({date: '2026-09-06', isWorkingDay: false, counts: {...source.summary.day, monitor: 5}});
+  source.summary.rows.sort((a, b) => a.date.localeCompare(b.date));
+  delete source.collectionSummary;
+  const original = structuredClone(source);
+  const html = renderCustomerDailyReportHtml(source), text = renderCustomerDailyReportText(source);
+  for (const output of [html, text]) {
+    for (const label of ['一、每日舆情处理量', '首次入库采集统计', '平台监控量', '本月去重累计', '走负面处理流程', '二、7天内热度值≥200的负面帖子', '三、本期冷处理负面帖', '处理状态：飞书表 · FS-2026-08']) assert.ok(output.includes(label));
+    assert.doesNotMatch(output, /实际采集量|本月处理累计|本月采集去重累计|2026\/9\/5|休假|休息日/);
+    assert.match(output, /2026\/9\/6/);
+  }
+  assert.equal((html.match(/<table\b/g) || []).length, 1);
+  assert.match(html, /colspan="4" scope="colgroup">负面/);
+  assert.equal((text.match(/MTD\t/g) || []).length, 1);
+  assert.match(text, /MTD\t17\t/);
+  const workbook = buildCustomerDailyReportWorkbook(source);
+  const reopened = new workbook.constructor();
+  await reopened.xlsx.load(await workbook.xlsx.writeBuffer());
+  const sheet = reopened.getWorksheet('日报');
+  assert.equal(sheet.getCell('A3').value, '首次入库采集统计');
+  assert.equal(sheet.getCell('B4').value, '平台监控量');
+  assert.ok(sheet.model.merges.includes('F4:I4'));
+  const mtdRows = [];
+  sheet.eachRow(row => { if (row.getCell(1).value === 'MTD') mtdRows.push(row); });
+  assert.equal(mtdRows.length, 1);
+  assert.equal(mtdRows[0].getCell(2).value, 17);
+  for (let column = 2; column <= 9; column++) assert.equal(typeof mtdRows[0].getCell(column).value, 'number', 'every frozen collection MTD cell remains a value, never SUM');
+  assert.equal(reopened.getWorksheet('高热负面').getCell('F7').value, '飞书表 · FS-2026-08');
+  assert.deepEqual(source, original);
+});

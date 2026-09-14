@@ -8,7 +8,7 @@ const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf
 const compiled = ts.transpileModule(source('web/admin/src/lib/post-judgment.ts'), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { postJudgment, normalizePostIntent, appendPostIntentFilter, POST_INTENT_OPTIONS } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { postJudgment, normalizePostIntent, initialPostIntentFilter, appendPostIntentFilter, POST_INTENT_OPTIONS, ALL_POST_INTENTS } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 
 test('four public post intents preserve legacy suggestions and keep missing values unjudged', () => {
   assert.deepEqual(POST_INTENT_OPTIONS.map(option => option.value), ['share', 'other', 'complaint', 'inquiry']);
@@ -26,11 +26,30 @@ test('multi-select intent query carries only selected categories and all-select 
   appendPostIntentFilter(subset, ['complaint', 'inquiry', 'complaint']);
   assert.deepEqual(subset.getAll('intent'), ['complaint', 'inquiry']);
   assert.equal(subset.get('keyword'), '哨兵');
-  for (const values of [[], ['share', 'other', 'complaint', 'inquiry']]) {
+  const all = new URLSearchParams({ intent: 'complaint' });
+  appendPostIntentFilter(all, ['share', 'other', 'complaint', 'inquiry']);
+  assert.equal(all.has('intent'), false);
+  const none = new URLSearchParams({ keyword: '哨兵', intent: 'complaint' });
+  appendPostIntentFilter(none, []);
+  assert.deepEqual(none.getAll('intent'), ['none']);
+  assert.equal(none.get('keyword'), '哨兵');
+});
+
+test('default intent selection stores all four and the last uncheck remains explicitly empty', () => {
+  for (const value of [undefined, null, '', 'unknown']) assert.deepEqual(initialPostIntentFilter(value), ALL_POST_INTENTS);
+  assert.deepEqual(initialPostIntentFilter('complaint,inquiry'), ['complaint', 'inquiry']);
+  assert.deepEqual(initialPostIntentFilter('none'), []);
+  let selected = initialPostIntentFilter();
+  for (const intent of ALL_POST_INTENTS) {
+    selected = selected.filter(value => value !== intent);
     const params = new URLSearchParams();
-    appendPostIntentFilter(params, values);
-    assert.equal(params.has('intent'), false);
+    appendPostIntentFilter(params, selected);
+    assert.deepEqual(params.getAll('intent'), selected.length ? selected : ['none']);
   }
+  assert.deepEqual(selected, []);
+  const fresh = initialPostIntentFilter();
+  fresh.pop();
+  assert.equal(initialPostIntentFilter().length, 4);
 });
 
 test('relevance degree is independent from judgment confidence, missing values are never fabricated as zero', () => {
@@ -68,7 +87,7 @@ test('list, mobile, board and drawer expose intent and relevance with one filter
   assert.ok(header.indexOf('<PostIntentFilter header') < header.indexOf('>相关度</th>'));
   assert.match(queue, /appendPostIntentFilter\(params, intents\)/);
   assert.match(queue, /useSelection\(`[^`]*\$\{intents\}/);
-  assert.match(queue, /setIntents\(\[\]\)/);
+  assert.match(queue, /setIntents\(\[\.\.\.ALL_POST_INTENTS\]\)/);
   assert.match(queue, /api\.download\('\/triage\/records\/export\?' \+ filterParams\(\)/);
   for (const text of [queue, board, drawer]) {
     assert.match(text, /<PostIntentBadge record=\{r\}/);
@@ -97,11 +116,14 @@ test('opening a drawer allows filters to wrap and keeps their labels horizontal'
   assert.match(component, /inline-flex shrink-0 items-center gap-1 whitespace-nowrap/);
 });
 
-test('unfiltered intent menu visibly selects all four and offers an explicit restore-all action', () => {
+test('intent menu uses an actual tri-state all checkbox and does not reinterpret empty as all', () => {
   const component = source('web/admin/src/components/shared/PostJudgment.tsx');
-  assert.match(component, /const allSelected = value\.length === 0 \|\| value\.length === POST_INTENT_OPTIONS\.length/);
-  assert.match(component, /const selected = allSelected \? POST_INTENT_OPTIONS\.map/);
+  assert.match(component, /const allSelected = ALL_POST_INTENTS\.every/);
+  assert.match(component, /const selected = value/);
   assert.match(component, /checked=\{selected\.includes\(option\.value\)\}/);
-  assert.match(component, /<DropdownMenu\.Item onSelect=\{event => \{ event\.preventDefault\(\); onChange\(\[\]\) \}\}/);
+  assert.match(component, /<DropdownMenu\.CheckboxItem checked=\{allSelected \? true : value\.length \? 'indeterminate' : false\}/);
+  assert.match(component, /onChange\(allSelected \? \[\] : \[\.\.\.ALL_POST_INTENTS\]\)/);
+  assert.doesNotMatch(component, /value\.length === 0 \|\|/);
   assert.match(component, /全部意图包含尚未判断的内容/);
+  assert.match(component, /未勾选意图，当前不显示任何内容/);
 });

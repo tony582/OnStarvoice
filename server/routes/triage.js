@@ -1,5 +1,6 @@
 import { Router } from 'express';
-import { queryAll, queryOne, withTransaction } from '../db/init.js';
+import { withTransaction } from '../db/init.js';
+import { queryTriageAll as queryAll, queryTriageOne as queryOne } from '../services/record-triage-query.js';
 import {
   requireSessionUser,
   requireTenantAccess,

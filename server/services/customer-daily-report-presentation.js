@@ -8,17 +8,21 @@ export const CUSTOMER_DAILY_SECTIONS = Object.freeze({
 export const CUSTOMER_DAILY_SUMMARY_HEADERS = Object.freeze(['日期', '监控数量', 'SDB范畴', '正向', '中性', '冷处理', '处理中', '已处理']);
 export const CUSTOMER_DAILY_MONTHLY_HEADERS = Object.freeze(['舆情处理日期', '平台监控量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-负面处理流程', '负面-其他']);
 export const isHandlingDailyReport = snapshot => snapshot?.summary?.format === 'daily_handling_v3' && Array.isArray(snapshot.summary.rows);
-export const isMonthlyDailyReport = snapshot => ['daily_disposition_v2', 'daily_handling_v3'].includes(snapshot?.summary?.format) && Array.isArray(snapshot.summary.rows);
+export const isCollectionDailyReport = snapshot => snapshot?.summary?.format === 'daily_collection_v4' && Array.isArray(snapshot.summary.rows);
+export const isGroupedDailyReport = snapshot => isHandlingDailyReport(snapshot) || isCollectionDailyReport(snapshot);
+export const isMonthlyDailyReport = snapshot => ['daily_disposition_v2', 'daily_handling_v3', 'daily_collection_v4'].includes(snapshot?.summary?.format) && Array.isArray(snapshot.summary.rows);
 export const CUSTOMER_DAILY_HANDLING_HEADERS = Object.freeze(['舆情处理日期', '处理量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-走负面处理流程', '负面-其他']);
-export const customerDailySections = snapshot => isHandlingDailyReport(snapshot) ? {summary: '一、每日舆情处理量', collection: '二、实际采集量', heat: '三、7天内热度值≥200的负面帖子', cold: '四、本期冷处理负面帖'} : CUSTOMER_DAILY_SECTIONS;
+export const CUSTOMER_DAILY_COLLECTION_HEADERS = Object.freeze(['舆情处理日期', '平台监控量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-走负面处理流程', '负面-其他']);
+export const customerDailySummaryBasis = snapshot => isCollectionDailyReport(snapshot) ? '首次入库采集统计' : '';
+export const customerDailySections = snapshot => isCollectionDailyReport(snapshot) ? {...CUSTOMER_DAILY_SECTIONS, summary: '一、每日舆情处理量'} : isHandlingDailyReport(snapshot) ? {summary: '一、每日舆情处理量', collection: '二、实际采集量', heat: '三、7天内热度值≥200的负面帖子', cold: '四、本期冷处理负面帖'} : CUSTOMER_DAILY_SECTIONS;
 export const customerDailyCollectionSnapshot = snapshot => ({...snapshot, summary: snapshot.collectionSummary, collectionDisplay: true});
 export const customerDailyTables = snapshot => [{snapshot, title: customerDailySections(snapshot).summary}, ...(isHandlingDailyReport(snapshot) && snapshot.collectionSummary ? [{snapshot: customerDailyCollectionSnapshot(snapshot), title: customerDailySections(snapshot).collection, collection: true}] : [])];
-export const customerDailyTableCaption = snapshot => snapshot.collectionDisplay ? '本月采集去重累计' : '本月处理累计';
-export const customerDailySummaryHeaders = snapshot => snapshot.collectionDisplay ? ['日报日期', '采集量', 'SDB范畴', '正面', '中性', '负面'] : isHandlingDailyReport(snapshot) ? CUSTOMER_DAILY_HANDLING_HEADERS : isMonthlyDailyReport(snapshot) ? CUSTOMER_DAILY_MONTHLY_HEADERS : CUSTOMER_DAILY_SUMMARY_HEADERS;
+export const customerDailyTableCaption = snapshot => isCollectionDailyReport(snapshot) ? '本月去重累计' : snapshot.collectionDisplay ? '本月采集去重累计' : '本月处理累计';
+export const customerDailySummaryHeaders = snapshot => isCollectionDailyReport(snapshot) ? CUSTOMER_DAILY_COLLECTION_HEADERS : snapshot.collectionDisplay ? ['日报日期', '采集量', 'SDB范畴', '正面', '中性', '负面'] : isHandlingDailyReport(snapshot) ? CUSTOMER_DAILY_HANDLING_HEADERS : isMonthlyDailyReport(snapshot) ? CUSTOMER_DAILY_MONTHLY_HEADERS : CUSTOMER_DAILY_SUMMARY_HEADERS;
 
 function count(value) { return Number(value) || 0; }
 
-export function customerDailySummaryRows(snapshot, {hideRestDays = isHandlingDailyReport(snapshot)} = {}) {
+export function customerDailySummaryRows(snapshot, {hideRestDays = isGroupedDailyReport(snapshot)} = {}) {
   if (snapshot.collectionDisplay) {
     const values = (label, counts = {}) => [label, ...['monitor', 'sdb', 'positive', 'neutral', 'negative'].map(field => count(counts[field]))];
     return [...snapshot.summary.rows.filter(row => row.isWorkingDay !== false || count(row.counts?.monitor) > 0).map(row => {

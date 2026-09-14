@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {dailyPostStatusLabel, isHandlingSummary, isMonthlySummary, monthlyDraftFromRows, parseMonthlyDraft, sumMonthlyRows, visibleMonthlyRows} from '../web/admin/src/pages/insights/CustomerDailyReport.summary.mjs';
+import {dailyPostStatusLabel, isCollectionSummary, isHandlingSummary, isMonthlySummary, monthlyDraftFromRows, monthlyFields, monthlySummaryTotals, parseMonthlyDraft, sumMonthlyRows, visibleMonthlyRows} from '../web/admin/src/pages/insights/CustomerDailyReport.summary.mjs';
 
 const counts = {monitor: 30, sdb: 25, positive: 3, neutral: 15, cold: 2, comment: 2, negativeProcess: 2, negativeOther: 1};
 const rows = [
@@ -79,6 +79,66 @@ test('high-heat post status labels show disposition and only attach a table numb
   assert.equal(dailyPostStatusLabel({status: 'negative_feishu'}), '飞书表');
   assert.equal(dailyPostStatusLabel({status: 'future_status'}), '状态待核对');
   assert.equal(dailyPostStatusLabel({}), '状态未记录');
+});
+
+test('v4 collection schema is explicit and does not reinterpret frozen v1, v2 or v3 reports', () => {
+  for (const [schemaVersion, format] of [[1, undefined], [2, 'daily_disposition_v2'], [3, 'daily_handling_v3'], [3, 'daily_collection_v4']]) {
+    assert.equal(isCollectionSummary({schemaVersion, summary: {format, rows}}), false);
+  }
+  const snapshot = {schemaVersion: 4, summary: {format: 'daily_collection_v4', mtdBasis: 'distinct_records', rows, mtd: counts}};
+  assert.equal(isCollectionSummary(snapshot), true);
+  assert.equal(isMonthlySummary(snapshot), true);
+  assert.equal(isHandlingSummary(snapshot), false);
+  assert.equal(monthlySummaryTotals(snapshot, null), counts);
+});
+
+test('v4 preview adjusts the frozen distinct MTD by edits instead of replacing it with the daily sum', () => {
+  const mtd = {monitor: 50, sdb: 45, positive: 8, neutral: 20, cold: 5, comment: 4, negativeProcess: 5, negativeOther: 3};
+  const snapshot = {schemaVersion: 4, summary: {format: 'daily_collection_v4', mtdBasis: 'distinct_records', rows, mtd}};
+  const draft = monthlyDraftFromRows(rows);
+  assert.deepEqual(monthlySummaryTotals(snapshot, draft), mtd);
+  draft['2026-09-01'].monitor = '40';
+  assert.equal(monthlySummaryTotals(snapshot, draft).monitor, 60);
+  assert.equal(sumMonthlyRows(rows, draft).monitor, 80);
+  draft['2026-09-01'].monitor = '30';
+  assert.deepEqual(monthlySummaryTotals(snapshot, draft), mtd);
+  for (const [schemaVersion, format] of [[2, 'daily_disposition_v2'], [3, 'daily_handling_v3']]) {
+    const legacy = {schemaVersion, summary: {format, rows: rows.slice(0, 2), mtd}};
+    assert.equal(monthlySummaryTotals(legacy, null), mtd);
+    assert.equal(monthlySummaryTotals(legacy, draft).monitor, 70);
+  }
+});
+
+test('v4 preview rejects invalid monthly totals without clamping or losing intermediate integer precision', () => {
+  const zero = Object.fromEntries(monthlyFields.map(field => [field, 0]));
+  const max = Number.MAX_SAFE_INTEGER;
+  const safeRows = [0, 0, max].map((monitor, index) => ({date: `2026-09-0${index + 1}`, isWorkingDay: true, counts: {...zero, monitor}}));
+  const snapshot = {schemaVersion: 4, summary: {format: 'daily_collection_v4', rows: safeRows, mtd: zero}};
+  const draft = monthlyDraftFromRows(safeRows);
+  draft['2026-09-01'].monitor = String(max);
+  draft['2026-09-02'].monitor = String(max);
+  draft['2026-09-03'].monitor = '0';
+  assert.equal(monthlySummaryTotals(snapshot, draft).monitor, max);
+  assert.throws(() => monthlySummaryTotals({...snapshot, summary: {...snapshot.summary, mtd: {...zero, monitor: 1}}}, draft), /月累计超出有效范围/u);
+  const negative = monthlyDraftFromRows(safeRows);
+  negative['2026-09-03'].monitor = '0';
+  assert.throws(() => monthlySummaryTotals(snapshot, negative), /月累计超出有效范围/u);
+  const badSdb = monthlyDraftFromRows(safeRows);
+  badSdb['2026-09-01'].sdb = '1';
+  assert.throws(() => monthlySummaryTotals(snapshot, badSdb), /SDB月累计不能大于/u);
+  const badSentiment = monthlyDraftFromRows(safeRows);
+  badSentiment['2026-09-01'].positive = '1';
+  assert.throws(() => monthlySummaryTotals(snapshot, badSentiment), /不能大于SDB范畴/u);
+});
+
+test('v4 single-table presentation retains legacy dual-table visibility only for handling v3', () => {
+  const view = readFileSync(new URL('../web/admin/src/pages/insights/CustomerDailyReport.tsx', import.meta.url), 'utf8');
+  assert.match(view, /isHandlingSummary\(snapshot\) && snapshot\.collectionSummary && <CollectionSummaryTable/u);
+  assert.match(view, /handling \|\| collection \? '一、每日舆情处理量'/u);
+  assert.match(view, /collection \? '本月去重累计'/u);
+  assert.match(view, /monthlySummaryTotals\(snapshot, draft\)/u);
+  assert.match(view, /MTD 在原去重累计上增减对应修改差额/u);
+  assert.match(view, /disabled=\{busy \|\| !!totalsError\}/u);
 });
 
 test('the empty insights entry defaults to daily while explicit dashboard navigation remains available', () => {

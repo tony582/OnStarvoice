@@ -2,7 +2,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import {renderCustomerDailySummaryPng} from './customer-daily-report-image.js';
 import {buildFeishuDailyPost, FEISHU_DAILY_POST_IMAGE_PLACEHOLDER} from './feishu-daily-report-message.js';
 import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryHeaders, isMonthlyDailyReport, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform,
-  customerDailyColdTitle, customerDailyColdPostLabel, customerDailyColdEmpty, isHandlingDailyReport, customerDailyTables, customerDailySections, customerDailyPostStatus, customerDailyTableCaption} from './customer-daily-report-presentation.js';
+  customerDailyColdTitle, customerDailyColdPostLabel, customerDailyColdEmpty, isGroupedDailyReport, customerDailySummaryBasis, customerDailyTables, customerDailySections, customerDailyPostStatus, customerDailyTableCaption} from './customer-daily-report-presentation.js';
 
 // Official contracts: /document/develop-robots/add-bot-to-external-group,
 // docx-v1/document-block-descendant/create, document-block/patch,
@@ -86,7 +86,7 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
     throw invalid('日报快照不完整');
   }
   const modern = isMonthlyDailyReport(snapshot);
-  const handling = isHandlingDailyReport(snapshot);
+  const handling = isGroupedDailyReport(snapshot);
   const mergeTargets = [];
   const handlingTables = handling ? customerDailyTables(snapshot).map((item, tableIndex) => {
     const headers = customerDailySummaryHeaders(item.snapshot);
@@ -99,7 +99,7 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
     for (let column = 0; column < 5; column++) mergeTargets.push({tableIndex, columns: 9, range: [0, 2, column, column + 1]});
     mergeTargets.push({tableIndex, columns: 9, range: [0, 1, 5, 9]});
     }
-    return {title: item.title, block: {block_type: 31, table: {property: {row_size: values.length, column_size: headers.length, column_width: item.collection ? [140, 110, 100, 100, 100, 100] : [140, 110, 100, 80, 80, 120, 150, 170, 110], header_row: true}}, nodes: values.flatMap((row, rowIndex) => row.map(value => ({block_type: 32, table_cell: {}, nodes: [textNode([run(value, null, rowIndex < (item.collection ? 1 : 2))])]})))}};
+    return {title: item.title, basis: customerDailySummaryBasis(item.snapshot), block: {block_type: 31, table: {property: {row_size: values.length, column_size: headers.length, column_width: item.collection ? [140, 110, 100, 100, 100, 100] : [140, 110, 100, 80, 80, 120, 150, 170, 110], header_row: true}}, nodes: values.flatMap((row, rowIndex) => row.map(value => ({block_type: 32, table_cell: {}, nodes: [textNode([run(value, null, rowIndex < (item.collection ? 1 : 2))])]})))}};
   }) : [];
   const rows = [
     ...(modern ? [customerDailySummaryHeaders(snapshot)] : [
@@ -113,7 +113,7 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
     nodes: [textNode([run(value, null, rowIndex < (modern ? 1 : 2))])] }))) };
   const nodes = [
     textNode(`${snapshot.tenantName || '客户'}舆情日报｜${snapshot.reportDate}${snapshot.mode === 'realtime' ? ' · 实时版' : ''}` , 3),
-    ...(handling ? handlingTables.flatMap(item => [textNode(item.title, 4), item.block]) : [textNode(CUSTOMER_DAILY_SECTIONS.summary, 4), table]),
+    ...(handling ? handlingTables.flatMap(item => [textNode(item.title, 4), ...(item.basis ? [textNode(item.basis)] : []), item.block]) : [textNode(CUSTOMER_DAILY_SECTIONS.summary, 4), table]),
     textNode(customerDailySections(snapshot).heat, 4),
   ];
   const high = snapshot.highHeat || [];

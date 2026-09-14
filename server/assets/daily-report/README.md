@@ -15,4 +15,6 @@ Rebuild procedure: verify the original SHA-256 above; instantiate the source var
 
 The daily-handling v3 update preserves all 51 prior characters and adds 15 characters: `、一二去实报本每累计走采重际集`. The resulting 66-character subset covers both report tables, section headings, and the separate handling and collection MTD captions. Source SHA-256, font weight, and prior cmap coverage were verified.
 
-Subset SHA-256: 593df4709375d5778f05c4ac6340b94fbdea630c12fae778eecc08bcc299be7b
+The single-table v4 update preserves all 66 prior characters and adds 5 characters: `入库次统首`, for the short first-ingestion collection-basis note. The resulting subset has 71 characters. Source SHA-256, font weight and prior cmap coverage were verified.
+
+Subset SHA-256: 388d4a1531abeddc758de604cab28916826785988f67ee038f42c01bc8155baa

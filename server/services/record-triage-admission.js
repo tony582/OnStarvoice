@@ -1,5 +1,5 @@
 import {
-  GM_POST_ENTITY_PATTERN, GM_CONTEXTUAL_MODEL_PATTERN, GM_VEHICLE_CONTEXT_PATTERN,
+  GM_POST_ENTITY_SQL_PATTERNS, GM_CONTEXTUAL_MODEL_PATTERN, GM_VEHICLE_CONTEXT_PATTERN,
   NON_SAIC_GM_ORG_PATTERN, GENERIC_ENTITY_PATTERN,
   POST_HASHTAG_PATTERN, SENTRY_SCOPE_KEYWORDS, MONITORING_EVIDENCE_VERSION,
   findRecordMonitoringEvidence, isSentryEvidenceScope, normalizeMonitoringEvidence, normalizePostIntent,
@@ -95,7 +95,7 @@ export function recordMainPostEvidenceSql(alias = 'r') {
       CROSS JOIN LATERAL (SELECT ${trimSql(`regexp_replace(COALESCE(raw_text,''),${literal(POST_HASHTAG_PATTERN)},' ','g')`)} AS text) clean
     )
     SELECT 1 FROM post_evidence_sources clean
-    WHERE clean.normalized_text ~* ${literal(GM_POST_ENTITY_PATTERN)}
+    WHERE (${GM_POST_ENTITY_SQL_PATTERNS.map(pattern => `clean.normalized_text ~* ${literal(pattern)}`).join(' OR ')})
       OR (clean.normalized_text ~* ${literal(GM_CONTEXTUAL_MODEL_PATTERN)}
         AND EXISTS (SELECT 1 FROM post_evidence_sources vehicle_context WHERE vehicle_context.normalized_text ~* ${literal(GM_VEHICLE_CONTEXT_PATTERN)}))
       OR EXISTS (
@@ -175,6 +175,7 @@ export function recordIntentSql(alias = 'r') {
 export function appendRecordIntentFilter(where, params, value, alias = 'r') {
   const values = (Array.isArray(value) ? value : [value]).flatMap(entry => String(entry || '').split(',')).map(entry => entry.trim()).filter(Boolean);
   if (!values.length) return where;
+  if (values.length === 1 && values[0] === 'none') return `${where} AND false`;
   const intents = [...new Set(values.map(normalizePostIntent))];
   if (intents.includes('')) {
     const error = new Error('意图筛选仅支持分享、其他、投诉抱怨、咨询');

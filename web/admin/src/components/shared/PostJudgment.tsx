@@ -1,7 +1,7 @@
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
-import { Check, ChevronDown } from 'lucide-react'
+import { Check, ChevronDown, Minus } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { POST_INTENT_OPTIONS, postJudgment } from '@/lib/post-judgment'
+import { ALL_POST_INTENTS, POST_INTENT_OPTIONS, postJudgment } from '@/lib/post-judgment'
 import { StatusPill } from '@/components/ui/badge'
 
 export function PostIntentFilter({ value, onChange, header = false }: {
@@ -9,8 +9,8 @@ export function PostIntentFilter({ value, onChange, header = false }: {
   onChange: (value: string[]) => void
   header?: boolean
 }) {
-  const allSelected = value.length === 0 || value.length === POST_INTENT_OPTIONS.length
-  const selected = allSelected ? POST_INTENT_OPTIONS.map(option => String(option.value)) : value
+  const allSelected = ALL_POST_INTENTS.every(intent => value.includes(intent))
+  const selected = value
   const toggle = (next: string) => {
     const updated = selected.includes(next) ? selected.filter(item => item !== next) : [...selected, next]
     onChange(updated)
@@ -28,6 +28,12 @@ export function PostIntentFilter({ value, onChange, header = false }: {
       <DropdownMenu.Portal>
         <DropdownMenu.Content align={header ? 'end' : 'start'} sideOffset={5} collisionPadding={10}
           className="z-[100] min-w-44 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg">
+          <DropdownMenu.CheckboxItem checked={allSelected ? true : value.length ? 'indeterminate' : false}
+            onCheckedChange={() => onChange(allSelected ? [] : [...ALL_POST_INTENTS])} onSelect={event => event.preventDefault()}
+            className="flex min-h-10 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[12px] outline-none data-[highlighted]:bg-accent lg:min-h-8">
+            <span className="flex-1">全选</span><span className="flex h-4 w-4 items-center justify-center rounded border border-border"><DropdownMenu.ItemIndicator>{allSelected ? <Check className="h-3 w-3 text-primary" /> : <Minus className="h-3 w-3 text-primary" />}</DropdownMenu.ItemIndicator></span>
+          </DropdownMenu.CheckboxItem>
+          <DropdownMenu.Separator className="my-1 h-px bg-border" />
           {POST_INTENT_OPTIONS.map(option => (
             <DropdownMenu.CheckboxItem key={option.value} checked={selected.includes(option.value)}
               onCheckedChange={() => toggle(option.value)} onSelect={event => event.preventDefault()}
@@ -35,12 +41,7 @@ export function PostIntentFilter({ value, onChange, header = false }: {
               <span className="flex-1">{option.label}</span><span className="flex h-4 w-4 items-center justify-center rounded border border-border"><DropdownMenu.ItemIndicator><Check className="h-3 w-3 text-primary" /></DropdownMenu.ItemIndicator></span>
             </DropdownMenu.CheckboxItem>
           ))}
-          <DropdownMenu.Separator className="my-1 h-px bg-border" />
-          <DropdownMenu.Item onSelect={event => { event.preventDefault(); onChange([]) }}
-            className="flex min-h-10 cursor-default items-center gap-2 rounded-md px-2.5 text-[12px] outline-none data-[highlighted]:bg-accent lg:min-h-8">
-            <span className="flex-1">全选</span><span className="flex h-4 w-4 items-center justify-center rounded border border-border">{allSelected && <Check className="h-3 w-3 text-primary" />}</span>
-          </DropdownMenu.Item>
-          <p className="px-2.5 pt-1 text-[10px] leading-4 text-muted-foreground">全部意图包含尚未判断的内容</p>
+          <p className="px-2.5 pt-1 text-[10px] leading-4 text-muted-foreground">{value.length ? '全部意图包含尚未判断的内容' : '未勾选意图，当前不显示任何内容'}</p>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>

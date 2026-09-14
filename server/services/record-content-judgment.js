@@ -33,11 +33,29 @@ const aliasMatchers = aliasEntries.flatMap(entry => entry.aliases.map(alias => {
   const contextual = entry.contextual && !/^[a-z]{1,4}[\s-]*\d{1,3}$/i.test(alias);
   const pattern = alias === '通用' ? `${body}(?=(?:汽车|集团|旗下)|的${VEHICLE_CONTEXT})`
     : contextual ? `(?:${body}(?=${CONTEXT_GAP}${VEHICLE_CONTEXT})|(?:我的|这辆|这台|这款|车主的|驾驶|开着|my\\s+|drive\\s+)${CONTEXT_GAP}${body})` : body;
-  return { alias, pattern, entityPattern: new RegExp(body, 'i') };
+  return { alias, pattern, body, contextual, entityPattern: new RegExp(body, 'i') };
 })).sort((a, b) => b.alias.length - a.alias.length);
 
 // One generated vocabulary drives both query-time and write-time matching.
 export const GM_POST_ENTITY_PATTERN = `(?:${[...new Set(aliasMatchers.map(item => item.pattern))].join('|')})`;
+// PostgreSQL compiles constant regexes while planning even EXPLAIN. Repeating
+// the vehicle-context alternatives per alias causes seconds of cold planning.
+// Factor the common context and bound the remaining direct-name alternatives;
+// the union is identical to GM_POST_ENTITY_PATTERN, with no vocabulary change.
+const contextualBodies = [...new Set(aliasMatchers.filter(item => item.contextual && item.alias !== '通用').map(item => item.body))];
+const contextualBody = `(?:${contextualBodies.join('|')})`;
+const directPatterns = [...new Set(aliasMatchers.filter(item => !item.contextual || item.alias === '通用').map(item => item.pattern))];
+const sqlPatternGroups = [];
+for (const pattern of directPatterns) {
+  const previous = sqlPatternGroups.at(-1);
+  if (!previous || previous.join('|').length + pattern.length > 900) sqlPatternGroups.push([pattern]);
+  else previous.push(pattern);
+}
+export const GM_POST_ENTITY_SQL_PATTERNS = Object.freeze([
+  ...sqlPatternGroups.map(group => `(?:${group.join('|')})`),
+  `(?:${contextualBody}(?=${CONTEXT_GAP}${VEHICLE_CONTEXT})|(?:我的|这辆|这台|这款|车主的|驾驶|开着|my\\s+|drive\\s+)${CONTEXT_GAP}${contextualBody})`,
+]);
+
 // For English model names, vehicle context can be elsewhere in the current
 // post. Adjacency must not reject "LaCrosse怎么开启哨兵" or a model-only title.
 export const GM_CONTEXTUAL_MODEL_PATTERN = `(?:${GM_VEHICLE_ALIASES

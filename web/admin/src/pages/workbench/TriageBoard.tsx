@@ -1,6 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
-import { Loader2, Heart, MessageCircle, FileText, GripVertical } from 'lucide-react'
+import { AlertCircle, RefreshCw, Loader2, Heart, MessageCircle, FileText, GripVertical } from 'lucide-react'
 import { api } from '@/lib/api'
+import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
+import { Button } from '@/components/ui/button'
 import { formatNumber, formatDate, LABELS, platformName, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { getCover } from '@/components/shared/RecordDrawer'
@@ -52,35 +54,61 @@ export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChange
 }) {
   const [cols, setCols] = useState<Record<ColKey, any[]>>(emptyColumns)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [dragId, setDragId] = useState<string | null>(null)
   const [overCol, setOverCol] = useState<ColKey | null>(null)
   const dragFrom = useRef<ColKey | null>(null)
   const requestSeq = useRef(0)
+  const requestAbort = useRef<AbortController | null>(null)
 
   const load = useCallback(() => Promise.resolve().then(async () => {
     const seq = ++requestSeq.current
+    requestAbort.current?.abort()
+    setLoadError('')
+    if (new URLSearchParams(filterQuery).getAll('intent').includes('none')) {
+      setCols(emptyColumns())
+      setLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    requestAbort.current = controller
     setLoading(true)
     try {
-      const results = await Promise.all(COLUMNS.map(column => {
-        const params = new URLSearchParams(filterQuery)
-        params.set('queue', 'triage')
-        params.set('status', column.key)
-        params.set('pageSize', String(PER_COL))
-        return api.get<any>('/triage/records?' + params)
-          .then(data => [column.key, data.records || []] as const)
-          .catch(() => [column.key, []] as const)
-      }))
+      const results = await withTriageReadDeadline(async signal => {
+        const loaded: Array<readonly [ColKey, ReturnType<typeof emptyColumns>[ColKey]]> = []
+        // Avoid nine simultaneous list queries when the database is busy.
+        for (let start = 0; start < COLUMNS.length; start += 2) {
+          signal.throwIfAborted()
+          const batch = await Promise.all(COLUMNS.slice(start, start + 2).map(async column => {
+            const params = new URLSearchParams(filterQuery)
+            params.set('queue', 'triage')
+            params.set('status', column.key)
+            params.set('pageSize', String(PER_COL))
+            const data = await api.request<any>('/triage/records?' + params, { signal })
+            if (!Array.isArray(data.records)) throw new Error('内容响应不完整，请稍后重试。')
+            return [column.key, data.records] as const
+          }))
+          loaded.push(...batch)
+        }
+        return loaded
+      }, controller)
       if (seq !== requestSeq.current) return
       const next = emptyColumns()
       for (const [key, records] of results) next[key] = records
       setCols(next)
+    } catch (error) {
+      controller.abort()
+      if (seq === requestSeq.current) setLoadError(triageLoadError(error))
     } finally {
       if (seq === requestSeq.current) setLoading(false)
     }
   }), [filterQuery])
 
-  useEffect(() => { void load() }, [load, reloadKey])
-  useEffect(() => () => { requestSeq.current += 1 }, [])
+  useEffect(() => {
+    void load()
+    return () => { requestSeq.current += 1; requestAbort.current?.abort() }
+  }, [load, reloadKey])
+  useEffect(() => () => { requestSeq.current += 1; requestAbort.current?.abort() }, [])
 
   const move = useCallback(async (id: string, from: ColKey, to: ColKey) => {
     if (from === to) return
@@ -98,8 +126,11 @@ export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChange
   }, [cols, onChangeMode, refreshBadges])
 
   if (loading) {
-    return <div className="flex items-center justify-center py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
+    return <div role="status" className="flex items-center justify-center gap-2 py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /><span className="text-sm text-muted-foreground">正在加载看板…</span></div>
   }
+
+  if (loadError) return <div role="alert" className="flex flex-col items-center gap-3 rounded-xl border border-destructive/20 bg-card px-5 py-10 text-center"><AlertCircle className="h-6 w-6 text-destructive" /><p className="text-sm font-medium">{loadError}</p><p className="text-xs text-muted-foreground">看板暂未加载完整，当前筛选已保留。</p><Button size="sm" variant="outline" onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" />重试加载</Button></div>
+  if (new URLSearchParams(filterQuery).getAll('intent').includes('none')) return <div className="rounded-xl border border-border bg-card px-5 py-10 text-center"><p className="text-sm font-medium">未勾选意图</p><p className="mt-2 text-xs text-muted-foreground">勾选需要查看的意图，或点击全选恢复全部内容</p></div>
 
   return (
     <div className="overflow-x-auto pb-2">

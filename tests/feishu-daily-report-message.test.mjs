@@ -128,3 +128,11 @@ test('v3 high heat message carries frozen status and feishu number below the com
   for (const label of ['处理状态：冷处理', '处理状态：评论区留言', '处理状态：飞书表 · FS-003', '处理状态：状态未记录']) assert.ok(value.includes(label));
   assert.equal(result.zh_cn.content.flat().filter(node => node.tag === 'img').length, 1);
 });
+
+test('v4 rich message retains collection basis and high heat status with the single summary image', () => {
+  const result = build({schemaVersion: 4, summary: {format: 'daily_collection_v4', rows: []}, highHeat: [{...item(3), status: 'negative_feishu', feishuTableNo: 'FS-003'}]});
+  const value = words(result);
+  for (const label of ['一、每日舆情处理量', '首次入库采集统计', '二、7天内热度值≥200', '三、本期冷处理', '处理状态：飞书表 · FS-003']) assert.ok(value.includes(label));
+  assert.doesNotMatch(value, /实际采集量|四、本期/);
+  assert.equal(result.zh_cn.content.flat().filter(node => node.tag === 'img').length, 1);
+});

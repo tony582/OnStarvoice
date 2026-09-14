@@ -6,6 +6,7 @@ export const POST_INTENT_OPTIONS = [
 ] as const
 
 export type PostIntent = typeof POST_INTENT_OPTIONS[number]['value']
+export const ALL_POST_INTENTS: PostIntent[] = POST_INTENT_OPTIONS.map(option => option.value)
 export type PostRelevance = 'relevant' | 'uncertain' | 'irrelevant'
 
 function object(value: unknown): Record<string, unknown> {
@@ -29,10 +30,19 @@ export function normalizePostIntentFilter(value: unknown): PostIntent[] {
   return [...new Set(values.map(normalizePostIntent).filter((intent): intent is PostIntent => intent !== null))]
 }
 
+export function initialPostIntentFilter(value: unknown): PostIntent[] {
+  if (value == null || value === '') return [...ALL_POST_INTENTS]
+  if (value === 'none') return []
+  const selected = normalizePostIntentFilter(value)
+  return selected.length ? selected : [...ALL_POST_INTENTS]
+}
+
 // No filter, including “全选”, retains records whose intent has not been judged.
 export function appendPostIntentFilter(params: URLSearchParams, intents: string[]): void {
   const selected = normalizePostIntentFilter(intents)
+  params.delete('intent')
   if (selected.length === POST_INTENT_OPTIONS.length) return
+  if (selected.length === 0) { params.set('intent', 'none'); return }
   selected.forEach(intent => params.append('intent', intent))
 }
 

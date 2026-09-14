@@ -9,6 +9,7 @@ import {
   getCommentRiskAttentionPolicy,
 } from '../services/comment-risk-attention.js';
 
+import { queryTriageAll, queryTriageOne } from '../services/record-triage-query.js';
 import { recordTriageAdmissionSql } from '../services/record-triage-admission.js';
 
 const router = Router();
@@ -17,7 +18,7 @@ const router = Router();
 router.get('/badges', requireTenantAccess, async (req, res, next) => {
   try {
     const [row, commentRiskPolicy] = await Promise.all([
-      queryOne(`
+      queryTriageOne(`
       SELECT
         (SELECT COUNT(*)
          FROM records r
@@ -106,7 +107,7 @@ router.get('/events', requireTenantAccess, async (req, res, next) => {
     if (status === 'open') where += ` AND i.status NOT IN ('resolved', 'closed', 'ignored')`;
     else if (status) { params.push(status); where += ` AND i.status = $${params.length}`; }
 
-    const events = await queryAll(`
+    const events = await queryTriageAll(`
       SELECT i.id, i.title, i.severity, i.status, i.summary,
         COUNT(r.id)::int AS record_count, i.owner_name,
         i.created_at, i.updated_at,
@@ -143,7 +144,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
     todayStart.setHours(0, 0, 0, 0);
     const commentRiskPolicy = await getCommentRiskAttentionPolicy(req.tenantId);
 
-    const kpi = await queryOne(`
+    const kpi = await queryTriageOne(`
       SELECT
         COUNT(*) AS total_records,
         COUNT(*) FILTER (WHERE created_at >= $2) AS period_new,
@@ -164,7 +165,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       WHERE tenant_id = $1
     `, [req.tenantId]);
 
-    const triageStats = await queryOne(`
+    const triageStats = await queryTriageOne(`
       SELECT
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'unhandled' AND rt.archived_at IS NULL) AS unhandled,
         COUNT(*) FILTER (WHERE COALESCE(rt.status, 'unhandled') = 'replied' AND rt.archived_at IS NULL) AS replied,
@@ -189,7 +190,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
         AND (${recordTriageAdmissionSql('r')})
     `, [req.tenantId]);
 
-    const operationsStats = await queryOne(`
+    const operationsStats = await queryTriageOne(`
       SELECT
         (SELECT COUNT(*)
          FROM record_observations ro
@@ -240,7 +241,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       ),
     };
 
-    const pendingRecords = await queryAll(`
+    const pendingRecords = await queryTriageAll(`
       SELECT r.id, r.platform, r.title, r.content, r.author_name, r.url, r.likes, r.comments_count,
         r.collects, r.shares, r.sentiment, r.category, r.last_seen_at,
         ${customTagsSelectSql('r')} AS custom_tags,
@@ -262,7 +263,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LIMIT 8
     `, [req.tenantId]);
 
-    const platformCoverage = await queryAll(`
+    const platformCoverage = await queryTriageAll(`
       SELECT platform, COUNT(*) AS count,
         COUNT(*) FILTER (WHERE created_at >= $2) AS period_new,
         MAX(last_seen_at) AS last_seen_at
@@ -272,7 +273,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       ORDER BY count DESC
     `, [req.tenantId, since]);
 
-    const riskTrend = await queryAll(`
+    const riskTrend = await queryTriageAll(`
       SELECT to_char(created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD') AS day,
         COUNT(*) AS total,
         COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative
@@ -282,7 +283,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       ORDER BY day ASC
     `, [req.tenantId, since]);
 
-    const latestContent = await queryAll(`
+    const latestContent = await queryTriageAll(`
       SELECT id, platform, record_type, title, content, author_name, url, likes,
         comments_count, collects, shares, sentiment, keyword, created_at, last_seen_at
       FROM records
@@ -309,7 +310,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
       LIMIT 8
     `, [req.tenantId]);
 
-    const latestMonitorHits = await queryAll(`
+    const latestMonitorHits = await queryTriageAll(`
       SELECT
         ro.id AS observation_id,
         ro.captured_at,
@@ -349,7 +350,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
     `, [req.tenantId]);
     const normalizedLatestMonitorHits = latestMonitorHits.map(applyResolvedMetrics);
 
-    const sourceDistribution = await queryAll(`
+    const sourceDistribution = await queryTriageAll(`
       SELECT COALESCE(NULLIF(record_type, ''), 'single_note') AS record_type,
         COUNT(*) AS count,
         COUNT(*) FILTER (WHERE created_at >= $2) AS period_new,
@@ -395,7 +396,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
     `, [req.tenantId]);
 
     // 情感结构(全量,指挥中心中轴)
-    const sentimentBreakdown = await queryOne(`
+    const sentimentBreakdown = await queryTriageOne(`
       SELECT
         COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative,
         COUNT(*) FILTER (WHERE sentiment = 'neutral') AS neutral,
@@ -407,7 +408,7 @@ router.get('/overview', requireTenantAccess, async (req, res, next) => {
     `, [req.tenantId]);
 
     // 分平台风险(各平台总量与负面数,指挥中心)
-    const platformRisk = await queryAll(`
+    const platformRisk = await queryTriageAll(`
       SELECT platform,
         COUNT(*) AS total,
         COUNT(*) FILTER (WHERE sentiment = 'negative') AS negative

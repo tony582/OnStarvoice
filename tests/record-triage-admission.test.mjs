@@ -122,3 +122,11 @@ test('a verifiable explicit model outside the dictionary can enter triage, but m
     assert.equal(recordTriageAdmission(value).admitted, false);
   }
 });
+
+test('deselecting all intents is an empty result and cannot become an unrestricted export', () => {
+  const params = [];
+  assert.equal(appendRecordIntentFilter('WHERE true', params, 'none'), 'WHERE true AND false');
+  assert.deepEqual(params, []);
+  assert.equal(appendRecordIntentFilter('WHERE true', [], ''), 'WHERE true');
+  assert.throws(() => appendRecordIntentFilter('WHERE true', [], 'none,inquiry'), { code: 'invalid_intent' });
+});

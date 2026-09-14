@@ -4,11 +4,12 @@ import {DAILY_HANDLING_SUMMARY_FORMAT} from './customer-daily-handling-summary.j
 
 export const MONTHLY_SUMMARY_FIELDS = Object.freeze(['monitor', 'sdb', 'positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther']);
 export const MONTHLY_SUMMARY_FORMAT = 'daily_disposition_v2';
+export const DAILY_COLLECTION_SUMMARY_FORMAT = 'daily_collection_v4';
 const invalid = (message, status = 400) => Object.assign(new Error(message), {status, code: 'daily_summary_invalid'});
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 
 export function isMonthlySummary(summary) {
-  return [MONTHLY_SUMMARY_FORMAT, DAILY_HANDLING_SUMMARY_FORMAT].includes(summary?.format) && Array.isArray(summary.rows);
+  return [MONTHLY_SUMMARY_FORMAT, DAILY_HANDLING_SUMMARY_FORMAT, DAILY_COLLECTION_SUMMARY_FORMAT].includes(summary?.format) && Array.isArray(summary.rows);
 }
 
 export function buildMonthlySummary(records, period, count) {
@@ -34,10 +35,12 @@ export function monthlySummarySignature(summary) {
 }
 
 export function mergeMonthlySummary(current, patch) {
+  const distinctMtd = current.format === DAILY_COLLECTION_SUMMARY_FORMAT;
   if (!object(patch) || Object.keys(patch).some(key => key !== 'rows') || !object(patch.rows) || !Object.keys(patch.rows).length) {
-    throw invalid('请提交需要修改的日期及汇总数量；MTD 按每日数量自动加总。');
+    throw invalid(distinctMtd ? '请提交需要修改的日期及汇总数量；月去重累计仅应用本次修改差额。' : '请提交需要修改的日期及汇总数量；MTD 按每日数量自动加总。');
   }
   const next = structuredClone(current);
+  const deltas = Object.fromEntries(MONTHLY_SUMMARY_FIELDS.map(field => [field, 0n]));
   let changed = 0;
   for (const [date, values] of Object.entries(patch.rows)) {
     const row = next.rows.find(item => item.date === date);
@@ -47,6 +50,10 @@ export function mergeMonthlySummary(current, patch) {
     if (!object(values) || Object.keys(values).some(field => !MONTHLY_SUMMARY_FIELDS.includes(field))) throw invalid('只能修改汇总数量，不能修改日期或系统分类。');
     for (const [field, value] of Object.entries(values)) {
       if (!Number.isSafeInteger(value) || value < 0) throw invalid('汇总数量须为非负整数。');
+      if (distinctMtd) {
+        if (!Number.isSafeInteger(row.counts[field]) || row.counts[field] < 0) throw invalid('原汇总数量格式无法核实，请重新生成日报。', 409);
+        deltas[field] += BigInt(value) - BigInt(row.counts[field]);
+      }
       row.counts[field] = value;
       changed++;
     }
@@ -63,9 +70,27 @@ export function mergeMonthlySummary(current, patch) {
   }
   next.day = structuredClone(next.rows.find(row => row.date === next.dayDate).counts);
   for (const field of MONTHLY_SUMMARY_FIELDS) {
-    const total = next.rows.reduce((sum, row) => sum + row.counts[field], 0);
-    if (!Number.isSafeInteger(total)) throw invalid('月累计数量过大。');
-    next.mtd[field] = total;
+    if (distinctMtd) {
+      if (!Number.isSafeInteger(current.mtd?.[field]) || current.mtd[field] < 0) throw invalid('原月去重累计格式无法核实，请重新生成日报。', 409);
+      // The frozen month has already deduplicated posts. Summing date rows here
+      // would lose that baseline, including across repeated customer edits.
+      const total = BigInt(current.mtd[field]) + deltas[field];
+      if (total < 0n) throw invalid('本次修改会使月去重累计小于零。');
+      if (total > BigInt(Number.MAX_SAFE_INTEGER)) throw invalid('月累计数量过大。');
+      next.mtd[field] = Number(total);
+    } else {
+      const total = next.rows.reduce((sum, row) => sum + row.counts[field], 0);
+      if (!Number.isSafeInteger(total)) throw invalid('月累计数量过大。');
+      next.mtd[field] = total;
+    }
+  }
+  if (distinctMtd) {
+    if (next.mtd.sdb > next.mtd.monitor) throw invalid('月去重累计的 SDB 范畴不能大于平台监控量。');
+    let available = next.mtd.sdb;
+    for (const field of MONTHLY_SUMMARY_FIELDS.slice(2)) {
+      if (next.mtd[field] > available) throw invalid('月去重累计的正面、中性和四类负面处理数量合计不能大于 SDB 范畴。');
+      available -= next.mtd[field];
+    }
   }
   return next;
 }

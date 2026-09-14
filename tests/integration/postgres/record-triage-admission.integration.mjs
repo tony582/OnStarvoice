@@ -245,6 +245,8 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   assert.deepEqual(mediaContextProjection.ai_result.monitoringEvidence.evidence, []);
   assert.match(mediaContextProjection.ai_result.monitoringEvidence.reason, /结合主帖标题、正文与当前媒体/);
   assert.deepEqual((await list('queue=triage&watched=true')).records.map(row => row.id), [ids['unscoped-watched-irrelevant']], 'ordinary watched content remains visible despite AI irrelevant, but an unverified sentry post does not');
+  assert.deepEqual((await list('queue=triage&intent=none')).records, []);
+  assert.equal((await list('queue=triage&intent=none')).pagination.total, 0);
   const blockedIds = sqlRows.filter(row => !row.admitted).map(row => row.id).sort();
   for (const route of ['/triage/records', '/triage/records/export']) {
     for (const query of ['bucket=relevance_review', 'queue=triage&bucket=relevance_review&watched=true']) {

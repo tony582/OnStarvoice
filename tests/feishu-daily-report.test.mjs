@@ -689,3 +689,31 @@ test('v3 lost body response recovers both table identities before applying table
   assert.equal(mutations(h).filter(request => request.url.pathname.endsWith('/descendant')).length, buildFeishuDailyDocumentPlan(source).batches.length);
   assert.equal(messages(h).length, 0);
 });
+
+test('v4 native document contains one nine-column collection table with frozen MTD and resumable merged headers', async () => {
+  const source = handlingSnapshot();
+  source.schemaVersion = 4;
+  source.summary = {...source.collectionSummary, format: 'daily_collection_v4'};
+  delete source.collectionSummary;
+  const original = structuredClone(source);
+  const plan = buildFeishuDailyDocumentPlan(source);
+  const blocks = plan.batches.flatMap(batch => batch.descendants);
+  const tables = blocks.filter(block => block.block_type === 31);
+  assert.equal(tables.length, 1);
+  assert.equal(tables[0].table.property.column_size, 9);
+  assert.equal(tables[0].table.property.row_size, 5);
+  assert.equal(plan.mergeTargets.length, 7);
+  assert.ok(plan.mergeTargets.every(target => target.tableIndex === 0 && target.columns === 9));
+  const value = JSON.stringify(plan);
+  for (const label of ['每日舆情处理量', '首次入库采集统计', '平台监控量', '本月去重累计', '处理状态：飞书表 · FS-009']) assert.ok(value.includes(label));
+  assert.doesNotMatch(value, /实际采集量|本月处理累计|本月采集去重累计/);
+  const map = new Map(blocks.map(block => [block.block_id, block]));
+  const cellText = index => map.get(map.get(tables[0].children[index]).children[0]).text.elements[0].text_run.content;
+  assert.equal(cellText(4 * 9 + 1), '321');
+  const h = harness();
+  assert.equal((await h.client.writeDocument({documentId: 'doc_one', snapshot: source, onProgress: savedProgress().save})).done, true);
+  assert.equal(h.blocks.filter(block => block.block_type === 31).length, 1);
+  assert.equal(mutations(h).filter(request => request.method === 'PATCH').length, 7);
+  assert.equal(messages(h).length, 0);
+  assert.deepEqual(source, original);
+});

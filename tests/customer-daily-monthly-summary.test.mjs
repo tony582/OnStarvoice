@@ -3,7 +3,7 @@ import test from 'node:test';
 import {inflateSync} from 'node:zlib';
 import {collectCustomerDailyReport} from '../server/services/customer-daily-report-data.js';
 import {customerDailyBusinessPeriod} from '../server/services/customer-daily-business-period.js';
-import {MONTHLY_SUMMARY_FIELDS, monthlySummarySignature} from '../server/services/customer-daily-monthly-summary.js';
+import {DAILY_COLLECTION_SUMMARY_FORMAT, MONTHLY_SUMMARY_FIELDS, monthlySummarySignature} from '../server/services/customer-daily-monthly-summary.js';
 import {mergeCustomerDailySummary} from '../server/services/customer-daily-reports.js';
 import {customerDailySummaryHeaders, customerDailySummaryRows} from '../server/services/customer-daily-report-presentation.js';
 import {renderCustomerDailyReportHtml, renderCustomerDailyReportText, buildCustomerDailyReportWorkbook} from '../server/services/customer-daily-report-render.js';
@@ -33,8 +33,8 @@ async function collect(date, records = [], {now = new Date(`${date}T19:00:00+08:
     },
   }});
   // These fixtures lock the already saved v2 collection tables and their exports.
-  // New reports carry that unchanged collection result below the handling table.
-  return {...snapshot, schemaVersion: 2, summary: snapshot.collectionSummary};
+  // New reports use the same collection data in the v4 single-table format.
+  return {...snapshot, schemaVersion: 2, summary: {...snapshot.summary, format: 'daily_disposition_v2'}};
 }
 
 function assertMtdEqualsRows(snapshot) {
@@ -191,6 +191,58 @@ test('v3 processing edits sum daily workload, including holiday handling, withou
   assert.deepEqual(snapshot, before);
   assert.throws(() => mergeCustomerDailySummary(source, {rows: {'2026-09-13': {monitor: 1}}}), {code: 'daily_summary_invalid'});
   assert.throws(() => mergeCustomerDailySummary(source, {mtd: {monitor: 1}}), {code: 'daily_summary_invalid'});
+});
+
+async function frozenCollectionSummary() {
+  const legacy = await collect('2026-09-14');
+  const counts = {...legacy.summary.day, monitor: 5, sdb: 4, positive: 1, neutral: 1, negative: 2, cold: 1, comment: 1};
+  return {
+    format: DAILY_COLLECTION_SUMMARY_FORMAT, mtdBasis: 'distinct_records', dayDate: '2026-09-14',
+    rows: [{date: '2026-09-11', isWorkingDay: true, counts: {...counts}}, {date: '2026-09-14', isWorkingDay: true, counts: {...counts}}],
+    day: {...counts}, mtd: {...counts, monitor: 8, sdb: 6, positive: 2, neutral: 2},
+  };
+}
+
+test('v4 no-op edits preserve the frozen distinct MTD even when date rows do not sum to it', async () => {
+  const source = await frozenCollectionSummary();
+  const before = structuredClone(source);
+  const edited = mergeCustomerDailySummary(source, {rows: {'2026-09-14': {monitor: 5, cold: 1}}});
+  assert.deepEqual(edited, source);
+  assert.deepEqual(source, before);
+  assert.equal(edited.mtd.monitor, 8);
+  assert.equal(edited.rows.reduce((sum, row) => sum + row.counts.monitor, 0), 10);
+});
+
+test('v4 edits apply only changed-row deltas to frozen monthly quantities across repeated saves', async () => {
+  const source = await frozenCollectionSummary();
+  const before = structuredClone(source);
+  const first = mergeCustomerDailySummary(source, {rows: {
+    '2026-09-11': {monitor: 7}, '2026-09-14': {monitor: 4, cold: 0, comment: 2},
+  }});
+  assert.equal(first.mtd.monitor, 9, '8 frozen + 2 for the older row - 1 for the report date');
+  assert.equal(first.mtd.cold, 0);
+  assert.equal(first.mtd.comment, 2);
+  assert.equal(first.mtd.sdb, source.mtd.sdb);
+  assert.equal(first.mtd.negative, source.mtd.negative, 'noneditable system totals remain frozen');
+  assert.deepEqual(first.day, first.rows.at(-1).counts);
+  assert.equal(first.mtdBasis, 'distinct_records');
+  const restored = mergeCustomerDailySummary(first, {rows: {
+    '2026-09-11': {monitor: 5}, '2026-09-14': {monitor: 5, cold: 1, comment: 1},
+  }});
+  assert.deepEqual(restored, source);
+  assert.deepEqual(source, before);
+});
+
+test('v4 rejects invalid frozen MTD, unsafe totals, and edits that would make distinct quantities negative', async () => {
+  const source = await frozenCollectionSummary();
+  const apply = (current, rows) => mergeCustomerDailySummary(current, {rows});
+  assert.throws(() => apply({...source, mtd: {...source.mtd, monitor: null}}, {'2026-09-14': {monitor: 5}}), {status: 409});
+  assert.throws(() => apply({...source, mtd: {...source.mtd, monitor: Number.MAX_SAFE_INTEGER}}, {'2026-09-14': {monitor: 6}}), /数量过大/);
+  assert.throws(() => apply(source, {'2026-09-11': {cold: 0}, '2026-09-14': {cold: 0}}), /小于零/);
+  const rowWithRoom = {...source, rows: source.rows.map(row => ({...row, counts: {...row.counts, sdb: 5}}))};
+  assert.throws(() => apply(rowWithRoom, {'2026-09-14': {sdb: 4}}), /月去重累计.*合计/);
+  assert.throws(() => apply({...source, rows: source.rows.map(row => ({...row, isWorkingDay: false}))}, {'2026-09-14': {monitor: 5}}), /工作日汇总/);
+  assert.throws(() => mergeCustomerDailySummary(source, {mtd: {monitor: 100}}), {code: 'daily_summary_invalid'});
 });
 
 test('HTML, TSV, SVG/PNG, Excel and native Feishu table present identical nine-column rows', async () => {

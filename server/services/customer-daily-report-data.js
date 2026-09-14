@@ -1,8 +1,6 @@
 import {resolveMetricUpdateFromPayload} from '../utils/metrics.js';
 import {recoverCustomerDailyObservationTime} from './customer-daily-metric-evidence.js';
-import {buildMonthlySummary} from './customer-daily-monthly-summary.js';
-import {buildCustomerDailyHandlingSummary, customerDailyHandlingMonthStart, parseCustomerDailyHandlingEvents} from './customer-daily-handling-summary.js';
-import {recordEffectiveRelevanceSql, recordTriageAdmissionSql} from './record-triage-admission.js';
+import {buildMonthlySummary, DAILY_COLLECTION_SUMMARY_FORMAT} from './customer-daily-monthly-summary.js';
 
 export {
   renderCustomerDailyReportHtml,
@@ -229,46 +227,12 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   const dayRows = uniqueRows.filter(row => ms(row.first_seen_at) >= ms(collectionStart));
   const warnings = [];
   const warn = (code, message, blocking = false) => warnings.push({code, message, blocking});
-  const collectionSummary = buildMonthlySummary(uniqueRows, period, count);
+  const summary = {...buildMonthlySummary(uniqueRows, period, count), format: DAILY_COLLECTION_SUMMARY_FORMAT, mtdBasis: 'distinct_records'};
   const conflicts = uniqueRows.filter(row => NEGATIVE_STATES.has(status(row)) && row.sentiment !== 'negative' && status(row) !== 'reviewed_non_monitor');
-  if (collectionSummary.mtd.unclassified) warn('unclassified', `本月截至报表日有${collectionSummary.mtd.unclassified}条SDB内容尚未完成情感识别（日新增${collectionSummary.day.unclassified}条），未自动归为中性。`, true);
+  if (summary.mtd.unclassified) warn('unclassified', `本月截至报表日有${summary.mtd.unclassified}条SDB内容尚未完成情感识别（日新增${summary.day.unclassified}条），未自动归为中性。`, true);
   if (conflicts.length) warn('sentiment_status_conflict', `本月内容中${conflicts.length}条情感结论与负面处理状态不一致，按有效情感统计，需核对。`, true);
   const pendingReview = dayRows.filter(row => status(row) === 'unhandled').length;
   if (businessPeriod && pendingReview) warn('review_pending', `本次采集清单还有${pendingReview}条待复核。`, true);
-
-  const handlingMonthStart = customerDailyHandlingMonthStart(period);
-  const handlingAuditRows = await db.queryAll(`/* customer_daily:handling_events */
-    SELECT id, tenant_id, action, target_type, target_id, created_at,
-      jsonb_build_object('previousStatus', metadata->'previousStatus', 'nextStatus', metadata->'nextStatus',
-        'status', metadata->'status', 'recordIds', metadata->'recordIds', 'previous', metadata->'previous') AS metadata
-    FROM audit_logs
-    WHERE tenant_id = $1 AND target_type = 'record'
-      AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
-      AND action IN ('record.triage_updated', 'record.triage_batch_updated', 'record.ticket_created', 'record.official_response_marked')
-    ORDER BY created_at, id`, [tenantId, handlingMonthStart, cutoffAt]);
-  const handlingParsed = parseCustomerDailyHandlingEvents(handlingAuditRows.filter(row => ms(row.created_at) >= ms(handlingMonthStart) && ms(row.created_at) < ms(cutoffAt)), {tenantId});
-  const handlingIds = [...new Set(handlingParsed.transitions.map(transition => transition.recordId))];
-  const handlingPostRows = handlingIds.length ? await db.queryAll(`/* customer_daily:handling_posts */
-    SELECT r.id, r.created_at AS first_seen_at, r.record_type, r.sentiment, r.business_visibility,
-      ${recordEffectiveRelevanceSql('r')} AS relevance,
-      EXISTS (SELECT 1 FROM record_watchlist w WHERE w.tenant_id=r.tenant_id AND w.record_id=r.id) AS watched,
-      COALESCE(rt.status, 'unhandled') AS status, true AS admission_allowed
-    FROM records r LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
-    WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[]) AND r.created_at < $3::timestamptz
-      AND ${POST_SQL} AND r.business_visibility = 'eligible' AND (${recordTriageAdmissionSql('r')})
-      AND (${recordEffectiveRelevanceSql('r')} IS DISTINCT FROM 'irrelevant' OR EXISTS (
-        SELECT 1 FROM record_watchlist daily_watched WHERE daily_watched.tenant_id=r.tenant_id AND daily_watched.record_id=r.id))
-    ORDER BY r.id`, [tenantId, handlingIds, cutoffAt]) : [];
-  const handlingPosts = handlingPostRows.filter(row => customerPost(row) && row.admission_allowed !== false && ms(row.first_seen_at) < ms(cutoffAt));
-  const coverage = auditCoverageFrom || (await db.queryOne(`/* customer_daily:audit_coverage */
-    SELECT applied_at FROM schema_migrations WHERE version = $1`, ['081_customer_daily_reports.sql']))?.applied_at;
-  const {summary, evidence: handlingEvidence} = buildCustomerDailyHandlingSummary(handlingPosts, handlingParsed.transitions, period, count,
-    {coverageFrom: coverage, malformedEventIds: handlingParsed.malformed});
-  if (!summary.coverageComplete) warn('handling_history_incomplete', `处理量仅统计可核实的状态变更，历史记录覆盖不完整，不能视为完整处理量。${handlingParsed.malformed.length ? `有${handlingParsed.malformed.length}条审计记录缺少有效状态变更信息。` : ''}`, true);
-  if (summary.mtd.unclassified) warn('handling_unclassified', `本月已处理的SDB内容中${summary.mtd.unclassified}条尚未完成情感识别，未自动归为中性。`, true);
-  const handlingById = new Map(handlingPosts.map(row => [row.id, row]));
-  const handlingConflicts = [...new Set(handlingEvidence.dailyLastTransitions.filter(transition => NEGATIVE_STATES.has(transition.nextStatus) && handlingById.get(transition.recordId)?.sentiment !== 'negative').map(transition => transition.recordId))];
-  if (handlingConflicts.length) warn('handling_sentiment_status_conflict', `本月已处理内容中${handlingConflicts.length}条当前情感结论与处理时的负面状态不一致，按有效情感统计，需核对。`, true);
 
   const heatRows = await db.queryAll(`/* customer_daily:heat_posts */
     SELECT r.id, r.title, r.platform, r.url, r.canonical_url, r.record_type, r.sentiment,
@@ -363,6 +327,8 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     });
   const withdrawn = [...latestTransition.values()].filter(t => !currentCold(coldById.get(t.recordId))).map(t => t.recordId);
   if (withdrawn.length) warn('cold_withdrawn_or_corrected', `${withdrawn.length}篇当日曾标冷处理的帖子已撤销、更正或不再属于有效负面范围，本版主清单不再列出。`);
+  const coverage = auditCoverageFrom || (await db.queryOne(`/* customer_daily:audit_coverage */
+    SELECT applied_at FROM schema_migrations WHERE version = $1`, ['081_customer_daily_reports.sql']))?.applied_at;
   const coverageComplete = Boolean(iso(coverage) && ms(coverage) <= ms(period.handlingStartAt || periodStart) && malformed.length === 0);
   if (!coverageComplete) warn('cold_history_incomplete', `${coldMarked.length ? '历史标记记录不完整，以下为可核实内容。' : '暂未检出，历史标记记录不完整。'}${malformed.length ? `有${malformed.length}条旧审计事件缺少变更前状态。` : ''}`);
   const missingLinks = [...highHeat, ...coldMarked].filter(row => !row.url);
@@ -390,13 +356,12 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   const activeCaptures = captureRows.map(assessCustomerDailyCaptureReadiness).filter(Boolean);
   if (activeCaptures.length) warn('capture_not_settled', `报表日创建的${activeCaptures.length}个普通采集任务存在未完成、失败或同步缺口，监控数量仅包含已成功入库主帖。`, true);
   return {
-    schemaVersion: 3, tenantId, tenantName: tenant.name || '', ...period, summary, collectionSummary, highHeat, coldMarked, warnings,
+    schemaVersion: 4, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, warnings,
     evidence: {
       scope: '当前租户首次入库且进入客户内容分诊清单的主帖；排除系统过滤和判为无关的内容，保留客户主动关注的帖子；同帖复采不重复计数；SDB再扣除客户标记的非监控内容',
       firstSeenField: 'records.created_at', timeZone: 'Asia/Shanghai', reviewBasis: '本版生成时有效情感及人工处理状态',
       monthRecords: uniqueRows.map(row => ({recordId: row.id, firstSeenAt: iso(row.first_seen_at), sentiment: row.sentiment || '', status: status(row), businessVisibility: row.business_visibility || 'eligible'})),
       dayRecordIds: dayRows.map(row => row.id), conflictRecordIds: conflicts.map(row => row.id),
-      handling: {...handlingEvidence, conflictRecordIds: handlingConflicts},
       heat: {candidateCount: heatCandidates.length, selected: heatEvidence, missingRecordIds: missingHeat, missingPublishedCount: Number(missingPublished?.count) || 0,
         updatedCount: highHeat.filter(row => !row.stale && row.quality === 'measured').length, staleCount, unverifiedCount: legacyHeat.length},
       cold: {coverageFrom: iso(coverage), coverageComplete, transitions, malformedEventIds: malformed, withdrawnRecordIds: withdrawn},

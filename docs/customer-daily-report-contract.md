@@ -1,6 +1,6 @@
 # 客户日报实现接口
 
-当前新日报采用 v3：上表按北京时间自然日统计状态变更的处理量，下表保留客户工作日采集量。工作日使用中国法定节假日及调休安排。
+当前新日报采用 v4：单表使用首次入库采集数量与月度去重 MTD，保留九列处理方式样式。v3 上下双表只保留于历史版本；工作日继续使用中国法定节假日及调休安排。
 
 ## 服务边界
 
@@ -30,7 +30,7 @@ Post保留平台代码，渲染显示中文。所有计数是number；未掌握�
 
 ## Snapshot JSON v3
 
-新生成的快照 `schemaVersion=3`。`summary.format=daily_handling_v3`，含 `rows:[{date,isWorkingDay,counts}]`、`dayDate`、`day`、`mtd`、`mtdBasis=daily_sum`、`coverageFrom`、`coverageComplete`。八个可编辑数量为 `monitor/sdb/positive/neutral/cold/comment/negativeProcess/negativeOther`。`collectionSummary` 保存原 `daily_disposition_v2` 采集汇总，原采集范围和月内去重口径不变。
+历史 v3 快照 `schemaVersion=3`。`summary.format=daily_handling_v3`，含 `rows:[{date,isWorkingDay,counts}]`、`dayDate`、`day`、`mtd`、`mtdBasis=daily_sum`、`coverageFrom`、`coverageComplete`。八个可编辑数量为 `monitor/sdb/positive/neutral/cold/comment/negativeProcess/negativeOther`。`collectionSummary` 保存原 `daily_disposition_v2` 采集汇总，原采集范围和月内去重口径不变。
 
 - 上表「每日舆情处理量」：读取北京时间月初零点至报告截止的有效状态变更审计，包含之前采集的旧帖；相同帖同一天多次变更只计一次，按该日末次变更后的状态归类。纯备注、同状态重复保存和巡查刷新不计处理量。
 - 上表 MTD 标为「本月处理累计」，是每日处理量之和；同帖跨天再次处理可以再计一次。处理量编辑保存后重新按日加总。
@@ -73,3 +73,9 @@ Settings 另有 `collectionBoundaryTime:'HH:mm'`，默认 `18:00`。`calendarPen
 日报独立显示在数据看板左侧；设置移至系统设置。默认最新版本，界面隐藏历史列表；数据说明通过感叹号弹窗查看。客户输出无入库时间、测量质量与版本说明。有可比观测才显示涨跌，否则简短显示暂无对比数据。手填后主动更新数据需确认，自动任务保留最新手填汇总。
 
 群消息采用 post 富文本：汇总 PNG、二/三帖子链接、可编辑文档链接。先上传图片，持久化 imageKey/imageHash 后再发群，重试复用同一图片；图片上传失败不尝试群发，消息结果不确定时禁止自动重发。完整列表保留在文档，超长消息明确提示剩余条数。
+
+## v4：单表采集口径（2026-09-14 更正）
+
+用户确认使用原采集数字合并为一张九列表。新快照为 `schemaVersion=4`、`summary.format=daily_collection_v4`、`summary.mtdBasis=distinct_records`；保留 rows/day/mtd 完整数量结构，不再包含 collectionSummary。MTD 由原月内去重主帖集合产生，人工保存使用冻结 MTD 加本次逐日编辑差额；无变化保存不改变原 MTD。前端编辑预览与服务端一致，Excel 使用冻结数值。
+
+既有 v1/v2/v3 快照及交付保持旧语义。需要将已有 v3 日报改成单表时，基于冻结 collectionSummary 创建一个新的 v4 版本，旧处理汇总及人工编辑信息保留到 legacyHandling，不修改旧记录。转换不重新采集、分类或发送；id/version 由持有日报日期锁的事务分配。

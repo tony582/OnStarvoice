@@ -7,7 +7,7 @@ import {
   User, FileText, Bell,
   ArrowUp, ArrowDown, ChevronsUpDown, Download, X, SlidersHorizontal,
   Rows3, Kanban, MoreHorizontal, Radar, ShieldAlert, Star,
-  Tags,
+  Tags, AlertCircle, RefreshCw,
 } from 'lucide-react'
 import { api, isApiNetworkError } from '@/lib/api'
 import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
@@ -47,7 +47,8 @@ import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 import { useNav } from '@/lib/navigation'
 import { recordDisplayTitle } from '@/lib/record-display'
-import { appendPostIntentFilter, normalizePostIntentFilter } from '@/lib/post-judgment'
+import { ALL_POST_INTENTS, appendPostIntentFilter, initialPostIntentFilter } from '@/lib/post-judgment'
+import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
 import { PostIntentFilter, PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
 
 interface Pagination { page: number; totalPages: number; total: number }
@@ -368,7 +369,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [boardNonce, setBoardNonce] = useState(0)
   const [archiveView, setArchiveView] = useState<ArchiveView>(initial?.bucket === 'archived' ? 'archived' : 'active')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
-  const [intents, setIntents] = useState<string[]>(() => normalizePostIntentFilter(initial?.intent))
+  const [intents, setIntents] = useState<string[]>(() => initialPostIntentFilter(initial?.intent))
   const [platform, setPlatform] = useState(initial?.platform ?? '')
   const [watchedFilter, setWatchedFilter] = useState(initial?.watched === 'watched' ? 'watched' : '')
   const [keyword, setKeyword] = useState(() => String(initial?.keyword ?? '').trim())
@@ -393,6 +394,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [pageSize, setPageSize] = useState(30)
   const [jumpPage, setJumpPage] = useState('')
   const [loading, setLoading] = useState(true)
+  const [listError, setListError] = useState('')
   const [modeBusyId, setModeBusyId] = useState<string | null>(null)
   const [noteBusyId, setNoteBusyId] = useState<string | null>(null)
   const [archiveBusyId, setArchiveBusyId] = useState<string | null>(null)
@@ -405,6 +407,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const batchFeedbackTimer = useRef<number | undefined>(undefined)
   const customTagRequestSeq = useRef(0)
   const listRequestSeq = useRef(0)
+  const listAbort = useRef<AbortController | null>(null)
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
@@ -482,27 +485,39 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }, [filterParams])
 
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
+    if (view !== 'list') return
     const requestSeq = ++listRequestSeq.current
+    listAbort.current?.abort()
+    setListError('')
+    if (intents.length === 0) {
+      setRecords([])
+      setPagination({ page: 1, totalPages: 1, total: 0 })
+      setLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    listAbort.current = controller
     if (!options?.silent) setLoading(true)
     try {
       const params = filterParams()
       params.set('page', String(page))
       params.set('pageSize', String(pageSize))
-      const data = await api.get<any>('/triage/records?' + params)
+      const data = await withTriageReadDeadline(signal => api.request<any>('/triage/records?' + params, { signal }), controller)
       if (requestSeq !== listRequestSeq.current) return
+      if (!Array.isArray(data.records)) throw new Error('内容响应不完整，请稍后重试。')
       setRecords(data.records || [])
       setPagination(data.pagination || null)
     } catch (err) {
-      if (requestSeq === listRequestSeq.current) console.error(err)
+      if (requestSeq === listRequestSeq.current) setListError(triageLoadError(err))
     } finally {
       if (requestSeq === listRequestSeq.current) setLoading(false)
     }
-  }), [filterParams, pageSize])
+  }), [filterParams, pageSize, intents.length, view])
 
   const exportXlsx = async () => {
     setExporting(true)
     try { await api.download('/triage/records/export?' + filterParams().toString(), '内容分诊.xlsx') }
-    catch (err) { console.error(err) }
+    catch (err) { showBatchFeedback(triageLoadError(err), 'error') }
     finally { setExporting(false) }
   }
 
@@ -513,13 +528,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
-  const activeIntentCount = intents.length === 4 ? 0 : intents.length
+  const activeIntentCount = intents.length === ALL_POST_INTENTS.length ? 0 : Math.max(1, intents.length)
   const hasActiveFilters = Boolean(platform || sentiment || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
   const activeFilterCount = [platform, sentiment].filter(Boolean).length
     + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
     setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
-    setIntents([])
+    setIntents([...ALL_POST_INTENTS])
     setSort({ field: 'publish', dir: 'desc' })
   }
   // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
@@ -529,9 +544,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     const timeoutId = window.setTimeout(() => setKeyword(nextKeyword), 400)
     return () => window.clearTimeout(timeoutId)
   }, [keywordDraft, keyword])
-  useEffect(() => { void load() }, [load])
+  useEffect(() => {
+    void load()
+    return () => { listRequestSeq.current += 1; listAbort.current?.abort() }
+  }, [load])
   useEffect(() => { void loadCustomTagCatalog() }, [loadCustomTagCatalog])
-  useEffect(() => () => { listRequestSeq.current += 1 }, [])
+  useEffect(() => () => { listRequestSeq.current += 1; listAbort.current?.abort() }, [])
   // 写后统一刷新:回退空页 + 拉列表 + 更新徽标
   const reloadAfterMutation = useCallback(async () => {
     const page = pagination?.page || 1
@@ -1122,12 +1140,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     : []
   const viewingWatchlist = watchedFilter === 'watched'
   const emptyTitle = hasActiveFilters
-    ? '没有搜索结果'
+    ? intents.length === 0 ? '未勾选意图' : '没有搜索结果'
     : viewingWatchlist
       ? archiveView === 'archived' ? '已归档的关注清单暂无内容' : '关注清单暂无内容'
       : archiveView === 'archived' ? '暂无已归档内容' : '暂无记录'
   const emptyDescription = hasActiveFilters
-    ? '调整表头筛选或清空筛选条件后重试'
+    ? intents.length === 0 ? '勾选需要查看的意图，或点击全选恢复全部内容' : '调整表头筛选或清空筛选条件后重试'
     : viewingWatchlist
       ? archiveView === 'archived' ? '已关注内容归档后会保留在这里' : '点击内容旁的星标即可加入关注清单'
       : archiveView === 'archived' ? '客户主动归档的内容会显示在这里' : '暂无可处理内容'
@@ -1398,8 +1416,16 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           refreshBadges={refreshBadges}
         />
       ) : loading ? (
-        <div className="flex items-center justify-center py-16">
+        <div role="status" className="flex items-center justify-center gap-2 py-16">
           <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+          <span className="text-sm text-muted-foreground">正在加载内容…</span>
+        </div>
+      ) : listError ? (
+        <div role="alert" className="flex flex-col items-center gap-3 rounded-xl border border-destructive/20 bg-card px-5 py-10 text-center">
+          <AlertCircle className="h-6 w-6 text-destructive" />
+          <p className="text-sm font-medium">{listError}</p>
+          <p className="text-xs text-muted-foreground">当前筛选已保留，点击重试重新加载。</p>
+          <Button size="sm" variant="outline" onClick={() => void load(pagination?.page || 1)}><RefreshCw className="h-3.5 w-3.5" />重试加载</Button>
         </div>
       ) : (
         <div className="isolate overflow-visible rounded-xl bg-card lg:-mx-6 lg:rounded-none">

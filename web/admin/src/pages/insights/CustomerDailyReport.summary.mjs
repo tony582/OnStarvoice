@@ -7,12 +7,16 @@ export const monthlyLabels = {
 
 export function isMonthlySummary(snapshot) {
   return Array.isArray(snapshot.summary.rows) && (
-    (snapshot.schemaVersion >= 2 && snapshot.summary.format === 'daily_disposition_v2') || isHandlingSummary(snapshot)
+    (snapshot.schemaVersion >= 2 && snapshot.summary.format === 'daily_disposition_v2') || isHandlingSummary(snapshot) || isCollectionSummary(snapshot)
   )
 }
 
 export function isHandlingSummary(snapshot) {
   return snapshot.schemaVersion >= 3 && snapshot.summary.format === 'daily_handling_v3' && Array.isArray(snapshot.summary.rows)
+}
+
+export function isCollectionSummary(snapshot) {
+  return snapshot.schemaVersion >= 4 && snapshot.summary.format === 'daily_collection_v4' && Array.isArray(snapshot.summary.rows)
 }
 
 export function visibleMonthlyRows(rows, includeHandledNonWorkingDays = false) {
@@ -41,6 +45,31 @@ export function sumMonthlyRows(rows, draft, includeHandledNonWorkingDays = false
     const value = draft ? Number(draft[row.date]?.[field] || 0) : Number(row.counts[field] || 0)
     return sum + (Number.isSafeInteger(value) && value >= 0 ? value : 0)
   }, 0)]))
+}
+
+export function monthlySummaryTotals(snapshot, draft) {
+  if (!draft) return snapshot.summary.mtd
+  const rows = snapshot.summary.rows || []
+  if (!isCollectionSummary(snapshot)) return sumMonthlyRows(rows, draft, isHandlingSummary(snapshot))
+  const totals = Object.fromEntries(monthlyFields.map(field => {
+    const original = snapshot.summary.mtd[field]
+    if (!Number.isSafeInteger(original) || original < 0) throw new Error('原月累计数据需要核对，请先更新日报。')
+    const delta = visibleMonthlyRows(rows).reduce((sum, row) => {
+      const value = String(draft[row.date]?.[field] ?? '').trim()
+      const count = Number(value)
+      const previous = row.counts[field] ?? 0
+      if (!Number.isSafeInteger(previous) || previous < 0) throw new Error('原逐日数据需要核对，请先更新日报。')
+      return sum + (/^\d+$/.test(value) && Number.isSafeInteger(count) && count >= 0 ? BigInt(count) - BigInt(previous) : 0n)
+    }, 0n)
+    const total = BigInt(original) + delta
+    if (total < 0n || total > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`${monthlyLabels[field]}月累计超出有效范围，请调整每日修改值。`)
+    return [field, Number(total)]
+  }))
+  if (totals.sdb > totals.monitor) throw new Error('SDB月累计不能大于平台监控量，请调整每日修改值。')
+  const classified = ['positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther']
+    .reduce((sum, field) => sum + BigInt(totals[field]), 0n)
+  if (classified > BigInt(totals.sdb)) throw new Error('正面、中性及负面月累计之和不能大于SDB范畴，请调整每日修改值。')
+  return totals
 }
 
 export function dailyPostStatusLabel(post) {

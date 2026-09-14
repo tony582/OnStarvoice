@@ -3,7 +3,7 @@ import {
   customerDailySummaryHeaders, isMonthlyDailyReport,
   customerDailySummaryRows as summaryRows,
   customerDailyPostPlatform as sourceLabel, customerDailyPostComparison, customerDailyColdEmpty as coldEmpty,
-  customerDailyColdTitle, customerDailyColdPostLabel, isHandlingDailyReport, customerDailySections, customerDailyTables, customerDailyPostStatus, customerDailyTableCaption,
+  customerDailyColdTitle, customerDailyColdPostLabel, isHandlingDailyReport, isCollectionDailyReport, isGroupedDailyReport, customerDailySummaryBasis, customerDailySections, customerDailyTables, customerDailyPostStatus, customerDailyTableCaption,
 } from './customer-daily-report-presentation.js';
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char])); }
@@ -23,6 +23,10 @@ export function customerDailyReportTitle(snapshot) {
   return `${snapshot.tenantName ? `${oneLine(snapshot.tenantName)} · ` : ''}舆情日报 ${snapshot.reportDate}${time}`;
 }
 export function customerDailyReportNotes(snapshot) {
+  if (isCollectionDailyReport(snapshot)) return [
+    '按首次成功入库的唯一主帖统计采集量；复采不重复计数。MTD 为本月去重累计，使用已保存的数值。',
+    'SDB 仅扣除已复核-非监控内容。高热负面帖保留已记录的处理状态和飞书表编号。',
+  ];
   if (isHandlingDailyReport(snapshot)) return [
     `每日处理量按北京时间当天发生状态变化的唯一主帖统计；同一帖子当天计一次，跨天再次处理分别计入，MTD 为每日处理量加总。`,
     `实际采集量按首次成功入库主帖统计；采集 MTD 为本月唯一主帖数，复采不重复计数。`,
@@ -38,13 +42,13 @@ export function customerDailyReportNotes(snapshot) {
   ];
 }
 function heatDescription(post, snapshot) {
-  return `热度 ${n(post.heat)}｜${oneLine(customerDailyPostComparison(post))}${isHandlingDailyReport(snapshot) ? `｜处理状态：${oneLine(customerDailyPostStatus(post))}` : ''}`;
+  return `热度 ${n(post.heat)}｜${oneLine(customerDailyPostComparison(post))}${isGroupedDailyReport(snapshot) ? `｜处理状态：${oneLine(customerDailyPostStatus(post))}` : ''}`;
 }
 
 export function renderCustomerDailyReportText(snapshot) {
-  const lines = [customerDailyReportTitle(snapshot), '', ...customerDailyTables(snapshot).flatMap(table => [table.title,
+  const lines = [customerDailyReportTitle(snapshot), '', ...customerDailyTables(snapshot).flatMap(table => [table.title, ...(customerDailySummaryBasis(table.snapshot) ? [customerDailySummaryBasis(table.snapshot)] : []),
     (isMonthlyDailyReport(table.snapshot) ? customerDailySummaryHeaders(table.snapshot) : ['日期', '监控数量', 'SDB范畴', '正向', '中性', '负面·冷处理', '负面·处理中', '负面·已处理']).join('\t'),
-    ...summaryRows(table.snapshot, {hideRestDays: isHandlingDailyReport(snapshot)}).flatMap(row => [...(isHandlingDailyReport(snapshot) && row[0] === 'MTD' ? [customerDailyTableCaption(table.snapshot)] : []), row.map(value => value ?? '').join('\t')]), '']),
+    ...summaryRows(table.snapshot, {hideRestDays: isGroupedDailyReport(snapshot)}).flatMap(row => [...(isGroupedDailyReport(snapshot) && row[0] === 'MTD' ? [customerDailyTableCaption(table.snapshot)] : []), row.map(value => value ?? '').join('\t')]), '']),
     renderCustomerDailyReportMessageText(snapshot),
   ];
   return lines.join('\n');
@@ -81,7 +85,7 @@ export function renderCustomerDailyReportHtml(snapshot) {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(customerDailyReportTitle(snapshot))}</title><style>
     :root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#fff;color:#20252b;font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}main{max-width:1000px;padding:32px 28px 48px;margin:auto}h1{font-size:24px;line-height:1.4;margin:0 0 12px}h2{font-size:18px;margin:32px 0 12px}p{margin:8px 0}a{color:#2563eb;text-decoration:underline;text-underline-offset:3px}.meta,.notes{font-size:12px;color:#66717e}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}th,td{border:1px solid #bcc3cb;padding:10px 9px;text-align:center}th{background:#101316;color:white;font-weight:600}td{font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}.monthly th:first-child,.monthly td:first-child{text-align:center}.mtd-caption td{background:#f1f1f1;text-align:center;font-size:12px}article{padding:14px 0;border-bottom:1px solid #e4e7eb}article h3{font-size:15px;margin:0 0 5px;font-weight:600}.source-url{font-weight:400;font-size:11px;color:#687684;overflow-wrap:anywhere}.missing{color:#9a4c12;font-size:12px}.data-notes{margin-top:28px;padding:14px 18px;background:#f5f7fa;border-left:3px solid #95a5b9}.data-notes ul{padding-left:20px;margin:6px 0}.empty{color:#687684}.foot{margin-top:24px;border-top:1px solid #e4e7eb;padding-top:12px}@media(max-width:600px){main{padding:20px 14px}h1{font-size:21px}}@media print{main{max-width:none;padding:0}body{font-size:11px}th{print-color-adjust:exact;-webkit-print-color-adjust:exact}article{break-inside:avoid}a{color:inherit}h2{break-after:avoid}.table-wrap{overflow:visible}}
   </style></head><body><main><h1>${esc(customerDailyReportTitle(snapshot))}</h1>
-    ${customerDailyTables(snapshot).map(table => renderSummaryHtml(table, isHandlingDailyReport(snapshot))).join('')}
+    ${customerDailyTables(snapshot).map(table => renderSummaryHtml(table, isGroupedDailyReport(snapshot))).join('')}
     ${renderCustomerDailyReportMessageHtml(snapshot)}
     </main></body></html>`;
 }
@@ -93,7 +97,7 @@ function renderSummaryHtml({snapshot, title}, handling) {
     ? `<tr>${headers.slice(0, 5).map(label => `<th rowspan="2" scope="col">${esc(label)}</th>`).join('')}<th colspan="${headers.length - 5}" scope="colgroup">负面</th></tr><tr>${headers.slice(5).map(label => `<th scope="col">${esc(label.replace(/^负面-/, ''))}</th>`).join('')}</tr>`
     : `<tr>${headers.map(label => `<th scope="col">${esc(label)}</th>`).join('')}</tr>`;
   const body = summaryRows(snapshot, {hideRestDays: handling}).map(row => `${handling && row[0] === 'MTD' ? `<tr class="mtd-caption"><td colspan="${headers.length}">${customerDailyTableCaption(snapshot)}</td></tr>` : ''}<tr>${row.map(value => `<td>${value === null ? '' : esc(value)}</td>`).join('')}</tr>`).join('');
-  return `<h2>${esc(title)}</h2><div class="table-wrap"><table class="${handling ? 'monthly' : ''}" aria-label="${esc(title)}"><thead>${header}</thead><tbody>${body}</tbody></table></div>`;
+  return `<h2>${esc(title)}</h2>${customerDailySummaryBasis(snapshot) ? `<p class="notes">${customerDailySummaryBasis(snapshot)}</p>` : ''}<div class="table-wrap"><table class="${handling ? 'monthly' : ''}" aria-label="${esc(title)}"><thead>${header}</thead><tbody>${body}</tbody></table></div>`;
 }
 
 function mergedText(sheet, row, lastColumn, value, options = {}) {
@@ -153,7 +157,7 @@ function appendGroupedSummary(sheet, snapshot, headerStart) {
     }
     const row = bodyRow(sheet, values);
     row.height = 28;
-    if (!snapshot.collectionDisplay && values[0] === 'MTD' && row.number - 2 >= headerStart + 2) {
+    if (isHandlingDailyReport(snapshot) && !snapshot.collectionDisplay && values[0] === 'MTD' && row.number - 2 >= headerStart + 2) {
       for (let column = 2; column <= headers.length; column++) {
         const cell = row.getCell(column), letter = cell.address.replace(/\d+$/, '');
         cell.value = {formula: `SUM(${letter}${headerStart + 2}:${letter}${row.number - 2})`, result: values[column - 1]};
@@ -175,11 +179,12 @@ export function buildCustomerDailyReportWorkbook(snapshot) {
   workbook.modified = new Date(snapshot.assessedAt);
   const sheet = workbook.addWorksheet('日报');
   const modern = isMonthlyDailyReport(snapshot);
-  const handling = isHandlingDailyReport(snapshot);
+  const handling = isGroupedDailyReport(snapshot);
   const HEADERS = customerDailySummaryHeaders(snapshot);
   configureSheet(sheet, HEADERS.length);
   mergedText(sheet, 1, HEADERS.length, customerDailyReportTitle(snapshot), {title: true});
   mergedText(sheet, 2, HEADERS.length, customerDailySections(snapshot).summary);
+  if (customerDailySummaryBasis(snapshot)) mergedText(sheet, 3, HEADERS.length, customerDailySummaryBasis(snapshot), {height: 24});
   if (handling) {
     [21, 17, 15, 12, 12, 20, 24, 27, 19].forEach((width, i) => { sheet.getColumn(i + 1).width = width; });
     let startRow = 4;

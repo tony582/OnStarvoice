@@ -34,8 +34,8 @@ export type DailyPost = {
 }
 
 export type DailySummary = {
-  format?: 'daily_disposition_v2' | 'daily_handling_v3'
-  mtdBasis?: 'daily_sum'
+  format?: 'daily_disposition_v2' | 'daily_handling_v3' | 'daily_collection_v4'
+  mtdBasis?: 'daily_sum' | 'distinct_records'
   dayDate?: string
   rows?: Array<{ date: string; isWorkingDay: boolean; counts: DailyCounts }>
   day: DailyCounts

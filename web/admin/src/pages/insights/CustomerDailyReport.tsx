@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { useNav } from '@/lib/navigation'
 import * as Dialog from '@radix-ui/react-dialog'
 import { CustomerDailyReportCalendar } from './CustomerDailyReportCalendar'
-import { dailyPostStatusLabel, isHandlingSummary, isMonthlySummary, monthlyDraftFromRows, monthlyFields, monthlyLabels, parseMonthlyDraft, sumMonthlyRows, visibleMonthlyRows } from './CustomerDailyReport.summary.mjs'
+import { dailyPostStatusLabel, isCollectionSummary, isHandlingSummary, isMonthlySummary, monthlyDraftFromRows, monthlyFields, monthlyLabels, monthlySummaryTotals, parseMonthlyDraft, visibleMonthlyRows } from './CustomerDailyReport.summary.mjs'
 import { DAILY_API, dailyError, dailyTime, safeReportUrl, shanghaiDate, type DailyCalendar, type DailyCounts, type DailyPost, type DailyReport, type DailySettings, type DailySnapshot } from './CustomerDailyReport.types'
 
 type ReportResponse = { report: DailyReport; html: string; text: string; messageHtml: string; messageText: string }
@@ -462,8 +462,9 @@ function CustomerDailyReportWorkspace() {
               {snapshot.calendarRevision && <p>工作日历：中国法定节假日及调休安排 · {snapshot.calendarRevision}。</p>}
             </> : <p>此日报按生成时的原统计范围展示：监控为首次成功入库的新帖，复采不重复计数；SDB 扣除已复核的非监控内容。</p>}
             {isHandlingSummary(snapshot) && <p>每日处理量按北京时间当天发生处理状态变化的帖子去重统计，同一帖子当天多次变更计 1 条，按当天最后一次状态归类。处理 MTD 累加各日处理量，同帖跨天处理可再次计入；采集 MTD 按帖子月内去重。休假有处理时按实际日期列出，无处理则不单列。</p>}
+            {isCollectionSummary(snapshot) && <p>本表按首次成功入库的采集内容去重统计，复采及后续修改状态不重复计数；MTD 保留本月帖子去重累计，不按每日数值简单相加。手填修改在原累计值上增减对应差额。</p>}
             <p>系统统计{isHandlingSummary(snapshot) ? '处理' : ''}负面：当日 {snapshot.summary.day.negative} 条，MTD {snapshot.summary.mtd.negative} 条。待识别或核对：当日 {snapshot.summary.day.unclassified} 条，MTD {snapshot.summary.mtd.unclassified} 条。客户补填的汇总与系统统计分别保存。</p>
-            {isMonthlySummary(snapshot) ? <p>表内逐日数值可在本页填写并保存，MTD 按报表累计口径展示。{isHandlingSummary(snapshot) ? '实际采集量单独展示，不随手填处理量修改。' : '此历史日报保留生成时的采集统计口径。'}飞书文档里的修改不会自动同步回本页。</p> : <p>处理中、已处理初始为空，空白不代表 0。可在本页填写并保存；飞书文档里的修改不会自动同步回本页。</p>}
+            {isMonthlySummary(snapshot) ? <p>表内逐日数值可在本页填写并保存，MTD 按报表累计口径展示。{isHandlingSummary(snapshot) ? '实际采集量单独展示，不随手填处理量修改。' : isCollectionSummary(snapshot) ? '每日数量和月累计均为采集统计口径。' : '此历史日报保留生成时的采集统计口径。'}飞书文档里的修改不会自动同步回本页。</p> : <p>处理中、已处理初始为空，空白不代表 0。可在本页填写并保存；飞书文档里的修改不会自动同步回本页。</p>}
             <p>7 天发布时间：{dailyTime(snapshot.heatStart)} 至 {dailyTime(snapshot.cutoffAt)}。热度为点赞、评论、收藏、分享之和。</p>
           </div>
         </Dialog.Content></Dialog.Portal>
@@ -489,25 +490,30 @@ function SummaryTable(props: Parameters<typeof LegacySummaryTable>[0]) {
   if (!isMonthlySummary(props.snapshot)) return <LegacySummaryTable {...props} />
   const { snapshot, draft, canEdit, busy, onEdit, onChange, onCancel, onSave } = props
   const handling = isHandlingSummary(snapshot)
+  const collection = isCollectionSummary(snapshot)
   const rows = visibleMonthlyRows(snapshot.summary.rows!, handling)
-  const totals = draft ? sumMonthlyRows(rows, draft, handling) : snapshot.summary.mtd
+  let totals: Pick<DailyCounts, typeof monthlyFields[number]> = snapshot.summary.mtd
+  let totalsError = ''
+  try { totals = monthlySummaryTotals(snapshot, draft) }
+  catch (error) { totalsError = dailyError(error, '月累计需要核对，请调整每日修改值。') }
   const labels = { ...monthlyLabels, monitor: handling ? '处理量' : '平台监控量' }
   return <section>
-    <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h4 className="text-base font-semibold text-slate-900">{handling ? '一、每日舆情处理量' : '一、监控汇总（采集口径）'}</h4><p className="mt-1.5 text-xs text-slate-500">{snapshot.reportDate.slice(0, 7)} · 月初至报表日</p></div>{canEdit && <div className="flex gap-2">{draft ? <><Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>取消</Button><Button size="sm" disabled={busy} onClick={onSave}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存汇总</Button></> : <Button size="sm" variant="ghost" disabled={busy} onClick={onEdit}><Pencil className="h-3.5 w-3.5" />编辑汇总</Button>}</div>}</div>
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h4 className="text-base font-semibold text-slate-900">{handling || collection ? '一、每日舆情处理量' : '一、监控汇总（采集口径）'}</h4><p className="mt-1.5 text-xs text-slate-500">{snapshot.reportDate.slice(0, 7)} · 月初至报表日</p></div>{canEdit && <div className="flex gap-2">{draft ? <><Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>取消</Button><Button size="sm" disabled={busy || !!totalsError} onClick={onSave}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存汇总</Button></> : <Button size="sm" variant="ghost" disabled={busy} onClick={onEdit}><Pencil className="h-3.5 w-3.5" />编辑汇总</Button>}</div>}</div>
     <div className="overflow-x-auto border border-slate-300">
       <table className="w-full min-w-[780px] border-collapse text-center text-xs tabular-nums" aria-label={handling ? '逐日舆情处理量与月累计' : '逐日采集汇总与月累计'}>
         <thead className="bg-[#101416] text-white">
-          <tr className="[&>th]:border-b [&>th]:border-r [&>th]:border-slate-300 [&>th]:px-3 [&>th]:py-3 [&>th]:font-semibold [&>th:last-child]:border-r-0"><th rowSpan={2} scope="col" className="w-32">{handling ? '舆情处理日期' : '日报日期'}</th><th rowSpan={2} scope="col">{labels.monitor}</th><th rowSpan={2} scope="col">SDB范畴</th><th rowSpan={2} scope="col">正面</th><th rowSpan={2} scope="col">中性</th><th colSpan={4} scope="colgroup">负面</th></tr>
+          <tr className="[&>th]:border-b [&>th]:border-r [&>th]:border-slate-300 [&>th]:px-3 [&>th]:py-3 [&>th]:font-semibold [&>th:last-child]:border-r-0"><th rowSpan={2} scope="col" className="w-32">{handling || collection ? '舆情处理日期' : '日报日期'}</th><th rowSpan={2} scope="col">{labels.monitor}</th><th rowSpan={2} scope="col">SDB范畴</th><th rowSpan={2} scope="col">正面</th><th rowSpan={2} scope="col">中性</th><th colSpan={4} scope="colgroup">负面</th></tr>
           <tr className="[&>th]:border-b [&>th]:border-r [&>th]:border-slate-300 [&>th]:px-3 [&>th]:py-2.5 [&>th]:font-semibold [&>th:last-child]:border-r-0"><th scope="col">冷处理</th><th scope="col">评论区留言</th><th scope="col">走负面处理流程</th><th scope="col">其他</th></tr>
         </thead>
         <tbody>{rows.map(row => <tr key={row.date} className="border-b border-slate-300 [&>td]:border-r [&>td]:border-slate-300 [&>td]:px-2 [&>td]:py-2.5 [&>td:last-child]:border-r-0">
           <th scope="row" className="border-r border-slate-300 px-3 py-2.5 font-normal">{row.date.split('-').map(Number).join('/')}</th>
           {monthlyFields.map(field => <td key={field}>{draft ? <input type="text" inputMode="numeric" aria-label={`${row.date} ${labels[field]}`} className="h-8 w-full min-w-12 rounded border border-blue-200 bg-white px-1 text-center text-xs focus:outline-none focus:ring-2 focus-visible:ring-primary/30 disabled:bg-slate-50" value={draft[row.date]?.[field] ?? ''} disabled={busy} onChange={event => onChange(row.date, field, event.target.value)} /> : Number(row.counts[field] ?? 0).toLocaleString()}</td>)}
         </tr>)}</tbody>
-        <tfoot><tr><td colSpan={9} className="border-b border-slate-300 bg-[#f2f2f2] px-3 py-3 text-left sm:text-center">{handling ? '本月处理累计' : '本月采集去重累计'}</td></tr><tr className="[&>td]:border-r [&>td]:border-slate-300 [&>td]:px-2 [&>td]:py-3 [&>td:last-child]:border-r-0"><th scope="row" className="border-r border-slate-300 px-3 py-3 font-normal">MTD</th>{monthlyFields.map(field => <td key={field} aria-label={`MTD ${labels[field]}`}>{Number(totals[field] ?? 0).toLocaleString()}</td>)}</tr></tfoot>
+        <tfoot><tr><td colSpan={9} className="border-b border-slate-300 bg-[#f2f2f2] px-3 py-3 text-left sm:text-center">{handling ? '本月处理累计' : collection ? '本月去重累计' : '本月采集去重累计'}</td></tr><tr className="[&>td]:border-r [&>td]:border-slate-300 [&>td]:px-2 [&>td]:py-3 [&>td:last-child]:border-r-0"><th scope="row" className="border-r border-slate-300 px-3 py-3 font-normal">MTD</th>{monthlyFields.map(field => <td key={field} aria-label={`MTD ${labels[field]}`}>{Number(totals[field] ?? 0).toLocaleString()}</td>)}</tr></tfoot>
       </table>
     </div>
-    <p className="mt-3 text-xs leading-6 text-slate-500">{draft ? '填写非负整数，MTD 自动汇总各日数值。请先保存或取消，再切换日期、下载或发送。' : handling ? '按当日处理状态有变化的帖子去重，同帖当天多次变更计 1 条，按当天最后一次状态归类。MTD 累加各日处理量，同帖跨天处理可再次计入。' : '此历史日报沿用采集统计口径，休息日采集内容合并到下一工作日。'}</p>
+    {totalsError && <p role="alert" className="mt-3 text-xs leading-6 text-rose-700">{totalsError}当前仍显示已保存的月累计。</p>}
+    <p className="mt-3 text-xs leading-6 text-slate-500">{draft ? `${collection ? '填写非负整数，MTD 在原去重累计上增减对应修改差额。' : '填写非负整数，MTD 自动汇总各日数值。'}请先保存或取消，再切换日期、下载或发送。` : handling ? '按当日处理状态有变化的帖子去重，同帖当天多次变更计 1 条，按当天最后一次状态归类。MTD 累加各日处理量，同帖跨天处理可再次计入。' : collection ? '按首次成功入库的采集内容去重统计，复采不重复计数；MTD 为本月去重累计。休息日采集内容合并到下一工作日。' : '此历史日报沿用采集统计口径，休息日采集内容合并到下一工作日。'}</p>
   </section>
 }
 

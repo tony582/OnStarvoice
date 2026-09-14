@@ -10,6 +10,7 @@ import {hashPassword} from '../../../server/services/auth-service.js';
 import {customerDailyBusinessPeriod} from '../../../server/services/customer-daily-business-period.js';
 import {buildCustomerDailyMetricEvidence} from '../../../server/services/customer-daily-metric-evidence.js';
 import {collectCustomerDailyReport} from '../../../server/services/customer-daily-report-data.js';
+import {parseCustomerDailyHandlingEvents} from '../../../server/services/customer-daily-handling-summary.js';
 import {normalizeRecord} from '../../../server/routes/sync.js';
 const require = createRequire(new URL('../../../server/package.json',import.meta.url));
 const ExcelJS = require('exceljs');
@@ -109,18 +110,18 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(response.status,200,JSON.stringify(result));
   const generated=result.report;
   assert.equal(generated.reportDate,period.reportDate);
-  assert.equal(generated.snapshot.schemaVersion,3);
-  assert.equal(generated.snapshot.summary.format,'daily_handling_v3');
-  assert.equal(generated.snapshot.summary.day.monitor,5);
-  assert.equal(generated.snapshot.summary.day.sdb,4);
+  assert.equal(generated.snapshot.schemaVersion,4);
+  assert.equal(generated.snapshot.summary.format,'daily_collection_v4');
+  assert.equal(generated.snapshot.summary.day.monitor,3);
+  assert.equal(generated.snapshot.summary.day.sdb,2);
   assert.equal(generated.snapshot.summary.day.positive,1);
-  assert.equal(generated.snapshot.summary.day.cold,2);
-  assert.equal(generated.snapshot.summary.day.negativeProcess,1);
-  assert.equal(generated.snapshot.summary.mtd.monitor,6,'the same hot post handled on two dates counts twice in processing MTD');
-  assert.equal(generated.snapshot.summary.mtdBasis,'daily_sum');
-  assert.equal(generated.snapshot.collectionSummary.day.monitor,3);
-  assert.equal(generated.snapshot.collectionSummary.day.sdb,2);
-  assert.equal(generated.snapshot.collectionSummary.mtd.monitor,4,'collection MTD deduplicates posts and excludes older-month handling');
+  assert.equal(generated.snapshot.summary.day.cold,1);
+  assert.equal(generated.snapshot.summary.day.negativeProcess,0);
+  assert.equal(generated.snapshot.summary.mtd.monitor,4,'collection MTD deduplicates posts and excludes older-month handling');
+  assert.equal(generated.snapshot.summary.mtd.negativeProcess,1,'the older collection-day hot post retains its current Feishu disposition');
+  assert.equal(generated.snapshot.summary.mtdBasis,'distinct_records');
+  assert.equal(Object.hasOwn(generated.snapshot,'collectionSummary'),false);
+  assert.equal(Object.hasOwn(generated.snapshot.evidence,'handling'),false);
   assert.equal(generated.snapshot.summary.day.inProgress,null);
   assert.equal(generated.snapshot.summary.mtd.processed,null);
   assert.deepEqual(generated.snapshot.highHeat.map(row=>row.recordId),[hot]);
@@ -139,12 +140,12 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(detail.report.snapshot.summary.day.positive,1,'saved snapshot is immutable');
   assert.match(detail.text,/https:\/\/www.douyin.com/);
   assert.ok(!detail.html.includes('绝不能混入的客户B帖子'));
-  assert.match(detail.messageHtml,/三、7天内热度值≥200的负面帖子/);
-  assert.match(detail.messageText,/四、本期冷处理负面帖：2 条（含历史帖 1 条）/);
+  assert.match(detail.messageHtml,/二、7天内热度值≥200的负面帖子/);
+  assert.match(detail.messageText,/三、本期冷处理负面帖：2 条（含历史帖 1 条）/);
   assert.match(detail.html,/一、每日舆情处理量/);
-  assert.match(detail.html,/二、实际采集量/);
-  assert.match(detail.html,/本月处理累计/);
-  assert.match(detail.html,/本月采集去重累计/);
+  assert.doesNotMatch(detail.html,/二、实际采集量/);
+  assert.doesNotMatch(detail.html,/本月处理累计/);
+  assert.match(detail.html,/本月去重累计/);
   assert.match(detail.messageText,/飞书表[^\n]*202609-007/);
   assert.ok(!detail.messageHtml.includes('<table'));
   assert.ok(!detail.messageText.includes('MTD'));
@@ -157,10 +158,15 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   await workbook.xlsx.load(Buffer.from(await excel.arrayBuffer()));
   assert.equal(workbook.worksheets.length,3);
   const sheet=workbook.worksheets[0];
-  const dayRow=sheet.getRows(1,sheet.rowCount).find(row=>row.getCell(2).value===5 && row.getCell(3).value===4);
+  const dayRow=sheet.getRows(1,sheet.rowCount).find(row=>row.getCell(1).value==='2026/9/11');
   assert.ok(dayRow);
+  assert.equal(dayRow.getCell(2).value,3);
+  assert.equal(dayRow.getCell(3).value,2);
+  const mtdRows=sheet.getRows(1,sheet.rowCount).filter(row=>row.getCell(1).value==='MTD');
+  assert.equal(mtdRows.length,1);
+  assert.equal(mtdRows[0].getCell(2).value,4,'export uses frozen distinct MTD, never a daily SUM formula');
   assert.equal(dayRow.getCell(7).value,0);
-  assert.equal(dayRow.getCell(8).value,1);
+  assert.equal(dayRow.getCell(8).value,0);
   assert.equal(dayRow.getCell(9).value,0);
   const monthResponse = await request(`/calendar-month?month=${period.reportDate.slice(0,7)}`);
   assert.equal(monthResponse.status,200);
@@ -206,7 +212,11 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(edited.mode,generated.mode);
   assert.equal(edited.snapshot.assessedAt,source.snapshot.assessedAt,'editing counts is not a new data assessment');
   assert.deepEqual(edited.snapshot.systemSummary,source.snapshot.summary);
-  assert.deepEqual(edited.snapshot.collectionSummary,source.snapshot.collectionSummary,'editing processing counts does not alter actual collection or deduplicated collection MTD');
+  assert.equal(Object.hasOwn(edited.snapshot,'collectionSummary'),false);
+  assert.equal(edited.snapshot.summary.mtd.monitor,source.snapshot.summary.mtd.monitor,'editing dispositions keeps the frozen monthly distinct post total');
+  assert.equal(edited.snapshot.summary.mtd.cold,source.snapshot.summary.mtd.cold-1);
+  assert.equal(edited.snapshot.summary.mtd.comment,source.snapshot.summary.mtd.comment+1);
+  assert.equal(edited.snapshot.summary.mtd.negativeProcess,source.snapshot.summary.mtd.negativeProcess);
   assert.equal(edited.snapshot.summaryEdited,true);
   assert.equal(edited.snapshot.summaryEdit.sourceReportId,source.id);
   assert.equal(edited.snapshot.summaryEdit.actorId,writer.id);
@@ -253,7 +263,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal((await request(`/${generated.id}/summary.png`,{tenantId:tenantB})).status,403);
   assert.equal((await request(`/${randomUUID()}/summary.png`)).status,404);
 
-  await t.test('a real PATCH with an uppercase UUID counts once while a later note-only PATCH does not count', async () => {
+  await t.test('real uppercase UUID and note PATCHes retain valid legacy audits while v4 counts the ingested post once', async () => {
     const recordId = await record({title:'大写链接状态处理验证',sentiment:'neutral'});
     const path = `${base}/api/triage/records/${recordId.toUpperCase()}`;
     const headers = {authorization:`Bearer ${token}`,'x-tenant-id':tenantA,'content-type':'application/json'};
@@ -261,7 +271,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
       const response = await fetch(path,{method:'PATCH',headers,body:JSON.stringify(body)});
       assert.equal(response.status,200,await response.text());
     }
-    const written = (await pool.query("SELECT target_id,metadata FROM audit_logs WHERE tenant_id=$1 AND action='record.triage_updated' AND lower(target_id)=$2 ORDER BY created_at",[tenantA,recordId])).rows;
+    const written = (await pool.query("SELECT id,tenant_id,action,target_type,target_id,metadata,created_at FROM audit_logs WHERE tenant_id=$1 AND action='record.triage_updated' AND lower(target_id)=$2 ORDER BY created_at",[tenantA,recordId])).rows;
     assert.equal(written.length,2);
     assert.equal(written[0].target_id,recordId.toUpperCase());
     assert.deepEqual(written.map(row=>[row.metadata.previousStatus,row.metadata.nextStatus]),[['unhandled','reviewed'],['reviewed','reviewed']]);
@@ -270,11 +280,12 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
       async queryAll(sql,values) {return (await pool.query(sql,values)).rows;},
       async queryOne(sql,values) {return (await pool.query(sql,values)).rows[0]||null;},
     }});
-    assert.equal(snapshot.evidence.handling.dailyRecordIds[period.reportDate].filter(id=>id===recordId).length,1);
-    assert.equal(snapshot.evidence.handling.transitions.filter(event=>event.recordId===recordId).length,1);
-    assert.equal(snapshot.summary.day.monitor,6);
-    assert.equal(snapshot.summary.mtd.monitor,7);
-    assert.equal(snapshot.collectionSummary.mtd.monitor,5);
+    const parsed = parseCustomerDailyHandlingEvents(written,{tenantId:tenantA});
+    assert.equal(parsed.transitions.filter(event=>event.recordId===recordId).length,1,'legacy parser continues to recognize a real uppercase route target');
+    assert.equal(snapshot.evidence.dayRecordIds.filter(id=>id===recordId).length,1);
+    assert.equal(snapshot.summary.day.monitor,4);
+    assert.equal(snapshot.summary.mtd.monitor,5);
+    assert.equal(Object.hasOwn(snapshot.evidence,'handling'),false);
   });
 
   await t.test('real observation projection preserves normalization precedence and the original null timestamp stamp', async () => {

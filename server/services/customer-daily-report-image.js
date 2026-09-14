@@ -1,6 +1,6 @@
 import {fileURLToPath} from 'node:url';
 import {Resvg} from '@resvg/resvg-js';
-import {customerDailySummaryRows, customerDailySummaryHeaders, isMonthlyDailyReport, isHandlingDailyReport, customerDailyTables, customerDailyTableCaption} from './customer-daily-report-presentation.js';
+import {customerDailySummaryRows, customerDailySummaryHeaders, isMonthlyDailyReport, isGroupedDailyReport, customerDailySummaryBasis, customerDailyTables, customerDailyTableCaption} from './customer-daily-report-presentation.js';
 
 const FONT = fileURLToPath(new URL('../assets/daily-report/StarVoiceDailyTable.ttf', import.meta.url));
 const LEGACY_WIDTHS = [160, 180, 160, 130, 130, 170, 175, 175];
@@ -12,7 +12,7 @@ export function renderCustomerDailySummarySvg(snapshot) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshot?.reportDate || '') || !snapshot.summary?.day || !snapshot.summary?.mtd) {
     throw new Error('日报汇总尚未就绪');
   }
-  if (isHandlingDailyReport(snapshot)) return renderHandlingSummarySvg(snapshot);
+  if (isGroupedDailyReport(snapshot)) return renderGroupedSummarySvg(snapshot);
   const rows = customerDailySummaryRows(snapshot);
   const modern = isMonthlyDailyReport(snapshot);
   const WIDTHS = modern ? [190, 180, 155, 100, 100, 200, 245, 280, 190] : LEGACY_WIDTHS;
@@ -49,10 +49,10 @@ export function renderCustomerDailySummaryPng(snapshot) {
   return Buffer.from(rendered.asPng());
 }
 
-function renderHandlingSummarySvg(snapshot) {
+function renderGroupedSummarySvg(snapshot) {
   const widths = [190, 150, 140, 120, 120, 155, 175, 235, 120];
   const width = widths.reduce((sum, value) => sum + value, 0);
-  const rowHeight = 50, headerHeight = 52, titleHeight = 64, captionHeight = 44, gap = 32;
+  const rowHeight = 50, headerHeight = 52, titleHeight = customerDailySummaryBasis(snapshot) ? 104 : 64, captionHeight = 44, gap = 32;
   const tables = customerDailyTables(snapshot).map(table => ({...table, rows: customerDailySummaryRows(table.snapshot, {hideRestDays: true})}));
   const height = tables.reduce((sum, table) => sum + titleHeight + headerHeight * (table.collection ? 1 : 2) + rowHeight * table.rows.length + captionHeight, 0) + (tables.length - 1) * gap;
   const xs = widths.map((_, index) => widths.slice(0, index).reduce((sum, value) => sum + value, 0));
@@ -68,6 +68,7 @@ function renderHandlingSummarySvg(snapshot) {
   for (const table of tables) {
     if (table.rows.some(row => row.slice(1).some(value => value !== null && (!Number.isSafeInteger(value) || value < 0)))) throw new Error('日报汇总数值无效');
     parts.push(`<text x="12" y="${y + 42}" font-family="StarVoice Daily Table" font-size="25" fill="#20252b">${esc(table.title)}</text>`);
+    if (customerDailySummaryBasis(table.snapshot)) parts.push(`<text x="12" y="${y + 77}" font-family="StarVoice Daily Table" font-size="20" fill="#66717e">${esc(customerDailySummaryBasis(table.snapshot))}</text>`);
     y += titleHeight;
     const headers = customerDailySummaryHeaders(table.snapshot);
     const tableWidths = table.collection ? [240, 240, 215, 270, 220, 220] : widths;

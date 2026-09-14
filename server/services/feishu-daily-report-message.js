@@ -1,5 +1,5 @@
 import {
-  customerDailySections, isHandlingDailyReport, customerDailyPostStatus,
+  customerDailySections, isGroupedDailyReport, customerDailySummaryBasis, customerDailyPostStatus,
   customerDailyPostPlatform,
   customerDailyPostComparison,
   customerDailyColdEmpty,
@@ -58,7 +58,7 @@ function postLine(post, index, heat, snapshot) {
   // untruncated and separated from surrounding text; parsed titles include the platform.
   const nodes = [text(heat ? `TOP${index + 1}： ` : `${index + 1}、 `),
     text(url || `${title}（原帖链接待补） - ${oneLine(customerDailyPostPlatform(item), '未知平台', 40)}`)];
-  if (heat) nodes.push(text(` | 热度 ${heatLabel(item)} | ${comparisonLabel(item)}${isHandlingDailyReport(snapshot) ? ` | 处理状态：${oneLine(customerDailyPostStatus(item), '未记录', 140)}` : ''}`));
+  if (heat) nodes.push(text(` | 热度 ${heatLabel(item)} | ${comparisonLabel(item)}${isGroupedDailyReport(snapshot) ? ` | 处理状态：${oneLine(customerDailyPostStatus(item), '未记录', 140)}` : ''}`));
   else if (customerDailyColdPostLabel(item)) nodes.push(text(' 【历史帖】'));
   return nodes;
 }
@@ -86,7 +86,7 @@ export function buildFeishuDailyPost({ snapshot, imageKey, documentUrl }) {
   const title = `${oneLine(snapshot.tenantName, '客户', 80)} · 舆情日报 ${oneLine(snapshot.reportDate, '', 20)}`.trim();
 
   function build(heatCount, coldCount) {
-    const content = [heading(customerDailySections(snapshot).summary), [{ tag: 'img', image_key: image }], heading(customerDailySections(snapshot).heat)];
+    const content = [heading(customerDailySections(snapshot).summary), ...(customerDailySummaryBasis(snapshot) ? [[text(customerDailySummaryBasis(snapshot))]] : []), [{ tag: 'img', image_key: image }], heading(customerDailySections(snapshot).heat)];
     if (!heat.length) content.push([text('暂未检出符合条件的帖子。')]);
     for (let index = 0; index < heatCount; index++) content.push(postLine(heat[index], index, true, snapshot));
     if (heatCount < heat.length) content.push([text(`另有 ${heat.length - heatCount} 条高热负面帖子，见底部完整日报。`)]);
