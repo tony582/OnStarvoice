@@ -17,7 +17,7 @@ export function publicDailyEmailDelivery(row) {
 export async function buildDailyEmailMessage(snapshot) {
   const workbook = await buildCustomerDailyReportWorkbook(snapshot);
   const buffer = await workbook.xlsx.writeBuffer();
-  return {html:renderCustomerDailyReportHtml(snapshot),text:renderCustomerDailyReportText(snapshot),
+  return {html:renderCustomerDailyReportHtml(snapshot, {email:true}),text:renderCustomerDailyReportText(snapshot),
     attachments:[{filename:`客户日报_${snapshot.reportDate}_v${snapshot.version}.xlsx`,
       content:Buffer.from(buffer),contentType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}]};
 }
