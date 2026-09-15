@@ -88,12 +88,17 @@ export function renderCustomerDailyReportMessageHtml(snapshot) {
 }
 
 export function renderCustomerDailyReportHtml(snapshot, {email = false} = {}) {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(customerDailyReportTitle(snapshot))}</title><style>
+  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(customerDailyReportTitle(snapshot))}</title><style>
     :root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#fff;color:#20252b;font:14px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}main{max-width:1000px;padding:32px 28px 48px;margin:auto}h1{font-size:24px;line-height:1.4;margin:0 0 12px}h2{font-size:18px;margin:32px 0 12px}p{margin:8px 0}a{color:#2563eb;text-decoration:underline;text-underline-offset:3px}.meta,.notes{font-size:12px;color:#66717e}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}th,td{border:1px solid #bcc3cb;padding:10px 9px;text-align:center}th{background:#101316;color:white;font-weight:600}td{font-variant-numeric:tabular-nums}th:first-child,td:first-child{text-align:left}.monthly th:first-child,.monthly td:first-child{text-align:center}.mtd-caption td{background:#f1f1f1;text-align:center;font-size:12px}article{padding:14px 0;border-bottom:1px solid #e4e7eb}article h3{font-size:15px;margin:0 0 5px;font-weight:600}.source-url{font-weight:400;font-size:11px;color:#687684;overflow-wrap:anywhere}.missing{color:#9a4c12;font-size:12px}.data-notes{margin-top:28px;padding:14px 18px;background:#f5f7fa;border-left:3px solid #95a5b9}.data-notes ul{padding-left:20px;margin:6px 0}.empty{color:#687684}.foot{margin-top:24px;border-top:1px solid #e4e7eb;padding-top:12px}@media(max-width:600px){main{padding:20px 14px}h1{font-size:21px}}@media print{main{max-width:none;padding:0}body{font-size:11px}th{print-color-adjust:exact;-webkit-print-color-adjust:exact}article{break-inside:avoid}a{color:inherit}h2{break-after:avoid}.table-wrap{overflow:visible}}
   </style></head><body><main><h1>${esc(customerDailyReportTitle(snapshot))}</h1>
     ${customerDailyTables(snapshot).map(table => renderSummaryHtml(table, isGroupedDailyReport(snapshot), {email})).join('')}
     ${renderCustomerDailyReportMessageHtml(snapshot)}
     </main></body></html>`;
+  if (!email) return html;
+  const font = "font-family:'Microsoft YaHei','微软雅黑',Arial,sans-serif;";
+  // Keep the font on text elements and cells even when email clients remove head styles.
+  return html.replace(/<(body|main|h[1-6]|p|a|span|table|th|td)(?=[\s>])([^>]*)>/g, (_, tag, attrs) =>
+    `<${tag}${attrs.includes('style="') ? attrs.replace('style="', `style="${font}`) : `${attrs} style="${font}"`}>`);
 }
 
 function renderSummaryHtml({snapshot, title}, handling, {email = false} = {}) {
