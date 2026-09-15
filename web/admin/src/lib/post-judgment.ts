@@ -1,5 +1,6 @@
 export const POST_INTENT_OPTIONS = [
   { value: 'share', label: '分享' },
+  { value: 'advertising', label: '广告/软文' },
   { value: 'other', label: '其他' },
   { value: 'complaint', label: '投诉/抱怨' },
   { value: 'inquiry', label: '咨询' },
@@ -59,7 +60,7 @@ export function initialPostIntentFilter(value: unknown): PostIntent[] {
   return normalizePostIntentFilter(value)
 }
 
-// Empty selection is unrestricted; explicitly selecting all four excludes unjudged posts.
+// Empty selection is unrestricted; explicitly selecting every category excludes unjudged posts.
 export function appendPostIntentFilter(params: URLSearchParams, intents: string[]): void {
   const selected = normalizePostIntentFilter(intents)
   params.delete('intent')

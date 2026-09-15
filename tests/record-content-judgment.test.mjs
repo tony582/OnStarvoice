@@ -29,8 +29,8 @@ const mediaRecord = (patch = {}) => ({
   ...patch,
 });
 
-test('发帖意图只保留四类，并兼容历史 suggestion', () => {
-  assert.deepEqual(POST_INTENTS, ['share', 'other', 'complaint', 'inquiry']);
+test('发帖意图包含广告软文五类，并兼容历史 suggestion', () => {
+  assert.deepEqual(POST_INTENTS, ['share', 'advertising', 'other', 'complaint', 'inquiry']);
   for (const intent of POST_INTENTS) {
     assert.equal(normalizePostIntent(` ${intent.toUpperCase()} `), intent);
     assert.equal(normalizeRecordClassificationResult({ relevance: 'relevant', intent }).intent, intent);
@@ -48,6 +48,24 @@ test('发帖目的独立于相关性和情感，未分类意图不冒充其他',
   assert.equal(irrelevantInquiry.sentiment, '');
   assert.equal(irrelevantInquiry.sentimentStatus, 'not_applicable');
   assert.equal(normalizeRecordClassificationResult({}).intent, '');
+});
+
+test('广告意图保留独立的情感、相关性和判断理由，历史其他不自动改为广告', () => {
+  for (const relevance of ['relevant', 'uncertain', 'irrelevant']) {
+    for (const sentiment of ['positive', 'neutral', 'negative']) {
+      const result = normalizeRecordClassificationResult({
+        relevance, sentiment, intent: ' ADVERTISING ', intentReason: '  以体验分享形式推广安装服务  ',
+      });
+      assert.equal(result.intent, 'advertising');
+      assert.equal(result.intentReason, '以体验分享形式推广安装服务');
+      assert.equal(result.relevance, relevance);
+      assert.equal(result.sentiment, relevance === 'irrelevant' ? '' : sentiment);
+      assert.equal(result.sentimentStatus, relevance === 'irrelevant' ? 'not_applicable' : 'classified');
+    }
+  }
+  for (const intent of ['other', 'suggestion']) {
+    assert.equal(normalizeRecordClassificationResult({ intent }).intent, 'other');
+  }
 });
 
 test('缺失、错误的相关性结论均保守待核实', () => {

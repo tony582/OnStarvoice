@@ -2,11 +2,11 @@ import {
   GM_POST_ENTITY_SQL_PATTERNS, GM_CONTEXTUAL_MODEL_PATTERN, GM_VEHICLE_CONTEXT_PATTERN,
   NON_SAIC_GM_ORG_PATTERN, GENERIC_ENTITY_PATTERN,
   POST_HASHTAG_PATTERN, SENTRY_SCOPE_KEYWORDS, MONITORING_EVIDENCE_VERSION,
-  findRecordMonitoringEvidence, isSentryEvidenceScope, normalizeMonitoringEvidence, normalizePostIntent,
+  findRecordMonitoringEvidence, isSentryEvidenceScope, normalizeMonitoringEvidence, normalizePostIntent, POST_INTENTS,
 } from './record-content-judgment.js';
 import { recordRelevanceExportFields } from './record-relevance-filter.js';
 
-export const POST_INTENT_LABELS = { share: '分享', other: '其他', complaint: '投诉/抱怨', inquiry: '咨询' };
+export const POST_INTENT_LABELS = { share: '分享', advertising: '广告/软文', other: '其他', complaint: '投诉/抱怨', inquiry: '咨询' };
 
 function aliasName(alias) {
   if (!/^[a-z_][a-z0-9_]*$/i.test(alias)) throw new Error('Invalid record SQL alias');
@@ -164,7 +164,7 @@ export function recordJudgmentExportFields(record = {}) {
 
 export function recordIntentSql(alias = 'r') {
   const value = `lower(${trimSql(`COALESCE(${aliasName(alias)}.intent,'')`)})`;
-  return `(CASE WHEN ${value} = 'suggestion' THEN 'other' WHEN ${value} IN ('share','other','complaint','inquiry') THEN ${value} ELSE NULL END)`;
+  return `(CASE WHEN ${value} = 'suggestion' THEN 'other' WHEN ${value} IN (${POST_INTENTS.map(literal).join(',')}) THEN ${value} ELSE NULL END)`;
 }
 
 export function appendRecordIntentFilter(where, params, value, alias = 'r') {
@@ -173,7 +173,7 @@ export function appendRecordIntentFilter(where, params, value, alias = 'r') {
   if (values.length === 1 && values[0] === 'none') return `${where} AND false`;
   const intents = [...new Set(values.map(normalizePostIntent))];
   if (intents.includes('')) {
-    const error = new Error('意图筛选仅支持分享、其他、投诉抱怨、咨询');
+    const error = new Error('意图筛选仅支持分享、广告/软文、其他、投诉抱怨、咨询');
     error.status = 400; error.code = 'invalid_intent'; throw error;
   }
   params.push(intents);

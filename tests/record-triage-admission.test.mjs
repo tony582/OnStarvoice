@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { appendRecordIntentFilter, recordTriageAdmission, withRecordAdmissionFields } from '../server/services/record-triage-admission.js';
+import { appendRecordIntentFilter, recordJudgmentExportFields, recordTriageAdmission, withRecordAdmissionFields } from '../server/services/record-triage-admission.js';
 
 const post = { keyword: '别克哨兵', ai_result: { relevance: 'relevant' }, title: '开启了哨兵模式' };
 test('sentry admission requires overall relevance and original post evidence; existing manual overrides have priority', () => {
@@ -41,6 +41,27 @@ test('intent filters support repeated/comma forms and keep unknown intent unclas
   const projected = withRecordAdmissionFields(post);
   assert.equal('relevance_review_required' in projected, false);
   assert.equal('relevance_review_reason' in projected, false);
+});
+
+test('advertising is directly selectable alone or with sharing, while legacy other remains distinct', () => {
+  for (const [input, selected] of [
+    ['advertising', ['advertising']],
+    [['advertising', 'share,advertising'], ['advertising', 'share']],
+    ['share,other,complaint,inquiry', ['share', 'other', 'complaint', 'inquiry']],
+  ]) {
+    const params = [];
+    appendRecordIntentFilter('WHERE true', params, input);
+    assert.deepEqual(params, [selected]);
+  }
+  const source = { title: '别克配件促销，欢迎到店咨询', intent: 'advertising', ai_result: { relevance: 'relevant' } };
+  assert.equal(withRecordAdmissionFields(source).intent_display, 'advertising');
+  assert.equal(recordJudgmentExportFields(source).intent, '广告/软文');
+  for (const intent of ['other', 'suggestion']) {
+    const legacy = { ...source, intent };
+    assert.equal(withRecordAdmissionFields(legacy).intent_display, 'other');
+    assert.equal(recordJudgmentExportFields(legacy).intent, '其他');
+    assert.equal(legacy.intent, intent, 'reading an old classification does not rewrite it from advertising content');
+  }
 });
 
 

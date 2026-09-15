@@ -34,10 +34,10 @@ test('third-party OnStar service advertisements persist neutral without erasing 
       assert.equal(saved.result.sentiment, 'neutral');
       const row = await persisted(record.id);
       assert.equal(row.sentiment, 'neutral');
-      assert.equal(row.intent, 'other');
+      assert.equal(row.intent, 'advertising');
       assert.equal(row.ai_result.relevance, 'relevant');
       assert.equal(row.ai_result.sentimentStatus, 'classified');
-      assert.equal(row.ai_result.classifierMetadata.promptVersion, 'record-topic-v6');
+      assert.equal(row.ai_result.classifierMetadata.promptVersion, 'record-topic-v7');
       assert.equal(row.ai_result.serviceAdJudgment.originalModel.sentiment, sentiment);
       assert.equal(row.ai_result.serviceAdJudgment.originalModel.summary, base.summary);
       const evidence = row.ai_result.serviceAdJudgment.evidence;
@@ -55,7 +55,7 @@ test('third-party OnStar service advertisements persist neutral without erasing 
         servicePromotion: servicePromotionFixture({ content }, ['service_offer', 'marketing_pain_point', 'marketing_benefit']) }) });
       const row = await persisted(record.id);
       assert.equal(row.sentiment, 'neutral');
-      assert.equal(row.intent, 'other');
+      assert.equal(row.intent, 'advertising');
       assert.equal(row.ai_result.serviceAdJudgment.originalModel.sentiment, 'negative');
     }
   });

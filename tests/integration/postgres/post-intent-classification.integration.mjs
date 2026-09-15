@@ -32,7 +32,7 @@ test('post intent classification persists grounded evidence and fences stale mod
     const row = await persisted(source.id);
     assert.equal(row.business_visibility, 'eligible');
     assert.equal(row.content, source.content);
-    assert.equal(row.ai_result.classifierMetadata.promptVersion, 'record-topic-v6');
+    assert.equal(row.ai_result.classifierMetadata.promptVersion, 'record-topic-v7');
   });
   await t.test('unambiguous model identity protects relevant posts even without a brand word', async () => {
     const source = await record('昂科威Plus哨兵没触发，车被刮了。');
@@ -120,6 +120,32 @@ test('post intent classification persists grounded evidence and fences stale mod
     assert.equal(outcome.result.relevance, 'irrelevant');
     assert.equal(outcome.result.intent, 'inquiry');
     assert.equal(outcome.result.sentiment, '');
+  });
+  await t.test('advertising intent and its explanation persist independently from sentiment and relevance', async () => {
+    for (const [relevance, sentiment] of [['relevant', 'positive'], ['relevant', 'neutral'], ['relevant', 'negative'], ['irrelevant', 'negative']]) {
+      const source = await record('别克车机升级安装服务介绍，欢迎预约到店。', '别克车机升级');
+      const intentReason = '以服务介绍招揽安装客户';
+      const outcome = await persistRecordClassification({ record: source, labeled: labeled({ ...baseResult,
+        intent: ' ADVERTISING ', intentReason, relevance, sentiment,
+      }) });
+      const row = await persisted(source.id);
+      assert.equal(outcome.result.intent, 'advertising');
+      assert.equal(row.intent, 'advertising');
+      assert.equal(row.ai_result.intent, 'advertising');
+      assert.equal(row.ai_result.intentReason, intentReason);
+      assert.equal(row.ai_result.relevance, relevance);
+      assert.equal(row.sentiment, relevance === 'irrelevant' ? '' : sentiment);
+      assert.equal(row.content, source.content);
+    }
+  });
+  await t.test('existing other records do not become advertisements when another record is classified', async () => {
+    const historical = await record('希望增加更多设置功能', '别克车机升级');
+    await pool.query("UPDATE records SET intent='other',ai_labeled_at=now(),ai_result='{\"intent\":\"other\",\"relevance\":\"relevant\"}' WHERE id=$1", [historical.id]);
+    const source = await record('别克车机升级安装服务，欢迎预约。', '别克车机升级');
+    await persistRecordClassification({ record: source, labeled: labeled({ ...baseResult, intent: 'advertising' }) });
+    const row = await persisted(historical.id);
+    assert.equal(row.intent, 'other');
+    assert.equal(row.ai_result.intent, 'other');
   });
   await t.test('a manual relevance decision made during model work wins', async () => {
     const source = await record();

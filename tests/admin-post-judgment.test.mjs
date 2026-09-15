@@ -10,8 +10,8 @@ const compiled = ts.transpileModule(source('web/admin/src/lib/post-judgment.ts')
 }).outputText;
 const { postJudgment, normalizePostIntent, initialPostIntentFilter, appendPostIntentFilter, appendPostRelevanceFilters, normalizePostRelevanceFilter, normalizePostConfidenceFilter, postFilterSummary, POST_INTENT_OPTIONS, ALL_POST_INTENTS } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 
-test('four public post intents preserve legacy suggestions and keep missing values unjudged', () => {
-  assert.deepEqual(POST_INTENT_OPTIONS.map(option => option.value), ['share', 'other', 'complaint', 'inquiry']);
+test('five public post intents preserve legacy suggestions and keep missing values unjudged', () => {
+  assert.deepEqual(POST_INTENT_OPTIONS.map(option => option.value), ['share', 'advertising', 'other', 'complaint', 'inquiry']);
   assert.equal(normalizePostIntent('suggestion'), 'other');
   for (const value of [undefined, null, '', 'unknown']) {
     assert.equal(postJudgment({ intent: value }).intentLabel, '待判断');
@@ -19,19 +19,28 @@ test('four public post intents preserve legacy suggestions and keep missing valu
   assert.equal(postJudgment({ intent: 'suggestion' }).intentLabel, '其他');
   assert.equal(postJudgment({ intent: 'share', intent_display: null }).intentLabel, '待判断');
   assert.equal(postJudgment({ intent: 'complaint' }).intentLabel, '投诉/抱怨');
+  for (const record of [
+    { intent: 'advertising' },
+    { ai_result: JSON.stringify({ intent: 'advertising', intentReason: '推广拆除服务并提供预约电话' }) },
+    { intent: 'share', intent_display: 'advertising' },
+  ]) {
+    assert.equal(postJudgment(record).intent, 'advertising');
+    assert.equal(postJudgment(record).intentLabel, '广告/软文');
+  }
 });
 
-test('positive intent selection defaults to unrestricted; explicit four categories remain filtered', () => {
+test('positive intent selection defaults to unrestricted; explicit categories remain filtered', () => {
   for (const value of [undefined, null, '', 'unknown', 'none']) assert.deepEqual(initialPostIntentFilter(value), []);
   assert.deepEqual(initialPostIntentFilter('share,inquiry'), ['share', 'inquiry']);
   const params = new URLSearchParams({ keyword: '哨兵' });
-  for (const selected of [[], ['share'], ['share', 'inquiry'], ['inquiry'], [], ALL_POST_INTENTS]) {
+  for (const selected of [[], ['share'], ['advertising'], ['share', 'advertising'], ['share', 'inquiry'], ['inquiry'], [], ['share', 'other', 'complaint', 'inquiry'], ALL_POST_INTENTS]) {
     appendPostIntentFilter(params, selected);
     assert.deepEqual(params.getAll('intent'), selected);
     assert.equal(params.get('keyword'), '哨兵');
   }
   appendPostIntentFilter(params, ['complaint', 'inquiry', 'complaint']);
   assert.deepEqual(params.getAll('intent'), ['complaint', 'inquiry']);
+  assert.deepEqual(initialPostIntentFilter('advertising,share,advertising'), ['advertising', 'share']);
 });
 
 test('relevance and confidence are independent OR dimensions on the common query', () => {
@@ -79,6 +88,7 @@ test('confidence bands use rounded valid numeric values including zero and trimm
 test('filter summaries show chosen labels and compact multiple selections', () => {
   assert.equal(postFilterSummary([], '全部意图'), '全部意图');
   assert.equal(postFilterSummary(['分享'], '全部意图'), '分享');
+  assert.equal(postFilterSummary(['广告/软文'], '全部意图'), '广告/软文');
   assert.equal(postFilterSummary(['分享', '咨询'], '全部意图'), '分享 +1');
   assert.equal(postFilterSummary(['相关', '无关', '高置信度', '人工判断'], '相关性'), '相关 +3');
 });

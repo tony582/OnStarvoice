@@ -119,6 +119,8 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   for (const [name, fields] of fallbackCases) await record(name, fields);
   await record('legacy-proof', { title: '我的 CT5 哨兵体验', keyword: '至境哨兵', intent: 'share' });
   await record('new-proof', { title: '别克车主分享', intent: 'inquiry', ai_result: { relevance: 'relevant', monitoringEvidence: { status: 'confirmed', evidence: [{ source: 'title', quote: '别克车主' }] } } });
+  await record('intent-advertising', { title: '别克配件促销，欢迎到店咨询', intent: 'advertising' });
+  await record('intent-legacy-other-ad', { title: '别克服务推广旧分类', content: '本店提供别克配件安装服务，欢迎到店咨询。', intent: 'other' });
   await record('stale-proof', { title: '别克车主分享', ai_result: { relevance: 'relevant', monitoringEvidence: { status: 'confirmed', evidence: [{ source: 'title', quote: 'CT5车主' }] } } });
   await record('cropped-model-proof', { title: 'CT50的哨兵功能演示', ai_result: { relevance: 'relevant', monitoringEvidence: { status: 'confirmed', evidence: [{ source: 'title', quote: 'CT5' }] } } });
   await record('new-needs-review', { title: '别克车主分享', ai_result: { relevance: 'relevant', monitoringEvidence: { status: 'needs_review', evidence: [{ source: 'title', quote: '别克车主' }] } } });
@@ -265,7 +267,20 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   assert.ok(overview.pendingRecords.every(row => admittedIds.includes(row.id)));
   const intentRows = (await list('intent=share&intent=inquiry')).records;
   assert.deepEqual(intentRows.map(row => row.intent_display).sort(), ['inquiry', 'share', 'share']);
-  assert.deepEqual((await list('intent=other,complaint')).records.map(row => row.intent_display).sort(), ['complaint', 'other', 'other']);
+  assert.deepEqual((await list('intent=other,complaint')).records.map(row => row.intent_display).sort(), ['complaint', 'other', 'other', 'other']);
+  const advertisingRows = await list('intent=advertising');
+  assert.deepEqual(advertisingRows.records.map(row => row.id), [ids['intent-advertising']]);
+  assert.equal(Number(advertisingRows.pagination.total), 1);
+  assert.equal(advertisingRows.records[0].intent_display, 'advertising');
+  const advertisingAndShareIds = [ids['intent-advertising'], ids['legacy-proof'], ids['whitespace-media']].sort();
+  for (const query of ['intent=advertising&intent=share', 'intent=advertising,share']) {
+    const body = await list(query);
+    assert.deepEqual(body.records.map(row => row.id).sort(), advertisingAndShareIds, query);
+    assert.equal(Number(body.pagination.total), advertisingAndShareIds.length);
+  }
+  const previousIntentRows = (await list('intent=share,other,complaint,inquiry')).records;
+  assert.ok(!previousIntentRows.some(row => row.id === ids['intent-advertising']), 'an explicit old four-category filter does not become unrestricted');
+  assert.equal(previousIntentRows.find(row => row.id === ids['intent-legacy-other-ad']).intent_display, 'other', 'advertising copy alone cannot silently reclassify historical other');
   assert.equal((await list()).records.find(row => row.id === ids['foreign-observation']).intent_display, null);
   for (const route of ['/triage/records', '/triage/records/export']) assert.equal((await fetch(`${base}/api${route}?intent=bogus`, { headers })).status, 400);
   async function exportRows(query) {
@@ -294,11 +309,23 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   assert.deepEqual(headerValues.slice(headerValues.indexOf('情感'), headerValues.indexOf('情感') + 6), ['情感','意图','相关性','AI置信度','判断来源','分类']);
   assert.ok(JSON.stringify(unjudgedSheet.getSheetValues()).includes('待判断'));
   assert.ok(JSON.stringify(unjudgedSheet.getSheetValues()).includes('投诉/抱怨'));
+  assert.ok(JSON.stringify(unjudgedSheet.getSheetValues()).includes('广告/软文'));
   const sheet = await exportRows('intent=other');
-  assert.equal(sheet.rowCount, 3);
+  assert.equal(sheet.rowCount, 4);
   const intentColumn = sheet.getRow(1).values.indexOf('意图');
   assert.ok(intentColumn > 0);
-  assert.equal(sheet.getRow(2).getCell(intentColumn).value, '其他');
+  for (let index = 2; index <= sheet.rowCount; index++) assert.equal(sheet.getRow(index).getCell(intentColumn).value, '其他');
+  assert.ok(JSON.stringify(sheet.getSheetValues()).includes('别克服务推广旧分类'));
+  const adSheet = await exportRows('intent=advertising');
+  assert.equal(adSheet.rowCount, 2);
+  assert.equal(adSheet.getRow(2).getCell(intentColumn).value, '广告/软文');
+  assert.ok(JSON.stringify(adSheet.getSheetValues()).includes('别克配件促销，欢迎到店咨询'));
+  assert.ok(!JSON.stringify(adSheet.getSheetValues()).includes('别克服务推广旧分类'));
+  const adShareSheet = await exportRows('intent=advertising&intent=share');
+  assert.equal(adShareSheet.rowCount, advertisingAndShareIds.length + 1);
+  const adShareLabels = [];
+  for (let index = 2; index <= adShareSheet.rowCount; index++) adShareLabels.push(adShareSheet.getRow(index).getCell(intentColumn).value);
+  assert.deepEqual(adShareLabels.sort(), ['广告/软文', '分享', '分享'].sort());
 
   const patchPath = `/triage/records/${ids['archived-blocked']}/relevance`;
   for (const actorHeaders of [headers, readerHeaders]) {
@@ -313,6 +340,8 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   assert.equal(raw.pagination.total, fixtures.size, 'all original records remain available in the raw database table');
   assert.deepEqual(raw.rows.map(row => row.id).sort(), sqlRows.map(row => row.id).sort());
   assert.ok(blockedIds.every(id => raw.rows.some(row => row.id === id)));
+  assert.equal(raw.rows.find(row => row.id === ids['intent-advertising']).intent, 'advertising');
+  assert.equal(raw.rows.find(row => row.id === ids['intent-legacy-other-ad']).intent, 'other');
   assert.deepEqual(raw.rows.find(row => row.id === ids['cropped-model-proof']).ai_result.monitoringEvidence.evidence, [{ source: 'title', quote: 'CT5' }], 'read-time quote repair must not rewrite persisted raw AI evidence');
   assert.equal(raw.rows.find(row => row.id === ids['short-l7-old-metadata']).ai_result.monitoringEvidence.status, 'needs_review');
   const rawReader = await json('/records/tables/keyword_notes?pageSize=100', { headers: readerHeaders });

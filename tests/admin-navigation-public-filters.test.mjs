@@ -20,12 +20,16 @@ const { normalizePage } = exports;
 const params = query => JSON.parse(JSON.stringify(normalizePublicPageParams(new URLSearchParams(query))));
 
 test('public links preserve repeated and comma-separated judgment selections together', () => {
-  assert.deepEqual(params('page=workbench&queue=triage&intent=share&intent=complaint,inquiry&relevance=relevant&relevance=uncertain&relevanceConfidence=high,medium&relevanceConfidence=missing'), {
-    queue: 'triage', intent: 'share,complaint,inquiry', relevance: 'relevant,uncertain', relevanceConfidence: 'high,medium,missing',
+  assert.deepEqual(params('page=workbench&queue=triage&intent=share&intent=advertising,complaint,inquiry&relevance=relevant&relevance=uncertain&relevanceConfidence=high,medium&relevanceConfidence=missing'), {
+    queue: 'triage', intent: 'share,advertising,complaint,inquiry', relevance: 'relevant,uncertain', relevanceConfidence: 'high,medium,missing',
   });
 });
 
-test('explicit four-category intent and unrestricted empty filters remain distinct', () => {
+test('explicit five-category intent and unrestricted empty filters remain distinct', () => {
+  assert.deepEqual(params('page=workbench&intent=share&intent=advertising&intent=other&intent=complaint&intent=inquiry'), {
+    intent: 'share,advertising,other,complaint,inquiry',
+  });
+  assert.deepEqual(params('page=workbench&intent=advertising'), { intent: 'advertising' });
   assert.deepEqual(params('page=workbench&intent=share&intent=other&intent=complaint&intent=inquiry'), {
     intent: 'share,other,complaint,inquiry',
   });

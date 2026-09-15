@@ -1,10 +1,10 @@
 import { getRecordEvidenceSources } from './record-content-judgment.js';
 
-export const ONSTAR_SERVICE_AD_RULE_VERSION = 'onstar-third-party-service-ad-v1';
+export const ONSTAR_SERVICE_AD_RULE_VERSION = 'onstar-third-party-service-ad-v2';
 export const ONSTAR_SERVICE_AD_PROMPT_RULES = `
-- 第三方商家推广安吉星设备拆除、GPS/定位设备检测拆除、第三方安保系统加装，若主帖只有服务招揽与营销卖点，没有真实车主抱怨、明确故障或对监控品牌的贬损：sentiment=neutral、intent=other。拆除设备本身不是负面，宣传第三方服务也不是对安吉星的好评。
+- 第三方商家推广安吉星设备拆除、GPS/定位设备检测拆除、第三方安保系统加装，若主帖只有服务招揽与营销卖点，没有真实车主抱怨、明确故障或对监控品牌的贬损：sentiment=neutral、intent=advertising。拆除设备本身不是负面，宣传第三方服务也不是对安吉星的好评。
 - “买家担心隐藏 GPS 不敢买”“定位清理提升二手车成交信任”等广告痛点，不等于作者遭遇安吉星故障、隐私侵害或提出投诉。先区分商家卖点与车主的真实经历，再判断情感。
-- 例：“我们帮你拆除旧GPS、安吉星，安装GDCAB安保系统并出具检测报告。关注我们获取支持。”属于第三方服务广告，neutral + other；即使广告中说“安全、放心、增值、隐私担忧”，也不改成 positive 或 negative。
+- 例：“我们帮你拆除旧GPS、安吉星，安装GDCAB安保系统并出具检测报告。关注我们获取支持。”属于第三方服务广告，neutral + advertising；即使广告中说“安全、放心、增值、隐私担忧”，也不改成 positive 或 negative。
 - 若商家广告夹带“安吉星偷偷监听、垃圾”等攻击，或作者引用广告表达批评、记录自己遭遇泄露/故障/收费争议/维权，仍按实际负面表达判断，不因电话号码、商家身份或拆除字样而抹掉负面。否定提供拆除服务、纯车主咨询、其他品牌广告也不能套用上述广告结论。
 - 上述广告规则不改变整体相关性：整体 irrelevant 时 sentiment=null、sentimentStatus=not_applicable；关键词、评论、作者名或单独标签不能替代主帖里的服务与品牌证据。`;
 
@@ -124,7 +124,7 @@ export function normalizeOnstarServiceAdJudgment(result = {}, record = {}, model
     ...result,
     sentiment: manualSentimentProtected ? String(record.sentiment || '') : 'neutral',
     sentimentStatus: manualSentimentProtected && !record.sentiment ? result.sentimentStatus : 'classified',
-    intent: 'other',
+    intent: 'advertising',
     intentReason: '主帖为第三方定位设备拆检或安保加装服务招揽，没有对安吉星的实际褒贬。',
     summary: '商家推广定位设备拆检或第三方安保加装服务',
     serviceAdJudgment: {

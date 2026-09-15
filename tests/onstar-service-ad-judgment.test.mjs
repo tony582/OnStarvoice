@@ -8,13 +8,13 @@ const base = { relevance: 'relevant', sentiment: 'negative', sentimentStatus: 'c
 const asAd = (record, roles, result = base) => ({ ...result, servicePromotion: servicePromotionFixture(record, roles) });
 const citations = evidence => [evidence.brand, evidence.service, evidence.offer, ...evidence.statements];
 
-test('screenshot service marketing normalizes conflicting model sentiments to neutral and intent other with original evidence', () => {
+test('screenshot service marketing normalizes conflicting model sentiments to neutral and advertising intent with original evidence', () => {
   for (const sentiment of ['negative', 'positive', 'neutral']) {
     const record = { content: screenshot };
     const input = asAd(record, screenshotAdRoles, { ...base, sentiment });
     const result = normalizeOnstarServiceAdJudgment(input, record);
     assert.equal(result.sentiment, 'neutral');
-    assert.equal(result.intent, 'other');
+    assert.equal(result.intent, 'advertising');
     assert.equal(result.relevance, 'relevant');
     assert.equal(result.serviceAdJudgment.version, ONSTAR_SERVICE_AD_RULE_VERSION);
     assert.equal(result.serviceAdJudgment.originalModel.sentiment, sentiment);
@@ -43,7 +43,7 @@ for (const [name, record, roles] of [
   test(`pure service advertisement: ${name}`, () => {
     const result = normalizeOnstarServiceAdJudgment(asAd(record, roles), record);
     assert.equal(result.sentiment, 'neutral');
-    assert.equal(result.intent, 'other');
+    assert.equal(result.intent, 'advertising');
     for (const evidence of citations(result.serviceAdJudgment.evidence)) assert.ok(String(record[evidence.source]).includes(evidence.quote));
   });
 }
@@ -117,7 +117,7 @@ test('manual sentiment is protected and raw model judgment remains separately au
     const model = asAd({ content: screenshot }, screenshotAdRoles);
     const result = normalizeOnstarServiceAdJudgment({ ...model, sentiment: 'neutral' }, { content: screenshot, sentiment: 'negative', manual_overrides }, model);
     assert.equal(result.sentiment, 'negative');
-    assert.equal(result.intent, 'other');
+    assert.equal(result.intent, 'advertising');
     assert.equal(result.serviceAdJudgment.manualSentimentProtected, true);
     assert.equal(result.serviceAdJudgment.sentimentApplied, false);
     assert.equal(result.serviceAdJudgment.originalModel.sentiment, 'negative');
@@ -170,7 +170,7 @@ test('model-supplied normalization audit claims are discarded', () => {
 test('classification prompt distinguishes third-party service ads from complaints and brand sentiment', () => {
   const prompt = buildSystemPrompt({ brandName: '安吉星', brandAliases: [], businessContext: '', positiveContextTerms: [], noiseTerms: [] });
   assert.match(prompt, /第三方商家推广安吉星设备拆除/u);
-  assert.match(prompt, /sentiment=neutral、intent=other/u);
+  assert.match(prompt, /sentiment=neutral、intent=advertising/u);
   assert.match(prompt, /宣传第三方服务也不是对安吉星的好评/u);
   assert.match(prompt, /商家广告夹带/u);
 });

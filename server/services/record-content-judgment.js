@@ -2,7 +2,7 @@ import { GM_VEHICLE_ALIASES, GM_COMPATIBLE_MODEL_SPELLINGS } from './gm-vehicle-
 
 // Post intent and verifiable main-post evidence. Search metadata and comments
 // are deliberately excluded: a recall keyword does not identify a vehicle.
-export const POST_INTENTS = ['share', 'other', 'complaint', 'inquiry'];
+export const POST_INTENTS = ['share', 'advertising', 'other', 'complaint', 'inquiry'];
 export const MONITORING_EVIDENCE_VERSION = 'main-post-entity-v3';
 export const SENTRY_SCOPE_KEYWORDS = ['别克哨兵', '至境哨兵', '凯迪拉克哨兵', '雪佛兰哨兵', '通用哨兵'];
 export const POST_HASHTAG_PATTERN = '[#＃][^#＃\\s，。！？,!?;；]+';

@@ -35,7 +35,7 @@ import {
   formatGmAliasesForPrompt, getRecordEvidenceSources, isSentryEvidenceScope, normalizeJudgmentConfidence, normalizeMonitoringEvidence, normalizePostIntent,
 } from './record-content-judgment.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v6';
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v7';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
 const LLM_PROVIDER_ALIASES = Object.freeze({
@@ -161,7 +161,7 @@ ${ONSTAR_SERVICE_AD_PROMPT_RULES}
   "sentiment": "positive|neutral|negative|null",
   "sentimentStatus": "classified|not_applicable",
   "servicePromotion": {"type":"third_party_service_ad|mixed|not_ad|uncertain","speaker":"merchant|owner|quoted|other|uncertain","brandEvaluation":"none|positive|negative|uncertain","statements":[{"source":"title|content|transcript","quote":"对应主帖中的完整原句（保留句尾标点）","role":"service_offer|marketing_pain_point|marketing_benefit|call_to_action|contact_or_header|brand_evaluation|owner_experience|quoted_claim|other"}]},
-  "intent": "share|other|complaint|inquiry",
+  "intent": "share|advertising|other|complaint|inquiry",
   "intentReason": "说明发帖者的主要表达目的，不超过80字",
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|other",
   "subcategory": "具体子分类（中文）",
@@ -172,7 +172,9 @@ ${ONSTAR_SERVICE_AD_PROMPT_RULES}
 
 分类说明：
 - sentiment: positive(推荐、好评、感谢), neutral(普通分享、使用教程), negative(投诉、吐槽、故障)
-- intent 独立于情感和相关性，按发帖者的主要目的四选一：share(分享：经历、体验、知识、教程或信息分享)，other(其他：纯营销、改进建议及无法归入其余三类的表达)，complaint(投诉/抱怨：诉说故障、不满、批评、质疑或维权，含暗讽和反问)，inquiry(咨询：真实寻求事实、方法、价格或购买/使用帮助)。不要把投诉中的“为什么这么差”“这也能用？”等反问当咨询；不要因为一句咨询带问号就忽略整篇的主要目的。
+- intent 独立于情感和相关性，按发帖者的主要目的五选一：share(分享：经历、体验、知识、教程或信息分享)，advertising(广告/软文：以推广产品、品牌、服务、促销、带货、招揽客户或商业引流为主要目的，包括包装成体验分享、测评、教程的推广软文)，other(其他：改进建议及无法归入其余四类的表达)，complaint(投诉/抱怨：诉说故障、不满、批评、质疑或维权，含暗讽和反问)，inquiry(咨询：真实寻求事实、方法、价格或购买/使用帮助)。不要把投诉中的“为什么这么差”“这也能用？”等反问当咨询；不要因为一句咨询带问号就忽略整篇的主要目的。
+- 广告/软文须有主帖中的推广目的证据，intentReason 写明依据。商家“欢迎咨询、私信报价、预约到店”是招揽，不是用户咨询；以推广为目的的“真实体验分享、好物推荐”仍为 advertising。不要求一定有价格、电话或购买链接；也不能仅凭品牌名称、正面评价、账号身份、联系方式或单个营销词认定广告。普通车主真实经验与无商业引导的教程按 share；用户引用广告进行投诉、暗讽或询价，分别按主导的 complaint/inquiry 判断，不继承被引用广告的意图。混合内容按作者主要目的选择，不把所有正面内容当软文。
+- advertising 不代表 neutral 或 irrelevant，不自动改变情感、相关性、来源类型或监控准入。推广中若含对监控对象的实际褒贬或故障描述，仍须独立判断情感；只有下述满足完整证据条件的纯第三方设备服务广告适用专门的中性规则。
 - servicePromotion 专门核对第三方设备拆检/安保加装广告：只有作者自己是招揽服务的商家、全文没有实际品牌褒贬或车主经历时，type=third_party_service_ad、speaker=merchant、brandEvaluation=none，并按完整原句逐句列出全部主帖标题、正文及可信当前逐字稿（纯话题标签除外）的来源和角色。使用句号/问号/叹号/分号或换行断句，原样保留句尾标点。服务=service_offer；泛指二手车买家担心隐藏GPS/隐私、影响成交等营销痛点=marketing_pain_point；信任、增值等卖点=marketing_benefit；招揽联系=call_to_action；地址电话或服务标题=contact_or_header。不得遗漏广告外的实际故障、品牌攻击、引述批评等句子；这些情况必须填 mixed/not_ad，信息不足用 uncertain。只为需要核对的纯第三方服务广告列出 statements，最多20句，每句不超过400字、合计不超过6000字，超过限制则 uncertain、statements=[]，不截短或漏句。普通非广告及混合帖子 statements=[]，不要编造补全。该结构与 sentiment 分开判断。
 - category:
   - safety_rescue: SOS紧急救援、碰撞自动求助、道路救援
