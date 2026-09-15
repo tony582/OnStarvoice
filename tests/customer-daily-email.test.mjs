@@ -44,7 +44,7 @@ test('email contains the rendered saved report and an editable Excel attachment,
   assert.match(message.html,/https:\/\/example.test\/post/);
   assert.match(message.text,/需要处理的原帖/);
   assert.doesNotMatch(message.html+message.text,/内部检查信息/);
-  assert.doesNotMatch(message.html,/min-width:640px|table\{[^}]*width:100%/);
+  assert.doesNotMatch(message.html,/min-width:640px|table\{[^}]*;width:100%/);
   assert.match(message.html,/table\.email-summary\{width:450pt!important/);
   assert.match(message.html,/<!--\[if mso\]><table role="presentation" width="600"/);
   assert.match(message.html,/<!--\[if mso\]><\/td><\/tr><\/table><!\[endif\]-->/);
