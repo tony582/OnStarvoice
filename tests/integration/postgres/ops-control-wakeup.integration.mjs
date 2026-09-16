@@ -23,6 +23,11 @@ async function waitFor(check, {timeoutMs = 3000, intervalMs = 20} = {}) {
 }
 
 async function createEnabledTenant(name) {
+  // This fixture exercises event wakeups outside the scheduled window. Keep
+  // it outside that window regardless of when CI runs (Shanghai time).
+  const shanghaiHour = new Date(Date.now() + 8 * 60 * 60 * 1000).getUTCHours();
+  const [windowStart, windowEnd] = shanghaiHour < 12
+    ? ['18:00', '19:00'] : ['02:00', '03:00'];
   const tenant = await queryOne(`
     INSERT INTO tenants (name)
     VALUES ($1)
@@ -32,10 +37,12 @@ async function createEnabledTenant(name) {
     INSERT INTO tenant_settings (tenant_id, key, value)
     VALUES
       ($1, 'ops_control_enabled', 'true'),
-      ($1, 'ops_control_digest_email_enabled', 'false')
+      ($1, 'ops_control_digest_email_enabled', 'false'),
+      ($1, 'ops_control_window_start', $2),
+      ($1, 'ops_control_window_end', $3)
     ON CONFLICT (tenant_id, key)
     DO UPDATE SET value = excluded.value, updated_at = now()
-  `, [tenant.id]);
+  `, [tenant.id, windowStart, windowEnd]);
   return tenant;
 }
 
