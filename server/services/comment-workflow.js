@@ -917,11 +917,13 @@ async function reprocessPendingCommentWorkflowReceiptsUnderLease({
     0,
     Math.min(300, Number(queuedGraceSeconds) || 0),
   );
+  // Keep the database version lossless: pg's Date parser truncates PostgreSQL
+  // microseconds, which would make an unchanged receipt fail the claim below.
   const rows = await queryAll(`
     SELECT observation.id AS observation_id,
       observation.tenant_id, observation.record_id,
       observation.comment_workflow_expected_count,
-      observation.comment_workflow_updated_at,
+      observation.comment_workflow_updated_at::text AS comment_workflow_version,
       observation.comment_workflow_retry_count,
       record.platform, record.title, record.content,
       record.author_name, record.author_id, record.author_account_no,
@@ -1008,7 +1010,7 @@ async function reprocessPendingCommentWorkflowReceiptsUnderLease({
     `, [
       row.observation_id,
       row.tenant_id,
-      row.comment_workflow_updated_at,
+      row.comment_workflow_version,
       COMMENT_WORKFLOW_WORKER_ID,
       COMMENT_WORKFLOW_LEASE_SECONDS,
     ]);
