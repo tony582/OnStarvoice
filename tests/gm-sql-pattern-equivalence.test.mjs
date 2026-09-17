@@ -40,7 +40,7 @@ const independentCases = [
   ['昂科威Plus哨兵没有触发', true], ['至境L7哨兵体验', true], ['CT50的哨兵功能演示', true],
   ['CT 5 的哨兵怎么开启', true], ['CT–5驻车异常', true], ['C T 5哨兵', true],
   ['GL8的驻车录像', true], ['我的开拓者哨兵录像没触发', true], ['景程车主咨询驻车监控', true],
-  ['L7哨兵模式怎么开', true], ['E5驻车监控异常', true], ['通用旗下车型驻车录像', true],
+  ['L7哨兵模式怎么开', true], ['E5驻车监控异常', true], ['至境智驾不可用后恢复', true], ['通用旗下车型驻车录像', true],
   ['通用集团新闻', true], ['通用的哨兵功能', true], ['通用的my car', false],
   ['myct50测试录像', false], ['CT500哨兵模式', false], ['GL80测试录像', false], ['EL70测试', false], ['E50资料', false],
   ['哨兵模式的行业开拓者', false], ['追求至境，哨兵技术再升级', false], ['一路景程，沿途风景真好', false],

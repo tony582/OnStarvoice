@@ -11,8 +11,8 @@ const SEPARATOR = '[\\s_‐‑‒–—−-]*';
 // complete name prevents its prefix from inventing SAIC-GM evidence.
 export const NON_SAIC_GM_ORG_PATTERN = `上汽\\s*通用\\s*五菱|上海\\s*通用\\s*五菱|(?<![a-z0-9])(?:saic${SEPARATOR}(?:gm|general\\s+motors)${SEPARATOR}wuling|shanghai\\s+general\\s+motors\\s+wuling|sgmw)(?![a-z0-9])`;
 export const GENERIC_ENTITY_PATTERN = '^(我的车|这辆车|这台车|这个车|该车|本车|车辆|车型|汽车|轿车|车主|品牌|型号|新车|新能源|电动车|哨兵|哨兵模式|驻车监控|车机|通用|上汽|gm|sgm|saic|suv|mpv|car|vehicle|model|brand|my car|sentinel|unknown|none|null)$';
-const VEHICLE_CONTEXT = '(?:车主|车型|汽车|轿车|车机|车门|车窗|车锁|哨兵|驻车|远控|远程|录像|行车|续航|油耗|提车|用车|试驾|发动机|变速箱|suv|mpv|car|vehicle|sedan|sentinel|parking|dashcam|onstar|owner|driv(?:e|ing))';
-export const GM_VEHICLE_CONTEXT_PATTERN = '(?:车主|车型|汽车|轿车|车机|车门|车窗|车锁|哨兵|驻车|远控|远程|解锁|行车|续航|油耗|提车|用车|试驾|发动机|变速箱|(?<![a-z0-9])(?:suv|mpv|cars?|vehicles?|sedan|sentinel|parking|dashcam|onstar|driving)(?![a-z0-9]))';
+const VEHICLE_CONTEXT = '(?:车主|车型|汽车|轿车|车机|车门|车窗|车锁|智驾|哨兵|驻车|远控|远程|录像|行车|续航|油耗|提车|用车|试驾|发动机|变速箱|suv|mpv|car|vehicle|sedan|sentinel|parking|dashcam|onstar|owner|driv(?:e|ing))';
+export const GM_VEHICLE_CONTEXT_PATTERN = '(?:车主|车型|汽车|轿车|车机|车门|车窗|车锁|智驾|哨兵|驻车|远控|远程|解锁|行车|续航|油耗|提车|用车|试驾|发动机|变速箱|(?<![a-z0-9])(?:suv|mpv|cars?|vehicles?|sedan|sentinel|parking|dashcam|onstar|driving)(?![a-z0-9]))';
 const CONTEXT_GAP = '[\\s的我这台辆款新老]{0,6}';
 const escapePattern = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 

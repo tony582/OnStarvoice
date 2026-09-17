@@ -91,6 +91,29 @@ test('saved search windows guard ingestion without changing patrol or customer e
     assert.equal(rejected.publishWindowCheck.referenceTimestamp, Date.parse(reference));
   });
 
+  await t.test('a later transient prefilter failure cannot hide an already completed capture', async () => {
+    const complete = body(xhsTask, '2026-09-10', {extraPayload: {
+      detailCaptureStatus: 'done',
+      aiRelevancePrefilter: {status: 'ok', executionDisposition: 'collect_full'},
+    }});
+    const first = await save(complete);
+    const externalId = normalizeRecord(complete)[0].external_id;
+    assert.equal((await getRecord(first.id)).business_visibility, 'eligible');
+
+    const transient = body(xhsTask, '2026-09-10', {id: externalId, extraPayload: {
+      detailCaptureStatus: 'deferred',
+      aiRelevancePrefilter: {
+        status: 'model_error',
+        executionDisposition: 'defer_enhancement',
+        reason: 'AI 前置筛选暂不可用，请继续原采集流程',
+      },
+    }});
+    await save(transient);
+    const stored = await getRecord(first.id);
+    assert.equal(stored.business_visibility, 'eligible');
+    assert.equal(stored.payload.detailCaptureStatus, 'done');
+  });
+
   await t.test('missing dates are preserved as unverified and cannot be invented from a title', async () => {
     const input = body(xhsTask, '');
     input.payload.items[0].title = '9-10月活动，2025年经验';

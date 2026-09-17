@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 
 import {buildSyncAiJob, normalizeRecord} from '../server/routes/sync.js';
@@ -553,6 +554,13 @@ test('prefilter audit projects records into one explicit business visibility sta
   assert.equal(resolveRecordBusinessVisibility({
     payload: {detailCaptureStatus: 'deferred'},
   }), 'deferred');
+  assert.equal(resolveRecordBusinessVisibility(
+    {payload: {
+      detailCaptureStatus: 'deferred',
+      aiRelevancePrefilter: {status: 'model_error', executionDisposition: 'defer_enhancement'},
+    }},
+    {business_visibility: 'eligible'},
+  ), 'eligible', 'later transient model failure cannot hide a previously admitted post');
   assert.equal(resolveRecordBusinessVisibility({
     payload: {
       aiRelevancePrefilter: {executionDisposition: 'collect_minimal_detail'},
@@ -562,6 +570,11 @@ test('prefilter audit projects records into one explicit business visibility sta
     {payload: {}},
     {business_visibility: 'deferred'},
   ), 'deferred');
+});
+
+test('prefilter persistence keeps an already eligible record visible on a later deferred decision', async () => {
+  const prefilter = await readFile(new URL('../server/services/relevance-prefilter.js', import.meta.url), 'utf8');
+  assert.match(prefilter, /WHEN business_visibility = 'eligible' AND \$4 = 'deferred'\s+THEN 'eligible'/u);
 });
 
 test('legacy comment count cannot overwrite a trusted stored count', () => {

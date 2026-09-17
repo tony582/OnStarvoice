@@ -836,6 +836,8 @@ async function persistPrefilterOutcome({
           SET business_visibility = CASE
                 WHEN payload->'serverPublishWindow'->>'status' = 'out_of_range'
                   THEN 'filtered_out'
+                WHEN business_visibility = 'eligible' AND $4 = 'deferred'
+                  THEN 'eligible'
                 ELSE $4 END,
               relevance_disposition_updated_at = now(),
               updated_at = now()

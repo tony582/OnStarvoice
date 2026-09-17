@@ -85,7 +85,7 @@ test('至境哨兵不会扩展为所有至境车型舆情', () => {
 });
 
 test('后台最终标注以整体范围为准并保留当前关键词归属', () => {
-  assert.equal(RECORD_CLASSIFICATION_PROMPT_VERSION, 'record-topic-v7');
+  assert.equal(RECORD_CLASSIFICATION_PROMPT_VERSION, 'record-topic-v8');
   const intent = resolveMonitoringIntent('凯迪拉克OTA');
   const prompt = buildSystemPrompt(BRAND, intent);
   const userMessage = buildUserMessage({
@@ -102,6 +102,7 @@ test('后台最终标注以整体范围为准并保留当前关键词归属', ()
   assert.match(prompt, /凯迪拉克CT5经常莫名拨打紧急救援电话/);
   assert.match(prompt, /昂科威plus远程失败/);
   assert.match(prompt, /安吉星，一生黑/);
+  assert.match(prompt, /恢复结果不能抹掉此前故障/);
   assert.match(prompt, /“安全感”“安全配置可靠”等正向表达不能据此生成风险或负面结论/);
   assert.match(prompt, /评论区不属于主贴判断证据/);
   assert.match(prompt, /不能反向把中性或正向主贴判为 negative/);

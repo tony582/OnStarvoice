@@ -32,7 +32,7 @@ test('post intent classification persists grounded evidence and fences stale mod
     const row = await persisted(source.id);
     assert.equal(row.business_visibility, 'eligible');
     assert.equal(row.content, source.content);
-    assert.equal(row.ai_result.classifierMetadata.promptVersion, 'record-topic-v7');
+    assert.equal(row.ai_result.classifierMetadata.promptVersion, 'record-topic-v8');
   });
   await t.test('unambiguous model identity protects relevant posts even without a brand word', async () => {
     const source = await record('昂科威Plus哨兵没触发，车被刮了。');

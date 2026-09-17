@@ -1126,20 +1126,22 @@ export function resolveRecordBusinessVisibility(record = {}, existing = {}) {
   const disposition = String(
     audit.executionDisposition || audit.modelExecutionDisposition || '',
   ).trim().toLowerCase();
+  const previous = String(existing?.business_visibility || '').trim().toLowerCase();
   if (
     detailStatus === 'filtered'
     || disposition === 'skip_expensive'
     || disposition === 'skip_full_capture'
   ) return 'filtered_out';
   if (detailStatus === 'deferred' || disposition === 'defer_enhancement') {
-    return 'deferred';
+    // A transient failure on a later keyword observation must not hide a post
+    // that a previous observation already captured successfully.
+    return previous === 'eligible' ? 'eligible' : 'deferred';
   }
   if (
     detailStatus === 'done'
     || disposition === 'collect_full'
     || disposition === 'collect_minimal_detail'
   ) return 'eligible';
-  const previous = String(existing?.business_visibility || '').trim().toLowerCase();
   return ['eligible', 'filtered_out', 'deferred'].includes(previous)
     ? previous
     : 'eligible';

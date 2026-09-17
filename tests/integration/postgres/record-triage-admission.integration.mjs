@@ -42,6 +42,7 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
     ['blazer-vehicle', '我的开拓者哨兵录像没触发', true],
     ['electra-figurative', '追求至境，哨兵技术再升级', false],
     ['electra-model', '至境L7哨兵体验', true],
+    ['electra-assisted-driving', '至境智驾不可用后恢复', true],
     ['epica-figurative', '一路景程，沿途风景真好', false],
     ['epica-owner', '景程车主咨询驻车监控', true],
   ];

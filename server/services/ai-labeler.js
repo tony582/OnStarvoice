@@ -35,7 +35,7 @@ import {
   formatGmAliasesForPrompt, getRecordEvidenceSources, isSentryEvidenceScope, normalizeJudgmentConfidence, normalizeMonitoringEvidence, normalizePostIntent,
 } from './record-content-judgment.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v7';
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v8';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
 const LLM_PROVIDER_ALIASES = Object.freeze({
@@ -134,6 +134,7 @@ ${isSentryEvidenceScope({ keyword: intent.keyword }) ? `${formatGmAliasesForProm
 - 只有整体 relevance 为 relevant 或 uncertain 时才判断 sentiment；整体 irrelevant 时 sentimentStatus=not_applicable、sentiment=null，禁止用 neutral 伪装“未判断”。
 - sentiment 必须表示内容对租户整体监控对象/主题的态度，而不是只看本次采集关键词。
 - 明确的故障、失败、误拨、抱怨、指责、误导、收费争议或维权诉求判 negative；客观询问且无明显不满判 neutral + inquiry。
+- 主帖明确写到功能不可用、失灵、服务方找不出原因或计划重置维修时，即使后文写“后来恢复”“第二天正常”，仍属于已经发生的故障经历，判 negative；恢复结果不能抹掉此前故障。
 - 内容相关与内容负面是两个独立结论；壁纸、教程、咨询可以 relevant 但 sentiment=neutral。
 - “安全”“安全感”“隐私”等普通词本身不代表负面或风险，必须结合完整上下文。
 ${ONSTAR_SERVICE_AD_PROMPT_RULES}

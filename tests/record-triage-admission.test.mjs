@@ -8,6 +8,11 @@ test('sentry admission requires overall relevance and original post evidence; ex
   assert.equal(recordTriageAdmission({ ...post, author_name: '别克车主', tags: ['别克'], content: '#别克哨兵 很方便' }).admitted, false);
   assert.equal(recordTriageAdmission({ ...post, title: 'CT50的使用说明' }).admitted, true);
   assert.equal(recordTriageAdmission({ ...post, title: '我的 CT5 哨兵功能' }).admitted, true);
+  assert.equal(recordTriageAdmission({
+    ...post,
+    title: '至境智驾不可用后恢复',
+    content: '至境智驾不可用，4S店找不出原因，计划重置升级车机，第二天又恢复正常。',
+  }).admitted, true);
   assert.equal(recordTriageAdmission({ ...post, keyword: '至境哨兵别克壁纸', title: 'CT5求救经历' }).admitted, true);
   assert.equal(recordTriageAdmission({ ...post, keyword: '哨兵模式' }).admitted, true);
   assert.equal(recordTriageAdmission({ ...post, keyword: '壁纸', observed_keywords: ['凯迪拉克哨兵'] }).admitted, false);
