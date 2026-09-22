@@ -3,12 +3,25 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.11',
+  latestVersion: '0.4.12',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-09-22',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.11-20260922.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.12-20260922.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.12',
+      releaseDate: '2026-09-22',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {title: '无人值守采集不再误判旧运行页', desc: '浏览器采集辅助首次启动降级后，关键词批次的兜底启动会带上当前执行轮次，不再被后台按“旧无人值守运行页已失效”拒绝导致整批失败；旧页面迟到请求仍会被拒绝。需更新 Extension。'},
+            {title: '失败上报保留错误码', desc: '批量采集与运行页领取阶段的失败会连同错误码和身份栅栏详情一起上报，后台可按技术失败归类并定位是哪一步身份错位。'},
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.11',
       releaseDate: '2026-09-22',

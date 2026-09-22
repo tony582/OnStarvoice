@@ -15955,3 +15955,195 @@ test("stale source cleanup rechecks an extension navigation before its reload fa
   assert.deepEqual(harness.reloadedTabIds, []);
   assert.deepEqual(harness.removedTabIds, []);
 });
+
+// 0.4.11 production regression (batch 54d648a6, 2026-09-22): after the optional
+// assist start degraded, the keyword batch re-sent BEGIN for the same stable
+// unattended task WITHOUT the attempt id. The fence compared incoming '' with
+// the attempt bound to the lock/request and rejected the live runner as stale.
+test("unattended BEGIN without an attempt id is rejected as stale with bounded identity details and leaves the live session untouched", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-current",
+    attemptNumber: 3,
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const lock = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "fallback-holder-1",
+    holderDocumentId: "fallback-document-1",
+    holderTabId: 41,
+  });
+  assert.equal(lock.ok, true);
+  const sender = buildUnattendedRunnerSender(
+    request,
+    lock.lock.holderDocumentId,
+  );
+
+  const firstBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    sender,
+  );
+  assert.equal(firstBegin.ok, true, JSON.stringify(firstBegin));
+  assert.equal(harness.storage[LOCK_KEY].captureTaskAttemptId, "attempt-current");
+
+  const fallbackBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    sender,
+  );
+  assert.equal(fallbackBegin.ok, false, JSON.stringify(fallbackBegin));
+  assert.equal(fallbackBegin.error.code, "stale_unattended_attempt");
+  assert.match(fallbackBegin.error.message, /缺少当前无人值守执行轮次标识/u);
+  const details = fallbackBegin.error.details;
+  assert.equal(details.reason, "attempt_missing");
+  assert.equal(details.requestId, request.id);
+  assert.equal(details.requestMatches, true);
+  assert.equal(details.incomingAttemptId, "");
+  assert.equal(details.currentAttemptId, "attempt-current");
+  assert.equal(details.request.id, request.id);
+  assert.equal(details.request.attemptId, "attempt-current");
+  assert.equal(details.request.attemptNumber, 3);
+  assert.equal(details.request.status, "running");
+  assert.equal(details.request.runnerTabId, 42);
+  assert.equal(details.actual.owner, "unattended_keyword_plan");
+  assert.equal(details.actual.lockId, lock.lock.id);
+  assert.equal(details.actual.holderId, "fallback-holder-1");
+  assert.equal(details.actual.holderDocumentId, "fallback-document-1");
+  assert.equal(details.actual.holderTabId, 41);
+  assert.equal(details.actual.captureTaskId, stableTaskId);
+  assert.equal(details.actual.attemptId, "attempt-current");
+  assert.equal(details.sender.tabId, 42);
+  assert.equal(details.sender.documentId, "fallback-document-1");
+  assert.equal(details.sender.requestId, request.id);
+  assert.equal(details.sourceTabId, 41);
+
+  // Isolation: the exact live attempt keeps its Debug session, lock binding
+  // and request; the rejected BEGIN must not tear anything down.
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(stableTaskId)?.tabId,
+    41,
+  );
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, stableTaskId);
+  assert.equal(harness.storage[LOCK_KEY].captureTaskAttemptId, "attempt-current");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, "attempt-current");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+
+  // The same BEGIN carrying the current attempt id is still accepted.
+  const currentBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: request.attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    sender,
+  );
+  assert.equal(currentBegin.ok, true, JSON.stringify(currentBegin));
+});
+
+test("a late BEGIN from a superseded attempt reports attempt_mismatch identities", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    attemptId: "attempt-current",
+    attemptNumber: 2,
+  });
+  const stableTaskId = `unattended-capture:${request.id}`;
+  const lock = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "mismatch-holder-1",
+    holderDocumentId: "mismatch-document-1",
+    holderTabId: 41,
+  });
+  assert.equal(lock.ok, true);
+
+  const staleBegin = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: stableTaskId,
+      attemptId: "attempt-old",
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+    },
+    {
+      documentId: "old-runner-document",
+      tab: {
+        id: 40,
+        url:
+          `chrome-extension://test/sidebar/sidebar.html?unattendedRun=${request.id}` +
+          "&unattendedAttempt=attempt-old",
+      },
+    },
+  );
+  assert.equal(staleBegin.ok, false, JSON.stringify(staleBegin));
+  assert.equal(staleBegin.error.code, "stale_unattended_attempt");
+  assert.match(staleBegin.error.message, /旧无人值守运行页已失效/u);
+  const details = staleBegin.error.details;
+  assert.equal(details.reason, "attempt_mismatch");
+  assert.equal(details.incomingAttemptId, "attempt-old");
+  assert.equal(details.currentAttemptId, "attempt-current");
+  assert.equal(details.request.attemptId, "attempt-current");
+  assert.equal(details.request.runnerTabId, 42);
+  assert.equal(details.actual.owner, "unattended_keyword_plan");
+  assert.equal(details.actual.holderDocumentId, "mismatch-document-1");
+  assert.equal(details.sender.tabId, 40);
+  assert.equal(details.sender.documentId, "old-runner-document");
+  assert.equal(details.sender.requestId, request.id);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(stableTaskId), null);
+  assert.ok(!harness.storage[LOCK_KEY].captureTaskId, "stale BEGIN must not bind the lock");
+});
+
+test("a BEGIN for a request the background no longer holds reports request_mismatch with the stored request", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {attemptId: "attempt-current"});
+
+  const foreignBegin = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: "unattended-capture:some-other-request",
+    attemptId: "attempt-foreign",
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(foreignBegin.ok, false, JSON.stringify(foreignBegin));
+  assert.equal(foreignBegin.error.code, "stale_unattended_attempt");
+  const details = foreignBegin.error.details;
+  assert.equal(details.reason, "request_mismatch");
+  assert.equal(details.requestId, "some-other-request");
+  assert.equal(details.requestMatches, false);
+  assert.equal(details.incomingAttemptId, "attempt-foreign");
+  assert.equal(details.currentAttemptId, "");
+  assert.equal(details.request.id, request.id);
+  assert.equal(details.request.attemptId, "attempt-current");
+  assert.equal(details.actual.owner, "");
+});
+
+test("an END without an attempt id is ignored with the same identity details", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {attemptId: "attempt-current"});
+  const stableTaskId = `unattended-capture:${request.id}`;
+
+  const end = await harness.sendBackgroundMessage({
+    type: "onstarvoice:end-capture-task",
+    taskId: stableTaskId,
+    reason: "capture_task_finished",
+    status: "completed",
+  });
+  assert.equal(end.ok, true, JSON.stringify(end));
+  assert.equal(end.data.ignored, true);
+  assert.equal(end.data.released, false);
+  assert.equal(end.data.reason, "stale_unattended_attempt");
+  assert.equal(end.data.details.reason, "attempt_missing");
+  assert.equal(end.data.details.currentAttemptId, "attempt-current");
+  assert.equal(end.data.details.request.id, request.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+});

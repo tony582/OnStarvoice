@@ -3436,3 +3436,96 @@ test("task capture-setting overrides preserve 1000 comments and normalize depend
   assert.equal(disabledParents.enableLowFollowerHitFilterOnDetailCapture, false);
   assert.equal(disabledParents.enableCommentLeadsFilterOnDetailCapture, false);
 });
+
+test("unattended batch fallback assist start carries the scoped attempt id and never owns the task", () => {
+  const section = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  const ensureStart = section.indexOf(
+    "const ensurePersistentCaptureTaskSession = async () => {",
+  );
+  const ensureEnd = section.indexOf("};", ensureStart);
+  assert.ok(ensureStart > -1 && ensureEnd > ensureStart);
+  const ensureSection = section.slice(ensureStart, ensureEnd);
+  assert.match(
+    ensureSection,
+    /startOptionalCaptureAssistSession\(\{[\s\S]*?taskId: persistentCaptureTaskId,[\s\S]*?\.\.\.\(scopedUnattendedAttemptId\s+\? \{attemptId: scopedUnattendedAttemptId, ownerRequired: false\}\s+: \{\}\),/,
+    "the fallback BEGIN for a stable unattended task must carry the current attempt id",
+  );
+  assert.ok(
+    section.indexOf("const scopedUnattendedAttemptId = String(") < ensureStart,
+    "the scoped attempt id must be resolved before the fallback closure",
+  );
+});
+
+test("batch keyword failures keep their error code and fence details for the unattended report", () => {
+  const batchSection = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  assert.match(
+    batchSection,
+    /failureOutcome = \{\s+started: true,\s+ok: false,\s+error: error\.message,[\s\S]*?\.\.\.\(failureCode \? \{errorCode: failureCode\} : \{\}\),\s+\.\.\.\(failureDetails \? \{errorDetails: failureDetails\} : \{\}\),\s+\};/,
+  );
+
+  const runnerSection = readFunctionSection(
+    "async function runUnattendedKeywordPlanRequest(request)",
+    "async function runCaptureAction({",
+  );
+  assert.match(
+    runnerSection,
+    /if \(batchRunResult\?\.ok === false && batchRunResult\?\.error\) \{\s+const batchError = new Error\(batchRunResult\.error\);\s+const batchErrorCode = String\(batchRunResult\.errorCode \|\| ""\)\.trim\(\);\s+if \(batchErrorCode\) \{\s+batchError\.code = batchErrorCode;\s+\}[\s\S]*?batchError\.details = \{\.\.\.batchRunResult\.errorDetails\};[\s\S]*?throw batchError;/,
+  );
+  assert.doesNotMatch(runnerSection, /throw new Error\(batchRunResult\.error\);/);
+  assert.match(
+    runnerSection,
+    /const degradedReason = String\(assistSession\?\.reason \|\| ""\)\.trim\(\);[\s\S]*?phase: "capture_assist_degraded",\s+message: degradedReason\s+\? `浏览器采集辅助不可用（\$\{degradedReason\}），已继续执行采集`\s+: "浏览器采集辅助不可用，已继续执行采集",/,
+    "the degrade stage must name the optional failure code that preceded the fallback",
+  );
+
+  const claimSection = readFunctionSection(
+    "async function maybeClaimAndRunUnattendedKeywordPlan(",
+    "async function runUnattendedKeywordPlanRequest(request)",
+  );
+  assert.match(
+    claimSection,
+    /const claimFailureDetails = normalizeCaptureFenceErrorDetails\(error\);[\s\S]*?error: \{\s+code: String\(error\?\.code \|\| ""\),\s+message: error\.message,\s+\.\.\.\(claimFailureDetails \? \{details: claimFailureDetails\} : \{\}\),\s+\},/,
+    "the outer claim failure report must not drop the error code",
+  );
+});
+
+test("batch failure code survives the runner rethrow as an executable contract", async () => {
+  const batchSection = readFunctionSection(
+    "async function handleBatchKeywordCapture(options = {})",
+    "async function reportUnattendedKeywordRun(",
+  );
+  const catchStart = batchSection.indexOf("  } catch (error) {\n    console.error(\"[Sidebar] Batch keyword capture failed:\", error);");
+  const catchEnd = batchSection.indexOf("    return failureOutcome;", catchStart);
+  assert.ok(catchStart > -1 && catchEnd > catchStart);
+  const catchBody = batchSection
+    .slice(catchStart, catchEnd)
+    .replace("  } catch (error) {", "")
+    .replace(/showMessage\([^;]*\);/u, "");
+  const sandbox = vm.createContext({console: {error() {}}});
+  vm.runInContext(
+    `globalThis.__batchFailure = (error) => { let failureOutcome = null; let sidebarTaskStatus = ""; let sidebarTaskError = null; let caughtError = null;\n${catchBody}\nreturn failureOutcome; };`,
+    sandbox,
+  );
+  const staleError = new Error(
+    "无法启动浏览器采集辅助：采集辅助请求缺少当前无人值守执行轮次标识，已按旧运行页拒绝",
+  );
+  staleError.code = "stale_unattended_attempt";
+  staleError.details = {reason: "attempt_missing", incomingAttemptId: ""};
+  const outcome = sandbox.__batchFailure(staleError);
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.errorCode, "stale_unattended_attempt");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(outcome.errorDetails)),
+    {reason: "attempt_missing", incomingAttemptId: ""},
+  );
+  assert.equal(outcome.error, staleError.message);
+  const plainOutcome = sandbox.__batchFailure(new Error("plain failure"));
+  assert.equal(plainOutcome.errorCode, undefined);
+  assert.equal(plainOutcome.errorDetails, undefined);
+});

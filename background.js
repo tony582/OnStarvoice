@@ -16188,10 +16188,10 @@ async function beginCaptureTaskNow(message, sender) {
     attemptId: request.attemptId,
   });
   if (beginAttemptFence.unattended && !beginAttemptFence.current) {
-    throw createCaptureTaskError(
-      'stale_unattended_attempt',
-      '旧无人值守运行页已失效，已忽略其采集辅助请求',
-    );
+    throw createStaleUnattendedAttemptError(beginAttemptFence, {
+      sender,
+      sourceTabId,
+    });
   }
   if (beginAttemptFence.unattended && !beginAttemptFence.active) {
     throw createCaptureTaskError(
@@ -17519,8 +17519,78 @@ async function inspectUnattendedCaptureTaskAttempt({
     incomingAttemptId,
     currentAttemptId,
     request: requestMatches ? request : null,
+    requestMatches,
+    // Diagnostics only: the request the background currently holds, even when
+    // it does not belong to the incoming task. Never used for fence decisions.
+    storedRequest: request || null,
     requestId: stableIdentity.requestId,
   };
+}
+
+// Bounded identity comparison for a rejected unattended BEGIN/END. It copies
+// only internal identities (request/attempt/lock/runner/sender) so a report can
+// prove which side of the fence moved; no page content, cookies or tokens.
+function describeStaleUnattendedAttempt(
+  fence,
+  {sender = null, sourceTabId = null} = {},
+) {
+  const lock = fence?.lock || null;
+  const storedRequest = fence?.storedRequest || null;
+  const incomingAttemptId = String(fence?.incomingAttemptId || '').trim();
+  const currentAttemptId = String(fence?.currentAttemptId || '').trim();
+  const requestMatches = fence?.requestMatches === true;
+  const reason = !incomingAttemptId
+    ? 'attempt_missing'
+    : !requestMatches
+      ? 'request_mismatch'
+      : !currentAttemptId
+        ? 'attempt_unknown'
+        : 'attempt_mismatch';
+  return {
+    reason,
+    requestId: String(fence?.requestId || ''),
+    requestMatches,
+    incomingAttemptId,
+    currentAttemptId,
+    request: {
+      id: String(storedRequest?.id || ''),
+      attemptId: String(storedRequest?.attemptId || ''),
+      attemptNumber: Number.isFinite(Number(storedRequest?.attemptNumber))
+        ? Number(storedRequest.attemptNumber)
+        : null,
+      status: String(storedRequest?.status || ''),
+      runnerTabId: resolveCaptureTaskTabId(storedRequest?.runnerTabId),
+    },
+    actual: {
+      lockId: String(lock?.id || ''),
+      owner: String(lock?.owner || ''),
+      holderId: String(lock?.holderId || ''),
+      holderDocumentId: String(lock?.holderDocumentId || ''),
+      holderTabId: resolveCaptureTaskTabId(lock?.holderTabId),
+      captureTaskId: String(lock?.captureTaskId || ''),
+      attemptId: String(lock?.captureTaskAttemptId || ''),
+    },
+    sender: {
+      tabId: resolveCaptureTaskTabId(sender?.tab?.id),
+      documentId: String(sender?.documentId || ''),
+      requestId: readUnattendedRequestIdFromSender(sender),
+    },
+    sourceTabId: resolveCaptureTaskTabId(sourceTabId),
+    at: new Date().toISOString(),
+  };
+}
+
+function createStaleUnattendedAttemptError(fence, context = {}) {
+  const details = describeStaleUnattendedAttempt(fence, context);
+  // A BEGIN without any attempt id is not an old runner page; it is a caller
+  // that forgot its identity. Keep the same fence code (the server already
+  // treats it as a non-chargeable technical failure) but say what happened.
+  const message =
+    details.reason === 'attempt_missing'
+      ? '采集辅助请求缺少当前无人值守执行轮次标识，已按旧运行页拒绝'
+      : '旧无人值守运行页已失效，已忽略其采集辅助请求';
+  console.warn('[CaptureTask] stale unattended attempt rejected:', details);
+  return createCaptureTaskError('stale_unattended_attempt', message, details);
 }
 
 function matchesUnattendedBeginLease(
@@ -17801,10 +17871,10 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
     attemptId,
   });
   if (attemptFence.unattended && !attemptFence.current) {
-    throw createCaptureTaskError(
-      'stale_unattended_attempt',
-      '旧无人值守运行页已失效，已忽略其采集辅助请求',
-    );
+    throw createStaleUnattendedAttemptError(attemptFence, {
+      sender,
+      sourceTabId: normalizedSourceTabId,
+    });
   }
   if (!authorizedRunner) {
     if (normalizedTaskId === stableTaskId) {
@@ -17904,6 +17974,7 @@ async function performEndCaptureTask(message) {
       released: false,
       ignored: true,
       reason: 'stale_unattended_attempt',
+      details: describeStaleUnattendedAttempt(attemptFence),
     };
   }
   const targetedAttempt = attemptFence.unattended

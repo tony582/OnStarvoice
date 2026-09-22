@@ -123,3 +123,77 @@ test("unrecognized errors and malformed identity payloads are not exported as fe
   assert.equal(details.expected.holderTabId, null);
   assert.equal(details.actual.holderDocumentId, "");
 });
+
+test("stale attempt fence details export only bounded request, attempt, lock and sender identities", () => {
+  const normalize = globalThis.OnStarvoiceTaskCenterCore.normalizeCaptureFenceErrorDetails;
+  const details = normalize({
+    code: "stale_unattended_attempt",
+    details: {
+      reason: "attempt_missing",
+      requestId: "f768ba55-497c-45cc-90fc-3f0e6bc4d35c",
+      requestMatches: true,
+      incomingAttemptId: "",
+      currentAttemptId: identity.attemptId,
+      request: {
+        id: "f768ba55-497c-45cc-90fc-3f0e6bc4d35c",
+        attemptId: identity.attemptId,
+        attemptNumber: 3,
+        status: "running",
+        runnerTabId: 42,
+        planSnapshot: {keywords: ["private keyword"]},
+      },
+      actual: {...identity, holderTabId: 41, cookie: "private-cookie"},
+      sender: {
+        tabId: 42,
+        documentId: identity.holderDocumentId,
+        requestId: "f768ba55-497c-45cc-90fc-3f0e6bc4d35c",
+        url: "https://private.example/runner",
+      },
+      sourceTabId: 41,
+      body: "private-body",
+    },
+  });
+  assert.equal(details.reason, "attempt_missing");
+  assert.equal(details.requestId, "f768ba55-497c-45cc-90fc-3f0e6bc4d35c");
+  assert.equal(details.requestMatches, true);
+  assert.equal(details.incomingAttemptId, "");
+  assert.equal(details.currentAttemptId, identity.attemptId);
+  assert.deepEqual(details.request, {
+    id: "f768ba55-497c-45cc-90fc-3f0e6bc4d35c",
+    attemptId: identity.attemptId,
+    attemptNumber: 3,
+    status: "running",
+    runnerTabId: 42,
+  });
+  assert.equal(details.actual.holderTabId, 41);
+  assert.equal(details.actual.captureTaskId, identity.captureTaskId);
+  assert.deepEqual(details.sender, {
+    tabId: 42,
+    documentId: identity.holderDocumentId,
+    requestId: "f768ba55-497c-45cc-90fc-3f0e6bc4d35c",
+  });
+  assert.equal(details.sourceTabId, 41);
+  for (const value of ["private-cookie", "private-body", "private.example", "private keyword"]) {
+    assert.equal(JSON.stringify(details).includes(value), false, value);
+  }
+
+  const malformed = normalize({
+    code: "stale_unattended_attempt",
+    details: {
+      reason: "Bearer secret",
+      requestId: "not-a-uuid",
+      request: {id: "x", attemptNumber: -1, status: "Running Now", runnerTabId: "42"},
+      sender: {tabId: 0, documentId: "private-body"},
+    },
+  });
+  assert.equal(malformed.reason, "");
+  assert.equal(malformed.requestId, "");
+  assert.equal(malformed.requestMatches, null);
+  assert.equal(malformed.request.attemptNumber, null);
+  assert.equal(malformed.request.status, "");
+  assert.equal(malformed.request.runnerTabId, null);
+  assert.equal(malformed.sender.tabId, null);
+  assert.equal(malformed.sender.documentId, "");
+  assert.equal(malformed.actual, null);
+  assert.equal(normalize({code: "stale_unattended_attempt", details: null}), null);
+});

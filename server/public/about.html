@@ -70,7 +70,14 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.11<span class="date">2026-09-22</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.12<span class="date">2026-09-22</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>无人值守启动修复：</strong>采集辅助首次启动降级后，关键词批次的兜底启动带上当前执行轮次，不再被误判为旧运行页导致整批失败；旧页面迟到请求仍被拒绝。需更新 Extension。</li>
+            <li><strong>失败上报保留错误码：</strong>批量采集与运行页领取阶段的失败连同错误码和身份栅栏详情一起上报，便于后台归类与定位。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.11<span class="date">2026-09-22</span></h3>
           <ul>
             <li><strong>抖音作者识别：</strong>只从发布者区域配对提取名称与主页，避免正文 @ 官方账号、评论和推荐账号导致普通用户帖子被误排除。需更新 Extension。</li>
             <li><strong>关键词逐节点采集：</strong>可让每个所选浏览器节点分别搜索全部所选关键词，独立记录进度，保留原目标账号；新增壁纸关键词快捷选择。</li>

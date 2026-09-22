@@ -14158,6 +14158,11 @@ async function handleBatchKeywordCapture(options = {}) {
     const ensurePersistentCaptureTaskSession = async () => {
       if (!captureTaskDebugSupported) return;
       if (captureTaskSessionStarted) return;
+      // 无人值守使用稳定 taskId（unattended-capture:<requestId>），后台按
+      // attemptId 判断请求是否属于当前运行页。运行页首次启动采集辅助失败
+      // 后（可选降级），这里的兜底 BEGIN 若不带当前 attemptId，会被后台当成
+      // 旧运行页拒绝（stale_unattended_attempt），把可选降级变成整批失败。
+      // 运行页也不拥有无人值守任务生命周期，兜底启动同样不绑定 owner。
       const assistSession = await startOptionalCaptureAssistSession({
         taskId: persistentCaptureTaskId,
         tabId: sourceTabId,
@@ -14166,6 +14171,9 @@ async function handleBatchKeywordCapture(options = {}) {
             ? `${captureExecutionLabel} · ${keywords.length} 个关键词`
             : `批量搜索采集 · ${keywords.length} 个关键词`,
         platform: pagePlatform,
+        ...(scopedUnattendedAttemptId
+          ? {attemptId: scopedUnattendedAttemptId, ownerRequired: false}
+          : {}),
       });
       captureTaskSessionStarted = assistSession?.active === true;
       captureTaskSessionOwnedHere = assistSession?.active === true;
@@ -14968,10 +14976,21 @@ async function handleBatchKeywordCapture(options = {}) {
       throw error;
     }
     showMessage("批量采集失败: " + error.message, "error");
+    const failureCode = String(error?.code || "").trim();
+    const failureDetails =
+      error?.details &&
+      typeof error.details === "object" &&
+      !Array.isArray(error.details)
+        ? {...error.details}
+        : null;
     failureOutcome = {
       started: true,
       ok: false,
       error: error.message,
+      // 保留结构化错误码与栅栏身份详情，供无人值守运行页原样上报；否则
+      // 服务端只拿到文本，error.code 为空，无法按技术失败归类。
+      ...(failureCode ? {errorCode: failureCode} : {}),
+      ...(failureDetails ? {errorDetails: failureDetails} : {}),
     };
     return failureOutcome;
   } finally {
@@ -18226,6 +18245,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
         `启动${claimedExecutionCopy.taskLabel}失败: ${error.message}`,
         "error",
       );
+      const claimFailureDetails = normalizeCaptureFenceErrorDetails(error);
       await reportUnattendedTerminalRun(
         claimedRequestId,
         {
@@ -18233,7 +18253,9 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
           finishedAt: new Date().toISOString(),
           message: error.message,
           error: {
+            code: String(error?.code || ""),
             message: error.message,
+            ...(claimFailureDetails ? {details: claimFailureDetails} : {}),
           },
         },
         {attemptId: claimedAttemptId},
@@ -19655,9 +19677,12 @@ async function runUnattendedKeywordPlanRequest(request) {
           unattendedCaptureTaskSessionStarted =
             assistSession?.active === true;
           if (assistSession?.degraded === true) {
+            const degradedReason = String(assistSession?.reason || "").trim();
             await reportAutomaticRecoveryStage({
               phase: "capture_assist_degraded",
-              message: "浏览器采集辅助不可用，已继续执行采集",
+              message: degradedReason
+                ? `浏览器采集辅助不可用（${degradedReason}），已继续执行采集`
+                : "浏览器采集辅助不可用，已继续执行采集",
               attemptCurrent: attempt,
               attemptTotal: localCaptureSessionMaxAttempts,
               retried: Math.max(0, attempt - 1),
@@ -19970,7 +19995,19 @@ async function runUnattendedKeywordPlanRequest(request) {
       throw new Error(batchRunResult?.reason || "采集流程未启动");
     }
     if (batchRunResult?.ok === false && batchRunResult?.error) {
-      throw new Error(batchRunResult.error);
+      const batchError = new Error(batchRunResult.error);
+      const batchErrorCode = String(batchRunResult.errorCode || "").trim();
+      if (batchErrorCode) {
+        batchError.code = batchErrorCode;
+      }
+      if (
+        batchRunResult.errorDetails &&
+        typeof batchRunResult.errorDetails === "object" &&
+        !Array.isArray(batchRunResult.errorDetails)
+      ) {
+        batchError.details = {...batchRunResult.errorDetails};
+      }
+      throw batchError;
     }
     if (batchRunResult?.securityBlocked) {
       unattendedCaptureTaskStatus = "completed_with_failures";

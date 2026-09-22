@@ -19,6 +19,9 @@ test('recovery error codes are accepted only from the explicit business-code set
       'UNATTENDED_RECOVERY_LAUNCH_EXHAUSTED',
     ],
     ['USER_CANCELED', 'USER_CANCELED'],
+    ['stale_unattended_attempt', 'STALE_UNATTENDED_ATTEMPT'],
+    ['unattended_runner_mismatch', 'UNATTENDED_RUNNER_MISMATCH'],
+    ['unattended_request_terminal', 'UNATTENDED_REQUEST_TERMINAL'],
   ]) {
     assert.equal(normalizeCaptureRecoveryErrorCode(input), expected, input);
   }

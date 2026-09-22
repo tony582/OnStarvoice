@@ -353,26 +353,69 @@
   // Keep only the internal identities needed to compare a BEGIN fence. Arbitrary
   // error payloads may contain page content or credentials and are not copied.
   function normalizeCaptureFenceErrorDetails(error = null) {
-    if (error?.code !== "unattended_begin_fence_changed") return null;
+    const code = String(error?.code || "");
+    const staleAttempt = code === "stale_unattended_attempt";
+    if (code !== "unattended_begin_fence_changed" && !staleAttempt) return null;
     const details = error.details;
     if (!details || typeof details !== "object" || Array.isArray(details)) return null;
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+    const documentIdPattern = /^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu;
+    const stableTaskIdPattern = /^unattended-capture:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
     const identity = (value, pattern = uuid) =>
       typeof value === "string" && pattern.test(value) ? value : "";
+    const token = (value) =>
+      typeof value === "string" && /^[a-z][a-z0-9_]{0,40}$/u.test(value) ? value : "";
+    const tabId = (value) =>
+      Number.isSafeInteger(value) && value > 0 ? value : null;
     const lock = (value) => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return null;
       return {
         lockId: identity(value.lockId),
         owner: value.owner === "unattended_keyword_plan" ? value.owner : "",
         holderId: identity(value.holderId),
-        holderDocumentId: identity(value.holderDocumentId, /^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu),
-        holderTabId: Number.isSafeInteger(value.holderTabId) && value.holderTabId > 0
-          ? value.holderTabId
-          : null,
-        captureTaskId: identity(value.captureTaskId, /^unattended-capture:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu),
+        holderDocumentId: identity(value.holderDocumentId, documentIdPattern),
+        holderTabId: tabId(value.holderTabId),
+        captureTaskId: identity(value.captureTaskId, stableTaskIdPattern),
         attemptId: identity(value.attemptId),
       };
     };
+    if (staleAttempt) {
+      // stale_unattended_attempt: which identity moved between the incoming
+      // BEGIN/END and the request/lock the background currently holds.
+      const request =
+        details.request && typeof details.request === "object" && !Array.isArray(details.request)
+          ? details.request
+          : {};
+      const sender =
+        details.sender && typeof details.sender === "object" && !Array.isArray(details.sender)
+          ? details.sender
+          : {};
+      return {
+        reason: token(details.reason),
+        requestId: identity(details.requestId),
+        requestMatches: typeof details.requestMatches === "boolean"
+          ? details.requestMatches
+          : null,
+        incomingAttemptId: identity(details.incomingAttemptId),
+        currentAttemptId: identity(details.currentAttemptId),
+        request: {
+          id: identity(request.id),
+          attemptId: identity(request.attemptId),
+          attemptNumber: Number.isSafeInteger(request.attemptNumber) && request.attemptNumber > 0
+            ? request.attemptNumber
+            : null,
+          status: token(request.status),
+          runnerTabId: tabId(request.runnerTabId),
+        },
+        actual: lock(details.actual),
+        sender: {
+          tabId: tabId(sender.tabId),
+          documentId: identity(sender.documentId, documentIdPattern),
+          requestId: identity(sender.requestId),
+        },
+        sourceTabId: tabId(details.sourceTabId),
+      };
+    }
     return {
       current: typeof details.current === "boolean" ? details.current : null,
       active: typeof details.active === "boolean" ? details.active : null,
