@@ -92,7 +92,7 @@ createRoot(document.getElementById('root')).render(<Harness/>);`);
   page.on('console', message => {if (message.type() === 'error') errors.push(message.text());});
   for (const platform of ['xiaohongshu', 'douyin']) {
     await page.goto(`${base}?platform=${platform}`);
-    const coverage = page.getByRole('group', {name: '每个所选节点都采集的关键词'});
+    const coverage = page.getByRole('group', {name: '多节点采集的关键词'});
     await coverage.waitFor();
     await coverage.getByRole('checkbox').first().waitFor();
     assert.equal(await page.getByText('壁纸关键词快捷选择').count(), 0);
@@ -123,7 +123,7 @@ createRoot(document.getElementById('root')).render(<Harness/>);`);
     await page.setViewportSize({width: 1440, height: 1050});
   }
   await page.goto(`${base}?platform=douyin&legacy=1`);
-  const coverage = page.getByRole('group', {name: '每个所选节点都采集的关键词'});
+  const coverage = page.getByRole('group', {name: '多节点采集的关键词'});
   await coverage.waitFor();
     await coverage.getByRole('checkbox').first().waitFor();
   assert.equal(await coverage.locator('input:checked').count(), 16, 'old all-node plans keep all selected');

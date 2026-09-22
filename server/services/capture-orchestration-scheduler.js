@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import {withTransaction} from '../db/query.js';
+import {settleScheduleKeywordNodeCoverage} from './keyword-node-coverage.js';
 import {
   aggregateParentTaskItems,
   computeNextOrchestrationRunAt,
@@ -321,6 +322,9 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
       JSON.stringify(aggregate.progress), SCHEDULE_OVERLAP_RUN_STATUSES]);
   }
 
+  // Missing optional node coverage must not suppress subsequent occurrences.
+  // Also run here so manual "run now" has the same rule as the cron path.
+  await settleScheduleKeywordNodeCoverage(tx, {tenantId: schedule.tenant_id, scheduleId: schedule.id});
   const overlapping = await tx.queryOne(`
     SELECT run.id
     FROM capture_tasks run

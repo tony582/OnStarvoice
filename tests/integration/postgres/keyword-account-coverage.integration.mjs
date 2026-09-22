@@ -16,6 +16,7 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
   const {withTransaction} = await import('../../../server/db/init.js');
   const {dispatchNextElasticWorkItem, mirrorTaskSnapshot} = await import('../../../server/routes/capture-cloud.js');
   const {normalizeCloudTaskSnapshot} = await import('../../../server/services/capture-cloud.js');
+  const {reconcileKeywordNodeCoverage} = await import('../../../server/services/keyword-node-coverage.js');
   const {createApp} = await import('../../../server/app.js');
   const {hashPassword} = await import('../../../server/services/auth-service.js');
   await runMigrations();
@@ -149,6 +150,10 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
     for (const expected of keywords) assert.equal(await f.complete(await f.claim(1)), expected);
     assert.equal(await f.claim(1), null, 'peer cannot take fresh or retryable work pinned to another account');
     assert.notEqual((await f.row('capture_tasks', published.id)).status, 'completed');
+    assert.equal((await reconcileKeywordNodeCoverage({tenantId: f.tenant.id, parentTaskIds: [published.id]})).skipped, 1);
+    assert.equal((await f.row('capture_task_items', failed.itemId)).error.code, 'keyword_node_failed');
+    await f.complete(await f.claim(0));
+    assert.equal((await f.row('capture_tasks', published.id)).status, 'completed_with_warnings');
   });
 
   await t.test('editing and scheduled runs preserve unique pairs and node pins', async st => {
@@ -184,6 +189,96 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
   });
 
   for (const platform of ['douyin', 'xiaohongshu']) {
+    await t.test(`${platform}: healthy long work and concurrent snapshots protect the node queue`, async st => {
+      const f = await fixture(st, platform);
+      const published = await f.publish();
+      const running = await f.claim(0);
+      await pool.query(`UPDATE capture_tasks SET status='running', created_at=now()-interval '30 minutes',
+        started_at=now()-interval '30 minutes', business_progress_at=now(), heartbeat_at=now() WHERE id=$1`, [running.childTaskId]);
+      const reconcile = () => reconcileKeywordNodeCoverage({tenantId: f.tenant.id, parentTaskIds: [published.id]});
+      assert.equal((await reconcile()).skipped, 0);
+      const connection = await pool.connect();
+      try {
+        await connection.query('BEGIN');
+        await connection.query('SELECT id FROM capture_tasks WHERE id=$1 FOR UPDATE', [running.childTaskId]);
+        assert.equal((await reconcile()).skipped, 0, 'maintenance yields to an in-flight snapshot');
+      } finally {
+        await connection.query('ROLLBACK'); connection.release();
+      }
+      await pool.query(`UPDATE capture_tasks SET created_at=now()-interval '5 minutes',
+        metadata=metadata || jsonb_build_object('publishedAt',now()-interval '4 minutes') WHERE id=$1`, [published.id]);
+      assert.equal((await reconcile()).skipped, 2, 'only the online but unresponsive peer is skipped');
+      assert.equal((await f.row('capture_task_items', running.itemId)).status, 'dispatched');
+      await f.complete(running);
+      await f.complete(await f.claim(0));
+      assert.equal((await f.row('capture_tasks', published.id)).status, 'completed_with_warnings');
+    });
+
+    await t.test(`${platform}: offline node is skipped, shared work continues, return does not reopen old coverage`, async st => {
+      const f = await fixture(st, platform);
+      const published = await f.publish({...f.plan, eachAgentKeywords: [keywords[0]]});
+      await pool.query("UPDATE capture_agents SET last_liveness_at=now()-interval '3 minutes' WHERE id=$1", [f.agentIds[1]]);
+      const reconcile = () => reconcileKeywordNodeCoverage({tenantId: f.tenant.id, parentTaskIds: [published.id]});
+      assert.equal((await reconcile()).skipped, 1);
+      const skipped = (await f.items(published.id)).find(item => item.status === 'skipped');
+      assert.equal(skipped.metadata.pinnedAgentId, f.agentIds[1]);
+      assert.equal(skipped.error.code, 'keyword_node_offline');
+      assert.equal((await f.items(published.id)).filter(item => item.status === 'pending').length, 2);
+      for (let index = 0; index < 2; index++) await f.complete(await f.claim(0));
+      const done = await f.row('capture_tasks', published.id);
+      assert.equal(done.status, 'completed_with_warnings');
+      assert.equal(done.counts.completed, 2);
+      assert.equal(done.counts.skipped, 1);
+      await pool.query('UPDATE capture_agents SET last_liveness_at=now() WHERE id=$1', [f.agentIds[1]]);
+      assert.equal(await f.claim(1), null);
+      assert.equal((await reconcile()).skipped, 0, 'settlement is idempotent');
+    });
+
+    for (const failure of ['no_response', 'no_progress']) {
+      await t.test(`${platform}: ${failure} revokes stuck work, preserves results, and fences late receipts`, async st => {
+        const f = await fixture(st, platform);
+        const published = await f.publish();
+        for (const keyword of keywords) assert.equal(await f.complete(await f.claim(0)), keyword);
+        const stuck = await f.claim(1);
+        const itemBefore = await f.row('capture_task_items', stuck.itemId);
+        await pool.query(`UPDATE capture_tasks SET status='running', created_at=now()-interval '15 minutes',
+          started_at=now()-interval '15 minutes', business_progress_at=now()-interval '11 minutes',
+          heartbeat_at=CASE WHEN $2 THEN now() ELSE now()-interval '4 minutes' END WHERE id=$1`,
+        [stuck.childTaskId, failure === 'no_progress']);
+        await pool.query("UPDATE capture_agent_commands SET status='acknowledged' WHERE id=$1", [stuck.commandId]);
+        const result = await reconcileKeywordNodeCoverage({tenantId: f.tenant.id, parentTaskIds: [published.id]});
+        assert.equal(result.skipped, 2, 'stalled node cannot hold its remaining words');
+        const itemAfter = await f.row('capture_task_items', stuck.itemId);
+        assert.equal(itemAfter.error.code, `keyword_node_${failure}`);
+        assert.equal(itemAfter.assignment_revision, itemBefore.assignment_revision + 1);
+        assert.equal((await f.row('capture_tasks', stuck.childTaskId)).status, 'superseded');
+        assert.equal((await f.row('capture_agent_commands', stuck.commandId)).status, 'expired');
+        assert.equal((await f.row('capture_tasks', published.id)).status, 'completed_with_warnings');
+        await f.complete(stuck);
+        assert.equal((await f.row('capture_task_items', stuck.itemId)).status, 'skipped');
+        assert.equal((await f.row('capture_tasks', stuck.childTaskId)).status, 'superseded');
+        assert.equal(await f.claim(1), null, 'same account cannot retry just to fill the count');
+      });
+    }
+
+    await t.test(`${platform}: next occurrence settles unavailable node and checks availability anew`, async st => {
+      const f = await fixture(st, platform);
+      const published = await f.publish({...f.plan, executionMode: 'unattended_plan', schedule: {mode: 'daily', startTime: '05:30'}});
+      const first = await f.request(`/${published.id}/schedule/run-now`, {requestKey: randomUUID()});
+      assert.equal(first.status, 201);
+      for (const keyword of keywords) assert.equal(await f.complete(await f.claim(0)), keyword);
+      await pool.query("UPDATE capture_agents SET last_liveness_at=now()-interval '3 minutes' WHERE id=$1", [f.agentIds[1]]);
+      const second = await f.request(`/${published.id}/schedule/run-now`, {requestKey: randomUUID()});
+      assert.equal(second.status, 201, JSON.stringify(second.body));
+      assert.equal((await f.row('capture_tasks', first.body.runTaskId)).status, 'completed_with_warnings');
+      assert.equal((await f.items(second.body.runTaskId)).length, 4);
+      await pool.query('UPDATE capture_agents SET last_liveness_at=now() WHERE id=$1', [f.agentIds[1]]);
+      const claim = await f.claim(1);
+      assert.equal((await f.row('capture_tasks', claim.childTaskId)).parent_task_id, second.body.runTaskId);
+      await f.complete(claim);
+      assert.equal((await f.items(second.body.runTaskId)).filter(item => item.status === 'completed').length, 1);
+    });
+
     await t.test(`${platform}: only selected words repeat and shared work can be claimed by either node`, async st => {
       const f = await fixture(st, platform);
       const input = {...f.plan, eachAgentKeywords: [keywords[0]], keywords: [...keywords, '安吉星壁纸']};

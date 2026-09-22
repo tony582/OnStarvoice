@@ -10,6 +10,7 @@ import {processCustomerDailyReports} from './services/customer-daily-reports.js'
 import {processCustomerAssistant} from './services/customer-assistant-service.js';
 import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
+import {reconcileKeywordNodeCoverage} from './services/keyword-node-coverage.js';
 import {enqueueDueProfilePatrolTasks} from './services/profile-patrol-dispatch.js';
 import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-retention.js';
 import {runOpsControlCycle} from './services/ops-control.js';
@@ -38,6 +39,7 @@ const DEFAULT_JOBS = Object.freeze({
   queryAll,
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
+  reconcileKeywordNodeCoverage,
   reconcilePendingOrchestrationRetries,
   reconcilePendingCaptureCommands,
   runOpsControlCycle,
@@ -155,6 +157,10 @@ function schedulerDefinitions(jobs, logger) {
               'log',
               `[Cron] Capture commands reconciled: ${reconciliation.commandCount}`,
             );
+          }
+          const coverage = await jobs.reconcileKeywordNodeCoverage();
+          if (coverage.skipped > 0) {
+            safeLog(logger, 'log', `[Cron] Keyword node coverage: ${coverage.skipped} unavailable item(s) skipped`);
           }
           const results = await jobs.enqueueDueCaptureOrchestrations(20);
           const created = results.filter(result => result.kind === 'created').length;

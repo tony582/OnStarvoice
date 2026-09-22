@@ -1384,7 +1384,7 @@ export function OrchestrationComposerDrawer({
                         </label>
                         <div className="flex items-center rounded-xl border border-border/70 bg-card px-3 py-2.5">
                           <p className="text-[11px] leading-4 text-muted-foreground">
-                            每个计划时间，<span className="font-semibold text-foreground">{eachAgentCoverage ? `${eachAgentKeywords.length} 个勾选词在每个所选节点各执行 1 次，其余 ${sharedKeywordCount} 个词分工执行 1 次` : '每个关键词执行 1 次'}</span>。
+                            每个计划时间，<span className="font-semibold text-foreground">{eachAgentCoverage ? `${eachAgentKeywords.length} 个勾选词在每个可用的所选节点各执行 1 次，其余 ${sharedKeywordCount} 个词分工执行 1 次` : '每个关键词执行 1 次'}</span>。
                           </p>
                         </div>
                       </div>
@@ -1400,7 +1400,7 @@ export function OrchestrationComposerDrawer({
                     <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary"><ClipboardList className="h-4 w-4" /></span>
                     <div>
                       <h3 className="text-sm font-bold text-foreground">任务内容</h3>
-                      <p className="text-[11px] text-muted-foreground">{eachAgentCoverage ? '勾选词由每个所选节点采集，其余词由节点池分工采集。' : '每个关键词会成为一个独立工作项。'}</p>
+                      <p className="text-[11px] text-muted-foreground">{eachAgentCoverage ? '勾选词由可用的所选节点各采一次，其余词由节点池分工采集。' : '每个关键词会成为一个独立工作项。'}</p>
                     </div>
                   </div>
                   <div className="space-y-3.5">
@@ -1450,8 +1450,8 @@ export function OrchestrationComposerDrawer({
                       </span>
                     </label>
                     <fieldset className="rounded-xl border border-primary/20 px-3 py-3">
-                      <legend className="px-1 text-xs font-semibold text-foreground">每个所选节点都采集的关键词</legend>
-                      <p className="text-[11px] leading-5 text-muted-foreground">勾选的词，每个所选节点各采一次；未勾选的词，节点池分工采一次。各节点使用当前登录的账号。</p>
+                      <legend className="px-1 text-xs font-semibold text-foreground">多节点采集的关键词</legend>
+                      <p className="text-[11px] leading-5 text-muted-foreground">勾选的词，每个可用的所选节点各采一次；未勾选的词，节点池分工采一次。各节点使用当前登录的账号。</p>
                       {keywords.length > 0 ? <>
                         <div className="my-2 flex gap-3 text-xs">
                           <button type="button" disabled={busy} className="text-primary" onClick={() => {
@@ -1473,7 +1473,7 @@ export function OrchestrationComposerDrawer({
                             }} />{keyword}
                           </label>)}
                         </div>
-                        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">{coverageSummary}。勾选词分别记录各节点的完成情况，帖子入库仍会去重。</p>
+                        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">计划最多 {coverageSummary}。离线、失败或超时节点的那份本轮跳过，记为未覆盖；其他节点继续，下一轮重新判断。同一节点不重复采来补足份数，帖子入库仍会去重。</p>
                       </> : <p className="mt-2 text-xs text-muted-foreground">先在上方填写关键词，再勾选需要每个节点都采集的词。</p>}
                     </fieldset>
                     <div className="grid gap-3 sm:grid-cols-2">
@@ -1684,7 +1684,7 @@ export function OrchestrationComposerDrawer({
                       {eachAgentCoverage ? '每个节点分别记录完成情况' : lockAgentSelection ? '只使用指定节点' : distributionMode === 'elastic_pool' ? '离线不会拖住整批任务' : '保留固定分配方式'}
                     </span>
                     <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
-                      {eachAgentCoverage ? '勾选词按节点分别记录完成情况；节点离线时，它的勾选词等待恢复，其他节点继续采集。未勾选词保持分工采集。' : lockAgentSelection ? '关键词与负面帖子由同一节点逐项执行，节点离线时等待上线。' : distributionMode === 'elastic_pool'
+                      {eachAgentCoverage ? '勾选词按节点分别记录完成情况；离线、失败或超时节点的那份本轮跳过，其他节点继续采集。未勾选词保持分工采集。' : lockAgentSelection ? '关键词与负面帖子由同一节点逐项执行，节点离线时等待上线。' : distributionMode === 'elastic_pool'
                         ? '创建指令 3 分钟未确认会退回队列；执行节点持续离线 10 分钟也会回收。验证码或登录验证只暂停当前关键词，不会自动扩散到其他节点。'
                         : '关键词会均衡后固定给各节点；某台设备较慢或离线时，其他设备不会自动领取它的关键词。'}
                     </span>
@@ -1817,7 +1817,7 @@ export function OrchestrationComposerDrawer({
                     <div key={agent.id} className="rounded-xl border border-border/70 bg-card px-3 py-2.5">
                       <div className="truncate text-xs font-bold text-foreground">{allocationAgentLabel(agent)}</div>
                       <div className="mt-1 text-[11px] text-muted-foreground">
-                        {eachAgentCoverage ? `${eachAgentKeywords.length} 个勾选词 · ${agent.online ? '在线' : '等待此节点上线'}` : distributionMode === 'elastic_pool'
+                        {eachAgentCoverage ? `${eachAgentKeywords.length} 个勾选词 · ${agent.online ? '在线' : '执行时仍离线则跳过'}` : distributionMode === 'elastic_pool'
                           ? agent.online ? '在线 · 空闲时可领取' : '离线 · 不阻塞其他节点'
                           : agent.online ? '在线 · 接收固定关键词' : '离线 · 固定关键词会等待'}
                       </div>
@@ -1888,7 +1888,7 @@ export function OrchestrationComposerDrawer({
                   {editMode
                     ? '同一个计划会继续运行，原有历史保持不变。新配置从下一次生成批次时开始使用。'
                     : eachAgentCoverage
-                    ? `每个所选节点分别执行 ${eachAgentKeywords.length} 个勾选词，其余 ${sharedKeywordCount} 个词分工采集，共 ${keywordWorkItemCount} 个工作项。各节点使用当前平台登录的账号。`
+                    ? `每个可用的所选节点分别执行 ${eachAgentKeywords.length} 个勾选词，其余 ${sharedKeywordCount} 个词分工采集，最多 ${keywordWorkItemCount} 个工作项。不可用节点本轮跳过，下一轮重新判断。`
                     : executionMode === 'unattended_plan'
                     ? sequentialSearchEnabled
                       ? `云端仍按关键词排队；同一 Agent 领取后依次执行“${patrolPathLabel}”，中途异常即停止该词。`

@@ -461,6 +461,7 @@ export function OrchestrationDetailWorkspace({
   const automaticRecoveryCount = itemStatusSummary.automaticRecovery
   const manualCount = itemStatusSummary.manual
   const failedCount = itemStatusSummary.failed
+  const uncoveredCount = sortedItems.filter(item => item.metadata?.keywordCoverageSkip === true).length
   const progressPercent = sortedItems.length > 0 ? Math.round((settledCount / sortedItems.length) * 100) : 0
   const isScheduleTemplate =
     detail?.orchestration.metadata?.orchestrationTemplate === true
@@ -1849,7 +1850,7 @@ export function OrchestrationDetailWorkspace({
                   <div>上轮状态：<strong className="font-semibold text-foreground">{schedule.last_run_status ? statusLabel(schedule.last_run_status) : '尚未运行'}</strong></div>
                 </div>
                 <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
-                  {eachAgentCoverage ? `勾选词在每个所选节点各执行一次，其余词由节点池分工执行${sequentialSearchEnabled ? `，分别按“${patrolPathLabel}”串行采集` : ''}。` : sequentialSearchEnabled
+                  {eachAgentCoverage ? `勾选词在每个可用的所选节点各执行一次，其余词由节点池分工执行${sequentialSearchEnabled ? `，分别按“${patrolPathLabel}”串行采集` : ''}；不可用节点本轮跳过。` : sequentialSearchEnabled
                     ? `每个关键词由同一 Agent 按“${patrolPathLabel}”串行完成；每次搜索采集后增强新增内容，不自动刷新补搜。`
                     : '每个计划时间，每个关键词执行 1 次。'} 计划只保存在云端，不会覆盖任一 Extension 的本地无人值守计划。
                 </p>
@@ -1912,7 +1913,7 @@ export function OrchestrationDetailWorkspace({
               <h3 className="mt-1 text-sm font-bold text-foreground">{scheduleTemplate ? '计划分配' : resultPresentation ? '本次任务结果' : '父任务进度'}</h3>
               <p className="mt-1 text-xs text-muted-foreground">
                 {scheduleTemplate
-                  ? eachAgentCoverage ? '勾选词在每个所选节点各执行一次，其余词分工执行；各节点使用当前平台登录的账号，分别记录完成情况。' : elasticPool
+                  ? eachAgentCoverage ? '勾选词在每个可用的所选节点各执行一次，其余词分工执行；离线、失败或超时节点本轮跳过，下一轮重新判断。' : elasticPool
                     ? '这里展示后续每轮都会沿用的关键词和弹性节点池；实际领取量由节点空闲速度决定。'
                     : '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
                   : resultPresentation
@@ -1928,8 +1929,10 @@ export function OrchestrationDetailWorkspace({
               {automaticRecoveryCount > 0 && <span className="rounded-md bg-primary/8 px-2 py-1 font-medium text-primary">自动恢复 {automaticRecoveryCount}</span>}
               {manualCount > 0 && <span className="rounded-md bg-status-orange/8 px-2 py-1 font-medium text-status-orange">需人工 {manualCount}</span>}
               {failedCount > 0 && <span className="rounded-md bg-status-red/8 px-2 py-1 font-medium text-status-red">失败 {failedCount}</span>}
+              {uncoveredCount > 0 && <span className="rounded-md bg-status-orange/8 px-2 py-1 font-medium text-status-orange">节点未覆盖 {uncoveredCount}</span>}
             </div>}
           </div>
+          {uncoveredCount > 0 && <p className="mt-3 text-xs text-muted-foreground">{uncoveredCount} 个节点关键词工作项因离线、失败或超时而跳过，未计入采集成功；本轮不再补采，下一轮重新判断节点可用性。</p>}
           {resultPresentation && <div className="mt-4 border-t border-border/70 pt-3"><TaskResultTimes createdAt={orchestration.created_at} startedAt={[...executions.map(execution => typeof execution.started_at === 'string' ? execution.started_at : ''), ...sortedItems.map(item => item.started_at || '')].filter(value => Number.isFinite(Date.parse(value))).sort((left, right) => Date.parse(left) - Date.parse(right))[0]} finishedAt={orchestration.finished_at} /><p className="mt-2 text-[10px] text-muted-foreground">开始时间取已保留的最早工作项或节点执行记录。</p></div>}
           {!scheduleTemplate && <div className="mt-4 flex items-center gap-3">
             <div

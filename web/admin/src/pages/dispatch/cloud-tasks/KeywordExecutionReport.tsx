@@ -184,6 +184,7 @@ function progressStage(
   savedCount: number | null,
 ): { stage: StageKey; label: string } {
   if (DONE_STATUSES.has(status)) return { stage: 'completed', label: '已完成' }
+  if (status === 'skipped' || status === 'canceled') return { stage: 'waiting', label: STATUS_LABELS[status] }
   if (FAILURE_STATUSES.has(status) && Number(savedCount || 0) > 0) {
     return { stage: 'partial', label: '部分完成' }
   }
@@ -276,7 +277,8 @@ function buildKeywordProgress(
     || executionAgent(execution)
     || attemptAgent(item, attempts, agentId)
   const message = String(
-    progress.message
+    (item.metadata?.keywordCoverageSkip === true ? objectValue(item.error).message : '')
+      || progress.message
       || execution?.message
       || objectValue(item.error).message
       || '',
@@ -289,7 +291,7 @@ function buildKeywordProgress(
     keyword,
     status,
     stage,
-    stageLabel: label,
+    stageLabel: item.metadata?.keywordCoverageSkip === true ? '本轮未覆盖' : label,
     batchCurrent: Number.isFinite(Number(item.ordinal)) ? Number(item.ordinal) + 1 : index + 1,
     batchTotal: total,
     itemCurrent,
@@ -443,7 +445,7 @@ export function KeywordExecutionReport({ items, executions, agents, attempts }: 
                   <span className="flex flex-wrap items-center gap-2">
                     <strong className="truncate text-sm text-foreground">{progress.keyword}</strong>
                     <span className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold ${statusTone(progress.status, progress.stage)}`}>
-                      {isLive || progress.stage === 'partial' ? progress.stageLabel : STATUS_LABELS[progress.status] || progress.stageLabel}
+                      {progress.item.metadata?.keywordCoverageSkip === true || isLive || progress.stage === 'partial' ? progress.stageLabel : STATUS_LABELS[progress.status] || progress.stageLabel}
                     </span>
                   </span>
                   <span className="mt-1.5 flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">

@@ -85,6 +85,9 @@ function safeJobs(overrides = {}) {
     async reconcileElasticCaptureLeases() {
       return {requeued: 0};
     },
+    async reconcileKeywordNodeCoverage() {
+      return {scanned: 0, skipped: 0};
+    },
     async reconcilePendingOrchestrationRetries() {
       return {dispatched: 0, waitingForAgent: 0, failed: 0};
     },
