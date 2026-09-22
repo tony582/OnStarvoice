@@ -5,7 +5,7 @@ import {validatePostgresIntegrationTarget} from '../../../scripts/lib/postgres-i
 
 const capabilities = {remoteTaskCreate: true, remoteTaskKeywordPostLimit: true,
   remoteTaskEnhancementOptions: true, singleRelayV1: true,
-  remoteSequentialSearchPassesV1: true, taskStateKnown: true, supportedPlatforms: ['douyin']};
+  remoteSequentialSearchPassesV1: true, taskStateKnown: true, supportedPlatforms: ['douyin', 'xiaohongshu']};
 const keywords = ['别克壁纸', '月兔栖梦'];
 
 test('per-account keyword coverage persists through HTTP, dispatch, receipts and schedules', async t => {
@@ -22,7 +22,7 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
   const pool = getPool();
   t.after(closePool);
 
-  async function fixture(st) {
+  async function fixture(st, platform = 'douyin') {
     const tenant = (await pool.query('INSERT INTO tenants (name) VALUES ($1) RETURNING id',
       [`Keyword coverage ${randomUUID()}`])).rows[0];
     st.after(() => pool.query('DELETE FROM tenants WHERE id=$1', [tenant.id]));
@@ -35,13 +35,13 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
       const agent = (await pool.query(`INSERT INTO capture_agents (tenant_id,client_uuid,display_name,
         browser_name,app_version,allowed_platforms,status,auth_code_id,auth_binding_id,capabilities,
         last_heartbeat_at,last_full_heartbeat_at,last_liveness_at)
-        VALUES ($1,$2,$3,'Chrome','0.4.10',ARRAY['douyin'],'active',$4,$5,$6,now(),now(),now()) RETURNING *`,
+        VALUES ($1,$2,$3,'Chrome','0.4.10',ARRAY['douyin','xiaohongshu'],'active',$4,$5,$6,now(),now(),now()) RETURNING *`,
       [tenant.id, randomUUID(), `Coverage node ${index}`, code.id, binding.id, JSON.stringify(capabilities)])).rows[0];
       agents.push(agent);
       await pool.query(`INSERT INTO capture_agent_tokens (agent_id,auth_code_id,auth_binding_id,token_hash)
         VALUES ($1,$2,$3,$4)`, [agent.id, code.id, binding.id, createHash('sha256').update(randomUUID()).digest('hex')]);
       await pool.query(`INSERT INTO social_agent_daily_usage (tenant_id,agent_id,platform,usage_date,searches,failed_events,safety_verifications)
-        VALUES ($1,$2,'douyin',(now() AT TIME ZONE 'Asia/Shanghai')::date,0,0,0)`, [tenant.id, agent.id]);
+        VALUES ($1,$2,$3,(now() AT TIME ZONE 'Asia/Shanghai')::date,0,0,0)`, [tenant.id, agent.id, platform]);
     }
     const email = `coverage-${randomUUID()}@integration.invalid`;
     const password = 'coverage-integration-only';
@@ -69,7 +69,7 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
     const row = async (table, id) => (await pool.query(`SELECT * FROM ${table} WHERE id=$1`, [id])).rows[0];
     const items = async id => (await pool.query('SELECT * FROM capture_task_items WHERE task_id=$1 ORDER BY ordinal', [id])).rows;
     const agentIds = agents.slice(0, 2).map(agent => agent.id);
-    const plan = {requestKey: randomUUID(), title: '壁纸逐账号采集', platform: 'douyin',
+    const plan = {requestKey: randomUUID(), title: '壁纸逐账号采集', platform,
       executionMode: 'one_time', distributionMode: 'elastic_pool', keywordCoverage: 'each_agent',
       agentIds, keywords, keywordMaxDetectedItems: 5, searchFilters: {publishTime: 'day'}};
     async function publish(input = plan) {
@@ -92,7 +92,7 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
       const keyword = command.payload.planSnapshot.keywords[0];
       const now = new Date().toISOString();
       const snapshot = normalizeCloudTaskSnapshot({id: child.client_task_id, controlTaskId: child.id,
-        attemptId: command.payload.attemptIdentity, attemptNumber: 1, status, platform: 'douyin',
+        attemptId: command.payload.attemptIdentity, attemptNumber: 1, status, platform,
         taskType: 'unattended_keyword_capture', featureKey: 'unattended_keyword_plan', source: 'cloud',
         title: child.title, createdAt: child.created_at.toISOString(), updatedAt: now, startedAt: now,
         finishedAt: now, heartbeatAt: now, progressSeq: 1, progress: {keyword, roundCurrent: 1},
@@ -182,6 +182,68 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
     assert.equal((await f.items(published.id)).length, 3);
     assert.equal((await f.items(started.body.runTaskId)).length, 6);
   });
+
+  for (const platform of ['douyin', 'xiaohongshu']) {
+    await t.test(`${platform}: only selected words repeat and shared work can be claimed by either node`, async st => {
+      const f = await fixture(st, platform);
+      const input = {...f.plan, eachAgentKeywords: [keywords[0]], keywords: [...keywords, '安吉星壁纸']};
+      const published = await f.publish(input);
+      assert.equal(published.created.body.items.length, 4);
+      assert.deepEqual(published.created.body.orchestration.metadata.planSnapshot.eachAgentKeywords, [keywords[0]]);
+      assert.deepEqual(published.preview.body.groups.map(group => group.keywords),
+        [[keywords[0], keywords[1]], [keywords[0], '安吉星壁纸']]);
+      // Either idle node may take the shared work, even when preview balanced it to its peer.
+      assert.equal(await f.claim(2), null);
+      for (let index = 0; index < 3; index++) {
+        const claimed = await f.claim(1);
+        const item = await f.row('capture_task_items', claimed.itemId);
+        const command = await f.row('capture_agent_commands', claimed.commandId);
+        assert.equal(command.payload.planSnapshot.platform, platform);
+        assert.equal(command.payload.planSnapshot.recoveryPolicy.allowIdleAgentHandoff,
+          item.metadata.pinnedAgentId ? false : true);
+        await f.complete(claimed);
+      }
+      assert.equal(await f.claim(1), null, 'node cannot consume a selected word pinned to its peer');
+      assert.notEqual((await f.row('capture_tasks', published.id)).status, 'completed');
+      const remaining = (await f.items(published.id)).filter(item => item.status === 'pending');
+      assert.equal(remaining.length, 1);
+      assert.equal(remaining[0].metadata.pinnedAgentId, f.agentIds[0]);
+      assert.equal(await f.complete(await f.claim(0)), keywords[0]);
+      assert.equal((await f.row('capture_tasks', published.id)).status, 'completed');
+    });
+
+    await t.test(`${platform}: editing and materialization preserve a mixed selection without changing old runs`, async st => {
+      const f = await fixture(st, platform);
+      const input = {...f.plan, executionMode: 'unattended_plan', eachAgentKeywords: [keywords[0]],
+        schedule: {mode: 'daily', startTime: '05:30'}};
+      const published = await f.publish(input);
+      const originalItems = await f.items(published.id);
+      assert.equal(originalItems.length, 3);
+      const edit = {...input, expectedRevision: 1, eachAgentKeywords: [keywords[1]], keywords: [...keywords, '檐下秋意']};
+      const saved = await f.request(`/${published.id}/schedule`, edit, 'PATCH');
+      assert.equal(saved.status, 200, JSON.stringify(saved.body));
+      assert.equal(saved.body.itemCount, 4);
+      const parent = await f.row('capture_tasks', published.id);
+      assert.deepEqual(parent.metadata.planSnapshot.eachAgentKeywords, [keywords[1]]);
+      const run = await f.request(`/${published.id}/schedule/run-now`, {requestKey: randomUUID()});
+      assert.equal(run.status, 201, JSON.stringify(run.body));
+      const runItems = await f.items(run.body.runTaskId);
+      assert.equal(runItems.length, 4);
+      assert.equal(runItems.filter(item => item.metadata.pinnedAgentId).length, 2);
+      assert.ok(runItems.filter(item => item.metadata.pinnedAgentId).every(item => item.keyword === keywords[1]));
+      // Omitted selection on a schedule-only patch preserves the saved subset.
+      const {eachAgentKeywords: omitted, ...scheduleOnly} = edit;
+      const preserved = await f.request(`/${published.id}/schedule`, {...scheduleOnly, expectedRevision: 2}, 'PATCH');
+      assert.equal(preserved.status, 200, JSON.stringify(preserved.body));
+      assert.deepEqual((await f.row('capture_tasks', published.id)).metadata.planSnapshot.eachAgentKeywords, [keywords[1]]);
+      const shared = await f.request(`/${published.id}/schedule`, {...edit, expectedRevision: 3,
+        keywordCoverage: 'shared', eachAgentKeywords: []}, 'PATCH');
+      assert.equal(shared.status, 200, JSON.stringify(shared.body));
+      assert.equal((await f.items(published.id)).length, 3);
+      assert.equal((await f.items(run.body.runTaskId)).length, 4);
+      assert.equal((await f.items(run.body.runTaskId)).filter(item => item.metadata.pinnedAgentId).length, 2);
+    });
+  }
 
   await t.test('default shared collection still creates one work item per unique keyword', async st => {
     const f = await fixture(st);

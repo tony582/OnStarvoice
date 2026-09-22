@@ -300,7 +300,7 @@ export function TaskCard({
               {orchestration
                 ? contentPatrol
                   ? `${safeNumber(task.counts?.total ?? task.progress?.total)} 条帖子`
-                  : `${safeNumber(task.counts?.total ?? task.progress?.total)} ${unattendedNegativePatrol ? '个工作项 · 含近7天负面巡查' : task.metadata?.keywordCoverage === 'each_agent' ? '个工作项 · 逐节点采集' : '个关键词'}`
+                  : `${safeNumber(task.counts?.total ?? task.progress?.total)} ${unattendedNegativePatrol ? '个工作项 · 含近7天负面巡查' : task.metadata?.keywordCoverage === 'each_agent' ? '个工作项 · 含逐节点采集' : '个关键词'}`
                 : `${task.agent_host_label || '未分配设备'} › ${task.agent_display_name || '未分配 Agent'}`}
             </span>
             {!orchestration && (

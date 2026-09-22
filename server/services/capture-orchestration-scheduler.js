@@ -513,7 +513,7 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     return {kind: 'failed_template', scheduleId: schedule.id, ...advanced};
   }
   if (planSnapshot.keywordCoverage === 'each_agent' && !keywordCoverageItemsMatch({
-    items: templateItems, keywords: planSnapshot.keywords, agentIds,
+    items: templateItems, keywords: planSnapshot.keywords, agentIds, eachAgentKeywords: planSnapshot.eachAgentKeywords,
   })) {
     const advanced = await advanceSchedule(tx, schedule, {
       after: scheduledFor,
@@ -653,7 +653,7 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
         keyword: templateItem.keyword,
         ordinal: Number(templateItem.ordinal),
         scheduleTemplateItemId: templateItem.id,
-        ...(planSnapshot.keywordCoverage === 'each_agent'
+        ...(planSnapshot.keywordCoverage === 'each_agent' && templateItem.metadata.pinnedAgentId
           ? {keywordCoverage: 'each_agent', pinnedAgentId: templateItem.metadata.pinnedAgentId}
           : {}),
         ...(distributionMode === 'elastic_pool'

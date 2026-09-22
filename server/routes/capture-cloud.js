@@ -7810,6 +7810,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
           // accepting this contract.
           disableAutomaticSearchRetry: true,
           singleRelayV1: true,
+          ...(itemMetadata.pinnedAgentId ? {allowIdleAgentHandoff: false} : {}),
           requireVerifiedFilters:
             itemMetadata.requireVerifiedFilters === true ||
             safeJson(planSnapshot.recoveryPolicy)

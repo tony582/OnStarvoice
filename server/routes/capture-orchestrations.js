@@ -292,6 +292,7 @@ function normalizeCreateRequest(body) {
           ...remoteTaskInput.planSnapshot,
           keywords: normalized.keywords,
           keywordCoverage: normalized.keywordCoverage,
+          ...(normalized.eachAgentKeywords ? {eachAgentKeywords: normalized.eachAgentKeywords} : {}),
           ...(normalized.taskInput.negativePatrol
             ? {negativePatrol: normalized.taskInput.negativePatrol}
             : {}),
@@ -349,6 +350,9 @@ function normalizeScheduleUpdate(
   const normalized = normalizeCreateRequest({
     ...safeBody,
     keywordCoverage: safeBody.keywordCoverage ?? existingPlanSnapshot.keywordCoverage ?? 'shared',
+    ...(!Object.hasOwn(safeBody, 'eachAgentKeywords') && Array.isArray(existingPlanSnapshot.eachAgentKeywords)
+      ? {eachAgentKeywords: existingPlanSnapshot.eachAgentKeywords.filter(keyword =>
+        !Array.isArray(safeBody.keywords) || safeBody.keywords.includes(keyword))} : {}),
     ...(preservePatrolStatuses ? {negativePatrol: {
       ...requestedNegativePatrol, triageStatuses: previousNegativePatrol.triageStatuses,
     }} : {}),
@@ -1230,15 +1234,18 @@ router.post(
         revision: Number(parent.orchestration_revision || 0),
       });
       if (planSnapshot.keywordCoverage === 'each_agent') {
-        if (!keywordCoverageItemsMatch({items, keywords: planSnapshot.keywords, agentIds: normalizedAgents.agentIds})) {
+        if (!keywordCoverageItemsMatch({items, keywords: planSnapshot.keywords, agentIds: normalizedAgents.agentIds, eachAgentKeywords: planSnapshot.eachAgentKeywords})) {
           return sendRequestError(res, requestError(
             'keyword_coverage_changed', '节点或关键词已变化，请重新生成逐节点采集预览', 409,
           ));
         }
-        allocation.items = items.map(item => ({
-          ordinal: item.ordinal, assignedAgentId: item.metadata.pinnedAgentId,
-        }));
-        allocation.groups = normalizedAgents.agentIds.map(agentId => ({agentId}));
+        const mixed = allocateKeywordWorkItems({keywords: planSnapshot.keywords,
+          agentIds: normalizedAgents.agentIds, keywordCoverage: 'each_agent', eachAgentKeywords: planSnapshot.eachAgentKeywords});
+        const agentsByIdentity = new Map(mixed.items.map(item =>
+          [keywordCoverageItemIdentity(item.keyword, item.metadata?.pinnedAgentId || ''), item.assignedAgentId]));
+        allocation.items = items.map(item => ({ordinal: item.ordinal, assignedAgentId:
+          agentsByIdentity.get(keywordCoverageItemIdentity(item.keyword, item.metadata?.pinnedAgentId || ''))}));
+        allocation.groups = mixed.groups;
       }
       if (
         parent.metadata?.distributionMode !== 'elastic_pool' &&
@@ -2843,8 +2850,9 @@ router.post(
             ? normalized.eligibleAgentIds
             : [...new Set(normalized.assignments.map(assignment => assignment.agentId))];
           const assignmentsById = new Map(normalized.assignments.map(assignment => [assignment.itemId, assignment.agentId]));
-          if (!keywordCoverageItemsMatch({items, keywords: parent.metadata.planSnapshot.keywords, agentIds: selectedAgentIds}) ||
-              items.some(item => assignmentsById.get(String(item.id)) !== item.metadata.pinnedAgentId)) {
+          if (!keywordCoverageItemsMatch({items, keywords: parent.metadata.planSnapshot.keywords, agentIds: selectedAgentIds,
+              eachAgentKeywords: parent.metadata.planSnapshot.eachAgentKeywords}) ||
+              items.some(item => item.metadata?.pinnedAgentId && assignmentsById.get(String(item.id)) !== item.metadata.pinnedAgentId)) {
             return {failure: requestError(
               'keyword_coverage_assignment_mismatch', '逐节点采集必须保留每个关键词的全部目标节点，请重新生成预览', 409,
             )};
@@ -4298,6 +4306,7 @@ router.patch(
           agentIds,
           revision: nextScheduleRevision,
           keywordCoverage: request.keywordCoverage,
+          eachAgentKeywords: request.eachAgentKeywords,
         });
         if (
           distributionMode === 'fixed_batch' &&
@@ -4590,6 +4599,7 @@ router.patch(
               keywordCount: new Set(existingItems.map(item => item.keyword)).size,
               itemCount: existingItems.length,
               keywordCoverage: safeJson(schedule.plan_snapshot).keywordCoverage || 'shared',
+              eachAgentKeywords: safeJson(schedule.plan_snapshot).eachAgentKeywords,
               agentIds: previousAgentIds,
             },
             next: {
@@ -4602,6 +4612,7 @@ router.patch(
               keywordCount: request.keywords.length,
               itemCount: allocation.items.length,
               keywordCoverage: request.keywordCoverage,
+              eachAgentKeywords: request.eachAgentKeywords,
               agentIds,
               nextRunAt,
             },

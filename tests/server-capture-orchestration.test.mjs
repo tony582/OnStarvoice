@@ -58,6 +58,44 @@ test('guarded schedule materialization rejects an empty or invalid target scope'
   );
 });
 
+test('selected keywords repeat on every node while unselected keywords remain shared on both platforms', () => {
+  const keywords = Array.from({length: 16}, (_, index) => `关键词${index}`);
+  const agentIds = ['a', 'b', 'c', 'd', 'e', 'f'];
+  for (const platform of ['douyin', 'xiaohongshu']) {
+    const input = normalizeOrchestrationRequest({platform, distributionMode: 'elastic_pool',
+      keywordCoverage: 'each_agent', keywords, agentIds, eachAgentKeywords: keywords.slice(0, 6)});
+    const allocation = allocateKeywordWorkItems(input);
+    assert.equal(allocation.items.length, 46);
+    assert.equal(input.taskInput.recoveryPolicy.allowIdleAgentHandoff, true, 'shared words retain recovery');
+    assert.deepEqual(input.taskInput.eachAgentKeywords, keywords.slice(0, 6));
+    for (const keyword of keywords) {
+      const items = allocation.items.filter(item => item.keyword === keyword);
+      if (input.eachAgentKeywords.includes(keyword)) {
+        assert.deepEqual(items.map(item => item.metadata.pinnedAgentId), agentIds);
+      } else {
+        assert.equal(items.length, 1);
+        assert.ok(!items[0].metadata?.pinnedAgentId);
+      }
+    }
+    assert.equal(keywordCoverageItemsMatch({...input, items: allocation.items}), true);
+    assert.equal(keywordCoverageItemsMatch({...input, items: allocation.items.slice(1)}), false);
+    const changed = {...input, eachAgentKeywords: keywords.slice(1, 7)};
+    assert.equal(keywordCoverageItemsMatch({...changed, items: allocation.items}), false);
+    assert.notEqual(hashOrchestrationRequest(input), hashOrchestrationRequest(changed));
+  }
+});
+
+test('selected coverage validates keyword membership and applies the limit to mixed work count', () => {
+  const base = {platform: 'xiaohongshu', distributionMode: 'elastic_pool', keywordCoverage: 'each_agent',
+    keywords: Array.from({length: 300}, (_, index) => `词${index}`), agentIds: ['a', 'b', 'c', 'd']};
+  const mixed = normalizeOrchestrationRequest({...base, eachAgentKeywords: base.keywords.slice(0, 200)});
+  assert.equal(allocateKeywordWorkItems(mixed).items.length, 900);
+  assert.throws(() => normalizeOrchestrationRequest({...base, eachAgentKeywords: base.keywords.slice(0, 234)}), /1000/);
+  for (const eachAgentKeywords of [[], ['不在清单内'], '词1']) {
+    assert.throws(() => normalizeOrchestrationRequest({...base, eachAgentKeywords}), /关键词/);
+  }
+});
+
 test('orchestration input keeps a validated cloud schedule without changing allocation order', () => {
   const normalized = normalizeOrchestrationRequest({
     requestKey: ' request-1 ',

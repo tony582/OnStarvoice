@@ -501,18 +501,30 @@ export function normalizeOrchestrationRequest(
   if (!['shared', 'each_agent'].includes(keywordCoverage)) {
     throw scheduleError('invalid_keyword_coverage', '请选择关键词分工采集或每个节点都采集');
   }
+  let eachAgentKeywords;
   if (keywordCoverage === 'each_agent') {
-    if (distributionMode !== 'elastic_pool' || normalizePlatform(source.platform) !== 'douyin') {
-      throw scheduleError('keyword_coverage_requires_douyin_pool', '每个节点都采集需要使用抖音弹性节点池');
+    if (distributionMode !== 'elastic_pool' || !['douyin', 'xiaohongshu'].includes(normalizePlatform(source.platform))) {
+      throw scheduleError('keyword_coverage_requires_elastic_pool', '每个节点都采集需要使用小红书或抖音弹性节点池');
+    }
+    if (source.eachAgentKeywords !== undefined) {
+      if (!Array.isArray(source.eachAgentKeywords)) {
+        throw scheduleError('invalid_each_agent_keywords', '请选择需要每个节点都采集的关键词');
+      }
+      const selected = normalizeStringList(source.eachAgentKeywords, {limit: 1000, itemLimit: 120, map: value => text(value, 120)});
+      if (!selected.length || selected.some(keyword => !keywords.includes(keyword))) {
+        throw scheduleError('invalid_each_agent_keywords', '逐节点采集的关键词必须来自当前关键词清单，且至少选择一个');
+      }
+      eachAgentKeywords = keywords.filter(keyword => selected.includes(keyword));
     }
     if (agentIds.length === 0) {
       throw scheduleError('keyword_coverage_agents_required', '请先选择需要逐一采集的节点');
     }
-    if (keywords.length * agentIds.length > 1000) {
+    const repeatedCount = (eachAgentKeywords || keywords).length;
+    if (repeatedCount * agentIds.length + keywords.length - repeatedCount > 1000) {
       throw scheduleError('keyword_coverage_too_large', '逐节点采集单批最多 1000 个工作项，请减少关键词或节点');
     }
     // A different browser cannot satisfy this account's coverage obligation.
-    recoveryPolicy.allowIdleAgentHandoff = false;
+    if (repeatedCount === keywords.length) recoveryPolicy.allowIdleAgentHandoff = false;
     recoveryPolicy.disableAutomaticSearchRetry = true;
   }
   const negativePatrolEnabled = object(source.negativePatrol).enabled === true;
@@ -574,10 +586,12 @@ export function normalizeOrchestrationRequest(
     allocationMode: 'balanced',
     distributionMode,
     keywordCoverage,
+    ...(eachAgentKeywords ? {eachAgentKeywords} : {}),
     keywords,
     agentIds,
     taskInput: {
       keywordCoverage,
+      ...(eachAgentKeywords ? {eachAgentKeywords} : {}),
       searchFilters: {
         sort: readFilter('sort'),
         publishTime: readFilter('publishTime'),
@@ -658,11 +672,14 @@ export function keywordCoverageItemIdentity(keyword, agentId = '') {
   return JSON.stringify([String(keyword || '').trim(), agentId]);
 }
 
-/** Verify the full keyword x browser matrix, including missing/duplicate pins. */
-export function keywordCoverageItemsMatch({items = [], keywords = [], agentIds = []} = {}) {
+/** Selected keywords need every browser; remaining keywords need one unpinned item. */
+export function keywordCoverageItemsMatch({items = [], keywords = [], agentIds = [], eachAgentKeywords = keywords} = {}) {
   if (![items, keywords, agentIds].every(Array.isArray)) return false;
-  const expected = new Set(agentIds.flatMap(agentId => keywords.map(keyword =>
-    keywordCoverageItemIdentity(keyword, agentId))));
+  if (!Array.isArray(eachAgentKeywords) || eachAgentKeywords.some(keyword => !keywords.includes(keyword))) return false;
+  const repeated = new Set(eachAgentKeywords);
+  const expected = new Set(keywords.flatMap(keyword => repeated.has(keyword)
+    ? agentIds.map(agentId => keywordCoverageItemIdentity(keyword, agentId))
+    : [keywordCoverageItemIdentity(keyword)]));
   if (!expected.size || items.length !== expected.size) return false;
   for (const item of items) {
     const key = keywordCoverageItemIdentity(item.keyword, object(item.metadata).pinnedAgentId || '');
@@ -672,8 +689,8 @@ export function keywordCoverageItemsMatch({items = [], keywords = [], agentIds =
 }
 
 /**
- * Allocate contiguous, disjoint keyword groups by default, or one complete
- * pinned keyword group for each Agent when keywordCoverage is each_agent.
+ * Split shared keywords into disjoint groups and repeat the selected keywords
+ * as pinned work for each Agent. Omitted selections retain legacy all-keyword coverage.
  * Given the same normalized
  * keyword and Agent order, the result is byte-for-byte deterministic. Group
  * sizes differ by at most one and empty Agent groups are omitted, so callers do
@@ -684,6 +701,7 @@ export function allocateKeywordWorkItems({
   agentIds: rawAgentIds = [],
   revision: rawRevision = 1,
   keywordCoverage = 'shared',
+  eachAgentKeywords,
 } = {}) {
   const keywords = normalizeStringList(rawKeywords, {
     limit: 1000,
@@ -705,31 +723,37 @@ export function allocateKeywordWorkItems({
     return {items: [], groups: []};
   }
 
-  const baseSize = Math.floor(keywords.length / agentIds.length);
-  const remainder = keywords.length % agentIds.length;
+  const repeated = new Set(keywordCoverage === 'each_agent' ? eachAgentKeywords ?? keywords : []);
+  const sharedKeywords = keywords.filter(keyword => !repeated.has(keyword));
+  const baseSize = Math.floor(sharedKeywords.length / agentIds.length);
+  const remainder = sharedKeywords.length % agentIds.length;
   const items = [];
   const groups = [];
   let cursor = 0;
+  let sharedCursor = 0;
 
   for (let agentIndex = 0; agentIndex < agentIds.length; agentIndex += 1) {
-    const size = keywordCoverage === 'each_agent'
-      ? keywords.length
-      : baseSize + (agentIndex < remainder ? 1 : 0);
+    const sharedSize = baseSize + (agentIndex < remainder ? 1 : 0);
+    const sharedGroup = new Set(sharedKeywords.slice(sharedCursor, sharedCursor + sharedSize));
+    sharedCursor += sharedSize;
+    const groupKeywords = keywords.filter(keyword => repeated.has(keyword) || sharedGroup.has(keyword));
+    const size = groupKeywords.length;
     if (size === 0) continue;
     const agentId = agentIds[agentIndex];
     const groupItems = [];
     for (let offset = 0; offset < size; offset += 1) {
       const ordinal = cursor + offset;
-      const keyword = keywords[keywordCoverage === 'each_agent' ? offset : ordinal];
+      const keyword = groupKeywords[offset];
+      const pinned = repeated.has(keyword);
       const item = {
-        itemKey: itemKeyForKeyword(keyword, ordinal, keywordCoverage === 'each_agent' ? agentId : ''),
+        itemKey: itemKeyForKeyword(keyword, ordinal, pinned ? agentId : ''),
         itemType: 'keyword',
         ordinal,
         keyword,
         assignedAgentId: agentId,
         assignmentRevision: revision,
         status: 'assigned',
-        ...(keywordCoverage === 'each_agent'
+        ...(pinned
           ? {metadata: {keywordCoverage, pinnedAgentId: agentId}}
           : {}),
       };
