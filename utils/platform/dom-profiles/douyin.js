@@ -352,7 +352,6 @@ export const DOUYIN_DOM_PROFILE = Object.freeze({
           '.search-result-card .RY_wFBXl',
           '.search-result-card [class*="author"]',
           '.search-result-card [class*="nickname"]',
-          '.search-result-card a[href*="/user/"]',
         ]),
         likes: Object.freeze([
           '.search-result-card .pMq55q1M',

@@ -8,10 +8,39 @@ import {
   checkpointEntryToItemStatus,
   computeNextOrchestrationRunAt,
   hashOrchestrationRequest,
+  keywordCoverageItemsMatch,
   normalizeOrchestrationRequest,
   normalizeOrchestrationSchedule,
 } from '../server/services/capture-orchestration.js';
 import {enqueueDueCaptureOrchestrations} from '../server/services/capture-orchestration-scheduler.js';
+
+test('each-agent coverage expands unique keyword/account pairs with stable identities', () => {
+  const input = {keywords: ['别克壁纸', '月兔栖梦', '别克壁纸'], agentIds: ['a', 'b', 'a'], keywordCoverage: 'each_agent'};
+  const allocation = allocateKeywordWorkItems(input);
+  assert.equal(allocation.items.length, 4);
+  assert.equal(new Set(allocation.items.map(item => item.itemKey)).size, 4);
+  assert.deepEqual(allocation.groups.map(group => group.keywords), [['别克壁纸', '月兔栖梦'], ['别克壁纸', '月兔栖梦']]);
+  const reordered = allocateKeywordWorkItems({...input, agentIds: ['b', 'a'], keywords: ['月兔栖梦', '别克壁纸']});
+  assert.deepEqual(allocation.items.map(item => item.itemKey).sort(), reordered.items.map(item => item.itemKey).sort());
+  assert.equal(keywordCoverageItemsMatch({items: allocation.items, keywords: input.keywords, agentIds: input.agentIds}), true);
+  assert.equal(keywordCoverageItemsMatch({items: allocation.items.slice(1), keywords: input.keywords, agentIds: input.agentIds}), false);
+  assert.equal(keywordCoverageItemsMatch({items: [allocation.items[0], allocation.items[0], ...allocation.items.slice(2)], keywords: input.keywords, agentIds: input.agentIds}), false);
+  const halfway = allocation.items.map(item => ({...item, status: item.assignedAgentId === 'a' ? 'completed' : 'pending'}));
+  assert.notEqual(aggregateParentTaskItems(halfway).status, 'completed');
+});
+
+test('each-agent coverage is explicit, keeps the original account, and changes request identity', () => {
+  const base = {platform: 'douyin', distributionMode: 'elastic_pool', keywords: ['别克壁纸'], agentIds: ['a', 'b']};
+  const shared = normalizeOrchestrationRequest(base);
+  const repeated = normalizeOrchestrationRequest({...base, keywordCoverage: 'each_agent'});
+  assert.equal(shared.keywordCoverage, 'shared');
+  assert.equal(repeated.taskInput.keywordCoverage, 'each_agent');
+  assert.equal(repeated.taskInput.recoveryPolicy.allowIdleAgentHandoff, false);
+  assert.equal(repeated.taskInput.recoveryPolicy.disableAutomaticSearchRetry, true);
+  assert.notEqual(hashOrchestrationRequest(shared), hashOrchestrationRequest(repeated));
+  assert.throws(() => normalizeOrchestrationRequest({...base, keywordCoverage: 'each_agent', agentIds: []}), /节点/);
+  assert.throws(() => normalizeOrchestrationRequest({...base, keywordCoverage: 'each_agent', distributionMode: 'fixed_batch'}), /弹性节点池/);
+});
 
 test('guarded schedule materialization rejects an empty or invalid target scope', async () => {
   const tenantId = '11111111-1111-4111-8111-111111111111';

@@ -55,7 +55,7 @@ export function OrchestrationResultReport({ items, executions, agents, attempts,
       {items.length === 0 ? <p className="p-4 text-xs text-muted-foreground">此任务没有保留工作项明细。</p> : <div className="divide-y divide-border/60">{items.map((item, index) => {
         const execution = executionFor(item)
         const source = item as OrchestrationItemRecord & {record_id?: string; result_record_id?: string}
-        const agent = agentsById.get(String(item.assigned_agent_id || execution?.agentId || execution?.agent_id || execution?.assigned_agent_id || ''))
+        const agent = agentsById.get(String(item.assigned_agent_id || execution?.agentId || execution?.agent_id || execution?.assigned_agent_id || item.metadata?.pinnedAgentId || ''))
         const history = attempts.filter(attempt => String(attempt.itemId || attempt.item_id || '') === item.id)
         const timing = orchestrationItemTiming(item, execution, history)
         const timingLabel = timing.source === 'attempt' ? '本次尝试' : timing.source === 'execution' ? '节点执行' : '工作项'

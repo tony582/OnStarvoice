@@ -497,6 +497,24 @@ export function normalizeOrchestrationRequest(
   const distributionMode = rawDistributionMode === 'elastic_pool'
     ? 'elastic_pool'
     : 'fixed_batch';
+  const keywordCoverage = source.keywordCoverage || 'shared';
+  if (!['shared', 'each_agent'].includes(keywordCoverage)) {
+    throw scheduleError('invalid_keyword_coverage', '请选择关键词分工采集或每个节点都采集');
+  }
+  if (keywordCoverage === 'each_agent') {
+    if (distributionMode !== 'elastic_pool' || normalizePlatform(source.platform) !== 'douyin') {
+      throw scheduleError('keyword_coverage_requires_douyin_pool', '每个节点都采集需要使用抖音弹性节点池');
+    }
+    if (agentIds.length === 0) {
+      throw scheduleError('keyword_coverage_agents_required', '请先选择需要逐一采集的节点');
+    }
+    if (keywords.length * agentIds.length > 1000) {
+      throw scheduleError('keyword_coverage_too_large', '逐节点采集单批最多 1000 个工作项，请减少关键词或节点');
+    }
+    // A different browser cannot satisfy this account's coverage obligation.
+    recoveryPolicy.allowIdleAgentHandoff = false;
+    recoveryPolicy.disableAutomaticSearchRetry = true;
+  }
   const negativePatrolEnabled = object(source.negativePatrol).enabled === true;
   if (negativePatrolEnabled &&
       !(executionMode === 'unattended_plan' && distributionMode === 'elastic_pool')) {
@@ -555,9 +573,11 @@ export function normalizeOrchestrationRequest(
     executionMode,
     allocationMode: 'balanced',
     distributionMode,
+    keywordCoverage,
     keywords,
     agentIds,
     taskInput: {
+      keywordCoverage,
       searchFilters: {
         sort: readFilter('sort'),
         publishTime: readFilter('publishTime'),
@@ -623,17 +643,38 @@ export function hashOrchestrationRequest(request = {}) {
     .digest('hex');
 }
 
-function itemKeyForKeyword(keyword, ordinal) {
+function itemKeyForKeyword(keyword, ordinal, agentId = '') {
   const fingerprint = crypto
     .createHash('sha256')
     .update(keyword)
     .digest('hex')
     .slice(0, 12);
-  return `keyword:${String(ordinal + 1).padStart(4, '0')}:${fingerprint}`;
+  return agentId
+    ? `keyword:agent:${agentId}:${fingerprint}`
+    : `keyword:${String(ordinal + 1).padStart(4, '0')}:${fingerprint}`;
+}
+
+export function keywordCoverageItemIdentity(keyword, agentId = '') {
+  return JSON.stringify([String(keyword || '').trim(), agentId]);
+}
+
+/** Verify the full keyword x browser matrix, including missing/duplicate pins. */
+export function keywordCoverageItemsMatch({items = [], keywords = [], agentIds = []} = {}) {
+  if (![items, keywords, agentIds].every(Array.isArray)) return false;
+  const expected = new Set(agentIds.flatMap(agentId => keywords.map(keyword =>
+    keywordCoverageItemIdentity(keyword, agentId))));
+  if (!expected.size || items.length !== expected.size) return false;
+  for (const item of items) {
+    const key = keywordCoverageItemIdentity(item.keyword, object(item.metadata).pinnedAgentId || '');
+    if (!expected.delete(key)) return false;
+  }
+  return expected.size === 0;
 }
 
 /**
- * Allocate contiguous, disjoint keyword groups. Given the same normalized
+ * Allocate contiguous, disjoint keyword groups by default, or one complete
+ * pinned keyword group for each Agent when keywordCoverage is each_agent.
+ * Given the same normalized
  * keyword and Agent order, the result is byte-for-byte deterministic. Group
  * sizes differ by at most one and empty Agent groups are omitted, so callers do
  * not emit no-op create commands.
@@ -642,6 +683,7 @@ export function allocateKeywordWorkItems({
   keywords: rawKeywords = [],
   agentIds: rawAgentIds = [],
   revision: rawRevision = 1,
+  keywordCoverage = 'shared',
 } = {}) {
   const keywords = normalizeStringList(rawKeywords, {
     limit: 1000,
@@ -670,21 +712,26 @@ export function allocateKeywordWorkItems({
   let cursor = 0;
 
   for (let agentIndex = 0; agentIndex < agentIds.length; agentIndex += 1) {
-    const size = baseSize + (agentIndex < remainder ? 1 : 0);
+    const size = keywordCoverage === 'each_agent'
+      ? keywords.length
+      : baseSize + (agentIndex < remainder ? 1 : 0);
     if (size === 0) continue;
     const agentId = agentIds[agentIndex];
     const groupItems = [];
     for (let offset = 0; offset < size; offset += 1) {
       const ordinal = cursor + offset;
-      const keyword = keywords[ordinal];
+      const keyword = keywords[keywordCoverage === 'each_agent' ? offset : ordinal];
       const item = {
-        itemKey: itemKeyForKeyword(keyword, ordinal),
+        itemKey: itemKeyForKeyword(keyword, ordinal, keywordCoverage === 'each_agent' ? agentId : ''),
         itemType: 'keyword',
         ordinal,
         keyword,
         assignedAgentId: agentId,
         assignmentRevision: revision,
         status: 'assigned',
+        ...(keywordCoverage === 'each_agent'
+          ? {metadata: {keywordCoverage, pinnedAgentId: agentId}}
+          : {}),
       };
       items.push(item);
       groupItems.push(item);

@@ -775,7 +775,9 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
             focusMobileTaskView(result.schedule ? 'plans' : 'active')
             setFeedback(result.schedule
               ? '多 Agent 无人值守计划已启用，将按云端时间生成每轮任务。'
-              : `多 Agent 任务已拆分为 ${result.executions.length} 条执行指令。`)
+              : result.executions.length > 0
+                ? `多 Agent 任务已拆分为 ${result.executions.length} 条执行指令。`
+                : '任务已加入云端队列；节点空闲时逐项领取。')
             setOrchestrationRefreshKey(value => value + 1)
             await load(true)
           }}

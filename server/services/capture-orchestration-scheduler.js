@@ -4,6 +4,7 @@ import {
   aggregateParentTaskItems,
   computeNextOrchestrationRunAt,
   hashOrchestrationRequest,
+  keywordCoverageItemsMatch,
 } from './capture-orchestration.js';
 import {
   normalizeCaptureAgentPlatforms,
@@ -433,7 +434,7 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
   }
 
   const templateItems = await tx.queryAll(`
-    SELECT id, ordinal, keyword, assigned_agent_id
+    SELECT id, ordinal, keyword, assigned_agent_id, metadata
     FROM capture_task_items
     WHERE tenant_id = $1 AND task_id = $2
     ORDER BY ordinal, id
@@ -511,6 +512,17 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
     });
     return {kind: 'failed_template', scheduleId: schedule.id, ...advanced};
   }
+  if (planSnapshot.keywordCoverage === 'each_agent' && !keywordCoverageItemsMatch({
+    items: templateItems, keywords: planSnapshot.keywords, agentIds,
+  })) {
+    const advanced = await advanceSchedule(tx, schedule, {
+      after: scheduledFor,
+      lastRunStatus: 'failed_template',
+      lastError: {code: 'keyword_coverage_incomplete', message: '逐节点关键词清单不完整，请重新保存计划'},
+      message: '逐节点关键词清单不完整，本轮未生成任务',
+    });
+    return {kind: 'failed_template', scheduleId: schedule.id, ...advanced};
+  }
   const agents = await tx.queryAll(`
     SELECT ca.*,
       tenant.status AS tenant_status,
@@ -534,6 +546,7 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
   const runMetadata = {
     allocationMode: schedule.allocation_mode,
     distributionMode,
+    keywordCoverage: planSnapshot.keywordCoverage || 'shared',
     eligibleAgentIds: distributionMode === 'elastic_pool' ? agentIds : [],
     claimUnit: distributionMode === 'elastic_pool' ? 'keyword' : 'fixed_batch',
     executionMode: 'one_time',
@@ -549,7 +562,7 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
           sequentialSearch: {
             enabled: true,
             passes: searchPasses,
-            keywordCount: templateItems.length,
+            keywordCount: new Set(templateItems.map(item => item.keyword)).size,
             itemCount: runItemTotal,
           },
         }
@@ -640,6 +653,9 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
         keyword: templateItem.keyword,
         ordinal: Number(templateItem.ordinal),
         scheduleTemplateItemId: templateItem.id,
+        ...(planSnapshot.keywordCoverage === 'each_agent'
+          ? {keywordCoverage: 'each_agent', pinnedAgentId: templateItem.metadata.pinnedAgentId}
+          : {}),
         ...(distributionMode === 'elastic_pool'
           ? {
               disableAutomaticSearchRetry: true,

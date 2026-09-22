@@ -141,6 +141,7 @@ function itemAgentId(
     item.assigned_agent_id
       || latestAttempt?.agentId
       || latestAttempt?.agent_id
+      || item.metadata?.pinnedAgentId
       || '',
   )
 }
@@ -389,7 +390,7 @@ export function KeywordExecutionReport({ items, executions, agents, attempts }: 
               <h3 className="mt-0.5 text-sm font-bold text-foreground">关键词执行情况</h3>
               <p className="mt-1 text-[11px] text-muted-foreground">按词查看所属 Agent，以及搜索、采集、增强与保存进度。</p>
             </div>
-            <span className="self-start rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{items.length} 个词</span>
+            <span className="self-start rounded-md bg-muted px-2 py-1 text-[10px] text-muted-foreground">{items.length} {items.some(item => item.metadata?.keywordCoverage === 'each_agent') ? '个工作项' : '个词'}</span>
           </div>
           <div className="mt-3 grid gap-2 sm:grid-cols-[minmax(0,1fr)_180px]">
             <label className="relative block">

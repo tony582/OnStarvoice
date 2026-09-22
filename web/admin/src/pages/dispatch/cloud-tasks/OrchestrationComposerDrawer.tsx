@@ -38,6 +38,12 @@ import type {
 type ComposerStage = 'define' | 'allocate' | 'dispatched'
 type PlanMode = 'daily' | 'custom_dates'
 type DistributionMode = 'fixed_batch' | 'elastic_pool'
+type KeywordCoverage = 'shared' | 'each_agent'
+
+const WALLPAPER_KEYWORD_GROUPS = [
+  { label: '本次重点词', keywords: ['别克壁纸', '凯迪拉克壁纸', '安吉星壁纸', '安吉星车机壁纸', '月兔栖梦', '檐下秋意'] },
+  { label: '建议补搜', keywords: ['别克车机壁纸', '凯迪拉克车机壁纸', '君越壁纸', '君越车机壁纸', '昂科威壁纸', '昂科威PLUS壁纸'] },
+]
 type PatrolContentType = 'all' | 'image' | 'video'
 type SupplementalContentType = '' | 'image' | 'video'
 
@@ -245,7 +251,8 @@ function agentBlockReason(
   return ''
 }
 
-function allocationAgentLabel(agent: OrchestrationCloudAgent) {
+function allocationAgentLabel(agent?: OrchestrationCloudAgent) {
+  if (!agent) return '目标节点不可用'
   const host = agent.host_label || '未命名设备'
   const node = agent.display_name || '未命名节点'
   const browser = agent.browser_name || '浏览器'
@@ -290,6 +297,7 @@ function buildEditPreview({
   keywords,
   selectedAgents,
   existingItems,
+  keywordCoverage,
 }: {
   orchestrationId: string
   revision: number
@@ -297,9 +305,10 @@ function buildEditPreview({
   keywords: string[]
   selectedAgents: OrchestrationCloudAgent[]
   existingItems: OrchestrationItemRecord[]
+  keywordCoverage: KeywordCoverage
 }) {
   const existingItemIdByKeyword = new Map(
-    existingItems.map(item => [keywordForItem(item), item.id]),
+    existingItems.map(item => [JSON.stringify([keywordForItem(item), safeRecord(item.metadata).pinnedAgentId || '']), item.id]),
   )
   const baseSize = Math.floor(keywords.length / selectedAgents.length)
   const remainder = keywords.length % selectedAgents.length
@@ -307,11 +316,11 @@ function buildEditPreview({
   const assignments: EditableAssignment[] = []
   let cursor = 0
   selectedAgents.forEach((agent, agentIndex) => {
-    const size = baseSize + (agentIndex < remainder ? 1 : 0)
+    const size = keywordCoverage === 'each_agent' ? keywords.length : baseSize + (agentIndex < remainder ? 1 : 0)
     if (size === 0) return
-    const groupKeywords = keywords.slice(cursor, cursor + size)
+    const groupKeywords = keywordCoverage === 'each_agent' ? keywords : keywords.slice(cursor, cursor + size)
     const itemIds = groupKeywords.map((keyword, offset) =>
-      existingItemIdByKeyword.get(keyword) || `edit-${cursor + offset}`,
+      existingItemIdByKeyword.get(JSON.stringify([keyword, keywordCoverage === 'each_agent' ? agent.id : ''])) || `edit-${cursor + offset}`,
     )
     groups.push({
       agentId: agent.id,
@@ -333,7 +342,7 @@ function buildEditPreview({
       orchestrationId,
       revision,
       platform,
-      itemCount: keywords.length,
+      itemCount: assignments.length,
       groups,
     },
     assignments,
@@ -402,8 +411,9 @@ export function OrchestrationComposerDrawer({
   const [includeComments, setIncludeComments] = useState(false)
   const [commentLimit, setCommentLimit] = useState(50)
   const [skipCaptured, setSkipCaptured] = useState(true)
-  const allowIdleAgentHandoff = true
   const [distributionMode, setDistributionMode] = useState<DistributionMode>('elastic_pool')
+  const [keywordCoverage, setKeywordCoverage] = useState<KeywordCoverage>('shared')
+  const allowIdleAgentHandoff = keywordCoverage !== 'each_agent'
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>([])
   const [selectionNotice, setSelectionNotice] = useState('')
   const [negativePreview, setNegativePreview] = useState<{windowStart?: string; windowEnd?: string; summary: Record<string, unknown>} | null>(null)
@@ -474,6 +484,8 @@ export function OrchestrationComposerDrawer({
     [agents, validSelectedAgentIds],
   )
   const busy = submitting || discardingDraft
+  const eachAgentCoverage = keywordCoverage === 'each_agent'
+  const keywordWorkItemCount = keywords.length * (eachAgentCoverage ? selectedAgents.length : 1)
   const requiredAgentCount = Number.isFinite(minimumAgentCount)
     ? Math.max(1, Math.floor(minimumAgentCount))
     : 1
@@ -553,6 +565,7 @@ export function OrchestrationComposerDrawer({
       ? [...sourcePlan.items]
         .sort((left, right) => safeCount(left.ordinal) - safeCount(right.ordinal))
         .map(keywordForItem)
+        .filter((keyword, index, all) => all.indexOf(keyword) === index)
         .join('\n')
       : '')
     setKeywordMaxDetectedItems(safeCount(planSnapshot.keywordMaxDetectedItems) || 50)
@@ -577,6 +590,7 @@ export function OrchestrationComposerDrawer({
     setCommentLimit(safeCount(enhancementSettings.detailCommentsMaxDetectedItems) || 50)
     setSkipCaptured(enhancementSettings.skipAlreadyCapturedOnDetailCapture !== false)
     setDistributionMode(editingDistributionMode)
+    setKeywordCoverage(planSnapshot.keywordCoverage === 'each_agent' ? 'each_agent' : 'shared')
     setSelectedAgentIds(lockAgentSelection ? candidateAgentIds : compatibleInitialAgentIds)
     setSelectionNotice(
       compatibleInitialAgentIds.length < candidateAgentIds.length
@@ -726,6 +740,7 @@ export function OrchestrationComposerDrawer({
     const nextSequentialSearchEnabled = sequentialSearchEnabled && value === 'douyin'
     setPlatform(value)
     if (value !== 'douyin') {
+      setKeywordCoverage('shared')
       setSupplementalContentType('')
       setVideoDuration('all')
     } else {
@@ -875,6 +890,7 @@ export function OrchestrationComposerDrawer({
     captureSettings,
     allowIdleAgentHandoff,
     distributionMode,
+    keywordCoverage,
     eligibleAgentIds: [...validSelectedAgentIds].sort(),
   })
 
@@ -933,6 +949,10 @@ export function OrchestrationComposerDrawer({
       setError(`请至少选择 ${requiredAgentCount} 个与当前平台和采集设置兼容的 Agent。`)
       return
     }
+    if (eachAgentCoverage && keywordWorkItemCount > 1000) {
+      setError('逐节点采集单批最多 1000 个工作项，请减少关键词或节点。')
+      return
+    }
     if (
       distributionMode === 'fixed_batch' &&
       validSelectedAgentIds.length < Math.ceil(keywords.length / 30)
@@ -953,6 +973,7 @@ export function OrchestrationComposerDrawer({
         keywords,
         selectedAgents,
         existingItems: editingPlan.items,
+        keywordCoverage,
       })
       setPreview(localPreview.preview)
       setAssignments(localPreview.assignments)
@@ -978,6 +999,7 @@ export function OrchestrationComposerDrawer({
           executionMode,
           ...unattendedNegativePatrolRequest(includeNegativePatrol, executionMode, negativePatrolStatuses),
           distributionMode,
+          keywordCoverage,
           agentIds: validSelectedAgentIds,
           ...(executionMode === 'unattended_plan'
             ? {
@@ -1046,7 +1068,7 @@ export function OrchestrationComposerDrawer({
       return
     }
     if (
-      assignments.length !== (editMode ? keywords.length : createResult?.items.length) ||
+      assignments.length !== (editMode ? keywordWorkItemCount : createResult?.items.length) ||
       assignments.some(assignment => !assignment.agentId)
     ) {
       setError('工作项清单不完整，请返回上一步重新生成。')
@@ -1069,6 +1091,7 @@ export function OrchestrationComposerDrawer({
             executionMode: 'unattended_plan',
             negativePatrol: includeNegativePatrol ? unattendedNegativePatrolRequest(true, 'unattended_plan', negativePatrolStatuses).negativePatrol : {enabled: false},
             distributionMode,
+            keywordCoverage,
             agentIds: validSelectedAgentIds,
             schedule: {
               mode: planMode,
@@ -1351,7 +1374,7 @@ export function OrchestrationComposerDrawer({
                         </label>
                         <div className="flex items-center rounded-xl border border-border/70 bg-card px-3 py-2.5">
                           <p className="text-[11px] leading-4 text-muted-foreground">
-                            每个计划时间，<span className="font-semibold text-foreground">每个关键词执行 1 次</span>。
+                            每个计划时间，<span className="font-semibold text-foreground">{eachAgentCoverage ? '每个关键词在每个所选节点各执行 1 次' : '每个关键词执行 1 次'}</span>。
                           </p>
                         </div>
                       </div>
@@ -1367,7 +1390,7 @@ export function OrchestrationComposerDrawer({
                     <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary"><ClipboardList className="h-4 w-4" /></span>
                     <div>
                       <h3 className="text-sm font-bold text-foreground">任务内容</h3>
-                      <p className="text-[11px] text-muted-foreground">每个关键词会成为一个独立工作项。</p>
+                      <p className="text-[11px] text-muted-foreground">{eachAgentCoverage ? '每个关键词在每个所选节点都有独立的采集结果。' : '每个关键词会成为一个独立工作项。'}</p>
                     </div>
                   </div>
                   <div className="space-y-3.5">
@@ -1383,7 +1406,7 @@ export function OrchestrationComposerDrawer({
                       />
                     </label>
                     <label className="block text-xs font-medium text-muted-foreground">
-                      每个关键词最多采集
+                      {eachAgentCoverage ? '每个节点的每个关键词最多采集' : '每个关键词最多采集'}
                       <input
                         type="number"
                         min={1}
@@ -1406,11 +1429,53 @@ export function OrchestrationComposerDrawer({
                       />
                       <span className={`mt-1.5 block text-[11px] ${keywords.length > 300 ? 'text-status-red' : 'text-muted-foreground'}`}>
                         {keywords.length}/300 个关键词
-                        {sequentialSearchEnabled
+                        {eachAgentCoverage ? ` × ${selectedAgents.length} 个节点 = ${keywordWorkItemCount} 个工作项` : sequentialSearchEnabled
                           ? ` · ${keywords.length} 个工作项，每个 Agent 按“${patrolPathLabel}”完成同词巡检`
                           : distributionMode === 'elastic_pool' ? ' · 每个 Agent 一次领取 1 个' : ' · 保存时按节点均衡固定分配'}
                       </span>
                     </label>
+                    {platform === 'douyin' && (
+                      <details className="rounded-xl border border-border/70 px-3 py-2.5">
+                        <summary className="cursor-pointer text-xs font-semibold text-foreground">壁纸关键词快捷选择</summary>
+                        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">勾选后加入上方清单；建议补搜用于覆盖只写车型或“车机壁纸”的帖子。</p>
+                        {WALLPAPER_KEYWORD_GROUPS.map(group => (
+                          <div key={group.label} className="mt-2">
+                            <div className="mb-1.5 text-[11px] text-muted-foreground">{group.label}</div>
+                            <div className="flex flex-wrap gap-2">
+                              {group.keywords.map(keyword => (
+                                <label key={keyword} className="flex cursor-pointer items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs">
+                                  <input type="checkbox" checked={keywords.includes(keyword)} disabled={busy} onChange={event => {
+                                    markDefinitionChanged()
+                                    setKeywordText((event.target.checked ? [...keywords, keyword] : keywords.filter(value => value !== keyword)).join('\n'))
+                                  }} />{keyword}
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </details>
+                    )}
+                    {platform === 'douyin' && (
+                      <fieldset className="rounded-xl border border-primary/20 px-3 py-3">
+                        <legend className="px-1 text-xs font-semibold text-foreground">关键词覆盖方式</legend>
+                        <div className="space-y-2">
+                          {([
+                            {value: 'shared' as const, label: '分工采集', description: '每个关键词由节点池中的一个节点执行。'},
+                            {value: 'each_agent' as const, label: '每个所选节点都采集', description: '使用各节点当前登录的抖音账号，每个词在每个节点各采集一次。请确认节点登录了不同账号。'},
+                          ]).map(option => (
+                            <label key={option.value} className="flex cursor-pointer items-start gap-2 text-xs">
+                              <input type="radio" name="keywordCoverage" value={option.value} checked={keywordCoverage === option.value} disabled={busy} className="mt-0.5" onChange={() => {
+                                markDefinitionChanged()
+                                setKeywordCoverage(option.value)
+                                if (option.value === 'each_agent') changeDistributionMode('elastic_pool')
+                              }} />
+                              <span><span className="block font-semibold text-foreground">{option.label}</span><span className="mt-0.5 block leading-5 text-muted-foreground">{option.description}</span></span>
+                            </label>
+                          ))}
+                        </div>
+                        {eachAgentCoverage && <p className="mt-2 text-[11px] leading-5 text-muted-foreground">{keywords.length} 个词 × {selectedAgents.length} 个节点 = {keywordWorkItemCount} 个工作项。各节点逐词执行，入库沿用帖子去重；离线节点保留自己的待采集项。</p>}
+                      </fieldset>
+                    )}
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="block text-xs font-medium text-muted-foreground">
                         排序方式
@@ -1590,7 +1655,7 @@ export function OrchestrationComposerDrawer({
                             key={option.value}
                             type="button"
                             aria-pressed={active}
-                            disabled={busy || (includeNegativePatrol && option.value === 'fixed_batch')}
+                            disabled={busy || ((includeNegativePatrol || eachAgentCoverage) && option.value === 'fixed_batch')}
                             onClick={() => {
                               if (active) return
                               changeDistributionMode(option.value)
@@ -1609,17 +1674,17 @@ export function OrchestrationComposerDrawer({
                 ) : (
                   <div className="mt-3 rounded-xl border border-primary/20 bg-primary/[0.045] px-3 py-2.5">
                     <div className="flex items-center gap-2 text-xs font-semibold text-primary"><Settings2 className="h-3.5 w-3.5" /> 弹性节点池</div>
-                    <p className="mt-1 text-[11px] leading-4 text-muted-foreground">关键词先留在云端。节点空闲时只领 1 个，完成后再领下一个；速度快的节点会自然多做。</p>
+                    <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{eachAgentCoverage ? '每个节点都有完整的关键词清单，空闲时领取自己的下一项，逐词执行。' : '关键词先留在云端。节点空闲时只领 1 个，完成后再领下一个；速度快的节点会自然多做。'}</p>
                   </div>
                 )}
                 <div className={`mt-3 flex items-start gap-3 rounded-xl border px-3 py-3 ${distributionMode === 'elastic_pool' ? 'border-primary/20 bg-primary/[0.035]' : 'border-status-orange/25 bg-status-orange/[0.045]'}`}>
                   <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground">✓</span>
                   <span>
                     <span className="block text-xs font-semibold text-foreground">
-                      {lockAgentSelection ? '只使用指定节点' : distributionMode === 'elastic_pool' ? '离线不会拖住整批任务' : '保留固定分配方式'}
+                      {eachAgentCoverage ? '每个节点分别记录完成情况' : lockAgentSelection ? '只使用指定节点' : distributionMode === 'elastic_pool' ? '离线不会拖住整批任务' : '保留固定分配方式'}
                     </span>
                     <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">
-                      {lockAgentSelection ? '关键词与负面帖子由同一节点逐项执行，节点离线时等待上线。' : distributionMode === 'elastic_pool'
+                      {eachAgentCoverage ? '节点离线时，它的关键词继续等待该节点；其他节点正常执行。不会用另一个账号的结果代替这个账号，也不会因为某个账号完成就将整批标记为完成。' : lockAgentSelection ? '关键词与负面帖子由同一节点逐项执行，节点离线时等待上线。' : distributionMode === 'elastic_pool'
                         ? '创建指令 3 分钟未确认会退回队列；执行节点持续离线 10 分钟也会回收。验证码或登录验证只暂停当前关键词，不会自动扩散到其他节点。'
                         : '关键词会均衡后固定给各节点；某台设备较慢或离线时，其他设备不会自动领取它的关键词。'}
                     </span>
@@ -1737,7 +1802,7 @@ export function OrchestrationComposerDrawer({
                     </div>
                     <h3 className="mt-1 text-base font-bold text-foreground">{title}</h3>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {preview.itemCount} 个关键词工作项{includeNegativePatrol ? ' + 每轮近7天负面巡查' : ''} · {selectedAgents.length} 个执行节点 · {distributionMode === 'elastic_pool' ? '一次领取 1 项' : '按当前顺序均衡固定分配'}
+                      {preview.itemCount} 个关键词工作项{includeNegativePatrol ? ' + 每轮近7天负面巡查' : ''} · {selectedAgents.length} 个执行节点 · {eachAgentCoverage ? `每个节点都采集全部 ${keywords.length} 个词` : distributionMode === 'elastic_pool' ? '一次领取 1 项' : '按当前顺序均衡固定分配'}
                       {sequentialSearchEnabled ? ` · 每项串行执行 ${patrolPathLabel}` : ''}
                       {executionMode === 'unattended_plan'
                         ? ` · ${planMode === 'daily' ? '每天' : `${parseCustomDates(customDates).dates.length} 个指定日期`} ${startTime}`
@@ -1752,7 +1817,7 @@ export function OrchestrationComposerDrawer({
                     <div key={agent.id} className="rounded-xl border border-border/70 bg-card px-3 py-2.5">
                       <div className="truncate text-xs font-bold text-foreground">{allocationAgentLabel(agent)}</div>
                       <div className="mt-1 text-[11px] text-muted-foreground">
-                        {distributionMode === 'elastic_pool'
+                        {eachAgentCoverage ? `${keywords.length} 个词 · ${agent.online ? '在线' : '等待此节点上线'}` : distributionMode === 'elastic_pool'
                           ? agent.online ? '在线 · 空闲时可领取' : '离线 · 不阻塞其他节点'
                           : agent.online ? '在线 · 接收固定关键词' : '离线 · 固定关键词会等待'}
                       </div>
@@ -1780,7 +1845,7 @@ export function OrchestrationComposerDrawer({
                   <div>
                     <h3 className="text-sm font-bold text-foreground">云端工作项</h3>
                     <p className="mt-0.5 text-[11px] text-muted-foreground">
-                      {distributionMode === 'elastic_pool'
+                      {eachAgentCoverage ? '逐项核对关键词和目标节点；每项仅由对应节点当前登录的账号执行。' : distributionMode === 'elastic_pool'
                         ? '这里确认要跑哪些词；实际执行节点由当时的空闲状态决定。'
                         : '这里确认要跑哪些词，以及保存后采用的固定均衡分配。'}
                     </p>
@@ -1799,7 +1864,7 @@ export function OrchestrationComposerDrawer({
                           </div>
                         </div>
                         <span className="rounded-full border border-primary/20 bg-primary/[0.055] px-2.5 py-1 text-[10px] font-semibold text-primary">
-                          {distributionMode === 'elastic_pool'
+                          {eachAgentCoverage ? allocationAgentLabel(selectedAgents.find(agent => agent.id === assignment.agentId)) : distributionMode === 'elastic_pool'
                             ? '等待动态领取'
                             : selectedAgents.find(agent => agent.id === assignment.agentId)?.display_name || '固定分配'}
                         </span>
@@ -1822,6 +1887,8 @@ export function OrchestrationComposerDrawer({
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">
                   {editMode
                     ? '同一个计划会继续运行，原有历史保持不变。新配置从下一次生成批次时开始使用。'
+                    : eachAgentCoverage
+                    ? `每个所选节点将分别执行全部 ${keywords.length} 个词，共 ${keywordWorkItemCount} 个工作项。各节点使用当前登录的抖音账号，逐词执行。`
                     : executionMode === 'unattended_plan'
                     ? sequentialSearchEnabled
                       ? `云端仍按关键词排队；同一 Agent 领取后依次执行“${patrolPathLabel}”，中途异常即停止该词。`
@@ -1841,7 +1908,7 @@ export function OrchestrationComposerDrawer({
                         <span className="font-semibold text-foreground">
                           {planMode === 'daily' ? '每天' : '指定日期'} {startTime}
                           {randomOffsetMin > 0 ? ` 后随机延迟 0–${randomOffsetMin} 分钟` : ''}
-                          {` · ${distributionMode === 'elastic_pool' ? '弹性节点池' : '固定分配'} · 每个关键词${sequentialSearchEnabled ? `按“${patrolPathLabel}”串行执行` : '执行 1 次'}`}
+                          {` · ${distributionMode === 'elastic_pool' ? '弹性节点池' : '固定分配'} · 每个关键词${eachAgentCoverage ? '在每个节点各执行 1 次' : sequentialSearchEnabled ? `按“${patrolPathLabel}”串行执行` : '执行 1 次'}`}
                         </span>
                       </div>
                       {includeNegativePatrol && <><div className="mt-1">负面巡查：启动前7天首次采集入库的负面内容，每轮可查；关键词优先，空闲接续，保留处理状态。</div><div className="mt-1 leading-5">巡查处理状态：{negativePatrolStatusSummary(negativePatrolStatuses)}</div></>}

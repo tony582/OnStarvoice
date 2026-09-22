@@ -34,6 +34,8 @@ import {
   allocateKeywordWorkItems,
   computeNextOrchestrationRunAt,
   hashOrchestrationRequest,
+  keywordCoverageItemIdentity,
+  keywordCoverageItemsMatch,
   normalizeOrchestrationRequest,
 } from '../services/capture-orchestration.js';
 import {
@@ -272,6 +274,11 @@ function normalizeCreateRequest(body) {
         '请至少填写一个关键词',
       )};
     }
+    if (normalized.keywordCoverage === 'each_agent') {
+      const selected = normalizedAgentIds(body?.agentIds);
+      if (selected.failure) return selected;
+      normalized.agentIds = selected.agentIds;
+    }
     const request = {
       ...normalized,
       requestKey,
@@ -284,6 +291,7 @@ function normalizeCreateRequest(body) {
         planSnapshot: {
           ...remoteTaskInput.planSnapshot,
           keywords: normalized.keywords,
+          keywordCoverage: normalized.keywordCoverage,
           ...(normalized.taskInput.negativePatrol
             ? {negativePatrol: normalized.taskInput.negativePatrol}
             : {}),
@@ -340,6 +348,7 @@ function normalizeScheduleUpdate(
     && previousNegativePatrol.enabled === true;
   const normalized = normalizeCreateRequest({
     ...safeBody,
+    keywordCoverage: safeBody.keywordCoverage ?? existingPlanSnapshot.keywordCoverage ?? 'shared',
     ...(preservePatrolStatuses ? {negativePatrol: {
       ...requestedNegativePatrol, triageStatuses: previousNegativePatrol.triageStatuses,
     }} : {}),
@@ -960,12 +969,18 @@ router.post(
           )};
         }
         const planSnapshot = request.taskInput.planSnapshot;
-        const total = request.keywords.length;
+        const workItems = request.keywordCoverage === 'each_agent'
+          ? allocateKeywordWorkItems(request).items
+          : request.keywords.map((keyword, ordinal) => ({
+              keyword, ordinal, itemKey: keywordItemKey(keyword, ordinal),
+            }));
+        const total = workItems.length;
         const metadata = {
           orchestrationRequestHash: requestHash,
           draft: true,
           allocationMode: request.allocationMode || 'balanced',
           distributionMode: request.distributionMode || 'fixed_batch',
+          keywordCoverage: request.keywordCoverage,
           executionMode: request.executionMode,
           planSnapshot,
           requestedByUserId: req.user?.id || '',
@@ -1008,9 +1023,8 @@ router.post(
             : '编排任务已创建，等待分配执行节点',
         ]);
         const items = [];
-        for (let index = 0; index < request.keywords.length; index += 1) {
-          const ordinal = index;
-          const keyword = request.keywords[index];
+        for (const workItem of workItems) {
+          const {ordinal, keyword} = workItem;
           const item = await tx.queryOne(`
             INSERT INTO capture_task_items (
               id, tenant_id, task_id, item_key, ordinal, keyword,
@@ -1028,11 +1042,11 @@ router.post(
             crypto.randomUUID(),
             req.tenantId,
             parent.id,
-            keywordItemKey(keyword, ordinal),
+            workItem.itemKey,
             ordinal,
             keyword,
             request.platform,
-            JSON.stringify({keyword, ordinal}),
+            JSON.stringify({keyword, ordinal, ...workItem.metadata}),
           ]);
           items.push(item);
         }
@@ -1049,7 +1063,9 @@ router.post(
           payload: {
             revision: 0,
             platform: parent.platform,
-            keywordCount: items.length,
+            keywordCount: request.keywords.length,
+            itemCount: items.length,
+            keywordCoverage: request.keywordCoverage,
             allocationMode: metadata.allocationMode,
             distributionMode: metadata.distributionMode,
             executionMode: request.executionMode,
@@ -1213,6 +1229,17 @@ router.post(
         agentIds: normalizedAgents.agentIds,
         revision: Number(parent.orchestration_revision || 0),
       });
+      if (planSnapshot.keywordCoverage === 'each_agent') {
+        if (!keywordCoverageItemsMatch({items, keywords: planSnapshot.keywords, agentIds: normalizedAgents.agentIds})) {
+          return sendRequestError(res, requestError(
+            'keyword_coverage_changed', '节点或关键词已变化，请重新生成逐节点采集预览', 409,
+          ));
+        }
+        allocation.items = items.map(item => ({
+          ordinal: item.ordinal, assignedAgentId: item.metadata.pinnedAgentId,
+        }));
+        allocation.groups = normalizedAgents.agentIds.map(agentId => ({agentId}));
+      }
       if (
         parent.metadata?.distributionMode !== 'elastic_pool' &&
         allocation.groups.some(group => group.keywords.length > 30)
@@ -2811,6 +2838,18 @@ router.post(
           parent.id,
           {lock: true},
         );
+        if (parent.metadata?.planSnapshot?.keywordCoverage === 'each_agent') {
+          const selectedAgentIds = normalized.eligibleAgentIds.length
+            ? normalized.eligibleAgentIds
+            : [...new Set(normalized.assignments.map(assignment => assignment.agentId))];
+          const assignmentsById = new Map(normalized.assignments.map(assignment => [assignment.itemId, assignment.agentId]));
+          if (!keywordCoverageItemsMatch({items, keywords: parent.metadata.planSnapshot.keywords, agentIds: selectedAgentIds}) ||
+              items.some(item => assignmentsById.get(String(item.id)) !== item.metadata.pinnedAgentId)) {
+            return {failure: requestError(
+              'keyword_coverage_assignment_mismatch', '逐节点采集必须保留每个关键词的全部目标节点，请重新生成预览', 409,
+            )};
+          }
+        }
         if (currentRevision !== normalized.expectedRevision) {
           const distributionMode = text(
             parent.metadata?.distributionMode,
@@ -4258,6 +4297,7 @@ router.patch(
           keywords: request.keywords,
           agentIds,
           revision: nextScheduleRevision,
+          keywordCoverage: request.keywordCoverage,
         });
         if (
           distributionMode === 'fixed_batch' &&
@@ -4307,21 +4347,18 @@ router.patch(
           FOR UPDATE
         `, [req.tenantId, schedule.id]);
         const previousAgentIds = previousAgentRows.map(row => String(row.agent_id));
-        const assignmentByKeyword = new Map(
-          allocation.items.map(item => [item.keyword, item.assignedAgentId]),
-        );
-        const existingByKeyword = new Map(
-          existingItems.map(item => [String(item.keyword || '').trim(), item]),
+        const existingByIdentity = new Map(
+          existingItems.map(item => [keywordCoverageItemIdentity(item.keyword, safeJson(item.metadata).pinnedAgentId || ''), item]),
         );
         const retainedItemIds = new Set();
-        for (let index = 0; index < request.keywords.length; index += 1) {
-          const keyword = request.keywords[index];
-          const existingItem = existingByKeyword.get(keyword);
+        for (const allocated of allocation.items) {
+          const {keyword, ordinal: index} = allocated;
+          const existingItem = existingByIdentity.get(keywordCoverageItemIdentity(keyword, allocated.metadata?.pinnedAgentId || ''));
           const assignedAgentId = distributionMode === 'fixed_batch'
-            ? assignmentByKeyword.get(keyword) || null
+            ? allocated.assignedAgentId || null
             : null;
           const itemStatus = assignedAgentId ? 'assigned' : 'pending';
-          const itemMetadata = JSON.stringify({keyword, ordinal: index});
+          const itemMetadata = JSON.stringify({keyword, ordinal: index, ...allocated.metadata});
           if (existingItem) {
             retainedItemIds.add(String(existingItem.id));
             await tx.execute(`
@@ -4344,7 +4381,7 @@ router.patch(
                 updated_at = now()
               WHERE id = $9 AND tenant_id = $10 AND task_id = $11
             `, [
-              keywordItemKey(keyword, index),
+              allocated.itemKey,
               index,
               keyword,
               request.platform,
@@ -4372,7 +4409,7 @@ router.patch(
               crypto.randomUUID(),
               req.tenantId,
               parent.id,
-              keywordItemKey(keyword, index),
+              allocated.itemKey,
               index,
               keyword,
               request.platform,
@@ -4464,6 +4501,7 @@ router.patch(
           executionMode: 'unattended_plan',
           allocationMode: 'balanced',
           distributionMode,
+          keywordCoverage: request.keywordCoverage,
           eligibleAgentIds: agentIds,
           claimUnit: distributionMode === 'elastic_pool' ? 'keyword' : 'fixed_batch',
           planSnapshot,
@@ -4500,14 +4538,14 @@ router.patch(
           nextScheduleRevision,
           JSON.stringify({
             current: 0,
-            total: request.keywords.length,
+            total: allocation.items.length,
             phase: nextStatus === 'paused' ? 'paused' : 'scheduled',
             nextRunAt,
           }),
           JSON.stringify({
-            total: request.keywords.length,
+            total: allocation.items.length,
             assigned: distributionMode === 'fixed_batch'
-              ? request.keywords.length
+              ? allocation.items.length
               : 0,
             processed: 0,
             success: 0,
@@ -4549,7 +4587,9 @@ router.patch(
               startTime: schedule.start_time,
               randomOffsetMin: schedule.random_offset_min,
               distributionMode: schedule.distribution_mode,
-              keywordCount: existingItems.length,
+              keywordCount: new Set(existingItems.map(item => item.keyword)).size,
+              itemCount: existingItems.length,
+              keywordCoverage: safeJson(schedule.plan_snapshot).keywordCoverage || 'shared',
               agentIds: previousAgentIds,
             },
             next: {
@@ -4560,6 +4600,8 @@ router.patch(
               randomOffsetMin: planSnapshot.randomOffsetMin,
               distributionMode,
               keywordCount: request.keywords.length,
+              itemCount: allocation.items.length,
+              keywordCoverage: request.keywordCoverage,
               agentIds,
               nextRunAt,
             },
@@ -4573,7 +4615,7 @@ router.patch(
         return {
           schedule: responseSchedule,
           parent: parentUpdate,
-          itemCount: request.keywords.length,
+          itemCount: allocation.items.length,
           agentIds,
           reactivated: schedule.status === 'completed',
         };

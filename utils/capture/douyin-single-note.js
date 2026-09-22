@@ -11,7 +11,6 @@ import { PAGE_TYPE, SYNC_TYPE } from "../constants.js";
 import {
   parseInteractionCount,
   cleanText,
-  extractBloggerId,
   extractNoteId,
 } from "../helpers.js";
 import { wait, waitUntil } from "../scroll.js";
@@ -27,6 +26,8 @@ import {
 } from "./shared/detail-dom.js";
 import {
   isDouyinOwnProfileUrl,
+  isDouyinNonAuthorElement,
+  extractDouyinDomAuthorInfo,
   isDouyinShellAuthorName,
   normalizeDouyinAuthorName,
   pickDouyinAuthorName,
@@ -1621,209 +1622,8 @@ function getNodeArea(node) {
   return Math.max(rect.width * rect.height, 1);
 }
 
-function extractDouyinAuthorInfo(detailRoot) {
-  const authorCardScope = findDouyinAuthorCardScope(detailRoot);
-  const candidateLink =
-    findPreferredDouyinAuthorLink(authorCardScope || detailRoot) ||
-    findPreferredDouyinAuthorLink(detailRoot) ||
-    getFirstMatch(
-      DOUYIN_DOM_PROFILE.noteDetail.fields.authorLink,
-      authorCardScope || detailRoot,
-    ) ||
-    null;
-  const linkElement = isRejectedDouyinAuthorElement(candidateLink)
-    ? null
-    : candidateLink;
-
-  let nameText =
-    findPreferredDouyinAuthorName(authorCardScope || detailRoot) ||
-    getText(
-      DOUYIN_DOM_PROFILE.noteDetail.fields.authorName,
-      authorCardScope || detailRoot,
-    ) ||
-    cleanText(linkElement?.textContent || "");
-
-  const url = normalizeUrl(linkElement?.getAttribute("href") || linkElement?.href || "");
-  if (!cleanText(nameText)) {
-    nameText = findDouyinAuthorNameByUrl(url, authorCardScope || detailRoot);
-  }
-
-  const name = normalizeDouyinAuthorName(nameText);
-  const userId = extractBloggerId(url) || "";
-
-  return {
-    name,
-    userId,
-    url,
-  };
-}
-
-function findDouyinAuthorCardScope(detailRoot = null) {
-  const scopes = [
-    detailRoot,
-    resolvePotentialDouyinMetricsScope(detailRoot),
-    document,
-  ].filter((node) => node instanceof Element || node === document);
-
-  const candidates = [];
-
-  scopes.forEach((scope) => {
-    try {
-      scope.querySelectorAll('a[href*="/user/"]').forEach((link) => {
-        if (!(link instanceof Element) || !isElementVisible(link)) return;
-        if (isRejectedDouyinAuthorElement(link)) return;
-        const rect = link.getBoundingClientRect();
-        if (rect.left < window.innerWidth * 0.5) return;
-        if (rect.top < 0 || rect.top > window.innerHeight * 0.45) return;
-
-        let current = link.parentElement;
-        for (let depth = 0; current && depth < 5; depth += 1) {
-          const text = cleanText(current.innerText || current.textContent || "");
-          const currentRect = current.getBoundingClientRect();
-          if (
-            text &&
-            text.length <= 200 &&
-            /粉丝/.test(text) &&
-            /获赞/.test(text) &&
-            currentRect.width > 120 &&
-            currentRect.width < 420 &&
-            currentRect.height > 40 &&
-            currentRect.height < 220
-          ) {
-            candidates.push(current);
-            break;
-          }
-          current = current.parentElement;
-        }
-      });
-    } catch {}
-  });
-
-  const ranked = Array.from(new Set(candidates))
-    .map((node) => ({
-      node,
-      area: Math.max(node.getBoundingClientRect().width * node.getBoundingClientRect().height, 1),
-      top: node.getBoundingClientRect().top,
-    }))
-    .sort((left, right) => {
-      if (left.top !== right.top) {
-        return left.top - right.top;
-      }
-      return left.area - right.area;
-    });
-
-  return ranked[0]?.node || null;
-}
-
-function findPreferredDouyinAuthorLink(detailRoot) {
-  const scope = resolvePotentialDouyinMetricsScope(detailRoot);
-  const candidates = [];
-  [scope, detailRoot, document].forEach((context) => {
-    if (!(context instanceof Element || context === document)) {
-      return;
-    }
-    try {
-      context.querySelectorAll('a[href*="/user/"]').forEach((node) => {
-        if (!(node instanceof Element) || !isElementVisible(node)) return;
-        if (isRejectedDouyinAuthorElement(node)) return;
-        if (!isLikelyDouyinUserEntry(node)) return;
-        const actionable =
-          node.closest?.('a[href*="/user/"]') ||
-          node.closest?.('[role="button"], button, [tabindex]') ||
-          node;
-        if (actionable instanceof Element && isElementVisible(actionable)) {
-          candidates.push(actionable);
-        }
-      });
-    } catch {}
-  });
-
-  const ranked = Array.from(new Set(candidates))
-    .map((node) => ({
-      node,
-      score: scoreDouyinAuthorEntryCandidate(node),
-    }))
-    .sort((left, right) => right.score - left.score);
-
-  return ranked[0]?.node || null;
-}
-
-function findPreferredDouyinAuthorName(detailRoot) {
-  const preferredLink = findPreferredDouyinAuthorLink(detailRoot);
-  if (!preferredLink) {
-    return "";
-  }
-
-  const textCandidates = [
-    normalizeDouyinAuthorName(preferredLink.textContent || ""),
-    normalizeDouyinAuthorName(
-      preferredLink.querySelector?.('[data-e2e="feed-video-nickname"]')?.textContent || "",
-    ),
-  ].filter(Boolean);
-
-  return textCandidates[0] || "";
-}
-
-function findDouyinAuthorNameByUrl(authorUrl = "", detailRoot = null) {
-  const normalizedUrl = normalizeUrl(authorUrl);
-  if (!normalizedUrl) {
-    return "";
-  }
-
-  const urlCandidates = new Set([normalizedUrl]);
-  try {
-    const parsed = new URL(normalizedUrl);
-    urlCandidates.add(parsed.pathname);
-  } catch {}
-
-  const scopes = [detailRoot, document].filter(
-    (node) => node instanceof Element || node === document,
-  );
-
-  for (const scope of scopes) {
-    for (const candidate of urlCandidates) {
-      if (!candidate) continue;
-      let matchedLinks = [];
-      try {
-        matchedLinks = Array.from(scope.querySelectorAll('a[href*="/user/"]')).filter(
-          (node) => {
-            if (!(node instanceof Element) || !isElementVisible(node)) return false;
-            const href = normalizeUrl(node.getAttribute("href") || node.href || "");
-            return href === normalizedUrl || href.includes(candidate);
-          },
-        );
-      } catch {}
-
-      for (const link of matchedLinks) {
-        if (isRejectedDouyinAuthorElement(link)) continue;
-        const directText = normalizeDouyinAuthorName(link.textContent || "");
-        if (directText) {
-          return directText;
-        }
-
-        let current = link.parentElement;
-        for (let depth = 0; current && depth < 4; depth += 1) {
-          const textCandidates = Array.from(
-            current.querySelectorAll('a[href*="/user/"], span, div, p, h1, h2, h3'),
-          )
-            .map((node) => normalizeDouyinAuthorName(node.textContent || ""))
-            .filter((text) => {
-              if (!text) return false;
-              if (text.length > 32) return false;
-              if (/(粉丝|获赞|关注|相关推荐|评论|\d{2}:\d{2})/.test(text)) return false;
-              return true;
-            });
-
-          if (textCandidates[0]) {
-            return textCandidates[0];
-          }
-          current = current.parentElement;
-        }
-      }
-    }
-  }
-
-  return "";
+export function extractDouyinAuthorInfo(detailRoot) {
+  return extractDouyinDomAuthorInfo(detailRoot, {isVisible: isElementVisible});
 }
 
 function resolveDouyinNoteBloggerMetrics({
@@ -2599,7 +2399,8 @@ function isRejectedDouyinAuthorElement(node) {
     node.getAttribute?.("href") ||
     node.closest?.('a[href*="/user/"]')?.getAttribute?.("href") ||
     "";
-  return isDouyinShellAuthorName(text) || isDouyinOwnProfileUrl(href);
+  return isDouyinNonAuthorElement(node) ||
+    isDouyinShellAuthorName(text) || isDouyinOwnProfileUrl(href);
 }
 
 function isLikelyRightRailTarget(node) {

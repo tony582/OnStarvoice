@@ -32,8 +32,7 @@ import {
   countMissingMetric,
 } from "./stage-diagnostics.js";
 import {
-  isDouyinOwnProfileUrl,
-  normalizeDouyinAuthorName,
+  extractDouyinDomAuthorInfo,
 } from "./douyin-author.js";
 import {
   assertNoDouyinSearchServiceAbnormalPage,
@@ -706,8 +705,9 @@ function extractDouyinSearchCards(searchRoot) {
 
     const title = resolveSearchCardTitle(card, noteId, index);
     const coverImageUrl = resolveSearchCardCover(card);
-    const author = resolveSearchCardAuthor(card);
-    const authorProfileUrl = resolveSearchCardAuthorProfileUrl(card, author);
+    const authorInfo = resolveSearchCardAuthorInfo(card);
+    const author = authorInfo.name;
+    const authorProfileUrl = authorInfo.url;
     const cardMedia = collectMediaUrlsFromElement(card);
     const reverseMatchHints = buildReverseMatchHints({
       noteId,
@@ -1293,130 +1293,10 @@ function resolveSearchCardCover(card) {
   return normalizeUrl(hit?.[0] || "");
 }
 
-function resolveSearchCardAuthor(card) {
-  const direct = normalizeDouyinAuthorName(
-    getText(DOUYIN_DOM_PROFILE.searchResults.cards.fields.author, card),
-  );
-  if (direct) {
-    return direct;
-  }
-
-  const text = cleanText(card?.innerText || "");
-  const match = text.match(/@([^\s@·#]+)/);
-  return normalizeDouyinAuthorName(match?.[1] || "");
-}
-
-function resolveSearchCardAuthorProfileUrl(card, author = "") {
-  if (!normalizeDouyinAuthorName(author)) {
-    return "";
-  }
-  const authorNodes = collectSearchCardAuthorNodes(card);
-  const candidates = [];
-  const normalizedAuthor = normalizeComparableAuthor(author);
-
-  const pushLinkCandidate = (node, baseScore = 0) => {
-    if (!(node instanceof Element)) return;
-    const rawUrl =
-      node.getAttribute?.("href") ||
-      node.getAttribute?.("data-href") ||
-      node.getAttribute?.("data-url") ||
-      node.href ||
-      "";
-    const url = normalizeDouyinAuthorProfileUrl(rawUrl);
-    if (!url) return;
-
-    const text = normalizeComparableAuthor(node.textContent || "");
-    const authorScore =
-      normalizedAuthor && text && text.includes(normalizedAuthor) ? 20 : 0;
-    candidates.push({
-      url,
-      score: baseScore + authorScore,
-    });
-  };
-
-  authorNodes.forEach((node) => {
-    if (!(node instanceof Element)) return;
-    pushLinkCandidate(node, 80);
-    pushLinkCandidate(
-      node.closest?.(
-        'a[href*="/user/"],a[data-href*="/user/"],a[data-url*="/user/"]',
-      ),
-      70,
-    );
-    node
-      .querySelectorAll?.(
-        'a[href*="/user/"],a[data-href*="/user/"],a[data-url*="/user/"]',
-      )
-      .forEach((link) => pushLinkCandidate(link, 65));
+export function resolveSearchCardAuthorInfo(card) {
+  return extractDouyinDomAuthorInfo(card, {
+    nameSelectors: DOUYIN_DOM_PROFILE.searchResults.cards.fields.author,
   });
-
-  card
-    ?.querySelectorAll?.(
-      'a[href*="/user/"],a[data-href*="/user/"],a[data-url*="/user/"]',
-    )
-    .forEach((link) => pushLinkCandidate(link, 40));
-
-  const deduped = new Map();
-  candidates.forEach((candidate) => {
-    const previous = deduped.get(candidate.url);
-    if (!previous || candidate.score > previous.score) {
-      deduped.set(candidate.url, candidate);
-    }
-  });
-
-  const bestCandidate = Array.from(deduped.values()).sort(
-    (left, right) => right.score - left.score,
-  )[0];
-
-  return bestCandidate?.url || "";
-}
-
-function collectSearchCardAuthorNodes(card) {
-  if (!card) return [];
-
-  const nodes = [];
-  const seen = new Set();
-  const push = (node) => {
-    if (!(node instanceof Element) || seen.has(node)) return;
-    seen.add(node);
-    nodes.push(node);
-  };
-
-  (DOUYIN_DOM_PROFILE.searchResults.cards.fields.author || []).forEach(
-    (selector) => {
-      try {
-        if (card.matches?.(selector)) {
-          push(card);
-        }
-        card.querySelectorAll?.(selector).forEach(push);
-      } catch {}
-    },
-  );
-
-  return nodes;
-}
-
-function normalizeDouyinAuthorProfileUrl(raw) {
-  const normalized = normalizeUrl(raw);
-  if (!normalized || isDouyinOwnProfileUrl(normalized)) return "";
-
-  try {
-    const parsed = new URL(normalized, "https://www.douyin.com");
-    const match = parsed.pathname.match(/\/user\/([^/?#]+)/i);
-    const userId = match?.[1] || "";
-    if (!userId) return "";
-    return `https://www.douyin.com/user/${userId}`;
-  } catch {
-    const match = normalized.match(/\/user\/([^/?#]+)/i);
-    return match?.[1] ? `https://www.douyin.com/user/${match[1]}` : "";
-  }
-}
-
-function normalizeComparableAuthor(value) {
-  return cleanText(value || "")
-    .replace(/^@/, "")
-    .replace(/\s+/g, "")
-    .toLowerCase();
 }
 
 export function resolveSearchCardPublishDate(card) {

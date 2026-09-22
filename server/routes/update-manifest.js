@@ -3,12 +3,30 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.10',
+  latestVersion: '0.4.11',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-12',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.10-20260912.zip',
+  releaseDate: '2026-09-22',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.11-20260922.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.11',
+      releaseDate: '2026-09-22',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {title: '抖音正文提及不再冒充发布者', desc: '从作品发布者区域配对提取作者名称与主页，避免正文 @ 官方账号、评论或推荐账号被当作作者，减少普通用户帖子被误排除。需更新 Extension。'},
+          ],
+        },
+        {
+          tag: '新增',
+          notes: [
+            {title: '抖音关键词逐节点采集', desc: '调度中心可让每个所选浏览器节点分别搜索全部所选关键词，按关键词和节点独立记录进度，失败不改派到其他账号；新增壁纸关键词快捷选择。'},
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.10',
       releaseDate: '2026-09-12',

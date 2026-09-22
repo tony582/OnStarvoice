@@ -269,6 +269,7 @@ function itemAssignedAgentId(
   executions: OrchestrationExecutionRecord[],
   attempts: OrchestrationAttemptRecord[],
 ) {
+  if (item.metadata?.pinnedAgentId) return String(item.metadata.pinnedAgentId)
   if (item.assigned_agent_id) return item.assigned_agent_id
   const execution = executions.find(candidate => executionItemIds(candidate).includes(item.id))
   if (execution) return executionAgentId(execution)
@@ -467,6 +468,7 @@ export function OrchestrationDetailWorkspace({
   const detailFinal = FINAL_ORCHESTRATION_STATUSES.has(String(detail?.orchestration.status || ''))
   const elasticPool = metadata.distributionMode === 'elastic_pool'
     || detail?.schedule?.distribution_mode === 'elastic_pool'
+  const eachAgentCoverage = objectRecord(metadata.planSnapshot).keywordCoverage === 'each_agent'
   const negativePatrol = detail?.orchestration.feature_key === 'negative_post_patrol'
     || detail?.orchestration.metadata?.workflow === 'negative_post_patrol'
   const watchedContentPatrol = detail?.orchestration.feature_key === 'watched_content_patrol'
@@ -813,7 +815,9 @@ export function OrchestrationDetailWorkspace({
         : blockingStatusText
           ? `等待原执行结算 · ${attemptLabel}`
           : `工作项已释放 · 恢复 ${attemptLabel}`
-      const message = commandStatus
+      const message = item.metadata?.pinnedAgentId
+        ? `关键词「${keywordForItem(item)}」保留在目标节点，等待该节点满足恢复条件；其他节点的结果不会替代这一项。`
+        : commandStatus
         ? `原执行指令已处于“${COMMAND_STATUS_LABELS[commandStatus] || commandStatus}”；服务端会在该指令结算后再允许其他 Agent 领取这个${workUnit}。`
         : blockingStatusText
           ? `该${workUnit}已进入恢复状态，但原执行尚未满足服务端接力条件；已采集结果继续保留。`
@@ -826,7 +830,7 @@ export function OrchestrationDetailWorkspace({
         message,
         failureMessage: dataMessage(itemError),
         waitUntil,
-        agentLabel: `原 Agent：${agentName(agentsById.get(String(recovery.sourceAgentId || item.assigned_agent_id || '')))}`,
+        agentLabel: `${item.metadata?.pinnedAgentId ? '目标节点' : '原 Agent'}：${agentName(agentsById.get(String(item.metadata?.pinnedAgentId || recovery.sourceAgentId || item.assigned_agent_id || '')))}`,
         commandStatus,
         blockingStatusText,
       })
@@ -1275,7 +1279,7 @@ export function OrchestrationDetailWorkspace({
   const patrolPathLabel = searchPasses
     .map(value => value === 'all' ? '综合' : CONTENT_TYPE_LABELS[value] || value)
     .join(' → ')
-  const idleHandoffAllowed = elasticPool || recoveryPolicy.allowIdleAgentHandoff !== false
+  const idleHandoffAllowed = !eachAgentCoverage && (elasticPool || recoveryPolicy.allowIdleAgentHandoff !== false)
   const automaticRecoveryAllowed = elasticPool
     && metadata.automaticRetryDisabled !== true
     && recoveryPolicy.allowIdleAgentHandoff !== false
@@ -1542,7 +1546,7 @@ export function OrchestrationDetailWorkspace({
                     </span>
                   </div>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                    {automaticKeywordRecoveryActive
+                    {eachAgentCoverage ? '每个节点分别负责自己的关键词；未完成项只会等待原目标节点，不会改派到其他账号。' : automaticKeywordRecoveryActive
                       ? '技术失败会按关键词自动重试，并优先交给近期更稳定的空闲 Agent；新结果仍回写当前任务。'
                       : orchestrationFinal && elasticPool
                         ? '该批次已结算；可先查看每次尝试的真实错误，再选择在当前任务内重试或新建补采任务。'
@@ -1552,7 +1556,7 @@ export function OrchestrationDetailWorkspace({
               </div>
               {automaticKeywordRecoveryActive ? (
                 <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
-                  {keywordRetryCandidates.length > 0
+                  {eachAgentCoverage ? '等待对应节点恢复并领取' : keywordRetryCandidates.length > 0
                     ? '等待空闲 Agent 心跳领取；真正下发后会显示目标 Agent 和命令状态'
                     : '当前没有兼容的空闲 Agent；页面每 5 秒刷新一次真实状态'}
                 </span>
@@ -1841,7 +1845,7 @@ export function OrchestrationDetailWorkspace({
                   <div>上轮状态：<strong className="font-semibold text-foreground">{schedule.last_run_status ? statusLabel(schedule.last_run_status) : '尚未运行'}</strong></div>
                 </div>
                 <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
-                  {sequentialSearchEnabled
+                  {eachAgentCoverage ? `每个关键词在每个所选节点各执行一次${sequentialSearchEnabled ? `，分别按“${patrolPathLabel}”串行采集` : ''}。` : sequentialSearchEnabled
                     ? `每个关键词由同一 Agent 按“${patrolPathLabel}”串行完成；每次搜索采集后增强新增内容，不自动刷新补搜。`
                     : '每个计划时间，每个关键词执行 1 次。'} 计划只保存在云端，不会覆盖任一 Extension 的本地无人值守计划。
                 </p>
@@ -1877,7 +1881,7 @@ export function OrchestrationDetailWorkspace({
               <span className="block text-[10px] text-muted-foreground">{scheduleTemplate ? (elasticPool ? '领取策略' : '固定分配') : '工作项状态'}</span>
               <span className="block text-xs font-bold">
                 {scheduleTemplate
-                  ? elasticPool
+                  ? eachAgentCoverage ? '每个节点采集全部关键词' : elasticPool
                     ? '空闲节点逐个领取'
                     : `${sortedItems.length} 个关键词已分配`
                   : [
@@ -1904,7 +1908,7 @@ export function OrchestrationDetailWorkspace({
               <h3 className="mt-1 text-sm font-bold text-foreground">{scheduleTemplate ? '计划分配' : resultPresentation ? '本次任务结果' : '父任务进度'}</h3>
               <p className="mt-1 text-xs text-muted-foreground">
                 {scheduleTemplate
-                  ? elasticPool
+                  ? eachAgentCoverage ? '每个关键词在每个所选节点各执行一次；各节点使用当前登录的抖音账号，分别记录完成情况。' : elasticPool
                     ? '这里展示后续每轮都会沿用的关键词和弹性节点池；实际领取量由节点空闲速度决定。'
                     : '这里展示后续每轮都会沿用的关键词和 Agent 分配。'
                   : resultPresentation
