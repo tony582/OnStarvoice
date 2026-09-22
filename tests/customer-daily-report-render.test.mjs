@@ -22,14 +22,15 @@ test('every report export labels verified lower bounds and suppresses incomplete
     JSON.stringify(buildFeishuDailyDocumentPlan(snapshot)),
     JSON.stringify(buildFeishuDailyPost({snapshot, documentUrl: 'https://example.test/doc', imageKey: 'img_test'}))];
   for (const value of outputs) {
-    assert.ok(value.includes('至少 215（分享数未取得）'));
+    assert.ok(value.includes('至少 215'));
+    assert.ok(!value.includes('分享数未取得'));
     assert.ok(value.includes('暂无可比数据'));
     assert.ok(!value.includes('25.7%'));
   }
   const workbook = buildCustomerDailyReportWorkbook(snapshot);
   const reopened = new workbook.constructor();
   await reopened.xlsx.load(await workbook.xlsx.writeBuffer());
-  assert.equal(reopened.getWorksheet('高热负面').getCell('D5').value, '至少 215（分享数未取得）');
+  assert.equal(reopened.getWorksheet('高热负面').getCell('D5').value, '至少 215');
   assert.equal(reopened.getWorksheet('高热负面').getCell('E5').value, '暂无可比数据');
   assert.deepEqual(snapshot, before);
 });

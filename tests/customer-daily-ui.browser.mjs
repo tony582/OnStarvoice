@@ -110,7 +110,7 @@ try {
   assert.equal(await handlingTable.getByRole('rowheader', {name: '2026/9/6', exact: true}).count(), 0);
   assert.equal(await collectionTable.getByRole('rowheader', {name: '2026/9/5', exact: true}).count(), 0);
   await page.getByText(/处理状态：飞书表 · 202609-007/).waitFor();
-  await page.getByText('小红书｜热度 至少 215（分享数未取得）｜较昨日 暂无可比数据', {exact: true}).waitFor();
+  await page.getByText('小红书｜热度 至少 215｜较昨日 暂无可比数据', {exact: true}).waitFor();
   assert.equal(await page.getByRole('checkbox').count(), 0);
   assert.equal(await page.getByRole('button', {name: '发送更正版'}).isEnabled(), true);
   assert.equal(await page.getByRole('button', {name: '发送邮件', exact: true}).isEnabled(), true);
@@ -185,7 +185,7 @@ try {
   await explicitContext.close();
 
   const narrow = await open({width: 390, mobile: true});
-  await narrow.page.getByText('小红书｜热度 至少 215（分享数未取得）｜较昨日 暂无可比数据', {exact: true}).waitFor();
+  await narrow.page.getByText('小红书｜热度 至少 215｜较昨日 暂无可比数据', {exact: true}).waitFor();
   await narrow.page.getByRole('button', {name: /日报日历/}).click();
   await narrow.page.getByRole('button', {name: /2026-09-25，法定休假/}).waitFor();
   await narrow.page.screenshot({path: join(output, 'mobile.png'), fullPage: true});
