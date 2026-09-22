@@ -1,6 +1,6 @@
 import {
   customerDailySections, isGroupedDailyReport, customerDailySummaryBasis, customerDailyPostStatus,
-  customerDailyPostPlatform,
+  customerDailyPostPlatform, customerDailyPostHeat,
   customerDailyPostComparison,
   customerDailyColdEmpty,
   customerDailyColdTitle,
@@ -31,7 +31,7 @@ function nonNegativeInteger(value) {
 }
 
 function heatLabel(post) {
-  return nonNegativeInteger(post.heat) ? String(post.heat) : '待核实';
+  return nonNegativeInteger(post.heat) ? customerDailyPostHeat(post) : '待核实';
 }
 
 function comparisonLabel(post) {

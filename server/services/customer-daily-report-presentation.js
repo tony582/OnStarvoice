@@ -57,8 +57,17 @@ export function customerDailyPostPlatform(post) {
 }
 
 export function customerDailyPostComparison(post) {
+  if (post.heatIsLowerBound) return '较昨日 暂无可比数据';
   const comparison = String(post.comparisonText || '暂无对比').replace(/^较昨日\s*[:：]?\s*/, '').trim();
   return `较昨日 ${comparison || '暂无对比'}`;
+}
+
+export function customerDailyPostHeat(post) {
+  if (typeof post.heat !== 'number' || !Number.isFinite(post.heat) || post.heat < 0) return '待核实';
+  if (!post.heatIsLowerBound) return String(post.heat);
+  const labels = {likes: '点赞数', comments_count: '评论数', collects: '收藏数', shares: '分享数'};
+  const missing = [...new Set(post.missingMetrics || [])].map(key => labels[key]).filter(Boolean);
+  return `至少 ${post.heat}（${missing.length ? missing.join('、') : '部分互动数'}未取得）`;
 }
 
 export function customerDailyColdEmpty(snapshot) {

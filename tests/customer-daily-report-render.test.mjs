@@ -3,12 +3,36 @@ import test from 'node:test';
 import { buildCustomerDailyReportWorkbook, renderCustomerDailyReportHtml, renderCustomerDailyReportText, renderCustomerDailyReportMessageHtml, renderCustomerDailyReportMessageText } from '../server/services/customer-daily-report-render.js';
 import { customerDailySummaryRows, customerDailyPostComparison, customerDailyColdTitle, customerDailyPostStatus } from '../server/services/customer-daily-report-presentation.js';
 import {collectionHandlingSnapshot} from './fixtures/customer-daily-v5.mjs';
+import {buildFeishuDailyDocumentPlan} from '../server/services/feishu-daily-report.js';
+import {buildFeishuDailyPost} from '../server/services/feishu-daily-report-message.js';
 
 function fixture() {
   const counts = {monitor: 126, sdb: 112, positive: 16, neutral: 75, negative: 18, cold: 8, inProgress: null, processed: null};
   const post = {title: '客户讨论 <更新> & 服务', platform: 'xiaohongshu', url: 'https://example.test/post?a=1&b=2', heat: 320, comparisonText: '', observedAt: '2026-09-07T12:00:00Z', previousObservedAt: '2026-09-06T12:00:00Z', quality: 'legacy_unverified', timeSource: 'ingested_at', stale: true, status: 'unavailable'};
   return {tenantName: '示例客户', reportDate: '2026-09-07', mode: 'formal', cutoffAt: '2026-09-07T16:00:00Z', assessedAt: '2026-09-08T01:00:00Z', summary: {day: {...counts}, mtd: {...counts}}, highHeat: [post], coldMarked: [{...post, markedAt: '2026-09-07T11:00:00Z'}], warnings: [{message: '内部核对事项：观测质量与标记记录待确认', blocking: true}], evidence: {cold: {coverageComplete: false}}};
 }
+
+test('every report export labels verified lower bounds and suppresses incomplete growth percentages', async () => {
+  const snapshot = fixture();
+  snapshot.highHeat[0] = {...snapshot.highHeat[0], heat: 215, heatIsLowerBound: true,
+    missingMetrics: ['shares'], comparisonText: '↑25.7%'};
+  const before = structuredClone(snapshot);
+  const outputs = [renderCustomerDailyReportHtml(snapshot), renderCustomerDailyReportHtml(snapshot, {email: true}),
+    renderCustomerDailyReportText(snapshot), renderCustomerDailyReportMessageHtml(snapshot), renderCustomerDailyReportMessageText(snapshot),
+    JSON.stringify(buildFeishuDailyDocumentPlan(snapshot)),
+    JSON.stringify(buildFeishuDailyPost({snapshot, documentUrl: 'https://example.test/doc', imageKey: 'img_test'}))];
+  for (const value of outputs) {
+    assert.ok(value.includes('至少 215（分享数未取得）'));
+    assert.ok(value.includes('暂无可比数据'));
+    assert.ok(!value.includes('25.7%'));
+  }
+  const workbook = buildCustomerDailyReportWorkbook(snapshot);
+  const reopened = new workbook.constructor();
+  await reopened.xlsx.load(await workbook.xlsx.writeBuffer());
+  assert.equal(reopened.getWorksheet('高热负面').getCell('D5').value, '至少 215（分享数未取得）');
+  assert.equal(reopened.getWorksheet('高热负面').getCell('E5').value, '暂无可比数据');
+  assert.deepEqual(snapshot, before);
+});
 
 test('customer exports contain the summary and two linked lists, excluding operational notes and computed negative footer', async () => {
   const snapshot = fixture();

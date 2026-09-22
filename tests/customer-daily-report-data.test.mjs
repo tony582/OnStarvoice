@@ -23,6 +23,15 @@ function observation(n, heat, time, patch = {}) {
     payload: {customerDailyMetricEvidence: {version: 1, observedAt: time, timeSource: 'capture_timestamp',
       metrics: Object.fromEntries(fields.map(k => [k, {value: values[k], measured: true, reason: 'observed'}])), allMeasured: true}}, ...patch};
 }
+function partialObservation(n, values, time, missing = ['shares']) {
+  const row = observation(n, 300, time);
+  Object.assign(row, values);
+  row.payload.customerDailyMetricEvidence.allMeasured = false;
+  row.payload.customerDailyMetricEvidence.metrics = Object.fromEntries(fields.map(key => [key,
+    missing.includes(key) ? {value: null, measured: false, reason: 'not_observed'} : {value: row[key], measured: true, reason: 'observed'},
+  ]));
+  return row;
+}
 function event(n, previous, next = 'negative_cold', patch = {}) {
   return {id: ID(n + 800), target_id: ID(n), created_at: d(7), action: 'record.triage_updated', metadata: {previousStatus: previous, nextStatus: next}, ...patch};
 }
@@ -62,6 +71,61 @@ test('Shanghai report date defaults to yesterday; realtime ends now and rolls ac
   assert.equal(dailyPeriod(undefined, '2026-08-31T16:00:00Z').reportDate, '2026-08-31');
   assert.equal(dailyPeriod(undefined, '2025-12-31T16:00:00Z').reportDate, '2025-12-31');
   for (const invalid of ['2026-02-30', '2026-9-7', 'junk', '2026-09-09']) assert.throws(() => dailyPeriod(invalid, now));
+});
+
+test('verified partial interactions admit the reported XHS post without inventing shares or daily growth', async () => {
+  const endpoint = partialObservation(1, {likes: 27, comments_count: 180, collects: 8, shares: 900}, d(7));
+  const before = structuredClone(endpoint);
+  const measured = assessCustomerDailyObservation(endpoint);
+  assert.equal(measured.heat, 215);
+  assert.equal(measured.metrics.shares, null, 'a stored fallback is not measured interaction');
+  assert.equal(measured.heatIsLowerBound, true);
+  assert.equal(measured.comparable, false);
+  const report = await collectCustomerDailyReport({...opts, db: fakeDb({heatPosts: [record(1)],
+    observations: [endpoint, observation(1, 171, d(6), {id: ID(601)})]})});
+  assert.equal(report.highHeat.length, 1);
+  assert.equal(report.highHeat[0].heat, 215);
+  assert.equal(report.highHeat[0].heatText, '至少 215（分享数未取得）');
+  assert.equal(report.highHeat[0].comparisonText, '暂无可比数据');
+  assert.equal(report.highHeat[0].previousHeat, null);
+  assert.deepEqual(report.evidence.heat.missingRecordIds, []);
+  assert.ok(report.warnings.some(w => w.code === 'heat_lower_bound'));
+  assert.ok(!report.warnings.some(w => w.code === 'heat_time_unverified'));
+  assert.deepEqual(endpoint, before);
+});
+
+test('partial threshold is inclusive, preserves below-threshold uncertainty, and retains date boundaries', async () => {
+  const at199 = partialObservation(1, {likes: 11, comments_count: 180, collects: 8, shares: 900}, d(7));
+  const at200 = partialObservation(2, {likes: 12, comments_count: 180, collects: 8, shares: 900}, d(7));
+  const excludedDate = partialObservation(3, {likes: 27, comments_count: 180, collects: 8, shares: 0}, d(7));
+  const afterCutoff = partialObservation(4, {likes: 27, comments_count: 180, collects: 8, shares: 0}, '2026-09-07T16:00:00Z');
+  const report = await collectCustomerDailyReport({...opts, db: fakeDb({
+    heatPosts: [record(1), record(2), record(3, {published_ts: '2026-08-31T15:59:59Z'}), record(4)],
+    observations: [at199, at200, excludedDate, afterCutoff],
+  })});
+  assert.deepEqual(report.highHeat.map(p => [p.recordId, p.heat]), [[ID(2), 200]]);
+  const stale = await collectCustomerDailyReport({...opts, db: fakeDb({heatPosts: [record(1)],
+    observations: [at199, observation(1, 320, d(6), {id: ID(601)})]})});
+  assert.equal(stale.highHeat[0].heat, 320, 'an incomplete subset cannot prove a fall below 200');
+  assert.equal(stale.highHeat[0].stale, true);
+});
+
+test('lower bounds require matching service evidence and never admit legacy or wholly unknown counts', () => {
+  const row = partialObservation(1, {likes: 27, comments_count: 180, collects: 8, shares: 0}, d(7));
+  for (const mutate of [
+    value => { value.payload.customerDailyMetricEvidence.metrics.likes.value = 270; },
+    value => { value.payload.customerDailyMetricEvidence.metrics.shares.value = 0; },
+    value => { delete value.payload.customerDailyMetricEvidence.metrics.likes; },
+    value => { value.payload.customerDailyMetricEvidence.allMeasured = true; },
+    value => { delete value.payload.customerDailyMetricEvidence; },
+  ]) {
+    const invalid = structuredClone(row); mutate(invalid);
+    assert.equal(assessCustomerDailyObservation(invalid).heat, null);
+  }
+  assert.equal(assessCustomerDailyObservation(partialObservation(1, {likes: 900}, d(7), fields)).heat, null);
+  const missingComments = partialObservation(1, {likes: 200, comments_count: 900, collects: 0, shares: 0}, d(7), ['comments_count']);
+  assert.equal(assessCustomerDailyObservation(missingComments).heat, 200);
+  assert.equal(assessCustomerDailyObservation(missingComments).metrics.comments_count, null);
 });
 
 test('collection day and MTD retain customer-visible first-insert counts once and subtract customer non-monitor decisions', async () => {

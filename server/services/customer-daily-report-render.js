@@ -2,7 +2,7 @@ import ExcelJS from 'exceljs';
 import {
   customerDailySummaryHeaders, isMonthlyDailyReport,
   customerDailySummaryRows as summaryRows,
-  customerDailyPostPlatform as sourceLabel, customerDailyPostComparison, customerDailyColdEmpty as coldEmpty,
+  customerDailyPostPlatform as sourceLabel, customerDailyPostComparison, customerDailyPostHeat, customerDailyColdEmpty as coldEmpty,
   customerDailyColdTitle, customerDailyColdPostLabel, isHandlingDailyReport, isCollectionDailyReport, isCollectionHandlingDailyReport, isGroupedDailyReport, customerDailySummaryBasis, customerDailySections, customerDailyTables, customerDailyPostStatus, customerDailyTableCaption,
 } from './customer-daily-report-presentation.js';
 
@@ -48,7 +48,7 @@ export function customerDailyReportNotes(snapshot) {
   ];
 }
 function heatDescription(post, snapshot) {
-  return `热度 ${n(post.heat)}｜${oneLine(customerDailyPostComparison(post))}${isGroupedDailyReport(snapshot) ? `｜处理状态：${oneLine(customerDailyPostStatus(post))}` : ''}`;
+  return `热度 ${customerDailyPostHeat(post)}｜${oneLine(customerDailyPostComparison(post))}${isGroupedDailyReport(snapshot) ? `｜处理状态：${oneLine(customerDailyPostStatus(post))}` : ''}`;
 }
 
 export function renderCustomerDailyReportText(snapshot) {
@@ -249,7 +249,7 @@ export function buildCustomerDailyReportWorkbook(snapshot) {
   heat.getRow(4).values = ['排名', '标题', '平台', '热度', '较昨日', ...(handling ? ['处理状态'] : [])];
   headerRow(heat, 4);
   for (const [index, post] of (snapshot.highHeat || []).entries()) {
-    const row = bodyRow(heat, [`TOP${index + 1}`, text(post.title), sourceLabel(post), n(post.heat), customerDailyPostComparison(post).replace(/^较昨日 /, ''), ...(handling ? [customerDailyPostStatus(post)] : [])]);
+    const row = bodyRow(heat, [`TOP${index + 1}`, text(post.title), sourceLabel(post), post.heatIsLowerBound ? customerDailyPostHeat(post) : n(post.heat), customerDailyPostComparison(post).replace(/^较昨日 /, ''), ...(handling ? [customerDailyPostStatus(post)] : [])]);
     hyperlink(row.getCell(2), post.title, post.url);
   }
   if (!snapshot.highHeat?.length) mergedText(heat, 5, handling ? 6 : 5, '暂未检出符合条件的帖子。');

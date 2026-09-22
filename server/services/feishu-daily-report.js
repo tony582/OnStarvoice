@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import {renderCustomerDailySummaryPng} from './customer-daily-report-image.js';
 import {buildFeishuDailyPost, FEISHU_DAILY_POST_IMAGE_PLACEHOLDER} from './feishu-daily-report-message.js';
-import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryHeaders, isMonthlyDailyReport, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform,
+import {CUSTOMER_DAILY_SECTIONS, customerDailySummaryHeaders, isMonthlyDailyReport, customerDailySummaryRows, customerDailyPostComparison, customerDailyPostPlatform, customerDailyPostHeat,
   customerDailyColdTitle, customerDailyColdPostLabel, customerDailyColdEmpty, isGroupedDailyReport, customerDailySummaryBasis, customerDailyTables, customerDailySections, customerDailyPostStatus, customerDailyTableCaption} from './customer-daily-report-presentation.js';
 
 // Official contracts: /document/develop-robots/add-bot-to-external-group,
@@ -120,7 +120,7 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
   if (!high.length) nodes.push(textNode('暂未检出。'));
   high.forEach((post, index) => {
     const url = validHttpUrl(post.url);
-    const description = ` - ${customerDailyPostPlatform(post)} | 热度 ${post.heat ?? '—'} | ${customerDailyPostComparison(post)}`
+    const description = ` - ${customerDailyPostPlatform(post)} | 热度 ${customerDailyPostHeat(post)} | ${customerDailyPostComparison(post)}`
       + (handling ? ` | 处理状态：${customerDailyPostStatus(post)}` : '') + (url ? '' : '｜原帖链接待补');
     nodes.push(textNode([run(`TOP${index + 1}：`), run(String(post.title || '未命名帖子').replace(/\s+/g,' ').trim(), url), run(description)]));
   });

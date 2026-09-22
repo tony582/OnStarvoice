@@ -32,6 +32,9 @@ const reportFor = date => {
     delivery: {status: date === '2026-09-08' ? 'needs_attention' : 'none', canRetry: false, ...(date === '2026-09-08' ? {error: '飞书结果未知'} : {})},
     emailDelivery: {status: date === '2026-09-08' ? 'failed' : 'none', ...(date === '2026-09-08' ? {ambiguous: true, canRetry: false, error: '邮件结果未知'} : {})}};
   stored.set(date, report);
+  report.snapshot.highHeat.push({recordId: 'heat-partial', title: '互动超过门槛但分享数未知', platform: 'xiaohongshu',
+    url: 'https://example.com/partial', heat: 215, heatIsLowerBound: true, missingMetrics: ['shares'],
+    heatText: '至少 215（分享数未取得）', comparisonText: '暂无可比数据', status: 'negative_feishu', feishuTableNo: '26091801'});
   return report;
 };
 const detail = report => ({report, html: '<p>日报</p>', text: '日报', messageHtml: '<p>日报正文</p>', messageText: '日报正文'});
@@ -107,6 +110,7 @@ try {
   assert.equal(await handlingTable.getByRole('rowheader', {name: '2026/9/6', exact: true}).count(), 0);
   assert.equal(await collectionTable.getByRole('rowheader', {name: '2026/9/5', exact: true}).count(), 0);
   await page.getByText(/处理状态：飞书表 · 202609-007/).waitFor();
+  await page.getByText('小红书｜热度 至少 215（分享数未取得）｜较昨日 暂无可比数据', {exact: true}).waitFor();
   assert.equal(await page.getByRole('checkbox').count(), 0);
   assert.equal(await page.getByRole('button', {name: '发送更正版'}).isEnabled(), true);
   assert.equal(await page.getByRole('button', {name: '发送邮件', exact: true}).isEnabled(), true);
@@ -181,6 +185,7 @@ try {
   await explicitContext.close();
 
   const narrow = await open({width: 390, mobile: true});
+  await narrow.page.getByText('小红书｜热度 至少 215（分享数未取得）｜较昨日 暂无可比数据', {exact: true}).waitFor();
   await narrow.page.getByRole('button', {name: /日报日历/}).click();
   await narrow.page.getByRole('button', {name: /2026-09-25，法定休假/}).waitFor();
   await narrow.page.screenshot({path: join(output, 'mobile.png'), fullPage: true});

@@ -3,6 +3,7 @@ import {recoverCustomerDailyObservationTime} from './customer-daily-metric-evide
 import {buildMonthlySummary, DAILY_COLLECTION_SUMMARY_FORMAT} from './customer-daily-monthly-summary.js';
 import {buildCustomerDailyMixedSummary, buildCustomerDailyNegativeHandlingSummary, customerDailyHandlingMonthStart, parseCustomerDailyHandlingEvents} from './customer-daily-handling-summary.js';
 import {recordEffectiveRelevanceSql, recordTriageAdmissionSql} from './record-triage-admission.js';
+import {customerDailyPostHeat} from './customer-daily-report-presentation.js';
 
 export {
   renderCustomerDailyReportHtml,
@@ -111,6 +112,7 @@ function observationPayloadSql() {
 }
 
 /** Only service-stamped, completely measured metrics can support daily change.
+ * A verified subset can establish a lower bound for threshold admission only.
  * Legacy snapshots can supply an explicitly labelled stored total, never a real-time claim. */
 export function assessCustomerDailyObservation(row = {}) {
   const payload = object(row.payload);
@@ -121,13 +123,23 @@ export function assessCustomerDailyObservation(row = {}) {
   if (!ingestedAt || Object.values(values).some(value => value === null)) return result;
   if (stamp.version === 1) {
     const fields = object(stamp.metrics);
-    if (stamp.allMeasured !== true || Object.keys(METRICS).some(key => {
+    const missingMetrics = Object.keys(METRICS).filter(key => object(fields[key]).measured !== true);
+    const partial = stamp.allMeasured === false && missingMetrics.length > 0;
+    if ((!partial && stamp.allMeasured !== true) || Object.keys(METRICS).some(key => {
       const field = object(fields[key]);
-      return field.measured !== true || number(field.value) !== values[key];
+      if (partial && field.measured === false) return field.value !== null;
+      return field.measured !== true || number(field.value) === null || number(field.value) !== values[key];
     })) return {...result, reason: 'partial_or_preserved_metrics'};
     const recovered = recoverCustomerDailyObservationTime(row);
     const observedAt = recovered?.observedAt || iso(stamp.observedAt);
     const trustedTime = (recovered || stamp.timeSource === 'capture_timestamp') && observedAt && ms(observedAt) <= ms(ingestedAt);
+    if (partial) {
+      const measured = Object.fromEntries(Object.keys(METRICS).map(key => [key, missingMetrics.includes(key) ? null : values[key]]));
+      if (missingMetrics.length === Object.keys(METRICS).length) return {...result, reason: 'partial_or_preserved_metrics'};
+      return {...result, metrics: measured, heat: Object.values(measured).reduce((sum, value) => sum + (value ?? 0), 0),
+        observedAt: trustedTime ? observedAt : ingestedAt, timeSource: trustedTime ? 'capture_timestamp' : 'ingested_at',
+        quality: 'measured_lower_bound', heatIsLowerBound: true, missingMetrics};
+    }
     return {...result, heat: Object.values(values).reduce((a, b) => a + b, 0),
       observedAt: trustedTime ? observedAt : ingestedAt,
       timeSource: trustedTime ? 'capture_timestamp' : 'ingested_at',
@@ -295,6 +307,9 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     if (ms(row.captured_at) < ms(heatStart) || ms(row.captured_at) >= ms(cutoffAt)) continue;
     const observation = assessCustomerDailyObservation(row);
     if (observation.heat === null || ms(observation.observedAt) >= ms(cutoffAt)) continue;
+    // A subset below the threshold cannot establish a drop or replace an older
+    // complete measurement. Never count carried-forward unknown fields as zero.
+    if (observation.heatIsLowerBound && observation.heat < 200) continue;
     if (!byRecord.has(row.record_id)) byRecord.set(row.record_id, []);
     byRecord.get(row.record_id).push(observation);
   }
@@ -313,6 +328,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     if (latest.heat < 200) continue;
     highHeat.push({...post(row), heat: latest.heat, observedAt: latest.observedAt, ingestedAt: latest.ingestedAt,
       quality: latest.quality, timeSource: latest.timeSource, stale,
+      ...(latest.heatIsLowerBound ? {heatIsLowerBound: true, missingMetrics: latest.missingMetrics, heatText: customerDailyPostHeat(latest)} : {}),
       comparisonText: stale ? '暂无本日数据' : sameMeasuredCurrent ? compareObservations(latest, yesterday) : '暂无可比数据',
       previousHeat: !stale && sameMeasuredCurrent && yesterday ? yesterday.heat : null,
       previousObservedAt: !stale && sameMeasuredCurrent && yesterday ? yesterday.observedAt : null,
@@ -320,7 +336,9 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   }
   highHeat.sort((a, b) => b.heat - a.heat || ms(b.publishedAt) - ms(a.publishedAt) || String(a.recordId).localeCompare(String(b.recordId)));
   if (missingHeat.length) warn('heat_missing', `${missingHeat.length}篇近7天发布的负面帖子缺少完整可核实互动观测，未按0处理，暂未进入榜单。`);
-  const legacyHeat = highHeat.filter(row => row.quality !== 'measured');
+  const partialHeat = highHeat.filter(row => row.heatIsLowerBound);
+  if (partialHeat.length) warn('heat_lower_bound', `${partialHeat.length}篇帖子已核实的互动合计达到200，按热度下限列入；缺失项保留未知，不计算较昨日变化。`);
+  const legacyHeat = highHeat.filter(row => row.quality !== 'measured' && !row.heatIsLowerBound);
   if (legacyHeat.length) warn('heat_time_unverified', `上榜${legacyHeat.length}篇使用历史入库记录或仅可确认入库时间，实测时间未核实，不计算较昨日。`);
   const staleCount = highHeat.filter(row => row.stale).length;
   if (staleCount) warn('heat_stale', `上榜${staleCount}篇本日无新有效互动观测，保留最近热度并注明更新时间。`);

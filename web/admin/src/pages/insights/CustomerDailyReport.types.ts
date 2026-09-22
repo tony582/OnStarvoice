@@ -20,6 +20,9 @@ export type DailyPost = {
   platform: string
   url: string
   heat?: number
+  heatText?: string
+  heatIsLowerBound?: boolean
+  missingMetrics?: string[]
   observedAt?: string
   comparisonText?: string
   previousHeat?: number
@@ -29,7 +32,7 @@ export type DailyPost = {
   stale?: boolean
   status?: string
   feishuTableNo?: string | null
-  quality?: 'measured' | 'measured_ingestion_time' | 'legacy_unverified'
+  quality?: 'measured' | 'measured_ingestion_time' | 'legacy_unverified' | 'measured_lower_bound'
   timeSource?: 'capture_timestamp' | 'ingested_at'
 }
 
