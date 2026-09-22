@@ -64,7 +64,10 @@ export function customerDailyPostComparison(post) {
 
 export function customerDailyPostHeat(post) {
   if (typeof post.heat !== 'number' || !Number.isFinite(post.heat) || post.heat < 0) return '待核实';
-  if (!post.heatIsLowerBound) return String(post.heat);
+  // Xiaohongshu heat is the total of its visible likes, comments, and collects.
+  const visibleXiaohongshuHeat = ['xiaohongshu', 'xhs'].includes(post.platform)
+    && post.missingMetrics?.length === 1 && post.missingMetrics[0] === 'shares';
+  if (!post.heatIsLowerBound || visibleXiaohongshuHeat) return String(post.heat);
   return `至少 ${post.heat}`;
 }
 

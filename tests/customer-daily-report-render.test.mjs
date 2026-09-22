@@ -12,7 +12,7 @@ function fixture() {
   return {tenantName: '示例客户', reportDate: '2026-09-07', mode: 'formal', cutoffAt: '2026-09-07T16:00:00Z', assessedAt: '2026-09-08T01:00:00Z', summary: {day: {...counts}, mtd: {...counts}}, highHeat: [post], coldMarked: [{...post, markedAt: '2026-09-07T11:00:00Z'}], warnings: [{message: '内部核对事项：观测质量与标记记录待确认', blocking: true}], evidence: {cold: {coverageComplete: false}}};
 }
 
-test('every report export labels verified lower bounds and suppresses incomplete growth percentages', async () => {
+test('every report export displays Xiaohongshu visible heat without missing-share qualifiers', async () => {
   const snapshot = fixture();
   snapshot.highHeat[0] = {...snapshot.highHeat[0], heat: 215, heatIsLowerBound: true,
     missingMetrics: ['shares'], comparisonText: '↑25.7%'};
@@ -22,7 +22,8 @@ test('every report export labels verified lower bounds and suppresses incomplete
     JSON.stringify(buildFeishuDailyDocumentPlan(snapshot)),
     JSON.stringify(buildFeishuDailyPost({snapshot, documentUrl: 'https://example.test/doc', imageKey: 'img_test'}))];
   for (const value of outputs) {
-    assert.ok(value.includes('至少 215'));
+    assert.ok(value.includes('热度 215'));
+    assert.ok(!value.includes('至少'));
     assert.ok(!value.includes('分享数未取得'));
     assert.ok(value.includes('暂无可比数据'));
     assert.ok(!value.includes('25.7%'));
@@ -30,7 +31,7 @@ test('every report export labels verified lower bounds and suppresses incomplete
   const workbook = buildCustomerDailyReportWorkbook(snapshot);
   const reopened = new workbook.constructor();
   await reopened.xlsx.load(await workbook.xlsx.writeBuffer());
-  assert.equal(reopened.getWorksheet('高热负面').getCell('D5').value, '至少 215');
+  assert.equal(reopened.getWorksheet('高热负面').getCell('D5').value, '215');
   assert.equal(reopened.getWorksheet('高热负面').getCell('E5').value, '暂无可比数据');
   assert.deepEqual(snapshot, before);
 });

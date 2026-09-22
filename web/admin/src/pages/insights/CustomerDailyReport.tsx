@@ -467,7 +467,7 @@ function CustomerDailyReportWorkspace() {
             {isCollectionHandlingSummary(snapshot) && <p>{collectionHandlingBasis}手填采集数值在原累计值上增减对应差额。</p>}
             <p>系统统计{isHandlingSummary(snapshot) ? '处理' : isCollectionHandlingSummary(snapshot) ? '采集' : ''}负面：当日 {snapshot.summary.day.negative} 条，MTD {snapshot.summary.mtd.negative} 条。待识别或核对：当日 {snapshot.summary.day.unclassified} 条，MTD {snapshot.summary.mtd.unclassified} 条。客户补填的汇总与系统统计分别保存。</p>
             {isMonthlySummary(snapshot) ? <p>表内逐日数值可在本页填写并保存，MTD 按报表累计口径展示。{isHandlingSummary(snapshot) ? '实际采集量单独展示，不随手填处理量修改。' : isCollectionHandlingSummary(snapshot) ? '负面日行是实际处理次数，MTD负面按帖子去重；负面处理与采集量分别统计。' : isCollectionSummary(snapshot) ? '每日数量和月累计均为采集统计口径。' : '此历史日报保留生成时的采集统计口径。'}飞书文档里的修改不会自动同步回本页。</p> : <p>处理中、已处理初始为空，空白不代表 0。可在本页填写并保存；飞书文档里的修改不会自动同步回本页。</p>}
-            <p>7 天发布时间：{dailyTime(snapshot.heatStart)} 至 {dailyTime(snapshot.cutoffAt)}。热度为点赞、评论、收藏、分享之和。</p>
+            <p>7 天发布时间：{dailyTime(snapshot.heatStart)} 至 {dailyTime(snapshot.cutoffAt)}。热度按可见互动数合计；小红书为点赞、评论、收藏之和。</p>
           </div>
         </Dialog.Content></Dialog.Portal>
       </Dialog.Root>
@@ -579,11 +579,14 @@ function PostList({ posts, kind, incomplete = false }: { posts: DailyPost[]; kin
   if (!posts.length) return <p className="rounded-lg bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-500">{kind === 'heat' ? '暂未检出符合条件的帖子。' : incomplete ? '暂未检出。' : '本期无冷处理负面帖子。'}</p>
   return <ol className="divide-y divide-slate-200 border-y border-slate-200">{posts.map((post, index) => {
     const url = safeReportUrl(post.url)
+    const visibleXiaohongshuHeat = ['xiaohongshu', 'xhs'].includes(post.platform)
+      && post.missingMetrics?.length === 1 && post.missingMetrics[0] === 'shares'
+    const showLowerBound = post.heatIsLowerBound && !visibleXiaohongshuHeat
     return <li key={`${post.recordId}-${index}`} className="flex gap-3 py-4 sm:gap-4">
       <span className="min-w-8 pt-0.5 text-xs font-semibold tabular-nums text-blue-700">{kind === 'heat' ? `TOP${index + 1}` : index + 1}</span>
       <div className="min-w-0 flex-1">
         {url ? <a href={url} target="_blank" rel="noopener noreferrer" className="break-words text-sm font-medium leading-6 text-blue-700 underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{post.title || '查看原帖'}<ExternalLink className="ml-1 inline h-3 w-3" /></a> : <p className="text-sm font-medium leading-6">{post.title || '标题待补'}<span className="ml-2 text-xs font-normal text-amber-800">原帖链接待补</span></p>}
-        <p className="mt-1.5 text-xs leading-5 text-slate-500">{platforms[post.platform] || post.platform || '未知平台'}{kind === 'cold' && post.isHistorical === true && <span className="ml-2 inline-flex rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">历史帖</span>}{kind === 'heat' && <>｜热度 {post.heatIsLowerBound && '至少 '}{post.heat?.toLocaleString() ?? '待核对'}｜较昨日 {(post.comparisonText || '暂无对比').replace(/^较昨日\s*[:：]?\s*/, '').trim() || '暂无对比'}</>}</p>
+        <p className="mt-1.5 text-xs leading-5 text-slate-500">{platforms[post.platform] || post.platform || '未知平台'}{kind === 'cold' && post.isHistorical === true && <span className="ml-2 inline-flex rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">历史帖</span>}{kind === 'heat' && <>｜热度 {showLowerBound && '至少 '}{post.heat?.toLocaleString() ?? '待核对'}｜较昨日 {(post.comparisonText || '暂无对比').replace(/^较昨日\s*[:：]?\s*/, '').trim() || '暂无对比'}</>}</p>
         {kind === 'heat' && <p className="mt-2 text-xs leading-5 text-slate-700"><span className="text-slate-500">处理状态：</span>{dailyPostStatusLabel(post)}</p>}
       </div>
     </li>

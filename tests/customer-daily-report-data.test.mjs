@@ -85,7 +85,7 @@ test('verified partial interactions admit the reported XHS post without inventin
     observations: [endpoint, observation(1, 171, d(6), {id: ID(601)})]})});
   assert.equal(report.highHeat.length, 1);
   assert.equal(report.highHeat[0].heat, 215);
-  assert.equal(report.highHeat[0].heatText, '至少 215');
+  assert.equal(report.highHeat[0].heatText, '215');
   assert.equal(report.highHeat[0].comparisonText, '暂无可比数据');
   assert.equal(report.highHeat[0].previousHeat, null);
   assert.deepEqual(report.evidence.heat.missingRecordIds, []);

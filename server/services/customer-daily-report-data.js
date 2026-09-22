@@ -328,7 +328,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     if (latest.heat < 200) continue;
     highHeat.push({...post(row), heat: latest.heat, observedAt: latest.observedAt, ingestedAt: latest.ingestedAt,
       quality: latest.quality, timeSource: latest.timeSource, stale,
-      ...(latest.heatIsLowerBound ? {heatIsLowerBound: true, missingMetrics: latest.missingMetrics, heatText: customerDailyPostHeat(latest)} : {}),
+      ...(latest.heatIsLowerBound ? {heatIsLowerBound: true, missingMetrics: latest.missingMetrics, heatText: customerDailyPostHeat({...latest, platform: row.platform})} : {}),
       comparisonText: stale ? '暂无本日数据' : sameMeasuredCurrent ? compareObservations(latest, yesterday) : '暂无可比数据',
       previousHeat: !stale && sameMeasuredCurrent && yesterday ? yesterday.heat : null,
       previousObservedAt: !stale && sameMeasuredCurrent && yesterday ? yesterday.observedAt : null,
