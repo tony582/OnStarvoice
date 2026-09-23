@@ -3,12 +3,38 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.12',
+  latestVersion: '0.4.14',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-22',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.12-20260922.zip',
+  releaseDate: '2026-09-23',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.14-20260923.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.14',
+      releaseDate: '2026-09-23',
+      releaseNotes: [
+        {tag: '新增', notes: [
+          {title: '平均下发手动采集', desc: '关键词均分给所选 Extension，完整设置包含帖子上限、搜索筛选、增强、同步、AI、作者指标及评论；扩展使用手动采集的批量关键词入口启动一次，进度和结果仍可查看。'},
+        ]},
+        {tag: '修复', notes: [
+          {title: '停止未确认时暂停新下发', desc: '旧任务未确认停止时保留节点现场，避免连续派发造成任务身份冲突；普通采集失败仍按原规则处理。'},
+          {title: '同步未收齐不再显示全部成功', desc: '同步存在失败、待上传或尚未排空时，任务明确保留待核对结果。'},
+        ]},
+        {
+          tag: '试点',
+          notes: [
+            {title: '安卓手机搜索发现', desc: '已开通租户可在调度中心创建单手机、每批 1–2 个关键词的抖音任务，默认综合排序、一天内；手机发现作品后由 Extension 补详情与评论。遇到断线或异常保护暂停，确认停稳后可按原时限恢复。'},
+          ],
+        },
+        {
+          tag: '修复',
+          notes: [
+            {title: '手机补采完成后自动关页', desc: '完成、失败或取消后关闭该次补采创建的页面，避免连续补采积累标签页。用户自行打开的页面不受影响。'},
+            {title: '抖音正文与作者显示更完整', desc: '保留正文和昵称中的表情，并将认证机构说明与真实发布者昵称分开，避免正常作品因格式差异无法交付。'},
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.12',
       releaseDate: '2026-09-22',

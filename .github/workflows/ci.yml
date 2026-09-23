@@ -79,6 +79,11 @@ jobs:
       - name: Run full Node.js regression suite
         run: npm --prefix server test
 
+      - name: Test independent Android runner on Node 24
+        run: |
+          npm --prefix runners/android run check:boundaries
+          npm --prefix runners/android test
+
       - name: Check Admin lint debt
         run: node scripts/check-admin-lint-baseline.mjs
 
@@ -190,3 +195,9 @@ jobs:
 
       - name: Run isolated PostgreSQL integration tests
         run: npm --prefix server run test:integration
+
+      - name: Run Android Runner against real control plane
+        if: matrix.node == '24.12.0'
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+        run: npm --prefix runners/android run test:integration

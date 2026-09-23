@@ -25,6 +25,7 @@ try {
 }
 
 importScripts(
+  'utils/manual-keyword-dispatch.js',
   'utils/control-storage-reserve.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
@@ -2740,6 +2741,9 @@ async function readTargetedPostRunRequest({persistNormalized = true} = {}) {
 
 function targetedPostTaskCenterDescriptor(request = {}) {
   const workflow = String(request?.workflow || '').trim();
+  if (workflow === 'discovered_post_capture') {
+    return {workflow, taskType: workflow, title: String(request?.title || '').trim() || '手机发现作品补详情'};
+  }
   if (workflow === 'watched_content_patrol') {
     return {
       workflow,
@@ -3431,7 +3435,7 @@ async function openOwnedTargetedPostPlatformTab({
   if (!isSameTargetedPostAttempt(current, expected)) {
     return {ok: false, reason: 'stale_targeted_post_attempt'};
   }
-  if (String(current.workflow || '').trim() !== 'negative_post_patrol') {
+  if (!cloudTargetedPostApi.usesOwnedPlatformTab(current.workflow)) {
     return {ok: false, reason: 'targeted_post_platform_tab_not_supported'};
   }
   const targetUrl = String(url || '').trim();
@@ -3633,7 +3637,7 @@ async function openOwnedTargetedPostPlatformTab({
 
 async function closeTerminalTargetedPostPlatformTab(request) {
   const status = String(request?.status || '').trim().toLowerCase();
-  if (status === 'needs_action' || !cloudTargetedPostApi?.isTerminalRunStatus?.(status)) {
+  if (cloudTargetedPostApi.shouldPreservePlatformTab(request) || !cloudTargetedPostApi?.isTerminalRunStatus?.(status)) {
     return {
       ok: true,
       removedCount: 0,
@@ -3656,6 +3660,16 @@ async function closeTerminalTargetedPostPlatformTab(request) {
       skipped: true,
       reason: 'targeted_post_platform_tab_not_owned',
     };
+  }
+
+  if (request.workflow === 'discovered_post_capture') {
+    // Persist ownership before closing: the runner shell can disappear during
+    // terminal reporting. A failed close is retried before another page opens.
+    const durable = await persistTargetedPostPlatformTabCleanup(registration, {
+      reason: 'discovered_post_terminal_cleanup',
+    });
+    if (!durable.ok) return {...durable, removedCount: 0};
+    return await recoverTargetedPostPlatformTabCleanup({force: true});
   }
 
   let liveTab = null;
@@ -6549,6 +6563,18 @@ async function reconcileStrandedNegativePatrolCancellation() {
   };
 }
 
+const manualKeywordDispatch = globalThis.OnStarvoiceManualKeywordDispatch.createController({
+  storage: chrome.storage.local,
+  tabs: chrome.tabs,
+  getURL: path => chrome.runtime.getURL(path),
+  isBusy: async () => {
+    if (await readActiveCaptureExecutionLock()) return true;
+    const current = await readUnattendedKeywordRunRequest();
+    return Boolean(current && !isTerminalUnattendedRunStatus(current.status));
+  },
+  reportRun: run => upsertTaskLedgerRun({run}),
+});
+
 async function executeCloudTaskAgentCommand(command, token) {
   const commandId = String(command?.id || '').trim();
   if (!commandId) return null;
@@ -6589,6 +6615,16 @@ async function executeCloudTaskAgentCommand(command, token) {
       commandId,
       success: commandResult?.accepted === true,
       result: commandResult,
+    });
+  }
+
+  if (commandType === 'create' && payload.executionMode === 'manual_batch') {
+    const delivered = commandResult?.state === 'completed'
+      ? commandResult : await manualKeywordDispatch.dispatch(command);
+    if (delivered.deferred) return {ok: true, ...delivered, commandId};
+    await rememberCloudCommandResult(commandId, {...delivered, state: 'completed'});
+    return await cloudTaskAgentApi.completeCommand({
+      token, commandId, success: delivered.accepted === true, result: delivered,
     });
   }
 
@@ -18842,6 +18878,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  void manualKeywordDispatch.removed(tabId).catch(error => console.warn('[Manual batch] close receipt failed', error));
   forgetRemovedTargetedPostPlatformTabCleanup(tabId).catch((error) => {
     console.warn('[onstarvoice] pending targeted platform tab cleanup failed', error);
   });
@@ -19024,6 +19061,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (type === 'onstarvoice:clear-task-center') {
         const result = await clearTaskCenterRecords();
         sendResponse({ok: true, data: result});
+        return;
+      }
+
+      if (type === 'onstarvoice:claim-manual-keyword-batch') {
+        sendResponse(await manualKeywordDispatch.claim(String(message.id || ''), sender));
+        return;
+      }
+      if (type === 'onstarvoice:finish-manual-keyword-batch') {
+        sendResponse(await manualKeywordDispatch.finish(String(message.id || ''), sender));
         return;
       }
 

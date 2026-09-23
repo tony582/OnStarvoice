@@ -421,7 +421,7 @@ test("admin UI can load and explicitly replace an existing unattended plan witho
   const toggleEnd = page.indexOf("  const editUnattendedPlan = () => {", resetEnd);
   const editEnd = page.indexOf("\n\n  if (!remoteTaskCreate)", toggleEnd);
   const submitStart = page.indexOf("  const submit = async", editEnd);
-  const submitEnd = page.indexOf("\n\n  const disabled =", submitStart);
+  const submitEnd = page.indexOf("\n\n  const submitDisabled =", submitStart);
 
   assert.notEqual(resetStart, -1, "missing new-task reset helper");
   assert.notEqual(resetEnd, -1, "missing new-task toggle helper");

@@ -1,4 +1,6 @@
+import {projectDiscoveryTaskResult} from '../services/capture-discovery/detail-projection.js';
 import crypto from 'crypto';
+import {dispatchDiscoveredPost} from '../services/capture-discovery/detail-dispatch.js';
 import { Router } from 'express';
 import {
   isDbCapacityError,
@@ -7,7 +9,7 @@ import {
   withTransaction,
 } from '../db/init.js';
 import {
-  requireCaptureAgent,
+  requireCaptureAgent as authenticateCaptureAgent,
   requireCriticalTenantAccess,
   requireSessionUser,
   requireTenantAccess,
@@ -15,6 +17,8 @@ import {
 } from '../middleware/auth.js';
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+  captureTaskHasUnconfirmedLocalStop,
+  captureTaskUnconfirmedLocalStopSql,
   captureAgentFullHeartbeatAt,
   captureAgentFullHeartbeatOnline,
   captureAgentLivenessAt,
@@ -74,6 +78,37 @@ import {
   projectCaptureResourceAdmission,
 } from '../services/capture-resource-policy.js';
 
+function requireCaptureAgent(req, res, next) {
+  return authenticateCaptureAgent(req, res, error => {
+    if (error) return next(error);
+    if (req.captureAgent?.capabilities?.agentKind === 'android_mobile') {
+      return res.status(403).json({ok: false, error: 'android_control_protocol_required'});
+    }
+    return next();
+  });
+}
+async function requireBrowserTaskControl(req, res, next) {
+  if (!/^[0-9a-f-]{36}$/iu.test(req.params.id)) return next();
+  try {
+    const task = await queryOne(`SELECT metadata->>'workflow' AS workflow FROM capture_tasks
+      WHERE tenant_id=$1 AND id=$2`, [req.tenantId, req.params.id], null, {category: 'critical'});
+    if (task?.workflow === 'douyin_mobile_discovery') {
+      return res.status(409).json({ok: false, error: 'android_control_protocol_required'});
+    }
+    return next();
+  } catch (error) { return next(error); }
+}
+async function requireBrowserNodeControl(req, res, next) {
+  if (!/^[0-9a-f-]{36}$/iu.test(req.params.id)) return next();
+  try {
+    const agent = await queryOne(`SELECT capabilities->>'agentKind' AS kind FROM capture_agents
+      WHERE tenant_id=$1 AND id=$2`, [req.tenantId, req.params.id], null, {category: 'critical'});
+    if (agent?.kind === 'android_mobile') {
+      return res.status(409).json({ok: false, error: 'android_control_protocol_required'});
+    }
+    return next();
+  } catch (error) { return next(error); }
+}
 const router = Router();
 const MAX_HEARTBEAT_TASKS = 50;
 const MAX_COMMAND_COMPLETION_RESULT_BYTES = 96 * 1024;
@@ -1057,6 +1092,9 @@ export function classifyCaptureRecoveryDisposition(
   {phase = 'fast'} = {},
 ) {
   const dutyRecovery = phase === 'duty';
+  if (captureTaskHasUnconfirmedLocalStop(item)) {
+    return {kind: 'manual_current', automatic: false};
+  }
   if (crossDeviceRetryItemNeedsManualSafety(item)) {
     return {kind: 'manual_current', automatic: false};
   }
@@ -1203,6 +1241,9 @@ export function projectElasticKeywordRecoveryStatus({
 } = {}) {
   const normalizedStatus = text(status, 80).toLowerCase();
   if (!elasticPool) return normalizedStatus;
+  if (captureTaskHasUnconfirmedLocalStop({status: normalizedStatus, error})) {
+    return 'needs_action';
+  }
   if (![
     'interrupted',
     'needs_action',
@@ -1653,6 +1694,7 @@ export function crossDeviceRetryAgentSupportsTask(
   commandPayload = {},
 ) {
   const capabilities = safeJson(agent.capabilities);
+  if (capabilities.agentKind === 'android_mobile') return false;
   if (capabilities.taskStateKnown === false) return false;
   if (capabilities.remoteTaskCreate !== true) return false;
   const dutyRecoveryRequested =
@@ -2960,6 +3002,7 @@ const TARGETED_POST_TASK_TYPES = new Set([
   'official_account_comment_patrol',
   'followed_creator_post_patrol',
   'official_account_post_discovery',
+  'discovered_post_capture',
 ]);
 
 function isTargetedPostTaskType(value) {
@@ -2967,6 +3010,7 @@ function isTargetedPostTaskType(value) {
 }
 
 function targetedPostTaskLabel(taskType) {
+  if (taskType === 'discovered_post_capture') return '手机发现补详情';
   if (taskType === 'watched_content_patrol') {
     return '关注内容巡查';
   }
@@ -4834,6 +4878,10 @@ export async function projectNegativePatrolSnapshot(tx, agent, task, snapshot = 
     return null;
   }
 
+  if (task.task_type === 'discovered_post_capture') {
+    return projectDiscoveryTaskResult(tx, {tenantId: agent.tenant_id, task, snapshot});
+  }
+
   const parentTaskId = text(task.parent_task_id, 100).toLowerCase();
   const orchestrationParent = parentTaskId
     ? await lockOrchestrationParent(tx, agent.tenant_id, parentTaskId)
@@ -6477,6 +6525,7 @@ export async function mirrorTaskSnapshot(
   delete agentSnapshotMetadata.itemAttempts;
   delete agentSnapshotMetadata.attemptIdentity;
   delete agentSnapshotMetadata.localRecoveryClientAttemptId;
+  delete agentSnapshotMetadata.candidateId;
   const previous = await tx.queryOne(`
     SELECT task.id, task.status, task.attempt_number,
       occupied_attempt.client_attempt_id AS occupied_attempt_id
@@ -6545,7 +6594,8 @@ export async function mirrorTaskSnapshot(
     DO UPDATE SET
       assigned_agent_id = EXCLUDED.assigned_agent_id,
       control_task_id = EXCLUDED.control_task_id,
-      task_type = EXCLUDED.task_type,
+      task_type = CASE WHEN capture_tasks.metadata->>'workflow'='discovered_post_capture'
+        THEN capture_tasks.task_type ELSE EXCLUDED.task_type END,
       feature_key = EXCLUDED.feature_key,
       title = EXCLUDED.title,
       platform = EXCLUDED.platform,
@@ -6665,6 +6715,9 @@ export async function mirrorTaskSnapshot(
           ))
           ELSE '{}'::jsonb
         END
+        || CASE WHEN capture_tasks.metadata->>'workflow'='discovered_post_capture'
+          THEN jsonb_build_object('workflow','discovered_post_capture','candidateId',capture_tasks.metadata->'candidateId')
+          ELSE '{}'::jsonb END
         || CASE
           WHEN capture_tasks.metadata ? 'stopCommandId'
           THEN jsonb_strip_nulls(jsonb_build_object(
@@ -7078,7 +7131,8 @@ async function negativePatrolFairClaimWait(tx, {agent, candidate, resourcePolicy
         SELECT 1 FROM capture_tasks busy
         WHERE busy.tenant_id = peer.tenant_id
           AND COALESCE(busy.assigned_agent_id, busy.origin_agent_id) = peer.id
-          AND busy.task_type <> 'capture_orchestration' AND busy.status = ANY($4::text[])
+          AND busy.task_type <> 'capture_orchestration'
+          AND (busy.status = ANY($4::text[]) OR ${captureTaskUnconfirmedLocalStopSql('busy')})
       )
       AND NOT EXISTS (
         SELECT 1 FROM capture_agent_commands command
@@ -7127,6 +7181,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       agent, capabilities, excludedItemIds, targetedOnly: true,
     }, 10);
   }
+  if (agent?.capabilities?.agentKind === 'android_mobile') return null;
   const freshCapabilities = safeJson(capabilities);
   const canClaimKeyword =
     freshCapabilities.remoteTaskCreate === true &&
@@ -8893,7 +8948,10 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         }
       }
 
-      const elasticClaim = taskStateIncomplete
+      const discoveryClaim = taskStateIncomplete ? null : await dispatchDiscoveredPost(tx, {
+        agent: {...agent, ...currentAgent}, capabilities: heartbeatCapabilities,
+      });
+      const elasticClaim = taskStateIncomplete || discoveryClaim
         ? null
         : await dispatchNextElasticWorkItem(tx, {
             agent: {
@@ -8932,6 +8990,11 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
             OR c.payload->>'executionMode' <> 'source_open'
             OR $7::boolean = true
           )
+          AND (
+            c.command_type <> 'create'
+            OR COALESCE(c.payload->>'workflow', t.task_type) <> 'discovered_post_capture'
+            OR $8::boolean = true
+          )
           AND NOT (
             c.command_type = 'create'
             AND COALESCE(
@@ -8958,6 +9021,15 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
             OR (
               t.status IN ('pending', 'claimed')
               AND t.metadata->>'createCommandId' = c.id::text
+              AND (
+                c.payload->>'executionMode' = 'unattended_plan'
+                OR NOT EXISTS (
+                  SELECT 1 FROM capture_tasks unsafe_stop
+                  WHERE unsafe_stop.tenant_id = t.tenant_id
+                    AND COALESCE(unsafe_stop.assigned_agent_id, unsafe_stop.origin_agent_id) = c.agent_id
+                    AND ${captureTaskUnconfirmedLocalStopSql('unsafe_stop')}
+                )
+              )
               AND NOT EXISTS (
                 SELECT 1
                 FROM capture_tasks parent
@@ -9000,6 +9072,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [],
         normalizeCaptureAgentPlatforms(heartbeatCapabilities.supportedPlatforms),
         heartbeatCapabilities.xiaohongshuSourceOpenV1 === true,
+        heartbeatCapabilities.discoveredPostCaptureV1 === true,
       ]) : [];
 
       if (commands.length > 0) {
@@ -9359,6 +9432,7 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
         80,
       );
       const createExecutionMode = [
+        'manual_batch',
         'unattended_plan',
         'source_open',
       ].includes(requestedCreateExecutionMode)
@@ -10671,7 +10745,7 @@ router.patch('/agents/:id', requireTenantAccess, requireSessionUser, requireTena
   }
 });
 
-router.delete('/agents/:id', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+router.delete('/agents/:id', requireTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl, async (req, res, next) => {
   try {
     const agentId = text(req.params.id, 100).toLowerCase();
     if (!UUID_PATTERN.test(agentId)) {
@@ -10840,7 +10914,7 @@ router.delete('/agents/:id', requireTenantAccess, requireSessionUser, requireTen
   }
 });
 
-router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl, async (req, res, next) => {
   try {
     const agentId = text(req.params.id, 100).toLowerCase();
     if (!UUID_PATTERN.test(agentId)) {
@@ -11329,7 +11403,7 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
   }
 });
 
-router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl, async (req, res, next) => {
   try {
     const result = await withTransaction(async tx => {
       const agent = await tx.queryOne(`
@@ -11402,6 +11476,16 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
         capabilities.remoteTaskEnhancementOptions !== true
       ) {
         return {error: 'agent_enhancement_capability_missing'};
+      }
+      if (body.executionMode === 'manual_batch') {
+        if (capabilities.remoteManualKeywordBatchV1 !== true) return {error: 'agent_manual_batch_capability_missing'};
+        // Manual dispatch only uses explicit controls; never inherit a saved plan.
+        for (const key of Object.keys(mirroredPlan)) delete mirroredPlan[key];
+        if (body.manualStartTime && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(body.manualStartTime))) {
+          return {error: 'invalid_manual_start_time'};
+        }
+        const keywords = Array.isArray(body.keywords) ? body.keywords : String(body.keywords || '').split(/\r?\n/);
+        if (keywords.filter(value => String(value || '').trim()).length > 30) return {error: 'manual_batch_keyword_limit'};
       }
       const bodyFilters = safeJson(body.searchFilters);
       const mirroredFilters = safeJson(mirroredPlan.searchFilters);
@@ -11543,8 +11627,8 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
           },
           existing: true,
           queueBlocker: safeJson(existingMetadata.queueBlocker),
-          executionMode: existingMetadata.executionMode === 'unattended_plan'
-            ? 'unattended_plan'
+          executionMode: ['unattended_plan', 'manual_batch'].includes(existingMetadata.executionMode)
+            ? existingMetadata.executionMode
             : 'one_time',
         };
       }
@@ -11640,12 +11724,12 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
       // neither inherit this blocker nor tell the operator to resolve old work.
       const queueBlocker = isPlanConfiguration ? null : await tx.queryOne(`
         SELECT id, title, platform, status
-        FROM capture_tasks
+        FROM capture_tasks task
         WHERE tenant_id = $1 AND assigned_agent_id = $2
-          AND control_task_id IS NOT NULL AND control_task_id <> ''
-          AND status IN (
-            'pending', 'claimed', 'running', 'recovering',
-            'interrupted', 'resume_requested'
+          AND (
+            (control_task_id IS NOT NULL AND control_task_id <> ''
+              AND status IN ('pending', 'claimed', 'running', 'recovering', 'interrupted', 'resume_requested'))
+            OR ${captureTaskUnconfirmedLocalStopSql('task')}
           )
         ORDER BY updated_at DESC, created_at DESC
         LIMIT 1
@@ -11656,7 +11740,7 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
         : planSnapshot.keywords.length * planSnapshot.maxRounds;
       const taskType = isPlanConfiguration
         ? 'unattended_plan_configuration'
-        : 'unattended_keyword_capture';
+        : executionMode === 'manual_batch' ? 'capture' : 'unattended_keyword_capture';
       const triggerType = isPlanConfiguration
         ? 'remote_plan_configuration'
         : 'remote_manual';
@@ -11679,7 +11763,7 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
         ? '目标节点有待处理的旧任务，新任务已排队'
         : isPlanConfiguration
           ? '已创建无人值守计划，等待目标设备保存'
-          : '已创建一次性采集任务，等待目标设备领取';
+          : executionMode === 'manual_batch' ? '已下发手动批量配置，等待 Extension 启动' : '已创建一次性采集任务，等待目标设备领取';
       const task = await tx.queryOne(`
         INSERT INTO capture_tasks (
           id, tenant_id, origin_agent_id, assigned_agent_id,
@@ -11688,7 +11772,7 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
           metadata, message, source_updated_at
         ) VALUES (
           $1::uuid, $2, $3, $3,
-          $1::text, $6, 'unattended_keyword_plan', $4, $5,
+          $1::text, $6, $13, $4, $5,
           'cloud', $7, 'pending', $8::jsonb, $9::jsonb, $10::jsonb,
           $11::jsonb, $12, now()
         )
@@ -11708,6 +11792,7 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
         JSON.stringify({total, processed: 0, success: 0, failed: 0, skipped: 0}),
         JSON.stringify(metadata),
         queuedMessage,
+        executionMode === 'manual_batch' ? 'capture.search' : 'unattended_keyword_plan',
       ]);
       const command = await tx.queryOne(`
         INSERT INTO capture_agent_commands (
@@ -11764,6 +11849,9 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
       agent_not_found: ['agent_not_found', '采集节点不存在'],
       agent_unavailable: ['agent_unavailable', '目标节点授权已失效、已停用或不存在'],
       agent_capability_missing: ['agent_capability_missing', '目标节点版本尚不支持云端创建任务，请先更新扩展'],
+      agent_manual_batch_capability_missing: ['agent_manual_batch_capability_missing', '目标节点尚不支持手动批量下发，请先更新 Extension'],
+      invalid_manual_start_time: ['invalid_manual_start_time', '当天延迟启动必须使用 HH:mm 格式'],
+      manual_batch_keyword_limit: ['manual_batch_keyword_limit', '每个节点最多接收 30 个关键词'],
       agent_plan_capability_missing: ['agent_plan_capability_missing', '目标节点版本尚不支持云端保存无人值守计划，请先更新扩展'],
       agent_enhancement_capability_missing: ['agent_enhancement_capability_missing', '目标节点版本尚不支持远程任务增强选项，请先更新扩展'],
       agent_keyword_limit_capability_missing: ['agent_keyword_limit_capability_missing', '目标节点版本尚不支持为远程任务指定帖子采集数量，请先更新扩展'],
@@ -11828,7 +11916,7 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
   }
 });
 
-router.delete('/agents/:id/unattended-plan', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+router.delete('/agents/:id/unattended-plan', requireTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl, async (req, res, next) => {
   try {
     const result = await withTransaction(async tx => {
       const agent = await tx.queryOne(`
@@ -15428,7 +15516,7 @@ export async function reconcileAutomaticCaptureRetries(input = 10) {
   return summary;
 }
 
-router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserTaskControl, async (req, res, next) => {
   try {
     const taskId = text(req.params.id, 100).toLowerCase();
     const requestKey = text(req.body?.requestKey, 100).toLowerCase();
@@ -15498,7 +15586,7 @@ router.post('/tasks/:id/retry-on-idle-agent', requireTenantAccess, requireSessio
   }
 });
 
-router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserTaskControl, async (req, res, next) => {
   try {
     const mode = ['remaining', 'failed', 'skip_current'].includes(req.body?.mode)
       ? req.body.mode
@@ -16264,7 +16352,7 @@ async function cascadeStopNegativePatrolParent(tx, {
   };
 }
 
-router.post('/tasks/:id/stop', requireCriticalTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+router.post('/tasks/:id/stop', requireCriticalTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserTaskControl, async (req, res, next) => {
   try {
     const result = await withTransaction(async tx => {
       const stopTarget = await tx.queryOne(`
@@ -16417,8 +16505,8 @@ router.post('/tasks/:id/stop', requireCriticalTenantAccess, requireSessionUser, 
 
       const metadata = safeJson(task.metadata);
       const controlTaskId = text(task.control_task_id || task.client_task_id, 240);
-      const remotelyControlled = String(task.task_type || '').includes('unattended') ||
-        metadata.remoteCreated === true;
+      const remotelyControlled = metadata.executionMode !== 'manual_batch' && (String(task.task_type || '').includes('unattended') ||
+        metadata.remoteCreated === true);
       if (!controlTaskId || !remotelyControlled) {
         return {error: 'task_not_remotely_stoppable', task};
       }

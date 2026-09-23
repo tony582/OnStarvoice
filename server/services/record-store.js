@@ -1,3 +1,4 @@
+import {recordDiscoveryIngestion,finishDiscoveryObservation} from './capture-discovery/detail-receipt.js';
 import crypto from 'crypto';
 import {persistCapturedContentAvailability} from './capture-content-availability.js';
 import { withTransaction } from '../db/init.js';
@@ -936,6 +937,7 @@ async function insertObservation(tx, {
     lineageContext,
     await loadCaptureObservationLineage(tx, lineageContext),
   );
+  const discoveryRecovery = await recordDiscoveryIngestion(tx, lineageContext, lineage);
   const observationSourceKey = lineage?.capture_task_item_attempt_id
     ? sha256([
         tenantId,
@@ -991,6 +993,7 @@ async function insertObservation(tx, {
         'UPDATE records SET latest_observation_id = $1, updated_at = now() WHERE id = $2',
         [existingObservation.id, recordId],
       );
+      await finishDiscoveryObservation(tx, discoveryRecovery);
       return {
         id: existingObservation.id,
         reused: true,
@@ -1038,6 +1041,7 @@ async function insertObservation(tx, {
     [result.id, recordId]
   );
 
+  await finishDiscoveryObservation(tx, discoveryRecovery);
   return {
     id: result.id,
     reused: false,

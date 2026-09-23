@@ -87,3 +87,44 @@ test('external and own-profile links cannot become strong publisher identities',
     assert.equal(author.url, '');
   }
 });
+
+
+test('real note nickname keeps inline emoji without mixing avatar or badge descriptions', () => {
+  const root = el('main', {}, el('div', {'data-e2e': 'user-info'},
+    link(AUTHOR, el('img', {alt: '头像'})),
+    link(AUTHOR, el('div', {'data-click-from': 'title'},
+      el('span', {}, 'girl', el('img', {alt: '👧🏻'})), el('img', {alt: '蓝V认证'})))));
+  assert.deepEqual(extractDouyinAuthorInfo(root), {name: 'girl👧🏻', userId: AUTHOR, url: profile(AUTHOR)});
+});
+
+test('emoji-only publisher names and search names retain their display identity', () => {
+  const detail = el('main', {}, card(AUTHOR, '🍊'),
+    el('div', {'data-e2e': 'video-desc'}, mention()));
+  assert.equal(extractDouyinAuthorInfo(detail).name, '🍊');
+  const search = el('div', {class: 'search-result-card'},
+    el('div', {class: 'WldPmwm5'}, link(AUTHOR, '车主', el('img', {alt: '🚗'}))));
+  assert.equal(resolveSearchCardAuthorInfo(search).name, '车主🚗');
+});
+
+
+test('real enterprise note separates the nickname from certification badge and organization text', () => {
+  // Observed /note/7688638185542934650: the title div has a nickname span
+  // followed by a badge div containing the organization name.
+  const name = '别克-山东润通(济南润华公园店)';
+  const authorCard = el('div', {'data-e2e': 'user-info'},
+    link(AUTHOR, el('img', {alt: name})),
+    link(AUTHOR, el('div', {'data-click-from': 'title'},
+      el('span', {}, el('span', {}, name)),
+      el('div', {}, el('div', {}, '认证徽章'),
+        el('span', {'data-e2e': 'badge-role-name'}, '山东润通汽车销售有限公司官方账号')))));
+  assert.deepEqual(extractDouyinAuthorInfo(el('main', {}, authorCard)),
+    {name, userId: AUTHOR, url: profile(AUTHOR)});
+});
+
+test('enterprise nickname selection retains emoji and legitimate organization words inside the nickname', () => {
+  const authorCard = el('div', {'data-e2e': 'user-info'},
+    link(AUTHOR, el('div', {'data-click-from': 'title'},
+      el('span', {}, '我的官方账号体验', el('img', {alt: '🚗'})),
+      el('div', {}, '认证徽章', el('span', {'data-e2e': 'badge-role-name'}, '另一家公司官方账号')))));
+  assert.equal(extractDouyinAuthorInfo(el('main', {}, authorCard)).name, '我的官方账号体验🚗');
+});

@@ -35,3 +35,6 @@ StarVoice-extension.zip
 
 # Only immutable public extension packages; internal releases stay outside this tree.
 public-downloads/
+
+# Local Android pilot release bundles
+/artifacts/android-pilot-*/

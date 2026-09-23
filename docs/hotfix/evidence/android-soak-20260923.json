@@ -1,0 +1,385 @@
+{
+  "date": "2026-09-23",
+  "scope": "isolated Android phone and actual P0 browser extension; no production writes",
+  "attempts": [
+    {
+      "id": "C",
+      "runId": "a51f6bae-045e-45c4-b83d-9d55ccdd9f26",
+      "seconds": 456,
+      "passed": false,
+      "cause": "leading_author_marker_mismatch"
+    },
+    {
+      "id": "D",
+      "seconds": 1679,
+      "events": 41,
+      "uniqueCandidates": 30,
+      "deliveredCandidates": 29,
+      "newRecords": 20,
+      "formalComments": 201,
+      "passed": false,
+      "cause": "caption_inline_emoji_missing"
+    },
+    {
+      "id": "E",
+      "startedAt": "2026-09-23T10:40:57.004Z",
+      "status": "failed",
+      "minimumMs": 3600000,
+      "elapsedMs": 1248229,
+      "cause": "author_certification_text_concatenated",
+      "events": 33,
+      "uniqueCandidates": 31,
+      "snapshotAt": "2026-09-23T11:02:15.806Z",
+      "deliveredAtSnapshot": 29,
+      "activeAtSnapshot": 1,
+      "needsActionAtSnapshot": 1
+    },
+    {
+      "id": "F",
+      "startedAt": "2026-09-23T11:07:58.472Z",
+      "status": "failed",
+      "minimumMs": 3600000,
+      "passed": false,
+      "elapsedMs": 220808,
+      "cause": "ui_source_default_5s_timeout",
+      "events": 4,
+      "uniqueCandidates": 4,
+      "deliveredCandidates": 4,
+      "newRecords": 0,
+      "formalComments": 8,
+      "stopScope": "discovery",
+      "deviceHeld": false,
+      "closureRequired": false
+    },
+    {
+      "id": "G",
+      "runId": "a3255603-9036-41d8-82bb-b013465fd25e",
+      "startedAt": "2026-09-23T11:22:29.896Z",
+      "status": "failed",
+      "minimumMs": 3600000,
+      "passed": false,
+      "cause": "short_link_dns_failed",
+      "elapsedMs": 1228373,
+      "events": 31,
+      "resolvedEvents": 30,
+      "pendingEvents": 1,
+      "uniqueCandidates": 29,
+      "deliveredCandidates": 29,
+      "newRecords": 4,
+      "formalComments": 101,
+      "deviceErrors": 0,
+      "sourceReads": 423,
+      "maxSourceReadMs": 6709
+    },
+    {
+      "id": "H",
+      "runId": "a8b2de76-6d7d-4d23-9ffb-2f9f87da93e9",
+      "startedAt": "2026-09-23T11:54:39.589Z",
+      "status": "failed",
+      "minimumMs": 3600000,
+      "passed": false,
+      "elapsedMs": 861446,
+      "cause": "scroll_default_5s_timeout",
+      "events": 20,
+      "resolvedEvents": 20,
+      "uniqueCandidates": 20,
+      "deliveredCandidates": 20,
+      "newRecords": 2,
+      "formalComments": 52,
+      "pendingEvents": 0,
+      "stopScope": "discovery",
+      "deviceHeld": false,
+      "closureRequired": false
+    }
+  ],
+  "liveRegression": {
+    "record": {
+      "id": "0d27e9ca-e133-4c22-a0b6-ec504c83aec9",
+      "external_id": "7688379052596749937",
+      "title": "换上新壁纸，感觉整个人的磁场都变强了🚩。#汽车里的爱国情怀 #人民万岁",
+      "content": "换上新壁纸，感觉整个人的磁场都变强了🚩。#汽车里的爱国情怀 #人民万岁",
+      "author_name": "青椒炒红椒",
+      "platform": "douyin",
+      "note_type": "image",
+      "comments_count": 3,
+      "comments_total_captured": 1,
+      "business_visibility": "eligible"
+    },
+    "source": "isolated API snapshot and native Chrome AX observations",
+    "mobileRunRemainsStopped": true,
+    "browserUi": {
+      "profile": "StarVoice P0",
+      "beforeTabs": [
+        "Extensions - StarVoice P0 本地测试",
+        "StarVoice 星语｜AI舆情巡检工具",
+        "换上新壁纸，感觉整个人的磁场都变强了🚩。#汽车里的爱国情怀 - 抖音"
+      ],
+      "afterTabs": [
+        "Extensions - StarVoice P0 本地测试"
+      ],
+      "temporaryPageAndRunnerClosed": true
+    },
+    "checkedAt": "2026-09-23T10:40:54.106Z"
+  },
+  "unitTests": {
+    "node18": 393,
+    "node24": 393,
+    "allPassed": true
+  },
+  "detailIntegrationTests": {
+    "businessScenarios": 15,
+    "includingParent": 16,
+    "allPassed": true
+  },
+  "productionWrites": 0,
+  "sourceHashes": {
+    "background.js": "2e304b42d662316556f5277365590a6a41dbe0f592eca52aa2b8934bcaf38aff",
+    "sidebar/sidebar-logic.js": "160eee69d6e93b32777b9c397fc5779ddeca5cc30abc41f65f159941714cf005",
+    "utils/cloud-targeted-post.js": "fefed3515ce10d77d6dcd3e2274eb107ff9c20ba08cc5e410731f94fabb192e5",
+    "utils/capture/douyin-inline-text.js": "38c5f3bc37a79195d5ffa8b95510a883f35b9e5684633638e91bf35645ac9fde",
+    "utils/capture/douyin-author.js": "dc40583ac3d1d3ca06e18423974f6a5a4f752684515ba7808d75283d43d3ccaa",
+    "utils/capture/douyin-single-note.js": "79f897cd0c3a06cbc2e331d1f29ca2ba0a8057d8bdc1509c45f413ce66ec7741",
+    "server/services/capture-discovery/management.js": "68b727a5381e7b7c897c80a9c0c72f4b8811f17163e5c7cba3fe68a4d0189866",
+    "server/services/capture-discovery/ui-binding.js": "d509f88baa477b0322280ff33c3eee67cf769c69bfc4520b0907c2cbde22c44b",
+    "runners/android/src/device/ui-session.mjs": "d3983f4ec43aef1d82492459475490206b62fc99a1de286974562933276de32b",
+    "runners/android/test/ui-session-read-budget.test.mjs": "cb57320bef2cc31b5985a9b3fe6ee058422781121791bd0bd3a1feb51e124959",
+    "server/services/capture-discovery/share-dns.js": "d61b4583b3a66a9b2d2a2c3d68643ab3361ff1d40882ccdbaae05d5491ee169d",
+    "tests/capture-discovery-dns.test.mjs": "d0499f486d40afcfb17e8048a3c265b86d979eaee88ff26784693a6b218ef37a"
+  },
+  "enterpriseAuthorRegression": {
+    "at": "2026-09-23T11:07:56.432Z",
+    "record": {
+      "id": "cc63806d-6d76-4f6c-8d20-8270579883d8",
+      "external_id": "7688638185542934650",
+      "title": "#君越 #别克 #梦中情车 #这车有点帅 #高颜值的车",
+      "content": "#君越 #别克 #梦中情车 #这车有点帅 #高颜值的车",
+      "author_name": "别克-山东润通(济南润华公园店)",
+      "platform": "douyin",
+      "note_type": "image",
+      "comments_count": 0,
+      "comments_total_captured": 0,
+      "business_visibility": "eligible"
+    },
+    "exactAuthorMatched": true,
+    "originalMobileRunStatus": "completed"
+  },
+  "authorCaptionTests": {
+    "node18": 25,
+    "node24": 25,
+    "allPassed": true
+  },
+  "uiReadBudgetRegression": {
+    "node": "24.12.0",
+    "runnerTests": 116,
+    "allPassed": true,
+    "oldCodeFailsAtMs": 5002,
+    "fixedCodePassesAfterMs": 5530,
+    "explicitDeadlineHonored": true,
+    "parentAbortHonored": true,
+    "preAbortedPreventsIO": true,
+    "overlayGuardRetained": true,
+    "directReadTimeoutMs": 10000,
+    "wholeActionTimeoutMs": 60000,
+    "realDevice": {
+      "source": "Appium method timing and real runner action logs",
+      "copyStartedAt": "2026-09-23T11:28:26.322Z",
+      "copyFinishedAt": "2026-09-23T11:28:44.132Z",
+      "slowReadMs": 6709,
+      "copyDurationMs": 17810,
+      "transport": [
+        {
+          "at": "2026-09-23T11:28:26.308Z",
+          "name": "source",
+          "ms": 5658
+        },
+        {
+          "at": "2026-09-23T11:28:30.157Z",
+          "name": "source",
+          "ms": 3835
+        },
+        {
+          "at": "2026-09-23T11:28:30.187Z",
+          "name": "getClipboard",
+          "ms": 22
+        },
+        {
+          "at": "2026-09-23T11:28:30.225Z",
+          "name": "setClipboard",
+          "ms": 37
+        },
+        {
+          "at": "2026-09-23T11:28:30.246Z",
+          "name": "getClipboard",
+          "ms": 20
+        },
+        {
+          "at": "2026-09-23T11:28:31.222Z",
+          "name": "findElements",
+          "ms": 975
+        },
+        {
+          "at": "2026-09-23T11:28:32.315Z",
+          "name": "clickElement",
+          "ms": 1092
+        },
+        {
+          "at": "2026-09-23T11:28:32.483Z",
+          "name": "source",
+          "ms": 168
+        },
+        {
+          "at": "2026-09-23T11:28:32.679Z",
+          "name": "findElements",
+          "ms": 192
+        },
+        {
+          "at": "2026-09-23T11:28:32.768Z",
+          "name": "clickElement",
+          "ms": 88
+        },
+        {
+          "at": "2026-09-23T11:28:32.788Z",
+          "name": "getClipboard",
+          "ms": 19
+        },
+        {
+          "at": "2026-09-23T11:28:33.071Z",
+          "name": "getClipboard",
+          "ms": 31
+        },
+        {
+          "at": "2026-09-23T11:28:33.970Z",
+          "name": "source",
+          "ms": 898
+        },
+        {
+          "at": "2026-09-23T11:28:34.033Z",
+          "name": "findElements",
+          "ms": 62
+        },
+        {
+          "at": "2026-09-23T11:28:34.093Z",
+          "name": "clickElement",
+          "ms": 60
+        },
+        {
+          "at": "2026-09-23T11:28:40.803Z",
+          "name": "source",
+          "ms": 6709
+        },
+        {
+          "at": "2026-09-23T11:28:44.092Z",
+          "name": "source",
+          "ms": 3278
+        },
+        {
+          "at": "2026-09-23T11:28:44.132Z",
+          "name": "setClipboard",
+          "ms": 31
+        },
+        {
+          "at": "2026-09-23T11:28:44.323Z",
+          "name": "back",
+          "ms": 190
+        }
+      ]
+    }
+  },
+  "dnsRetryRegression": {
+    "node18": 23,
+    "node24": 23,
+    "allPassed": true,
+    "maximumDnsAttempts": 2,
+    "serviceDeadlineMs": 3000,
+    "readOnlyProbe": {
+      "at": "2026-09-23T11:47:10.401Z",
+      "eventId": "009af1b9-587f-56de-8b26-b39e0f40ae2f",
+      "ms": 893,
+      "result": {
+        "status": "resolved",
+        "externalId": "7688610654147720305",
+        "canonicalUrl": "https://www.douyin.com/note/7688610654147720305"
+      }
+    },
+    "explicitReprocess": {
+      "startedAt": "2026-09-23T11:54:09.165Z",
+      "finishedAt": "2026-09-23T11:54:09.965Z",
+      "runId": "a3255603-9036-41d8-82bb-b013465fd25e",
+      "candidate": {
+        "id": "b14510ac-bbc1-4d3f-ada2-0d4adf3c5bc8",
+        "externalId": "7688610654147720305",
+        "canonicalUrl": "https://www.douyin.com/note/7688610654147720305",
+        "status": "already_exists",
+        "demandStatus": "fulfilled",
+        "recordId": "5fc3c4a2-5268-408b-b59c-8d34425ceec8",
+        "recordVisibility": "eligible",
+        "triageStatus": null,
+        "titleHint": "听说最近别克很火，巧了刚好我有俩！！！#晚霞下的君越 #晚霞下的昂科威#爱车与秋景",
+        "authorHint": "Zh ❛‿˂̵ ao🧸ྀིɞ静",
+        "keyword": "别克壁纸",
+        "reason": ""
+      }
+    },
+    "doesNotCountAsAutonomousWindow": true
+  },
+  "scrollBudgetRegression": {
+    "node": "24.12.0",
+    "runnerTests": 118,
+    "allPassed": true,
+    "oldCodeFailsAtMs": 5097,
+    "fixedCodePassesAfterMs": 5528,
+    "scrollTimeoutMs": 10000,
+    "wholeActionTimeoutMs": 60000,
+    "oneGestureOnly": true,
+    "explicitShortDeadlineHonored": true,
+    "requiresConfirmedClosureOnTimeout": true,
+    "realPostFixLongWindowRun": false
+  },
+  "releaseDecision": {
+    "target": "single-phone pilot",
+    "userRequestedReleaseFocus": true,
+    "noMoreLongTestWindows": true,
+    "longStabilityPassed": false,
+    "threeRoundBusinessComparisonPassed": false,
+    "deferredToPilotObservation": [
+      "continuous long-run stability",
+      "three-round mobile-versus-web comparison"
+    ],
+    "productionDeployment": false
+  },
+  "releaseCompatibility": {
+    "referenceCommit": "c06c7cb5d9eb93ff9ae5f795645999755543bfb8",
+    "candidateVersion": "0.4.13",
+    "node18Tests": 894,
+    "node24Tests": 894,
+    "postgresNode18Tests": 47,
+    "runnerNode24Tests": 118,
+    "adminBuildPassed": true,
+    "targetedAdminLintPassed": true,
+    "moduleCount": 82,
+    "largestModuleLines": 264
+  },
+  "finalCleanup": {
+    "at": "2026-09-23T12:36:50.037Z",
+    "counts": {
+      "test_tenants": 0,
+      "discovery_events": 0,
+      "candidates": 0
+    },
+    "migrations": [
+      "086_capture_discovery.sql",
+      "087_android_control.sql",
+      "088_discovery_detail_jobs.sql",
+      "089_discovery_ui_binding.sql"
+    ],
+    "checkedAt": "2026-09-23T12:46:34.726934+00:00",
+    "portsClosed": {
+      "3001": true,
+      "4723": true,
+      "55492": true
+    },
+    "phoneTextBoomRestored": 1,
+    "privateCredentialsRemoved": true,
+    "productionExtensionUnchanged": true
+  }
+}

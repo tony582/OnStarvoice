@@ -258,7 +258,7 @@ function buildSidebarTaskRun(taskContext, patch = {}) {
     taskType: String(taskContext.taskType || "task"),
     kind: String(taskContext.taskType || "task"),
     featureKey: String(taskContext.featureKey || ""),
-    title: resolveTaskCenterTitle(
+    title: metadata.remoteManualTitle || resolveTaskCenterTitle(
       taskContext.taskType,
       taskContext.featureKey,
     ),
@@ -302,11 +302,13 @@ function buildSidebarTaskRun(taskContext, patch = {}) {
 }
 
 function beginSidebarTask({
+  taskId = "",
   taskType = "task",
   featureKey = "unknown",
   metadata = {},
 } = {}) {
   const taskContext = beginTaskContext({
+    taskId,
     taskType,
     featureKey,
     source: "sidebar",
@@ -3365,6 +3367,8 @@ export async function initSidebar() {
     populateMonitorSettingsForm(DEFAULT_MONITOR_SETTINGS);
   }
 
+  void runRemoteManualKeywordBatch().catch(error => showMessage(error.message, "error"));
+
   void maybeClaimAndRunUnattendedKeywordPlan({allowPending: true}).catch((error) => {
     console.error("[Sidebar] Initial unattended keyword plan failed:", error);
   });
@@ -5129,6 +5133,7 @@ function isTargetedProfileDiscoveryWorkflow(workflow = "", targetMode = "") {
 
 function getTargetedWorkflowLabel(workflow = "") {
   const normalized = String(workflow || "").trim();
+  if (normalized === "discovered_post_capture") return "手机发现作品补详情";
   if (normalized === "watched_content_patrol") {
     return "关注内容巡查";
   }
@@ -8308,7 +8313,73 @@ function getSearchBatchKeywordsFromTextarea() {
     .filter(Boolean);
 }
 
-async function handleCaptureSearchData() {
+function getRemoteManualKeywordBatchId() {
+  return new URLSearchParams(window.location.search).get("manualKeywordBatch") || "";
+}
+
+async function runRemoteManualKeywordBatch() {
+  const id = getRemoteManualKeywordBatchId();
+  if (!id) return;
+  const receipt = await chrome.runtime.sendMessage({type: "onstarvoice:claim-manual-keyword-batch", id});
+  if (!receipt?.ok) {
+    showMessage("这份手动采集指令已经领取或当前无法启动，请核对本地任务记录。", "warning");
+    return;
+  }
+  const {plan, title} = receipt.data;
+  let executionLock = null;
+  try {
+    executionLock = await acquireCaptureExecutionLock({owner: "manual_search_capture", label: "手动批量关键词采集"});
+    if (!executionLock) throw new Error("本地已有采集任务，请结束后重新手动启动");
+    const switched = await chrome.runtime.sendMessage({type: "onstarvoice:switch-platform-tab", platform: plan.platform});
+    if (!switched?.ok) throw new Error(switched?.error?.message || "打开采集平台失败");
+    const navigation = await navigateActiveTabToKeywordSearchForPlan({
+      keyword: plan.keywords[0], platform: plan.platform, tabId: switched.data.tabId,
+      baseSearchUrl: switched.data.url, maxAttempts: 1,
+    });
+    if (!navigation?.initialSearchEvidence?.ready) throw new Error("搜索页面未就绪，请在 Extension 核对后手动启动");
+    manualSelectedPlatform = plan.platform;
+    if (plan.captureSettings?.autoDetailCaptureAfterListCapture && !isAuthVerified(getCurrentAuth())) {
+      throw new Error("采集增强需要先完成 Extension 授权验证");
+    }
+    const settings = await saveCaptureSettings({
+      ...(plan.captureSettings || {}),
+      ...(plan.keywordMaxDetectedItems == null ? {} : {keywordMaxDetectedItems: plan.keywordMaxDetectedItems}),
+      keywordMinLikes: plan.keywordMinLikes || 0,
+    });
+    await initCaptureSettingsUI();
+    syncDetailCaptureControlsFromStoredSettings(settings, {platform: plan.platform});
+    window.activateSidebarTab?.("searchTab");
+    setSearchExecutionMode("manual");
+    document.getElementById("chkSearchBatchMode").checked = true;
+    document.getElementById("searchBatchKeywordGroup").hidden = false;
+    document.getElementById("searchSingleKeywordGroup").hidden = true;
+    document.getElementById("textareaSearchBatchKeywords").value = plan.keywords.join("\n");
+    document.getElementById("inputKeywordMinLikes").value = String(settings.keywordMinLikes);
+    document.getElementById("inputKeywordMaxDetectedItems").value = String(settings.keywordMaxDetectedItems);
+    document.getElementById("inputSearchScheduledStart").value = plan.manualStartTime || "";
+    syncSearchFilterControlsForPlatform(plan.platform, {scope: "search", values: plan.searchFilters});
+    persistCurrentBatchDraft();
+    showMessage(`已设置手动批量采集：${plan.keywords.length} 个关键词`, "success");
+    const result = await handleCaptureSearchData({manualTaskId: id, manualTaskTitle: title,
+      sourceTabId: navigation.tabId, executionLock});
+    if (!result?.started) throw new Error("手动采集未启动，请检查页面和授权状态");
+  } catch (error) {
+    await reportSidebarTaskRun({
+      id, taskType: "capture", featureKey: "capture.search", title, platform: plan.platform,
+      status: "needs_action", finishedAt: new Date().toISOString(),
+      message: error.message, error: {code: "MANUAL_BATCH_START_FAILED", message: error.message},
+      metadata: {executionMode: "manual_batch", remoteManual: true},
+    });
+    showMessage(error.message, "error");
+  } finally {
+    if (executionLock) await releaseCaptureExecutionLock(executionLock.id);
+    await chrome.runtime.sendMessage({type: "onstarvoice:finish-manual-keyword-batch", id});
+  }
+}
+
+async function handleCaptureSearchData(options = {}) {
+  const runOptions = options && typeof options.preventDefault !== "function" ? options : {};
+  const manualTaskId = String(runOptions.manualTaskId || "");
   const runtime = getCurrentRuntime();
   const selectedPlatform = getViewPlatform(runtime);
   const pagePlatform = getPagePlatform(runtime);
@@ -8334,12 +8405,15 @@ async function handleCaptureSearchData() {
   let activeTabUrl = runtime?.lastPageUrl || "";
   let searchActiveTabId = null;
   try {
-    const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
+    const tab = runOptions.sourceTabId
+      ? await chrome.tabs.get(runOptions.sourceTabId)
+      : (await chrome.tabs.query({active: true, currentWindow: true}))[0];
     if (tab?.url) {
       activeTabUrl = tab.url;
     }
     if (tab?.id != null) searchActiveTabId = tab.id;
   } catch {
+    if (runOptions.sourceTabId) throw new Error("指定的手动采集页面已关闭");
     // ignore and fallback to runtime url
   }
 
@@ -8372,12 +8446,15 @@ async function handleCaptureSearchData() {
   }
 
   const taskContext = beginSidebarTask({
+    taskId: manualTaskId,
     taskType: "capture",
     featureKey: "capture.search",
     metadata: {
       platform: pagePlatform,
       pageType: runtime?.pageType || "",
       keyword,
+      ...(manualTaskId ? {executionMode: "manual_batch", remoteManual: true,
+        remoteManualTitle: String(runOptions.manualTaskTitle || "")} : {}),
     },
   });
   let taskStatus = "completed";
@@ -8395,6 +8472,7 @@ async function handleCaptureSearchData() {
     );
     streamingSyncQueue = createStreamingDetailAutoSyncQueue(settings, {
       shouldStop: () => searchCaptureCancelRequested,
+      captureTaskId: manualTaskId,
     });
     if (
       settings.autoDetailCaptureAfterListCapture &&
@@ -8405,7 +8483,7 @@ async function handleCaptureSearchData() {
       taskStatus = "skipped";
       return;
     }
-    executionLock = await acquireCaptureExecutionLock({
+    executionLock = runOptions.executionLock || await acquireCaptureExecutionLock({
       owner: "manual_search_capture",
       label: searchBatchMode ? "手动批量关键词采集" : "手动搜索页采集",
     });
@@ -8817,6 +8895,7 @@ async function handleCaptureSearchData() {
       await releaseCaptureExecutionLock(executionLock.id);
     }
   }
+  return {started: true, status: taskStatus};
 }
 
 function setKeywordStrategyTab(tab = "opportunity") {
@@ -13666,7 +13745,8 @@ function buildStreamingSyncTaskIssue(stats = {}) {
   const failedCount = Number(stats.failedCount || 0);
   const remainingCount = Number(stats.remainingCount || 0);
   const blocked = Boolean(stats.blocked);
-  if (!blocked && failedCount === 0 && remainingCount === 0) {
+  const drainIncomplete = stats.drainCompleted === false;
+  if (!blocked && !drainIncomplete && failedCount === 0 && remainingCount === 0) {
     return null;
   }
   const successCount = Number(stats.successCount || 0);
@@ -13676,7 +13756,18 @@ function buildStreamingSyncTaskIssue(stats = {}) {
     message: [
       blockedReason ? `数据同步未完成：${blockedReason}` : "数据同步未全部完成",
       `成功 ${successCount}，失败 ${failedCount}，待上传 ${remainingCount}`,
+      ...(drainIncomplete ? ["同步队列尚未收尾"] : []),
     ].join("；"),
+  };
+}
+
+function resolveUnattendedCompletionOutcome(stats = {}, streamingSync = {}) {
+  const error = buildStreamingSyncTaskIssue(streamingSync || {});
+  return {
+    status: Number(stats.failed || 0) > 0 || Number(stats.partial || 0) > 0 || error
+      ? "completed_with_failures"
+      : "completed",
+    error,
   };
 }
 
@@ -17350,6 +17441,7 @@ function scheduleTargetedPostReconcileRetry() {
 }
 
 async function maybeClaimAndRunTargetedPostWorkflow() {
+  if (getRemoteManualKeywordBatchId()) return;
   const requestId = getTargetedPostRunRequestIdFromUrl();
   if (!requestId) {
     return;
@@ -17580,7 +17672,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       : []
     ).filter((target) => !settledItemIds.has(String(target?.itemId || "")));
     if (pendingTargets.length > 0 && !shouldStop()) {
-      if (targetedWorkflow === "negative_post_patrol") {
+      if (cloudTargetedPostApi.usesOwnedPlatformTab(targetedWorkflow)) {
         const targetTabResponse = await chrome.runtime.sendMessage({
           type: "onstarvoice:open-targeted-post-platform-tab",
           requestId: String(request.id || "").trim(),
@@ -17825,6 +17917,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
               [
                 "negative_post_patrol",
                 "watched_content_patrol",
+                "discovered_post_capture",
               ].includes(targetedWorkflow),
             includeComments: captureSettings.includeComments === true,
             includeBloggerMetrics:
@@ -18130,7 +18223,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       ))
     ) {
       await settleTargetedPostRunnerTab(targetTabId, request?.platform, {
-        returnHome: String(request?.status || "") !== "needs_action",
+        returnHome: !cloudTargetedPostApi.shouldPreservePlatformTab(request),
         targets: request?.targets,
       });
     }
@@ -18161,6 +18254,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
 }
 
 async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}) {
+  if (getRemoteManualKeywordBatchId()) return;
   if (getTargetedPostRunRequestIdFromUrl()) {
     return;
   }
@@ -20122,12 +20216,15 @@ async function runUnattendedKeywordPlanRequest(request) {
       success: stats.success,
       failed: stats.failed,
     };
-    const status =
-      stats.failed > 0 || stats.partial > 0
-        ? "completed_with_failures"
-        : "completed";
+    const completion = resolveUnattendedCompletionOutcome(
+      stats,
+      batchRunResult?.streamingSync,
+    );
+    const status = completion.status;
     unattendedCaptureTaskStatus = status;
-    const message = `${executionCopy.taskLabel}${status === "completed_with_failures" ? "部分" : ""}完成：共 ${stats.total} 个${sequentialSearchEnabled ? "巡检步骤" : "关键词次"}，完整完成 ${stats.success}，部分完成 ${stats.partial}，失败 ${stats.failed}`;
+    const message = completion.error
+      ? `${executionCopy.taskLabel}采集已结束；${completion.error.message}`
+      : `${executionCopy.taskLabel}${status === "completed_with_failures" ? "部分" : ""}完成：共 ${stats.total} 个${sequentialSearchEnabled ? "巡检步骤" : "关键词次"}，完整完成 ${stats.success}，部分完成 ${stats.partial}，失败 ${stats.failed}`;
     const finishedAt = new Date().toISOString();
     await reportUnattendedTerminalRun(
       requestId,
@@ -20143,9 +20240,10 @@ async function runUnattendedKeywordPlanRequest(request) {
           success: stats.success,
           failed: stats.failed,
           skipped: stats.skipped,
-          warnings: stats.partial,
+          warnings: Math.max(stats.partial, completion.error ? 1 : 0),
         }),
         message,
+        ...(completion.error ? {error: completion.error} : {}),
         progress: createTerminalProgress({
           status,
           finishedAt,

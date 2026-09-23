@@ -10,6 +10,10 @@ export class AuthorDomNode {
       if (child instanceof AuthorDomNode) child.parentElement = this;
     }
   }
+  get nodeType() { return 1; }
+  get childNodes() {
+    return this.children.map(child => typeof child === 'string' ? {nodeType: 3, textContent: child} : child);
+  }
   get textContent() {
     return this.children.map(child => typeof child === 'string' ? child : child.textContent).join('');
   }
@@ -25,10 +29,14 @@ export class AuthorDomNode {
       let node = this;
       if (!node.matchesSimple(segments.pop())) return false;
       while (segments.length) {
+        const directChild = segments.at(-1) === '>';
+        if (directChild) segments.pop();
         const ancestorSelector = segments.pop();
         node = node.parentElement;
-        while (node && !node.matchesSimple(ancestorSelector)) node = node.parentElement;
-        if (!node) return false;
+        if (!directChild) {
+          while (node && !node.matchesSimple(ancestorSelector)) node = node.parentElement;
+        }
+        if (!node?.matchesSimple(ancestorSelector)) return false;
       }
       return true;
     });

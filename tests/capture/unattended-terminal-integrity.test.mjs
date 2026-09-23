@@ -30,6 +30,34 @@ const terminalContext = vm.createContext({});
 vm.runInContext(functionSource("buildUnattendedTerminalProgress"), terminalContext);
 const terminal = terminalContext.buildUnattendedTerminalProgress;
 
+vm.runInContext(functionSource("buildStreamingSyncTaskIssue"), terminalContext);
+vm.runInContext(functionSource("resolveUnattendedCompletionOutcome"), terminalContext);
+
+test("collected keyword with one undelivered record cannot report complete", () => {
+  const outcome = terminalContext.resolveUnattendedCompletionOutcome(
+    {success: 1, failed: 0, partial: 0},
+    {enabled: true, enqueuedCount: 15, successCount: 14, failedCount: 1,
+      remainingCount: 0, drainCompleted: true},
+  );
+  assert.equal(outcome.status, "completed_with_failures");
+  assert.equal(outcome.error.code, "STREAMING_SYNC_INCOMPLETE");
+  assert.match(outcome.error.message, /成功 14，失败 1，待上传 0/u);
+});
+
+test("completion respects blocked, pending and unfinished delivery without failing excluded records", () => {
+  for (const sync of [{blocked:true}, {remainingCount:1}, {drainCompleted:false}]) {
+    const outcome = terminalContext.resolveUnattendedCompletionOutcome(
+      {success:1}, {enabled:true, ...sync},
+    );
+    assert.equal(outcome.status, "completed_with_failures");
+    assert.ok(outcome.error);
+  }
+  for (const sync of [null, {enabled:false},
+    {enabled:true,successCount:14,failedCount:0,remainingCount:0,excludedCount:5,drainCompleted:true}]) {
+    assert.equal(terminalContext.resolveUnattendedCompletionOutcome({success:1}, sync).status, "completed");
+  }
+});
+
 test("startup failure displays zero progress at its actual first step", () => {
   const progress = terminal({
     status: "failed", taskTotal: 2, roundTotal: 2, roundCurrent: 1,

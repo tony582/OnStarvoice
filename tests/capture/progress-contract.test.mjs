@@ -855,7 +855,7 @@ test("unattended terminal report owns the final structured progress snapshot", (
     runSection,
     /updateCaptureTaskSession\(\{[\s\S]*?progress: unattendedCaptureTaskTerminalProgress/,
   );
-  assert.match(runSection, /warnings: stats\.partial/);
+  assert.match(runSection, /warnings: Math\.max\(stats\.partial, completion\.error \? 1 : 0\)/);
   assert.match(runSection, /processed:\s*stats\.success \+ stats\.partial/);
 
   const drainSection = readSection(

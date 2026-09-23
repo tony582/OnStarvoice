@@ -30,6 +30,10 @@ test('extension update manifest matches the packaged source version', () => {
   assert.equal(OPS_CONTROL_RUNTIME_BASELINE_VERSION, manifest.version);
   assert.match(
     JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases[0]?.releaseNotes),
+    /安卓手机搜索发现[\s\S]*补采完成后自动关页[\s\S]*正文与作者显示/u,
+  );
+  assert.match(
+    JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.12')?.releaseNotes),
     /无人值守采集不再误判旧运行页[\s\S]*失败上报保留错误码/u,
   );
   assert.match(
@@ -48,7 +52,7 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[1]?.version, '0.4.11');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[1]?.version, '0.4.12');
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);

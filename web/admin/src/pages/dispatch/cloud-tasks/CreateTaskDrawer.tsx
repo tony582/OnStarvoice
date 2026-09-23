@@ -22,7 +22,7 @@ import type { OrchestrationLaunchIntent } from './types'
 // 单节点配置复用 AgentTaskCreator；多节点直接进入编排器，在平台和采集规则确定后只选一次节点。
 type WizardStep = 'type' | 'method' | 'agents' | 'configure'
 type TaskType = CloudCreateTaskType
-type ExecutionMethod = 'single' | 'multi'
+type ExecutionMethod = 'single' | 'multi' | 'manual_average'
 
 const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string; note: string; icon: LucideIcon; planned: boolean }> = [
   { value: 'keyword', title: '关键词采集', description: '按关键词在小红书、抖音搜索并采集匹配帖子。', note: '一次性补采', icon: Search, planned: false },
@@ -34,6 +34,7 @@ const TASK_TYPE_CARDS: Array<{ value: string; title: string; description: string
 ]
 
 const EXECUTION_METHODS: Array<{ value: ExecutionMethod; title: string; description: string; icon: LucideIcon }> = [
+  { value: 'manual_average', title: '平均下发手动采集', description: '把关键词和完整设置均分给所选 Extension，启动本地手动批量采集。', icon: Network },
   { value: 'single', title: '固定一个节点', description: '只交给指定 Agent；节点离线时任务原地等待，不自动转交。', icon: Bot },
   { value: 'multi', title: '弹性节点池（推荐）', description: '工作项留在云端，哪个兼容节点先空闲就先领取一个。', icon: Network },
 ]
@@ -115,6 +116,7 @@ export function CreateTaskDrawer({
     ['negative_patrol', 'watched_content'].includes(presetTaskType || '') ? 'multi' : 'single'
   ))
   const [selectedAgentIds, setSelectedAgentIds] = useState<string[]>(presetAgentId ? [presetAgentId] : [])
+  const [manualDispatchStarted, setManualDispatchStarted] = useState(false)
 
   const mode: 'one_time' | 'unattended_plan' = taskType === 'unattended_plan' ? 'unattended_plan' : 'one_time'
   const selectedAgent = agents.find(agent => agent.id === selectedAgentIds[0])
@@ -124,6 +126,7 @@ export function CreateTaskDrawer({
   // 已选节点里当前仍可接单的（任务类型回退修改后，原选择可能因能力/平台不符被阻断）。
   const selectedAssignableIds = selectedAgentIds.filter(id => {
     const agent = agents.find(candidate => candidate.id === id)
+    if (method === 'manual_average' && agent?.capabilities?.remoteManualKeywordBatchV1 !== true) return false
     return agent ? !agentTaskTypeBlockReason(agent, taskType, negativePatrolEnabled && taskType === 'unattended_plan' ? 'one_time' : mode) : false
   })
   const showIndicator = !editingExisting
@@ -142,6 +145,7 @@ export function CreateTaskDrawer({
     : STEP_LABELS
 
   const goBack = () => {
+    if (manualDispatchStarted) return onClose()
     if (step === 'configure') {
       if (startsAtConfigure) return onClose()
       if (taskType === 'negative_patrol') return setStep('type')
@@ -195,7 +199,7 @@ export function CreateTaskDrawer({
 
   // 步骤条回退：锁定 Agent 的链路只能回到任务类型，避免绕过锁定。
   const canBackTo = (target: WizardStep) => {
-    if (editingExisting) return false
+    if (editingExisting || manualDispatchStarted) return false
     if (presetAgentId) return target === 'type'
     return true
   }
@@ -224,9 +228,9 @@ export function CreateTaskDrawer({
     <Drawer onClose={onClose} width="xl" labelledBy="create-task-title" closeOnOverlay={false}>
       <header className="shrink-0 border-b border-border/70 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] sm:px-6">
         <div className="flex items-start gap-3">
-          <button type="button" onClick={goBack} aria-label={atFirstStep ? '关闭任务创建' : '返回上一步'} data-dialog-initial-focus
+          <button type="button" onClick={goBack} aria-label={atFirstStep || manualDispatchStarted ? '关闭任务创建' : '返回上一步'} data-dialog-initial-focus
             className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-border text-muted-foreground hover:bg-muted hover:text-foreground">
-            {atFirstStep ? <X className="h-5 w-5" /> : <ArrowLeft className="h-5 w-5" />}
+            {atFirstStep || manualDispatchStarted ? <X className="h-5 w-5" /> : <ArrowLeft className="h-5 w-5" />}
           </button>
           <div className="min-w-0 flex-1">
             <h2 id="create-task-title" className="text-lg font-bold text-foreground">{editingExisting ? '修改无人值守计划' : '新建任务'}</h2>
@@ -235,7 +239,7 @@ export function CreateTaskDrawer({
                 ? '更新该设备的无人值守计划，保存后覆盖原计划。'
                 : taskType === 'negative_patrol'
                   ? '先选择巡查帖子，再按帖子平台匹配执行节点。'
-                  : '先选择任务类型，再决定固定给一个节点，还是交给弹性节点池。'}
+                  : '先选择任务类型，再选择执行方式和节点。'}
             </p>
           </div>
         </div>
@@ -270,6 +274,7 @@ export function CreateTaskDrawer({
                     onClick={() => {
                       if (!item.planned) {
                         setTaskType(item.value as TaskType)
+                        if (item.value !== 'keyword' && method === 'manual_average') setMethod('single')
                         if (['negative_patrol', 'watched_content'].includes(item.value)) {
                           setMethod('multi')
                         } else if (['comment_patrol', 'creator_patrol'].includes(item.value)) {
@@ -299,10 +304,10 @@ export function CreateTaskDrawer({
           <div className="mx-auto max-w-2xl">
             <div className="mb-4">
               <h3 className="text-base font-bold">怎么执行这批采集？</h3>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">固定节点适合必须保留同一浏览器现场的任务；弹性池适合可拆分的批量工作。</p>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">{taskType === 'keyword' ? '平均下发会为每个节点设置并启动本地手动批量采集；也可以选择固定节点或弹性节点池执行云端任务。' : '固定节点适合必须保留同一浏览器现场的任务；弹性池适合可拆分的批量工作。'}</p>
             </div>
             <div className="grid gap-3 sm:grid-cols-2" role="radiogroup" aria-label="执行方式">
-              {EXECUTION_METHODS.filter(item => !presetAgentId || item.value === 'single').map(item => {
+              {EXECUTION_METHODS.filter(item => (!presetAgentId || item.value === 'single') && (item.value !== 'manual_average' || taskType === 'keyword')).map(item => {
                 const Icon = item.icon
                 const selected = method === item.value
                 const unavailable = ['comment_patrol', 'creator_patrol'].includes(taskType) && item.value === 'multi'
@@ -352,9 +357,9 @@ export function CreateTaskDrawer({
         {step === 'agents' && (
           <div className="mx-auto max-w-2xl">
             <div className="mb-4">
-              <h3 className="text-base font-bold">{method === 'multi' ? '选择参与编排的节点' : '选择一个执行节点'}</h3>
+              <h3 className="text-base font-bold">{method === 'manual_average' ? '选择平均下发的节点' : method === 'multi' ? '选择参与编排的节点' : '选择一个执行节点'}</h3>
               <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                {method === 'multi'
+                {method === 'manual_average' ? '可多选；提交前预览每个节点的关键词，Extension 独立执行本地手动批量采集。' : method === 'multi'
                   ? contentPatrolTask
                     ? '可多选；帖子保留在云端，由这些兼容节点空闲时逐篇领取。'
                     : '可多选；关键词保留在云端，由这些兼容节点空闲时逐个领取。'
@@ -366,7 +371,8 @@ export function CreateTaskDrawer({
               tasks={tasks}
               mode={negativePatrolEnabled && taskType === 'unattended_plan' ? 'one_time' : mode}
               taskType={taskType}
-              multiple={method === 'multi'}
+              multiple={method !== 'single'}
+              manualBatch={method === 'manual_average'}
               selectedIds={selectedAgentIds}
               onChange={setSelectedAgentIds}
             />
@@ -406,14 +412,14 @@ export function CreateTaskDrawer({
                         : '关键词采集'}
                 </span>
                 <span aria-hidden="true">·</span>
-                <span>{method === 'multi' ? `多节点 · ${selectedAgents.length} 个 Agent` : '单个节点'}</span>
+                <span>{method === 'manual_average' ? `平均下发 · ${selectedAgents.length} 个节点` : method === 'multi' ? `多节点 · ${selectedAgents.length} 个 Agent` : '单个节点'}</span>
                 <span aria-hidden="true">·</span>
                 <span className="min-w-0 truncate">
-                  {method === 'multi'
+                  {method !== 'single'
                     ? selectedAgents.map(agent => agent.display_name).join('、')
                     : `${selectedAgent.host_label} › ${selectedAgent.display_name}`}
                 </span>
-                {!editingExisting && (
+                {!editingExisting && !manualDispatchStarted && (
                   <button type="button" onClick={goBack}
                     className="ml-auto min-h-7 shrink-0 rounded-md px-2 text-[11px] font-semibold text-primary hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
                     返回修改
@@ -458,6 +464,8 @@ export function CreateTaskDrawer({
                 <AgentTaskCreator
                   key={`${selectedAgent.id}:${mode}:${editingExisting ? 'edit' : 'new'}`}
                   agent={selectedAgent}
+                  manualBatchAgents={method === 'manual_average' ? selectedAgents : undefined}
+                  onManualDispatchStarted={() => setManualDispatchStarted(true)}
                   writable={writable}
                   initialExecutionMode={mode}
                   forceOpen

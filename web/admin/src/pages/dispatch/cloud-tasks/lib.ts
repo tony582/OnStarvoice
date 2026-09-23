@@ -771,6 +771,7 @@ export function automaticIdleAgentRecoveryEnabled(task: CloudTask) {
 }
 
 export function canStop(task: CloudTask) {
+  if (task.metadata?.executionMode === 'manual_batch' && task.pending_command_type !== 'create') return false;
   if (task.agent_capabilities?.remoteStop !== true) return false
   const status = task.status
   const activeOrRecoverable = [

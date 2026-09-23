@@ -19,6 +19,8 @@
     FOLLOWED_CREATOR_POST_WORKFLOW,
     OFFICIAL_ACCOUNT_POST_DISCOVERY_WORKFLOW,
   ]);
+  const DISCOVERED_POST_WORKFLOW = "discovered_post_capture";
+  SUPPORTED_WORKFLOWS.add(DISCOVERED_POST_WORKFLOW);
   const MAX_TARGETS = 100;
   const TERMINAL_STATUSES = new Set([
     "completed",
@@ -429,18 +431,27 @@
       requireOfficialCommentPatrolSettings(captureSettings);
     }
 
+    const isDiscoveredPost = workflow === DISCOVERED_POST_WORKFLOW;
+    if (isDiscoveredPost && platform !== "douyin") {
+      throw Object.assign(new Error("手机候选仅支持抖音"), {code: "DISCOVERY_PLATFORM_INVALID"});
+    }
     const seenItems = new Set();
     const seenRecords = new Set();
     const targets = rawTargets.map((rawTarget, index) => {
       const target = objectValue(rawTarget);
       const recordId = text(target.recordId, 240);
+      const candidateId = text(target.candidateId, 240);
+      if (isDiscoveredPost && (recordId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidateId))) {
+        throw Object.assign(new Error("手机候选标识无效"), {code: "DISCOVERY_CANDIDATE_INVALID"});
+      }
+      const identity = isDiscoveredPost ? candidateId : recordId;
       const itemId = text(target.itemId || recordId, 240);
-      if (!recordId || !itemId) {
+      if (!identity || !itemId) {
         throw Object.assign(new Error(`第 ${index + 1} 个目标缺少记录标识`), {
           code: "TARGET_RECORD_ID_REQUIRED",
         });
       }
-      if (seenItems.has(itemId) || seenRecords.has(recordId)) {
+      if (seenItems.has(itemId) || seenRecords.has(identity)) {
         throw Object.assign(new Error("定向采集目标重复"), {
           code: "TARGET_DUPLICATED",
         });
@@ -466,7 +477,7 @@
         });
       }
       seenItems.add(itemId);
-      seenRecords.add(recordId);
+      seenRecords.add(identity);
       const captureAttempt = {
         captureTaskItemAttemptId: text(
           target.captureTaskItemAttemptId || target.attemptId,
@@ -487,6 +498,11 @@
           ),
         ),
       };
+      if (isDiscoveredPost && (!captureAttempt.captureTaskItemAttemptId ||
+        !/^[a-f0-9]{64}$/.test(captureAttempt.captureTaskItemRequestHash) ||
+        captureAttempt.captureTaskItemAssignmentRevision < 1 || captureAttempt.captureTaskItemAttemptNumber < 1)) {
+        throw Object.assign(new Error("手机候选缺少执行凭据"), {code: "DISCOVERY_LINEAGE_REQUIRED"});
+      }
       if (isProfilePatrol) {
         const subscriptionId = text(
           target.subscriptionId || target.recordId,
@@ -524,6 +540,7 @@
         workflow,
         itemId,
         recordId,
+        ...(isDiscoveredPost ? {candidateId} : {}),
         externalId: canonical.externalId,
         url: canonical.url,
         routeKind: canonical.routeKind,
@@ -1277,6 +1294,15 @@
     return TERMINAL_STATUSES.has(text(value, 80));
   }
 
+  function usesOwnedPlatformTab(workflow) {
+    return [WORKFLOW, DISCOVERED_POST_WORKFLOW].includes(text(workflow, 80));
+  }
+
+  function shouldPreservePlatformTab(request = {}) {
+    return text(request.status, 80) === "needs_action" &&
+      text(request.workflow, 80) !== DISCOVERED_POST_WORKFLOW;
+  }
+
   root.OnStarvoiceCloudTargetedPost = Object.freeze({
     PROTOCOL_VERSION,
     WORKFLOW,
@@ -1301,5 +1327,7 @@
     createRunRequest,
     mergeRunPatch,
     isTerminalRunStatus,
+    usesOwnedPlatformTab,
+    shouldPreservePlatformTab,
   });
 })(typeof globalThis !== "undefined" ? globalThis : self);

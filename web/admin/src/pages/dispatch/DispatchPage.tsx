@@ -17,6 +17,7 @@ import { PlansView } from './cloud-tasks/PlansView'
 import { HistoryView } from './cloud-tasks/HistoryView'
 import { TaskResultDetailWorkspace } from './cloud-tasks/TaskResultDetailWorkspace'
 import { TaskCard } from './cloud-tasks/TaskCard'
+import { AndroidDiscoveryEntry } from './android-discovery/AndroidDiscoveryEntry'
 import type {
   CloudAgent,
   CloudTask,
@@ -50,7 +51,7 @@ function MobileDispatchMetric({ label, value, tone = 'text-foreground' }: { labe
 }
 
 export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'mobile' } = {}) {
-  const { canWrite } = useAuth()
+  const { canWrite, tenantId } = useAuth()
   const { params } = useNav()
   const mobile = surface === 'mobile'
   const [overview, setOverview] = useState<Overview | null>(null)
@@ -276,7 +277,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   }, [closeOrchestrationDetail, selectedOrchestrationId, selectedResultTask])
 
   const businessTasks = useMemo(
-    () => (overview?.tasks || []).filter(isBusinessVisibleTask),
+    () => (overview?.tasks || []).filter(isBusinessVisibleTask).filter(task => task.metadata?.workflow !== 'douyin_mobile_discovery'),
     [overview?.tasks],
   )
   // The server already omits migrated/revoked Agents. Keep the same boundary
@@ -284,7 +285,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   // preset task flow while a lifecycle action is refreshing the page.
   const operationalAgents = useMemo(
     () => (overview?.agents || []).filter(agent =>
-      agent.status === 'active' || agent.status === 'paused'),
+      agent.capabilities?.agentKind !== 'android_mobile' && (agent.status === 'active' || agent.status === 'paused')),
     [overview?.agents],
   )
 
@@ -614,7 +615,8 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
                   </p>
                 )}
               </div>
-              <div className={`flex shrink-0 items-center gap-2 ${mobile ? 'w-full justify-end' : ''}`}>
+              <div className={`flex flex-wrap shrink-0 items-center gap-2 ${mobile ? 'w-full justify-end' : ''}`}>
+                <AndroidDiscoveryEntry key={tenantId} writable={canWrite()} />
                 <Button variant="outline" size="sm" onClick={() => { void load(true); if (taskView === 'history') setHistoryRefreshKey(value => value + 1) }} disabled={refreshing} className={mobile ? 'min-h-11' : 'min-h-10'}>
                   <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /> 刷新
                 </Button>

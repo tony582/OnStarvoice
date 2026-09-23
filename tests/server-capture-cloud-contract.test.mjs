@@ -6,6 +6,8 @@ import vm from "node:vm";
 
 import {
   CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES,
+  captureTaskHasUnconfirmedLocalStop,
+  captureTaskUnconfirmedLocalStopSql,
   bindCloudTaskSnapshotHealthToAttempt,
   captureAgentFullHeartbeatOnline,
   captureAgentHeartbeatDegraded,
@@ -100,6 +102,25 @@ function readRouteSection(startMarker, endMarker) {
   assert.notEqual(end, -1, `missing route marker: ${endMarker}`);
   return captureCloudRouteSource.slice(start, end);
 }
+
+test("failed local stop holds the source node and cannot automatically release another item", async () => {
+  const unsafe = {status:'needs_action',error:{code:'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'}};
+  assert.equal(captureTaskHasUnconfirmedLocalStop(unsafe), true);
+  assert.equal(captureTaskHasUnconfirmedLocalStop({...unsafe,status:'superseded'}), true);
+  assert.equal(captureTaskHasUnconfirmedLocalStop({...unsafe,status:'canceled'}), false);
+  assert.equal(captureTaskHasUnconfirmedLocalStop({...unsafe,metadata:{recoveryTaskId:'manual-recovery'}}), false);
+  assert.equal(captureTaskHasUnconfirmedLocalStop({status:'needs_action',error:{code:'SEARCH_FILTER_APPLICATION_FAILED'}}), false);
+  assert.equal(projectElasticKeywordRecoveryStatus({elasticPool:true,...unsafe,attemptCount:1}), 'needs_action');
+  assert.equal(classifyCaptureRecoveryDisposition(unsafe).automatic, false);
+  assert.equal(classifyCaptureRecoveryDisposition(unsafe,{phase:'duty'}).automatic, false);
+  let statement;
+  const blocker = {id:'unsafe-task',kind:'task',status:'needs_action'};
+  assert.equal(await findCaptureAgentExecutionSlotBlocker({queryOne:async(sql,params)=>{
+    statement={sql,params}; return blocker;
+  }}, 'tenant', 'agent'), blocker);
+  assert.ok(statement.sql.includes(captureTaskUnconfirmedLocalStopSql('task')));
+  assert.throws(()=>captureTaskUnconfirmedLocalStopSql('task;delete'), /invalid_task_alias/u);
+});
 
 test("targeted completion receipts hash the exact bounded raw JSON", () => {
   const raw = {status: "canceled", detail: "界".repeat(40_000)};

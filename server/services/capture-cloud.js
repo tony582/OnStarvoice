@@ -57,6 +57,7 @@ const TERMINAL_TASK_STATUSES = new Set([
 ]);
 
 const TARGETED_TASK_TYPES = new Set([
+  'discovered_post_capture',
   'negative_post_patrol',
   'watched_content_patrol',
   'official_account_comment_patrol',
@@ -307,7 +308,7 @@ export function normalizeRemoteTaskInput(input = {}) {
     'scheduled',
   ].includes(rawExecutionMode)
     ? 'unattended_plan'
-    : 'one_time';
+    : rawExecutionMode === 'manual_batch' ? 'manual_batch' : 'one_time';
 
   const rawPlatform = String(read('platform', 'unknown')).trim().toLowerCase();
   const platform = PLATFORM_ALIASES[rawPlatform] || 'unknown';
@@ -348,7 +349,7 @@ export function normalizeRemoteTaskInput(input = {}) {
     searchFilters.contentType = searchPasses[0];
   }
 
-  const maxRounds = boundedInteger(read('maxRounds'), 1, 1, 100);
+  const maxRounds = executionMode === 'manual_batch' ? 1 : boundedInteger(read('maxRounds'), 1, 1, 100);
   const roundGapMin = boundedInteger(read('roundGapMin'), 10, 0, 1440);
   const randomOffsetMin = boundedInteger(read('randomOffsetMin'), 0, 0, 1440);
   const rawMode = String(read('mode', 'daily')).trim().toLowerCase();
@@ -447,7 +448,7 @@ export function normalizeRemoteTaskInput(input = {}) {
     false,
   );
   const recoveryPolicy = {
-    allowIdleAgentHandoff: boolean(
+    allowIdleAgentHandoff: executionMode !== 'manual_batch' && boolean(
       rawRecoveryPolicy.allowIdleAgentHandoff ??
       rawRecoveryPolicy.allow_idle_agent_handoff,
       true,
@@ -471,6 +472,11 @@ export function normalizeRemoteTaskInput(input = {}) {
     randomOffsetMin,
     keywords,
     searchFilters,
+    ...(executionMode === 'manual_batch' ? {
+      keywordMinLikes: boundedInteger(read('keywordMinLikes'), 0, 0, Number.MAX_SAFE_INTEGER),
+      manualStartTime: /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(read('manualStartTime', '')))
+        ? String(read('manualStartTime')) : '',
+    } : {}),
     ...(hasKeywordMaxDetectedItems ? {keywordMaxDetectedItems} : {}),
     autoLoop: maxRounds > 1,
     roundGapMin,
@@ -499,7 +505,7 @@ export function normalizeRemoteTaskInput(input = {}) {
       request.title || (
         executionMode === 'unattended_plan'
           ? '无人值守关键词采集计划'
-          : '一次性关键词采集'
+          : executionMode === 'manual_batch' ? '手动批量关键词采集' : '一次性关键词采集'
       ),
       240,
     ),
@@ -1002,6 +1008,23 @@ export const CAPTURE_AGENT_SLOT_BLOCKING_TASK_STATUSES = Object.freeze([
   'resume_requested',
 ]);
 
+export function captureTaskHasUnconfirmedLocalStop(task = {}) {
+  return text(jsonObject(task.error).code, 100).toUpperCase() ===
+      'PREVIOUS_CAPTURE_STOP_UNCONFIRMED' &&
+    !['canceled', 'completed', 'completed_with_warnings', 'skipped']
+      .includes(text(task.status, 80)) &&
+    !text(jsonObject(task.metadata).recoveryTaskId, 240);
+}
+
+export function captureTaskUnconfirmedLocalStopSql(alias = 'task') {
+  if (!/^[a-z_][a-z0-9_]*$/u.test(alias)) throw new Error('invalid_task_alias');
+  // An explicit failed stop is stronger evidence than an attention/terminal
+  // label. A confirmed cancel or successful manual recovery releases it.
+  return `(UPPER(COALESCE(${alias}.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+    AND ${alias}.status NOT IN ('canceled', 'completed', 'completed_with_warnings', 'skipped')
+    AND NULLIF(${alias}.metadata->>'recoveryTaskId', '') IS NULL)`;
+}
+
 export async function findCaptureAgentExecutionSlotBlocker(
   executor,
   tenantId,
@@ -1022,8 +1045,10 @@ export async function findCaptureAgentExecutionSlotBlocker(
       WHERE task.tenant_id = $1
         AND COALESCE(task.assigned_agent_id, task.origin_agent_id) = $2
         AND task.task_type <> 'capture_orchestration'
-        AND task.status = ANY($3::text[])
-        AND NOT (task.id = ANY($4::uuid[]))
+        AND (
+          (task.status = ANY($3::text[]) AND NOT (task.id = ANY($4::uuid[])))
+          OR ${captureTaskUnconfirmedLocalStopSql('task')}
+        )
 
       UNION ALL
 

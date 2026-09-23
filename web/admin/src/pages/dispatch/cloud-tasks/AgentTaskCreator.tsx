@@ -14,6 +14,7 @@ import {
   shanghaiToday,
 } from './lib'
 import { ScheduledDatesPicker } from './ScheduledDatesPicker'
+import { splitManualKeywords, MANUAL_SEARCH_FILTERS } from './manualKeywordDispatch.mjs'
 
 export function AgentTaskCreator({
   agent,
@@ -24,6 +25,8 @@ export function AgentTaskCreator({
   editExistingInitially = false,
   hideLauncher = false,
   lockExecutionMode = false,
+  manualBatchAgents,
+  onManualDispatchStarted,
 }: {
   agent: CloudAgent
   writable: boolean
@@ -33,12 +36,17 @@ export function AgentTaskCreator({
   editExistingInitially?: boolean
   hideLauncher?: boolean
   lockExecutionMode?: boolean
+  manualBatchAgents?: CloudAgent[]
+  onManualDispatchStarted?: () => void
 }) {
+  const manualDispatch = Boolean(manualBatchAgents)
+  const dispatchAgents = manualBatchAgents || [agent]
   const remoteTaskCreate = agent.capabilities?.remoteTaskCreate === true
   const remoteUnattendedPlanWrite = agent.capabilities?.remoteUnattendedPlanWrite === true
   const remoteTaskEnhancementOptions = agent.capabilities?.remoteTaskEnhancementOptions === true
   const remoteTaskKeywordPostLimit = agent.capabilities?.remoteTaskKeywordPostLimit === true
-  const availablePlatforms = useMemo(() => agentCreatePlatforms(agent), [agent])
+  const availablePlatforms = useMemo(() => agentCreatePlatforms(agent).filter(platform =>
+    !manualBatchAgents || manualBatchAgents.every(node => agentCreatePlatforms(node).includes(platform))), [agent, manualBatchAgents])
   const [open, setOpen] = useState(forceOpen)
   const [executionMode, setExecutionMode] = useState<'one_time' | 'unattended_plan'>(initialExecutionMode)
   const [taskTitle, setTaskTitle] = useState('')
@@ -46,6 +54,11 @@ export function AgentTaskCreator({
   const [keywordText, setKeywordText] = useState('')
   const [sort, setSort] = useState('comprehensive')
   const [publishTime, setPublishTime] = useState('all')
+  const [manualFilters, setManualFilters] = useState<Record<string, string>>({contentType: 'all', searchScope: 'all', distance: 'all', videoDuration: 'all'})
+  const [keywordMinLikes, setKeywordMinLikes] = useState(0)
+  const [manualStartTime, setManualStartTime] = useState('')
+  const [dispatchLocked, setDispatchLocked] = useState(false)
+  const manualReceipts = useRef<Record<string, {requestKey: string; accepted: boolean}>>({})
   const [maxRounds, setMaxRounds] = useState(1)
   const [roundGapMin, setRoundGapMin] = useState(10)
   const [planMode, setPlanMode] = useState<'daily' | 'custom_dates'>('daily')
@@ -214,8 +227,8 @@ export function AgentTaskCreator({
       setError('该 Agent 没有可执行的平台，请先完成 Agent 配置。')
       return
     }
-    if (keywordLines.length < 1 || keywordLines.length > 30) {
-      setError('请输入 1–30 个关键词，每行一个。')
+    if (keywords.length < 1 || keywords.length > (manualDispatch ? dispatchAgents.length * 30 : 30)) {
+      setError(`请输入 1–${manualDispatch ? dispatchAgents.length * 30 : 30} 个不同的关键词，每行一个。`)
       return
     }
     if (
@@ -285,6 +298,15 @@ export function AgentTaskCreator({
       return
     }
 
+    if (manualDispatch && dispatchAgents.some(node => node.capabilities?.remoteManualKeywordBatchV1 !== true)) {
+      setError('所选节点中有 Extension 尚不支持手动批量下发，请先更新。')
+      return
+    }
+    if (manualDispatch && (!Number.isSafeInteger(keywordMinLikes) || keywordMinLikes < 0)) {
+      setError('点赞数下限必须是大于等于 0 的整数。')
+      return
+    }
+
     const captureSettings: CaptureEnhancementSettings | undefined = remoteTaskEnhancementOptions && captureSettingsOverrideEnabled
       ? {
           autoDetailCaptureAfterListCapture: enhancementEnabled,
@@ -308,7 +330,8 @@ export function AgentTaskCreator({
 
     const taskInput = {
       ...(taskTitle.trim() ? { title: taskTitle.trim() } : {}),
-      executionMode,
+      executionMode: manualDispatch ? 'manual_batch' : executionMode,
+      ...(manualDispatch ? {searchFilters: manualFilters, keywordMinLikes, manualStartTime} : {}),
       platform: selectedPlatform,
       keywords,
       sort: selectedSort,
@@ -343,6 +366,34 @@ export function AgentTaskCreator({
 
     setSubmitting(true)
     try {
+      if (manualDispatch) {
+        setDispatchLocked(true)
+        onManualDispatchStarted?.()
+        const groups = splitManualKeywords(keywordText, dispatchAgents.map(node => node.id))
+        const failed: string[] = []
+        let accepted = 0
+        for (const group of groups) {
+          const receipt = manualReceipts.current[group.agentId] ||= {requestKey: window.crypto.randomUUID(), accepted: false}
+          if (!receipt.accepted) {
+            try {
+              await api.post(`/capture-cloud/agents/${group.agentId}/tasks`, {
+                ...taskInput, keywords: group.keywords, requestKey: receipt.requestKey,
+              })
+              receipt.accepted = true
+            } catch (err) {
+              failed.push(`${dispatchAgents.find(node => node.id === group.agentId)?.display_name}: ${err instanceof Error ? err.message : '未确认'}`)
+            }
+          }
+          if (receipt.accepted) accepted += 1
+        }
+        setFeedback(`已确认下发 ${accepted}/${groups.length} 个节点；本批次总计 ${keywords.length} 个关键词。`)
+        if (failed.length) {
+          setError(`以下节点未确认，请点击重试；已确认节点不会重复下发。${failed.join('；')}`)
+          return
+        }
+        await onCreated()
+        return
+      }
       const result = await api.post<{ message?: string }>(`/capture-cloud/agents/${agent.id}/tasks`, {
         ...taskInput,
         requestKey,
@@ -368,8 +419,13 @@ export function AgentTaskCreator({
     }
   }
 
-  const disabled = submitting || !writable || agent.status !== 'active' || availablePlatforms.length === 0
-  const nodeMessage = agent.status !== 'active'
+  const submitDisabled = submitting || !writable || dispatchAgents.some(node => node.status !== 'active' || (manualDispatch && node.capabilities?.remoteManualKeywordBatchV1 !== true)) || availablePlatforms.length === 0
+  const disabled = submitDisabled || dispatchLocked
+  const preview = manualDispatch && keywordText.trim() && new Set(keywordText.split(/\r?\n/).map(word => word.trim()).filter(Boolean)).size <= dispatchAgents.length * 30
+    ? splitManualKeywords(keywordText, dispatchAgents.map(node => node.id)) : []
+  const nodeMessage = manualDispatch
+    ? `将关键词均分给 ${dispatchAgents.length} 个节点；Extension 按完整设置启动本地手动采集，进度与结果仍可查看。`
+    : agent.status !== 'active'
     ? 'Agent 已暂停，恢复后才能接收新任务。'
     : agent.online
       ? 'Agent 在线，提交后会在下一次心跳领取任务。'
@@ -411,7 +467,7 @@ export function AgentTaskCreator({
               className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary disabled:opacity-60" />
             <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">用于在任务队列中快速识别；不填写时会自动生成名称。</span>
           </label>
-          <div>
+          {!manualDispatch && <div>
             <div className="text-xs font-medium text-muted-foreground">执行方式</div>
             <div className="mt-1.5 grid grid-cols-2 gap-1 rounded-lg bg-muted p-1" role="tablist" aria-label="执行方式">
               <button type="button" role="tab" aria-selected={executionMode === 'one_time'}
@@ -439,7 +495,7 @@ export function AgentTaskCreator({
               </p>
             )}
             {!remoteUnattendedPlanWrite && <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">当前扩展只支持一次性任务，更新后可从云端保存无人值守计划。</p>}
-          </div>
+          </div>}
           <label className="block text-xs font-medium text-muted-foreground">
             执行平台
             <select value={selectedPlatform} onChange={event => setPlatform(event.target.value)} disabled={disabled}
@@ -449,11 +505,29 @@ export function AgentTaskCreator({
             </select>
           </label>
           <label className="block text-xs font-medium text-muted-foreground">
-            关键词（每行一个，1–30 个）
+            关键词（每行一个，最多 {manualDispatch ? dispatchAgents.length * 30 : 30} 个）
             <textarea value={keywordText} onChange={event => setKeywordText(event.target.value)} rows={4} disabled={disabled}
               placeholder={'新能源汽车\n智能座舱'}
               className="mt-1.5 w-full resize-y rounded-lg border border-border bg-background px-3 py-2.5 text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground/60 focus:border-primary disabled:opacity-60" />
           </label>
+          {manualDispatch && preview.length > 0 && <div className="rounded-lg border border-border p-3 text-xs leading-5">
+            <div className="font-semibold">平均分配预览 · {preview.length} 个节点</div>
+            {preview.map(group => <p key={group.agentId} className="mt-1 break-words"><strong>{dispatchAgents.find(node => node.id === group.agentId)?.display_name}</strong> · {group.keywords.length} 个：{group.keywords.join('、')}</p>)}
+            {preview.length < dispatchAgents.length && <p className="mt-1 text-muted-foreground">关键词少于节点数，未分配到关键词的节点保持空闲。</p>}
+          </div>}
+          {manualDispatch && <div className="grid gap-3 sm:grid-cols-2">
+            <label className="text-xs font-medium text-muted-foreground">点赞数下限
+              <input type="number" min={0} value={keywordMinLikes} onChange={event => setKeywordMinLikes(Number(event.target.value))} disabled={disabled} className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground" />
+            </label>
+            <label className="text-xs font-medium text-muted-foreground">当天延迟启动（留空立即）
+              <input type="time" value={manualStartTime} onChange={event => setManualStartTime(event.target.value)} disabled={disabled} className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground" />
+            </label>
+            {MANUAL_SEARCH_FILTERS.filter(filter => !filter.platform || filter.platform === selectedPlatform).map(filter => <label key={filter.key} className="text-xs font-medium text-muted-foreground">{filter.label}
+              <select value={manualFilters[filter.key]} onChange={event => setManualFilters({...manualFilters, [filter.key]: event.target.value})} disabled={disabled} className="mt-1.5 h-10 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground">
+                {filter.options.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </label>)}
+          </div>}
           {remoteTaskKeywordPostLimit ? (
             <fieldset className="rounded-xl border border-border/70 bg-card/50 p-3">
               <legend className="px-1 text-xs font-semibold text-foreground">帖子采集上限</legend>
@@ -659,9 +733,9 @@ export function AgentTaskCreator({
           )}
           {error && <p role="alert" className="text-xs leading-5 text-status-red">{error}</p>}
           {feedback && <p role="status" className="text-xs leading-5 text-status-green">{feedback}</p>}
-          <Button type="submit" size="sm" className="min-h-10 w-full" disabled={disabled || !keywordText.trim()}>
+          <Button type="submit" size="sm" className="min-h-10 w-full" disabled={submitDisabled || !keywordText.trim()}>
             {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-            {editingExistingPlan
+            {manualDispatch ? dispatchLocked ? '重试未确认的下发' : '平均下发并启动手动采集' : editingExistingPlan
               ? agent.online ? '保存修改并覆盖原计划' : '排队保存修改并覆盖原计划'
               : executionMode === 'unattended_plan'
                 ? agent.online ? '保存无人值守计划' : '排队保存计划'

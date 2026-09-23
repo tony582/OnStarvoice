@@ -1,0 +1,202 @@
+{
+  "checkedAt": "2026-09-23T12:23:31.635993+00:00",
+  "root": "/opt/onstarvoice",
+  "files": {
+    "manifest.json": {
+      "sha256": "c43d8739507941a81346fcdff70dce4cc909288d28643097fa796ab1a48e93b4",
+      "bytes": 2467,
+      "version": "0.4.12",
+      "matchesReleaseC06c7cb": true
+    },
+    "server/app.js": {
+      "sha256": "f1d8e9b3928ad1ae592b72a1e6974908516d42b896195f92296bcc643939913f",
+      "bytes": 10276,
+      "matchesReleaseC06c7cb": true
+    },
+    "server/routes/capture-cloud.js": {
+      "sha256": "44896908bb8f5a2cb1c79e83cf5993554e95098c639c27aaff3a05da9ee6252d",
+      "bytes": 619219,
+      "matchesReleaseC06c7cb": true
+    },
+    "server/services/capture-cloud.js": {
+      "sha256": "1e86c1716d1797f2f01fa6345941e74b4cbe2646807b909074d72e0830695bbd",
+      "bytes": 41804,
+      "matchesReleaseC06c7cb": true
+    },
+    "server/services/capture-orchestration-scheduler.js": {
+      "sha256": "769a59e1ecc53913398ff2ba968e88eba53febd488d474b0dc028255170b3edb",
+      "bytes": 44127,
+      "matchesReleaseC06c7cb": true
+    },
+    "server/services/record-store.js": {
+      "sha256": "830a04b1790d6ff2b00a4f076db4979df115d24e91e30d00ca9c1589dd434b16",
+      "bytes": 62566,
+      "matchesReleaseC06c7cb": true
+    },
+    "server/services/keyword-node-coverage.js": {
+      "sha256": "dbc0f177aea5eb9e9c9376a414d419f3c48089a243fde914af2528b5d1cbc8e5",
+      "bytes": 12312,
+      "matchesReleaseC06c7cb": true
+    },
+    "server/routes/update-manifest.js": {
+      "sha256": "d2e198a7c751fd254847cfc06a4fb9092d140d836b329425e231cd9cccd0efee",
+      "bytes": 46231,
+      "matchesReleaseC06c7cb": true
+    },
+    "server/package.json": {
+      "sha256": "f1d03c0ad77344027e7dc3bc774c1b342dfec9585a20e597449673ee1b333572",
+      "bytes": 1322,
+      "version": "0.1.0",
+      "matchesReleaseC06c7cb": true
+    },
+    "server/package-lock.json": {
+      "sha256": "ef8fd0916efb14c60d794c3f39b9126cd9a9226b07b20afe7ae5160bcc64d21c",
+      "bytes": 82867,
+      "matchesReleaseC06c7cb": true
+    },
+    "web/admin/dist/index.html": {
+      "sha256": "7701fac22ee0b733ef916557c0cf1aac3c7ebe476aaa65f5955d5ec6b0aac466",
+      "bytes": 1138,
+      "matchesReleaseC06c7cb": null
+    },
+    "server/services/ops-control.js": {
+      "sha256": "7ec20594371b55018eb004e3cf6996449efda8d77acc213469d70cc441800e8c",
+      "bytes": 92232,
+      "matchesReleaseC06c7cb": true
+    },
+    "server/public/about.html": {
+      "sha256": "f142c603779b0c0ce42315190fa51ebf2ce2cf1c1b2f80f5bec9d0c35253c7b6",
+      "bytes": 20461,
+      "matchesReleaseC06c7cb": true
+    },
+    "public-downloads/StarVoice-extension-v0.4.12-20260922.zip": {
+      "sha256": "3484a6c17e043152928071a74615f95de0f2b9fd1f6bd93b692cb1537f0dcd4c",
+      "bytes": 1307357,
+      "matchesReleaseC06c7cb": null
+    }
+  },
+  "packages": {},
+  "runtime": [
+    {
+      "name": "onstarvoice",
+      "pid": 369817,
+      "status": "online",
+      "cwd": "/opt/onstarvoice/server",
+      "script": "/opt/onstarvoice/server/index.js",
+      "node": "18.20.8"
+    }
+  ],
+  "migrationNames": [
+    "001_initial_postgres.sql",
+    "002_accounts_workspace.sql",
+    "003_comments_official_workflow.sql",
+    "004_comment_leads_workspace.sql",
+    "005_content_studio.sql",
+    "006_hit_analyses.sql",
+    "007_sales_leads.sql",
+    "008_comment_lead_notes.sql",
+    "009_opinion_handling.sql",
+    "010_tickets.sql",
+    "011_ticket_state_unify.sql",
+    "012_record_transcript.sql",
+    "013_transcript_analysis.sql",
+    "014_publish_sort.sql",
+    "015_reset_captured_data.sql",
+    "016_reset_captured_data_v2.sql",
+    "018_reset_captured_data_v3.sql",
+    "019_reset_captured_data_v4.sql",
+    "020_broaden_brand_scope.sql",
+    "021_comment_ai_classified_at.sql",
+    "022_reset_anjixing_for_client.sql",
+    "023_comment_source_type.sql",
+    "024_ticket_notes.sql",
+    "025_cover_local.sql",
+    "026_author_account_no.sql",
+    "027_focus_topics.sql",
+    "028_publish_location.sql",
+    "029_record_feedback_manual_overrides.sql",
+    "030_record_custom_tags.sql",
+    "031_relevance_prefilter.sql",
+    "032_cloud_capture_task_center.sql",
+    "033_cloud_remote_task_creation.sql",
+    "034_capture_task_snapshot_history.sql",
+    "035_record_triage_archive.sql",
+    "036_record_triage_no_action.sql",
+    "037_record_notes.sql",
+    "038_false_positive_feedback_only.sql",
+    "039_ticket_activity.sql",
+    "040_record_local_images.sql",
+    "041_capture_task_orchestration.sql",
+    "042_record_image_ocr.sql",
+    "043_capture_orchestration_schedules.sql",
+    "044_opinion_analysis.sql",
+    "045_social_account_usage.sql",
+    "046_capture_attention_notifications.sql",
+    "047_social_account_binding_mode.sql",
+    "048_record_content_availability.sql",
+    "049_official_account_monitor_link.sql",
+    "050_ticket_comment_record_link.sql",
+    "051_official_comment_operations.sql",
+    "052_merge_legacy_official_account_exclusions.sql",
+    "053_backfill_official_account_profile_identity.sql",
+    "054_restore_iso_publish_timestamps.sql",
+    "055_capture_agent_tenant_migration.sql",
+    "056_ai_model_failover.sql",
+    "057_content_ticket_inline_triage.sql",
+    "058_content_ticket_processing_mode.sql",
+    "059_content_handling_statuses.sql",
+    "060_content_feishu_table_no.sql",
+    "061_capture_cloud_work_queue.sql",
+    "062_capture_task_lifecycle.sql",
+    "063_social_agent_daily_health.sql",
+    "064_content_privacy_unreachable_status.sql",
+    "065_record_watchlist.sql",
+    "066_tenant_comment_risk_attention.sql",
+    "068_llm_relay_agent.sql",
+    "069_capture_bootstrap_pacing.sql",
+    "070_ops_control_plane.sql",
+    "071_ops_control_guarded_actions.sql",
+    "072_ops_control_incident_alerts.sql",
+    "073_ops_control_event_wakeups.sql",
+    "074_capture_recovery_intents.sql",
+    "075_capture_safety_handoff_once.sql",
+    "076_capture_agent_heartbeat_semantics.sql",
+    "078_relevance_disposition_v2.sql",
+    "079_negative_patrol_admission.sql",
+    "080_comment_workflow_leases.sql",
+    "081_customer_daily_reports.sql",
+    "081_unattended_negative_patrol.sql",
+    "082_content_negative_comment_status.sql",
+    "083_customer_daily_email_deliveries.sql",
+    "084_customer_group_assistant.sql",
+    "085_comment_lead_followups.sql"
+  ],
+  "referenceCommit": "c06c7cb5d9eb93ff9ae5f795645999755543bfb8",
+  "localLoadedExtension": {
+    "fileCount": 99,
+    "unchangedFromTrialStart": true,
+    "matchesReleaseSource": true,
+    "sourceMismatches": [],
+    "manifestVersion": "0.4.12"
+  },
+  "productionMutations": 0,
+  "compiledAdmin": {
+    "baselineCommit": "c06c7cb5d9eb93ff9ae5f795645999755543bfb8",
+    "allBaselineFilesPresentAndEqual": true,
+    "matchedFiles": {
+      "index.html": "7701fac22ee0b733ef916557c0cf1aac3c7ebe476aaa65f5955d5ec6b0aac466",
+      "icons.svg": "b45fa506195cfcdef406ba9f0c77b36ddc1a7c224040926ec70abc2fdea7b93a",
+      "favicon.svg": "6fafafc0b6d88cdd9787ff75ca0a63ffe882eb44738b33a3cf4bb53ecc4306dc",
+      "assets/MobileApp-DJWbWdDN.js": "9e364648f5750ef0f2960b9d70c1d5c1d27d8ace6385a3bc4956e620c98b9d91",
+      "assets/DesktopApp-C1GheRr6.js": "45d8dddad7b0261b9c288a684f69320b81e709ac816b3d4deee66bedb098f4fc",
+      "assets/officialCommentPatrolPreview-7eK_DOcv.js": "77da935d0558162e899c5c9632dcde0d4baee85d60869953ebab78c3f8a48527",
+      "assets/ThemeToggle-KozaqHdl.css": "870a0ac20251e2adf5d7461ee3a391a25c4a6ca4a6e158654e2fe6f8d5ec0763",
+      "assets/ThemeToggle-BS2fGLPb.js": "65095f96a13e0e963c5f87e7a330d4edc9f98ea168710dd6fb47739fc0e8e7f0",
+      "assets/index-BfpfBMF2.js": "d9d4eee25fd6d1a332acb823a8919bc6d0d07386714efda80c51f987e405c124",
+      "assets/index-D59DCtzw.css": "2558666703de5479ec2e41dcb0050381e1236a50b4c96a4726e408e260468329",
+      "assets/ChinaMap-CHnYjG93.js": "6b7423fcdb2feecafbc2ca1e20df965ef64b49eb0308738e34e95cf42a93ebb2"
+    },
+    "additionalProductionFiles": 147,
+    "preserveAdditionalFilesOnCutover": true
+  }
+}

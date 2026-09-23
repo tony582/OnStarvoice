@@ -18,6 +18,7 @@ export function AgentPicker({
   mode,
   taskType = 'keyword',
   multiple = false,
+  manualBatch = false,
   selectedIds,
   onChange,
 }: {
@@ -26,6 +27,7 @@ export function AgentPicker({
   mode: 'one_time' | 'unattended_plan'
   taskType?: CloudCreateTaskType
   multiple?: boolean
+  manualBatch?: boolean
   selectedIds: string[]
   onChange: (ids: string[]) => void
 }) {
@@ -60,7 +62,9 @@ export function AgentPicker({
   return (
     <div className="space-y-2" role={multiple ? 'group' : 'radiogroup'} aria-label="选择执行节点">
       {sortedAgents.map(agent => {
-        const blockReason = agentTaskTypeBlockReason(agent, taskType, mode)
+        const blockReason = manualBatch && agent.capabilities?.remoteManualKeywordBatchV1 !== true
+          ? '需要升级 Extension，当前版本不支持手动批量下发'
+          : agentTaskTypeBlockReason(agent, taskType, mode)
         const selected = selectedIds.includes(agent.id)
         const platforms = agentCreatePlatforms(agent)
         const agentTasks = tasks.filter(task => taskBelongsToAgent(task, agent) && ACTIVE_TASK_STATUSES.has(task.effective_status || task.status))

@@ -870,3 +870,12 @@ test("heartbeat-only patches preserve business progress while real progress adva
   });
   assert.equal(nextPhase.businessProgressAt, "2026-08-25T01:01:05.000Z");
 });
+
+
+test("mobile detail tasks share owned pages and release them even when attention is needed", () => {
+  assert.equal(targeted.usesOwnedPlatformTab("discovered_post_capture"), true);
+  assert.equal(targeted.usesOwnedPlatformTab("negative_post_patrol"), true);
+  assert.equal(targeted.usesOwnedPlatformTab("unknown"), false);
+  assert.equal(targeted.shouldPreservePlatformTab({workflow: "discovered_post_capture", status: "needs_action"}), false);
+  assert.equal(targeted.shouldPreservePlatformTab({workflow: "negative_post_patrol", status: "needs_action"}), true);
+});

@@ -30,6 +30,7 @@ const controlStorageReserveSource = await readFile(
 );
 const phase5RuntimeSources = await Promise.all(
   [
+    "utils/manual-keyword-dispatch.js",
     "utils/runtime-tab-policy.js",
     "utils/capture/debug-session.js",
     "utils/capture/task-tab-group.js",
@@ -5547,6 +5548,103 @@ test("a terminal targeted patrol closes its registered platform tab before relea
   assert.deepEqual(harness.removedTabIds, [opened.data.tabId, 61]);
   assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
   assert.equal(harness.storage[LOCK_KEY], undefined);
+});
+
+test("mobile discovered detail terminal reporting closes its owned page before the runner shell", async () => {
+  for (const status of ["completed", "completed_with_warnings", "failed", "canceled", "superseded", "needs_action"]) {
+    const harness = createHarness();
+    const request = buildTargetedPostRequest({workflow: "discovered_post_capture"});
+    harness.storage["onstarvoice.auth"] = {
+      captureAgent: {id: "mobile-detail-agent", token: "mobile-detail-token"},
+    };
+    harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+    const opened = await harness.sendBackgroundMessage({
+      type: "onstarvoice:open-targeted-post-platform-tab",
+      requestId: request.id, attemptId: request.attemptId, url: request.targets[0].url,
+    });
+    assert.equal(opened.ok, true, JSON.stringify(opened));
+    harness.setTabGetHandler(async (id) => ({id, url: request.targets[0].url}));
+    const runnerUrl = "chrome-extension://test/sidebar/sidebar.html" +
+      `?targetedPostRun=${request.id}&targetedPostAttempt=${request.attemptId}`;
+    harness.setTabQueryHandler(async () => [
+      {id: 61, url: runnerUrl},
+      {id: 62, url: request.targets[0].url}, // User page showing the same work.
+      {id: 63, url: runnerUrl.replace(request.attemptId, "other-attempt")},
+    ]);
+    const response = await harness.sendBackgroundMessage({
+      type: "onstarvoice:update-targeted-post-run", requestId: request.id,
+      attemptId: request.attemptId,
+      patch: {status, finishedAt: new Date().toISOString(), error: {code: "DETAIL_TEST"}},
+    });
+    assert.equal(response.ok, true, status);
+    assert.equal(response.platformTabClosed, true, status);
+    assert.equal(response.runnerClosed, true, status);
+    assert.deepEqual(harness.removedTabIds, [opened.data.tabId, 61], status);
+    assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+    assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_CLEANUP_KEY], undefined);
+    assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].error.code, "DETAIL_TEST");
+  }
+});
+
+test("mobile detail close failure survives restart and prevents accumulating pages", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({workflow: "discovered_post_capture"});
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "mobile-detail-agent", token: "mobile-detail-token"},
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id, attemptId: request.attemptId, url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (id) => ({id, url: request.targets[0].url}));
+  harness.setTabRemoveHandler(async () => {throw new Error("temporary close failure");});
+  harness.setTabQueryHandler(async () => []);
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run", requestId: request.id,
+    attemptId: request.attemptId, patch: {status: "completed"},
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.platformTabClosed, false);
+  const cleanup = harness.storage[TARGETED_POST_PLATFORM_TAB_CLEANUP_KEY];
+  assert.equal(cleanup.tabId, opened.data.tabId);
+  assert.ok(harness.alarmDefinitions.has(TARGETED_POST_PLATFORM_TAB_CLEANUP_ALARM));
+  const next = {...request, id: "next-mobile-detail", attemptId: "next-attempt", cloudCommandId: "next-command"};
+  harness.storage[TARGETED_POST_REQUEST_KEY] = next;
+  const blocked = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab", requestId: next.id,
+    attemptId: next.attemptId, url: next.targets[0].url,
+  });
+  assert.equal(blocked.ok, false);
+  assert.equal(harness.createdTabs.length, 1);
+  const restarted = createHarness();
+  Object.assign(restarted.storage, JSON.parse(JSON.stringify(harness.storage)));
+  restarted.setTabGetHandler(async (id) => ({id, url: request.targets[0].url}));
+  const recovered = await restarted.api.recoverTargetedPostPlatformTabCleanup({force: true});
+  assert.equal(recovered.ok, true);
+  assert.deepEqual(restarted.removedTabIds, [opened.data.tabId]);
+  assert.equal(restarted.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+  assert.equal(restarted.storage[TARGETED_POST_PLATFORM_TAB_CLEANUP_KEY], undefined);
+});
+
+test("mobile detail cleanup preserves a task page the user navigated elsewhere", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({workflow: "discovered_post_capture"});
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab", requestId: request.id,
+    attemptId: request.attemptId, url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (id) => ({id, url: "https://example.com/user-page"}));
+  harness.setTabQueryHandler(async () => []);
+  await harness.sendBackgroundMessage({
+    type: "onstarvoice:update-targeted-post-run", requestId: request.id,
+    attemptId: request.attemptId, patch: {status: "failed"},
+  });
+  assert.deepEqual(harness.removedTabIds, []);
+  assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
 });
 
 test("targeted platform cleanup never closes a tab id that now shows unrelated content", async () => {

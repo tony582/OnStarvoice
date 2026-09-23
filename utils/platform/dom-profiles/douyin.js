@@ -47,6 +47,8 @@ export const DOUYIN_DOM_PROFILE = Object.freeze({
       ]),
       title: Object.freeze([
         '[data-e2e="video-desc"]',
+        // Current image-note caption; scoped away from the recommendation list.
+        '[data-e2e="note-detail"] .daVLa2m7 .Bfj9rfeR',
         ".video-info-detail .title",
         "h1.idrZUbq7",
         ".tYvuOjO8 h1",

@@ -1,3 +1,5 @@
+import {readDouyinInlineText} from './douyin-inline-text.js';
+
 const DOUYIN_SHELL_AUTHOR_NAME_PATTERN = /^我的$/u;
 const DOUYIN_AUTHOR_DECORATION_SUFFIX_PATTERN =
   /(?:认证徽章|(?:商家|企业|官方|机构|个人|品牌)?认证账号|(?:商家|企业|官方|机构|个人|品牌)认证|蓝V认证|黄V认证|已关注|关注)+$/u;
@@ -51,6 +53,7 @@ const DOUYIN_AUTHOR_NAME_SELECTORS = [
   '[data-e2e="feed-video-nickname"]',
   '.author-card-name',
   '[data-e2e="user-info"] h1',
+  '[data-e2e="user-info"] [data-click-from="title"] > span',
   '.video-info-detail .account-name-text',
   '.video-info-detail .account-name',
   '.OMAnlCHg .q5XQ42ql',
@@ -121,18 +124,18 @@ export function extractDouyinDomAuthorInfo(root, {
     if (ids.size === 1) {
       const identity = identities[0];
       const namedLink = identities.find(({link}) =>
-        normalizeDouyinAuthorName(link.textContent));
+        normalizeDouyinAuthorName(readDouyinInlineText(link)));
       const nameNode = nameNodes.find(node => region.contains(node));
       const name = pickDouyinAuthorName(
-        nameNode?.textContent,
-        namedLink?.link.textContent,
+        readDouyinInlineText(nameNode),
+        readDouyinInlineText(namedLink?.link),
         identity.link.querySelector?.('img[alt]')?.getAttribute('alt'),
       );
       if (name) return {name, userId: identity.userId, url: identity.url};
       continue;
     }
     if (nameNodes.includes(region)) {
-      nameOnly ||= normalizeDouyinAuthorName(region.textContent);
+      nameOnly ||= normalizeDouyinAuthorName(readDouyinInlineText(region));
     }
   }
   // A reliable nickname without a profile link is safer than borrowing the ID

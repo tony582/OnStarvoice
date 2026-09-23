@@ -54,6 +54,7 @@ function sanitizeMetadata(metadata = {}) {
 }
 
 export function createTaskContext({
+  taskId = "",
   taskType = "task",
   featureKey = "unknown",
   source = "extension",
@@ -61,7 +62,7 @@ export function createTaskContext({
 } = {}) {
   const startedAt = new Date().toISOString();
   return {
-    taskId: createId(TASK_ID_PREFIX),
+    taskId: normalizeText(taskId, 240) || createId(TASK_ID_PREFIX),
     correlationId: createId(CORRELATION_ID_PREFIX),
     taskType: normalizeText(taskType, 80) || "task",
     featureKey: normalizeText(featureKey, 120) || "unknown",
@@ -100,12 +101,13 @@ export function normalizeTaskContext(input = null) {
 }
 
 export function beginTaskContext({
+  taskId = "",
   taskType = "task",
   featureKey = "unknown",
   source = "sidebar",
   metadata = {},
 } = {}) {
-  const context = createTaskContext({taskType, featureKey, source, metadata});
+  const context = createTaskContext({taskId, taskType, featureKey, source, metadata});
   activeTasks.set(taskKey(taskType, featureKey), context);
   lastTaskContext = context;
   return context;

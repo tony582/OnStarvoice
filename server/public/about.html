@@ -70,7 +70,17 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.12<span class="date">2026-09-22</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.14<span class="date">2026-09-23</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>平均下发手动采集：</strong>关键词与完整采集设置均分到 Extension，使用手动批量入口执行，支持增强、同步、AI、作者指标与评论。</li>
+            <li><strong>采集结果与节点保护：</strong>停止未确认时暂停新下发；同步失败或尚未排空时保留待核对结果。</li>
+            <li><strong>安卓手机搜索发现（试点）：</strong>已开通租户可创建单手机、每批 1–2 个关键词的任务，默认综合排序、一天内，由手机发现作品、Extension 补详情与评论。异常时保护暂停，确认停稳后按原时限恢复。</li>
+            <li><strong>补采自动关页：</strong>回收本次手机补采创建的标签页，减少连续采集的内存占用。</li>
+            <li><strong>正文与作者显示：</strong>保留正文和昵称中的表情，避免将认证机构说明混入真实昵称。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.12<span class="date">2026-09-22</span></h3>
           <ul>
             <li><strong>无人值守启动修复：</strong>采集辅助首次启动降级后，关键词批次的兜底启动带上当前执行轮次，不再被误判为旧运行页导致整批失败；旧页面迟到请求仍被拒绝。需更新 Extension。</li>
             <li><strong>失败上报保留错误码：</strong>批量采集与运行页领取阶段的失败连同错误码和身份栅栏详情一起上报，便于后台归类与定位。</li>

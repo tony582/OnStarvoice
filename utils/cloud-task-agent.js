@@ -697,6 +697,9 @@
   function targetedPostTaskDescriptor(request = {}) {
     const source = objectValue(request);
     const workflow = text(source.workflow, 80);
+    if (workflow === "discovered_post_capture") {
+      return {workflow, taskType: workflow, featureKey: workflow, title: text(source.title, 500) || "手机发现作品补详情"};
+    }
     if (workflow === "watched_content_patrol") {
       return {
         workflow,
@@ -1178,6 +1181,7 @@
           supportedPlatforms: ["xiaohongshu", "douyin", "weibo"],
           remoteResume: true,
           remoteTaskCreate: true,
+          remoteManualKeywordBatchV1: true,
           xiaohongshuSourceOpenV1: false,
           remoteStop: true,
           remoteUnattendedPlanWrite: true,
@@ -1198,6 +1202,7 @@
           followedCreatorPostPatrol: true,
           officialAccountPostDiscovery: true,
           remoteTargetedPostCaptureV1: true,
+          discoveredPostCaptureV1: true,
           unattendedPlanMirror: true,
           localExecutionLock: true,
           socialAccountIdentity: true,

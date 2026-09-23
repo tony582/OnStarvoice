@@ -129,6 +129,9 @@ function agentFailure(agent, platform, planSnapshot) {
     return {code: 'scheduled_agent_unavailable', message: '计划中的执行节点授权失效或已暂停'};
   }
   const capabilities = object(agent.capabilities);
+  if (capabilities.agentKind === 'android_mobile') {
+    return {code: 'scheduled_agent_kind_mismatch', message: '手机节点仅支持手机发现任务'};
+  }
   if (capabilities.remoteTaskCreate !== true) {
     return {code: 'scheduled_agent_version_unsupported', message: '执行节点版本不支持云端任务'};
   }

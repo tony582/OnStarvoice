@@ -552,6 +552,7 @@ test("server reconciliation gates only negative patrol runners", async () => {
       status: "running",
     };
     const context = {
+      getRemoteManualKeywordBatchId: () => "",
       getTargetedPostRunRequestIdFromUrl: () => request.id,
       getTargetedPostRunAttemptIdFromUrl: () => request.attemptId,
       createTargetedPostInvocationToken: (requestId, attemptId) => ({
@@ -1533,7 +1534,7 @@ test("blogger capture uses one optional assist session across list and detail wo
 
 test("manual search starts optional assist only for the actual run and ends it in finally", () => {
   const section = readFunctionSection(
-    "async function handleCaptureSearchData()",
+    "async function handleCaptureSearchData(options = {})",
     "function setKeywordStrategyTab(",
   );
   const scheduleIndex = section.indexOf("const scheduledStart =");
@@ -2214,7 +2215,7 @@ test("one cloud item uses one business keyword attempt while retaining bounded t
     "async function handleCaptureBloggerData()",
   );
   const manualSearchSection = readFunctionSection(
-    "async function handleCaptureSearchData()",
+    "async function handleCaptureSearchData(options = {})",
     "function setKeywordStrategyTab(",
   );
   assert.doesNotMatch(manualNoteSection, /bootstrapInitialSearchEvidence/u);
@@ -2507,7 +2508,7 @@ test("keyword settlement classifies saved records before the unattended ownershi
 
 test("manual Douyin multi-keyword capture retries only after the first pass", () => {
   const section = readFunctionSection(
-    "async function handleCaptureSearchData()",
+    "async function handleCaptureSearchData(options = {})",
     "function setKeywordStrategyTab(",
   );
 
@@ -2527,7 +2528,7 @@ test("manual Douyin multi-keyword capture retries only after the first pass", ()
 
 test("one keyword cannot schedule a third detail enhancement attempt", () => {
   const manualSection = readFunctionSection(
-    "async function handleCaptureSearchData()",
+    "async function handleCaptureSearchData(options = {})",
     "function setKeywordStrategyTab(",
   );
   const unattendedSection = readFunctionSection(
@@ -2691,7 +2692,7 @@ test("Weibo capture paths keep their non-Debug workflow", () => {
   );
 
   const searchSection = readFunctionSection(
-    "async function handleCaptureSearchData()",
+    "async function handleCaptureSearchData(options = {})",
     "function setKeywordStrategyTab(",
   );
   assert.match(
@@ -3272,7 +3273,7 @@ test("native cancellation fences automatic backend sync at every task call site"
   assert.match(autoSyncSection, /if \(result\?\.canceled\) return canceledResult\(\)/);
 
   const searchSection = readFunctionSection(
-    "async function handleCaptureSearchData()",
+    "async function handleCaptureSearchData(options = {})",
     "function setKeywordStrategyTab(",
   );
   assert.match(

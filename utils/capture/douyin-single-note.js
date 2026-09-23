@@ -33,6 +33,8 @@ import {
   pickDouyinAuthorName,
 } from "./douyin-author.js";
 import {findDouyinSearchSecurityChallengeNode} from "./douyin-search-guard.js";
+import {readDouyinInlineText} from "./douyin-inline-text.js";
+import {findDirectDouyinNoteRoot} from "./douyin-note-root.js";
 
 const DOUYIN_DOM_PROFILE = getDomProfile("douyin");
 const DOUYIN_DETAIL_DOM_READY_TIMEOUT_MS = 25000;
@@ -1359,9 +1361,13 @@ function findDouyinTargetBoundModalRoot(noteId) {
   return null;
 }
 
-function resolveActiveDouyinDetailRoot(expectedNoteId = "") {
-  const fallbackRoot = resolveDetailRoot(DOUYIN_DOM_PROFILE);
+export function resolveActiveDouyinDetailRoot(expectedNoteId = "") {
   const currentUrl = String(window.location.href || "");
+  const noteRoot = findDirectDouyinNoteRoot({
+    url: currentUrl, expectedNoteId, document, isVisible: isElementVisible,
+  });
+  if (noteRoot) return noteRoot;
+  const fallbackRoot = resolveDetailRoot(DOUYIN_DOM_PROFILE);
   let modalId = "";
   let currentPath = "";
   try {
@@ -2554,8 +2560,9 @@ function safeClick(node) {
   return false;
 }
 
-function extractDouyinTitle(detailRoot) {
-  const title = cleanText(getText(DOUYIN_DOM_PROFILE.noteDetail.fields.title, detailRoot));
+export function extractDouyinTitle(detailRoot) {
+  const titleNode = getFirstMatch(DOUYIN_DOM_PROFILE.noteDetail.fields.title, detailRoot || document);
+  const title = cleanText(readDouyinInlineText(titleNode));
   if (title) return title;
 
   return cleanText(document.title.replace(/\s*-\s*抖音.*$/i, ""));

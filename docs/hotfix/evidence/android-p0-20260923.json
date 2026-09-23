@@ -1,0 +1,1726 @@
+{
+  "date": "2026-09-23",
+  "device": {
+    "model": "DE106",
+    "android": "8.1.0",
+    "api": 27,
+    "douyin": "30.6.0"
+  },
+  "scope": "real phone discovery plus independent official browser review; local backend replay; real Chrome Extension detail capture against isolated local backend",
+  "sourceHashes": {
+    "runners/android/src/device/appium.mjs": "87f18775f047ad53576d8cad17039eca4708c0e6f55942730cec5e61ca5b5035",
+    "runners/android/src/device/ui-tree.mjs": "f215a115ff94c055f5fcf1e41adf9575d667efebbfc2799acf80acd1eb2a3436",
+    "runners/android/src/device/douyin-profile.mjs": "6f0851d5e22a856657a9b694e53c41f4a392c625f25dd7e03f26c499d33a1796",
+    "runners/android/src/device/douyin-detail.mjs": "1c1b246ef7c88f730b27854ad199f9ce9097cce70a262dffe5501502575e611d",
+    "runners/android/src/device/ui-session.mjs": "7694f19a4e0d72521654ab6988888d60db37cd5a53114d3b66b9d5898e6a0694",
+    "runners/android/src/calibration/share-evidence.mjs": "693a9963dac1afbeb6d0cd29d771dd0d371b1ce691960089938c9504d3711a40",
+    "runners/android/src/calibration/douyin-flow.mjs": "a9822840f8dd22ce5d354d5aafe74abc8d227ed462a36f4fc6adce04badf5b9d",
+    "utils/capture/douyin-author.js": "002e1fbeb3ec54c7a72c692d32d299594baacafe531df283706d67e551dd2e34",
+    "runners/android/src/core/operation-gate.mjs": "c6fa3696f3f3721c2d1a88e14b1d4ac7f0a8a90aa319ade4d2641313d7d89b27",
+    "runners/android/src/core/execution-permit.mjs": "249313883c537dd7490540e6d3c6bc3af42f8df1778898be30d9b8fee46e9520",
+    "runners/android/src/core/device-closure.mjs": "3267389e91bccc9893a60f7bb8855cb510c20909e18b24c1f9f4b2400f036416"
+  },
+  "stability": {
+    "startedAt": "2026-09-23T02:32:41.306Z",
+    "closedAt": "2026-09-23T03:11:06.506Z",
+    "sessionSeconds": 2305,
+    "heartbeats": 150,
+    "sameHelperPid": true,
+    "screenKeeperSeen": false,
+    "normalClosureConfirmed": true,
+    "finalWindowStrategyInUseFromApprox": "2026-09-23T02:40:00Z"
+  },
+  "bigBangRestored": true,
+  "backendReplay": {
+    "mode": "real_public_evidence_replay",
+    "phoneWasNotDrivenByReplay": true,
+    "extensionUiWasNotRun": true,
+    "browserCompletionIsFixtureReplay": true,
+    "verifiedWorks": 20,
+    "formalTestRecords": 20,
+    "storedCandidates": 20,
+    "duplicateBatchStable": true,
+    "wrongWorkRejected": true,
+    "sqlitePending": 0,
+    "productionWrites": 0,
+    "finishedAt": "2026-09-23T03:13:50.997Z"
+  },
+  "remainingAcceptance": [
+    "larger current-version batches and matched mobile/web recall comparison",
+    "all-day unattended stability and operator recovery usability",
+    "folded reply completeness and mixed manual sync comment status follow-up"
+  ],
+  "samples": [
+    {
+      "index": 1,
+      "externalId": "7688525188494163658",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688525188494163658",
+      "searchTitle": "#别克昂科威plus挑战赛 #别克昂科威plus",
+      "searchAuthor": "girl👧🏻",
+      "officialBrowserTitle": "#别克昂科威plus挑战赛 #别克昂科威plus",
+      "officialBrowserAuthor": "girl👧🏻",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": null,
+      "capturedAt": "2026-09-23T02:16:25.233901+00:00",
+      "captureDriver": "disposable_python_calibration"
+    },
+    {
+      "index": 2,
+      "externalId": "7688508647312464290",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688508647312464290",
+      "searchTitle": "#别克世家 的秋天的壁纸来了 期待车机优化和新的功能。#车主生活记录",
+      "searchAuthor": "@开世家的宝妈小闫",
+      "officialBrowserTitle": "#别克世家 的秋天的壁纸来了期待车机优化和新的功能。#车主生活记录",
+      "officialBrowserAuthor": "@开世家的宝妈小闫",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": null,
+      "capturedAt": "2026-09-23T02:16:36.993940+00:00",
+      "captureDriver": "disposable_python_calibration"
+    },
+    {
+      "index": 3,
+      "externalId": "7688506050899277754",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688506050899277754",
+      "searchTitle": "昂科威又又又又又又出新壁纸了#燃油车的魅力 #昂科威plus #昂科威壁纸",
+      "searchAuthor": "顺其123456",
+      "officialBrowserTitle": "昂科威又又又又又又出新壁纸了#燃油车的魅力 #昂科威plus #昂科威壁纸",
+      "officialBrowserAuthor": "顺其123456",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": null,
+      "capturedAt": "2026-09-23T02:16:49.647426+00:00",
+      "captureDriver": "disposable_python_calibration"
+    },
+    {
+      "index": 4,
+      "externalId": "7688342339450859496",
+      "kind": "video",
+      "canonicalUrl": "https://www.douyin.com/video/7688342339450859496",
+      "searchTitle": "别克又给我更新壁纸啦！哪个好看呢 #别克 #别克壁纸",
+      "searchAuthor": "田小田·哈尔滨房产",
+      "officialBrowserTitle": "别克又给我更新壁纸啦！哪个好看呢 #别克 #别克壁纸",
+      "officialBrowserAuthor": "田小田·哈尔滨房产",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": null,
+      "capturedAt": "2026-09-23T02:24:18.543469+00:00",
+      "captureDriver": "disposable_python_calibration"
+    },
+    {
+      "index": 5,
+      "externalId": "7688324162008131237",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688324162008131237",
+      "searchTitle": "别克又出新壁纸了？请问6.0的车机还有戏吗？#别克gl8 @上海安吉星信息服务有限公司 @别克MPV百科全书",
+      "searchAuthor": "郑能量的GL8",
+      "officialBrowserTitle": "别克又出新壁纸了？请问6.0的车机还有戏吗？#别克gl8 @上海安吉星信息服务有限公司 @别克MPV百科全书",
+      "officialBrowserAuthor": "郑能量的GL8",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": null,
+      "capturedAt": "2026-09-23T02:27:02.219616+00:00",
+      "captureDriver": "disposable_python_calibration"
+    },
+    {
+      "index": 6,
+      "externalId": "7688319783884421810",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688319783884421810",
+      "searchTitle": "别克又更新壁纸了！#安吉星车机壁纸@上海安吉星信息服务有限公司 #檐下秋意#月兔栖梦",
+      "searchAuthor": "sean",
+      "officialBrowserTitle": "别克又更新壁纸了！#安吉星车机壁纸@上海安吉星信息服务有限公司 #檐下秋意#月兔栖梦",
+      "officialBrowserAuthor": "sean",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一天内"
+      },
+      "capturedAt": "2026-09-23T02:40:50.562Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 7,
+      "externalId": "7688308801523435249",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688308801523435249",
+      "searchTitle": "昂科威车主注意！别克上新中秋车机壁纸了！ 名字叫玉兔栖梦，一浅一深两套。 圆月桂花小兔子，中秋氛围感直接拉满。 还没刷出来的，长按语音按键重启车机刷新。 评论区看看，谁已经换上了？#别克昂科威plus #昂科威plus #别克车机 #别克车机壁纸",
+      "searchAuthor": "初心Buick",
+      "officialBrowserTitle": "昂科威车主注意！别克上新中秋车机壁纸了！名字叫玉兔栖梦，一浅一深两套。圆月桂花小兔子，中秋氛围感直接拉满。还没刷出来的，长按语音按键重启车机刷新。评论区看看，谁已经换上了？#别克昂科威plus #昂科威plus #别克车机 #别克车机壁纸",
+      "officialBrowserAuthor": "初心Buick",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一天内"
+      },
+      "capturedAt": "2026-09-23T02:41:10.877Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 8,
+      "externalId": "7688531694614003186",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688531694614003186",
+      "searchTitle": "这波壁纸我愿意给到夯#别克",
+      "searchAuthor": "小煊",
+      "officialBrowserTitle": "这波壁纸我愿意给到夯#别克",
+      "officialBrowserAuthor": "小煊",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一天内"
+      },
+      "capturedAt": "2026-09-23T02:45:34.854Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 9,
+      "externalId": "7688300388709755814",
+      "kind": "video",
+      "canonicalUrl": "https://www.douyin.com/video/7688300388709755814",
+      "searchTitle": "新壁纸你们都更新了么!#别克艾维亚 #别克壁纸",
+      "searchAuthor": "黑曼巴「洒脱」",
+      "officialBrowserTitle": "新壁纸你们都更新了么!#别克艾维亚 #别克壁纸",
+      "officialBrowserAuthor": "黑曼巴「洒脱」",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一天内"
+      },
+      "capturedAt": "2026-09-23T02:46:14.192Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 10,
+      "externalId": "7688296362274426538",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688296362274426538",
+      "searchTitle": "别克e5新壁纸，不错",
+      "searchAuthor": "闷闷儿唐",
+      "officialBrowserTitle": "别克e5新壁纸，不错",
+      "officialBrowserAuthor": "闷闷儿唐",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一天内"
+      },
+      "capturedAt": "2026-09-23T02:46:33.484Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 11,
+      "externalId": "7688275159347077243",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688275159347077243",
+      "searchTitle": "机壁纸换上这一幕，红歌一响，瞬间肃然起敬。 人民，只有人民，才是创造世界历史的动力。 #人民万岁 #国庆 #家国情怀 #别克君越",
+      "searchAuthor": "morning",
+      "officialBrowserTitle": "机壁纸换上这一幕，红歌一响，瞬间肃然起敬。人民，只有人民，才是创造世界历史的动力。#人民万岁 #国庆 #家国情怀 #别克君越",
+      "officialBrowserAuthor": "morning",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一天内"
+      },
+      "capturedAt": "2026-09-23T02:46:46.143Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 12,
+      "externalId": "7688267524730873713",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688267524730873713",
+      "searchTitle": "咱们别克GL8，又出新壁纸了。 真的是与时俱进，中秋时节秋意浓浓，赶紧换上吧#车机壁纸 #别克gl8 #GL8陆尊#用车小知识 #用车分享",
+      "searchAuthor": "艾莎的别克GL8",
+      "officialBrowserTitle": "咱们别克GL8，又出新壁纸了。真的是与时俱进，中秋时节秋意浓浓，赶紧换上吧#车机壁纸 #别克gl8 #GL8陆尊#用车小知识 #用车分享",
+      "officialBrowserAuthor": "艾莎的别克GL8",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一天内"
+      },
+      "capturedAt": "2026-09-23T02:47:04.276Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 13,
+      "externalId": "7688242826555882895",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688242826555882895",
+      "searchTitle": "别克车机两款新的壁纸，你学会设置了吗？#别克至境E7#孩子的满分座舱#家在一起爱在E7#新车到店",
+      "searchAuthor": "别克-岳阳申达(八字门店)",
+      "officialBrowserTitle": "别克车机两款新的壁纸，你学会设置了吗？#别克至境E7#孩子的满分座舱#家在一起爱在E7#新车到店",
+      "officialBrowserAuthor": "别克-岳阳申达(八字门店)",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一天内"
+      },
+      "capturedAt": "2026-09-23T02:47:16.281Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 14,
+      "externalId": "7688189163107623354",
+      "kind": "video",
+      "canonicalUrl": "https://www.douyin.com/video/7688189163107623354",
+      "searchTitle": "别克至境E7的车机壁纸 #安吉星车机壁纸@上海安吉星信息服务有限公司 别克至境E7的车机壁纸，做的很生动，希望以后的壁纸风格可以更好",
+      "searchAuthor": "🍊粉",
+      "officialBrowserTitle": "别克至境E7的车机壁纸 #安吉星车机壁纸@上海安吉星信息服务有限公司 别克至境E7的车机壁纸，做的很生动，希望以后的壁纸风格可以更好",
+      "officialBrowserAuthor": "🍊粉",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一周内"
+      },
+      "capturedAt": "2026-09-23T02:55:21.909Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 15,
+      "externalId": "7688177951930921289",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688177951930921289",
+      "searchTitle": "别克的新壁纸#中秋壁纸#别克 #别克昂科威plus #安吉星",
+      "searchAuthor": "一小只团子🍡",
+      "officialBrowserTitle": "别克的新壁纸#中秋壁纸#别克 #别克昂科威plus #安吉星",
+      "officialBrowserAuthor": "一小只团子🍡",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一周内"
+      },
+      "capturedAt": "2026-09-23T02:55:34.849Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 16,
+      "externalId": "7688169416945269339",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688169416945269339",
+      "searchTitle": "别克官方新壁纸又来啦！！#真实生活分享计划 #别克",
+      "searchAuthor": "飞哥小课堂（别克篇）",
+      "officialBrowserTitle": "别克官方新壁纸又来啦！！#真实生活分享计划 #别克",
+      "officialBrowserAuthor": "飞哥小课堂（别克篇）",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一周内"
+      },
+      "capturedAt": "2026-09-23T03:00:18.859Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 17,
+      "externalId": "7688168579418098019",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688168579418098019",
+      "searchTitle": "壁纸上新。这次上新了《檐下秋意》 和《月兔栖梦》两款壁纸 安吉星壁纸从来没有让车友失望过 赞赞赞@上海安吉星信息服务有限公司 #安吉星车机壁纸 #别克君越 #君越大连屏",
+      "searchAuthor": "Change",
+      "officialBrowserTitle": "壁纸上新。这次上新了《檐下秋意》 和《月兔栖梦》两款壁纸 安吉星壁纸从来没有让车友失望过 赞赞赞@上海安吉星信息服务有限公司 #安吉星车机壁纸 #别克君越 #君越大连屏",
+      "officialBrowserAuthor": "Change",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一周内"
+      },
+      "capturedAt": "2026-09-23T03:03:06.806Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 18,
+      "externalId": "7688139128278070139",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688139128278070139",
+      "searchTitle": "别克中秋壁纸你们打几分？个人认为是目前最好看的一组，但是6.0什么时候来啊#君越 #艾维亚 #壁纸",
+      "searchAuthor": "开君越的熊二🚗",
+      "officialBrowserTitle": "别克中秋壁纸你们打几分？个人认为是目前最好看的一组，但是6.0什么时候来啊#君越 #艾维亚 #壁纸",
+      "officialBrowserAuthor": "开君越的熊二🚗",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一周内"
+      },
+      "capturedAt": "2026-09-23T03:03:22.029Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 19,
+      "externalId": "7688002337491397627",
+      "kind": "note",
+      "canonicalUrl": "https://www.douyin.com/note/7688002337491397627",
+      "searchTitle": "凯迪拉克太有仪式感了  提前送来了中秋壁纸#凯迪拉克 #CT5#壁纸 #大连屏ct5",
+      "searchAuthor": "温衡",
+      "officialBrowserTitle": "凯迪拉克太有仪式感了  提前送来了中秋壁纸#凯迪拉克 #CT5#壁纸 #大连屏ct5",
+      "officialBrowserAuthor": "温衡",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一周内"
+      },
+      "capturedAt": "2026-09-23T03:03:42.395Z",
+      "captureDriver": "runner_calibration_modules"
+    },
+    {
+      "index": 20,
+      "externalId": "7688000012572351387",
+      "kind": "video",
+      "canonicalUrl": "https://www.douyin.com/video/7688000012572351387",
+      "searchTitle": "别克新的车机壁纸上新了 兔子超可爱#别克 #安吉星车机壁纸 #凯迪拉克 #别克gl8 #别克昂科威plus",
+      "searchAuthor": "小扬流量卡及日常",
+      "officialBrowserTitle": "别克新的车机壁纸上新了 兔子超可爱#别克 #安吉星车机壁纸 #凯迪拉克 #别克gl8 #别克昂科威plus",
+      "officialBrowserAuthor": "小扬流量卡及日常",
+      "fullIdentityConfirmed": true,
+      "filtersRetained": true,
+      "filters": {
+        "sort": "最新发布",
+        "time": "一周内"
+      },
+      "capturedAt": "2026-09-23T03:04:13.848Z",
+      "captureDriver": "runner_calibration_modules"
+    }
+  ],
+  "realExtension": {
+    "verifiedAt": "2026-09-23T03:48:38.766406+00:00",
+    "profile": "StarVoice P0",
+    "packageName": "StarVoice P0 本地测试",
+    "packageVersion": "0.4.10",
+    "loadedPath": "/private/tmp/starvoice-p0-local-extension-20260923",
+    "extensionId": "fajpdkdbaeohgpadhfeedplfkilajeab",
+    "businessApi": "http://localhost:3001",
+    "phoneSamplesReplayed": true,
+    "livePhoneToBrowserDaemonRun": false,
+    "initialDistinctWorks": 3,
+    "initialAutomaticTasksCompleted": 3,
+    "loggedInAutomaticRepeatTasksCompleted": 2,
+    "repeatScenario": "isolated test fixture requeued two stored candidates with records retained; normal management reprocess API was not used",
+    "finalRecordCount": 3,
+    "finalStoredCandidates": 3,
+    "allFiveCreateCommandsCompleted": true,
+    "records": [
+      {
+        "external_id": "7688324162008131237",
+        "title": "别克又出新壁纸了？请问6.0的车机还有戏吗？#别克gl8 @上海安吉星信息服务有限公司 @别克MPV百科全书",
+        "author_name": "郑能量的GL8",
+        "author_id": "MS4wLjABAAAAC0sKTX-hFOioe4hTqyKLbj_m6bv23GTMastGJ83vXT8",
+        "comments_count": 3,
+        "comments_capture_status": "done",
+        "comments_total_captured": 2
+      },
+      {
+        "external_id": "7688342339450859496",
+        "title": "别克又给我更新壁纸啦！哪个好看呢 #别克 #别克壁纸",
+        "author_name": "田小田·哈尔滨房产",
+        "author_id": "MS4wLjABAAAA21J6NXhAVLclyg9H0lB0tMFBceqPQRUs1dxqaqVUxz4",
+        "comments_count": 0,
+        "comments_capture_status": "done",
+        "comments_total_captured": 0
+      },
+      {
+        "external_id": "7688525188494163658",
+        "title": "#别克昂科威plus挑战赛 #别克昂科威plus",
+        "author_name": "girl👧🏻",
+        "author_id": "MS4wLjABAAAAg-AVfwZmgLH-0Edy3d8IMRola152IkBsSra6GksYvyY",
+        "comments_count": 3,
+        "comments_capture_status": "done",
+        "comments_total_captured": 1
+      }
+    ],
+    "authorMentionIdentityCorrect": true,
+    "emojiNicknameFixedAndVerified": true,
+    "productionWrites": 0,
+    "productionPackageUnchanged": true,
+    "productionPackageFilesVerified": 99,
+    "commentLimits": [
+      "At 11:42 local time one work displayed two comments, one visible root and one collapsed reply. Automatic capture stored one root and did not expand replies.",
+      "Displayed comment metrics changed during the live session; done means the current collector finished, not complete reply coverage.",
+      "Syncing a mixed pair of manual captures, one without comments, changed comments_capture_status to not_started while retaining comments_total_captured. Later automatic detail capture restored done; the mixed-manual-sync issue was not fixed in this hotfix."
+    ],
+    "regressions": {
+      "targetedAuthorAndDetailTestsPassed": 14,
+      "diffCheckPassed": true
+    },
+    "testPackageSourceHashes": {
+      "background.js": "3e5897884fdcd6e0ed3fb55c2a1e0824fd42945c2de75a843bc09b972a3c5f24",
+      "content-v2.js": "b1c068d4713d6a8abdbb1c73d7f3ab41bee95336691c9850d921392c588680ab",
+      "manifest.json": "b8ea6be101905fe0606231a297b1647948e2612000ef9cf04e53c1a2105a47e7",
+      "content-loader.js": "5263dd9ed57fd9b2cdefcd41acbed6dd40af9476f468923e2143cdda6bd81ef0",
+      "sidebar/task-center-ui.js": "f335b4754cd03c1dd555e0b4d87508b019c67de0250bbae2ab877cbb85101b98",
+      "sidebar/platform-config.js": "7650f0aaf0b87a80bf918214ecfbca901ca61b84ef9faeed766080d8d439bcd6",
+      "sidebar/state.js": "1b143b89fbf97824423a5914115f5f1c920eb556495d2a9e018b8e059ea82685",
+      "sidebar/sidebar.css": "b34b0cd97f6159ae68e37a258a9eb5dc6ae69672c897cf02cda77d8b05137f5e",
+      "sidebar/sidebar-logic.js": "5bd2c0e6b6cbf4cf87cfb897f243119c36d1f731df21bd97f5f99a7751bee625",
+      "sidebar/sidebar.html": "6c08387f55901b7f39b7115c776dbc76aefe05d717ae9a569cf3ef3454248b3a",
+      "sidebar/platform-registry.js": "d8b2f0c3c0367e4dc831e3b2dfd5b6dc787c588dd61225bf943bdef613750a12",
+      "sidebar/sidebar-ui.js": "d7a55595a8b6a3eb7630f3529414f2c638e72818bfefcd5216b525a47d65f51d",
+      "images/icon16.png": "87df3b3394294086b9a8fcb8b69623b97d7e2c3edec29d35d184be12115e8826",
+      "images/icon48.png": "dbf63b93d68c17e1e91e01dd06600f7a36674a2836d0ffbeee6444e7ee0146f3",
+      "images/icon128.png": "265710813d35618ecdcac269fc03e11337f33b51e22121048169ffa90a1f0431",
+      "images/logo-starvoice.svg": "182c25b00d7d0ed004bee90a4083554ad68dd22b14a72b8e4b0e0cac428a4371",
+      "images/icon256.png": "1dbba1816df32a39b467a5641a29f43dd31d9d2b349c1937d5e990b09b58b55d",
+      "images/wechat.png": "0b53d054c3a0f7ae086fd65fe12ab7482a97bce53a0de05fcd4272cd20b0b4ca",
+      "utils/constants.js": "a8d345ff69de679303132704d8404f99ef8bb41c97a5a887502e10fc7ca929c0",
+      "utils/scroll.js": "dca84be798570a89969b9bcf0c4c519eb0e488c9a28706faafcb1296d16559ec",
+      "utils/social-account-identity.js": "f2bdd88bb6d930ab3af948275c8b9f874760e307d9f7fc460cc5839ea9f425a6",
+      "utils/diagnostics.js": "3df131bade984bc50b49a4db3b2614d19ded95bda87929809c6b11d34ccdf53d",
+      "utils/selectors.js": "0d753a66d6668cea10ce7a71b57d70989bd1c601178786b3f9e74f7b1caf3f76",
+      "utils/comment-dedupe.js": "70c7ace27e218ecf0564477effd0187ee1f6d1123e426d066bc1da52645a5989",
+      "utils/auth-code.js": "7961dfedbda97710ca64f997a8f436525ec2de620f442960363c024fb18a04a2",
+      "utils/social-account-usage.js": "b28962304ce5961f83519ddb909b7a7d76b10af69842d9e18ab370f45222c662",
+      "utils/unattended-report-outbox.js": "3b5099f336bdb61427f6a48a145705993ab56108557b8535d2beafa57365784c",
+      "utils/task-center.js": "dae39c96aa8a5128a055f5d25484db74e2ce23e93b0e3559b02878a3688816b6",
+      "utils/runtime-config.js": "76380d76fa34559597e57c66708579eaf0788c51a187bb341961b4f457a8187f",
+      "utils/capture-recovery.js": "d8d5cee3516891bc0af13b084730af6de5519b567da9be229d905a313e7db0a4",
+      "utils/runtime-tab-policy.js": "12d9e709995cb48e48a79946869b8731ffb8c07b90c7eed74e7fabb0ba64eef3",
+      "utils/cloud-targeted-post.js": "e7d399ee9dc3d5ebb9e43be177241c4894382941a5d7855457132bb56a81103e",
+      "utils/task-context.js": "53fa2f9baa219544075e36e31e6749675ff82971e137f2594a19448b67adb7f1",
+      "utils/record-sync-queue.js": "9c1564702bde69731d4109247f8f86360ce21eb2438b5a0ca88358fca4b49dbb",
+      "utils/control-storage-reserve.js": "820d2ee9a1457d9e71ce5e8430197764b92f3be5a638931a94ac0d98fd055d33",
+      "utils/unattended-keyword-run.js": "dbdeb546a1975daf08f46b36b362c13e921cff5dbaf589bf886756ed4efe5f2c",
+      "utils/capture-request.js": "4071ca0154192a6c57d91c548367d8c3c0cbfa68891a8ebaef10eaf27e632b75",
+      "utils/helpers.js": "6f7437e4389cf4a1a997c29829d07b62f5b08e6b0fda4ffcafbb75e06bfac272",
+      "utils/capture-sync.js": "200706a33e0e235fbb1153f5ce853b93f6b80e2bb0dfe796b331ec70ca3db61f",
+      "utils/cloud-task-agent.js": "716523d8618b3e7fed8819e299e7994d6bb86c46efd5371feba206d578c99034",
+      "utils/api.js": "b9edd2f72a3a4d9a575aea8e05c6946c3f0bb4eda0a156578b3956ccbd0c6439",
+      "utils/timer-worker.js": "4b3c40ad41e49305ec94b81331d7a132df9440f21253964db91d17da653822cb",
+      "utils/content-page-state.js": "f2f45347a9f863a44857bb576629d8dc033ee2c13402e329f8e3043a8f7cf4c6",
+      "utils/capture-settings.js": "2e191219b7320f6f364dcb368e1b34bec7ac58e3555518ca3239216d0baf11b0",
+      "utils/storage.js": "a552eb339c9830c04947b52089933a0612c94cf43ec6ced48e5dbb9d30735fe3",
+      "utils/capture-recovery-ui.js": "4a88cf64452f6b52dfb631a5655e8a3300658bd9639f768f8d414e2d20b643c2",
+      "utils/capture-publish-window-exclusion.js": "53ef5568b605792fc676c277f5df38c2b897225d013f30de6709cbb0f40126f9",
+      "utils/capture/enhancement-retry.js": "854000372233bc77c2eb3dbd56957dc538d8ab81e2017f0fa935a177b4daf8a4",
+      "utils/capture/target-page-availability.js": "6ee7211a2a2af5f8c60e2e62e19ba368cd8b8280e69ce1acbc0bbe487bacc81f",
+      "utils/capture/douyin-comments.js": "34708e29e910858e0c2af8a66ca536db2c4cd78c4c83036258438857fda9ae7b",
+      "utils/capture/douyin-single-note.js": "59269ccba3506fb21c5eb998be89a1609c06c6bd2edce559192351a9a5928b7b",
+      "utils/capture/blogger.js": "80a02f0a488ededa00df58b55b3ee36610e125050242826f69457889c9e090b6",
+      "utils/capture/weibo-net-bridge.js": "170fe4aafd28b4f95df9b278b2df5980ea8b368e3e745fe69220c06662e9871b",
+      "utils/capture/douyin-blogger.js": "07c9af806e49cd214c0271d7bae442b055ef5849ef71c579280b2f8e2571044c",
+      "utils/capture/douyin-search-guard.js": "253385ddd73d0734feedced1841c37e29c1d57d4863025e28cd444a135600c49",
+      "utils/capture/weibo-single-note.js": "7ae7e9c979ca9b35197774e2fac52b63ee9276fc85c0f146b01fdfc084a87878",
+      "utils/capture/stage-diagnostics.js": "a646d1e800a8b031bc02ba2c6c4910cda478de3b5cf8d3758572ceca01eae284",
+      "utils/capture/xiaohongshu-security.js": "b743145278972dc06427733078677fcc59bd32126d883a97495fb44f91d56b02",
+      "utils/capture/keyword-search.js": "d3c3415970388ad5f5f484bc97b1ca7087d3cc5482a80d46b4ac36e35049154f",
+      "utils/capture/task-tab-group.js": "27b0dde3f83b2bb0ebce78f726cf8ee12bf3757cc34fd40397c4e78ce8575404",
+      "utils/capture/weibo-blogger.js": "0b0c622cb98694ba3491b58a9f7e407e7508043ded68f98829b73aeca8701c04",
+      "utils/capture/debug-session.js": "4aed172cd11e8a067d7078012f3b4bc8d8cae25e8f41bdd9806d2fe2b76f7d90",
+      "utils/capture/xhs-search-filter-evidence.js": "f7ba3d1ffa6fd4cc5e9577d9bc0da23f15fca4f9c55ec736a44586f794c58f44",
+      "utils/capture/keyword-expansion.js": "f3d93c367770b7618f57282dfd18f43ddf81d5bfdaacf719f7552d5a2d262cf3",
+      "utils/capture/list-capture-debug-overlay.js": "0a6ed0051acd70a4cc76ad1850b631cfd7e9b02a39ea129ad2c57e8bb2f201d2",
+      "utils/capture/douyin-keyword-search.js": "3e4142876f6f21a860f9a6d13adcd49eec3e73c7b4e5169448b869c7d9a8e407",
+      "utils/capture/index.js": "1244f0dfcdcce60d75df76bda12c98acba057a6321919d0766a726f1cf28c2c8",
+      "utils/capture/task-runtime.js": "6f6b22c6aef4a6cf240c0a92281440e3a1125b34bf4f00aa43e1ad579dc97d19",
+      "utils/capture/weibo-keyword-search.js": "f2c0d59ab161e3f4c7b83dc0cfc752dda6f8c615b6ed4806239a23492a2dc831",
+      "utils/capture/single-note.js": "0b5b581e2cc487ed9fb27cd5760d3b65b571998507fae0d4971fc9b388bb5a4f",
+      "utils/capture/detail-runner.js": "a4005438bb81b41435ed07ad7d76a7ca4300e5b3c90f33e9119bfe0d62ff5072",
+      "utils/capture/douyin-interceptor.js": "7371081792b2d0233a616fa47270260551016f66e850760f5a8ea0cbbb773eab",
+      "utils/capture/task-owner.js": "5d0128fc706587f58f5e0da214b82e53c6b82db420bcf4fd460b59a5651fe64e",
+      "utils/capture/relevance-prefilter.js": "d2840897ca1c4126a08663ba0fd4173df0df8d932bc0bff1b78187cc30ebf433",
+      "utils/capture/comments.js": "74fba91335ec4c0b1feb87d8ec65602b037b44d38b363b775acc6608957f2ec4",
+      "utils/capture/xhs-publish-window.js": "2c259d6e863f8b1230d6b91ed6650dd40d23497a3d17a0daec1a3265dc3ffc13",
+      "utils/capture/detail-availability.js": "9f3906123cce0d2099a2b8dd59222d51244c13c74c9cf451e3a049b2dbace608",
+      "utils/capture/detail-prefetch-pipeline.js": "8f39bb9bc92d327c1b81028cf3419a0d4973c6a8216f74d8b250e68d67cee559",
+      "utils/capture/weibo-api.js": "a407711281c20e29cf125b37bbafc9b943fd3884b37ce34924348b954a460c44",
+      "utils/capture/douyin-author.js": "002e1fbeb3ec54c7a72c692d32d299594baacafe531df283706d67e551dd2e34",
+      "utils/capture/list-capture-trace.js": "013f6d15b2d713b799cc00b10a7179e37b484c42c388d794377e947874621e6f",
+      "utils/platform/shared-policy.js": "8e813bcf3a983eba753924ef1e983dd94d87a596429c96ee925a8bda4f144d1b",
+      "utils/platform/registry.js": "ec2017a1bcded537bbe191b54a9afd5614238e46511b7c062aedbbc458058566",
+      "utils/platform/sync-router.js": "691e0305b46340e490bd5d98f31391c855c3544874a28f70294397d2a0d654ae",
+      "utils/platform/record-envelope.js": "4dd245b986f5551b7499ef35d356c4ce9436c53b4d78a6663a49e08fe8c9083d",
+      "utils/platform/page-routing.js": "9446d1e60a9d19ae97ccd56e493177152cc1fbb4359073275339491cc94ce3d4",
+      "utils/features/registry.js": "78040822c475abb3ed740a532d6aa56e7df8e1a872de66325176d6b8b76e1ca4",
+      "utils/platform/dom-profiles/douyin.js": "8625ea7e2b89eeb0162a6348cbeac49fd19cb3275f0e8a8f813c2ed695330493",
+      "utils/platform/dom-profiles/index.js": "0e2b071105c5a3f206cdb8f68ece47eb03e112f18093cea6973d6ae1a6d0663b",
+      "utils/platform/dom-profiles/xiaohongshu.js": "3057080491b55685557aad43af5ad90128aae1cdb4745927c52d66b0e2bbd978",
+      "utils/capture/shared/dom-locator.js": "f6028c24cc3dd42f68c67c205e43b87b6f0f62bbb1467c9084c4468628f6852e",
+      "utils/capture/shared/detail-dom.js": "0d665fa71a80fe1a92bfd29346815ce593bde5e24f95ff76c04e43f7dd911ae5",
+      "utils/capture/adapters/weibo/index.js": "2c49c19d3ecafe5086ac9be2febd54e3a6ed58e878ab4bb4bd838a8ab46f0547",
+      "utils/capture/adapters/xiaohongshu/index.js": "e42e46721afcf796994c87d4c87f4628cc4fdba6292609b765d0f918aaaf5803",
+      "utils/capture/adapters/douyin/index.js": "a4d430ab321c6dd3ca7c1aafd9abebb208c8f65ea6ee9f525ab56e73b95116ef",
+      "sidebar/renderers/douyin.js": "a8743acaf92d2722857092aa06a09d35dee278b9dfe937ec4685f786a3bee781",
+      "sidebar/renderers/xiaohongshu.js": "c10eb163aae6f62b170d24a7f7a4440a1eefc372ca0f8e8fa929ac42b8c91dc8",
+      "sidebar/renderers/common.js": "c13ac65ccafb10a4152390d35240453e494c4e399c4dbd298d531d71b4fbe8ea",
+      "sidebar/renderers/weibo.js": "81d6fa44c67bda0d742d262fee2ea12cee969eb99c56528b509dd3b846975a6b"
+    },
+    "cleanup": {
+      "at": "2026-09-23T03:50:13.754Z",
+      "testTenantGone": true,
+      "testBrowserAgentGone": true,
+      "privateFixtureRemoved": true,
+      "localApiStopped": true,
+      "shutdownLogged": true,
+      "testExtensionDisabledInP0Profile": true,
+      "postgresTestInstanceStopped": true,
+      "appiumStopped": true
+    },
+    "observedBrowserWarnings": [
+      "Risk notice dialog aria-hidden focus warning",
+      "Douyin detail interceptor returned empty JSON for one work; actual DOM capture and database identity verification succeeded."
+    ]
+  },
+  "usbReconnectProbe": {
+    "at": "2026-09-23T03:57:23.835Z",
+    "physicalDisconnect": true,
+    "physicalReconnect": true,
+    "readOperationCancelled": true,
+    "noRequestAfterStop": true,
+    "restartWithoutClosureBlocked": true,
+    "verifiedClosureAccepted": true,
+    "helperStopped": true,
+    "lockReleased": true,
+    "probeScope": "real device read-source and local operation gate; no search task or remote stop command",
+    "appiumStopped": true,
+    "phoneStillConnected": true,
+    "bigBangSettingStillOriginal": true,
+    "events": [
+      {
+        "at": "2026-09-23T03:55:06.575Z",
+        "event": "session_opened",
+        "wakeLockTimeout": 0,
+        "helperPid": "7157"
+      },
+      {
+        "at": "2026-09-23T03:55:08.080Z",
+        "event": "initial_source",
+        "latencyMs": 1503,
+        "nodes": 279,
+        "douyinNodes": 278,
+        "searchVerified": false,
+        "cards": 0
+      },
+      {
+        "at": "2026-09-23T03:55:08.081Z",
+        "event": "ready_for_physical_disconnect",
+        "waitLimitSeconds": 240
+      },
+      {
+        "at": "2026-09-23T03:55:41.338Z",
+        "event": "read_error",
+        "code": "appium_http_error"
+      },
+      {
+        "at": "2026-09-23T03:55:41.376Z",
+        "event": "physical_usb_disconnected",
+        "readsBeforeDisconnect": 8
+      },
+      {
+        "at": "2026-09-23T03:55:53.391Z",
+        "event": "helper_cleanup",
+        "helperPid": ""
+      },
+      {
+        "at": "2026-09-23T03:55:53.392Z",
+        "event": "offline_session_closed",
+        "deleted": true,
+        "invalid": true,
+        "closureConfirmed": true
+      },
+      {
+        "at": "2026-09-23T03:55:53.427Z",
+        "event": "physical_usb_reconnected"
+      },
+      {
+        "at": "2026-09-23T03:55:57.223Z",
+        "event": "session_opened",
+        "wakeLockTimeout": 0,
+        "helperPid": "7426"
+      },
+      {
+        "at": "2026-09-23T03:56:00.291Z",
+        "event": "reconnected_source",
+        "latencyMs": 3065,
+        "nodes": 276,
+        "douyinNodes": 275,
+        "searchVerified": false,
+        "cards": 0
+      },
+      {
+        "at": "2026-09-23T03:56:00.321Z",
+        "event": "stop_gate_checked",
+        "firstResult": "user_stop",
+        "nextOperationRejected": "operation_not_settled",
+        "noFurtherRequests": true,
+        "closureRequired": true
+      },
+      {
+        "at": "2026-09-23T03:56:00.700Z",
+        "event": "final_session_closed",
+        "deleted": true,
+        "invalid": true,
+        "closureConfirmed": true
+      },
+      {
+        "at": "2026-09-23T03:56:00.701Z",
+        "event": "probe_finished",
+        "physicalDisconnect": true,
+        "physicalReconnect": true,
+        "closureConfirmed": true,
+        "reads": 9,
+        "productionReady": false
+      },
+      {
+        "at": "2026-09-23T03:56:00.701Z",
+        "event": "lock_released"
+      }
+    ],
+    "afterReconnectSearchTaskExecuted": false,
+    "remoteStopCommandTested": false,
+    "helperForceStoppedDuringRecovery": true,
+    "sourceXmlOmitted": "phone UI trees remain private temporary artifacts"
+  },
+  "currentVersionPilot": {
+    "profileId": "douyin-40.6.0-de106-api27-p0",
+    "userConfirmedManualAppUpgrade": true,
+    "appInstallUpdatedAt": "2026-09-23T11:32:56+08:00",
+    "scope": "real_phone_real_runner_real_http_local_postgres",
+    "productionAccepted": false,
+    "productionWrites": 0,
+    "sourceHashes": {
+      "runners/android/src/device/appium.mjs": "240c452dce04ffccc6c7035b6c2c88c6328703bc39b527397f090b53d0f97372",
+      "runners/android/src/device/douyin-profile.mjs": "cfe5f9e8595eec0eede1c737bee7134f14197adf4afe117b78c01f325052c194",
+      "runners/android/src/device/douyin-readiness.mjs": "4fd3c0727dfcc0e0a4cd327d4ef75c4382267a32775e2379d1e5fa7a8b3efa07",
+      "runners/android/src/device/douyin-semantic-filters.mjs": "98051046e33c92086c5967c591d24e2d651710a925f918fe73dc465f9fbf4516",
+      "runners/android/src/device/douyin-share.mjs": "2634a56a834a45d12cf8e021055a76110b43ccde557a3755df27fb05178bb902",
+      "runners/android/src/device/profile-adapter.mjs": "11a1cc8faaa38311970098dcaaa631f77a3e3f68fa960311bc6a9726e9dbb009",
+      "runners/android/src/device/profile-session.mjs": "fff775fb8275d342914fd72c568fd22ea6ef51af0d8d7377a29f2aead663deac",
+      "runners/android/src/device/session-profile.mjs": "eabb60796c845d6000a50d1312e388ac994756ba1ac0c0d73c1ef9af64269e20",
+      "runners/android/src/calibration/douyin-flow.mjs": "0e6f9b8c0550dd5b606cc65879fafef948ffb94f4b062267a788bcb3fa430e46",
+      "runners/android/src/core/discovery-evidence.mjs": "9b89980b289eea8c193a341574a91e08971d0d848e1f53a9f1b205797cb1a34c",
+      "runners/android/src/core/discovery-runner.mjs": "6ece4e719e3c9b527ae3f72736dbff9b48aaa147dd27ba15aa9bdecda0440e6a",
+      "runners/android/src/daemon/runtime.mjs": "c668b20f98e71661e0ed507b1c321c5dd76c7fec94465c6cc1cd4dde17314bdd",
+      "runners/android/src/daemon/settle-device.mjs": "cb501e11526fdcb43000630b3a2ae757d77d30a1ee5b318b14864e46534bbce0"
+    },
+    "twoKeywordRun": {
+      "startedAt": "2026-09-23T04:55:29.308Z",
+      "finishedAt": "2026-09-23T04:58:47.722Z",
+      "status": "completed",
+      "items": [
+        {
+          "keyword": "别克壁纸",
+          "status": "completed"
+        },
+        {
+          "keyword": "君越壁纸",
+          "status": "completed"
+        }
+      ],
+      "events": [
+        {
+          "keyword": "别克壁纸",
+          "verification": "ui_bound",
+          "observedFilters": {
+            "sort": "comprehensive",
+            "range": "day"
+          },
+          "resolutionStatus": "pending",
+          "resolutionError": "short_link_resolution_failed",
+          "discoveredAt": "2026-09-23T04:56:54.535Z",
+          "shareUrlSha256": "7ab8dbc704dfec4e8f982878517748483d4684faf34a55ebf4b507bd9235b376"
+        },
+        {
+          "keyword": "君越壁纸",
+          "verification": "ui_bound",
+          "observedFilters": {
+            "sort": "comprehensive",
+            "range": "day"
+          },
+          "resolutionStatus": "pending",
+          "resolutionError": "short_link_resolution_failed",
+          "discoveredAt": "2026-09-23T04:58:31.240Z",
+          "shareUrlSha256": "665a1dba12fb6db9b992b9a87f2169a1b538958ba949288a2103a53dcad2be43"
+        }
+      ],
+      "maxLinksPerKeyword": 1,
+      "sqlitePending": 0,
+      "physicalClosureConfirmed": true,
+      "formalRecords": 0,
+      "systemDnsAddress": "198.18.16.159"
+    },
+    "remoteStop": {
+      "requestedAt": "2026-09-23T05:05:06.240Z",
+      "operation": "search",
+      "closedAt": "2026-09-23T05:05:08.060Z",
+      "runStatus": "canceled",
+      "completion": {
+        "status": "canceled",
+        "reason": "remote_stop",
+        "deviceIdle": true
+      },
+      "deviceHeld": false,
+      "events": 0,
+      "postStopUiClicks": 0
+    },
+    "validation": {
+      "focusedTests": 141,
+      "focusedTestsPassed": 141,
+      "stopRegressionTestsPassed": 12,
+      "postgresDetailTestsPassed": 13,
+      "adminTypecheckPassed": true,
+      "boundedModules": 78,
+      "largestModuleLines": 264
+    },
+    "sourceHashScope": "final hotfix after stop-reason correction; two-keyword run preceded that correction; final physical remote-stop test used corrected runtime",
+    "cleanup": {
+      "remainingHttpFixtureTenants": 0,
+      "deviceLockReleased": true,
+      "helperStopped": true,
+      "appiumStopped": true,
+      "temporaryPostgresStopped": true,
+      "temporaryCredentialsAndRawUiRemoved": true
+    }
+  },
+  "dnsResolutionPilot": {
+    "mode": "google-doh",
+    "defaultUnchanged": "system",
+    "systemAndUdpAddress": "198.18.16.159",
+    "publicAddressGuardRetained": true,
+    "tlsVerificationRetained": true,
+    "productionConfigurationChanged": false,
+    "resolvedPreviousRealPhoneEvents": [
+      {
+        "externalId": "7688308801523435249",
+        "kind": "note",
+        "milliseconds": 756
+      },
+      {
+        "externalId": "7688275159347077243",
+        "kind": "note",
+        "milliseconds": 378
+      }
+    ],
+    "validation": {
+      "tests": 146,
+      "passed": 146,
+      "adminTypescript": true,
+      "boundedModules": 79,
+      "largestLines": 264
+    },
+    "sourceHashes": {
+      "server/services/capture-discovery/share-dns.js": "b2b5b385084ce01a2969f25927ea6e023550711d94950f0709bc958ca0606751",
+      "server/services/capture-discovery/share-resolver.js": "5b34fd79f57316cbc67ca34efbc880cf3454007e9daf04eb40927d7765068885",
+      "server/services/capture-discovery/identity.js": "cdbc1f8c77a5bbc1c1cbfd3347a360c27172855a7c2073531f8711f34cbc692a",
+      "tests/capture-discovery-dns.test.mjs": "02fb68ba79ab4b725a47c8621aca4a9d73bb22efef31f46e579eba62859d6821"
+    },
+    "liveEndToEnd": {
+      "status": "awaiting_test_browser_window",
+      "realPhoneRunStarted": false,
+      "formalRecordsCreated": 0,
+      "fixtureTenantRemaining": 0,
+      "productionPackageFilesChecked": 99,
+      "productionPackageUnchanged": true,
+      "temporaryCredentialsRemoved": true
+    }
+  },
+  "currentVersionLiveEndToEnd": {
+    "startedAt": "2026-09-23T05:52:37.942Z",
+    "phoneCompletedAt": "2026-09-23T05:55:39.854Z",
+    "runId": "1249d4a5-026d-44cc-bffa-c99616c49556",
+    "scope": "real phone, real HTTP and SQLite, real Chrome Extension, isolated PostgreSQL",
+    "profileId": "douyin-40.6.0-de106-api27-p0",
+    "browserProfile": "StarVoice P0",
+    "extensionVersion": "0.4.10",
+    "filters": {
+      "sort": "comprehensive",
+      "range": "day"
+    },
+    "keywords": [
+      "别克壁纸",
+      "君越壁纸"
+    ],
+    "phoneItemsCompleted": 2,
+    "discoveryEvents": 2,
+    "distinctCandidates": 1,
+    "externalId": "7688275159347077243",
+    "candidateStatus": "stored",
+    "detailAttempts": 4,
+    "createCommandsAcknowledged": 4,
+    "formalRecordCount": 1,
+    "endToEndAccepted": true,
+    "reportedCommentsPerCapture": 50,
+    "commentsScope": "50 raw captured items persisted in payload; existing server non-comment filter removed 2, leaving 48 formal record_comments; no all-replies or AI-refinement acceptance",
+    "mobileCaption": "机壁纸换上这一幕，红歌一响，瞬间肃然起敬。 人民，只有人民，才是创造世界历史的动力。 #人民万岁 #国庆 #家国情怀 #别克君越",
+    "browserNormalizedRecord": {
+      "externalId": "7688275159347077243",
+      "url": "https://www.douyin.com/note/7688275159347077243",
+      "title": "机壁纸换上这一幕，红歌一响，瞬间肃然起敬。人民，只有人民，才是创造世界历史的动力。#人民万岁 #国庆 #家国情怀 #别克君越",
+      "content": "机壁纸换上这一幕，红歌一响，瞬间肃然起敬。人民，只有人民，才是创造世界历史的动力。#人民万岁 #国庆 #家国情怀 #别克君越",
+      "authorName": "morning",
+      "captureTaskId": "8bf72200-6ce4-4ff6-9beb-2929a1df6cda"
+    },
+    "failureCode": null,
+    "identityGuardPreserved": true,
+    "diagnosis": "Observed current image-note caption at [data-e2e=\"note-detail\"] .daVLa2m7 .Bfj9rfeR. Existing PC source, production 0.4.12 package and pre-fix P0 shared the same caption resolution; missing selector fell back to truncated document.title when full API desc was unavailable.",
+    "phoneClosureConfirmed": true,
+    "pendingEvents": 0,
+    "productionWrites": 0,
+    "remainingBlocker": null,
+    "sourceHashes": {
+      "utils/capture/douyin-single-note.js": "c6dbaa88eb076abce8a6828564f2c4700bb1ed5508105ba63219e21daa9a21de",
+      "utils/platform/dom-profiles/douyin.js": "7928fe4971de66b57003039aaccd725f7aa5367fdc8252a07eddd8d3c0be83a6",
+      "server/services/capture-discovery/ui-binding.js": "ccae98dd03e0393975959a2757636a290bc89beee693170d167a2abd6cebe3a2",
+      "server/services/capture-discovery/share-dns.js": "b2b5b385084ce01a2969f25927ea6e023550711d94950f0709bc958ca0606751"
+    },
+    "beforeFix": {
+      "detailAttempts": 3,
+      "formalRecordCount": 0,
+      "browserNormalizedRecord": {
+        "externalId": "7688275159347077243",
+        "url": "https://www.douyin.com/note/7688275159347077243",
+        "title": "机壁纸换上这一幕，红歌一响，瞬间肃然起敬。 人民，只有人民，",
+        "content": "机壁纸换上这一幕，红歌一响，瞬间肃然起敬。 人民，只有人民，",
+        "authorName": "morning",
+        "captureTaskId": "323b31bd-4d4d-4b8a-aea9-3d1c82233ca4",
+        "captureTaskItemAttemptId": "bcea9bda-6238-4c72-82f3-c84cb3141b98"
+      },
+      "failureCode": "DISCOVERY_DETAIL_IDENTITY_MISMATCH",
+      "sourceHashes": {
+        "utils/capture/douyin-single-note.js": "59269ccba3506fb21c5eb998be89a1609c06c6bd2edce559192351a9a5928b7b",
+        "server/services/capture-discovery/ui-binding.js": "ccae98dd03e0393975959a2757636a290bc89beee693170d167a2abd6cebe3a2",
+        "server/services/capture-discovery/share-dns.js": "b2b5b385084ce01a2969f25927ea6e023550711d94950f0709bc958ca0606751"
+      }
+    },
+    "verifiedAt": "2026-09-23T06:27:13.398Z",
+    "acceptanceScope": "bounded two-keyword discovery and one distinct work; completed after code fix and normal management retry, not an uninterrupted new phone run",
+    "uninterruptedRunAccepted": false,
+    "formalCommentCount": 48,
+    "commentWorkflowStatus": "persisted",
+    "filteredNonComments": 2,
+    "fix": "Reuse existing PC collector; add the scoped image-note caption selector and keep DOM fallback within the already-bound detail root. Exact phone/browser identity guard unchanged.",
+    "regression": {
+      "testsPassed": 36,
+      "testsFailed": 0,
+      "newCases": 3,
+      "moduleBoundaryPassed": true,
+      "modules": 79,
+      "largestLines": 264
+    },
+    "phoneBrowserChecks": [
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688275159347077243",
+        "candidateStatus": "stored",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 50
+      },
+      {
+        "keyword": "君越壁纸",
+        "externalId": "7688275159347077243",
+        "candidateStatus": "stored",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 50
+      }
+    ],
+    "demandStatus": "fulfilled",
+    "productionBuildFilesVerifiedUnchanged": 99,
+    "cleanup": {
+      "status": "completed",
+      "testExtensionDisabled": true,
+      "localApiStopped": true,
+      "appiumStopped": true,
+      "isolatedPostgresStopped": true,
+      "fixtureDeleted": true,
+      "temporaryCredentialsRemoved": true,
+      "phoneHelperAbsent": true,
+      "bigBangOriginalValue": 1,
+      "productionBuildFilesUnchanged": 99
+    }
+  },
+  "currentVersionContinuousBatch": {
+    "runId": "279d3227-6b0c-4f07-b8ed-e581cfd54793",
+    "scope": "real_phone_and_real_extension",
+    "mobileStartedAt": "2026-09-23T06:55:20.726Z",
+    "mobileCompletedAt": "2026-09-23T07:00:41.801Z",
+    "completionTimePrecision": "exact server completion timestamp",
+    "profileId": "douyin-40.6.0-de106-api27-p0",
+    "browserProfile": "StarVoice P0",
+    "extensionId": "fajpdkdbaeohgpadhfeedplfkilajeab",
+    "filters": {
+      "sort": "comprehensive",
+      "range": "day"
+    },
+    "keywords": [
+      "别克壁纸",
+      "君越壁纸"
+    ],
+    "maxLinksPerKeyword": 3,
+    "events": 6,
+    "distinctWorks": 5,
+    "uninterruptedMobile": true,
+    "uninterruptedEndToEnd": false,
+    "requiredPcFixAndRetry": true,
+    "verifiedAt": "2026-09-23T07:21:50.568Z",
+    "identityAndDeliveryPassed": true,
+    "checks": [
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688275159347077243",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "eda2b4d8-712d-4a46-87b5-12281cd311fe",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 50
+      },
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688400908224987643",
+        "candidateStatus": "stored",
+        "verification": "ui_bound",
+        "recordId": "ca5a8e06-20e5-48d3-9076-b523745e335f",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 0
+      },
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688568868482288960",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "db2ef9a3-d161-43f8-b720-209c0e585042",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 3
+      },
+      {
+        "keyword": "君越壁纸",
+        "externalId": "7688275159347077243",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "eda2b4d8-712d-4a46-87b5-12281cd311fe",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 50
+      },
+      {
+        "keyword": "君越壁纸",
+        "externalId": "7688542941609995118",
+        "candidateStatus": "stored",
+        "verification": "ui_bound",
+        "recordId": "6f402dd0-fea9-4311-9fef-5bda7536da85",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 4
+      },
+      {
+        "keyword": "君越壁纸",
+        "externalId": "7688531694614003186",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "a70cf98f-f2aa-4c6e-8aa8-2ed21d5591c9",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 3
+      }
+    ],
+    "sourceHashes": {
+      "runners/android/src/device/douyin-detail.mjs": "7ea3909ef97e37faca889b3366d0657a50ad3cef12522b98ed6894282c24d891",
+      "utils/capture/douyin-note-root.js": "5f7a5c81a5718924c7c625d3df31e792b5cbb9ec46092a8bd47c30748ecd3944",
+      "utils/capture/douyin-single-note.js": "8b1cddcb97eb015d8e8401f5d968580915122ceef68de3883f2a45b60a961834",
+      "utils/platform/dom-profiles/douyin.js": "7928fe4971de66b57003039aaccd725f7aa5367fdc8252a07eddd8d3c0be83a6"
+    },
+    "longNoteFix": {
+      "externalId": "7688400908224987643",
+      "author": "没你不行",
+      "cause": "A playing media preview selected a media-only focusPanel; caption and publisher were outside this root.",
+      "fix": "Reuse the existing PC collector, preferring the unique visible direct-note main with matching URL identity and caption/publisher markers.",
+      "before": {
+        "externalId": "7688400908224987643",
+        "url": "https://www.douyin.com/note/7688400908224987643",
+        "title": "别克又出新壁纸啦！第一张《月兔栖梦》:小兔子抱着发光的月亮，",
+        "content": "别克又出新壁纸啦！第一张《月兔栖梦》:小兔子抱着发光的月亮，",
+        "authorName": "",
+        "captureTaskId": "1c299af0-e3d5-442e-9396-bcae7c54a74f",
+        "captureTaskItemAttemptId": "0a8e39ae-ec17-49f7-9051-d413bb72fd8c"
+      },
+      "after": {
+        "externalId": "7688400908224987643",
+        "url": "https://www.douyin.com/note/7688400908224987643",
+        "title": "别克又出新壁纸啦！第一张《月兔栖梦》:小兔子抱着发光的月亮，配上黄色小花，画面温柔治愈。第二张《檐下秋意》:深蓝流动星河背景，左侧暖橙色枫树小屋，搭配昂科威小车插画，冷暖配色高级，视觉效果很舒服。搭配昂科威Plus的30寸一体式大连屏，使用任意一款壁纸时图标放在画面上不会被遮挡，在深色背景模式下晚上开车屏幕也不会刺眼。#安吉星车机壁纸@上海安吉星信息服务有限公司",
+        "content": "别克又出新壁纸啦！第一张《月兔栖梦》:小兔子抱着发光的月亮，配上黄色小花，画面温柔治愈。第二张《檐下秋意》:深蓝流动星河背景，左侧暖橙色枫树小屋，搭配昂科威小车插画，冷暖配色高级，视觉效果很舒服。搭配昂科威Plus的30寸一体式大连屏，使用任意一款壁纸时图标放在画面上不会被遮挡，在深色背景模式下晚上开车屏幕也不会刺眼。#安吉星车机壁纸@上海安吉星信息服务有限公司",
+        "authorName": "没你不行",
+        "captureTaskId": "39a893fb-c78e-4207-8814-aa52874442e8",
+        "captureTaskItemAttemptId": "5626f3cd-0429-46c4-a717-39d72ded06db"
+      },
+      "afterResponse": {
+        "ok": true,
+        "id": "ca5a8e06-20e5-48d3-9076-b523745e335f",
+        "action": "inserted",
+        "businessVisibility": "eligible",
+        "observationId": "e1110f35-830b-4a16-92f9-cc18bfa313eb",
+        "observationReused": false,
+        "commentWorkflowStatus": "not_required",
+        "officialContent": false,
+        "officialContentSource": "ordinary_content",
+        "recordId": "rec_single_note_44bbde8367b2",
+        "backendRecordId": "ca5a8e06-20e5-48d3-9076-b523745e335f",
+        "commentStats": {
+          "inserted": 0,
+          "updated": 0,
+          "negative": 0,
+          "officialResponses": 0,
+          "officialContent": false,
+          "officialResponseStatus": "none"
+        }
+      },
+      "identityGuardUnchanged": true
+    },
+    "androidInlineExpandFix": {
+      "externalId": "7688568868482288960",
+      "author": "昂科威女车主",
+      "cause": "40.6.0 renders 展开 inline in the clickable caption and appends 收起 after expansion.",
+      "fix": "Use the observed unique clickable caption; remove a terminal UI 收起 only when the remaining full caption and author exactly match the selected card.",
+      "mobileAndBackendValidated": true
+    },
+    "additionalCompletedRun": {
+      "runId": "53a19902-cc14-4309-9642-11c4318f8e28",
+      "events": 3,
+      "newDistinctWorks": [
+        "7688610654147720305"
+      ],
+      "usbInterrupted": false
+    },
+    "formalRecordsAcrossFixtureAtVerification": 6,
+    "pendingEventsAtContinuousBatchCompletion": 0,
+    "continuousBatchPhoneClosed": true,
+    "tests": {
+      "androidAndRelatedBeforePcRootFix": 116,
+      "pcRootCaptionAuthorIdentityNavigationUniqueTests": 42,
+      "newPcRootTests": 4,
+      "boundaryModules": 79,
+      "largestLines": 264,
+      "pcRootHelperLines": 23
+    },
+    "commentsScope": "Counts are existing collector results, not evidence of complete folded replies or AI refinement.",
+    "productionWrites": 0,
+    "cleanup": {
+      "at": "2026-09-23T07:41:31.104490+00:00",
+      "status": "completed",
+      "testExtensionDisabled": true,
+      "localApiStopped": true,
+      "appiumStopped": true,
+      "isolatedPostgresStopped": true,
+      "portsClosed": {
+        "3001": true,
+        "4723": true,
+        "55492": true
+      },
+      "fixtureDeleted": true,
+      "temporaryCredentialsRemoved": true,
+      "phoneHelperAbsent": true,
+      "deviceLockReleased": true,
+      "bigBangOriginalValue": 1,
+      "productionBuildFilesUnchanged": 99,
+      "testBrowserTabsRetained": true
+    }
+  },
+  "currentVersionPostFixContinuous": {
+    "runId": "4d0db98f-4c70-44b8-89e9-bc8c9ac78688",
+    "timings": {
+      "started_at": "2026-09-23T07:20:24.822Z",
+      "finished_at": "2026-09-23T07:24:25.421Z"
+    },
+    "verifiedAt": "2026-09-23T07:25:46.418Z",
+    "events": 6,
+    "distinctWorks": 6,
+    "newRecords": 1,
+    "existingRecordReuses": 5,
+    "uninterruptedMobile": true,
+    "uninterruptedDelivery": true,
+    "requiredRetry": false,
+    "checks": [
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688275159347077243",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "eda2b4d8-712d-4a46-87b5-12281cd311fe",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 50
+      },
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688531694614003186",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "a70cf98f-f2aa-4c6e-8aa8-2ed21d5591c9",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 3
+      },
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688568868482288960",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "db2ef9a3-d161-43f8-b720-209c0e585042",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 3
+      },
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688610654147720305",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "716d90ca-2994-4220-a782-239a4764e2f9",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 2
+      },
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688287344550607331",
+        "candidateStatus": "stored",
+        "verification": "ui_bound",
+        "recordId": "34abef24-5265-42c9-8124-37bbcfbf43ae",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 50
+      },
+      {
+        "keyword": "别克壁纸",
+        "externalId": "7688400908224987643",
+        "candidateStatus": "already_exists",
+        "verification": "ui_bound",
+        "recordId": "ca5a8e06-20e5-48d3-9076-b523745e335f",
+        "resolution": "resolved",
+        "command": "completed",
+        "detailTask": "completed",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true,
+        "requestedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "observedFilters": {
+          "sort": "comprehensive",
+          "range": "day"
+        },
+        "commentsStatus": "done",
+        "commentsStored": 0
+      }
+    ],
+    "accepted": true,
+    "pending": 0,
+    "deviceClosed": true,
+    "intendedUsbTest": true,
+    "actualUsbDisconnect": false,
+    "scope": "One keyword; six real discoveries; five existing records verified and reused; one new real Extension capture.",
+    "sourceHashes": {
+      "runners/android/src/device/douyin-detail.mjs": "7ea3909ef97e37faca889b3366d0657a50ad3cef12522b98ed6894282c24d891",
+      "utils/capture/douyin-note-root.js": "5f7a5c81a5718924c7c625d3df31e792b5cbb9ec46092a8bd47c30748ecd3944",
+      "utils/capture/douyin-single-note.js": "8b1cddcb97eb015d8e8401f5d968580915122ceef68de3883f2a45b60a961834",
+      "utils/platform/dom-profiles/douyin.js": "7928fe4971de66b57003039aaccd725f7aa5367fdc8252a07eddd8d3c0be83a6"
+    },
+    "productionWrites": 0,
+    "cleanup": {
+      "at": "2026-09-23T07:41:31.104490+00:00",
+      "status": "completed",
+      "testExtensionDisabled": true,
+      "localApiStopped": true,
+      "appiumStopped": true,
+      "isolatedPostgresStopped": true,
+      "portsClosed": {
+        "3001": true,
+        "4723": true,
+        "55492": true
+      },
+      "fixtureDeleted": true,
+      "temporaryCredentialsRemoved": true,
+      "phoneHelperAbsent": true,
+      "deviceLockReleased": true,
+      "bigBangOriginalValue": 1,
+      "productionBuildFilesUnchanged": 99,
+      "testBrowserTabsRetained": true
+    }
+  },
+  "currentVersionUsbTaskRecovery": {
+    "runId": "1102b62a-8b35-4ca7-a210-3e127c811418",
+    "verifiedAt": "2026-09-23T07:38:01.922Z",
+    "accepted": true,
+    "scope": "Real copyLink USB interruption, fail-closed pause, independent process/helper closure, explicit resume, bounded delivery.",
+    "initialSessionCreationInterruptionAlsoObserved": true,
+    "disconnectAt": "2026-09-23T07:31:14.244Z",
+    "reconnectAt": "2026-09-23T07:31:53.251Z",
+    "disconnectedMs": 39007,
+    "interruptedOperation": "copyLink",
+    "interruptedReason": "clipboard_restore_unconfirmed",
+    "unconfirmedCopyDelivered": false,
+    "resumeBeforeClosureStatus": 409,
+    "resumeBeforeClosureError": "STOP_OR_DEVICE_CLOSURE_REQUIRED",
+    "attempts": [
+      {
+        "id": "2e6b6de4-35af-4c03-bbee-53f5b68089ef",
+        "attempt_number": 1,
+        "assignment_revision": 1,
+        "status": "needs_action",
+        "started_at": "2026-09-23T07:26:11.804Z",
+        "finished_at": "2026-09-23T07:26:26.843Z",
+        "result": {
+          "reason": "appium_http_error",
+          "closure": {
+            "hash": "0f909e250ba8d64f7585e3f77278bba4e2bd434d5ebf1a788f96cbbf8738c3fc",
+            "evidence": {
+              "method": "independent_stop_check",
+              "evidenceId": "15a7113b-9244-4c55-89af-3d3fbebeda1a",
+              "verifiedAt": "2026-09-23T07:29:32.665Z",
+              "verifiedBy": "dedicated-appium-process-and-helper-stop"
+            },
+            "requestId": "300bed42-912e-4c67-af39-6f8b9e897feb"
+          },
+          "completion": {
+            "hash": "329caffa1348cce702a63cdcf73b28324105e4e77b83055ed74333f7215b9081",
+            "receipt": {
+              "accepted": true,
+              "deviceHeld": true
+            },
+            "requestId": "158b8ee3-bc35-44be-a029-825f3945c8a0"
+          }
+        }
+      },
+      {
+        "id": "12dd2ac2-6bb8-4b34-b6a9-d9c25b2fb98e",
+        "attempt_number": 2,
+        "assignment_revision": 2,
+        "status": "needs_action",
+        "started_at": "2026-09-23T07:29:58.534Z",
+        "finished_at": "2026-09-23T07:31:18.733Z",
+        "result": {
+          "reason": "clipboard_restore_unconfirmed",
+          "closure": {
+            "hash": "ce5139e9d2689da33cc0d12e9fbbbe1cf080a009f8c3c3240826d062c7f22718",
+            "evidence": {
+              "method": "independent_stop_check",
+              "evidenceId": "15af1a1e-d92f-434e-81cc-2aedafc45433",
+              "verifiedAt": "2026-09-23T07:33:21.521Z",
+              "verifiedBy": "dedicated-appium-process-and-helper-stop"
+            },
+            "requestId": "a77153e9-9721-4a1a-9c8a-ff478b5234ca"
+          },
+          "completion": {
+            "hash": "e2df103c70cd2c069940da8c52cf3a28d840263372465a1de132a6b65ed414b3",
+            "receipt": {
+              "accepted": true,
+              "deviceHeld": true
+            },
+            "requestId": "ec13d831-465f-45d8-bd39-cd8534bba1ee"
+          }
+        }
+      },
+      {
+        "id": "50021127-c4ee-4ae1-9267-f1ebc49329a8",
+        "attempt_number": 3,
+        "assignment_revision": 3,
+        "status": "completed",
+        "started_at": "2026-09-23T07:33:33.823Z",
+        "finished_at": "2026-09-23T07:36:19.212Z",
+        "result": {
+          "reason": "keyword_time_limit",
+          "completion": {
+            "hash": "8698836a1a26fd029c73625fe9aff6145cbcbada80749233a1411b0db83a6f3f",
+            "receipt": {
+              "accepted": true,
+              "deviceHeld": false
+            },
+            "requestId": "3a0b69af-5047-4550-b443-5ea75dac5972"
+          }
+        }
+      }
+    ],
+    "criteria": {
+      "sameRun": true,
+      "threeAttempts": true,
+      "originalDeadlinePreserved": true,
+      "confirmedPhysicalClosure": true,
+      "interruptedCopyNotDelivered": true,
+      "recoveredDelivery": true,
+      "runCompleted": true,
+      "outboxEmpty": true,
+      "phoneClosed": true,
+      "noDuplicateRecords": true
+    },
+    "physicalClosure": {
+      "at": "2026-09-23T07:33:21.521Z",
+      "runId": "1102b62a-8b35-4ca7-a210-3e127c811418",
+      "phase": "copy_link_interrupted",
+      "runnerPid": 34529,
+      "runnerExited": true,
+      "appiumPid": 34512,
+      "appiumExited": true,
+      "appiumPortClosed": true,
+      "helpersBeforeCreation": [
+        "30079"
+      ],
+      "initialHelpers": [],
+      "helperPids": [],
+      "evidence": {
+        "method": "independent_stop_check",
+        "evidenceId": "15af1a1e-d92f-434e-81cc-2aedafc45433",
+        "verifiedBy": "dedicated-appium-process-and-helper-stop",
+        "verifiedAt": "2026-09-23T07:33:21.521Z"
+      }
+    },
+    "oldSessionProbeResult": "HTTP 500 unknown error; not treated as invalid session. Dedicated Appium process stopped and port closure verified.",
+    "sameOriginalRunResumed": true,
+    "assignmentRevisions": [
+      1,
+      2,
+      3
+    ],
+    "originalBatchDeadline": "2026-09-23T07:51:11.804Z",
+    "budget": {
+      "deadlineAt": 1790149871804,
+      "elapsedMs": 601823.4103760001,
+      "items": {
+        "997d1983-d5c3-4f0c-87e6-3b18b64a038d": {
+          "assignmentRevision": 3,
+          "attemptId": "50021127-c4ee-4ae1-9267-f1ebc49329a8",
+          "cards": 4,
+          "definitionHash": "1e26b552c59ad9dc5cfc2afd9e2aaf009e159fbdbae3f1f5f4110b802f1c6e38",
+          "elapsedMs": 601823.4103760001,
+          "lastWallAt": 1790148973631,
+          "links": [
+            "ui:9b84e88f815afd69491ae9d32404abf37220bc4efd58609db8cc671873216986",
+            "ui:6470e38e7fc203a51bc61dd97e0a09a3652ffabd26aecc061f1387c609d24641",
+            "ui:b9ebb2cf1921428a621d2196f282111c152384ba7e27df0790dba4185e46f9e5"
+          ],
+          "reason": "keyword_time_limit",
+          "status": "completed_with_warnings",
+          "swipes": 0
+        }
+      },
+      "lastWallAt": 1790148973631,
+      "limitsHash": "495ba4fc168195e366ef93302af26892e53265b95453c1c97fd1c6e6c72bd23a"
+    },
+    "finishedAt": "2026-09-23T07:36:19.212Z",
+    "completionReason": "keyword_time_limit",
+    "recoveredEvents": 3,
+    "checks": [
+      {
+        "externalId": "7688275159347077243",
+        "attemptId": "50021127-c4ee-4ae1-9267-f1ebc49329a8",
+        "verification": "ui_bound",
+        "status": "already_exists",
+        "recordId": "eda2b4d8-712d-4a46-87b5-12281cd311fe",
+        "resolution": "resolved",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true
+      },
+      {
+        "externalId": "7688531694614003186",
+        "attemptId": "50021127-c4ee-4ae1-9267-f1ebc49329a8",
+        "verification": "ui_bound",
+        "status": "already_exists",
+        "recordId": "a70cf98f-f2aa-4c6e-8aa8-2ed21d5591c9",
+        "resolution": "resolved",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true
+      },
+      {
+        "externalId": "7688540621404917371",
+        "attemptId": "50021127-c4ee-4ae1-9267-f1ebc49329a8",
+        "verification": "ui_bound",
+        "status": "stored",
+        "recordId": "6375e20c-bdf0-4051-9a70-1bf3382e0173",
+        "resolution": "resolved",
+        "captionMatches": true,
+        "authorMatches": true,
+        "kindMatches": true
+      }
+    ],
+    "pending": 0,
+    "quarantined": 0,
+    "phoneClosed": true,
+    "formalRecordsAcrossFixture": 8,
+    "duplicateFormalRecords": 0,
+    "automaticReconnectAccepted": false,
+    "explicitOperatorRecoveryRequired": true,
+    "clipboardLimitation": "The in-flight clipboard restore could not be confirmed after USB loss; no claim that the pre-interruption clipboard was restored.",
+    "completeSixLinkBudgetReached": false,
+    "keywordTimeBudgetPreserved": true,
+    "productionWrites": 0,
+    "cleanup": {
+      "at": "2026-09-23T07:41:31.104490+00:00",
+      "status": "completed",
+      "testExtensionDisabled": true,
+      "localApiStopped": true,
+      "appiumStopped": true,
+      "isolatedPostgresStopped": true,
+      "portsClosed": {
+        "3001": true,
+        "4723": true,
+        "55492": true
+      },
+      "fixtureDeleted": true,
+      "temporaryCredentialsRemoved": true,
+      "phoneHelperAbsent": true,
+      "deviceLockReleased": true,
+      "bigBangOriginalValue": 1,
+      "productionBuildFilesUnchanged": 99,
+      "testBrowserTabsRetained": true
+    },
+    "formalCommentRowsAtCleanup": 110,
+    "allDiscoveryDemandsFulfilled": true,
+    "historicalFailedDetailAttemptsPreservedUntilFixtureCleanup": 2,
+    "commentsScope": "110 formal comments across eight works; capture counts are not an all-replies completeness guarantee."
+  },
+  "currentVersionRecoveryUi": {
+    "updatedAt": "2026-09-23T08:21:50.068137+00:00",
+    "scope": "Local operator recovery read model and UI; no new physical-device run or production deployment",
+    "checks": {
+      "policyAndRouteTests": 13,
+      "postgresBusinessScenarios": 15,
+      "postgresTestCountIncludingParent": 16,
+      "adminTypecheck": true,
+      "adminBuild": true,
+      "componentLint": true,
+      "moduleCount": 81,
+      "largestModuleLines": 264,
+      "uiFixtureStates": [
+        "working",
+        "closure_required",
+        "ready",
+        "waiting_device",
+        "deadline_expired",
+        "budget_limit",
+        "stopped",
+        "readonly",
+        "missing_recovery",
+        "node_unavailable"
+      ],
+      "uiViewports": [
+        1280,
+        390
+      ],
+      "singleResumeSubmission": true,
+      "productionBuildFiles": 99,
+      "productionBuildUnchanged": true,
+      "serverRuntimeVersions": [
+        "18.20.8",
+        "24.12.0"
+      ],
+      "freshPreviewConsoleErrors": 0
+    },
+    "remaining": [
+      "1-2 hour continuous physical trial",
+      "three mobile/web comparison rounds",
+      "operator recovery and release acceptance",
+      "scheduled morning patrol integration"
+    ],
+    "sourceHashes": {
+      "server/services/android-control/leases.js": "8b91681d9d9d1314e5b62324bc0adc8040b3e3461746c49b3d0466e5e6d3f78b",
+      "server/services/android-control/recovery.js": "87e8087f05d32bbce1251b908ad9b9287544537cd6a0a3138fc6b67099a84d52",
+      "server/services/android-control/tasks.js": "f12576f29d00a9b86344eb323001ab1b44571168bece7df1d8d20bae9d253c60",
+      "server/services/android-control/views.js": "686384bfa9033c22934c0f98db892ed2ff1f0faa220a0e00a772a1b34211d145",
+      "tests/android-recovery.test.mjs": "e246271cbf58ac7f1a3c53f68c7276b30d4868a53d909d97862005a767719b45",
+      "tests/integration/postgres/android-control.integration.mjs": "ddb7a58c7840b891c4bdeffd6e8d790d62ffe8ba5b475f9984d0c7d5d7efe370",
+      "web/admin/src/pages/dispatch/android-discovery/AndroidDiscoveryEntry.tsx": "ea12aa0a183f4f7f2be1e9a832d85493de3f2eea374b34d80286d22fe8d6936b",
+      "web/admin/src/pages/dispatch/android-discovery/AndroidDiscoveryPanel.tsx": "e991fe0c0b078aec88ac154d00261b6d518d666b08a274240e3c0d61d28af8dc",
+      "web/admin/src/pages/dispatch/android-discovery/CreateMobileRun.tsx": "806f2d0e9589b5f19ec2399884c0943feb2b1cb7f135f02dc589ba2ea24af5c3",
+      "web/admin/src/pages/dispatch/android-discovery/DiscoveryCandidates.tsx": "5cbeebc1cd85652ff7ca30235e6eca154f3cc02b7aa06c5892cc9164f410a8fc",
+      "web/admin/src/pages/dispatch/android-discovery/MobileRunDetail.tsx": "f27671270dce7f2a656d95dce39e738d9ce73347206b5b14b7634941486c0401",
+      "web/admin/src/pages/dispatch/android-discovery/RecoveryPanel.tsx": "1a8ce761b3f1d76066c9f5b30f9667a7116cfd8209a5506840cf538dd99e2449",
+      "web/admin/src/pages/dispatch/android-discovery/api.ts": "4f2a8132bce3646395a2147bc2f68edb70f1bb03f19d09c0dbe282c56a4c43f4",
+      "web/admin/src/pages/dispatch/android-discovery/presentation.ts": "176a09999fc693ab84c4dc20defddcbbfc86bb712859438fc07da856cfcea890",
+      "web/admin/src/pages/dispatch/android-discovery/types.ts": "afa4a8a1ee335ea9a27e5510b671bf2c036fe895347db9ec2a877f465e4786e5",
+      "web/admin/src/pages/dispatch/android-discovery/useAndroidDiscovery.ts": "ffa39ee528f28c963f9c0dcbfd96cc102ad0782db1a4a96ef1a70b9af21526f6"
+    },
+    "cleanup": {
+      "ephemeralTestTenantsRemaining": 0,
+      "isolatedPostgresStopped": true,
+      "noMobileRunStartedThisTurn": true,
+      "noProductionDeployment": true
+    }
+  }
+}
