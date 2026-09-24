@@ -88,3 +88,22 @@ test('backlog stops discovery before a single device action', async () => {
     assert.deepEqual(calls, []);
   } finally { store.close(); }
 });
+
+test('resume faults name the earlier attempt, and a new run or item never inherits them', () => {
+  const store = new RunnerStore(':memory:');
+  try {
+    const task = fixtureTask();
+    const clock = fixtureClock();
+    new BudgetLedger({ task, store, clock }).finish('needs_action', 'douyin_not_foreground');
+    assert.throws(() => new BudgetLedger({ task, store, clock }), error => error.code === 'resume_authorization_required'
+      && error.details.previousAttemptId === 'attempt-1' && error.details.previousAssignmentRevision === 1
+      && error.details.previousStatus === 'needs_action' && error.details.previousReason === 'douyin_not_foreground');
+    const otherItem = fixtureTask({ keyword: '君越壁纸', identity: { ...task.identity, itemId: 'item-2', attemptId: 'attempt-2' } });
+    assert.equal(new BudgetLedger({ task: otherItem, store, clock }).skippedCards, 0);
+    const otherRun = fixtureTask({ identity: { ...task.identity, taskId: 'run-2', discoveryRunId: 'run-2', itemId: 'item-9', attemptId: 'attempt-9' } });
+    const ledger = new BudgetLedger({ task: otherRun, store, clock });
+    assert.equal(ledger.summary().batchElapsedMs, 0);
+    assert.equal(ledger.noteSkippedCard(), 1);
+    assert.equal(store.loadCheckpoint('run-1').value.items['item-1'].skippedCards, undefined, 'skips stay with their own item');
+  } finally { store.close(); }
+});

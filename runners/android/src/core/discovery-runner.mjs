@@ -7,6 +7,26 @@ import { DeviceClosureJournal, readDeviceClosure } from './device-closure.mjs';
 
 const DEFAULT_CLOCK = { wallNow: () => Date.now(), monotonicNow: () => performance.now() };
 const METHODS = ['inspect', 'search', 'readCards', 'openCard', 'copyLink', 'returnToResults', 'scroll'];
+// A single work may be skipped after these settled open failures, once the results page is proven again.
+const RECOVERABLE_OPEN_FAILURES = new Set(['detail_ui_not_ready', 'detail_identity_unverified', 'card_open_failed']);
+export const MAX_SKIPPED_CARDS = 3;
+const CONTROL_CODES = new Set(['user_stop', 'operator_takeover', 'remote_stop', 'lease_expired', 'usb_disconnected', 'aborted']);
+const DETAIL_KEYS = ['cause', 'recovery', 'attempts', 'elapsedMs', 'budgetMs', 'observed', 'activity', 'stage', 'backPresses',
+  'skippedCards', 'skipLimitReached', 'previousAttemptId', 'previousAssignmentRevision', 'previousStatus', 'previousReason',
+  'w3cError', 'launched', 'focus', 'wakefulness'];
+
+/** Bounded, PII-free diagnostics carried into the completion checkpoint. */
+export function faultDetails(error) {
+  const source = { ...(error?.details && typeof error.details === 'object' ? error.details : {}), ...(error ?? {}) };
+  const picked = {};
+  for (const key of DETAIL_KEYS) {
+    const value = source[key];
+    if (value === undefined || value === null) continue;
+    picked[key] = typeof value === 'string' ? value.slice(0, 120) : typeof value === 'number' ? Math.round(value)
+      : typeof value === 'boolean' ? value : typeof value === 'object' ? JSON.parse(JSON.stringify(value)) : String(value).slice(0, 120);
+  }
+  return picked;
+}
 
 function validateTask(task, permit, device) {
   requireEvidence(task?.identity && typeof task.keyword === 'string' && task.keyword.trim().length > 0, 'invalid_task');
@@ -40,13 +60,29 @@ export async function runDiscoveryTask({ task, store, device, permit, clock = DE
     const journal = new DeviceClosureJournal({ store, task, clock, deviceClosureVerified });
     ledger = new BudgetLedger({ task, store, clock, resumeAuthorized });
     gate = new OperationGate({ permit, beforeAction: () => ledger.assertAllowed(), journal, timeoutMs: actionTimeoutMs });
-    const call = (method, params = {}) => gate.run((signal) => device[method]({ ...params, signal }), method);
+    const call = (method, params = {}) => gate.run((signal, { budgetMs }) => device[method]({ ...params, signal, actionBudgetMs: budgetMs }), method);
     const read = async (method, params) => {
       try { return await call(method, params); }
       catch (error) {
         if (error.code !== 'loading_failed' || error.safeToRetry !== true) throw error;
         return call(method, params);
       }
+    };
+    // Skip one work only after the adapter proves the same results page, keyword and filters again;
+    // an unproven return keeps the original precise reason and the device closure protection.
+    const skipAfterSafeReturn = async (error, contextId) => {
+      if (!RECOVERABLE_OPEN_FAILURES.has(error.code) || error.deviceSettled !== true || typeof device.recoverResults !== 'function') throw error;
+      if (ledger.skippedCards >= MAX_SKIPPED_CARDS) {
+        throw new RunnerFault(error.code, error.message, { ...faultDetails(error), skippedCards: ledger.skippedCards, skipLimitReached: true });
+      }
+      try {
+        verifyContext(await call('recoverResults', { contextId, keyword: task.keyword, filters: task.filters }), task, contextId);
+      } catch (recoveryError) {
+        if (CONTROL_CODES.has(recoveryError.code)) throw recoveryError;
+        throw new RunnerFault(error.code, `${error.message}; safe return failed (${recoveryError.code})`,
+          { ...faultDetails(error), recovery: recoveryError.code });
+      }
+      ledger.noteSkippedCard();
     };
     const deviceState = await call('inspect');
     requireEvidence(deviceState?.deviceId === task.deviceId, 'device_identity_mismatch');
@@ -69,7 +105,9 @@ export async function runDiscoveryTask({ task, store, device, permit, clock = DE
         seenCards.add(card.cardId);
         newCards++;
         ledger.beforeCard();
-        const detail = await call('openCard', { card, contextId });
+        let detail;
+        try { detail = await call('openCard', { card, contextId }); }
+        catch (error) { await skipAfterSafeReturn(error, contextId); continue; }
         requireEvidence(detail?.identityVerified === true && detail.cardId === card.cardId
           && typeof detail.detailId === 'string' && detail.detailId.length > 0, 'detail_identity_unverified');
         let link;
@@ -99,11 +137,11 @@ export async function runDiscoveryTask({ task, store, device, permit, clock = DE
       requireEvidence(scrolled?.contextVerified === true && scrolled.contextId === contextId, 'search_context_changed');
     }
   } catch (error) {
-    result = { ...outcome(error), message: error.message };
+    result = { ...outcome(error), message: error.message, details: faultDetails(error) };
   }
   if (ledger) {
     try { ledger.finish(result.status, result.reason); }
-    catch (error) { result = { ...outcome(error), message: error.message }; }
+    catch (error) { result = { ...outcome(error), message: error.message, details: faultDetails(error) }; }
   }
   const deviceClosure = task?.deviceId ? readDeviceClosure(store, task.deviceId) : null;
   const deviceIdle = !deviceClosure?.required && (gate ? gate.deviceIdle && result.reason !== 'usb_disconnected' : true);

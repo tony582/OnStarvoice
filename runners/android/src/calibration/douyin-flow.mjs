@@ -6,9 +6,18 @@ import { byId, resource, readSearch, searchEntryNodes,
   readFilters, filtersMatch, filterSelector } from '../device/douyin-profile.mjs';
 import { readVerifiedDetail } from '../device/douyin-detail.mjs';
 import { copyBoundShare } from '../device/douyin-share.mjs';
+import { readUntil, READ_TIMEOUT_MS, RETRY_DELAY_MS } from '../device/ui-wait.mjs';
+
+// openCard budget split: the outer action budget minus the results/click time already spent,
+// minus one caption-expand read and a safety margin, capped so the gate deadline is never reached.
+const OPEN_EXPAND_RESERVE_MS = 11_000;
+const OPEN_SAFETY_MS = 3_000;
+const MIN_DETAIL_READY_MS = READ_TIMEOUT_MS + RETRY_DELAY_MS;
+const MAX_DETAIL_READY_MS = 40_000;
+const RETURN_BUDGET_MS = 15_000;
 
 // The UI flow has no cloud client; copied links remain pending independent detail verification.
-export function createDouyinCalibrationFlow({ ui }) {
+export function createDouyinCalibrationFlow({ ui, now = () => performance.now() }) {
   let context = null;
   let opened = null;
   let semanticFilters = false;
@@ -80,14 +89,19 @@ export function createDouyinCalibrationFlow({ ui }) {
       catch (error) { context = null; throw error; }
     },
     readCards: ({ signal } = {}) => results({ signal }),
-    async openCard({card, signal}) {
+    async openCard({card, signal, actionBudgetMs = 60_000}) {
+      const startedAt = now();
       opened = null;
+      const { keyword } = requireContext();
       const page = await results({signal});
       if (page.cards.filter(item => item.cardId === card.cardId).length !== 1) {
-        throw new DeviceError('card_identity_unverified', 'Card is missing or ambiguous on the current page');
+        throw new DeviceError('card_identity_unverified', 'Card is missing or ambiguous on the current page', { deviceSettled: true });
       }
       await ui.clickXPath(card.selector, {signal});
-      const detail = await readVerifiedDetail({ui, card, signal});
+      // Exactly one click per openCard. From here the detail is only re-read inside the remaining budget.
+      const remaining = actionBudgetMs - (now() - startedAt) - OPEN_EXPAND_RESERVE_MS - OPEN_SAFETY_MS;
+      const detail = await readVerifiedDetail({ui, card, signal, searchKeyword: keyword, now,
+        budgetMs: Math.min(MAX_DETAIL_READY_MS, Math.max(remaining, MIN_DETAIL_READY_MS))});
       opened = {card, detail};
       return {identityVerified:true, cardId:card.cardId, detailId:card.cardId, kind:detail.kind};
     },
@@ -104,6 +118,27 @@ export function createDouyinCalibrationFlow({ ui }) {
       opened = null;
       await results({signal});
       return verifyFilters({signal});
+    },
+    /**
+     * After a failed openCard: get back to the verified results page without opening anything, then
+     * read all filter groups again. Back is pressed at most twice and never from Douyin's home page,
+     * because leaving the search can not be undone safely.
+     */
+    async recoverResults({signal} = {}) {
+      opened = null;
+      const { keyword } = requireContext();
+      const options = {signal};
+      let tree = await ui.read(options);
+      for (let presses = 0; !readSearch(tree, keyword).verified; presses++) {
+        if (presses >= 2 || searchEntryNodes(tree).length) {
+          throw new DeviceError('search_context_unverified', 'Could not return to the verified search results',
+            { deviceSettled: true, backPresses: presses });
+        }
+        await ui.back(options);
+        ({ tree } = await readUntil({ ui, signal, now, budgetMs: RETURN_BUDGET_MS,
+          predicate: current => readSearch(current, keyword).verified }));
+      }
+      return verifyFilters(options);
     },
     async capture({card, signal}) {
       const detail = await flow.openCard({card, signal});

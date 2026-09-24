@@ -67,5 +67,23 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
     validateSerial(serial);
     return call(['-s', serial, 'shell', 'am', 'force-stop', 'io.appium.uiautomator2.server'], options);
   };
-  return {listDevices, inspect, inspectApp, helperPids, stopHelper};
+  // Read-only foreground and lock probes. Large dumps are filtered on the device so output stays bounded;
+  // `|| true` keeps an empty grep from failing the command.
+  const dump = (serial, script, options) => { validateSerial(serial); return call(['-s', serial, 'shell', script], options).then(value => value.stdout); };
+  const windowFocus = (serial, options = {}) => dump(serial, 'dumpsys window windows | grep -E "mCurrentFocus|mFocusedApp" || true', options);
+  const resumedActivity = (serial, options = {}) => dump(serial, 'dumpsys activity activities | grep -E "mResumedActivity|mFocusedActivity" || true', options);
+  const keyguardState = (serial, options = {}) => dump(serial, 'dumpsys window policy', options);
+  const powerState = (serial, options = {}) => dump(serial, 'dumpsys power | grep -E "mWakefulness=" || true', options);
+  // Plain MAIN/LAUNCHER start of an explicit component: no --stop, no reset, no data clearing.
+  const launchActivity = async (serial, component, options = {}) => {
+    validateSerial(serial);
+    if (typeof component !== 'string' || !/^[a-z]\w*(?:\.\w+)+\/\.?[\w.$]+$/u.test(component)) {
+      throw new DeviceError('invalid_component', 'An explicit package/activity component is required');
+    }
+    const result = await call(['-s', serial, 'shell', 'am', 'start', '-a', 'android.intent.action.MAIN',
+      '-c', 'android.intent.category.LAUNCHER', '-n', component], options);
+    if (/Error/u.test(`${result.stdout}\n${result.stderr}`)) throw new DeviceError('app_launch_failed', 'The app could not be launched');
+    return {launched: true};
+  };
+  return {listDevices, inspect, inspectApp, helperPids, stopHelper, windowFocus, resumedActivity, keyguardState, powerState, launchActivity};
 }

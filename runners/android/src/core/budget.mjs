@@ -26,10 +26,13 @@ export class BudgetLedger {
     this.itemKey = task.identity.itemId;
     let item = this.state.items[this.itemKey];
     if (item) {
-      if (!resumeAuthorized) throw new RunnerFault('resume_authorization_required');
-      if (['completed', 'completed_with_warnings', 'canceled'].includes(item.status)) throw new RunnerFault('terminal_item');
-      if (item.attemptId === task.identity.attemptId || task.identity.assignmentRevision <= item.assignmentRevision) throw new RunnerFault('fresh_attempt_required');
-      if (item.definitionHash !== payloadHash({ keyword: task.keyword, filters: task.filters })) throw new RunnerFault('item_definition_changed');
+      // Faults name the earlier attempt so a server-side record shows exactly which run/item was replayed.
+      const previous = { previousAttemptId: item.attemptId, previousAssignmentRevision: item.assignmentRevision,
+        previousStatus: item.status, previousReason: item.reason ?? null };
+      if (!resumeAuthorized) throw new RunnerFault('resume_authorization_required', 'resume_authorization_required', previous);
+      if (['completed', 'completed_with_warnings', 'canceled'].includes(item.status)) throw new RunnerFault('terminal_item', 'terminal_item', previous);
+      if (item.attemptId === task.identity.attemptId || task.identity.assignmentRevision <= item.assignmentRevision) throw new RunnerFault('fresh_attempt_required', 'fresh_attempt_required', previous);
+      if (item.definitionHash !== payloadHash({ keyword: task.keyword, filters: task.filters })) throw new RunnerFault('item_definition_changed', 'item_definition_changed', previous);
       item.elapsedMs += now - item.lastWallAt;
       item.attemptId = task.identity.attemptId;
       item.assignmentRevision = task.identity.assignmentRevision;
@@ -82,6 +85,12 @@ export class BudgetLedger {
     this.item.swipes++;
     this.save();
   }
+  get skippedCards() { return this.item.skippedCards ?? 0; }
+  noteSkippedCard() {
+    this.item.skippedCards = this.skippedCards + 1;
+    this.save();
+    return this.item.skippedCards;
+  }
   noteLink(identity) {
     if (this.item.links.includes(identity)) return false;
     this.item.links.push(identity);
@@ -95,7 +104,7 @@ export class BudgetLedger {
     this.save();
   }
   summary() {
-    return { cards: this.item.cards, swipes: this.item.swipes, links: this.item.links.length,
+    return { cards: this.item.cards, swipes: this.item.swipes, links: this.item.links.length, skippedCards: this.skippedCards,
       keywordElapsedMs: this.item.elapsedMs, batchElapsedMs: this.state.elapsedMs };
   }
 }

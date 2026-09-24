@@ -41,6 +41,10 @@ node runners/android/cli.mjs setup --state-dir /path/to/private/android-state --
 
 每个逻辑动作最长 60 秒，单次 UI 层级读取和翻页默认最多 10 秒，其他 Appium 请求保留各自较短时限；搜索由多个有界命令组成。调用方更短的时限和停止信号仍可打断读屏，超时不能当作手机已经停稳，也不能直接解释为 USB 断线。
 
+打开作品只点击一次；之后在整段动作预算内反复读屏核对作品身份（标题、作者、cardId 不放宽），不再点第二张卡片。详情始终读不到时返回 `detail_ui_not_ready`，读到别的作品返回 `detail_identity_unverified`，点击后仍停在结果页返回 `card_open_failed`；真正的 Appium/ADB 失联仍是 `device_timeout` 或 `appium_*`。这三种精确错误发生后，Runner 先按返回键回到结果页并重新读回关键词与全部筛选分组，核对通过才跳过该作品继续当前关键词（每个关键词最多跳过 3 个）；无法证明已安全返回则停止并保留停稳保护。
+
+领取任务前每次轮询都重新探测手机：ADB 在线、机型/抖音版本、Appium 就绪、亮屏、未锁屏、抖音持有前台焦点；不再沿用旧的 `readyForSearch=true`。抖音退到后台且手机已解锁时，只通过审核过的 `com.ss.android.ugc.aweme/.main.MainActivity` 用 `am start` 拉起（不 reset、不清数据，每 60 秒最多一次），拉起后重新核对版本与前台包名；登录与搜索入口在任务开始的 inspect 中核对。息屏或锁屏时报告 `device_asleep`/`device_locked`，Runner 不会唤醒或解锁手机。`status` 的 `deviceProbe` 显示最近一次探测结果。见 [20260924 hotfix](../../docs/hotfix/20260924-android-opencard-detail-ready.md)。
+
 ```sh
 node runners/android/cli.mjs status --state-dir /path/to/private/android-state
 node runners/android/cli.mjs stop --state-dir /path/to/private/android-state
@@ -154,4 +158,6 @@ npm --prefix runners/android run test:integration
 2026-09-23 最新真机补充：40.6.0 综合排序＋一天内，两关键词各 3 条产生 6 个真实事件、5 个不同作品。修复内嵌展开及既有 PC 图文范围后，另一次 6 条连续发现零重试交付（5 复用、1 新入库）。真实复制链接中 USB 断开约 39 秒，停稳核验后显式恢复同一任务，恢复获得 3 条，按原关键词 10 分钟预算有界结束；待传为 0，无重复记录。自动重连、全天稳定性与发现率对照未验收，详见 [P0 记录](../../docs/hotfix/20260923-android-p0-validation.md)。
 
 
-9 月 23 日傍晚连续试跑另见[固定版本验证](../../docs/hotfix/20260923-android-soak-validation.md)。已修复作者标记、正文表情、认证昵称、手机补采标签页收尾及读屏／翻页误超时，均保留对应失败及回归证据；最新 Node 24.12.0 Runner 全套 118 项通过，模块边界 82 个、最大 264 行；有限回归不代表已通过长时间稳定性或生产发布。
+9 月 23 日傍晚连续试跑另见[固定版本验证](../../docs/hotfix/20260923-android-soak-validation.md)。已修复作者标记、正文表情、认证昵称、手机补采标签页收尾及读屏／翻页误超时，均保留对应失败及回归证据；有限回归不代表已通过长时间稳定性或生产发布。
+
+2026-09-24 hotfix（Runner 0.2.1）：openCard 详情等待改为预算内有界重读、精确错误与安全返回后跳过；领取前逐次探测前台/锁屏/亮屏/Appium；闭环证明只按 operationId 传递。Node 24.12.0 Runner 全套 143 项串行通过，模块边界 84 个、最大 278 行；前台解析与拉起组件尚未在 DE106 实机核对，见对应 hotfix 记录。

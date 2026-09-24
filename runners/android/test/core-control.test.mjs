@@ -58,3 +58,32 @@ test('bounded command timeout blocks future operations without releasing control
   assert.equal(gate.deviceIdle, false);
   await assert.rejects(gate.run(async () => {}), { code: 'operation_not_settled' });
 });
+
+test('a settled adapter failure completes the closure marker and hands the action its whole budget', async () => {
+  const task = fixtureTask();
+  const clock = fixtureClock();
+  const journal = { begins: 0, completes: 0, begin() { this.begins++; }, complete() { this.completes++; } };
+  const gate = new OperationGate({ permit: fixturePermit(task, clock), beforeAction() {}, journal, timeoutMs: 200 });
+  const settled = Object.assign(new Error('not ready'), { code: 'detail_ui_not_ready', deviceSettled: true });
+  await assert.rejects(gate.run(async () => { throw settled; }), { code: 'detail_ui_not_ready' });
+  assert.equal(gate.deviceIdle, true);
+  assert.deepEqual([journal.begins, journal.completes], [1, 1]);
+  let budget;
+  await gate.run(async (_signal, options) => { budget = options.budgetMs; });
+  assert.equal(budget, 200, 'the budget is the action timeout while the lease has more time left');
+  await assert.rejects(gate.run(async () => { throw Object.assign(new Error('x'), { code: 'detail_identity_unverified' }); }), { code: 'detail_identity_unverified' });
+  assert.equal(gate.deviceIdle, false, 'an unmarked failure still requires closure');
+  assert.deepEqual([journal.begins, journal.completes], [3, 2]);
+});
+
+test('a settled failure raised after the gate timed out cannot clear the uncertainty', async () => {
+  const task = fixtureTask();
+  const clock = fixtureClock();
+  const journal = { completes: 0, begin() {}, complete() { this.completes++; } };
+  const gate = new OperationGate({ permit: fixturePermit(task, clock), beforeAction() {}, journal, timeoutMs: 5 });
+  await assert.rejects(gate.run(signal => new Promise((_, reject) => signal.addEventListener('abort',
+    () => reject(Object.assign(new Error('late'), { code: 'detail_ui_not_ready', deviceSettled: true }))))), { code: 'device_action_timeout' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(gate.deviceIdle, false);
+  assert.equal(journal.completes, 0);
+});

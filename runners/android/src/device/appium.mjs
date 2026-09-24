@@ -95,6 +95,15 @@ export function createAppiumClient({ appiumUrl, fetchImpl = globalThis.fetch, ti
         args: [{ elementId, direction: 'down', percent: 0.72 }] }, options);
     },
     status: (options = {}) => request('/status', 'GET', undefined, options),
+    // Foreground identity of the session device; diagnostic only, never a substitute for hierarchy verification.
+    async currentActivity(id, options = {}) {
+      const value = await request(route(id, '/appium/device/current_activity'), 'GET', undefined, options);
+      return typeof value === 'string' ? value.slice(0, 200) : null;
+    },
+    async currentPackage(id, options = {}) {
+      const value = await request(route(id, '/appium/device/current_package'), 'GET', undefined, options);
+      return typeof value === 'string' ? value.slice(0, 200) : null;
+    },
     async getClipboard(sessionId, options = {}) {
       const value = await request(sessionPath(sessionId), 'POST', { script: 'mobile: getClipboard', args: [] }, options);
       if (typeof value !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {

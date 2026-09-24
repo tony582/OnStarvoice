@@ -111,6 +111,7 @@ Every device method receives an `AbortSignal` and must observe it. Required meth
 | `openCard` | `identityVerified=true`, matching `cardId`, nonempty `detailId`; optionally independently verified `externalId` |
 | `copyLink` | Receives a fresh clipboard marker; returns `fresh/markerReplaced/identityVerified=true`, matching detail, work `externalId`, `shareUrl` |
 | `returnToResults` | Same verified keyword, filters and context |
+| `recoverResults` | Optional. After a failed `openCard`, proves the same verified keyword, filters and context again without opening anything; absent means the runner never skips a work |
 | `scroll` | Verified matching context |
 
 IDs must represent observed identity, not guessed title/OCR/position equivalence.
@@ -120,6 +121,17 @@ links persist an audit event and stop the workflow. Profile-less real adapters a
 expected to return `profile_required`; tests never advertise them as phone support.
 Only errors explicitly marked `code='loading_failed', safeToRetry=true` in search
 or card reads receive one retry. Other actions are not blindly replayed.
+
+Every action receives `actionBudgetMs`, the whole bound the gate applies to that call, so a
+long UI wait can be spread over it instead of a fixed inner limit. An adapter may mark an
+error `deviceSettled: true` only when it was raised after the last device command returned
+with nothing in flight; such errors close the closure marker like a normal return. Any other
+error still leaves the marker pending. After a settled `detail_ui_not_ready`,
+`detail_identity_unverified` or `card_open_failed` from `openCard`, the runner calls
+`recoverResults` through the gate, verifies the context, and only then skips that one work
+(at most 3 per keyword item, persisted); an unproven return keeps the original reason,
+records the recovery failure in `details.recovery` and retains closure protection.
+Bounded, PII-free `details` travel into the completion checkpoint as `failure`.
 
 ## Outbox API
 

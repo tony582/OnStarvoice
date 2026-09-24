@@ -148,13 +148,11 @@ test('collapsed video must expand to the full selected caption before identity i
   const make = (title, author = '@' + card.author) => tree(node('desc', title)
     + node('title', author, '', { 'content-desc': '按钮' }) + node('vmj') + node('0s0', '展开'));
   let expanded = false; let clicks = 0;
-  const ui = { waitFor: async predicate => {
-    const current = make(expanded ? card.title : '新壁纸...');
-    assert.equal(predicate(current), true); return current;
-  }, clickId: async id => { assert.equal(id, '0s0'); clicks++; expanded = true; } };
+  const ui = { read: async () => make(expanded ? card.title : '新壁纸...'),
+    clickId: async id => { assert.equal(id, '0s0'); clicks++; expanded = true; } };
   assert.equal((await readVerifiedDetail({ ui, card })).title, card.title);
   assert.equal(clicks, 1);
-  await assert.rejects(readVerifiedDetail({ ui: { ...ui, waitFor: async () => make('新壁纸...', '@其他人') }, card }),
+  await assert.rejects(readVerifiedDetail({ ui: { ...ui, read: async () => make('新壁纸...', '@其他人') }, card }),
     { code: 'detail_identity_unverified' });
   assert.equal(clicks, 1);
 });
@@ -187,6 +185,7 @@ test('an oversized original clipboard is rejected before marker replacement or s
   let current = page; let clipboardWrites = 0; let shares = 0;
   const ui = {
     setWindowScope: async () => {},
+    read: async () => current,
     waitFor: async predicate => { assert.equal(predicate(current), true); return current; },
     clickXPath: async selector => { current = selector.includes('筛选，按钮') ? filters : detailPage; },
     clickId: async id => { if (id === 'zsg') current = page; else shares++; },
@@ -204,20 +203,18 @@ test('40.6 inline video caption expands and removes only a verified UI collapse 
   const make = (title, author = '@' + card.author, clickable = 'true') => tree(
     node('desc', title, '', {clickable}) + node('title', author, '', {'content-desc': '按钮'}) + node('vmj'));
   let expanded = false; let clicks = 0;
-  const ui = {waitFor: async predicate => {
-    const current = make(expanded ? card.title + ' 收起' : '新壁纸... 展开');
-    assert.equal(predicate(current), true); return current;
-  }, clickId: async id => {assert.equal(id, 'desc'); clicks++; expanded = true;}};
+  const ui = {read: async () => make(expanded ? card.title + ' 收起' : '新壁纸... 展开'),
+    clickId: async id => {assert.equal(id, 'desc'); clicks++; expanded = true;}};
   assert.equal((await readVerifiedDetail({ui, card})).title, card.title);
   assert.equal((await readVerifiedDetail({ui, card})).title, card.title); // After returning from share.
   assert.equal(clicks, 1);
   for (const current of [make('新壁纸... 展开', '@其他人'), make('新壁纸... 展开', undefined, 'false'),
     make('另一篇正文 收起'), make(card.title + ' 收起', '@其他人'), make(card.title + ' 收起', undefined, 'false')]) {
-    await assert.rejects(readVerifiedDetail({ui: {...ui, waitFor: async () => current}, card}),
+    await assert.rejects(readVerifiedDetail({ui: {...ui, read: async () => current}, card}),
       {code: 'detail_identity_unverified'});
   }
   assert.equal(clicks, 1);
   const literal = {...card, title: card.title + ' 收起'};
   const current = make(literal.title);
-  assert.equal((await readVerifiedDetail({ui: {...ui, waitFor: async () => current}, card: literal})).title, literal.title);
+  assert.equal((await readVerifiedDetail({ui: {...ui, read: async () => current}, card: literal})).title, literal.title);
 });

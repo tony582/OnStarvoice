@@ -15,6 +15,15 @@ import {createSimulationDevice} from './simulation.mjs';
 import {assertSimulationOrigin, fixedLockRoot, readConfig, setCheckpoint, stateValue} from './state.mjs';
 
 const clock = {wallNow: Date.now, monotonicNow: () => performance.now()};
+// Results with these reasons mean the phone itself is not ready; the runner stops advertising readiness at once.
+const DEVICE_READINESS_REASONS = new Set(['douyin_not_foreground', 'device_locked', 'device_asleep', 'login_required',
+  'login_or_challenge_required', 'login_state_unverified', 'challenge_or_unknown', 'profile_version_mismatch', 'system_overlay_blocked']);
+/** The retained proof is handed to a task only for the closure it actually names; older proofs never travel. */
+export function closureProofFor(store, deviceId) {
+  const pending = readDeviceClosure(store, deviceId);
+  const proof = stateValue(store, 'daemon:closure-proof');
+  return pending?.required && proof?.deviceId === deviceId && proof.operationId === pending.operationId ? proof : null;
+}
 export const delay = (ms, signal) => new Promise(resolve => {
   if (signal?.aborted) { resolve(); return; }
   const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); };
@@ -36,7 +45,7 @@ export class AndroidDaemon {
       ? createAndroidDeviceAdapter({serial:config.deviceId,profileId:config.deviceProfile,appiumUrl:config.appiumUrl,
         adb:createAdbClient({adbPath:config.adbPath}),onState:value=>setCheckpoint(this.store,'daemon:device-session',value)}) : null);
     this.ready = config.simulation === true && !!this.device;
-    this.nextDeviceProbeAt = 0;
+    this.deviceProbe = null;
     Object.assign(this, {lockRoot, pollMs, renewMs, deliveryMs, watchMs, actionTimeoutMs});
     this.sessionId = randomUUID();
     this.shutdown = new AbortController();
@@ -54,7 +63,7 @@ export class AndroidDaemon {
       activeIdentity: this.active?.task.identity ?? null, pendingEvents: this.store.pendingCount(),
       completionPending: !!stateValue(this.store, 'daemon:completion'),
       deviceClosureRequired: !!readDeviceClosure(this.store, this.config.deviceId)?.required,
-      updatedAt: new Date().toISOString(), ...extra};
+      deviceProbe: this.deviceProbe, updatedAt: new Date().toISOString(), ...extra};
     setCheckpoint(this.store, 'daemon:status', value);
     return value;
   }
@@ -80,7 +89,8 @@ export class AndroidDaemon {
     const body = {requestId: randomUUID(), identity: active.task.identity, sessionId: active.sessionId,
       status, reason: result.reason, deviceIdle: result.deviceIdle === true,
       checkpoint: {stats: result.stats ?? null, lastEventId: result.lastEventId ?? null,
-        originalStatus: result.status, pendingEvents: this.store.pendingCount()}};
+        originalStatus: result.status, pendingEvents: this.store.pendingCount(),
+        ...(result.details && Object.keys(result.details).length ? {failure: result.details} : {})}};
     setCheckpoint(this.store, 'daemon:completion', body); // Persist before touching the network.
     setCheckpoint(this.store, 'daemon:last-task', active);
     setCheckpoint(this.store, 'daemon:active', null);
@@ -112,7 +122,7 @@ export class AndroidDaemon {
     this.nextRenewAt = Date.now() + this.renewMs;
     this.taskPromise = runDiscoveryTask({task, store: this.store, device: this.device, permit, clock,
       actionTimeoutMs: this.actionTimeoutMs, resumeAuthorized: task.resumeAuthorized === true,
-      deviceClosureVerified: stateValue(this.store, 'daemon:closure-proof')})
+      deviceClosureVerified: closureProofFor(this.store, this.config.deviceId)})
       .then(result => settleDevice({device:this.device,store:this.store,task,result,clock}))
       .then(result => {
         if (result.status.startsWith('completed')) {
@@ -120,6 +130,7 @@ export class AndroidDaemon {
           catch (error) { result = {...result, reason:error.code ?? 'lease_expired',
             status:['user_stop','remote_stop'].includes(error.code) ? 'canceled' : 'interrupted'}; }
         }
+        if (this.device?.probe && DEVICE_READINESS_REASONS.has(result.reason)) { this.ready = false; this.deviceReason = result.reason; }
         this.saveCompletion({...active, leaseId: this.active?.leaseId ?? active.leaseId}, result);
         return result;
       })
@@ -131,6 +142,14 @@ export class AndroidDaemon {
       this.active?.permit.stop(control.stopRequested || control.reason === 'remote_stop' ? 'remote_stop' : 'lease_expired');
     }
     if (control?.stopRequested) this.active?.permit.stop('remote_stop');
+  }
+  async probeDevice() {
+    // Every idle poll re-reads the phone; an earlier readyForSearch=true never claims another task.
+    const state = await this.device.probe({signal: this.shutdown.signal});
+    this.ready = state.readyForSearch === true;
+    this.deviceReason = state.reason ?? null;
+    this.deviceProbe = {readyForSearch: this.ready, reason: this.deviceReason, checkedAt: new Date().toISOString(),
+      ...(state.foreground ? {foreground: state.foreground} : {}), ...(state.focus !== undefined ? {focus: state.focus} : {})};
   }
   async tick() {
     if (Date.now() < this.nextControlAt) return;
@@ -156,12 +175,7 @@ export class AndroidDaemon {
       return;
     }
     if (this.blocked) return;
-    if (!this.active && this.device?.probe && Date.now() >= this.nextDeviceProbeAt) {
-      const state = await this.device.probe({signal:this.shutdown.signal});
-      this.ready = state.readyForSearch === true;
-      this.deviceReason = state.reason;
-      this.nextDeviceProbeAt = Date.now() + 30000;
-    }
+    if (!this.active && this.device?.probe) await this.probeDevice();
     let started = performance.now();
     const polled = await this.control.poll({deviceId: this.config.deviceId, sessionId: this.sessionId,
       readyForSearch: this.ready}, {signal: this.shutdown.signal});

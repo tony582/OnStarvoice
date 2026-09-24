@@ -1,5 +1,9 @@
 import { RunnerFault } from './errors.mjs';
 
+// An adapter may mark an error `deviceSettled: true` only when it was raised after the last device
+// command returned, so nothing is in flight; such errors complete the closure marker like a normal return.
+const settledFailure = error => error?.deviceSettled === true || (error?.code === 'loading_failed' && error.safeToRetry === true);
+
 export class OperationGate {
   constructor({ permit, beforeAction, journal = null, timeoutMs = 10_000 }) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60_000) throw new RunnerFault('invalid_action_timeout');
@@ -32,12 +36,13 @@ export class OperationGate {
     this.active = true;
     const operation = Promise.resolve().then(() => {
       this.permit.assertAllowed();
-      return action(controller.signal);
+      // The action learns its whole budget so long UI waits can use it instead of a fixed inner limit.
+      return action(controller.signal, { budgetMs: timeout });
     }).then((value) => {
       if (!this.uncertain) this.journal?.complete();
       return value;
     }, (error) => {
-      if (error.code === 'loading_failed' && error.safeToRetry === true && !this.uncertain) this.journal?.complete();
+      if (settledFailure(error) && !this.uncertain) this.journal?.complete();
       else this.uncertain = true;
       throw error;
     }).finally(() => { this.active = false; });

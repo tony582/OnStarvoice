@@ -53,6 +53,8 @@ export function createUiSession({ client, sessionId, resourceLocator = 'id' }) {
       return client.scrollElement(sessionId, id, { timeoutMs: 10000, ...options });
     },
     back: (options) => client.back(sessionId, options),
+    currentActivity: (options) => client.currentActivity(sessionId, options),
+    currentPackage: (options) => client.currentPackage(sessionId, options),
     getClipboard: (options) => client.getClipboard(sessionId, options),
     setClipboard: (text, options) => client.setClipboard(sessionId, text, options),
   };

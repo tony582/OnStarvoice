@@ -13,6 +13,7 @@ export function createSimulationDevice(deviceId, {works = ['7000000000000000001'
     copyLink: async ({detail}) => ({fresh: true, markerReplaced: true, identityVerified: true,
       detailId: detail.detailId, externalId: detail.externalId, shareUrl: `https://www.douyin.com/video/${detail.externalId}`}),
     returnToResults: async () => context,
+    recoverResults: async () => context,
     scroll: async () => ({contextVerified: true, contextId: context.contextId}),
   };
 }

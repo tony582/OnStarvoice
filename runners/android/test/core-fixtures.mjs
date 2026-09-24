@@ -29,6 +29,7 @@ export function fixtureDevice(task, overrides = {}) {
     copyLink: async ({ detail }) => ({ identityVerified: true, fresh: true, markerReplaced: true, detailId: detail.detailId,
       externalId: detail.externalId, shareUrl: `https://www.douyin.com/note/${detail.externalId}` }),
     returnToResults: async () => context,
+    recoverResults: async () => context,
     scroll: async () => ({ contextVerified: true, contextId: context.contextId }),
     ...overrides,
   };
