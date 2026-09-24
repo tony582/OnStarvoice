@@ -80,7 +80,11 @@ test('real device without calibrated profile polls unavailable and never operate
   const daemon = new AndroidDaemon({...options(f), store, config: {...f.config, simulation: false}});
   const running = daemon.run();
   t.after(async () => { daemon.requestStop(); await running; store.close(); });
-  await until(() => f.state.calls.some(c => c.path.endsWith('/poll')));
+  // A received HTTP request does not mean the daemon has consumed its response.
+  // Wait for the completed poll projection before stopping, otherwise aborting the
+  // in-flight response can race this assertion into control_requires_attention.
+  await until(() => f.state.calls.some(c => c.path.endsWith('/poll'))
+    && stateValue(store, 'daemon:status')?.reason === 'profile_required');
   daemon.requestStop(); await running;
   assert.equal(store.pendingCount(), 0);
   assert.equal(stateValue(store, 'daemon:status').reason, 'profile_required');
