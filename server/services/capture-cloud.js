@@ -1016,13 +1016,68 @@ export function captureTaskHasUnconfirmedLocalStop(task = {}) {
     !text(jsonObject(task.metadata).recoveryTaskId, 240);
 }
 
-export function captureTaskUnconfirmedLocalStopSql(alias = 'task') {
+export function captureTaskUnconfirmedLocalStopSql(alias = 'task', tenantParameter = '$1') {
   if (!/^[a-z_][a-z0-9_]*$/u.test(alias)) throw new Error('invalid_task_alias');
-  // An explicit failed stop is stronger evidence than an attention/terminal
-  // label. A confirmed cancel or successful manual recovery releases it.
+  if (!/^\$[1-9][0-9]*$/u.test(tenantParameter)) throw new Error('invalid_tenant_parameter');
+  // A superseded label alone cannot prove that the source browser stopped.
+  // Later work that the SAME node actually started and settled can. Resolve
+  // those historical fences once per tenant-scoped query, not with nested
+  // correlated probes for every task: the latter triggers expensive JIT even
+  // when no old errors remain. Keep the original errors for task-history and
+  // recovery decisions; only admission ignores the independently closed work.
   return `(UPPER(COALESCE(${alias}.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
     AND ${alias}.status NOT IN ('canceled', 'completed', 'completed_with_warnings', 'skipped')
-    AND NULLIF(${alias}.metadata->>'recoveryTaskId', '') IS NULL)`;
+    AND NULLIF(${alias}.metadata->>'recoveryTaskId', '') IS NULL
+    AND ${alias}.id NOT IN (
+      WITH confirmed_stops AS MATERIALIZED (
+        SELECT tenant_id, task_id, agent_id, MAX(finished_at) AS finished_at
+        FROM capture_agent_commands
+        WHERE tenant_id = ${tenantParameter}
+          AND command_type = 'stop' AND status = 'completed'
+          AND result->>'accepted' = 'true'
+        GROUP BY tenant_id, task_id, agent_id
+      ), settled_runs AS MATERIALIZED (
+        SELECT stop_proof.tenant_id,
+          COALESCE(stop_proof.assigned_agent_id, stop_proof.origin_agent_id) AS agent_id,
+          stop_proof.platform,
+          MAX(LEAST(stop_proof.created_at, stop_proof.started_at)) AS settled_run_after
+        FROM capture_tasks stop_proof
+        LEFT JOIN confirmed_stops stop_receipt
+          ON stop_receipt.tenant_id = stop_proof.tenant_id
+          AND stop_receipt.task_id = stop_proof.id
+          AND stop_receipt.agent_id = COALESCE(stop_proof.assigned_agent_id, stop_proof.origin_agent_id)
+          AND stop_receipt.finished_at >= stop_proof.started_at
+        WHERE stop_proof.tenant_id = ${tenantParameter}
+          AND stop_proof.task_type IN ('capture', 'unattended_keyword_capture')
+          AND COALESCE(stop_proof.metadata->>'executionMode', '') NOT IN ('source_open', 'unattended_plan')
+          AND stop_proof.finished_at >= stop_proof.started_at
+          AND stop_proof.metadata->>'stopPending' IS DISTINCT FROM 'true'
+          AND UPPER(COALESCE(stop_proof.error->>'code', '')) <> 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+          AND (
+            stop_proof.status IN ('completed', 'completed_with_warnings')
+            OR (stop_proof.status = 'canceled' AND stop_receipt.task_id IS NOT NULL)
+          )
+        GROUP BY stop_proof.tenant_id,
+          COALESCE(stop_proof.assigned_agent_id, stop_proof.origin_agent_id), stop_proof.platform
+      )
+      SELECT historical_stop.id
+      FROM capture_tasks historical_stop
+      JOIN capture_tasks stop_successor
+        ON stop_successor.tenant_id = historical_stop.tenant_id
+        AND stop_successor.parent_task_id = historical_stop.parent_task_id
+        AND stop_successor.id <> historical_stop.id
+        AND stop_successor.id::text = historical_stop.metadata->>'handoffSuccessorTaskId'
+      JOIN settled_runs
+        ON settled_runs.tenant_id = historical_stop.tenant_id
+        AND settled_runs.agent_id = COALESCE(historical_stop.assigned_agent_id, historical_stop.origin_agent_id)
+        AND settled_runs.platform = historical_stop.platform
+        AND settled_runs.settled_run_after > historical_stop.updated_at
+      WHERE historical_stop.tenant_id = ${tenantParameter}
+        AND historical_stop.status = 'superseded'
+        AND historical_stop.metadata->>'stopPending' IS DISTINCT FROM 'true'
+        AND UPPER(COALESCE(historical_stop.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+        AND NULLIF(historical_stop.metadata->>'recoveryTaskId', '') IS NULL
+    ))`;
 }
 
 export async function findCaptureAgentExecutionSlotBlocker(

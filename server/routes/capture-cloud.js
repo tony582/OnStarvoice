@@ -9027,7 +9027,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
                   SELECT 1 FROM capture_tasks unsafe_stop
                   WHERE unsafe_stop.tenant_id = t.tenant_id
                     AND COALESCE(unsafe_stop.assigned_agent_id, unsafe_stop.origin_agent_id) = c.agent_id
-                    AND ${captureTaskUnconfirmedLocalStopSql('unsafe_stop')}
+                    AND ${captureTaskUnconfirmedLocalStopSql('unsafe_stop', '$2')}
                 )
               )
               AND NOT EXISTS (

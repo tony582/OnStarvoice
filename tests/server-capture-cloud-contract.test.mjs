@@ -120,6 +120,8 @@ test("failed local stop holds the source node and cannot automatically release a
   }}, 'tenant', 'agent'), blocker);
   assert.ok(statement.sql.includes(captureTaskUnconfirmedLocalStopSql('task')));
   assert.throws(()=>captureTaskUnconfirmedLocalStopSql('task;delete'), /invalid_task_alias/u);
+  assert.match(captureTaskUnconfirmedLocalStopSql('unsafe_stop', '$2'), /historical_stop\.tenant_id = \$2/u);
+  assert.throws(()=>captureTaskUnconfirmedLocalStopSql('task', 'tenant_id'), /invalid_tenant_parameter/u);
 });
 
 test("targeted completion receipts hash the exact bounded raw JSON", () => {
