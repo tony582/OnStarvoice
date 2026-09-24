@@ -48,6 +48,13 @@ import {
   loadUnattendedNegativePatrolCandidates,
   normalizeUnattendedNegativePatrolScope,
 } from '../services/unattended-negative-patrol.js';
+import {
+  MOBILE_WORKFLOW,
+  mobilePlanBlockReason,
+  mobileTaskBudgets,
+  mobileTaskFilters,
+  trimMobilePlanSnapshot,
+} from '../services/android-control/mobile-tasks.js';
 
 const router = Router();
 const UUID_PATTERN =
@@ -473,6 +480,28 @@ function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
     };
   }
   const capabilities = safeJson(agent.capabilities);
+  if (capabilities.agentKind === 'android_mobile') {
+    // A phone is a normal douyin keyword-search node: it needs only the mobile
+    // search capability, the douyin platform, and a plain single-pass plan.
+    if (capabilities.mobileSearchDiscoveryV1 !== true) {
+      return {code: 'agent_mobile_capability_missing', message: '手机节点版本尚不支持关键词搜索发现，请更新手机采集器'};
+    }
+    if (platform !== 'douyin') {
+      return {code: 'agent_mobile_platform_mismatch', message: '手机节点仅支持抖音关键词搜索发现'};
+    }
+    if (mobilePlanBlockReason(planSnapshot, platform)) {
+      return {code: 'agent_mobile_plan_unsupported', message: '手机节点仅支持单段抖音关键词搜索，不支持串行补充、负面巡查或近一月'};
+    }
+    const mobileAllowed = Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [];
+    if (mobileAllowed.length > 0 && !mobileAllowed.includes('douyin')) {
+      return {code: 'agent_platform_mismatch', message: '目标节点未配置负责该任务平台'};
+    }
+    const mobileSupported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
+    if (mobileSupported.length > 0 && !mobileSupported.includes('douyin')) {
+      return {code: 'agent_platform_unsupported', message: '目标节点当前版本不支持该任务平台'};
+    }
+    return null;
+  }
   if (safeJson(planSnapshot.negativePatrol).enabled === true &&
       !(capabilities.remoteTargetedPostCaptureV1 === true &&
         capabilities.negativePostPatrol === true &&
@@ -3315,6 +3344,84 @@ router.post(
           const agentId = sortedAgentIds[groupIndex];
           const agent = compatible.agentsById.get(agentId);
           const groupItems = assignmentsByAgent.get(agentId);
+          if (safeJson(agent.capabilities).agentKind === 'android_mobile') {
+            // Phone fixed-batch group: a mobile child task owns the keyword items
+            // (execution_task_id) with no create command. Each keyword stays
+            // 'pending' so android poll case 1 claims it in turn.
+            const mobileChildTaskId = crypto.randomUUID();
+            const mobileKeywords = groupItems.map(item => item.keyword);
+            const mobileChildMetadata = {
+              workflow: MOBILE_WORKFLOW,
+              agentKind: 'android_mobile',
+              deviceId: safeJson(agent.capabilities).deviceId,
+              filters: mobileTaskFilters(planSnapshot.searchFilters),
+              budgets: mobileTaskBudgets(planSnapshot, mobileKeywords.length),
+              keywords: mobileKeywords,
+              deadlineAt: null,
+              planSnapshot: trimMobilePlanSnapshot(planSnapshot, mobileKeywords),
+              orchestrationChild: true,
+              parentTaskId: parent.id,
+              orchestrationRevision: nextRevision,
+              distributionMode: 'fixed_batch',
+              claimUnit: 'fixed_batch',
+              requestedByUserId: req.user?.id || '',
+              requestedByName: text(req.actorName, 240),
+            };
+            const mobileChild = await tx.queryOne(`
+              INSERT INTO capture_tasks (
+                id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
+                client_task_id, task_type, feature_key, title, platform,
+                source, trigger_type, status, progress, checkpoint, counts,
+                metadata, message, source_updated_at
+              ) VALUES (
+                $1::uuid, $2, $3, $4, $4,
+                $1::uuid::text, 'capture', $5, $6, 'douyin',
+                'android_runner', 'orchestration_dispatch', 'pending',
+                $7::jsonb, '{}'::jsonb, $8::jsonb,
+                $9::jsonb, '手机搜索发现子任务已创建，等待手机领取', now()
+              )
+              RETURNING id, parent_task_id, assigned_agent_id, status
+            `, [
+              mobileChildTaskId, req.tenantId, parent.id, agentId, MOBILE_WORKFLOW,
+              sortedAgentIds.length === 1 ? parent.title : `${parent.title} · ${groupIndex + 1}/${sortedAgentIds.length}`,
+              JSON.stringify({current: 0, total: mobileKeywords.length, phase: 'queued'}),
+              JSON.stringify({total: mobileKeywords.length, processed: 0, success: 0, failed: 0, skipped: 0}),
+              JSON.stringify(mobileChildMetadata),
+            ]);
+            for (const item of groupItems) {
+              const updatedItem = await tx.queryOne(`
+                UPDATE capture_task_items
+                SET status = 'pending', assigned_agent_id = $1, execution_task_id = $2,
+                  assignment_revision = $3, assigned_at = now(), updated_at = now()
+                WHERE id = $4 AND tenant_id = $5 AND task_id = $6
+                  AND status = 'pending' AND assigned_agent_id IS NULL AND execution_task_id IS NULL
+                RETURNING id
+              `, [agentId, mobileChild.id, nextRevision, item.id, req.tenantId, parent.id]);
+              if (!updatedItem) {
+                const conflict = new Error('orchestration_item_assignment_conflict');
+                conflict.code = 'orchestration_item_assignment_conflict';
+                throw conflict;
+              }
+            }
+            await appendEvent(tx, {
+              tenantId: req.tenantId, taskId: mobileChild.id, agentId,
+              eventType: 'orchestration_child_dispatched',
+              actorId: req.user?.id || '', actorName: req.actorName,
+              status: mobileChild.status,
+              message: '手机搜索发现子任务已分配，等待手机逐词领取',
+              payload: {
+                parentTaskId: parent.id, revision: nextRevision,
+                itemIds: groupItems.map(item => item.id), keywords: mobileKeywords,
+                distributionMode: 'fixed_batch', deviceOnly: true,
+              },
+            });
+            executions.push({
+              taskId: mobileChild.id, agentId, commandId: null,
+              itemIds: groupItems.map(item => item.id), keywords: mobileKeywords,
+              status: mobileChild.status, agentOnline: captureAgentOnline(agent.last_heartbeat_at),
+            });
+            continue;
+          }
           const childTaskId = crypto.randomUUID();
           const commandId = crypto.randomUUID();
           const childTitle = sortedAgentIds.length === 1
@@ -3782,6 +3889,36 @@ router.post(
         for (const child of executionTasks) {
           const metadata = safeJson(child.metadata);
           const agentId = text(child.assigned_agent_id, 100);
+          if (safeJson(child.agent_capabilities).agentKind === 'android_mobile'
+            || metadata.workflow === MOBILE_WORKFLOW) {
+            // Phones have no command channel and the browser terminal-notice
+            // acknowledgement protocol does not apply. Set the android stop flag
+            // on the child so poll/renew control() fences it; cancel it now if it
+            // holds no device, otherwise keep it (and its held item) pending until
+            // the phone independently confirms closure via complete/close.
+            const heldRow = await tx.queryOne(`
+              SELECT 1 FROM capture_task_items
+              WHERE tenant_id = $1 AND execution_task_id = $2
+                AND metadata->>'deviceHeld' = 'true' LIMIT 1
+            `, [req.tenantId, child.id]);
+            const held = Boolean(heldRow);
+            await tx.execute(`
+              UPDATE capture_tasks
+              SET status = CASE WHEN $3::boolean THEN status ELSE 'canceled' END,
+                metadata = metadata || jsonb_build_object(
+                  'stopRequested', true, 'stopScope', 'batch',
+                  'stopRequestedAt', now()::text
+                ),
+                message = '父任务已停止，手机将确认停稳',
+                finished_at = CASE WHEN $3::boolean THEN finished_at ELSE COALESCE(finished_at, now()) END,
+                updated_at = now(), source_updated_at = now()
+              WHERE id = $1 AND tenant_id = $2
+            `, [child.id, req.tenantId, held]);
+            // A held mobile child is retained so its in-flight item is not
+            // synchronously canceled; the phone confirms and settles it.
+            if (held) retainedExecutionTaskIds.push(child.id);
+            continue;
+          }
           const activeCreate = activeCreateByTask.get(String(child.id));
           const activeCreateItemAttempts = Array.isArray(
             activeCreate?.payload?.orchestration?.itemAttempts,

@@ -78,8 +78,10 @@ export function readFilters(tree) {
 }
 
 export function filtersMatch(groups, filters) {
+  // Every requested group is compared to its choice; the groups the task does not steer must read 不限.
   return groups['排序依据'] === filters.sort && groups['发布时间'] === filters.time
-    && ['视频时长', '搜索范围', '内容形式'].every(name => groups[name] === '不限')
+    && groups['内容形式'] === (filters.content ?? '不限')
+    && ['视频时长', '搜索范围'].every(name => groups[name] === '不限')
     && (!Object.hasOwn(groups,'位置距离') || groups['位置距离'] === '不限');
 }
 

@@ -817,6 +817,30 @@ export function agentCreatePlatforms(agent: CloudAgent) {
   )
 }
 
+// 手机节点（Runner 上报 capabilities.agentKind='android_mobile'）在后台的统一识别与就绪文案。
+// 与浏览器 Agent 共用 CloudAgent 形状，这里只读取 capabilities，OrchestrationCloudAgent 亦可结构兼容传入。
+const MOBILE_DEVICE_REASON_LABELS: Record<string, string> = {
+  douyin_not_foreground: '抖音未在前台',
+  device_locked: '需解锁',
+  device_asleep: '手机息屏',
+  device_missing: '未连接',
+  appium_not_ready: '执行器未就绪',
+}
+
+export function isMobileAgent(agent: { capabilities?: Record<string, unknown> | null }) {
+  return agent.capabilities?.agentKind === 'android_mobile'
+}
+
+// readyForSearch=true → 可执行搜索；否则按 Runner 的 deviceReason 映射，未知原因原样透传。
+// 离线与否仍由既有的 2 分钟心跳规则（agent.online）决定，调用方在离线时无需展示就绪文案。
+export function mobileReadinessLabel(agent: { capabilities?: Record<string, unknown> | null }) {
+  const capabilities = agent.capabilities || {}
+  if (capabilities.readyForSearch === true) return '可执行搜索'
+  const reason = String(capabilities.deviceReason || '').trim()
+  if (!reason) return '手机未就绪'
+  return MOBILE_DEVICE_REASON_LABELS[reason] || reason
+}
+
 export function agentTaskTypeBlockReason(
   agent: CloudAgent,
   taskType: CloudCreateTaskType,
@@ -824,6 +848,11 @@ export function agentTaskTypeBlockReason(
 ) {
   const genericReason = agentAssignmentBlockReason(agent, mode)
   if (genericReason) return genericReason
+  // 手机节点只做抖音关键词搜索发现：关键词一次性与无人值守计划放行，其余（各类巡查、平均下发）拒绝。
+  if (isMobileAgent(agent)) {
+    if (taskType !== 'keyword' && taskType !== 'unattended_plan') return '手机节点仅支持关键词搜索发现'
+    return ''
+  }
   if (['creator_patrol', 'negative_patrol', 'watched_content', 'comment_patrol'].includes(taskType)
     && agent.capabilities?.remoteTargetedPostCaptureV1 !== true) {
     return '客户端扩展版本过低，尚不支持定向页面任务'
@@ -897,6 +926,12 @@ export function agentAssignmentBlockReason(agent: CloudAgent, mode: 'one_time' |
   if (agent.status === 'migrated') return 'Agent 已移出当前租户，不能接收新任务'
   if (agent.status === 'revoked') return 'Agent 已永久停用，不能接收新任务'
   if (agent.status !== 'active') return 'Agent 已暂停，不能接收新任务'
+  // 手机节点不看浏览器扩展的 remoteTaskCreate / remoteUnattendedPlanWrite；只要求手机搜索发现能力与抖音平台。
+  if (isMobileAgent(agent)) {
+    if (agent.capabilities?.mobileSearchDiscoveryV1 !== true) return '手机执行器版本过低，需升级后才能接收搜索发现'
+    if (!agentCreatePlatforms(agent).includes('douyin')) return '手机节点未开通抖音平台'
+    return ''
+  }
   if (agent.capabilities?.remoteTaskCreate !== true) return '客户端扩展版本过低，需升级后才能远程接单'
   if (mode === 'unattended_plan' && agent.capabilities?.remoteUnattendedPlanWrite !== true) {
     return '当前版本不支持云端无人值守计划'

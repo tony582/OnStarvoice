@@ -38,6 +38,7 @@ import { KeywordExecutionReport } from './KeywordExecutionReport'
 import { OrchestrationResultReport } from './OrchestrationResultReport'
 import { TaskResultTimes } from './TaskResultSections'
 import { TaskResultRecords } from './TaskResultDetailWorkspace'
+import { AndroidChildRunPanel } from '../android-discovery/AndroidChildRunPanel'
 import {
   allocateKeywordRetryItems,
   buildKeywordRetryAssignments,
@@ -445,6 +446,25 @@ export function OrchestrationDetailWorkspace({
     () => new Map((detail?.agents || []).map(agent => [agent.id, agent])),
     [detail?.agents],
   )
+  // 手机子任务（execution_task_id 指向 workflow=douyin_mobile_discovery 的抖音手机 run）。
+  // 用于在任务详情里展示「手机发现 → 补详情」进度、候选与停稳恢复。
+  const mobileChildRuns = useMemo(() => {
+    const runs: Array<{ runId: string; agentLabel: string }> = []
+    const seen = new Set<string>()
+    for (const execution of detail?.executions || []) {
+      const runId = executionTaskId(execution)
+      if (!runId || seen.has(runId)) continue
+      const agent = agentsById.get(executionAgentId(execution))
+      const mobile = agent?.capabilities?.agentKind === 'android_mobile'
+        || String(execution.feature_key || '') === 'douyin_mobile_discovery'
+        || objectRecord(execution.metadata).workflow === 'douyin_mobile_discovery'
+        || String(execution.source || '') === 'android_runner'
+      if (!mobile) continue
+      seen.add(runId)
+      runs.push({ runId, agentLabel: agentName(agent) })
+    }
+    return runs
+  }, [detail?.executions, agentsById])
   const attemptsByItem = useMemo(() => {
     const result = new Map<string, OrchestrationAttemptRecord[]>()
     for (const attempt of detail?.attempts || []) {
@@ -1960,6 +1980,20 @@ export function OrchestrationDetailWorkspace({
             </div>
           )}
         </section>
+
+        {mobileChildRuns.length > 0 && (
+          <section className="mt-4 space-y-3" aria-label="手机发现子任务">
+            {mobileChildRuns.map(run => (
+              <AndroidChildRunPanel
+                key={run.runId}
+                runId={run.runId}
+                agentLabel={run.agentLabel}
+                writable={writable && !resultView}
+                refreshKey={refreshKey}
+              />
+            ))}
+          </section>
+        )}
 
         {resultPresentation ? <><OrchestrationResultReport items={sortedItems} executions={executions} agents={agents} attempts={attempts} expectedSearchPasses={searchPasses.length || 1} searchPasses={searchPasses} parentStatus={orchestration.status} automaticRecovery={automaticRecoveryAllowed} now={nowMs} recoveryActions={resultRecoveryActions} /><div className="mt-4"><TaskResultRecords key={orchestration.id} taskId={orchestration.id} refreshKey={refreshKey} /></div></> : !contentPatrol && !scheduleTemplate ? (
           <div className="mt-4">

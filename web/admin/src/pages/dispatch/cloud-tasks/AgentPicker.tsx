@@ -1,11 +1,13 @@
 import { useMemo } from 'react'
-import { CheckCircle2, CircleOff } from 'lucide-react'
+import { CheckCircle2, CircleOff, Smartphone } from 'lucide-react'
 import type { CloudAgent, CloudCreateTaskType, CloudTask } from './lib'
 import {
   ACTIVE_TASK_STATUSES,
   PLATFORM_LABELS,
   agentCreatePlatforms,
   agentTaskTypeBlockReason,
+  isMobileAgent,
+  mobileReadinessLabel,
   safeNumber,
   taskBelongsToAgent,
 } from './lib'
@@ -62,10 +64,13 @@ export function AgentPicker({
   return (
     <div className="space-y-2" role={multiple ? 'group' : 'radiogroup'} aria-label="选择执行节点">
       {sortedAgents.map(agent => {
-        const blockReason = manualBatch && agent.capabilities?.remoteManualKeywordBatchV1 !== true
-          ? '需要升级 Extension，当前版本不支持手动批量下发'
-          : agentTaskTypeBlockReason(agent, taskType, mode)
+        const blockReason = manualBatch && isMobileAgent(agent)
+          ? '手机节点仅支持关键词搜索发现'
+          : manualBatch && agent.capabilities?.remoteManualKeywordBatchV1 !== true
+            ? '需要升级 Extension，当前版本不支持手动批量下发'
+            : agentTaskTypeBlockReason(agent, taskType, mode)
         const selected = selectedIds.includes(agent.id)
+        const mobile = isMobileAgent(agent)
         const platforms = agentCreatePlatforms(agent)
         const agentTasks = tasks.filter(task => taskBelongsToAgent(task, agent) && ACTIVE_TASK_STATUSES.has(task.effective_status || task.status))
         const workloadKnown = agent.active_task_count !== undefined || agent.queued_task_count !== undefined
@@ -80,9 +85,10 @@ export function AgentPicker({
             <span className="min-w-0 flex-1">
               <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
                 <span className="truncate text-sm font-semibold text-foreground">{agent.display_name}</span>
+                {mobile && <span className="inline-flex items-center gap-0.5 rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary"><Smartphone className="h-3 w-3" />手机</span>}
                 <span className="text-[11px] tabular-nums text-muted-foreground">执行中 {activeTaskCount}{queuedTaskCount > 0 ? ` · 排队 ${queuedTaskCount}` : ''}</span>
               </span>
-              <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{agent.host_label} · {agent.browser_name}</span>
+              <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{mobile ? (agent.online ? mobileReadinessLabel(agent) : '手机执行器离线') : `${agent.host_label} · ${agent.browser_name}`}</span>
               <span className="mt-1 flex flex-wrap items-center gap-1">
                 {platforms.length > 0
                   ? platforms.map(platform => (

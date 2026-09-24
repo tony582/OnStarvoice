@@ -1,4 +1,4 @@
-import type {AndroidNode, DiscoveryRunDetail} from './types'
+import type {DiscoveryRunDetail} from './types'
 
 const labels: Record<string, string> = {
   pending: '等待领取', waiting_device: '等待设备', claimed: '已领取', running: '执行中',
@@ -51,22 +51,12 @@ export function runResultLabel(detail: DiscoveryRunDetail) {
   return detail.run.status === 'completed' && detail.items.some(item => limitReasons.has(item.reason || ''))
     ? '发现结束 · 达到本次上限' : statusLabel(detail.run.status)
 }
-export function nodeStateLabel(node: AndroidNode) {
-  if (node.holdState === 'closure_required') return '旧操作待确认停止'
-  if (node.holdState === 'stopping') return '正在停止手机操作'
-  if (node.deviceHeld) return '正在执行手机任务'
-  if (node.status !== 'active') return '节点已停用'
-  if (!node.online) return '执行器离线'
-  return node.readyForSearch ? '可执行搜索' : '已连接 · 等待手机就绪'
-}
 export function durationLabel(milliseconds: number) {
   const seconds = Math.ceil(Math.max(0, milliseconds) / 1000)
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
 }
 export const statusLabel = (status: string) => labels[status] || '等待核对'
 export const reasonLabel = (reason?: string) => reason ? reasons[reason] || '请查看任务详情并核对执行端状态' : ''
-export const canResumeRun = (status: string) => ['needs_action', 'interrupted'].includes(status)
-export const canStopDiscovery = (status: string) => ['pending', 'waiting_device', 'claimed', 'running', 'recovering', 'interrupted', 'needs_action', 'resume_requested'].includes(status)
 export function safeOriginalUrl(value: string) {
   try {
     const url = new URL(value)

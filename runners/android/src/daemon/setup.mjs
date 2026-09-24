@@ -6,9 +6,11 @@ import {RunnerStore} from '../storage/runner-store.mjs';
 import {createControlClient} from '../cloud/control-client.mjs';
 import {normalizeCloudUrl} from '../cloud/client.mjs';
 import {validateSerial} from '../device/adb.mjs';
+import {resolveAppiumLaunch} from './appium-launch.mjs';
 import {assertSimulationOrigin, loadClientUuid, readConfig, stateValue, writePrivateJson} from './state.mjs';
 
-export async function setupRunner({stateDir, baseUrl, deviceId, code, simulation = false, deviceProfile, adbPath, appiumUrl, clientLabel, client} = {}) {
+export async function setupRunner({stateDir, baseUrl, deviceId, code, simulation = false, deviceProfile, adbPath, appiumUrl,
+  appiumLaunch, appiumLaunchFile, clientLabel, client} = {}) {
   const directory = resolve(stateDir);
   const origin = normalizeCloudUrl(baseUrl);
   validateSerial(deviceId);
@@ -18,6 +20,8 @@ export async function setupRunner({stateDir, baseUrl, deviceId, code, simulation
     profileCapabilities(deviceProfile,deviceId);
   }
   if (appiumUrl) validateAppiumUrl(appiumUrl);
+  // Record the local Appium launch descriptor so `up` can start it later; parse the run-appium.sh, never run it.
+  const launch = deviceProfile ? (appiumLaunch ?? resolveAppiumLaunch({file: appiumLaunchFile})) : null;
   if (typeof code !== 'string' || !code.trim()) throw new Error('Activation code required in environment');
   if (existsSync(join(directory, 'connection.json'))) {
     const previous = readConfig(directory);
@@ -38,7 +42,7 @@ export async function setupRunner({stateDir, baseUrl, deviceId, code, simulation
   });
   const config = {baseUrl: origin, deviceId, clientUuid, agentId: registered.agent.id,
     agentToken: registered.agent.token, tenantId: registered.tenantId, simulation,
-    ...(deviceProfile ? {deviceProfile,adbPath,appiumUrl:validateAppiumUrl(appiumUrl)} : {})};
+    ...(deviceProfile ? {deviceProfile, adbPath, appiumUrl: validateAppiumUrl(appiumUrl), ...(launch ? {appiumLaunch: launch} : {})} : {})};
   writePrivateJson(directory, 'connection.json', config);
   return {ok: true, agentId: config.agentId, deviceId, simulation, readyForSearch: simulation,
     reason: simulation ? 'simulation_only' : deviceProfile ? 'device_check_pending' : 'profile_required'};

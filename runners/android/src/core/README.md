@@ -30,8 +30,13 @@ const task = {
 };
 ```
 
-Optional budgets are positive integers: `maxLinks` (20), `maxCards` (40),
-`maxSwipes` (20), `keywordMs` (600000), `batchMs` (1500000), `maxPending` (100).
+Optional budgets are non-negative safe integers: `maxLinks` (20), `maxCards` (40),
+`maxSwipes` (20), `keywordMs` (600000), `batchMs` (1500000), `maxPending` (100). A
+`0` for `maxLinks`, `maxCards`, `maxSwipes` or `batchMs` means unlimited: that ceiling
+is dropped and the run relies on results-end / no-new-cards and the keyword/batch time
+bounds instead. `keywordMs` and `maxPending` must stay positive. Server-sent budgets may
+omit keys (defaults apply); the limits hash is unchanged for positive limits, so older
+checkpoints still load.
 All items in a discovery run retain the same budget definition. Limits, elapsed
 time, spent cards/swipes, distinct work IDs and the earliest absolute deadline
 survive restarts. Offline time counts against budgets. Backward wall-clock movement

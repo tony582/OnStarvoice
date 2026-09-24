@@ -46,10 +46,17 @@ test('capacity failures expose backoff rather than unbounded retries',async t=>{
   const api=await serve(t,{failure:{code:'55P03'}});const response=await api.request('/agent/renew',{},'agent');
   assert.equal(response.status,503);assert.equal(response.headers.get('retry-after'),'1');
 });
-test('pilot inputs are bounded and cannot widen filters or budgets silently',()=>{
+test('standalone run inputs accept 1-300 keywords with uncapped nonnegative budgets',()=>{
   const input={agentId:'00000000-0000-4000-8000-000000000000'};
   assert.equal(runInput(input).keywords.length,2);
-  assert.throws(()=>runInput({...input,keywords:['a','b','c']}),{code:'ONE_OR_TWO_KEYWORDS_REQUIRED'});
-  assert.throws(()=>runInput({...input,budgets:{maxLinks:21}}),{code:'INVALID_BUDGETS'});
+  // A phone is now a normal node: many keywords and no upper caps on links.
+  assert.equal(runInput({...input,keywords:Array.from({length:300},(_,i)=>`k${i}`)}).keywords.length,300);
+  assert.doesNotThrow(()=>runInput({...input,budgets:{maxLinks:2000}}));
+  assert.equal(runInput({...input,budgets:{maxLinks:0}}).budgets.maxLinks,0);
+  // Bounds that remain: keyword count 1-300, nonnegative integers, positive keywordMs.
+  assert.throws(()=>runInput({...input,keywords:Array.from({length:301},(_,i)=>`k${i}`)}),{code:'KEYWORDS_1_TO_300_REQUIRED'});
+  assert.throws(()=>runInput({...input,keywords:[]}),{code:'KEYWORDS_1_TO_300_REQUIRED'});
+  assert.throws(()=>runInput({...input,budgets:{maxLinks:-1}}),{code:'INVALID_BUDGETS'});
+  assert.throws(()=>runInput({...input,budgets:{keywordMs:0}}),{code:'INVALID_BUDGETS'});
   assert.throws(()=>runInput({...input,filters:{sort:'latest',range:'all'}}),{code:'INVALID_FILTERS'});
 });

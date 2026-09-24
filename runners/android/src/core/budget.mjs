@@ -2,6 +2,9 @@ import { payloadHash } from '../storage/codec.mjs';
 import { RunnerFault } from './errors.mjs';
 
 const DEFAULTS = Object.freeze({ maxLinks: 20, maxCards: 40, maxSwipes: 20, keywordMs: 600_000, batchMs: 1_500_000, maxPending: 100 });
+// A 0 in any of these dimensions means unlimited: the ledger drops that ceiling and relies on results-end,
+// no-new-cards and the keyword/batch time bounds instead. keywordMs and maxPending must stay positive.
+const UNLIMITED_KEYS = new Set(['maxLinks', 'maxCards', 'maxSwipes', 'batchMs']);
 
 export class BudgetLedger {
   constructor({ task, store, clock, resumeAuthorized = false }) {
@@ -9,8 +12,9 @@ export class BudgetLedger {
     this.store = store;
     this.clock = clock;
     this.limits = { ...DEFAULTS, ...task.budgets };
-    for (const value of Object.values(this.limits)) {
-      if (!Number.isSafeInteger(value) || value <= 0) throw new RunnerFault('invalid_budget');
+    for (const [key, value] of Object.entries(this.limits)) {
+      const minimum = UNLIMITED_KEYS.has(key) ? 0 : 1;
+      if (!Number.isSafeInteger(value) || value < minimum) throw new RunnerFault('invalid_budget');
     }
     this.key = task.identity.discoveryRunId;
     const saved = store.loadCheckpoint(this.key);
@@ -68,20 +72,23 @@ export class BudgetLedger {
     this.advance();
     this.save();
     const deadline = this.state.deadlineAt ?? Infinity;
-    const reason = this.clock.wallNow() >= deadline ? 'task_deadline' : this.state.elapsedMs >= this.limits.batchMs ? 'batch_time_limit'
-      : this.item.elapsedMs >= this.limits.keywordMs ? 'keyword_time_limit' : this.item.links.length >= this.limits.maxLinks ? 'link_limit' : null;
+    const { batchMs, keywordMs, maxLinks } = this.limits;
+    const reason = this.clock.wallNow() >= deadline ? 'task_deadline'
+      : batchMs > 0 && this.state.elapsedMs >= batchMs ? 'batch_time_limit'
+      : this.item.elapsedMs >= keywordMs ? 'keyword_time_limit'
+      : maxLinks > 0 && this.item.links.length >= maxLinks ? 'link_limit' : null;
     if (reason) throw new RunnerFault('budget_exhausted', reason, { reason });
     if (this.store.pendingCount() >= this.limits.maxPending) throw new RunnerFault('outbox_backlog');
   }
   beforeCard() {
     this.assertAllowed();
-    if (this.item.cards >= this.limits.maxCards) throw new RunnerFault('budget_exhausted', 'card_limit', { reason: 'card_limit' });
+    if (this.limits.maxCards > 0 && this.item.cards >= this.limits.maxCards) throw new RunnerFault('budget_exhausted', 'card_limit', { reason: 'card_limit' });
     this.item.cards++;
     this.save();
   }
   beforeSwipe() {
     this.assertAllowed();
-    if (this.item.swipes >= this.limits.maxSwipes) throw new RunnerFault('budget_exhausted', 'swipe_limit', { reason: 'swipe_limit' });
+    if (this.limits.maxSwipes > 0 && this.item.swipes >= this.limits.maxSwipes) throw new RunnerFault('budget_exhausted', 'swipe_limit', { reason: 'swipe_limit' });
     this.item.swipes++;
     this.save();
   }

@@ -15,6 +15,13 @@ import {
   loadUnattendedNegativePatrolCandidates,
   normalizeUnattendedNegativePatrolScope,
 } from './unattended-negative-patrol.js';
+import {
+  MOBILE_WORKFLOW,
+  mobilePlanBlockReason,
+  mobileTaskBudgets,
+  mobileTaskFilters,
+  trimMobilePlanSnapshot,
+} from './android-control/mobile-tasks.js';
 
 export const SCHEDULE_OVERLAP_RUN_STATUSES = Object.freeze([
   'pending',
@@ -130,7 +137,28 @@ function agentFailure(agent, platform, planSnapshot) {
   }
   const capabilities = object(agent.capabilities);
   if (capabilities.agentKind === 'android_mobile') {
-    return {code: 'scheduled_agent_kind_mismatch', message: '手机节点仅支持手机发现任务'};
+    // A phone is a normal douyin keyword-search node. It does not need the
+    // browser create/keyword-limit/enhancement capabilities; it only needs the
+    // mobile search capability, the douyin platform, and a plain single-pass
+    // plan (no sequential passes, no negative patrol, no month window).
+    if (capabilities.mobileSearchDiscoveryV1 !== true) {
+      return {code: 'scheduled_agent_mobile_unsupported', message: '手机节点版本不支持关键词搜索发现'};
+    }
+    if (platform !== 'douyin') {
+      return {code: 'scheduled_agent_mobile_platform', message: '手机节点仅支持抖音关键词搜索发现'};
+    }
+    if (mobilePlanBlockReason(planSnapshot, platform)) {
+      return {code: 'scheduled_agent_mobile_plan_unsupported', message: '手机节点仅支持单段抖音关键词搜索，不支持串行补充、负面巡查或近一月'};
+    }
+    const mobileAllowed = Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [];
+    if (mobileAllowed.length > 0 && !mobileAllowed.includes('douyin')) {
+      return {code: 'scheduled_agent_platform_mismatch', message: '执行节点未配置负责当前平台'};
+    }
+    const mobileSupported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
+    if (mobileSupported.length > 0 && !mobileSupported.includes('douyin')) {
+      return {code: 'scheduled_agent_platform_unsupported', message: '执行节点版本不支持当前平台'};
+    }
+    return null;
   }
   if (capabilities.remoteTaskCreate !== true) {
     return {code: 'scheduled_agent_version_unsupported', message: '执行节点版本不支持云端任务'};
@@ -165,6 +193,77 @@ function agentFailure(agent, platform, planSnapshot) {
     return {code: 'scheduled_agent_platform_unsupported', message: '执行节点版本不支持当前平台'};
   }
   return null;
+}
+
+// Fixed-batch child for a phone: a mobile-workflow capture_tasks row that owns
+// the group's keyword items by execution_task_id, with no create command. The
+// item stays 'pending' so android poll case 1 claims each keyword in turn.
+async function materializeMobileFixedBatchChild(tx, {
+  schedule, runTaskId, agent, agentId, groupItems, planSnapshot, scheduledFor, revision = 1,
+}) {
+  const childTaskId = crypto.randomUUID();
+  const keywords = groupItems.map(item => item.keyword);
+  const childMetadata = {
+    workflow: MOBILE_WORKFLOW,
+    agentKind: 'android_mobile',
+    deviceId: object(agent.capabilities).deviceId,
+    filters: mobileTaskFilters(planSnapshot.searchFilters),
+    budgets: mobileTaskBudgets(planSnapshot, keywords.length),
+    keywords,
+    deadlineAt: null,
+    planSnapshot: trimMobilePlanSnapshot(planSnapshot, keywords),
+    orchestrationChild: true,
+    parentTaskId: runTaskId,
+    orchestrationRevision: revision,
+    distributionMode: 'fixed_batch',
+    claimUnit: 'fixed_batch',
+    scheduleId: schedule.id,
+    scheduledFor: scheduledFor.toISOString(),
+  };
+  await tx.execute(`
+    INSERT INTO capture_tasks (
+      id, tenant_id, parent_task_id, origin_agent_id, assigned_agent_id,
+      client_task_id, task_type, feature_key, title, platform,
+      source, trigger_type, status, progress, checkpoint, counts,
+      metadata, message, source_updated_at,
+      orchestration_schedule_id, scheduled_for, schedule_revision
+    ) VALUES (
+      $1::uuid, $2, $3, $4, $4,
+      $1::uuid::text, 'capture', $5, $6, 'douyin',
+      'android_runner', 'orchestration_schedule', 'pending', $7::jsonb, '{}'::jsonb, $8::jsonb,
+      $9::jsonb, '手机搜索发现子任务已创建，等待手机领取', now(),
+      $10, $11, $12
+    )
+  `, [
+    childTaskId, schedule.tenant_id, runTaskId, agentId, MOBILE_WORKFLOW,
+    `${schedule.title} · 手机`,
+    JSON.stringify({current: 0, total: keywords.length, phase: 'queued'}),
+    JSON.stringify({total: keywords.length, processed: 0, success: 0, failed: 0, skipped: 0}),
+    JSON.stringify(childMetadata),
+    schedule.id, scheduledFor.toISOString(), Number(schedule.revision),
+  ]);
+  for (const item of groupItems) {
+    await tx.execute(`
+      UPDATE capture_task_items
+      SET status = 'pending', assigned_agent_id = $1, execution_task_id = $2,
+        assignment_revision = $3, assigned_at = now(), updated_at = now()
+      WHERE id = $4 AND tenant_id = $5
+    `, [agentId, childTaskId, revision, item.id, schedule.tenant_id]);
+  }
+  await appendEvent(tx, {
+    tenantId: schedule.tenant_id,
+    taskId: childTaskId,
+    agentId,
+    eventType: 'orchestration_child_dispatched',
+    status: 'pending',
+    message: '手机搜索发现子任务已分配，等待手机逐词领取',
+    payload: {
+      parentTaskId: runTaskId, scheduleId: schedule.id,
+      itemIds: groupItems.map(item => item.id), keywords,
+      distributionMode: 'fixed_batch', deviceOnly: true,
+    },
+  });
+  return childTaskId;
 }
 
 async function appendEvent(tx, {
@@ -813,6 +912,16 @@ async function materializeOccurrence(tx, schedule, {manual = false} = {}) {
         message: failure.message,
         payload: {code: failure.code, itemIds: groupItems.map(item => item.id)},
       });
+      continue;
+    }
+
+    if (object(agent.capabilities).agentKind === 'android_mobile') {
+      // A phone group becomes a mobile child task with no create command; the
+      // phone claims each keyword item through android poll case 1.
+      await materializeMobileFixedBatchChild(tx, {
+        schedule, runTaskId, agent, agentId, groupItems, planSnapshot, scheduledFor,
+      });
+      executionCount += 1;
       continue;
     }
 

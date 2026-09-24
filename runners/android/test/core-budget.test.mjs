@@ -89,6 +89,64 @@ test('backlog stops discovery before a single device action', async () => {
   } finally { store.close(); }
 });
 
+test('a 0 budget lifts the link, card, swipe and batch ceilings while keyword time still bounds', () => {
+  const store = new RunnerStore(':memory:');
+  try {
+    const clock = fixtureClock();
+    const task = fixtureTask({ budgets: { maxLinks: 0, maxCards: 0, maxSwipes: 0, batchMs: 0, keywordMs: 1_000 } });
+    const ledger = new BudgetLedger({ task, store, clock });
+    for (let i = 0; i < 100; i++) { ledger.beforeCard(); ledger.beforeSwipe(); ledger.noteLink(`work-${i}`); }
+    assert.doesNotThrow(() => ledger.assertAllowed(), 'no card, swipe, link or batch ceiling applies');
+    assert.equal(ledger.summary().cards, 100);
+    assert.equal(ledger.summary().swipes, 100);
+    assert.equal(ledger.summary().links, 100);
+    clock.advance(1_000);
+    assert.throws(() => ledger.assertAllowed(), (error) => error.code === 'budget_exhausted' && error.details.reason === 'keyword_time_limit');
+  } finally { store.close(); }
+});
+
+test('keywordMs and maxPending must still be positive; the other dimensions accept 0', () => {
+  const clock = fixtureClock();
+  for (const budgets of [{ keywordMs: 0 }, { maxPending: 0 }, { maxLinks: -1 }, { maxCards: 1.5 }]) {
+    const store = new RunnerStore(':memory:');
+    try { assert.throws(() => new BudgetLedger({ task: fixtureTask({ budgets }), store, clock }), { code: 'invalid_budget' }); }
+    finally { store.close(); }
+  }
+});
+
+test('an unlimited run walks every page to results end past the default card and link ceilings', async () => {
+  const total = 41; // beyond the default maxCards 40 / maxLinks 20 to prove the ceilings are gone.
+  const clock = fixtureClock();
+  const store = new RunnerStore(':memory:');
+  const task = fixtureTask({ budgets: { maxLinks: 0, maxCards: 0, maxSwipes: 0, batchMs: 0 } });
+  try {
+    const context = { verified: true, keyword: task.keyword, filters: task.filters, contextId: 'ctx-unlimited' };
+    let served = 0; const perPage = 5; const calls = { openCard: 0, scroll: 0 };
+    const device = {
+      inspect: async () => ({ deviceId: task.deviceId, connected: true, unlocked: true, loggedIn: true, challenge: false }),
+      search: async () => context,
+      readCards: async () => {
+        const cards = [];
+        for (let i = 0; i < perPage && served < total; i++, served++) cards.push({ cardId: `card-${served}`, title: `t${served}`, author: `a${served}` });
+        return { contextVerified: true, contextId: context.contextId, cards, end: served >= total };
+      },
+      openCard: async ({ card }) => { calls.openCard++; return { identityVerified: true, cardId: card.cardId,
+        detailId: `d-${card.cardId}`, externalId: String(7_000_000_000_000_000n + BigInt(Number(card.cardId.split('-')[1]))) }; },
+      copyLink: async ({ detail }) => ({ identityVerified: true, fresh: true, markerReplaced: true, detailId: detail.detailId,
+        externalId: detail.externalId, shareUrl: `https://www.douyin.com/note/${detail.externalId}` }),
+      returnToResults: async () => context,
+      scroll: async () => { calls.scroll++; return { contextVerified: true, contextId: context.contextId }; },
+    };
+    const result = await runDiscoveryTask({ task, store, clock, device, permit: fixturePermit(task, clock) });
+    assert.equal(result.status, 'completed');
+    assert.equal(result.reason, 'results_end');
+    assert.equal(result.stats.cards, total);
+    assert.equal(result.stats.links, total);
+    assert.equal(calls.openCard, total);
+    assert.equal(calls.scroll, Math.ceil(total / perPage) - 1);
+  } finally { store.close(); }
+});
+
 test('resume faults name the earlier attempt, and a new run or item never inherits them', () => {
   const store = new RunnerStore(':memory:');
   try {

@@ -18,9 +18,27 @@ Runner 使用 Node 24.12.x，无第三方运行依赖；服务端仍兼容 Node 
 
 模块上限由边界脚本设为 350 行；Runner 不引用服务端实现，设备层不引用状态机或数据库。业务职责增加时优先拆模块。
 
+## 一键启动（电脑端操作员）
+
+给试点电脑准备的双击入口，把「起 adb、起 Appium、注册、上线」收敛成一步：
+
+1. 准备：数据线连上已解锁、已登录抖音的手机，第一次插上需要在手机上**授权 USB 调试**（只需一次）。保持手机**解锁常亮、充电**——息屏/锁屏时 Runner 会报 `device_asleep`/`device_locked` 且不会替你唤醒或解锁。
+2. 激活码：在后台「节点激活」页为这台手机生成**激活码**，`up` 首次运行时在终端提示里粘贴，激活码**只读一次、不写入磁盘或日志**（只有换来的节点 token 落到 `connection.json`）。
+3. 双击 `runners/android/launcher/StarVoice 手机采集.command`（macOS，已 `chmod +x`）或 `StarVoice 手机采集.cmd`（Windows）。它设置 PATH、切到 Runner 目录、以默认状态目录运行 `up`；想改状态目录，在 `launcher/` 放一个 `launcher.json`（`{"stateDir": "..."}`）。
+
+也可以直接命令行：
+
+```sh
+node runners/android/cli.mjs up --state-dir /path/to/private/android-state
+# 首次会提示：调度中心地址（默认取 --cloud-url 或 STARVOICE_CLOUD_URL）、激活码
+# 只有恰好一台 adb 在线设备时才自动选序列号；否则会列出设备并退出，请用 --serial 指定
+```
+
+`up` 依次：① `adb start-server`；② 若本机 Appium `/status` 不通，就按注册时从 `~/.local/share/starvoice/android-toolchain/run-appium.sh`（或 `--appium-launch-file`）解析出的 `appiumLaunch`（node 二进制 + Appium 入口 + 参数 + `JAVA_HOME/ANDROID_HOME/APPIUM_HOME`）**直接 spawn node 拉起**（不经 shell、不执行 .sh），并在 60 秒内轮询等就绪；③ 无 `connection.json` 时交互式注册；④ 前台跑 daemon，每次探测变化打印一行人话状态（如「手机已连接 · 抖音在前台 · 已上线，可在调度中心下发任务」或「抖音未在前台 · 等待…」）；⑤ Ctrl-C / 关闭窗口（SIGINT/SIGTERM/SIGHUP）时请求受控停止、等 daemon 结束、再结束 Appium 子进程（先 SIGTERM，10 秒后 SIGKILL），并打印停稳结果（`deviceClosureRequired` true/false）。它不安装常驻服务。
+
 ## 首次设置与启动
 
-激活码只从环境读取，用于一次注册，不写入本地配置、日志或命令参数。注册得到的节点 token 写入指定状态目录的 `connection.json`（权限 0600）；`identity.json` 保存独立稳定 client UUID。不要把状态目录放进版本库，不要复制同一状态目录绑定另一台手机或服务端。
+激活码只从环境读取，用于一次注册，不写入本地配置、日志或命令参数。注册得到的节点 token 写入指定状态目录的 `connection.json`（权限 0600）；`identity.json` 保存独立稳定 client UUID。不要把状态目录放进版本库，不要复制同一状态目录绑定另一台手机或服务端。手动 `setup` 也可用 `--appium-launch-file` 指定或让它自动探测上面的 `run-appium.sh`，把 `appiumLaunch` 写进 `connection.json` 供 `up` 使用。
 
 ```sh
 # 在当前 shell 安全注入 STARVOICE_ACTIVATION_CODE 和 STARVOICE_CLOUD_URL 后：
@@ -37,7 +55,7 @@ node runners/android/cli.mjs setup --state-dir /path/to/private/android-state --
   --device-profile douyin-40.6.0-de106-api27-p0 --adb-path /path/to/adb --appium-url http://127.0.0.1:4723
 ```
 
-启动前需自行运行已配置的本机 Appium。profile 精确核对机型、安卓版本和抖音版本；版本变化后暂停，不能沿用旧控件。匹配组合且 Appium 可用后，Runner 可领取任务，进入搜索前还会确认抖音前台、已登录且未锁屏。`readyForSearch` 表示本次执行条件，不等于生产验收通过；profile 的 `productionAccepted` 仍为 false。默认综合排序＋一天内，其他四组不限；完整选项见方案 4.1.1。
+启动前需自行运行已配置的本机 Appium。profile 精确核对机型、安卓版本和抖音版本；版本变化后暂停，不能沿用旧控件。匹配组合且 Appium 可用后，Runner 可领取任务，进入搜索前还会确认抖音前台、已登录且未锁屏。`readyForSearch` 表示本次执行条件，不等于生产验收通过；profile 的 `productionAccepted` 仍为 false。缺省仍是综合排序＋一天内、其余组不限；服务端可下发 `filters={sort, publishTime, contentType}`（排序：综合/最新/最多点赞/最多评论/最多收藏；发布时间：不限/一天内/一周内/半年内；内容形式：不限/图文/视频），旧 `{sort, range:'day'}` 兼容，读回按请求逐组核对、其余组仍须为不限；不支持的取值在触碰界面前即报 `unsupported_search_filters`。完整选项见方案 4.1.1。
 
 每个逻辑动作最长 60 秒，单次 UI 层级读取和翻页默认最多 10 秒，其他 Appium 请求保留各自较短时限；搜索由多个有界命令组成。调用方更短的时限和停止信号仍可打断读屏，超时不能当作手机已经停稳，也不能直接解释为 USB 断线。
 

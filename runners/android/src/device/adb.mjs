@@ -38,6 +38,8 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
   const call = (args, options = {}) => bounded((signal) => command(adbPath,
     ['-H', '127.0.0.1', '-P', '5037', ...args], { signal, timeoutMs }), { timeoutMs, ...options });
   const listDevices = async (options = {}) => parseAdbDevices((await call(['devices', '-l'], options)).stdout);
+  // Ensure the local adb server is up. This never selects, connects to or opens a device.
+  const startServer = async (options = {}) => { await call(['start-server'], options); return {started: true}; };
   const inspect = async (serial, options = {}) => {
     validateSerial(serial);
     const device = selectDevice(await listDevices(options), serial);
@@ -85,5 +87,5 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
     if (/Error/u.test(`${result.stdout}\n${result.stderr}`)) throw new DeviceError('app_launch_failed', 'The app could not be launched');
     return {launched: true};
   };
-  return {listDevices, inspect, inspectApp, helperPids, stopHelper, windowFocus, resumedActivity, keyguardState, powerState, launchActivity};
+  return {listDevices, startServer, inspect, inspectApp, helperPids, stopHelper, windowFocus, resumedActivity, keyguardState, powerState, launchActivity};
 }

@@ -1,6 +1,12 @@
 import {digest,fail,id,json,text} from './validation.js';
-import {currentAttempt} from './leases.js';
-import {rollup,saveItemMetadata} from './repository.js';
+import {currentAttempt,MOBILE_ELASTIC_ATTEMPT_LIMIT} from './leases.js';
+import {refreshOrchestrationParent} from './parent-refresh.js';
+import {parentStopRequested,rollup,saveItemMetadata} from './repository.js';
+async function parentMetadataFor(tx,principal,task) {
+  if (!task.metadata?.orchestrationChild || !task.parent_task_id) return null;
+  const row=await tx.queryOne('SELECT metadata FROM capture_tasks WHERE id=$1 AND tenant_id=$2',[task.parent_task_id,principal.tenantId]);
+  return row?.metadata || null;
+}
 export async function complete(tx,principal,body) {
   const requestId=id(body.requestId,'REQUEST_ID');
   const sessionId=id(body.sessionId,'SESSION_ID');
@@ -21,16 +27,31 @@ export async function complete(tx,principal,body) {
     return receipt;
   }
   if (!current) fail('STALE_ATTEMPT');
-  const status=task.metadata.stopRequested?'canceled':body.status;
-  const itemStatus=body.deviceIdle ? status==='interrupted'?'needs_action':status : 'needs_action';
+  const parentMetadata=await parentMetadataFor(tx,principal,task);
+  const stopFlagged=task.metadata.stopRequested===true || parentStopRequested(parentMetadata);
+  const status=stopFlagged?'canceled':body.status;
+  const orchestrationChild=task.metadata?.orchestrationChild===true;
+  // Item projection: a stop cancels; a still-held device needs manual closure; a
+  // clean completion is terminal. For orchestration children an unfinished
+  // device-idle attempt becomes retryable while budget remains and the parent is
+  // not stopped, so the same phone or another eligible node can pick it up again.
+  // Standalone runs keep the legacy needs_action projection and explicit resume.
+  let itemStatus;
+  if (status==='canceled') itemStatus='canceled';
+  else if (!body.deviceIdle) itemStatus='needs_action';
+  else if (status==='completed') itemStatus='completed';
+  else if (orchestrationChild && item.attempt_count < MOBILE_ELASTIC_ATTEMPT_LIMIT && !stopFlagged) itemStatus='retryable';
+  else itemStatus='needs_action';
   const receipt={accepted:true,deviceHeld:!body.deviceIdle};
   const completion={requestId,hash,receipt};
   await tx.execute(`UPDATE capture_task_item_attempts SET status=$2,checkpoint=checkpoint||$3::jsonb,
     result=result||$4::jsonb,finished_at=now(),updated_at=now() WHERE id=$1`,
   [attempt.id,status,{runner:payload.checkpoint},{completion,reason:payload.reason}]);
   await saveItemMetadata(tx,item,{...item.metadata,deviceHeld:!body.deviceIdle,completion,
-    reason:payload.reason,deviceClosedAt:body.deviceIdle?new Date().toISOString():null},itemStatus);
+    reason:payload.reason,deviceClosedAt:body.deviceIdle?new Date().toISOString():null,
+    resumeAuthorized:itemStatus==='retryable'?false:item.metadata.resumeAuthorized===true},itemStatus);
   await rollup(tx,principal.tenantId,task.id);
+  await refreshOrchestrationParent(tx,principal.tenantId,task,principal.agentId);
   return receipt;
 }
 export async function closeDevice(tx,principal,body) {
@@ -47,9 +68,12 @@ export async function closeDevice(tx,principal,body) {
   if (!current) fail('STALE_ATTEMPT');
   if (!Number.isFinite(verified) || verified<Date.parse(attempt.started_at) || verified>Date.now()+5000) fail('INVALID_CLOSURE_TIME',400);
   const closure={requestId,hash,evidence};
+  const parentMetadata=await parentMetadataFor(tx,principal,task);
+  const stopFlagged=task.metadata.stopRequested===true || parentStopRequested(parentMetadata);
   await tx.execute(`UPDATE capture_task_item_attempts SET result=result||$2::jsonb,status=CASE WHEN status='running'
     THEN 'interrupted' ELSE status END,finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE id=$1`,[attempt.id,{closure}]);
-  await saveItemMetadata(tx,item,{...item.metadata,deviceHeld:false,closure},task.metadata.stopRequested?'canceled':'needs_action');
+  await saveItemMetadata(tx,item,{...item.metadata,deviceHeld:false,closure},stopFlagged?'canceled':'needs_action');
   await rollup(tx,principal.tenantId,task.id);
+  await refreshOrchestrationParent(tx,principal.tenantId,task,principal.agentId);
   return {deviceHeld:false};
 }

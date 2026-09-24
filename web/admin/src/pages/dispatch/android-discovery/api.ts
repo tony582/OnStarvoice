@@ -1,15 +1,11 @@
 import {api} from '@/lib/api'
-import type {AndroidNode, CreateDiscoveryRun, DiscoveryRun, DiscoveryRunDetail} from './types'
+import type {DiscoveryRunDetail} from './types'
 
+// 手机发现已并入普通调度：后台只保留读取子任务/独立 run 详情与重处理候选两个接口，
+// 建任务/停止/恢复/节点列表统一走普通编排链路，不再由此模块直接调用。
 const base = '/capture-cloud/android'
 export const androidApi = {
-  capabilities: () => api.get<{ok: boolean; enabled: boolean}>(`${base}/capabilities`),
-  nodes: () => api.get<{ok: boolean; nodes: AndroidNode[]}>(`${base}/nodes`),
-  runs: () => api.get<{ok: boolean; runs: DiscoveryRun[]}>(`${base}/runs`),
   detail: (id: string) => api.get<DiscoveryRunDetail>(`${base}/runs/${encodeURIComponent(id)}`),
-  create: (body: CreateDiscoveryRun) => api.post<{ok: boolean; run: DiscoveryRun}>(`${base}/runs`, body),
-  stop: (id: string, scope: 'discovery' | 'batch') => api.post(`${base}/runs/${encodeURIComponent(id)}/stop`, {scope}),
-  resume: (id: string) => api.post(`${base}/runs/${encodeURIComponent(id)}/resume`),
   reprocess: (id: string, eventIds: string[], requestId: string) => api.post(
     `/capture-cloud/tasks/${encodeURIComponent(id)}/discoveries/reprocess`, {eventIds, requestId}),
 }

@@ -78,6 +78,7 @@ import {
   projectNegativePatrolAdmission,
   projectCaptureResourceAdmission,
 } from '../services/capture-resource-policy.js';
+import {registerOrchestrationParentProjector} from '../services/android-control/parent-refresh.js';
 
 function requireCaptureAgent(req, res, next) {
   return authenticateCaptureAgent(req, res, error => {
@@ -4488,7 +4489,7 @@ function buildLocalRecoveryAdoptionReceipt(task, snapshot, agentId = '') {
   };
 }
 
-async function refreshOrchestrationParentTask(tx, {
+export async function refreshOrchestrationParentTask(tx, {
   tenantId,
   parentTaskId,
   parent: lockedParent = null,
@@ -16797,3 +16798,6 @@ router.get('/tasks/:id/events', requireTenantAccess, requireSessionUser, async (
 });
 
 export default router;
+
+// Register the parent projector for the phone control plane (services never import routes).
+registerOrchestrationParentProjector(refreshOrchestrationParentTask);

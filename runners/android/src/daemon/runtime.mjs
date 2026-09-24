@@ -151,6 +151,16 @@ export class AndroidDaemon {
     this.deviceProbe = {readyForSearch: this.ready, reason: this.deviceReason, checkedAt: new Date().toISOString(),
       ...(state.foreground ? {foreground: state.foreground} : {}), ...(state.focus !== undefined ? {focus: state.focus} : {})};
   }
+  /** A bounded, PII-free probe summary for the poll body: only the foreground identity and when it was read. */
+  pollProbe() {
+    const probe = this.deviceProbe;
+    if (!probe) return null;
+    const bound = value => typeof value === 'string' ? value.slice(0, 120) : null;
+    const summary = {checkedAt: bound(probe.checkedAt)};
+    if (probe.foreground) summary.foreground = {package: bound(probe.foreground.package),
+      activity: bound(probe.foreground.activity), launched: probe.foreground.launched === true};
+    return summary;
+  }
   async tick() {
     if (Date.now() < this.nextControlAt) return;
     if (stateValue(this.store, 'daemon:completion')) {
@@ -178,7 +188,7 @@ export class AndroidDaemon {
     if (!this.active && this.device?.probe) await this.probeDevice();
     let started = performance.now();
     const polled = await this.control.poll({deviceId: this.config.deviceId, sessionId: this.sessionId,
-      readyForSearch: this.ready}, {signal: this.shutdown.signal});
+      readyForSearch: this.ready, reason: this.deviceReason ?? null, probe: this.pollProbe()}, {signal: this.shutdown.signal});
     this.nextControlAt = Date.now() + Math.max(this.pollMs, polled.pollAfterMs ?? 0);
     this.applyControl(polled.control);
     if (this.shutdown.signal.aborted) return;

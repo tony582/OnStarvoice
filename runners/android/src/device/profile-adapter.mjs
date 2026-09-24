@@ -11,6 +11,29 @@ import {createDouyinCalibrationFlow} from '../calibration/douyin-flow.mjs';
 // Model, API level and Douyin version change rarely; every other readiness fact is re-read per probe.
 const STATIC_PROBE_MS = 30_000;
 
+// Public filter names from the plan snapshot mapped to the calibrated Chinese panel labels.
+const SORT_LABELS = Object.freeze({comprehensive:'综合排序', latest:'最新发布', likes:'最多点赞', comments:'最多评论', collects:'最多收藏'});
+const PUBLISH_TIME_LABELS = Object.freeze({all:'不限', day:'一天内', week:'一周内', halfyear:'半年内'});
+const CONTENT_TYPE_LABELS = Object.freeze({all:'不限', image:'图文', video:'视频'});
+/**
+ * Accepts the new {sort, publishTime, contentType} and the legacy {sort, range:'day'}; every unsupported value
+ * (for instance publishTime='month', which the panel cannot express) is rejected before any UI action begins.
+ */
+export function mapSearchFilters(filters) {
+  const reject = () => { throw new DeviceError('unsupported_search_filters', 'This calibrated profile does not support the requested search filters'); };
+  if (!filters || typeof filters !== 'object') reject();
+  const sort = SORT_LABELS[filters.sort];
+  if (!sort) reject();
+  if (filters.range !== undefined) {
+    if (filters.range !== 'day' || filters.publishTime !== undefined || filters.contentType !== undefined) reject();
+    return {sort, time: '一天内', content: '不限'};
+  }
+  const time = PUBLISH_TIME_LABELS[filters.publishTime];
+  const content = CONTENT_TYPE_LABELS[filters.contentType];
+  if (!time || !content) reject();
+  return {sort, time, content};
+}
+
 export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=createAppiumClient({appiumUrl}),onState,
   foreground=createForegroundGuard({adb,serial}),now=Date.now}) {
   if (profileId !== DOUYIN_P0_PROFILE.id) throw new DeviceError('profile_required','Unknown device profile');
@@ -54,11 +77,9 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
     async search({keyword, filters, signal}) {
       throwIfAborted(signal);
       if (!flow) throw new DeviceError('session_required','Inspect the selected phone first');
-      if (!['comprehensive','latest'].includes(filters?.sort) || filters?.range !== 'day' || Object.keys(filters).length !== 2) {
-        throw new DeviceError('unsupported_search_filters','This calibrated profile supports comprehensive or latest within one day');
-      }
+      const mapped = mapSearchFilters(filters); // Rejects unsupported filters before touching the UI.
       context = null;
-      await flow.search({keyword,filters:{sort:filters.sort === 'comprehensive' ? '综合排序' : '最新发布',time:'一天内'},signal});
+      await flow.search({keyword, filters: mapped, signal});
       context = {verified:true,contextId:randomUUID(),keyword,filters:{...filters}};
       return {...context};
     },

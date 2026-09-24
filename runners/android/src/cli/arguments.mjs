@@ -1,8 +1,8 @@
-const OPTIONS = new Set(['serial', 'adb-path', 'appium-path', 'appium-cli-path', 'appium-url', 'state-dir', 'cloud-url', 'simulation', 'label', 'evidence-file', 'duration-seconds', 'device-profile']);
+const OPTIONS = new Set(['serial', 'adb-path', 'appium-path', 'appium-cli-path', 'appium-url', 'state-dir', 'cloud-url', 'simulation', 'label', 'evidence-file', 'duration-seconds', 'device-profile', 'appium-launch-file']);
 
 export function parseArguments(args) {
   const [command = 'help', ...rest] = args;
-  if (!['help', 'doctor', 'demo', 'status', 'deliver', 'retry-delivery', 'run', 'setup', 'start', 'stop', 'close'].includes(command)) {
+  if (!['help', 'doctor', 'demo', 'status', 'deliver', 'retry-delivery', 'run', 'setup', 'start', 'stop', 'close', 'up'].includes(command)) {
     throw new Error(`Unknown command: ${command}`);
   }
   const values = {};
@@ -14,7 +14,7 @@ export function parseArguments(args) {
     }
     values[name] = rest[i + 1];
   }
-  if (['status', 'deliver', 'retry-delivery', 'setup', 'start', 'stop', 'close'].includes(command) && !values['state-dir']) {
+  if (['status', 'deliver', 'retry-delivery', 'setup', 'start', 'stop', 'close', 'up'].includes(command) && !values['state-dir']) {
     throw new Error('--state-dir is required');
   }
   if (values.simulation && !['true', 'false'].includes(values.simulation)) throw new Error('Invalid simulation mode');
@@ -32,6 +32,10 @@ demo    [--state-dir DIR]  Run local simulated discovery; no network or device.
 setup   --state-dir DIR --serial SERIAL [--cloud-url ORIGIN] [--simulation true]
         [--device-profile douyin-40.6.0-de106-api27-p0] [--adb-path PATH] [--appium-url URL]
         Register with STARVOICE_ACTIVATION_CODE from the environment. Code is not saved.
+up      --state-dir DIR [--cloud-url ORIGIN] [--serial SERIAL] [--device-profile ID]
+        [--adb-path PATH] [--appium-url URL] [--appium-launch-file run-appium.sh]
+        One click: adb start-server, start Appium if needed, register on first use
+        (prompts for the activation code, which is never saved), then run the daemon.
 start   --state-dir DIR   Foreground daemon; SIGINT/SIGTERM requests a bounded stop.
 stop    --state-dir DIR   Durable stop request; inspect status to confirm closure.
 close   --state-dir DIR --evidence-file PATH  Explicit independent device closure proof.

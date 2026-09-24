@@ -11,6 +11,7 @@ import {
   Loader2,
   Play,
   Settings2,
+  Smartphone,
   Users,
   Wifi,
   WifiOff,
@@ -22,7 +23,7 @@ import { ScheduledDatesPicker } from './ScheduledDatesPicker'
 import { NegativePatrolScheduleOption } from './NegativePatrolScheduleOption'
 import { hasUnattendedNegativePatrol, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable, DEFAULT_NEGATIVE_PATROL_STATUSES, negativePatrolTriageStatuses, validNegativePatrolStatuses, negativePatrolStatusSummary } from './unattendedNegativePatrol.mjs'
 import { Drawer } from '@/components/shared/Drawer'
-import { shanghaiToday } from './lib'
+import { isMobileAgent, mobileReadinessLabel, shanghaiToday } from './lib'
 import type {
   CaptureEnhancementSettings,
   OrchestrationCloudAgent,
@@ -232,6 +233,15 @@ function agentBlockReason(
   negativePatrolEnabled = false,
 ) {
   if (agent.status !== 'active') return agent.status === 'paused' ? '节点已暂停接单' : '节点已撤销'
+  // 手机节点只做抖音关键词搜索发现：小红书、多段搜索、负面巡查一律不可选并说明原因。
+  if (isMobileAgent(agent)) {
+    if (agent.capabilities?.mobileSearchDiscoveryV1 !== true) return '手机执行器版本过低，需升级后才能接收搜索发现'
+    if (platform !== 'douyin') return '手机节点仅支持抖音搜索发现'
+    if (!agentPlatforms(agent).includes('douyin')) return '手机节点未开通抖音平台'
+    if (sequentialSearchEnabled) return '手机节点不支持多段搜索巡检'
+    if (negativePatrolEnabled) return '手机节点不支持负面巡查'
+    return ''
+  }
   if (agent.capabilities?.remoteTaskCreate !== true) return 'Extension 版本不支持云端任务'
   if (!agentPlatforms(agent).includes(platform)) {
     return `该节点不支持${PLATFORM_OPTIONS.find(option => option.value === platform)?.label || platform}`
@@ -399,6 +409,8 @@ export function OrchestrationComposerDrawer({
   const [customDates, setCustomDates] = useState('')
   const [keywordText, setKeywordText] = useState('')
   const [keywordMaxDetectedItems, setKeywordMaxDetectedItems] = useState(50)
+  // 手机每词最长时间（分钟），仅在选了手机节点时下发为 mobileKeywordMaxMinutes；服务端归一到 1–120，默认 15。
+  const [mobileKeywordMaxMinutes, setMobileKeywordMaxMinutes] = useState(15)
   const [sort, setSort] = useState('comprehensive')
   const [publishTime, setPublishTime] = useState('all')
   const [contentType, setContentType] = useState<PatrolContentType>('all')
@@ -484,6 +496,8 @@ export function OrchestrationComposerDrawer({
       .filter((agent): agent is OrchestrationCloudAgent => Boolean(agent)),
     [agents, validSelectedAgentIds],
   )
+  // 选中节点里是否含手机：决定是否展示并下发「手机每词最长时间」。
+  const mobileSelected = useMemo(() => selectedAgents.some(agent => isMobileAgent(agent)), [selectedAgents])
   const busy = submitting || discardingDraft
   const eachAgentKeywords = keywords.filter(keyword => eachAgentKeywordSelection.includes(keyword))
   const eachAgentCoverage = eachAgentKeywords.length > 0
@@ -575,6 +589,8 @@ export function OrchestrationComposerDrawer({
       : []
     setKeywordText(initialKeywords.join('\n'))
     setKeywordMaxDetectedItems(safeCount(planSnapshot.keywordMaxDetectedItems) || 50)
+    const rawMobileMinutes = safeCount(planSnapshot.mobileKeywordMaxMinutes)
+    setMobileKeywordMaxMinutes(rawMobileMinutes >= 1 && rawMobileMinutes <= 120 ? rawMobileMinutes : 15)
     setSort(String(searchFilters.sort || 'comprehensive'))
     setPublishTime(String(searchFilters.publishTime || 'all'))
     setContentType(
@@ -900,6 +916,7 @@ export function OrchestrationComposerDrawer({
     keywordCoverage,
     eachAgentKeywords,
     eligibleAgentIds: [...validSelectedAgentIds].sort(),
+    ...(mobileSelected ? { mobileKeywordMaxMinutes } : {}),
   })
 
   const generatePreview = async () => {
@@ -922,6 +939,10 @@ export function OrchestrationComposerDrawer({
     }
     if (!Number.isSafeInteger(keywordMaxDetectedItems) || keywordMaxDetectedItems < 1) {
       setError('每个关键词的帖子上限必须是大于等于 1 的整数。')
+      return
+    }
+    if (mobileSelected && (!Number.isSafeInteger(mobileKeywordMaxMinutes) || mobileKeywordMaxMinutes < 1 || mobileKeywordMaxMinutes > 120)) {
+      setError('手机每词最长时间需要填写 1–120 分钟的整数。')
       return
     }
     if (enhancementEnabled && includeComments && (!Number.isSafeInteger(commentLimit) || commentLimit < 1)) {
@@ -1025,6 +1046,7 @@ export function OrchestrationComposerDrawer({
             : {}),
           keywords,
           keywordMaxDetectedItems,
+          ...(mobileSelected ? { mobileKeywordMaxMinutes } : {}),
           searchFilters: {
             sort,
             publishTime,
@@ -1114,6 +1136,7 @@ export function OrchestrationComposerDrawer({
             },
             keywords,
             keywordMaxDetectedItems,
+            ...(mobileSelected ? { mobileKeywordMaxMinutes } : {}),
             searchFilters: {
               sort,
               publishTime,
@@ -1427,6 +1450,22 @@ export function OrchestrationComposerDrawer({
                         className={inputClassName}
                       />
                     </label>
+                    {mobileSelected && (
+                      <label className="block text-xs font-medium text-muted-foreground">
+                        手机每词最长时间（分钟）
+                        <input
+                          type="number"
+                          min={1}
+                          max={120}
+                          step={1}
+                          value={mobileKeywordMaxMinutes}
+                          onChange={event => { markDefinitionChanged(); setMobileKeywordMaxMinutes(Number(event.target.value)) }}
+                          disabled={busy}
+                          className={inputClassName}
+                        />
+                        <span className="mt-1.5 block text-[11px] text-muted-foreground">仅对手机节点生效：每个关键词最多搜索这么久（1–120 分钟，默认 15），到点即结束该词，不代表已搜完所有结果。</span>
+                      </label>
+                    )}
                     <label className="block text-xs font-medium text-muted-foreground">
                       关键词（每行一个）
                       <textarea
@@ -1701,6 +1740,7 @@ export function OrchestrationComposerDrawer({
                     {sortedAgents.map(agent => {
                       const blockReason = agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol)
                       const checked = validSelectedAgentIds.includes(agent.id)
+                      const mobile = isMobileAgent(agent)
                       const workloadKnown = agent.active_task_count !== undefined || agent.queued_task_count !== undefined
                       const activeTasks = safeCount(agent.active_task_count)
                       const queuedTasks = safeCount(agent.queued_task_count)
@@ -1717,17 +1757,18 @@ export function OrchestrationComposerDrawer({
                             className="mt-1 h-4 w-4 shrink-0 accent-primary"
                           />
                           <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${agent.online ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}>
-                            <Bot className="h-4 w-4" />
+                            {mobile ? <Smartphone className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
                           </span>
                           <span className="min-w-0 flex-1">
                             <span className="flex flex-wrap items-center gap-1.5">
                               <span className="truncate text-xs font-bold text-foreground">{agent.display_name}</span>
+                              {mobile && <span className="inline-flex items-center gap-0.5 rounded bg-primary/8 px-1.5 py-0.5 text-[9px] font-medium text-primary"><Smartphone className="h-2.5 w-2.5" />手机</span>}
                               <span className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${agent.online ? 'bg-status-green/10 text-status-green' : 'bg-muted text-muted-foreground'}`}>
                                 {agent.online ? <Wifi className="h-2.5 w-2.5" /> : <WifiOff className="h-2.5 w-2.5" />}
                                 {agent.online ? '在线' : '离线'}
                               </span>
                             </span>
-                            <span className="mt-1 block truncate text-[11px] text-muted-foreground">{agent.host_label} › {agent.browser_name} · {agent.operating_system}</span>
+                            <span className="mt-1 block truncate text-[11px] text-muted-foreground">{mobile ? (agent.online ? mobileReadinessLabel(agent) : '手机执行器离线') : `${agent.host_label} › ${agent.browser_name} · ${agent.operating_system}`}</span>
                             {blockReason ? (
                               <span className="mt-1.5 block text-[11px] font-medium text-status-red">{blockReason}</span>
                             ) : (

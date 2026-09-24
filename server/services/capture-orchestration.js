@@ -606,6 +606,20 @@ export function normalizeOrchestrationRequest(
         1,
         Number.MAX_SAFE_INTEGER,
       ),
+      // Optional per-keyword time fence for phone nodes (1–120 minutes, default
+      // 15 at consumption). Only persisted when the caller sets it so existing
+      // plan-snapshot hashes stay stable.
+      ...(source.mobileKeywordMaxMinutes !== undefined ||
+        source.mobile_keyword_max_minutes !== undefined
+        ? {
+            mobileKeywordMaxMinutes: integer(
+              source.mobileKeywordMaxMinutes ?? source.mobile_keyword_max_minutes,
+              15,
+              1,
+              120,
+            ),
+          }
+        : {}),
       maxRounds: schedule?.maxRounds || 1,
       roundGapMin: schedule?.roundGapMin || 10,
       ...(sequentialSearchEnabled ? {searchPasses: effectiveSearchPasses} : {}),

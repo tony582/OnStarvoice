@@ -3,7 +3,7 @@ import * as Dialog from '@radix-ui/react-dialog'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   AlertTriangle, ArrowLeft, Bot, CalendarClock, CheckCircle2, ChevronRight, CircleOff,
-  ChevronDown, ClipboardList, Loader2, LogOut, MoreHorizontal, Pencil, Plus, PowerOff, Save, Trash2,
+  ChevronDown, ClipboardList, Loader2, LogOut, MoreHorizontal, Pencil, Plus, PowerOff, Save, Smartphone, Trash2,
   Wifi, WifiOff,
 } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -19,6 +19,8 @@ import {
   agentCreatePlatforms,
   formatTime,
   hasConfiguredUnattendedPlan,
+  isMobileAgent,
+  mobileReadinessLabel,
   isPendingUnattendedPlanDeleteTask,
   safeNumber,
   statusTone,
@@ -95,6 +97,7 @@ function AgentRow({
   const { activeTaskCount, queuedTaskCount } = agentWorkload(agent, tasks)
   const platforms = agentCreatePlatforms(agent)
   const hasPlan = hasConfiguredUnattendedPlan(agent.unattended_plan)
+  const mobile = isMobileAgent(agent)
   const dotClass = agent.status === 'paused' ? 'bg-status-orange' : agent.online ? 'bg-status-green' : 'bg-muted-foreground/40'
   const statusLabel = agent.status === 'paused' ? '已暂停' : agent.online ? '在线' : '离线'
 
@@ -106,10 +109,11 @@ function AgentRow({
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-1.5">
             <span className="truncate text-[13px] font-semibold text-foreground">{agent.display_name}</span>
+            {mobile && <span className="inline-flex shrink-0 items-center gap-0.5 rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary"><Smartphone className="h-3 w-3" />手机</span>}
             {hasPlan && <CalendarClock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-label="已配置无人值守计划" />}
             {agent.last_error && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-status-red" aria-label="Agent 异常" />}
           </span>
-          <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{statusLabel} · 最近心跳 {formatDate(agent.last_heartbeat_at)}</span>
+          <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{statusLabel} · 最近心跳 {formatDate(agent.last_heartbeat_at)}{mobile && agent.online ? ` · ${mobileReadinessLabel(agent)}` : ''}</span>
           <span className="mt-1 flex flex-wrap items-center gap-1">
             {platforms.length > 0
               ? platforms.map(platform => (

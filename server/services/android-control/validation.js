@@ -25,14 +25,22 @@ export function identity(input) {
 }
 export function runInput(input = {}) {
   const keywords = input.keywords ?? ['别克壁纸', '君越壁纸'];
-  if (!Array.isArray(keywords) || keywords.length < 1 || keywords.length > 2) fail('ONE_OR_TWO_KEYWORDS_REQUIRED',400);
+  if (!Array.isArray(keywords) || keywords.length < 1 || keywords.length > 300) fail('KEYWORDS_1_TO_300_REQUIRED',400);
   const normalized = [...new Set(keywords.map(k => text(k,'KEYWORD',128)))];
   const filters = input.filters ?? {sort:'comprehensive',range:'day'};
   if (!filters || Array.isArray(filters) || typeof filters !== 'object'
       || !['latest','comprehensive'].includes(filters.sort) || filters.range !== 'day'
       || Object.keys(filters).some(k => !['sort','range'].includes(k))) fail('INVALID_FILTERS',400);
-  const limits = {maxLinks:20,maxCards:40,maxSwipes:20,keywordMs:600000,batchMs:1500000,maxPending:100};
-  const budgets = {...limits,...json(input.budgets)};
-  for (const [k,v] of Object.entries(budgets)) if (!(k in limits) || !Number.isInteger(v) || v < 1 || v > limits[k]) fail('INVALID_BUDGETS',400);
-  return {agentId:id(input.agentId),title:text(input.title || '抖音手机发现试验','TITLE'),keywords:normalized,filters,budgets};
+  // A phone is a normal douyin node now: it runs to the end of results and is
+  // fenced only by the per-keyword and batch time budgets. Upper caps on links,
+  // cards and swipes are gone; 0 means unlimited. Only nonnegative integers and
+  // a positive keyword time budget are enforced.
+  const defaults = {maxLinks:0,maxCards:0,maxSwipes:0,keywordMs:900000,batchMs:0,maxPending:100};
+  const budgets = {...defaults,...json(input.budgets)};
+  for (const [k,v] of Object.entries(budgets)) {
+    if (!(k in defaults) || !Number.isInteger(v) || v < 0) fail('INVALID_BUDGETS',400);
+  }
+  if (!(budgets.keywordMs > 0)) fail('INVALID_BUDGETS',400);
+  if (!(budgets.batchMs > 0)) budgets.batchMs = budgets.keywordMs * normalized.length + 300000;
+  return {agentId:id(input.agentId),title:text(input.title || '抖音手机发现','TITLE'),keywords:normalized,filters,budgets};
 }

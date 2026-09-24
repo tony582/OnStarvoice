@@ -4,6 +4,7 @@ import {parseArguments, HELP} from './arguments.mjs';
 import {runDoctor} from '../device/index.mjs';
 import {runLocalDemo} from './demo.mjs';
 import {daemonCommand, runControlPlaneDemo} from './daemon-commands.mjs';
+import {runUp} from './up-command.mjs';
 import {RunnerStore} from '../storage/runner-store.mjs';
 import {createCloudClient} from '../cloud/client.mjs';
 import {deliverPendingBatch} from '../cloud/delivery.mjs';
@@ -32,6 +33,7 @@ export async function runCli(args, {stdout = console.log, stderr = console.error
       stdout(JSON.stringify(report, null, 2));
       return report.readyForP0 ? 0 : 2;
     }
+    if (command === 'up') { await runUp(values, {env, stdout}); return 0; }
     if (['setup', 'start', 'stop', 'close', 'status'].includes(command)) {
       const report = await daemonCommand(command, values, {env, stdout});
       stdout(JSON.stringify(report, null, 2));

@@ -1,4 +1,4 @@
-import {hasSemanticFilters, semanticFilterSelector} from '../device/douyin-semantic-filters.mjs';
+import {FILTER_OPTIONS, hasSemanticFilters, semanticFilterSelector} from '../device/douyin-semantic-filters.mjs';
 import { randomUUID } from 'node:crypto';
 import { DeviceError } from '../device/bounded.mjs';
 import { descendants, visible } from '../device/ui-tree.mjs';
@@ -15,6 +15,18 @@ const OPEN_SAFETY_MS = 3_000;
 const MIN_DETAIL_READY_MS = READ_TIMEOUT_MS + RETRY_DELAY_MS;
 const MAX_DETAIL_READY_MS = 40_000;
 const RETURN_BUDGET_MS = 15_000;
+
+// The calibrated panel choices the flow can select; the profile adapter maps public filter names into these labels.
+const CALIBRATED_SORT = FILTER_OPTIONS['排序依据'];
+const CALIBRATED_TIME = FILTER_OPTIONS['发布时间'];
+const CALIBRATED_CONTENT = FILTER_OPTIONS['内容形式'];
+function assertCalibratedSearch(keyword, filters) {
+  if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 100
+    || !CALIBRATED_SORT.includes(filters?.sort) || !CALIBRATED_TIME.includes(filters?.time)
+    || !CALIBRATED_CONTENT.includes(filters?.content ?? '不限')) {
+    throw new DeviceError('unsupported_calibration_search', 'Unsupported calibration keyword or filters');
+  }
+}
 
 // The UI flow has no cloud client; copied links remain pending independent detail verification.
 export function createDouyinCalibrationFlow({ ui, now = () => performance.now() }) {
@@ -48,13 +60,10 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
     return results(options);
   };
   const flow = {
-    async search({ keyword, signal, filters = { sort: '综合排序', time: '一天内' } }) {
+    async search({ keyword, signal, filters = { sort: '综合排序', time: '一天内', content: '不限' } }) {
       context = null;
       try {
-      if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 100
-        || !['综合排序','最新发布'].includes(filters.sort) || !['一天内', '一周内'].includes(filters.time)) {
-        throw new DeviceError('unsupported_calibration_search', 'Unsupported calibration keyword or filters');
-      }
+      assertCalibratedSearch(keyword, filters);
       const options = { signal }; await ui.setWindowScope(false, options); let tree = await ui.read(options);
       if (!byId(tree, 'et_search_kw').length && searchEntryNodes(tree).length === 1) {
         await ui.clickXPath(`//*[@resource-id='${resource('hmy')}' and @content-desc='搜索']`,options); tree = await ui.waitFor(tree => byId(tree, 'et_search_kw').length === 1, options);
@@ -65,7 +74,7 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
       try {
       let panel = await filterState(options);
       for (const [group, choice] of [['排序依据', filters.sort], ['发布时间', filters.time],
-        ['视频时长', '不限'], ['搜索范围', '不限'], ['内容形式', '不限'],
+        ['视频时长', '不限'], ['搜索范围', '不限'], ['内容形式', filters.content ?? '不限'],
         ...(semanticFilters ? [['位置距离','不限']] : [])]) {
         if (readFilters(panel)[group] === choice) continue;
         await ui.clickXPath(semanticFilters ? semanticFilterSelector(group,choice,panel) : filterSelector(group, choice), options);
@@ -80,10 +89,7 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
     },
     async adoptCurrentSearch({ keyword, filters, signal }) {
       context = null;
-      if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 100
-        || !['综合排序','最新发布'].includes(filters?.sort) || !['一天内', '一周内'].includes(filters?.time)) {
-        throw new DeviceError('unsupported_calibration_search', 'Unsupported calibration keyword or filters');
-      }
+      assertCalibratedSearch(keyword, filters);
       context = { keyword, filters: { ...filters } };
       try { await results({ signal }); return await verifyFilters({ signal }); }
       catch (error) { context = null; throw error; }

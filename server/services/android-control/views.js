@@ -10,7 +10,7 @@ function run(row) {
 const RUN_SQL=`SELECT task.*,agent.status AS agent_status,agent.capabilities AS agent_capabilities,
   agent.last_liveness_at AS agent_last_liveness_at,
   (SELECT jsonb_build_object('total',COUNT(*),'completed',COUNT(*) FILTER(WHERE status IN ('completed','completed_with_warnings')),
-    'needsAction',COUNT(*) FILTER(WHERE status IN ('needs_action','failed'))) FROM capture_task_items WHERE task_id=task.id) AS progress,
+    'needsAction',COUNT(*) FILTER(WHERE status IN ('needs_action','failed'))) FROM capture_task_items WHERE execution_task_id=task.id) AS progress,
   (SELECT jsonb_build_object('total',COUNT(*),'stored',COUNT(*) FILTER(WHERE demand_status='fulfilled'),
     'needsAction',COUNT(*) FILTER(WHERE demand_status='needs_action')) FROM capture_discovery_run_candidates WHERE run_id=task.id) AS candidate_counts
   FROM capture_tasks task LEFT JOIN capture_agents agent ON agent.id=task.assigned_agent_id AND agent.tenant_id=task.tenant_id
@@ -43,7 +43,7 @@ export async function runView(tx,tenantId,taskId) {
     attempt.checkpoint FROM capture_task_items item LEFT JOIN capture_task_item_attempts attempt
       ON attempt.item_id=item.id AND attempt.tenant_id=item.tenant_id
       AND attempt.assignment_revision=item.assignment_revision AND attempt.id::text=item.metadata->>'attemptId'
-    WHERE item.tenant_id=$1 AND item.task_id=$2 ORDER BY item.ordinal`,[tenantId,taskId]);
+    WHERE item.tenant_id=$1 AND item.execution_task_id=$2 ORDER BY item.ordinal`,[tenantId,taskId]);
   const candidates=await tx.queryAll(`SELECT c.id,c.external_id,c.canonical_url,c.status,d.demand_status,d.record_id,
     e.title_hint,e.author_hint,e.keyword,c.last_error,r.business_visibility,triage.status AS triage_status FROM capture_discovery_run_candidates d
     JOIN capture_discovery_candidates c ON c.id=d.candidate_id AND c.tenant_id=d.tenant_id

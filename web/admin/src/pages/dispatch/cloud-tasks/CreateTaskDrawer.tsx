@@ -15,7 +15,7 @@ import { WatchedContentTaskCreator } from './WatchedContentTaskCreator'
 import { OfficialCommentPatrolTaskCreator } from './OfficialCommentPatrolTaskCreator'
 import { AccountDiscoveryTaskCreator } from './AccountDiscoveryTaskCreator'
 import type { CloudAgent, CloudCreateTaskType, CloudTask, ComposerIntent } from './lib'
-import { agentTaskTypeBlockReason } from './lib'
+import { agentTaskTypeBlockReason, isMobileAgent } from './lib'
 import type { OrchestrationLaunchIntent } from './types'
 
 // 统一「新建任务」向导：任务类型 → 执行方式 → 选择节点 → 任务配置。
@@ -165,6 +165,16 @@ export function CreateTaskDrawer({
     lockAgentSelection: true,
     initialNegativePatrolEnabled: true,
     initialNegativePatrolStatuses: negativePatrolStatuses,
+  })
+
+  // 手机节点只走统一编排（固定/弹性均由服务端 poll 领取，不用浏览器 create 命令）。
+  // 单节点关键词/无人值守选中手机时，改用编排器把该手机作为固定执行节点配置。
+  const launchSinglePhoneOrchestration = () => onLaunchOrchestration({
+    executionMode: mode,
+    agentIds: selectedAgentIds.slice(0, 1),
+    lockExecutionMode: true,
+    minimumAgentCount: 1,
+    lockAgentSelection: true,
   })
 
   const goNext = () => {
@@ -460,6 +470,17 @@ export function CreateTaskDrawer({
                     onClose()
                   }}
                 />
+              ) : isMobileAgent(selectedAgent) ? (
+                <div className="rounded-2xl border border-primary/20 bg-primary/[0.03] p-5">
+                  <h3 className="text-sm font-bold text-foreground">手机节点通过统一编排下发</h3>
+                  <p className="mt-1.5 text-xs leading-5 text-muted-foreground">
+                    手机只做抖音关键词搜索发现，采用与电脑节点一致的编排流程（固定分配 / 弹性领取均由云端调度）。
+                    点击下方按钮，用当前手机作为固定执行节点配置关键词、筛选与每词最长时间。
+                  </p>
+                  <Button className="mt-3" onClick={launchSinglePhoneOrchestration} disabled={!writable}>
+                    配置手机搜索发现 <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
               ) : (
                 <AgentTaskCreator
                   key={`${selectedAgent.id}:${mode}:${editingExisting ? 'edit' : 'new'}`}

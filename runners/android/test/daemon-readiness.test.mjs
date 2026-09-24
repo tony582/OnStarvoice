@@ -80,6 +80,26 @@ test('a readiness failure at inspect demotes the runner until re-probed, and the
   assert.equal(store.loadCheckpoint(first.identity.discoveryRunId).value.items[first.identity.itemId].status, 'needs_action');
 });
 
+test('the poll body carries the device reason and a bounded probe summary', async t => {
+  const f = await mockControlPlane(t);
+  const store = new RunnerStore(join(f.directory, 'runner.sqlite'));
+  const device = createSimulationDevice(f.config.deviceId);
+  device.probe = async () => ({readyForSearch: false, reason: 'douyin_not_foreground',
+    foreground: {package: 'com.smartisanos.launcher', activity: '.Launcher', launched: false}});
+  const daemon = new AndroidDaemon({...options(f), store, device});
+  const running = daemon.run();
+  t.after(async () => { daemon.requestStop(); await running; store.close(); });
+  await until(() => polls(f).some(c => c.body.probe));
+  daemon.requestStop(); await running;
+  const withProbe = polls(f).find(c => c.body.probe);
+  assert.equal(withProbe.body.readyForSearch, false);
+  assert.equal(withProbe.body.reason, 'douyin_not_foreground');
+  assert.equal(withProbe.body.probe.foreground.package, 'com.smartisanos.launcher');
+  assert.equal(withProbe.body.probe.foreground.activity, '.Launcher');
+  assert.equal(withProbe.body.probe.foreground.launched, false);
+  assert.equal(typeof withProbe.body.probe.checkedAt, 'string');
+});
+
 test('a retained closure proof reaches a task only for the pending operation it names', () => {
   const store = new RunnerStore(':memory:');
   try {

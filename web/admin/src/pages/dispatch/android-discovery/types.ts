@@ -1,17 +1,3 @@
-export interface AndroidNode {
-  id: string
-  displayName: string
-  deviceId: string
-  status: string
-  readyForSearch: boolean
-  online: boolean
-  holdState: 'free' | 'working' | 'stopping' | 'closure_required'
-  lastHeartbeatAt: string | null
-  activeRunId: string | null
-  deviceHeld: boolean
-  holdReason?: string
-}
-
 export interface DiscoveryRun {
   id: string
   title: string
@@ -75,12 +61,4 @@ export interface DiscoveryRunDetail {
   items: {id: string; keyword: string; status: string; reason?: string; attemptCount?: number; stats?: KeywordReceiptStats | null}[]
   candidates: DiscoveryCandidate[]
   events: DiscoveryEvent[]
-}
-
-export interface CreateDiscoveryRun {
-  requestId: string
-  agentId: string
-  title: string
-  keywords: string[]
-  filters: {sort: 'latest' | 'comprehensive'; range: 'day'}
 }

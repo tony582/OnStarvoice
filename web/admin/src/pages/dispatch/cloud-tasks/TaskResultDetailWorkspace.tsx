@@ -7,6 +7,7 @@ import type { CloudTask } from './lib'
 import { PLATFORM_LABELS, STATUS_LABELS, formatTime, statusTone, taskDiagnostics, taskErrorText } from './lib'
 import { TaskResultRecordButton, TaskResultSyncSummary, TaskResultTimes } from './TaskResultSections'
 import { historicalItemStatus, resultCount, resultMessage, resultObject, taskResultKind } from './task-result-presentation.mjs'
+import { AndroidChildRunPanel } from '../android-discovery/AndroidChildRunPanel'
 
 type ResultSummary = {
   observationCount: number
@@ -87,6 +88,11 @@ export function TaskResultDetailWorkspace({ taskId, initialTask, onClose, classN
   const targets = targetResults || (Array.isArray(metadata.targets) ? metadata.targets : [])
   const reportedMetrics = REPORTED_METRICS.filter(([key]) => resultCount(task.counts?.[key]) !== null)
   const status = task.status || task.effective_status || ''
+  // 旧的独立手机发现 run（task_type='capture'、workflow=douyin_mobile_discovery、无父任务）：
+  // 用与编排子任务相同的详情块展示手机发现进度与候选（run id = 任务本身 id）。
+  const isMobileDiscoveryRun = metadata.workflow === 'douyin_mobile_discovery'
+    || task.feature_key === 'douyin_mobile_discovery'
+    || task.source === 'android_runner'
   return <section className={cn('overflow-hidden rounded-[22px] border border-border/70 bg-card', className)}>
     <header className="border-b border-border/70 p-4 sm:p-5">
       <div className="flex items-start gap-3">
@@ -105,6 +111,7 @@ export function TaskResultDetailWorkspace({ taskId, initialTask, onClose, classN
     <div className="space-y-4 p-4 sm:p-5">
       {error && <p role="alert" className="rounded-xl border border-status-red/25 p-3 text-xs text-status-red">{error} 当前显示已读取的任务记录。</p>}
       <section className="rounded-xl bg-muted/30 p-4"><TaskResultTimes createdAt={task.created_at} startedAt={task.started_at} finishedAt={task.finished_at} /></section>
+      {isMobileDiscoveryRun && <AndroidChildRunPanel runId={task.id} writable={false} refreshKey={`${refreshKey ?? ''}:${resultRefresh}`} />}
       <section className="rounded-xl border border-border/70 p-4">
         <h3 className="flex items-center gap-2 text-sm font-semibold"><ClipboardList className="h-4 w-4 text-primary" />完成情况</h3>
         {task.message && <p className="mt-2 break-words text-xs leading-5 text-muted-foreground">{task.message}</p>}
