@@ -56,6 +56,7 @@ import {
   normalizeHistoryClearTaskIds,
   readCaptureTaskResultSummary,
 } from '../services/capture-task-history.js';
+import {loadCaptureScheduleTemplates} from '../services/capture-schedule-projection.js';
 import {
   processSocialAccountHeartbeat,
 } from '../services/social-account-usage.js';
@@ -10574,6 +10575,11 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             AND t.orchestration_revision = 0
             AND COALESCE(t.metadata->>'draft', 'false') = 'true'
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM capture_orchestration_schedules schedule
+            WHERE schedule.tenant_id = t.tenant_id
+              AND schedule.template_task_id = t.id
+          )
         ORDER BY
           CASE WHEN t.status IN ('running', 'recovering', 'resume_requested', 'needs_action', 'interrupted') THEN 0 ELSE 1 END,
           t.updated_at DESC
@@ -10616,7 +10622,8 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             AND COALESCE(t.metadata->>'draft', 'false') = 'true'
           )
       `, [req.tenantId]);
-        return {agents, tasks, taskSummary};
+        const scheduleTemplates = await loadCaptureScheduleTemplates(tx, req.tenantId);
+        return {agents, tasks: [...scheduleTemplates, ...tasks], taskSummary};
       }, {
         category: 'reporting',
         waitTimeoutMs: 250,
