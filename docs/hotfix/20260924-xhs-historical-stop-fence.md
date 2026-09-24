@@ -1,6 +1,6 @@
 # 小红书历史停止保护误拦修复
 
-本地修复已验证，尚未提交、推送或部署。基线为 `3043c9c82252901a9d1c643a6def409e0c140cdd`。仅需发布 `server/services/capture-cloud.js` 和 `server/routes/capture-cloud.js`，无数据库迁移或 Extension 更新。
+修复提交为 `976a0c627fd24d56618400eaced8f7a34b0a0a97`，基线为 `3043c9c82252901a9d1c643a6def409e0c140cdd`。2026-09-24 16:05（Asia/Shanghai）已部署 `server/services/capture-cloud.js` 和 `server/routes/capture-cloud.js`；无数据库迁移或 Extension 更新。
 
 ## 故障和证据
 
@@ -30,6 +30,8 @@
 
 ## 发布与剩余问题
 
-发布清单和代码包位于 `output/hotfix-xhs-stop-fence-20260924/`。上线前按清单核对两份生产文件仍与基线一致，备份并仅替换这两份文件；按现有发布流程切换服务，再核验节点心跳与新批次领取。无需清理历史记录、修改任务状态或重载 Extension。
+GitHub Actions 运行 `35972624212` 的五个任务全部通过。上线前确认生产两份文件与基线 SHA-256 一致；备份后仅替换这两份文件并重启 `onstarvoice`。新进程 PID 为 `413492`，`health`、`live`、`ready` 均通过，部署后错误日志未新增内容。8 个 0.4.14 小红书节点没有任务占用，其中 7 个心跳新鲜；霸王龙保持部署前已有的离线状态。
+
+回滚副本位于 `/opt/onstarvoice-private/releases/xhs-stop-fence-976a0c6-20260924T080518Z/server-candidate`，部署证据位于 `/opt/onstarvoice-release-evidence/0.4.14-976a0c6-20260924/xhs-stop-fence/deployment.json`。无需清理历史记录、修改任务状态或重载 Extension。
 
 早上提到的时间筛选校验失败是另一个问题。本修复不放宽“一天内”校验，也不宣称这些失败已经恢复。原 07:05 批次已于 09:09 被停止，本次诊断没有重新启动它。
