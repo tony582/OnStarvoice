@@ -212,14 +212,18 @@ export class AndroidDaemon {
     while (!this.shutdown.signal.aborted) {
       try { await this.tick(); this.controlFailures = 0; }
       catch (error) {
-        if (error.retryable === false || [401, 403, 409].includes(error.status)) {
-          this.blocked = 'control_requires_attention';
-          this.active?.permit.stop('lease_expired');
+        // A normal local shutdown aborts an in-flight poll. Do not turn that
+        // expected cancellation into a persistent control-plane fault.
+        if (!this.shutdown.signal.aborted) {
+          if (error.retryable === false || [401, 403, 409].includes(error.status)) {
+            this.blocked = 'control_requires_attention';
+            this.active?.permit.stop('lease_expired');
+          }
+          this.lastControlError = error.code ?? 'control_unavailable';
+          this.controlFailures++;
+          this.nextControlAt = Date.now() + Math.max(error.retryAfterMs ?? 0,
+            Math.min(60000, this.pollMs * 2 ** Math.min(this.controlFailures, 6)));
         }
-        this.lastControlError = error.code ?? 'control_unavailable';
-        this.controlFailures++;
-        this.nextControlAt = Date.now() + Math.max(error.retryAfterMs ?? 0,
-          Math.min(60000, this.pollMs * 2 ** Math.min(this.controlFailures, 6)));
       }
       this.status({controlError: this.lastControlError ?? null});
       await delay(this.pollMs, this.shutdown.signal);
