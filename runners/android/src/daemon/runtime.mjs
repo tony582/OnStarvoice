@@ -193,6 +193,7 @@ export class AndroidDaemon {
     let started = performance.now();
     const polled = await this.control.poll({deviceId: this.config.deviceId, sessionId: this.sessionId,
       readyForSearch: this.ready, reason: this.deviceReason ?? null, probe: this.pollProbe()}, {signal: this.shutdown.signal});
+    this.lastControlError = null; // Only an answered poll clears it; turns skipped by backoff or a block keep the last error.
     this.nextControlAt = Date.now() + Math.max(this.pollMs, polled.pollAfterMs ?? 0);
     this.applyControl(polled.control);
     if (this.shutdown.signal.aborted) return;
