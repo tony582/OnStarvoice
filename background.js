@@ -15963,6 +15963,22 @@ async function inspectCaptureTaskGroupLiveness(group) {
   // through the ledger/request/owner/lock checks so a terminal task can be
   // reclaimed instead of blocking every later begin forever.
   if (debugSession && debugSessionState !== 'detached') {
+    // 仍挂着的 Debug 会话默认视为存活。唯一例外：稳定无人值守 taskId 的
+    // 请求槽/执行轮次已被证明换走（残留），它不会再收到有效 END，放着只会
+    // 让后续每个任务都撞上 starvoice_active / relay_mismatch。其它 taskId
+    // （手动 task_…、巡查、定向帖、manual_batch）保持原语义不回收。
+    const residue = await inspectUnattendedCaptureAssistResidue(taskId, {
+      session: debugSession,
+      group,
+    });
+    if (residue.residue) {
+      return {
+        active: false,
+        reason: 'residual_capture_assist',
+        residue,
+        debugSession,
+      };
+    }
     return {active: true, reason: 'debug_session', debugSession};
   }
 
@@ -16051,7 +16067,9 @@ async function inspectCaptureTaskGroupLiveness(group) {
   };
 }
 
-async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
+async function releaseConfirmedStaleCaptureTaskGroupsForBegin({
+  preserveTabIds = [],
+} = {}) {
   const releasedTaskIds = [];
   const protectedTasks = [];
   const candidatesByTaskId = new Map(
@@ -16087,16 +16105,33 @@ async function releaseConfirmedStaleCaptureTaskGroupsForBegin() {
       continue;
     }
 
+    const residual = liveness.reason === 'residual_capture_assist';
     try {
       await releaseCaptureTaskResourcesWithRetry(
         {
           taskId: group.taskId,
           reason: 'stale_capture_task_recovered',
+          // 可证明的无人值守残留走同一条有序释放，只换原因便于排查。
+          ...(residual ? {reason: 'residual_capture_assist_reclaimed'} : {}),
           debugSnapshot: liveness.debugSession,
+          // 只释放旧任务自己的 Debug/标签组/工作页；新任务要用的来源 Tab
+          // （残留时还包括当前执行锁持有的 Tab）即使出现在旧工作页列表里
+          // 也不关闭。
+          preserveTabIds: [
+            ...preserveTabIds,
+            ...(residual ? [liveness.residue?.liveHolderTabId] : []),
+          ],
         },
         {attempts: 3},
       );
       releasedTaskIds.push(group.taskId);
+      if (residual) {
+        console.warn('[CaptureTask] residual capture assist reclaimed:', {
+          taskId: group.taskId,
+          reason: liveness.residue?.reason || '',
+          stage: 'begin',
+        });
+      }
     } catch (error) {
       console.warn(
         '[CaptureTask] confirmed stale group cleanup remains pending:',
@@ -16371,7 +16406,9 @@ async function beginCaptureTaskNow(message, sender) {
   };
 
   const staleRecovery =
-    await releaseConfirmedStaleCaptureTaskGroupsForBegin();
+    await releaseConfirmedStaleCaptureTaskGroupsForBegin({
+      preserveTabIds: [sourceTabId],
+    });
   await reconcileUnattendedBeginFence();
 
   let existingSession =
@@ -17312,6 +17349,8 @@ async function releaseCaptureTaskResources({
   taskId,
   reason,
   debugSnapshot = null,
+  preserveTabIds = [],
+  resolveKeptWorkerTabIds = null,
 } = {}) {
   const activeDebugSnapshot =
     debugSnapshot || captureDebugSessionManager.getSessionByTaskId(taskId);
@@ -17321,6 +17360,17 @@ async function releaseCaptureTaskResources({
     activeDebugSnapshot,
     groupSnapshot,
   );
+  // Tabs another (newer) task is using are never closed as this task's
+  // workers, even if a stale worker list still names them.
+  const preservedTabIds = new Set(
+    (Array.isArray(preserveTabIds) ? preserveTabIds : [])
+      .map((tabId) => resolveCaptureTaskTabId(tabId))
+      .filter(Boolean),
+  );
+  const isClosableWorkerTab = (tabId) =>
+    !preservedTabIds.has(resolveCaptureTaskTabId(tabId));
+  workerSnapshot.workerTabIds =
+    workerSnapshot.workerTabIds.filter(isClosableWorkerTab);
   const cleanupSnapshot = {
     ...(groupSnapshot || {}),
     ...(activeDebugSnapshot || {}),
@@ -17371,8 +17421,27 @@ async function releaseCaptureTaskResources({
           taskId: activeTaskId,
           reason: stopReason,
         }),
-      closeWorkerTabs: (workerTabIds) =>
-        closeTrackedCaptureTaskWorkerTabs(taskId, workerTabIds),
+      closeWorkerTabs: async (candidateTabIds) => {
+        // Callers outside any task lifecycle re-decide right before closing:
+        // a successor may have adopted one of these tabs during the release.
+        // null keeps every worker tab open.
+        const keptAtClose =
+          typeof resolveKeptWorkerTabIds === 'function'
+            ? await resolveKeptWorkerTabIds()
+            : [];
+        if (keptAtClose === null) return null;
+        const keptAtCloseIds = new Set(
+          keptAtClose
+            .map((tabId) => resolveCaptureTaskTabId(tabId))
+            .filter(Boolean),
+        );
+        const workerTabIds = candidateTabIds.filter(
+          (tabId) =>
+            isClosableWorkerTab(tabId) &&
+            !keptAtCloseIds.has(resolveCaptureTaskTabId(tabId)),
+        );
+        return await closeTrackedCaptureTaskWorkerTabs(taskId, workerTabIds);
+      },
     });
     captureTaskPendingWorkerTabIds.delete(taskId);
     captureTaskOwnerCoordinator?.clearTask(taskId);
@@ -17476,6 +17545,280 @@ async function releaseStableUnattendedCaptureTaskResourcesOnly(
   }
   captureTaskOwnerCoordinator?.clearTask(taskId);
   return {released: true, taskId, reason: 'already_absent'};
+}
+
+// 持久采集辅助（Debug 会话 / 原生标签组）的“可证明残留”判定。
+// 只覆盖稳定的 unattended-capture:<requestId>：单一请求槽 + 执行锁是它唯一的
+// 存活凭证。旧任务被停止/取消、或以 PREVIOUS_CAPTURE_STOP_UNCONFIRMED 收尾后，
+// 请求槽已换到下一项，它的 END 被 attempt 围栏忽略，会话就一直挂在共享的
+// 来源页上，让后续每个 BEGIN 撞 starvoice_active、每次列表中继撞
+// relay_mismatch。判定为残留只允许释放 Debug/标签组/工作页，从不改动
+// 执行锁、请求或停止确认证据；判定不了一律按存活处理。
+async function inspectUnattendedCaptureAssistResidue(
+  taskId = '',
+  {session = null, group = null} = {},
+) {
+  const identity = parseStableUnattendedCaptureTaskId(taskId);
+  if (!identity.unattended) {
+    return {
+      unattended: false,
+      residue: false,
+      reason: 'not_unattended_stable_task',
+    };
+  }
+  if (captureTaskCleanupInProgress.has(identity.taskId)) {
+    return {unattended: true, residue: false, reason: 'cleanup_in_progress'};
+  }
+  let lock = null;
+  let request = null;
+  try {
+    [lock, request] = await Promise.all([
+      readStoredCaptureExecutionLock(),
+      readUnattendedKeywordRunRequest(),
+    ]);
+  } catch {
+    // 读不到执行锁或请求槽就证明不了残留：按存活处理，调用方保持 0.4.14 的
+    // 结果（BEGIN 仍 starvoice_active、中继仍 relay_mismatch、END 仍 ignored）。
+    return {
+      unattended: true,
+      residue: false,
+      reason: 'residue_state_unreadable',
+    };
+  }
+  const resourceAttemptId = String(
+    session?.attemptId || group?.attemptId || '',
+  ).trim();
+  const currentAttemptId = String(request?.attemptId || '').trim();
+  const verdict = (residue, reason) => ({
+    unattended: true,
+    residue,
+    reason,
+    taskId: identity.taskId,
+    requestId: identity.requestId,
+    resourceAttemptId,
+    currentRequestId: String(request?.id || '').trim(),
+    currentAttemptId,
+    // 槽里仍在跑的请求（另一请求或本请求的新轮次）及其 runner/平台页：
+    // 回收残留时这些 Tab 可能正被它使用，不能当旧工作页关掉。
+    currentRequestActive: Boolean(
+      request && !isTerminalUnattendedRunStatus(request.status),
+    ),
+    currentRequestTabIds: [
+      request?.runnerTabId,
+      request?.progress?.runnerTabId,
+    ]
+      .map((tabId) => resolveCaptureTaskTabId(tabId))
+      .filter(Boolean),
+    liveHolderTabId: resolveCaptureTaskTabId(lock?.holderTabId),
+  });
+  // 执行锁仍绑定本任务（不论轮次、是否过期）：要么是当前存活执行，要么
+  // 由它自己的恢复/收尾路径带着停止证据释放，这里不抢。
+  if (
+    lock &&
+    String(lock.owner || '') === 'unattended_keyword_plan' &&
+    String(lock.captureTaskId || '').trim() === identity.taskId
+  ) {
+    return verdict(false, 'execution_lock');
+  }
+  if (!request) return verdict(true, 'request_absent');
+  if (String(request.id || '').trim() !== identity.requestId) {
+    return verdict(true, 'request_mismatch');
+  }
+  const attemptSuperseded = Boolean(
+    resourceAttemptId &&
+      currentAttemptId &&
+      resourceAttemptId !== currentAttemptId,
+  );
+  if (isTerminalUnattendedRunStatus(request.status)) {
+    if (attemptSuperseded) return verdict(true, 'request_terminal');
+    // 同一轮次的终态收尾会把本会话的来源页当作停止目标。停止确认落盘前
+    // 不回收，避免削弱 PREVIOUS_CAPTURE_STOP_UNCONFIRMED 的证据链。
+    const stopStage = String(
+      readExactUnattendedStopConfirmation(request)?.stage || '',
+    );
+    if (
+      stopStage === 'source_stopped' ||
+      stopStage === 'runtime_released' ||
+      buildUnattendedLocalClosureKeyFromRequest(request)
+    ) {
+      return verdict(true, 'request_terminal');
+    }
+    return verdict(false, 'terminal_cleanup_pending');
+  }
+  if (attemptSuperseded) return verdict(true, 'attempt_superseded');
+  return verdict(false, 'unattended_run_request');
+}
+
+async function readActiveTabIdsFailSoft() {
+  try {
+    const tabs = await chrome.tabs.query({active: true});
+    return (Array.isArray(tabs) ? tabs : []).map((tab) => tab?.id);
+  } catch {
+    return [];
+  }
+}
+
+async function releaseResidualUnattendedCaptureAssist(
+  taskId,
+  {
+    session = null,
+    preserveTabIds = [],
+    stage = '',
+    deferToLiveRequest = false,
+    preserveActiveTabs = false,
+  } = {},
+) {
+  const normalizedTaskId = String(taskId || '').trim();
+  const group = captureTaskTabGroupManager.getTask(normalizedTaskId);
+  const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(normalizedTaskId);
+  if (!session && !group && pendingWorkerTabIds.length === 0) {
+    return {released: false, reason: 'capture_assist_absent'};
+  }
+  const residue = await inspectUnattendedCaptureAssistResidue(
+    normalizedTaskId,
+    {session, group},
+  );
+  if (!residue.residue) {
+    return {released: false, reason: residue.reason};
+  }
+  // 不在后继任务生命周期内的调用方（迟到 END）：槽里已有存活的后继时，它的
+  // runner 可能已经 switch-platform-tab 选中本任务的旧工作页当来源、还没
+  // BEGIN。此时谁的 Tab 都不能动，留给后继自己的 BEGIN（保留其来源 Tab）或
+  // 列表中继（保留中继 Tab）回收。
+  if (deferToLiveRequest && residue.currentRequestActive) {
+    return {released: false, reason: 'successor_active'};
+  }
+  // 上面的判定和快照早于释放；释放要先清页面覆盖层、分离 Debug。runner 的
+  // switch-platform-tab 已与本回收串行，但派发新请求不在生命周期队列里
+  // （派发会直接激活平台页）。迟到 END 在真正关页前再判一次：槽里冒出存活
+  // 后继就一个工作页都不关，否则再保留此刻的前台 Tab、锁持有 Tab 与槽内
+  // 请求的 runner/平台页。
+  let workerTabsKept = false;
+  const resolveKeptWorkerTabIds = deferToLiveRequest
+    ? async () => {
+        const inUse = await readTabIdsInUseForResidueClose({
+          preserveActiveTabs,
+        });
+        if (inUse === null) workerTabsKept = true;
+        return inUse;
+      }
+    : null;
+  try {
+    await releaseCaptureTaskResourcesWithRetry(
+      {
+        taskId: normalizedTaskId,
+        reason: 'residual_capture_assist_reclaimed',
+        debugSnapshot: session,
+        preserveTabIds: [
+          ...preserveTabIds,
+          residue.liveHolderTabId,
+          ...residue.currentRequestTabIds,
+          // activateOrCreatePlatformTab 总会激活它交出去的平台页；前台 Tab
+          // 可能刚被别的 runner/手动采集选作来源，不当旧工作页关掉。
+          ...(preserveActiveTabs ? await readActiveTabIdsFailSoft() : []),
+        ],
+        resolveKeptWorkerTabIds,
+      },
+      {attempts: 3},
+    );
+  } catch (error) {
+    // 释放失败时残留仍在，调用方按原语义处理（END 仍 ignored、中继仍
+    // relay_mismatch），下一次 BEGIN/中继/END 会再试。
+    console.warn('[CaptureTask] residual capture assist cleanup pending:', {
+      taskId: normalizedTaskId,
+      stage,
+      error: String(error?.message || error || '').slice(0, 320),
+    });
+    return {released: false, reason: 'cleanup_failed'};
+  }
+  console.warn('[CaptureTask] residual capture assist reclaimed:', {
+    taskId: normalizedTaskId,
+    reason: residue.reason,
+    stage,
+    workerTabsKept,
+  });
+  return {
+    released: true,
+    reason: residue.reason,
+    ...(workerTabsKept ? {workerTabsKept: true} : {}),
+  };
+}
+
+// 迟到 END 关页前的最后判定。槽里是非终态请求（释放途中新派发的后继）
+// 就返回 null：一个工作页都不关，已分离的旧页留给后继照常使用。读不到
+// 状态同样按“不关”处理。
+async function readTabIdsInUseForResidueClose({
+  preserveActiveTabs = false,
+} = {}) {
+  try {
+    const [lock, request] = await Promise.all([
+      readStoredCaptureExecutionLock(),
+      readUnattendedKeywordRunRequest(),
+    ]);
+    if (request && !isTerminalUnattendedRunStatus(request.status)) {
+      return null;
+    }
+    return [
+      lock?.holderTabId,
+      request?.runnerTabId,
+      request?.progress?.runnerTabId,
+      ...(preserveActiveTabs ? await readActiveTabIdsFailSoft() : []),
+    ];
+  } catch {
+    return null;
+  }
+}
+
+// 列表中继撞到另一任务的持久会话：只有可证明的无人值守残留才释放后继续
+// 中继（列表采集本身从不依赖 Debug）；存活会话仍按 relay_mismatch 拒绝。
+async function reclaimResidualCaptureAssistForRelay(tabId, session) {
+  const taskId = String(session?.taskId || '').trim();
+  if (!parseStableUnattendedCaptureTaskId(taskId).unattended) {
+    return {released: false, reason: 'not_unattended_stable_task'};
+  }
+  // 与 BEGIN/END 同队列：判定与释放之间不能插进新轮次的 BEGIN。
+  return await runCaptureTaskLifecycleOperation(async () => {
+    const current = captureDebugSessionManager.getSession(tabId);
+    if (
+      !current?.persistent ||
+      String(current.taskId || '').trim() !== taskId
+    ) {
+      return {released: false, reason: 'capture_assist_changed'};
+    }
+    return await releaseResidualUnattendedCaptureAssist(taskId, {
+      session: current,
+      preserveTabIds: [tabId],
+      stage: 'relay',
+    });
+  });
+}
+
+// 被 attempt 围栏忽略的 END：请求槽已换走时，本任务的采集辅助整体是残留；
+// 同一请求的旧轮次 END 只能释放仍绑定在“它自己那一轮”的会话，绝不碰
+// 新轮次（同一个稳定 taskId）的会话。迟到 END 不在任何新任务的生命周期里：
+// 槽里还有存活的后继就不释放（交给后继 BEGIN/中继），只在槽空或已终态时
+// 回收，并且保留前台 Tab 与槽内请求的 runner/平台页。
+async function releaseResidualCaptureAssistForStaleEnd(taskId, attemptFence) {
+  const session = captureDebugSessionManager.getSessionByTaskId(taskId);
+  if (attemptFence?.requestMatches === true) {
+    const incomingAttemptId = String(
+      attemptFence.incomingAttemptId || '',
+    ).trim();
+    const resourceAttemptId = String(
+      session?.attemptId ||
+        captureTaskTabGroupManager.getTask(taskId)?.attemptId ||
+        '',
+    ).trim();
+    if (!incomingAttemptId || resourceAttemptId !== incomingAttemptId) {
+      return {released: false, reason: 'capture_assist_attempt_mismatch'};
+    }
+  }
+  return await releaseResidualUnattendedCaptureAssist(taskId, {
+    session,
+    stage: 'end',
+    deferToLiveRequest: true,
+    preserveActiveTabs: true,
+  });
 }
 
 async function readUnattendedParentForCaptureTask(taskId = '') {
@@ -17746,6 +18089,7 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
     reason = 'unattended_runtime_recovery',
     request = null,
     preserveLockBinding = false,
+    preserveTabIds = [],
   } = {},
 ) {
   // Recovery can clear the persisted lock binding before every asynchronous
@@ -17760,7 +18104,7 @@ async function releaseUnattendedCaptureTaskResourcesForRecovery(
   const pendingWorkerTabIds = getTrackedCaptureTaskWorkers(taskId);
   if (debugSnapshot || groupSnapshot || pendingWorkerTabIds.length > 0) {
     await releaseCaptureTaskResourcesWithRetry(
-      {taskId, reason, debugSnapshot},
+      {taskId, reason, debugSnapshot, preserveTabIds},
       {attempts: 3},
     );
   } else {
@@ -17978,6 +18322,9 @@ async function reclaimSupersededUnattendedCaptureTaskForBegin({
         // Releasing the old attempt's browser resources must not erase the
         // replacement attempt binding while BEGIN continues.
         preserveLockBinding: true,
+        // 新轮次可能恰好选中了旧轮次的工作页当来源（前台/最大 id），它不能
+        // 被当作旧工作页关掉，否则本次 BEGIN 自己丢了来源 Tab。
+        preserveTabIds: [normalizedSourceTabId],
       },
     );
   }
@@ -18005,12 +18352,20 @@ async function performEndCaptureTask(message) {
     attemptId: request.attemptId,
   });
   if (attemptFence.unattended && !attemptFence.current) {
+    // 旧轮次 END 本身仍被忽略（不结算、不取消）；但它所属任务若已被证明是
+    // 残留（请求槽换走，或会话仍停在这个旧轮次），且槽里没有存活的后继，
+    // 顺手释放其采集辅助。有后继时由后继的 BEGIN/列表中继回收。
+    const residual = await releaseResidualCaptureAssistForStaleEnd(
+      taskId,
+      attemptFence,
+    );
     return {
       taskId,
-      released: false,
+      released: residual.released === true,
       ignored: true,
       reason: 'stale_unattended_attempt',
       details: describeStaleUnattendedAttempt(attemptFence),
+      residualCaptureAssist: residual,
     };
   }
   const targetedAttempt = attemptFence.unattended
@@ -19541,7 +19896,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (type === 'onstarvoice:switch-platform-tab') {
-        const data = await activateOrCreatePlatformTab(message?.platform);
+        // 与 BEGIN/END 同一生命周期队列：回收残留（迟到 END / 列表中继）在
+        // 释放途中关闭旧工作页时，runner 不能恰好把那个页选作来源。
+        const data = await runCaptureTaskLifecycleOperation(() =>
+          activateOrCreatePlatformTab(message?.platform),
+        );
         sendResponse({ ok: true, data });
         return;
       }
@@ -19698,7 +20057,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             }
           }
         }
-        const existingDebugSession =
+        let existingDebugSession =
           captureDebugSessionManager.getSession(relayTabId);
         if (
           contentAction === 'cancelCapture' &&
@@ -19715,6 +20074,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           globalThis.OnStarvoiceCaptureDebugSession.isListCaptureAction(
             contentAction,
           );
+        if (
+          existingDebugSession?.persistent &&
+          isListCaptureAction &&
+          (!requestedTaskId ||
+            requestedTaskId !== existingDebugSession.taskId)
+        ) {
+          // 旧任务遗留在本页的采集辅助：可证明残留则先释放，再按无会话
+          // 正常中继；存活会话不动，下面仍抛 capture_task_relay_mismatch。
+          await reclaimResidualCaptureAssistForRelay(
+            relayTabId,
+            existingDebugSession,
+          );
+          existingDebugSession =
+            captureDebugSessionManager.getSession(relayTabId);
+        }
         const supportedListPlatform =
           platform === 'xiaohongshu' || platform === 'douyin';
         let persistentRelayTaskId = '';

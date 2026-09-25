@@ -268,3 +268,133 @@ test('Keyword content request carries the publish window without adding it to si
   const handler = contentSource.slice(contentSource.indexOf('async function handleCaptureKeywordNotes('), contentSource.indexOf('async function handleDetectSearchSortDimension('));
   assert.match(handler, /publishTimeWindow: request\.publishTimeWindow/u);
 });
+
+test('XHS filter settling keeps the 0.4.14 8 second window and reports bounded diagnostics', async () => {
+  const p = page();
+  const result = await p.witness.waitForSettled({changed: true, wait: p.wait});
+  assert.equal(result.verified, false);
+  assert.equal(result.reason, 'result_transition_unconfirmed');
+  assert.equal(result.elapsedMs, 8000);
+  assert.equal(result.polls, 41);
+  assert.equal(result.baselineCardCount, 2);
+  assert.equal(result.cardCount, 2);
+  const explicit = page();
+  const short = await explicit.witness.waitForSettled({changed: true, wait: explicit.wait, timeoutMs: 4000});
+  assert.equal(short.verified, false);
+  assert.equal(short.elapsedMs, 4000);
+  assert.equal(short.polls, 21);
+  // A longer timeout cannot stretch the window past the fixed 42-poll bound.
+  const longer = page();
+  const capped = await longer.witness.waitForSettled({changed: true, wait: longer.wait, timeoutMs: 15000});
+  assert.equal(capped.verified, false);
+  assert.equal(capped.elapsedMs, 8400);
+  assert.equal(capped.polls, 42);
+});
+
+test('XHS filter settling keeps its poll bound when the clock moves backwards', async () => {
+  for (const timeoutMs of [undefined, 8000, 0, Number.NaN, Infinity]) {
+    const body = new Element('body');
+    const scope = body.append(new Element('search-results'));
+    const root = scope.append(new Element('feeds-container'));
+    root.append(new Element('note-item')).append(new Element('', '', {href: '/explore/665df0000000000000000001'}));
+    let clock = 1_000_000;
+    let waits = 0;
+    const witness = beginXhsSearchFilterEvidence({
+      documentRef: {body, documentElement: {}, querySelector: selector => body.querySelector(selector)},
+      windowRef: {getComputedStyle: () => ({display: 'block', visibility: 'visible', opacity: '1'})},
+      Observer: null,
+      now: () => { clock -= 50; return clock; },
+    });
+    const result = await witness.waitForSettled({changed: true, wait: async () => { waits += 1; }, ...(timeoutMs === undefined ? {} : {timeoutMs})});
+    assert.equal(result.verified, false);
+    assert.equal(result.polls, 42, String(timeoutMs));
+    assert.equal(waits, 42, String(timeoutMs));
+    assert.equal(result.elapsedMs, 0);
+    assert.equal(result.baselineCardCount, 1);
+  }
+});
+
+test('XHS verified filter evidence carries the same diagnostics without changing the verdict', async () => {
+  const p = page();
+  const result = await p.witness.waitForSettled({changed: false, wait: p.wait});
+  assert.equal(result.verified, true);
+  assert.equal(result.reason, 'already_active');
+  assert.equal(result.polls, 2);
+  assert.equal(result.elapsedMs, 200);
+  assert.equal(result.baselineCardCount, 2);
+  const replaced = page();
+  replaced.replaceCards(['665df0000000000000000009']);
+  const changed = await replaced.witness.waitForSettled({changed: true, wait: replaced.wait});
+  assert.equal(changed.verified, true);
+  assert.equal(changed.reason, 'result_ids_changed');
+  assert.equal(changed.baselineCardCount, 2);
+  assert.equal(changed.cardCount, 1);
+  assert.equal(isXhsSearchTimeFilterVerified({
+    results: [{field: 'publishTime', value: 'day', applied: true}],
+    xhsTimeFilterEvidence: {...changed, active: true},
+  }, 'day'), true);
+});
+
+function waitWithEventAt(p, atMs, event) {
+  let elapsed = 0;
+  return async (ms) => {
+    await p.wait(ms);
+    elapsed += ms;
+    if (elapsed === atMs) event();
+  };
+}
+
+test('XHS list changes that only arrive at or after 8 seconds never verify a changed filter', async () => {
+  const ids = ['665df0000000000000000001', '665df0000000000000000002', '665df0000000000000000003'];
+  const events = {
+    reorder: (p) => p.replaceCards([ids[1], ids[0], ids[2]]),
+    headRemoved: (p) => {
+      const first = p.root.children[0];
+      p.root.remove(first);
+      p.emit([{removedNodes: [first]}]);
+    },
+    headHidden: (p) => {
+      p.root.children[0].hidden = true;
+      p.emit([]);
+    },
+    newIds: (p) => p.replaceCards(['665df0000000000000000009']),
+    spinner: (p) => {
+      const loading = p.scope.append(new Element('loading'));
+      p.emit();
+      p.scope.remove(loading);
+      p.emit([{removedNodes: [loading]}]);
+    },
+    cleared: (p) => {
+      p.replaceCards([]);
+      p.scope.append(new Element('empty-container', '没有找到相关笔记'));
+      p.emit();
+    },
+  };
+  for (const [name, event] of Object.entries(events)) {
+    for (const atMs of [8000, 10000]) {
+      const p = page(ids);
+      const result = await p.witness.waitForSettled({changed: true, wait: waitWithEventAt(p, atMs, () => event(p))});
+      assert.equal(result.verified, false, `${name} at ${atMs}`);
+      assert.equal(result.elapsedMs, 8000, `${name} at ${atMs}`);
+      assert.equal(result.polls, 41, `${name} at ${atMs}`);
+      if (atMs === 10000) assert.equal(result.signature, ids.join('|'), name);
+    }
+  }
+  // The unchanged 0.4.14 boundary: a new ID set seen by two polls inside the window still verifies.
+  const inside = page(ids);
+  const insideResult = await inside.witness.waitForSettled({changed: true, wait: waitWithEventAt(inside, 7800, () => events.newIds(inside))});
+  assert.equal(insideResult.verified, true);
+  assert.equal(insideResult.reason, 'result_ids_changed');
+  assert.equal(insideResult.elapsedMs, 8000);
+  assert.equal(insideResult.polls, 41);
+});
+
+test('XHS an already-active time filter still gives up after the original 8 seconds', async () => {
+  const p = page();
+  p.scope.append(new Element('loading'));
+  p.emit();
+  const result = await p.witness.waitForSettled({changed: false, wait: p.wait});
+  assert.equal(result.verified, false);
+  assert.equal(result.elapsedMs, 8000);
+  assert.equal(result.polls, 41);
+});

@@ -129,18 +129,26 @@ export function beginXhsSearchFilterEvidence({
       const startedAt = now();
       let previous = '';
       let stable = 0;
+      let polls = 0;
       let evidence = sample();
+      // Bounded diagnostics for failure reporting; never part of the verification decision.
+      const diagnostics = () => ({
+        baselineCardCount: baseline.cards.length,
+        elapsedMs: Math.min(Math.max(Math.round(Number(now() - startedAt) || 0), 0), 600000),
+        polls,
+      });
       // Poll count also bounds this loop if the wall clock moves backwards.
       for (let poll = 0; poll < 42; poll += 1) {
+        polls = poll + 1;
         evidence = sample();
         const accepted = evidence.ready && (!changed || evidence.transitioned);
         stable = accepted ? (evidence.signature === previous ? stable + 1 : 1) : 0;
         previous = evidence.signature;
-        if (stable >= 2) return {...evidence, verified: true, changed, reason: changed ? evidence.reason : 'already_active'};
+        if (stable >= 2) return {...evidence, verified: true, changed, reason: changed ? evidence.reason : 'already_active', ...diagnostics()};
         if (now() - startedAt >= timeoutMs || typeof wait !== 'function') break;
         await wait(200);
       }
-      return {...evidence, verified: false, changed};
+      return {...evidence, verified: false, changed, ...diagnostics()};
     },
   };
 }
