@@ -3,12 +3,25 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.15',
+  latestVersion: '0.4.16',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-24',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.15-20260924.zip',
+  releaseDate: '2026-09-25',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.16-20260925.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.16',
+      releaseDate: '2026-09-25',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {title: '旧采集页面停止后自动放行', desc: '节点因“旧采集页面未能安全停止”暂停接单时，系统会请节点核对旧页面，确认已停止后自动恢复接单。核对不刷新任何页面，最多对仍只跑着旧采集的页面发送精确停止信号，并关闭该任务自己的运行页；核对不通过时后台会说明原因和需要处理的页面。需更新 Extension。'},
+            {title: '扩展重载或升级前打开的平台页面无法自动确认', desc: '升级后请重启 Chrome；否则需要在该电脑关闭或刷新这些页面后由系统再核对，或由管理员在后台点「确认旧页面已停止」。'},
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.15',
       releaseDate: '2026-09-24',

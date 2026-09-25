@@ -70,7 +70,14 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.15<span class="date">2026-09-24</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.16<span class="date">2026-09-25</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>旧采集页面停止后自动放行：</strong>节点因“旧采集页面未能安全停止”暂停接单时，系统会请节点核对旧页面，确认已停止后自动恢复接单；核对不刷新任何页面，最多对仍只跑着旧采集的页面发送精确停止信号，并关闭该任务自己的运行页，核对不通过时后台说明原因和需要处理的页面。需更新 Extension。</li>
+            <li><strong>升级后请重启 Chrome：</strong>扩展重载或升级前打开的平台页面无法自动确认，需要在该电脑关闭或刷新这些页面后由系统再核对，或由管理员在后台点「确认旧页面已停止」。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.15<span class="date">2026-09-24</span></h3>
           <ul>
             <li><strong>停止任务后不再残留采集辅助：</strong>无人值守任务被停止或取消后，留在小红书来源页的旧采集辅助会在下一个无人值守任务启动或列表采集时释放，不再导致下一任务的关键词连续报“采集辅助任务不一致”；不会关闭或刷新来源页。需更新 Extension。</li>
             <li><strong>自动搜索不再误入 AI 搜索页：</strong>标签页停在小红书 AI 搜索页（/search_result_ai）等非标准路由时，自动搜索改为打开标准搜索页 /search_result，不再因筛选面板不同而连续报时间筛选未确认。需更新 Extension。</li>
