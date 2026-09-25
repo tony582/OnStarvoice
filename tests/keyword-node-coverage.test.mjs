@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {keywordCoverageSkipReason} from '../server/services/keyword-node-coverage.js';
+import {
+  KEYWORD_COVERAGE_SKIP_MESSAGES,
+  keywordCoverageSkipReason,
+} from '../server/services/keyword-node-coverage.js';
 
 const now = Date.parse('2026-09-22T10:00:00Z');
 const ago = minutes => new Date(now - minutes * 60_000).toISOString();
@@ -67,4 +70,27 @@ test('explicit failures settle without exhausting automatic retries; completed s
   input.item.status = 'pending'; input.parent.metadata.publishedAt = ago(20);
   input.nodeTasks = [{status: 'completed', finished_at: ago(1)}];
   assert.equal(keywordCoverageSkipReason(input, now), '');
+});
+
+test('a node held by an unconfirmed old-page stop is reported as fenced, not unresponsive', () => {
+  assert.match(KEYWORD_COVERAGE_SKIP_MESSAGES.keyword_node_stop_fenced, /旧采集页面尚未确认停止/u);
+  const input = fixture();
+  input.parent.metadata.publishedAt = ago(3);
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_response');
+  input.stopFenced = true;
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_stop_fenced');
+  input.parent.metadata.publishedAt = ago(2);
+  assert.equal(keywordCoverageSkipReason(input, now), '', 'the same three-minute allowance applies');
+  // An undelivered create behind the fence is explained the same way.
+  input.child = {status: 'pending', created_at: ago(4), started_at: null, heartbeat_at: null};
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_stop_fenced');
+  // Real failures and real progress stalls keep their own reasons.
+  input.child = {status: 'needs_action', created_at: ago(20)};
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_failed');
+  input.child = {status: 'running', created_at: ago(25), started_at: ago(25), heartbeat_at: ago(0),
+    business_progress_at: ago(11)};
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress');
+  input.child = null;
+  input.agent.last_liveness_at = ago(3);
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_offline');
 });

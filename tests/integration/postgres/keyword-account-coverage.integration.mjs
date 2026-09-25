@@ -15,7 +15,7 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
   const {getPool, closePool} = await import('../../../server/db/pool.js');
   const {withTransaction} = await import('../../../server/db/init.js');
   const {dispatchNextElasticWorkItem, mirrorTaskSnapshot} = await import('../../../server/routes/capture-cloud.js');
-  const {normalizeCloudTaskSnapshot} = await import('../../../server/services/capture-cloud.js');
+  const {findCaptureAgentExecutionSlotBlocker, normalizeCloudTaskSnapshot} = await import('../../../server/services/capture-cloud.js');
   const {reconcileKeywordNodeCoverage} = await import('../../../server/services/keyword-node-coverage.js');
   const {createApp} = await import('../../../server/app.js');
   const {hashPassword} = await import('../../../server/services/auth-service.js');
@@ -339,6 +339,35 @@ test('per-account keyword coverage persists through HTTP, dispatch, receipts and
       assert.equal((await f.items(run.body.runTaskId)).filter(item => item.metadata.pinnedAgentId).length, 2);
     });
   }
+
+  await t.test('coverage never erases an unconfirmed old-page stop and names the fence for the rest', async st => {
+    const f = await fixture(st, 'xiaohongshu');
+    const published = await f.publish();
+    const stuck = await f.claim(1);
+    const stopError = {code: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED', message: '旧采集页面未能安全停止，已阻止自动恢复'};
+    await pool.query("UPDATE capture_tasks SET status='needs_action', error=$2 WHERE id=$1", [stuck.childTaskId, stopError]);
+    await pool.query("UPDATE capture_agent_commands SET status='completed' WHERE id=$1", [stuck.commandId]);
+    await pool.query(`UPDATE capture_tasks SET created_at=now()-interval '5 minutes',
+      metadata=metadata || jsonb_build_object('publishedAt',now()-interval '4 minutes') WHERE id=$1`, [published.id]);
+    for (const keyword of keywords) assert.equal(await f.complete(await f.claim(0)), keyword);
+    const result = await reconcileKeywordNodeCoverage({tenantId: f.tenant.id, parentTaskIds: [published.id]});
+    assert.equal(result.skipped, 2);
+    const child = await f.row('capture_tasks', stuck.childTaskId);
+    assert.equal(child.status, 'superseded');
+    assert.equal(child.error.code, 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED', 'the fence code is kept');
+    assert.equal(child.error.message, stopError.message);
+    assert.equal(child.error.coverageReason, 'keyword_node_failed');
+    assert.match(child.error.coverageMessage, /本轮未覆盖/u);
+    assert.equal((await f.row('capture_task_items', stuck.itemId)).error.code, 'keyword_node_failed');
+    const other = (await f.items(published.id)).find(item =>
+      item.metadata.pinnedAgentId === f.agentIds[1] && item.id !== stuck.itemId);
+    assert.equal(other.status, 'skipped');
+    assert.equal(other.error.code, 'keyword_node_stop_fenced', 'the fenced node is not called unresponsive');
+    const blocker = await withTransaction(tx => findCaptureAgentExecutionSlotBlocker(tx, f.tenant.id, f.agentIds[1]));
+    assert.equal(blocker?.id, stuck.childTaskId, 'the node stays fenced until its old page is proven stopped');
+    assert.equal(blocker.reason, 'previous_capture_stop_unconfirmed');
+    assert.equal((await f.row('capture_tasks', published.id)).status, 'completed_with_warnings');
+  });
 
   await t.test('default shared collection still creates one work item per unique keyword', async st => {
     const f = await fixture(st);
