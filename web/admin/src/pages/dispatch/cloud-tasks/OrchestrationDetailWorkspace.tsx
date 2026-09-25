@@ -50,6 +50,12 @@ import {
   orchestrationItemStatusBucket,
   summarizeOrchestrationItems,
 } from './recovery-presentation.js'
+import {
+  findExecutionStopFence,
+  formatStopFenceElapsed,
+  formatStopFenceTime,
+  isAgentStopFenced,
+} from './stop-fence-presentation.mjs'
 
 const SORT_LABELS: Record<string, string> = {
   comprehensive: '综合排序',
@@ -532,16 +538,21 @@ export function OrchestrationDetailWorkspace({
     }
     return attempted
   }, [detail?.attempts])
+  // 停止保护只随 /overview 的节点返回（批次详情的 agents/retryCandidates 不带），按 id 交叉排除。
+  const stopFencedAgentIds = useMemo(
+    () => new Set(availableAgents.filter(isAgentStopFenced).map(agent => agent.id)),
+    [availableAgents],
+  )
   const keywordRetryCandidates = useMemo(() => {
     if (!detail || contentPatrol) return []
     const source = Array.isArray(detail.retryCandidates)
       ? detail.retryCandidates
       : availableAgents
-    return source.filter(agent => agentSupportsKeywordRetry(
+    return source.filter(agent => !stopFencedAgentIds.has(agent.id) && agentSupportsKeywordRetry(
         agent,
         detail.orchestration.platform,
       ))
-  }, [availableAgents, contentPatrol, detail])
+  }, [availableAgents, contentPatrol, detail, stopFencedAgentIds])
   const keywordRetryAllocation = useMemo(() => {
     return allocateKeywordRetryItems({
       items: keywordRetryItems,
@@ -728,6 +739,7 @@ export function OrchestrationDetailWorkspace({
     return availableAgents
       .filter(agent =>
         agent.id !== attentionContext.sourceAgentId &&
+        !stopFencedAgentIds.has(agent.id) &&
         agent.status === 'active' &&
         agent.online &&
         (agent.allowed_platforms.length === 0 || agent.allowed_platforms.includes(detail.orchestration.platform)) &&
@@ -737,7 +749,7 @@ export function OrchestrationDetailWorkspace({
       .sort((left, right) =>
         `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN'),
       )
-  }, [attentionContext, availableAgents, detail])
+  }, [attentionContext, availableAgents, detail, stopFencedAgentIds])
 
   const automaticRecoveryStates = useMemo(() => {
     if (
@@ -1529,7 +1541,7 @@ export function OrchestrationDetailWorkspace({
                     <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
                       {handoffCandidates.length > 0
                         ? `系统正在按词分配后续 ${attentionContext.unstartedCount} 个关键词`
-                        : `后续 ${attentionContext.unstartedCount} 个关键词正在等待空闲 Agent`}
+                        : `后续 ${attentionContext.unstartedCount} 个关键词正在等待空闲 Agent${stopFencedAgentIds.size > 0 ? `；${stopFencedAgentIds.size} 个节点等待确认旧页面已停止` : ''}`}
                     </span>
                   )}
                 </div>
@@ -1583,7 +1595,7 @@ export function OrchestrationDetailWorkspace({
                 <span className="inline-flex min-h-9 items-center rounded-lg border border-primary/20 bg-primary/[0.045] px-3 text-xs font-medium text-primary">
                   {eachAgentCoverage ? '勾选词等待对应节点，其余词等待空闲节点领取' : keywordRetryCandidates.length > 0
                     ? '等待空闲 Agent 心跳领取；真正下发后会显示目标 Agent 和命令状态'
-                    : '当前没有兼容的空闲 Agent；页面每 5 秒刷新一次真实状态'}
+                    : `当前没有兼容的空闲 Agent；页面每 5 秒刷新一次真实状态${stopFencedAgentIds.size > 0 ? `；${stopFencedAgentIds.size} 个节点等待确认旧页面已停止` : ''}`}
                 </span>
               ) : <div className="flex flex-col items-end gap-1">
                 <Button
@@ -2125,9 +2137,18 @@ export function OrchestrationDetailWorkspace({
                               {(() => {
                                 const executionItems = sortedItems.filter(item => item.execution_task_id === executionTaskId(execution))
                                 const itemCount = executionItemIds(execution).length || executionItems.length || (execution.keywords || []).length
+                                // 该子任务正挡着原节点接单（旧采集页面未确认停止）；依据是 /overview 的 stop_fence.tasks。
+                                const stopFence = findExecutionStopFence(executionTaskId(execution), availableAgents)
+                                const stopFenceSince = Date.parse(String(stopFence?.task.fenced_at || ''))
                                 return <>
                               <div className="flex items-center justify-between gap-2">
-                                <span className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold ${statusTone(String(execution.status || ''))}`}>{statusLabel(String(execution.status || ''))}</span>
+                                {stopFence ? (
+                                  <span className="rounded-full border border-status-orange/30 bg-status-orange/10 px-2 py-0.5 text-[9px] font-semibold text-amber-700 dark:text-amber-300">
+                                    {String(execution.status || '') === 'superseded' ? '已转交' : statusLabel(String(execution.status || ''))} · 旧页面未确认停止
+                                  </span>
+                                ) : (
+                                  <span className={`rounded-full border px-2 py-0.5 text-[9px] font-semibold ${statusTone(String(execution.status || ''))}`}>{statusLabel(String(execution.status || ''))}</span>
+                                )}
                                 <span className="text-[10px] text-muted-foreground">{itemCount} {contentPatrol ? '条帖子' : '个工作项'}</span>
                               </div>
                               <div className="mt-1.5 truncate font-mono text-[10px] text-muted-foreground">{executionTaskId(execution) || '未返回子任务 ID'}</div>
@@ -2141,6 +2162,14 @@ export function OrchestrationDetailWorkspace({
                               )}
                               {executionOnline(execution) === false && <p className="mt-1 text-[10px] text-amber-700 dark:text-amber-300">节点离线；子任务保持服务端返回的当前状态。</p>}
                               {execution.message && <p className="mt-1 text-[10px] leading-4 text-muted-foreground">{execution.message}</p>}
+                              {stopFence && (
+                                <p className="mt-1 text-[10px] leading-4 text-amber-700 dark:text-amber-300">
+                                  该节点暂不接单（{[
+                                    stopFence.task.fenced_at ? `自 ${formatStopFenceTime(stopFence.task.fenced_at)}` : '',
+                                    Number.isFinite(stopFenceSince) ? formatStopFenceElapsed(nowMs - stopFenceSince) : '',
+                                  ].filter(Boolean).join('，') || '旧采集页面未确认停止'}），请在「执行节点」中处理
+                                </p>
+                              )}
                                 </>
                               })()}
                             </div>

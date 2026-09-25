@@ -659,3 +659,77 @@ test("settled root tasks auto-recover while retaining the legacy manual fallback
   assert.match(page, /expectedRevision/u);
   assert.match(page, /重试结果仍汇总在这条原任务里/u);
 });
+
+test("admin explains stop-fenced agents and releases them only through a guarded dialog", async () => {
+  const [page, rail, panel, presentation, lib, picker, composer, detail, overview, mobile] = await Promise.all([
+    read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/AgentRail.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/StopFencePanel.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/stop-fence-presentation.mjs"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/lib.ts"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/AgentPicker.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/OrchestrationComposerDrawer.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/OrchestrationDetailWorkspace.tsx"),
+    read("web/admin/src/pages/OverviewPage.tsx"),
+    read("web/admin/src/mobile/MobileApp.tsx"),
+  ]);
+
+  // AgentRail 通过面板里的 Radix 对话框人工确认，禁止 window.confirm；面板文件只导出组件（react-refresh）。
+  assert.match(rail, /<StopFencePanel/u);
+  assert.match(panel, /<ReleaseStopFenceDialog/u);
+  assert.match(panel, /<Dialog\.Root/u);
+  assert.doesNotMatch(panel, /window\.confirm/u);
+  assert.doesNotMatch(rail, /window\.confirm/u);
+  assert.deepEqual(
+    [...panel.matchAll(/^export\s+(?:const|function|let|class)\s+(\w+)/gmu)].map(match => match[1]),
+    ["StopFencePanel", "ReleaseStopFenceDialog"],
+  );
+  assert.match(panel, /我已在该电脑检查，旧采集页面已停止或已关闭/u);
+  assert.match(panel, /disabled=\{confirming \|\| !checked/u);
+  assert.match(panel, /可能触发平台风控/u);
+  assert.match(panel, /!mobileAgent && \(/u);
+  // expectedTaskIds 取全部已转交围栏（含超出 20 条列表的），不能只取列出的行，否则确认接口必然 409；
+  // 而且取打开对话框那一刻的快照，不取之后轮询到的最新一次，否则运营没看到的新围栏会被一并放行。
+  assert.match(panel, /setConfirmSnapshot\(notice\)/u);
+  assert.match(panel, /notice=\{confirmSnapshot\}/u);
+  assert.match(panel, /onConfirm\(agent, confirmSnapshot\.confirmTaskIds, note\)/u);
+  assert.doesNotMatch(panel, /onConfirm\(agent, notice\./u);
+  assert.doesNotMatch(panel, /supersededTasks\.map\(task => task\.id\)/u);
+  assert.match(panel, /!checked \|\| !notice\.canConfirm \|\| Boolean\(drift\)/u);
+
+  // DispatchPage 调两个后台接口，并把错误抛回对话框显示。
+  assert.match(page, /`\/capture-cloud\/agents\/\$\{agent\.id\}\/stop-fence\/recheck`/u);
+  assert.match(page, /`\/capture-cloud\/agents\/\$\{agent\.id\}\/stop-fence\/confirm`/u);
+  assert.match(page, /\{ confirmation: '确认旧页面已停止', expectedTaskIds/u);
+  assert.match(page, /onRecheckStopFence=\{recheckStopFence\}/u);
+  assert.match(page, /onConfirmStopFence=\{confirmStopFence\}/u);
+  assert.match(page, /const confirmStopFence[\s\S]*?setActionError\(message\)\s*throw err/u);
+  // 服务端的“已排队”文案（含停止保护原因）不再被通用文案覆盖。
+  assert.match(page, /setFeedback\(serverMessage \|\|/u);
+
+  // 停止保护不禁用分配：可分配性判断不读 stop_fence。
+  for (const name of ["agentAssignmentBlockReason", "agentTaskTypeBlockReason"]) {
+    const start = lib.indexOf(`export function ${name}`);
+    assert.ok(start >= 0, name);
+    const body = lib.slice(start, lib.indexOf("\n}\n", start));
+    assert.doesNotMatch(body, /stop_fence|StopFence/u, name);
+  }
+  // 管理端只认服务端的 stop_fence.phase，不按错误码推断围栏。
+  assert.doesNotMatch(presentation.replace(/\/\/.*$/gmu, ""), /PREVIOUS_CAPTURE_STOP_UNCONFIRMED|error\??\.code/u);
+  assert.match(lib, /stop_fence\?: AgentStopFence \| null/u);
+
+  assert.match(picker, /等待确认旧页面已停止/u);
+  assert.match(picker, /分配后会排队，确认后执行/u);
+  assert.match(composer, /暂不领取：等待确认旧页面已停止/u);
+  assert.equal((detail.match(/!stopFencedAgentIds\.has\(agent\.id\)/gu) || []).length, 2);
+  assert.match(detail, /findExecutionStopFence\(executionTaskId\(execution\), availableAgents\)/u);
+  assert.match(detail, /请在「执行节点」中处理/u);
+
+  for (const ui of [overview, mobile]) {
+    assert.match(ui, /stopFenceBlockedAgentCount/u);
+    assert.match(ui, /capture_agent_stop_fence_blocked/u);
+    assert.match(ui, /label="待确认停止"/u);
+    assert.match(ui, /节点旧页面未确认停止，已暂停接单/u);
+    assert.match(ui, /label="恢复阻塞"/u);
+  }
+});

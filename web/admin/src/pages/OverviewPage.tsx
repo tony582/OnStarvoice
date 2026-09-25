@@ -51,6 +51,7 @@ interface OpsControlSummary {
       activeTaskCount?: number
       recoveredItemCount?: number
       sourceClosureBlockedCount?: number
+      stopFenceBlockedAgentCount?: number
       manualBlockerCount?: number
       onlineAgentCount?: number
       registeredAgentCount?: number
@@ -259,6 +260,8 @@ function OpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
   const summary = run?.summary || {}
   const actionSummary = summary.actions || {}
   const sourceClosureBlockedCount = Number(summary.sourceClosureBlockedCount || 0)
+  // 节点因旧采集页面未确认停止而暂停接单的数量（服务端按节点统计，与条目级「恢复阻塞」含义不同）。
+  const stopFenceBlockedAgentCount = Number(summary.stopFenceBlockedAgentCount || 0)
   const explicitManualBlockerCount = Number(summary.manualBlockerCount || 0)
   const guarded = data?.mode === 'guarded'
   const actionsEnabled = data?.policy?.actionsEnabled === true
@@ -276,6 +279,8 @@ function OpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
   const firstIncidentType = firstIncident?.incident_type || firstIncident?.type || ''
   const alertLabel = firstIncidentType === 'capture_source_closure_blocked'
     ? '自动恢复已阻塞，等待原 Agent 关闭确认'
+    : firstIncidentType === 'capture_agent_stop_fence_blocked'
+    ? '节点旧页面未确认停止，已暂停接单'
     : firstIncident?.alert_delivery_status === 'sent'
     ? '异常提醒已发送'
     : ['retry_wait', 'blocked_config', 'failed'].includes(firstIncident?.alert_delivery_status || '')
@@ -320,12 +325,13 @@ function OpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatch }: {
       </div>
 
       {enabled && run && (
-        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
+        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-9">
           <OpsFact label="计划覆盖" value={`${Number(summary.observedScheduleCount || 0)}/${Number(summary.expectedScheduleCount || 0)}`} />
           <OpsFact label="任务" value={String(Number(summary.taskCount || 0))} />
           <OpsFact label="仍在执行" value={String(Number(summary.activeTaskCount || 0))} />
           <OpsFact label="恢复已完成" value={String(Number(summary.recoveredItemCount || 0))} />
           <OpsFact label="恢复阻塞" value={String(sourceClosureBlockedCount)} danger={sourceClosureBlockedCount > 0} />
+          <OpsFact label="待确认停止" value={String(stopFenceBlockedAgentCount)} danger={stopFenceBlockedAgentCount > 0} />
           <OpsFact label="需人工" value={String(explicitManualBlockerCount)} danger={explicitManualBlockerCount > 0} />
           <OpsFact label="在线 Agent" value={`${Number(summary.onlineAgentCount || 0)}/${Number(summary.registeredAgentCount || 0)}`} />
           <OpsFact

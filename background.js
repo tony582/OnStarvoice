@@ -68,7 +68,15 @@ const STORAGE_KEYS = {
   observedSocialAccounts: 'onstarvoice.observedSocialAccounts',
   socialAccountUsageQueue: 'onstarvoice.socialAccountUsageQueue',
   diagnostics: 'onstarvoice.diagnostics',
+  stopFenceChecks: 'onstarvoice.stopFenceChecks',
 };
+
+// 本次扩展加载标识（0.4.16 停止保护核对）。放在 storage.session：service
+// worker 重启后保留，扩展重载、升级、停用和浏览器重启时清空，所以同一个 id
+// 就是“同一加载期”。workerStartedAt 取模块加载时刻，不早于真正的加载时间；
+// 读写失败时用它兜底，只会让更多页面被判为“早于本次加载”，更保守。
+const RUNTIME_EPOCH_SESSION_KEY = 'onstarvoice.runtimeEpoch';
+const workerStartedAt = Date.now();
 
 const CONTROL_STORAGE_CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
 const TASK_LEDGER_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
@@ -239,6 +247,11 @@ let unattendedKeywordAlarmInFlight = false;
 let unattendedSupervisorInFlight = false;
 let lastUnattendedSupervisorTickAt = 0;
 const contentRelayHeartbeatByRequestId = new Map();
+// 在途内容中继登记表（0.4.16，只登记不改行为）。停止保护核对用它判断页面上
+// 的采集活动是谁发起的。纯内存：SW 重启会清空它，同时也终止了它登记的全部
+// 中继 promise；重启前留在页面里的处理函数因无法追溯，按“无法归属”处理。
+const inFlightContentRelays = new Map();
+let inFlightContentRelaySequence = 0;
 const abortedCaptureRequestIds = new Map();
 const settledCaptureRequestIds = new Map();
 let captureDebugSessionManager = null;
@@ -7599,6 +7612,20 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
         response.acceptedSocialUsageEventIds,
       );
     }
+    // 停止保护核对随完整心跳下发（0.4.16），字段缺失或不是数组时直接跳过。
+    const stopFenceChecks = Array.isArray(response.stopFenceChecks)
+      ? response.stopFenceChecks
+      : [];
+    // 仅释放项先于本轮指令执行（有界等待），免得同一心跳里的创建指令先撞上
+    // 绑定旧任务的本机执行锁。
+    if (stopFenceChecks.some((offer) => offer?.mode === 'release_only')) {
+      await runStopFenceReleaseOnlyBeforeCommands(
+        stopFenceChecks,
+        credential,
+      ).catch((error) => {
+        console.warn('[CloudTaskAgent] stop fence local release failed:', error);
+      });
+    }
     const commands = Array.isArray(response.commands) ? response.commands : [];
     for (const command of commands) {
       try {
@@ -7609,6 +7636,15 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
         );
         console.warn('[CloudTaskAgent] command execution failed:', error);
       }
+    }
+    // 核对项不阻塞本轮心跳；单飞、按 checkId 去重（已处理的仅释放项会被跳过）。
+    if (stopFenceChecks.length > 0) {
+      void runStopFenceChecksFromHeartbeat(
+        stopFenceChecks,
+        credential,
+      ).catch((error) => {
+        console.warn('[CloudTaskAgent] stop fence check failed:', error);
+      });
     }
     return response;
   } finally {
@@ -9772,6 +9808,1973 @@ async function persistUnattendedStopConfirmationWithinMutation(
   return next;
 }
 
+// ==================== 停止保护核对（0.4.16） ====================
+//
+// 任务以 PREVIOUS_CAPTURE_STOP_UNCONFIRMED 收尾、关键词被弹性接力给别的节点后，
+// 服务端在原节点的完整心跳里下发 stopFenceChecks，请本机核对旧采集页面是否已
+// 停止。全部证明后按精确身份释放本机执行锁与采集辅助，再回执；服务端据此放行。
+// 核对全程遵守：
+// - 不刷新、不导航、不丢弃任何标签页，不注入内容脚本（只读的文档探测除外）；
+// - 不碰请求槽里的非终态请求，也不碰持有文档存活的执行锁；
+// - 只对“页面上全部活动都属于 R”的页面发带非空 captureRequestId 的精确停止；
+// - 只在 R 本机已终态时关闭 R 的 runner 页（含更早轮次遗留的），checkpoint
+//   未上报不关（同 0.4.15 本地收口）；
+// - 平台工作页只经由 0.4.15 的残留回收流程关闭；
+// - 早于本次扩展加载的平台页文档，永远不作为放行证据。
+// 这里绝不调用带刷新/重注入的停止路径（relayToContentWithRetry、
+// sendContentMessageWithTimeout、stopUnattendedCaptureTargetsForRecovery、
+// readActiveCaptureExecutionLock 等），测试用 spy 锁定。
+
+const STOP_FENCE_CHECK_STORE_VERSION = 1;
+const STOP_FENCE_CHECK_STORE_ENTRY_LIMIT = 20;
+const STOP_FENCE_CHECK_OFFER_LIMIT = 3;
+// 可在测试里缩短；生产取值见设计稿。
+const STOP_FENCE_CHECK_TIMING = {
+  deadlineMs: 45 * 1000,
+  probeTimeoutMs: 3000,
+  contentQueryTimeoutMs: 3000,
+  cancelSettleMs: 5000,
+  cancelPollMs: 500,
+  relayDrainMs: 5000,
+  relayPollMs: 250,
+  concurrency: 6,
+  offPlatformObserveMs: 10 * 60 * 1000,
+  offPlatformRetentionMs: 24 * 60 * 60 * 1000,
+  rerunAfterMs: 10 * 60 * 1000,
+  documentMarginMs: 2000,
+  // 仅释放项的 checkId 在服务端重发时不变：送达但未完成释放的，至少隔这么久
+  // 才在同一 checkId 再次下发时重跑（服务端自己按 3 分钟节流）。
+  releaseOnlyRetryMs: 60 * 1000,
+  // 心跳在执行本轮指令前最多等仅释放项这么久（含等待正在进行的核对）。
+  releaseOnlyWaitMs: 15 * 1000,
+  releaseOnlyPollMs: 250,
+};
+// 与 manifest 里 content-loader.js 的 matches 一致：只有这些站点会跑我们的
+// 采集脚本。其它能识别为平台、但不在清单里的站点（例如裸域）只在按 id
+// 归属于 R 时才检查，且按“离开站点”处理。
+const STOP_FENCE_CONTENT_SCRIPT_HOSTS = new Set([
+  'www.xiaohongshu.com',
+  'www.douyin.com',
+  'v.douyin.com',
+  'weibo.com',
+  'www.weibo.com',
+  's.weibo.com',
+]);
+const STOP_FENCE_PROOF_EVIDENCE = new Set([
+  'tab_closed',
+  'tab_discarded',
+  'navigated_off_platform',
+  'runner_closed',
+  'content_idle',
+  'content_absent',
+  'content_canceled_settled',
+  'unrelated_live_capture',
+]);
+const STOP_FENCE_CONTENT_EVIDENCE = new Set([
+  'content_idle',
+  'content_absent',
+  'content_canceled_settled',
+  'unrelated_live_capture',
+]);
+const STOP_FENCE_OPERATOR_REASONS = new Set([
+  'old_document_uninspectable',
+  'source_identity_unverifiable',
+]);
+// 未通过时整体原因的归并顺序：需人工优先，再按协议表顺序。
+const STOP_FENCE_REASON_PRIORITY = [
+  'old_document_uninspectable',
+  'source_identity_unverifiable',
+  'request_active',
+  'capture_still_active',
+  'tab_busy_unattributed',
+  'off_platform_observing',
+  'tab_frozen',
+  'probe_failed',
+  'checkpoint_reports_pending',
+  'runner_close_failed',
+  'lock_holder_alive',
+  'local_release_failed',
+  'request_changed',
+  'check_timeout',
+  'storage_unreadable',
+];
+const STOP_FENCE_REASON_MESSAGES = {
+  previous_capture_stopped:
+    '设备已确认旧采集页面已停止，已释放本机执行锁与采集辅助',
+  request_active: '节点本机仍在运行该任务，稍后再核对',
+  capture_still_active:
+    '已向旧采集发送精确停止信号，尚未结束，稍后自动复核',
+  tab_busy_unattributed: '页面上有无法归属的采集在运行，未做处理，稍后复核',
+  off_platform_observing: '旧页面已离开平台，观察满 10 分钟后确认',
+  tab_frozen: '页面暂时无法检查（冻结、加载中或无响应），稍后复核',
+  probe_failed: '页面暂时无法检查（冻结、加载中或无响应），稍后复核',
+  checkpoint_reports_pending:
+    '旧任务还有进度未上报，暂不关闭其运行页，稍后复核',
+  runner_close_failed: '本机运行页或执行锁未能释放，稍后复核',
+  lock_holder_alive: '本机运行页或执行锁未能释放，稍后复核',
+  local_release_failed: '本机运行页或执行锁未能释放，稍后复核',
+  request_changed: '本机运行页或执行锁未能释放，稍后复核',
+  check_timeout: '核对超时或本机状态读取失败，稍后复核',
+  storage_unreadable: '核对超时或本机状态读取失败，稍后复核',
+  old_document_uninspectable:
+    '旧采集页面是扩展重载或升级前打开的，无法自动确认；请在该电脑关闭或刷新这些页面（或重启 Chrome），系统会在 3 分钟内自动复核',
+  source_identity_unverifiable:
+    '无法确认旧采集页面身份，请在该电脑关闭这些页面，或检查后人工确认',
+  local_release_done: '节点已释放本机执行锁与采集辅助',
+  local_lock_absent: '节点本机没有绑定该任务的执行锁，已回收采集辅助',
+};
+const STOP_FENCE_ROLE_PRIORITY = [
+  'runner',
+  'lock_holder',
+  'progress_tab',
+  'debug_source',
+  'group_source',
+  'group_worker',
+  'fence_target',
+  'relay_target',
+  'platform_tab',
+];
+
+let stopFenceCheckInFlight = false;
+let stopFenceCheckStoreQueue = Promise.resolve();
+let runtimeEpochQueue = Promise.resolve();
+let runtimeEpochCreatedByThisWorker = false;
+
+function runRuntimeEpochOperation(operation) {
+  const pending = runtimeEpochQueue.then(operation, operation);
+  runtimeEpochQueue = pending.catch(() => null);
+  return pending;
+}
+
+function normalizeRuntimeEpoch(value) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  const id = String(source?.id || '').trim();
+  const startedAt = Number(source?.startedAt);
+  if (!id || !Number.isFinite(startedAt) || startedAt <= 0) return null;
+  const origin = ['browser_startup', 'extension_load'].includes(source.origin)
+    ? source.origin
+    : 'unknown';
+  return {id, startedAt, origin};
+}
+
+function runtimeEpochFallback() {
+  return {known: false, id: '', origin: 'unknown', startedAt: workerStartedAt};
+}
+
+async function ensureRuntimeEpoch() {
+  const sessionArea = chrome.storage?.session;
+  if (
+    !sessionArea ||
+    typeof sessionArea.get !== 'function' ||
+    typeof sessionArea.set !== 'function'
+  ) {
+    return runtimeEpochFallback();
+  }
+  return await runRuntimeEpochOperation(async () => {
+    try {
+      const stored = await sessionArea.get(RUNTIME_EPOCH_SESSION_KEY);
+      const existing = normalizeRuntimeEpoch(
+        stored?.[RUNTIME_EPOCH_SESSION_KEY],
+      );
+      if (existing) return {known: true, ...existing};
+      const created = {
+        id: createUuid(),
+        startedAt: Date.now(),
+        origin: 'unknown',
+      };
+      await sessionArea.set({[RUNTIME_EPOCH_SESSION_KEY]: created});
+      runtimeEpochCreatedByThisWorker = true;
+      return {known: true, ...created};
+    } catch (error) {
+      console.warn('[StopFence] runtime epoch unavailable:', error);
+      return runtimeEpochFallback();
+    }
+  });
+}
+
+// onStartup / onInstalled 只能给“本 worker 创建的”标识定来源。browser_startup
+// 表示浏览器进程随本次加载一起启动，进程里不可能有上一次加载留下的旧内容
+// 脚本；extension_load 更保守，可以覆盖 browser_startup，反之不行。
+async function markRuntimeEpochOrigin(origin) {
+  const normalizedOrigin =
+    origin === 'browser_startup' || origin === 'extension_load' ? origin : '';
+  if (!normalizedOrigin) return false;
+  await ensureRuntimeEpoch();
+  const sessionArea = chrome.storage?.session;
+  if (!runtimeEpochCreatedByThisWorker || !sessionArea) return false;
+  return await runRuntimeEpochOperation(async () => {
+    try {
+      const stored = await sessionArea.get(RUNTIME_EPOCH_SESSION_KEY);
+      const current = normalizeRuntimeEpoch(
+        stored?.[RUNTIME_EPOCH_SESSION_KEY],
+      );
+      if (!current) return false;
+      if (current.origin === normalizedOrigin) return true;
+      if (
+        normalizedOrigin === 'browser_startup' &&
+        current.origin !== 'unknown'
+      ) {
+        return false;
+      }
+      await sessionArea.set({
+        [RUNTIME_EPOCH_SESSION_KEY]: {...current, origin: normalizedOrigin},
+      });
+      return true;
+    } catch (error) {
+      console.warn('[StopFence] runtime epoch origin not recorded:', error);
+      return false;
+    }
+  });
+}
+
+// 文档年龄门槛：早于本次加载的文档里可能还跑着旧内容脚本，新脚本无法区分，
+// 永远不作证明。startedAt 偏晚只会让更多文档被判为“早于本次加载”。
+function isDocumentFromCurrentRuntime(documentTimeOrigin, epoch) {
+  const documentAt = Number(documentTimeOrigin);
+  if (!Number.isFinite(documentAt) || documentAt <= 0) return false;
+  if (epoch?.known === true && epoch.origin === 'browser_startup') return true;
+  const startedAt = Number(epoch?.startedAt);
+  if (!Number.isFinite(startedAt) || startedAt <= 0) return false;
+  return documentAt > startedAt + STOP_FENCE_CHECK_TIMING.documentMarginMs;
+}
+
+// 围栏写入时留证据，不改变停止目标、方法、状态迁移和返回值。
+async function buildUnattendedStopFenceEvidence({
+  request = null,
+  lock = null,
+  targets = [],
+  stopResult = null,
+  failedTabId = null,
+} = {}) {
+  const epoch = await ensureRuntimeEpoch();
+  const resolvedFailedTabId = resolveCaptureTaskTabId(
+    stopResult?.holderTabId,
+    failedTabId,
+  );
+  const failedReason = String(
+    stopResult?.reason ||
+      stopResult?.error?.message ||
+      stopResult?.method ||
+      '',
+  ).slice(0, 80);
+  const seenTabIds = new Set();
+  const normalizedTargets = [];
+  for (const target of Array.isArray(targets) ? targets : []) {
+    const tabId = resolveCaptureTaskTabId(target?.tabId);
+    if (!tabId || seenTabIds.has(tabId)) continue;
+    seenTabIds.add(tabId);
+    normalizedTargets.push({
+      tabId,
+      role: target?.role === 'lock_holder' ? 'lock_holder' : 'progress_tab',
+      reason: tabId === resolvedFailedTabId ? failedReason : '',
+    });
+  }
+  return {
+    version: 1,
+    at: new Date().toISOString(),
+    runtimeEpochId: String(epoch?.id || ''),
+    runtimeStartedAt: Number(epoch?.startedAt) || 0,
+    runtimeEpochOrigin: String(epoch?.origin || 'unknown'),
+    captureRequestId: String(request?.progress?.captureRequestId || '').trim(),
+    lockIdentity: buildCaptureExecutionLockStopIdentity(lock),
+    targets: normalizedTargets,
+    failedTabId: resolvedFailedTabId,
+    failedReason,
+  };
+}
+
+function readStopFenceEvidence(request) {
+  const evidence = request?.stopFenceEvidence;
+  return evidence &&
+    typeof evidence === 'object' &&
+    !Array.isArray(evidence) &&
+    Number(evidence.version) === 1
+    ? evidence
+    : null;
+}
+
+function runStopFenceCheckStoreMutation(operation) {
+  const pending = stopFenceCheckStoreQueue.then(operation, operation);
+  stopFenceCheckStoreQueue = pending.catch(() => null);
+  return pending;
+}
+
+function normalizeStopFenceCheckStore(value, now = Date.now()) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const rawEntries =
+    source.entries &&
+    typeof source.entries === 'object' &&
+    !Array.isArray(source.entries)
+      ? source.entries
+      : {};
+  const entries = Object.entries(rawEntries)
+    .filter(([checkId, entry]) =>
+      String(checkId || '').trim() &&
+      entry &&
+      typeof entry === 'object' &&
+      !Array.isArray(entry),
+    )
+    .map(([checkId, entry]) => [
+      String(checkId).trim(),
+      {
+        taskId: String(entry.taskId || '').trim(),
+        requestId: String(entry.requestId || '').trim(),
+        mode: entry.mode === 'release_only' ? 'release_only' : 'check',
+        state: entry.state === 'running' ? 'running' : 'done',
+        result:
+          entry.result &&
+          typeof entry.result === 'object' &&
+          !Array.isArray(entry.result)
+            ? entry.result
+            : null,
+        posted: entry.posted === true,
+        at: Number(entry.at) || 0,
+        retryAt: Math.max(0, Number(entry.retryAt) || 0),
+      },
+    ])
+    .sort((left, right) => right[1].at - left[1].at)
+    .slice(0, STOP_FENCE_CHECK_STORE_ENTRY_LIMIT);
+  const rawSeen =
+    source.offPlatformSeen &&
+    typeof source.offPlatformSeen === 'object' &&
+    !Array.isArray(source.offPlatformSeen)
+      ? source.offPlatformSeen
+      : {};
+  // 离站观察按“请求 + 页面”记：两个围栏请求归属同一页面时，各自的 10 分钟
+  // 窗口互不重置。
+  const offPlatformSeen = {};
+  for (const [key, seen] of Object.entries(rawSeen)) {
+    const normalizedTabId = resolveCaptureTaskTabId(
+      seen?.tabId ?? String(key).split(':')[0],
+    );
+    const requestId = String(seen?.requestId || '').trim();
+    const firstSeenAt = Number(seen?.firstSeenAt);
+    if (
+      !normalizedTabId ||
+      !requestId ||
+      !Number.isFinite(firstSeenAt) ||
+      firstSeenAt <= 0 ||
+      now - firstSeenAt > STOP_FENCE_CHECK_TIMING.offPlatformRetentionMs
+    ) {
+      continue;
+    }
+    offPlatformSeen[stopFenceOffPlatformKey(requestId, normalizedTabId)] = {
+      requestId,
+      tabId: normalizedTabId,
+      firstSeenAt,
+    };
+  }
+  return {
+    version: STOP_FENCE_CHECK_STORE_VERSION,
+    entries: Object.fromEntries(entries),
+    offPlatformSeen,
+  };
+}
+
+async function readStopFenceCheckStore() {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.stopFenceChecks);
+  return normalizeStopFenceCheckStore(stored?.[STORAGE_KEYS.stopFenceChecks]);
+}
+
+async function updateStopFenceCheckStore(mutator) {
+  return await runStopFenceCheckStoreMutation(async () => {
+    const current = await readStopFenceCheckStore();
+    const next = normalizeStopFenceCheckStore(mutator(current) || current);
+    await chrome.storage.local.set({[STORAGE_KEYS.stopFenceChecks]: next});
+    return next;
+  });
+}
+
+function normalizeStopFenceCheckOffer(value) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!source || Number(source.version) !== 1) return null;
+  const mode =
+    source.mode === 'check' || source.mode === 'release_only'
+      ? source.mode
+      : '';
+  const checkId = String(source.checkId || '').trim().slice(0, 240);
+  const taskId = String(source.taskId || '').trim().slice(0, 240);
+  const requestId = String(source.requestId || '').trim().slice(0, 240);
+  if (!mode || !checkId || !taskId || !requestId) return null;
+  return {
+    version: 1,
+    mode,
+    checkId,
+    taskId,
+    requestId,
+    attemptId: String(source.attemptId || '').trim().slice(0, 240),
+    platform: String(source.platform || '').trim().slice(0, 60),
+    fencedAt: String(source.fencedAt || '').trim().slice(0, 64),
+    expiresAt: String(source.expiresAt || '').trim().slice(0, 64),
+  };
+}
+
+function isStopFenceContentScriptSiteUrl(url) {
+  try {
+    const parsed = new URL(String(url || '').trim());
+    return (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      STOP_FENCE_CONTENT_SCRIPT_HOSTS.has(parsed.hostname.toLowerCase())
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isOwnExtensionPageUrl(url) {
+  try {
+    const candidate = new URL(String(url || '').trim());
+    const extension = new URL(chrome.runtime.getURL(SIDEBAR_PAGE_PATH));
+    return (
+      candidate.protocol === extension.protocol &&
+      candidate.host === extension.host
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isStopFenceMissingTabError(error) {
+  return /no tab with id|not found|does not exist|invalid tab id/iu.test(
+    String(error?.message || error || ''),
+  );
+}
+
+function isStopFenceMissingReceiverError(error) {
+  return /receiving end does not exist|could not establish connection/iu.test(
+    String(error?.message || error || ''),
+  );
+}
+
+async function withStopFenceTimeout(operation, timeoutMs, code) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error(code || 'stop_fence_timeout');
+          error.code = code || 'stop_fence_timeout';
+          reject(error);
+        }, Math.max(0, Number(timeoutMs) || 0));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function stopFenceSleep(ms) {
+  return new Promise((resolve) =>
+    setTimeout(resolve, Math.max(0, Number(ms) || 0)),
+  );
+}
+
+async function mapStopFenceWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const runnerCount = Math.max(1, Math.min(Number(limit) || 1, items.length));
+  await Promise.all(
+    Array.from({length: runnerCount}, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await worker(items[index], index);
+      }
+    }),
+  );
+  return results;
+}
+
+function stopFencePlatformOfUrl(url) {
+  if (isOwnExtensionPageUrl(url)) return 'extension';
+  const platform = detectPlatformFromUrl(url);
+  return ['xiaohongshu', 'douyin', 'weibo'].includes(platform)
+    ? platform
+    : 'other';
+}
+
+function normalizeStopFenceOverlayState(value) {
+  const state = String(value || '').trim().toLowerCase();
+  return ['running', 'backoff', 'completed', 'failed', 'cancelled'].includes(
+    state,
+  )
+    ? state
+    : '';
+}
+
+// 读 R 的本机记录：请求槽 → 归档 → 台账，全部只读。
+async function readStopFenceRequestState(requestId) {
+  const normalizedRequestId = String(requestId || '').trim();
+  try {
+    const slot = await readUnattendedKeywordRunRequest();
+    if (slot && slot.id === normalizedRequestId) {
+      return {
+        ok: true,
+        request: slot,
+        requestSource: 'slot',
+        requestActive: !isTerminalUnattendedRunStatus(slot.status),
+      };
+    }
+    const archived = await readArchivedUnattendedKeywordRunRequest(
+      normalizedRequestId,
+    );
+    if (archived) {
+      return {
+        ok: true,
+        request: archived,
+        requestSource: 'archive',
+        requestActive: false,
+      };
+    }
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.taskLedger);
+    const runs = Array.isArray(stored?.[STORAGE_KEYS.taskLedger]?.runs)
+      ? stored[STORAGE_KEYS.taskLedger].runs
+      : [];
+    const run = runs.find(
+      (entry) => String(entry?.id || '').trim() === normalizedRequestId,
+    );
+    if (run) {
+      return {
+        ok: true,
+        request: {
+          id: normalizedRequestId,
+          status: String(run.status || ''),
+          attemptId: String(run.attemptId || '').trim(),
+          previousAttemptId: '',
+          runnerTabId: resolveCaptureTaskTabId(run.runnerTabId),
+          progress: {
+            captureRequestId: String(
+              run.progress?.captureRequestId || '',
+            ).trim(),
+          },
+        },
+        requestSource: 'ledger',
+        requestActive: false,
+      };
+    }
+    return {ok: true, request: null, requestSource: 'unknown', requestActive: false};
+  } catch (error) {
+    return {ok: false, error};
+  }
+}
+
+function createStopFenceCheckContext(offer, state, epoch = null) {
+  const request = state?.request || null;
+  const fence = readStopFenceEvidence(request);
+  const requestId = offer.requestId;
+  const terminalAttemptIds = new Set(
+    [request?.attemptId, request?.previousAttemptId]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean),
+  );
+  const recordedRunnerTabIds = new Set(
+    [request?.runnerTabId]
+      .map((tabId) => resolveCaptureTaskTabId(tabId))
+      .filter(Boolean),
+  );
+  // R 本机已终态（请求槽里是终态，或已归档、台账里是终态）。此时 R 不会再有
+  // 新轮次：新轮次总是先写进请求槽再开 runner，关页前还会重读请求槽。所以带
+  // R 的 id 和任一轮次参数的 runner 都是 R 自己遗留的页面，包括两次自动恢复后
+  // 更早轮次的 runner（北京现场）。本机读不到 R 或 R 不是终态时仍只认 T_R。
+  const requestTerminalKnown = Boolean(
+    state?.ok !== false &&
+      request &&
+      !state?.requestActive &&
+      isTerminalUnattendedRunStatus(request.status),
+  );
+  const ctx = {
+    offer,
+    checkId: offer.checkId,
+    serverTaskId: offer.taskId,
+    requestId,
+    taskKey: buildUnattendedCaptureTaskId(requestId),
+    request,
+    requestSource: state?.requestSource || 'unknown',
+    fence,
+    epoch,
+    terminalAttemptIds,
+    recordedRunnerTabIds,
+    lock: null,
+    boundToR: false,
+    lockHolderState: 'unknown',
+    deadlineAt: Date.now() + STOP_FENCE_CHECK_TIMING.deadlineMs,
+    offPlatformSeen: {},
+    offPlatformChanged: false,
+    scopedCancelSent: false,
+    closedRunnerTabIds: new Set(),
+  };
+  ctx.isRequestRunnerTab = (tab) =>
+    isUnattendedRunnerTabForRequest(tab, requestId, '') ||
+    isLegacyUnattendedRunnerTabForRequest(tab, requestId);
+  // 可关的 runner：R 已终态轮次（T_R）的；R 本机已终态时，带任一轮次参数的
+  // R 的 runner；legacy runner（无轮次参数）必须是本机记录的那个标签页。
+  ctx.isClosableRunnerTab = (tab) =>
+    [...terminalAttemptIds].some((attemptId) =>
+      isUnattendedRunnerTabForRequest(tab, requestId, attemptId),
+    ) ||
+    (
+      requestTerminalKnown &&
+      isUnattendedRunnerTabForRequest(tab, requestId, '') &&
+      Boolean(stopFenceRunnerAttemptId(tab))
+    ) ||
+    (
+      isLegacyUnattendedRunnerTabForRequest(tab, requestId) &&
+      recordedRunnerTabIds.has(resolveCaptureTaskTabId(tab?.id))
+    );
+  return ctx;
+}
+
+// 严格认锁：只认稳定 taskId，或与围栏时记录的锁身份完全相等。不用轮次 id，
+// 也不按持有页回退（isCaptureExecutionLockOwnedByUnattendedAttempt 会）。
+function isStopFenceLockBoundToRequest(lock, ctx) {
+  if (!lock || String(lock.owner || '') !== 'unattended_keyword_plan') {
+    return false;
+  }
+  if (String(lock.captureTaskId || '').trim() === ctx.taskKey) return true;
+  const fencedLockIdentity = ctx.fence?.lockIdentity;
+  return Boolean(
+    fencedLockIdentity &&
+      String(fencedLockIdentity.id || '').trim() &&
+      captureExecutionLockMatchesStopIdentity(lock, fencedLockIdentity),
+  );
+}
+
+// R 的已知采集 id：本机进度、围栏证据、Debug 会话进度，以及登记表里 R 名下
+// 在途中继的 id。后者每次判定都实时重算。
+function collectStopFenceRequestCaptureIds(ctx) {
+  const debugSession = captureDebugSessionManager?.getSessionByTaskId(
+    ctx.taskKey,
+  );
+  const ids = new Set(
+    [
+      ctx.request?.progress?.captureRequestId,
+      ctx.fence?.captureRequestId,
+      debugSession?.progress?.captureRequestId,
+    ]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean),
+  );
+  for (const relay of listRequestRelays(ctx.requestId, ctx.taskKey)) {
+    if (relay.captureRequestId) ids.add(relay.captureRequestId);
+  }
+  return ids;
+}
+
+function collectStopFenceAttributedTabs(ctx) {
+  const attributed = [];
+  const push = (tabId, role) => {
+    const normalized = resolveCaptureTaskTabId(tabId);
+    if (normalized) attributed.push({tabId: normalized, role});
+  };
+  for (const target of Array.isArray(ctx.fence?.targets)
+    ? ctx.fence.targets
+    : []) {
+    push(target?.tabId, 'fence_target');
+  }
+  if (ctx.boundToR) push(ctx.lock?.holderTabId, 'lock_holder');
+  push(ctx.request?.progress?.runnerTabId, 'progress_tab');
+  push(ctx.request?.runnerTabId, 'runner');
+  const debugSession = captureDebugSessionManager?.getSessionByTaskId(
+    ctx.taskKey,
+  );
+  if (debugSession) {
+    push(debugSession.sourceTabId || debugSession.tabId, 'debug_source');
+    for (const tabId of Array.isArray(debugSession.workerTabIds)
+      ? debugSession.workerTabIds
+      : []) {
+      push(tabId, 'group_worker');
+    }
+  }
+  const group = captureTaskTabGroupManager?.getTask(ctx.taskKey);
+  if (group) {
+    push(group.sourceTabId, 'group_source');
+    for (const tabId of Array.isArray(group.workerTabIds)
+      ? group.workerTabIds
+      : []) {
+      push(tabId, 'group_worker');
+    }
+  }
+  for (const tabId of getTrackedCaptureTaskWorkers(ctx.taskKey)) {
+    push(tabId, 'group_worker');
+  }
+  for (const relay of listRequestRelays(ctx.requestId, ctx.taskKey)) {
+    push(relay.tabId, 'relay_target');
+  }
+  return attributed;
+}
+
+// 全量扫描范围：采集脚本站点页、R 的 runner 页、按 id 归属于 R 的页面。扩展
+// 重载或 worker 重启后内存里的任务组记录可能丢失，只查“已记录的页面”会漏掉
+// 旧的详情工作页，所以每次都扫全部站点页。
+async function collectStopFenceCandidates(ctx) {
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (error) {
+    return {ok: false, error};
+  }
+  const candidates = new Map();
+  const add = (tabId, role, {attributed = false, tab = null} = {}) => {
+    const normalized = resolveCaptureTaskTabId(tabId);
+    if (!normalized) return;
+    const entry = candidates.get(normalized) || {
+      tabId: normalized,
+      tab: null,
+      roles: [],
+      attributed: false,
+    };
+    if (tab) entry.tab = tab;
+    if (!entry.roles.includes(role)) entry.roles.push(role);
+    entry.attributed = entry.attributed || attributed;
+    candidates.set(normalized, entry);
+  };
+  for (const tab of Array.isArray(tabs) ? tabs : []) {
+    if (ctx.isRequestRunnerTab(tab)) {
+      add(tab?.id, 'runner', {tab});
+    } else if (isStopFenceContentScriptSiteUrl(tab?.url || tab?.pendingUrl)) {
+      add(tab?.id, 'platform_tab', {tab});
+    }
+  }
+  for (const {tabId, role} of collectStopFenceAttributedTabs(ctx)) {
+    add(tabId, role, {attributed: true});
+  }
+  return {ok: true, candidates: [...candidates.values()]};
+}
+
+function pickStopFenceRole(roles = []) {
+  return (
+    STOP_FENCE_ROLE_PRIORITY.find((role) => roles.includes(role)) ||
+    'platform_tab'
+  );
+}
+
+async function probeStopFenceDocument(tabId) {
+  try {
+    const results = await withStopFenceTimeout(
+      () =>
+        chrome.scripting.executeScript({
+          target: {tabId, frameIds: [0]},
+          func: () => ({
+            t: performance.timeOrigin,
+            o:
+              document.querySelector('[data-osv-list-harvest-host="true"]')
+                ?.dataset?.state || '',
+          }),
+        }),
+      STOP_FENCE_CHECK_TIMING.probeTimeoutMs,
+      'stop_fence_probe_timeout',
+    );
+    const entries = Array.isArray(results) ? results : [];
+    const entry =
+      entries.find((item) => Number(item?.frameId ?? 0) === 0) || null;
+    const documentTimeOrigin = Number(entry?.result?.t);
+    if (!Number.isFinite(documentTimeOrigin) || documentTimeOrigin <= 0) {
+      return {ok: false, reason: 'probe_result_invalid'};
+    }
+    return {
+      ok: true,
+      documentTimeOrigin,
+      overlayState: normalizeStopFenceOverlayState(entry.result.o),
+    };
+  } catch (error) {
+    return isStopFenceErrorPageError(error)
+      ? {ok: false, reason: 'error_page', error}
+      : {ok: false, reason: 'probe_failed', error};
+  }
+}
+
+// 探测只打主框架（frameIds: [0]），所以这两种报错都说明主框架当前是 Chrome
+// 的错误页（断网、超时、DNS/代理错误等；地址栏仍是原平台地址）。其它注入
+// 失败（超时、无权限、页面无响应）仍按探测失败处理。
+function isStopFenceErrorPageError(error) {
+  const message = String(error?.message || error || '');
+  return (
+    /is showing error page/iu.test(message) ||
+    /chrome-error:\/\//iu.test(message)
+  );
+}
+
+// 直接问内容脚本，不经过中继：不刷新、不重注入，也不动在途中继的心跳记录。
+async function inspectStopFenceContentActivity(tabId) {
+  let response;
+  try {
+    response = await withStopFenceTimeout(
+      () =>
+        chrome.tabs.sendMessage(
+          tabId,
+          {action: 'inspectCaptureActivity'},
+          {frameId: 0},
+        ),
+      STOP_FENCE_CHECK_TIMING.contentQueryTimeoutMs,
+      'stop_fence_content_timeout',
+    );
+  } catch (error) {
+    // 处理函数是同步的：超时说明页面主线程忙，不是“没有脚本”。
+    return isStopFenceMissingReceiverError(error)
+      ? {ok: false, reason: 'content_absent'}
+      : {ok: false, reason: 'probe_failed', error};
+  }
+  const activeCount = Number(response?.activeCount);
+  if (
+    response?.ok !== true ||
+    !Number.isSafeInteger(activeCount) ||
+    activeCount < 0
+  ) {
+    return {ok: false, reason: 'probe_failed'};
+  }
+  let activeRequests = null;
+  if (Array.isArray(response.activeRequests)) {
+    activeRequests = response.activeRequests
+      .slice(0, 20)
+      .map((entry) => ({
+        id: String(entry?.id || '').trim().slice(0, 200),
+        count: Math.max(0, Math.floor(Number(entry?.count) || 0)),
+      }))
+      .filter((entry) => entry.id && entry.count > 0);
+  }
+  return {ok: true, activeCount, activeRequests};
+}
+
+// 页面上的活动全部属于 R：先打中止标记，再发带非空 id 的精确停止（内容脚本的
+// 取消标志整页生效），每 500 ms 复查，最多 5 秒。
+async function stopStopFenceOwnedContentCapture(tabId, activeRequests, ctx) {
+  const captureIds = activeRequests.map((entry) => entry.id).filter(Boolean);
+  if (captureIds.length === 0) return 'tab_busy_unattributed';
+  for (const captureRequestId of captureIds) {
+    markCaptureRequestAborted(captureRequestId);
+  }
+  ctx.scopedCancelSent = true;
+  try {
+    await withStopFenceTimeout(
+      () =>
+        chrome.tabs.sendMessage(
+          tabId,
+          {action: 'cancelCapture', captureRequestId: captureIds[0]},
+          {frameId: 0},
+        ),
+      STOP_FENCE_CHECK_TIMING.contentQueryTimeoutMs,
+      'stop_fence_cancel_timeout',
+    );
+  } catch {
+    // 取消回执不是证明；下面按活动计数归零判定。
+  }
+  const settleUntil = Date.now() + STOP_FENCE_CHECK_TIMING.cancelSettleMs;
+  for (;;) {
+    const inspection = await inspectStopFenceContentActivity(tabId);
+    if (inspection.ok && inspection.activeCount === 0) {
+      return 'content_canceled_settled';
+    }
+    if (Date.now() >= settleUntil) return 'capture_still_active';
+    await stopFenceSleep(STOP_FENCE_CHECK_TIMING.cancelPollMs);
+  }
+}
+
+// 页面上没有 R 的活动时，只有每个活动 id 都能追溯到存活执行锁持有文档
+// 发起的在途中继，才算“与本请求无关”；混合或追溯不到一律不算。
+function stopFenceActivityExplainedByLiveLockHolder(tabId, activeRequests, ctx) {
+  const lock = ctx.lock;
+  if (!lock || ctx.boundToR || ctx.lockHolderState !== 'alive') return false;
+  const holderDocumentId = String(lock.holderDocumentId || '').trim();
+  const holderTabId = resolveCaptureTaskTabId(lock.holderTabId);
+  return activeRequests.every(({id}) =>
+    findRelaysByCaptureRequestId(id).some((relay) =>
+      !relay.internal &&
+      relay.tabId === tabId &&
+      relay.runnerRequestId !== ctx.requestId &&
+      relay.taskId !== ctx.taskKey &&
+      (
+        (holderDocumentId && relay.senderDocumentId === holderDocumentId) ||
+        (holderTabId && relay.senderTabId && relay.senderTabId === holderTabId)
+      ),
+    ),
+  );
+}
+
+function stopFenceOffPlatformKey(requestId, tabId) {
+  return `${tabId}:${requestId}`;
+}
+
+function observeStopFenceOffPlatform(ctx, tabId) {
+  const key = stopFenceOffPlatformKey(ctx.requestId, tabId);
+  const now = Date.now();
+  const seen = ctx.offPlatformSeen[key];
+  if (!seen) {
+    ctx.offPlatformSeen[key] = {
+      requestId: ctx.requestId,
+      tabId,
+      firstSeenAt: now,
+    };
+    ctx.offPlatformChanged = true;
+    return 'off_platform_observing';
+  }
+  // 往返缓存最长约 10 分钟，按「后退」可恢复旧文档；连续离开满 10 分钟才算证明。
+  return now - seen.firstSeenAt >= STOP_FENCE_CHECK_TIMING.offPlatformObserveMs
+    ? 'navigated_off_platform'
+    : 'off_platform_observing';
+}
+
+// 页面回到站点或已关闭：清掉所有请求对该页面的离站观察（窗口一律重新计时）。
+function forgetStopFenceOffPlatform(ctx, tabId) {
+  for (const [key, seen] of Object.entries(ctx.offPlatformSeen)) {
+    if (resolveCaptureTaskTabId(seen?.tabId) === tabId) {
+      delete ctx.offPlatformSeen[key];
+      ctx.offPlatformChanged = true;
+    }
+  }
+}
+
+// 单页判定（设计稿决策表第 1–10 行）。返回 {target} 或 {runnerPending}。
+async function evaluateStopFenceTab(candidate, ctx, {rescan = false} = {}) {
+  const tabId = candidate.tabId;
+  const role = pickStopFenceRole(candidate.roles);
+  const verdict = (evidence, extra = {}) => ({
+    target: {
+      tabId,
+      role,
+      evidence,
+      platform: extra.platform || 'other',
+      documentState: extra.documentState || 'unknown',
+      overlayState: extra.overlayState || '',
+    },
+    title: String(extra.title || '').slice(0, 40),
+  });
+  // 2. 每页都重新读取：扫描到判定之间页面可能已关闭或跳走。
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (error) {
+    if (isStopFenceMissingTabError(error)) {
+      forgetStopFenceOffPlatform(ctx, tabId);
+      return verdict('tab_closed');
+    }
+    return verdict('probe_failed');
+  }
+  const url = String(tab?.url || tab?.pendingUrl || '');
+  const platform = stopFencePlatformOfUrl(url);
+  const title = String(tab?.title || '');
+  // 1. R 的 runner 页：已终态轮次的留给阶段二；复扫时仍在就是没关掉。
+  if (ctx.isRequestRunnerTab(tab)) {
+    if (ctx.isClosableRunnerTab(tab)) {
+      return rescan
+        ? verdict('runner_close_failed', {platform: 'extension', title})
+        : {runnerPending: {tabId, tab}};
+    }
+    return verdict('source_identity_unverifiable', {
+      platform: 'extension',
+      title,
+    });
+  }
+  // 3–5. 丢弃（含尚未加载的 unloaded）、冻结、加载中。
+  if (tab?.discarded === true || tab?.status === 'unloaded') {
+    return verdict('tab_discarded', {platform, title});
+  }
+  if (tab?.frozen === true) return verdict('tab_frozen', {platform, title});
+  if (tab?.status === 'loading') {
+    return verdict('probe_failed', {platform, title});
+  }
+  const scriptSite = isStopFenceContentScriptSiteUrl(url);
+  const extensionPage = isOwnExtensionPageUrl(url);
+  // 6. 归属页已离开采集脚本站点。未归属的站点页在扫描后跳走时，本轮无法
+  //    确认它此前跑过什么，按探测失败处理，下一轮不再扫描它。
+  if (!scriptSite && !extensionPage) {
+    if (!candidate.attributed) return verdict('probe_failed', {platform, title});
+    return verdict(observeStopFenceOffPlatform(ctx, tabId), {platform, title});
+  }
+  // 7. 本扩展页面，但不是 R 的 runner。
+  if (extensionPage) {
+    forgetStopFenceOffPlatform(ctx, tabId);
+    return verdict('source_identity_unverifiable', {
+      platform: 'extension',
+      title,
+    });
+  }
+  // 8. 只读探测文档时间与页面覆盖层状态。
+  const probe = await probeStopFenceDocument(tabId);
+  // 8a. 停在浏览器错误页（自动恢复刷新时断网等会落到这里，也正是围栏的
+  //     来源之一）：当前文档是 Chrome 错误页，扩展脚本进不去，页面上不会有
+  //     采集在跑；旧文档已被刷新销毁，或留在往返缓存里。按“离开站点”同样
+  //     计时，连续满 10 分钟才算证明；归属与否都一样，否则这个页面每轮都会
+  //     被扫到、永远探测失败。只有这里不清离站观察，其它结果都重新计时。
+  if (probe.reason === 'error_page') {
+    return {
+      ...verdict(observeStopFenceOffPlatform(ctx, tabId), {
+        platform,
+        title: `浏览器错误页·${title}`,
+      }),
+      errorPage: true,
+    };
+  }
+  forgetStopFenceOffPlatform(ctx, tabId);
+  if (!probe.ok) return verdict('probe_failed', {platform, title});
+  // 9. 年龄门槛：早于本次加载的文档不再查询内容脚本，无论它是否应答。
+  if (!isDocumentFromCurrentRuntime(probe.documentTimeOrigin, ctx.epoch)) {
+    return verdict('old_document_uninspectable', {
+      platform,
+      title,
+      documentState: 'before_runtime',
+      overlayState: probe.overlayState,
+    });
+  }
+  const current = {
+    platform,
+    title,
+    documentState: 'current_runtime',
+    overlayState: probe.overlayState,
+  };
+  // 10. 查询内容脚本。
+  const activity = await inspectStopFenceContentActivity(tabId);
+  if (!activity.ok) {
+    return activity.reason === 'content_absent'
+      ? verdict('content_absent', current)
+      : verdict('probe_failed', current);
+  }
+  if (activity.activeCount === 0) return verdict('content_idle', current);
+  const activeRequests = activity.activeRequests;
+  const attributedCount = Array.isArray(activeRequests)
+    ? activeRequests.reduce((total, entry) => total + entry.count, 0)
+    : -1;
+  // 缺字段、为空或计数对不上（例如超过 20 条被截断）：无法归属。
+  if (
+    !Array.isArray(activeRequests) ||
+    activeRequests.length === 0 ||
+    attributedCount !== activity.activeCount
+  ) {
+    return verdict('tab_busy_unattributed', current);
+  }
+  const requestCaptureIds = collectStopFenceRequestCaptureIds(ctx);
+  const ownedCount = activeRequests.filter((entry) =>
+    requestCaptureIds.has(entry.id),
+  ).length;
+  if (ownedCount === activeRequests.length) {
+    return verdict(
+      await stopStopFenceOwnedContentCapture(tabId, activeRequests, ctx),
+      current,
+    );
+  }
+  if (ownedCount > 0) return verdict('tab_busy_unattributed', current);
+  return verdict(
+    stopFenceActivityExplainedByLiveLockHolder(tabId, activeRequests, ctx)
+      ? 'unrelated_live_capture'
+      : 'tab_busy_unattributed',
+    current,
+  );
+}
+
+// 阶段一（或复扫）：逐页判定，并发 6 页，整体受 45 秒截止约束。
+async function sweepStopFenceBrowser(ctx, {rescan = false} = {}) {
+  // 只读：绝不走 readActiveCaptureExecutionLock 的带刷新清理。
+  ctx.lock = await readStoredCaptureExecutionLock();
+  ctx.boundToR = isStopFenceLockBoundToRequest(ctx.lock, ctx);
+  ctx.lockHolderState = ctx.lock
+    ? await getCaptureExecutionLockHolderState(ctx.lock)
+    : 'unknown';
+  // 中止 R 的在途中继：带这些 id 的中继在下一个检查点返回，不再刷新、
+  // 重注入或重发。
+  for (const captureRequestId of collectStopFenceRequestCaptureIds(ctx)) {
+    markCaptureRequestAborted(captureRequestId);
+  }
+  const collected = await collectStopFenceCandidates(ctx);
+  if (!collected.ok) {
+    return {
+      complete: false,
+      targets: [],
+      titles: new Map(),
+      errorPageTabIds: new Set(),
+      runnerPending: [],
+      unresolved: [],
+      sweptTabCount: 0,
+    };
+  }
+  const outcomes = await mapStopFenceWithConcurrency(
+    collected.candidates,
+    STOP_FENCE_CHECK_TIMING.concurrency,
+    async (candidate) => {
+      const remainingMs = ctx.deadlineAt - Date.now();
+      if (remainingMs <= 0) return {unresolved: candidate};
+      try {
+        return await withStopFenceTimeout(
+          () => evaluateStopFenceTab(candidate, ctx, {rescan}),
+          remainingMs,
+          'stop_fence_check_timeout',
+        );
+      } catch {
+        return {unresolved: candidate};
+      }
+    },
+  );
+  const targets = [];
+  const titles = new Map();
+  const errorPageTabIds = new Set();
+  const runnerPending = [];
+  const unresolved = [];
+  for (const outcome of outcomes) {
+    if (outcome?.target) {
+      targets.push(outcome.target);
+      titles.set(outcome.target.tabId, outcome.title || '');
+      if (outcome.errorPage === true) errorPageTabIds.add(outcome.target.tabId);
+    } else if (outcome?.runnerPending) {
+      runnerPending.push(outcome.runnerPending);
+    } else if (outcome?.unresolved) {
+      unresolved.push(outcome.unresolved);
+    }
+  }
+  return {
+    complete: unresolved.length === 0,
+    targets,
+    titles,
+    errorPageTabIds,
+    runnerPending,
+    unresolved,
+    sweptTabCount: targets.length + runnerPending.length,
+  };
+}
+
+function mergeStopFenceReason(reasons = []) {
+  for (const reason of STOP_FENCE_REASON_PRIORITY) {
+    if (reasons.includes(reason)) return reason;
+  }
+  return reasons[0] || 'probe_failed';
+}
+
+function isStopFenceProofTarget(target) {
+  if (!STOP_FENCE_PROOF_EVIDENCE.has(target?.evidence)) return false;
+  // 内容类证据只在文档晚于本次加载时成立（与服务端校验一致）。
+  return !STOP_FENCE_CONTENT_EVIDENCE.has(target.evidence) ||
+    target.documentState === 'current_runtime';
+}
+
+function judgeStopFenceSweep(sweep) {
+  const reasons = sweep.targets
+    .filter((target) => !isStopFenceProofTarget(target))
+    .map((target) =>
+      STOP_FENCE_PROOF_EVIDENCE.has(target.evidence)
+        ? 'probe_failed'
+        : target.evidence,
+    );
+  if (!sweep.complete) {
+    reasons.push(sweep.unresolved.length > 0 ? 'check_timeout' : 'probe_failed');
+  }
+  return reasons.length === 0
+    ? {ok: true}
+    : {ok: false, reason: mergeStopFenceReason(reasons)};
+}
+
+// 阶段一全部成立后，最多再等 5 秒让 R 名下的在途中继归零；归零后本轮的
+// content_absent 才算证明。
+async function waitForStopFenceRequestRelaysToDrain(ctx) {
+  const until = Math.min(
+    Date.now() + STOP_FENCE_CHECK_TIMING.relayDrainMs,
+    ctx.deadlineAt,
+  );
+  for (;;) {
+    const remaining = listRequestRelays(ctx.requestId, ctx.taskKey).length;
+    if (remaining === 0 || Date.now() >= until) return remaining;
+    await stopFenceSleep(STOP_FENCE_CHECK_TIMING.relayPollMs);
+  }
+}
+
+function stopFenceRunnerAttemptId(tab) {
+  try {
+    return String(
+      new URL(String(tab?.url || '')).searchParams.get(
+        UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY,
+      ) || '',
+    ).trim();
+  } catch {
+    return '';
+  }
+}
+
+// 阶段二：关闭 R 已终态轮次的 runner 页。规则同 0.4.15 本地收口的
+// closeOwnedRunnerTabs：checkpoint 未上报的轮次保留 runner 让它送达；每关一页
+// 前重读请求槽；按 URL 复核后关闭，再确认已不在。
+async function closeStopFenceRunnerTabs(ctx) {
+  return await runUnattendedRunnerTabLifecycle(async () => {
+    const closedTabIds = [];
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({});
+    } catch {
+      return {ok: false, reason: 'runner_close_failed', closedTabIds};
+    }
+    const ownedRunnerTabs = (Array.isArray(tabs) ? tabs : []).filter(
+      ctx.isClosableRunnerTab,
+    );
+    if (ownedRunnerTabs.length === 0) return {ok: true, closedTabIds};
+    const attemptIds = new Set();
+    for (const tab of ownedRunnerTabs) {
+      const attemptId = stopFenceRunnerAttemptId(tab);
+      if (attemptId) {
+        attemptIds.add(attemptId);
+      } else {
+        for (const terminalAttemptId of ctx.terminalAttemptIds) {
+          attemptIds.add(terminalAttemptId);
+        }
+      }
+    }
+    for (const attemptId of attemptIds) {
+      const outbox = await inspectUnattendedCheckpointOutboxAttempt(
+        ctx.requestId,
+        attemptId,
+      );
+      if (!outbox.known || outbox.pendingCount !== 0) {
+        return {ok: false, reason: 'checkpoint_reports_pending', closedTabIds};
+      }
+    }
+    try {
+      for (const tab of ownedRunnerTabs) {
+        const tabId = resolveCaptureTaskTabId(tab?.id);
+        if (!tabId) continue;
+        const slot = await readUnattendedKeywordRunRequest();
+        if (
+          slot &&
+          slot.id === ctx.requestId &&
+          (
+            !isTerminalUnattendedRunStatus(slot.status) ||
+            !ctx.terminalAttemptIds.has(slot.attemptId)
+          )
+        ) {
+          return {ok: false, reason: 'request_changed', closedTabIds};
+        }
+        let liveTab;
+        try {
+          liveTab = await chrome.tabs.get(tabId);
+        } catch (error) {
+          if (isStopFenceMissingTabError(error)) continue;
+          throw error;
+        }
+        if (!ctx.isClosableRunnerTab(liveTab)) continue;
+        await chrome.tabs.remove(tabId);
+        closedTabIds.push(tabId);
+        ctx.closedRunnerTabIds.add(tabId);
+      }
+      const remainingTabs = await chrome.tabs.query({});
+      if (
+        (Array.isArray(remainingTabs) ? remainingTabs : []).some(
+          ctx.isClosableRunnerTab,
+        )
+      ) {
+        return {ok: false, reason: 'runner_close_failed', closedTabIds};
+      }
+    } catch {
+      return {ok: false, reason: 'runner_close_failed', closedTabIds};
+    }
+    return {ok: true, closedTabIds};
+  });
+}
+
+async function stopFenceTabExists(tabId) {
+  const normalized = resolveCaptureTaskTabId(tabId);
+  if (!normalized) return false;
+  try {
+    await chrome.tabs.get(normalized);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 本机释放（全部证明后，或运营已人工确认）：三步依次执行，每步开头重读状态。
+async function releaseStopFenceLocalResources(
+  ctx,
+  {method, proofStatus, targetTabIds = [], preserveTabIds = [], stage = ''} = {},
+) {
+  const fingerprint = {
+    taskId: ctx.taskKey,
+    lock: ctx.boundToR ? buildCaptureExecutionLockStopIdentity(ctx.lock) : null,
+    targetTabIds: [...new Set(
+      targetTabIds.map((tabId) => resolveCaptureTaskTabId(tabId)).filter(Boolean),
+    )]
+      .sort((left, right) => left - right)
+      .slice(0, 40),
+  };
+  const isStillTerminalR = (current) => Boolean(
+    current &&
+      current.id === ctx.requestId &&
+      isTerminalUnattendedRunStatus(current.status) &&
+      ctx.terminalAttemptIds.has(current.attemptId),
+  );
+  // 1. 停止确认写到 source_stopped（R 不在请求槽时跳过）。
+  const sourceStopped = await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (!current || current.id !== ctx.requestId) return {ok: true};
+    if (!isStillTerminalR(current)) return {ok: false, reason: 'request_changed'};
+    await persistUnattendedStopConfirmationWithinMutation(current, {
+      stage: 'source_stopped',
+      fingerprint,
+      method,
+    });
+    return {ok: true};
+  }).catch(() => ({ok: false, reason: 'local_release_failed'}));
+  if (!sourceStopped.ok) {
+    return {
+      ok: false,
+      reason: sourceStopped.reason,
+      lockReleased: false,
+      localLockBoundToRequest: ctx.boundToR,
+      residueReleased: false,
+    };
+  }
+  // 2. 与 BEGIN/END 同一生命周期队列：按精确身份释放执行锁，再按 0.4.15 迟到
+  //    END 的语义回收采集辅助（延后于存活请求、保留前台页与锁持有页）。
+  const runtimeRelease = await runCaptureTaskLifecycleOperation(async () => {
+    const slot = await readUnattendedKeywordRunRequest();
+    if (slot && !isTerminalUnattendedRunStatus(slot.status)) {
+      return {
+        ok: false,
+        reason: 'local_release_failed',
+        localLockBoundToRequest: ctx.boundToR,
+      };
+    }
+    const lock = await readStoredCaptureExecutionLock();
+    let lockReleased = false;
+    if (isStopFenceLockBoundToRequest(lock, ctx)) {
+      const holderState = await getCaptureExecutionLockHolderState(lock);
+      if (
+        holderState === 'alive' ||
+        (holderState === 'unknown' && await stopFenceTabExists(lock.holderTabId))
+      ) {
+        return {
+          ok: false,
+          reason: 'lock_holder_alive',
+          localLockBoundToRequest: true,
+        };
+      }
+      const released = await releaseExactCaptureExecutionLockSnapshot(lock);
+      if (!released) {
+        const reread = await readStoredCaptureExecutionLock();
+        if (isStopFenceLockBoundToRequest(reread, ctx)) {
+          return {
+            ok: false,
+            reason: 'local_release_failed',
+            localLockBoundToRequest: true,
+          };
+        }
+      }
+      lockReleased = true;
+    }
+    const residue = await releaseResidualUnattendedCaptureAssist(ctx.taskKey, {
+      session: captureDebugSessionManager?.getSessionByTaskId(ctx.taskKey) || null,
+      preserveTabIds,
+      stage: stage || 'stop_fence_check',
+      deferToLiveRequest: true,
+      preserveActiveTabs: true,
+    }).catch(() => ({released: false, reason: 'cleanup_failed'}));
+    return {
+      ok: true,
+      lockReleased,
+      residueReleased:
+        residue?.released === true ||
+        residue?.reason === 'capture_assist_absent',
+    };
+  }).catch(() => ({ok: false, reason: 'local_release_failed'}));
+  if (!runtimeRelease.ok) {
+    return {
+      ok: false,
+      reason: runtimeRelease.reason || 'local_release_failed',
+      lockReleased: false,
+      localLockBoundToRequest:
+        runtimeRelease.localLockBoundToRequest ?? ctx.boundToR,
+      residueReleased: false,
+    };
+  }
+  // 3. 停止确认写到 runtime_released，并记下 stopFenceClosure。status、error、
+  //    message 保持不变，与服务端先例一致。
+  const closure = await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (!isStillTerminalR(current)) return {localStopConfirmationAt: ''};
+    const next = await persistUnattendedStopConfirmationWithinMutation(
+      {
+        ...current,
+        stopFenceClosure: {
+          version: 1,
+          at: new Date().toISOString(),
+          checkId: ctx.checkId,
+          taskId: ctx.serverTaskId,
+          proofStatus,
+        },
+      },
+      {stage: 'runtime_released', fingerprint, method},
+    );
+    return {
+      localStopConfirmationAt: String(
+        readExactUnattendedStopConfirmation(next)?.runtimeReleasedAt || '',
+      ),
+    };
+  }).catch((error) => {
+    console.warn('[StopFence] local stop confirmation not recorded:', error);
+    return {localStopConfirmationAt: ''};
+  });
+  return {
+    ok: true,
+    lockReleased: runtimeRelease.lockReleased,
+    localLockBoundToRequest: false,
+    residueReleased: runtimeRelease.residueReleased,
+    localStopConfirmationAt: closure.localStopConfirmationAt,
+  };
+}
+
+function stopFenceReasonMessage(reason) {
+  return STOP_FENCE_REASON_MESSAGES[reason] || '节点核对未通过，稍后复核';
+}
+
+function buildStopFencePendingTabs(targets, titles, unresolved) {
+  const pending = [
+    ...targets
+      .filter((target) => !isStopFenceProofTarget(target))
+      .sort(
+        (left, right) =>
+          Number(STOP_FENCE_OPERATOR_REASONS.has(right.evidence)) -
+          Number(STOP_FENCE_OPERATOR_REASONS.has(left.evidence)),
+      )
+      .map((target) => ({
+        tabId: target.tabId,
+        platform: target.platform,
+        evidence: target.evidence,
+        title: String(titles.get(target.tabId) || '').slice(0, 40),
+      })),
+    ...unresolved.map((candidate) => ({
+      tabId: candidate.tabId,
+      platform: stopFencePlatformOfUrl(
+        candidate.tab?.url || candidate.tab?.pendingUrl || '',
+      ),
+      evidence: 'probe_failed',
+      title: String(candidate.tab?.title || '').slice(0, 40),
+    })),
+  ];
+  return {
+    pendingTabIds: pending.map((entry) => entry.tabId).slice(0, 20),
+    pendingTabs: pending.slice(0, 10),
+  };
+}
+
+function buildStopFenceCheckResult(ctx, {
+  reason,
+  startedAt,
+  requestActive = false,
+  sweep = null,
+  relayInFlightCount = 0,
+  runnerTabsClosed = 0,
+  release = null,
+}) {
+  const accepted = reason === 'previous_capture_stopped';
+  const requiresOperator = STOP_FENCE_OPERATOR_REASONS.has(reason);
+  const targets = (sweep?.targets || []).map((target) =>
+    ctx.closedRunnerTabIds.has(target.tabId) && target.evidence === 'tab_closed'
+      ? {...target, role: 'runner', evidence: 'runner_closed'}
+      : target,
+  );
+  let appendedRunnerCount = 0;
+  for (const tabId of ctx.closedRunnerTabIds) {
+    if (!targets.some((target) => target.tabId === tabId)) {
+      appendedRunnerCount += 1;
+      targets.push({
+        tabId,
+        role: 'runner',
+        evidence: 'runner_closed',
+        platform: 'extension',
+        documentState: 'unknown',
+        overlayState: '',
+      });
+    }
+  }
+  // 非证明页放前面（需人工的最前），截断到 40 个。
+  const orderedTargets = [...targets].sort((left, right) => {
+    const rank = (target) =>
+      STOP_FENCE_OPERATOR_REASONS.has(target.evidence)
+        ? 0
+        : isStopFenceProofTarget(target)
+          ? 2
+          : 1;
+    return rank(left) - rank(right);
+  });
+  const unresolved = sweep?.unresolved || [];
+  const {pendingTabIds, pendingTabs} = accepted
+    ? {pendingTabIds: [], pendingTabs: []}
+    : buildStopFencePendingTabs(
+        orderedTargets,
+        sweep?.titles || new Map(),
+        unresolved,
+      );
+  const scrollingOldPages = orderedTargets.filter(
+    (target) =>
+      target.evidence === 'old_document_uninspectable' &&
+      target.overlayState === 'running',
+  ).length;
+  // 停在浏览器错误页的页面不会“稍后可检查”，只能等满 10 分钟的离站窗口。
+  const errorPageTabIds = sweep?.errorPageTabIds || new Set();
+  const observingErrorPages = orderedTargets.filter(
+    (target) =>
+      target.evidence === 'off_platform_observing' &&
+      errorPageTabIds.has(target.tabId),
+  ).length;
+  const message = `${stopFenceReasonMessage(reason)}${
+    scrollingOldPages > 0 ? `；其中 ${scrollingOldPages} 个页面仍在自动滚动` : ''
+  }${
+    observingErrorPages > 0
+      ? `；其中 ${observingErrorPages} 个页面停在浏览器错误页（旧页面已不在），连续满 10 分钟后自动确认`
+      : ''
+  }`.slice(0, 200);
+  const epoch = ctx.epoch || runtimeEpochFallback();
+  const fenceRuntimeId = String(ctx.fence?.runtimeEpochId || '').trim();
+  return {
+    version: 1,
+    mode: 'check',
+    checkId: ctx.checkId,
+    taskId: ctx.serverTaskId,
+    requestId: ctx.requestId,
+    accepted,
+    reason,
+    retryable: !accepted && !requiresOperator,
+    requiresOperator,
+    proofMethod: 'browser_sweep',
+    requestKnown: Boolean(ctx.request),
+    requestStatus: String(ctx.request?.status || '').slice(0, 40),
+    requestActive,
+    attemptId: String(ctx.request?.attemptId || '').slice(0, 240),
+    lockAttemptId: ctx.boundToR
+      ? String(ctx.lock?.captureTaskAttemptId || '').slice(0, 240)
+      : '',
+    runtimeEpochOrigin: String(epoch.origin || 'unknown'),
+    runtimeStartedAt: new Date(Number(epoch.startedAt) || workerStartedAt).toISOString(),
+    fenceRuntime:
+      fenceRuntimeId && epoch.known === true && epoch.id
+        ? fenceRuntimeId === epoch.id ? 'same' : 'different'
+        : 'unknown',
+    captureRequestKnown: collectStopFenceRequestCaptureIds(ctx).size > 0,
+    sweepComplete: Boolean(sweep?.complete),
+    sweptTabCount: (Number(sweep?.sweptTabCount) || 0) + appendedRunnerCount,
+    unresolvedTabCount: unresolved.length,
+    relayInFlightCount,
+    targets: orderedTargets.slice(0, 40),
+    pendingTabIds,
+    pendingTabs,
+    runnerTabsClosed,
+    scopedCancelSent: ctx.scopedCancelSent,
+    lockReleased: release?.lockReleased === true,
+    localLockBoundToRequest: accepted
+      ? false
+      : Boolean(release ? release.localLockBoundToRequest : ctx.boundToR),
+    residueReleased: release?.residueReleased === true,
+    localStopConfirmationAt: String(release?.localStopConfirmationAt || ''),
+    checkedAt: new Date().toISOString(),
+    durationMs: Math.max(0, Date.now() - startedAt),
+    message,
+  };
+}
+
+async function persistStopFenceOffPlatformObservations(ctx) {
+  if (!ctx.offPlatformChanged) return;
+  await updateStopFenceCheckStore((store) => ({
+    ...store,
+    offPlatformSeen: {...ctx.offPlatformSeen},
+  })).catch((error) => {
+    console.warn('[StopFence] off-platform observations not saved:', error);
+  });
+}
+
+// 核对流程（mode: 'check'）。
+async function confirmPreviousUnattendedStopForFenceCheck(offer) {
+  const startedAt = Date.now();
+  const state = await readStopFenceRequestState(offer.requestId);
+  const epoch = await ensureRuntimeEpoch();
+  const ctx = createStopFenceCheckContext(offer, state, epoch);
+  if (!state.ok) {
+    return buildStopFenceCheckResult(ctx, {
+      reason: 'storage_unreadable',
+      startedAt,
+    });
+  }
+  // 1. R 在请求槽里仍在运行：不做任何动作。
+  if (state.requestActive) {
+    return buildStopFenceCheckResult(ctx, {
+      reason: 'request_active',
+      startedAt,
+      requestActive: true,
+    });
+  }
+  try {
+    const store = await readStopFenceCheckStore();
+    ctx.offPlatformSeen = {...store.offPlatformSeen};
+  } catch {
+    ctx.offPlatformSeen = {};
+  }
+  let sweep;
+  let verdict;
+  let relayInFlightCount = 0;
+  let runnerTabsClosed = 0;
+  let release = null;
+  try {
+    sweep = await sweepStopFenceBrowser(ctx);
+    verdict = judgeStopFenceSweep(sweep);
+    if (verdict.ok) {
+      relayInFlightCount = await waitForStopFenceRequestRelaysToDrain(ctx);
+      if (relayInFlightCount > 0) {
+        verdict = {ok: false, reason: 'capture_still_active'};
+      }
+    } else {
+      relayInFlightCount = listRequestRelays(ctx.requestId, ctx.taskKey).length;
+    }
+    // 阶段二：阶段一全部成立后才关 R 已终态轮次的 runner，再复扫。
+    if (verdict.ok && sweep.runnerPending.length > 0) {
+      const closed = await closeStopFenceRunnerTabs(ctx);
+      runnerTabsClosed = closed.closedTabIds.length;
+      if (!closed.ok) {
+        verdict = {ok: false, reason: closed.reason};
+        if (closed.reason === 'runner_close_failed') {
+          sweep.targets.push(
+            ...sweep.runnerPending
+              .filter((runner) => !ctx.closedRunnerTabIds.has(runner.tabId))
+              .map((runner) => ({
+                tabId: runner.tabId,
+                role: 'runner',
+                evidence: 'runner_close_failed',
+                platform: 'extension',
+                documentState: 'unknown',
+                overlayState: '',
+              })),
+          );
+        }
+      } else {
+        sweep = await sweepStopFenceBrowser(ctx, {rescan: true});
+        verdict = judgeStopFenceSweep(sweep);
+        if (verdict.ok) {
+          relayInFlightCount = await waitForStopFenceRequestRelaysToDrain(ctx);
+          if (relayInFlightCount > 0) {
+            verdict = {ok: false, reason: 'capture_still_active'};
+          }
+        }
+      }
+    }
+    // 本机释放：只有全部页面都成立才执行。
+    if (verdict.ok) {
+      release = await releaseStopFenceLocalResources(ctx, {
+        method: 'stop_fence_check',
+        proofStatus: 'agent_confirmed',
+        targetTabIds: sweep.targets.map((target) => target.tabId),
+        preserveTabIds: sweep.targets
+          .filter((target) => target.evidence === 'unrelated_live_capture')
+          .map((target) => target.tabId),
+        stage: 'stop_fence_check',
+      });
+      if (!release.ok) verdict = {ok: false, reason: release.reason};
+    }
+  } catch (error) {
+    console.warn('[StopFence] check failed:', error);
+    verdict = {ok: false, reason: 'storage_unreadable'};
+  } finally {
+    await persistStopFenceOffPlatformObservations(ctx);
+  }
+  return buildStopFenceCheckResult(ctx, {
+    reason: verdict.ok ? 'previous_capture_stopped' : verdict.reason,
+    startedAt,
+    sweep,
+    relayInFlightCount,
+    runnerTabsClosed,
+    release,
+  });
+}
+
+function buildStopFenceReleaseOnlyResult(
+  offer,
+  reason,
+  {runnerTabsClosed = 0, release = null, boundToR = false} = {},
+) {
+  const accepted = reason === 'local_release_done' ||
+    reason === 'local_lock_absent';
+  return {
+    version: 1,
+    mode: 'release_only',
+    checkId: offer.checkId,
+    taskId: offer.taskId,
+    requestId: offer.requestId,
+    accepted,
+    reason,
+    retryable: !accepted,
+    runnerTabsClosed,
+    lockReleased: release?.lockReleased === true,
+    localLockBoundToRequest: accepted
+      ? false
+      : Boolean(release ? release.localLockBoundToRequest : boundToR),
+    residueReleased: release?.residueReleased === true,
+    checkedAt: new Date().toISOString(),
+    message: stopFenceReasonMessage(reason),
+  };
+}
+
+// 仅释放流程（mode: 'release_only'）：运营已人工确认。不做页面证明、不发取消，
+// 只关 R 已终态轮次的 runner，并按精确身份释放本机执行锁与采集辅助。
+async function releaseStopFenceLocalResourcesForOperator(offer) {
+  const state = await readStopFenceRequestState(offer.requestId);
+  const ctx = createStopFenceCheckContext(offer, state, null);
+  const finish = (reason, {runnerTabsClosed = 0, release = null} = {}) =>
+    buildStopFenceReleaseOnlyResult(offer, reason, {
+      runnerTabsClosed,
+      release,
+      boundToR: ctx.boundToR,
+    });
+  if (!state.ok) return finish('storage_unreadable');
+  if (state.requestActive) return finish('request_active');
+  try {
+    ctx.lock = await readStoredCaptureExecutionLock();
+    ctx.boundToR = isStopFenceLockBoundToRequest(ctx.lock, ctx);
+    const closed = await closeStopFenceRunnerTabs(ctx);
+    if (!closed.ok) {
+      return finish(closed.reason, {
+        runnerTabsClosed: closed.closedTabIds.length,
+      });
+    }
+    const release = await releaseStopFenceLocalResources(ctx, {
+      method: 'stop_fence_operator_confirmed',
+      proofStatus: 'operator_confirmed',
+      stage: 'stop_fence_release_only',
+    });
+    return finish(
+      release.ok
+        ? release.lockReleased ? 'local_release_done' : 'local_lock_absent'
+        : release.reason,
+      {runnerTabsClosed: closed.closedTabIds.length, release},
+    );
+  } catch (error) {
+    console.warn('[StopFence] local release failed:', error);
+    return finish('local_release_failed');
+  }
+}
+
+async function executeStopFenceCheckOffer(offer) {
+  return offer.mode === 'release_only'
+    ? await releaseStopFenceLocalResourcesForOperator(offer)
+    : await confirmPreviousUnattendedStopForFenceCheck(offer);
+}
+
+function requestImmediateCloudTaskAgentSync(reason) {
+  if (cloudTaskAgentSyncInFlight) {
+    cloudTaskAgentSyncPending = true;
+    return;
+  }
+  setTimeout(() => {
+    syncCloudTaskAgent({reason, force: true}).catch((error) =>
+      console.warn('[CloudTaskAgent] follow-up sync failed:', error),
+    );
+  }, 0);
+}
+
+// 回执：除 429 外的任何 4xx（含 404 统一成的 endpoint_missing）标记已送达并
+// 丢弃结果；5xx、429 和网络错误保留缓存结果，下次心跳重发。
+async function deliverStopFenceCheckResult(offer, result, token) {
+  let response;
+  try {
+    response = await cloudTaskAgentApi.completeStopFenceCheck({
+      token,
+      checkId: offer.checkId,
+      taskId: offer.taskId,
+      requestId: offer.requestId,
+      result,
+    });
+  } catch (error) {
+    response = {
+      ok: false,
+      reason: 'network_error',
+      message: String(error?.message || error || '').slice(0, 200),
+    };
+  }
+  const status = Number(response?.status) || 0;
+  const delivered = response?.ok === true;
+  const discarded = !delivered && (
+    response?.reason === 'endpoint_missing' ||
+    (status >= 400 && status < 500 && status !== 429)
+  );
+  // 核对项每轮重试都换新 checkId；仅释放项的 checkId 不变（服务端 3 分钟后
+  // 以同一 checkId 重发）。所以仅释放项送达但未完成释放时不能当作终结，记下
+  // 最早重跑时间，同一 checkId 再次下发时重新执行。
+  const retryAt =
+    offer.mode === 'release_only' &&
+    delivered &&
+    (result?.accepted !== true || response?.localRelease === 'pending')
+      ? Date.now() + STOP_FENCE_CHECK_TIMING.releaseOnlyRetryMs
+      : 0;
+  await updateStopFenceCheckStore((store) => {
+    const entry = store.entries[offer.checkId] || {};
+    return {
+      ...store,
+      entries: {
+        ...store.entries,
+        [offer.checkId]: {
+          ...entry,
+          taskId: offer.taskId,
+          requestId: offer.requestId,
+          mode: offer.mode,
+          state: 'done',
+          result: discarded ? null : result,
+          posted: delivered || discarded,
+          at: Number(entry.at) || Date.now(),
+          retryAt,
+        },
+      },
+    };
+  }).catch((error) => {
+    console.warn('[StopFence] delivery state not saved:', error);
+  });
+  if (delivered && response?.released === true) {
+    // 已放行：立即补一次完整心跳去领任务。
+    requestImmediateCloudTaskAgentSync('stop_fence_released');
+  }
+  return {
+    delivered,
+    discarded,
+    released: delivered && response?.released === true,
+    retryAt,
+    response,
+  };
+}
+
+// 心跳接入：单飞，每次最多处理一条，按 checkId 去重（同一 checkId 最多每
+// 10 分钟执行一次）。
+async function runStopFenceChecksFromHeartbeat(offers, credential = {}) {
+  if (!Array.isArray(offers) || offers.length === 0) {
+    return {ok: true, handled: 0, reason: 'no_offers'};
+  }
+  if (!cloudTaskAgentApi?.completeStopFenceCheck) {
+    return {ok: false, handled: 0, reason: 'cloud_agent_unavailable'};
+  }
+  if (stopFenceCheckInFlight) {
+    return {ok: false, handled: 0, reason: 'check_in_flight'};
+  }
+  stopFenceCheckInFlight = true;
+  try {
+    const token = String(credential?.token || '');
+    let store;
+    try {
+      store = await readStopFenceCheckStore();
+    } catch (error) {
+      console.warn('[StopFence] check state unreadable:', error);
+      return {ok: false, handled: 0, reason: 'storage_unreadable'};
+    }
+    const now = Date.now();
+    for (const rawOffer of offers.slice(0, STOP_FENCE_CHECK_OFFER_LIMIT)) {
+      const offer = normalizeStopFenceCheckOffer(rawOffer);
+      if (!offer) continue;
+      const entry = store.entries[offer.checkId];
+      const entryAgeMs = now - (Number(entry?.at) || 0);
+      if (entry?.state === 'running' && entryAgeMs < STOP_FENCE_CHECK_TIMING.rerunAfterMs) {
+        continue;
+      }
+      if (entry?.state === 'done' && entry.posted) {
+        // 已送达即终结；只有未完成释放的仅释放项，在服务端以同一 checkId
+        // 重发且已过最早重跑时间时重新执行。
+        const releaseRetryDue =
+          offer.mode === 'release_only' &&
+          entry.mode === 'release_only' &&
+          Number(entry.retryAt) > 0 &&
+          now >= Number(entry.retryAt);
+        if (!releaseRetryDue) continue;
+      } else if (
+        entry?.state === 'done' &&
+        entry.result &&
+        entryAgeMs < STOP_FENCE_CHECK_TIMING.rerunAfterMs
+      ) {
+        const delivery = await deliverStopFenceCheckResult(
+          offer,
+          entry.result,
+          token,
+        );
+        return {ok: true, handled: 1, action: 'redelivered', checkId: offer.checkId, ...delivery};
+      }
+      const rememberEntry = (state, result = null) =>
+        updateStopFenceCheckStore((current) => ({
+          ...current,
+          entries: {
+            ...current.entries,
+            [offer.checkId]: {
+              taskId: offer.taskId,
+              requestId: offer.requestId,
+              mode: offer.mode,
+              state,
+              result,
+              posted: false,
+              at: Date.now(),
+            },
+          },
+        })).catch((error) => {
+          // 记不下去重状态时仍照常核对与回执；内存单飞仍然有效。
+          console.warn('[StopFence] check state not saved:', error);
+        });
+      await rememberEntry('running');
+      let result;
+      try {
+        result = await executeStopFenceCheckOffer(offer);
+      } catch (error) {
+        console.warn('[StopFence] check crashed:', error);
+        result = offer.mode === 'release_only'
+          ? buildStopFenceReleaseOnlyResult(offer, 'local_release_failed')
+          : buildStopFenceCheckResult(
+              createStopFenceCheckContext(offer, {request: null}, null),
+              {reason: 'storage_unreadable', startedAt: Date.now()},
+            );
+      }
+      await rememberEntry('done', result);
+      const delivery = await deliverStopFenceCheckResult(offer, result, token);
+      return {
+        ok: true,
+        handled: 1,
+        action: 'executed',
+        checkId: offer.checkId,
+        result,
+        ...delivery,
+      };
+    }
+    return {ok: true, handled: 0, reason: 'nothing_to_do'};
+  } finally {
+    stopFenceCheckInFlight = false;
+  }
+}
+
+// 仅释放项（运营已人工确认）不探测页面、不发取消，很快。心跳在执行本轮
+// 指令之前先把它跑完：人工确认后的第一次完整心跳往往同时带着创建指令，
+// 若先建任务，新任务会撞上绑定 R 的旧执行锁，走 0.4.15 带刷新的旧锁清理，
+// 或以执行锁冲突收尾。有核对正在进行时等它结束；整体最多等 releaseOnlyWaitMs，
+// 超时就照常执行指令，仅释放项按服务端重发再做。
+async function runStopFenceReleaseOnlyBeforeCommands(offers, credential = {}) {
+  const releaseOffers = (Array.isArray(offers) ? offers : [])
+    .slice(0, STOP_FENCE_CHECK_OFFER_LIMIT)
+    .filter((offer) => offer?.mode === 'release_only');
+  if (releaseOffers.length === 0) {
+    return {ok: true, handled: 0, reason: 'no_offers'};
+  }
+  const deadlineAt = Date.now() + STOP_FENCE_CHECK_TIMING.releaseOnlyWaitMs;
+  let handled = 0;
+  for (const offer of releaseOffers) {
+    for (;;) {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        return {ok: false, handled, reason: 'release_only_wait_timeout'};
+      }
+      let outcome;
+      try {
+        outcome = await withStopFenceTimeout(
+          () => runStopFenceChecksFromHeartbeat([offer], credential),
+          remainingMs,
+          'stop_fence_release_only_timeout',
+        );
+      } catch {
+        return {ok: false, handled, reason: 'release_only_wait_timeout'};
+      }
+      if (outcome?.reason !== 'check_in_flight') {
+        handled += Number(outcome?.handled) || 0;
+        break;
+      }
+      await stopFenceSleep(
+        Math.min(STOP_FENCE_CHECK_TIMING.releaseOnlyPollMs, remainingMs),
+      );
+    }
+  }
+  return {ok: true, handled};
+}
+
 async function retryUnattendedLocalClosureCleanup(request) {
   const expectedRequestId = String(request?.id || '').trim();
   const expectedAttemptId = String(request?.attemptId || '').trim();
@@ -11929,6 +13932,14 @@ async function claimUnattendedKeywordRun({
         transferredLock,
       );
       if (!stopResult.ok) {
+        // 只留证据（哪个页面、为什么没停下），供 0.4.16 停止保护核对使用。
+        const stopFenceEvidence = await buildUnattendedStopFenceEvidence({
+          request,
+          lock: transferredLock,
+          targets: [{tabId: transferredLock?.holderTabId, role: 'lock_holder'}],
+          stopResult,
+          failedTabId: transferredLock?.holderTabId,
+        }).catch(() => null);
         const blockedAt = new Date().toISOString();
         const blockedMessage =
           '旧采集页面未能安全停止，已阻止自动继续；请在任务中心取消任务或人工检查页面后重试';
@@ -11943,6 +13954,7 @@ async function claimUnattendedKeywordRun({
             code: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
             message: blockedMessage,
           },
+          ...(stopFenceEvidence ? {stopFenceEvidence} : {}),
         };
         await persistUnattendedRunMutation(blockedRequest, {
           previousRequest: request,
@@ -12666,7 +14678,11 @@ async function deferPendingUnattendedRecoveryForLock(request, activeLock) {
   });
 }
 
-async function markUnattendedRecoveryStopUnconfirmed(request, message) {
+async function markUnattendedRecoveryStopUnconfirmed(
+  request,
+  message,
+  stopFenceEvidence = null,
+) {
   return await runUnattendedRunMutation(async () => {
     const current = await readUnattendedKeywordRunRequest();
     if (
@@ -12690,6 +14706,9 @@ async function markUnattendedRecoveryStopUnconfirmed(request, message) {
         code: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
         message,
       },
+      ...(stopFenceEvidence && typeof stopFenceEvidence === 'object'
+        ? {stopFenceEvidence}
+        : {}),
     };
     await persistUnattendedRunMutation(nextRequest, {
       previousRequest: current,
@@ -12748,9 +14767,19 @@ async function launchPendingUnattendedRecovery(request) {
     if (!stopResult.ok) {
       const message =
         '旧采集页面未能安全停止，本次恢复已暂停；请人工检查页面后从任务中心重试';
+      const stopFenceEvidence = await buildUnattendedStopFenceEvidence({
+        request,
+        lock: activeLock,
+        targets: [
+          {tabId: activeLock.holderTabId, role: 'lock_holder'},
+          {tabId: request?.progress?.runnerTabId, role: 'progress_tab'},
+        ],
+        stopResult,
+      }).catch(() => null);
       const blockedRequest = await markUnattendedRecoveryStopUnconfirmed(
         request,
         message,
+        stopFenceEvidence,
       );
       return {
         recovered: false,
@@ -13099,9 +15128,19 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
   if (!stopResult.ok) {
     const message =
       '旧采集页面未能安全停止，已阻止自动恢复；请人工检查页面后从任务中心继续';
+    const stopFenceEvidence = await buildUnattendedStopFenceEvidence({
+      request,
+      lock: oldUnattendedLock,
+      targets: [
+        {tabId: request.progress?.runnerTabId, role: 'progress_tab'},
+        {tabId: oldUnattendedLock?.holderTabId, role: 'lock_holder'},
+      ],
+      stopResult,
+    }).catch(() => null);
     const blockedRequest = await markUnattendedRecoveryStopUnconfirmed(
       transition.request,
       message,
+      stopFenceEvidence,
     );
     return {
       recovered: false,
@@ -15666,9 +17705,82 @@ async function reloadStalledCaptureTab(tabId, { shouldAbort = null } = {}) {
   return !(typeof shouldAbort === 'function' && shouldAbort());
 }
 
-async function relayToContentWithRetry(tabId, payload) {
+// 登记一次在途内容中继。owner 只由 relay-to-content 从 sender 取得；内部取消
+// 中继不传 owner，登记为 internal，不计入任何请求。
+function registerInFlightContentRelay(tabId, payload = {}, owner = null) {
+  inFlightContentRelaySequence += 1;
+  const key = `relay-${inFlightContentRelaySequence}`;
+  const source =
+    owner && typeof owner === 'object' && !Array.isArray(owner) ? owner : null;
+  inFlightContentRelays.set(key, {
+    tabId: resolveCaptureTaskTabId(tabId),
+    action: String(payload?.action || '').slice(0, 80),
+    captureRequestId: getCaptureRequestId(payload),
+    taskId: String(source?.taskId || '').trim(),
+    senderTabId: resolveCaptureTaskTabId(source?.senderTabId),
+    senderDocumentId: String(source?.senderDocumentId || '').trim(),
+    runnerRequestId: String(source?.runnerRequestId || '').trim(),
+    runnerAttemptId: String(source?.runnerAttemptId || '').trim(),
+    internal: !source,
+    startedAt: Date.now(),
+  });
+  return key;
+}
+
+// R 名下的在途中继：R 的 runner 发起的，或带 R 稳定任务号的。包括不带
+// captureRequestId 的动作（例如 applyBatchSearchFilters）。
+function listRequestRelays(requestId = '', taskKey = '') {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedTaskKey = String(taskKey || '').trim();
+  if (!normalizedRequestId && !normalizedTaskKey) return [];
+  return [...inFlightContentRelays.values()].filter((relay) =>
+    !relay.internal &&
+    (
+      (normalizedRequestId && relay.runnerRequestId === normalizedRequestId) ||
+      (normalizedTaskKey && relay.taskId === normalizedTaskKey)
+    ),
+  );
+}
+
+function findRelaysByCaptureRequestId(captureRequestId = '') {
+  const normalized = String(captureRequestId || '').trim();
+  if (!normalized) return [];
+  return [...inFlightContentRelays.values()].filter(
+    (relay) => relay.captureRequestId === normalized,
+  );
+}
+
+// relay-to-content 的发起方。sender.url 是本扩展页面时解析 runner 的请求与
+// 轮次参数；侧栏与普通页面只记文档和标签页。
+function buildContentRelayOwner(sender = {}, requestedTaskId = '') {
+  let runnerRequestId = '';
+  let runnerAttemptId = '';
+  try {
+    const senderUrl = new URL(String(sender?.url || ''));
+    if (isOwnExtensionPageUrl(senderUrl.href)) {
+      runnerRequestId = String(
+        senderUrl.searchParams.get(UNATTENDED_RUNNER_QUERY_KEY) || '',
+      ).trim();
+      runnerAttemptId = String(
+        senderUrl.searchParams.get(UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY) || '',
+      ).trim();
+    }
+  } catch {
+    // 没有可解析的 sender.url：只按文档和标签页登记。
+  }
+  return {
+    taskId: String(requestedTaskId || '').trim(),
+    senderTabId: resolveCaptureTaskTabId(sender?.tab?.id),
+    senderDocumentId: String(sender?.documentId || '').trim(),
+    runnerRequestId,
+    runnerAttemptId,
+  };
+}
+
+async function relayToContentWithRetry(tabId, payload, owner = null) {
   const timeoutMs = getContentRelayTimeoutMs(payload);
   const requestId = getCaptureRequestId(payload);
+  const inFlightRelayKey = registerInFlightContentRelay(tabId, payload, owner);
   if (requestId) {
     settledCaptureRequestIds.delete(requestId);
   }
@@ -15734,6 +17846,7 @@ async function relayToContentWithRetry(tabId, payload) {
 
     throw new Error('failed to relay message to content script');
   } finally {
+    inFlightContentRelays.delete(inFlightRelayKey);
     if (requestId) {
       abortedCaptureRequestIds.delete(requestId);
       markCaptureRequestSettled(requestId);
@@ -19032,7 +21145,11 @@ async function handleCaptureRuntimeTabRemoved(tabId) {
   await captureTaskTabGroupManager.handleTabRemoved(tabId);
 }
 
+// 建立本次加载标识；onStartup / onInstalled 再为本 worker 创建的标识定来源。
+void ensureRuntimeEpoch().catch(() => null);
+
 chrome.runtime.onInstalled.addListener(({ reason }) => {
+  void markRuntimeEpochOrigin('extension_load').catch(() => false);
   const resetObservedAccounts =
     reason === 'install' || reason === 'update'
       ? chrome.storage.local
@@ -19067,6 +21184,7 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  void markRuntimeEpochOrigin('browser_startup').catch(() => false);
   ensureRuntimeState()
     .then(() => retryCurrentTerminalUnattendedLocalClosure())
     .then(() => recoverTargetedPostPlatformTabCleanup({force: true}))
@@ -20152,10 +22270,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           };
         }
 
+        // 只登记发起方（文档、runner 请求/轮次、任务号），不改变中继行为；
+        // 停止保护核对据此追溯页面上的采集活动归属。
+        const relayOwner = buildContentRelayOwner(sender, requestedTaskId);
         let response;
         let relayError = null;
         try {
-          response = await relayToContentWithRetry(relayTabId, relayPayload);
+          response = await relayToContentWithRetry(
+            relayTabId,
+            relayPayload,
+            relayOwner,
+          );
         } catch (error) {
           relayError = error;
           throw error;

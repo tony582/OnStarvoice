@@ -6665,12 +6665,15 @@ router.post(
         if (targetBusyTask) {
           return {failure: requestError(
             'handoff_target_busy',
-            '接力节点当前有执行中或排队任务，请选择空闲节点',
+            targetBusyTask.reason === 'previous_capture_stop_unconfirmed'
+              ? '接力节点旧采集页面尚未确认停止，请选择其它节点，或先在执行节点中处理'
+              : '接力节点当前有执行中或排队任务，请选择空闲节点',
             409,
             {
               blockingTaskId: targetBusyTask.task_id || targetBusyTask.id,
               blockingTaskStatus: targetBusyTask.status,
               blockerKind: targetBusyTask.kind,
+              blockerReason: targetBusyTask.reason || '',
             },
           )};
         }

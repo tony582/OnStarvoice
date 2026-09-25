@@ -241,6 +241,7 @@ interface MobileOpsControlSummary {
       expectedScheduleCount?: number
       recoveredItemCount?: number
       sourceClosureBlockedCount?: number
+      stopFenceBlockedAgentCount?: number
       manualBlockerCount?: number
       onlineAgentCount?: number
       registeredAgentCount?: number
@@ -464,6 +465,8 @@ function MobileOpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatc
   const summary = run?.summary || {}
   const actionSummary = summary.actions || {}
   const sourceClosureBlockedCount = Number(summary.sourceClosureBlockedCount || 0)
+  // 节点因旧采集页面未确认停止而暂停接单的数量（与条目级「恢复阻塞」含义不同）。
+  const stopFenceBlockedAgentCount = Number(summary.stopFenceBlockedAgentCount || 0)
   const explicitManualBlockerCount = Number(summary.manualBlockerCount || 0)
   const guarded = data?.mode === 'guarded'
   const actionsEnabled = data?.policy?.actionsEnabled === true
@@ -471,6 +474,8 @@ function MobileOpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatc
   const firstIncidentType = firstIncident?.incident_type || firstIncident?.type || ''
   const alertLabel = firstIncidentType === 'capture_source_closure_blocked'
     ? '恢复阻塞：等待原 Agent 关闭确认'
+    : firstIncidentType === 'capture_agent_stop_fence_blocked'
+    ? '节点旧页面未确认停止，已暂停接单'
     : firstIncident?.alert_delivery_status === 'sent'
     ? '提醒已发'
     : ['retry_wait', 'blocked_config', 'failed'].includes(firstIncident?.alert_delivery_status || '')
@@ -509,10 +514,11 @@ function MobileOpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatc
       </div>
 
       {enabled && run && (
-        <div className="mt-3 grid grid-cols-2 gap-y-3 divide-x divide-border rounded-xl bg-muted/45 py-2.5 text-center">
+        <div className="mt-3 grid grid-cols-3 gap-y-3 divide-x divide-border rounded-xl bg-muted/45 py-2.5 text-center">
           <MobileOpsFact label="计划覆盖" value={`${Number(summary.observedScheduleCount || 0)}/${Number(summary.expectedScheduleCount || 0)}`} />
           <MobileOpsFact label="恢复已完成" value={String(Number(summary.recoveredItemCount || 0))} />
           <MobileOpsFact label="恢复阻塞" value={String(sourceClosureBlockedCount)} />
+          <MobileOpsFact label="待确认停止" value={String(stopFenceBlockedAgentCount)} danger={stopFenceBlockedAgentCount > 0} />
           <MobileOpsFact label="需人工" value={String(explicitManualBlockerCount)} />
         </div>
       )}
@@ -550,8 +556,8 @@ function MobileOpsControlCard({ data, busy, canObserve, onObserve, onOpenDispatc
   )
 }
 
-function MobileOpsFact({ label, value }: { label: string; value: string }) {
-  return <div><div className="text-[17px] font-extrabold tabular-nums">{value}</div><div className="mt-0.5 text-[9.5px] text-muted-foreground">{label}</div></div>
+function MobileOpsFact({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
+  return <div><div className={cn('text-[17px] font-extrabold tabular-nums', danger && 'text-status-red')}>{value}</div><div className="mt-0.5 text-[9.5px] text-muted-foreground">{label}</div></div>
 }
 
 function TasksHub({ openPage }: { openPage: OpenPage }) {

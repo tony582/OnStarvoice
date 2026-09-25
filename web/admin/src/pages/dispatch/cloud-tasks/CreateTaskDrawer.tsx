@@ -88,7 +88,7 @@ export function CreateTaskDrawer({
   writable: boolean
   intent: ComposerIntent
   onClose: () => void
-  onCreated: (taskType: TaskType) => Promise<void>
+  onCreated: (taskType: TaskType, serverMessage?: string) => Promise<void>
   onLaunchOrchestration: (intent: OrchestrationLaunchIntent) => void
 }) {
   const editingExisting = intent.editExisting === true
@@ -493,8 +493,8 @@ export function CreateTaskDrawer({
                   editExistingInitially={editingExisting}
                   hideLauncher
                   lockExecutionMode
-                  onCreated={async () => {
-                    await onCreated(taskType)
+                  onCreated={async serverMessage => {
+                    await onCreated(taskType, serverMessage)
                     onClose()
                   }}
                 />

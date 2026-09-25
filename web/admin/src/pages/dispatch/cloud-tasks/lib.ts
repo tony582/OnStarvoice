@@ -1,3 +1,5 @@
+import type { AgentStopFence } from './stop-fence-presentation.mjs'
+
 export type CaptureEnhancementSettings = {
   autoDetailCaptureAfterListCapture?: boolean
   autoSyncAfterDetailCapture?: boolean
@@ -66,6 +68,8 @@ export type CloudAgent = {
   online: boolean
   active_task_count?: number
   queued_task_count?: number
+  /** 旧采集页面未确认停止（服务端 /overview 计算 phase）；为空表示没有停止保护。 */
+  stop_fence?: AgentStopFence | null
 }
 
 export type CloudTask = {

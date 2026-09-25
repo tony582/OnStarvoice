@@ -30,7 +30,7 @@ export function AgentTaskCreator({
 }: {
   agent: CloudAgent
   writable: boolean
-  onCreated: () => Promise<void>
+  onCreated: (serverMessage?: string) => Promise<void>
   initialExecutionMode?: 'one_time' | 'unattended_plan'
   forceOpen?: boolean
   editExistingInitially?: boolean
@@ -411,7 +411,7 @@ export function AgentTaskCreator({
             : '无人值守计划已排队，将在设备上线后保存。'
           : '一次性采集任务已创建，将在设备上线后自动领取。'))
       if (!editingExistingPlan) setKeywordText('')
-      await onCreated()
+      await onCreated(result.message)
     } catch (err) {
       setError(err instanceof Error ? err.message : '创建关键词采集任务失败')
     } finally {

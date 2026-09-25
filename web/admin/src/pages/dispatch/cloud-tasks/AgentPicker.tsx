@@ -11,6 +11,7 @@ import {
   safeNumber,
   taskBelongsToAgent,
 } from './lib'
+import { agentStopFenceNotice, isAgentStopFenced } from './stop-fence-presentation.mjs'
 
 // 共用的执行节点选择列表：新建任务向导按单选/多选复用。
 // 行内展示状态点、名称、设备、负责平台与负载；不可选（暂停/能力缺失/无可用平台）时禁用并注明原因。
@@ -37,6 +38,10 @@ export function AgentPicker({
     const leftBlocked = Boolean(agentTaskTypeBlockReason(left, taskType, mode))
     const rightBlocked = Boolean(agentTaskTypeBlockReason(right, taskType, mode))
     if (leftBlocked !== rightBlocked) return leftBlocked ? 1 : -1
+    // 停止保护中的节点仍可选（分配后排队），但排在可立即接单的在线节点之后。
+    const leftReady = left.online && !isAgentStopFenced(left)
+    const rightReady = right.online && !isAgentStopFenced(right)
+    if (leftReady !== rightReady) return leftReady ? -1 : 1
     if (left.online !== right.online) return left.online ? -1 : 1
     return `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN')
   }), [agents, mode, taskType])
@@ -77,6 +82,7 @@ export function AgentPicker({
         const activeTaskCount = workloadKnown ? safeNumber(agent.active_task_count) : agentTasks.length
         const queuedTaskCount = workloadKnown ? safeNumber(agent.queued_task_count) : 0
         const dotClass = agent.status === 'paused' ? 'bg-status-orange' : agent.online ? 'bg-status-green' : 'bg-muted-foreground/40'
+        const stopFence = agentStopFenceNotice(agent)
         return (
           <button key={agent.id} type="button" role={multiple ? 'checkbox' : 'radio'} aria-checked={selected} disabled={Boolean(blockReason)}
             onClick={() => toggle(agent.id)}
@@ -98,7 +104,11 @@ export function AgentPicker({
               </span>
               {blockReason
                 ? <span className="mt-1 block text-[11px] font-medium text-status-red">{blockReason}</span>
-                : !agent.online && <span className="mt-1 block text-[11px] font-medium text-amber-700 dark:text-amber-300">Agent 离线；分配后会排队，上线即执行</span>}
+                : stopFence?.blocking
+                  ? <span className="mt-1 block text-[11px] font-medium text-amber-700 dark:text-amber-300">等待确认旧页面已停止{stopFence.elapsedLabel ? `（${stopFence.elapsedLabel}）` : ''}；分配后会排队，确认后执行</span>
+                  : stopFence?.holdsNewWork
+                  ? <span className="mt-1 block text-[11px] font-medium text-amber-700 dark:text-amber-300">节点正在释放旧任务的本机执行锁；分配后会排队，释放后执行</span>
+                  : !agent.online && <span className="mt-1 block text-[11px] font-medium text-amber-700 dark:text-amber-300">Agent 离线；分配后会排队，上线即执行</span>}
             </span>
             <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${selected ? 'border-primary bg-primary' : 'border-border'}`}>
               {selected && <CheckCircle2 className="h-3.5 w-3.5 text-primary-foreground" />}

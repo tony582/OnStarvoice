@@ -12,6 +12,14 @@ import {
 } from './email-notifier.js';
 import {runOpsControlGuardedActions} from './ops-control-actions.js';
 import {normalizeCaptureRecoverySettings} from './capture-recovery-intents.js';
+import {
+  STOP_FENCE_OPERATOR_PHASES,
+  STOP_FENCE_PHASES,
+  listCaptureAgentStopFences,
+  stopFenceAutoCheckEnabled,
+  stopFencePhaseLabel,
+  summarizeAgentStopFence,
+} from './capture-stop-fence.js';
 
 export const OPS_CONTROL_POLICY_VERSION = 'ops-guarded-v1';
 export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.15';
@@ -81,6 +89,9 @@ const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/u;
 const SHANGHAI_OFFSET = '+08:00';
 const MAX_TENANTS_PER_CYCLE = 50;
 export const OPS_CONTROL_TASK_WAKE_GRACE_SECONDS = 30 * 60;
+// A node kept out of admission by an unconfirmed old-page stop is reported
+// once the fence has lasted this long (the automatic check gets its chance).
+export const OPS_CONTROL_STOP_FENCE_ALERT_AFTER_SECONDS = 30 * 60;
 const OPS_CONTROL_TASK_WINDOW_END_PADDING_MS = 60 * 1000;
 
 function object(value) {
@@ -713,6 +724,38 @@ async function collectAgents(db, tenantId) {
   `, [tenantId]);
 }
 
+async function collectStopFences(db, tenantId, agents, now) {
+  // Same listing and phase as the Admin node panel, so the duty view never
+  // guesses a fence from error codes (the 976a0c6 rule keeps the old code).
+  const rows = await listCaptureAgentStopFences(db, tenantId, {
+    includeLocalRelease: true,
+  });
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const byAgent = new Map();
+  for (const row of rows) {
+    const agentId = text(row.agent_id, 80);
+    if (!byAgent.has(agentId)) byAgent.set(agentId, []);
+    byAgent.get(agentId).push(row);
+  }
+  const autoCheckEnabled = stopFenceAutoCheckEnabled();
+  const result = [];
+  for (const agent of Array.isArray(agents) ? agents : []) {
+    const agentRows = byAgent.get(text(agent.id, 80));
+    if (!agentRows) continue;
+    const summary = summarizeAgentStopFence(agent, agentRows, {now, autoCheckEnabled});
+    if (!summary) continue;
+    result.push({
+      agentId: text(agent.id, 80),
+      displayName: text(agent.display_name || agent.client_label || agent.browser_name, 240),
+      phase: summary.phase,
+      since: summary.since,
+      taskCount: summary.task_count,
+      escalated: summary.escalated,
+    });
+  }
+  return result;
+}
+
 async function collectOperations(db, tenantId, window) {
   return db.queryOne(`
     SELECT
@@ -893,6 +936,7 @@ export async function collectOpsControlEvidence({
   const schedules = await collectSchedules(database, tenantId, window, now);
   const tasks = await collectTasks(database, tenantId, window);
   const agents = await collectAgents(database, tenantId);
+  const stopFences = await collectStopFences(database, tenantId, agents, now);
   const operations = await collectOperations(database, tenantId, window);
   const persistence = await collectPersistence(database, tenantId, window);
   const ai = await collectAi(database, tenantId, window);
@@ -901,6 +945,7 @@ export async function collectOpsControlEvidence({
     schedules,
     tasks,
     agents,
+    stopFences,
     operations: operations || {},
     persistence: persistence || {},
     ai,
@@ -1017,6 +1062,26 @@ function normalizeAgent(row, capturedAt) {
   };
 }
 
+function normalizeStopFence(row) {
+  const value = object(row);
+  const phase = text(value.phase, 80);
+  return {
+    agentId: text(value.agentId, 80),
+    displayName: text(value.displayName, 240),
+    phase: STOP_FENCE_PHASES.includes(phase) ? phase : 'awaiting_node',
+    since: iso(value.since),
+    taskCount: integer(value.taskCount),
+    escalated: value.escalated === true,
+  };
+}
+
+function shanghaiMinuteLabel(value) {
+  const at = timestamp(value);
+  if (!at) return '未知时间';
+  const shifted = new Date(at + 8 * 60 * 60 * 1000).toISOString();
+  return `${shifted.slice(5, 10)} ${shifted.slice(11, 16)}`;
+}
+
 export function normalizeOpsControlEvidence(evidence = {}) {
   const capturedAt = iso(evidence.capturedAt) || new Date().toISOString();
   const schedules = Array.isArray(evidence.schedules)
@@ -1028,6 +1093,9 @@ export function normalizeOpsControlEvidence(evidence = {}) {
   const agents = Array.isArray(evidence.agents)
     ? evidence.agents.map(row => normalizeAgent(row, capturedAt))
     : [];
+  const stopFences = Array.isArray(evidence.stopFences)
+    ? evidence.stopFences.map(normalizeStopFence).filter(row => row.agentId)
+    : [];
   const operations = object(evidence.operations);
   const persistence = object(evidence.persistence);
   const prefilter = object(object(evidence.ai).prefilter);
@@ -1037,6 +1105,7 @@ export function normalizeOpsControlEvidence(evidence = {}) {
     schedules,
     tasks,
     agents,
+    stopFences,
     scheduleSummary: {
       expected: schedules.length,
       observed: schedules.filter(row => row.occurrenceState === 'observed').length,
@@ -1295,6 +1364,32 @@ export function assessOpsControlSnapshots(previousValue, currentValue, settings 
     ));
   }
 
+  // Nodes kept out of admission by an unconfirmed old-page stop. Informational
+  // only: never mapped to an automatic action. An operator-only phase alerts.
+  const blockedStopFences = (Array.isArray(current.stopFences) ? current.stopFences : [])
+    .filter(row => row?.agentId && row.phase !== 'local_release_pending');
+  const stopFenceBlockedAgentCount = blockedStopFences.length;
+  for (const row of blockedStopFences) {
+    const blockedSeconds = ageSeconds(current.capturedAt, row.since);
+    if (blockedSeconds === null || blockedSeconds < OPS_CONTROL_STOP_FENCE_ALERT_AFTER_SECONDS) {
+      continue;
+    }
+    incidents.push(incident(
+      'capture_agent_stop_fence_blocked',
+      row.agentId,
+      STOP_FENCE_OPERATOR_PHASES.includes(row.phase) ? 'high' : 'warning',
+      '节点旧采集页面未确认停止，已暂停接单',
+      `${row.displayName || row.agentId} 自 ${shanghaiMinuteLabel(row.since)} 起不接新任务：${stopFencePhaseLabel(row.phase)}；请到「执行节点」处理`,
+      {
+        agentId: row.agentId,
+        phase: row.phase,
+        since: row.since,
+        taskCount: integer(row.taskCount),
+        escalated: row.escalated === true,
+      },
+    ));
+  }
+
   if (consecutive && aiBacklogStalled(previous, current, policy)) {
     incidents.push(incident(
       'ai_backlog_stalled',
@@ -1397,6 +1492,7 @@ export function assessOpsControlSnapshots(previousValue, currentValue, settings 
     finalFailureCount,
     manualBlockerCount,
     sourceClosureBlockedCount,
+    stopFenceBlockedAgentCount,
     manualRecoveryStopCount,
     observationCount: integer(current.persistence?.observationCount),
     pendingRecordAiCount: integer(current.persistence?.pendingRecordAiCount),

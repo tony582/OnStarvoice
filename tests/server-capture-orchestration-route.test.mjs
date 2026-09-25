@@ -683,6 +683,17 @@ test('retry candidate SQL fails closed on unknown Shanghai usage and hard limits
   assert.match(route, /crossDeviceRetryAgentDailyUsageEligible\(agent\)/u);
 });
 
+test('retry candidates do not evaluate the stop fence on the detail poll', () => {
+  // GET /orchestrations/:id polls this every 5 s in the general DB gate. The
+  // fence SQL costs ~250 ms on production (2026-09-25), so fenced nodes are
+  // hidden by the admin from overview stop_fence instead.
+  const candidateStart = route.indexOf('async function loadRetryAgentCandidates');
+  const candidateEnd = route.indexOf('function publicRetryAgentCandidate', candidateStart);
+  const candidates = route.slice(candidateStart, candidateEnd);
+  assert.doesNotMatch(candidates, /captureTaskUnconfirmedLocalStopSql/u);
+  assert.doesNotMatch(candidates, /FROM capture_tasks fenced/u);
+});
+
 test('retryPending has a bounded deterministic consumer on the existing recovery sweep', () => {
   const consumerStart = route.indexOf(
     'export async function reconcilePendingOrchestrationRetries',

@@ -1,3 +1,5 @@
+import type { AgentStopFence } from './stop-fence-presentation.mjs'
+
 export type OrchestrationPlatform = 'xiaohongshu' | 'douyin'
 export type OrchestrationExecutionMode = 'one_time' | 'unattended_plan'
 
@@ -41,6 +43,8 @@ export type OrchestrationCloudAgent = {
   accountHealthStatus?: string
   recentTechnicalFailureCount?: number
   recentSuccessCount?: number
+  /** 与 CloudAgent 相同：旧采集页面未确认停止时由 /overview 带出。 */
+  stop_fence?: AgentStopFence | null
 }
 
 export type OrchestrationRecord = {

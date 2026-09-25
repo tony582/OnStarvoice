@@ -79,6 +79,18 @@ import {
   projectCaptureResourceAdmission,
 } from '../services/capture-resource-policy.js';
 import {registerOrchestrationParentProjector} from '../services/android-control/parent-refresh.js';
+import {
+  STOP_FENCE_CHECK_CAPABILITY,
+  STOP_FENCE_CONFIRMATION_TEXT,
+  attachAgentStopFences,
+  claimStopFenceCheckOffers,
+  completeStopFenceCheckReceipt,
+  listCaptureAgentStopFences,
+  readStopFenceHeartbeatWork,
+  reconcileCaptureTaskStopFences,
+  rotateStopFenceChecks,
+  stopFenceAutoCheckEnabled,
+} from '../services/capture-stop-fence.js';
 
 function requireCaptureAgent(req, res, next) {
   return authenticateCaptureAgent(req, res, error => {
@@ -7979,7 +7991,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     UUID_PATTERN.test(previousExecutionTaskId) &&
     previousExecutionTaskId !== childTaskId
   ) {
-    await tx.execute(`
+    const supersededSource = await tx.queryOne(`
       UPDATE capture_tasks
       SET status = 'superseded',
         metadata = metadata || jsonb_build_object(
@@ -8001,6 +8013,12 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
           'interrupted', 'needs_action', 'failed',
           'completed_with_failures', 'canceled', 'skipped'
         )
+      RETURNING id,
+        (
+          UPPER(COALESCE(error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+          AND NULLIF(metadata->>'recoveryTaskId', '') IS NULL
+        ) AS stop_fenced,
+        COALESCE(assigned_agent_id, origin_agent_id) AS source_agent_id
     `, [
       childTaskId,
       previousExecutionTaskId,
@@ -8008,6 +8026,28 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       candidate.parent_id,
       attemptIdentity,
     ]);
+    if (supersededSource?.stop_fenced === true) {
+      // Leave a trace on the source task: the keyword moved on, but the
+      // source node stays fenced until its old page is proven stopped.
+      // agent_id stays NULL on purpose: a foreign key to the SOURCE node row
+      // would take a key-share lock that waits on that node's own heartbeat
+      // (which holds its row FOR UPDATE while it may wait on this task row).
+      await appendEvent(tx, {
+        tenantId: agent.tenant_id,
+        taskId: supersededSource.id,
+        eventType: 'stop_fence_handoff',
+        actorType: 'system',
+        actorName: '云端弹性调度器',
+        status: 'superseded',
+        message: '关键词已转交其它节点；本节点旧采集页面尚未确认停止，暂不向本节点派发新任务',
+        payload: {
+          sourceAgentId: supersededSource.source_agent_id || '',
+          successorTaskId: childTaskId,
+          successorAgentId: agent.id,
+          errorCode: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
+        },
+      });
+    }
   }
   await tx.execute(`
     INSERT INTO capture_tasks (
@@ -8950,10 +8990,34 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         }
       }
 
-      const discoveryClaim = taskStateIncomplete ? null : await dispatchDiscoveredPost(tx, {
-        agent: {...agent, ...currentAgent}, capabilities: heartbeatCapabilities,
-      });
-      const elasticClaim = taskStateIncomplete || discoveryClaim
+      // Stop-fence closure: only a complete heartbeat from a node that
+      // declared the check protocol in THIS heartbeat, and only while the
+      // node owns a superseded fenced row or a pending local release. The
+      // offers themselves are claimed in a separate short transaction below.
+      // Right after an operator confirmation the node first drops the local
+      // lock of the old request (release_only), so no new capture work is
+      // claimed or delivered until it answered, for at most
+      // STOP_FENCE_LOCAL_RELEASE_HOLD_MS after the first offer. The heartbeat
+      // that carries the first offer never carries new work, however long the
+      // node was away: currentAgent still holds the previous full heartbeat.
+      const stopFenceWork = taskStateKnown &&
+        heartbeatCapabilities[STOP_FENCE_CHECK_CAPABILITY] === true &&
+        stopFenceAutoCheckEnabled()
+        ? await readStopFenceHeartbeatWork(tx, {
+            tenantId: agent.tenant_id,
+            agentId: agent.id,
+            previousFullHeartbeatAt: captureAgentFullHeartbeatAt(currentAgent),
+          })
+        : {checkDue: false, holdNewWork: false};
+      const stopFenceCheckDue = stopFenceWork.checkDue;
+      const stopFenceHoldsNewWork = stopFenceWork.holdNewWork;
+
+      const discoveryClaim = taskStateIncomplete || stopFenceHoldsNewWork
+        ? null
+        : await dispatchDiscoveredPost(tx, {
+            agent: {...agent, ...currentAgent}, capabilities: heartbeatCapabilities,
+          });
+      const elasticClaim = taskStateIncomplete || discoveryClaim || stopFenceHoldsNewWork
         ? null
         : await dispatchNextElasticWorkItem(tx, {
             agent: {
@@ -8996,6 +9060,13 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
             c.command_type <> 'create'
             OR COALESCE(c.payload->>'workflow', t.task_type) <> 'discovered_post_capture'
             OR $8::boolean = true
+          )
+          -- Stop-fence local release pending: capture work waits (stop and
+          -- plan saves do not need the execution slot and still go out).
+          AND NOT (
+            $9::boolean
+            AND c.command_type IN ('create', 'resume')
+            AND COALESCE(c.payload->>'executionMode', '') NOT IN ('unattended_plan', 'source_open')
           )
           AND NOT (
             c.command_type = 'create'
@@ -9075,6 +9146,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         normalizeCaptureAgentPlatforms(heartbeatCapabilities.supportedPlatforms),
         heartbeatCapabilities.xiaohongshuSourceOpenV1 === true,
         heartbeatCapabilities.discoveredPostCaptureV1 === true,
+        stopFenceHoldsNewWork,
       ]) : [];
 
       if (commands.length > 0) {
@@ -9112,6 +9184,7 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         heartbeatDegraded,
         taskStateKnown,
         taskStateIncomplete,
+        stopFenceCheckDue,
         previousFullHeartbeatAt: captureAgentFullHeartbeatAt(currentAgent),
       };
     });
@@ -9122,6 +9195,28 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         error: 'agent_inactive',
         message: '采集节点已撤销或授权已变更，请重新验证扩展',
       });
+    }
+    let stopFenceChecks = [];
+    if (result.stopFenceCheckDue) {
+      // Never let the closure loop cost the heartbeat or work it already
+      // claimed: a short, bounded transaction whose failure offers nothing.
+      try {
+        stopFenceChecks = await withTransaction(tx => claimStopFenceCheckOffers(tx, {
+          agent,
+          lockAgentSession: lockActiveCaptureAgentSession,
+        }), {
+          waitTimeoutMs: 500,
+          statementTimeoutMs: 1500,
+          lockTimeoutMs: 500,
+        });
+      } catch (stopFenceError) {
+        console.error(
+          '[capture-cloud] stop fence check offer skipped:',
+          stopFenceError?.code || '',
+          stopFenceError?.message || stopFenceError,
+        );
+        stopFenceChecks = [];
+      }
     }
     return res.json({
       ok: true,
@@ -9153,6 +9248,10 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
       localRecoveryAdoptions: result.localRecoveryAdoptions,
       terminalNotices: [],
       commands: result.commands,
+      // 0.4.14/0.4.15 never declare the capability and never see the field.
+      ...(heartbeatCapabilities[STOP_FENCE_CHECK_CAPABILITY] === true
+        ? {stopFenceChecks}
+        : {}),
     });
   } catch (err) {
     if (isDbCapacityError(err)) {
@@ -9162,6 +9261,50 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         ok: false,
         error: 'server_busy',
         message: '心跳对账通道繁忙，请稍后重试',
+        retryAfterMs,
+      });
+    }
+    return next(err);
+  }
+});
+
+// Receipt for a heartbeat-delivered stop-fence check (not a command). Any 4xx
+// except 429 tells the Extension to drop the result; 5xx keeps it for retry.
+router.post('/agent/stop-fence-checks/:checkId/complete', requireCaptureAgent, async (req, res, next) => {
+  try {
+    const rawResult = req.body?.result &&
+      typeof req.body.result === 'object' &&
+      !Array.isArray(req.body.result)
+      ? req.body.result
+      : null;
+    const resultSizeBytes = captureCommandCompletionResultSizeBytes(rawResult || {});
+    if (resultSizeBytes > MAX_COMMAND_COMPLETION_RESULT_BYTES) {
+      return res.status(413).json({
+        ok: false,
+        error: 'stop_fence_check_result_too_large',
+        message: '核对回执超过 96 KiB，请升级扩展或人工确认',
+      });
+    }
+    const outcome = await withTransaction(tx => completeStopFenceCheckReceipt(tx, {
+      agent: req.captureAgent,
+      lockAgentSession: lockActiveCaptureAgentSession,
+      checkId: req.params.checkId,
+      taskId: req.body?.taskId,
+      requestId: text(req.body?.requestId, 240),
+      rawResult,
+    }));
+    return res.status(outcome.status).json(outcome.body);
+  } catch (err) {
+    if (
+      isDbCapacityError(err) ||
+      ['57014', '55P03', '40P01'].includes(err?.code)
+    ) {
+      const retryAfterMs = Math.max(250, Number(err.retryAfterMs) || 1000);
+      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(503).json({
+        ok: false,
+        error: 'server_busy',
+        message: '核对回执通道繁忙，请稍后重试',
         retryAfterMs,
       });
     }
@@ -10624,7 +10767,21 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
           )
       `, [req.tenantId]);
         const scheduleTemplates = await loadCaptureScheduleTemplates(tx, req.tenantId);
-        return {agents, tasks: [...scheduleTemplates, ...tasks], taskSummary};
+        // Why an idle-looking node gets no work: one tenant-scoped listing
+        // from the same fence SQL admission uses, summarized per node. Each
+        // node keeps its own first rows (same cap and order as the confirm
+        // route), so superseded_task_ids is exactly what confirm will check.
+        const stopFenceRows = await listCaptureAgentStopFences(tx, req.tenantId, {
+          includeLocalRelease: true,
+        });
+        return {
+          agents: attachAgentStopFences(agents, stopFenceRows, {
+            now: Date.now(),
+            autoCheckEnabled: stopFenceAutoCheckEnabled(),
+          }),
+          tasks: [...scheduleTemplates, ...tasks],
+          taskSummary,
+        };
       }, {
         category: 'reporting',
         waitTimeoutMs: 250,
@@ -11411,6 +11568,270 @@ router.post('/agents/:id/retire', requireTenantAccess, requireSessionUser, requi
   }
 });
 
+const STOP_FENCE_ADMIN_ERRORS = Object.freeze({
+  invalid_agent_id: [400, '采集节点标识无效'],
+  agent_not_found: [404, '采集节点不存在'],
+  agent_stop_fence_confirmation_required: [400, '请勾选确认后再提交'],
+  agent_stop_fence_absent: [409, '该节点当前没有待确认的旧采集页面'],
+  agent_stop_fence_task_action_required: [
+    409,
+    '该节点的停止保护来自仍需处理的任务，请在该任务上点「继续」或「停止」',
+  ],
+  agent_stop_fence_check_unsupported: [
+    409,
+    '该节点扩展版本不支持自动核对（需升级到 0.4.16），请到该电脑检查后点「确认旧页面已停止」',
+  ],
+  agent_stop_fence_check_disabled: [
+    409,
+    '自动核对已在服务端关闭，请到该电脑检查后点「确认旧页面已停止」',
+  ],
+  agent_stop_fence_manual_only: [
+    409,
+    '该节点的待确认任务无法定位节点本机记录，请到该电脑检查后点「确认旧页面已停止」',
+  ],
+  agent_stop_fence_changed: [409, '该节点的待确认任务已变化，请刷新后重新确认'],
+});
+
+function sendStopFenceAdminError(res, code, extra = {}) {
+  const [status, message] = STOP_FENCE_ADMIN_ERRORS[code];
+  return res.status(status).json({ok: false, error: code, message, ...extra});
+}
+
+function stopFenceRequiresTaskAction(rows) {
+  return rows
+    .filter(row => row.kind === 'fence' && row.status !== 'superseded')
+    .map(row => ({
+      id: row.id,
+      title: row.title || '',
+      status: row.status,
+      parentTaskId: row.parent_task_id || null,
+    }));
+}
+
+async function loadStopFenceAdminAgent(tx, tenantId, agentId) {
+  // Same advisory fence as heartbeats and receipts: slot lock first, then
+  // task rows, so an operator action and a node receipt never interleave.
+  await lockCaptureAgentExecutionSlot(tx, tenantId, agentId);
+  return await tx.queryOne(`
+    SELECT id, display_name, client_label, status, capabilities,
+      last_heartbeat_at, last_liveness_at, last_full_heartbeat_at
+    FROM capture_agents
+    WHERE tenant_id = $1 AND id = $2 AND status IN ('active', 'paused')
+  `, [tenantId, agentId]);
+}
+
+router.post('/agents/:id/stop-fence/recheck', requireCriticalTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl, async (req, res, next) => {
+  try {
+    const agentId = text(req.params.id, 100).toLowerCase();
+    if (!UUID_PATTERN.test(agentId)) return sendStopFenceAdminError(res, 'invalid_agent_id');
+    const result = await withTransaction(async tx => {
+      const agent = await loadStopFenceAdminAgent(tx, req.tenantId, agentId);
+      if (!agent) return {error: 'agent_not_found'};
+      const rows = await listCaptureAgentStopFences(tx, req.tenantId, {agentId});
+      const superseded = rows.filter(row => row.kind === 'fence' && row.status === 'superseded');
+      if (rows.length === 0) return {error: 'agent_stop_fence_absent'};
+      if (superseded.length === 0) {
+        return {
+          error: 'agent_stop_fence_task_action_required',
+          requiresTaskAction: stopFenceRequiresTaskAction(rows),
+        };
+      }
+      if (safeJson(agent.capabilities)[STOP_FENCE_CHECK_CAPABILITY] !== true) {
+        return {error: 'agent_stop_fence_check_unsupported'};
+      }
+      if (!stopFenceAutoCheckEnabled()) return {error: 'agent_stop_fence_check_disabled'};
+      const checkable = superseded.filter(row => text(row.request_id, 240));
+      if (checkable.length === 0) return {error: 'agent_stop_fence_manual_only'};
+      const actorName = text(req.actorName, 240);
+      const rotated = await rotateStopFenceChecks(tx, {
+        tenantId: req.tenantId,
+        agentId,
+        taskIds: checkable.map(row => row.id),
+        requestedByName: actorName,
+        actorId: String(req.user?.id || ''),
+      });
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES (
+          $1, 'user', $2, $3, 'capture_agent.stop_fence_recheck_requested',
+          'capture_agent', $4, $5::jsonb
+        )
+      `, [
+        req.tenantId,
+        String(req.user?.id || ''),
+        req.user?.id || null,
+        agentId,
+        JSON.stringify({
+          displayName: agent.display_name || agent.client_label || '',
+          actorName,
+          taskIds: rotated,
+          manualOnlyTaskCount: superseded.length - checkable.length,
+        }),
+      ]);
+      return {
+        agent,
+        rotated,
+        manualOnlyCount: superseded.length - checkable.length,
+      };
+    }, {category: 'critical'});
+    if (result.error) {
+      return sendStopFenceAdminError(res, result.error, result.requiresTaskAction
+        ? {requiresTaskAction: result.requiresTaskAction}
+        : {});
+    }
+    const online = captureAgentLivenessOnline(result.agent);
+    const dispatchReady = captureAgentFullHeartbeatOnline(result.agent);
+    let message = !online
+      ? '节点当前离线，上线后会自动核对'
+      : !dispatchReady
+        ? '节点状态上报不完整，恢复后才会核对；也可到该电脑检查后人工确认'
+        : '已请求节点重新核对旧采集页面，约 1 分钟内返回结果';
+    if (result.manualOnlyCount > 0) {
+      message += `；其中 ${result.manualOnlyCount} 个任务无法定位节点本机记录，需人工确认`;
+    }
+    return res.json({
+      ok: true,
+      agentId,
+      taskIds: result.rotated,
+      agentOnline: online,
+      message,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/agents/:id/stop-fence/confirm', requireCriticalTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl, async (req, res, next) => {
+  try {
+    const agentId = text(req.params.id, 100).toLowerCase();
+    if (!UUID_PATTERN.test(agentId)) return sendStopFenceAdminError(res, 'invalid_agent_id');
+    if (text(req.body?.confirmation, 40) !== STOP_FENCE_CONFIRMATION_TEXT) {
+      return sendStopFenceAdminError(res, 'agent_stop_fence_confirmation_required');
+    }
+    const expectedTaskIds = new Set(
+      (Array.isArray(req.body?.expectedTaskIds) ? req.body.expectedTaskIds : [])
+        .slice(0, 500)
+        .map(value => text(value, 100).toLowerCase())
+        .filter(value => UUID_PATTERN.test(value)),
+    );
+    const note = text(req.body?.note, 200);
+    const result = await withTransaction(async tx => {
+      const agent = await loadStopFenceAdminAgent(tx, req.tenantId, agentId);
+      if (!agent) return {error: 'agent_not_found'};
+      const rows = await listCaptureAgentStopFences(tx, req.tenantId, {agentId});
+      const superseded = rows.filter(row => row.kind === 'fence' && row.status === 'superseded');
+      const requiresTaskAction = stopFenceRequiresTaskAction(rows);
+      if (superseded.length === 0) {
+        return requiresTaskAction.length > 0
+          ? {error: 'agent_stop_fence_task_action_required', requiresTaskAction}
+          : {error: 'agent_stop_fence_absent'};
+      }
+      // Confirm only what the operator actually looked at.
+      if (superseded.some(row => !expectedTaskIds.has(String(row.id).toLowerCase()))) {
+        return {error: 'agent_stop_fence_changed'};
+      }
+      const autoCheckSupported =
+        safeJson(agent.capabilities)[STOP_FENCE_CHECK_CAPABILITY] === true;
+      const autoCheckEnabled = stopFenceAutoCheckEnabled();
+      // A local release is only ever offered to a 0.4.16 node while the kill
+      // switch is off, and only for a row the node can locate by request id;
+      // anything else would stay pending with nobody to answer it.
+      const requestLocalRelease = autoCheckSupported && autoCheckEnabled;
+      const locatable = new Set(superseded
+        .filter(row => text(row.request_id, 240))
+        .map(row => String(row.id).toLowerCase()));
+      const actorName = text(req.actorName, 240);
+      const actorId = String(req.user?.id || '');
+      const released = await reconcileCaptureTaskStopFences(tx, {
+        tenantId: req.tenantId,
+        agentId,
+        taskIds: superseded.map(row => row.id),
+        proofStatus: 'operator_confirmed',
+        reason: 'operator_confirmed_previous_capture_stopped',
+        requestedBy: actorName,
+        actorType: 'user',
+        actorId,
+        actorName,
+        note,
+        requestLocalRelease,
+      });
+      const localReleaseTaskIds = requestLocalRelease
+        ? released.filter(id => locatable.has(String(id).toLowerCase()))
+        : [];
+      await tx.execute(`
+        INSERT INTO audit_logs (
+          tenant_id, actor_type, actor_id, actor_user_id,
+          action, target_type, target_id, metadata
+        ) VALUES (
+          $1, 'user', $2, $3, 'capture_agent.stop_fence_confirmed',
+          'capture_agent', $4, $5::jsonb
+        )
+      `, [
+        req.tenantId,
+        actorId,
+        req.user?.id || null,
+        agentId,
+        JSON.stringify({
+          displayName: agent.display_name || agent.client_label || '',
+          actorName,
+          taskIds: released,
+          note,
+          localReleaseRequested: localReleaseTaskIds.length > 0,
+          localReleaseTaskIds,
+          requiresTaskActionCount: requiresTaskAction.length,
+        }),
+      ]);
+      return {
+        released,
+        requiresTaskAction,
+        autoCheckSupported,
+        autoCheckEnabled,
+        localReleaseTaskIds,
+      };
+    }, {category: 'critical'});
+    if (result.error) {
+      return sendStopFenceAdminError(res, result.error, result.requiresTaskAction
+        ? {requiresTaskAction: result.requiresTaskAction}
+        : {});
+    }
+    const pendingActions = result.requiresTaskAction.length;
+    const localReleaseCount = result.localReleaseTaskIds.length;
+    const withoutLocalRelease = result.released.length - localReleaseCount;
+    // A 0.4.16 node takes no new capture work until it dropped the old local
+    // lock (heartbeat hold), so do not promise it resumes right away.
+    let message = pendingActions > 0 || localReleaseCount > 0
+      ? `已确认旧采集页面已停止（${result.released.length} 个任务已记录人工确认）`
+      : `已确认旧采集页面已停止，节点恢复接单（${result.released.length} 个任务已记录人工确认）`;
+    if (localReleaseCount > 0) {
+      message += pendingActions > 0
+        ? '；节点会在下次心跳时释放本机执行锁'
+        : '；节点会在下次心跳时释放本机执行锁，释放后恢复接单';
+    }
+    if (withoutLocalRelease > 0) {
+      message += !result.autoCheckSupported
+        ? '；该节点扩展版本较旧，如随后领任务报执行锁冲突，请在该电脑重启 Chrome'
+        : !result.autoCheckEnabled
+          ? '；自动核对已在服务端关闭，节点不会自动释放本机执行锁，如随后领任务报执行锁冲突，请在该电脑重启 Chrome'
+          : `；其中 ${withoutLocalRelease} 个任务无法定位节点本机记录，如随后领任务报执行锁冲突，请在该电脑重启 Chrome`;
+    }
+    if (pendingActions > 0) {
+      message += `；另有 ${pendingActions} 个仍需处理的任务，请在任务上点「继续」或「停止」，处理后节点才会恢复接单`;
+    }
+    return res.json({
+      ok: true,
+      agentId,
+      taskIds: result.released,
+      localReleaseRequested: localReleaseCount > 0,
+      requiresTaskAction: result.requiresTaskAction,
+      message,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl, async (req, res, next) => {
   try {
     const result = await withTransaction(async tx => {
@@ -11730,8 +12151,16 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
       // next assignment forever.
       // Plan configuration itself does not consume the capture slot, so it must
       // neither inherit this blocker nor tell the operator to resolve old work.
+      // `reason` only names the blocker for the operator; the queueing rule
+      // is unchanged (a row that fails the live-work branch matched the fence).
       const queueBlocker = isPlanConfiguration ? null : await tx.queryOne(`
-        SELECT id, title, platform, status
+        SELECT id, title, platform, status,
+          CASE
+            WHEN control_task_id IS NOT NULL AND control_task_id <> ''
+              AND status IN ('pending', 'claimed', 'running', 'recovering', 'interrupted', 'resume_requested')
+              THEN 'active_task'
+            ELSE 'previous_capture_stop_unconfirmed'
+          END AS reason
         FROM capture_tasks task
         WHERE tenant_id = $1 AND assigned_agent_id = $2
           AND (
@@ -11742,6 +12171,21 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
         ORDER BY updated_at DESC, created_at DESC
         LIMIT 1
       `, [req.tenantId, agent.id]);
+      const queuedBehindStopFence =
+        queueBlocker?.reason === 'previous_capture_stop_unconfirmed';
+      // Right after an operator confirmation a 0.4.16 node first drops the
+      // old local lock; the heartbeat holds create commands until it did
+      // (readStopFenceHeartbeatWork). Only the operator message changes: the
+      // command is queued exactly as before.
+      const heldForStopFenceLocalRelease = !queueBlocker && !isPlanConfiguration &&
+        capabilities[STOP_FENCE_CHECK_CAPABILITY] === true &&
+        stopFenceAutoCheckEnabled()
+        ? (await readStopFenceHeartbeatWork(tx, {
+            tenantId: req.tenantId,
+            agentId: agent.id,
+            previousFullHeartbeatAt: agent.last_full_heartbeat_at || null,
+          })).holdNewWork
+        : false;
 
       const total = isPlanConfiguration
         ? 1
@@ -11765,9 +12209,12 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
           title: queueBlocker.title,
           platform: queueBlocker.platform,
           status: queueBlocker.status,
+          reason: queueBlocker.reason,
         }} : {}),
       };
-      const queuedMessage = queueBlocker
+      const queuedMessage = queuedBehindStopFence
+        ? '目标节点旧采集页面尚未确认停止，新任务已排队'
+        : queueBlocker
         ? '目标节点有待处理的旧任务，新任务已排队'
         : isPlanConfiguration
           ? '已创建无人值守计划，等待目标设备保存'
@@ -11850,7 +12297,10 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
           queuedBehindTaskId: queueBlocker?.id || '',
         },
       });
-      return {agent, task, command, existing: false, queueBlocker, executionMode};
+      return {
+        agent, task, command, existing: false, queueBlocker, executionMode,
+        heldForStopFenceLocalRelease,
+      };
     });
 
     const messages = {
@@ -11905,12 +12355,18 @@ router.post('/agents/:id/tasks', requireTenantAccess, requireSessionUser, requir
       queuedBehindRecoverableTask: Boolean(
         result.queueBlocker?.id && result.task.status === 'pending',
       ),
+      queueBlockerReason: result.queueBlocker?.reason || '',
       agentOnline: online,
       status: responseStatus,
       message: result.existing
         ? '相同请求已存在，已返回原任务状态'
+        : result.queueBlocker?.id &&
+            result.queueBlocker.reason === 'previous_capture_stop_unconfirmed'
+          ? '任务已排队：该节点旧采集页面尚未确认停止，节点核对通过或管理员确认后自动执行'
         : result.queueBlocker?.id
           ? '任务已排队；请先继续或处理该节点的旧任务，设备空闲后会自动执行'
+          : result.heldForStopFenceLocalRelease
+            ? '任务已创建：节点正在按人工确认释放旧任务的本机执行锁，释放后自动领取'
           : result.executionMode === 'unattended_plan' && online
             ? '无人值守计划已下发，在线设备将在下一次心跳保存并启用'
             : result.executionMode === 'unattended_plan'

@@ -1209,6 +1209,8 @@
           socialAccountDailyUsage: true,
           structuredTaskHealthV1: true,
           dutyRecoveryLineageV1: true,
+          // 0.4.16：能接收心跳下发的 stopFenceChecks，核对旧采集页面并回执。
+          previousCaptureStopCheckV1: true,
           taskStateKnown: safeTaskStateKnown,
           heartbeatDegraded: degradedReasons.length > 0,
           taskLedgerVersion: Number(safeLedger.version || 1) || 1,
@@ -1407,6 +1409,30 @@
     });
   }
 
+  // 停止保护核对回执。核对请求不是远程指令：它随心跳下发，回执走独立路由，
+  // 不经过指令完成接口，也不占用执行槽。
+  async function completeStopFenceCheck({
+    checkId,
+    taskId,
+    requestId,
+    result = {},
+    ...options
+  }) {
+    const normalizedCheckId = text(checkId, 240);
+    if (!normalizedCheckId) {
+      return {ok: false, skipped: true, reason: "missing_check_id"};
+    }
+    return await requestJson({
+      ...options,
+      endpoint: `/api/capture-cloud/agent/stop-fence-checks/${encodeURIComponent(normalizedCheckId)}/complete`,
+      body: {
+        taskId: text(taskId, 240),
+        requestId: text(requestId, 240),
+        result: objectValue(result),
+      },
+    });
+  }
+
   root.OnStarvoiceCloudTaskAgent = Object.freeze({
     buildTaskHealthEvidence,
     enrichHeartbeatHealthEvidence,
@@ -1420,5 +1446,6 @@
     sendLiveness,
     sendHeartbeat,
     completeCommand,
+    completeStopFenceCheck,
   });
 })(typeof globalThis !== "undefined" ? globalThis : self);

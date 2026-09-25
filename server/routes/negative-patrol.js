@@ -1201,20 +1201,24 @@ async function loadCompatibleAgents(
         agentId,
       );
       if (blocker) {
+        const agentLabel = text(
+          compatible.agent?.display_name ||
+          compatible.agent?.client_label ||
+          agentId,
+          120,
+        );
         return {failure: requestError(
           'agent_busy',
-          `节点“${text(
-            compatible.agent?.display_name ||
-            compatible.agent?.client_label ||
-            agentId,
-            120,
-          )}”当前仍有任务或远程指令占用，请选择空闲节点`,
+          blocker.reason === 'previous_capture_stop_unconfirmed'
+            ? `节点“${agentLabel}”旧采集页面尚未确认停止，暂不接新任务，请选择其它节点，或先在执行节点中处理`
+            : `节点“${agentLabel}”当前仍有任务或远程指令占用，请选择空闲节点`,
           409,
           {
             agentId,
             blockingTaskId: blocker.task_id || blocker.id,
             blockingTaskStatus: blocker.status,
             blockerKind: blocker.kind,
+            blockerReason: blocker.reason || '',
           },
         )};
       }

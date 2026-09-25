@@ -5042,3 +5042,119 @@ test("legacy retry remains only as a fallback outside guarded duty Agent tenants
   );
   assert.match(cronSource, /processCaptureAttentionNotifications\(20\)/u);
 });
+
+test("stop-fence closure leaves the admission fence byte-identical and only explains blockers", async () => {
+  // Invariant 1 of docs/hotfix/20260925-stop-fence-closure.md: the fence SQL,
+  // the JS predicate and the 976a0c6 rule are exactly the f069fd7 baseline.
+  const sha256 = value => crypto.createHash("sha256").update(value).digest("hex");
+  assert.equal(
+    sha256(captureTaskUnconfirmedLocalStopSql("task")),
+    "65d7868a902738412b24d43b4f232ef262147e358e6a145a5953ae020b0ff900",
+  );
+  assert.equal(
+    sha256(captureTaskUnconfirmedLocalStopSql("unsafe_stop", "$2")),
+    "03552781e7c3bf9f92b7a6b5c460b96638798a941e08af70cbeeb17ae557e352",
+  );
+  assert.equal(
+    sha256(captureTaskHasUnconfirmedLocalStop.toString()),
+    "3e93205891806451fcf324b28522a158231acff4e8344d4e68d66fec5b0fab47",
+  );
+
+  let statement = null;
+  await findCaptureAgentExecutionSlotBlocker({
+    async queryOne(sql, params) {
+      statement = {sql, params};
+      return null;
+    },
+  }, "tenant-id", "agent-id");
+  // The blocker only gains an explanatory column; the predicate is unchanged.
+  assert.match(statement.sql, /SELECT blocker\.kind, blocker\.id, blocker\.task_id, blocker\.status, blocker\.reason/u);
+  assert.match(
+    statement.sql,
+    /WHEN task\.status = ANY\(\$3::text\[\]\) AND NOT \(task\.id = ANY\(\$4::uuid\[\]\)\)\s+THEN 'active_task'\s+ELSE 'previous_capture_stop_unconfirmed'/u,
+  );
+  assert.match(
+    statement.sql,
+    new RegExp(
+      `\\(task\\.status = ANY\\(\\$3::text\\[\\]\\) AND NOT \\(task\\.id = ANY\\(\\$4::uuid\\[\\]\\)\\)\\)\\s+OR ${captureTaskUnconfirmedLocalStopSql("task").replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`,
+      "u",
+    ),
+  );
+  assert.match(statement.sql, /'active_command'::text AS reason/u);
+
+  // The check request is not a command: nothing in the new module may create,
+  // expire or read capture_agent_commands, and metadata writes never move
+  // updated_at (the 976a0c6 rule compares against it).
+  const stopFenceSource = await readFile(
+    new URL("../server/services/capture-stop-fence.js", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(stopFenceSource, /capture_agent_commands/u);
+  assert.doesNotMatch(stopFenceSource, /updated_at\s*=/u);
+  assert.doesNotMatch(stopFenceSource, /SET status|status\s*=\s*'canceled'/u);
+  assert.match(stopFenceSource, /import \{\s*captureAgentFullHeartbeatOnline,\s*captureAgentLivenessOnline,\s*captureTaskUnconfirmedLocalStopSql,\s*\} from '\.\/capture-cloud\.js';/u);
+
+  const heartbeat = readRouteSection(
+    "router.post('/agent/heartbeat'",
+    "router.post('/agent/stop-fence-checks/:checkId/complete'",
+  );
+  // Offered only on complete heartbeats from nodes that declare the protocol
+  // in this very heartbeat, in a separate bounded transaction that can fail
+  // without costing the heartbeat; priority-only responses never carry it.
+  assert.match(
+    heartbeat,
+    /taskStateKnown &&\s+heartbeatCapabilities\[STOP_FENCE_CHECK_CAPABILITY\] === true &&\s+stopFenceAutoCheckEnabled\(\)/u,
+  );
+  assert.match(
+    heartbeat,
+    /claimStopFenceCheckOffers\(tx, \{[\s\S]*statementTimeoutMs: 1500,\s+lockTimeoutMs: 500,[\s\S]*catch \(stopFenceError\)[\s\S]*stopFenceChecks = \[\];/u,
+  );
+  assert.match(
+    heartbeat,
+    /\.\.\.\(heartbeatCapabilities\[STOP_FENCE_CHECK_CAPABILITY\] === true\s+\? \{stopFenceChecks\}\s+: \{\}\)/u,
+  );
+  const priorityResponse = heartbeat.slice(
+    heartbeat.indexOf("priorityControlOnly: true"),
+    heartbeat.indexOf("const result = await withTransaction"),
+  );
+  assert.doesNotMatch(priorityResponse, /stopFenceChecks/u);
+  // Right after an operator confirmation a 0.4.16 node first drops the lock
+  // of the old request: capture work is neither claimed nor delivered in the
+  // meantime (bounded in the service); stops and plan saves never wait.
+  assert.ok(
+    heartbeat.indexOf("readStopFenceHeartbeatWork(tx") > 0 &&
+      heartbeat.indexOf("readStopFenceHeartbeatWork(tx") < heartbeat.indexOf("dispatchDiscoveredPost(tx"),
+    "the hold is known before any work is claimed",
+  );
+  // A release never offered holds on the node's first full heartbeat after
+  // the confirmation, whatever its age: the precheck needs the previous full
+  // heartbeat, read before this heartbeat updated the row.
+  assert.match(
+    heartbeat,
+    /readStopFenceHeartbeatWork\(tx, \{\s+tenantId: agent\.tenant_id,\s+agentId: agent\.id,\s+previousFullHeartbeatAt: captureAgentFullHeartbeatAt\(currentAgent\),\s+\}\)/u,
+  );
+  assert.match(heartbeat, /const discoveryClaim = taskStateIncomplete \|\| stopFenceHoldsNewWork/u);
+  assert.match(heartbeat, /const elasticClaim = taskStateIncomplete \|\| discoveryClaim \|\| stopFenceHoldsNewWork/u);
+  assert.match(
+    heartbeat,
+    /AND NOT \(\s+\$9::boolean\s+AND c\.command_type IN \('create', 'resume'\)\s+AND COALESCE\(c\.payload->>'executionMode', ''\) NOT IN \('unattended_plan', 'source_open'\)\s+\)/u,
+  );
+  assert.match(heartbeat, /heartbeatCapabilities\.discoveredPostCaptureV1 === true,\s+stopFenceHoldsNewWork,\s+\]\)/u);
+
+  const confirm = readRouteSection(
+    "router.post('/agents/:id/stop-fence/confirm'",
+    "router.post('/agents/:id/tasks'",
+  );
+  assert.match(confirm, /requireCriticalTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl/u);
+  assert.match(confirm, /proofStatus: 'operator_confirmed'/u);
+  assert.match(confirm, /capture_agent\.stop_fence_confirmed/u);
+  // A local release only where a heartbeat can ever deliver it.
+  assert.match(confirm, /const requestLocalRelease = autoCheckSupported && autoCheckEnabled;/u);
+  assert.match(stopFenceSource, /\.\.\.\(requestLocalRelease && requestId\s+\? \{localRelease: \{/u);
+  const recheck = readRouteSection(
+    "router.post('/agents/:id/stop-fence/recheck'",
+    "router.post('/agents/:id/stop-fence/confirm'",
+  );
+  assert.match(recheck, /requireCriticalTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl/u);
+  assert.match(recheck, /capture_agent\.stop_fence_recheck_requested/u);
+});

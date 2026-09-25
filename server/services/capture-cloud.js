@@ -1091,11 +1091,20 @@ export async function findCaptureAgentExecutionSlotBlocker(
       .map(value => text(value, 100).toLowerCase())
       .filter(value => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value)),
   )];
+  // `reason` only explains the blocker to operators; the admission predicate
+  // itself is unchanged. A task row matches either the live-status branch or
+  // the stop-fence branch, so the fence is the reason whenever the live-status
+  // branch does not hold (this avoids evaluating the fence subquery twice).
   return await executor.queryOne(`
-    SELECT blocker.kind, blocker.id, blocker.task_id, blocker.status
+    SELECT blocker.kind, blocker.id, blocker.task_id, blocker.status, blocker.reason
     FROM (
       SELECT 'task'::text AS kind, task.id, task.id AS task_id, task.status,
-        task.created_at AS blocked_at
+        task.created_at AS blocked_at,
+        CASE
+          WHEN task.status = ANY($3::text[]) AND NOT (task.id = ANY($4::uuid[]))
+            THEN 'active_task'
+          ELSE 'previous_capture_stop_unconfirmed'
+        END AS reason
       FROM capture_tasks task
       WHERE task.tenant_id = $1
         AND COALESCE(task.assigned_agent_id, task.origin_agent_id) = $2
@@ -1108,7 +1117,8 @@ export async function findCaptureAgentExecutionSlotBlocker(
       UNION ALL
 
       SELECT 'command'::text AS kind, command.id, command.task_id,
-        command.status, command.created_at AS blocked_at
+        command.status, command.created_at AS blocked_at,
+        'active_command'::text AS reason
       FROM capture_agent_commands command
       WHERE command.tenant_id = $1
         AND command.agent_id = $2

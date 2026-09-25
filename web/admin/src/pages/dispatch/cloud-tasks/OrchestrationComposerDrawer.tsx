@@ -24,6 +24,7 @@ import { NegativePatrolScheduleOption } from './NegativePatrolScheduleOption'
 import { hasUnattendedNegativePatrol, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable, DEFAULT_NEGATIVE_PATROL_STATUSES, negativePatrolTriageStatuses, validNegativePatrolStatuses, negativePatrolStatusSummary } from './unattendedNegativePatrol.mjs'
 import { Drawer } from '@/components/shared/Drawer'
 import { isMobileAgent, mobileReadinessLabel, shanghaiToday } from './lib'
+import { isAgentStopFenced } from './stop-fence-presentation.mjs'
 import type {
   CaptureEnhancementSettings,
   OrchestrationCloudAgent,
@@ -1771,6 +1772,13 @@ export function OrchestrationComposerDrawer({
                             <span className="mt-1 block truncate text-[11px] text-muted-foreground">{mobile ? (agent.online ? mobileReadinessLabel(agent) : '手机执行器离线') : `${agent.host_label} › ${agent.browser_name} · ${agent.operating_system}`}</span>
                             {blockReason ? (
                               <span className="mt-1.5 block text-[11px] font-medium text-status-red">{blockReason}</span>
+                            ) : isAgentStopFenced(agent) ? (
+                              // 停止保护中的节点仍可勾选；服务端在旧页面确认停止前不会让它领取或执行。
+                              <span className="mt-1.5 block text-[11px] font-medium text-amber-700 dark:text-amber-300">
+                                {distributionMode === 'elastic_pool'
+                                  ? '暂不领取：等待确认旧页面已停止'
+                                  : '固定任务会排队：等待确认旧页面已停止'}
+                              </span>
                             ) : (
                               <span className="mt-1.5 block text-[11px] text-muted-foreground">
                                 {workloadKnown

@@ -3,13 +3,15 @@ import * as Dialog from '@radix-ui/react-dialog'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   AlertTriangle, ArrowLeft, Bot, CalendarClock, CheckCircle2, ChevronRight, CircleOff,
-  ChevronDown, ClipboardList, Loader2, LogOut, MoreHorizontal, Pencil, Plus, PowerOff, Save, Smartphone, Trash2,
+  ChevronDown, ClipboardList, Loader2, LogOut, MoreHorizontal, Pencil, Plus, PowerOff, Save, ShieldAlert, Smartphone, Trash2,
   Wifi, WifiOff,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { formatDate } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { UnattendedPlanSummary } from './UnattendedPlanSummary'
+import { StopFencePanel } from './StopFencePanel'
+import { agentStopFenceNotice, countStopFencedAgents, isAgentStopFenced } from './stop-fence-presentation.mjs'
 import type { CloudAgent, CloudTask } from './lib'
 import {
   ACTIVE_TASK_STATUSES,
@@ -98,6 +100,7 @@ function AgentRow({
   const platforms = agentCreatePlatforms(agent)
   const hasPlan = hasConfiguredUnattendedPlan(agent.unattended_plan)
   const mobile = isMobileAgent(agent)
+  const stopFence = agentStopFenceNotice(agent)
   const dotClass = agent.status === 'paused' ? 'bg-status-orange' : agent.online ? 'bg-status-green' : 'bg-muted-foreground/40'
   const statusLabel = agent.status === 'paused' ? '已暂停' : agent.online ? '在线' : '离线'
 
@@ -112,8 +115,13 @@ function AgentRow({
             {mobile && <span className="inline-flex shrink-0 items-center gap-0.5 rounded bg-primary/8 px-1.5 py-0.5 text-[10px] font-medium text-primary"><Smartphone className="h-3 w-3" />手机</span>}
             {hasPlan && <CalendarClock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-label="已配置无人值守计划" />}
             {agent.last_error && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-status-red" aria-label="Agent 异常" />}
+            {stopFence?.blocking && <ShieldAlert className={`h-3.5 w-3.5 shrink-0 ${stopFence.operatorRequired ? 'text-status-red' : 'text-status-orange'}`} aria-label="旧采集页面未确认停止" />}
           </span>
           <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{statusLabel} · 最近心跳 {formatDate(agent.last_heartbeat_at)}{mobile && agent.online ? ` · ${mobileReadinessLabel(agent)}` : ''}</span>
+          {/* 不用“暂停”：它已表示节点状态 paused；这里是停止保护暂不派新任务。 */}
+          {stopFence?.rowLabel && (
+            <span className={`mt-0.5 block truncate text-[11px] font-medium ${stopFence.operatorRequired ? 'text-status-red' : 'text-amber-700 dark:text-amber-300'}`}>{stopFence.rowLabel}</span>
+          )}
           <span className="mt-1 flex flex-wrap items-center gap-1">
             {platforms.length > 0
               ? platforms.map(platform => (
@@ -413,6 +421,10 @@ function AgentDetailPane({
   onSaved,
   onBack,
   compact,
+  stopFenceBusy,
+  onRecheckStopFence,
+  onConfirmStopFence,
+  onOpenOrchestration,
 }: {
   agent: CloudAgent
   tasks: CloudTask[]
@@ -425,9 +437,16 @@ function AgentDetailPane({
   onSaved: () => Promise<void>
   onBack: () => void
   compact: boolean
+  stopFenceBusy: boolean
+  onRecheckStopFence: (agent: CloudAgent) => Promise<void>
+  onConfirmStopFence: (agent: CloudAgent, expectedTaskIds: string[], note: string) => Promise<void>
+  onOpenOrchestration?: (orchestrationId: string) => void
 }) {
   const { activeTaskCount, queuedTaskCount } = agentWorkload(agent, tasks)
   const blockReason = agentAssignmentBlockReason(agent, 'one_time')
+  // 停止保护不禁用「分配任务」：服务端让新任务排在围栏后面，这里只把原因说清楚。
+  const stopFenced = isAgentStopFenced(agent)
+  const hasTopNotice = Boolean(agent.last_error || blockReason || agent.stop_fence?.phase)
   const hasPlan = hasConfiguredUnattendedPlan(agent.unattended_plan)
   const remoteUnattendedPlanWrite = agent.capabilities?.remoteUnattendedPlanWrite === true
   const remoteUnattendedPlanDelete = agent.capabilities?.remoteUnattendedPlanDelete === true
@@ -538,10 +557,19 @@ function AgentDetailPane({
       <div className={`workspace-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain py-4 ${compact ? '' : 'pr-5'}`}>
         {agent.last_error && <div role="alert" className="mt-3 rounded-lg bg-status-red/8 px-2.5 py-2 text-[11px] leading-4 text-status-red">Agent 异常：{agent.last_error}</div>}
         {blockReason && <p className="mt-2 text-[11px] leading-4 text-status-red">{blockReason}</p>}
+        <StopFencePanel
+          agent={agent}
+          writable={writable}
+          compact={compact}
+          busy={stopFenceBusy}
+          onRecheck={onRecheckStopFence}
+          onConfirm={onConfirmStopFence}
+          onOpenOrchestration={onOpenOrchestration}
+        />
 
         {/* 节点资料是低频设置，只在用户点击右上角“编辑节点”后展开。 */}
         {profileEditing && (
-          <section className={`${agent.last_error || blockReason ? 'mt-3 ' : ''}rounded-xl border border-border/70 bg-card p-3.5 shadow-xs`} aria-label="编辑节点资料">
+          <section className={`${hasTopNotice ? 'mt-3 ' : ''}rounded-xl border border-border/70 bg-card p-3.5 shadow-xs`} aria-label="编辑节点资料">
             <h3 className="text-xs font-bold text-foreground">编辑节点资料</h3>
             <p className="mt-1 text-[11px] leading-4 text-muted-foreground">设置客户可识别的名称，以及这个 Agent 负责的平台。</p>
             <div className="mt-3 space-y-3">
@@ -578,7 +606,7 @@ function AgentDetailPane({
         )}
 
         {/* 当前任务与计划是详情页主体；历史记录默认收起，按需查看。 */}
-        <section className={profileEditing || agent.last_error || blockReason ? 'mt-5' : ''} aria-label="当前任务与计划">
+        <section className={profileEditing || hasTopNotice ? 'mt-5' : ''} aria-label="当前任务与计划">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <div className="flex items-center gap-1.5">
@@ -587,7 +615,8 @@ function AgentDetailPane({
               </div>
               <p className="mt-1 text-[11px] leading-4 text-muted-foreground">优先显示正在执行、等待设备和已启用的计划。</p>
             </div>
-            <Button size="sm" onClick={() => onAssign(agent)} disabled={!writable || Boolean(blockReason)} className={compact ? 'min-h-11' : 'min-h-9'}>
+            <Button size="sm" onClick={() => onAssign(agent)} disabled={!writable || Boolean(blockReason)} className={compact ? 'min-h-11' : 'min-h-9'}
+              title={stopFenced && !blockReason ? '分配后会排队，确认旧页面已停止后执行' : undefined}>
               <Plus className="h-4 w-4" /> 分配任务
             </Button>
           </div>
@@ -684,6 +713,10 @@ export function AgentRail({
   deletingAgentId = '',
   detachingAgentId = '',
   retiringAgentId = '',
+  stopFenceActionAgentId = '',
+  onRecheckStopFence,
+  onConfirmStopFence,
+  onOpenOrchestration,
   onSaved,
 }: {
   agents: CloudAgent[]
@@ -701,6 +734,10 @@ export function AgentRail({
   deletingAgentId?: string
   detachingAgentId?: string
   retiringAgentId?: string
+  stopFenceActionAgentId?: string
+  onRecheckStopFence: (agent: CloudAgent) => Promise<void>
+  onConfirmStopFence: (agent: CloudAgent, expectedTaskIds: string[], note: string) => Promise<void>
+  onOpenOrchestration?: (orchestrationId: string) => void
   onSaved: () => Promise<void>
 }) {
   const compact = surface === 'mobile'
@@ -715,6 +752,7 @@ export function AgentRail({
   // 轮询刷新会替换 agents 数组；用 id 定位保证详情页在刷新后仍指向最新的同一 Agent，Agent 消失时自动返回列表。
   const activeAgent = activeAgentId ? agents.find(agent => agent.id === activeAgentId) ?? null : null
   const onlineAgentCount = agents.filter(agent => agent.online).length
+  const stopFencedAgentCount = countStopFencedAgents(agents)
 
   const confirmDelete = async () => {
     if (!deleteCandidate) return
@@ -767,11 +805,15 @@ export function AgentRail({
           onSaved={onSaved}
           onBack={() => setActiveAgentId(null)}
           compact={compact}
+          stopFenceBusy={stopFenceActionAgentId === activeAgent.id}
+          onRecheckStopFence={onRecheckStopFence}
+          onConfirmStopFence={onConfirmStopFence}
+          onOpenOrchestration={onOpenOrchestration}
         />
       ) : (
         <>
           <header className={`mb-3 shrink-0 ${compact ? '' : 'pr-5'}`}>
-            <div className="flex items-center gap-2"><Bot className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">执行节点 · 在线 {onlineAgentCount}/{agents.length}</h3></div>
+            <div className="flex items-center gap-2"><Bot className="h-4 w-4 text-primary" /><h3 className="text-base font-bold">执行节点 · 在线 {onlineAgentCount}/{agents.length}{stopFencedAgentCount > 0 ? ` · 待确认停止 ${stopFencedAgentCount}` : ''}</h3></div>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">每个浏览器均为独立 Agent · 2 分钟无心跳即视为离线</p>
           </header>
           <div className={`workspace-scrollbar min-h-0 flex-1 overflow-y-auto overscroll-contain pb-4 ${compact ? '' : 'pr-5'}`}>

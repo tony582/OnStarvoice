@@ -535,16 +535,26 @@ function handleInspectCaptureActivity(request, sendResponse) {
     (total, value) => total + Math.max(0, Number(value) || 0),
     0,
   );
+  const targetCount = targetRequestId
+    ? Math.max(0, Number(activeCaptureRequestCounts.get(targetRequestId)) || 0)
+    : activeCount;
+  // 0.4.16 停止保护核对按 id 归属页面上的活动：只有全部活动都属于旧任务时
+  // 才发精确停止。纯新增字段，原有字段语义不变；最多 20 条、id 截断到 200 字，
+  // 截断后计数对不上时后台按“无法归属”处理，不会误停。
+  const activeRequests = [...activeCaptureRequestCounts.entries()]
+    .map(([id, value]) => ({
+      id: String(id || "").slice(0, 200),
+      count: Math.max(0, Number(value) || 0),
+    }))
+    .filter((entry) => entry.id && entry.count > 0)
+    .slice(0, 20);
   sendResponse({
     ok: true,
     captureRequestId: targetRequestId,
-    targetActive: targetRequestId
-      ? Math.max(
-          0,
-          Number(activeCaptureRequestCounts.get(targetRequestId)) || 0,
-        ) > 0
-      : activeCount > 0,
+    targetActive: targetRequestId ? targetCount > 0 : activeCount > 0,
     activeCount,
+    targetCount,
+    activeRequests,
   });
 }
 

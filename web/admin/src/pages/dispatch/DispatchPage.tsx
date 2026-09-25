@@ -569,6 +569,50 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
     }
   }
 
+  // 停止保护：请原节点重新核对旧采集页面（换发新核对并清零失败计数）。
+  const recheckStopFence = async (agent: CloudAgent) => {
+    setAgentActionId(agent.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/agents/${agent.id}/stop-fence/recheck`,
+        {},
+      )
+      setFeedback(result.message || '已请求节点重新核对旧采集页面，约 1 分钟内返回结果')
+      await load(true)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '请求节点重新核对失败'
+      setActionError(message)
+      throw err
+    } finally {
+      setAgentActionId('')
+    }
+  }
+
+  // 停止保护的人工兜底：运营看过该电脑后确认旧页面已停止；expectedTaskIds 是运营打开时那次 /overview 里
+  // 该节点的全部已转交围栏（stop_fence.superseded_task_ids，不受 20 条列表限制），
+  // 服务端发现之后新出现的围栏时拒绝（agent_stop_fence_changed），避免放行运营没看到的任务。
+  const confirmStopFence = async (agent: CloudAgent, expectedTaskIds: string[], note: string) => {
+    setAgentActionId(agent.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>(
+        `/capture-cloud/agents/${agent.id}/stop-fence/confirm`,
+        { confirmation: '确认旧页面已停止', expectedTaskIds, ...(note ? { note } : {}) },
+      )
+      setFeedback(result.message || '已确认旧采集页面已停止，节点恢复接单')
+      await load(true)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '确认旧页面已停止失败'
+      setActionError(message)
+      throw err
+    } finally {
+      setAgentActionId('')
+    }
+  }
+
   if (loading && !overview) {
     return <div className="flex justify-center py-24"><Loader2 className="h-7 w-7 animate-spin text-primary" /></div>
   }
@@ -726,6 +770,13 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
             deletingAgentId={agentActionId}
             detachingAgentId={agentActionId}
             retiringAgentId={agentActionId}
+            stopFenceActionAgentId={agentActionId}
+            onRecheckStopFence={recheckStopFence}
+            onConfirmStopFence={confirmStopFence}
+            onOpenOrchestration={orchestrationId => {
+              setSelectedResultTask(null)
+              setSelectedOrchestrationId(orchestrationId)
+            }}
             onSaved={() => load(true)}
           />
         </aside>
@@ -738,7 +789,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
             setComposerIntent(null)
             setOrchestrationLaunchIntent(launchIntent)
           }}
-          onCreated={async createdTaskType => {
+          onCreated={async (createdTaskType, serverMessage) => {
             if (mobile) {
               if (createdTaskType === 'unattended_plan' && composerIntent?.editExisting) {
                 setMobileWorkspace('agents')
@@ -746,11 +797,12 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
                 focusMobileTaskView(createdTaskType === 'unattended_plan' ? 'plans' : 'active')
               }
             }
-            setFeedback(createdTaskType === 'watched_content'
+            // 服务端文案优先：节点被旧任务或停止保护挡住时，它会写明“已排队”及原因。
+            setFeedback(serverMessage || (createdTaskType === 'watched_content'
               ? '关注内容巡查已创建，内容将按平台由兼容 Agent 领取。'
               : createdTaskType === 'negative_patrol'
                 ? '负面帖子巡查已创建，内容将按平台由兼容 Agent 领取。'
-                : '任务已创建并分配给指定 Agent。')
+                : '任务已创建并分配给指定 Agent。'))
             await load(true)
           }} />
       )}
