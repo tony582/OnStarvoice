@@ -43,3 +43,24 @@
 
 1. 只替换 `server/services/android-control/leases.js` 一个文件，无迁移，后台、扩展和手机 Runner 都不用动。按既有流程：SHA 前置校验、备份、原子替换、pm2 重启、健康检查。
 2. 上线后看手机是否领走上面 4 个词；`node cli.mjs diagnose --state-dir ../state-829d89 --hours 2` 可看这几次执行的结果。
+
+## 发布（2026-09-25，Asia/Shanghai）
+
+- CI（run 36154691761）5/5 通过：生产 Node 18 兼容、测试与构建、PostgreSQL 14/16 × Node 18/24。
+- 部署脚本演练（模拟生产目录，`9b836f6` 服务端在 Node 18 下真实启动）：
+  - 预检通过。
+  - 文件漂移、服务不在线、锁被占用时拒绝执行，不改动任何文件。
+  - 正常发布只换 `leases.js`；再执行一次会被拒绝。
+  - 就绪失败，或重启中收到 SIGTERM／SIGHUP 时，自动回滚到 `9b836f6`。
+- 预检（47.103.125.200）：生产 `leases.js` 与 `9b836f6` 逐字节一致（`6ce6ca5a…`），服务在线且就绪。
+- 23:40:58 切换并重启 PM2 `onstarvoice`，新 PID 449708。`health/ready` 通过，`/api/update-manifest` 前后逐字节一致。
+- 部署后约 1 分钟：
+  - 错误日志新增 10 行：1 次 `DbCapacityError`（`DB_CAPACITY_UNAVAILABLE` 5939 → 5940），以及随之出现的客服助手队列本轮未完成。重启后节点集中重连时常见，与本改动无关。
+  - `/admin/` 返回 200。
+- 23:41:10 手机领到 09-24 夜那一轮的「别克车机壁纸」（同一工作项 `466427c7`，第 2 次尝试），修复在生产生效。
+
+发布材料与备份在 `/opt/onstarvoice-private/releases/elastic-retry-stall-97b3765-20260925/`，原文件是 `backup/server/services/android-control/leases.js`。
+
+## 回滚
+
+用发布目录里 `backup/server/services/android-control/leases.js` 覆盖 `/opt/onstarvoice/server/services/android-control/leases.js`，然后 `pm2 restart onstarvoice`。手机会回到“需要处理的任务里不再领词”的旧行为。
