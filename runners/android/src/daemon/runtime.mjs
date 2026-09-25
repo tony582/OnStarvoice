@@ -131,6 +131,10 @@ export class AndroidDaemon {
             status:['user_stop','remote_stop'].includes(error.code) ? 'canceled' : 'interrupted'}; }
         }
         if (this.device?.probe && DEVICE_READINESS_REASONS.has(result.reason)) { this.ready = false; this.deviceReason = result.reason; }
+        // Plain summary for the one-click window; keyword and counts only.
+        this.lastOutcome = {keyword: task.keyword, status: result.status, reason: result.reason ?? null,
+          links: result.stats?.links ?? 0, skipped: result.stats?.skippedCards ?? 0,
+          elapsedMs: result.stats?.keywordElapsedMs ?? null, at: Date.now()};
         this.saveCompletion({...active, leaseId: this.active?.leaseId ?? active.leaseId}, result);
         return result;
       })

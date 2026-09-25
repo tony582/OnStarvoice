@@ -203,8 +203,10 @@ test('40.6 inline video caption expands and removes only a verified UI collapse 
   const make = (title, author = '@' + card.author, clickable = 'true') => tree(
     node('desc', title, '', {clickable}) + node('title', author, '', {'content-desc': '按钮'}) + node('vmj'));
   let expanded = false; let clicks = 0;
+  // The inline "展开" is tapped at the caption's end; the caption centre (a possible #topic link) is never clicked.
   const ui = {read: async () => make(expanded ? card.title + ' 收起' : '新壁纸... 展开'),
-    clickId: async id => {assert.equal(id, 'desc'); clicks++; expanded = true;}};
+    clickId: async id => { assert.fail(`the caption must not be clicked at its centre (${id})`); },
+    tapIdNearEnd: async id => {assert.equal(id, 'desc'); clicks++; expanded = true; return {x: 800, y: 90, width: 852, height: 120};}};
   assert.equal((await readVerifiedDetail({ui, card})).title, card.title);
   assert.equal((await readVerifiedDetail({ui, card})).title, card.title); // After returning from share.
   assert.equal(clicks, 1);

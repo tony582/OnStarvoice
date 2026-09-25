@@ -87,5 +87,15 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
     if (/Error/u.test(`${result.stdout}\n${result.stderr}`)) throw new DeviceError('app_launch_failed', 'The app could not be launched');
     return {launched: true};
   };
-  return {listDevices, startServer, inspect, inspectApp, helperPids, stopHelper, windowFocus, resumedActivity, keyguardState, powerState, launchActivity};
+  // Developer option "stay awake while charging" (0 = off). Read-only; the runner never changes it.
+  const stayOnWhilePluggedIn = async (serial, options = {}) => {
+    const value = (await dump(serial, 'settings get global stay_on_while_plugged_in', options)).trim();
+    return /^\d+$/u.test(value) ? Number(value) : null;
+  };
+  // Automation-related log lines only (helper crash, low-memory kill), for a local diagnostic after a lost session.
+  const automationLog = async (serial, options = {}) => (await dump(serial,
+    'logcat -d -t 4000 | grep -E "uiautomator2|UiAutomation|lowmemorykiller|am_kill|FATAL EXCEPTION|Process io\\.appium" | tail -n 30 || true',
+    options)).split(/\r?\n/u).map(line => line.trim().slice(0, 240)).filter(Boolean).slice(-30);
+  return {listDevices, startServer, inspect, inspectApp, helperPids, stopHelper, windowFocus, resumedActivity, keyguardState,
+    powerState, launchActivity, stayOnWhilePluggedIn, automationLog};
 }

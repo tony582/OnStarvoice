@@ -3,7 +3,7 @@ import {ChevronDown, Loader2, RotateCcw, Smartphone} from 'lucide-react'
 import {androidApi, friendlyError} from './api'
 import {DiscoveryCandidates} from './DiscoveryCandidates'
 import {RecoveryPanel} from './RecoveryPanel'
-import {durationLabel, reasonLabel, runResultLabel, statusLabel} from './presentation'
+import {durationLabel, poolRecoveryRelevant, poolRunResultLabel, reasonLabel, runResultLabel, skippedLabel, statusLabel} from './presentation'
 import type {DiscoveryRunDetail} from './types'
 
 // 已入库：候选状态终态成功，或已关联到可展示的正式记录。
@@ -14,12 +14,15 @@ const FAILED_STATUSES = new Set(['unresolvable'])
 // 复用手机发现的既有详情接口（GET /capture-cloud/android/runs/:id）与重处理接口，
 // 在普通任务详情/历史里展示「手机发现 → 补详情」进度、候选与停稳恢复。
 // runId 对编排子任务是 execution_task_id，对旧独立 run 是任务本身的 id。
-export function AndroidChildRunPanel({runId, writable, agentLabel, refreshKey}: {
+export function AndroidChildRunPanel({runId, writable, agentLabel, refreshKey, context = 'standalone'}: {
   runId: string
   writable: boolean
   agentLabel?: string
   refreshKey?: string | number
+  // 'pool': one attempt of a keyword inside an orchestration; 'standalone': a legacy phone-only run.
+  context?: 'pool' | 'standalone'
 }) {
+  const pool = context === 'pool'
   const [detail, setDetail] = useState<DiscoveryRunDetail | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -86,7 +89,7 @@ export function AndroidChildRunPanel({runId, writable, agentLabel, refreshKey}: 
         <h4 className="flex items-center gap-1.5 text-xs font-semibold text-primary">
           <Smartphone className="h-3.5 w-3.5" />手机发现{agentLabel ? ` · ${agentLabel}` : ''}
         </h4>
-        {detail && <span className="text-[11px] text-muted-foreground">{runResultLabel(detail)}</span>}
+        {detail && <span className="text-[11px] text-muted-foreground">{pool ? poolRunResultLabel(detail) : runResultLabel(detail)}</span>}
       </div>
 
       {loading && !detail ? (
@@ -103,7 +106,7 @@ export function AndroidChildRunPanel({runId, writable, agentLabel, refreshKey}: 
             <div className="rounded-lg bg-muted/40 px-2.5 py-2"><dt className="text-[10px] text-muted-foreground">失败</dt><dd className={`mt-0.5 text-base font-semibold tabular-nums ${counts.failed > 0 ? 'text-status-red' : ''}`}>{counts.failed}</dd></div>
           </dl>
 
-          {detail.recovery && <div className="mt-3"><RecoveryPanel recovery={detail.recovery} /></div>}
+          {detail.recovery && (!pool || poolRecoveryRelevant(detail.recovery)) && <div className="mt-3"><RecoveryPanel recovery={detail.recovery} /></div>}
 
           {detail.items.length > 0 && (
             <ul className="mt-3 space-y-1.5 text-[11px]" aria-label="关键词执行状态">
@@ -113,6 +116,7 @@ export function AndroidChildRunPanel({runId, writable, agentLabel, refreshKey}: 
                   <span className="text-muted-foreground">{statusLabel(item.status)}
                     {item.stats?.keywordElapsedMs !== undefined ? ` · 耗时 ${durationLabel(item.stats.keywordElapsedMs)}` : ''}
                     {(item.attemptCount || 0) > 1 ? ` · 第 ${item.attemptCount} 次` : ''}
+                    {skippedLabel(item.stats?.skippedCards) ? ` · ${skippedLabel(item.stats?.skippedCards)}` : ''}
                   </span>
                   {item.reason && <span className="w-full text-muted-foreground">{reasonLabel(item.reason)}</span>}
                 </li>

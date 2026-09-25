@@ -84,6 +84,15 @@ export function createAppiumClient({ appiumUrl, fetchImpl = globalThis.fetch, ti
       return request(route(id, '/elements'), 'POST', { using, value }, options);
     },
     clickElement: (id, elementId, options = {}) => request(elementRoute(id, elementId, 'click'), 'POST', {}, options),
+    elementRect: (id, elementId, options = {}) => request(elementRoute(id, elementId, 'rect'), 'GET', undefined, options),
+    /** Tap inside one located element; x/y are offsets from its top-left corner, so the tap cannot leave it. */
+    tapElementAt(id, elementId, x, y, options = {}) {
+      elementRoute(id, elementId, 'click');
+      if (![x, y].every(value => Number.isSafeInteger(value) && value >= 0 && value <= 10000)) {
+        throw new DeviceError('invalid_tap', 'Tap offsets must be bounded non-negative integers');
+      }
+      return request(sessionPath(id), 'POST', { script: 'mobile: clickGesture', args: [{ elementId, x, y }] }, options);
+    },
     clearElement: (id, elementId, options = {}) => request(elementRoute(id, elementId, 'clear'), 'POST', {}, options),
     setValue(id, elementId, text, options = {}) {
       if (typeof text !== 'string' || text.length > 1024) throw new DeviceError('invalid_input', 'Input exceeds its permitted size');

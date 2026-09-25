@@ -53,7 +53,7 @@ export interface RunRecovery {
   lastClosedAt: string | null
 }
 export interface KeywordReceiptStats {
-  links?: number; cards?: number; swipes?: number; keywordElapsedMs?: number; batchElapsedMs?: number
+  links?: number; cards?: number; swipes?: number; skippedCards?: number; keywordElapsedMs?: number; batchElapsedMs?: number
 }
 export interface DiscoveryRunDetail {
   run: DiscoveryRun

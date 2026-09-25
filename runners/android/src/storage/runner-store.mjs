@@ -53,6 +53,17 @@ export class RunnerStore {
       AND json_extract(payload, '$.verification') IN ('verified','ui_bound')`).all(discoveryRunId, itemId);
     return rows.map((row) => row.work_id).filter((id) => typeof id === 'string' && /^(?:\d{16,22}|ui:[a-f0-9]{64})$/.test(id));
   }
+  /** Read-only listing for local diagnostics. */
+  listCheckpoints() {
+    return this.db.prepare('SELECT run_id, revision, payload FROM checkpoints').all()
+      .map((row) => ({ runId: row.run_id, revision: row.revision, value: JSON.parse(row.payload) }));
+  }
+  /** Keyword per item from locally recorded discoveries (read-only), for runs that predate local notes. */
+  recentEventKeywords(sinceMs) {
+    return this.db.prepare(`SELECT DISTINCT json_extract(payload, '$.itemId') AS item_id, json_extract(payload, '$.keyword') AS keyword
+      FROM events WHERE json_extract(payload, '$.discoveredAt') >= ?`).all(new Date(sinceMs).toISOString())
+      .map((row) => ({ itemId: row.item_id, keyword: row.keyword }));
+  }
   loadCheckpoint(runId) {
     const row = this.db.prepare('SELECT revision, payload FROM checkpoints WHERE run_id = ?').get(runId);
     return row ? { revision: row.revision, value: JSON.parse(row.payload) } : null;

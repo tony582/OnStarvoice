@@ -47,6 +47,16 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
     assertProfileDevice({...await adb.inspect(serial,options),...await adb.inspectApp(serial,options)});
     staticCheckedAt = now();
   };
+  // After a new automation session the Appium helper app can hold focus for a moment: wait (read-only) for
+  // Douyin, and relaunch it once through the reviewed launcher only if it did not come back by itself.
+  const regainFocus = async signal => {
+    if ((await foreground.waitFor({signal, waitMs: 8000})).douyin) return;
+    await foreground.ensure({signal, launch: true});
+  };
+  // When the automation service dies mid-run, keep its log lines (crash or low-memory kill) for a local diagnostic.
+  const automationLog = async () => {
+    try { return await bounded(signal => adb.automationLog(serial, {signal}), {timeoutMs: 6000}); } catch { return null; }
+  };
   const pending = new Set();
   const adapter = {
     profileId,
@@ -70,9 +80,11 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
       }
     },
     async inspect(options = {}) {
-      // The claimed task re-verifies the foreground before a session is created; it never relaunches here.
+      // The claimed task re-verifies the foreground before a session is created (no relaunch there). After a new
+      // session it may relaunch Douyin once, through the reviewed launcher, if the helper app kept focus.
       await foreground.ensure({signal:options.signal,launch:false});
-      const state = await session.inspect(options); flow = createDouyinCalibrationFlow({ui:session.ui}); context=null; return state;
+      const state = await session.inspect({...options, afterCreate: () => regainFocus(options.signal)});
+      flow = createDouyinCalibrationFlow({ui:session.ui}); context=null; return state;
     },
     async search({keyword, filters, signal}) {
       throwIfAborted(signal);
@@ -104,7 +116,13 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
   for (const name of ['inspect','search','readCards','openCard','copyLink','returnToResults','recoverResults','scroll','readSource']) {
     const method = adapter[name];
     adapter[name] = params => {
-      const operation = Promise.resolve().then(()=>method(params)).finally(()=>pending.delete(operation));
+      const operation = Promise.resolve().then(()=>method(params)).catch(async error => {
+        if (error?.code === 'appium_http_error' && error.diagnostic === undefined) {
+          const log = await automationLog();
+          try { error.diagnostic = {stage: 'automation', operation: name, w3cError: error.w3cError ?? null, log}; } catch { /* frozen */ }
+        }
+        throw error;
+      }).finally(()=>pending.delete(operation));
       pending.add(operation);
       return operation;
     };

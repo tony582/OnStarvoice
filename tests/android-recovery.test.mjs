@@ -60,3 +60,9 @@ test('disabled or missing nodes cannot advertise a resumable task',()=>{
     assert.equal(state.resumeError,'MOBILE_AGENT_NOT_FOUND');
   }
 });
+
+test('receipt stats carry the runner skipped-card count so the task detail can show it', () => {
+  assert.deepEqual(receiptStats({runner: {stats: {links: 13, cards: 14, skippedCards: 1, keywordElapsedMs: 560000}}}),
+    {links: 13, cards: 14, skippedCards: 1, keywordElapsedMs: 560000});
+  assert.deepEqual(receiptStats({runner: {stats: {links: 2, skippedCards: -3}}}), {links: 2});
+});

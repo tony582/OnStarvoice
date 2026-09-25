@@ -2,8 +2,12 @@ import {DeviceError, throwIfAborted} from './bounded.mjs';
 import {assertProfileDevice, DOUYIN_P0_PROFILE} from './douyin-profile.mjs';
 import {pause} from './ui-wait.mjs';
 
-/** The only reviewed launch target. A launch never resets, clears, reinstalls or force-stops the app. */
-export const DOUYIN_LAUNCH_COMPONENT = `${DOUYIN_P0_PROFILE.packageName}/.main.MainActivity`;
+/**
+ * The only reviewed launch target. A launch never resets, clears, reinstalls or force-stops the app.
+ * Measured on DE106 / Douyin 40.6.0 (2026-09-25, read-only `cmd package resolve-activity` for MAIN/LAUNCHER):
+ * the launcher is .splash.SplashActivity, which also hosts the home feed. .main.MainActivity is not the launcher.
+ */
+export const DOUYIN_LAUNCH_COMPONENT = `${DOUYIN_P0_PROFILE.packageName}/.splash.SplashActivity`;
 const ACTIVITY = /([a-z]\w*(?:\.\w+)+)\/(\.?[\w.$]+)/u;
 
 /** `dumpsys window windows`: the focused window is the authority; a keyguard or system window takes focus away. */
@@ -45,6 +49,16 @@ export function createForegroundGuard({adb, serial, launchIntervalMs = 60_000, w
     ?? parseResumedActivity(await adb.resumedActivity(serial, options));
   const isDouyin = foreground => foreground?.package === DOUYIN_P0_PROFILE.packageName;
   return {
+    /**
+     * Wait, read-only, until Douyin holds focus again. Creating an automation session can briefly bring the
+     * Appium helper app to the front; reading the screen during that moment is not a Douyin failure.
+     */
+    async waitFor({signal, waitMs: limit = 8_000} = {}) {
+      const deadline = now() + limit;
+      let foreground = await readForeground({signal});
+      while (!isDouyin(foreground) && now() < deadline) { await wait(pollMs, signal); foreground = await readForeground({signal}); }
+      return {douyin: isDouyin(foreground), focus: describe(foreground)};
+    },
     async ensure({signal, launch = true} = {}) {
       const options = {signal};
       throwIfAborted(signal);

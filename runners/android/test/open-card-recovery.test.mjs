@@ -6,7 +6,7 @@ import { readVerifiedDetail } from '../src/device/douyin-detail.mjs';
 import { readUntil } from '../src/device/ui-wait.mjs';
 import { createDouyinCalibrationFlow } from '../src/calibration/douyin-flow.mjs';
 import { RunnerStore } from '../src/storage/runner-store.mjs';
-import { runDiscoveryTask, MAX_SKIPPED_CARDS } from '../src/core/discovery-runner.mjs';
+import { runDiscoveryTask, MAX_CONSECUTIVE_SKIPS } from '../src/core/discovery-runner.mjs';
 import { fixtureTask, fixtureClock, fixturePermit, fixtureDevice } from './core-fixtures.mjs';
 
 const encode = value => value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
@@ -192,15 +192,18 @@ test('an unsettled open failure is never skipped and still requires closure', as
   assert.equal(calls.includes('recoverResults'), false);
 });
 
-test('skips are bounded per keyword and the limit is reported', async () => {
-  const cards = Array.from({ length: MAX_SKIPPED_CARDS + 1 }, (_, i) => ({ cardId: `card-${i}`, title: `第${i}条`, author: '车友' }));
+test('only a run of consecutive abnormal cards stops the keyword, and the limit is reported', async () => {
+  const cards = Array.from({ length: MAX_CONSECUTIVE_SKIPS + 2 }, (_, i) => ({ cardId: `card-${i}`, title: `第${i}条`, author: '车友' }));
   const { result, calls } = await run({ overrides: {
     readCards: async () => ({ contextVerified: true, contextId: 'context-1', end: true, cards }),
     openCard: async () => { throw settled('detail_identity_unverified', { stage: 'loaded' }); } } });
   assert.equal(result.reason, 'detail_identity_unverified');
   assert.equal(result.details.skipLimitReached, true);
-  assert.equal(result.stats.skippedCards, MAX_SKIPPED_CARDS);
-  assert.equal(calls.filter(name => name === 'recoverResults').length, MAX_SKIPPED_CARDS);
+  assert.equal(result.details.consecutiveSkips, MAX_CONSECUTIVE_SKIPS + 1);
+  assert.equal(result.details.operation, 'openCard');
+  assert.equal(result.stats.skippedCards, MAX_CONSECUTIVE_SKIPS);
+  assert.equal(calls.filter(name => name === 'recoverResults').length, MAX_CONSECUTIVE_SKIPS);
+  assert.equal(calls.filter(name => name === 'openCard').length, MAX_CONSECUTIVE_SKIPS + 1);
 });
 
 test('a stop during the safe return is reported as the stop, not as the open failure', async () => {

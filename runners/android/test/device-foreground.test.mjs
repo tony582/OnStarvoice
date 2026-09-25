@@ -54,7 +54,8 @@ test('Douyin in front needs no launch; another app is relaunched once through th
   assert.equal(launched.launched, true);
   assert.equal(launched.package, 'com.ss.android.ugc.aweme');
   assert.deepEqual(launches, [{target: serial, component: DOUYIN_LAUNCH_COMPONENT}]);
-  assert.equal(DOUYIN_LAUNCH_COMPONENT, 'com.ss.android.ugc.aweme/.main.MainActivity');
+  // Measured launcher on DE106 / Douyin 40.6.0; it also hosts the home feed.
+  assert.equal(DOUYIN_LAUNCH_COMPONENT, 'com.ss.android.ugc.aweme/.splash.SplashActivity');
   state.focus = focusLauncher;
   await assert.rejects(guard.ensure(), {code: 'douyin_not_foreground', launched: false, focus: 'com.smartisanos.launcher'});
   assert.equal(launches.length, 1, 'relaunches are rate limited');

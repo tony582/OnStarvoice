@@ -1990,6 +1990,7 @@ export function OrchestrationDetailWorkspace({
                 agentLabel={run.agentLabel}
                 writable={writable && !resultView}
                 refreshKey={refreshKey}
+                context="pool"
               />
             ))}
           </section>

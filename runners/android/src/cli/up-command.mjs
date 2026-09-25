@@ -18,6 +18,23 @@ const REASON_TEXT = Object.freeze({
   profile_version_mismatch: '机型或抖音版本不匹配', device_closure_required: '需人工确认手机停稳',
 });
 
+// What the operator can do about a readiness reason; printed once each time the reason appears.
+const REASON_HINT = Object.freeze({
+  device_asleep: '手机已息屏：请解锁手机；建议在「开发者选项」打开「保持唤醒状态（充电时屏幕不休眠）」，插着电就不会息屏',
+  device_locked: '手机锁屏：请解锁手机（锁屏密码只能由你输入，执行器不会解锁）',
+  douyin_not_foreground: '抖音不在前台：执行器会自动把抖音切回前台；若一直如此，请手动打开抖音',
+  appium_not_ready: 'Appium 执行器未就绪：关闭本窗口后重新双击启动',
+});
+// Plain wording for how a keyword ended, matching the admin task detail.
+const OUTCOME_TEXT = Object.freeze({
+  results_end: '结果已到底', no_new_cards: '结果已看完', keyword_time_limit: '已到每词时限', link_limit: '已达帖子上限',
+  task_deadline: '已到截止时间', batch_time_limit: '已到本批时限',
+  detail_identity_unverified: '连续多个作品无法核对', detail_ui_not_ready: '连续多个作品详情未加载',
+  card_open_failed: '连续多个作品点不开', appium_http_error: '手机自动化服务意外中断', device_timeout: '手机响应超时',
+  douyin_not_foreground: '抖音不在前台', device_asleep: '手机息屏', device_locked: '手机锁屏',
+  user_stop: '已手动停止', remote_stop: '调度中心已停止', lease_expired: '与调度中心的连接中断',
+});
+
 /** One human-readable status line from the daemon's current probe. */
 export function describeReadiness(daemon) {
   if (daemon.ready) return '手机已连接 · 抖音在前台 · 已上线，可在调度中心下发任务';
@@ -25,13 +42,41 @@ export function describeReadiness(daemon) {
   return `${REASON_TEXT[reason] ?? reason} · 等待…`;
 }
 
+/** One line per finished keyword, e.g. "【完成】别克壁纸 · 找到 13 条 · 跳过 1 个无法核对的作品 · 结果已看完". */
+export function describeOutcome(outcome) {
+  if (!outcome) return null;
+  const done = outcome.status === 'completed' || outcome.status === 'completed_with_warnings';
+  const parts = [`${done ? '【完成】' : '【提前结束】'}${outcome.keyword}`, `找到 ${outcome.links} 条`];
+  if (outcome.skipped > 0) parts.push(`跳过 ${outcome.skipped} 个无法核对的作品`);
+  parts.push(OUTCOME_TEXT[outcome.reason] ?? outcome.reason ?? '已结束');
+  if (!done && outcome.status !== 'canceled') parts.push('调度中心会自动重试或交给其它节点');
+  return parts.join(' · ');
+}
+
 async function watchReadiness(daemon, {stdout, sleep, signal, watchMs}) {
-  let last;
+  let last, lastOutcomeAt = daemon.lastOutcome?.at ?? null, lastHint = null;
   while (!signal.aborted) {
     const line = describeReadiness(daemon);
     if (line !== last) { stdout(line); last = line; }
+    const reason = daemon.ready ? null : (daemon.blocked ?? daemon.deviceReason ?? null);
+    if (reason !== lastHint) { if (REASON_HINT[reason]) stdout(`提示：${REASON_HINT[reason]}`); lastHint = reason; }
+    if (daemon.lastOutcome && daemon.lastOutcome.at !== lastOutcomeAt) {
+      lastOutcomeAt = daemon.lastOutcome.at;
+      stdout(describeOutcome(daemon.lastOutcome));
+    }
     await sleep(watchMs, signal);
   }
+}
+
+/** Read-only check of the phone's "stay awake while charging" developer option. */
+async function warnWhenScreenCanSleep({adb, serial, stdout}) {
+  try {
+    if (typeof adb.stayOnWhilePluggedIn !== 'function') return;
+    if (await adb.stayOnWhilePluggedIn(serial) === 0) {
+      stdout('提示：手机「保持唤醒状态」未开启。无人值守时屏幕会自动息屏并锁屏，之后任务会停住直到有人解锁。'
+        + '请在 设置 → 开发者选项 打开「保持唤醒状态（充电时屏幕不休眠）」。');
+    }
+  } catch { /* A failed check never blocks start-up. */ }
 }
 
 // TTY prompt. The activation code is read with echo suppressed and is never written to disk or logs.
@@ -98,6 +143,7 @@ export async function runUp(values, {env = process.env, stdout = console.log, de
     appiumChild = child;
     stdout(started ? 'Appium 执行器已由启动器拉起' : 'Appium 执行器已在运行');
   }
+  if (!config.simulation && config.deviceProfile) await warnWhenScreenCanSleep({adb, serial: config.deviceId, stdout});
   const daemon = createDaemon({stateDir, config, actionTimeoutMs: config.deviceProfile ? 60000 : 10000});
   const cleanup = onSignals(() => daemon.requestStop('user_stop'));
   const watch = new AbortController();

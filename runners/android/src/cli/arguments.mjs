@@ -1,8 +1,8 @@
-const OPTIONS = new Set(['serial', 'adb-path', 'appium-path', 'appium-cli-path', 'appium-url', 'state-dir', 'cloud-url', 'simulation', 'label', 'evidence-file', 'duration-seconds', 'device-profile', 'appium-launch-file']);
+const OPTIONS = new Set(['serial', 'adb-path', 'appium-path', 'appium-cli-path', 'appium-url', 'state-dir', 'cloud-url', 'simulation', 'label', 'evidence-file', 'duration-seconds', 'device-profile', 'appium-launch-file', 'hours']);
 
 export function parseArguments(args) {
   const [command = 'help', ...rest] = args;
-  if (!['help', 'doctor', 'demo', 'status', 'deliver', 'retry-delivery', 'run', 'setup', 'start', 'stop', 'close', 'up'].includes(command)) {
+  if (!['help', 'doctor', 'demo', 'status', 'deliver', 'retry-delivery', 'run', 'setup', 'start', 'stop', 'close', 'up', 'diagnose'].includes(command)) {
     throw new Error(`Unknown command: ${command}`);
   }
   const values = {};
@@ -14,12 +14,15 @@ export function parseArguments(args) {
     }
     values[name] = rest[i + 1];
   }
-  if (['status', 'deliver', 'retry-delivery', 'setup', 'start', 'stop', 'close', 'up'].includes(command) && !values['state-dir']) {
+  if (['status', 'deliver', 'retry-delivery', 'setup', 'start', 'stop', 'close', 'up', 'diagnose'].includes(command) && !values['state-dir']) {
     throw new Error('--state-dir is required');
   }
   if (values.simulation && !['true', 'false'].includes(values.simulation)) throw new Error('Invalid simulation mode');
   if (command === 'setup' && !values.serial) throw new Error('--serial is required');
   if (command === 'close' && !values['evidence-file']) throw new Error('--evidence-file is required');
+  if (values.hours !== undefined && !(Number.isInteger(Number(values.hours)) && Number(values.hours) >= 1 && Number(values.hours) <= 720)) {
+    throw new Error('--hours must be 1..720');
+  }
   return {command, values};
 }
 
@@ -40,6 +43,7 @@ start   --state-dir DIR   Foreground daemon; SIGINT/SIGTERM requests a bounded s
 stop    --state-dir DIR   Durable stop request; inspect status to confirm closure.
 close   --state-dir DIR --evidence-file PATH  Explicit independent device closure proof.
 status  --state-dir DIR   Show daemon, device closure and durable outbox state.
+diagnose --state-dir DIR [--hours 24]  Recent keyword runs and why cards or runs ended early (local, read-only).
 demo    --cloud-url http://127.0.0.1:PORT [--duration-seconds 15]
         Opt-in loopback control-plane simulation; never a production tenant.
 deliver --state-dir DIR   One bounded delivery attempt to the configured server.

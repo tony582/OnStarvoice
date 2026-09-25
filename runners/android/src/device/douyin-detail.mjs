@@ -6,26 +6,50 @@ import { readUntil, READ_TIMEOUT_MS, RETRY_DELAY_MS } from './ui-wait.mjs';
 export const DETAIL_READY_BUDGET_MS = 15_000;
 // Errors below are thrown only after a completed read: nothing is in flight on the phone.
 const settled = (code, message, details = {}) => new DeviceError(code, message, { ...details, deviceSettled: true });
+// After an expand tap, stop waiting as soon as the page shows it will not become the selected work.
+const EXPAND_UNCHANGED_READS = 3;
+const EXPAND_LEFT_DETAIL_READS = 3;
+// 40.6.0 appends a UI "收起" after expansion; the whitespace before it varies ("\n收起", " 收起", "收起").
+const COLLAPSE_SUFFIX = /\s*收起$/u;
+// The collapsed caption ends with an ellipsis and an inline "展开" ("... 展开", "…展开").
+const COLLAPSED_CAPTION = /(?:\.\.\.|…)\s*展开$/u;
 
-// 40.6.0 places its expand/collapse label inside the clickable video caption.
-// Remove that UI suffix only when the remaining full text AND author match the card.
+// Remove the UI collapse label only when the remaining full text AND author match the card exactly.
+// Whitespace is not identity (normalizeCaption drops it), so accepting any spacing before "收起" is not a looser match.
 function readCardDetail(tree, card) {
   const detail = readDetail(tree);
   if (!detail || detailMatchesCard(detail, card)) return detail;
   const captions = byId(tree, 'desc');
   if (detail.kind === 'video' && captions.length === 1
-    && captions[0].attributes.clickable === 'true' && detail.title.endsWith(' 收起')) {
-    const expanded = {...detail, title: detail.title.slice(0, -3)};
+    && captions[0].attributes.clickable === 'true' && COLLAPSE_SUFFIX.test(detail.title)) {
+    const expanded = {...detail, title: detail.title.replace(COLLAPSE_SUFFIX, '')};
     if (detailMatchesCard(expanded, card)) return expanded;
   }
   return detail;
 }
 
-/** Diagnostic counts only; captions and authors never leave the device layer through errors. */
+/** Diagnostic counts only; captions and authors never leave the device layer through uploaded details. */
 export function describeDetailTree(tree) {
   const count = id => byId(tree, id).length;
   return { appNodes: appNodes(tree).length, noteCaption: count('tv_desc'), noteAuthor: count('w67'), noteShare: count('n00'),
     videoCaption: count('desc'), videoAuthor: count('title'), videoShare: count('vmj') };
+}
+
+const clip = (value, max = 300) => typeof value === 'string' ? value.slice(0, max) : null;
+// Visible text nodes, so a local diagnostic shows where a caption actually went after a tap.
+function visibleTexts(tree) {
+  return appNodes(tree).filter(node => (node.attributes.text || '').length >= 8).slice(0, 12)
+    .map(node => ({ id: (node.attributes['resource-id'] || '').split('/').pop().slice(0, 40),
+      length: node.attributes.text.length, text: clip(node.attributes.text, 60) }));
+}
+const workFields = work => work ? { kind: work.kind, title: clip(work.title), author: clip(work.author, 80) } : null;
+/**
+ * A local-only record of why a card could not be verified (the core keeps it in the private state
+ * database for `diagnose`). It is deliberately not one of the uploaded completion detail keys.
+ */
+function diagnosticFor({ card, detail = null, after = null, extra = {} }) {
+  return { card: { title: clip(card?.title), author: clip(card?.author, 80) },
+    detail: workFields(detail), after: workFields(after), ...extra };
 }
 
 async function currentActivity(ui, signal) {
@@ -41,26 +65,52 @@ async function expandAndVerify({ ui, tree, detail, card, signal, budgetMs, now }
   const captions = byId(tree, 'desc');
   const separateExpand = expand.length === 1 && expand[0].attributes.text === '展开';
   const inlineExpand = expand.length === 0 && captions.length === 1
-    && captions[0].attributes.clickable === 'true' && /\.\.\.\s+展开$/u.test(detail.title);
+    && captions[0].attributes.clickable === 'true' && COLLAPSED_CAPTION.test(detail.title);
   if (detail.kind !== 'video' || !sameAuthor || (!separateExpand && !inlineExpand)) {
-    throw settled('detail_identity_unverified', 'Opened detail differs from the selected card', { stage: 'loaded' });
+    throw settled('detail_identity_unverified', 'Opened detail differs from the selected card', { stage: 'loaded',
+      diagnostic: diagnosticFor({ card, detail, extra: { stage: 'loaded', sameAuthor, expandButtons: expand.length,
+        captionNodes: captions.length, texts: visibleTexts(tree) } }) });
   }
-  // Expand the observed control; a truncated prefix alone never verifies identity.
-  await ui.clickId(separateExpand ? '0s0' : 'desc', { signal });
-  const expanded = await readUntil({ ui, signal, budgetMs, now,
-    predicate: current => detailMatchesCard(readCardDetail(current, card), card) });
+  // Expand through the observed control only: the dedicated button, or the inline "展开" at the caption's end.
+  // A truncated prefix never verifies identity, and the caption centre is never tapped because it can be a link.
+  let tap = null;
+  if (separateExpand) await ui.clickId('0s0', { signal });
+  else tap = await ui.tapIdNearEnd('desc', { signal });
+  let outcome = 'timeout', unchanged = 0, left = 0, changedTitle = null, last = null;
+  const expanded = await readUntil({ ui, signal, budgetMs, now, predicate: current => {
+    const found = readCardDetail(current, card);
+    if (detailMatchesCard(found, card)) return true;
+    last = found ?? last;
+    if (!found) {
+      unchanged = 0; changedTitle = null;
+      if (++left >= EXPAND_LEFT_DETAIL_READS) { outcome = 'left_detail'; return true; }
+      return false;
+    }
+    left = 0;
+    if (found.title === detail.title) {
+      changedTitle = null;
+      if (++unchanged >= EXPAND_UNCHANGED_READS) { outcome = 'no_change'; return true; }
+      return false;
+    }
+    unchanged = 0;
+    // The caption changed but reads the same twice in a row without matching: it is another text.
+    if (found.title === changedTitle) { outcome = 'mismatch'; return true; }
+    changedTitle = found.title;
+    return false;
+  } });
   const result = readCardDetail(expanded.tree, card);
-  if (!expanded.matched || !detailMatchesCard(result, card)) {
-    throw settled('detail_identity_unverified', 'Expanded detail did not match', { stage: 'expanded', attempts: expanded.attempts });
-  }
-  return result;
+  if (detailMatchesCard(result, card)) return result;
+  throw settled('detail_identity_unverified', 'Expanded detail did not match', { stage: 'expanded', expandOutcome: outcome,
+    attempts: expanded.attempts, diagnostic: diagnosticFor({ card, detail, after: last, extra: { stage: 'expanded',
+      expandOutcome: outcome, control: separateExpand ? 'button' : 'inline', tap, texts: visibleTexts(expanded.tree),
+      activity: await currentActivity(ui, signal) } }) });
 }
 
 /**
  * Verify that the open detail is the selected card. The hierarchy is re-read, never re-clicked,
  * while the budget allows; identity is checked strictly on every read. Outcomes:
  * - matching detail (possibly after one expand of the same-author video caption);
- * - detail_identity_unverified: a detail loaded but it is another work;
+ * - detail_identity_unverified: a detail loaded but it is another work (stage loaded/expanded);
  * - card_open_failed: the verified results page kept showing after the click (searchKeyword given);
  * - detail_ui_not_ready: no readable detail appeared inside the budget;
  * - transport faults (device_timeout, appium_*, aborted, douyin_not_foreground) propagate unchanged.
@@ -83,9 +133,11 @@ export async function readVerifiedDetail({ ui, card, signal, budgetMs = DETAIL_R
   }
   if (resultsPageReads >= 2) {
     throw settled('card_open_failed', 'The selected card did not open; the verified results page is still showing',
-      { attempts: outcome.attempts, elapsedMs: Math.round(outcome.elapsedMs) });
+      { attempts: outcome.attempts, elapsedMs: Math.round(outcome.elapsedMs),
+        diagnostic: diagnosticFor({ card, extra: { stage: 'open' } }) });
   }
+  const activity = await currentActivity(ui, signal);
   throw settled('detail_ui_not_ready', 'The detail page did not expose a readable work inside the action budget',
-    { attempts: outcome.attempts, elapsedMs: Math.round(outcome.elapsedMs), budgetMs, observed,
-      activity: await currentActivity(ui, signal) });
+    { attempts: outcome.attempts, elapsedMs: Math.round(outcome.elapsedMs), budgetMs, observed, activity,
+      diagnostic: diagnosticFor({ card, extra: { stage: 'not_ready', observed, activity, texts: visibleTexts(outcome.tree) } }) });
 }

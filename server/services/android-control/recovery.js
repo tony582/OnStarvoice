@@ -39,6 +39,6 @@ export function recoveryView(task, items, agent, now = Date.now()) {
 export function receiptStats(checkpoint) {
   const source = checkpoint?.runner?.stats;
   if (!source) return null;
-  return Object.fromEntries(['links', 'cards', 'swipes', 'keywordElapsedMs', 'batchElapsedMs']
+  return Object.fromEntries(['links', 'cards', 'swipes', 'skippedCards', 'keywordElapsedMs', 'batchElapsedMs']
     .filter(key => Number.isFinite(source[key]) && source[key] >= 0).map(key => [key, source[key]]));
 }

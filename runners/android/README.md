@@ -36,6 +36,16 @@ node runners/android/cli.mjs up --state-dir /path/to/private/android-state
 
 `up` 依次：① `adb start-server`；② 若本机 Appium `/status` 不通，就按注册时从 `~/.local/share/starvoice/android-toolchain/run-appium.sh`（或 `--appium-launch-file`）解析出的 `appiumLaunch`（node 二进制 + Appium 入口 + 参数 + `JAVA_HOME/ANDROID_HOME/APPIUM_HOME`）**直接 spawn node 拉起**（不经 shell、不执行 .sh），并在 60 秒内轮询等就绪；③ 无 `connection.json` 时交互式注册；④ 前台跑 daemon，每次探测变化打印一行人话状态（如「手机已连接 · 抖音在前台 · 已上线，可在调度中心下发任务」或「抖音未在前台 · 等待…」）；⑤ Ctrl-C / 关闭窗口（SIGINT/SIGTERM/SIGHUP）时请求受控停止、等 daemon 结束、再结束 Appium 子进程（先 SIGTERM，10 秒后 SIGKILL），并打印停稳结果（`deviceClosureRequired` true/false）。它不安装常驻服务。
 
+### 运行情况自查（0.2.2）
+
+一键窗口每个关键词结束会打印一行结果；想看最近一晚的完整情况，在 Runner 目录执行：
+
+```sh
+node cli.mjs diagnose --state-dir /path/to/private/android-state --hours 12
+```
+
+它只读本机状态库，列出每个关键词的开始／结束时间、找到条数、跳过张数和结束原因，以及被跳过作品的本机诊断（卡片与详情文字、展开结果、点击坐标、当时页面文字）。这些诊断只留在本机，不上传。手机需插电并在「开发者选项」打开「保持唤醒状态」；手机有锁屏密码时，息屏后必须人工解锁。见 [20260925 稳定性 hotfix](../../docs/hotfix/20260925-android-stability.md)。
+
 ## 首次设置与启动
 
 激活码只从环境读取，用于一次注册，不写入本地配置、日志或命令参数。注册得到的节点 token 写入指定状态目录的 `connection.json`（权限 0600）；`identity.json` 保存独立稳定 client UUID。不要把状态目录放进版本库，不要复制同一状态目录绑定另一台手机或服务端。手动 `setup` 也可用 `--appium-launch-file` 指定或让它自动探测上面的 `run-appium.sh`，把 `appiumLaunch` 写进 `connection.json` 供 `up` 使用。

@@ -8,6 +8,7 @@ const labels: Record<string, string> = {
   awaiting_detail_adapter: '等待详情接入', queued: '等待补详情', capturing: '正在补详情',
   stored: '已入库', already_exists: '已存在', needs_review: '需要核对',
   resolved: '链接已确认', unresolvable: '链接无法解析', fulfilled: '详情已完成',
+  retryable: '已退回队列，等待重新执行', superseded: '已由新的执行接手',
 }
 const reasons: Record<string, string> = {
   profile_required: '尚未配置这台手机的采集适配',
@@ -32,7 +33,17 @@ const reasons: Record<string, string> = {
   late_audit: '任务结束后收到的发现证据，需重新处理',
   manual_review_required: '需要人工核对',
   clipboard_restore_unconfirmed: '复制链接时中断，尚未确认剪贴板恢复；本次未完成的复制不会作为发现结果提交',
-  appium_http_error: '手机控制连接异常，需确认旧操作已停止',
+  appium_http_error: '手机自动化服务意外中断（已自动确认手机停稳）',
+  detail_identity_unverified: '连续多个作品详情与搜索卡片核对不一致，本次提前结束',
+  detail_ui_not_ready: '连续多个作品详情长时间未加载完成，本次提前结束',
+  card_open_failed: '连续多个作品点击后未进入详情，本次提前结束',
+  douyin_not_foreground: '抖音不在手机前台',
+  device_asleep: '手机已息屏，需要解锁手机',
+  device_timeout: '手机响应超时',
+  device_action_timeout: '手机操作超时',
+  search_context_unverified: '无法确认已回到原搜索结果',
+  no_new_cards: '结果已看完',
+  results_end: '结果已到底',
   session_creation_unconfirmed: '手机控制会话创建中断，是否仍在操作尚未确认',
   process_restarted: '执行器重新启动，原任务等待恢复确认',
   keyword_time_limit: '已到单关键词时限，本次发现结束；不代表已搜完所有结果',
@@ -56,6 +67,21 @@ export function durationLabel(milliseconds: number) {
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
 }
 export const statusLabel = (status: string) => labels[status] || '等待核对'
+// A phone run inside a keyword pool is one attempt: when it stops early the keyword returns to the pool
+// and the dispatcher retries it (on this phone or another node). "Resume" does not apply there.
+const poolRunLabels: Record<string, string> = {
+  interrupted: '本次提前结束 · 关键词已退回队列', needs_action: '需要处理', superseded: '已由新的执行接手',
+}
+export function poolRunResultLabel(detail: DiscoveryRunDetail) {
+  return poolRunLabels[detail.run.status] ?? runResultLabel(detail)
+}
+/** Pool runs show the recovery check only while the phone itself still needs a stop confirmation. */
+export function poolRecoveryRelevant(recovery?: DiscoveryRunDetail['recovery'] | null) {
+  return !!recovery && (recovery.closureRequired || recovery.deviceHeld || recovery.state === 'stopping')
+}
+export function skippedLabel(skipped?: number) {
+  return skipped && skipped > 0 ? `跳过 ${skipped} 个无法核对的作品` : ''
+}
 export const reasonLabel = (reason?: string) => reason ? reasons[reason] || '请查看任务详情并核对执行端状态' : ''
 export function safeOriginalUrl(value: string) {
   try {

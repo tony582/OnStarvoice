@@ -41,6 +41,21 @@ export function createUiSession({ client, sessionId, resourceLocator = 'id' }) {
       }, { timeoutMs: 15000, ...options });
     },
     clickId: (id, options) => click(...locateResource(id), options),
+    /**
+     * Tap the bottom-right end of one located element. For a collapsed caption this is where the inline
+     * "展开" sits; the element centre can be a #topic or @mention link that navigates away instead.
+     */
+    async tapIdNearEnd(id, options = {}) {
+      const elementId = await unique(...locateResource(id), options); throwIfAborted(options.signal);
+      const rect = await client.elementRect(sessionId, elementId, options);
+      const width = Math.round(Number(rect?.width)), height = Math.round(Number(rect?.height));
+      if (!(width > 0 && height > 0)) throw new DeviceError('invalid_element_rect', 'Element size is unknown');
+      const x = Math.max(0, width - Math.min(56, Math.max(24, Math.round(width * 0.06))));
+      const y = Math.max(0, height - Math.min(36, Math.max(12, Math.round(height * 0.25))));
+      throwIfAborted(options.signal);
+      await client.tapElementAt(sessionId, elementId, x, y, options);
+      return { x, y, width, height };
+    },
     clickXPath: (value, options) => click('xpath', value, options),
     clickText: (text, options) => click('xpath', `//*[@package=${xpathLiteral(DOUYIN_P0_PROFILE.packageName)} and @text=${xpathLiteral(text)}]`, options),
     async input(id, text, options = {}) {

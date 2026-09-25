@@ -34,7 +34,7 @@ export async function runCli(args, {stdout = console.log, stderr = console.error
       return report.readyForP0 ? 0 : 2;
     }
     if (command === 'up') { await runUp(values, {env, stdout}); return 0; }
-    if (['setup', 'start', 'stop', 'close', 'status'].includes(command)) {
+    if (['setup', 'start', 'stop', 'close', 'status', 'diagnose'].includes(command)) {
       const report = await daemonCommand(command, values, {env, stdout});
       stdout(JSON.stringify(report, null, 2));
       return 0;

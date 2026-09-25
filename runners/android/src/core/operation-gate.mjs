@@ -17,6 +17,10 @@ export class OperationGate {
   get deviceIdle() { return !this.active && !this.uncertain; }
   async run(action, operationName = 'device_action') {
     if (this.active || this.uncertain) throw new RunnerFault('operation_not_settled');
+    const tag = (error) => {
+      if (error && typeof error === 'object' && error.operation === undefined) { try { error.operation = operationName; } catch { /* frozen */ } }
+      return error;
+    };
     this.permit.assertAllowed();
     this.beforeAction();
     this.journal?.begin(operationName);
@@ -25,7 +29,7 @@ export class OperationGate {
     const aborted = new Promise((_, reject) => { rejectAbort = reject; });
     const abort = (reason) => {
       this.uncertain = true;
-      controller.abort(reason);
+      controller.abort(tag(reason));
       rejectAbort(reason);
     };
     const onStop = () => abort(this.permit.signal.reason ?? new RunnerFault('user_stop'));
@@ -44,7 +48,7 @@ export class OperationGate {
     }, (error) => {
       if (settledFailure(error) && !this.uncertain) this.journal?.complete();
       else this.uncertain = true;
-      throw error;
+      throw tag(error);
     }).finally(() => { this.active = false; });
     try { return await Promise.race([operation, aborted]); }
     finally {

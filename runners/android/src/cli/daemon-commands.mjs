@@ -6,6 +6,7 @@ import {setupRunner} from '../daemon/setup.mjs';
 import {AndroidDaemon} from '../daemon/runtime.mjs';
 import {readConfig} from '../daemon/state.mjs';
 import {confirmDeviceClosure, daemonStatus, requestLocalStop} from '../daemon/local-control.mjs';
+import {diagnoseRunner} from '../daemon/diagnose.mjs';
 
 export async function startRunner({stateDir, durationMs, stdout = console.log}) {
   const config = readConfig(stateDir);
@@ -40,6 +41,7 @@ export async function daemonCommand(command, values, {env, stdout}) {
   const store = new RunnerStore(path);
   try {
     if (command === 'status') return daemonStatus(store);
+    if (command === 'diagnose') return diagnoseRunner(store, {hours: Number(values.hours ?? 24)});
     if (command === 'stop') return requestLocalStop(store);
     if (command === 'close') return await confirmDeviceClosure({store, config: readConfig(stateDir),
       evidence: JSON.parse(readFileSync(values['evidence-file'], 'utf8'))});
