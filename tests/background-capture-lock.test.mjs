@@ -16245,3 +16245,1210 @@ test("an END without an attempt id is ignored with the same identity details", a
   assert.equal(end.data.details.request.id, request.id);
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
 });
+
+// ---------------------------------------------------------------------------
+// Residual capture-assist sessions: a persistent Debug session left behind by
+// an earlier unattended request must never block later tasks, while any live
+// session (current request+attempt, or an owner-bound manual task) stays
+// protected.
+// ---------------------------------------------------------------------------
+
+async function beginResidueUnattendedAttempt(
+  harness,
+  request,
+  {holderDocumentId, sourceTabId = 41, withLock = true} = {},
+) {
+  const lock = withLock
+    ? await harness.api.acquireCaptureExecutionLock({
+        owner: "unattended_keyword_plan",
+        holderId: `holder-${holderDocumentId}`,
+        holderDocumentId,
+        holderTabId: sourceTabId,
+      })
+    : null;
+  if (withLock) assert.equal(lock.ok, true, JSON.stringify(lock));
+  const begun = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: `unattended-capture:${request.id}`,
+      attemptId: request.attemptId,
+      sourceTabId,
+      platform: "xiaohongshu",
+      ownerRequired: false,
+    },
+    buildUnattendedRunnerSender(request, holderDocumentId),
+  );
+  return {lock, begun};
+}
+
+function relayResidueKeywordList(harness, taskId, {tabId = 41} = {}) {
+  return harness.sendBackgroundMessage({
+    type: "onstarvoice:relay-to-content",
+    tabId,
+    payload: {
+      action: "captureKeywordNotes",
+      keyword: "别克OTA",
+      listCaptureRunId: `list-run-${Math.random().toString(36).slice(2, 8)}`,
+      captureRequestId: "capture-residue-1",
+      runnerTabId: tabId,
+      ...(taskId ? {taskId, taskContext: {taskId}} : {}),
+    },
+  });
+}
+
+function moveResidueSlotToNextRequest(harness, {id, attemptId}) {
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    id,
+    attemptId,
+    attemptNumber: 1,
+    status: "running",
+    runnerTabId: 52,
+    localClosureStopConfirmation: undefined,
+  };
+  return harness.storage[UNATTENDED_REQUEST_KEY];
+}
+
+function assertResidueSourceTabUntouched(harness, tabId = 41) {
+  assert.ok(
+    !harness.removedTabIds.includes(tabId),
+    `source tab ${tabId} must not be closed`,
+  );
+  assert.ok(
+    !harness.reloadedTabIds.includes(tabId),
+    `source tab ${tabId} must not be reloaded`,
+  );
+  assert.ok(
+    !harness.updatedTabs.some(
+      (tab) => Number(tab?.id) === tabId && Object.hasOwn(tab, "url"),
+    ),
+    `source tab ${tabId} must not be navigated`,
+  );
+}
+
+async function setupStoppedRequestResidue(harness, {workerTabIds = [43]} = {}) {
+  const requestA = seedUnattendedRequest(harness, {
+    id: "residue-request-a",
+    attemptId: "residue-attempt-a",
+  });
+  const taskA = `unattended-capture:${requestA.id}`;
+  const {lock: lockA, begun} = await beginResidueUnattendedAttempt(
+    harness,
+    requestA,
+    {holderDocumentId: "residue-document-a"},
+  );
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  for (const workerTabId of workerTabIds) {
+    const registered = await harness.sendBackgroundMessage({
+      type: "onstarvoice:register-capture-task-tab",
+      taskId: taskA,
+      attemptId: requestA.attemptId,
+      workerTabId,
+      role: "detail_worker",
+    });
+    assert.equal(registered.ok, true, JSON.stringify(registered));
+    assert.notEqual(registered.data?.ignored, true, JSON.stringify(registered));
+  }
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA)?.tabId, 41);
+  assert.deepEqual(
+    [...(harness.api.getCaptureDebugSessionByTaskId(taskA)?.workerTabIds || [])],
+    workerTabIds,
+  );
+
+  // Operator stop: A turns terminal, its runner lets go of the lock and the
+  // single request slot is immediately handed to the next keyword request B.
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "canceled",
+  };
+  assert.equal(
+    (await harness.api.releaseCaptureExecutionLock(lockA.lock.id)),
+    true,
+  );
+  const requestB = moveResidueSlotToNextRequest(harness, {
+    id: "residue-request-b",
+    attemptId: "residue-attempt-b",
+  });
+  return {requestA, taskA, requestB, taskB: `unattended-capture:${requestB.id}`};
+}
+
+test("a stopped request's leftover capture assist is reclaimed by the next request's BEGIN on the shared source tab", async () => {
+  const harness = createHarness();
+  const {taskA, requestB, taskB} = await setupStoppedRequestResidue(harness);
+
+  const {begun} = await beginResidueUnattendedAttempt(harness, requestB, {
+    holderDocumentId: "residue-document-b",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(begun.data.session?.taskId, taskB);
+  assert.equal(begun.data.session?.state, "attached");
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null);
+  assert.equal(harness.api.getCaptureTaskGroup(taskA), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskB)?.tabId, 41);
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, taskB);
+  assert.equal(
+    harness.storage[LOCK_KEY].captureTaskAttemptId,
+    requestB.attemptId,
+  );
+
+  const relayed = await relayResidueKeywordList(harness, taskB);
+  assert.equal(relayed.ok, true, JSON.stringify(relayed));
+  assert.ok(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 41 &&
+        payload?.action === "captureKeywordNotes" &&
+        payload?.taskId === taskB,
+    ),
+  );
+  // A's own detail worker is closed; the shared XHS source tab is not.
+  assert.deepEqual(harness.removedTabIds, [43]);
+  assertResidueSourceTabUntouched(harness);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, requestB.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+});
+
+test("the next request's list relay reclaims a leftover assist even when its own BEGIN degraded", async () => {
+  const harness = createHarness();
+  const {taskA, requestB, taskB} = await setupStoppedRequestResidue(harness);
+  const lockB = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "holder-residue-document-b",
+    holderDocumentId: "residue-document-b",
+    holderTabId: 41,
+  });
+  assert.equal(lockB.ok, true);
+
+  const relayed = await relayResidueKeywordList(harness, taskB);
+  assert.equal(relayed.ok, true, JSON.stringify(relayed));
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null);
+  assert.equal(harness.api.getCaptureTaskGroup(taskA), null);
+  assert.deepEqual(harness.removedTabIds, [43]);
+  assert.ok(
+    harness.sentTabMessages.some(
+      ({tabId, payload}) =>
+        tabId === 41 && payload?.action === "captureKeywordNotes",
+    ),
+  );
+  assertResidueSourceTabUntouched(harness);
+  // Reclaiming a residue never touches the live request's lock or request.
+  assert.equal(harness.storage[LOCK_KEY].id, lockB.lock.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, requestB.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+});
+
+test("the relay reclaim waits in the lifecycle queue and rechecks the session when the successor BEGIN races it", async () => {
+  // Without the queue (or without the in-queue session recheck) the relay
+  // releases A while B's own BEGIN is reclaiming it, and B loses its session.
+  for (const relayFirst of [false, true]) {
+    const harness = createHarness();
+    const {taskA, requestB, taskB} = await setupStoppedRequestResidue(harness);
+    const lockB = await harness.api.acquireCaptureExecutionLock({
+      owner: "unattended_keyword_plan",
+      holderId: "holder-residue-document-b",
+      holderDocumentId: "residue-document-b",
+      holderTabId: 41,
+    });
+    assert.equal(lockB.ok, true);
+    const messagesBeforeRace = harness.sentTabMessages.length;
+    const sendBegin = () =>
+      harness.sendBackgroundMessage(
+        {
+          type: "onstarvoice:begin-capture-task",
+          taskId: taskB,
+          attemptId: requestB.attemptId,
+          sourceTabId: 41,
+          platform: "xiaohongshu",
+          ownerRequired: false,
+        },
+        buildUnattendedRunnerSender(requestB, "residue-document-b"),
+      );
+    const [begun, relayed] = relayFirst
+      ? (await Promise.all([relayResidueKeywordList(harness, taskB), sendBegin()])).reverse()
+      : await Promise.all([sendBegin(), relayResidueKeywordList(harness, taskB)]);
+    await harness.api.flushRuntime();
+    const label = relayFirst ? "relay first" : "BEGIN first";
+    assert.equal(begun.ok, true, `${label}: ${JSON.stringify(begun)}`);
+    assert.equal(begun.data.session?.taskId, taskB, label);
+    assert.equal(relayed.ok, true, `${label}: ${JSON.stringify(relayed)}`);
+    assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null, label);
+    assert.equal(harness.api.getCaptureTaskGroup(taskA), null, label);
+    assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskB)?.tabId, 41, label);
+    assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskB)?.state, "attached", label);
+    assert.equal(harness.storage["onstarvoice.runtime"]?.captureDebugSession?.taskId, taskB, label);
+    assert.ok(
+      harness.sentTabMessages.some(
+        ({tabId, payload}) =>
+          tabId === 41 &&
+          payload?.action === "captureKeywordNotes" &&
+          payload?.taskId === taskB,
+      ),
+      label,
+    );
+    // A is released once, by whichever side got the queue first; the other
+    // side's in-queue recheck sees B's session and leaves it alone.
+    assert.equal(
+      harness.sentTabMessages
+        .slice(messagesBeforeRace)
+        .filter(
+          ({tabId, payload}) =>
+            tabId === 41 &&
+            payload?.action === "setCaptureTaskTakeover" &&
+            payload?.taskId === taskA,
+        ).length,
+      1,
+      label,
+    );
+    assert.deepEqual(harness.removedTabIds, [43], label);
+    assertResidueSourceTabUntouched(harness);
+  }
+});
+
+function installResidueXhsTabs(harness, {activeTabId = 43} = {}) {
+  // 41 = shared XHS search page, 43/44 = detail worker pages. The fake window
+  // mirrors what switch-platform-tab sees: the active XHS tab wins, otherwise
+  // the highest id.
+  const xhsTab = (id) => ({
+    id,
+    windowId: 1,
+    active: id === activeTabId,
+    groupId: -1,
+    status: "complete",
+    url:
+      id === 41
+        ? "https://www.xiaohongshu.com/search_result?keyword=%E5%88%AB%E5%85%8BOTA"
+        : `https://www.xiaohongshu.com/explore/residue-note-${id}`,
+  });
+  harness.setTabQueryHandler(async (queryInfo = {}) => {
+    const live = [41, 43, 44]
+      .filter((id) => !harness.removedTabIds.includes(id))
+      .map(xhsTab);
+    return queryInfo.active ? live.filter((tab) => tab.active) : live;
+  });
+}
+
+function sendResidueLateEnd(harness, taskId, attemptId, status = "canceled") {
+  return harness.sendBackgroundMessage({
+    type: "onstarvoice:end-capture-task",
+    taskId,
+    attemptId,
+    reason: "capture_task_finished",
+    status,
+  });
+}
+
+test("a late END from a request that lost the slot to a live request defers to that request, whose BEGIN reclaims the leftover", async () => {
+  const harness = createHarness();
+  const {requestA, taskA, requestB, taskB} =
+    await setupStoppedRequestResidue(harness);
+  // B's runner page (52) reserved the lock; B has not begun yet.
+  const lockB = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "holder-residue-document-b",
+    holderDocumentId: "residue-document-b",
+    holderTabId: 52,
+  });
+  assert.equal(lockB.ok, true);
+
+  const lateEnd = await sendResidueLateEnd(harness, taskA, requestA.attemptId);
+  assert.equal(lateEnd.ok, true, JSON.stringify(lateEnd));
+  assert.equal(lateEnd.data.ignored, true);
+  assert.equal(lateEnd.data.reason, "stale_unattended_attempt");
+  assert.equal(lateEnd.data.details.reason, "request_mismatch");
+  assert.equal(lateEnd.data.released, false);
+  assert.equal(lateEnd.data.residualCaptureAssist.released, false);
+  assert.equal(lateEnd.data.residualCaptureAssist.reason, "successor_active");
+  // B's runner may already hold one of A's tabs as its source: nothing closes.
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA)?.state, "attached");
+  assert.deepEqual(harness.removedTabIds, []);
+  assertResidueSourceTabUntouched(harness);
+  // The ignored END must not cancel the page or settle anything for B.
+  assert.ok(
+    !harness.sentTabMessages.some(
+      ({payload}) => payload?.action === "cancelCapture",
+    ),
+  );
+  assert.equal(harness.storage[LOCK_KEY].id, lockB.lock.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, requestB.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+
+  const {begun} = await beginResidueUnattendedAttempt(harness, requestB, {
+    holderDocumentId: "residue-document-b",
+    withLock: false,
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null);
+  assert.equal(harness.api.getCaptureTaskGroup(taskA), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskB)?.tabId, 41);
+  assert.deepEqual(harness.removedTabIds, [43]);
+  assertResidueSourceTabUntouched(harness);
+
+  // A second late END for the gone request has nothing left to release.
+  const repeatedEnd = await sendResidueLateEnd(
+    harness,
+    taskA,
+    requestA.attemptId,
+    "completed",
+  );
+  assert.equal(repeatedEnd.data.ignored, true);
+  assert.equal(repeatedEnd.data.released, false);
+  assert.equal(
+    repeatedEnd.data.residualCaptureAssist.reason,
+    "capture_assist_absent",
+  );
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(taskB)?.state,
+    "attached",
+  );
+});
+
+test("a late END releases a leftover assist once no live request holds the slot, keeping foreground tabs open", async () => {
+  const harness = createHarness();
+  const {requestA, taskA, requestB} = await setupStoppedRequestResidue(
+    harness,
+    {workerTabIds: [43, 44]},
+  );
+  // B already finished; no runner is adopting tabs. Worker 44 is the tab the
+  // operator is looking at.
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "completed",
+  };
+  installResidueXhsTabs(harness, {activeTabId: 44});
+
+  const lateEnd = await sendResidueLateEnd(harness, taskA, requestA.attemptId);
+  assert.equal(lateEnd.ok, true, JSON.stringify(lateEnd));
+  assert.equal(lateEnd.data.ignored, true);
+  assert.equal(lateEnd.data.reason, "stale_unattended_attempt");
+  assert.equal(lateEnd.data.details.reason, "request_mismatch");
+  assert.equal(lateEnd.data.released, true);
+  assert.equal(lateEnd.data.residualCaptureAssist.released, true);
+  assert.equal(lateEnd.data.residualCaptureAssist.reason, "request_mismatch");
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null);
+  assert.equal(harness.api.getCaptureTaskGroup(taskA), null);
+  assert.deepEqual(harness.removedTabIds, [43]);
+  assertResidueSourceTabUntouched(harness);
+  assert.ok(
+    !harness.sentTabMessages.some(
+      ({payload}) => payload?.action === "cancelCapture",
+    ),
+  );
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].id, requestB.id);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "completed");
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+});
+
+test("a late END never closes the old worker tab the next request already picked as its source", async () => {
+  const harness = createHarness();
+  const {requestA, taskA, requestB, taskB} =
+    await setupStoppedRequestResidue(harness);
+  const lockB = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "holder-residue-document-b",
+    holderDocumentId: "residue-document-b",
+    holderTabId: 52,
+  });
+  assert.equal(lockB.ok, true);
+  // A was stopped mid-detail, so its worker 43 is the active XHS tab and B's
+  // runner is handed that tab as its source before A's END arrives.
+  installResidueXhsTabs(harness, {activeTabId: 43});
+  const senderB = buildUnattendedRunnerSender(requestB, "residue-document-b");
+  const switched = await harness.sendBackgroundMessage(
+    {type: "onstarvoice:switch-platform-tab", platform: "xiaohongshu"},
+    senderB,
+  );
+  assert.equal(switched.ok, true, JSON.stringify(switched));
+  assert.equal(switched.data.tabId, 43);
+
+  const lateEnd = await sendResidueLateEnd(harness, taskA, requestA.attemptId);
+  assert.equal(lateEnd.ok, true, JSON.stringify(lateEnd));
+  assert.equal(lateEnd.data.ignored, true);
+  assert.equal(lateEnd.data.released, false);
+  assert.equal(lateEnd.data.residualCaptureAssist.reason, "successor_active");
+  assert.deepEqual(harness.removedTabIds, []);
+
+  const {begun} = await beginResidueUnattendedAttempt(harness, requestB, {
+    holderDocumentId: "residue-document-b",
+    sourceTabId: 43,
+    withLock: false,
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(begun.data.session?.taskId, taskB);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskB)?.tabId, 43);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null);
+  assert.equal(harness.api.getCaptureTaskGroup(taskA), null);
+  assert.deepEqual(harness.removedTabIds, []);
+  assertResidueSourceTabUntouched(harness, 41);
+  assertResidueSourceTabUntouched(harness, 43);
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, taskB);
+
+  const relayed = await relayResidueKeywordList(harness, taskB, {tabId: 43});
+  assert.equal(relayed.ok, true, JSON.stringify(relayed));
+});
+
+test("an old attempt's END defers to a live newer attempt and releases only its own assist once the request is terminal", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    id: "residue-same-request",
+    attemptId: "residue-attempt-1",
+  });
+  const taskId = `unattended-capture:${request.id}`;
+  const {lock: lock1, begun} = await beginResidueUnattendedAttempt(
+    harness,
+    request,
+    {holderDocumentId: "residue-document-1"},
+  );
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(await harness.api.releaseCaptureExecutionLock(lock1.lock.id), true);
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    attemptId: "residue-attempt-2",
+    attemptNumber: 2,
+    runnerTabId: 44,
+  };
+  const lock2 = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "holder-residue-document-2",
+    holderDocumentId: "residue-document-2",
+    holderTabId: 44,
+  });
+  assert.equal(lock2.ok, true);
+
+  // Attempt 2 is live but has not begun: attempt 1's END leaves every tab to
+  // attempt 2's own BEGIN.
+  const deferredEnd = await sendResidueLateEnd(
+    harness,
+    taskId,
+    "residue-attempt-1",
+    "completed",
+  );
+  assert.equal(deferredEnd.ok, true, JSON.stringify(deferredEnd));
+  assert.equal(deferredEnd.data.ignored, true);
+  assert.equal(deferredEnd.data.details.reason, "attempt_mismatch");
+  assert.equal(deferredEnd.data.released, false);
+  assert.equal(
+    deferredEnd.data.residualCaptureAssist.reason,
+    "successor_active",
+  );
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(taskId)?.attemptId,
+    "residue-attempt-1",
+  );
+
+  // Attempt 2 ends up terminal without ever beginning; attempt 1's assist is
+  // now provable residue and its own late END releases it.
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "canceled",
+  };
+  assert.equal(await harness.api.releaseCaptureExecutionLock(lock2.lock.id), true);
+  const lateEnd = await sendResidueLateEnd(
+    harness,
+    taskId,
+    "residue-attempt-1",
+    "completed",
+  );
+  assert.equal(lateEnd.ok, true, JSON.stringify(lateEnd));
+  assert.equal(lateEnd.data.ignored, true);
+  assert.equal(lateEnd.data.details.reason, "attempt_mismatch");
+  assert.equal(lateEnd.data.released, true);
+  assert.equal(lateEnd.data.residualCaptureAssist.reason, "request_terminal");
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskId), null);
+  assertResidueSourceTabUntouched(harness);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "canceled");
+});
+
+test("a late END from an old attempt never closes the worker tab its newer attempt picked as source", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    id: "residue-rebind-request",
+    attemptId: "residue-rebind-attempt-1",
+  });
+  const taskId = `unattended-capture:${request.id}`;
+  const {lock: lock1, begun} = await beginResidueUnattendedAttempt(
+    harness,
+    request,
+    {holderDocumentId: "residue-rebind-document-1"},
+  );
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  const registered = await harness.sendBackgroundMessage({
+    type: "onstarvoice:register-capture-task-tab",
+    taskId,
+    attemptId: request.attemptId,
+    workerTabId: 43,
+    role: "detail_worker",
+  });
+  assert.equal(registered.ok, true, JSON.stringify(registered));
+  assert.equal(await harness.api.releaseCaptureExecutionLock(lock1.lock.id), true);
+  const request2 = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    attemptId: "residue-rebind-attempt-2",
+    attemptNumber: 2,
+    runnerTabId: 44,
+  };
+  harness.storage[UNATTENDED_REQUEST_KEY] = request2;
+  const lock2 = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    holderId: "holder-residue-rebind-document-2",
+    holderDocumentId: "residue-rebind-document-2",
+    holderTabId: 44,
+  });
+  assert.equal(lock2.ok, true);
+  installResidueXhsTabs(harness, {activeTabId: 43});
+  const sender2 = buildUnattendedRunnerSender(
+    request2,
+    "residue-rebind-document-2",
+  );
+  const switched = await harness.sendBackgroundMessage(
+    {type: "onstarvoice:switch-platform-tab", platform: "xiaohongshu"},
+    sender2,
+  );
+  assert.equal(switched.ok, true, JSON.stringify(switched));
+  assert.equal(switched.data.tabId, 43);
+
+  const lateEnd = await sendResidueLateEnd(
+    harness,
+    taskId,
+    "residue-rebind-attempt-1",
+    "completed",
+  );
+  assert.equal(lateEnd.data.ignored, true);
+  assert.equal(lateEnd.data.released, false);
+  assert.equal(lateEnd.data.residualCaptureAssist.reason, "successor_active");
+  assert.deepEqual(harness.removedTabIds, []);
+
+  // Attempt 2's BEGIN rebinds the stable task: it releases attempt 1's assist
+  // but keeps its own chosen source, even though attempt 1 listed it as a
+  // worker.
+  const {begun: begun2} = await beginResidueUnattendedAttempt(
+    harness,
+    request2,
+    {
+      holderDocumentId: "residue-rebind-document-2",
+      sourceTabId: 43,
+      withLock: false,
+    },
+  );
+  assert.equal(begun2.ok, true, JSON.stringify(begun2));
+  const session2 = harness.api.getCaptureDebugSessionByTaskId(taskId);
+  assert.equal(session2?.tabId, 43);
+  assert.equal(session2?.attemptId, "residue-rebind-attempt-2");
+  assert.deepEqual(harness.removedTabIds, []);
+  assertResidueSourceTabUntouched(harness, 41);
+  assertResidueSourceTabUntouched(harness, 43);
+  assert.equal(
+    harness.storage[LOCK_KEY].captureTaskAttemptId,
+    "residue-rebind-attempt-2",
+  );
+});
+
+test("a late END from attempt 1 never releases attempt 2's live assist and foreign list relays still mismatch", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    id: "residue-live-request",
+    attemptId: "residue-live-attempt-1",
+  });
+  const taskId = `unattended-capture:${request.id}`;
+  const {lock: lock1, begun: begun1} = await beginResidueUnattendedAttempt(
+    harness,
+    request,
+    {holderDocumentId: "residue-live-document-1"},
+  );
+  assert.equal(begun1.ok, true, JSON.stringify(begun1));
+  assert.equal(await harness.api.releaseCaptureExecutionLock(lock1.lock.id), true);
+  const request2 = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    attemptId: "residue-live-attempt-2",
+    attemptNumber: 2,
+    runnerTabId: 43,
+  };
+  harness.storage[UNATTENDED_REQUEST_KEY] = request2;
+  const {begun: begun2} = await beginResidueUnattendedAttempt(
+    harness,
+    request2,
+    {holderDocumentId: "residue-live-document-2"},
+  );
+  assert.equal(begun2.ok, true, JSON.stringify(begun2));
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(taskId)?.attemptId,
+    "residue-live-attempt-2",
+  );
+
+  const lateEnd = await harness.sendBackgroundMessage({
+    type: "onstarvoice:end-capture-task",
+    taskId,
+    attemptId: "residue-live-attempt-1",
+    reason: "capture_task_finished",
+    status: "completed",
+  });
+  assert.equal(lateEnd.ok, true, JSON.stringify(lateEnd));
+  assert.equal(lateEnd.data.ignored, true);
+  assert.equal(lateEnd.data.released, false);
+  assert.equal(lateEnd.data.details.reason, "attempt_mismatch");
+  const liveSession = harness.api.getCaptureDebugSessionByTaskId(taskId);
+  assert.equal(liveSession?.attemptId, "residue-live-attempt-2");
+  assert.equal(liveSession?.state, "attached");
+
+  for (const foreignTaskId of [
+    "unattended-capture:some-other-request",
+    "task_manual_foreign",
+    "",
+  ]) {
+    const relayed = await relayResidueKeywordList(harness, foreignTaskId);
+    assert.equal(relayed.ok, false, JSON.stringify(relayed));
+    assert.equal(relayed.error.code, "capture_task_relay_mismatch");
+  }
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(taskId)?.state,
+    "attached",
+  );
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, taskId);
+  assert.equal(
+    harness.storage[LOCK_KEY].captureTaskAttemptId,
+    "residue-live-attempt-2",
+  );
+  const ownRelay = await relayResidueKeywordList(harness, taskId);
+  assert.equal(ownRelay.ok, true, JSON.stringify(ownRelay));
+});
+
+test("a live owner-bound manual task session is not reclaimed by an unattended BEGIN", async () => {
+  const harness = createHarness();
+  const manualTaskId = "task_residue_manual_live";
+  const ownerPort = createCaptureOwnerPort();
+  assert.equal(
+    harness.api.bindCaptureTaskOwner(ownerPort, manualTaskId).bound,
+    true,
+  );
+  const manualBegin = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: manualTaskId,
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+    ownerRequired: true,
+  });
+  assert.equal(manualBegin.ok, true, JSON.stringify(manualBegin));
+
+  const request = seedUnattendedRequest(harness, {
+    id: "residue-unattended-contender",
+    attemptId: "residue-contender-attempt",
+  });
+  const {begun} = await beginResidueUnattendedAttempt(harness, request, {
+    holderDocumentId: "residue-contender-document",
+  });
+  assert.equal(begun.ok, false, JSON.stringify(begun));
+  assert.equal(begun.error.code, "capture_task_debug_starvoice_active");
+  assert.equal(begun.error.details?.ownerTaskId, manualTaskId);
+  assert.equal(begun.error.details?.safeToDetach, false);
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(manualTaskId)?.state,
+    "attached",
+  );
+  assert.equal(harness.api.getCaptureTaskGroup(manualTaskId)?.sourceTabId, 41);
+
+  const relayed = await relayResidueKeywordList(
+    harness,
+    `unattended-capture:${request.id}`,
+  );
+  assert.equal(relayed.ok, false, JSON.stringify(relayed));
+  assert.equal(relayed.error.code, "capture_task_relay_mismatch");
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(manualTaskId)?.state,
+    "attached",
+  );
+  assert.deepEqual(harness.removedTabIds, []);
+});
+
+test("a terminal request's own assist stays protected until its source stop is confirmed", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    id: "residue-terminal-request",
+    attemptId: "residue-terminal-attempt",
+  });
+  const taskId = `unattended-capture:${request.id}`;
+  const {lock, begun} = await beginResidueUnattendedAttempt(harness, request, {
+    holderDocumentId: "residue-terminal-document",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "needs_action",
+  };
+  assert.equal(await harness.api.releaseCaptureExecutionLock(lock.lock.id), true);
+
+  // Still in the slot without stop evidence: the terminal closure path owns
+  // this session as a stop target, so a manual BEGIN must not reclaim it.
+  const blocked = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: "task_residue_manual_after_terminal",
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(blocked.ok, false, JSON.stringify(blocked));
+  assert.equal(blocked.error.code, "capture_task_debug_starvoice_active");
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskId)?.state, "attached");
+
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    localClosureStopConfirmation: {
+      version: 1,
+      requestId: request.id,
+      attemptId: request.attemptId,
+      stage: "source_stopped",
+      taskId,
+      lockIdentity: null,
+      targetTabIds: [41],
+      method: "content_capture_settled",
+      sourceStoppedAt: new Date().toISOString(),
+    },
+  };
+  const accepted = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: "task_residue_manual_after_terminal",
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskId), null);
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(
+      "task_residue_manual_after_terminal",
+    )?.tabId,
+    41,
+  );
+  assertResidueSourceTabUntouched(harness);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].localClosureStopConfirmation.stage,
+    "source_stopped",
+  );
+});
+
+test("reclaiming a residue never closes a tab the new task uses as its source", async () => {
+  const harness = createHarness();
+  const {taskA, requestB, taskB} = await setupStoppedRequestResidue(harness);
+  // B runs on the Tab that A had registered as a detail worker (43).
+  const {begun} = await beginResidueUnattendedAttempt(harness, requestB, {
+    holderDocumentId: "residue-document-b",
+    sourceTabId: 43,
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskB)?.tabId, 43);
+  assert.ok(!harness.removedTabIds.includes(43), "new source tab closed");
+  assertResidueSourceTabUntouched(harness, 41);
+  assertResidueSourceTabUntouched(harness, 43);
+});
+
+test("an assist whose task still holds the execution lock is never treated as residue", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    id: "residue-locked-request",
+    attemptId: "residue-locked-attempt-1",
+  });
+  const taskId = `unattended-capture:${request.id}`;
+  const {lock, begun} = await beginResidueUnattendedAttempt(harness, request, {
+    holderDocumentId: "residue-locked-document",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, taskId);
+
+  // Recovery already assigned attempt 2, but attempt 1 still holds the bound
+  // lock until its stop is confirmed: its assist is not provably residue.
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    attemptId: "residue-locked-attempt-2",
+    attemptNumber: 2,
+    status: "recovering",
+  };
+  const foreignRelay = await relayResidueKeywordList(harness, "task_manual_x");
+  assert.equal(foreignRelay.ok, false, JSON.stringify(foreignRelay));
+  assert.equal(foreignRelay.error.code, "capture_task_relay_mismatch");
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskId)?.state, "attached");
+
+  // Even a moved slot does not override a lock that still names the task.
+  moveResidueSlotToNextRequest(harness, {
+    id: "residue-locked-next",
+    attemptId: "residue-locked-next-attempt",
+  });
+  const nextRelay = await relayResidueKeywordList(
+    harness,
+    "unattended-capture:residue-locked-next",
+  );
+  assert.equal(nextRelay.ok, false, JSON.stringify(nextRelay));
+  assert.equal(nextRelay.error.code, "capture_task_relay_mismatch");
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskId)?.state, "attached");
+  assert.equal(harness.storage[LOCK_KEY].id, lock.lock.id);
+
+  // Once that lock is gone the leftover is reclaimable on the next relay.
+  assert.equal(await harness.api.releaseCaptureExecutionLock(lock.lock.id), true);
+  const reclaimedRelay = await relayResidueKeywordList(
+    harness,
+    "unattended-capture:residue-locked-next",
+  );
+  assert.equal(reclaimedRelay.ok, true, JSON.stringify(reclaimedRelay));
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskId), null);
+  assertResidueSourceTabUntouched(harness);
+});
+
+test("a running request's same-attempt assist stays live after its lock binding is lost", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness, {
+    id: "residue-unbound-request",
+    attemptId: "residue-unbound-attempt-2",
+    attemptNumber: 2,
+  });
+  const taskId = `unattended-capture:${request.id}`;
+  const {lock, begun} = await beginResidueUnattendedAttempt(harness, request, {
+    holderDocumentId: "residue-unbound-document",
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  const registered = await harness.sendBackgroundMessage({
+    type: "onstarvoice:register-capture-task-tab",
+    taskId,
+    attemptId: request.attemptId,
+    workerTabId: 43,
+    role: "detail_worker",
+  });
+  assert.equal(registered.ok, true, JSON.stringify(registered));
+  // The lock is lost (lease expired, holder document gone, or runner
+  // recovery) while the request is still running in the same attempt. Only
+  // the request slot proves this assist is live now.
+  assert.equal(await harness.api.releaseCaptureExecutionLock(lock.lock.id), true);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].attemptId,
+    "residue-unbound-attempt-2",
+  );
+
+  for (const foreignTaskId of [
+    "task_manual_unbound",
+    "unattended-capture:residue-unbound-other",
+    "",
+  ]) {
+    const relayed = await relayResidueKeywordList(harness, foreignTaskId);
+    assert.equal(relayed.ok, false, JSON.stringify(relayed));
+    assert.equal(relayed.error.code, "capture_task_relay_mismatch");
+  }
+  const manualBegin = await harness.sendBackgroundMessage({
+    type: "onstarvoice:begin-capture-task",
+    taskId: "task_manual_unbound_begin",
+    sourceTabId: 41,
+    platform: "xiaohongshu",
+  });
+  assert.equal(manualBegin.ok, false, JSON.stringify(manualBegin));
+  assert.equal(manualBegin.error.code, "capture_task_debug_starvoice_active");
+
+  // Late ENDs from an older attempt of the same request, or from another
+  // request, are ignored and never release the live same-attempt assist.
+  const olderAttemptEnd = await sendResidueLateEnd(
+    harness,
+    taskId,
+    "residue-unbound-attempt-1",
+  );
+  assert.equal(olderAttemptEnd.ok, true, JSON.stringify(olderAttemptEnd));
+  assert.equal(olderAttemptEnd.data.ignored, true);
+  assert.equal(olderAttemptEnd.data.released, false);
+  assert.equal(
+    olderAttemptEnd.data.residualCaptureAssist?.reason,
+    "capture_assist_attempt_mismatch",
+  );
+  const otherRequestEnd = await sendResidueLateEnd(
+    harness,
+    "unattended-capture:residue-unbound-other",
+    "residue-unbound-other-attempt",
+  );
+  assert.equal(otherRequestEnd.ok, true, JSON.stringify(otherRequestEnd));
+  assert.equal(otherRequestEnd.data.ignored, true);
+  assert.equal(otherRequestEnd.data.released, false);
+
+  const session = harness.api.getCaptureDebugSessionByTaskId(taskId);
+  assert.equal(session?.state, "attached");
+  assert.equal(session?.tabId, 41);
+  assert.equal(session?.attemptId, "residue-unbound-attempt-2");
+  assert.deepEqual([...(session?.workerTabIds || [])], [43]);
+  assert.equal(harness.api.getCaptureTaskGroup(taskId)?.sourceTabId, 41);
+  assert.deepEqual(harness.removedTabIds, []);
+  assertResidueSourceTabUntouched(harness);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "running");
+});
+
+test("a storage read error during the leftover check treats the assist as live, as before", async () => {
+  const harness = createHarness();
+  const {requestA, taskA, taskB} = await setupStoppedRequestResidue(harness);
+  // failLockRead(n) decides whether the n-th lock read since the last reset
+  // fails.
+  let failLockRead = () => true;
+  let lockReads = 0;
+  harness.setStorageGetHandler(async (keys, result) => {
+    const list = Array.isArray(keys) ? keys : [keys];
+    if (list.includes(LOCK_KEY)) {
+      lockReads += 1;
+      if (failLockRead(lockReads)) {
+        throw new Error("transient storage failure");
+      }
+    }
+    return result;
+  });
+
+  // Undecidable: the relay is refused exactly as in 0.4.14, not a runtime error.
+  const relayed = await relayResidueKeywordList(harness, taskB);
+  assert.equal(relayed.ok, false, JSON.stringify(relayed));
+  assert.equal(relayed.error.code, "capture_task_relay_mismatch");
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA)?.state, "attached");
+
+  // A late END stays an ignored END and releases nothing. Its attempt fence
+  // (first lock read, as in 0.4.14) succeeds; only the leftover check fails.
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "completed",
+  };
+  lockReads = 0;
+  failLockRead = (read) => read === 2;
+  const lateEnd = await sendResidueLateEnd(harness, taskA, requestA.attemptId);
+  assert.equal(lockReads >= 2, true, String(lockReads));
+  assert.equal(lateEnd.ok, true, JSON.stringify(lateEnd));
+  assert.equal(lateEnd.data.ignored, true);
+  assert.equal(lateEnd.data.released, false);
+  assert.equal(
+    lateEnd.data.residualCaptureAssist?.reason,
+    "residue_state_unreadable",
+  );
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA)?.state, "attached");
+  assert.deepEqual(harness.removedTabIds, []);
+
+  // Once storage reads work again the leftover is reclaimed as usual.
+  failLockRead = () => false;
+  const retried = await sendResidueLateEnd(harness, taskA, requestA.attemptId);
+  assert.equal(retried.ok, true, JSON.stringify(retried));
+  assert.equal(retried.data.ignored, true);
+  assert.equal(retried.data.released, true, JSON.stringify(retried));
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null);
+  assertResidueSourceTabUntouched(harness);
+});
+
+test("a late END reclaim finishes before a racing successor can adopt a platform tab, and keeps the tab it adopts", async () => {
+  const harness = createHarness();
+  const {requestA, taskA} = await setupStoppedRequestResidue(harness);
+  // The slot's request B already finished: A's late END sees no live
+  // successor and starts releasing A's assist.
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "completed",
+  };
+  // 41 = shared XHS search page, 43 = A's old detail worker, 52 = the runner
+  // page in front. switch-platform-tab picks the highest-id XHS tab.
+  let activeTabId = 52;
+  const tabOf = (id) => ({
+    id,
+    windowId: 1,
+    active: id === activeTabId,
+    groupId: -1,
+    status: "complete",
+    url:
+      id === 52
+        ? "chrome-extension://test/sidebar/sidebar.html"
+        : id === 41
+          ? "https://www.xiaohongshu.com/search_result?keyword=%E5%88%AB%E5%85%8BOTA"
+          : `https://www.xiaohongshu.com/explore/residue-note-${id}`,
+  });
+  harness.setTabQueryHandler(async (queryInfo = {}) => {
+    const live = [41, 43, 52]
+      .filter((id) => !harness.removedTabIds.includes(id))
+      .map(tabOf);
+    return queryInfo.active ? live.filter((tab) => tab.active) : live;
+  });
+  harness.setTabUpdateHandler(async (tabId, patch) => {
+    if (patch?.active) activeTabId = Number(tabId);
+    return {...tabOf(Number(tabId)), ...patch};
+  });
+
+  // While the END is mid-release (clearing A's overlay on 41), request C is
+  // dispatched, reserves the lock and its runner asks for a platform tab.
+  const order = [];
+  let requestC = null;
+  let switchedC = null;
+  harness.setTabMessageHandler(async (tabId, payload) => {
+    if (
+      !requestC &&
+      payload?.action === "setCaptureTaskTakeover" &&
+      payload?.taskId === taskA
+    ) {
+      requestC = moveResidueSlotToNextRequest(harness, {
+        id: "residue-request-c",
+        attemptId: "residue-attempt-c",
+      });
+      const lockC = await harness.api.acquireCaptureExecutionLock({
+        owner: "unattended_keyword_plan",
+        holderId: "holder-residue-document-c",
+        holderDocumentId: "residue-document-c",
+        holderTabId: 52,
+      });
+      assert.equal(lockC.ok, true, JSON.stringify(lockC));
+      // A content page never waits on the runner's tab switch.
+      switchedC = harness
+        .sendBackgroundMessage(
+          {type: "onstarvoice:switch-platform-tab", platform: "xiaohongshu"},
+          buildUnattendedRunnerSender(requestC, "residue-document-c"),
+        )
+        .then((response) => {
+          order.push("switch");
+          return response;
+        });
+    }
+    if (payload?.action === "inspectCaptureActivity") {
+      return {ok: true, targetActive: false, activeCount: 0};
+    }
+    return {ok: true};
+  });
+
+  const lateEnd = await sendResidueLateEnd(harness, taskA, requestA.attemptId);
+  order.push("end");
+  assert.ok(requestC, "the successor was not dispatched mid-release");
+  const switched = await switchedC;
+  // The runner cannot adopt a tab while the reclaim is still closing tabs.
+  assert.deepEqual(order, ["end", "switch"]);
+  assert.equal(lateEnd.ok, true, JSON.stringify(lateEnd));
+  assert.equal(lateEnd.data.ignored, true);
+  assert.equal(lateEnd.data.details.reason, "request_mismatch");
+  assert.equal(lateEnd.data.released, true);
+  assert.equal(lateEnd.data.residualCaptureAssist.released, true);
+  assert.equal(lateEnd.data.residualCaptureAssist.workerTabsKept, true);
+  assert.equal(harness.api.getCaptureDebugSessionByTaskId(taskA), null);
+  assert.equal(harness.api.getCaptureTaskGroup(taskA), null);
+  // C showed up before the close: A's detached worker stays open for it.
+  assert.deepEqual(harness.removedTabIds, []);
+
+  assert.equal(switched.ok, true, JSON.stringify(switched));
+  assert.equal(switched.data.tabId, 43);
+  const {begun} = await beginResidueUnattendedAttempt(harness, requestC, {
+    holderDocumentId: "residue-document-c",
+    sourceTabId: switched.data.tabId,
+    withLock: false,
+  });
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(
+    harness.api.getCaptureDebugSessionByTaskId(
+      `unattended-capture:${requestC.id}`,
+    )?.tabId,
+    43,
+  );
+  const relayed = await relayResidueKeywordList(
+    harness,
+    `unattended-capture:${requestC.id}`,
+    {tabId: 43},
+  );
+  assert.equal(relayed.ok, true, JSON.stringify(relayed));
+  assert.deepEqual(harness.removedTabIds, []);
+  assertResidueSourceTabUntouched(harness, 41);
+  assertResidueSourceTabUntouched(harness, 43);
+});
+
+test("a cloud stop never reloads the source tab under the running request's in-flight list relay", async () => {
+  const harness = createHarness();
+  const id = "residue-stop-inflight";
+  const attemptId = `${id}-attempt`;
+  const taskId = `unattended-capture:${id}`;
+  const captureRequestId = `${id}-capture`;
+  seedUnattendedRequest(harness, {
+    id,
+    attemptId,
+    status: "pending",
+    runnerTabId: 52,
+    cloudAssigned: true,
+    progress: {
+      current: 1,
+      total: 2,
+      keyword: "别克OTA",
+      phase: "searching",
+      message: "正在采集别克OTA",
+      captureRequestId,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  const request = harness.storage[UNATTENDED_REQUEST_KEY];
+  const sender = buildUnattendedRunnerSender(request, `${id}-document`);
+  const claimed = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:claim-unattended-keyword-run",
+      requestId: id,
+      attemptId,
+      holderId: `${id}-holder`,
+    },
+    sender,
+  );
+  assert.equal(claimed.accepted, true, JSON.stringify(claimed));
+  const begun = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId,
+      attemptId,
+      sourceTabId: 41,
+      platform: "xiaohongshu",
+      ownerRequired: false,
+    },
+    sender,
+  );
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+
+  // The runner's list capture is still unwinding on 41 (busy machine): it
+  // stays active through the whole stop window.
+  const deliveries = [];
+  let finishCapture = null;
+  harness.setTabMessageHandler(async (tabId, payload) => {
+    if (tabId === 41 && payload?.action === "captureKeywordNotes") {
+      deliveries.push(payload.captureRequestId);
+      return await new Promise((resolve) => {
+        finishCapture = () => resolve({ok: true, data: {items: []}});
+      });
+    }
+    if (payload?.action === "cancelCapture") return {ok: true, matched: true};
+    if (payload?.action === "inspectCaptureActivity") {
+      const active = tabId === 41 && typeof finishCapture === "function";
+      return {ok: true, targetActive: active, activeCount: active ? 1 : 0};
+    }
+    return {ok: true, ready: true};
+  });
+  const relay = harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:relay-to-content",
+      tabId: 41,
+      payload: {
+        action: "captureKeywordNotes",
+        keyword: "别克OTA",
+        captureRequestId,
+        listCaptureRunId: `${id}-list-run`,
+        taskId,
+        taskContext: {taskId},
+      },
+    },
+    sender,
+  );
+  for (let poll = 0; poll < 100 && deliveries.length === 0; poll += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(deliveries, [captureRequestId]);
+
+  await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: `${id}-stop-command`,
+      command_type: "stop",
+      client_task_id: id,
+      payload: {controlTaskId: id},
+    },
+    "token",
+  );
+  await harness.api.flushUnattended();
+
+  const stopped = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(stopped.status, "canceled");
+  // A reload would kill the in-flight relay's port and let the relay retry
+  // re-send the canceled capture into the fresh document. The stop leaves
+  // the source page alone and records no stop evidence while the stopped
+  // request's own capture is still running.
+  assertResidueSourceTabUntouched(harness, 41);
+  assert.equal(stopped.localClosureStopConfirmation, undefined);
+
+  finishCapture();
+  await relay;
+  assert.deepEqual(deliveries, [captureRequestId]);
+});

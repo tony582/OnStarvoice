@@ -1278,6 +1278,7 @@ async function applyBatchSearchFilters({
     : /xiaohongshu\.com/i.test(window.location.href)
       ? "xiaohongshu"
       : "unknown";
+  const pageRoute = detectBatchSearchPageRoute();
   const requireXhsTimeFilter = platform === "xiaohongshu" &&
     verifyXhsTimeFilter && isXhsPublishTimeWindow(publishTime);
   if (requireXhsTimeFilter) assertNoXhsSearchFilterSecurityPage();
@@ -1291,6 +1292,7 @@ async function applyBatchSearchFilters({
       appliedCount: 0,
       failedFields: [],
       results: [],
+      pageRoute,
     };
   }
   if (platform === "douyin") {
@@ -1356,6 +1358,7 @@ async function applyBatchSearchFilters({
       appliedCount: 0,
       failedFields: [],
       results: [],
+      pageRoute,
     };
   }
   const notes = [];
@@ -1375,6 +1378,7 @@ async function applyBatchSearchFilters({
         applied: false,
       })),
       notes,
+      pageRoute,
     };
   }
   const results = [];
@@ -1434,8 +1438,23 @@ async function applyBatchSearchFilters({
     failedFields,
     results,
     notes,
+    pageRoute,
     ...(requireXhsTimeFilter ? {xhsTimeFilterEvidence} : {}),
   };
+}
+
+// 只回传路由种类（不含查询参数和关键词），用于说明时间筛选失败时所在的页面；
+// 小红书 AI 搜索页 /search_result_ai 的布局和筛选面板与标准搜索页不同。
+function detectBatchSearchPageRoute() {
+  const href = String(window.location?.href || "");
+  const pathname = String(
+    window.location?.pathname ||
+      href.match(/^[a-z][a-z\d+.-]*:\/\/[^/?#]*([^?#]*)/iu)?.[1] ||
+      "",
+  ).toLowerCase();
+  if (/^\/search_result(?:\/|$)/u.test(pathname)) return "search_result";
+  if (/^\/search_result_ai(?:\/|$)/u.test(pathname)) return "search_result_ai";
+  return "other";
 }
 
 async function prepareKeywordStrategyCapture() {

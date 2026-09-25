@@ -16243,6 +16243,17 @@ function createSearchFilterApplicationError(result = null) {
   return error;
 }
 
+// 页面脚本或中转失败时，在 filterResult 里保留原始错误码和截断后的文案，便于排查；
+// 失败文案只写「页面脚本调用失败」，错误码和各标志仍由 createXhsSearchTimeFilterError 决定。
+function buildXhsTimeFilterContentFailure(error = null) {
+  const message = typeof error === 'string' ? error : error?.message;
+  return {
+    reason: 'content_message_failed',
+    relayCode: String(error?.code || '').trim().slice(0, 80),
+    relayMessage: String(message || '').trim().slice(0, 200),
+  };
+}
+
 async function applySearchFiltersInTab(
   tabId,
   searchFilters = {},
@@ -16287,7 +16298,11 @@ async function applySearchFiltersInTab(
       if (requireVerifiedFilters) {
         throw createSearchFilterApplicationError(responseError);
       }
-      if (requireXhsTimeFilter) throw createXhsSearchTimeFilterError(responseError);
+      if (requireXhsTimeFilter) {
+        throw createXhsSearchTimeFilterError(
+          buildXhsTimeFilterContentFailure(responseError),
+        );
+      }
       return null;
     }
     const result = contentResponse?.data ?? contentResponse ?? null;
@@ -16295,7 +16310,11 @@ async function applySearchFiltersInTab(
       throw createSearchFilterApplicationError(result);
     }
     if (requireXhsTimeFilter && !isXhsSearchTimeFilterVerified(result, searchFilters.publishTime)) {
-      throw createXhsSearchTimeFilterError(result);
+      throw createXhsSearchTimeFilterError(
+        result && typeof result === 'object'
+          ? result
+          : buildXhsTimeFilterContentFailure(null),
+      );
     }
     return result;
   } catch (error) {
@@ -16314,7 +16333,7 @@ async function applySearchFiltersInTab(
     if (requireXhsTimeFilter) {
       if (error?.code === 'XHS_SECURITY_BLOCK' && error?.securityEvidence?.confirmed === true) throw error;
       if (error?.code === 'XHS_SEARCH_TIME_FILTER_UNVERIFIED') throw error;
-      throw createXhsSearchTimeFilterError({reason: 'content_message_failed'});
+      throw createXhsSearchTimeFilterError(buildXhsTimeFilterContentFailure(error));
     }
     return null;
   }
@@ -17359,7 +17378,7 @@ export async function batchCaptureByKeywords({
         partial: canceledError,
         recoverableInterruption: canceledError,
         fatal: fatalError || captureFailure.fatal,
-        error: error?.message || '当前关键词采集失败',
+        error: formatKeywordFailureMessage(error) || '当前关键词采集失败',
         errorCode: captureFailure.code,
         errorCategory: captureFailure.category,
         securityBlocked: captureFailure.securityBlocked,
@@ -17829,6 +17848,102 @@ export async function batchCaptureByKeywords({
   }
 }
 
+// 小红书搜索路由：只有 /search_result（可带结尾斜杠）是标准搜索页。
+// /search_result_ai（AI 搜索）等只是「包含」search_result 的路由，布局和筛选面板都不同；
+// 自动搜索不复用它的参数，改回标准搜索路由。
+function classifyXhsSearchPathname(pathname = '') {
+  const normalized = String(pathname || '').toLowerCase();
+  if (normalized === '/search_result' || normalized === '/search_result/') {
+    return 'standard';
+  }
+  if (
+    normalized.includes('/search_result') ||
+    normalized.includes('/web/search_result') ||
+    normalized.includes('/search/result')
+  ) {
+    return 'non_standard';
+  }
+  return 'none';
+}
+
+// XHS_SEARCH_TIME_FILTER_UNVERIFIED 是多种原因共用的兜底码：在关键词失败文案后附上
+// error.filterResult 里的真实原因（总长有界）。只改说明文字，错误码、分类和各标志不变；
+// 其它错误原样返回 error.message。
+function formatKeywordFailureMessage(error) {
+  const message = String(error?.message || '').trim();
+  if (
+    String(error?.code || '').trim() !== 'XHS_SEARCH_TIME_FILTER_UNVERIFIED' ||
+    !message
+  ) {
+    return error?.message;
+  }
+  const maxLength = 160;
+  const filterResult =
+    error.filterResult && typeof error.filterResult === 'object'
+      ? error.filterResult
+      : {};
+  const evidence =
+    filterResult.xhsTimeFilterEvidence &&
+    typeof filterResult.xhsTimeFilterEvidence === 'object'
+      ? filterResult.xhsTimeFilterEvidence
+      : null;
+  const reason = String(filterResult.reason || '').trim();
+  const evidenceReason = String(evidence?.reason || '').trim();
+  const readCount = (value) => {
+    const number = Number(value);
+    return value !== null && value !== undefined && value !== '' &&
+      Number.isFinite(number) && number >= 0
+      ? Math.min(Math.floor(number), 9999)
+      : null;
+  };
+  let reasonText = '';
+  if (reason === 'content_message_failed') {
+    // 中转/页面脚本的原始错误码（filterResult.relayCode）不写进文案：后台和
+    // 管理端会按错误文本归类失败（如含 required 判为安全、含 timeout 判为网络），
+    // 附上它会让同一个错误码被改判。
+    reasonText = '页面脚本调用失败';
+  } else if (reason === 'panel_not_opened') {
+    reasonText = '未找到筛选面板';
+  } else if (reason === 'not_search_page') {
+    reasonText = '当前不是搜索页';
+  } else if (evidenceReason === 'time_option_unverified') {
+    reasonText = '时间选项未保持选中';
+  } else if (evidenceReason === 'result_transition_unconfirmed') {
+    reasonText = '筛选后结果未刷新';
+  }
+  const parts = [];
+  if (reasonText) parts.push(`原因：${reasonText}`);
+  const cardCount = readCount(evidence?.cardCount);
+  const baselineCardCount = readCount(evidence?.baselineCardCount);
+  if (cardCount !== null) {
+    parts.push(
+      baselineCardCount !== null
+        ? `结果卡片 ${cardCount}/基线 ${baselineCardCount}`
+        : `结果卡片 ${cardCount}`,
+    );
+  }
+  const elapsedMs = Number(evidence?.elapsedMs);
+  if (Number.isFinite(elapsedMs) && elapsedMs > 0) {
+    const seconds =
+      elapsedMs >= 10000
+        ? Math.round(elapsedMs / 1000)
+        : Math.round(elapsedMs / 100) / 10;
+    parts.push(`等待 ${Math.min(seconds, 600)} 秒`);
+  }
+  const pageRoute = String(filterResult.pageRoute || '').trim();
+  if (pageRoute === 'search_result_ai') {
+    parts.push('页面：AI 搜索页');
+  } else if (pageRoute === 'other' && reason !== 'not_search_page') {
+    parts.push('页面：非标准搜索页');
+  }
+  let suffix = '';
+  for (const part of parts) {
+    const next = suffix ? `${suffix}；${part}` : part;
+    if (`${message}（${next}）`.length <= maxLength) suffix = next;
+  }
+  return suffix ? `${message}（${suffix}）` : message;
+}
+
 export async function lightSampleByKeywords({
   categorySamples = [],
   platform = '',
@@ -18073,16 +18188,18 @@ function buildKeywordSearchUrl(keyword, platform, baseSearchUrl) {
   if (baseSearchUrl) {
     try {
       const parsed = new URL(baseSearchUrl);
-      const pathname = String(parsed.pathname || '').toLowerCase();
-      const isXhsSearchPath =
-        pathname.includes('/search_result') ||
-        pathname.includes('/web/search_result') ||
-        pathname.includes('/search/result');
+      const searchRoute = classifyXhsSearchPathname(parsed.pathname);
 
-      // 已在搜索结果页：复用该 URL 的搜索参数，避免丢失可用上下文
-      if (isXhsSearchPath) {
+      // 已在标准搜索结果页：复用该 URL 的搜索参数，避免丢失可用上下文
+      if (searchRoute === 'standard') {
         parsed.searchParams.set('keyword', keyword);
         return parsed.toString();
+      }
+
+      // /search_result_ai（AI 搜索）等非标准搜索路由：回到标准搜索路由，不带走该页参数
+      if (searchRoute === 'non_standard') {
+        xhsDefaultSearchUrl.searchParams.set('keyword', keyword);
+        return xhsDefaultSearchUrl.toString();
       }
 
       // 非搜索结果页（例如 explore）：切到标准搜索路由，只拷贝与搜索相关的参数

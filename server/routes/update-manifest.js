@@ -3,12 +3,26 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.14',
+  latestVersion: '0.4.15',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-23',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.14-20260923.zip',
+  releaseDate: '2026-09-24',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.15-20260924.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.15',
+      releaseDate: '2026-09-24',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {title: '停止任务后不再残留采集辅助', desc: '无人值守任务被停止、取消或以“停止未确认”收尾后，留在小红书来源页上的旧浏览器采集辅助，会在下一个无人值守任务启动或列表采集时被识别并释放，不再导致下一任务的关键词连续报“列表采集子运行与当前采集辅助任务不一致”；正在运行的任务以及手动、巡查任务的采集辅助处理不变，也不会关闭或刷新来源页。需更新 Extension。'},
+            {title: '自动搜索不再误入小红书 AI 搜索页', desc: '标签页停在小红书 AI 搜索页（/search_result_ai）等非标准搜索路由时，自动搜索（无人值守启动和后续关键词）改为打开标准搜索页 /search_result，不再沿用 AI 搜索页的布局和筛选面板；此前这会让该机器的关键词连续报“无法确认小红书时间筛选及结果刷新已生效”。搜索次数和筛选点击不变。需更新 Extension。'},
+            {title: '时间筛选失败写明原因', desc: '“无法确认小红书时间筛选及结果刷新已生效”的失败会附带有界的原因说明：未找到筛选面板、时间选项未保持选中、筛选后结果未刷新、当前不是搜索页或页面脚本调用失败，以及结果卡片数、等待时长和所在页面（AI 搜索页或非标准搜索页）；错误码、分类和处理方式不变，结果刷新的等待时间和校验规则与 0.4.14 相同。'},
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.14',
       releaseDate: '2026-09-23',

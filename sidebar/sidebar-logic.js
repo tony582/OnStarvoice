@@ -18402,9 +18402,15 @@ function buildSidebarKeywordSearchUrl(keyword, platform, baseSearchUrl = "") {
         pathname.includes("/search_result") ||
         pathname.includes("/web/search_result") ||
         pathname.includes("/search/result");
-      if (isXhsSearchPath) {
+      // 只有标准搜索路由 /search_result 才复用当前参数；/search_result_ai（AI 搜索）
+      // 等非标准路由布局和筛选面板都不同，回到标准搜索路由且不带走该页参数。
+      if (pathname === "/search_result" || pathname === "/search_result/") {
         parsed.searchParams.set("keyword", keyword);
         return parsed.toString();
+      }
+      if (isXhsSearchPath) {
+        xhsDefaultSearchUrl.searchParams.set("keyword", keyword);
+        return xhsDefaultSearchUrl.toString();
       }
       const nextSearchUrl = new URL(xhsDefaultSearchUrl.toString());
       const source = String(parsed.searchParams.get("source") || "").trim();
