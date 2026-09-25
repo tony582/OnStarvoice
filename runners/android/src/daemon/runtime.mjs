@@ -193,7 +193,8 @@ export class AndroidDaemon {
     let started = performance.now();
     const polled = await this.control.poll({deviceId: this.config.deviceId, sessionId: this.sessionId,
       readyForSearch: this.ready, reason: this.deviceReason ?? null, probe: this.pollProbe()}, {signal: this.shutdown.signal});
-    this.lastControlError = null; // Only an answered poll clears it; turns skipped by backoff or a block keep the last error.
+    // Only an answered poll ends a failure streak; turns skipped for backoff or a block keep the count and the error.
+    this.controlFailures = 0; this.lastControlError = null;
     this.nextControlAt = Date.now() + Math.max(this.pollMs, polled.pollAfterMs ?? 0);
     this.applyControl(polled.control);
     if (this.shutdown.signal.aborted) return;
@@ -215,7 +216,7 @@ export class AndroidDaemon {
   }
   async controlLoop() {
     while (!this.shutdown.signal.aborted) {
-      try { await this.tick(); this.controlFailures = 0; }
+      try { await this.tick(); }
       catch (error) {
         // A normal local shutdown aborts an in-flight poll. Do not turn that
         // expected cancellation into a persistent control-plane fault.
@@ -226,8 +227,9 @@ export class AndroidDaemon {
           }
           this.lastControlError = error.code ?? 'control_unavailable';
           this.controlFailures++;
-          this.nextControlAt = Date.now() + Math.max(error.retryAfterMs ?? 0,
-            Math.min(60000, this.pollMs * 2 ** Math.min(this.controlFailures, 6)));
+          // A running task or an undelivered completion stays at the first step so it still reaches the server within the 90 s lease.
+          const step = this.active || stateValue(this.store, 'daemon:completion') ? 1 : Math.min(this.controlFailures, 6);
+          this.nextControlAt = Date.now() + Math.max(error.retryAfterMs ?? 0, Math.min(60000, this.pollMs * 2 ** step));
         }
       }
       this.status({controlError: this.lastControlError ?? null});
