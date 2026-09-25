@@ -82,6 +82,8 @@ import {registerOrchestrationParentProjector} from '../services/android-control/
 import {
   STOP_FENCE_CHECK_CAPABILITY,
   STOP_FENCE_CONFIRMATION_TEXT,
+  STOP_FENCE_OPERATOR_RELEASED_ITEM_CODE,
+  STOP_FENCE_OPERATOR_RELEASED_REASON,
   attachAgentStopFences,
   claimStopFenceCheckOffers,
   completeStopFenceCheckReceipt,
@@ -90,7 +92,13 @@ import {
   reconcileCaptureTaskStopFences,
   rotateStopFenceChecks,
   stopFenceAutoCheckEnabled,
+  stopFenceOperatorReleasable,
 } from '../services/capture-stop-fence.js';
+import {
+  readNeedsActionReleaseItemOutcome,
+  recordNeedsActionStopFenceOutcome,
+  releaseNeedsActionStopFences,
+} from '../services/capture-stop-fence-release.js';
 
 function requireCaptureAgent(req, res, next) {
   return authenticateCaptureAgent(req, res, error => {
@@ -4140,6 +4148,14 @@ async function adoptLocalOrchestrationRecovery(
   if (!sourceTask?.parent_task_id) return task;
 
   const sourceMetadata = safeJson(sourceTask.metadata);
+  // An operator released this source (needs_action stop fence) and handed its
+  // work back to the batch; a local continuation must not take it back.
+  if (
+    sourceTask.status === 'superseded' &&
+    sourceMetadata.terminalReason === STOP_FENCE_OPERATOR_RELEASED_REASON
+  ) {
+    return task;
+  }
   const recordedSuccessorId = text(
     sourceMetadata.recoveryTaskId || sourceMetadata.handoffSuccessorTaskId,
     240,
@@ -11575,7 +11591,11 @@ const STOP_FENCE_ADMIN_ERRORS = Object.freeze({
   agent_stop_fence_absent: [409, '该节点当前没有待确认的旧采集页面'],
   agent_stop_fence_task_action_required: [
     409,
-    '该节点的停止保护来自仍需处理的任务，请在该任务上点「继续」或「停止」',
+    '该节点的停止保护来自仍需处理的任务：批次任务请刷新后在「确认旧页面已停止」里一并确认，其它任务请在任务上点「继续」或「停止」',
+  ],
+  agent_stop_fence_command_in_flight: [
+    409,
+    '该节点待确认的任务正在执行后台指令（例如停止），请等指令完成后再确认',
   ],
   agent_stop_fence_check_unsupported: [
     409,
@@ -11597,15 +11617,52 @@ function sendStopFenceAdminError(res, code, extra = {}) {
   return res.status(status).json({ok: false, error: code, message, ...extra});
 }
 
-function stopFenceRequiresTaskAction(rows) {
+// Fence rows that still hold the node after this request. With skipReasons
+// (the confirm route) every row also says why it was not released:
+// not_selected / command_in_flight / not_releasable / not_orchestration_child.
+function stopFenceRequiresTaskAction(rows, {skipReasons = null, releasedIds = null} = {}) {
   return rows
     .filter(row => row.kind === 'fence' && row.status !== 'superseded')
-    .map(row => ({
-      id: row.id,
-      title: row.title || '',
-      status: row.status,
-      parentTaskId: row.parent_task_id || null,
-    }));
+    .filter(row => !releasedIds || !releasedIds.has(String(row.id).toLowerCase()))
+    .map(row => {
+      const operatorConfirmable = stopFenceOperatorReleasable(row);
+      return {
+        id: row.id,
+        title: row.title || '',
+        status: row.status,
+        parentTaskId: row.parent_task_id || null,
+        operatorConfirmable,
+        ...(skipReasons
+          ? {skipReason: skipReasons.get(String(row.id).toLowerCase()) ||
+              (operatorConfirmable ? 'not_selected' : 'not_orchestration_child')}
+          : {}),
+      };
+    });
+}
+
+// Sum the actual outcomes of needs_action releases into the confirm message.
+function stopFenceReleaseOutcomeMessage(itemOutcomes = []) {
+  let returned = 0;
+  let exhausted = 0;
+  let batchRetry = 0;
+  let parentStopped = 0;
+  for (const outcome of itemOutcomes) {
+    returned += Number(outcome.retryable || 0);
+    if (outcome.distributionMode === 'elastic_pool') {
+      exhausted += Number(outcome.failed || 0) + Number(outcome.needsAction || 0);
+    } else {
+      batchRetry += Number(outcome.failed || 0) + Number(outcome.needsAction || 0);
+    }
+    if (outcome.kind === 'none' && outcome.parentStopped) parentStopped += 1;
+  }
+  let message = '';
+  if (returned > 0) message += `；${returned} 个未完成关键词已退回任务池，由其它节点接力`;
+  if (exhausted > 0) message += `；${exhausted} 个关键词已达自动接力上限，可在批次里点「重试失败关键词」`;
+  if (batchRetry > 0) message += `；${batchRetry} 个未完成关键词已标为需处理，可在批次里点「重试失败关键词」`;
+  if (parentStopped > 0) {
+    message += `；${parentStopped} 个任务所在批次已停止，未完成关键词已随批次取消，本次只解除停止保护`;
+  }
+  return message;
 }
 
 async function loadStopFenceAdminAgent(tx, tenantId, agentId) {
@@ -11722,8 +11779,14 @@ router.post('/agents/:id/stop-fence/confirm', requireCriticalTenantAccess, requi
       if (!agent) return {error: 'agent_not_found'};
       const rows = await listCaptureAgentStopFences(tx, req.tenantId, {agentId});
       const superseded = rows.filter(row => row.kind === 'fence' && row.status === 'superseded');
-      const requiresTaskAction = stopFenceRequiresTaskAction(rows);
-      if (superseded.length === 0) {
+      // docs/hotfix/20260925-needs-action-fence.md: a needs_action batch child
+      // is released only when the operator selected it explicitly (an older
+      // Admin never sends these ids and keeps the previous behaviour).
+      const selected = rows.filter(row =>
+        stopFenceOperatorReleasable(row) &&
+        expectedTaskIds.has(String(row.id).toLowerCase()));
+      if (superseded.length === 0 && selected.length === 0) {
+        const requiresTaskAction = stopFenceRequiresTaskAction(rows, {skipReasons: new Map()});
         return requiresTaskAction.length > 0
           ? {error: 'agent_stop_fence_task_action_required', requiresTaskAction}
           : {error: 'agent_stop_fence_absent'};
@@ -11739,12 +11802,21 @@ router.post('/agents/:id/stop-fence/confirm', requireCriticalTenantAccess, requi
       // switch is off, and only for a row the node can locate by request id;
       // anything else would stay pending with nobody to answer it.
       const requestLocalRelease = autoCheckSupported && autoCheckEnabled;
-      const locatable = new Set(superseded
+      const locatable = new Set([...superseded, ...selected]
         .filter(row => text(row.request_id, 240))
         .map(row => String(row.id).toLowerCase()));
       const actorName = text(req.actorName, 240);
       const actorId = String(req.user?.id || '');
-      const released = await reconcileCaptureTaskStopFences(tx, {
+      // Lock order: slot lock (above) -> every selected task row by id ->
+      // parents -> work items -> attempts, the same direction as heartbeat
+      // projection and retry dispatch.
+      await tx.queryAll(`
+        SELECT id FROM capture_tasks
+        WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+        ORDER BY id
+        FOR UPDATE
+      `, [req.tenantId, [...superseded, ...selected].map(row => row.id)]);
+      const supersededReleased = await reconcileCaptureTaskStopFences(tx, {
         tenantId: req.tenantId,
         agentId,
         taskIds: superseded.map(row => row.id),
@@ -11757,6 +11829,73 @@ router.post('/agents/:id/stop-fence/confirm', requireCriticalTenantAccess, requi
         note,
         requestLocalRelease,
       });
+      const needsActionRelease = await releaseNeedsActionStopFences(tx, {
+        tenantId: req.tenantId,
+        agentId,
+        taskIds: selected.map(row => row.id),
+        requestedBy: actorName,
+        actorId,
+        note,
+        requestLocalRelease,
+      });
+      const skipReasons = new Map(needsActionRelease.skipped.map(skip =>
+        [String(skip.id).toLowerCase(), skip.reason]));
+      // Only needs_action rows were selected and none could be released: say
+      // why instead of recording a confirmation of nothing.
+      if (superseded.length === 0 && needsActionRelease.released.length === 0) {
+        const requiresTaskAction = stopFenceRequiresTaskAction(rows, {skipReasons});
+        return requiresTaskAction.some(task => task.skipReason === 'command_in_flight')
+          ? {error: 'agent_stop_fence_command_in_flight', requiresTaskAction}
+          : {error: 'agent_stop_fence_changed'};
+      }
+      // Hand the work of each released child back to its batch exactly like
+      // an expired create command does (same projection as the heartbeat):
+      // elastic -> retryable (failed at the budget), fixed -> needs_action,
+      // a stopped or finished batch -> untouched.
+      const itemOutcomes = [];
+      const orderedReleases = [...needsActionRelease.released].sort((left, right) =>
+        String(left.parentTaskId).localeCompare(String(right.parentTaskId)) ||
+        String(left.id).localeCompare(String(right.id)));
+      for (const release of orderedReleases) {
+        // Same-transaction re-entry; the order stays child -> parent. Only to
+        // record the parent as it was before the projection.
+        const parentBefore = await lockOrchestrationParent(tx, req.tenantId, release.parentTaskId);
+        await projectOrchestrationChildControlOutcome(tx, {
+          tenantId: req.tenantId,
+          childTask: release.row,
+          agentId,
+          status: 'needs_action',
+          error: {
+            code: STOP_FENCE_OPERATOR_RELEASED_ITEM_CODE,
+            originalCode: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
+            message: '旧采集页面未能安全停止，已由管理员确认停止后交回批次',
+          },
+          actorType: 'user',
+          actorId,
+          actorName,
+        });
+        const itemOutcome = await readNeedsActionReleaseItemOutcome(tx, {
+          tenantId: req.tenantId,
+          parentTaskId: release.parentTaskId,
+          taskId: release.id,
+          parentBefore,
+        });
+        await recordNeedsActionStopFenceOutcome(tx, {
+          tenantId: req.tenantId,
+          agentId,
+          taskId: release.id,
+          itemOutcome,
+          originalError: release.originalError,
+          actorType: 'user',
+          actorId,
+          actorName,
+        });
+        itemOutcomes.push({taskId: release.id, ...itemOutcome});
+      }
+      const needsActionTaskIds = needsActionRelease.released.map(release => release.id);
+      const released = [...supersededReleased, ...needsActionTaskIds];
+      const releasedIds = new Set(released.map(id => String(id).toLowerCase()));
+      const requiresTaskAction = stopFenceRequiresTaskAction(rows, {skipReasons, releasedIds});
       const localReleaseTaskIds = requestLocalRelease
         ? released.filter(id => locatable.has(String(id).toLowerCase()))
         : [];
@@ -11781,10 +11920,15 @@ router.post('/agents/:id/stop-fence/confirm', requireCriticalTenantAccess, requi
           localReleaseRequested: localReleaseTaskIds.length > 0,
           localReleaseTaskIds,
           requiresTaskActionCount: requiresTaskAction.length,
+          needsActionTaskIds,
+          itemOutcomes,
+          skipped: needsActionRelease.skipped,
         }),
       ]);
       return {
         released,
+        needsActionTaskIds,
+        itemOutcomes,
         requiresTaskAction,
         autoCheckSupported,
         autoCheckEnabled,
@@ -11796,16 +11940,19 @@ router.post('/agents/:id/stop-fence/confirm', requireCriticalTenantAccess, requi
         ? {requiresTaskAction: result.requiresTaskAction}
         : {});
     }
-    const pendingActions = result.requiresTaskAction.length;
+    const commandInFlight = result.requiresTaskAction
+      .filter(task => task.skipReason === 'command_in_flight').length;
+    const pendingActions = result.requiresTaskAction.length - commandInFlight;
     const localReleaseCount = result.localReleaseTaskIds.length;
     const withoutLocalRelease = result.released.length - localReleaseCount;
     // A 0.4.16 node takes no new capture work until it dropped the old local
     // lock (heartbeat hold), so do not promise it resumes right away.
-    let message = pendingActions > 0 || localReleaseCount > 0
+    let message = pendingActions > 0 || commandInFlight > 0 || localReleaseCount > 0
       ? `已确认旧采集页面已停止（${result.released.length} 个任务已记录人工确认）`
       : `已确认旧采集页面已停止，节点恢复接单（${result.released.length} 个任务已记录人工确认）`;
+    message += stopFenceReleaseOutcomeMessage(result.itemOutcomes);
     if (localReleaseCount > 0) {
-      message += pendingActions > 0
+      message += pendingActions > 0 || commandInFlight > 0
         ? '；节点会在下次心跳时释放本机执行锁'
         : '；节点会在下次心跳时释放本机执行锁，释放后恢复接单';
     }
@@ -11819,10 +11966,15 @@ router.post('/agents/:id/stop-fence/confirm', requireCriticalTenantAccess, requi
     if (pendingActions > 0) {
       message += `；另有 ${pendingActions} 个仍需处理的任务，请在任务上点「继续」或「停止」，处理后节点才会恢复接单`;
     }
+    if (commandInFlight > 0) {
+      message += `；另有 ${commandInFlight} 个任务正在执行后台指令，完成后再确认`;
+    }
     return res.json({
       ok: true,
       agentId,
       taskIds: result.released,
+      needsActionTaskIds: result.needsActionTaskIds,
+      itemOutcomes: result.itemOutcomes,
       localReleaseRequested: localReleaseCount > 0,
       requiresTaskAction: result.requiresTaskAction,
       message,
@@ -16093,6 +16245,17 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
       if (String(agentId || '') !== String(taskIdentity.agent_id)) {
         return { error: 'task_agent_changed', task };
       }
+      // A fenced batch child can never be resumed on the node (no Extension
+      // version completes the command) and a resume_requested row could no
+      // longer be released from the node panel. Root tasks are unaffected.
+      if (
+        task.parent_task_id &&
+        task.task_type === 'unattended_keyword_capture' &&
+        task.status === 'needs_action' &&
+        captureTaskHasUnconfirmedLocalStop(task)
+      ) {
+        return { error: 'task_stop_fence_operator_release_required', task };
+      }
 
       let allowedKeywords = [];
       if (task.parent_task_id) {
@@ -16397,6 +16560,10 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
       task_not_remotely_resumable: ['task_not_remotely_resumable', '该任务还不支持远程继续'],
       agent_unavailable: ['agent_unavailable', '原执行节点授权已失效、已停用或不存在'],
       agent_platform_mismatch: ['agent_platform_mismatch', '原执行节点未配置负责该任务平台'],
+      task_stop_fence_operator_release_required: [
+        'task_stop_fence_operator_release_required',
+        '该任务的旧采集页面未确认停止，节点本机无法继续；请到该电脑检查后，在「执行节点」点「确认旧页面已停止」，未完成关键词会交回批次',
+      ],
     };
     if (result.error) {
       const [error, message] = messages[result.error];

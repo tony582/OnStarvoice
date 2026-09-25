@@ -12,6 +12,8 @@ import {
   stopFencePendingTabKey,
   stopFencePlatformLabel,
   stopFenceReasonLabel,
+  stopFenceReleaseDispositionShort,
+  stopFenceReleaseDispositionText,
   stopFenceTaskStatusLabel,
 } from './stop-fence-presentation.mjs'
 
@@ -100,7 +102,7 @@ export function StopFencePanel({
   const mobileAgent = isMobileAgent(agent)
   const actionBusy = busy || rechecking || confirming
   const totalTaskCount = Number(agent.stop_fence?.task_count || 0)
-  const listedTaskCount = notice.supersededTasks.length + notice.actionTasks.length
+  const listedTaskCount = notice.supersededTasks.length + notice.releasableTasks.length + notice.actionTasks.length
   const tone = notice.urgent
     ? 'border-status-red/30 bg-status-red/[0.05] text-status-red'
     : 'border-status-orange/30 bg-status-orange/[0.06] text-amber-700 dark:text-amber-300'
@@ -153,7 +155,7 @@ export function StopFencePanel({
       )}
 
       <ul className="mt-2 space-y-1.5">
-        {[...notice.supersededTasks, ...notice.actionTasks].map(task => {
+        {[...notice.supersededTasks, ...notice.releasableTasks, ...notice.actionTasks].map(task => {
           const lastResult = task.check?.last_result || null
           const failureCount = Number(task.check?.failure_count || 0)
           const resultLabel = lastResult
@@ -170,7 +172,9 @@ export function StopFencePanel({
                 {stopFencePlatformLabel(task.platform)}{fencedAt ? ` · 自 ${fencedAt}` : ''}
                 {task.status === 'superseded' && task.auto_checkable === false ? ' · 无法定位节点本机记录，需人工确认' : ''}
               </p>
-              {task.status !== 'superseded' ? (
+              {task.status !== 'superseded' && task.operator_confirmable === true ? (
+                <p className="mt-0.5 text-status-red">节点本机无法继续该任务；检查后点「确认旧页面已停止」，确认后{stopFenceReleaseDispositionText(task.release_disposition)}。节点侧栏的「停止」「结束并保留」会放弃这些关键词。</p>
+              ) : task.status !== 'superseded' ? (
                 <p className="mt-0.5 text-status-red">该任务仍待处理，请在任务或批次里点「继续」或「停止」（停止即放弃该任务）；停止或接力后本节点即可继续接单或进入自动核对。</p>
               ) : resultLabel ? (
                 <p className="mt-0.5">节点核对：{resultLabel}{failureCount > 0 && lastResult?.accepted !== true ? `（已 ${failureCount} 次未通过）` : ''}</p>
@@ -275,17 +279,27 @@ export function ReleaseStopFenceDialog({
           <div className="mt-4 rounded-xl border border-border/70 bg-muted/30 px-3.5 py-3">
             <p className="truncate text-sm font-semibold text-foreground">{agent?.display_name || '未命名节点'}</p>
             {evidence.detail && <p className="mt-1 text-[11px] leading-5 text-muted-foreground">节点最新状态：{evidence.detail}</p>}
-            <p className="mt-2 text-[11px] font-semibold text-foreground">待确认任务（{notice.supersededCount}）</p>
+            <p className="mt-2 text-[11px] font-semibold text-foreground">待确认任务（{notice.supersededCount + notice.releasableCount}）</p>
             <ul className="mt-1 space-y-0.5 text-[11px] leading-5 text-muted-foreground">
               {notice.supersededTasks.map(task => (
                 <li key={task.id} className="truncate">
                   · {task.title || '采集任务'} · {stopFencePlatformLabel(task.platform)}{task.fenced_at ? ` · 自 ${formatStopFenceTime(task.fenced_at)}` : ''}
                 </li>
               ))}
+              {notice.releasableTasks.map(task => (
+                <li key={task.id} className="truncate">
+                  · {task.title || '采集任务'} · {stopFencePlatformLabel(task.platform)} · {stopFenceTaskStatusLabel(task.status)} · 预计：{stopFenceReleaseDispositionShort(task.release_disposition)}
+                </li>
+              ))}
             </ul>
             {notice.unlistedSupersededCount > 0 && (
               <p className="mt-0.5 text-[11px] leading-5 text-muted-foreground">
                 {notice.supersededTasks.length > 0 ? `仅列出 ${notice.supersededTasks.length} 个；` : ''}共 {notice.supersededCount} 个已转交任务，本次确认一并放行。
+              </p>
+            )}
+            {notice.unlistedReleasableCount > 0 && (
+              <p className="mt-0.5 text-[11px] leading-5 text-muted-foreground">
+                另有 {notice.unlistedReleasableCount} 个「需要处理」的批次任务未列出，本次确认一并放行。
               </p>
             )}
             {evidence.pendingTabs.length > 0 && (
@@ -315,6 +329,9 @@ export function ReleaseStopFenceDialog({
               <li>· 请先到这台电脑检查：没有仍在自动搜索或滚动的小红书、抖音、微博采集页（可直接关闭或刷新，最稳妥是重启 Chrome）。</li>
               <li>· 确认后系统立即恢复向该节点派发任务；如果旧页面仍在运行，同一浏览器里会有两条采集同时操作同一账号，可能触发平台风控。</li>
               <li>· 操作人和时间会记入任务事件与审计日志。</li>
+              {notice.releasableCount > 0 && (
+                <li>· 「需要处理」的批次任务确认后即结束，未完成关键词按上述方式交回批次；节点侧栏里该任务仍显示「需要处理」，不必再点「继续」。</li>
+              )}
             </ul>
           </div>
 

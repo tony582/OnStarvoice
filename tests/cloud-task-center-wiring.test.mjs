@@ -724,6 +724,13 @@ test("admin explains stop-fenced agents and releases them only through a guarded
   assert.equal((detail.match(/!stopFencedAgentIds\.has\(agent\.id\)/gu) || []).length, 2);
   assert.match(detail, /findExecutionStopFence\(executionTaskId\(execution\), availableAgents\)/u);
   assert.match(detail, /请在「执行节点」中处理/u);
+  // A needs_action batch child is released from the node panel, not from the batch.
+  assert.match(
+    detail,
+    /stopFence\.task\.operator_confirmable === true\s+\? '请在「执行节点」中点「确认旧页面已停止」'\s+: '请在「执行节点」中处理'/u,
+  );
+  assert.match(panel, /task\.operator_confirmable === true \?/u);
+  assert.match(panel, /\.\.\.notice\.releasableTasks/u);
 
   for (const ui of [overview, mobile]) {
     assert.match(ui, /stopFenceBlockedAgentCount/u);

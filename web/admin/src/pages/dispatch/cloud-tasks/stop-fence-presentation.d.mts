@@ -37,6 +37,8 @@ export type StopFenceCheck = {
   last_result?: StopFenceCheckResult | null
 }
 
+export type StopFenceReleaseDisposition = 'return_to_pool' | 'batch_retry' | 'parent_stopped' | 'unknown'
+
 export type AgentStopFenceTask = {
   id: string
   kind?: 'fence' | 'local_release' | string
@@ -49,6 +51,10 @@ export type AgentStopFenceTask = {
   handoff_successor_task_id?: string | null
   auto_checkable?: boolean
   check?: StopFenceCheck | null
+  /** 「需要处理」的批次任务，可由运营人工确认放行（服务端 stopFenceOperatorReleasable）。 */
+  operator_confirmable?: boolean
+  /** 放行前的预计去向（依据父批次）；实际结果以确认回执为准。 */
+  release_disposition?: StopFenceReleaseDisposition | string | null
 }
 
 export type AgentStopFence = {
@@ -69,6 +75,9 @@ export type AgentStopFence = {
   tasks?: AgentStopFenceTask[]
   /** 该节点当前全部已转交围栏的 id（不受 20 条限制）；人工确认必须全部带上。 */
   superseded_task_ids?: string[]
+  /** 该节点全部可人工放行的「需要处理」批次任务 id（不受 20 条限制）；phase 仍为 task_action_required。 */
+  operator_confirmable_task_ids?: string[]
+  operator_confirmable_count?: number
 }
 
 export type StopFenceAgentLike = {
@@ -95,17 +104,24 @@ export type StopFenceNotice = {
   canRecheck: boolean
   recheckHint: string
   recheckLabel: string
-  /** 有已转交围栏，且拿全了它们的 id（confirmTaskIds 不少于 supersededCount）。 */
+  /** 有已转交围栏或可放行任务，且拿全了已转交围栏的 id。 */
   canConfirm: boolean
   /** 有已转交围栏但 id 拿不全、不能确认时的说明；其余情况为空。 */
   confirmHint: string
-  /** 人工确认时发送的 expectedTaskIds：已列出的已转交任务并上服务端给的完整 superseded_task_ids。 */
+  /** 人工确认时发送的 expectedTaskIds：已转交任务（列出的并上 superseded_task_ids）并上可放行任务（列出的并上 operator_confirmable_task_ids）。 */
   confirmTaskIds: string[]
   /** 已转交围栏总数，以服务端 superseded_count 为准。 */
   supersededCount: number
   /** 已转交但没在 tasks 里列出的数量。 */
   unlistedSupersededCount: number
   supersededTasks: AgentStopFenceTask[]
+  /** 列出的可人工放行的「需要处理」批次任务。 */
+  releasableTasks: AgentStopFenceTask[]
+  /** 可人工放行的任务总数，以服务端 operator_confirmable_count 为准。 */
+  releasableCount: number
+  /** 可放行但没在 tasks 里列出的数量。 */
+  unlistedReleasableCount: number
+  /** 既不是已转交、也不可人工放行的任务：要在任务上继续或停止。 */
   actionTasks: AgentStopFenceTask[]
   manualOnlyTasks: AgentStopFenceTask[]
   /** 围栏还在挡新任务（local_release_pending 已放行，不算）。 */
@@ -126,6 +142,9 @@ export function stopFenceReasonLabel(reason: string | null | undefined): string
 export function stopFenceEvidenceLabel(evidence: string | null | undefined): string
 export function stopFencePlatformLabel(platform: string | null | undefined): string
 export function stopFenceTaskStatusLabel(status: string | null | undefined): string
+/** 预计去向的完整说明与简短标签；未知取值按 unknown。 */
+export function stopFenceReleaseDispositionText(disposition: string | null | undefined): string
+export function stopFenceReleaseDispositionShort(disposition: string | null | undefined): string
 export function isAgentStopFenced(agent: StopFenceAgentLike | null | undefined): boolean
 export function countStopFencedAgents(agents: StopFenceAgentLike[] | null | undefined): number
 export function findExecutionStopFence<T extends StopFenceAgentLike>(executionId: string | null | undefined, agents: T[] | null | undefined): {agent: T; task: AgentStopFenceTask} | null

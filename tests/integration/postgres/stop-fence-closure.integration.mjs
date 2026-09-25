@@ -40,6 +40,7 @@ test('stop-fence closure asks the source node, releases only on proof or operato
   const {
     clearCaptureOverviewProjectionCache, dispatchNextElasticWorkItem,
   } = await import('../../../server/routes/capture-cloud.js');
+  const {reconcilePendingOrchestrationRetries} = await import('../../../server/routes/capture-orchestrations.js');
   const {
     assessOpsControlSnapshots, buildOpsControlWindow, collectOpsControlEvidence,
     normalizeOpsControlEvidence, normalizeOpsControlSettings,
@@ -1155,5 +1156,475 @@ test('stop-fence closure asks the source node, releases only on proof or operato
       evidence: 'navigated_off_platform', platform: 'xiaohongshu', documentState: 'unknown'}], sweptTabCount: 1}));
     assert.equal(proved.body.released, true, JSON.stringify(proved.body));
     assert.equal(await f.blocker(), null);
+  });
+  // docs/hotfix/20260925-needs-action-fence.md: a batch child that the node
+  // left in needs_action with the fence code can never be resumed there. The
+  // operator releases it with the same confirmation, and its keywords go back
+  // to the batch exactly like a technical failure.
+  const RELEASED_ITEM_CODE = 'PREVIOUS_CAPTURE_STOP_OPERATOR_RELEASED';
+  const batchPlan = {enabled: true, platform: 'xiaohongshu', keywordMaxDetectedItems: 5,
+    searchPasses: ['all'], searchFilters: {publishTime: 'day'},
+    recoveryPolicy: {singleRelayV1: true, disableAutomaticSearchRetry: true, requireVerifiedFilters: true}};
+  const confirmation = '确认旧页面已停止';
+  async function needsActionBatch(f, {
+    index = 0, elastic = true, parentStatus = 'running', parentMetadata = {}, childMetadata = {},
+    childStatus = 'needs_action', attemptCount = 1,
+    items = [{keyword: '檐下秋意', status: 'needs_action', error: STOP_ERROR, started: true}],
+  } = {}) {
+    const agent = f.agents[index];
+    const [parent] = await query(`INSERT INTO capture_tasks(tenant_id,client_task_id,task_type,
+      feature_key,platform,status,title,metadata,counts,orchestration_revision) VALUES($1,$2,'capture_orchestration',
+      'keyword_orchestration','xiaohongshu',$3,'小红书~日常巡检',$4,$5,1) RETURNING *`,
+    [f.tenant.id, randomUUID(), parentStatus, {
+      distributionMode: elastic ? 'elastic_pool' : 'fixed_batch',
+      eligibleAgentIds: f.agents.map(row => row.id),
+      planSnapshot: {...batchPlan, keywords: items.map(item => item.keyword)},
+      ...parentMetadata,
+    }, {total: items.length}]);
+    const child = await f.task(agent, {parent_task_id: parent.id, status: childStatus, error: STOP_ERROR,
+      title: `小红书~日常巡检 · ${items[0].keyword}`, control_task_id: randomUUID(), metadata: childMetadata});
+    const itemRows = [];
+    for (const [ordinal, spec] of items.entries()) {
+      const count = spec.attemptCount ?? attemptCount;
+      const [item] = await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,item_type,keyword,
+        platform,status,ordinal,metadata,assigned_agent_id,execution_task_id,attempt_count,assignment_revision,
+        error,started_at) VALUES($1,$2,$3,'keyword',$4,'xiaohongshu',$5,$6,$7,$8,$9,$10,1,$11,$12) RETURNING *`,
+      [f.tenant.id, parent.id, `keyword:${ordinal}:${spec.keyword}`, spec.keyword, spec.status, ordinal,
+        {singleRelayV1: true, searchPasses: ['all'], requireVerifiedFilters: true},
+        agent.id, child.id, count, spec.error || {}, spec.started ? new Date() : null]);
+      await query(`INSERT INTO capture_task_item_attempts(tenant_id,item_id,parent_task_id,execution_task_id,
+        agent_id,attempt_number,assignment_revision,status,error) VALUES($1,$2,$3,$4,$5,$6,1,$7,$8)`,
+      [f.tenant.id, item.id, parent.id, child.id, agent.id, count,
+        spec.status === 'running' ? 'running' : 'needs_action', spec.error || {}]);
+      itemRows.push(item);
+    }
+    return {parent, child, items: itemRows};
+  }
+  const itemRow = async id => (await query('SELECT * FROM capture_task_items WHERE id=$1', [id]))[0];
+  const confirmAudits = f => query(`SELECT * FROM audit_logs WHERE tenant_id=$1
+    AND action='capture_agent.stop_fence_confirmed' ORDER BY created_at, id`, [f.tenant.id]);
+  const adminHttp = (f, path, body = {}) => http(path,
+    {token: f.sessions.tenant_admin.token, tenantId: f.tenant.id, body});
+  const addUsage = (f, index) => query(`INSERT INTO social_agent_daily_usage(tenant_id,agent_id,platform,
+    usage_date,searches,last_event_at) VALUES($1,$2,'xiaohongshu',(now() AT TIME ZONE 'Asia/Shanghai')::date,1,now())`,
+  [f.tenant.id, f.agents[index].id]);
+  const staleSnapshot = child => ({id: child.client_task_id, controlTaskId: child.id, status: 'needs_action',
+    taskType: 'unattended_keyword_capture', platform: 'xiaohongshu', title: child.title, error: STOP_ERROR,
+    updatedAt: new Date().toISOString(), attemptNumber: 1});
+  // Another keyword of the same batch still running on node 1, which can be
+  // stopped remotely.
+  const remoteStopNodes = [legacyCapabilities, {...legacyCapabilities, remoteStop: true}];
+  async function runningExecution(f, parent) {
+    const running = await f.task(f.agents[1], {parent_task_id: parent.id, status: 'running', error: {},
+      control_task_id: randomUUID(), finished_at: null});
+    await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,item_type,keyword,platform,status,
+      ordinal,metadata,assigned_agent_id,execution_task_id,attempt_count,assignment_revision,started_at)
+      VALUES($1,$2,'keyword:5:另一个','keyword','另一个','xiaohongshu','running',5,'{}'::jsonb,$3,$4,1,1,now())`,
+    [f.tenant.id, parent.id, f.agents[1].id, running.id]);
+    return running;
+  }
+  async function completeStop(f, index, taskId) {
+    const [command] = await query(`SELECT * FROM capture_agent_commands WHERE task_id=$1
+      AND command_type='stop' ORDER BY created_at DESC LIMIT 1`, [taskId]);
+    assert.ok(command, 'a stop command exists for the running execution');
+    const done = await http(`/agent/commands/${command.id}/complete`, {token: f.agents[index].token,
+      body: {success: true, result: {accepted: true, requestId: command.payload.controlTaskId,
+        attemptId: command.payload.attemptId || undefined, reason: 'stopped'}}});
+    assert.equal(done.status, 200, JSON.stringify(done.body));
+  }
+
+  await t.test('an old node releases a needs_action batch child and its keyword returns to the pool', async st => {
+    const f = await fixture(st, {nodes: 2, capabilities: legacyCapabilities});
+    const {parent, child, items: [item]} = await needsActionBatch(f);
+    assert.equal((await f.blocker(0))?.id, child.id, 'the needs_action child holds the node');
+    assert.deepEqual((await f.heartbeat(0)).commands, []);
+    let fence = (await f.overview()).get(f.agents[0].id).stop_fence;
+    assert.equal(fence.phase, 'task_action_required', 'it still needs a person');
+    assert.deepEqual(fence.operator_confirmable_task_ids, [child.id]);
+    assert.equal(fence.operator_confirmable_count, 1);
+    assert.equal(fence.tasks[0].operator_confirmable, true);
+    assert.equal(fence.tasks[0].release_disposition, 'return_to_pool');
+    const notice = agentStopFenceNotice({...f.agents[0], stop_fence: fence});
+    assert.equal(notice.canConfirm, true);
+    assert.deepEqual(notice.confirmTaskIds, [child.id]);
+
+    // An older Admin never sends the id: exactly the previous behaviour.
+    const unselected = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: []});
+    assert.equal(unselected.status, 409);
+    assert.equal(unselected.body.error, 'agent_stop_fence_task_action_required');
+    assert.match(unselected.body.message, /确认旧页面已停止/u);
+    assert.equal(unselected.body.requiresTaskAction[0].operatorConfirmable, true);
+    assert.equal(unselected.body.requiresTaskAction[0].skipReason, 'not_selected');
+    assert.equal((await f.row(child.id)).status, 'needs_action');
+    assert.equal((await itemRow(item.id)).status, 'needs_action');
+
+    const confirmed = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: notice.confirmTaskIds,
+      note: '已重启 Chrome'});
+    assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+    assert.deepEqual(confirmed.body.taskIds, [child.id]);
+    assert.deepEqual(confirmed.body.needsActionTaskIds, [child.id]);
+    assert.equal(confirmed.body.localReleaseRequested, false);
+    assert.deepEqual(confirmed.body.requiresTaskAction, []);
+    assert.match(confirmed.body.message, /已确认旧采集页面已停止，节点恢复接单（1 个任务已记录人工确认）/u);
+    assert.match(confirmed.body.message, /1 个未完成关键词已退回任务池，由其它节点接力/u);
+    assert.match(confirmed.body.message, /重启 Chrome/u);
+    const [outcome] = confirmed.body.itemOutcomes;
+    assert.equal(outcome.taskId, child.id);
+    assert.equal(outcome.kind, 'returned_to_pool');
+    assert.equal(outcome.retryable, 1);
+    assert.equal(outcome.distributionMode, 'elastic_pool');
+
+    const after = await f.row(child.id);
+    assert.equal(after.status, 'superseded');
+    assert.equal(after.error.code, 'HISTORICAL_STOP_FENCE_RECONCILED');
+    assert.equal(after.error.originalCode, 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED');
+    assert.equal(after.error.message, STOP_ERROR.message, 'original message kept');
+    assert.ok(after.updated_at > child.updated_at, 'a real status transition');
+    assert.equal(after.metadata.terminalReason, 'stop_fence_operator_released');
+    assert.equal(after.metadata.terminalDisposition, undefined,
+      'no terminal notice for a stopped batch to wait on');
+    assert.equal(after.metadata.handoffSuccessorTaskId, undefined);
+    const reconciliation = after.metadata.historicalStopFenceReconciliation;
+    assert.equal(reconciliation.proofStatus, 'operator_confirmed');
+    assert.equal(reconciliation.reason, 'operator_confirmed_needs_action_released');
+    assert.equal(reconciliation.releasedFromStatus, 'needs_action');
+    assert.deepEqual(reconciliation.originalError, STOP_ERROR);
+    assert.equal(reconciliation.note, '已重启 Chrome');
+    assert.equal(reconciliation.requestId, child.control_task_id);
+    assert.equal(reconciliation.itemOutcome.kind, 'returned_to_pool');
+    assert.equal(after.metadata.stopFenceCheck.resolution, 'operator_confirmed');
+    assert.equal(after.metadata.stopFenceCheck.localRelease, undefined, 'old versions never get a local release');
+    assert.match(after.message, /本执行结束；未完成关键词已退回任务池/u);
+    const [event] = await f.events(child.id, 'historical_stop_fence_reconciled');
+    assert.equal(event.actor_type, 'user');
+    assert.equal(event.status, 'superseded');
+    assert.equal(event.payload.releasedFromStatus, 'needs_action');
+    assert.equal(event.payload.itemOutcome.kind, 'returned_to_pool');
+    assert.match(event.message, /人工确认旧采集页面已停止，解除停止保护；该执行结束，未完成关键词已退回任务池/u);
+    const [audit] = await confirmAudits(f);
+    assert.deepEqual(audit.metadata.taskIds, [child.id]);
+    assert.deepEqual(audit.metadata.needsActionTaskIds, [child.id]);
+    assert.equal(audit.metadata.itemOutcomes[0].kind, 'returned_to_pool');
+    assert.deepEqual(audit.metadata.skipped, []);
+
+    const released = await itemRow(item.id);
+    assert.equal(released.status, 'retryable');
+    assert.equal(released.error.code, RELEASED_ITEM_CODE);
+    assert.equal(released.execution_task_id, child.id);
+    const attempts = await query('SELECT * FROM capture_task_item_attempts WHERE item_id=$1', [item.id]);
+    assert.deepEqual(attempts.map(row => row.status), ['retryable']);
+    assert.notEqual((await f.row(parent.id)).updated_at.toISOString(), parent.updated_at.toISOString(),
+      'the parent was refreshed');
+    assert.equal(await f.blocker(0), null, 'the node takes work again');
+    assert.equal((await f.overview()).get(f.agents[0].id).stop_fence, null);
+
+    // A late snapshot of the same run cannot bring the fence back.
+    await f.heartbeat(0, {tasks: [staleSnapshot(child)]});
+    const replayed = await f.row(child.id);
+    assert.equal(replayed.status, 'superseded');
+    assert.equal(replayed.error.code, 'HISTORICAL_STOP_FENCE_RECONCILED');
+    assert.deepEqual(replayed.metadata.historicalStopFenceReconciliation, after.metadata.historicalStopFenceReconciliation);
+    const replayedItem = await itemRow(item.id);
+    assert.equal(replayedItem.status, 'retryable');
+    assert.equal(replayedItem.error.code, RELEASED_ITEM_CODE);
+    assert.equal(await f.blocker(0), null);
+
+    // The source node never gets the same keyword back in this round; any
+    // other node picks it up, and nothing records a handoff trace.
+    assert.equal(await withTransaction(tx => dispatchNextElasticWorkItem(tx,
+      {agent: f.agents[0], capabilities: legacyCapabilities})), null);
+    const claim = await withTransaction(tx => dispatchNextElasticWorkItem(tx,
+      {agent: f.agents[1], capabilities: legacyCapabilities}));
+    assert.ok(claim?.childTaskId, JSON.stringify(claim));
+    const claimed = await itemRow(item.id);
+    assert.equal(claimed.assigned_agent_id, f.agents[1].id);
+    assert.equal(claimed.execution_task_id, claim.childTaskId);
+    const source = await f.row(child.id);
+    assert.equal(source.status, 'superseded');
+    assert.equal(source.metadata.handoffSuccessorTaskId, undefined);
+    assert.equal((await f.events(child.id, 'stop_fence_handoff')).length, 0);
+
+    // New keywords go to the released node on its next heartbeat.
+    await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,item_type,keyword,platform,status,
+      ordinal,metadata) VALUES($1,$2,'keyword:9:新词','keyword','新词','xiaohongshu','pending',9,$3)`,
+    [f.tenant.id, parent.id, {singleRelayV1: true, searchPasses: ['all'], requireVerifiedFilters: true}]);
+    const next = await f.heartbeat(0);
+    assert.deepEqual(next.commands.map(command => command.command_type), ['create'], JSON.stringify(next));
+  });
+
+  await t.test('a 0.4.16 node drops its lock before new work after a needs_action release', async st => {
+    const f = await fixture(st, {nodes: 2});
+    const {parent, child} = await needsActionBatch(f);
+    await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,item_type,keyword,platform,status,
+      ordinal,metadata) VALUES($1,$2,'keyword:9:新词','keyword','新词','xiaohongshu','pending',9,$3)`,
+    [f.tenant.id, parent.id, {singleRelayV1: true, searchPasses: ['all'], requireVerifiedFilters: true}]);
+    const confirmed = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: [child.id]});
+    assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+    assert.equal(confirmed.body.localReleaseRequested, true);
+    assert.match(confirmed.body.message, /退回任务池[\s\S]*下次心跳时释放本机执行锁，释放后恢复接单/u);
+    assert.doesNotMatch(confirmed.body.message, /重启 Chrome/u);
+    const localRelease = (await f.check(child.id)).localRelease;
+    assert.equal(localRelease.state, 'pending');
+    assert.equal((await f.overview()).get(f.agents[0].id).stop_fence.phase, 'local_release_pending');
+
+    const beat = await f.heartbeat(0);
+    assert.deepEqual(beat.commands, [], 'no capture work beside the release');
+    assert.deepEqual(beat.stopFenceChecks.map(offer => [offer.mode, offer.taskId, offer.requestId]),
+      [['release_only', child.id, child.control_task_id]]);
+    const done = await f.receipt(0, beat.stopFenceChecks[0].checkId, {taskId: child.id,
+      requestId: child.control_task_id, result: {version: 1, mode: 'release_only',
+        checkId: beat.stopFenceChecks[0].checkId, taskId: child.id, requestId: child.control_task_id,
+        accepted: true, reason: 'local_release_done', retryable: false, lockReleased: true,
+        localLockBoundToRequest: true, residueReleased: true, message: '已释放本机执行锁'}});
+    assert.equal(done.status, 200, JSON.stringify(done.body));
+    assert.equal((await f.check(child.id)).localRelease.state, 'done');
+    const next = await f.heartbeat(0);
+    assert.deepEqual(next.commands.map(command => command.command_type), ['create'], 'work resumes');
+    assert.deepEqual(next.stopFenceChecks, []);
+  });
+
+  await t.test('a fixed-allocation child ends with its keywords ready for 重试失败关键词', async st => {
+    const f = await fixture(st, {nodes: 3, capabilities: legacyCapabilities});
+    const blocked = {code: 'blocked_by_prior_item', message: '前一个关键词需要处理'};
+    const {parent, child, items} = await needsActionBatch(f, {elastic: false, items: [
+      {keyword: '檐下秋意', status: 'running', error: {}, started: true},
+      {keyword: '秋日车机', status: 'needs_action', error: blocked},
+      {keyword: '安吉星', status: 'needs_action', error: blocked},
+    ]});
+    assert.equal((await f.overview()).get(f.agents[0].id).stop_fence.tasks[0].release_disposition, 'batch_retry');
+    const confirmed = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: [child.id]});
+    assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+    assert.match(confirmed.body.message, /3 个未完成关键词已标为需处理，可在批次里点「重试失败关键词」/u);
+    assert.doesNotMatch(confirmed.body.message, /退回任务池/u);
+    const [outcome] = confirmed.body.itemOutcomes;
+    assert.equal(outcome.kind, 'batch_retry');
+    assert.equal(outcome.needsAction, 3);
+    for (const item of items) {
+      const row = await itemRow(item.id);
+      assert.equal(row.status, 'needs_action', item.keyword);
+      assert.equal(row.error.code, RELEASED_ITEM_CODE);
+    }
+    assert.equal((await f.row(parent.id)).status, 'needs_action');
+    assert.match((await f.row(child.id)).message, /可在批次里点「重试失败关键词」/u);
+    assert.match((await f.events(child.id, 'historical_stop_fence_reconciled'))[0].message, /重试失败关键词/u);
+    assert.equal((await confirmAudits(f))[0].metadata.itemOutcomes[0].kind, 'batch_retry');
+
+    // Control: a source superseded by an ordinary handoff is still not settled.
+    const other = await needsActionBatch(f, {index: 1, elastic: false, childStatus: 'superseded',
+      childMetadata: {terminalReason: 'elastic_retry_claimed', handoffSuccessorTaskId: randomUUID()},
+      items: [{keyword: '对照', status: 'needs_action', error: {code: 'SEARCH_FILTER_APPLICATION_FAILED'}}]});
+    await query(`UPDATE capture_tasks SET error='{}'::jsonb WHERE id=$1`, [other.child.id]);
+    const refused = await adminHttp(f, `/orchestrations/${other.parent.id}/retry-items`, {
+      requestKey: randomUUID(), expectedRevision: 1, itemIds: [other.items[0].id]});
+    assert.equal(refused.status, 409, JSON.stringify(refused.body));
+    assert.equal(refused.body.error, 'retry_source_not_settled');
+
+    // Only node 1 has usage today: one keyword is dispatched, two wait.
+    await addUsage(f, 1);
+    const retried = await adminHttp(f, `/orchestrations/${parent.id}/retry-items`, {
+      requestKey: randomUUID(), expectedRevision: Number((await f.row(parent.id)).orchestration_revision),
+      itemIds: items.map(item => item.id)});
+    assert.equal(retried.status, 201, JSON.stringify(retried.body));
+    const retryChildren = await query(`SELECT * FROM capture_tasks WHERE parent_task_id=$1
+      AND metadata->>'retryRequestKey' IS NOT NULL`, [parent.id]);
+    assert.equal(retryChildren.length, 1, JSON.stringify(retried.body));
+    assert.equal(retryChildren[0].assigned_agent_id, f.agents[1].id);
+    const waiting = await query(`SELECT * FROM capture_task_items WHERE task_id=$1
+      AND metadata->>'retryPending'='true'`, [parent.id]);
+    assert.equal(waiting.length, 2);
+    assert.ok(waiting.every(row => row.execution_task_id === child.id));
+
+    // The waiting-retry sweep and its locked recheck accept the released source.
+    await addUsage(f, 2);
+    const swept = await reconcilePendingOrchestrationRetries(1);
+    assert.equal(swept.dispatched, 1, JSON.stringify(swept));
+    assert.equal((await query(`SELECT * FROM capture_tasks WHERE parent_task_id=$1
+      AND metadata->>'retryRequestKey' IS NOT NULL`, [parent.id])).length, 2);
+  });
+
+  await t.test('an elastic keyword at its relay budget fails like a technical failure and can be retried', async st => {
+    const f = await fixture(st, {nodes: 2, capabilities: legacyCapabilities});
+    const {parent, child, items: [item]} = await needsActionBatch(f, {attemptCount: 4});
+    const confirmed = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: [child.id]});
+    assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+    assert.match(confirmed.body.message, /1 个关键词已达自动接力上限，可在批次里点「重试失败关键词」/u);
+    assert.doesNotMatch(confirmed.body.message, /退回任务池/u);
+    assert.equal(confirmed.body.itemOutcomes[0].kind, 'retry_exhausted');
+    assert.equal(confirmed.body.itemOutcomes[0].failed, 1);
+    assert.equal((await itemRow(item.id)).status, 'failed');
+    const after = await f.row(child.id);
+    assert.match(after.message, /已达自动接力上限/u);
+    assert.doesNotMatch(after.message, /退回任务池/u);
+    const [event] = await f.events(child.id, 'historical_stop_fence_reconciled');
+    assert.match(event.message, /已达自动接力上限/u);
+    assert.doesNotMatch(event.message, /退回任务池/u);
+    assert.equal((await confirmAudits(f))[0].metadata.itemOutcomes[0].kind, 'retry_exhausted');
+    assert.equal(await withTransaction(tx => dispatchNextElasticWorkItem(tx,
+      {agent: f.agents[1], capabilities: legacyCapabilities})), null, 'no automatic relay past the budget');
+    await addUsage(f, 1);
+    const retried = await adminHttp(f, `/orchestrations/${parent.id}/retry-items`, {
+      requestKey: randomUUID(), expectedRevision: Number((await f.row(parent.id)).orchestration_revision),
+      itemIds: [item.id]});
+    assert.equal(retried.status, 201, JSON.stringify(retried.body));
+    assert.equal((await itemRow(item.id)).status, 'dispatched');
+  });
+
+  await t.test('only explicitly selected, command-free batch children are released', async st => {
+    const f = await fixture(st, {nodes: 2, capabilities: legacyCapabilities});
+    // A stop the operator just requested: let it finish first.
+    const stopping = await needsActionBatch(f);
+    await query(`INSERT INTO capture_agent_commands(tenant_id,agent_id,task_id,command_type,payload)
+      VALUES($1,$2,$3,'stop','{}'::jsonb)`, [f.tenant.id, f.agents[0].id, stopping.child.id]);
+    const busy = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: [stopping.child.id]});
+    assert.equal(busy.status, 409, JSON.stringify(busy.body));
+    assert.equal(busy.body.error, 'agent_stop_fence_command_in_flight');
+    assert.equal(busy.body.requiresTaskAction[0].skipReason, 'command_in_flight');
+    assert.equal((await f.row(stopping.child.id)).status, 'needs_action');
+    assert.equal((await itemRow(stopping.items[0].id)).status, 'needs_action');
+    assert.equal((await confirmAudits(f)).length, 0, 'nothing confirmed, nothing audited');
+    await query(`UPDATE capture_agent_commands SET status='completed' WHERE task_id=$1`, [stopping.child.id]);
+
+    // resume_requested is not releasable; a root needs_action task neither.
+    const g = await fixture(st, {nodes: 2, capabilities: legacyCapabilities});
+    const resuming = await needsActionBatch(g, {childStatus: 'resume_requested'});
+    const root = await g.task(g.agents[0], {status: 'needs_action', error: STOP_ERROR});
+    const view = (await g.overview()).get(g.agents[0].id).stop_fence;
+    assert.deepEqual(view.operator_confirmable_task_ids, []);
+    assert.ok(view.tasks.every(task => task.operator_confirmable === false && task.release_disposition === null));
+    const refused = await g.admin(0, 'confirm', {confirmation, expectedTaskIds: [resuming.child.id, root.id]});
+    assert.equal(refused.status, 409);
+    assert.equal(refused.body.error, 'agent_stop_fence_task_action_required');
+    assert.deepEqual(refused.body.requiresTaskAction.map(task => task.skipReason),
+      ['not_orchestration_child', 'not_orchestration_child']);
+    assert.equal((await g.row(resuming.child.id)).status, 'resume_requested');
+    assert.equal((await g.row(root.id)).status, 'needs_action');
+
+    // Mixed with a superseded fence: every superseded id is still required.
+    const h = await fixture(st, {nodes: 2, capabilities: legacyCapabilities});
+    const handedOff = await h.fenced(h.agents[0]);
+    const mixed = await needsActionBatch(h);
+    const foreign = await needsActionBatch(h, {index: 1});
+    const other = await fixture(st, {capabilities: legacyCapabilities});
+    const otherTenant = await needsActionBatch(other);
+    const missing = await h.admin(0, 'confirm', {confirmation, expectedTaskIds: [mixed.child.id]});
+    assert.equal(missing.status, 409);
+    assert.equal(missing.body.error, 'agent_stop_fence_changed');
+    assert.equal((await h.row(mixed.child.id)).status, 'needs_action');
+    const both = await h.admin(0, 'confirm', {confirmation,
+      expectedTaskIds: [handedOff.id, mixed.child.id, foreign.child.id, otherTenant.child.id]});
+    assert.equal(both.status, 200, JSON.stringify(both.body));
+    assert.deepEqual([...both.body.taskIds].sort(), [handedOff.id, mixed.child.id].sort());
+    assert.deepEqual(both.body.needsActionTaskIds, [mixed.child.id]);
+    assert.equal((await h.row(handedOff.id)).error.code, 'HISTORICAL_STOP_FENCE_RECONCILED');
+    assert.equal((await h.row(handedOff.id)).status, 'superseded');
+    assert.equal((await h.row(mixed.child.id)).status, 'superseded');
+    assert.equal((await h.row(foreign.child.id)).status, 'needs_action', 'another node is untouched');
+    assert.equal((await other.row(otherTenant.child.id)).status, 'needs_action', 'another tenant is untouched');
+    assert.equal(await h.blocker(0), null);
+    assert.equal((await h.blocker(1))?.id, foreign.child.id);
+  });
+
+  await t.test('a local continuation never takes back keywords an operator returned to the batch', async st => {
+    const f = await fixture(st, {nodes: 2, capabilities: legacyCapabilities});
+    const {child, items: [item]} = await needsActionBatch(f);
+    assert.equal((await f.admin(0, 'confirm', {confirmation, expectedTaskIds: [child.id]})).status, 200);
+    const localId = `local-recovery-${randomUUID()}`;
+    await f.heartbeat(0, {tasks: [{id: localId, status: 'running', taskType: 'unattended_keyword_capture',
+      platform: 'xiaohongshu', title: '檐下秋意 · 本机继续', updatedAt: new Date().toISOString(), attemptNumber: 1,
+      metadata: {parentRequestId: child.client_task_id, cloudAssigned: true, keywords: ['檐下秋意']}}]});
+    const local = (await query('SELECT * FROM capture_tasks WHERE client_task_id=$1', [localId]))[0];
+    assert.ok(local, 'the snapshot itself was accepted');
+    assert.equal(local.parent_task_id, null, 'not adopted into the batch');
+    const unchanged = await itemRow(item.id);
+    assert.equal(unchanged.status, 'retryable');
+    assert.equal(unchanged.execution_task_id, child.id);
+  });
+
+  await t.test('remote resume refuses a fenced batch child and keeps working for root tasks', async st => {
+    const f = await fixture(st, {capabilities: legacyCapabilities});
+    const {child} = await needsActionBatch(f);
+    const refused = await adminHttp(f, `/tasks/${child.id}/resume`, {mode: 'remaining'});
+    assert.equal(refused.status, 409, JSON.stringify(refused.body));
+    assert.equal(refused.body.error, 'task_stop_fence_operator_release_required');
+    assert.match(refused.body.message, /「执行节点」点「确认旧页面已停止」/u);
+    assert.equal((await query('SELECT id FROM capture_agent_commands WHERE task_id=$1', [child.id])).length, 0);
+    assert.equal((await f.row(child.id)).status, 'needs_action');
+    const root = await f.task(f.agents[0], {status: 'needs_action', error: STOP_ERROR,
+      control_task_id: randomUUID()});
+    const resumed = await adminHttp(f, `/tasks/${root.id}/resume`, {mode: 'remaining'});
+    assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
+    assert.ok(resumed.body.commandId);
+  });
+
+  await t.test('a batch already stopped keeps its canceled keywords; the confirmation only lifts the fence', async st => {
+    for (const retained of [false, true]) {
+      const f = await fixture(st, {nodes: 2, capabilities: remoteStopNodes});
+      const {parent, child, items: [item]} = await needsActionBatch(f);
+      const running = retained ? await runningExecution(f, parent) : null;
+      const stopped = await adminHttp(f, `/orchestrations/${parent.id}/stop`, {});
+      assert.equal(stopped.status, 200, JSON.stringify(stopped.body));
+      const parentAfterStop = await f.row(parent.id);
+      assert.equal(parentAfterStop.status, retained ? 'waiting_device' : 'canceled');
+      assert.equal(parentAfterStop.metadata.operatorStopped, true);
+      assert.equal((await f.row(child.id)).status, 'needs_action', 'stopping the batch does not stop the child');
+      assert.equal((await f.row(child.id)).error.code, 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED');
+      assert.equal((await query(`SELECT id FROM capture_agent_commands WHERE task_id=$1`, [child.id])).length, 0);
+      assert.equal((await itemRow(item.id)).status, 'canceled');
+      assert.equal((await f.blocker(0))?.id, child.id, 'the node is still held');
+      assert.equal((await f.overview()).get(f.agents[0].id).stop_fence.tasks[0].release_disposition, 'parent_stopped');
+
+      const confirmed = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: [child.id]});
+      assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+      assert.match(confirmed.body.message, /1 个任务所在批次已停止，未完成关键词已随批次取消，本次只解除停止保护/u);
+      assert.doesNotMatch(confirmed.body.message, /退回任务池/u);
+      const [outcome] = confirmed.body.itemOutcomes;
+      assert.equal(outcome.kind, 'none');
+      assert.equal(outcome.parentStatus, retained ? 'waiting_device' : 'canceled');
+      assert.equal(outcome.operatorStopped, true);
+      assert.equal((await f.row(child.id)).status, 'superseded');
+      assert.match((await f.row(child.id)).message, /批次已停止，未完成关键词已随批次取消/u);
+      assert.match((await f.events(child.id, 'historical_stop_fence_reconciled'))[0].message, /已随批次取消/u);
+      assert.equal((await confirmAudits(f))[0].metadata.itemOutcomes[0].kind, 'none');
+      assert.equal((await itemRow(item.id)).status, 'canceled');
+      assert.equal(await f.blocker(0), null, 'the node takes work again');
+      if (retained) {
+        // The released child is no terminal notice the stop waits on.
+        await completeStop(f, 1, running.id);
+        assert.equal((await f.row(running.id)).status, 'canceled');
+        assert.equal((await f.row(parent.id)).status, 'canceled',
+          'the stopped batch settles once the other execution stopped');
+      }
+    }
+  });
+
+  await t.test('a batch stopped after a release settles once its other execution stops', async st => {
+    const f = await fixture(st, {nodes: 2, capabilities: remoteStopNodes});
+    const {parent, child, items: [item]} = await needsActionBatch(f);
+    const running = await runningExecution(f, parent);
+    const confirmed = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: [child.id]});
+    assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+    assert.equal(confirmed.body.itemOutcomes[0].kind, 'returned_to_pool');
+    const stopped = await adminHttp(f, `/orchestrations/${parent.id}/stop`, {});
+    assert.equal(stopped.status, 200, JSON.stringify(stopped.body));
+    assert.equal((await f.row(parent.id)).status, 'waiting_device');
+    assert.equal((await f.row(child.id)).status, 'superseded');
+    assert.equal((await itemRow(item.id)).status, 'canceled', 'the returned keyword stops with the batch');
+    await completeStop(f, 1, running.id);
+    assert.equal((await f.row(parent.id)).status, 'canceled');
+  });
+
+  await t.test('a child adopted by a local recovery follows its elastic parent', async st => {
+    const f = await fixture(st, {nodes: 2, capabilities: legacyCapabilities});
+    const {parent, child, items: [item]} = await needsActionBatch(f, {childMetadata: {
+      orchestrationChild: true, localRecovery: true, itemIds: [], localRecoverySourceExecutionTaskId: randomUUID()}});
+    await query(`UPDATE capture_tasks SET metadata=metadata || jsonb_build_object('parentTaskId', $2::text,
+      'itemIds', jsonb_build_array($3::text)) WHERE id=$1`, [child.id, parent.id, item.id]);
+    const fence = (await f.overview()).get(f.agents[0].id).stop_fence;
+    assert.equal(fence.tasks[0].release_disposition, 'return_to_pool', 'from the parent, not the child');
+    const confirmed = await f.admin(0, 'confirm', {confirmation, expectedTaskIds: [child.id]});
+    assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+    assert.equal(confirmed.body.itemOutcomes[0].kind, 'returned_to_pool');
+    assert.match(confirmed.body.message, /退回任务池/u);
+    assert.equal((await itemRow(item.id)).status, 'retryable');
   });
 });

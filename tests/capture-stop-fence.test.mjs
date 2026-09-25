@@ -2,9 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {captureTaskUnconfirmedLocalStopSql} from '../server/services/capture-cloud.js';
+import {orchestrationParentAcceptsProjection} from '../server/routes/capture-cloud.js';
 import {
   STOP_FENCE_CONTENT_EVIDENCE,
+  STOP_FENCE_PARENT_TERMINAL_STATUSES,
   STOP_FENCE_PHASES,
+  STOP_FENCE_PHASE_LABELS,
   STOP_FENCE_PROOF_EVIDENCE,
   evaluateStopFenceProof,
   STOP_FENCE_LOCAL_RELEASE_HOLD_MS,
@@ -16,7 +19,11 @@ import {
   stopFenceAutoCheckEnabled,
   stopFenceCheckEscalated,
   stopFenceLocalReleaseHoldsNewWork,
+  stopFenceOperatorReleasable,
   stopFenceReasonLabel,
+  stopFenceReleaseDisposition,
+  stopFenceReleaseItemOutcome,
+  stopFenceReleaseOutcomeSentence,
   summarizeAgentStopFence,
 } from '../server/services/capture-stop-fence.js';
 
@@ -521,4 +528,123 @@ test('rounds that only observe an off-site page never escalate by failure count'
   result: observing, now: NOW + 18 * 60_000});
   assert.equal(events().filter(type => type === 'stop_fence_check_failed').length, before + 2,
     'a result from before the recheck belongs to the previous epoch');
+});
+
+// docs/hotfix/20260925-needs-action-fence.md
+const PARENT_ID = '33333333-3333-4333-8333-333333333333';
+const batchChild = (overrides = {}) => fenceRow({id: 'child', status: 'needs_action', parent_task_id: PARENT_ID,
+  task_type: 'unattended_keyword_capture', parent_state: {status: 'running', distributionMode: 'elastic_pool',
+    operatorStopped: null}, ...overrides});
+
+test('only a needs_action batch child is operator-releasable', () => {
+  assert.equal(stopFenceOperatorReleasable(batchChild()), true);
+  const cases = {
+    'root task': {parent_task_id: null},
+    'manual batch (capture)': {task_type: 'capture'},
+    resume_requested: {status: 'resume_requested'},
+    failed: {status: 'failed'},
+    interrupted: {status: 'interrupted'},
+    superseded: {status: 'superseded'},
+    'local release': {kind: 'local_release'},
+    'missing kind': {kind: undefined},
+  };
+  for (const [name, overrides] of Object.entries(cases)) {
+    assert.equal(stopFenceOperatorReleasable(batchChild(overrides)), false, name);
+  }
+  assert.equal(stopFenceOperatorReleasable(null), false);
+});
+
+test('the expected destination follows the parent, never the child metadata', () => {
+  assert.equal(stopFenceReleaseDisposition(batchChild()), 'return_to_pool');
+  assert.equal(stopFenceReleaseDisposition(batchChild({parent_state: {status: 'running',
+    distributionMode: 'fixed_batch'}})), 'batch_retry');
+  assert.equal(stopFenceReleaseDisposition(batchChild({parent_state: {status: 'running'}})), 'batch_retry');
+  assert.equal(stopFenceReleaseDisposition(batchChild({parent_state: {status: 'waiting_device',
+    distributionMode: 'elastic_pool', operatorStopped: 'true'}})), 'parent_stopped');
+  assert.equal(stopFenceReleaseDisposition(batchChild({parent_state: {status: 'canceled',
+    distributionMode: 'elastic_pool'}})), 'parent_stopped');
+  assert.equal(stopFenceReleaseDisposition(batchChild({parent_state: null})), 'unknown');
+  // A child adopted by a local recovery keeps neither key; the parent decides.
+  assert.equal(stopFenceReleaseDisposition(batchChild({metadata: {cloudWorkQueue: false,
+    distributionMode: 'fixed_batch'}})), 'return_to_pool');
+  assert.equal(stopFenceReleaseDisposition(batchChild({parent_state: {status: 'running',
+    distributionMode: 'fixed_batch'}, metadata: {cloudWorkQueue: true, distributionMode: 'elastic_pool'}})), 'batch_retry');
+  // The terminal set is exactly the one the projection refuses.
+  const statuses = ['pending', 'assigned', 'dispatched', 'waiting_device', 'running', 'recovering', 'needs_action',
+    'retryable', 'interrupted', 'resume_requested', 'completed', 'completed_with_warnings',
+    'completed_with_failures', 'failed', 'canceled', 'skipped', 'superseded'];
+  for (const status of statuses) {
+    assert.equal(STOP_FENCE_PARENT_TERMINAL_STATUSES.includes(status), !orchestrationParentAcceptsProjection(status), status);
+    assert.equal(stopFenceReleaseDisposition(batchChild({parent_state: {status, distributionMode: 'elastic_pool'}})),
+      orchestrationParentAcceptsProjection(status) ? 'return_to_pool' : 'parent_stopped', status);
+  }
+});
+
+test('the node summary names every releasable batch child without changing the phase', () => {
+  const children = Array.from({length: 22}, (_, index) => batchChild({id: `child-${index}`,
+    fenced_at: ago(100 - index)}));
+  const root = fenceRow({id: 'root', status: 'needs_action', fenced_at: ago(200)});
+  const summary = summarizeAgentStopFence(onlineAgent, [root, ...children], {now: NOW, autoCheckEnabled: true});
+  assert.equal(summary.phase, 'task_action_required', 'these still need a person');
+  assert.equal(summary.operator_confirmable_count, 22);
+  assert.deepEqual(summary.operator_confirmable_task_ids, children.map(row => row.id),
+    'not cut by the 20-row task list');
+  assert.equal(summary.tasks.length, 20);
+  assert.equal(summary.tasks[0].id, 'root');
+  assert.equal(summary.tasks[0].operator_confirmable, false);
+  assert.equal(summary.tasks[0].release_disposition, null);
+  assert.equal(summary.tasks[1].operator_confirmable, true);
+  assert.equal(summary.tasks[1].release_disposition, 'return_to_pool');
+  assert.deepEqual(summary.superseded_task_ids, []);
+  // With a superseded fence the phase is the superseded one, as before.
+  const mixed = summarizeAgentStopFence(onlineAgent, [fenceRow(), batchChild()], {now: NOW, autoCheckEnabled: true});
+  assert.equal(mixed.phase, 'awaiting_node');
+  assert.deepEqual(mixed.operator_confirmable_task_ids, ['child']);
+  const none = summarizeAgentStopFence(onlineAgent, [fenceRow()], {now: NOW, autoCheckEnabled: true});
+  assert.deepEqual(none.operator_confirmable_task_ids, []);
+  assert.equal(none.operator_confirmable_count, 0);
+  assert.match(STOP_FENCE_PHASE_LABELS.task_action_required, /批次任务请到该电脑检查后在「执行节点」点「确认旧页面已停止」/u);
+});
+
+test('the release outcome and its sentence follow the projected work items', () => {
+  const elastic = {status: 'running', metadata: {distributionMode: 'elastic_pool'}};
+  const fixed = {status: 'running', metadata: {distributionMode: 'fixed_batch'}};
+  const pool = stopFenceReleaseItemOutcome([{status: 'retryable', count: 1}], elastic);
+  assert.deepEqual(pool, {kind: 'returned_to_pool', retryable: 1, failed: 0, needsAction: 0,
+    parentStatus: 'running', operatorStopped: false, distributionMode: 'elastic_pool', parentStopped: false});
+  assert.match(stopFenceReleaseOutcomeSentence(pool), /退回任务池/u);
+  const exhausted = stopFenceReleaseItemOutcome([{status: 'failed', count: 1}], elastic);
+  assert.equal(exhausted.kind, 'retry_exhausted');
+  assert.match(stopFenceReleaseOutcomeSentence(exhausted), /已达自动接力上限，可在批次里点「重试失败关键词」/u);
+  assert.equal(stopFenceReleaseItemOutcome([{status: 'needs_action', count: 1}], elastic).kind, 'retry_exhausted');
+  const batch = stopFenceReleaseItemOutcome([{status: 'needs_action', count: 3}], fixed);
+  assert.equal(batch.kind, 'batch_retry');
+  assert.equal(batch.needsAction, 3);
+  assert.match(stopFenceReleaseOutcomeSentence(batch), /已标为需处理，可在批次里点「重试失败关键词」/u);
+  const stopped = stopFenceReleaseItemOutcome([], {status: 'canceled', metadata: {distributionMode: 'elastic_pool'}});
+  assert.equal(stopped.kind, 'none');
+  assert.equal(stopped.parentStopped, true);
+  assert.match(stopFenceReleaseOutcomeSentence(stopped), /批次已停止，未完成关键词已随批次取消/u);
+  const waiting = stopFenceReleaseItemOutcome([], {status: 'waiting_device',
+    metadata: {distributionMode: 'elastic_pool', operatorStopped: true}});
+  assert.equal(waiting.parentStopped, true);
+  assert.equal(waiting.operatorStopped, true);
+  const empty = stopFenceReleaseItemOutcome([], elastic);
+  assert.equal(empty.kind, 'none');
+  assert.equal(empty.parentStopped, false);
+  assert.doesNotMatch(stopFenceReleaseOutcomeSentence(empty), /退回任务池|批次已停止/u);
+  assert.equal(stopFenceReleaseItemOutcome([], null).parentStatus, '');
+});
+
+test('the listing reads the parent only for needs_action batch children, by primary key', async () => {
+  const statements = [];
+  const executor = {queryAll: async (sql, params) => { statements.push({sql, params}); return []; }};
+  await listCaptureAgentStopFences(executor, 'tenant-1', {agentId: '55555555-5555-4555-8555-555555555555'});
+  const [{sql}] = statements;
+  for (const alias of ['task', 'released']) {
+    assert.match(sql, new RegExp(`${alias}\\.task_type,`, 'u'));
+    assert.match(sql, new RegExp(`CASE WHEN ${alias}\\.status = 'needs_action' AND ${alias}\\.parent_task_id IS NOT NULL THEN \\(`
+      + `[\\s\\S]*?WHERE parent\\.tenant_id = ${alias}\\.tenant_id AND parent\\.id = ${alias}\\.parent_task_id\\s+\\) END AS parent_state`, 'u'));
+  }
+  assert.doesNotMatch(sql, /JOIN capture_tasks parent/u, 'no join, one scalar subquery');
 });
