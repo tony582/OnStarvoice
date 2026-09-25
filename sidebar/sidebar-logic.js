@@ -7103,6 +7103,54 @@ async function renderAuthCodeInput(auth = getCurrentAuth()) {
 
 // ==================== UI 事件监听 ====================
 
+// 本机「继续」对这两种任务不会再有进展：只提示，不算失败。文案以 background
+// 回的 message 为准，这里是缺省值（与 background 同文）。
+const UNATTENDED_RECOVERY_OPERATOR_MESSAGES = Object.freeze({
+  previous_capture_stop_requires_operator:
+    "本机无法自行确认旧采集页面已停止，「继续」不会生效。请到这台电脑检查旧采集页面后，" +
+    "在后台「执行节点」点「确认旧页面已停止」；确认后该任务结束，剩余关键词由后台交回批次",
+  stop_fence_released_to_cloud:
+    "后台已确认旧采集页面停止，该任务已结束，剩余关键词由后台处理，本机无需继续",
+});
+
+// 任务中心恢复失败的说明：final 为真时按提示显示；否则作为失败原因显示。
+function describeUnattendedRecoveryFailure(response) {
+  const reason = String(response?.reason || "").trim();
+  if (
+    Object.prototype.hasOwnProperty.call(
+      UNATTENDED_RECOVERY_OPERATOR_MESSAGES,
+      reason,
+    )
+  ) {
+    return {
+      final: true,
+      text:
+        String(response?.message || "").trim() ||
+        UNATTENDED_RECOVERY_OPERATOR_MESSAGES[reason],
+    };
+  }
+  if (reason === "checkpoint_flush_not_ready") {
+    return {
+      final: false,
+      text: "旧运行页还在收尾（进度未上报完），请稍后再试；持续出现时请在后台「执行节点」处理",
+    };
+  }
+  // unverifiable 只在来源已归档（不再是本机当前任务）时出现，重试也不会变。
+  if (reason === "source_local_closure_unverifiable") {
+    return {
+      final: false,
+      text: "该任务已不是本机当前任务，本机无法继续；请在后台批次里处理",
+    };
+  }
+  if (reason.startsWith("source_local_closure_")) {
+    return {final: false, text: "本机尚未确认旧任务已收尾，请稍后再试"};
+  }
+  return {
+    final: false,
+    text: response?.reason || response?.error?.message || "无法恢复任务",
+  };
+}
+
 async function handleTaskCenterAction(event) {
   const detail = event?.detail && typeof event.detail === "object"
     ? event.detail
@@ -7193,7 +7241,13 @@ async function handleTaskCenterAction(event) {
       mode,
     });
     if (!response?.ok) {
-      throw new Error(response?.reason || response?.error?.message || "无法恢复任务");
+      const failure = describeUnattendedRecoveryFailure(response);
+      if (failure.final) {
+        showMessage(failure.text, "warning");
+        await loadKeywordPlanUI();
+        return;
+      }
+      throw new Error(failure.text);
     }
     showMessage(
       mode === "failed"

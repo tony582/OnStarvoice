@@ -143,6 +143,10 @@ const UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX =
   'onstarvoice.unattendedCheckpointReportOutbox.v2.';
 const UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX =
   'onstarvoice.unattendedLocalClosureReady.v1.';
+// runner 写的 flush 意图键前缀，须与 sidebar/sidebar-logic.js 同名常量一致
+// （测试断言）。background 只读它，判断 R 是否还有轮次在收尾。
+const UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX =
+  'onstarvoice.unattendedFinalFlushIntent.v1.';
 const UNATTENDED_LOCAL_CLOSURE_READY_VERSION = 1;
 const UNATTENDED_LOCAL_CLOSURE_EVIDENCE_VERSION = 2;
 const UNATTENDED_LOCAL_STOP_CONFIRMATION_VERSION = 1;
@@ -2535,8 +2539,10 @@ function summarizeCloudRecoveryResult(result) {
     reason: String(result?.reason || ''),
     requestId: String(result?.request?.id || result?.request?.requestId || ''),
     parentRequestId: String(result?.request?.parentRequestId || ''),
+    // 终局拒绝（例如孤儿围栏轮次）带自己的说明，优先于任务原文案回给后台。
     message: String(
-      result?.request?.message ||
+      result?.message ||
+        result?.request?.message ||
         (result?.accepted ? '设备已创建恢复任务' : '设备无法恢复当前任务'),
     ).slice(0, 1000),
   };
@@ -8797,12 +8803,18 @@ function isLegacyUnattendedRunnerTabForRequest(tab, requestId = '') {
   }
 }
 
+// anyAttempt: 统计请求 R 任一轮次的待报行（只比 requestId）。不传时与原来
+// 一样只认精确的 (R, A)。
 async function inspectUnattendedCheckpointOutboxAttempt(
   requestId,
   attemptId,
+  {anyAttempt = false} = {},
 ) {
   const normalizedRequestId = String(requestId || '').trim();
   const normalizedAttemptId = String(attemptId || '').trim();
+  if (anyAttempt === true && !normalizedRequestId) {
+    return {known: false, pendingCount: null, reason: 'outbox_request_missing'};
+  }
   let stored;
   try {
     stored = await chrome.storage.local.get(null);
@@ -8849,7 +8861,7 @@ async function inspectUnattendedCheckpointOutboxAttempt(
     }
     if (
       entryRequestId === normalizedRequestId &&
-      entryAttemptId === normalizedAttemptId
+      (anyAttempt === true || entryAttemptId === normalizedAttemptId)
     ) {
       const deliveryStatus = String(
         value.deliveryStatus || value.outboxStatus || '',
@@ -15342,6 +15354,106 @@ function buildManualRecoveryCheckpoint(request, mode) {
   return checkpoint;
 }
 
+const ORPHANED_STOP_FENCE_RECOVERY_MESSAGES = Object.freeze({
+  previous_capture_stop_requires_operator:
+    '本机无法自行确认旧采集页面已停止，「继续」不会生效。请到这台电脑检查旧采集页面后，' +
+    '在后台「执行节点」点「确认旧页面已停止」；确认后该任务结束，剩余关键词由后台交回批次',
+  stop_fence_released_to_cloud:
+    '后台已确认旧采集页面停止，该任务已结束，剩余关键词由后台处理，本机无需继续',
+});
+
+function isStopFenceBlockedNeedsAction(request) {
+  return Boolean(
+    request &&
+      request.status === 'needs_action' &&
+      String(request.error?.code || '').trim().toUpperCase() ===
+        'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
+  );
+}
+
+// stopFenceClosure 只在后台确认后 release_only 关掉 R 的 runner、释放 R 的锁
+// 之后（或节点自证后）写入，有它就说明后台已放行。
+function describeStopFenceOperatorGuidance(request) {
+  const closure = request?.stopFenceClosure;
+  const reason =
+    closure && typeof closure === 'object' && !Array.isArray(closure)
+      ? 'stop_fence_released_to_cloud'
+      : 'previous_capture_stop_requires_operator';
+  return {reason, message: ORPHANED_STOP_FENCE_RECOVERY_MESSAGES[reason]};
+}
+
+// 孤儿围栏轮次：自动恢复新建的轮次 A2 在停止旧页面失败后直接以
+// PREVIOUS_CAPTURE_STOP_UNCONFIRMED 收尾，从未被 runner 认领，(R, A2) 的 flush
+// 标记结构上不会出现，「继续」只会得到 checkpoint_flush_not_ready。
+// 要排除的是更早的轮次（A1）仍在收尾：它的 runner 可能开着或冻结、可能仍持有
+// 绑定 R 的锁、可能还有未上报的 outbox 行。所以除请求槽外都按整个 R 查，认锁与
+// 持有页判定沿用停止保护本机释放的规则。全部干净时返回终局说明；任一读取失败、
+// 结果未知或有存活迹象时返回 null，调用方保持原来的 deferred。
+// 只读：不写存储、不改请求槽、不碰标签页、不发心跳。Debug 会话、标签组和采集
+// 辅助残留不算存活迹象（已无东西驱动它们，release_only 会清掉），所以文案不说
+// “页面已关闭”。
+// 平台页也不算：progress.runnerTabId 是采集所在的平台页（停止失败的正是它），
+// 不是 runner；它不写 checkpoint，release_only 也不关它，运营要检查的就是它。
+// runner 只按 URL 认（含加载中的 pendingUrl），不按记录的标签页 id 认。
+async function classifyOrphanedStopFenceAttempt(source) {
+  const requestId = String(source?.id || '').trim();
+  const attemptId = String(source?.attemptId || '').trim();
+  if (!requestId || !attemptId) return null;
+  const isExactFencedSlot = (slot) => Boolean(
+    slot &&
+      slot.id === requestId &&
+      slot.attemptId === attemptId &&
+      isStopFenceBlockedNeedsAction(slot),
+  );
+  try {
+    const request = await readUnattendedKeywordRunRequest();
+    if (!isExactFencedSlot(request)) return null;
+    const stored = await chrome.storage.local.get(null);
+    if (!stored || typeof stored !== 'object') return null;
+    const intentPrefix =
+      `${UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX}${requestId}.`;
+    if (Object.keys(stored).some((key) => key.startsWith(intentPrefix))) {
+      return null;
+    }
+    const ctx = createStopFenceCheckContext(
+      {requestId, checkId: '', taskId: ''},
+      {ok: true, request, requestSource: 'slot', requestActive: false},
+    );
+    const tabs = await chrome.tabs.query({});
+    const isRunnerOfR = (tab) =>
+      ctx.isRequestRunnerTab(tab) ||
+      ctx.isRequestRunnerTab({url: tab?.pendingUrl});
+    if (!Array.isArray(tabs) || tabs.some(isRunnerOfR)) {
+      return null;
+    }
+    const lock = await readStoredCaptureExecutionLock();
+    if (isStopFenceLockBoundToRequest(lock, ctx)) {
+      const holderState = await getCaptureExecutionLockHolderState(lock);
+      const holderGone =
+        holderState === 'gone' ||
+        (
+          holderState === 'unknown' &&
+          !(await stopFenceTabExists(lock.holderTabId))
+        );
+      if (!holderGone) return null;
+    }
+    if (listRequestRelays(requestId, ctx.taskKey).length > 0) return null;
+    const outbox = await inspectUnattendedCheckpointOutboxAttempt(
+      requestId,
+      '',
+      {anyAttempt: true},
+    );
+    if (outbox?.known !== true || outbox.pendingCount !== 0) return null;
+    // 上面几次读取不是原子的：最后重读请求槽，期间换了轮次或状态就不下结论。
+    const reread = await readUnattendedKeywordRunRequest();
+    if (!isExactFencedSlot(reread)) return null;
+    return {...describeStopFenceOperatorGuidance(reread), request: reread};
+  } catch (error) {
+    console.warn('[Background] Orphaned stop-fence attempt check failed:', error);
+    return null;
+  }
+}
+
 async function prepareUnattendedManualRecoverySource(requestId = '') {
   const normalizedRequestId = String(requestId || '').trim();
   const current = await readUnattendedKeywordRunRequest();
@@ -15363,6 +15475,17 @@ async function prepareUnattendedManualRecoverySource(requestId = '') {
     current.id !== source.id ||
     current.attemptId !== source.attemptId
   ) {
+    // 归档副本回不到请求槽，这个原因是永久的。停止保护挡住的任务（例如后台
+    // 放行、release_only 之后节点领了新任务把它归档）直接给终局说明：这里
+    // 只换文案、让远程 resume 以失败完成，什么都不放行，不用查存活迹象。
+    if (isStopFenceBlockedNeedsAction(source)) {
+      return {
+        ready: false,
+        final: true,
+        ...describeStopFenceOperatorGuidance(source),
+        request: source,
+      };
+    }
     return {
       ready: false,
       reason: 'source_local_closure_unverifiable',
@@ -15386,6 +15509,20 @@ async function prepareUnattendedManualRecoverySource(requestId = '') {
     locallyClosed?.id !== current.id ||
     locallyClosed?.attemptId !== current.attemptId
   ) {
+    // 标记缺失时先看是不是孤儿围栏轮次：是的话标记永远不会出现，给终局说明，
+    // 把运营引到后台确认；不是（或判断不了）就照旧 deferred。
+    if (String(closure?.reason || '') === 'checkpoint_flush_not_ready') {
+      const orphaned = await classifyOrphanedStopFenceAttempt(current);
+      if (orphaned) {
+        return {
+          ready: false,
+          final: true,
+          reason: orphaned.reason,
+          message: orphaned.message,
+          request: orphaned.request,
+        };
+      }
+    }
     return {
       ready: false,
       reason: String(closure?.reason || 'source_local_closure_pending'),
@@ -15438,10 +15575,15 @@ async function manuallyRecoverUnattendedKeywordRun({
     requestId,
   );
   if (!sourcePreparation.ready) {
+    // final: 本机不会再有进展（孤儿围栏轮次），远程 resume 以失败完成而不是
+    // 挂起到指令过期；message 给侧栏和后台看。
     return {
       accepted: false,
-      deferred: true,
+      deferred: sourcePreparation.final !== true,
       reason: sourcePreparation.reason,
+      ...(sourcePreparation.message
+        ? {message: String(sourcePreparation.message)}
+        : {}),
       request: sourcePreparation.request || null,
     };
   }
@@ -21932,6 +22074,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           data: result.request || null,
           accepted: result.accepted,
           reason: result.reason,
+          message: String(result.message || ''),
         });
         return;
       }
