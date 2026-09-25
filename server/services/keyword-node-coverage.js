@@ -1,6 +1,9 @@
 import {queryAll, withTransaction} from '../db/query.js';
 import {aggregateParentTaskItems} from './capture-orchestration.js';
-import {captureAgentLivenessOnline} from './capture-cloud.js';
+import {
+  captureAgentLivenessOnline,
+  captureTaskUnconfirmedLocalStopSql,
+} from './capture-cloud.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const ACTIVE = new Set(['pending', 'claimed', 'running', 'recovering', 'waiting_device', 'interrupted', 'resume_requested']);
@@ -13,6 +16,7 @@ const timestamp = value => Date.parse(String(value || '')) || 0;
 
 export const KEYWORD_COVERAGE_SKIP_MESSAGES = Object.freeze({
   keyword_node_offline: '节点离线，本轮未覆盖；其他节点继续采集',
+  keyword_node_stop_fenced: '节点旧采集页面尚未确认停止，暂不接新任务，本轮未覆盖；其他节点继续采集',
   keyword_node_unavailable: '节点不可用，本轮未覆盖；其他节点继续采集',
   keyword_node_no_response: '节点未及时响应采集任务，本轮未覆盖',
   keyword_node_no_progress: '节点持续没有采集进展，本轮未覆盖',
@@ -49,8 +53,12 @@ function stalledExecution(child, now) {
   return '';
 }
 
+// A node held by an unconfirmed old-page stop is not "unresponsive": say why.
+const fencedReason = (reason, stopFenced) =>
+  stopFenced && reason === 'keyword_node_no_response' ? 'keyword_node_stop_fenced' : reason;
+
 /** A pinned search is best effort, never a requirement to wait for a broken node. */
-export function keywordCoverageSkipReason({parent, item, agent, child, nodeTasks = []}, now = Date.now()) {
+export function keywordCoverageSkipReason({parent, item, agent, child, nodeTasks = [], stopFenced = false}, now = Date.now()) {
   if (!coverageParent(parent) || item?.item_type !== 'keyword' ||
       !UUID.test(String(object(item.metadata).pinnedAgentId || '')) || SETTLED_ITEMS.has(item.status)) return '';
   if (!agent || agent.status !== 'active') return 'keyword_node_unavailable';
@@ -59,18 +67,18 @@ export function keywordCoverageSkipReason({parent, item, agent, child, nodeTasks
       ['failed', 'needs_action', 'interrupted', 'completed_with_failures'].includes(child?.status)) return 'keyword_node_failed';
   if (child) {
     if (FINISHED.has(child.status)) return 'keyword_node_missing_result';
-    return stalledExecution(child, now);
+    return fencedReason(stalledExecution(child, now), stopFenced);
   }
   // The node may be working through its other keywords. Healthy ongoing work
   // protects the remaining queue even when an individual word takes a while.
   const active = nodeTasks.filter(task => ACTIVE.has(task.status));
   const stalled = active.map(task => stalledExecution(task, now)).find(Boolean);
-  if (stalled) return stalled;
+  if (stalled) return fencedReason(stalled, stopFenced);
   if (active.length > 0) return '';
   const lastFinished = Math.max(0, ...nodeTasks.map(task => timestamp(task.finished_at)));
   const anchor = Math.max(timestamp(parent.started_at), timestamp(parent.created_at),
     timestamp(object(parent.metadata).publishedAt), lastFinished);
-  return now - anchor >= RESPONSE_MS ? 'keyword_node_no_response' : '';
+  return now - anchor >= RESPONSE_MS ? fencedReason('keyword_node_no_response', stopFenced) : '';
 }
 
 /** Lock child -> parent -> items, matching snapshot ingestion. Never wait on a live writer. */
@@ -90,13 +98,21 @@ export async function settleKeywordNodeCoverage(tx, {tenantId, parentTaskId}) {
   if (agentIds.length === 0) return {skipped: 0};
   const agents = await tx.queryAll(`SELECT * FROM capture_agents WHERE tenant_id=$1 AND id=ANY($2::uuid[])`, [tenantId, agentIds]);
   const agentsById = new Map(agents.map(agent => [agent.id, agent]));
+  // Same predicate admission uses; the node's own fence explains its silence.
+  const fencedAgentIds = new Set((await tx.queryAll(`SELECT DISTINCT
+      COALESCE(task.assigned_agent_id, task.origin_agent_id) AS agent_id
+    FROM capture_tasks task
+    WHERE task.tenant_id=$1 AND COALESCE(task.assigned_agent_id, task.origin_agent_id)=ANY($2::uuid[])
+      AND task.task_type <> 'capture_orchestration'
+      AND ${captureTaskUnconfirmedLocalStopSql('task')}`, [tenantId, agentIds])).map(row => String(row.agent_id)));
   const now = timestamp(parent.coverage_now);
   let skipped = 0;
   for (const item of pinned) {
     const agentId = item.metadata.pinnedAgentId;
     const child = childrenById.get(item.execution_task_id);
     const reason = keywordCoverageSkipReason({parent, item, child, agent: agentsById.get(agentId),
-      nodeTasks: children.filter(task => task.assigned_agent_id === agentId)}, now);
+      nodeTasks: children.filter(task => task.assigned_agent_id === agentId),
+      stopFenced: fencedAgentIds.has(String(agentId))}, now);
     if (!reason) continue;
     const message = KEYWORD_COVERAGE_SKIP_MESSAGES[reason];
     const error = {code: reason, message, retryable: false, originalError: item.error};
@@ -104,7 +120,13 @@ export async function settleKeywordNodeCoverage(tx, {tenantId, parentTaskId}) {
     if (child && !FINISHED.has(child.status)) {
       // Superseded tasks reject late snapshots. The assignment revision also
       // fences result ingestion; terminal notices tell a returning runner to stop.
-      await tx.execute(`UPDATE capture_tasks SET status='superseded', error=$3::jsonb,
+      // Never overwrite an unconfirmed old-page stop: that code is the only
+      // thing keeping the node out of admission until the stop is proven, so
+      // the coverage reason is added beside it instead of replacing it.
+      await tx.execute(`UPDATE capture_tasks SET status='superseded',
+        error=CASE WHEN UPPER(COALESCE(error->>'code',''))='PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+          THEN error || jsonb_build_object('coverageReason',$5::text,'coverageMessage',$4::text)
+          ELSE $3::jsonb END,
         message=$4, finished_at=now(), updated_at=now(),
         metadata=metadata || jsonb_build_object('terminalDisposition','revoked',
           'terminalReason',$5::text,'terminalDispositionAt',now()::text)
