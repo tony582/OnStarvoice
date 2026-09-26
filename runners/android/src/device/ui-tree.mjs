@@ -28,8 +28,10 @@ export function parseUiTree(xml) {
   const source = xml.replace(/^<\?xml\s[^?]*\?>\s*/u, '');
   const document = { tag: 'document', attributes: {}, children: [], parent: null };
   const stack = [document]; const nodes = []; let offset = 0;
-  const at = rule => fail(rule, { bytes, nodes: nodes.length, depth: stack.length - 1 });
-  for (const match of source.matchAll(/<[^>]*>/gu)) {
+  const at = (rule, facts = {}) => fail(rule, { bytes, nodes: nodes.length, depth: stack.length - 1, ...facts });
+  // XML allows a raw `>` inside a quoted attribute value (a caption such as "A>B"), so a tag ends at
+  // the first `>` outside quotes, not at the first `>`.
+  for (const match of source.matchAll(/<(?:[^>"]|"[^"]*")*>/gu)) {
     if (source.slice(offset, match.index).trim()) return at('stray_text');
     offset = match.index + match[0].length;
     const close = match[0].match(/^<\/([\p{L}_][\p{L}\p{N}_.:-]*)>$/u);
@@ -37,7 +39,7 @@ export function parseUiTree(xml) {
       if (stack.length < 2 || stack.pop().tag !== close[1]) return at('unbalanced_tag');
       continue;
     }
-    const open = match[0].match(/^<([\p{L}_][\p{L}\p{N}_.:-]*)(\s[^<>]*?)?\s*(\/?)>$/u);
+    const open = match[0].match(/^<([\p{L}_][\p{L}\p{N}_.:-]*)(\s(?:[^<>"]|"[^"<]*")*?)?\s*(\/?)>$/u);
     if (!open) return at('invalid_tag');
     if (stack.length > 128) return at('too_deep');
     if (nodes.length >= 12000) return at('too_many_nodes');
@@ -46,7 +48,11 @@ export function parseUiTree(xml) {
     while (cursor < attrs.length) {
       if (!attrs.slice(cursor).trim()) break;
       regex.lastIndex = cursor; const attribute = regex.exec(attrs);
-      if (!attribute) return at('invalid_attribute');
+      if (!attribute) {
+        return at('invalid_attribute', { tag: open[1], parsedAttributes: Object.keys(attributes).length,
+          lastAttribute: Object.keys(attributes).at(-1) ?? '',
+          nextCodePoints: [...attrs.slice(cursor).trimStart()].slice(0, 4).map(char => char.codePointAt(0)) });
+      }
       if (Object.hasOwn(attributes, attribute[1])) return at('duplicate_attribute');
       if (/&(?![^&;]+;)/u.test(attribute[2])) return at('bare_ampersand');
       attributes[attribute[1]] = decode(attribute[2]); cursor = regex.lastIndex;
