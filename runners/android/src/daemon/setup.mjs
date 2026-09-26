@@ -38,7 +38,7 @@ export async function setupRunner({stateDir, baseUrl, deviceId, code, simulation
   }
   const clientUuid = loadClientUuid(directory);
   const registered = await (client ?? createControlClient({baseUrl: origin})).register({
-    code, clientUuid, deviceId, clientLabel: clientLabel ?? 'Android USB Runner', appVersion: '0.2.3',
+    code, clientUuid, deviceId, clientLabel: clientLabel ?? 'Android USB Runner', appVersion: '0.2.4',
   });
   const config = {baseUrl: origin, deviceId, clientUuid, agentId: registered.agent.id,
     agentToken: registered.agent.token, tenantId: registered.tenantId, simulation,

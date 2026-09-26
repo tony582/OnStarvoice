@@ -14,6 +14,28 @@ const COLLAPSE_SUFFIX = /\s*收起$/u;
 // The collapsed caption ends with an ellipsis and an inline "展开" ("... 展开", "…展开").
 const COLLAPSED_CAPTION = /(?:\.\.\.|…)\s*展开$/u;
 
+// On some videos 40.6.0 answers the inline "展开" with a detail panel over the video instead of
+// expanding in place: author g_5, full caption g=7, heading "相关推荐" g_f (measured on the DE106,
+// 2026-09-26). The share button is hidden until the panel is closed again. The caption node ends with
+// the publish time ("…#车载大屏    23小时前"); that suffix is removed only when it is exactly the time the
+// detail page showed before the tap, so the rest must still equal the card caption.
+function readCaptionPanel(tree, publishTime = null) {
+  const headings = byId(tree, 'g_f').filter(node => node.attributes.text === '相关推荐');
+  const captions = byId(tree, 'g=7'); const authors = byId(tree, 'g_5');
+  if (headings.length !== 1 || captions.length !== 1 || authors.length !== 1) return null;
+  let title = captions[0].attributes.text?.trimEnd() ?? ''; const author = authors[0].attributes.text;
+  if (publishTime && title.endsWith(publishTime) && /\s$/u.test(title.slice(0, -publishTime.length))) {
+    title = title.slice(0, -publishTime.length).trimEnd();
+  }
+  return title.trim() && author?.trim() ? { kind: 'video', title, author } : null;
+}
+// The detail page's own publish time (" · 23小时前"), read before the tap.
+function detailPublishTime(tree) {
+  const nodes = byId(tree, '4wp');
+  const value = nodes.length === 1 ? (nodes[0].attributes.text ?? '').replace(/^[\s·]+/u, '').trim() : '';
+  return value || null;
+}
+
 // Remove the UI collapse label only when the remaining full text AND author match the card exactly.
 // Whitespace is not identity (normalizeCaption drops it), so accepting any spacing before "收起" is not a looser match.
 function readCardDetail(tree, card) {
@@ -74,10 +96,20 @@ async function expandAndVerify({ ui, tree, detail, card, signal, budgetMs, now }
   // Expand through the observed control only: the dedicated button, or the inline "展开" at the caption's end.
   // A truncated prefix never verifies identity, and the caption centre is never tapped because it can be a link.
   let tap = null;
+  const startedAt = now();
   if (separateExpand) await ui.clickId('0s0', { signal });
   else tap = await ui.tapIdNearEnd('desc', { signal });
-  let outcome = 'timeout', unchanged = 0, left = 0, changedTitle = null, last = null;
+  let outcome = 'timeout', unchanged = 0, left = 0, changedTitle = null, last = null, panel = null, panelMismatches = 0;
+  const publishTime = detailPublishTime(tree);
   const expanded = await readUntil({ ui, signal, budgetMs, now, predicate: current => {
+    const shown = readCaptionPanel(current, publishTime);
+    if (shown) {
+      if (detailMatchesCard(shown, card)) { panel = shown; outcome = 'panel'; return true; }
+      // A panel that keeps showing another text or author belongs to another work.
+      last = shown; left = 0;
+      if (++panelMismatches >= 2) { outcome = 'panel_mismatch'; return true; }
+      return false;
+    }
     const found = readCardDetail(current, card);
     if (detailMatchesCard(found, card)) return true;
     last = found ?? last;
@@ -98,6 +130,10 @@ async function expandAndVerify({ ui, tree, detail, card, signal, budgetMs, now }
     changedTitle = found.title;
     return false;
   } });
+  if (panel) {
+    return closeCaptionPanel({ ui, card, detail, panel, signal, now, tap,
+      budgetMs: Math.max(budgetMs - (now() - startedAt), READ_TIMEOUT_MS + RETRY_DELAY_MS) });
+  }
   const result = readCardDetail(expanded.tree, card);
   if (detailMatchesCard(result, card)) return result;
   throw settled('detail_identity_unverified', 'Expanded detail did not match', { stage: 'expanded', expandOutcome: outcome,
@@ -106,10 +142,27 @@ async function expandAndVerify({ ui, tree, detail, card, signal, budgetMs, now }
       activity: await currentActivity(ui, signal) } }) });
 }
 
+// The panel showed the card's full caption and author. Close it and require the very same collapsed
+// detail (caption and author unchanged) before anything else uses the page; the share flow needs it.
+async function closeCaptionPanel({ ui, card, detail, panel, signal, now, tap, budgetMs }) {
+  await ui.back({ signal });
+  const restored = await readUntil({ ui, signal, budgetMs, now, predicate: current => {
+    const found = readDetail(current);
+    return !readCaptionPanel(current) && found?.title === detail.title && found.author === detail.author;
+  } });
+  if (restored.matched) return { ...readDetail(restored.tree), title: panel.title };
+  throw settled('detail_identity_unverified', 'The detail did not return after its caption panel closed', {
+    stage: 'panel', expandOutcome: 'panel_not_closed', attempts: restored.attempts,
+    diagnostic: diagnosticFor({ card, detail, after: readDetail(restored.tree), extra: { stage: 'panel',
+      expandOutcome: 'panel_not_closed', control: 'inline', tap, texts: visibleTexts(restored.tree),
+      activity: await currentActivity(ui, signal) } }) });
+}
+
 /**
  * Verify that the open detail is the selected card. The hierarchy is re-read, never re-clicked,
  * while the budget allows; identity is checked strictly on every read. Outcomes:
- * - matching detail (possibly after one expand of the same-author video caption);
+ * - matching detail (possibly after one expand of the same-author video caption, in place or in a caption panel
+ *   that is closed again before returning);
  * - detail_identity_unverified: a detail loaded but it is another work (stage loaded/expanded);
  * - card_open_failed: the verified results page kept showing after the click (searchKeyword given);
  * - detail_ui_not_ready: no readable detail appeared inside the budget;
