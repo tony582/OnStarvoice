@@ -109,7 +109,7 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
     async returnToResults({contextId,signal}) {requireContext(contextId); await flow.returnToResults({signal}); return {...context};},
     // Proves the verified results page, keyword and filters again after a failed open, without opening anything.
     async recoverResults({contextId,signal}) {requireContext(contextId); await flow.recoverResults({signal}); return {...context};},
-    async scroll({contextId,signal}) {requireContext(contextId); const page=await flow.scroll({signal}); return {contextId,contextVerified:page.verified};},
+    async scroll({contextId,signal}) {requireContext(contextId); const page=await flow.scroll({signal}); return {contextId,contextVerified:page.verified,end:page.end===true};},
     readSource: options => session.ui.read(options),
     async close() {await bounded(()=>Promise.allSettled([...pending]),{timeoutMs:15000}); const result=await session.close(); if(result.closed) {flow=null;context=null;} return result;},
   };

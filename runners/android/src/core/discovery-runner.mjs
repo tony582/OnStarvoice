@@ -151,6 +151,7 @@ export async function runDiscoveryTask({ task, store, device, permit, clock = DE
       ledger.beforeSwipe();
       const scrolled = await call('scroll', { contextId });
       requireEvidence(scrolled?.contextVerified === true && scrolled.contextId === contextId, 'search_context_changed');
+      if (scrolled.end === true) { result = { status: 'completed', reason: 'results_end' }; break; }
     }
   } catch (error) {
     failure = error;

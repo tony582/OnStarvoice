@@ -15,6 +15,19 @@ const OPEN_SAFETY_MS = 3_000;
 const MIN_DETAIL_READY_MS = READ_TIMEOUT_MS + RETRY_DELAY_MS;
 const MAX_DETAIL_READY_MS = 40_000;
 const RETURN_BUDGET_MS = 15_000;
+// A verified search that shows no card list gets this long for late cards before it counts as empty.
+const EMPTY_RESULTS_BUDGET_MS = 20_000;
+
+const cardLists = tree => tree.nodes.filter(node => visible(node)
+  && node.attributes.class === 'androidx.recyclerview.widget.RecyclerView'
+  && descendants(node).some(child => child.attributes['resource-id'] === resource('b87')));
+const listFacts = node => ({ id: node.attributes['resource-id'] ?? '', scrollable: node.attributes.scrollable ?? '',
+  bounds: node.attributes.bounds ?? '',
+  cards: descendants(node).filter(child => child.attributes['resource-id'] === resource('b87')).length });
+// Local-only evidence for an unresolved result list: ids, flags, bounds and counts, never text.
+const listDiagnostic = (tree, lists) => ({ stage: 'scroll', cardLists: lists.map(listFacts),
+  scrollables: tree.nodes.filter(node => visible(node) && node.attributes.scrollable === 'true').slice(0, 8)
+    .map(node => ({ class: node.attributes.class ?? '', ...listFacts(node) })) });
 
 // The calibrated panel choices the flow can select; the profile adapter maps public filter names into these labels.
 const CALIBRATED_SORT = FILTER_OPTIONS['排序依据'];
@@ -152,13 +165,30 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
       await flow.returnToResults({signal});
       return {...observation, filtersRetained:true, keyword:context.keyword, filters:context.filters};
     },
+    /**
+     * Scroll the one result list. A short result (the list fits on one screen, so Android marks it not
+     * scrollable) or an empty one (no list even after waiting for late cards) has nothing further to
+     * show: every visible card was read before this call, so the results end here instead of failing.
+     */
     async scroll({ signal } = {}) {
-      await results({ signal }); const tree = await ui.read({ signal });
-      const containers = tree.nodes.filter(node => visible(node)
-        && node.attributes.class === 'androidx.recyclerview.widget.RecyclerView' && node.attributes.scrollable === 'true'
-        && descendants(node).some(child => child.attributes['resource-id'] === resource('b87')));
-      if (containers.length !== 1 || !containers[0].attributes['resource-id']) throw new DeviceError('scroll_container_ambiguous', 'Result list was not identified uniquely');
-      await ui.scroll(containers[0].attributes['resource-id'], { signal }); return results({ signal });
+      const { keyword } = requireContext();
+      let page = await results({ signal }); let tree = await ui.read({ signal });
+      let lists = cardLists(tree);
+      if (!lists.length && !page.cards.length) {
+        ({ tree } = await readUntil({ ui, signal, now, budgetMs: EMPTY_RESULTS_BUDGET_MS,
+          predicate: current => cardLists(current).length > 0 }));
+        lists = cardLists(tree); page = readSearch(tree, keyword);
+        if (lists.length && page.verified) return page; // Late cards: read them before any scroll.
+      }
+      const scrollable = lists.filter(node => node.attributes.scrollable === 'true');
+      if (scrollable.length === 1 && scrollable[0].attributes['resource-id']) {
+        await ui.scroll(scrollable[0].attributes['resource-id'], { signal }); return results({ signal });
+      }
+      const shortList = lists.length === 1 && !scrollable.length;
+      const emptyResult = !lists.length && !page.cards.length;
+      if (page.verified && (shortList || emptyResult)) return { ...page, end: true };
+      throw new DeviceError('scroll_container_ambiguous', 'Result list was not identified uniquely',
+        { diagnostic: listDiagnostic(tree, lists) });
     },
   };
   return flow;

@@ -9,16 +9,33 @@ export function assertDouyinScreen(tree) {
   }
 }
 
+// A previous keyword can leave Douyin on a screen whose hierarchy the parser rejects (seen on a
+// search results page, 2026-09-26). Reading it again would fail every later keyword in seconds,
+// so step back out of it a bounded number of times before giving up.
+export const UNREADABLE_SCREEN_BACKS = 3;
+
 // A positive own-profile marker is required. Search results alone do not prove login.
 export async function verifyLoginAndSearchEntry(ui, {signal} = {}) {
   const options = {signal};
-  let tree = await ui.read(options);
+  let unreadableBacks = 0;
+  const read = async () => {
+    while (true) {
+      try { return await ui.read(options); }
+      catch (error) {
+        if (error?.code !== 'invalid_ui_source') throw error;
+        if (unreadableBacks >= UNREADABLE_SCREEN_BACKS) { error.backPresses = unreadableBacks; throw error; }
+        unreadableBacks++;
+        await ui.back(options);
+      }
+    }
+  };
+  let tree = await read();
   const ownProfile = tree => byId(tree,'504').some(node => /^抖音号[：:]\s*\S+/u.test(node.attributes.text || ''))
     && byId(tree,'whh').some(node => node.attributes.text === '编辑主页');
   const profileTab = tree => byId(tree,'0p3').some(node => node.attributes['content-desc'] === '我，按钮');
   for (let step=0; step<6 && !ownProfile(tree) && !profileTab(tree); step++) {
     assertDouyinScreen(tree);
-    await ui.back(options); tree = await ui.read(options);
+    await ui.back(options); tree = await read();
   }
   if (!ownProfile(tree)) {
     if (!profileTab(tree)) throw new DeviceError('login_state_unverified', 'Own profile is not reachable');
