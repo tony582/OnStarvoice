@@ -75,12 +75,15 @@ async function findAssignedCandidate(tx,tenantId,agentId) {
         AND COALESCE(parent.metadata->>'stopCommandId','')=''))
     ORDER BY child.created_at, item.ordinal LIMIT 1 FOR UPDATE OF item SKIP LOCKED`,[tenantId,agentId,WORKFLOW]);
 }
+// One keyword that runs out of attempts turns the run needs_action; its other keywords stay claimable,
+// as in the browser elastic dispatch. Retries go to the fewest attempts first, so one failing keyword
+// cannot use up all of its retries while the others wait behind it.
 async function claimElasticItem(tx,principal,agent,now) {
   const item=await tx.queryOne(`SELECT item.* FROM capture_task_items item
     JOIN capture_tasks parent ON parent.id=item.task_id AND parent.tenant_id=item.tenant_id
     WHERE item.tenant_id=$1
       AND parent.task_type='capture_orchestration'
-      AND parent.status IN ('pending','running')
+      AND parent.status IN ('pending','running','needs_action')
       AND parent.platform='douyin'
       AND COALESCE(parent.metadata->>'distributionMode','')='elastic_pool'
       AND parent.metadata->>'stopRequested' IS DISTINCT FROM 'true'
@@ -105,7 +108,7 @@ async function claimElasticItem(tx,principal,agent,now) {
       AND COALESCE(jsonb_array_length(parent.metadata->'planSnapshot'->'searchPasses'),0) <= 1
       AND COALESCE(parent.metadata->'planSnapshot'->'negativePatrol'->>'enabled','false') <> 'true'
       AND COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'publishTime','all') <> 'month'
-    ORDER BY CASE WHEN item.status='pending' THEN 0 ELSE 1 END, parent.created_at, item.ordinal, item.id
+    ORDER BY CASE WHEN item.status='pending' THEN 0 ELSE 1 END, parent.created_at, item.attempt_count, item.ordinal, item.id
     FOR UPDATE OF item SKIP LOCKED LIMIT 1`,
   [principal.tenantId,agent.id,MOBILE_ELASTIC_ATTEMPT_LIMIT,TERMINAL_EXECUTION_STATUSES,MOBILE_SAFETY_ERROR_CODES]);
   if (!item) return null;

@@ -236,4 +236,37 @@ test('phones participate in normal orchestration scheduling with hard isolation'
     const [item] = await query('SELECT status FROM capture_task_items WHERE keyword=$1', ['安吉星车机壁纸']);
     assert.equal(item.status, 'canceled');
   });
+
+  await t.test('retries go to the fewest attempts first, and a keyword that ran out of attempts does not strand the rest', async st => {
+    const f = await fixture(st);
+    const {parentId} = await elasticParent(f.tenantId, {eligibleAgentIds: [f.phone.id], keywords: ['凯迪拉克壁纸', '别克车机壁纸', '君越车机壁纸']});
+    const claimed = [];
+    const attempt = async status => {
+      const claim = await f.poll();
+      assert.ok(claim.task, `the phone gets a keyword after ${claimed.join(' > ')}`);
+      claimed.push(claim.task.keyword);
+      await f.complete(claim.task, {status});
+    };
+    // The 09-24 night run: the first keyword failed again and again while the others waited behind it.
+    await attempt('interrupted'); // 凯迪拉克壁纸, attempt 1
+    await attempt('interrupted'); // 别克车机壁纸, attempt 1
+    await attempt('completed'); // 君越车机壁纸
+    await attempt('interrupted'); // 凯迪拉克壁纸, attempt 2
+    await attempt('interrupted'); // 别克车机壁纸, attempt 2: fewer attempts go first
+    await attempt('interrupted'); // 凯迪拉克壁纸, attempt 3: out of attempts
+    const [exhausted] = await query('SELECT status,attempt_count FROM capture_task_items WHERE task_id=$1 AND keyword=$2', [parentId, '凯迪拉克壁纸']);
+    assert.deepEqual([exhausted.status, exhausted.attempt_count], ['needs_action', 3]);
+    const [blocked] = await query('SELECT status FROM capture_tasks WHERE id=$1', [parentId]);
+    assert.equal(blocked.status, 'needs_action', 'the run reports the exhausted keyword');
+    const resumed = await f.poll(); // 别克车机壁纸, attempt 3
+    assert.equal(resumed.task?.keyword, '别克车机壁纸', 'the other keyword is still claimed from the needs_action run');
+    const [working] = await query('SELECT status FROM capture_tasks WHERE id=$1', [parentId]);
+    assert.equal(working.status, 'running', 'the run shows running while the phone works on it');
+    claimed.push(resumed.task.keyword);
+    await f.complete(resumed.task, {status: 'completed'});
+    assert.deepEqual(claimed, ['凯迪拉克壁纸', '别克车机壁纸', '君越车机壁纸', '凯迪拉克壁纸', '别克车机壁纸', '凯迪拉克壁纸', '别克车机壁纸']);
+    assert.equal((await f.poll()).task, null, 'nothing is left to claim');
+    const [settled] = await query('SELECT status FROM capture_tasks WHERE id=$1', [parentId]);
+    assert.equal(settled.status, 'needs_action');
+  });
 });
