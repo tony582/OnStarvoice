@@ -1627,4 +1627,88 @@ test('stop-fence closure asks the source node, releases only on proof or operato
     assert.match(confirmed.body.message, /退回任务池/u);
     assert.equal((await itemRow(item.id)).status, 'retryable');
   });
+
+  // docs/hotfix/20260926-elastic-handoff-disposition.md: several server paths
+  // end a keyword child with metadata.terminalDisposition, but only the patrol
+  // task types ever receive a terminal notice to acknowledge. A batch stopped
+  // later must not wait on a notice that is never sent.
+  const technicalError = {code: 'CAPTURE_PAGE_TIMEOUT', message: '页面加载超时'};
+  await t.test('a batch stopped after an ordinary elastic handoff settles once its other execution stops', async st => {
+    for (const fencedSource of [false, true]) {
+      const f = await fixture(st, {nodes: 2, capabilities: remoteStopNodes});
+      const {parent, child: source, items: [item]} = await needsActionBatch(f,
+        {childStatus: fencedSource ? 'needs_action' : 'failed',
+          items: [{keyword: '檐下秋意', status: 'retryable', error: technicalError, started: true}]});
+      if (!fencedSource) await query(`UPDATE capture_tasks SET error=$2 WHERE id=$1`, [source.id, technicalError]);
+      const claim = await withTransaction(tx => dispatchNextElasticWorkItem(tx,
+        {agent: f.agents[1], capabilities: remoteStopNodes[1]}));
+      assert.ok(claim?.childTaskId, JSON.stringify(claim));
+      const handedOff = await f.row(source.id);
+      assert.equal(handedOff.status, 'superseded');
+      assert.equal(handedOff.metadata.handoffSuccessorTaskId, claim.childTaskId);
+      assert.equal(handedOff.metadata.terminalReason, 'elastic_retry_claimed');
+      assert.equal(handedOff.metadata.terminalDisposition, 'superseded', 'the handoff still records its disposition');
+      assert.equal((await itemRow(item.id)).execution_task_id, claim.childTaskId);
+
+      const running = await runningExecution(f, parent);
+      const stopped = await adminHttp(f, `/orchestrations/${parent.id}/stop`, {});
+      assert.equal(stopped.status, 200, JSON.stringify(stopped.body));
+      assert.equal((await f.row(parent.id)).status, 'waiting_device');
+      assert.equal((await f.row(claim.childTaskId)).status, 'canceled', 'the undelivered successor stops at once');
+      await completeStop(f, 1, running.id);
+      assert.equal((await f.row(running.id)).status, 'canceled');
+      assert.equal((await f.row(parent.id)).status, 'canceled',
+        'the stopped batch settles once the other execution stopped');
+      assert.equal((await f.row(source.id)).status, 'superseded');
+      // Settling the batch is not a stop proof: a fenced source node stays held.
+      assert.equal((await f.blocker(0))?.id, fencedSource ? source.id : undefined);
+    }
+  });
+
+  await t.test('only task types that receive terminal notices wait for their acknowledgement', async st => {
+    const keywordChildren = [
+      {taskType: 'capture', status: 'superseded', disposition: 'superseded', reason: 'android_elastic_claimed'},
+      {taskType: 'unattended_keyword_capture', status: 'failed', disposition: 'revoked',
+        reason: 'elastic_agent_offline_timeout'},
+      {taskType: 'unattended_keyword_capture', status: 'superseded', disposition: 'revoked',
+        reason: 'keyword_node_offline'},
+    ];
+    const patrolChild = {taskType: 'negative_post_patrol', status: 'superseded', disposition: 'superseded',
+      reason: 'elastic_retry_claimed'};
+    for (const spec of [...keywordChildren, patrolChild]) {
+      const label = `${spec.taskType} ${spec.status} ${spec.reason}`;
+      const f = await fixture(st, {nodes: 2, capabilities: remoteStopNodes});
+      const attemptIdentity = randomUUID();
+      const {parent, child} = await needsActionBatch(f, {childStatus: spec.status,
+        childMetadata: {terminalDisposition: spec.disposition, terminalReason: spec.reason, attemptIdentity},
+        items: [{keyword: '檐下秋意', status: 'retryable', error: technicalError, started: true}]});
+      await query(`UPDATE capture_tasks SET task_type=$2, error='{}'::jsonb, finished_at=now(), updated_at=now()
+        WHERE id=$1`, [child.id, spec.taskType]);
+      // With no retained execution the stop route cancels the parent itself;
+      // the settle rule runs when the last retained execution stops.
+      const running = await runningExecution(f, parent);
+      const stopped = await adminHttp(f, `/orchestrations/${parent.id}/stop`, {});
+      assert.equal(stopped.status, 200, `${label}: ${JSON.stringify(stopped.body)}`);
+      assert.equal((await f.row(parent.id)).status, 'waiting_device', label);
+      await completeStop(f, 1, running.id);
+      if (spec !== patrolChild) {
+        assert.equal((await f.row(parent.id)).status, 'canceled', label);
+        continue;
+      }
+      // Control: a patrol child still waits until its node acknowledges the
+      // exact terminal notice.
+      assert.equal((await f.row(parent.id)).status, 'waiting_device', label);
+      const receiptCapabilities = {...legacyCapabilities, negativePatrolTerminalReceiptV1: true};
+      const noticed = await f.heartbeat(0, {capabilities: receiptCapabilities});
+      const notice = {requestId: child.control_task_id, attemptId: attemptIdentity, status: 'superseded'};
+      assert.deepEqual(noticed.terminalNotices.map(({requestId, attemptId, status}) =>
+        ({requestId, attemptId, status})), [notice], label);
+      assert.equal((await f.row(parent.id)).status, 'waiting_device', `${label}: a notice alone settles nothing`);
+      const acked = await http('/agent/heartbeat', {token: f.agents[0].token, body: {
+        agent: {clientUuid: f.agents[0].client_uuid, appVersion: '0.4.16', capabilities: receiptCapabilities},
+        tasks: [], terminalNoticeAcks: [notice]}});
+      assert.equal(acked.status, 200, JSON.stringify(acked.body));
+      assert.equal((await f.row(parent.id)).status, 'canceled', `${label}: settles on the acknowledgement`);
+    }
+  });
 });

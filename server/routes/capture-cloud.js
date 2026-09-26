@@ -2942,6 +2942,16 @@ const OPERATOR_STOP_TERMINAL_DISPOSITIONS = new Set([
   'revoked',
   'superseded',
 ]);
+// The task types claimPriorityAgentControl sends terminal notices for. Any
+// other child that carries a terminal disposition can never be acknowledged
+// and settles by status alone.
+const TERMINAL_NOTICE_TASK_TYPES = new Set([
+  'negative_post_patrol',
+  'watched_content_patrol',
+  'official_account_comment_patrol',
+  'followed_creator_post_patrol',
+  'official_account_post_discovery',
+]);
 
 export function operatorStoppedChildRequiresSettlement(child = {}) {
   const metadata = safeJson(child.metadata);
@@ -2954,7 +2964,8 @@ export function operatorStoppedChildRequiresSettlement(child = {}) {
   const disposition = text(metadata.terminalDisposition, 80);
   if (
     OPERATOR_STOP_TERMINAL_DISPOSITIONS.has(disposition) &&
-    metadata.stoppedBeforeDispatch !== true
+    metadata.stoppedBeforeDispatch !== true &&
+    TERMINAL_NOTICE_TASK_TYPES.has(text(child.task_type, 80))
   ) {
     const acknowledgement = safeJson(
       metadata.terminalNoticeAcknowledgement,
@@ -4612,6 +4623,18 @@ export async function refreshOrchestrationParentTask(tx, {
             )
             AND child.metadata->>'stoppedBeforeDispatch'
               IS DISTINCT FROM 'true'
+            -- Only these types are sent a terminal notice (the list in
+            -- claimPriorityAgentControl). Keyword children also carry a
+            -- disposition after an elastic handoff, lease timeout or
+            -- coverage skip; no acknowledgement can ever arrive for them, so
+            -- they settle by status like any other child.
+            AND child.task_type IN (
+              'negative_post_patrol',
+              'watched_content_patrol',
+              'official_account_comment_patrol',
+              'followed_creator_post_patrol',
+              'official_account_post_discovery'
+            )
             AND (
               child.status NOT IN ('canceled', 'superseded')
               OR COALESCE(
