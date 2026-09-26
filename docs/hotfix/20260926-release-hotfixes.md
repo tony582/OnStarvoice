@@ -104,39 +104,120 @@ Admin 本地构建：`tsc -b && vite build`，Node 24.12.0。`node_modules` 取�
 | Admin `tsc -b && vite build` | 通过，index 为 `476f8e19…` |
 | 安装包 | 见上文「Extension 0.4.17 安装包」 |
 
+### 集成验收：与基线 `2a99bb1` 逐项对照（2026-09-26）
+
+两边都用 `git archive` 出的干净副本（scratch `hotfixes0926/int/base` 与 `int/cand`），`server/node_modules`、`web/admin/node_modules` 链到主工作区，用同一个解析垫片和同一个一次性 PostgreSQL 17.9（`--locale=C`，只监听 127.0.0.1:55741，已停）。
+
+| 套件 | 基线 `2a99bb1` | 本分支 `bc4622c` | 失败名单 |
+|---|---|---|---|
+| 完整回归，Node 24.12.0 | 2738 项，2720 通过，18 失败 | 2765 项，2747 通过，18 失败 | 17 个名字，与右列逐字相同 |
+| 完整回归，Node 18.20.8 | 2738 项，2720 通过，18 失败 | 2765 项，2747 通过，18 失败 | 同上；四次运行名单完全一致 |
+| PostgreSQL 集成全套（46 个文件，Node 18.20.8，`--test-concurrency=1`） | 318 项，301 通过，17 失败 | 331 项，314 通过，17 失败 | 17 个名字逐字相同 |
+
+- 失败全部是环境原因，两边一样：副本没有根目录 `node_modules`，子进程或 CJS 找不到 `dotenv`、`express`、`exceljs`、`pg`、`react/jsx-runtime`；副本里也没有 `extension-build/`，所以 `douyin-blogger-profile-scope` 整文件失败（在工作区里跑时通过，见上表）。回归报告的“18 失败”含 1 条汇总，名单是 17 个。名单与 09-26 needs-action 验收时的候选名单相同。
+- 新增的测试都通过：回归多出 27 项；PostgreSQL 多出 13 项，其中 stop-fence-closure 20 → 32，android-unified-scheduling 7 → 8，其余每个文件的通过数与基线相同。
+
+Admin 构建（Node 24.12.0，vite 8.0.16，`node_modules` 从 `OnStarvoice-release-v048-20260910` 只读复制，`package-lock.json` 两边都是 `38d615a0…`）：
+
+| 构建 | `index.html` | 结论 |
+|---|---|---|
+| 对照：`2a99bb1` | `8161b52f…72491` | 与生产现值相同，资源名 `index-BUinIx_i.js` 等与生产一致 |
+| 本分支 `bc4622c`，第 1 次 | `476f8e19c5fd6240453a0cc30ae9bc8004d0bf94b252c87d283a0ddaced87750` | |
+| 本分支 `bc4622c`，第 2 次（另一份干净副本） | 同上 | 11 个文件逐字节相同 |
+
+安装包复核：zip `c82fc024…` 解开后与 `git archive bc4622c` 的 7 个扩展路径、与 `ext/extension-build-0.4.17/` 都 `diff -r` 无差异；主工作区 `extension-build/` 仍与 `4ed2a99` 完全一致（0.4.16 试点，未动）。
+
 ### CI
 
-待补：推送后 GitHub Actions 的结果（run 号、各项结论）。
+[run 36212258163](https://github.com/tony582/OnStarvoice/actions/runs/36212258163)，head `bc4622c`，5/5 通过：Tests and builds、Production Node 18 compatibility、PostgreSQL 14 / Node 24.12.0、PostgreSQL 16 / Node 18.20.8、PostgreSQL 16 / Node 24.12.0。之后只有本条文档提交，不改 `server/`、`web/admin/` 和扩展文件，所以 CI 结论和下面的发布包仍然有效。
+
+### 发布包
+
+目录：会话 scratch 的 `hotfixes0926/stage/release-hotfixes-bc4622c-20260926/`，从 `bc4622c` 生成（生成脚本 `hotfixes0926/stage/build-stage.sh`）。生产位置：`/opt/onstarvoice-private/releases/release-hotfixes-bc4622c-20260926`。
+
+| 文件 | SHA-256 | 内容 |
+|---|---|---|
+| `server.tar.gz` | `a86de4da67aa22e92d053a966627a262355a09734bb41cc89c049ea5d7349f77` | 上表 7 个服务端文件 + `public-downloads/StarVoice-extension-v0.4.17-20260926.zip`（ustar，属主 root） |
+| `admin-dist.tar.gz` | `a9b7355c37cf2f9c935be392bdaeaf684ce4c45f42f0d657eb6f7333bd1772a8` | `dist/` 11 个文件，哈希见 `admin-files.sha256` |
+| `deploy.sh` | `60e84eeedd7af136181da61ad448426a4c90f17442057b6dec0ca7e417af1d52` | 见下 |
+| `release-manifest.json` | `eb7ca47ac028427704f5e9c190fa50d5ac854ae12fc44c284124e0c289c263fa` | 前置条件、新值、验证记录 |
+| `local.sha256` | — | 以上 4 个文件的哈希，上传后用它核对 |
+
+另附 `src/`、`admin-src/`（包内文件的明文副本）和 `admin-source.sha256`（构建所用 `web/admin` 源码，158 个文件）。needs-action 旧发布包 `needs-action-fence-a6e17d3-20260925` 作废，不要部署。
+
+`deploy.sh` 要点：
+
+- `--check` 只读：两个包的哈希；6 个待替换文件和 Admin index 为 `9b836f6` 现值，`leases.js` 为 `97b3765`（`c331fe2d…`）；`capture-stop-fence-release.js` 不存在（包括悬空链接）；`public-downloads/` 是真实目录，有 0.4.15 zip，没有 0.4.17 zip 及其 `.tmp`；PM2 在线；`/api/health/ready` 通过；`/api/update-manifest` 顶层和 `data.updateManifest` 都是 0.4.15、指向 0.4.15 zip、`minSupportedVersion` 0.3.51。
+- 部署：加发布锁；同一目录只能跑一次（`backup/` 或 `candidate/` 已存在即拒绝）；解包后核对包内恰好 19 个文件及各自哈希、zip 大小，Node `--check` 6 个 js；备份。然后先装 zip（tmp+mv），再加 Admin 资源，再切 index、先放新模块、再逐个 tmp+mv 替换 6 个文件，`pm2 restart onstarvoice`。
+- 部署后检查（任何一项失败都自动回滚）：30 秒内 ready；live；进程确实重启且解释器版本不变；磁盘文件与包逐字节相同；`/api/update-manifest` 两处都是 0.4.17、指向新 zip、`minSupportedVersion` 仍为 0.3.51（重启后的进程能返回它，说明包括 `capture-cloud.js` 和新模块在内的整套路由都已加载）；`/downloads/<0.4.17 zip>` 逐字节一致，0.4.15 zip 仍可下载，`public-downloads/` 只多了这一个 zip；`/changelog` 有“扩展 v0.4.17”；`/admin/` 为 `476f8e19…`，8 个资源逐字节可取。成功后再取一次公网 `https://voice.minilife.online/downloads/<zip>` 比对 SHA，只提示，不回滚。
+- 自动回滚：切换后任何失败或 INT/TERM/HUP，都恢复 6 个文件（仍是旧内容的不动）、删除新模块、恢复 index、重启并等 ready；确认旧代码已就绪后再删掉 0.4.17 zip。回滚期间忽略后续信号。新 Admin 资源保留但不被引用。切换前失败（例如资源冲突）只删掉已装的 zip。
+
+模拟（scratch `hotfixes0926/deploysim/`）：按生产现状搭建的 `/opt/onstarvoice`（服务端 `9b836f6` + `leases.js` `97b3765`；Admin 为 `68c32ba` 与 `9b836f6` 两次构建，index `8161b52f`；`public-downloads/` 有 0.4.15 zip），真实应用在 Node 18.20.8 下由 pm2 替身启动，公网地址一律拦截。
+
+| 场景 | 结果 |
+|---|---|
+| 原样 `--check` | 通过，目录树不变 |
+| 漂移拒绝（14 种）：`about.html`、`capture-cloud.js`、`update-manifest.js` 文件、仅运行中的 update-manifest 不同、`leases.js` 仍是 `9b836f6`、旧 needs-action 发布包已上线、新模块为悬空链接、0.4.17 zip 已存在、残留 zip `.tmp`、0.4.15 zip 缺失、`public-downloads` 为链接、Admin index 为 `68c32ba`、`server.tar.gz` 被篡改、PM2 停止 | `--check` 和部署都退出 1，目录树不变，发布目录未被使用，未重启 |
+| 发布锁被占用；参数写错（`--deploy`） | 拒绝，目录树不变 |
+| 正常部署 | 退出 0，全部检查通过，重启 1 次；文件、index、update-manifest 0.4.17、zip `c82fc024…`、changelog 均符合；树的变化恰好是 6 个替换文件、新模块、新 zip、index 和 5 个新资源 |
+| 再跑一次 | 拒绝，目录树不变；`--check` 如实报告已不是 `9b836f6` |
+| 按文档手工回滚 | 服务恢复 0.4.15，`--check` 重新通过；与原样相比只多 5 个新资源 |
+| 自动回滚：ready 失败、资源取回不符、zip 取回不符、SIGTERM、SIGHUP、两次 SIGTERM（第二次落在回滚的重启上）、`routes/` 只读 | 都回到 `9b836f6` 文件和 index，zip 已删，服务 ready，`--check` 重新通过，再部署被拒绝；与原样相比只多 5 个新资源 |
+| 切换前资源冲突 | 代码和 index 未动，已装的 zip 被删除 |
+
+### 本机 `extension-build/` 同步脚本
+
+`hotfixes0926/stage/sync-extension-build.sh`（SHA-256 `96ba5cc3f965409fe20c1e2ca905bd0b1758816e370b97e5e114ccc1f1a9788a`，只在本机运行，不上传），尚未执行：
+
+- `--check` 只读：zip SHA 为 `c82fc024…`；`ext/extension-build-0.4.17/` 与脚本内嵌的 102 个文件哈希完全一致，且与 zip 解包 `diff -r` 相同；`extension-build/` 与内嵌的 `4ed2a99` 试点清单完全一致（多一个 `.DS_Store` 也算不一致）；备份目录不存在。
+- 执行：先 `cp -Rp` 备份到 `extension-build.rollback-v0416pilot-before-bc4622c` 并逐文件核对，再原地替换（只写内容变了的文件，每个 tmp+mv，删多余文件，目录权限 755），最后逐文件核对为 0.4.17、与解包目录 `diff -r` 相同、与备份相比恰好只有 `background.js`、`manifest.json`、`sidebar/sidebar-logic.js` 不同。替换中途失败或被中断，自动从备份恢复并逐文件核对。备份已存在就拒绝。
+- `--rollback`：备份必须仍是试点版，原地恢复并逐文件核对，备份保留。
+
+模拟（对真实 `extension-build/` 的副本，scratch `hotfixes0926/syncsim/`）：`--check` 通过且不改动；正常同步后与解包目录一致、备份与试点一致；再跑和 `--check` 都拒绝；`--rollback` 后与试点一致；目标有 `.DS_Store`、目标文件被改、备份已存在、来源被篡改、没有备份时回滚，都拒绝且不改动；替换到 `sidebar/` 时失败，自动恢复为试点版。
 
 ### 部署后
 
-待补。
+待补（需要有权限的人执行，见「上线顺序」）。
 
 ## 上线顺序
 
-1. **服务端 + Admin + 安装包，一次完成**（人工或运维执行，agent 没有 ssh 权限）。以 `68c32ba` 发布 0.4.15 的脚本和 needs-action 发布包为模板，重新生成发布包：
-   - 前置条件：上表文件为生产现值；`capture-stop-fence-release.js` 不存在；`public-downloads/` 是真实目录，不是符号链接，里面没有 0.4.17 zip，但有 0.4.15 zip；PM2 在线；`/api/health/ready` 通过；`/api/update-manifest` 为 0.4.15。
-   - 执行顺序：先装 zip（`install -m 0644 … .<zip>.tmp && mv`），再加 Admin 资源，再切换 `index.html`，然后先放新模块、再用 tmp+mv 替换服务端文件，最后 `pm2 restart onstarvoice`。
-   - 部署后检查：
-     - 文件哈希与上表一致。
-     - `/api/update-manifest` 顶层和 `data.updateManifest` 的 `latestVersion` 都是 0.4.17，`downloadUrl` 以 `/downloads/StarVoice-extension-v0.4.17-20260926.zip` 结尾。
-     - 从 `127.0.0.1:3002/downloads/<zip>` 和公网 nginx 取回的 zip，SHA 都是 `c82fc024…`，解出的 `manifest.json` 版本为 0.4.17。
-     - `/changelog` 包含“扩展 v0.4.17”。
-     - 0.4.15 zip 仍在。
-     - `/admin/` 和新资源逐字节可取。
-   - 发布目录：`/opt/onstarvoice-private/releases/release-hotfixes-<短 sha>-20260926`。
-2. **本机 `extension-build/` 原地替换**：必须在第 1 步之后，因为侧栏说明指向的后台按钮是第 1 步才上线的。扩展清单没有 `key`，扩展 ID 由目录决定，所以只能原地替换，不能换目录。
-   1. 预检：主工作区 `extension-build/` 与 `git archive 4ed2a99` 的 7 个扩展路径一致（当前是 0.4.16 试点版）。不一致就停止。
-   2. 备份：`cp -Rp extension-build extension-build.rollback-v0416pilot-before-<短 sha>`，然后用 `diff -r` 核对备份。
-   3. 替换：再核对一次 zip 的 SHA，然后执行 `rsync -a --delete --delete-excluded --exclude .DS_Store <scratch>/ext/extension-build-0.4.17/ extension-build/`，再 `chmod 755 extension-build`。
-   4. 核对：与解包目录 `diff -r` 无差异；共 102 个文件；版本 0.4.17；与备份相比只有 3 个文件不同。
-   5. 以上步骤先写成脚本，用户同意后再执行。
+1. **服务端 + Admin + 安装包，一次完成**（运维执行；agent 没有 ssh 权限）：
+
+   ```bash
+   # 本机：上传整个发布目录（目标目录必须还不存在）
+   scp -r <scratch>/hotfixes0926/stage/release-hotfixes-bc4622c-20260926 <生产主机>:/opt/onstarvoice-private/releases/
+   # 生产主机
+   cd /opt/onstarvoice-private/releases/release-hotfixes-bc4622c-20260926
+   sha256sum --check local.sha256
+   bash deploy.sh --check    # 应输出 preconditions OK: production matches 9b836f6 + leases.js 97b3765, ...
+   bash deploy.sh            # 成功时最后打印 runtime.json、ready 结果和公网下载核对
+   ```
+
+   `--check` 不通过就先查明原因，不要硬上；它会打印生产上的实际哈希和 update-manifest。部署失败会自动回滚并说明结果；同一目录不能再跑，重试要重新上传一份干净的发布目录。
+2. **本机 `extension-build/` 原地替换**：必须在第 1 步成功之后，因为侧栏说明指向的后台按钮是第 1 步才上线的。扩展清单没有 `key`，扩展 ID 由目录决定，所以只能原地替换，不能换目录。
+
+   ```bash
+   bash <scratch>/hotfixes0926/stage/sync-extension-build.sh --check
+   bash <scratch>/hotfixes0926/stage/sync-extension-build.sh
+   ```
 3. **逐个节点重载**：在节点空闲或已停止时，在 `chrome://extensions` 里重载扩展，然后重启 Chrome。一次一个节点，成都等多窗口机器放在最后。每个节点都到后台核对 `app_version` 为 0.4.17 并带 `previousCaptureStopCheckV1` 能力位。Windows 节点从下载地址取包，在各自原目录内原地替换。
 4. 0.4.17 铺开、没有节点还在 0.4.15 或更早版本之后，再评估单独发布 `17351b2`。
 
 ## 回滚
 
-- **服务端与 Admin**：用发布目录 `backup/` 下的 6 个服务端文件和 `backup/admin/index.html` 覆盖回原位置，删除 `server/services/capture-stop-fence-release.js`，然后 `pm2 restart onstarvoice`。`update-manifest.js` 回到 0.4.15 后，更新提示不再指向 0.4.17 zip。zip 留在 `public-downloads/` 里，但不再被引用。
+- **服务端与 Admin**：部署中失败时 `deploy.sh` 已自动回滚。部署成功后要手工回滚：
+
+  ```bash
+  cd /opt/onstarvoice-private/releases/release-hotfixes-bc4622c-20260926
+  for f in server/public/about.html server/routes/capture-cloud.js server/routes/capture-orchestrations.js server/routes/update-manifest.js server/services/capture-stop-fence.js server/services/ops-control.js; do cp -p backup/$f /opt/onstarvoice/$f; done
+  rm -f /opt/onstarvoice/server/services/capture-stop-fence-release.js
+  cp -p backup/admin/index.html /opt/onstarvoice/web/admin/dist/index.html
+  pm2 restart onstarvoice && curl -fsS http://127.0.0.1:3002/api/health/ready
+  rm -f /opt/onstarvoice/public-downloads/StarVoice-extension-v0.4.17-20260926.zip
+  bash deploy.sh --check    # 重新输出 preconditions OK 即已回到 9b836f6（模拟验证过）
+  ```
+
+  `update-manifest.js` 回到 0.4.15 后更新提示不再指向 0.4.17，所以最后再删 zip。
 - **已放行的记录不回退**：它们的格式与历史对账相同，并且有事件和审计记录。
 - **只想停掉自动核对**：设置 `CAPTURE_STOP_FENCE_AUTO_CHECK=off` 后重启服务。
-- **本机扩展**：`rsync -a --delete extension-build.rollback-v0416pilot-before-<短 sha>/ extension-build/`，然后重载扩展。要回到 0.4.15，就用 0.4.15 zip（`d7422afc9aab6c6e27971a19d7e89537b87cd2420c19875913e3660182fe50af`）解包后同样原地替换。
+- **本机扩展**：`bash <scratch>/hotfixes0926/stage/sync-extension-build.sh --rollback`，然后逐个节点重载扩展。要回到 0.4.15，就用 0.4.15 zip（`d7422afc9aab6c6e27971a19d7e89537b87cd2420c19875913e3660182fe50af`）解包后同样原地替换。
