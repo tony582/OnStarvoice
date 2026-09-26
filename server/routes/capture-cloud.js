@@ -11622,7 +11622,7 @@ const STOP_FENCE_ADMIN_ERRORS = Object.freeze({
   ],
   agent_stop_fence_check_unsupported: [
     409,
-    '该节点扩展版本不支持自动核对（需升级到 0.4.16），请到该电脑检查后点「确认旧页面已停止」',
+    '该节点扩展版本不支持自动核对（需升级到 0.4.16 或更高版本），请到该电脑检查后点「确认旧页面已停止」',
   ],
   agent_stop_fence_check_disabled: [
     409,

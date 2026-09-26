@@ -350,7 +350,7 @@ function phaseDetail(phase, { agent, stopFence, supersededCount, actionTasks, ma
     case 'manual_only':
       if (stopFence.auto_check_supported !== true) {
         const version = textValue(agent?.app_version)
-        return `该节点扩展为 ${version || '旧版本'}，不支持自动核对；请到这台电脑检查：关闭或刷新所有小红书、抖音、微博采集页（最稳妥是重启 Chrome）后，点「确认旧页面已停止」；升级到 0.4.16 后系统会自动核对`
+        return `该节点扩展为 ${version || '旧版本'}，不支持自动核对；请到这台电脑检查：关闭或刷新所有小红书、抖音、微博采集页（最稳妥是重启 Chrome）后，点「确认旧页面已停止」；升级到 0.4.16 或更高版本后系统会自动核对`
       }
       return `${manualOnlyTasks.length || Number(stopFence.manual_only_task_count) || 1} 个任务无法定位节点本机记录，无法自动核对；请到该电脑检查后点「确认旧页面已停止」`
     case 'auto_check_disabled':
@@ -385,7 +385,7 @@ function recheckState(phase, stopFence, agent, releasableCount = 0) {
     return {
       canRecheck: false,
       recheckHint: stopFence.auto_check_supported !== true
-        ? `该节点扩展为 ${textValue(agent?.app_version) || '旧版本'}，不支持自动核对；请到这台电脑检查：关闭或刷新所有小红书、抖音、微博采集页（最稳妥是重启 Chrome）后，点「确认旧页面已停止」；升级到 0.4.16 后系统会自动核对`
+        ? `该节点扩展为 ${textValue(agent?.app_version) || '旧版本'}，不支持自动核对；请到这台电脑检查：关闭或刷新所有小红书、抖音、微博采集页（最稳妥是重启 Chrome）后，点「确认旧页面已停止」；升级到 0.4.16 或更高版本后系统会自动核对`
         : '有任务无法定位节点本机记录，无法自动核对；请到该电脑检查后点「确认旧页面已停止」',
     }
   }

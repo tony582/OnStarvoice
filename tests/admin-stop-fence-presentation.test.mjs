@@ -116,7 +116,7 @@ test('old extensions are told to check the computer and confirm; recheck stays d
   const notice = agentStopFenceNotice(agent, NOW)
   assert.match(notice.detail, /该节点扩展为 0\.4\.15，不支持自动核对/u)
   assert.match(notice.detail, /最稳妥是重启 Chrome/u)
-  assert.match(notice.detail, /升级到 0\.4\.16 后系统会自动核对/u)
+  assert.match(notice.detail, /升级到 0\.4\.16 或更高版本后系统会自动核对/u)
   assert.equal(notice.canRecheck, false)
   assert.equal(notice.recheckHint, notice.detail)
   assert.equal(notice.canConfirm, true)
