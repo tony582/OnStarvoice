@@ -177,7 +177,13 @@ Admin 构建（Node 24.12.0，vite 8.0.16，`node_modules` 从 `OnStarvoice-rele
 
 ### 部署后
 
-待补（需要有权限的人执行，见「上线顺序」）。
+2026-09-26（Asia/Shanghai），发布目录 `/opt/onstarvoice-private/releases/release-hotfixes-bc4622c-20260926/`：
+
+- 上传后 `sha256sum --check local.sha256` 通过；`deploy.sh --check`：生产与 `9b836f6` + `leases.js`（`97b3765`）一致，`capture-stop-fence-release.js` 不存在，更新清单为 0.4.15，0.4.17 安装包尚未发布。
+- 11:37:23 切换并重启 PM2 `onstarvoice`，新 PID 462857（Node 18.20.8），`health/ready` 通过；脚本内置后检全部通过，公网下载 `StarVoice-extension-v0.4.17-20260926.zip` 的 sha256 为 `c82fc024…`，与发布包一致。
+- 公网复核：`/api/update-manifest` 为 0.4.17（发布日期 2026-09-26），`/admin/`、`/changelog`（含 v0.4.17）、`/api/health/ready` 均为 200。
+- 本机 `extension-build/` 已由 0.4.16 试点版同步为 0.4.17（102 个文件逐个核对），备份在 `extension-build.rollback-v0416pilot-before-bc4622c`；各 Chrome 配置需逐个重载扩展后生效。
+- 部署后的错误日志与节点心跳未能由本次执行人复核（生产日志/数据库只读查询被本地权限拦截），需补看：错误日志自 11:37 起是否有新增、在线节点心跳是否在 2 分钟内恢复。
 
 ## 上线顺序
 
