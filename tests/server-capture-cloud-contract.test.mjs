@@ -232,6 +232,7 @@ test("operator-stopped parents wait for every delivered child", () => {
   );
 
   const terminalNoticePending = {
+    task_type: "negative_post_patrol",
     status: "needs_action",
     control_task_id: "negative-request-2",
     metadata: {
@@ -274,6 +275,38 @@ test("operator-stopped parents wait for every delivered child", () => {
     operatorStoppedChildRequiresSettlement(terminalNoticeSettled),
     false,
   );
+  // Keyword children get no terminal notice: a disposition left by an elastic
+  // handoff, lease timeout or coverage skip must not hold a stopped batch.
+  for (const [taskType, status, disposition] of [
+    ["unattended_keyword_capture", "superseded", "superseded"],
+    ["unattended_keyword_capture", "failed", "revoked"],
+    ["capture", "superseded", "superseded"],
+  ]) {
+    const keywordChild = {
+      task_type: taskType,
+      status,
+      control_task_id: "keyword-request-1",
+      metadata: {attemptIdentity: "keyword-attempt-1", terminalDisposition: disposition},
+    };
+    assert.equal(
+      operatorStoppedChildRequiresSettlement(keywordChild),
+      false,
+      `${taskType} ${status} ${disposition}`,
+    );
+    assert.equal(
+      operatorStoppedChildRequiresSettlement({...keywordChild, status: "running"}),
+      true,
+      "a keyword child still running keeps the batch waiting",
+    );
+    assert.equal(
+      operatorStoppedChildRequiresSettlement({
+        ...keywordChild,
+        metadata: {...keywordChild.metadata, stopPending: true},
+      }),
+      true,
+      "a pending stop keeps the batch waiting",
+    );
+  }
 
   const firstSettledChild = {status: "canceled", metadata: {}};
   assert.equal(
@@ -328,6 +361,25 @@ test("operator stop fences failed stop commands until exact cleanup", () => {
   const heartbeatControl = readRouteSection(
     "async function claimPriorityAgentControl",
     "router.post('/agent/liveness'",
+  );
+  // The stopped parent waits for an acknowledgement only where a terminal
+  // notice is actually sent.
+  const taskTypeList = (section, alias) => {
+    const lists = [...section.matchAll(
+      new RegExp(`${alias}\\.task_type IN \\(([^)]*)\\)`, "gu"),
+    )];
+    assert.equal(lists.length, 1, `one ${alias}.task_type list`);
+    return lists[0][1].split(",").map(value => value.trim()).filter(Boolean);
+  };
+  const noticeTaskTypes = taskTypeList(heartbeatControl, "task");
+  assert.deepEqual(taskTypeList(refresh, "child"), noticeTaskTypes);
+  assert.deepEqual(
+    readRouteSection(
+      "const TERMINAL_NOTICE_TASK_TYPES = new Set([",
+      "]);",
+    ).split("\n").slice(1).map(value => value.trim().replace(/,$/u, ""))
+      .filter(Boolean),
+    noticeTaskTypes,
   );
   assert.match(
     heartbeatControl,
