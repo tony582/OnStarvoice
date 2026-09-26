@@ -3,12 +3,24 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.17',
+  latestVersion: '0.4.18',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-09-26',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.17-20260926.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.18-20260926.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.18',
+      releaseDate: '2026-09-26',
+      releaseNotes: [
+        {
+          tag: '修复',
+          notes: [
+            {title: '定向作品任务的运行页关闭后不再卡住', desc: '手机发现作品补详情、官方账号评论巡查、关注博主和关注内容巡查等定向作品任务，如果运行页在任务进行中被关闭（或被浏览器丢弃、冻结），点「停止」会由后台直接结束任务、回报服务器、关闭任务自己的页面并释放本机采集锁，不再一直停在「请求停止」；运行页被单独关闭时立即结束该任务，其余情况（例如整窗关闭、浏览器重启后）约 2 分钟后自动结束。未请求停止的任务记为需要处理，已采集的结果保留，节点随即恢复接单。运行页正常时停止行为不变，负面帖子巡查不受影响。需更新 Extension。'},
+          ],
+        },
+      ],
+    },
     {
       version: '0.4.17',
       releaseDate: '2026-09-26',

@@ -33,8 +33,9 @@ test('extension update manifest matches the packaged source version', () => {
   // refreshes a page; it may only send an exact stop to a page running nothing
   // but the old capture and close that task's own runner page. Pages opened
   // before a reload need a person.
-  const stopFenceNotes = JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases[0]?.releaseNotes);
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[0]?.version, '0.4.17');
+  const release0417 = EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.17');
+  const stopFenceNotes = JSON.stringify(release0417?.releaseNotes);
+  assert.equal(release0417?.releaseDate, '2026-09-26');
   assert.equal(EXTENSION_UPDATE_MANIFEST.releases.some(release => release.version === '0.4.16'), false);
   assert.doesNotMatch(aboutHtml, /扩展 v0\.4\.16/u);
   assert.match(
@@ -53,7 +54,7 @@ test('extension update manifest matches the packaged source version', () => {
   assert.doesNotMatch(stopFenceNotes, /刷新旧页面|自动刷新|重新加载旧页面|按时间自动放行/u);
   assert.match(
     aboutHtml,
-    /扩展 v0\.4\.17<span class="date">2026-09-26<\/span><span class="pill">最新<\/span>[\s\S]*旧采集页面停止后自动放行[\s\S]*不刷新任何页面[\s\S]*确认旧页面已停止[\s\S]*重启 Chrome[\s\S]*扩展 v0\.4\.15</u,
+    /扩展 v0\.4\.17<span class="date">2026-09-26<\/span><\/h3>[\s\S]*旧采集页面停止后自动放行[\s\S]*不刷新任何页面[\s\S]*确认旧页面已停止[\s\S]*重启 Chrome[\s\S]*扩展 v0\.4\.15</u,
   );
   assert.match(
     aboutHtml,
@@ -105,11 +106,22 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[1]?.version, '0.4.15');
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[2]?.version, '0.4.14');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[1]?.version, '0.4.17');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[2]?.version, '0.4.15');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[3]?.version, '0.4.14');
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);
+  // 0.4.18: a targeted run whose runner page is gone is settled by the background, never left pending.
+  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[0]?.version, '0.4.18');
+  assert.match(
+    JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases[0]?.releaseNotes),
+    /定向作品任务的运行页关闭后不再卡住[\s\S]*「停止」[\s\S]*回报服务器[\s\S]*释放本机采集锁[\s\S]*约 2 分钟[\s\S]*需要处理[\s\S]*负面帖子巡查不受影响/u,
+  );
+  assert.match(
+    aboutHtml,
+    /扩展 v0\.4\.18<span class="date">2026-09-26<\/span><span class="pill">最新<\/span>[\s\S]*定向作品任务的运行页关闭后不再卡住[\s\S]*扩展 v0\.4\.17</u,
+  );
 });
 
 test('extension update endpoint returns the shape consumed by the sidebar', () => {
