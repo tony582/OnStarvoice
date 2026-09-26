@@ -28,11 +28,15 @@ test('extension update manifest matches the packaged source version', () => {
     manifest.version,
   );
   assert.equal(OPS_CONTROL_RUNTIME_BASELINE_VERSION, manifest.version);
-  // 0.4.16: the stop-fence check never refreshes a page; it may only send an
-  // exact stop to a page running nothing but the old capture and close that
-  // task's own runner page. Pages opened before a reload need a person.
+  // 0.4.17 is the first public build of the stop-fence closure (0.4.16 was
+  // only loaded as a pilot and is never announced). The stop-fence check never
+  // refreshes a page; it may only send an exact stop to a page running nothing
+  // but the old capture and close that task's own runner page. Pages opened
+  // before a reload need a person.
   const stopFenceNotes = JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases[0]?.releaseNotes);
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[0]?.version, '0.4.16');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[0]?.version, '0.4.17');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.releases.some(release => release.version === '0.4.16'), false);
+  assert.doesNotMatch(aboutHtml, /扩展 v0\.4\.16/u);
   assert.match(
     stopFenceNotes,
     /旧采集页面停止后自动放行[\s\S]*核对旧页面[\s\S]*自动恢复接单[\s\S]*不刷新任何页面[\s\S]*精确停止信号[\s\S]*运行页[\s\S]*原因和需要处理的页面/u,
@@ -41,10 +45,19 @@ test('extension update manifest matches the packaged source version', () => {
     stopFenceNotes,
     /扩展重载或升级前打开的平台页面无法自动确认[\s\S]*重启 Chrome[\s\S]*关闭或刷新这些页面[\s\S]*确认旧页面已停止/u,
   );
+  // needs_action tasks blocked by the stop fence: 继续 ends with operator guidance, never retries forever.
+  assert.match(
+    stopFenceNotes,
+    /「需要处理」的任务点「继续」不再没有结果[\s\S]*执行节点[\s\S]*确认旧页面已停止[\s\S]*剩余关键词由后台交回批次/u,
+  );
   assert.doesNotMatch(stopFenceNotes, /刷新旧页面|自动刷新|重新加载旧页面|按时间自动放行/u);
   assert.match(
     aboutHtml,
-    /扩展 v0\.4\.16<span class="date">2026-09-25<\/span><span class="pill">最新<\/span>[\s\S]*旧采集页面停止后自动放行[\s\S]*不刷新任何页面[\s\S]*重启 Chrome[\s\S]*扩展 v0\.4\.15</u,
+    /扩展 v0\.4\.17<span class="date">2026-09-26<\/span><span class="pill">最新<\/span>[\s\S]*旧采集页面停止后自动放行[\s\S]*不刷新任何页面[\s\S]*确认旧页面已停止[\s\S]*重启 Chrome[\s\S]*扩展 v0\.4\.15</u,
+  );
+  assert.match(
+    aboutHtml,
+    /扩展 v0\.4\.17<[\s\S]*「需要处理」的任务点「继续」不再没有结果[\s\S]*执行节点[\s\S]*确认旧页面已停止[\s\S]*剩余关键词由后台交回批次[\s\S]*扩展 v0\.4\.15</u,
   );
   assert.doesNotMatch(
     aboutHtml.slice(0, aboutHtml.indexOf('扩展 v0.4.15<')),

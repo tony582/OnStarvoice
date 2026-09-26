@@ -3,20 +3,21 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.16',
+  latestVersion: '0.4.17',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-25',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.16-20260925.zip',
+  releaseDate: '2026-09-26',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.17-20260926.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
     {
-      version: '0.4.16',
-      releaseDate: '2026-09-25',
+      version: '0.4.17',
+      releaseDate: '2026-09-26',
       releaseNotes: [
         {
           tag: '修复',
           notes: [
             {title: '旧采集页面停止后自动放行', desc: '节点因“旧采集页面未能安全停止”暂停接单时，系统会请节点核对旧页面，确认已停止后自动恢复接单。核对不刷新任何页面，最多对仍只跑着旧采集的页面发送精确停止信号，并关闭该任务自己的运行页；核对不通过时后台会说明原因和需要处理的页面。需更新 Extension。'},
+            {title: '「需要处理」的任务点「继续」不再没有结果', desc: '因旧采集页面未能安全停止而停在「需要处理」的无人值守任务，点「继续」不再只报 checkpoint_flush_not_ready：本机已没有该任务的运行页在收尾、也没有未上报的进度时，侧栏会直接说明需到这台电脑检查旧采集页面后，在后台「执行节点」点「确认旧页面已停止」；该按钮现在也能放行这类「需要处理」的批次任务。确认后侧栏提示该任务已结束、剩余关键词由后台交回批次（弹性批次回到任务池，固定分配批次可「重试失败关键词」），本机无需继续。后台对这类任务下发的「继续」也会带说明结束，不再一直等待。需更新 Extension。'},
             {title: '扩展重载或升级前打开的平台页面无法自动确认', desc: '升级后请重启 Chrome；否则需要在该电脑关闭或刷新这些页面后由系统再核对，或由管理员在后台点「确认旧页面已停止」。'},
           ],
         },
