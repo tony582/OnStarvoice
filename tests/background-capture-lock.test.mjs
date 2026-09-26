@@ -475,6 +475,7 @@ function createHarness() {
       `  closeTerminalTargetedPostRunnerTabs,\n` +
       `  cancelTargetedPostRunFromControl,\n` +
       `  reconcileStrandedNegativePatrolCancellation,\n` +
+      `  settleTargetedPostRunWithoutRunner,\n` +
       `  stopTargetedPostAttemptResources,\n` +
       `  applyTargetedPostTerminalNotice,\n` +
       `  applyTargetedPostTerminalNotices,\n` +
@@ -4464,6 +4465,7 @@ test("running non-negative targeted workflows keep their in-flight result settle
     "official_account_comment_patrol",
     "followed_creator_post_patrol",
     "watched_content_patrol",
+    "discovered_post_capture",
   ]) {
     const harness = createHarness();
     const request = buildTargetedPostRequest({
@@ -6427,6 +6429,182 @@ test("mobile detail cleanup preserves a task page the user navigated elsewhere",
   });
   assert.deepEqual(harness.removedTabIds, []);
   assert.equal(harness.storage[TARGETED_POST_PLATFORM_TAB_KEY], undefined);
+});
+
+async function startMobileDetailRun(harness, overrides = {}) {
+  const request = buildTargetedPostRequest({
+    workflow: "discovered_post_capture",
+    runnerTabId: 81,
+    progress: {phase: "target_comments_capturing", current: 1, total: 1},
+    ...overrides,
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "mobile-detail-agent", token: "mobile-detail-token"},
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const lock = await harness.sendBackgroundMessage({
+    type: "onstarvoice:acquire-capture-lock",
+    owner: "cloud_targeted_post_capture",
+    label: "手机发现作品补详情",
+    captureTaskId: `${request.id}::${request.attemptId}`,
+    captureTaskAttemptId: request.attemptId,
+    holderId: "mobile-detail-runner",
+    holderTabId: request.runnerTabId,
+  });
+  assert.equal(lock.ok, true);
+  const opened = await harness.sendBackgroundMessage({
+    type: "onstarvoice:open-targeted-post-platform-tab",
+    requestId: request.id, attemptId: request.attemptId, url: request.targets[0].url,
+  });
+  assert.equal(opened.ok, true);
+  harness.setTabGetHandler(async (id) => ({id, url: request.targets[0].url}));
+  const runnerUrl = "chrome-extension://test/sidebar/sidebar.html" +
+    `?targetedPostRun=${request.id}&targetedPostAttempt=${request.attemptId}`;
+  const openTabs = (tabs) => async () =>
+    tabs.filter((tab) => !harness.removedTabIds.includes(tab.id));
+  return {request, platformTabId: opened.data.tabId, runnerUrl, openTabs};
+}
+
+test("a stop settles a mobile detail run whose runner page is already gone", async () => {
+  const harness = createHarness();
+  const {request, platformTabId, openTabs} = await startMobileDetailRun(harness);
+  // 09-26 西瓜: the runner shell closed mid-comments, so the stop was never answered.
+  harness.setTabQueryHandler(openTabs([{id: platformTabId, url: request.targets[0].url}]));
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:cancel-targeted-post-run",
+    requestId: request.id,
+    attemptId: request.attemptId,
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.reason, "canceled");
+  assert.equal(response.data.request.status, "canceled");
+  assert.equal(response.data.request.error.code, "TARGETED_POST_RUNNER_LOST");
+  assert.equal(response.data.cloudReported, true);
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  assert.equal(harness.cloudCommandCompletions[0].commandId, request.cloudCommandId);
+  assert.equal(harness.cloudCommandCompletions[0].success, false);
+  assert.equal(harness.cloudCommandCompletions[0].result.status, "canceled");
+  assert.deepEqual(harness.removedTabIds, [platformTabId]);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
+    (run) => run.id === `${request.id}::${request.attemptId}`,
+  );
+  assert.equal(ledgerRun.status, "canceled");
+});
+
+test("a stop settles a mobile detail run whose runner page is discarded or frozen", async () => {
+  for (const state of [{discarded: true}, {frozen: true}]) {
+    const harness = createHarness();
+    const {request, platformTabId, runnerUrl, openTabs} =
+      await startMobileDetailRun(harness);
+    harness.setTabQueryHandler(openTabs([
+      {id: request.runnerTabId, url: runnerUrl, ...state},
+      {id: platformTabId, url: request.targets[0].url},
+    ]));
+
+    const result = await harness.api.cancelTargetedPostRunFromControl(
+      request.id,
+      request.attemptId,
+    );
+
+    const label = JSON.stringify(state);
+    assert.equal(result.reason, "canceled", label);
+    assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "canceled", label);
+    assert.ok(harness.removedTabIds.includes(request.runnerTabId), label);
+    assert.ok(harness.removedTabIds.includes(platformTabId), label);
+    assert.equal(harness.storage[LOCK_KEY], undefined, label);
+    assert.equal(harness.cloudCommandCompletions.length, 1, label);
+  }
+});
+
+test("closing the runner tab of a running mobile detail run settles it as retryable needs action", async () => {
+  const harness = createHarness();
+  const {request, platformTabId, openTabs} = await startMobileDetailRun(harness, {
+    heartbeatAt: new Date().toISOString(),
+  });
+  harness.setTabQueryHandler(openTabs([{id: platformTabId, url: request.targets[0].url}]));
+
+  await harness.removeTab(request.runnerTabId);
+  await waitFor(
+    () =>
+      harness.storage[TARGETED_POST_REQUEST_KEY]?.status === "needs_action" &&
+      harness.storage[LOCK_KEY] === undefined &&
+      harness.removedTabIds.includes(platformTabId),
+    "an orphaned run settles once its runner tab closes",
+    {attempts: 200},
+  );
+
+  const settled = harness.storage[TARGETED_POST_REQUEST_KEY];
+  assert.equal(settled.error.code, "TARGETED_POST_RUNNER_LOST");
+  assert.equal(settled.error.retryable, true);
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  assert.equal(harness.cloudCommandCompletions[0].success, false);
+  assert.equal(harness.cloudCommandCompletions[0].result.status, "needs_action");
+  assert.equal(
+    harness.cloudCommandCompletions[0].result.error.code,
+    "TARGETED_POST_RUNNER_LOST",
+  );
+});
+
+test("a stop left pending by a vanished runner settles on the next state check", async () => {
+  const harness = createHarness();
+  const {request} = await startMobileDetailRun(harness, {
+    status: "cancel_requested",
+    cancelRequested: true,
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:get-targeted-post-run-state",
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.data.status, "canceled");
+  assert.equal(response.data.error.code, "TARGETED_POST_RUNNER_LOST");
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  assert.equal(harness.cloudCommandCompletions[0].commandId, request.cloudCommandId);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+});
+
+test("the runner-loss check leaves alone a run whose runner may still come back", async () => {
+  const harness = createHarness();
+  const {request, runnerUrl} = await startMobileDetailRun(harness, {
+    heartbeatAt: new Date().toISOString(),
+  });
+  harness.setTabQueryHandler(async () => []);
+
+  // A closing window may be a browser shutdown that session restore undoes.
+  for (const listener of harness.chrome.tabs.onRemoved.listeners) {
+    listener(request.runnerTabId, {isWindowClosing: true});
+  }
+  const recent = await harness.api.settleTargetedPostRunWithoutRunner();
+  assert.equal(recent.reason, "targeted_post_runner_grace");
+  assert.equal(harness.storage[TARGETED_POST_REQUEST_KEY].status, "running");
+
+  harness.storage[TARGETED_POST_REQUEST_KEY] = {
+    ...harness.storage[TARGETED_POST_REQUEST_KEY],
+    heartbeatAt: "2026-07-29T00:00:00.000Z",
+  };
+  // A runner tab still loading its page is only visible through pendingUrl.
+  harness.setTabQueryHandler(async () => [{id: 82, url: "", pendingUrl: runnerUrl}]);
+  const loading = await harness.api.settleTargetedPostRunWithoutRunner();
+  assert.equal(loading.reason, "targeted_post_runner_present");
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+
+  harness.setTabQueryHandler(async () => []);
+  const lost = await harness.api.settleTargetedPostRunWithoutRunner();
+  assert.equal(lost.settled, true);
+  assert.equal(lost.request.status, "needs_action");
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+
+  const negative = createHarness();
+  negative.storage[TARGETED_POST_REQUEST_KEY] = buildTargetedPostRequest({runnerTabId: 91});
+  negative.setTabQueryHandler(async () => []);
+  const untouched = await negative.api.settleTargetedPostRunWithoutRunner({removedTabId: 91});
+  assert.equal(untouched.reason, "targeted_post_runner_settle_not_required");
+  assert.equal(negative.storage[TARGETED_POST_REQUEST_KEY].status, "running");
 });
 
 test("targeted platform cleanup never closes a tab id that now shows unrelated content", async () => {

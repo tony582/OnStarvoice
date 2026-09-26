@@ -3801,6 +3801,10 @@ const TARGETED_POST_TERMINAL_NOTICE_ACKS_STORAGE_KEY =
   'onstarvoice.targetedPostTerminalNoticeAcks.v1';
 const TARGETED_POST_TERMINAL_NOTICE_ACKS_MAX_ENTRIES = 50;
 const TARGETED_POST_CANCEL_RELAY_TIMEOUT_MS = 1500;
+// The runner heartbeats every 20 s. A runner page missing for longer than this,
+// in a browser session older than this, is not coming back (not a session
+// restore still in flight, not a reload).
+const TARGETED_POST_RUNNER_LOSS_GRACE_MS = 2 * 60 * 1000;
 
 function normalizeTargetedPostTerminalNotice(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -6317,6 +6321,24 @@ async function cancelTargetedPostRunFromControl(requestId, attemptId = '') {
       terminalized: negativePatrol,
     };
   });
+  if (transition.accepted && transition.reason === 'cancel_requested') {
+    // The runner page settles a requested stop itself. When it is gone, or
+    // discarded or frozen so it cannot hear the stop, settle the stop here.
+    const settled = await settleTargetedPostRunWithoutRunner({
+      explicitStop: true,
+    });
+    if (settled.settled) {
+      return {
+        ...transition,
+        request: settled.request,
+        reason: settled.reason,
+        terminalized: true,
+        cleanup: settled.cleanup,
+        cloudReported: settled.cloudReported,
+      };
+    }
+    return transition;
+  }
   if (!transition.accepted || !transition.terminalized) {
     return transition;
   }
@@ -6579,6 +6601,121 @@ async function reconcileStrandedNegativePatrolCancellation() {
     reconciled: stopped.accepted === true,
     ledgerRun,
     ownership,
+  };
+}
+
+function isTargetedPostRunnerTabPresent(tab, request, {responsive = false} = {}) {
+  const matches =
+    isTargetedPostRunnerTabForAttempt(tab, request) ||
+    isTargetedPostRunnerTabForAttempt({url: tab?.pendingUrl}, request);
+  return matches && (
+    !responsive || (tab?.discarded !== true && tab?.frozen !== true)
+  );
+}
+
+// Only the runner page drives a targeted capture and settles a requested stop.
+// Once it is gone (closed tab or window, extension reload) the attempt would
+// stay running or cancel_requested forever, holding the node's lock and the
+// server task. Settle it here: canceled when a stop was requested, otherwise a
+// retryable needs_action. A stop, or the close of the recorded runner tab
+// itself, is decided at once; any other check waits out
+// TARGETED_POST_RUNNER_LOSS_GRACE_MS so a restoring or reloading runner can
+// rebind. Negative patrols keep their own outbox-fenced terminal path.
+async function settleTargetedPostRunWithoutRunner({
+  removedTabId = null,
+  explicitStop = false,
+} = {}) {
+  const transition = await runTargetedPostRunMutation(async () => {
+    const request = await readTargetedPostRunRequest({
+      persistNormalized: false,
+    });
+    const status = String(request?.status || '').trim();
+    if (
+      !request ||
+      isNegativePatrolWorkflow(request.workflow) ||
+      !['running', 'cancel_requested'].includes(status)
+    ) {
+      return {
+        settled: false,
+        reason: 'targeted_post_runner_settle_not_required',
+        request,
+      };
+    }
+    const removedRunner =
+      Number(removedTabId) > 0 &&
+      Number(removedTabId) === Number(request.runnerTabId);
+    if (!explicitStop && !removedRunner) {
+      const now = Date.now();
+      const epoch = await ensureRuntimeEpoch();
+      const lastRunnerActivityAt = Math.max(
+        0,
+        ...[request.heartbeatAt, request.startedAt, request.createdAt]
+          .map(parseTimestampMs)
+          .filter(Number.isFinite),
+      );
+      if (
+        (epoch?.known === true &&
+          now - Number(epoch.startedAt) < TARGETED_POST_RUNNER_LOSS_GRACE_MS) ||
+        now - lastRunnerActivityAt < TARGETED_POST_RUNNER_LOSS_GRACE_MS
+      ) {
+        return {settled: false, reason: 'targeted_post_runner_grace', request};
+      }
+    }
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({});
+    } catch (_error) {
+      return {
+        settled: false,
+        reason: 'targeted_post_resource_inventory_unavailable',
+        request,
+      };
+    }
+    if (
+      (Array.isArray(tabs) ? tabs : []).some((tab) =>
+        isTargetedPostRunnerTabPresent(tab, request, {
+          responsive: explicitStop,
+        }),
+      )
+    ) {
+      return {settled: false, reason: 'targeted_post_runner_present', request};
+    }
+    const canceled =
+      request.cancelRequested === true || status === 'cancel_requested';
+    const finalStatus = canceled ? 'canceled' : 'needs_action';
+    const persisted = await persistTargetedPostRunRequest(
+      cloudTargetedPostApi.mergeRunPatch(request, {
+        status: finalStatus,
+        finishedAt: new Date().toISOString(),
+        progress: {...(request.progress || {}), phase: finalStatus},
+        message: canceled
+          ? '定向作品任务已停止：运行页已不在，已保留已有结果'
+          : '定向作品任务运行页已关闭，本轮已结束，已保留已有结果',
+        error: {
+          code: 'TARGETED_POST_RUNNER_LOST',
+          message: '运行页在任务结束前关闭或无响应，已由后台结束本轮',
+          retryable: !canceled,
+        },
+      }),
+    );
+    return {
+      settled: true,
+      reason: canceled ? 'canceled' : 'targeted_post_runner_lost',
+      request: persisted,
+    };
+  });
+  if (!transition.settled) return transition;
+  const cloudReport = await reportTargetedPostTerminalToCloud(
+    transition.request,
+  );
+  const cleanup = await stopTargetedPostAttemptResources(transition.request, {
+    signalCapture: true,
+  });
+  return {
+    ...transition,
+    cloudReported: cloudReport?.ok === true,
+    cloudReport,
+    cleanup,
   };
 }
 
@@ -7401,6 +7538,10 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
     await reconcileStrandedNegativePatrolCancellation().catch((error) => {
       console.warn('[CloudTaskAgent] negative patrol cancel reconcile failed:', error);
       markDegraded('negative_patrol_cancel_reconcile_failed');
+    });
+    await settleTargetedPostRunWithoutRunner().catch((error) => {
+      console.warn('[CloudTaskAgent] targeted runner loss reconcile failed:', error);
+      markDegraded('targeted_runner_loss_reconcile_failed');
     });
     await recoverNegativePatrolTerminalOutboxCleanup().catch((error) => {
       console.warn('[CloudTaskAgent] negative patrol cleanup reconcile failed:', error);
@@ -21492,8 +21633,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   });
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   void manualKeywordDispatch.removed(tabId).catch(error => console.warn('[Manual batch] close receipt failed', error));
+  settleTargetedPostRunWithoutRunner({
+    // A closing window may be a browser shutdown that session restore undoes;
+    // that case waits for the periodic check and its grace.
+    removedTabId: removeInfo?.isWindowClosing === true ? null : tabId,
+  }).catch((error) => {
+    console.warn('[onstarvoice] targeted runner removal check failed', error);
+  });
   forgetRemovedTargetedPostPlatformTabCleanup(tabId).catch((error) => {
     console.warn('[onstarvoice] pending targeted platform tab cleanup failed', error);
   });
@@ -21788,6 +21936,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await reconcileStrandedNegativePatrolCancellation().catch((error) => {
           console.warn(
             '[Background] targeted post cancel reconcile failed:',
+            error,
+          );
+        });
+        await settleTargetedPostRunWithoutRunner().catch((error) => {
+          console.warn(
+            '[Background] targeted runner loss reconcile failed:',
             error,
           );
         });
