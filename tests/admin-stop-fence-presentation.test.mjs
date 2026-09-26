@@ -12,6 +12,8 @@ import {
   stopFencePendingTabKey,
   stopFenceEvidenceLabel,
   stopFenceReasonLabel,
+  stopFenceReleaseDispositionShort,
+  stopFenceReleaseDispositionText,
 } from '../web/admin/src/pages/dispatch/cloud-tasks/stop-fence-presentation.mjs'
 
 const NOW = Date.parse('2026-09-25T09:41:54+08:00')
@@ -423,4 +425,120 @@ test('pending tabs have one stable key per platform, evidence and title', () => 
   assert.equal(stopFencePendingTabKey(tab), stopFencePendingTabKey({...tab, reason: 'x', platformLabel: '小红书'}))
   assert.notEqual(stopFencePendingTabKey(tab), stopFencePendingTabKey({...tab, evidence: 'probe_failed'}))
   assert.equal(stopFencePendingTabKey(null), stopFencePendingTabKey({}))
+})
+
+// docs/hotfix/20260925-needs-action-fence.md：「需要处理」的批次任务由运营在「确认旧页面已停止」里一并确认。
+function releasableTask(overrides = {}) {
+  return fenceTask({id: taskId(50), status: 'needs_action', handoff_successor_task_id: null, auto_checkable: false,
+    operator_confirmable: true, release_disposition: 'return_to_pool', title: '金星 · 檐下秋意', ...overrides})
+}
+
+test('a needs_action batch child the server marks confirmable can be confirmed from the node panel', () => {
+  const notice = agentStopFenceNotice(agentWith('task_action_required', {
+    tasks: [releasableTask()], superseded_count: 0, superseded_task_ids: [],
+    operator_confirmable_task_ids: [taskId(50)], operator_confirmable_count: 1,
+  }), NOW)
+  assert.equal(notice.canConfirm, true)
+  assert.equal(notice.headline, '旧采集页面未确认停止 · 需人工确认')
+  assert.equal(notice.guidance, '到该电脑检查后点「确认旧页面已停止」')
+  assert.deepEqual(notice.confirmTaskIds, [taskId(50)])
+  assert.deepEqual(notice.releasableTasks.map(task => task.id), [taskId(50)])
+  assert.equal(notice.releasableCount, 1)
+  assert.deepEqual(notice.actionTasks, [])
+  assert.equal(notice.canRecheck, false, 'automatic checks never cover these rows')
+  assert.match(notice.recheckHint, /不能自动核对；批次任务请到该电脑检查后点「确认旧页面已停止」/u)
+  assert.match(notice.detail, /1 个批次任务停在「需要处理」，节点本机已无法继续/u)
+  assert.match(notice.detail, /checkpoint_flush_not_ready/u)
+  assert.match(notice.detail, /最稳妥是重启 Chrome/u)
+  assert.match(notice.detail, /预计：未完成关键词退回任务池，由其它节点接力/u)
+  assert.doesNotMatch(notice.detail, /升级 0\.4\.16|自动核对/u)
+  assert.equal(notice.operatorRequired, true)
+
+  // Other tasks still needing an action are counted separately.
+  const mixed = agentStopFenceNotice(agentWith('task_action_required', {
+    tasks: [releasableTask(), releasableTask({id: taskId(51), release_disposition: 'batch_retry'}),
+      fenceTask({id: taskId(52), status: 'needs_action', parent_task_id: null})],
+    superseded_count: 0, operator_confirmable_task_ids: [taskId(50), taskId(51)], operator_confirmable_count: 2,
+  }), NOW)
+  assert.deepEqual(mixed.actionTasks.map(task => task.id), [taskId(52)])
+  assert.deepEqual(mixed.confirmTaskIds, [taskId(50), taskId(51)])
+  assert.match(mixed.detail, /预计：未完成关键词退回任务池[\s\S]*；未完成关键词标为需处理/u)
+  assert.match(mixed.detail, /另有 1 个任务仍需在任务上点「继续」或「停止」/u)
+})
+
+test('without the server field the needs_action rows behave exactly as before', () => {
+  const notice = agentStopFenceNotice(agentWith('task_action_required', {
+    tasks: [releasableTask({operator_confirmable: undefined, release_disposition: undefined})], superseded_count: 0,
+  }), NOW)
+  assert.equal(notice.canConfirm, false)
+  assert.equal(notice.headline, '旧采集页面未确认停止 · 请处理该任务')
+  assert.deepEqual(notice.confirmTaskIds, [])
+  assert.deepEqual(notice.releasableTasks, [])
+  assert.equal(notice.actionTasks.length, 1)
+  assert.equal(notice.recheckHint, '该节点的停止保护来自仍需处理的任务，请在该任务上点「继续」或「停止」')
+})
+
+test('releasable ids beyond the list are sent, but never make up for missing superseded ids', () => {
+  const unlisted = agentStopFenceNotice(agentWith('task_action_required', {
+    tasks: [], task_count: 1, superseded_count: 0,
+    operator_confirmable_task_ids: [taskId(60)], operator_confirmable_count: 1,
+  }), NOW)
+  assert.equal(unlisted.canConfirm, true)
+  assert.deepEqual(unlisted.confirmTaskIds, [taskId(60)])
+  assert.equal(unlisted.unlistedReleasableCount, 1)
+  assert.match(unlisted.detail, /预计：未完成关键词按批次分配方式交回/u)
+  const found = findExecutionStopFence(taskId(60), [agentWith('task_action_required', {
+    tasks: [], operator_confirmable_task_ids: [taskId(60)]})])
+  assert.equal(found?.task.operator_confirmable, true, 'an unlisted releasable child still marks its execution')
+
+  // Two superseded fences but only one id reachable: the releasable id must not fill the gap.
+  const incomplete = agentStopFenceNotice(agentWith('awaiting_node', {
+    tasks: [fenceTask({id: taskId(1)}), releasableTask()],
+    superseded_count: 2, superseded_task_ids: [taskId(1)],
+    operator_confirmable_task_ids: [taskId(50)], operator_confirmable_count: 1,
+  }), NOW)
+  assert.equal(incomplete.confirmTaskIds.length, 2)
+  assert.equal(incomplete.canConfirm, false)
+  assert.match(incomplete.confirmHint, /共有 2 个已转交任务，本页只拿到其中 1 个/u)
+  const complete = agentStopFenceNotice(agentWith('awaiting_node', {
+    tasks: [fenceTask({id: taskId(1)}), releasableTask()],
+    superseded_count: 1, superseded_task_ids: [taskId(1)],
+    operator_confirmable_task_ids: [taskId(50)], operator_confirmable_count: 1,
+  }), NOW)
+  assert.equal(complete.canConfirm, true)
+  assert.deepEqual(complete.confirmTaskIds, [taskId(1), taskId(50)])
+})
+
+test('a releasable child appearing after the dialog opened counts as a change', () => {
+  const snapshot = agentStopFenceNotice(agentWith('task_action_required', {
+    tasks: [releasableTask()], superseded_count: 0, operator_confirmable_task_ids: [taskId(50)],
+  }), NOW)
+  const same = agentStopFenceNotice(agentWith('task_action_required', {
+    tasks: [releasableTask()], superseded_count: 0, operator_confirmable_task_ids: [taskId(50)],
+  }), NOW)
+  assert.equal(stopFenceConfirmDrift(snapshot, same), '')
+  const grown = agentStopFenceNotice(agentWith('task_action_required', {
+    tasks: [releasableTask(), releasableTask({id: taskId(51)})], superseded_count: 0,
+    operator_confirmable_task_ids: [taskId(50), taskId(51)],
+  }), NOW)
+  assert.match(stopFenceConfirmDrift(snapshot, grown), /待确认任务有变化/u)
+})
+
+test('every expected destination has a full and a short label', () => {
+  const expected = {
+    return_to_pool: ['未完成关键词退回任务池，由其它节点接力（已达接力上限的改为可在批次里重试）', '退回任务池'],
+    batch_retry: ['未完成关键词标为需处理，可在批次里「重试失败关键词」', '可在批次重试'],
+    parent_stopped: ['所在批次已停止，关键词已取消，确认只解除停止保护', '批次已停止'],
+    unknown: ['未完成关键词按批次分配方式交回', '按批次分配方式交回'],
+  }
+  for (const [code, [text, short]] of Object.entries(expected)) {
+    assert.equal(stopFenceReleaseDispositionText(code), text, code)
+    assert.equal(stopFenceReleaseDispositionShort(code), short, code)
+  }
+  assert.equal(stopFenceReleaseDispositionText('something_new'), expected.unknown[0])
+  assert.equal(stopFenceReleaseDispositionShort(null), expected.unknown[1])
+  const stopped = agentStopFenceNotice(agentWith('task_action_required', {
+    tasks: [releasableTask({release_disposition: 'parent_stopped'})], superseded_count: 0,
+  }), NOW)
+  assert.match(stopped.detail, /预计：所在批次已停止，关键词已取消，确认只解除停止保护/u)
 })

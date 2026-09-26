@@ -71,6 +71,24 @@ export const STOP_FENCE_TENANT_LISTING_LIMIT = 5000;
 // 45 s sweep just as the round aged out). Accept it for five more minutes.
 export const STOP_FENCE_RECEIPT_GRACE_MS = 5 * 60 * 1000;
 export const STOP_FENCE_CONFIRMATION_TEXT = '确认旧页面已停止';
+// docs/hotfix/20260925-needs-action-fence.md: a batch child that the Extension
+// left in needs_action with the fence code can never be resumed or skipped on
+// the node (its local flush marker cannot appear). An operator confirmation
+// ends it as `superseded` and hands its unfinished work items back to the
+// batch with this code, which is not a fence code.
+export const STOP_FENCE_OPERATOR_RELEASED_ITEM_CODE = 'PREVIOUS_CAPTURE_STOP_OPERATOR_RELEASED';
+export const STOP_FENCE_OPERATOR_RELEASED_REASON = 'stop_fence_operator_released';
+// Same set as ORCHESTRATION_PARENT_TERMINAL_STATUSES in routes/capture-cloud.js
+// (a unit test pins it against orchestrationParentAcceptsProjection).
+export const STOP_FENCE_PARENT_TERMINAL_STATUSES = Object.freeze([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+  'superseded',
+]);
 
 export const STOP_FENCE_PHASES = Object.freeze([
   'task_action_required',
@@ -93,7 +111,7 @@ export const STOP_FENCE_OPERATOR_PHASES = Object.freeze([
   'task_action_required',
 ]);
 export const STOP_FENCE_PHASE_LABELS = Object.freeze({
-  task_action_required: '停止保护来自仍需处理的任务，请在任务或批次里点「继续」或「停止」',
+  task_action_required: '停止保护来自仍需处理的任务：批次任务请到该电脑检查后在「执行节点」点「确认旧页面已停止」，其它任务在任务上点「继续」或「停止」',
   manual_only: '扩展版本不支持自动核对或任务无法定位本机记录，请到该电脑检查后点「确认旧页面已停止」',
   auto_check_disabled: '自动核对已在服务端关闭，请到该电脑检查后点「确认旧页面已停止」',
   offline: '节点离线，上线后自动核对',
@@ -205,6 +223,91 @@ export function stopFenceReasonLabel(reason) {
 
 export function stopFencePhaseLabel(phase) {
   return STOP_FENCE_PHASE_LABELS[text(phase, 80)] || '旧采集页面尚未确认停止';
+}
+
+/**
+ * A fence row an operator may release although it is not superseded: a batch
+ * child in needs_action. The fence code, no recoveryTaskId and "not a parent"
+ * are already guaranteed by listCaptureAgentStopFences. Root tasks can still
+ * be resumed or stopped on the node; resume_requested/failed/interrupted rows
+ * keep their current handling.
+ */
+export function stopFenceOperatorReleasable(row) {
+  return row?.kind === 'fence' &&
+    row.status === 'needs_action' &&
+    Boolean(row.parent_task_id) &&
+    row.task_type === 'unattended_keyword_capture';
+}
+
+function stopFenceParentStopped(parent) {
+  return STOP_FENCE_PARENT_TERMINAL_STATUSES.includes(text(parent?.status, 80)) ||
+    parent?.operatorStopped === true ||
+    parent?.operatorStopped === 'true';
+}
+
+/**
+ * Where the unfinished work of a releasable row is expected to go, from the
+ * PARENT (the same source the projection uses; a child adopted by a local
+ * recovery does not keep cloudWorkQueue/distributionMode). Display only: the
+ * receipt, events and audit follow the actual projection.
+ */
+export function stopFenceReleaseDisposition(row) {
+  const parent = object(row?.parent_state);
+  if (!text(parent.status, 80)) return 'unknown';
+  if (stopFenceParentStopped(parent)) return 'parent_stopped';
+  if (parent.distributionMode === 'elastic_pool') return 'return_to_pool';
+  return 'batch_retry';
+}
+
+/**
+ * The actual outcome of one needs_action release, from the work items the
+ * projection changed (grouped by status) and the parent as it was before the
+ * projection.
+ */
+export function stopFenceReleaseItemOutcome(statusCounts = [], parentBefore = null) {
+  const counts = {retryable: 0, failed: 0, needsAction: 0};
+  for (const row of Array.isArray(statusCounts) ? statusCounts : []) {
+    const count = Math.max(0, Number(row?.count) || 0);
+    if (row?.status === 'retryable') counts.retryable += count;
+    else if (row?.status === 'failed') counts.failed += count;
+    else if (row?.status === 'needs_action') counts.needsAction += count;
+  }
+  const parentMetadata = object(parentBefore?.metadata);
+  const distributionMode = text(parentMetadata.distributionMode, 80);
+  const operatorStopped = parentMetadata.operatorStopped === true ||
+    parentMetadata.operatorStopped === 'true';
+  const elastic = distributionMode === 'elastic_pool';
+  let kind = 'none';
+  if (counts.retryable > 0) kind = 'returned_to_pool';
+  else if (elastic && counts.failed + counts.needsAction > 0) kind = 'retry_exhausted';
+  else if (!elastic && counts.needsAction + counts.failed > 0) kind = 'batch_retry';
+  return {
+    kind,
+    ...counts,
+    parentStatus: text(parentBefore?.status, 80),
+    operatorStopped,
+    distributionMode,
+    parentStopped: kind === 'none' && Boolean(parentBefore) && stopFenceParentStopped({
+      status: parentBefore.status,
+      operatorStopped,
+    }),
+  };
+}
+
+/** One sentence for the child message and event, from the actual outcome. */
+export function stopFenceReleaseOutcomeSentence(outcome) {
+  switch (object(outcome).kind) {
+    case 'returned_to_pool':
+      return '未完成关键词已退回任务池，由其它节点接力';
+    case 'retry_exhausted':
+      return '关键词已达自动接力上限，可在批次里点「重试失败关键词」';
+    case 'batch_retry':
+      return '未完成关键词已标为需处理，可在批次里点「重试失败关键词」';
+    default:
+      return object(outcome).parentStopped
+        ? '批次已停止，未完成关键词已随批次取消，本次只解除停止保护'
+        : '没有需要交回的未完成关键词，本次只解除停止保护';
+  }
 }
 
 /**
@@ -427,7 +530,19 @@ function stopFenceRowSelect(alias) {
       NULLIF(${alias}.metadata->>'attemptIdentity', ''),
       ''
     ) AS attempt_id,
-    ${alias}.metadata->'stopFenceCheck' AS stop_fence_check`;
+    ${alias}.metadata->'stopFenceCheck' AS stop_fence_check,
+    ${alias}.task_type,
+    -- Only for needs_action batch children (operator-releasable candidates):
+    -- one primary-key read of the parent. The heartbeat claim lists only
+    -- superseded rows and never evaluates it.
+    CASE WHEN ${alias}.status = 'needs_action' AND ${alias}.parent_task_id IS NOT NULL THEN (
+      SELECT jsonb_build_object(
+        'status', parent.status,
+        'distributionMode', parent.metadata->>'distributionMode',
+        'operatorStopped', parent.metadata->>'operatorStopped')
+      FROM capture_tasks parent
+      WHERE parent.tenant_id = ${alias}.tenant_id AND parent.id = ${alias}.parent_task_id
+    ) END AS parent_state`;
 }
 
 const LATEST_ATTEMPT_JOIN = (alias) => `
@@ -730,6 +845,7 @@ export function summarizeAgentStopFence(agentRow = {}, rows = [], {
   if (fences.length === 0 && releases.length === 0) return null;
   const superseded = fences.filter(row => row.status === 'superseded');
   const actionRequired = fences.filter(row => row.status !== 'superseded');
+  const operatorConfirmable = actionRequired.filter(stopFenceOperatorReleasable);
   const manualOnly = superseded.filter(row => !text(row.request_id, 240));
   const checkable = superseded.filter(row => text(row.request_id, 240));
   const autoCheckSupported = agentAutoCheckSupported(agentRow);
@@ -779,9 +895,15 @@ export function summarizeAgentStopFence(agentRow = {}, rows = [], {
     // Every superseded fence of this node, not cut by the 20-row task list:
     // the confirm route refuses unless the operator sends all of them.
     superseded_task_ids: superseded.map(row => String(row.id)),
+    // Every needs_action batch child the operator may release with the same
+    // confirmation (not cut by the 20-row list either). The phase stays
+    // task_action_required: these still need a person.
+    operator_confirmable_task_ids: operatorConfirmable.map(row => String(row.id)),
+    operator_confirmable_count: operatorConfirmable.length,
     tasks: fences.slice(0, 20).map(row => {
       const error = object(row.error);
       const autoCheckable = row.status === 'superseded' && Boolean(text(row.request_id, 240));
+      const confirmable = stopFenceOperatorReleasable(row);
       // Only rows that still hold the node are listed; rows already released
       // and waiting for the node's local lock release are only counted.
       return {
@@ -796,6 +918,8 @@ export function summarizeAgentStopFence(agentRow = {}, rows = [], {
         handoff_successor_task_id: row.handoff_successor_task_id || null,
         auto_checkable: autoCheckable,
         check: autoCheckable ? publicCheck(readStopFenceCheckState(row.stop_fence_check)) : null,
+        operator_confirmable: confirmable,
+        release_disposition: confirmable ? stopFenceReleaseDisposition(row) : null,
       };
     }),
   };
@@ -816,7 +940,7 @@ export function attachAgentStopFences(agents = [], rows = [], options = {}) {
   }));
 }
 
-async function appendStopFenceEvent(tx, {
+export async function appendStopFenceEvent(tx, {
   tenantId,
   taskId,
   agentId = null,
@@ -1010,7 +1134,7 @@ export async function recordStopFenceCheckResult(tx, {
   return next;
 }
 
-async function enqueueStopFenceReleaseWakeup(tx, {tenantId, agentId}) {
+export async function enqueueStopFenceReleaseWakeup(tx, {tenantId, agentId}) {
   // Changing only the error code does not fire 074's slot-release trigger.
   // Mirror that trigger (074:720-736) so waiting recovery intents re-plan.
   await tx.execute(`
@@ -1033,11 +1157,68 @@ async function enqueueStopFenceReleaseWakeup(tx, {tenantId, agentId}) {
   `, [tenantId, agentId]);
 }
 
-const RECONCILED_EVENT_MESSAGES = Object.freeze({
+export const RECONCILED_EVENT_MESSAGES = Object.freeze({
   agent_confirmed: () => '节点已确认旧采集页面已停止，解除停止保护',
   operator_confirmed: actorName => `${actorName || '管理员'} 人工确认旧采集页面已停止，解除停止保护`,
   completed: () => '该节点此后已在同平台完成采集，按既有规则确认旧页面已停止',
 });
+
+/**
+ * The release record both release paths write, field for field: the
+ * historicalStopFenceReconciliation object and the resolved stopFenceCheck
+ * (with a pending local release for a 0.4.16 node that can locate the row).
+ */
+export function buildStopFenceReleaseRecord(row, {
+  current,
+  reason,
+  proofStatus,
+  requestedBy = '',
+  agentId,
+  checkId = '',
+  evidence = null,
+  note = '',
+  actorId = '',
+  requestLocalRelease = false,
+  extra = {},
+}) {
+  const at = new Date(current).toISOString();
+  const originalError = object(row.error);
+  const requestId = text(row.control_task_id, 240) || text(row.client_task_id, 240);
+  const reconciliation = {
+    at,
+    reason: text(reason, 120),
+    proofStatus,
+    requestedBy: text(requestedBy, 240),
+    originalError,
+    agentId,
+    checkId: text(checkId, 100),
+    requestId,
+    evidence: evidence || null,
+    note: text(note, 200),
+    actorId: text(actorId, 240),
+    ...extra,
+  };
+  const previousCheck = readStopFenceCheckState(object(row.metadata).stopFenceCheck) || {};
+  const check = {
+    ...previousCheck,
+    resolvedAt: at,
+    resolution: proofStatus,
+    // Only a row the node can locate by request id can be released locally;
+    // a release it could never be offered would stay pending forever.
+    ...(requestLocalRelease && requestId
+      ? {localRelease: {
+          checkId: crypto.randomUUID(),
+          state: 'pending',
+          requestedAt: at,
+          expiresAt: new Date(current + STOP_FENCE_LOCAL_RELEASE_TTL_MS).toISOString(),
+          lastOfferedAt: null,
+          nextIssueAt: null,
+          lastResult: null,
+        }}
+      : {}),
+  };
+  return {originalError, requestId, reconciliation, check};
+}
 
 /**
  * Release fenced rows in the 2026-09-24/25 manual format. Only superseded
@@ -1068,7 +1249,6 @@ export async function reconcileCaptureTaskStopFences(tx, {
   const scopedAgentId = text(agentId, 100).toLowerCase();
   if (ids.length === 0 || !scopedTenantId || !UUID.test(scopedAgentId)) return [];
   const current = nowMs(now);
-  const at = new Date(current).toISOString();
   const rows = await tx.queryAll(`
     SELECT id, error, metadata, client_task_id, control_task_id
     FROM capture_tasks
@@ -1082,40 +1262,18 @@ export async function reconcileCaptureTaskStopFences(tx, {
   `, [scopedTenantId, ids, scopedAgentId]);
   const released = [];
   for (const row of rows) {
-    const originalError = object(row.error);
-    const requestId = text(row.control_task_id, 240) || text(row.client_task_id, 240);
-    const reconciliation = {
-      at,
-      reason: text(reason, 120),
+    const {originalError, reconciliation, check} = buildStopFenceReleaseRecord(row, {
+      current,
+      reason,
       proofStatus,
-      requestedBy: text(requestedBy, 240),
-      originalError,
+      requestedBy,
       agentId: scopedAgentId,
-      checkId: text(checkId, 100),
-      requestId,
-      evidence: evidence || null,
-      note: text(note, 200),
-      actorId: text(actorId, 240),
-    };
-    const previousCheck = readStopFenceCheckState(object(row.metadata).stopFenceCheck) || {};
-    const check = {
-      ...previousCheck,
-      resolvedAt: at,
-      resolution: proofStatus,
-      // Only a row the node can locate by request id can be released locally;
-      // a release it could never be offered would stay pending forever.
-      ...(requestLocalRelease && requestId
-        ? {localRelease: {
-            checkId: crypto.randomUUID(),
-            state: 'pending',
-            requestedAt: at,
-            expiresAt: new Date(current + STOP_FENCE_LOCAL_RELEASE_TTL_MS).toISOString(),
-            lastOfferedAt: null,
-            nextIssueAt: null,
-            lastResult: null,
-          }}
-        : {}),
-    };
+      checkId,
+      evidence,
+      note,
+      actorId,
+      requestLocalRelease,
+    });
     const updated = await tx.queryOne(`
       UPDATE capture_tasks
       SET error = COALESCE(error, '{}'::jsonb) || jsonb_build_object(

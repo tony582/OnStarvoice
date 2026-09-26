@@ -2167,7 +2167,9 @@ export function OrchestrationDetailWorkspace({
                                   该节点暂不接单（{[
                                     stopFence.task.fenced_at ? `自 ${formatStopFenceTime(stopFence.task.fenced_at)}` : '',
                                     Number.isFinite(stopFenceSince) ? formatStopFenceElapsed(nowMs - stopFenceSince) : '',
-                                  ].filter(Boolean).join('，') || '旧采集页面未确认停止'}），请在「执行节点」中处理
+                                  ].filter(Boolean).join('，') || '旧采集页面未确认停止'}），{stopFence.task.operator_confirmable === true
+                                    ? '请在「执行节点」中点「确认旧页面已停止」'
+                                    : '请在「执行节点」中处理'}
                                 </p>
                               )}
                                 </>

@@ -58,6 +58,41 @@ const PHASE_COPY = {
   },
 }
 
+// 批次任务停在「需要处理」且带停止保护时，节点本机「继续」永远失败（checkpoint_flush_not_ready），
+// 只能由运营到现场检查后在这里人工确认（服务端 stop_fence.operator_confirmable_task_ids）。phase 仍是 task_action_required。
+const RELEASABLE_COPY = {
+  headline: '需人工确认',
+  guidance: '到该电脑检查后点「确认旧页面已停止」',
+}
+const RELEASABLE_RECHECK_HINT = '该节点的停止保护来自仍需处理的任务，不能自动核对；批次任务请到该电脑检查后点「确认旧页面已停止」'
+
+// 放行前的预计去向（服务端 release_disposition，依据父批次）；实际结果以确认后的回执为准。
+const RELEASE_DISPOSITION_TEXT = {
+  return_to_pool: '未完成关键词退回任务池，由其它节点接力（已达接力上限的改为可在批次里重试）',
+  batch_retry: '未完成关键词标为需处理，可在批次里「重试失败关键词」',
+  parent_stopped: '所在批次已停止，关键词已取消，确认只解除停止保护',
+  unknown: '未完成关键词按批次分配方式交回',
+}
+const RELEASE_DISPOSITION_SHORT = {
+  return_to_pool: '退回任务池',
+  batch_retry: '可在批次重试',
+  parent_stopped: '批次已停止',
+  unknown: '按批次分配方式交回',
+}
+
+function dispositionCode(value) {
+  const code = textValue(value)
+  return code in RELEASE_DISPOSITION_TEXT ? code : 'unknown'
+}
+
+export function stopFenceReleaseDispositionText(disposition) {
+  return RELEASE_DISPOSITION_TEXT[dispositionCode(disposition)]
+}
+
+export function stopFenceReleaseDispositionShort(disposition) {
+  return RELEASE_DISPOSITION_SHORT[dispositionCode(disposition)]
+}
+
 // 人工确认后，0.4.16 节点要先释放绑定旧任务的本机执行锁，服务端在此之前暂不给它派新采集
 // （stop_fence.local_release_holds_new_work，与心跳用同一判定）。这时不能说「不影响派发」。
 const LOCAL_RELEASE_HOLD_GUIDANCE = '节点释放本机执行锁后开始接单'
@@ -188,18 +223,28 @@ function fenceTasks(stopFence) {
 
 // 人工确认要带上该节点当前全部已转交围栏的 id：确认接口只要发现有没带上的已转交围栏就返回 409（agent_stop_fence_changed）。
 // tasks 每个节点最多列 20 条且和仍需处理的任务混排，所以并上服务端给的完整 superseded_task_ids（同一次 /overview 快照）。
-function confirmTaskIdsFrom(stopFence, supersededTasks) {
+function uniqueIds(values) {
   const ids = []
   const seen = new Set()
-  const listedIds = supersededTasks.map(task => task.id)
-  const serverIds = Array.isArray(stopFence.superseded_task_ids) ? stopFence.superseded_task_ids : []
-  for (const value of [...listedIds, ...serverIds]) {
+  for (const value of values) {
     const id = textValue(value)
     if (!id || seen.has(id.toLowerCase())) continue
     seen.add(id.toLowerCase())
     ids.push(id)
   }
   return ids
+}
+
+function confirmTaskIdsFrom(stopFence, supersededTasks) {
+  const serverIds = Array.isArray(stopFence.superseded_task_ids) ? stopFence.superseded_task_ids : []
+  return uniqueIds([...supersededTasks.map(task => task.id), ...serverIds])
+}
+
+// 可人工放行的「需要处理」批次任务：列出的并上服务端完整的 operator_confirmable_task_ids。
+// 只认服务端字段，不按状态自行推断（服务端没给这个字段时，行为与之前完全一样）。
+function releasableTaskIdsFrom(stopFence, releasableTasks) {
+  const serverIds = Array.isArray(stopFence.operator_confirmable_task_ids) ? stopFence.operator_confirmable_task_ids : []
+  return uniqueIds([...releasableTasks.map(task => task.id), ...serverIds])
 }
 
 function countValue(value) {
@@ -231,6 +276,10 @@ export function findExecutionStopFence(executionId, agents) {
     const serverIds = Array.isArray(stopFence.superseded_task_ids) ? stopFence.superseded_task_ids : []
     if (serverIds.some(value => textValue(value).toLowerCase() === id.toLowerCase())) {
       return { agent, task: { id, kind: 'fence', status: 'superseded' } }
+    }
+    const releasableIds = Array.isArray(stopFence.operator_confirmable_task_ids) ? stopFence.operator_confirmable_task_ids : []
+    if (releasableIds.some(value => textValue(value).toLowerCase() === id.toLowerCase())) {
+      return { agent, task: { id, kind: 'fence', status: 'needs_action', operator_confirmable: true } }
     }
   }
   return null
@@ -277,12 +326,26 @@ function primaryCheck(tasks) {
     || {}
 }
 
-function phaseDetail(phase, { agent, stopFence, supersededCount, actionTasks, manualOnlyTasks, check }) {
+// 可放行任务的预计去向：按列出的任务的 release_disposition，几种都有时各写一句。
+function releasableDispositionSummary(releasableTasks) {
+  const codes = uniqueIds(releasableTasks.map(task => dispositionCode(task.release_disposition)))
+  return (codes.length > 0 ? codes : ['unknown']).map(code => RELEASE_DISPOSITION_TEXT[code]).join('；')
+}
+
+function releasableDetail({ releasableCount, releasableTasks, actionTasks }) {
+  const others = actionTasks.length > 0 ? `；另有 ${actionTasks.length} 个任务仍需在任务上点「继续」或「停止」` : ''
+  return `${releasableCount} 个批次任务停在「需要处理」，节点本机已无法继续（节点侧栏点「继续」会报 checkpoint_flush_not_ready，或提示到后台处理）；`
+    + '请到这台电脑检查：关闭或刷新所有小红书、抖音、微博采集页（旧版本扩展最稳妥是重启 Chrome）后，点「确认旧页面已停止」。'
+    + `确认后这些任务结束，预计：${releasableDispositionSummary(releasableTasks)}${others}`
+}
+
+function phaseDetail(phase, { agent, stopFence, supersededCount, actionTasks, manualOnlyTasks, check, releasableCount, releasableTasks }) {
   const lastResult = objectValue(check.last_result)
   const reasonLabel = stopFenceReasonLabel(lastResult.reason) || textValue(lastResult.message)
   const failureCount = Math.max(0, Math.floor(Number(check.failure_count) || 0))
   switch (phase) {
     case 'task_action_required':
+      if (releasableCount > 0) return releasableDetail({ releasableCount, releasableTasks, actionTasks })
       return `${actionTasks.length || Number(stopFence.action_required_count) || 1} 个旧任务仍待处理；停止或接力后本节点即可继续接单或进入自动核对`
     case 'manual_only':
       if (stopFence.auto_check_supported !== true) {
@@ -317,7 +380,7 @@ function phaseDetail(phase, { agent, stopFence, supersededCount, actionTasks, ma
   }
 }
 
-function recheckState(phase, stopFence, agent) {
+function recheckState(phase, stopFence, agent, releasableCount = 0) {
   if (phase === 'manual_only') {
     return {
       canRecheck: false,
@@ -333,7 +396,12 @@ function recheckState(phase, stopFence, agent) {
     return { canRecheck: false, recheckHint: '已请求节点核对，等待节点返回结果' }
   }
   if (phase === 'task_action_required') {
-    return { canRecheck: false, recheckHint: '该节点的停止保护来自仍需处理的任务，请在该任务上点「继续」或「停止」' }
+    return {
+      canRecheck: false,
+      recheckHint: releasableCount > 0
+        ? RELEASABLE_RECHECK_HINT
+        : '该节点的停止保护来自仍需处理的任务，请在该任务上点「继续」或「停止」',
+    }
   }
   if (phase === 'local_release_pending') {
     return { canRecheck: false, recheckHint: '已人工确认，无需再核对' }
@@ -351,12 +419,19 @@ export function agentStopFenceNotice(agent, now = Date.now()) {
   if (!phase) return null
   const tasks = fenceTasks(stopFence)
   const supersededTasks = tasks.filter(task => task.status === 'superseded')
-  const actionTasks = tasks.filter(task => task.status !== 'superseded')
+  // 「需要处理」的批次任务：服务端标了 operator_confirmable 的可一并人工确认，其余仍要在任务上继续或停止。
+  const releasableTasks = tasks.filter(task => task.status !== 'superseded' && task.operator_confirmable === true)
+  const actionTasks = tasks.filter(task => task.status !== 'superseded' && task.operator_confirmable !== true)
   const manualOnlyTasks = supersededTasks.filter(task => task.auto_checkable === false)
-  const confirmTaskIds = confirmTaskIdsFrom(stopFence, supersededTasks)
+  const supersededConfirmIds = confirmTaskIdsFrom(stopFence, supersededTasks)
+  const releasableIds = releasableTaskIdsFrom(stopFence, releasableTasks)
+  const confirmTaskIds = uniqueIds([...supersededConfirmIds, ...releasableIds])
   // 以服务端计数为准：列表截断时，已转交的围栏可能一条都没列出来。
-  const supersededCount = Math.max(countValue(stopFence.superseded_count), confirmTaskIds.length)
-  const copy = PHASE_COPY[phase] || { headline: '等待确认', guidance: '' }
+  const supersededCount = Math.max(countValue(stopFence.superseded_count), supersededConfirmIds.length)
+  const releasableCount = Math.max(countValue(stopFence.operator_confirmable_count), releasableIds.length)
+  const copy = phase === 'task_action_required' && releasableCount > 0
+    ? RELEASABLE_COPY
+    : PHASE_COPY[phase] || { headline: '等待确认', guidance: '' }
   const check = primaryCheck(supersededTasks.length > 0 ? supersededTasks : tasks)
   const since = timeValue(stopFence.since)
     ?? tasks.map(task => timeValue(task.fenced_at)).filter(value => value !== null).sort((a, b) => a - b)[0]
@@ -366,13 +441,16 @@ export function agentStopFenceNotice(agent, now = Date.now()) {
   const holdsNewWork = !blocking && stopFence.local_release_holds_new_work === true
   const elapsedLabel = since === null ? '' : formatStopFenceElapsed(Number(now) - since)
   const operatorRequired = OPERATOR_PHASES.has(phase)
-  const { canRecheck, recheckHint } = recheckState(phase, stopFence, agent)
+  const { canRecheck, recheckHint } = recheckState(phase, stopFence, agent, releasableCount)
   // 拿不全已转交围栏的 id（例如服务端没给 superseded_task_ids 而列表又被截断）时不让确认：发出去必然被确认接口 409 拒绝。
-  const confirmIdsComplete = confirmTaskIds.length >= supersededCount
+  // 只比已转交部分：并上可放行的 id 后总数够了，也不能掩盖缺失的已转交 id。
+  const confirmIdsComplete = supersededConfirmIds.length >= supersededCount
   return {
     phase,
     headline: blocking ? `${HEADLINE_PREFIX}${copy.headline}` : copy.headline,
-    detail: phaseDetail(phase, { agent, stopFence, supersededCount, actionTasks, manualOnlyTasks, check }),
+    detail: phaseDetail(phase, {
+      agent, stopFence, supersededCount, actionTasks, manualOnlyTasks, check, releasableCount, releasableTasks,
+    }),
     guidance: holdsNewWork ? LOCAL_RELEASE_HOLD_GUIDANCE : copy.guidance,
     sinceLabel: since === null ? '' : formatStopFenceTime(since),
     elapsedLabel,
@@ -380,15 +458,18 @@ export function agentStopFenceNotice(agent, now = Date.now()) {
     canRecheck,
     recheckHint,
     recheckLabel: phase === 'offline' ? '节点上线后核对' : '让节点重新核对',
-    // 人工确认只放行已转交（superseded）的围栏；仍需处理的任务要在任务上继续或停止。
-    canConfirm: blocking && supersededCount > 0 && confirmIdsComplete,
+    // 人工确认放行已转交（superseded）的围栏，以及服务端标为可放行的「需要处理」批次任务；其余仍需处理的任务要在任务上继续或停止。
+    canConfirm: blocking && (supersededCount > 0 || releasableCount > 0) && confirmIdsComplete,
     confirmHint: blocking && supersededCount > 0 && !confirmIdsComplete
-      ? `该节点共有 ${supersededCount} 个已转交任务，本页只拿到其中 ${confirmTaskIds.length} 个，暂不能在此确认；请刷新后重试，仍不行请联系技术人员`
+      ? `该节点共有 ${supersededCount} 个已转交任务，本页只拿到其中 ${supersededConfirmIds.length} 个，暂不能在此确认；请刷新后重试，仍不行请联系技术人员`
       : '',
     confirmTaskIds,
     supersededCount,
     unlistedSupersededCount: Math.max(0, supersededCount - supersededTasks.length),
     supersededTasks,
+    releasableTasks,
+    releasableCount,
+    unlistedReleasableCount: Math.max(0, releasableCount - releasableTasks.length),
     actionTasks,
     manualOnlyTasks,
     blocking,

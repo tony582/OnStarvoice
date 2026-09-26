@@ -529,6 +529,10 @@ function createHarness() {
       `  reloadTabAndWaitForDocumentReplacement,\n` +
       `  reconcileUnattendedLocalClosureEvidence,\n` +
       `  finalizeTerminalUnattendedAttemptExact,\n` +
+      `  inspectUnattendedCheckpointOutboxAttempt,\n` +
+      `  registerInFlightContentRelay,\n` +
+      `  clearInFlightContentRelay: (key) => inFlightContentRelays.delete(key),\n` +
+      `  listRequestRelays,\n` +
       `  flush: () => captureExecutionLockOperationQueue,\n` +
       `  flushRuntime: () => runtimeMutationQueue,\n` +
       `  flushUnattended: () => unattendedRunMutationQueue,\n` +
@@ -1879,6 +1883,784 @@ test("manual orchestration recovery stays dormant when another agent wins adopti
   assert.equal(
     harness.cloudCommandCompletions[0].result.reason,
     "recovery_adoption_rejected",
+  );
+});
+
+// ==================== 孤儿围栏轮次（needs_action 停止保护 hotfix） ====================
+// 现场（金星 1363ff0e）：批次子任务 R 的自动恢复新建了轮次 A2，停止旧页面失败后
+// A2 直接以 PREVIOUS_CAPTURE_STOP_UNCONFIRMED 收尾，从未被 runner 认领，所以
+// (R, A2) 的 flush 标记不会出现。本机锁仍绑定 R，持有文档是 A1 的 runner。
+// 这些用例都不写 flush 标记。
+
+const ORPHAN_REQUEST_ID = "orphan-fence-request";
+const ORPHAN_TASK_KEY = `unattended-capture:${ORPHAN_REQUEST_ID}`;
+const ORPHAN_ATTEMPT_ID = "orphan-attempt-2";
+const ORPHAN_PREVIOUS_ATTEMPT_ID = "orphan-attempt-1";
+const ORPHAN_FENCE_MESSAGE =
+  "旧采集页面未能安全停止，已阻止自动恢复；请人工检查页面后从任务中心继续";
+const UNATTENDED_FINAL_FLUSH_INTENT_PREFIX =
+  "onstarvoice.unattendedFinalFlushIntent.v1.";
+
+function orphanRunnerUrl(attemptId = "") {
+  return (
+    "chrome-extension://test/sidebar/sidebar.html" +
+    `?unattendedRun=${ORPHAN_REQUEST_ID}` +
+    (attemptId ? `&unattendedAttempt=${attemptId}` : "")
+  );
+}
+
+function jsonPlain(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+// 默认是“证据干净”的形状：R 的 runner、平台页都已不在；锁仍绑定 R，但持有
+// 文档已不在（contextMode gone）；没有中继、outbox、flush 意图。
+function seedOrphanedStopFenceAttempt(harness, overrides = {}) {
+  const now = new Date().toISOString();
+  const request = seedTerminalUnattendedClosureCandidate(harness, {
+    id: ORPHAN_REQUEST_ID,
+    attemptId: ORPHAN_ATTEMPT_ID,
+    previousAttemptId: ORPHAN_PREVIOUS_ATTEMPT_ID,
+    attemptNumber: 2,
+    recoveryCount: 1,
+    type: "keyword_batch",
+    cloudAssigned: true,
+    cloudAgentScopeId: "agent-safe",
+    runnerTabId: null,
+    planSnapshot: buildUnattendedPlan({keywords: ["关键词一", "关键词二"]}),
+    checkpoint: {
+      activeKeyword: "关键词二",
+      currentKeyword: "关键词二",
+      completedKeywords: ["关键词一"],
+      failedKeywords: [],
+      skippedKeywords: [],
+    },
+    message: ORPHAN_FENCE_MESSAGE,
+    error: {
+      code: "PREVIOUS_CAPTURE_STOP_UNCONFIRMED",
+      message: ORPHAN_FENCE_MESSAGE,
+    },
+    ...overrides,
+    progress: {
+      runnerTabId: 20,
+      captureRequestId: "capture-orphan",
+      ...(overrides.progress || {}),
+    },
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-safe", token: "secret-safe"},
+  };
+  harness.storage[LOCK_KEY] = {
+    id: "orphan-lock",
+    owner: "unattended_keyword_plan",
+    label: "无人值守计划",
+    holderId: "a1-runner-holder",
+    holderDocumentId: "a1-runner-document",
+    holderTabId: 30,
+    captureTaskId: ORPHAN_TASK_KEY,
+    captureTaskAttemptId: ORPHAN_PREVIOUS_ATTEMPT_ID,
+    schemaVersion: 1,
+    startedAt: now,
+    updatedAt: now,
+    expiresAt: Date.now() - 60 * 1000,
+  };
+  const openTabs = new Map();
+  harness.setTabQueryHandler(async () =>
+    [...openTabs.values()].map((tab) => ({...tab})),
+  );
+  harness.setTabGetHandler(async (tabId) => {
+    const tab = openTabs.get(Number(tabId));
+    if (!tab) throw new Error(`No tab with id: ${tabId}.`);
+    return {...tab};
+  });
+  harness.setContextMode("gone");
+  const openTab = (id, url) => {
+    openTabs.set(id, {id, windowId: 1, groupId: -1, status: "complete", url});
+  };
+  return {request, openTabs, openTab};
+}
+
+function snapshotOrphanState(harness) {
+  return {
+    slot: jsonPlain(harness.storage[UNATTENDED_REQUEST_KEY]),
+    lock: jsonPlain(harness.storage[LOCK_KEY]),
+  };
+}
+
+// 每个场景都要满足：请求槽和锁不变，不开/刷/改/关任何标签页，不写 flush
+// 标记，不发心跳。
+function assertOrphanCheckSideEffectFree(harness, before) {
+  assert.deepEqual(jsonPlain(harness.storage[UNATTENDED_REQUEST_KEY]), before.slot);
+  assert.deepEqual(jsonPlain(harness.storage[LOCK_KEY]), before.lock);
+  assert.equal(harness.createdTabs.length, 0, "no tabs.create");
+  assert.deepEqual(harness.reloadedTabIds, [], "no tabs.reload");
+  assert.deepEqual(harness.updatedTabs, [], "no tabs.update");
+  assert.deepEqual(harness.removedTabIds, [], "no tabs.remove");
+  assert.equal(harness.sentTabMessages.length, 0, "no content messages");
+  assert.equal(
+    Object.keys(harness.storage).some((key) =>
+      key.startsWith(UNATTENDED_LOCAL_CLOSURE_READY_PREFIX),
+    ),
+    false,
+    "no synthetic flush-ready marker",
+  );
+  assert.equal(harness.cloudHeartbeats.length, 0, "no heartbeat");
+}
+
+async function recoverOrphanFromSidebar(harness) {
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:recover-unattended-keyword-run",
+    requestId: ORPHAN_REQUEST_ID,
+    mode: "remaining",
+  });
+  await harness.api.flushUnattended();
+  return jsonPlain(response);
+}
+
+test("an orphaned stop-fence attempt with no live runner, lock holder, relay or report sends the operator to the admin", async () => {
+  const harness = createHarness();
+  const {request, openTabs, openTab} = seedOrphanedStopFenceAttempt(harness);
+  // A1 还在跑时开始的采集任务：锁绑定 R，Debug 会话和标签组都建起来。
+  delete harness.storage[LOCK_KEY];
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...request,
+    attemptId: ORPHAN_PREVIOUS_ATTEMPT_ID,
+    status: "running",
+    runnerTabId: 30,
+    error: null,
+    message: "正在采集",
+  };
+  openTab(20, "https://www.xiaohongshu.com/search_result?keyword=test");
+  openTab(30, orphanRunnerUrl(ORPHAN_PREVIOUS_ATTEMPT_ID));
+  harness.setContextMode("alive");
+  const acquired = await harness.api.acquireCaptureExecutionLock({
+    owner: "unattended_keyword_plan",
+    label: "无人值守计划",
+    holderId: "a1-runner-holder",
+    holderDocumentId: "a1-runner-document",
+    holderTabId: 30,
+  });
+  assert.equal(acquired.ok, true, JSON.stringify(acquired));
+  const runnerSender = {
+    documentId: "a1-runner-document",
+    tab: {id: 30, url: orphanRunnerUrl(ORPHAN_PREVIOUS_ATTEMPT_ID)},
+    url: orphanRunnerUrl(ORPHAN_PREVIOUS_ATTEMPT_ID),
+  };
+  const begun = await harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:begin-capture-task",
+      taskId: ORPHAN_TASK_KEY,
+      attemptId: ORPHAN_PREVIOUS_ATTEMPT_ID,
+      sourceTabId: 20,
+      platform: "xiaohongshu",
+    },
+    runnerSender,
+  );
+  assert.equal(begun.ok, true, JSON.stringify(begun));
+  assert.equal(harness.storage[LOCK_KEY].captureTaskId, ORPHAN_TASK_KEY);
+  assert.notEqual(harness.api.getCaptureDebugSessionByTaskId(ORPHAN_TASK_KEY), null);
+  // 自动恢复停旧页失败：A2 以围栏码收尾。之后 A1 的 runner 与平台页都已关掉，
+  // 持有文档随之不在；Debug 会话与标签组残留仍在。
+  harness.storage[UNATTENDED_REQUEST_KEY] = request;
+  openTabs.clear();
+  harness.setContextMode("gone");
+  harness.sentTabMessages.length = 0;
+  harness.updatedTabs.length = 0;
+  const before = snapshotOrphanState(harness);
+
+  const response = await recoverOrphanFromSidebar(harness);
+
+  assert.equal(response.ok, false, JSON.stringify(response));
+  assert.equal(response.reason, "previous_capture_stop_requires_operator");
+  assert.match(response.message, /本机无法自行确认旧采集页面已停止/);
+  assert.match(response.message, /在后台「执行节点」点「确认旧页面已停止」/);
+  assert.doesNotMatch(response.message, /已关闭/);
+  assert.notEqual(
+    harness.api.getCaptureDebugSessionByTaskId(ORPHAN_TASK_KEY),
+    null,
+    "the read-only check never clears the debug residue",
+  );
+  assertOrphanCheckSideEffectFree(harness, before);
+
+  const direct = jsonPlain(await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: ORPHAN_REQUEST_ID,
+    mode: "skip_current",
+  }));
+  assert.equal(direct.accepted, false);
+  assert.equal(direct.deferred, false, "a final reason is not deferred");
+  assert.equal(direct.reason, "previous_capture_stop_requires_operator");
+  assert.equal(direct.request.id, ORPHAN_REQUEST_ID);
+  assert.equal(direct.request.attemptId, ORPHAN_ATTEMPT_ID);
+  assertOrphanCheckSideEffectFree(harness, before);
+});
+
+test("after the admin release the orphaned attempt reports that the cloud took over its keywords", async () => {
+  const harness = createHarness();
+  seedOrphanedStopFenceAttempt(harness, {
+    stopFenceClosure: {
+      version: 1,
+      at: new Date().toISOString(),
+      checkId: "release-1",
+      taskId: "server-task-1",
+      proofStatus: "operator_confirmed",
+    },
+  });
+  // release_only 已按精确身份释放了锁。
+  delete harness.storage[LOCK_KEY];
+  const before = snapshotOrphanState(harness);
+
+  const response = await recoverOrphanFromSidebar(harness);
+
+  assert.equal(response.ok, false, JSON.stringify(response));
+  assert.equal(response.reason, "stop_fence_released_to_cloud");
+  assert.match(response.message, /后台已确认旧采集页面停止/);
+  assert.match(response.message, /本机无需继续/);
+  assertOrphanCheckSideEffectFree(harness, before);
+});
+
+test("a lock holder of unknown state counts as gone only when its tab is gone", async () => {
+  const harness = createHarness();
+  const {openTab} = seedOrphanedStopFenceAttempt(harness);
+  harness.setContextMode("throw");
+  const before = snapshotOrphanState(harness);
+
+  const gone = await recoverOrphanFromSidebar(harness);
+  assert.equal(gone.reason, "previous_capture_stop_requires_operator");
+
+  // 持有标签页仍在（不是 runner 页也算）：判断不了，保持原来的 deferred。
+  openTab(30, "chrome-extension://test/sidebar/sidebar.html");
+  const alive = await recoverOrphanFromSidebar(harness);
+  assert.equal(alive.ok, false);
+  assert.equal(alive.reason, "checkpoint_flush_not_ready");
+  assert.equal(alive.message, "");
+  assertOrphanCheckSideEffectFree(harness, before);
+});
+
+test("the field shape with the old runner still open and holding R's lock stays deferred", async () => {
+  const harness = createHarness();
+  const {openTab} = seedOrphanedStopFenceAttempt(harness);
+  openTab(30, orphanRunnerUrl(ORPHAN_PREVIOUS_ATTEMPT_ID));
+  harness.setContextMode("alive");
+  const before = snapshotOrphanState(harness);
+
+  const response = await recoverOrphanFromSidebar(harness);
+  assert.equal(response.ok, false);
+  assert.equal(response.reason, "checkpoint_flush_not_ready");
+  assert.equal(response.message, "");
+
+  const direct = jsonPlain(await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: ORPHAN_REQUEST_ID,
+    mode: "remaining",
+  }));
+  assert.equal(direct.deferred, true);
+  assert.equal(direct.reason, "checkpoint_flush_not_ready");
+  assert.equal(direct.message, undefined);
+
+  // 远程继续也照旧挂起，不回执。
+  const remote = jsonPlain(await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-orphan-live",
+      command_type: "resume",
+      client_task_id: ORPHAN_REQUEST_ID,
+      payload: {controlTaskId: ORPHAN_REQUEST_ID, mode: "remaining"},
+    },
+    "agent-token",
+  ));
+  assert.equal(remote.deferred, true, JSON.stringify(remote));
+  assert.equal(remote.reason, "checkpoint_flush_not_ready");
+  assert.equal(harness.cloudCommandCompletions.length, 0);
+  assertOrphanCheckSideEffectFree(harness, before);
+});
+
+test("any single sign that R may still be finishing keeps the orphaned attempt deferred", async () => {
+  const scenarios = [
+    {
+      // 锁的持有文档已换掉（contextMode gone），但 A1 的 runner 页还开着。
+      name: "the old attempt's runner is still open",
+      setup: ({openTab}) =>
+        openTab(30, orphanRunnerUrl(ORPHAN_PREVIOUS_ATTEMPT_ID)),
+    },
+    {
+      name: "a legacy runner of R without an attempt parameter",
+      setup: ({openTab}) => openTab(31, orphanRunnerUrl("")),
+    },
+    {
+      name: "the runner of the orphaned attempt itself",
+      setup: ({openTab}) => openTab(32, orphanRunnerUrl(ORPHAN_ATTEMPT_ID)),
+    },
+    {
+      name: "a runner of R that is still loading (pendingUrl only)",
+      setup: ({openTabs}) =>
+        openTabs.set(33, {
+          id: 33,
+          windowId: 1,
+          groupId: -1,
+          status: "loading",
+          url: "",
+          pendingUrl: orphanRunnerUrl(ORPHAN_PREVIOUS_ATTEMPT_ID),
+        }),
+    },
+    {
+      name: "the lock holder document of R is alive",
+      setup: ({harness}) => harness.setContextMode("alive"),
+    },
+    {
+      name: "a relay of R is still in flight",
+      setup: ({harness}) =>
+        harness.api.registerInFlightContentRelay(40, {
+          action: "applyBatchSearchFilters",
+        }, {
+          taskId: "",
+          senderTabId: 30,
+          senderDocumentId: "a1-runner-document",
+          runnerRequestId: ORPHAN_REQUEST_ID,
+          runnerAttemptId: ORPHAN_PREVIOUS_ATTEMPT_ID,
+        }),
+    },
+    {
+      name: "a relay carrying R's stable task id is still in flight",
+      setup: ({harness}) =>
+        harness.api.registerInFlightContentRelay(41, {
+          action: "applyBatchSearchFilters",
+        }, {taskId: ORPHAN_TASK_KEY}),
+    },
+    {
+      name: "the old attempt still has an unreported checkpoint row",
+      setup: ({harness}) => {
+        harness.storage[`${UNATTENDED_OUTBOX_PREFIX}rev-a1`] = {
+          id: `${ORPHAN_REQUEST_ID}:${ORPHAN_PREVIOUS_ATTEMPT_ID}`,
+          requestId: ORPHAN_REQUEST_ID,
+          attemptId: ORPHAN_PREVIOUS_ATTEMPT_ID,
+          revision: "rev-a1",
+          patch: {checkpoint: {completedKeywords: ["关键词一"]}},
+        };
+      },
+    },
+    {
+      name: "an outbox row that cannot be attributed",
+      setup: ({harness}) => {
+        harness.storage[`${UNATTENDED_OUTBOX_PREFIX}rev-bad`] = {
+          requestId: ORPHAN_REQUEST_ID,
+        };
+      },
+    },
+    {
+      name: "a flush intent of an older attempt of R",
+      setup: ({harness}) => {
+        harness.storage[
+          `${UNATTENDED_FINAL_FLUSH_INTENT_PREFIX}${ORPHAN_REQUEST_ID}.` +
+            ORPHAN_PREVIOUS_ATTEMPT_ID
+        ] = {
+          version: 1,
+          requestId: ORPHAN_REQUEST_ID,
+          attemptId: ORPHAN_PREVIOUS_ATTEMPT_ID,
+          status: "pending",
+        };
+      },
+    },
+    {
+      name: "local storage cannot be read in full",
+      setup: ({harness}) =>
+        harness.setStorageGetHandler(async (keys, result) => {
+          if (keys === null) throw new Error("storage unavailable");
+          return result;
+        }),
+    },
+  ];
+  for (const scenario of scenarios) {
+    const harness = createHarness();
+    const seeded = seedOrphanedStopFenceAttempt(
+      harness,
+      scenario.overrides || {},
+    );
+    const relayKey = scenario.setup({harness, ...seeded});
+    const before = snapshotOrphanState(harness);
+
+    const response = await recoverOrphanFromSidebar(harness);
+
+    assert.equal(response.ok, false, scenario.name);
+    assert.equal(
+      response.reason,
+      "checkpoint_flush_not_ready",
+      `${scenario.name}: ${JSON.stringify(response)}`,
+    );
+    assert.equal(response.message, "", scenario.name);
+    assertOrphanCheckSideEffectFree(harness, before);
+    if (typeof relayKey === "string") {
+      harness.api.clearInFlightContentRelay(relayKey);
+      assert.equal(
+        harness.api.listRequestRelays(ORPHAN_REQUEST_ID, ORPHAN_TASK_KEY).length,
+        0,
+      );
+      const drained = await recoverOrphanFromSidebar(harness);
+      assert.equal(
+        drained.reason,
+        "previous_capture_stop_requires_operator",
+        `${scenario.name}: the relay was the only blocker`,
+      );
+    }
+  }
+});
+
+test("pages and a live lock that do not belong to R never block the orphan guidance", async () => {
+  const harness = createHarness();
+  const {openTab} = seedOrphanedStopFenceAttempt(harness);
+  openTab(50, "https://www.xiaohongshu.com/search_result?keyword=other");
+  openTab(51, "chrome-extension://test/sidebar/sidebar.html?unattendedRun=other-request&unattendedAttempt=x");
+  harness.storage[LOCK_KEY] = {
+    ...harness.storage[LOCK_KEY],
+    id: "other-lock",
+    captureTaskId: "unattended-capture:other-request",
+    holderDocumentId: "other-document",
+    holderTabId: 51,
+  };
+  harness.setContextMode("alive");
+  harness.api.registerInFlightContentRelay(50, {action: "captureList"}, {
+    taskId: "unattended-capture:other-request",
+    runnerRequestId: "other-request",
+  });
+  const before = snapshotOrphanState(harness);
+
+  const response = await recoverOrphanFromSidebar(harness);
+
+  assert.equal(response.reason, "previous_capture_stop_requires_operator");
+  assertOrphanCheckSideEffectFree(harness, before);
+});
+
+const ORPHAN_STOP_FENCE_CLOSURE = Object.freeze({
+  version: 1,
+  at: "2026-09-25T13:50:00.000Z",
+  checkId: "release-1",
+  taskId: "server-task-1",
+  proofStatus: "operator_confirmed",
+});
+
+function resumeOrphanRemotely(harness, commandId) {
+  return harness.api.executeCloudTaskAgentCommand(
+    {
+      id: commandId,
+      command_type: "resume",
+      client_task_id: ORPHAN_REQUEST_ID,
+      payload: {controlTaskId: ORPHAN_REQUEST_ID, mode: "remaining"},
+    },
+    "agent-token",
+  );
+}
+
+test("the platform page that failed to stop is not a sign of life, before or after the admin release", async () => {
+  // 现场形状：停不下来的是平台页 20（progress.runnerTabId），不是 runner；
+  // release_only 按设计不关它，运营要检查的也正是它。记录的 runnerTabId 若已
+  // 不是 R 的 runner 页（runner 只按 URL 认）同样不算。
+  const harness = createHarness();
+  const {openTab} = seedOrphanedStopFenceAttempt(harness, {runnerTabId: 33});
+  openTab(20, "https://www.xiaohongshu.com/search_result?keyword=test");
+  openTab(33, "https://www.xiaohongshu.com/explore/runner-reused");
+  const before = snapshotOrphanState(harness);
+
+  const pending = await recoverOrphanFromSidebar(harness);
+  assert.equal(pending.ok, false, JSON.stringify(pending));
+  assert.equal(pending.reason, "previous_capture_stop_requires_operator");
+  assertOrphanCheckSideEffectFree(harness, before);
+
+  // 后台放行后：release_only 已释放锁、写入 stopFenceClosure，平台页仍开着。
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    stopFenceClosure: {...ORPHAN_STOP_FENCE_CLOSURE},
+  };
+  delete harness.storage[LOCK_KEY];
+  const released = snapshotOrphanState(harness);
+
+  const response = await recoverOrphanFromSidebar(harness);
+  assert.equal(response.reason, "stop_fence_released_to_cloud");
+  assert.match(response.message, /本机无需继续/);
+
+  // 远程继续（例如放行前已下发的 resume）以失败完成，不再挂起到指令过期。
+  const remote = jsonPlain(
+    await resumeOrphanRemotely(harness, "cloud-command-platform-open"),
+  );
+  assert.notEqual(remote.deferred, true, JSON.stringify(remote));
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  const completion = jsonPlain(harness.cloudCommandCompletions[0]);
+  assert.equal(completion.success, false);
+  assert.equal(completion.result.reason, "stop_fence_released_to_cloud");
+  assertOrphanCheckSideEffectFree(harness, released);
+});
+
+test("an archived stop-fenced batch child gives the final guidance, never a retry-later promise", async () => {
+  const cases = [
+    {
+      // 放行后 release_only 先写 stopFenceClosure，同一心跳的 create 再归档 R。
+      name: "released",
+      overrides: {stopFenceClosure: {...ORPHAN_STOP_FENCE_CLOSURE}},
+      reason: "stop_fence_released_to_cloud",
+      text: /本机无需继续/,
+    },
+    {
+      // 例如本机手动开了新任务，把还没放行的 R 归档。
+      name: "not released",
+      overrides: {},
+      reason: "previous_capture_stop_requires_operator",
+      text: /在后台「执行节点」点「确认旧页面已停止」/,
+    },
+  ];
+  for (const scenario of cases) {
+    const harness = createHarness();
+    seedOrphanedStopFenceAttempt(harness, scenario.overrides);
+    delete harness.storage[LOCK_KEY];
+    await harness.api.createUnattendedKeywordRunRequest(
+      buildUnattendedPlan({keywords: ["新任务关键词"]}),
+      {reason: "cloud_assignment", requestId: "next-task", cloudAssigned: true},
+    );
+    await harness.api.flushUnattended();
+    const archived =
+      harness.storage[UNATTENDED_ARCHIVE_KEY]?.requests?.[ORPHAN_REQUEST_ID];
+    assert.equal(archived?.status, "needs_action", scenario.name);
+    assert.equal(Boolean(archived?.stopFenceClosure), scenario.name === "released");
+    harness.storage[UNATTENDED_REQUEST_KEY] = {
+      ...harness.storage[UNATTENDED_REQUEST_KEY],
+      status: "completed",
+      finishedAt: new Date().toISOString(),
+    };
+    const before = snapshotOrphanState(harness);
+    const archiveBefore = jsonPlain(harness.storage[UNATTENDED_ARCHIVE_KEY]);
+
+    const response = await recoverOrphanFromSidebar(harness);
+    assert.equal(response.ok, false, scenario.name);
+    assert.equal(response.reason, scenario.reason, JSON.stringify(response));
+    assert.match(response.message, scenario.text, scenario.name);
+
+    const remote = jsonPlain(
+      await resumeOrphanRemotely(harness, `cloud-command-archived-${scenario.name}`),
+    );
+    assert.notEqual(remote.deferred, true, JSON.stringify(remote));
+    assert.equal(harness.cloudCommandCompletions.length, 1, scenario.name);
+    const completion = jsonPlain(harness.cloudCommandCompletions[0]);
+    assert.equal(completion.success, false);
+    assert.equal(completion.result.accepted, false);
+    assert.equal(completion.result.reason, scenario.reason);
+    assert.match(completion.result.message, scenario.text);
+    assert.deepEqual(
+      jsonPlain(harness.storage[UNATTENDED_ARCHIVE_KEY]),
+      archiveBefore,
+      "the archive is untouched",
+    );
+    assertOrphanCheckSideEffectFree(harness, before);
+  }
+});
+
+test("an archived batch child without the stop-fence code stays source_local_closure_unverifiable", async () => {
+  const harness = createHarness();
+  seedOrphanedStopFenceAttempt(harness, {
+    error: {code: "CAPTURE_LOCK_CONFLICT", message: "锁冲突"},
+  });
+  delete harness.storage[LOCK_KEY];
+  await harness.api.createUnattendedKeywordRunRequest(
+    buildUnattendedPlan({keywords: ["新任务关键词"]}),
+    {reason: "cloud_assignment", requestId: "next-task", cloudAssigned: true},
+  );
+  await harness.api.flushUnattended();
+  harness.storage[UNATTENDED_REQUEST_KEY] = {
+    ...harness.storage[UNATTENDED_REQUEST_KEY],
+    status: "completed",
+    finishedAt: new Date().toISOString(),
+  };
+
+  const response = await recoverOrphanFromSidebar(harness);
+  assert.equal(response.ok, false);
+  assert.equal(response.reason, "source_local_closure_unverifiable");
+  assert.equal(response.message, "");
+  const direct = jsonPlain(await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: ORPHAN_REQUEST_ID,
+    mode: "remaining",
+  }));
+  assert.equal(direct.deferred, true);
+});
+
+test("the orphan check only runs for the exact fenced needs_action slot", async () => {
+  const scenarios = [
+    {
+      name: "another error code",
+      overrides: {error: {code: "CAPTURE_LOCK_CONFLICT", message: "锁冲突"}},
+    },
+    {name: "a failed request", overrides: {status: "failed"}},
+  ];
+  for (const scenario of scenarios) {
+    const harness = createHarness();
+    seedOrphanedStopFenceAttempt(harness, scenario.overrides);
+    const before = snapshotOrphanState(harness);
+
+    const response = await recoverOrphanFromSidebar(harness);
+
+    assert.equal(response.ok, false, scenario.name);
+    assert.equal(response.reason, "checkpoint_flush_not_ready", scenario.name);
+    assertOrphanCheckSideEffectFree(harness, before);
+  }
+});
+
+test("a remote resume of an orphaned attempt completes as rejected with the operator guidance", async () => {
+  const harness = createHarness();
+  seedOrphanedStopFenceAttempt(harness);
+  const before = snapshotOrphanState(harness);
+
+  const result = jsonPlain(await harness.api.executeCloudTaskAgentCommand(
+    {
+      id: "cloud-command-orphan-resume",
+      command_type: "resume",
+      client_task_id: ORPHAN_REQUEST_ID,
+      payload: {controlTaskId: ORPHAN_REQUEST_ID, mode: "remaining"},
+    },
+    "agent-token",
+  ));
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.notEqual(result.deferred, true);
+  assert.equal(harness.cloudCommandCompletions.length, 1);
+  const completion = jsonPlain(harness.cloudCommandCompletions[0]);
+  assert.equal(completion.commandId, "cloud-command-orphan-resume");
+  assert.equal(completion.success, false);
+  assert.equal(completion.result.state, "completed");
+  assert.equal(completion.result.accepted, false);
+  assert.equal(completion.result.reason, "previous_capture_stop_requires_operator");
+  assert.equal(completion.result.requestId, ORPHAN_REQUEST_ID);
+  assert.match(completion.result.message, /在后台「执行节点」点「确认旧页面已停止」/);
+  assert.notEqual(completion.result.message, ORPHAN_FENCE_MESSAGE);
+  assertOrphanCheckSideEffectFree(harness, before);
+});
+
+test("the any-attempt outbox option counts every attempt of R and leaves the exact lookup unchanged", async () => {
+  const harness = createHarness();
+  const row = (requestId, attemptId, revision, extra = {}) => {
+    harness.storage[`${UNATTENDED_OUTBOX_PREFIX}${revision}`] = {
+      id: `${requestId}:${attemptId}`,
+      requestId,
+      attemptId,
+      revision,
+      patch: {checkpoint: {completedKeywords: []}},
+      ...extra,
+    };
+  };
+  row(ORPHAN_REQUEST_ID, ORPHAN_PREVIOUS_ATTEMPT_ID, "rev-a1");
+  row(ORPHAN_REQUEST_ID, ORPHAN_ATTEMPT_ID, "rev-a2");
+  row(ORPHAN_REQUEST_ID, "orphan-attempt-0", "rev-a0", {acknowledged: true});
+  row("another-request", "another-attempt", "rev-other");
+  const inspect = async (...args) =>
+    jsonPlain(await harness.api.inspectUnattendedCheckpointOutboxAttempt(...args));
+
+  assert.deepEqual(
+    await inspect(ORPHAN_REQUEST_ID, ORPHAN_ATTEMPT_ID),
+    {known: true, pendingCount: 1, reason: ""},
+  );
+  assert.deepEqual(
+    await inspect(ORPHAN_REQUEST_ID, ORPHAN_PREVIOUS_ATTEMPT_ID),
+    {known: true, pendingCount: 1, reason: ""},
+  );
+  // 不带选项时空轮次什么都匹配不上：这正是整个 R 不能用它查的原因。
+  assert.deepEqual(
+    await inspect(ORPHAN_REQUEST_ID, ""),
+    {known: true, pendingCount: 0, reason: ""},
+  );
+  assert.deepEqual(
+    await inspect(ORPHAN_REQUEST_ID, "", {anyAttempt: true}),
+    {known: true, pendingCount: 2, reason: ""},
+  );
+  assert.deepEqual(
+    await inspect("", "", {anyAttempt: true}),
+    {known: false, pendingCount: null, reason: "outbox_request_missing"},
+  );
+  harness.storage[`${UNATTENDED_OUTBOX_PREFIX}rev-bad`] = {requestId: "x"};
+  assert.equal((await inspect(ORPHAN_REQUEST_ID, "", {anyAttempt: true})).known, false);
+  assert.equal((await inspect(ORPHAN_REQUEST_ID, ORPHAN_ATTEMPT_ID)).known, false);
+});
+
+test("the sidebar shows operator guidance for final recovery reasons and plain Chinese for pending closure", async () => {
+  const [sidebarSource, source] = await Promise.all([
+    readFile(resolve(repoRoot, "sidebar/sidebar-logic.js"), "utf8"),
+    Promise.resolve(backgroundSource),
+  ]);
+  const flushPrefix = (text) =>
+    text.match(
+      /UNATTENDED_FINAL_FLUSH_INTENT_STORAGE_PREFIX\s*=\s*['"]([^'"]+)['"]/,
+    )?.[1];
+  assert.equal(flushPrefix(source), UNATTENDED_FINAL_FLUSH_INTENT_PREFIX);
+  assert.equal(flushPrefix(sidebarSource), flushPrefix(source));
+
+  const sidebarBlock = sidebarSource.slice(
+    sidebarSource.indexOf("const UNATTENDED_RECOVERY_OPERATOR_MESSAGES"),
+    sidebarSource.indexOf("async function handleTaskCenterAction"),
+  );
+  assert.match(sidebarBlock, /function describeUnattendedRecoveryFailure/);
+  const describe = vm.runInContext(
+    `${sidebarBlock}\ndescribeUnattendedRecoveryFailure;`,
+    vm.createContext({}),
+    {filename: "sidebar-recovery-failure.js"},
+  );
+  const backgroundBlock = source.slice(
+    source.indexOf("const ORPHANED_STOP_FENCE_RECOVERY_MESSAGES"),
+    source.indexOf("async function classifyOrphanedStopFenceAttempt"),
+  );
+  const backgroundMessages = jsonPlain(vm.runInContext(
+    `${backgroundBlock}\nORPHANED_STOP_FENCE_RECOVERY_MESSAGES;`,
+    vm.createContext({}),
+    {filename: "background-orphan-messages.js"},
+  ));
+  for (const reason of [
+    "previous_capture_stop_requires_operator",
+    "stop_fence_released_to_cloud",
+  ]) {
+    assert.deepEqual(
+      jsonPlain(describe({ok: false, reason, message: "后台给的说明"})),
+      {final: true, text: "后台给的说明"},
+    );
+    assert.deepEqual(
+      jsonPlain(describe({ok: false, reason, message: ""})),
+      {final: true, text: backgroundMessages[reason]},
+      `${reason} falls back to the background copy`,
+    );
+  }
+  const flushPending = jsonPlain(describe({reason: "checkpoint_flush_not_ready"}));
+  assert.equal(flushPending.final, false);
+  assert.match(flushPending.text, /旧运行页还在收尾/);
+  assert.match(flushPending.text, /后台「执行节点」处理/);
+  for (const reason of [
+    "source_local_closure_sync_pending",
+    "source_local_closure_not_confirmed",
+    "source_local_closure_changed",
+  ]) {
+    assert.deepEqual(
+      jsonPlain(describe({reason})),
+      {final: false, text: "本机尚未确认旧任务已收尾，请稍后再试"},
+    );
+  }
+  // 归档来源永远回不到请求槽：不许诺「稍后再试」。
+  const unverifiable = jsonPlain(
+    describe({reason: "source_local_closure_unverifiable"}),
+  );
+  assert.equal(unverifiable.final, false);
+  assert.equal(
+    unverifiable.text,
+    "该任务已不是本机当前任务，本机无法继续；请在后台批次里处理",
+  );
+  assert.doesNotMatch(unverifiable.text, /稍后/);
+  assert.deepEqual(
+    jsonPlain(describe({reason: "recovery_dismissed"})),
+    {final: false, text: "recovery_dismissed"},
+  );
+  assert.deepEqual(
+    jsonPlain(describe({error: {message: "网络错误"}})),
+    {final: false, text: "网络错误"},
+  );
+  assert.deepEqual(jsonPlain(describe(undefined)), {
+    final: false,
+    text: "无法恢复任务",
+  });
+
+  const handlerBlock = sidebarSource.slice(
+    sidebarSource.indexOf("async function handleTaskCenterAction"),
+    sidebarSource.indexOf("function setupUIEventListeners"),
+  );
+  assert.match(
+    handlerBlock,
+    /const failure = describeUnattendedRecoveryFailure\(response\);\s*if \(failure\.final\) \{\s*showMessage\(failure\.text, "warning"\);\s*await loadKeywordPlanUI\(\);\s*return;\s*\}\s*throw new Error\(failure\.text\);/,
   );
 });
 

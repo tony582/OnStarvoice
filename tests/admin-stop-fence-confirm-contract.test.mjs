@@ -67,3 +67,35 @@ test('a superseded fence behind 20 older needs_action rows keeps the confirm but
     assert.equal(confirmGuardRejects(rows, notice.confirmTaskIds), false)
   }
 })
+
+// docs/hotfix/20260925-needs-action-fence.md：确认接口额外放行运营显式带上的「需要处理」批次任务
+// （服务端 stopFenceOperatorReleasable）；已转交围栏仍须全部带上。
+function serverReleasable(row) {
+  return row.kind === 'fence' && row.status === 'needs_action' && Boolean(row.parent_task_id) &&
+    row.task_type === 'unattended_keyword_capture'
+}
+
+test('a needs_action batch child from the real server summary is sent with every superseded fence', () => {
+  const batchChild = index => fenceRow(index, {status: 'needs_action', parent_task_id: '7a0e0000-0000-4000-8000-000000000009',
+    task_type: 'unattended_keyword_capture', parent_state: {status: 'running', distributionMode: 'elastic_pool'}})
+  const rows = [
+    ...Array.from({length: 21}, (_, index) => batchChild(index + 1)),
+    fenceRow(40, {status: 'needs_action', task_type: 'unattended_keyword_capture'}),
+    fenceRow(41, {fenced_at: ago(1)}),
+  ]
+  for (const agent of [currentAgent, oldExtensionAgent]) {
+    const {stopFence, notice} = adminConfirmPayload(agent, rows)
+    assert.equal(notice.canConfirm, true)
+    assert.equal(confirmGuardRejects(rows, notice.confirmTaskIds), false)
+    const sent = new Set(notice.confirmTaskIds)
+    const releasable = rows.filter(serverReleasable).map(row => row.id)
+    assert.equal(releasable.length, 21)
+    assert.ok(releasable.every(id => sent.has(id)), `${stopFence.phase}: every releasable child, listed or not`)
+    assert.equal(sent.has(taskId(40)), false, 'a root task is never sent')
+    assert.equal(sent.has(taskId(41)), true)
+  }
+  const onlyChildren = adminConfirmPayload(oldExtensionAgent, rows.filter(serverReleasable))
+  assert.equal(onlyChildren.stopFence.phase, 'task_action_required')
+  assert.equal(onlyChildren.notice.canConfirm, true)
+  assert.equal(onlyChildren.notice.confirmTaskIds.length, 21)
+})

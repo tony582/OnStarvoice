@@ -424,6 +424,8 @@ function createHarness({sessionStorage = true} = {}) {
       `  syncCloudTaskAgent,\n` +
       `  claimUnattendedKeywordRun,\n` +
       `  recoverUnattendedKeywordRunRequest,\n` +
+      `  manuallyRecoverUnattendedKeywordRun,\n` +
+      `  createUnattendedKeywordRunRequest,\n` +
       `  acquireCaptureExecutionLock,\n` +
       `  timing: STOP_FENCE_CHECK_TIMING,\n` +
       `  getCaptureTaskGroup: (taskId) => captureTaskTabGroupManager.getTask(taskId),\n` +
@@ -2006,6 +2008,133 @@ test("release_only runs before the same heartbeat's create command, so the new t
   ]);
   assert.equal(harness.stopFenceCompletions[0].result.reason, "local_release_done");
   assertCheckSafety(harness, {allowedRemovedTabIds: [30]});
+});
+
+// ==================== needs_action 停止保护：批次子任务的本机「继续」 ====================
+// 现场形状：批次子任务 R 的轮次 A2 停旧页失败，以 PREVIOUS_CAPTURE_STOP_UNCONFIRMED
+// 收尾。停不下来的是平台页 20（progress.runnerTabId），release_only 按设计不关它。
+// 它是运营要检查的页面，不是 R 还在收尾的迹象。
+
+function seedBatchChildFence(harness) {
+  seedTypicalFence(harness);
+  harness.storage[REQUEST_KEY] = {
+    ...harness.storage[REQUEST_KEY],
+    cloudAgentScopeId: "agent-1",
+    orchestrationContext: {
+      parentTaskId: "parent-task",
+      requiresLocalClosureReuseFenceV1: true,
+      itemAttempts: [{
+        itemId: "item-1",
+        attemptId: "item-attempt-1",
+        attemptNumber: 3,
+        assignmentRevision: 7,
+      }],
+    },
+  };
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: "agent-1", token: "agent-token"},
+  };
+}
+
+async function continueFromTaskCenter(harness, requestId = REQUEST_ID) {
+  const response = await harness.sendBackgroundMessage({
+    type: "onstarvoice:recover-unattended-keyword-run",
+    requestId,
+    mode: "remaining",
+  });
+  await harness.api.flushUnattended();
+  return plain(response);
+}
+
+test("before the admin release a batch child whose platform page is still open points the operator to the admin", async () => {
+  const harness = createHarness();
+  seedBatchChildFence(harness);
+  const slotBefore = JSON.stringify(harness.storage[REQUEST_KEY]);
+  const lockBefore = JSON.stringify(harness.storage[LOCK_KEY]);
+  harness.resetCallLog();
+
+  // A1 的 runner 页 30 还开着：R 可能还在收尾，照旧 deferred。
+  const runnerOpen = await continueFromTaskCenter(harness);
+  assert.equal(runnerOpen.ok, false);
+  assert.equal(runnerOpen.reason, "checkpoint_flush_not_ready");
+  assert.equal(runnerOpen.message, "");
+
+  // runner 已关、锁的持有文档已不在，只剩停不下来的平台页 20。
+  harness.tabs.delete(30);
+  const pageOpen = await continueFromTaskCenter(harness);
+  assert.equal(pageOpen.ok, false, JSON.stringify(pageOpen));
+  assert.equal(pageOpen.reason, "previous_capture_stop_requires_operator");
+  assert.match(pageOpen.message, /在后台「执行节点」点「确认旧页面已停止」/);
+  const direct = plain(await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: REQUEST_ID,
+    mode: "remaining",
+  }));
+  await harness.api.flushUnattended();
+  assert.equal(direct.deferred, false, "a final reason is not deferred");
+  assert.equal(direct.reason, "previous_capture_stop_requires_operator");
+
+  assert.ok(harness.tabs.has(20), "the platform page is left alone");
+  assert.equal(JSON.stringify(harness.storage[REQUEST_KEY]), slotBefore);
+  assert.equal(JSON.stringify(harness.storage[LOCK_KEY]), lockBefore);
+  assert.deepEqual(harness.sentTabMessages, []);
+  assertCheckSafety(harness);
+});
+
+test("after the admin release, and after the node takes new work, continuing R says the cloud took over its keywords", async () => {
+  const harness = createHarness();
+  seedBatchChildFence(harness);
+
+  const release = plain(await harness.api.releaseStopFenceLocalResourcesForOperator(
+    buildOffer({mode: "release_only", checkId: "release-1"}),
+  ));
+  await harness.api.flushUnattended();
+  assert.equal(release.reason, "local_release_done", JSON.stringify(release));
+  assert.equal(harness.tabs.has(30), false, "release_only closed R's runner");
+  assert.ok(harness.tabs.has(20), "release_only keeps the platform page");
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assert.ok(harness.storage[REQUEST_KEY].stopFenceClosure);
+  assert.equal(harness.storage[REQUEST_KEY].status, "needs_action");
+
+  harness.resetCallLog();
+  const released = await continueFromTaskCenter(harness);
+  assert.equal(released.ok, false, JSON.stringify(released));
+  assert.equal(released.reason, "stop_fence_released_to_cloud");
+  assert.match(released.message, /本机无需继续/);
+  assert.ok(harness.tabs.has(20));
+  assertCheckSafety(harness);
+
+  // 同一心跳里的 create：新任务把 R 归档。归档副本回不到请求槽，「继续」
+  // 给同一句终局说明，而不是永远「请稍后再试」。
+  await harness.api.createUnattendedKeywordRunRequest(
+    {platform: "xiaohongshu", keywords: ["新关键词"]},
+    {requestId: "next-request", cloudAssigned: true},
+  );
+  await harness.api.flushUnattended();
+  assert.equal(harness.storage[REQUEST_KEY].id, "next-request");
+  const archived = harness.storage[ARCHIVE_KEY]?.requests?.[REQUEST_ID];
+  assert.ok(archived?.stopFenceClosure, "the archive keeps stopFenceClosure");
+  harness.storage[REQUEST_KEY] = {
+    ...harness.storage[REQUEST_KEY],
+    status: "completed",
+    finishedAt: new Date().toISOString(),
+  };
+  const nextSlot = JSON.stringify(harness.storage[REQUEST_KEY]);
+  const archiveBefore = JSON.stringify(harness.storage[ARCHIVE_KEY]);
+
+  const afterArchive = await continueFromTaskCenter(harness);
+  assert.equal(afterArchive.ok, false, JSON.stringify(afterArchive));
+  assert.equal(afterArchive.reason, "stop_fence_released_to_cloud");
+  assert.match(afterArchive.message, /本机无需继续/);
+  const direct = plain(await harness.api.manuallyRecoverUnattendedKeywordRun({
+    requestId: REQUEST_ID,
+    mode: "skip_current",
+  }));
+  await harness.api.flushUnattended();
+  assert.equal(direct.deferred, false);
+  assert.equal(direct.request.id, REQUEST_ID);
+  assert.equal(JSON.stringify(harness.storage[REQUEST_KEY]), nextSlot);
+  assert.equal(JSON.stringify(harness.storage[ARCHIVE_KEY]), archiveBefore);
+  assertCheckSafety(harness);
 });
 
 test("release_only waits for a check already in flight, but never holds the commands past its budget", async () => {

@@ -55,6 +55,7 @@ import {
   mobileTaskFilters,
   trimMobilePlanSnapshot,
 } from '../services/android-control/mobile-tasks.js';
+import {STOP_FENCE_OPERATOR_RELEASED_REASON} from '../services/capture-stop-fence.js';
 
 const router = Router();
 const UUID_PATTERN =
@@ -132,6 +133,19 @@ function text(value, limit = 1000) {
 
 function safeJson(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+// Besides a settled source (HANDOFF_SOURCE_FINAL_STATUSES), a retry may start
+// from a needs_action batch child an operator released from its stop fence:
+// it ends as `superseded` with no successor and its unfinished keywords wait
+// in the batch. A source superseded by a handoff or a recovery task stays
+// unsettled for retries. The pending-retry scan SQL uses the same rule.
+function stopFenceReleasedRetrySource(source) {
+  const metadata = safeJson(source?.metadata);
+  return source?.status === 'superseded' &&
+    metadata.terminalReason === STOP_FENCE_OPERATOR_RELEASED_REASON &&
+    !text(metadata.handoffSuccessorTaskId, 240) &&
+    !text(metadata.recoveryTaskId, 240);
 }
 
 function elasticQueueOwnsRetry(parent) {
@@ -1759,7 +1773,12 @@ async function loadPendingRetryCandidates(
     WHERE item.status = 'retryable'
       AND item.metadata->>'retryPending' = 'true'
       AND tenant.status = 'active'
-      AND source_execution.status = ANY($1::text[])
+      AND (source_execution.status = ANY($1::text[])
+        -- Same rule as stopFenceReleasedRetrySource.
+        OR (source_execution.status = 'superseded'
+          AND source_execution.metadata->>'terminalReason' = '${STOP_FENCE_OPERATOR_RELEASED_REASON}'
+          AND COALESCE(source_execution.metadata->>'handoffSuccessorTaskId', '') = ''
+          AND COALESCE(source_execution.metadata->>'recoveryTaskId', '') = ''))
       AND NOT (parent.status = ANY($2::text[]))
       AND parent.metadata->>'operatorStopped' IS DISTINCT FROM 'true'
       AND parent.metadata->>'orchestrationTemplate' IS DISTINCT FROM 'true'
@@ -2292,7 +2311,7 @@ async function dispatchOnePendingOrchestrationRetry(
     // source execution second, parent third, and the exact item last. This
     // prevents a late terminal heartbeat from deadlocking an automatic claim.
     const sourceTask = await tx.queryOne(`
-      SELECT id, tenant_id, parent_task_id, status
+      SELECT id, tenant_id, parent_task_id, status, metadata
       FROM capture_tasks
       WHERE id = $1 AND tenant_id = $2 AND parent_task_id = $3
       FOR UPDATE
@@ -2350,7 +2369,8 @@ async function dispatchOnePendingOrchestrationRetry(
       lineage.sourceExecutionTaskId !== previewLineage.sourceExecutionTaskId ||
       lineage.itemRevision !== previewLineage.itemRevision ||
       lineage.attemptCount !== previewLineage.attemptCount ||
-      !HANDOFF_SOURCE_FINAL_STATUSES.has(sourceTask.status) ||
+      !(HANDOFF_SOURCE_FINAL_STATUSES.has(sourceTask.status) ||
+        stopFenceReleasedRetrySource(sourceTask)) ||
       item.status !== 'retryable' ||
       agentCompatibilityFailure(targetAgent, parent.platform, planSnapshot)
     ) {
@@ -5695,7 +5715,7 @@ router.post(
         // and lock the selected source executions before parent/items so retry
         // dispatch cannot deadlock a late terminal heartbeat.
         const sourceTasks = await tx.queryAll(`
-          SELECT source.id, source.status, source.assigned_agent_id
+          SELECT source.id, source.status, source.assigned_agent_id, source.metadata
           FROM capture_tasks source
           WHERE source.tenant_id = $1
             AND source.parent_task_id = $2
@@ -5799,7 +5819,8 @@ router.post(
         )).sort();
         if (
           sourceTasks.length !== sourceTaskIds.length ||
-          sourceTasks.some(task => !HANDOFF_SOURCE_FINAL_STATUSES.has(task.status))
+          sourceTasks.some(task => !(HANDOFF_SOURCE_FINAL_STATUSES.has(task.status) ||
+            stopFenceReleasedRetrySource(task)))
         ) {
           return {failure: requestError(
             'retry_source_not_settled',

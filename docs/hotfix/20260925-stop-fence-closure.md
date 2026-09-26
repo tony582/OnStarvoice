@@ -175,6 +175,7 @@ Admin：
 1. 围栏判定不变。`captureTaskUnconfirmedLocalStopSql`、`captureTaskHasUnconfirmedLocalStop` 的文本不改，`976a0c6` 规则不改，`excludeTaskIds` 仍然绕不过围栏。创建、领取的准入只有一处变化：已放行的行不再命中。
 2. 放行只有三条路：节点回执满足下文的证明条件（`agent_confirmed`）、运营显式确认（`operator_confirmed`）、`976a0c6` 原规则（本次只为它补写记录，`proofStatus: 'completed'`）。不按时间自动放行。
 3. 只放行 `status = 'superseded'` 的围栏行。`needs_action`、`failed`、`interrupted` 等仍由节点负责，服务端不改它们，只在后台说明原因并指路（见「管理端」）。
+   > 20260926 更新：批次子执行停在 `needs_action` 的围栏行，节点本地既不能继续也不能跳过，已改为允许人工确认放行，见 [20260925-needs-action-fence.md](20260925-needs-action-fence.md)。
 4. 核对请求不写 `capture_agent_commands`。执行槽判定、接力 relay gate、指令过期清扫和停止触发器都不受影响。
 5. 下发、回执和放行写 `metadata` 时都不更新 `updated_at`，因为 `976a0c6` 规则比较的是后续采集时间和 `historical_stop.updated_at`。
 6. 节点核对中：
@@ -1025,7 +1026,7 @@ R 已归档或本机未知时，第 1、3 步跳过，第 2 步照做。
 
 - 新 `command_type` 或迁移。
 - 按时间自动放行。
-- 对 `needs_action` 等非 `superseded` 围栏做自动核对或放行。
+- 对 `needs_action` 等非 `superseded` 围栏做自动核对或放行。（批次子执行的 `needs_action` 围栏已由 [20260925-needs-action-fence.md](20260925-needs-action-fence.md) 开放人工放行；自动核对仍不做。）
 - 恢复路径把 `captureRequestId` 传入停止目标，以减少围栏产生。
 - 扩展上下文失效时，内容脚本自行停止采集（`content-v2.js` 约 98–121 处 `setCancelFlag`），让以后重载前的页面也能自证。
 - 邮件以外的推送通知：`capture_attention_notifications.notification_type` 的 CHECK 只允许 `security_verification`，需要迁移。本次告警走值守事件。
