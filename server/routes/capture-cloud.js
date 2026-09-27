@@ -119,6 +119,7 @@ import {
   normalizeOperatorCloseTaskIds,
   operatorClosedTask,
   operatorClosedTaskSql,
+  operatorClosedWorkItem,
 } from '../services/capture-operator-close.js';
 
 function requireCaptureAgent(req, res, next) {
@@ -15007,11 +15008,14 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         abortCrossDeviceRetry('retry_items_unavailable');
       }
       let retryItems = scopedItems.filter(
-        item => (dutySafetyHandoffPolicy
-          ? text(item.id, 100).toLowerCase() === requestedItemIds[0]
-          : dutyRecovery
-          ? classifyCaptureRecoveryDisposition(item, {phase: 'duty'}).automatic
-          : classifyCaptureRecoveryDisposition(item).automatic),
+        // An item the operator ended with 「结束并移到历史」 is never picked
+        // up automatically; 换设备重试 and 「重试失败关键词」 still can.
+        item => !(automatic && operatorClosedWorkItem(item)) &&
+          (dutySafetyHandoffPolicy
+            ? text(item.id, 100).toLowerCase() === requestedItemIds[0]
+            : dutyRecovery
+            ? classifyCaptureRecoveryDisposition(item, {phase: 'duty'}).automatic
+            : classifyCaptureRecoveryDisposition(item).automatic),
       );
       let sourceExecutionPending = false;
       if (automatic && retryItems.length > 0) {

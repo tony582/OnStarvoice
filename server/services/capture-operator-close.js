@@ -127,6 +127,18 @@ export function operatorClosedTask(row) {
     sameInteger(marker.orchestrationRevision, row.orchestration_revision);
 }
 
+/**
+ * A work item 「结束并移到历史」 failed on purpose and nobody re-dispatched
+ * since (a re-dispatch resets error or changes status). The operator said
+ * "do not re-capture": only an explicit operator retry may run it again,
+ * never an automatic cross-device scan, even after a partial 「重试失败关键词」
+ * on the same batch cleared the root's dismissal.
+ */
+export function operatorClosedWorkItem(item) {
+  const row = object(item);
+  return text(row.status, 80) === 'failed' && object(row.error).operatorClosed === true;
+}
+
 /** SQL twin of operatorClosedTask for a capture_tasks alias (constant cost). */
 export function operatorClosedTaskSql(alias = 'task') {
   if (!SQL_ALIAS_PATTERN.test(alias)) throw new Error('invalid_task_alias');

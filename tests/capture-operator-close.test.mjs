@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -12,6 +13,7 @@ import {
   operatorCloseItemTransition,
   operatorClosedTask,
   operatorClosedTaskSql,
+  operatorClosedWorkItem,
 } from '../server/services/capture-operator-close.js';
 
 // docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md F3
@@ -47,6 +49,22 @@ test('a row is closed only while it is still the execution and revision the oper
   // Callers that did not select the counters cannot contradict the marker.
   assert.equal(operatorClosedTask({status: 'failed', metadata: {operatorClose: marker()}}), true);
   assert.equal(operatorClosedTask({...row, orchestration_revision: undefined}), true);
+});
+
+test('a closed work item stays out of automatic retry until an operator re-dispatches it', () => {
+  const item = {status: 'failed', error: {code: 'XHS_SEARCH_PAGE_TIMEOUT', operatorClosed: true, originalStatus: 'needs_action'}};
+  assert.equal(operatorClosedWorkItem(item), true);
+  // 「重试失败关键词」 resets error on dispatch or queues it (retryable): no longer closed.
+  for (const status of ['dispatched', 'retryable', 'running', 'completed', 'needs_action']) {
+    assert.equal(operatorClosedWorkItem({...item, status}), false, status);
+  }
+  assert.equal(operatorClosedWorkItem({...item, error: {}}), false);
+  assert.equal(operatorClosedWorkItem({...item, error: {operatorClosed: 'true'}}), false);
+  assert.equal(operatorClosedWorkItem(null), false);
+
+  const cloud = readFileSync(new URL('../server/routes/capture-cloud.js', import.meta.url), 'utf8');
+  assert.match(cloud, /item => !\(automatic && operatorClosedWorkItem\(item\)\) &&/u,
+    'dispatchCrossDeviceRetry skips it only for automatic (cron, duty) callers');
 });
 
 test('the SQL twin checks the same four facts with constant cost', () => {
