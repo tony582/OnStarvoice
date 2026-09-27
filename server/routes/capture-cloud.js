@@ -100,8 +100,15 @@ import {
   releaseNeedsActionStopFences,
 } from '../services/capture-stop-fence-release.js';
 import {
+  ELASTIC_FILTER_VERIFICATION_CODES,
+  FILTER_VERIFICATION_SETTLED_EVENT,
+  FILTER_VERIFICATION_STOP_REASON,
   elasticRoundAnchorSql,
   elasticRoundRelaxAfterMs,
+  filterVerificationErrorCode,
+  filterVerificationSettledEventMessage,
+  settleElasticFilterVerification,
+  settleElasticFilterVerificationBatch,
 } from '../services/capture-elastic-policy.js';
 
 function requireCaptureAgent(req, res, next) {
@@ -1584,6 +1591,45 @@ export function elasticRecoveryHoldRemainingMs(
   if (!Number.isFinite(recoveryAnchorAt)) return 0;
   const holdMs = elasticAgentRecoveryHoldMs(source);
   return Math.max(0, recoveryAnchorAt + holdMs - Number(now || Date.now()));
+}
+
+function filterVerificationAlreadySettled(item = {}) {
+  return text(item?.status, 80) === 'failed' &&
+    safeJson(item?.error).automaticRetryStopReason === FILTER_VERIFICATION_STOP_REASON;
+}
+
+async function appendFilterVerificationSettledEvent(tx, {
+  tenantId,
+  parentTaskId,
+  agentId = null,
+  itemId,
+  keyword,
+  settlement,
+  settledAt,
+}) {
+  await appendEvent(tx, {
+    tenantId,
+    taskId: parentTaskId,
+    agentId,
+    eventType: FILTER_VERIFICATION_SETTLED_EVENT,
+    actorType: 'system',
+    actorName: '云端弹性调度器',
+    status: 'failed',
+    message: filterVerificationSettledEventMessage({
+      keyword,
+      attempts: settlement.attempts,
+      agents: settlement.agents,
+    }),
+    payload: {
+      itemId,
+      keyword: text(keyword, 120),
+      errorCode: text(settlement.code, 100),
+      attemptCount: Number(settlement.attempts) || 0,
+      agentCount: Number(settlement.agents) || 0,
+      limit: Number(settlement.limit) || 0,
+      settledAt,
+    },
+  });
 }
 
 function elasticRecoveryMetadataForItem(item = {}) {
@@ -5973,7 +6019,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       : text(rawEntryError, 1000)
         ? {message: text(rawEntryError, 1000)}
         : {};
-    const error = keywordServiceAbnormal
+    let error = keywordServiceAbnormal
       ? {}
       : {
       ...(unexpectedCheckpointCancellation
@@ -6098,7 +6144,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     };
     const currentItemState = elasticPool
       ? await tx.queryOne(`
-          SELECT id, attempt_count, safety_handoff_count, metadata, error
+          SELECT id, status, attempt_count, safety_handoff_count, metadata, error
           FROM capture_task_items
           WHERE tenant_id = $1
             AND task_id = $2
@@ -6125,7 +6171,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
           task.id,
         )
       : {attemptBudget: serverAttemptCount, metadataPatch: {}};
-    const status = projectElasticKeywordRecoveryStatus({
+    let status = projectElasticKeywordRecoveryStatus({
       elasticPool,
       status: checkpointProjectedStatus,
       error,
@@ -6135,6 +6181,27 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
       agentAttemptLimit: elasticItemAgentAttemptLimit(parent.metadata, currentItemState?.metadata),
     });
+    // F2: the same time-filter failure on K attempts (or on every Agent of a
+    // pool smaller than K) settles the keyword instead of searching again.
+    // Decided before the recovery metadata so a settled item keeps no anchor.
+    const filterVerification = currentItemState
+      ? await settleElasticFilterVerification(tx, {
+          tenantId: agent.tenant_id,
+          itemId: currentItemState.id,
+          status,
+          error,
+          checkpoint,
+          elasticPool,
+          agentAttemptLimit: elasticItemAgentAttemptLimit(parent.metadata, currentItemState.metadata),
+          itemMetadata: currentItemState.metadata,
+          reporterAgentId: agent.id,
+          attemptNumber: serverAttemptCount,
+        })
+      : null;
+    if (filterVerification) {
+      status = 'failed';
+      error = filterVerification.error;
+    }
     const recovery = buildElasticRecoveryMetadata({
       status,
       error,
@@ -6198,6 +6265,20 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     ]);
     if (!item) continue;
     projectedItemIds.push(item.id);
+    if (
+      filterVerification &&
+      !filterVerificationAlreadySettled(currentItemState)
+    ) {
+      await appendFilterVerificationSettledEvent(tx, {
+        tenantId: agent.tenant_id,
+        parentTaskId: task.parent_task_id,
+        agentId: agent.id,
+        itemId: item.id,
+        keyword,
+        settlement: filterVerification,
+        settledAt: 'projection',
+      });
+    }
 
     await tx.execute(`
       UPDATE capture_task_item_attempts
@@ -6355,7 +6436,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
             task.id,
           )
         : {attemptBudget: serverAttemptCount, metadataPatch: {}};
-      const activeUnresolvedStatus = childServiceAbnormalSettlesEmpty
+      let activeUnresolvedStatus = childServiceAbnormalSettlesEmpty
         ? 'completed'
         : projectElasticKeywordRecoveryStatus({
             elasticPool,
@@ -6367,9 +6448,32 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
             technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
             agentAttemptLimit: elasticAgentAttemptLimit,
           });
+      // F2 on the active-keyword path; see the checkpoint-entry projection.
+      const activeFilterVerification =
+        currentActiveItem && !childServiceAbnormalSettlesEmpty
+          ? await settleElasticFilterVerification(tx, {
+              tenantId: agent.tenant_id,
+              itemId: currentActiveItem.id,
+              status: activeUnresolvedStatus,
+              error: childError,
+              checkpoint: activeCheckpoint,
+              elasticPool,
+              agentAttemptLimit: elasticItemAgentAttemptLimit(
+                parent.metadata,
+                currentActiveItem.metadata,
+              ),
+              itemMetadata: currentActiveItem.metadata,
+              reporterAgentId: agent.id,
+              attemptNumber: serverAttemptCount,
+            })
+          : null;
+      const activeFailureError = activeFilterVerification
+        ? activeFilterVerification.error
+        : childError;
+      if (activeFilterVerification) activeUnresolvedStatus = 'failed';
       const recovery = buildElasticRecoveryMetadata({
         status: activeUnresolvedStatus,
-        error: childError,
+        error: activeFailureError,
         checkpoint: activeCheckpoint,
         attemptCount: serverAttemptCount,
         sourceAgentId: agent.id,
@@ -6377,15 +6481,18 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         agentAttemptLimit: elasticAgentAttemptLimit,
       });
       const activeChildError = Object.keys(recovery).length > 0
-        ? {...childError, recovery}
-        : childError;
+        ? {...activeFailureError, recovery}
+        : activeFailureError;
       const activeTerminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(
         activeUnresolvedStatus,
       );
       const activeItem = await tx.queryOne(`
         UPDATE capture_task_items
         SET status = $1,
-          metadata = metadata ||
+          metadata = CASE
+              WHEN $14::boolean THEN metadata #- '{checkpoint,recovery}'
+              ELSE metadata
+            END ||
             CASE
               WHEN $12::boolean THEN jsonb_build_object(
                 'checkpoint', $13::jsonb
@@ -6435,9 +6542,21 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         JSON.stringify(attemptBudgetProjection.metadataPatch),
         childServiceAbnormalSettlesEmpty,
         JSON.stringify(activeCheckpoint),
+        Boolean(activeFilterVerification),
       ]);
       if (activeItem) {
         projectedItemIds.push(activeItem.id);
+        if (activeFilterVerification) {
+          await appendFilterVerificationSettledEvent(tx, {
+            tenantId: agent.tenant_id,
+            parentTaskId: task.parent_task_id,
+            agentId: agent.id,
+            itemId: activeItem.id,
+            keyword: activeKeyword,
+            settlement: activeFilterVerification,
+            settledAt: 'projection',
+          });
+        }
         if (childServiceAbnormalSettlesEmpty) {
           await tx.execute(`
             UPDATE capture_task_item_attempts
@@ -7221,7 +7340,11 @@ async function negativePatrolFairClaimWait(tx, {agent, candidate, resourcePolicy
 }
 
 export async function dispatchNextElasticWorkItem(tx, options = {}) {
-  return dispatchNextElasticWorkItemWithinBudget(tx, options, 10);
+  return dispatchNextElasticWorkItemWithinBudget(
+    tx,
+    {...options, slotChecked: false},
+    10,
+  );
 }
 
 async function dispatchNextElasticWorkItemWithinBudget(tx, {
@@ -7230,12 +7353,17 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   excludedItemIds = [],
   targetedOnly = false,
   allowTargetedFallback = false,
+  // Recursive calls of the same heartbeat: the first call already proved the
+  // execution slot free (stop-fence SQL, ~275 ms) and checked the recovery
+  // hold. Neither result feeds the candidate SQL, and settling other items in
+  // this transaction cannot occupy this Agent's slot, so they run once.
+  slotChecked = false,
 } = {}, remainingSkipBudget) {
   if (remainingSkipBudget <= 0) {
     // Keep heartbeat work bounded without repeatedly scanning the same busy
     // keyword head on every heartbeat and starving spare-capacity revisits.
     return targetedOnly || !allowTargetedFallback ? null : dispatchNextElasticWorkItemWithinBudget(tx, {
-      agent, capabilities, excludedItemIds, targetedOnly: true,
+      agent, capabilities, excludedItemIds, targetedOnly: true, slotChecked: true,
     }, 10);
   }
   if (agent?.capabilities?.agentKind === 'android_mobile') return null;
@@ -7258,48 +7386,50 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   if (!canClaimKeyword && !canClaimNegativePost && !canClaimWatchedContent) {
     return null;
   }
-  const busy = await findCaptureAgentExecutionSlotBlocker(
-    tx,
-    agent.tenant_id,
-    agent.id,
-  );
-  if (busy) return null;
-  // Do not turn browser-local cleanup evidence into a queue-wide allocation
-  // lock. The Extension's execution lock is the authority for local
-  // concurrency; assignment revisions and idempotent persistence fence late or
-  // duplicate results. A missing historical local-closure snapshot is useful
-  // audit evidence, but it must never strand an otherwise idle Agent.
-  const recentRecoveryAttempt = await tx.queryOne(`
-    SELECT attempt.status, attempt.error, attempt.checkpoint,
-      attempt.finished_at, attempt.updated_at,
-      execution.finished_at AS execution_finished_at
-    FROM capture_task_item_attempts attempt
-    JOIN capture_tasks parent
-      ON parent.id = attempt.parent_task_id
-      AND parent.tenant_id = attempt.tenant_id
-    LEFT JOIN capture_tasks execution
-      ON execution.id = attempt.execution_task_id
-      AND execution.tenant_id = attempt.tenant_id
-    WHERE attempt.tenant_id = $1
-      AND attempt.agent_id = $2
-      AND attempt.status IN ('retryable', 'needs_action', 'failed')
-      AND attempt.updated_at > now() - interval '30 minutes'
-      AND (
-        COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
-        OR (
-          parent.metadata->>'workflow' = 'negative_post_patrol'
-          AND parent.metadata->>'perItemAdmissionV1' = 'true'
+  if (!slotChecked) {
+    const busy = await findCaptureAgentExecutionSlotBlocker(
+      tx,
+      agent.tenant_id,
+      agent.id,
+    );
+    if (busy) return null;
+    // Do not turn browser-local cleanup evidence into a queue-wide allocation
+    // lock. The Extension's execution lock is the authority for local
+    // concurrency; assignment revisions and idempotent persistence fence late or
+    // duplicate results. A missing historical local-closure snapshot is useful
+    // audit evidence, but it must never strand an otherwise idle Agent.
+    const recentRecoveryAttempt = await tx.queryOne(`
+      SELECT attempt.status, attempt.error, attempt.checkpoint,
+        attempt.finished_at, attempt.updated_at,
+        execution.finished_at AS execution_finished_at
+      FROM capture_task_item_attempts attempt
+      JOIN capture_tasks parent
+        ON parent.id = attempt.parent_task_id
+        AND parent.tenant_id = attempt.tenant_id
+      LEFT JOIN capture_tasks execution
+        ON execution.id = attempt.execution_task_id
+        AND execution.tenant_id = attempt.tenant_id
+      WHERE attempt.tenant_id = $1
+        AND attempt.agent_id = $2
+        AND attempt.status IN ('retryable', 'needs_action', 'failed')
+        AND attempt.updated_at > now() - interval '30 minutes'
+        AND (
+          COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+          OR (
+            parent.metadata->>'workflow' = 'negative_post_patrol'
+            AND parent.metadata->>'perItemAdmissionV1' = 'true'
+          )
         )
-      )
-    ORDER BY COALESCE(
-      attempt.finished_at,
-      execution.finished_at,
-      attempt.created_at
-    ) DESC, attempt.id DESC
-    LIMIT 1
-  `, [agent.tenant_id, agent.id]);
-  if (elasticRecoveryHoldRemainingMs(recentRecoveryAttempt) > 0) {
-    return null;
+      ORDER BY COALESCE(
+        attempt.finished_at,
+        execution.finished_at,
+        attempt.created_at
+      ) DESC, attempt.id DESC
+      LIMIT 1
+    `, [agent.tenant_id, agent.id]);
+    if (elasticRecoveryHoldRemainingMs(recentRecoveryAttempt) > 0) {
+      return null;
+    }
   }
   // A safety challenge fences this exact item/account pair through the
   // append-only same-Agent attempt check below. It must not quarantine the
@@ -7618,7 +7748,60 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     agent, capabilities, targetedOnly,
     allowTargetedFallback: allowTargetedFallback || candidate.item_type === 'keyword',
     excludedItemIds: [...excludedItemIds, candidate.item_id],
+    slotChecked: true,
   }, remainingSkipBudget - 1);
+
+  // F2 backstop for keywords that were already retryable before the
+  // projection rule existed: settle the whole parent's repeated time-filter
+  // failures in one statement, then pick a candidate again. Only a legacy
+  // time-filter retryable candidate pays for this; everything else only runs
+  // this JS check.
+  if (
+    candidate.item_type === 'keyword' &&
+    candidate.item_status === 'retryable' &&
+    ELASTIC_FILTER_VERIFICATION_CODES.has(filterVerificationErrorCode(
+      candidate.item_error,
+      safeJson(candidate.item_metadata).checkpoint,
+    )) &&
+    safeJson(candidate.parent_metadata).distributionMode === 'elastic_pool'
+  ) {
+    const settledItems = await settleElasticFilterVerificationBatch(tx, {
+      tenantId: agent.tenant_id,
+      parentTaskId: candidate.parent_id,
+      agentAttemptLimit: elasticParentAgentAttemptLimit(candidate.parent_metadata),
+    });
+    if (settledItems.length > 0) {
+      await refreshOrchestrationParentTask(tx, {
+        tenantId: agent.tenant_id,
+        parentTaskId: candidate.parent_id,
+        actorType: 'system',
+        actorName: '云端弹性调度器',
+        eventAgentId: agent.id,
+      });
+      for (const settledItem of settledItems) {
+        await appendFilterVerificationSettledEvent(tx, {
+          tenantId: agent.tenant_id,
+          parentTaskId: candidate.parent_id,
+          agentId: agent.id,
+          itemId: settledItem.id,
+          keyword: settledItem.keyword,
+          settlement: {
+            code: settledItem.error_code,
+            attempts: settledItem.attempts,
+            agents: settledItem.agents,
+            limit: settledItem.limit,
+          },
+          settledAt: 'claim',
+        });
+      }
+    }
+    if (settledItems.some(settledItem => settledItem.id === candidate.item_id)) {
+      return dispatchNextElasticWorkItemWithinBudget(tx, {
+        agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback,
+        slotChecked: true,
+      }, remainingSkipBudget - 1);
+    }
+  }
 
   if (candidate.item_type === 'negative_post') {
     // Archiving uses this same record lock. Acquire it without waiting, then
@@ -7674,7 +7857,8 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         payload: {itemId: candidate.item_id, recordId: candidate.record_id},
       });
       return dispatchNextElasticWorkItemWithinBudget(
-        tx, {agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback}, remainingSkipBudget - 1,
+        tx, {agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback, slotChecked: true},
+        remainingSkipBudget - 1,
       );
     }
   }

@@ -56,7 +56,10 @@ import {
   trimMobilePlanSnapshot,
 } from '../services/android-control/mobile-tasks.js';
 import {STOP_FENCE_OPERATOR_RELEASED_REASON} from '../services/capture-stop-fence.js';
-import {elasticRoundRelaxAfterMs} from '../services/capture-elastic-policy.js';
+import {
+  FILTER_VERIFICATION_SETTLEMENT_KEYS,
+  elasticRoundRelaxAfterMs,
+} from '../services/capture-elastic-policy.js';
 
 const router = Router();
 const UUID_PATTERN =
@@ -5997,7 +6000,10 @@ router.post(
                 ]::text[]
               ) || jsonb_build_object(
                 'retrySourceExecutionTaskId', $5::uuid::text,
-                'retryRequestKey', $6::uuid::text
+                'retryRequestKey', $6::uuid::text,
+                -- A manual retry opens a fresh time-filter window (F2):
+                -- earlier failures no longer count towards the limit.
+                'filterVerificationBaseAttemptCount', attempt_count
               ),
               assigned_at = now(),
               dispatched_at = now(),
@@ -6132,6 +6138,15 @@ router.post(
             const preserved = await tx.queryOne(`
               UPDATE capture_task_items
               SET status = 'retryable',
+                -- Back in the automatic queue: a time-filter settlement no
+                -- longer describes this item, show the original failure.
+                error = CASE
+                  WHEN error->>'automaticRetryStopped' = 'true' THEN
+                    (error - $9::text[]) || jsonb_build_object(
+                      'message', COALESCE(error->>'originalMessage', error->>'message', '')
+                    )
+                  ELSE error
+                END,
                 metadata = (
                   metadata - ARRAY[
                     'retryPending', 'retryWaitingSince',
@@ -6149,7 +6164,8 @@ router.post(
                 ) || jsonb_build_object(
                   'elasticRetryWaitingSince', now(),
                   'elasticRetryWaitingReason', $1::text,
-                  'elasticRetryRequestKey', $2::uuid::text
+                  'elasticRetryRequestKey', $2::uuid::text,
+                  'filterVerificationBaseAttemptCount', attempt_count
                 ),
                 updated_at = now()
               WHERE id = $3 AND tenant_id = $4 AND task_id = $5
@@ -6167,6 +6183,7 @@ router.post(
               item.execution_task_id,
               Number(item.assignment_revision || 0),
               Number(item.attempt_count || 0),
+              FILTER_VERIFICATION_SETTLEMENT_KEYS,
             ]);
             if (!preserved) {
               const error = new Error('orchestration_retry_item_conflict');
