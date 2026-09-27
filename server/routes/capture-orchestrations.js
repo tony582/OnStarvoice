@@ -5515,8 +5515,12 @@ router.post(
         const currentItems = await tx.queryAll(`SELECT status FROM capture_task_items
           WHERE tenant_id = $1 AND task_id = $2`, [req.tenantId, parentId]);
         const aggregate = aggregateParentTaskItems(currentItems);
+        // Like 「重试失败关键词」: the requeued round must surface again.
         await tx.execute(`UPDATE capture_tasks SET status = 'running',
           orchestration_revision = $3, finished_at = NULL, updated_at = now(),
+          attention_dismissed_at = NULL, attention_dismissed_by_user_id = NULL,
+          attention_dismissed_by_name = '',
+          metadata = metadata - 'historyClearedAt' - 'historyClearedBy',
           counts = $4::jsonb, progress = $5::jsonb,
           message = '失败巡查已恢复到原队列，空闲节点将重新核对范围后领取'
           WHERE tenant_id = $1 AND id = $2`, [req.tenantId, parentId, revision,
@@ -6262,7 +6266,8 @@ router.post(
             status = $1,
             progress = $2::jsonb,
             counts = $3::jsonb,
-            metadata = metadata || jsonb_build_object(
+            metadata = (metadata - 'historyClearedAt' - 'historyClearedBy') ||
+              jsonb_build_object(
               'lastRetryAt', now(),
               'lastRetryTaskIds', $4::jsonb,
               'lastRetryRequestKey', $5::uuid::text,
@@ -6278,6 +6283,12 @@ router.post(
               ELSE '失败关键词已按单项租约分片下发重试'
             END,
             finished_at = NULL,
+            -- A re-dispatched batch is live again: an earlier dismissal,
+            -- history clear or 「结束并移到历史」 must not hide its next
+            -- needs_action from 需处理 (cross-device retry does the same).
+            attention_dismissed_at = NULL,
+            attention_dismissed_by_user_id = NULL,
+            attention_dismissed_by_name = '',
             updated_at = now(),
             source_updated_at = now()
           WHERE id = $9 AND tenant_id = $10
@@ -7004,7 +7015,8 @@ router.post(
             status = $1,
             progress = $2::jsonb,
             counts = $3::jsonb,
-            metadata = metadata || jsonb_build_object(
+            metadata = (metadata - 'historyClearedAt' - 'historyClearedBy') ||
+              jsonb_build_object(
               'lastHandoffAt', now(),
               'lastHandoffSourceExecutionTaskId', $4::uuid::text,
               'lastHandoffSuccessorTaskId', $5::uuid::text,
@@ -7012,6 +7024,9 @@ router.post(
             ),
             message = '未开始关键词已由人工确认转交空闲节点',
             finished_at = NULL,
+            attention_dismissed_at = NULL,
+            attention_dismissed_by_user_id = NULL,
+            attention_dismissed_by_name = '',
             updated_at = now(),
             source_updated_at = now()
           WHERE id = $7 AND tenant_id = $8

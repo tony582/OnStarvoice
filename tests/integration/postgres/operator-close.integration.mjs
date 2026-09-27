@@ -43,8 +43,8 @@ test('operator close ends dead needs_action roots without releasing fences, live
   const {createSession} = await import('../../../server/services/auth-service.js');
   const {normalizeCloudTaskSnapshot, findCaptureAgentExecutionSlotBlocker} =
     await import('../../../server/services/capture-cloud.js');
-  const {clearCaptureOverviewProjectionCache, dispatchNextElasticWorkItem, mirrorTaskSnapshot} =
-    await import('../../../server/routes/capture-cloud.js');
+  const {clearCaptureOverviewProjectionCache, dispatchNextElasticWorkItem, mirrorTaskSnapshot,
+    refreshOrchestrationParentTask} = await import('../../../server/routes/capture-cloud.js');
   const {loadOperatorCloseEligibility} = await import('../../../server/services/capture-operator-close.js');
   const {createAndroidControlService} = await import('../../../server/services/android-control/service.js');
   const {createDiscoveryRepository} = await import('../../../server/services/capture-discovery/repository.js');
@@ -832,5 +832,89 @@ test('operator close ends dead needs_action roots without releasing fences, live
     const again = await f.request('/history/clear', {body: {taskIds: [normal.id, attention.id]}});
     assert.equal(again.status, 200);
     assert.deepEqual(again.body.alreadyClearedTaskIds, [normal.id]);
+  });
+
+  await t.test('a closed batch that 「重试失败关键词」 or 「恢复失败巡查」 reopens returns to 需处理, even after a history clear', async st => {
+    const f = await fixture(st);
+    const [mars, jupiter] = [await f.addAgent('火星'), await f.addAgent('木星')];
+    // Offline pool: the retried keyword waits instead of being dispatched, so
+    // the only change is the reopen itself.
+    await query(`UPDATE capture_agents SET last_heartbeat_at=now()-interval '1 day',
+      last_full_heartbeat_at=now()-interval '1 day',last_liveness_at=now()-interval '1 day' WHERE id = ANY($1::uuid[])`,
+    [[mars.id, jupiter.id]]);
+    const parent = await f.batch({agents: [mars, jupiter]});
+    const marsChild = await f.child(parent, mars);
+    await f.item(parent, {keyword: '君越壁纸', status: 'completed', execution: marsChild, agent: mars});
+    const stuck = await f.item(parent, {keyword: '昂科威壁纸', status: 'needs_action', execution: marsChild, agent: mars,
+      error: TECHNICAL_ERROR});
+    assert.equal((await f.close(parent.id)).status, 200);
+    const closed = await f.row(parent.id);
+    assert.equal(closed.status, 'completed_with_failures');
+    assert.ok(closed.attention_dismissed_at);
+    const cleared = await f.request('/history/clear', {body: {taskIds: [parent.id]}});
+    assert.deepEqual(cleared.body.clearedTaskIds, [parent.id], JSON.stringify(cleared.body));
+    assert.ok((await f.row(parent.id)).metadata.historyClearedAt);
+
+    const retried = await f.request(`/orchestrations/${parent.id}/retry-items`, {body: {
+      requestKey: randomUUID(), expectedRevision: closed.orchestration_revision, itemIds: [stuck.id]}});
+    assert.equal(retried.status, 201, JSON.stringify(retried.body));
+    const reopened = await f.row(parent.id);
+    assert.equal(reopened.orchestration_revision, closed.orchestration_revision + 1);
+    assert.equal(reopened.attention_dismissed_at, null, 'the retried batch is no longer dismissed');
+    assert.equal(reopened.attention_dismissed_by_user_id, null);
+    assert.equal(reopened.attention_dismissed_by_name, '');
+    assert.equal(reopened.metadata.historyClearedAt, undefined, 'nor cleared from history');
+    assert.equal(reopened.metadata.historyClearedBy, undefined);
+    assert.ok(reopened.metadata.operatorClose?.closedAt, 'the close marker stays as audit');
+    const live = await f.overviewTask(parent.id);
+    assert.ok(live, 'the live batch is on the overview');
+    assert.deepEqual(live.operator_close, {eligible: false, reason: 'live_item'});
+
+    // The retried keyword needs manual action again (e.g. a security block).
+    await query("UPDATE capture_task_items SET status='needs_action' WHERE id=$1", [stuck.id]);
+    await withTransaction(tx => refreshOrchestrationParentTask(tx, {tenantId: f.tenant.id, parentTaskId: parent.id}));
+    const again = await f.row(parent.id);
+    assert.equal(again.status, 'needs_action');
+    assert.equal(again.attention_dismissed_at, null);
+    const card = await f.overviewTask(parent.id);
+    assert.equal(card?.status, 'needs_action', 'back in 需处理');
+    assert.equal(card.attention_dismissed_at, null);
+    assert.deepEqual(card.operator_close, {eligible: true, reason: ''}, 'and can be ended again');
+    const history = await f.request('/history?page=1&pageSize=100');
+    assert.equal(history.status, 200, JSON.stringify(history.body));
+    assert.equal(history.body.tasks.some(row => row.id === parent.id), false, 'not listed in history');
+    const reclosed = await f.close(parent.id);
+    assert.equal(reclosed.status, 200, JSON.stringify(reclosed.body));
+    assert.equal(reclosed.body.idempotent, false);
+    const final = await f.row(parent.id);
+    assert.equal(final.status, 'completed_with_failures');
+    assert.ok(final.attention_dismissed_at);
+    assert.equal(final.metadata.operatorClose.orchestrationRevision, reopened.orchestration_revision);
+    assert.equal((await f.events(parent.id, 'task_operator_closed')).length, 2);
+
+    // 恢复失败巡查 on a closed negative-patrol batch surfaces it the same way.
+    const [record] = await query(`INSERT INTO records(tenant_id,platform,external_id,title) VALUES($1,'xiaohongshu',$2,
+      '负面帖子') RETURNING id`, [f.tenant.id, randomUUID()]);
+    await query(`INSERT INTO unattended_negative_patrol_state(tenant_id,platform,external_id,record_id,first_eligible_at,
+      last_eligible_at,needs_action,failure_count) SELECT $1,'xiaohongshu',external_id,id,now(),now(),false,2
+      FROM records WHERE id=$2`, [f.tenant.id, record.id]);
+    const patrol = await f.batch({agents: [jupiter], metadata: {negativePatrolRun: {timezone: 'Asia/Shanghai'}}});
+    const patrolChild = await f.child(patrol, jupiter, {status: 'failed'});
+    const patrolItem = await f.item(patrol, {status: 'failed', itemType: 'negative_post', execution: patrolChild,
+      agent: jupiter, recordId: record.id, metadata: {unattendedNegativePatrol: true}, attemptStatus: 'failed'});
+    const patrolStuckChild = await f.child(patrol, jupiter);
+    await f.item(patrol, {status: 'needs_action', execution: patrolStuckChild, agent: jupiter, error: TECHNICAL_ERROR});
+    assert.equal((await f.close(patrol.id)).status, 200);
+    const closedPatrol = await f.row(patrol.id);
+    assert.ok(closedPatrol.attention_dismissed_at);
+    assert.deepEqual((await f.request('/history/clear', {body: {taskIds: [patrol.id]}})).body.clearedTaskIds, [patrol.id]);
+    const recovered = await f.request(`/orchestrations/${patrol.id}/negative-patrol/retry`, {body: {
+      itemIds: [patrolItem.id], expectedRevision: closedPatrol.orchestration_revision}});
+    assert.equal(recovered.status, 200, JSON.stringify(recovered.body));
+    const patrolReopened = await f.row(patrol.id);
+    assert.equal(patrolReopened.status, 'running');
+    assert.equal(patrolReopened.attention_dismissed_at, null);
+    assert.equal(patrolReopened.metadata.historyClearedAt, undefined);
+    assert.ok(await f.overviewTask(patrol.id), 'the recovered patrol is on the overview');
   });
 });
