@@ -10754,40 +10754,59 @@ router.post('/history/clear', requireTenantAccess, requireSessionUser, requireTe
         ORDER BY t.id
         FOR UPDATE OF t
       `, [req.tenantId, taskIds]);
-      if (tasks.length !== taskIds.length) return {error: 'task_not_found'};
-      if (tasks.some(task => task.parent_task_id || task.business_root_visible !== true
-        || task.history_eligible !== true || ['needs_action', 'interrupted'].includes(task.status))) {
-        return {error: 'task_not_clearable'};
+      // Each row is decided on its own: a stale row in the selection (for
+      // example a canceled batch that still owns an unfinished item) is
+      // reported in `skipped` instead of failing the whole selection.
+      const found = new Map(tasks.map(task => [String(task.id).toLowerCase(), task]));
+      const skipped = [];
+      const candidates = [];
+      for (const taskId of taskIds) {
+        const task = found.get(taskId);
+        if (!task) skipped.push({taskId, reason: 'not_found'});
+        else if (task.parent_task_id) skipped.push({taskId: task.id, reason: 'not_root'});
+        else if (task.business_root_visible !== true || task.history_eligible !== true
+          || ['needs_action', 'interrupted'].includes(task.status)) {
+          skipped.push({taskId: task.id, reason: 'not_in_history'});
+        } else candidates.push(task);
       }
-      const blocker = await tx.queryOne(`
+      const blockedRows = candidates.length === 0 ? [] : await tx.queryAll(`
         WITH RECURSIVE task_tree AS (
-          SELECT id FROM capture_tasks WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+          SELECT id AS root_id, id FROM capture_tasks WHERE tenant_id = $1 AND id = ANY($2::uuid[])
           UNION
-          SELECT child.id FROM capture_tasks child
-          JOIN task_tree parent ON child.parent_task_id = parent.id
+          SELECT tree.root_id, child.id FROM capture_tasks child
+          JOIN task_tree tree ON child.parent_task_id = tree.id
           WHERE child.tenant_id = $1
         )
-        SELECT EXISTS (
-          SELECT 1 FROM capture_tasks child JOIN task_tree tree ON tree.id = child.id
-          WHERE child.tenant_id = $1 AND child.status IN (
+        SELECT DISTINCT tree.root_id
+        FROM task_tree tree
+        WHERE EXISTS (
+          SELECT 1 FROM capture_tasks child
+          WHERE child.tenant_id = $1 AND child.id = tree.id AND child.status IN (
             'pending', 'waiting_device', 'claimed', 'running', 'recovering',
             'resume_requested'
           )
         ) OR EXISTS (
-          SELECT 1 FROM capture_task_items item JOIN task_tree tree ON tree.id = item.task_id
-          WHERE item.tenant_id = $1 AND item.status IN (
+          SELECT 1 FROM capture_task_items item
+          WHERE item.tenant_id = $1 AND item.task_id = tree.id AND item.status IN (
             'pending', 'assigned', 'dispatch_pending', 'dispatched',
             'waiting_device', 'running', 'retryable', 'needs_action'
           )
         ) OR EXISTS (
-          SELECT 1 FROM capture_agent_commands command JOIN task_tree tree ON tree.id = command.task_id
-          WHERE command.tenant_id = $1 AND command.status IN ('pending', 'acknowledged')
+          SELECT 1 FROM capture_agent_commands command
+          WHERE command.tenant_id = $1 AND command.task_id = tree.id
+            AND command.status IN ('pending', 'acknowledged')
             AND command.expires_at > now()
-        ) AS blocked
-      `, [req.tenantId, taskIds]);
-      if (blocker?.blocked) return {error: 'task_not_clearable'};
-      const alreadyClearedTaskIds = tasks.filter(task => text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
-      const clearedTaskIds = tasks.filter(task => !text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
+        )
+      `, [req.tenantId, candidates.map(task => task.id)]);
+      const blocked = new Set(blockedRows.map(row => String(row.root_id).toLowerCase()));
+      const clearable = [];
+      for (const task of candidates) {
+        if (blocked.has(String(task.id).toLowerCase())) skipped.push({taskId: task.id, reason: 'live_work'});
+        else clearable.push(task);
+      }
+      skipped.sort((left, right) => String(left.taskId).localeCompare(String(right.taskId)));
+      const alreadyClearedTaskIds = clearable.filter(task => text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
+      const clearedTaskIds = clearable.filter(task => !text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
       if (clearedTaskIds.length > 0) {
         await tx.execute(`
           UPDATE capture_tasks
@@ -10797,20 +10816,25 @@ router.post('/history/clear', requireTenantAccess, requireSessionUser, requireTe
           WHERE tenant_id = $1 AND id = ANY($2::uuid[])
         `, [req.tenantId, clearedTaskIds, req.user.id]);
       }
-      return {clearedTaskIds, alreadyClearedTaskIds};
+      return {clearedTaskIds, alreadyClearedTaskIds, skipped};
     });
-    if (result.error) {
-      return res.status(result.error === 'task_not_found' ? 404 : 409).json({
+    const clearedCount = result.clearedTaskIds.length + result.alreadyClearedTaskIds.length;
+    if (clearedCount === 0) {
+      const notFound = result.skipped.every(skip => skip.reason === 'not_found');
+      return res.status(notFound ? 404 : 409).json({
         ok: false,
-        error: result.error,
-        message: result.error === 'task_not_found' ? '任务不存在或无权访问' : '仅可清除已结束且无需处理的历史主任务，请先处理仍在执行或等待恢复的任务',
+        error: notFound ? 'task_not_found' : 'task_not_clearable',
+        message: notFound ? '任务不存在或无权访问' : '仅可清除已结束且无需处理的历史主任务，请先处理仍在执行或等待恢复的任务',
+        skipped: result.skipped,
       });
     }
     clearCaptureOverviewProjectionCache();
     return res.json({
       ok: true, ...result,
-      clearedCount: result.clearedTaskIds.length + result.alreadyClearedTaskIds.length,
-      message: '已从历史列表移除，任务详情、采集内容和结果仍保留',
+      clearedCount,
+      message: result.skipped.length > 0
+        ? `已移出 ${clearedCount} 条；${result.skipped.length} 条未移出：仍有未结束的工作或仍需处理`
+        : '已从历史列表移除，任务详情、采集内容和结果仍保留',
     });
   } catch (err) {
     return next(err);

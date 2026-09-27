@@ -164,14 +164,30 @@ test('task history preserves business roots and clears only terminal visibility 
     assert.equal((await request('/tasks/not-a-uuid')).status, 400);
   });
 
-  await t.test('clear requires writer, bounds and same-tenant complete root validation; mixed batches are atomic', async () => {
+  await t.test('clear requires writer, bounds and same-tenant complete root validation; mixed batches clear eligible roots and report the rest', async () => {
     assert.equal((await request('/history/clear', {body: {taskIds: [morning.id]}, role: 'tenant_viewer'})).status, 403);
     for (const taskIds of [[], ['not-a-uuid'], Array(101).fill(morning.id)]) {
       assert.equal((await request('/history/clear', {body: {taskIds}})).status, 400);
     }
-    assert.equal((await request('/history/clear', {body: {taskIds: [morning.id, foreign.id]}})).status, 404);
+    const mixedRoot = await task({});
+    const withForeign = await request('/history/clear', {body: {taskIds: [mixedRoot.id, foreign.id]}});
+    assert.equal(withForeign.status, 200);
+    assert.deepEqual(withForeign.body.clearedTaskIds, [mixedRoot.id]);
+    assert.deepEqual(withForeign.body.skipped, [{taskId: foreign.id, reason: 'not_found'}]);
+    assert.match(withForeign.body.message, /已移出 1 条；1 条未移出/u);
+    assert.equal((await pool.query('SELECT metadata FROM capture_tasks WHERE id = $1', [foreign.id])).rows[0].metadata.historyClearedAt, undefined);
+    assert.equal((await request('/history/clear', {body: {taskIds: [foreign.id]}})).status, 404);
     for (const row of hidden) {
-      assert.equal((await request('/history/clear', {body: {taskIds: [morning.id, row.id]}})).status, 409, `${row.task_type}/${row.status} must not clear`);
+      const mixed = await request('/history/clear', {body: {taskIds: [mixedRoot.id, row.id]}});
+      assert.equal(mixed.status, 200, `${row.task_type}/${row.status} must not fail the selection`);
+      assert.deepEqual(mixed.body.alreadyClearedTaskIds, [mixedRoot.id]);
+      assert.deepEqual(mixed.body.skipped, [{taskId: row.id, reason: row.parent_task_id ? 'not_root' : 'not_in_history'}],
+        `${row.task_type}/${row.status} must be reported`);
+      const alone = await request('/history/clear', {body: {taskIds: [row.id]}});
+      assert.equal(alone.status, 409, `${row.task_type}/${row.status} must not clear`);
+      assert.equal(alone.body.error, 'task_not_clearable');
+      assert.deepEqual(alone.body.skipped, mixed.body.skipped);
+      assert.equal((await pool.query('SELECT metadata FROM capture_tasks WHERE id = $1', [row.id])).rows[0].metadata.historyClearedAt, undefined);
     }
     const untouched = (await pool.query('SELECT metadata FROM capture_tasks WHERE id = $1', [morning.id])).rows[0];
     assert.equal(untouched.metadata.historyClearedAt, undefined);
