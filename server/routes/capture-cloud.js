@@ -92,6 +92,8 @@ import {
   reconcileCaptureTaskStopFences,
   rotateStopFenceChecks,
   stopFenceAutoCheckEnabled,
+  stopFenceNeedsActionAutoCheckEnabled,
+  stopFenceNeedsActionAutoCheckable,
   stopFenceOperatorReleasable,
 } from '../services/capture-stop-fence.js';
 import {
@@ -6575,6 +6577,9 @@ export async function mirrorTaskSnapshot(
   delete agentSnapshotMetadata.perItemAdmissionV1;
   delete agentSnapshotMetadata.historyClearedAt;
   delete agentSnapshotMetadata.historyClearedBy;
+  // The stop-fence check round is server state (S3 checks needs_action rows,
+  // which the mirror still updates); a device can never write or replace it.
+  delete agentSnapshotMetadata.stopFenceCheck;
   delete agentSnapshotMetadata.itemAttempts;
   delete agentSnapshotMetadata.attemptIdentity;
   delete agentSnapshotMetadata.localRecoveryClientAttemptId;
@@ -6687,10 +6692,14 @@ export async function mirrorTaskSnapshot(
           - 'stoppedBeforeDispatch'
           - 'historyClearedAt'
           - 'historyClearedBy'
+          - 'stopFenceCheck'
         )
         || jsonb_strip_nulls(jsonb_build_object(
           'historyClearedAt', capture_tasks.metadata->'historyClearedAt',
-          'historyClearedBy', capture_tasks.metadata->'historyClearedBy'
+          'historyClearedBy', capture_tasks.metadata->'historyClearedBy',
+          -- A newer ledger snapshot of a needs_action fence must not erase
+          -- the check round in progress (its receipt would turn stale).
+          'stopFenceCheck', capture_tasks.metadata->'stopFenceCheck'
         ))
         || CASE
           WHEN capture_tasks.status = 'resume_requested'
@@ -9331,6 +9340,9 @@ router.post('/agent/stop-fence-checks/:checkId/complete', requireCaptureAgent, a
       taskId: req.body?.taskId,
       requestId: text(req.body?.requestId, 240),
       rawResult,
+      // S3: a proof for a needs_action batch child is released here, in the
+      // same transaction (node session -> child -> parent -> items).
+      releaseNeedsAction: releaseNeedsActionStopFenceByNodeProof,
     }));
     return res.status(outcome.status).json(outcome.body);
   } catch (err) {
@@ -11688,6 +11700,113 @@ function stopFenceReleaseOutcomeMessage(itemOutcomes = []) {
   return message;
 }
 
+// Hand the work of each released needs_action child back to its batch
+// exactly like an expired create command does (same projection as the
+// heartbeat): elastic -> retryable (failed at the budget), fixed ->
+// needs_action, a stopped or finished batch -> untouched. Shared by the
+// operator confirmation and the node's proof receipt (S3); the caller holds
+// the child rows, so the order stays child -> parent -> items.
+async function handBackReleasedNeedsActionChildren(tx, {
+  tenantId,
+  agentId,
+  released = [],
+  proofStatus = 'operator_confirmed',
+  reason = '',
+  checkId = '',
+  actorType = 'user',
+  actorId = '',
+  actorName = '',
+  itemMessage,
+}) {
+  const itemOutcomes = [];
+  const orderedReleases = [...released].sort((left, right) =>
+    String(left.parentTaskId).localeCompare(String(right.parentTaskId)) ||
+    String(left.id).localeCompare(String(right.id)));
+  for (const release of orderedReleases) {
+    // Same-transaction re-entry; the order stays child -> parent. Only to
+    // record the parent as it was before the projection.
+    const parentBefore = await lockOrchestrationParent(tx, tenantId, release.parentTaskId);
+    await projectOrchestrationChildControlOutcome(tx, {
+      tenantId,
+      childTask: release.row,
+      agentId,
+      status: 'needs_action',
+      error: {
+        code: STOP_FENCE_OPERATOR_RELEASED_ITEM_CODE,
+        originalCode: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
+        message: itemMessage,
+      },
+      actorType,
+      actorId,
+      actorName,
+    });
+    const itemOutcome = await readNeedsActionReleaseItemOutcome(tx, {
+      tenantId,
+      parentTaskId: release.parentTaskId,
+      taskId: release.id,
+      parentBefore,
+    });
+    await recordNeedsActionStopFenceOutcome(tx, {
+      tenantId,
+      agentId,
+      taskId: release.id,
+      itemOutcome,
+      originalError: release.originalError,
+      actorType,
+      actorId,
+      actorName,
+      proofStatus,
+      reason,
+      checkId,
+    });
+    itemOutcomes.push({taskId: release.id, ...itemOutcome});
+  }
+  return itemOutcomes;
+}
+
+// S3: a node's bound proof for a needs_action batch child releases it with
+// the operator-release semantics, recorded as agent_confirmed. The node
+// already dropped its local lock, runner and helpers before it answered, so
+// there is no local release to queue and new work is not held.
+export async function releaseNeedsActionStopFenceByNodeProof(tx, {
+  agent,
+  task,
+  checkId,
+  evidence,
+  now = Date.now(),
+}) {
+  const tenantId = text(task?.tenant_id || agent?.tenant_id, 100);
+  const agentId = text(agent?.id, 100).toLowerCase();
+  const actorName = text(agent?.display_name || agent?.client_label, 240);
+  const release = await releaseNeedsActionStopFences(tx, {
+    tenantId,
+    agentId,
+    taskIds: [task.id],
+    requestedBy: actorName || agentId,
+    actorId: agentId,
+    proofStatus: 'agent_confirmed',
+    checkId,
+    evidence,
+    requestLocalRelease: false,
+    now,
+  });
+  if (release.released.length === 0) {
+    return {released: false, skipReason: text(release.skipped[0]?.reason, 80) || 'not_releasable'};
+  }
+  const itemOutcomes = await handBackReleasedNeedsActionChildren(tx, {
+    tenantId,
+    agentId,
+    released: release.released,
+    proofStatus: 'agent_confirmed',
+    checkId,
+    actorType: 'capture_agent',
+    actorId: agentId,
+    actorName,
+    itemMessage: '旧采集页面未能安全停止，节点已确认停止后交回批次',
+  });
+  return {released: true, itemOutcomes};
+}
+
 async function loadStopFenceAdminAgent(tx, tenantId, agentId) {
   // Same advisory fence as heartbeats and receipts: slot lock first, then
   // task rows, so an operator action and a node receipt never interleave.
@@ -11708,7 +11827,15 @@ router.post('/agents/:id/stop-fence/recheck', requireCriticalTenantAccess, requi
       const agent = await loadStopFenceAdminAgent(tx, req.tenantId, agentId);
       if (!agent) return {error: 'agent_not_found'};
       const rows = await listCaptureAgentStopFences(tx, req.tenantId, {agentId});
-      const superseded = rows.filter(row => row.kind === 'fence' && row.status === 'superseded');
+      const autoCheckSupported = safeJson(agent.capabilities)[STOP_FENCE_CHECK_CAPABILITY] === true;
+      // S3: on a capable node a needs_action batch child is checked by the
+      // node too (the same rows summarizeAgentStopFence puts into its
+      // automatic phases), so its node can be asked again.
+      const includeNeedsActionChildren = autoCheckSupported && stopFenceNeedsActionAutoCheckEnabled();
+      const superseded = rows.filter(row => row.kind === 'fence' && (
+        row.status === 'superseded' ||
+        (includeNeedsActionChildren && stopFenceNeedsActionAutoCheckable(row))
+      ));
       if (rows.length === 0) return {error: 'agent_stop_fence_absent'};
       if (superseded.length === 0) {
         return {
@@ -11716,7 +11843,7 @@ router.post('/agents/:id/stop-fence/recheck', requireCriticalTenantAccess, requi
           requiresTaskAction: stopFenceRequiresTaskAction(rows),
         };
       }
-      if (safeJson(agent.capabilities)[STOP_FENCE_CHECK_CAPABILITY] !== true) {
+      if (!autoCheckSupported) {
         return {error: 'agent_stop_fence_check_unsupported'};
       }
       if (!stopFenceAutoCheckEnabled()) return {error: 'agent_stop_fence_check_disabled'};
@@ -11871,50 +11998,16 @@ router.post('/agents/:id/stop-fence/confirm', requireCriticalTenantAccess, requi
           ? {error: 'agent_stop_fence_command_in_flight', requiresTaskAction}
           : {error: 'agent_stop_fence_changed'};
       }
-      // Hand the work of each released child back to its batch exactly like
-      // an expired create command does (same projection as the heartbeat):
-      // elastic -> retryable (failed at the budget), fixed -> needs_action,
-      // a stopped or finished batch -> untouched.
-      const itemOutcomes = [];
-      const orderedReleases = [...needsActionRelease.released].sort((left, right) =>
-        String(left.parentTaskId).localeCompare(String(right.parentTaskId)) ||
-        String(left.id).localeCompare(String(right.id)));
-      for (const release of orderedReleases) {
-        // Same-transaction re-entry; the order stays child -> parent. Only to
-        // record the parent as it was before the projection.
-        const parentBefore = await lockOrchestrationParent(tx, req.tenantId, release.parentTaskId);
-        await projectOrchestrationChildControlOutcome(tx, {
-          tenantId: req.tenantId,
-          childTask: release.row,
-          agentId,
-          status: 'needs_action',
-          error: {
-            code: STOP_FENCE_OPERATOR_RELEASED_ITEM_CODE,
-            originalCode: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
-            message: '旧采集页面未能安全停止，已由管理员确认停止后交回批次',
-          },
-          actorType: 'user',
-          actorId,
-          actorName,
-        });
-        const itemOutcome = await readNeedsActionReleaseItemOutcome(tx, {
-          tenantId: req.tenantId,
-          parentTaskId: release.parentTaskId,
-          taskId: release.id,
-          parentBefore,
-        });
-        await recordNeedsActionStopFenceOutcome(tx, {
-          tenantId: req.tenantId,
-          agentId,
-          taskId: release.id,
-          itemOutcome,
-          originalError: release.originalError,
-          actorType: 'user',
-          actorId,
-          actorName,
-        });
-        itemOutcomes.push({taskId: release.id, ...itemOutcome});
-      }
+      const itemOutcomes = await handBackReleasedNeedsActionChildren(tx, {
+        tenantId: req.tenantId,
+        agentId,
+        released: needsActionRelease.released,
+        proofStatus: 'operator_confirmed',
+        actorType: 'user',
+        actorId,
+        actorName,
+        itemMessage: '旧采集页面未能安全停止，已由管理员确认停止后交回批次',
+      });
       const needsActionTaskIds = needsActionRelease.released.map(release => release.id);
       const released = [...supersededReleased, ...needsActionTaskIds];
       const releasedIds = new Set(released.map(id => String(id).toLowerCase()));

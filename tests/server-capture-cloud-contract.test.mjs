@@ -2404,12 +2404,12 @@ test("server-owned local closure metadata survives snapshots without Agent injec
   );
   assert.match(
     mirror,
-    /metadata = \(\s*EXCLUDED\.metadata\s*- 'requiresLocalClosureReuseFenceV1'\s*- 'stoppedBeforeDispatch'\s*- 'historyClearedAt'\s*- 'historyClearedBy'\s*\)/u,
+    /metadata = \(\s*EXCLUDED\.metadata\s*- 'requiresLocalClosureReuseFenceV1'\s*- 'stoppedBeforeDispatch'\s*- 'historyClearedAt'\s*- 'historyClearedBy'\s*- 'stopFenceCheck'\s*\)/u,
     "an Agent snapshot must not mint server-owned fence or history fields",
   );
   assert.match(
     mirror,
-    /const agentSnapshotMetadata = \{\.\.\.safeJson\(snapshot\.metadata\)\};[\s\S]*delete agentSnapshotMetadata\.requiresLocalClosureReuseFenceV1;[\s\S]*delete agentSnapshotMetadata\.stoppedBeforeDispatch;[\s\S]*JSON\.stringify\(agentSnapshotMetadata\)/u,
+    /const agentSnapshotMetadata = \{\.\.\.safeJson\(snapshot\.metadata\)\};[\s\S]*delete agentSnapshotMetadata\.requiresLocalClosureReuseFenceV1;[\s\S]*delete agentSnapshotMetadata\.stoppedBeforeDispatch;[\s\S]*delete agentSnapshotMetadata\.stopFenceCheck;[\s\S]*JSON\.stringify\(agentSnapshotMetadata\)/u,
     "newly discovered snapshots must be stripped before their initial insert too",
   );
   for (const field of [
@@ -2417,6 +2417,8 @@ test("server-owned local closure metadata survives snapshots without Agent injec
     "stoppedBeforeDispatch",
     "historyClearedAt",
     "historyClearedBy",
+    // S3 checks needs_action rows, which the mirror still updates.
+    "stopFenceCheck",
   ]) {
     assert.match(
       mirror,

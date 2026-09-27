@@ -792,6 +792,9 @@ export function normalizeCloudTaskSnapshot(input = {}) {
   // snapshot (including the first insert and later heartbeat mirrors).
   delete metadata.historyClearedAt;
   delete metadata.historyClearedBy;
+  // The stop-fence check round is server state too: no device writes or
+  // forges one (docs/hotfix/20260927-unattended-self-heal.md, S3).
+  delete metadata.stopFenceCheck;
   // Local closure has exactly one authoritative top-level channel. Metadata
   // aliases are removed before strictly normalized single/array reports are
   // promoted. The legacy object remains supported for rolling upgrades.

@@ -12,6 +12,9 @@ import {
   evaluateStopFenceProof,
   STOP_FENCE_LOCAL_RELEASE_HOLD_MS,
   STOP_FENCE_LOCAL_RELEASE_UNOFFERED_HOLD_MS,
+  STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL,
+  claimStopFenceCheckOffers,
+  completeStopFenceCheckReceipt,
   listCaptureAgentStopFences,
   normalizeStopFenceCheckResult,
   readStopFenceHeartbeatWork,
@@ -19,6 +22,8 @@ import {
   stopFenceAutoCheckEnabled,
   stopFenceCheckEscalated,
   stopFenceLocalReleaseHoldsNewWork,
+  stopFenceNeedsActionAutoCheckEnabled,
+  stopFenceNeedsActionAutoCheckable,
   stopFenceOperatorReleasable,
   stopFenceReasonLabel,
   stopFenceReleaseDisposition,
@@ -348,7 +353,7 @@ test('the fence listing reuses the exact admission predicate and filters by node
   assert.ok(sql.includes(captureTaskUnconfirmedLocalStopSql('task')), 'same fence SQL as admission');
   assert.match(sql, /HISTORICAL_STOP_FENCE_RECONCILED/u);
   assert.match(sql, /localRelease,state/u);
-  assert.deepEqual(params, ['tenant-1', '55555555-5555-4555-8555-555555555555', true, true, 6, false, 200, false]);
+  assert.deepEqual(params, ['tenant-1', '55555555-5555-4555-8555-555555555555', true, true, 6, false, 200, false, false]);
   assert.deepEqual(await listCaptureAgentStopFences(executor, 'tenant-1', {agentId: 'not-a-uuid'}), []);
   assert.equal(statements.length, 1, 'an invalid node id never widens to the whole tenant');
 
@@ -362,11 +367,11 @@ test('the fence listing reuses the exact admission predicate and filters by node
   assert.match(tenantWide.sql,
     /ORDER BY stop_fence\.kind,[\s\S]*?\(stop_fence\.kind = 'local_release'\s+AND NULLIF\(stop_fence\.stop_fence_check #>> '\{localRelease,firstOfferedAt\}', ''\) IS NOT NULL\),\s+stop_fence\.fenced_at, stop_fence\.id\s+\) AS agent_row_number/u);
   assert.match(tenantWide.sql, /WHERE ranked\.agent_row_number <= \$7\s+ORDER BY ranked\.agent_row_number/u);
-  assert.deepEqual(tenantWide.params, ['tenant-1', null, false, true, 5000, false, 200, false]);
+  assert.deepEqual(tenantWide.params, ['tenant-1', null, false, true, 5000, false, 200, false, false]);
   // The node-scoped default equals the per-node cap: the confirm route checks
   // exactly the rows the overview listed for that node.
   await listCaptureAgentStopFences(executor, 'tenant-1', {agentId: '55555555-5555-4555-8555-555555555555'});
-  assert.deepEqual(statements.at(-1).params.slice(4), [200, false, 200, false]);
+  assert.deepEqual(statements.at(-1).params.slice(4), [200, false, 200, false, false]);
   // The heartbeat claim only takes rows the node can locate, in SQL, so rows
   // without a request id never use up its window.
   await listCaptureAgentStopFences(executor, 'tenant-1', {
@@ -580,12 +585,13 @@ test('the expected destination follows the parent, never the child metadata', ()
   }
 });
 
-test('the node summary names every releasable batch child without changing the phase', () => {
+test('the node summary names every releasable batch child; only an old node keeps the manual phase', () => {
   const children = Array.from({length: 22}, (_, index) => batchChild({id: `child-${index}`,
     fenced_at: ago(100 - index)}));
   const root = fenceRow({id: 'root', status: 'needs_action', fenced_at: ago(200)});
-  const summary = summarizeAgentStopFence(onlineAgent, [root, ...children], {now: NOW, autoCheckEnabled: true});
-  assert.equal(summary.phase, 'task_action_required', 'these still need a person');
+  const oldNode = {...onlineAgent, capabilities: {}};
+  const summary = summarizeAgentStopFence(oldNode, [root, ...children], {now: NOW, autoCheckEnabled: true});
+  assert.equal(summary.phase, 'task_action_required', 'an old node still needs a person');
   assert.equal(summary.operator_confirmable_count, 22);
   assert.deepEqual(summary.operator_confirmable_task_ids, children.map(row => row.id),
     'not cut by the 20-row task list');
@@ -596,9 +602,28 @@ test('the node summary names every releasable batch child without changing the p
   assert.equal(summary.tasks[1].operator_confirmable, true);
   assert.equal(summary.tasks[1].release_disposition, 'return_to_pool');
   assert.deepEqual(summary.superseded_task_ids, []);
+  assert.equal(summary.tasks[1].auto_checkable, false, 'an old node is never asked');
+  assert.equal(summary.tasks[1].check, null);
+  // S3: a capable node checks them itself; the operator may still confirm.
+  const capable = summarizeAgentStopFence(onlineAgent, [root, ...children], {now: NOW, autoCheckEnabled: true});
+  assert.equal(capable.phase, 'awaiting_node');
+  assert.equal(capable.auto_check_task_count, 22);
+  assert.equal(capable.operator_confirmable_count, 22);
+  assert.equal(capable.tasks[0].auto_checkable, false, 'a root task stays manual');
+  assert.equal(capable.tasks[1].auto_checkable, true);
+  assert.deepEqual(capable.superseded_task_ids, []);
+  // Either switch off: the previous manual phase.
+  for (const options of [{autoCheckEnabled: false}, {needsActionAutoCheckEnabled: false}]) {
+    const switched = summarizeAgentStopFence(onlineAgent, [root, ...children],
+      {now: NOW, autoCheckEnabled: true, ...options});
+    assert.equal(switched.phase, 'task_action_required', JSON.stringify(options));
+    assert.equal(switched.tasks[1].auto_checkable, false);
+  }
   // With a superseded fence the phase is the superseded one, as before.
-  const mixed = summarizeAgentStopFence(onlineAgent, [fenceRow(), batchChild()], {now: NOW, autoCheckEnabled: true});
-  assert.equal(mixed.phase, 'awaiting_node');
+  const mixed = summarizeAgentStopFence(oldNode, [fenceRow(), batchChild()], {now: NOW, autoCheckEnabled: true});
+  assert.equal(mixed.phase, 'manual_only');
+  assert.equal(summarizeAgentStopFence(onlineAgent, [fenceRow(), batchChild()],
+    {now: NOW, autoCheckEnabled: true, needsActionAutoCheckEnabled: false}).phase, 'awaiting_node');
   assert.deepEqual(mixed.operator_confirmable_task_ids, ['child']);
   const none = summarizeAgentStopFence(onlineAgent, [fenceRow()], {now: NOW, autoCheckEnabled: true});
   assert.deepEqual(none.operator_confirmable_task_ids, []);
@@ -647,4 +672,207 @@ test('the listing reads the parent only for needs_action batch children, by prim
       + `[\\s\\S]*?WHERE parent\\.tenant_id = ${alias}\\.tenant_id AND parent\\.id = ${alias}\\.parent_task_id\\s+\\) END AS parent_state`, 'u'));
   }
   assert.doesNotMatch(sql, /JOIN capture_tasks parent/u, 'no join, one scalar subquery');
+});
+
+// docs/hotfix/20260927-unattended-self-heal.md (S3): needs_action batch
+// children fenced by an automatic recovery are checked by capable nodes.
+test('the S3 switch needs both switches on and only accepts an explicit off', () => {
+  assert.equal(stopFenceNeedsActionAutoCheckEnabled({}), true);
+  assert.equal(stopFenceNeedsActionAutoCheckEnabled({CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION: 'on'}), true);
+  assert.equal(stopFenceNeedsActionAutoCheckEnabled({CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION: ' Off '}), false);
+  assert.equal(stopFenceNeedsActionAutoCheckEnabled({CAPTURE_STOP_FENCE_AUTO_CHECK: 'off'}), false,
+    'the global kill switch turns every check off');
+  assert.match(stopFenceReasonLabel('command_in_flight'), /后台指令/u);
+});
+
+test('only a locatable needs_action batch child is auto-checkable, as listing row or raw row', () => {
+  assert.equal(stopFenceNeedsActionAutoCheckable(batchChild()), true);
+  const raw = {id: TASK_ID, status: 'needs_action', parent_task_id: PARENT_ID,
+    task_type: 'unattended_keyword_capture', control_task_id: '', client_task_id: 'request-1'};
+  assert.equal(stopFenceNeedsActionAutoCheckable(raw), true, 'a locked task row has no kind');
+  assert.equal(stopFenceNeedsActionAutoCheckable({...raw, client_task_id: ''}), false, 'unlocatable');
+  const cases = {
+    'root task': {parent_task_id: null},
+    'manual batch (capture)': {task_type: 'capture'},
+    resume_requested: {status: 'resume_requested'},
+    superseded: {status: 'superseded'},
+    'local release': {kind: 'local_release'},
+    'no request id': {request_id: ''},
+  };
+  for (const [name, overrides] of Object.entries(cases)) {
+    assert.equal(stopFenceNeedsActionAutoCheckable(batchChild(overrides)), false, name);
+  }
+  assert.equal(stopFenceNeedsActionAutoCheckable(null), false);
+  const sql = STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL('task');
+  assert.match(sql, /task\.status = 'needs_action'/u);
+  assert.match(sql, /task\.parent_task_id IS NOT NULL/u);
+  assert.match(sql, /task\.task_type = 'unattended_keyword_capture'/u);
+  assert.match(sql, /COALESCE\(NULLIF\(task\.control_task_id, ''\), NULLIF\(task\.client_task_id, ''\), ''\) <> ''/u);
+  assert.throws(() => STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL('task; DROP'), /invalid_task_alias/u);
+});
+
+test('the heartbeat precheck adds one bound OR branch and the claim listing opts in', async () => {
+  const statements = [];
+  const executor = {
+    queryOne: async (sql, params) => { statements.push({sql, params}); return {fence_pending: true}; },
+    queryAll: async (sql, params) => { statements.push({sql, params}); return []; },
+  };
+  const previous = process.env.CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION;
+  try {
+    delete process.env.CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION;
+    await readStopFenceHeartbeatWork(executor, {tenantId: 'tenant-1', agentId: 'agent-1', now: NOW});
+    assert.deepEqual(statements.at(-1).params, ['tenant-1', 'agent-1', true], '$3 defaults from the switch');
+    process.env.CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION = 'off';
+    await readStopFenceHeartbeatWork(executor, {tenantId: 'tenant-1', agentId: 'agent-1', now: NOW});
+    assert.deepEqual(statements.at(-1).params, ['tenant-1', 'agent-1', false], '$3 is always bound');
+  } finally {
+    if (previous === undefined) delete process.env.CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION;
+    else process.env.CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION = previous;
+  }
+  const {sql} = statements.at(-1);
+  const fencePending = sql.slice(sql.indexOf('EXISTS'), sql.indexOf('AS fence_pending'));
+  // Two EXISTS, each with an equality on status, so each probes the
+  // (tenant_id, status) index; the S3 one only runs while $3 is true.
+  assert.match(fencePending, /AND status = 'superseded'\s+AND task_type <> 'capture_orchestration'/u);
+  assert.ok(fencePending.includes(`OR ($3::boolean AND EXISTS (
+        SELECT 1 FROM capture_tasks fenced_child`));
+  assert.ok(fencePending.includes(STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL('fenced_child')));
+  assert.equal(fencePending.match(/UPPER\(COALESCE\((fenced_child\.)?error->>'code', ''\)\) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'/gu).length, 2);
+  assert.equal(fencePending.match(/NULLIF\((fenced_child\.)?metadata->>'recoveryTaskId', ''\) IS NULL/gu).length, 2);
+  assert.doesNotMatch(fencePending, /capture_agent_commands|NOT IN \(/u, 'no fence SQL on the heartbeat');
+
+  await listCaptureAgentStopFences(executor, 'tenant-1', {
+    agentId: '55555555-5555-4555-8555-555555555555', onlySuperseded: true,
+    includeNeedsActionChildren: true, requireRequestId: true, limit: 6});
+  const listing = statements.at(-1);
+  assert.equal(listing.params[8], true);
+  assert.ok(listing.sql.includes(`($3::boolean = false OR task.status = 'superseded'
+            OR ($9::boolean AND ${STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL('task')}))`));
+  assert.ok(listing.sql.includes(captureTaskUnconfirmedLocalStopSql('task')), 'still the admission fence SQL');
+});
+
+test('a capable node shows the automatic phases for its needs_action batch children', () => {
+  const phase = rows => summarizeAgentStopFence(onlineAgent, rows, {now: NOW, autoCheckEnabled: true,
+    needsActionAutoCheckEnabled: true}).phase;
+  const issued = {version: 1, checkId: CHECK_ID, round: 1, firstIssuedAt: ago(2), issuedAt: ago(2),
+    expiresAt: later(8), lastOfferedAt: ago(2), failureCount: 0, lastResult: null};
+  const failed = {...issued, failureCount: 1, nextIssueAt: later(3), lastResult: {checkId: CHECK_ID,
+    at: ago(1), accepted: false, reason: 'tab_frozen', requiresOperator: false,
+    pendingTabs: [{platform: 'xiaohongshu', evidence: 'tab_frozen', title: '工作页'}], pendingTabCount: 1}};
+  assert.equal(phase([batchChild()]), 'awaiting_node');
+  assert.equal(phase([batchChild({stop_fence_check: issued})]), 'node_checking');
+  assert.equal(phase([batchChild({stop_fence_check: failed})]), 'node_retrying');
+  assert.equal(phase([batchChild({stop_fence_check: {...failed, failureCount: 3}})]), 'needs_operator');
+  const summary = summarizeAgentStopFence(onlineAgent, [batchChild({stop_fence_check: failed})],
+    {now: NOW, autoCheckEnabled: true, needsActionAutoCheckEnabled: true});
+  assert.equal(summary.tasks[0].check.last_result.pending_tabs[0].title, '工作页');
+  assert.equal(summary.tasks[0].operator_confirmable, true, 'the operator can still confirm');
+  assert.equal(summarizeAgentStopFence({...onlineAgent, online: false}, [batchChild()],
+    {now: NOW, autoCheckEnabled: true, needsActionAutoCheckEnabled: true}).phase, 'offline');
+});
+
+function receiptTx(task, {commandInFlight = false} = {}) {
+  const statements = [];
+  return {
+    statements,
+    queryOne: async (sql, params) => { statements.push({sql, params}); return /FROM capture_tasks/u.test(sql) ? task : null; },
+    queryAll: async (sql, params) => { statements.push({sql, params}); return commandInFlight ? [{task_id: task.id}] : []; },
+    execute: async (sql, params) => { statements.push({sql, params}); },
+  };
+}
+
+test('a proof for a needs_action batch child is handed to the injected release, never written here', async () => {
+  const state = {version: 1, checkId: CHECK_ID, round: 1, firstIssuedAt: ago(2), issuedAt: ago(2),
+    expiresAt: later(8), lastOfferedAt: ago(2), failureCount: 0, lastResult: null};
+  const task = {id: TASK_ID, tenant_id: 'tenant-1', status: 'needs_action', parent_task_id: PARENT_ID,
+    task_type: 'unattended_keyword_capture', error: {code: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'},
+    metadata: {stopFenceCheck: state}, client_task_id: REQUEST_ID, control_task_id: '', owner_agent_id: 'agent-1'};
+  const agent = {id: 'agent-1', tenant_id: 'tenant-1', display_name: '火星'};
+  const call = (tx, overrides = {}) => completeStopFenceCheckReceipt(tx, {
+    agent, lockAgentSession: async () => agent, checkId: CHECK_ID, taskId: TASK_ID, requestId: REQUEST_ID,
+    rawResult: proof(), now: NOW, includeNeedsActionChildren: true, ...overrides});
+
+  const calls = [];
+  const released = await call(receiptTx(task), {releaseNeedsAction: async (_tx, input) => {
+    calls.push(input); return {released: true};
+  }});
+  assert.equal(released.status, 200);
+  assert.equal(released.body.released, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].checkId, CHECK_ID);
+  assert.equal(calls[0].task.id, TASK_ID);
+  assert.equal(calls[0].evidence.proofMethod, 'browser_sweep');
+
+  // A command in flight: one retryable failure, recorded once per round.
+  const busyTx = receiptTx(task);
+  const busy = await call(busyTx, {releaseNeedsAction: async () => ({released: false, skipReason: 'command_in_flight'})});
+  assert.equal(busy.status, 200);
+  assert.equal(busy.body.released, false);
+  assert.match(busy.body.message, /后台指令/u);
+  const written = busyTx.statements.find(entry => /'\{stopFenceCheck\}'/u.test(entry.sql));
+  const recorded = JSON.parse(written.params[2]);
+  assert.equal(recorded.lastResult.reason, 'command_in_flight');
+  assert.equal(recorded.failureCount, 1);
+  const replayTx = receiptTx({...task, metadata: {stopFenceCheck: recorded}});
+  const replay = await call(replayTx, {releaseNeedsAction: async () => ({released: false, skipReason: 'command_in_flight'})});
+  assert.equal(replay.body.idempotent, true);
+  assert.equal(replayTx.statements.some(entry => /'\{stopFenceCheck\}'/u.test(entry.sql)), false, 'not counted twice');
+
+  // Anything else the release refuses is stale; the switch off is stale too.
+  assert.equal((await call(receiptTx(task), {releaseNeedsAction: async () => ({released: false, skipReason: 'not_releasable'})})).status, 409);
+  let asked = false;
+  const off = await call(receiptTx(task), {includeNeedsActionChildren: false,
+    releaseNeedsAction: async () => { asked = true; return {released: true}; }});
+  assert.equal(off.status, 409);
+  assert.equal(asked, false);
+  for (const overrides of [{parent_task_id: null}, {task_type: 'capture'}, {metadata: {stopFenceCheck: state, recoveryTaskId: 'x'}}]) {
+    const stale = await call(receiptTx({...task, ...overrides}), {releaseNeedsAction: async () => { asked = true; return {released: true}; }});
+    assert.equal(stale.status, 409, JSON.stringify(overrides));
+  }
+  assert.equal(asked, false, 'roots, manual batches and recovery-owned rows are never released by a node');
+  await assert.rejects(call(receiptTx(task)), /stop_fence_needs_action_release_required/u);
+
+  // A failed proof round is recorded exactly like a superseded row's.
+  const failedTx = receiptTx(task);
+  const failed = await call(failedTx, {rawResult: proof({accepted: false, reason: 'tab_frozen', retryable: true}),
+    releaseNeedsAction: async () => { asked = true; return {released: true}; }});
+  assert.equal(failed.status, 200);
+  assert.equal(failed.body.released, false);
+  assert.equal(asked, false);
+  assert.equal(JSON.parse(failedTx.statements.find(entry => /'\{stopFenceCheck\}'/u.test(entry.sql)).params[2])
+    .lastResult.reason, 'tab_frozen');
+});
+
+test('the heartbeat claim offers a needs_action batch child only while the switch is on', async () => {
+  const agent = {id: '55555555-5555-4555-8555-555555555555', tenant_id: 'tenant-1', display_name: '上海'};
+  const child = {id: TASK_ID, status: 'needs_action', parent_task_id: PARENT_ID,
+    task_type: 'unattended_keyword_capture', error: {code: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'},
+    metadata: {}, client_task_id: REQUEST_ID, control_task_id: ''};
+  const run = async (includeNeedsActionChildren, lockedRow = child) => {
+    const statements = [];
+    const tx = {
+      queryAll: async (sql, params) => {
+        statements.push({sql, params});
+        if (/SELECT ranked\.\*/u.test(sql)) {
+          return params[8] ? [{...batchChild({id: TASK_ID}), request_id: REQUEST_ID, attempt_id: 'a2'}] : [];
+        }
+        if (/FOR UPDATE SKIP LOCKED/u.test(sql)) return [lockedRow];
+        return [];
+      },
+      execute: async (sql, params) => { statements.push({sql, params}); },
+    };
+    const offers = await claimStopFenceCheckOffers(tx, {agent, lockAgentSession: async () => agent,
+      now: NOW, includeNeedsActionChildren});
+    return {offers, statements};
+  };
+  const on = await run(true);
+  assert.equal(on.offers.length, 1);
+  assert.equal(on.offers[0].taskId, TASK_ID);
+  assert.equal(on.offers[0].requestId, REQUEST_ID);
+  assert.match(on.statements.find(entry => /FOR UPDATE SKIP LOCKED/u.test(entry.sql)).sql,
+    /status IN \('superseded', 'needs_action'\)/u);
+  assert.equal((await run(false)).offers.length, 0, 'the listing is asked without the children');
+  // A root or a row that changed under the lock is never offered.
+  assert.equal((await run(true, {...child, parent_task_id: null})).offers.length, 0);
+  assert.equal((await run(true, {...child, metadata: {recoveryTaskId: 'r'}})).offers.length, 0);
 });

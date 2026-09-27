@@ -376,6 +376,7 @@ test('reason labels cover the agent and server reason codes from the design tabl
     check_timeout: '核对超时或本机状态读取失败，稍后复核',
     storage_unreadable: '核对超时或本机状态读取失败，稍后复核',
     proof_rejected: '节点回执不满足放行条件',
+    command_in_flight: '该任务正在执行后台指令，稍后复核',
     invalid_result: '节点回执格式不正确，请升级扩展或人工确认',
     local_release_done: '节点已释放本机执行锁',
     local_lock_absent: '节点已释放本机执行锁',
@@ -541,4 +542,25 @@ test('every expected destination has a full and a short label', () => {
     tasks: [releasableTask({release_disposition: 'parent_stopped'})], superseded_count: 0,
   }), NOW)
   assert.match(stopped.detail, /预计：所在批次已停止，关键词已取消，确认只解除停止保护/u)
+})
+
+// docs/hotfix/20260927-unattended-self-heal.md (S3): a capable node checks its
+// needs_action batch children itself; the pages it reports are listed too,
+// and the operator can still confirm them from the same panel.
+test('pages a node reports for an auto-checked needs_action batch child are listed', () => {
+  const child = fenceTask({id: 'child', status: 'needs_action', operator_confirmable: true,
+    release_disposition: 'return_to_pool', handoff_successor_task_id: null, auto_checkable: true,
+    check: {check_id: 'c9', round: 2, failure_count: 1, last_result: {accepted: false, reason: 'tab_frozen',
+      requires_operator: false, pending_tab_count: 1,
+      pending_tabs: [{platform: 'xiaohongshu', evidence: 'tab_frozen', title: '工作页'}]}}})
+  const root = fenceTask({id: 'root', status: 'needs_action', parent_task_id: null, auto_checkable: false,
+    check: {check_id: 'c0', last_result: {accepted: false, reason: 'probe_failed',
+      pending_tabs: [{platform: 'douyin', evidence: 'probe_failed', title: '不该列出'}]}}})
+  const notice = agentStopFenceNotice(agentWith('node_retrying', {tasks: [child, root],
+    operator_confirmable_task_ids: ['child'], operator_confirmable_count: 1}), NOW)
+  assert.deepEqual(notice.pendingTabs.map(tab => tab.title), ['工作页'])
+  assert.match(notice.detail, /第 1 次核对未通过：页面暂时无法检查/u)
+  assert.equal(notice.canRecheck, true)
+  assert.equal(notice.canConfirm, true)
+  assert.deepEqual(notice.confirmTaskIds, ['child'])
 })

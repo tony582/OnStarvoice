@@ -58,8 +58,9 @@ const PHASE_COPY = {
   },
 }
 
-// 批次任务停在「需要处理」且带停止保护时，节点本机「继续」永远失败（checkpoint_flush_not_ready），
-// 只能由运营到现场检查后在这里人工确认（服务端 stop_fence.operator_confirmable_task_ids）。phase 仍是 task_action_required。
+// 批次任务停在「需要处理」且带停止保护时，节点本机「继续」永远失败（checkpoint_flush_not_ready）。
+// 0.4.16 及以上的节点由服务端自动下发核对，phase 是自动核对的那几个阶段；旧版本节点只能由运营到现场检查后
+// 在这里人工确认（服务端 stop_fence.operator_confirmable_task_ids），phase 仍是 task_action_required。
 const RELEASABLE_COPY = {
   headline: '需人工确认',
   guidance: '到该电脑检查后点「确认旧页面已停止」',
@@ -116,6 +117,7 @@ const REASON_LABELS = {
   old_document_uninspectable: '旧采集页面是扩展重载或升级前打开的，无法自动确认；请在该电脑关闭或刷新下列页面（或重启 Chrome），系统会在 3 分钟内自动复核',
   source_identity_unverifiable: '无法确认旧采集页面身份，请在该电脑关闭下列页面，或检查后人工确认',
   proof_rejected: '节点回执不满足放行条件',
+  command_in_flight: '该任务正在执行后台指令，稍后复核',
   invalid_result: '节点回执格式不正确，请升级扩展或人工确认',
   local_release_done: '节点已释放本机执行锁',
   local_lock_absent: '节点已释放本机执行锁',
@@ -454,7 +456,8 @@ export function agentStopFenceNotice(agent, now = Date.now()) {
     guidance: holdsNewWork ? LOCAL_RELEASE_HOLD_GUIDANCE : copy.guidance,
     sinceLabel: since === null ? '' : formatStopFenceTime(since),
     elapsedLabel,
-    pendingTabs: pendingTabsFrom(supersededTasks),
+    // 有能力的节点也会自动核对「需要处理」的批次任务（服务端 auto_checkable），它们报告的待处理页面一并列出。
+    pendingTabs: pendingTabsFrom(tasks.filter(task => task.status === 'superseded' || task.auto_checkable === true)),
     canRecheck,
     recheckHint,
     recheckLabel: phase === 'offline' ? '节点上线后核对' : '让节点重新核对',

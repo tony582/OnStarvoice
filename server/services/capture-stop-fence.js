@@ -141,6 +141,7 @@ const REASON_LABELS = Object.freeze({
   old_document_uninspectable: '旧采集页面是扩展重载或升级前打开的，无法自动确认；请在该电脑关闭或刷新下列页面（或重启 Chrome），系统会在 3 分钟内自动复核',
   source_identity_unverifiable: '无法确认旧采集页面身份，请在该电脑关闭下列页面，或检查后人工确认',
   proof_rejected: '节点回执不满足放行条件',
+  command_in_flight: '该任务正在执行后台指令，稍后复核',
   invalid_result: '节点回执格式不正确，请升级扩展或人工确认',
   local_release_done: '节点已释放本机执行锁',
   local_lock_absent: '节点已释放本机执行锁',
@@ -216,6 +217,16 @@ export function stopFenceAutoCheckEnabled(env = process.env) {
   return String(env?.CAPTURE_STOP_FENCE_AUTO_CHECK ?? '').trim().toLowerCase() !== 'off';
 }
 
+// docs/hotfix/20260927-unattended-self-heal.md (S3): a needs_action batch
+// child fenced by an automatic recovery is asked to the node exactly like a
+// superseded row. `CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION=off` goes back
+// to checking superseded rows only; `CAPTURE_STOP_FENCE_AUTO_CHECK=off` still
+// turns every check off.
+export function stopFenceNeedsActionAutoCheckEnabled(env = process.env) {
+  return stopFenceAutoCheckEnabled(env) &&
+    String(env?.CAPTURE_STOP_FENCE_AUTO_CHECK_NEEDS_ACTION ?? '').trim().toLowerCase() !== 'off';
+}
+
 export function stopFenceReasonLabel(reason) {
   const code = text(reason, 80);
   return REASON_LABELS[code] || (code ? `节点核对未通过（${code}）` : '节点核对未通过');
@@ -237,6 +248,47 @@ export function stopFenceOperatorReleasable(row) {
     row.status === 'needs_action' &&
     Boolean(row.parent_task_id) &&
     row.task_type === 'unattended_keyword_capture';
+}
+
+function stopFenceRowRequestId(row) {
+  return text(row?.request_id, 240) ||
+    text(row?.control_task_id, 240) ||
+    text(row?.client_task_id, 240);
+}
+
+/**
+ * S3: an operator-releasable needs_action batch child that the node can
+ * locate by request id is checked by the node like a superseded row, and a
+ * proof releases it with the needs_action release semantics. Accepts a
+ * listing row (kind 'fence') or a raw capture_tasks row (no kind). Root
+ * tasks, manual batches and resume_requested rows stay manual: a root can
+ * still be resumed on the node. The fence code and "no recoveryTaskId" are
+ * guaranteed by the listing and re-checked by every writer.
+ */
+export function stopFenceNeedsActionAutoCheckable(row) {
+  if (!row || (row.kind !== undefined && row.kind !== 'fence')) return false;
+  return row.status === 'needs_action' &&
+    Boolean(row.parent_task_id) &&
+    row.task_type === 'unattended_keyword_capture' &&
+    Boolean(stopFenceRowRequestId(row));
+}
+
+const REQUEST_ID_PRESENT_SQL = (alias) =>
+  `COALESCE(NULLIF(${alias}.control_task_id, ''), NULLIF(${alias}.client_task_id, ''), '') <> ''`;
+
+/** SQL twin of stopFenceNeedsActionAutoCheckable for a capture_tasks alias. */
+export function STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL(alias) {
+  if (!/^[a-z_][a-z0-9_]*$/u.test(alias)) throw new Error('invalid_task_alias');
+  return `(${alias}.status = 'needs_action'
+      AND ${alias}.parent_task_id IS NOT NULL
+      AND ${alias}.task_type = 'unattended_keyword_capture'
+      AND ${REQUEST_ID_PRESENT_SQL(alias)})`;
+}
+
+/** Rows the node is asked to check: superseded, or S3 needs_action children. */
+function stopFenceAutoCheckRow(row, includeNeedsActionChildren) {
+  return row?.status === 'superseded' ||
+    (includeNeedsActionChildren === true && stopFenceNeedsActionAutoCheckable(row));
 }
 
 function stopFenceParentStopped(parent) {
@@ -563,9 +615,6 @@ const LOCAL_RELEASE_EXPIRES_AT_SQL = `CASE
   ELSE '-infinity'::timestamptz
 END`;
 
-const REQUEST_ID_PRESENT_SQL = (alias) =>
-  `COALESCE(NULLIF(${alias}.control_task_id, ''), NULLIF(${alias}.client_task_id, ''), '') <> ''`;
-
 // Pending local releases of node $2 in tenant $1 that the heartbeat claim can
 // locate (non-empty request id); alias `released`.
 const LOCAL_RELEASE_PENDING_SQL = `released.tenant_id = $1
@@ -591,6 +640,9 @@ const LOCAL_RELEASE_PENDING_SQL = `released.tenant_id = $1
 export async function listCaptureAgentStopFences(executor, tenantId, {
   agentId = null,
   onlySuperseded = false,
+  // With onlySuperseded (the heartbeat claim), also the S3 needs_action batch
+  // children. The overview and the operator routes list every fence anyway.
+  includeNeedsActionChildren = false,
   includeLocalRelease = false,
   includeExpiredLocalRelease = false,
   requireRequestId = false,
@@ -621,7 +673,8 @@ export async function listCaptureAgentStopFences(executor, tenantId, {
           AND ($2::uuid IS NULL OR COALESCE(task.assigned_agent_id, task.origin_agent_id) = $2::uuid)
           AND task.task_type <> 'capture_orchestration'
           AND UPPER(COALESCE(task.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
-          AND ($3::boolean = false OR task.status = 'superseded')
+          AND ($3::boolean = false OR task.status = 'superseded'
+            OR ($9::boolean AND ${STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL('task')}))
           AND ($8::boolean = false OR ${REQUEST_ID_PRESENT_SQL('task')})
           AND ${captureTaskUnconfirmedLocalStopSql('task')}
 
@@ -654,6 +707,7 @@ export async function listCaptureAgentStopFences(executor, tenantId, {
     includeExpiredLocalRelease === true,
     Math.min(STOP_FENCE_AGENT_LISTING_LIMIT, Math.max(1, Number(perAgentLimit) || STOP_FENCE_AGENT_LISTING_LIMIT)),
     requireRequestId === true,
+    includeNeedsActionChildren === true,
   ]);
 }
 
@@ -719,10 +773,17 @@ export async function readStopFenceHeartbeatWork(executor, {
   agentId,
   previousFullHeartbeatAt = null,
   now = Date.now(),
+  // Decided here, so no caller (heartbeat, create route, hasStopFenceCheckWork)
+  // can forget it; $3 is always bound.
+  includeNeedsActionChildren = stopFenceNeedsActionAutoCheckEnabled(),
 }) {
+  // S3 adds a second branch for needs_action batch children. It is its own
+  // EXISTS on purpose: each branch keeps an equality on status, so each
+  // probes the (tenant_id, status) index instead of the whole tenant (an OR
+  // inside one EXISTS leaves only tenant_id as the index condition).
   const row = await executor.queryOne(`
     SELECT
-      EXISTS (
+      (EXISTS (
         SELECT 1 FROM capture_tasks
         WHERE tenant_id = $1
           AND (assigned_agent_id = $2 OR (assigned_agent_id IS NULL AND origin_agent_id = $2))
@@ -731,7 +792,15 @@ export async function readStopFenceHeartbeatWork(executor, {
           AND UPPER(COALESCE(error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
           AND NULLIF(metadata->>'recoveryTaskId', '') IS NULL
           AND COALESCE(NULLIF(control_task_id, ''), NULLIF(client_task_id, ''), '') <> ''
-      ) AS fence_pending,
+      ) OR ($3::boolean AND EXISTS (
+        SELECT 1 FROM capture_tasks fenced_child
+        WHERE fenced_child.tenant_id = $1
+          AND (fenced_child.assigned_agent_id = $2
+            OR (fenced_child.assigned_agent_id IS NULL AND fenced_child.origin_agent_id = $2))
+          AND ${STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL('fenced_child')}
+          AND UPPER(COALESCE(fenced_child.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+          AND NULLIF(fenced_child.metadata->>'recoveryTaskId', '') IS NULL
+      ))) AS fence_pending,
       -- Expired ones count here too: the claim marks them expired.
       EXISTS (
         SELECT 1 FROM capture_tasks released
@@ -759,7 +828,7 @@ export async function readStopFenceHeartbeatWork(executor, {
           )
         ) holding
       ), '[]'::jsonb) AS local_releases
-  `, [text(tenantId, 100), text(agentId, 100)]);
+  `, [text(tenantId, 100), text(agentId, 100), includeNeedsActionChildren === true]);
   const localReleases = Array.isArray(row?.local_releases) ? row.local_releases : [];
   return {
     checkDue: row?.fence_pending === true || row?.local_release_pending === true,
@@ -835,6 +904,7 @@ function checkRoundState(state, now) {
 export function summarizeAgentStopFence(agentRow = {}, rows = [], {
   now = Date.now(),
   autoCheckEnabled = stopFenceAutoCheckEnabled(),
+  needsActionAutoCheckEnabled = stopFenceNeedsActionAutoCheckEnabled(),
 } = {}) {
   const current = nowMs(now);
   const fences = rows.filter(row => (row.kind || 'fence') === 'fence');
@@ -846,15 +916,22 @@ export function summarizeAgentStopFence(agentRow = {}, rows = [], {
   const superseded = fences.filter(row => row.status === 'superseded');
   const actionRequired = fences.filter(row => row.status !== 'superseded');
   const operatorConfirmable = actionRequired.filter(stopFenceOperatorReleasable);
-  const manualOnly = superseded.filter(row => !text(row.request_id, 240));
-  const checkable = superseded.filter(row => text(row.request_id, 240));
   const autoCheckSupported = agentAutoCheckSupported(agentRow);
+  // S3: on a capable node with both switches on, needs_action batch children
+  // are checked by the node like superseded rows, so their phase is the
+  // automatic one instead of task_action_required. Old nodes and a switched
+  // off server keep the previous phases.
+  const includeNeedsActionChildren = autoCheckSupported &&
+    autoCheckEnabled === true && needsActionAutoCheckEnabled === true;
+  const autoCheckRows = fences.filter(row => stopFenceAutoCheckRow(row, includeNeedsActionChildren));
+  const manualOnly = autoCheckRows.filter(row => !text(row.request_id, 240));
+  const checkable = autoCheckRows.filter(row => text(row.request_id, 240));
   const states = checkable.map(row => readStopFenceCheckState(row.stop_fence_check));
   const escalatedStates = states.filter(state => state && stopFenceCheckEscalated(state, current));
   const roundStates = states.map(state => checkRoundState(state, current));
   let phase;
   if (fences.length === 0) phase = 'local_release_pending';
-  else if (superseded.length === 0) phase = 'task_action_required';
+  else if (autoCheckRows.length === 0) phase = 'task_action_required';
   else if (!autoCheckSupported || manualOnly.length > 0) phase = 'manual_only';
   else if (!autoCheckEnabled) phase = 'auto_check_disabled';
   else if (!agentOnline(agentRow, current)) phase = 'offline';
@@ -884,6 +961,7 @@ export function summarizeAgentStopFence(agentRow = {}, rows = [], {
     task_count: fences.length,
     superseded_count: superseded.length,
     action_required_count: actionRequired.length,
+    auto_check_task_count: autoCheckRows.length,
     manual_only_task_count: manualOnly.length,
     local_release_pending_count: releases.length,
     local_release_holds_new_work: localReleaseHoldsNewWork,
@@ -896,13 +974,15 @@ export function summarizeAgentStopFence(agentRow = {}, rows = [], {
     // the confirm route refuses unless the operator sends all of them.
     superseded_task_ids: superseded.map(row => String(row.id)),
     // Every needs_action batch child the operator may release with the same
-    // confirmation (not cut by the 20-row list either). The phase stays
-    // task_action_required: these still need a person.
+    // confirmation (not cut by the 20-row list either). On an old node (or
+    // with the S3 switch off) the phase stays task_action_required; on a
+    // capable node the node checks them and the operator may still confirm.
     operator_confirmable_task_ids: operatorConfirmable.map(row => String(row.id)),
     operator_confirmable_count: operatorConfirmable.length,
     tasks: fences.slice(0, 20).map(row => {
       const error = object(row.error);
-      const autoCheckable = row.status === 'superseded' && Boolean(text(row.request_id, 240));
+      const autoCheckable = stopFenceAutoCheckRow(row, includeNeedsActionChildren) &&
+        Boolean(text(row.request_id, 240));
       const confirmable = stopFenceOperatorReleasable(row);
       // Only rows that still hold the node are listed; rows already released
       // and waiting for the node's local lock release are only counted.
@@ -1347,6 +1427,7 @@ export async function claimStopFenceCheckOffers(tx, {
   agent,
   lockAgentSession,
   now = Date.now(),
+  includeNeedsActionChildren = stopFenceNeedsActionAutoCheckEnabled(),
 } = {}) {
   if (typeof lockAgentSession !== 'function') throw new Error('stop_fence_agent_lock_required');
   const currentAgent = await lockAgentSession(tx, agent);
@@ -1390,16 +1471,21 @@ export async function claimStopFenceCheckOffers(tx, {
   const rows = await listCaptureAgentStopFences(tx, tenantId, {
     agentId,
     onlySuperseded: true,
+    includeNeedsActionChildren: includeNeedsActionChildren === true,
     includeLocalRelease: true,
     includeExpiredLocalRelease: true,
     requireRequestId: true,
     limit: 6,
   });
   if (rows.length === 0) return [];
+  // needs_action rows are S3 batch children; the listing already required
+  // that, and each locked row is judged again below.
   const locked = await tx.queryAll(`
-    SELECT id, status, error, metadata
+    SELECT id, status, error, metadata, parent_task_id, task_type,
+      client_task_id, control_task_id
     FROM capture_tasks
-    WHERE tenant_id = $1 AND id = ANY($2::uuid[]) AND status = 'superseded'
+    WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+      AND status IN ('superseded', 'needs_action')
     ORDER BY id
     FOR UPDATE SKIP LOCKED
   `, [tenantId, rows.map(row => row.id)]);
@@ -1414,7 +1500,7 @@ export async function claimStopFenceCheckOffers(tx, {
     const at = new Date(current).toISOString();
 
     if (row.kind === 'local_release') {
-      if (code !== STOP_FENCE_RECONCILED_CODE) continue;
+      if (lockedRow.status !== 'superseded' || code !== STOP_FENCE_RECONCILED_CODE) continue;
       const localRelease = object(state?.localRelease);
       if (localRelease.state !== 'pending') continue;
       // Expired, or unusable without a checkId: close it so that the
@@ -1449,6 +1535,8 @@ export async function claimStopFenceCheckOffers(tx, {
     }
 
     if (code !== STOP_FENCE_CODE) continue;
+    if (!stopFenceAutoCheckRow(lockedRow, includeNeedsActionChildren === true)) continue;
+    if (text(object(lockedRow.metadata).recoveryTaskId, 100)) continue;
     let next = null;
     let offer = false;
     const lastResult = object(state?.lastResult);
@@ -1635,6 +1723,69 @@ async function completeLocalReleaseReceipt(tx, {task, agent, state, checkId, req
   });
 }
 
+export const STOP_FENCE_NEEDS_ACTION_RELEASED_MESSAGE = '节点已确认旧采集页面已停止，本执行结束，已恢复接单';
+
+/**
+ * S3: a proof for a needs_action batch child. The row changes status and its
+ * work items go back to the batch, which only the route can project, so the
+ * route injects `releaseNeedsAction(tx, {task, agent, checkId, evidence, now})`
+ * returning {released} or {skipReason}. It runs in this transaction, after the
+ * node session and the task row are locked (node -> child -> parent -> items,
+ * the heartbeat projection order). A row with a command in flight is not
+ * released: that round counts as one retryable failure.
+ */
+async function completeNeedsActionProof(tx, {
+  task,
+  agent,
+  state,
+  checkId,
+  evidence,
+  alreadyRecorded,
+  releaseNeedsAction,
+  now,
+}) {
+  if (typeof releaseNeedsAction !== 'function') {
+    throw new Error('stop_fence_needs_action_release_required');
+  }
+  const release = object(await releaseNeedsAction(tx, {task, agent, checkId, evidence, now}));
+  if (release.released === true) {
+    return receipt(200, {
+      ok: true,
+      released: true,
+      message: STOP_FENCE_NEEDS_ACTION_RELEASED_MESSAGE,
+    });
+  }
+  if (text(release.skipReason, 80) !== 'command_in_flight') return STALE_RECEIPT;
+  if (alreadyRecorded) {
+    return receipt(200, {
+      ok: true,
+      released: false,
+      idempotent: true,
+      nextIssueAt: state.nextIssueAt || null,
+      message: stopFenceReasonLabel(object(state.lastResult).reason),
+    });
+  }
+  const next = await recordStopFenceCheckResult(tx, {
+    task,
+    agent,
+    state,
+    result: {
+      checkId,
+      reason: 'command_in_flight',
+      retryable: true,
+      requiresOperator: false,
+      message: stopFenceReasonLabel('command_in_flight'),
+    },
+    now,
+  });
+  return receipt(200, {
+    ok: true,
+    released: false,
+    nextIssueAt: next.nextIssueAt,
+    message: stopFenceReasonLabel('command_in_flight'),
+  });
+}
+
 /**
  * POST /agent/stop-fence-checks/:checkId/complete, inside one transaction.
  * Returns {status, body}; the route only serializes it.
@@ -1647,6 +1798,8 @@ export async function completeStopFenceCheckReceipt(tx, {
   requestId,
   rawResult,
   now = Date.now(),
+  includeNeedsActionChildren = stopFenceNeedsActionAutoCheckEnabled(),
+  releaseNeedsAction = null,
 }) {
   if (typeof lockAgentSession !== 'function') throw new Error('stop_fence_agent_lock_required');
   const current = nowMs(now);
@@ -1671,6 +1824,7 @@ export async function completeStopFenceCheckReceipt(tx, {
   const agentId = text(agent.id, 100).toLowerCase();
   const task = await tx.queryOne(`
     SELECT id, tenant_id, status, error, metadata, client_task_id, control_task_id,
+      parent_task_id, task_type,
       COALESCE(assigned_agent_id, origin_agent_id) AS owner_agent_id
     FROM capture_tasks
     WHERE tenant_id = $1 AND id = $2
@@ -1714,7 +1868,13 @@ export async function completeStopFenceCheckReceipt(tx, {
       message: '旧采集页面此前已确认停止',
     });
   }
-  if (task.status !== 'superseded' || code !== STOP_FENCE_CODE) return STALE_RECEIPT;
+  // S3: a needs_action batch child is answered like a superseded row, but
+  // only while the switch that offered it is still on.
+  const needsActionRow = task.status === 'needs_action' &&
+    includeNeedsActionChildren === true &&
+    stopFenceNeedsActionAutoCheckable(task) &&
+    !text(object(task.metadata).recoveryTaskId, 100);
+  if ((task.status !== 'superseded' && !needsActionRow) || code !== STOP_FENCE_CODE) return STALE_RECEIPT;
   if (!state || state.checkId !== scopedCheckId) return STALE_RECEIPT;
   if (!(current <= toMs(state.expiresAt) + STOP_FENCE_RECEIPT_GRACE_MS)) return STALE_RECEIPT;
   const alreadyRecorded = object(state.lastResult).checkId === scopedCheckId;
@@ -1749,6 +1909,18 @@ export async function completeStopFenceCheckReceipt(tx, {
     taskId: scopedTaskId,
     requestId: expectedRequestId,
   });
+  if (verdict.ok && needsActionRow) {
+    return completeNeedsActionProof(tx, {
+      task,
+      agent: agentForEvents,
+      state,
+      checkId: scopedCheckId,
+      evidence: stopFenceEvidenceSubset(result),
+      alreadyRecorded,
+      releaseNeedsAction,
+      now: current,
+    });
+  }
   if (verdict.ok) {
     const released = await reconcileCaptureTaskStopFences(tx, {
       tenantId,
@@ -1817,7 +1989,8 @@ export async function completeStopFenceCheckReceipt(tx, {
 
 /**
  * Admin "让节点重新核对": a fresh checkId and a fresh escalation epoch for
- * every superseded fenced row of this node that the node can locate. The
+ * every superseded fenced row of this node that the node can locate, and
+ * (S3) every needs_action batch child the node is asked to check. The
  * round is not offered here; its expiry and epoch restart at the first
  * heartbeat that actually offers it (claimStopFenceCheckOffers).
  */
@@ -1828,6 +2001,7 @@ export async function rotateStopFenceChecks(tx, {
   requestedByName = '',
   actorId = '',
   now = Date.now(),
+  includeNeedsActionChildren = stopFenceNeedsActionAutoCheckEnabled(),
 }) {
   const ids = uniqueUuids(taskIds);
   if (ids.length === 0) return [];
@@ -1835,15 +2009,17 @@ export async function rotateStopFenceChecks(tx, {
   const rows = await tx.queryAll(`
     SELECT id, metadata,
       COALESCE(NULLIF(control_task_id, ''), NULLIF(client_task_id, ''), '') AS request_id
-    FROM capture_tasks
+    FROM capture_tasks rotated
     WHERE tenant_id = $1
       AND id = ANY($2::uuid[])
       AND COALESCE(assigned_agent_id, origin_agent_id) = $3
-      AND status = 'superseded'
+      AND (status = 'superseded'
+        OR ($4::boolean AND ${STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL('rotated')}))
       AND UPPER(COALESCE(error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+      AND NULLIF(metadata->>'recoveryTaskId', '') IS NULL
     ORDER BY id
     FOR UPDATE
-  `, [text(tenantId, 100), ids, text(agentId, 100).toLowerCase()]);
+  `, [text(tenantId, 100), ids, text(agentId, 100).toLowerCase(), includeNeedsActionChildren === true]);
   const rotated = [];
   for (const row of rows) {
     if (!text(row.request_id, 240)) continue;

@@ -12,7 +12,9 @@ import {
 // docs/hotfix/20260925-needs-action-fence.md. A batch child that the
 // Extension left in needs_action with PREVIOUS_CAPTURE_STOP_UNCONFIRMED can
 // neither be resumed nor skipped on the node, and the batch never hands its
-// keywords on. Only an explicit operator confirmation ends it here. Unlike the
+// keywords on. An explicit operator confirmation, or (S3 of
+// docs/hotfix/20260927-unattended-self-heal.md) the node's bound proof from
+// the heartbeat check, ends it here. Unlike the
 // check protocol in capture-stop-fence.js (which never reads commands, never
 // changes a status and never moves updated_at), this is a real status
 // transition to `superseded`, written in the same release format.
@@ -42,16 +44,35 @@ function uniqueUuids(values, limit = 200) {
   )].sort().slice(0, limit);
 }
 
-const NEEDS_ACTION_RELEASE_MESSAGE = '已人工确认旧采集页面已停止，本执行结束';
+// The row message per proof source. Both keep the same release format;
+// historicalStopFenceReconciliation.proofStatus tells them apart.
+const NEEDS_ACTION_RELEASE_MESSAGES = Object.freeze({
+  operator_confirmed: '已人工确认旧采集页面已停止，本执行结束',
+  agent_confirmed: '节点已确认旧采集页面已停止，本执行结束',
+});
+const NEEDS_ACTION_RELEASE_REASONS = Object.freeze({
+  operator_confirmed: 'operator_confirmed_needs_action_released',
+  agent_confirmed: 'agent_confirmed_needs_action_released',
+});
+
+function releaseProofStatus(value) {
+  return value === 'agent_confirmed' ? 'agent_confirmed' : 'operator_confirmed';
+}
 
 /**
- * Operator release of needs_action batch children (the operator selected each
- * id explicitly). Each row becomes `superseded` in the same format as a
- * superseded release, which the heartbeat mirror can no longer rewrite, and
+ * Release of needs_action batch children: by an operator who selected each id
+ * explicitly, or (docs/hotfix/20260927-unattended-self-heal.md, S3) by the
+ * node's bound proof for one row (proofStatus 'agent_confirmed', with its
+ * checkId and evidence). Each row becomes `superseded` in the same format as
+ * a superseded release, which the heartbeat mirror can no longer rewrite, and
  * leaves the fence. The caller hands the work items back to the batch
  * (projectOrchestrationChildControlOutcome) and then records the actual
  * outcome with recordNeedsActionStopFenceOutcome. A row with a remote command
  * in flight (for example a stop the operator just requested) is skipped.
+ *
+ * terminalReason and the item code keep their operator names on purpose:
+ * three readers match them exactly (stopFenceReleasedRetrySource, the
+ * pending-retry scan and the adoption guard).
  */
 export async function releaseNeedsActionStopFences(tx, {
   tenantId,
@@ -61,8 +82,16 @@ export async function releaseNeedsActionStopFences(tx, {
   actorId = '',
   note = '',
   requestLocalRelease = false,
+  proofStatus = 'operator_confirmed',
+  reason = '',
+  checkId = '',
+  evidence = null,
+  message = '',
   now = Date.now(),
 }) {
+  const source = releaseProofStatus(proofStatus);
+  const releaseReason = text(reason, 120) || NEEDS_ACTION_RELEASE_REASONS[source];
+  const releaseMessage = text(message, 500) || NEEDS_ACTION_RELEASE_MESSAGES[source];
   const ids = uniqueUuids(taskIds);
   const scopedTenantId = text(tenantId, 100);
   const scopedAgentId = text(agentId, 100).toLowerCase();
@@ -104,10 +133,12 @@ export async function releaseNeedsActionStopFences(tx, {
     }
     const {originalError, reconciliation, check} = buildStopFenceReleaseRecord(row, {
       current,
-      reason: 'operator_confirmed_needs_action_released',
-      proofStatus: 'operator_confirmed',
+      reason: releaseReason,
+      proofStatus: source,
       requestedBy,
       agentId: scopedAgentId,
+      checkId,
+      evidence,
       note,
       actorId,
       requestLocalRelease,
@@ -145,7 +176,7 @@ export async function releaseNeedsActionStopFences(tx, {
       row.id,
       JSON.stringify(reconciliation),
       JSON.stringify(check),
-      NEEDS_ACTION_RELEASE_MESSAGE,
+      releaseMessage,
       STOP_FENCE_OPERATOR_RELEASED_REASON,
     ]);
     if (!updated) {
@@ -200,7 +231,11 @@ export async function recordNeedsActionStopFenceOutcome(tx, {
   actorType = 'user',
   actorId = '',
   actorName = '',
+  proofStatus = 'operator_confirmed',
+  reason = '',
+  checkId = '',
 }) {
+  const source = releaseProofStatus(proofStatus);
   const outcome = object(itemOutcome);
   const sentence = stopFenceReleaseOutcomeSentence(outcome);
   await tx.execute(`
@@ -213,7 +248,7 @@ export async function recordNeedsActionStopFenceOutcome(tx, {
     WHERE tenant_id = $1 AND id = $2
       AND status = 'superseded'
       AND metadata ? 'historicalStopFenceReconciliation'
-  `, [text(tenantId, 100), taskId, `${NEEDS_ACTION_RELEASE_MESSAGE}；${sentence}`, JSON.stringify(outcome)]);
+  `, [text(tenantId, 100), taskId, `${NEEDS_ACTION_RELEASE_MESSAGES[source]}；${sentence}`, JSON.stringify(outcome)]);
   await appendStopFenceEvent(tx, {
     tenantId: text(tenantId, 100),
     taskId,
@@ -223,12 +258,12 @@ export async function recordNeedsActionStopFenceOutcome(tx, {
     actorId,
     actorName,
     status: 'superseded',
-    message: `${RECONCILED_EVENT_MESSAGES.operator_confirmed(actorName)}；该执行结束，${sentence}`,
+    message: `${RECONCILED_EVENT_MESSAGES[source](actorName)}；该执行结束，${sentence}`,
     payload: {
-      proofStatus: 'operator_confirmed',
-      reason: 'operator_confirmed_needs_action_released',
+      proofStatus: source,
+      reason: text(reason, 120) || NEEDS_ACTION_RELEASE_REASONS[source],
       originalError: object(originalError),
-      checkId: '',
+      checkId: text(checkId, 100),
       releasedFromStatus: 'needs_action',
       itemOutcome: outcome,
     },
