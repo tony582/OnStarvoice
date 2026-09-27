@@ -23,6 +23,16 @@ export const OPERATOR_CLOSE_ORCHESTRATION_MESSAGE =
   '已由操作员结束并移到历史；未完成的工作项已标记失败，已完成结果保留';
 export const OPERATOR_CLOSE_EVENT_MESSAGE = '操作员结束任务并移到历史（未重新采集，未向设备发送指令）';
 export const OPERATOR_CLOSE_SUCCESS_MESSAGE = '已结束并移到历史，采集结果已保留';
+// docs/hotfix/20260927-unattended-self-heal.md (S4): the same close, run by the
+// system for rows nobody can act on (mode 'automatic', actor type 'system').
+export const OPERATOR_CLOSE_AUTOMATIC_ACTOR_NAME = '系统自动结算';
+export const OPERATOR_CLOSE_AUTOMATIC_ROOT_MESSAGE = '系统已自动结束并移到历史（没有可继续的工作，未重新采集）';
+export const OPERATOR_CLOSE_AUTOMATIC_CHILD_MESSAGE = '已由系统自动结束（未重新采集）';
+export const OPERATOR_CLOSE_AUTOMATIC_ORCHESTRATION_MESSAGE =
+  '系统已自动结束：用尽次数的工作项已标记失败，已完成结果保留';
+export const OPERATOR_CLOSE_AUTOMATIC_EVENT_MESSAGE =
+  '系统自动结算：任务已没有可继续的工作，结束并移到历史（未重新采集，未向设备发送指令）';
+export const OPERATOR_CLOSE_MODES = Object.freeze(['single', 'bulk', 'automatic']);
 export const OPERATOR_CLOSE_CLOSEABLE_STATUS = 'needs_action';
 export const OPERATOR_CLOSED_TASK_STATUSES = Object.freeze(['failed', 'completed_with_failures']);
 export const OPERATOR_CLOSE_MAX_BULK = 100;
@@ -354,6 +364,15 @@ export class OperatorCloseNotTerminalError extends Error {
  * Close one root inside the caller's transaction. Lock order matches the
  * heartbeat projection: descendants by id -> root -> subtree items by id ->
  * their attempts. Returns {task, idempotent, ...counts} or {error, reason}.
+ *
+ * S4 (docs/hotfix/20260927-unattended-self-heal.md) runs the same routine
+ * with mode 'automatic' and actor {type: 'system'}: the same marker, guards,
+ * events and audit, written as the system. `verify(tx, {root, items})` runs
+ * after every lock and F3's own re-check and may refuse with a reason (the
+ * automatic conditions, judged again on the locked rows). `dismissAttention`
+ * false keeps an orchestration root in 需处理 (as completed_with_failures).
+ * `eventPayload` adds fields (for example the settled kind) to the event and
+ * the audit metadata.
  */
 export async function closeOperatorAttentionRoot(tx, {
   tenantId,
@@ -361,12 +380,18 @@ export async function closeOperatorAttentionRoot(tx, {
   actor = {},
   mode = 'single',
   refreshOrchestrationParent,
+  verify = null,
+  dismissAttention = true,
+  eventPayload = {},
 } = {}) {
   const scopedRootId = text(rootId, 100).toLowerCase();
   if (!UUID_PATTERN.test(scopedRootId)) return {error: 'task_not_found'};
-  const actorName = text(actor.name, 240);
-  const actorUserId = text(actor.userId, 100);
-  const closeMode = mode === 'bulk' ? 'bulk' : 'single';
+  const closeMode = OPERATOR_CLOSE_MODES.includes(mode) ? mode : 'single';
+  const automatic = closeMode === 'automatic';
+  const actorType = automatic || actor.type === 'system' ? 'system' : 'user';
+  const actorName = text(actor.name, 240) || (actorType === 'system' ? OPERATOR_CLOSE_AUTOMATIC_ACTOR_NAME : '');
+  const actorUserId = actorType === 'system' ? '' : text(actor.userId, 100);
+  const extraPayload = object(eventPayload);
 
   const treeIds = await readTreeIds(tx, tenantId, scopedRootId);
   if (treeIds.length === 0) return {error: 'task_not_found'};
@@ -403,6 +428,10 @@ export async function closeOperatorAttentionRoot(tx, {
     .get(scopedRootId);
   if (!eligibility?.eligible) {
     return {error: 'task_not_closeable', reason: eligibility?.reason || 'status_not_closeable'};
+  }
+  if (typeof verify === 'function') {
+    const refused = text(await verify(tx, {root, items, treeIds}), 80);
+    if (refused) return {error: 'task_not_closeable', reason: refused};
   }
 
   const standaloneMobileRun = object(root.metadata).workflow === STANDALONE_MOBILE_WORKFLOW;
@@ -466,7 +495,8 @@ export async function closeOperatorAttentionRoot(tx, {
         updated_at = now()
       WHERE tenant_id = $1 AND id = ANY($2::uuid[]) AND status = 'needs_action'
       RETURNING id
-    `, [tenantId, childIds, actorName, actorUserId, scopedRootId, closeMode, OPERATOR_CLOSE_CHILD_MESSAGE]);
+    `, [tenantId, childIds, actorName, actorUserId, scopedRootId, closeMode,
+      automatic ? OPERATOR_CLOSE_AUTOMATIC_CHILD_MESSAGE : OPERATOR_CLOSE_CHILD_MESSAGE]);
     closedChildTaskIds = closedChildren.map(row => row.id).sort();
   }
 
@@ -482,7 +512,7 @@ export async function closeOperatorAttentionRoot(tx, {
       tenantId,
       parentTaskId: scopedRootId,
       parent: root,
-      actorType: 'user',
+      actorType,
       actorId: actorUserId,
       actorName,
     });
@@ -504,16 +534,20 @@ export async function closeOperatorAttentionRoot(tx, {
               'originalMessage', $10::text
             )
         ),
-        attention_dismissed_at = now(),
-        attention_dismissed_by_user_id = NULLIF($4, '')::uuid,
-        attention_dismissed_by_name = $3,
+        -- S4 keeps an automatically settled batch in 需处理 when asked to
+        -- (completed_with_failures, like a browser batch with failures).
+        attention_dismissed_at = CASE WHEN $11::boolean THEN now() ELSE attention_dismissed_at END,
+        attention_dismissed_by_user_id = CASE WHEN $11::boolean THEN NULLIF($4, '')::uuid
+          ELSE attention_dismissed_by_user_id END,
+        attention_dismissed_by_name = CASE WHEN $11::boolean THEN $3 ELSE attention_dismissed_by_name END,
         updated_at = now()
       WHERE tenant_id = $1 AND id = $2
       RETURNING *
     `, [
       tenantId, scopedRootId, actorName, actorUserId, scopedRootId, closeMode,
-      OPERATOR_CLOSE_ORCHESTRATION_MESSAGE, root.status,
-      JSON.stringify(object(root.error)), text(root.message, 4000),
+      automatic ? OPERATOR_CLOSE_AUTOMATIC_ORCHESTRATION_MESSAGE : OPERATOR_CLOSE_ORCHESTRATION_MESSAGE,
+      root.status, JSON.stringify(object(root.error)), text(root.message, 4000),
+      dismissAttention !== false,
     ]);
   } else {
     closedRoot = await tx.queryOne(`
@@ -530,7 +564,8 @@ export async function closeOperatorAttentionRoot(tx, {
         updated_at = now()
       WHERE tenant_id = $1 AND id = $2 AND status = '${OPERATOR_CLOSE_CLOSEABLE_STATUS}'
       RETURNING *
-    `, [tenantId, scopedRootId, actorName, actorUserId, scopedRootId, closeMode, OPERATOR_CLOSE_ROOT_MESSAGE]);
+    `, [tenantId, scopedRootId, actorName, actorUserId, scopedRootId, closeMode,
+      automatic ? OPERATOR_CLOSE_AUTOMATIC_ROOT_MESSAGE : OPERATOR_CLOSE_ROOT_MESSAGE]);
   }
   if (!closedRoot) throw new OperatorCloseNotTerminalError(root.status);
 
@@ -544,20 +579,22 @@ export async function closeOperatorAttentionRoot(tx, {
     INSERT INTO capture_task_events (
       tenant_id, task_id, event_type, actor_type, actor_id, actor_name,
       status, message, payload
-    ) VALUES ($1, $2, $3, 'user', $4, $5, $6, $7, $8::jsonb)
+    ) VALUES ($1, $2, $3, $9, $4, $5, $6, $7, $8::jsonb)
   `, [
     tenantId, scopedRootId, OPERATOR_CLOSE_EVENT, actorUserId, actorName,
-    closedRoot.status, OPERATOR_CLOSE_EVENT_MESSAGE,
-    JSON.stringify({originalStatus: root.status, mode: closeMode, ...counts}),
+    closedRoot.status, automatic ? OPERATOR_CLOSE_AUTOMATIC_EVENT_MESSAGE : OPERATOR_CLOSE_EVENT_MESSAGE,
+    JSON.stringify({...extraPayload, originalStatus: root.status, mode: closeMode, ...counts}),
+    actorType,
   ]);
   await tx.execute(`
     INSERT INTO audit_logs (
       tenant_id, actor_type, actor_id, actor_user_id,
       action, target_type, target_id, metadata
-    ) VALUES ($1, 'user', $2, NULLIF($3, '')::uuid, $4, 'capture_task', $5, $6::jsonb)
+    ) VALUES ($1, $7, $2, NULLIF($3, '')::uuid, $4, 'capture_task', $5, $6::jsonb)
   `, [
     tenantId, actorUserId, actorUserId, OPERATOR_CLOSE_AUDIT_ACTION, scopedRootId,
     JSON.stringify({
+      ...extraPayload,
       actorName,
       title: text(root.title, 240),
       taskType: text(root.task_type, 120),
@@ -565,6 +602,7 @@ export async function closeOperatorAttentionRoot(tx, {
       mode: closeMode,
       ...counts,
     }),
+    actorType,
   ]);
   return {task: closedRoot, idempotent: false, originalStatus: root.status, ...counts};
 }

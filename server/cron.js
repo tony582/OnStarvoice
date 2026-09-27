@@ -16,6 +16,7 @@ import {compactOldCaptureTaskTechnicalHistory} from './services/capture-task-ret
 import {runOpsControlCycle} from './services/ops-control.js';
 import {
   reconcileAutomaticCaptureRetries,
+  reconcileDeadAttentionRoots,
   reconcileElasticCaptureLeases,
   reconcilePendingCaptureCommands,
 } from './routes/capture-cloud.js';
@@ -38,6 +39,7 @@ const DEFAULT_JOBS = Object.freeze({
   processCustomerAssistant,
   queryAll,
   reconcileAutomaticCaptureRetries,
+  reconcileDeadAttentionRoots,
   reconcileElasticCaptureLeases,
   reconcileKeywordNodeCoverage,
   reconcilePendingOrchestrationRetries,
@@ -248,6 +250,27 @@ function schedulerDefinitions(jobs, logger) {
       run:async()=>{
         try {await jobs.processCustomerAssistant();}
         catch {safeLog(logger,'error','[Cron] Customer assistant queue could not complete this cycle.');}
+      },
+    },
+    {
+      // S4 of docs/hotfix/20260927-unattended-self-heal.md: settle 需处理
+      // roots nobody can act on (CAPTURE_DEAD_ATTENTION_SWEEP=off stops it).
+      name: 'dead-attention-settlement',
+      expression: '*/5 * * * *',
+      run: async () => {
+        try {
+          const result = await jobs.reconcileDeadAttentionRoots({limit: 50, logger});
+          if (result.settled > 0 || result.busy > 0) {
+            safeLog(
+              logger,
+              'log',
+              `[Cron] Dead attention settlement: ${result.settled} settled ` +
+              `${JSON.stringify(result.kinds || {})}, ${result.busy} busy, ${result.scanned} scanned`,
+            );
+          }
+        } catch (err) {
+          safeLog(logger, 'error', '[Cron] Dead attention settlement error:', err.message);
+        }
       },
     },
     {

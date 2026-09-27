@@ -123,6 +123,7 @@ import {
   operatorClosedTaskSql,
   operatorClosedWorkItem,
 } from '../services/capture-operator-close.js';
+import {sweepDeadAttentionRoots} from '../services/capture-dead-attention.js';
 
 function requireCaptureAgent(req, res, next) {
   return authenticateCaptureAgent(req, res, error => {
@@ -16439,6 +16440,20 @@ export async function reconcileElasticCaptureLeases(input = 50) {
     }
   }
   return summary;
+}
+
+// S4 of docs/hotfix/20260927-unattended-self-heal.md: the automatic
+// counterpart of 「结束并移到历史」 for 需处理 roots nobody can act on. The
+// service decides which roots and when; F3's close routine settles them. The
+// route only injects the orchestration projector (services may not import
+// routes) and refreshes the overview cache. Cron: every five minutes.
+export async function reconcileDeadAttentionRoots(options = {}) {
+  const result = await sweepDeadAttentionRoots({
+    ...(options && typeof options === 'object' ? options : {}),
+    refreshOrchestrationParent: refreshOrchestrationParentTask,
+  });
+  if (result.settled > 0) clearCaptureOverviewProjectionCache();
+  return result;
 }
 
 export async function reconcileAutomaticCaptureRetries(input = 10) {

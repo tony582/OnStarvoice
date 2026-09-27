@@ -82,6 +82,9 @@ function safeJobs(overrides = {}) {
     async reconcileAutomaticCaptureRetries() {
       return {dispatched: 0, waitingForAgent: 0, manualOnly: 0, failed: 0};
     },
+    async reconcileDeadAttentionRoots() {
+      return {tenants: 0, scanned: 0, settled: 0, skipped: 0, busy: 0, kinds: {}};
+    },
     async reconcileElasticCaptureLeases() {
       return {requeued: 0};
     },
@@ -151,6 +154,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   let reconcileCalls = 0;
   let patrolCalls = 0;
   let fallbackRecoveryLimit = 0;
+  let deadAttentionOptions = null;
   let pendingRetryLimit = 0;
   const runtime = startSchedulerCronJobs({
     cronModule: fakeCron,
@@ -169,6 +173,10 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
         fallbackRecoveryLimit = limit;
         return {dispatched: 0, waitingForAgent: 0, manualOnly: 0, failed: 0};
       },
+      async reconcileDeadAttentionRoots(options) {
+        deadAttentionOptions = options;
+        return {tenants: 1, scanned: 0, settled: 0, skipped: 0, busy: 0, kinds: {}};
+      },
       async reconcilePendingOrchestrationRetries(limit) {
         pendingRetryLimit = limit;
         return {dispatched: 0, waitingForAgent: 0, failed: 0};
@@ -178,7 +186,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
 
   assert.deepEqual(
     fakeCron.registrations.map(item => item.expression),
-    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *', '*/5 * * * * *', '*/5 * * * *'],
+    ['17 3 * * *', '*/5 * * * *', '* * * * *', '* * * * *', '* * * * *', '*/5 * * * * *', '*/5 * * * *', '*/5 * * * *'],
   );
   assert.deepEqual(
     fakeCron.registrations.map(item => item.options.name),
@@ -189,6 +197,7 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
       'onstarvoice:capture-attention-notifications',
       'onstarvoice:customer-daily-delivery',
       'onstarvoice:customer-group-assistant',
+      'onstarvoice:dead-attention-settlement',
       'onstarvoice:ops-control-observer',
     ],
   );
@@ -202,6 +211,8 @@ test('scheduler cron owns only scheduler work and every task is non-overlapping'
   assert.equal(reconcileCalls, 2);
   assert.equal(fallbackRecoveryLimit, 10);
   assert.equal(pendingRetryLimit, 10);
+  await fakeCron.registrations[6].task.fire();
+  assert.equal(deadAttentionOptions?.limit, 50, 'the dead-attention sweep runs on its own five-minute job');
 
   assert.equal(runtime.stop(), true);
   assert.equal(runtime.stop(), false);
@@ -307,7 +318,7 @@ test('compatibility cron composes both groups without duplicate lifecycle calls'
     jobs: safeJobs(),
   });
 
-  assert.equal(fakeCron.registrations.length, 9);
+  assert.equal(fakeCron.registrations.length, 10);
   assert.deepEqual(runtime.runtimes.map(item => item.groupName), ['scheduler', 'ai']);
   assert.deepEqual(messages, ['[Cron] Scheduled jobs started']);
   assert.equal(runtime.stop(), true);
