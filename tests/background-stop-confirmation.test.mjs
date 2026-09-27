@@ -932,6 +932,184 @@ test("0.4.19: R's hung background page (the content query times out) is discarde
   });
 });
 
+// 评审复现（S2'）：R 已归档，计划闹钟之后在 R 的旧来源页 20 上启动的本地运行
+// R2 正在跑（请求槽里非终态、持有自己的锁、runner 正往 20 发采集）。20 忙过
+// 3 秒时，节点核对不能把 R2 的页面丢弃：丢了也换不来证明（本机释放会因为
+// 运行中的 R2 失败），只会毁掉 R2 的采集。
+test("0.4.19: a node check never discards the page of a request now running in the slot", async () => {
+  const harness = createHarness();
+  seedTypicalFence(harness, {lock: false});
+  const archived = harness.storage[REQUEST_KEY];
+  harness.storage[ARCHIVE_KEY] = {
+    version: 1,
+    requests: {[REQUEST_ID]: {...archived, archivedAt: new Date().toISOString()}},
+  };
+  harness.storage[REQUEST_KEY] = {
+    ...archived,
+    id: "r2",
+    status: "running",
+    attemptId: "r2-attempt",
+    previousAttemptId: "",
+    error: null,
+    stopFenceEvidence: undefined,
+    progress: {runnerTabId: 20, captureRequestId: "r2-capture", phase: "list_capture"},
+  };
+  seedLock(harness, {
+    id: "lock-r2",
+    holderId: "r2-holder",
+    holderDocumentId: "r2-runner-document",
+    holderTabId: 20,
+    captureTaskId: "unattended-capture:r2",
+    captureTaskAttemptId: "r2-attempt",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+  });
+  harness.addTab({
+    id: 50,
+    url: runnerUrl("r2", "r2-attempt"),
+    documentId: "r2-runner-document",
+    active: true,
+  });
+  let release;
+  harness.content(20).onAction = () => new Promise((resolvePromise) => {
+    release = () => resolvePromise({ok: true});
+  });
+  const relay = harness.sendBackgroundMessage(
+    {
+      type: "onstarvoice:relay-to-content",
+      tabId: 20,
+      payload: {action: "captureDetailForManual", captureRequestId: "r2-capture"},
+    },
+    {
+      documentId: "r2-runner-document",
+      url: runnerUrl("r2", "r2-attempt"),
+      tab: {id: 50},
+    },
+  );
+  for (let attempt = 0; attempt < 50 && !release; attempt += 1) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 2));
+  }
+  assert.equal(typeof release, "function", "R2's relay must be in flight");
+  harness.content(20).active.set("r2-capture", 1);
+  harness.content(20).hang = true;
+
+  const result = await runCheck(harness);
+
+  assert.equal(result.accepted, false, JSON.stringify(result));
+  assert.equal(result.retryable, true);
+  assert.deepEqual(harness.forbiddenTabCalls.discard, []);
+  assert.equal(harness.tabs.get(20).discarded, false);
+  assert.equal(harness.storage[REQUEST_KEY].id, "r2");
+  assert.equal(harness.storage[LOCK_KEY].id, "lock-r2", "R2's lock untouched");
+  assertCheckSafety(harness, {allowedRemovedTabIds: [30]});
+  release();
+  await relay;
+});
+
+// 评审复现：另一个活着的采集（这里是手动采集，持有执行锁、持有文档存活、
+// 正往 20 发中继）在用 R 曾经用过的页。页面应答时判 unrelated_live_capture；
+// 忙过 3 秒时也不能丢弃它。
+test("0.4.19: a node check never discards a busy page of another live capture", async () => {
+  const harness = createHarness();
+  seedTypicalFence(harness, {lock: false});
+  seedLock(harness, {
+    id: "manual-lock",
+    owner: "manual_batch_keyword_capture",
+    holderId: "manual-holder",
+    holderDocumentId: "manual-document",
+    holderTabId: null,
+    captureTaskId: "manual-task",
+    captureTaskAttemptId: "",
+    expiresAt: Date.now() + 10 * 60 * 1000,
+  });
+  const finishRelay = await startManualRelay(harness, {
+    tabId: 20,
+    captureRequestId: "manual-capture",
+    documentId: "manual-document",
+  });
+  harness.content(20).active.set("manual-capture", 1);
+  harness.content(20).hang = true;
+
+  const result = await runCheck(harness);
+
+  assert.equal(result.accepted, false, JSON.stringify(result));
+  assert.equal(targetFor(result, 20).evidence, "probe_failed");
+  assert.deepEqual(harness.forbiddenTabCalls.discard, []);
+  assert.equal(harness.tabs.get(20).discarded, false);
+  assert.equal(harness.storage[LOCK_KEY].id, "manual-lock", "other lock untouched");
+  assertCheckSafety(harness, {allowedRemovedTabIds: [30]});
+
+  // 只剩另一条流水线的中继（锁已释放）时，这一页同样不丢。
+  const relayOnly = createHarness();
+  seedTypicalFence(relayOnly, {lock: false});
+  const finishRelayOnly = await startManualRelay(relayOnly, {
+    tabId: 20,
+    captureRequestId: "manual-capture",
+    documentId: "manual-document",
+  });
+  relayOnly.content(20).active.set("manual-capture", 1);
+  relayOnly.content(20).hang = true;
+  const relayOnlyResult = await runCheck(relayOnly);
+  assert.equal(relayOnlyResult.accepted, false, JSON.stringify(relayOnlyResult));
+  assert.deepEqual(relayOnly.forbiddenTabCalls.discard, []);
+  assertCheckSafety(relayOnly, {allowedRemovedTabIds: [30]});
+  await finishRelay();
+  await finishRelayOnly();
+});
+
+// 评审复现：围栏证据里记下的页、已归档的 R 的进度页，都可能是几小时前的
+// 记录，挂住时不丢弃；绑定 R 的锁的持有页仍按 R 的页处理。
+test("0.4.19: a hung page recorded only in the fence evidence or in an archived R's progress is not discarded", async () => {
+  const recorded = createHarness();
+  seedTypicalFence(recorded);
+  recorded.storage[REQUEST_KEY].stopFenceEvidence.targets.push(
+    {tabId: 41, role: "progress_tab", reason: ""},
+  );
+  recorded.addTab({
+    id: 41,
+    url: "https://www.douyin.com/user/self",
+    title: "用户自己的抖音页",
+    timeOrigin: freshDocument(),
+    content: {active: {}},
+  });
+  recorded.content(41).hang = true;
+  const recordedResult = await runCheck(recorded);
+  assert.equal(recordedResult.accepted, false, JSON.stringify(recordedResult));
+  assert.equal(targetFor(recordedResult, 41).evidence, "probe_failed");
+  assert.deepEqual(recorded.forbiddenTabCalls.discard, []);
+  assertCheckSafety(recorded, {allowedRemovedTabIds: [30]});
+
+  const archiveR = (harness) => {
+    const request = harness.storage[REQUEST_KEY];
+    harness.storage[ARCHIVE_KEY] = {
+      version: 1,
+      requests: {[REQUEST_ID]: {...request, archivedAt: new Date().toISOString()}},
+    };
+    delete harness.storage[REQUEST_KEY];
+  };
+  const archived = createHarness();
+  seedTypicalFence(archived);
+  archiveR(archived);
+  archived.content(20).hang = true;
+  const archivedResult = await runCheck(archived);
+  assert.equal(archivedResult.accepted, false, JSON.stringify(archivedResult));
+  assert.equal(targetFor(archivedResult, 20).evidence, "probe_failed");
+  assert.deepEqual(archived.forbiddenTabCalls.discard, []);
+
+  // 同一页若是绑定 R 的锁的持有页（持有文档已不在），仍按 R 的页丢弃并证明。
+  const held = createHarness();
+  seedTypicalFence(held);
+  held.storage[LOCK_KEY].holderTabId = 20;
+  archiveR(held);
+  held.content(20).hang = true;
+  const heldResult = await runCheck(held);
+  assert.equal(heldResult.accepted, true, JSON.stringify(heldResult));
+  assert.equal(targetFor(heldResult, 20).evidence, "tab_discarded");
+  assertCheckSafety(held, {
+    allowedRemovedTabIds: [30],
+    allowedDiscardedTabIds: [20],
+  });
+});
+
 test("a page running only R is precisely stopped with a non-empty id, then proven", async () => {
   const harness = createHarness();
   seedTypicalFence(harness);

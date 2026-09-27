@@ -12192,8 +12192,10 @@ async function isSelfStopRequestSlotCurrent(ctx) {
     return false;
   }
   if (ctx.mode === 'fence_check' && (!slot || slot.id !== ctx.requestId)) {
-    // 节点核对：R 不在请求槽里（已归档）就不会再在本机运行。
-    return true;
+    // 节点核对：R 不在请求槽里（已归档）就不会再在本机运行。但槽里另一条
+    // 非终态请求（例如计划闹钟之后在 R 的旧来源页上启动的 R2）可能正用着
+    // R 的旧页面：这时什么都不关、不丢（本机释放本来也会因为它失败）。
+    return !slot || isTerminalUnattendedRunStatus(slot.status);
   }
   if (!slot || slot.id !== ctx.requestId) return false;
   if (ctx.mode === 'terminal' || ctx.mode === 'fence_check') {
@@ -12369,21 +12371,55 @@ async function closeSelfStopPendingRunners(ctx, pendingClose) {
 // 点开时才重新加载；丢弃后的页面报 tab_discarded，扩展与服务端都认它是证明。
 // 只丢：
 // - 冻结的平台页（浏览器已把它挂起在后台，无论是否归属于 R）；
-// - 归属于 R 的平台页（锁持有页、进度页、R 的中继目标、任务组或 Debug 会话
-//   的页），探测或查询超时（渲染进程挂住）。
+// - 此刻仍归属于 R 的平台页（见 collectStopFenceLiveDiscardTabIds），探测或
+//   查询超时（渲染进程挂住）。
 // 永远不丢：活动页（Chrome 也拒绝丢弃活动页）、runner 与扩展页、非平台页
 // （归属于 R 的 about:blank 工作页除外）、仍能应答的页（包括正在跑采集的
 // 页），以及早于本次加载的旧文档（这一类仍需人工或重启浏览器）。每丢一页前
 // 重读标签页与请求槽。
+// 另一条流水线还活着时一页都不丢（执行锁不属于 R 且持有文档存活；节点核对
+// 时请求槽里有别的非终态请求，见 isSelfStopRequestSlotCurrent）；别的流水线
+// 正往里发中继的页也不丢。这些情况下丢弃换不来证明，只会毁掉别人的页面。
 function isStopFenceDiscardCandidate(target, sweep) {
   if (!target || isStopFenceProofTarget(target)) return false;
   if (target.role === 'runner') return false;
   if (target.evidence === 'tab_frozen') return true;
   return (
-    target.role !== 'platform_tab' &&
     target.evidence === 'probe_failed' &&
     Boolean(sweep?.unresponsiveTabIds?.has(target.tabId))
   );
+}
+
+// 挂住的页按“此刻仍归属于 R”才丢：绑定 R 的锁的持有页、R 名下在途中继的
+// 目标页、R 的任务组与 Debug 会话的页；自停时再加上意图里记下的进度页（R
+// 正在请求槽里恢复）。节点核对时：围栏证据里记下的页不算（可能是几小时前
+// 的记录，页面早已换人用）；进度页只在 R 仍在请求槽里时算，归档的 R 的进度页
+// 不算（请求槽里之后可能跑过别的请求）。
+function collectStopFenceLiveDiscardTabIds(ctx) {
+  const tabIds = new Set();
+  for (const {tabId, role} of collectStopFenceAttributedTabs(ctx)) {
+    if (role === 'runner' || role === 'fence_target') continue;
+    if (
+      role === 'progress_tab' &&
+      ctx.mode === 'fence_check' &&
+      ctx.requestSource !== 'slot'
+    ) {
+      continue;
+    }
+    tabIds.add(tabId);
+  }
+  return tabIds;
+}
+
+// 别的流水线（不是 R 或它的来源请求）正往这一页发的采集中继。
+function stopFenceTabHasForeignRelay(ctx, tabId) {
+  const scoped = new Set(listStopFenceScopeRelays(ctx));
+  for (const relay of inFlightContentRelays.values()) {
+    if (!relay.internal && relay.tabId === tabId && !scoped.has(relay)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function discardStuckStopFenceTabs(ctx, sweep) {
@@ -12391,8 +12427,22 @@ async function discardStuckStopFenceTabs(ctx, sweep) {
   if (typeof chrome.tabs?.discard !== 'function' || !sweep?.complete) {
     return discardedTabIds;
   }
-  for (const target of sweep.targets) {
-    if (!isStopFenceDiscardCandidate(target, sweep)) continue;
+  const candidates = sweep.targets.filter((target) =>
+    isStopFenceDiscardCandidate(target, sweep),
+  );
+  if (candidates.length === 0) return discardedTabIds;
+  if (
+    ctx.lock &&
+    !ctx.boundToR &&
+    (await isCaptureExecutionLockHolderAlive(ctx.lock))
+  ) {
+    return discardedTabIds;
+  }
+  const liveTabIds = collectStopFenceLiveDiscardTabIds(ctx);
+  for (const target of candidates) {
+    const live = liveTabIds.has(target.tabId);
+    if (target.evidence !== 'tab_frozen' && !live) continue;
+    if (stopFenceTabHasForeignRelay(ctx, target.tabId)) continue;
     let tab;
     try {
       tab = await chrome.tabs.get(target.tabId);
@@ -12401,8 +12451,7 @@ async function discardStuckStopFenceTabs(ctx, sweep) {
     }
     const url = String(tab?.url || tab?.pendingUrl || '');
     const platformOrBlank =
-      isStopFenceContentScriptSiteUrl(url) ||
-      (url === 'about:blank' && target.role !== 'platform_tab');
+      isStopFenceContentScriptSiteUrl(url) || (url === 'about:blank' && live);
     if (
       tab?.active === true ||
       tab?.discarded === true ||
@@ -12684,13 +12733,20 @@ async function buildRecoverySelfStopFenceEvidence(
   {lockFirst = false} = {},
 ) {
   const lock = await readStoredCaptureExecutionLock().catch(() => null);
-  const failingTabIds = (result?.sweep?.targets || [])
-    .filter((target) => !isStopFenceProofTarget(target))
-    .map((target) => target.tabId);
-  const failedTargets = failingTabIds.map((tabId) => ({
-    tabId,
-    role: 'progress_tab',
-  }));
+  const failingTargets = (result?.sweep?.targets || []).filter(
+    (target) => !isStopFenceProofTarget(target),
+  );
+  const failingTabIds = failingTargets.map((target) => target.tabId);
+  // 围栏目标在之后的节点核对里算作 R 的页，所以只记这次扫描里归属于 R 的页；
+  // 未归属的页（例如用户自己的平台页）不记成目标，只可能出现在 failedTabId 里。
+  const failedTargets = failingTargets
+    .filter(
+      (target) => target.role !== 'platform_tab' && target.role !== 'runner',
+    )
+    .map((target) => ({
+      tabId: target.tabId,
+      role: target.role === 'lock_holder' ? 'lock_holder' : 'progress_tab',
+    }));
   const intent = readRecoverySelfStopIntent(request);
   const progressTarget = {
     tabId: intent?.progressTabId ?? request?.progress?.runnerTabId,

@@ -1233,6 +1233,21 @@ test("a hung source page that is the active tab, or a hung page not attributed t
   assert.deepEqual(unrelated.forbiddenTabCalls.discard, []);
   assert.equal(unrelated.tabs.get(27).discarded, false);
   assertSelfStopSafety(unrelated);
+  // 用尽后写围栏：未归属的页只作为 failedTabId 留下，不记成围栏目标（节点
+  // 核对会把围栏目标当作 R 的页）。
+  let last = failing;
+  for (let attempt = 2; attempt <= 5; attempt += 1) {
+    last = await superviseAfterWait(unrelated);
+  }
+  assert.equal(last.reason, "previous_capture_stop_unconfirmed", JSON.stringify(last));
+  const evidence = unrelated.storage[REQUEST_KEY].stopFenceEvidence;
+  assert.equal(evidence.failedTabId, 27);
+  assert.equal(
+    evidence.targets.some((target) => target.tabId === 27),
+    false,
+    JSON.stringify(evidence.targets),
+  );
+  assert.ok(evidence.targets.some((target) => target.tabId === SOURCE_TAB));
 });
 
 test("a registered worker the user took elsewhere is forgotten, and one the user is looking at is not closed", async () => {
