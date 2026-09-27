@@ -4,6 +4,8 @@ import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { TaskCard } from './TaskCard'
 import type { CloudTask, TaskHistoryResponse } from './lib'
+import { historyClearOutcome } from './operator-close-presentation.mjs'
+import type { HistoryClearResult } from './operator-close-presentation.mjs'
 
 type HistoryFilters = {
   q: string
@@ -141,9 +143,12 @@ export function HistoryView({
     setError('')
     setNotice('')
     try {
-      const result = await api.post<{ clearedCount: number; message?: string }>('/capture-cloud/history/clear', { taskIds: selectedIds })
-      setSelectedIds([])
-      setNotice(result.message || `已清除 ${result.clearedCount} 条历史记录，采集内容和运行结果已保留。`)
+      // 服务端逐行判断：不能移出的行（仍有未结束的工作或仍需处理）放在 skipped 里，
+      // 这些行保持勾选，方便看出是哪几条；全部不能移出时返回 409，勾选不变。
+      const result = await api.post<HistoryClearResult>('/capture-cloud/history/clear', { taskIds: selectedIds })
+      const outcome = historyClearOutcome(result)
+      setSelectedIds(outcome.keepSelectedIds)
+      setNotice(outcome.notice)
       await load()
       await onCleared?.()
     } catch (err) {

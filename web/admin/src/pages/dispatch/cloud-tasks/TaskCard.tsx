@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { hasUnattendedNegativePatrol } from './unattendedNegativePatrol.mjs'
 import {
-  Archive, BadgeCheck, Bot, ChevronDown, ChevronUp, Eye, Loader2, MessagesSquare, Network, Play, RefreshCw, ShieldAlert, Square,
+  Archive, ArchiveX, BadgeCheck, Bot, ChevronDown, ChevronUp, Eye, Loader2, MessagesSquare, Network, Play, RefreshCw, ShieldAlert, Square,
   Radar,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -13,11 +13,13 @@ import {
   STATUS_LABELS,
   automaticIdleAgentRecoveryEnabled,
   canDismissAttention,
+  canOperatorClose,
   canResume,
   canRetryOnIdleAgent,
   canStop,
   formatTime,
   isPlatformSafetyAttention,
+  operatorCloseBlockedReason,
   platformSafetyReason,
   resumeBlockReason,
   safeNumber,
@@ -36,6 +38,7 @@ export function TaskCard({
   onRetryOnIdleAgent,
   onStop,
   onDismissAttention,
+  onOperatorClose,
   onOpenOrchestration,
   onOpenResult,
   history = false,
@@ -48,6 +51,8 @@ export function TaskCard({
   onRetryOnIdleAgent: (task: CloudTask) => Promise<void>
   onStop: (task: CloudTask) => Promise<void>
   onDismissAttention: (task: CloudTask) => Promise<void>
+  /** 「结束并移到历史」：只有服务端判定可结束（operator_close.eligible）时出现。 */
+  onOperatorClose?: (task: CloudTask) => Promise<void>
   onOpenOrchestration: (task: CloudTask) => void
   onOpenResult?: (task: CloudTask) => void
   history?: boolean
@@ -129,6 +134,8 @@ export function TaskCard({
     ? `${diagnostics.currentOrdinal}/${Math.max(diagnostics.total, 1)}「${diagnostics.currentKeyword}」`
     : ''
   const dismissible = canDismissAttention(task)
+  const operatorClosable = Boolean(onOperatorClose) && canOperatorClose(task)
+  const operatorCloseBlocked = history ? '' : operatorCloseBlockedReason(task)
   // 计划模板将从本列表移出，但保留其状态/文案分支，方便复用同一张卡渲染计划视图。
   const scheduleTemplate = orchestration && task.metadata?.orchestrationTemplate === true
   const scheduleRun = orchestration && task.metadata?.orchestrationScheduleRun === true
@@ -165,7 +172,7 @@ export function TaskCard({
             ? '一次性任务'
             : '设备任务'
 
-  const hasActions = orchestration || resumable || retryOnIdleAgent || stoppable || commandPending || dismissible
+  const hasActions = orchestration || resumable || retryOnIdleAgent || stoppable || commandPending || dismissible || operatorClosable
   const resumeActionLabel = resumeBlocked
     ? diagnostics.retryExhausted
       ? '失败词已达上限'
@@ -205,11 +212,14 @@ export function TaskCard({
               ? 'stop'
               : dismissible
                 ? 'dismiss'
-                : ''
+                : operatorClosable
+                  ? 'operator-close'
+                  : ''
   const hasMobileSecondaryActions =
     (resumable && !commandPending && mobilePrimaryAction !== 'resume') ||
     (stoppable && !stopPending && mobilePrimaryAction !== 'stop') ||
-    (dismissible && mobilePrimaryAction !== 'dismiss')
+    (dismissible && mobilePrimaryAction !== 'dismiss') ||
+    (operatorClosable && mobilePrimaryAction !== 'operator-close')
   const orchestrationAgentCount = Array.isArray(task.metadata?.selectedAgentIds)
     ? task.metadata.selectedAgentIds.length
     : Array.isArray(task.metadata?.eligibleAgentIds)
@@ -395,6 +405,11 @@ export function TaskCard({
                 {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />} 移到历史
               </Button>
             )}
+            {mobilePrimaryAction === 'operator-close' && onOperatorClose && (
+              <Button variant="outline" size="sm" className="min-h-11" onClick={() => void onOperatorClose(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArchiveX className="h-4 w-4" />} 结束并移到历史
+              </Button>
+            )}
           </div>
         ) : (
           <div className="flex flex-wrap justify-end gap-2">
@@ -456,6 +471,12 @@ export function TaskCard({
                 移到历史
               </Button>
             )}
+            {operatorClosable && onOperatorClose && (
+              <Button variant="outline" size="sm" onClick={() => void onOperatorClose(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArchiveX className="h-4 w-4" />}
+                结束并移到历史
+              </Button>
+            )}
           </div>
         ))}
       </div>
@@ -480,8 +501,16 @@ export function TaskCard({
                 {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />} 移到历史
               </Button>
             )}
+            {operatorClosable && onOperatorClose && mobilePrimaryAction !== 'operator-close' && (
+              <Button variant="outline" size="sm" className="min-h-11 w-full" onClick={() => void onOperatorClose(task)} disabled={!writable || actionTaskId === task.id}>
+                {actionTaskId === task.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArchiveX className="h-4 w-4" />} 结束并移到历史
+              </Button>
+            )}
           </div>
         </details>
+      )}
+      {operatorCloseBlocked && (
+        <p className="mt-2 text-[11px] leading-5 text-muted-foreground">暂不能结束并移到历史：{operatorCloseBlocked}</p>
       )}
       {detailsOpen && (
         hasKeywordDiagnostics ? (

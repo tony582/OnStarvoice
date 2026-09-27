@@ -194,6 +194,8 @@ export type OrchestrationDetailResponse = {
   retryCandidates?: OrchestrationCloudAgent[]
   attempts: OrchestrationAttemptRecord[]
   schedule?: OrchestrationScheduleRecord | null
+  /** 弹性池本轮排除放宽阈值（常量）；老服务端没有该字段时按 10 分钟算。 */
+  elasticPolicy?: { roundRelaxAfterMs?: number }
 }
 
 export type OrchestrationDispatchResult = {

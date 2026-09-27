@@ -143,6 +143,17 @@ async function claimElasticItem(tx,principal,agent,now) {
   const child=await taskRow(tx,principal.tenantId,childId);
   return {item:bound,child};
 }
+// A claim starts a new handoff, as the browser elastic claim does: drop the previous
+// wait anchors so the browser round-relax clock restarts when this attempt releases
+// the item (docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md, F1).
+function withoutHandoffAnchors(metadata) {
+  const {elasticRetryWaitingSince:_waiting,...rest}=metadata || {};
+  if (rest.checkpoint && typeof rest.checkpoint==='object' && 'recovery' in rest.checkpoint) {
+    const {recovery:_recovery,...checkpoint}=rest.checkpoint;
+    rest.checkpoint=checkpoint;
+  }
+  return rest;
+}
 async function claimBoundItem(tx,principal,agent,child,item,sessionId,now) {
   if (!child.metadata.deadlineAt) {
     child.metadata.deadlineAt=new Date(now+Number(child.metadata.budgets?.batchMs||0)).toISOString();
@@ -161,7 +172,7 @@ async function claimBoundItem(tx,principal,agent,child,item,sessionId,now) {
     || (item.status==='retryable' && lastAttempt?.agent_id===agent.id);
   const attemptId=randomUUID(), revision=item.assignment_revision+1;
   const hash=digest({taskId:child.id,itemId:item.id,keyword:item.keyword,filters:child.metadata.filters,budgets:child.metadata.budgets,revision});
-  const metadata={...item.metadata,attemptId,deviceHeld:true,sessionId,leaseId:randomUUID(),completion:null,
+  const metadata={...withoutHandoffAnchors(item.metadata),attemptId,deviceHeld:true,sessionId,leaseId:randomUUID(),completion:null,
     reason:'',closure:null,deviceClosedAt:null,resumeAuthorized,
     leaseUntil:new Date(Math.min(now+LEASE_MS,Date.parse(child.metadata.deadlineAt))).toISOString()};
   const updated=await tx.queryOne(`UPDATE capture_task_items SET assignment_revision=$2,attempt_count=attempt_count+1,

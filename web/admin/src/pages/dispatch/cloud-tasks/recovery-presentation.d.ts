@@ -46,3 +46,66 @@ export function activeRecoveryCommandStatus(options?: {
   expiresAt?: unknown
   now?: number
 }): string
+
+export const DEFAULT_ELASTIC_ROUND_RELAX_MS: number
+
+export function elasticRoundAnchorMs(item?: {
+  metadata?: Record<string, unknown> | null
+  error?: Record<string, unknown> | null
+  updated_at?: string | null
+  updatedAt?: string | null
+} | null): number
+
+export type ElasticRoundUntriedAgent = {
+  id: string
+  name: string
+  reason: string
+}
+
+export type ElasticRoundWaitSummary = {
+  window: number
+  poolSize: number
+  triedAgentIds: string[]
+  untried: ElasticRoundUntriedAgent[]
+  sourceAgentId: string
+  anchorMs: number
+  relaxAtMs: number
+  relaxed: boolean
+  message: string
+}
+
+export function summarizeElasticRoundWait(options?: {
+  item?: {
+    id?: string
+    status?: string | null
+    platform?: string | null
+    attempt_count?: number | null
+    assigned_agent_id?: string | null
+    metadata?: Record<string, unknown> | null
+    error?: Record<string, unknown> | null
+    updated_at?: string | null
+  } | null
+  attempts?: Array<{
+    id?: string
+    item_id?: string
+    itemId?: string
+    agent_id?: string
+    agentId?: string
+    attempt_number?: number
+    created_at?: string | null
+  }>
+  poolAgentIds?: unknown[]
+  agents?: Array<{
+    id: string
+    display_name?: string
+    host_label?: string
+    browser_name?: string
+    status?: string
+    online?: boolean
+    allowed_platforms?: string[]
+    active_task_count?: number
+  }>
+  fencedAgentIds?: Iterable<string>
+  relaxAfterMs?: number
+  now?: number
+}): ElasticRoundWaitSummary | null

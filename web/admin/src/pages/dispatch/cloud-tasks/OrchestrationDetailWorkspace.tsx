@@ -42,12 +42,18 @@ import { AndroidChildRunPanel } from '../android-discovery/AndroidChildRunPanel'
 import {
   allocateKeywordRetryItems,
   buildKeywordRetryAssignments,
+  keywordRetrySourceReleased,
+  manualKeywordRetrySourceSettled,
+  MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT,
+  mobileKeywordRetrySource,
 } from './retry-item-allocation.js'
 import {
   activeRecoveryCommandStatus,
+  DEFAULT_ELASTIC_ROUND_RELAX_MS,
   formatRecoveryAttemptLabel,
   formatRecoveryState,
   orchestrationItemStatusBucket,
+  summarizeElasticRoundWait,
   summarizeOrchestrationItems,
 } from './recovery-presentation.js'
 import {
@@ -145,6 +151,8 @@ const NEGATIVE_REASSIGN_BLOCKING_EXECUTION_STATUSES = new Set([
   'resume_requested',
 ])
 const KEYWORD_RETRY_STATUSES = new Set(['retryable', 'needs_action', 'failed'])
+// 原执行停在这些状态时，其失败关键词还不能人工重试（服务端 retry_source_not_settled）。
+const RETRY_AWAITING_SOURCE_EXECUTION_STATUSES = new Set(['needs_action', 'interrupted'])
 
 const COMMAND_STATUS_LABELS: Record<string, string> = {
   pending: '等待 Agent 领取',
@@ -508,25 +516,52 @@ export function OrchestrationDetailWorkspace({
     ])),
     [detail?.executions],
   )
-  const keywordRetryItems = useMemo(() => {
-    if (!detail || contentPatrol || isScheduleTemplate) return []
-    return sortedItems.filter(item => {
-      if (item.item_type !== 'keyword' || !KEYWORD_RETRY_STATUSES.has(item.status)) return false
+  // keywordRetryItems：可提交「重试失败关键词」或正由弹性池自动接力的关键词，
+  // 来源闸门与服务端一致（keywordRetrySourceReleased）。原执行仍停在需处理/中断
+  // （如旧页面未确认停止）的失败关键词会让服务端整单 409，单独列出并提示先处理原执行。
+  // 手机执行已结束的失败关键词服务端同样整单 409（手机不接收重试任务），单独提示新建手机批次。
+  const { keywordRetryItems, keywordRetryAwaitingSourceItems, keywordRetryMobileItems } = useMemo(() => {
+    const ready: OrchestrationItemRecord[] = []
+    const awaitingSource: OrchestrationItemRecord[] = []
+    const mobile: OrchestrationItemRecord[] = []
+    if (!detail || contentPatrol || isScheduleTemplate) {
+      return { keywordRetryItems: ready, keywordRetryAwaitingSourceItems: awaitingSource, keywordRetryMobileItems: mobile }
+    }
+    for (const item of sortedItems) {
+      if (item.item_type !== 'keyword' || !KEYWORD_RETRY_STATUSES.has(item.status)) continue
       if (safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata)) {
         // 弹性池第一次命中验证码会自动换 Agent；此时 item 已被服务端明确
         // 标为 retryable，不应提前显示成人工待办。
-        if (!(elasticPool && item.status === 'retryable')) return false
+        if (!(elasticPool && item.status === 'retryable')) continue
       }
       const sourceExecution = executionsById.get(
         String(item.execution_task_id || ''),
       )
-      if (!sourceExecution) return false
-      const sourceStatus = executionStatus(sourceExecution)
-      return elasticPool
-        ? RETRY_SOURCE_RELEASED_EXECUTION_STATUSES.has(sourceStatus)
-        : FINAL_EXECUTION_STATUSES.has(sourceStatus)
-    })
+      if (!sourceExecution) continue
+      if (keywordRetrySourceReleased({ item, execution: sourceExecution, elasticPool })) {
+        ready.push(item)
+      } else if (
+        mobileKeywordRetrySource(sourceExecution) &&
+        manualKeywordRetrySourceSettled(sourceExecution)
+      ) {
+        mobile.push(item)
+      } else if (
+        elasticPool &&
+        item.status !== 'retryable' &&
+        RETRY_AWAITING_SOURCE_EXECUTION_STATUSES.has(executionStatus(sourceExecution))
+      ) {
+        awaitingSource.push(item)
+      }
+    }
+    return { keywordRetryItems: ready, keywordRetryAwaitingSourceItems: awaitingSource, keywordRetryMobileItems: mobile }
   }, [contentPatrol, detail, elasticPool, executionsById, isScheduleTemplate, sortedItems])
+  // 原执行正被停止保护挡着（依据 /overview 的 stop_fence，不按错误码推断）的数量，决定提示文案。
+  const keywordRetryAwaitingStopFenceCount = useMemo(
+    () => keywordRetryAwaitingSourceItems.filter(item =>
+      findExecutionStopFence(String(item.execution_task_id || ''), availableAgents) !== null,
+    ).length,
+    [availableAgents, keywordRetryAwaitingSourceItems],
+  )
   const attemptedAgentIdsByRetryItem = useMemo(() => {
     const attempted = new Map<string, Set<string>>()
     for (const attempt of detail?.attempts || []) {
@@ -751,6 +786,24 @@ export function OrchestrationDetailWorkspace({
       )
   }, [attentionContext, availableAgents, detail, stopFencedAgentIds])
 
+  // F1：本轮排除的池节点（eligible ∪ relay）与节点状态。节点在线/忙碌/停止保护
+  // 取自 /overview 的 availableAgents，缺失时回落到批次详情里的 agents。
+  const elasticPoolAgentIds = useMemo(() => {
+    if (!elasticPool) return []
+    const eligible = Array.isArray(metadata.eligibleAgentIds) ? metadata.eligibleAgentIds : []
+    const resourcePolicy = objectRecord(objectRecord(metadata.planSnapshot).resourcePolicy)
+    const relay = Array.isArray(resourcePolicy.relayAgentIds) ? resourcePolicy.relayAgentIds : []
+    return [...eligible, ...relay].map(value => String(value || ''))
+  }, [elasticPool, metadata.eligibleAgentIds, metadata.planSnapshot])
+  const elasticRoundAgents = useMemo(() => {
+    const merged = new Map<string, OrchestrationCloudAgent>()
+    for (const agent of detail?.agents || []) merged.set(agent.id, agent)
+    for (const agent of availableAgents) {
+      merged.set(agent.id, { ...(merged.get(agent.id) || {}), ...agent })
+    }
+    return Array.from(merged.values())
+  }, [availableAgents, detail?.agents])
+
   const automaticRecoveryStates = useMemo(() => {
     if (
       !detail ||
@@ -848,6 +901,17 @@ export function OrchestrationDetailWorkspace({
         : blockingStatusText
           ? `等待原执行结算 · ${attemptLabel}`
           : `工作项已释放 · 恢复 ${attemptLabel}`
+      const roundWait = elasticPool && workUnit === '关键词'
+        ? summarizeElasticRoundWait({
+            item,
+            attempts: detail.attempts || [],
+            poolAgentIds: elasticPoolAgentIds,
+            agents: elasticRoundAgents,
+            fencedAgentIds: stopFencedAgentIds,
+            relaxAfterMs: Number(detail.elasticPolicy?.roundRelaxAfterMs) || DEFAULT_ELASTIC_ROUND_RELAX_MS,
+            now: nowMs,
+          })
+        : null
       const message = item.metadata?.pinnedAgentId
         ? `关键词「${keywordForItem(item)}」保留在目标节点，等待该节点满足恢复条件；其他节点的结果不会替代这一项。`
         : commandStatus
@@ -856,7 +920,9 @@ export function OrchestrationDetailWorkspace({
           ? `该${workUnit}已进入恢复状态，但原执行尚未满足服务端接力条件；已采集结果继续保留。`
           : String(recovery.reason || '') === 'platform_safety_handoff'
             ? `仅隔离${workUnit}「${keywordForItem(item)}」与原账号这一组合；其他空闲 Agent 可立即领取，并优先在未尝试账号中接力；原账号可继续领取其他关键词`
-            : `${workUnit}「${keywordForItem(item)}」正在等待兼容的空闲 Agent；技术失败在全池尝试后可进入下一轮，原 Agent 可继续领取其他关键词`
+            : roundWait
+              ? `${workUnit}「${keywordForItem(item)}」：${roundWait.message}`
+              : `${workUnit}「${keywordForItem(item)}」正在等待兼容的空闲 Agent；技术失败在全池尝试后可进入下一轮，原 Agent 可继续领取其他关键词`
       states.push({
         id: `item:${item.id}`,
         label,
@@ -869,7 +935,10 @@ export function OrchestrationDetailWorkspace({
       })
     }
     return states
-  }, [agentsById, contentPatrol, detail, executionsById, isScheduleTemplate, nowMs, sortedItems])
+  }, [
+    agentsById, contentPatrol, detail, elasticPool, elasticPoolAgentIds, elasticRoundAgents,
+    executionsById, isScheduleTemplate, nowMs, sortedItems, stopFencedAgentIds,
+  ])
 
   useEffect(() => {
     if (!orchestrationId || resultView || detailFinal) return
@@ -1558,6 +1627,11 @@ export function OrchestrationDetailWorkspace({
             </div>
           </section>
         )}
+        {!resultView && keywordRetryMobileItems.length > 0 && (
+          <p className="mb-4 rounded-xl border border-border bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
+            {`${keywordRetryMobileItems.length} 个关键词（${keywordRetryMobileItems.slice(0, 3).map(keywordForItem).join('、')}${keywordRetryMobileItems.length > 3 ? ' 等' : ''}）：${MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT}。`}
+          </p>
+        )}
         {!resultView && keywordRetryItems.length > 0 && (
           <section id={`keyword-retry-${orchestration.id}`} className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1589,6 +1663,14 @@ export function OrchestrationDetailWorkspace({
                         ? '该批次已结算；可先查看每次尝试的真实错误，再选择在当前任务内重试或新建补采任务。'
                         : '下拉框只是优先 Agent 预览；提交后服务端会按实时空闲、已尝试轮次与安全风控记录完成最终分配。'}
                   </p>
+                  {keywordRetryAwaitingSourceItems.length > 0 && (
+                    <p className="mt-1 text-xs leading-5 text-amber-700 dark:text-amber-300">
+                      {`另有 ${keywordRetryAwaitingSourceItems.length} 个关键词（${keywordRetryAwaitingSourceItems.slice(0, 3).map(keywordForItem).join('、')}${keywordRetryAwaitingSourceItems.length > 3 ? ' 等' : ''}）的原执行仍为需处理，暂不随这里重试；`}
+                      {keywordRetryAwaitingStopFenceCount > 0
+                        ? '旧页面未确认停止的，请先在「执行节点」中点「确认旧页面已停止」，之后会交回任务池或出现在这里。'
+                        : '请先在上方处理或停止原执行，结束后会出现在这里。'}
+                    </p>
+                  )}
                 </div>
               </div>
               {automaticKeywordRecoveryActive ? (

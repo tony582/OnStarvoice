@@ -101,6 +101,28 @@ import {
   recordNeedsActionStopFenceOutcome,
   releaseNeedsActionStopFences,
 } from '../services/capture-stop-fence-release.js';
+import {
+  ELASTIC_FILTER_VERIFICATION_CODES,
+  FILTER_VERIFICATION_SETTLED_EVENT,
+  FILTER_VERIFICATION_STOP_REASON,
+  elasticRoundAnchorSql,
+  elasticRoundRelaxAfterMs,
+  filterVerificationErrorCode,
+  filterVerificationSettledEventMessage,
+  settleElasticFilterVerification,
+  settleElasticFilterVerificationBatch,
+} from '../services/capture-elastic-policy.js';
+import {
+  OPERATOR_CLOSE_LOCK_TIMEOUT_MS,
+  OPERATOR_CLOSE_REASON_MESSAGES,
+  OPERATOR_CLOSE_SUCCESS_MESSAGE,
+  closeOperatorAttentionRoot,
+  loadOperatorCloseEligibility,
+  normalizeOperatorCloseTaskIds,
+  operatorClosedTask,
+  operatorClosedTaskSql,
+  operatorClosedWorkItem,
+} from '../services/capture-operator-close.js';
 
 function requireCaptureAgent(req, res, next) {
   return authenticateCaptureAgent(req, res, error => {
@@ -1582,6 +1604,45 @@ export function elasticRecoveryHoldRemainingMs(
   if (!Number.isFinite(recoveryAnchorAt)) return 0;
   const holdMs = elasticAgentRecoveryHoldMs(source);
   return Math.max(0, recoveryAnchorAt + holdMs - Number(now || Date.now()));
+}
+
+function filterVerificationAlreadySettled(item = {}) {
+  return text(item?.status, 80) === 'failed' &&
+    safeJson(item?.error).automaticRetryStopReason === FILTER_VERIFICATION_STOP_REASON;
+}
+
+async function appendFilterVerificationSettledEvent(tx, {
+  tenantId,
+  parentTaskId,
+  agentId = null,
+  itemId,
+  keyword,
+  settlement,
+  settledAt,
+}) {
+  await appendEvent(tx, {
+    tenantId,
+    taskId: parentTaskId,
+    agentId,
+    eventType: FILTER_VERIFICATION_SETTLED_EVENT,
+    actorType: 'system',
+    actorName: '云端弹性调度器',
+    status: 'failed',
+    message: filterVerificationSettledEventMessage({
+      keyword,
+      attempts: settlement.attempts,
+      agents: settlement.agents,
+    }),
+    payload: {
+      itemId,
+      keyword: text(keyword, 120),
+      errorCode: text(settlement.code, 100),
+      attemptCount: Number(settlement.attempts) || 0,
+      agentCount: Number(settlement.agents) || 0,
+      limit: Number(settlement.limit) || 0,
+      settledAt,
+    },
+  });
 }
 
 function elasticRecoveryMetadataForItem(item = {}) {
@@ -4087,7 +4148,7 @@ function orchestrationItemAttemptStatus(itemStatus) {
 async function lockOrchestrationParent(tx, tenantId, parentTaskId) {
   return tx.queryOne(`
     SELECT id, title, status, progress, metadata, feature_key,
-      orchestration_revision,
+      orchestration_revision, attempt_number,
       orchestration_schedule_id, scheduled_for
     FROM capture_tasks
     WHERE id = $1 AND tenant_id = $2
@@ -4149,7 +4210,8 @@ async function adoptLocalOrchestrationRecovery(
   }
   if (!sourceCandidate?.parent_task_id) return task;
   const sourceTask = await tx.queryOne(`
-    SELECT id, parent_task_id, assigned_agent_id, status, metadata
+    SELECT id, parent_task_id, assigned_agent_id, status, metadata,
+      attempt_number, orchestration_revision
     FROM capture_tasks
     WHERE id = $1 AND tenant_id = $2 AND parent_task_id = $3
     FOR UPDATE
@@ -4193,6 +4255,10 @@ async function adoptLocalOrchestrationRecovery(
   ) {
     return task;
   }
+  // An operator ended this batch or source (「结束并移到历史」): adopting its
+  // failed items would leave dispatched work under a terminal parent that no
+  // projection settles any more.
+  if (operatorClosedTask(parent) || operatorClosedTask(sourceTask)) return task;
 
   const authoritativeItemIds = new Set(
     (Array.isArray(sourceMetadata.itemIds) ? sourceMetadata.itemIds : [])
@@ -5971,7 +6037,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       : text(rawEntryError, 1000)
         ? {message: text(rawEntryError, 1000)}
         : {};
-    const error = keywordServiceAbnormal
+    let error = keywordServiceAbnormal
       ? {}
       : {
       ...(unexpectedCheckpointCancellation
@@ -6096,7 +6162,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     };
     const currentItemState = elasticPool
       ? await tx.queryOne(`
-          SELECT id, attempt_count, safety_handoff_count, metadata, error
+          SELECT id, status, attempt_count, safety_handoff_count, metadata, error
           FROM capture_task_items
           WHERE tenant_id = $1
             AND task_id = $2
@@ -6123,7 +6189,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
           task.id,
         )
       : {attemptBudget: serverAttemptCount, metadataPatch: {}};
-    const status = projectElasticKeywordRecoveryStatus({
+    let status = projectElasticKeywordRecoveryStatus({
       elasticPool,
       status: checkpointProjectedStatus,
       error,
@@ -6133,6 +6199,27 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
       agentAttemptLimit: elasticItemAgentAttemptLimit(parent.metadata, currentItemState?.metadata),
     });
+    // F2: the same time-filter failure on K attempts (or on every Agent of a
+    // pool smaller than K) settles the keyword instead of searching again.
+    // Decided before the recovery metadata so a settled item keeps no anchor.
+    const filterVerification = currentItemState
+      ? await settleElasticFilterVerification(tx, {
+          tenantId: agent.tenant_id,
+          itemId: currentItemState.id,
+          status,
+          error,
+          checkpoint,
+          elasticPool,
+          agentAttemptLimit: elasticItemAgentAttemptLimit(parent.metadata, currentItemState.metadata),
+          itemMetadata: currentItemState.metadata,
+          reporterAgentId: agent.id,
+          attemptNumber: serverAttemptCount,
+        })
+      : null;
+    if (filterVerification) {
+      status = 'failed';
+      error = filterVerification.error;
+    }
     const recovery = buildElasticRecoveryMetadata({
       status,
       error,
@@ -6196,6 +6283,20 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     ]);
     if (!item) continue;
     projectedItemIds.push(item.id);
+    if (
+      filterVerification &&
+      !filterVerificationAlreadySettled(currentItemState)
+    ) {
+      await appendFilterVerificationSettledEvent(tx, {
+        tenantId: agent.tenant_id,
+        parentTaskId: task.parent_task_id,
+        agentId: agent.id,
+        itemId: item.id,
+        keyword,
+        settlement: filterVerification,
+        settledAt: 'projection',
+      });
+    }
 
     await tx.execute(`
       UPDATE capture_task_item_attempts
@@ -6353,7 +6454,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
             task.id,
           )
         : {attemptBudget: serverAttemptCount, metadataPatch: {}};
-      const activeUnresolvedStatus = childServiceAbnormalSettlesEmpty
+      let activeUnresolvedStatus = childServiceAbnormalSettlesEmpty
         ? 'completed'
         : projectElasticKeywordRecoveryStatus({
             elasticPool,
@@ -6365,9 +6466,32 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
             technicalLimitReached: attemptBudgetProjection.technicalLimitReached,
             agentAttemptLimit: elasticAgentAttemptLimit,
           });
+      // F2 on the active-keyword path; see the checkpoint-entry projection.
+      const activeFilterVerification =
+        currentActiveItem && !childServiceAbnormalSettlesEmpty
+          ? await settleElasticFilterVerification(tx, {
+              tenantId: agent.tenant_id,
+              itemId: currentActiveItem.id,
+              status: activeUnresolvedStatus,
+              error: childError,
+              checkpoint: activeCheckpoint,
+              elasticPool,
+              agentAttemptLimit: elasticItemAgentAttemptLimit(
+                parent.metadata,
+                currentActiveItem.metadata,
+              ),
+              itemMetadata: currentActiveItem.metadata,
+              reporterAgentId: agent.id,
+              attemptNumber: serverAttemptCount,
+            })
+          : null;
+      const activeFailureError = activeFilterVerification
+        ? activeFilterVerification.error
+        : childError;
+      if (activeFilterVerification) activeUnresolvedStatus = 'failed';
       const recovery = buildElasticRecoveryMetadata({
         status: activeUnresolvedStatus,
-        error: childError,
+        error: activeFailureError,
         checkpoint: activeCheckpoint,
         attemptCount: serverAttemptCount,
         sourceAgentId: agent.id,
@@ -6375,15 +6499,18 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         agentAttemptLimit: elasticAgentAttemptLimit,
       });
       const activeChildError = Object.keys(recovery).length > 0
-        ? {...childError, recovery}
-        : childError;
+        ? {...activeFailureError, recovery}
+        : activeFailureError;
       const activeTerminal = ORCHESTRATION_ITEM_TERMINAL_STATUSES.has(
         activeUnresolvedStatus,
       );
       const activeItem = await tx.queryOne(`
         UPDATE capture_task_items
         SET status = $1,
-          metadata = metadata ||
+          metadata = CASE
+              WHEN $14::boolean THEN metadata #- '{checkpoint,recovery}'
+              ELSE metadata
+            END ||
             CASE
               WHEN $12::boolean THEN jsonb_build_object(
                 'checkpoint', $13::jsonb
@@ -6433,9 +6560,21 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
         JSON.stringify(attemptBudgetProjection.metadataPatch),
         childServiceAbnormalSettlesEmpty,
         JSON.stringify(activeCheckpoint),
+        Boolean(activeFilterVerification),
       ]);
       if (activeItem) {
         projectedItemIds.push(activeItem.id);
+        if (activeFilterVerification) {
+          await appendFilterVerificationSettledEvent(tx, {
+            tenantId: agent.tenant_id,
+            parentTaskId: task.parent_task_id,
+            agentId: agent.id,
+            itemId: activeItem.id,
+            keyword: activeKeyword,
+            settlement: activeFilterVerification,
+            settledAt: 'projection',
+          });
+        }
         if (childServiceAbnormalSettlesEmpty) {
           await tx.execute(`
             UPDATE capture_task_item_attempts
@@ -6564,6 +6703,16 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
   });
 }
 
+// F3 (docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md): a row the
+// operator closed stays failed while the SAME execution repeats needs_action
+// or failed. A stop-fence report, interrupted (slot-blocking), completed or a
+// new execution goes through the normal CASE and reopens the row; a reopened
+// root also leaves history so its fence or interruption is seen again.
+const OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL = `(${operatorClosedTaskSql('capture_tasks')}
+          AND capture_tasks.metadata->'operatorClose'->>'attemptNumber' = EXCLUDED.attempt_number::text
+          AND EXCLUDED.status IN ('needs_action', 'failed', 'completed_with_failures')
+          AND UPPER(COALESCE(EXCLUDED.error->>'code', '')) <> 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED')`;
+
 export async function mirrorTaskSnapshot(
   tx,
   agent,
@@ -6577,6 +6726,8 @@ export async function mirrorTaskSnapshot(
   delete agentSnapshotMetadata.perItemAdmissionV1;
   delete agentSnapshotMetadata.historyClearedAt;
   delete agentSnapshotMetadata.historyClearedBy;
+  // Server-owned operator close marker: a device can neither mint nor erase it.
+  delete agentSnapshotMetadata.operatorClose;
   // The stop-fence check round is server state (S3 checks needs_action rows,
   // which the mirror still updates); a device can never write or replace it.
   delete agentSnapshotMetadata.stopFenceCheck;
@@ -6660,6 +6811,8 @@ export async function mirrorTaskSnapshot(
       source = EXCLUDED.source,
       trigger_type = EXCLUDED.trigger_type,
       status = CASE
+        WHEN ${OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL}
+          THEN capture_tasks.status
         WHEN capture_tasks.status = 'superseded'
           THEN capture_tasks.status
         WHEN capture_tasks.status = 'failed'
@@ -6697,6 +6850,7 @@ export async function mirrorTaskSnapshot(
         || jsonb_strip_nulls(jsonb_build_object(
           'historyClearedAt', capture_tasks.metadata->'historyClearedAt',
           'historyClearedBy', capture_tasks.metadata->'historyClearedBy',
+          'operatorClose', capture_tasks.metadata->'operatorClose',
           -- A newer ledger snapshot of a needs_action fence must not erase
           -- the check round in progress (its receipt would turn stale).
           'stopFenceCheck', capture_tasks.metadata->'stopFenceCheck'
@@ -6789,7 +6943,20 @@ export async function mirrorTaskSnapshot(
           ELSE '{}'::jsonb
         END,
       error = EXCLUDED.error,
-      message = EXCLUDED.message,
+      message = CASE
+        WHEN ${OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL}
+          THEN capture_tasks.message
+        ELSE EXCLUDED.message
+      END,
+      -- A closed root that this snapshot reopens returns to 需处理 instead of
+      -- hiding a fence, an interruption or a new execution in history.
+      attention_dismissed_at = CASE
+        WHEN capture_tasks.parent_task_id IS NULL
+          AND ${operatorClosedTaskSql('capture_tasks')}
+          AND NOT ${OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL}
+          THEN NULL
+        ELSE capture_tasks.attention_dismissed_at
+      END,
       attempt_number = GREATEST(capture_tasks.attempt_number, EXCLUDED.attempt_number),
       progress_seq = CASE
         WHEN EXCLUDED.attempt_number > capture_tasks.attempt_number
@@ -7226,7 +7393,11 @@ async function negativePatrolFairClaimWait(tx, {agent, candidate, resourcePolicy
 }
 
 export async function dispatchNextElasticWorkItem(tx, options = {}) {
-  return dispatchNextElasticWorkItemWithinBudget(tx, options, 10);
+  return dispatchNextElasticWorkItemWithinBudget(
+    tx,
+    {...options, slotChecked: false},
+    10,
+  );
 }
 
 async function dispatchNextElasticWorkItemWithinBudget(tx, {
@@ -7235,12 +7406,17 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   excludedItemIds = [],
   targetedOnly = false,
   allowTargetedFallback = false,
+  // Recursive calls of the same heartbeat: the first call already proved the
+  // execution slot free (stop-fence SQL, ~275 ms) and checked the recovery
+  // hold. Neither result feeds the candidate SQL, and settling other items in
+  // this transaction cannot occupy this Agent's slot, so they run once.
+  slotChecked = false,
 } = {}, remainingSkipBudget) {
   if (remainingSkipBudget <= 0) {
     // Keep heartbeat work bounded without repeatedly scanning the same busy
     // keyword head on every heartbeat and starving spare-capacity revisits.
     return targetedOnly || !allowTargetedFallback ? null : dispatchNextElasticWorkItemWithinBudget(tx, {
-      agent, capabilities, excludedItemIds, targetedOnly: true,
+      agent, capabilities, excludedItemIds, targetedOnly: true, slotChecked: true,
     }, 10);
   }
   if (agent?.capabilities?.agentKind === 'android_mobile') return null;
@@ -7263,48 +7439,50 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   if (!canClaimKeyword && !canClaimNegativePost && !canClaimWatchedContent) {
     return null;
   }
-  const busy = await findCaptureAgentExecutionSlotBlocker(
-    tx,
-    agent.tenant_id,
-    agent.id,
-  );
-  if (busy) return null;
-  // Do not turn browser-local cleanup evidence into a queue-wide allocation
-  // lock. The Extension's execution lock is the authority for local
-  // concurrency; assignment revisions and idempotent persistence fence late or
-  // duplicate results. A missing historical local-closure snapshot is useful
-  // audit evidence, but it must never strand an otherwise idle Agent.
-  const recentRecoveryAttempt = await tx.queryOne(`
-    SELECT attempt.status, attempt.error, attempt.checkpoint,
-      attempt.finished_at, attempt.updated_at,
-      execution.finished_at AS execution_finished_at
-    FROM capture_task_item_attempts attempt
-    JOIN capture_tasks parent
-      ON parent.id = attempt.parent_task_id
-      AND parent.tenant_id = attempt.tenant_id
-    LEFT JOIN capture_tasks execution
-      ON execution.id = attempt.execution_task_id
-      AND execution.tenant_id = attempt.tenant_id
-    WHERE attempt.tenant_id = $1
-      AND attempt.agent_id = $2
-      AND attempt.status IN ('retryable', 'needs_action', 'failed')
-      AND attempt.updated_at > now() - interval '30 minutes'
-      AND (
-        COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
-        OR (
-          parent.metadata->>'workflow' = 'negative_post_patrol'
-          AND parent.metadata->>'perItemAdmissionV1' = 'true'
+  if (!slotChecked) {
+    const busy = await findCaptureAgentExecutionSlotBlocker(
+      tx,
+      agent.tenant_id,
+      agent.id,
+    );
+    if (busy) return null;
+    // Do not turn browser-local cleanup evidence into a queue-wide allocation
+    // lock. The Extension's execution lock is the authority for local
+    // concurrency; assignment revisions and idempotent persistence fence late or
+    // duplicate results. A missing historical local-closure snapshot is useful
+    // audit evidence, but it must never strand an otherwise idle Agent.
+    const recentRecoveryAttempt = await tx.queryOne(`
+      SELECT attempt.status, attempt.error, attempt.checkpoint,
+        attempt.finished_at, attempt.updated_at,
+        execution.finished_at AS execution_finished_at
+      FROM capture_task_item_attempts attempt
+      JOIN capture_tasks parent
+        ON parent.id = attempt.parent_task_id
+        AND parent.tenant_id = attempt.tenant_id
+      LEFT JOIN capture_tasks execution
+        ON execution.id = attempt.execution_task_id
+        AND execution.tenant_id = attempt.tenant_id
+      WHERE attempt.tenant_id = $1
+        AND attempt.agent_id = $2
+        AND attempt.status IN ('retryable', 'needs_action', 'failed')
+        AND attempt.updated_at > now() - interval '30 minutes'
+        AND (
+          COALESCE(parent.metadata->>'distributionMode', '') = 'elastic_pool'
+          OR (
+            parent.metadata->>'workflow' = 'negative_post_patrol'
+            AND parent.metadata->>'perItemAdmissionV1' = 'true'
+          )
         )
-      )
-    ORDER BY COALESCE(
-      attempt.finished_at,
-      execution.finished_at,
-      attempt.created_at
-    ) DESC, attempt.id DESC
-    LIMIT 1
-  `, [agent.tenant_id, agent.id]);
-  if (elasticRecoveryHoldRemainingMs(recentRecoveryAttempt) > 0) {
-    return null;
+      ORDER BY COALESCE(
+        attempt.finished_at,
+        execution.finished_at,
+        attempt.created_at
+      ) DESC, attempt.id DESC
+      LIMIT 1
+    `, [agent.tenant_id, agent.id]);
+    if (elasticRecoveryHoldRemainingMs(recentRecoveryAttempt) > 0) {
+      return null;
+    }
   }
   // A safety challenge fences this exact item/account pair through the
   // append-only same-Agent attempt check below. It must not quarantine the
@@ -7359,6 +7537,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       ) AS source_execution_started_at,
       item.metadata AS item_metadata,
       agent_policy.agent_attempt_limit,
+      item_round.round_relaxed,
       COALESCE(
         CASE
           WHEN (item.metadata->>'elasticAttemptBudgetUsed') ~ '^[0-9]+$'
@@ -7406,6 +7585,14 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         ) AS configured_agent_id
       ) configured_agents
     ) agent_policy
+    -- F1: a retryable item whose current handoff has waited longer than the
+    -- relax window (no untried pool Agent claimed it) opens to every pool
+    -- Agent except the most recent attempt's. Reads only this item row.
+    CROSS JOIN LATERAL (
+      SELECT item.status = 'retryable'
+        AND ${elasticRoundAnchorSql('item')}
+          <= now() - ($14::integer * interval '1 millisecond') AS round_relaxed
+    ) item_round
     WHERE item.tenant_id = $1
       AND NOT (item.id = ANY($12::uuid[]))
       AND parent.task_type = 'capture_orchestration'
@@ -7563,11 +7750,17 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
             AND recent_attempt.agent_id IS NOT NULL
         ) current_round_attempt
         WHERE current_round_attempt.agent_id = $2::uuid
-          AND current_round_attempt.reverse_attempt_ordinal <=
-            MOD(item.attempt_count -
+          AND current_round_attempt.reverse_attempt_ordinal <= CASE
+            WHEN item_round.round_relaxed THEN LEAST(1,
+              MOD(item.attempt_count -
+                CASE WHEN item.metadata->>'manualRetryBaseAttemptCount' ~ '^[0-9]+$'
+                  THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END,
+                agent_policy.agent_attempt_limit))
+            ELSE MOD(item.attempt_count -
               CASE WHEN item.metadata->>'manualRetryBaseAttemptCount' ~ '^[0-9]+$'
                 THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END,
               agent_policy.agent_attempt_limit)
+          END
       )
       AND (
         agent_policy.agent_attempt_limit = 1
@@ -7601,13 +7794,67 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     Array.from(CROSS_DEVICE_RETRY_SAFETY_CODES),
     excludedItemIds,
     freshCapabilities.remoteTaskEnhancementOptions === true,
+    elasticRoundRelaxAfterMs(),
   ]);
   if (!candidate) return null;
   const nextCandidate = () => dispatchNextElasticWorkItemWithinBudget(tx, {
     agent, capabilities, targetedOnly,
     allowTargetedFallback: allowTargetedFallback || candidate.item_type === 'keyword',
     excludedItemIds: [...excludedItemIds, candidate.item_id],
+    slotChecked: true,
   }, remainingSkipBudget - 1);
+
+  // F2 backstop for keywords that were already retryable before the
+  // projection rule existed: settle the whole parent's repeated time-filter
+  // failures in one statement, then pick a candidate again. Only a legacy
+  // time-filter retryable candidate pays for this; everything else only runs
+  // this JS check.
+  if (
+    candidate.item_type === 'keyword' &&
+    candidate.item_status === 'retryable' &&
+    ELASTIC_FILTER_VERIFICATION_CODES.has(filterVerificationErrorCode(
+      candidate.item_error,
+      safeJson(candidate.item_metadata).checkpoint,
+    )) &&
+    safeJson(candidate.parent_metadata).distributionMode === 'elastic_pool'
+  ) {
+    const settledItems = await settleElasticFilterVerificationBatch(tx, {
+      tenantId: agent.tenant_id,
+      parentTaskId: candidate.parent_id,
+      agentAttemptLimit: elasticParentAgentAttemptLimit(candidate.parent_metadata),
+    });
+    if (settledItems.length > 0) {
+      await refreshOrchestrationParentTask(tx, {
+        tenantId: agent.tenant_id,
+        parentTaskId: candidate.parent_id,
+        actorType: 'system',
+        actorName: '云端弹性调度器',
+        eventAgentId: agent.id,
+      });
+      for (const settledItem of settledItems) {
+        await appendFilterVerificationSettledEvent(tx, {
+          tenantId: agent.tenant_id,
+          parentTaskId: candidate.parent_id,
+          agentId: agent.id,
+          itemId: settledItem.id,
+          keyword: settledItem.keyword,
+          settlement: {
+            code: settledItem.error_code,
+            attempts: settledItem.attempts,
+            agents: settledItem.agents,
+            limit: settledItem.limit,
+          },
+          settledAt: 'claim',
+        });
+      }
+    }
+    if (settledItems.some(settledItem => settledItem.id === candidate.item_id)) {
+      return dispatchNextElasticWorkItemWithinBudget(tx, {
+        agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback,
+        slotChecked: true,
+      }, remainingSkipBudget - 1);
+    }
+  }
 
   if (candidate.item_type === 'negative_post') {
     // Archiving uses this same record lock. Acquire it without waiting, then
@@ -7663,7 +7910,8 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         payload: {itemId: candidate.item_id, recordId: candidate.record_id},
       });
       return dispatchNextElasticWorkItemWithinBudget(
-        tx, {agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback}, remainingSkipBudget - 1,
+        tx, {agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback, slotChecked: true},
+        remainingSkipBudget - 1,
       );
     }
   }
@@ -8144,7 +8392,8 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       metadata = (
         metadata - 'checkpoint' - 'targetResult' -
         'waitingForSourceClosure' - 'sourceClosureBlockedAt' -
-        'sourceClosureBlockedReason' - 'sourceClosureBlockedAttemptId'
+        'sourceClosureBlockedReason' - 'sourceClosureBlockedAttemptId' -
+        'elasticRetryWaitingSince'
       ) ||
         jsonb_build_object('elasticAttemptBudgetUsed', $2::integer),
       assigned_agent_id = $3,
@@ -8251,6 +8500,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       attemptBudget,
       agentAttemptLimit: Number(candidate.agent_attempt_limit) ||
         AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT,
+      roundExclusionRelaxed: candidate.round_relaxed === true,
       ...(bootstrapPacing || {}),
       commandId,
     },
@@ -10560,40 +10810,59 @@ router.post('/history/clear', requireTenantAccess, requireSessionUser, requireTe
         ORDER BY t.id
         FOR UPDATE OF t
       `, [req.tenantId, taskIds]);
-      if (tasks.length !== taskIds.length) return {error: 'task_not_found'};
-      if (tasks.some(task => task.parent_task_id || task.business_root_visible !== true
-        || task.history_eligible !== true || ['needs_action', 'interrupted'].includes(task.status))) {
-        return {error: 'task_not_clearable'};
+      // Each row is decided on its own: a stale row in the selection (for
+      // example a canceled batch that still owns an unfinished item) is
+      // reported in `skipped` instead of failing the whole selection.
+      const found = new Map(tasks.map(task => [String(task.id).toLowerCase(), task]));
+      const skipped = [];
+      const candidates = [];
+      for (const taskId of taskIds) {
+        const task = found.get(taskId);
+        if (!task) skipped.push({taskId, reason: 'not_found'});
+        else if (task.parent_task_id) skipped.push({taskId: task.id, reason: 'not_root'});
+        else if (task.business_root_visible !== true || task.history_eligible !== true
+          || ['needs_action', 'interrupted'].includes(task.status)) {
+          skipped.push({taskId: task.id, reason: 'not_in_history'});
+        } else candidates.push(task);
       }
-      const blocker = await tx.queryOne(`
+      const blockedRows = candidates.length === 0 ? [] : await tx.queryAll(`
         WITH RECURSIVE task_tree AS (
-          SELECT id FROM capture_tasks WHERE tenant_id = $1 AND id = ANY($2::uuid[])
+          SELECT id AS root_id, id FROM capture_tasks WHERE tenant_id = $1 AND id = ANY($2::uuid[])
           UNION
-          SELECT child.id FROM capture_tasks child
-          JOIN task_tree parent ON child.parent_task_id = parent.id
+          SELECT tree.root_id, child.id FROM capture_tasks child
+          JOIN task_tree tree ON child.parent_task_id = tree.id
           WHERE child.tenant_id = $1
         )
-        SELECT EXISTS (
-          SELECT 1 FROM capture_tasks child JOIN task_tree tree ON tree.id = child.id
-          WHERE child.tenant_id = $1 AND child.status IN (
+        SELECT DISTINCT tree.root_id
+        FROM task_tree tree
+        WHERE EXISTS (
+          SELECT 1 FROM capture_tasks child
+          WHERE child.tenant_id = $1 AND child.id = tree.id AND child.status IN (
             'pending', 'waiting_device', 'claimed', 'running', 'recovering',
             'resume_requested'
           )
         ) OR EXISTS (
-          SELECT 1 FROM capture_task_items item JOIN task_tree tree ON tree.id = item.task_id
-          WHERE item.tenant_id = $1 AND item.status IN (
+          SELECT 1 FROM capture_task_items item
+          WHERE item.tenant_id = $1 AND item.task_id = tree.id AND item.status IN (
             'pending', 'assigned', 'dispatch_pending', 'dispatched',
             'waiting_device', 'running', 'retryable', 'needs_action'
           )
         ) OR EXISTS (
-          SELECT 1 FROM capture_agent_commands command JOIN task_tree tree ON tree.id = command.task_id
-          WHERE command.tenant_id = $1 AND command.status IN ('pending', 'acknowledged')
+          SELECT 1 FROM capture_agent_commands command
+          WHERE command.tenant_id = $1 AND command.task_id = tree.id
+            AND command.status IN ('pending', 'acknowledged')
             AND command.expires_at > now()
-        ) AS blocked
-      `, [req.tenantId, taskIds]);
-      if (blocker?.blocked) return {error: 'task_not_clearable'};
-      const alreadyClearedTaskIds = tasks.filter(task => text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
-      const clearedTaskIds = tasks.filter(task => !text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
+        )
+      `, [req.tenantId, candidates.map(task => task.id)]);
+      const blocked = new Set(blockedRows.map(row => String(row.root_id).toLowerCase()));
+      const clearable = [];
+      for (const task of candidates) {
+        if (blocked.has(String(task.id).toLowerCase())) skipped.push({taskId: task.id, reason: 'live_work'});
+        else clearable.push(task);
+      }
+      skipped.sort((left, right) => String(left.taskId).localeCompare(String(right.taskId)));
+      const alreadyClearedTaskIds = clearable.filter(task => text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
+      const clearedTaskIds = clearable.filter(task => !text(task.metadata?.historyClearedAt, 100)).map(task => task.id);
       if (clearedTaskIds.length > 0) {
         await tx.execute(`
           UPDATE capture_tasks
@@ -10603,20 +10872,25 @@ router.post('/history/clear', requireTenantAccess, requireSessionUser, requireTe
           WHERE tenant_id = $1 AND id = ANY($2::uuid[])
         `, [req.tenantId, clearedTaskIds, req.user.id]);
       }
-      return {clearedTaskIds, alreadyClearedTaskIds};
+      return {clearedTaskIds, alreadyClearedTaskIds, skipped};
     });
-    if (result.error) {
-      return res.status(result.error === 'task_not_found' ? 404 : 409).json({
+    const clearedCount = result.clearedTaskIds.length + result.alreadyClearedTaskIds.length;
+    if (clearedCount === 0) {
+      const notFound = result.skipped.every(skip => skip.reason === 'not_found');
+      return res.status(notFound ? 404 : 409).json({
         ok: false,
-        error: result.error,
-        message: result.error === 'task_not_found' ? '任务不存在或无权访问' : '仅可清除已结束且无需处理的历史主任务，请先处理仍在执行或等待恢复的任务',
+        error: notFound ? 'task_not_found' : 'task_not_clearable',
+        message: notFound ? '任务不存在或无权访问' : '仅可清除已结束且无需处理的历史主任务，请先处理仍在执行或等待恢复的任务',
+        skipped: result.skipped,
       });
     }
     clearCaptureOverviewProjectionCache();
     return res.json({
       ok: true, ...result,
-      clearedCount: result.clearedTaskIds.length + result.alreadyClearedTaskIds.length,
-      message: '已从历史列表移除，任务详情、采集内容和结果仍保留',
+      clearedCount,
+      message: result.skipped.length > 0
+        ? `已移出 ${clearedCount} 条；${result.skipped.length} 条未移出：仍有未结束的工作或仍需处理`
+        : '已从历史列表移除，任务详情、采集内容和结果仍保留',
     });
   } catch (err) {
     return next(err);
@@ -10817,6 +11091,20 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             AND COALESCE(t.metadata->>'draft', 'false') = 'true'
           )
       `, [req.tenantId]);
+        // 「结束并移到历史」 eligibility for this page's attention roots only:
+        // one recursive statement over their subtrees, no fence SQL.
+        const attentionRootIds = tasks
+          .filter(task => !task.parent_task_id
+            && ['needs_action', 'interrupted'].includes(task.status)
+            && !task.attention_dismissed_at)
+          .map(task => task.id);
+        const operatorClose = attentionRootIds.length > 0
+          ? await loadOperatorCloseEligibility(tx, req.tenantId, attentionRootIds)
+          : new Map();
+        const tasksWithOperatorClose = tasks.map(task => {
+          const eligibility = operatorClose.get(String(task.id).toLowerCase());
+          return eligibility ? {...task, operator_close: eligibility} : task;
+        });
         const scheduleTemplates = await loadCaptureScheduleTemplates(tx, req.tenantId);
         // Why an idle-looking node gets no work: one tenant-scoped listing
         // from the same fence SQL admission uses, summarized per node. Each
@@ -10830,7 +11118,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             now: Date.now(),
             autoCheckEnabled: stopFenceAutoCheckEnabled(),
           }),
-          tasks: [...scheduleTemplates, ...tasks],
+          tasks: [...scheduleTemplates, ...tasksWithOperatorClose],
           taskSummary,
         };
       }, {
@@ -13072,6 +13360,103 @@ router.post('/tasks/dismiss-terminal-attention', requireTenantAccess, requireSes
   }
 });
 
+// 「结束并移到历史」 (docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md
+// F3): one transaction per root, so one busy root never rolls back another.
+async function operatorCloseRoot(req, taskId, mode) {
+  try {
+    return await withTransaction(tx => closeOperatorAttentionRoot(tx, {
+      tenantId: req.tenantId,
+      rootId: taskId,
+      mode,
+      actor: {userId: req.user?.id || '', name: req.actorName},
+      refreshOrchestrationParent: refreshOrchestrationParentTask,
+    }), {
+      category: 'critical',
+      lockTimeoutMs: OPERATOR_CLOSE_LOCK_TIMEOUT_MS,
+      statementTimeoutMs: 15_000,
+    });
+  } catch (err) {
+    if (['55P03', '40P01'].includes(err?.code)) return {error: 'task_busy'};
+    if (err?.code === 'OPERATOR_CLOSE_NOT_TERMINAL') {
+      return {error: 'task_not_closeable', reason: 'live_item'};
+    }
+    throw err;
+  }
+}
+
+const OPERATOR_CLOSE_ERROR_MESSAGES = Object.freeze({
+  task_not_found: '任务不存在或无权访问',
+  task_not_root: OPERATOR_CLOSE_REASON_MESSAGES.not_root,
+  task_busy: '任务正在被其它操作更新，请稍后重试',
+});
+
+function operatorCloseSkipReason(result) {
+  if (result.error === 'task_not_found') return 'not_found';
+  if (result.error === 'task_not_root') return 'not_root';
+  if (result.error === 'task_busy') return 'task_busy';
+  return text(result.reason, 80) || 'status_not_closeable';
+}
+
+router.post('/tasks/:id/operator-close', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const taskId = text(req.params.id, 100).toLowerCase();
+    const result = UUID_PATTERN.test(taskId)
+      ? await operatorCloseRoot(req, taskId, 'single')
+      : {error: 'task_not_found'};
+    if (result.error) {
+      return res.status(result.error === 'task_not_found' ? 404 : 409).json({
+        ok: false,
+        error: result.error,
+        ...(result.reason ? {reason: result.reason} : {}),
+        message: OPERATOR_CLOSE_ERROR_MESSAGES[result.error]
+          || OPERATOR_CLOSE_REASON_MESSAGES[result.reason]
+          || OPERATOR_CLOSE_REASON_MESSAGES.status_not_closeable,
+      });
+    }
+    clearCaptureOverviewProjectionCache();
+    return res.json({
+      ok: true,
+      task: {
+        id: result.task.id,
+        status: result.task.status,
+        attention_dismissed_at: result.task.attention_dismissed_at,
+      },
+      idempotent: result.idempotent === true,
+      message: result.idempotent ? '任务已经结束并在历史中' : OPERATOR_CLOSE_SUCCESS_MESSAGE,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/tasks/operator-close', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const taskIds = normalizeOperatorCloseTaskIds(req.body?.taskIds);
+    if (!taskIds) {
+      return res.status(400).json({ok: false, error: 'invalid_task_ids', message: '请选择 1 至 100 个有效的任务'});
+    }
+    const closedTaskIds = [];
+    const alreadyClosedTaskIds = [];
+    const skipped = [];
+    for (const taskId of taskIds) {
+      const result = await operatorCloseRoot(req, taskId, 'bulk');
+      if (result.error) skipped.push({taskId, reason: operatorCloseSkipReason(result)});
+      else if (result.idempotent) alreadyClosedTaskIds.push(taskId);
+      else closedTaskIds.push(taskId);
+    }
+    if (closedTaskIds.length + alreadyClosedTaskIds.length > 0) clearCaptureOverviewProjectionCache();
+    return res.json({
+      ok: true,
+      closedTaskIds,
+      alreadyClosedTaskIds,
+      skipped,
+      message: `已结束 ${closedTaskIds.length} 个任务并移到历史${skipped.length > 0 ? `；${skipped.length} 个未处理` : ''}`,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
 function promotedRetryKeywordItemKey(keyword, ordinal) {
   const fingerprint = crypto
     .createHash('sha256')
@@ -14716,11 +15101,14 @@ export async function dispatchCrossDeviceRetry(options = {}) {
         abortCrossDeviceRetry('retry_items_unavailable');
       }
       let retryItems = scopedItems.filter(
-        item => (dutySafetyHandoffPolicy
-          ? text(item.id, 100).toLowerCase() === requestedItemIds[0]
-          : dutyRecovery
-          ? classifyCaptureRecoveryDisposition(item, {phase: 'duty'}).automatic
-          : classifyCaptureRecoveryDisposition(item).automatic),
+        // An item the operator ended with 「结束并移到历史」 is never picked
+        // up automatically; 换设备重试 and 「重试失败关键词」 still can.
+        item => !(automatic && operatorClosedWorkItem(item)) &&
+          (dutySafetyHandoffPolicy
+            ? text(item.id, 100).toLowerCase() === requestedItemIds[0]
+            : dutyRecovery
+            ? classifyCaptureRecoveryDisposition(item, {phase: 'duty'}).automatic
+            : classifyCaptureRecoveryDisposition(item).automatic),
       );
       let sourceExecutionPending = false;
       if (automatic && retryItems.length > 0) {
@@ -16115,6 +16503,10 @@ export async function reconcileAutomaticCaptureRetries(input = 10) {
       AND COALESCE(metadata->>'orchestrationTemplate', 'false') <> 'true'
       AND COALESCE(metadata->>'distributionMode', '') <> 'elastic_pool'
       AND COALESCE(metadata->>'automaticRetryDisabled', 'false') <> 'true'
+      -- An operator who reopened a dismissed/closed batch from history
+      -- (retry-items, manual handoff) picked the keywords to re-run; the
+      -- scan never re-runs the ones they left alone.
+      AND NOT (metadata ? 'reopenedFromHistoryAt')
       AND COALESCE(
         metadata #>> '{planSnapshot,recoveryPolicy,allowIdleAgentHandoff}',
         'true'
@@ -16372,14 +16764,17 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
       ) {
         return { error: 'task_stop_fence_operator_release_required', task };
       }
+      // 「结束并移到历史」 ended this task (or its batch) without re-capture.
+      if (operatorClosedTask(task)) return { error: 'task_operator_closed', task };
 
       let allowedKeywords = [];
       if (task.parent_task_id) {
         const parent = await tx.queryOne(`
-          SELECT id, metadata
+          SELECT id, status, metadata, attempt_number, orchestration_revision
           FROM capture_tasks
           WHERE id = $1 AND tenant_id = $2
         `, [task.parent_task_id, req.tenantId]);
+        if (operatorClosedTask(parent)) return { error: 'task_operator_closed', task };
         const parentMetadata = safeJson(parent?.metadata);
         if (parentMetadata.distributionMode === 'elastic_pool') {
           const releasedSafetyAttempts = await tx.queryAll(`
@@ -16679,6 +17074,10 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
       task_stop_fence_operator_release_required: [
         'task_stop_fence_operator_release_required',
         '该任务的旧采集页面未确认停止，节点本机无法继续；请到该电脑检查后，在「执行节点」点「确认旧页面已停止」，未完成关键词会交回批次',
+      ],
+      task_operator_closed: [
+        'task_operator_closed',
+        '该任务已结束并移到历史，不能继续；需要重采请在批次里「重试失败关键词」或重新下发',
       ],
     };
     if (result.error) {

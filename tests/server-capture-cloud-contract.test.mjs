@@ -75,6 +75,7 @@ import {
   resolveStopCommandOutcome,
   supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
+import {operatorClosedTaskSql as operatorClosedTaskSqlForContract} from "../server/services/capture-operator-close.js";
 
 const captureCloudRouteSource = await readFile(
   new URL("../server/routes/capture-cloud.js", import.meta.url),
@@ -5247,3 +5248,192 @@ test("a 0.4.19 snapshot keeps the front stage, relay action and self-stop reason
   assert.equal("stopFenceCheck" in snapshot.metadata, false);
   assert.equal(snapshot.metadata.workflow, "unattended_keyword_capture");
 });
+
+// docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md F1/F2: the round
+// relax is a constant-cost predicate of the claim SQL, the time-filter backstop
+// never adds stop-fence work, and recursive candidate picks reuse the slot check.
+test("elastic claim relaxes a stuck round in SQL and settles repeated time-filter failures once per heartbeat", async () => {
+  const claim = readRouteSection(
+    "async function dispatchNextElasticWorkItemWithinBudget",
+    "function normalizeTerminalNoticeAcks",
+  );
+  assert.match(
+    claim,
+    /CROSS JOIN LATERAL \(\s+SELECT item\.status = 'retryable'\s+AND \$\{elasticRoundAnchorSql\('item'\)\}\s+<= now\(\) - \(\$14::integer \* interval '1 millisecond'\) AS round_relaxed\s+\) item_round/u,
+  );
+  assert.match(claim, /item_round\.round_relaxed,/u);
+  assert.match(
+    claim,
+    /reverse_attempt_ordinal <= CASE\s+WHEN item_round\.round_relaxed THEN LEAST\(1,\s+MOD\(item\.attempt_count -[\s\S]*?agent_policy\.agent_attempt_limit\)\)\s+ELSE MOD\(item\.attempt_count -[\s\S]*?agent_policy\.agent_attempt_limit\)\s+END/u,
+  );
+  // The source Agent never takes the same keyword twice in a row.
+  assert.match(
+    claim,
+    /agent_policy\.agent_attempt_limit = 1\s+OR item\.assigned_agent_id IS DISTINCT FROM \$2::uuid/u,
+  );
+  assert.match(claim, /elasticRoundRelaxAfterMs\(\),\s+\]\);/u);
+  assert.match(claim, /roundExclusionRelaxed: candidate\.round_relaxed === true/u);
+  assert.match(
+    claim,
+    /metadata - 'checkpoint' - 'targetResult' -[\s\S]*?'sourceClosureBlockedAttemptId' -\s+'elasticRetryWaitingSince'/u,
+    'a claim ends the current manual waiting window',
+  );
+
+  const slotGuard = claim.indexOf('if (!slotChecked) {');
+  assert.ok(slotGuard > 0);
+  assert.ok(claim.indexOf('findCaptureAgentExecutionSlotBlocker(') > slotGuard);
+  assert.ok(claim.indexOf('const recentRecoveryAttempt') > slotGuard);
+  assert.ok(claim.indexOf('const candidate = await tx.queryOne(') > claim.indexOf('elasticRecoveryHoldRemainingMs(recentRecoveryAttempt)'));
+  // [0] precedes the definition, [1] is the definition itself.
+  const recursions = claim.split('dispatchNextElasticWorkItemWithinBudget(').slice(2);
+  assert.equal(recursions.length, 4);
+  for (const call of recursions) {
+    assert.match(call.slice(0, 260), /slotChecked: true/u, call.slice(0, 260));
+  }
+
+  const backstop = claim.slice(
+    claim.indexOf('// F2 backstop for keywords'),
+    claim.indexOf("if (candidate.item_type === 'negative_post')"),
+  );
+  assert.match(backstop, /candidate\.item_type === 'keyword'/u);
+  assert.match(backstop, /settleElasticFilterVerificationBatch\(tx,/u);
+  assert.equal((backstop.match(/refreshOrchestrationParentTask\(/gu) || []).length, 1);
+  assert.match(backstop, /settledAt: 'claim'/u);
+  assert.doesNotMatch(backstop, /captureTaskUnconfirmedLocalStopSql|findCaptureAgentExecutionSlotBlocker|PREVIOUS_CAPTURE_STOP_UNCONFIRMED/u);
+  assert.doesNotMatch(backstop, /INSERT INTO capture_agent_commands|INSERT INTO capture_tasks/u);
+
+  const policySource = await readFile(
+    new URL("../server/services/capture-elastic-policy.js", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(policySource, /PREVIOUS_CAPTURE_STOP_UNCONFIRMED|captureTaskUnconfirmedLocalStopSql/u);
+  assert.match(policySource, /FOR UPDATE SKIP LOCKED/u);
+  assert.match(policySource, /metadata = item\.metadata #- '\{checkpoint,recovery\}'/u);
+  assert.match(policySource, /error = \(item\.error - 'recovery'\) \|\|/u);
+
+  const projection = readRouteSection(
+    "async function projectOrchestrationSnapshot",
+    "export async function mirrorTaskSnapshot",
+  );
+  assert.equal((projection.match(/await settleElasticFilterVerification\(tx,/gu) || []).length, 2);
+  assert.match(projection, /if \(filterVerification\) \{\s+status = 'failed';\s+error = filterVerification\.error;/u);
+  assert.ok(
+    projection.indexOf('settleElasticFilterVerification(tx,') <
+      projection.indexOf('const recovery = buildElasticRecoveryMetadata({'),
+    'a settled item never gets a new handoff anchor',
+  );
+  assert.match(projection, /WHEN \$14::boolean THEN metadata #- '\{checkpoint,recovery\}'/u);
+  assert.match(projection, /settledAt: 'projection'/u);
+  assert.doesNotMatch(projection, /recoveryLimitReached: true/u);
+});
+
+test("重试失败关键词 opens a new time-filter window and releases a settled item back to the queue", async () => {
+  const routes = await readFile(
+    new URL("../server/routes/capture-orchestrations.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    routes,
+    /'retryRequestKey', \$6::uuid::text,[\s\S]{0,200}'filterVerificationBaseAttemptCount', attempt_count/u,
+  );
+  assert.match(
+    routes,
+    /'elasticRetryWaitingSince', now\(\),[\s\S]{0,200}'filterVerificationBaseAttemptCount', attempt_count/u,
+  );
+  assert.match(routes, /WHEN error->>'automaticRetryStopped' = 'true' THEN\s+\(error - \$9::text\[\]\)/u);
+  assert.match(routes, /FILTER_VERIFICATION_SETTLEMENT_KEYS,\s+\]\);/u);
+});
+
+// docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md F3/F3b
+test("「结束并移到历史」 is writer-only, fence-free and cannot be undone by a late device report", async () => {
+  const single = readRouteSection(
+    "router.post('/tasks/:id/operator-close'",
+    "router.post('/tasks/operator-close'",
+  );
+  const bulk = readRouteSection(
+    "router.post('/tasks/operator-close'",
+    "function promotedRetryKeywordItemKey",
+  );
+  for (const route of [single, bulk]) {
+    assert.match(route, /requireTenantAccess, requireSessionUser, requireTenantWriter/u);
+    assert.match(route, /operatorCloseRoot\(req, taskId, '(single|bulk)'\)/u);
+    assert.match(route, /clearCaptureOverviewProjectionCache\(\)/u);
+    assert.doesNotMatch(route, /captureTaskUnconfirmedLocalStopSql|findCaptureAgentExecutionSlotBlocker|\bDELETE\b/u);
+  }
+  assert.match(captureCloudRouteSource,
+    /async function operatorCloseRoot[\s\S]*?lockTimeoutMs: OPERATOR_CLOSE_LOCK_TIMEOUT_MS[\s\S]*?\['55P03', '40P01'\][\s\S]*?task_busy/u);
+  assert.match(captureCloudRouteSource,
+    /refreshOrchestrationParent: refreshOrchestrationParentTask/u,
+    "the orchestration root is re-aggregated by the route projector, never forced to failed");
+
+  const service = await readFile(
+    new URL("../server/services/capture-operator-close.js", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(service, /from ['"]\.\.\/routes\//u, "services never import routes");
+  assert.ok(!/from ['"]\.\/capture-cloud\.js['"]/u.test(service) &&
+    !/captureTaskUnconfirmedLocalStopSql\(|findCaptureAgentExecutionSlotBlocker\(|INSERT INTO capture_agent_commands/u.test(service),
+  "eligibility never runs the admission fence SQL and closing sends no command");
+  assert.ok(!/UPDATE capture_discovery|UPDATE unattended_negative_patrol_state/u.test(service),
+    "candidates, demands and the negative patrol rotation are left alone");
+  assert.match(service, /assignment_revision = assignment_revision \+ 1/u);
+  assert.match(service, /- 'attemptId' - 'leaseId'/u);
+
+  const overview = readRouteSection("router.get('/overview'", "router.patch('/agents/:id'");
+  assert.match(overview, /\['needs_action', 'interrupted'\]\.includes\(task\.status\)[\s\S]*?!task\.attention_dismissed_at/u);
+  assert.match(overview, /await loadOperatorCloseEligibility\(tx, req\.tenantId, attentionRootIds\)/u);
+  assert.match(overview, /operator_close: eligibility/u);
+
+  const mirror = readRouteSection("export async function mirrorTaskSnapshot", "router.post('/agent/heartbeat'");
+  assert.match(mirror, /delete agentSnapshotMetadata\.operatorClose;/u);
+  assert.match(mirror, /'operatorClose', capture_tasks\.metadata->'operatorClose'/u);
+  const statusCase = mirror.slice(mirror.indexOf('status = CASE'), mirror.indexOf('progress = EXCLUDED.progress'));
+  assert.ok(statusCase.indexOf('OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL') > -1 &&
+    statusCase.indexOf('OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL') < statusCase.indexOf("capture_tasks.status = 'superseded'"),
+  'the hold branch is the first status branch, before ELSE');
+  assert.match(mirror, /attention_dismissed_at = CASE\s+WHEN capture_tasks\.parent_task_id IS NULL[\s\S]*?AND NOT \$\{OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL\}\s+THEN NULL/u);
+  const hold = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf('const OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL'),
+    captureCloudRouteSource.indexOf('export async function mirrorTaskSnapshot'),
+  );
+  assert.match(hold, /operatorClosedTaskSql\('capture_tasks'\)/u);
+  assert.match(hold, /->>'attemptNumber' = EXCLUDED\.attempt_number::text/u);
+  assert.match(hold, /EXCLUDED\.status IN \('needs_action', 'failed', 'completed_with_failures'\)/u);
+  assert.match(hold, /UPPER\(COALESCE\(EXCLUDED\.error->>'code', ''\)\) <> 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'/u);
+  assert.doesNotMatch(hold, /interrupted/u, "an interrupted report is slot-blocking and must be mirrored");
+  assert.match(operatorClosedTaskSqlSource(), /capture_tasks\.status IN \('failed', 'completed_with_failures'\)/u);
+
+  const snapshot = normalizeCloudTaskSnapshot({id: 'late', status: 'failed',
+    metadata: {operatorClose: {closedAt: 'forged'}, keep: 'yes'}});
+  assert.equal(snapshot.metadata.operatorClose, undefined);
+  assert.equal(snapshot.metadata.keep, 'yes');
+
+  const adoption = readRouteSection("async function adoptLocalOrchestrationRecovery", "export async function refreshOrchestrationParentTask");
+  assert.match(adoption, /if \(operatorClosedTask\(parent\) \|\| operatorClosedTask\(sourceTask\)\) return task;/u);
+  assert.match(adoption, /attempt_number, orchestration_revision\s+FROM capture_tasks/u);
+  const resume = readRouteSection("router.post('/tasks/:id/resume'", "router.post('/tasks/:id/stop'");
+  assert.match(resume, /if \(operatorClosedTask\(task\)\) return \{ error: 'task_operator_closed', task \};/u);
+  assert.match(resume, /SELECT id, status, metadata, attempt_number, orchestration_revision[\s\S]*?if \(operatorClosedTask\(parent\)\) return \{ error: 'task_operator_closed', task \};/u);
+  assert.ok(resume.indexOf("error: 'task_operator_closed'") < resume.indexOf('releasedSafetyAttempts'),
+    "a closed task is refused before any safety hold is released");
+  assert.match(resume, /已结束并移到历史，不能继续/u);
+  assert.match(captureCloudRouteSource,
+    /async function lockOrchestrationParent[\s\S]*?orchestration_revision, attempt_number,/u);
+});
+
+test("history clear reports unclearable rows instead of failing the whole selection", () => {
+  const clear = readRouteSection("router.post('/history/clear'", "router.get('/overview'");
+  for (const reason of ['not_found', 'not_root', 'not_in_history', 'live_work']) {
+    assert.match(clear, new RegExp(`reason: '${reason}'`, 'u'));
+  }
+  assert.match(clear, /SELECT DISTINCT tree\.root_id/u);
+  assert.match(clear, /status\(notFound \? 404 : 409\)/u);
+  assert.match(clear, /skipped: result\.skipped/u);
+  assert.match(clear, /已移出 \$\{clearedCount\} 条；\$\{result\.skipped\.length\} 条未移出/u);
+  assert.match(clear, /'historyClearedAt', now\(\), 'historyClearedBy', \$3::text/u);
+  assert.doesNotMatch(clear, /\bDELETE\b/u);
+});
+
+function operatorClosedTaskSqlSource() {
+  return String(operatorClosedTaskSqlForContract('capture_tasks'));
+}

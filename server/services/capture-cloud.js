@@ -792,6 +792,8 @@ export function normalizeCloudTaskSnapshot(input = {}) {
   // snapshot (including the first insert and later heartbeat mirrors).
   delete metadata.historyClearedAt;
   delete metadata.historyClearedBy;
+  // So does the operator's 「结束并移到历史」 marker (operatorClose).
+  delete metadata.operatorClose;
   // The stop-fence check round is server state too: no device writes or
   // forges one (docs/hotfix/20260927-unattended-self-heal.md, S3).
   delete metadata.stopFenceCheck;

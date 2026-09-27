@@ -56,6 +56,10 @@ import {
   trimMobilePlanSnapshot,
 } from '../services/android-control/mobile-tasks.js';
 import {STOP_FENCE_OPERATOR_RELEASED_REASON} from '../services/capture-stop-fence.js';
+import {
+  FILTER_VERIFICATION_SETTLEMENT_KEYS,
+  elasticRoundRelaxAfterMs,
+} from '../services/capture-elastic-policy.js';
 
 const router = Router();
 const UUID_PATTERN =
@@ -76,6 +80,20 @@ const HANDOFF_PLATFORM_SAFETY_CODES = new Set([
   'CAPTCHA_PAGE_DETECTED',
 ]);
 const RETRY_ITEM_STATUSES = new Set(['retryable', 'needs_action', 'failed']);
+// An operator reopening a dismissed or history-cleared batch (retry-items,
+// manual handoff) consents to the keywords they picked, not to the rest:
+// reconcileAutomaticCaptureRetries skips roots with this marker, so the
+// cleared dismissal (the batch shows up in 需处理 again) does not let the
+// cron re-run keywords the operator left alone. SET expressions read the
+// row before the update, i.e. while it was still dismissed.
+const REOPENED_FROM_HISTORY_MARKER_SQL = `CASE
+  WHEN capture_tasks.attention_dismissed_at IS NOT NULL
+    OR capture_tasks.metadata ? 'historyClearedAt'
+  THEN jsonb_build_object('reopenedFromHistoryAt', now())
+  ELSE '{}'::jsonb
+END`;
+export const RETRY_ITEMS_MOBILE_SOURCE_MESSAGE =
+  '手机采集的关键词不能在原批次里重试（手机不接收重试任务）；需要重采请新建手机采集批次';
 const RETRY_AGENT_SLOT_BLOCKING_STATUSES = [
   'pending',
   'waiting_device',
@@ -2213,6 +2231,8 @@ async function loadIdlePendingRetryAgent(tx, {tenantId, parent, lineage}) {
     agentIds: lineage.preferredAgentId ? [lineage.preferredAgentId] : [],
   });
   const eligibleCandidates = candidates.filter(agent =>
+    // The waiting retry goes out as a browser create command; phones never read one.
+    safeJson(agent.capabilities).agentKind !== 'android_mobile' &&
     !agentCompatibilityFailure(agent, parent.platform, planSnapshot) &&
     captureAgentFullHeartbeatOnline(agent) &&
     crossDeviceRetryAgentDailyUsageEligible(agent)
@@ -5511,8 +5531,12 @@ router.post(
         const currentItems = await tx.queryAll(`SELECT status FROM capture_task_items
           WHERE tenant_id = $1 AND task_id = $2`, [req.tenantId, parentId]);
         const aggregate = aggregateParentTaskItems(currentItems);
+        // Like 「重试失败关键词」: the requeued round must surface again.
         await tx.execute(`UPDATE capture_tasks SET status = 'running',
           orchestration_revision = $3, finished_at = NULL, updated_at = now(),
+          attention_dismissed_at = NULL, attention_dismissed_by_user_id = NULL,
+          attention_dismissed_by_name = '',
+          metadata = metadata - 'historyClearedAt' - 'historyClearedBy',
           counts = $4::jsonb, progress = $5::jsonb,
           message = '失败巡查已恢复到原队列，空闲节点将重新核对范围后领取'
           WHERE tenant_id = $1 AND id = $2`, [req.tenantId, parentId, revision,
@@ -5828,6 +5852,24 @@ router.post(
             409,
           )};
         }
+        // A phone keyword cannot be re-run inside its old batch: the Runner
+        // reads no create command, a fixed-batch phone child never reopens
+        // and the elastic phone claim counts attempts absolutely, so the
+        // retry would be accepted and then wait forever. Only reachable once
+        // 「结束并移到历史」 settled the phone child; a new phone batch re-captures.
+        const mobileSourceTaskIds = new Set(sourceTasks
+          .filter(task => safeJson(task.metadata).workflow === MOBILE_WORKFLOW)
+          .map(task => String(task.id)));
+        if (mobileSourceTaskIds.size > 0) {
+          return {failure: requestError(
+            'retry_items_mobile_source',
+            RETRY_ITEMS_MOBILE_SOURCE_MESSAGE,
+            409,
+            {itemIds: retryItems
+              .filter(item => mobileSourceTaskIds.has(String(item.execution_task_id || '')))
+              .map(item => item.id)},
+          )};
+        }
 
         retryItems.sort(
           (left, right) => Number(left.ordinal) - Number(right.ordinal),
@@ -5865,6 +5907,9 @@ router.post(
         for (const agent of candidateAgents) {
           const agentId = String(agent.id);
           if (
+            // Retries go out as browser create commands, which a phone never
+            // reads (cross-device retry excludes phones the same way).
+            safeJson(agent.capabilities).agentKind === 'android_mobile' ||
             agentCompatibilityFailure(agent, parent.platform, planSnapshot) ||
             !captureAgentFullHeartbeatOnline(agent) ||
             !crossDeviceRetryAgentDailyUsageEligible(agent)
@@ -5996,7 +6041,10 @@ router.post(
                 ]::text[]
               ) || jsonb_build_object(
                 'retrySourceExecutionTaskId', $5::uuid::text,
-                'retryRequestKey', $6::uuid::text
+                'retryRequestKey', $6::uuid::text,
+                -- A manual retry opens a fresh time-filter window (F2):
+                -- earlier failures no longer count towards the limit.
+                'filterVerificationBaseAttemptCount', attempt_count
               ),
               assigned_at = now(),
               dispatched_at = now(),
@@ -6131,6 +6179,15 @@ router.post(
             const preserved = await tx.queryOne(`
               UPDATE capture_task_items
               SET status = 'retryable',
+                -- Back in the automatic queue: a time-filter settlement no
+                -- longer describes this item, show the original failure.
+                error = CASE
+                  WHEN error->>'automaticRetryStopped' = 'true' THEN
+                    (error - $9::text[]) || jsonb_build_object(
+                      'message', COALESCE(error->>'originalMessage', error->>'message', '')
+                    )
+                  ELSE error
+                END,
                 metadata = (
                   metadata - ARRAY[
                     'retryPending', 'retryWaitingSince',
@@ -6148,7 +6205,8 @@ router.post(
                 ) || jsonb_build_object(
                   'elasticRetryWaitingSince', now(),
                   'elasticRetryWaitingReason', $1::text,
-                  'elasticRetryRequestKey', $2::uuid::text
+                  'elasticRetryRequestKey', $2::uuid::text,
+                  'filterVerificationBaseAttemptCount', attempt_count
                 ),
                 updated_at = now()
               WHERE id = $3 AND tenant_id = $4 AND task_id = $5
@@ -6166,6 +6224,7 @@ router.post(
               item.execution_task_id,
               Number(item.assignment_revision || 0),
               Number(item.attempt_count || 0),
+              FILTER_VERIFICATION_SETTLEMENT_KEYS,
             ]);
             if (!preserved) {
               const error = new Error('orchestration_retry_item_conflict');
@@ -6244,14 +6303,15 @@ router.post(
             status = $1,
             progress = $2::jsonb,
             counts = $3::jsonb,
-            metadata = metadata || jsonb_build_object(
+            metadata = (metadata - 'historyClearedAt' - 'historyClearedBy') ||
+              jsonb_build_object(
               'lastRetryAt', now(),
               'lastRetryTaskIds', $4::jsonb,
               'lastRetryRequestKey', $5::uuid::text,
               'lastRetryRequestHash', $6::text,
               'lastRetryAssignments', $7::jsonb,
               'lastRetryWaiting', $8::jsonb
-            ),
+            ) || ${REOPENED_FROM_HISTORY_MARKER_SQL},
             message = CASE
               WHEN jsonb_array_length($4::jsonb) = 0
                 THEN '失败关键词尚未下发，正在等待兼容的空闲 Agent'
@@ -6260,6 +6320,12 @@ router.post(
               ELSE '失败关键词已按单项租约分片下发重试'
             END,
             finished_at = NULL,
+            -- A re-dispatched batch is live again: an earlier dismissal,
+            -- history clear or 「结束并移到历史」 must not hide its next
+            -- needs_action from 需处理 (cross-device retry does the same).
+            attention_dismissed_at = NULL,
+            attention_dismissed_by_user_id = NULL,
+            attention_dismissed_by_name = '',
             updated_at = now(),
             source_updated_at = now()
           WHERE id = $9 AND tenant_id = $10
@@ -6986,14 +7052,18 @@ router.post(
             status = $1,
             progress = $2::jsonb,
             counts = $3::jsonb,
-            metadata = metadata || jsonb_build_object(
+            metadata = (metadata - 'historyClearedAt' - 'historyClearedBy') ||
+              jsonb_build_object(
               'lastHandoffAt', now(),
               'lastHandoffSourceExecutionTaskId', $4::uuid::text,
               'lastHandoffSuccessorTaskId', $5::uuid::text,
               'lastHandoffRequestKey', $6::uuid::text
-            ),
+            ) || ${REOPENED_FROM_HISTORY_MARKER_SQL},
             message = '未开始关键词已由人工确认转交空闲节点',
             finished_at = NULL,
+            attention_dismissed_at = NULL,
+            attention_dismissed_by_user_id = NULL,
+            attention_dismissed_by_name = '',
             updated_at = now(),
             source_updated_at = now()
           WHERE id = $7 AND tenant_id = $8
@@ -7293,6 +7363,9 @@ router.get(
         retryCandidates: retryCandidates.map(publicRetryAgentCandidate),
         attempts,
         schedule,
+        // Constant (no query): lets the recovery card say when a waiting
+        // retryable keyword opens to Agents that already tried it (F1).
+        elasticPolicy: {roundRelaxAfterMs: elasticRoundRelaxAfterMs()},
       });
     } catch (error) {
       return next(error);

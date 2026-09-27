@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Archive, CheckCircle2, ClipboardList,
+  Archive, ArchiveX, CheckCircle2, ClipboardList,
   ListChecks, Loader2, Plus, RefreshCw,
 } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -26,8 +26,15 @@ import type {
 } from './cloud-tasks/lib'
 import type { OrchestrationDetailResponse, OrchestrationLaunchIntent } from './cloud-tasks/types'
 import {
+  operatorCloseBulkConfirmText,
+  operatorCloseBulkResultText,
+  operatorCloseConfirmText,
+} from './cloud-tasks/operator-close-presentation.mjs'
+import type { OperatorCloseBulkResult } from './cloud-tasks/operator-close-presentation.mjs'
+import {
   ACTIVE_TASK_STATUSES,
   canDismissAttention,
+  canOperatorClose,
   hasConfiguredUnattendedPlan,
   isPendingUnattendedPlanDeleteTask,
   isAttentionTask,
@@ -340,6 +347,11 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
     () => queueTasks.filter(canDismissAttention).length,
     [queueTasks],
   )
+  // 服务端判定没有进行中工作、可以「结束并移到历史」的需处理主任务（最多 100 个一批）。
+  const operatorClosableTaskIds = useMemo(
+    () => queueTasks.filter(canOperatorClose).map(task => task.id).slice(0, 100),
+    [queueTasks],
+  )
   const onlineAgentCount = operationalAgents.filter(agent => agent.online).length
 
   const resume = async (task: CloudTask) => {
@@ -413,6 +425,40 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
       await load(true)
     } catch (err) {
       setActionError(err instanceof Error ? err.message : '移到历史失败')
+    } finally {
+      setActionTaskId('')
+    }
+  }
+
+  const operatorClose = async (task: CloudTask) => {
+    if (!window.confirm(operatorCloseConfirmText(task))) return
+    setActionTaskId(task.id)
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<{ message?: string }>('/capture-cloud/tasks/' + task.id + '/operator-close', {})
+      setFeedback(result.message || '已结束并移到历史，采集结果已保留')
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '结束任务失败')
+    } finally {
+      setActionTaskId('')
+    }
+  }
+
+  const closeUnrecoverableTasks = async () => {
+    const taskIds = operatorClosableTaskIds
+    if (taskIds.length === 0) return
+    if (!window.confirm(operatorCloseBulkConfirmText(taskIds.length))) return
+    setActionTaskId('bulk-operator-close')
+    setFeedback('')
+    setActionError('')
+    try {
+      const result = await api.post<OperatorCloseBulkResult>('/capture-cloud/tasks/operator-close', { taskIds })
+      setFeedback(operatorCloseBulkResultText(result))
+      await load(true)
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : '清理无法继续的任务失败')
     } finally {
       setActionTaskId('')
     }
@@ -716,13 +762,26 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
               />
             ) : (
               <>
-                {taskView === 'attention' && dismissibleAttentionCount > 0 && (
+                {taskView === 'attention' && (dismissibleAttentionCount > 0 || operatorClosableTaskIds.length > 0) && (
                   <div className="mb-3 flex flex-col gap-3 rounded-xl border border-border/70 bg-muted/35 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-                    <p className="text-xs leading-5 text-muted-foreground">失败和部分失败已经结束，可移到历史；中断和需要人工处理的任务会继续保留。</p>
-                    <Button variant="outline" size="sm" onClick={() => void dismissTerminalAttention()} disabled={!canWrite() || actionTaskId === 'bulk-dismiss-attention'} className="shrink-0">
-                      {actionTaskId === 'bulk-dismiss-attention' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
-                      清理已结束失败项
-                    </Button>
+                    <div className="space-y-1 text-xs leading-5 text-muted-foreground">
+                      {dismissibleAttentionCount > 0 && <p>失败和部分失败已经结束，可移到历史；中断和需要人工处理的任务会继续保留。</p>}
+                      {operatorClosableTaskIds.length > 0 && <p>以下任务已经没有进行中的工作，但状态停在“需要处理”，可以结束并移到历史；仍在自动恢复、或需要先确认旧页面停止的任务会保留。</p>}
+                    </div>
+                    <div className="flex shrink-0 flex-wrap gap-2">
+                      {dismissibleAttentionCount > 0 && (
+                        <Button variant="outline" size="sm" onClick={() => void dismissTerminalAttention()} disabled={!canWrite() || actionTaskId === 'bulk-dismiss-attention'} className="shrink-0">
+                          {actionTaskId === 'bulk-dismiss-attention' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Archive className="h-4 w-4" />}
+                          清理已结束失败项
+                        </Button>
+                      )}
+                      {operatorClosableTaskIds.length > 0 && (
+                        <Button variant="outline" size="sm" onClick={() => void closeUnrecoverableTasks()} disabled={!canWrite() || actionTaskId === 'bulk-operator-close'} className="shrink-0">
+                          {actionTaskId === 'bulk-operator-close' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArchiveX className="h-4 w-4" />}
+                          清理无法继续的任务（{operatorClosableTaskIds.length}）
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 )}
 
@@ -743,6 +802,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
                       <TaskCard key={task.id} task={task} surface={surface} writable={canWrite()} actionTaskId={actionTaskId} onResume={resume} onStop={stop}
                         onRetryOnIdleAgent={retryOnIdleAgent}
                         onDismissAttention={dismissAttention}
+                        onOperatorClose={operatorClose}
                         onOpenResult={openTaskResult}
                         onOpenOrchestration={selected => setSelectedOrchestrationId(selected.id)} />
                     ))}
