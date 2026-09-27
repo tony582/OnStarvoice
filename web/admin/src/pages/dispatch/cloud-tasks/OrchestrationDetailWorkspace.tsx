@@ -45,9 +45,11 @@ import {
 } from './retry-item-allocation.js'
 import {
   activeRecoveryCommandStatus,
+  DEFAULT_ELASTIC_ROUND_RELAX_MS,
   formatRecoveryAttemptLabel,
   formatRecoveryState,
   orchestrationItemStatusBucket,
+  summarizeElasticRoundWait,
   summarizeOrchestrationItems,
 } from './recovery-presentation.js'
 import {
@@ -751,6 +753,24 @@ export function OrchestrationDetailWorkspace({
       )
   }, [attentionContext, availableAgents, detail, stopFencedAgentIds])
 
+  // F1：本轮排除的池节点（eligible ∪ relay）与节点状态。节点在线/忙碌/停止保护
+  // 取自 /overview 的 availableAgents，缺失时回落到批次详情里的 agents。
+  const elasticPoolAgentIds = useMemo(() => {
+    if (!elasticPool) return []
+    const eligible = Array.isArray(metadata.eligibleAgentIds) ? metadata.eligibleAgentIds : []
+    const resourcePolicy = objectRecord(objectRecord(metadata.planSnapshot).resourcePolicy)
+    const relay = Array.isArray(resourcePolicy.relayAgentIds) ? resourcePolicy.relayAgentIds : []
+    return [...eligible, ...relay].map(value => String(value || ''))
+  }, [elasticPool, metadata.eligibleAgentIds, metadata.planSnapshot])
+  const elasticRoundAgents = useMemo(() => {
+    const merged = new Map<string, OrchestrationCloudAgent>()
+    for (const agent of detail?.agents || []) merged.set(agent.id, agent)
+    for (const agent of availableAgents) {
+      merged.set(agent.id, { ...(merged.get(agent.id) || {}), ...agent })
+    }
+    return Array.from(merged.values())
+  }, [availableAgents, detail?.agents])
+
   const automaticRecoveryStates = useMemo(() => {
     if (
       !detail ||
@@ -848,6 +868,17 @@ export function OrchestrationDetailWorkspace({
         : blockingStatusText
           ? `等待原执行结算 · ${attemptLabel}`
           : `工作项已释放 · 恢复 ${attemptLabel}`
+      const roundWait = elasticPool && workUnit === '关键词'
+        ? summarizeElasticRoundWait({
+            item,
+            attempts: detail.attempts || [],
+            poolAgentIds: elasticPoolAgentIds,
+            agents: elasticRoundAgents,
+            fencedAgentIds: stopFencedAgentIds,
+            relaxAfterMs: Number(detail.elasticPolicy?.roundRelaxAfterMs) || DEFAULT_ELASTIC_ROUND_RELAX_MS,
+            now: nowMs,
+          })
+        : null
       const message = item.metadata?.pinnedAgentId
         ? `关键词「${keywordForItem(item)}」保留在目标节点，等待该节点满足恢复条件；其他节点的结果不会替代这一项。`
         : commandStatus
@@ -856,7 +887,9 @@ export function OrchestrationDetailWorkspace({
           ? `该${workUnit}已进入恢复状态，但原执行尚未满足服务端接力条件；已采集结果继续保留。`
           : String(recovery.reason || '') === 'platform_safety_handoff'
             ? `仅隔离${workUnit}「${keywordForItem(item)}」与原账号这一组合；其他空闲 Agent 可立即领取，并优先在未尝试账号中接力；原账号可继续领取其他关键词`
-            : `${workUnit}「${keywordForItem(item)}」正在等待兼容的空闲 Agent；技术失败在全池尝试后可进入下一轮，原 Agent 可继续领取其他关键词`
+            : roundWait
+              ? `${workUnit}「${keywordForItem(item)}」：${roundWait.message}`
+              : `${workUnit}「${keywordForItem(item)}」正在等待兼容的空闲 Agent；技术失败在全池尝试后可进入下一轮，原 Agent 可继续领取其他关键词`
       states.push({
         id: `item:${item.id}`,
         label,
@@ -869,7 +902,10 @@ export function OrchestrationDetailWorkspace({
       })
     }
     return states
-  }, [agentsById, contentPatrol, detail, executionsById, isScheduleTemplate, nowMs, sortedItems])
+  }, [
+    agentsById, contentPatrol, detail, elasticPool, elasticPoolAgentIds, elasticRoundAgents,
+    executionsById, isScheduleTemplate, nowMs, sortedItems, stopFencedAgentIds,
+  ])
 
   useEffect(() => {
     if (!orchestrationId || resultView || detailFinal) return
