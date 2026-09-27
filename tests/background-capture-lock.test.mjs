@@ -86,6 +86,15 @@ function createCaptureOwnerPort() {
 
 function createHarness() {
   const storage = {};
+  // storage.session：浏览器随本次加载启动（browser_startup），平台页文档都晚于
+  // 本次加载，自停与核对的全量扫描可以查询它们的内容脚本。
+  const sessionStore = {
+    "onstarvoice.runtimeEpoch": {
+      id: "epoch-test",
+      startedAt: Date.now() - 10 * 60 * 1000,
+      origin: "browser_startup",
+    },
+  };
   const sentTabMessages = [];
   const reloadedTabIds = [];
   const removedTabIds = [];
@@ -192,9 +201,26 @@ function createHarness() {
     },
   };
 
+  const sessionStorage = {
+    async get(key) {
+      if (typeof key === "string") {
+        return Object.hasOwn(sessionStore, key) ? {[key]: sessionStore[key]} : {};
+      }
+      return {...sessionStore};
+    },
+    async set(values) {
+      Object.assign(sessionStore, JSON.parse(JSON.stringify(values)));
+    },
+    async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        delete sessionStore[key];
+      }
+    },
+  };
+
   const chrome = {
     runtime,
-    storage: {local: localStorage},
+    storage: {local: localStorage, session: sessionStorage},
     alarms: {
       onAlarm: createEvent(),
       async clear(name) {
@@ -216,6 +242,7 @@ function createHarness() {
     },
     tabs: {
       onActivated: createEvent(),
+      onCreated: createEvent(),
       onUpdated: createEvent(),
       onRemoved: createEvent(),
       onReplaced: createEvent(),
@@ -292,6 +319,9 @@ function createHarness() {
         }
         const tab = {id: 99 + createdTabs.length, ...options};
         createdTabs.push(tab);
+        for (const listener of [...chrome.tabs.onCreated.listeners]) {
+          listener({...tab});
+        }
         return tab;
       },
       async group(options) {
@@ -337,7 +367,14 @@ function createHarness() {
       },
     },
     scripting: {
-      async executeScript() {
+      async executeScript(options = {}) {
+        // 只读探测（func）回一份晚于本次加载的文档；注入脚本文件照旧回空。
+        if (typeof options?.func === "function") {
+          if (missingTabIds.has(Number(options?.target?.tabId))) {
+            throw new Error("No tab with id");
+          }
+          return [{frameId: 0, result: {t: Date.now() - 1000, o: ""}}];
+        }
         return [];
       },
     },
@@ -560,6 +597,7 @@ function createHarness() {
     sentTabMessages,
     storageSetCalls,
     storageRemoveCalls,
+    sessionStore,
     failNextRuntimeSet(error = new Error("runtime set failed")) {
       nextRuntimeSetError = error;
     },
@@ -794,6 +832,25 @@ function seedUnattendedRequest(harness, overrides = {}) {
     planSnapshot: plan,
   };
   return harness.storage[UNATTENDED_REQUEST_KEY];
+}
+
+// 0.4.19：旧轮次 runner 看到换代后退役（停掉锁心跳），后台把退役回执记在
+// storage.session。自停据此确认锁的持有文档已退役，不必关它的运行页。
+function seedRetiredAttemptReceipt(harness, request, documentId) {
+  harness.sessionStore[
+    `onstarvoice.unattendedAttemptRetired.v1.${request.id}.${request.attemptId}`
+  ] = {
+    v: 1,
+    requestId: request.id,
+    attemptId: request.attemptId,
+    documentId,
+    tabId: Number(request.runnerTabId) || null,
+    at: new Date().toISOString(),
+    reason: "attempt_superseded",
+    heartbeatStopped: true,
+    flushed: true,
+    pendingUploads: 0,
+  };
 }
 
 async function launchDeferredUnattendedRecovery(harness) {
@@ -11196,21 +11253,37 @@ test("stalled list capture recovery cancels the old lock holder before replaceme
   });
 
   assert.equal(acquired.ok, true);
+  // 旧 runner 文档已不在；来源页 73 的内容脚本空闲。
+  harness.setContextMode("gone");
   const result = await harness.api.recoverUnattendedKeywordRunRequest(request, {
     healthy: false,
     reason: "business_progress_stalled",
   });
 
-  assert.equal(result.deferred, true);
+  assert.equal(result.deferred, true, JSON.stringify(result));
+  assert.equal(result.reason, "recovery_wait");
+  // 0.4.19：自停只做只读查询与带 id 的取消，不发全页取消、不刷新。
   assert.ok(
     harness.sentTabMessages.some(
-      ({tabId, payload}) => tabId === 73 && payload?.action === "cancelCapture",
+      ({tabId, payload}) =>
+        tabId === 73 && payload?.action === "inspectCaptureActivity",
     ),
   );
-  assert.notEqual(
-    harness.storage[UNATTENDED_REQUEST_KEY].attemptId,
-    request.attemptId,
+  assert.equal(
+    harness.sentTabMessages.some(
+      ({payload}) =>
+        payload?.action === "cancelCapture" && !payload?.captureRequestId,
+    ),
+    false,
   );
+  assert.deepEqual(harness.reloadedTabIds, []);
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  const recovering = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.notEqual(recovering.attemptId, request.attemptId);
+  assert.equal(recovering.status, "recovering");
+  assert.equal(recovering.recoverySelfStop.fromAttemptId, request.attemptId);
+  assert.equal(recovering.recoverySelfStop.done.lockReleased, true);
+  assert.equal(recovering.progress.phase, "waiting_automatic_recovery");
   assert.equal(harness.createdTabs.length, 0);
   const launched = await launchDeferredUnattendedRecovery(harness);
   assert.equal(launched.recovered, true, JSON.stringify(launched));
@@ -11242,16 +11315,46 @@ test("automatic recovery never launches a replacement when the old capture canno
     throw new Error("reload failed");
   });
 
+  harness.setContextMode("gone");
+
   const result = await harness.api.recoverUnattendedKeywordRunRequest(request, {
     healthy: false,
     reason: "business_progress_stalled",
   });
 
+  // 0.4.19：第一次证明不成立时留在 recovering 里重试（刷新心跳），不写围栏。
   assert.equal(result.recovered, false);
-  assert.equal(result.reason, "previous_capture_stop_unconfirmed");
-  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
+  assert.equal(result.deferred, true, JSON.stringify(result));
+  assert.equal(result.reason, "recovery_self_stop_pending");
+  assert.equal(result.selfStopReason, "probe_failed");
+  let current = harness.storage[UNATTENDED_REQUEST_KEY];
+  assert.equal(current.status, "recovering");
+  assert.equal(current.recoverySelfStop.tries, 1);
+  assert.equal(current.recoverySelfStop.lastReason, "probe_failed");
+  assert.equal(current.progress.phase, "recovery_self_stop");
+  assert.equal(harness.storage[LOCK_KEY].allowReload, false);
+  assert.equal(harness.storage[LOCK_KEY].selfStopRequestId, request.id);
+
+  let last = result;
+  for (let attempt = 2; attempt <= 5; attempt += 1) {
+    last = await launchDeferredUnattendedRecovery(harness);
+    current = harness.storage[UNATTENDED_REQUEST_KEY];
+    if (attempt < 5) {
+      assert.equal(current.status, "recovering", `attempt ${attempt}`);
+      assert.equal(current.recoverySelfStop.tries, attempt);
+    }
+  }
+
+  // 用尽之后才写 needs_action，并带原因；替代轮次从未启动，锁保留且不许刷新。
+  assert.equal(last.recovered, false);
+  assert.equal(last.reason, "previous_capture_stop_unconfirmed");
+  assert.equal(current.status, "needs_action");
+  assert.equal(current.error.code, "PREVIOUS_CAPTURE_STOP_UNCONFIRMED");
+  assert.equal(current.error.reason, "self_stop:probe_failed");
   assert.equal(harness.storage[LOCK_KEY].holderTabId, 74);
+  assert.equal(harness.storage[LOCK_KEY].allowReload, false);
   assert.equal(harness.createdTabs.length, 0);
+  assert.deepEqual(harness.reloadedTabIds, []);
 });
 
 test("closing the active runner triggers recovery through tabs.onRemoved", async () => {
@@ -15522,6 +15625,7 @@ test("unattended recovery releases the previous child Debug group before relaunc
     harness.storage[LOCK_KEY].captureTaskId,
     "unattended-child-attempt-1",
   );
+  seedRetiredAttemptReceipt(harness, request, "runner-document-1");
 
   const recovery = await harness.api.recoverUnattendedKeywordRunRequest(
     request,
@@ -15585,6 +15689,8 @@ test("an unattended sidebar owner disconnect recovers the parent request instead
     platform: "xiaohongshu",
   });
   assert.equal(begun.ok, true);
+  // 侧栏 owner 断开：运行页文档已不在。
+  harness.setContextMode("gone");
 
   await harness.api.handleAbandonedCaptureTask({
     taskId: "unattended-child-owner-disconnected",
@@ -15728,6 +15834,7 @@ test("closing an active unattended source tab recovers the root request without 
     buildUnattendedRunnerSender(request, lock.lock.holderDocumentId),
   );
   assert.equal(begun.ok, true, JSON.stringify(begun));
+  seedRetiredAttemptReceipt(harness, request, lock.lock.holderDocumentId);
 
   await harness.api.handleCaptureRuntimeTabRemoved(41);
 
@@ -15966,6 +16073,7 @@ test("a late END from the recovered unattended attempt cannot stop the replaceme
     ),
   );
   assert.equal(firstBegin.ok, true, JSON.stringify(firstBegin));
+  seedRetiredAttemptReceipt(harness, request, firstLock.lock.holderDocumentId);
 
   const recovery = await harness.api.recoverUnattendedKeywordRunRequest(
     request,

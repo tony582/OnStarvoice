@@ -116,8 +116,14 @@ test("a runner retires as soon as its request moves to a new attempt", async () 
   assert.equal(runner.calls.heartbeatStops, 1);
   assert.equal(runner.context.activeCaptureExecutionLockId, "");
   assert.equal(runner.context.adoptedUnattendedCaptureExecutionLockId, "");
-  assert.equal(runner.calls.messages.length, 1);
-  const [receipt] = runner.calls.messages;
+  // 冲刷前先报“冲刷中”（心跳已停，后台据此保留本页），冲刷后再报结果。
+  assert.equal(runner.calls.messages.length, 2);
+  const [flushing, receipt] = runner.calls.messages;
+  assert.equal(flushing.type, "onstarvoice:unattended-attempt-retired");
+  assert.equal(flushing.heartbeatStopped, true);
+  assert.equal(flushing.flushing, true);
+  assert.equal(flushing.flushed, false);
+  assert.equal(flushing.pendingUploads, 1);
   assert.equal(receipt.type, "onstarvoice:unattended-attempt-retired");
   assert.equal(receipt.heartbeatStopped, true);
   assert.equal(receipt.flushed, true);
@@ -129,7 +135,16 @@ test("a runner retires as soon as its request moves to a new attempt", async () 
   // 单飞：同一轮次再看到换代不会重复退役。
   runner.context.__handle({id: "request-r", attemptId: "attempt-3", status: "recovering"});
   await settle();
+  assert.equal(runner.calls.messages.length, 2);
+});
+
+test("a runner without an upload queue retires with a single flushed receipt", async () => {
+  const runner = createRunner({queue: null});
+  runner.context.__handle({id: "request-r", attemptId: "attempt-2", status: "recovering"});
+  await settle();
   assert.equal(runner.calls.messages.length, 1);
+  assert.equal(runner.calls.messages[0].flushed, true);
+  assert.equal(runner.calls.messages[0].pendingUploads, 0);
 });
 
 test("a stuck upload queue is bounded and the receipt reports what was left", async () => {
@@ -140,7 +155,9 @@ test("a stuck upload queue is bounded and the receipt reports what was left", as
   runner.context.__handle({id: "request-r", attemptId: "attempt-2", status: "recovering"});
   await new Promise((resolve) => setTimeout(resolve, 60));
   await settle();
-  const [receipt] = runner.calls.messages;
+  const receipt = runner.calls.messages.at(-1);
+  assert.equal(runner.calls.messages.length, 2);
+  assert.equal(receipt.flushing, undefined);
   assert.equal(receipt.flushed, false);
   assert.equal(receipt.pendingUploads, 4);
 });

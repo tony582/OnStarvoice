@@ -2222,7 +2222,7 @@ test("the overall deadline reports checked and unresolved pages as check_timeout
 
 // ==================== 围栏证据、加载标识、中继登记 ====================
 
-test("the automatic-recovery fence records which pages failed without changing the 0.4.15 outcome", async () => {
+test("the automatic-recovery fence records which pages failed and why, after bounded self-stop retries", async () => {
   const harness = createHarness();
   seedRuntimeEpoch(harness);
   const request = seedFencedRequest(harness, {
@@ -2245,17 +2245,32 @@ test("the automatic-recovery fence records which pages failed without changing t
     throw new Error("reload failed");
   };
 
-  const result = await harness.api.recoverUnattendedKeywordRunRequest(request, {
+  let result = await harness.api.recoverUnattendedKeywordRunRequest(request, {
     healthy: false,
     reason: "business_progress_stalled",
   });
 
+  // 0.4.19：证明不成立时先留在 recovering 里有限次重试，用尽才写围栏。
+  assert.equal(result.reason, "recovery_self_stop_pending");
+  assert.equal(harness.storage[REQUEST_KEY].status, "recovering");
+  for (let attempt = 2; attempt <= 5; attempt += 1) {
+    harness.storage[REQUEST_KEY] = {
+      ...harness.storage[REQUEST_KEY],
+      recoveryWaitUntil: new Date(Date.now() - 1000).toISOString(),
+    };
+    result = await harness.context.launchPendingUnattendedRecovery(
+      harness.storage[REQUEST_KEY],
+    );
+  }
   assert.equal(result.reason, "previous_capture_stop_unconfirmed");
   const stored = harness.storage[REQUEST_KEY];
   assert.equal(stored.status, "needs_action");
   assert.equal(stored.error.code, "PREVIOUS_CAPTURE_STOP_UNCONFIRMED");
+  assert.equal(stored.error.reason, "self_stop:probe_failed");
   assert.equal(stored.previousAttemptId, "attempt-1");
   assert.equal(harness.storage[LOCK_KEY].id, "lock-r", "lock kept as in 0.4.15");
+  assert.equal(harness.storage[LOCK_KEY].allowReload, false);
+  assert.deepEqual(harness.forbiddenTabCalls.reload, []);
   const evidence = plain(stored.stopFenceEvidence);
   assert.equal(evidence.version, 1);
   assert.equal(evidence.runtimeEpochId, "epoch-current");
@@ -2268,7 +2283,7 @@ test("the automatic-recovery fence records which pages failed without changing t
     [[74, "progress_tab"]],
   );
   assert.equal(evidence.failedTabId, 74);
-  assert.ok(evidence.failedReason);
+  assert.equal(evidence.failedReason, "self_stop:probe_failed");
 });
 
 test("the pending-recovery and runner-refresh fences also record evidence", async () => {
@@ -2328,6 +2343,8 @@ test("the pending-recovery and runner-refresh fences also record evidence", asyn
     [[91, "lock_holder"]],
   );
   assert.equal(refresh.storage[REQUEST_KEY].error.code, "PREVIOUS_CAPTURE_STOP_UNCONFIRMED");
+  assert.match(refresh.storage[REQUEST_KEY].error.reason, /^resume_stop:/u);
+  assert.equal(pending.storage[REQUEST_KEY].error.reason, "self_stop:probe_failed");
 });
 
 test("the runtime epoch is created once per load and only its creator may label the origin", async () => {

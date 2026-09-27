@@ -3174,10 +3174,36 @@ async function retireSupersededUnattendedAttempt({
   stopCaptureExecutionLockHeartbeat();
   activeCaptureExecutionLockId = "";
   adoptedUnattendedCaptureExecutionLockId = "";
-  // 3. 在上限内冲刷流式上传队列（取消后它只等正在上传的那一条）。
   let flushed = true;
   let pendingUploads = 0;
+  const sendReceipt = async (receipt) => {
+    for (const delayMs of [0, 500, 2000]) {
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      try {
+        const response = await chrome.runtime.sendMessage({
+          type: "onstarvoice:unattended-attempt-retired",
+          reason,
+          heartbeatStopped: true,
+          ...receipt,
+        });
+        if (response?.ok) return true;
+      } catch (error) {
+        console.warn("[Sidebar] Unattended retirement receipt not delivered:", error);
+      }
+    }
+    return false;
+  };
+  // 3. 在上限内冲刷流式上传队列（取消后它只等正在上传的那一条）。心跳已停、
+  //    编排已取消，所以冲刷前先报一次“冲刷中”的回执：后台据此保留本页，不会
+  //    在冲刷途中把它当作卡死的 runner 关掉。
   if (queue?.enabled && beforeStats) {
+    await sendReceipt({
+      flushed: false,
+      flushing: true,
+      pendingUploads: Math.max(0, Number(beforeStats.remainingCount || 0)),
+    });
     const afterStats = await Promise.race([
       queue.drain().catch(() => queue.getStats()),
       new Promise((resolve) =>
@@ -3197,24 +3223,7 @@ async function retireSupersededUnattendedAttempt({
     flushed = Boolean(afterStats) && pendingUploads === 0;
   }
   // 4. 退役回执：后台从 sender 取请求、轮次、文档与标签页，写进 storage.session。
-  for (const delayMs of [0, 500, 2000]) {
-    if (delayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-    try {
-      const response = await chrome.runtime.sendMessage({
-        type: "onstarvoice:unattended-attempt-retired",
-        reason,
-        heartbeatStopped: true,
-        flushed,
-        pendingUploads,
-      });
-      if (response?.ok) return true;
-    } catch (error) {
-      console.warn("[Sidebar] Unattended retirement receipt not delivered:", error);
-    }
-  }
-  return false;
+  return await sendReceipt({flushed, pendingUploads});
 }
 
 async function handleSaveKeywordPlan(scope = "modal") {
