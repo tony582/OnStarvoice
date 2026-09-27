@@ -792,6 +792,8 @@ export function normalizeCloudTaskSnapshot(input = {}) {
   // snapshot (including the first insert and later heartbeat mirrors).
   delete metadata.historyClearedAt;
   delete metadata.historyClearedBy;
+  // So does the operator's 「结束并移到历史」 marker (operatorClose).
+  delete metadata.operatorClose;
   // Local closure has exactly one authoritative top-level channel. Metadata
   // aliases are removed before strictly normalized single/array reports are
   // promoted. The legacy object remains supported for rolling upgrades.

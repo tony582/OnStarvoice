@@ -1,8 +1,12 @@
+import {operatorClosedTask} from '../capture-operator-close.js';
+
 const terminal=new Set(['completed','completed_with_warnings','completed_with_failures','failed','needs_action','canceled','skipped','superseded']);
 
 // Targeted legacy patrols identify an existing record. Discovery deliberately
 // has no input recordId; success is proved by the record-store receipt instead.
 export async function projectDiscoveryTaskResult(tx,{tenantId,task,snapshot={}}) {
+  // An operator ended this row (「结束并移到历史」): a late snapshot must not reopen it.
+  if (operatorClosedTask(task)) return null;
   const status=String(snapshot.status||task.status||'');
   if (!terminal.has(status)) return null;
   const candidate=await tx.queryOne(`SELECT candidate.*,item.id AS item_id,item.attempt_count,item.assignment_revision,

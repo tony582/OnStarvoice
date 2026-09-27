@@ -110,6 +110,16 @@ import {
   settleElasticFilterVerification,
   settleElasticFilterVerificationBatch,
 } from '../services/capture-elastic-policy.js';
+import {
+  OPERATOR_CLOSE_LOCK_TIMEOUT_MS,
+  OPERATOR_CLOSE_REASON_MESSAGES,
+  OPERATOR_CLOSE_SUCCESS_MESSAGE,
+  closeOperatorAttentionRoot,
+  loadOperatorCloseEligibility,
+  normalizeOperatorCloseTaskIds,
+  operatorClosedTask,
+  operatorClosedTaskSql,
+} from '../services/capture-operator-close.js';
 
 function requireCaptureAgent(req, res, next) {
   return authenticateCaptureAgent(req, res, error => {
@@ -4135,7 +4145,7 @@ function orchestrationItemAttemptStatus(itemStatus) {
 async function lockOrchestrationParent(tx, tenantId, parentTaskId) {
   return tx.queryOne(`
     SELECT id, title, status, progress, metadata, feature_key,
-      orchestration_revision,
+      orchestration_revision, attempt_number,
       orchestration_schedule_id, scheduled_for
     FROM capture_tasks
     WHERE id = $1 AND tenant_id = $2
@@ -4197,7 +4207,8 @@ async function adoptLocalOrchestrationRecovery(
   }
   if (!sourceCandidate?.parent_task_id) return task;
   const sourceTask = await tx.queryOne(`
-    SELECT id, parent_task_id, assigned_agent_id, status, metadata
+    SELECT id, parent_task_id, assigned_agent_id, status, metadata,
+      attempt_number, orchestration_revision
     FROM capture_tasks
     WHERE id = $1 AND tenant_id = $2 AND parent_task_id = $3
     FOR UPDATE
@@ -4241,6 +4252,10 @@ async function adoptLocalOrchestrationRecovery(
   ) {
     return task;
   }
+  // An operator ended this batch or source (「结束并移到历史」): adopting its
+  // failed items would leave dispatched work under a terminal parent that no
+  // projection settles any more.
+  if (operatorClosedTask(parent) || operatorClosedTask(sourceTask)) return task;
 
   const authoritativeItemIds = new Set(
     (Array.isArray(sourceMetadata.itemIds) ? sourceMetadata.itemIds : [])
@@ -6685,6 +6700,16 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
   });
 }
 
+// F3 (docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md): a row the
+// operator closed stays failed while the SAME execution repeats needs_action
+// or failed. A stop-fence report, interrupted (slot-blocking), completed or a
+// new execution goes through the normal CASE and reopens the row; a reopened
+// root also leaves history so its fence or interruption is seen again.
+const OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL = `(${operatorClosedTaskSql('capture_tasks')}
+          AND capture_tasks.metadata->'operatorClose'->>'attemptNumber' = EXCLUDED.attempt_number::text
+          AND EXCLUDED.status IN ('needs_action', 'failed', 'completed_with_failures')
+          AND UPPER(COALESCE(EXCLUDED.error->>'code', '')) <> 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED')`;
+
 export async function mirrorTaskSnapshot(
   tx,
   agent,
@@ -6698,6 +6723,8 @@ export async function mirrorTaskSnapshot(
   delete agentSnapshotMetadata.perItemAdmissionV1;
   delete agentSnapshotMetadata.historyClearedAt;
   delete agentSnapshotMetadata.historyClearedBy;
+  // Server-owned operator close marker: a device can neither mint nor erase it.
+  delete agentSnapshotMetadata.operatorClose;
   delete agentSnapshotMetadata.itemAttempts;
   delete agentSnapshotMetadata.attemptIdentity;
   delete agentSnapshotMetadata.localRecoveryClientAttemptId;
@@ -6778,6 +6805,8 @@ export async function mirrorTaskSnapshot(
       source = EXCLUDED.source,
       trigger_type = EXCLUDED.trigger_type,
       status = CASE
+        WHEN ${OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL}
+          THEN capture_tasks.status
         WHEN capture_tasks.status = 'superseded'
           THEN capture_tasks.status
         WHEN capture_tasks.status = 'failed'
@@ -6813,7 +6842,8 @@ export async function mirrorTaskSnapshot(
         )
         || jsonb_strip_nulls(jsonb_build_object(
           'historyClearedAt', capture_tasks.metadata->'historyClearedAt',
-          'historyClearedBy', capture_tasks.metadata->'historyClearedBy'
+          'historyClearedBy', capture_tasks.metadata->'historyClearedBy',
+          'operatorClose', capture_tasks.metadata->'operatorClose'
         ))
         || CASE
           WHEN capture_tasks.status = 'resume_requested'
@@ -6903,7 +6933,20 @@ export async function mirrorTaskSnapshot(
           ELSE '{}'::jsonb
         END,
       error = EXCLUDED.error,
-      message = EXCLUDED.message,
+      message = CASE
+        WHEN ${OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL}
+          THEN capture_tasks.message
+        ELSE EXCLUDED.message
+      END,
+      -- A closed root that this snapshot reopens returns to 需处理 instead of
+      -- hiding a fence, an interruption or a new execution in history.
+      attention_dismissed_at = CASE
+        WHEN capture_tasks.parent_task_id IS NULL
+          AND ${operatorClosedTaskSql('capture_tasks')}
+          AND NOT ${OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL}
+          THEN NULL
+        ELSE capture_tasks.attention_dismissed_at
+      END,
       attempt_number = GREATEST(capture_tasks.attempt_number, EXCLUDED.attempt_number),
       progress_seq = CASE
         WHEN EXCLUDED.attempt_number > capture_tasks.attempt_number
@@ -11035,6 +11078,20 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             AND COALESCE(t.metadata->>'draft', 'false') = 'true'
           )
       `, [req.tenantId]);
+        // 「结束并移到历史」 eligibility for this page's attention roots only:
+        // one recursive statement over their subtrees, no fence SQL.
+        const attentionRootIds = tasks
+          .filter(task => !task.parent_task_id
+            && ['needs_action', 'interrupted'].includes(task.status)
+            && !task.attention_dismissed_at)
+          .map(task => task.id);
+        const operatorClose = attentionRootIds.length > 0
+          ? await loadOperatorCloseEligibility(tx, req.tenantId, attentionRootIds)
+          : new Map();
+        const tasksWithOperatorClose = tasks.map(task => {
+          const eligibility = operatorClose.get(String(task.id).toLowerCase());
+          return eligibility ? {...task, operator_close: eligibility} : task;
+        });
         const scheduleTemplates = await loadCaptureScheduleTemplates(tx, req.tenantId);
         // Why an idle-looking node gets no work: one tenant-scoped listing
         // from the same fence SQL admission uses, summarized per node. Each
@@ -11048,7 +11105,7 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
             now: Date.now(),
             autoCheckEnabled: stopFenceAutoCheckEnabled(),
           }),
-          tasks: [...scheduleTemplates, ...tasks],
+          tasks: [...scheduleTemplates, ...tasksWithOperatorClose],
           taskSummary,
         };
       }, {
@@ -13203,6 +13260,103 @@ router.post('/tasks/dismiss-terminal-attention', requireTenantAccess, requireSes
       message: dismissedCount > 0
         ? `已将 ${dismissedCount} 个结束的失败任务移到历史`
         : '当前没有可清理的结束失败任务',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// 「结束并移到历史」 (docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md
+// F3): one transaction per root, so one busy root never rolls back another.
+async function operatorCloseRoot(req, taskId, mode) {
+  try {
+    return await withTransaction(tx => closeOperatorAttentionRoot(tx, {
+      tenantId: req.tenantId,
+      rootId: taskId,
+      mode,
+      actor: {userId: req.user?.id || '', name: req.actorName},
+      refreshOrchestrationParent: refreshOrchestrationParentTask,
+    }), {
+      category: 'critical',
+      lockTimeoutMs: OPERATOR_CLOSE_LOCK_TIMEOUT_MS,
+      statementTimeoutMs: 15_000,
+    });
+  } catch (err) {
+    if (['55P03', '40P01'].includes(err?.code)) return {error: 'task_busy'};
+    if (err?.code === 'OPERATOR_CLOSE_NOT_TERMINAL') {
+      return {error: 'task_not_closeable', reason: 'live_item'};
+    }
+    throw err;
+  }
+}
+
+const OPERATOR_CLOSE_ERROR_MESSAGES = Object.freeze({
+  task_not_found: '任务不存在或无权访问',
+  task_not_root: OPERATOR_CLOSE_REASON_MESSAGES.not_root,
+  task_busy: '任务正在被其它操作更新，请稍后重试',
+});
+
+function operatorCloseSkipReason(result) {
+  if (result.error === 'task_not_found') return 'not_found';
+  if (result.error === 'task_not_root') return 'not_root';
+  if (result.error === 'task_busy') return 'task_busy';
+  return text(result.reason, 80) || 'status_not_closeable';
+}
+
+router.post('/tasks/:id/operator-close', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const taskId = text(req.params.id, 100).toLowerCase();
+    const result = UUID_PATTERN.test(taskId)
+      ? await operatorCloseRoot(req, taskId, 'single')
+      : {error: 'task_not_found'};
+    if (result.error) {
+      return res.status(result.error === 'task_not_found' ? 404 : 409).json({
+        ok: false,
+        error: result.error,
+        ...(result.reason ? {reason: result.reason} : {}),
+        message: OPERATOR_CLOSE_ERROR_MESSAGES[result.error]
+          || OPERATOR_CLOSE_REASON_MESSAGES[result.reason]
+          || OPERATOR_CLOSE_REASON_MESSAGES.status_not_closeable,
+      });
+    }
+    clearCaptureOverviewProjectionCache();
+    return res.json({
+      ok: true,
+      task: {
+        id: result.task.id,
+        status: result.task.status,
+        attention_dismissed_at: result.task.attention_dismissed_at,
+      },
+      idempotent: result.idempotent === true,
+      message: result.idempotent ? '任务已经结束并在历史中' : OPERATOR_CLOSE_SUCCESS_MESSAGE,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.post('/tasks/operator-close', requireTenantAccess, requireSessionUser, requireTenantWriter, async (req, res, next) => {
+  try {
+    const taskIds = normalizeOperatorCloseTaskIds(req.body?.taskIds);
+    if (!taskIds) {
+      return res.status(400).json({ok: false, error: 'invalid_task_ids', message: '请选择 1 至 100 个有效的任务'});
+    }
+    const closedTaskIds = [];
+    const alreadyClosedTaskIds = [];
+    const skipped = [];
+    for (const taskId of taskIds) {
+      const result = await operatorCloseRoot(req, taskId, 'bulk');
+      if (result.error) skipped.push({taskId, reason: operatorCloseSkipReason(result)});
+      else if (result.idempotent) alreadyClosedTaskIds.push(taskId);
+      else closedTaskIds.push(taskId);
+    }
+    if (closedTaskIds.length + alreadyClosedTaskIds.length > 0) clearCaptureOverviewProjectionCache();
+    return res.json({
+      ok: true,
+      closedTaskIds,
+      alreadyClosedTaskIds,
+      skipped,
+      message: `已结束 ${closedTaskIds.length} 个任务并移到历史${skipped.length > 0 ? `；${skipped.length} 个未处理` : ''}`,
     });
   } catch (err) {
     return next(err);
@@ -16509,14 +16663,17 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
       ) {
         return { error: 'task_stop_fence_operator_release_required', task };
       }
+      // 「结束并移到历史」 ended this task (or its batch) without re-capture.
+      if (operatorClosedTask(task)) return { error: 'task_operator_closed', task };
 
       let allowedKeywords = [];
       if (task.parent_task_id) {
         const parent = await tx.queryOne(`
-          SELECT id, metadata
+          SELECT id, status, metadata, attempt_number, orchestration_revision
           FROM capture_tasks
           WHERE id = $1 AND tenant_id = $2
         `, [task.parent_task_id, req.tenantId]);
+        if (operatorClosedTask(parent)) return { error: 'task_operator_closed', task };
         const parentMetadata = safeJson(parent?.metadata);
         if (parentMetadata.distributionMode === 'elastic_pool') {
           const releasedSafetyAttempts = await tx.queryAll(`
@@ -16816,6 +16973,10 @@ router.post('/tasks/:id/resume', requireTenantAccess, requireSessionUser, requir
       task_stop_fence_operator_release_required: [
         'task_stop_fence_operator_release_required',
         '该任务的旧采集页面未确认停止，节点本机无法继续；请到该电脑检查后，在「执行节点」点「确认旧页面已停止」，未完成关键词会交回批次',
+      ],
+      task_operator_closed: [
+        'task_operator_closed',
+        '该任务已结束并移到历史，不能继续；需要重采请在批次里「重试失败关键词」或重新下发',
       ],
     };
     if (result.error) {

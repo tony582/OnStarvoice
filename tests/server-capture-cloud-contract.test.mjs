@@ -75,6 +75,7 @@ import {
   resolveStopCommandOutcome,
   supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
+import {operatorClosedTaskSql as operatorClosedTaskSqlForContract} from "../server/services/capture-operator-close.js";
 
 const captureCloudRouteSource = await readFile(
   new URL("../server/routes/capture-cloud.js", import.meta.url),
@@ -5305,3 +5306,97 @@ test("重试失败关键词 opens a new time-filter window and releases a settle
   assert.match(routes, /WHEN error->>'automaticRetryStopped' = 'true' THEN\s+\(error - \$9::text\[\]\)/u);
   assert.match(routes, /FILTER_VERIFICATION_SETTLEMENT_KEYS,\s+\]\);/u);
 });
+
+// docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md F3/F3b
+test("「结束并移到历史」 is writer-only, fence-free and cannot be undone by a late device report", async () => {
+  const single = readRouteSection(
+    "router.post('/tasks/:id/operator-close'",
+    "router.post('/tasks/operator-close'",
+  );
+  const bulk = readRouteSection(
+    "router.post('/tasks/operator-close'",
+    "function promotedRetryKeywordItemKey",
+  );
+  for (const route of [single, bulk]) {
+    assert.match(route, /requireTenantAccess, requireSessionUser, requireTenantWriter/u);
+    assert.match(route, /operatorCloseRoot\(req, taskId, '(single|bulk)'\)/u);
+    assert.match(route, /clearCaptureOverviewProjectionCache\(\)/u);
+    assert.doesNotMatch(route, /captureTaskUnconfirmedLocalStopSql|findCaptureAgentExecutionSlotBlocker|\bDELETE\b/u);
+  }
+  assert.match(captureCloudRouteSource,
+    /async function operatorCloseRoot[\s\S]*?lockTimeoutMs: OPERATOR_CLOSE_LOCK_TIMEOUT_MS[\s\S]*?\['55P03', '40P01'\][\s\S]*?task_busy/u);
+  assert.match(captureCloudRouteSource,
+    /refreshOrchestrationParent: refreshOrchestrationParentTask/u,
+    "the orchestration root is re-aggregated by the route projector, never forced to failed");
+
+  const service = await readFile(
+    new URL("../server/services/capture-operator-close.js", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(service, /from ['"]\.\.\/routes\//u, "services never import routes");
+  assert.ok(!/from ['"]\.\/capture-cloud\.js['"]/u.test(service) &&
+    !/captureTaskUnconfirmedLocalStopSql\(|findCaptureAgentExecutionSlotBlocker\(|INSERT INTO capture_agent_commands/u.test(service),
+  "eligibility never runs the admission fence SQL and closing sends no command");
+  assert.ok(!/UPDATE capture_discovery|UPDATE unattended_negative_patrol_state/u.test(service),
+    "candidates, demands and the negative patrol rotation are left alone");
+  assert.match(service, /assignment_revision = assignment_revision \+ 1/u);
+  assert.match(service, /- 'attemptId' - 'leaseId'/u);
+
+  const overview = readRouteSection("router.get('/overview'", "router.patch('/agents/:id'");
+  assert.match(overview, /\['needs_action', 'interrupted'\]\.includes\(task\.status\)[\s\S]*?!task\.attention_dismissed_at/u);
+  assert.match(overview, /await loadOperatorCloseEligibility\(tx, req\.tenantId, attentionRootIds\)/u);
+  assert.match(overview, /operator_close: eligibility/u);
+
+  const mirror = readRouteSection("export async function mirrorTaskSnapshot", "router.post('/agent/heartbeat'");
+  assert.match(mirror, /delete agentSnapshotMetadata\.operatorClose;/u);
+  assert.match(mirror, /'operatorClose', capture_tasks\.metadata->'operatorClose'/u);
+  const statusCase = mirror.slice(mirror.indexOf('status = CASE'), mirror.indexOf('progress = EXCLUDED.progress'));
+  assert.ok(statusCase.indexOf('OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL') > -1 &&
+    statusCase.indexOf('OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL') < statusCase.indexOf("capture_tasks.status = 'superseded'"),
+  'the hold branch is the first status branch, before ELSE');
+  assert.match(mirror, /attention_dismissed_at = CASE\s+WHEN capture_tasks\.parent_task_id IS NULL[\s\S]*?AND NOT \$\{OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL\}\s+THEN NULL/u);
+  const hold = captureCloudRouteSource.slice(
+    captureCloudRouteSource.indexOf('const OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL'),
+    captureCloudRouteSource.indexOf('export async function mirrorTaskSnapshot'),
+  );
+  assert.match(hold, /operatorClosedTaskSql\('capture_tasks'\)/u);
+  assert.match(hold, /->>'attemptNumber' = EXCLUDED\.attempt_number::text/u);
+  assert.match(hold, /EXCLUDED\.status IN \('needs_action', 'failed', 'completed_with_failures'\)/u);
+  assert.match(hold, /UPPER\(COALESCE\(EXCLUDED\.error->>'code', ''\)\) <> 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'/u);
+  assert.doesNotMatch(hold, /interrupted/u, "an interrupted report is slot-blocking and must be mirrored");
+  assert.match(operatorClosedTaskSqlSource(), /capture_tasks\.status IN \('failed', 'completed_with_failures'\)/u);
+
+  const snapshot = normalizeCloudTaskSnapshot({id: 'late', status: 'failed',
+    metadata: {operatorClose: {closedAt: 'forged'}, keep: 'yes'}});
+  assert.equal(snapshot.metadata.operatorClose, undefined);
+  assert.equal(snapshot.metadata.keep, 'yes');
+
+  const adoption = readRouteSection("async function adoptLocalOrchestrationRecovery", "export async function refreshOrchestrationParentTask");
+  assert.match(adoption, /if \(operatorClosedTask\(parent\) \|\| operatorClosedTask\(sourceTask\)\) return task;/u);
+  assert.match(adoption, /attempt_number, orchestration_revision\s+FROM capture_tasks/u);
+  const resume = readRouteSection("router.post('/tasks/:id/resume'", "router.post('/tasks/:id/stop'");
+  assert.match(resume, /if \(operatorClosedTask\(task\)\) return \{ error: 'task_operator_closed', task \};/u);
+  assert.match(resume, /SELECT id, status, metadata, attempt_number, orchestration_revision[\s\S]*?if \(operatorClosedTask\(parent\)\) return \{ error: 'task_operator_closed', task \};/u);
+  assert.ok(resume.indexOf("error: 'task_operator_closed'") < resume.indexOf('releasedSafetyAttempts'),
+    "a closed task is refused before any safety hold is released");
+  assert.match(resume, /已结束并移到历史，不能继续/u);
+  assert.match(captureCloudRouteSource,
+    /async function lockOrchestrationParent[\s\S]*?orchestration_revision, attempt_number,/u);
+});
+
+test("history clear reports unclearable rows instead of failing the whole selection", () => {
+  const clear = readRouteSection("router.post('/history/clear'", "router.get('/overview'");
+  for (const reason of ['not_found', 'not_root', 'not_in_history', 'live_work']) {
+    assert.match(clear, new RegExp(`reason: '${reason}'`, 'u'));
+  }
+  assert.match(clear, /SELECT DISTINCT tree\.root_id/u);
+  assert.match(clear, /status\(notFound \? 404 : 409\)/u);
+  assert.match(clear, /skipped: result\.skipped/u);
+  assert.match(clear, /已移出 \$\{clearedCount\} 条；\$\{result\.skipped\.length\} 条未移出/u);
+  assert.match(clear, /'historyClearedAt', now\(\), 'historyClearedBy', \$3::text/u);
+  assert.doesNotMatch(clear, /\bDELETE\b/u);
+});
+
+function operatorClosedTaskSqlSource() {
+  return String(operatorClosedTaskSqlForContract('capture_tasks'));
+}
