@@ -3090,6 +3090,9 @@ function handleUnattendedRunRequestStorageChange(request) {
   if (maybeRetireSupersededUnattendedAttempt(request)) {
     return;
   }
+  if (maybeRetireTerminatedUnattendedAttempt(request)) {
+    return;
+  }
   if (
     activeUnattendedRunRequestId &&
     (String(request.id || "").trim() !== activeUnattendedRunRequestId ||
@@ -3145,6 +3148,35 @@ function maybeRetireSupersededUnattendedAttempt(request) {
     reason: "attempt_superseded",
   }).catch((error) => {
     console.warn("[Sidebar] Retire superseded unattended attempt failed:", error);
+  });
+  return true;
+}
+
+// 后台监督把请求判为终态（自动恢复用尽、安全页阻断）时写 runnerRetireAttemptId：
+// 这一轮的 runner 同样立即退役（停锁心跳、冲刷上传、写回执），后台的终态自停
+// 据此释放锁，不必关掉一个还活着的 runner。runner 自己写的终态不带这个字段，
+// 正常收尾流程不受影响。
+function maybeRetireTerminatedUnattendedAttempt(request) {
+  const requestId = String(request?.id || "").trim();
+  const requestAttemptId = String(request?.attemptId || "").trim();
+  const retireAttemptId = String(request?.runnerRetireAttemptId || "").trim();
+  const ownAttemptId = resolveOwnUnattendedAttemptId();
+  if (
+    !requestId ||
+    !ownAttemptId ||
+    retireAttemptId !== ownAttemptId ||
+    requestAttemptId !== ownAttemptId ||
+    !["failed", "needs_action"].includes(String(request?.status || "")) ||
+    (activeUnattendedRunRequestId && activeUnattendedRunRequestId !== requestId)
+  ) {
+    return false;
+  }
+  void retireSupersededUnattendedAttempt({
+    requestId,
+    attemptId: ownAttemptId,
+    reason: "request_terminal",
+  }).catch((error) => {
+    console.warn("[Sidebar] Retire terminated unattended attempt failed:", error);
   });
   return true;
 }

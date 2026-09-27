@@ -10650,22 +10650,57 @@ function isStopFenceLockBoundToRequest(lock, ctx) {
   );
 }
 
+// 判定范围里的任务 key：R 自己的，以及启动点里锁所属的旧请求（0.4.19）。
+function listStopFenceScopeTaskKeys(ctx) {
+  return [
+    ctx.taskKey,
+    ...(Array.isArray(ctx.sourceRequestIds) ? ctx.sourceRequestIds : []).map(
+      (requestId) => buildUnattendedCaptureTaskId(requestId),
+    ),
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+}
+
+// 判定范围里的在途中继：R 名下的，以及启动点里锁所属旧请求名下的。
+function listStopFenceScopeRelays(ctx) {
+  const relays = listRequestRelays(ctx.requestId, ctx.taskKey);
+  const sourceRequestIds = Array.isArray(ctx.sourceRequestIds)
+    ? ctx.sourceRequestIds
+    : [];
+  if (sourceRequestIds.length === 0) return relays;
+  const seen = new Set(relays);
+  for (const sourceRequestId of sourceRequestIds) {
+    for (const relay of listRequestRelays(
+      sourceRequestId,
+      buildUnattendedCaptureTaskId(sourceRequestId),
+    )) {
+      if (!seen.has(relay)) {
+        seen.add(relay);
+        relays.push(relay);
+      }
+    }
+  }
+  return relays;
+}
+
 // R 的已知采集 id：本机进度、围栏证据、Debug 会话进度，以及登记表里 R 名下
 // 在途中继的 id。后者每次判定都实时重算。
 function collectStopFenceRequestCaptureIds(ctx) {
-  const debugSession = captureDebugSessionManager?.getSessionByTaskId(
-    ctx.taskKey,
-  );
   const ids = new Set(
     [
       ctx.request?.progress?.captureRequestId,
       ctx.fence?.captureRequestId,
-      debugSession?.progress?.captureRequestId,
+      ...listStopFenceScopeTaskKeys(ctx).map(
+        (taskKey) =>
+          captureDebugSessionManager?.getSessionByTaskId(taskKey)?.progress
+            ?.captureRequestId,
+      ),
     ]
       .map((value) => String(value || '').trim())
       .filter(Boolean),
   );
-  for (const relay of listRequestRelays(ctx.requestId, ctx.taskKey)) {
+  for (const relay of listStopFenceScopeRelays(ctx)) {
     if (relay.captureRequestId) ids.add(relay.captureRequestId);
   }
   // 自停意图里持久记下的 id（worker 重启后内存里的中继登记已丢失）。
@@ -10690,30 +10725,30 @@ function collectStopFenceAttributedTabs(ctx) {
   if (ctx.boundToR) push(ctx.lock?.holderTabId, 'lock_holder');
   push(ctx.request?.progress?.runnerTabId, 'progress_tab');
   push(ctx.request?.runnerTabId, 'runner');
-  const debugSession = captureDebugSessionManager?.getSessionByTaskId(
-    ctx.taskKey,
-  );
-  if (debugSession) {
-    push(debugSession.sourceTabId || debugSession.tabId, 'debug_source');
-    for (const tabId of Array.isArray(debugSession.workerTabIds)
-      ? debugSession.workerTabIds
-      : []) {
+  for (const taskKey of listStopFenceScopeTaskKeys(ctx)) {
+    const debugSession = captureDebugSessionManager?.getSessionByTaskId(taskKey);
+    if (debugSession) {
+      push(debugSession.sourceTabId || debugSession.tabId, 'debug_source');
+      for (const tabId of Array.isArray(debugSession.workerTabIds)
+        ? debugSession.workerTabIds
+        : []) {
+        push(tabId, 'group_worker');
+      }
+    }
+    const group = captureTaskTabGroupManager?.getTask(taskKey);
+    if (group) {
+      push(group.sourceTabId, 'group_source');
+      for (const tabId of Array.isArray(group.workerTabIds)
+        ? group.workerTabIds
+        : []) {
+        push(tabId, 'group_worker');
+      }
+    }
+    for (const tabId of getTrackedCaptureTaskWorkers(taskKey)) {
       push(tabId, 'group_worker');
     }
   }
-  const group = captureTaskTabGroupManager?.getTask(ctx.taskKey);
-  if (group) {
-    push(group.sourceTabId, 'group_source');
-    for (const tabId of Array.isArray(group.workerTabIds)
-      ? group.workerTabIds
-      : []) {
-      push(tabId, 'group_worker');
-    }
-  }
-  for (const tabId of getTrackedCaptureTaskWorkers(ctx.taskKey)) {
-    push(tabId, 'group_worker');
-  }
-  for (const relay of listRequestRelays(ctx.requestId, ctx.taskKey)) {
+  for (const relay of listStopFenceScopeRelays(ctx)) {
     push(relay.tabId, 'relay_target');
   }
   return attributed;
@@ -11188,7 +11223,7 @@ async function waitForStopFenceRequestRelaysToDrain(ctx) {
     ctx.deadlineAt,
   );
   for (;;) {
-    const remaining = listRequestRelays(ctx.requestId, ctx.taskKey).length;
+    const remaining = listStopFenceScopeRelays(ctx).length;
     if (remaining === 0 || Date.now() >= until) return remaining;
     await stopFenceSleep(STOP_FENCE_CHECK_TIMING.relayPollMs);
   }
@@ -11931,6 +11966,19 @@ function createRecoverySelfStopContext(request, intent, epoch, mode) {
   const legacyRunnerTabIds = new Set(
     [intent?.runnerTabId].map((tabId) => resolveCaptureTaskTabId(tabId)).filter(Boolean),
   );
+  // 启动点（launch）：锁可能还属于派生出 R 的旧请求（人工继续会换新请求 id）。
+  // 那些请求已不在请求槽里，它们的 runner 永远不会再看到换代，按“R 的旧轮次”
+  // 一并处理：读它们自己的退役回执、算它们的中继，未退役的在限时等待后关闭。
+  const sourceRequestIds =
+    mode === 'launch' && Array.isArray(intent?.sourceRequestIds)
+      ? [
+          ...new Set(
+            intent.sourceRequestIds
+              .map((value) => String(value || '').trim())
+              .filter((value) => value && value !== requestId),
+          ),
+        ].slice(0, 3)
+      : [];
   const ctx = {
     selfStop: true,
     mode,
@@ -11939,6 +11987,7 @@ function createRecoverySelfStopContext(request, intent, epoch, mode) {
     serverTaskId: '',
     requestId,
     taskKey: buildUnattendedCaptureTaskId(requestId),
+    sourceRequestIds,
     currentAttemptId,
     // 归因用：只归到进度页（采集所在的平台页）。旧 runner 按 URL 认，不按记录
     // 的标签页 id 认。
@@ -11977,16 +12026,23 @@ function createRecoverySelfStopContext(request, intent, epoch, mode) {
     scopedCancelSent: false,
     closedRunnerTabIds: new Set(),
   };
+  const isSourceRequestRunnerTab = (tab) =>
+    Boolean(stopFenceRunnerAttemptId(tab)) &&
+    sourceRequestIds.some((sourceRequestId) =>
+      isUnattendedRunnerTabForRequest(tab, sourceRequestId, ''),
+    );
   ctx.isRequestRunnerTab = (tab) =>
     isUnattendedRunnerTabForRequest(tab, requestId, '') ||
-    isLegacyUnattendedRunnerTabForRequest(tab, requestId);
+    isLegacyUnattendedRunnerTabForRequest(tab, requestId) ||
+    isSourceRequestRunnerTab(tab);
   ctx.isCurrentAttemptRunnerTab = (tab) =>
     Boolean(
       currentAttemptId &&
         isUnattendedRunnerTabForRequest(tab, requestId, currentAttemptId),
     );
   // 可关的旧 runner：URL 同时带 R 和一个不是当前轮次的轮次 id；没有轮次参数
-  // 的旧版 runner 必须是意图里记下的那个标签页。
+  // 的旧版 runner 必须是意图里记下的那个标签页；启动点另加派生出 R 的旧请求
+  // 的 runner（带轮次参数）。
   ctx.isClosableRunnerTab = (tab) =>
     !ctx.isCurrentAttemptRunnerTab(tab) &&
     (
@@ -11997,9 +12053,39 @@ function createRecoverySelfStopContext(request, intent, epoch, mode) {
       (
         isLegacyUnattendedRunnerTabForRequest(tab, requestId) &&
         legacyRunnerTabIds.has(resolveCaptureTaskTabId(tab?.id))
-      )
+      ) ||
+      isSourceRequestRunnerTab(tab)
     );
   return ctx;
+}
+
+// 启动点的锁可能属于哪些旧请求：锁绑定的稳定任务 id、自停标记，以及派生出
+// R 的父请求（BEGIN 之前的锁没有任务 id）。去掉 R 自己；这些请求都不在请求槽
+// 里，不会再有正当工作。
+function resolveSelfStopLockSourceRequestIds(request, lock) {
+  const requestId = String(request?.id || '').trim();
+  return [
+    ...new Set(
+      [
+        parseStableUnattendedCaptureTaskId(lock?.captureTaskId).requestId,
+        String(lock?.selfStopRequestId || '').trim(),
+        String(request?.parentRequestId || '').trim(),
+      ].filter((candidate) => candidate && candidate !== requestId),
+    ),
+  ];
+}
+
+// runner 页 URL 里的请求 id（没有时空串）。
+function stopFenceRunnerRequestId(tab) {
+  try {
+    return String(
+      new URL(String(tab?.url || '')).searchParams.get(
+        UNATTENDED_RUNNER_QUERY_KEY,
+      ) || '',
+    ).trim();
+  } catch {
+    return '';
+  }
 }
 
 // 第 0 步：把绑定 R 的执行锁原样写回并加上“不许刷新”。之后无论自停中途失败、
@@ -12156,12 +12242,17 @@ async function closeOwnedDetailWorkersForSelfStop(
   return {ok: true, closedTabIds, skippedTabIds};
 }
 
-// 第 4 步：旧 runner 只判断、不在这里关。有退役回执的留着（R 终态后由已有流程
-// 关）；第一次尝试最多等 15 秒回执；从第二次尝试起仍没有回执就标成待关闭，在
-// 第 5 步的锁操作里关。终态与 launch 模式只尝试一次，不关 runner。
+// 第 4 步：旧 runner 只判断、不在这里关。有退役回执的留着（第 5 步之后回执
+// 已是最终回执的当场关，还在冲刷的等它的最终回执到了再关）；最多等 15 秒回执。
+// 自动恢复第一次尝试仍没有回执就失败、下次再试；从第二次尝试起，以及只试一次
+// 的终态（R 已终态，它的 runner 不会再有正当工作）和启动点（旧请求已不在请求
+// 槽里，它的 runner 永远看不到换代），仍没有回执的标成待关闭，在第 5 步的锁
+// 操作里关。
 async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
   const runners = runnerPending.map(({tabId, tab}) => ({
     tabId,
+    // 回执按 runner 自己 URL 上的请求读（启动点的旧请求不是 R）。
+    requestId: stopFenceRunnerRequestId(tab) || ctx.requestId,
     attemptId: stopFenceRunnerAttemptId(tab) || String(
       [...ctx.terminalAttemptIds][0] || '',
     ),
@@ -12171,7 +12262,7 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
     for (const runner of runners) {
       if (!runner.receipt) {
         runner.receipt = await readUnattendedAttemptRetiredReceipt(
-          ctx.requestId,
+          runner.requestId,
           runner.attemptId,
         );
       }
@@ -12179,7 +12270,8 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
     return runners.every((runner) => runner.receipt);
   };
   let allRetired = await readReceipts();
-  if (!allRetired && ctx.mode === 'recovery' && tryIndex === 0) {
+  const waitForReceipts = ctx.mode !== 'recovery' || tryIndex === 0;
+  if (!allRetired && waitForReceipts) {
     const until = Date.now() + UNATTENDED_RECOVERY_SELF_STOP_TIMING.firstRetireWaitMs;
     while (!allRetired && Date.now() < until) {
       await stopFenceSleep(UNATTENDED_RECOVERY_SELF_STOP_TIMING.retirePollMs);
@@ -12202,7 +12294,7 @@ async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
   if (unretired.length === 0) {
     return {ok: true, retained, receipts, pendingClose: []};
   }
-  if (ctx.mode !== 'recovery' || tryIndex === 0) {
+  if (ctx.mode === 'recovery' && tryIndex === 0) {
     return {
       ok: false,
       reason: 'runner_not_retired',
@@ -12242,6 +12334,46 @@ async function closeSelfStopPendingRunners(ctx, pendingClose) {
     ctx.closedRunnerTabIds.add(runner.tabId);
   }
   return {ok: true, closedTabIds};
+}
+
+// 第 5 步之后：已退役、回执已是最终回执（不再冲刷）的旧 runner 当场关掉。只关
+// 扩展为这些旧轮次建的 runner 页（URL 同时带它的请求与轮次），关后 5 秒内
+// tabs.get 报不存在才算。还在冲刷的留着，等它的最终回执到了再关（见
+// closeRetiredUnattendedRunnerAfterReceipt）。尽力而为：关不掉不影响已成立的
+// 证明，退役的 runner 已停心跳，也发不出采集中继。
+async function closeRetiredSelfStopRunners(ctx, runnerPlan) {
+  const closedTabIds = [];
+  for (const runner of runnerPlan?.retained || []) {
+    const receipt = await readUnattendedAttemptRetiredReceipt(
+      runner.requestId,
+      runner.attemptId,
+    );
+    if (!receipt || receipt.flushing === true) continue;
+    let tab;
+    try {
+      tab = await chrome.tabs.get(runner.tabId);
+    } catch {
+      continue;
+    }
+    if (
+      !ctx.isClosableRunnerTab(tab) ||
+      !isUnattendedRunnerTabForRequest(tab, runner.requestId, runner.attemptId)
+    ) {
+      continue;
+    }
+    try {
+      await chrome.tabs.remove(runner.tabId);
+    } catch {
+      // 以 tabs.get 的结果为准。
+    }
+    const gone = await waitForTabToBeGone(
+      runner.tabId,
+      UNATTENDED_RECOVERY_SELF_STOP_TIMING.closeConfirmMs,
+      UNATTENDED_RECOVERY_SELF_STOP_TIMING.closePollMs,
+    );
+    if (gone) closedTabIds.push(runner.tabId);
+  }
+  return closedTabIds;
 }
 
 async function isCaptureExecutionLockHolderAlive(lock) {
@@ -12374,11 +12506,18 @@ async function attemptUnattendedRecoverySelfStop(request, intent, {
     if (relayInFlightCount > 0) {
       return fail('relays_not_drained', {sweep, workers, relayInFlightCount});
     }
-    const commit = await runUnattendedRunnerTabLifecycle(() =>
-      runCaptureExecutionLockOperation(() =>
+    const commit = await runUnattendedRunnerTabLifecycle(async () => {
+      const committed = await runCaptureExecutionLockOperation(() =>
         commitRecoverySelfStop(ctx, runnerPlan),
-      ),
-    );
+      );
+      if (committed.ok) {
+        committed.retiredRunnersClosed = await closeRetiredSelfStopRunners(
+          ctx,
+          runnerPlan,
+        ).catch(() => []);
+      }
+      return committed;
+    });
     if (!commit.ok) return fail(commit.reason, {sweep, workers, commit});
     await releaseUnattendedCaptureTaskResourcesForRecovery(
       commit.lock || {captureTaskId: ctx.taskKey},
@@ -12409,6 +12548,7 @@ async function attemptUnattendedRecoverySelfStop(request, intent, {
         runnerClosed: commit.runnersClosed.length > 0,
         runnerClosedWithoutReceipt: commit.runnersClosed.length > 0,
         runnersRetained: runnerPlan.retained.length,
+        retiredRunnersClosed: (commit.retiredRunnersClosed || []).length,
         pendingUploads,
         lockReleased: commit.lockReleased === true,
         durationMs: Date.now() - startedAt,
@@ -12728,6 +12868,9 @@ async function runOneShotUnattendedSelfStop(request, lock, {mode}) {
       ].filter(Boolean),
       progressTabId: resolveCaptureTaskTabId(request?.progress?.runnerTabId),
       runnerTabId: resolveCaptureTaskTabId(request?.runnerTabId),
+      // 启动点：锁可能还属于派生出 R 的旧请求（人工继续换了新请求 id）。
+      sourceRequestIds:
+        mode === 'launch' ? resolveSelfStopLockSourceRequestIds(request, lock) : [],
       startedAt: new Date().toISOString(),
       tries: 0,
       lastReason: '',
@@ -12739,6 +12882,60 @@ async function runOneShotUnattendedSelfStop(request, lock, {mode}) {
   } finally {
     recoverySelfStopInFlight.delete(requestId);
   }
+}
+
+// 终态自停的补试（0.4.19）：终态转换那次自停没成立时，R 已终态、没有围栏码，
+// 执行锁带着 R 的自停标记留着（不许刷新，读锁路径也不会释放它）。监督闹钟看到
+// 这种状态就按 3 分钟节奏再试一次同样的终态自停，直到证明成立（释放锁、关掉
+// R 的 runner），或锁已转交给新的领取者（标记随之去掉）。带围栏码的 needs_action
+// 由节点核对与运营放行处理，这里不碰。节奏记在 storage.session，worker 重启
+// 不会让它变密。
+const TERMINAL_SELF_STOP_RETRY_SESSION_KEY = 'onstarvoice.terminalSelfStopRetry.v1';
+const TERMINAL_SELF_STOP_RETRY_INTERVAL_MS = 3 * 60 * 1000;
+
+async function maybeRetryTerminalUnattendedSelfStop(request) {
+  const requestId = String(request?.id || '').trim();
+  if (
+    !requestId ||
+    !isTerminalUnattendedRunStatus(request?.status) ||
+    isStopFenceBlockedNeedsAction(request) ||
+    recoverySelfStopInFlight.has(requestId)
+  ) {
+    return null;
+  }
+  const lock = await readStoredCaptureExecutionLock().catch(() => null);
+  if (
+    !lock ||
+    String(lock.owner || '') !== 'unattended_keyword_plan' ||
+    lock.allowReload !== false ||
+    lock.selfStopRequestId !== requestId
+  ) {
+    return null;
+  }
+  const last = await readExtensionSessionValue(
+    TERMINAL_SELF_STOP_RETRY_SESSION_KEY,
+  ).catch(() => null);
+  const lastAt = Number(last?.at);
+  if (
+    last?.requestId === requestId &&
+    Number.isFinite(lastAt) &&
+    Date.now() - lastAt < TERMINAL_SELF_STOP_RETRY_INTERVAL_MS
+  ) {
+    return {deferred: true, reason: 'terminal_self_stop_retry_wait'};
+  }
+  await writeExtensionSessionValue(TERMINAL_SELF_STOP_RETRY_SESSION_KEY, {
+    requestId,
+    at: Date.now(),
+  }).catch(() => {});
+  // 成立时自停本身已按精确身份删锁并释放标签组与 Debug 会话。
+  const result = await runOneShotUnattendedSelfStop(request, lock, {
+    mode: 'terminal',
+  });
+  return {
+    retried: true,
+    ok: result?.ok === true,
+    reason: result?.ok ? 'terminal_self_stop_done' : describeRecoverySelfStopFailure(result),
+  };
 }
 
 async function executeStopFenceCheckOffer(offer) {
@@ -16220,6 +16417,9 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
       const nextRequest = {
         ...current,
         status: 'needs_action',
+        // 0.4.19：请这一轮的 runner 退役（停锁心跳、冲刷上传、写回执），终态
+        // 自停据此不必关掉一个还活着的 runner。
+        runnerRetireAttemptId: current.attemptId,
         finishedAt: now,
         updatedAt: now,
         message: blockReason,
@@ -16261,6 +16461,7 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
       const nextRequest = {
         ...current,
         status: cloudAssigned ? 'failed' : 'needs_action',
+        runnerRetireAttemptId: current.attemptId,
         finishedAt: now,
         updatedAt: now,
         message,
@@ -16365,8 +16566,9 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
     return {recovered: false, reason: 'fenced', request: transition.request};
   }
   if (transition.action === 'terminal') {
-    // 终态转换只自停一次：成功就释放锁和资源；失败保持原来的行为（请求已是
-    // 终态，不写围栏、不重试），锁带着“不许刷新”的标记留给已有收尾流程。
+    // 终态转换当场自停一次（等 runner 退役回执，没有回执的在证明后关掉）：成功
+    // 就释放锁和资源。失败时请求仍是终态、不写围栏；锁带着“不许刷新”的标记
+    // 留着，监督闹钟每 3 分钟再试同样的终态自停（maybeRetryTerminalUnattendedSelfStop）。
     const terminalStop = await runOneShotUnattendedSelfStop(
       transition.request,
       oldUnattendedLock,
@@ -17063,6 +17265,10 @@ async function manuallyRecoverUnattendedKeywordRun({
     delete nextRequest.localClosureEvidence;
     delete nextRequest.localClosureEvidences;
     delete nextRequest.localClosureStopConfirmation;
+    // 自停意图与退役请求只属于旧请求的轮次：新请求不继承（否则会接着旧请求
+    // 已用尽的自停预算，也会按新请求 id 去找旧 runner 的退役回执）。
+    delete nextRequest.recoverySelfStop;
+    delete nextRequest.runnerRetireAttemptId;
     await persistUnattendedRunMutation(nextRequest, {
       event: {
         type: 'manual_recovery',
@@ -17193,7 +17399,17 @@ async function superviseUnattendedKeywordRun({
     let request = await readUnattendedKeywordRunRequest();
     if (!request || isTerminalUnattendedRunStatus(request.status)) {
       lastUnattendedSupervisorTickAt = nowMs;
-      return {healthy: true, reason: 'no_active_request'};
+      const terminalRetry = request
+        ? await maybeRetryTerminalUnattendedSelfStop(request).catch((error) => {
+            console.warn('[SelfStop] terminal retry failed:', error);
+            return null;
+          })
+        : null;
+      return {
+        healthy: true,
+        reason: 'no_active_request',
+        ...(terminalRetry ? {terminalSelfStop: terminalRetry} : {}),
+      };
     }
     const previousSupervisorTickAt = lastUnattendedSupervisorTickAt;
     const supervisorGap = previousSupervisorTickAt
@@ -19444,7 +19660,78 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
     buildUnattendedAttemptRetiredKey(requestId, attemptId),
     receipt,
   );
+  if (receipt.heartbeatStopped && !receipt.flushing) {
+    // 先回复 runner，再关它的页（关页后回复送不到）。
+    setTimeout(() => {
+      closeRetiredUnattendedRunnerAfterReceipt(receipt).catch((error) => {
+        console.warn('[SelfStop] retired runner not closed:', error);
+      });
+    }, 0);
+  }
   return {ok: true};
+}
+
+// 最终退役回执（不再冲刷）到达后，关掉发回执的那个旧 runner 页。只在以下都
+// 成立时关：它的轮次已不是请求槽里正在跑的轮次（换代或已终态）；执行锁不由
+// 它的文档持有（持有时留给自停第 5 步，它会在按精确身份删锁后再关）；页面仍
+// 是这个请求、这个轮次的 runner。与第 5 步同样在 runner 生命周期与锁队列里
+// 执行。尽力而为。
+async function closeRetiredUnattendedRunnerAfterReceipt(receipt) {
+  if (!receipt || receipt.flushing === true) {
+    return {closed: false, reason: 'receipt_not_final'};
+  }
+  const tabId = resolveCaptureTaskTabId(receipt.tabId);
+  const documentId = String(receipt.documentId || '').trim();
+  if (!tabId || !documentId) return {closed: false, reason: 'receipt_incomplete'};
+  return await runUnattendedRunnerTabLifecycle(() =>
+    runCaptureExecutionLockOperation(async () => {
+      const stored = await chrome.storage.local.get(
+        STORAGE_KEYS.captureExecutionLock,
+      );
+      const lock = normalizeCaptureExecutionLock(
+        stored?.[STORAGE_KEYS.captureExecutionLock],
+        {allowExpired: true},
+      );
+      if (lock && String(lock.holderDocumentId || '').trim() === documentId) {
+        return {closed: false, reason: 'lock_holder'};
+      }
+      const slot = await readUnattendedKeywordRunRequest();
+      if (
+        slot &&
+        slot.id === receipt.requestId &&
+        slot.attemptId === receipt.attemptId &&
+        !isTerminalUnattendedRunStatus(slot.status)
+      ) {
+        return {closed: false, reason: 'attempt_current'};
+      }
+      let tab;
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch {
+        return {closed: false, reason: 'tab_missing'};
+      }
+      if (
+        !isUnattendedRunnerTabForRequest(
+          tab,
+          receipt.requestId,
+          receipt.attemptId,
+        )
+      ) {
+        return {closed: false, reason: 'not_runner'};
+      }
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch {
+        // 以 tabs.get 的结果为准。
+      }
+      const gone = await waitForTabToBeGone(
+        tabId,
+        UNATTENDED_RECOVERY_SELF_STOP_TIMING.closeConfirmMs,
+        UNATTENDED_RECOVERY_SELF_STOP_TIMING.closePollMs,
+      );
+      return {closed: gone, reason: gone ? 'retired_runner_closed' : 'close_failed'};
+    }),
+  );
 }
 
 async function readUnattendedAttemptRetiredReceipt(requestId, attemptId) {

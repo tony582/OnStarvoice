@@ -177,6 +177,47 @@ test("the same attempt, another request or a legacy runner without an attempt do
   }
 });
 
+test("a runner retires when the supervisor ends its request and asks this attempt to retire", async () => {
+  for (const status of ["failed", "needs_action"]) {
+    const runner = createRunner({queue: null});
+    runner.context.__handle({
+      id: "request-r",
+      attemptId: "attempt-1",
+      status,
+      runnerRetireAttemptId: "attempt-1",
+    });
+    await settle();
+    assert.deepEqual(runner.calls.cancelFlags, [true], status);
+    assert.deepEqual(runner.calls.rejected, ["request_terminal"], status);
+    assert.equal(runner.calls.heartbeatStops, 1, status);
+    assert.equal(runner.context.activeCaptureExecutionLockId, "", status);
+    assert.equal(runner.calls.messages.length, 1, status);
+    const [receipt] = runner.calls.messages;
+    assert.equal(receipt.type, "onstarvoice:unattended-attempt-retired");
+    assert.equal(receipt.reason, "request_terminal");
+    assert.equal(receipt.heartbeatStopped, true);
+    assert.equal(receipt.flushed, true);
+  }
+});
+
+test("a terminal status without the supervisor's retire request (or for another attempt) keeps the runner's own finish", async () => {
+  const cases = [
+    {id: "request-r", attemptId: "attempt-1", status: "failed"},
+    {id: "request-r", attemptId: "attempt-1", status: "completed", runnerRetireAttemptId: "attempt-1"},
+    {id: "request-r", attemptId: "attempt-1", status: "running", runnerRetireAttemptId: "attempt-1"},
+    {id: "request-r", attemptId: "attempt-1", status: "failed", runnerRetireAttemptId: "attempt-0"},
+    {id: "request-other", attemptId: "attempt-1", status: "failed", runnerRetireAttemptId: "attempt-1"},
+  ];
+  for (const request of cases) {
+    const runner = createRunner();
+    runner.context.__handle(request);
+    await settle();
+    assert.deepEqual(runner.calls.messages, [], JSON.stringify(request));
+    assert.equal(runner.calls.heartbeatStops, 0, JSON.stringify(request));
+    assert.equal(runner.context.activeCaptureExecutionLockId, "lock-r");
+  }
+});
+
 test("an explicit cancel of the current attempt keeps its existing handling", async () => {
   const runner = createRunner();
   runner.context.__handle({
