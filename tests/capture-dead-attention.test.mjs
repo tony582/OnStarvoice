@@ -123,6 +123,9 @@ test('the candidate query is cheap, index-shaped and never the admission fence S
   assert.match(DEAD_ATTENTION_CANDIDATE_SQL, /UPPER\(COALESCE\(t\.error->>'code', ''\)\) <> 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'/u);
   assert.match(DEAD_ATTENTION_CANDIDATE_SQL, /\(t\.updated_at, t\.id\) > \(\$2::timestamptz, \$3::uuid\)/u);
   assert.match(DEAD_ATTENTION_CANDIDATE_SQL, /ORDER BY t\.updated_at, t\.id\s+LIMIT \$4/u);
+  assert.match(DEAD_ATTENTION_CANDIDATE_SQL,
+    /to_char\(t\.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS\.US"Z"'\) AS cursor_updated_at/u,
+    'the cursor keeps microseconds');
   assert.equal(DEAD_ATTENTION_CANDIDATE_SQL.includes('confirmed_stops'), false);
   assert.equal(DEAD_ATTENTION_CANDIDATE_SQL.includes(captureTaskUnconfirmedLocalStopSql('t')), false);
   assert.ok(DEAD_ATTENTION_SAFETY_CODES.includes('LOGIN_REQUIRED'));
@@ -150,6 +153,25 @@ test('tree flags are one statement keyed by root and bound to the shared constan
 
 test('the sweep is off with the switch and refuses to run without the parent projector', async () => {
   assert.deepEqual(await sweepDeadAttentionRoots({env: {CAPTURE_DEAD_ATTENTION_SWEEP: 'off'}}),
-    {tenants: 0, scanned: 0, settled: 0, skipped: 0, busy: 0, kinds: {}, disabled: true});
+    {tenants: 0, scanned: 0, settled: 0, skipped: 0, busy: 0, failed: 0, kinds: {}, disabled: true});
   await assert.rejects(sweepDeadAttentionRoots({env: {}, tenantIds: []}), /orchestration_parent_projector_required/u);
+});
+
+test('one failing tenant or root never stops the sweep', async () => {
+  const tenantA = '11111111-1111-4111-8111-111111111111';
+  const tenantB = '22222222-2222-4222-8222-222222222222';
+  const errors = [];
+  const result = await sweepDeadAttentionRoots({
+    env: {}, tenantIds: [tenantA, tenantB], refreshOrchestrationParent: async () => {},
+    logger: {log() {}, error: (...args) => errors.push(args.join(' '))},
+    withTransaction: async (callback) => callback({
+      queryAll: async (sql, params) => {
+        if (params[0] === tenantA) throw Object.assign(new Error('boom'), {code: '57014'});
+        return [];
+      },
+    }),
+  });
+  assert.equal(result.tenants, 2);
+  assert.equal(result.failed, 1);
+  assert.match(errors[0], /candidate read failed tenant=11111111/u);
 });

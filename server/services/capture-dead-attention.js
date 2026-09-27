@@ -134,7 +134,11 @@ function manualMarkSql(column, safety, categories) {
 // shortest grace, after the cursor. Uses idx_capture_tasks_tenant_status_updated.
 export const DEAD_ATTENTION_CANDIDATE_SQL = `
   SELECT t.id, t.task_type, t.platform, t.status, t.parent_task_id, t.updated_at,
-    t.metadata, t.error
+    t.metadata, t.error,
+    -- The cursor keeps PostgreSQL's microseconds: rows written by one
+    -- statement share one updated_at, and a millisecond cursor would read
+    -- the same page again forever.
+    to_char(t.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_updated_at
   FROM capture_tasks t
   WHERE t.tenant_id = $1
     AND t.status = 'needs_action'
@@ -307,6 +311,14 @@ function lockBusy(error) {
   return ['55P03', '40P01'].includes(error?.code) || error?.code === 'OPERATOR_CLOSE_NOT_TERMINAL';
 }
 
+function logError(logger, message, error) {
+  try {
+    logger?.error?.(message, error?.code || '', error?.message || error);
+  } catch {
+    // A custom logger never stops the sweep.
+  }
+}
+
 /**
  * One sweep over every active tenant (or the given ones). The candidate
  * read is one short read-only transaction per tenant (candidates, F3
@@ -324,7 +336,7 @@ export async function sweepDeadAttentionRoots({
   logger = console,
   env = process.env,
 } = {}) {
-  const summary = {tenants: 0, scanned: 0, settled: 0, skipped: 0, busy: 0, kinds: {}};
+  const summary = {tenants: 0, scanned: 0, settled: 0, skipped: 0, busy: 0, failed: 0, kinds: {}};
   if (!deadAttentionSweepEnabled(env)) return {...summary, disabled: true};
   if (typeof refreshOrchestrationParent !== 'function') {
     throw new TypeError('orchestration_parent_projector_required');
@@ -338,24 +350,32 @@ export async function sweepDeadAttentionRoots({
     if (!UUID.test(tenantId)) continue;
     summary.tenants += 1;
     const cursor = cursors.get(tenantId) || null;
-    const page = await withTransaction(async tx => {
-      const rows = await tx.queryAll(DEAD_ATTENTION_CANDIDATE_SQL, [
-        tenantId, cursor?.updatedAt || null, cursor?.id || null, pageLimit,
-        DEAD_ATTENTION_SAFETY_CODES, SAFETY_CATEGORIES, DEAD_ATTENTION_MIN_AGE_MS,
-      ]);
-      if (rows.length === 0) return {rows, eligibility: new Map(), flags: new Map()};
-      const ids = rows.map(row => row.id);
-      return {
-        rows,
-        eligibility: await loadOperatorCloseEligibility(tx, tenantId, ids),
-        flags: await loadDeadAttentionTreeFlags(tx, tenantId, ids),
-      };
-    }, {readOnly: true, statementTimeoutMs: 10_000});
+    let page;
+    try {
+      page = await withTransaction(async tx => {
+        const rows = await tx.queryAll(DEAD_ATTENTION_CANDIDATE_SQL, [
+          tenantId, cursor?.updatedAt || null, cursor?.id || null, pageLimit,
+          DEAD_ATTENTION_SAFETY_CODES, SAFETY_CATEGORIES, DEAD_ATTENTION_MIN_AGE_MS,
+        ]);
+        if (rows.length === 0) return {rows, eligibility: new Map(), flags: new Map()};
+        const ids = rows.map(row => row.id);
+        return {
+          rows,
+          eligibility: await loadOperatorCloseEligibility(tx, tenantId, ids),
+          flags: await loadDeadAttentionTreeFlags(tx, tenantId, ids),
+        };
+      }, {readOnly: true, statementTimeoutMs: 10_000});
+    } catch (error) {
+      // One tenant never stops the others; the next round reads it again.
+      summary.failed += 1;
+      logError(logger, `[dead-attention] candidate read failed tenant=${tenantId}:`, error);
+      continue;
+    }
     const {rows} = page;
     if (rows.length < pageLimit) cursors.delete(tenantId);
     else {
       const last = rows[rows.length - 1];
-      cursors.set(tenantId, {updatedAt: new Date(toMs(last.updated_at)).toISOString(), id: last.id});
+      cursors.set(tenantId, {updatedAt: last.cursor_updated_at, id: last.id});
     }
     summary.scanned += rows.length;
     for (const row of rows) {
@@ -387,8 +407,12 @@ export async function sweepDeadAttentionRoots({
           },
         }), {lockTimeoutMs: DEAD_ATTENTION_LOCK_TIMEOUT_MS, statementTimeoutMs: 15_000});
       } catch (error) {
-        if (!lockBusy(error)) throw error;
-        summary.busy += 1;
+        if (lockBusy(error)) summary.busy += 1;
+        else {
+          // Rolled back; one root never stops the sweep.
+          summary.failed += 1;
+          logError(logger, `[dead-attention] settle failed task=${id} tenant=${tenantId}:`, error);
+        }
         continue;
       }
       if (result?.error || result?.idempotent) {

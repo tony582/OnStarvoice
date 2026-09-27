@@ -364,10 +364,15 @@ test('dead 需处理 roots settle automatically through the operator-close path'
   await t.test('the cursor reaches a settleable root behind a full page of permanent ones, without the fence SQL', async st => {
     const f = await fixture(st);
     const browser = await f.addAgent('西瓜', {platforms: ['douyin']});
+    const permanent = [];
     for (let index = 0; index < 60; index += 1) {
-      await f.discovered(browser, {code: 'detail_finished_without_ingestion', reportedStatus: 'needs_action'},
-        3 * HOUR + index * 1000);
+      permanent.push((await f.discovered(browser,
+        {code: 'detail_finished_without_ingestion', reportedStatus: 'needs_action'}, 3 * HOUR)).id);
     }
+    // One statement: all 60 share one updated_at, with microseconds. A
+    // millisecond cursor would read the same first page forever.
+    await query(`UPDATE capture_tasks SET updated_at = now() - interval '3 hours' - interval '123 microseconds'
+      WHERE id = ANY($1::uuid[])`, [permanent]);
     const target = await f.manualBatch(await f.addAgent('木星'), {age: 2 * HOUR});
     const statements = [];
     const spyQueryAll = (sql, params) => { statements.push(sql); return poolQueryAll(sql, params); };
