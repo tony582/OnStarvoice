@@ -11,6 +11,14 @@ const FINISHED = new Set(['completed', 'completed_with_warnings', 'completed_wit
 const SETTLED_ITEMS = new Set(['completed', 'completed_with_warnings', 'failed', 'skipped', 'canceled']);
 const RESPONSE_MS = 3 * 60 * 1000;
 const PROGRESS_MS = 10 * 60 * 1000;
+// docs/hotfix/20260927-unattended-self-heal.md (S2-srv): Extension 0.4.19
+// proves its old page stopped inside `recovering` for up to eight minutes
+// (phase recovery_self_stop), refreshing the heartbeat on every try. Revoking
+// the child meanwhile would drop the fence code it may report next, so allow
+// the self-stop budget plus the usual three minutes. Progress keeps its own
+// limit, counted from the recovery transition.
+export const KEYWORD_COVERAGE_SELF_STOP_RESPONSE_MS = 11 * 60 * 1000;
+const COMMENT_STAGE_PROGRESS_MS = 12 * 60 * 1000;
 const object = value => value && typeof value === 'object' ? value : {};
 const timestamp = value => Date.parse(String(value || '')) || 0;
 
@@ -40,16 +48,18 @@ function stalledExecution(child, now) {
   const created = timestamp(child.created_at);
   const started = timestamp(child.started_at);
   const heartbeat = timestamp(child.heartbeat_at);
-  // updated_at can move on empty heartbeats; it is not evidence of progress.
-  if (now - Math.max(created, started, heartbeat) >= RESPONSE_MS) return 'keyword_node_no_response';
-  const progressed = Math.max(created, started, timestamp(child.business_progress_at));
   const progress = object(child.progress);
   const phase = String(progress.phase || '').toLowerCase();
+  const selfStopping = child.status === 'recovering' && phase === 'recovery_self_stop';
+  // updated_at can move on empty heartbeats; it is not evidence of progress.
+  if (now - Math.max(created, started, heartbeat) >=
+      (selfStopping ? KEYWORD_COVERAGE_SELF_STOP_RESPONSE_MS : RESPONSE_MS)) return 'keyword_node_no_response';
+  const progressed = Math.max(created, started, timestamp(child.business_progress_at));
   const commentStage = phase === 'detail_comments_capturing' || phase.startsWith('comments_') ||
     String(progress.captureAction || '').toLowerCase() === 'capturecomments';
   // Comment detail requests can legitimately take ten minutes. Match the
   // Extension's existing twelve-minute allowance for that explicit stage.
-  if (now - progressed >= (commentStage ? 12 * 60 * 1000 : PROGRESS_MS)) return 'keyword_node_no_progress';
+  if (now - progressed >= (commentStage ? COMMENT_STAGE_PROGRESS_MS : PROGRESS_MS)) return 'keyword_node_no_progress';
   return '';
 }
 

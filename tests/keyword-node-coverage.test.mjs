@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  KEYWORD_COVERAGE_SELF_STOP_RESPONSE_MS,
   KEYWORD_COVERAGE_SKIP_MESSAGES,
   keywordCoverageSkipReason,
 } from '../server/services/keyword-node-coverage.js';
@@ -93,4 +94,31 @@ test('a node held by an unconfirmed old-page stop is reported as fenced, not unr
   input.child = null;
   input.agent.last_liveness_at = ago(3);
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_offline');
+});
+
+// docs/hotfix/20260927-unattended-self-heal.md (S2-srv): a recovering child
+// that is proving its old page stopped refreshes its heartbeat on every try
+// for up to eight minutes; it is not an unresponsive node.
+test('a self-stopping recovery child gets the self-stop budget before it counts as unresponsive', () => {
+  assert.equal(KEYWORD_COVERAGE_SELF_STOP_RESPONSE_MS, 11 * 60_000);
+  const input = fixture();
+  input.child = {status: 'recovering', created_at: ago(30), started_at: ago(30), heartbeat_at: ago(10),
+    business_progress_at: ago(9), progress: {phase: 'recovery_self_stop'}};
+  assert.equal(keywordCoverageSkipReason(input, now), '');
+  input.child.heartbeat_at = ago(12);
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_response');
+  // Only the self-stop phase of a recovering child is widened.
+  input.child = {...input.child, heartbeat_at: ago(4), progress: {phase: 'waiting_automatic_recovery'}};
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_response');
+  input.child = {...input.child, status: 'running', progress: {phase: 'recovery_self_stop'}};
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_response');
+  // The progress limit is unchanged: counted from the recovery transition.
+  input.child = {status: 'recovering', created_at: ago(30), started_at: ago(30), heartbeat_at: ago(1),
+    business_progress_at: ago(11), progress: {phase: 'recovery_self_stop'}};
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress');
+  // The same allowance protects sibling keywords of the node.
+  input.child = null;
+  input.nodeTasks = [{status: 'recovering', created_at: ago(30), started_at: ago(30), heartbeat_at: ago(10),
+    business_progress_at: ago(9), progress: {phase: 'recovery_self_stop'}}];
+  assert.equal(keywordCoverageSkipReason(input, now), '');
 });

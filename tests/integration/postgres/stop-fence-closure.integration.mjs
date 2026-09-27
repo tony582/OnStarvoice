@@ -2003,4 +2003,52 @@ test('stop-fence closure asks the source node, releases only on proof or operato
     assert.equal((await f.receipt(0, fresh.checkId, proofBody(fresh))).body.released, true);
   });
 
+  await t.test('S2-srv: coverage keeps a self-stopping recovery child and its later fence reaches the server', async st => {
+    const {reconcileKeywordNodeCoverage} = await import('../../../server/services/keyword-node-coverage.js');
+    const f = await fixture(st, {nodes: 2});
+    async function coverageChild(progress) {
+      const [parent] = await query(`INSERT INTO capture_tasks(tenant_id,client_task_id,task_type,
+        feature_key,platform,status,title,metadata,counts,orchestration_revision,created_at,started_at)
+        VALUES($1,$2,'capture_orchestration','keyword_orchestration','xiaohongshu','running','覆盖批次',$3,
+        '{"total":1}',1,now()-interval '30 minutes',now()-interval '30 minutes') RETURNING *`,
+      [f.tenant.id, randomUUID(), {distributionMode: 'elastic_pool', keywordCoverage: 'each_agent',
+        eligibleAgentIds: f.agents.map(agent => agent.id), publishedAt: past(30),
+        planSnapshot: {...batchPlan, keywords: ['别克哨兵'], keywordCoverage: 'each_agent'}}]);
+      const child = await f.task(f.agents[0], {parent_task_id: parent.id, status: 'recovering', error: {},
+        control_task_id: randomUUID(), finished_at: null, title: '覆盖批次 · 别克哨兵',
+        created_at: past(30), started_at: past(30), updated_at: past(1)});
+      await query(`UPDATE capture_tasks SET progress=$2, heartbeat_at=now()-interval '5 minutes',
+        business_progress_at=now()-interval '6 minutes' WHERE id=$1`, [child.id, progress]);
+      const [item] = await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,item_type,keyword,
+        platform,status,ordinal,metadata,assigned_agent_id,execution_task_id,attempt_count,assignment_revision,
+        started_at) VALUES($1,$2,'keyword:0:别克哨兵','keyword','别克哨兵','xiaohongshu','running',0,$3,$4,$5,1,1,now())
+        RETURNING *`, [f.tenant.id, parent.id, {singleRelayV1: true, searchPasses: ['all'],
+        requireVerifiedFilters: true, pinnedAgentId: f.agents[0].id}, f.agents[0].id, child.id]);
+      return {parent, child, item};
+    }
+    const selfStopping = await coverageChild({phase: 'recovery_self_stop', message: '正在确认旧采集页面已停止（第 2/5 次）'});
+    assert.equal((await reconcileKeywordNodeCoverage({tenantId: f.tenant.id,
+      parentTaskIds: [selfStopping.parent.id]})).skipped, 0);
+    assert.equal((await f.row(selfStopping.child.id)).status, 'recovering', 'not revoked while self-stopping');
+    assert.equal((await itemRow(selfStopping.item.id)).status, 'running');
+    // The self-stop ran out: the node reports the fence, and the server keeps it.
+    await f.heartbeat(0, {tasks: [{...staleSnapshot(selfStopping.child),
+      controlTaskId: selfStopping.child.control_task_id,
+      error: {...STOP_ERROR, reason: 'self_stop:tab_frozen'}}]});
+    const fenced = await f.row(selfStopping.child.id);
+    assert.equal(fenced.status, 'needs_action');
+    assert.equal(fenced.error.code, 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED');
+    assert.equal(fenced.error.reason, 'self_stop:tab_frozen');
+    assert.equal((await f.blocker(0))?.id, selfStopping.child.id, 'admission holds the node');
+    assert.equal((await f.heartbeat(0)).stopFenceChecks[0]?.taskId, selfStopping.child.id,
+      'and S3 asks the node to check it');
+
+    // Control: an ordinary recovering child five minutes silent is revoked.
+    const silent = await coverageChild({phase: 'waiting_automatic_recovery'});
+    assert.equal((await reconcileKeywordNodeCoverage({tenantId: f.tenant.id,
+      parentTaskIds: [silent.parent.id]})).skipped, 1);
+    const revoked = await f.row(silent.child.id);
+    assert.equal(revoked.status, 'superseded');
+  });
+
 });
