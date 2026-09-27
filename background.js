@@ -11974,18 +11974,70 @@ function buildUnattendedRecoverySelfStopIntent(
   };
 }
 
-// mode：recovery（换代后的自动恢复，可重试）、terminal（终态转换，只一次，R 的
-// 所有轮次都算旧轮次）、launch（没有意图的启动点，例如手动恢复，只一次）。
+const UNATTENDED_TERMINAL_SELF_STOP_MESSAGE =
+  '正在确认旧采集页面已停止，确认后结束本次任务';
+
+// 终态转换（安全页阻断、自动恢复用尽）：结局（status、message、error、
+// progress）先记在自停意图里，不直接写。本机台账一旦写入终态就不再接受改动
+// （terminal_absorbed），服务端也就收不到之后的围栏码：旧页面证明不了时，这台
+// 节点被带标记的锁占着、却被服务端当作空闲继续派活，谁也不知道。所以像一次
+// 自动恢复那样先换代（A1 的 runner 看到换代即退役，A1 的中继被轮次围栏拒绝），
+// 状态保持 recovering（服务端按占用处理），走同样有限次、带心跳的自停：
+// - 证明成立：在同一次变更里写下结局（persistRecoverySelfStopTerminalOutcome）；
+// - 用尽仍证明不了：与自动恢复一样写带围栏码的 needs_action，error.reason 写
+//   原因，由节点核对或运营放行。
+// 新轮次永远不会启动（launchPendingUnattendedRecovery 看到结局就不启动）。
+function buildUnattendedTerminalSelfStopRequest(
+  current,
+  {oldLock = null, now, reason = '', terminalOutcome},
+) {
+  const message = UNATTENDED_TERMINAL_SELF_STOP_MESSAGE;
+  const nextRequest = {
+    ...current,
+    recoverySelfStop: {
+      ...buildUnattendedRecoverySelfStopIntent(current, oldLock, now, now),
+      terminalOutcome,
+    },
+    previousAttemptId: current.attemptId,
+    attemptId: createUuid(),
+    attemptNumber: Math.max(1, Number(current.attemptNumber) || 1) + 1,
+    progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,
+    recoveryReason: String(reason || ''),
+    recoveryPendingLaunch: true,
+    recoveryLaunchFailures: 0,
+    recoveryWaitUntil: now,
+    status: 'recovering',
+    runnerTabId: null,
+    heartbeatAt: now,
+    businessProgressAt: now,
+    updatedAt: now,
+    message,
+    progress: {
+      ...(current.progress && typeof current.progress === 'object'
+        ? current.progress
+        : {}),
+      phase: 'recovery_self_stop',
+      waitUntil: '',
+      remainingMs: null,
+      message,
+      updatedAt: now,
+    },
+    error: null,
+  };
+  delete nextRequest.runnerRetireAttemptId;
+  return nextRequest;
+}
+
+// mode：recovery（换代后的自动恢复与终态转换，可重试）、launch（没有意图的
+// 启动点，例如手动恢复，只一次）。
 function createRecoverySelfStopContext(request, intent, epoch, mode) {
   const requestId = String(request?.id || '').trim();
-  const currentAttemptId =
-    mode === 'terminal' ? '' : String(request?.attemptId || '').trim();
+  const currentAttemptId = String(request?.attemptId || '').trim();
   const terminalAttemptIds = new Set(
     [
       intent?.fromAttemptId,
       ...(Array.isArray(intent?.olderAttemptIds) ? intent.olderAttemptIds : []),
       request?.previousAttemptId,
-      mode === 'terminal' ? request?.attemptId : '',
     ]
       .map((value) => String(value || '').trim())
       .filter((value) => value && value !== currentAttemptId),
@@ -12198,7 +12250,7 @@ async function isSelfStopRequestSlotCurrent(ctx) {
     return !slot || isTerminalUnattendedRunStatus(slot.status);
   }
   if (!slot || slot.id !== ctx.requestId) return false;
-  if (ctx.mode === 'terminal' || ctx.mode === 'fence_check') {
+  if (ctx.mode === 'fence_check') {
     return (
       isTerminalUnattendedRunStatus(slot.status) &&
       ctx.terminalAttemptIds.has(String(slot.attemptId || '').trim())
@@ -12274,10 +12326,9 @@ async function closeOwnedDetailWorkersForSelfStop(
 
 // 第 4 步：旧 runner 只判断、不在这里关。有退役回执的留着（第 5 步之后回执
 // 已是最终回执的当场关，还在冲刷的等它的最终回执到了再关）；最多等 15 秒回执。
-// 自动恢复第一次尝试仍没有回执就失败、下次再试；从第二次尝试起，以及只试一次
-// 的终态（R 已终态，它的 runner 不会再有正当工作）和启动点（旧请求已不在请求
-// 槽里，它的 runner 永远看不到换代），仍没有回执的标成待关闭，在第 5 步的锁
-// 操作里关。
+// 自动恢复（含终态转换）第一次尝试仍没有回执就失败、下次再试；从第二次尝试
+// 起，以及只试一次的启动点（旧请求已不在请求槽里，它的 runner 永远看不到
+// 换代），仍没有回执的标成待关闭，在第 5 步的锁操作里关。
 async function planSelfStopRunners(ctx, runnerPending, {tryIndex = 0} = {}) {
   const runners = runnerPending.map(({tabId, tab}) => ({
     tabId,
@@ -12914,6 +12965,61 @@ async function persistRecoverySelfStopDone(request, done) {
   });
 }
 
+// 终态转换的自停证明成立：在同一次变更里记下 done 并写下换代时定好的结局
+// （status、message、error、progress）。之后没有新轮次，本机台账按终态收住。
+async function persistRecoverySelfStopTerminalOutcome(request, done) {
+  return await runUnattendedRunMutation(async () => {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      !current ||
+      current.id !== request?.id ||
+      current.attemptId !== request?.attemptId ||
+      String(current.status || '') !== 'recovering'
+    ) {
+      return null;
+    }
+    const intent = readRecoverySelfStopIntent(current);
+    const outcome = intent?.terminalOutcome;
+    if (!outcome) return null;
+    const now = new Date().toISOString();
+    const finalDone = done || intent.done || null;
+    const nextRequest = {
+      ...current,
+      status: outcome.status === 'failed' ? 'failed' : 'needs_action',
+      recoverySelfStop: {
+        ...intent,
+        ...(finalDone
+          ? {tries: finalDone.tries, lastReason: '', done: finalDone}
+          : {}),
+      },
+      recoveryPendingLaunch: false,
+      recoveryWaitUntil: '',
+      finishedAt: now,
+      updatedAt: now,
+      progressSeq: Math.max(0, Number(current.progressSeq) || 0) + 1,
+      message: String(outcome.message || ''),
+      progress: {
+        ...(outcome.progress && typeof outcome.progress === 'object'
+          ? outcome.progress
+          : {}),
+        waitUntil: '',
+        remainingMs: null,
+        updatedAt: now,
+      },
+      error: outcome.error || null,
+    };
+    await persistUnattendedRunMutation(nextRequest, {
+      previousRequest: current,
+      event: {
+        type: nextRequest.status,
+        message: nextRequest.message,
+        at: now,
+      },
+    });
+    return nextRequest;
+  });
+}
+
 // 自动恢复（mode: recovery）的一次自停，带有限次重试与心跳。返回 {ok, request}
 // 或 {ok:false, result}：result 是交给调用方的恢复结果（仍在 recovering 等待下次
 // 巡检，或用尽后写入 needs_action）。
@@ -12946,7 +13052,23 @@ async function runUnattendedRecoverySelfStop(request, {firstAttempt = false} = {
     }
     let intent = readRecoverySelfStopIntent(current);
     if (!intent) return {ok: true, request: current};
-    if (intent.done) return {ok: true, request: current};
+    // 终态转换：证明成立后写下结局，不启动新轮次。
+    const finishTerminal = async (done) => {
+      const finished = await persistRecoverySelfStopTerminalOutcome(current, done);
+      return {
+        ok: false,
+        result: {
+          recovered: false,
+          terminal: true,
+          request: finished || (await readUnattendedKeywordRunRequest()),
+        },
+      };
+    };
+    if (intent.done) {
+      return intent.terminalOutcome
+        ? await finishTerminal(intent.done)
+        : {ok: true, request: current};
+    }
     const tryIndex = Math.max(0, Number(intent.tries) || 0);
     if (!firstAttempt) {
       current = await persistRecoverySelfStopHeartbeat(current) || current;
@@ -12957,6 +13079,7 @@ async function runUnattendedRecoverySelfStop(request, {firstAttempt = false} = {
       tryIndex,
     });
     if (attempt.ok) {
+      if (intent.terminalOutcome) return await finishTerminal(attempt.done);
       const doneRequest = await persistRecoverySelfStopDone(current, attempt.done);
       return {ok: true, request: doneRequest || current};
     }
@@ -12984,14 +13107,30 @@ async function runUnattendedRecoverySelfStop(request, {firstAttempt = false} = {
         },
       };
     }
-    const message =
+    const fenceMessage =
       '旧采集页面未能安全停止，已阻止自动恢复；请人工检查页面后从任务中心继续';
+    // 终态转换用尽：写同样的围栏；安全页阻断的原因一并留下（服务端据
+    // securityBlocked / category 仍按平台安全处理这个关键词）。
+    const outcome = intent.terminalOutcome;
+    const blocked = outcome?.kind === 'blocked' ? outcome.error || {} : null;
+    const message = blocked
+      ? `${String(outcome.message || '').slice(0, 200)}；${fenceMessage}`
+      : fenceMessage;
     const evidence = await buildRecoverySelfStopFenceEvidence(current, attempt);
     const blockedRequest = await markUnattendedRecoveryStopUnconfirmed(
       current,
       message,
       evidence,
       `self_stop:${reason}`,
+      blocked
+        ? {
+            blockedCode: String(blocked.code || '').slice(0, 100),
+            ...(blocked.securityBlocked === true ? {securityBlocked: true} : {}),
+            ...(blocked.category
+              ? {category: String(blocked.category).slice(0, 100)}
+              : {}),
+          }
+        : {},
     );
     return {
       ok: false,
@@ -13008,8 +13147,8 @@ async function runUnattendedRecoverySelfStop(request, {firstAttempt = false} = {
   }
 }
 
-// 只尝试一次的自停：终态转换（terminal），以及没有意图的启动点（launch，例如
-// 手动恢复、云端接管）。意图按当时的锁与请求临时构造，同样先给锁打标记。
+// 只尝试一次的自停：没有意图的启动点（launch，例如手动恢复、云端接管）。
+// 意图按当时的锁与请求临时构造，同样先给锁打标记。
 async function runOneShotUnattendedSelfStop(request, lock, {mode}) {
   const requestId = String(request?.id || '').trim();
   if (!requestId || recoverySelfStopInFlight.has(requestId)) {
@@ -13019,10 +13158,7 @@ async function runOneShotUnattendedSelfStop(request, lock, {mode}) {
   try {
     const intent = {
       v: 1,
-      fromAttemptId:
-        mode === 'terminal'
-          ? String(request?.attemptId || '').trim()
-          : String(request?.previousAttemptId || '').trim(),
+      fromAttemptId: String(request?.previousAttemptId || '').trim(),
       lockIdentity: lock ? buildCaptureExecutionLockStopIdentity(lock) : null,
       captureRequestIds: [
         String(request?.progress?.captureRequestId || '').trim(),
@@ -13044,60 +13180,6 @@ async function runOneShotUnattendedSelfStop(request, lock, {mode}) {
   } finally {
     recoverySelfStopInFlight.delete(requestId);
   }
-}
-
-// 终态自停的补试（0.4.19）：终态转换那次自停没成立时，R 已终态、没有围栏码，
-// 执行锁带着 R 的自停标记留着（不许刷新，读锁路径也不会释放它）。监督闹钟看到
-// 这种状态就按 3 分钟节奏再试一次同样的终态自停，直到证明成立（释放锁、关掉
-// R 的 runner），或锁已转交给新的领取者（标记随之去掉）。带围栏码的 needs_action
-// 由节点核对与运营放行处理，这里不碰。节奏记在 storage.session，worker 重启
-// 不会让它变密。
-const TERMINAL_SELF_STOP_RETRY_SESSION_KEY = 'onstarvoice.terminalSelfStopRetry.v1';
-const TERMINAL_SELF_STOP_RETRY_INTERVAL_MS = 3 * 60 * 1000;
-
-async function maybeRetryTerminalUnattendedSelfStop(request) {
-  const requestId = String(request?.id || '').trim();
-  if (
-    !requestId ||
-    !isTerminalUnattendedRunStatus(request?.status) ||
-    isStopFenceBlockedNeedsAction(request) ||
-    recoverySelfStopInFlight.has(requestId)
-  ) {
-    return null;
-  }
-  const lock = await readStoredCaptureExecutionLock().catch(() => null);
-  if (
-    !lock ||
-    String(lock.owner || '') !== 'unattended_keyword_plan' ||
-    lock.allowReload !== false ||
-    lock.selfStopRequestId !== requestId
-  ) {
-    return null;
-  }
-  const last = await readExtensionSessionValue(
-    TERMINAL_SELF_STOP_RETRY_SESSION_KEY,
-  ).catch(() => null);
-  const lastAt = Number(last?.at);
-  if (
-    last?.requestId === requestId &&
-    Number.isFinite(lastAt) &&
-    Date.now() - lastAt < TERMINAL_SELF_STOP_RETRY_INTERVAL_MS
-  ) {
-    return {deferred: true, reason: 'terminal_self_stop_retry_wait'};
-  }
-  await writeExtensionSessionValue(TERMINAL_SELF_STOP_RETRY_SESSION_KEY, {
-    requestId,
-    at: Date.now(),
-  }).catch(() => {});
-  // 成立时自停本身已按精确身份删锁并释放标签组与 Debug 会话。
-  const result = await runOneShotUnattendedSelfStop(request, lock, {
-    mode: 'terminal',
-  });
-  return {
-    retried: true,
-    ok: result?.ok === true,
-    reason: result?.ok ? 'terminal_self_stop_done' : describeRecoverySelfStopFailure(result),
-  };
 }
 
 async function executeStopFenceCheckOffer(offer) {
@@ -16255,6 +16337,7 @@ async function markUnattendedRecoveryStopUnconfirmed(
   message,
   stopFenceEvidence = null,
   reasonCode = '',
+  errorExtras = {},
 ) {
   return await runUnattendedRunMutation(async () => {
     const current = await readUnattendedKeywordRunRequest();
@@ -16276,6 +16359,8 @@ async function markUnattendedRecoveryStopUnconfirmed(
       updatedAt: now,
       message,
       error: {
+        // 终态转换带来的附加说明（例如安全页阻断的原码与 securityBlocked）。
+        ...(errorExtras && typeof errorExtras === 'object' ? errorExtras : {}),
         code: 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED',
         message,
         // 为什么停不下来（0.4.19）：self_stop:<原因码>，服务端可按原因分类。
@@ -16325,8 +16410,12 @@ async function launchPendingUnattendedRecovery(request) {
     };
   }
   // 0.4.19 S2：自动恢复的自停还没成立时，这次巡检再试一次（有限次、带心跳）。
+  // 终态转换的自停由它写下结局（成立）或围栏（用尽）。
   const selfStopIntent = readRecoverySelfStopIntent(request);
-  if (selfStopIntent && !selfStopIntent.done) {
+  if (
+    selfStopIntent &&
+    (!selfStopIntent.done || selfStopIntent.terminalOutcome)
+  ) {
     const selfStop = await runUnattendedRecoverySelfStop(request);
     if (!selfStop.ok) return selfStop.result;
     request = selfStop.request || request;
@@ -16334,6 +16423,15 @@ async function launchPendingUnattendedRecovery(request) {
     if (Number.isFinite(waitUntil) && waitUntil > Date.now()) {
       return {recovered: false, deferred: true, reason: 'recovery_wait', request};
     }
+  }
+  // 终态转换的请求永远不启动新轮次。
+  if (readRecoverySelfStopIntent(request)?.terminalOutcome) {
+    return {
+      recovered: false,
+      deferred: true,
+      reason: 'terminal_self_stop_pending',
+      request,
+    };
   }
   const storedLock = await readStoredCaptureExecutionLock();
   const activeLock =
@@ -16575,16 +16673,43 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
       return {action: 'fenced', request: current};
     }
     const now = new Date().toISOString();
+    const currentProgress =
+      current.progress && typeof current.progress === 'object'
+        ? current.progress
+        : {};
+    // 终态（安全页阻断、自动恢复用尽）的结局在旧页面被证明已停之后才写，见
+    // buildUnattendedTerminalSelfStopRequest。
+    const beginTerminalSelfStop = async (terminalOutcome) => {
+      const nextRequest = buildUnattendedTerminalSelfStopRequest(current, {
+        oldLock: oldUnattendedLock,
+        now,
+        reason: health.reason,
+        terminalOutcome,
+      });
+      await persistUnattendedRunMutation(nextRequest, {
+        previousRequest: current,
+        allowAttemptTransition: true,
+        event: {
+          type: 'recovery_self_stop',
+          message: `${terminalOutcome.message}；${nextRequest.message}`,
+          at: now,
+        },
+      });
+      return {action: 'recover', request: nextRequest};
+    };
+    // 终态转换的自停还没成立时又换代（例如来源页在等待期间被关）：结局不变，
+    // 否则安全页阻断会在换代后被当成一次普通恢复。
+    const pendingTerminalOutcome =
+      readRecoverySelfStopIntent(current)?.terminalOutcome || null;
+    if (pendingTerminalOutcome) {
+      return await beginTerminalSelfStop(pendingTerminalOutcome);
+    }
     if (blockReason) {
-      const nextRequest = {
-        ...current,
+      return await beginTerminalSelfStop({
+        kind: 'blocked',
         status: 'needs_action',
-        // 0.4.19：请这一轮的 runner 退役（停锁心跳、冲刷上传、写回执），终态
-        // 自停据此不必关掉一个还活着的 runner。
-        runnerRetireAttemptId: current.attemptId,
-        finishedAt: now,
-        updatedAt: now,
         message: blockReason,
+        progress: {...currentProgress},
         error: {
           ...(current.error && typeof current.error === 'object'
             ? current.error
@@ -16602,12 +16727,7 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
           requiresManualAction: true,
           retryable: false,
         },
-      };
-      await persistUnattendedRunMutation(nextRequest, {
-        previousRequest: current,
-        event: {type: 'needs_action', message: blockReason, at: now},
       });
-      return {action: 'terminal', request: nextRequest};
     }
 
     const recoveryCount = Math.max(0, Number(current.recoveryCount) || 0);
@@ -16620,17 +16740,12 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
       const message = cloudAssigned
         ? `${reasonText}，已完成 ${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次分散恢复，当前关键词已交回云端等待其它 Agent 接力`
         : `${reasonText}，自动恢复已达到 ${UNATTENDED_MAX_RECOVERY_ATTEMPTS} 次，请人工检查后继续`;
-      const nextRequest = {
-        ...current,
+      return await beginTerminalSelfStop({
+        kind: 'exhausted',
         status: cloudAssigned ? 'failed' : 'needs_action',
-        runnerRetireAttemptId: current.attemptId,
-        finishedAt: now,
-        updatedAt: now,
         message,
         progress: {
-          ...(current.progress && typeof current.progress === 'object'
-            ? current.progress
-            : {}),
+          ...currentProgress,
           phase: cloudAssigned
             ? 'returned_to_cloud_queue'
             : 'automatic_recovery_exhausted',
@@ -16639,7 +16754,6 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
           attemptCurrent: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
           attemptTotal: UNATTENDED_MAX_RECOVERY_ATTEMPTS,
           message,
-          updatedAt: now,
         },
         error: {
           code: 'UNATTENDED_RECOVERY_EXHAUSTED',
@@ -16650,16 +16764,7 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
           fastRetryExhausted: true,
           failureOrigin: 'extension_runtime',
         },
-      };
-      await persistUnattendedRunMutation(nextRequest, {
-        previousRequest: current,
-        event: {
-          type: cloudAssigned ? 'failed' : 'needs_action',
-          message,
-          at: now,
-        },
       });
-      return {action: 'terminal', request: nextRequest};
     }
 
     const nextRecoveryCount = recoveryCount + 1;
@@ -16727,28 +16832,8 @@ async function recoverUnattendedKeywordRunRequest(request, health) {
   if (transition.action === 'fenced') {
     return {recovered: false, reason: 'fenced', request: transition.request};
   }
-  if (transition.action === 'terminal') {
-    // 终态转换当场自停一次（等 runner 退役回执，没有回执的在证明后关掉）：成功
-    // 就释放锁和资源。失败时请求仍是终态、不写围栏；锁带着“不许刷新”的标记
-    // 留着，监督闹钟每 3 分钟再试同样的终态自停（maybeRetryTerminalUnattendedSelfStop）。
-    const terminalStop = await runOneShotUnattendedSelfStop(
-      transition.request,
-      oldUnattendedLock,
-      {mode: 'terminal'},
-    );
-    return {
-      recovered: false,
-      terminal: true,
-      ...(terminalStop.ok
-        ? {}
-        : {
-            reason: 'previous_capture_stop_unconfirmed',
-            selfStopReason: describeRecoverySelfStopFailure(terminalStop),
-          }),
-      request: transition.request,
-    };
-  }
   // 0.4.19 S2：旧页面由节点自己停——不刷新、只关自己建的页、能证明才继续。
+  // 终态转换走同一条路，证明成立时由自停写下终态结局，不会走到下面的启动。
   const selfStop = await runUnattendedRecoverySelfStop(transition.request, {
     firstAttempt: true,
   });
@@ -17561,17 +17646,7 @@ async function superviseUnattendedKeywordRun({
     let request = await readUnattendedKeywordRunRequest();
     if (!request || isTerminalUnattendedRunStatus(request.status)) {
       lastUnattendedSupervisorTickAt = nowMs;
-      const terminalRetry = request
-        ? await maybeRetryTerminalUnattendedSelfStop(request).catch((error) => {
-            console.warn('[SelfStop] terminal retry failed:', error);
-            return null;
-          })
-        : null;
-      return {
-        healthy: true,
-        reason: 'no_active_request',
-        ...(terminalRetry ? {terminalSelfStop: terminalRetry} : {}),
-      };
+      return {healthy: true, reason: 'no_active_request'};
     }
     const previousSupervisorTickAt = lastUnattendedSupervisorTickAt;
     const supervisorGap = previousSupervisorTickAt

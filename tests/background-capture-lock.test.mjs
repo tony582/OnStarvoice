@@ -11558,7 +11558,13 @@ test("recovery stops at the bounded retry limit and requires attention", async (
 
   assert.equal(result.terminal, true);
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
-  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, request.attemptId);
+  // 0.4.19：终态结局在旧轮次被证明已停之后才写（先换代自停），但不启动新轮次。
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].previousAttemptId,
+    request.attemptId,
+  );
+  assert.ok(harness.storage[UNATTENDED_REQUEST_KEY].recoverySelfStop.done);
+  assert.equal(harness.createdTabs.length, 0, "no new runner");
   assert.match(harness.storage[UNATTENDED_REQUEST_KEY].message, /达到 4 次/);
 });
 
@@ -11679,7 +11685,12 @@ test("risk and login failures trip a circuit breaker without automatic retries",
   assert.equal(result.terminal, true);
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].status, "needs_action");
   assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 0);
-  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].attemptId, request.attemptId);
+  // 0.4.19：先换代自停、再写结局；不启动新轮次。
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].previousAttemptId,
+    request.attemptId,
+  );
+  assert.equal(harness.createdTabs.length, 0, "no new runner");
 });
 
 test("manual recovery creates a new linked request and opens one runner", async () => {
