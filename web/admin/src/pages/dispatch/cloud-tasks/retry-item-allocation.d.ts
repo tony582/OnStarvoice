@@ -46,3 +46,10 @@ export function keywordRetrySourceReleased(input?: {
   execution?: KeywordRetrySourceExecutionLike | null
   elasticPool?: boolean
 }): boolean
+
+export const MOBILE_KEYWORD_RETRY_WORKFLOW: 'douyin_mobile_discovery'
+export const MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT: string
+
+export function mobileKeywordRetrySource(
+  execution?: KeywordRetrySourceExecutionLike | null,
+): boolean

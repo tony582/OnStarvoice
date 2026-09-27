@@ -109,6 +109,17 @@ export function manualKeywordRetrySourceSettled(execution) {
     !String(metadata.recoveryTaskId || '').trim();
 }
 
+// 手机执行（douyin_mobile_discovery）的关键词不能在原批次里「重试失败关键词」：
+// 手机不读重试下发的指令，服务端整单 409 retry_items_mobile_source
+// （capture-orchestrations.js RETRY_ITEMS_MOBILE_SOURCE_MESSAGE），需要新建手机批次重采。
+export const MOBILE_KEYWORD_RETRY_WORKFLOW = 'douyin_mobile_discovery';
+export const MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT =
+  '手机采集的关键词不能在原批次里重试（手机不接收重试任务）；需要重采请新建手机采集批次';
+
+export function mobileKeywordRetrySource(execution) {
+  return plainObject(execution?.metadata).workflow === MOBILE_KEYWORD_RETRY_WORKFLOW;
+}
+
 // retryable 关键词在弹性池里由自动接力负责（按领取闸门判断）；其余关键词要走
 // 「重试失败关键词」，按服务端人工重试闸门判断。
 export function keywordRetrySourceReleased({item, execution, elasticPool = false} = {}) {
@@ -116,5 +127,6 @@ export function keywordRetrySourceReleased({item, execution, elasticPool = false
   if (elasticPool && item?.status === 'retryable') {
     return ELASTIC_CLAIM_SOURCE_RELEASED_STATUSES.has(String(execution.status || ''));
   }
+  if (mobileKeywordRetrySource(execution)) return false;
   return manualKeywordRetrySourceSettled(execution);
 }

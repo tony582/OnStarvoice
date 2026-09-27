@@ -43,6 +43,9 @@ import {
   allocateKeywordRetryItems,
   buildKeywordRetryAssignments,
   keywordRetrySourceReleased,
+  manualKeywordRetrySourceSettled,
+  MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT,
+  mobileKeywordRetrySource,
 } from './retry-item-allocation.js'
 import {
   activeRecoveryCommandStatus,
@@ -516,11 +519,13 @@ export function OrchestrationDetailWorkspace({
   // keywordRetryItems：可提交「重试失败关键词」或正由弹性池自动接力的关键词，
   // 来源闸门与服务端一致（keywordRetrySourceReleased）。原执行仍停在需处理/中断
   // （如旧页面未确认停止）的失败关键词会让服务端整单 409，单独列出并提示先处理原执行。
-  const { keywordRetryItems, keywordRetryAwaitingSourceItems } = useMemo(() => {
+  // 手机执行已结束的失败关键词服务端同样整单 409（手机不接收重试任务），单独提示新建手机批次。
+  const { keywordRetryItems, keywordRetryAwaitingSourceItems, keywordRetryMobileItems } = useMemo(() => {
     const ready: OrchestrationItemRecord[] = []
     const awaitingSource: OrchestrationItemRecord[] = []
+    const mobile: OrchestrationItemRecord[] = []
     if (!detail || contentPatrol || isScheduleTemplate) {
-      return { keywordRetryItems: ready, keywordRetryAwaitingSourceItems: awaitingSource }
+      return { keywordRetryItems: ready, keywordRetryAwaitingSourceItems: awaitingSource, keywordRetryMobileItems: mobile }
     }
     for (const item of sortedItems) {
       if (item.item_type !== 'keyword' || !KEYWORD_RETRY_STATUSES.has(item.status)) continue
@@ -536,6 +541,11 @@ export function OrchestrationDetailWorkspace({
       if (keywordRetrySourceReleased({ item, execution: sourceExecution, elasticPool })) {
         ready.push(item)
       } else if (
+        mobileKeywordRetrySource(sourceExecution) &&
+        manualKeywordRetrySourceSettled(sourceExecution)
+      ) {
+        mobile.push(item)
+      } else if (
         elasticPool &&
         item.status !== 'retryable' &&
         RETRY_AWAITING_SOURCE_EXECUTION_STATUSES.has(executionStatus(sourceExecution))
@@ -543,7 +553,7 @@ export function OrchestrationDetailWorkspace({
         awaitingSource.push(item)
       }
     }
-    return { keywordRetryItems: ready, keywordRetryAwaitingSourceItems: awaitingSource }
+    return { keywordRetryItems: ready, keywordRetryAwaitingSourceItems: awaitingSource, keywordRetryMobileItems: mobile }
   }, [contentPatrol, detail, elasticPool, executionsById, isScheduleTemplate, sortedItems])
   // 原执行正被停止保护挡着（依据 /overview 的 stop_fence，不按错误码推断）的数量，决定提示文案。
   const keywordRetryAwaitingStopFenceCount = useMemo(
@@ -1616,6 +1626,11 @@ export function OrchestrationDetailWorkspace({
               </div>
             </div>
           </section>
+        )}
+        {!resultView && keywordRetryMobileItems.length > 0 && (
+          <p className="mb-4 rounded-xl border border-border bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
+            {`${keywordRetryMobileItems.length} 个关键词（${keywordRetryMobileItems.slice(0, 3).map(keywordForItem).join('、')}${keywordRetryMobileItems.length > 3 ? ' 等' : ''}）：${MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT}。`}
+          </p>
         )}
         {!resultView && keywordRetryItems.length > 0 && (
           <section id={`keyword-retry-${orchestration.id}`} className="mb-4 rounded-2xl border border-primary/20 bg-primary/[0.025] p-4">

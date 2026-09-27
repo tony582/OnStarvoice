@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -6,6 +7,8 @@ import {
   buildKeywordRetryAssignments,
   keywordRetrySourceReleased,
   manualKeywordRetrySourceSettled,
+  MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT,
+  mobileKeywordRetrySource,
 } from '../web/admin/src/pages/dispatch/cloud-tasks/retry-item-allocation.js';
 
 test('a preferred retry Agent falls back to another idle Agent after refresh', () => {
@@ -114,4 +117,29 @@ test('manual keyword retry only submits items whose source passes the server gat
   assert.equal(keywordRetrySourceReleased({item: {status: 'failed'}, execution: {status: 'superseded'}}), false);
   assert.equal(keywordRetrySourceReleased({item: {status: 'failed'}, execution: settled}), true);
   assert.equal(keywordRetrySourceReleased({item: {status: 'failed'}, execution: undefined}), false);
+});
+
+test('a phone keyword never goes into 「重试失败关键词」; the admin says to start a new phone batch', () => {
+  const phone = {status: 'failed', metadata: {workflow: 'douyin_mobile_discovery', operatorClose: {closedAt: 'x'}}};
+  assert.equal(mobileKeywordRetrySource(phone), true);
+  assert.equal(mobileKeywordRetrySource({status: 'failed', metadata: {}}), false);
+  assert.equal(mobileKeywordRetrySource(null), false);
+  assert.equal(manualKeywordRetrySourceSettled(phone), true, 'settled, but the server still refuses it');
+  for (const elasticPool of [false, true]) {
+    for (const status of ['failed', 'needs_action']) {
+      assert.equal(keywordRetrySourceReleased({item: {status}, execution: phone, elasticPool}), false,
+        `${status} elastic=${elasticPool}`);
+    }
+  }
+  // A retryable keyword in a phone pool is still relayed by the phone's own claim.
+  assert.equal(keywordRetrySourceReleased({item: {status: 'retryable'},
+    execution: {...phone, status: 'interrupted'}, elasticPool: true}), true);
+
+  const server = readFileSync(new URL('../server/routes/capture-orchestrations.js', import.meta.url), 'utf8');
+  assert.ok(server.includes(`'${MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT}'`),
+    'the admin text is the server 409 retry_items_mobile_source message');
+  const workspace = readFileSync(new URL(
+    '../web/admin/src/pages/dispatch/cloud-tasks/OrchestrationDetailWorkspace.tsx', import.meta.url), 'utf8');
+  assert.match(workspace, /mobileKeywordRetrySource\(sourceExecution\) &&\s*manualKeywordRetrySourceSettled\(sourceExecution\)/u);
+  assert.match(workspace, /MOBILE_KEYWORD_RETRY_UNSUPPORTED_TEXT/u);
 });
