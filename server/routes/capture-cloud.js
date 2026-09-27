@@ -6768,6 +6768,29 @@ export async function mirrorTaskSnapshot(
     `, [previous.id, agent.tenant_id]);
   }
 
+  // Coverage may revoke before a delayed node reports its failed stop. Keep
+  // only that safety evidence, never resurrect the lease/items/checkpoint.
+  // This runs only for a late fence, not on ordinary heartbeat snapshots.
+  if (previous?.status === 'superseded' &&
+      String(snapshot.error?.code || '').toUpperCase() === 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED') {
+    const fenced = await tx.queryOne(`
+      UPDATE capture_tasks
+      SET error = $4::jsonb || jsonb_build_object(
+            'coverageReason', metadata->>'terminalReason'),
+          updated_at = now()
+      WHERE id = $1 AND tenant_id = $2 AND origin_agent_id = $3
+        AND status = 'superseded' AND parent_task_id IS NOT NULL
+        AND task_type = 'unattended_keyword_capture'
+        AND metadata->>'terminalDisposition' = 'revoked'
+        AND metadata->>'terminalReason' LIKE 'keyword_node_%'
+        AND $5 >= attempt_number
+        AND NULLIF(metadata->>'recoveryTaskId', '') IS NULL
+        AND UPPER(COALESCE(error->>'code', '')) <> 'HISTORICAL_STOP_FENCE_RECONCILED'
+      RETURNING *
+    `, [previous.id, agent.tenant_id, agent.id, JSON.stringify(snapshot.error), snapshot.attemptNumber]);
+    if (fenced) return fenced;
+  }
+
   // Read exact create evidence without locking it; the task upsert below takes
   // the first write lock, and command reconciliation follows that same
   // task-then-command order everywhere.
@@ -6803,7 +6826,11 @@ export async function mirrorTaskSnapshot(
       WHERE client_task_id <> ''
     DO UPDATE SET
       assigned_agent_id = EXCLUDED.assigned_agent_id,
-      control_task_id = EXCLUDED.control_task_id,
+      control_task_id = CASE
+        WHEN UPPER(COALESCE(capture_tasks.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+          THEN capture_tasks.control_task_id
+        ELSE EXCLUDED.control_task_id
+      END,
       task_type = CASE WHEN capture_tasks.metadata->>'workflow'='discovered_post_capture'
         THEN capture_tasks.task_type ELSE EXCLUDED.task_type END,
       feature_key = EXCLUDED.feature_key,
@@ -6812,6 +6839,8 @@ export async function mirrorTaskSnapshot(
       source = EXCLUDED.source,
       trigger_type = EXCLUDED.trigger_type,
       status = CASE
+        WHEN UPPER(COALESCE(capture_tasks.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+          THEN capture_tasks.status
         WHEN ${OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL}
           THEN capture_tasks.status
         WHEN capture_tasks.status = 'superseded'
@@ -6943,7 +6972,11 @@ export async function mirrorTaskSnapshot(
           ))
           ELSE '{}'::jsonb
         END,
-      error = EXCLUDED.error,
+      error = CASE
+        WHEN UPPER(COALESCE(capture_tasks.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
+          THEN capture_tasks.error
+        ELSE EXCLUDED.error
+      END,
       message = CASE
         WHEN ${OPERATOR_CLOSED_SNAPSHOT_HOLD_SQL}
           THEN capture_tasks.message

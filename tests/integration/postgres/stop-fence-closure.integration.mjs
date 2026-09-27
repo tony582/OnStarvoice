@@ -1938,6 +1938,10 @@ test('stop-fence closure asks the source node, releases only on proof or operato
     const mirrored = await f.row(child.id);
     assert.equal(mirrored.message, '节点台账更新', 'the newer snapshot was mirrored');
     assert.equal(mirrored.status, 'needs_action');
+    await f.heartbeat(0, {tasks: [{...staleSnapshot(mirrored), status: 'canceled', error: {},
+      updatedAt: new Date(Date.now() + 1000).toISOString()}]});
+    assert.equal((await f.row(child.id)).status, 'needs_action', 'a local plan cannot cancel away a fence');
+    assert.equal((await f.row(child.id)).error.code, 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED');
     assert.equal(mirrored.metadata.stopFenceCheck.checkId, offer.checkId, 'the round survives the merge');
     assert.equal(mirrored.metadata.stopFenceCheck.forged, undefined);
     const answered = await f.receipt(0, offer.checkId, proofBody(offer));
@@ -2018,7 +2022,7 @@ test('stop-fence closure asks the source node, releases only on proof or operato
         control_task_id: randomUUID(), finished_at: null, title: '覆盖批次 · 别克哨兵',
         created_at: past(30), started_at: past(30), updated_at: past(1)});
       await query(`UPDATE capture_tasks SET progress=$2, heartbeat_at=now()-interval '5 minutes',
-        business_progress_at=now()-interval '6 minutes' WHERE id=$1`, [child.id, progress]);
+        business_progress_at=now()-interval '15 minutes' WHERE id=$1`, [child.id, progress]);
       const [item] = await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,item_type,keyword,
         platform,status,ordinal,metadata,assigned_agent_id,execution_task_id,attempt_count,assignment_revision,
         started_at) VALUES($1,$2,'keyword:0:别克哨兵','keyword','别克哨兵','xiaohongshu','running',0,$3,$4,$5,1,1,now())
@@ -2049,6 +2053,14 @@ test('stop-fence closure asks the source node, releases only on proof or operato
       parentTaskIds: [silent.parent.id]})).skipped, 1);
     const revoked = await f.row(silent.child.id);
     assert.equal(revoked.status, 'superseded');
+    const frozenItems = await itemRow(silent.item.id);
+    await f.heartbeat(0, {tasks: [{...staleSnapshot(silent.child), controlTaskId: silent.child.control_task_id,
+      error: {...STOP_ERROR, reason: 'self_stop:probe_failed'}}]});
+    const late = await f.row(silent.child.id);
+    assert.equal(late.status, 'superseded', 'the revoked lease stays revoked');
+    assert.equal(late.error.code, 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED', 'late safety evidence survives');
+    assert.equal((await itemRow(silent.item.id)).status, frozenItems.status, 'late fence never reprojects results');
+    assert.ok((await f.heartbeat(0)).stopFenceChecks.some(o => o.taskId === silent.child.id));
   });
 
 });

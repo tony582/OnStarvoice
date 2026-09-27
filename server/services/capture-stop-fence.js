@@ -800,6 +800,14 @@ export async function readStopFenceHeartbeatWork(executor, {
           AND ${STOP_FENCE_NEEDS_ACTION_AUTO_CHECK_SQL('fenced_child')}
           AND UPPER(COALESCE(fenced_child.error->>'code', '')) = 'PREVIOUS_CAPTURE_STOP_UNCONFIRMED'
           AND NULLIF(fenced_child.metadata->>'recoveryTaskId', '') IS NULL
+          AND (
+            COALESCE(fenced_child.metadata #>> '{stopFenceCheck,version}', '') <> '1'
+            OR NULLIF(fenced_child.metadata #>> '{stopFenceCheck,checkId}', '') IS NULL
+            OR (fenced_child.metadata #>> '{stopFenceCheck,lastResult,checkId}') IS DISTINCT FROM
+              (fenced_child.metadata #>> '{stopFenceCheck,checkId}')
+            OR COALESCE(fenced_child.metadata #>> '{stopFenceCheck,nextIssueAt}', '') <=
+              to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+          )
       ))) AS fence_pending,
       -- Expired ones count here too: the claim marks them expired.
       EXISTS (
@@ -1091,7 +1099,7 @@ function newCheckRound(previous, now, {
   };
 }
 
-async function escalateIfNeeded(tx, {tenantId, taskId, agentId, state, now, actorName = ''}) {
+async function escalateIfNeeded(tx, {tenantId, taskId, agentId, state, now, actorName = '', status = 'superseded'}) {
   if (!state || state.escalatedAt || state.resolvedAt) return state;
   const cause = stopFenceCheckEscalationCause(state, now);
   if (!cause) return state;
@@ -1105,6 +1113,7 @@ async function escalateIfNeeded(tx, {tenantId, taskId, agentId, state, now, acto
     taskId,
     agentId,
     eventType: 'stop_fence_check_escalated',
+    status,
     actorType: 'system',
     actorName: actorName || '云端调度器',
     message: `节点自动核对未能完成，需要人工处理：${reasonText}`,
@@ -1190,6 +1199,7 @@ export async function recordStopFenceCheckResult(tx, {
       taskId: task.id,
       agentId: agent?.id || null,
       eventType: 'stop_fence_check_failed',
+      status: task.status,
       actorType: reason === 'check_timeout' ? 'system' : 'capture_agent',
       actorId: reason === 'check_timeout' ? '' : (agent?.id || ''),
       actorName: agent?.display_name || agent?.client_label || '',
@@ -1207,6 +1217,7 @@ export async function recordStopFenceCheckResult(tx, {
     tenantId,
     taskId: task.id,
     agentId: agent?.id || null,
+    status: task.status,
     state: next,
     now: current,
   });
@@ -1548,6 +1559,7 @@ export async function claimStopFenceCheckOffers(tx, {
         taskId: row.id,
         agentId,
         eventType: 'stop_fence_check_requested',
+        status: lockedRow.status,
         actorType: 'system',
         actorName: '云端调度器',
         message: '已请求原节点核对并停止旧采集页面',
@@ -1579,7 +1591,7 @@ export async function claimStopFenceCheckOffers(tx, {
     } else if (!(current < toMs(state.expiresAt))) {
       // Expired without an answer: count it as one failed round.
       next = await recordStopFenceCheckResult(tx, {
-        task: {id: row.id, tenant_id: tenantId},
+        task: {id: row.id, tenant_id: tenantId, status: lockedRow.status},
         agent: {...agent, id: agentId, display_name: actorName},
         state,
         result: {
@@ -1607,6 +1619,7 @@ export async function claimStopFenceCheckOffers(tx, {
       tenantId,
       taskId: row.id,
       agentId,
+      status: lockedRow.status,
       state: next || state,
       now: current,
     });

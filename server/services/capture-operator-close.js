@@ -582,7 +582,11 @@ export async function closeOperatorAttentionRoot(tx, {
     ) VALUES ($1, $2, $3, $9, $4, $5, $6, $7, $8::jsonb)
   `, [
     tenantId, scopedRootId, OPERATOR_CLOSE_EVENT, actorUserId, actorName,
-    closedRoot.status, automatic ? OPERATOR_CLOSE_AUTOMATIC_EVENT_MESSAGE : OPERATOR_CLOSE_EVENT_MESSAGE,
+    closedRoot.status, automatic
+      ? (dismissAttention === false
+        ? '系统自动结算：用尽次数的工作项已标记失败，已完成结果保留，批次仍在需处理'
+        : OPERATOR_CLOSE_AUTOMATIC_EVENT_MESSAGE)
+      : OPERATOR_CLOSE_EVENT_MESSAGE,
     JSON.stringify({...extraPayload, originalStatus: root.status, mode: closeMode, ...counts}),
     actorType,
   ]);

@@ -3192,6 +3192,9 @@ async function retireSupersededUnattendedAttempt({
   }
   retiredUnattendedAttemptKey = retirementKey;
   const queue = activeUnattendedStreamingSyncQueue;
+  // Freeze collection, but keep already captured results uploading. Ordinary
+  // cancellation would empty this queue before drain() ever sees the jobs.
+  queue?.retire?.();
   const beforeStats = queue?.enabled ? queue.getStats() : null;
   // 1. 停本地编排。不发不限定请求的全页取消：后台自停只按请求 id 取消，
   //    旧页面上的采集中继也已被后台的轮次围栏拒绝。
@@ -3227,7 +3230,7 @@ async function retireSupersededUnattendedAttempt({
     }
     return false;
   };
-  // 3. 在上限内冲刷流式上传队列（取消后它只等正在上传的那一条）。心跳已停、
+  // 3. 等采集生产者退出后冲刷全部已入队结果。心跳已停、
   //    编排已取消，所以冲刷前先报一次“冲刷中”的回执：后台据此保留本页，不会
   //    在冲刷途中把它当作卡死的 runner 关掉。
   if (queue?.enabled && beforeStats) {
@@ -3236,23 +3239,39 @@ async function retireSupersededUnattendedAttempt({
       flushing: true,
       pendingUploads: Math.max(0, Number(beforeStats.remainingCount || 0)),
     });
-    const afterStats = await Promise.race([
-      queue.drain().catch(() => queue.getStats()),
-      new Promise((resolve) =>
-        setTimeout(() => resolve(null), UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS),
-      ),
-    ]);
-    const finalStats = afterStats || queue.getStats();
-    const uploadedDuringFlush = Math.max(
-      0,
-      Number(finalStats?.processedCount || 0) -
-        Number(beforeStats.processedCount || 0),
-    );
-    pendingUploads = Math.max(
-      0,
-      Number(beforeStats.remainingCount || 0) - uploadedDuringFlush,
-    );
-    flushed = Boolean(afterStats) && pendingUploads === 0;
+    const pendingFrom = (stats) => Math.max(0, Number(stats?.unsettledCount ??
+      (Number(stats?.remainingCount || 0) + Number(stats?.failedCount || 0))));
+    const finishFlush = async (stats) => {
+      const pending = pendingFrom(stats);
+      const complete = pending === 0 && !stats?.canceled && !stats?.blocked;
+      const delivered = await sendReceipt({flushed: complete, flushing: !complete, pendingUploads: pending});
+      if (!complete || !delivered) {
+        const timer = setTimeout(() => {
+          queue.retryFailed?.();
+          queue.drain().then(finishFlush).catch(() => finishFlush(queue.getStats()));
+        }, UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS);
+        timer?.unref?.();
+      }
+    };
+    // Keep observing a slow drain after the bounded foreground wait. A late
+    // successful upload sends the final receipt automatically.
+    const drain = (async () => {
+      // A canceled capture may still finish saving/enqueuing its last record.
+      // A momentarily empty upload queue is not a complete flush.
+      await queue.whenProducerStopped?.();
+      return await queue.drain();
+    })().catch(() => queue.getStats());
+    let timeout;
+    const afterStats = await Promise.race([drain, new Promise((resolve) => {
+      timeout = setTimeout(() => resolve(null), UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS);
+    })]);
+    clearTimeout(timeout);
+    if (!afterStats) {
+      void drain.then(finishFlush);
+      return await sendReceipt({flushed: false, flushing: true, pendingUploads: pendingFrom(queue.getStats())});
+    }
+    await finishFlush(afterStats);
+    return true;
   }
   // 4. 退役回执：后台从 sender 取请求、轮次、文档与标签页，写进 storage.session。
   return await sendReceipt({flushed, pendingUploads});
@@ -13767,12 +13786,16 @@ function createStreamingDetailAutoSyncQueue(
     resolveCaptureTaskItemAttempt = null,
   } = {},
 ) {
-  return createRecordSyncQueue({
+  let retiring = false;
+  let finishProducing;
+  const producerStopped = new Promise(resolve => { finishProducing = resolve; });
+  const shouldStopSync = () => !retiring && (typeof shouldStop === 'function' && shouldStop());
+  const queue = createRecordSyncQueue({
     enabled: Boolean(
       settings?.autoDetailCaptureAfterListCapture &&
         settings?.autoSyncAfterDetailCapture,
     ),
-    shouldStop,
+    shouldStop: shouldStopSync,
     signal,
     retryDelaysMs: [1000, 3000, 8000],
     shouldRetry: isTransientStreamingSyncFailure,
@@ -13786,7 +13809,7 @@ function createStreamingDetailAutoSyncQueue(
         recordIds: [recordId],
         silent: true,
         refreshAfter: false,
-        shouldStop,
+        shouldStop: shouldStopSync,
         signal: jobSignal || signal,
         captureTaskId,
         captureTaskItemAttemptId: String(
@@ -13805,6 +13828,11 @@ function createStreamingDetailAutoSyncQueue(
             Number(result?.skippedCount || 0) > 0),
       };
     },
+  });
+  return Object.assign(queue, {
+    retire() { retiring = true; },
+    finishProducing,
+    whenProducerStopped() { return producerStopped; },
   });
 }
 
@@ -15292,6 +15320,7 @@ async function handleBatchKeywordCapture(options = {}) {
     };
     return failureOutcome;
   } finally {
+    streamingSyncQueue?.finishProducing?.();
     const ownsBatchInvocation = () =>
       activeBatchKeywordInvocationToken === batchInvocationToken;
     const ownsCurrentBatchInvocation = () =>

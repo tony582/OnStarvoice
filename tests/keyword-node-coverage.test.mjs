@@ -56,12 +56,12 @@ test('healthy slow work protects sibling keywords; repeated heartbeats do not hi
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_response');
 });
 
-test('long comment requests retain the existing twelve-minute allowance', () => {
+test('comment progress waits beyond the node watchdog and mirror window', () => {
   const input = fixture();
   input.child = {status: 'running', created_at: ago(20), started_at: ago(20), heartbeat_at: ago(0),
     business_progress_at: ago(11), progress: {phase: 'detail_comments_capturing'}};
   assert.equal(keywordCoverageSkipReason(input, now), '');
-  input.child.business_progress_at = ago(13);
+  input.child.business_progress_at = ago(16);
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress');
 });
 
@@ -73,12 +73,12 @@ test('the comment allowance follows the page in front, not a prefetch phase', ()
   const prefetch = extra => ({status: 'running', created_at: ago(20), started_at: ago(20), heartbeat_at: ago(0),
     business_progress_at: ago(11), progress: {phase: 'detail_item_prefetch_ready', ...extra}});
   input.child = prefetch({activeStage: 'comments_capture', captureAction: ''});
-  assert.equal(keywordCoverageSkipReason(input, now), '', 'still inside twelve minutes');
+  assert.equal(keywordCoverageSkipReason(input, now), '', 'inside server allowance');
   input.child = prefetch({activeStage: 'note_capture', captureAction: 'captureComments'});
   assert.equal(keywordCoverageSkipReason(input, now), '', 'the comment relay action alone also counts');
   input.child = prefetch({activeStage: 'note_capture', captureAction: ''});
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress', 'other stages keep ten minutes');
-  input.child = {...prefetch({activeStage: 'comments_capture'}), business_progress_at: ago(13)};
+  input.child = {...prefetch({activeStage: 'comments_capture'}), business_progress_at: ago(16)};
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress');
 });
 
@@ -129,10 +129,10 @@ test('a self-stopping recovery child gets the self-stop budget before it counts 
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_response');
   input.child = {...input.child, status: 'running', progress: {phase: 'recovery_self_stop'}};
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_response');
-  // The progress limit is unchanged: counted from the recovery transition.
+  // Self-stop heartbeats are proof of response, never fake business progress.
   input.child = {status: 'recovering', created_at: ago(30), started_at: ago(30), heartbeat_at: ago(1),
-    business_progress_at: ago(11), progress: {phase: 'recovery_self_stop'}};
-  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress');
+    business_progress_at: ago(20), progress: {phase: 'recovery_self_stop'}};
+  assert.equal(keywordCoverageSkipReason(input, now), '');
   // The same allowance protects sibling keywords of the node.
   input.child = null;
   input.nodeTasks = [{status: 'recovering', created_at: ago(30), started_at: ago(30), heartbeat_at: ago(10),

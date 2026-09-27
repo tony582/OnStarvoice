@@ -32,6 +32,7 @@ export function createRecordSyncQueue({
   const settledCountsById = new Map();
   const dirtyIds = new Set();
   const latestMetaById = new Map();
+  const failedJobs = new Map();
   let activeJob = null;
   let workerPromise = null;
   let blockedError = null;
@@ -70,6 +71,7 @@ export function createRecordSyncQueue({
     enqueuedUniqueCount: enqueuedIds.size,
     excludedUniqueCount: excludedIds.size,
     succeededUniqueCount: succeededIds.size,
+    unsettledCount: [...enqueuedIds].filter(id => !succeededIds.has(id)).length,
   });
 
   const stopRequested = () => {
@@ -167,6 +169,7 @@ export function createRecordSyncQueue({
     seenIds.add(normalizedId);
     excludedIds.delete(normalizedId);
     enqueuedIds.add(normalizedId);
+    succeededIds.delete(normalizedId);
     latestMetaById.set(normalizedId, meta || {});
     if (activeJob?.recordId === normalizedId) {
       dirtyIds.add(normalizedId);
@@ -316,6 +319,7 @@ export function createRecordSyncQueue({
       excludedIds.add(job.recordId);
       enqueuedIds.delete(job.recordId);
       succeededIds.delete(job.recordId);
+      failedJobs.delete(job.recordId);
       dirtyIds.delete(job.recordId);
       latestMetaById.delete(job.recordId);
       activeJob = null;
@@ -341,6 +345,11 @@ export function createRecordSyncQueue({
       stats.successCount += 1;
       counts.successCount += 1;
       succeededIds.add(job.recordId);
+    }
+    if (result?.skipped || result?.ok === false) {
+      failedJobs.set(job.recordId, {recordId: job.recordId, meta: latestMeta, result});
+    } else {
+      failedJobs.delete(job.recordId);
     }
     settledCountsById.set(job.recordId, counts);
 
@@ -414,6 +423,16 @@ export function createRecordSyncQueue({
       return seenIds.has(normalizeRecordId(recordId));
     },
     getStats,
+    // Retirement may outlive a temporary network failure. Requeue only
+    // retryable failed jobs, keeping their original task/item identity.
+    retryFailed() {
+      let count = 0;
+      for (const job of failedJobs.values()) {
+        if (isRetryableResult(job.result, {recordId: job.recordId, meta: job.meta}) &&
+            enqueue(job.recordId, job.meta)) count += 1;
+      }
+      return count;
+    },
     drain,
     cancel,
   };

@@ -427,8 +427,8 @@ function createHarness({state = null} = {}) {
   vm.runInContext(
     `${backgroundSource}\n;globalThis.__selfStopTestApi = {\n` +
       `  recoverUnattendedKeywordRunRequest,\n` +
-      `  superviseUnattendedKeywordRun,\n` +
-      `  launchPendingUnattendedRecovery,\n` +
+      `  superviseUnattendedKeywordRun, handleUnattendedKeywordAlarm, resolveUnattendedPlanLockState, createUnattendedKeywordRunRequest, resolveSupersededNeedsActionTask,\n` +
+      `  launchPendingUnattendedRecovery, finalizeTerminalUnattendedAttemptExact,\n` +
       `  manuallyRecoverUnattendedKeywordRun,\n` +
       `  confirmPreviousUnattendedStopForFenceCheck,\n` +
       `  claimUnattendedKeywordRun,\n` +
@@ -1131,52 +1131,17 @@ test("the source page is never closed or reloaded: a capture that keeps running 
   );
 });
 
-test("a frozen platform page is discarded (never closed or reloaded) and then counts as proof; an active one is left alone", async () => {
-  const harness = createHarness();
-  seedRunningRequest(harness);
-  harness.addTab({
-    id: 25,
-    url: "https://www.xiaohongshu.com/explore/user-tab",
-    frozen: true,
-  });
-  await retireRunner(harness);
-  harness.resetCallLog();
-
-  const result = await recover(harness);
-
-  assert.equal(result.reason, "recovery_wait", JSON.stringify(result));
-  assert.equal(harness.tabs.has(25), true, "the frozen page stays in the tab strip");
-  assert.equal(harness.tabs.get(25).discarded, true);
-  const done = harness.storage[REQUEST_KEY].recoverySelfStop.done;
-  assert.deepEqual(done.discardedTabIds, [25]);
-  assert.equal(
-    done.targets.find((target) => target.tabId === 25).evidence,
-    "tab_discarded",
-  );
-  assert.equal(harness.storage[LOCK_KEY], undefined);
-  assertSelfStopSafety(harness, {
-    allowedRemovedTabIds: [RUNNER_TAB],
-    allowedDiscardedTabIds: [25],
-  });
-
-  // Chrome 不丢弃活动页：活动的冻结页（理论上不会出现）仍然不成立，也不被关。
-  const active = createHarness();
-  seedRunningRequest(active);
-  active.addTab({
-    id: 25,
-    url: "https://www.xiaohongshu.com/explore/user-tab",
-    frozen: true,
-    active: true,
-  });
-  await retireRunner(active);
-  active.resetCallLog();
-  const blocked = await recover(active);
-  assert.equal(blocked.reason, "recovery_self_stop_pending");
-  assert.equal(blocked.selfStopReason, "tab_frozen");
-  assert.equal(active.tabs.get(25).discarded, false);
-  assert.deepEqual(active.forbiddenTabCalls.discard, []);
-  assert.equal(active.storage[LOCK_KEY].id, "lock-r");
-  assertSelfStopSafety(active);
+test("an unrelated frozen platform page is never discarded or closed", async () => {
+  const h = createHarness();
+  seedRunningRequest(h);
+  h.addTab({id: 25, url: "https://www.xiaohongshu.com/explore/user-tab", frozen: true});
+  await retireRunner(h);
+  h.resetCallLog();
+  const result = await recover(h);
+  assert.equal(result.selfStopReason, "tab_frozen");
+  assert.equal(h.tabs.get(25).discarded, false);
+  assert.equal(h.storage[LOCK_KEY].id, "lock-r");
+  assertSelfStopSafety(h);
 });
 
 test("R's own frozen or hung source page is discarded (never reloaded or closed), then proven, and A2 starts", async () => {
@@ -1308,38 +1273,29 @@ test("before BEGIN the lock holder is A1's runner page: its receipt proves it re
   assertSelfStopSafety(harness, {allowedRemovedTabIds: [RUNNER_TAB]});
 });
 
-test("a stuck runner without a receipt is closed only on the second attempt, inside the lock operation", async () => {
-  const harness = createHarness();
-  seedRunningRequest(harness);
-  harness.addTab({
-    id: 33,
-    url: runnerUrl("another-request", "attempt-x"),
-    documentId: "another-runner-document",
-  });
-  harness.resetCallLog();
-
-  const first = await recover(harness);
-  assert.equal(first.reason, "recovery_self_stop_pending");
-  assert.equal(first.selfStopReason, "runner_not_retired");
-  assert.equal(harness.tabs.has(RUNNER_TAB), true, "not closed on the first attempt");
-  assert.equal(harness.storage[LOCK_KEY].id, "lock-r");
-
-  const second = await superviseAfterWait(harness);
-  assert.equal(harness.tabs.has(RUNNER_TAB), false, "closed on the second attempt");
-  assert.equal(harness.storage[LOCK_KEY], undefined);
-  const done = harness.storage[REQUEST_KEY].recoverySelfStop.done;
-  assert.equal(done.runnerClosed, true);
-  assert.equal(done.runnerClosedWithoutReceipt, true);
-  assert.equal(done.tries, 2);
-  assert.equal(harness.tabs.has(33), true, "another request's runner is untouched");
-  assertSelfStopSafety(harness, {allowedRemovedTabIds: [RUNNER_TAB]});
-  // 第二次尝试把重试等待推后了 60 秒；到点后启动 A2。
-  if (second.recovered !== true) {
-    assert.equal(second.reason, "recovery_wait", JSON.stringify(second));
-    const launched = await superviseAfterWait(harness);
-    assert.equal(launched.recovered, true, JSON.stringify(launched));
-  }
-  assert.equal(runnerLaunches(harness).length, 1);
+test("a runner without a flush receipt stays fenced across retries and a local plan alarm", async () => {
+  const h = createHarness();
+  seedRunningRequest(h);
+  h.addTab({id: 33, url: runnerUrl("another-request", "attempt-x"), documentId: "other"});
+  await recover(h);
+  for (let i = 0; i < 5 && h.storage[REQUEST_KEY].status === "recovering"; i++) await superviseAfterWait(h);
+  assert.equal(h.storage[REQUEST_KEY].status, "needs_action");
+  assert.equal(h.tabs.has(RUNNER_TAB), true);
+  assert.equal(h.tabs.has(33), true);
+  const locked = plain(h.storage[LOCK_KEY]);
+  const slot = plain(h.storage[REQUEST_KEY]);
+  assert.equal((await h.api.resolveUnattendedPlanLockState(locked)).type, "blocking");
+  h.storage[PLAN_KEY] = {...slot.planSnapshot, enabled: true};
+  await h.api.handleUnattendedKeywordAlarm();
+  assert.deepEqual(h.storage[LOCK_KEY], locked);
+  assert.equal(h.storage[REQUEST_KEY].id, REQUEST_ID);
+  assert.equal(runnerLaunches(h).length, 0);
+  assertSelfStopSafety(h);
+  // Even a missing lock cannot turn a fenced request into a new local plan.
+  delete h.storage[LOCK_KEY];
+  await assert.rejects(h.api.createUnattendedKeywordRunRequest(slot.planSnapshot), /自动核对/u);
+  await h.api.resolveSupersededNeedsActionTask(REQUEST_ID, "successor");
+  assert.equal(h.storage[LEDGER_KEY].runs.find(r => r.id === REQUEST_ID).status, "needs_action");
 });
 
 test("a runner that reports the new attempt means the request changed: nothing is closed", async () => {
@@ -1441,6 +1397,11 @@ test("a terminal transition self-stops as a recovering attempt first and writes 
   assert.ok(blocked.recoverySelfStop.done, "the proof is recorded");
   assert.equal(blocked.stopFenceEvidence, undefined);
   assert.equal(released.storage[LOCK_KEY], undefined);
+  const closure = await released.api.finalizeTerminalUnattendedAttemptExact({
+    requestId: blocked.id, attemptId: blocked.attemptId, scheduleRetry: true,
+  });
+  assert.equal(closure.reason, "item_attempt_identity_unknown",
+    "a supervisor-only terminal incarnation has no runner checkpoint to poll");
   assert.deepEqual(releasedTrail, [
     "recovering:",
     "needs_action:SECURITY_VERIFICATION_REQUIRED",
@@ -1464,7 +1425,7 @@ test("a terminal transition self-stops as a recovering attempt first and writes 
   assertSelfStopSafety(retiring, {allowedRemovedTabIds: [RUNNER_TAB]});
 
   // runner 卡死、始终不退役（第 5 次卡住，交回云端）：第一次尝试等不到回执，
-  // 留在 recovering（服务端仍按占用处理）；第二次在证明之后的锁操作里关掉它、
+  // 留在 recovering（服务端仍按占用处理）；随后取得退役回执才关掉它、
   // 释放锁，才写 failed。
   const stuck = createHarness();
   seedRunningRequest(stuck, {recoveryCount: 4});
@@ -1476,6 +1437,7 @@ test("a terminal transition self-stops as a recovering attempt first and writes 
   assert.equal(stuck.storage[REQUEST_KEY].status, "recovering");
   assert.equal(stuck.storage[REQUEST_KEY].progress.phase, "recovery_self_stop");
   assert.equal(stuck.tabs.has(RUNNER_TAB), true);
+  await retireRunner(stuck);
   const closed = await superviseAfterWait(stuck);
   assert.equal(closed.terminal, true, JSON.stringify(closed));
   const failed = stuck.storage[REQUEST_KEY];
@@ -1754,7 +1716,7 @@ test("a second 继续 still recognizes the first request's retired runner after 
   assertSelfStopSafety(harness, {allowedRemovedTabIds: [RUNNER_TAB]});
 });
 
-test("the launch-time stop closes an unretired runner of the request it was derived from after a bounded wait; other requests' runners are untouched", async () => {
+test("the launch-time stop retains unretired runners and their unsynced results", async () => {
   const harness = createHarness();
   seedRunningRequest(harness);
   const newRequestId = "manual-new-request";
@@ -1783,12 +1745,12 @@ test("the launch-time stop closes an unretired runner of the request it was deri
   );
   await harness.api.flushUnattended();
 
-  assert.equal(launch.recovered, true, JSON.stringify(launch));
-  assert.equal(harness.tabs.has(RUNNER_TAB), false, "the derived-from request's stuck runner was closed");
+  assert.equal(launch.recovered, false, JSON.stringify(launch));
+  assert.equal(harness.tabs.has(RUNNER_TAB), true, "no receipt, no close");
   assert.equal(harness.tabs.has(33), true, "another request's runner is untouched");
-  assert.equal(harness.storage[LOCK_KEY], undefined);
-  assert.equal(runnerLaunches(harness).length, 1);
-  assertSelfStopSafety(harness, {allowedRemovedTabIds: [RUNNER_TAB]});
+  assert.equal(harness.storage[LOCK_KEY].id, "lock-r");
+  assert.equal(runnerLaunches(harness).length, 0);
+  assertSelfStopSafety(harness);
 });
 
 // ==================== 节点核对里关登记过的工作页（S2'） ====================
@@ -1843,7 +1805,7 @@ test("S2': a node check closes a frozen worker registered to R and then proves t
   assertSelfStopSafety(harness, {allowedRemovedTabIds: [worker]});
 });
 
-test("S2': an unregistered frozen page is discarded (not closed) and a failing source page is never closed", async () => {
+test("S2': unregistered frozen pages and failing source pages are preserved", async () => {
   const unregistered = createHarness();
   seedFencedForCheck(unregistered);
   unregistered.addTab({
@@ -1855,13 +1817,13 @@ test("S2': an unregistered frozen page is discarded (not closed) and a failing s
   const frozen = plain(
     await unregistered.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer()),
   );
-  assert.equal(frozen.accepted, true, JSON.stringify(frozen));
+  assert.equal(frozen.accepted, false, JSON.stringify(frozen));
   assert.equal(
     frozen.targets.find((target) => target.tabId === 26)?.evidence,
-    "tab_discarded",
+    "tab_frozen",
   );
   assert.equal(unregistered.tabs.has(26), true, "discarded, never closed");
-  assertSelfStopSafety(unregistered, {allowedDiscardedTabIds: [26]});
+  assertSelfStopSafety(unregistered);
 
   const source = createHarness();
   seedRunningRequest(source);
@@ -1909,28 +1871,22 @@ test("self-stop retries on a one-minute cadence while the replacement keeps its 
   assertSelfStopSafety(harness, {allowedRemovedTabIds: [RUNNER_TAB]});
 });
 
-test("a runner still flushing after retirement is kept open by its early receipt and closed by its final one", async () => {
-  const harness = createHarness();
-  seedRunningRequest(harness);
-  await retireRunner(harness, A1, {flushing: true, flushed: false, pendingUploads: 2});
-  const result = await recover(harness);
-  assert.equal(result.reason, "recovery_wait", JSON.stringify(result));
-  assert.equal(harness.tabs.has(RUNNER_TAB), true);
-  const done = harness.storage[REQUEST_KEY].recoverySelfStop.done;
-  assert.equal(done.runnersRetained, 1);
-  assert.equal(done.retiredRunnersClosed, 0);
-  assert.equal(done.pendingUploads, 2);
-  const receipt = plain(
-    await harness.api.readUnattendedAttemptRetiredReceipt(REQUEST_ID, A1),
-  );
-  assert.equal(receipt.flushing, true);
-
-  // 冲刷结束，最终回执到达：锁已释放、它的轮次已不是当前轮次，关掉它。
-  harness.resetCallLog();
-  await retireRunner(harness, A1, {flushed: true, pendingUploads: 0});
-  await waitFor(() => !harness.tabs.has(RUNNER_TAB));
-  assert.equal(harness.tabs.has(SOURCE_TAB), true);
-  assertSelfStopSafety(harness, {allowedRemovedTabIds: [RUNNER_TAB]});
+test("pending or failed uploads retain the runner and lock until a successful flush receipt", async () => {
+  for (const flushing of [true, false]) {
+    const h = createHarness();
+    seedRunningRequest(h);
+    await retireRunner(h, A1, {flushing, flushed: false, pendingUploads: 2});
+    const result = await recover(h);
+    assert.equal(result.selfStopReason, "checkpoint_reports_pending");
+    assert.equal(h.tabs.has(RUNNER_TAB), true);
+    assert.equal(h.storage[LOCK_KEY].id, "lock-r");
+    assert.equal(runnerLaunches(h).length, 0);
+    await retireRunner(h, A1, {flushed: true, pendingUploads: 0});
+    await superviseAfterWait(h);
+    assert.equal(h.storage[LOCK_KEY], undefined);
+    assert.equal(h.tabs.has(RUNNER_TAB), false);
+    assert.equal(h.tabs.has(SOURCE_TAB), true);
+  }
 });
 
 test("a final receipt never closes the lock holder or the runner of the current attempt", async () => {

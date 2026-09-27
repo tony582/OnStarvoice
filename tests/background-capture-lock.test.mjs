@@ -2450,12 +2450,18 @@ test("an archived stop-fenced batch child gives the final guidance, never a retr
     {
       // 放行后 release_only 先写 stopFenceClosure，同一心跳的 create 再归档 R。
       name: "released",
-      overrides: {stopFenceClosure: {...ORPHAN_STOP_FENCE_CLOSURE}},
+      overrides: {
+        stopFenceClosure: {...ORPHAN_STOP_FENCE_CLOSURE},
+        localClosureStopConfirmation: {
+          version: 1, requestId: ORPHAN_REQUEST_ID, attemptId: ORPHAN_ATTEMPT_ID,
+          stage: "runtime_released", runtimeReleasedAt: new Date().toISOString(),
+        },
+      },
       reason: "stop_fence_released_to_cloud",
       text: /本机无需继续/,
     },
     {
-      // 例如本机手动开了新任务，把还没放行的 R 归档。
+      // 0.4.18 遗留的归档记录；0.4.19 已禁止新建任务覆盖未放行的 R。
       name: "not released",
       overrides: {},
       reason: "previous_capture_stop_requires_operator",
@@ -2466,6 +2472,21 @@ test("an archived stop-fenced batch child gives the final guidance, never a retr
     const harness = createHarness();
     seedOrphanedStopFenceAttempt(harness, scenario.overrides);
     delete harness.storage[LOCK_KEY];
+    const legacyRequest = jsonPlain(harness.storage[UNATTENDED_REQUEST_KEY]);
+    if (scenario.name === "not released") {
+      await assert.rejects(
+        harness.api.createUnattendedKeywordRunRequest(
+          buildUnattendedPlan({keywords: ["新任务关键词"]}),
+          {reason: "cloud_assignment", requestId: "next-task", cloudAssigned: true},
+        ),
+        /旧采集页面仍在自动核对/,
+      );
+      // 直接载入旧版本已经留下的历史记录，仍验证历史查看和远程恢复的提示。
+      harness.storage[UNATTENDED_ARCHIVE_KEY] = {
+        version: 1, requests: {[ORPHAN_REQUEST_ID]: legacyRequest},
+      };
+      delete harness.storage[UNATTENDED_REQUEST_KEY];
+    }
     await harness.api.createUnattendedKeywordRunRequest(
       buildUnattendedPlan({keywords: ["新任务关键词"]}),
       {reason: "cloud_assignment", requestId: "next-task", cloudAssigned: true},

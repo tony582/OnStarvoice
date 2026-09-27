@@ -15,10 +15,11 @@ const PROGRESS_MS = 10 * 60 * 1000;
 // proves its old page stopped inside `recovering` for up to eight minutes
 // (phase recovery_self_stop), refreshing the heartbeat on every try. Revoking
 // the child meanwhile would drop the fence code it may report next, so allow
-// the self-stop budget plus the usual three minutes. Progress keeps its own
-// limit, counted from the recovery transition.
+// the self-stop budget plus the usual three minutes. Self-stop heartbeats
+// deliberately do not claim business progress: only loss of response can
+// expire this phase, including delayed browser alarm ticks.
 export const KEYWORD_COVERAGE_SELF_STOP_RESPONSE_MS = 11 * 60 * 1000;
-const COMMENT_STAGE_PROGRESS_MS = 12 * 60 * 1000;
+const COMMENT_STAGE_PROGRESS_MS = 15 * 60 * 1000;
 const object = value => value && typeof value === 'object' ? value : {};
 const timestamp = value => Date.parse(String(value || '')) || 0;
 
@@ -54,6 +55,7 @@ function stalledExecution(child, now) {
   // updated_at can move on empty heartbeats; it is not evidence of progress.
   if (now - Math.max(created, started, heartbeat) >=
       (selfStopping ? KEYWORD_COVERAGE_SELF_STOP_RESPONSE_MS : RESPONSE_MS)) return 'keyword_node_no_response';
+  if (selfStopping) return '';
   const progressed = Math.max(created, started, timestamp(child.business_progress_at));
   // Same test as the Extension watchdog (assessUnattendedRunHealth): the
   // explicit comment phase, the comment relay action (reported since
@@ -63,8 +65,8 @@ function stalledExecution(child, now) {
   const commentStage = phase === 'detail_comments_capturing' || phase.startsWith('comments_') ||
     String(progress.captureAction || '').toLowerCase() === 'capturecomments' ||
     String(progress.activeStage || '').toLowerCase() === 'comments_capture';
-  // Comment detail requests can legitimately take ten minutes. Match the
-  // Extension's existing twelve-minute allowance for that explicit stage.
+  // Let the node's twelve-minute watchdog, next supervisor tick and mirror
+  // finish first. A late fence after revocation is also retained by the mirror.
   if (now - progressed >= (commentStage ? COMMENT_STAGE_PROGRESS_MS : PROGRESS_MS)) return 'keyword_node_no_progress';
   return '';
 }

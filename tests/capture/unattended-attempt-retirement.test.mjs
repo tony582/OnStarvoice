@@ -157,7 +157,7 @@ test("a stuck upload queue is bounded and the receipt reports what was left", as
   await settle();
   const receipt = runner.calls.messages.at(-1);
   assert.equal(runner.calls.messages.length, 2);
-  assert.equal(receipt.flushing, undefined);
+  assert.equal(receipt.flushing, true);
   assert.equal(receipt.flushed, false);
   assert.equal(receipt.pendingUploads, 4);
 });
@@ -246,4 +246,50 @@ test("after retirement a lost lock cannot fall back to a page-wide cancel", () =
     "if (\n      settings.autoDetailCaptureAfterListCapture",
   );
   assert.match(batch, /activeUnattendedStreamingSyncQueue = streamingSyncQueue/u);
+});
+
+test("retirement preserves pending uploads, retries a network failure and reports success only after acknowledgments", async () => {
+  const {createRecordSyncQueue} = await import('../../utils/record-sync-queue.js');
+  const runner = createRunner({flushMs: 20});
+  let failNetwork = true;
+  let unblock;
+  const calls = [];
+  runner.context.createRecordSyncQueue = options => createRecordSyncQueue({...options, retryDelaysMs: []});
+  runner.context.isTransientStreamingSyncFailure = r => r?.ok === false && r?.message === 'network';
+  runner.context.maybeRunAutoSyncAfterDetailCapture = async (_settings, options) => {
+    const id = options.recordIds[0];
+    calls.push({id, task: options.captureTaskId, stopped: options.shouldStop()});
+    if (id === 'a' && failNetwork) {
+      await new Promise(resolve => { unblock = resolve; });
+      return {ok: false, message: 'network'};
+    }
+    return {ok: true, successCount: 1};
+  };
+  vm.runInContext(readSection(sidebarSource, 'function createStreamingDetailAutoSyncQueue(',
+    'function isTransientStreamingSyncFailure(') + '\nthis.__queue = createStreamingDetailAutoSyncQueue;', runner.context);
+  const queue = runner.context.__queue({autoDetailCaptureAfterListCapture: true, autoSyncAfterDetailCapture: true}, {
+    shouldStop: () => runner.context.searchCaptureCancelRequested, captureTaskId: 'request-r',
+  });
+  runner.context.activeUnattendedStreamingSyncQueue = queue;
+  queue.enqueue('a'); queue.enqueue('b');
+  runner.context.__handle({id: 'request-r', attemptId: 'attempt-2', status: 'recovering'});
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(queue.getStats().remainingCount, 2, 'canceling collection did not empty uploads');
+  assert.equal(runner.calls.messages.at(-1).flushed, false);
+  unblock();
+  await settle();
+  assert.equal(queue.getStats().unsettledCount, 1, 'a processed failure is still an unacknowledged upload');
+  assert.equal(runner.calls.messages.at(-1).flushed, false);
+  queue.enqueue('late');
+  await queue.drain();
+  assert.equal(runner.calls.messages.at(-1).flushed, false, 'the producer is still unwinding');
+  queue.finishProducing();
+  failNetwork = false;
+  for (let i = 0; i < 100 && !runner.calls.messages.at(-1).flushed; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(runner.calls.messages.at(-1).flushed, true);
+  assert.equal(queue.getStats().unsettledCount, 0);
+  assert.deepEqual(calls.map(c => c.id), ['a', 'b', 'late', 'a']);
+  assert.ok(calls.every(c => c.task === 'request-r' && c.stopped === false));
 });

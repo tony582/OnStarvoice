@@ -3,12 +3,24 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.18',
+  latestVersion: '0.4.19',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-26',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.18-20260926.zip',
+  releaseDate: '2026-09-27',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.19-20260927.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.19',
+      releaseDate: '2026-09-27',
+      releaseNotes: [{
+        tag: '修复',
+        notes: [
+          {title: '无人值守卡住后自动核对并恢复', desc: '改进评论采集的卡住判断；恢复时只回收本次任务创建的工作页，确认旧采集已停止、已采结果上传完成后继续。仍无法确认时保留保护并自动重试；处于「需要处理」的批次子任务也会由节点自动核对，取得停止证据后恢复接单。用户自行打开的页面不会被关闭。需更新 Extension。'},
+          {title: '待上传结果继续同步', desc: '旧运行页退出采集后继续上传已采集结果，网络暂时失败会自动重试；有未同步结果或缺少停止证据时，不关闭旧运行页、不启动第二条采集流水线。'},
+          {title: '自动结清无法继续的历史任务', desc: '无法继续的补详情、手动采集和过期或次数用尽的手机任务，在宽限期后自动结算并保留已完成结果；需要登录、安全验证或停止核对的任务继续保留保护。'},
+        ],
+      }],
+    },
     {
       version: '0.4.18',
       releaseDate: '2026-09-26',
