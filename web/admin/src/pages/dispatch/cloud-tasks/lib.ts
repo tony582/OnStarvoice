@@ -1,4 +1,7 @@
 import type { AgentStopFence } from './stop-fence-presentation.mjs'
+import type { OperatorCloseEligibility } from './operator-close-presentation.mjs'
+// 「结束并移到历史」：能否结束以服务端 overview 的 operator_close 为准。
+export { canOperatorClose, operatorCloseBlockedReason, operatorCloseBlockedText } from './operator-close-presentation.mjs'
 
 export type CaptureEnhancementSettings = {
   autoDetailCaptureAfterListCapture?: boolean
@@ -116,6 +119,8 @@ export type CloudTask = {
   agent_capabilities?: Record<string, unknown> | null
   agent_allowed_platforms?: string[] | null
   resume_block_reason?: string
+  /** 需处理主任务能否「结束并移到历史」；只在 overview 里对未移到历史的 needs_action/interrupted 主任务返回。 */
+  operator_close?: OperatorCloseEligibility
 }
 
 export type TaskKeywordResult = {

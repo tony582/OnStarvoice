@@ -92,3 +92,74 @@ test('bulk ids are 1..100 UUIDs, lower-cased, de-duplicated and sorted', () => {
   assert.equal(normalizeOperatorCloseTaskIds(Array(101).fill(b)), null);
   assert.equal(normalizeOperatorCloseTaskIds('nope'), null);
 });
+
+// Admin presentation: the card explains exactly the server's reasons, and
+// only the server's eligibility shows the action.
+const admin = await import('../web/admin/src/pages/dispatch/cloud-tasks/operator-close-presentation.mjs');
+
+test('the Admin text for each explainable reason is the server message, one to one', () => {
+  assert.deepEqual(Object.keys(admin.OPERATOR_CLOSE_BLOCKED_TEXT).sort(), [...OPERATOR_CLOSE_EXPLAINED_REASONS].sort());
+  for (const reason of OPERATOR_CLOSE_EXPLAINED_REASONS) {
+    assert.equal(admin.operatorCloseBlockedText(reason), OPERATOR_CLOSE_REASON_MESSAGES[reason], reason);
+  }
+  for (const reason of ['not_root', 'status_not_closeable', '', 'unknown', undefined]) {
+    assert.equal(admin.operatorCloseBlockedText(reason), '', String(reason));
+  }
+  assert.match(admin.operatorCloseBlockedText('interrupted'), /节点上的旧页面可能仍在运行/u);
+});
+
+test('the Admin shows 「结束并移到历史」 only for a server-eligible needs_action root still in 需处理', () => {
+  const eligible = {status: 'needs_action', parent_task_id: null, attention_dismissed_at: null,
+    operator_close: {eligible: true, reason: ''}};
+  assert.equal(admin.canOperatorClose(eligible), true);
+  for (const variant of [
+    {operator_close: undefined},
+    {operator_close: {eligible: false, reason: 'stop_fence'}},
+    {status: 'interrupted'},
+    {status: 'failed'},
+    {parent_task_id: 'parent'},
+    {attention_dismissed_at: '2026-09-27T12:00:00Z'},
+  ]) {
+    assert.equal(admin.canOperatorClose({...eligible, ...variant}), false, JSON.stringify(variant));
+  }
+  assert.equal(admin.canOperatorClose(null), false);
+  const fenced = {...eligible, operator_close: {eligible: false, reason: 'stop_fence'}};
+  assert.match(admin.operatorCloseBlockedReason(fenced), /确认旧页面已停止/u);
+  assert.match(admin.operatorCloseBlockedReason({...fenced, status: 'interrupted',
+    operator_close: {eligible: false, reason: 'interrupted'}}), /任务被中断/u);
+  for (const variant of [eligible, {...fenced, attention_dismissed_at: 'x'}, {...fenced, parent_task_id: 'p'},
+    {...fenced, status: 'failed'}, {...fenced, operator_close: {eligible: false, reason: 'status_not_closeable'}},
+    {...fenced, operator_close: undefined}]) {
+    assert.equal(admin.operatorCloseBlockedReason(variant), '', JSON.stringify(variant));
+  }
+});
+
+test('confirmation and result texts say nothing is re-captured and why rows were left', () => {
+  const confirm = admin.operatorCloseConfirmText({title: '提前', task_type: 'capture'});
+  assert.equal(confirm.split('\n')[0], '结束「提前」并移到历史？');
+  assert.match(confirm, /不会重新采集，也不会向设备发送任何指令/u);
+  assert.match(confirm, /已采集的内容、运行结果和执行记录全部保留/u);
+  assert.match(confirm, /未完成的工作项会标记为失败，原状态和原因记录在任务详情里/u);
+  assert.doesNotMatch(confirm, /重新处理/u);
+  assert.match(admin.operatorCloseConfirmText({title: '手机发现作品补详情', task_type: 'discovered_post_capture'}),
+    /该作品仍可在对应手机批次里「重新处理」。$/u);
+  assert.equal(admin.operatorCloseBulkConfirmText(23),
+    '将 23 个无法继续的任务结束并移到历史？不会重新采集，也不会给设备发指令；采集结果保留。');
+  assert.equal(admin.operatorCloseBulkResultText({closedTaskIds: ['a', 'b'], alreadyClosedTaskIds: [], skipped: []}),
+    '已结束 2 个任务并移到历史');
+  assert.equal(admin.operatorCloseBulkResultText({closedTaskIds: ['a'], alreadyClosedTaskIds: ['c'],
+    skipped: [{taskId: 'x', reason: 'stop_fence'}, {taskId: 'y', reason: 'live_item'}, {taskId: 'z', reason: 'live_child'}]}),
+  '已结束 1 个任务并移到历史（另有 1 个此前已结束）；3 个未处理（待确认旧页面停止、仍有进行中的工作）');
+});
+
+test('history clear keeps the skipped rows selected and says why they stayed', () => {
+  assert.deepEqual(admin.historyClearOutcome({clearedCount: 1, skipped: [{taskId: 'a', reason: 'live_work'},
+    {taskId: 'b', reason: 'not_in_history'}]}), {
+    keepSelectedIds: ['a', 'b'],
+    notice: '已移出 1 条；2 条未移出：仍有未结束的工作或仍需处理',
+  });
+  assert.deepEqual(admin.historyClearOutcome({clearedCount: 3, skipped: [], message: '已从历史列表移除'}),
+    {keepSelectedIds: [], notice: '已从历史列表移除'});
+  assert.deepEqual(admin.historyClearOutcome({clearedCount: 2}),
+    {keepSelectedIds: [], notice: '已清除 2 条历史记录，采集内容和运行结果已保留。'});
+});

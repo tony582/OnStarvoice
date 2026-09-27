@@ -740,3 +740,38 @@ test("admin explains stop-fenced agents and releases them only through a guarded
     assert.match(ui, /label="恢复阻塞"/u);
   }
 });
+
+test("admin ends dead needs_action roots and reports history rows it could not clear", async () => {
+  const [page, card, history, lib] = await Promise.all([
+    read("web/admin/src/pages/dispatch/DispatchPage.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/TaskCard.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/HistoryView.tsx"),
+    read("web/admin/src/pages/dispatch/cloud-tasks/lib.ts"),
+  ]);
+  assert.match(page, /'\/capture-cloud\/tasks\/' \+ task\.id \+ '\/operator-close'/u);
+  assert.match(page, /'\/capture-cloud\/tasks\/operator-close', \{ taskIds \}/u);
+  assert.match(page, /queueTasks\.filter\(canOperatorClose\)\.map\(task => task\.id\)\.slice\(0, 100\)/u);
+  assert.match(page, /window\.confirm\(operatorCloseConfirmText\(task\)\)/u);
+  assert.match(page, /window\.confirm\(operatorCloseBulkConfirmText\(taskIds\.length\)\)/u);
+  assert.match(page, /清理无法继续的任务（\{operatorClosableTaskIds\.length\}）/u);
+  assert.match(page, /以下任务已经没有进行中的工作，但状态停在“需要处理”，可以结束并移到历史/u);
+  assert.match(page, /onOperatorClose=\{operatorClose\}/u);
+  assert.match(page, /清理已结束失败项/u);
+
+  assert.match(card, /const operatorClosable = Boolean\(onOperatorClose\) && canOperatorClose\(task\)/u);
+  assert.match(card, /dismissible \|\| operatorClosable\n/u);
+  assert.match(card, /: operatorClosable\s+\? 'operator-close'/u);
+  const buttons = [...card.matchAll(/\{([^{}\n]*?)\(\s*\n\s*<Button[^\n]*onOperatorClose\(task\)/gu)].map(match => match[1]);
+  assert.equal(buttons.length, 3, "mobile primary, desktop and mobile secondary");
+  for (const guard of buttons) assert.match(guard, /operatorClosable && onOperatorClose|mobilePrimaryAction === 'operator-close' && onOperatorClose/u);
+  assert.match(card, /\{operatorCloseBlocked && \(\s*<p[^>]*>暂不能结束并移到历史：\{operatorCloseBlocked\}<\/p>/u);
+  assert.match(card, /history \? '' : operatorCloseBlockedReason\(task\)/u);
+
+  assert.match(lib, /export \{ canOperatorClose, operatorCloseBlockedReason, operatorCloseBlockedText \} from '\.\/operator-close-presentation\.mjs'/u);
+  assert.match(lib, /operator_close\?: OperatorCloseEligibility/u);
+  assert.match(lib, /const DISMISSIBLE_ATTENTION_TASK_STATUSES = new Set\(\['failed', 'completed_with_failures'\]\)/u);
+
+  assert.match(history, /api\.post<HistoryClearResult>\('\/capture-cloud\/history\/clear'/u);
+  assert.match(history, /const outcome = historyClearOutcome\(result\)/u);
+  assert.match(history, /setSelectedIds\(outcome\.keepSelectedIds\)/u);
+});
