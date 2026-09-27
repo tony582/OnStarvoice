@@ -10602,6 +10602,7 @@ function createStopFenceCheckContext(offer, state, epoch = null) {
     scopedCancelSent: false,
     closedRunnerTabIds: new Set(),
     closedWorkerTabIds: new Set(),
+    discardedTabIds: new Set(),
   };
   ctx.isRequestRunnerTab = (tab) =>
     isUnattendedRunnerTabForRequest(tab, requestId, '') ||
@@ -11061,7 +11062,13 @@ async function evaluateStopFenceTab(candidate, ctx, {rescan = false} = {}) {
     };
   }
   forgetStopFenceOffPlatform(ctx, tabId);
-  if (!probe.ok) return verdict('probe_failed', {platform, title});
+  if (!probe.ok) {
+    // 探测超时（渲染进程挂住）另记一笔，供自停的“丢弃”一步使用；证据不变。
+    return {
+      ...verdict('probe_failed', {platform, title}),
+      unresponsive: probe.error?.code === 'stop_fence_probe_timeout',
+    };
+  }
   // 9. 年龄门槛：早于本次加载的文档不再查询内容脚本，无论它是否应答。
   if (!isDocumentFromCurrentRuntime(probe.documentTimeOrigin, ctx.epoch)) {
     return verdict('old_document_uninspectable', {
@@ -11082,7 +11089,10 @@ async function evaluateStopFenceTab(candidate, ctx, {rescan = false} = {}) {
   if (!activity.ok) {
     return activity.reason === 'content_absent'
       ? verdict('content_absent', current)
-      : verdict('probe_failed', current);
+      : {
+          ...verdict('probe_failed', current),
+          unresponsive: activity.error?.code === 'stop_fence_content_timeout',
+        };
   }
   if (activity.activeCount === 0) return verdict('content_idle', current);
   const activeRequests = activity.activeRequests;
@@ -11136,6 +11146,7 @@ async function sweepStopFenceBrowser(ctx, {rescan = false} = {}) {
       targets: [],
       titles: new Map(),
       errorPageTabIds: new Set(),
+      unresponsiveTabIds: new Set(),
       runnerPending: [],
       unresolved: [],
       sweptTabCount: 0,
@@ -11161,6 +11172,7 @@ async function sweepStopFenceBrowser(ctx, {rescan = false} = {}) {
   const targets = [];
   const titles = new Map();
   const errorPageTabIds = new Set();
+  const unresponsiveTabIds = new Set();
   const runnerPending = [];
   const unresolved = [];
   for (const outcome of outcomes) {
@@ -11168,6 +11180,9 @@ async function sweepStopFenceBrowser(ctx, {rescan = false} = {}) {
       targets.push(outcome.target);
       titles.set(outcome.target.tabId, outcome.title || '');
       if (outcome.errorPage === true) errorPageTabIds.add(outcome.target.tabId);
+      if (outcome.unresponsive === true) {
+        unresponsiveTabIds.add(outcome.target.tabId);
+      }
     } else if (outcome?.runnerPending) {
       runnerPending.push(outcome.runnerPending);
     } else if (outcome?.unresolved) {
@@ -11179,6 +11194,7 @@ async function sweepStopFenceBrowser(ctx, {rescan = false} = {}) {
     targets,
     titles,
     errorPageTabIds,
+    unresponsiveTabIds,
     runnerPending,
     unresolved,
     sweptTabCount: targets.length + runnerPending.length,
@@ -11723,6 +11739,17 @@ async function confirmPreviousUnattendedStopForFenceCheck(offer) {
         verdict = judgeStopFenceSweep(sweep);
       }
     }
+    // 0.4.19：冻结或挂住的页丢弃（不刷新、不关）后复扫；丢弃后报 tab_discarded。
+    if (!verdict.ok) {
+      const discarded = await discardStuckStopFenceTabs(
+        {...ctx, mode: 'fence_check', currentAttemptId: ''},
+        sweep,
+      );
+      if (discarded.length > 0) {
+        sweep = await sweepStopFenceBrowser(ctx);
+        verdict = judgeStopFenceSweep(sweep);
+      }
+    }
     if (verdict.ok) {
       relayInFlightCount = await waitForStopFenceRequestRelaysToDrain(ctx);
       if (relayInFlightCount > 0) {
@@ -12025,6 +12052,7 @@ function createRecoverySelfStopContext(request, intent, epoch, mode) {
     offPlatformChanged: false,
     scopedCancelSent: false,
     closedRunnerTabIds: new Set(),
+    discardedTabIds: new Set(),
   };
   const isSourceRequestRunnerTab = (tab) =>
     Boolean(stopFenceRunnerAttemptId(tab)) &&
@@ -12336,6 +12364,74 @@ async function closeSelfStopPendingRunners(ctx, pendingClose) {
   return {ok: true, closedTabIds};
 }
 
+// 冻结或挂住的平台页（0.4.19）：不刷新、不关，只“丢弃”（chrome.tabs.discard）。
+// 丢弃销毁页面里的旧文档（包括里面可能卡着的采集），标签页留在标签栏，用户
+// 点开时才重新加载；丢弃后的页面报 tab_discarded，扩展与服务端都认它是证明。
+// 只丢：
+// - 冻结的平台页（浏览器已把它挂起在后台，无论是否归属于 R）；
+// - 归属于 R 的平台页（锁持有页、进度页、R 的中继目标、任务组或 Debug 会话
+//   的页），探测或查询超时（渲染进程挂住）。
+// 永远不丢：活动页（Chrome 也拒绝丢弃活动页）、runner 与扩展页、非平台页
+// （归属于 R 的 about:blank 工作页除外）、仍能应答的页（包括正在跑采集的
+// 页），以及早于本次加载的旧文档（这一类仍需人工或重启浏览器）。每丢一页前
+// 重读标签页与请求槽。
+function isStopFenceDiscardCandidate(target, sweep) {
+  if (!target || isStopFenceProofTarget(target)) return false;
+  if (target.role === 'runner') return false;
+  if (target.evidence === 'tab_frozen') return true;
+  return (
+    target.role !== 'platform_tab' &&
+    target.evidence === 'probe_failed' &&
+    Boolean(sweep?.unresponsiveTabIds?.has(target.tabId))
+  );
+}
+
+async function discardStuckStopFenceTabs(ctx, sweep) {
+  const discardedTabIds = [];
+  if (typeof chrome.tabs?.discard !== 'function' || !sweep?.complete) {
+    return discardedTabIds;
+  }
+  for (const target of sweep.targets) {
+    if (!isStopFenceDiscardCandidate(target, sweep)) continue;
+    let tab;
+    try {
+      tab = await chrome.tabs.get(target.tabId);
+    } catch {
+      continue;
+    }
+    const url = String(tab?.url || tab?.pendingUrl || '');
+    const platformOrBlank =
+      isStopFenceContentScriptSiteUrl(url) ||
+      (url === 'about:blank' && target.role !== 'platform_tab');
+    if (
+      tab?.active === true ||
+      tab?.discarded === true ||
+      !platformOrBlank ||
+      // 扫描之后被唤醒（例如用户点开）的页不再按“冻结”丢弃。
+      (target.evidence === 'tab_frozen' && tab?.frozen !== true)
+    ) {
+      continue;
+    }
+    if (!(await isSelfStopRequestSlotCurrent(ctx))) break;
+    try {
+      await chrome.tabs.discard(target.tabId);
+    } catch {
+      // 以 tabs.get 的结果为准。
+    }
+    let after = null;
+    try {
+      after = await chrome.tabs.get(target.tabId);
+    } catch (error) {
+      // 丢弃后 id 被替换：新 id 的页面由复扫按 tab_discarded 判定。
+      if (isStopFenceMissingTabError(error)) discardedTabIds.push(target.tabId);
+      continue;
+    }
+    if (after?.discarded === true) discardedTabIds.push(target.tabId);
+  }
+  for (const tabId of discardedTabIds) ctx.discardedTabIds?.add(tabId);
+  return discardedTabIds;
+}
+
 // 第 5 步之后：已退役、回执已是最终回执（不再冲刷）的旧 runner 当场关掉。只关
 // 扩展为这些旧轮次建的 runner 页（URL 同时带它的请求与轮次），关后 5 秒内
 // tabs.get 报不存在才算。还在冲刷的留着，等它的最终回执到了再关（见
@@ -12489,12 +12585,21 @@ async function attemptUnattendedRecoverySelfStop(request, intent, {
     // 第 2 步：与停止保护核对相同的全量扫描与判定（页面上属于 R 的活动会收到
     // 带 id 的精确停止）。
     let sweep;
+    let verdict;
     try {
       sweep = await sweepStopFenceBrowser(ctx);
+      verdict = judgeStopFenceSweep(sweep);
+      // 冻结或挂住的页：丢弃（不刷新、不关）后复扫，以复扫结果为准。
+      if (!verdict.ok) {
+        const discarded = await discardStuckStopFenceTabs(ctx, sweep);
+        if (discarded.length > 0) {
+          sweep = await sweepStopFenceBrowser(ctx, {rescan: true});
+          verdict = judgeStopFenceSweep(sweep);
+        }
+      }
     } finally {
       await persistStopFenceOffPlatformObservations(ctx);
     }
-    const verdict = judgeStopFenceSweep(sweep);
     if (!verdict.ok) return fail(verdict.reason, {sweep, workers});
     // 第 4 步：旧 runner。
     const runnerPlan = await planSelfStopRunners(ctx, sweep.runnerPending, {
@@ -12545,6 +12650,7 @@ async function attemptUnattendedRecoverySelfStop(request, intent, {
         tries: tryIndex + 1,
         mode,
         closedTabIds: workers.closedTabIds.slice(0, 20),
+        discardedTabIds: [...ctx.discardedTabIds].slice(0, 20),
         runnerClosed: commit.runnersClosed.length > 0,
         runnerClosedWithoutReceipt: commit.runnersClosed.length > 0,
         runnersRetained: runnerPlan.retained.length,

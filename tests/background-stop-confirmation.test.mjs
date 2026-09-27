@@ -289,7 +289,19 @@ function createHarness({sessionStorage = true} = {}) {
         return {id: Number(tabId), ...patch};
       },
       async discard(tabId) {
-        forbiddenTabCalls.discard.push(Number(tabId));
+        // 与 Chrome 一致：活动页和已丢弃的页不丢弃（返回 undefined）；丢弃后
+        // 旧文档被销毁，标签页留在标签栏。
+        const id = Number(tabId);
+        forbiddenTabCalls.discard.push(id);
+        const tab = tabs.get(id);
+        if (!tab) throw new Error(`No tab with id: ${id}.`);
+        if (tab.active === true || tab.discarded === true) return undefined;
+        Object.assign(tab, {discarded: true, frozen: false, status: "unloaded"});
+        documents.delete(id);
+        contents.delete(id);
+        const documentId = tabDocuments.get(id);
+        if (documentId) deadDocuments.add(documentId);
+        return {...tab};
       },
       async create(options) {
         return {id: 900 + tabs.size, ...options};
@@ -700,10 +712,19 @@ async function runCheck(harness, offer = buildOffer()) {
 }
 
 // 每个场景都要满足的安全约束。
-function assertCheckSafety(harness, {allowedRemovedTabIds = []} = {}) {
+function assertCheckSafety(
+  harness,
+  {allowedRemovedTabIds = [], allowedDiscardedTabIds = []} = {},
+) {
   assert.deepEqual(harness.forbiddenTabCalls.reload, [], "no tabs.reload");
   assert.deepEqual(harness.forbiddenTabCalls.update, [], "no tabs.update");
-  assert.deepEqual(harness.forbiddenTabCalls.discard, [], "no tabs.discard");
+  // 0.4.19：只有冻结或挂住的页可以被丢弃（不刷新、不关），由各场景列出。
+  for (const tabId of harness.forbiddenTabCalls.discard) {
+    assert.ok(
+      allowedDiscardedTabIds.includes(tabId),
+      `unexpected tab discard ${tabId}`,
+    );
+  }
   for (const name of FORBIDDEN_FUNCTIONS) {
     assert.equal(harness.forbiddenCalls[name], 0, `${name} must not be called`);
   }
@@ -871,12 +892,16 @@ test("content_absent proves a current document only after R has no relay in flig
   assertCheckSafety(harness, {allowedRemovedTabIds: [30]});
 });
 
-test("a content query timeout or a loading tab is probe_failed and releases nothing", async () => {
-  for (const variant of ["timeout", "loading"]) {
+test("a content query timeout on R's active page or a loading tab is probe_failed and releases nothing", async () => {
+  for (const variant of ["timeout_active", "loading"]) {
     const harness = createHarness();
     seedTypicalFence(harness);
-    if (variant === "timeout") harness.content(20).hang = true;
-    else harness.tabs.get(20).status = "loading";
+    if (variant === "timeout_active") {
+      harness.content(20).hang = true;
+      harness.tabs.get(20).active = true;
+    } else {
+      harness.tabs.get(20).status = "loading";
+    }
 
     const result = await runCheck(harness);
 
@@ -885,8 +910,26 @@ test("a content query timeout or a loading tab is probe_failed and releases noth
     assert.equal(result.retryable, true, variant);
     assert.equal(harness.storage[LOCK_KEY].id, "lock-r", variant);
     assert.equal(harness.tabs.has(30), true, variant);
+    assert.deepEqual(harness.forbiddenTabCalls.discard, [], variant);
     assertCheckSafety(harness);
   }
+});
+
+test("0.4.19: R's hung background page (the content query times out) is discarded, never reloaded or closed, and then proven", async () => {
+  const harness = createHarness();
+  seedTypicalFence(harness);
+  harness.content(20).hang = true;
+
+  const result = await runCheck(harness);
+
+  assert.equal(result.accepted, true, JSON.stringify(result));
+  assert.equal(targetFor(result, 20).evidence, "tab_discarded");
+  assert.equal(harness.tabs.has(20), true, "the page stays in the tab strip");
+  assert.equal(harness.tabs.get(20).discarded, true);
+  assertCheckSafety(harness, {
+    allowedRemovedTabIds: [30],
+    allowedDiscardedTabIds: [20],
+  });
 });
 
 test("a page running only R is precisely stopped with a non-empty id, then proven", async () => {
@@ -1432,13 +1475,28 @@ test("closed, discarded and frozen pages", async () => {
   assert.equal(targetFor(discardedResult, 20).evidence, "tab_discarded");
   assertCheckSafety(discarded, {allowedRemovedTabIds: [30]});
 
+  // 0.4.19：冻结页被丢弃（不刷新、不关），之后按 tab_discarded 成立。
   const frozen = createHarness();
   seedTypicalFence(frozen);
   frozen.tabs.get(20).frozen = true;
   const frozenResult = await runCheck(frozen);
-  assert.equal(frozenResult.reason, "tab_frozen");
-  assert.equal(frozenResult.retryable, true);
-  assertCheckSafety(frozen);
+  assert.equal(frozenResult.accepted, true, JSON.stringify(frozenResult));
+  assert.equal(targetFor(frozenResult, 20).evidence, "tab_discarded");
+  assert.equal(frozen.tabs.has(20), true);
+  assertCheckSafety(frozen, {
+    allowedRemovedTabIds: [30],
+    allowedDiscardedTabIds: [20],
+  });
+
+  // Chrome 不丢弃活动页：活动的冻结页仍是 tab_frozen。
+  const activeFrozen = createHarness();
+  seedTypicalFence(activeFrozen);
+  activeFrozen.tabs.get(20).frozen = true;
+  activeFrozen.tabs.get(20).active = true;
+  const activeFrozenResult = await runCheck(activeFrozen);
+  assert.equal(activeFrozenResult.reason, "tab_frozen");
+  assert.equal(activeFrozenResult.retryable, true);
+  assertCheckSafety(activeFrozen);
 });
 
 test("an attributed page that left the platform is proven only after ten minutes off-site", async () => {
@@ -1651,12 +1709,14 @@ test("only Chrome's error-page rejection counts: a real document or any other pr
   assert.equal(errorAgain.reason, "off_platform_observing", "the window starts over");
   assertCheckSafety(reloaded);
 
-  // 其它注入失败（无权限、无响应）仍是探测失败，也不沿用旧窗口。
+  // 其它注入失败（无权限、活动页无响应）仍是探测失败，也不沿用旧窗口。
+  // （后台页无响应会被丢弃，见上面的 0.4.19 场景。）
   for (const patch of [{fail: true}, {hang: true}]) {
     const other = createHarness();
     seedTypicalFence(other);
     other.storage[STOP_FENCE_STORE_KEY] = elevenMinutesAgo();
     other.setDocument(20, patch);
+    if (patch.hang) other.tabs.get(20).active = true;
     const result = await runCheck(other);
     assert.equal(result.reason, "probe_failed", JSON.stringify(patch));
     assert.equal(targetFor(result, 20).evidence, "probe_failed");

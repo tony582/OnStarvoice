@@ -286,7 +286,19 @@ function createHarness({state = null} = {}) {
         return tab ? {...tab, ...patch} : {id: Number(tabId), ...patch};
       },
       async discard(tabId) {
-        forbiddenTabCalls.discard.push(Number(tabId));
+        // 与 Chrome 一致：活动页和已丢弃的页不丢弃（返回 undefined）；丢弃后
+        // 旧文档被销毁，标签页留在标签栏。
+        const id = Number(tabId);
+        forbiddenTabCalls.discard.push(id);
+        const tab = tabs.get(id);
+        if (!tab) throw missingTab(id);
+        if (tab.active === true || tab.discarded === true) return undefined;
+        tabs.set(id, {...tab, discarded: true, frozen: false, status: "unloaded"});
+        documents.delete(id);
+        contents.delete(id);
+        const documentId = tabDocuments.get(id);
+        if (documentId) deadDocuments.add(documentId);
+        return {...tabs.get(id)};
       },
       async create(options = {}) {
         shared.nextTabId.value += 1;
@@ -691,9 +703,17 @@ async function superviseAfterWait(harness) {
   return plain(result);
 }
 
-function assertSelfStopSafety(harness, {allowedRemovedTabIds = []} = {}) {
+function assertSelfStopSafety(
+  harness,
+  {allowedRemovedTabIds = [], allowedDiscardedTabIds = []} = {},
+) {
   assert.deepEqual(harness.forbiddenTabCalls.reload, [], "no tabs.reload");
-  assert.deepEqual(harness.forbiddenTabCalls.discard, [], "no tabs.discard");
+  for (const tabId of harness.forbiddenTabCalls.discard) {
+    assert.ok(
+      allowedDiscardedTabIds.includes(tabId),
+      `unexpected tab discard ${tabId}`,
+    );
+  }
   for (const name of FORBIDDEN_FUNCTIONS) {
     assert.equal(harness.forbiddenCalls[name], 0, `${name} must not be called`);
   }
@@ -1109,7 +1129,7 @@ test("the source page is never closed or reloaded: a capture that keeps running 
   );
 });
 
-test("an unregistered frozen platform page fails the attempt as tab_frozen and is left alone", async () => {
+test("a frozen platform page is discarded (never closed or reloaded) and then counts as proof; an active one is left alone", async () => {
   const harness = createHarness();
   seedRunningRequest(harness);
   harness.addTab({
@@ -1122,11 +1142,97 @@ test("an unregistered frozen platform page fails the attempt as tab_frozen and i
 
   const result = await recover(harness);
 
-  assert.equal(result.reason, "recovery_self_stop_pending");
-  assert.equal(result.selfStopReason, "tab_frozen");
-  assert.equal(harness.tabs.has(25), true);
-  assert.equal(harness.storage[LOCK_KEY].id, "lock-r");
-  assertSelfStopSafety(harness);
+  assert.equal(result.reason, "recovery_wait", JSON.stringify(result));
+  assert.equal(harness.tabs.has(25), true, "the frozen page stays in the tab strip");
+  assert.equal(harness.tabs.get(25).discarded, true);
+  const done = harness.storage[REQUEST_KEY].recoverySelfStop.done;
+  assert.deepEqual(done.discardedTabIds, [25]);
+  assert.equal(
+    done.targets.find((target) => target.tabId === 25).evidence,
+    "tab_discarded",
+  );
+  assert.equal(harness.storage[LOCK_KEY], undefined);
+  assertSelfStopSafety(harness, {
+    allowedRemovedTabIds: [RUNNER_TAB],
+    allowedDiscardedTabIds: [25],
+  });
+
+  // Chrome 不丢弃活动页：活动的冻结页（理论上不会出现）仍然不成立，也不被关。
+  const active = createHarness();
+  seedRunningRequest(active);
+  active.addTab({
+    id: 25,
+    url: "https://www.xiaohongshu.com/explore/user-tab",
+    frozen: true,
+    active: true,
+  });
+  await retireRunner(active);
+  active.resetCallLog();
+  const blocked = await recover(active);
+  assert.equal(blocked.reason, "recovery_self_stop_pending");
+  assert.equal(blocked.selfStopReason, "tab_frozen");
+  assert.equal(active.tabs.get(25).discarded, false);
+  assert.deepEqual(active.forbiddenTabCalls.discard, []);
+  assert.equal(active.storage[LOCK_KEY].id, "lock-r");
+  assertSelfStopSafety(active);
+});
+
+test("R's own frozen or hung source page is discarded (never reloaded or closed), then proven, and A2 starts", async () => {
+  for (const variant of ["frozen", "hung"]) {
+    const harness = createHarness();
+    seedRunningRequest(harness);
+    if (variant === "frozen") harness.patchTab(SOURCE_TAB, {frozen: true});
+    else harness.setDocument(SOURCE_TAB, {hang: true});
+    await retireRunner(harness);
+    harness.resetCallLog();
+
+    const result = await recover(harness);
+
+    assert.equal(result.reason, "recovery_wait", `${variant}: ${JSON.stringify(result)}`);
+    assert.equal(harness.tabs.has(SOURCE_TAB), true, `${variant}: the source page stays`);
+    assert.equal(harness.tabs.get(SOURCE_TAB).discarded, true, variant);
+    const done = harness.storage[REQUEST_KEY].recoverySelfStop.done;
+    assert.deepEqual(done.discardedTabIds, [SOURCE_TAB], variant);
+    assert.equal(harness.storage[LOCK_KEY], undefined, variant);
+    assertSelfStopSafety(harness, {
+      allowedRemovedTabIds: [RUNNER_TAB],
+      allowedDiscardedTabIds: [SOURCE_TAB],
+    });
+    const launched = await superviseAfterWait(harness);
+    assert.equal(launched.recovered, true, `${variant}: ${JSON.stringify(launched)}`);
+    assert.equal(runnerLaunches(harness).length, 1, variant);
+  }
+});
+
+test("a hung source page that is the active tab, or a hung page not attributed to R, is never discarded", async () => {
+  const active = createHarness();
+  seedRunningRequest(active);
+  active.patchTab(SOURCE_TAB, {active: true});
+  active.setDocument(SOURCE_TAB, {hang: true});
+  await retireRunner(active);
+  active.resetCallLog();
+  const blocked = await recover(active);
+  assert.equal(blocked.reason, "recovery_self_stop_pending");
+  assert.equal(blocked.selfStopReason, "probe_failed");
+  assert.deepEqual(active.forbiddenTabCalls.discard, []);
+  assert.equal(active.storage[LOCK_KEY].id, "lock-r");
+  assertSelfStopSafety(active);
+
+  const unrelated = createHarness();
+  seedRunningRequest(unrelated);
+  unrelated.addTab({
+    id: 27,
+    url: "https://www.douyin.com/search/other",
+    timeOrigin: freshDocument(),
+  });
+  unrelated.setDocument(27, {hang: true});
+  await retireRunner(unrelated);
+  unrelated.resetCallLog();
+  const failing = await recover(unrelated);
+  assert.equal(failing.selfStopReason, "probe_failed");
+  assert.deepEqual(unrelated.forbiddenTabCalls.discard, []);
+  assert.equal(unrelated.tabs.get(27).discarded, false);
+  assertSelfStopSafety(unrelated);
 });
 
 test("a registered worker the user took elsewhere is forgotten, and one the user is looking at is not closed", async () => {
@@ -1612,7 +1718,7 @@ test("S2': a node check closes a frozen worker registered to R and then proves t
   assertSelfStopSafety(harness, {allowedRemovedTabIds: [worker]});
 });
 
-test("S2': an unregistered frozen page stays tab_frozen and a failing source page is never closed", async () => {
+test("S2': an unregistered frozen page is discarded (not closed) and a failing source page is never closed", async () => {
   const unregistered = createHarness();
   seedFencedForCheck(unregistered);
   unregistered.addTab({
@@ -1620,12 +1726,17 @@ test("S2': an unregistered frozen page stays tab_frozen and a failing source pag
     url: "https://www.xiaohongshu.com/explore/unregistered",
     frozen: true,
   });
+  unregistered.resetCallLog();
   const frozen = plain(
     await unregistered.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer()),
   );
-  assert.equal(frozen.accepted, false);
-  assert.equal(frozen.reason, "tab_frozen");
-  assert.equal(unregistered.tabs.has(26), true);
+  assert.equal(frozen.accepted, true, JSON.stringify(frozen));
+  assert.equal(
+    frozen.targets.find((target) => target.tabId === 26)?.evidence,
+    "tab_discarded",
+  );
+  assert.equal(unregistered.tabs.has(26), true, "discarded, never closed");
+  assertSelfStopSafety(unregistered, {allowedDiscardedTabIds: [26]});
 
   const source = createHarness();
   seedRunningRequest(source);
@@ -1637,9 +1748,12 @@ test("S2': an unregistered frozen page stays tab_frozen and a failing source pag
     await source.api.confirmPreviousUnattendedStopForFenceCheck(buildOffer()),
   );
   assert.equal(mixed.accepted, false);
+  assert.equal(mixed.reason, "tab_busy_unattributed");
   assert.equal(source.tabs.has(worker), true, "not every failing page is a registered worker");
   assert.equal(source.tabs.has(SOURCE_TAB), true);
-  assertSelfStopSafety(source);
+  assert.equal(source.tabs.get(SOURCE_TAB).discarded, false, "a live page is never discarded");
+  // 冻结的工作页被丢弃（不是关闭）；应答中的来源页不动。
+  assertSelfStopSafety(source, {allowedDiscardedTabIds: [worker]});
 });
 
 test("self-stop retries on a one-minute cadence while the replacement keeps its recovery delay", async () => {
