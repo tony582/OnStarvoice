@@ -55,8 +55,14 @@ function stalledExecution(child, now) {
   if (now - Math.max(created, started, heartbeat) >=
       (selfStopping ? KEYWORD_COVERAGE_SELF_STOP_RESPONSE_MS : RESPONSE_MS)) return 'keyword_node_no_response';
   const progressed = Math.max(created, started, timestamp(child.business_progress_at));
+  // Same test as the Extension watchdog (assessUnattendedRunHealth): the
+  // explicit comment phase, the comment relay action (reported since
+  // 0.4.19), or the stage of the page in front while a prefetch event of
+  // the second work page owns `phase` (S1-1 of
+  // docs/hotfix/20260927-unattended-self-heal.md).
   const commentStage = phase === 'detail_comments_capturing' || phase.startsWith('comments_') ||
-    String(progress.captureAction || '').toLowerCase() === 'capturecomments';
+    String(progress.captureAction || '').toLowerCase() === 'capturecomments' ||
+    String(progress.activeStage || '').toLowerCase() === 'comments_capture';
   // Comment detail requests can legitimately take ten minutes. Match the
   // Extension's existing twelve-minute allowance for that explicit stage.
   if (now - progressed >= (commentStage ? COMMENT_STAGE_PROGRESS_MS : PROGRESS_MS)) return 'keyword_node_no_progress';

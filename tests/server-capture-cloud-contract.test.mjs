@@ -5212,3 +5212,38 @@ test("stop-fence closure leaves the admission fence byte-identical and only expl
   assert.match(recheck, /requireCriticalTenantAccess, requireSessionUser, requireTenantWriter, requireBrowserNodeControl/u);
   assert.match(recheck, /capture_agent\.stop_fence_recheck_requested/u);
 });
+
+// docs/hotfix/20260927-unattended-self-heal.md: S1-1/S1-4 report the stage of
+// the page in front, the comment relay action and the self-stop reason; the
+// server stores them as sent. The stop-fence check round (S3) is server
+// state and never comes from a device.
+test("a 0.4.19 snapshot keeps the front stage, relay action and self-stop reason, never a check round", () => {
+  const snapshot = normalizeCloudTaskSnapshot({
+    id: "unattended-request-1",
+    status: "needs_action",
+    taskType: "unattended_keyword_capture",
+    platform: "xiaohongshu",
+    progress: {
+      phase: "detail_item_prefetch_ready",
+      current: 29,
+      total: 50,
+      activeStage: "comments_capture",
+      captureAction: "captureComments",
+    },
+    error: {
+      code: "PREVIOUS_CAPTURE_STOP_UNCONFIRMED",
+      reason: "self_stop:tab_frozen",
+      message: "旧采集页面未能安全停止",
+    },
+    metadata: {
+      stopFenceCheck: {version: 1, checkId: "11111111-1111-4111-8111-111111111111"},
+      workflow: "unattended_keyword_capture",
+    },
+  });
+  assert.equal(snapshot.progress.activeStage, "comments_capture");
+  assert.equal(snapshot.progress.captureAction, "captureComments");
+  assert.equal(snapshot.progress.current, 29);
+  assert.equal(snapshot.error.reason, "self_stop:tab_frozen");
+  assert.equal("stopFenceCheck" in snapshot.metadata, false);
+  assert.equal(snapshot.metadata.workflow, "unattended_keyword_capture");
+});

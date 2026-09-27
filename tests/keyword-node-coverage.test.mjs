@@ -65,6 +65,23 @@ test('long comment requests retain the existing twelve-minute allowance', () => 
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress');
 });
 
+// S1-1: a prefetch event of the second work page owns `phase` while the page
+// in front captures comments; 0.4.19 reports that stage (and the relay
+// action) next to it, like the Extension watchdog reads them.
+test('the comment allowance follows the page in front, not a prefetch phase', () => {
+  const input = fixture();
+  const prefetch = extra => ({status: 'running', created_at: ago(20), started_at: ago(20), heartbeat_at: ago(0),
+    business_progress_at: ago(11), progress: {phase: 'detail_item_prefetch_ready', ...extra}});
+  input.child = prefetch({activeStage: 'comments_capture', captureAction: ''});
+  assert.equal(keywordCoverageSkipReason(input, now), '', 'still inside twelve minutes');
+  input.child = prefetch({activeStage: 'note_capture', captureAction: 'captureComments'});
+  assert.equal(keywordCoverageSkipReason(input, now), '', 'the comment relay action alone also counts');
+  input.child = prefetch({activeStage: 'note_capture', captureAction: ''});
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress', 'other stages keep ten minutes');
+  input.child = {...prefetch({activeStage: 'comments_capture'}), business_progress_at: ago(13)};
+  assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_no_progress');
+});
+
 test('explicit failures settle without exhausting automatic retries; completed sibling gives next word time', () => {
   const input = fixture(); input.item.status = 'retryable';
   assert.equal(keywordCoverageSkipReason(input, now), 'keyword_node_failed');
