@@ -159,9 +159,11 @@ test('orchestration detail omits retired closure blocking and keeps separate sta
   assert.doesNotMatch(source, /recovery\.nextEvaluationAt/u);
   assert.doesNotMatch(source, /recovery\.next_evaluation_at/u);
   assert.doesNotMatch(source, /hasVisibleRecoveryCountdown/u);
+  // The retry list uses the server's gates (retry-item-allocation.js):
+  // heartbeat claim for retryable elastic keywords, manual retry otherwise.
   assert.match(
     source,
-    /elasticPool[\s\S]*RETRY_SOURCE_RELEASED_EXECUTION_STATUSES\.has\(sourceStatus\)/u,
+    /keywordRetrySourceReleased\(\{ item, execution: sourceExecution, elasticPool \}\)/u,
   );
   assert.match(
     source,
