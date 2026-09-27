@@ -80,6 +80,8 @@ const HANDOFF_PLATFORM_SAFETY_CODES = new Set([
   'CAPTCHA_PAGE_DETECTED',
 ]);
 const RETRY_ITEM_STATUSES = new Set(['retryable', 'needs_action', 'failed']);
+export const RETRY_ITEMS_MOBILE_SOURCE_MESSAGE =
+  '手机采集的关键词不能在原批次里重试（手机不接收重试任务）；需要重采请新建手机采集批次';
 const RETRY_AGENT_SLOT_BLOCKING_STATUSES = [
   'pending',
   'waiting_device',
@@ -2217,6 +2219,8 @@ async function loadIdlePendingRetryAgent(tx, {tenantId, parent, lineage}) {
     agentIds: lineage.preferredAgentId ? [lineage.preferredAgentId] : [],
   });
   const eligibleCandidates = candidates.filter(agent =>
+    // The waiting retry goes out as a browser create command; phones never read one.
+    safeJson(agent.capabilities).agentKind !== 'android_mobile' &&
     !agentCompatibilityFailure(agent, parent.platform, planSnapshot) &&
     captureAgentFullHeartbeatOnline(agent) &&
     crossDeviceRetryAgentDailyUsageEligible(agent)
@@ -5836,6 +5840,24 @@ router.post(
             409,
           )};
         }
+        // A phone keyword cannot be re-run inside its old batch: the Runner
+        // reads no create command, a fixed-batch phone child never reopens
+        // and the elastic phone claim counts attempts absolutely, so the
+        // retry would be accepted and then wait forever. Only reachable once
+        // 「结束并移到历史」 settled the phone child; a new phone batch re-captures.
+        const mobileSourceTaskIds = new Set(sourceTasks
+          .filter(task => safeJson(task.metadata).workflow === MOBILE_WORKFLOW)
+          .map(task => String(task.id)));
+        if (mobileSourceTaskIds.size > 0) {
+          return {failure: requestError(
+            'retry_items_mobile_source',
+            RETRY_ITEMS_MOBILE_SOURCE_MESSAGE,
+            409,
+            {itemIds: retryItems
+              .filter(item => mobileSourceTaskIds.has(String(item.execution_task_id || '')))
+              .map(item => item.id)},
+          )};
+        }
 
         retryItems.sort(
           (left, right) => Number(left.ordinal) - Number(right.ordinal),
@@ -5873,6 +5895,9 @@ router.post(
         for (const agent of candidateAgents) {
           const agentId = String(agent.id);
           if (
+            // Retries go out as browser create commands, which a phone never
+            // reads (cross-device retry excludes phones the same way).
+            safeJson(agent.capabilities).agentKind === 'android_mobile' ||
             agentCompatibilityFailure(agent, parent.platform, planSnapshot) ||
             !captureAgentFullHeartbeatOnline(agent) ||
             !crossDeviceRetryAgentDailyUsageEligible(agent)

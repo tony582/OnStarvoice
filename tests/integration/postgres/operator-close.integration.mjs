@@ -46,6 +46,8 @@ test('operator close ends dead needs_action roots without releasing fences, live
   const {clearCaptureOverviewProjectionCache, dispatchNextElasticWorkItem, mirrorTaskSnapshot,
     reconcileAutomaticCaptureRetries, refreshOrchestrationParentTask} =
     await import('../../../server/routes/capture-cloud.js');
+  const {RETRY_ITEMS_MOBILE_SOURCE_MESSAGE, reconcilePendingOrchestrationRetries} =
+    await import('../../../server/routes/capture-orchestrations.js');
   const {loadOperatorCloseEligibility} = await import('../../../server/services/capture-operator-close.js');
   const {createAndroidControlService} = await import('../../../server/services/android-control/service.js');
   const {createDiscoveryRepository} = await import('../../../server/services/capture-discovery/repository.js');
@@ -975,5 +977,83 @@ test('operator close ends dead needs_action roots without releasing fences, live
       assert.equal(current.status, 'dispatched', item.keyword);
       assert.equal(current.assigned_agent_id, jupiter.id);
     }
+  });
+
+  await t.test('a phone batch closed with 「结束并移到历史」 refuses 「重试失败关键词」, and no retry is handed to a phone', async st => {
+    const f = await fixture(st);
+    const android = createAndroidControlService({enabledTenants: () => new Set([f.tenant.id])});
+    const [phoneCode] = await query('INSERT INTO auth_codes(tenant_id,code,max_bindings) VALUES($1,$2,4) RETURNING *',
+      [f.tenant.id, randomUUID()]);
+    const registration = {code: phoneCode.code, clientUuid: randomUUID(), deviceId: `test-${randomUUID()}`};
+    const phone = (await query('SELECT * FROM capture_agents WHERE id=$1', [(await android.register(registration)).agent.id]))[0];
+    const principal = {tenantId: f.tenant.id, agentId: phone.id, authCodeId: phone.auth_code_id, authBindingId: phone.auth_binding_id};
+    const sessionId = randomUUID();
+    const poll = () => android.poll(principal, {sessionId, deviceId: registration.deviceId, readyForSearch: true});
+    const plan = {platform: 'douyin', keywords: ['别克壁纸', '君越壁纸'],
+      searchFilters: {sort: 'latest', publishTime: 'day', contentType: 'video'}, keywordMaxDetectedItems: 40,
+      recoveryPolicy: {disableAutomaticSearchRetry: true, singleRelayV1: true}};
+    // A phone that is idle, online and has searched today: the kind of node
+    // retry-items used to pick.
+    await query(`INSERT INTO social_agent_daily_usage(tenant_id,agent_id,platform,usage_date,searches,last_event_at)
+      VALUES($1,$2,'douyin',(now() AT TIME ZONE 'Asia/Shanghai')::date,1,now())`, [f.tenant.id, phone.id]);
+    const [parent] = await query(`INSERT INTO capture_tasks(tenant_id,client_task_id,task_type,feature_key,title,platform,
+      source,trigger_type,status,metadata,orchestration_revision)
+      VALUES($1,$2,'capture_orchestration','keyword_orchestration','手机采集','douyin','cloud','manual',
+        'running',$3,1) RETURNING *`,
+    [f.tenant.id, randomUUID(), {distributionMode: 'elastic_pool', claimUnit: 'keyword', eligibleAgentIds: [phone.id],
+      executionMode: 'one_time', planSnapshot: plan}]);
+    const [exhausted] = await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,ordinal,keyword,platform,
+      item_type,status,attempt_count,assignment_revision) VALUES($1,$2,'keyword:0',0,'别克壁纸','douyin','keyword',
+      'pending',2,2) RETURNING *`, [f.tenant.id, parent.id]);
+    const claimed = await poll();
+    assert.equal(claimed.task.keyword, '别克壁纸');
+    await android.complete(principal, {requestId: randomUUID(), identity: claimed.task.identity, sessionId,
+      status: 'interrupted', deviceIdle: true});
+    assert.equal((await f.itemRow(exhausted.id)).status, 'needs_action');
+    assert.equal((await f.close(parent.id)).status, 200);
+    const closed = await f.row(parent.id);
+    assert.equal(closed.status, 'completed_with_failures');
+    assert.equal((await f.row(claimed.task.identity.taskId)).status, 'failed', 'the phone child is settled');
+    const itemBefore = await f.itemRow(exhausted.id);
+    assert.equal(itemBefore.status, 'failed');
+
+    await poll();
+    const refused = await f.request(`/orchestrations/${parent.id}/retry-items`, {body: {
+      requestKey: randomUUID(), expectedRevision: closed.orchestration_revision, itemIds: [exhausted.id]}});
+    assert.equal(refused.status, 409, JSON.stringify(refused.body));
+    assert.equal(refused.body.error, 'retry_items_mobile_source');
+    assert.equal(refused.body.message, RETRY_ITEMS_MOBILE_SOURCE_MESSAGE);
+    assert.deepEqual(refused.body.itemIds, [exhausted.id]);
+    const after = await f.row(parent.id);
+    assert.equal(after.status, 'completed_with_failures', 'the closed batch stays closed');
+    assert.equal(after.orchestration_revision, closed.orchestration_revision);
+    assert.ok(after.attention_dismissed_at, 'and stays in history');
+    assert.deepEqual(await f.itemRow(exhausted.id), itemBefore);
+
+    // A browser keyword of a douyin batch is not handed to that idle phone:
+    // a create command is something the phone never reads.
+    const browser = await f.addAgent('西瓜', {platforms: ['douyin'],
+      capabilities: {...XHS_CAPABILITIES, supportedPlatforms: ['douyin']}});
+    await query(`UPDATE capture_agents SET last_heartbeat_at=now()-interval '1 day',
+      last_full_heartbeat_at=now()-interval '1 day',last_liveness_at=now()-interval '1 day' WHERE id=$1`, [browser.id]);
+    const douyinBatch = await f.batch({platform: 'douyin', agents: [browser, phone],
+      metadata: {distributionMode: 'fixed_batch', claimUnit: 'fixed_batch', planSnapshot: plan}});
+    const browserChild = await f.child(douyinBatch, browser, {status: 'failed'});
+    const browserItem = await f.item(douyinBatch, {keyword: '别克壁纸', status: 'failed', execution: browserChild,
+      agent: browser, error: TECHNICAL_ERROR, attemptStatus: 'failed'});
+    await poll();
+    const handed = await f.request(`/orchestrations/${douyinBatch.id}/retry-items`, {body: {
+      requestKey: randomUUID(), expectedRevision: douyinBatch.orchestration_revision, itemIds: [browserItem.id]}});
+    assert.equal(handed.status, 201, JSON.stringify(handed.body));
+    assert.deepEqual(handed.body.executions, [], 'waits for a browser instead');
+    assert.equal((await f.itemRow(browserItem.id)).status, 'retryable');
+    // The waiting-retry dispatcher does not pick the phone later either.
+    await poll();
+    await reconcilePendingOrchestrationRetries({limit: 20});
+    const waiting = await f.itemRow(browserItem.id);
+    assert.equal(waiting.status, 'retryable');
+    assert.equal(waiting.metadata.retryPending, true, 'still waiting for a browser');
+    assert.equal((await query('SELECT COUNT(*)::integer AS n FROM capture_agent_commands WHERE agent_id=$1',
+      [phone.id]))[0].n, 0, 'no create command is queued for the phone');
   });
 });
