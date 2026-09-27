@@ -80,6 +80,18 @@ const HANDOFF_PLATFORM_SAFETY_CODES = new Set([
   'CAPTCHA_PAGE_DETECTED',
 ]);
 const RETRY_ITEM_STATUSES = new Set(['retryable', 'needs_action', 'failed']);
+// An operator reopening a dismissed or history-cleared batch (retry-items,
+// manual handoff) consents to the keywords they picked, not to the rest:
+// reconcileAutomaticCaptureRetries skips roots with this marker, so the
+// cleared dismissal (the batch shows up in 需处理 again) does not let the
+// cron re-run keywords the operator left alone. SET expressions read the
+// row before the update, i.e. while it was still dismissed.
+const REOPENED_FROM_HISTORY_MARKER_SQL = `CASE
+  WHEN capture_tasks.attention_dismissed_at IS NOT NULL
+    OR capture_tasks.metadata ? 'historyClearedAt'
+  THEN jsonb_build_object('reopenedFromHistoryAt', now())
+  ELSE '{}'::jsonb
+END`;
 export const RETRY_ITEMS_MOBILE_SOURCE_MESSAGE =
   '手机采集的关键词不能在原批次里重试（手机不接收重试任务）；需要重采请新建手机采集批次';
 const RETRY_AGENT_SLOT_BLOCKING_STATUSES = [
@@ -6299,7 +6311,7 @@ router.post(
               'lastRetryRequestHash', $6::text,
               'lastRetryAssignments', $7::jsonb,
               'lastRetryWaiting', $8::jsonb
-            ),
+            ) || ${REOPENED_FROM_HISTORY_MARKER_SQL},
             message = CASE
               WHEN jsonb_array_length($4::jsonb) = 0
                 THEN '失败关键词尚未下发，正在等待兼容的空闲 Agent'
@@ -7046,7 +7058,7 @@ router.post(
               'lastHandoffSourceExecutionTaskId', $4::uuid::text,
               'lastHandoffSuccessorTaskId', $5::uuid::text,
               'lastHandoffRequestKey', $6::uuid::text
-            ),
+            ) || ${REOPENED_FROM_HISTORY_MARKER_SQL},
             message = '未开始关键词已由人工确认转交空闲节点',
             finished_at = NULL,
             attention_dismissed_at = NULL,

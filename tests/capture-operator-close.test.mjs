@@ -65,6 +65,14 @@ test('a closed work item stays out of automatic retry until an operator re-dispa
   const cloud = readFileSync(new URL('../server/routes/capture-cloud.js', import.meta.url), 'utf8');
   assert.match(cloud, /item => !\(automatic && operatorClosedWorkItem\(item\)\) &&/u,
     'dispatchCrossDeviceRetry skips it only for automatic (cron, duty) callers');
+  // A batch an operator reopened from history (dismissed, cleared or closed)
+  // is marked by both fixed-batch reopen paths and skipped by the cron scan.
+  const orchestrations = readFileSync(new URL('../server/routes/capture-orchestrations.js', import.meta.url), 'utf8');
+  assert.match(orchestrations, /WHEN capture_tasks\.attention_dismissed_at IS NOT NULL\s+OR capture_tasks\.metadata \? 'historyClearedAt'\s+THEN jsonb_build_object\('reopenedFromHistoryAt', now\(\)\)/u);
+  assert.equal(orchestrations.split('|| ${REOPENED_FROM_HISTORY_MARKER_SQL},').length - 1, 2,
+    'retry-items and manual handoff');
+  const cron = cloud.slice(cloud.indexOf('export async function reconcileAutomaticCaptureRetries'));
+  assert.match(cron.slice(0, cron.indexOf('ORDER BY')), /AND NOT \(metadata \? 'reopenedFromHistoryAt'\)/u);
 });
 
 test('the SQL twin checks the same four facts with constant cost', () => {

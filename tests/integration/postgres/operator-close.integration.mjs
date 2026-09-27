@@ -43,8 +43,8 @@ test('operator close ends dead needs_action roots without releasing fences, live
   const {createSession} = await import('../../../server/services/auth-service.js');
   const {normalizeCloudTaskSnapshot, findCaptureAgentExecutionSlotBlocker} =
     await import('../../../server/services/capture-cloud.js');
-  const {clearCaptureOverviewProjectionCache, dispatchNextElasticWorkItem, mirrorTaskSnapshot,
-    reconcileAutomaticCaptureRetries, refreshOrchestrationParentTask} =
+  const {clearCaptureOverviewProjectionCache, dispatchCrossDeviceRetry, dispatchNextElasticWorkItem,
+    mirrorTaskSnapshot, reconcileAutomaticCaptureRetries, refreshOrchestrationParentTask} =
     await import('../../../server/routes/capture-cloud.js');
   const {RETRY_ITEMS_MOBILE_SOURCE_MESSAGE, reconcilePendingOrchestrationRetries} =
     await import('../../../server/routes/capture-orchestrations.js');
@@ -921,62 +921,113 @@ test('operator close ends dead needs_action roots without releasing fences, live
     assert.ok(await f.overviewTask(patrol.id), 'the recovered patrol is on the overview');
   });
 
-  await t.test('a partial 「重试失败关键词」 on a closed fixed batch never lets the cron re-run the other closed keywords', async st => {
+  await t.test('a partial 「重试失败关键词」 on a closed or dismissed fixed batch never lets the cron re-run the rest', async st => {
     const f = await fixture(st);
     const [mars, jupiter] = [await f.addAgent('火星'), await f.addAgent('木星')];
-    // The source is offline and 木星 idle: without the guard the cron hands
-    // every closed keyword with attempt_count < 2 to 木星.
+    // The source is offline and 木星 idle: without the guards the cron hands
+    // every failed keyword with attempt_count < 2 to 木星.
     await query(`UPDATE capture_agents SET last_heartbeat_at=now()-interval '1 day',
       last_full_heartbeat_at=now()-interval '1 day',last_liveness_at=now()-interval '1 day' WHERE id=$1`, [mars.id]);
-    const keywords = ['君越壁纸', '昂科威壁纸', '别克壁纸'];
-    const parent = await f.batch({agents: [mars, jupiter], metadata: {distributionMode: 'fixed_batch',
-      claimUnit: 'fixed_batch', planSnapshot: {enabled: true, platform: 'xiaohongshu', keywords,
-        keywordMaxDetectedItems: 5, searchPasses: ['all'], searchFilters: {publishTime: 'day'}}}});
-    const marsChild = await f.child(parent, mars);
-    const items = [];
-    for (const keyword of keywords) {
-      items.push(await f.item(parent, {keyword, execution: marsChild, agent: mars, error: TECHNICAL_ERROR}));
+    const fixedBatch = async (keywords, {status = 'needs_action'} = {}) => {
+      const parent = await f.batch({status, agents: [mars, jupiter], metadata: {distributionMode: 'fixed_batch',
+        claimUnit: 'fixed_batch', planSnapshot: {enabled: true, platform: 'xiaohongshu', keywords,
+          keywordMaxDetectedItems: 5, searchPasses: ['all'], searchFilters: {publishTime: 'day'}}}});
+      const marsChild = await f.child(parent, mars, {status: status === 'needs_action' ? 'needs_action' : 'failed'});
+      return {parent, marsChild};
+    };
+    const commandsTo = async agent => (await query(
+      'SELECT COUNT(*)::integer AS n FROM capture_agent_commands WHERE agent_id=$1', [agent.id]))[0].n;
+    const childCount = async parentId => (await query(
+      'SELECT COUNT(*)::integer AS n FROM capture_tasks WHERE parent_task_id=$1', [parentId]))[0].n;
+    // Retry one keyword through the route, then let it finish.
+    const retryOne = async (parent, item) => {
+      const retried = await f.request(`/orchestrations/${parent.id}/retry-items`, {body: {
+        requestKey: randomUUID(), expectedRevision: (await f.row(parent.id)).orchestration_revision,
+        itemIds: [item.id]}});
+      assert.equal(retried.status, 201, JSON.stringify(retried.body));
+      await query(`UPDATE capture_task_items SET status='completed', finished_at=now() WHERE id=$1`, [item.id]);
+      await withTransaction(tx => refreshOrchestrationParentTask(tx, {tenantId: f.tenant.id, parentTaskId: parent.id}));
+      const settled = await f.row(parent.id);
+      assert.equal(settled.status, 'completed_with_failures');
+      assert.equal(settled.attention_dismissed_at, null, 'the retried batch is visible again');
+      return settled;
+    };
+
+    // 1. 「结束并移到历史」: three needs_action keywords plus one that had
+    //    already failed before the close (no item marker).
+    const closedRun = await fixedBatch(['君越壁纸', '昂科威壁纸', '别克壁纸', '凯迪拉克壁纸']);
+    const closedItems = [];
+    for (const keyword of ['君越壁纸', '昂科威壁纸', '别克壁纸']) {
+      closedItems.push(await f.item(closedRun.parent, {keyword, execution: closedRun.marsChild, agent: mars,
+        error: TECHNICAL_ERROR}));
     }
-    const [retriedItem, ...closedItems] = items;
-    assert.equal((await f.close(parent.id)).status, 200);
-    const closed = await f.row(parent.id);
-    assert.equal((await reconcileAutomaticCaptureRetries({tenantId: f.tenant.id, taskIds: [parent.id]})).scanned, 0,
-      'a dismissed closed batch is not scanned');
-
-    const retried = await f.request(`/orchestrations/${parent.id}/retry-items`, {body: {
-      requestKey: randomUUID(), expectedRevision: closed.orchestration_revision, itemIds: [retriedItem.id]}});
-    assert.equal(retried.status, 201, JSON.stringify(retried.body));
-    // The one retried keyword finishes; the batch settles and is no longer dismissed.
-    await query(`UPDATE capture_task_items SET status='completed', finished_at=now() WHERE id=$1`, [retriedItem.id]);
-    await withTransaction(tx => refreshOrchestrationParentTask(tx, {tenantId: f.tenant.id, parentTaskId: parent.id}));
-    const settled = await f.row(parent.id);
-    assert.equal(settled.status, 'completed_with_failures');
-    assert.equal(settled.attention_dismissed_at, null);
-    const before = await Promise.all(closedItems.map(item => f.itemRow(item.id)));
-    const childCount = async () => Number((await query(
-      'SELECT COUNT(*)::integer AS n FROM capture_tasks WHERE parent_task_id=$1', [parent.id]))[0].n);
-    const childrenBefore = await childCount();
-
-    const automatic = await reconcileAutomaticCaptureRetries({tenantId: f.tenant.id, taskIds: [parent.id]});
-    assert.equal(automatic.scanned, 1);
-    assert.equal(automatic.dispatched, 0, JSON.stringify(automatic));
-    assert.equal(automatic.waitingForAgent, 0, JSON.stringify(automatic));
-    assert.deepEqual(await Promise.all(closedItems.map(item => f.itemRow(item.id))), before,
-      'the keywords the operator ended stay failed and untouched');
-    assert.equal(await childCount(), childrenBefore, 'no automatic retry child');
-    assert.equal((await query('SELECT COUNT(*)::integer AS n FROM capture_agent_commands WHERE agent_id=$1',
-      [jupiter.id]))[0].n, 0, 'no command reaches the idle node');
-
+    const failedBefore = await f.item(closedRun.parent, {keyword: '凯迪拉克壁纸', status: 'failed',
+      execution: closedRun.marsChild, agent: mars, error: TECHNICAL_ERROR});
+    assert.equal((await f.close(closedRun.parent.id)).status, 200);
+    assert.equal((await reconcileAutomaticCaptureRetries({tenantId: f.tenant.id,
+      taskIds: [closedRun.parent.id]})).scanned, 0, 'a dismissed closed batch is not scanned');
+    const [retriedItem, ...leftItems] = closedItems;
+    const settled = await retryOne(closedRun.parent, retriedItem);
+    assert.ok(settled.metadata.reopenedFromHistoryAt, 'reopened from history by the operator');
+    const before = await Promise.all([...leftItems, failedBefore].map(item => f.itemRow(item.id)));
+    const childrenBefore = await childCount(closedRun.parent.id);
+    const automatic = await reconcileAutomaticCaptureRetries({tenantId: f.tenant.id, taskIds: [closedRun.parent.id]});
+    assert.equal(automatic.scanned, 0, JSON.stringify(automatic));
+    assert.deepEqual(await Promise.all([...leftItems, failedBefore].map(item => f.itemRow(item.id))), before,
+      'the keywords the operator did not pick stay failed and untouched');
+    assert.equal(await childCount(closedRun.parent.id), childrenBefore, 'no automatic retry child');
+    assert.equal(await commandsTo(jupiter), 0, 'no command reaches the idle node');
+    // Any other automatic caller skips the items the operator ended.
+    await assert.rejects(dispatchCrossDeviceRetry({tenantId: f.tenant.id, taskId: closedRun.parent.id,
+      requestKey: randomUUID(), expectedRevision: settled.orchestration_revision, automatic: true,
+      itemIds: leftItems.map(item => item.id)}),
+    error => error?.crossDeviceRetryError === 'retry_items_not_automatically_recoverable');
+    assert.deepEqual(await Promise.all(leftItems.map(item => f.itemRow(item.id))), before.slice(0, 2));
     // An explicit 换设备重试 by the operator still re-runs them.
-    const manual = await f.request(`/tasks/${parent.id}/retry-on-idle-agent`, {body: {
+    const manual = await f.request(`/tasks/${closedRun.parent.id}/retry-on-idle-agent`, {body: {
       requestKey: randomUUID(), expectedRevision: settled.orchestration_revision}});
     assert.equal(manual.status, 201, JSON.stringify(manual.body));
     assert.equal(manual.body.targetAgentId, jupiter.id);
-    for (const item of closedItems) {
+    for (const item of leftItems) {
       const current = await f.itemRow(item.id);
       assert.equal(current.status, 'dispatched', item.keyword);
       assert.equal(current.assigned_agent_id, jupiter.id);
     }
+    await query(`UPDATE capture_agent_commands SET status='completed', finished_at=now() WHERE agent_id=$1`,
+      [jupiter.id]);
+    await query(`UPDATE capture_tasks SET status='completed', finished_at=now()
+      WHERE parent_task_id=$1 AND assigned_agent_id=$2`, [closedRun.parent.id, jupiter.id]);
+
+    // 2. Plain 「移到历史」 then a partial retry: the same, the rest stays manual.
+    const dismissedRun = await fixedBatch(['君越壁纸', '昂科威壁纸'], {status: 'completed_with_failures'});
+    const [dismissedRetry, dismissedLeft] = [
+      await f.item(dismissedRun.parent, {keyword: '君越壁纸', status: 'failed', execution: dismissedRun.marsChild,
+        agent: mars, error: TECHNICAL_ERROR}),
+      await f.item(dismissedRun.parent, {keyword: '昂科威壁纸', status: 'failed', execution: dismissedRun.marsChild,
+        agent: mars, error: TECHNICAL_ERROR}),
+    ];
+    const dismissed = await f.request(`/tasks/${dismissedRun.parent.id}/dismiss-attention`, {body: {}});
+    assert.equal(dismissed.status, 200, JSON.stringify(dismissed.body));
+    const reopened = await retryOne(dismissedRun.parent, dismissedRetry);
+    assert.ok(reopened.metadata.reopenedFromHistoryAt);
+    const leftBefore = await f.itemRow(dismissedLeft.id);
+    assert.equal((await reconcileAutomaticCaptureRetries({tenantId: f.tenant.id,
+      taskIds: [dismissedRun.parent.id]})).scanned, 0);
+    assert.deepEqual(await f.itemRow(dismissedLeft.id), leftBefore);
+
+    // 3. Control: a batch nobody dismissed keeps its automatic retry.
+    const liveRun = await fixedBatch(['君越壁纸', '昂科威壁纸'], {status: 'completed_with_failures'});
+    const [liveRetry, liveLeft] = [
+      await f.item(liveRun.parent, {keyword: '君越壁纸', status: 'failed', execution: liveRun.marsChild,
+        agent: mars, error: TECHNICAL_ERROR}),
+      await f.item(liveRun.parent, {keyword: '昂科威壁纸', status: 'failed', execution: liveRun.marsChild,
+        agent: mars, error: TECHNICAL_ERROR}),
+    ];
+    const live = await retryOne(liveRun.parent, liveRetry);
+    assert.equal(live.metadata.reopenedFromHistoryAt, undefined);
+    const control = await reconcileAutomaticCaptureRetries({tenantId: f.tenant.id, taskIds: [liveRun.parent.id]});
+    assert.equal(control.dispatched, 1, JSON.stringify(control));
+    assert.equal((await f.itemRow(liveLeft.id)).assigned_agent_id, jupiter.id);
   });
 
   await t.test('a phone batch closed with 「结束并移到历史」 refuses 「重试失败关键词」, and no retry is handed to a phone', async st => {

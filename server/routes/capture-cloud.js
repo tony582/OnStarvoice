@@ -16410,6 +16410,10 @@ export async function reconcileAutomaticCaptureRetries(input = 10) {
       AND COALESCE(metadata->>'orchestrationTemplate', 'false') <> 'true'
       AND COALESCE(metadata->>'distributionMode', '') <> 'elastic_pool'
       AND COALESCE(metadata->>'automaticRetryDisabled', 'false') <> 'true'
+      -- An operator who reopened a dismissed/closed batch from history
+      -- (retry-items, manual handoff) picked the keywords to re-run; the
+      -- scan never re-runs the ones they left alone.
+      AND NOT (metadata ? 'reopenedFromHistoryAt')
       AND COALESCE(
         metadata #>> '{planSnapshot,recoveryPolicy,allowIdleAgentHandoff}',
         'true'
