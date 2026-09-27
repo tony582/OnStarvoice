@@ -99,6 +99,10 @@ import {
   recordNeedsActionStopFenceOutcome,
   releaseNeedsActionStopFences,
 } from '../services/capture-stop-fence-release.js';
+import {
+  elasticRoundAnchorSql,
+  elasticRoundRelaxAfterMs,
+} from '../services/capture-elastic-policy.js';
 
 function requireCaptureAgent(req, res, next) {
   return authenticateCaptureAgent(req, res, error => {
@@ -7350,6 +7354,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       ) AS source_execution_started_at,
       item.metadata AS item_metadata,
       agent_policy.agent_attempt_limit,
+      item_round.round_relaxed,
       COALESCE(
         CASE
           WHEN (item.metadata->>'elasticAttemptBudgetUsed') ~ '^[0-9]+$'
@@ -7397,6 +7402,14 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         ) AS configured_agent_id
       ) configured_agents
     ) agent_policy
+    -- F1: a retryable item whose current handoff has waited longer than the
+    -- relax window (no untried pool Agent claimed it) opens to every pool
+    -- Agent except the most recent attempt's. Reads only this item row.
+    CROSS JOIN LATERAL (
+      SELECT item.status = 'retryable'
+        AND ${elasticRoundAnchorSql('item')}
+          <= now() - ($14::integer * interval '1 millisecond') AS round_relaxed
+    ) item_round
     WHERE item.tenant_id = $1
       AND NOT (item.id = ANY($12::uuid[]))
       AND parent.task_type = 'capture_orchestration'
@@ -7554,11 +7567,17 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
             AND recent_attempt.agent_id IS NOT NULL
         ) current_round_attempt
         WHERE current_round_attempt.agent_id = $2::uuid
-          AND current_round_attempt.reverse_attempt_ordinal <=
-            MOD(item.attempt_count -
+          AND current_round_attempt.reverse_attempt_ordinal <= CASE
+            WHEN item_round.round_relaxed THEN LEAST(1,
+              MOD(item.attempt_count -
+                CASE WHEN item.metadata->>'manualRetryBaseAttemptCount' ~ '^[0-9]+$'
+                  THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END,
+                agent_policy.agent_attempt_limit))
+            ELSE MOD(item.attempt_count -
               CASE WHEN item.metadata->>'manualRetryBaseAttemptCount' ~ '^[0-9]+$'
                 THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END,
               agent_policy.agent_attempt_limit)
+          END
       )
       AND (
         agent_policy.agent_attempt_limit = 1
@@ -7592,6 +7611,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     Array.from(CROSS_DEVICE_RETRY_SAFETY_CODES),
     excludedItemIds,
     freshCapabilities.remoteTaskEnhancementOptions === true,
+    elasticRoundRelaxAfterMs(),
   ]);
   if (!candidate) return null;
   const nextCandidate = () => dispatchNextElasticWorkItemWithinBudget(tx, {
@@ -8135,7 +8155,8 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       metadata = (
         metadata - 'checkpoint' - 'targetResult' -
         'waitingForSourceClosure' - 'sourceClosureBlockedAt' -
-        'sourceClosureBlockedReason' - 'sourceClosureBlockedAttemptId'
+        'sourceClosureBlockedReason' - 'sourceClosureBlockedAttemptId' -
+        'elasticRetryWaitingSince'
       ) ||
         jsonb_build_object('elasticAttemptBudgetUsed', $2::integer),
       assigned_agent_id = $3,
@@ -8242,6 +8263,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       attemptBudget,
       agentAttemptLimit: Number(candidate.agent_attempt_limit) ||
         AUTOMATIC_CROSS_DEVICE_ITEM_ATTEMPT_LIMIT,
+      roundExclusionRelaxed: candidate.round_relaxed === true,
       ...(bootstrapPacing || {}),
       commandId,
     },

@@ -56,6 +56,7 @@ import {
   trimMobilePlanSnapshot,
 } from '../services/android-control/mobile-tasks.js';
 import {STOP_FENCE_OPERATOR_RELEASED_REASON} from '../services/capture-stop-fence.js';
+import {elasticRoundRelaxAfterMs} from '../services/capture-elastic-policy.js';
 
 const router = Router();
 const UUID_PATTERN =
@@ -7293,6 +7294,9 @@ router.get(
         retryCandidates: retryCandidates.map(publicRetryAgentCandidate),
         attempts,
         schedule,
+        // Constant (no query): lets the recovery card say when a waiting
+        // retryable keyword opens to Agents that already tried it (F1).
+        elasticPolicy: {roundRelaxAfterMs: elasticRoundRelaxAfterMs()},
       });
     } catch (error) {
       return next(error);
