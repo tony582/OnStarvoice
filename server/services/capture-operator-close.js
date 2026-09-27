@@ -164,12 +164,32 @@ export function operatorCloseChildTransition(status) {
   return text(status, 80) === 'needs_action' ? 'failed' : null;
 }
 
+// The subtree of each requested root. The per-task facts are read from the
+// same row the recursion already fetched (root by primary key, children by
+// idx_capture_tasks_parent_created), so no second pass over capture_tasks.
+// standalone_mobile marks a stopped phone run whose own queued words it never
+// claims again (see live_item).
+function treeNodeColumns(alias, {root}) {
+  return `UPPER(COALESCE(${alias}.error->>'code', '')) = '${STOP_FENCE_CODE}'
+      AND ${alias}.status NOT IN (${sqlList(STOP_FENCE_EXEMPT_TASK_STATUSES)})
+      AND NULLIF(${alias}.metadata->>'recoveryTaskId', '') IS NULL AS task_stop_fence,
+    COALESCE(
+      ${alias}.metadata->>'stopPending' = 'true'
+      OR ${alias}.metadata->>'legacyPackStopPending' = 'true'
+      OR ${alias}.metadata->>'stopIdentityUnavailable' = 'true',
+      false
+    ) AS stop_pending,
+    ${root ? 'false' : `${alias}.status IN (${sqlList(LIVE_CHILD_STATUSES)})`} AS live_child`;
+}
 const TREE_SQL = `WITH RECURSIVE task_tree AS (
-  SELECT root.id AS root_id, root.id
+  SELECT root.id AS root_id, root.id,
+    COALESCE(root.metadata->>'workflow', '') = '${STANDALONE_MOBILE_WORKFLOW}' AS standalone_mobile,
+    ${treeNodeColumns('root', {root: true})}
   FROM capture_tasks root
   WHERE root.tenant_id = $1 AND root.id = ANY($2::uuid[])
   UNION
-  SELECT tree.root_id, child.id
+  SELECT tree.root_id, child.id, tree.standalone_mobile,
+    ${treeNodeColumns('child', {root: false})}
   FROM capture_tasks child
   JOIN task_tree tree ON child.parent_task_id = tree.id
   WHERE child.tenant_id = $1
@@ -180,6 +200,12 @@ const TREE_SQL = `WITH RECURSIVE task_tree AS (
  * or foreign ids are absent). One statement, no locks, no fence SQL: the
  * overview calls it for the page's attention roots, the close action calls
  * it again under the row locks.
+ *
+ * The recursion reads each task once; items, commands and demands are
+ * LATERAL probes keyed by the node id (items by task_id, live commands by
+ * the partial pending/acknowledged index, demands by primary key prefix).
+ * The recursive CTE's row estimate is far too high, so plain joins would
+ * hash the whole tenant's tasks and items instead of probing ~100 nodes.
  */
 export async function loadOperatorCloseEligibility(tx, tenantId, rootIds = []) {
   const ids = [...new Set((Array.isArray(rootIds) ? rootIds : [])
@@ -187,65 +213,64 @@ export async function loadOperatorCloseEligibility(tx, tenantId, rootIds = []) {
     .filter(id => UUID_PATTERN.test(id)))];
   const result = new Map();
   if (ids.length === 0 || !text(tenantId, 100)) return result;
-  const rows = await tx.queryAll(`${TREE_SQL}, task_flags AS (
-      SELECT tree.root_id,
-        BOOL_OR(
-          UPPER(COALESCE(task.error->>'code', '')) = '${STOP_FENCE_CODE}'
-          AND task.status NOT IN (${sqlList(STOP_FENCE_EXEMPT_TASK_STATUSES)})
-          AND NULLIF(task.metadata->>'recoveryTaskId', '') IS NULL
-        ) AS stop_fence,
-        BOOL_OR(
-          task.metadata->>'stopPending' = 'true'
-          OR task.metadata->>'legacyPackStopPending' = 'true'
-          OR task.metadata->>'stopIdentityUnavailable' = 'true'
-        ) AS stop_pending,
-        BOOL_OR(task.id <> tree.root_id AND task.status IN (${sqlList(LIVE_CHILD_STATUSES)})) AS live_child
+  const rows = await tx.queryAll(`${TREE_SQL}, node_flags AS (
+      SELECT tree.root_id, tree.task_stop_fence, tree.stop_pending, tree.live_child, items.*, links.*
       FROM task_tree tree
-      JOIN capture_tasks task ON task.id = tree.id AND task.tenant_id = $1
-      GROUP BY tree.root_id
-    ), command_flags AS (
-      SELECT DISTINCT tree.root_id
-      FROM task_tree tree
-      JOIN capture_agent_commands command ON command.task_id = tree.id
-      WHERE command.tenant_id = $1
-        AND command.status IN ('pending', 'acknowledged')
-        AND (command.expires_at IS NULL OR command.expires_at > now())
-    ), item_flags AS (
-      SELECT tree.root_id,
-        BOOL_OR(
-          UPPER(COALESCE(item.error->>'code', '')) = '${STOP_FENCE_CODE}'
-          AND item.status NOT IN (${sqlList(STOP_FENCE_EXEMPT_ITEM_STATUSES)})
-        ) AS stop_fence,
-        BOOL_OR(item.metadata->>'deviceHeld' = 'true') AS device_held,
-        BOOL_OR(
-          item.status IN (${sqlList(LIVE_ITEM_STATUSES)})
-          OR item.metadata->>'retryPending' = 'true'
-          OR (
-            item.status IN (${sqlList(QUEUED_ITEM_STATUSES)})
-            -- COALESCE: a queued item handed back to the pool has no
-            -- execution_task_id, and NOT (NULL) would hide it as not live.
-            AND NOT COALESCE(
-              root.metadata->>'workflow' = '${STANDALONE_MOBILE_WORKFLOW}'
-              AND item.task_id = root.id
-              AND item.execution_task_id = root.id,
-              false
+      CROSS JOIN LATERAL (
+        SELECT
+          COALESCE(BOOL_OR(
+            UPPER(COALESCE(item.error->>'code', '')) = '${STOP_FENCE_CODE}'
+            AND item.status NOT IN (${sqlList(STOP_FENCE_EXEMPT_ITEM_STATUSES)})
+          ), false) AS item_stop_fence,
+          COALESCE(BOOL_OR(item.metadata->>'deviceHeld' = 'true'), false) AS device_held,
+          COALESCE(BOOL_OR(
+            item.status IN (${sqlList(LIVE_ITEM_STATUSES)})
+            OR COALESCE(item.metadata->>'retryPending' = 'true', false)
+            OR (
+              item.status IN (${sqlList(QUEUED_ITEM_STATUSES)})
+              -- COALESCE: a queued item handed back to the pool has no
+              -- execution_task_id, and NOT (NULL) would hide it as not live.
+              AND NOT COALESCE(
+                tree.standalone_mobile
+                AND item.task_id = tree.root_id
+                AND item.execution_task_id = tree.root_id,
+                false
+              )
             )
-          )
-        ) AS live_item,
-        BOOL_OR(
-          item.metadata->>'unattendedNegativePatrol' = 'true'
-          AND item.status = 'needs_action'
-        ) AS negative_patrol_needs_action
-      FROM task_tree tree
-      JOIN capture_tasks root ON root.id = tree.root_id AND root.tenant_id = $1
-      JOIN capture_task_items item ON item.task_id = tree.id AND item.tenant_id = $1
-      GROUP BY tree.root_id
-    ), demand_flags AS (
-      SELECT DISTINCT tree.root_id
-      FROM task_tree tree
-      JOIN capture_discovery_run_candidates demand
-        ON demand.tenant_id = $1 AND demand.run_id = tree.id
-      WHERE demand.demand_status = 'active'
+          ), false) AS live_item,
+          COALESCE(BOOL_OR(
+            item.metadata->>'unattendedNegativePatrol' = 'true'
+            AND item.status = 'needs_action'
+          ), false) AS negative_patrol_needs_action
+        FROM capture_task_items item
+        WHERE item.task_id = tree.id AND item.tenant_id = $1
+      ) items
+      CROSS JOIN LATERAL (
+        SELECT
+          EXISTS (
+            SELECT 1 FROM capture_agent_commands command
+            WHERE command.task_id = tree.id AND command.tenant_id = $1
+              AND command.status IN ('pending', 'acknowledged')
+              AND (command.expires_at IS NULL OR command.expires_at > now())
+          ) AS live_command,
+          EXISTS (
+            SELECT 1 FROM capture_discovery_run_candidates demand
+            WHERE demand.tenant_id = $1 AND demand.run_id = tree.id
+              AND demand.demand_status = 'active'
+          ) AS active_demand
+      ) links
+    ), root_flags AS (
+      SELECT root_id,
+        BOOL_OR(task_stop_fence OR item_stop_fence) AS stop_fence,
+        BOOL_OR(stop_pending) AS stop_pending,
+        BOOL_OR(live_child) AS live_child,
+        BOOL_OR(live_command) AS live_command,
+        BOOL_OR(device_held) AS device_held,
+        BOOL_OR(live_item) AS live_item,
+        BOOL_OR(negative_patrol_needs_action) AS negative_patrol_needs_action,
+        BOOL_OR(active_demand) AS active_demand
+      FROM node_flags
+      GROUP BY root_id
     )
     SELECT root.id,
       CASE
@@ -259,23 +284,19 @@ export async function loadOperatorCloseEligibility(tx, tenantId, rootIds = []) {
             AND COALESCE(root.metadata->>'draft', 'false') = 'true'
           )
           THEN 'status_not_closeable'
-        WHEN COALESCE(task_flags.stop_fence, false) OR COALESCE(item_flags.stop_fence, false)
-          THEN 'stop_fence'
-        WHEN COALESCE(task_flags.stop_pending, false) THEN 'stop_pending'
-        WHEN COALESCE(task_flags.live_child, false) THEN 'live_child'
-        WHEN command_flags.root_id IS NOT NULL THEN 'live_command'
-        WHEN COALESCE(item_flags.device_held, false) THEN 'device_held'
-        WHEN COALESCE(item_flags.live_item, false) THEN 'live_item'
-        WHEN COALESCE(item_flags.negative_patrol_needs_action, false)
+        WHEN COALESCE(flags.stop_fence, false) THEN 'stop_fence'
+        WHEN COALESCE(flags.stop_pending, false) THEN 'stop_pending'
+        WHEN COALESCE(flags.live_child, false) THEN 'live_child'
+        WHEN COALESCE(flags.live_command, false) THEN 'live_command'
+        WHEN COALESCE(flags.device_held, false) THEN 'device_held'
+        WHEN COALESCE(flags.live_item, false) THEN 'live_item'
+        WHEN COALESCE(flags.negative_patrol_needs_action, false)
           THEN 'negative_patrol_needs_action'
-        WHEN demand_flags.root_id IS NOT NULL THEN 'active_discovery_demand'
+        WHEN COALESCE(flags.active_demand, false) THEN 'active_discovery_demand'
         ELSE ''
       END AS reason
     FROM capture_tasks root
-    LEFT JOIN task_flags ON task_flags.root_id = root.id
-    LEFT JOIN command_flags ON command_flags.root_id = root.id
-    LEFT JOIN item_flags ON item_flags.root_id = root.id
-    LEFT JOIN demand_flags ON demand_flags.root_id = root.id
+    LEFT JOIN root_flags flags ON flags.root_id = root.id
     WHERE root.tenant_id = $1 AND root.id = ANY($2::uuid[])
   `, [tenantId, ids]);
   for (const row of rows) {

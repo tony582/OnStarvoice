@@ -5,6 +5,7 @@ import {
   OPERATOR_CLOSE_EXPLAINED_REASONS,
   OPERATOR_CLOSE_REASON_MESSAGES,
   OPERATOR_CLOSE_REASONS,
+  loadOperatorCloseEligibility,
   normalizeOperatorCloseTaskIds,
   operatorCloseAttemptTransition,
   operatorCloseChildTransition,
@@ -91,6 +92,31 @@ test('bulk ids are 1..100 UUIDs, lower-cased, de-duplicated and sorted', () => {
   assert.equal(normalizeOperatorCloseTaskIds(['not-a-uuid']), null);
   assert.equal(normalizeOperatorCloseTaskIds(Array(101).fill(b)), null);
   assert.equal(normalizeOperatorCloseTaskIds('nope'), null);
+});
+
+test('eligibility is one indexed statement per page: node probes are LATERAL, never the admission fence', async () => {
+  const calls = [];
+  const tx = {queryAll: async (sql, params) => {
+    calls.push({sql, params});
+    return [{id: params[1][0], reason: ''}, {id: params[1][1], reason: 'stop_fence'}];
+  }};
+  const a = '6f1e1c8e-9f53-4f7e-9a55-1b9a0c3f0a11';
+  const b = '0a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d';
+  const map = await loadOperatorCloseEligibility(tx, 'tenant', [a, b.toUpperCase(), 'nope', a]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].params, ['tenant', [a, b]]);
+  assert.deepEqual(map.get(a), {eligible: true, reason: ''});
+  assert.deepEqual(map.get(b), {eligible: false, reason: 'stop_fence'});
+  const {sql} = calls[0];
+  assert.match(sql, /WITH RECURSIVE task_tree AS/u);
+  assert.match(sql, /CROSS JOIN LATERAL \(\s*SELECT[\s\S]*?FROM capture_task_items item\s+WHERE item\.task_id = tree\.id AND item\.tenant_id = \$1/u);
+  assert.match(sql, /FROM capture_agent_commands command\s+WHERE command\.task_id = tree\.id/u);
+  assert.match(sql, /FROM capture_discovery_run_candidates demand\s+WHERE demand\.tenant_id = \$1 AND demand\.run_id = tree\.id/u);
+  assert.doesNotMatch(sql, /JOIN capture_tasks task ON task\.id = tree\.id/u,
+    'task facts come from the recursion, not a second join the planner hashes over the tenant');
+  assert.doesNotMatch(sql, /confirmed_stops|settled_runs|FOR UPDATE/u, 'no admission fence SQL, no locks');
+  assert.equal((await loadOperatorCloseEligibility(tx, 'tenant', ['nope'])).size, 0);
+  assert.equal(calls.length, 1, 'no statement without valid ids');
 });
 
 // Admin presentation: the card explains exactly the server's reasons, and
