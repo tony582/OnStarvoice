@@ -8,6 +8,7 @@ import {
   closeOwnedDetailRunnerTabs,
   createDedicatedDetailRunnerTab,
   normalizeDetailRunnerMode,
+  notifyOwnedDetailRunnerTab,
 } from "../../utils/capture/detail-runner.js";
 
 test("source-tab mode remains the compatibility default", () => {
@@ -191,4 +192,43 @@ test("multi-worker cleanup reports every non-benign close failure without skippi
     },
   );
   assert.deepEqual(removed.sort((a, b) => a - b), [92, 93]);
+});
+
+test("a dedicated worker is reported to the background without blocking creation", async () => {
+  const messages = [];
+  const chromeApi = {
+    tabs: {
+      async create(properties) {
+        return {id: 93, ...properties};
+      },
+    },
+    runtime: {
+      sendMessage(message) {
+        messages.push(structuredClone(message));
+        return Promise.reject(new Error("background restarting"));
+      },
+    },
+  };
+  const worker = await createDedicatedDetailRunnerTab({
+    sourceTab: {id: 41, windowId: 7, index: 3},
+    chromeApi,
+  });
+  assert.equal(worker.id, 93);
+  assert.deepEqual(messages, [
+    {type: "onstarvoice:record-owned-capture-tab", tabId: 93, sourceTabId: 41},
+  ]);
+
+  // 没有 runtime（旧环境）或发送抛错都不影响采集流程。
+  assert.equal(
+    notifyOwnedDetailRunnerTab({chromeApi: {tabs: {}}, runnerTabId: 5, sourceTab: {id: 1}}),
+    false,
+  );
+  assert.equal(
+    notifyOwnedDetailRunnerTab({
+      chromeApi: {runtime: {sendMessage() { throw new Error("gone"); }}},
+      runnerTabId: 5,
+      sourceTab: {id: 1},
+    }),
+    false,
+  );
 });

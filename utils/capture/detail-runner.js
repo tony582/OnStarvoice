@@ -56,7 +56,31 @@ export async function createDedicatedDetailRunnerTab({
     throw new Error("详情采集工作页与来源页冲突");
   }
 
+  notifyOwnedDetailRunnerTab({chromeApi, runnerTabId, sourceTab});
   return tab;
+}
+
+// 0.4.19：告诉后台这是本 runner 为当前请求建的详情工作页。后台只接受无人值守
+// runner 页发来的登记，并用 tabs.onCreated 核实；自动恢复自停时只会关闭这类
+// 登记过的工作页。登记失败不影响采集流程。
+export function notifyOwnedDetailRunnerTab({
+  chromeApi = globalThis.chrome,
+  runnerTabId,
+  sourceTab,
+} = {}) {
+  const runtime = chromeApi?.runtime;
+  if (!runtime || typeof runtime.sendMessage !== "function") return false;
+  try {
+    const pending = runtime.sendMessage({
+      type: "onstarvoice:record-owned-capture-tab",
+      tabId: Number(runnerTabId),
+      sourceTabId: Number(sourceTab?.id),
+    });
+    pending?.catch?.(() => {});
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function closeOwnedDetailRunnerTabs(

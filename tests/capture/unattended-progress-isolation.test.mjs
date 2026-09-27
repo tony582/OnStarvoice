@@ -321,6 +321,9 @@ test("cancellation received after claim but before activation is preserved", () 
     getUnattendedRunRequestIdFromUrl: () => "request-current",
     isExplicitUserUnattendedCancellationMessage: () => true,
     setCancelFlag: () => {},
+    // 0.4.19 的换代退役由 unattended-attempt-retirement.test.mjs 覆盖；同一轮次
+    // 的取消不会触发它。
+    maybeRetireSupersededUnattendedAttempt: () => false,
   };
   vm.createContext(context);
   vm.runInContext(

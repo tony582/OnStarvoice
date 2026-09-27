@@ -1272,6 +1272,11 @@ let activeUnattendedProgressSeq = 0;
 let activeUnattendedAttemptRejected = false;
 let lastUnattendedContentProgressAt = 0;
 let lastUnattendedContentProgressFingerprint = "";
+// 0.4.19 事件驱动退役：当前无人值守流水线的流式上传队列（模块级引用，退役时
+// 冲刷），以及本页已退役的请求轮次（单飞）。
+let activeUnattendedStreamingSyncQueue = null;
+let retiredUnattendedAttemptKey = "";
+const UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS = 60 * 1000;
 const KEYWORD_PLAN_MODES = new Set([
   "daily",
   "custom_dates",
@@ -3082,6 +3087,9 @@ function handleUnattendedRunRequestStorageChange(request) {
     return;
   }
   const requestAttemptId = String(request?.attemptId || "").trim();
+  if (maybeRetireSupersededUnattendedAttempt(request)) {
+    return;
+  }
   if (
     activeUnattendedRunRequestId &&
     (String(request.id || "").trim() !== activeUnattendedRunRequestId ||
@@ -3106,6 +3114,107 @@ function handleUnattendedRunRequestStorageChange(request) {
   searchCaptureCancelRequested = true;
   // background 在状态切换前已捕获旧 lock holder 并精确转发取消。这里仅停止
   // 本地编排；若再发送无 captureRequestId 的全页取消，迟到消息可能误伤新 attempt。
+}
+
+// 本 runner 页的轮次：URL 参数（后台按轮次建 runner），旧版 runner 没有时用
+// 已激活的轮次。
+function resolveOwnUnattendedAttemptId() {
+  return String(
+    getUnattendedRunAttemptIdFromUrl() || activeUnattendedRunAttemptId || "",
+  ).trim();
+}
+
+// 请求槽换代（自动恢复写入新轮次）后，旧轮次的 runner 立即退役，不等卡住的
+// 流水线 promise 结束（卡住的正是它）。
+function maybeRetireSupersededUnattendedAttempt(request) {
+  const requestId = String(request?.id || "").trim();
+  const requestAttemptId = String(request?.attemptId || "").trim();
+  const ownAttemptId = resolveOwnUnattendedAttemptId();
+  if (
+    !requestId ||
+    !requestAttemptId ||
+    !ownAttemptId ||
+    requestAttemptId === ownAttemptId ||
+    (activeUnattendedRunRequestId && activeUnattendedRunRequestId !== requestId)
+  ) {
+    return false;
+  }
+  void retireSupersededUnattendedAttempt({
+    requestId,
+    attemptId: ownAttemptId,
+    reason: "attempt_superseded",
+  }).catch((error) => {
+    console.warn("[Sidebar] Retire superseded unattended attempt failed:", error);
+  });
+  return true;
+}
+
+async function retireSupersededUnattendedAttempt({
+  requestId,
+  attemptId,
+  reason = "attempt_superseded",
+} = {}) {
+  const retirementKey = `${requestId}:${attemptId}`;
+  if (retiredUnattendedAttemptKey === retirementKey) {
+    return false;
+  }
+  retiredUnattendedAttemptKey = retirementKey;
+  const queue = activeUnattendedStreamingSyncQueue;
+  const beforeStats = queue?.enabled ? queue.getStats() : null;
+  // 1. 停本地编排。不发不限定请求的全页取消：后台自停只按请求 id 取消，
+  //    旧页面上的采集中继也已被后台的轮次围栏拒绝。
+  if (activeUnattendedRunRequestId === requestId) {
+    setCancelFlag(true);
+    stopRejectedUnattendedAttempt(reason);
+    searchCaptureCancelRequested = true;
+  }
+  // 2. 停掉执行锁心跳并忘掉锁 id。否则后台释放锁之后，这里续租失败会进入
+  //    handleCaptureExecutionLockLost，拿不到中继页时退到当前窗口的活动页发
+  //    全页取消，可能误伤新轮次或用户自己的页面。
+  stopCaptureExecutionLockHeartbeat();
+  activeCaptureExecutionLockId = "";
+  adoptedUnattendedCaptureExecutionLockId = "";
+  // 3. 在上限内冲刷流式上传队列（取消后它只等正在上传的那一条）。
+  let flushed = true;
+  let pendingUploads = 0;
+  if (queue?.enabled && beforeStats) {
+    const afterStats = await Promise.race([
+      queue.drain().catch(() => queue.getStats()),
+      new Promise((resolve) =>
+        setTimeout(() => resolve(null), UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS),
+      ),
+    ]);
+    const finalStats = afterStats || queue.getStats();
+    const uploadedDuringFlush = Math.max(
+      0,
+      Number(finalStats?.processedCount || 0) -
+        Number(beforeStats.processedCount || 0),
+    );
+    pendingUploads = Math.max(
+      0,
+      Number(beforeStats.remainingCount || 0) - uploadedDuringFlush,
+    );
+    flushed = Boolean(afterStats) && pendingUploads === 0;
+  }
+  // 4. 退役回执：后台从 sender 取请求、轮次、文档与标签页，写进 storage.session。
+  for (const delayMs of [0, 500, 2000]) {
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "onstarvoice:unattended-attempt-retired",
+        reason,
+        heartbeatStopped: true,
+        flushed,
+        pendingUploads,
+      });
+      if (response?.ok) return true;
+    } catch (error) {
+      console.warn("[Sidebar] Unattended retirement receipt not delivered:", error);
+    }
+  }
+  return false;
 }
 
 async function handleSaveKeywordPlan(scope = "modal") {
@@ -14202,6 +14311,9 @@ async function handleBatchKeywordCapture(options = {}) {
       captureTaskId: scopedUnattendedRequestId,
       resolveCaptureTaskItemAttempt,
     });
+    if (scopedUnattendedRequestId) {
+      activeUnattendedStreamingSyncQueue = streamingSyncQueue;
+    }
     if (
       settings.autoDetailCaptureAfterListCapture &&
       !ensureAuthVerifiedOrWarn({
@@ -15156,6 +15268,9 @@ async function handleBatchKeywordCapture(options = {}) {
         return streamingSyncQueue.getStats();
       });
       streamingSyncDrained = true;
+    }
+    if (activeUnattendedStreamingSyncQueue === streamingSyncQueue) {
+      activeUnattendedStreamingSyncQueue = null;
     }
     // The terminal drain happens in finally so every exceptional exit uses the
     // same queue. Preserve that result on the already-returned object/error;

@@ -76,6 +76,20 @@ const STORAGE_KEYS = {
 // 就是“同一加载期”。workerStartedAt 取模块加载时刻，不早于真正的加载时间；
 // 读写失败时用它兜底，只会让更多页面被判为“早于本次加载”，更保守。
 const RUNTIME_EPOCH_SESSION_KEY = 'onstarvoice.runtimeEpoch';
+// 0.4.19 自愈：扩展为无人值守请求建的详情工作页登记表，以及旧轮次 runner 的
+// 退役回执。都放在 storage.session：生命周期与标签页 id、runner 文档相同，
+// 扩展重载或浏览器重启时一并清空，不会留下过期的 id。
+const OWNED_CAPTURE_TABS_SESSION_KEY = 'onstarvoice.ownedCaptureTabs.v1';
+const UNATTENDED_ATTEMPT_RETIRED_SESSION_PREFIX =
+  'onstarvoice.unattendedAttemptRetired.v1.';
+const OWNED_CAPTURE_TAB_REGISTRATION_WINDOW_MS = 15 * 1000;
+// tabs.create 的回包与 onCreated 事件到达后台的先后没有保证：登记时最多等 1 秒。
+const OWNED_CAPTURE_TAB_REGISTRATION_TIMING = {
+  createdWaitMs: 1000,
+  createdPollMs: 50,
+};
+const RECENTLY_CREATED_TAB_RETENTION_MS = 30 * 1000;
+const OWNED_CAPTURE_TABS_LIMIT = 200;
 const workerStartedAt = Date.now();
 
 const CONTROL_STORAGE_CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
@@ -8706,10 +8720,34 @@ async function reloadUnattendedCaptureTabAndConfirm(holderTabId) {
   }
 }
 
+function isSelfStopMarkedCaptureExecutionLock(lock) {
+  return Boolean(
+    lock &&
+      lock.allowReload === false &&
+      String(lock.selfStopRequestId || '').trim(),
+  );
+}
+
 async function stopPreviousUnattendedCaptureForResume(lock) {
   const holderTabId = Number(lock?.holderTabId);
   if (!Number.isFinite(holderTabId) || holderTabId <= 0) {
     return {ok: true, method: 'no_target'};
+  }
+  if (isSelfStopMarkedCaptureExecutionLock(lock)) {
+    // 自动恢复自停时标记过的锁（0.4.19）：持有页可能是用户在用、或已被别的
+    // 请求复用的平台页。租约清理、侧栏打开、手动批次、计划闹钟等读锁路径都
+    // 走到这里，一律不发取消、不刷新；只有持有页已不存在才算停止。
+    try {
+      await chrome.tabs.get(holderTabId);
+    } catch {
+      return {ok: true, method: 'tab_missing'};
+    }
+    return {
+      ok: false,
+      method: 'stop_unconfirmed',
+      reason: 'self_stop_marked_lock',
+      error: new Error('自停标记的锁只在持有页关闭后释放'),
+    };
   }
   const targetState = await inspectUnattendedCaptureStopTarget(holderTabId);
   if (targetState) {
@@ -13343,6 +13381,12 @@ function normalizeCaptureExecutionLock(value, { allowExpired = false } = {}) {
     holderDocumentId: String(value.holderDocumentId || ''),
     holderTabId:
       Number.isFinite(holderTabId) && holderTabId > 0 ? holderTabId : null,
+    // 自停标记（0.4.19）：恢复换代时把绑定 R 的锁标成“不许刷新”。续租、绑定都
+    // 经过这里写回，所以标记一直保留；只有转交给新的领取者时才去掉。
+    ...(value.allowReload === false ? {allowReload: false} : {}),
+    ...(String(value.selfStopRequestId || '').trim()
+      ? {selfStopRequestId: String(value.selfStopRequestId).trim().slice(0, 240)}
+      : {}),
   };
 }
 
@@ -13590,8 +13634,11 @@ async function transferOrReserveUnattendedCaptureExecutionLock({
     }
 
     const normalizedHolderTabId = Number(holderTabId);
+    // 自停标记只属于做标记的那次恢复；锁转交给新的领取者就是新的所有权。
+    const {allowReload: _allowReload, selfStopRequestId: _selfStopRequestId, ...lockWithoutSelfStopMarks} =
+      lock || {};
     const transferred = {
-      ...(lock || {}),
+      ...lockWithoutSelfStopMarks,
       id: lock?.id || createUuid(),
       owner: 'unattended_keyword_plan',
       label: lock?.label || '无人值守计划',
@@ -18080,6 +18127,327 @@ function buildContentRelayOwner(sender = {}, requestedTaskId = '') {
   };
 }
 
+// 中继轮次围栏（0.4.19）：无人值守 runner 发起的采集类中继，只有请求槽里
+// 仍是“同一请求、正好这一轮、非终态”时才放行。换代后旧 runner 的流水线即使
+// 还卡着，也不能再把采集发进任何页面。ping、取消、查询活动与不带请求 id 的
+// 非列表动作照常放行；没有轮次参数的旧版 runner 不围。
+const UNATTENDED_RELAY_UNFENCED_ACTIONS = new Set([
+  'ping',
+  'cancelCapture',
+  'inspectCaptureActivity',
+]);
+
+function isUnattendedCaptureRelayPayload(payload = {}) {
+  const action = String(payload?.action || '');
+  if (UNATTENDED_RELAY_UNFENCED_ACTIONS.has(action)) return false;
+  return Boolean(
+    getCaptureRequestId(payload) ||
+      globalThis.OnStarvoiceCaptureDebugSession?.isListCaptureAction?.(action),
+  );
+}
+
+async function assertUnattendedRelayAttemptCurrent(owner, payload) {
+  const requestId = String(owner?.runnerRequestId || '').trim();
+  const attemptId = String(owner?.runnerAttemptId || '').trim();
+  if (!requestId || !attemptId || !isUnattendedCaptureRelayPayload(payload)) {
+    return;
+  }
+  const slot = await readUnattendedKeywordRunRequest();
+  if (
+    slot &&
+    slot.id === requestId &&
+    slot.attemptId === attemptId &&
+    !isTerminalUnattendedRunStatus(slot.status)
+  ) {
+    return;
+  }
+  throw createCaptureTaskError(
+    'unattended_attempt_superseded',
+    '无人值守运行已换代或结束，已拒绝旧运行页继续采集',
+    {requestId, attemptId},
+  );
+}
+
+// ---- 本机自建工作页登记表与旧轮次退役回执（0.4.19）----
+// storage.session 不可用时（旧浏览器、测试）退回本 worker 内存：只影响重启
+// 后能否认出旧工作页，认不出的页只按证据判断，绝不会被关。
+const extensionSessionValueFallback = new Map();
+const recentlyCreatedTabs = new Map();
+let ownedCaptureTabsQueue = Promise.resolve();
+
+function getExtensionSessionArea() {
+  const area = chrome.storage?.session;
+  return area &&
+    typeof area.get === 'function' &&
+    typeof area.set === 'function'
+    ? area
+    : null;
+}
+
+async function readExtensionSessionValue(key) {
+  const area = getExtensionSessionArea();
+  if (!area) {
+    return extensionSessionValueFallback.has(key)
+      ? extensionSessionValueFallback.get(key)
+      : null;
+  }
+  const stored = await area.get(key);
+  const value = stored?.[key];
+  return value === undefined ? null : value;
+}
+
+async function writeExtensionSessionValue(key, value) {
+  const area = getExtensionSessionArea();
+  if (!area) {
+    if (value === null || value === undefined) {
+      extensionSessionValueFallback.delete(key);
+    } else {
+      extensionSessionValueFallback.set(key, value);
+    }
+    return;
+  }
+  if ((value === null || value === undefined) && typeof area.remove === 'function') {
+    await area.remove(key);
+    return;
+  }
+  await area.set({[key]: value ?? null});
+}
+
+function runOwnedCaptureTabsMutation(operation) {
+  const pending = ownedCaptureTabsQueue.then(operation, operation);
+  ownedCaptureTabsQueue = pending.catch(() => null);
+  return pending;
+}
+
+function pruneRecentlyCreatedTabs(now = Date.now()) {
+  for (const [tabId, created] of recentlyCreatedTabs) {
+    if (now - Number(created?.createdAt || 0) > RECENTLY_CREATED_TAB_RETENTION_MS) {
+      recentlyCreatedTabs.delete(tabId);
+    }
+  }
+}
+
+// tabs.onCreated：只在内存里记最近 30 秒新建的标签页，供登记时核实。
+function rememberCreatedTab(tab) {
+  const tabId = resolveCaptureTaskTabId(tab?.id);
+  if (!tabId) return;
+  pruneRecentlyCreatedTabs();
+  const urls = [tab?.url, tab?.pendingUrl].map((value) =>
+    String(value || '').trim(),
+  );
+  recentlyCreatedTabs.set(tabId, {
+    tabId,
+    windowId: Number.isFinite(Number(tab?.windowId)) ? Number(tab.windowId) : null,
+    createdAt: Date.now(),
+    // 工作页固定以 about:blank、active:false 创建。
+    blank: urls.some((url) => url === 'about:blank') || urls.every((url) => !url),
+  });
+}
+
+function normalizeOwnedCaptureTabs(value) {
+  const source =
+    value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const rawEntries =
+    source.entries && typeof source.entries === 'object' && !Array.isArray(source.entries)
+      ? source.entries
+      : {};
+  const entries = {};
+  for (const [key, entry] of Object.entries(rawEntries)) {
+    const tabId = resolveCaptureTaskTabId(entry?.tabId ?? key);
+    const requestId = String(entry?.requestId || '').trim().slice(0, 240);
+    const attemptId = String(entry?.attemptId || '').trim().slice(0, 240);
+    if (!tabId || !requestId || !attemptId || entry?.role !== 'detail_worker') {
+      continue;
+    }
+    entries[tabId] = {
+      tabId,
+      requestId,
+      attemptId,
+      role: 'detail_worker',
+      windowId: Number.isFinite(Number(entry?.windowId))
+        ? Number(entry.windowId)
+        : null,
+      createdAt: Math.max(0, Number(entry?.createdAt) || 0),
+    };
+  }
+  return {v: 1, entries};
+}
+
+async function readOwnedCaptureTabs() {
+  try {
+    return normalizeOwnedCaptureTabs(
+      await readExtensionSessionValue(OWNED_CAPTURE_TABS_SESSION_KEY),
+    );
+  } catch (error) {
+    console.warn('[OwnedTabs] registry unreadable:', error);
+    return {v: 1, entries: {}};
+  }
+}
+
+async function listOwnedCaptureTabsForRequest(requestId) {
+  const normalizedRequestId = String(requestId || '').trim();
+  if (!normalizedRequestId) return [];
+  const registry = await readOwnedCaptureTabs();
+  return Object.values(registry.entries).filter(
+    (entry) => entry.requestId === normalizedRequestId,
+  );
+}
+
+async function forgetOwnedCaptureTab(tabId) {
+  const normalizedTabId = resolveCaptureTaskTabId(tabId);
+  if (!normalizedTabId) return false;
+  recentlyCreatedTabs.delete(normalizedTabId);
+  return await runOwnedCaptureTabsMutation(async () => {
+    const registry = await readOwnedCaptureTabs();
+    if (!registry.entries[normalizedTabId]) return false;
+    delete registry.entries[normalizedTabId];
+    await writeExtensionSessionValue(OWNED_CAPTURE_TABS_SESSION_KEY, registry);
+    return true;
+  });
+}
+
+async function replaceOwnedCaptureTab(removedTabId, addedTabId) {
+  const oldTabId = resolveCaptureTaskTabId(removedTabId);
+  const newTabId = resolveCaptureTaskTabId(addedTabId);
+  if (!oldTabId || !newTabId || oldTabId === newTabId) return false;
+  return await runOwnedCaptureTabsMutation(async () => {
+    const registry = await readOwnedCaptureTabs();
+    const entry = registry.entries[oldTabId];
+    if (!entry) return false;
+    delete registry.entries[oldTabId];
+    registry.entries[newTabId] = {...entry, tabId: newTabId};
+    await writeExtensionSessionValue(OWNED_CAPTURE_TABS_SESSION_KEY, registry);
+    return true;
+  });
+}
+
+// runner 登记自己刚建的详情工作页。请求与轮次只从 sender.url 解析（只接受
+// 无人值守 runner 页），并用 tabs.onCreated 的记录核实：15 秒内刚建、创建时
+// 是 about:blank、与 runner 报的来源页同一窗口、从未登记过。核实不了就不登记，
+// 这一页之后只按证据判断，绝不会被关。
+async function registerOwnedCaptureTabFromRunner(message = {}, sender = {}) {
+  const owner = buildContentRelayOwner(sender);
+  const requestId = owner.runnerRequestId;
+  const attemptId = owner.runnerAttemptId;
+  if (!requestId || !attemptId) {
+    return {ok: false, reason: 'not_unattended_runner'};
+  }
+  const tabId = resolveCaptureTaskTabId(message?.tabId);
+  if (!tabId) return {ok: false, reason: 'invalid_tab'};
+  let created = null;
+  const waitUntil =
+    Date.now() + OWNED_CAPTURE_TAB_REGISTRATION_TIMING.createdWaitMs;
+  for (;;) {
+    pruneRecentlyCreatedTabs();
+    created = recentlyCreatedTabs.get(tabId) || null;
+    if (created || Date.now() >= waitUntil) break;
+    await new Promise((resolve) =>
+      setTimeout(resolve, OWNED_CAPTURE_TAB_REGISTRATION_TIMING.createdPollMs),
+    );
+  }
+  if (
+    !created ||
+    Date.now() - created.createdAt > OWNED_CAPTURE_TAB_REGISTRATION_WINDOW_MS
+  ) {
+    return {ok: false, reason: 'creation_unverified'};
+  }
+  if (!created.blank) return {ok: false, reason: 'creation_url_mismatch'};
+  const sourceTabId = resolveCaptureTaskTabId(message?.sourceTabId);
+  let sourceTab = null;
+  try {
+    sourceTab = sourceTabId ? await chrome.tabs.get(sourceTabId) : null;
+  } catch {
+    sourceTab = null;
+  }
+  if (
+    !sourceTab ||
+    created.windowId === null ||
+    Number(sourceTab.windowId) !== created.windowId
+  ) {
+    return {ok: false, reason: 'window_mismatch'};
+  }
+  return await runOwnedCaptureTabsMutation(async () => {
+    const registry = await readOwnedCaptureTabs();
+    if (registry.entries[tabId]) return {ok: false, reason: 'already_registered'};
+    // 一个创建记录只能登记一次。
+    recentlyCreatedTabs.delete(tabId);
+    registry.entries[tabId] = {
+      tabId,
+      requestId,
+      attemptId,
+      role: 'detail_worker',
+      windowId: created.windowId,
+      createdAt: created.createdAt,
+    };
+    const ordered = Object.values(registry.entries).sort(
+      (left, right) => right.createdAt - left.createdAt,
+    );
+    registry.entries = Object.fromEntries(
+      ordered
+        .slice(0, OWNED_CAPTURE_TABS_LIMIT)
+        .map((entry) => [entry.tabId, entry]),
+    );
+    await writeExtensionSessionValue(OWNED_CAPTURE_TABS_SESSION_KEY, registry);
+    return {ok: true};
+  });
+}
+
+function buildUnattendedAttemptRetiredKey(requestId, attemptId) {
+  return `${UNATTENDED_ATTEMPT_RETIRED_SESSION_PREFIX}${requestId}.${attemptId}`;
+}
+
+// 旧轮次 runner 在看到换代后写的退役回执：心跳已停、流水线已被取消、上传队列
+// 已尽量冲刷。请求、轮次、文档与标签页都从 sender 取，不信消息自报。
+async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
+  const owner = buildContentRelayOwner(sender);
+  const requestId = owner.runnerRequestId;
+  const attemptId = owner.runnerAttemptId;
+  if (!requestId || !attemptId) {
+    return {ok: false, reason: 'not_unattended_runner'};
+  }
+  const pendingUploads = Number(message?.pendingUploads);
+  const receipt = {
+    v: 1,
+    requestId,
+    attemptId,
+    documentId: String(sender?.documentId || '').trim().slice(0, 240),
+    tabId: resolveCaptureTaskTabId(sender?.tab?.id),
+    at: new Date().toISOString(),
+    reason: String(message?.reason || 'attempt_superseded').trim().slice(0, 60),
+    heartbeatStopped: message?.heartbeatStopped === true,
+    flushed: message?.flushed === true,
+    pendingUploads:
+      Number.isSafeInteger(pendingUploads) && pendingUploads >= 0
+        ? pendingUploads
+        : null,
+  };
+  await writeExtensionSessionValue(
+    buildUnattendedAttemptRetiredKey(requestId, attemptId),
+    receipt,
+  );
+  return {ok: true};
+}
+
+async function readUnattendedAttemptRetiredReceipt(requestId, attemptId) {
+  const normalizedRequestId = String(requestId || '').trim();
+  const normalizedAttemptId = String(attemptId || '').trim();
+  if (!normalizedRequestId || !normalizedAttemptId) return null;
+  try {
+    const receipt = await readExtensionSessionValue(
+      buildUnattendedAttemptRetiredKey(normalizedRequestId, normalizedAttemptId),
+    );
+    return receipt &&
+      typeof receipt === 'object' &&
+      receipt.requestId === normalizedRequestId &&
+      receipt.attemptId === normalizedAttemptId &&
+      receipt.heartbeatStopped === true
+      ? receipt
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 async function relayToContentWithRetry(tabId, payload, owner = null) {
   const timeoutMs = getContentRelayTimeoutMs(payload);
   const requestId = getCaptureRequestId(payload);
@@ -21656,7 +22024,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   });
 });
 
+chrome.tabs.onCreated?.addListener((tab) => {
+  rememberCreatedTab(tab);
+});
+
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  forgetOwnedCaptureTab(tabId).catch((error) => {
+    console.warn('[OwnedTabs] removal cleanup failed', error);
+  });
   void manualKeywordDispatch.removed(tabId).catch(error => console.warn('[Manual batch] close receipt failed', error));
   settleTargetedPostRunWithoutRunner({
     // A closing window may be a browser shutdown that session restore undoes;
@@ -21683,6 +22058,9 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
 });
 
 chrome.tabs.onReplaced?.addListener((addedTabId, removedTabId) => {
+  replaceOwnedCaptureTab(removedTabId, addedTabId).catch((error) => {
+    console.warn('[OwnedTabs] replacement migration failed', error);
+  });
   handleCaptureRuntimeTabReplaced(addedTabId, removedTabId).catch((error) => {
     console.warn('[onstarvoice] capture task tab migration failed', error);
   });
@@ -22302,6 +22680,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      if (type === 'onstarvoice:record-owned-capture-tab') {
+        sendResponse(await registerOwnedCaptureTabFromRunner(message, sender));
+        return;
+      }
+
+      if (type === 'onstarvoice:unattended-attempt-retired') {
+        sendResponse(await recordUnattendedAttemptRetired(message, sender));
+        return;
+      }
+
       if (type === 'onstarvoice:renew-capture-lock') {
         const result = await renewCaptureExecutionLock({
           lockId: message?.lockId,
@@ -22477,6 +22865,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const requestedTaskId = String(
           sourcePayload.taskId || sourcePayload.taskContext?.taskId || '',
         ).trim();
+        // 只登记发起方（文档、runner 请求/轮次、任务号）；停止保护核对据此
+        // 追溯页面上的采集活动归属。换代后的旧轮次在任何副作用之前被拒。
+        const relayOwner = buildContentRelayOwner(sender, requestedTaskId);
+        await assertUnattendedRelayAttemptCurrent(relayOwner, sourcePayload);
         let relayTabId = requestedTabId;
         let relayTab = null;
         try {
@@ -22590,9 +22982,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           };
         }
 
-        // 只登记发起方（文档、runner 请求/轮次、任务号），不改变中继行为；
-        // 停止保护核对据此追溯页面上的采集活动归属。
-        const relayOwner = buildContentRelayOwner(sender, requestedTaskId);
         let response;
         let relayError = null;
         try {
