@@ -2,6 +2,15 @@ import {createHash} from 'node:crypto';
 import {DiscoveryError, requireUuid} from '../capture-discovery/validation.js';
 export const WORKFLOW = 'douyin_mobile_discovery';
 export const LEASE_MS = 90_000;
+// Runner endings only the phone's owner can clear (login wall, verification).
+// A keyword ending with one stays needs_action for a person, never failed
+// automatically (docs/hotfix/20260927-unattended-self-heal.md, K4).
+export const MOBILE_MANUAL_ACTION_REASONS = Object.freeze([
+  'login_required', 'login_or_challenge_required', 'challenge_or_unknown',
+]);
+export function mobileReasonRequiresManualAction(reason) {
+  return MOBILE_MANUAL_ACTION_REASONS.includes(String(reason || '').trim().toLowerCase());
+}
 export const fail = (code, status = 409) => { throw new DiscoveryError(code, status); };
 export function text(value, field, max = 240) {
   if (typeof value !== 'string' || !value.trim() || value.length > max) fail(`INVALID_${field}`, 400);

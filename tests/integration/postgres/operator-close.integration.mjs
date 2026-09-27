@@ -539,7 +539,11 @@ test('operator close ends dead needs_action roots without releasing fences, live
       1,1,now())`, [f.tenant.id, parent.id]);
     const claimed = await poll();
     assert.equal(claimed.task.keyword, '别克壁纸');
-    const lastReport = {requestId: randomUUID(), identity: claimed.task.identity, sessionId, status: 'interrupted', deviceIdle: true};
+    // A login wall on the last attempt keeps the keyword needs_action for a
+    // person (an ordinary ending out of attempts fails by itself, K4 of
+    // docs/hotfix/20260927-unattended-self-heal.md).
+    const lastReport = {requestId: randomUUID(), identity: claimed.task.identity, sessionId, status: 'interrupted',
+      deviceIdle: true, reason: 'login_required'};
     await android.complete(principal, lastReport);
     assert.equal((await f.itemRow(exhausted.id)).status, 'needs_action', 'third attempt used up the phone budget');
     assert.equal((await f.row(parent.id)).status, 'needs_action');
@@ -1058,8 +1062,10 @@ test('operator close ends dead needs_action roots without releasing fences, live
       'pending',2,2) RETURNING *`, [f.tenant.id, parent.id]);
     const claimed = await poll();
     assert.equal(claimed.task.keyword, '别克壁纸');
+    // A verification ending keeps the used-up keyword needs_action (K4 of
+    // docs/hotfix/20260927-unattended-self-heal.md fails the others by itself).
     await android.complete(principal, {requestId: randomUUID(), identity: claimed.task.identity, sessionId,
-      status: 'interrupted', deviceIdle: true});
+      status: 'interrupted', deviceIdle: true, reason: 'challenge_or_unknown'});
     assert.equal((await f.itemRow(exhausted.id)).status, 'needs_action');
     assert.equal((await f.close(parent.id)).status, 200);
     const closed = await f.row(parent.id);

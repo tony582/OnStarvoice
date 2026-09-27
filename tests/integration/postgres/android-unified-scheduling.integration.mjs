@@ -254,12 +254,17 @@ test('phones participate in normal orchestration scheduling with hard isolation'
     await attempt('interrupted'); // 凯迪拉克壁纸, attempt 2
     await attempt('interrupted'); // 别克车机壁纸, attempt 2: fewer attempts go first
     await attempt('interrupted'); // 凯迪拉克壁纸, attempt 3: out of attempts
-    const [exhausted] = await query('SELECT status,attempt_count FROM capture_task_items WHERE task_id=$1 AND keyword=$2', [parentId, '凯迪拉克壁纸']);
-    assert.deepEqual([exhausted.status, exhausted.attempt_count], ['needs_action', 3]);
-    const [blocked] = await query('SELECT status FROM capture_tasks WHERE id=$1', [parentId]);
-    assert.equal(blocked.status, 'needs_action', 'the run reports the exhausted keyword');
+    // K4 (docs/hotfix/20260927-unattended-self-heal.md): out of attempts it fails
+    // like a browser elastic keyword instead of waiting in needs_action for
+    // nobody (no claim takes a needs_action keyword, no one resumes a phone one).
+    const [exhausted] = await query('SELECT status,attempt_count,error,finished_at FROM capture_task_items WHERE task_id=$1 AND keyword=$2', [parentId, '凯迪拉克壁纸']);
+    assert.deepEqual([exhausted.status, exhausted.attempt_count], ['failed', 3]);
+    assert.equal(exhausted.error.code, 'MOBILE_ATTEMPTS_EXHAUSTED');
+    assert.ok(exhausted.finished_at);
+    const [open] = await query('SELECT status FROM capture_tasks WHERE id=$1', [parentId]);
+    assert.notEqual(open.status, 'needs_action', 'nothing in the run needs a person');
     const resumed = await f.poll(); // 别克车机壁纸, attempt 3
-    assert.equal(resumed.task?.keyword, '别克车机壁纸', 'the other keyword is still claimed from the needs_action run');
+    assert.equal(resumed.task?.keyword, '别克车机壁纸', 'the other keyword is still claimed');
     const [working] = await query('SELECT status FROM capture_tasks WHERE id=$1', [parentId]);
     assert.equal(working.status, 'running', 'the run shows running while the phone works on it');
     claimed.push(resumed.task.keyword);
@@ -267,6 +272,23 @@ test('phones participate in normal orchestration scheduling with hard isolation'
     assert.deepEqual(claimed, ['凯迪拉克壁纸', '别克车机壁纸', '君越车机壁纸', '凯迪拉克壁纸', '别克车机壁纸', '凯迪拉克壁纸', '别克车机壁纸']);
     assert.equal((await f.poll()).task, null, 'nothing is left to claim');
     const [settled] = await query('SELECT status FROM capture_tasks WHERE id=$1', [parentId]);
-    assert.equal(settled.status, 'needs_action');
+    assert.equal(settled.status, 'completed_with_failures', 'the batch ends by itself');
+  });
+
+  await t.test('K4: a login or verification ending, or a phone still held, stays needs_action for a person', async st => {
+    const f = await fixture(st);
+    const {parentId} = await elasticParent(f.tenantId, {eligibleAgentIds: [f.phone.id], keywords: ['别克壁纸', '君越壁纸']});
+    await query("UPDATE capture_task_items SET attempt_count=2 WHERE task_id=$1", [parentId]);
+    const login = await f.poll();
+    await f.complete(login.task, {status: 'needs_action', reason: 'login_or_challenge_required'});
+    const held = await f.poll();
+    await f.complete(held.task, {status: 'interrupted', deviceIdle: false, reason: 'invalid_ui_source'});
+    const items = await query('SELECT keyword,status,attempt_count,metadata FROM capture_task_items WHERE task_id=$1 ORDER BY ordinal', [parentId]);
+    assert.deepEqual(items.map(item => [item.keyword, item.status, item.attempt_count]),
+      [['别克壁纸', 'needs_action', 3], ['君越壁纸', 'needs_action', 3]]);
+    assert.equal(items[0].metadata.reason, 'login_or_challenge_required');
+    assert.equal(items[1].metadata.deviceHeld, true);
+    const [parent] = await query('SELECT status FROM capture_tasks WHERE id=$1', [parentId]);
+    assert.equal(parent.status, 'needs_action');
   });
 });

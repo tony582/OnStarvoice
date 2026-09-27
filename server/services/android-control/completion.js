@@ -1,4 +1,4 @@
-import {digest,fail,id,json,text} from './validation.js';
+import {digest,fail,id,json,mobileReasonRequiresManualAction,text} from './validation.js';
 import {currentAttempt,MOBILE_ELASTIC_ATTEMPT_LIMIT} from './leases.js';
 import {refreshOrchestrationParent} from './parent-refresh.js';
 import {parentStopRequested,rollup,saveItemMetadata} from './repository.js';
@@ -35,12 +35,17 @@ export async function complete(tx,principal,body) {
   // clean completion is terminal. For orchestration children an unfinished
   // device-idle attempt becomes retryable while budget remains and the parent is
   // not stopped, so the same phone or another eligible node can pick it up again.
+  // Out of attempts it fails like a browser elastic keyword (K4 of
+  // docs/hotfix/20260927-unattended-self-heal.md): no claim ever takes a
+  // needs_action keyword again, and nobody can resume a phone keyword. Only a
+  // login or verification ending stays needs_action for the phone's owner.
   // Standalone runs keep the legacy needs_action projection and explicit resume.
   let itemStatus;
   if (status==='canceled') itemStatus='canceled';
   else if (!body.deviceIdle) itemStatus='needs_action';
   else if (status==='completed') itemStatus='completed';
   else if (orchestrationChild && item.attempt_count < MOBILE_ELASTIC_ATTEMPT_LIMIT && !stopFlagged) itemStatus='retryable';
+  else if (orchestrationChild && !stopFlagged && !mobileReasonRequiresManualAction(payload.reason)) itemStatus='failed';
   else itemStatus='needs_action';
   const receipt={accepted:true,deviceHeld:!body.deviceIdle};
   const completion={requestId,hash,receipt};
@@ -50,6 +55,10 @@ export async function complete(tx,principal,body) {
   await saveItemMetadata(tx,item,{...item.metadata,deviceHeld:!body.deviceIdle,completion,
     reason:payload.reason,deviceClosedAt:body.deviceIdle?new Date().toISOString():null,
     resumeAuthorized:itemStatus==='retryable'?false:item.metadata.resumeAuthorized===true},itemStatus);
+  if (itemStatus==='failed') await tx.execute(`UPDATE capture_task_items SET finished_at=COALESCE(finished_at,now()),
+    error=COALESCE(error,'{}'::jsonb)||jsonb_build_object('code','MOBILE_ATTEMPTS_EXHAUSTED','reason',$2::text,
+      'message',$3::text) WHERE id=$1`,
+  [item.id,payload.reason,`手机已尝试 ${MOBILE_ELASTIC_ATTEMPT_LIMIT} 次仍未完成，已标记失败`]);
   await rollup(tx,principal.tenantId,task.id);
   await refreshOrchestrationParent(tx,principal.tenantId,task,principal.agentId);
   return receipt;
