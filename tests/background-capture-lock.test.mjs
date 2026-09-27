@@ -466,6 +466,7 @@ function createHarness() {
       `  markCaptureRequestAborted,\n` +
       `  isCaptureRequestAborted,\n` +
       `  relayToContentWithRetry,\n` +
+      `  getContentRelayTimeoutMs,\n` +
       `  handleUnattendedKeywordAlarm,\n` +
       `  reconcileUnattendedKeywordPlanSchedule,\n` +
       `  createUnattendedKeywordRunRequest,\n` +
@@ -10979,6 +10980,137 @@ test("the comment-stage watchdog remains bounded after twelve minutes", async ()
     harness.storage[UNATTENDED_REQUEST_KEY].progress.phase,
     "waiting_automatic_recovery",
   );
+});
+
+function seedDetailSideEventRequest(harness, minutesAgo, progress) {
+  return seedUnattendedRequest(harness, {
+    heartbeatAt: new Date().toISOString(),
+    businessProgressAt: new Date(Date.now() - minutesAgo * 60 * 1000).toISOString(),
+    progress: {
+      current: 29,
+      total: 50,
+      keyword: "别克哨兵",
+      phase: "detail_item_prefetch_ready",
+      message: "工作页 B 已加载下一条，等待当前采集完成",
+      ...progress,
+    },
+  });
+}
+
+test("a prefetch event during comment capture keeps the comment-stage watchdog", async () => {
+  const commentStage = {
+    captureAction: "captureComments",
+    activeStage: "comments_capture",
+  };
+  const live = createHarness();
+  const liveRequest = seedDetailSideEventRequest(live, 7, commentStage);
+  const liveResult = await live.api.superviseUnattendedKeywordRun();
+  assert.equal(liveResult.healthy, true, JSON.stringify(liveResult));
+  assert.equal(live.storage[UNATTENDED_REQUEST_KEY].attemptId, liveRequest.attemptId);
+
+  const stalled = createHarness();
+  stalled.setContextMode("gone");
+  seedDetailSideEventRequest(stalled, 13, commentStage);
+  const stalledResult = await stalled.api.superviseUnattendedKeywordRun();
+  assert.equal(stalledResult.healthy, undefined, JSON.stringify(stalledResult));
+  assert.equal(stalled.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
+});
+
+test("the active stage alone selects the comment threshold, other stages keep six minutes", async () => {
+  const stageOnly = createHarness();
+  seedDetailSideEventRequest(stageOnly, 7, {
+    captureAction: "",
+    activeStage: "comments_capture",
+  });
+  const stageOnlyResult = await stageOnly.api.superviseUnattendedKeywordRun();
+  assert.equal(stageOnlyResult.healthy, true, JSON.stringify(stageOnlyResult));
+
+  const noteStage = createHarness();
+  noteStage.setContextMode("gone");
+  seedDetailSideEventRequest(noteStage, 7, {
+    captureAction: "",
+    activeStage: "note_capture",
+  });
+  const noteStageResult = await noteStage.api.superviseUnattendedKeywordRun();
+  assert.notEqual(noteStageResult.healthy, true, JSON.stringify(noteStageResult));
+  assert.equal(noteStage.storage[UNATTENDED_REQUEST_KEY].recoveryCount, 1);
+  assert.equal(
+    noteStage.storage[UNATTENDED_REQUEST_KEY].recoveryReason,
+    "business_progress_stalled",
+  );
+});
+
+test("runner progress keeps captureAction and activeStage without carrying them forward", async () => {
+  const harness = createHarness();
+  const request = seedUnattendedRequest(harness);
+  const first = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: request.progressSeq + 1,
+      progress: {
+        phase: "detail_item_prefetch_ready",
+        current: 3,
+        total: 9,
+        captureAction: "captureComments",
+        activeStage: "comments_capture",
+      },
+    },
+  });
+  assert.equal(first.accepted, true);
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].progress.captureAction,
+    "captureComments",
+  );
+  assert.equal(
+    harness.storage[UNATTENDED_REQUEST_KEY].progress.activeStage,
+    "comments_capture",
+  );
+  const second = await harness.api.updateUnattendedKeywordRun({
+    requestId: request.id,
+    attemptId: request.attemptId,
+    patch: {
+      progressSeq: request.progressSeq + 2,
+      progress: {phase: "detail_note_capture_started", current: 4, total: 9},
+    },
+  });
+  assert.equal(second.accepted, true);
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progress.captureAction, "");
+  assert.equal(harness.storage[UNATTENDED_REQUEST_KEY].progress.activeStage, "");
+});
+
+test("trace-binding overlay relays are best effort: 10 seconds, one send, no cancel or reinjection", async () => {
+  const harness = createHarness();
+  assert.equal(
+    harness.api.getContentRelayTimeoutMs({action: "updateListCaptureTraceBindings"}),
+    10 * 1000,
+  );
+  let injected = 0;
+  harness.chrome.scripting.executeScript = async () => {
+    injected += 1;
+    return [];
+  };
+  harness.setTabMessageHandler(async (_tabId, payload) => {
+    if (payload?.action === "updateListCaptureTraceBindings") {
+      throw new Error(
+        "Could not establish connection. Receiving end does not exist.",
+      );
+    }
+    return {ok: true};
+  });
+
+  await assert.rejects(
+    harness.api.relayToContentWithRetry(31, {
+      action: "updateListCaptureTraceBindings",
+      bindings: [],
+    }),
+    /Receiving end does not exist/u,
+  );
+  const sentActions = harness.sentTabMessages.map(({payload}) => payload?.action);
+  assert.deepEqual(sentActions, ["updateListCaptureTraceBindings"]);
+  assert.equal(injected, 0);
+  assert.deepEqual(harness.reloadedTabIds, []);
+  assert.equal(harness.api.listRequestRelays("", "").length, 0);
 });
 
 test("fresh content business progress protects a long-running unattended capture", async () => {

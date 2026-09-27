@@ -289,6 +289,10 @@
       keyword: sanitizeText(input.keyword, 200),
       phase: sanitizeText(input.phase, 100),
       message: sanitizeText(input.message),
+      // 评论阶段标记：服务端覆盖调度按 captureAction 放宽卡住判定，activeStage
+      // 说明前台工作页停在哪一步。不在评论阶段时为空串。
+      captureAction: sanitizeText(input.captureAction, 40),
+      activeStage: sanitizeText(input.activeStage, 40),
       retryCount: normalizeNonNegativeInteger(input.retryCount),
       maxRetries: normalizeNonNegativeInteger(input.maxRetries),
       round: normalizeNonNegativeInteger(input.round),

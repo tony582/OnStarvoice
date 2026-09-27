@@ -549,3 +549,41 @@ test("incomplete legacy running records are historical, not active tasks", () =>
   assert.equal(items.every((item) => item.status === "completed_with_warnings"), true);
   assert.equal(items.every((item) => Boolean(item.finishedAt)), true);
 });
+
+test("task progress keeps the comment-stage markers the watchdog and coverage read", () => {
+  const run = core.normalizeTaskRun(
+    {
+      id: "run-comment-stage",
+      status: "running",
+      progress: {
+        phase: "detail_item_prefetch_ready",
+        current: 29,
+        total: 50,
+        captureAction: "captureComments",
+        activeStage: "comments_capture",
+      },
+    },
+    {now: NOW},
+  );
+  assert.equal(run.progress.captureAction, "captureComments");
+  assert.equal(run.progress.activeStage, "comments_capture");
+  assert.equal(run.progress.current, 29);
+
+  const idle = core.normalizeTaskRun(
+    {id: "run-idle", status: "running", progress: {phase: "capturing"}},
+    {now: NOW},
+  );
+  assert.equal(idle.progress.captureAction, "");
+  assert.equal(idle.progress.activeStage, "");
+
+  const bounded = core.normalizeTaskRun(
+    {
+      id: "run-bounded",
+      status: "running",
+      progress: {captureAction: "x".repeat(80), activeStage: "y".repeat(80)},
+    },
+    {now: NOW},
+  );
+  assert.ok(bounded.progress.captureAction.length <= 40);
+  assert.ok(bounded.progress.activeStage.length <= 40);
+});

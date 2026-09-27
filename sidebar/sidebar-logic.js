@@ -16157,6 +16157,13 @@ function createUnattendedKeywordProgressReporter(
       ),
       phaseStartedAt: String(projectedProgress?.phaseStartedAt || ""),
       workerMode: String(projectedProgress?.workerMode || ""),
+      // 看门狗按这两个字段识别评论阶段（预加载等旁路事件也会带上前台阶段）。
+      captureAction: String(projectedProgress?.captureAction || "")
+        .trim()
+        .slice(0, 40),
+      activeStage: String(projectedProgress?.activeStage || "")
+        .trim()
+        .slice(0, 40),
       workerStates: Array.isArray(projectedProgress?.workerStates)
         ? projectedProgress.workerStates.slice(0, 2)
         : [],

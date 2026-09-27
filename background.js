@@ -696,6 +696,10 @@ function normalizeUnattendedRunProgress(progress = null, fallbackMessage = '') {
     phaseStartedAt: String(progress.phaseStartedAt || ''),
     updatedAt: String(progress.updatedAt || new Date().toISOString()),
     workerMode: String(progress.workerMode || ''),
+    // 看门狗与服务端覆盖调度按这两个字段识别评论阶段；每次按原样重建，
+    // 空值表示当前不在评论阶段。
+    captureAction: String(progress.captureAction || '').trim().slice(0, 40),
+    activeStage: String(progress.activeStage || '').trim().slice(0, 40),
     workerStates: Array.isArray(progress.workerStates)
       ? progress.workerStates
           .filter((worker) => worker && typeof worker === 'object')
@@ -14680,10 +14684,14 @@ async function assessUnattendedRunHealth(
     const captureAction = String(request?.progress?.captureAction || '')
       .trim()
       .toLowerCase();
+    const activeStage = String(request?.progress?.activeStage || '')
+      .trim()
+      .toLowerCase();
     const businessStallLimitMs =
       progressPhase === 'detail_comments_capturing' ||
       progressPhase.startsWith('comments_') ||
-      captureAction === 'capturecomments'
+      captureAction === 'capturecomments' ||
+      activeStage === 'comments_capture'
         ? UNATTENDED_RUN_COMMENT_STAGE_STALL_MS
         : UNATTENDED_RUN_BUSINESS_STALL_MS;
     if (
@@ -17533,6 +17541,17 @@ async function ensureContentScriptReady(tabId) {
   });
 }
 
+// 尽力而为的覆盖层消息：调用方不看结果。只发一次，超时或出错直接抛给调用方；
+// 不发取消（它带空 captureRequestId，列表阶段会误停来源页上的列表采集）、不刷新、
+// 不重注入。否则一条覆盖层消息可以把流水线拖住 4 分钟以上。
+const CONTENT_RELAY_BEST_EFFORT_ACTIONS = new Set([
+  'updateListCaptureTraceBindings',
+]);
+
+function isBestEffortContentRelayAction(payload = {}) {
+  return CONTENT_RELAY_BEST_EFFORT_ACTIONS.has(String(payload?.action || ''));
+}
+
 function getContentRelayTimeoutMs(payload = {}) {
   const action = String(payload?.action || '');
   if (
@@ -17540,7 +17559,8 @@ function getContentRelayTimeoutMs(payload = {}) {
     action === 'cancelCapture' ||
     action === 'inspectCaptureActivity' ||
     action === 'detectPageType' ||
-    action === 'detectSearchSortDimension'
+    action === 'detectSearchSortDimension' ||
+    isBestEffortContentRelayAction(payload)
   ) {
     return 10 * 1000;
   }
@@ -18068,6 +18088,9 @@ async function relayToContentWithRetry(tabId, payload, owner = null) {
     settledCaptureRequestIds.delete(requestId);
   }
   try {
+    if (isBestEffortContentRelayAction(payload)) {
+      return await sendContentMessageWithTimeout(tabId, payload, timeoutMs);
+    }
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (requestId && isCaptureRequestAborted(requestId)) {
         return resolveAbortedCaptureRequest(payload);

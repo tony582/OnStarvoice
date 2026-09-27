@@ -1397,6 +1397,31 @@ function collectListCaptureSessionRecordIds(session) {
   );
 }
 
+// 渲染进程挂住或后台工作页被冻结时 executeScript 可能永远不返回。探测类调用
+// 统一限时：超时返回 null（按“没就绪/未知”处理），由调用方已有的循环截止时间
+// 接着生效。超时后留在后台的那次调用没有副作用。
+export const DETAIL_PROBE_EXECUTE_SCRIPT_TIMEOUT_MS = 10 * 1000;
+
+export async function executeScriptWithTimeout(
+  details,
+  timeoutMs = DETAIL_PROBE_EXECUTE_SCRIPT_TIMEOUT_MS,
+) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      chrome.scripting.executeScript(details),
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve(null),
+          Math.max(0, Number(timeoutMs) || 0),
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function getActiveListCaptureCheckpointStats() {
   const session = activeListCaptureCheckpointSession;
   if (!session) return null;
@@ -4431,6 +4456,20 @@ export async function batchCaptureDetailsForRecords(
       throw lastRecoverableError || new Error('抖音详情页未完成加载');
     },
     onTransition: ({type, slot, snapshot, error}) => {
+      // 预加载工作页 B 与释放事件只描述旁路工作页。看门狗按上报的阶段选
+      // 阈值，所以这些事件同时带上前台工作页 A 的序号与阶段；不在评论阶段时
+      // 显式写空的 captureAction，避免沿用上一条事件的评论标记。
+      const readForegroundDetailProgress = () => {
+        const context = activeDetailItemContext || {};
+        const activeStage = String(context.activeStage || '').trim().slice(0, 40);
+        return {
+          current: Number(context.current) || 0,
+          total: uniqueRecordIds.length,
+          activeStage,
+          captureAction:
+            activeStage === 'comments_capture' ? 'captureComments' : '',
+        };
+      };
       const fatalNavigationFailure =
         (type === 'navigation_failed' ||
           type === 'external_navigation_failed') &&
@@ -4483,6 +4522,7 @@ export async function batchCaptureDetailsForRecords(
         }, 'detail foreground navigation started');
       } else if (type === 'navigation_started' && slot.mode === 'prefetch') {
         void reportProgressFailSoft(onProgress, {
+          ...readForegroundDetailProgress(),
           phase: 'detail_item_prefetch_loading',
           message: `${slot.label} 正在预加载下一条详情...`,
           recordId: slot.recordId,
@@ -4494,6 +4534,7 @@ export async function batchCaptureDetailsForRecords(
         }, 'detail prefetch loading');
       } else if (type === 'navigation_ready' && slot.mode === 'prefetch') {
         void reportProgressFailSoft(onProgress, {
+          ...readForegroundDetailProgress(),
           phase: 'detail_item_prefetch_ready',
           message: `${slot.label} 已加载下一条，等待当前采集完成`,
           recordId: slot.recordId,
@@ -4506,6 +4547,7 @@ export async function batchCaptureDetailsForRecords(
         }, 'detail prefetch ready');
       } else if (type === 'collection_finished') {
         void reportProgressFailSoft(onProgress, {
+          ...readForegroundDetailProgress(),
           phase: 'detail_worker_released',
           message: `${slot.label} 已完成当前详情，等待下一条`,
           runnerTabId: slot.tabId,
@@ -5854,6 +5896,9 @@ export async function batchCaptureDetailsForRecords(
           !shouldSkipConfirmedEmptyComments
         ) {
           activeStage = 'comments_capture';
+          if (activeDetailItemContext) {
+            activeDetailItemContext.activeStage = activeStage;
+          }
           const expectedCommentNoteId =
             recordPlatform === 'douyin'
               ? expectedDouyinNoteId
@@ -5934,6 +5979,7 @@ export async function batchCaptureDetailsForRecords(
               captureRequestId: commentCaptureIdentity.captureRequestId,
               runnerTabId: commentCaptureIdentity.runnerTabId,
               captureAction: 'captureComments',
+              activeStage: 'comments_capture',
             });
           }
 
@@ -13415,7 +13461,7 @@ async function probeDetailPreloadSafety(
       if (typeof shouldStop === 'function' && shouldStop()) {
         throw new Error('DETAIL_CAPTURE_CANCELED');
       }
-      const [execution] = await chrome.scripting.executeScript({
+      const [execution] = (await executeScriptWithTimeout({
         target: {tabId: Number(tabId)},
         args: [
           String(expectedNoteId || ''),
@@ -13930,7 +13976,7 @@ async function probeDetailPreloadSafety(
             securityEvidence: xhsSecurityEvidence,
           };
         },
-      });
+      })) || [];
       const result = execution?.result || {};
       if (result.blocked) {
         const error = result.securityEvidence?.confirmed === true
@@ -15559,9 +15605,9 @@ async function classifyTargetPageAvailabilityInTab(tabId, targetUrl) {
 async function probeDetailUnavailableInTab(tabId, targetUrl) {
   if (detectPlatformFromUrl(targetUrl) !== 'xiaohongshu') return null;
   try {
-    const [execution] = await chrome.scripting.executeScript({
+    const [execution] = (await executeScriptWithTimeout({
       target: {tabId: Number(tabId)}, func: readDetailAvailabilitySnapshot,
-    });
+    })) || [];
     return classifyDetailAvailabilitySnapshot(execution?.result, {
       targetUrl, classifySnapshot: targetPageAvailabilityApi?.classifySnapshot,
     });
