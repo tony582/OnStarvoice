@@ -1021,3 +1021,27 @@ WHERE task_id = '408d1410-97ee-49cd-af1a-dac05ec98d02'
 - 人工交接（resolve-attention）写 `reopenedFromHistoryAt` 的路径没有路由级 PG 测试；它与 `retry-items` 共用同一段 SQL（PG 测试覆盖），UPDATE 形状在 PG17 上用 EXPLAIN 核对过，单元测试钉住两处都带它。
 - CI 没有跑（分支未推送），K=3 风险 SQL 没有在生产上跑，两项都在「上线步骤」里。
 - 本机 PG 是 17.9；CI 用 14 和 16。
+
+## 发布记录（2026-09-27，Asia/Shanghai）
+
+### K=3 风险核对结论：F2 在生产上保持实际关闭
+
+发布前按「关于 K=3 的风险」跑了只读回放（近 7 天）：有 11 个关键词在同一工作项里先有 ≥3 次时间筛选失败、之后又被别的节点采集成功。进一步按节点看：
+
+- 09-27 03:30 批次的 5 个词（安吉星壁纸、上汽通用客服、月兔栖梦、君越壁纸、昂科威壁纸）在 7 台节点失败后，12:02–12:07 全部由 **上海** 一次成功（12:01 人工确认放行后）。
+- 近 7 天时间筛选失败次数/尝试次数：金星 45/179、成都 39/129、北京 26/131、重庆 10/98、霸王龙 9/100、火星 9/78、木星 7/68、上海 2/78。
+
+所以这个失败是节点（账号或窗口状态）相关的，不是「该时段没有内容」。K=3 会把本来能在上海采到的词提前停掉。处理：
+
+- 生产 `/opt/onstarvoice/server/.env` 加 `CAPTURE_FILTER_VERIFICATION_LIMIT=20`（允许的最大值；次数条件 20 超过 16 次预算，永不触发；只剩「池内 8 台都失败过」才结算）。备份：`/opt/onstarvoice-private/config-backups/server.env.before-filter-verification-limit-20260927T173852`。
+- F1（10 分钟后放开本轮排除）和 F3 照常生效。
+- 后续：扩展侧查明为什么这些节点的时间筛选取证失败（候选：窗口被遮挡导致渲染节流、账号拿到不同前端导致结果容器重挂载），见 20260927-unattended-self-heal。
+
+### 部署
+
+- CI run 36309783365 5/5 通过（分支 `codex/hotfix-stuck-retry-cleanup-20260927`，head `31b51d1`）。
+- 上传后 `sha256sum --check` 通过；`deploy.sh --check`：5 个替换文件、6 个核对文件与 e791483（fe74ec5）一致，admin index 476f8e19，两个新模块不存在，更新清单 0.4.18，operator-close 路由未上线。
+- 17:38:52 写入上述 env（先备份），随后 `deploy.sh`：PM2 `onstarvoice` 新 PID 491003（Node 18.20.8），`health/ready` 通过，脚本后检全部通过。
+- 部署后：17:39:26 18/18 个近 2 小时有心跳的节点在 90 秒内全部重连；公网 `POST /api/capture-cloud/tasks/operator-close` 未登录返回 401（路由已上线）；`/api/update-manifest` 仍为 0.4.18。
+
+发布目录：`/opt/onstarvoice-private/releases/stuck-retry-cleanup-31b51d1-20260927/`（含 `backup/`）。
