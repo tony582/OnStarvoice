@@ -31,3 +31,18 @@ export function buildKeywordRetryAssignments<
   items?: Item[]
   overrides?: Record<string, string>
 }): Array<{itemId: string; agentId: string}>
+
+export interface KeywordRetrySourceExecutionLike {
+  status?: string
+  metadata?: unknown
+}
+
+export function manualKeywordRetrySourceSettled(
+  execution?: KeywordRetrySourceExecutionLike | null,
+): boolean
+
+export function keywordRetrySourceReleased(input?: {
+  item?: {status?: string} | null
+  execution?: KeywordRetrySourceExecutionLike | null
+  elasticPool?: boolean
+}): boolean

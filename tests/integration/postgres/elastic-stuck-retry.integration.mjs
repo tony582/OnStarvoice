@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import test from 'node:test';
 import {validatePostgresIntegrationTarget} from '../../../scripts/lib/postgres-integration-target.mjs';
+import {keywordRetrySourceReleased} from '../../../web/admin/src/pages/dispatch/cloud-tasks/retry-item-allocation.js';
 
 // docs/hotfix/20260927-stuck-retry-and-attention-cleanup.md
 // F1: a retryable keyword whose untried pool nodes cannot claim it (09-27:
@@ -97,6 +98,13 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
       headers: {'content-type': 'application/json', authorization: `Bearer ${f.session.token}`,
         'x-tenant-id': f.tenant.id},
       body: JSON.stringify(body),
+    });
+    return {status: response.status, body: await response.json()};
+  }
+
+  async function adminGet(f, path) {
+    const response = await fetch(`${origin}/api/capture-cloud${path}`, {
+      headers: {authorization: `Bearer ${f.session.token}`, 'x-tenant-id': f.tenant.id},
     });
     return {status: response.status, body: await response.json()};
   }
@@ -592,6 +600,60 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     const again = [];
     assert.equal(await claim(f, '北京', again), null);
     assert.equal(again.filter(sql => sql.includes('PREVIOUS_CAPTURE_STOP_UNCONFIRMED')).length, 1);
+  });
+
+  await t.test('09-27 after F2: the admin retry list leaves out fenced keywords and the server accepts it', async st => {
+    const f = await fixture(st);
+    const keywords = ['安吉星壁纸', '上汽通用客服', '月兔栖梦', '君越壁纸', '昂科威壁纸'];
+    const {parent, items} = await batch(f, {keywords, status: 'needs_action'});
+    await seedAttempts(f, parent, items[0], ['火星', '成都', '霸王龙', '重庆', '金星', '北京', '木星'],
+      {anchor: minutesAgo(60)});
+    for (const item of items.slice(1)) {
+      await seedAttempts(f, parent, item, ['霸王龙', '成都', '重庆', '金星', '北京', '木星'],
+        {anchor: minutesAgo(60)});
+    }
+    await fence(f, parent, '火星', '别克哨兵');
+    await fence(f, parent, '上海', 'ibuick');
+    assert.equal(await claim(f, '成都'), null);
+    for (const item of items) assert.equal((await itemRow(item.id)).status, 'failed', item.keyword);
+
+    // What OrchestrationDetailWorkspace submits: keyword items in a retry
+    // status whose source passes keywordRetrySourceReleased (elastic pool).
+    const detail = await adminGet(f, `/orchestrations/${parent.id}`);
+    assert.equal(detail.status, 200, JSON.stringify(detail.body).slice(0, 400));
+    const executionById = new Map(detail.body.executions.map(execution => [String(execution.id), execution]));
+    const retryStatus = item => item.item_type === 'keyword' &&
+      ['retryable', 'needs_action', 'failed'].includes(item.status);
+    const adminItems = detail.body.items.filter(item => retryStatus(item) && keywordRetrySourceReleased({
+      item, execution: executionById.get(String(item.execution_task_id)), elasticPool: true,
+    }));
+    assert.deepEqual(adminItems.map(item => item.keyword).sort(), [...keywords].sort(),
+      'the fenced 别克哨兵/ibuick wait for 确认旧页面已停止 instead');
+    assert.ok(adminItems.every(item => item.status === 'failed'), 'no automatic recovery hides the button');
+
+    // Before the fix the admin also sent the needs_action keywords whose
+    // source is fenced; the server refuses the whole request.
+    const withFenced = detail.body.items.filter(item => retryStatus(item) &&
+      executionById.has(String(item.execution_task_id)));
+    assert.equal(withFenced.length, keywords.length + 2);
+    const refused = await adminPost(f, `/orchestrations/${parent.id}/retry-items`, {
+      requestKey: randomUUID(), expectedRevision: Number(detail.body.orchestration.revision),
+      itemIds: withFenced.map(item => item.id),
+    });
+    assert.equal(refused.status, 409, JSON.stringify(refused.body));
+    assert.equal(refused.body.error, 'retry_source_not_settled', JSON.stringify(refused.body));
+
+    const accepted = await adminPost(f, `/orchestrations/${parent.id}/retry-items`, {
+      requestKey: randomUUID(), expectedRevision: Number(detail.body.orchestration.revision),
+      itemIds: adminItems.map(item => item.id),
+    });
+    assert.equal(accepted.status, 201, JSON.stringify(accepted.body));
+    for (const item of items) {
+      assert.ok(['retryable', 'dispatched'].includes((await itemRow(item.id)).status), item.keyword);
+    }
+    const fencedItems = await query(`SELECT status FROM capture_task_items WHERE task_id=$1
+      AND item_key LIKE 'keyword:fenced:%'`, [parent.id]);
+    assert.deepEqual(fencedItems.map(item => item.status), ['needs_action', 'needs_action']);
   });
 
   await t.test('a phone claim drops stale anchors so a mixed pool restarts the relax window', async st => {

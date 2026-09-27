@@ -69,3 +69,52 @@ export function buildKeywordRetryAssignments({items = [], overrides = {}} = {}) 
     return agentId ? [{itemId: item.id, agentId}] : [];
   });
 }
+
+// 与服务端 POST /orchestrations/:id/retry-items 的来源闸门一致
+// （capture-orchestrations.js HANDOFF_SOURCE_FINAL_STATUSES 或
+// stopFenceReleasedRetrySource）：原执行已结算，或是运营「确认旧页面已停止」
+// 放行的批次子任务（superseded + terminalReason，且没有接力/恢复后继）。
+// 只要一条来源不满足，整次请求就会 409 retry_source_not_settled，所以管理端
+// 只能提交满足这条规则的关键词。
+const MANUAL_RETRY_SOURCE_FINAL_STATUSES = new Set([
+  'completed',
+  'completed_with_warnings',
+  'completed_with_failures',
+  'failed',
+  'canceled',
+  'skipped',
+]);
+const STOP_FENCE_OPERATOR_RELEASED_REASON = 'stop_fence_operator_released';
+// 弹性池自动接力（心跳领取）对 retryable 关键词的来源要求更宽：原执行停在
+// 需处理/中断也可以由其他节点领取。
+const ELASTIC_CLAIM_SOURCE_RELEASED_STATUSES = new Set([
+  ...MANUAL_RETRY_SOURCE_FINAL_STATUSES,
+  'superseded',
+  'needs_action',
+  'interrupted',
+]);
+
+function plainObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+export function manualKeywordRetrySourceSettled(execution) {
+  if (!execution) return false;
+  const status = String(execution.status || '');
+  if (MANUAL_RETRY_SOURCE_FINAL_STATUSES.has(status)) return true;
+  const metadata = plainObject(execution.metadata);
+  return status === 'superseded' &&
+    metadata.terminalReason === STOP_FENCE_OPERATOR_RELEASED_REASON &&
+    !String(metadata.handoffSuccessorTaskId || '').trim() &&
+    !String(metadata.recoveryTaskId || '').trim();
+}
+
+// retryable 关键词在弹性池里由自动接力负责（按领取闸门判断）；其余关键词要走
+// 「重试失败关键词」，按服务端人工重试闸门判断。
+export function keywordRetrySourceReleased({item, execution, elasticPool = false} = {}) {
+  if (!execution) return false;
+  if (elasticPool && item?.status === 'retryable') {
+    return ELASTIC_CLAIM_SOURCE_RELEASED_STATUSES.has(String(execution.status || ''));
+  }
+  return manualKeywordRetrySourceSettled(execution);
+}

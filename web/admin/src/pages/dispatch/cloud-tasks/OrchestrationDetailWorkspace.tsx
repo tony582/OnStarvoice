@@ -42,6 +42,7 @@ import { AndroidChildRunPanel } from '../android-discovery/AndroidChildRunPanel'
 import {
   allocateKeywordRetryItems,
   buildKeywordRetryAssignments,
+  keywordRetrySourceReleased,
 } from './retry-item-allocation.js'
 import {
   activeRecoveryCommandStatus,
@@ -147,6 +148,8 @@ const NEGATIVE_REASSIGN_BLOCKING_EXECUTION_STATUSES = new Set([
   'resume_requested',
 ])
 const KEYWORD_RETRY_STATUSES = new Set(['retryable', 'needs_action', 'failed'])
+// 原执行停在这些状态时，其失败关键词还不能人工重试（服务端 retry_source_not_settled）。
+const RETRY_AWAITING_SOURCE_EXECUTION_STATUSES = new Set(['needs_action', 'interrupted'])
 
 const COMMAND_STATUS_LABELS: Record<string, string> = {
   pending: '等待 Agent 领取',
@@ -510,25 +513,45 @@ export function OrchestrationDetailWorkspace({
     ])),
     [detail?.executions],
   )
-  const keywordRetryItems = useMemo(() => {
-    if (!detail || contentPatrol || isScheduleTemplate) return []
-    return sortedItems.filter(item => {
-      if (item.item_type !== 'keyword' || !KEYWORD_RETRY_STATUSES.has(item.status)) return false
+  // keywordRetryItems：可提交「重试失败关键词」或正由弹性池自动接力的关键词，
+  // 来源闸门与服务端一致（keywordRetrySourceReleased）。原执行仍停在需处理/中断
+  // （如旧页面未确认停止）的失败关键词会让服务端整单 409，单独列出并提示先处理原执行。
+  const { keywordRetryItems, keywordRetryAwaitingSourceItems } = useMemo(() => {
+    const ready: OrchestrationItemRecord[] = []
+    const awaitingSource: OrchestrationItemRecord[] = []
+    if (!detail || contentPatrol || isScheduleTemplate) {
+      return { keywordRetryItems: ready, keywordRetryAwaitingSourceItems: awaitingSource }
+    }
+    for (const item of sortedItems) {
+      if (item.item_type !== 'keyword' || !KEYWORD_RETRY_STATUSES.has(item.status)) continue
       if (safetyDiagnostic(item.error) || safetyDiagnostic(item.metadata)) {
         // 弹性池第一次命中验证码会自动换 Agent；此时 item 已被服务端明确
         // 标为 retryable，不应提前显示成人工待办。
-        if (!(elasticPool && item.status === 'retryable')) return false
+        if (!(elasticPool && item.status === 'retryable')) continue
       }
       const sourceExecution = executionsById.get(
         String(item.execution_task_id || ''),
       )
-      if (!sourceExecution) return false
-      const sourceStatus = executionStatus(sourceExecution)
-      return elasticPool
-        ? RETRY_SOURCE_RELEASED_EXECUTION_STATUSES.has(sourceStatus)
-        : FINAL_EXECUTION_STATUSES.has(sourceStatus)
-    })
+      if (!sourceExecution) continue
+      if (keywordRetrySourceReleased({ item, execution: sourceExecution, elasticPool })) {
+        ready.push(item)
+      } else if (
+        elasticPool &&
+        item.status !== 'retryable' &&
+        RETRY_AWAITING_SOURCE_EXECUTION_STATUSES.has(executionStatus(sourceExecution))
+      ) {
+        awaitingSource.push(item)
+      }
+    }
+    return { keywordRetryItems: ready, keywordRetryAwaitingSourceItems: awaitingSource }
   }, [contentPatrol, detail, elasticPool, executionsById, isScheduleTemplate, sortedItems])
+  // 原执行正被停止保护挡着（依据 /overview 的 stop_fence，不按错误码推断）的数量，决定提示文案。
+  const keywordRetryAwaitingStopFenceCount = useMemo(
+    () => keywordRetryAwaitingSourceItems.filter(item =>
+      findExecutionStopFence(String(item.execution_task_id || ''), availableAgents) !== null,
+    ).length,
+    [availableAgents, keywordRetryAwaitingSourceItems],
+  )
   const attemptedAgentIdsByRetryItem = useMemo(() => {
     const attempted = new Map<string, Set<string>>()
     for (const attempt of detail?.attempts || []) {
@@ -1625,6 +1648,14 @@ export function OrchestrationDetailWorkspace({
                         ? '该批次已结算；可先查看每次尝试的真实错误，再选择在当前任务内重试或新建补采任务。'
                         : '下拉框只是优先 Agent 预览；提交后服务端会按实时空闲、已尝试轮次与安全风控记录完成最终分配。'}
                   </p>
+                  {keywordRetryAwaitingSourceItems.length > 0 && (
+                    <p className="mt-1 text-xs leading-5 text-amber-700 dark:text-amber-300">
+                      {`另有 ${keywordRetryAwaitingSourceItems.length} 个关键词（${keywordRetryAwaitingSourceItems.slice(0, 3).map(keywordForItem).join('、')}${keywordRetryAwaitingSourceItems.length > 3 ? ' 等' : ''}）的原执行仍为需处理，暂不随这里重试；`}
+                      {keywordRetryAwaitingStopFenceCount > 0
+                        ? '旧页面未确认停止的，请先在「执行节点」中点「确认旧页面已停止」，之后会交回任务池或出现在这里。'
+                        : '请先在上方处理或停止原执行，结束后会出现在这里。'}
+                    </p>
+                  )}
                 </div>
               </div>
               {automaticKeywordRecoveryActive ? (
