@@ -19261,6 +19261,9 @@ async function navigateActiveTabToKeywordSearchForPlan({
               shouldStop,
             })
           : false;
+        // Persist the real search document independently of progress, after
+        // readiness probes. Cleanup evidence never fails or retries collection.
+        await globalThis.OnStarvoiceKeywordSourceBinding?.recordNavigation(preferredTabId, searchUrl);
         if (readyState.ready && isSearchRuntimeReady) {
           if (typeof shouldStop === "function" && shouldStop()) {
             const stoppedError = new Error("无人值守搜索页恢复已取消");

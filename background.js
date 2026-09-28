@@ -27,6 +27,7 @@ try {
 importScripts(
   'utils/manual-keyword-dispatch.js',
   'utils/task-home-cleanup.js',
+  'utils/keyword-source-binding.js',
   'utils/retired-runner-cleanup.js',
   'utils/control-storage-reserve.js',
   'utils/social-account-usage.js',
@@ -4135,6 +4136,10 @@ async function stopTargetedPostAttemptResources(
     request,
     cleanupCurrent,
   );
+  // Capture the owned page's window before closing it. Only a verified
+  // disappearance may authorize replacing a targeted task page with a home.
+  const platformTabBeforeCleanup = registration && !registration.legacy
+    ? await chrome.tabs.get(registration.tabId).catch(() => null) : null;
   let cancelRelayedCount = 0;
   if (signalCapture && registration?.tabId) {
     cancelRelayedCount = await relayTargetedPostCancelWithTimeout(
@@ -4187,7 +4192,19 @@ async function stopTargetedPostAttemptResources(
     );
   }
   if (executionLockSettled && platformCleanup?.ok && !cloudTargetedPostApi.shouldPreservePlatformTab(request)) {
-    await queueFinishedTaskHome(request).catch(error => console.warn('[Cleanup] platform home pending:', error));
+    let allowCreateHome = false;
+    if (platformTabBeforeCleanup && registration?.sessionId &&
+      platformCleanup.removedCount === 1 && platformCleanup.tabId === registration.tabId &&
+      !platformCleanup.skipped && !platformCleanup.retained) {
+      try { await chrome.tabs.get(registration.tabId); }
+      catch (error) { allowCreateHome = isExplicitMissingTargetedPostTabError(error); }
+    }
+    await queueFinishedTaskHome(request, {
+      allowCreateHome,
+      ...(allowCreateHome ? {runnerTab: {
+        id: request.runnerTabId, windowId: platformTabBeforeCleanup.windowId,
+      }} : {}),
+    }).catch(error => console.warn('[Cleanup] platform home pending:', error));
   }
   const runnerCleanup = isSameTargetedPostAttempt(request, cleanupCurrent)
     ? await closeTerminalTargetedPostRunnerTabs(request)
@@ -6777,35 +6794,177 @@ async function isTaskBrowserIdle() {
     .some(entry => ['pending', 'claimed'].includes(entry.status));
 }
 
+const keywordSourceBindings = globalThis.OnStarvoiceKeywordSourceBinding?.createController({storage: chrome.storage.local});
+
+function keywordSourceOwnerForRequest(request, runnerDocumentId = '') {
+  return {
+    kind: request?.attemptId ? 'unattended' : 'manual',
+    identity: `${request?.id || ''}:${request?.attemptId || request?.commandId || ''}`,
+    requestId: request?.id, attemptId: request?.attemptId || '', commandId: request?.commandId || '',
+    platform: request?.platform || request?.planSnapshot?.platform || request?.plan?.platform,
+    runnerDocumentId,
+  };
+}
+
+async function readKeywordSourceSenderOwner(sender) {
+  if (!sender?.documentId || !resolveCaptureTaskTabId(sender?.tab?.id)) return null;
+  let url;
+  try { url = new URL(sender.url); } catch { return null; }
+  if (!isOwnExtensionPageUrl(url.href) || url.pathname !== '/sidebar/sidebar.html') return null;
+  const requestId = url.searchParams.get(UNATTENDED_RUNNER_QUERY_KEY);
+  if (requestId) {
+    const request = await readUnattendedKeywordRunRequest();
+    if (!request || request.id !== requestId || request.attemptId !== url.searchParams.get(UNATTENDED_RUNNER_ATTEMPT_QUERY_KEY) ||
+        request.runnerTabId !== sender.tab.id || isTerminalUnattendedRunStatus(request.status)) return null;
+    return {owner: keywordSourceOwnerForRequest(request, sender.documentId), request};
+  }
+  const manualId = url.searchParams.get('manualKeywordBatch');
+  if (!manualId || url.searchParams.has('targetedPostRun')) return null;
+  const key = globalThis.OnStarvoiceManualKeywordDispatch.STORAGE_KEY;
+  const request = (await chrome.storage.local.get(key))[key]?.[manualId];
+  if (!request || request.status !== 'claimed' || request.runnerTabId !== sender.tab.id ||
+      request.claimedDocumentId !== sender.documentId) return null;
+  return {owner: keywordSourceOwnerForRequest(request, sender.documentId), request};
+}
+
+async function runTaskHomeSidecar(operation) {
+  let timer;
+  let canceled = false;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => operation({isCanceled: () => canceled})),
+      new Promise(resolve => { timer = setTimeout(() => { canceled = true; resolve(null); }, 1500); }),
+    ]);
+  } catch (error) { console.warn('[Cleanup] source sidecar unavailable:', error); return null; }
+  finally { canceled = true; clearTimeout(timer); }
+}
+
+async function bindKeywordSource(request, source, runnerDocumentId = '') {
+  return await runTaskHomeSidecar(async control => {
+    const owner = keywordSourceOwnerForRequest(request, runnerDocumentId);
+    let current;
+    if (owner.kind === 'unattended') {
+      current = await readUnattendedKeywordRunRequest();
+      if (!current || current.id !== request.id || current.attemptId !== request.attemptId ||
+          isTerminalUnattendedRunStatus(current.status)) return;
+    } else {
+      const key = globalThis.OnStarvoiceManualKeywordDispatch.STORAGE_KEY;
+      current = (await chrome.storage.local.get(key))[key]?.[request.id];
+      if (!current || current.commandId !== request.commandId || current.status !== 'claimed' ||
+          current.claimedDocumentId !== runnerDocumentId) return;
+    }
+    if (control.isCanceled()) return;
+    const binding = await keywordSourceBindings?.bind(owner, source, {shouldWrite: () => !control.isCanceled()});
+    // A timed-out storage operation cannot be canceled in Chrome. Its serial
+    // write finishes before newer binding writes, and it never revokes a newer
+    // task's queued cleanup after the caller has moved on.
+    if (binding?.transferred && !control.isCanceled()) await taskHomeCleanup?.revokeSource(source.tabId);
+  });
+}
+
+async function getTaskSourceDocumentIdentity(tabId) {
+  let timer;
+  try {
+    return await Promise.race([
+      (async () => {
+        const before = await chrome.tabs.get(tabId);
+        if (before.pendingUrl || before.status === 'loading') return null;
+        const results = await chrome.scripting.executeScript({
+          target: {tabId, frameIds: [0]}, func: () => ({url: location.href}),
+        });
+        const main = results?.find(result => result.frameId === 0);
+        const after = await chrome.tabs.get(tabId);
+        if (!main?.documentId || !main.result?.url || after.pendingUrl || after.status === 'loading' ||
+            before.windowId !== after.windowId || before.url !== after.url || main.result.url !== after.url) return null;
+        return {documentId: main.documentId, url: main.result.url, windowId: after.windowId};
+      })(),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 1500); }),
+    ]);
+  } catch { return null; }
+  finally { clearTimeout(timer); }
+}
+
+async function recordKeywordSourceNavigation(message, sender) {
+  const context = await readKeywordSourceSenderOwner(sender);
+  if (!context || !keywordSourceBindings) return {recorded: false};
+  const sourceTabId = resolveCaptureTaskTabId(message.sourceTabId);
+  const sources = await keywordSourceBindings.get(context.owner);
+  if (!sources.some(source => source.sourceTabId === sourceTabId)) return {recorded: false};
+  const keywords = context.request.planSnapshot?.keywords || context.request.plan?.keywords || [];
+  const matchesSearch = url => globalThis.OnStarvoiceTaskHomeCleanup?.isPlanSearch(url, context.owner.platform, keywords);
+  if (!matchesSearch(String(message.expectedUrl || ''))) return {recorded: false};
+  // Restoration starts a real navigation. Let that document settle before
+  // recording it; a timeout only forfeits UI cleanup, never collection work.
+  const deadline = Date.now() + 4000;
+  let evidence = null;
+  do {
+    evidence = await getTaskSourceDocumentIdentity(sourceTabId);
+    if (evidence) break;
+    if (Date.now() >= deadline) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  } while (Date.now() < deadline);
+  const latest = await readKeywordSourceSenderOwner(sender);
+  if (!evidence || !matchesSearch(evidence.url) || latest?.owner.identity !== context.owner.identity ||
+      globalThis.OnStarvoiceKeywordSourceBinding.searchKeyword(evidence.url, context.owner.platform) !==
+      globalThis.OnStarvoiceKeywordSourceBinding.searchKeyword(message.expectedUrl, context.owner.platform)) return {recorded: false};
+  const recorded = await keywordSourceBindings.record(context.owner, {sourceTabId, ...evidence});
+  return {recorded};
+}
+
+let taskHomeCreationSessionPromise = null;
+async function getTaskHomeCreationSessionId() {
+  if (!chrome.storage.session?.get || !chrome.storage.session?.set) return null;
+  if (!taskHomeCreationSessionPromise) {
+    taskHomeCreationSessionPromise = (async () => {
+      const key = 'onstarvoice.taskHomeCreationSession.v1';
+      const value = (await chrome.storage.session.get(key))[key];
+      if (typeof value === 'string' && value) return value;
+      const created = crypto.randomUUID();
+      await chrome.storage.session.set({[key]: created});
+      return created;
+    })().catch(() => null);
+  }
+  return taskHomeCreationSessionPromise;
+}
+
 const taskHomeCleanup = globalThis.OnStarvoiceTaskHomeCleanup?.createController({
   storage: chrome.storage.local, tabs: chrome.tabs, canPark: isTaskBrowserIdle,
+  getDocumentIdentity: getTaskSourceDocumentIdentity,
+  canCreateHome: async entry => Boolean(entry.creationSessionId &&
+    entry.creationSessionId === await getTaskHomeCreationSessionId()),
 });
 
-async function queueFinishedTaskHome(request, {runnerTab = null, sourceTabId = null} = {}) {
+async function queueFinishedTaskHome(request, {runnerTab = null, allowCreateHome = false} = {}) {
   if (!taskHomeCleanup || !['completed', 'completed_with_warnings', 'completed_with_failures', 'failed', 'canceled', 'skipped'].includes(request?.status)) return;
   const platform = request.platform || request.planSnapshot?.platform || request.plan?.platform;
   if (platform === 'multi') {
     for (const targetPlatform of new Set((request.targets || []).map(target => target.platform).filter(value => value && value !== 'multi'))) {
-      await queueFinishedTaskHome({...request, platform: targetPlatform}, {runnerTab, sourceTabId});
+      await queueFinishedTaskHome({...request, platform: targetPlatform}, {runnerTab, allowCreateHome});
     }
     return;
   }
   if (!globalThis.OnStarvoiceTaskHomeCleanup.HOMES[platform]) return;
   const runner = runnerTab || (request.runnerTabId
     ? await chrome.tabs.get(request.runnerTabId).catch(() => null) : null);
-  const source = resolveCaptureTaskTabId(sourceTabId)
-    ? await chrome.tabs.get(sourceTabId).catch(() => null) : null;
-  const windowId = runner?.windowId || source?.windowId;
-  if (!windowId) return;
-  const keywords = request.planSnapshot?.keywords || request.plan?.keywords || [];
-  const sourceUrl = String(source?.pendingUrl || source?.url || '');
-  const ownedSearch = globalThis.OnStarvoiceTaskHomeCleanup.isPlanSearch(sourceUrl, platform, keywords);
-  await taskHomeCleanup.enqueue({
-    identity: `${request.id}:${request.attemptId || request.commandId || ''}`,
-    platform, windowId, runnerTabId: runner?.id,
-    sourceTabId: ownedSearch ? source.id : null,
-    expectedSourceUrl: ownedSearch ? sourceUrl : '', keywords,
-  });
+  // progress.runnerTabId describes the current detail/sync step, and final
+  // streaming progress legitimately clears it. It is never source authority.
+  const sources = await runTaskHomeSidecar(() => keywordSourceBindings
+    ? keywordSourceBindings.get(keywordSourceOwnerForRequest(request)) : []);
+  // A stuck cosmetic registry must not prevent the terminal runner handshake.
+  if (!Array.isArray(sources)) return;
+  const windowIds = new Set(sources.map(source => source.windowId));
+  if (!windowIds.size && runner?.windowId) windowIds.add(runner.windowId);
+  for (const windowId of windowIds) {
+    const windowSources = sources.filter(source => source.windowId === windowId);
+    await taskHomeCleanup.enqueue({
+      identity: `${request.id}:${request.attemptId || request.commandId || ''}`,
+      platform, windowId, runnerTabId: runner?.id,
+      sources: windowSources, dedicatedWindow: windowSources.length > 0,
+      keywords: request.planSnapshot?.keywords || request.plan?.keywords || [],
+      allowCreateHome: allowCreateHome === true,
+      creationSessionId: allowCreateHome === true ? await getTaskHomeCreationSessionId() : null,
+    });
+  }
   await scheduleTaskBrowserCleanup();
   // Serialize with acquiring a new execution lock, not with collection work.
   await runCaptureExecutionLockOperation(() => taskHomeCleanup.reconcile());
@@ -6845,7 +7004,7 @@ const manualKeywordDispatch = globalThis.OnStarvoiceManualKeywordDispatch.create
   reportRun: run => upsertTaskLedgerRun({run}),
   canCloseRunner: canCloseManualKeywordRunner,
   scheduleCleanup: scheduleTaskBrowserCleanup,
-  onCleaned: (entry, runnerTab) => queueFinishedTaskHome(entry, {runnerTab, sourceTabId: entry.sourceTabId}),
+  onCleaned: (entry, runnerTab) => queueFinishedTaskHome(entry, {runnerTab}),
 });
 
 async function executeCloudTaskAgentCommand(command, token) {
@@ -9331,7 +9490,7 @@ async function closeExactTerminalUnattendedRunnerAfterFlush(request) {
   if (initialOutbox.pendingCount !== 0) {
     return {closed: false, reason: 'checkpoint_reports_pending'};
   }
-  await queueFinishedTaskHome(normalized, {sourceTabId: normalized.progress?.runnerTabId})
+  await queueFinishedTaskHome(normalized)
     .catch(error => console.warn('[Cleanup] unattended home pending:', error));
   const lifecycle = await runUnattendedRunnerTabLifecycle(async () => {
     const current = await readUnattendedKeywordRunRequest();
@@ -13765,7 +13924,7 @@ async function inspectUnattendedLocalClosurePredicate(
     let exactRunnerTabs = tabs.filter(isOwnedRunnerTab);
     if (closeOwnedRunnerTabs && exactRunnerTabs.length > 0) {
       try {
-        await queueFinishedTaskHome(current, {sourceTabId: current.progress?.runnerTabId})
+        await queueFinishedTaskHome(current)
           .catch(error => console.warn('[Cleanup] unattended home pending:', error));
         for (const tab of exactRunnerTabs) {
           const tabId = Number(tab?.id);
@@ -16118,6 +16277,7 @@ async function launchUnattendedKeywordRun(
   }
   try {
     const platformTab = await activateOrCreatePlatformTab(normalizedPlan.platform);
+    await bindKeywordSource(request, platformTab);
     const runnerTab = await openUnattendedRunnerTab(request.id, {
       windowId: platformTab?.windowId,
       attemptId: request.attemptId,
@@ -16677,6 +16837,7 @@ async function launchPendingUnattendedRecovery(request) {
   try {
     const plan = normalizeUnattendedKeywordPlan(pendingRequest.planSnapshot || {});
     const platformTab = await activateOrCreatePlatformTab(plan.platform);
+    await bindKeywordSource(pendingRequest, platformTab);
     const runnerTab = await openUnattendedRunnerTab(pendingRequest.id, {
       windowId: platformTab?.windowId,
       attemptId: pendingRequest.attemptId,
@@ -23786,6 +23947,7 @@ chrome.tabs.onCreated?.addListener((tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  void keywordSourceBindings?.forget(tabId).catch(error => console.warn('[Cleanup] closed source binding cleanup failed:', error));
   forgetOwnedCaptureTab(tabId).catch((error) => {
     console.warn('[OwnedTabs] removal cleanup failed', error);
   });
@@ -23816,6 +23978,9 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
 });
 
 chrome.tabs.onReplaced?.addListener((addedTabId, removedTabId) => {
+  void keywordSourceBindings?.replace(removedTabId, addedTabId).catch(error => {
+    console.warn('[Cleanup] source replacement migration failed', error);
+  });
   replaceOwnedCaptureTab(removedTabId, addedTabId).catch((error) => {
     console.warn('[OwnedTabs] replacement migration failed', error);
   });
@@ -24486,10 +24651,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (type === 'onstarvoice:switch-platform-tab') {
         // 与 BEGIN/END 同一生命周期队列：回收残留（迟到 END / 列表中继）在
         // 释放途中关闭旧工作页时，runner 不能恰好把那个页选作来源。
-        const data = await runCaptureTaskLifecycleOperation(() =>
-          activateOrCreatePlatformTab(message?.platform),
-        );
+        const data = await runCaptureTaskLifecycleOperation(async () => {
+          const context = await runTaskHomeSidecar(() => readKeywordSourceSenderOwner(sender));
+          const platformTab = await activateOrCreatePlatformTab(message?.platform);
+          if (context && context.owner.platform === platformTab.platform) {
+            await bindKeywordSource(context.request, platformTab, context.owner.runnerDocumentId);
+          }
+          return platformTab;
+        });
         sendResponse({ ok: true, data });
+        return;
+      }
+
+      if (type === 'onstarvoice:record-keyword-source-navigation') {
+        const data = await recordKeywordSourceNavigation(message, sender).catch(() => ({recorded: false}));
+        sendResponse({ok: true, data});
         return;
       }
 

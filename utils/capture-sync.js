@@ -10,6 +10,7 @@
  */
 
 import { sync, syncBatch, checkCapturedExternalIds } from './api.js';
+import './keyword-source-binding.js';
 import {
   CAPTURE_PUBLISH_WINDOW_EXCLUSION,
   hasNewCaptureAfterPublishWindowExclusion,
@@ -16850,6 +16851,7 @@ export async function batchCaptureByKeywords({
           },
         ),
       );
+      await globalThis.OnStarvoiceKeywordSourceBinding?.recordNavigation(runnerTabId, searchUrl);
       throwConfirmedEmptySearchResult(keyword, initialReadiness);
       const initialResultsReady = initialReadiness.ready;
       if (!initialResultsReady && isDouyinPlatform(platform)) {
@@ -17887,6 +17889,7 @@ export async function batchCaptureByKeywords({
             url: runnerCtx.sourcePageUrl,
           });
         }
+        await globalThis.OnStarvoiceKeywordSourceBinding?.recordNavigation(runnerTabId, runnerCtx.sourcePageUrl);
       } catch {
         // ignore restore failure
       }

@@ -658,7 +658,12 @@ test("tab replacement migrates persistent capture ownership instead of treating 
   const listenerAt = backgroundSource.indexOf(
     "chrome.tabs.onReplaced?.addListener",
   );
-  const listenerBody = backgroundSource.slice(listenerAt, listenerAt + 360);
+  const listenerEnd = backgroundSource.indexOf(
+    "chrome.runtime.onConnect.addListener",
+    listenerAt,
+  );
+  assert.ok(listenerAt >= 0 && listenerEnd > listenerAt);
+  const listenerBody = backgroundSource.slice(listenerAt, listenerEnd);
   assert.match(listenerBody, /handleCaptureRuntimeTabReplaced\(addedTabId, removedTabId\)/u);
   assert.doesNotMatch(listenerBody, /handleCaptureRuntimeTabRemoved/u);
 });

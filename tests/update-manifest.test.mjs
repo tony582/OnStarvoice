@@ -106,8 +106,8 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 6).map(release => release.version),
-    ['0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
+  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 7).map(release => release.version),
+    ['0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);
@@ -125,12 +125,9 @@ test('extension update manifest matches the packaged source version', () => {
 });
 
 test('0.4.20 announces safe cleanup and the separate Android Runner upgrade without raising the minimum version', async () => {
-  assert.equal(manifest.version, '0.4.20');
   assert.equal(EXTENSION_UPDATE_MANIFEST.releaseDate, '2026-09-28');
   assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
-  assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
-    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.20-20260928.zip');
-  const latest = EXTENSION_UPDATE_MANIFEST.releases[0];
+  const latest = EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.20');
   assert.equal(latest?.releaseDate, EXTENSION_UPDATE_MANIFEST.releaseDate);
   const notes = JSON.stringify(latest?.releaseNotes);
   for (const description of [
@@ -167,4 +164,21 @@ test('extension update endpoint returns the shape consumed by the sidebar', () =
     EXTENSION_UPDATE_MANIFEST,
   );
   assert.equal(payload?.latestVersion, manifest.version);
+});
+
+
+test('0.4.21 publishes source-bound home cleanup while preserving the mobile version and minimum browser extension', () => {
+  assert.equal(manifest.version, '0.4.21');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.latestVersion, manifest.version);
+  assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
+    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.21-20260928.zip');
+  const latest = EXTENSION_UPDATE_MANIFEST.releases[0];
+  assert.equal(latest.version, manifest.version);
+  const notes = JSON.stringify(latest.releaseNotes);
+  for (const phrase of ['专用采集窗口', '身份可核验', '/jingxuan', '不再额外打开主页', '手机 Runner 0.2.6 保持不变']) {
+    assert.ok(notes.includes(phrase), phrase);
+  }
+  const latestAbout = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.21<'), aboutHtml.indexOf('扩展 v0.4.20<'));
+  assert.match(latestAbout, /身份可核验[\s\S]*jingxuan[\s\S]*Android Runner 0\.2\.6/u);
 });

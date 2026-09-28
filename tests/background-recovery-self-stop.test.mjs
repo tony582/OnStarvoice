@@ -26,6 +26,7 @@ const supportSources = await Promise.all(
     "utils/runtime-tab-policy.js",
     "utils/retired-runner-cleanup.js",
     "utils/task-home-cleanup.js",
+    "utils/keyword-source-binding.js",
     "utils/capture/debug-session.js",
     "utils/capture/task-tab-group.js",
     "utils/capture/task-runtime.js",

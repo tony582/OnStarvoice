@@ -32,6 +32,7 @@ const phase5RuntimeSources = await Promise.all(
   [
     "utils/manual-keyword-dispatch.js",
     "utils/task-home-cleanup.js",
+    "utils/keyword-source-binding.js",
     "utils/retired-runner-cleanup.js",
     "utils/runtime-tab-policy.js",
     "utils/capture/debug-session.js",
