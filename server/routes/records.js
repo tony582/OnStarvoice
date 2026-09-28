@@ -26,6 +26,8 @@ import { formatPublishDate } from '../services/publish-date.js';
 import { getRecordLifecycle, getRecordLifecycles, sendRecordArchived } from '../services/record-lifecycle.js';
 import { redactXhsRecordNavigation } from '../services/xhs-source-open.js';
 
+import { normalizeContentTopic } from '../services/content-topic.js';
+
 const router = Router();
 
 const MANUAL_SENTIMENTS = new Set(['positive', 'neutral', 'negative']);
@@ -34,7 +36,7 @@ const MANUAL_CATEGORIES = new Set([
   'app_issue', 'service_quality', 'brand_image', 'other',
 ]);
 const MANUAL_IDENTITIES = new Set(['', 'user', 'kol', 'dealer', 'koe', 'other']);
-const MANUAL_INPUT_KEYS = new Set(['sentiment', 'category', 'identityOverride', 'publishTime', 'reason']);
+const MANUAL_INPUT_KEYS = new Set(['sentiment', 'category', 'contentTopic', 'identityOverride', 'publishTime', 'reason']);
 
 function hasOwn(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj, key);
@@ -77,6 +79,14 @@ export function validateManualFields(body = {}) {
     values.category = category;
     providedFields.push('category');
   }
+  if (hasOwn(body, 'contentTopic')) {
+    const contentTopic = normalizeContentTopic(body.contentTopic);
+    if (body.contentTopic !== null && body.contentTopic !== '' && !contentTopic) {
+      return { ok: false, error: 'invalid_content_topic', message: '内容主题无效' };
+    }
+    values.contentTopic = contentTopic;
+    providedFields.push('contentTopic');
+  }
   if (hasOwn(body, 'identityOverride')) {
     const identityOverride = String(body.identityOverride ?? '').trim();
     if (!MANUAL_IDENTITIES.has(identityOverride)) {
@@ -114,6 +124,7 @@ export function manualFieldsRecordResponse(record = {}) {
     id: record.id || null,
     sentiment: String(record.sentiment || ''),
     category: String(record.category || ''),
+    content_topic: record.content_topic || null,
     identity_override: String(record.identity_override || ''),
     publish_time: String(record.publish_time || ''),
     published_ts: record.published_ts || null,
@@ -391,7 +402,7 @@ router.get('/:id/manual-fields', requireTenantAccess, requireSessionUser, async 
   try {
     const record = await queryOne(`
       SELECT
-        id, sentiment, category, identity_override,
+        id, sentiment, category, content_topic, identity_override,
         publish_time, published_ts, created_at,
         manual_updated_by, manual_updated_name, manual_updated_at, updated_at
       FROM records
@@ -638,6 +649,9 @@ router.patch('/:id/manual-fields', requireTenantAccess, requireSessionUser, requ
       if (validated.providedFields.includes('category') && String(record.category || '') !== values.category) {
         addChange('category', record.category || '', values.category);
       }
+      if (validated.providedFields.includes('contentTopic') && (record.content_topic || null) !== values.contentTopic) {
+        addChange('content_topic', record.content_topic || null, values.contentTopic);
+      }
       if (validated.providedFields.includes('identityOverride')
         && String(record.identity_override || '') !== values.identityOverride) {
         addChange('identity_override', record.identity_override || '', values.identityOverride);
@@ -669,6 +683,7 @@ router.patch('/:id/manual-fields', requireTenantAccess, requireSessionUser, requ
         UPDATE records
         SET sentiment = CASE WHEN $3 THEN $4 ELSE sentiment END,
           category = CASE WHEN $5 THEN $6 ELSE category END,
+          content_topic = CASE WHEN $16 THEN $17 ELSE content_topic END,
           identity_override = CASE WHEN $7 THEN $8 ELSE identity_override END,
           publish_time = CASE WHEN $9 THEN $10 ELSE publish_time END,
           published_ts = CASE WHEN $9 THEN $11::timestamptz ELSE published_ts END,
@@ -700,6 +715,8 @@ router.patch('/:id/manual-fields', requireTenantAccess, requireSessionUser, requ
         actorUserId,
         actorName,
         clearIdentityOverride,
+        changedFields.includes('content_topic'),
+        values.contentTopic ?? null,
       ]);
 
       await tx.execute(`

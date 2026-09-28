@@ -30,6 +30,7 @@ import {
 import { tagsFromRecord, type CustomTag, type CustomTagPatch } from '@/lib/custom-tags'
 import { isRecordDetailDegraded, recordDisplayTitle } from '@/lib/record-display'
 import { PostIntentBadge, PostRelevanceBadge, PostJudgmentDetails } from '@/components/shared/PostJudgment'
+import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
 
 /**
  * 内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
@@ -37,6 +38,7 @@ import { PostIntentBadge, PostRelevanceBadge, PostJudgmentDetails } from '@/comp
 export interface ManualRecordFields {
   sentiment?: string
   category?: string
+  contentTopic?: string
   identityOverride?: string
   publishTime?: string
 }
@@ -250,6 +252,7 @@ function RecordDrawerContent({
 
     if (editDraft.sentiment !== original.sentiment) { changes.sentiment = editDraft.sentiment; changed = true }
     if (editDraft.category !== original.category) { changes.category = editDraft.category; changed = true }
+    if (editDraft.contentTopic !== original.contentTopic) { changes.contentTopic = editDraft.contentTopic; changed = true }
     if (editDraft.identityOverride !== original.identityOverride) { changes.identityOverride = editDraft.identityOverride; changed = true }
     if (editDraft.publishTime !== original.publishTime) { changes.publishTime = editDraft.publishTime; changed = true }
 
@@ -439,6 +442,7 @@ function RecordDrawerContent({
                   <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
                   <PostIntentBadge record={r} />
                   <PostRelevanceBadge record={r} />
+                  <StatusBadge tone="muted">内容主题：{contentTopicLabel(r.content_topic)}</StatusBadge>
                   {r.content_availability_status === 'page_unavailable' && (
                     <StatusBadge tone="muted"><Ban className="h-3 w-3" />已删除或不可访问</StatusBadge>
                   )}
@@ -1115,15 +1119,17 @@ function activityTags(value: unknown): string {
 interface ManualEditDraft {
   sentiment: string
   category: string
+  contentTopic: string
   identityOverride: string
   publishTime: string
 }
 
-const MANUAL_HISTORY_FIELDS = ['sentiment', 'category', 'identity_override', 'publish_time'] as const
+const MANUAL_HISTORY_FIELDS = ['sentiment', 'category', 'content_topic', 'identity_override', 'publish_time'] as const
 type ManualHistoryField = typeof MANUAL_HISTORY_FIELDS[number]
 const MANUAL_HISTORY_LABELS: Record<ManualHistoryField, string> = {
   sentiment: '情感',
   category: '分类',
+  content_topic: '内容主题',
   identity_override: '疑似身份',
   publish_time: '发布日期',
 }
@@ -1143,6 +1149,7 @@ function manualHistoryValue(field: ManualHistoryField, value: unknown): string {
   const text = String(value ?? '').trim()
   if (field === 'sentiment') return LABELS.sentiment[text] || text || '未设置'
   if (field === 'category') return LABELS.category[text] || text || '未设置'
+  if (field === 'content_topic') return contentTopicLabel(text)
   if (field === 'identity_override') {
     return ({ user: '用户', kol: 'KOL / KOC', dealer: '4S店', koe: 'KOE', other: '其他' } as Record<string, string>)[text] || '沿用 AI'
   }
@@ -1162,6 +1169,7 @@ function manualDraft(record: any): ManualEditDraft {
   return {
     sentiment: String(record?.sentiment || ''),
     category: String(record?.category || ''),
+    contentTopic: String(record?.content_topic || ''),
     identityOverride: String(record?.identity_override || ''),
     publishTime: dateInputValue(record),
   }
@@ -1213,6 +1221,13 @@ function JudgementEditor({ draft, currentIdentity, error, saving, onChange, onCa
               <option value="service_quality">服务质量</option>
               <option value="brand_image">品牌形象</option>
               <option value="other">其他</option>
+            </select>
+          </label>
+          <label className="text-[12px] font-semibold text-muted-foreground">
+            内容主题
+            <select value={draft.contentTopic} onChange={e => onChange({ ...draft, contentTopic: e.target.value })} className={controlClass}>
+              <option value="">未分类</option>
+              {CONTENT_TOPIC_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
           </label>
           <label className="text-[12px] font-semibold text-muted-foreground">

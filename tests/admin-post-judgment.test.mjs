@@ -122,7 +122,8 @@ test('list, mobile, board and drawer expose intent and relevance with one filter
   assert.ok(header.indexOf('label="情感"') < header.indexOf('<PostIntentFilter header'));
   assert.ok(header.indexOf('<PostIntentFilter header') < header.indexOf('<PostRelevanceFilter header'));
   assert.match(queue, /appendPostIntentFilter\(params, intents\)/);
-  assert.match(queue, /useSelection\(`\$\{filterParams\(\)\.toString\(\)\}/);
+  assert.match(queue, /useSelection\('triage-selection-session'\)/);
+  assert.match(queue, /<fieldset disabled=\{selectionActive\}/);
   assert.match(queue, /appendPostRelevanceFilters\(params, relevances, relevanceConfidences\)/);
   assert.match(queue, /<PostRelevanceFilter value=\{relevances\}/);
   assert.match(queue, /setIntents\(\[\]\); setRelevances\(\[\]\); setRelevanceConfidences\(\[\]\)/);

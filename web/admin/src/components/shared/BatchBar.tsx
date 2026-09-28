@@ -45,16 +45,18 @@ export function useSelection(resetKey: string) {
 }
 
 /** 复选框(三态:勾选 / 半选 / 未选)。 */
-export function Checkbox({ checked, indeterminate, onChange, className }: {
+export function Checkbox({ checked, indeterminate, onChange, className, disabled }: {
   checked: boolean
   indeterminate?: boolean
   onChange: () => void
   className?: string
+  disabled?: boolean
 }) {
   return (
     <button
       type="button"
       role="checkbox"
+      disabled={disabled}
       aria-checked={indeterminate ? 'mixed' : checked}
       onClick={e => { e.stopPropagation(); onChange() }}
       className={cn(
@@ -89,13 +91,14 @@ export type BatchActionMenu = {
 /**
  * 浮动批量操作条。选中数 > 0 时从底部浮起,居中显示,操作执行期间禁用并转圈。
  */
-export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }: {
+export function BatchBar({ count, actions, menus = [], onAction, onClear, busy, clearLabel }: {
   count: number
   actions: BatchAction[]
   menus?: BatchActionMenu[]
   onAction: (key: string) => void
   onClear: () => void
   busy?: boolean
+  clearLabel?: string
 }) {
   const [openMenuKey, setOpenMenuKey] = useState<string | null>(null)
 
@@ -209,10 +212,11 @@ export function BatchBar({ count, actions, menus = [], onAction, onClear, busy }
             type="button"
             disabled={busy}
             onClick={clearSelection}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50 lg:h-8 lg:w-8"
-            aria-label="取消选择"
+            className={cn('inline-flex h-10 shrink-0 items-center justify-center gap-1 rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50 lg:h-8', clearLabel ? 'px-3 text-xs' : 'w-10 lg:w-8')}
+            aria-label={clearLabel || '取消选择'}
           >
             <X className="h-4 w-4" />
+            {clearLabel}
           </button>
         </div>
       </div>

@@ -35,7 +35,9 @@ import {
   formatGmAliasesForPrompt, getRecordEvidenceSources, isSentryEvidenceScope, normalizeJudgmentConfidence, normalizeMonitoringEvidence, normalizePostIntent,
 } from './record-content-judgment.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v8';
+import { CONTENT_TOPIC_PROMPT_RULES, CONTENT_TOPIC_VERSION, normalizeContentTopic } from './content-topic.js';
+
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v9';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
 const LLM_PROVIDER_ALIASES = Object.freeze({
@@ -147,6 +149,8 @@ ${ONSTAR_SERVICE_AD_PROMPT_RULES}
 - “凯迪拉克碰撞测试”没有软件升级、安全救援或其它整体监测主题时，整体 relevance=irrelevant。
 - “安全感”“安全配置可靠”等正向表达不能据此生成风险或负面结论。
 
+${CONTENT_TOPIC_PROMPT_RULES}
+
 对每条内容，只输出以下 JSON：
 {
   "relevance": "relevant|irrelevant|uncertain",
@@ -166,6 +170,8 @@ ${ONSTAR_SERVICE_AD_PROMPT_RULES}
   "intentReason": "说明发帖者的主要表达目的，不超过80字",
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|other",
   "subcategory": "具体子分类（中文）",
+  "contentTopic": "onstar|infotainment|wallpaper|brand_app|sentry|gm_customer_service|gm_other|null",
+  "contentTopicReason": "核心讨论对象及多主题择主依据，不超过80字",
   "sourceType": "ugc|pgc|employee|dealer|other",
   "confidence": 0.0-1.0,
   "summary": "一句话概括核心内容（不超过50字）"
@@ -1208,6 +1214,8 @@ export function normalizeRecordClassificationResult(result) {
     ...result,
     relevance,
     intent: normalizePostIntent(result?.intent),
+    contentTopic: normalizeContentTopic(result?.contentTopic),
+    contentTopicReason: String(result?.contentTopicReason || '').trim().slice(0, 500),
     intentReason: String(result?.intentReason || '').trim().slice(0, 500),
     currentKeywordMatch,
     matchedTopics: Array.isArray(result?.matchedTopics ?? result?.matched_topics)
@@ -1323,6 +1331,7 @@ export async function persistRecordClassification({ record, labeled, observedKey
       monitoringEvidence: scoped ? monitoringEvidence : undefined,
       classifierMetadata: {
         promptVersion: RECORD_CLASSIFICATION_PROMPT_VERSION,
+        contentTopicVersion: CONTENT_TOPIC_VERSION,
         provider: labeled.provider,
         model: labeled.model,
         monitoringIntentId: labeled.intent.intentId,
@@ -1348,6 +1357,10 @@ export async function persistRecordClassification({ record, labeled, observedKey
           ELSE $3
         END,
         subcategory = $4,
+        content_topic = CASE
+          WHEN COALESCE(manual_overrides, '{}'::jsonb) ? 'content_topic' THEN content_topic
+          ELSE $12
+        END,
         source_type = $5, ai_summary = $6, ai_confidence = $7,
         ai_result = $8::jsonb,
         published_ts = CASE
@@ -1363,6 +1376,7 @@ export async function persistRecordClassification({ record, labeled, observedKey
       JSON.stringify(result),
       publishedTs,
       record.id, current.tenant_id,
+      result.contentTopic,
     ]);
     return { result, persisted };
   });

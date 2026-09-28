@@ -15,6 +15,7 @@ const summaryFields = ['monitor', 'sdb', 'positive', 'neutral', 'cold', 'inProgr
 type SummaryField = typeof summaryFields[number] | typeof monthlyFields[number]
 type SummaryDraft = Record<string, Partial<Record<SummaryField, string>>>
 const summaryLabels: Record<SummaryField, string> = { ...monthlyLabels, monitor: '监控数量', sdb: 'SDB范畴', positive: '正向', neutral: '中性', cold: '冷处理', inProgress: '处理中', processed: '已处理' }
+const effectiveHandlingBasis = '采集列沿用首次入库采集集合；四项负面按各处理日更正后的有效帖子去重统计，改情感或移出对应状态后同步移除，重复保存和备注不新增数量。MTD 按本月帖子去重，不把每日数量相加。本期清单跨休息日可能包含多天，请按处理日期核对。'
 const collectionHandlingBasis = '平台监控量、SDB、正面和中性按首次成功入库的采集内容统计，采集 MTD 按本月帖子去重；休息日采集合并到下一工作日。负面四列按北京时间当日实际处理次数统计，同帖多次不同状态变更可重复计，重复同状态及仅修改备注不计；休息日有处理时按实际日期列出。MTD 负面按每帖本月最后处理状态去重归类，已转出这四类状态的不计入，不按每日次数相加。修改日处理次数不会改变MTD去重数量。'
 const pendingStatuses = new Set(['queued', 'working', 'retry_wait'])
 const deliveryLabels: Record<string, string> = {
@@ -447,6 +448,14 @@ function CustomerDailyReportWorkspace() {
           <ReportSection title={coldSectionTitle(snapshot.coldMarked, isHandlingSummary(snapshot) && snapshot.collectionSummary ? '四' : '三')}>
             <PostList posts={snapshot.coldMarked} kind="cold" incomplete={snapshot.evidence?.cold?.coverageComplete !== true} />
           </ReportSection>
+          {snapshot.handlingListsVersion === 1 && <>
+            <ReportSection title={`四、本期已回复帖子：${snapshot.repliedMarked?.length || 0} 条`}>
+              <PostList posts={snapshot.repliedMarked || []} kind="replied" />
+            </ReportSection>
+            <ReportSection title={`五、本期负面–评论区留言：${snapshot.commentMarked?.length || 0} 条`}>
+              <PostList posts={snapshot.commentMarked || []} kind="comment" />
+            </ReportSection>
+          </>}
         </article>
       </section>
 
@@ -464,9 +473,9 @@ function CustomerDailyReportWorkspace() {
             </> : <p>此日报按生成时的原统计范围展示：监控为首次成功入库的新帖，复采不重复计数；SDB 扣除已复核的非监控内容。</p>}
             {isHandlingSummary(snapshot) && <p>每日处理量按北京时间当天发生处理状态变化的帖子去重统计，同一帖子当天多次变更计 1 条，按当天最后一次状态归类。处理 MTD 累加各日处理量，同帖跨天处理可再次计入；采集 MTD 按帖子月内去重。休假有处理时按实际日期列出，无处理则不单列。</p>}
             {isCollectionSummary(snapshot) && <p>本表按首次成功入库的采集内容去重统计，复采及后续修改状态不重复计数；MTD 保留本月帖子去重累计，不按每日数值简单相加。手填修改在原累计值上增减对应差额。</p>}
-            {isCollectionHandlingSummary(snapshot) && <p>{collectionHandlingBasis}手填采集数值在原累计值上增减对应差额。</p>}
+            {isCollectionHandlingSummary(snapshot) && <p>{snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : collectionHandlingBasis}手填采集数值在原累计值上增减对应差额。</p>}
             <p>系统统计{isHandlingSummary(snapshot) ? '处理' : isCollectionHandlingSummary(snapshot) ? '采集' : ''}负面：当日 {snapshot.summary.day.negative} 条，MTD {snapshot.summary.mtd.negative} 条。待识别或核对：当日 {snapshot.summary.day.unclassified} 条，MTD {snapshot.summary.mtd.unclassified} 条。客户补填的汇总与系统统计分别保存。</p>
-            {isMonthlySummary(snapshot) ? <p>表内逐日数值可在本页填写并保存，MTD 按报表累计口径展示。{isHandlingSummary(snapshot) ? '实际采集量单独展示，不随手填处理量修改。' : isCollectionHandlingSummary(snapshot) ? '负面日行是实际处理次数，MTD负面按帖子去重；负面处理与采集量分别统计。' : isCollectionSummary(snapshot) ? '每日数量和月累计均为采集统计口径。' : '此历史日报保留生成时的采集统计口径。'}飞书文档里的修改不会自动同步回本页。</p> : <p>处理中、已处理初始为空，空白不代表 0。可在本页填写并保存；飞书文档里的修改不会自动同步回本页。</p>}
+            {isMonthlySummary(snapshot) ? <p>表内逐日数值可在本页填写并保存，MTD 按报表累计口径展示。{isHandlingSummary(snapshot) ? '实际采集量单独展示，不随手填处理量修改。' : isCollectionHandlingSummary(snapshot) ? snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : '负面日行是实际处理次数，MTD负面按帖子去重；负面处理与采集量分别统计。' : isCollectionSummary(snapshot) ? '每日数量和月累计均为采集统计口径。' : '此历史日报保留生成时的采集统计口径。'}飞书文档里的修改不会自动同步回本页。</p> : <p>处理中、已处理初始为空，空白不代表 0。可在本页填写并保存；飞书文档里的修改不会自动同步回本页。</p>}
             <p>7 天发布时间：{dailyTime(snapshot.heatStart)} 至 {dailyTime(snapshot.cutoffAt)}。热度按可见互动数合计；小红书为点赞、评论、收藏之和。</p>
           </div>
         </Dialog.Content></Dialog.Portal>
@@ -516,7 +525,7 @@ function SummaryTable(props: Parameters<typeof LegacySummaryTable>[0]) {
       </table>
     </div>
     {totalsError && <p role="alert" className="mt-3 text-xs leading-6 text-rose-700">{totalsError}当前仍显示已保存的月累计。</p>}
-    {collectionHandling && <p className="mt-3 text-xs leading-6 text-slate-500">{collectionHandlingBasis}</p>}
+    {collectionHandling && <p className="mt-3 text-xs leading-6 text-slate-500">{snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : collectionHandlingBasis}</p>}
     {(!collectionHandling || draft) && <p className="mt-3 text-xs leading-6 text-slate-500">{draft ? `${collectionHandling ? '填写非负整数；采集字段的 MTD 按修改差额调整，负面 MTD 保留系统去重数量。' : collection ? '填写非负整数，MTD 在原去重累计上增减对应修改差额。' : '填写非负整数，MTD 自动汇总各日数值。'}请先保存或取消，再切换日期、下载或发送。` : handling ? '按当日处理状态有变化的帖子去重，同帖当天多次变更计 1 条，按当天最后一次状态归类。MTD 累加各日处理量，同帖跨天处理可再次计入。' : collection ? '按首次成功入库的采集内容去重统计，复采不重复计数；MTD 为本月去重累计。休息日采集内容合并到下一工作日。' : '此历史日报沿用采集统计口径，休息日采集内容合并到下一工作日。'}</p>}
   </section>
 }
@@ -575,8 +584,8 @@ function coldSectionTitle(posts: DailyPost[], section = '三') {
   return `${section}、本期冷处理负面帖：${posts.length} 条${historicalCount ? `（含历史帖 ${historicalCount} 条）` : ''}`
 }
 
-function PostList({ posts, kind, incomplete = false }: { posts: DailyPost[]; kind: 'heat' | 'cold'; incomplete?: boolean }) {
-  if (!posts.length) return <p className="rounded-lg bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-500">{kind === 'heat' ? '暂未检出符合条件的帖子。' : incomplete ? '暂未检出。' : '本期无冷处理负面帖子。'}</p>
+function PostList({ posts, kind, incomplete = false }: { posts: DailyPost[]; kind: 'heat' | 'cold' | 'replied' | 'comment'; incomplete?: boolean }) {
+  if (!posts.length) return <p className="rounded-lg bg-slate-50 px-4 py-4 text-sm leading-6 text-slate-500">{kind === 'heat' ? '暂未检出符合条件的帖子。' : incomplete ? '暂未检出。' : kind === 'replied' ? '本期无已回复帖子。' : kind === 'comment' ? '本期无负面–评论区留言帖子。' : '本期无冷处理负面帖子。'}</p>
   return <ol className="divide-y divide-slate-200 border-y border-slate-200">{posts.map((post, index) => {
     const url = safeReportUrl(post.url)
     const visibleXiaohongshuHeat = ['xiaohongshu', 'xhs'].includes(post.platform)
@@ -588,6 +597,11 @@ function PostList({ posts, kind, incomplete = false }: { posts: DailyPost[]; kin
         {url ? <a href={url} target="_blank" rel="noopener noreferrer" className="break-words text-sm font-medium leading-6 text-blue-700 underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{post.title || '查看原帖'}<ExternalLink className="ml-1 inline h-3 w-3" /></a> : <p className="text-sm font-medium leading-6">{post.title || '标题待补'}<span className="ml-2 text-xs font-normal text-amber-800">原帖链接待补</span></p>}
         <p className="mt-1.5 text-xs leading-5 text-slate-500">{platforms[post.platform] || post.platform || '未知平台'}{kind === 'cold' && post.isHistorical === true && <span className="ml-2 inline-flex rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">历史帖</span>}{kind === 'heat' && <>｜热度 {showLowerBound && '至少 '}{post.heat?.toLocaleString() ?? '待核对'}｜较昨日 {(post.comparisonText || '暂无对比').replace(/^较昨日\s*[:：]?\s*/, '').trim() || '暂无对比'}</>}</p>
         {kind === 'heat' && <p className="mt-2 text-xs leading-5 text-slate-700"><span className="text-slate-500">处理状态：</span>{dailyPostStatusLabel(post)}</p>}
+        {kind !== 'heat' && post.markedAt && <p className="mt-1 text-xs text-slate-500">处理时间：{dailyTime(post.markedAt)}</p>}
+        {(kind === 'replied' || kind === 'comment') && <div className="mt-2 space-y-2 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
+          <p>回复内容：{post.replyContent?.trim() ? post.replyContent : '未填写回复内容'}</p>
+          {(post.supplementalNotes || []).map(note => <p key={note.id}>补充备注：{note.body}</p>)}
+        </div>}
       </div>
     </li>
   })}</ol>

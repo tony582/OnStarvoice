@@ -49,9 +49,11 @@ import { useNav } from '@/lib/navigation'
 import { recordDisplayTitle } from '@/lib/record-display'
 import { appendPostIntentFilter, appendPostRelevanceFilters, initialPostIntentFilter, normalizePostRelevanceFilter, normalizePostConfidenceFilter } from '@/lib/post-judgment'
 import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
+import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
 import { PostIntentFilter, PostRelevanceFilter, PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
 
 interface Pagination { page: number; totalPages: number; total: number }
+type TriageListResponse = { records: Record<string, unknown>[]; pagination?: Pagination }
 interface CustomTagsMutationResponse {
   customTags?: unknown
   custom_tags?: unknown
@@ -311,6 +313,7 @@ function responseRecord(data?: ManualFieldsMutationResponse): Record<string, unk
 function manualFieldsMatch(record: Record<string, unknown>, fields: ManualRecordFields) {
   return (fields.sentiment === undefined || String(record.sentiment || '') === fields.sentiment)
     && (fields.category === undefined || String(record.category || '') === fields.category)
+    && (fields.contentTopic === undefined || String(record.content_topic || '') === fields.contentTopic)
     && (fields.identityOverride === undefined || String(record.identity_override || '') === fields.identityOverride)
     && (fields.publishTime === undefined || String(record.publish_time || '') === fields.publishTime)
 }
@@ -322,6 +325,7 @@ function localManualFieldsPatch(
   const patch: Record<string, unknown> = {}
   if (fields.sentiment !== undefined) patch.sentiment = fields.sentiment
   if (fields.category !== undefined) patch.category = fields.category
+  if (fields.contentTopic !== undefined) patch.content_topic = fields.contentTopic || null
   if (fields.identityOverride !== undefined) patch.identity_override = fields.identityOverride
   if (fields.publishTime !== undefined) {
     patch.publish_time = fields.publishTime
@@ -369,6 +373,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [boardNonce, setBoardNonce] = useState(0)
   const [archiveView, setArchiveView] = useState<ArchiveView>(initial?.bucket === 'archived' ? 'archived' : 'active')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
+  const [contentTopic, setContentTopic] = useState(initial?.contentTopic ?? '')
   const [intents, setIntents] = useState<string[]>(() => initialPostIntentFilter(initial?.intent))
   const [relevances, setRelevances] = useState<string[]>(() => normalizePostRelevanceFilter(initial?.relevance))
   const [relevanceConfidences, setRelevanceConfidences] = useState<string[]>(() => normalizePostConfidenceFilter(initial?.relevanceConfidence))
@@ -410,11 +415,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const customTagRequestSeq = useRef(0)
   const listRequestSeq = useRef(0)
   const listAbort = useRef<AbortController | null>(null)
+  // Keep this page as a working set until the operator explicitly exits selection.
+  const [selectionActive, setSelectionActive] = useState(false)
+  const selectionSession = useRef(false)
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
   const filterParams = useCallback(() => {
     const params = new URLSearchParams({ sentiment, platform, keyword })
+    if (contentTopic) params.set('contentTopic', contentTopic)
     if (watchedFilter) params.set('watched', watchedFilter)
     if (archiveView !== 'active') params.set('bucket', archiveView)
     else params.set('queue', 'triage')
@@ -437,9 +446,23 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (dateRanges.handled.from) params.set('handledFrom', dateRanges.handled.from)
     if (dateRanges.handled.to) params.set('handledTo', dateRanges.handled.to)
     return params
-  }, [archiveView, triageStatuses, risk, identity, sentiment, intents, relevances, relevanceConfidences, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
+  }, [archiveView, triageStatuses, risk, identity, sentiment, contentTopic, intents, relevances, relevanceConfidences, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
-  const sel = useSelection(`${filterParams().toString()}|${pageSize}|${pagination?.page ?? 1}`)
+  const sel = useSelection('triage-selection-session')
+  const selectionBusy = batchBusy || modeBusyId !== null || archiveBusyId !== null || watchBusyId !== null
+  const beginSelection = () => {
+    if (selectionBusy) return false
+    selectionSession.current = true
+    setSelectionActive(true)
+    listRequestSeq.current += 1
+    listAbort.current?.abort()
+    setLoading(false)
+    return true
+  }
+  const toggleSelection = (id: string) => { if (beginSelection()) sel.toggle(id) }
+  const toggleAllSelection = (checked: boolean) => {
+    if (beginSelection()) sel.setAll(records.map(record => String(record.id)), checked)
+  }
 
   const batchRemovalCatalog = (() => {
     const tagsById = new Map<string, CustomTag>()
@@ -491,6 +514,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
     if (view !== 'list') return
+    if (selectionSession.current) return
     const requestSeq = ++listRequestSeq.current
     listAbort.current?.abort()
     setListError('')
@@ -501,7 +525,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       const params = filterParams()
       params.set('page', String(page))
       params.set('pageSize', String(pageSize))
-      const data = await withTriageReadDeadline(signal => api.request<any>('/triage/records?' + params, { signal }), controller)
+      let data = await withTriageReadDeadline(signal => api.request<TriageListResponse>('/triage/records?' + params, { signal }), controller)
+      const lastPage = Math.max(1, Number(data.pagination?.totalPages) || 1)
+      if (page > lastPage && requestSeq === listRequestSeq.current && !selectionSession.current) {
+        params.set('page', String(lastPage))
+        data = await withTriageReadDeadline(signal => api.request<TriageListResponse>('/triage/records?' + params, { signal }), controller)
+      }
       if (requestSeq !== listRequestSeq.current) return
       if (!Array.isArray(data.records)) throw new Error('内容响应不完整，请稍后重试。')
       setRecords(data.records || [])
@@ -513,6 +542,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     }
   }), [filterParams, pageSize, view])
 
+  const cancelSelection = () => {
+    if (selectionBusy) return
+    selectionSession.current = false
+    setSelectionActive(false)
+    sel.clear()
+    void load(pagination?.page || 1, { silent: true })
+  }
+
   const exportXlsx = async () => {
     setExporting(true)
     try { await api.download('/triage/records/export?' + filterParams().toString(), '内容分诊.xlsx') }
@@ -521,28 +558,32 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }
 
   // 点表头排序:点未激活列 → 该列降序;再点已激活列 → 升/降序切换
-  const toggleSort = (field: SortField) =>
+  const toggleSort = (field: SortField) => {
+    if (selectionSession.current) return
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
+  }
 
   // 筛选是否有激活项(用于显示「清空筛选」);清空只重置筛选与排序,保留 tab
   const activeDateFilterCount = Object.values(dateRanges).filter(range => range.from || range.to).length
   const hasCustomSort = sort.field !== 'publish' || sort.dir !== 'desc'
   const activeIntentCount = intents.length + relevances.length + relevanceConfidences.length
-  const hasActiveFilters = Boolean(platform || sentiment || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
-  const activeFilterCount = [platform, sentiment].filter(Boolean).length
+  const hasActiveFilters = Boolean(platform || sentiment || contentTopic || activeIntentCount || keyword || triageStatuses.length || risk.length || identity.length || captureKeywords.length || customTagIds.length || activeDateFilterCount || hasCustomSort)
+  const activeFilterCount = [platform, sentiment, contentTopic].filter(Boolean).length
     + activeIntentCount + Number(Boolean(keyword)) + triageStatuses.length + risk.length + identity.length + captureKeywords.length + customTagIds.length + activeDateFilterCount + Number(hasCustomSort)
   const clearFilters = () => {
     setPlatform(''); setSentiment(''); setKeyword(''); setKeywordDraft(''); setTriageStatuses([]); setRisk([]); setIdentity([]); setCaptureKeywords([]); setCustomTagIds([]); setDateRanges(emptyDateRanges())
     setIntents([]); setRelevances([]); setRelevanceConfidences([])
+    setContentTopic('')
     setSort({ field: 'publish', dir: 'desc' })
   }
   // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
   useEffect(() => {
+    if (selectionActive) return
     const nextKeyword = keywordDraft.trim()
     if (nextKeyword === keyword) return
     const timeoutId = window.setTimeout(() => setKeyword(nextKeyword), 400)
     return () => window.clearTimeout(timeoutId)
-  }, [keywordDraft, keyword])
+  }, [keywordDraft, keyword, selectionActive])
   useEffect(() => {
     void load()
     return () => { listRequestSeq.current += 1; listAbort.current?.abort() }
@@ -599,7 +640,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     const savedSentiment = savedRecord && Object.prototype.hasOwnProperty.call(savedRecord, 'sentiment')
       ? String(savedRecord.sentiment || '')
       : fields.sentiment
-    const leavesCurrentSentiment = Boolean(sentiment && savedSentiment !== undefined && savedSentiment !== sentiment)
+    const leavesCurrentSentiment = !selectionSession.current && Boolean(sentiment && savedSentiment !== undefined && savedSentiment !== sentiment)
     setRecords(current => current.flatMap(record => {
       if (record.id !== recordId) return [record]
       return leavesCurrentSentiment ? [] : [{ ...record, ...patch }]
@@ -628,7 +669,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     await loadCustomTagCatalog()
     if (customTagIds.length) {
       const stillMatches = tags.some(tag => customTagIds.includes(tag.id))
-      if (!stillMatches) {
+      if (!stillMatches && !selectionSession.current) {
         setRecords(current => current.filter(record => record.id !== recordId))
         setPagination(current => {
           if (!current) return current
@@ -691,8 +732,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         missingCount ? `${missingCount} 条已不存在` : '',
       ].filter(Boolean)
 
-      if (operation === 'add' && limitIds.length) sel.setAll(limitIds, true)
-      else sel.clear()
+      const updatedIds = new Set(Array.isArray(result.updatedIds) ? result.updatedIds.map(String) : [])
+      const addedTags = normalizeCustomTags(result.tags)
+      const applyTags = (record: Record<string, unknown>) => {
+        if (!updatedIds.has(String(record.id))) return record
+        const tags = tagsFromRecord(record).filter(tag => !values.removeTagIds.includes(tag.id))
+        return withCustomTags(record, operation === 'add'
+          ? [...new Map([...tags, ...addedTags].map(tag => [tag.id, tag])).values()]
+          : tags)
+      }
+      setRecords(current => current.map(applyTags))
+      setDrawerRecord((current: Record<string, unknown> | null) => current ? applyTags(current) : current)
       const message = operation === 'remove'
         ? updated > 0
           ? `已从 ${updated} 条内容移除${tagNames || '所选标签'}${unchanged ? `，${unchanged} 条原本未关联` : ''}${skippedParts.length ? `；${skippedParts.join('，')}未处理` : ''}`
@@ -823,7 +873,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     feishuTableNo?: string,
   ) => {
     const changed = new Set(ids)
-    const keepInList = modeVisibleInCurrentList(newStatus)
+    const keepInList = selectionSession.current || modeVisibleInCurrentList(newStatus)
     setRecords(current => current.flatMap(record => {
       if (!changed.has(record.id)) return [record]
       if (!keepInList) return []
@@ -917,7 +967,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       const targetPage = !modeVisibleInCurrentList(newStatus) && changedOnPage >= records.length && page > 1 ? page - 1 : page
 
       if (changedIds.length === 0) {
-        showBatchFeedback('所选内容未能修改，列表已刷新，请重新选择后再试', 'error')
+        showBatchFeedback('所选内容未能修改，已保留当前选择，请核对后重试', 'error')
         await load(page, { silent: true })
         return
       }
@@ -927,7 +977,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         newStatus,
         newStatus === 'negative_feishu' ? values.feishuTableNo : undefined,
       )
-      sel.clear()
       showBatchFeedback(
         skippedCount > 0
           ? `已将 ${changedIds.length} 条改为“${modeLabel}”，另有 ${skippedCount} 条未修改`
@@ -943,9 +992,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     finally { setBatchBusy(false) }
   }
 
-  const syncArchiveLocally = useCallback((ids: Iterable<string>) => {
+  const syncArchiveLocally = useCallback((ids: Iterable<string>, archived: boolean) => {
     const changed = new Set([...ids].map(id => String(id).toLowerCase()))
-    setRecords(current => current.filter(record => !changed.has(String(record.id).toLowerCase())))
+    setRecords(current => current.flatMap(record => {
+      if (!changed.has(String(record.id).toLowerCase())) return [record]
+      return selectionSession.current ? [{ ...record, archived_at: archived ? new Date().toISOString() : null }] : []
+    }))
     setDrawerRecord((current: any) => current && changed.has(String(current.id).toLowerCase()) ? null : current)
   }, [])
 
@@ -957,7 +1009,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       const changedIds = changedArchiveIds(result, [recordId])
       const page = pagination?.page || 1
       const targetPage = changedIds.length > 0 && records.length <= 1 && page > 1 ? page - 1 : page
-      if (changedIds.length > 0) syncArchiveLocally(changedIds)
+      if (changedIds.length > 0) syncArchiveLocally(changedIds, archived)
       refreshBadges()
       await load(targetPage, { silent: true })
       return changedIds.includes(recordId.toLowerCase())
@@ -980,8 +1032,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       const page = pagination?.page || 1
       const changedOnPage = records.filter(record => changedSet.has(String(record.id).toLowerCase())).length
       const targetPage = changedOnPage >= records.length && page > 1 ? page - 1 : page
-      syncArchiveLocally(changedIds)
-      sel.clear()
+      syncArchiveLocally(changedIds, archived)
       refreshBadges()
       await load(targetPage, { silent: true })
     } catch (err) { console.error(err) }
@@ -992,7 +1043,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     const changed = new Set([...ids].map(id => String(id).toLowerCase()))
     setRecords(current => current.flatMap(record => {
       if (!changed.has(String(record.id).toLowerCase())) return [record]
-      if ((watchedFilter === 'watched' && !watched) || (watchedFilter === 'unwatched' && watched)) return []
+      if (!selectionSession.current && ((watchedFilter === 'watched' && !watched) || (watchedFilter === 'unwatched' && watched))) return []
       return [{
         ...record,
         is_watched: watched,
@@ -1037,7 +1088,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     try {
       const ids = [...sel.selected]
       const updatedIds = await setRecordsWatched(ids, watched)
-      sel.clear()
       showBatchFeedback(`已${watched ? '关注' : '取消关注'} ${updatedIds.length} 条内容`, 'success')
       await load(pagination?.page || 1, { silent: true })
     } catch (error) {
@@ -1117,6 +1167,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   } : null
 
   const goToPage = (requestedPage: number) => {
+    if (selectionSession.current) return
     if (!pagination) return
     const totalPages = Math.max(1, pagination.totalPages)
     const targetPage = Math.min(totalPages, Math.max(1, Math.trunc(requestedPage)))
@@ -1179,7 +1230,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </button>
         </div>
       )}
-      <div className="sticky left-0 z-30 !mb-0 space-y-2 border-b border-border/60 bg-background pb-3 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
+      {selectionActive && <div role="status" className="sticky left-0 flex flex-wrap items-center gap-3 rounded-lg border border-primary/20 bg-accent px-3 py-2 text-xs lg:w-[calc(100cqw-3rem)]">
+        <span className="flex-1">多选中，已选 {sel.count} 条。修改后保留当前列表和勾选；取消多选后按筛选更新。</span>
+        <Button size="sm" variant="outline" disabled={selectionBusy} onClick={cancelSelection}><X className="h-3.5 w-3.5" />取消多选</Button>
+      </div>}
+      <fieldset disabled={selectionActive} className="sticky left-0 z-30 min-w-0 !mb-0 space-y-2 border-b border-border/60 bg-background pb-3 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
         <div data-triage-toolbar="primary" className="flex flex-wrap items-center gap-2">
           <div className="inline-flex h-10 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:h-8" role="tablist" aria-label="内容生命周期">
             {ARCHIVE_VIEWS.map(item => {
@@ -1359,6 +1414,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           <PostIntentFilter value={intents} onChange={setIntents} />
+          <TriageSelect value={contentTopic} onChange={e => setContentTopic(e.target.value)} aria-label="内容主题筛选" className="lg:!w-[146px]">
+            <option value="">全部内容主题</option>
+            {CONTENT_TOPIC_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+            <option value="unclassified">未分类</option>
+          </TriageSelect>
           <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} />
 
           {view === 'list' && (
@@ -1401,7 +1461,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             <X className="h-3.5 w-3.5" />清空
           </button>
         </div>
-      </div>
+      </fieldset>
 
 
       {/* Board view */}
@@ -1438,11 +1498,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 record={r}
                 canWrite={canWrite()}
                 selected={sel.has(r.id)}
-                onToggle={() => sel.toggle(r.id)}
+                onToggle={() => toggleSelection(r.id)}
                 onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
                 onSaveFeishuTableNo={(value: string) => saveFeishuTableNo(r, value)}
                 modeBusy={modeBusyId === r.id}
-                modeDisabled={Boolean(r.archived_at) || modeBusyId !== null || archiveBusyId !== null}
+                modeDisabled={Boolean(r.archived_at) || selectionBusy}
                 onAddNote={() => addRecordNote(r)}
                 noteBusy={noteBusyId === r.id}
                 onArchive={() => changeArchive(r.id, !r.archived_at)}
@@ -1464,12 +1524,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
               <tr className="h-12 border-b border-border/60 [&>th]:whitespace-nowrap">
                 {canWrite() && (
                   <th className="w-8 pl-3 pr-0">
-                    <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} onChange={() => sel.setAll(records.map(r => r.id), !allChecked)} />
+                    <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} disabled={selectionBusy} onChange={() => toggleAllSelection(!allChecked)} />
                   </th>
                 )}
-                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
+                <th inert={selectionActive || undefined} className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
                 {!narrow && (
-                  <th className="px-1.5 text-left">
+                  <th inert={selectionActive || undefined} className="px-1.5 text-left">
                     <HeaderSingleFilter
                       label="平台"
                       value={platform}
@@ -1484,7 +1544,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                     />
                   </th>
                 )}
-                <th className="px-1.5 text-left">
+                <th inert={selectionActive || undefined} className="px-1.5 text-left">
                   <HeaderSingleFilter
                     label="情感"
                     value={sentiment}
@@ -1497,18 +1557,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                     ]}
                   />
                 </th>
-                <th className="px-1.5 text-left"><PostIntentFilter header value={intents} onChange={setIntents} /></th>
-                <th className="px-1.5 text-left"><PostRelevanceFilter header value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} /></th>
-                {!narrow && <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
-                {!narrow && <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>}
-                {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />}
-                {!narrow && <SortableTh label="评论" field="comments" sort={sort} onSort={toggleSort} align="right" />}
-                {!narrow && <SortableTh label="点赞" field="likes" sort={sort} onSort={toggleSort} align="right" />}
-                {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />}
-                {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
-                {!narrow && <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />}
-                {!narrow && <th className="hidden whitespace-nowrap px-3 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
-                <th className="sticky right-0 z-50 w-[208px] min-w-[208px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
+                <th inert={selectionActive || undefined} className="px-1.5 text-left"><PostIntentFilter header value={intents} onChange={setIntents} /></th>
+                <th inert={selectionActive || undefined} className="px-1.5 text-left"><PostRelevanceFilter header value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} /></th>
+                {!narrow && <th inert={selectionActive || undefined} className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
+                {!narrow && <th inert={selectionActive || undefined} className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>}
+                {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} disabled={selectionActive} align="right" />}
+                {!narrow && <SortableTh label="评论" field="comments" sort={sort} onSort={toggleSort} disabled={selectionActive} align="right" />}
+                {!narrow && <SortableTh label="点赞" field="likes" sort={sort} onSort={toggleSort} disabled={selectionActive} align="right" />}
+                {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} disabled={selectionActive} className="hidden lg:table-cell" />}
+                {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} disabled={selectionActive} className="hidden xl:table-cell" />}
+                {!narrow && <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} disabled={selectionActive} className="hidden xl:table-cell" />}
+                {!narrow && <th inert={selectionActive || undefined} className="hidden whitespace-nowrap px-3 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
+                <th inert={selectionActive || undefined} className="sticky right-0 z-50 w-[208px] min-w-[208px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
                   <div className="grid grid-cols-[112px_48px] items-center gap-2">
                     <div className="flex justify-center">
                       <HeaderMultiFilter
@@ -1538,13 +1598,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   narrow={narrow}
                   open={drawerRecord?.id === r.id}
                   selected={sel.has(r.id)}
-                  onToggle={() => sel.toggle(r.id)}
+                  onToggle={() => toggleSelection(r.id)}
                   onAddNote={() => addRecordNote(r)}
                   noteBusy={noteBusyId === r.id}
                   onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
                   onSaveFeishuTableNo={(value: string) => saveFeishuTableNo(r, value)}
                   modeBusy={modeBusyId === r.id}
-                  modeDisabled={Boolean(r.archived_at) || modeBusyId !== null || archiveBusyId !== null}
+                  modeDisabled={Boolean(r.archived_at) || selectionBusy}
                   onArchive={() => changeArchive(r.id, !r.archived_at)}
                   archiveBusy={archiveBusyId === r.id}
                   watchBusy={watchBusyId === r.id}
@@ -1559,7 +1619,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           {pagination && (
-            <div className="flex flex-col gap-3 border-t border-border/50 px-4 py-3 xl:flex-row xl:items-center xl:justify-between">
+            <fieldset disabled={selectionActive} className="min-w-0 flex flex-col gap-3 border-t border-border/50 px-4 py-3 xl:flex-row xl:items-center xl:justify-between">
               <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
                 第 {formatNumber(pageStart)}–{formatNumber(pageEnd)} 条，共 {formatNumber(pagination.total)} 条
               </span>
@@ -1647,7 +1707,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   </Button>
                 </div>
               </div>
-            </div>
+            </fieldset>
           )}
         </div>
       )}
@@ -1656,8 +1716,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       {canWrite() && (
         <BatchBar
           count={sel.count}
-          busy={batchBusy}
-          onClear={sel.clear}
+          busy={selectionBusy}
+          clearLabel="取消多选"
+          onClear={cancelSelection}
           onAction={key => {
             if (key === 'custom_tags_add') setBatchTagMode('add')
             else if (key === 'custom_tags_remove') setBatchTagMode('remove')
@@ -1836,7 +1897,7 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
       </div>
 
       <div className={cn('mt-2.5 flex min-w-0 items-center justify-between gap-2', canWrite && 'pl-10')}>
-        <div className="min-w-0">{customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact />}</div>
+        <div className="min-w-0"><span className="text-[11px] text-muted-foreground">内容主题：{contentTopicLabel(r.content_topic)}</span>{customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact />}</div>
         <div className="flex shrink-0 items-center gap-1.5">
           {canWrite && !archived && <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} />}
           {canWrite && (
@@ -1914,6 +1975,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
             <div className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-muted-foreground">
               <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
               {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
+              <span className="truncate" title="内容主题">· {contentTopicLabel(r.content_topic)}</span>
               <RecordSourceAction record={r} compact />
               {archived && <span className="text-[10px]">已归档</span>}
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}
@@ -2106,11 +2168,12 @@ function TriageStatusMenu({ status, busy, archiveBusy, disabled, onChange, onArc
 }
 
 /* 可排序表头:点击切换该列升/降序,激活列显示实心箭头,未激活显示淡色双箭头 */
-function SortableTh({ label, field, sort, onSort, align = 'left', className = '' }: {
+function SortableTh({ label, field, sort, onSort, disabled, align = 'left', className = '' }: {
   label: string
   field: SortField
   sort: { field: string; dir: 'asc' | 'desc' }
   onSort: (field: SortField) => void
+  disabled?: boolean
   align?: 'left' | 'right'
   className?: string
 }) {
@@ -2118,7 +2181,7 @@ function SortableTh({ label, field, sort, onSort, align = 'left', className = ''
   const Arrow = active ? (sort.dir === 'desc' ? ArrowDown : ArrowUp) : ChevronsUpDown
   return (
     <th className={cn('px-3 py-3.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground', align === 'right' ? 'text-right' : 'text-left', className)}>
-      <button onClick={() => onSort(field)} title="点击切换排序"
+      <button disabled={disabled} onClick={() => onSort(field)} title={disabled ? '取消多选后可排序' : '点击切换排序'}
         className={cn('inline-flex items-center gap-1 align-middle uppercase tracking-wider transition-colors hover:text-foreground', active && 'text-foreground')}>
         {label}
         <Arrow className={cn('h-3 w-3', active ? 'opacity-100' : 'opacity-30')} strokeWidth={2.5} />

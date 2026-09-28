@@ -89,9 +89,9 @@ test('handled date filtering stays combined-only and follows initial, clear, sel
   assert.match(queue, /handled: \{ from: initial\?\.handledFrom \|\| '', to: initial\?\.handledTo \|\| '' \}/);
   const selection = queue.match(/const sel = useSelection\([^\n]+/)?.[0];
   assert.ok(selection);
-  assert.match(selection, /\$\{filterParams\(\)\.toString\(\)\}/);
-  assert.match(selection, /\$\{pageSize\}/);
-  assert.match(selection, /\$\{pagination\?\.page \?\? 1\}/);
+  assert.match(selection, /useSelection\('triage-selection-session'\)/);
+  assert.match(queue, /<fieldset disabled=\{selectionActive\}/);
+  assert.match(queue, /const cancelSelection[\s\S]*?sel\.clear\(\)[\s\S]*?load\(pagination\?\.page \|\| 1/);
   const commonFilters = queue.match(/const filterParams = useCallback\(\(\) => \{[\s\S]*?\}, \[[^\]]*\]\)/)?.[0];
   assert.ok(commonFilters);
   assert.match(commonFilters, /params\.set\('handledFrom', dateRanges\.handled\.from\)/);

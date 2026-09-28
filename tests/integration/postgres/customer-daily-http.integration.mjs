@@ -122,7 +122,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(generated.snapshot.summary.mtdBasis,'distinct_records');
   assert.equal(Object.hasOwn(generated.snapshot,'collectionSummary'),false);
   assert.ok(generated.snapshot.evidence.handling.transitions.length > 0);
-  assert.equal(generated.snapshot.summary.negativeDailyBasis,'status_transition_events');
+  assert.equal(generated.snapshot.summary.negativeDailyBasis,'effective_handled_posts');
   assert.equal(generated.snapshot.summary.negativeMtdBasis,'distinct_records_last_status');
   assert.equal(generated.snapshot.summary.mtd.cold,2);
   assert.equal(generated.snapshot.summary.day.inProgress,null);
@@ -159,7 +159,7 @@ test('customer daily HTTP uses real first-ingest/observation/audit SQL, immutabl
   assert.equal(excel.status,200);
   const workbook=new ExcelJS.Workbook();
   await workbook.xlsx.load(Buffer.from(await excel.arrayBuffer()));
-  assert.equal(workbook.worksheets.length,3);
+  assert.equal(workbook.worksheets.length,5);
   const sheet=workbook.worksheets[0];
   const dayRow=sheet.getRows(1,sheet.rowCount).find(row=>row.getCell(1).value==='2026/9/11');
   assert.ok(dayRow);

@@ -26,58 +26,61 @@ const negativeSummary = (events, posts = records, options = {}) => {
     {coverageFrom: '2026-08-31T16:00:00Z', malformedEventIds: parsed.malformed, ...options});
 };
 
-test('v5 counts every true same-day negative action and classifies each monthly post by only its last state', () => {
+test('v5 counts each effective post once per day despite repeated transitions and duplicates, and once in MTD', () => {
   const events = [event(1, 'unhandled', 'negative_cold', date(14, '09:00:00')),
     event(1, 'negative_cold', 'negative_comment', date(14, '10:00:00'), {id: id(201)}),
     event(1, 'negative_comment', 'negative_cold', date(14, '11:00:00'), {id: id(202)})];
   const before = structuredClone(events);
-  const {summary, evidence} = negativeSummary([...events, events[1]]);
-  assert.deepEqual(summary.day, {cold: 2, comment: 1, negativeProcess: 0, negativeOther: 0});
+  const {summary, evidence} = negativeSummary([...events, events[1]], [{...records[0], status: 'negative_cold'}]);
+  assert.deepEqual(summary.day, {cold: 1, comment: 0, negativeProcess: 0, negativeOther: 0});
   assert.deepEqual(summary.mtd, {cold: 1, comment: 0, negativeProcess: 0, negativeOther: 0});
   assert.equal(evidence.transitions.length, 3, 'repeated input for the same audit event/post is not an extra action');
-  assert.equal(summary.dailyBasis, 'status_transition_events');
+  assert.equal(summary.dailyBasis, 'effective_handled_posts');
   assert.equal(summary.mtdBasis, 'distinct_records_last_status');
   assert.deepEqual(events, before);
 });
 
-test('v5 keeps historical-post weekend and cross-day actions, but a last reviewed state removes only the MTD bucket', () => {
+test('v5 keeps effective historical-post weekend handling, but later corrections remove obsolete daily and MTD buckets', () => {
   const events = [event(1, 'unhandled', 'negative_comment', date(12)),
     event(1, 'negative_comment', 'negative_cold', date(13), {id: id(201)}),
     event(1, 'negative_cold', 'negative_comment', date(14), {id: id(202)})];
   const first = negativeSummary(events);
   assert.equal(first.summary.rows.find(row => row.date === '2026-09-12').isWorkingDay, false);
   assert.equal(first.summary.rows.find(row => row.date === '2026-09-12').counts.comment, 1);
+  assert.equal(first.summary.rows.find(row => row.date === '2026-09-13').counts.cold, 0);
   assert.equal(first.summary.day.comment, 1);
   assert.equal(first.summary.mtd.comment, 1);
-  const final = negativeSummary([...events, event(1, 'negative_comment', 'reviewed', date(14, '14:00:00'), {id: id(203)})]);
-  assert.deepEqual(final.summary.day, first.summary.day, 'an actual comment action is not erased by a later review');
+  const final = negativeSummary([...events, event(1, 'negative_comment', 'reviewed', date(14, '14:00:00'), {id: id(203)})], [{...records[0], status: 'reviewed'}]);
+  assert.deepEqual(final.summary.day, {cold: 0, comment: 0, negativeProcess: 0, negativeOther: 0});
+  assert.equal(final.summary.rows.find(row => row.date === '2026-09-12').counts.comment, 0);
   assert.deepEqual(final.summary.mtd, {cold: 0, comment: 0, negativeProcess: 0, negativeOther: 0});
   assert.deepEqual(final.evidence.monthExcludedRecordIds, [id(1)]);
 });
 
-test('explicit negative actions survive sentiment corrections while generic unavailable states require negative evidence', () => {
-  const posts = [1, 2, 3, 4, 5, 6].map(n => ({id: id(n), sentiment: n === 5 ? 'negative' : n % 2 ? 'positive' : 'neutral'}));
+test('all four negative handling columns respect the current sentiment and state, including generic unreachable states', () => {
+  const states = ['negative_cold', 'negative_comment', 'unavailable', 'privacy_unreachable', 'unavailable', 'privacy_unreachable'];
+  const posts = [1, 2, 3, 4, 5, 6].map(n => ({id: id(n), status: states[n - 1], sentiment: n === 5 ? 'negative' : n % 2 ? 'positive' : 'neutral'}));
   const result = negativeSummary([
     event(1, 'unhandled', 'negative_cold'), event(2, 'unhandled', 'negative_comment'),
     event(3, 'reviewed', 'unavailable'), event(4, 'reviewed', 'privacy_unreachable'),
     event(5, 'reviewed', 'unavailable'), event(6, 'negative_feishu', 'privacy_unreachable'),
   ], posts);
-  assert.deepEqual(result.summary.day, {cold: 1, comment: 1, negativeProcess: 0, negativeOther: 2});
+  assert.deepEqual(result.summary.day, {cold: 0, comment: 0, negativeProcess: 0, negativeOther: 1});
   assert.deepEqual(result.summary.mtd, result.summary.day);
-  assert.deepEqual(result.evidence.monthExcludedRecordIds.sort(), [id(3), id(4)]);
+  assert.deepEqual(result.evidence.monthExcludedRecordIds.sort(), [id(1), id(2), id(3), id(4), id(6)]);
 });
 
-test('verified negative context survives consecutive unreachable actions, and nonnegative states break that proof chain', () => {
-  const post = [{id: id(1), sentiment: 'neutral'}];
+test('past negative handling cannot override a corrected neutral sentiment', () => {
+  const post = [{id: id(1), sentiment: 'neutral', status: 'privacy_unreachable'}];
   const events = [event(1, 'negative_cold', 'unavailable', date(14, '09:00:00')),
     event(1, 'unavailable', 'privacy_unreachable', date(14, '10:00:00'), {id: id(201)})];
   const result = negativeSummary(events, post);
-  assert.equal(result.summary.day.negativeOther, 2);
-  assert.equal(result.summary.mtd.negativeOther, 1);
+  assert.equal(result.summary.day.negativeOther, 0);
+  assert.equal(result.summary.mtd.negativeOther, 0);
   const cleared = negativeSummary([...events,
     event(1, 'privacy_unreachable', 'reviewed', date(14, '11:00:00'), {id: id(202)}),
     event(1, 'reviewed', 'unavailable', date(14, '12:00:00'), {id: id(203)})], post);
-  assert.equal(cleared.summary.day.negativeOther, 2, 'a later generic unavailability with no current negative or prior negative chain is not a negative action');
+  assert.equal(cleared.summary.day.negativeOther, 0);
   assert.equal(cleared.summary.mtd.negativeOther, 0);
 });
 
@@ -87,7 +90,7 @@ test('v5 ignores repeated status, notes, other tenants and equivalent batch UUID
     metadata: {status: 'negative_comment', recordIds: [key, key.toUpperCase()], previous: {[key]: {status: 'negative_cold'}, [key.toUpperCase()]: {status: 'negative_cold'}}}};
   const result = negativeSummary([batch, event(1, 'negative_cold', 'negative_cold'),
     event(2, 'reviewed', 'reviewed', date(14), {metadata: {previousStatus: 'reviewed', nextStatus: 'reviewed', note: 'only a note'}}),
-    event(3, 'unhandled', 'negative_cold', date(14), {tenant_id: id(901)}), event(1, undefined, 'negative_cold')], [{id: key}, ...records]);
+    event(3, 'unhandled', 'negative_cold', date(14), {tenant_id: id(901)}), event(1, undefined, 'negative_cold')], [{id: key, sentiment: 'negative', status: 'negative_comment'}, ...records]);
   assert.deepEqual(result.summary.day, {cold: 0, comment: 1, negativeProcess: 0, negativeOther: 0});
   assert.equal(result.summary.coverageComplete, false);
   assert.deepEqual(result.evidence.malformedEventIds, [id(101)]);

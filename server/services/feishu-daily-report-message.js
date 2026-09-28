@@ -1,3 +1,4 @@
+import {customerDailyHandlingSections, customerDailyHandlingNoteLines, customerDailyHandlingTime} from './customer-daily-report-presentation.js';
 import {
   customerDailySections, isGroupedDailyReport, customerDailySummaryBasis, customerDailyPostStatus,
   customerDailyPostPlatform, customerDailyPostHeat,
@@ -60,6 +61,7 @@ function postLine(post, index, heat, snapshot) {
     text(url || `${title}（原帖链接待补） - ${oneLine(customerDailyPostPlatform(item), '未知平台', 40)}`)];
   if (heat) nodes.push(text(` | 热度 ${heatLabel(item)} | ${comparisonLabel(item)}${isGroupedDailyReport(snapshot) ? ` | 处理状态：${oneLine(customerDailyPostStatus(item), '未记录', 140)}` : ''}`));
   else if (customerDailyColdPostLabel(item)) nodes.push(text(' 【历史帖】'));
+  if (!heat && snapshot.handlingListsVersion === 1) nodes.push(text(` | ${customerDailyHandlingTime(item)}`));
   return nodes;
 }
 
@@ -85,6 +87,8 @@ export function buildFeishuDailyPost({ snapshot, imageKey, documentUrl }) {
   const cold = Array.isArray(snapshot.coldMarked) ? snapshot.coldMarked : [];
   const title = `${oneLine(snapshot.tenantName, '客户', 80)} · 舆情日报 ${oneLine(snapshot.reportDate, '', 20)}`.trim();
 
+  const extraSections = customerDailyHandlingSections(snapshot);
+  let extraCounts = extraSections.map(section => Math.min(1, section.posts.length));
   function build(heatCount, coldCount) {
     const content = [heading(customerDailySections(snapshot).summary), ...(customerDailySummaryBasis(snapshot) ? [[text(customerDailySummaryBasis(snapshot))]] : []), [{ tag: 'img', image_key: image }], heading(customerDailySections(snapshot).heat)];
     if (!heat.length) content.push([text('暂未检出符合条件的帖子。')]);
@@ -94,6 +98,16 @@ export function buildFeishuDailyPost({ snapshot, imageKey, documentUrl }) {
     if (!cold.length) content.push([text(customerDailyColdEmpty(snapshot))]);
     for (let index = 0; index < coldCount; index++) content.push(postLine(cold[index], index, false, snapshot));
     if (coldCount < cold.length) content.push([text(`另有 ${cold.length - coldCount} 条冷处理负面帖子，见底部完整日报。`)]);
+    extraSections.forEach((section, sectionIndex) => {
+      content.push(heading(section.title));
+      if (!section.posts.length) content.push([text(section.empty)]);
+      for (let index = 0; index < extraCounts[sectionIndex]; index++) {
+        const post = section.posts[index];
+        content.push(postLine(post, index, false, snapshot));
+        for (const line of customerDailyHandlingNoteLines(post)) content.push([text(line)]);
+      }
+      if (extraCounts[sectionIndex] < section.posts.length) content.push([text(`另有 ${section.posts.length - extraCounts[sectionIndex]} 条${section.sheet}内容及回复备注，见底部完整日报。`)]);
+    });
     content.push([{ tag: 'a', text: '打开完整日报（可编辑）', href: document }]);
     return { zh_cn: { title, content } };
   }
@@ -103,6 +117,10 @@ export function buildFeishuDailyPost({ snapshot, imageKey, documentUrl }) {
   let heatCount = Math.min(1, heat.length);
   let coldCount = Math.min(1, cold.length);
   let result = build(heatCount, coldCount);
+  if (extraSections.length && feishuDailyPostRequestBytes(result) > FEISHU_DAILY_POST_MAX_BYTES) {
+    extraCounts = extraSections.map(() => 0);
+    result = build(heatCount, coldCount);
+  }
   if (feishuDailyPostRequestBytes(result) > FEISHU_DAILY_POST_MAX_BYTES) throw new RangeError('日报首条内容过长，无法完整展示两部分');
   let heatDone = heatCount === heat.length;
   let coldDone = coldCount === cold.length;
@@ -118,6 +136,14 @@ export function buildFeishuDailyPost({ snapshot, imageKey, documentUrl }) {
       if (feishuDailyPostRequestBytes(candidate) <= FEISHU_DAILY_POST_MAX_BYTES) { coldCount++; result = candidate; }
       else coldDone = true;
       coldDone ||= coldCount === cold.length;
+    }
+  }
+  for (const [sectionIndex, section] of extraSections.entries()) {
+    while (extraCounts[sectionIndex] < section.posts.length) {
+      extraCounts[sectionIndex]++;
+      const candidate = build(heatCount, coldCount);
+      if (feishuDailyPostRequestBytes(candidate) > FEISHU_DAILY_POST_MAX_BYTES) { extraCounts[sectionIndex]--; break; }
+      result = candidate;
     }
   }
   return result;

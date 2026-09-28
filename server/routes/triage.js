@@ -28,6 +28,7 @@ import {
   recordAdmissionSelectSql, withRecordAdmissionFields,
 } from '../services/record-triage-admission.js';
 import { appendRecordRelevanceFilters } from '../services/record-relevance-filter.js';
+import { appendContentTopicFilter, contentTopicLabel } from '../services/content-topic.js';
 
 const router = Router();
 
@@ -617,6 +618,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     where = appendSentimentFilter(where, params, sentiment);
     where = appendRecordIntentFilter(where, params, req.query.intent);
     where = appendRecordRelevanceFilters(where, params, req.query);
+    where = appendContentTopicFilter(where, params, req.query.contentTopic);
     const bucket = String(req.query.bucket || '');
     if (bucket && !['active', 'archived'].includes(bucket)) return res.status(400).json({ ok: false, error: 'invalid_bucket', message: '内容分诊范围无效' });
     // 先按 bucket/queue 圈定大范围,再叠加具体处置状态(status)与风险(risk)筛选。
@@ -688,7 +690,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         r.latest_negative_comment_at, r.last_risk_reopened_at,
         r.content_availability_status, r.content_availability_checked_at,
         r.content_availability_reason, r.content_availability_evidence,
-        r.sentiment, r.category, r.source_type, r.identity_override, r.intent, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
+        r.sentiment, r.category, r.content_topic, r.source_type, r.identity_override, r.intent, r.ai_summary, r.keyword, r.first_seen_at, r.last_seen_at,
         r.ai_result, r.manual_overrides, ${customTagsSelectSql('r')} AS custom_tags,
         ${recordAdmissionSelectSql('r', { admitted: true })},
         r.seen_count, r.created_at,
@@ -1299,6 +1301,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
     where = appendSentimentFilter(where, params, sentiment);
     where = appendRecordIntentFilter(where, params, req.query.intent);
     where = appendRecordRelevanceFilters(where, params, req.query);
+    where = appendContentTopicFilter(where, params, req.query.contentTopic);
     const bucket = String(req.query.bucket || '');
     if (bucket && !['active', 'archived'].includes(bucket)) return res.status(400).json({ ok: false, error: 'invalid_bucket', message: '内容分诊范围无效' });
     if (queue === 'triage') {
@@ -1347,7 +1350,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
           NULLIF(r.payload->'detailPayload'->>'bloggerUserId',''), NULLIF(r.payload->'detailPayload'->>'redId',''),
           NULLIF(r.payload->'detailPayload'->>'douyinId',''), NULLIF(r.payload->'detailPayload'->>'bloggerId','')
         ) AS payload_account_no,
-        r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.ai_summary,
+        r.likes, r.comments_count, r.collects, r.shares, r.sentiment, r.category, r.content_topic, r.ai_summary,
         r.intent, ${recordIntentSql('r')} AS intent_display,
         jsonb_build_object('relevance',r.ai_result->'relevance','relevanceReason',r.ai_result->'relevanceReason','relevanceConfidence',r.ai_result->'relevanceConfidence') AS ai_result,
         ${recordAdmissionSelectSql('r', { admitted: true })},
@@ -1457,6 +1460,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       shares: r.shares,
       sentiment: SENTIMENT_CN[r.sentiment] || r.sentiment || '',
       category: CATEGORY_CN[r.category] || r.category || '',
+      contentTopic: contentTopicLabel(r.content_topic),
       ...recordJudgmentExportFields(r),
       custom_tags: (Array.isArray(r.custom_tags) ? r.custom_tags : [])
         .map(tag => String(tag?.name || '').trim())
@@ -1502,6 +1506,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       { header: 'AI置信度', key: 'relevance_confidence', width: 12 },
       { header: '判断来源', key: 'relevance_source', width: 12 },
       { header: '分类', key: 'category', width: 12 },
+      { header: '内容主题', key: 'contentTopic', width: 18 },
       { header: '相关性依据', key: 'relevance_reason', width: 50 },
       { header: '自定义标签', key: 'custom_tags', width: 28 },
       { header: '处理记录', key: 'processing_records', width: 50, style: { alignment: { wrapText: true, vertical: 'top' } } },

@@ -64,7 +64,7 @@ export function convertCustomerDailyV4ToMixedSnapshot(snapshot, {sourceReportId 
   const validNegative = counts => object(counts) && CUSTOMER_DAILY_NEGATIVE_HANDLING_FIELDS.every(field => Number.isSafeInteger(counts[field]) && counts[field] >= 0);
   const days = Number(snapshot.reportDate.slice(-2));
   const expectedDates = new Set(Array.from({length: days}, (_, i) => `${snapshot.reportDate.slice(0, 8)}${String(i + 1).padStart(2, '0')}`));
-  if (!object(handlingSummary) || handlingSummary.dailyBasis !== 'status_transition_events' || handlingSummary.mtdBasis !== 'distinct_records_last_status' ||
+  if (!object(handlingSummary) || !['status_transition_events', 'effective_handled_posts'].includes(handlingSummary.dailyBasis) || handlingSummary.mtdBasis !== 'distinct_records_last_status' ||
       handlingSummary.dayDate !== snapshot.reportDate || !validNegative(handlingSummary.day) || !validNegative(handlingSummary.mtd) || !Array.isArray(handlingSummary.rows) ||
       handlingSummary.rows.length !== days || new Set(handlingSummary.rows.map(row => row?.date)).size !== days ||
       handlingSummary.rows.some(row => !object(row) || !expectedDates.has(row.date) || !validNegative(row.counts)) ||

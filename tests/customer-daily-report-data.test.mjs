@@ -48,12 +48,11 @@ function fakeDb(seed = {}) {
     async queryAll(sql, params) {
       calls.push({sql, params});
       if (sql.includes('customer_daily:month')) return seed.month || [];
-      if (sql.includes('customer_daily:handling_events')) return seed.handlingEvents || [];
-      if (sql.includes('customer_daily:handling_posts')) return seed.handlingPosts || [];
+      if (sql.includes('customer_daily:handling_events')) return seed.handlingEvents || seed.events || [];
+      if (sql.includes('customer_daily:handling_posts')) return seed.handlingPosts || seed.coldPosts || [];
+      if (sql.includes('customer_daily:handling_notes')) return seed.notes || [];
       if (sql.includes('customer_daily:heat_posts')) return seed.heatPosts || [];
       if (sql.includes('customer_daily:observations')) return seed.observations || [];
-      if (sql.includes('customer_daily:cold_events')) return seed.events || [];
-      if (sql.includes('customer_daily:cold_posts')) return seed.coldPosts || [];
       if (sql.includes('customer_daily:pending_capture')) return seed.pending || [];
       throw new Error(`Unexpected queryAll ${sql}`);
     },
@@ -169,17 +168,17 @@ test('morning new posts belong to today realtime and G corrections apply to yest
 });
 
 test('v5 preserves collection cohorts while actual negative handling includes eligible older-month posts', async () => {
-  const historical = record(1, {first_seen_at: '2026-08-01T00:00:00Z', status: 'negative_comment'});
+  const historical = record(1, {first_seen_at: '2026-08-01T00:00:00Z', status: 'negative_cold'});
   const current = record(2, {status: 'reviewed_non_monitor'});
-  const untouched = record(3, {status: 'negative_cold', updated_at: d(7)});
+  const handledCurrent = record(3, {status: 'negative_feishu', updated_at: d(7)});
   const cold = record(4, {status: 'negative_cold'});
   const comment = record(5, {status: 'negative_comment'});
   const feishu = record(6, {status: 'negative_feishu'});
   const unavailable = record(7, {status: 'unavailable'});
   const privacy = record(8, {status: 'privacy_unreachable'});
-  const db = fakeDb({month: [historical, current, untouched, cold, comment, feishu, unavailable, privacy, cold],
+  const db = fakeDb({month: [historical, current, handledCurrent, cold, comment, feishu, unavailable, privacy, cold],
     handlingEvents: [event(1, 'unhandled'), event(3, 'unhandled', 'negative_feishu')],
-    handlingPosts: [historical, untouched], coverage: '2026-08-31T16:00:00Z'});
+    handlingPosts: [historical, handledCurrent], coverage: '2026-08-31T16:00:00Z'});
   const report = await collectCustomerDailyReport({...opts, db});
   assert.equal(report.schemaVersion, 5);
   assert.equal(report.summary.format, 'daily_collection_handling_v5');
@@ -354,7 +353,7 @@ test('cold list includes older posts, deduplicates reentry, excludes corrections
   assert.equal(report.coldMarked.length, 1);
   assert.equal(report.coldMarked[0].eventId, e1again.id);
   assert.equal(report.coldMarked[0].isHistorical, true);
-  assert.equal(report.summary.day.cold, 0);
+  assert.equal(report.summary.day.cold, 1, 'an older post handled today counts in handling independently of collection');
   assert.deepEqual(report.evidence.cold.withdrawnRecordIds, [ID(2), ID(3)]);
   assert.equal(report.evidence.cold.transitions.length, 4);
   assert.equal(report.evidence.cold.coverageComplete, true);
@@ -382,7 +381,7 @@ test('Monday cold list includes weekend changes and coverage must span the whole
   assert.equal(report.coldMarked.find(p=>p.recordId===ID(1)).isHistorical,false,'weekend arrival belongs to Monday collection cohort');
   assert.equal(report.coldMarked.find(p=>p.recordId===ID(2)).isHistorical,true);
   assert.equal(report.evidence.cold.coverageComplete,false,'coverage starting Monday cannot prove the entire weekend');
-  assert.equal(db.calls.find(q=>q.sql.includes('customer_daily:cold_events')).params[1],'2026-09-11T16:00:00.000Z');
+  assert.equal(db.calls.find(q=>q.sql.includes('customer_daily:handling_events')).params[1], '2026-08-31T16:00:00.000Z', 'the shared query covers both the report interval and MTD');
 });
 
 test('historical cold labels use the collection start boundary and do not guess missing first-ingest times', async () => {
@@ -397,7 +396,7 @@ test('historical cold labels use the collection start boundary and do not guess 
   })});
   assert.equal(report.coldMarked.find(p=>p.recordId===ID(1)).isHistorical,true);
   assert.equal(report.coldMarked.find(p=>p.recordId===ID(2)).isHistorical,false);
-  assert.equal(Object.hasOwn(report.coldMarked.find(p=>p.recordId===ID(3)),'isHistorical'),false);
+  assert.equal(report.coldMarked.find(p=>p.recordId===ID(3)), undefined, 'a missing first insertion time cannot prove admission before the cutoff');
 });
 
 test('missing source links and unsettled keyword capture are visible blockers, heat gaps are not', async () => {
@@ -436,7 +435,7 @@ test('HTML, copy text and editable monthly workbook preserve counts, all links a
   assert.doesNotMatch(copied, /复核及冷处理状态截至|观测质量|数据说明/);
   for (const row of rows) { assert.ok(copied.includes(row.url)); assert.ok(html.includes(row.url)); }
   const workbook = buildCustomerDailyReportWorkbook(report);
-  assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '本期冷处理']);
+  assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '本期冷处理', '本期已回复', '本期评论区留言']);
   const summary = workbook.getWorksheet('日报');
   const summaryDates = [], mtdRows = [];
   summary.eachRow(row => {

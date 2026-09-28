@@ -114,7 +114,7 @@ function collectionSource() {
   return {...convertCustomerDailyV3ToCollectionSnapshot(sourceSnapshot()), id: 'frozen-v4-report', version: 8};
 }
 function actionsFor(source) {
-  return buildCustomerDailyNegativeHandlingSummary([{id: 'old-post-1', sentiment: 'negative'}, {id: 'old-post-2', sentiment: 'neutral'}], [
+  return buildCustomerDailyNegativeHandlingSummary([{id: 'old-post-1', sentiment: 'negative', status: 'negative_comment'}, {id: 'old-post-2', sentiment: 'neutral', status: 'negative_comment'}], [
     {recordId: 'old-post-1', eventId: 'event-1', handledAt: '2026-09-12T01:00:00Z', previousStatus: 'unhandled', nextStatus: 'negative_cold'},
     {recordId: 'old-post-1', eventId: 'event-2', handledAt: '2026-09-14T04:00:00Z', previousStatus: 'negative_cold', nextStatus: 'negative_comment'},
     {recordId: 'old-post-2', eventId: 'event-3', handledAt: '2026-09-14T05:00:00Z', previousStatus: 'negative_feishu', nextStatus: 'negative_comment'},
@@ -132,13 +132,13 @@ test('v4 to v5 preserves the exact frozen collection baseline and customer conte
     assert.equal(converted.summary.mtd[field], source.summary.mtd[field]);
     for (const row of source.summary.rows) assert.equal(converted.summary.rows.find(item => item.date === row.date).counts[field], row.counts[field]);
   }
-  assert.equal(converted.summary.day.comment, 2);
-  assert.equal(converted.summary.mtd.comment, 2);
+  assert.equal(converted.summary.day.comment, 1);
+  assert.equal(converted.summary.mtd.comment, 1);
   const weekend = converted.summary.rows.find(row => row.date === '2026-09-12');
   assert.equal(weekend.counts.monitor, 0);
-  assert.equal(weekend.counts.cold, 1);
+  assert.equal(weekend.counts.cold, 0);
   assert.equal(weekend.isWorkingDay, false);
-  assert.equal(converted.summary.mtd.cold, 0, 'last comment state replaces a prior cold state for monthly dedup only');
+  assert.equal(converted.summary.mtd.cold, 0, 'the obsolete cold state is excluded in both daily and monthly quantities');
   assert.equal(converted.summary.mtd.monitor, 1243);
   for (const field of ['notes', 'highHeat', 'coldMarked', 'assessedAt', 'cutoffAt', 'legacyHandling']) assert.deepEqual(converted[field], source[field], field);
   assert.equal(Object.hasOwn(converted, 'id'), false);
@@ -169,13 +169,13 @@ test('v4 to v5 retains top-level edit protection and converts the original syste
   assert.equal(converted.summary.mtd.monitor, 1244);
   assert.equal(converted.systemSummary.day.monitor, 280);
   assert.equal(converted.systemSummary.mtd.monitor, 1243);
-  assert.equal(converted.systemSummary.day.comment, 2);
+  assert.equal(converted.systemSummary.day.comment, 1);
   assert.equal(converted.systemSummary.format, 'daily_collection_handling_v5');
   for (const field of ['summaryEdited', 'summaryEditedAt', 'summaryEdit']) assert.deepEqual(converted[field], source[field]);
   assert.deepEqual(converted.legacyCollection.systemSummary, source.systemSummary);
   const edited = mergeCustomerDailySummary(converted.summary, {rows: {'2026-09-14': {monitor: 282, comment: 0}}});
   assert.equal(edited.mtd.monitor, 1245);
-  assert.equal(edited.mtd.comment, 2);
+  assert.equal(edited.mtd.comment, 1);
   assert.deepEqual(source, before);
 });
 

@@ -15,7 +15,11 @@ export const isGroupedDailyReport = snapshot => isHandlingDailyReport(snapshot) 
 export const isMonthlyDailyReport = snapshot => ['daily_disposition_v2', 'daily_handling_v3', 'daily_collection_v4', 'daily_collection_handling_v5'].includes(snapshot?.summary?.format) && Array.isArray(snapshot.summary.rows);
 export const CUSTOMER_DAILY_HANDLING_HEADERS = Object.freeze(['舆情处理日期', '处理量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-走负面处理流程', '负面-其他']);
 export const CUSTOMER_DAILY_COLLECTION_HEADERS = Object.freeze(['舆情处理日期', '平台监控量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-走负面处理流程', '负面-其他']);
-export const customerDailySummaryBasis = snapshot => isCollectionHandlingDailyReport(snapshot) ? '采集列按采集日期统计；四项负面按实际处理日期计次数（含旧帖）；MTD 按帖去重。' : isCollectionDailyReport(snapshot) ? '首次入库采集统计' : '';
+export const customerDailySummaryBasis = snapshot => isCollectionHandlingDailyReport(snapshot)
+  ? snapshot.summary.negativeDailyBasis === 'effective_handled_posts'
+    ? '采集列沿用采集口径；四项负面按更正后的有效帖子按处理日期去重（含旧帖）；MTD 按帖去重。'
+    : '采集列按采集日期统计；四项负面按实际处理日期计次数（含旧帖）；MTD 按帖去重。'
+  : isCollectionDailyReport(snapshot) ? '首次入库采集统计' : '';
 export const customerDailySections = snapshot => isSingleTableDailyReport(snapshot) ? {...CUSTOMER_DAILY_SECTIONS, summary: '一、每日舆情处理量'} : isHandlingDailyReport(snapshot) ? {summary: '一、每日舆情处理量', collection: '二、实际采集量', heat: '三、7天内热度值≥200的负面帖子', cold: '四、本期冷处理负面帖'} : CUSTOMER_DAILY_SECTIONS;
 export const customerDailyCollectionSnapshot = snapshot => ({...snapshot, summary: snapshot.collectionSummary, collectionDisplay: true});
 export const customerDailyTables = snapshot => [{snapshot, title: customerDailySections(snapshot).summary}, ...(isHandlingDailyReport(snapshot) && snapshot.collectionSummary ? [{snapshot: customerDailyCollectionSnapshot(snapshot), title: customerDailySections(snapshot).collection, collection: true}] : [])];
@@ -85,6 +89,25 @@ export function customerDailyColdTitle(snapshot) {
 
 export function customerDailyColdPostLabel(post) {
   return post?.isHistorical === true ? '历史帖' : '';
+}
+
+export function customerDailyHandlingSections(snapshot) {
+  if (snapshot?.handlingListsVersion !== 1) return [];
+  const offset = isHandlingDailyReport(snapshot) && snapshot.collectionSummary;
+  return [
+    {key: 'repliedMarked', title: `${offset ? '五' : '四'}、本期已回复帖子`, sheet: '本期已回复', posts: snapshot.repliedMarked || [], empty: '本期无已回复帖子。'},
+    {key: 'commentMarked', title: `${offset ? '六' : '五'}、本期负面–评论区留言`, sheet: '本期评论区留言', posts: snapshot.commentMarked || [], empty: '本期无负面–评论区留言帖子。'},
+  ].map(section => ({...section, title: `${section.title}：${section.posts.length} 条`}));
+}
+
+export function customerDailyHandlingNoteLines(post) {
+  return [`回复内容：${String(post.replyContent || '').trim() ? post.replyContent : '未填写回复内容'}`,
+    ...(post.supplementalNotes || []).filter(note => String(note.body || '').trim()).map(note => `补充备注：${note.body}`)];
+}
+
+export function customerDailyHandlingTime(post) {
+  if (!post?.markedAt || !Number.isFinite(new Date(post.markedAt).getTime())) return '处理时间未记录';
+  return new Date(new Date(post.markedAt).getTime() + 8 * 3600000).toISOString().slice(0, 16).replace('T', ' ');
 }
 
 const POST_STATUS_LABELS = Object.freeze({unhandled: '待处理', reviewed: '已复核', reviewed_non_monitor: '已复核-非监控内容', replied: '已回复', unavailable: '已不可见', privacy_unreachable: '隐私设置无法触达', negative_feishu: '飞书表', negative_cold: '冷处理', negative_comment: '评论区留言'});

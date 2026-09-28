@@ -1,3 +1,4 @@
+import {buildCustomerDailyHandlingLists} from './customer-daily-handling-lists.js';
 import {resolveMetricUpdateFromPayload} from '../utils/metrics.js';
 import {recoverCustomerDailyObservationTime} from './customer-daily-metric-evidence.js';
 import {buildMonthlySummary, DAILY_COLLECTION_SUMMARY_FORMAT} from './customer-daily-monthly-summary.js';
@@ -169,10 +170,6 @@ function post(row) {
     url: safeUrl(row.url) || safeUrl(row.canonical_url), status: status(row),
     ...(status(row) === 'negative_feishu' ? {feishuTableNo: String(row.feishu_table_no || '').trim()} : {})};
 }
-function currentCold(row) {
-  return row && mainPost(row) && row.sentiment === 'negative' && status(row) === 'negative_cold';
-}
-
 export function parseCustomerDailyColdEvents(events = []) {
   const transitions = [];
   const malformed = [];
@@ -227,23 +224,26 @@ export function buildCustomerDailyCollectionSummary(records, period) {
 export async function collectCustomerDailyNegativeHandling({tenantId, period, db, auditCoverageFrom = null}) {
   if (!tenantId || !db?.queryAll || !db?.queryOne) throw new TypeError('负面处理统计需要租户及只读查询接口');
   const monthStart = customerDailyHandlingMonthStart(period);
+  const handlingStart = period.handlingStartAt || period.periodStart;
+  const eventStart = ms(handlingStart) < ms(monthStart) ? handlingStart : monthStart;
   const events = await db.queryAll(`/* customer_daily:handling_events */
     SELECT id, tenant_id, action, target_type, target_id, created_at,
       jsonb_build_object('previousStatus', metadata->'previousStatus', 'nextStatus', metadata->'nextStatus',
-        'status', metadata->'status', 'recordIds', metadata->'recordIds', 'previous', metadata->'previous') AS metadata
+        'status', metadata->'status', 'recordIds', metadata->'recordIds', 'previous', metadata->'previous', 'note', metadata->'note') AS metadata
     FROM audit_logs
     WHERE tenant_id = $1 AND target_type = 'record'
       AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
       AND action IN ('record.triage_updated', 'record.triage_batch_updated', 'record.ticket_created', 'record.official_response_marked')
-    ORDER BY created_at, id`, [tenantId, monthStart, period.cutoffAt]);
-  const parsed = parseCustomerDailyHandlingEvents(events.filter(row => ms(row.created_at) >= ms(monthStart) && ms(row.created_at) < ms(period.cutoffAt)), {tenantId});
+    ORDER BY created_at, id`, [tenantId, eventStart, period.cutoffAt]);
+  const parsed = parseCustomerDailyHandlingEvents(events.filter(row => ms(row.created_at) >= ms(eventStart) && ms(row.created_at) < ms(period.cutoffAt)), {tenantId});
   const ids = [...new Set(parsed.transitions.map(transition => transition.recordId))];
   const rows = ids.length ? await db.queryAll(`/* customer_daily:handling_posts */
-    SELECT r.id, r.created_at AS first_seen_at, r.record_type, r.business_visibility, r.sentiment,
+    SELECT r.id, r.title, r.platform, r.url, r.canonical_url, r.created_at AS first_seen_at, r.record_type, r.business_visibility, r.sentiment,
+      COALESCE(rt.status, 'unhandled') AS status,
       ${recordEffectiveRelevanceSql('r')} AS relevance,
       EXISTS (SELECT 1 FROM record_watchlist w WHERE w.tenant_id=r.tenant_id AND w.record_id=r.id) AS watched,
       true AS admission_allowed
-    FROM records r
+    FROM records r LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id
     WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[]) AND r.created_at < $3::timestamptz
       AND ${POST_SQL} AND r.business_visibility = 'eligible' AND (${recordTriageAdmissionSql('r')})
       AND (${recordEffectiveRelevanceSql('r')} IS DISTINCT FROM 'irrelevant' OR EXISTS (
@@ -252,7 +252,7 @@ export async function collectCustomerDailyNegativeHandling({tenantId, period, db
   const records = rows.filter(row => customerPost(row) && row.admission_allowed !== false && ms(row.first_seen_at) < ms(period.cutoffAt));
   const coverage = auditCoverageFrom || (await db.queryOne(`/* customer_daily:audit_coverage */
     SELECT applied_at FROM schema_migrations WHERE version = $1`, ['081_customer_daily_reports.sql']))?.applied_at;
-  return buildCustomerDailyNegativeHandlingSummary(records, parsed.transitions, period, {coverageFrom: coverage, malformedEventIds: parsed.malformed});
+  return {...buildCustomerDailyNegativeHandlingSummary(records, parsed.transitions, period, {coverageFrom: coverage, malformedEventIds: parsed.malformed}), records, transitions: parsed.transitions, events};
 }
 
 export async function collectCustomerDailyReport({tenantId, date, now = new Date(), db, auditCoverageFrom = null, businessPeriod = null}) {
@@ -279,7 +279,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   const collectionSummary = buildCustomerDailyCollectionSummary(uniqueRows, period);
   const handling = await collectCustomerDailyNegativeHandling({tenantId, period, db, auditCoverageFrom});
   const summary = buildCustomerDailyMixedSummary(collectionSummary, handling.summary);
-  if (!handling.summary.coverageComplete) warn('handling_history_incomplete', `负面处理次数仅统计可核实的真实状态变更；本月历史记录覆盖不完整，不能视为完整次数。${handling.evidence.malformedEventIds.length ? `有${handling.evidence.malformedEventIds.length}条审计记录缺少有效变更信息。` : ''}`);
+  if (!handling.summary.coverageComplete) warn('handling_history_incomplete', `负面处理仅统计可核实的真实状态变更；本月历史记录覆盖不完整，不能视为完整数量。${handling.evidence.malformedEventIds.length ? `有${handling.evidence.malformedEventIds.length}条审计记录缺少有效变更信息。` : ''}`);
   const conflicts = uniqueRows.filter(row => NEGATIVE_STATES.has(status(row)) && row.sentiment !== 'negative' && status(row) !== 'reviewed_non_monitor');
   if (summary.mtd.unclassified) warn('unclassified', `本月截至报表日有${summary.mtd.unclassified}条SDB内容尚未完成情感识别（日新增${summary.day.unclassified}条），未自动归为中性。`, true);
   if (conflicts.length) warn('sentiment_status_conflict', `本月内容中${conflicts.length}条情感结论与负面处理状态不一致，按有效情感统计，需核对。`, true);
@@ -350,45 +350,24 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
       AND COALESCE(rt.status, 'unhandled') <> 'reviewed_non_monitor'`, [tenantId, heatStart, cutoffAt]);
   if (Number(missingPublished?.count) > 0) warn('published_time_missing', `近7天入库的负面帖子中${Number(missingPublished.count)}篇缺少发布时间，无法确认是否落在热度窗口。`);
 
-  const auditRows = await db.queryAll(`/* customer_daily:cold_events */
-    SELECT id, action, target_id, created_at,
-      jsonb_build_object('previousStatus', metadata->'previousStatus', 'nextStatus', metadata->'nextStatus',
-        'status', metadata->'status', 'recordIds', metadata->'recordIds', 'previous', metadata->'previous') AS metadata
-    FROM audit_logs
-    WHERE tenant_id = $1 AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
-      AND action IN ('record.triage_updated', 'record.triage_batch_updated')
-      AND (metadata->>'nextStatus' = 'negative_cold' OR metadata->>'status' = 'negative_cold')
-    ORDER BY created_at, id`, [tenantId, period.handlingStartAt || periodStart, cutoffAt]);
-  const {transitions, malformed} = parseCustomerDailyColdEvents(auditRows.filter(row => ms(row.created_at) >= ms(period.handlingStartAt || periodStart) && ms(row.created_at) < ms(cutoffAt)));
-  const ids = [...new Set(transitions.map(t => t.recordId))];
-  const coldRows = ids.length ? await db.queryAll(`/* customer_daily:cold_posts */
-    SELECT r.id, r.title, r.platform, r.url, r.canonical_url, r.record_type, r.sentiment,
-      r.created_at AS first_seen_at,
-      COALESCE(rt.status, 'unhandled') AS status
-    FROM records r LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
-    WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[]) AND ${CUSTOMER_POST_SQL}`, [tenantId, ids]) : [];
-  const coldById = new Map(coldRows.map(row => [row.id, row]));
-  const latestTransition = new Map();
-  for (const t of transitions) {
-    const old = latestTransition.get(t.recordId);
-    if (!old || ms(t.markedAt) >= ms(old.markedAt)) latestTransition.set(t.recordId, t);
-  }
-  const coldMarked = [...latestTransition.values()].filter(t => currentCold(coldById.get(t.recordId)))
-    .sort((a, b) => ms(a.markedAt) - ms(b.markedAt) || String(a.recordId).localeCompare(String(b.recordId)))
-    .map(t => {
-      const row = coldById.get(t.recordId);
-      const firstSeen = ms(row.first_seen_at);
-      // Historical is relative to this report's collection cohort, so weekend
-      // arrivals in a merged Monday report are still this period's new posts.
-      return {...post(row), markedAt: t.markedAt, eventId: t.eventId,
-        ...(Number.isFinite(firstSeen) ? {isHistorical:firstSeen < ms(collectionStart)} : {})};
-    });
-  const withdrawn = [...latestTransition.values()].filter(t => !currentCold(coldById.get(t.recordId))).map(t => t.recordId);
-  if (withdrawn.length) warn('cold_withdrawn_or_corrected', `${withdrawn.length}篇当日曾标冷处理的帖子已撤销、更正或不再属于有效负面范围，本版主清单不再列出。`);
+  const {transitions, records: handlingRecords, events: handlingEvents} = handling;
+  const preliminary = buildCustomerDailyHandlingLists(handlingRecords, transitions, handlingEvents, [], period);
+  const listPosts = Object.values(preliminary).flat();
+  const listIds = [...new Set(listPosts.map(row => row.recordId))];
+  const notes = listIds.length ? await db.queryAll(`/* customer_daily:handling_notes */
+    SELECT id, record_id, body, created_at FROM record_notes
+    WHERE tenant_id=$1 AND record_id=ANY($2::uuid[]) AND created_at >= $3::timestamptz AND created_at < $4::timestamptz
+    ORDER BY created_at, id`, [tenantId, listIds, period.handlingStartAt || periodStart, cutoffAt]) : [];
+  const {coldMarked, repliedMarked, commentMarked} = buildCustomerDailyHandlingLists(handlingRecords, transitions, handlingEvents, notes, period);
+  const malformed = handling.evidence.malformedEventIds;
+  const currentColdIds = new Set(coldMarked.map(row => row.recordId));
+  const withdrawn = [...new Set(transitions.filter(t => t.nextStatus === 'negative_cold'
+    && ms(t.handledAt) >= ms(period.handlingStartAt || periodStart) && !currentColdIds.has(t.recordId)).map(t => t.recordId))];
+  if (withdrawn.length) warn('cold_withdrawn_or_corrected', `${withdrawn.length}篇本期曾标冷处理的帖子已撤销、更正或不再属于有效负面范围，本版汇总和清单均按有效内容统计。`);
   const coverage = handling.summary.coverageFrom;
   const coverageComplete = Boolean(iso(coverage) && ms(coverage) <= ms(period.handlingStartAt || periodStart) && malformed.length === 0);
   if (!coverageComplete) warn('cold_history_incomplete', `${coldMarked.length ? '历史标记记录不完整，以下为可核实内容。' : '暂未检出，历史标记记录不完整。'}${malformed.length ? `有${malformed.length}条旧审计事件缺少变更前状态。` : ''}`);
-  const missingLinks = [...highHeat, ...coldMarked].filter(row => !row.url);
+  const missingLinks = [...highHeat, ...coldMarked, ...repliedMarked, ...commentMarked].filter(row => !row.url);
   if (missingLinks.length) warn('source_link_missing', `${new Set(missingLinks.map(row => row.recordId)).size}篇清单帖子缺少可用原帖链接，需补齐。`, true);
   const captureRows = await db.queryAll(`/* customer_daily:pending_capture */
     SELECT t.id, t.status, t.task_type, t.feature_key,
@@ -413,7 +392,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   const activeCaptures = captureRows.map(assessCustomerDailyCaptureReadiness).filter(Boolean);
   if (activeCaptures.length) warn('capture_not_settled', `报表日创建的${activeCaptures.length}个普通采集任务存在未完成、失败或同步缺口，监控数量仅包含已成功入库主帖。`, true);
   return {
-    schemaVersion: 5, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, warnings,
+    schemaVersion: 5, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, repliedMarked, commentMarked, handlingListsVersion: 1, warnings,
     evidence: {
       scope: '当前租户首次入库且进入客户内容分诊清单的主帖；排除系统过滤和判为无关的内容，保留客户主动关注的帖子；同帖复采不重复计数；SDB再扣除客户标记的非监控内容',
       firstSeenField: 'records.created_at', timeZone: 'Asia/Shanghai', reviewBasis: '本版生成时有效情感及人工处理状态',
@@ -422,7 +401,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
       handling: handling.evidence,
       heat: {candidateCount: heatCandidates.length, selected: heatEvidence, missingRecordIds: missingHeat, missingPublishedCount: Number(missingPublished?.count) || 0,
         updatedCount: highHeat.filter(row => !row.stale && row.quality === 'measured').length, staleCount, unverifiedCount: legacyHeat.length},
-      cold: {coverageFrom: iso(coverage), coverageComplete, transitions, malformedEventIds: malformed, withdrawnRecordIds: withdrawn},
+      cold: {coverageFrom: iso(coverage), coverageComplete, transitions: transitions.filter(t => t.nextStatus === 'negative_cold' && ms(t.handledAt) >= ms(period.handlingStartAt || periodStart)), malformedEventIds: malformed, withdrawnRecordIds: withdrawn},
       pendingCaptureTasks: activeCaptures,
     },
   };

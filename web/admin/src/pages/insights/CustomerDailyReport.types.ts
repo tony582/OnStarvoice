@@ -31,6 +31,8 @@ export type DailyPost = {
   isHistorical?: boolean
   stale?: boolean
   status?: string
+  replyContent?: string
+  supplementalNotes?: Array<{ id: string; body: string; createdAt: string }>
   feishuTableNo?: string | null
   quality?: 'measured' | 'measured_ingestion_time' | 'legacy_unverified' | 'measured_lower_bound'
   timeSource?: 'capture_timestamp' | 'ingested_at'
@@ -39,7 +41,7 @@ export type DailyPost = {
 export type DailySummary = {
   format?: 'daily_disposition_v2' | 'daily_handling_v3' | 'daily_collection_v4' | 'daily_collection_handling_v5'
   mtdBasis?: 'daily_sum' | 'distinct_records'
-  negativeDailyBasis?: 'status_transition_events'
+  negativeDailyBasis?: 'status_transition_events' | 'effective_handled_posts'
   negativeMtdBasis?: 'distinct_records_last_status'
   dayDate?: string
   rows?: Array<{ date: string; isWorkingDay: boolean; counts: DailyCounts }>
@@ -68,6 +70,9 @@ export type DailySnapshot = {
   summaryEdited?: boolean
   highHeat: DailyPost[]
   coldMarked: DailyPost[]
+  repliedMarked?: DailyPost[]
+  commentMarked?: DailyPost[]
+  handlingListsVersion?: number
   evidence?: { cold?: { coverageComplete?: boolean } }
   warnings: Array<{ code: string; message: string; blocking: boolean }>
 }
