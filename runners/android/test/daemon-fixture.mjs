@@ -11,8 +11,11 @@ export async function mockControlPlane(t, {onRequest} = {}) {
   const task = {identity, deviceId: 'SIMULATED_DEVICE', keyword: '别克壁纸',
     filters: {sort: 'latest', timeRange: 'day'}, deadlineAt: new Date(Date.now() + 60000).toISOString()};
   const state = {calls: [], completed: false, receipts: new Map(), task};
-  const lease = () => ({...identity, leaseId: 'lease-one', serverTime: new Date().toISOString(),
-    leaseUntil: new Date(Date.now() + 90000).toISOString()});
+  const lease = () => {
+    const serverTime = Date.now();
+    return {...identity, leaseId: 'lease-one', serverTime: new Date(serverTime).toISOString(),
+      leaseUntil: new Date(serverTime + 90000).toISOString()};
+  };
   const server = createServer(async (request, response) => {
     let raw = '';
     for await (const chunk of request) raw += chunk;

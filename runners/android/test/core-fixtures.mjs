@@ -13,8 +13,9 @@ export function fixtureClock() {
 }
 export function fixturePermit(task, clock, duration = 90_000) {
   const permit = new ExecutionPermit({ identity: task.identity, monotonicNow: clock.monotonicNow });
-  permit.grant({ ...task.identity, leaseId: 'lease-1', serverTime: new Date(clock.wallNow()).toISOString(),
-    leaseUntil: new Date(clock.wallNow() + duration).toISOString() }, { requestStartedAt: clock.monotonicNow() });
+  const serverTime = clock.wallNow();
+  permit.grant({ ...task.identity, leaseId: 'lease-1', serverTime: new Date(serverTime).toISOString(),
+    leaseUntil: new Date(serverTime + duration).toISOString() }, { requestStartedAt: clock.monotonicNow() });
   return permit;
 }
 export function fixtureDevice(task, overrides = {}) {

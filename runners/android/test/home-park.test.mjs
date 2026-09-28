@@ -206,8 +206,9 @@ test('daemon launches the original collection, parks with its same lease, and sa
     device, control: {}, delivery: {}});
   daemon.ready = true;
   try {
-    daemon.launch(task, {...task.identity, leaseId: 'lease-1', serverTime: new Date().toISOString(),
-      leaseUntil: new Date(Date.now() + 90000).toISOString()}, performance.now());
+    const serverTime = Date.now();
+    daemon.launch(task, {...task.identity, leaseId: 'lease-1', serverTime: new Date(serverTime).toISOString(),
+      leaseUntil: new Date(serverTime + 90000).toISOString()}, performance.now());
     await daemon.taskPromise;
     assert.deepEqual(calls.slice(-3), ['returnToResults', 'parkHome', 'close']);
     const completion = stateValue(store, 'daemon:completion');
