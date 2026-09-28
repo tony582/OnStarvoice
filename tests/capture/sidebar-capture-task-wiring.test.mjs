@@ -382,6 +382,8 @@ test("storage handoff from attempt A to B fences late A progress and cleanup", (
     targetedPostCancelRequested: false,
     batchUrlCancelRequested: false,
     activeBatchRunnerTabId: 77,
+    getUnattendedRunRequestIdFromUrl: () => "",
+    getRemoteManualKeywordBatchId: () => "",
     getTargetedPostRunRequestIdFromUrl: () => "request-1",
     getTargetedPostRunAttemptIdFromUrl: () => "attempt-a",
     stopTargetedPostRunnerForInvalidBinding: (reason) => {
@@ -553,7 +555,9 @@ test("server reconciliation gates only negative patrol runners", async () => {
     };
     const context = {
       getRemoteManualKeywordBatchId: () => "",
-      getTargetedPostRunRequestIdFromUrl: () => request.id,
+      getUnattendedRunRequestIdFromUrl: () => "",
+    getRemoteManualKeywordBatchId: () => "",
+    getTargetedPostRunRequestIdFromUrl: () => request.id,
       getTargetedPostRunAttemptIdFromUrl: () => request.attemptId,
       createTargetedPostInvocationToken: (requestId, attemptId) => ({
         requestId,
@@ -1209,6 +1213,8 @@ test("a normal side panel without a runner query renders shared targeted state a
   };
   const syntheticContext = {
     targetedPostRunState: sharedRequest,
+    getUnattendedRunRequestIdFromUrl: () => "",
+    getRemoteManualKeywordBatchId: () => "",
     getTargetedPostRunRequestIdFromUrl: () => "",
     cloudTargetedPostApi: {isTerminalRunStatus: () => false},
     debugSessionDismissedTargetedTerminalRunAt: "",
@@ -1243,6 +1249,8 @@ test("a normal side panel without a runner query renders shared targeted state a
             attemptId: request.attemptId,
           }
         : null,
+    getUnattendedRunRequestIdFromUrl: () => "",
+    getRemoteManualKeywordBatchId: () => "",
     getTargetedPostRunRequestIdFromUrl: () => "",
     getTargetedPostRunAttemptIdFromUrl: () => "",
     createTargetedPostInvocationToken: () => null,

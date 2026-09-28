@@ -111,6 +111,25 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
     async recoverResults({contextId,signal}) {requireContext(contextId); await flow.recoverResults({signal}); return {...context};},
     async scroll({contextId,signal}) {requireContext(contextId); const page=await flow.scroll({signal}); return {contextId,contextVerified:page.verified,end:page.end===true};},
     readSource: options => session.ui.read(options),
+    async parkHome({permit, timeoutMs = 15000}) {
+      permit.assertAllowed();
+      const prior = [...pending];
+      const remaining = Math.floor(permit.expiresAt - permit.monotonicNow());
+      // Existing close can spend 15 s draining and 15 s proving session closure. Never consume that lease budget.
+      const parkBudget = Math.min(timeoutMs, remaining - 31000);
+      if (parkBudget < 1) throw new DeviceError('home_park_lease_too_short', 'Keep the remaining lease for physical closure');
+      return bounded(async signal => {
+        await Promise.allSettled(prior);
+        const guard = () => { throwIfAborted(signal); permit.assertAllowed(); };
+        guard();
+        await foreground.ensure({signal, launch: false});
+        guard();
+        // Track the underlying navigation, not the timeout race: close must wait for the actual command to settle.
+        const navigation = session.parkHome({signal, beforeAction: guard});
+        pending.add(navigation);
+        try { return await navigation; } finally { pending.delete(navigation); }
+      }, {signal: permit.signal, timeoutMs: parkBudget});
+    },
     async close() {await bounded(()=>Promise.allSettled([...pending]),{timeoutMs:15000}); const result=await session.close(); if(result.closed) {flow=null;context=null;} return result;},
   };
   for (const name of ['inspect','search','readCards','openCard','copyLink','returnToResults','recoverResults','scroll','readSource']) {

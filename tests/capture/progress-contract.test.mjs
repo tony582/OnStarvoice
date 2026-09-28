@@ -62,6 +62,10 @@ function evaluateSyntheticSessionBuilder({dismissedTerminalRunAt = ""} = {}) {
   );
   const context = {
     keywordPlanState: null,
+    getRemoteManualKeywordBatchId: () => "",
+    getTargetedPostRunRequestIdFromUrl: () => "",
+    getUnattendedRunRequestIdFromUrl: () => "",
+    getUnattendedRunAttemptIdFromUrl: () => "",
     isKeywordPlanRunning: (plan = {}) =>
       ["started", "running", "recovering"].includes(
         String(plan?.lastRunStatus || ""),

@@ -3083,13 +3083,12 @@ function setupKeywordPlanStorageListener() {
 
 function handleUnattendedRunRequestStorageChange(request) {
   const requestId = getUnattendedRunRequestIdFromUrl();
-  if (!requestId || !request || request.id !== requestId) {
-    return;
-  }
+  if (!requestId || !request) return;
+  // The old document owns its URL identity even when a different request
+  // replaces the single request slot. Retire and flush that old identity.
+  if (maybeRetireSupersededUnattendedAttempt(request)) return;
+  if (request.id !== requestId) return;
   const requestAttemptId = String(request?.attemptId || "").trim();
-  if (maybeRetireSupersededUnattendedAttempt(request)) {
-    return;
-  }
   if (maybeRetireTerminatedUnattendedAttempt(request)) {
     return;
   }
@@ -3133,19 +3132,17 @@ function maybeRetireSupersededUnattendedAttempt(request) {
   const requestId = String(request?.id || "").trim();
   const requestAttemptId = String(request?.attemptId || "").trim();
   const ownAttemptId = resolveOwnUnattendedAttemptId();
+  const ownRequestId = String(
+    getUnattendedRunRequestIdFromUrl() || activeUnattendedRunRequestId || "",
+  ).trim();
   if (
-    !requestId ||
-    !requestAttemptId ||
-    !ownAttemptId ||
-    requestAttemptId === ownAttemptId ||
-    (activeUnattendedRunRequestId && activeUnattendedRunRequestId !== requestId)
-  ) {
-    return false;
-  }
+    !requestId || !requestAttemptId || !ownRequestId || !ownAttemptId ||
+    (requestId === ownRequestId && requestAttemptId === ownAttemptId)
+  ) return false;
   void retireSupersededUnattendedAttempt({
-    requestId,
+    requestId: ownRequestId,
     attemptId: ownAttemptId,
-    reason: "attempt_superseded",
+    reason: requestId === ownRequestId ? "attempt_superseded" : "request_superseded",
   }).catch((error) => {
     console.warn("[Sidebar] Retire superseded unattended attempt failed:", error);
   });
@@ -3212,6 +3209,21 @@ async function retireSupersededUnattendedAttempt({
   let flushed = true;
   let pendingUploads = 0;
   const sendReceipt = async (receipt) => {
+    let deliveredReceipt = receipt;
+    if (receipt.flushed === true) {
+      // Streaming drain does not prove the durable checkpoint outbox is empty.
+      const checkpointFlush = await flushPendingUnattendedCheckpointReports({quiet: true});
+      if (checkpointFlush?.ok !== true || Number(checkpointFlush?.retained || 0) !== 0) {
+        deliveredReceipt = {...receipt, flushed: false, flushing: true,
+          pendingUploads: Math.max(Number(receipt.pendingUploads) || 0,
+            Number(checkpointFlush?.retained) || 1)};
+        const retry = setTimeout(() => {
+          void sendReceipt(receipt).catch(error => console.warn(
+            "[Sidebar] Retired checkpoint flush remains pending:", error));
+        }, UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS);
+        retry?.unref?.();
+      }
+    }
     for (const delayMs of [0, 500, 2000]) {
       if (delayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -3221,7 +3233,7 @@ async function retireSupersededUnattendedAttempt({
           type: "onstarvoice:unattended-attempt-retired",
           reason,
           heartbeatStopped: true,
-          ...receipt,
+          ...deliveredReceipt,
         });
         if (response?.ok) return true;
       } catch (error) {
@@ -5003,6 +5015,11 @@ function buildUnattendedSyntheticDebugSession(
   runtime = {},
   plan = buildKeywordRunDisplayPlan(keywordPlanState),
 ) {
+  if (getRemoteManualKeywordBatchId() || getTargetedPostRunRequestIdFromUrl()) return null;
+  const ownRequestId = getUnattendedRunRequestIdFromUrl();
+  if (ownRequestId && (String(plan?.lastRunRequestId || "") !== ownRequestId ||
+      !getUnattendedRunAttemptIdFromUrl() ||
+      String(plan?.lastRunProgress?.unattendedAttemptId || "") !== getUnattendedRunAttemptIdFromUrl())) return null;
   const status = String(plan?.lastRunStatus || "").trim().toLowerCase();
   const running = isKeywordPlanRunning(plan);
   const terminal = KEYWORD_PLAN_TERMINAL_STATUSES.has(status);
@@ -5125,6 +5142,7 @@ function buildTargetedPostSyntheticDebugSession(
   runtime = {},
   request = targetedPostRunState,
 ) {
+  if (getUnattendedRunRequestIdFromUrl() || getRemoteManualKeywordBatchId()) return null;
   const queryRequestId = getTargetedPostRunRequestIdFromUrl();
   const sharedRequestId = String(request?.id || "").trim();
   const requestId = queryRequestId || sharedRequestId;
@@ -5133,7 +5151,9 @@ function buildTargetedPostSyntheticDebugSession(
     !request ||
     typeof request !== "object" ||
     !sharedRequestId ||
-    (queryRequestId && sharedRequestId !== queryRequestId)
+    (queryRequestId && (sharedRequestId !== queryRequestId ||
+      !getTargetedPostRunAttemptIdFromUrl() ||
+      String(request.attemptId || "") !== getTargetedPostRunAttemptIdFromUrl()))
   ) {
     return null;
   }
@@ -5368,11 +5388,30 @@ function resolveDisplayedUnattendedSessionBinding({
   };
 }
 
+function isCaptureSessionForCurrentRunner(session = {}) {
+  const taskId = String(session?.taskId || session?.runId || "").trim();
+  const manualId = getRemoteManualKeywordBatchId();
+  if (manualId) return taskId === manualId;
+  const unattendedId = getUnattendedRunRequestIdFromUrl();
+  if (unattendedId) {
+    const attemptId = getUnattendedRunAttemptIdFromUrl();
+    return taskId === `unattended-capture:${unattendedId}` && Boolean(attemptId) &&
+      String(session?.attemptId || "") === attemptId;
+  }
+  const targetedId = getTargetedPostRunRequestIdFromUrl();
+  if (targetedId) {
+    const attemptId = getTargetedPostRunAttemptIdFromUrl();
+    return Boolean(attemptId) && taskId === `${targetedId}::${attemptId}`;
+  }
+  return true;
+}
+
 function renderCaptureDebugSession(runtime = {}) {
   const panel = document.getElementById("debugSessionPanel");
   const dock = document.getElementById("debugSessionDock");
   if (!panel) return;
-  const nativeSession = runtime?.captureDebugSession;
+  const nativeSession = isCaptureSessionForCurrentRunner(runtime?.captureDebugSession)
+    ? runtime?.captureDebugSession : null;
   const nativeSessionTabId = Number(
     nativeSession?.sourceTabId ?? nativeSession?.tabId,
   );
@@ -8546,15 +8585,22 @@ async function runRemoteManualKeywordBatch() {
   const receipt = await chrome.runtime.sendMessage({type: "onstarvoice:claim-manual-keyword-batch", id});
   if (!receipt?.ok) {
     showMessage("这份手动采集指令已经领取或当前无法启动，请核对本地任务记录。", "warning");
+    await chrome.runtime.sendMessage({type: "onstarvoice:retire-idle-runner",
+      kind: "manual", requestId: id, reason: String(receipt?.reason || "claim_rejected"),
+    }).catch(() => null);
     return;
   }
   const {plan, title} = receipt.data;
   let executionLock = null;
+  let sourceTabId = null;
+  let retirementStatus = "needs_action";
+  let closureProof = {producerStopped: true, flushConfirmed: true, pendingUploads: 0};
   try {
     executionLock = await acquireCaptureExecutionLock({owner: "manual_search_capture", label: "手动批量关键词采集"});
     if (!executionLock) throw new Error("本地已有采集任务，请结束后重新手动启动");
     const switched = await chrome.runtime.sendMessage({type: "onstarvoice:switch-platform-tab", platform: plan.platform});
     if (!switched?.ok) throw new Error(switched?.error?.message || "打开采集平台失败");
+    sourceTabId = switched.data.tabId;
     const navigation = await navigateActiveTabToKeywordSearchForPlan({
       keyword: plan.keywords[0], platform: plan.platform, tabId: switched.data.tabId,
       baseSearchUrl: switched.data.url, maxAttempts: 1,
@@ -8583,9 +8629,16 @@ async function runRemoteManualKeywordBatch() {
     syncSearchFilterControlsForPlatform(plan.platform, {scope: "search", values: plan.searchFilters});
     persistCurrentBatchDraft();
     showMessage(`已设置手动批量采集：${plan.keywords.length} 个关键词`, "success");
+    sourceTabId = navigation.tabId;
+    closureProof = {producerStopped: false, flushConfirmed: false, pendingUploads: null};
     const result = await handleCaptureSearchData({manualTaskId: id, manualTaskTitle: title,
-      sourceTabId: navigation.tabId, executionLock});
-    if (!result?.started) throw new Error("手动采集未启动，请检查页面和授权状态");
+      sourceTabId, executionLock});
+    if (!result?.started) {
+      closureProof = {producerStopped: true, flushConfirmed: true, pendingUploads: 0};
+      throw new Error("手动采集未启动，请检查页面和授权状态");
+    }
+    retirementStatus = result.status;
+    closureProof = result.closureProof || closureProof;
   } catch (error) {
     await reportSidebarTaskRun({
       id, taskType: "capture", featureKey: "capture.search", title, platform: plan.platform,
@@ -8596,7 +8649,11 @@ async function runRemoteManualKeywordBatch() {
     showMessage(error.message, "error");
   } finally {
     if (executionLock) await releaseCaptureExecutionLock(executionLock.id);
-    await chrome.runtime.sendMessage({type: "onstarvoice:finish-manual-keyword-batch", id});
+    // A thrown pipeline has no proven flush. Keep its shell and durable receipt
+    // for reconciliation instead of converting an unknown outcome to success.
+    await chrome.runtime.sendMessage({type: "onstarvoice:finish-manual-keyword-batch", id,
+      sourceTabId, status: retirementStatus, closureProof,
+    });
   }
 }
 
@@ -9118,7 +9175,16 @@ async function handleCaptureSearchData(options = {}) {
       await releaseCaptureExecutionLock(executionLock.id);
     }
   }
-  return {started: true, status: taskStatus};
+  const pendingUploads = streamingSyncQueue?.enabled
+    ? Math.max(0, Number(streamingSyncResult?.unsettledCount ??
+      (Number(streamingSyncResult?.remainingCount || 0) + Number(streamingSyncResult?.failedCount || 0))))
+    : 0;
+  return {started: true, status: taskStatus, closureProof: {
+    producerStopped: true,
+    flushConfirmed: !streamingSyncQueue?.enabled ||
+      (streamingSyncResult?.drainCompleted === true && !streamingSyncResult?.blocked && pendingUploads === 0),
+    pendingUploads,
+  }};
 }
 
 function setKeywordStrategyTab(tab = "opportunity") {
@@ -17014,6 +17080,11 @@ function createTargetedPostInvocationError(
 }
 
 function handleTargetedPostRunRequestStorageChange(request) {
+  if (getUnattendedRunRequestIdFromUrl() || getRemoteManualKeywordBatchId()) {
+    targetedPostRunState = null;
+    renderCaptureDebugSession(getCurrentRuntime() || {});
+    return;
+  }
   const runnerRequestId = getTargetedPostRunRequestIdFromUrl();
   if (!runnerRequestId) {
     targetedPostRunState = request;
@@ -17198,6 +17269,10 @@ async function reconcileTargetedPostRunState(requestId = "", attemptId = "") {
 }
 
 async function loadTargetedPostRunStateForDisplay() {
+  if (getUnattendedRunRequestIdFromUrl() || getRemoteManualKeywordBatchId()) {
+    targetedPostRunState = null;
+    return null;
+  }
   try {
     const requestId = getTargetedPostRunRequestIdFromUrl();
     const attemptId = getTargetedPostRunAttemptIdFromUrl();
@@ -18518,6 +18593,7 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
   let claimedAttemptId = "";
   let claimedAdoptedLockId = "";
   let claimedRunAccepted = false;
+  let rejectedClaimCanRetire = false;
   let claimedExecutionCopy = getKeywordExecutionCopy();
   try {
     const response = await chrome.runtime.sendMessage({
@@ -18526,6 +18602,10 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
       attemptId: requestAttemptId,
       holderId: CAPTURE_EXECUTION_LOCK_HOLDER_ID,
     });
+    rejectedClaimCanRetire = response?.accepted === false && [
+      "not_found", "request_mismatch", "attempt_mismatch", "attempt_superseded",
+      "stale_attempt", "already_terminal", "terminal",
+    ].includes(String(response.reason || ""));
     if (
       response?.accepted === false &&
       response?.reason === "previous_capture_stop_unconfirmed"
@@ -18614,6 +18694,11 @@ async function maybeClaimAndRunUnattendedKeywordPlan({allowPending = false} = {}
     // a storage-backed flush-ready marker. Background may close only this
     // runner after seeing that marker; cloud-fenced runs additionally persist
     // proof, while local schedules stop after safe runner cleanup.
+    if (!claimedRunAccepted && rejectedClaimCanRetire && requestId && requestAttemptId) {
+      await retireSupersededUnattendedAttempt({
+        requestId, attemptId: requestAttemptId, reason: "claim_rejected",
+      }).catch(error => console.warn("[Sidebar] Unclaimed runner retirement remains pending:", error));
+    }
     if (claimedRunAccepted) {
       await finalizeUnattendedLocalClosureAfterFlush(
         claimedRequestId,

@@ -6,7 +6,9 @@
 
   // This is a delivery receipt, not a scheduler. Claim is persisted before the
   // manual entry point runs; reopening/reloading a page never starts it twice.
-  function createController({storage, tabs, getURL, isBusy, reportRun, now = () => new Date().toISOString()}) {
+  function createController({storage, tabs, getURL, isBusy, reportRun,
+    canCloseRunner = async () => false, scheduleCleanup = async () => {}, onCleaned = async () => {},
+    now = () => new Date().toISOString()}) {
     let tail = Promise.resolve();
     const serial = fn => {
       const result = tail.then(fn);
@@ -16,7 +18,11 @@
     const read = async () => (await storage.get(STORAGE_KEY))[STORAGE_KEY] || {};
     const write = async entries => {
       const keep = Object.values(entries).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      await storage.set({[STORAGE_KEY]: Object.fromEntries(keep.slice(0, 1000).map(item => [item.id, item]))});
+      // A bounded history must not discard an unfinished cleanup obligation.
+      const retained = keep.filter(item => item.cleanupPending || !terminal.has(item.status));
+      const history = keep.filter(item => !item.cleanupPending && terminal.has(item.status));
+      await storage.set({[STORAGE_KEY]: Object.fromEntries(
+        [...retained, ...history.slice(0, Math.max(0, 1000 - retained.length))].map(item => [item.id, item]))});
     };
     const report = async (entry, status, message, error = null) => reportRun({
       id: entry.id, taskType: 'capture', featureKey: 'capture.search',
@@ -26,16 +32,84 @@
       message, error,
       metadata: {executionMode: 'manual_batch', cloudCommandId: entry.commandId, remoteManual: true},
     });
-    const senderMatches = (entry, sender) => {
+    const matchesRunnerUrl = (entry, value) => {
       try {
-        const url = new URL(sender?.url || '');
-        return url.protocol === 'chrome-extension:' && url.host === new URL(getURL('sidebar/sidebar.html')).host &&
-          url.pathname === '/sidebar/sidebar.html' && url.searchParams.get(QUERY_KEY) === entry.id &&
-          sender?.tab?.id === entry.runnerTabId;
+        const url = new URL(value || '');
+        const expected = new URL(getURL('sidebar/sidebar.html'));
+        return url.protocol === expected.protocol && url.host === expected.host &&
+          url.pathname === expected.pathname && url.searchParams.get(QUERY_KEY) === entry.id &&
+          !url.searchParams.has('targetedPostRun') && !url.searchParams.has('unattendedRun');
       } catch { return false; }
+    };
+    const senderMatches = (entry, sender) => matchesRunnerUrl(entry, sender?.url) &&
+      sender?.tab?.id === entry.runnerTabId;
+    const sameOwner = (left, right) => left?.id === right?.id &&
+      left?.commandId === right?.commandId && left?.runnerTabId === right?.runnerTabId &&
+      String(left?.claimedDocumentId || '') === String(right?.claimedDocumentId || '') &&
+      String(left?.cleanupDocumentId || '') === String(right?.cleanupDocumentId || '');
+    const missingTab = error => /^(?:missing|No tab with id(?::\s*\d+)?\.?)$/iu.test(String(error?.message || error || ''));
+    const cleanupReady = entry => entry?.closureProof?.producerStopped === true &&
+      entry.closureProof.flushConfirmed === true &&
+      Number.isSafeInteger(entry.closureProof.pendingUploads) && entry.closureProof.pendingUploads === 0;
+    const reconcile = async () => {
+      let closedCount = 0;
+      const pending = Object.values(await read()).filter(entry => entry.cleanupPending === true);
+      for (const snapshot of pending) {
+        let entries = await read();
+        let entry = entries[snapshot.id];
+        if (!sameOwner(entry, snapshot) || !entry.cleanupPending || !terminal.has(entry.status)) continue;
+        const settle = async reason => {
+          entries = await read();
+          const latest = entries[snapshot.id];
+          if (!sameOwner(latest, snapshot) || !latest.cleanupPending) return;
+          entries[snapshot.id] = {...latest, cleanupPending: false, cleanupCompletedAt: now(), cleanupReason: reason};
+          await write(entries);
+        };
+        try {
+          let tab;
+          try { tab = await tabs.get(entry.runnerTabId); }
+          catch (error) { if (!missingTab(error)) throw error; await settle('runner_already_closed'); continue; }
+          if (!matchesRunnerUrl(entry, tab.url) || (tab.pendingUrl && !matchesRunnerUrl(entry, tab.pendingUrl))) {
+            await settle('runner_identity_changed');
+            continue;
+          }
+          // Neither a delivery receipt nor a sidebar's zero count is enough:
+          // background verifies the durable ledger and live task resources.
+          if (!cleanupReady(entry) || await canCloseRunner(entry, tab) !== true) continue;
+          await Promise.resolve().then(() => onCleaned(entry, tab)).catch(() => {});
+          entries = await read();
+          entry = entries[snapshot.id];
+          if (!sameOwner(entry, snapshot) || !entry.cleanupPending || !cleanupReady(entry)) continue;
+          tab = await tabs.get(entry.runnerTabId);
+          if (!matchesRunnerUrl(entry, tab.url) || (tab.pendingUrl && !matchesRunnerUrl(entry, tab.pendingUrl))) {
+            await settle('runner_identity_changed');
+            continue;
+          }
+          // Home restoration can await browser work. Recheck the document, lock
+          // and relay after it; a same-URL reload is a different runner owner.
+          if (await canCloseRunner(entry, tab) !== true) continue;
+          await tabs.remove(entry.runnerTabId);
+          // A resolved remove call is not a verified disappearance.
+          try { await tabs.get(entry.runnerTabId); throw new Error('manual runner remains open'); }
+          catch (error) { if (!missingTab(error)) throw error; }
+          await settle('runner_closed');
+          closedCount += 1;
+        } catch (error) {
+          entries = await read();
+          entry = entries[snapshot.id];
+          if (sameOwner(entry, snapshot) && entry.cleanupPending) {
+            entries[snapshot.id] = {...entry, cleanupLastError: String(error?.message || error).slice(0, 500)};
+            await write(entries);
+          }
+        }
+      }
+      const pendingCount = Object.values(await read()).filter(entry => entry.cleanupPending === true).length;
+      if (pendingCount > 0) await Promise.resolve().then(() => scheduleCleanup()).catch(() => {});
+      return {ok: pendingCount === 0, closedCount, pendingCount};
     };
     return {
       dispatch: command => serial(async () => {
+        await reconcile();
         const payload = command.payload || {};
         const id = String(payload.clientTaskId || command.client_task_id || '');
         const plan = payload.planSnapshot || {};
@@ -119,15 +193,50 @@
         await write(entries);
         return {ok: true, data: entry};
       }),
-      finish: (id, sender) => serial(async () => {
+      finish: (id, sender, evidence = {}) => serial(async () => {
         const entries = await read();
         const entry = entries[id];
-        if (!entry || !senderMatches(entry, sender)) return {ok: false};
-        // The normal manual pipeline owns the actual terminal ledger status.
-        entry.status = 'completed';
+        if (!entry || !senderMatches(entry, sender) ||
+            !entry.claimedDocumentId || entry.claimedDocumentId !== sender.documentId) return {ok: false};
+        // Record only delivery retirement. Never rewrite the pipeline's ledger,
+        // result, error or synchronization outcome while reclaiming its shell.
+        const reportedStatus = evidence.status === 'partial' ? 'completed_with_failures' : evidence.status;
+        entry.status = terminal.has(reportedStatus) ? reportedStatus
+          : terminal.has(entry.status) ? entry.status : 'needs_action';
+        const sourceTabId = Number(evidence.sourceTabId);
+        if (Number.isSafeInteger(sourceTabId) && sourceTabId > 0) entry.sourceTabId = sourceTabId;
+        entry.finishedAt = now();
+        entry.cleanupDocumentId = entry.claimedDocumentId;
+        entry.cleanupPending = true;
+        entry.closureProof = {
+          producerStopped: evidence.closureProof?.producerStopped === true,
+          flushConfirmed: evidence.closureProof?.flushConfirmed === true,
+          pendingUploads: Number.isSafeInteger(evidence.closureProof?.pendingUploads) &&
+              evidence.closureProof.pendingUploads >= 0 ? evidence.closureProof.pendingUploads : null,
+        };
         await write(entries);
-        return {ok: true};
+        const cleanup = await reconcile();
+        return {ok: true, cleanup};
       }),
+      requestCleanup: (id, sender, {reason = ''} = {}) => serial(async () => {
+        const entries = await read();
+        const entry = entries[id];
+        if (!entry || !senderMatches(entry, sender) || !terminal.has(entry.status)) {
+          return {ok: false, reason: 'manual_runner_not_retired'};
+        }
+        // A rejected, never-claimed document produced no capture data. A
+        // refreshed claimed runner cannot make that claim for its old document.
+        if (!entry.claimedDocumentId) {
+          if (!sender.documentId) return {ok: false, reason: 'manual_runner_document_unknown'};
+          entry.closureProof = {producerStopped: true, flushConfirmed: true, pendingUploads: 0};
+          entry.cleanupDocumentId = String(sender.documentId);
+        }
+        entry.cleanupPending = true;
+        entry.cleanupRequestedReason = String(reason).slice(0, 160);
+        await write(entries);
+        return {ok: true, cleanup: await reconcile()};
+      }),
+      reconcileCleanup: () => serial(reconcile),
       removed: tabId => serial(async () => {
         const entries = await read();
         for (const entry of Object.values(entries)) {

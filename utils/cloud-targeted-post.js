@@ -1295,7 +1295,10 @@
   }
 
   function usesOwnedPlatformTab(workflow) {
-    return [WORKFLOW, DISCOVERED_POST_WORKFLOW].includes(text(workflow, 80));
+    // All cloud workflows create a dedicated platform page. Keep their
+    // ownership in background before navigation so closing the runner shell
+    // cannot strand a profile/comment page before its finally block runs.
+    return isSupportedWorkflow(workflow);
   }
 
   function shouldPreservePlatformTab(request = {}) {

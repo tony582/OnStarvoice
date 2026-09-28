@@ -31,6 +31,8 @@ const controlStorageReserveSource = await readFile(
 const phase5RuntimeSources = await Promise.all(
   [
     "utils/manual-keyword-dispatch.js",
+    "utils/task-home-cleanup.js",
+    "utils/retired-runner-cleanup.js",
     "utils/runtime-tab-policy.js",
     "utils/capture/debug-session.js",
     "utils/capture/task-tab-group.js",
@@ -108,6 +110,7 @@ function createHarness() {
   const missingTabIds = new Set();
   let uuidCounter = 0;
   let contextMode = "alive";
+  let runtimeContextHandler = null;
   let tabMessageHandler = null;
   let tabCreateHandler = null;
   let tabGetHandler = null;
@@ -188,7 +191,8 @@ function createHarness() {
     onConnect: createEvent(),
     getManifest: () => ({version: "test"}),
     getURL: (path) => `chrome-extension://test/${path}`,
-    async getContexts({documentIds}) {
+    async getContexts({documentIds = []} = {}) {
+      if (runtimeContextHandler) return await runtimeContextHandler({documentIds});
       if (contextMode === "throw") {
         throw new Error("getContexts unavailable");
       }
@@ -197,7 +201,13 @@ function createHarness() {
       }
       return contextMode === "gone"
         ? []
-        : documentIds.map((documentId) => ({documentId}));
+        : documentIds.map((documentId) => {
+            const tab = createdTabs.find(candidate =>
+              candidate.documentId === documentId && !missingTabIds.has(candidate.id));
+            return {documentId, tabId: tab?.id ?? -1,
+              documentUrl: tab?.url || "chrome-extension://test/sidebar/sidebar.html",
+              contextType: tab ? "TAB" : "SIDE_PANEL"};
+          });
     },
   };
 
@@ -623,6 +633,9 @@ function createHarness() {
     },
     setContextMode(mode) {
       contextMode = mode;
+    },
+    setRuntimeContextHandler(handler) {
+      runtimeContextHandler = handler;
     },
     setReloadHook(handler) {
       reloadHook = handler;

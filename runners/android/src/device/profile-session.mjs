@@ -4,6 +4,7 @@ import {selectDevice} from './adb.mjs';
 import {assertProfileDevice} from './douyin-profile.mjs';
 import {createUiSession} from './ui-session.mjs';
 import {verifyLoginAndSearchEntry} from './douyin-readiness.mjs';
+import {parkDouyinHome} from './douyin-home.mjs';
 
 // Label the start-up step on any error that has none, so a failed start says where it stopped (PII-free).
 async function step(name, operation) {
@@ -56,6 +57,14 @@ export function createProfileSession({serial, profileId, adb, client, onState = 
       });
       const login = await step('login_check', () => verifyLoginAndSearchEntry(ui,options));
       return {...device,...login,deviceId:serial,unlocked:true,connected:true,readyForSearch:true};
+    },
+    async parkHome({signal, beforeAction}) {
+      throwIfAborted(signal); beforeAction();
+      if (creating || uncertain) throw new DeviceError('session_closure_required', 'Session ownership is not confirmed');
+      if (!sessionId || !ui) throw new DeviceError('no_active_session', 'There is no owned session to return home');
+      if (await client.isLocked(sessionId, {signal}) !== false) throw new DeviceError('device_locked', 'The phone must remain unlocked');
+      throwIfAborted(signal); beforeAction();
+      return parkDouyinHome({ui, signal, beforeAction});
     },
     close() {
       return bounded(async signal => {

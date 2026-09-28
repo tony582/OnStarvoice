@@ -26,6 +26,8 @@ try {
 
 importScripts(
   'utils/manual-keyword-dispatch.js',
+  'utils/task-home-cleanup.js',
+  'utils/retired-runner-cleanup.js',
   'utils/control-storage-reserve.js',
   'utils/social-account-usage.js',
   'utils/runtime-tab-policy.js',
@@ -3133,6 +3135,11 @@ function normalizeTargetedPostPlatformTab(value) {
     platform: String(value.platform || '').trim(),
     externalId: String(value.externalId || '').trim().slice(0, 500),
     url: String(value.url || '').trim(),
+    allowedTargets: (Array.isArray(value.allowedTargets) ? value.allowedTargets : [])
+      .slice(0, cloudTargetedPostApi.MAX_TARGETS)
+      .map(target => ({url: String(target?.url || '').trim(),
+        externalId: String(target?.externalId || '').trim(), platform: String(target?.platform || '').trim()}))
+      .filter(target => target.url),
     placeholderUrl: String(value.placeholderUrl || '').trim().slice(0, 1000),
     openedAt: String(value.openedAt || ''),
   };
@@ -3321,21 +3328,12 @@ function targetedPostPlatformCleanupOwnsUrl(url, record) {
   ) {
     return true;
   }
-  try {
-    const expected = cloudTargetedPostApi.canonicalizeTargetUrl(
-      normalized.url,
-      normalized.platform,
-      normalized.externalId,
-    );
-    cloudTargetedPostApi.canonicalizeTargetUrl(
-      candidateUrl,
-      normalized.platform,
-      normalized.externalId || expected.externalId,
-    );
-    return true;
-  } catch (_error) {
-    return false;
-  }
+  return targetedPostPlatformUrlBelongsToRequest(candidateUrl, {
+    platform: normalized.platform,
+    workflow: normalized.workflow,
+    targets: normalized.allowedTargets.length ? normalized.allowedTargets
+      : [{url: normalized.url, externalId: normalized.externalId}],
+  });
 }
 
 async function recoverTargetedPostPlatformTabCleanup({force = false} = {}) {
@@ -3438,17 +3436,28 @@ async function forgetRemovedTargetedPostPlatformTabCleanup(tabId) {
 }
 
 function targetedPostPlatformUrlBelongsToRequest(url, request) {
-  const platform = String(request?.platform || '').trim();
   for (const target of Array.isArray(request?.targets) ? request.targets : []) {
+    const platform = String(target?.platform || request?.platform || '').trim();
     try {
+      const expected = cloudTargetedPostApi.canonicalizeTargetUrl(
+        target.url, platform, String(target?.externalId || '').trim(),
+      );
       cloudTargetedPostApi.canonicalizeTargetUrl(
         url,
         platform,
-        String(target?.externalId || '').trim(),
+        expected.externalId,
       );
       return true;
     } catch (_error) {
       // Keep checking the remaining targets from this exact attempt.
+    }
+    if (['official_account_comment_patrol', 'followed_creator_post_patrol',
+      'official_account_post_discovery'].includes(request?.workflow)) {
+      try {
+        const expected = new URL(cloudTargetedPostApi.canonicalizeCreatorProfileUrl(target.url, platform).url);
+        const live = new URL(cloudTargetedPostApi.canonicalizeCreatorProfileUrl(url, platform).url);
+        if (live.origin === expected.origin && live.pathname.replace(/\/$/, '') === expected.pathname.replace(/\/$/, '')) return true;
+      } catch { /* An unrelated profile, origin or route is never task-owned. */ }
     }
   }
   return false;
@@ -3551,6 +3560,8 @@ async function openOwnedTargetedPostPlatformTab({
           platform: String(current.platform || target.platform || '').trim(),
           externalId: String(target.externalId || '').trim().slice(0, 500),
           url: targetUrl,
+          allowedTargets: current.targets.map(target => ({url: target.url,
+            externalId: target.externalId || '', platform: target.platform || current.platform})),
         };
         try {
           await runAuthoritativeControlStorageMutation(() =>
@@ -3592,6 +3603,8 @@ async function openOwnedTargetedPostPlatformTab({
     platform: String(current.platform || target.platform || '').trim(),
     externalId: String(target.externalId || '').trim().slice(0, 500),
     url: targetUrl,
+    allowedTargets: current.targets.map(target => ({url: target.url,
+      externalId: target.externalId || '', platform: target.platform || current.platform})),
     placeholderUrl,
     openedAt: new Date().toISOString(),
   };
@@ -3699,11 +3712,11 @@ async function closeTerminalTargetedPostPlatformTab(request) {
     };
   }
 
-  if (request.workflow === 'discovered_post_capture') {
+  if (cloudTargetedPostApi.usesOwnedPlatformTab(request.workflow)) {
     // Persist ownership before closing: the runner shell can disappear during
     // terminal reporting. A failed close is retried before another page opens.
     const durable = await persistTargetedPostPlatformTabCleanup(registration, {
-      reason: 'discovered_post_terminal_cleanup',
+      reason: 'targeted_post_terminal_cleanup',
     });
     if (!durable.ok) return {...durable, removedCount: 0};
     return await recoverTargetedPostPlatformTabCleanup({force: true});
@@ -4172,6 +4185,9 @@ async function stopTargetedPostAttemptResources(
       lockAfterRelease,
       request,
     );
+  }
+  if (executionLockSettled && platformCleanup?.ok && !cloudTargetedPostApi.shouldPreservePlatformTab(request)) {
+    await queueFinishedTaskHome(request).catch(error => console.warn('[Cleanup] platform home pending:', error));
   }
   const runnerCleanup = isSameTargetedPostAttempt(request, cleanupCurrent)
     ? await closeTerminalTargetedPostRunnerTabs(request)
@@ -6737,6 +6753,86 @@ async function settleTargetedPostRunWithoutRunner({
   };
 }
 
+const TASK_BROWSER_CLEANUP_ALARM = 'onstarvoice:task-browser-cleanup';
+async function scheduleTaskBrowserCleanup() {
+  // Independent of cloud credentials/connectivity; MV3 suspension must not
+  // cancel a persisted UI-cleanup obligation.
+  await chrome.alarms.create(TASK_BROWSER_CLEANUP_ALARM, {periodInMinutes: 1});
+}
+
+async function isTaskBrowserIdle() {
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.captureExecutionLock, STORAGE_KEYS.runtime,
+    STORAGE_KEYS.unattendedKeywordRunRequest, STORAGE_KEYS.targetedPostRunRequest,
+    globalThis.OnStarvoiceManualKeywordDispatch.STORAGE_KEY,
+  ]);
+  if (stored[STORAGE_KEYS.captureExecutionLock]) return false;
+  if (stored[STORAGE_KEYS.runtime]?.captureDebugSession) return false;
+  if (inFlightContentRelays.size || captureTaskCleanupInProgress.size) return false;
+  const unattended = stored[STORAGE_KEYS.unattendedKeywordRunRequest];
+  if (unattended && (!isTerminalUnattendedRunStatus(unattended.status) || unattended.status === 'needs_action')) return false;
+  const targeted = stored[STORAGE_KEYS.targetedPostRunRequest];
+  if (targeted && (!cloudTargetedPostApi.isTerminalRunStatus(targeted.status) || cloudTargetedPostApi.shouldPreservePlatformTab(targeted))) return false;
+  return !Object.values(stored[globalThis.OnStarvoiceManualKeywordDispatch.STORAGE_KEY] || {})
+    .some(entry => ['pending', 'claimed'].includes(entry.status));
+}
+
+const taskHomeCleanup = globalThis.OnStarvoiceTaskHomeCleanup?.createController({
+  storage: chrome.storage.local, tabs: chrome.tabs, canPark: isTaskBrowserIdle,
+});
+
+async function queueFinishedTaskHome(request, {runnerTab = null, sourceTabId = null} = {}) {
+  if (!taskHomeCleanup || !['completed', 'completed_with_warnings', 'completed_with_failures', 'failed', 'canceled', 'skipped'].includes(request?.status)) return;
+  const platform = request.platform || request.planSnapshot?.platform || request.plan?.platform;
+  if (platform === 'multi') {
+    for (const targetPlatform of new Set((request.targets || []).map(target => target.platform).filter(value => value && value !== 'multi'))) {
+      await queueFinishedTaskHome({...request, platform: targetPlatform}, {runnerTab, sourceTabId});
+    }
+    return;
+  }
+  if (!globalThis.OnStarvoiceTaskHomeCleanup.HOMES[platform]) return;
+  const runner = runnerTab || (request.runnerTabId
+    ? await chrome.tabs.get(request.runnerTabId).catch(() => null) : null);
+  const source = resolveCaptureTaskTabId(sourceTabId)
+    ? await chrome.tabs.get(sourceTabId).catch(() => null) : null;
+  const windowId = runner?.windowId || source?.windowId;
+  if (!windowId) return;
+  const keywords = request.planSnapshot?.keywords || request.plan?.keywords || [];
+  const sourceUrl = String(source?.pendingUrl || source?.url || '');
+  const ownedSearch = globalThis.OnStarvoiceTaskHomeCleanup.isPlanSearch(sourceUrl, platform, keywords);
+  await taskHomeCleanup.enqueue({
+    identity: `${request.id}:${request.attemptId || request.commandId || ''}`,
+    platform, windowId, runnerTabId: runner?.id,
+    sourceTabId: ownedSearch ? source.id : null,
+    expectedSourceUrl: ownedSearch ? sourceUrl : '', keywords,
+  });
+  await scheduleTaskBrowserCleanup();
+  // Serialize with acquiring a new execution lock, not with collection work.
+  await runCaptureExecutionLockOperation(() => taskHomeCleanup.reconcile());
+}
+
+async function canCloseManualKeywordRunner(entry, tab) {
+  const documentId = entry.claimedDocumentId || entry.cleanupDocumentId;
+  if (typeof chrome.runtime.getContexts !== 'function' || !documentId) return false;
+  const contexts = await chrome.runtime.getContexts({documentIds: [documentId]});
+  if (!contexts.some(context => context.documentId === documentId && context.tabId === tab.id && context.documentUrl === tab.url)) return false;
+  const stored = await chrome.storage.local.get([STORAGE_KEYS.taskLedger, STORAGE_KEYS.captureExecutionLock, STORAGE_KEYS.runtime]);
+  const run = (stored[STORAGE_KEYS.taskLedger]?.runs || []).find(run => run.id === entry.id);
+  if (!run || !['completed', 'completed_with_failures', 'failed', 'canceled', 'needs_action'].includes(run.status)) return false;
+  if (stored[STORAGE_KEYS.captureExecutionLock] || stored[STORAGE_KEYS.runtime]?.captureDebugSession) return false;
+  return ![...inFlightContentRelays.values()].some(relay =>
+    relay.senderDocumentId === documentId || relay.senderTabId === tab.id || relay.taskId === entry.id);
+}
+
+async function reconcileTaskBrowserCleanup() {
+  await scheduleTaskBrowserCleanup();
+  const retired = await reconcileRetiredUnattendedRunners().catch(error => ({error: String(error)}));
+  const manual = await manualKeywordDispatch.reconcileCleanup().catch(error => ({error: String(error)}));
+  const homes = taskHomeCleanup
+    ? await runCaptureExecutionLockOperation(() => taskHomeCleanup.reconcile()).catch(error => ({error: String(error)})) : [];
+  return {retired, manual, homes};
+}
+
 const manualKeywordDispatch = globalThis.OnStarvoiceManualKeywordDispatch.createController({
   storage: chrome.storage.local,
   tabs: chrome.tabs,
@@ -6747,6 +6843,9 @@ const manualKeywordDispatch = globalThis.OnStarvoiceManualKeywordDispatch.create
     return Boolean(current && !isTerminalUnattendedRunStatus(current.status));
   },
   reportRun: run => upsertTaskLedgerRun({run}),
+  canCloseRunner: canCloseManualKeywordRunner,
+  scheduleCleanup: scheduleTaskBrowserCleanup,
+  onCleaned: (entry, runnerTab) => queueFinishedTaskHome(entry, {runnerTab, sourceTabId: entry.sourceTabId}),
 });
 
 async function executeCloudTaskAgentCommand(command, token) {
@@ -7552,6 +7651,10 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
     await retryCurrentTerminalUnattendedLocalClosure().catch((error) => {
       console.warn('[CloudTaskAgent] local closure reconcile failed:', error);
       markDegraded('local_closure_reconcile_failed');
+    });
+    await reconcileTaskBrowserCleanup().catch(error => {
+      console.warn('[CloudTaskAgent] browser cleanup retry failed:', error);
+      markDegraded('browser_cleanup_failed');
     });
     await reconcileStrandedNegativePatrolCancellation().catch((error) => {
       console.warn('[CloudTaskAgent] negative patrol cancel reconcile failed:', error);
@@ -9228,6 +9331,8 @@ async function closeExactTerminalUnattendedRunnerAfterFlush(request) {
   if (initialOutbox.pendingCount !== 0) {
     return {closed: false, reason: 'checkpoint_reports_pending'};
   }
+  await queueFinishedTaskHome(normalized, {sourceTabId: normalized.progress?.runnerTabId})
+    .catch(error => console.warn('[Cleanup] unattended home pending:', error));
   const lifecycle = await runUnattendedRunnerTabLifecycle(async () => {
     const current = await readUnattendedKeywordRunRequest();
     if (
@@ -13660,6 +13765,8 @@ async function inspectUnattendedLocalClosurePredicate(
     let exactRunnerTabs = tabs.filter(isOwnedRunnerTab);
     if (closeOwnedRunnerTabs && exactRunnerTabs.length > 0) {
       try {
+        await queueFinishedTaskHome(current, {sourceTabId: current.progress?.runnerTabId})
+          .catch(error => console.warn('[Cleanup] unattended home pending:', error));
         for (const tab of exactRunnerTabs) {
           const tabId = Number(tab?.id);
           if (!Number.isFinite(tabId) || tabId <= 0) continue;
@@ -19915,7 +20022,7 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
   if (!requestId || !attemptId) {
     return {ok: false, reason: 'not_unattended_runner'};
   }
-  const pendingUploads = Number(message?.pendingUploads);
+  const pendingUploads = message?.pendingUploads;
   const receipt = {
     v: 1,
     requestId,
@@ -19953,52 +20060,56 @@ async function recordUnattendedAttemptRetired(message = {}, sender = {}) {
 // 是这个请求、这个轮次的 runner。与第 5 步同样在 runner 生命周期与锁队列里
 // 执行。尽力而为。
 async function closeRetiredUnattendedRunnerAfterReceipt(receipt) {
-  if (!isUnattendedRetirementFlushed(receipt)) {
+  const policy = globalThis.OnStarvoiceRetiredRunnerCleanup;
+  if (!policy) return {closed: false, reason: 'cleanup_policy_unavailable'};
+  if (!policy.isFinalReceipt(receipt)) {
     return {closed: false, reason: 'receipt_not_final'};
   }
   const tabId = resolveCaptureTaskTabId(receipt.tabId);
   const documentId = String(receipt.documentId || '').trim();
-  if (!tabId || !documentId) return {closed: false, reason: 'receipt_incomplete'};
   return await runUnattendedRunnerTabLifecycle(() =>
     runCaptureExecutionLockOperation(async () => {
-      const stored = await chrome.storage.local.get(
-        STORAGE_KEYS.captureExecutionLock,
-      );
-      const lock = normalizeCaptureExecutionLock(
-        stored?.[STORAGE_KEYS.captureExecutionLock],
-        {allowExpired: true},
-      );
-      if (lock && String(lock.holderDocumentId || '').trim() === documentId) {
-        return {closed: false, reason: 'lock_holder'};
-      }
-      const slot = await readUnattendedKeywordRunRequest();
-      if (
-        slot &&
-        slot.id === receipt.requestId &&
-        slot.attemptId === receipt.attemptId &&
-        !isTerminalUnattendedRunStatus(slot.status)
-      ) {
-        return {closed: false, reason: 'attempt_current'};
-      }
-      let tab;
+      const inspect = async () => {
+        const latestReceipt = await readUnattendedAttemptRetiredReceipt(
+          receipt.requestId, receipt.attemptId,
+        );
+        const stored = await chrome.storage.local.get(STORAGE_KEYS.captureExecutionLock);
+        const rawLock = stored?.[STORAGE_KEYS.captureExecutionLock];
+        const lock = normalizeCaptureExecutionLock(rawLock, {allowExpired: true});
+        const slot = await readUnattendedKeywordRunRequest();
+        const outbox = await inspectUnattendedCheckpointOutboxAttempt(
+          receipt.requestId, receipt.attemptId,
+        );
+        const tab = await chrome.tabs.get(tabId);
+        const contexts = typeof chrome.runtime.getContexts === 'function'
+          ? await chrome.runtime.getContexts({documentIds: [documentId]})
+          : null;
+        return policy.inspectCandidate({
+          receipt, latestReceipt, tab, contexts, slot, lock, outbox,
+          terminal: Boolean(slot && isTerminalUnattendedRunStatus(slot.status)),
+          lockKnown: !rawLock || Boolean(lock),
+          relays: listRequestRelays(
+            receipt.requestId, buildUnattendedCaptureTaskId(receipt.requestId),
+          ),
+          runnerMatches: isUnattendedRunnerTabForRequest(
+            tab, receipt.requestId, receipt.attemptId,
+          ),
+        });
+      };
       try {
-        tab = await chrome.tabs.get(tabId);
-      } catch {
-        return {closed: false, reason: 'tab_missing'};
-      }
-      if (
-        !isUnattendedRunnerTabForRequest(
-          tab,
-          receipt.requestId,
-          receipt.attemptId,
-        )
-      ) {
-        return {closed: false, reason: 'not_runner'};
-      }
-      try {
+        // A persisted receipt can outlive navigation in the same numeric tab.
+        // Re-read the exact document, pending writes and ownership immediately
+        // before removal; neither task age nor a terminal ledger is proof.
+        for (let pass = 0; pass < 2; pass += 1) {
+          const verdict = await inspect();
+          if (!verdict.closable) return {closed: false, reason: verdict.reason};
+        }
         await chrome.tabs.remove(tabId);
-      } catch {
-        // 以 tabs.get 的结果为准。
+      } catch (error) {
+        if (isStopFenceMissingTabError(error)) {
+          return {closed: true, reason: 'retired_runner_already_gone'};
+        }
+        return {closed: false, reason: 'runner_cleanup_unconfirmed'};
       }
       const gone = await waitForTabToBeGone(
         tabId,
@@ -20012,7 +20123,7 @@ async function closeRetiredUnattendedRunnerAfterReceipt(receipt) {
 
 function isUnattendedRetirementFlushed(receipt) {
   return receipt?.heartbeatStopped === true && receipt.flushed === true &&
-    receipt.flushing !== true && Number(receipt.pendingUploads) === 0;
+    receipt.flushing !== true && receipt.pendingUploads === 0;
 }
 
 async function readUnattendedAttemptRetiredReceipt(requestId, attemptId) {
@@ -20032,6 +20143,48 @@ async function readUnattendedAttemptRetiredReceipt(requestId, attemptId) {
       : null;
   } catch {
     return null;
+  }
+}
+
+let retiredUnattendedRunnerReconcilePromise = null;
+
+async function reconcileRetiredUnattendedRunners() {
+  if (retiredUnattendedRunnerReconcilePromise) {
+    return await retiredUnattendedRunnerReconcilePromise;
+  }
+  const reconcile = async () => {
+    const policy = globalThis.OnStarvoiceRetiredRunnerCleanup;
+    if (!policy) return {ok: false, reason: 'cleanup_policy_unavailable'};
+    let stored;
+    try {
+      const area = getExtensionSessionArea();
+      stored = area
+        ? await area.get(null)
+        : Object.fromEntries(extensionSessionValueFallback);
+    } catch {
+      return {ok: false, reason: 'retirement_receipts_unavailable'};
+    }
+    const receipts = policy.selectReceipts(stored, UNATTENDED_ATTEMPT_RETIRED_SESSION_PREFIX);
+    const results = [];
+    for (const receipt of receipts) {
+      const result = await closeRetiredUnattendedRunnerAfterReceipt(receipt).catch(() => ({
+        closed: false, reason: 'runner_cleanup_unconfirmed',
+      }));
+      results.push({tabId: receipt.tabId, ...result});
+    }
+    return {
+      ok: true,
+      checked: receipts.length,
+      closed: results.filter((result) => result.closed).length,
+      preserved: results.filter((result) => !result.closed).length,
+      results,
+    };
+  };
+  retiredUnattendedRunnerReconcilePromise = reconcile();
+  try {
+    return await retiredUnattendedRunnerReconcilePromise;
+  } finally {
+    retiredUnattendedRunnerReconcilePromise = null;
   }
 }
 
@@ -23437,6 +23590,7 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
     .then(() => recoverTargetedPostPlatformTabCleanup({force: true}))
     .then(() => reconcileStrandedNegativePatrolCancellation())
     .then(() => recoverNegativePatrolTerminalOutboxCleanup())
+    .then(() => reconcileTaskBrowserCleanup())
     .catch((error) => {
       console.error('[onstarvoice] failed to initialize runtime on install', error);
     });
@@ -23462,6 +23616,7 @@ chrome.runtime.onStartup.addListener(() => {
     .then(() => recoverTargetedPostPlatformTabCleanup({force: true}))
     .then(() => reconcileStrandedNegativePatrolCancellation())
     .then(() => recoverNegativePatrolTerminalOutboxCleanup())
+    .then(() => reconcileTaskBrowserCleanup())
     .catch((error) => {
       console.error('[onstarvoice] failed to initialize runtime on startup', error);
     });
@@ -23484,6 +23639,10 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm?.name === TASK_BROWSER_CLEANUP_ALARM) {
+    reconcileTaskBrowserCleanup().catch(error => console.warn('[Cleanup] browser retry failed:', error));
+    return;
+  }
   if (alarm?.name === TARGETED_POST_PLATFORM_TAB_CLEANUP_ALARM_NAME) {
     recoverTargetedPostPlatformTabCleanup({force: true}).catch((error) => {
       console.error('[onstarvoice] targeted platform tab cleanup retry failed', error);
@@ -23631,6 +23790,7 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
     console.warn('[OwnedTabs] removal cleanup failed', error);
   });
   void manualKeywordDispatch.removed(tabId).catch(error => console.warn('[Manual batch] close receipt failed', error));
+  void taskHomeCleanup?.forgetTab(tabId).catch(error => console.warn('[Cleanup] home source invalidation failed:', error));
   settleTargetedPostRunWithoutRunner({
     // A closing window may be a browser shutdown that session restore undoes;
     // that case waits for the periodic check and its grace.
@@ -23831,7 +23991,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
       if (type === 'onstarvoice:finish-manual-keyword-batch') {
-        sendResponse(await manualKeywordDispatch.finish(String(message.id || ''), sender));
+        sendResponse(await manualKeywordDispatch.finish(String(message.id || ''), sender, message));
+        return;
+      }
+      if (type === 'onstarvoice:retire-idle-runner' && message.kind === 'manual') {
+        sendResponse(await manualKeywordDispatch.requestCleanup(String(message.requestId || ''), sender, {reason: message.reason}));
         return;
       }
 

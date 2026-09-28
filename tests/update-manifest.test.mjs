@@ -106,16 +106,13 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[1]?.version, '0.4.18');
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[2]?.version, '0.4.17');
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[3]?.version, '0.4.15');
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[4]?.version, '0.4.14');
+  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 6).map(release => release.version),
+    ['0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);
   // 0.4.18: a targeted run whose runner page is gone is settled by the background, never left pending.
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releases[0]?.version, '0.4.19');
-  assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases[0]?.releaseNotes),
+  assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.19')?.releaseNotes),
     /自动核对[\s\S]*用户自行打开[\s\S]*待上传结果[\s\S]*未同步结果[\s\S]*自动结清/u);
   assert.match(
     JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.18')?.releaseNotes),
@@ -125,6 +122,29 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     /扩展 v0\.4\.18<span class="date">2026-09-26<\/span>[\s\S]*定向作品任务的运行页关闭后不再卡住[\s\S]*扩展 v0\.4\.17</u,
   );
+});
+
+test('0.4.20 announces safe cleanup and the separate Android Runner upgrade without raising the minimum version', async () => {
+  assert.equal(manifest.version, '0.4.20');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.releaseDate, '2026-09-28');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
+    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.20-20260928.zip');
+  const latest = EXTENSION_UPDATE_MANIFEST.releases[0];
+  assert.equal(latest?.releaseDate, EXTENSION_UPDATE_MANIFEST.releaseDate);
+  const notes = JSON.stringify(latest?.releaseNotes);
+  for (const description of [
+    /完成、普通失败或取消[\s\S]*清理失败自动重试[\s\S]*不重新执行任务/u,
+    /真实状态和错误原因[\s\S]*恢复平台主页[\s\S]*用户自行打开或已切走/u,
+    /待上传结果与登录现场[\s\S]*需要登录或安全验证[\s\S]*不强制关页/u,
+    /手机任务[\s\S]*人工停止、接管、USB 失联[\s\S]*不强制导航[\s\S]*Android Runner 至 0\.2\.6[\s\S]*仅更新 Extension 不会启用/u,
+  ]) assert.match(notes, description);
+  const latestAbout = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.20<'), aboutHtml.indexOf('扩展 v0.4.19<'));
+  assert.match(latestAbout, /清理失败自动重试[\s\S]*保留待上传结果与登录现场[\s\S]*Android Runner 至 0\.2\.6/u);
+  const runnerManifest = JSON.parse(await readFile(new URL('../runners/android/package.json', import.meta.url), 'utf8'));
+  const runnerSetup = await readFile(new URL('../runners/android/src/daemon/setup.mjs', import.meta.url), 'utf8');
+  assert.equal(runnerManifest.version, '0.2.6');
+  assert.match(runnerSetup, new RegExp(`appVersion: '${runnerManifest.version.replaceAll('.', '\\.')}'`, 'u'));
 });
 
 test('extension update endpoint returns the shape consumed by the sidebar', () => {

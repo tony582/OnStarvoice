@@ -24,6 +24,8 @@ const supportSources = await Promise.all(
     "utils/control-storage-reserve.js",
     "utils/manual-keyword-dispatch.js",
     "utils/runtime-tab-policy.js",
+    "utils/retired-runner-cleanup.js",
+    "utils/task-home-cleanup.js",
     "utils/capture/debug-session.js",
     "utils/capture/task-tab-group.js",
     "utils/capture/task-runtime.js",
@@ -181,6 +183,7 @@ function createHarness({state = null} = {}) {
 
   const session = {
     async get(key) {
+      if (key === null || key === undefined) return {...sessionStore};
       return Object.hasOwn(sessionStore, key) ? {[key]: sessionStore[key]} : {};
     },
     async set(values) {
@@ -209,7 +212,13 @@ function createHarness({state = null} = {}) {
       async getContexts({documentIds = []} = {}) {
         return documentIds
           .filter((documentId) => !deadDocuments.has(documentId))
-          .map((documentId) => ({documentId}));
+          .map((documentId) => {
+            const tabId = [...tabDocuments].find(([, value]) => value === documentId)?.[0];
+            const tab = tabs.get(tabId);
+            return {documentId, tabId: tab?.id ?? -1,
+              documentUrl: tab?.url || `${EXTENSION_ORIGIN}/sidebar/sidebar.html`,
+              contextType: tab ? "TAB" : "SIDE_PANEL"};
+          });
       },
     },
     storage: {local: localStorage, session},

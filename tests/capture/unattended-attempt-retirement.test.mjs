@@ -53,6 +53,7 @@ function createRunner({
     },
     getUnattendedRunRequestIdFromUrl: () => urlRequestId,
     getUnattendedRunAttemptIdFromUrl: () => urlAttemptId,
+    flushPendingUnattendedCheckpointReports: async () => ({ok: true, retained: 0}),
     isExplicitUserUnattendedCancellationMessage: () => true,
     setCancelFlag: (value) => calls.cancelFlags.push(value),
     stopRejectedUnattendedAttempt: (reason) => calls.rejected.push(reason),
@@ -162,15 +163,13 @@ test("a stuck upload queue is bounded and the receipt reports what was left", as
   assert.equal(receipt.pendingUploads, 4);
 });
 
-test("the same attempt, another request or a legacy runner without an attempt does not retire", async () => {
+test("the same attempt or a legacy runner without an attempt does not retire", async () => {
   const same = createRunner();
   same.context.__handle({id: "request-r", attemptId: "attempt-1", status: "running"});
-  const other = createRunner();
-  other.context.__handle({id: "request-other", attemptId: "attempt-9", status: "running"});
   const legacy = createRunner({urlAttemptId: "", activeAttemptId: ""});
   legacy.context.__handle({id: "request-r", attemptId: "attempt-2", status: "recovering"});
   await settle();
-  for (const runner of [same, other, legacy]) {
+  for (const runner of [same, legacy]) {
     assert.deepEqual(runner.calls.messages, []);
     assert.deepEqual(runner.calls.cancelFlags, []);
     assert.equal(runner.context.activeCaptureExecutionLockId, "lock-r");
@@ -206,7 +205,6 @@ test("a terminal status without the supervisor's retire request (or for another 
     {id: "request-r", attemptId: "attempt-1", status: "completed", runnerRetireAttemptId: "attempt-1"},
     {id: "request-r", attemptId: "attempt-1", status: "running", runnerRetireAttemptId: "attempt-1"},
     {id: "request-r", attemptId: "attempt-1", status: "failed", runnerRetireAttemptId: "attempt-0"},
-    {id: "request-other", attemptId: "attempt-1", status: "failed", runnerRetireAttemptId: "attempt-1"},
   ];
   for (const request of cases) {
     const runner = createRunner();
@@ -292,4 +290,35 @@ test("retirement preserves pending uploads, retries a network failure and report
   assert.equal(queue.getStats().unsettledCount, 0);
   assert.deepEqual(calls.map(c => c.id), ['a', 'b', 'late', 'a']);
   assert.ok(calls.every(c => c.task === 'request-r' && c.stopped === false));
+});
+
+
+test("a different request retires and flushes the old URL identity without canceling the successor", async () => {
+  const runner = createRunner({queue: createQueue({remainingBefore: 2})});
+  runner.context.__handle({id: "request-next", attemptId: "attempt-next", status: "running"});
+  await settle();
+  assert.deepEqual(runner.calls.rejected, ["request_superseded"]);
+  assert.equal(runner.context.retiredUnattendedAttemptKey, "request-r:attempt-1");
+  assert.equal(runner.calls.messages.at(-1).flushed, true);
+  assert.equal(runner.calls.messages.at(-1).pendingUploads, 0);
+  assert.ok(runner.calls.messages.every(message => message.type === "onstarvoice:unattended-attempt-retired"));
+  runner.context.__handle({id: "request-next", attemptId: "attempt-next", status: "running"});
+  await settle();
+  assert.equal(runner.calls.heartbeatStops, 1);
+});
+
+test("retirement cannot claim a flush while durable checkpoint reports remain", async () => {
+  const runner = createRunner({flushMs: 10});
+  let retained = 1;
+  runner.context.flushPendingUnattendedCheckpointReports = async () => ({ok: retained === 0, retained});
+  runner.context.__handle({id: "request-next", attemptId: "attempt-next", status: "running"});
+  await settle();
+  assert.equal(runner.calls.messages.at(-1).flushed, false);
+  assert.equal(runner.calls.messages.at(-1).pendingUploads, 1);
+  retained = 0;
+  for (let i = 0; i < 30 && !runner.calls.messages.at(-1).flushed; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(runner.calls.messages.at(-1).flushed, true);
+  assert.equal(runner.calls.messages.at(-1).pendingUploads, 0);
 });

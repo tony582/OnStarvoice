@@ -3,12 +3,25 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.19',
+  latestVersion: '0.4.20',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-27',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.19-20260927.zip',
+  releaseDate: '2026-09-28',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.20-20260928.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.20',
+      releaseDate: '2026-09-28',
+      releaseNotes: [{
+        tag: '修复',
+        notes: [
+          {title: '任务结束后安全回收运行页', desc: '远程手动关键词、无人值守及定向巡查、作品补采任务，在完成、普通失败或取消后，确认已停止且数据安全收尾，再回收任务自己的运行页和工作页。清理失败自动重试，不重新执行任务；已采结果、真实状态和错误原因仍保留在任务记录中。需更新 Extension。'},
+          {title: '空闲后恢复平台主页', desc: '浏览器空闲后复用或恢复抖音、小红书主页，避免每轮重复添加主页；用户自行打开或已切走的页面保留。旧运行页只显示自己的任务，不再显示后续巡查任务的状态。'},
+          {title: '待上传结果与登录现场继续保护', desc: '有待上传结果、采集尚未停止、需要登录或安全验证时继续保留保护；无法确认页面归属时不强制关页。符合安全条件后继续清理，不用删除任务结果来整理浏览器。'},
+          {title: '手机任务结束后尝试回到抖音主页', desc: '现有安卓抖音关键词发现任务在安全结束后尝试回到应用主页，并核验是否到达。人工停止、接管、USB 失联、登录或安全验证时不强制导航。手机端需单独升级 Android Runner 至 0.2.6，仅更新 Extension 不会启用此项；本次不新增手机小红书或独立手机负面巡查能力。'},
+        ],
+      }],
+    },
     {
       version: '0.4.19',
       releaseDate: '2026-09-27',

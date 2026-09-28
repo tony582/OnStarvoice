@@ -90,8 +90,15 @@ export class AndroidDaemon {
       status, reason: result.reason, deviceIdle: result.deviceIdle === true,
       checkpoint: {stats: result.stats ?? null, lastEventId: result.lastEventId ?? null,
         originalStatus: result.status, pendingEvents: this.store.pendingCount(),
+        ...(result.homePark ? {homePark: result.homePark} : {}),
         ...(result.details && Object.keys(result.details).length ? {failure: result.details} : {})}};
-    setCheckpoint(this.store, 'daemon:completion', body); // Persist before touching the network.
+    // Home diagnostics are optional; preserve the original completion if the additional field exceeds storage limits.
+    try { setCheckpoint(this.store, 'daemon:completion', body); }
+    catch (error) {
+      if (!body.checkpoint.homePark) throw error;
+      delete body.checkpoint.homePark;
+      setCheckpoint(this.store, 'daemon:completion', body); // A real persistence failure still blocks delivery.
+    }
     setCheckpoint(this.store, 'daemon:last-task', active);
     setCheckpoint(this.store, 'daemon:active', null);
     if (!body.deviceIdle) this.blocked = 'device_closure_required';
@@ -123,7 +130,7 @@ export class AndroidDaemon {
     this.taskPromise = runDiscoveryTask({task, store: this.store, device: this.device, permit, clock,
       actionTimeoutMs: this.actionTimeoutMs, resumeAuthorized: task.resumeAuthorized === true,
       deviceClosureVerified: closureProofFor(this.store, this.config.deviceId)})
-      .then(result => settleDevice({device:this.device,store:this.store,task,result,clock}))
+      .then(result => settleDevice({device:this.device,store:this.store,task,result,clock,permit}))
       .then(result => {
         if (result.status.startsWith('completed')) {
           try { permit.assertAllowed(); }

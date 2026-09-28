@@ -144,7 +144,7 @@ function runnerHarness(overrides = {}) {
     setSearchExecutionMode:mode=>calls.push(['mode',mode]),
     syncSearchFilterControlsForPlatform:(platform,values)=>calls.push(['filters',platform,values]),
     persistCurrentBatchDraft:()=>{}, showMessage:()=>{}, reportSidebarTaskRun:async run=>calls.push(['error',run]),
-    handleCaptureSearchData:async options=>{calls.push(['capture',options]);return {started:true,status:'completed'};},
+    handleCaptureSearchData:async options=>{calls.push(['capture',options]);return {started:true,status:'completed',closureProof:{producerStopped:true,flushConfirmed:true,pendingUploads:0}};},
     ...overrides,
   });
   const start=sidebar.indexOf('async function runRemoteManualKeywordBatch()');
