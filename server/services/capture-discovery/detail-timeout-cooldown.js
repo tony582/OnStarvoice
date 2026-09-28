@@ -82,4 +82,3 @@ export async function readDiscoveryDetailTimeoutCooldownMs(tx, {tenantId, agentI
     await tx.execute('RELEASE SAVEPOINT discovery_detail_timeout_cooldown');
   }
 }
-
