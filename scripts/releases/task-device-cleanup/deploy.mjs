@@ -149,6 +149,9 @@ async function assertHttpFiles(zip, zipSha, aboutSha) {
     if (hash(curl(origin + '/changelog')) !== aboutSha) throw new Error('HTTP changelog differs: ' + origin);
     for (const guard of manifest.guards.filter(file => file.path.startsWith('web/admin/dist/'))) {
       const relative = guard.path.slice('web/admin/dist/'.length);
+      // Express static does not serve dotfiles. Keep every file in the disk
+      // inventory/SHA guards, but do not request macOS metadata over HTTP.
+      if (relative.split('/').some(segment => segment.startsWith('.'))) continue;
       const url = relative === 'index.html' ? '/admin/' : '/admin/' + relative;
       if (hash(curl(origin + url)) !== guard.sha) throw new Error('HTTP Admin file changed: ' + guard.path);
     }
@@ -172,7 +175,7 @@ async function restartAndWait() {
   }
   throw last || new Error('Readiness timeout');
 }
-async function checkBase() {
+async function checkBase({verifyHttp = false} = {}) {
   for (const file of manifest.files) await assertHash(safePath(file.path), file.oldSha);
   await checkGuards();
   await assertManifest('0.4.19', manifest.previousZip);
@@ -181,6 +184,11 @@ async function checkBase() {
   const info = pm2Info();
   if (info.nodeVersion !== '18.20.8' || info.execPath !== '/opt/onstarvoice/server/index.js') throw new Error('Production runtime changed');
   await health();
+  if (verifyHttp) {
+    const previousZipGuard = manifest.guards.find(file => file.path === 'public-downloads/' + manifest.previousZip);
+    await assertHttpFiles(manifest.previousZip, previousZipGuard.sha,
+      manifest.files.find(file => file.path === metadataPaths[1]).oldSha);
+  }
   return info;
 }
 async function checkStage() {
@@ -213,7 +221,7 @@ async function atomicCopy(source, target) {
 }
 const receipt = (name, data) => fs.writeFile(path.join(stage, name), JSON.stringify(data, null, 2) + '\n');
 await checkStage();
-await checkBase();
+await checkBase({verifyHttp: true});
 if (checkOnly) {
   console.log('PASS: exact CI SHA, four-file scope, 88f5c10 baseline, unchanged Admin, Node 18.20.8, update 0.4.19');
   process.exit(0);
@@ -241,10 +249,9 @@ async function rollback(error) {
   try { await restartAndWait(); } catch (failure) { failures.push(failure.message); }
   let runtime;
   try {
-    runtime = await checkBase();
+    runtime = await checkBase({verifyHttp: true});
     if (await readHash(safePath('server/.env')) !== environmentHash || runtime.environmentHash !== before.environmentHash) throw new Error('Environment changed');
-    const previousZipGuard = manifest.guards.find(file => file.path === 'public-downloads/' + manifest.previousZip);
-    await assertHttpFiles(manifest.previousZip, previousZipGuard.sha, manifest.files.find(file => file.path === metadataPaths[1]).oldSha);
+    // checkBase already verified the old public package, changelog and Admin.
   } catch (failure) { failures.push(failure.message); }
   await receipt('rollback.json', {sourceHead: tag, baseHead: manifest.baseHead, cause: error.message,
     restored: failures.length === 0, failures, runtime, simulation, at: new Date().toISOString()});

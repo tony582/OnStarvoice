@@ -6,8 +6,10 @@ import {createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import test from 'node:test';
+import vm from 'node:vm';
 
 const publisher = fileURLToPath(new URL('./deploy.mjs', import.meta.url));
+const publisherSource = await fs.readFile(publisher, 'utf8');
 const digest = value => createHash('sha256').update(value).digest('hex');
 const oldZip = 'StarVoice-extension-v0.4.19-20260927.zip';
 const newZip = 'StarVoice-extension-v0.4.20-20260928.zip';
@@ -44,6 +46,9 @@ async function fixture(t) {
     ['public-downloads/' + oldZip]: 'old-package-fixture',
     'web/admin/dist/index.html': '<html>unchanged admin</html>',
     'web/admin/dist/assets/admin.js': '// unchanged admin asset\n',
+    'web/admin/dist/._assets': 'existing macOS directory metadata',
+    'web/admin/dist/assets/._admin.js': 'existing macOS file metadata',
+    'web/admin/dist/.cache/file.json': 'existing hidden directory file',
   };
   const newFiles = {
     [metadata[0]]: sourceFor('0.4.20', newZip),
@@ -114,7 +119,7 @@ for (const fail of ['mid-switch', 'readiness']) test(fail + ' restores all old f
   await assert.rejects(fs.stat(path.join(f.stage, 'deployed.json')), {code: 'ENOENT'});
 });
 
-for (const relative of [metadata[1], 'server/index.js', 'server/.env']) test('baseline drift refuses before switch: ' + relative, async t => {
+for (const relative of [metadata[1], 'server/index.js', 'server/.env', 'web/admin/dist/._assets']) test('baseline drift refuses before switch: ' + relative, async t => {
   const f = await fixture(t);
   await fs.appendFile(path.join(f.app, relative), 'external drift');
   const result = f.run();
@@ -122,9 +127,9 @@ for (const relative of [metadata[1], 'server/index.js', 'server/.env']) test('ba
   assert.match(result.stderr, /SHA mismatch/);
 });
 
-test('an additional Admin asset refuses before switch', async t => {
+for (const relative of ['assets/unexpected.js', 'assets/._unexpected.js']) test('an additional Admin asset refuses before switch: ' + relative, async t => {
   const f = await fixture(t);
-  await write(path.join(f.app, 'web/admin/dist/assets/unexpected.js'), 'external admin update');
+  await write(path.join(f.app, 'web/admin/dist', relative), 'external admin update');
   const result = f.run();
   await f.assertNoSwitch(result);
   assert.match(result.stderr, /Admin file inventory changed/);
@@ -161,3 +166,61 @@ test('ops-control is limited to the version constant even when the staged SHA ma
   await f.assertNoSwitch(result);
   assert.match(result.stderr, /ops-control change exceeds/);
 });
+
+function sourceBlock(startMarker, endMarker) {
+  const start = publisherSource.indexOf(startMarker);
+  const end = publisherSource.indexOf(endMarker, start + startMarker.length);
+  assert.ok(start >= 0 && end > start, 'publisher source boundary exists');
+  return publisherSource.slice(start, end);
+}
+
+// Exercise the actual production HTTP checks with a read-only transport double;
+// --simulate deliberately has no HTTP, so file-switch rehearsals alone miss it.
+function httpPreflight(f) {
+  const origins = ['http://local.test', 'https://public.test'];
+  const responses = new Map(), requested = [];
+  for (const origin of origins) {
+    responses.set(origin + '/downloads/' + oldZip, f.oldFiles['public-downloads/' + oldZip]);
+    responses.set(origin + '/changelog', f.oldFiles[metadata[1]]);
+    responses.set(origin + '/admin/', f.oldFiles['web/admin/dist/index.html']);
+    responses.set(origin + '/admin/assets/admin.js', f.oldFiles['web/admin/dist/assets/admin.js']);
+  }
+  const context = vm.createContext({
+    simulation: false, checkOnly: false, origins, manifest: f.release, hash: digest, metadataPaths: metadata,
+    safePath: relative => path.join(f.app, relative),
+    assertHash: async () => {}, checkGuards: async () => {}, assertManifest: async () => {},
+    assertRegular: async () => {}, health: async () => {}, checkStage: async () => {},
+    pm2Info: () => ({nodeVersion: '18.20.8', execPath: '/opt/onstarvoice/server/index.js'}),
+    curl(url) {
+      requested.push(url);
+      if (!responses.has(url)) throw new Error('HTTP 404: ' + url);
+      return responses.get(url);
+    },
+  });
+  vm.runInContext(sourceBlock('async function assertHttpFiles(', 'async function health(') +
+    sourceBlock('async function checkBase(', 'async function checkStage('), context);
+  return {origins, responses, requested, run: () => vm.runInContext('(async () => {\n' +
+    sourceBlock('await checkStage();', 'const lockPath =') + '\n})()', context)};
+}
+
+test('production HTTP preflight verifies public assets but never requests hidden metadata', async t => {
+  const f = await fixture(t), http = httpPreflight(f);
+  await http.run();
+  assert.equal(http.requested.length, 8, 'package, changelog and two public Admin files at both origins');
+  assert.deepEqual(new Set(http.requested), new Set(http.responses.keys()));
+  await f.assertOriginal();
+});
+
+for (const failure of ['missing-public-asset', 'wrong-public-asset', 'wrong-package', 'wrong-changelog']) {
+  test('production preflight rejects an existing HTTP problem before switching: ' + failure, async t => {
+    const f = await fixture(t), http = httpPreflight(f), origin = http.origins[1];
+    if (failure === 'missing-public-asset') http.responses.delete(origin + '/admin/assets/admin.js');
+    if (failure === 'wrong-public-asset') http.responses.set(origin + '/admin/assets/admin.js', 'different public bytes');
+    if (failure === 'wrong-package') http.responses.set(origin + '/downloads/' + oldZip, 'different zip');
+    if (failure === 'wrong-changelog') http.responses.set(origin + '/changelog', 'different changelog');
+    await assert.rejects(http.run(), /HTTP (404|Admin file changed|extension package differs|changelog differs)/);
+    await f.assertOriginal();
+    await assert.rejects(fs.stat(path.join(f.stage, 'backup')), {code: 'ENOENT'});
+    await assert.rejects(fs.stat(path.join(f.root, 'task-device-cleanup.deploy.lock')), {code: 'ENOENT'});
+  });
+}

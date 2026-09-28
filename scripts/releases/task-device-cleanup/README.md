@@ -48,6 +48,8 @@
 
 `guards` 还必须逐一列出生产 `web/admin/dist/` 的**全部文件**，包含 assets 等子目录；发布器同时验证完整文件清单和各文件摘要，新增或遗漏文件均拒绝。可追加其他只读基线 guards。`environmentSha` 可选；正式 stage 应填写，既核对已记录的环境基线，又比较发布前后 `.env` 和 PM2 环境摘要。收据只保存摘要，不保存环境值。
 
+磁盘守卫也包括现有 `._assets`、`._文件名` 等隐藏元数据；不能从 guards 中删除这些文件。HTTP 校验只请求相对路径各段均不以 `.` 开头的公开文件，与 Express 静态资源的 dotfile 边界一致。发布前已验证旧版 zip、changelog 及全部公开 Admin 文件的本机/公网 HTTP 摘要；已有不可访问或内容不符的公开资源会在任何切换前拒绝。
+
 CI 必须已完成并成功，而且恰好包含以下五个成功 job（名称必须一致）：
 
 1. `Tests and builds`
@@ -76,9 +78,9 @@ bash deploy.sh --simulate /private/tmp/simulation-readiness --fail=readiness
 将 stage 放在 `/opt/onstarvoice-private/releases/task-device-cleanup-<short-sha>-20260928/`。确认 stage 和生产目录均为真实目录，无符号链接。
 
 1. 运行 `sha256sum -c SHA256SUMS`，核对已审阅的完整 SHA 和 CI 证据。
-2. 运行 `bash deploy.sh --check`。此步骤只读，核对四文件范围、全部 oldSha/newSha/guards、完整 Admin 清单、旧更新清单 `0.4.19`、Node 18、PM2 入口、环境基线和本机健康。基线漂移即停止，不自动改写基线。
+2. 运行 `bash deploy.sh --check`。此步骤只读，核对四文件范围、全部 oldSha/newSha/guards、完整 Admin 清单、旧更新清单 `0.4.19`、Node 18、PM2 入口、环境基线和本机健康，并从本机及公网验证旧包、changelog、全部公开 Admin 文件 HTTP 摘要。基线漂移即停止，不自动改写基线。
 3. 运行 `bash deploy.sh`。发布器重新核对基线，取得独占锁，先备份三个旧文件，再逐文件检查并通过临时文件原子替换。PM2 重启不带 `--update-env`。
-4. 验收本机 ready/live、PM2 新 PID/启动时间与原 Node/入口/环境、四文件新摘要、完整 Admin guards、环境文件摘要。再从本机和公网分别核对 `0.4.20` 更新清单、扩展 zip HTTP SHA、`/changelog` HTML SHA、Admin 全部静态文件 HTTP SHA。更新说明必须标注 Extension `0.4.20` 和 Android Runner `0.2.6`。
+4. 验收本机 ready/live、PM2 新 PID/启动时间与原 Node/入口/环境、四文件新摘要、完整 Admin guards、环境文件摘要。再从本机和公网分别核对 `0.4.20` 更新清单、扩展 zip HTTP SHA、`/changelog` HTML SHA、Admin 全部公开静态文件 HTTP SHA。更新说明必须标注 Extension `0.4.20` 和 Android Runner `0.2.6`。
 5. 只有上述全部通过才生成 `deployed.json`。失败则逆序恢复已切换文件、移除本次新增 zip，再重启并验证旧清单 `0.4.19`、旧包 HTTP SHA、旧 changelog、Admin、环境和健康，生成 `rollback.json`。回滚不完整会明确报错；存在外部并发修改时拒绝覆盖，需人工调查。
 
 保留 stage、`backup/`、`before.json`、`deployed.json` 或 `rollback.json` 作为证据。已使用的 stage 不可覆盖备份重跑。常规可捕获失败及 TERM/INT/HUP 会进入回滚；断电或 SIGKILL 无法由进程捕获，恢复时保留锁和备份，核对实际文件后按备份恢复，不删除锁后盲目重跑。
