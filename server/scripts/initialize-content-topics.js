@@ -3,27 +3,31 @@ import 'dotenv/config';
 import {randomUUID} from 'node:crypto';
 import {getPool, closePool} from '../db/pool.js';
 import {callDeepSeekWithPrompt} from '../services/ai-labeler.js';
-import {CONTENT_TOPIC_INITIALIZATION_PROMPT, contentTopicInitializationInput, parseContentTopicInitialization, persistInitializedContentTopic} from '../services/content-topic-initialization.js';
+import {CONTENT_TOPIC_INITIALIZATION_PROMPT, contentTopicInitializationInput, parseContentTopicInitialization, persistInitializedContentTopic, recordContentTopicInitializationAudit} from '../services/content-topic-initialization.js';
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
 const tenantId = option('--tenant', ''), apply = args.includes('--apply');
+const recheckRunId = option('--recheck-run', null);
+if (recheckRunId && !/^topic-init:[a-f0-9-]{36}$/i.test(recheckRunId)) throw new Error('Invalid --recheck-run');
 const batchSize = Math.min(60, Math.max(1, Number(option('--batch-size', 36)) || 36));
 const concurrency = Math.min(6, Math.max(1, Number(option('--concurrency', 4)) || 4));
 const limit = Math.min(50000, Math.max(1, Number(option('--limit', 50000)) || 50000));
 if (!/^[a-f0-9-]{36}$/i.test(tenantId)) throw new Error('--tenant is required');
 const pool = getPool(), lock = await pool.connect(), runId = `topic-init:${randomUUID()}`;
-const totals = {runId, apply, total: 0, processed: 0, updated: 0, skipped: 0, failed: 0, topics: {}, promptTokens: 0, completionTokens: 0};
+const totals = {runId, recheckRunId, apply, total: 0, processed: 0, updated: 0, skipped: 0, failed: 0, topics: {}, promptTokens: 0, completionTokens: 0};
 const db = {queryOne: async (sql, params) => (await pool.query(sql, params)).rows[0]};
 try {
   const locked = (await lock.query("SELECT pg_try_advisory_lock(hashtext('content-topic-initialization'),hashtext($1)) AS locked", [tenantId])).rows[0].locked;
   if (!locked) throw new Error('Topic initialization already running for this tenant');
-  const rows = (await pool.query(`SELECT id,title,content,transcript,transcript_status,transcript_source_url,video_url,audio_url,
+  const rows = (await pool.query(`SELECT id,title,content,content_topic,transcript,transcript_status,transcript_source_url,video_url,audio_url,
       jsonb_build_object('videoUrl',payload->'videoUrl','video_url',payload->'video_url','awemeVideoUrl',payload->'awemeVideoUrl',
         'videoUrls',payload->'videoUrls','audioUrl',payload->'audioUrl','musicUrl',payload->'musicUrl','audioUrls',payload->'audioUrls') AS payload
-    FROM records WHERE tenant_id=$1 AND content_topic IS NULL
+    FROM records WHERE tenant_id=$1
+      AND (($3::text IS NULL AND content_topic IS NULL) OR ($3::text IS NOT NULL
+        AND ai_result->'contentTopicInitialization'->>'runId'=$3 AND content_topic<>'gm_other'))
       AND NOT (COALESCE(manual_overrides,'{}'::jsonb) ? 'content_topic')
-    ORDER BY (business_visibility='eligible') DESC, created_at DESC, id LIMIT $2`, [tenantId, limit])).rows;
+    ORDER BY (business_visibility='eligible') DESC, created_at DESC, id LIMIT $2`, [tenantId, limit, recheckRunId])).rows;
   totals.total = rows.length;
   console.log(JSON.stringify({stage: 'start', ...totals, batchSize, concurrency}));
   let cursor = 0;
@@ -46,7 +50,7 @@ try {
         for (let i = 0; i < batch.length; i++) {
           const result = classifications[i];
           if (apply) {
-            const saved = await persistInitializedContentTopic(db, tenantId, batch[i], result, runId);
+            const saved = await persistInitializedContentTopic(db, tenantId, batch[i], result, runId, {recheckRunId});
             if (saved) totals.updated++; else totals.skipped++;
           }
           totals.topics[result.topic] = (totals.topics[result.topic] || 0) + 1;
@@ -59,8 +63,7 @@ try {
       }
     }
   }));
-  if (apply) await pool.query(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,action,target_type,target_id,metadata)
-    VALUES($1,'system','content-topic-initialization','records.content_topics_initialized','tenant',$1::text,$2::jsonb)`, [tenantId, JSON.stringify(totals)]);
+  if (apply) await recordContentTopicInitializationAudit(db, tenantId, totals);
   console.log(JSON.stringify({stage: 'complete', ...totals}));
   if (totals.failed) process.exitCode = 1;
 } finally {

@@ -9,7 +9,7 @@ import { createApp } from '../../../server/app.js';
 import { hashPassword } from '../../../server/services/auth-service.js';
 import { persistRecordClassification } from '../../../server/services/ai-labeler.js';
 import { CONTENT_TOPIC_LABELS, CONTENT_TOPIC_VERSION } from '../../../server/services/content-topic.js';
-import {persistInitializedContentTopic} from '../../../server/services/content-topic-initialization.js';
+import {persistInitializedContentTopic, recordContentTopicInitializationAudit} from '../../../server/services/content-topic-initialization.js';
 import { resolveMonitoringIntent, resolveTenantMonitoringScope } from '../../../server/services/monitoring-intent.js';
 const ExcelJS = createRequire(new URL('../../../server/package.json', import.meta.url))('exceljs');
 
@@ -129,6 +129,17 @@ test('content topics persist, filter and export independently, with audited manu
     assert.equal(saved.ai_result.relevance,original.ai_result.relevance);
     assert.equal((await pool.query('SELECT status,note FROM record_triage WHERE record_id=$1',[id])).rows[0].note,'客户备注保持');
     assert.equal(await persistInitializedContentTopic(db,tenant,original,result,'retry'),undefined);
+    assert.equal(await persistInitializedContentTopic(db,tenant,saved,result,'recheck',{recheckRunId:'wrong-run'}),undefined);
+    assert.ok(await persistInitializedContentTopic(db,tenant,saved,{...result,topic:'gm_other'},'recheck',{recheckRunId:'local-test'}));
+    assert.equal((await getRecord(id)).content_topic,'gm_other');
+    assert.equal(await persistInitializedContentTopic(db,tenant,saved,result,'stale-recheck',{recheckRunId:'local-test'}),undefined);
+    const rechecked = await getRecord(id);
+    await patch(id,{contentTopic:'brand_app'});
+    assert.equal(await persistInitializedContentTopic(db,tenant,rechecked,result,'manual-recheck',{recheckRunId:'recheck'}),undefined);
+    const audit = {runId:'local-test',total:1,updated:1,failed:0};
+    assert.ok(await recordContentTopicInitializationAudit(db,tenant,audit));
+    assert.equal(await recordContentTopicInitializationAudit(db,tenant,audit),undefined);
+    assert.equal((await pool.query("SELECT count(*)::int AS count FROM audit_logs WHERE tenant_id=$1 AND action='records.content_topics_initialized' AND metadata->>'runId'='local-test'",[tenant])).rows[0].count,1);
     const manualId=await insert(null), manual=await getRecord(manualId);
     await patch(manualId,{contentTopic:'onstar'});
     assert.equal(await persistInitializedContentTopic(db,tenant,manual,result,'race'),undefined);

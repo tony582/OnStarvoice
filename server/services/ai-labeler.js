@@ -37,7 +37,7 @@ import {
 
 import { CONTENT_TOPIC_PROMPT_RULES, CONTENT_TOPIC_VERSION, normalizeContentTopic } from './content-topic.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v10';
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v11';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
 const LLM_PROVIDER_ALIASES = Object.freeze({
