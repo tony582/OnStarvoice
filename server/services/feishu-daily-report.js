@@ -1,4 +1,4 @@
-import {customerDailyHandlingSections, customerDailyHandlingNoteLines, customerDailyHandlingTime} from './customer-daily-report-presentation.js';
+import {customerDailyHandlingSections, customerDailyHandlingReplyLine, customerDailyHandlingSupplementalNoteLines} from './customer-daily-report-presentation.js';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import {renderCustomerDailySummaryPng} from './customer-daily-report-image.js';
 import {buildFeishuDailyPost, FEISHU_DAILY_POST_IMAGE_PLACEHOLDER} from './feishu-daily-report-message.js';
@@ -133,15 +133,15 @@ export function buildFeishuDailyDocumentPlan(snapshot) {
   cold.forEach((post, index) => {
     const url = validHttpUrl(post.url);
     nodes.push(textNode([run(`${index + 1}、`), run(String(post.title || '未命名帖子').replace(/\s+/g,' ').trim(), url),
-      run(`${customerDailyColdPostLabel(post) ? '【历史帖】' : ''} - ${customerDailyPostPlatform(post)}${snapshot.handlingListsVersion === 1 ? `｜${customerDailyHandlingTime(post)}` : ''}${url ? '' : '｜原帖链接待补'}`)]));
+      run(`${customerDailyColdPostLabel(post) ? '【历史帖】' : ''} - ${customerDailyPostPlatform(post)}${url ? '' : '｜原帖链接待补'}`)]));
   });
   for (const section of customerDailyHandlingSections(snapshot)) {
     nodes.push(textNode(section.title, 4));
     if (!section.posts.length) nodes.push(textNode(section.empty));
     section.posts.forEach((post, index) => {
       const url = validHttpUrl(post.url);
-      nodes.push(textNode([run(`${index + 1}、`), run(String(post.title || '未命名帖子'), url), run(` - ${customerDailyPostPlatform(post)}｜${customerDailyHandlingTime(post)}`)]));
-      for (const line of customerDailyHandlingNoteLines(post)) nodes.push(textNode(line));
+      nodes.push(textNode([run(`${index + 1}、`), run(String(post.title || '未命名帖子'), url), run(` - ${customerDailyHandlingReplyLine(post)}`)]));
+      for (const line of customerDailyHandlingSupplementalNoteLines(post)) nodes.push(textNode(line));
     });
   }
   let sequence = 0;

@@ -1,5 +1,5 @@
 import ExcelJS from 'exceljs';
-import { customerDailyHandlingSections, customerDailyHandlingNoteLines, customerDailyHandlingTime } from './customer-daily-report-presentation.js';
+import { customerDailyHandlingSections, customerDailyHandlingReplyLine, customerDailyHandlingSupplementalNoteLines } from './customer-daily-report-presentation.js';
 import {
   customerDailySummaryHeaders, isMonthlyDailyReport,
   customerDailySummaryRows as summaryRows,
@@ -76,13 +76,13 @@ export function renderCustomerDailyReportMessageText(snapshot) {
   if (!snapshot.coldMarked?.length) lines.push(coldEmpty(snapshot));
   for (const [index, post] of (snapshot.coldMarked || []).entries()) {
     const historical = customerDailyColdPostLabel(post);
-    lines.push(`${index + 1}、${oneLine(post.title)}${historical ? `【${historical}】` : ''} — ${sourceLabel(post)}${snapshot.handlingListsVersion === 1 ? `｜${customerDailyHandlingTime(post)}` : ''}`, url(post.url) || '原帖链接待补');
+    lines.push(`${index + 1}、${oneLine(post.title)}${historical ? `【${historical}】` : ''} — ${sourceLabel(post)}`, url(post.url) || '原帖链接待补');
   }
   for (const section of customerDailyHandlingSections(snapshot)) {
     lines.push('', section.title);
     if (!section.posts.length) lines.push(section.empty);
     for (const [index, post] of section.posts.entries()) {
-      lines.push(`${index + 1}、${oneLine(post.title)} — ${sourceLabel(post)}｜${customerDailyHandlingTime(post)}`, url(post.url) || '原帖链接待补', ...customerDailyHandlingNoteLines(post));
+      lines.push(`${index + 1}、${oneLine(post.title)} — ${customerDailyHandlingReplyLine(post)}`, url(post.url) || '原帖链接待补', ...customerDailyHandlingSupplementalNoteLines(post));
     }
   }
   return lines.join('\n');
@@ -97,8 +97,8 @@ export function renderCustomerDailyReportMessageHtml(snapshot) {
   return `<h2>${customerDailySections(snapshot).heat}</h2>
     ${(snapshot.highHeat || []).map((post, index) => `<article><h3>TOP${index + 1}：${linkedTitle(post)}</h3><p>${esc(sourceLabel(post))}｜${esc(heatDescription(post, snapshot))}</p></article>`).join('') || '<p class="empty">暂未检出符合条件的帖子。</p>'}
     <h2>${customerDailyColdTitle(snapshot)}</h2>
-    ${(snapshot.coldMarked || []).map((post, index) => `<article><h3>${index + 1}、${linkedTitle(post)}${customerDailyColdPostLabel(post) ? '<span class="historical">【历史帖】</span>' : ''}</h3><p>${esc(sourceLabel(post))}${snapshot.handlingListsVersion === 1 ? `｜${customerDailyHandlingTime(post)}` : ''}</p></article>`).join('') || `<p class="empty">${esc(coldEmpty(snapshot))}</p>`}
-    ${customerDailyHandlingSections(snapshot).map(section => `<h2>${esc(section.title)}</h2>${section.posts.map((post, index) => `<article><h3>${index + 1}、${linkedTitle(post)}</h3><p>${esc(sourceLabel(post))}｜${customerDailyHandlingTime(post)}</p>${customerDailyHandlingNoteLines(post).map(line => `<p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(line).replace(/\r?\n/g, '<br>')}</p>`).join('')}</article>`).join('') || `<p class="empty">${esc(section.empty)}</p>`}`).join('')}`;
+    ${(snapshot.coldMarked || []).map((post, index) => `<article><h3>${index + 1}、${linkedTitle(post)}${customerDailyColdPostLabel(post) ? '<span class="historical">【历史帖】</span>' : ''}</h3><p>${esc(sourceLabel(post))}</p></article>`).join('') || `<p class="empty">${esc(coldEmpty(snapshot))}</p>`}
+    ${customerDailyHandlingSections(snapshot).map(section => `<h2>${esc(section.title)}</h2>${section.posts.map((post, index) => `<article><h3>${index + 1}、${linkedTitle(post)}</h3>${[customerDailyHandlingReplyLine(post), ...customerDailyHandlingSupplementalNoteLines(post)].map(line => `<p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(line).replace(/\r?\n/g, '<br>')}</p>`).join('')}</article>`).join('') || `<p class="empty">${esc(section.empty)}</p>`}`).join('')}`;
 }
 
 export function renderCustomerDailyReportHtml(snapshot, {email = false} = {}) {
@@ -270,35 +270,34 @@ export function buildCustomerDailyReportWorkbook(snapshot) {
   heat.views = [{state: 'frozen', ySplit: 4}]; heat.pageSetup.printTitlesRow = '4:4';
 
   const cold = workbook.addWorksheet('本期冷处理');
-  const coldColumns = snapshot.handlingListsVersion === 1 ? 4 : 3;
+  const coldColumns = 3;
   configureSheet(cold, coldColumns);
   [9, 72, 18].forEach((width, i) => { cold.getColumn(i + 1).width = width; });
-  if (coldColumns === 4) cold.getColumn(4).width = 23;
   mergedText(cold, 1, coldColumns, customerDailyReportTitle(snapshot), {title: true});
   mergedText(cold, 2, coldColumns, customerDailyColdTitle(snapshot));
-  cold.getRow(4).values = ['序号', '标题', '平台', ...(coldColumns === 4 ? ['处理时间'] : [])]; headerRow(cold, 4);
+  cold.getRow(4).values = ['序号', '标题', '平台']; headerRow(cold, 4);
   for (const [index, post] of (snapshot.coldMarked || []).entries()) {
     const title = `${text(post.title)}${customerDailyColdPostLabel(post) ? '【历史帖】' : ''}`;
-    const row = bodyRow(cold, [index + 1, title, sourceLabel(post), ...(coldColumns === 4 ? [customerDailyHandlingTime(post)] : [])]);
+    const row = bodyRow(cold, [index + 1, title, sourceLabel(post)]);
     hyperlink(row.getCell(2), title, post.url);
   }
   if (!snapshot.coldMarked?.length) mergedText(cold, 5, coldColumns, coldEmpty(snapshot));
   cold.views = [{state: 'frozen', ySplit: 4}]; cold.pageSetup.printTitlesRow = '4:4';
   for (const section of customerDailyHandlingSections(snapshot)) {
     const details = workbook.addWorksheet(section.sheet);
-    configureSheet(details, 6);
-    [9, 60, 18, 70, 70, 23].forEach((width, i) => { details.getColumn(i + 1).width = width; });
-    mergedText(details, 1, 6, customerDailyReportTitle(snapshot), {title: true});
-    mergedText(details, 2, 6, section.title);
-    details.getRow(4).values = ['序号', '标题', '平台', '回复内容', '补充备注', '处理时间']; headerRow(details, 4);
+    configureSheet(details, 4);
+    [9, 60, 88, 70].forEach((width, i) => { details.getColumn(i + 1).width = width; });
+    mergedText(details, 1, 4, customerDailyReportTitle(snapshot), {title: true});
+    mergedText(details, 2, 4, section.title);
+    details.getRow(4).values = ['序号', '标题', '平台及回复内容', '补充备注']; headerRow(details, 4);
     for (const [index, post] of section.posts.entries()) {
       const supplements = (post.supplementalNotes || []).map(note => text(note.body));
-      const row = bodyRow(details, [index + 1, text(post.title), sourceLabel(post), String(post.replyContent || '').trim() ? text(post.replyContent) : '未填写回复内容', supplements[0] || '', customerDailyHandlingTime(post)]);
+      const row = bodyRow(details, [index + 1, text(post.title), text(customerDailyHandlingReplyLine(post)), supplements[0] || '']);
       hyperlink(row.getCell(2), post.title, post.url);
       row.height = Math.min(409, Math.max(60, 18 * (String(post.replyContent || '').split('\n').length + 2)));
-      for (const supplement of supplements.slice(1)) bodyRow(details, ['', '', '', '', supplement]);
+      for (const supplement of supplements.slice(1)) bodyRow(details, ['', '', '', supplement]);
     }
-    if (!section.posts.length) mergedText(details, 5, 6, section.empty);
+    if (!section.posts.length) mergedText(details, 5, 4, section.empty);
     details.views = [{state: 'frozen', ySplit: 4}]; details.pageSetup.printTitlesRow = '4:4';
   }
   return workbook;

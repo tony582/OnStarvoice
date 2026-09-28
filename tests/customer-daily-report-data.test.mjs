@@ -436,7 +436,7 @@ test('HTML, copy text and editable monthly workbook preserve counts, all links a
   assert.doesNotMatch(copied, /复核及冷处理状态截至|观测质量|数据说明/);
   for (const row of rows) { assert.ok(copied.includes(row.url)); assert.ok(html.includes(row.url)); }
   const workbook = buildCustomerDailyReportWorkbook(report);
-  assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '本期冷处理', '本期已回复', '本期评论区留言']);
+  assert.deepEqual(workbook.worksheets.map(s => s.name), ['日报', '高热负面', '本期冷处理', '本期评论区留言', '本期已回复']);
   const summary = workbook.getWorksheet('日报');
   const summaryDates = [], mtdRows = [];
   summary.eachRow(row => {

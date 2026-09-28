@@ -1,4 +1,4 @@
-import {customerDailyHandlingSections, customerDailyHandlingNoteLines, customerDailyHandlingTime} from './customer-daily-report-presentation.js';
+import {customerDailyHandlingSections, customerDailyHandlingReplyLine, customerDailyHandlingSupplementalNoteLines} from './customer-daily-report-presentation.js';
 import {
   customerDailySections, isGroupedDailyReport, customerDailySummaryBasis, customerDailyPostStatus,
   customerDailyPostPlatform, customerDailyPostHeat,
@@ -51,17 +51,17 @@ function comparisonLabel(post) {
 const text = value => ({ tag: 'text', text: value });
 const heading = value => [{ ...text(value), style: ['bold'] }];
 
-function postLine(post, index, heat, snapshot) {
+function postLine(post, index, heat, snapshot, reply = false) {
   const item = post && typeof post === 'object' ? post : {};
   const title = oneLine(item.title, '未命名帖子');
   const url = safeUrl(item.url);
   // Raw URLs let Feishu resolve the native title and hover preview. Keep them
   // untruncated and separated from surrounding text; parsed titles include the platform.
   const nodes = [text(heat ? `TOP${index + 1}： ` : `${index + 1}、 `),
-    text(url || `${title}（原帖链接待补） - ${oneLine(customerDailyPostPlatform(item), '未知平台', 40)}`)];
+    text(url || `${title}（原帖链接待补） - ${reply ? customerDailyHandlingReplyLine(item) : oneLine(customerDailyPostPlatform(item), '未知平台', 40)}`)];
+  if (reply && url) nodes.push(text(` - ${customerDailyHandlingReplyLine(item)}`));
   if (heat) nodes.push(text(` | 热度 ${heatLabel(item)} | ${comparisonLabel(item)}${isGroupedDailyReport(snapshot) ? ` | 处理状态：${oneLine(customerDailyPostStatus(item), '未记录', 140)}` : ''}`));
   else if (customerDailyColdPostLabel(item)) nodes.push(text(' 【历史帖】'));
-  if (!heat && snapshot.handlingListsVersion === 1) nodes.push(text(` | ${customerDailyHandlingTime(item)}`));
   return nodes;
 }
 
@@ -103,8 +103,8 @@ export function buildFeishuDailyPost({ snapshot, imageKey, documentUrl }) {
       if (!section.posts.length) content.push([text(section.empty)]);
       for (let index = 0; index < extraCounts[sectionIndex]; index++) {
         const post = section.posts[index];
-        content.push(postLine(post, index, false, snapshot));
-        for (const line of customerDailyHandlingNoteLines(post)) content.push([text(line)]);
+        content.push(postLine(post, index, false, snapshot, true));
+        for (const line of customerDailyHandlingSupplementalNoteLines(post)) content.push([text(line)]);
       }
       if (extraCounts[sectionIndex] < section.posts.length) content.push([text(`另有 ${section.posts.length - extraCounts[sectionIndex]} 条${section.sheet}内容及回复备注，见底部完整日报。`)]);
     });

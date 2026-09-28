@@ -449,11 +449,11 @@ function CustomerDailyReportWorkspace() {
             <PostList posts={snapshot.coldMarked} kind="cold" incomplete={snapshot.evidence?.cold?.coverageComplete !== true} />
           </ReportSection>
           {snapshot.handlingListsVersion === 1 && <>
-            <ReportSection title={`四、本期已回复帖子：${snapshot.repliedMarked?.length || 0} 条`}>
-              <PostList posts={snapshot.repliedMarked || []} kind="replied" />
-            </ReportSection>
-            <ReportSection title={`五、本期负面–评论区留言：${snapshot.commentMarked?.length || 0} 条`}>
+            <ReportSection title={`${isHandlingSummary(snapshot) && snapshot.collectionSummary ? '五' : '四'}、本期负面–评论区留言：${snapshot.commentMarked?.length || 0} 条`}>
               <PostList posts={snapshot.commentMarked || []} kind="comment" />
+            </ReportSection>
+            <ReportSection title={`${isHandlingSummary(snapshot) && snapshot.collectionSummary ? '六' : '五'}、本期已回复帖子：${snapshot.repliedMarked?.length || 0} 条`}>
+              <PostList posts={snapshot.repliedMarked || []} kind="replied" />
             </ReportSection>
           </>}
         </article>
@@ -595,11 +595,9 @@ function PostList({ posts, kind, incomplete = false }: { posts: DailyPost[]; kin
       <span className="min-w-8 pt-0.5 text-xs font-semibold tabular-nums text-blue-700">{kind === 'heat' ? `TOP${index + 1}` : index + 1}</span>
       <div className="min-w-0 flex-1">
         {url ? <a href={url} target="_blank" rel="noopener noreferrer" className="break-words text-sm font-medium leading-6 text-blue-700 underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">{post.title || '查看原帖'}<ExternalLink className="ml-1 inline h-3 w-3" /></a> : <p className="text-sm font-medium leading-6">{post.title || '标题待补'}<span className="ml-2 text-xs font-normal text-amber-800">原帖链接待补</span></p>}
-        <p className="mt-1.5 text-xs leading-5 text-slate-500">{platforms[post.platform] || post.platform || '未知平台'}{kind === 'cold' && post.isHistorical === true && <span className="ml-2 inline-flex rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">历史帖</span>}{kind === 'heat' && <>｜热度 {showLowerBound && '至少 '}{post.heat?.toLocaleString() ?? '待核对'}｜较昨日 {(post.comparisonText || '暂无对比').replace(/^较昨日\s*[:：]?\s*/, '').trim() || '暂无对比'}</>}</p>
+        <p className="mt-1.5 whitespace-pre-wrap break-words text-xs leading-5 text-slate-500">{platforms[post.platform] || post.platform || '未知平台'}{kind === 'cold' && post.isHistorical === true && <span className="ml-2 inline-flex rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">历史帖</span>}{kind === 'heat' && <>｜热度 {showLowerBound && '至少 '}{post.heat?.toLocaleString() ?? '待核对'}｜较昨日 {(post.comparisonText || '暂无对比').replace(/^较昨日\s*[:：]?\s*/, '').trim() || '暂无对比'}</>}{(kind === 'replied' || kind === 'comment') && <span className="text-slate-700">｜回复内容：{post.replyContent?.trim() ? post.replyContent : '未填写回复内容'}</span>}</p>
         {kind === 'heat' && <p className="mt-2 text-xs leading-5 text-slate-700"><span className="text-slate-500">处理状态：</span>{dailyPostStatusLabel(post)}</p>}
-        {kind !== 'heat' && post.markedAt && <p className="mt-1 text-xs text-slate-500">处理时间：{dailyTime(post.markedAt)}</p>}
-        {(kind === 'replied' || kind === 'comment') && <div className="mt-2 space-y-2 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
-          <p>回复内容：{post.replyContent?.trim() ? post.replyContent : '未填写回复内容'}</p>
+        {(kind === 'replied' || kind === 'comment') && !!post.supplementalNotes?.length && <div className="mt-2 space-y-2 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700">
           {(post.supplementalNotes || []).map(note => <p key={note.id}>补充备注：{note.body}</p>)}
         </div>}
       </div>

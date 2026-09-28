@@ -95,19 +95,17 @@ export function customerDailyHandlingSections(snapshot) {
   if (snapshot?.handlingListsVersion !== 1) return [];
   const offset = isHandlingDailyReport(snapshot) && snapshot.collectionSummary;
   return [
-    {key: 'repliedMarked', title: `${offset ? '五' : '四'}、本期已回复帖子`, sheet: '本期已回复', posts: snapshot.repliedMarked || [], empty: '本期无已回复帖子。'},
-    {key: 'commentMarked', title: `${offset ? '六' : '五'}、本期负面–评论区留言`, sheet: '本期评论区留言', posts: snapshot.commentMarked || [], empty: '本期无负面–评论区留言帖子。'},
+    {key: 'commentMarked', title: `${offset ? '五' : '四'}、本期负面–评论区留言`, sheet: '本期评论区留言', posts: snapshot.commentMarked || [], empty: '本期无负面–评论区留言帖子。'},
+    {key: 'repliedMarked', title: `${offset ? '六' : '五'}、本期已回复帖子`, sheet: '本期已回复', posts: snapshot.repliedMarked || [], empty: '本期无已回复帖子。'},
   ].map(section => ({...section, title: `${section.title}：${section.posts.length} 条`}));
 }
 
-export function customerDailyHandlingNoteLines(post) {
-  return [`回复内容：${String(post.replyContent || '').trim() ? post.replyContent : '未填写回复内容'}`,
-    ...(post.supplementalNotes || []).filter(note => String(note.body || '').trim()).map(note => `补充备注：${note.body}`)];
+export function customerDailyHandlingReplyLine(post) {
+  return `${customerDailyPostPlatform(post)}｜回复内容：${String(post.replyContent || '').trim() ? post.replyContent : '未填写回复内容'}`;
 }
 
-export function customerDailyHandlingTime(post) {
-  if (!post?.markedAt || !Number.isFinite(new Date(post.markedAt).getTime())) return '处理时间未记录';
-  return new Date(new Date(post.markedAt).getTime() + 8 * 3600000).toISOString().slice(0, 16).replace('T', ' ');
+export function customerDailyHandlingSupplementalNoteLines(post) {
+  return (post.supplementalNotes || []).filter(note => String(note.body || '').trim()).map(note => `补充备注：${note.body}`);
 }
 
 const POST_STATUS_LABELS = Object.freeze({unhandled: '待处理', reviewed: '已复核', reviewed_non_monitor: '已复核-非监控内容', replied: '已回复', unavailable: '已不可见', privacy_unreachable: '隐私设置无法触达', negative_feishu: '飞书表', negative_cold: '冷处理', negative_comment: '评论区留言'});

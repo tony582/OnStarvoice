@@ -89,32 +89,41 @@ test('each natural handling date deduplicates posts, spans weekends/month bounda
   assert.equal(buildCustomerDailyNegativeHandlingSummary([record], parsed.transitions, nextMonth).summary.mtd.comment, 0);
 });
 
-test('all output channels preserve replies, line breaks, emoji, links and handling dates without changing frozen legacy snapshots', async () => {
+test('all output channels show comments before replies, inline platform and reply, and hide handling dates without changing snapshots', async () => {
   const snapshot = {...collectionHandlingSnapshot(), handlingListsVersion: 1, repliedMarked: [{recordId: id(1), title: '<script>标题</script>', platform: 'douyin', url: 'https://www.douyin.com/video/1', markedAt: at(28, 9), replyContent: '=客户回复\n注意安全😀', supplementalNotes: [{body: '后补一\n后补二'}]}], commentMarked: [{recordId: id(2), title: '评论区留言', platform: 'xiaohongshu', url: 'https://www.xiaohongshu.com/explore/2', markedAt: at(28, 10), replyContent: '', supplementalNotes: []}]};
   const before = structuredClone(snapshot);
   const text = renderCustomerDailyReportText(snapshot);
   assert.ok(text.includes('=客户回复\n注意安全😀')); assert.ok(text.includes('后补一\n后补二'));
-  assert.match(text, /四、本期已回复帖子：1 条/); assert.match(text, /五、本期负面–评论区留言：1 条/);
+  assert.match(text, /四、本期负面–评论区留言：1 条/); assert.match(text, /五、本期已回复帖子：1 条/);
+  assert.ok(text.indexOf('四、本期负面–评论区留言') < text.indexOf('五、本期已回复帖子'));
+  assert.ok(text.includes('抖音｜回复内容：=客户回复\n注意安全😀'));
+  assert.doesNotMatch(text, /处理时间|2026-09-28 09:00/);
   for (const email of [false, true]) {
     const html = renderCustomerDailyReportHtml(snapshot, {email});
     assert.ok(html.includes('=客户回复<br>注意安全😀')); assert.ok(html.includes('后补一<br>后补二'));
     assert.ok(html.includes('&lt;script&gt;标题')); assert.ok(!html.includes('<script>标题'));
-    assert.match(html, /2026-09-28 09:00/);
+    assert.ok(html.includes('抖音｜回复内容：=客户回复<br>注意安全😀'));
+    assert.doesNotMatch(html, /处理时间|2026-09-28 09:00/);
   }
   const workbook = buildCustomerDailyReportWorkbook(snapshot), read = new workbook.constructor();
   await read.xlsx.load(await workbook.xlsx.writeBuffer());
   const sheet = read.getWorksheet('本期已回复');
-  assert.equal(sheet.getCell('D5').value, '=客户回复\n注意安全😀');
-  assert.equal(sheet.getCell('D5').formula, undefined);
-  assert.equal(sheet.getCell('E5').value, '后补一\n后补二');
-  assert.equal(sheet.getCell('F5').value, '2026-09-28 09:00');
+  assert.equal(sheet.getCell('C5').value, '抖音｜回复内容：=客户回复\n注意安全😀');
+  assert.equal(sheet.getCell('C5').formula, undefined);
+  assert.equal(sheet.getCell('D5').value, '后补一\n后补二');
+  assert.equal(sheet.columnCount, 4);
+  assert.deepEqual(sheet.getRow(4).values.slice(1), ['序号', '标题', '平台及回复内容', '补充备注']);
   assert.equal(sheet.getCell('B5').value.hyperlink, snapshot.repliedMarked[0].url);
   const plan = buildFeishuDailyDocumentPlan(snapshot);
   const docText = plan.batches.flatMap(batch => batch.descendants).flatMap(block => (block.text || block.heading2 || {}).elements || []).map(element => element.text_run?.content || '').join('\n');
   assert.ok(docText.includes('=客户回复\n注意安全😀')); assert.ok(docText.includes('后补一\n后补二'));
+  assert.ok(docText.includes('抖音｜回复内容：=客户回复\n注意安全😀'));
+  assert.doesNotMatch(docText, /处理时间|2026-09-28 09:00/);
   const args = {snapshot, imageKey: 'img_test', documentUrl: 'https://example.feishu.cn/docx/report'};
   const group = buildFeishuDailyPost(args), groupText = group.zh_cn.content.flat().map(node => node.text || '').join('\n');
   assert.ok(groupText.includes('=客户回复\n注意安全😀')); assert.match(groupText, /未填写回复内容/);
+  assert.ok(groupText.includes('抖音｜回复内容：=客户回复\n注意安全😀'));
+  assert.doesNotMatch(groupText, /处理时间|2026-09-28 09:00/);
   const long = buildFeishuDailyPost({...args, snapshot: {...snapshot, repliedMarked: [{...snapshot.repliedMarked[0], supplementalNotes: Array.from({length: 50}, () => ({body: '备注😀'.repeat(300)}))}]}});
   assert.ok(feishuDailyPostRequestBytes(long) <= FEISHU_DAILY_POST_MAX_BYTES);
   const longText = long.zh_cn.content.flat().map(node => node.text || '').join('\n');
