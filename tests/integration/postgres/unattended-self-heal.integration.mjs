@@ -5,6 +5,10 @@ import test, {after} from "node:test";
 import vm from "node:vm";
 import {fileURLToPath} from "node:url";
 import {dirname, resolve} from "node:path";
+import {
+  enqueueUnattendedCheckpointReport,
+  flushUnattendedCheckpointReportOutbox,
+} from "../../../utils/unattended-report-outbox.js";
 
 // 0.4.19 无人值守自愈（设计：docs/hotfix/20260927-unattended-self-heal.md）：
 // 真实 background.js + 假 chrome。自停路径的禁止调用（刷新、带刷新的停止、
@@ -827,6 +831,11 @@ const retirementSource = sourceBlock(
   "function handleUnattendedRunRequestStorageChange(request) {",
   "async function handleSaveKeywordPlan(",
 );
+const checkpointFlushSource = sourceBlock(
+  sidebarSource,
+  "let unattendedCheckpointOutboxFlushPromise = null;",
+  "function buildUnattendedLocalClosureReadyStorageKey(",
+);
 
 const W_A = 101; // detail worker A (foreground, comments of #29)
 const W_B = 102; // detail worker B (prefetched #30)
@@ -847,24 +856,39 @@ function attachRunner(harness, {
   responsive = true,
   documentId = RUNNER_DOCUMENT,
   tabId = RUNNER_TAB,
+  flushMs = 60 * 1000,
 } = {}) {
-  const calls = {cancelFlags: [], rejected: [], heartbeatStops: 0, messages: [], renewals: 0};
+  const calls = {cancelFlags: [], rejected: [], heartbeatStops: 0, messages: [], renewals: 0, warnings: [], checkpointFlushes: []};
   let lockHeartbeat = null;
+  const sendRuntimeMessage = async (message) => {
+    calls.messages.push(JSON.parse(JSON.stringify(message)));
+    return await harness.sendBackgroundMessage(
+      message,
+      runnerSender(attemptId, {tabId, documentId}),
+    );
+  };
   const context = vm.createContext({
-    console: {warn() {}, log() {}, error() {}},
+    console: {warn(...args) {
+      const warning = args.map(value => String(value?.stack || value)).join(" ");
+      calls.warnings.push(warning);
+      log("[runner warning]", warning);
+    }, log() {}, error() {}},
     setTimeout,
     clearTimeout,
     Promise,
     chrome: {
       runtime: {
-        async sendMessage(message) {
-          calls.messages.push(JSON.parse(JSON.stringify(message)));
-          return await harness.sendBackgroundMessage(
-            message,
-            runnerSender(attemptId, {tabId, documentId}),
-          );
-        },
+        sendMessage: sendRuntimeMessage,
       },
+    },
+    sendUnattendedRuntimeMessage: sendRuntimeMessage,
+    async flushUnattendedCheckpointReportOutbox(options) {
+      await harness.api.flushUnattended();
+      // Run the actual durable outbox against this browser's storage and real
+      // background message handler. An empty streaming queue alone is no proof.
+      const result = await flushUnattendedCheckpointReportOutbox(options, {storage: harness.chrome.storage.local});
+      calls.checkpointFlushes.push(plain(result));
+      return result;
     },
     getUnattendedRunRequestIdFromUrl: () => REQUEST_ID,
     getUnattendedRunAttemptIdFromUrl: () => attemptId,
@@ -888,10 +912,10 @@ function attachRunner(harness, {
     adoptedUnattendedCaptureExecutionLockId: "lock-r",
     activeUnattendedStreamingSyncQueue: queue,
     retiredUnattendedAttemptKey: "",
-    UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS: 60 * 1000,
+    UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS: flushMs,
   });
   vm.runInContext(
-    `${retirementSource}\nthis.__handle = handleUnattendedRunRequestStorageChange;`,
+    `${checkpointFlushSource}\n${retirementSource}\nthis.__handle = handleUnattendedRunRequestStorageChange;`,
     context,
   );
   // The runner keeps renewing its lock every 200 ms until retirement stops it.
@@ -1500,6 +1524,37 @@ async function localSlotAndServer(h, f) {
   };
 }
 
+test("runner retirement preserves a durable checkpoint across transport failure before final receipt", async t => {
+  const h = createHarness();
+  setIdentity("retirement-outbox-request", "retirement-outbox-attempt");
+  const request = seedRunningRequest(h);
+  const queued = await enqueueUnattendedCheckpointReport({requestId: REQUEST_ID, attemptId: A1,
+    patch: {checkpoint: {completedKeywords: ["已采关键词"]}, progressSeq: 4}}, {storage: h.chrome.storage.local});
+  assert.equal(queued.ok, true);
+  const backgroundMessage = h.sendBackgroundMessage.bind(h);
+  let transportBlocked = true;
+  h.sendBackgroundMessage = async (message, sender) => {
+    if (transportBlocked && message.type === "onstarvoice:update-unattended-keyword-run") {
+      throw new Error("simulated checkpoint transport failure");
+    }
+    return await backgroundMessage(message, sender);
+  };
+  const runner = attachRunner(h, {queue: createUploadQueue({pending: 0, drainMs: 1}), flushMs: 50});
+  t.after(() => runner.stop());
+  await h.chrome.storage.local.set({[REQUEST_KEY]: {...request, attemptId: "next-attempt", status: "recovering"}});
+  assert.ok(await waitFor(() => runner.calls.checkpointFlushes.some(result => result.retained === 1)));
+  assert.ok(h.storage[queued.entry.storageKey], "failed transport preserves the actual durable outbox row");
+  assert.ok(!runner.calls.messages.some(message => message.type === "onstarvoice:unattended-attempt-retired" && message.flushed === true),
+    "empty streaming queue cannot authorize final retirement while a checkpoint remains");
+  transportBlocked = false;
+  assert.ok(await waitFor(() => runner.calls.messages.some(message =>
+    message.type === "onstarvoice:unattended-attempt-retired" && message.flushed === true)));
+  assert.equal(h.storage[queued.entry.storageKey], undefined);
+  assert.ok(runner.calls.checkpointFlushes.some(result => result.ok === true && result.retained === 0 && result.discarded === 1),
+    "the real background rejects the superseded attempt before the real outbox discards its checkpoint");
+  assert.deepEqual(runner.calls.warnings, []);
+});
+
 test("S2/S3 end to end: hold an unprovable stop, then resume the next keyword on node proof", async (t) => {
   const f = await serverFixture(t, {keywords: ["别克哨兵", "ibuick"]});
   const h = createHarness();
@@ -1524,6 +1579,11 @@ test("S2/S3 end to end: hold an unprovable stop, then resume the next keyword on
   const local = h.storage[REQUEST_KEY];
   log("[19A] local after S2", local.status, local.error, "lock", h.storage[LOCK_KEY] && {allowReload: h.storage[LOCK_KEY].allowReload, self: h.storage[LOCK_KEY].selfStopRequestId});
   assert.equal(local.status, "needs_action");
+  assert.ok(await waitFor(() => runnerSim.calls.messages.some(message =>
+    message.type === "onstarvoice:unattended-attempt-retired" && message.flushed === true)),
+  "the real runner completes its durable checkpoint flush before final retirement");
+  assert.ok(runnerSim.calls.checkpointFlushes.some(result => result.ok === true && result.retained === 0));
+  assert.ok(!runnerSim.calls.warnings.some(warning => warning.includes("ReferenceError")), "runner VM has all production retirement dependencies");
   h.storage[PLAN_KEY] = {...local.planSnapshot, enabled: true, mode: "daily"};
   const heldLock = plain(h.storage[LOCK_KEY]);
   await h.api.handleUnattendedKeywordAlarm();
