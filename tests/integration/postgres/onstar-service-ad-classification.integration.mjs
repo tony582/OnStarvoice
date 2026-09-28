@@ -37,7 +37,7 @@ test('third-party OnStar service advertisements persist neutral without erasing 
       assert.equal(row.intent, 'advertising');
       assert.equal(row.ai_result.relevance, 'relevant');
       assert.equal(row.ai_result.sentimentStatus, 'classified');
-      assert.equal(row.ai_result.classifierMetadata.promptVersion, 'record-topic-v9');
+      assert.equal(row.ai_result.classifierMetadata.promptVersion, 'record-topic-v10');
       assert.equal(row.ai_result.serviceAdJudgment.originalModel.sentiment, sentiment);
       assert.equal(row.ai_result.serviceAdJudgment.originalModel.summary, base.summary);
       const evidence = row.ai_result.serviceAdJudgment.evidence;

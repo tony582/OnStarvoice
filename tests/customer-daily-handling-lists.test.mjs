@@ -41,6 +41,36 @@ test('reply notes stay within their handling episode, including same-status, bat
   assert.equal(summary.day.comment, lists.commentMarked.length);
 });
 
+test('reply reclassification inherits original text and supplements without changing counts or crossing a reopened episode', () => {
+  const record = post(1, 'negative_comment');
+  const events = [event(101, record, 'unhandled', 'replied', 28, 10, '您方便时可按下车内蓝键，客服顾问帮您解答。'),
+    event(102, record, 'replied', 'replied', 28, 11, '同状态补充😀'),
+    event(103, record, 'replied', 'negative_comment', 28, 14)];
+  const notes = [{id: id(201), record_id: record.id, body: '分类更正前的补充\n第二行', created_at: at(28, 12)}];
+  const collect = () => buildCustomerDailyHandlingLists([record], parseCustomerDailyHandlingEvents(events).transitions, events, notes, period);
+  const first = collect();
+  assert.equal(first.commentMarked.length, 1); assert.equal(first.repliedMarked.length, 0);
+  assert.equal(first.commentMarked[0].replyContent, events[0].metadata.note);
+  assert.equal(first.commentMarked[0].replySourceEventId, id(101));
+  assert.deepEqual(first.commentMarked[0].supplementalNotes.map(row => row.body), ['同状态补充😀', notes[0].body]);
+  events[2].metadata.note = '客户明确填写了新回复';
+  assert.equal(collect().commentMarked[0].replyContent, '客户明确填写了新回复');
+  events.push(event(104, record, 'negative_comment', 'unhandled', 28, 15), event(105, record, 'unhandled', 'negative_comment', 28, 16));
+  assert.equal(collect().commentMarked[0].replyContent, '');
+  assert.deepEqual(collect().commentMarked[0].supplementalNotes, []);
+});
+
+test('batch reclassification supports both reply directions and keeps another post separate', () => {
+  const records = [post(1, 'negative_comment'), post(2, 'replied', 'positive')];
+  const events = [event(101, records[0], 'unhandled', 'replied', 27, 10, '第一条回复'),
+    event(102, records[1], 'unhandled', 'negative_comment', 27, 11, '第二条回复'),
+    {id: id(103), action: 'record.triage_batch_updated', created_at: at(28, 14), metadata: {recordIds: [records[0].id], status: 'negative_comment', previous: {[records[0].id]: {status: 'replied'}}, note: ''}},
+    event(104, records[1], 'negative_comment', 'replied', 28, 14)];
+  const result = buildCustomerDailyHandlingLists(records, parseCustomerDailyHandlingEvents(events).transitions, events, [], period);
+  assert.deepEqual(result.commentMarked.map(row => row.replyContent), ['第一条回复']);
+  assert.deepEqual(result.repliedMarked.map(row => row.replyContent), ['第二条回复']);
+});
+
 test('each natural handling date deduplicates posts, spans weekends/month boundaries, and keeps handling MTD distinct', () => {
   const record = post(1, 'negative_comment');
   const events = [event(101, record, 'unhandled', 'negative_comment', 26), event(102, record, 'negative_comment', 'negative_cold', 27),

@@ -1,4 +1,4 @@
-import {buildCustomerDailyHandlingLists} from './customer-daily-handling-lists.js';
+import {buildCustomerDailyHandlingLists, customerDailyHandlingEpisode} from './customer-daily-handling-lists.js';
 import {resolveMetricUpdateFromPayload} from '../utils/metrics.js';
 import {recoverCustomerDailyObservationTime} from './customer-daily-metric-evidence.js';
 import {buildMonthlySummary, DAILY_COLLECTION_SUMMARY_FORMAT} from './customer-daily-monthly-summary.js';
@@ -354,11 +354,29 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   const preliminary = buildCustomerDailyHandlingLists(handlingRecords, transitions, handlingEvents, [], period);
   const listPosts = Object.values(preliminary).flat();
   const listIds = [...new Set(listPosts.map(row => row.recordId))];
+  const listTransitions = transitions.filter(item => listPosts.some(row => row.eventId === item.eventId && row.recordId === item.recordId));
+  const historyIds = [...new Set(listTransitions.filter(item => customerDailyHandlingEpisode(item, transitions, cutoffAt).needsEarlierContext).map(item => item.recordId))];
+  const eventStart = Math.min(ms(customerDailyHandlingMonthStart(period)), ms(period.handlingStartAt || periodStart));
+  const historyStart = Math.min(eventStart, ...handlingRecords.filter(row => historyIds.includes(row.id)).map(row => ms(row.first_seen_at)));
+  // Earlier reply context is only for notes. It must not add old handling
+  // events to this month's statistics or change which posts enter the lists.
+  const historyEvents = historyIds.length && historyStart < eventStart ? await db.queryAll(`/* customer_daily:reply_history */
+    SELECT id, tenant_id, action, target_type, target_id, created_at,
+      jsonb_build_object('previousStatus', metadata->'previousStatus', 'nextStatus', metadata->'nextStatus',
+        'status', metadata->'status', 'recordIds', metadata->'recordIds', 'previous', metadata->'previous', 'note', metadata->'note') AS metadata
+    FROM audit_logs WHERE tenant_id=$1 AND target_type='record'
+      AND created_at >= $2::timestamptz AND created_at < $3::timestamptz
+      AND action IN ('record.triage_updated', 'record.triage_batch_updated', 'record.ticket_created', 'record.official_response_marked')
+      AND (target_id=ANY($4::text[]) OR metadata->'recordIds' ?| $4::text[])
+    ORDER BY created_at, id`, [tenantId, new Date(historyStart).toISOString(), new Date(eventStart).toISOString(), historyIds]) : [];
+  const noteEvents = [...historyEvents, ...handlingEvents];
+  const noteTransitions = historyEvents.length ? parseCustomerDailyHandlingEvents(noteEvents, {tenantId}).transitions : transitions;
+  const noteStart = Math.min(ms(period.handlingStartAt || periodStart), ...listTransitions.map(item => ms(customerDailyHandlingEpisode(item, noteTransitions, cutoffAt).startAt)));
   const notes = listIds.length ? await db.queryAll(`/* customer_daily:handling_notes */
     SELECT id, record_id, body, created_at FROM record_notes
     WHERE tenant_id=$1 AND record_id=ANY($2::uuid[]) AND created_at >= $3::timestamptz AND created_at < $4::timestamptz
-    ORDER BY created_at, id`, [tenantId, listIds, period.handlingStartAt || periodStart, cutoffAt]) : [];
-  const {coldMarked, repliedMarked, commentMarked} = buildCustomerDailyHandlingLists(handlingRecords, transitions, handlingEvents, notes, period);
+    ORDER BY created_at, id`, [tenantId, listIds, new Date(noteStart).toISOString(), cutoffAt]) : [];
+  const {coldMarked, repliedMarked, commentMarked} = buildCustomerDailyHandlingLists(handlingRecords, noteTransitions, noteEvents, notes, period);
   const malformed = handling.evidence.malformedEventIds;
   const currentColdIds = new Set(coldMarked.map(row => row.recordId));
   const withdrawn = [...new Set(transitions.filter(t => t.nextStatus === 'negative_cold'

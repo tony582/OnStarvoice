@@ -9,6 +9,7 @@ import { createApp } from '../../../server/app.js';
 import { hashPassword } from '../../../server/services/auth-service.js';
 import { persistRecordClassification } from '../../../server/services/ai-labeler.js';
 import { CONTENT_TOPIC_LABELS, CONTENT_TOPIC_VERSION } from '../../../server/services/content-topic.js';
+import {persistInitializedContentTopic} from '../../../server/services/content-topic-initialization.js';
 import { resolveMonitoringIntent, resolveTenantMonitoringScope } from '../../../server/services/monitoring-intent.js';
 const ExcelJS = createRequire(new URL('../../../server/package.json', import.meta.url))('exceljs');
 
@@ -67,7 +68,7 @@ test('content topics persist, filter and export independently, with audited manu
       assert.equal(sheet.rowCount, 2);
       const column = sheet.getRow(1).values.indexOf('内容主题');
       assert.ok(column > 0);
-      assert.equal(sheet.getRow(2).getCell(column).value, CONTENT_TOPIC_LABELS[topic] || '未分类');
+      assert.equal(sheet.getRow(2).getCell(column).value, CONTENT_TOPIC_LABELS[topic] || '主题生成中');
       assert.ok(sheet.getRow(1).values.includes('分类'));
     }
     const selected = await (await request('/triage/records?queue=triage&contentTopic=gm_other&status=reviewed_non_monitor')).json();
@@ -96,10 +97,10 @@ test('content topics persist, filter and export independently, with audited manu
     const history = (await pool.query('SELECT changed_fields,after_data FROM record_versions WHERE record_id=$1', [before.id])).rows;
     assert.ok(history.some(item => item.changed_fields.includes('content_topic') && item.after_data.content_topic === 'brand_app'));
     assert.equal((await patch(before.id, { contentTopic: 'not_a_topic' })).status, 400);
-    assert.equal((await patch(before.id, { contentTopic: null })).status, 200);
+    assert.equal((await patch(before.id, { contentTopic: null })).status, 400);
     const cleared = await getRecord(before.id);
     await persistRecordClassification({ record: cleared, labeled: label('onstar') });
-    assert.equal((await getRecord(before.id)).content_topic, null);
+    assert.equal((await getRecord(before.id)).content_topic, 'brand_app');
   });
   await t.test('AI writes a topic even outside monitoring, without changing triage state or inventing legacy topics', async () => {
     const source = await getRecord(ids.gm_other);
@@ -110,10 +111,30 @@ test('content topics persist, filter and export independently, with audited manu
     assert.equal((await pool.query('SELECT status FROM record_triage WHERE record_id=$1', [source.id])).rows[0].status, 'reviewed_non_monitor');
     const id = await insert(null);
     await persistRecordClassification({ record: await getRecord(id), labeled: label(undefined) });
-    assert.equal((await getRecord(id)).content_topic, null);
+    assert.equal((await getRecord(id)).content_topic, 'gm_other');
     await assert.rejects(pool.query('UPDATE records SET content_topic=$2 WHERE id=$1', [id, 'invented']), /records_content_topic_check/);
     const snapshot = await getRecord(id);
     await pool.query('UPDATE records SET content=$2 WHERE id=$1', [id, '正文已变更']);
     assert.equal(await persistRecordClassification({ record: snapshot, labeled: label('wallpaper') }), null);
+  });
+  await t.test('historical initialization only fills a classified topic and preserves manual decisions and concurrent content edits', async () => {
+    const id = await insert(null), original = await getRecord(id);
+    await pool.query("INSERT INTO record_triage(tenant_id,record_id,status,note) VALUES($1,$2,'reviewed','客户备注保持')", [tenant,id]);
+    const db = {queryOne: async(sql,params) => (await pool.query(sql,params)).rows[0]};
+    const result = {topic:'wallpaper',reason:'正文主要讨论壁纸',version:CONTENT_TOPIC_VERSION};
+    assert.ok(await persistInitializedContentTopic(db,tenant,original,result,'local-test'));
+    const saved = await getRecord(id);
+    assert.equal(saved.content_topic,'wallpaper');
+    for(const field of ['sentiment','category','content','title']) assert.equal(saved[field],original[field]);
+    assert.equal(saved.ai_result.relevance,original.ai_result.relevance);
+    assert.equal((await pool.query('SELECT status,note FROM record_triage WHERE record_id=$1',[id])).rows[0].note,'客户备注保持');
+    assert.equal(await persistInitializedContentTopic(db,tenant,original,result,'retry'),undefined);
+    const manualId=await insert(null), manual=await getRecord(manualId);
+    await patch(manualId,{contentTopic:'onstar'});
+    assert.equal(await persistInitializedContentTopic(db,tenant,manual,result,'race'),undefined);
+    const changedId=await insert(null), changed=await getRecord(changedId);
+    await pool.query('UPDATE records SET content=$2 WHERE id=$1',[changedId,'新的正文']);
+    assert.equal(await persistInitializedContentTopic(db,tenant,changed,result,'stale'),undefined);
+    assert.equal(await persistInitializedContentTopic(db,otherTenant,changed,result,'other-tenant'),undefined);
   });
 });

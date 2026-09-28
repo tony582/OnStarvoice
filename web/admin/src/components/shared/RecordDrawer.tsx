@@ -1226,7 +1226,7 @@ function JudgementEditor({ draft, currentIdentity, error, saving, onChange, onCa
           <label className="text-[12px] font-semibold text-muted-foreground">
             内容主题
             <select value={draft.contentTopic} onChange={e => onChange({ ...draft, contentTopic: e.target.value })} className={controlClass}>
-              <option value="">未分类</option>
+              {!draft.contentTopic && <option value="" disabled>请选择内容主题</option>}
               {CONTENT_TOPIC_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
           </label>

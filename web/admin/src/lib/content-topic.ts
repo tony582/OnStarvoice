@@ -9,5 +9,5 @@ export const CONTENT_TOPIC_OPTIONS = [
 ] as const
 
 export function contentTopicLabel(value: unknown): string {
-  return CONTENT_TOPIC_OPTIONS.find(option => option.value === value)?.label || '未分类'
+  return CONTENT_TOPIC_OPTIONS.find(option => option.value === value)?.label || '主题生成中'
 }

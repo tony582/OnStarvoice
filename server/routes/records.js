@@ -81,7 +81,7 @@ export function validateManualFields(body = {}) {
   }
   if (hasOwn(body, 'contentTopic')) {
     const contentTopic = normalizeContentTopic(body.contentTopic);
-    if (body.contentTopic !== null && body.contentTopic !== '' && !contentTopic) {
+    if (!contentTopic) {
       return { ok: false, error: 'invalid_content_topic', message: '内容主题无效' };
     }
     values.contentTopic = contentTopic;

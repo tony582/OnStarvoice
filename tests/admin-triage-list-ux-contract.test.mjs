@@ -132,7 +132,8 @@ test('toolbar and header filter the nine handling states without ticket filters'
   assert.doesNotMatch(lifecycleViews, /watched|已关注|Star/);
   assert.match(primary, /打开关注清单/);
   assert.match(primary, /aria-pressed=\{viewingWatchlist\}/);
-  assert.match(primary, /搜索标题、正文、作者、飞书表号、账号、平台ID、采集词、标签…/);
+  assert.match(primary, /placeholder="搜索标题、正文、作者…"/);
+  assert.match(primary, /title="可搜索标题、正文、作者、飞书表号、账号、平台ID、采集词和标签"/);
   assert.match(primary, /<MultiSelect label="疑似身份"/);
   assert.match(primary, /<KeywordFilter/);
   assert.match(primary, /label="自定义标签"/);

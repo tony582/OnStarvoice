@@ -37,7 +37,7 @@ import {
 
 import { CONTENT_TOPIC_PROMPT_RULES, CONTENT_TOPIC_VERSION, normalizeContentTopic } from './content-topic.js';
 
-export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v9';
+export const RECORD_CLASSIFICATION_PROMPT_VERSION = 'record-topic-v10';
 const RETRYABLE_MODEL_HTTP_STATUSES = new Set([429, 500, 502, 503, 504]);
 const activeActiveRequestSequences = new Map();
 const LLM_PROVIDER_ALIASES = Object.freeze({
@@ -170,7 +170,7 @@ ${CONTENT_TOPIC_PROMPT_RULES}
   "intentReason": "说明发帖者的主要表达目的，不超过80字",
   "category": "safety_rescue|feature_usage|renewal_billing|privacy|app_issue|service_quality|brand_image|other",
   "subcategory": "具体子分类（中文）",
-  "contentTopic": "onstar|infotainment|wallpaper|brand_app|sentry|gm_customer_service|gm_other|null",
+  "contentTopic": "onstar|infotainment|wallpaper|brand_app|sentry|gm_customer_service|gm_other",
   "contentTopicReason": "核心讨论对象及多主题择主依据，不超过80字",
   "sourceType": "ugc|pgc|employee|dealer|other",
   "confidence": 0.0-1.0,
@@ -1214,7 +1214,7 @@ export function normalizeRecordClassificationResult(result) {
     ...result,
     relevance,
     intent: normalizePostIntent(result?.intent),
-    contentTopic: normalizeContentTopic(result?.contentTopic),
+    contentTopic: normalizeContentTopic(result?.contentTopic) || 'gm_other',
     contentTopicReason: String(result?.contentTopicReason || '').trim().slice(0, 500),
     intentReason: String(result?.intentReason || '').trim().slice(0, 500),
     currentKeywordMatch,

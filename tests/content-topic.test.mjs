@@ -5,7 +5,7 @@ import { CONTENT_TOPIC_LABELS, CONTENT_TOPIC_PROMPT_RULES, normalizeContentTopic
 import { normalizeRecordClassificationResult } from '../server/services/ai-labeler.js';
 import { validateManualFields } from '../server/routes/records.js';
 
-test('content topics are seven single values; missing, unrelated and malformed results stay unclassified', () => {
+test('content topics are seven single values and manual changes cannot clear the topic', () => {
   assert.equal(Object.keys(CONTENT_TOPIC_LABELS).length, 7);
   for (const topic of Object.keys(CONTENT_TOPIC_LABELS)) {
     assert.equal(normalizeContentTopic(topic), topic);
@@ -15,8 +15,8 @@ test('content topics are seven single values; missing, unrelated and malformed r
     assert.equal(normalizeContentTopic(topic), null);
   }
   for (const topic of [false, {}, ['onstar'], 'other']) assert.equal(validateManualFields({ contentTopic: topic }).ok, false);
-  assert.equal(validateManualFields({ contentTopic: null }).values.contentTopic, null);
-  assert.equal(validateManualFields({ contentTopic: '' }).values.contentTopic, null);
+  assert.equal(validateManualFields({ contentTopic: null }).ok, false);
+  assert.equal(validateManualFields({ contentTopic: '' }).ok, false);
 });
 
 test('topic does not change overall relevance or intent, and outside monitoring can still have a GM topic', () => {
@@ -26,7 +26,7 @@ test('topic does not change overall relevance or intent, and outside monitoring 
     assert.equal(result.relevance, relevance);
     assert.equal(result.intent, 'inquiry');
   }
-  assert.equal(normalizeRecordClassificationResult({ relevance: 'irrelevant' }).contentTopic, null);
+  assert.equal(normalizeRecordClassificationResult({ relevance: 'irrelevant' }).contentTopic, 'gm_other');
 });
 
 test('topic SQL preserves tenant parameters and rejects invalid filters instead of exporting all rows', () => {

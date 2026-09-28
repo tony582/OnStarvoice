@@ -373,7 +373,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [boardNonce, setBoardNonce] = useState(0)
   const [archiveView, setArchiveView] = useState<ArchiveView>(initial?.bucket === 'archived' ? 'archived' : 'active')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
-  const [contentTopic, setContentTopic] = useState(initial?.contentTopic ?? '')
+  const [contentTopic, setContentTopic] = useState(CONTENT_TOPIC_OPTIONS.some(option => option.value === initial?.contentTopic) ? initial!.contentTopic : '')
   const [intents, setIntents] = useState<string[]>(() => initialPostIntentFilter(initial?.intent))
   const [relevances, setRelevances] = useState<string[]>(() => normalizePostRelevanceFilter(initial?.relevance))
   const [relevanceConfidences, setRelevanceConfidences] = useState<string[]>(() => normalizePostConfidenceFilter(initial?.relevanceConfidence))
@@ -1235,7 +1235,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         <Button size="sm" variant="outline" disabled={selectionBusy} onClick={cancelSelection}><X className="h-3.5 w-3.5" />取消多选</Button>
       </div>}
       <fieldset disabled={selectionActive} className="sticky left-0 z-30 min-w-0 !mb-0 space-y-2 border-b border-border/60 bg-background pb-3 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
-        <div data-triage-toolbar="primary" className="flex flex-wrap items-center gap-2">
+        <div data-triage-toolbar="primary" className="flex flex-wrap items-center gap-2 lg:gap-1 2xl:gap-2">
           <div className="inline-flex h-10 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:h-8" role="tablist" aria-label="内容生命周期">
             {ARCHIVE_VIEWS.map(item => {
               const Icon = item.icon
@@ -1263,7 +1263,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             })}
           </div>
 
-          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[140px] lg:max-w-[680px] lg:flex-1">
+          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[96px] lg:max-w-[320px] lg:flex-1">
             <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input value={keywordDraft} onChange={e => setKeywordDraft(e.target.value)}
@@ -1271,7 +1271,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   if (e.key !== 'Enter') return
                   e.preventDefault()
                   setKeyword(keywordDraft.trim())
-                }} placeholder="搜索标题、正文、作者、飞书表号、账号、平台ID、采集词、标签…" className="h-10 w-full border-transparent bg-muted px-8 text-[12px] focus:bg-card lg:h-8" />
+                }} placeholder="搜索标题、正文、作者…" title="可搜索标题、正文、作者、飞书表号、账号、平台ID、采集词和标签" className="h-10 w-full border-transparent bg-muted px-8 text-[12px] focus:bg-card lg:h-8" />
               {keywordDraft && (
                 <button
                   type="button"
@@ -1295,6 +1295,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
               <SlidersHorizontal className="h-3.5 w-3.5" />筛选
               {activeFilterCount > 0 && <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-bold text-primary-foreground">{activeFilterCount}</span>}
             </button>
+          </div>
+
+          <div className="hidden w-[128px] shrink-0 lg:block">
+            <TriageSelect value={contentTopic} onChange={e => setContentTopic(e.target.value)} aria-label="内容主题筛选" className={cn('bg-muted font-medium hover:bg-muted/70', contentTopic ? 'text-primary' : 'text-muted-foreground')}>
+              <option value="">全部内容主题</option>
+              {CONTENT_TOPIC_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </TriageSelect>
           </div>
 
           <div className="hidden shrink-0 lg:block">
@@ -1414,11 +1421,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           <PostIntentFilter value={intents} onChange={setIntents} />
-          <TriageSelect value={contentTopic} onChange={e => setContentTopic(e.target.value)} aria-label="内容主题筛选" className="lg:!w-[146px]">
+          <div className="lg:hidden">
+          <TriageSelect value={contentTopic} onChange={e => setContentTopic(e.target.value)} aria-label="内容主题筛选" className={cn('bg-muted font-medium hover:bg-muted/70', contentTopic ? 'text-primary' : 'text-muted-foreground')}>
             <option value="">全部内容主题</option>
             {CONTENT_TOPIC_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-            <option value="unclassified">未分类</option>
           </TriageSelect>
+          </div>
           <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} />
 
           {view === 'list' && (

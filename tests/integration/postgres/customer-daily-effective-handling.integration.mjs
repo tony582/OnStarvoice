@@ -73,4 +73,18 @@ test('real PostgreSQL reproduces cold 14 to 7, audits every negative bucket, and
   assert.deepEqual(after.commentMarked.find(row => row.recordId === groups.negative_comment[2]).supplementalNotes.map(row => row.body), ['同状态追加']);
   assert.deepEqual(before, frozen, 'regenerating cannot alter the prior version');
   assert.doesNotMatch(JSON.stringify(after), /跨租户/);
+  // A prior-month reply can be reclassified today. Preserve its text/notes
+  // without moving the earlier event into this month's handling counts.
+  const inherited = await record('negative_comment', 'negative', '2026-08-30T01:00:00Z');
+  await pool.query('DELETE FROM audit_logs WHERE tenant_id=$1 AND target_id=$2', [tenantId,inherited]);
+  await pool.query(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,action,target_type,target_id,metadata,created_at)
+    VALUES($1,'system','local-test','record.triage_updated','record',$2,$3::jsonb,'2026-08-31T10:00:00+08:00')`, [tenantId,inherited,JSON.stringify({previousStatus:'unhandled',nextStatus:'replied',note:'跨月原回复😀'})]);
+  await pool.query("INSERT INTO record_notes(tenant_id,record_id,body,created_at) VALUES($1,$2,'跨月回复的补充','2026-08-31T11:00:00+08:00')", [tenantId,inherited]);
+  await transition(inherited,'replied','negative_comment',14);
+  const updated = await collectCustomerDailyReport(options), carried = updated.commentMarked.find(row => row.recordId === inherited);
+  assert.equal(carried.replyContent,'跨月原回复😀');
+  assert.deepEqual(carried.supplementalNotes.map(row => row.body),['跨月回复的补充']);
+  assert.equal(updated.summary.day.comment,after.summary.day.comment+1);
+  assert.equal(updated.summary.mtd.comment,after.summary.mtd.comment+1);
+  assert.equal(updated.repliedMarked.length,after.repliedMarked.length);
 });

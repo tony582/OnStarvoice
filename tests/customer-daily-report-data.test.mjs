@@ -51,6 +51,7 @@ function fakeDb(seed = {}) {
       if (sql.includes('customer_daily:handling_events')) return seed.handlingEvents || seed.events || [];
       if (sql.includes('customer_daily:handling_posts')) return seed.handlingPosts || seed.coldPosts || [];
       if (sql.includes('customer_daily:handling_notes')) return seed.notes || [];
+      if (sql.includes('customer_daily:reply_history')) return seed.replyHistory || [];
       if (sql.includes('customer_daily:heat_posts')) return seed.heatPosts || [];
       if (sql.includes('customer_daily:observations')) return seed.observations || [];
       if (sql.includes('customer_daily:pending_capture')) return seed.pending || [];
