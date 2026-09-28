@@ -4,9 +4,9 @@ import test from 'node:test';
 import vm from 'node:vm';
 import {webcrypto} from 'node:crypto';
 
-const [bindingSource, homeSource, background, sidebar, capture] = await Promise.all([
+const [bindingSource, homeSource, background, sidebar, capture, safetySource] = await Promise.all([
   '../utils/keyword-source-binding.js', '../utils/task-home-cleanup.js', '../background.js',
-  '../sidebar/sidebar-logic.js', '../utils/capture-sync.js',
+  '../sidebar/sidebar-logic.js', '../utils/capture-sync.js', '../utils/task-home-page-safety.js',
 ].map(path => readFile(new URL(path, import.meta.url), 'utf8')));
 const clone = value => structuredClone(value);
 function section(source, start, end) {
@@ -161,7 +161,7 @@ function integrationHarness({storage = memory(), session = memory(), pages: init
       scripting: {executeScript: async ({target}) => {
         const page = await tabs.get(target.tabId);
         if (state.probe) return state.probe(page);
-        return [{frameId: 0, documentId: page.documentId, result: {url: page.url}}];
+        return [{frameId: 0, documentId: page.documentId, result: {url: page.url, safeForCleanup: true}}];
       }}},
     isTaskBrowserIdle: async () => state.idle,
     resolveCaptureTaskTabId: value => Number.isSafeInteger(value) && value > 0 ? value : null,
@@ -181,6 +181,7 @@ function integrationHarness({storage = memory(), session = memory(), pages: init
   });
   vm.runInContext(bindingSource, context);
   vm.runInContext(homeSource, context);
+  vm.runInContext(safetySource, context);
   vm.runInContext(section(background, 'const keywordSourceBindings =', 'async function canCloseManualKeywordRunner('), context);
   for (const name of ['findExistingPlatformTab', 'activateOrCreatePlatformTab', 'launchUnattendedKeywordRun']) {
     vm.runInContext(fn(background, name), context);

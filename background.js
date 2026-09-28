@@ -27,6 +27,8 @@ try {
 importScripts(
   'utils/manual-keyword-dispatch.js',
   'utils/task-home-cleanup.js',
+  'utils/task-window-sources.js',
+  'utils/task-home-page-safety.js',
   'utils/keyword-source-binding.js',
   'utils/retired-runner-cleanup.js',
   'utils/control-storage-reserve.js',
@@ -3569,6 +3571,7 @@ async function openOwnedTargetedPostPlatformTab({
             chrome.storage.local.set({
               [STORAGE_KEYS.targetedPostPlatformTab]: reusedRegistration,
             }));
+          await captureManagedTaskWindow({...current, platform: target.platform || current.platform}, existingTab);
           await chrome.tabs.update(existingRegistration.tabId, {
             url: targetUrl,
             active: true,
@@ -3613,6 +3616,7 @@ async function openOwnedTargetedPostPlatformTab({
     await runAuthoritativeControlStorageMutation(() => chrome.storage.local.set({
       [STORAGE_KEYS.targetedPostPlatformTab]: registration,
     }));
+    await captureManagedTaskWindow({...current, platform: target.platform || current.platform}, tab);
     await chrome.tabs.update(tabId, {url: targetUrl, active: true});
     return {ok: true, data: registration};
   } catch (error) {
@@ -6854,6 +6858,8 @@ async function bindKeywordSource(request, source, runnerDocumentId = '') {
           current.claimedDocumentId !== runnerDocumentId) return;
     }
     if (control.isCanceled()) return;
+    await captureManagedTaskWindow(request, source, control);
+    if (control.isCanceled()) return;
     const binding = await keywordSourceBindings?.bind(owner, source, {shouldWrite: () => !control.isCanceled()});
     // A timed-out storage operation cannot be canceled in Chrome. Its serial
     // write finishes before newer binding writes, and it never revokes a newer
@@ -6870,13 +6876,14 @@ async function getTaskSourceDocumentIdentity(tabId) {
         const before = await chrome.tabs.get(tabId);
         if (before.pendingUrl || before.status === 'loading') return null;
         const results = await chrome.scripting.executeScript({
-          target: {tabId, frameIds: [0]}, func: () => ({url: location.href}),
+          target: {tabId, frameIds: [0]}, func: globalThis.OnStarvoiceTaskHomePageSafety.readDocument,
         });
         const main = results?.find(result => result.frameId === 0);
         const after = await chrome.tabs.get(tabId);
         if (!main?.documentId || !main.result?.url || after.pendingUrl || after.status === 'loading' ||
             before.windowId !== after.windowId || before.url !== after.url || main.result.url !== after.url) return null;
-        return {documentId: main.documentId, url: main.result.url, windowId: after.windowId};
+        return {documentId: main.documentId, url: main.result.url, windowId: after.windowId,
+          safeForCleanup: main.result.safeForCleanup === true};
       })(),
       new Promise(resolve => { timer = setTimeout(() => resolve(null), 1500); }),
     ]);
@@ -6911,6 +6918,30 @@ async function recordKeywordSourceNavigation(message, sender) {
   return {recorded};
 }
 
+async function deferKeywordSourceRestore(message, sender) {
+  // Only the authenticated managed runner can hand its final search document
+  // to home cleanup. This records proof; it never starts navigation or cleanup.
+  const context = await readKeywordSourceSenderOwner(sender);
+  if (!context || !keywordSourceBindings) return {deferred: false};
+  const sourceTabId = resolveCaptureTaskTabId(message.sourceTabId);
+  const sources = await keywordSourceBindings.get(context.owner);
+  const source = sources.find(item => item.sourceTabId === sourceTabId);
+  if (!source?.documentId || !source.expectedSourceUrl) return {deferred: false};
+  const evidence = await getTaskSourceDocumentIdentity(sourceTabId);
+  const keywords = context.request.planSnapshot?.keywords || context.request.plan?.keywords || [];
+  const api = globalThis.OnStarvoiceTaskHomeCleanup;
+  if (!evidence || evidence.safeForCleanup !== true || evidence.windowId !== source.windowId ||
+      evidence.documentId !== source.documentId || evidence.url !== source.expectedSourceUrl ||
+      (!api.isPlanSearch(evidence.url, context.owner.platform, keywords) && !api.isHome(evidence.url, context.owner.platform))) {
+    return {deferred: false};
+  }
+  const latest = await readKeywordSourceSenderOwner(sender);
+  if (latest?.owner.identity !== context.owner.identity || latest.owner.runnerDocumentId !== context.owner.runnerDocumentId) {
+    return {deferred: false};
+  }
+  return {deferred: await keywordSourceBindings.record(context.owner, {sourceTabId, ...evidence})};
+}
+
 let taskHomeCreationSessionPromise = null;
 async function getTaskHomeCreationSessionId() {
   if (!chrome.storage.session?.get || !chrome.storage.session?.set) return null;
@@ -6927,9 +6958,50 @@ async function getTaskHomeCreationSessionId() {
   return taskHomeCreationSessionPromise;
 }
 
+// Background-managed jobs run in the dedicated collection window. Snapshot
+// only its standard platform landing/search documents before work starts; this
+// does not authorize sweeping other windows, detail pages or later user tabs.
+const taskWindowSources = globalThis.OnStarvoiceTaskWindowSources?.createController({
+  storage: chrome.storage.session, tabs: chrome.tabs,
+  getDocumentIdentity: getTaskSourceDocumentIdentity, getSessionId: getTaskHomeCreationSessionId,
+});
+async function captureManagedTaskWindow(request, tab, control = null) {
+  if (!taskWindowSources || !request?.id || !tab?.windowId) return;
+  const capture = async sidecar => {
+    // The optional inventory must never turn a storage/probe failure into a
+    // collection failure or extend the task's launch budget indefinitely.
+    if (request.workflow) {
+      const latest = await readTargetedPostRunRequest({persistNormalized: false});
+      if (latest?.id !== request.id || latest?.attemptId !== request.attemptId ||
+          cloudTargetedPostApi.isTerminalRunStatus(latest?.status)) return;
+    }
+    if (sidecar.isCanceled()) return;
+    const platforms = new Set([
+      request.platform || request.planSnapshot?.platform || request.plan?.platform,
+      ...(request.targets || []).map(target => target.platform),
+    ].filter(platform => globalThis.OnStarvoiceTaskHomeCleanup.HOMES[platform]));
+    for (const platform of platforms) {
+      if (sidecar.isCanceled()) return;
+      await taskWindowSources.begin({
+        identity: `${request.id}:${request.attemptId || request.commandId || ''}`,
+        platform, windowId: tab.windowId,
+        excludeTabIds: [request.runnerTabId, tab.id].filter(Number.isSafeInteger),
+      }, sidecar);
+    }
+  };
+  // A source returned by activateOrCreatePlatformTab uses tabId, not id, and
+  // must remain in the inventory. The targeted placeholder/detail uses id.
+  try {
+    if (control) return await capture(control);
+    return await runTaskHomeSidecar(capture);
+  } catch { return null; }
+}
+
 const taskHomeCleanup = globalThis.OnStarvoiceTaskHomeCleanup?.createController({
   storage: chrome.storage.local, tabs: chrome.tabs, canPark: isTaskBrowserIdle,
   getDocumentIdentity: getTaskSourceDocumentIdentity,
+  canUseWindowSource: async source => Boolean(source.windowSessionId &&
+    source.windowSessionId === await getTaskHomeCreationSessionId()),
   canCreateHome: async entry => Boolean(entry.creationSessionId &&
     entry.creationSessionId === await getTaskHomeCreationSessionId()),
 });
@@ -6948,10 +7020,23 @@ async function queueFinishedTaskHome(request, {runnerTab = null, allowCreateHome
     ? await chrome.tabs.get(request.runnerTabId).catch(() => null) : null);
   // progress.runnerTabId describes the current detail/sync step, and final
   // streaming progress legitimately clears it. It is never source authority.
-  const sources = await runTaskHomeSidecar(() => keywordSourceBindings
-    ? keywordSourceBindings.get(keywordSourceOwnerForRequest(request)) : []);
+  const sourceState = await runTaskHomeSidecar(async () => {
+    const bound = keywordSourceBindings ? await keywordSourceBindings.get(keywordSourceOwnerForRequest(request)) : [];
+    const window = taskWindowSources ? await taskWindowSources.get({
+      identity: `${request.id}:${request.attemptId || request.commandId || ''}`, platform,
+    }) : {sources: [], keywords: [], known: false, blocked: false};
+    // A newer task has taken this window. Old callbacks cannot borrow its proof
+    // or turn an empty lookup into permission to open another homepage.
+    if (window.blocked) return null;
+    const merged = new Map((window.sources || []).map(source => [source.sourceTabId, source]));
+    // Keyword navigation owns the current document; the pre-task snapshot must
+    // never overwrite that newer evidence, even when recording was unavailable.
+    for (const source of bound) merged.set(source.sourceTabId, source);
+    return {sources: [...merged.values()], keywords: window.keywords || []};
+  });
   // A stuck cosmetic registry must not prevent the terminal runner handshake.
-  if (!Array.isArray(sources)) return;
+  if (!sourceState) return;
+  const {sources} = sourceState;
   const windowIds = new Set(sources.map(source => source.windowId));
   if (!windowIds.size && runner?.windowId) windowIds.add(runner.windowId);
   for (const windowId of windowIds) {
@@ -6960,7 +7045,7 @@ async function queueFinishedTaskHome(request, {runnerTab = null, allowCreateHome
       identity: `${request.id}:${request.attemptId || request.commandId || ''}`,
       platform, windowId, runnerTabId: runner?.id,
       sources: windowSources, dedicatedWindow: windowSources.length > 0,
-      keywords: request.planSnapshot?.keywords || request.plan?.keywords || [],
+      keywords: [...new Set([...(request.planSnapshot?.keywords || request.plan?.keywords || []), ...sourceState.keywords])],
       allowCreateHome: allowCreateHome === true,
       creationSessionId: allowCreateHome === true ? await getTaskHomeCreationSessionId() : null,
     });
@@ -23947,6 +24032,7 @@ chrome.tabs.onCreated?.addListener((tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  void taskWindowSources?.forgetTab(tabId).catch(error => console.warn('[Cleanup] window source removal failed:', error));
   void keywordSourceBindings?.forget(tabId).catch(error => console.warn('[Cleanup] closed source binding cleanup failed:', error));
   forgetOwnedCaptureTab(tabId).catch((error) => {
     console.warn('[OwnedTabs] removal cleanup failed', error);
@@ -24660,6 +24746,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return platformTab;
         });
         sendResponse({ ok: true, data });
+        return;
+      }
+
+      if (type === 'onstarvoice:defer-keyword-source-restore') {
+        const data = await deferKeywordSourceRestore(message, sender).catch(() => ({deferred: false}));
+        sendResponse({ok: true, data});
         return;
       }
 

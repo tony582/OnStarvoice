@@ -70,7 +70,15 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.21<span class="date">2026-09-28</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.22<span class="date">2026-09-28</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>补详情和巡查收拢已有页面：</strong>专用采集窗口在任务开始时记录已有搜索页和主页，停稳后将身份可核验的页面收拢为每个平台一个主页。只有搜索页时直接归位，已有抖音 /jingxuan 主页时复用，修复补详情结束仍剩“搜索页＋主页”的问题。需更新 Extension。</li>
+            <li><strong>关键词直接归位：</strong>后台确认接管的来源页直接进入主页收尾，不再先恢复旧搜索页，避免慢加载导致记录失效。采集、同步和任务结果处理保持原流程。</li>
+            <li><strong>保留保护现场：</strong>复核窗口、地址、文档和浏览器加载期；新任务、用户切页、登录或安全验证时保留页面，未知状态不额外开主页。Android Runner 0.2.6 保持不变。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.21<span class="date">2026-09-28</span></h3>
           <ul>
             <li><strong>收拢任务搜索页：</strong>专用采集窗口内，关键词任务停止及上传确认完成后，回收任务实际使用且身份可核验的多余搜索页，每个平台复用一个主页。归属独立保存，不再因最终同步进度缺少页面编号而遗留。需更新 Extension。</li>
             <li><strong>正确识别主页：</strong>识别抖音 /jingxuan 主页和小红书标准搜索路由，已有主页时优先复用；找不到任务源页时不再额外开主页。巡查及手机发现作品补详情仍保留安全归位。</li>

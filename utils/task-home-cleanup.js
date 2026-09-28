@@ -39,6 +39,7 @@
       sourceTabId: id(value.sourceTabId), expectedSourceUrl: text(value.expectedSourceUrl),
       documentId: text(value.documentId), createdByTask: value.createdByTask === true,
       originalUrl: text(value.originalUrl),
+      ...(text(value.windowSessionId) ? {windowSessionId: text(value.windowSessionId)} : {}),
       ...(value.closed === true ? {closed: true} : {}),
       ...(value.homeRequested === true ? {homeRequested: true} : {}),
       ...(text(value.settledReason) ? {settledReason: text(value.settledReason)} : {}),
@@ -52,7 +53,7 @@
   }
   // This queue carries UI cleanup only. Every source obligation survives until
   // it is resolved; sharing a window/platform does not merge task ownership.
-  function createController({storage, tabs, canPark, getDocumentIdentity = async () => null, canCreateHome = async () => false}) {
+  function createController({storage, tabs, canPark, getDocumentIdentity = async () => null, canCreateHome = async () => false, canUseWindowSource = async () => false}) {
     let tail = Promise.resolve();
     const serial = fn => { const next = tail.then(fn, fn); tail = next.catch(() => {}); return next; };
     const read = async () => (await storage.get(STORAGE_KEY))[STORAGE_KEY] || {};
@@ -73,6 +74,7 @@
       if (!source.sourceTabId || !source.documentId || !source.expectedSourceUrl) {
         return {reason: 'source_identity_unverified'};
       }
+      if (source.windowSessionId && !await canUseWindowSource(source)) return {reason: 'window_session_changed'};
       const current = await readTab(source.sourceTabId);
       if (current.gone) return current;
       const matches = tab => tab?.windowId === entry.windowId && tab.url === source.expectedSourceUrl &&
@@ -83,6 +85,7 @@
       }
       const document = await getDocumentIdentity(source.sourceTabId);
       if (!document?.documentId || !document?.url) return {reason: 'source_identity_unverified'};
+      if (document.safeForCleanup === false || (source.windowSessionId && document.safeForCleanup !== true)) return {reason: 'source_page_protected'};
       if (document.documentId !== source.documentId || document.url !== source.expectedSourceUrl) {
         return {reason: 'source_document_changed'};
       }
@@ -322,10 +325,15 @@
         const reassignedTabs = new Set(next.sources.filter(source => source.documentId).map(source => source.sourceTabId));
         for (const [oldKey, old] of Object.entries(entries)) {
           if (old.identity === next.identity) continue;
-          old.sources = sourcesOf(old).filter(source => !reassignedTabs.has(source.sourceTabId));
-          if (reassignedTabs.has(old.createdHome?.sourceTabId)) {
+          const oldSources = sourcesOf(old);
+          old.sources = oldSources.filter(source => !reassignedTabs.has(source.sourceTabId));
+          const homeReassigned = reassignedTabs.has(old.createdHome?.sourceTabId);
+          if (homeReassigned) {
             old.createdHome.creationPending = false; old.createdHome.documentId = '';
           }
+          // Transferring the last source cannot revive the old task's fallback
+          // create permission. The newer task now owns this window obligation.
+          if (homeReassigned || old.sources.length < oldSources.length) old.allowCreateHome = false;
           if (!old.sources.length && !old.allowCreateHome) delete entries[oldKey];
         }
         entries[key] = next;

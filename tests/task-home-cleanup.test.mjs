@@ -354,7 +354,7 @@ test('the actual background home entry accepts warning/partial/error terminals b
     taskHomeCleanup: {enqueue: async value => enqueued.push(value), reconcile: async () => []},
     chrome: {tabs: {get: async () => ({id: 11, windowId: 1})}},
     resolveCaptureTaskTabId: () => null, scheduleTaskBrowserCleanup: async () => {},
-    keywordSourceBindings: {get: async () => []}, keywordSourceOwnerForRequest: request => request,
+    taskWindowSources: null, keywordSourceBindings: {get: async () => []}, keywordSourceOwnerForRequest: request => request,
     getTaskHomeCreationSessionId: async () => base.creationSessionId,
     runTaskHomeSidecar: fn => fn(),
     runCaptureExecutionLockOperation: fn => fn(),

@@ -3,12 +3,24 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.21',
+  latestVersion: '0.4.22',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-09-28',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.21-20260928.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.22-20260928.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.22',
+      releaseDate: '2026-09-28',
+      releaseNotes: [{
+        tag: '修复',
+        notes: [
+          {title: '补详情结束后合并已有搜索页', desc: '专用采集窗口内，手机发现作品补详情和各类巡查会记录本轮开始前已有的搜索页与主页；任务停稳后，身份可核验的页面收拢为每个平台一个主页。只有搜索页时直接归位，已有抖音 /jingxuan 主页时优先复用，避免再留一张搜索页。需更新 Extension。'},
+          {title: '关键词结束后直接归位', desc: '后台确认接管的关键词来源页直接进入主页收尾，不再先恢复旧搜索页，避免慢加载导致收尾记录失效。采集、同步与任务结果处理保持原流程。'},
+          {title: '保留正在使用及验证中的页面', desc: '开始时和收尾前复核同一窗口、地址、文档及浏览器加载期，后台重启后继续核对；遇到新任务、页面已切走、登录或安全验证时保留页面，未知状态不额外开主页。Android Runner 0.2.6 保持不变。'},
+        ],
+      }],
+    },
     {
       version: '0.4.21',
       releaseDate: '2026-09-28',

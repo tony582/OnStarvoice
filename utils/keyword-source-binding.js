@@ -106,5 +106,20 @@
     } catch { /* Missing evidence preserves the page. */ }
     finally { clearTimeout(timer); }
   }
-  root.OnStarvoiceKeywordSourceBinding = Object.freeze({STORAGE_KEY, identityFor, searchKeyword, createController, recordNavigation});
+  // The authenticated background may keep the current proven search document
+  // for terminal home cleanup. A timeout changes only this local decision;
+  // late background work records evidence and never navigates a page.
+  async function deferRestore(sourceTabId) {
+    let timer;
+    try {
+      if (!tabId(sourceTabId)) return false;
+      const response = await Promise.race([
+        root.chrome?.runtime?.sendMessage({type: 'onstarvoice:defer-keyword-source-restore', sourceTabId}),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), 1500); }),
+      ]);
+      return response?.ok === true && response?.data?.deferred === true;
+    } catch { return false; }
+    finally { clearTimeout(timer); }
+  }
+  root.OnStarvoiceKeywordSourceBinding = Object.freeze({STORAGE_KEY, identityFor, searchKeyword, createController, recordNavigation, deferRestore});
 })(globalThis);

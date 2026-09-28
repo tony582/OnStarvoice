@@ -17880,20 +17880,28 @@ export async function batchCaptureByKeywords({
     if (typeof runnerReplacementEvents?.removeListener === 'function') {
       runnerReplacementEvents.removeListener(handleRunnerTabReplacement);
     }
-    // 检查点持久化或外部回调失败时也必须恢复 runner 原页，避免页面永久停在半途关键词。
+    // Managed keyword runners can hand the current proven document to final
+    // home cleanup, avoiding another search navigation just before retirement.
+    // Ordinary capture or an unconfirmed handoff keeps the original restore.
     if (runnerCtx.shouldRestoreSourcePage && runnerCtx.sourcePageUrl) {
+      let restoreDeferred = false;
       try {
-        const currentTab = await chrome.tabs.get(runnerTabId);
-        const currentUrl = normalizeUrlWithoutHash(currentTab?.url);
-        const sourceUrl = normalizeUrlWithoutHash(runnerCtx.sourcePageUrl);
-        if (currentUrl !== sourceUrl) {
-          await chrome.tabs.update(runnerTabId, {
-            url: runnerCtx.sourcePageUrl,
-          });
+        restoreDeferred = await globalThis.OnStarvoiceKeywordSourceBinding?.deferRestore?.(runnerTabId) === true;
+      } catch { /* Sidecar failure must not prevent the original restore. */ }
+      if (!restoreDeferred) {
+        try {
+          const currentTab = await chrome.tabs.get(runnerTabId);
+          const currentUrl = normalizeUrlWithoutHash(currentTab?.url);
+          const sourceUrl = normalizeUrlWithoutHash(runnerCtx.sourcePageUrl);
+          if (currentUrl !== sourceUrl) {
+            await chrome.tabs.update(runnerTabId, {
+              url: runnerCtx.sourcePageUrl,
+            });
+          }
+          await globalThis.OnStarvoiceKeywordSourceBinding?.recordNavigation(runnerTabId, runnerCtx.sourcePageUrl);
+        } catch {
+          // ignore restore failure
         }
-        await globalThis.OnStarvoiceKeywordSourceBinding?.recordNavigation(runnerTabId, runnerCtx.sourcePageUrl);
-      } catch {
-        // ignore restore failure
       }
     }
   }
