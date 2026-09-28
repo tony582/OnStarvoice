@@ -46,12 +46,17 @@ import {
   batchCaptureByUrls,
   lightSampleByKeywords,
   captureTabContent,
+  probeDetailPreloadSafety,
   beginDouyinSearchResultTransitionInTab,
   readDouyinSearchDocumentGenerationInTab,
   beginCaptureTaskSession,
   updateCaptureTaskSession,
   endCaptureTaskSession,
 } from "../utils/capture-sync.js";
+import {
+  readDiscoveredPostDocument,
+  waitForDiscoveredPostTab,
+} from "../utils/capture/discovered-post-readiness.js";
 import {
   getCaptureSettings,
   saveCaptureSettings,
@@ -17678,7 +17683,19 @@ async function settleTargetedPostRunnerTab(
   }
 }
 
-async function waitForTargetedPostRunnerTab(tabId, shouldStop) {
+async function waitForTargetedPostRunnerTab(tabId, shouldStop, {workflow, target, platform} = {}) {
+  if (workflow === "discovered_post_capture") {
+    return waitForDiscoveredPostTab({
+      tabId,
+      target,
+      platform,
+      shouldStop,
+      readTab: (id) => chrome.tabs.get(id),
+      readDocument: readDiscoveredPostDocument,
+      probeSafety: probeDetailPreloadSafety,
+      canonicalizeTargetUrl: cloudTargetedPostApi.canonicalizeTargetUrl,
+    });
+  }
   const startedAt = Date.now();
   while (Date.now() - startedAt < 20 * 1000) {
     if (shouldStop()) {
@@ -17882,6 +17899,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
   batchUrlCancelRequested = targetedPostCancelRequested;
   let executionLock = null;
   let targetTabId = null;
+  let initialReadinessSafetyFailure = null;
   let stopTargetedPostHeartbeat = () => {};
   let targetedBusinessProgressTimer = null;
   let pendingTargetedBusinessProgress = null;
@@ -18028,7 +18046,11 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       }
       activeBatchRunnerTabId = targetTabId;
       targetedPostRunnerTabOwnerToken = invocationToken;
-      await waitForTargetedPostRunnerTab(targetTabId, shouldStop);
+      await waitForTargetedPostRunnerTab(targetTabId, shouldStop, {
+        workflow: targetedWorkflow,
+        target: pendingTargets[0],
+        platform: request.platform,
+      });
     }
 
     if (!isActiveTargetedPostInvocation(invocationToken)) {
@@ -18488,6 +18510,18 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
     stopTargetedPostHeartbeat();
     await flushTargetedBusinessProgress();
     console.error("[Sidebar] Targeted post workflow failed:", error);
+    if (
+      targetedWorkflow === "discovered_post_capture" &&
+      error?.stage === "initial_detail_readiness" &&
+      !shouldStop() && error?.code !== "TARGET_CAPTURE_CANCELED"
+    ) {
+      const failure = cloudTargetedPostApi.projectCaptureFailure([error], {
+        stage: "initial_detail_readiness",
+      });
+      if (failure.requiresManualAction === true) {
+        initialReadinessSafetyFailure = failure;
+      }
+    }
     const staleInvocation =
       String(error?.code || "") === "stale_targeted_post_attempt" ||
       !isActiveTargetedPostInvocation(invocationToken);
@@ -18497,19 +18531,23 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       !cloudTargetedPostApi.isTerminalRunStatus(request.status)
     ) {
       try {
-        await updateTargetedPostRun(request, {
+        const updatedRequest = await updateTargetedPostRun(request, {
           status:
             shouldStop() || error?.code === "TARGET_CAPTURE_CANCELED"
               ? "canceled"
-              : "failed",
+              : initialReadinessSafetyFailure ? "needs_action" : "failed",
           finishedAt: new Date().toISOString(),
           heartbeatAt: new Date().toISOString(),
           message:
             shouldStop() || error?.code === "TARGET_CAPTURE_CANCELED"
               ? `${workflowLabel}已停止并保留已有结果`
               : String(error?.message || `${workflowLabel}失败`),
-          error: {
+          error: initialReadinessSafetyFailure || {
             code: String(error?.code || "TARGET_CAPTURE_FAILED"),
+            ...(targetedWorkflow === "discovered_post_capture" &&
+            error?.stage === "initial_detail_readiness"
+              ? {stage: "initial_detail_readiness"}
+              : {}),
             message: String(error?.message || "定向作品采集失败").slice(
               0,
               1000,
@@ -18518,9 +18556,11 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
               ![
                 "TARGET_IDENTITY_MISMATCH",
                 "TARGET_URL_NOT_ALLOWED",
+                "TARGET_RUNNER_DOCUMENT_CHANGED",
               ].includes(String(error?.code || "")),
           },
         }, invocationToken);
+        if (initialReadinessSafetyFailure) request = updatedRequest;
       } catch (reportError) {
         console.error(
           "[Sidebar] Targeted post terminal report failed:",
@@ -18544,7 +18584,8 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       ))
     ) {
       await settleTargetedPostRunnerTab(targetTabId, request?.platform, {
-        returnHome: !cloudTargetedPostApi.shouldPreservePlatformTab(request),
+        returnHome: !initialReadinessSafetyFailure &&
+          !cloudTargetedPostApi.shouldPreservePlatformTab(request),
         targets: request?.targets,
       });
     }

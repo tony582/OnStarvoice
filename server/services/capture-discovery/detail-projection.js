@@ -2,6 +2,32 @@ import {operatorClosedTask} from '../capture-operator-close.js';
 
 const terminal=new Set(['completed','completed_with_warnings','completed_with_failures','failed','needs_action','canceled','skipped','superseded']);
 
+const projectionCodes=new Set(['detail_finished_without_ingestion','detail_canceled']);
+const text=(value,limit=1500)=>typeof value==='string'?value.trim().slice(0,limit):'';
+function failureSource(task,snapshot) {
+  const inputs=[snapshot,task];
+  for (const input of inputs) {
+    const error=input.error||{};
+    const projected=projectionCodes.has(error.code);
+    const sourceCode=text(projected?error.sourceCode:error.code,160);
+    const sourceMessage=text(projected?error.sourceMessage:error.message||error.reason);
+    if (!sourceCode&&!sourceMessage) continue;
+    const phase=text(projected?error.sourcePhase:error.phase||error.stage||input.progress?.phase||input.phase,160);
+    return {...(sourceCode?{sourceCode}:{}),...(sourceMessage?{sourceMessage}:{}),
+      ...(phase&&phase!=='unknown'?{sourcePhase:phase}:{})};
+  }
+  // Old agents can report only a failure message. Do not promote a generic
+  // projection message (or a successful client report) into the original cause.
+  for (const input of inputs) {
+    if (projectionCodes.has(input.error?.code)||!['failed','needs_action','completed_with_failures','canceled','superseded'].includes(input.status)) continue;
+    const sourceMessage=text(input.message);
+    if (!sourceMessage) continue;
+    const phase=text(input.progress?.phase||input.phase,160);
+    return {sourceMessage,...(phase&&phase!=='unknown'?{sourcePhase:phase}:{})};
+  }
+  return {};
+}
+
 // Targeted legacy patrols identify an existing record. Discovery deliberately
 // has no input recordId; success is proved by the record-store receipt instead.
 export async function projectDiscoveryTaskResult(tx,{tenantId,task,snapshot={}}) {
@@ -22,7 +48,17 @@ export async function projectDiscoveryTaskResult(tx,{tenantId,task,snapshot={}})
   const canceled=['canceled','superseded'].includes(task.status)||['canceled','superseded'].includes(status);
   const itemStatus=stored?'completed':canceled?'canceled':'needs_action';
   const taskStatus=canceled?status==='superseded'?'superseded':'canceled':stored?'completed':'needs_action';
-  const error=stored?{}:{code:canceled?'detail_canceled':'detail_finished_without_ingestion',reportedStatus:status};
+  const source=stored?{}:failureSource(task,snapshot);
+  const cause=source.sourceMessage
+    ? `${source.sourceMessage}${source.sourceCode&&!source.sourceMessage.includes(source.sourceCode)?`（${source.sourceCode}）`:''}`
+    : source.sourceCode||'';
+  const message=stored?'手机发现作品已补齐详情并入库':canceled
+    ? cause?`补详情已停止：${cause}`:'补详情已停止'
+    : cause?`补详情未入库：${cause}；尚未取得入库回执，需要处理`:'补详情结束但未取得入库回执，需要处理';
+  // The stable code is a receipt/recovery contract. Keep the observed failure
+  // separately so rendering it cannot change whether a late receipt is accepted.
+  const error=stored?{}:{code:canceled?'detail_canceled':'detail_finished_without_ingestion',reportedStatus:status,
+    ...source,...(cause?{message}:{})};
   await tx.execute(`UPDATE capture_task_items SET status=$3,result_record_id=$4,result_observation_id=$5,error=$6,
     finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2`,
   [tenantId,candidate.item_id,itemStatus,candidate.record_id,candidate.observation_id,error]);
@@ -38,5 +74,5 @@ export async function projectDiscoveryTaskResult(tx,{tenantId,task,snapshot={}})
   return tx.queryOne(`UPDATE capture_tasks SET status=$3,error=$4,counts=$5,progress=$6,message=$7,
     finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2 RETURNING *`,
   [tenantId,task.id,taskStatus,error,{total:1,processed:1,success:stored?1:0,failed:stored?0:1},
-    {current:1,total:1,percent:100,phase:taskStatus},stored?'手机发现作品已补齐详情并入库':canceled?'补详情已停止':'补详情结束但未取得入库回执，需要处理']);
+    {current:1,total:1,percent:100,phase:taskStatus},message]);
 }

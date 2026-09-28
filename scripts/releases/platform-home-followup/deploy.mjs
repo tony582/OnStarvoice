@@ -1,5 +1,5 @@
-// Scoped metadata/package publication. No dependency installs, Admin build,
-// migrations, database commands, environment edits or browser/device controls.
+// Scoped platform-home and discovery-detail publication. No dependency installs, Admin build,
+// migrations, database writes, environment edits or browser/device controls.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -14,10 +14,12 @@ const simulation = simulationIndex >= 0;
 const checkOnly = args.includes('--check');
 const app = simulation ? path.resolve(args[simulationIndex + 1] || '') : '/opt/onstarvoice';
 const failure = (args.find(value => value.startsWith('--fail=')) || '').slice(7);
+const simulatedIdle = (args.find(value => value.startsWith('--idle=')) || '').slice(7);
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--simulate') { i++; continue; }
   if (args[i] === '--check') continue;
-  if (simulation && ['--fail=mid-switch', '--fail=readiness'].includes(args[i])) continue;
+  if (simulation && ['--fail=mid-switch', '--fail=after-code', '--fail=readiness'].includes(args[i])) continue;
+  if (simulation && ['--idle=busy', '--idle=held', '--idle=unknown'].includes(args[i])) continue;
   throw new Error('Unknown argument: ' + args[i]);
 }
 if (simulation && (!args[simulationIndex + 1] || app === '/opt/onstarvoice' ||
@@ -31,6 +33,10 @@ const SHA = /^[0-9a-f]{64}$/;
 const ZIP = /^StarVoice-extension-v0\.4\.21-\d{8}\.zip$/;
 const PREVIOUS_ZIP = /^StarVoice-extension-v0\.4\.20-\d{8}\.zip$/;
 const metadataPaths = ['server/routes/update-manifest.js', 'server/public/about.html', 'server/services/ops-control.js'];
+const replacedCodePaths = ['server/services/capture-discovery/detail-dispatch.js',
+  'server/services/capture-discovery/detail-projection.js'];
+const addedCodePaths = ['server/services/capture-discovery/detail-timeout-cooldown.js'];
+const replacedPaths = [...metadataPaths, ...replacedCodePaths];
 const CI_JOBS = ['Tests and builds', 'Production Node 18 compatibility',
   'PostgreSQL 14 / Node 24.12.0 integration', 'PostgreSQL 16 / Node 18.20.8 integration',
   'PostgreSQL 16 / Node 24.12.0 integration'];
@@ -38,7 +44,12 @@ if (!/^[0-9a-f]{40}$/.test(tag) || manifest.baseHead !== 'd68201d' ||
   manifest.version !== '0.4.21' || manifest.androidVersion !== '0.2.6' ||
   !ZIP.test(manifest.zip) || !PREVIOUS_ZIP.test(manifest.previousZip)) throw new Error('Invalid release identity');
 if (!simulation && manifest.rehearsalOnly) throw new Error('Dirty-worktree rehearsal cannot deploy');
-const allowedPaths = new Set([...metadataPaths, 'public-downloads/' + manifest.zip]);
+const zipPath = 'public-downloads/' + manifest.zip;
+const allowedPaths = new Set([...replacedPaths, ...addedCodePaths, zipPath]);
+// Never trust caller-provided manifest ordering. Install imports before their
+// consumers and publish version metadata only after code and package exist.
+const publicationPaths = [...addedCodePaths, ...replacedCodePaths, zipPath,
+  metadataPaths[1], metadataPaths[2], metadataPaths[0]];
 function safeRelative(relative) {
   if (typeof relative !== 'string' || !relative || relative.includes('\\') || relative.includes('\0') ||
     path.isAbsolute(relative) || relative.split('/').some(part => !part || part === '..' || part === '.')) {
@@ -47,11 +58,11 @@ function safeRelative(relative) {
   return relative;
 }
 const safePath = relative => path.join(app, safeRelative(relative));
-if (!Array.isArray(manifest.files) || manifest.files.length !== 4 ||
-  new Set(manifest.files.map(file => file.path)).size !== 4 ||
+if (!Array.isArray(manifest.files) || manifest.files.length !== allowedPaths.size ||
+  new Set(manifest.files.map(file => file.path)).size !== allowedPaths.size ||
   manifest.files.some(file => !allowedPaths.has(file.path) || !SHA.test(file.newSha) ||
-    (metadataPaths.includes(file.path) ? !SHA.test(file.oldSha) : file.oldSha !== null))) {
-  throw new Error('Release must replace exactly three metadata files and add exactly one new zip');
+    (replacedPaths.includes(file.path) ? !SHA.test(file.oldSha) : file.oldSha !== null))) {
+  throw new Error('Release must replace exactly three metadata and two discovery files and add one cooldown module and one zip');
 }
 if (!Array.isArray(manifest.guards) || new Set(manifest.guards.map(file => file.path)).size !== manifest.guards.length ||
   manifest.guards.some(file => !SHA.test(file.sha) || allowedPaths.has(file.path))) throw new Error('Invalid guards');
@@ -118,6 +129,64 @@ function pm2Info() {
   return {pid: process.pid, startedAt: env.pm_uptime, nodeVersion: env.node_version,
     execPath: env.pm_exec_path, status: env.status, environmentHash: hash(JSON.stringify(environment))};
 }
+// Isolated read-only client: existing server dependencies/config only. A hard
+// child-process deadline also bounds connect/end hangs beyond driver timeouts.
+const IDLE_QUERY_SOURCE = `
+import 'dotenv/config';
+import pg from 'pg';
+let client;
+try {
+  if (!process.env.DATABASE_URL) throw new Error('Database configuration unavailable');
+  client = new pg.Client({connectionString:process.env.DATABASE_URL,
+    connectionTimeoutMillis:3000, statement_timeout:3000, query_timeout:4000});
+  await client.connect();
+  await client.query('BEGIN READ ONLY');
+  const active = await client.query("SELECT count(*)::int AS count FROM capture_tasks t JOIN capture_agents a ON t.assigned_agent_id=a.id WHERE t.status IN ('claimed','running','recovering','resume_requested') AND COALESCE(a.last_liveness_at,a.last_heartbeat_at)>now()-interval '5 minutes'");
+  const held = await client.query("SELECT count(*)::int AS count FROM capture_task_items i JOIN capture_agents a ON a.id=i.assigned_agent_id WHERE a.capabilities->>'agentKind'='android_mobile' AND i.metadata->>'deviceHeld'='true'");
+  await client.query('ROLLBACK');
+  const counts = {checkedAt:new Date().toISOString(),activeTasks:active.rows[0]?.count,
+    androidHeldItems:held.rows[0]?.count};
+  await client.end(); client = null;
+  process.stdout.write(JSON.stringify(counts));
+} catch {
+  process.stderr.write('Read-only idle counts unavailable');
+  process.exitCode = 1;
+} finally {
+  if (client) await client.end().catch(() => {});
+}
+`;
+function readIdleCounts() {
+  if (simulation) return simulatedIdle === 'unknown' ? {} : {
+    checkedAt: new Date().toISOString(), activeTasks: simulatedIdle === 'busy' ? 1 : 0,
+    androidHeldItems: simulatedIdle === 'held' ? 1 : 0,
+  };
+  try {
+    return JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', IDLE_QUERY_SOURCE], {
+      cwd: safePath('server'), encoding: 'utf8', timeout: 15000, killSignal: 'SIGKILL',
+      maxBuffer: 8192, stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+  } catch {
+    // Do not print database credentials, driver errors or inherited environment.
+    throw new Error('IDLE GATE UNKNOWN: read-only counts could not be confirmed');
+  }
+}
+function assertIdleBeforeSwitch() {
+  const counts = readIdleCounts();
+  const checkedAt = Date.parse(counts?.checkedAt || '');
+  if (!Number.isSafeInteger(counts?.activeTasks) || counts.activeTasks < 0 ||
+    !Number.isSafeInteger(counts?.androidHeldItems) || counts.androidHeldItems < 0 ||
+    !Number.isFinite(checkedAt) || checkedAt > Date.now() + 1000 || Date.now() - checkedAt > 20000) {
+    throw new Error('IDLE GATE UNKNOWN: missing, invalid or stale counts');
+  }
+  if (counts.activeTasks !== 0 || counts.androidHeldItems !== 0) {
+    const error = new Error('IDLE GATE BUSY: activeTasks=' + counts.activeTasks +
+      ' androidHeldItems=' + counts.androidHeldItems + '; no backup, switch or restart');
+    error.exitCode = 78;
+    throw error;
+  }
+  console.log('IDLE GATE VERIFIED: activeTasks=0 androidHeldItems=0 at ' + counts.checkedAt);
+  return counts;
+}
 async function sourceManifest(file) {
   const source = await fs.readFile(file, 'utf8');
   const expression = source.match(/export const EXTENSION_UPDATE_MANIFEST = Object\.freeze\(([\s\S]*?)\);/);
@@ -167,6 +236,7 @@ async function health() {
 }
 async function restartAndWait() {
   restarts++;
+  if (simulation) console.log('SIMULATION: restart ' + restarts);
   if (!simulation) execFileSync('pm2', ['restart', 'onstarvoice'], {stdio: ['ignore', 'pipe', 'pipe']});
   let last;
   for (let attempt = 0; attempt < (simulation ? 1 : 30); attempt++) {
@@ -195,7 +265,7 @@ async function checkStage() {
   const payloadPaths = await listFiles(path.join(stage, 'payload'));
   if (JSON.stringify(payloadPaths) !== JSON.stringify([...allowedPaths].sort())) throw new Error('Payload contains an out-of-scope file');
   for (const file of manifest.files) await assertHash(path.join(stage, 'payload', file.path), file.newSha);
-  for (const relative of [metadataPaths[0], metadataPaths[2]]) execFileSync(process.execPath, ['--input-type=module', '--check'],
+  for (const relative of [...metadataPaths.filter(file => file.endsWith('.js')), ...replacedCodePaths, ...addedCodePaths]) execFileSync(process.execPath, ['--input-type=module', '--check'],
     {input: await fs.readFile(path.join(stage, 'payload', relative)), stdio: ['pipe', 'pipe', 'pipe']});
   const oldOps = await fs.readFile(safePath(metadataPaths[2]), 'utf8');
   const newOps = await fs.readFile(path.join(stage, 'payload', metadataPaths[2]), 'utf8');
@@ -223,7 +293,7 @@ const receipt = (name, data) => fs.writeFile(path.join(stage, name), JSON.string
 await checkStage();
 await checkBase({verifyHttp: true});
 if (checkOnly) {
-  console.log('PASS: exact CI SHA, four-file scope, d68201d baseline, unchanged Admin, Node 18.20.8, update 0.4.20');
+  console.log('PASS: exact CI SHA, seven-file scope, d68201d baseline, unchanged Admin, Node 18.20.8, update 0.4.20');
   process.exit(0);
 }
 const lockPath = path.join(path.dirname(stage), 'platform-home-followup.deploy.lock');
@@ -254,12 +324,14 @@ async function rollback(error) {
     // checkBase already verified the old public package, changelog and Admin.
   } catch (failure) { failures.push(failure.message); }
   await receipt('rollback.json', {sourceHead: tag, baseHead: manifest.baseHead, cause: error.message,
-    restored: failures.length === 0, failures, runtime, simulation, at: new Date().toISOString()});
+    restored: failures.length === 0, failures, runtime, simulation,
+    switchedFiles: mutated.map(file => file.path), at: new Date().toISOString()});
   console.error(failures.length ? 'ROLLBACK INCOMPLETE: ' + failures.join('; ') : 'ROLLBACK VERIFIED: d68201d / 0.4.20 / unchanged Admin and environment / ready');
 }
 try {
   before = await checkBase();
   environmentHash = await readHash(safePath('server/.env'));
+  const idleCounts = assertIdleBeforeSwitch();
   await fs.mkdir(backup); // Refuse reuse: never overwrite a release's backup.
   for (const file of manifest.files.filter(file => file.oldSha !== null)) {
     const destination = path.join(backup, file.path);
@@ -267,10 +339,10 @@ try {
     await fs.copyFile(safePath(file.path), destination);
     await assertHash(destination, file.oldSha);
   }
-  await receipt('before.json', {sourceHead: tag, baseHead: manifest.baseHead, runtime: before, environmentHash, simulation});
-  await checkBase();
+  await receipt('before.json', {sourceHead: tag, baseHead: manifest.baseHead, runtime: before, environmentHash, idleCounts, simulation});
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.once(signal, onSignal);
-  for (const file of manifest.files) {
+  for (const relative of publicationPaths) {
+    const file = manifest.files.find(candidate => candidate.path === relative);
     checkInterrupted();
     await assertHash(safePath(file.path), file.oldSha);
     await assertHash(path.join(stage, 'payload', file.path), file.newSha);
@@ -278,6 +350,7 @@ try {
     await atomicCopy(path.join(stage, 'payload', file.path), safePath(file.path));
     checkInterrupted();
     if (failure === 'mid-switch' && mutated.length === 2) throw new Error('Injected mid-switch failure');
+    if (failure === 'after-code' && replacedCodePaths.every(relative => mutated.some(entry => entry.path === relative))) throw new Error('Injected after-code failure');
   }
   await restartAndWait();
   checkInterrupted();
@@ -292,12 +365,13 @@ try {
     manifest.files.find(file => file.path === metadataPaths[1]).newSha);
   checkInterrupted();
   await receipt('deployed.json', {sourceHead: tag, baseHead: manifest.baseHead, version: manifest.version,
-    androidVersion: manifest.androidVersion, runtime: after, files: manifest.files.length, simulation, at: new Date().toISOString()});
+    androidVersion: manifest.androidVersion, runtime: after, files: manifest.files.length, simulation,
+    switchedFiles: mutated.map(file => file.path), idleCounts, at: new Date().toISOString()});
   console.log('DEPLOYMENT VERIFIED: ' + tag + ' / 0.4.21 / unchanged Admin and environment / ready');
 } catch (error) {
   if (mutated.length) await rollback(error);
   else console.error('REFUSED BEFORE SWITCH: ' + error.message);
-  process.exitCode = 1;
+  process.exitCode = error.exitCode === 78 ? 78 : 1;
 } finally {
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.removeListener(signal, onSignal);
   await lock.close();

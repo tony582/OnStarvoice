@@ -1302,8 +1302,13 @@
   }
 
   function shouldPreservePlatformTab(request = {}) {
-    return text(request.status, 80) === "needs_action" &&
-      text(request.workflow, 80) !== DISCOVERED_POST_WORKFLOW;
+    if (text(request.status, 80) !== "needs_action") return false;
+    if (text(request.workflow, 80) !== DISCOVERED_POST_WORKFLOW) return true;
+    // Missing ingestion alone remains eligible for cleanup. Only a confirmed
+    // initial login / platform safety or document identity boundary needs its
+    // page left for action; a replacement document is not the task's authority.
+    return text(request.error?.stage, 80) === "initial_detail_readiness" &&
+      projectCaptureFailure([request.error]).requiresManualAction === true;
   }
 
   root.OnStarvoiceCloudTargetedPost = Object.freeze({

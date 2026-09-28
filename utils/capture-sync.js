@@ -116,6 +116,8 @@ import {
   RELEVANCE_PREFILTER_LIST_PROMPT_VERSION,
 } from './capture/relevance-prefilter.js';
 import './capture/target-page-availability.js';
+
+export {probeDetailPreloadSafety};
 // StarVoice 未启用福利中心（welfare-usage.js）；相关 welfare 埋点已移除，见下方 no-op。
 
 const targetPageAvailabilityApi =

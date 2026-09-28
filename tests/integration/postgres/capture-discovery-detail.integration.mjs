@@ -61,14 +61,14 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
       {tenantId,captureTaskId:detail.taskId,captureAgentId:browser.id,captureAgentAuthCodeId:authCodeId,
         captureAgentAuthBindingId:authBindingId,captureTaskItemAttemptId:attempt.id,captureTaskItemRequestHash:attempt.request_hash,...contextOverrides});
     }
-    async function mirror(detail,status='running') {
+    async function mirror(detail,status='running',overrides={}) {
       const [command]=await query('SELECT * FROM capture_agent_commands WHERE id=$1',[detail.commandId]);
       const now=new Date(Date.now()+1000).toISOString();
       const payload=globalThis.OnStarvoiceCloudTaskAgent.buildHeartbeatPayload({runtime:{appVersion:'0.4.7'},ledger:{runs:[]},
         targetedPostRequest:{id:detail.taskId,taskId:detail.taskId,cloudCommandId:detail.commandId,
           attemptId:command.payload.attemptIdentity,attemptNumber:1,workflow:'discovered_post_capture',platform:'douyin',status,
           targets:command.payload.targets,metadata:{candidateId:randomUUID(),workflow:'forged'},progressSeq:2,
-          createdAt:now,updatedAt:now,startedAt:now,heartbeatAt:now}});
+          createdAt:now,updatedAt:now,startedAt:now,heartbeatAt:now,...overrides}});
       const snapshot=normalizeCloudTaskSnapshot(payload.tasks[0]);
       return withTransaction(tx=>mirrorTaskSnapshot(tx,browser,snapshot));
     }
@@ -142,6 +142,37 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
     const [item]=await query('SELECT * FROM capture_task_items WHERE id=$1',[detail.itemId]);
     assert.equal(item.status,'needs_action');
     assert.equal((await query('SELECT * FROM records WHERE tenant_id=$1',[f.tenantId])).length,0);
+  });
+  await t.test('a real timeout heartbeat keeps the original cause until a formal late receipt arrives',async st=>{
+    const f=await fixture(st),run=await f.addRun(),detail=await f.dispatch();
+    const error={code:'TARGET_RUNNER_TAB_TIMEOUT',message:'定向作品采集页打开超时',phase:'target_navigating'};
+    const mirrored=await f.mirror(detail,'failed',{error,progress:{current:1,total:1,phase:'discovered_post_capture'}});
+    assert.equal(mirrored.status,'needs_action');
+    assert.equal(mirrored.error.code,'detail_finished_without_ingestion');assert.equal(mirrored.error.reportedStatus,'failed');
+    assert.equal(mirrored.error.sourceCode,error.code);assert.equal(mirrored.error.sourceMessage,error.message);
+    assert.equal(mirrored.error.sourcePhase,error.phase);assert.match(mirrored.message,/定向作品采集页打开超时.*TARGET_RUNNER_TAB_TIMEOUT/u);
+    assert.deepEqual(mirrored.counts,{total:1,processed:1,success:0,failed:1});
+    const [item]=await query('SELECT * FROM capture_task_items WHERE id=$1',[detail.itemId]);
+    const [attempt]=await query('SELECT * FROM capture_task_item_attempts WHERE item_id=$1',[detail.itemId]);
+    const [candidate]=await query('SELECT * FROM capture_discovery_candidates WHERE id=$1',[run.receipt.candidateId]);
+    assert.deepEqual(item.error,mirrored.error);assert.deepEqual(attempt.error,mirrored.error);
+    assert.deepEqual(candidate.last_error,mirrored.error);assert.equal(item.result_observation_id,null);
+    assert.equal((await query('SELECT id FROM records WHERE tenant_id=$1',[f.tenantId])).length,0);
+    const stored=await f.store(detail);assert.ok(stored.observationId);
+    const [settled]=await query('SELECT * FROM capture_tasks WHERE id=$1',[detail.taskId]);
+    assert.equal(settled.status,'completed');assert.deepEqual(settled.error,{});
+    assert.deepEqual(settled.counts,{total:1,processed:1,success:1,failed:0});
+    const [settledItem]=await query('SELECT * FROM capture_task_items WHERE id=$1',[detail.itemId]);
+    assert.equal(settledItem.result_observation_id,stored.observationId);assert.equal(settledItem.status,'completed');
+  });
+  await t.test('a canceled detail retains its source error without granting a late receipt',async st=>{
+    const f=await fixture(st);await f.addRun();const detail=await f.dispatch();
+    const error={code:'TARGET_CAPTURE_CANCELED',message:'定向作品任务已停止',phase:'target_navigating'};
+    const stopped=await f.mirror(detail,'canceled',{error});
+    assert.equal(stopped.status,'canceled');assert.equal(stopped.error.code,'detail_canceled');
+    assert.equal(stopped.error.sourceCode,error.code);assert.equal(stopped.counts.success,0);
+    await assert.rejects(f.store(detail),failure=>['DISCOVERY_RECEIPT_NOT_CURRENT','stale_attempt'].includes(failure.code));
+    assert.equal((await query('SELECT id FROM records WHERE tenant_id=$1',[f.tenantId])).length,0);
   });
   await t.test('real completion snapshot arriving before current sync is recovered without false failure',async st=>{
     const f=await fixture(st);await f.addRun();const detail=await f.dispatch();

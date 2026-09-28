@@ -1,6 +1,7 @@
 import {randomUUID, createHash} from 'node:crypto';
 import {findCaptureAgentExecutionSlotBlocker} from '../capture-cloud.js';
 import {reconcileDiscoveryDetails} from './detail-lifecycle.js';
+import {readDiscoveryDetailTimeoutCooldownMs} from './detail-timeout-cooldown.js';
 
 export const DISCOVERED_POST_WORKFLOW = 'discovered_post_capture';
 export function canCaptureDiscoveredPost(agent, capabilities = agent?.capabilities || {}) {
@@ -14,6 +15,11 @@ export async function dispatchDiscoveredPost(tx, {agent, capabilities = agent?.c
   if (!tenants.has(agent?.tenant_id) || !canCaptureDiscoveredPost(agent, capabilities)) return null;
   await reconcileDiscoveryDetails(tx, {tenantId:agent.tenant_id});
   if (await findCaptureAgentExecutionSlotBlocker(tx,agent.tenant_id,agent.id)) return null;
+  // Leave queued candidates untouched so another healthy browser can claim them.
+  // Expiry permits the next natural claim; the existing slot lock admits one job.
+  if (await readDiscoveryDetailTimeoutCooldownMs(tx, {
+    tenantId:agent.tenant_id, agentId:agent.id,
+  }) > 0) return null;
   const candidate = await tx.queryOne(`SELECT candidate.* FROM capture_discovery_candidates candidate
     WHERE candidate.tenant_id=$1 AND candidate.status='queued' AND EXISTS (
       SELECT 1 FROM capture_discovery_run_candidates demand WHERE demand.tenant_id=candidate.tenant_id

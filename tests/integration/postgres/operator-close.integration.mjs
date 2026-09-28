@@ -242,19 +242,22 @@ test('operator close ends dead needs_action roots without releasing fences, live
     assert.ok(detail?.commandId);
     const [command] = await query('SELECT * FROM capture_agent_commands WHERE id=$1', [detail.commandId]);
     assert.deepEqual(await f.eligibility([detail.taskId]), {[detail.taskId]: 'status_not_closeable'});
-    async function mirrorDetail(status) {
+    async function mirrorDetail(status,overrides={}) {
       const now = new Date(Date.now() + 1000).toISOString();
       const payload = globalThis.OnStarvoiceCloudTaskAgent.buildHeartbeatPayload({runtime: {appVersion: '0.4.18'},
         ledger: {runs: []}, targetedPostRequest: {id: detail.taskId, taskId: detail.taskId, cloudCommandId: detail.commandId,
           attemptId: command.payload.attemptIdentity, attemptNumber: 1, workflow: 'discovered_post_capture',
           platform: 'douyin', status, targets: command.payload.targets, metadata: {candidateId: randomUUID(),
             workflow: 'forged', operatorClose: {closedAt: 'forged'}},
-          progressSeq: 2, createdAt: now, updatedAt: now, startedAt: now, heartbeatAt: now}});
+          progressSeq: 2, createdAt: now, updatedAt: now, startedAt: now, heartbeatAt: now,...overrides}});
       return withTransaction(tx => mirrorTaskSnapshot(tx, browser, normalizeCloudTaskSnapshot(payload.tasks[0])));
     }
-    const failedDetail = await mirrorDetail('completed');
+    const sourceError = {code: 'TARGET_RUNNER_TAB_TIMEOUT', message: '定向作品采集页打开超时', phase: 'target_navigating'};
+    const failedDetail = await mirrorDetail('failed', {error: sourceError});
     assert.equal(failedDetail.status, 'needs_action');
     assert.equal(failedDetail.error.code, 'detail_finished_without_ingestion');
+    assert.equal(failedDetail.error.sourceCode, sourceError.code);
+    assert.equal(failedDetail.error.sourcePhase, sourceError.phase);
     assert.equal(failedDetail.metadata.operatorClose, undefined, 'a device cannot mint the marker');
     assert.notEqual((await query('SELECT status FROM capture_agent_commands WHERE id=$1', [detail.commandId]))[0].status,
       'pending', 'the accepted snapshot settled the create command');
@@ -277,6 +280,8 @@ test('operator close ends dead needs_action roots without releasing fences, live
     assertClosedMarker(closedTask);
     assert.equal(closedTask.metadata.operatorClose.originalError.code, 'detail_finished_without_ingestion');
     assert.equal(closedTask.error.code, 'detail_finished_without_ingestion', 'the original error stays on the row');
+    assert.deepEqual(closedTask.error, failedDetail.error);
+    assert.deepEqual(closedTask.metadata.operatorClose.originalError, failedDetail.error);
     assert.equal(closedTask.message, ROOT_MESSAGE);
     assert.equal(closedTask.attention_dismissed_by_name, '运营 值班');
     const closedItem = await f.itemRow(detail.itemId);
