@@ -11,13 +11,36 @@ import {
 
 import { queryTriageAll, queryTriageOne } from '../services/record-triage-query.js';
 import { recordTriageAdmissionSql } from '../services/record-triage-admission.js';
+import {
+  createRateLimitedReporter,
+  createSingleFlightReadCache,
+} from '../services/display-read-resilience.js';
 
 const router = Router();
+
+// 徽标计数在生产上空闲时也要约 2.7 秒(逐条判断内容准入),每个打开的后台页面
+// 每分钟读一次,写操作之后还会再读。这些读取与内容分诊、任务看板共用只有 2 个并发的
+// 报表通道,所以同一租户同一时刻只跑一条:
+// - 定时/切回页面的读取复用 20 秒内的结果,或加入正在进行的那一次;
+// - 写操作之后的读取(fresh=1)一定晚于该写操作开始,不复用旧结果;
+// - 数据库短暂繁忙时,回退到 10 分钟内最近一次完整结果并标记 stale。
+export const WORKSPACE_BADGES_CACHE_TTL_MS = 20_000;
+export const WORKSPACE_BADGES_STALE_MAX_AGE_MS = 10 * 60_000;
+const workspaceBadgesCache = createSingleFlightReadCache({
+  ttlMs: WORKSPACE_BADGES_CACHE_TTL_MS,
+  staleMaxAgeMs: WORKSPACE_BADGES_STALE_MAX_AGE_MS,
+});
+const reportWorkspaceBadgesRead = createRateLimitedReporter({intervalMs: 30_000});
+
+export function clearWorkspaceBadgesCache() {
+  workspaceBadgesCache.clear();
+}
 
 // 侧边栏徽标计数:单次往返。triagePending 与收件箱「待处理队列」同条件。
 router.get('/badges', requireTenantAccess, async (req, res, next) => {
   try {
-    const [row, commentRiskPolicy] = await Promise.all([
+    const fresh = ['1', 'true'].includes(String(req.query.fresh || '').toLowerCase());
+    const read = await workspaceBadgesCache.read(String(req.tenantId), () => Promise.all([
       queryTriageOne(`
       SELECT
         (SELECT COUNT(*)
@@ -32,10 +55,19 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
         (SELECT COUNT(*) FROM record_feedback WHERE tenant_id = $1 AND review_status = 'pending') AS feedback_pending
     `, [req.tenantId]),
       getCommentRiskAttentionPolicy(req.tenantId),
-    ]);
+    ]), {fresh});
+    const [row, commentRiskPolicy] = read.value;
+    if (read.stale) {
+      reportWorkspaceBadgesRead(`stale:${req.tenantId}`, '[WorkspaceBadges] served last complete counts', {
+        tenantId: req.tenantId,
+        code: read.error?.code || '',
+        ageMs: read.ageMs,
+      });
+    }
 
     return res.json({
       ok: true,
+      ...(read.stale ? {stale: true, staleAgeMs: read.ageMs} : {}),
       badges: {
         triagePending: Number(row?.triage_pending || 0),
         leadsNew: exposeCommentAttentionCount(row?.leads_new, commentRiskPolicy.enabled),
@@ -49,7 +81,7 @@ router.get('/badges', requireTenantAccess, async (req, res, next) => {
       features: {
         commentRiskAttentionEnabled: commentRiskPolicy.enabled,
       },
-      generatedAt: new Date().toISOString(),
+      generatedAt: new Date(Date.now() - read.ageMs).toISOString(),
     });
   } catch (err) {
     return next(err);
