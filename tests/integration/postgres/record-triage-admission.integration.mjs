@@ -143,6 +143,16 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   await record('manual-release', { manual_overrides: { relevance: { value: 'relevant', reason: '已核对车型图片' } }, ai_result: { relevance: 'irrelevant' }, intent: 'complaint' });
   await record('manual-reject', { title: 'CT5内容', manual_overrides: { relevance: 'irrelevant' } });
   await record('manual-uncertain', { title: 'CT5内容', manual_overrides: { relevance: { value: 'uncertain' } } });
+  const reviewAi = { relevance: 'uncertain', relevanceReason: '原帖未指明品牌或车型', monitoringEvidence: { status: 'needs_review', evidence: [] } };
+  const reviewRequest = { triage_review: { value: 'requested', reason: '用户指定单条复核' } };
+  await record('review-requested', { ai_result: reviewAi, sentiment: 'neutral', manual_overrides: reviewRequest });
+  await record('review-requested-non-monitor', { ai_result: reviewAi, sentiment: 'neutral', manual_overrides: reviewRequest });
+  await pool.query("INSERT INTO record_triage(tenant_id,record_id,status) VALUES($1,$2,'reviewed_non_monitor')", [tenant, ids['review-requested-non-monitor']]);
+  await record('review-requested-irrelevant', { ai_result: { relevance: 'irrelevant' }, manual_overrides: reviewRequest });
+  await record('review-requested-manual-reject', { ai_result: reviewAi, manual_overrides: { ...reviewRequest, relevance: 'irrelevant' } });
+  await record('review-canceled', { ai_result: reviewAi, manual_overrides: { triage_review: { value: 'canceled' } } });
+  await record('review-malformed-string', { ai_result: reviewAi, manual_overrides: { triage_review: '{"value":"requested"}' } });
+  await record('review-malformed-array', { ai_result: reviewAi, manual_overrides: { triage_review: [{ value: 'requested' }] } });
   const videoUrl = 'https://v.douyinvod.com/current.mp4';
   await record('valid-transcript', { video_url: videoUrl, transcript_status: 'done', transcript_source_url: videoUrl, transcript: '我是别克车主', intent: 'other' });
   await record('whitespace-media', { video_url: ` ${videoUrl}\n`, transcript_status: 'done', transcript_source_url: `\n${videoUrl} `, transcript: '别克体验', intent: '\nshare\n' });
@@ -215,7 +225,7 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   async function list(query = '') { return json(`/triage/records?pageSize=100&${query}`); }
   const admittedIds = sqlRows.filter(row => row.admitted).map(row => row.id).sort();
   const workingIds = admittedIds.filter(id => id !== ids['archived-manual-override']);
-  const activeIds = workingIds.filter(id => id !== ids['unscoped-watched-irrelevant']);
+  const activeIds = workingIds.filter(id => ![ids['unscoped-watched-irrelevant'], ids['review-requested-non-monitor']].includes(id));
   for (const query of ['', 'queue=triage', 'queue=active']) {
     const body = await list(query);
     const expected = query === 'queue=active' ? activeIds : query === 'queue=triage' ? workingIds : admittedIds;
@@ -224,6 +234,19 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
     assert.ok(body.records.every(row => !('relevance_review_required' in row) && !('relevance_review_reason' in row)));
   }
   const visible = (await list('queue=triage')).records;
+  for (const name of ['review-requested', 'review-requested-non-monitor']) {
+    const row = visible.find(item => item.id === ids[name]);
+    assert.ok(row, 'explicit single-post review is visible without confirming relevance');
+    assert.deepEqual(row.ai_result, reviewAi);
+    assert.equal(row.sentiment, 'neutral');
+    assert.equal(row.monitoring_evidence_status, 'needs_review');
+    assert.equal(row.manual_overrides.relevance, undefined);
+  }
+  assert.deepEqual((await list('queue=triage&relevance=uncertain')).records.map(row => row.id).sort(), [ids['unscoped'], ids['review-requested'], ids['review-requested-non-monitor']].sort());
+  assert.deepEqual((await list('queue=triage&status=reviewed_non_monitor')).records.map(row => row.id), [ids['review-requested-non-monitor']]);
+  for (const name of ['uncertain', 'review-requested-irrelevant', 'review-requested-manual-reject', 'review-canceled', 'review-malformed-string', 'review-malformed-array']) {
+    assert.ok(!visible.some(row => row.id === ids[name]), `${name} keeps existing exclusion`);
+  }
   for (const name of ['short-l7','short-e5','short-l7-old-metadata','substring','cropped-model-proof','new-needs-review','stale-proof']) {
     const row = visible.find(item => item.id === ids[name]);
     assert.ok(row, `${name} must remain in ordinary triage when the whole-post AI decision is relevant`);
@@ -338,6 +361,9 @@ test('sentry content admission is shared by HTTP lists, exports, badges and work
   assert.equal((await pool.query("SELECT COUNT(*)::int AS n FROM audit_logs WHERE tenant_id=$1 AND action='record.relevance_reviewed'", [tenant])).rows[0].n, 0);
   assert.equal((await pool.query('SELECT COUNT(*)::int AS n FROM record_versions WHERE tenant_id=$1', [tenant])).rows[0].n, 0);
   const raw = await json('/records/tables/keyword_notes?pageSize=100');
+  for (let page = 2; page <= raw.pagination.totalPages; page++) {
+    raw.rows.push(...(await json(`/records/tables/keyword_notes?pageSize=100&page=${page}`)).rows);
+  }
   assert.equal(raw.pagination.total, fixtures.size, 'all original records remain available in the raw database table');
   assert.deepEqual(raw.rows.map(row => row.id).sort(), sqlRows.map(row => row.id).sort());
   assert.ok(blockedIds.every(id => raw.rows.some(row => row.id === id)));
