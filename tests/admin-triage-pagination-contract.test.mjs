@@ -36,10 +36,36 @@ test('content triage limits the page before expensive ticket and progress joins'
   const ticketJoin = route.indexOf('${LATEST_CONTENT_TICKET_JOIN}', outerPage);
   const progressJoin = route.indexOf('${LATEST_CONTENT_PROGRESS_JOIN}', outerPage);
 
+  const statementEnd = route.indexOf('`, params, readOptions);', progressJoin);
+
   assert.ok(pageCte >= 0);
   assert.ok(pageLimit > pageCte);
   assert.ok(outerPage > pageLimit);
   assert.ok(ticketJoin > outerPage);
   assert.ok(progressJoin > ticketJoin);
-  assert.doesNotMatch(route.slice(outerPage), /\$\{where\}/);
+  assert.ok(statementEnd > progressJoin);
+  assert.doesNotMatch(route.slice(outerPage, statementEnd), /\$\{where\}/);
+});
+
+test('content triage counts and pages the filtered posts in one statement', () => {
+  const routeStart = routeSource.indexOf("router.get('/records'");
+  const routeEnd = routeSource.indexOf("router.patch('/records/watch'", routeStart);
+  const route = routeSource.slice(routeStart, routeEnd);
+  const pageCte = route.indexOf('WITH page_records AS MATERIALIZED');
+  const statementEnd = route.indexOf('`, params, readOptions);', pageCte);
+  const pageStatement = route.slice(pageCte, statementEnd);
+
+  // The admission predicates cost about a second per evaluation over a
+  // tenant's posts: the page statement is the only one that may run them.
+  assert.equal(route.slice(0, pageCte).includes('${where}'), false, 'nothing evaluates the filter before the page statement');
+  assert.match(pageStatement, /SELECT r\.id, COUNT\(\*\) OVER \(\) AS matched_total\s+FROM records r\s+LEFT JOIN record_triage rt[^\n]+\s+\$\{where\}\s+ORDER BY/u);
+  assert.equal([...pageStatement.matchAll(/\$\{where\}/gu)].length, 1);
+  assert.match(pageStatement, /SELECT\s+page\.matched_total,/u);
+
+  const afterPage = route.slice(statementEnd);
+  assert.match(afterPage, /if \(records\.length > 0\) \{\s+total = Number\(records\[0\]\.matched_total\) \|\| 0;\s+\} else if \(offset > 0\) \{/u);
+  assert.equal([...afterPage.matchAll(/\$\{where\}/gu)].length, 1, 'only an empty page beyond the first counts separately');
+  assert.match(afterPage, /`, countParams, readOptions\)/u);
+  assert.match(route, /const countParams = \[\.\.\.params\];\s+const limit = /u, 'the count never receives LIMIT and OFFSET values');
+  assert.match(afterPage, /records\.map\(\(\{ matched_total: _matchedTotal, \.\.\.record \}\) =>/u, 'the helper column stays out of the response');
 });

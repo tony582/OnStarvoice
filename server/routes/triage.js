@@ -29,6 +29,12 @@ import {
 } from '../services/record-triage-admission.js';
 import { appendRecordRelevanceFilters } from '../services/record-relevance-filter.js';
 import { appendContentTopicFilter, contentTopicLabel } from '../services/content-topic.js';
+import {
+  createClientGoneProbe,
+  isClientGoneError,
+  isTransientDatabaseReadError,
+  transientDatabaseReadRetryAfterMs,
+} from '../services/display-read-resilience.js';
 
 const router = Router();
 
@@ -661,19 +667,18 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
     }
     where = watchedFilter.where;
 
-    const total = (await queryOne(`
-      SELECT COUNT(*) AS total
-      FROM records r
-      LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
-      ${where}
-    `, params)).total;
-
+    const readOptions = { clientGone: createClientGoneProbe(req, res) };
+    const countParams = [...params];
     const limit = Math.min(100, Math.max(1, Number(pageSize) || 30));
     const offset = (Math.max(1, Number(page)) - 1) * limit;
     params.push(limit, offset);
+    // The content-admission predicates of this filter cost about a second
+    // over a tenant's posts. Counting and paging used to evaluate them twice,
+    // in two statements; the window count makes every page row carry the
+    // total of the same filtered set, in the one statement that reads the page.
     const records = await queryAll(`
       WITH page_records AS MATERIALIZED (
-        SELECT r.id
+        SELECT r.id, COUNT(*) OVER () AS matched_total
         FROM records r
         LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
         ${where}
@@ -681,6 +686,7 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
         LIMIT $${params.length - 1} OFFSET $${params.length}
       )
       SELECT
+        page.matched_total,
         r.id, r.external_id, r.platform, r.title, r.content, r.author_name, r.author_avatar,
         r.author_fans, r.url, r.canonical_url, r.cover_url, r.cover_local, r.image_urls, r.image_local_urls, r.note_type,
         r.publish_time, r.published_ts, r.publish_location, r.blogger_profile_url,
@@ -757,9 +763,24 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       ${LATEST_CONTENT_TICKET_JOIN}
       ${LATEST_CONTENT_PROGRESS_JOIN}
       ORDER BY ${orderBySql(sort, dir)}
-    `, params);
+    `, params, readOptions);
 
-    const publicRecords = records.map(record => redactXhsRecordNavigation(withRecordAdmissionFields({
+    // A page beyond the last one has no row to carry the total. The first page
+    // being empty means nothing matched; any other empty page counts once so
+    // the client can step back to the real last page.
+    let total = 0;
+    if (records.length > 0) {
+      total = Number(records[0].matched_total) || 0;
+    } else if (offset > 0) {
+      total = Number((await queryOne(`
+        SELECT COUNT(*) AS total
+        FROM records r
+        LEFT JOIN record_triage rt ON rt.record_id = r.id AND rt.tenant_id = r.tenant_id
+        ${where}
+      `, countParams, readOptions))?.total) || 0;
+    }
+
+    const publicRecords = records.map(({ matched_total: _matchedTotal, ...record }) => redactXhsRecordNavigation(withRecordAdmissionFields({
       ...record,
       publish_display: formatPublishDate(record.publish_time, record.created_at),
     })));
@@ -770,8 +791,20 @@ router.get('/records', requireTenantAccess, async (req, res, next) => {
       pagination: { page: Number(page), pageSize: limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
+    // Nobody is waiting: the browser replaced or left this request.
+    if (isClientGoneError(err)) return undefined;
     if (err.status && err.code) {
       return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
+    }
+    if (isTransientDatabaseReadError(err)) {
+      const retryAfterMs = transientDatabaseReadRetryAfterMs(err, 2000);
+      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return res.status(503).json({
+        ok: false,
+        error: 'server_busy',
+        message: '当前服务暂时繁忙，内容加载失败，请稍后重试。',
+        retryAfterMs,
+      });
     }
     return next(err);
   }
