@@ -183,6 +183,33 @@
 - 新旧前后端可以混用：旧页面不带 `fresh=1`、不认识 `stale`，只是徽标在写操作后最多滞后 20 秒、看板不显示黄色说明；新页面遇到旧服务端按原样处理 503。
 - 回退：恢复 4 个文件和 Admin index，删除新增文件，重启。没有数据需要回退。
 
+### 发布包与演练
+
+发布包从提交 `6a7125c` 导出（`git archive`），Admin 在干净目录里重新构建：
+
+| 文件 | SHA-256 |
+| --- | --- |
+| `server.tar.gz` | `327657d2fd384781fceec0a3c6391ad43876bc644e71e33e4f4cd830016f1e8c` |
+| `admin-dist.tar.gz` | `d641a10c247cc64ad14184bc524fbd819db7823ed50b299d881b323eec02da0e` |
+| `deploy.sh` | `78ee623e5aafb0f82d9f248ed5171efb1bebc7af8a4f53174af2150cf04566d0` |
+| Admin `index.html`（新） | `b099c928298c32a2dca61ffb22f2956e5cbc4e4e51280e51c51c2796c807c6c2`，入口 `index-cH3yV58Y.js` |
+| Admin `index.html`（线上） | `ebe20bd48390d10a3f175828f3773a49e767b8560f7b55f954e461fc5cdb0f98`，入口 `index-BsQLOvwd.js` |
+
+`deploy.sh` 沿用 09-27 发布用过的结构：`--check` 只读预检；发布前核对 4 个待替换文件和 10 个它们依赖的未改文件仍是 `b89b181` 的内容、新增文件不存在、Admin index 是线上版本；先加新资源，再原子替换 index 和 Server 文件，重启一次；任何一步失败都恢复原文件并重启。
+
+本机演练（模拟生产目录，基线代码加对照构建的 Admin，Node 18.20.8 真实启动）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 预检 | 通过 |
+| 一个被依赖的文件与基线不符 | 预检失败；发布拒绝，未改动任何文件 |
+| 新增文件已经存在 | 发布拒绝，未改动任何文件 |
+| 切换后服务 30 秒内没有就绪 | 自动恢复 4 个文件和 Admin index、删除新增文件、重启；服务就绪，没有残留临时文件 |
+| 正常发布 | 磁盘上的文件与发布包一致，服务重启并就绪，`/admin/` 和全部资源逐字节一致；登录后看板、徽标、列表应答正常 |
+| 同一发布目录再次执行 | 拒绝 |
+
+演练中校验和工具、进程管理和文件锁用的是替身（macOS 没有 GNU `sha256sum`、`flock`，也没有 PM2）；脚本里的每一步检查和切换都是原样执行的。
+
 上线后核对：
 
 1. nginx 日志里 `/api/capture-cloud/overview` 的 503 次数；PM2 日志 `[CaptureOverview] projection failed` 的 `statement` 和 `servedLastGood`。
