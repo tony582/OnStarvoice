@@ -18,10 +18,11 @@ const SENTIMENTS = new Set(['positive', 'neutral', 'negative']);
 const NEGATIVE_STATES = new Set(['negative_cold', 'negative_comment', 'negative_feishu', 'privacy_unreachable']);
 const NON_POST_TYPES = new Set(['official_content', 'blogger_profile', 'comment', 'comments', 'record_comment', 'comment_detail']);
 const POST_SQL = "r.record_type NOT IN ('official_content', 'blogger_profile', 'comment', 'comments', 'record_comment', 'comment_detail')";
-// Match both lifecycle tabs of customer content triage. Archiving a reviewed post
-// must not remove its original contribution to monitoring volume.
+// Reuse content triage's admission and effective relevance for every report
+// section. Archiving alone does not remove an otherwise eligible post.
 const CUSTOMER_POST_SQL = `${POST_SQL} AND r.business_visibility = 'eligible'
-  AND (r.ai_result->>'relevance' IS DISTINCT FROM 'irrelevant' OR EXISTS (
+  AND (${recordTriageAdmissionSql('r')})
+  AND (${recordEffectiveRelevanceSql('r')} IS DISTINCT FROM 'irrelevant' OR EXISTS (
     SELECT 1 FROM record_watchlist daily_watched WHERE daily_watched.tenant_id=r.tenant_id AND daily_watched.record_id=r.id))`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ACTIVE_CAPTURE = new Set(['pending', 'waiting_device', 'claimed', 'running', 'recovering', 'interrupted', 'resume_requested', 'needs_action']);
@@ -54,7 +55,7 @@ function iso(value) { const n = ms(value); return Number.isFinite(n) ? new Date(
 function shanghaiDate(value) { return new Date(ms(value) + ZONE_OFFSET).toISOString().slice(0, 10); }
 function number(value) { if (value === null || value === undefined || value === '') return null; const n = Number(value); return Number.isFinite(n) && n >= 0 ? n : null; }
 function mainPost(row) { return !NON_POST_TYPES.has(row.record_type); }
-function customerPost(row) { return mainPost(row) && row.business_visibility === 'eligible' && (row.relevance !== 'irrelevant' || row.watched === true); }
+function customerPost(row) { return mainPost(row) && row.business_visibility === 'eligible' && row.admission_allowed !== false && (row.relevance !== 'irrelevant' || row.watched === true); }
 function status(row) { return row.status || row.triage_status || 'unhandled'; }
 function safeUrl(value) {
   try { const url = new URL(String(value || '')); return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password ? url.href : ''; }
@@ -245,11 +246,9 @@ export async function collectCustomerDailyNegativeHandling({tenantId, period, db
       true AS admission_allowed
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id
     WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[]) AND r.created_at < $3::timestamptz
-      AND ${POST_SQL} AND r.business_visibility = 'eligible' AND (${recordTriageAdmissionSql('r')})
-      AND (${recordEffectiveRelevanceSql('r')} IS DISTINCT FROM 'irrelevant' OR EXISTS (
-        SELECT 1 FROM record_watchlist daily_watched WHERE daily_watched.tenant_id=r.tenant_id AND daily_watched.record_id=r.id))
+      AND ${CUSTOMER_POST_SQL}
     ORDER BY r.id`, [tenantId, ids, period.cutoffAt]) : [];
-  const records = rows.filter(row => customerPost(row) && row.admission_allowed !== false && ms(row.first_seen_at) < ms(period.cutoffAt));
+  const records = rows.filter(row => customerPost(row) && ms(row.first_seen_at) < ms(period.cutoffAt));
   const coverage = auditCoverageFrom || (await db.queryOne(`/* customer_daily:audit_coverage */
     SELECT applied_at FROM schema_migrations WHERE version = $1`, ['081_customer_daily_reports.sql']))?.applied_at;
   return {...buildCustomerDailyNegativeHandlingSummary(records, parsed.transitions, period, {coverageFrom: coverage, malformedEventIds: parsed.malformed}), records, transitions: parsed.transitions, events};
@@ -266,7 +265,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   if (!tenant) throw Object.assign(new Error('租户不存在'), {statusCode: 404});
   const monthRows = await db.queryAll(`/* customer_daily:month */
     SELECT r.id, r.created_at AS first_seen_at, r.record_type, r.sentiment, r.business_visibility,
-      r.ai_result->>'relevance' AS relevance,
+      ${recordEffectiveRelevanceSql('r')} AS relevance, true AS admission_allowed,
       EXISTS (SELECT 1 FROM record_watchlist w WHERE w.tenant_id=r.tenant_id AND w.record_id=r.id) AS watched,
       COALESCE(rt.status, 'unhandled') AS status
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
@@ -288,6 +287,8 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
 
   const heatRows = await db.queryAll(`/* customer_daily:heat_posts */
     SELECT r.id, r.title, r.platform, r.url, r.canonical_url, r.record_type, r.sentiment,
+      r.business_visibility, ${recordEffectiveRelevanceSql('r')} AS relevance, true AS admission_allowed,
+      EXISTS (SELECT 1 FROM record_watchlist w WHERE w.tenant_id=r.tenant_id AND w.record_id=r.id) AS watched,
       r.published_ts, r.created_at AS first_seen_at, COALESCE(rt.status, 'unhandled') AS status,
       rt.feishu_table_no
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
@@ -295,7 +296,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
       AND r.created_at < $3::timestamptz AND r.sentiment = 'negative' AND ${CUSTOMER_POST_SQL}
       AND COALESCE(rt.status, 'unhandled') <> 'reviewed_non_monitor'
     ORDER BY r.published_ts DESC, r.id`, [tenantId, heatStart, cutoffAt]);
-  const heatCandidates = heatRows.filter(row => mainPost(row) && row.sentiment === 'negative' && status(row) !== 'reviewed_non_monitor' && ms(row.first_seen_at) < ms(cutoffAt) && ms(row.published_ts) >= ms(heatStart) && ms(row.published_ts) < ms(cutoffAt));
+  const heatCandidates = heatRows.filter(row => customerPost(row) && row.sentiment === 'negative' && status(row) !== 'reviewed_non_monitor' && ms(row.first_seen_at) < ms(cutoffAt) && ms(row.published_ts) >= ms(heatStart) && ms(row.published_ts) < ms(cutoffAt));
   const observations = heatCandidates.length ? await db.queryAll(`/* customer_daily:observations */
     SELECT ro.id, ro.record_id, ro.captured_at, ro.likes, ro.comments_count, ro.collects, ro.shares,
       ${observationPayloadSql()} AS payload
@@ -412,7 +413,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   return {
     schemaVersion: 5, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, repliedMarked, commentMarked, handlingListsVersion: 1, warnings,
     evidence: {
-      scope: '当前租户首次入库且进入客户内容分诊清单的主帖；排除系统过滤和判为无关的内容，保留客户主动关注的帖子；同帖复采不重复计数；SDB再扣除客户标记的非监控内容',
+      scope: '当前租户首次入库且符合内容分诊准入规则的主帖；沿用人工相关性、哨兵品牌证据与关注规则；排除系统过滤和不符合分诊范围的内容；同帖复采不重复计数；SDB再扣除客户标记的非监控内容',
       firstSeenField: 'records.created_at', timeZone: 'Asia/Shanghai', reviewBasis: '本版生成时有效情感及人工处理状态',
       monthRecords: uniqueRows.map(row => ({recordId: row.id, firstSeenAt: iso(row.first_seen_at), sentiment: row.sentiment || '', status: status(row), businessVisibility: row.business_visibility || 'eligible'})),
       dayRecordIds: dayRows.map(row => row.id), conflictRecordIds: conflicts.map(row => row.id),
