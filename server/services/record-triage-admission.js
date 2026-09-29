@@ -27,18 +27,28 @@ export function manualRecordRelevance(record) {
   return ['relevant', 'irrelevant', 'uncertain'].includes(value) ? value : '';
 }
 
+function requestedTriageReview(record, relevance) {
+  const overrides = record.manual_overrides;
+  const request = overrides && typeof overrides === 'object' && !Array.isArray(overrides) ? overrides.triage_review : null;
+  return relevance === 'uncertain' && request !== null && typeof request === 'object'
+    && !Array.isArray(request) && request.value === 'requested';
+}
+
 export function recordTriageAdmission(record = {}) {
   const scoped = isSentryEvidenceScope(record);
   const manual = manualRecordRelevance(record);
   const ai = object(record.ai_result);
   const relevance = manual || ai.relevance || 'uncertain';
+  // Sending a specific uncertain post for human triage is a workflow decision,
+  // not evidence that its brand is confirmed or its relevance is positive.
+  const reviewRequested = requestedTriageReview(record, relevance);
   // Stored evidence is explanatory metadata, not an independent rejection.
   // Re-evaluate current source text so older narrow matching cannot hide a post.
   const verified = findRecordMonitoringEvidence(ai, record).length > 0;
-  const admitted = !scoped || manual === 'relevant' || (!manual && relevance === 'relevant' && verified);
+  const admitted = !scoped || reviewRequested || manual === 'relevant' || (!manual && relevance === 'relevant' && verified);
   return {
     admitted, scoped, relevance,
-    monitoring_evidence_status: !scoped ? 'not_applicable' : manual === 'relevant' ? 'manual_confirmed' : admitted ? 'confirmed' : 'needs_review',
+    monitoring_evidence_status: !scoped ? 'not_applicable' : reviewRequested ? 'needs_review' : manual === 'relevant' ? 'manual_confirmed' : admitted ? 'confirmed' : 'needs_review',
   };
 }
 
@@ -119,7 +129,8 @@ export function recordMainPostEvidenceSql(alias = 'r') {
 
 export function recordTriageAdmissionSql(alias = 'r') {
   const a = aliasName(alias);
-  return `(NOT ${recordSentryScopeSql(a)} OR CASE WHEN ${manualRecordRelevanceSql(a)} IS NOT NULL THEN ${manualRecordRelevanceSql(a)} = 'relevant' ELSE COALESCE(${a}.ai_result->>'relevance' = 'relevant',false) AND ${recordMainPostEvidenceSql(a)} END)`;
+  const reviewRequested = `COALESCE(${a}.manual_overrides->'triage_review'->>'value' = 'requested',false) AND ${recordEffectiveRelevanceSql(a)} = 'uncertain'`;
+  return `(NOT ${recordSentryScopeSql(a)} OR (${reviewRequested}) OR CASE WHEN ${manualRecordRelevanceSql(a)} IS NOT NULL THEN ${manualRecordRelevanceSql(a)} = 'relevant' ELSE COALESCE(${a}.ai_result->>'relevance' = 'relevant',false) AND ${recordMainPostEvidenceSql(a)} END)`;
 }
 
 export function recordAdmissionSelectSql(alias = 'r', { admitted = null } = {}) {
@@ -132,12 +143,13 @@ export function recordAdmissionSelectSql(alias = 'r', { admitted = null } = {}) 
 export function withRecordAdmissionFields(record = {}) {
   const { admission_scoped, admission_allowed, ...publicRecord } = record;
   const manual = manualRecordRelevance(record);
+  const reviewRequested = requestedTriageReview(record, manual || object(record.ai_result).relevance || 'uncertain');
   const computed = admission_scoped === undefined ? recordTriageAdmission(record) : {
     scoped: admission_scoped,
     admitted: admission_allowed,
-    monitoring_evidence_status: !admission_scoped ? 'not_applicable' : manual === 'relevant' ? 'manual_confirmed' : admission_allowed ? 'confirmed' : 'needs_review',
+    monitoring_evidence_status: !admission_scoped ? 'not_applicable' : reviewRequested ? 'needs_review' : manual === 'relevant' ? 'manual_confirmed' : admission_allowed ? 'confirmed' : 'needs_review',
   };
-  if (computed.scoped && computed.admitted) {
+  if (computed.scoped && computed.admitted && !reviewRequested) {
     const ai = object(record.ai_result);
     const metadata = normalizeMonitoringEvidence({ ...ai, relevance: manual || ai.relevance }, record);
     // The paged list omits transcript text. A source already admitted by SQL

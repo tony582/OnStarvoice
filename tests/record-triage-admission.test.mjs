@@ -3,6 +3,29 @@ import test from 'node:test';
 import { appendRecordIntentFilter, recordJudgmentExportFields, recordTriageAdmission, withRecordAdmissionFields } from '../server/services/record-triage-admission.js';
 
 const post = { keyword: '别克哨兵', ai_result: { relevance: 'relevant' }, title: '开启了哨兵模式' };
+test('a requested single-post triage review preserves uncertain AI judgment and unverified evidence', () => {
+  const uncertain = { ...post, sentiment: 'neutral', ai_result: { relevance: 'uncertain', relevanceReason: '未确认品牌', monitoringEvidence: { status: 'needs_review', evidence: [] } } };
+  const requested = { ...uncertain, manual_overrides: { triage_review: { value: 'requested', reason: '用户指定进入待复核' } } };
+  const before = structuredClone(requested);
+  assert.equal(recordTriageAdmission(uncertain).admitted, false, 'unrequested uncertain posts keep existing admission');
+  assert.deepEqual(recordTriageAdmission(requested), { admitted: true, scoped: true, relevance: 'uncertain', monitoring_evidence_status: 'needs_review' });
+  for (const input of [requested, { ...requested, admission_scoped: true, admission_allowed: true }]) {
+    const projected = withRecordAdmissionFields(input);
+    assert.deepEqual(projected.ai_result, uncertain.ai_result, 'admission must not manufacture confirmed brand evidence');
+    assert.equal(projected.monitoring_evidence_status, 'needs_review');
+    assert.equal(projected.sentiment, 'neutral');
+    assert.equal(recordJudgmentExportFields(input).relevance, '信息不足');
+    assert.equal(recordJudgmentExportFields(input).relevance_source, 'AI');
+  }
+  assert.deepEqual(requested, before);
+  for (const triage_review of [null, true, 'requested', '{"value":"requested"}', [{ value: 'requested' }], { value: true }, { value: 'canceled' }]) {
+    assert.equal(recordTriageAdmission({ ...uncertain, manual_overrides: { triage_review } }).admitted, false);
+  }
+  assert.equal(recordTriageAdmission({ ...requested, ai_result: { relevance: 'irrelevant' } }).admitted, false, 'a later irrelevant judgment still excludes the post');
+  assert.equal(recordTriageAdmission({ ...requested, manual_overrides: { ...requested.manual_overrides, relevance: 'irrelevant' } }).admitted, false, 'human irrelevance takes priority');
+  assert.equal(recordTriageAdmission({ ...requested, manual_overrides: { triage_review: { value: 'canceled' } } }).admitted, false, 'the workflow request is reversible');
+});
+
 test('sentry admission requires overall relevance and original post evidence; existing manual overrides have priority', () => {
   assert.equal(recordTriageAdmission(post).admitted, false);
   assert.equal(recordTriageAdmission({ ...post, author_name: '别克车主', tags: ['别克'], content: '#别克哨兵 很方便' }).admitted, false);
