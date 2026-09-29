@@ -23,6 +23,26 @@ export function isApiNetworkError(error: unknown): error is ApiNetworkError {
   return error instanceof ApiNetworkError
 }
 
+// 服务端已应答但不是 2xx。message 与原先一致，另带状态码、错误码和建议的重试间隔，
+// 供页面区分「服务繁忙（503 server_busy）」与其他失败。
+export class ApiResponseError extends Error {
+  readonly status: number
+  readonly code: string
+  readonly retryAfterMs: number | null
+
+  constructor(message: string, status: number, data: unknown) {
+    super(message)
+    this.name = 'ApiResponseError'
+    this.status = status
+    const body = data && typeof data === 'object'
+      ? data as { error?: unknown; retryAfterMs?: unknown }
+      : {}
+    this.code = typeof body.error === 'string' ? body.error : ''
+    const retryAfterMs = Number(body.retryAfterMs)
+    this.retryAfterMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : null
+  }
+}
+
 function responseMessage(data: unknown, fallback: string) {
   if (!data || typeof data !== 'object') return fallback
   const response = data as { message?: unknown; error?: unknown }
@@ -92,7 +112,7 @@ class ApiClient {
     }
 
     if (!resp.ok) {
-      throw new Error(responseMessage(data, '请求失败'))
+      throw new ApiResponseError(responseMessage(data, '请求失败'), resp.status, data)
     }
 
     return data as T

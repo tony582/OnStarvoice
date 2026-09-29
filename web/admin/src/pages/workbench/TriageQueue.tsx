@@ -49,6 +49,7 @@ import { useNav } from '@/lib/navigation'
 import { recordDisplayTitle } from '@/lib/record-display'
 import { appendPostIntentFilter, appendPostRelevanceFilters, initialPostIntentFilter, normalizePostRelevanceFilter, normalizePostConfidenceFilter } from '@/lib/post-judgment'
 import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
+import { readWithBusyRetry } from '@/lib/busy-retry.mjs'
 import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
 import { PostIntentFilter, PostRelevanceFilter, PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
 
@@ -415,6 +416,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const customTagRequestSeq = useRef(0)
   const listRequestSeq = useRef(0)
   const listAbort = useRef<AbortController | null>(null)
+  // 列表区正显示着当前筛选的结果。用户发起读取时先置否，读成功才置真。
+  const listShown = useRef(false)
   // Keep this page as a working set until the operator explicitly exits selection.
   const [selectionActive, setSelectionActive] = useState(false)
   const selectionSession = useRef(false)
@@ -517,30 +520,45 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (selectionSession.current) return
     const requestSeq = ++listRequestSeq.current
     listAbort.current?.abort()
-    setListError('')
+    // 静默重读（处理完一条之后）只在列表正显示当前筛选的结果时才静默；
+    // 列表区是错误面板或别的筛选的旧结果时，按用户发起的读取处理。
+    const silent = Boolean(options?.silent) && listShown.current
+    if (!silent) {
+      listShown.current = false
+      setListError('')
+    }
     const controller = new AbortController()
     listAbort.current = controller
-    if (!options?.silent) setLoading(true)
+    if (!silent) setLoading(true)
     try {
       const params = filterParams()
       params.set('page', String(page))
       params.set('pageSize', String(pageSize))
-      let data = await withTriageReadDeadline(signal => api.request<TriageListResponse>('/triage/records?' + params, { signal }), controller)
+      // 服务繁忙（503）先自动重试两次，仍在 25 秒读取时限之内；筛选变化会取消整次读取。
+      const readList = () => withTriageReadDeadline(signal => readWithBusyRetry(
+        () => api.request<TriageListResponse>('/triage/records?' + params, { signal }),
+        { retries: 2, signal },
+      ), controller)
+      let data = await readList()
       const lastPage = Math.max(1, Number(data.pagination?.totalPages) || 1)
       if (page > lastPage && requestSeq === listRequestSeq.current && !selectionSession.current) {
         params.set('page', String(lastPage))
-        data = await withTriageReadDeadline(signal => api.request<TriageListResponse>('/triage/records?' + params, { signal }), controller)
+        data = await readList()
       }
       if (requestSeq !== listRequestSeq.current) return
       if (!Array.isArray(data.records)) throw new Error('内容响应不完整，请稍后重试。')
       setRecords(data.records || [])
       setPagination(data.pagination || null)
+      listShown.current = true
     } catch (err) {
-      if (requestSeq === listRequestSeq.current) setListError(triageLoadError(err))
+      if (requestSeq !== listRequestSeq.current) return
+      // 静默重读失败时保留已显示的列表，只给一条提示；其余读取失败换成错误面板。
+      if (silent) showBatchFeedback(`${triageLoadError(err)}列表保留刷新前的内容。`, 'error')
+      else setListError(triageLoadError(err))
     } finally {
       if (requestSeq === listRequestSeq.current) setLoading(false)
     }
-  }), [filterParams, pageSize, view])
+  }), [filterParams, pageSize, showBatchFeedback, view])
 
   const cancelSelection = () => {
     if (selectionBusy) return

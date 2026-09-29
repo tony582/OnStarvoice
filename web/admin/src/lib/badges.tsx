@@ -59,10 +59,14 @@ export function BadgesProvider({ children }: { children: ReactNode }) {
     tokenRef.current += 1
   }, [])
 
-  const refresh = useCallback(() => {
+  // fresh=1：调用方刚改过数据，服务端必须在这次请求之后重新计数；
+  // 定时与切回页面的读取不带它，可复用服务端 20 秒内的结果。
+  const read = useCallback((fresh: boolean) => {
     if (!user || !tenantId) return
     const token = ++tokenRef.current
-    api.get<{ ok: boolean; badges: Badges; features?: Partial<WorkspaceFeatures> }>('/workspace/badges')
+    api.get<{ ok: boolean; badges: Badges; features?: Partial<WorkspaceFeatures> }>(
+      fresh ? '/workspace/badges?fresh=1' : '/workspace/badges',
+    )
       .then(data => {
         if (token === tokenRef.current && data?.ok) {
           const commentRiskAttentionEnabled = data.features?.commentRiskAttentionEnabled !== false
@@ -78,19 +82,20 @@ export function BadgesProvider({ children }: { children: ReactNode }) {
       })
       .catch(() => {})
   }, [badgeScope, user, tenantId])
+  const refresh = useCallback(() => read(true), [read])
 
   useEffect(() => {
     invalidatePending() // 租户变更立即作废在途请求
-    refresh()
-    const timer = window.setInterval(refresh, POLL_MS)
-    const onVisible = () => { if (document.visibilityState === 'visible') refresh() }
+    read(false)
+    const timer = window.setInterval(() => read(false), POLL_MS)
+    const onVisible = () => { if (document.visibilityState === 'visible') read(false) }
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       invalidatePending()
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', onVisible)
     }
-  }, [invalidatePending, refresh])
+  }, [invalidatePending, read])
 
   return (
     <BadgesContext.Provider value={{ badges, features, refresh }}>

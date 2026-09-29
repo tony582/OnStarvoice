@@ -5,6 +5,12 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth'
+import {
+  overviewNextPollDelayMs,
+  overviewReadOutcome,
+  readWithBusyRetry,
+} from '@/lib/busy-retry.mjs'
+import type { OverviewReadOutcome } from '@/lib/busy-retry.mjs'
 import { useNav } from '@/lib/navigation'
 import { Button } from '@/components/ui/button'
 import {
@@ -64,6 +70,8 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
+  // 看板没能刷新但页面仍有数据时的说明；与 error 不同，它不代表看板不可用。
+  const [refreshNotice, setRefreshNotice] = useState('')
   const [feedback, setFeedback] = useState('')
   const [actionError, setActionError] = useState('')
   const [actionTaskId, setActionTaskId] = useState('')
@@ -112,6 +120,8 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   const overviewLoadFollowUp = useRef(false)
   const overviewLoadWaiters = useRef<Array<() => void>>([])
   const overviewLoadFailureCount = useRef(0)
+  const overviewLoadBusy = useRef(false)
+  const overviewLoaded = useRef(false)
   const orchestrationDetailDialogRef = useRef<HTMLDivElement | null>(null)
 
   const closeOrchestrationComposer = useCallback(() => {
@@ -145,21 +155,28 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   const fetchOverview = useCallback(async (quiet = false) => {
     if (quiet) setRefreshing(true)
     else setLoading(true)
+    const previous = { loaded: overviewLoaded.current, failureCount: overviewLoadFailureCount.current }
+    let outcome: OverviewReadOutcome
     try {
-      const data = await api.get<Overview & { ok: boolean }>('/capture-cloud/overview')
-      setOverview({ agents: data.agents || [], tasks: data.tasks || [], summary: data.summary })
-      setError('')
-      overviewLoadFailureCount.current = 0
-    } catch (err) {
-      overviewLoadFailureCount.current = Math.min(
-        4,
-        overviewLoadFailureCount.current + 1,
+      // 还没有任何数据时，服务繁忙先自动重试几次，不急着给出一个空看板。
+      const data = await readWithBusyRetry(
+        () => api.get<Overview & { ok: boolean; stale?: boolean; staleAgeMs?: number }>('/capture-cloud/overview'),
+        { retries: previous.loaded ? 0 : 3 },
       )
-      setError(err instanceof Error ? err.message : '读取云端任务中心失败')
+      // 服务端读不成时给的是它最近一次完整结果（stale）：照常展示，由 outcome 决定说明和重试。
+      setOverview({ agents: data.agents || [], tasks: data.tasks || [], summary: data.summary })
+      outcome = overviewReadOutcome(previous, { data })
+    } catch (err) {
+      outcome = overviewReadOutcome(previous, { error: err })
     } finally {
       setLoading(false)
       setRefreshing(false)
     }
+    overviewLoaded.current = outcome.loaded
+    overviewLoadBusy.current = outcome.busy
+    overviewLoadFailureCount.current = outcome.failureCount
+    setRefreshNotice(outcome.notice)
+    setError(outcome.error)
   }, [])
 
   const load = useCallback((
@@ -212,8 +229,10 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
       if (disposed || document.hidden) return
       await load(quiet, { queueIfBusy: false })
       if (disposed || document.hidden) return
-      const retryMultiplier = 2 ** overviewLoadFailureCount.current
-      schedule(Math.min(120_000, 15_000 * retryMultiplier))
+      schedule(overviewNextPollDelayMs({
+        failureCount: overviewLoadFailureCount.current,
+        busy: overviewLoadBusy.current,
+      }))
     }
     const handleVisibilityChange = () => {
       if (document.hidden) {
@@ -666,6 +685,7 @@ export function DispatchPage({ surface = 'desktop' }: { surface?: 'desktop' | 'm
   return (
     <div className="space-y-5 xl:h-full">
       {error && <div role="alert" className="rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-sm text-status-red">{error}</div>}
+      {!error && refreshNotice && <div role="status" aria-live="polite" className="rounded-xl border border-status-orange/25 bg-status-orange/8 px-4 py-3 text-sm text-amber-700 dark:text-amber-300">{refreshNotice}</div>}
       {actionError && <div role="alert" className="rounded-xl border border-status-red/25 bg-status-red/8 px-4 py-3 text-sm text-status-red">{actionError}</div>}
       {feedback && <div role="status" aria-live="polite" className="rounded-xl border border-primary/20 bg-primary/8 px-4 py-3 text-sm text-primary">{feedback}</div>}
 
