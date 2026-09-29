@@ -148,7 +148,7 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
 - 每次心跳都会执行的三条语句（预检、执行槽占用、终止通知）：目前在用的节点都没有未放行的停止保护记录，预计各在几十页以内。
 - 节点出现未放行的停止保护记录期间，它的执行槽占用语句要执行子查询；全租户列表只要租户里有带停止保护码的记录（目前 20 条）就要执行子查询。预计约 1,700 页，其中约 1,500 页是上面 7 条历史记录的接力任务探测。
 - `settled_runs` 走只读索引时，两次清理之间被改动过的堆页仍要回表（每条一页，不解 TOAST）。实际页数取决于自动清理的节奏，需要上线后测量。
-- **PostgreSQL 14 是否选用这些索引尚未验证。** 本机是 17。CI 在 PostgreSQL 14 上跑同一份集成测试；生产上建好索引后再用取证脚本只读复核一次。
+- PostgreSQL 14 会选用这些索引：CI 在 PostgreSQL 14 上通过了同一份计划测试（见「验证」）。这是测试夹具上的结果；生产数据上的计划要在建好索引后用测量脚本只读复核。
 
 ## 没有改的
 
@@ -172,7 +172,19 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
 - Node 全量回归（Node 18.20.8）：3,152 / 3,152。
 - PostgreSQL 全量集成（Node 18.20.8，本机 PostgreSQL 17.9，库 `onstarvoice_test_heartbeat_claim_20260929`）：457 / 457。
 - 在线建索引演练：在没有 091 的库上用下文的命令建出六个索引，全部有效；随后执行迁移文件，六条语句都报告「已存在，跳过」。
-- 尚未做：PostgreSQL 14 上的运行（CI）、生产上的建索引与复核。
+- CI（运行 36526823194，提交 `5083fba`）：`PostgreSQL 14 / Node 24.12.0`、`PostgreSQL 16 / Node 24.12.0`、`PostgreSQL 16 / Node 18.20.8` 三项集成和 `Production Node 18 compatibility` 通过。PostgreSQL 14 上的计划测试：
+
+  | 语句 | 读取页数 | 禁用索引扫描时 |
+  | --- | --- | --- |
+  | 执行槽占用（节点带停止保护记录） | 62–63 | 12,022 |
+  | 执行槽占用（节点没有未放行记录） | 10 | 281 |
+  | 停止保护预检 | 8–11 | 1,284–1,413 |
+  | 列表（节点、六行、全租户） | 3–59 | 12,383–14,432 |
+  | 隐式放行查询 | 54 | 12,062 |
+  | 终止通知 | 2–3 | 273 |
+
+- 同一次运行里 `Tests and builds` 第一次失败在 Android Runner 的计时测试「expired upload window closes interrupted while durable events retain their original identity」（`runners/android/test/daemon-integration.test.mjs`，任务期限只留 60 ms）。本批没有改 `runners/`，本机 Node 24.12.0 连跑 8 次都通过；重跑后通过，五项全部通过。
+- 尚未做：生产上的建索引与复核。
 
 ## 发布与回退
 
@@ -207,6 +219,25 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
 3. nginx 日志里心跳和存活上报的 500 次数。
 
 回退：`DROP INDEX CONCURRENTLY` 六个索引。语句没有变，计划回到现状。迁移文件如已登记，保留登记即可；需要重建时手工执行。
+
+## 与看板、内容分诊 hotfix 的关系
+
+`codex/hotfix-dashboard-triage-load-20260929`（分支头 `450b6f6`，代码到 `4b22f60`）同样基于 `b89b181`，改 Server 8 个文件和 Admin，没有迁移。2026-09-29 核对：
+
+- 两个分支没有共同文件，合并没有冲突。
+- 合并后的树（`450b6f6` + `5083fba`）：Node 全量回归 3,191 / 3,191，PostgreSQL 全量集成 466 / 466（Node 18.20.8，本机 PostgreSQL 17.9）。
+- 合并后的树里，对方发布包要替换的 6 个文件、新增的 2 个文件和它核对的 12 个文件，SHA-256 与发布包 `release-manifest.json` 完全一致。也就是说合并不改变对方已经演练过的发布包。
+- 对方 `deploy.sh` 的预检只核对它列出的文件和 Admin index。建索引、放入 091 迁移文件都不影响预检。
+- 生产进程是 `compatibility`（角色 `all`），启动时执行迁移。091 迁移文件在场时，对方发布里的那一次重启会登记它；索引已经建好时迁移只登记版本。
+- 两边互补：对方把看板的语句上限放宽到 5 秒并在繁忙时回退到最近一次完整结果；本批把看板里的停止保护列表从约 10 万页降下来。
+
+建议同一个窗口发布，分两步，各自可以单独回退：
+
+1. 本批：在线建六个索引，核对有效，`ANALYZE`，只读复核。不重启。回退是删索引。
+2. 把 `server/db/migrations/091_capture_heartbeat_indexes.sql`（SHA-256 `7a72a5419c4afee922983aea4acc72c2f39970f14ea4bc9f46089af533f31e5e`）放进生产的迁移目录。
+3. 对方发布包原样发布（`deploy.sh --check`，再 `deploy.sh`）。它的重启会登记 091。
+
+不建议为了带上迁移文件重新出包：对方的包已经演练并记录了哈希，迁移文件不在它的核对范围内。
 
 ## 附：逐行探测写法（未采用）
 
