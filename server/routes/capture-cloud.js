@@ -124,6 +124,13 @@ import {
   operatorClosedWorkItem,
 } from '../services/capture-operator-close.js';
 import {sweepDeadAttentionRoots} from '../services/capture-dead-attention.js';
+import {
+  createLastGoodStore,
+  createRateLimitedReporter,
+  isTransientDatabaseReadError,
+  traceReadExecutor,
+  transientDatabaseReadRetryAfterMs,
+} from '../services/display-read-resilience.js';
 
 function requireCaptureAgent(req, res, next) {
   return authenticateCaptureAgent(req, res, error => {
@@ -162,6 +169,26 @@ const MAX_COMMAND_COMPLETION_RESULT_BYTES = 96 * 1024;
 const CAPTURE_OVERVIEW_CACHE_TTL_MS = 1_000;
 const CAPTURE_OVERVIEW_CACHE_MAX_ENTRIES = 100;
 const captureOverviewProjectionCache = new Map();
+// The board is polled every 15 seconds. When one read meets a saturated
+// database, the last complete projection (at most this old, and marked as such
+// in the response) is a better answer than an empty board.
+export const CAPTURE_OVERVIEW_LAST_GOOD_MAX_AGE_MS = 90_000;
+const captureOverviewLastGood = createLastGoodStore({
+  maxAgeMs: CAPTURE_OVERVIEW_LAST_GOOD_MAX_AGE_MS,
+  maxEntries: 20,
+});
+// A statement that needs two seconds on a busy two-core host is slow, not
+// broken. Production, 2026-09-20..29: 150 overview statements cancelled at the
+// former 2000 ms limit (93 stop-fence listings, 57 task pages; both need well
+// under half a second on an idle database) and 35 reads refused after the
+// former 250 ms wait for one of the two reporting slots.
+const CAPTURE_OVERVIEW_WAIT_TIMEOUT_MS = 1_500;
+const CAPTURE_OVERVIEW_STATEMENT_TIMEOUT_MS = 5_000;
+// The six statements together: no new statement starts after this, so one read
+// holds its reporting slot for about as long as before (six times two seconds).
+const CAPTURE_OVERVIEW_PROJECTION_BUDGET_MS = 8_000;
+const CAPTURE_OVERVIEW_SLOW_PROJECTION_MS = 2_000;
+const reportCaptureOverviewRead = createRateLimitedReporter({intervalMs: 10_000});
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const RECOVERABLE_STATUSES = new Set([
   'interrupted',
@@ -282,6 +309,7 @@ export async function loadCachedCaptureOverviewProjection({
         expiresAt: Number(now()) + CAPTURE_OVERVIEW_CACHE_TTL_MS,
       });
     }
+    captureOverviewLastGood.remember(key, value, startedAt);
     return value;
   } catch (err) {
     if (captureOverviewProjectionCache.get(key)?.promise === promise) {
@@ -291,8 +319,38 @@ export async function loadCachedCaptureOverviewProjection({
   }
 }
 
-export function clearCaptureOverviewProjectionCache() {
+/**
+ * The last complete projection of this tenant and page size, or null when
+ * there is none younger than CAPTURE_OVERVIEW_LAST_GOOD_MAX_AGE_MS. Only the
+ * overview route reads it, and only after a transient database failure.
+ */
+export function readLastGoodCaptureOverviewProjection({
+  tenantId,
+  limit,
+  now = Date.now,
+}) {
+  return captureOverviewLastGood.read(
+    `${String(tenantId || '')}:${Number(limit) || 0}`,
+    Number(now()),
+  );
+}
+
+// Writers call this so the next read is fresh. The last complete projection
+// stays: it is served only when that fresh read fails, and always marked.
+export function clearCaptureOverviewProjectionCache({includeLastGood = false} = {}) {
   captureOverviewProjectionCache.clear();
+  if (includeLastGood) captureOverviewLastGood.clear();
+}
+
+function captureOverviewStatementLabel(sql) {
+  const statement = String(sql || '');
+  if (statement.includes('WITH task_load AS')) return 'agents';
+  if (statement.includes('agent_display_name')) return 'tasks';
+  if (statement.includes('AS running_tasks')) return 'task_summary';
+  if (statement.includes('WITH RECURSIVE task_tree')) return 'operator_close';
+  if (statement.includes('orchestration_schedule_id')) return 'schedule_templates';
+  if (statement.includes('ROW_NUMBER() OVER')) return 'stop_fences';
+  return 'other';
 }
 // One normal execution plus one different-Agent relay. More generations make
 // a congested host or weak network noisier without improving the real result.
@@ -10937,10 +10995,18 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
     // Command expiry is maintained by the bounded scheduler reconciliation.
     // Keep this display endpoint read-only and on one reporting connection so
     // a refresh cannot consume three pool slots or become an accidental cron.
-    const {agents, tasks, taskSummary} = await loadCachedCaptureOverviewProjection({
+    const projectionRead = {stale: false, staleAgeMs: 0, retryAfterMs: 0};
+    const loadProjection = () => loadCachedCaptureOverviewProjection({
       tenantId: req.tenantId,
       limit,
-      loader: () => withTransaction(async tx => {
+      loader: async () => {
+      const trace = [];
+      const startedAt = Date.now();
+      try {
+      return await withTransaction(async transaction => {
+      const tx = traceReadExecutor(transaction, trace, captureOverviewStatementLabel, {
+        budgetMs: CAPTURE_OVERVIEW_PROJECTION_BUDGET_MS,
+      });
       const agents = await tx.queryAll(`
         WITH task_load AS (
           SELECT
@@ -11157,12 +11223,54 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
         };
       }, {
         category: 'reporting',
-        waitTimeoutMs: 250,
-        statementTimeoutMs: 2000,
+        waitTimeoutMs: CAPTURE_OVERVIEW_WAIT_TIMEOUT_MS,
+        statementTimeoutMs: CAPTURE_OVERVIEW_STATEMENT_TIMEOUT_MS,
         lockTimeoutMs: 100,
         jitOff: true,
-      }),
+      });
+      } catch (error) {
+        if (error && typeof error === 'object') {
+          error.captureOverviewTrace = trace;
+          error.captureOverviewElapsedMs = Date.now() - startedAt;
+        }
+        throw error;
+      } finally {
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs >= CAPTURE_OVERVIEW_SLOW_PROJECTION_MS && !trace.some(entry => entry.failed)) {
+          reportCaptureOverviewRead(`slow:${req.tenantId}`, '[CaptureOverview] slow projection', {
+            tenantId: req.tenantId,
+            elapsedMs,
+            statements: trace.map(entry => `${entry.statement}=${entry.ms}ms`).join(' '),
+          });
+        }
+      }
+      },
     });
+
+    let projection;
+    try {
+      projection = await loadProjection();
+    } catch (error) {
+      if (!isTransientDatabaseReadError(error)) throw error;
+      const lastGood = readLastGoodCaptureOverviewProjection({tenantId: req.tenantId, limit});
+      reportCaptureOverviewRead(`failed:${req.tenantId}`, '[CaptureOverview] projection failed', {
+        tenantId: req.tenantId,
+        code: error.code,
+        reason: error.reason || '',
+        statement: error.readStatement || '',
+        elapsedMs: Number(error.captureOverviewElapsedMs) || 0,
+        statements: (error.captureOverviewTrace || [])
+          .map(entry => `${entry.statement}=${entry.ms}ms${entry.failed ? '!' : ''}`).join(' '),
+        servedLastGood: Boolean(lastGood),
+        lastGoodAgeMs: lastGood ? lastGood.ageMs : null,
+      });
+      if (!lastGood) throw error;
+      projection = lastGood.value;
+      projectionRead.stale = true;
+      projectionRead.staleAgeMs = lastGood.ageMs;
+      projectionRead.retryAfterMs = transientDatabaseReadRetryAfterMs(error, 3000);
+    }
+    const {agents, tasks, taskSummary} = projection;
 
     const aiAdmission = getTenantAiAdmissionSnapshot(req.tenantId);
     const publicAgents = agents.map(agent => ({
@@ -11173,8 +11281,21 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
         safeJson(agent.capabilities).taskStateKnown === false ||
         safeJson(agent.capabilities).heartbeatDegraded === true,
     }));
+    if (projectionRead.stale) {
+      res.set('Retry-After', String(Math.ceil(projectionRead.retryAfterMs / 1000)));
+    }
     return res.json({
       ok: true,
+      // Present only when this answer is the last complete projection because
+      // the current read met a saturated database; the page says so and asks
+      // again after retryAfterMs.
+      ...(projectionRead.stale
+        ? {
+            stale: true,
+            staleAgeMs: projectionRead.staleAgeMs,
+            retryAfterMs: projectionRead.retryAfterMs,
+          }
+        : {}),
       agents: publicAgents,
       tasks: tasks.map(task => ({
         ...task,
@@ -11199,8 +11320,8 @@ router.get('/overview', requireTenantAccess, requireSessionUser, async (req, res
       },
     });
   } catch (err) {
-    if (isDbCapacityError(err) || err?.code === '57014') {
-      const retryAfterMs = Math.max(250, Number(err?.retryAfterMs) || 1000);
+    if (isTransientDatabaseReadError(err)) {
+      const retryAfterMs = transientDatabaseReadRetryAfterMs(err, 1000);
       res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
       return res.status(503).json({
         ok: false,
