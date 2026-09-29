@@ -8,6 +8,7 @@ import {dispatchDiscoveredPost} from '../../../server/services/capture-discovery
 import {cancelDiscoveryDemands,reconcileDiscoveryDetails} from '../../../server/services/capture-discovery/detail-lifecycle.js';
 import {createAndroidControlService} from '../../../server/services/android-control/service.js';
 import {createDiscoveryManagementService} from '../../../server/services/capture-discovery/management.js';
+import {listRecordDiscoveryKeywords,readDiscoveryCaptureKeyword} from '../../../server/services/capture-discovery/record-keyword.js';
 
 test('discovery detail pipeline against isolated PostgreSQL',async t=>{
   validatePostgresIntegrationTarget({testDatabaseUrl:process.env.TEST_DATABASE_URL,databaseUrl:process.env.DATABASE_URL,requireDatabaseUrl:true});
@@ -37,17 +38,17 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
     const mobile=await addAgent({agentKind:'android_mobile',mobileSearchDiscoveryV1:true});
     const browser=await addAgent({remoteTaskCreate:true,remoteTargetedPostCaptureV1:true,remoteStop:true,
       discoveredPostCaptureV1:true,supportedPlatforms:['douyin']});
-    async function addRun(rawShareUrl='https://www.douyin.com/video/7654321098765432109',ingestService=service,evidence={}) {
+    async function addRun(rawShareUrl='https://www.douyin.com/video/7654321098765432109',ingestService=service,evidence={},keyword='别克壁纸') {
       const [{id:taskId}]=await query(`INSERT INTO capture_tasks(tenant_id,origin_agent_id,assigned_agent_id,platform,status,metadata)
         VALUES($1,$2,$2,'douyin','running',$3) RETURNING id`,[tenantId,mobile.id,{workflow:'douyin_mobile_discovery',deadlineAt:new Date(Date.now()+600000).toISOString()}]);
       const requestHash='a'.repeat(64);
       const [{id:itemId}]=await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,platform,status,keyword,
         assigned_agent_id,execution_task_id,assignment_revision,request_hash,attempt_count)
-        VALUES($1,$2,'kw-1','douyin','running','别克壁纸',$3,$2,1,$4,1) RETURNING id`,[tenantId,taskId,mobile.id,requestHash]);
+        VALUES($1,$2,'kw-1','douyin','running',$5,$3,$2,1,$4,1) RETURNING id`,[tenantId,taskId,mobile.id,requestHash,keyword]);
       const [{id:attemptId}]=await query(`INSERT INTO capture_task_item_attempts(tenant_id,item_id,parent_task_id,execution_task_id,
         agent_id,assignment_revision,request_hash,status) VALUES($1,$2,$3,$3,$4,1,$5,'running') RETURNING id`,[tenantId,itemId,taskId,mobile.id,requestHash]);
       const event={eventId:randomUUID(),discoveryRunId:taskId,taskId,itemId,attemptId,agentId:mobile.id,requestHash,
-        assignmentRevision:1,keyword:'别克壁纸',verification:'verified',discoveredAt:new Date().toISOString(),rawShareUrl,...evidence};
+        assignmentRevision:1,keyword,verification:'verified',discoveredAt:new Date().toISOString(),rawShareUrl,...evidence};
       const principal={tenantId,agentId:mobile.id,authCodeId,authBindingId};
       const receipt=(await ingestService.ingestBatch({principal,batch:{uploadBatchId:randomUUID(),events:[event]}})).receipts[0];
       return {taskId,event,receipt};
@@ -299,5 +300,52 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
     await withTransaction(tx=>reconcileDiscoveryDetails(tx,{tenantId:f.tenantId}));
     const [candidate]=await query('SELECT status,last_error FROM capture_discovery_candidates WHERE tenant_id=$1',[f.tenantId]);
     assert.equal(candidate.status,'failed');assert.equal(candidate.last_error.code,'detail_create_expired');
+  });
+  await t.test('a phone-found post is stored under the keyword the phone found it with',async st=>{
+    // The browser opens the post by its link: its upload carries no keyword.
+    const f=await fixture(st),run=await f.addRun(),detail=await f.dispatch();
+    await f.mirror(detail);
+    const stored=await f.store(detail); assert.equal(stored.action,'inserted');
+    const [record]=await query('SELECT keyword FROM records WHERE id=$1',[stored.id]);
+    assert.equal(record.keyword,'别克壁纸');
+    const [observation]=await query('SELECT keyword FROM record_observations WHERE id=$1',[stored.observationId]);
+    assert.equal(observation.keyword,'别克壁纸','the observation is filed under the same keyword');
+    const executor={queryAll:query,queryOne:async(sql,values)=>(await query(sql,values))[0]||null};
+    assert.equal(await readDiscoveryCaptureKeyword(executor,{tenantId:f.tenantId,captureTaskId:detail.taskId}),'别克壁纸');
+    // The phone's own search run is not a detail capture; neither is an unknown or malformed task.
+    assert.equal(await readDiscoveryCaptureKeyword(executor,{tenantId:f.tenantId,captureTaskId:run.taskId}),'');
+    assert.equal(await readDiscoveryCaptureKeyword(executor,{tenantId:f.tenantId,captureTaskId:randomUUID()}),'');
+    assert.equal(await readDiscoveryCaptureKeyword(executor,{tenantId:f.tenantId,captureTaskId:'not-a-task'}),'');
+    assert.equal(await readDiscoveryCaptureKeyword(executor,{tenantId:randomUUID(),captureTaskId:detail.taskId}),'','another tenant reads nothing');
+    assert.deepEqual(await listRecordDiscoveryKeywords(executor,{tenantId:f.tenantId,recordId:stored.id}),['别克壁纸']);
+    assert.deepEqual(await listRecordDiscoveryKeywords(executor,{tenantId:randomUUID(),recordId:stored.id}),[]);
+    assert.deepEqual(await listRecordDiscoveryKeywords(executor,{tenantId:f.tenantId,recordId:'not-a-record'}),[]);
+  });
+  await t.test('found under several keywords: the earliest discovery names the record, all of them are listed',async st=>{
+    const f=await fixture(st);
+    const earlier=new Date(Date.now()-120000).toISOString(),later=new Date(Date.now()-60000).toISOString();
+    // Received in another order than discovered: the discovery time decides.
+    const second=await f.addRun(undefined,undefined,{discoveredAt:later},'别克车机壁纸');
+    const first=await f.addRun(undefined,undefined,{discoveredAt:earlier},'君越壁纸');
+    await f.addRun(undefined,undefined,{discoveredAt:new Date().toISOString()},'君越壁纸');
+    assert.equal(first.receipt.candidateId,second.receipt.candidateId);
+    const detail=await f.dispatch(),stored=await f.store(detail);
+    const [record]=await query('SELECT keyword FROM records WHERE id=$1',[stored.id]);
+    assert.equal(record.keyword,'君越壁纸');
+    const executor={queryAll:query,queryOne:async(sql,values)=>(await query(sql,values))[0]||null};
+    assert.deepEqual(await listRecordDiscoveryKeywords(executor,{tenantId:f.tenantId,recordId:stored.id}),['君越壁纸','别克车机壁纸']);
+    assert.deepEqual(await listRecordDiscoveryKeywords(executor,{tenantId:f.tenantId,recordId:stored.id,limit:1}),['君越壁纸']);
+  });
+  await t.test('a keyword the upload does carry is kept, and other captures are untouched',async st=>{
+    const f=await fixture(st);await f.addRun();const detail=await f.dispatch();
+    const stored=await f.store(detail,{keyword:'浏览器自带关键词'});
+    const [record]=await query('SELECT keyword FROM records WHERE id=$1',[stored.id]);
+    assert.equal(record.keyword,'浏览器自带关键词');
+    // An ordinary upload without a capture task keeps its empty keyword.
+    const plain=await upsertCapturedRecord({platform:'douyin',external_id:'7654321098765432110',
+      url:'https://www.douyin.com/video/7654321098765432110',record_type:'single_note',title:'没有任务的单帖',
+      author_name:'真实用户',author_id:'person-456',content:'正文'},{tenantId:f.tenantId});
+    const [plainRecord]=await query('SELECT keyword FROM records WHERE id=$1',[plain.id]);
+    assert.equal(plainRecord.keyword,'');
   });
 });

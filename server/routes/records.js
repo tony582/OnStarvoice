@@ -27,6 +27,7 @@ import { getRecordLifecycle, getRecordLifecycles, sendRecordArchived } from '../
 import { redactXhsRecordNavigation } from '../services/xhs-source-open.js';
 
 import { normalizeContentTopic } from '../services/content-topic.js';
+import { listRecordDiscoveryKeywords } from '../services/capture-discovery/record-keyword.js';
 
 const router = Router();
 
@@ -335,7 +336,13 @@ router.get('/:id/observations', requireTenantAccess, async (req, res, next) => {
       'SELECT * FROM record_observations WHERE record_id = $1 AND tenant_id = $2 ORDER BY captured_at DESC',
       [req.params.id, req.tenantId]
     );
-    return res.json({ ok: true, observations });
+    // 手机发现的作品由浏览器按链接补详情，早先入库时没有写关键词；
+    // 发现台账里有。读不到不影响快照本身。
+    const discoveryKeywords = await listRecordDiscoveryKeywords({ queryAll }, {
+      tenantId: req.tenantId,
+      recordId: req.params.id,
+    }).catch(() => []);
+    return res.json({ ok: true, observations, discoveryKeywords });
   } catch (err) {
     return next(err);
   }

@@ -1,4 +1,5 @@
 import {recordDiscoveryIngestion,finishDiscoveryObservation} from './capture-discovery/detail-receipt.js';
+import {readDiscoveryCaptureKeyword} from './capture-discovery/record-keyword.js';
 import crypto from 'crypto';
 import {persistCapturedContentAvailability} from './capture-content-availability.js';
 import { withTransaction } from '../db/init.js';
@@ -1174,6 +1175,13 @@ export async function upsertCapturedRecord(record, context) {
   let payload = jsonText(record.payload, '{}');
 
   const runUpsertTransaction = () => withTransaction(async tx => {
+    // A browser reads a phone-discovered post by its link, so its upload has no
+    // keyword. Store the post and this observation under the keyword the phone
+    // found it with, as a keyword capture by a browser would be.
+    if (!String(record.keyword || '').trim()) {
+      const discoveryKeyword = await readDiscoveryCaptureKeyword(tx, {tenantId, captureTaskId});
+      if (discoveryKeyword) record = {...record, keyword: discoveryKeyword};
+    }
     // Only the saved task can supply the search window. Never infer it from a
     // current schedule (which may have changed) or trust an upload's window.
     const captureTask = record.record_type === 'keyword_notes'
