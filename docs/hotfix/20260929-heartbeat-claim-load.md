@@ -2,7 +2,7 @@
 
 分支：`codex/hotfix-heartbeat-claim-load-20260929`，基线 `b89b181`。2026-09-29 12:50 核对：生产 `/opt/onstarvoice` 的 `server/services/capture-cloud.js`、`server/services/capture-stop-fence.js`、`server/routes/capture-cloud.js` 与 `b89b181` 的 SHA-256 完全一致（`codex/hotfix-dashboard-triage-load-20260929` 当时尚未提交、未上线）。
 
-本批只新增一个数据库迁移（091，六个部分索引）、测试和一个只读测量脚本。不改任何 SQL 语句、Server 代码、Admin、Extension、Android Runner、依赖和环境配置。停止保护 SQL（`captureTaskUnconfirmedLocalStopSql`）逐字节不变，原有的 SHA-256 钉子测试不变。
+2026-09-29 已上线（索引 13:54，迁移登记 14:05）。本批只新增一个数据库迁移（091，六个部分索引）、测试和一个只读测量脚本。不改任何 SQL 语句、Server 代码、Admin、Extension、Android Runner、依赖和环境配置。停止保护 SQL（`captureTaskUnconfirmedLocalStopSql`）逐字节不变，原有的 SHA-256 钉子测试不变。
 
 ## 现象
 
@@ -92,14 +92,14 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
 
 迁移 `server/db/migrations/091_capture_heartbeat_indexes.sql`，六个部分索引。索引条件逐字重复语句里已有的条件，规划器才能证明可用。
 
-| 索引 | 服务的语句 | 本机大小（条目） |
-| --- | --- | --- |
-| `idx_capture_tasks_stop_fence_unconfirmed`：租户、节点、状态；条件是错误码等于停止保护码 | 执行槽占用的停止保护分支、列表、预检、隐式放行、`historical_stop` | 16 kB（122） |
-| `idx_capture_tasks_stop_fence_local_release`：租户、节点；条件是已放行且本机释放待办 | 预检的三处读取、列表的本机释放分支 | 16 kB（7） |
-| `idx_capture_tasks_agent_slot_blocking`：租户、节点、状态；条件是七个占用执行槽的状态 | 执行槽占用的在途任务分支 | 16 kB（30） |
-| `idx_capture_tasks_terminal_notice`：租户、节点、最后时间、id；条件是五种巡查类型且已终止 | 终止通知 | 32 kB（216） |
-| `idx_capture_tasks_settled_run_proof`：租户、状态、平台，附带节点与时间列；条件是 `settled_runs` 的五个静态条件 | `settled_runs`（只读索引，不再访问 `metadata`） | 464 kB（3,445） |
-| `idx_capture_agent_commands_accepted_stop`：租户、任务、节点、完成时间；条件是已接受的停止回执 | `confirmed_stops` | 32 kB（152） |
+| 索引 | 服务的语句 | 本机大小（条目） | 生产大小（条目） |
+| --- | --- | --- | --- |
+| `idx_capture_tasks_stop_fence_unconfirmed`：租户、节点、状态；条件是错误码等于停止保护码 | 执行槽占用的停止保护分支、列表、预检、隐式放行、`historical_stop` | 16 kB（122） | 16 kB（20） |
+| `idx_capture_tasks_stop_fence_local_release`：租户、节点；条件是已放行且本机释放待办 | 预检的三处读取、列表的本机释放分支 | 16 kB（7） | 8 kB（0） |
+| `idx_capture_tasks_agent_slot_blocking`：租户、节点、状态；条件是七个占用执行槽的状态 | 执行槽占用的在途任务分支 | 16 kB（30） | 16 kB（21） |
+| `idx_capture_tasks_terminal_notice`：租户、节点、最后时间、id；条件是五种巡查类型且已终止 | 终止通知 | 32 kB（216） | 56 kB（434） |
+| `idx_capture_tasks_settled_run_proof`：租户、状态、平台，附带节点与时间列；条件是 `settled_runs` 的五个静态条件 | `settled_runs`（只读索引，不再访问 `metadata`） | 464 kB（3,445） | 760 kB（5,822） |
+| `idx_capture_agent_commands_accepted_stop`：租户、任务、节点、完成时间；条件是已接受的停止回执 | `confirmed_stops` | 32 kB（152） | 56 kB（437） |
 
 写入代价：前四个索引只收录极少数行；`settled_run_proof` 只收录已结束的采集执行，结束后很少再更新。每次更新要多算几个索引条件，其中读 `metadata` 的条件排在类型、时间条件之后，运行中的任务不会走到。
 
@@ -143,12 +143,25 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
 | 隐式放行查询 | 57 | 12,557 |
 | 终止通知 | 2–3 | 356 |
 
-### 生产预期与尚未验证的部分
+### 生产（2026-09-29 13:56，建索引后只读复核）
 
-- 每次心跳都会执行的三条语句（预检、执行槽占用、终止通知）：目前在用的节点都没有未放行的停止保护记录，预计各在几十页以内。
-- 节点出现未放行的停止保护记录期间，它的执行槽占用语句要执行子查询；全租户列表只要租户里有带停止保护码的记录（目前 20 条）就要执行子查询。预计约 1,700 页，其中约 1,500 页是上面 7 条历史记录的接力任务探测。
-- `settled_runs` 走只读索引时，两次清理之间被改动过的堆页仍要回表（每条一页，不解 TOAST）。实际页数取决于自动清理的节奏，需要上线后测量。
-- PostgreSQL 14 会选用这些索引：CI 在 PostgreSQL 14 上通过了同一份计划测试（见「验证」）。这是测试夹具上的结果；生产数据上的计划要在建好索引后用测量脚本只读复核。
+同一份测量脚本、同样的 12 个节点，建索引前后：
+
+| 语句 | 建索引前 | 建索引后 |
+| --- | --- | --- |
+| 停止保护预检 | 3,000–8,500 页，10–44 ms | 15–19 页，0.1–0.3 ms |
+| 执行槽占用 | 1,957 页，8–20 ms | 9–12 页，0.4–1.2 ms |
+| 执行槽占用，节点带未放行的停止保护记录 | 75,368 页，205–440 ms | 958–963 页，8.5–8.8 ms |
+| 终止通知 | 500–1,580 页，2–17 ms | 2–508 页，0.06–0.73 ms |
+| 隐式放行查询 | 2,500–3,600 页；带记录的节点 75,400 页 | 1 页；带记录的节点 958–967 页 |
+| 六行列表、单节点列表 | 75,000–79,000 页，206–274 ms | 1–3 页；节点有带停止保护码的记录时 942–990 页，4.5–4.9 ms |
+| 全租户停止保护列表 | 102,139 页，288 ms | 1,052 页，5.2 ms |
+| 转任务排队原因 | 330–660 页；带记录的节点 73,400 页 | 13–18 页；带记录的节点 958–960 页 |
+
+- 所有计划都经过新索引，没有顺序扫描。
+- 终止通知在候选最多的节点上仍有 508 页：19 条候选逐条读 `metadata` 和查执行记录。
+- 子查询执行时约 950 页，其中大部分是 7 条历史记录的接力任务探测（建索引前测得 1,511 页）。
+- 这是空闲时的数字。采集高峰（20–22 点、03–05 点）下的超时次数要看上线后的日志。
 
 ## 没有改的
 
@@ -184,22 +197,24 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
   | 终止通知 | 2–3 | 273 |
 
 - 同一次运行里 `Tests and builds` 第一次失败在 Android Runner 的计时测试「expired upload window closes interrupted while durable events retain their original identity」（`runners/android/test/daemon-integration.test.mjs`，任务期限只留 60 ms）。本批没有改 `runners/`，本机 Node 24.12.0 连跑 8 次都通过；重跑后通过，五项全部通过。
-- 尚未做：生产上的建索引与复核。
+- 生产：2026-09-29 13:54 在线建好六个索引，13:56 只读复核（见「效果」）。
 
 ## 发布与回退
 
-发布内容：一个迁移文件。不需要替换 Server 代码。
+发布内容：六个索引和一个迁移文件。不需要替换 Server 代码。
 
-1. **先在线建索引。** `deploy.sh` 在旧进程仍在服务时执行迁移，而迁移在事务里建索引会在建完之前挡住 `capture_tasks` 的写入。把迁移里的 `CREATE INDEX IF NOT EXISTS` 换成 `CREATE INDEX CONCURRENTLY IF NOT EXISTS` 后交给 `psql` 逐条执行（不能加 `--single-transaction`，在线建索引不能放在事务里）：
+**迁移文件不能在登记之前放进生产的迁移目录。** `/api/health/ready` 会逐一核对磁盘上的迁移文件是否都已登记（`assertRuntimeSchemaReady`），有一个没登记就返回 503 `database_unavailable`。2026-09-29 14:02 实际发生过一次，见 `docs/hotfix/20260929-release-dashboard-heartbeat.md`。
+
+1. **在线建索引。** `deploy.sh` 在旧进程仍在服务时执行迁移，而迁移在事务里建索引会在建完之前挡住 `capture_tasks` 的写入。把迁移里的 `CREATE INDEX IF NOT EXISTS` 换成 `CREATE INDEX CONCURRENTLY IF NOT EXISTS` 后交给 `psql` 逐条执行（不能加 `--single-transaction`，在线建索引不能放在事务里）：
 
    ```bash
    sed 's/^CREATE INDEX IF NOT EXISTS/CREATE INDEX CONCURRENTLY IF NOT EXISTS/' \
      server/db/migrations/091_capture_heartbeat_indexes.sql > create-indexes-online.sql
    ```
-2. 核对六个索引都有效：
+2. 核对六个索引都有效，定义与迁移一致：
 
    ```sql
-   SELECT c.relname, x.indisvalid, pg_size_pretty(pg_relation_size(c.oid))
+   SELECT c.relname, x.indisvalid, pg_get_indexdef(c.oid)
    FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
    WHERE c.relname IN (
      'idx_capture_tasks_stop_fence_unconfirmed', 'idx_capture_tasks_stop_fence_local_release',
@@ -210,7 +225,8 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
    在线建索引中途失败会留下无效索引，`IF NOT EXISTS` 会把它当成已存在。遇到 `indisvalid = false` 先 `DROP INDEX CONCURRENTLY` 再重建。
 3. `ANALYZE capture_tasks; ANALYZE capture_agent_commands;`
 4. 只读复核：重跑 `scripts/diagnostics/heartbeat-claim-explain.mjs` 生成的脚本，确认各语句的计划用到了新索引、读取页数下降。
-5. 放入迁移文件。下次启动或部署时迁移发现索引已存在，只登记版本。
+5. 登记迁移：确认第 2 步的结果后，向 `schema_migrations` 写入 `091_capture_heartbeat_indexes.sql`。迁移的全部效果（六个索引）此时已经存在，这一行与迁移程序执行完文件后写入的那一行相同。
+6. 放入迁移文件。之后的启动发现 091 已登记，不再执行它。
 
 上线后核对：
 
@@ -218,7 +234,7 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
 2. PostgreSQL 日志里终止通知、停止保护列表被取消的次数，节点锁等待超时的次数。
 3. nginx 日志里心跳和存活上报的 500 次数。
 
-回退：`DROP INDEX CONCURRENTLY` 六个索引。语句没有变，计划回到现状。迁移文件如已登记，保留登记即可；需要重建时手工执行。
+回退：`DROP INDEX CONCURRENTLY` 六个索引。语句没有变，计划回到现状。迁移的登记和文件保留即可；需要重建时手工执行。
 
 ## 与看板、内容分诊 hotfix 的关系
 
@@ -228,16 +244,10 @@ node scripts/diagnostics/heartbeat-claim-explain.mjs --nodes=6 > explain.sql
 - 合并后的树（`450b6f6` + `5083fba`）：Node 全量回归 3,191 / 3,191，PostgreSQL 全量集成 466 / 466（Node 18.20.8，本机 PostgreSQL 17.9）。
 - 合并后的树里，对方发布包要替换的 6 个文件、新增的 2 个文件和它核对的 12 个文件，SHA-256 与发布包 `release-manifest.json` 完全一致。也就是说合并不改变对方已经演练过的发布包。
 - 对方 `deploy.sh` 的预检只核对它列出的文件和 Admin index。建索引、放入 091 迁移文件都不影响预检。
-- 生产进程是 `compatibility`（角色 `all`），启动时执行迁移。091 迁移文件在场时，对方发布里的那一次重启会登记它；索引已经建好时迁移只登记版本。
+- 生产进程是 `compatibility`（角色 `all`），启动时执行迁移。
 - 两边互补：对方把看板的语句上限放宽到 5 秒并在繁忙时回退到最近一次完整结果；本批把看板里的停止保护列表从约 10 万页降下来。
 
-建议同一个窗口发布，分两步，各自可以单独回退：
-
-1. 本批：在线建六个索引，核对有效，`ANALYZE`，只读复核。不重启。回退是删索引。
-2. 把 `server/db/migrations/091_capture_heartbeat_indexes.sql`（SHA-256 `7a72a5419c4afee922983aea4acc72c2f39970f14ea4bc9f46089af533f31e5e`）放进生产的迁移目录。
-3. 对方发布包原样发布（`deploy.sh --check`，再 `deploy.sh`）。它的重启会登记 091。
-
-不建议为了带上迁移文件重新出包：对方的包已经演练并记录了哈希，迁移文件不在它的核对范围内。
+两边在 2026-09-29 同一个窗口发布，分两步，各自可以单独回退：先建索引、登记并放入迁移文件，再原样发布对方的包。没有为了带上迁移文件重新出包：对方的包已经演练并记录了哈希，迁移文件不在它的核对范围内。发布分支 `codex/release-dashboard-heartbeat-20260929`（`acbe77f`）合并了两边；上线记录在 `docs/hotfix/20260929-release-dashboard-heartbeat.md`。
 
 ## 附：逐行探测写法（未采用）
 
