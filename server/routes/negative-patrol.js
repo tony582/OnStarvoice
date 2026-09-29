@@ -25,6 +25,7 @@ import {
   getNegativePatrolAnalytics,
   getNegativePatrolPostTimeline,
 } from '../services/negative-patrol-analytics.js';
+import {truncateWellFormed} from '../utils/well-formed-text.js';
 
 const router = Router();
 const UUID_PATTERN =
@@ -66,7 +67,9 @@ const NEGATIVE_PATROL_TERMINAL_ATTEMPT_STATUSES = [
 
 function text(value, limit = 1000) {
   const normalized = String(value ?? '').trim();
-  return normalized.length > limit ? normalized.slice(0, limit) : normalized;
+  // Much of this ends up in jsonb (item metadata, request snapshots), which
+  // rejects the lone surrogate a plain slice can leave of an emoji.
+  return normalized.length > limit ? truncateWellFormed(normalized, limit) : normalized;
 }
 
 function safeJson(value) {

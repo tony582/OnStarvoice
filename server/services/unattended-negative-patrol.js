@@ -1,3 +1,5 @@
+import {truncateWellFormed} from '../utils/well-formed-text.js';
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PLATFORMS = new Set(['xiaohongshu', 'douyin']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -277,7 +279,8 @@ function publicCandidate(row, qualification) {
         comments: row.baseline_comments ?? row.comments_count ?? 0,
         collects: row.baseline_collects ?? row.collects ?? 0,
         shares: row.baseline_shares ?? row.shares ?? 0}},
-    sourceRecord: {title: row.title || '', content: text(row.content).slice(0, 1000),
+    // Bound for jsonb metadata: a cut through an emoji would leave a lone surrogate.
+    sourceRecord: {title: row.title || '', content: truncateWellFormed(text(row.content), 1000),
       authorName: row.author_name || '', publishedAt: row.published_ts,
       publishTime: row.publish_time, keyword: row.keyword, noteType: row.note_type},
   };
