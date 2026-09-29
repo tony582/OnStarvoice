@@ -10,6 +10,7 @@ import {
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
 import { api } from '@/lib/api'
 import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel, friendlyError, proxiedImg } from '@/lib/utils'
+import { captureKeywordPresentation, publishTimePresentation } from '@/lib/publish-time.mjs'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -104,6 +105,7 @@ function RecordDrawerContent({
   const [comments, setComments] = useState<any[]>([])
   const [officialResponses, setOfficialResponses] = useState<any[]>([])
   const [observations, setObservations] = useState<any[]>([])
+  const [discoveryKeywords, setDiscoveryKeywords] = useState<string[]>([])
   const [activity, setActivity] = useState<RecordActivity[]>([])
   const [loadedRecordId, setLoadedRecordId] = useState('')
   const [loading, setLoading] = useState(true)
@@ -140,6 +142,7 @@ function RecordDrawerContent({
       setComments(cData.comments || [])
       setOfficialResponses(cData.officialResponses || [])
       setObservations(oData.observations || [])
+      setDiscoveryKeywords(Array.isArray(oData.discoveryKeywords) ? oData.discoveryKeywords : [])
       setActivity(aData.activity || [])
       setLoadedRecordId(r.id)
     }).finally(() => { if (active) setLoading(false) })
@@ -685,9 +688,9 @@ function RecordDrawerContent({
                 {tab === 'snapshot' && (
                   <div className="space-y-4">
                     <div className="grid grid-cols-2 gap-3">
-                      <InfoTile label="关键词" value={r.keyword || '-'} />
+                      <InfoTile label="关键词" {...captureKeywordPresentation(r.keyword, discoveryKeywords)} />
                       <InfoTile label="内容类型" value={r.note_type || '-'} />
-                      <InfoTile label="发布时间" value={r.publish_time || '-'} />
+                      <InfoTile label="发布时间" {...publishTimePresentation(r)} />
                       <InfoTile label="首次发现" value={formatFullDateSec(r.first_seen_at)} />
                       <InfoTile label="最近采集" value={formatFullDateSec(r.last_seen_at || r.created_at)} />
                       <InfoTile label="采集次数" value={`${formatNumber(r.seen_count)} 次`} />
@@ -1269,11 +1272,12 @@ function Metric({ icon: Icon, label, value }: { icon: React.ElementType; label: 
   )
 }
 
-function InfoTile({ label, value }: { label: string; value: string }) {
+function InfoTile({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="border-b border-border/40 py-2">
       <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{label}</div>
       <div className="mt-0.5 text-sm font-semibold">{value || '-'}</div>
+      {hint && <div className="mt-0.5 text-[11px] leading-4 text-muted-foreground">{hint}</div>}
     </div>
   )
 }
