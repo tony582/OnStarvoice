@@ -16,6 +16,7 @@ import {
   buildUserMessage,
   normalizeRecordClassificationResult,
 } from '../server/services/ai-labeler.js';
+import { isWellFormed } from '../server/utils/well-formed-text.js';
 
 const CURRENT_VIDEO = 'https://sns-video.example.test/current.mp4';
 const PREVIOUS_VIDEO = 'https://sns-video.example.test/previous.mp4';
@@ -242,4 +243,120 @@ test('长主帖超过旧 2000 字截断点仍可进入实际分类输入，评�
   });
   assert.match(message, /昂科威Plus的哨兵没有触发/);
   assert.doesNotMatch(message, /评论秘密正文/);
+});
+
+// PostgreSQL jsonb rejects a lone-surrogate escape, so one half-emoji in an evidence
+// quote fails the whole label write (SQLSTATE 22P02) and the record is retried forever.
+const loneSurrogateEscape = json => /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f][0-9a-f]{2})|(?<!\\ud[89ab][0-9a-f]{2})\\ud[c-f][0-9a-f]{2}/i.test(json);
+const assertEvidenceIsWholeText = (content, evidence, label) => {
+  assert.ok(evidence.length > 0, `${label}：应能抽取到线索`);
+  for (const item of evidence) {
+    assert.equal(isWellFormed(item.quote), true, `${label}：quote 含孤立代理项`);
+    assert.equal(isWellFormed(item.entity), true, `${label}：entity 含孤立代理项`);
+    assert.ok(content.includes(item.quote), `${label}：quote 必须仍是原文的子串`);
+    assert.ok(item.quote.includes(item.entity), `${label}：quote 必须包含 entity`);
+  }
+  assert.equal(loneSurrogateEscape(JSON.stringify(evidence)), false, `${label}：序列化后不能有孤立转义`);
+};
+
+test('引用窗口的起点或终点落在 emoji 中间时整字丢弃，引用仍是原文子串且含实体', () => {
+  // 窗口是实体前 25、后 60 个 UTF-16 code unit：逐个偏移扫过两个边界，含正好切断的那一个。
+  for (let filler = 20; filler <= 28; filler += 1) {
+    const content = `💰${'，'.repeat(filler)}别克哨兵昨晚没有录像`;
+    assertEvidenceIsWholeText(content, findMainPostGmEvidence({ content, keyword: '别克哨兵' }), `起点 filler=${filler}`);
+  }
+  for (let filler = 55; filler <= 63; filler += 1) {
+    const content = `别克${'，'.repeat(filler)}💰谁看谁心动`;
+    assertEvidenceIsWholeText(content, findMainPostGmEvidence({ content, keyword: '别克哨兵' }), `终点 filler=${filler}`);
+  }
+  const both = `💰${'，'.repeat(24)}别克${'，'.repeat(59)}💰后面`;
+  assertEvidenceIsWholeText(both, findMainPostGmEvidence({ content: both, keyword: '别克哨兵' }), '两端同时');
+  // 生产日志里的形状：句子以 emoji 结尾，窗口恰好切在 emoji 前一半之后。
+  const production = `别克${'，'.repeat(50)}💡 算完全包落地💰谁看谁心动🤝`;
+  for (const cut of [1, 2, 3]) {
+    const trimmed = production.slice(0, production.length - cut);
+    assertEvidenceIsWholeText(trimmed, findMainPostGmEvidence({ content: trimmed, keyword: '别克哨兵' }), `尾部裁掉 ${cut}`);
+  }
+});
+
+test('NFKC 会折叠的花体品牌名不会让实体被切在一对代理项中间', () => {
+  // 数学字母、方框字母折叠成一个 BMP 字母，归一化偏移落在原文一对代理项的中间。
+  for (const [content, entity] of [
+    ['𝐁𝐮𝐢𝐜𝐤哨兵没录像', '𝐁𝐮𝐢𝐜𝐤'],
+    ['𝓑𝓾𝓲𝓬𝓴哨兵怎么开', '𝓑𝓾𝓲𝓬𝓴'],
+    ['𝔹𝕦𝕚𝕔𝕜哨兵怎么开', '𝔹𝕦𝕚𝕔𝕜'],
+    ['🄱🅄🄸🄲🄺哨兵怎么开', '🄱🅄🄸🄲🄺'],
+    ['𝘊𝘢𝘥𝘪𝘭𝘭𝘢𝘤的哨兵', '𝘊𝘢𝘥𝘪𝘭𝘭𝘢𝘤'],
+    ['我的𝐋𝐚𝐂𝐫𝐨𝐬𝐬𝐞哨兵', '𝐋𝐚𝐂𝐫𝐨𝐬𝐬𝐞'],
+  ]) {
+    const evidence = findMainPostGmEvidence({ content, keyword: '别克哨兵' });
+    assertEvidenceIsWholeText(content, evidence, content);
+    assert.equal(evidence[0].entity, entity, `${content}：实体应是完整的原文写法`);
+  }
+});
+
+test('随机混排 emoji、花体和实体：每条证据都是完整文本（固定种子，可复现）', () => {
+  let seed = 20260929;
+  const next = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 2 ** 32; };
+  const pick = list => list[Math.floor(next() * list.length)];
+  const filler = ['，', '。', '哨兵', '录像', '💰', '👍🏽', '🇨🇳', '👨‍👩‍👧', '1️⃣', '谁看谁心动', ' ', 'abc'];
+  const entities = ['别克', '昂科威Plus', '𝐁𝐮𝐢𝐜𝐤', '🄱🅄🄸🄲🄺', '凯迪拉克', 'LaCrosse'];
+  let checked = 0;
+  for (let round = 0; round < 400; round += 1) {
+    let content = '';
+    for (let i = Math.floor(next() * 30); i > 0; i -= 1) content += pick(filler);
+    content += pick(entities);
+    for (let i = Math.floor(next() * 50); i > 0; i -= 1) content += pick(filler);
+    const evidence = findMainPostGmEvidence({ content, keyword: '别克哨兵' });
+    if (!evidence.length) continue;
+    checked += 1;
+    assertEvidenceIsWholeText(content, evidence, `round ${round}`);
+  }
+  assert.ok(checked > 200, `随机样本里大部分应抽到线索，实际 ${checked}`);
+});
+
+test('模型引用停在半个 emoji 上会通过 includes 校验，必须被丢弃；完整引用仍被接受', () => {
+  const record = { title: '新车ZX9000哨兵没触发💰', content: '' };
+  const cite = quote => normalizeMonitoringEvidence({
+    relevance: 'relevant',
+    monitoringEvidence: {
+      status: 'confirmed',
+      evidence: [{ source: 'title', entityType: 'model', manufacturer: 'saic_gm', entity: 'ZX9000', quote }],
+    },
+  }, record);
+  const halfEmoji = record.title.slice(0, -1);
+  assert.equal(isWellFormed(halfEmoji), false, '夹具：引用确实以孤立高位代理项结尾');
+  assert.ok(record.title.includes(halfEmoji), '夹具：UTF-16 的 includes 会放行它');
+  const rejected = cite(halfEmoji);
+  assert.ok(rejected.evidence.every(item => isWellFormed(item.quote) && isWellFormed(item.entity)));
+  assert.equal(rejected.evidence.some(item => item.entityType === 'model'), false, '半个 emoji 的模型引用不能入库');
+  assert.equal(loneSurrogateEscape(JSON.stringify(rejected)), false);
+
+  const accepted = cite(record.title);
+  assert.equal(accepted.status, 'confirmed');
+  assert.deepEqual(accepted.evidence.map(item => [item.source, item.entity, item.quote, item.entityType]),
+    [['title', 'ZX9000', record.title, 'model']]);
+});
+
+test('模型引用的 quote 完整、但 entity 以半个 emoji 结尾或开头时同样丢弃', () => {
+  // hasWholeSourceEntity 用 UTF-16 indexOf，所以带半个 emoji 的 entity 也能在完整的 quote 里找到。
+  const cases = [
+    { title: '新车ZX9000💰哨兵没触发', entity: 'ZX9000\uD83D', quote: '新车ZX9000💰哨兵' },
+    { title: '新车💰ZX9000哨兵没触发', entity: '\uDCB0ZX9000', quote: '新车💰ZX9000哨兵' },
+  ];
+  for (const { title, entity, quote } of cases) {
+    assert.equal(isWellFormed(quote), true, '夹具：quote 本身是完整文本');
+    assert.equal(isWellFormed(entity), false, '夹具：entity 带孤立代理项');
+    assert.ok(title.includes(quote) && quote.includes(entity), '夹具：includes 校验会放行它');
+    const result = normalizeMonitoringEvidence({
+      relevance: 'relevant',
+      monitoringEvidence: {
+        status: 'confirmed',
+        evidence: [{ source: 'title', entityType: 'model', manufacturer: 'saic_gm', entity, quote }],
+      },
+    }, { title });
+    assert.equal(result.evidence.some(item => item.entityType === 'model'), false);
+    assert.ok(result.evidence.every(item => isWellFormed(item.entity) && isWellFormed(item.quote)));
+    assert.equal(loneSurrogateEscape(JSON.stringify(result)), false);
+  }
 });

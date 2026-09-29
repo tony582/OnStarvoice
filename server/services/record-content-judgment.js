@@ -1,4 +1,5 @@
 import { GM_VEHICLE_ALIASES, GM_COMPATIBLE_MODEL_SPELLINGS } from './gm-vehicle-aliases.js';
+import { isWellFormed, sliceWellFormed, splitsSurrogatePair } from '../utils/well-formed-text.js';
 
 // Post intent and verifiable main-post evidence. Search metadata and comments
 // are deliberately excluded: a recall keyword does not identify a vehicle.
@@ -76,7 +77,12 @@ function sourceOffset(text, offset, end = false) {
     if (size < offset || (!end && size === offset)) low = middle + 1;
     else high = middle;
   }
-  return end ? low : Math.max(0, low - (text.slice(0, low).normalize('NFKC').length > offset ? 1 : 0));
+  const index = end ? low : Math.max(0, low - (text.slice(0, low).normalize('NFKC').length > offset ? 1 : 0));
+  // NFKC folds some astral letters (mathematical bold/italic, squared Latin) into one
+  // BMP letter, so the prefix that reaches `offset` can stop between the two halves of
+  // the pair. Snap outward so the cited entity keeps its whole first and last character.
+  if (!splitsSurrogatePair(text, index)) return index;
+  return end ? index + 1 : index - 1;
 }
 
 export function formatGmAliasesForPrompt() {
@@ -146,8 +152,10 @@ export function findMainPostGmEvidence(record = {}) {
       if (!entityMatch) continue;
       const entityStart = sourceOffset(text, match.index + entityMatch.index);
       const entityEnd = sourceOffset(text, match.index + entityMatch.index + entityMatch[0].length, true);
-      const entity = text.slice(entityStart, entityEnd);
-      const quote = text.slice(Math.max(0, entityStart - 25), Math.min(text.length, entityEnd + 60)).trim();
+      const entity = sliceWellFormed(text, entityStart, entityEnd);
+      // The window edges are arbitrary UTF-16 offsets. An emoji on an edge is dropped whole: a
+      // lone surrogate in the quote is rejected by PostgreSQL jsonb and fails the label write.
+      const quote = sliceWellFormed(text, Math.max(0, entityStart - 25), Math.min(text.length, entityEnd + 60)).trim();
       evidence.push({ source, quote, entity });
       if (evidence.length >= 6) return evidence;
     }
@@ -180,7 +188,10 @@ export function findRecordMonitoringEvidence(result = {}, record = {}) {
       || typeof item.quote !== 'string' || typeof item.entity !== 'string') continue;
     const quote = item.quote.trim();
     const entity = item.entity.trim();
+    // A quote that ends on half an emoji still passes includes() below (UTF-16 comparison) and
+    // would be stored as is, so a malformed model citation is dropped like any other bad one.
     if (quote.length < 2 || quote.length > 500 || entity.length < 2 || entity.length > 80
+      || !isWellFormed(quote) || !isWellFormed(entity)
       || new RegExp(GENERIC_ENTITY_PATTERN, 'i').test(entity.normalize('NFKC'))
       || new RegExp(NON_SAIC_GM_ORG_PATTERN, 'i').test(entity.normalize('NFKC'))) continue;
     const source = sources.find(entry => entry.source === item.source);

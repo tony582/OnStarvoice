@@ -18,6 +18,17 @@ import {
   resolveTenantMonitoringScope,
 } from './monitoring-intent.js';
 import { scheduleProcessBackgroundWork } from '../runtime/process-background-work.js';
+import { stringifyJsonWellFormed, toWellFormed, truncateWellFormed } from '../utils/well-formed-text.js';
+import {
+  LABEL_FAILURE_BUDGET,
+  LABEL_FAILURE_RULES_VERSION,
+  LABEL_RETRY_DUE_SQL,
+  classifyLabelError,
+  isLabelAttemptBlocked,
+  planLabelFailure,
+  readLabelFailure,
+  writeLabelFailure,
+} from './ai-label-failure.js';
 import {
   getLlmRelayConfig,
   isLlmRelayEligibleKind,
@@ -363,27 +374,7 @@ export function normalizeLLMProvider(value) {
 // JSON 字符串（DeepSeek 返回 unexpected end of hex escape）。所有模型请求在
 // 序列化前再做一次边界清洗；提示词的定长截取则按完整 code point 进行。
 export function sanitizePromptText(value) {
-  const input = String(value ?? '');
-  let output = '';
-  for (let index = 0; index < input.length; index += 1) {
-    const code = input.charCodeAt(index);
-    if (code >= 0xD800 && code <= 0xDBFF) {
-      const next = input.charCodeAt(index + 1);
-      if (next >= 0xDC00 && next <= 0xDFFF) {
-        output += input[index] + input[index + 1];
-        index += 1;
-      } else {
-        output += '\uFFFD';
-      }
-      continue;
-    }
-    if (code >= 0xDC00 && code <= 0xDFFF) {
-      output += '\uFFFD';
-      continue;
-    }
-    output += input[index];
-  }
-  return output;
+  return toWellFormed(value);
 }
 
 export function truncatePromptText(value, maxCodePoints) {
@@ -1215,12 +1206,12 @@ export function normalizeRecordClassificationResult(result) {
     relevance,
     intent: normalizePostIntent(result?.intent),
     contentTopic: normalizeContentTopic(result?.contentTopic) || 'gm_other',
-    contentTopicReason: String(result?.contentTopicReason || '').trim().slice(0, 500),
-    intentReason: String(result?.intentReason || '').trim().slice(0, 500),
+    contentTopicReason: truncateWellFormed(String(result?.contentTopicReason || '').trim(), 500),
+    intentReason: truncateWellFormed(String(result?.intentReason || '').trim(), 500),
     currentKeywordMatch,
     matchedTopics: Array.isArray(result?.matchedTopics ?? result?.matched_topics)
       ? (result.matchedTopics ?? result.matched_topics)
-        .map(value => String(value || '').trim().slice(0, 100))
+        .map(value => truncateWellFormed(String(value || '').trim(), 100))
         .filter(Boolean)
         .slice(0, 30)
       : [],
@@ -1373,7 +1364,9 @@ export async function persistRecordClassification({ record, labeled, observedKey
     `, [
       result.sentiment || '', result.intent || '', result.category || '', result.subcategory || '',
       result.sourceType || result.source_type || '', result.summary || '', result.confidence || 0,
-      JSON.stringify(result),
+      // jsonb rejects a lone surrogate escape (22P02) and the model reply is spread into `result`
+      // unbounded, so no truncation helper can vouch for every string that lands here.
+      stringifyJsonWellFormed(result),
       publishedTs,
       record.id, current.tenant_id,
       result.contentTopic,
@@ -1382,11 +1375,51 @@ export async function persistRecordClassification({ record, labeled, observedKey
   });
 }
 
+// Records a failed attempt on the record itself (see ai-label-failure.js). It never throws:
+// the caller is a batch, and a record whose failure could not be saved must not cost the
+// rest of the batch. The message is only logged; the record keeps the error code.
+async function noteLabelFailure(record, error, options) {
+  let failure = { counts: false, reason: 'unclassified' };
+  let note = '';
+  let parkedAfter = 0;
+  try {
+    failure = classifyLabelError(error);
+    note = `${failure.reason}, not counted`;
+    if (failure.counts) {
+      const previous = readLabelFailure(record.ai_result);
+      const plan = planLabelFailure({ previous, force: Boolean(options.force) }); // the same reading of force as the gate
+      const isObject = record.ai_result && typeof record.ai_result === 'object' && !Array.isArray(record.ai_result);
+      const written = await writeLabelFailure({
+        record, failure, error, plan,
+        // an ai_result that is not an object and holds no label can only be counted by replacing it
+        replaceScalar: !isObject && !hasRelevanceResult(record),
+      });
+      note = written
+        ? `${failure.reason}, counted ${plan.attempts}/${LABEL_FAILURE_BUDGET}${plan.parked ? ', parked' : ''}`
+        : `${failure.reason}, not recorded: the record already has a label or changed meanwhile`;
+      if (written && plan.parked) parkedAfter = plan.attempts;
+    }
+  } catch (noteError) {
+    note = `${failure.reason}, failure state not saved: ${noteError?.message || noteError}`;
+  }
+  let shown;
+  try { shown = error?.message ?? error; } catch { shown = '[unreadable error]'; }
+  console.error(`[AI] Label error for record ${record.id}:`, shown, `[${note}]`);
+  if (parkedAfter) {
+    console.error(`[AI] Label parked for record ${record.id} after ${parkedAfter} counted failures (${failure.reason}); `
+      + `it stays unlabelled until its text changes or ${LABEL_FAILURE_RULES_VERSION} is bumped`);
+  }
+}
+
 export async function labelRecord(recordId, options = {}) {
-  const record = await queryOne('SELECT *, ai_labeled_at::text AS classification_version FROM records WHERE id = $1', [recordId]);
+  const record = await queryOne(`SELECT *, ai_labeled_at::text AS classification_version,
+    extract(epoch FROM now())::float8 AS db_now_epoch FROM records WHERE id = $1`, [recordId]);
   if (['official_content', 'blogger_profile'].includes(record?.record_type)) return null;
   if (record?.business_visibility && record.business_visibility !== 'eligible') return null;
   if (!record || (!options.force && record.ai_labeled_at && hasRelevanceResult(record))) return null;
+  // Parked, or waiting out the delay after a counted failure: no model call. A forced relabel
+  // (its text changed) always gets through. The clock is the database's, like the batch SQL.
+  if (!options.force && isLabelAttemptBlocked(record.ai_result, record.db_now_epoch * 1000)) return null;
 
   const observationRows = await queryAll(`
     SELECT DISTINCT keyword
@@ -1410,7 +1443,15 @@ export async function labelRecord(recordId, options = {}) {
       record.keyword,
       {priority: 'normal', kind: 'record_classification'},
     );
-    if (!labeled?.result) return null;
+    // No provider configured yet: the record is waiting for configuration, not failing.
+    if (!labeled) return null;
+    if (!labeled.result) {
+      // The model answered with null/0/false/"". This used to return silently and be re-sent
+      // (and re-billed) every batch with nothing in the log.
+      const emptyResult = new Error('模型返回了空结果');
+      emptyResult.code = 'LABEL_MODEL_EMPTY_RESULT';
+      throw emptyResult;
+    }
     const saved = await persistRecordClassification({ record, labeled, observedKeywords: uniqueObservedKeywords });
     if (!saved) return null;
     const { result, persisted } = saved;
@@ -1425,26 +1466,42 @@ export async function labelRecord(recordId, options = {}) {
     }
     return result;
   } catch (err) {
-    console.error(`[AI] Label error for record ${recordId}:`, err.message);
+    await noteLabelFailure(record, err, options);
     return null;
   }
 }
 
-export async function labelPendingRecords(limit = 50) {
+// `label` and `pauseMs` exist so a test can drive the batch without a model or 500 ms per record.
+export async function labelPendingRecords(limit = 50, { label = labelRecord, pauseMs = 500 } = {}) {
   const records = await queryAll(
     `SELECT id FROM records
      WHERE record_type NOT IN ('official_content', 'blogger_profile')
        AND business_visibility = 'eligible'
        AND (ai_labeled_at IS NULL OR ai_result->>'relevance' IS NULL)
+       AND ${LABEL_RETRY_DUE_SQL}
      ORDER BY created_at DESC
      LIMIT $1`,
-    [limit]
+    [limit, LABEL_FAILURE_RULES_VERSION]
   );
   let labeled = 0;
+  let consecutiveErrors = 0;
   for (const record of records) {
-    const result = await labelRecord(record.id);
-    if (result) labeled++;
-    await new Promise(r => setTimeout(r, 500));
+    try {
+      const result = await label(record.id);
+      if (result) labeled++;
+      consecutiveErrors = 0;
+    } catch (err) {
+      // labelRecord reads the database before its try block, so a busy database throws out of
+      // it. One record must not cost the rest of the batch, but three in a row means the
+      // database is not answering: stop and let the next tick try again.
+      consecutiveErrors += 1;
+      console.error(`[AI] Batch label error for record ${record.id}:`, err?.message || err);
+      if (consecutiveErrors >= 3) {
+        console.error('[AI] Batch stopped after 3 consecutive errors');
+        break;
+      }
+    }
+    if (pauseMs > 0) await new Promise(r => setTimeout(r, pauseMs));
   }
   console.log(`[AI] Batch labeled ${labeled}/${records.length} records`);
   return { total: records.length, labeled };

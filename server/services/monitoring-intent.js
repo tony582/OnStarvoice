@@ -1,3 +1,5 @@
+import { truncateWellFormed } from '../utils/well-formed-text.js';
+
 export const MONITORING_INTENT_VERSION = 3;
 export const TENANT_MONITORING_SCOPE_VERSION = 1;
 
@@ -120,7 +122,7 @@ const KEYWORD_INTENTS = [
 ];
 
 function boundedText(value, maxLength = 500) {
-  return String(value ?? '').trim().slice(0, maxLength);
+  return truncateWellFormed(String(value ?? '').trim(), maxLength);
 }
 
 function uniqueBounded(values = [], { maxItems = 120, maxLength = 100 } = {}) {
