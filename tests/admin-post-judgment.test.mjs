@@ -119,7 +119,7 @@ test('list, mobile, board and drawer expose intent and relevance with one filter
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const header = queue.slice(queue.indexOf('<thead data-sticky-header'), queue.indexOf('</thead>'));
-  const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* Board view */}'));
+  const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* List */}'));
   // 意图与相关性只在筛选栏出现一次（相关性在前）；表头合并成一列「AI 判断」只展示，不再放筛选器。
   assert.ok(filters.indexOf('aria-label="情感筛选"') < filters.indexOf('<PostRelevanceFilter value={relevances}'));
   assert.ok(filters.indexOf('<PostRelevanceFilter value={relevances}') < filters.indexOf('<PostIntentFilter value={intents}'));
@@ -157,14 +157,14 @@ test('filters wrap by content width in every layout and keep their labels horizo
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const component = source('web/admin/src/components/shared/PostJudgment.tsx');
   const trigger = source('web/admin/src/lib/filter-trigger.ts');
-  const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* Board view */}'));
+  const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* List */}'));
   // 不再按抽屉开关切换等宽网格：筛选 pill 永远按内容宽度排布并自然换行，标签不会被截成「全部平…」。
   assert.doesNotMatch(queue, /xl:grid-cols-|lg:w-\[160px\]|justify-between whitespace-nowrap/);
-  assert.match(filters, /w-full flex-wrap items-center gap-x-2 gap-y-2 rounded-b-xl border-t border-border\/70 bg-muted\/25/);
-  assert.match(filters, /<FilterGroup label="判断筛选组">/);
+  assert.match(filters, /w-full flex-wrap items-stretch gap-1\.5 border-t border-border\/70/);
+  assert.match(queue, /const FILTER_CELL = 'min-w-0 shrink grow basis-\[132px\]'/);
   assert.match(trigger, /shrink-0 items-center gap-1 whitespace-nowrap/);
   assert.match(component, /inline-flex shrink-0 items-center gap-1 whitespace-nowrap/);
-  assert.match(component, /pillTriggerClass\(active\)/);
+  assert.match(component, /pillTriggerClass\(active, className\)/);
 });
 
 test('menus use independent unrestricted reset items and positive multiselect choices', () => {

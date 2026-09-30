@@ -90,7 +90,7 @@ test('handled date filtering stays combined-only and follows initial, clear, sel
   const selection = queue.match(/const sel = useSelection\([^\n]+/)?.[0];
   assert.ok(selection);
   // 勾选跟着查询走（筛选/翻页/视图变化即清空），不再把整页筛选锁进「多选中」态。
-  assert.match(selection, /useSelection\(`\$\{filterQuery\}\|\$\{pageSize\}\|\$\{pagination\?\.page \?\? 1\}\|\$\{view\}`\)/);
+  assert.match(selection, /useSelection\(`\$\{filterQuery\}\|\$\{pageSize\}\|\$\{pagination\?\.page \?\? 1\}`\)/);
   assert.doesNotMatch(queue, /<fieldset disabled=\{selectionActive\}/);
   const cancel = queue.slice(queue.indexOf('const cancelSelection'), queue.indexOf('const refreshList'));
   assert.match(cancel, /sel\.clear\(\)/);

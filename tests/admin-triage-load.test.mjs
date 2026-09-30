@@ -41,7 +41,6 @@ test('capacity failure, timeouts and invalid responses have explicit actionable 
 test('list and board cancel superseded reads, load unrestricted selections and expose retries instead of false empty results', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
-  assert.match(queue, /if \(view !== 'list'\) return/);
   assert.doesNotMatch(queue, /if \(intents\.length === 0\)/);
   assert.match(queue, /listAbort\.current\?\.abort\(\)/);
   // 列表读取仍在 25 秒时限和取消信号之内；服务繁忙的自动重试包在时限里面。

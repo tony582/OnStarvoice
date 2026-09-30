@@ -1,16 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, Search, X } from 'lucide-react'
 import { api } from '@/lib/api'
+import { cn } from '@/lib/utils'
 import { filterTriggerClass } from '@/lib/filter-trigger'
 
 interface KeywordItem { keyword: string; count: number }
 
 // 采集关键词多选:每个关键词=一次采集 session。选项来自 /workspace/keywords(该租户采过的关键词去重)。
-export function KeywordFilter({ label = '采集关键词', value, onChange, triggerClassName }: {
+export function KeywordFilter({ label = '采集关键词', value, onChange, triggerClassName, className }: {
   label?: string
   value: string[]
   onChange: (v: string[]) => void
   triggerClassName?: string
+  className?: string
 }) {
   const [open, setOpen] = useState(false)
   const [items, setItems] = useState<KeywordItem[]>([])
@@ -33,7 +35,7 @@ export function KeywordFilter({ label = '采集关键词', value, onChange, trig
   const triggerText = value.length === 1 ? `${label}：${value[0]}` : label
 
   return (
-    <div className="relative" ref={ref}>
+    <div className={cn('relative', className)} ref={ref}>
       <button
         type="button"
         onClick={() => setOpen(o => !o)}

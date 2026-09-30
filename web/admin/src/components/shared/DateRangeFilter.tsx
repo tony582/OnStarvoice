@@ -136,22 +136,18 @@ export function DateRangeFilter({ from, to, onChange, basis, onBasisChange, trig
 
 /**
  * 内容分诊的时间筛选组：发布时间 / 首次发现 / 最近采集 / 处理时间四个维度各自是一个入口，
- * 直接点开设置区间，各自保留区间、可同时设置多个（服务端按 AND 组合）。四个按钮视觉上收成一组，
- * 激活的维度按钮上直接显示区间，不用点开就知道当前按什么时间在筛。
+ * 直接点开设置区间，各自保留区间、可同时设置多个（服务端按 AND 组合）。四个芯片与其它筛选芯片同一外观，
+ * 靠筛选区的行名「时间」分组；激活的维度芯片上直接显示区间，不用点开就知道当前按什么时间在筛。
  */
-export function CombinedDateRangeFilter({ value, onChange, triggerClassName }: {
+export function CombinedDateRangeFilter({ value, onChange, triggerClassName, itemClassName }: {
   value: CombinedDateRanges
   onChange: (value: CombinedDateRanges) => void
   triggerClassName?: string
+  /** 每个维度芯片外层的样式，供筛选区把它们当作普通芯片排进自动填充的行里。 */
+  itemClassName?: string
 }) {
-  const activeCount = COMBINED_BASIS_ORDER.filter(([key]) => value[key].from || value[key].to).length
   return (
-    <div
-      role="group"
-      aria-label={`时间筛选${activeCount ? `，已设置 ${activeCount} 个维度` : ''}`}
-      className="inline-flex h-10 max-w-full items-center gap-0.5 rounded-lg bg-muted p-0.5 lg:h-8"
-    >
-      <CalendarRange aria-hidden className="ml-1.5 mr-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+    <>
       {COMBINED_BASIS_ORDER.map(([basis]) => (
         <IndependentDateRangeFilter
           key={basis}
@@ -159,17 +155,19 @@ export function CombinedDateRangeFilter({ value, onChange, triggerClassName }: {
           value={value[basis]}
           onChange={(from, to) => onChange({ ...value, [basis]: { from, to } })}
           triggerClassName={triggerClassName}
+          className={itemClassName}
         />
       ))}
-    </div>
+    </>
   )
 }
 
-function IndependentDateRangeFilter({ basis, value, onChange, triggerClassName }: {
+function IndependentDateRangeFilter({ basis, value, onChange, triggerClassName, className }: {
   basis: CombinedDateBasis
   value: DateRangeValue
   onChange: (from: string, to: string) => void
   triggerClassName?: string
+  className?: string
 }) {
   const [open, setOpen] = useState(false)
   const [alignRight, setAlignRight] = useState(false)
@@ -197,22 +195,16 @@ function IndependentDateRangeFilter({ basis, value, onChange, triggerClassName }
   }, [open])
 
   return (
-    <div className="relative" ref={ref}>
+    <div className={cn('relative', className)} ref={ref}>
       <button
         type="button"
         onClick={() => setOpen(current => !current)}
         aria-expanded={open}
         aria-label={`${BASIS_FULL[basis]}筛选${active ? `，已设置 ${label}` : ''}`}
         title={active ? `${BASIS_FULL[basis]}：${label}` : `按${BASIS_FULL[basis]}筛选`}
-        className={cn(
-          'inline-flex h-9 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2.5 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary/20 lg:h-7 lg:px-2',
-          active
-            ? 'bg-primary/10 text-primary hover:bg-primary/15'
-            : 'text-muted-foreground hover:bg-card/70 hover:text-foreground',
-          triggerClassName,
-        )}
+        className={filterTriggerClass(active, triggerClassName)}
       >
-        <span>{active ? `${BASIS_SHORT[basis]} ${label}` : BASIS_FULL[basis]}</span>
+        <span className="truncate">{active ? `${BASIS_SHORT[basis]} ${label}` : BASIS_FULL[basis]}</span>
         <ChevronDown className="h-3 w-3 shrink-0" />
       </button>
       {open && (

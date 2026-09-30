@@ -125,7 +125,7 @@ test('empty list keeps filters and the table header usable', () => {
 test('one filter bar carries every content dimension once; the table header only labels and sorts', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const primary = between(queue, 'data-triage-toolbar="primary"', 'data-triage-toolbar="secondary"');
-  const secondary = between(queue, 'data-triage-toolbar="secondary"', '{/* Board view */}');
+  const secondary = between(queue, 'data-triage-toolbar="secondary"', '{/* List */}');
   const header = between(queue, '<thead data-sticky-header', '</thead>');
 
   const lifecycleViews = between(queue, 'const ARCHIVE_VIEWS', 'const PAGE_SIZE_OPTIONS');
@@ -136,15 +136,18 @@ test('one filter bar carries every content dimension once; the table header only
   assert.match(primary, /aria-pressed=\{viewingWatchlist\}/);
   assert.match(primary, /placeholder="搜索标题、正文、作者…"/);
   assert.match(primary, /title="可搜索标题、正文、作者、飞书表号、账号、平台ID、采集词和标签"/);
-  assert.match(primary, /aria-label="视图模式"/);
-  // 刷新是常驻的小图标按钮，取代原来的说明横幅 + 「刷新结果」大按钮。
+  // 刷新是常驻的小图标按钮，取代原来的说明横幅 + 「刷新结果」大按钮；清空筛选也在这一排动作里。
   assert.match(primary, /aria-label="刷新列表"/);
+  assert.match(primary, /清空筛选/);
   assert.match(primary, /exportXlsx/);
   assert.doesNotMatch(queue, /保存后可继续编辑|刷新结果将按当前条件重新查询|上次查询：/);
 
-  // 内容维度的筛选全部收在第二行，各出现一次；平台与内容主题换成和其它筛选一致的 pill 下拉。
+  // 内容维度的筛选全部收在第二行，各出现一次，同一外观并按可用宽度自动填满；平台与内容主题换成和其它筛选一致的 pill 下拉。
+  assert.match(queue, /const FILTER_CELL = 'min-w-0 shrink grow basis-\[132px\]'/);
+  assert.match(queue, /const FILTER_TRIGGER = 'w-full justify-between'/);
   assert.match(secondary, /aria-label="情感筛选"/);
-  assert.match(secondary, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*activeLabel="处理状态"[\s\S]*value=\{triageStatuses\}/);
+  assert.match(secondary, /<MultiSelect[\s\S]*label="处理状态"[\s\S]*value=\{triageStatuses\}[\s\S]*className=\{FILTER_CELL\}/);
+  assert.match(secondary, /<CombinedDateRangeFilter value=\{dateRanges\} onChange=\{setDateRanges\} itemClassName=\{FILTER_CELL\} triggerClassName=\{FILTER_TRIGGER\} \/>/);
   assert.match(secondary, /<SingleSelectFilter label="平台" aria-label="平台筛选" value=\{platform\} options=\{PLATFORM_OPTIONS\} onChange=\{setPlatform\}/);
   assert.match(secondary, /<SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value=\{contentTopic\} options=\{CONTENT_TOPIC_FILTER_OPTIONS\} onChange=\{setContentTopic\}/);
   assert.match(secondary, /<MultiSelect label="疑似身份"/);
@@ -170,7 +173,7 @@ test('selection is lightweight: no page lock, no banner, cleared when the query 
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const batchBar = source('web/admin/src/components/shared/BatchBar.tsx');
   // 勾选跟着查询走：筛选/翻页/切视图自动清空，不再进入「多选中」锁定态。
-  assert.match(queue, /useSelection\(`\$\{filterQuery\}\|\$\{pageSize\}\|\$\{pagination\?\.page \?\? 1\}\|\$\{view\}`\)/);
+  assert.match(queue, /useSelection\(`\$\{filterQuery\}\|\$\{pageSize\}\|\$\{pagination\?\.page \?\? 1\}`\)/);
   assert.doesNotMatch(queue, /selectionActive|selectionSession|<fieldset disabled|多选中，已选|取消多选后按筛选更新/);
   assert.match(queue, /const cancelSelection = \(\) => \{\s+if \(selectionBusy\) return\s+sel\.clear\(\)\s+\}/);
   // shift 连选：从上一次勾选的行到当前行整段跟随。
@@ -210,9 +213,8 @@ test('content topic shows as a chip only when classified and the filter offers a
   assert.match(topics, /\{ value: '', label: '全部内容主题' \}/);
 });
 
-test('search commits once, ignores stale responses, and keeps board filters aligned with list filters', () => {
+test('search commits once, ignores stale responses, and the page is list-only', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
-  const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
   const searchInput = between(queue, '<Search className=', '<button\n                type="button"\n                onClick={() => setMobileFiltersOpen');
 
   assert.match(queue, /const \[keywordDraft, setKeywordDraft\]/);
@@ -223,16 +225,9 @@ test('search commits once, ignores stale responses, and keeps board filters alig
   assert.match(queue, /requestSeq !== listRequestSeq\.current/);
   assert.match(queue, /if \(requestSeq === listRequestSeq\.current\) setLoading\(false\)/);
 
-  assert.match(queue, /const boardFilterQuery = useMemo/);
-  assert.match(queue, /params\.delete\('status'\)/);
-  assert.match(queue, /params\.delete\('sort'\)/);
+  // 看板视图已退役：页面只保留列表，没有视图切换，也不再向看板同步筛选。
+  assert.doesNotMatch(queue, /TriageBoard|boardFilterQuery|aria-label="视图模式"|setView\(/);
   assert.match(queue, /setTriageStatuses\(\[\]\)/);
-  assert.match(queue, /filterQuery=\{boardFilterQuery\}/);
-  assert.match(board, /new URLSearchParams\(filterQuery\)/);
-  assert.match(board, /params\.set\('status', column\.key\)/);
-  assert.match(board, /const requestSeq = useRef\(0\)/);
-  assert.match(board, /seq !== requestSeq\.current/);
-  assert.doesNotMatch(board, /sentiment: string|platform\?: string|keyword: string/);
 });
 
 test('drawer header keeps the Feishu number in the old inline-edit position while history remains available', () => {

@@ -26,17 +26,19 @@ function FilterChoices({ options, value, onChange, resetLabel }: {
 }
 
 // 表头内的紧凑触发器保留原样；筛选条里的 pill 与其它筛选共用 filterTriggerClass。
-function filterTriggerClass(header: boolean, active: boolean) {
-  if (!header) return pillTriggerClass(active)
+function filterTriggerClass(header: boolean, active: boolean, className?: string) {
+  if (!header) return pillTriggerClass(active, className)
   return cn('inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md font-medium outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary/20 max-w-full min-w-0',
     'h-7 px-1.5 text-[11px]',
-    active ? 'text-primary' : 'text-muted-foreground')
+    active ? 'text-primary' : 'text-muted-foreground',
+    className)
 }
 
-export function PostIntentFilter({ value, onChange, header = false }: {
+export function PostIntentFilter({ value, onChange, header = false, className }: {
   value: string[]
   onChange: (value: string[]) => void
   header?: boolean
+  className?: string
 }) {
   const labels = POST_INTENT_OPTIONS.filter(option => value.includes(option.value)).map(option => option.label)
   const text = header
@@ -44,7 +46,7 @@ export function PostIntentFilter({ value, onChange, header = false }: {
     : labels.length ? `意图：${postFilterSummary(labels, '')}` : '意图'
   return <DropdownMenu.Root>
     <DropdownMenu.Trigger asChild>
-      <button type="button" aria-label={`意图筛选，${labels.join('、') || '全部意图'}`} title={labels.join('、') || '全部意图'} className={filterTriggerClass(header, labels.length > 0)}>
+      <button type="button" aria-label={`意图筛选，${labels.join('、') || '全部意图'}`} title={labels.join('、') || '全部意图'} className={filterTriggerClass(header, labels.length > 0, className)}>
         <span className="truncate">{text}</span><ChevronDown className="h-3 w-3 shrink-0" />
       </button>
     </DropdownMenu.Trigger>
@@ -57,12 +59,13 @@ export function PostIntentFilter({ value, onChange, header = false }: {
   </DropdownMenu.Root>
 }
 
-export function PostRelevanceFilter({ value, confidence, onChange, onConfidenceChange, header = false }: {
+export function PostRelevanceFilter({ value, confidence, onChange, onConfidenceChange, header = false, className }: {
   value: string[]
   confidence: string[]
   onChange: (value: string[]) => void
   onConfidenceChange: (value: string[]) => void
   header?: boolean
+  className?: string
 }) {
   const labels = [...POST_RELEVANCE_OPTIONS.filter(option => value.includes(option.value)).map(option => option.label),
     ...POST_CONFIDENCE_OPTIONS.filter(option => confidence.includes(option.value)).map(option => option.shortLabel)]
@@ -71,7 +74,7 @@ export function PostRelevanceFilter({ value, confidence, onChange, onConfidenceC
     : labels.length ? `相关性：${postFilterSummary(labels, '')}` : '相关性'
   return <DropdownMenu.Root>
     <DropdownMenu.Trigger asChild>
-      <button type="button" aria-label={`相关性筛选，${labels.join('、') || '不限'}`} title={labels.join('、') || '相关性'} className={filterTriggerClass(header, labels.length > 0)}>
+      <button type="button" aria-label={`相关性筛选，${labels.join('、') || '不限'}`} title={labels.join('、') || '相关性'} className={filterTriggerClass(header, labels.length > 0, className)}>
         <span className="truncate">{text}</span><ChevronDown className="h-3 w-3 shrink-0" />
       </button>
     </DropdownMenu.Trigger>
