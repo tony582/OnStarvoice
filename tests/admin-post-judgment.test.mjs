@@ -131,10 +131,14 @@ test('list, mobile, board and drawer expose intent and relevance with one filter
   assert.match(queue, /<PostRelevanceFilter value=\{relevances\}/);
   assert.match(queue, /setIntents\(\[\]\); setRelevances\(\[\]\); setRelevanceConfidences\(\[\]\)/);
   assert.match(queue, /api\.download\('\/triage\/records\/export\?' \+ filterParams\(\)/);
-  for (const text of [queue, board, drawer]) {
+  for (const text of [queue, board]) {
     assert.match(text, /<PostIntentBadge record=\{r\}/);
     assert.match(text, /<PostRelevanceBadge record=\{r\}/);
   }
+  // 抽屉头部是属性面板：意图/相关性按「名称 + 值」成行，值来自同一份 postJudgment 判定。
+  assert.match(drawer, /const judgment = postJudgment\(r\)/);
+  assert.match(drawer, /<Prop label="意图"><span>\{judgment\.intentLabel\}<\/span><\/Prop>/);
+  assert.match(drawer, /<Prop label="相关性">[\s\S]*?<StatusDot tone=\{judgment\.relevanceTone\}>\{judgment\.relevanceLabel\}<\/StatusDot>/);
   assert.match(drawer, /<PostJudgmentDetails/);
   assert.match(drawer, /<PostJudgmentDetails record=\{r\} \/>/);
 });

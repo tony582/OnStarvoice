@@ -40,7 +40,8 @@ test('React admin exposes reusable custom tag editing, batch add/remove and filt
 
   assert.match(drawer, /onUpdateCustomTags/);
   assert.match(drawer, /RecordLabelEditor/);
-  assert.match(drawer, /RecordLabelsHeading/);
+  assert.match(drawer, /<Prop label="标签"/);
+  assert.match(drawer, /<RecordLabelChips tags=\{customTags\} compact \/>/);
   assert.match(drawer, /onDeleteCustomTag/);
 
   assert.match(batchTagUi, /批量添加自定义标签/);

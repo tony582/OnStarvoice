@@ -4,7 +4,7 @@ import {
   LinkIcon, CheckCircle, Loader2, X, Heart, MessageCircle, Star, Share2,
   User, FileText, Camera, Bell, Archive, ArchiveRestore, Eye, Sparkles, ZoomIn,
   Pencil, Ban, ArrowLeft, ArrowRight, History, StickyNote, Tags, AlertTriangle,
-  Copy, RefreshCw, Radar, ClipboardCheck, Inbox, CircleOff, ChevronDown, Check,
+  Copy, RefreshCw, Radar, ClipboardCheck, Inbox, CircleOff, ChevronDown, Check, Plus,
 } from 'lucide-react'
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
@@ -12,7 +12,7 @@ import { api } from '@/lib/api'
 import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel, friendlyError, proxiedImg } from '@/lib/utils'
 import { captureKeywordPresentation, publishTimePresentation } from '@/lib/publish-time.mjs'
 import { Button } from '@/components/ui/button'
-import { StatusBadge, StatusPill } from '@/components/ui/badge'
+import { StatusBadge, StatusDot } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
@@ -25,12 +25,11 @@ import {
   recordDisplayImageEntries,
   recordDisplayImages,
 } from '@/components/shared/record-images'
-import {
-  RecordLabelChips, RecordLabelEditor, RecordLabelsHeading,
-} from '@/components/shared/RecordLabels'
+import { RecordLabelChips, RecordLabelEditor } from '@/components/shared/RecordLabels'
 import { tagsFromRecord, type CustomTag, type CustomTagPatch } from '@/lib/custom-tags'
 import { isRecordDetailDegraded, recordDisplayTitle } from '@/lib/record-display'
-import { PostIntentBadge, PostRelevanceBadge, PostJudgmentDetails } from '@/components/shared/PostJudgment'
+import { PostJudgmentDetails } from '@/components/shared/PostJudgment'
+import { postJudgment } from '@/lib/post-judgment'
 import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
 
 /**
@@ -221,6 +220,13 @@ function RecordDrawerContent({
   }
 
   const resolvedIdentity = identityLabel(r.source_type, r.author_fans, r.author_name, r.identity_override)
+  const judgment = postJudgment(r)
+  const relevanceDetail = judgment.manual
+    ? '人工判断'
+    : judgment.relevance
+      ? judgment.confidence !== null ? `置信度 ${judgment.confidence}%` : '暂无评分'
+      : ''
+  const topicLabel = contentTopicLabel(r.content_topic, '')
   const archived = Boolean(r.archived_at)
   const canProcess = canWrite && !archived
 
@@ -495,56 +501,57 @@ function RecordDrawerContent({
               </div>
             )}
 
-            {/* 判断结果与标签：左列内容可换行，右列是固定的窄动作列，两行的按钮上下对齐、不会被换行顶走。 */}
-            <div className="mt-3.5 grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-2.5 border-t border-border/60 pt-3">
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5" aria-label="判断结果">
-                <Fact label="情感"><StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></Fact>
-                <Fact label="意图"><PostIntentBadge record={r} /></Fact>
-                <Fact label="相关性"><PostRelevanceBadge record={r} compact /></Fact>
-                <Fact label="主题">
-                  {contentTopicLabel(r.content_topic, '')
-                    ? <StatusPill tone="neutral">{contentTopicLabel(r.content_topic)}</StatusPill>
-                    : <span className="text-[12px] text-muted-foreground/70">未分类</span>}
-                </Fact>
-                {r.category && <Fact label="分类"><StatusPill tone="neutral">{LABELS.category[r.category] || r.category}</StatusPill></Fact>}
-                {resolvedIdentity && (
-                  <Fact label="身份">
-                    <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(resolvedIdentity) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{resolvedIdentity}</span></Tooltip>
-                  </Fact>
+            {/* 属性面板：两列「名称 + 值」对齐排布，值用文字和小圆点而不是彩色胶囊；整块只留一个「编辑判断」。 */}
+            <div className="mt-3.5 border-t border-border/60 pt-3">
+              <div className="mb-1.5 flex items-center justify-between gap-2">
+                <span className="text-[11px] font-medium tracking-wide text-muted-foreground">判断与归类</span>
+                {canProcess && onUpdateFields && (
+                  <button type="button" onClick={openJudgementEditor}
+                    className="-mr-1.5 inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-primary">
+                    <Pencil className="h-3 w-3" />编辑判断
+                  </button>
                 )}
               </div>
-              {canProcess && onUpdateFields ? (
-                <button type="button" onClick={openJudgementEditor}
-                  className="inline-flex h-6 items-center gap-1 self-start rounded-md px-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-primary">
-                  <Pencil className="h-3 w-3" />编辑判断
-                </button>
-              ) : <span />}
-
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <RecordLabelsHeading />
-                {customTags.length > 0 ? (
-                  <RecordLabelChips tags={customTags} />
-                ) : (
-                  <span className="text-[11px] text-muted-foreground/60">暂无</span>
-                )}
-              </div>
-              {canProcess && onUpdateCustomTags ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditingJudgement(false)
-                    setEditingLabels(open => !open)
-                  }}
-                  className={cn(
-                    'inline-flex h-6 items-center gap-1 self-start rounded-md px-1.5 text-[11px] font-medium transition-colors',
-                    editingLabels
-                      ? 'bg-accent text-primary'
-                      : 'text-muted-foreground hover:bg-accent hover:text-primary',
-                  )}
-                >
-                  <Tags className="h-3 w-3" />{editingLabels ? '收起' : '管理标签'}
-                </button>
-              ) : <span />}
+              <dl className="grid grid-cols-1 gap-x-6 gap-y-1 sm:grid-cols-2" aria-label="判断结果">
+                <Prop label="情感"><StatusDot tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusDot></Prop>
+                <Prop label="主题">{topicLabel ? <span>{topicLabel}</span> : <span className="text-muted-foreground/70">未分类</span>}</Prop>
+                <Prop label="意图"><span>{judgment.intentLabel}</span></Prop>
+                <Prop label="分类">{r.category ? <span>{LABELS.category[r.category] || r.category}</span> : <span className="text-muted-foreground/70">待分类</span>}</Prop>
+                <Prop label="相关性">
+                  <StatusDot tone={judgment.relevanceTone}>{judgment.relevanceLabel}</StatusDot>
+                  {relevanceDetail && <span className="ml-1.5 text-[11px] text-muted-foreground">{relevanceDetail}</span>}
+                </Prop>
+                <Prop label="身份">
+                  {resolvedIdentity ? (
+                    <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}>
+                      <span className={cn('cursor-help', ['KOE', '4S店'].includes(resolvedIdentity) && 'font-semibold text-violet-700 dark:text-violet-300')}>{resolvedIdentity}</span>
+                    </Tooltip>
+                  ) : <span className="text-muted-foreground/70">未判定</span>}
+                </Prop>
+                <Prop label="标签" className="sm:col-span-2">
+                  <span className="flex min-w-0 flex-wrap items-center gap-1">
+                    {customTags.length > 0 && <RecordLabelChips tags={customTags} compact />}
+                    {canProcess && onUpdateCustomTags ? (
+                      <button
+                        type="button"
+                        aria-expanded={editingLabels}
+                        onClick={() => {
+                          setEditingJudgement(false)
+                          setEditingLabels(open => !open)
+                        }}
+                        className={cn(
+                          'inline-flex h-5 items-center gap-0.5 rounded-md border border-dashed px-1.5 text-[10.5px] font-medium transition-colors',
+                          editingLabels
+                            ? 'border-primary/40 bg-accent text-primary'
+                            : 'border-border text-muted-foreground hover:border-primary/40 hover:text-primary',
+                        )}
+                      >
+                        <Plus className="h-3 w-3" />{customTags.length > 0 ? '管理' : '添加标签'}
+                      </button>
+                    ) : customTags.length === 0 ? <span className="text-muted-foreground/70">暂无</span> : null}
+                  </span>
+                </Prop>
+              </dl>
             </div>
             {editingLabels && canProcess && onUpdateCustomTags && (
               <RecordLabelEditor
@@ -1279,12 +1286,12 @@ function JudgementEditor({ draft, currentIdentity, error, saving, onChange, onCa
   )
 }
 
-/* 详情头部「名称 + 值」的一组判断结果。 */
-function Fact({ label, children }: { label: string; children: React.ReactNode }) {
+/* 属性面板里的一行：固定宽度的名称列 + 可换行的值。 */
+function Prop({ label, className, children }: { label: string; className?: string; children: React.ReactNode }) {
   return (
-    <div className="inline-flex items-center gap-1.5">
-      <span className="text-[11px] text-muted-foreground">{label}</span>
-      <span className="inline-flex items-center">{children}</span>
+    <div className={cn('flex min-w-0 items-start gap-2 text-[12px] leading-5 text-foreground', className)}>
+      <dt className="w-11 shrink-0 text-[11px] leading-5 text-muted-foreground">{label}</dt>
+      <dd className="flex min-w-0 flex-wrap items-center">{children}</dd>
     </div>
   )
 }
