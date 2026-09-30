@@ -96,7 +96,7 @@ test('drawer and batch expose all nine states with shared status-change prompts'
   assert.match(feishuControl, /onBlur=\{\(\) =>/);
   assert.match(feishuControl, /CopyTicketNumberButton value=\{number\} label="飞书表号"/);
 
-  const inlineSave = between(queue, 'const saveFeishuTableNo', 'const modeVisibleInCurrentList');
+  const inlineSave = between(queue, 'const saveFeishuTableNo', 'const syncModeLocally');
   assert.match(inlineSave, /`\/triage\/records\/\$\{record\.id\}`/);
   assert.match(inlineSave, /\{ feishuTableNo \}/);
   assert.match(inlineSave, /feishu_table_no: savedNumber/);

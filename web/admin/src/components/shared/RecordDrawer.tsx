@@ -267,7 +267,10 @@ function RecordDrawerContent({
     setEditError('')
     try {
       const result = await onUpdateFields(changes)
-      if (result !== false) setEditingJudgement(false)
+      if (result !== false) {
+        setEditingJudgement(false)
+        await refreshActivity()
+      }
     } catch (err) {
       setEditError(err instanceof Error ? err.message : '保存失败，请稍后重试')
     } finally {
