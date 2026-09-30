@@ -1,6 +1,6 @@
 # 负面巡查截断切开 emoji 致 jsonb 写入失败 hotfix（2026-09-29）
 
-分支 `codex/hotfix-negative-patrol-surrogate-20260929`，叠在 `codex/hotfix-ai-label-surrogate-20260929`（`11c8ddc`）之上，复用它新增的 `server/utils/well-formed-text.js`。没有迁移、配置、扩展或 Admin 改动。
+分支 `codex/hotfix-negative-patrol-surrogate-20260929`，叠在 `codex/hotfix-ai-label-surrogate-20260929`（`11c8ddc`）之上，复用它新增的 `server/utils/well-formed-text.js`。没有迁移、配置、扩展或 Admin 改动。已随 `codex/release-hotfixes-20260929`（`bb53e44`）于 2026-09-30 09:45:50 上线，发布记录见 `docs/hotfix/20260929-release-hotfixes.md`。
 
 ## 问题
 

@@ -1,6 +1,6 @@
 # AI 标注反复失败：孤立代理项与有界重试 hotfix（2026-09-29）
 
-分支：`codex/hotfix-ai-label-surrogate-20260929`，基线 `d275b6f`（生产当前运行的是 `acbe77f` 的代码，`d275b6f` 只多一份发布记录）。**未提交、未推送、未部署。** 没有数据库迁移，没有新配置项。
+分支：`codex/hotfix-ai-label-surrogate-20260929`，基线 `d275b6f`（生产当前运行的是 `acbe77f` 的代码，`d275b6f` 只多一份发布记录）。**已随 `codex/release-hotfixes-20260929`（`bb53e44`）于 2026-09-30 09:45:50 上线**，发布记录见 `docs/hotfix/20260929-release-hotfixes.md`。 没有数据库迁移，没有新配置项。
 
 ## 现象
 
