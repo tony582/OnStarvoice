@@ -270,4 +270,3 @@ export async function recordNeedsActionStopFenceOutcome(tx, {
   });
   return sentence;
 }
-
