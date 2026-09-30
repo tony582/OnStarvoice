@@ -9,6 +9,7 @@ import {
   Rows3, Kanban, MoreHorizontal, Radar, ShieldAlert, Star,
   Tags, AlertCircle, RefreshCw,
 } from 'lucide-react'
+import { mergeRecordPatches, mergePatchMaps, reconcileQueryRecords } from '@/lib/triage-edit-context'
 import { api, isApiNetworkError } from '@/lib/api'
 import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -421,6 +422,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   // Keep this page as a working set until the operator explicitly exits selection.
   const [selectionActive, setSelectionActive] = useState(false)
   const selectionSession = useRef(false)
+  const [savedEdits, setSavedEdits] = useState<Record<string, Record<string, unknown>>>({})
+  const editsRevision = useRef(0)
+  const editJournal = useRef<Array<{ revision: number; patches: Record<string, Record<string, unknown>> }>>([])
+  const applySavedEdits = useCallback((patches: Record<string, Record<string, unknown>>) => {
+    editJournal.current.push({ revision: ++editsRevision.current, patches })
+    setSavedEdits(current => mergePatchMaps(current, patches))
+    setRecords(current => mergeRecordPatches(current, mergePatchMaps({}, patches)))
+    setDrawerRecord((current: ({ id: string } & Record<string, unknown>) | null) => current ? mergeRecordPatches([current], mergePatchMaps({}, patches))[0] : current)
+  }, [])
   const { ask, dialog } = useNotePrompt()
   const { ask: askStatusChange, dialog: statusChangeDialog } = useStatusChangePrompt()
 
@@ -466,6 +476,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const toggleAllSelection = (checked: boolean) => {
     if (beginSelection()) sel.setAll(records.map(record => String(record.id)), checked)
   }
+
+  const clearSelectionRef = useRef(sel.clear)
+  useEffect(() => { clearSelectionRef.current = sel.clear }, [sel.clear])
 
   const batchRemovalCatalog = (() => {
     const tagsById = new Map<string, CustomTag>()
@@ -519,6 +532,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (view !== 'list') return
     if (selectionSession.current) return
     const requestSeq = ++listRequestSeq.current
+    const revision = editsRevision.current
     listAbort.current?.abort()
     // 静默重读（处理完一条之后）只在列表正显示当前筛选的结果时才静默；
     // 列表区是错误面板或别的筛选的旧结果时，按用户发起的读取处理。
@@ -547,7 +561,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       }
       if (requestSeq !== listRequestSeq.current) return
       if (!Array.isArray(data.records)) throw new Error('内容响应不完整，请稍后重试。')
-      setRecords(data.records || [])
+      // A save that finishes during this request must not be overwritten by an older response.
+      const newerEdits = editJournal.current.filter(edit => edit.revision > revision)
+      const patches = newerEdits.reduce((all, edit) => mergePatchMaps(all, edit.patches), {})
+      setRecords(current => reconcileQueryRecords(data.records || [], current, patches))
+      setSavedEdits(patches)
+      editJournal.current = newerEdits
+      clearSelectionRef.current()
       setPagination(data.pagination || null)
       listShown.current = true
     } catch (err) {
@@ -565,7 +585,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     selectionSession.current = false
     setSelectionActive(false)
     sel.clear()
-    void load(pagination?.page || 1, { silent: true })
   }
 
   const exportXlsx = async () => {
@@ -608,13 +627,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }, [load])
   useEffect(() => { void loadCustomTagCatalog() }, [loadCustomTagCatalog])
   useEffect(() => () => { listRequestSeq.current += 1; listAbort.current?.abort() }, [])
-  // 写后统一刷新:回退空页 + 拉列表 + 更新徽标
-  const reloadAfterMutation = useCallback(async () => {
-    const page = pagination?.page || 1
-    const willEmpty = records.length <= 1 && page > 1
-    await load(willEmpty ? page - 1 : page, { silent: true })
-    refreshBadges()
-  }, [load, pagination, records.length, refreshBadges])
   const markFalsePositive = async (recordId: string): Promise<boolean> => {
     if (archiveView === 'archived') return false
     const reason = await ask({
@@ -655,24 +667,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
     const savedRecord = responseRecord(data)
     const patch = localManualFieldsPatch(fields, savedRecord)
-    const savedSentiment = savedRecord && Object.prototype.hasOwnProperty.call(savedRecord, 'sentiment')
-      ? String(savedRecord.sentiment || '')
-      : fields.sentiment
-    const leavesCurrentSentiment = !selectionSession.current && Boolean(sentiment && savedSentiment !== undefined && savedSentiment !== sentiment)
-    setRecords(current => current.flatMap(record => {
-      if (record.id !== recordId) return [record]
-      return leavesCurrentSentiment ? [] : [{ ...record, ...patch }]
-    }))
-    if (leavesCurrentSentiment) {
-      setPagination(current => {
-        if (!current) return current
-        const total = Math.max(0, current.total - 1)
-        return { ...current, total, totalPages: Math.ceil(total / pageSize) }
-      })
-    }
-    setDrawerRecord(null)
-    // 数据已保存即返回成功；列表与角标刷新是尽力而为，不能反向把成功写入误报成失败。
-    void reloadAfterMutation().catch(error => console.warn('保存后的列表刷新失败', error))
+    applySavedEdits({ [recordId]: patch })
+    refreshBadges()
     return true
   }
 
@@ -680,25 +676,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     if (archiveView === 'archived') return []
     const data = await api.patch<CustomTagsMutationResponse>('/records/' + recordId + '/custom-tags', patch)
     const tags = tagsFromMutationResponse(data)
-    setRecords(current => current.map(record =>
-      record.id === recordId ? withCustomTags(record, tags) : record))
-    setDrawerRecord((current: Record<string, unknown> | null) =>
-      current?.id === recordId ? withCustomTags(current, tags) : current)
-    await loadCustomTagCatalog()
-    if (customTagIds.length) {
-      const stillMatches = tags.some(tag => customTagIds.includes(tag.id))
-      if (!stillMatches && !selectionSession.current) {
-        setRecords(current => current.filter(record => record.id !== recordId))
-        setPagination(current => {
-          if (!current) return current
-          const total = Math.max(0, current.total - 1)
-          return { ...current, total, totalPages: Math.ceil(total / pageSize) }
-        })
-      }
-      const page = pagination?.page || 1
-      const willEmpty = records.length <= 1 && page > 1
-      await load(willEmpty ? page - 1 : page)
-    }
+    applySavedEdits({ [recordId]: withCustomTags({}, tags) })
+    void loadCustomTagCatalog()
     return tags
   }
 
@@ -750,17 +729,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         missingCount ? `${missingCount} 条已不存在` : '',
       ].filter(Boolean)
 
-      const updatedIds = new Set(Array.isArray(result.updatedIds) ? result.updatedIds.map(String) : [])
+      // Only acknowledged successes are patched; partial failures keep their real values and selection.
+      const changedIds = new Set(Array.isArray(result.updatedIds) ? result.updatedIds.map(String) : [])
       const addedTags = normalizeCustomTags(result.tags)
-      const applyTags = (record: Record<string, unknown>) => {
-        if (!updatedIds.has(String(record.id))) return record
-        const tags = tagsFromRecord(record).filter(tag => !values.removeTagIds.includes(tag.id))
-        return withCustomTags(record, operation === 'add'
-          ? [...new Map([...tags, ...addedTags].map(tag => [tag.id, tag])).values()]
-          : tags)
-      }
-      setRecords(current => current.map(applyTags))
-      setDrawerRecord((current: Record<string, unknown> | null) => current ? applyTags(current) : current)
+      const patches = Object.fromEntries(records.filter(record => changedIds.has(record.id)).map(record => {
+        const tags = tagsFromRecord(record)
+        const next = operation === 'remove'
+          ? tags.filter(tag => !values.removeTagIds.includes(tag.id))
+          : normalizeCustomTags([...tags, ...addedTags])
+        return [record.id, withCustomTags({}, next)]
+      }))
+      if (changedIds.size) applySavedEdits(patches)
       const message = operation === 'remove'
         ? updated > 0
           ? `已从 ${updated} 条内容移除${tagNames || '所选标签'}${unchanged ? `，${unchanged} 条原本未关联` : ''}${skippedParts.length ? `；${skippedParts.join('，')}未处理` : ''}`
@@ -773,10 +752,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             ? `所选 ${unchanged} 条内容原本已有${tagNames || '所选标签'}，无需重复添加`
             : `没有内容被修改${skippedParts.length ? `：${skippedParts.join('，')}` : ''}`
       showBatchFeedback(message, skippedParts.length ? 'warning' : 'success')
-      await Promise.all([
-        loadCustomTagCatalog(),
-        load(pagination?.page || 1, { silent: true }),
-      ])
+      void loadCustomTagCatalog()
     } finally {
       setBatchBusy(false)
     }
@@ -830,16 +806,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         eventType: 'note',
       }
       const applyProgress = (item: any) => ({
-        ...item,
         progress_count: Number(item.progress_count || 0) + 1,
         progress_latest_body: progress.body,
         progress_latest_author: progress.authorName,
         progress_latest_at: progress.createdAt,
         progress_latest_type: progress.eventType,
       })
-      setRecords(current => current.map(item => item.id === record.id ? applyProgress(item) : item))
-      setDrawerRecord((current: any) => current?.id === record.id ? applyProgress(current) : current)
-      setBoardNonce(n => n + 1)
+      applySavedEdits({ [record.id]: applyProgress(record) })
       showBatchFeedback('备注已保存', 'success')
       return true
     } catch (error) {
@@ -849,7 +822,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     } finally {
       setNoteBusyId(null)
     }
-  }, [archiveView, ask, noteBusyId, showBatchFeedback])
+  }, [archiveView, ask, noteBusyId, showBatchFeedback, applySavedEdits])
 
   const saveFeishuTableNo = useCallback(async (
     record: any,
@@ -866,50 +839,32 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         { feishuTableNo },
       )
       const savedNumber = String(response.triage?.feishu_table_no || feishuTableNo).trim()
-      setRecords(current => current.map(item => item.id === record.id
-        ? { ...item, feishu_table_no: savedNumber }
-        : item))
-      setDrawerRecord((current: any) => current?.id === record.id
-        ? { ...current, feishu_table_no: savedNumber }
-        : current)
-      setBoardNonce(nonce => nonce + 1)
-      if (keyword.trim()) await load(pagination?.page || 1, { silent: true })
+      applySavedEdits({ [record.id]: { feishu_table_no: savedNumber } })
       return { ok: true }
     } catch (error) {
       console.error(error)
       return { ok: false, message: error instanceof Error ? error.message : '飞书表号保存失败' }
     }
-  }, [archiveView, keyword, load, pagination])
-
-  const modeVisibleInCurrentList = useCallback((newStatus: string) => {
-    return triageStatuses.length === 0 || triageStatuses.includes(newStatus)
-  }, [triageStatuses])
+  }, [archiveView, applySavedEdits])
 
   const syncModeLocally = useCallback((
     ids: Iterable<string>,
     newStatus: TriageMode,
     feishuTableNo?: string,
+    note?: string,
   ) => {
-    const changed = new Set(ids)
-    const keepInList = selectionSession.current || modeVisibleInCurrentList(newStatus)
-    setRecords(current => current.flatMap(record => {
-      if (!changed.has(record.id)) return [record]
-      if (!keepInList) return []
-      return [{
-        ...record,
-        triage_status: newStatus,
-        ...(feishuTableNo !== undefined ? { feishu_table_no: feishuTableNo } : {}),
-      }]
-    }))
-    setDrawerRecord((current: any) => {
-      if (!current || !changed.has(current.id)) return current
-      return {
-        ...current,
-        triage_status: newStatus,
-        ...(feishuTableNo !== undefined ? { feishu_table_no: feishuTableNo } : {}),
-      }
-    })
-  }, [modeVisibleInCurrentList])
+    applySavedEdits(Object.fromEntries([...ids].map(id => [id, {
+      triage_status: newStatus,
+      ...(note?.trim() ? {
+        progress_count: Number((records.find(record => record.id === id) || (drawerRecord?.id === id ? drawerRecord : null))?.progress_count || 0) + 1,
+        progress_latest_body: note.trim(),
+        progress_latest_author: '当前用户',
+        progress_latest_at: new Date().toISOString(),
+        progress_latest_type: 'status_note',
+      } : {}),
+      ...(feishuTableNo !== undefined ? { feishu_table_no: feishuTableNo } : {}),
+    }])))
+  }, [applySavedEdits, records, drawerRecord])
 
   const changeTriageMode = useCallback(async (
     recordId: string,
@@ -925,15 +880,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         ...(newStatus === 'negative_feishu' ? { feishuTableNo: values.feishuTableNo } : {}),
       }
       await api.patch('/triage/records/' + recordId, payload)
-      const page = pagination?.page || 1
-      const targetPage = !modeVisibleInCurrentList(newStatus) && records.length <= 1 && page > 1 ? page - 1 : page
       syncModeLocally(
         [recordId],
         newStatus,
         newStatus === 'negative_feishu' ? values.feishuTableNo : undefined,
+        values.note,
       )
       refreshBadges()
-      await load(targetPage, { silent: true })
       return true
     } catch (err) {
       console.error(err)
@@ -942,7 +895,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     } finally {
       setModeBusyId(null)
     }
-  }, [archiveBusyId, archiveView, load, modeBusyId, modeVisibleInCurrentList, pagination, records.length, refreshBadges, showBatchFeedback, syncModeLocally])
+  }, [archiveBusyId, archiveView, modeBusyId, refreshBadges, showBatchFeedback, syncModeLocally])
 
   const changeRecordMode = async (record: any, newStatus: TriageMode): Promise<boolean> => {
     if (archiveView === 'archived' || modeBusyId || archiveBusyId) return false
@@ -979,14 +932,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       })
       const changedIds = changedBatchModeIds(result, ids)
       const skippedCount = Math.max(0, ids.length - changedIds.length)
-      const page = pagination?.page || 1
-      const changedSet = new Set(changedIds)
-      const changedOnPage = records.filter(record => changedSet.has(String(record.id).toLowerCase())).length
-      const targetPage = !modeVisibleInCurrentList(newStatus) && changedOnPage >= records.length && page > 1 ? page - 1 : page
-
       if (changedIds.length === 0) {
-        showBatchFeedback('所选内容未能修改，已保留当前选择，请核对后重试', 'error')
-        await load(page, { silent: true })
+        showBatchFeedback('所选内容未能修改，请核对后重试', 'error')
         return
       }
 
@@ -994,6 +941,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         changedIds,
         newStatus,
         newStatus === 'negative_feishu' ? values.feishuTableNo : undefined,
+        values.note,
       )
       showBatchFeedback(
         skippedCount > 0
@@ -1002,7 +950,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         skippedCount > 0 ? 'warning' : 'success',
       )
       refreshBadges()
-      await load(targetPage, { silent: true })
     } catch (err) {
       console.error(err)
       showBatchFeedback(`批量修改失败：${err instanceof Error ? err.message : '请稍后重试'}`, 'error')
@@ -1010,14 +957,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     finally { setBatchBusy(false) }
   }
 
-  const syncArchiveLocally = useCallback((ids: Iterable<string>, archived: boolean) => {
+  const syncArchiveLocally = useCallback((ids: Iterable<string>) => {
     const changed = new Set([...ids].map(id => String(id).toLowerCase()))
-    setRecords(current => current.flatMap(record => {
-      if (!changed.has(String(record.id).toLowerCase())) return [record]
-      return selectionSession.current ? [{ ...record, archived_at: archived ? new Date().toISOString() : null }] : []
-    }))
+    setRecords(current => current.filter(record => !changed.has(String(record.id).toLowerCase())))
     setDrawerRecord((current: any) => current && changed.has(String(current.id).toLowerCase()) ? null : current)
-  }, [])
+    applySavedEdits(Object.fromEntries([...changed].map(id => [id, { _removedFromContext: true }])))
+    sel.setAll([...sel.selected].filter(id => !changed.has(id.toLowerCase())), true)
+  }, [applySavedEdits, sel])
 
   const changeArchive = useCallback(async (recordId: string, archived: boolean): Promise<boolean> => {
     if (modeBusyId || archiveBusyId) return false
@@ -1025,11 +971,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     try {
       const result = await api.patch('/triage/records/archive', { ids: [recordId], archived }) as ArchiveMutationResponse
       const changedIds = changedArchiveIds(result, [recordId])
-      const page = pagination?.page || 1
-      const targetPage = changedIds.length > 0 && records.length <= 1 && page > 1 ? page - 1 : page
-      if (changedIds.length > 0) syncArchiveLocally(changedIds, archived)
+      if (changedIds.length > 0) syncArchiveLocally(changedIds)
       refreshBadges()
-      await load(targetPage, { silent: true })
       return changedIds.includes(recordId.toLowerCase())
     } catch (err) {
       console.error(err)
@@ -1037,7 +980,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     } finally {
       setArchiveBusyId(null)
     }
-  }, [archiveBusyId, load, modeBusyId, pagination, records.length, refreshBadges, syncArchiveLocally])
+  }, [archiveBusyId, modeBusyId, refreshBadges, syncArchiveLocally])
 
   const runArchiveBatch = async (archived: boolean) => {
     if (sel.count === 0) return
@@ -1046,33 +989,20 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       const ids = [...sel.selected]
       const result = await api.patch('/triage/records/archive', { ids, archived }) as ArchiveMutationResponse
       const changedIds = changedArchiveIds(result, ids)
-      const changedSet = new Set(changedIds)
-      const page = pagination?.page || 1
-      const changedOnPage = records.filter(record => changedSet.has(String(record.id).toLowerCase())).length
-      const targetPage = changedOnPage >= records.length && page > 1 ? page - 1 : page
-      syncArchiveLocally(changedIds, archived)
+      syncArchiveLocally(changedIds)
+      sel.clear()
       refreshBadges()
-      await load(targetPage, { silent: true })
     } catch (err) { console.error(err) }
     finally { setBatchBusy(false) }
   }
 
   const syncWatchedLocally = useCallback((ids: Iterable<string>, watched: boolean) => {
-    const changed = new Set([...ids].map(id => String(id).toLowerCase()))
-    setRecords(current => current.flatMap(record => {
-      if (!changed.has(String(record.id).toLowerCase())) return [record]
-      if (!selectionSession.current && ((watchedFilter === 'watched' && !watched) || (watchedFilter === 'unwatched' && watched))) return []
-      return [{
-        ...record,
-        is_watched: watched,
-        watched_at: watched ? new Date().toISOString() : null,
-        watched_by_name: watched ? '当前用户' : '',
-      }]
-    }))
-    setDrawerRecord((current: { id?: unknown } | null) => current && changed.has(String(current.id).toLowerCase())
-      ? { ...current, is_watched: watched, watched_at: watched ? new Date().toISOString() : null, watched_by_name: watched ? '当前用户' : '' }
-      : current)
-  }, [watchedFilter])
+    applySavedEdits(Object.fromEntries([...ids].map(id => [id, {
+      is_watched: watched,
+      watched_at: watched ? new Date().toISOString() : null,
+      watched_by_name: watched ? '当前用户' : '',
+    }])))
+  }, [applySavedEdits])
 
   const setRecordsWatched = useCallback(async (ids: string[], watched: boolean) => {
     const result = await api.patch<WatchMutationResponse>('/triage/records/watch', { ids, watched })
@@ -1090,7 +1020,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     try {
       const updatedIds = await setRecordsWatched([record.id], watched)
       showBatchFeedback(watched ? '已关注该内容' : '已取消关注', 'success')
-      await load(pagination?.page || 1, { silent: true })
       return updatedIds.includes(String(record.id).toLowerCase())
     } catch (error) {
       showBatchFeedback(`关注状态修改失败：${error instanceof Error ? error.message : '请稍后重试'}`, 'error')
@@ -1098,7 +1027,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     } finally {
       setWatchBusyId(null)
     }
-  }, [load, pagination, setRecordsWatched, showBatchFeedback, watchBusyId])
+  }, [setRecordsWatched, showBatchFeedback, watchBusyId])
 
   const runWatchBatch = async (watched: boolean) => {
     if (sel.count === 0) return
@@ -1107,7 +1036,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       const ids = [...sel.selected]
       const updatedIds = await setRecordsWatched(ids, watched)
       showBatchFeedback(`已${watched ? '关注' : '取消关注'} ${updatedIds.length} 条内容`, 'success')
-      await load(pagination?.page || 1, { silent: true })
     } catch (error) {
       showBatchFeedback(`批量${watched ? '关注' : '取消关注'}失败：${error instanceof Error ? error.message : '请稍后重试'}`, 'error')
     } finally {
@@ -1172,15 +1100,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     onProgressAdded: (progress: RecordProgressSummary) => {
       const recordId = drawerRecord.id
       const applyProgress = (record: any) => ({
-        ...record,
         progress_count: Number(record.progress_count || 0) + 1,
         progress_latest_body: progress.body,
         progress_latest_author: progress.authorName,
         progress_latest_at: progress.createdAt,
         progress_latest_type: progress.eventType,
       })
-      setRecords(current => current.map(record => record.id === recordId ? applyProgress(record) : record))
-      setDrawerRecord((current: any) => current?.id === recordId ? applyProgress(current) : current)
+      applySavedEdits({ [recordId]: applyProgress(drawerRecord) })
     },
   } : null
 
@@ -1249,7 +1175,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         </div>
       )}
       {selectionActive && <div role="status" className="sticky left-0 flex flex-wrap items-center gap-3 rounded-lg border border-primary/20 bg-accent px-3 py-2 text-xs lg:w-[calc(100cqw-3rem)]">
-        <span className="flex-1">多选中，已选 {sel.count} 条。修改后保留当前列表和勾选；取消多选后按筛选更新。</span>
+        <span className="flex-1">多选中，已选 {sel.count} 条。修改后保留当前列表和勾选；取消多选只取消勾选；点击“刷新结果”后按筛选更新。</span>
         <Button size="sm" variant="outline" disabled={selectionBusy} onClick={cancelSelection}><X className="h-3.5 w-3.5" />取消多选</Button>
       </div>}
       <fieldset disabled={selectionActive} className="sticky left-0 z-30 min-w-0 !mb-0 space-y-2 border-b border-border/60 bg-background pb-3 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
@@ -1490,11 +1416,26 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       </fieldset>
 
 
+      <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
+        <span>{Object.keys(savedEdits).length > 0
+          ? '修改已保存，当前内容和位置已保留；刷新后按最新条件显示。数量为上次查询结果，导出按最新筛选条件生成。'
+          : '保存后可继续编辑；刷新结果将按当前条件重新查询。'}</span>
+        <Button variant="outline" size="sm" disabled={loading || batchBusy || Boolean(modeBusyId || archiveBusyId || noteBusyId || watchBusyId)}
+          onClick={() => {
+            selectionSession.current = false
+            setSelectionActive(false)
+            sel.clear()
+            if (view === 'board') { setSavedEdits({}); editJournal.current = [] }
+            else void load(pagination?.page || 1)
+            setBoardNonce(n => n + 1)
+          }}>刷新结果</Button>
+      </div>
       {/* Board view */}
       {view === 'board' ? (
         <TriageBoard
           filterQuery={boardFilterQuery}
           reloadKey={String(boardNonce)}
+          savedEdits={savedEdits}
           canWrite={canWrite()}
           onOpen={record => openDrawer(record)}
           onChangeMode={(record, nextStatus) => changeRecordMode(record, nextStatus)}
@@ -1524,6 +1465,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 record={r}
                 canWrite={canWrite()}
                 selected={sel.has(r.id)}
+                  retained={Boolean(savedEdits[String(r.id).toLowerCase()])}
                 onToggle={() => toggleSelection(r.id)}
                 onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
                 onSaveFeishuTableNo={(value: string) => saveFeishuTableNo(r, value)}
@@ -1624,6 +1566,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   narrow={narrow}
                   open={drawerRecord?.id === r.id}
                   selected={sel.has(r.id)}
+                  retained={Boolean(savedEdits[String(r.id).toLowerCase()])}
                   onToggle={() => toggleSelection(r.id)}
                   onAddNote={() => addRecordNote(r)}
                   noteBusy={noteBusyId === r.id}
@@ -1647,7 +1590,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           {pagination && (
             <fieldset disabled={selectionActive} className="min-w-0 flex flex-col gap-3 border-t border-border/50 px-4 py-3 xl:flex-row xl:items-center xl:justify-between">
               <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                第 {formatNumber(pageStart)}–{formatNumber(pageEnd)} 条，共 {formatNumber(pagination.total)} 条
+                {Object.keys(savedEdits).length > 0 ? '上次查询：' : ''}第 {formatNumber(pageStart)}–{formatNumber(pageEnd)} 条，共 {formatNumber(pagination.total)} 条
               </span>
               <div className="flex flex-wrap items-center gap-2 xl:justify-end">
                 <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
@@ -1823,7 +1766,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 /* 手机值守卡片：把桌面表格里最需要扫读的判断、风险和时间压到一屏内。 */
 // Mirrors the long-standing desktop row contract while keeping the mobile view local.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onAddNote, noteBusy, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: any) {
+function MobileRecordCard({ record: r, canWrite, selected, retained, onToggle, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onAddNote, noteBusy, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
@@ -1894,6 +1837,7 @@ function MobileRecordCard({ record: r, canWrite, selected, onToggle, onChangeMod
         <PostIntentBadge record={r} />
         <PostRelevanceBadge record={r} />
         {archived && <StatusBadge tone="muted">已归档</StatusBadge>}
+        {retained && <span className="text-[10px] text-muted-foreground" title="修改已保存，刷新后按最新筛选条件显示">已修改 · 暂留</span>}
         {r.triage_status === 'negative_feishu' && (
           <FeishuTableNumberControl
             value={r.feishu_table_no}
@@ -1958,7 +1902,7 @@ function MobileMetric({ label, value, valueClassName = 'text-foreground' }: { la
 }
 
 /* ==================== Record Row(列表行)==================== */
-function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAddNote, noteBusy, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: any) {
+function RecordRow({ record: r, canWrite, narrow, open, selected, retained, onToggle, onAddNote, noteBusy, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: any) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const accentBar = recordAccentClass(r)
@@ -2023,6 +1967,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, onToggle, onAd
       <td className="px-3 py-3.5 align-middle">
         <div className="flex flex-wrap gap-1">
           <StatusBadge tone={tone}>{r.sentiment ? (LABELS.sentiment[r.sentiment] || r.sentiment) : '—'}</StatusBadge>
+          {retained && <span className="text-[10px] text-muted-foreground" title="修改已保存，刷新后按最新筛选条件显示">已修改 · 暂留</span>}
           {availabilityLabel && <StatusBadge tone="muted"><CircleOff className="h-3 w-3" />{availabilityLabel}</StatusBadge>}
         </div>
       </td>

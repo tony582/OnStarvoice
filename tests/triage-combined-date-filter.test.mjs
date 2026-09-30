@@ -91,7 +91,9 @@ test('handled date filtering stays combined-only and follows initial, clear, sel
   assert.ok(selection);
   assert.match(selection, /useSelection\('triage-selection-session'\)/);
   assert.match(queue, /<fieldset disabled=\{selectionActive\}/);
-  assert.match(queue, /const cancelSelection[\s\S]*?sel\.clear\(\)[\s\S]*?load\(pagination\?\.page \|\| 1/);
+  const cancel = queue.slice(queue.indexOf('const cancelSelection'), queue.indexOf('const exportXlsx'));
+  assert.match(cancel, /sel\.clear\(\)/);
+  assert.doesNotMatch(cancel, /\bload\(/);
   const commonFilters = queue.match(/const filterParams = useCallback\(\(\) => \{[\s\S]*?\}, \[[^\]]*\]\)/)?.[0];
   assert.ok(commonFilters);
   assert.match(commonFilters, /params\.set\('handledFrom', dateRanges\.handled\.from\)/);

@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { AlertCircle, RefreshCw, Loader2, Heart, MessageCircle, FileText, GripVertical } from 'lucide-react'
+import { mergeRecordPatches, type RecordPatches } from '@/lib/triage-edit-context'
 import { api } from '@/lib/api'
 import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
 import { Button } from '@/components/ui/button'
@@ -43,9 +44,10 @@ function emptyColumns(): Record<ColKey, any[]> {
   }
 }
 
-export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChangeMode, onSaveFeishuTableNo, refreshBadges }: {
+export function TriageBoard({ filterQuery, reloadKey, savedEdits, canWrite, onOpen, onChangeMode, onSaveFeishuTableNo, refreshBadges }: {
   filterQuery: string
   reloadKey: string
+  savedEdits: RecordPatches
   canWrite: boolean
   onOpen: (record: any) => void
   onChangeMode: (record: any, status: ColKey) => Promise<boolean>
@@ -107,7 +109,7 @@ export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChange
 
   const move = useCallback(async (id: string, from: ColKey, to: ColKey) => {
     if (from === to) return
-    const card = cols[from].find(record => record.id === id)
+    const card = mergeRecordPatches(cols[from], savedEdits).find(record => record.id === id)
     if (!card) return
 
     const changed = await onChangeMode(card, to)
@@ -118,7 +120,7 @@ export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChange
       [to]: [{ ...card, triage_status: to }, ...previous[to]],
     }))
     refreshBadges()
-  }, [cols, onChangeMode, refreshBadges])
+  }, [cols, savedEdits, onChangeMode, refreshBadges])
 
   if (loading) {
     return <div role="status" className="flex items-center justify-center gap-2 py-20"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /><span className="text-sm text-muted-foreground">正在加载看板…</span></div>
@@ -134,7 +136,7 @@ export function TriageBoard({ filterQuery, reloadKey, canWrite, onOpen, onChange
         </div>
         <div className="flex items-stretch gap-3">
           {COLUMNS.map(column => {
-            const items = cols[column.key]
+            const items = mergeRecordPatches(cols[column.key], savedEdits).filter(record => !record._removedFromContext)
             const isOver = overCol === column.key
             return (
               <div

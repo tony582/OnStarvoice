@@ -254,8 +254,8 @@ test("React admin exposes drawer-only reporting and a review queue", async () =>
   );
   assert.match(manualUpdateAction, /isApiNetworkError/);
   assert.match(manualUpdateAction, /verifyManualFieldsSaved/);
-  assert.match(manualUpdateAction, /void reloadAfterMutation\(\)/);
-  assert.doesNotMatch(manualUpdateAction, /await reloadAfterMutation\(\)/);
+  assert.match(manualUpdateAction, /applySavedEdits/);
+  assert.doesNotMatch(manualUpdateAction, /reloadAfterMutation|setDrawerRecord\(null\)|leavesCurrentSentiment/);
   assert.match(apiClient, /class ApiNetworkError extends Error/);
   assert.match(apiClient, /网络连接中断，请检查网络后重试/);
   assert.doesNotMatch(triage, /<RecordDrawer key=/);

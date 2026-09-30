@@ -14,7 +14,7 @@ const routeSource = readFileSync(
 test('content triage pagination supports page size, page numbers, and direct jump', () => {
   assert.match(source, /const PAGE_SIZE_OPTIONS = \[20, 30, 50, 100\]/);
   assert.match(source, /params\.set\('pageSize', String\(pageSize\)\)/);
-  assert.match(source, /Math\.ceil\(total \/ pageSize\)/);
+  assert.match(source, /setPagination\(data\.pagination \|\| null\)/);
   assert.match(source, /function getPaginationItems/);
   assert.match(source, /aria-label="内容列表分页"/);
   assert.match(source, /aria-label="每页条数"/);

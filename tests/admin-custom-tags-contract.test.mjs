@@ -60,8 +60,8 @@ test('React admin exposes reusable custom tag editing, batch add/remove and filt
   assert.match(triage, /api\.patch<CustomTagsMutationResponse>\('\/records\/' \+ recordId \+ '\/custom-tags'/);
   assert.match(triage, /params\.append\('customTag', id\)/);
   assert.match(triage, /RecordLabelChips tags=\{customTags\} limit=\{2\}/);
-  assert.match(triage, /customTagIds\.length[\s\S]*await load/);
-  assert.match(triage, /stillMatches[\s\S]*current\.filter\(record => record\.id !== recordId\)/);
+  assert.match(triage, /applySavedEdits\(\{ \[recordId\]: withCustomTags/);
+  assert.doesNotMatch(triage, /const stillMatches/);
   assert.match(triage, /onSearch=\{loadCustomTagCatalog\}/);
   assert.match(triage, /api\.delete<DeleteCustomTagResponse>\('\/custom-tags\/'/);
   assert.match(triage, /setCustomTagCatalog\(current => current\.filter/);
