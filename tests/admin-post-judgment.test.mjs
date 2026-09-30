@@ -156,7 +156,8 @@ test('filters wrap by content width in every layout and keep their labels horizo
   const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* Board view */}'));
   // 不再按抽屉开关切换等宽网格：筛选 pill 永远按内容宽度排布并自然换行，标签不会被截成「全部平…」。
   assert.doesNotMatch(queue, /xl:grid-cols-|lg:w-\[160px\]|justify-between whitespace-nowrap/);
-  assert.match(filters, /w-full flex-wrap items-center gap-1\.5/);
+  assert.match(filters, /w-full flex-wrap items-center gap-x-2 gap-y-2 rounded-b-xl border-t border-border\/70 bg-muted\/25/);
+  assert.match(filters, /<FilterGroup label="判断筛选组">/);
   assert.match(trigger, /shrink-0 items-center gap-1 whitespace-nowrap/);
   assert.match(component, /inline-flex shrink-0 items-center gap-1 whitespace-nowrap/);
   assert.match(component, /pillTriggerClass\(active\)/);

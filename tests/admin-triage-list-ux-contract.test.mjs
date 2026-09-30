@@ -213,7 +213,7 @@ test('content topic shows as a chip only when classified and the filter offers a
 test('search commits once, ignores stale responses, and keeps board filters aligned with list filters', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
-  const searchInput = between(queue, '<Search className=', '<button\n              type="button"\n              onClick={() => setMobileFiltersOpen');
+  const searchInput = between(queue, '<Search className=', '<button\n                type="button"\n                onClick={() => setMobileFiltersOpen');
 
   assert.match(queue, /const \[keywordDraft, setKeywordDraft\]/);
   assert.match(queue, /window\.setTimeout\(\(\) => setKeyword\(nextKeyword\), 400\)/);

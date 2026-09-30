@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChevronDown, CalendarRange, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { filterTriggerClass } from '@/lib/filter-trigger'
@@ -134,21 +134,49 @@ export function DateRangeFilter({ from, to, onChange, basis, onBasisChange, trig
   )
 }
 
-const EMPTY_RANGE: DateRangeValue = { from: '', to: '' }
-
 /**
- * 内容分诊的时间筛选：一个「时间」入口，弹层内按维度切换（发布时间 / 首次发现 / 最近采集 / 处理时间），
- * 每个维度各自保留区间，同时设置多个维度时由服务端按 AND 组合。
- * 按钮上直接概括当前生效的区间，已设置的维度在页签上带蓝点。
+ * 内容分诊的时间筛选组：发布时间 / 首次发现 / 最近采集 / 处理时间四个维度各自是一个入口，
+ * 直接点开设置区间，各自保留区间、可同时设置多个（服务端按 AND 组合）。四个按钮视觉上收成一组，
+ * 激活的维度按钮上直接显示区间，不用点开就知道当前按什么时间在筛。
  */
 export function CombinedDateRangeFilter({ value, onChange, triggerClassName }: {
   value: CombinedDateRanges
   onChange: (value: CombinedDateRanges) => void
   triggerClassName?: string
 }) {
+  const activeCount = COMBINED_BASIS_ORDER.filter(([key]) => value[key].from || value[key].to).length
+  return (
+    <div
+      role="group"
+      aria-label={`时间筛选${activeCount ? `，已设置 ${activeCount} 个维度` : ''}`}
+      className="inline-flex h-10 max-w-full items-center gap-0.5 rounded-lg bg-muted p-0.5 lg:h-8"
+    >
+      <CalendarRange aria-hidden className="ml-1.5 mr-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      {COMBINED_BASIS_ORDER.map(([basis]) => (
+        <IndependentDateRangeFilter
+          key={basis}
+          basis={basis}
+          value={value[basis]}
+          onChange={(from, to) => onChange({ ...value, [basis]: { from, to } })}
+          triggerClassName={triggerClassName}
+        />
+      ))}
+    </div>
+  )
+}
+
+function IndependentDateRangeFilter({ basis, value, onChange, triggerClassName }: {
+  basis: CombinedDateBasis
+  value: DateRangeValue
+  onChange: (from: string, to: string) => void
+  triggerClassName?: string
+}) {
   const [open, setOpen] = useState(false)
-  const [basis, setBasis] = useState<CombinedDateBasis>('publish')
+  const [alignRight, setAlignRight] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const active = Boolean(value.from || value.to)
+  const label = rangeLabel(value)
 
   useEffect(() => {
     const close = (event: MouseEvent) => {
@@ -158,88 +186,54 @@ export function CombinedDateRangeFilter({ value, onChange, triggerClassName }: {
     return () => document.removeEventListener('click', close)
   }, [])
 
-  const activeBases = COMBINED_BASIS_ORDER.filter(([key]) => value[key].from || value[key].to)
-  const active = activeBases.length > 0
-  const summary = active
-    ? `${BASIS_SHORT[activeBases[0][0]]} ${rangeLabel(value[activeBases[0][0]])}${activeBases.length > 1 ? ` +${activeBases.length - 1}` : ''}`
-    : '时间'
-  const fullSummary = activeBases.map(([key, label]) => `${label} ${rangeLabel(value[key])}`).join('；')
-
-  const toggleOpen = () => {
-    // 打开时定位到第一个已设置的维度，方便直接调整。
-    if (!open && activeBases.length) setBasis(activeBases[0][0])
-    setOpen(current => !current)
-  }
-  const setRange = (key: CombinedDateBasis, from: string, to: string) => onChange({ ...value, [key]: { from, to } })
+  // 靠右的维度弹层容易撑出视口，打开时按实际位置决定向左还是向右展开。
+  useLayoutEffect(() => {
+    if (!open || !ref.current || !menuRef.current) return
+    const trigger = ref.current.getBoundingClientRect()
+    const menuWidth = menuRef.current.getBoundingClientRect().width
+    const wouldOverflowRight = trigger.left + menuWidth > window.innerWidth - 12
+    const fitsToLeft = trigger.right - menuWidth >= 12
+    setAlignRight(wouldOverflowRight && fitsToLeft)
+  }, [open])
 
   return (
     <div className="relative" ref={ref}>
       <button
         type="button"
-        onClick={toggleOpen}
+        onClick={() => setOpen(current => !current)}
         aria-expanded={open}
-        aria-label={`时间筛选${active ? `，已设置 ${activeBases.length} 个维度` : ''}`}
-        title={active ? fullSummary : '按发布时间、首次发现、最近采集或处理时间筛选'}
-        className={filterTriggerClass(active, triggerClassName)}
+        aria-label={`${BASIS_FULL[basis]}筛选${active ? `，已设置 ${label}` : ''}`}
+        title={active ? `${BASIS_FULL[basis]}：${label}` : `按${BASIS_FULL[basis]}筛选`}
+        className={cn(
+          'inline-flex h-9 shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-2.5 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary/20 lg:h-7 lg:px-2',
+          active
+            ? 'bg-primary/10 text-primary hover:bg-primary/15'
+            : 'text-muted-foreground hover:bg-card/70 hover:text-foreground',
+          triggerClassName,
+        )}
       >
-        <CalendarRange className="h-3.5 w-3.5 shrink-0" />
-        <span className="max-w-[200px] truncate">{summary}</span>
+        <span>{active ? `${BASIS_SHORT[basis]} ${label}` : BASIS_FULL[basis]}</span>
         <ChevronDown className="h-3 w-3 shrink-0" />
       </button>
       {open && (
-        <div className="responsive-filter-popover absolute left-0 top-full z-50 mt-1.5 w-[308px] rounded-xl border border-border bg-card p-3.5 shadow-lg">
-          <div role="tablist" aria-label="时间维度" className="mb-3 grid grid-cols-4 gap-0.5 rounded-lg bg-muted p-0.5">
-            {COMBINED_BASIS_ORDER.map(([key, label]) => {
-              const set = Boolean(value[key].from || value[key].to)
-              return (
-                <button
-                  key={key}
-                  type="button"
-                  role="tab"
-                  aria-selected={basis === key}
-                  onClick={() => setBasis(key)}
-                  className={cn(
-                    'relative inline-flex h-7 items-center justify-center rounded-md text-[11px] font-medium transition-colors',
-                    basis === key ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground',
-                  )}
-                >
-                  {label}
-                  {set && <span aria-hidden className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-primary" />}
-                </button>
-              )
-            })}
-          </div>
+        <div
+          ref={menuRef}
+          className={cn(
+            'responsive-filter-popover absolute top-full z-50 mt-1.5 w-[264px] rounded-xl border border-border bg-card p-3.5 shadow-lg',
+            alignRight ? 'right-0' : 'left-0',
+          )}
+        >
+          <div className="mb-2.5 text-[11px] font-semibold text-foreground">{BASIS_FULL[basis]}</div>
           {basis === 'handled' && <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">筛选此期间人工更改过处理状态的帖子。</p>}
-          <DateRangeEditor
-            from={value[basis].from}
-            to={value[basis].to}
-            onChange={(from, to) => setRange(basis, from, to)}
-            onPreset={() => setOpen(false)}
-          />
+          <DateRangeEditor from={value.from} to={value.to} onChange={onChange} onPreset={() => setOpen(false)} />
           {active && (
-            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-border pt-2.5 text-[11px] text-muted-foreground">
-              {activeBases.map(([key, label]) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => setRange(key, '', '')}
-                  title={`清空${label}`}
-                  className="inline-flex items-center gap-1 rounded transition-colors hover:text-foreground"
-                >
-                  {label} {rangeLabel(value[key])}
-                  <X className="h-3 w-3" />
-                </button>
-              ))}
-              {activeBases.length > 1 && (
-                <button
-                  type="button"
-                  onClick={() => onChange({ publish: EMPTY_RANGE, recent: EMPTY_RANGE, first: EMPTY_RANGE, handled: EMPTY_RANGE })}
-                  className="ml-auto font-medium transition-colors hover:text-foreground"
-                >
-                  清空全部
-                </button>
-              )}
-            </div>
+            <button
+              type="button"
+              onClick={() => onChange('', '')}
+              className="mt-2.5 flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <X className="h-3 w-3" />清空日期
+            </button>
           )}
         </div>
       )}

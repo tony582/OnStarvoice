@@ -12,7 +12,7 @@ import { api } from '@/lib/api'
 import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel, friendlyError, proxiedImg } from '@/lib/utils'
 import { captureKeywordPresentation, publishTimePresentation } from '@/lib/publish-time.mjs'
 import { Button } from '@/components/ui/button'
-import { StatusBadge } from '@/components/ui/badge'
+import { StatusBadge, StatusPill } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
@@ -407,7 +407,7 @@ function RecordDrawerContent({
         <div data-drawer-header className="flex min-h-16 shrink-0 items-center gap-2 border-b border-border/60 bg-card px-2 pt-[env(safe-area-inset-top)] sm:gap-3 sm:px-5 lg:min-h-14">
           <button onClick={onClose} aria-label="返回内容列表" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-foreground transition active:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:hidden"><ArrowLeft className="h-5 w-5" /></button>
-          <h2 className="shrink-0 text-[16px] font-bold text-foreground">舆情内容详情</h2>
+          <h2 className="shrink-0 text-[15px] font-semibold text-foreground">舆情内容详情</h2>
           {triageStatus === 'negative_feishu' && (
             <div className="min-w-0 flex-1">
               <FeishuTableNumberControl
@@ -419,8 +419,28 @@ function RecordDrawerContent({
               />
             </div>
           )}
-          <button onClick={onClose} aria-label="关闭舆情内容详情" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
-            className="ml-auto hidden rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:block"><X className="h-5 w-5" /></button>
+          <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            {canWrite && onSetWatched ? (
+              <button type="button" onClick={() => void setWatched()} disabled={watchBusy}
+                aria-label={r.is_watched ? '取消关注内容' : '关注内容'}
+                aria-pressed={Boolean(r.is_watched)}
+                className={cn(
+                  'inline-flex h-8 items-center gap-1 rounded-md border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-60',
+                  r.is_watched
+                    ? 'border-primary/30 bg-primary/8 text-primary hover:bg-primary/12'
+                    : 'border-border text-muted-foreground hover:border-primary/40 hover:bg-accent hover:text-primary',
+                )}>
+                {watchBusy
+                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  : <Star className={cn('h-3.5 w-3.5', r.is_watched && 'fill-current')} />}
+                {r.is_watched ? '已关注' : '关注'}
+              </button>
+            ) : r.is_watched ? (
+              <span className="inline-flex h-8 items-center gap-1 rounded-md bg-primary/8 px-2.5 text-[12px] font-medium text-primary"><Star className="h-3.5 w-3.5 fill-current" />已关注</span>
+            ) : null}
+            <button onClick={onClose} aria-label="关闭舆情内容详情" disabled={savingEdit || savingLabels || savingNote || statusBusy || falsePositiveBusy}
+              className="hidden rounded-lg p-1.5 text-muted-foreground transition hover:bg-accent disabled:pointer-events-none disabled:opacity-40 lg:block"><X className="h-5 w-5" /></button>
+          </div>
         </div>
 
         {archived && (
@@ -432,114 +452,112 @@ function RecordDrawerContent({
 
         {/* Scrollable body */}
         <div className="flex-1 overflow-y-auto overscroll-contain">
-          {/* Hero */}
-          <section className="border-b border-border/60 bg-card p-4 sm:p-5">
-            <div className="flex gap-4">
+          {/* Hero：标题与来源在前；判断结果按「名称 + 值」成组，动作靠右，不再堆一排状态胶囊。 */}
+          <section className="border-b border-border/60 bg-card px-4 py-4 sm:px-5">
+            <div className="flex gap-3.5">
               {cover ? (
                 <button type="button" onClick={() => setLightbox(cover)} title="点击放大"
-                  className="group relative h-[88px] w-[88px] shrink-0 cursor-zoom-in overflow-hidden rounded-lg border border-border bg-muted">
+                  className="group relative h-[76px] w-[76px] shrink-0 cursor-zoom-in overflow-hidden rounded-lg border border-border bg-muted">
                   <img src={cover} alt="" className="h-full w-full object-cover transition group-hover:scale-105" referrerPolicy="no-referrer" onError={e => { (e.target as HTMLImageElement).parentElement!.style.display = 'none' }} />
                   <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/25 group-hover:opacity-100"><ZoomIn className="h-4 w-4 text-white" /></span>
                 </button>
               ) : null}
               <div className="min-w-0 flex-1">
-                <div className="mb-2 flex flex-wrap items-center gap-1.5">
-                  <StatusBadge tone="neutral">{platformName(r.platform)}</StatusBadge>
-                  <StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge>
-                  <PostIntentBadge record={r} />
-                  <PostRelevanceBadge record={r} />
-                  <StatusBadge tone="muted">内容主题：{contentTopicLabel(r.content_topic)}</StatusBadge>
-                  {r.content_availability_status === 'page_unavailable' && (
-                    <StatusBadge tone="muted"><Ban className="h-3 w-3" />已删除或不可访问</StatusBadge>
-                  )}
-                  {detailDegraded && <StatusBadge tone="muted">详情待补采</StatusBadge>}
-                  {r.category && <StatusBadge tone="neutral">{LABELS.category[r.category] || r.category}</StatusBadge>}
-                  {canWrite && onSetWatched ? (
-                    <button type="button" onClick={() => void setWatched()} disabled={watchBusy}
-                      aria-label={r.is_watched ? '取消关注内容' : '关注内容'}
-                      className={cn(
-                        'inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-semibold transition-colors disabled:opacity-60',
-                        r.is_watched
-                          ? 'border-primary/30 bg-primary/8 text-primary'
-                          : 'border-border text-muted-foreground hover:border-primary/40 hover:bg-accent hover:text-primary',
-                      )}>
-                      {watchBusy
-                        ? <Loader2 className="h-3 w-3 animate-spin" />
-                        : <Star className={cn('h-3 w-3', r.is_watched && 'fill-current')} />}
-                      {r.is_watched ? '已关注' : '关注'}
-                    </button>
-                  ) : r.is_watched ? (
-                    <StatusBadge tone="neutral"><Star className="h-3 w-3 fill-current" />已关注</StatusBadge>
-                  ) : null}
-                  {resolvedIdentity && (
-                    <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(resolvedIdentity) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{resolvedIdentity}</span></Tooltip>
-                  )}
-                  {canProcess && onUpdateFields && (
-                    <button type="button" onClick={openJudgementEditor}
-                      className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-0.5 text-[11px] font-semibold text-muted-foreground transition-colors hover:border-primary/40 hover:bg-accent hover:text-primary">
-                      <Pencil className="h-3 w-3" />编辑判断
-                    </button>
-                  )}
-                </div>
-                <h3 className="text-[17px] font-bold leading-snug text-foreground">{displayTitle}</h3>
-
-                {/* Author + links */}
-                <div className="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1.5">
-                  <div className="flex items-center gap-2">
-                    <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-[11px] font-bold text-muted-foreground">
+                <h3 className="text-[16px] font-semibold leading-snug text-foreground">{displayTitle}</h3>
+                <div className="mt-1.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[12px] text-muted-foreground">
+                  <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-foreground/90">
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-muted text-[10px] font-bold text-muted-foreground">
                       {(r.author_name || '?').slice(0, 1)}
-                    </div>
-                    <span className="text-[13px] font-semibold">{r.author_name || '未知作者'}</span>
-                    <span className="text-[11px] text-muted-foreground">粉丝 {Number(r.author_fans) > 0 ? formatNumber(r.author_fans) : '-'}</span>
-                  </div>
-                  <RecordSourceAction record={r} className="gap-1 text-[12px] font-semibold" />
-                  {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-[12px] font-semibold text-primary hover:underline"><User className="h-3.5 w-3.5" />主页</a>}
-                  {r.publish_display && <span className="text-[12px] text-muted-foreground">发布于 {r.publish_display}</span>}
+                    </span>
+                    <span className="truncate">{r.author_name || '未知作者'}</span>
+                  </span>
+                  {Number(r.author_fans) > 0 && <><MetaDot /><span>粉丝 {formatNumber(r.author_fans)}</span></>}
+                  <MetaDot /><span>{platformName(r.platform)}</span>
+                  {r.publish_display && <><MetaDot /><span>发布于 {r.publish_display}</span></>}
+                  <MetaDot /><RecordSourceAction record={r} className="gap-1 text-[12px] font-medium" />
+                  {r.blogger_profile_url && <><MetaDot /><a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-medium text-primary hover:underline"><User className="h-3.5 w-3.5" />主页</a></>}
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-x-3.5 gap-y-1 text-[12px] tabular-nums text-muted-foreground" aria-label="互动数据">
+                  <span title="点赞" className="inline-flex items-center gap-1"><Heart className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.likes)}</span>
+                  <span title="评论" className="inline-flex items-center gap-1"><MessageCircle className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.comments_count)}</span>
+                  <span title="收藏" className="inline-flex items-center gap-1"><Star className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.collects)}</span>
+                  <span title="转发" className="inline-flex items-center gap-1"><Share2 className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.shares)}</span>
                 </div>
               </div>
             </div>
 
-            <div className="mt-4 border-t border-border/50 pt-3">
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <RecordLabelsHeading />
-                {customTags.length > 0 ? (
-                  <RecordLabelChips tags={customTags} />
-                ) : (
-                  <span className="text-[11px] text-muted-foreground/60">暂无</span>
+            {(r.content_availability_status === 'page_unavailable' || detailDegraded) && (
+              <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                {r.content_availability_status === 'page_unavailable' && (
+                  <StatusBadge tone="muted"><Ban className="h-3 w-3" />已删除或不可访问</StatusBadge>
                 )}
-                {canProcess && onUpdateCustomTags && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setEditingJudgement(false)
-                      setEditingLabels(open => !open)
-                    }}
-                    className={cn(
-                      'inline-flex h-6 items-center rounded-md border px-2 text-[10.5px] font-semibold transition-colors',
-                      editingLabels
-                        ? 'border-primary/30 bg-accent text-primary'
-                        : 'border-border text-muted-foreground hover:border-primary/30 hover:bg-accent hover:text-primary',
-                    )}
-                  >
-                    {editingLabels ? '收起管理' : '管理标签'}
-                  </button>
-                )}
+                {detailDegraded && <StatusBadge tone="muted">详情待补采</StatusBadge>}
               </div>
-              {editingLabels && canProcess && onUpdateCustomTags && (
-                <RecordLabelEditor
-                  initialTags={customTags}
-                  catalog={customTagCatalog}
-                  onSave={updateLabels}
-                  onDeleteCatalogTag={onDeleteCustomTag}
-                  onCancel={() => setEditingLabels(false)}
-                  onSavingChange={setSavingLabels}
-                />
+            )}
+
+            {/* 判断结果：每个值都带名字，一眼知道哪个是情感、哪个是相关性。 */}
+            <div className="mt-3.5 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border/60 pt-3" aria-label="判断结果">
+              <Fact label="情感"><StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></Fact>
+              <Fact label="意图"><PostIntentBadge record={r} /></Fact>
+              <Fact label="相关性"><PostRelevanceBadge record={r} compact /></Fact>
+              <Fact label="主题">
+                {contentTopicLabel(r.content_topic, '')
+                  ? <StatusPill tone="neutral">{contentTopicLabel(r.content_topic)}</StatusPill>
+                  : <span className="text-[12px] text-muted-foreground/70">未分类</span>}
+              </Fact>
+              {r.category && <Fact label="分类"><StatusPill tone="neutral">{LABELS.category[r.category] || r.category}</StatusPill></Fact>}
+              {resolvedIdentity && (
+                <Fact label="身份">
+                  <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(resolvedIdentity) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{resolvedIdentity}</span></Tooltip>
+                </Fact>
+              )}
+              {canProcess && onUpdateFields && (
+                <button type="button" onClick={openJudgementEditor}
+                  className="ml-auto inline-flex h-7 items-center gap-1 rounded-md border border-border px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:bg-accent hover:text-primary">
+                  <Pencil className="h-3 w-3" />编辑判断
+                </button>
               )}
             </div>
 
+            <div className="mt-3 flex min-w-0 flex-wrap items-center gap-2">
+              <RecordLabelsHeading />
+              {customTags.length > 0 ? (
+                <RecordLabelChips tags={customTags} />
+              ) : (
+                <span className="text-[11px] text-muted-foreground/60">暂无</span>
+              )}
+              {canProcess && onUpdateCustomTags && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingJudgement(false)
+                    setEditingLabels(open => !open)
+                  }}
+                  className={cn(
+                    'ml-auto inline-flex h-7 items-center rounded-md border px-2 text-[11px] font-medium transition-colors',
+                    editingLabels
+                      ? 'border-primary/30 bg-accent text-primary'
+                      : 'border-border text-muted-foreground hover:border-primary/30 hover:bg-accent hover:text-primary',
+                  )}
+                >
+                  {editingLabels ? '收起管理' : '管理标签'}
+                </button>
+              )}
+            </div>
+            {editingLabels && canProcess && onUpdateCustomTags && (
+              <RecordLabelEditor
+                initialTags={customTags}
+                catalog={customTagCatalog}
+                onSave={updateLabels}
+                onDeleteCatalogTag={onDeleteCustomTag}
+                onCancel={() => setEditingLabels(false)}
+                onSavingChange={setSavingLabels}
+              />
+            )}
+
             {/* 风险区只展示真实风险；官方回复属于处理进展，在“官方回复”与“处理记录”中展示。 */}
             {hasSignals && (
-              <div className="mt-4 flex flex-wrap items-center gap-2 border-l-2 border-status-red bg-status-red/[0.04] px-3 py-2.5 dark:bg-status-red/[0.08]">
+              <div className="mt-3 flex flex-wrap items-center gap-2 rounded-md border-l-2 border-status-red bg-status-red/[0.04] px-3 py-2 dark:bg-status-red/[0.08]">
                 <span className="text-[11px] font-semibold text-muted-foreground">风险信号</span>
                 {alerts > 0 && (
                   <Tooltip text={r.alert_reasons || '已触发预警规则,建议优先处理'}><span className="cursor-help rounded bg-status-red/12 px-2 py-0.5 text-[11px] font-semibold text-rose-700 dark:text-rose-300">预警 {alerts}</span></Tooltip>
@@ -555,13 +573,6 @@ function RecordDrawerContent({
                 )}
               </div>
             )}
-
-            <div className="mt-4 grid grid-cols-2 divide-x divide-border/50 border-y border-border/50 bg-muted/20 sm:grid-cols-4">
-              <Metric icon={Heart} label="点赞" value={r.likes} />
-              <Metric icon={MessageCircle} label="评论" value={r.comments_count} />
-              <Metric icon={Star} label="收藏" value={r.collects} />
-              <Metric icon={Share2} label="转发" value={r.shares} />
-            </div>
           </section>
 
           {/* Tabs */}
@@ -1266,13 +1277,18 @@ function JudgementEditor({ draft, currentIdentity, error, saving, onChange, onCa
   )
 }
 
-function Metric({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: any }) {
+/* 详情头部「名称 + 值」的一组判断结果。 */
+function Fact({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="px-3 py-2.5">
-      <div className="flex items-center gap-1 text-[10.5px] font-medium text-muted-foreground"><Icon className="h-3 w-3" strokeWidth={2} />{label}</div>
-      <div className="mt-0.5 text-[15px] font-bold tabular-nums">{formatNumber(value)}</div>
+    <div className="inline-flex items-center gap-1.5">
+      <span className="text-[11px] text-muted-foreground">{label}</span>
+      <span className="inline-flex items-center">{children}</span>
     </div>
   )
+}
+
+function MetaDot() {
+  return <span aria-hidden className="text-muted-foreground/40">·</span>
 }
 
 function InfoTile({ label, value, hint }: { label: string; value: string; hint?: string }) {
