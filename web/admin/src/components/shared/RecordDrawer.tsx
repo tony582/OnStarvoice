@@ -495,38 +495,40 @@ function RecordDrawerContent({
               </div>
             )}
 
-            {/* 判断结果：每个值都带名字，一眼知道哪个是情感、哪个是相关性。 */}
-            <div className="mt-3.5 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-border/60 pt-3" aria-label="判断结果">
-              <Fact label="情感"><StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></Fact>
-              <Fact label="意图"><PostIntentBadge record={r} /></Fact>
-              <Fact label="相关性"><PostRelevanceBadge record={r} compact /></Fact>
-              <Fact label="主题">
-                {contentTopicLabel(r.content_topic, '')
-                  ? <StatusPill tone="neutral">{contentTopicLabel(r.content_topic)}</StatusPill>
-                  : <span className="text-[12px] text-muted-foreground/70">未分类</span>}
-              </Fact>
-              {r.category && <Fact label="分类"><StatusPill tone="neutral">{LABELS.category[r.category] || r.category}</StatusPill></Fact>}
-              {resolvedIdentity && (
-                <Fact label="身份">
-                  <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(resolvedIdentity) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{resolvedIdentity}</span></Tooltip>
+            {/* 判断结果与标签：左列内容可换行，右列是固定的窄动作列，两行的按钮上下对齐、不会被换行顶走。 */}
+            <div className="mt-3.5 grid grid-cols-[minmax(0,1fr)_auto] gap-x-3 gap-y-2.5 border-t border-border/60 pt-3">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5" aria-label="判断结果">
+                <Fact label="情感"><StatusBadge tone={r.sentiment || 'muted'}>{LABELS.sentiment[r.sentiment] || '待标注'}</StatusBadge></Fact>
+                <Fact label="意图"><PostIntentBadge record={r} /></Fact>
+                <Fact label="相关性"><PostRelevanceBadge record={r} compact /></Fact>
+                <Fact label="主题">
+                  {contentTopicLabel(r.content_topic, '')
+                    ? <StatusPill tone="neutral">{contentTopicLabel(r.content_topic)}</StatusPill>
+                    : <span className="text-[12px] text-muted-foreground/70">未分类</span>}
                 </Fact>
-              )}
-              {canProcess && onUpdateFields && (
+                {r.category && <Fact label="分类"><StatusPill tone="neutral">{LABELS.category[r.category] || r.category}</StatusPill></Fact>}
+                {resolvedIdentity && (
+                  <Fact label="身份">
+                    <Tooltip text={r.identity_override ? '人工修正的疑似身份' : '疑似身份:账号名带品牌/车型 → 疑似品牌关联号(4S店 / KOE,非真实车主);其余按 AI 多信号判定。研判时 4S店 / KOE 建议剔除'}><span className={cn('cursor-help rounded-md px-2 py-0.5 text-[11px] font-semibold', ['KOE', '4S店'].includes(resolvedIdentity) ? 'bg-violet-500/15 text-violet-700 dark:text-violet-300' : 'bg-muted text-muted-foreground')}>{resolvedIdentity}</span></Tooltip>
+                  </Fact>
+                )}
+              </div>
+              {canProcess && onUpdateFields ? (
                 <button type="button" onClick={openJudgementEditor}
-                  className="ml-auto inline-flex h-7 items-center gap-1 rounded-md border border-border px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:bg-accent hover:text-primary">
+                  className="inline-flex h-6 items-center gap-1 self-start rounded-md px-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-primary">
                   <Pencil className="h-3 w-3" />编辑判断
                 </button>
-              )}
-            </div>
+              ) : <span />}
 
-            <div className="mt-3 flex min-w-0 flex-wrap items-center gap-2">
-              <RecordLabelsHeading />
-              {customTags.length > 0 ? (
-                <RecordLabelChips tags={customTags} />
-              ) : (
-                <span className="text-[11px] text-muted-foreground/60">暂无</span>
-              )}
-              {canProcess && onUpdateCustomTags && (
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <RecordLabelsHeading />
+                {customTags.length > 0 ? (
+                  <RecordLabelChips tags={customTags} />
+                ) : (
+                  <span className="text-[11px] text-muted-foreground/60">暂无</span>
+                )}
+              </div>
+              {canProcess && onUpdateCustomTags ? (
                 <button
                   type="button"
                   onClick={() => {
@@ -534,15 +536,15 @@ function RecordDrawerContent({
                     setEditingLabels(open => !open)
                   }}
                   className={cn(
-                    'ml-auto inline-flex h-7 items-center rounded-md border px-2 text-[11px] font-medium transition-colors',
+                    'inline-flex h-6 items-center gap-1 self-start rounded-md px-1.5 text-[11px] font-medium transition-colors',
                     editingLabels
-                      ? 'border-primary/30 bg-accent text-primary'
-                      : 'border-border text-muted-foreground hover:border-primary/30 hover:bg-accent hover:text-primary',
+                      ? 'bg-accent text-primary'
+                      : 'text-muted-foreground hover:bg-accent hover:text-primary',
                   )}
                 >
-                  {editingLabels ? '收起管理' : '管理标签'}
+                  <Tags className="h-3 w-3" />{editingLabels ? '收起' : '管理标签'}
                 </button>
-              )}
+              ) : <span />}
             </div>
             {editingLabels && canProcess && onUpdateCustomTags && (
               <RecordLabelEditor
