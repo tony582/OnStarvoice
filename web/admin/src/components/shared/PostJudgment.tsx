@@ -1,6 +1,7 @@
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { Check, ChevronDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { filterTriggerClass as pillTriggerClass } from '@/lib/filter-trigger'
 import { POST_INTENT_OPTIONS, POST_RELEVANCE_OPTIONS, POST_CONFIDENCE_OPTIONS, postFilterSummary, postJudgment } from '@/lib/post-judgment'
 import { StatusPill } from '@/components/ui/badge'
 
@@ -24,9 +25,11 @@ function FilterChoices({ options, value, onChange, resetLabel }: {
   </>
 }
 
+// 表头内的紧凑触发器保留原样；筛选条里的 pill 与其它筛选共用 filterTriggerClass。
 function filterTriggerClass(header: boolean, active: boolean) {
+  if (!header) return pillTriggerClass(active)
   return cn('inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md font-medium outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary/20 max-w-full min-w-0',
-    header ? 'h-7 px-1.5 text-[11px]' : 'h-10 bg-muted px-3 text-[12px] lg:h-8',
+    'h-7 px-1.5 text-[11px]',
     active ? 'text-primary' : 'text-muted-foreground')
 }
 
@@ -36,10 +39,13 @@ export function PostIntentFilter({ value, onChange, header = false }: {
   header?: boolean
 }) {
   const labels = POST_INTENT_OPTIONS.filter(option => value.includes(option.value)).map(option => option.label)
+  const text = header
+    ? postFilterSummary(labels, '意图')
+    : labels.length ? `意图：${postFilterSummary(labels, '')}` : '意图'
   return <DropdownMenu.Root>
     <DropdownMenu.Trigger asChild>
       <button type="button" aria-label={`意图筛选，${labels.join('、') || '全部意图'}`} title={labels.join('、') || '全部意图'} className={filterTriggerClass(header, labels.length > 0)}>
-        <span className="truncate">{postFilterSummary(labels, header ? '意图' : '全部意图')}</span><ChevronDown className="h-3 w-3 shrink-0" />
+        <span className="truncate">{text}</span><ChevronDown className="h-3 w-3 shrink-0" />
       </button>
     </DropdownMenu.Trigger>
     <DropdownMenu.Portal><DropdownMenu.Content align={header ? 'end' : 'start'} sideOffset={5} collisionPadding={10}
@@ -60,10 +66,13 @@ export function PostRelevanceFilter({ value, confidence, onChange, onConfidenceC
 }) {
   const labels = [...POST_RELEVANCE_OPTIONS.filter(option => value.includes(option.value)).map(option => option.label),
     ...POST_CONFIDENCE_OPTIONS.filter(option => confidence.includes(option.value)).map(option => option.shortLabel)]
+  const text = header
+    ? postFilterSummary(labels, '相关性')
+    : labels.length ? `相关性：${postFilterSummary(labels, '')}` : '相关性'
   return <DropdownMenu.Root>
     <DropdownMenu.Trigger asChild>
       <button type="button" aria-label={`相关性筛选，${labels.join('、') || '不限'}`} title={labels.join('、') || '相关性'} className={filterTriggerClass(header, labels.length > 0)}>
-        <span className="truncate">{postFilterSummary(labels, '相关性')}</span><ChevronDown className="h-3 w-3 shrink-0" />
+        <span className="truncate">{text}</span><ChevronDown className="h-3 w-3 shrink-0" />
       </button>
     </DropdownMenu.Trigger>
     <DropdownMenu.Portal><DropdownMenu.Content align={header ? 'end' : 'start'} sideOffset={5} collisionPadding={10}
@@ -81,9 +90,28 @@ export function PostIntentBadge({ record }: { record: unknown }) {
   return <StatusPill tone="neutral">{postJudgment(record).intentLabel}</StatusPill>
 }
 
-export function PostRelevanceBadge({ record }: { record: unknown }) {
+/**
+ * 相关性胶囊。默认在胶囊下方另起一行显示置信度；compact 时把置信度并进胶囊，
+ * 供列表等单行场景使用。
+ */
+export function PostRelevanceBadge({ record, compact = false }: { record: unknown; compact?: boolean }) {
   const judgment = postJudgment(record)
-  return <span className="inline-flex flex-col items-start gap-1 whitespace-nowrap" title={judgment.relevanceReason || '打开详情查看判断依据'}><StatusPill tone={judgment.relevanceTone}>{judgment.relevanceLabel}</StatusPill>{(judgment.manual || judgment.relevance) && <span className="text-[10px] leading-4 text-muted-foreground">{judgment.manual ? '人工判断' : judgment.confidence !== null ? `置信度${judgment.confidence}%` : '暂无评分'}</span>}</span>
+  const detail = judgment.manual
+    ? '人工判断'
+    : judgment.relevance
+      ? judgment.confidence !== null ? `置信度${judgment.confidence}%` : '暂无评分'
+      : ''
+  const title = judgment.relevanceReason || '打开详情查看判断依据'
+  if (compact) {
+    const suffix = judgment.manual ? '人工' : judgment.relevance && judgment.confidence !== null ? `${judgment.confidence}%` : ''
+    return (
+      <StatusPill tone={judgment.relevanceTone} className="gap-1" >
+        <span title={title}>{judgment.relevanceLabel}</span>
+        {suffix && <span className="font-medium opacity-70" title={detail}>{suffix}</span>}
+      </StatusPill>
+    )
+  }
+  return <span className="inline-flex flex-col items-start gap-1 whitespace-nowrap" title={title}><StatusPill tone={judgment.relevanceTone}>{judgment.relevanceLabel}</StatusPill>{detail && <span className="text-[10px] leading-4 text-muted-foreground">{detail}</span>}</span>
 }
 
 export function PostJudgmentDetails({ record }: { record: unknown }) {

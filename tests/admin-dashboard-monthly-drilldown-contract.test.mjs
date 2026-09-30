@@ -113,7 +113,7 @@ test('dashboard drill-down presets preserve unknown platform while pending senti
   assert.match(queue, /initial\?\.recentTo/);
   assert.match(queue, /initial\?\.captureKeywords/);
   assert.doesNotMatch(queue, /待标注/);
-  assert.match(queue, /value="unknown">未知平台/);
+  assert.match(queue, /\{ value: 'unknown', label: '未知平台' \}/);
   assert.match(triage, /sentiment === 'pending'/);
   assert.match(triage, /COALESCE\(r\.sentiment, ''\) = ''/);
   assert.match(triage, /platform === 'unknown'/);

@@ -89,9 +89,10 @@ test('handled date filtering stays combined-only and follows initial, clear, sel
   assert.match(queue, /handled: \{ from: initial\?\.handledFrom \|\| '', to: initial\?\.handledTo \|\| '' \}/);
   const selection = queue.match(/const sel = useSelection\([^\n]+/)?.[0];
   assert.ok(selection);
-  assert.match(selection, /useSelection\('triage-selection-session'\)/);
-  assert.match(queue, /<fieldset disabled=\{selectionActive\}/);
-  const cancel = queue.slice(queue.indexOf('const cancelSelection'), queue.indexOf('const exportXlsx'));
+  // 勾选跟着查询走（筛选/翻页/视图变化即清空），不再把整页筛选锁进「多选中」态。
+  assert.match(selection, /useSelection\(`\$\{filterQuery\}\|\$\{pageSize\}\|\$\{pagination\?\.page \?\? 1\}\|\$\{view\}`\)/);
+  assert.doesNotMatch(queue, /<fieldset disabled=\{selectionActive\}/);
+  const cancel = queue.slice(queue.indexOf('const cancelSelection'), queue.indexOf('const refreshList'));
   assert.match(cancel, /sel\.clear\(\)/);
   assert.doesNotMatch(cancel, /\bload\(/);
   const commonFilters = queue.match(/const filterParams = useCallback\(\(\) => \{[\s\S]*?\}, \[[^\]]*\]\)/)?.[0];

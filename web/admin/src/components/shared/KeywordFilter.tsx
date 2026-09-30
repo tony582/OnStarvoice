@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, Search, X } from 'lucide-react'
 import { api } from '@/lib/api'
-import { cn } from '@/lib/utils'
+import { filterTriggerClass } from '@/lib/filter-trigger'
 
 interface KeywordItem { keyword: string; count: number }
 
@@ -18,7 +18,7 @@ export function KeywordFilter({ label = '采集关键词', value, onChange, trig
   const ref = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    api.get<any>('/workspace/keywords').then(d => setItems(d.keywords || [])).catch(() => {})
+    api.get<{ keywords?: KeywordItem[] }>('/workspace/keywords').then(d => setItems(d.keywords || [])).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -29,15 +29,22 @@ export function KeywordFilter({ label = '采集关键词', value, onChange, trig
 
   const toggle = (kw: string) => onChange(value.includes(kw) ? value.filter(k => k !== kw) : [...value, kw])
   const filtered = q ? items.filter(i => i.keyword.toLowerCase().includes(q.toLowerCase())) : items
+  const active = value.length > 0
+  const triggerText = value.length === 1 ? `${label}：${value[0]}` : label
 
   return (
     <div className="relative" ref={ref}>
-      <button type="button" onClick={() => setOpen(o => !o)}
-        className={cn('inline-flex h-10 items-center gap-1 rounded-lg border border-transparent bg-muted px-3 text-[12px] font-medium transition-colors hover:bg-muted/70 lg:h-8 lg:px-2.5',
-          value.length ? 'text-primary' : 'text-muted-foreground', triggerClassName)}>
-        {label}
-        {value.length > 0 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
-        <ChevronDown className="h-3 w-3" />
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        aria-label={`${label}筛选${active ? `，已选 ${value.length} 项` : ''}`}
+        title={active ? value.join('、') : undefined}
+        className={filterTriggerClass(active, triggerClassName)}
+      >
+        <span className="max-w-[180px] truncate">{triggerText}</span>
+        {value.length > 1 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
+        <ChevronDown className="h-3 w-3 shrink-0" />
       </button>
       {open && (
         <div className="responsive-filter-popover absolute left-0 top-full z-50 mt-1 w-60 rounded-xl border border-border bg-card p-2 shadow-lg lg:rounded-lg">

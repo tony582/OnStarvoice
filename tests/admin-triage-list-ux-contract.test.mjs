@@ -19,11 +19,13 @@ function functionBlock(text, name) {
   return text.slice(start, next === -1 ? text.length : next);
 }
 
-test('platform and handling-state pills keep compact stable scan widths', () => {
+test('handling-state pill keeps a compact stable scan width and platform lives in the content meta line', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const feishuControl = source('web/admin/src/components/shared/FeishuTableNumberControl.tsx');
   const copyButton = source('web/admin/src/components/shared/CopyTicketNumberButton.tsx');
-  assert.match(queue, /const PLATFORM_BADGE_CLASS\s*=\s*['"][^'"]*w-14[^'"]*justify-center/);
+  // 平台不再单独占一列：写在作者旁边，表格少一列噪音。
+  assert.doesNotMatch(queue, /PLATFORM_BADGE_CLASS/);
+  assert.match(functionBlock(queue, 'RecordRow'), /platformName\(r\.platform\)/);
   assert.match(queue, /const TRIAGE_MODE_BADGE_CLASS\s*=\s*['"][^'"]*w-\[112px\][^'"]*justify-center[^'"]*overflow-hidden/);
   assert.match(queue, /dark:text-white/);
 
@@ -80,7 +82,7 @@ test('fixed processing cell combines handling state with a direct note action', 
 
   assert.match(header, /sticky right-0 z-50 w-\[208px\] min-w-\[208px\]/);
   assert.match(header, /grid-cols-\[112px_48px\]/);
-  assert.match(header, /label="处理状态"/);
+  assert.match(header, />处理状态</);
   assert.match(header, /sr-only">备注/);
   assert.match(row, /sticky right-0 z-20 w-\[208px\] min-w-\[208px\]/);
   assert.match(row, /<TriageStatusMenu[\s\S]*<InlineRecordProgress record=\{r\} onAdd=\{onAddNote\}/);
@@ -120,7 +122,7 @@ test('empty list keeps filters and the table header usable', () => {
   assert.doesNotMatch(queue, /records\.length === 0 \? \(\s*<EmptyState[\s\S]{0,300}\) : \(\s*<div className="isolate/);
 });
 
-test('toolbar and header filter the nine handling states without ticket filters', () => {
+test('one filter bar carries every content dimension once; the table header only labels and sorts', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const primary = between(queue, 'data-triage-toolbar="primary"', 'data-triage-toolbar="secondary"');
   const secondary = between(queue, 'data-triage-toolbar="secondary"', '{/* Board view */}');
@@ -134,28 +136,78 @@ test('toolbar and header filter the nine handling states without ticket filters'
   assert.match(primary, /aria-pressed=\{viewingWatchlist\}/);
   assert.match(primary, /placeholder="搜索标题、正文、作者…"/);
   assert.match(primary, /title="可搜索标题、正文、作者、飞书表号、账号、平台ID、采集词和标签"/);
-  assert.match(primary, /<MultiSelect label="疑似身份"/);
-  assert.match(primary, /<KeywordFilter/);
-  assert.match(primary, /label="自定义标签"/);
   assert.match(primary, /aria-label="视图模式"/);
+  // 刷新是常驻的小图标按钮，取代原来的说明横幅 + 「刷新结果」大按钮。
+  assert.match(primary, /aria-label="刷新列表"/);
   assert.match(primary, /exportXlsx/);
+  assert.doesNotMatch(queue, /保存后可继续编辑|刷新结果将按当前条件重新查询|上次查询：/);
 
+  // 内容维度的筛选全部收在第二行，各出现一次；平台与内容主题换成和其它筛选一致的 pill 下拉。
   assert.match(secondary, /aria-label="情感筛选"/);
-  assert.match(secondary, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*value=\{triageStatuses\}/);
-  assert.match(secondary, /aria-label="平台筛选"/);
-  assert.doesNotMatch(secondary, /关注状态筛选|未关注/);
-  assert.match(secondary, /<CombinedDateRangeFilter/);
+  assert.match(secondary, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*activeLabel="处理状态"[\s\S]*value=\{triageStatuses\}/);
+  assert.match(secondary, /<SingleSelectFilter label="平台" aria-label="平台筛选" value=\{platform\} options=\{PLATFORM_OPTIONS\} onChange=\{setPlatform\}/);
+  assert.match(secondary, /<SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value=\{contentTopic\} options=\{CONTENT_TOPIC_FILTER_OPTIONS\} onChange=\{setContentTopic\}/);
+  assert.match(secondary, /<MultiSelect label="疑似身份"/);
   assert.match(secondary, /<MultiSelect label="风险信号"/);
-  assert.match(secondary, /xl:grid-cols-\[232px_repeat\(9,minmax\(0,1fr\)\)_58px\]/);
-  for (const [surface, headerProp] of [[secondary, ''], [header, 'header ']]) {
-    assert.ok(surface.includes(`<PostIntentFilter ${headerProp}value={intents} onChange={setIntents}`));
-    assert.ok(surface.includes(`<PostRelevanceFilter ${headerProp}value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences}`));
-  }
+  assert.match(secondary, /<KeywordFilter/);
+  assert.match(secondary, /label="自定义标签"/);
+  assert.match(secondary, /<CombinedDateRangeFilter/);
+  assert.doesNotMatch(secondary, /关注状态筛选|未关注/);
+  assert.ok(secondary.includes('<PostIntentFilter value={intents} onChange={setIntents}'));
+  assert.ok(secondary.includes('<PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences}'));
+  // 等宽网格会把「全部平台」截成「全部平…」；筛选 pill 按内容宽度自然换行。
+  assert.doesNotMatch(secondary, /xl:grid-cols-|<TriageSelect|<select/);
   assert.doesNotMatch(queue, /TicketStatusFilter|工单状态筛选/);
 
-  assert.match(header, /label="平台"[\s\S]*value=\{platform\}[\s\S]*onChange=\{setPlatform\}/);
-  assert.match(header, /label="情感"[\s\S]*value=\{sentiment\}[\s\S]*onChange=\{setSentiment\}/);
-  assert.match(header, /label="处理状态"[\s\S]*value=\{triageStatuses\}[\s\S]*onChange=\{setTriageStatuses\}/);
+  // 表头不再重复放筛选器：只有列名与排序。
+  assert.doesNotMatch(queue, /HeaderSingleFilter|HeaderMultiFilter/);
+  assert.doesNotMatch(header, /<PostIntentFilter|<PostRelevanceFilter|<MultiSelect|onChange=\{setPlatform\}|onChange=\{setSentiment\}|onChange=\{setTriageStatuses\}/);
+  assert.match(header, />处理状态</);
+  assert.match(header, /<SortableTh label="发布时间" field="publish"/);
+});
+
+test('selection is lightweight: no page lock, no banner, cleared when the query changes', () => {
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const batchBar = source('web/admin/src/components/shared/BatchBar.tsx');
+  // 勾选跟着查询走：筛选/翻页/切视图自动清空，不再进入「多选中」锁定态。
+  assert.match(queue, /useSelection\(`\$\{filterQuery\}\|\$\{pageSize\}\|\$\{pagination\?\.page \?\? 1\}\|\$\{view\}`\)/);
+  assert.doesNotMatch(queue, /selectionActive|selectionSession|<fieldset disabled|多选中，已选|取消多选后按筛选更新/);
+  assert.match(queue, /const cancelSelection = \(\) => \{\s+if \(selectionBusy\) return\s+sel\.clear\(\)\s+\}/);
+  // shift 连选：从上一次勾选的行到当前行整段跟随。
+  assert.match(queue, /sel\.setMany\(records\.slice\(start, end \+ 1\)/);
+  assert.match(batchBar, /const setMany = useCallback/);
+  assert.match(batchBar, /onChange: \(event: React\.MouseEvent<HTMLButtonElement>\) => void/);
+  // 已保存但不再符合筛选的行淡显并提示，刷新后移出；不替用户悄悄重排。
+  assert.match(queue, /function recordMatchesFilters\(record: Record<string, unknown>, filters: TriageFilterSnapshot\): boolean/);
+  assert.match(queue, /outOfFilterIds\.has\(String\(r\.id\)\)/);
+  assert.match(queue, /条已修改、不再符合当前筛选，刷新后移出/);
+  assert.match(functionBlock(queue, 'RecordRow'), /outOfFilter && 'opacity-60 hover:opacity-100'/);
+});
+
+test('first load shows skeleton rows while refetches keep the old rows dimmed and unclickable', () => {
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  assert.match(queue, /const showSkeleton = loading && records\.length === 0/);
+  assert.match(queue, /const refreshing = loading && records\.length > 0/);
+  assert.match(queue, /refreshing && 'pointer-events-none opacity-60'/);
+  assert.match(queue, /<SkeletonRows withCheckbox=\{canWrite\(\)\} \/>/);
+  assert.match(queue, /<MobileSkeletonCards \/>/);
+  assert.doesNotMatch(queue, /正在加载内容…/);
+});
+
+test('content topic shows as a chip only when classified and the filter offers an unclassified bucket', () => {
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  const topics = source('web/admin/src/lib/content-topic.ts');
+  const row = functionBlock(queue, 'RecordRow');
+  const mobile = functionBlock(queue, 'MobileRecordCard');
+  const chips = functionBlock(queue, 'RecordTopicChips');
+  assert.match(chips, /contentTopicLabel\(r\.content_topic, ''\)/);
+  assert.match(chips, /r\.category !== 'other'/);
+  assert.match(row, /<RecordTopicChips record=\{r\} \/>/);
+  assert.match(mobile, /<RecordTopicChips record=\{r\} \/>/);
+  assert.doesNotMatch(queue, /主题生成中|内容主题：\{contentTopicLabel/);
+  assert.match(topics, /fallback = '未分类'/);
+  assert.match(topics, /\{ value: 'unclassified', label: '未分类' \}/);
+  assert.match(topics, /\{ value: '', label: '全部内容主题' \}/);
 });
 
 test('search commits once, ignores stale responses, and keeps board filters aligned with list filters', () => {

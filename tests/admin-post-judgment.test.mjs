@@ -119,11 +119,14 @@ test('list, mobile, board and drawer expose intent and relevance with one filter
   const board = source('web/admin/src/pages/workbench/TriageBoard.tsx');
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const header = queue.slice(queue.indexOf('<thead data-sticky-header'), queue.indexOf('</thead>'));
-  assert.ok(header.indexOf('label="情感"') < header.indexOf('<PostIntentFilter header'));
-  assert.ok(header.indexOf('<PostIntentFilter header') < header.indexOf('<PostRelevanceFilter header'));
+  const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* Board view */}'));
+  // 意图与相关性只在筛选栏出现一次（相关性在前）；表头合并成一列「AI 判断」只展示，不再放筛选器。
+  assert.ok(filters.indexOf('aria-label="情感筛选"') < filters.indexOf('<PostRelevanceFilter value={relevances}'));
+  assert.ok(filters.indexOf('<PostRelevanceFilter value={relevances}') < filters.indexOf('<PostIntentFilter value={intents}'));
+  assert.doesNotMatch(header, /<PostIntentFilter|<PostRelevanceFilter/);
+  assert.match(header, />AI 判断</);
   assert.match(queue, /appendPostIntentFilter\(params, intents\)/);
-  assert.match(queue, /useSelection\('triage-selection-session'\)/);
-  assert.match(queue, /<fieldset disabled=\{selectionActive\}/);
+  assert.doesNotMatch(queue, /useSelection\('triage-selection-session'\)|<fieldset disabled=\{selectionActive\}/);
   assert.match(queue, /appendPostRelevanceFilters\(params, relevances, relevanceConfidences\)/);
   assert.match(queue, /<PostRelevanceFilter value=\{relevances\}/);
   assert.match(queue, /setIntents\(\[\]\); setRelevances\(\[\]\); setRelevanceConfidences\(\[\]\)/);
@@ -146,13 +149,17 @@ test('content triage retains two lifecycle tabs and classification evidence is r
   assert.doesNotMatch(component, /<textarea|<select|api\.patch/);
 });
 
-test('opening a drawer allows filters to wrap and keeps their labels horizontal', () => {
+test('filters wrap by content width in every layout and keep their labels horizontal', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const component = source('web/admin/src/components/shared/PostJudgment.tsx');
-  assert.match(queue, /view === 'list' && !drawerRecord && 'xl:grid/);
-  assert.match(queue, /w-full shrink-0 lg:w-\[160px\]/);
-  assert.match(queue, /triggerClassName="w-full shrink-0 justify-between whitespace-nowrap"/);
+  const trigger = source('web/admin/src/lib/filter-trigger.ts');
+  const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* Board view */}'));
+  // 不再按抽屉开关切换等宽网格：筛选 pill 永远按内容宽度排布并自然换行，标签不会被截成「全部平…」。
+  assert.doesNotMatch(queue, /xl:grid-cols-|lg:w-\[160px\]|justify-between whitespace-nowrap/);
+  assert.match(filters, /w-full flex-wrap items-center gap-1\.5/);
+  assert.match(trigger, /shrink-0 items-center gap-1 whitespace-nowrap/);
   assert.match(component, /inline-flex shrink-0 items-center gap-1 whitespace-nowrap/);
+  assert.match(component, /pillTriggerClass\(active\)/);
 });
 
 test('menus use independent unrestricted reset items and positive multiselect choices', () => {

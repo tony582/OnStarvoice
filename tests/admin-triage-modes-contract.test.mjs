@@ -33,7 +33,7 @@ test('content handling exposes exactly the nine customer-maintained states', () 
   const statusMigration = source('server/db/migrations/082_content_negative_comment_status.sql');
 
   const statusSet = between(route, 'const TRIAGE_STATUSES = new Set([', ']);');
-  const queueModes = between(queue, 'const CONTENT_TRIAGE_MODES', 'const PLATFORM_BADGE_CLASS');
+  const queueModes = between(queue, 'const CONTENT_TRIAGE_MODES', 'const TRIAGE_MODE_BADGE_CLASS');
   const boardColumns = between(board, 'const COLUMNS', 'const PER_COL');
   const drawerModes = between(drawer, 'const modeActions', 'const currentModeLabel');
   const constraint = between(statusMigration, 'ADD CONSTRAINT record_triage_status_check', '));');
@@ -60,8 +60,9 @@ test('content status filtering supports selecting multiple states end to end', (
 
   assert.match(queue, /const \[triageStatuses, setTriageStatuses\] = useState<string\[]>/);
   assert.match(queue, /triageStatuses\.forEach\(status => params\.append\('status', status\)\)/);
-  assert.match(queue, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*value=\{triageStatuses\}/);
-  assert.match(queue, /<HeaderMultiFilter[\s\S]*label="处理状态"[\s\S]*value=\{triageStatuses\}/);
+  assert.match(queue, /<MultiSelect[\s\S]*label="全部状态"[\s\S]*activeLabel="处理状态"[\s\S]*value=\{triageStatuses\}/);
+  // 状态筛选只在筛选栏出现一次；表头不再重复放一个筛选器。
+  assert.doesNotMatch(queue, /HeaderMultiFilter/);
   assert.match(route, /function appendStatusFilter/);
   assert.match(route, /= ANY\(\$\$\{params\.length\}::text\[\]\)/);
   assert.equal((route.match(/appendStatusFilter\(where, params, status\)/g) || []).length, 2);

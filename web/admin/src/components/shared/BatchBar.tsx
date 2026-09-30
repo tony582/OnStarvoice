@@ -30,6 +30,18 @@ export function useSelection(resetKey: string) {
     setSelection({ resetKey, ids: checked ? new Set(ids) : new Set() })
   }, [resetKey])
 
+  // 只改动给定的一段 id（shift 连选），其余勾选保持不变。
+  const setMany = useCallback((ids: string[], checked: boolean) => {
+    setSelection(previous => {
+      const next = new Set(previous.resetKey === resetKey ? previous.ids : [])
+      for (const id of ids) {
+        if (checked) next.add(id)
+        else next.delete(id)
+      }
+      return { resetKey, ids: next }
+    })
+  }, [resetKey])
+
   const clear = useCallback(() => {
     setSelection({ resetKey, ids: new Set() })
   }, [resetKey])
@@ -40,15 +52,16 @@ export function useSelection(resetKey: string) {
     has: (id: string) => selected.has(id),
     toggle,
     setAll,
+    setMany,
     clear,
   }
 }
 
-/** 复选框(三态:勾选 / 半选 / 未选)。 */
+/** 复选框(三态:勾选 / 半选 / 未选)。onChange 会带上点击事件，便于 shift 连选。 */
 export function Checkbox({ checked, indeterminate, onChange, className, disabled }: {
   checked: boolean
   indeterminate?: boolean
-  onChange: () => void
+  onChange: (event: React.MouseEvent<HTMLButtonElement>) => void
   className?: string
   disabled?: boolean
 }) {
@@ -58,7 +71,8 @@ export function Checkbox({ checked, indeterminate, onChange, className, disabled
       role="checkbox"
       disabled={disabled}
       aria-checked={indeterminate ? 'mixed' : checked}
-      onClick={e => { e.stopPropagation(); onChange() }}
+      onClick={e => { e.stopPropagation(); onChange(e) }}
+      onMouseDown={e => { if (e.shiftKey) e.preventDefault() }}
       className={cn(
         'flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-[5px] border transition-colors',
         checked || indeterminate

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, CalendarRange, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { filterTriggerClass } from '@/lib/filter-trigger'
 
 function ymd(d: Date) {
   const y = d.getFullYear()
@@ -15,9 +16,13 @@ export type DateRangeValue = { from: string; to: string }
 export type CombinedDateRanges = Record<CombinedDateBasis, DateRangeValue>
 
 const BASIS_FULL: Record<CombinedDateBasis, string> = { publish: '发布时间', recent: '最近采集', first: '首次发现', handled: '处理时间' }
-const BASIS_SHORT: Record<DateBasis, string> = { publish: '发布', recent: '最近', first: '首次' }
+const BASIS_SHORT: Record<CombinedDateBasis, string> = { publish: '发布', recent: '最近', first: '首次', handled: '处理' }
 const BASIS_ORDER: [DateBasis, string][] = [['publish', '发布时间'], ['first', '首次发现'], ['recent', '最近采集']]
 const COMBINED_BASIS_ORDER: [CombinedDateBasis, string][] = [...BASIS_ORDER, ['handled', '处理时间']]
+
+function rangeLabel(value: DateRangeValue) {
+  return `${value.from ? value.from.slice(5) : '…'}~${value.to ? value.to.slice(5) : '…'}`
+}
 
 function DateRangeEditor({ from, to, onChange, onPreset }: {
   from: string
@@ -99,9 +104,8 @@ export function DateRangeFilter({ from, to, onChange, basis, onBasisChange, trig
 
   return (
     <div className="relative" ref={ref}>
-      <button type="button" onClick={() => setOpen(o => !o)}
-        className={cn('inline-flex h-10 items-center gap-1 rounded-lg border border-transparent bg-muted px-3 text-[12px] font-medium transition-colors hover:bg-muted/70 lg:h-8 lg:px-2.5',
-          active ? 'text-primary' : 'text-muted-foreground', triggerClassName)}>
+      <button type="button" onClick={() => setOpen(o => !o)} aria-expanded={open}
+        className={filterTriggerClass(active, triggerClassName)}>
         <CalendarRange className="h-3.5 w-3.5" />
         {label}
         <ChevronDown className="h-3 w-3" />
@@ -130,40 +134,21 @@ export function DateRangeFilter({ from, to, onChange, basis, onBasisChange, trig
   )
 }
 
+const EMPTY_RANGE: DateRangeValue = { from: '', to: '' }
+
 /**
- * 内容分诊用独立日期筛选组。四个日期维度直接展示，各自保留区间；
- * 同时设置多个维度时由服务端按 AND 组合。
+ * 内容分诊的时间筛选：一个「时间」入口，弹层内按维度切换（发布时间 / 首次发现 / 最近采集 / 处理时间），
+ * 每个维度各自保留区间，同时设置多个维度时由服务端按 AND 组合。
+ * 按钮上直接概括当前生效的区间，已设置的维度在页签上带蓝点。
  */
 export function CombinedDateRangeFilter({ value, onChange, triggerClassName }: {
   value: CombinedDateRanges
   onChange: (value: CombinedDateRanges) => void
   triggerClassName?: string
 }) {
-  return (
-    <>
-      {COMBINED_BASIS_ORDER.map(([basis]) => (
-        <IndependentDateRangeFilter
-          key={basis}
-          basis={basis}
-          value={value[basis]}
-          onChange={(from, to) => onChange({ ...value, [basis]: { from, to } })}
-          triggerClassName={triggerClassName}
-        />
-      ))}
-    </>
-  )
-}
-
-function IndependentDateRangeFilter({ basis, value, onChange, triggerClassName }: {
-  basis: CombinedDateBasis
-  value: DateRangeValue
-  onChange: (from: string, to: string) => void
-  triggerClassName?: string
-}) {
   const [open, setOpen] = useState(false)
+  const [basis, setBasis] = useState<CombinedDateBasis>('publish')
   const ref = useRef<HTMLDivElement>(null)
-  const active = Boolean(value.from || value.to)
-  const rangeLabel = `${value.from ? value.from.slice(5) : '…'}~${value.to ? value.to.slice(5) : '…'}`
 
   useEffect(() => {
     const close = (event: MouseEvent) => {
@@ -173,38 +158,88 @@ function IndependentDateRangeFilter({ basis, value, onChange, triggerClassName }
     return () => document.removeEventListener('click', close)
   }, [])
 
+  const activeBases = COMBINED_BASIS_ORDER.filter(([key]) => value[key].from || value[key].to)
+  const active = activeBases.length > 0
+  const summary = active
+    ? `${BASIS_SHORT[activeBases[0][0]]} ${rangeLabel(value[activeBases[0][0]])}${activeBases.length > 1 ? ` +${activeBases.length - 1}` : ''}`
+    : '时间'
+  const fullSummary = activeBases.map(([key, label]) => `${label} ${rangeLabel(value[key])}`).join('；')
+
+  const toggleOpen = () => {
+    // 打开时定位到第一个已设置的维度，方便直接调整。
+    if (!open && activeBases.length) setBasis(activeBases[0][0])
+    setOpen(current => !current)
+  }
+  const setRange = (key: CombinedDateBasis, from: string, to: string) => onChange({ ...value, [key]: { from, to } })
+
   return (
     <div className="relative" ref={ref}>
       <button
         type="button"
-        onClick={() => setOpen(current => !current)}
+        onClick={toggleOpen}
         aria-expanded={open}
-        aria-label={`${BASIS_FULL[basis]}筛选${active ? '，已设置日期范围' : ''}`}
-        title={active ? `${BASIS_FULL[basis]}：${rangeLabel}` : undefined}
-        className={cn(
-          'inline-flex h-10 items-center gap-1 rounded-lg border border-transparent bg-muted px-3 text-[12px] font-medium transition-colors hover:bg-muted/70 lg:h-8 lg:px-2.5',
-          active ? 'text-primary' : 'text-muted-foreground',
-          triggerClassName,
-        )}
+        aria-label={`时间筛选${active ? `，已设置 ${activeBases.length} 个维度` : ''}`}
+        title={active ? fullSummary : '按发布时间、首次发现、最近采集或处理时间筛选'}
+        className={filterTriggerClass(active, triggerClassName)}
       >
-        <span className="whitespace-nowrap">{BASIS_FULL[basis]}</span>
-        <ChevronDown className="h-3 w-3" />
+        <CalendarRange className="h-3.5 w-3.5 shrink-0" />
+        <span className="max-w-[200px] truncate">{summary}</span>
+        <ChevronDown className="h-3 w-3 shrink-0" />
       </button>
       {open && (
-        <div className={cn(
-          'responsive-filter-popover absolute top-full z-50 mt-1.5 w-[264px] rounded-xl border border-border bg-card p-3.5 shadow-lg',
-          basis === 'publish' ? 'left-0' : 'right-0',
-        )}>
+        <div className="responsive-filter-popover absolute left-0 top-full z-50 mt-1.5 w-[308px] rounded-xl border border-border bg-card p-3.5 shadow-lg">
+          <div role="tablist" aria-label="时间维度" className="mb-3 grid grid-cols-4 gap-0.5 rounded-lg bg-muted p-0.5">
+            {COMBINED_BASIS_ORDER.map(([key, label]) => {
+              const set = Boolean(value[key].from || value[key].to)
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  role="tab"
+                  aria-selected={basis === key}
+                  onClick={() => setBasis(key)}
+                  className={cn(
+                    'relative inline-flex h-7 items-center justify-center rounded-md text-[11px] font-medium transition-colors',
+                    basis === key ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {label}
+                  {set && <span aria-hidden className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-primary" />}
+                </button>
+              )
+            })}
+          </div>
           {basis === 'handled' && <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">筛选此期间人工更改过处理状态的帖子。</p>}
-          <DateRangeEditor from={value.from} to={value.to} onChange={onChange} onPreset={() => setOpen(false)} />
+          <DateRangeEditor
+            from={value[basis].from}
+            to={value[basis].to}
+            onChange={(from, to) => setRange(basis, from, to)}
+            onPreset={() => setOpen(false)}
+          />
           {active && (
-            <button
-              type="button"
-              onClick={() => onChange('', '')}
-              className="mt-2.5 flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
-            >
-              <X className="h-3 w-3" />清空日期
-            </button>
+            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-border pt-2.5 text-[11px] text-muted-foreground">
+              {activeBases.map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setRange(key, '', '')}
+                  title={`清空${label}`}
+                  className="inline-flex items-center gap-1 rounded transition-colors hover:text-foreground"
+                >
+                  {label} {rangeLabel(value[key])}
+                  <X className="h-3 w-3" />
+                </button>
+              ))}
+              {activeBases.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => onChange({ publish: EMPTY_RANGE, recent: EMPTY_RANGE, first: EMPTY_RANGE, handled: EMPTY_RANGE })}
+                  className="ml-auto font-medium transition-colors hover:text-foreground"
+                >
+                  清空全部
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}

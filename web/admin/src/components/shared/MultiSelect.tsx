@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChevronDown, Search, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { filterTriggerClass } from '@/lib/filter-trigger'
 
 export interface MultiOption {
   value: string
@@ -10,11 +11,13 @@ export interface MultiOption {
 }
 
 /**
- * 通用多选下拉筛选(固定选项)。外观与 KeywordFilter 一致(bg-muted 按钮 + 计数徽标 + 复选下拉),
+ * 通用多选下拉筛选(固定选项)。外观与 KeywordFilter 一致(灰 pill + 复选下拉),
  * 各列表页统一用它做「风险」等多选筛选。选项写死传入,选中态 string[]。
+ * 只选一项时按钮直接显示「标签：选项」，多选时显示计数，不用点开就知道选了什么。
  */
 export function MultiSelect({
   label,
+  activeLabel,
   options,
   value,
   onChange,
@@ -27,6 +30,8 @@ export function MultiSelect({
   onSearch,
 }: {
   label: string
+  /** 激活后按钮上用的名称（例如未激活显示「全部状态」，激活后显示「处理状态：待处理」）。 */
+  activeLabel?: string
   options: MultiOption[]
   value: string[]
   onChange: (v: string[]) => void
@@ -89,14 +94,27 @@ export function MultiSelect({
     }
   }
 
+  const selectedLabels = options.filter(option => value.includes(option.value)).map(option => option.label)
+  const active = value.length > 0
+  const triggerText = !active
+    ? label
+    : value.length === 1 && selectedLabels[0]
+      ? `${activeLabel || label}：${selectedLabels[0]}`
+      : (activeLabel || label)
+
   return (
     <div className={cn('relative', className)} ref={ref}>
-      <button type="button" onClick={toggleOpen} aria-expanded={open}
-        className={cn('inline-flex h-10 items-center gap-1 rounded-lg border border-transparent bg-muted px-3 text-[12px] font-medium transition-colors hover:bg-muted/70 lg:h-8 lg:px-2.5',
-          value.length ? 'text-primary' : 'text-muted-foreground', triggerClassName)}>
-        {label}
-        {value.length > 0 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
-        <ChevronDown className="h-3 w-3" />
+      <button
+        type="button"
+        onClick={toggleOpen}
+        aria-expanded={open}
+        aria-label={`${activeLabel || label}筛选${active ? `，已选 ${value.length} 项` : ''}`}
+        title={active ? selectedLabels.join('、') || `已选 ${value.length} 项` : undefined}
+        className={filterTriggerClass(active, triggerClassName)}
+      >
+        <span className="max-w-[180px] truncate">{triggerText}</span>
+        {value.length > 1 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
+        <ChevronDown className="h-3 w-3 shrink-0" />
       </button>
       {open && (
         <div

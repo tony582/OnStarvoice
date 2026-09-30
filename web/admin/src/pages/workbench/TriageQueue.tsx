@@ -20,7 +20,6 @@ import {
   RecordDrawer, getCover,
   type ManualRecordFields, type RecordProgressSummary,
 } from '@/components/shared/RecordDrawer'
-import { WorkbenchSelect } from '@/components/shared/Workbench'
 import { KeywordFilter } from '@/components/shared/KeywordFilter'
 import { CombinedDateRangeFilter, type CombinedDateRanges } from '@/components/shared/DateRangeFilter'
 import { MultiSelect } from '@/components/shared/MultiSelect'
@@ -48,14 +47,18 @@ import { useAuth } from '@/lib/auth'
 import { useBadges } from '@/lib/badges'
 import { useNav } from '@/lib/navigation'
 import { recordDisplayTitle } from '@/lib/record-display'
-import { appendPostIntentFilter, appendPostRelevanceFilters, initialPostIntentFilter, normalizePostRelevanceFilter, normalizePostConfidenceFilter } from '@/lib/post-judgment'
+import { appendPostIntentFilter, appendPostRelevanceFilters, initialPostIntentFilter, normalizePostRelevanceFilter, normalizePostConfidenceFilter, postJudgment } from '@/lib/post-judgment'
 import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
 import { readWithBusyRetry } from '@/lib/busy-retry.mjs'
-import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
+import { filterTriggerClass } from '@/lib/filter-trigger'
+import { CONTENT_TOPIC_FILTER_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
 import { PostIntentFilter, PostRelevanceFilter, PostIntentBadge, PostRelevanceBadge } from '@/components/shared/PostJudgment'
 
 interface Pagination { page: number; totalPages: number; total: number }
-type TriageListResponse = { records: Record<string, unknown>[]; pagination?: Pagination }
+// 列表行沿用服务端的宽松字段集合；字段名以 /triage/records 的 SELECT 为准。
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type TriageRecord = { id: string } & Record<string, any>
+type TriageListResponse = { records: TriageRecord[]; pagination?: Pagination }
 interface CustomTagsMutationResponse {
   customTags?: unknown
   custom_tags?: unknown
@@ -106,6 +109,14 @@ const RISK_OPTIONS = [
   { value: 'deleted', label: '已删帖' },
 ]
 const IDENTITY_OPTIONS = [{ value: 'user', label: '用户' }, { value: 'kol', label: 'KOL / KOC' }, { value: 'dealer', label: '4S店' }, { value: 'koe', label: 'KOE' }, { value: 'other', label: '其他' }]
+const PLATFORM_OPTIONS = [
+  { value: '', label: '全部平台' },
+  { value: 'xiaohongshu', label: '小红书' },
+  { value: 'douyin', label: '抖音' },
+  { value: 'weibo', label: '微博' },
+  { value: 'unknown', label: '未知平台' },
+]
+const SENTIMENT_OPTIONS = [['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const
 type TriageMode = 'unhandled' | 'replied' | 'reviewed' | 'reviewed_non_monitor' | 'unavailable' | 'privacy_unreachable' | 'negative_feishu' | 'negative_cold' | 'negative_comment'
 type ArchiveView = 'active' | 'archived'
 const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: React.ElementType }> = [
@@ -119,7 +130,6 @@ const CONTENT_TRIAGE_MODES: Array<{ value: TriageMode; label: string; icon: Reac
   { value: 'negative_cold', label: '负面-冷处理', icon: Bell },
   { value: 'negative_comment', label: '负面-评论区留言', icon: MessageSquareText },
 ]
-const PLATFORM_BADGE_CLASS = 'w-14 justify-center dark:text-white'
 const TRIAGE_MODE_BADGE_CLASS = 'w-[112px] justify-center overflow-hidden dark:text-white'
 const ARCHIVE_VIEWS: Array<{ value: ArchiveView; label: string; icon: React.ElementType }> = [
   { value: 'active', label: '工作中', icon: Inbox },
@@ -142,47 +152,28 @@ function initialDateRanges(initial?: Record<string, string>): CombinedDateRanges
   }
 }
 
-function TriageSelect({ className, disabled, ...props }: React.SelectHTMLAttributes<HTMLSelectElement>) {
-  return (
-    <span className="relative block w-full">
-      <WorkbenchSelect
-        {...props}
-        disabled={disabled}
-        className={cn('w-full appearance-none !pr-8', className)}
-      />
-      <ChevronDown
-        aria-hidden
-        className={cn(
-          'pointer-events-none absolute right-2.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground',
-          disabled && 'opacity-50',
-        )}
-      />
-    </span>
-  )
-}
-
-function HeaderSingleFilter({ label, value, options, onChange }: {
+/* 单选筛选（平台 / 内容主题）：与多选筛选同一套 pill 外观，激活后直接把选中项写在按钮上。 */
+function SingleSelectFilter({ label, value, options, onChange, className, ...props }: {
   label: string
+  'aria-label': string
   value: string
-  options: Array<{ value: string; label: string }>
+  options: ReadonlyArray<{ value: string; label: string }>
   onChange: (value: string) => void
+  className?: string
 }) {
+  const selected = options.find(option => option.value === value)
   const active = Boolean(value)
-  const selectedLabel = options.find(option => option.value === value)?.label
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <button
           type="button"
-          aria-label={`${label}筛选${selectedLabel ? `，当前${selectedLabel}` : ''}`}
-          title={selectedLabel ? `${label}：${selectedLabel}` : `筛选${label}`}
-          className={cn(
-            'inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium uppercase tracking-wider outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary/20',
-            active ? 'text-primary' : 'text-muted-foreground',
-          )}
+          aria-label={props['aria-label']}
+          title={active && selected ? `${label}：${selected.label}` : `筛选${label}`}
+          className={filterTriggerClass(active, className)}
         >
-          <span>{label}</span>
-          <ChevronDown className="h-3 w-3" />
+          <span className="max-w-[180px] truncate">{active && selected ? `${label}：${selected.label}` : label}</span>
+          <ChevronDown className="h-3 w-3 shrink-0" />
         </button>
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
@@ -190,7 +181,7 @@ function HeaderSingleFilter({ label, value, options, onChange }: {
           align="start"
           sideOffset={5}
           collisionPadding={10}
-          className="z-[100] min-w-32 animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg"
+          className="z-[100] min-w-40 animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg"
         >
           <DropdownMenu.RadioGroup
             value={value || '__all__'}
@@ -201,7 +192,7 @@ function HeaderSingleFilter({ label, value, options, onChange }: {
               <DropdownMenu.RadioItem
                 key={option.value || 'all'}
                 value={option.value || '__all__'}
-                className="flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[12px] outline-none transition-colors data-[highlighted]:bg-accent"
+                className="flex min-h-10 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[12px] outline-none transition-colors data-[highlighted]:bg-accent lg:min-h-8"
               >
                 <span className={cn('flex-1', option.value === value && 'font-semibold')}>{option.label}</span>
                 <span className="flex h-4 w-4 items-center justify-center">
@@ -212,71 +203,6 @@ function HeaderSingleFilter({ label, value, options, onChange }: {
               </DropdownMenu.RadioItem>
             ))}
           </DropdownMenu.RadioGroup>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
-  )
-}
-
-function HeaderMultiFilter({ label, value, options, onChange }: {
-  label: string
-  value: string[]
-  options: Array<{ value: string; label: string }>
-  onChange: (value: string[]) => void
-}) {
-  const toggle = (nextValue: string) => onChange(
-    value.includes(nextValue)
-      ? value.filter(item => item !== nextValue)
-      : [...value, nextValue],
-  )
-  return (
-    <DropdownMenu.Root>
-      <DropdownMenu.Trigger asChild>
-        <button
-          type="button"
-          aria-label={`${label}筛选${value.length ? `，已选${value.length}项` : '，全部'}`}
-          className={cn(
-            'inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium uppercase tracking-wider outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary/20',
-            value.length ? 'text-primary' : 'text-muted-foreground',
-          )}
-        >
-          <span>{label}</span>
-          {value.length > 0 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
-          <ChevronDown className="h-3 w-3" />
-        </button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          align="end"
-          sideOffset={5}
-          collisionPadding={10}
-          className="z-[100] min-w-48 animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg"
-        >
-          {value.length > 0 && (
-            <DropdownMenu.Item
-              onSelect={event => { event.preventDefault(); onChange([]) }}
-              className="flex h-8 cursor-default items-center gap-2 rounded-md px-2.5 text-[11px] text-muted-foreground outline-none data-[highlighted]:bg-accent data-[highlighted]:text-foreground"
-            >
-              <X className="h-3 w-3" />清空已选（{value.length}）
-            </DropdownMenu.Item>
-          )}
-          {options.map(option => {
-            const checked = value.includes(option.value)
-            return (
-              <DropdownMenu.CheckboxItem
-                key={option.value}
-                checked={checked}
-                onCheckedChange={() => toggle(option.value)}
-                onSelect={event => event.preventDefault()}
-                className="flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[12px] outline-none transition-colors data-[highlighted]:bg-accent"
-              >
-                <span className={cn('flex-1', checked && 'font-semibold')}>{option.label}</span>
-                <span className="flex h-4 w-4 items-center justify-center rounded border border-border">
-                  <DropdownMenu.ItemIndicator><Check className="h-3 w-3 text-primary" /></DropdownMenu.ItemIndicator>
-                </span>
-              </DropdownMenu.CheckboxItem>
-            )
-          })}
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
@@ -367,6 +293,41 @@ function changedBatchModeIds(data: BatchModeMutationResponse | undefined, reques
   return normalizedRequested.filter(id => !skipped.has(id))
 }
 
+type TriageFilterSnapshot = {
+  archiveView: ArchiveView
+  triageStatuses: string[]
+  sentiment: string
+  watchedFilter: string
+  contentTopic: string
+  customTagIds: string[]
+  intents: string[]
+  relevances: string[]
+  relevanceConfidences: string[]
+}
+
+/**
+ * 保存过的内容留在当前列表里不动（保住位置和勾选）；这里判断它是否还符合当前筛选，
+ * 不符合的行淡显并提示「刷新后移出」，而不是替用户悄悄重排列表。
+ */
+function recordMatchesFilters(record: Record<string, unknown>, filters: TriageFilterSnapshot): boolean {
+  if (record._removedFromContext) return false
+  const archived = Boolean(record.archived_at)
+  if (filters.archiveView === 'active' ? archived : !archived) return false
+  if (filters.triageStatuses.length && !filters.triageStatuses.includes(String(record.triage_status || 'unhandled'))) return false
+  if (filters.sentiment && String(record.sentiment || '') !== filters.sentiment) return false
+  if (filters.watchedFilter === 'watched' && !record.is_watched) return false
+  if (filters.contentTopic) {
+    const topic = String(record.content_topic || '')
+    if (filters.contentTopic === 'unclassified' ? topic !== '' : topic !== filters.contentTopic) return false
+  }
+  if (filters.customTagIds.length && !tagsFromRecord(record).some(tag => filters.customTagIds.includes(tag.id))) return false
+  const judgment = postJudgment(record)
+  if (filters.intents.length && (!judgment.intent || !filters.intents.includes(judgment.intent))) return false
+  if (filters.relevances.length && !filters.relevances.includes(judgment.relevanceFilter)) return false
+  if (filters.relevanceConfidences.length && !filters.relevanceConfidences.includes(judgment.confidenceBand)) return false
+  return true
+}
+
 export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const { canWrite } = useAuth()
   const { refresh: refreshBadges } = useBadges()
@@ -375,7 +336,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [boardNonce, setBoardNonce] = useState(0)
   const [archiveView, setArchiveView] = useState<ArchiveView>(initial?.bucket === 'archived' ? 'archived' : 'active')
   const [sentiment, setSentiment] = useState(initial?.sentiment ?? '')
-  const [contentTopic, setContentTopic] = useState(CONTENT_TOPIC_OPTIONS.some(option => option.value === initial?.contentTopic) ? initial!.contentTopic : '')
+  const [contentTopic, setContentTopic] = useState(CONTENT_TOPIC_FILTER_OPTIONS.some(option => option.value && option.value === initial?.contentTopic) ? initial!.contentTopic : '')
   const [intents, setIntents] = useState<string[]>(() => initialPostIntentFilter(initial?.intent))
   const [relevances, setRelevances] = useState<string[]>(() => normalizePostRelevanceFilter(initial?.relevance))
   const [relevanceConfidences, setRelevanceConfidences] = useState<string[]>(() => normalizePostConfidenceFilter(initial?.relevanceConfidence))
@@ -398,7 +359,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
   // 默认按发布时间倒序(最新在前);表头可点切换发布时间/互动量/首次发现/最近采集、升降序
   const [sort, setSort] = useState<{ field: SortField; dir: 'asc' | 'desc' }>({ field: 'publish', dir: 'desc' })
-  const [records, setRecords] = useState<any[]>([])
+  const [records, setRecords] = useState<TriageRecord[]>([])
   const [pagination, setPagination] = useState<Pagination | null>(null)
   const [pageSize, setPageSize] = useState(30)
   const [jumpPage, setJumpPage] = useState('')
@@ -408,7 +369,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const [noteBusyId, setNoteBusyId] = useState<string | null>(null)
   const [archiveBusyId, setArchiveBusyId] = useState<string | null>(null)
   const [watchBusyId, setWatchBusyId] = useState<string | null>(null)
-  const [drawerRecord, setDrawerRecord] = useState<any>(null)
+  const [drawerRecord, setDrawerRecord] = useState<TriageRecord | null>(null)
   const [drawerInitialTab, setDrawerInitialTab] = useState<'content' | 'history'>('content')
   const [batchBusy, setBatchBusy] = useState(false)
   const [batchTagMode, setBatchTagMode] = useState<BatchCustomTagMode | null>(null)
@@ -419,9 +380,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const listAbort = useRef<AbortController | null>(null)
   // 列表区正显示着当前筛选的结果。用户发起读取时先置否，读成功才置真。
   const listShown = useRef(false)
-  // Keep this page as a working set until the operator explicitly exits selection.
-  const [selectionActive, setSelectionActive] = useState(false)
-  const selectionSession = useRef(false)
+  // 保存过的修改只打在当前列表上：不重查、不重排，行留在原位，直到用户改筛选/翻页/刷新。
   const [savedEdits, setSavedEdits] = useState<Record<string, Record<string, unknown>>>({})
   const editsRevision = useRef(0)
   const editJournal = useRef<Array<{ revision: number; patches: Record<string, Record<string, unknown>> }>>([])
@@ -461,20 +420,26 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return params
   }, [archiveView, triageStatuses, risk, identity, sentiment, contentTopic, intents, relevances, relevanceConfidences, platform, watchedFilter, keyword, sort, captureKeywords, customTagIds, dateRanges])
 
-  const sel = useSelection('triage-selection-session')
+  // 勾选跟着「当前这一页的查询」走：筛选、排序、翻页、切视图都会自动清空勾选，避免带着看不见的幽灵选中去批量处理。
+  const filterQuery = useMemo(() => filterParams().toString(), [filterParams])
+  const sel = useSelection(`${filterQuery}|${pageSize}|${pagination?.page ?? 1}|${view}`)
   const selectionBusy = batchBusy || modeBusyId !== null || archiveBusyId !== null || watchBusyId !== null
-  const beginSelection = () => {
-    if (selectionBusy) return false
-    selectionSession.current = true
-    setSelectionActive(true)
-    listRequestSeq.current += 1
-    listAbort.current?.abort()
-    setLoading(false)
-    return true
+  const lastToggledIndex = useRef<number | null>(null)
+  const toggleSelection = (id: string, index: number, shiftKey = false) => {
+    if (selectionBusy) return
+    const anchor = lastToggledIndex.current
+    if (shiftKey && anchor !== null && anchor !== index) {
+      // shift 连选：从上一次点的那行到这一行，整段跟随本次勾选/取消。
+      const [start, end] = anchor < index ? [anchor, index] : [index, anchor]
+      sel.setMany(records.slice(start, end + 1).map(record => String(record.id)), !sel.has(id))
+    } else {
+      sel.toggle(id)
+    }
+    lastToggledIndex.current = index
   }
-  const toggleSelection = (id: string) => { if (beginSelection()) sel.toggle(id) }
   const toggleAllSelection = (checked: boolean) => {
-    if (beginSelection()) sel.setAll(records.map(record => String(record.id)), checked)
+    if (selectionBusy) return
+    sel.setAll(records.map(record => String(record.id)), checked)
   }
 
   const clearSelectionRef = useRef(sel.clear)
@@ -515,8 +480,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     }
   }), [])
 
-
-
   // 看板与列表使用同一套筛选；看板逐列自行补 status，不能继承列表的状态多选。
   const boardFilterQuery = useMemo(() => {
     const params = filterParams()
@@ -530,7 +493,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   const load = useCallback((page = 1, options?: { silent?: boolean }) => Promise.resolve().then(async () => {
     if (view !== 'list') return
-    if (selectionSession.current) return
     const requestSeq = ++listRequestSeq.current
     const revision = editsRevision.current
     listAbort.current?.abort()
@@ -555,7 +517,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       ), controller)
       let data = await readList()
       const lastPage = Math.max(1, Number(data.pagination?.totalPages) || 1)
-      if (page > lastPage && requestSeq === listRequestSeq.current && !selectionSession.current) {
+      if (page > lastPage && requestSeq === listRequestSeq.current) {
         params.set('page', String(lastPage))
         data = await readList()
       }
@@ -582,10 +544,20 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   const cancelSelection = () => {
     if (selectionBusy) return
-    selectionSession.current = false
-    setSelectionActive(false)
     sel.clear()
   }
+
+  // 手动刷新：列表按当前条件重查（会清掉勾选）；看板丢弃本地补丁后整体重载。
+  const refreshList = () => {
+    if (view === 'board') {
+      setSavedEdits({})
+      editJournal.current = []
+      setBoardNonce(nonce => nonce + 1)
+      return
+    }
+    void load(pagination?.page || 1)
+  }
+  const refreshBusy = loading || batchBusy || Boolean(modeBusyId || archiveBusyId || noteBusyId || watchBusyId)
 
   const exportXlsx = async () => {
     setExporting(true)
@@ -596,7 +568,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
 
   // 点表头排序:点未激活列 → 该列降序;再点已激活列 → 升/降序切换
   const toggleSort = (field: SortField) => {
-    if (selectionSession.current) return
     setSort(s => s.field === field ? { field, dir: s.dir === 'desc' ? 'asc' : 'desc' } : { field, dir: 'desc' })
   }
 
@@ -615,12 +586,11 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }
   // 输入框只维护草稿，停顿后才提交搜索；回车只提前提交，不再额外发第二次请求。
   useEffect(() => {
-    if (selectionActive) return
     const nextKeyword = keywordDraft.trim()
     if (nextKeyword === keyword) return
     const timeoutId = window.setTimeout(() => setKeyword(nextKeyword), 400)
     return () => window.clearTimeout(timeoutId)
-  }, [keywordDraft, keyword, selectionActive])
+  }, [keywordDraft, keyword])
   useEffect(() => {
     void load()
     return () => { listRequestSeq.current += 1; listAbort.current?.abort() }
@@ -640,7 +610,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     await api.post('/feedback/false-positive', { recordId, reason })
     setRecords(current => current.map(record =>
       record.id === recordId ? { ...record, false_positive_pending: true } : record))
-    setDrawerRecord((current: Record<string, unknown> | null) =>
+    setDrawerRecord((current: TriageRecord | null) =>
       current?.id === recordId ? { ...current, false_positive_pending: true } : current)
     refreshBadges()
     return true
@@ -768,12 +738,12 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     customTagRequestSeq.current += 1
     setCustomTagCatalog(current => current.filter(item => item.id !== deletedId))
     setCustomTagIds(current => current.filter(id => id !== deletedId))
-    const withoutDeletedTag = (record: Record<string, unknown>) => withCustomTags(
+    const withoutDeletedTag = (record: TriageRecord) => withCustomTags(
       record,
       tagsFromRecord(record).filter(item => item.id !== deletedId),
     )
     setRecords(current => current.map(record => withoutDeletedTag(record)))
-    setDrawerRecord((current: Record<string, unknown> | null) => current ? withoutDeletedTag(current) : current)
+    setDrawerRecord((current: TriageRecord | null) => current ? withoutDeletedTag(current) : current)
     showBatchFeedback(
       affectedRecords > 0
         ? `标签“${String(data.tag?.name || tag.name)}”已删除，并已从 ${affectedRecords.toLocaleString('zh-CN')} 条内容中移除`
@@ -783,7 +753,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     return affectedRecords
   }
 
-  const addRecordNote = useCallback(async (record: any): Promise<boolean> => {
+  const addRecordNote = useCallback(async (record: TriageRecord): Promise<boolean> => {
     if (archiveView === 'archived' || record.archived_at || noteBusyId) return false
     const body = await ask({
       title: '填写备注',
@@ -805,7 +775,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         createdAt: String(note.created_at || new Date().toISOString()),
         eventType: 'note',
       }
-      const applyProgress = (item: any) => ({
+      const applyProgress = (item: TriageRecord) => ({
         progress_count: Number(item.progress_count || 0) + 1,
         progress_latest_body: progress.body,
         progress_latest_author: progress.authorName,
@@ -825,7 +795,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   }, [archiveView, ask, noteBusyId, showBatchFeedback, applySavedEdits])
 
   const saveFeishuTableNo = useCallback(async (
-    record: any,
+    record: TriageRecord,
     value: string,
   ): Promise<FeishuTableNumberSaveResult> => {
     const feishuTableNo = value.trim()
@@ -897,7 +867,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     }
   }, [archiveBusyId, archiveView, modeBusyId, refreshBadges, showBatchFeedback, syncModeLocally])
 
-  const changeRecordMode = async (record: any, newStatus: TriageMode): Promise<boolean> => {
+  const changeRecordMode = async (record: TriageRecord, newStatus: TriageMode): Promise<boolean> => {
     if (archiveView === 'archived' || modeBusyId || archiveBusyId) return false
     const currentStatus = String(record.triage_status || 'unhandled')
     if (currentStatus === newStatus) return false
@@ -960,7 +930,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const syncArchiveLocally = useCallback((ids: Iterable<string>) => {
     const changed = new Set([...ids].map(id => String(id).toLowerCase()))
     setRecords(current => current.filter(record => !changed.has(String(record.id).toLowerCase())))
-    setDrawerRecord((current: any) => current && changed.has(String(current.id).toLowerCase()) ? null : current)
+    setDrawerRecord((current: TriageRecord | null) => current && changed.has(String(current.id).toLowerCase()) ? null : current)
     applySavedEdits(Object.fromEntries([...changed].map(id => [id, { _removedFromContext: true }])))
     sel.setAll([...sel.selected].filter(id => !changed.has(id.toLowerCase())), true)
   }, [applySavedEdits, sel])
@@ -1065,14 +1035,26 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     })
   }
 
-  const interactions = (r: any) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0)
+  const interactions = (r: TriageRecord) => Number(r.likes || 0) + Number(r.comments_count || 0) + Number(r.collects || 0) + Number(r.shares || 0)
   const allChecked = records.length > 0 && records.every(r => sel.has(r.id))
   const someChecked = records.some(r => sel.has(r.id))
   const contentStatusOptions: Array<[string, string]> = CONTENT_TRIAGE_MODES.map(mode => [mode.value, mode.label])
 
-  const narrow = false
+  // 已保存但不再符合当前筛选的行：淡显 + 提示，刷新后才移出。
+  const filterSnapshot = useMemo<TriageFilterSnapshot>(() => ({
+    archiveView, triageStatuses, sentiment, watchedFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences,
+  }), [archiveView, triageStatuses, sentiment, watchedFilter, contentTopic, customTagIds, intents, relevances, relevanceConfidences])
+  const outOfFilterIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const record of records) {
+      const id = String(record.id)
+      if (savedEdits[id.toLowerCase()] && !recordMatchesFilters(record, filterSnapshot)) ids.add(id)
+    }
+    return ids
+  }, [records, savedEdits, filterSnapshot])
+
   const drawerArchived = Boolean(drawerRecord?.archived_at)
-  const openDrawer = (record: any, initialTab: 'content' | 'history' = 'content') => {
+  const openDrawer = (record: TriageRecord, initialTab: 'content' | 'history' = 'content') => {
     setDrawerInitialTab(initialTab)
     setDrawerRecord(record)
   }
@@ -1099,7 +1081,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
     initialTab: drawerInitialTab,
     onProgressAdded: (progress: RecordProgressSummary) => {
       const recordId = drawerRecord.id
-      const applyProgress = (record: any) => ({
+      const applyProgress = (record: TriageRecord) => ({
         progress_count: Number(record.progress_count || 0) + 1,
         progress_latest_body: progress.body,
         progress_latest_author: progress.authorName,
@@ -1111,7 +1093,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   } : null
 
   const goToPage = (requestedPage: number) => {
-    if (selectionSession.current) return
     if (!pagination) return
     const totalPages = Math.max(1, pagination.totalPages)
     const targetPage = Math.min(totalPages, Math.max(1, Math.trunc(requestedPage)))
@@ -1139,11 +1120,14 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       ? archiveView === 'archived' ? '已归档的关注清单暂无内容' : '关注清单暂无内容'
       : archiveView === 'archived' ? '暂无已归档内容' : '暂无记录'
   const emptyDescription = hasActiveFilters
-    ? '调整表头筛选或清空筛选条件后重试'
+    ? '调整筛选条件或清空筛选后重试'
     : viewingWatchlist
       ? archiveView === 'archived' ? '已关注内容归档后会保留在这里' : '点击内容旁的星标即可加入关注清单'
       : archiveView === 'archived' ? '客户主动归档的内容会显示在这里' : '暂无可处理内容'
   const EmptyIcon = hasActiveFilters ? Search : viewingWatchlist ? Star : archiveView === 'archived' ? Archive : Inbox
+  // 首次读取（没有可保留的旧结果）用骨架屏；条件变化时保留旧列表淡显并顶部走进度条，避免整页闪成加载态。
+  const showSkeleton = loading && records.length === 0
+  const refreshing = loading && records.length > 0
 
   return (
     <div className={cn('space-y-3', view === 'list' && 'lg:w-max lg:min-w-full')}>
@@ -1174,12 +1158,8 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </button>
         </div>
       )}
-      {selectionActive && <div role="status" className="sticky left-0 flex flex-wrap items-center gap-3 rounded-lg border border-primary/20 bg-accent px-3 py-2 text-xs lg:w-[calc(100cqw-3rem)]">
-        <span className="flex-1">多选中，已选 {sel.count} 条。修改后保留当前列表和勾选；取消多选只取消勾选；点击“刷新结果”后按筛选更新。</span>
-        <Button size="sm" variant="outline" disabled={selectionBusy} onClick={cancelSelection}><X className="h-3.5 w-3.5" />取消多选</Button>
-      </div>}
-      <fieldset disabled={selectionActive} className="sticky left-0 z-30 min-w-0 !mb-0 space-y-2 border-b border-border/60 bg-background pb-3 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
-        <div data-triage-toolbar="primary" className="flex flex-wrap items-center gap-2 lg:gap-1 2xl:gap-2">
+      <div className="sticky left-0 z-30 min-w-0 space-y-2 border-b border-border/60 bg-background pb-3 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
+        <div data-triage-toolbar="primary" className="flex flex-wrap items-center gap-2">
           <div className="inline-flex h-10 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:h-8" role="tablist" aria-label="内容生命周期">
             {ARCHIVE_VIEWS.map(item => {
               const Icon = item.icon
@@ -1207,7 +1187,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             })}
           </div>
 
-          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[96px] lg:max-w-[320px] lg:flex-1">
+          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[220px] lg:max-w-[380px] lg:flex-1">
             <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input value={keywordDraft} onChange={e => setKeywordDraft(e.target.value)}
@@ -1241,68 +1221,34 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             </button>
           </div>
 
-          <div className="hidden w-[128px] shrink-0 lg:block">
-            <TriageSelect value={contentTopic} onChange={e => setContentTopic(e.target.value)} aria-label="内容主题筛选" className={cn('bg-muted font-medium hover:bg-muted/70', contentTopic ? 'text-primary' : 'text-muted-foreground')}>
-              <option value="">全部内容主题</option>
-              {CONTENT_TOPIC_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </TriageSelect>
-          </div>
-
-          <div className="hidden shrink-0 lg:block">
-            <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} />
-          </div>
-
-          <div className="hidden shrink-0 lg:block">
-            <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
-          </div>
-
-          <div className="hidden shrink-0 lg:block">
-            <MultiSelect
-              label="自定义标签"
-              options={customTagCatalog.map(tag => ({
-                value: tag.id,
-                label: tag.name,
-                count: tag.usageCount,
-              }))}
-              value={customTagIds}
-              onChange={setCustomTagIds}
-              width="w-64"
-              searchable
-              searchPlaceholder="搜索自定义标签…"
-              emptyText="暂无自定义标签"
-              onSearch={loadCustomTagCatalog}
-            />
-          </div>
-
-          {archiveView === 'active' && (
-            <div className="hidden h-8 shrink-0 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:inline-flex" role="group" aria-label="视图模式">
-              {([['list', '列表', Rows3], ['board', '看板', Kanban]] as const).map(([value, label, Icon]) => (
-                <button
-                  key={value}
-                  type="button"
-                  aria-pressed={view === value}
-                  onClick={() => {
-                    setView(value)
-                    if (value === 'board') {
-                      setWatchedFilter('')
-                      setTriageStatuses([])
-                      setSort({ field: 'publish', dir: 'desc' })
-                    }
-                  }}
-                  className={cn(
-                    'inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-semibold transition-colors',
-                    view === value
-                      ? 'bg-card text-foreground shadow-sm ring-1 ring-border/80'
-                      : 'text-muted-foreground hover:bg-card/60 hover:text-foreground',
-                  )}
-                >
-                  <Icon className="h-3.5 w-3.5" />{label}
-                </button>
-              ))}
-            </div>
-          )}
-
-          <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1">
+          <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1.5">
+            {archiveView === 'active' && (
+              <div className="hidden h-8 shrink-0 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:inline-flex" role="group" aria-label="视图模式">
+                {([['list', '列表', Rows3], ['board', '看板', Kanban]] as const).map(([value, label, Icon]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    aria-pressed={view === value}
+                    onClick={() => {
+                      setView(value)
+                      if (value === 'board') {
+                        setWatchedFilter('')
+                        setTriageStatuses([])
+                        setSort({ field: 'publish', dir: 'desc' })
+                      }
+                    }}
+                    className={cn(
+                      'inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-semibold transition-colors',
+                      view === value
+                        ? 'bg-card text-foreground shadow-sm ring-1 ring-border/80'
+                        : 'text-muted-foreground hover:bg-card/60 hover:text-foreground',
+                    )}
+                  >
+                    <Icon className="h-3.5 w-3.5" />{label}
+                  </button>
+                ))}
+              </div>
+            )}
             {view === 'list' && (
               <>
                 <Button
@@ -1323,6 +1269,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 </Button>
               </>
             )}
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-10 w-10 lg:h-8 lg:w-8"
+              aria-label="刷新列表"
+              title={view === 'board' ? '重新加载看板' : '按当前条件重新查询列表'}
+              disabled={refreshBusy}
+              onClick={refreshList}
+            >
+              <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+            </Button>
           </div>
         </div>
 
@@ -1331,105 +1288,70 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           aria-label="内容筛选"
           data-triage-toolbar="secondary"
           className={cn(
-            'w-full flex-wrap items-center gap-2 rounded-xl bg-muted/30 p-3',
+            'w-full flex-wrap items-center gap-1.5 rounded-xl bg-muted/30 p-3',
             mobileFiltersOpen ? 'flex' : 'hidden',
             'lg:flex lg:min-h-8 lg:rounded-none lg:bg-transparent lg:p-0',
-            view === 'list' && !drawerRecord && 'xl:grid xl:grid-cols-[232px_repeat(9,minmax(0,1fr))_58px]',
           )}
         >
-          <div className="contents lg:hidden">
-            <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} />
-            <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} />
-            <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
-            <MultiSelect
-              label="自定义标签"
-              options={customTagCatalog.map(tag => ({ value: tag.id, label: tag.name, count: tag.usageCount }))}
-              value={customTagIds}
-              onChange={setCustomTagIds}
-              width="w-64"
-              searchable
-              searchPlaceholder="搜索自定义标签…"
-              emptyText="暂无自定义标签"
-              onSearch={loadCustomTagCatalog}
-            />
-          </div>
-
-          <div role="group" aria-label="情感筛选" className={cn('mobile-table-scroll inline-flex h-10 max-w-full shrink-0 items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8', !drawerRecord && 'xl:w-full')}>
-            {([['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const).map(([value, label]) => (
+          <div role="group" aria-label="情感筛选" className="mobile-table-scroll inline-flex h-10 max-w-full shrink-0 items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8">
+            {SENTIMENT_OPTIONS.map(([value, label]) => (
               <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
-                className={cn('inline-flex h-9 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-2.5 text-[12px] font-medium transition-colors lg:h-7 xl:flex-1 xl:px-2',
+                className={cn('inline-flex h-9 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-2.5 text-[12px] font-medium transition-colors lg:h-7',
                   sentiment === value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
                 {label}
               </button>
             ))}
           </div>
 
-          <PostIntentFilter value={intents} onChange={setIntents} />
-          <div className="lg:hidden">
-          <TriageSelect value={contentTopic} onChange={e => setContentTopic(e.target.value)} aria-label="内容主题筛选" className={cn('bg-muted font-medium hover:bg-muted/70', contentTopic ? 'text-primary' : 'text-muted-foreground')}>
-            <option value="">全部内容主题</option>
-            {CONTENT_TOPIC_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-          </TriageSelect>
-          </div>
-          <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} />
-
           {view === 'list' && (
-            <div className={cn('w-full shrink-0 lg:w-[160px]', !drawerRecord && 'xl:w-full')}>
-              <MultiSelect
-                label="全部状态"
-                options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
-                value={triageStatuses}
-                onChange={setTriageStatuses}
-                triggerClassName="w-full shrink-0 justify-between whitespace-nowrap"
-              />
-            </div>
+            <MultiSelect
+              label="全部状态"
+              activeLabel="处理状态"
+              options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
+              value={triageStatuses}
+              onChange={setTriageStatuses}
+              width="w-56"
+            />
           )}
+          <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} />
+          <PostIntentFilter value={intents} onChange={setIntents} />
+          <SingleSelectFilter label="平台" aria-label="平台筛选" value={platform} options={PLATFORM_OPTIONS} onChange={setPlatform} />
+          <SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value={contentTopic} options={CONTENT_TOPIC_FILTER_OPTIONS} onChange={setContentTopic} />
+          <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} />
+          <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} />
+          <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} />
+          <MultiSelect
+            label="自定义标签"
+            options={customTagCatalog.map(tag => ({
+              value: tag.id,
+              label: tag.name,
+              count: tag.usageCount,
+            }))}
+            value={customTagIds}
+            onChange={setCustomTagIds}
+            width="w-64"
+            searchable
+            searchPlaceholder="搜索自定义标签…"
+            emptyText="暂无自定义标签"
+            onSearch={loadCustomTagCatalog}
+          />
+          <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} />
 
-          <div className={cn('w-full shrink-0 lg:w-[108px]', !drawerRecord && 'xl:w-full')}>
-            <TriageSelect value={platform} onChange={e => setPlatform(e.target.value)}
-              aria-label="平台筛选"
-              className={cn('bg-muted font-medium hover:bg-muted/70', platform ? 'text-foreground' : 'text-muted-foreground')}>
-              <option value="">全部平台</option>
-              <option value="xiaohongshu">小红书</option>
-              <option value="douyin">抖音</option>
-              <option value="weibo">微博</option>
-              <option value="unknown">未知平台</option>
-            </TriageSelect>
-          </div>
-
-          <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} triggerClassName={cn('w-full shrink-0 justify-between whitespace-nowrap lg:!w-[82px] lg:!px-2', !drawerRecord && 'xl:!w-full')} />
-          <div className="hidden shrink-0 lg:block">
-            <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} triggerClassName="shrink-0 whitespace-nowrap xl:w-full xl:justify-between" />
-          </div>
-
-          <button
-            type="button"
-            onClick={clearFilters}
-            disabled={!hasActiveFilters}
-            title={hasActiveFilters ? '清空所有筛选与排序' : '暂无筛选或自定义排序'}
-            aria-label={hasActiveFilters ? `清空全部 ${activeFilterCount} 项筛选与排序` : '清空筛选与排序，当前无活动条件'}
-            className="inline-flex h-10 w-[58px] shrink-0 items-center justify-center gap-1 rounded-lg text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:text-muted-foreground/35 disabled:hover:bg-transparent lg:h-8"
-          >
-            <X className="h-3.5 w-3.5" />清空
-          </button>
+          {hasActiveFilters && (
+            <button
+              type="button"
+              onClick={clearFilters}
+              title="清空所有筛选与排序"
+              aria-label={`清空全部 ${activeFilterCount} 项筛选与排序`}
+              className="inline-flex h-10 shrink-0 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:h-8"
+            >
+              <X className="h-3.5 w-3.5" />清空
+              <span className="rounded bg-muted px-1 text-[10px] font-semibold tabular-nums">{activeFilterCount}</span>
+            </button>
+          )}
         </div>
-      </fieldset>
-
-
-      <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
-        <span>{Object.keys(savedEdits).length > 0
-          ? '修改已保存，当前内容和位置已保留；刷新后按最新条件显示。数量为上次查询结果，导出按最新筛选条件生成。'
-          : '保存后可继续编辑；刷新结果将按当前条件重新查询。'}</span>
-        <Button variant="outline" size="sm" disabled={loading || batchBusy || Boolean(modeBusyId || archiveBusyId || noteBusyId || watchBusyId)}
-          onClick={() => {
-            selectionSession.current = false
-            setSelectionActive(false)
-            sel.clear()
-            if (view === 'board') { setSavedEdits({}); editJournal.current = [] }
-            else void load(pagination?.page || 1)
-            setBoardNonce(n => n + 1)
-          }}>刷新结果</Button>
       </div>
+
       {/* Board view */}
       {view === 'board' ? (
         <TriageBoard
@@ -1442,11 +1364,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           onSaveFeishuTableNo={(record, value) => saveFeishuTableNo(record, value)}
           refreshBadges={refreshBadges}
         />
-      ) : loading ? (
-        <div role="status" className="flex items-center justify-center gap-2 py-16">
-          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-          <span className="text-sm text-muted-foreground">正在加载内容…</span>
-        </div>
       ) : listError ? (
         <div role="alert" className="flex flex-col items-center gap-3 rounded-xl border border-destructive/20 bg-card px-5 py-10 text-center">
           <AlertCircle className="h-6 w-6 text-destructive" />
@@ -1456,17 +1373,19 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
         </div>
       ) : (
         <div className="isolate overflow-visible rounded-xl bg-card lg:-mx-6 lg:rounded-none">
-          <div className="divide-y divide-border/50 lg:hidden">
-            {records.length === 0 ? (
+          <div className={cn('divide-y divide-border/50 lg:hidden', refreshing && 'pointer-events-none opacity-60')} aria-busy={loading || undefined}>
+            {showSkeleton ? (
+              <MobileSkeletonCards />
+            ) : records.length === 0 ? (
               <EmptyState icon={EmptyIcon} title={emptyTitle} description={emptyDescription} />
-            ) : records.map(r => (
+            ) : records.map((r, index) => (
               <MobileRecordCard
                 key={r.id}
                 record={r}
                 canWrite={canWrite()}
                 selected={sel.has(r.id)}
-                  retained={Boolean(savedEdits[String(r.id).toLowerCase()])}
-                onToggle={() => toggleSelection(r.id)}
+                outOfFilter={outOfFilterIds.has(String(r.id))}
+                onToggle={event => toggleSelection(r.id, index, event?.shiftKey)}
                 onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
                 onSaveFeishuTableNo={(value: string) => saveFeishuTableNo(r, value)}
                 modeBusy={modeBusyId === r.id}
@@ -1487,87 +1406,58 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             data-triage-table-scroll
             className="relative hidden lg:block"
           >
-          <table className="w-full min-w-[1240px] text-sm xl:min-w-full">
-            <thead data-sticky-header className="sticky top-0 z-40 bg-card [&_th]:!h-12 [&_th]:!py-0">
-              <tr className="h-12 border-b border-border/60 [&>th]:whitespace-nowrap">
+          {refreshing && <div aria-hidden className="skeleton absolute inset-x-0 top-0 z-[45] h-0.5 rounded-none" />}
+          <table
+            aria-busy={loading || undefined}
+            className={cn('w-full min-w-[1240px] text-sm xl:min-w-full transition-opacity', refreshing && 'pointer-events-none opacity-60')}
+          >
+            <thead data-sticky-header className="sticky top-0 z-40 bg-card [&_th]:!h-11 [&_th]:!py-0">
+              <tr className="h-11 border-b border-border/60 [&>th]:whitespace-nowrap">
                 {canWrite() && (
                   <th className="w-8 pl-3 pr-0">
-                    <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} disabled={selectionBusy} onChange={() => toggleAllSelection(!allChecked)} />
+                    <Checkbox checked={allChecked} indeterminate={!allChecked && someChecked} disabled={selectionBusy || records.length === 0} onChange={() => toggleAllSelection(!allChecked)} />
                   </th>
                 )}
-                <th inert={selectionActive || undefined} className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
-                {!narrow && (
-                  <th inert={selectionActive || undefined} className="px-1.5 text-left">
-                    <HeaderSingleFilter
-                      label="平台"
-                      value={platform}
-                      onChange={setPlatform}
-                      options={[
-                        { value: '', label: '全部平台' },
-                        { value: 'xiaohongshu', label: '小红书' },
-                        { value: 'douyin', label: '抖音' },
-                        { value: 'weibo', label: '微博' },
-                        { value: 'unknown', label: '未知平台' },
-                      ]}
-                    />
-                  </th>
-                )}
-                <th inert={selectionActive || undefined} className="px-1.5 text-left">
-                  <HeaderSingleFilter
-                    label="情感"
-                    value={sentiment}
-                    onChange={setSentiment}
-                    options={[
-                      { value: '', label: '全部情感' },
-                      { value: 'negative', label: '负面' },
-                      { value: 'neutral', label: '中性' },
-                      { value: 'positive', label: '正面' },
-                    ]}
-                  />
+                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
+                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
+                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  <span className="inline-flex items-center gap-1">AI 判断<span className="normal-case tracking-normal text-muted-foreground/60">意图 · 相关性</span></span>
                 </th>
-                <th inert={selectionActive || undefined} className="px-1.5 text-left"><PostIntentFilter header value={intents} onChange={setIntents} /></th>
-                <th inert={selectionActive || undefined} className="px-1.5 text-left"><PostRelevanceFilter header value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} /></th>
-                {!narrow && <th inert={selectionActive || undefined} className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>}
-                {!narrow && <th inert={selectionActive || undefined} className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>}
-                {!narrow && <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} disabled={selectionActive} align="right" />}
-                {!narrow && <SortableTh label="评论" field="comments" sort={sort} onSort={toggleSort} disabled={selectionActive} align="right" />}
-                {!narrow && <SortableTh label="点赞" field="likes" sort={sort} onSort={toggleSort} disabled={selectionActive} align="right" />}
-                {!narrow && <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} disabled={selectionActive} className="hidden lg:table-cell" />}
-                {!narrow && <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} disabled={selectionActive} className="hidden xl:table-cell" />}
-                {!narrow && <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} disabled={selectionActive} className="hidden xl:table-cell" />}
-                {!narrow && <th inert={selectionActive || undefined} className="hidden whitespace-nowrap px-3 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>}
-                <th inert={selectionActive || undefined} className="sticky right-0 z-50 w-[208px] min-w-[208px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
+                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>
+                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>
+                <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />
+                <SortableTh label="评论" field="comments" sort={sort} onSort={toggleSort} align="right" />
+                <SortableTh label="点赞" field="likes" sort={sort} onSort={toggleSort} align="right" />
+                <SortableTh label="发布时间" field="publish" sort={sort} onSort={toggleSort} className="hidden lg:table-cell" />
+                <SortableTh label="首次发现" field="first_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />
+                <SortableTh label="最近采集" field="last_seen" sort={sort} onSort={toggleSort} className="hidden xl:table-cell" />
+                <th className="hidden whitespace-nowrap px-3 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>
+                <th className="sticky right-0 z-50 w-[208px] min-w-[208px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
                   <div className="grid grid-cols-[112px_48px] items-center gap-2">
-                    <div className="flex justify-center">
-                      <HeaderMultiFilter
-                        label="处理状态"
-                        value={triageStatuses}
-                        onChange={setTriageStatuses}
-                        options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
-                      />
-                    </div>
+                    <span className="text-center text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处理状态</span>
                     <span className="sr-only">备注</span>
                   </div>
                 </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border/40">
-              {records.length === 0 ? (
+              {showSkeleton ? (
+                <SkeletonRows withCheckbox={canWrite()} />
+              ) : records.length === 0 ? (
                 <tr>
                   <td colSpan={20} className="h-[280px]">
                     <EmptyState icon={EmptyIcon} title={emptyTitle} description={emptyDescription} />
                   </td>
                 </tr>
-              ) : records.map(r => (
+              ) : records.map((r, index) => (
                 <RecordRow
                   key={r.id}
                   record={r}
                   canWrite={canWrite()}
-                  narrow={narrow}
                   open={drawerRecord?.id === r.id}
                   selected={sel.has(r.id)}
-                  retained={Boolean(savedEdits[String(r.id).toLowerCase()])}
-                  onToggle={() => toggleSelection(r.id)}
+                  outOfFilter={outOfFilterIds.has(String(r.id))}
+                  onToggle={event => toggleSelection(r.id, index, event?.shiftKey)}
                   onAddNote={() => addRecordNote(r)}
                   noteBusy={noteBusyId === r.id}
                   onChangeMode={(nextStatus: TriageMode) => changeRecordMode(r, nextStatus)}
@@ -1588,10 +1478,23 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           {pagination && (
-            <fieldset disabled={selectionActive} className="min-w-0 flex flex-col gap-3 border-t border-border/50 px-4 py-3 xl:flex-row xl:items-center xl:justify-between">
-              <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                {Object.keys(savedEdits).length > 0 ? '上次查询：' : ''}第 {formatNumber(pageStart)}–{formatNumber(pageEnd)} 条，共 {formatNumber(pagination.total)} 条
-              </span>
+            <div className="min-w-0 flex flex-col gap-3 border-t border-border/50 px-4 py-3 xl:flex-row xl:items-center xl:justify-between">
+              <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span className="shrink-0 tabular-nums">
+                  第 {formatNumber(pageStart)}–{formatNumber(pageEnd)} 条，共 {formatNumber(pagination.total)} 条
+                </span>
+                {outOfFilterIds.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={refreshList}
+                    disabled={refreshBusy}
+                    className="inline-flex items-center gap-1 font-medium text-amber-700 transition-colors hover:text-amber-800 disabled:opacity-60 dark:text-amber-300"
+                  >
+                    <RefreshCw className="h-3 w-3" />
+                    {outOfFilterIds.size} 条已修改、不再符合当前筛选，刷新后移出
+                  </button>
+                )}
+              </div>
               <div className="flex flex-wrap items-center gap-2 xl:justify-end">
                 <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
                   每页
@@ -1676,7 +1579,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   </Button>
                 </div>
               </div>
-            </fieldset>
+            </div>
           )}
         </div>
       )}
@@ -1704,16 +1607,13 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             { key: 'custom_tags_remove', label: '移除标签', icon: Tags, tone: 'danger' },
           ]}
           menus={[
-            {
-              key: 'patrol',
-              label: '创建巡查',
-              icon: Radar,
-              tone: 'primary',
-              actions: [
-                { key: 'create_negative_patrol', label: '负面巡查', icon: ShieldAlert },
-                { key: 'create_watched_patrol', label: '关注巡查', icon: Star },
-              ],
-            },
+            ...(archiveView === 'archived' ? [] : [{
+              key: 'triage-state',
+              label: '处理状态',
+              icon: CheckCircle,
+              tone: 'primary' as const,
+              actions: CONTENT_TRIAGE_MODES.map(mode => ({ key: mode.value, label: mode.label, icon: mode.icon })),
+            }]),
             {
               key: 'watch-state',
               label: '关注状态',
@@ -1723,12 +1623,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 { key: 'unwatch', label: '取消关注', icon: Star },
               ],
             },
-            ...(archiveView === 'archived' ? [] : [{
-              key: 'triage-state',
-              label: '处理状态',
-              icon: CheckCircle,
-              actions: CONTENT_TRIAGE_MODES.map(mode => ({ key: mode.value, label: mode.label, icon: mode.icon })),
-            }]),
+            {
+              key: 'patrol',
+              label: '创建巡查',
+              icon: Radar,
+              actions: [
+                { key: 'create_negative_patrol', label: '负面巡查', icon: ShieldAlert },
+                { key: 'create_watched_patrol', label: '关注巡查', icon: Star },
+              ],
+            },
             {
               key: 'more',
               label: '更多',
@@ -1763,10 +1666,45 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   )
 }
 
+interface RecordItemProps {
+  record: TriageRecord
+  canWrite: boolean
+  selected: boolean
+  /** 已保存的修改让这条内容不再符合当前筛选，刷新后会移出。 */
+  outOfFilter: boolean
+  onToggle: (event?: React.MouseEvent<HTMLButtonElement>) => void
+  onChangeMode: (status: TriageMode) => void | Promise<unknown>
+  onSaveFeishuTableNo: (value: string) => Promise<FeishuTableNumberSaveResult>
+  modeBusy: boolean
+  modeDisabled: boolean
+  onAddNote: () => void
+  noteBusy: boolean
+  onArchive: () => void | Promise<unknown>
+  archiveBusy: boolean
+  watchBusy: boolean
+  onToggleWatch: () => void | Promise<unknown>
+  archived: boolean
+  onOpenDetail: () => void
+  interactions: number
+}
+
+const OUT_OF_FILTER_HINT = '修改已保存；这条内容已不符合当前筛选，刷新列表后移出'
+
+/* 内容分类小标签：问题分类（AI 分类，「其他」不占位）与内容主题（未分类时不显示）。 */
+function RecordTopicChips({ record: r, className }: { record: TriageRecord; className?: string }) {
+  const categoryLabel = r.category && r.category !== 'other' ? (LABELS.category[r.category] || String(r.category)) : ''
+  const topicLabel = contentTopicLabel(r.content_topic, '')
+  if (!categoryLabel && !topicLabel) return null
+  return (
+    <span className={cn('inline-flex min-w-0 items-center gap-1', className)}>
+      {categoryLabel && <span className="max-w-[120px] truncate rounded bg-muted px-1.5 py-px text-[10px] font-medium text-muted-foreground" title={`问题分类：${categoryLabel}`}>{categoryLabel}</span>}
+      {topicLabel && <span className="max-w-[120px] truncate rounded bg-sky-500/10 px-1.5 py-px text-[10px] font-medium text-sky-700 dark:text-sky-300" title={`内容主题：${topicLabel}`}>{topicLabel}</span>}
+    </span>
+  )
+}
+
 /* 手机值守卡片：把桌面表格里最需要扫读的判断、风险和时间压到一屏内。 */
-// Mirrors the long-standing desktop row contract while keeping the mobile view local.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function MobileRecordCard({ record: r, canWrite, selected, retained, onToggle, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onAddNote, noteBusy, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: any) {
+function MobileRecordCard({ record: r, canWrite, selected, outOfFilter, onToggle, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onAddNote, noteBusy, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: RecordItemProps) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const tone = r.sentiment === 'negative' ? 'negative' : r.sentiment === 'positive' ? 'positive' : 'neutral'
@@ -1794,6 +1732,7 @@ function MobileRecordCard({ record: r, canWrite, selected, retained, onToggle, o
       className={cn(
         'relative cursor-pointer px-3 py-3.5 transition-colors active:bg-accent/70',
         selected && 'bg-primary/[0.05]',
+        outOfFilter && 'opacity-70',
       )}
     >
       <span className={cn('absolute inset-y-3.5 left-0 w-1 rounded-r-full', accentBar)} />
@@ -1835,9 +1774,9 @@ function MobileRecordCard({ record: r, canWrite, selected, retained, onToggle, o
       <div className={cn('mt-3 flex flex-wrap items-center gap-1.5', canWrite && 'pl-10')}>
         <StatusBadge tone={tone}>{r.sentiment ? (LABELS.sentiment[r.sentiment] || r.sentiment) : '—'}</StatusBadge>
         <PostIntentBadge record={r} />
-        <PostRelevanceBadge record={r} />
+        <PostRelevanceBadge record={r} compact />
         {archived && <StatusBadge tone="muted">已归档</StatusBadge>}
-        {retained && <span className="text-[10px] text-muted-foreground" title="修改已保存，刷新后按最新筛选条件显示">已修改 · 暂留</span>}
+        {outOfFilter && <span className="text-[10px] font-medium text-amber-700 dark:text-amber-300" title={OUT_OF_FILTER_HINT}>已修改 · 刷新后移出</span>}
         {r.triage_status === 'negative_feishu' && (
           <FeishuTableNumberControl
             value={r.feishu_table_no}
@@ -1867,7 +1806,10 @@ function MobileRecordCard({ record: r, canWrite, selected, retained, onToggle, o
       </div>
 
       <div className={cn('mt-2.5 flex min-w-0 items-center justify-between gap-2', canWrite && 'pl-10')}>
-        <div className="min-w-0"><span className="text-[11px] text-muted-foreground">内容主题：{contentTopicLabel(r.content_topic)}</span>{customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact />}</div>
+        <div className="flex min-w-0 flex-wrap items-center gap-1">
+          <RecordTopicChips record={r} />
+          {customTags.length > 0 && <RecordLabelChips tags={customTags} limit={2} compact />}
+        </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {canWrite && !archived && <InlineRecordProgress record={r} onAdd={onAddNote} busy={noteBusy} />}
           {canWrite && (
@@ -1901,8 +1843,62 @@ function MobileMetric({ label, value, valueClassName = 'text-foreground' }: { la
   )
 }
 
+function MobileSkeletonCards() {
+  return (
+    <div role="status" aria-label="正在加载内容" className="divide-y divide-border/50">
+      {Array.from({ length: 4 }, (_, index) => (
+        <div key={index} className="flex items-start gap-3 px-3 py-3.5">
+          <div className="skeleton h-12 w-12 shrink-0 rounded-xl" />
+          <div className="min-w-0 flex-1 space-y-2 pt-1">
+            <div className="skeleton h-3.5 w-4/5" />
+            <div className="skeleton h-3 w-1/3" />
+            <div className="flex gap-1.5 pt-1"><div className="skeleton h-5 w-12 rounded-full" /><div className="skeleton h-5 w-16 rounded-full" /></div>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/* 骨架屏只在首次读取（没有旧结果可保留）时出现，形状对齐真实行，避免加载完成时整表跳动。 */
+function SkeletonRows({ withCheckbox }: { withCheckbox: boolean }) {
+  return (
+    <>
+      {Array.from({ length: 6 }, (_, index) => (
+        <tr key={index} aria-hidden={index > 0 || undefined} role={index === 0 ? 'status' : undefined}>
+          {withCheckbox && <td className="py-3 pl-3 pr-0"><div className="skeleton h-[18px] w-[18px] rounded-[5px]" /></td>}
+          <td className="px-3 py-3">
+            <div className="flex items-center gap-3">
+              <span className="h-10 w-1 shrink-0 rounded-full bg-muted" />
+              <div className="skeleton h-10 w-10 shrink-0 rounded-xl" />
+              <div className="w-[300px] space-y-2">
+                <div className="skeleton h-3.5 w-full" />
+                <div className="skeleton h-3 w-2/5" />
+              </div>
+            </div>
+          </td>
+          <td className="px-3 py-3"><div className="skeleton h-5 w-12 rounded-full" /></td>
+          <td className="px-3 py-3"><div className="flex gap-1"><div className="skeleton h-5 w-12 rounded-full" /><div className="skeleton h-5 w-16 rounded-full" /></div></td>
+          <td className="px-3 py-3"><div className="skeleton h-4 w-10" /></td>
+          <td className="px-3 py-3"><div className="skeleton h-4 w-8" /></td>
+          <td className="px-3 py-3"><div className="skeleton ml-auto h-3 w-8" /></td>
+          <td className="px-3 py-3"><div className="skeleton ml-auto h-3 w-6" /></td>
+          <td className="px-3 py-3"><div className="skeleton ml-auto h-3 w-6" /></td>
+          <td className="hidden px-3 py-3 lg:table-cell"><div className="skeleton h-3 w-20" /></td>
+          <td className="hidden px-3 py-3 xl:table-cell"><div className="skeleton h-3 w-16" /></td>
+          <td className="hidden px-3 py-3 xl:table-cell"><div className="skeleton h-3 w-16" /></td>
+          <td className="hidden px-3 py-3 xl:table-cell"><div className="skeleton ml-auto h-3 w-4" /></td>
+          <td className="sticky right-0 z-20 w-[208px] min-w-[208px] bg-card py-3 pl-6 pr-2 before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
+            <div className="grid grid-cols-[112px_48px] items-center gap-2"><div className="skeleton h-5 w-[112px] rounded-full" /><div className="skeleton h-8 w-12 rounded-lg" /></div>
+          </td>
+        </tr>
+      ))}
+    </>
+  )
+}
+
 /* ==================== Record Row(列表行)==================== */
-function RecordRow({ record: r, canWrite, narrow, open, selected, retained, onToggle, onAddNote, noteBusy, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: any) {
+function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle, onAddNote, noteBusy, onChangeMode, onSaveFeishuTableNo, modeBusy, modeDisabled, onArchive, archiveBusy, watchBusy, onToggleWatch, archived, onOpenDetail, interactions }: RecordItemProps & { open: boolean }) {
   const cover = getCover(r)
   const customTags = tagsFromRecord(r)
   const accentBar = recordAccentClass(r)
@@ -1913,13 +1909,21 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, retained, onTo
   const displayTitle = recordDisplayTitle(r)
 
   return (
-    <tr data-record-detail-trigger className={cn('group cursor-pointer transition-colors', open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45')} onClick={onOpenDetail}>
+    <tr
+      data-record-detail-trigger
+      className={cn(
+        'group cursor-pointer transition-colors',
+        open ? 'bg-accent' : selected ? 'bg-primary/[0.05]' : 'hover:bg-accent/45',
+        outOfFilter && 'opacity-60 hover:opacity-100',
+      )}
+      onClick={onOpenDetail}
+    >
       {canWrite && (
-        <td className="py-3.5 pl-3 pr-0 align-middle" onClick={e => e.stopPropagation()}>
+        <td className="py-3 pl-3 pr-0 align-middle" onClick={e => e.stopPropagation()}>
           <Checkbox checked={selected} onChange={onToggle} />
         </td>
       )}
-      <td className="px-3 py-3.5 align-middle">
+      <td className="px-3 py-3 align-middle">
         <div className="flex items-center gap-3">
           <span className={cn('h-10 w-1 shrink-0 rounded-full', accentBar)} />
           {cover ? (
@@ -1929,7 +1933,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, retained, onTo
           ) : (
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-dashed border-border bg-muted/40"><FileText className="h-4 w-4 text-muted-foreground/40" /></div>
           )}
-          <div className="min-w-0 max-w-[300px]">
+          <div className="min-w-0 max-w-[340px]">
             <div className="flex items-start gap-1.5">
               <div className="line-clamp-2 min-w-0 flex-1 text-[13px] font-medium leading-tight">{displayTitle}</div>
               {canWrite ? (
@@ -1942,13 +1946,15 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, retained, onTo
                 <span title="已关注" className="flex h-6 w-6 shrink-0 items-center justify-center text-primary"><Star className="h-3.5 w-3.5 fill-current" /></span>
               ) : null}
             </div>
-            <div className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-muted-foreground">
-              <User className="h-2.5 w-2.5 shrink-0" />{r.author_name || '未知'}
-              {r.category && <span className="truncate">· {LABELS.category[r.category] || r.category}</span>}
-              <span className="truncate" title="内容主题">· {contentTopicLabel(r.content_topic)}</span>
+            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-muted-foreground">
+              <span className="inline-flex min-w-0 max-w-[150px] items-center gap-1"><User className="h-2.5 w-2.5 shrink-0" /><span className="truncate">{r.author_name || '未知'}</span></span>
+              <span className="text-muted-foreground/50">·</span>
+              <span className="shrink-0">{platformName(r.platform)}</span>
+              <RecordTopicChips record={r} />
               <RecordSourceAction record={r} compact />
-              {archived && <span className="text-[10px]">已归档</span>}
               {r.blogger_profile_url && <a href={r.blogger_profile_url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="inline-flex shrink-0 items-center gap-0.5 font-medium text-primary hover:underline"><User className="h-2.5 w-2.5" />主页</a>}
+              {archived && <span className="text-[10px]">已归档</span>}
+              {outOfFilter && <span className="text-[10px] font-medium text-amber-700 dark:text-amber-300" title={OUT_OF_FILTER_HINT}>已修改 · 刷新后移出</span>}
             </div>
             {triageStatus === 'negative_feishu' && (
               <FeishuTableNumberControl
@@ -1963,27 +1969,29 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, retained, onTo
           </div>
         </div>
       </td>
-      {!narrow && <td className="px-3 py-3.5 align-middle"><StatusBadge tone="neutral" className={PLATFORM_BADGE_CLASS}>{platformName(r.platform)}</StatusBadge></td>}
-      <td className="px-3 py-3.5 align-middle">
+      <td className="px-3 py-3 align-middle">
         <div className="flex flex-wrap gap-1">
           <StatusBadge tone={tone}>{r.sentiment ? (LABELS.sentiment[r.sentiment] || r.sentiment) : '—'}</StatusBadge>
-          {retained && <span className="text-[10px] text-muted-foreground" title="修改已保存，刷新后按最新筛选条件显示">已修改 · 暂留</span>}
           {availabilityLabel && <StatusBadge tone="muted"><CircleOff className="h-3 w-3" />{availabilityLabel}</StatusBadge>}
         </div>
       </td>
-      <td className="px-3 py-3.5 align-middle"><PostIntentBadge record={r} /></td>
-      <td className="px-3 py-3.5 align-middle"><PostRelevanceBadge record={r} /></td>
-      {!narrow && <td className="px-3 py-3.5 align-middle"><RiskSignals record={r} /></td>}
-      {!narrow && <td className="px-3 py-3.5 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} /></td>}
-      {!narrow && <td className={`px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums ${negativeInteractionClass(r.sentiment, interactions, 'text-foreground')}`}>{formatNumber(interactions)}</td>}
-      {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(r.comments_count)}</td>}
-      {!narrow && <td className="px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums">{formatNumber(r.likes)}</td>}
-      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>}
-      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.first_seen_at)}</td>}
-      {!narrow && <td className="hidden whitespace-nowrap px-3 py-3.5 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.last_seen_at)}</td>}
-      {!narrow && <td className="hidden px-3 py-3.5 text-right align-middle text-[12px] font-semibold tabular-nums xl:table-cell">{formatNumber(r.seen_count || 1)}</td>}
+      <td className="px-3 py-3 align-middle">
+        <div className="flex flex-wrap items-center gap-1">
+          <PostIntentBadge record={r} />
+          <PostRelevanceBadge record={r} compact />
+        </div>
+      </td>
+      <td className="px-3 py-3 align-middle"><RiskSignals record={r} /></td>
+      <td className="px-3 py-3 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} /></td>
+      <td className={`px-3 py-3 text-right align-middle text-[12px] font-semibold tabular-nums ${negativeInteractionClass(r.sentiment, interactions, 'text-foreground')}`}>{formatNumber(interactions)}</td>
+      <td className="px-3 py-3 text-right align-middle text-[12px] tabular-nums text-muted-foreground">{formatNumber(r.comments_count)}</td>
+      <td className="px-3 py-3 text-right align-middle text-[12px] tabular-nums text-muted-foreground">{formatNumber(r.likes)}</td>
+      <td className="hidden whitespace-nowrap px-3 py-3 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>
+      <td className="hidden whitespace-nowrap px-3 py-3 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.first_seen_at)}</td>
+      <td className="hidden whitespace-nowrap px-3 py-3 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.last_seen_at)}</td>
+      <td className="hidden px-3 py-3 text-right align-middle text-[12px] tabular-nums text-muted-foreground xl:table-cell">{formatNumber(r.seen_count || 1)}</td>
       <td className={cn(
-        "sticky right-0 z-20 w-[208px] min-w-[208px] pl-6 pr-2 py-3.5 align-middle transition-colors before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']",
+        "sticky right-0 z-20 w-[208px] min-w-[208px] pl-6 pr-2 py-3 align-middle transition-colors before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']",
         open || selected ? 'bg-accent' : 'bg-card group-hover:bg-accent',
       )} onClick={e => e.stopPropagation()}>
         <div className="grid grid-cols-[112px_48px] items-center gap-2">
@@ -2009,7 +2017,7 @@ function RecordRow({ record: r, canWrite, narrow, open, selected, retained, onTo
 }
 
 function InlineRecordProgress({ record, onAdd, busy = false }: {
-  record: any
+  record: TriageRecord
   onAdd: () => void
   busy?: boolean
 }) {
@@ -2139,20 +2147,19 @@ function TriageStatusMenu({ status, busy, archiveBusy, disabled, onChange, onArc
 }
 
 /* 可排序表头:点击切换该列升/降序,激活列显示实心箭头,未激活显示淡色双箭头 */
-function SortableTh({ label, field, sort, onSort, disabled, align = 'left', className = '' }: {
+function SortableTh({ label, field, sort, onSort, align = 'left', className = '' }: {
   label: string
   field: SortField
   sort: { field: string; dir: 'asc' | 'desc' }
   onSort: (field: SortField) => void
-  disabled?: boolean
   align?: 'left' | 'right'
   className?: string
 }) {
   const active = sort.field === field
   const Arrow = active ? (sort.dir === 'desc' ? ArrowDown : ArrowUp) : ChevronsUpDown
   return (
-    <th className={cn('px-3 py-3.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground', align === 'right' ? 'text-right' : 'text-left', className)}>
-      <button disabled={disabled} onClick={() => onSort(field)} title={disabled ? '取消多选后可排序' : '点击切换排序'}
+    <th className={cn('px-3 py-3 text-[11px] font-medium uppercase tracking-wider text-muted-foreground', align === 'right' ? 'text-right' : 'text-left', className)} aria-sort={active ? (sort.dir === 'desc' ? 'descending' : 'ascending') : undefined}>
+      <button type="button" onClick={() => onSort(field)} title="点击切换排序"
         className={cn('inline-flex items-center gap-1 align-middle uppercase tracking-wider transition-colors hover:text-foreground', active && 'text-foreground')}>
         {label}
         <Arrow className={cn('h-3 w-3', active ? 'opacity-100' : 'opacity-30')} strokeWidth={2.5} />
@@ -2177,7 +2184,7 @@ function IdentityBadge({ sourceType, fans, name, override }: { sourceType?: stri
 }
 
 /* 风险信号:预警 / 负面评论数 / 已删帖,一眼可扫 */
-function RiskSignals({ record: r }: any) {
+function RiskSignals({ record: r }: { record: TriageRecord }) {
   const alerts = Number(r.alert_count || 0)
   const neg = Number(r.negative_comment_count || 0)
   const deleted = String(r.content_availability_status || '') === 'deleted'
