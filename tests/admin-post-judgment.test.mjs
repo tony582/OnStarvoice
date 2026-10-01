@@ -120,8 +120,8 @@ test('list, mobile, board and drawer expose intent and relevance with one filter
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const header = queue.slice(queue.indexOf('<thead data-sticky-header'), queue.indexOf('</thead>'));
   const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* List */}'));
-  // 意图与相关性只在筛选栏出现一次（相关性在前）；表头合并成一列「AI 判断」只展示，不再放筛选器。
-  assert.ok(filters.indexOf('aria-label="情感筛选"') < filters.indexOf('<PostRelevanceFilter value={relevances}'));
+  // 意图与相关性只在筛选栏出现一次（情感在第一行，相关性在第二行最前）；表头合并成一列「AI 判断」只展示，不再放筛选器。
+  assert.ok(queue.indexOf('aria-label="情感筛选"') < queue.indexOf('<PostRelevanceFilter value={relevances}'));
   assert.ok(filters.indexOf('<PostRelevanceFilter value={relevances}') < filters.indexOf('<PostIntentFilter value={intents}'));
   assert.doesNotMatch(header, /<PostIntentFilter|<PostRelevanceFilter/);
   assert.match(header, />AI 判断</);
@@ -160,8 +160,8 @@ test('filters wrap by content width in every layout and keep their labels horizo
   const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* List */}'));
   // 不再按抽屉开关切换等宽网格：筛选 pill 永远按内容宽度排布并自然换行，标签不会被截成「全部平…」。
   assert.doesNotMatch(queue, /xl:grid-cols-|lg:w-\[160px\]|justify-between whitespace-nowrap/);
-  assert.match(filters, /mt-2 w-full grid-cols-\[repeat\(auto-fill,minmax\(120px,1fr\)\)\] gap-1\.5/);
-  assert.match(queue, /const FILTER_CELL = 'min-w-0'/);
+  assert.match(filters, /mt-2 w-full flex-wrap items-center gap-1\.5/);
+  assert.match(queue, /const FILTER_CELL = 'min-w-0 grow'/);
   assert.match(trigger, /shrink-0 items-center gap-1 whitespace-nowrap/);
   assert.match(component, /inline-flex shrink-0 items-center gap-1 whitespace-nowrap/);
   assert.match(component, /pillTriggerClass\(active, className\)/);

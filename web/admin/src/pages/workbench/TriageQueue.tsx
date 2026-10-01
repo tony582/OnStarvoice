@@ -208,10 +208,11 @@ function SingleSelectFilter({ label, value, options, onChange, className, ...pro
   )
 }
 
-// 筛选芯片放在等宽网格里：每格只需防止内容撑宽，宽度由网格列决定。
-const FILTER_CELL = 'min-w-0'
+// 筛选芯片按内容宽度排布并均分多出的宽度，整行刚好填满。
+const FILTER_CELL = 'min-w-0 grow'
 const FILTER_TRIGGER = 'w-full justify-between'
-const FILTER_TRIGGER_CELL = `${FILTER_CELL} ${FILTER_TRIGGER}`
+// 自身就是触发按钮的筛选（没有外层容器）：直接当作一个会生长的芯片，不能再加 w-full，否则会独占一整行。
+const FILTER_TRIGGER_CELL = `${FILTER_CELL} justify-between`
 
 function recordAccentClass(record: Record<string, unknown>) {
   if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold' || record.triage_status === 'negative_comment' || record.triage_status === 'privacy_unreachable') return 'bg-status-red'
@@ -1203,6 +1204,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             </button>
           </div>
 
+          {/* 情感是最常用的快捷筛选，和生命周期一样做成分段控件放在第一行，第二行只留下拉芯片。 */}
+          <div role="group" aria-label="情感筛选" className="mobile-table-scroll inline-flex h-10 max-w-full shrink-0 items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8">
+            {SENTIMENT_OPTIONS.map(([value, label]) => (
+              <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
+                className={cn('inline-flex h-9 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-2.5 text-[12px] font-medium transition-colors lg:h-7',
+                  sentiment === value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+                {label}
+              </button>
+            ))}
+          </div>
+
           <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1.5">
             {hasActiveFilters && (
               <button
@@ -1246,26 +1258,17 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
         </div>
 
-        {/* 筛选区：等宽网格，列数按可用宽度自动增减（每列最少 120px），所有芯片同一外观、同一宽度；激活的芯片变蓝并直接显示值。 */}
+        {/* 筛选区：芯片按各自内容宽度排成一行，多出的宽度平均分给每个芯片；窗口不够宽时才折行。 */}
         <div
           role="group"
           aria-label="内容筛选"
           data-triage-toolbar="secondary"
           className={cn(
-            'mt-2 w-full grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-1.5 rounded-xl bg-muted/30 p-3 lg:rounded-none lg:bg-transparent lg:p-0',
-            mobileFiltersOpen ? 'grid' : 'hidden',
-            'lg:grid',
+            'mt-2 w-full flex-wrap items-center gap-1.5 rounded-xl bg-muted/30 p-3 lg:rounded-none lg:bg-transparent lg:p-0',
+            mobileFiltersOpen ? 'flex' : 'hidden',
+            'lg:flex',
           )}
         >
-          <div role="group" aria-label="情感筛选" className={cn(FILTER_CELL, 'col-span-2 mobile-table-scroll inline-flex h-10 items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-7')}>
-            {SENTIMENT_OPTIONS.map(([value, label]) => (
-              <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
-                className={cn('inline-flex h-9 flex-1 items-center justify-center whitespace-nowrap rounded-md px-2 text-[12px] font-medium transition-colors lg:h-6',
-                  sentiment === value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
-                {label}
-              </button>
-            ))}
-          </div>
           <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} className={FILTER_TRIGGER_CELL} />
           <PostIntentFilter value={intents} onChange={setIntents} className={FILTER_TRIGGER_CELL} />
           <MultiSelect

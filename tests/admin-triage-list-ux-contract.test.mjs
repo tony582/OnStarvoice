@@ -143,13 +143,14 @@ test('one filter bar carries every content dimension once; the table header only
   assert.doesNotMatch(queue, /保存后可继续编辑|刷新结果将按当前条件重新查询|上次查询：/);
 
   // 内容维度的筛选全部收在第二行，各出现一次，同一外观、放在列数自适应的等宽网格里；平台与内容主题换成和其它筛选一致的 pill 下拉。
-  assert.match(queue, /const FILTER_CELL = 'min-w-0'/);
+  assert.match(queue, /const FILTER_CELL = 'min-w-0 grow'/);
   assert.match(queue, /const FILTER_TRIGGER = 'w-full justify-between'/);
-  assert.match(secondary, /grid-cols-\[repeat\(auto-fill,minmax\(120px,1fr\)\)\]/);
-  // 查询区不再套卡片边框；到表头的间距收紧。
+  assert.match(secondary, /w-full flex-wrap items-center gap-1\.5/);
+  // 查询区不再套卡片边框；到表头的间距收紧；情感分段控件放在第一行，整个查询区只占两行。
   assert.doesNotMatch(queue, /rounded-xl border border-border bg-card shadow-xs/);
   assert.match(queue, /className="sticky left-0 z-30 min-w-0 bg-background pb-2 /);
-  assert.match(secondary, /aria-label="情感筛选"/);
+  assert.match(primary, /aria-label="情感筛选"/);
+  assert.doesNotMatch(secondary, /aria-label="情感筛选"/);
   assert.match(secondary, /<MultiSelect[\s\S]*label="处理状态"[\s\S]*value=\{triageStatuses\}[\s\S]*className=\{FILTER_CELL\}/);
   assert.match(secondary, /<CombinedDateRangeFilter value=\{dateRanges\} onChange=\{setDateRanges\} itemClassName=\{FILTER_CELL\} triggerClassName=\{FILTER_TRIGGER\} \/>/);
   assert.match(secondary, /<SingleSelectFilter label="平台" aria-label="平台筛选" value=\{platform\} options=\{PLATFORM_OPTIONS\} onChange=\{setPlatform\}/);
