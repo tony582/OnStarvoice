@@ -208,11 +208,11 @@ function SingleSelectFilter({ label, value, options, onChange, className, ...pro
   )
 }
 
-// 筛选芯片按内容宽度排布并均分多出的宽度，整行刚好填满。
-const FILTER_CELL = 'min-w-0 grow'
+// 筛选芯片按各自内容宽度排布，不拉伸；行尾剩下的空位留给「清空筛选」。
+const FILTER_CELL = 'min-w-0'
 const FILTER_TRIGGER = 'w-full justify-between'
-// 自身就是触发按钮的筛选（没有外层容器）：直接当作一个会生长的芯片，不能再加 w-full，否则会独占一整行。
-const FILTER_TRIGGER_CELL = `${FILTER_CELL} justify-between`
+// 自身就是触发按钮的筛选（没有外层容器）：直接当作一个芯片，不能加 w-full，否则会独占一整行。
+const FILTER_TRIGGER_CELL = FILTER_CELL
 
 function recordAccentClass(record: Record<string, unknown>) {
   if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold' || record.triage_status === 'negative_comment' || record.triage_status === 'privacy_unreachable') return 'bg-status-red'
@@ -1170,7 +1170,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             })}
           </div>
 
-          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[220px] lg:max-w-[380px] lg:flex-1">
+          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[220px] lg:flex-1">
             <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input value={keywordDraft} onChange={e => setKeywordDraft(e.target.value)}
@@ -1216,18 +1216,6 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </div>
 
           <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1.5">
-            {hasActiveFilters && (
-              <button
-                type="button"
-                onClick={clearFilters}
-                title="清空所有筛选与排序"
-                aria-label={`清空全部 ${activeFilterCount} 项筛选与排序`}
-                className="inline-flex h-10 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:h-8"
-              >
-                <X className="h-3.5 w-3.5" />清空筛选
-                <span className="rounded bg-muted px-1 text-[10px] font-semibold tabular-nums">{activeFilterCount}</span>
-              </button>
-            )}
             <Button
               variant="outline"
               size="sm"
@@ -1303,6 +1291,18 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             triggerClassName={FILTER_TRIGGER}
           />
           <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} itemClassName={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
+          {/* 清空固定在筛选行的右下角：芯片按内容宽度排布，剩下的空位正好留给它。 */}
+          <button
+            type="button"
+            onClick={clearFilters}
+            disabled={!hasActiveFilters}
+            title={hasActiveFilters ? '清空所有筛选与排序' : '当前没有生效的筛选'}
+            aria-label={hasActiveFilters ? `清空全部 ${activeFilterCount} 项筛选与排序` : '清空筛选，当前没有生效的筛选'}
+            className="ml-auto inline-flex h-10 shrink-0 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:text-muted-foreground/40 disabled:hover:bg-transparent lg:h-7"
+          >
+            <X className="h-3.5 w-3.5" />清空筛选
+            {activeFilterCount > 0 && <span className="rounded bg-muted px-1 text-[10px] font-semibold tabular-nums">{activeFilterCount}</span>}
+          </button>
         </div>
       </div>
 

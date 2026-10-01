@@ -136,14 +136,16 @@ test('one filter bar carries every content dimension once; the table header only
   assert.match(primary, /aria-pressed=\{viewingWatchlist\}/);
   assert.match(primary, /placeholder="搜索标题、正文、作者…"/);
   assert.match(primary, /title="可搜索标题、正文、作者、飞书表号、账号、平台ID、采集词和标签"/);
-  // 刷新是常驻的小图标按钮，取代原来的说明横幅 + 「刷新结果」大按钮；清空筛选也在这一排动作里。
+  // 刷新是常驻的小图标按钮，取代原来的说明横幅 + 「刷新结果」大按钮；清空筛选固定在筛选行右下角。
   assert.match(primary, /aria-label="刷新列表"/);
-  assert.match(primary, /清空筛选/);
+  assert.doesNotMatch(primary, /清空筛选/);
+  assert.match(secondary, /ml-auto inline-flex[^"]*"\s*>\s*<X className="h-3\.5 w-3\.5" \/>清空筛选/);
+  assert.match(secondary, /disabled=\{!hasActiveFilters\}/);
   assert.match(primary, /exportXlsx/);
   assert.doesNotMatch(queue, /保存后可继续编辑|刷新结果将按当前条件重新查询|上次查询：/);
 
   // 内容维度的筛选全部收在第二行，各出现一次，同一外观、放在列数自适应的等宽网格里；平台与内容主题换成和其它筛选一致的 pill 下拉。
-  assert.match(queue, /const FILTER_CELL = 'min-w-0 grow'/);
+  assert.match(queue, /const FILTER_CELL = 'min-w-0'/);
   assert.match(queue, /const FILTER_TRIGGER = 'w-full justify-between'/);
   assert.match(secondary, /w-full flex-wrap items-center gap-1\.5/);
   // 查询区不再套卡片边框；到表头的间距收紧；情感分段控件放在第一行，整个查询区只占两行。
