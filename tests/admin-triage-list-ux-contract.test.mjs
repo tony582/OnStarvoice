@@ -145,21 +145,25 @@ test('one filter bar carries every content dimension once; the table header only
   assert.doesNotMatch(queue, /保存后可继续编辑|刷新结果将按当前条件重新查询|上次查询：/);
 
   // 内容维度的筛选全部收在第二行，各出现一次，同一外观、放在列数自适应的等宽网格里；平台与内容主题换成和其它筛选一致的 pill 下拉。
-  assert.match(queue, /const FILTER_CELL = 'min-w-0'/);
+  assert.match(queue, /const FILTER_CELL = 'min-w-0 grow'/);
   assert.match(queue, /const FILTER_TRIGGER = 'w-full justify-between'/);
   assert.match(secondary, /w-full flex-wrap items-center gap-1\.5/);
-  // 查询区不再套卡片边框；到表头的间距收紧；情感分段控件放在第一行，整个查询区只占两行。
+  // 查询区不再套卡片边框；到表头的间距收紧；情感分段控件固定在第二行最左侧。
   assert.doesNotMatch(queue, /rounded-xl border border-border bg-card shadow-xs/);
   assert.match(queue, /className="sticky left-0 z-30 min-w-0 bg-background pb-2 /);
-  assert.match(primary, /aria-label="情感筛选"/);
-  assert.doesNotMatch(secondary, /aria-label="情感筛选"/);
+  assert.doesNotMatch(primary, /aria-label="情感筛选"/);
+  assert.ok(secondary.indexOf('aria-label="情感筛选"') < secondary.indexOf('<PostRelevanceFilter'));
   assert.match(secondary, /<MultiSelect[\s\S]*label="处理状态"[\s\S]*value=\{triageStatuses\}[\s\S]*className=\{FILTER_CELL\}/);
   assert.match(secondary, /<CombinedDateRangeFilter value=\{dateRanges\} onChange=\{setDateRanges\} itemClassName=\{FILTER_CELL\} triggerClassName=\{FILTER_TRIGGER\} \/>/);
-  assert.match(secondary, /<SingleSelectFilter label="平台" aria-label="平台筛选" value=\{platform\} options=\{PLATFORM_OPTIONS\} onChange=\{setPlatform\}/);
-  assert.match(secondary, /<SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value=\{contentTopic\} options=\{CONTENT_TOPIC_FILTER_OPTIONS\} onChange=\{setContentTopic\}/);
-  assert.match(secondary, /<MultiSelect label="疑似身份"/);
+  // 用得少的平台 / 内容主题 / 疑似身份 / 采集关键词写成一组：桌面放第一行搜索框旁，窄屏收进筛选面板。
+  const attributeFilters = between(queue, 'const attributeFilters = (', '// 首次读取');
+  assert.match(attributeFilters, /<SingleSelectFilter label="平台" aria-label="平台筛选" value=\{platform\} options=\{PLATFORM_OPTIONS\} onChange=\{setPlatform\}/);
+  assert.match(attributeFilters, /<SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value=\{contentTopic\} options=\{CONTENT_TOPIC_FILTER_OPTIONS\} onChange=\{setContentTopic\}/);
+  assert.match(attributeFilters, /<MultiSelect label="疑似身份"/);
+  assert.match(attributeFilters, /<KeywordFilter/);
+  assert.match(primary, /<div className="hidden lg:contents">\s*\{attributeFilters\}/);
+  assert.match(secondary, /<div className="contents lg:hidden">\s*\{attributeFilters\}/);
   assert.match(secondary, /<MultiSelect label="风险信号"/);
-  assert.match(secondary, /<KeywordFilter/);
   assert.match(secondary, /label="自定义标签"/);
   assert.match(secondary, /<CombinedDateRangeFilter/);
   assert.doesNotMatch(secondary, /关注状态筛选|未关注/);

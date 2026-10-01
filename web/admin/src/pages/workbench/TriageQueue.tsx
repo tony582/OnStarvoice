@@ -208,11 +208,11 @@ function SingleSelectFilter({ label, value, options, onChange, className, ...pro
   )
 }
 
-// 筛选芯片按各自内容宽度排布，不拉伸；行尾剩下的空位留给「清空筛选」。
-const FILTER_CELL = 'min-w-0'
+// 筛选芯片按内容宽度排布并均分多出的宽度，整行刚好填满；窗口不够宽时才折行。
+const FILTER_CELL = 'min-w-0 grow'
 const FILTER_TRIGGER = 'w-full justify-between'
-// 自身就是触发按钮的筛选（没有外层容器）：直接当作一个芯片，不能加 w-full，否则会独占一整行。
-const FILTER_TRIGGER_CELL = FILTER_CELL
+// 自身就是触发按钮的筛选（没有外层容器）：直接当作一个会生长的芯片，不能加 w-full，否则会独占一整行。
+const FILTER_TRIGGER_CELL = `${FILTER_CELL} justify-between`
 
 function recordAccentClass(record: Record<string, unknown>) {
   if (record.triage_status === 'negative_feishu' || record.triage_status === 'negative_cold' || record.triage_status === 'negative_comment' || record.triage_status === 'privacy_unreachable') return 'bg-status-red'
@@ -1108,6 +1108,15 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
       ? archiveView === 'archived' ? '已关注内容归档后会保留在这里' : '点击内容旁的星标即可加入关注清单'
       : archiveView === 'archived' ? '客户主动归档的内容会显示在这里' : '暂无可处理内容'
   const EmptyIcon = hasActiveFilters ? Search : viewingWatchlist ? Star : archiveView === 'archived' ? Archive : Inbox
+  // 用得较少的内容属性筛选：桌面放在第一行搜索框旁边，窄屏收进筛选面板（两处只会显示一处）。
+  const attributeFilters = (
+    <>
+      <SingleSelectFilter label="平台" aria-label="平台筛选" value={platform} options={PLATFORM_OPTIONS} onChange={setPlatform} className={FILTER_TRIGGER_CELL} />
+      <SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value={contentTopic} options={CONTENT_TOPIC_FILTER_OPTIONS} onChange={setContentTopic} className={FILTER_TRIGGER_CELL} />
+      <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
+      <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
+    </>
+  )
   // 首次读取（没有可保留的旧结果）用骨架屏；条件变化时保留旧列表淡显并顶部走进度条，避免整页闪成加载态。
   const showSkeleton = loading && records.length === 0
   const refreshing = loading && records.length > 0
@@ -1204,15 +1213,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             </button>
           </div>
 
-          {/* 情感是最常用的快捷筛选，和生命周期一样做成分段控件放在第一行，第二行只留下拉芯片。 */}
-          <div role="group" aria-label="情感筛选" className="mobile-table-scroll inline-flex h-10 max-w-full shrink-0 items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-8">
-            {SENTIMENT_OPTIONS.map(([value, label]) => (
-              <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
-                className={cn('inline-flex h-9 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-2.5 text-[12px] font-medium transition-colors lg:h-7',
-                  sentiment === value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
-                {label}
-              </button>
-            ))}
+          {/* 平台 / 内容主题 / 疑似身份 / 采集关键词用得少，放在第一行搜索框旁边填满空位。 */}
+          <div className="hidden lg:contents">
+            {attributeFilters}
           </div>
 
           <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1.5">
@@ -1257,6 +1260,16 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             'lg:flex',
           )}
         >
+          {/* 情感是最常用的筛选，固定在第二行最左侧。 */}
+          <div role="group" aria-label="情感筛选" className="mobile-table-scroll inline-flex h-10 max-w-full shrink-0 items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-7">
+            {SENTIMENT_OPTIONS.map(([value, label]) => (
+              <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
+                className={cn('inline-flex h-9 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-2.5 text-[12px] font-medium transition-colors lg:h-6',
+                  sentiment === value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+                {label}
+              </button>
+            ))}
+          </div>
           <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} className={FILTER_TRIGGER_CELL} />
           <PostIntentFilter value={intents} onChange={setIntents} className={FILTER_TRIGGER_CELL} />
           <MultiSelect
@@ -1269,10 +1282,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             triggerClassName={FILTER_TRIGGER}
           />
           <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
-          <SingleSelectFilter label="平台" aria-label="平台筛选" value={platform} options={PLATFORM_OPTIONS} onChange={setPlatform} className={FILTER_TRIGGER_CELL} />
-          <SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value={contentTopic} options={CONTENT_TOPIC_FILTER_OPTIONS} onChange={setContentTopic} className={FILTER_TRIGGER_CELL} />
-          <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
-          <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
+          <div className="contents lg:hidden">
+            {attributeFilters}
+          </div>
           <MultiSelect
             label="自定义标签"
             options={customTagCatalog.map(tag => ({
@@ -1291,7 +1303,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             triggerClassName={FILTER_TRIGGER}
           />
           <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} itemClassName={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
-          {/* 清空固定在筛选行的右下角：芯片按内容宽度排布，剩下的空位正好留给它。 */}
+          {/* 清空固定在筛选行最右侧。 */}
           <button
             type="button"
             onClick={clearFilters}
