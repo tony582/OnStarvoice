@@ -208,8 +208,8 @@ function SingleSelectFilter({ label, value, options, onChange, className, ...pro
   )
 }
 
-// 筛选芯片按可用宽度自动填满：每格最少 132px，同一行多出的宽度平均分给各芯片，窄了自动折行。
-const FILTER_CELL = 'min-w-0 shrink grow basis-[132px]'
+// 筛选芯片放在等宽网格里：每格只需防止内容撑宽，宽度由网格列决定。
+const FILTER_CELL = 'min-w-0'
 const FILTER_TRIGGER = 'w-full justify-between'
 const FILTER_TRIGGER_CELL = `${FILTER_CELL} ${FILTER_TRIGGER}`
 
@@ -1112,7 +1112,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const refreshing = loading && records.length > 0
 
   return (
-    <div className="space-y-3 lg:w-max lg:min-w-full">
+    <div className="space-y-2 lg:w-max lg:min-w-full">
       {batchFeedback && (
         <div
           role={batchFeedback.tone === 'error' ? 'alert' : 'status'}
@@ -1140,168 +1140,166 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
           </button>
         </div>
       )}
-      <div className="sticky left-0 z-30 min-w-0 bg-background pb-3 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
-        {/* 查询卡片：工作范围、搜索、动作与全部筛选装在同一张卡里，边界清楚、层级统一。 */}
-        <div className="rounded-xl border border-border bg-card shadow-xs">
-          <div data-triage-toolbar="primary" className="flex flex-wrap items-center gap-2 px-3 py-2">
-            <div className="inline-flex h-10 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:h-8" role="tablist" aria-label="内容生命周期">
-              {ARCHIVE_VIEWS.map(item => {
-                const Icon = item.icon
-                return (
-                  <button
-                    key={item.value}
-                    type="button"
-                    onClick={() => {
-                      setArchiveView(item.value)
-                      setTriageStatuses([])
-                    }}
-                    role="tab"
-                    aria-selected={archiveView === item.value}
-                    className={cn(
-                      'inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors lg:h-7',
-                      archiveView === item.value
-                        ? 'bg-card text-foreground shadow-sm ring-1 ring-border/80'
-                        : 'text-muted-foreground hover:bg-card/60 hover:text-foreground',
-                    )}
-                  >
-                    <Icon className="h-3.5 w-3.5" />{item.label}
-                  </button>
-                )
-              })}
-            </div>
+      <div className="sticky left-0 z-30 min-w-0 bg-background pb-2 lg:-mx-6 lg:w-[calc(100cqw-6px)] lg:px-6">
+        {/* 查询区不加框：第一行是范围 / 搜索 / 动作，第二行是等宽网格的筛选芯片，靠对齐本身成为一个整体。 */}
+        <div data-triage-toolbar="primary" className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex h-10 items-center rounded-lg border border-border/80 bg-muted/55 p-0.5 lg:h-8" role="tablist" aria-label="内容生命周期">
+            {ARCHIVE_VIEWS.map(item => {
+              const Icon = item.icon
+              return (
+                <button
+                  key={item.value}
+                  type="button"
+                  onClick={() => {
+                    setArchiveView(item.value)
+                    setTriageStatuses([])
+                  }}
+                  role="tab"
+                  aria-selected={archiveView === item.value}
+                  className={cn(
+                    'inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-[12px] font-semibold transition-colors lg:h-7',
+                    archiveView === item.value
+                      ? 'bg-card text-foreground shadow-sm ring-1 ring-border/80'
+                      : 'text-muted-foreground hover:bg-card/60 hover:text-foreground',
+                  )}
+                >
+                  <Icon className="h-3.5 w-3.5" />{item.label}
+                </button>
+              )
+            })}
+          </div>
 
-            <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[220px] lg:max-w-[380px] lg:flex-1">
-              <div className="relative min-w-0 flex-1">
-                <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input value={keywordDraft} onChange={e => setKeywordDraft(e.target.value)}
-                  onKeyDown={e => {
-                    if (e.key !== 'Enter') return
-                    e.preventDefault()
-                    setKeyword(keywordDraft.trim())
-                  }} placeholder="搜索标题、正文、作者…" title="可搜索标题、正文、作者、飞书表号、账号、平台ID、采集词和标签" className="h-10 w-full border-transparent bg-muted px-8 text-[12px] focus:bg-card lg:h-8" />
-                {keywordDraft && (
-                  <button
-                    type="button"
-                    aria-label="清空搜索"
-                    onClick={() => { setKeywordDraft(''); setKeyword('') }}
-                    className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-card hover:text-foreground"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                )}
-              </div>
-              <button
-                type="button"
-                onClick={() => setMobileFiltersOpen(open => !open)}
-                aria-expanded={mobileFiltersOpen}
-                className={cn(
-                  'inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border px-3 text-[12px] font-semibold lg:hidden',
-                  mobileFiltersOpen || activeFilterCount > 0 ? 'border-primary/25 bg-accent text-primary' : 'border-border bg-card text-muted-foreground',
-                )}
-              >
-                <SlidersHorizontal className="h-3.5 w-3.5" />筛选
-                {activeFilterCount > 0 && <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-bold text-primary-foreground">{activeFilterCount}</span>}
-              </button>
-            </div>
-
-            <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1.5">
-              {hasActiveFilters && (
+          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[220px] lg:max-w-[380px] lg:flex-1">
+            <div className="relative min-w-0 flex-1">
+              <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input value={keywordDraft} onChange={e => setKeywordDraft(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key !== 'Enter') return
+                  e.preventDefault()
+                  setKeyword(keywordDraft.trim())
+                }} placeholder="搜索标题、正文、作者…" title="可搜索标题、正文、作者、飞书表号、账号、平台ID、采集词和标签" className="h-10 w-full border-transparent bg-muted px-8 text-[12px] focus:bg-card lg:h-8" />
+              {keywordDraft && (
                 <button
                   type="button"
-                  onClick={clearFilters}
-                  title="清空所有筛选与排序"
-                  aria-label={`清空全部 ${activeFilterCount} 项筛选与排序`}
-                  className="inline-flex h-10 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:h-8"
+                  aria-label="清空搜索"
+                  onClick={() => { setKeywordDraft(''); setKeyword('') }}
+                  className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-card hover:text-foreground"
                 >
-                  <X className="h-3.5 w-3.5" />清空筛选
-                  <span className="rounded bg-muted px-1 text-[10px] font-semibold tabular-nums">{activeFilterCount}</span>
+                  <X className="h-3.5 w-3.5" />
                 </button>
               )}
-              <Button
-                variant="outline"
-                size="sm"
-                aria-pressed={viewingWatchlist}
-                aria-label={viewingWatchlist ? '关闭关注清单，显示当前生命周期的全部内容' : '打开关注清单'}
-                title={viewingWatchlist ? '显示当前生命周期的全部内容' : '查看人工关注的内容'}
-                onClick={() => setWatchedFilter(viewingWatchlist ? '' : 'watched')}
-                className={cn(viewingWatchlist && 'border-primary/35 bg-primary/8 text-primary hover:bg-primary/12')}
-              >
-                <Star className={cn('h-3.5 w-3.5', viewingWatchlist && 'fill-current')} />
-                关注清单
-              </Button>
-              <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
-                <Download className={cn('h-3.5 w-3.5', exporting && 'animate-pulse')} />
-                {exporting ? '导出中…' : '导出'}
-              </Button>
-              <Button
-                variant="outline"
-                size="icon"
-                className="h-10 w-10 lg:h-8 lg:w-8"
-                aria-label="刷新列表"
-                title="按当前条件重新查询列表"
-                disabled={refreshBusy}
-                onClick={refreshList}
-              >
-                <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
-              </Button>
             </div>
+            <button
+              type="button"
+              onClick={() => setMobileFiltersOpen(open => !open)}
+              aria-expanded={mobileFiltersOpen}
+              className={cn(
+                'inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border px-3 text-[12px] font-semibold lg:hidden',
+                mobileFiltersOpen || activeFilterCount > 0 ? 'border-primary/25 bg-accent text-primary' : 'border-border bg-card text-muted-foreground',
+              )}
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" />筛选
+              {activeFilterCount > 0 && <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-bold text-primary-foreground">{activeFilterCount}</span>}
+            </button>
           </div>
 
-          {/* 筛选区：所有筛选芯片同一外观，按可用宽度自动填满、自适应折行；激活的芯片变蓝并直接显示值。 */}
-          <div
-            role="group"
-            aria-label="内容筛选"
-            data-triage-toolbar="secondary"
-            className={cn(
-              'w-full flex-wrap items-stretch gap-1.5 border-t border-border/70 px-3 py-2.5',
-              mobileFiltersOpen ? 'flex' : 'hidden',
-              'lg:flex',
+          <div className="ml-auto inline-flex shrink-0 items-center justify-end gap-1.5">
+            {hasActiveFilters && (
+              <button
+                type="button"
+                onClick={clearFilters}
+                title="清空所有筛选与排序"
+                aria-label={`清空全部 ${activeFilterCount} 项筛选与排序`}
+                className="inline-flex h-10 items-center gap-1 rounded-lg px-2 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground lg:h-8"
+              >
+                <X className="h-3.5 w-3.5" />清空筛选
+                <span className="rounded bg-muted px-1 text-[10px] font-semibold tabular-nums">{activeFilterCount}</span>
+              </button>
             )}
-          >
-            <div role="group" aria-label="情感筛选" className={cn(FILTER_CELL, 'mobile-table-scroll inline-flex h-10 basis-[264px] items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-7')}>
-              {SENTIMENT_OPTIONS.map(([value, label]) => (
-                <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
-                  className={cn('inline-flex h-9 flex-1 items-center justify-center whitespace-nowrap rounded-md px-2 text-[12px] font-medium transition-colors lg:h-6',
-                    sentiment === value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
-                  {label}
-                </button>
-              ))}
-            </div>
-            <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} className={FILTER_TRIGGER_CELL} />
-            <PostIntentFilter value={intents} onChange={setIntents} className={FILTER_TRIGGER_CELL} />
-            <MultiSelect
-              label="处理状态"
-              options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
-              value={triageStatuses}
-              onChange={setTriageStatuses}
-              width="w-56"
-              className={FILTER_CELL}
-              triggerClassName={FILTER_TRIGGER}
-            />
-            <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
-            <SingleSelectFilter label="平台" aria-label="平台筛选" value={platform} options={PLATFORM_OPTIONS} onChange={setPlatform} className={FILTER_TRIGGER_CELL} />
-            <SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value={contentTopic} options={CONTENT_TOPIC_FILTER_OPTIONS} onChange={setContentTopic} className={FILTER_TRIGGER_CELL} />
-            <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
-            <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
-            <MultiSelect
-              label="自定义标签"
-              options={customTagCatalog.map(tag => ({
-                value: tag.id,
-                label: tag.name,
-                count: tag.usageCount,
-              }))}
-              value={customTagIds}
-              onChange={setCustomTagIds}
-              width="w-64"
-              searchable
-              searchPlaceholder="搜索自定义标签…"
-              emptyText="暂无自定义标签"
-              onSearch={loadCustomTagCatalog}
-              className={FILTER_CELL}
-              triggerClassName={FILTER_TRIGGER}
-            />
-            <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} itemClassName={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
+            <Button
+              variant="outline"
+              size="sm"
+              aria-pressed={viewingWatchlist}
+              aria-label={viewingWatchlist ? '关闭关注清单，显示当前生命周期的全部内容' : '打开关注清单'}
+              title={viewingWatchlist ? '显示当前生命周期的全部内容' : '查看人工关注的内容'}
+              onClick={() => setWatchedFilter(viewingWatchlist ? '' : 'watched')}
+              className={cn(viewingWatchlist && 'border-primary/35 bg-primary/8 text-primary hover:bg-primary/12')}
+            >
+              <Star className={cn('h-3.5 w-3.5', viewingWatchlist && 'fill-current')} />
+              关注清单
+            </Button>
+            <Button variant="outline" size="sm" onClick={exportXlsx} disabled={exporting} title="导出当前筛选结果为 Excel">
+              <Download className={cn('h-3.5 w-3.5', exporting && 'animate-pulse')} />
+              {exporting ? '导出中…' : '导出'}
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              className="h-10 w-10 lg:h-8 lg:w-8"
+              aria-label="刷新列表"
+              title="按当前条件重新查询列表"
+              disabled={refreshBusy}
+              onClick={refreshList}
+            >
+              <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+            </Button>
           </div>
+        </div>
+
+        {/* 筛选区：等宽网格，列数按可用宽度自动增减（每列最少 120px），所有芯片同一外观、同一宽度；激活的芯片变蓝并直接显示值。 */}
+        <div
+          role="group"
+          aria-label="内容筛选"
+          data-triage-toolbar="secondary"
+          className={cn(
+            'mt-2 w-full grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-1.5 rounded-xl bg-muted/30 p-3 lg:rounded-none lg:bg-transparent lg:p-0',
+            mobileFiltersOpen ? 'grid' : 'hidden',
+            'lg:grid',
+          )}
+        >
+          <div role="group" aria-label="情感筛选" className={cn(FILTER_CELL, 'col-span-2 mobile-table-scroll inline-flex h-10 items-center overflow-x-auto rounded-lg bg-muted p-0.5 lg:h-7')}>
+            {SENTIMENT_OPTIONS.map(([value, label]) => (
+              <button key={value} type="button" aria-pressed={sentiment === value} onClick={() => setSentiment(value)}
+                className={cn('inline-flex h-9 flex-1 items-center justify-center whitespace-nowrap rounded-md px-2 text-[12px] font-medium transition-colors lg:h-6',
+                  sentiment === value ? 'bg-card text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <PostRelevanceFilter value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} className={FILTER_TRIGGER_CELL} />
+          <PostIntentFilter value={intents} onChange={setIntents} className={FILTER_TRIGGER_CELL} />
+          <MultiSelect
+            label="处理状态"
+            options={contentStatusOptions.map(([value, label]) => ({ value, label }))}
+            value={triageStatuses}
+            onChange={setTriageStatuses}
+            width="w-56"
+            className={FILTER_CELL}
+            triggerClassName={FILTER_TRIGGER}
+          />
+          <MultiSelect label="风险信号" options={RISK_OPTIONS} value={risk} onChange={setRisk} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
+          <SingleSelectFilter label="平台" aria-label="平台筛选" value={platform} options={PLATFORM_OPTIONS} onChange={setPlatform} className={FILTER_TRIGGER_CELL} />
+          <SingleSelectFilter label="内容主题" aria-label="内容主题筛选" value={contentTopic} options={CONTENT_TOPIC_FILTER_OPTIONS} onChange={setContentTopic} className={FILTER_TRIGGER_CELL} />
+          <MultiSelect label="疑似身份" options={IDENTITY_OPTIONS} value={identity} onChange={setIdentity} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
+          <KeywordFilter value={captureKeywords} onChange={setCaptureKeywords} className={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
+          <MultiSelect
+            label="自定义标签"
+            options={customTagCatalog.map(tag => ({
+              value: tag.id,
+              label: tag.name,
+              count: tag.usageCount,
+            }))}
+            value={customTagIds}
+            onChange={setCustomTagIds}
+            width="w-64"
+            searchable
+            searchPlaceholder="搜索自定义标签…"
+            emptyText="暂无自定义标签"
+            onSearch={loadCustomTagCatalog}
+            className={FILTER_CELL}
+            triggerClassName={FILTER_TRIGGER}
+          />
+          <CombinedDateRangeFilter value={dateRanges} onChange={setDateRanges} itemClassName={FILTER_CELL} triggerClassName={FILTER_TRIGGER} />
         </div>
       </div>
 

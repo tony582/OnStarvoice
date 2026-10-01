@@ -160,8 +160,8 @@ test('filters wrap by content width in every layout and keep their labels horizo
   const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* List */}'));
   // 不再按抽屉开关切换等宽网格：筛选 pill 永远按内容宽度排布并自然换行，标签不会被截成「全部平…」。
   assert.doesNotMatch(queue, /xl:grid-cols-|lg:w-\[160px\]|justify-between whitespace-nowrap/);
-  assert.match(filters, /w-full flex-wrap items-stretch gap-1\.5 border-t border-border\/70/);
-  assert.match(queue, /const FILTER_CELL = 'min-w-0 shrink grow basis-\[132px\]'/);
+  assert.match(filters, /mt-2 w-full grid-cols-\[repeat\(auto-fill,minmax\(120px,1fr\)\)\] gap-1\.5/);
+  assert.match(queue, /const FILTER_CELL = 'min-w-0'/);
   assert.match(trigger, /shrink-0 items-center gap-1 whitespace-nowrap/);
   assert.match(component, /inline-flex shrink-0 items-center gap-1 whitespace-nowrap/);
   assert.match(component, /pillTriggerClass\(active, className\)/);
