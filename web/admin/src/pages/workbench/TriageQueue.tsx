@@ -1170,7 +1170,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
             })}
           </div>
 
-          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[220px] lg:flex-1">
+          <div className="order-last flex w-full min-w-0 items-center gap-2 lg:order-none lg:w-auto lg:min-w-[220px] lg:max-w-[380px] lg:flex-1">
             <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input value={keywordDraft} onChange={e => setKeywordDraft(e.target.value)}
