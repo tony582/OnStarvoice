@@ -100,6 +100,7 @@ export async function runDiscoveryTask({ task, store, device, permit, clock = DE
       note('card_skipped', error, { consecutiveSkips });
     };
     const deviceState = await call('inspect');
+    if (deviceState?.feedSkips) note('feed_unreadable_recovered', null, { feedSkips: deviceState.feedSkips });
     requireEvidence(deviceState?.deviceId === task.deviceId, 'device_identity_mismatch');
     requireEvidence(deviceState.connected === true, 'usb_disconnected');
     if (deviceState.readyForSearch === false) throw new RunnerFault(deviceState.reason ?? 'device_not_ready');

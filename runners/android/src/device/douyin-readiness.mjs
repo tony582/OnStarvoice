@@ -1,5 +1,6 @@
 import {DeviceError} from './bounded.mjs';
 import {byId, resource, appNodes, searchEntryNodes} from './douyin-profile.mjs';
+import {pause} from './ui-wait.mjs';
 
 export function assertDouyinScreen(tree) {
   const nodes = appNodes(tree);
@@ -14,14 +15,32 @@ export function assertDouyinScreen(tree) {
 // so step back out of it a bounded number of times before giving up.
 export const UNREADABLE_SCREEN_BACKS = 3;
 
+// The screen a keyword starts on can also be one whose hierarchy read never finishes: the home feed
+// resting on an auto-advancing photo post (2026-10-02). Every later keyword then failed its first
+// read within seconds. The feed is moved on a bounded number of times before giving up. Only the
+// first read does this; every later screen is one this check navigated to itself.
+export const UNREADABLE_FEED_SKIPS = 2;
+export const FEED_SETTLE_MS = 1200;
+
 // A positive own-profile marker is required. Search results alone do not prove login.
-export async function verifyLoginAndSearchEntry(ui, {signal} = {}) {
+export async function verifyLoginAndSearchEntry(ui, {signal, skipFeedItem = null, feedSettleMs = FEED_SETTLE_MS} = {}) {
   const options = {signal};
-  let unreadableBacks = 0;
+  let unreadableBacks = 0, feedSkips = 0, nothingReadYet = true;
   const read = async () => {
     while (true) {
-      try { return await ui.read(options); }
+      try { const tree = await ui.read(options); nothingReadYet = false; return tree; }
       catch (error) {
+        if (error?.code === 'device_timeout') {
+          let moved = false;
+          if (nothingReadYet && skipFeedItem && feedSkips < UNREADABLE_FEED_SKIPS) {
+            // A failed skip must not hide the timeout that led to it.
+            try { moved = await skipFeedItem(options) === true; } catch { moved = false; }
+          }
+          if (!moved) { if (feedSkips) error.feedSkips = feedSkips; throw error; }
+          feedSkips++;
+          await pause(feedSettleMs, signal);
+          continue;
+        }
         if (error?.code !== 'invalid_ui_source') throw error;
         if (unreadableBacks >= UNREADABLE_SCREEN_BACKS) { error.backPresses = unreadableBacks; throw error; }
         unreadableBacks++;
@@ -45,5 +64,5 @@ export async function verifyLoginAndSearchEntry(ui, {signal} = {}) {
   if (!ownProfile(tree)) throw new DeviceError('login_required','Own profile was not confirmed');
   await ui.clickXPath(`//*[@resource-id='${resource('0p3')}' and @content-desc='首页，按钮']`,options);
   await ui.waitFor(tree => searchEntryNodes(tree).length === 1 || byId(tree,'et_search_kw').length === 1,options);
-  return {loggedIn:true, challenge:false};
+  return {loggedIn:true, challenge:false, ...(feedSkips ? {feedSkips} : {})};
 }

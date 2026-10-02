@@ -1,7 +1,8 @@
 import {randomUUID} from 'node:crypto';
 import {bounded, DeviceError, throwIfAborted} from './bounded.mjs';
 import {selectDevice} from './adb.mjs';
-import {assertProfileDevice} from './douyin-profile.mjs';
+import {assertProfileDevice, DOUYIN_P0_PROFILE} from './douyin-profile.mjs';
+import {parseWindowFocus} from './douyin-foreground.mjs';
 import {createUiSession} from './ui-session.mjs';
 import {verifyLoginAndSearchEntry} from './douyin-readiness.mjs';
 import {parkDouyinHome} from './douyin-home.mjs';
@@ -15,7 +16,7 @@ async function step(name, operation) {
   }
 }
 
-export function createProfileSession({serial, profileId, adb, client, onState = () => {}}) {
+export function createProfileSession({serial, profileId, adb, client, onState = () => {}, feedSettleMs}) {
   let sessionId = null, creating = false, uncertain = false, ui = null;
   return {
     get ui() { if (!ui) throw new DeviceError('session_required','Device session is not initialized'); return ui; },
@@ -55,7 +56,15 @@ export function createProfileSession({serial, profileId, adb, client, onState = 
           throw new DeviceError('session_settings_changed','Calibrated session settings changed');
         }
       });
-      const login = await step('login_check', () => verifyLoginAndSearchEntry(ui,options));
+      // Moves the home feed on by one item when its hierarchy cannot be read. Only while Douyin's home
+      // activity holds focus, and through adb: the automation helper is the part that is not answering.
+      const skipFeedItem = async () => {
+        const focus = parseWindowFocus(await adb.windowFocus(serial, options));
+        if (focus?.package !== DOUYIN_P0_PROFILE.packageName || !focus.activity?.endsWith('.splash.SplashActivity')) return false;
+        await adb.swipeUp(serial, options);
+        return true;
+      };
+      const login = await step('login_check', () => verifyLoginAndSearchEntry(ui, {...options, skipFeedItem, feedSettleMs}));
       return {...device,...login,deviceId:serial,unlocked:true,connected:true,readyForSearch:true};
     },
     async parkHome({signal, beforeAction}) {

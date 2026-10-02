@@ -87,6 +87,17 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
     if (/Error/u.test(`${result.stdout}\n${result.stderr}`)) throw new DeviceError('app_launch_failed', 'The app could not be launched');
     return {launched: true};
   };
+  // One upward swipe through the middle of the screen: a vertical feed moves on by one item. The points come
+  // from the display size alone, so no element is addressed and nothing is tapped. It goes through adb because
+  // it is used when the automation helper cannot answer.
+  const swipeUp = async (serial, options = {}) => {
+    const sizes = [...(await dump(serial, 'wm size', options)).matchAll(/(?:Physical|Override) size:\s*(\d{3,4})x(\d{3,4})/gu)];
+    if (!sizes.length) throw new DeviceError('display_size_unknown', 'The display size could not be read');
+    const [width, height] = sizes.at(-1).slice(1).map(Number);
+    const x = Math.round(width / 2), from = Math.round(height * 0.67), to = Math.round(height * 0.27);
+    await call(['-s', serial, 'shell', 'input', 'swipe', String(x), String(from), String(x), String(to), '250'], options);
+    return {swiped: true, width, height};
+  };
   // Developer option "stay awake while charging" (0 = off). Read-only; the runner never changes it.
   const stayOnWhilePluggedIn = async (serial, options = {}) => {
     const value = (await dump(serial, 'settings get global stay_on_while_plugged_in', options)).trim();
@@ -97,5 +108,5 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
     'logcat -d -t 4000 | grep -E "uiautomator2|UiAutomation|lowmemorykiller|am_kill|FATAL EXCEPTION|Process io\\.appium" | tail -n 30 || true',
     options)).split(/\r?\n/u).map(line => line.trim().slice(0, 240)).filter(Boolean).slice(-30);
   return {listDevices, startServer, inspect, inspectApp, helperPids, stopHelper, windowFocus, resumedActivity, keyguardState,
-    powerState, launchActivity, stayOnWhilePluggedIn, automationLog};
+    powerState, launchActivity, swipeUp, stayOnWhilePluggedIn, automationLog};
 }
