@@ -1,6 +1,6 @@
 # 手机采集每个关键词秒失败：一条超长标题堵死上传队列 hotfix（2026-10-02）
 
-分支：`codex/hotfix-android-outbox-poison-20261002`，基线 `main`（`686f359`）。Android Runner `0.2.6` → `0.2.7`，服务端一处校验上限、一处旧轮次事件的认定，后台一处显示。没有数据库迁移，没有新配置项。**Runner 部分只需换本机运行目录即可生效；服务端部分需要部署后生效（部署情况见文末）。**
+分支：`codex/hotfix-android-outbox-poison-20261002`，基线 `main`（`686f359`）。Android Runner `0.2.6` → `0.2.7`，服务端一处校验上限、一处旧轮次事件的认定，后台一处显示。没有数据库迁移，没有新配置项。**Runner 已在本机手机主机上换好；服务端两个文件已于 2026-10-02 11:54:00 部署到生产（发布提交 `750db3e`，PID 621335）。后台的候选标题三行截显没有随本次发布，见文末。**
 
 ## 现象
 
@@ -84,6 +84,7 @@
 | 11:08:59 | 用 `runtime-0.2.7-4af82c1/launcher` 的一键启动器启动（PID 32342）。运行目录由 `git archive 4af82c1 runners/android` 生成，`release-source.sha` 记录完整提交号，`launcher.json` 沿用原状态目录 |
 | 11:09:00 | 第一轮上传：旧的 `blocked` 按新规则重试，服务端回 400 `INVALID_TITLEHINT`（第一次在本机看到真实错误码），那条 2,807 字事件被隔离，队列继续 |
 | 11:17:33 | 队列排空：`pendingEvents=0`、`deliveryBlocked=false`，所有批次已关闭 |
+| 11:37:24 | 换到带「连续被拒放慢」保险的 `runtime-0.2.7-750db3e`（PID 39263）。换版前 Runner 空闲，SIGINT 2 秒停稳，状态库另备份为 `backups/runner-0.2.7-4af82c1-before-750db3e-20261002.sqlite` |
 
 100 条积压的去向：
 
@@ -95,6 +96,41 @@
 
 换版后 Runner 在线、就绪、`controlError=null`，但直到 11:21 没有领到新任务：10:33 那一批的关键词在 10:33–10:40 已经各用完 3 次机会（每次都是 0 秒 `outbox_backlog`），按 `completion.js` 的规则应已标记失败（未查生产库确认）。需要重新下发一轮才会有新的采集。
 
-### 服务端与后台
+### 服务端 — 2026-10-02 11:54:00 已部署
 
-见本文件后续追加的记录。
+范围：Server 2 个文件（`capture-discovery/validation.js`、`capture-discovery/lineage.js`）。没有数据库迁移，不改 Admin 静态文件，不改扩展，不改环境变量。发布包与生成器、演练脚本在 `~/Documents/claude/releases/OnStarvoice-hotfix-android-outbox-750db3e-20261002/`。
+
+发布前核对：
+
+| 项目 | 结果 |
+| --- | --- |
+| CI（运行 36961456876，提交 `750db3e`） | 五项全部通过：`Tests and builds`、`Production Node 18 compatibility`、`PostgreSQL 14 / Node 24.12.0`、`PostgreSQL 16 / Node 24.12.0`、`PostgreSQL 16 / Node 18.20.8` |
+| 本机 Node 18.20.8 全量回归 | 3,228 / 3,228 |
+| 本机 PostgreSQL 17 全量集成（全新库，Node 18.20.8） | 496 / 496（64 个文件） |
+| 本机演练（模拟生产目录 = `bb53e44`，Node 18.20.8 真实启动服务） | 预检通过；被依赖的模块被改过时拒绝；待替换文件不是基线内容时拒绝；启动失败时自动恢复 2 个文件并重启成功；正常部署成功，同一目录再次执行被拒绝 |
+
+过程（Asia/Shanghai，用户在确认框中选择「部署到 47.103.125.200」）：
+
+| 时间 | 操作 | 结果 |
+| --- | --- | --- |
+| 11:44 | 只读核对生产现状 | PID 574642（09-30 09:45:50 起，重启 34 次）；两个待替换文件是 `bb53e44` 的内容；上次发布之后没有 Server 文件被改过；最近的发布目录是 Codex 09-30 14:30 的后台静态发布 `triage-edit-context-bdcc256-20260930` |
+| 11:53:30 | 部署前基线 | 进行中的采集任务 0，手机占用中的工作项 0，5 分钟内在线节点 18 个（含手机 DE106）；PM2 错误日志 345,211 行；`capture_discovery_events` 1,359 行，其中 `late_audit` 37 行 |
+| 11:53 | 上传，`sha256sum -c`，`bash deploy.sh --check` | 2 个待替换文件与 9 个核对模块是 `bb53e44` 的内容，服务就绪 |
+| 11:54:00 | `bash deploy.sh` | 退出码 0；新进程 PID 621335（重启 35 次），Node 18.20.8，角色 all，就绪；磁盘文件与本包一致（`lineage.js` `91152280…`、`validation.js` `ed0766a1…`）；两条发现路由对未带令牌的请求应答与部署前一致（401）；扩展更新清单逐字节未变 |
+| 11:54:33 | 手机 Runner | 已重新连上，`controlError=null`、`deliveryBlocked=false`、`refusedInARow=0` |
+| 11:55:11 | 部署后 71 秒 | PM2 错误日志 0 行新增；PostgreSQL 日志无新 ERROR；部署前在线的 18 个节点全部已重连；重启次数仍为 35 |
+
+生产发布目录：`/opt/onstarvoice-private/releases/hotfix-android-outbox-750db3e-20261002`（含 `backup/`、部署前后的健康与 PM2 状态、`pre-deploy-baseline.txt`）。
+
+还没有在生产上用真实数据看到的两点（靠后续流量自然验证，不为此造数据）：
+
+- 那篇 2,807 字文案的作品：下一轮「别克哨兵」应被正常收下并生成候选，Runner `diagnose` 的 `quarantinedByReason.INVALID_TITLEHINT` 不再增加。
+- 旧轮次事件按迟到证据收下：要等下一次出现「事件还没传完、关键词已被重新派发」才会走到。集成测试在 PostgreSQL 14／16／17 上覆盖了这条路径。
+
+回退：恢复发布目录 `backup/` 里的 2 个文件并重启。没有数据需要回退：按迟到证据收下的事件是普通的 `late_audit` 行，长标题存在 `TEXT` 列里，旧代码都能读。
+
+### 没有随本次发布
+
+- **后台候选标题三行截显**（`DiscoveryCandidates.tsx`）。生产后台是 Codex 09-30 单独发布的 `bdcc256` 构建（内容分诊保存后保留编辑上下文），`main` 不含那次提交，从本分支重新构建后台会把它带掉。改动已在分支里，随下一次后台发布上线。在那之前，超长文案的候选在「手机发现」列表里会完整显示成很长的一段，只影响观感。
+- `server/services/capture-stop-fence-release.js`：`main` 比生产少一个结尾空行（`a4f4bd0`），生产保持原样。
+- 10-02 上午被隔离在手机本机的 64 条发现没有补传。它们的原始内容还在本机状态库里；服务端现在已能收下（只会作为迟到证据保留，不生成候选），需要时可以再放回队列。
