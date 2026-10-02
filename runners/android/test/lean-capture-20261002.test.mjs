@@ -277,4 +277,24 @@ test('returning from a work still requires the verified results page of this key
   await flow.openCard({card: search.cards[0]});
   phone.returnTo(otherResults);
   await assert.rejects(flow.returnToResults({}), {code: 'device_timeout'});
+  // The same keyword is not enough: the 综合 tab must be selected and no filter panel may be open.
+  const otherTab = parseUiTree(xml(node('et_search_kw', keyword)
+    + node('tab', '综合', '', {'resource-id': 'android:id/text1', selected: 'false'})
+    + node('b87', '', node('desc', card.title) + node('ab0', card.author))));
+  const panelOpen = parseUiTree(xml(header + node('b87', '', node('desc', card.title) + node('ab0', card.author))
+    + group('排序依据', '最新发布')));
+  for (const [label, page] of [['综合 tab not selected', otherTab], ['filter panel still open', panelOpen]]) {
+    phone.returnTo(resultsPage);
+    await flow.recoverResults({});
+    await flow.openCard({card: search.cards[0]});
+    phone.returnTo(page);
+    await assert.rejects(flow.returnToResults({}), {code: 'device_timeout'}, label);
+  }
+  // And the verified results page is accepted without opening the filter panel.
+  phone.returnTo(resultsPage);
+  await flow.recoverResults({});
+  const panels = phone.counts.filterPanels;
+  await flow.openCard({card: search.cards[0]});
+  assert.equal((await flow.returnToResults({})).verified, true);
+  assert.equal(phone.counts.filterPanels, panels);
 });

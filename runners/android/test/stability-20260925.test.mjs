@@ -54,6 +54,7 @@ test('the visible part must begin the card caption: another text, author or a pl
     + node('title', author, '', {'content-desc': '按钮'}) + node('vmj'));
   for (const [label, page] of [['another caption, unfolded', videoPage('另一条完全不同的正文\n收起')],
     ['another caption, folded', videoPage('车机壁纸分享 #奔驰... 展开')], ['nothing visible', videoPage('... 展开')],
+    ['unfolded but shorter than the card', videoPage('车机壁纸分享 #别克\n收起')],
     ['another author', videoPage('车机壁纸分享 #别克... 展开', '@另一个作者')],
     ['caption not clickable', plain('车机壁纸分享 #别克... 展开')], ['no UI label', videoPage('车机壁纸分享 #别克')]]) {
     let reads = 0;

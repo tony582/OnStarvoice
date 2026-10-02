@@ -39,8 +39,10 @@ export function readSearch(tree, keyword) {
 }
 
 // 40.6.0 folds a long video caption inside its clickable caption node: the visible part, an ellipsis and an
-// inline "展开" ("... 展开", "…展开"). An unfolded one ends with a UI "收起" (spacing varies). Neither label is tapped.
-const CAPTION_UI_SUFFIX = /(?:(?:\.\.\.|…)\s*展开|\s*收起)$/u;
+// inline "展开" ("... 展开", "…展开"). An unfolded one shows the whole caption and ends with a UI "收起" (spacing
+// varies). Neither label is tapped.
+const FOLDED_LABEL = /(?:\.\.\.|…)\s*展开$/u;
+const UNFOLDED_LABEL = /\s*收起$/u;
 
 export function readDetail(tree) {
   for (const [kind, caption, authorId, share, back] of [
@@ -60,10 +62,10 @@ export function readDetail(tree) {
   return null;
 }
 
-// The opened detail is the clicked card: the same author, and the caption either equals the card's or, for a
-// folded (or unfolded) video caption, its visible part without the UI label begins the card's caption. Nothing is
-// tapped to unfold it: the copied link is the work's identity (2026-10-02). Code-unit prefix, so a fold inside an
-// emoji or a surrogate pair still matches.
+// The opened detail is the clicked card: the same author, and the caption equals the card's. A video caption that
+// shows its UI label is compared without it: unfolded (收起) it must still equal the card's caption, folded (… 展开)
+// its visible part must begin the card's caption. Nothing is tapped to unfold it: the copied link is the work's
+// identity (2026-10-02). Code-unit prefix, so a fold inside an emoji or a surrogate pair still matches.
 export function detailMatchesCard(detail, card) {
   if (!detail || !(detail.author === card.author || detail.author === `@${card.author}`)) return false;
   const wanted = normalizeCaption(card.title);
@@ -72,8 +74,10 @@ export function detailMatchesCard(detail, card) {
   // Preserve all punctuation inside both fields; this is not fuzzy matching.
   if (detail.kind === 'note' && detail.heading && detail.body) captions.push(`${detail.heading}。${detail.body}`);
   if (captions.some(value => normalizeCaption(value) === wanted)) return true;
-  if (detail.kind !== 'video' || detail.captionClickable !== true || !CAPTION_UI_SUFFIX.test(detail.title)) return false;
-  const visible = normalizeCaption(detail.title.replace(CAPTION_UI_SUFFIX, ''));
+  if (detail.kind !== 'video' || detail.captionClickable !== true) return false;
+  if (UNFOLDED_LABEL.test(detail.title)) return normalizeCaption(detail.title.replace(UNFOLDED_LABEL, '')) === wanted;
+  if (!FOLDED_LABEL.test(detail.title)) return false;
+  const visible = normalizeCaption(detail.title.replace(FOLDED_LABEL, ''));
   return visible.length > 0 && wanted.startsWith(visible);
 }
 

@@ -159,6 +159,9 @@ test('the folded visible part must begin the card caption; notes and plain trunc
   assert.equal(detailMatchesCard(folded, card), true);
   assert.equal(detailMatchesCard({ ...folded, title: '新壁纸 @上海…展开' }, card), true);
   assert.equal(detailMatchesCard({ ...folded, title: `${card.title}\n收起` }, card), true);
+  // Unfolded, the whole caption is on screen: it must equal the card's, not merely begin it.
+  assert.equal(detailMatchesCard({ ...folded, title: '新壁纸 @上海安吉星信息服务有限公司\n收起' }, card), false);
+  assert.equal(detailMatchesCard({ ...folded, title: '收起' }, card), false);
   assert.equal(detailMatchesCard({ ...folded, captionClickable: false }, card), false);
   assert.equal(detailMatchesCard({ ...folded, captionClickable: undefined }, card), false);
   assert.equal(detailMatchesCard({ ...folded, title: '新壁纸 @上海...' }, card), false);
