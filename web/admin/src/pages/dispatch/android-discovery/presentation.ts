@@ -18,7 +18,7 @@ const reasons: Record<string, string> = {
   search_filters_changed: '搜索条件发生变化，已暂停采集',
   filter_unverified: '无法确认搜索筛选条件',
   filter_ambiguous: '无法唯一识别搜索筛选选项',
-  existing_record_identity_mismatch: '已有内容与手机作品的正文或作者不一致',
+  existing_record_identity_mismatch: '已有内容与手机作品的作者或作品类型不一致',
   DISCOVERY_DETAIL_IDENTITY_MISMATCH: '浏览器详情与手机作品不一致，未写入正式内容',
   device_closure_required: '上次设备操作是否停止仍需确认',
   lease_expired: '执行许可已过期，等待恢复确认',

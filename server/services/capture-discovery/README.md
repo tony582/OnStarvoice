@@ -12,7 +12,7 @@ The mobile control plane is in `../android-control/` and
 | `service`, `repository`, `lineage`, `validation`, `state` | Authenticated ingestion, immutable event receipts, attempt ownership and canonical candidate persistence |
 | `identity`, `share-resolver` | Douyin URL identity, bounded first-party redirects, public DNS validation and pinned HTTPS connections |
 | `detail-dispatch` | Browser capability admission and real task/item/attempt/create-command materialization |
-| `detail-receipt`, `ui-binding` | Same-transaction formal record receipt, strict current attempt and independently captured body/author/kind checks |
+| `detail-receipt`, `ui-binding` | Same-transaction formal record receipt, strict current attempt and independently captured author/kind checks |
 | `detail-projection` | Terminal task/item/attempt projection using persisted observations, not client success alone |
 | `detail-lifecycle` | Shared-demand batch stop and expired create reconciliation |
 | `management` | Read-only candidate/evidence view and explicit idempotent reprocessing |
@@ -54,11 +54,13 @@ candidate and an active demand. `ui_bound` means the phone matched the search
 card and current detail, and obtained a fresh copied link; it does not assert an
 independently verified work ID. Migration 089 permits this separate state.
 
-Before formal ingestion or reuse of an existing record, the independent browser
-record must match every applicable normal UI-bound demand: full caption (NFC and
-whitespace normalization only), actual author including emoji, and media kind.
-A mismatch rolls back the formal write or marks existing-record reuse as needing
-attention. A truncated share caption is never independent proof.
+The copied link is the work's identity: the resolved work ID must equal the
+record's `external_id`. Before formal ingestion or reuse of an existing record,
+the independent browser record must also match every applicable normal UI-bound
+demand on actual author (one leading @ ignored, emoji kept) and media kind. The
+caption is not compared (since 2026-10-02): `titleHint` is the search card's
+text, kept for display. A mismatch rolls back the formal write or marks
+existing-record reuse as needing attention.
 Candidates are unique per tenant/platform/externalId and are not formal records
 or daily report counts. Existing records retain their classification; hidden
 records are shown with their actual visibility and a demand needing attention.

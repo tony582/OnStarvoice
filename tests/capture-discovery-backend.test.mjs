@@ -27,7 +27,7 @@ test('identity and bounded payload validation refuse ambiguous admission', () =>
   assert.throws(() => normalize({...event, agentId: randomUUID()}), {code: 'AGENT_ID_MISMATCH'});
   assert.throws(() => normalize({...event, verification: undefined}), {code: 'INVALID_VERIFICATION'});
   assert.throws(() => normalize({...event, assignmentRevision: 0}), {code: 'INVALID_ASSIGNMENT_REVISION'});
-  // The hint must hold a whole caption: the captured detail is later compared with it in full.
+  // The hint is the search card's text, kept whole for display (it is hashed with the event, so never shortened).
   assert.equal(normalize({...event, titleHint: 'a'.repeat(2807)}).events[0].titleHint.length, 2807);
   assert.throws(() => normalize({...event, titleHint: 'a'.repeat(20001)}), {code: 'INVALID_TITLEHINT'});
   assert.throws(() => normalize({...event, discoveredAt: '2999-01-01'}), {code: 'INVALID_DISCOVERED_AT'});

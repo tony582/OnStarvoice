@@ -3,9 +3,11 @@ import {normalizeUiBinding} from './ui-binding.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HASH = /^[0-9a-f]{64}$/;
-// The title hint is later compared in full with the captured detail (ui-binding.js), so it has to
-// hold an entire caption. The earlier bound of 2000 was shorter than real Douyin captions: one
-// 2807-character post was refused with the whole batch and stopped a phone's uploads for good.
+// The title hint is the search card's text, kept whole for display in the admin list; it is not
+// compared with the captured detail (ui-binding.js). Real Douyin captions exceed the earlier bound
+// of 2000: one 2807-character post was refused with the whole batch and stopped a phone's uploads for
+// good. Do not shorten the hint here either: the normalized event is hashed, so any change would make
+// replays of events already stored conflict (EVENT_PAYLOAD_CONFLICT).
 const TITLE_HINT_MAX = 20000;
 
 export class DiscoveryError extends Error {

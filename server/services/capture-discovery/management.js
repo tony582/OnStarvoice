@@ -92,7 +92,7 @@ export function createDiscoveryManagementService({database,resolveShareUrl=resol
           }
           let candidateId=event.candidate_id;
           if (!candidateId && identity.status==='resolved') {
-            const record=await tx.queryOne(`SELECT id,business_visibility,title,content,author_name,url FROM records WHERE tenant_id=$1
+            const record=await tx.queryOne(`SELECT id,business_visibility,author_name,url FROM records WHERE tenant_id=$1
               AND platform='douyin' AND external_id=$2 LIMIT 1`,[tenantId,identity.externalId]);
             const candidate=await tx.queryOne(`INSERT INTO capture_discovery_candidates(tenant_id,external_id,canonical_url,
               status,first_seen_at,last_seen_at,record_id) VALUES($1,$2,$3,$4,$5,$5,$6)

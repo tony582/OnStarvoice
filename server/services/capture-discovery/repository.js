@@ -37,7 +37,7 @@ function session(tx) {
           last_seen_at=GREATEST(capture_discovery_candidates.last_seen_at,EXCLUDED.last_seen_at),
           first_seen_at=LEAST(capture_discovery_candidates.first_seen_at,EXCLUDED.first_seen_at)
         RETURNING *`,[principal.tenantId,identity.externalId,identity.canonicalUrl,event.discoveredAt]);
-      const record = await tx.queryOne(`SELECT id,business_visibility,title,content,author_name,url FROM records
+      const record = await tx.queryOne(`SELECT id,business_visibility,author_name,url FROM records
         WHERE tenant_id=$1 AND platform='douyin' AND external_id=$2 LIMIT 1`,[principal.tenantId,identity.externalId]);
       const outcome=candidateOutcome(record);
       const status=record?'already_exists':['already_exists','stored'].includes(previous.status)?'queued':previous.status;

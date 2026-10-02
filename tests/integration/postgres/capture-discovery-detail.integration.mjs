@@ -100,18 +100,20 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
     assert.equal(result.candidates[0].recordId,stored.id);
     assert.equal((await query('SELECT * FROM record_observations WHERE tenant_id=$1',[f.tenantId])).length,1);
   });
-  await t.test('UI-bound candidate requires independent full author and caption before any formal record commits',async st=>{
+  // Since 2026-10-02 the copied link is the work's identity; the caption is not compared.
+  await t.test('UI-bound candidate requires the independently captured author and media kind before any formal record commits; the caption is not compared',async st=>{
     const f=await fixture(st);
     const evidence={verification:'ui_bound',titleHint:'君越车机壁纸很有秋天的味道',authorHint:'真实用户',
       uiBinding:{profileId:'douyin-30.6.0-de106-api27-p0',cardId:'b'.repeat(64),kind:'video'}};
     await f.addRun(undefined,service,evidence);const detail=await f.dispatch();
     for(const change of [{author_name:'上海安吉星信息服务有限公司'},
-      {title:'君越车机壁纸...',content:'君越车机壁纸...'}]) {
+      {url:'https://www.douyin.com/note/7654321098765432109'}]) {
       await assert.rejects(f.store(detail,change),{code:'DISCOVERY_DETAIL_IDENTITY_MISMATCH'});
       assert.equal((await query('SELECT id FROM records WHERE tenant_id=$1',[f.tenantId])).length,0);
       assert.equal((await query('SELECT id FROM record_observations WHERE tenant_id=$1',[f.tenantId])).length,0);
     }
-    const stored=await f.store(detail);assert.ok(stored.id);
+    // A body the browser captured shorter than the card's caption no longer refuses the work.
+    const stored=await f.store(detail,{title:'君越车机壁纸...',content:'君越车机壁纸...'});assert.ok(stored.id);
     const mismatched=await f.addRun(undefined,service,{...evidence,authorHint:'另一个人'});
     assert.equal(mismatched.receipt.reason,'existing_record_identity_mismatch');
     const readback=await management.list({tenantId:f.tenantId,runId:mismatched.taskId});

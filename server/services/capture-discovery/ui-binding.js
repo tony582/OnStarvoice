@@ -1,6 +1,5 @@
 import {DiscoveryError} from './validation.js';
 
-const caption = value => String(value ?? '').normalize('NFC').replace(/\s+/gu, '');
 // The existing PC collector removes one leading @ from the publisher name.
 // Match that presentation rule without changing the raw mobile evidence or
 // stripping internal @ signs, emoji, or any other nickname characters.
@@ -13,15 +12,16 @@ export function normalizeUiBinding(input) {
   return {profileId:input.profileId, cardId:input.cardId, kind:input.kind};
 }
 
-// Never use the copied share caption as independent evidence. This comparison
-// runs against the browser's actual record, within the formal ingestion transaction.
+// The copied link is the work's identity: the record's platform and work ID must equal the candidate
+// resolved from that link (detail-receipt.js; repository.js looks the record up by it). The caption
+// is not compared: titleHint is the search card's text, kept for display only (2026-10-02). Two cheap
+// cross-checks remain against the browser's actual record, inside the formal ingestion transaction:
+// the publisher shown on the card and the media kind seen on the phone.
 export function matchesUiBoundRecord(event, record) {
   if (event.verification !== 'ui_bound') return true;
-  const expected = caption(event.titleHint);
   const kind = String(record?.url || '').match(/douyin\.com\/(note|video)\/\d{16,22}/)?.[1];
-  return !!expected && !!author(event.authorHint) && !!event.uiBinding
-    && kind === event.uiBinding.kind && author(record?.author_name) === author(event.authorHint)
-    && [record?.title, record?.content].some(value => caption(value) === expected);
+  return !!author(event.authorHint) && !!event.uiBinding
+    && kind === event.uiBinding.kind && author(record?.author_name) === author(event.authorHint);
 }
 
 export async function assertUiBoundIngestion(tx, {tenantId, candidateId, record}) {
