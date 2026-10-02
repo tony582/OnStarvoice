@@ -155,7 +155,7 @@ node runners/android/cli.mjs retry-delivery --state-dir /path/to/state
 
 事件、固定 uploadBatchId 与退避状态均持久保存。先查询已落库回执再补传，网络重试不重做 UI。身份冲突／鉴权失败保留队列并要求处理根因；候选不是正式记录，不计入日报。
 
-0.2.7 起，服务端因请求内容本身拒收（HTTP 400／413／422）不再停住整个队列：整批被拒时拆开逐条重发，只有单独发送仍被拒的那一条标记为 `rejected` 留在本机（原始内容不删），其余继续上传。`status` 的 `lastRefusal`／`deliveryError` 与 `diagnose` 的 `quarantined` 给出服务端错误码、关键词和标题长度，不含标题原文；一键窗口同时打印一行提示。401／403／404／409 仍停住队列并记下原因，等人处理。见 [20261002 hotfix](../../docs/hotfix/20261002-android-outbox-poison.md)。
+0.2.7 起，服务端因某一条事件本身拒收不再停住整个队列。包括两类：请求内容被拒（HTTP 400／413／422），以及事件所属的轮次已被重新派发（403 `ATTEMPT_LINEAGE_MISMATCH`／`DISCOVERY_TASK_MISMATCH`）。整批被拒时先取回已入库事件的回执，再拆开逐条重发，只有单独发送仍被拒的那一条标记为 `rejected` 留在本机（原始内容不删），其余继续上传。`status` 的 `lastRefusal`／`deliveryError` 与 `diagnose` 的 `quarantinedByReason`／`quarantined` 给出服务端错误码、关键词和标题长度，不含标题原文；一键窗口同时打印一行提示。401、其它 403、404、409 仍停住队列并记下原因，等人处理。见 [20261002 hotfix](../../docs/hotfix/20261002-android-outbox-poison.md)。
 
 ## 服务端短链 DNS
 

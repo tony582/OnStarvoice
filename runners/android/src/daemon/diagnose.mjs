@@ -33,5 +33,5 @@ export function diagnoseRunner(store, {hours = 24, now = Date.now()} = {}) {
     summary: {runs: runs.length, finished: runs.filter(run => DONE.has(run.status)).length,
       endedEarly: runs.filter(run => !DONE.has(run.status)).length, links: runs.reduce((sum, run) => sum + run.links, 0),
       skippedCards: runs.reduce((sum, run) => sum + run.skipped, 0), byReason},
-    quarantined: store.listQuarantined?.(20) ?? [], runs, problems};
+    quarantinedByReason: store.quarantineReasons?.() ?? {}, quarantined: store.listQuarantined?.(20) ?? [], runs, problems};
 }

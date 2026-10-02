@@ -39,6 +39,32 @@ function cloud(refused, {status = 400, serverCode = 'INVALID_TITLEHINT', known =
         receipts: batch.events.map(event => ({eventId: event.eventId, receiptId: randomUUID(), status: 'accepted'}))};
     }};
 }
+// Behaves like the real ingestion: the request is validated as a whole before anything is saved, then
+// events are saved one by one, so a refusal in the middle leaves the earlier ones accepted for good.
+function faithfulServer({invalid = () => false, superseded = () => false} = {}) {
+  const saved = new Map();
+  const posts = [];
+  return {saved, posts,
+    getReceipts: async uploadBatchId => ({ok: true, uploadBatchId,
+      receipts: [...saved.values()].filter(row => row.uploadBatchId === uploadBatchId).map(row => row.receipt)}),
+    ingest: async batch => {
+      posts.push(batch.events.map(event => event.eventId));
+      if (batch.events.some(invalid)) throw new CloudRequestError('cloud_http_400', {status: 400, serverCode: 'INVALID_TITLEHINT'});
+      const receipts = [];
+      for (const event of batch.events) {
+        const existing = saved.get(event.eventId);
+        if (existing && existing.uploadBatchId !== batch.uploadBatchId) {
+          throw new CloudRequestError('cloud_http_409', {status: 409, serverCode: 'EVENT_BATCH_CONFLICT'});
+        }
+        if (existing) { receipts.push({...existing.receipt, status: 'duplicate'}); continue; }
+        if (superseded(event)) throw new CloudRequestError('cloud_http_403', {status: 403, serverCode: 'ATTEMPT_LINEAGE_MISMATCH'});
+        const receipt = {eventId: event.eventId, receiptId: randomUUID(), status: 'accepted'};
+        saved.set(event.eventId, {uploadBatchId: batch.uploadBatchId, receipt});
+        receipts.push(receipt);
+      }
+      return {ok: true, uploadBatchId: batch.uploadBatchId, receipts};
+    }};
+}
 async function drain(store, client, retryState = {}) {
   const statuses = [];
   for (let turn = 0; turn < 60; turn++) {
@@ -104,8 +130,54 @@ test('events already accepted before a refusal keep their receipts and are never
   assert.equal(store.quarantinedCount(), 1);
 });
 
+// After 21:26 the finished keywords could not report completion, their leases ran out and the server
+// handed the same keywords out again (revision 2, 3). Events of the earlier attempts are refused one
+// by one with 403 ATTEMPT_LINEAGE_MISMATCH, after the events before them in the batch were accepted.
+test('events of a superseded attempt are set aside one by one and accepted events never travel under a second batch', async () => {
+  const events = Array.from({length: 9}, (_, index) => discovery(index));
+  const old = new Set([2, 5, 6].map(index => events[index].eventId));
+  const store = seeded(events);
+  const server = faithfulServer({superseded: event => old.has(event.eventId)});
+  const {statuses, retryState} = await drain(store, server);
+  // Offering an accepted event under another batch would end in 409 EVENT_BATCH_CONFLICT and hold the queue.
+  assert.deepEqual(statuses, ['split', 'quarantined', 'delivered', 'delivered', 'split', 'quarantined', 'quarantined', 'delivered', 'delivered', 'idle']);
+  assert.equal(store.pendingCount(), 0);
+  for (const [index, event] of events.entries()) {
+    const stored = store.getEvent(event.eventId);
+    if (old.has(event.eventId)) {
+      assert.deepEqual([stored.state, stored.receipt.reason, stored.receipt.quarantinedBy], ['rejected', 'ATTEMPT_LINEAGE_MISMATCH', 'runner'], `event ${index}`);
+    } else {
+      assert.deepEqual([stored.state, stored.receipt.receiptId], ['acked', server.saved.get(event.eventId).receipt.receiptId], `event ${index}`);
+    }
+  }
+  assert.deepEqual(store.quarantineReasons(), {ATTEMPT_LINEAGE_MISMATCH: 3});
+  assert.equal(retryState.blocked, undefined);
+  assert.equal(retryState.lastRefusal.serverCode, 'ATTEMPT_LINEAGE_MISMATCH');
+});
+
+test('when receipts cannot be read right after a refusal the batch stays whole and is taken apart on a later turn', async () => {
+  const events = Array.from({length: 3}, (_, index) => discovery(index));
+  const store = seeded(events);
+  const server = faithfulServer({superseded: event => event.eventId === events[1].eventId});
+  let lookups = 0;
+  const flaky = {...server, getReceipts: async uploadBatchId => {
+    if (++lookups === 2) throw new CloudRequestError('cloud_http_503', {status: 503, retryable: true});
+    return server.getReceipts(uploadBatchId);
+  }};
+  const first = await deliverPendingBatch({store, client: flaky, now: () => 1000, random: () => 0});
+  assert.equal(first.status, 'deferred');
+  assert.equal(first.retryState.blocked, false);
+  assert.deepEqual([store.pendingCount(), store.quarantinedCount()], [3, 0]);
+  const {statuses} = await drain(store, flaky, first.retryState);
+  assert.deepEqual(statuses, ['split', 'quarantined', 'delivered', 'idle']);
+  assert.deepEqual([store.pendingCount(), store.quarantinedCount()], [0, 1]);
+  assert.deepEqual(events.map(event => store.getEvent(event.eventId).state), ['acked', 'rejected', 'acked']);
+  assert.equal(server.posts.flat().filter(id => id === events[0].eventId).length, 2, 'the accepted event is only ever re-sent inside its own batch');
+});
+
 test('a refusal that is about this runner, not an event, still stops uploads and now records why', async () => {
-  for (const [status, serverCode] of [[401, null], [403, 'MOBILE_AGENT_NOT_AUTHORIZED'], [404, 'discovery_not_enabled'], [409, 'BATCH_PAYLOAD_CONFLICT']]) {
+  for (const [status, serverCode] of [[401, null], [403, null], [403, 'MOBILE_AGENT_NOT_AUTHORIZED'], [403, 'mobile_discovery_agent_required'],
+    [404, 'discovery_not_enabled'], [409, 'BATCH_PAYLOAD_CONFLICT'], [409, 'EVENT_BATCH_CONFLICT']]) {
     const store = seeded([discovery(0), discovery(1)]);
     const client = cloud(() => true, {status, serverCode});
     const first = await deliverPendingBatch({store, client, now: () => 1000, random: () => 0});
@@ -185,6 +257,7 @@ test('status, diagnose and the one-click window say what was refused without sho
   assert.equal(status.lastRefusal.serverCode, 'INVALID_TITLEHINT');
   const report = diagnoseRunner(store, {hours: 1});
   assert.equal(report.quarantined.length, 1);
+  assert.deepEqual(report.quarantinedByReason, {INVALID_TITLEHINT: 1});
   assert.deepEqual({keyword: report.quarantined[0].keyword, reason: report.quarantined[0].reason, titleLength: report.quarantined[0].titleLength},
     {keyword: '别克哨兵', reason: 'INVALID_TITLEHINT', titleLength: 2807});
   assert.equal(JSON.stringify(report).includes('十十十'), false);

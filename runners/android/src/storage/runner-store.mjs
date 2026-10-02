@@ -64,6 +64,11 @@ export class RunnerStore {
       .map((row) => ({ eventId: row.event_id, keyword: row.keyword, discoveredAt: row.discovered_at,
         titleLength: row.title_length ?? 0, reason: row.receipt ? JSON.parse(row.receipt).reason ?? null : null }));
   }
+  /** How many events were set aside, by the reason recorded with them. */
+  quarantineReasons() {
+    return Object.fromEntries(this.db.prepare(`SELECT COALESCE(json_extract(receipt, '$.reason'), 'unknown') AS reason, COUNT(*) AS count
+      FROM events WHERE state = 'rejected' GROUP BY 1 ORDER BY 2 DESC`).all().map((row) => [row.reason, row.count]));
+  }
   /** Read-only listing for local diagnostics. */
   listCheckpoints() {
     return this.db.prepare('SELECT run_id, revision, payload FROM checkpoints').all()

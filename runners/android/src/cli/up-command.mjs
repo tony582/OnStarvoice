@@ -66,7 +66,7 @@ export function describeDelivery(delivery) {
 }
 
 async function watchReadiness(daemon, {stdout, sleep, signal, watchMs}) {
-  let last, lastOutcomeAt = daemon.lastOutcome?.at ?? null, lastHint = null, lastDeliveryAt = null;
+  let last, lastOutcomeAt = daemon.lastOutcome?.at ?? null, lastHint = null, lastDeliveryAt = null, lastNote = null, lastNoteAt = 0;
   while (!signal.aborted) {
     const line = describeReadiness(daemon);
     if (line !== last) { stdout(line); last = line; }
@@ -79,7 +79,12 @@ async function watchReadiness(daemon, {stdout, sleep, signal, watchMs}) {
     if (daemon.lastDelivery && daemon.lastDelivery.at !== lastDeliveryAt) {
       lastDeliveryAt = daemon.lastDelivery.at;
       const note = describeDelivery(daemon.lastDelivery);
-      if (note) stdout(note);
+      // A run of refusals for the same reason is announced once, then at most every ten minutes.
+      if (note && (note !== lastNote || Date.now() - lastNoteAt >= 600_000)) {
+        stdout(note);
+        lastNote = note;
+        lastNoteAt = Date.now();
+      }
     }
     await sleep(watchMs, signal);
   }
