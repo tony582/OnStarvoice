@@ -2,6 +2,7 @@ import {existsSync} from 'node:fs';
 import {join, resolve} from 'node:path';
 import {createInterface} from 'node:readline';
 import {Writable} from 'node:stream';
+import {REFUSAL_PAUSE_MS} from '../cloud/delivery.mjs';
 import {AndroidDaemon} from '../daemon/runtime.mjs';
 import {readConfig} from '../daemon/state.mjs';
 import {setupRunner} from '../daemon/setup.mjs';
@@ -59,6 +60,9 @@ export function describeDelivery(delivery) {
   if (delivery?.status === 'needs_action' && delivery.blocked) {
     return `【上传已暂停】服务端拒绝上传${cause}，需要人工处理；可用 diagnose 查看原因`;
   }
+  if (delivery?.status === 'quarantined' && delivery.pausedUntil) {
+    return `【上传已放慢】服务端连续拒收了 ${delivery.refusedInARow} 条发现${cause}，改为每 ${REFUSAL_PAUSE_MS / 60_000} 分钟只试 1 条；服务端恢复后自动继续，可用 diagnose 查看原因`;
+  }
   if (delivery?.status === 'quarantined' || delivery?.status === 'needs_action') {
     return `【上传】服务端拒收了发现${cause}，已单独隔离，其余继续上传；可用 diagnose 查看`;
   }
@@ -79,10 +83,10 @@ async function watchReadiness(daemon, {stdout, sleep, signal, watchMs}) {
     if (daemon.lastDelivery && daemon.lastDelivery.at !== lastDeliveryAt) {
       lastDeliveryAt = daemon.lastDelivery.at;
       const note = describeDelivery(daemon.lastDelivery);
-      // A run of refusals for the same reason is announced once, then at most every ten minutes.
-      if (note && (note !== lastNote || Date.now() - lastNoteAt >= 600_000)) {
+      // A run of refusals for the same reason is announced once, then at most every half hour (counts aside).
+      if (note && (note.replace(/\d+/gu, '') !== lastNote || Date.now() - lastNoteAt >= 1_800_000)) {
         stdout(note);
-        lastNote = note;
+        lastNote = note.replace(/\d+/gu, '');
         lastNoteAt = Date.now();
       }
     }

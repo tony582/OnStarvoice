@@ -4,13 +4,15 @@ import {createControlClient} from '../cloud/control-client.mjs';
 import {randomUUID} from 'node:crypto';
 import {fixedLockRoot, setCheckpoint, stateValue} from './state.mjs';
 
-export function daemonStatus(store) {
+export function daemonStatus(store, now = Date.now()) {
   const status = stateValue(store, 'daemon:status');
   let processAlive = false;
   try { if (status?.pid) { process.kill(status.pid, 0); processAlive = true; } } catch {}
   const delivery = stateValue(store, 'network:delivery');
   return {...status, processAlive, pendingEvents: store.pendingCount(), quarantinedEvents: store.quarantinedCount(),
     deliveryBlocked: !!delivery?.blocked, deliveryError: delivery?.error ?? null, lastRefusal: delivery?.lastRefusal ?? null,
+    refusedInARow: delivery?.refusedInARow ?? 0,
+    deliveryPausedUntil: delivery?.pausedUntil > now ? new Date(delivery.pausedUntil).toISOString() : null,
     completionPending: !!stateValue(store, 'daemon:completion')};
 }
 export function requestLocalStop(store) {

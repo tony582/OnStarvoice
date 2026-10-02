@@ -6,7 +6,7 @@ import {randomUUID} from 'node:crypto';
 import test from 'node:test';
 import {RunnerStore} from '../src/storage/runner-store.mjs';
 import {createCloudClient, CloudRequestError} from '../src/cloud/client.mjs';
-import {deliverPendingBatch, summarizeDelivery} from '../src/cloud/delivery.mjs';
+import {deliverPendingBatch, summarizeDelivery, REFUSALS_BEFORE_PAUSE, REFUSAL_PAUSE_MS} from '../src/cloud/delivery.mjs';
 import {daemonStatus} from '../src/daemon/local-control.mjs';
 import {diagnoseRunner} from '../src/daemon/diagnose.mjs';
 import {describeDelivery} from '../src/cli/up-command.mjs';
@@ -175,6 +175,83 @@ test('when receipts cannot be read right after a refusal the batch stays whole a
   assert.equal(server.posts.flat().filter(id => id === events[0].eventId).length, 2, 'the accepted event is only ever re-sent inside its own batch');
 });
 
+// Setting everything aside would hide a server fault or a version mismatch: keywords would finish
+// while nothing reaches the server. A long run of refusals therefore slows uploads down, so waiting
+// events pile up and keywords end with outbox_backlog, which is the failure a person can see.
+test('a long run of refusals slows uploads to one event per pause and resumes by itself once the server accepts again', async () => {
+  const events = Array.from({length: REFUSALS_BEFORE_PAUSE + 12}, (_, index) => discovery(index));
+  const store = seeded(events);
+  let broken = true;
+  const server = faithfulServer({invalid: () => broken});
+  let clock = 1_790_900_000_000;
+  let retryState = {};
+  const statuses = [];
+  const turn = async () => {
+    const result = await deliverPendingBatch({store, client: server, retryState, now: () => clock});
+    retryState = result.retryState;
+    statuses.push(result.status);
+    return result;
+  };
+  const until = async reached => {
+    for (let turns = 0; turns < 300; turns++) { const result = await turn(); if (reached(result)) return result; }
+    return assert.fail('uploads never reached the expected state');
+  };
+  let result = await until(outcome => outcome.retryState.pausedUntil);
+  // The first refusals are set aside at full speed, exactly up to the limit.
+  assert.equal(store.quarantinedCount(), REFUSALS_BEFORE_PAUSE);
+  assert.equal(store.pendingCount(), 12);
+  assert.deepEqual([result.status, result.retryState.refusedInARow, result.retryState.pausedUntil],
+    ['quarantined', REFUSALS_BEFORE_PAUSE, clock + REFUSAL_PAUSE_MS]);
+  assert.match(describeDelivery(summarizeDelivery(result)), /^【上传已放慢】服务端连续拒收了 20 条发现（INVALID_TITLEHINT），改为每 10 分钟只试 1 条；服务端恢复后自动继续/u);
+
+  // During the pause nothing is sent, however often the loop turns.
+  const sentBefore = server.posts.length;
+  clock += REFUSAL_PAUSE_MS - 1;
+  assert.equal((await turn()).status, 'deferred');
+  assert.equal(server.posts.length, sentBefore);
+  store.saveCheckpoint('network:delivery', retryState, 0);
+  const paused = daemonStatus(store, clock);
+  assert.deepEqual([paused.refusedInARow, paused.deliveryPausedUntil, paused.deliveryBlocked, paused.lastRefusal.serverCode],
+    [REFUSALS_BEFORE_PAUSE, new Date(retryState.pausedUntil).toISOString(), false, 'INVALID_TITLEHINT']);
+  assert.equal(daemonStatus(store, retryState.pausedUntil).deliveryPausedUntil, null);
+
+  // When the pause ends, one more event is tried and set aside, and the pause starts again.
+  clock += 1;
+  result = await until(outcome => outcome.status !== 'split');
+  assert.deepEqual([result.status, store.quarantinedCount(), store.pendingCount(), result.retryState.pausedUntil],
+    ['quarantined', REFUSALS_BEFORE_PAUSE + 1, 11, clock + REFUSAL_PAUSE_MS]);
+  assert.equal((await turn()).status, 'deferred');
+
+  // The server is repaired. The next try is accepted, the count is forgotten and the rest drains at full speed.
+  broken = false;
+  clock += REFUSAL_PAUSE_MS;
+  statuses.length = 0;
+  await until(outcome => outcome.status === 'idle');
+  assert.equal(statuses.includes('deferred'), false);
+  assert.equal(statuses.includes('quarantined'), false);
+  assert.deepEqual([store.pendingCount(), store.quarantinedCount()], [0, REFUSALS_BEFORE_PAUSE + 1]);
+  assert.deepEqual([retryState.refusedInARow, retryState.pausedUntil, retryState.nextAttemptAt], [undefined, undefined, 0]);
+});
+
+test('refusals with accepted events in between never add up to a pause', async () => {
+  const events = Array.from({length: (REFUSALS_BEFORE_PAUSE + 5) * 2}, (_, index) => discovery(index));
+  const bad = new Set(events.filter((_, index) => index % 2 === 0).map(event => event.eventId));
+  const store = seeded(events);
+  const server = faithfulServer({superseded: event => bad.has(event.eventId)});
+  let retryState = {};
+  const statuses = [];
+  for (let turn = 0; turn < 400; turn++) {
+    const result = await deliverPendingBatch({store, client: server, retryState, now: () => 1_790_900_000_000 + turn});
+    retryState = result.retryState;
+    statuses.push(result.status);
+    assert.equal(result.retryState.pausedUntil, undefined);
+    if (result.status === 'idle') break;
+  }
+  assert.equal(statuses.at(-1), 'idle');
+  assert.equal(statuses.includes('deferred'), false);
+  assert.deepEqual([store.pendingCount(), store.quarantinedCount()], [0, REFUSALS_BEFORE_PAUSE + 5]);
+});
+
 test('a refusal that is about this runner, not an event, still stops uploads and now records why', async () => {
   for (const [status, serverCode] of [[401, null], [403, null], [403, 'MOBILE_AGENT_NOT_AUTHORIZED'], [403, 'mobile_discovery_agent_required'],
     [404, 'discovery_not_enabled'], [409, 'BATCH_PAYLOAD_CONFLICT'], [409, 'EVENT_BATCH_CONFLICT']]) {
@@ -272,13 +349,15 @@ test('a held queue names its recorded cause again after a restart', async () => 
   const store = seeded([discovery(0)]);
   const client = cloud(() => true, {status: 403, serverCode: 'MOBILE_AGENT_NOT_AUTHORIZED'});
   const first = await deliverPendingBatch({store, client, now: () => 1000, random: () => 0});
-  assert.deepEqual(summarizeDelivery(first), {status: 'needs_action', blocked: true, uploadBatchId: null, code: 'MOBILE_AGENT_NOT_AUTHORIZED'});
+  const held = {status: 'needs_action', blocked: true, uploadBatchId: null, code: 'MOBILE_AGENT_NOT_AUTHORIZED', pausedUntil: null, refusedInARow: 0};
+  assert.deepEqual(summarizeDelivery(first), held);
   // The process restarts: only the persisted state is left, and the first turn returns before any request.
   const afterRestart = await deliverPendingBatch({store, client, retryState: first.retryState, now: () => 9_000_000});
-  assert.deepEqual(summarizeDelivery(afterRestart), {status: 'needs_action', blocked: true, uploadBatchId: null, code: 'MOBILE_AGENT_NOT_AUTHORIZED'});
+  assert.deepEqual(summarizeDelivery(afterRestart), held);
   assert.match(describeDelivery(summarizeDelivery(afterRestart)), /上传已暂停.*MOBILE_AGENT_NOT_AUTHORIZED/u);
   const refused = await deliverPendingBatch({store: seeded([discovery(1)]), client: cloud(() => true), now: () => 1000});
-  assert.deepEqual({...summarizeDelivery(refused), uploadBatchId: null}, {status: 'quarantined', blocked: false, uploadBatchId: null, code: 'INVALID_TITLEHINT'});
+  assert.deepEqual({...summarizeDelivery(refused), uploadBatchId: null},
+    {status: 'quarantined', blocked: false, uploadBatchId: null, code: 'INVALID_TITLEHINT', pausedUntil: null, refusedInARow: 1});
 });
 
 test('the server keeps a whole caption, because the captured detail is later compared with it in full', () => {

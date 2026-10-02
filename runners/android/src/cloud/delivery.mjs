@@ -25,6 +25,13 @@ const PAYLOAD_REFUSED = new Set([400, 413, 422]);
 const EVENT_ORIGIN_REFUSED = new Set(['ATTEMPT_LINEAGE_MISMATCH', 'DISCOVERY_TASK_MISMATCH']);
 const refusesEvents = error => error instanceof CloudRequestError
   && (PAYLOAD_REFUSED.has(error.status) || (error.status === 403 && EVENT_ORIGIN_REFUSED.has(error.serverCode)));
+// Refusals in a row with nothing accepted in between. A few bad events are simply set aside. This
+// many in a row means the cause is probably not in the events (a server fault, a version mismatch),
+// and setting everything aside would hide it: keywords would finish while nothing reaches the server.
+// From then on only one event is tried per pause. Waiting events pile up, keywords end with
+// outbox_backlog, and that failure is what a person sees. The first accepted event ends it.
+export const REFUSALS_BEFORE_PAUSE = 20;
+export const REFUSAL_PAUSE_MS = 600_000;
 const failure = (error, batch, now) => ({code: error.code || 'delivery_failed', serverCode: error.serverCode ?? null,
   status: error.status || 0, uploadBatchId: batch.uploadBatchId, at: new Date(now()).toISOString()});
 
@@ -32,7 +39,8 @@ const failure = (error, batch, now) => ({code: error.code || 'delivery_failed', 
 export function summarizeDelivery(result) {
   const cause = result.retryState?.error;
   return {status: result.status, blocked: !!result.retryState?.blocked, uploadBatchId: result.uploadBatchId ?? null,
-    code: result.serverCode ?? result.error ?? cause?.serverCode ?? cause?.code ?? null};
+    code: result.serverCode ?? result.error ?? cause?.serverCode ?? cause?.code ?? null,
+    pausedUntil: result.retryState?.pausedUntil ?? null, refusedInARow: result.retryState?.refusedInARow ?? 0};
 }
 
 // One bounded delivery attempt. The caller owns cadence and persists retryState
@@ -47,8 +55,12 @@ export async function deliverPendingBatch({store, client, retryState = {},
   if (retryState.blocked) return {status: 'needs_action', retryState};
   // After a refused batch its events are offered one at a time for as many turns as it held.
   const singles = Math.max(0, retryState.singles || 0);
-  const rested = () => ({failures: 0, nextAttemptAt: 0, ...(retryState.lastRefusal ? {lastRefusal: retryState.lastRefusal} : {})});
-  const settled = (extra = {}) => ({...rested(), ...(singles > 1 ? {singles: singles - 1} : {}), ...extra});
+  const refusedInARow = Math.max(0, retryState.refusedInARow || 0);
+  const kept = {...(retryState.lastRefusal ? {lastRefusal: retryState.lastRefusal} : {})};
+  const rested = () => ({failures: 0, nextAttemptAt: 0, ...kept, ...(refusedInARow ? {refusedInARow} : {})});
+  const oneSingleDone = singles > 1 ? {singles: singles - 1} : {};
+  // An accepted event proves the server takes this runner's uploads: the run of refusals is over.
+  const accepted = () => ({failures: 0, nextAttemptAt: 0, ...kept, ...oneSingleDone});
   const batch = store.nextBatch({limit: singles > 0 ? 1 : 5});
   if (!batch) return {status: 'idle', retryState: rested()};
   const stopped = error => signal?.aborted || error.code === 'cloud_aborted';
@@ -64,14 +76,14 @@ export async function deliverPendingBatch({store, client, retryState = {},
     const known = await takeReceipts();
     if (known.length === batch.events.length) {
       return {status: known.some(r => r.status === 'rejected') ? 'needs_action' : 'delivered',
-        uploadBatchId: batch.uploadBatchId, retryState: settled()};
+        uploadBatchId: batch.uploadBatchId, retryState: accepted()};
     }
     uploading = true;
     const receipts = checkedReceipts(await client.ingest(batch, {signal}), batch);
     if (receipts.length !== batch.events.length) throw new CloudRequestError('incomplete_cloud_receipt');
     store.ackBatch(batch.uploadBatchId, receipts);
     return {status: receipts.some(r => r.status === 'rejected') ? 'needs_action' : 'delivered',
-      uploadBatchId: batch.uploadBatchId, retryState: settled()};
+      uploadBatchId: batch.uploadBatchId, retryState: accepted()};
   } catch (error) {
     if (stopped(error)) return {status: 'stopped', retryState};
     cause = error;
@@ -88,9 +100,12 @@ export async function deliverPendingBatch({store, client, retryState = {},
         store.dissolveBatch(batch.uploadBatchId);
         return {status: 'split', ...refused, retryState: {...rested(), singles: waiting, lastRefusal}};
       }
-      if (!waiting) return {status: 'delivered', uploadBatchId: batch.uploadBatchId, retryState: settled()};
+      if (!waiting) return {status: 'delivered', uploadBatchId: batch.uploadBatchId, retryState: accepted()};
       store.quarantineBatch(batch.uploadBatchId, {reason: lastRefusal.serverCode ?? lastRefusal.code, at: lastRefusal.at});
-      return {status: 'quarantined', ...refused, retryState: settled({lastRefusal})};
+      const inARow = refusedInARow + 1;
+      const pausedUntil = inARow >= REFUSALS_BEFORE_PAUSE ? now() + REFUSAL_PAUSE_MS : 0;
+      return {status: 'quarantined', ...refused, retryState: {failures: 0, nextAttemptAt: pausedUntil, ...oneSingleDone,
+        lastRefusal, refusedInARow: inARow, ...(pausedUntil ? {pausedUntil} : {})}};
     } catch (error) {
       if (stopped(error)) return {status: 'stopped', retryState};
       cause = error; // Nothing was taken apart; the next turn starts over from the batch's receipts.
@@ -102,5 +117,5 @@ export async function deliverPendingBatch({store, client, retryState = {},
     Math.min(60000, 1000 * 2 ** Math.min(failures - 1, 6)) * (1 + random() * 0.2));
   return {status: retryable ? 'deferred' : 'needs_action', error: cause.code || 'delivery_failed', serverCode: cause.serverCode ?? null,
     retryState: {failures, blocked: !retryable, nextAttemptAt: now() + Math.ceil(delay), error: failure(cause, batch, now),
-      ...(singles ? {singles} : {}), ...(retryState.lastRefusal ? {lastRefusal: retryState.lastRefusal} : {})}};
+      ...(singles ? {singles} : {}), ...kept, ...(refusedInARow ? {refusedInARow} : {})}};
 }

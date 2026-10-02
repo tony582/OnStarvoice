@@ -83,8 +83,26 @@ test('historical real attempts are audit-only and missing history is refused', (
   const now = Date.parse('2026-09-22T02:00:00Z');
   assert.equal(validateLineage(current, event, now).late, false);
   for (const change of [{assignment_revision: 2}, {task_status: 'completed'},
-    {stop_requested: true}, {deadline_at: ''}, {attempt_status: 'interrupted'}]) {
+    {stop_requested: true}, {deadline_at: ''}, {attempt_status: 'interrupted'},
+    // The keyword was handed out again: the item now points at a newer execution task.
+    {execution_task_id: randomUUID(), assignment_revision: 2, attempt_count: 2}]) {
     assert.equal(validateLineage({...current, ...change}, event, now).late, true);
   }
   assert.throws(() => validateLineage(null, event, now), {code: 'ATTEMPT_LINEAGE_MISMATCH'});
+});
+
+test('the lineage lookup finds an earlier attempt after its keyword moved to a newer execution task', async () => {
+  // Pinning the item's current execution task here turned every event of a superseded attempt into
+  // 403 ATTEMPT_LINEAGE_MISMATCH (2026-10-01). The attempt row itself must still bind the event's task.
+  const calls = [];
+  const {loadLineage} = await import('../server/services/capture-discovery/lineage.js');
+  await loadLineage({queryOne: async (sql, values) => { calls.push({sql, values}); return null; }}, principal, event);
+  const [{sql, values}] = calls;
+  assert.doesNotMatch(sql, /item\.execution_task_id\s*=\s*\$/u);
+  assert.match(sql, /attempt\.execution_task_id = \$5/u);
+  assert.match(sql, /attempt\.parent_task_id = item\.task_id/u);
+  assert.match(sql, /attempt\.agent_id = \$4/u);
+  assert.match(sql, /attempt\.assignment_revision = \$6 AND attempt\.request_hash = \$7/u);
+  assert.deepEqual(values, [event.attemptId, principal.tenantId, event.itemId, principal.agentId,
+    event.taskId, event.assignmentRevision, event.requestHash]);
 });

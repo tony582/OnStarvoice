@@ -142,6 +142,36 @@ test('discovery receipts and candidate ownership against isolated PostgreSQL', a
       {code: 'MOBILE_AGENT_NOT_AUTHORIZED'});
   });
 
+  // 2026-10-01: a phone could not upload for a night, its leases ran out and the same keywords were
+  // handed out again under new execution tasks. Every event of the earlier attempts was then refused.
+  await t.test('an attempt whose keyword was handed out again under a newer execution task is still audit only', async st => {
+    const f = await fixture(st);
+    const [{id: newerTaskId}] = await query(`INSERT INTO capture_tasks(tenant_id,origin_agent_id,assigned_agent_id,
+      platform,status,metadata) VALUES($1,$2,$2,'douyin','running',$3) RETURNING id`,
+    [f.tenantId, f.agentId, {workflow: 'douyin_mobile_discovery', deadlineAt: new Date(Date.now() + 600_000).toISOString()}]);
+    await query(`UPDATE capture_task_items SET execution_task_id=$2,assignment_revision=2,attempt_count=2 WHERE id=$1`,
+      [f.itemId, newerTaskId]);
+    const [{id: newerAttemptId}] = await query(`INSERT INTO capture_task_item_attempts(tenant_id,item_id,parent_task_id,
+      execution_task_id,agent_id,attempt_number,assignment_revision,request_hash,status)
+      VALUES($1,$2,$3,$4,$5,2,2,$6,'running') RETURNING id`,
+    [f.tenantId, f.itemId, f.taskId, newerTaskId, f.agentId, f.event.requestHash]);
+
+    const earlier = (await f.ingest()).receipts[0];
+    assert.deepEqual([earlier.status, earlier.deliveryMode, earlier.candidateId], ['accepted', 'late_audit', null]);
+    assert.equal((await f.rows('capture_discovery_candidates')).length, 0);
+    const [stored] = await f.rows('capture_discovery_events');
+    assert.deepEqual([stored.task_id, stored.attempt_id, stored.delivery_mode], [f.taskId, f.event.attemptId, 'late_audit']);
+
+    // The earlier attempt cannot be used to write into the run that replaced it.
+    await assert.rejects(f.ingest({eventId: randomUUID(), taskId: newerTaskId, discoveryRunId: newerTaskId}),
+      {code: 'ATTEMPT_LINEAGE_MISMATCH'});
+    const current = (await f.ingest({eventId: randomUUID(), taskId: newerTaskId, discoveryRunId: newerTaskId,
+      attemptId: newerAttemptId, assignmentRevision: 2})).receipts[0];
+    assert.equal(current.deliveryMode, 'normal');
+    assert.ok(current.candidateId);
+    assert.equal((await f.rows('capture_discovery_run_candidates'))[0].run_id, newerTaskId);
+  });
+
   await t.test('stop intent and deadline block new candidate work without erasing evidence', async st => {
     const f = await fixture(st);
     await query(`UPDATE capture_tasks SET metadata=metadata||$2::jsonb WHERE id=$1`,

@@ -36,10 +36,14 @@ export async function loadLineage(tx, principal, event) {
     JOIN capture_tasks task ON task.id = attempt.execution_task_id AND task.tenant_id = attempt.tenant_id
     WHERE attempt.id = $1 AND attempt.tenant_id = $2 AND attempt.item_id = $3
       AND attempt.agent_id = $4 AND attempt.execution_task_id = $5
-      -- The run is the child (execution) task. Standalone runs keep
+      -- The run is the attempt's own child (execution) task. Standalone runs keep
       -- parent_task_id = task_id; orchestration children carry the item on the
       -- parent, so the attempt's parent_task_id equals the item's task_id.
-      AND attempt.parent_task_id = item.task_id AND item.execution_task_id = $5
+      -- The item's current execution task is not matched here. Once a keyword is
+      -- handed out again the item points at a newer child, and the earlier attempt
+      -- must still be found so that its evidence is kept as late audit;
+      -- validateLineage compares the two and decides.
+      AND attempt.parent_task_id = item.task_id
       AND attempt.assignment_revision = $6 AND attempt.request_hash = $7
     FOR SHARE OF task, item, attempt
   `, [event.attemptId, principal.tenantId, event.itemId, principal.agentId,
