@@ -16,7 +16,7 @@ async function step(name, operation) {
   }
 }
 
-export function createProfileSession({serial, profileId, adb, client, onState = () => {}, feedSettleMs}) {
+export function createProfileSession({serial, profileId, adb, client, onState = () => {}, feedSettleMs, slowReadMs}) {
   let sessionId = null, creating = false, uncertain = false, ui = null;
   return {
     get ui() { if (!ui) throw new DeviceError('session_required','Device session is not initialized'); return ui; },
@@ -56,15 +56,15 @@ export function createProfileSession({serial, profileId, adb, client, onState = 
           throw new DeviceError('session_settings_changed','Calibrated session settings changed');
         }
       });
-      // Moves the home feed on by one item when its hierarchy cannot be read. Only while Douyin's home
-      // activity holds focus, and through adb: the automation helper is the part that is not answering.
+      // Moves the home feed on by one item when reading it is slow or does not finish. Only while Douyin's
+      // home activity holds focus, and through adb: the automation helper is the part that is busy.
       const skipFeedItem = async () => {
         const focus = parseWindowFocus(await adb.windowFocus(serial, options));
         if (focus?.package !== DOUYIN_P0_PROFILE.packageName || !focus.activity?.endsWith('.splash.SplashActivity')) return false;
         await adb.swipeUp(serial, options);
         return true;
       };
-      const login = await step('login_check', () => verifyLoginAndSearchEntry(ui, {...options, skipFeedItem, feedSettleMs}));
+      const login = await step('login_check', () => verifyLoginAndSearchEntry(ui, {...options, skipFeedItem, feedSettleMs, slowReadMs}));
       return {...device,...login,deviceId:serial,unlocked:true,connected:true,readyForSearch:true};
     },
     async parkHome({signal, beforeAction}) {
