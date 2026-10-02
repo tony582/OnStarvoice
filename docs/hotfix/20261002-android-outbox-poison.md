@@ -68,4 +68,26 @@
 
 ## 部署与本机处置
 
-见本文件后续追加的记录。
+### 本机手机（DE106，`829d89`）— 2026-10-02 已完成
+
+| 时间 | 动作 |
+| --- | --- |
+| 11:08:38 | 确认 Runner 空闲（无任务、无待回报完成）后向 `runtime-0.2.6-d68201d`（PID 16495）发 SIGINT，2 秒内受控停止，`deviceClosureRequired=false` |
+| 11:08 | 状态库备份为 `StarVoice-Android/backups/runner-0.2.6-before-0.2.7-4af82c1-20261002.sqlite`（完整性检查通过：1,323 已上传、1 待回执、99 待上传，`network:delivery` 为 `blocked`） |
+| 11:08:59 | 用 `runtime-0.2.7-4af82c1/launcher` 的一键启动器启动（PID 32342）。运行目录由 `git archive 4af82c1 runners/android` 生成，`release-source.sha` 记录完整提交号，`launcher.json` 沿用原状态目录 |
+| 11:09:00 | 第一轮上传：旧的 `blocked` 按新规则重试，服务端回 400 `INVALID_TITLEHINT`（第一次在本机看到真实错误码），那条 2,807 字事件被隔离，队列继续 |
+| 11:17:33 | 队列排空：`pendingEvents=0`、`deliveryBlocked=false`，所有批次已关闭 |
+
+100 条积压的去向：
+
+| 结果 | 条数 | 说明 |
+| --- | --- | --- |
+| 隔离，`ATTEMPT_LINEAGE_MISMATCH` | 61 | 分配版本 1、2 的旧轮次：别克哨兵 8 + 24、至境哨兵 25、凯迪拉克壁纸 1 + 2、别克壁纸 1 |
+| 隔离，`INVALID_TITLEHINT` | 3 | 同一篇 2,807 字作品在三轮「别克哨兵」里各出现一次 |
+| 服务端收下，`late_audit` | 36 | 分配版本 3 的轮次：上汽通用客服 16、别克哨兵 16、至境哨兵 4。迟到证据只留作核对，不生成候选 |
+
+换版后 Runner 在线、就绪、`controlError=null`，但直到 11:21 没有领到新任务：10:33 那一批的关键词在 10:33–10:40 已经各用完 3 次机会（每次都是 0 秒 `outbox_backlog`），按 `completion.js` 的规则应已标记失败（未查生产库确认）。需要重新下发一轮才会有新的采集。
+
+### 服务端与后台 — 未部署
+
+`TITLE_HINT_MAX` 与候选标题三行显示需要部署服务端并重新构建后台。部署前的影响仅限于：那篇超长文案的作品每轮被隔离 1 条，其它一切正常。分支未推送。
