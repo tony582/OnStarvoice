@@ -155,6 +155,8 @@ node runners/android/cli.mjs retry-delivery --state-dir /path/to/state
 
 事件、固定 uploadBatchId 与退避状态均持久保存。先查询已落库回执再补传，网络重试不重做 UI。身份冲突／鉴权失败保留队列并要求处理根因；候选不是正式记录，不计入日报。
 
+0.2.7 起，服务端因请求内容本身拒收（HTTP 400／413／422）不再停住整个队列：整批被拒时拆开逐条重发，只有单独发送仍被拒的那一条标记为 `rejected` 留在本机（原始内容不删），其余继续上传。`status` 的 `lastRefusal`／`deliveryError` 与 `diagnose` 的 `quarantined` 给出服务端错误码、关键词和标题长度，不含标题原文；一键窗口同时打印一行提示。401／403／404／409 仍停住队列并记下原因，等人处理。见 [20261002 hotfix](../../docs/hotfix/20261002-android-outbox-poison.md)。
+
 ## 服务端短链 DNS
 
 默认仍使用系统 DNS。若当前网络将 `v.douyin.com` 解析为代理合成地址（例如 `198.18.0.0/15`），后端会保留事件并显示“链接域名解析到了受限地址”，不会把它计为入库成功。

@@ -40,6 +40,41 @@ export function nextBatch(db, { limit = 5 } = {}) {
   });
 }
 
+const WAITING = "SELECT e.event_id FROM events e JOIN batch_events b ON e.event_id = b.event_id WHERE b.batch_id = ? AND e.state = 'batched'";
+
+/** Events of this batch that still wait for a receipt. */
+export function unackedInBatch(db, batchId) {
+  return db.prepare(WAITING).all(batchId).length;
+}
+
+// A refused batch is taken apart so its events can be offered one at a time. Only events
+// without a receipt go back to pending (oldest first again); acknowledged ones keep their batch.
+export function dissolveBatch(db, batchId) {
+  return transaction(db, () => {
+    const rows = db.prepare(WAITING).all(batchId);
+    for (const row of rows) {
+      db.prepare('DELETE FROM batch_events WHERE batch_id = ? AND event_id = ?').run(batchId, row.event_id);
+      db.prepare("UPDATE events SET state = 'pending' WHERE event_id = ?").run(row.event_id);
+    }
+    db.prepare("UPDATE batches SET state = 'closed' WHERE id = ?").run(batchId);
+    return { released: rows.length };
+  });
+}
+
+// The server refused this event on its own. It leaves the queue as 'rejected' with a local
+// marker instead of holding up every later event; the payload stays in the store for review.
+export function quarantineBatch(db, batchId, marker = {}) {
+  return transaction(db, () => {
+    const rows = db.prepare(WAITING).all(batchId);
+    for (const row of rows) {
+      db.prepare("UPDATE events SET state = 'rejected', receipt = ? WHERE event_id = ?")
+        .run(canonicalJson({ ...marker, eventId: row.event_id, status: 'rejected', quarantinedBy: 'runner' }), row.event_id);
+    }
+    db.prepare("UPDATE batches SET state = 'closed' WHERE id = ?").run(batchId);
+    return { quarantined: rows.length };
+  });
+}
+
 export function ackBatch(db, batchId, receipts) {
   if (!Array.isArray(receipts)) throw new TypeError('Receipts must be an array');
   return transaction(db, () => {

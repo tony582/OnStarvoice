@@ -3,6 +3,10 @@ import {normalizeUiBinding} from './ui-binding.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HASH = /^[0-9a-f]{64}$/;
+// The title hint is later compared in full with the captured detail (ui-binding.js), so it has to
+// hold an entire caption. The earlier bound of 2000 was shorter than real Douyin captions: one
+// 2807-character post was refused with the whole batch and stopped a phone's uploads for good.
+const TITLE_HINT_MAX = 20000;
 
 export class DiscoveryError extends Error {
   constructor(code, status = 400) {
@@ -84,7 +88,7 @@ export function normalizeBatch(batch, principal, now = Date.now()) {
       deliveryMode: input.deliveryMode || 'normal',
       keyword: text(input.keyword, 'keyword', 256, true),
       rawShareUrl: text(input.rawShareUrl, 'rawShareUrl', 4096),
-      titleHint: text(input.titleHint, 'titleHint', 2000),
+      titleHint: text(input.titleHint, 'titleHint', TITLE_HINT_MAX),
       authorHint: text(input.authorHint, 'authorHint', 512),
       publishTimeRaw: text(input.publishTimeRaw, 'publishTimeRaw', 128),
       evidenceRef: text(input.evidenceRef, 'evidenceRef', 512),

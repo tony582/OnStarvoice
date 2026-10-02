@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { canonicalJson } from './codec.mjs';
-import { recordEvent, nextBatch, ackBatch } from './outbox.mjs';
+import { recordEvent, nextBatch, ackBatch, unackedInBatch, dissolveBatch, quarantineBatch } from './outbox.mjs';
 
 export class RunnerStore {
   constructor(path) {
@@ -36,6 +36,9 @@ export class RunnerStore {
   recordEvent(payload) { return recordEvent(this.db, payload); }
   nextBatch(options) { return nextBatch(this.db, options); }
   ackBatch(batchId, receipts) { return ackBatch(this.db, batchId, receipts); }
+  unackedInBatch(batchId) { return unackedInBatch(this.db, batchId); }
+  dissolveBatch(batchId) { return dissolveBatch(this.db, batchId); }
+  quarantineBatch(batchId, marker) { return quarantineBatch(this.db, batchId, marker); }
   getEvent(eventId) {
     const row = this.db.prepare('SELECT payload, state, receipt FROM events WHERE event_id = ?').get(eventId);
     return row ? { payload: JSON.parse(row.payload), state: row.state, receipt: row.receipt ? JSON.parse(row.receipt) : null } : null;
@@ -52,6 +55,14 @@ export class RunnerStore {
       FROM events WHERE json_extract(payload, '$.discoveryRunId') = ? AND json_extract(payload, '$.itemId') = ?
       AND json_extract(payload, '$.verification') IN ('verified','ui_bound')`).all(discoveryRunId, itemId);
     return rows.map((row) => row.work_id).filter((id) => typeof id === 'string' && /^(?:\d{16,22}|ui:[a-f0-9]{64})$/.test(id));
+  }
+  /** Read-only, text-free listing of locally quarantined events, newest first. */
+  listQuarantined(limit = 20) {
+    return this.db.prepare(`SELECT event_id, json_extract(payload, '$.keyword') AS keyword,
+      json_extract(payload, '$.discoveredAt') AS discovered_at, length(json_extract(payload, '$.titleHint')) AS title_length, receipt
+      FROM events WHERE state = 'rejected' ORDER BY rowid DESC LIMIT ?`).all(limit)
+      .map((row) => ({ eventId: row.event_id, keyword: row.keyword, discoveredAt: row.discovered_at,
+        titleLength: row.title_length ?? 0, reason: row.receipt ? JSON.parse(row.receipt).reason ?? null : null }));
   }
   /** Read-only listing for local diagnostics. */
   listCheckpoints() {

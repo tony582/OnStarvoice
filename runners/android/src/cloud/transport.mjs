@@ -2,10 +2,10 @@ const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
 const MAX_RESPONSE_BYTES = 256 * 1024;
 
 export class CloudRequestError extends Error {
-  constructor(code, {status = 0, retryAfterMs = 0, retryable = false} = {}) {
+  constructor(code, {status = 0, retryAfterMs = 0, retryable = false, serverCode = null} = {}) {
     super(code);
     this.name = 'CloudRequestError';
-    Object.assign(this, {code, status, retryAfterMs, retryable});
+    Object.assign(this, {code, status, retryAfterMs, retryable, serverCode});
   }
 }
 
@@ -51,6 +51,15 @@ async function readJson(response) {
   } finally { reader.releaseLock(); }
 }
 
+// An error body contributes only its short machine code (e.g. INVALID_TITLEHINT). Free text,
+// which could echo request content or credentials, never leaves this function.
+async function serverErrorCode(response) {
+  try {
+    const payload = await readJson(response);
+    return typeof payload?.error === 'string' && /^[A-Za-z0-9_]{1,80}$/u.test(payload.error) ? payload.error : null;
+  } catch { return null; }
+}
+
 export function createTransport({baseUrl, agentToken, fetchImpl = fetch,
   timeoutMs = 10000, now = Date.now} = {}) {
   const origin = normalizeCloudUrl(baseUrl);
@@ -86,9 +95,8 @@ export function createTransport({baseUrl, agentToken, fetchImpl = fetch,
           ...(body ? {body: JSON.stringify(body)} : {}),
         });
         if (!response.ok) {
-          await response.body?.cancel().catch(() => {});
           throw new CloudRequestError(`cloud_http_${response.status}`, {
-            status: response.status,
+            status: response.status, serverCode: await serverErrorCode(response),
             retryAfterMs: retryDelay(response.headers.get('retry-after'), now),
             retryable: response.status === 429 || response.status >= 500,
           });

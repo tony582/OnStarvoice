@@ -55,3 +55,12 @@ test('missing a caption emoji remains an identity mismatch',()=>{
   assert.equal(matchesUiBoundRecord(observed,{...captured,title:captured.title.replace('🚩','')}),false);
   assert.equal(matchesUiBoundRecord(observed,captured),true);
 });
+test('a caption longer than the old 2000-character bound is kept whole so the captured detail still matches it',()=>{
+  // 2026-10-01: a 2807-character caption was refused, and shortening it instead would break this comparison.
+  const caption='十五万人走到漠北，找不到敌人。'.repeat(190);
+  const observed=normalize({...event,titleHint:caption});
+  assert.equal(observed.titleHint.length,caption.length);
+  const captured={url,title:caption.slice(0,40),content:caption,author_name:event.authorHint};
+  assert.equal(matchesUiBoundRecord(observed,captured),true);
+  assert.equal(matchesUiBoundRecord({...observed,titleHint:caption.slice(0,2000)},captured),false);
+});

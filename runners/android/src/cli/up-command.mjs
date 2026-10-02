@@ -53,8 +53,20 @@ export function describeOutcome(outcome) {
   return parts.join(' · ');
 }
 
+/** One line when uploads are held, or when the server refuses discoveries and the rest carry on. */
+export function describeDelivery(delivery) {
+  const cause = delivery?.code ? `（${delivery.code}）` : '';
+  if (delivery?.status === 'needs_action' && delivery.blocked) {
+    return `【上传已暂停】服务端拒绝上传${cause}，需要人工处理；可用 diagnose 查看原因`;
+  }
+  if (delivery?.status === 'quarantined' || delivery?.status === 'needs_action') {
+    return `【上传】服务端拒收了发现${cause}，已单独隔离，其余继续上传；可用 diagnose 查看`;
+  }
+  return null;
+}
+
 async function watchReadiness(daemon, {stdout, sleep, signal, watchMs}) {
-  let last, lastOutcomeAt = daemon.lastOutcome?.at ?? null, lastHint = null;
+  let last, lastOutcomeAt = daemon.lastOutcome?.at ?? null, lastHint = null, lastDeliveryAt = null;
   while (!signal.aborted) {
     const line = describeReadiness(daemon);
     if (line !== last) { stdout(line); last = line; }
@@ -63,6 +75,11 @@ async function watchReadiness(daemon, {stdout, sleep, signal, watchMs}) {
     if (daemon.lastOutcome && daemon.lastOutcome.at !== lastOutcomeAt) {
       lastOutcomeAt = daemon.lastOutcome.at;
       stdout(describeOutcome(daemon.lastOutcome));
+    }
+    if (daemon.lastDelivery && daemon.lastDelivery.at !== lastDeliveryAt) {
+      lastDeliveryAt = daemon.lastDelivery.at;
+      const note = describeDelivery(daemon.lastDelivery);
+      if (note) stdout(note);
     }
     await sleep(watchMs, signal);
   }

@@ -10,7 +10,7 @@ import {readDeviceClosure} from '../core/device-closure.mjs';
 import {acquireDeviceLock, inspectDeviceLock} from '../core/device-lock.mjs';
 import {createCloudClient} from '../cloud/client.mjs';
 import {createControlClient} from '../cloud/control-client.mjs';
-import {deliverPendingBatch} from '../cloud/delivery.mjs';
+import {deliverPendingBatch, summarizeDelivery} from '../cloud/delivery.mjs';
 import {createSimulationDevice} from './simulation.mjs';
 import {assertSimulationOrigin, fixedLockRoot, readConfig, setCheckpoint, stateValue} from './state.mjs';
 
@@ -248,6 +248,11 @@ export class AndroidDaemon {
       const result = await deliverPendingBatch({store: this.store, client: this.delivery,
         retryState: stateValue(this.store, 'network:delivery') ?? {}, signal: this.shutdown.signal});
       setCheckpoint(this.store, 'network:delivery', result.retryState);
+      // One note per change for the one-click window: a held queue or a newly refused event.
+      const summary = summarizeDelivery(result);
+      if (summary.status !== this.lastDelivery?.status || summary.uploadBatchId !== this.lastDelivery?.uploadBatchId) {
+        this.lastDelivery = {...summary, at: Date.now()};
+      }
       await delay(this.deliveryMs, this.shutdown.signal);
     }
   }

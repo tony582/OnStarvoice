@@ -36,7 +36,7 @@ export function DiscoveryCandidates({candidates, events, writable, busy, onRepro
             {writable && source && <input type="checkbox" aria-label={`选择 ${candidate.titleHint || '作品'}`} checked={selected.includes(source.eventId)} disabled={busy || (!selected.includes(source.eventId) && selectedIds.length >= 5)}
               onChange={event => setSelected(ids => event.target.checked ? [...ids, source.eventId] : ids.filter(id => id !== source.eventId))} className="mt-1 h-4 w-4"/>}
             <div className="min-w-0 flex-1">
-              <p className="break-words text-sm font-medium">{candidate.titleHint || '作品标题待补充'}</p>
+              <p className="line-clamp-3 break-words text-sm font-medium" title={candidate.titleHint || undefined}>{candidate.titleHint || '作品标题待补充'}</p>
               <p className="mt-1 text-xs text-muted-foreground">{candidate.authorHint || '作者待补充'} · {candidate.keyword}</p>
               <p className="mt-2 text-xs">{candidate.recordId && candidate.recordVisibility !== 'eligible' ? '已有记录，待审核' : statusLabel(candidate.status)}{candidate.demandStatus === 'canceled' ? ' · 本批需求已停止' : ''}</p>
               {candidate.reason && <p className="mt-1 text-xs text-amber-700">{reasonLabel(candidate.reason)}</p>}
@@ -51,7 +51,7 @@ export function DiscoveryCandidates({candidates, events, writable, busy, onRepro
       {pending.map(event => <label key={event.eventId} className="flex items-start gap-2 text-xs leading-5">
         {writable && <input type="checkbox" checked={selected.includes(event.eventId)} disabled={busy || (!selected.includes(event.eventId) && selectedIds.length >= 5)} className="mt-1"
           onChange={e => setSelected(ids => e.target.checked ? [...ids, event.eventId] : ids.filter(id => id !== event.eventId))}/>}
-        <span>{event.titleHint || event.keyword} · {event.deliveryMode === 'late_audit' ? '迟到证据，保留供核对' : reasonLabel(event.resolutionError) || statusLabel(event.resolutionStatus)}</span>
+        <span className="line-clamp-3 min-w-0 break-words">{event.titleHint || event.keyword} · {event.deliveryMode === 'late_audit' ? '迟到证据，保留供核对' : reasonLabel(event.resolutionError) || statusLabel(event.resolutionStatus)}</span>
       </label>)}
     </div>}
   </section>
