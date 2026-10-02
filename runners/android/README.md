@@ -73,7 +73,7 @@ node runners/android/cli.mjs setup --state-dir /path/to/private/android-state --
 
 领取任务前每次轮询都重新探测手机：ADB 在线、机型/抖音版本、Appium 就绪、亮屏、未锁屏、抖音持有前台焦点；不再沿用旧的 `readyForSearch=true`。抖音退到后台且手机已解锁时，只通过审核过的 `com.ss.android.ugc.aweme/.main.MainActivity` 用 `am start` 拉起（不 reset、不清数据，每 60 秒最多一次），拉起后重新核对版本与前台包名；登录与搜索入口在任务开始的 inspect 中核对。息屏或锁屏时报告 `device_asleep`/`device_locked`，Runner 不会唤醒或解锁手机。`status` 的 `deviceProbe` 显示最近一次探测结果。见 [20260924 hotfix](../../docs/hotfix/20260924-android-opencard-detail-ready.md)。
 
-0.2.8 起，任务开始的第一次读屏如果超时（任务结束回到首页后，信息流正好停在自动轮播的图文作品上，UiAutomator2 取不到层级），Runner 会在确认抖音首页持有焦点后用 `adb shell input swipe` 把信息流滑到下一条再重读，最多 2 次；发生过时本机诊断里有一条 `feed_unreadable_recovered`。见 [20261002 hotfix](../../docs/hotfix/20261002-android-feed-read-timeout.md)。
+0.2.8 起，任务开始的第一次读屏如果超时或耗时达到 4 秒（任务结束回到首页后，信息流停在一条取层级很慢的作品上；DE106 实测不同作品 2–6 秒不等，个别超过 10 秒），Runner 会在确认抖音首页持有焦点后用 `adb shell input swipe` 把信息流滑到下一条再重读，最多 3 次、总共不超过 25 秒；这一步里点「我」和「首页」的元素查找上限同时放宽到 10 秒。发生过时本机诊断里有一条 `feed_unreadable_recovered`。见 [20261002 hotfix](../../docs/hotfix/20261002-android-feed-read-timeout.md)。
 
 ```sh
 node runners/android/cli.mjs status --state-dir /path/to/private/android-state
