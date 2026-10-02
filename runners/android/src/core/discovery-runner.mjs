@@ -16,7 +16,7 @@ export const MAX_CONSECUTIVE_SKIPS = 4;
 const CONTROL_CODES = new Set(['user_stop', 'operator_takeover', 'remote_stop', 'lease_expired', 'usb_disconnected', 'aborted']);
 const DETAIL_KEYS = ['cause', 'recovery', 'attempts', 'elapsedMs', 'budgetMs', 'observed', 'activity', 'stage', 'backPresses',
   'skippedCards', 'skipLimitReached', 'previousAttemptId', 'previousAssignmentRevision', 'previousStatus', 'previousReason',
-  'w3cError', 'launched', 'focus', 'wakefulness', 'expandOutcome', 'operation', 'consecutiveSkips'];
+  'w3cError', 'launched', 'focus', 'wakefulness', 'operation', 'consecutiveSkips'];
 
 /** Bounded, PII-free diagnostics carried into the completion checkpoint. */
 export function faultDetails(error) {

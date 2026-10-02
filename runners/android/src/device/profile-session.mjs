@@ -20,7 +20,7 @@ export function createProfileSession({serial, profileId, adb, client, onState = 
   let sessionId = null, creating = false, uncertain = false, ui = null;
   return {
     get ui() { if (!ui) throw new DeviceError('session_required','Device session is not initialized'); return ui; },
-    async inspect({signal, afterCreate = null} = {}) {
+    async inspect({signal, afterCreate = null, loginProven = () => false} = {}) {
       const options = {signal};
       const device = await step('device_check', async () => {
         const value = await adb.inspect(serial, options);
@@ -64,7 +64,9 @@ export function createProfileSession({serial, profileId, adb, client, onState = 
         await adb.swipeUp(serial, options);
         return true;
       };
-      const login = await step('login_check', () => verifyLoginAndSearchEntry(ui, {...options, skipFeedItem, feedSettleMs, slowReadMs}));
+      const ownProfileProven = loginProven() === true;
+      const login = await step('login_check', () => verifyLoginAndSearchEntry(ui, {...options, skipFeedItem, feedSettleMs,
+        slowReadMs, ownProfileProven}));
       return {...device,...login,deviceId:serial,unlocked:true,connected:true,readyForSearch:true};
     },
     async parkHome({signal, beforeAction}) {

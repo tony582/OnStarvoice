@@ -38,30 +38,52 @@ export function readSearch(tree, keyword) {
   return { verified, keyword, cards };
 }
 
+// 40.6.0 folds a long video caption inside its clickable caption node: the visible part, an ellipsis and an
+// inline "展开" ("... 展开", "…展开"). An unfolded one ends with a UI "收起" (spacing varies). Neither label is tapped.
+const CAPTION_UI_SUFFIX = /(?:(?:\.\.\.|…)\s*展开|\s*收起)$/u;
+
 export function readDetail(tree) {
   for (const [kind, caption, authorId, share, back] of [
     ['note', 'tv_desc', 'w67', 'n00', 'iv_back'], ['video', 'desc', 'title', 'vmj', null],
   ]) {
-    const body = oneText(byId(tree, caption));
+    const captionNodes = byId(tree, caption);
+    const body = oneText(captionNodes);
     const heading = kind === 'note' ? oneText(byId(tree, 'tv_title')) : null;
     const title = heading ? `${heading} ${body ?? ''}`.trim() : body;
     const authors = byId(tree, authorId).filter(node => kind !== 'video'
       || node.attributes.text?.startsWith('@') && node.attributes['content-desc'] === '按钮');
     const author = oneText(authors);
-    if (title && author && byId(tree, share).length === 1) return { kind, title, author, share, back, ...(heading ? { heading, body: body ?? '' } : {}) };
+    if (title && author && byId(tree, share).length === 1) return { kind, title, author, share, back,
+      ...(heading ? { heading, body: body ?? '' } : {}),
+      ...(kind === 'video' ? { captionClickable: captionNodes[0]?.attributes.clickable === 'true' } : {}) };
   }
   return null;
 }
 
+// The opened detail is the clicked card: the same author, and the caption either equals the card's or, for a
+// folded (or unfolded) video caption, its visible part without the UI label begins the card's caption. Nothing is
+// tapped to unfold it: the copied link is the work's identity (2026-10-02). Code-unit prefix, so a fold inside an
+// emoji or a surrogate pair still matches.
 export function detailMatchesCard(detail, card) {
-  if (!detail) return false;
+  if (!detail || !(detail.author === card.author || detail.author === `@${card.author}`)) return false;
+  const wanted = normalizeCaption(card.title);
   const captions = [detail.title];
   // Search may join a separate note heading and body with a full stop.
   // Preserve all punctuation inside both fields; this is not fuzzy matching.
   if (detail.kind === 'note' && detail.heading && detail.body) captions.push(`${detail.heading}。${detail.body}`);
-  return captions.some(value => normalizeCaption(value) === normalizeCaption(card.title))
-    && (detail.author === card.author || detail.author === `@${card.author}`);
+  if (captions.some(value => normalizeCaption(value) === wanted)) return true;
+  if (detail.kind !== 'video' || detail.captionClickable !== true || !CAPTION_UI_SUFFIX.test(detail.title)) return false;
+  const visible = normalizeCaption(detail.title.replace(CAPTION_UI_SUFFIX, ''));
+  return visible.length > 0 && wanted.startsWith(visible);
 }
+
+const homeButtons = tree => byId(tree, '0p3').filter(node => node.attributes['content-desc'] === '首页，按钮');
+// Search/profile controls can be shared by other tabs. Positive Home selection is mandatory;
+// devices that do not expose this marker remain unverified until calibrated on the physical phone.
+export const isDouyinHome = tree => searchEntryNodes(tree).length === 1
+  && byId(tree, '0p3').filter(node => node.attributes['content-desc'] === '我，按钮').length === 1
+  && byId(tree, 'et_search_kw').length === 0
+  && homeButtons(tree).length === 1 && homeButtons(tree)[0].attributes.selected === 'true';
 
 export function readFilters(tree) {
   if (hasSemanticFilters(tree)) return readSemanticFilters(tree);

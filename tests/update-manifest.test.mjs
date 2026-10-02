@@ -143,7 +143,7 @@ test('0.4.20 announces safe cleanup and the separate Android Runner upgrade with
 test('the Android Runner package and the version it registers with stay in step', async () => {
   const runnerManifest = JSON.parse(await readFile(new URL('../runners/android/package.json', import.meta.url), 'utf8'));
   const runnerSetup = await readFile(new URL('../runners/android/src/daemon/setup.mjs', import.meta.url), 'utf8');
-  assert.equal(runnerManifest.version, '0.2.8');
+  assert.equal(runnerManifest.version, '0.2.9');
   assert.match(runnerSetup, new RegExp(`appVersion: '${runnerManifest.version.replaceAll('.', '\\.')}'`, 'u'));
 });
 

@@ -1,5 +1,5 @@
 import {DeviceError} from './bounded.mjs';
-import {byId, resource, appNodes, searchEntryNodes} from './douyin-profile.mjs';
+import {byId, resource, appNodes, searchEntryNodes, isDouyinHome} from './douyin-profile.mjs';
 import {pause} from './ui-wait.mjs';
 
 export function assertDouyinScreen(tree) {
@@ -29,9 +29,12 @@ export const FEED_SETTLE_MS = 1200;
 // The tab clicks of this check look an element up by XPath, which needs the same hierarchy dump as a read.
 const LOOKUP_TIMEOUT_MS = 10_000;
 
-// A positive own-profile marker is required. Search results alone do not prove login.
+// Login is proven by a positive own-profile marker (我); search results alone do not prove it. The profile adapter
+// keeps that proof in memory for the Runner process until it starts Douyin again (2026-10-02). With the proof
+// (ownProfileProven) this check only returns to Douyin's home, and every read still stops at a login or verification
+// prompt (assertDouyinScreen).
 export async function verifyLoginAndSearchEntry(ui, {signal, skipFeedItem = null, feedSettleMs = FEED_SETTLE_MS,
-  slowReadMs = SLOW_FEED_READ_MS, now = () => performance.now()} = {}) {
+  slowReadMs = SLOW_FEED_READ_MS, now = () => performance.now(), ownProfileProven = false} = {}) {
   const options = {signal};
   const lookup = {signal, timeoutMs: LOOKUP_TIMEOUT_MS};
   let unreadableBacks = 0, feedSkips = 0;
@@ -76,13 +79,19 @@ export async function verifyLoginAndSearchEntry(ui, {signal, skipFeedItem = null
     assertDouyinScreen(tree);
     await ui.back(options); tree = await read();
   }
-  if (!ownProfile(tree)) {
+  const skipped = feedSkips ? {feedSkips} : {};
+  if (ownProfileProven) {
+    if (!ownProfile(tree) && !profileTab(tree)) throw new DeviceError('login_state_unverified', 'Douyin home is not reachable');
+    assertDouyinScreen(tree);
+    // Already home: no tap. Tapping 首页 there can refresh the feed onto an item that reads slowly.
+    if (isDouyinHome(tree)) return {loggedIn:true, challenge:false, loginCheck:'retained', ...skipped};
+  } else if (!ownProfile(tree)) {
     if (!profileTab(tree)) throw new DeviceError('login_state_unverified', 'Own profile is not reachable');
     await ui.clickXPath(`//*[@resource-id='${resource('0p3')}' and @content-desc='我，按钮']`,lookup);
     tree = await ui.waitFor(ownProfile,options);
+    if (!ownProfile(tree)) throw new DeviceError('login_required','Own profile was not confirmed');
   }
-  if (!ownProfile(tree)) throw new DeviceError('login_required','Own profile was not confirmed');
   await ui.clickXPath(`//*[@resource-id='${resource('0p3')}' and @content-desc='首页，按钮']`,lookup);
   await ui.waitFor(tree => searchEntryNodes(tree).length === 1 || byId(tree,'et_search_kw').length === 1,options);
-  return {loggedIn:true, challenge:false, ...(feedSkips ? {feedSkips} : {})};
+  return {loggedIn:true, challenge:false, loginCheck: ownProfileProven ? 'retained' : 'own_profile', ...skipped};
 }

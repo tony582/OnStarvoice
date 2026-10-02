@@ -44,11 +44,13 @@ const describe = foreground => foreground?.package ?? foreground?.focus ?? null;
  */
 export function createForegroundGuard({adb, serial, launchIntervalMs = 60_000, waitMs = 10_000, pollMs = 1_000,
   now = Date.now, wait = pause}) {
-  let lastLaunchAt = -Infinity;
+  let lastLaunchAt = -Infinity, launches = 0;
   const readForeground = async options => parseWindowFocus((await adb.windowFocus(serial, options)))
     ?? parseResumedActivity(await adb.resumedActivity(serial, options));
   const isDouyin = foreground => foreground?.package === DOUYIN_P0_PROFILE.packageName;
   return {
+    /** Starts of Douyin made through the reviewed launcher by this guard, counted before the start command. */
+    get launches() { return launches; },
     /**
      * Wait, read-only, until Douyin holds focus again. Creating an automation session can briefly bring the
      * Appium helper app to the front; reading the screen during that moment is not a Douyin failure.
@@ -72,7 +74,7 @@ export function createForegroundGuard({adb, serial, launchIntervalMs = 60_000, w
       if (!launch || now() - lastLaunchAt < launchIntervalMs) {
         throw new DeviceError('douyin_not_foreground', 'Douyin must be in the foreground', {focus: describe(foreground), launched: false, deviceSettled: true});
       }
-      lastLaunchAt = now();
+      lastLaunchAt = now(); launches++;
       await adb.launchActivity(serial, DOUYIN_LAUNCH_COMPONENT, options);
       const deadline = now() + waitMs;
       do { await wait(pollMs, signal); foreground = await readForeground(options); }

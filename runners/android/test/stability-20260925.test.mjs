@@ -7,8 +7,6 @@ import {randomUUID} from 'node:crypto';
 import {parseUiTree} from '../src/device/ui-tree.mjs';
 import {resource} from '../src/device/douyin-profile.mjs';
 import {readVerifiedDetail} from '../src/device/douyin-detail.mjs';
-import {createAppiumClient} from '../src/device/appium.mjs';
-import {createUiSession} from '../src/device/ui-session.mjs';
 import {createAdbClient} from '../src/device/adb.mjs';
 import {createForegroundGuard} from '../src/device/douyin-foreground.mjs';
 import {createProfileSession} from '../src/device/profile-session.mjs';
@@ -32,80 +30,53 @@ const tree = body => parseUiTree(xml(body));
 const card = {title: '车机壁纸分享 #别克 #车机壁纸 @上海安吉星', author: '车主小王'};
 const videoPage = (caption, author = '@' + card.author) => tree(node('desc', caption, '', {clickable: 'true'})
   + node('title', author, '', {'content-desc': '按钮'}) + node('vmj'));
-const topicPage = () => tree(node('topic_title', '#车机壁纸 话题页面') + node('topic_count', '12.3万次播放'));
-const TAP = {x: 801, y: 90, width: 852, height: 120};
+// ---- Video captions (2026-10-02: nothing on the detail is tapped; the copied link is the work's identity) ----
+// Until 0.2.8 a folded caption was unfolded by tapping its inline 展开, which on some videos hit a #topic link
+// or opened a caption panel and lost the card. Now the visible part has to begin the card's caption.
 
-// ---- Video caption expansion (the cause of last night's skipped video cards) ----
+const noTap = {clickId: async id => assert.fail(`nothing on the detail may be tapped (${id})`),
+  back: async () => assert.fail('the detail must not be left while verifying it'),
+  tapIdNearEnd: async () => assert.fail('captions are never unfolded')};
 
-test('the inline 展开 is tapped at the caption end and any spacing before the UI 收起 is accepted', async () => {
-  for (const [collapsed, expandedText] of [['车机壁纸分享 #别克…展开', `${card.title}\n收起`],
-    ['车机壁纸分享 #别克... 展开', `${card.title}收起`], ['车机壁纸分享 #别克...展开', `${card.title}  收起`]]) {
-    let expanded = false; const taps = [];
-    const ui = {read: async () => videoPage(expanded ? expandedText : collapsed),
-      clickId: async id => assert.fail(`the caption centre must never be clicked (${id})`),
-      tapIdNearEnd: async id => { taps.push(id); expanded = true; return TAP; }};
-    const detail = await readVerifiedDetail({ui, card});
-    assert.equal(detail.title, card.title, collapsed);
-    assert.deepEqual(taps, ['desc']);
+test('a folded or unfolded video caption verifies the work without any tap', async () => {
+  for (const shown of ['车机壁纸分享 #别克…展开', '车机壁纸分享 #别克... 展开', '车机壁纸分享 #别克...展开',
+    `${card.title}\n收起`, `${card.title}收起`, `${card.title}  收起`]) {
+    let reads = 0;
+    const detail = await readVerifiedDetail({ui: {...noTap, read: async () => { reads++; return videoPage(shown); }}, card});
+    assert.equal(detail.title, shown, shown);
+    assert.equal(detail.captionClickable, true);
+    assert.equal(reads, 1, `${shown}: one read, no waiting for an unfold`);
   }
 });
 
-test('identity stays exact: a UI 收起 suffix is only removed when the rest equals the card', async () => {
-  let expanded = false;
-  const ui = {read: async () => videoPage(expanded ? '另一条完全不同的正文\n收起' : '车机壁纸分享 #别克... 展开'),
-    tapIdNearEnd: async () => { expanded = true; return TAP; }};
-  await assert.rejects(readVerifiedDetail({ui, card}), {code: 'detail_identity_unverified', stage: 'expanded', expandOutcome: 'mismatch'});
+test('the visible part must begin the card caption: another text, author or a plain truncation is refused at once', async () => {
+  const plain = (caption, author = '@' + card.author) => tree(node('desc', caption)
+    + node('title', author, '', {'content-desc': '按钮'}) + node('vmj'));
+  for (const [label, page] of [['another caption, unfolded', videoPage('另一条完全不同的正文\n收起')],
+    ['another caption, folded', videoPage('车机壁纸分享 #奔驰... 展开')], ['nothing visible', videoPage('... 展开')],
+    ['another author', videoPage('车机壁纸分享 #别克... 展开', '@另一个作者')],
+    ['caption not clickable', plain('车机壁纸分享 #别克... 展开')], ['no UI label', videoPage('车机壁纸分享 #别克')]]) {
+    let reads = 0;
+    await assert.rejects(readVerifiedDetail({ui: {...noTap, read: async () => { reads++; return page; }}, card}),
+      {code: 'detail_identity_unverified', stage: 'loaded', deviceSettled: true}, label);
+    assert.equal(reads, 1, label);
+  }
 });
 
-test('a tap that does not expand stops after three unchanged reads with a local-only diagnostic', async () => {
-  let reads = 0; let clock = 0;
-  const ui = {read: async () => { reads++; clock += 3000; return videoPage('车机壁纸分享 #别克... 展开'); },
-    tapIdNearEnd: async () => TAP, currentActivity: async () => '.splash.SplashActivity'};
-  await assert.rejects(readVerifiedDetail({ui, card, budgetMs: 40_000, now: () => clock}), error => {
-    assert.equal(error.code, 'detail_identity_unverified');
-    assert.equal(error.stage, 'expanded');
-    assert.equal(error.expandOutcome, 'no_change');
-    assert.equal(error.deviceSettled, true);
+test('a skipped video leaves a local-only diagnostic and uploads no caption', async () => {
+  const shown = '车机壁纸分享 #奔驰... 展开';
+  await assert.rejects(readVerifiedDetail({ui: {...noTap, read: async () => videoPage(shown)}, card}), error => {
     assert.equal(error.diagnostic.card.title, card.title);
-    assert.equal(error.diagnostic.detail.title, '车机壁纸分享 #别克... 展开');
-    assert.deepEqual(error.diagnostic.tap, TAP);
+    assert.equal(error.diagnostic.detail.title, shown);
+    assert.equal(error.diagnostic.sameAuthor, true);
+    assert.equal('after' in error.diagnostic, false);
     const uploaded = faultDetails(error);
-    assert.equal(uploaded.expandOutcome, 'no_change');
-    assert.equal(JSON.stringify(uploaded).includes(card.title), false, 'captions never reach uploaded details');
+    assert.equal(uploaded.stage, 'loaded');
     assert.equal('diagnostic' in uploaded, false);
+    assert.equal('expandOutcome' in uploaded, false);
+    assert.equal(JSON.stringify(uploaded).includes('车机壁纸'), false, 'captions never reach uploaded details');
     return true;
   });
-  assert.equal(reads, 4, 'one read finds the collapsed detail, three unchanged reads end the wait');
-});
-
-test('a tap that leaves the detail (for example a #topic page) is recognised after three reads', async () => {
-  let expanded = false; let reads = 0;
-  const ui = {read: async () => { reads++; return expanded ? topicPage() : videoPage('车机壁纸分享 #别克... 展开'); },
-    tapIdNearEnd: async () => { expanded = true; return TAP; }};
-  await assert.rejects(readVerifiedDetail({ui, card}), error => {
-    assert.equal(error.expandOutcome, 'left_detail');
-    assert.ok(error.diagnostic.texts.some(entry => entry.text.includes('话题页面')));
-    return true;
-  });
-  assert.equal(reads, 4);
-});
-
-test('the caption tap is an element-relative clickGesture inside the located caption, never a centre click', async () => {
-  const calls = [];
-  const client = createAppiumClient({fetchImpl: async (url, init) => {
-    calls.push({url, method: init.method, body: init.body ? JSON.parse(init.body) : null});
-    if (url.endsWith('/elements')) return new Response(JSON.stringify({value: [{'element-6066-11e4-a52e-4f735466cecf': 'caption-1'}]}));
-    if (url.endsWith('/rect')) return new Response(JSON.stringify({value: {x: 36, y: 1800, width: 852, height: 120}}));
-    return new Response(JSON.stringify({value: null}));
-  }});
-  const ui = createUiSession({client, sessionId: 'session-1', resourceLocator: 'xpath'});
-  assert.deepEqual(await ui.tapIdNearEnd('desc'), TAP);
-  const gesture = calls.at(-1);
-  assert.match(gesture.url, /\/session\/session-1\/execute\/sync$/u);
-  assert.deepEqual(gesture.body, {script: 'mobile: clickGesture', args: [{elementId: 'caption-1', x: 801, y: 90}]});
-  assert.equal(calls.some(call => call.url.endsWith('/click')), false);
-  assert.throws(() => client.tapElementAt('session-1', 'caption-1', -1, 5), {code: 'invalid_tap'});
-  assert.throws(() => client.tapElementAt('session-1', 'caption-1', 1.5, 5), {code: 'invalid_tap'});
 });
 
 // ---- Skipping policy and local diagnostics ----
@@ -117,8 +88,8 @@ function patternDevice(task, pattern) {
     readCards: async () => ({contextVerified: true, contextId: 'context-1', end: true, cards}),
     openCard: async ({card: selected}) => {
       if (selected.kind === 'F') {
-        throw settled('detail_identity_unverified', {stage: 'expanded', expandOutcome: 'no_change',
-          diagnostic: {card: {title: `秘密标题-${selected.cardId}`, author: '车友'}, stage: 'expanded'}});
+        throw settled('detail_identity_unverified', {stage: 'loaded',
+          diagnostic: {card: {title: `秘密标题-${selected.cardId}`, author: '车友'}, stage: 'loaded'}});
       }
       return {identityVerified: true, cardId: selected.cardId, detailId: `detail-${selected.cardId}`,
         externalId: String(7_000_000_000_000_000_000n + BigInt(selected.cardId.slice(5)))};
@@ -282,7 +253,7 @@ test('diagnose lists recent runs with their keyword and the local notes about pr
     const ledger = new BudgetLedger({task, store, clock});
     ledger.beforeCard(); ledger.noteSkippedCard(); ledger.finish('needs_action', 'detail_identity_unverified');
     recordDiagnostic(store, {at: new Date(clock.wallNow()).toISOString(), event: 'card_skipped', itemId: task.identity.itemId,
-      keyword: task.keyword, code: 'detail_identity_unverified', diagnostic: {expandOutcome: 'no_change'}});
+      keyword: task.keyword, code: 'detail_identity_unverified', diagnostic: {stage: 'loaded', sameAuthor: true}});
     recordDiagnostic(store, {at: new Date(clock.wallNow()).toISOString(), event: 'task_finished', itemId: task.identity.itemId,
       keyword: task.keyword, status: 'needs_action', reason: 'detail_identity_unverified'});
     const report = diagnoseRunner(store, {hours: 1, now: clock.wallNow() + 1000});

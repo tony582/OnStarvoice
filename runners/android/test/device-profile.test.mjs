@@ -144,17 +144,31 @@ test('video author excludes the related-search heading that reuses the title res
 });
 
 
-test('collapsed video must expand to the full selected caption before identity is accepted', async () => {
+test('a truncated caption with a separate 展开 control is not tapped and does not verify', async () => {
   const make = (title, author = '@' + card.author) => tree(node('desc', title)
     + node('title', author, '', { 'content-desc': '按钮' }) + node('vmj') + node('0s0', '展开'));
-  let expanded = false; let clicks = 0;
-  const ui = { read: async () => make(expanded ? card.title : '新壁纸...'),
-    clickId: async id => { assert.equal(id, '0s0'); clicks++; expanded = true; } };
-  assert.equal((await readVerifiedDetail({ ui, card })).title, card.title);
-  assert.equal(clicks, 1);
+  const ui = { read: async () => make('新壁纸...'), clickId: async id => assert.fail(`nothing is tapped (${id})`) };
+  await assert.rejects(readVerifiedDetail({ ui, card }), { code: 'detail_identity_unverified', stage: 'loaded' });
   await assert.rejects(readVerifiedDetail({ ui: { ...ui, read: async () => make('新壁纸...', '@其他人') }, card }),
-    { code: 'detail_identity_unverified' });
-  assert.equal(clicks, 1);
+    { code: 'detail_identity_unverified', stage: 'loaded' });
+});
+
+
+test('the folded visible part must begin the card caption; notes and plain truncations stay exact', () => {
+  const folded = { kind: 'video', title: '新壁纸 @上海... 展开', author: '@真实车主', captionClickable: true };
+  assert.equal(detailMatchesCard(folded, card), true);
+  assert.equal(detailMatchesCard({ ...folded, title: '新壁纸 @上海…展开' }, card), true);
+  assert.equal(detailMatchesCard({ ...folded, title: `${card.title}\n收起` }, card), true);
+  assert.equal(detailMatchesCard({ ...folded, captionClickable: false }, card), false);
+  assert.equal(detailMatchesCard({ ...folded, captionClickable: undefined }, card), false);
+  assert.equal(detailMatchesCard({ ...folded, title: '新壁纸 @上海...' }, card), false);
+  assert.equal(detailMatchesCard({ ...folded, title: '... 展开' }, card), false);
+  assert.equal(detailMatchesCard({ ...folded, title: '新壁纸 @北京... 展开' }, card), false);
+  assert.equal(detailMatchesCard({ ...folded, author: '@其他人' }, card), false);
+  assert.equal(detailMatchesCard({ ...folded, kind: 'note' }, card), false, 'notes were never folded: exact only');
+  // A fold inside an emoji or a surrogate pair still matches: the comparison is a code-unit prefix.
+  const emoji = { title: '换上新壁纸🚩。#汽车里的爱国情怀', author: '青椒炒红椒' };
+  assert.equal(detailMatchesCard({ ...folded, author: '@青椒炒红椒', title: '换上新壁纸\uD83D... 展开' }, emoji), true);
 });
 
 
@@ -199,24 +213,40 @@ test('an oversized original clipboard is rejected before marker replacement or s
 });
 
 
-test('40.6 inline video caption expands and removes only a verified UI collapse suffix', async () => {
+test('40.6 folded video caption verifies by its visible part with no tap', async () => {
   const make = (title, author = '@' + card.author, clickable = 'true') => tree(
     node('desc', title, '', {clickable}) + node('title', author, '', {'content-desc': '按钮'}) + node('vmj'));
-  let expanded = false; let clicks = 0;
-  // The inline "展开" is tapped at the caption's end; the caption centre (a possible #topic link) is never clicked.
-  const ui = {read: async () => make(expanded ? card.title + ' 收起' : '新壁纸... 展开'),
-    clickId: async id => { assert.fail(`the caption must not be clicked at its centre (${id})`); },
-    tapIdNearEnd: async id => {assert.equal(id, 'desc'); clicks++; expanded = true; return {x: 800, y: 90, width: 852, height: 120};}};
-  assert.equal((await readVerifiedDetail({ui, card})).title, card.title);
-  assert.equal((await readVerifiedDetail({ui, card})).title, card.title); // After returning from share.
-  assert.equal(clicks, 1);
+  const ui = {read: async () => make('新壁纸... 展开'),
+    clickId: async id => assert.fail(`nothing on the detail is tapped (${id})`),
+    tapIdNearEnd: async () => assert.fail('captions are never unfolded')};
+  assert.equal((await readVerifiedDetail({ui, card})).title, '新壁纸... 展开');
+  assert.equal((await readVerifiedDetail({ui: {...ui, read: async () => make(card.title + ' 收起')}, card})).title, card.title + ' 收起');
   for (const current of [make('新壁纸... 展开', '@其他人'), make('新壁纸... 展开', undefined, 'false'),
     make('另一篇正文 收起'), make(card.title + ' 收起', '@其他人'), make(card.title + ' 收起', undefined, 'false')]) {
     await assert.rejects(readVerifiedDetail({ui: {...ui, read: async () => current}, card}),
-      {code: 'detail_identity_unverified'});
+      {code: 'detail_identity_unverified', stage: 'loaded'});
   }
-  assert.equal(clicks, 1);
   const literal = {...card, title: card.title + ' 收起'};
   const current = make(literal.title);
   assert.equal((await readVerifiedDetail({ui: {...ui, read: async () => current}, card: literal})).title, literal.title);
+  // Measured on the DE106 (2026-09-26): this caption used to open a caption panel when its 展开 was tapped.
+  const measured = {title: '车机壁纸分享✨ 贺兰山下万马奔腾，这壁纸效果真的挺不错！ #车机壁纸 #别克', author: '车主小王'};
+  const shown = make('车机壁纸分享✨ 贺兰山下万马奔腾，这壁纸... 展开', '@车主小王');
+  assert.equal((await readVerifiedDetail({ui: {...ui, read: async () => shown}, card: measured})).kind, 'video');
+});
+
+
+test('the copy-time recheck accepts the same card shown folded or unfolded and refuses another visible text', () => {
+  const videoCard = { title: '安吉星车机壁纸上新，这次的秋天配色很好看 #别克 #车机壁纸', author: '真实车主' };
+  const folded = { kind: 'video', title: '安吉星车机壁纸上新，这次的... 展开', author: '@真实车主', captionClickable: true, share: 'vmj' };
+  const copied = detailAfter => observeCopiedShare({ marker, beforeText: marker,
+    afterText: '看看【真实车主的视频作品】安吉星车机... https://v.douyin.com/validLink/', card: videoCard, detailBefore: folded, detailAfter });
+  for (const after of [folded, { ...folded, title: `${videoCard.title}\n收起` }]) {
+    const result = copied(after);
+    assert.equal(result.cardDetailMatched, true);
+    assert.equal(result.title, videoCard.title);
+    assert.equal(result.kind, 'video');
+  }
+  assert.throws(() => copied({ ...folded, title: '另一条视频的正文... 展开' }), { code: 'detail_identity_unverified' });
+  assert.throws(() => copied({ ...folded, kind: 'note' }), { code: 'detail_identity_unverified' });
 });

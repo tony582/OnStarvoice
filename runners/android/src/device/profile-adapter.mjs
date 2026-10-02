@@ -39,6 +39,10 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
   if (profileId !== DOUYIN_P0_PROFILE.id) throw new DeviceError('profile_required','Unknown device profile');
   const session = createProfileSession({serial,profileId,adb,client,onState});
   let flow = null, context = null, staticCheckedAt = -Infinity;
+  // Memory only, for this Runner process: Douyin's own profile (我) showed a logged-in account, and the reviewed
+  // launcher has not started Douyin since. Never persisted, so a new Runner process proves login again (2026-10-02).
+  let loginProof = null;
+  const launchCount = () => foreground.launches ?? 0;
   const requireContext = id => {
     if (!context || id !== context.contextId) throw new DeviceError('search_context_changed','Search context is stale');
     return context;
@@ -83,7 +87,15 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
       // The claimed task re-verifies the foreground before a session is created (no relaunch there). After a new
       // session it may relaunch Douyin once, through the reviewed launcher, if the helper app kept focus.
       await foreground.ensure({signal:options.signal,launch:false});
-      const state = await session.inspect({...options, afterCreate: () => regainFocus(options.signal)});
+      let launchesAtCheck = null;
+      const state = await session.inspect({...options, afterCreate: () => regainFocus(options.signal),
+        // Evaluated after afterCreate, right before the login check: a relaunch there or in a probe ends the proof.
+        loginProven: () => {
+          launchesAtCheck = launchCount();
+          if (loginProof && loginProof.launches !== launchesAtCheck) loginProof = null;
+          return loginProof !== null;
+        }});
+      if (state.loginCheck === 'own_profile') loginProof = {launches: launchesAtCheck};
       flow = createDouyinCalibrationFlow({ui:session.ui}); context=null; return state;
     },
     async search({keyword, filters, signal}) {

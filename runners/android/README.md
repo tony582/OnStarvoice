@@ -44,7 +44,7 @@ node runners/android/cli.mjs up --state-dir /path/to/private/android-state
 node cli.mjs diagnose --state-dir /path/to/private/android-state --hours 12
 ```
 
-它只读本机状态库，列出每个关键词的开始／结束时间、找到条数、跳过张数和结束原因，以及被跳过作品的本机诊断（卡片与详情文字、展开结果、点击坐标、当时页面文字）。这些诊断只留在本机，不上传。手机需插电并在「开发者选项」打开「保持唤醒状态」；手机有锁屏密码时，息屏后必须人工解锁。见 [20260925 稳定性 hotfix](../../docs/hotfix/20260925-android-stability.md)。
+它只读本机状态库，列出每个关键词的开始／结束时间、找到条数、跳过张数和结束原因，以及被跳过作品的本机诊断（卡片与详情文字、当时页面文字）。这些诊断只留在本机，不上传。手机需插电并在「开发者选项」打开「保持唤醒状态」；手机有锁屏密码时，息屏后必须人工解锁。见 [20260925 稳定性 hotfix](../../docs/hotfix/20260925-android-stability.md)。
 
 ## 首次设置与启动
 
@@ -69,11 +69,13 @@ node runners/android/cli.mjs setup --state-dir /path/to/private/android-state --
 
 每个逻辑动作最长 60 秒，单次 UI 层级读取和翻页默认最多 10 秒，其他 Appium 请求保留各自较短时限；搜索由多个有界命令组成。调用方更短的时限和停止信号仍可打断读屏，超时不能当作手机已经停稳，也不能直接解释为 USB 断线。
 
-打开作品只点击一次；之后在整段动作预算内反复读屏核对作品身份（标题、作者、cardId 不放宽），不再点第二张卡片。详情始终读不到时返回 `detail_ui_not_ready`，读到别的作品返回 `detail_identity_unverified`，点击后仍停在结果页返回 `card_open_failed`；真正的 Appium/ADB 失联仍是 `device_timeout` 或 `appium_*`。这三种精确错误发生后，Runner 先按返回键回到结果页并重新读回关键词与全部筛选分组，核对通过才跳过该作品继续当前关键词（每个关键词最多跳过 3 个）；无法证明已安全返回则停止并保留停稳保护。
+打开作品只点击一次；之后在整段动作预算内反复读屏核对作品身份，不再点第二张卡片。0.2.9 起作品页上除分享按钮外不再点任何东西：作者必须与卡片一致；文案要么与卡片完全一致，要么是被折叠的视频文案（以「… 展开」或「收起」结尾），去掉这个界面标签后可见的部分必须是卡片文案的开头。作品身份以复制到的链接为准，服务端不再比对全文。详情始终读不到时返回 `detail_ui_not_ready`，读到别的作品返回 `detail_identity_unverified`，点击后仍停在结果页返回 `card_open_failed`；真正的 Appium/ADB 失联仍是 `device_timeout` 或 `appium_*`。这三种精确错误发生后，Runner 先按返回键回到结果页并重新读回关键词与全部筛选分组，核对通过才跳过该作品继续当前关键词（每个关键词最多跳过 3 个）；无法证明已安全返回则停止并保留停稳保护。
 
 领取任务前每次轮询都重新探测手机：ADB 在线、机型/抖音版本、Appium 就绪、亮屏、未锁屏、抖音持有前台焦点；不再沿用旧的 `readyForSearch=true`。抖音退到后台且手机已解锁时，只通过审核过的 `com.ss.android.ugc.aweme/.main.MainActivity` 用 `am start` 拉起（不 reset、不清数据，每 60 秒最多一次），拉起后重新核对版本与前台包名；登录与搜索入口在任务开始的 inspect 中核对。息屏或锁屏时报告 `device_asleep`/`device_locked`，Runner 不会唤醒或解锁手机。`status` 的 `deviceProbe` 显示最近一次探测结果。见 [20260924 hotfix](../../docs/hotfix/20260924-android-opencard-detail-ready.md)。
 
 0.2.8 起，任务开始的第一次读屏如果超时或耗时达到 4 秒（任务结束回到首页后，信息流停在一条取层级很慢的作品上；DE106 实测不同作品 2–6 秒不等，个别超过 10 秒），Runner 会在确认抖音首页持有焦点后用 `adb shell input swipe` 把信息流滑到下一条再重读，最多 3 次、总共不超过 25 秒；这一步里点「我」和「首页」的元素查找上限同时放宽到 10 秒。发生过时本机诊断里有一条 `feed_unreadable_recovered`。见 [20261002 hotfix](../../docs/hotfix/20261002-android-feed-read-timeout.md)。
+
+0.2.9 起：① 只有 Runner 启动后的第一个任务、以及 Runner 自己重新拉起抖音之后的第一个任务会去「我」页确认登录；这一证明只存在 Runner 进程内存里，不落盘。其它任务只回到抖音首页（已在首页则什么都不点），读屏时出现登录或验证提示照旧停止。② 采完一条作品返回结果页时只确认回到了本关键词的结果页，不再打开筛选面板；搜索后和出错恢复后照旧完整核对筛选。③ 作品页不再点「展开」。见 [20261002 精简采集](../../docs/hotfix/20261002-android-lean-capture.md)。
 
 ```sh
 node runners/android/cli.mjs status --state-dir /path/to/private/android-state

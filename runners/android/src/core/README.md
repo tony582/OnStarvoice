@@ -110,12 +110,12 @@ Every device method receives an `AbortSignal` and must observe it. Required meth
 
 | Method | Required evidence |
 | --- | --- |
-| `inspect` | Exact `deviceId`, `connected/unlocked/loggedIn=true`, `challenge=false`; `readyForSearch=false` blocks with its explicit reason |
+| `inspect` | Exact `deviceId`, `connected/unlocked/loggedIn=true`, `challenge=false`; `readyForSearch=false` blocks with its explicit reason. The profile adapter proves login on 我 on the first task of the process and after it starts Douyin again; otherwise it returns to Douyin's home, and every read stops at a login or verification prompt |
 | `search` | `verified=true`, exact `keyword/filters`, nonempty `contextId` |
 | `readCards` | `contextVerified=true`, same context, cards with nonempty `cardId`, explicit `end` when observed |
 | `openCard` | `identityVerified=true`, matching `cardId`, nonempty `detailId`; optionally independently verified `externalId` |
 | `copyLink` | Receives a fresh clipboard marker; returns `fresh/markerReplaced/identityVerified=true`, matching detail, work `externalId`, `shareUrl` |
-| `returnToResults` | Same verified keyword, filters and context |
+| `returnToResults` | Same verified keyword and context on the results page (综合 tab, no filter panel); filter groups are read back after `search` and `recoverResults`, not after every work |
 | `recoverResults` | Optional. After a failed `openCard`, proves the same verified keyword, filters and context again without opening anything; absent means the runner never skips a work |
 | `scroll` | Verified matching context |
 

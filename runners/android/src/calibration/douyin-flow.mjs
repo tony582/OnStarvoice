@@ -8,9 +8,10 @@ import { readVerifiedDetail } from '../device/douyin-detail.mjs';
 import { copyBoundShare } from '../device/douyin-share.mjs';
 import { readUntil, READ_TIMEOUT_MS, RETRY_DELAY_MS } from '../device/ui-wait.mjs';
 
-// openCard budget split: the outer action budget minus the results/click time already spent,
-// minus one caption-expand read and a safety margin, capped so the gate deadline is never reached.
-const OPEN_EXPAND_RESERVE_MS = 11_000;
+// openCard budget split: the outer action budget minus the results/click time already spent, minus a reserve for
+// what follows the detail wait (the bounded foreground-activity probe of a not-ready detail) and a safety margin,
+// capped so the gate deadline is never reached. Nothing on the detail is tapped.
+const OPEN_TAIL_RESERVE_MS = 11_000;
 const OPEN_SAFETY_MS = 3_000;
 const MIN_DETAIL_READY_MS = READ_TIMEOUT_MS + RETRY_DELAY_MS;
 const MAX_DETAIL_READY_MS = 40_000;
@@ -118,7 +119,7 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
       }
       await ui.clickXPath(card.selector, {signal});
       // Exactly one click per openCard. From here the detail is only re-read inside the remaining budget.
-      const remaining = actionBudgetMs - (now() - startedAt) - OPEN_EXPAND_RESERVE_MS - OPEN_SAFETY_MS;
+      const remaining = actionBudgetMs - (now() - startedAt) - OPEN_TAIL_RESERVE_MS - OPEN_SAFETY_MS;
       const detail = await readVerifiedDetail({ui, card, signal, searchKeyword: keyword, now,
         budgetMs: Math.min(MAX_DETAIL_READY_MS, Math.max(remaining, MIN_DETAIL_READY_MS))});
       opened = {card, detail};
@@ -135,8 +136,9 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
       if (!opened) throw new DeviceError('detail_identity_unverified', 'No open work to return from');
       if (opened.detail.back) await ui.clickId(opened.detail.back, {signal}); else await ui.back({signal});
       opened = null;
-      await results({signal});
-      return verifyFilters({signal});
+      // The verified results page only: the keyword, the selected 综合 tab and no filter panel. The filter groups
+      // are read back after the search and after a recovery (recoverResults), not after every work (2026-10-02).
+      return results({signal});
     },
     /**
      * After a failed openCard: get back to the verified results page without opening anything, then
@@ -163,7 +165,7 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
       const detail = await flow.openCard({card, signal});
       const observation = await flow.copyLink({detail, marker:`starvoice-discovery:${randomUUID()}`, signal});
       await flow.returnToResults({signal});
-      return {...observation, filtersRetained:true, keyword:context.keyword, filters:context.filters};
+      return {...observation, keyword:context.keyword, filters:context.filters};
     },
     /**
      * Scroll the one result list. A short result (the list fits on one screen, so Android marks it not
