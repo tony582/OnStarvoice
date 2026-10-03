@@ -4,7 +4,7 @@ import { OperationGate } from './operation-gate.mjs';
 import { RunnerFault, requireEvidence } from './errors.mjs';
 import { verifyContext, verifyLink, discoveryEvent, eventIdFor, discoveredWorkKey } from './discovery-evidence.mjs';
 import { DeviceClosureJournal, readDeviceClosure } from './device-closure.mjs';
-import { recordDiagnostic } from './diagnostics.mjs';
+import { recordDiagnostic, PREFILTER_DIAGNOSTICS_KEY } from './diagnostics.mjs';
 
 const DEFAULT_CLOCK = { wallNow: () => Date.now(), monotonicNow: () => performance.now() };
 const METHODS = ['inspect', 'search', 'readCards', 'openCard', 'copyLink', 'returnToResults', 'scroll'];
@@ -13,6 +13,7 @@ const RECOVERABLE_OPEN_FAILURES = new Set(['detail_ui_not_ready', 'detail_identi
 // Isolated bad cards are skipped without limit (the keyword time cap still applies); only this many
 // abnormal cards in a row stop the keyword, because that pattern means the page itself is not usable.
 export const MAX_CONSECUTIVE_SKIPS = 4;
+const NO_SKIPS = new Set(); // Read only: a page without AI skips.
 const CONTROL_CODES = new Set(['user_stop', 'operator_takeover', 'remote_stop', 'lease_expired', 'usb_disconnected', 'aborted']);
 const DETAIL_KEYS = ['cause', 'recovery', 'attempts', 'elapsedMs', 'budgetMs', 'observed', 'activity', 'stage', 'backPresses',
   'skippedCards', 'skipLimitReached', 'previousAttemptId', 'previousAssignmentRevision', 'previousStatus', 'previousReason',
@@ -51,8 +52,9 @@ function outcome(error) {
   return { status: 'needs_action', reason: error.code ?? 'device_failure' };
 }
 
+/** `prefilter` (optional) builds the task's AI card prefilter from {task, signal, now, onBatch}: see card-prefilter.mjs. */
 export async function runDiscoveryTask({ task, store, device, permit, clock = DEFAULT_CLOCK, resumeAuthorized = false,
-  deviceClosureVerified = null, actionTimeoutMs = 10_000 }) {
+  deviceClosureVerified = null, actionTimeoutMs = 10_000, prefilter = null }) {
   let ledger;
   let gate;
   let result;
@@ -99,6 +101,32 @@ export async function runDiscoveryTask({ task, store, device, permit, clock = DE
       consecutiveSkips++;
       note('card_skipped', error, { consecutiveSkips });
     };
+    // The fresh cards of a page go to the server's relevance prefilter once, before any of them is opened; only the
+    // cards it clearly marks irrelevant stay unopened. A prefilter failure never ends the task: those cards open.
+    const seenCards = new Set();
+    let cardPrefilter = null;
+    const onBatch = batch => recordDiagnostic(store, { at: new Date(clock.wallNow()).toISOString(), event: 'card_prefilter',
+      runId: task.identity.discoveryRunId, itemId: task.identity.itemId, keyword: task.keyword, ...batch }, { key: PREFILTER_DIAGNOSTICS_KEY });
+    try { cardPrefilter = typeof prefilter === 'function' ? prefilter({ task, signal: permit.signal, now: clock.monotonicNow, onBatch }) : null; }
+    catch { cardPrefilter = null; }
+    if (cardPrefilter?.enabled === true) ledger.notePrefilter();
+    else cardPrefilter = null;
+    const prefilterPage = async (cards) => {
+      if (!cardPrefilter) return NO_SKIPS;
+      const fresh = new Map();
+      for (const card of cards) {
+        if (typeof card?.cardId === 'string' && !seenCards.has(card.cardId) && !fresh.has(card.cardId)) fresh.set(card.cardId, card);
+      }
+      if (!fresh.size) return NO_SKIPS;
+      permit.assertAllowed();
+      ledger.assertAllowed();
+      let decision = null;
+      try { decision = await cardPrefilter.decide([...fresh.values()]); } catch { /* Fail open below. */ }
+      const skip = decision?.skip instanceof Set ? decision.skip : NO_SKIPS;
+      ledger.notePrefilter({ skipped: skip.size, judged: decision?.judged ?? 0, unjudged: decision ? decision.unjudged : fresh.size });
+      permit.assertAllowed();
+      return skip;
+    };
     const deviceState = await call('inspect');
     if (deviceState?.feedSkips) note('feed_unreadable_recovered', null, { feedSkips: deviceState.feedSkips });
     requireEvidence(deviceState?.deviceId === task.deviceId, 'device_identity_mismatch');
@@ -109,17 +137,19 @@ export async function runDiscoveryTask({ task, store, device, permit, clock = DE
     requireEvidence(deviceState.challenge === false, 'challenge_or_unknown');
     const context = await read('search', { keyword: task.keyword, filters: task.filters });
     const contextId = verifyContext(context, task);
-    const seenCards = new Set();
     let emptyPages = 0;
     while (true) {
       const page = await read('readCards', { contextId });
       requireEvidence(page?.contextVerified === true && page.contextId === contextId && Array.isArray(page.cards), 'search_context_unverified');
+      const skipped = await prefilterPage(page.cards);
       let newCards = 0;
       for (const card of page.cards) {
         requireEvidence(typeof card.cardId === 'string' && card.cardId.length > 0, 'card_identity_unverified');
         if (seenCards.has(card.cardId)) continue;
         seenCards.add(card.cardId);
         newCards++;
+        // Left unopened on the server's say-so: no card budget, no link, no open failure.
+        if (skipped.has(card.cardId)) continue;
         ledger.beforeCard();
         let detail;
         try { detail = await call('openCard', { card, contextId }); }

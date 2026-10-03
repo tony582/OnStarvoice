@@ -6,7 +6,9 @@ durable store uses `node:sqlite`. The production server runtime is unchanged.
 
 ## Entry points
 
-- `runDiscoveryTask` in `discovery-runner.mjs`: runs **one keyword item**.
+- `runDiscoveryTask` in `discovery-runner.mjs`: runs **one keyword item**. The optional
+  `prefilter` factory (the daemon passes `createCardPrefilter` from `card-prefilter.mjs` bound to
+  its control client) screens each page's fresh cards before any is opened; without it the run is unchanged.
 - `ExecutionPermit` in `execution-permit.mjs`: bounded, monotonic execution permission
   plus an irreversible local stop signal.
 - `RunnerStore` in `../storage/runner-store.mjs`: SQLite outbox, receipts and versioned

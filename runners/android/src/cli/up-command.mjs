@@ -49,6 +49,7 @@ export function describeOutcome(outcome) {
   const done = outcome.status === 'completed' || outcome.status === 'completed_with_warnings';
   const parts = [`${done ? '【完成】' : '【提前结束】'}${outcome.keyword}`, `找到 ${outcome.links} 条`];
   if (outcome.skipped > 0) parts.push(`跳过 ${outcome.skipped} 个无法核对的作品`);
+  if (outcome.prefilterSkipped > 0) parts.push(`AI 跳过 ${outcome.prefilterSkipped} 条无关`);
   parts.push(OUTCOME_TEXT[outcome.reason] ?? outcome.reason ?? '已结束');
   if (!done && outcome.status !== 'canceled') parts.push('调度中心会自动重试或交给其它节点');
   return parts.join(' · ');

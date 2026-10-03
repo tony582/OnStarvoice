@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import {RunnerStore} from '../storage/runner-store.mjs';
 import {ExecutionPermit} from '../core/execution-permit.mjs';
 import {runDiscoveryTask} from '../core/discovery-runner.mjs';
+import {createCardPrefilter} from '../core/card-prefilter.mjs';
 import {readDeviceClosure} from '../core/device-closure.mjs';
 import {acquireDeviceLock, inspectDeviceLock} from '../core/device-lock.mjs';
 import {createCloudClient} from '../cloud/client.mjs';
@@ -129,6 +130,7 @@ export class AndroidDaemon {
     this.nextRenewAt = Date.now() + this.renewMs;
     this.taskPromise = runDiscoveryTask({task, store: this.store, device: this.device, permit, clock,
       actionTimeoutMs: this.actionTimeoutMs, resumeAuthorized: task.resumeAuthorized === true,
+      prefilter: options => createCardPrefilter({...options, client: this.control}),
       deviceClosureVerified: closureProofFor(this.store, this.config.deviceId)})
       .then(result => settleDevice({device:this.device,store:this.store,task,result,clock,permit}))
       .then(result => {
@@ -140,7 +142,7 @@ export class AndroidDaemon {
         if (this.device?.probe && DEVICE_READINESS_REASONS.has(result.reason)) { this.ready = false; this.deviceReason = result.reason; }
         // Plain summary for the one-click window; keyword and counts only.
         this.lastOutcome = {keyword: task.keyword, status: result.status, reason: result.reason ?? null,
-          links: result.stats?.links ?? 0, skipped: result.stats?.skippedCards ?? 0,
+          links: result.stats?.links ?? 0, skipped: result.stats?.skippedCards ?? 0, prefilterSkipped: result.stats?.prefilterSkipped ?? 0,
           elapsedMs: result.stats?.keywordElapsedMs ?? null, at: Date.now()};
         this.saveCompletion({...active, leaseId: this.active?.leaseId ?? active.leaseId}, result);
         return result;

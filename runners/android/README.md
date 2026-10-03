@@ -77,6 +77,8 @@ node runners/android/cli.mjs setup --state-dir /path/to/private/android-state --
 
 0.2.9 起：① 只有 Runner 启动后的第一个任务、以及 Runner 自己重新拉起抖音之后的第一个任务会去「我」页确认登录；这一证明只存在 Runner 进程内存里，不落盘。其它任务只回到抖音首页（已在首页则什么都不点），读屏时出现登录或验证提示照旧停止。② 采完一条作品返回结果页时只确认回到了本关键词的结果页，不再打开筛选面板；搜索后和出错恢复后照旧完整核对筛选。③ 作品页不再点「展开」。见 [20261002 精简采集](../../docs/hotfix/20261002-android-lean-capture.md)。
 
+0.3.0 起，读到一屏搜索结果后，Runner 先把这一屏还没见过的卡片（卡片上的完整文案和作者，每次最多 8 张，一次只发一个请求）发给服务端 `POST /api/capture-cloud/android/agent/prefilter`，由服务端用插件「AI 精准筛选」同一套相关性预筛判断，再开始逐张点开；只有服务端明确判为与本租户无关、建议不采（`status=ok`、`skip`、`irrelevant`、置信度在 0–1 之间、无保护信号、`skip_full_capture`）且文案不是占位标题、至少 2 个字的卡片才不点开，其它照旧点开复制链接。被跳过的卡片不占帖子数和卡片数，也不算打开失败；翻页「没有新作品」的判断不变。开关跟随任务方案：只有方案同时打开「列表后自动补详情」和「AI 精准筛选」时，服务端下发的任务才带 `relevancePrefilter.enabled=true`。一律失败放行：请求出错、超过 30 秒、服务端返回 `enabled=false` 或答复不清楚，这一批卡片全部照常点开；连续 2 次请求失败或收到一次 `enabled=false` 后，本任务剩余卡片不再请求、直接点开。预筛失败不会结束任务，也不会要求确认停稳；请求期间收到停止会立即结束、不再点开卡片。完成回执的 `stats` 增加 `prefilterSkipped`（AI 跳过）、`prefilterJudged`（服务端给出判断）、`prefilterUnjudged`（该判未判、照常点开）；一键窗口的每词结果行在有跳过时加一段「AI 跳过 N 条无关」。每张被跳过卡片的判断理由在服务端 `relevance_prefilter_decisions` 表按任务可查；本机每个请求记一条 `card_prefilter`（数量、耗时、失败码，以及最多 8 条被跳过卡片的标题前 60 字与理由前 80 字），存在单独的环（`diagnostics:prefilter`，不挤掉失败记录），只留在本机不上传；`diagnose` 的 `prefilter` 列出最近 20 条，每个关键词行带 `aiSkipped`／`aiJudged`／`aiUnjudged`，`summary.aiSkipped` 为合计。
+
 ```sh
 node runners/android/cli.mjs status --state-dir /path/to/private/android-state
 node runners/android/cli.mjs stop --state-dir /path/to/private/android-state

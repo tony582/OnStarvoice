@@ -2,6 +2,9 @@
 // (state directory, 0600) and are never uploaded; uploaded completion details remain PII-free.
 export const DIAGNOSTICS_KEY = 'diagnostics:recent';
 export const DIAGNOSTICS_LIMIT = 200;
+// AI card prefilter notes (one per request, card-prefilter.mjs) keep a ring of their own: a busy round would otherwise
+// push the failure notes out of the main one.
+export const PREFILTER_DIAGNOSTICS_KEY = 'diagnostics:prefilter';
 
 function sanitize(value, depth = 0) {
   if (value === null || value === undefined) return null;
@@ -17,18 +20,18 @@ function sanitize(value, depth = 0) {
 }
 
 /** Append one note to a bounded ring. A diagnostic never interrupts or fails a run. */
-export function recordDiagnostic(store, entry, {limit = DIAGNOSTICS_LIMIT} = {}) {
+export function recordDiagnostic(store, entry, {limit = DIAGNOSTICS_LIMIT, key = DIAGNOSTICS_KEY} = {}) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const saved = store.loadCheckpoint(DIAGNOSTICS_KEY);
+      const saved = store.loadCheckpoint(key);
       const entries = [...(saved?.value?.entries ?? []), sanitize(entry)].slice(-limit);
-      store.saveCheckpoint(DIAGNOSTICS_KEY, {entries}, saved?.revision ?? 0);
+      store.saveCheckpoint(key, {entries}, saved?.revision ?? 0);
       return true;
     } catch { /* Retry once on a concurrent write, then give up silently. */ }
   }
   return false;
 }
 
-export function readDiagnostics(store) {
-  try { return store.loadCheckpoint(DIAGNOSTICS_KEY)?.value?.entries ?? []; } catch { return []; }
+export function readDiagnostics(store, {key = DIAGNOSTICS_KEY} = {}) {
+  try { return store.loadCheckpoint(key)?.value?.entries ?? []; } catch { return []; }
 }

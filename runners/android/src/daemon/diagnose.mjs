@@ -1,4 +1,4 @@
-import {readDiagnostics} from '../core/diagnostics.mjs';
+import {readDiagnostics, PREFILTER_DIAGNOSTICS_KEY} from '../core/diagnostics.mjs';
 import {daemonStatus} from './local-control.mjs';
 
 // Read-only summary of recent keyword runs and why cards or runs ended early, from the local state only.
@@ -21,7 +21,8 @@ export function diagnoseRunner(store, {hours = 24, now = Date.now()} = {}) {
       runs.push({start: beijing(item.lastWallAt - item.elapsedMs), end: beijing(item.lastWallAt), keyword: keywords.get(itemId) ?? null,
         status: item.status, reason: item.reason ?? null, links: item.links?.length ?? 0, cards: item.cards, swipes: item.swipes,
         skipped: item.skippedCards ?? 0, minutes: Math.round(item.elapsedMs / 6000) / 10, revision: item.assignmentRevision,
-        runId: runId.slice(0, 8)});
+        runId: runId.slice(0, 8),
+        ...(item.prefilter ? {aiSkipped: item.prefilter.skipped, aiJudged: item.prefilter.judged, aiUnjudged: item.prefilter.unjudged} : {})});
     }
   }
   runs.sort((a, b) => a.end.localeCompare(b.end));
@@ -29,9 +30,12 @@ export function diagnoseRunner(store, {hours = 24, now = Date.now()} = {}) {
   for (const run of runs) byReason[`${run.status}:${run.reason}`] = (byReason[`${run.status}:${run.reason}`] ?? 0) + 1;
   const problems = notes.filter(entry => entry.event !== 'task_finished' || !DONE.has(entry.status)).slice(-40)
     .map(entry => ({...entry, at: beijing(Date.parse(entry.at))}));
+  // One note per AI prefilter request: counts, latency, failure code and the skipped titles with the model's reason.
+  const prefilter = readDiagnostics(store, {key: PREFILTER_DIAGNOSTICS_KEY}).filter(entry => Date.parse(entry?.at) >= since).slice(-20)
+    .map(entry => ({...entry, at: beijing(Date.parse(entry.at))}));
   return {checkedAt: beijing(now), hours, status: daemonStatus(store),
     summary: {runs: runs.length, finished: runs.filter(run => DONE.has(run.status)).length,
       endedEarly: runs.filter(run => !DONE.has(run.status)).length, links: runs.reduce((sum, run) => sum + run.links, 0),
-      skippedCards: runs.reduce((sum, run) => sum + run.skipped, 0), byReason},
-    quarantinedByReason: store.quarantineReasons?.() ?? {}, quarantined: store.listQuarantined?.(20) ?? [], runs, problems};
+      skippedCards: runs.reduce((sum, run) => sum + run.skipped, 0), aiSkipped: runs.reduce((sum, run) => sum + (run.aiSkipped ?? 0), 0), byReason},
+    quarantinedByReason: store.quarantineReasons?.() ?? {}, quarantined: store.listQuarantined?.(20) ?? [], runs, problems, prefilter};
 }

@@ -98,6 +98,12 @@ export class BudgetLedger {
     this.save();
     return this.item.skippedCards;
   }
+  /** AI prefilter counts (card-prefilter.mjs). A task that never had the prefilter on reports none of these keys. */
+  notePrefilter({ skipped = 0, judged = 0, unjudged = 0 } = {}) {
+    const counts = this.item.prefilter ?? { skipped: 0, judged: 0, unjudged: 0 };
+    this.item.prefilter = { skipped: counts.skipped + skipped, judged: counts.judged + judged, unjudged: counts.unjudged + unjudged };
+    this.save();
+  }
   noteLink(identity) {
     if (this.item.links.includes(identity)) return false;
     this.item.links.push(identity);
@@ -111,7 +117,9 @@ export class BudgetLedger {
     this.save();
   }
   summary() {
+    const prefilter = this.item.prefilter;
     return { cards: this.item.cards, swipes: this.item.swipes, links: this.item.links.length, skippedCards: this.skippedCards,
-      keywordElapsedMs: this.item.elapsedMs, batchElapsedMs: this.state.elapsedMs };
+      keywordElapsedMs: this.item.elapsedMs, batchElapsedMs: this.state.elapsedMs,
+      ...(prefilter ? { prefilterSkipped: prefilter.skipped, prefilterJudged: prefilter.judged, prefilterUnjudged: prefilter.unjudged } : {}) };
   }
 }
