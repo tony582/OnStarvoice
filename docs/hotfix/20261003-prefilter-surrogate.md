@@ -1,6 +1,6 @@
 # AI 前置筛选截断切开 emoji 致整批判断丢失 hotfix（2026-10-03）
 
-分支 `codex/hotfix-prefilter-surrogate-20261003`，基线 `main`（`8fd8d74`；生产服务端 = `12d09bc`，10-03 12:28 手机卡片预筛上线，`8fd8d74` 只多一份记录）。最初基于 `5b7081b` 写成，卡片预筛上线后变基到 `8fd8d74`，没有冲突（卡片预筛没改 `relevance-prefilter.js`）。复用 `server/utils/well-formed-text.js`（09-29 AI 标注 hotfix 引入，已在生产）。没有迁移、配置、扩展、Runner 或 Admin 改动。**未部署。**
+分支 `codex/hotfix-prefilter-surrogate-20261003`，基线 `main`（`8fd8d74`；生产服务端 = `12d09bc`，10-03 12:28 手机卡片预筛上线，`8fd8d74` 只多一份记录）。最初基于 `5b7081b` 写成，卡片预筛上线后变基到 `8fd8d74`，没有冲突（卡片预筛没改 `relevance-prefilter.js`）。复用 `server/utils/well-formed-text.js`（09-29 AI 标注 hotfix 引入，已在生产）。没有迁移、配置、扩展、Runner 或 Admin 改动。**已于 2026-10-03 13:25:30 上线**（见文末「部署」）。
 
 ## 问题
 
@@ -53,3 +53,14 @@ GROUP BY 1 ORDER BY 1 DESC LIMIT 14;
 ```
 
 丢失的判断不需要回填：客户端当时已按 `failOpen` 完整采集，下次遇到同一内容会重新判断并写入缓存。
+
+## 部署（2026-10-03，用户本会话已点名主机 47.103.125.200）
+
+| 时间 | 步骤 | 结果 |
+| --- | --- | --- |
+| 13:24:40 | 只读核对生产 | PID 648108（12:28 起，重启 37 次，Node 18.20.8）；12:29 之后没有服务端文件被改过，12:28 之后改动的只有卡片预筛那次发布的文件；`relevance-prefilter.js` 与 `12d09bc` 一致（`9bbdca93…`）；进行中的采集任务 0（待执行 22）；前置筛选最近一次请求 05:20；近 7 天失败请求 2 条；PM2 错误日志里两个预筛路由的 `invalid input syntax for type json` 0 条（1,207 条是 09-29 已修的 AI 标注，2 条是 `[Cron] Report scheduler error`，另一个路径，未处理） |
+| 13:25:2x | 上传发布目录 `/opt/onstarvoice-private/releases/prefilter-surrogate-5fc6131-20261003`，`SHA256SUMS` 核对，`bash deploy.sh --check` | 三个文件 OK；预检通过（1 个替换文件、8 个相关模块与 `12d09bc` 一致，服务就绪） |
+| 13:25:28 | `bash deploy.sh` | 退出码 0；替换 `services/relevance-prefilter.js`（`1dc36e2d…`）；新进程 PID 650010（重启 38 次），13:25:30 起、就绪；浏览器预筛、手机预筛、手机领取、云端概览四个路由对未带令牌请求的应答与部署前一致（401）；扩展更新清单未变 |
+| 13:26:33 | 部署后核对 | 部署前一小时内活跃的 18 个节点全部在重启后有心跳；进程未再重启；错误日志尾部只有重启后的数据库繁忙类老问题（`DB_CAPACITY_UNAVAILABLE`），没有预筛、模块加载或语法错误 |
+
+生产服务端 = `5fc6131` 的内容；`main` 快进到 `5fc6131` 之后的记录提交，下个 hotfix 以 `main` 为基线。
