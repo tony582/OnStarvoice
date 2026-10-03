@@ -65,6 +65,17 @@ export function trimMobilePlanSnapshot(planSnapshot = {}, keywords = []) {
   return trimmed;
 }
 
+// The phone asks the AI prefilter about result cards only when the plan turned on
+// the same switch the browser honours for "AI 精准筛选": detail capture after the
+// list and AI relevance screening, both strictly true. A run without a plan
+// snapshot (standalone pilot runs) opens every card as before.
+export function mobileRelevancePrefilterEnabled(planSnapshot) {
+  const settings = planSnapshot && typeof planSnapshot === 'object' ? planSnapshot.captureSettings : null;
+  return Boolean(settings && typeof settings === 'object'
+    && settings.autoDetailCaptureAfterListCapture === true
+    && settings.enableAiRelevancePrefilter === true);
+}
+
 // A phone can only take a plain single-pass douyin keyword search. Multi-pass
 // sequential searches, negative patrols and the `month` publication window stay
 // browser-only. Returns a reason string when the plan is not phone-eligible.

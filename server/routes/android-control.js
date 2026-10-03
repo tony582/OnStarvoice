@@ -2,6 +2,8 @@ import {Router} from 'express';
 import {requireCaptureAgent,requireCriticalTenantAccess,requireSessionUser,requireTenantWriter} from '../middleware/auth.js';
 import {isDbCapacityError} from '../db/query.js';
 import {configuredAndroidTenants,createAndroidControlService} from '../services/android-control/service.js';
+import {DiscoveryError} from '../services/capture-discovery/validation.js';
+import {PrefilterRequestError} from '../services/relevance-prefilter.js';
 export function createAndroidControlRouter({service,enabledTenants=configuredAndroidTenants,
   authenticateAgent=requireCaptureAgent,authenticateUser=requireCriticalTenantAccess,
   sessionUser=requireSessionUser,tenantWriter=requireTenantWriter}={}) {
@@ -27,6 +29,23 @@ export function createAndroidControlRouter({service,enabledTenants=configuredAnd
       next(error);
     }
   };}
+  // The card prefilter is advisory: every failure tells the phone to open the cards
+  // (failOpen), and busy/limit answers are expected here, so it keeps its own mapping.
+  function failOpen(op) {return async (req,res)=>{
+    const refuse=(status,error,retryAfterMs=0)=>{
+      if (retryAfterMs>0) res.set('Retry-After',String(Math.max(1,Math.ceil(retryAfterMs/1000))));
+      return res.status(status).json({ok:false,error,failOpen:true,...(retryAfterMs>0?{retryAfterMs}:{})});
+    };
+    try {res.json({ok:true,...await op(req)});} catch(error) {
+      if (isDbCapacityError(error) || ['55P03','57014'].includes(error?.code)) return refuse(429,'server_busy',1000);
+      // A 429 without its own hint is the daily quota: it will not come back soon.
+      if (error instanceof PrefilterRequestError) return refuse(error.status,error.code,
+        Number(error.details?.retryAfterMs) || (error.status===429?60000:0));
+      if (error instanceof DiscoveryError && [400,401,403,404,409,413,422].includes(error.status)) return refuse(error.status,error.code);
+      console.error('[AndroidPrefilter] Unexpected failure:',error?.message || error);
+      return refuse(503,'PREFILTER_UNAVAILABLE');
+    }
+  };}
   router.get('/capabilities',authenticateUser,sessionUser,(req,res)=>res.json({ok:true,enabled:enabled().has(req.tenantId)}));
   router.post('/register',(req,res,next)=>{
     if (!enabled().size) return res.status(404).json({ok:false,error:'android_discovery_not_enabled'});
@@ -47,6 +66,7 @@ export function createAndroidControlRouter({service,enabledTenants=configuredAnd
   const agent=[authenticateAgent,flag,principal];
   for (const action of ['poll','renew','complete','close']) router.post(`/agent/${action}`,...agent,
     handle(req=>service[action](req.mobilePrincipal,req.body || {})));
+  router.post('/agent/prefilter',...agent,failOpen(req=>service.prefilter(req.mobilePrincipal,req.body)));
   return router;
 }
 export default createAndroidControlRouter();

@@ -2,7 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {digest,fail,id,identity,LEASE_MS,text,WORKFLOW} from './validation.js';
 import {refreshOrchestrationParent} from './parent-refresh.js';
 import {heldItem,lockAgent,parentStopRequested,rollup,saveItemMetadata,taskRow} from './repository.js';
-import {mobilePlanBlockReason,mobileTaskBudgets,mobileTaskFilters,trimMobilePlanSnapshot} from './mobile-tasks.js';
+import {mobilePlanBlockReason,mobileRelevancePrefilterEnabled,mobileTaskBudgets,mobileTaskFilters,trimMobilePlanSnapshot} from './mobile-tasks.js';
 
 // A phone attempt budget per work item (mirrors the browser elastic pool's
 // bounded attempts). Manual-action safety endings fence the item for this phone.
@@ -22,10 +22,13 @@ export function taskIdentity(item,attemptId=item.metadata.attemptId) {
   return {discoveryRunId:runId,taskId:runId,itemId:item.id,attemptId,
     assignmentRevision:item.assignment_revision,requestHash:item.request_hash,agentId:item.assigned_agent_id};
 }
-function taskPayload(item,metadata) {
+// metadata is the child (execution) task's; its trimmed plan snapshot carries the
+// plan's capture switches, so a held re-poll reports the same flag as the claim.
+export function taskPayload(item,metadata) {
   return {identity:taskIdentity(item),deviceId:metadata.deviceId,keyword:item.keyword,
     filters:metadata.filters,budgets:metadata.budgets,deadlineAt:metadata.deadlineAt,
-    resumeAuthorized:item.metadata.resumeAuthorized===true};
+    resumeAuthorized:item.metadata.resumeAuthorized===true,
+    relevancePrefilter:{enabled:mobileRelevancePrefilterEnabled(metadata.planSnapshot)}};
 }
 function permit(item,metadata,now) {
   return {...taskIdentity(item),leaseId:item.metadata.leaseId,serverTime:new Date(now).toISOString(),
