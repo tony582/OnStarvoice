@@ -41,6 +41,7 @@ import {
   truncatePromptText,
 } from '../server/services/ai-labeler.js';
 import { resolveMonitoringIntent } from '../server/services/monitoring-intent.js';
+import { isWellFormed } from '../server/utils/well-formed-text.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -433,6 +434,76 @@ test('model prompts never contain a lone UTF-16 surrogate after truncation or se
   });
   assert.equal(request.messages[1].content, 'prefix�');
   assert.doesNotMatch(JSON.stringify(request), /\\ud83d/iu);
+});
+
+test('model reason, evidence and missing signals cut inside an emoji keep only whole characters', () => {
+  const validation = validatePrefilterRequest(validBody());
+  assert.equal(validation.ok, true);
+  const policy = resolvePrefilterPolicyValues({ requestedMode: 'conservative' });
+  const reply = overrides => normalizePrefilterModelResponse(validation.value, {
+    items: [{
+      itemId: 'xiaohongshu:a',
+      decision: 'skip',
+      tenantRelevance: 'irrelevant',
+      queryMatch: 0.01,
+      brandMatch: 0.02,
+      confidence: 0.98,
+      reason: '其它品牌壁纸',
+      evidence: ['大众'],
+      missingSignals: [],
+      ...overrides,
+    }],
+  }, policy).items[0];
+  const control = reply();
+  // 1000 and 120 are the stored limits; each one falls between the two halves of 💰.
+  const cut = reply({
+    reason: `${'因'.repeat(999)}💰后面还有说明`,
+    evidence: [`${'证'.repeat(119)}💰`, '大众'],
+    missingSignals: [`${'缺'.repeat(119)}💰尾巴`],
+  });
+  assert.equal(cut.reason, '因'.repeat(999));
+  assert.deepEqual(cut.evidence, ['证'.repeat(119), '大众']);
+  assert.deepEqual(cut.missingSignals, ['缺'.repeat(119)]);
+  for (const text of [cut.reason, ...cut.evidence, ...cut.missingSignals]) {
+    assert.equal(isWellFormed(text), true);
+  }
+  assert.doesNotMatch(JSON.stringify(cut), /\\ud[89a-f][0-9a-f]{2}/iu);
+  // Only the stored text changes; the decision is the one a short reason gets.
+  for (const key of ['status', 'modelDecision', 'tenantRelevance', 'confidence', 'executionDisposition', 'failOpen']) {
+    assert.equal(cut[key], control[key], key);
+  }
+  assert.equal(control.executionDisposition, 'skip_full_capture');
+
+  const dirty = reply({ reason: '理由\uD83D', evidence: ['\uDCB0证据'] });
+  assert.equal(dirty.reason, '理由�');
+  assert.deepEqual(dirty.evidence, ['�证据']);
+});
+
+test('request fields that feed the cache key and body hash are still cut exactly as before', () => {
+  // contentSummaryHash, prefilterCacheKey and the idempotency body hash read these fields. Cutting
+  // them differently would orphan cached decisions and turn retries into IDEMPOTENCY_CONFLICT, so
+  // the well-formed cut is only for model output, which is stored but never hashed.
+  const title = `${'题'.repeat(499)}💰`;
+  const validation = validatePrefilterRequest(validBody({
+    items: [{ itemId: 'xiaohongshu:a', title, author: '车友' }],
+    intent: { intentId: 'intent-1', targetEntity: [`${'车'.repeat(79)}💰`] },
+  }));
+  assert.equal(validation.ok, true);
+  assert.equal(validation.value.items[0].title, title.slice(0, 500));
+  assert.deepEqual(validation.value.intent.targetEntity, [`${'车'.repeat(79)}💰`.slice(0, 80)]);
+});
+
+test('every jsonb parameter of the prefilter goes through the well-formed serializer', async () => {
+  const service = await source('server/services/relevance-prefilter.js');
+  const start = service.indexOf('async function persistPrefilterOutcome');
+  const end = service.indexOf('async function markPrefilterRequestFailed');
+  assert.ok(start > 0 && end > start);
+  const persist = service.slice(start, end);
+  // evidence, missing_signals, metadata, the cache response_item and the request response_body.
+  assert.equal(service.match(/::jsonb/gu)?.length, 5);
+  assert.equal(persist.match(/::jsonb/gu)?.length, 5);
+  assert.equal(persist.match(/stringifyJsonWellFormed\(/gu)?.length, 5);
+  assert.doesNotMatch(persist, /JSON\.stringify\(/u);
 });
 
 test('purpose route never reuses a credential across providers', () => {

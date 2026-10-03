@@ -12,6 +12,7 @@ import {
   resolveMonitoringIntent,
   resolveTenantMonitoringScope,
 } from './monitoring-intent.js';
+import { stringifyJsonWellFormed, truncateWellFormed } from '../utils/well-formed-text.js';
 
 export const PREFILTER_PROMPT_VERSION = 'prefilter-list-v4';
 export const PREFILTER_DETAIL_PROMPT_VERSION = 'prefilter-detail-v1';
@@ -45,16 +46,24 @@ export class PrefilterRequestError extends Error {
   }
 }
 
+// Request fields feed contentSummaryHash, the cache key and the idempotency body hash, so they keep
+// this plain cut: cutting them differently would orphan cached decisions and make retries conflict.
 function boundedText(value, maxLength) {
   return String(value ?? '').trim().slice(0, maxLength);
 }
 
-function boundedStringArray(value, { maxItems = 20, maxLength = 100 } = {}) {
+// Model and provider text (reasons, evidence, error messages) is stored and shown but never hashed.
+// A plain cut can split an emoji, and the half character makes the jsonb write fail (22P02).
+function boundedModelText(value, maxLength) {
+  return truncateWellFormed(String(value ?? '').trim(), maxLength);
+}
+
+function boundedStringArray(value, { maxItems = 20, maxLength = 100, cut = boundedText } = {}) {
   if (!Array.isArray(value)) return [];
   const seen = new Set();
   const result = [];
   for (const raw of value) {
-    const item = boundedText(raw, maxLength);
+    const item = cut(raw, maxLength);
     if (!item || seen.has(item)) continue;
     seen.add(item);
     result.push(item);
@@ -468,7 +477,7 @@ function failOpenItem(item, status, reason, policy) {
     queryMatch: null,
     brandMatch: null,
     confidence: null,
-    reason: boundedText(reason, 1000) || 'AI 判断不可用，已按安全策略继续采集',
+    reason: boundedModelText(reason, 1000) || 'AI 判断不可用，已按安全策略继续采集',
     evidence: [],
     missingSignals: [],
     executionDisposition: 'defer_enhancement',
@@ -536,7 +545,7 @@ function normalizeOneModelItem(item, raw, policy) {
   const queryMatch = normalizeScore(raw?.queryMatch ?? raw?.query_match);
   const brandMatch = normalizeScore(raw?.brandMatch ?? raw?.brand_match);
   const confidence = normalizeScore(raw?.confidence);
-  const reason = boundedText(raw?.reason, 1000);
+  const reason = boundedModelText(raw?.reason, 1000);
   if (
     !VALID_DECISIONS.has(decision)
     || !VALID_TENANT_RELEVANCE.has(tenantRelevance)
@@ -559,8 +568,11 @@ function normalizeOneModelItem(item, raw, policy) {
     confidence,
     protectedSignal,
     reason,
-    evidence: boundedStringArray(raw?.evidence, { maxItems: 10, maxLength: 120 }),
-    missingSignals: boundedStringArray(raw?.missingSignals ?? raw?.missing_signals, { maxItems: 10, maxLength: 120 }),
+    evidence: boundedStringArray(raw?.evidence, { maxItems: 10, maxLength: 120, cut: boundedModelText }),
+    missingSignals: boundedStringArray(
+      raw?.missingSignals ?? raw?.missing_signals,
+      { maxItems: 10, maxLength: 120, cut: boundedModelText },
+    ),
     executionDisposition: 'collect_full',
     failOpen: false,
     cacheHit: false,
@@ -812,13 +824,13 @@ async function persistPrefilterOutcome({
         result.brandMatch,
         result.confidence,
         result.reason,
-        JSON.stringify(result.evidence || []),
-        JSON.stringify(result.missingSignals || []),
+        stringifyJsonWellFormed(result.evidence || []),
+        stringifyJsonWellFormed(result.missingSignals || []),
         response.effectiveMode,
         response.skipThreshold,
         response.latencyMs,
         Boolean(result.cacheHit),
-        JSON.stringify({
+        stringifyJsonWellFormed({
           failOpen: result.failOpen,
           itemIndex: index,
           tenantRelevance: result.tenantRelevance || null,
@@ -881,7 +893,7 @@ async function persistPrefilterOutcome({
           request.promptVersion,
           provider,
           model,
-          JSON.stringify(result),
+          stringifyJsonWellFormed(result),
         ]);
       }
     }
@@ -890,7 +902,7 @@ async function persistPrefilterOutcome({
       SET status = 'completed', model_provider = $3, model_name = $4,
           response_body = $5::jsonb, updated_at = now()
       WHERE id = $1 AND tenant_id = $2
-    `, [prefilterRequestId, tenantId, provider, model, JSON.stringify(response)]);
+    `, [prefilterRequestId, tenantId, provider, model, stringifyJsonWellFormed(response)]);
   });
 }
 
@@ -1029,7 +1041,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
               timedOut ? 'timeout' : 'model_error',
               timedOut
                 ? 'AI 判断超时，已按安全策略继续采集'
-                : `AI 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
+                : `AI 判断不可用，已按安全策略继续采集：${boundedModelText(error?.message, 300)}`,
               policy
             );
             for (const item of failed) pendingResults.set(item.itemId, item);
@@ -1051,7 +1063,7 @@ export async function prefilterRelevanceBatch({ tenantId, body }) {
           timedOut ? 'timeout' : 'model_error',
           timedOut
             ? 'AI 判断超时，已按安全策略继续采集'
-            : `AI 判断不可用，已按安全策略继续采集：${boundedText(error?.message, 300)}`,
+            : `AI 判断不可用，已按安全策略继续采集：${boundedModelText(error?.message, 300)}`,
           policy
         ));
       }
