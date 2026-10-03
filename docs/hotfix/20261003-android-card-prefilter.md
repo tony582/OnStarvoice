@@ -65,6 +65,28 @@
 
 修复后：Runner 262 / 262。
 
-## 部署与换版
+## 部署与换版（2026-10-03，用户本会话已点名主机 47.103.125.200）
 
-（发布后补充）
+发布前：CI 运行 37094909410（`494a840`）与 37096172055（`12d09bc`，含审查修复）五项全部通过；服务端发布脚本在模拟生产目录上对最终发布包重新演练 6 种情形，全部符合预期。
+
+| 时间 | 操作 | 结果 |
+| --- | --- | --- |
+| 12:27:42 | 只读核对生产 | PID 628165（10-02 17:04 起，重启 36 次）；之后没有服务端文件被改过；进行中的采集任务 0，手机占用中的工作项 0 |
+| 12:28:03 | 服务端 `bash deploy.sh`（`/opt/onstarvoice-private/releases/card-prefilter-12d09bc-20261003`） | 预检通过（5 个替换文件、16 个相关模块与 `5b7081b` 一致，新增文件不存在）；退出码 0；替换 `routes/android-control.js` 和 `android-control/` 下 `leases.js`、`mobile-tasks.js`、`recovery.js`、`service.js`，新增 `android-control/prefilter.js`；新进程 PID 648108（重启 37 次），12:28:08 就绪；手机领取路由和相邻路由对未带令牌请求的应答与部署前一致（401），新路由 404 → 401；扩展更新清单未变 |
+| 12:29:15 | 部署后核对 | 部署前一小时内活跃的 18 个节点全部重连（46 秒内 13 个）；新增错误日志只有重启后的数据库繁忙类老问题，预筛路由相关 0 条 |
+| 12:29:55 | 手机 Runner 0.2.9（`runtime-0.2.9-934b7c9`）空闲时受控停止 | 立即停稳；状态库备份 `backups/runner-0.2.9-934b7c9-before-0.3.0-12d09bc-20261003.sqlite`（完整性通过） |
+| 12:30:12 | 启动 `runtime-0.3.0-12d09bc`（PID 35682） | 就绪、`controlError=null`；12:30:13 已与服务端联络 |
+
+发布包、出包与演练脚本：`~/Documents/claude/releases/OnStarvoice-card-prefilter-server-20261003/`（`build-stage.py` 这次支持「新增文件」：预检要求生产上不存在，回退时删除）。
+
+回退：服务端恢复发布目录 `backup/` 里的 5 个文件、删除 `server/services/android-control/prefilter.js` 并重启；手机换回 `runtime-0.2.9-934b7c9` 的启动器。没有数据需要回退（手机的预筛只多写了 `relevance_prefilter_decisions` / `relevance_prefilter_requests` 记录）。
+
+换版时手机没有任务，实际效果要等下一轮下发。核对方法：一键启动窗口的结果行出现「AI 跳过 N 条无关」；本机 `cli.mjs diagnose` 的 `prefilter` 列表和每个关键词的 `aiSkipped`；服务端按幂等键前缀 `android:` 统计决策：
+
+```sql
+SELECT d.execution_disposition, d.server_model_status, count(*)
+FROM relevance_prefilter_decisions d
+JOIN relevance_prefilter_requests r ON r.id = d.prefilter_request_id
+WHERE r.idempotency_key LIKE 'android:%'
+GROUP BY 1, 2;
+```
