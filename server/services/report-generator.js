@@ -9,6 +9,7 @@ import { sendReportEmail } from './email-notifier.js';
 import { callLLMWithPrompt } from './ai-labeler.js';
 import { getNegativePatrolAnalytics } from './negative-patrol-analytics.js';
 import { getCommentRiskAttentionPolicy } from './comment-risk-attention.js';
+import { stringifyJsonWellFormed, truncateWellFormed } from '../utils/well-formed-text.js';
 
 const SENTIMENT_LABEL = { positive: '正面', neutral: '中性', negative: '负面' };
 const SENTIMENT_COLOR = { positive: '#059669', neutral: '#6B7280', negative: '#DC2626' };
@@ -109,10 +110,12 @@ function pct(part, total, digits = 1) {
   return Number((num(part) / denominator * 100).toFixed(digits));
 }
 
+// The dashboard and email HTML built from these cuts is stored in report_runs.metadata (jsonb): half an emoji
+// there failed the whole report write (22P02, production 2026-09-12/13).
 function compactText(value, max = 140) {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   if (text.length <= max) return text;
-  return `${text.slice(0, max - 1)}…`;
+  return `${truncateWellFormed(text, max - 1)}…`;
 }
 
 function shanghaiParts(date) {
@@ -1025,7 +1028,8 @@ function collectTermsFromText(counter, text, weight = 1) {
     if (value.toLowerCase().includes(term.toLowerCase())) addTerm(counter, term, weight + 1);
   }
   const hashtagMatches = value.match(/#[^#\s,，。；;:：、]{2,24}/g) || [];
-  for (const tag of hashtagMatches) addTerm(counter, tag, weight + 2);
+  // {2,24} counts UTF-16 units, so a long tag can end on the first half of an emoji: drop that half.
+  for (const tag of hashtagMatches) addTerm(counter, tag.replace(/[\uD800-\uDBFF]$/, ''), weight + 2);
 }
 
 function collectTermsFromRow(counter, row, weight = 1) {
@@ -1217,7 +1221,7 @@ export function buildInsightSamplePool(stats) {
     if (!id) continue;
     if (!sampleMap[id]) {
       sampleMap[id] = {
-        title: String(r.title || '').slice(0, 80),
+        title: truncateWellFormed(String(r.title || ''), 80),
         url: r.url || r.record_url || '',
         platform: r.platform || '',
       };
@@ -1226,12 +1230,12 @@ export function buildInsightSamplePool(stats) {
     seen.add(id);
     samples.push({
       id,
-      title: String(r.title || '').slice(0, 80),
+      title: truncateWellFormed(String(r.title || ''), 80),
       sentiment: r.sentiment || '',
       likes: Number(r.likes || 0),
       comments: Number(r.comments_count || 0),
       ...(includeCommentRisk ? { negComments: Number(r.negative_comment_count || 0) } : {}),
-      summary: String(r.ai_summary || r.content || '').replace(/\s+/g, ' ').slice(0, 160),
+      summary: truncateWellFormed(String(r.ai_summary || r.content || '').replace(/\s+/g, ' '), 160),
     });
     if (samples.length >= 30) break;
   }
@@ -2275,13 +2279,13 @@ async function upsertReportRun({ tenantId, type, periodStart, periodEnd, subject
       status,
       subject,
       html,
-      JSON.stringify({ stats, dashboardHtml, emailHtml, template }),
+      stringifyJsonWellFormed({ stats, dashboardHtml, emailHtml, template }),
     ]);
 
     await tx.execute('DELETE FROM report_snapshots WHERE report_run_id = $1', [run.id]);
     await tx.execute(
       'INSERT INTO report_snapshots (tenant_id, report_run_id, data) VALUES ($1, $2, $3::jsonb)',
-      [tenantId, run.id, JSON.stringify(stats)]
+      [tenantId, run.id, stringifyJsonWellFormed(stats)]
     );
     return run;
   });
@@ -2373,7 +2377,7 @@ export async function resendReport(reportId, tenantId = null) {
   await execute(`
     INSERT INTO audit_logs (tenant_id, action, target_type, target_id, metadata)
     VALUES ($1, 'report_resend', 'report_run', $2, $3::jsonb)
-  `, [report.tenant_id, report.id, JSON.stringify({ reportType: report.report_type })]);
+  `, [report.tenant_id, report.id, stringifyJsonWellFormed({ reportType: report.report_type })]);
   return { ...report, status: 'sent' };
 }
 
