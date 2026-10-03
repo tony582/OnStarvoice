@@ -24,7 +24,7 @@ test('phone card prefilter follows the plan switch, fences attempts and holds no
   const both = {autoDetailCaptureAfterListCapture: true, enableAiRelevancePrefilter: true};
   const card = n => ({cardId: n.toString(16).padStart(64, '0'), title: `别克远控 第${n}条`, author: `作者${n}`});
 
-  async function fixture(st) {
+  async function fixture(st, {realPrefilter = false} = {}) {
     const [{id: tenantId}] = await query('INSERT INTO tenants(name) VALUES($1) RETURNING id', [`android-prefilter-${randomUUID()}`]);
     const code = randomUUID();
     await query('INSERT INTO auth_codes(tenant_id,code,max_bindings) VALUES($1,$2,4)', [tenantId, code]);
@@ -45,7 +45,7 @@ test('phone card prefilter follows the plan switch, fences attempts and holds no
       return state;
     };
     const enabledTenants = () => new Set([tenantId]);
-    const service = createAndroidControlService({enabledTenants, prefilter});
+    const service = createAndroidControlService({enabledTenants, ...(realPrefilter ? {} : {prefilter})});
     async function phone() {
       const registration = {code, clientUuid: randomUUID(), deviceId: `test-${randomUUID()}`};
       const registered = await service.register(registration);
@@ -70,6 +70,9 @@ test('phone card prefilter follows the plan switch, fences attempts and holds no
       await query('DELETE FROM capture_task_items WHERE tenant_id=$1', [tenantId]);
       await query('DELETE FROM capture_agent_commands WHERE tenant_id=$1', [tenantId]);
       await query('DELETE FROM capture_tasks WHERE tenant_id=$1', [tenantId]);
+      await query('DELETE FROM relevance_prefilter_decisions WHERE tenant_id=$1', [tenantId]);
+      await query('DELETE FROM relevance_prefilter_requests WHERE tenant_id=$1', [tenantId]);
+      await query('DELETE FROM tenant_settings WHERE tenant_id=$1', [tenantId]);
       await query('DELETE FROM tenants WHERE id=$1', [tenantId]);
     });
     const send = async (token, body) => {
@@ -197,5 +200,38 @@ test('phone card prefilter follows the plan switch, fences attempts and holds no
     assert.equal(body.keywordRunId, identity.itemId);
     assert.equal(body.mode, 'conservative');
     assert.deepEqual(body.items.map(item => [item.itemId, item.externalId]), cards.map(c => [c.cardId, '']));
+  });
+
+  // The real relevance prefilter, kept away from any model by the tenant's own
+  // switch (the safest of server, tenant and request mode wins): the phone's
+  // request shape must pass its validation, idempotency and decision write.
+  await t.test('the real prefilter accepts the phone request, records the decisions and answers every card unjudged when off', async st => {
+    const f = await fixture(st, {realPrefilter: true});
+    await query(`INSERT INTO tenant_settings(tenant_id,key,value,updated_at) VALUES($1,'relevance_prefilter_mode','disabled',now())`, [f.tenantId]);
+    const a = await f.phone();
+    await elasticParent(f.tenantId, {eligibleAgentIds: [a.agent.id], keywords: ['别克远控'], captureSettings: both});
+    const claimed = await a.poll();
+    const {identity} = claimed.task;
+    const requestId = randomUUID(), cards = [card(1), {...card(2), title: `${'长'.repeat(499)}😀尾巴`}];
+    const body = {identity, requestId, cards};
+    const answer = await f.send(a.token, body);
+    assert.equal(answer.status, 200);
+    assert.equal(answer.body.enabled, true);
+    assert.equal(answer.body.degraded, true);
+    assert.deepEqual(answer.body.items.map(item => [item.cardId, item.status, item.executionDisposition]),
+      cards.map(c => [c.cardId, 'model_error', 'collect_full']), 'nothing is skipped when the model is off');
+    const rows = await query(`SELECT item_id, external_id, task_id, run_id, keyword_run_id, keyword, stage, platform
+      FROM relevance_prefilter_decisions WHERE tenant_id=$1 ORDER BY item_title_excerpt`, [f.tenantId]);
+    assert.equal(rows.length, 2);
+    for (const row of rows) {
+      assert.deepEqual([row.external_id, row.task_id, row.run_id, row.keyword_run_id, row.keyword, row.stage, row.platform],
+        ['', identity.taskId, identity.discoveryRunId, identity.itemId, '别克远控', 'list', 'douyin']);
+    }
+    assert.deepEqual(rows.map(row => row.item_id).sort(), cards.map(c => c.cardId).sort());
+    // The same request again is the stored answer, not a second decision.
+    const replay = await f.send(a.token, body);
+    assert.equal(replay.status, 200);
+    assert.deepEqual(replay.body.items, answer.body.items);
+    assert.equal((await query('SELECT count(*)::int AS n FROM relevance_prefilter_decisions WHERE tenant_id=$1', [f.tenantId]))[0].n, 2);
   });
 });

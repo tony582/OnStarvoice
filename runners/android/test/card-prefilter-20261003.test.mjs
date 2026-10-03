@@ -187,6 +187,28 @@ test('within one page the breaker stops the third batch after two failed request
     { skipped: 0, judged: 0, unjudged: 17, failure: 'prefilter_failed' });
 });
 
+test('a model outage (200, every card failed open) counts as a failed request; two in a row stop the calls', async () => {
+  const timeoutItem = card => skipItem(card, { status: 'timeout', modelDecision: null, tenantRelevance: null, confidence: null,
+    executionDisposition: 'collect_full' });
+  const outcomes = [timeoutItem, skipItem, timeoutItem, timeoutItem];
+  let calls = 0;
+  const prefilter = createCardPrefilter({ task: enabledTask(),
+    client: { prefilter: async body => { const decide = outcomes[calls++]; return { ...answer(body.cards.map(decide)), degraded: true }; } } });
+  const first = await prefilter.decide(cardsOf(2, '一'));
+  assert.deepEqual({ skipped: first.skip.size, judged: first.judged, unjudged: first.unjudged, failure: first.failure },
+    { skipped: 0, judged: 0, unjudged: 2, failure: 'prefilter_unjudged' });
+  const second = await prefilter.decide(cardsOf(2, '二')); // a judged answer resets the streak
+  assert.deepEqual({ skipped: second.skip.size, judged: second.judged, failure: second.failure }, { skipped: 2, judged: 2, failure: null });
+  await prefilter.decide(cardsOf(2, '三'));
+  assert.equal(prefilter.stopped, null, 'one unjudged answer after a judged one does not stop');
+  const fourth = await prefilter.decide(cardsOf(2, '四'));
+  assert.deepEqual({ unjudged: fourth.unjudged, failure: fourth.failure }, { unjudged: 2, failure: 'prefilter_unjudged' });
+  assert.equal(prefilter.stopped, 'prefilter_breaker_open');
+  const fifth = await prefilter.decide(cardsOf(2, '五'));
+  assert.equal(calls, 4);
+  assert.deepEqual({ unjudged: fifth.unjudged, failure: fifth.failure }, { unjudged: 2, failure: 'prefilter_breaker_open' });
+});
+
 test('missing, duplicated or non-ok items open only those cards; the rest of the answer still counts', async () => {
   const [a, b, c, d] = cardsOf(4);
   const prefilter = createCardPrefilter({ task: enabledTask(), client: { prefilter: async () => answer([skipItem(a),
@@ -207,6 +229,23 @@ test('the control client posts the prefilter to the agent route with the agent t
       return Response.json({ ok: true, enabled: false, degraded: false, items: [] });
     } });
   assert.deepEqual(await client.prefilter(body), { ok: true, enabled: false, degraded: false, items: [] });
+});
+
+test('the prefilter request waits the transport\'s full 30 s; other control calls keep their 10 s', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const client = createControlClient({ baseUrl: 'https://capture.example', agentToken: 'local-fixture-token',
+    fetchImpl: () => new Promise(() => {}) });
+  const watch = promise => { const state = { error: null }; promise.catch(error => { state.error = error; }); return state; };
+  const prefilter = watch(client.prefilter({ identity: fixtureTask().identity, requestId: '00000000-0000-4000-8000-000000000000', cards: [] }));
+  const renew = watch(client.renew({}));
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(15_000);
+  await settle();
+  assert.equal(renew.error?.code, 'cloud_timeout');
+  assert.equal(prefilter.error, null, 'still waiting at 15 s');
+  t.mock.timers.tick(15_000);
+  await settle();
+  assert.equal(prefilter.error?.code, 'cloud_timeout');
 });
 
 // ---- The discovery runner with the prefilter ----

@@ -93,7 +93,6 @@ export function createCardPrefilter({ client, task, signal = null, now = () => p
       if (failure === 'prefilter_disabled') stopReason = failure;
       else if (failure && failure !== 'aborted' && ++failedInARow >= MAX_FAILED_REQUESTS) stopReason = 'prefilter_breaker_open';
       else if (!failure) {
-        failedInARow = 0;
         for (const card of batch) {
           const item = judgedItem(response, card);
           if (!item) continue;
@@ -102,6 +101,13 @@ export function createCardPrefilter({ client, task, signal = null, now = () => p
             result.skip.add(card.cardId);
             skipped.push({ title: clipText(cleanText(card.title), 60), reason: clipText(cleanText(item.reason), 80) });
           }
+        }
+        // A model outage answers 200 with every card failed open (timeout, model_error): that is a failed request too,
+        // or each page would keep waiting up to the model deadline only to open everything.
+        if (judged > 0) failedInARow = 0;
+        else {
+          failure = 'prefilter_unjudged';
+          if (++failedInARow >= MAX_FAILED_REQUESTS) stopReason = 'prefilter_breaker_open';
         }
       }
       result.judged += judged;
