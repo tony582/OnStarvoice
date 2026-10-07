@@ -1,6 +1,6 @@
 # 负面巡查卡在「正在核对巡查任务状态」hotfix（2026-10-07）
 
-分支 `codex/hotfix-patrol-reconcile-livelock-20261007`，基线 `dd2b027`（= `main` = 生产服务端；生产的 `capture-stop-fence-release.js` 仍是 `bb53e44` 版，只比 main 多末尾一个空行）。发布 = `323e05d`：扩展 0.4.23 + 服务端兜底。没有迁移、配置、Admin 或 Runner 改动。
+分支 `codex/hotfix-patrol-reconcile-livelock-20261007`，基线 `dd2b027`（= `main` = 生产服务端；生产的 `capture-stop-fence-release.js` 仍是 `bb53e44` 版，只比 main 多末尾一个空行）。发布 = `edbd48e`：扩展 0.4.23 + 服务端兜底。没有迁移、配置、Admin 或 Runner 改动。
 
 ## 现象
 
@@ -47,6 +47,7 @@ nginx 访问日志：同一台 Windows 机器（39.144.x.x，地球和月球）�
 | `background.js` 新增 `syncCloudTaskAgentAfterRequest` | 返回一次「在本次请求之后开始」的同步结果。已在进行的同步只等不算（它可能在请求之前就读了本地和服务端状态）。没有同步在跑就自己发一次强制同步。等待先前同步最多 30 秒，超过仍返回 `sync_in_flight` |
 | 对账消息处理 | 改用 `syncCloudTaskAgentAfterRequest`。服务端失败、退避中（`failure_backoff`）仍判未对账，不开跑 |
 | `sidebar-logic.js` | 执行页开跑前这一条对账消息的等待上限改为 90 秒（`TARGETED_POST_RECONCILE_MESSAGE_TIMEOUT_MS`）；侧栏初始化时的展示用对账和其它控制消息仍是 12 秒 |
+| `syncCloudTaskAgent`（复审修复 `9b53187`） | 「同步进行中」标志、序号和结束信号改在读凭据（一次 `chrome.storage` 调用）之前同步置好；没有凭据时也从同一个 `finally` 返回。原先标志在读凭据之后才置，被同一次同步唤醒的多个等待者和待同步链会在这段时间里各自开一次完整同步，原有的「同一时间只跑一次同步」就不成立了 |
 
 ### 服务端兜底（`3798159`）
 
@@ -59,6 +60,11 @@ nginx 访问日志：同一台 Windows 机器（39.144.x.x，地球和月球）�
 
 **已知同类风险，没有改：** 离线超时退回（`elastic_agent_offline_timeout`）在节点回来确认通知时，也会把还没被别的节点接走的工作项投影成 `canceled`。
 
+**独立复审指出、留作选项的缺口：**
+
+- 还没升级的 0.4.22 慢节点被收回一条后，会立刻再领一条新巡查，可能再卡 15 分钟，每次消耗该帖一次重试预算。新码的节点暂停时间是 0，和其它「任务心跳中断」类一致。可选做法：对新码给节点 30–60 分钟不领负面巡查，或计为不扣预算。
+- 只覆盖弹性池（`elastic_pool`）批次。后台手动派发的固定批次巡查（`fixed_batch`），以及被「创建指令过期」复活成 `claimed` 的子任务，不在这条兜底内。
+
 ### 版本（`323e05d`）
 
 `manifest.json` 0.4.23，更新清单、更新日志页、`OPS_CONTROL_RUNTIME_BASELINE_VERSION` 同步。最低支持版本仍为 0.3.51。
@@ -68,10 +74,12 @@ nginx 访问日志：同一台 Windows 机器（39.144.x.x，地球和月球）�
 | 项目 | 结果 |
 | --- | --- |
 | `tests/background-capture-lock.test.mjs` 新增 3 项：执行页比一次同步更频繁地重试仍能对账；请求前已开始的同步不算数；服务端退避中仍不开跑 | 修复前前两项失败，形态与生产一致（连续 6 次 `sync_in_flight`）；修复后 3/3 |
+| 复审后再加 2 项：同一次同步唤醒的多个等待者仍一次只跑一个同步（待同步链、两条执行页消息两种情形，存储读加 5 ms 延迟）；没有凭据时等待者正常结束 | 在 `323e05d` 上第一项失败（最多 2 个心跳并发）；修复后通过 |
+| 两个原有测试（搁浅的负面巡查取消对账）写死 `2026-09-07T11:0xZ`，任务中心 30 天后清掉已结束记录，10-07 19:00 起在任何代码上都失败 | 改成一分钟前（`edbd48e`，只改测试）；其它写死日期的测试另开任务排查 |
 | 新增 `tests/integration/postgres/negative-patrol-start-timeout.integration.mjs` | 真实下发 → 快照确认 → 14 分钟不动、16 分钟退回 → 卡住节点收到 superseded 通知并确认，工作项仍是 `retryable` → 另一节点接走。对照：已开始的、创建未确认的都不动。基线代码上第一项失败（不退回）；只去掉确认那段改动时，工作项变成 `canceled`。修复后 3/3 |
 | `tests/server-capture-cloud-contract.test.mjs` | 119/119（新增迟到快照防线与新分支断言） |
-| 全量单元 `run-node-regression-tests.mjs` | Node 18.20.8、24.12.0 各 3258/3258 |
-| 全量 PostgreSQL 集成 | 见下方部署记录 |
+| 全量单元 `run-node-regression-tests.mjs` | Node 18.20.8、24.12.0 各 3260/3260（`edbd48e`） |
+| 全量 PostgreSQL 集成 `run-postgres-integration-tests.mjs`（全新库，PostgreSQL 17，Node 18.20.8） | 511/511（`323e05d`；之后只改了扩展和测试） |
 | 生产只读 `EXPLAIN ANALYZE` 新候选查询 | 走 `idx_capture_tasks_elastic_children_active` 与 `idx_capture_tasks_agent_slot_blocking`，74 ms（冷读） |
 | 发布脚本在模拟生产目录（`dd2b027` 的 `server/` + 生产那份 `capture-stop-fence-release.js`，真实 Node 18 进程）上演练 6 种情形 | 预检通过；相关模块被改、替换文件被改、新安装包已存在都拒绝且不改任何东西；新进程起不来时恢复 4 个文件、删掉新安装包、服务恢复就绪；正常部署后更新清单 0.4.23、安装包按字节一致下载、更新日志页显示最新、未登录请求应答不变（401）；同一发布目录第二次运行被拒 |
 
