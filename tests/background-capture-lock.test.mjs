@@ -5172,6 +5172,120 @@ test("a reopened sidebar reconciles a server-terminal snapshot and acknowledges 
   );
 });
 
+function seedPendingNegativePatrolRunner(harness, id) {
+  const request = buildTargetedPostRequest({
+    id,
+    clientTaskId: id,
+    attemptId: `${id}-attempt`,
+    status: "pending",
+    runnerTabId: 87,
+  });
+  harness.storage["onstarvoice.auth"] = {
+    captureAgent: {id: `${id}-agent`, token: `${id}-token`},
+  };
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+  const runnerUrl =
+    `chrome-extension://test/sidebar/sidebar.html?targetedPostRun=${request.id}` +
+    `&targetedPostAttempt=${request.attemptId}`;
+  harness.setTabQueryHandler(async () => [{
+    id: 87,
+    windowId: 1,
+    status: "complete",
+    url: runnerUrl,
+  }]);
+  return request;
+}
+
+function reconcileNegativePatrolRunner(harness, request) {
+  return harness.sendBackgroundMessage({
+    type: "onstarvoice:reconcile-targeted-post-run-state",
+    requestId: request.id,
+    attemptId: request.attemptId,
+  });
+}
+
+test("a negative patrol runner that polls faster than one sync takes still gets reconciled", async () => {
+  // 2026-10-07: on slow Windows nodes one full sync took longer than the
+  // runner's 5 s retry. Every poll hit "sync_in_flight", re-armed the pending
+  // chain, and three patrols waited six hours while every heartbeat succeeded.
+  const harness = createHarness();
+  const request = seedPendingNegativePatrolRunner(harness, "patrol-slow-sync");
+  harness.setCloudHeartbeatHandler(async (_options, heartbeatNumber) => {
+    await new Promise((resolve) => setTimeout(resolve, heartbeatNumber === 1 ? 300 : 150));
+    return {ok: true, commands: [], terminalNotices: []};
+  });
+  const earlierSync = harness.api.syncCloudTaskAgent({reason: "alarm", force: true});
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const outcomes = [];
+  for (let poll = 0; poll < 6; poll += 1) {
+    const response = await reconcileNegativePatrolRunner(harness, request);
+    outcomes.push(response?.reconciled === true ? "reconciled" : response?.reason);
+    if (response?.reconciled === true) break;
+    // Polls more often than one sync takes, like the runner on a slow node.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await earlierSync;
+
+  assert.deepEqual(outcomes, ["reconciled"]);
+  assert.equal(
+    harness.cloudHeartbeats.at(-1).reason,
+    "targeted_post_sidebar_reconcile",
+  );
+});
+
+test("a sync already in flight when the runner asks does not count as its reconciliation", async () => {
+  const harness = createHarness();
+  const request = seedPendingNegativePatrolRunner(harness, "patrol-in-flight");
+  let releaseFirstHeartbeat = () => {};
+  harness.setCloudHeartbeatHandler(async (_options, heartbeatNumber) => {
+    if (heartbeatNumber === 1) {
+      await new Promise((resolve) => {
+        releaseFirstHeartbeat = resolve;
+      });
+    }
+    return {ok: true, commands: [], terminalNotices: []};
+  });
+  const earlierSync = harness.api.syncCloudTaskAgent({reason: "alarm", force: true});
+  await waitFor(
+    () => harness.cloudHeartbeats.length === 1,
+    "the earlier sync did not reach its heartbeat",
+  );
+
+  let answered = false;
+  const reconcile = reconcileNegativePatrolRunner(harness, request).then((response) => {
+    answered = true;
+    return response;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(answered, false, "the runner was answered by a sync that started before it asked");
+
+  releaseFirstHeartbeat();
+  const response = await reconcile;
+  await earlierSync;
+
+  assert.equal(response.reconciled, true, JSON.stringify(response));
+  assert.equal(harness.cloudHeartbeats.length, 2);
+  assert.equal(harness.cloudHeartbeats[1].reason, "targeted_post_sidebar_reconcile");
+});
+
+test("a runner reconciliation still fails while the cloud is backing off", async () => {
+  const harness = createHarness();
+  const request = seedPendingNegativePatrolRunner(harness, "patrol-backoff");
+  harness.setCloudHeartbeatHandler(async () => ({
+    ok: false,
+    reason: "service_unavailable",
+    message: "Database general capacity is temporarily unavailable.",
+  }));
+  await harness.api.syncCloudTaskAgent({reason: "alarm", force: true});
+
+  const response = await reconcileNegativePatrolRunner(harness, request);
+
+  assert.equal(response.reconciled, false);
+  assert.equal(response.reason, "failure_backoff");
+  assert.equal(harness.cloudHeartbeats.length, 1);
+});
+
 test("a late server notice closes only old attempt resources and cannot harm the replacement", async () => {
   const harness = createHarness();
   const requestId = "targeted-reused-request";

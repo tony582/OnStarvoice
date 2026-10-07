@@ -212,6 +212,10 @@ const CLOUD_TASK_AGENT_PERIOD_MINUTES = 1;
 const CLOUD_TASK_AGENT_ACTIVE_THROTTLE_MS = 15 * 1000;
 const CLOUD_TASK_AGENT_FAILURE_BACKOFF_BASE_MS = 15 * 1000;
 const CLOUD_TASK_AGENT_FAILURE_BACKOFF_MAX_MS = 5 * 60 * 1000;
+// How long a requested sync waits for in-flight syncs that started earlier.
+// The runner page allows TARGETED_POST_RECONCILE_MESSAGE_TIMEOUT_MS on top of
+// this for the sync it then starts itself.
+const CLOUD_TASK_AGENT_REQUESTED_SYNC_WAIT_MS = 30 * 1000;
 const UNATTENDED_LOCAL_CLOSURE_RETRY_DELAYS_MS = Object.freeze([
   1000,
   5000,
@@ -2119,6 +2123,12 @@ async function readTaskLedger() {
 }
 
 let cloudTaskAgentSyncInFlight = false;
+// Every full sync that actually starts gets a sequence number, so a caller can
+// wait for one that began after its own request instead of being turned away
+// while another sync is in flight.
+let cloudTaskAgentSyncSeq = 0;
+let cloudTaskAgentSyncSettled = Promise.resolve();
+let cloudTaskAgentLastSettledSync = {seq: 0, result: null};
 let cloudTaskAgentLivenessInFlight = false;
 let cloudTaskAgentSyncPending = false;
 let cloudTaskAgentLastSyncAt = 0;
@@ -7874,6 +7884,12 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
   }
 
   cloudTaskAgentSyncInFlight = true;
+  const syncSeq = ++cloudTaskAgentSyncSeq;
+  let settledResult = null;
+  let resolveSettled = () => {};
+  cloudTaskAgentSyncSettled = new Promise((resolve) => {
+    resolveSettled = resolve;
+  });
   try {
     const degradedHealth = [];
     const markDegraded = (code) => {
@@ -8053,6 +8069,7 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
       ).catch((error) => {
         console.warn('[CloudTaskAgent] failed to persist sync error:', error);
       });
+      settledResult = response;
       return response;
     }
 
@@ -8158,9 +8175,15 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
         console.warn('[CloudTaskAgent] stop fence check failed:', error);
       });
     }
+    settledResult = response;
     return response;
   } finally {
     cloudTaskAgentSyncInFlight = false;
+    cloudTaskAgentLastSettledSync = {
+      seq: syncSeq,
+      result: settledResult || {ok: false, reason: 'sync_failed'},
+    };
+    resolveSettled();
     if (cloudTaskAgentSyncPending) {
       cloudTaskAgentSyncPending = false;
       setTimeout(() => {
@@ -8169,6 +8192,43 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
         );
       }, 0);
     }
+  }
+}
+
+// Returns the result of a full sync that started after this call. A sync that
+// is already in flight may have read local state and server state before the
+// caller asked, so it is awaited but not counted. Returning 'sync_in_flight'
+// instead let a runner that polls faster than one sync takes keep re-arming the
+// pending chain and never get an answer (2026-10-07 negative patrol livelock).
+async function syncCloudTaskAgentAfterRequest({
+  reason = 'requested',
+  waitMs = CLOUD_TASK_AGENT_REQUESTED_SYNC_WAIT_MS,
+} = {}) {
+  const startedBefore = cloudTaskAgentSyncSeq;
+  const deadline = Date.now() + Math.max(0, Number(waitMs) || 0);
+  for (;;) {
+    if (cloudTaskAgentLastSettledSync.seq > startedBefore) {
+      return cloudTaskAgentLastSettledSync.result;
+    }
+    if (!cloudTaskAgentSyncInFlight) {
+      const result = await syncCloudTaskAgent({reason, force: true});
+      if (result?.skipped !== true || result.reason !== 'sync_in_flight') {
+        return result;
+      }
+      continue;
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      return {ok: false, skipped: true, reason: 'sync_in_flight'};
+    }
+    let waitTimer = null;
+    await Promise.race([
+      cloudTaskAgentSyncSettled,
+      new Promise((resolve) => {
+        waitTimer = setTimeout(resolve, remainingMs);
+      }),
+    ]);
+    clearTimeout(waitTimer);
   }
 }
 
@@ -24298,9 +24358,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           return;
         }
-        const reconciliation = await syncCloudTaskAgent({
+        const reconciliation = await syncCloudTaskAgentAfterRequest({
           reason: 'targeted_post_sidebar_reconcile',
-          force: true,
         });
         const request = await readTargetedPostRunRequest({
           persistNormalized: false,

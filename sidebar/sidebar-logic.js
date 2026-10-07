@@ -1215,6 +1215,10 @@ const TARGETED_POST_RUN_REQUEST_STORAGE_KEY =
   "onstarvoice.targetedPostRunRequest";
 const cloudTargetedPostApi = globalThis.OnStarvoiceCloudTargetedPost;
 const TARGETED_POST_CONTROL_MESSAGE_TIMEOUT_MS = 12 * 1000;
+// Before a negative patrol starts, the background waits for a sync that began
+// after the runner asked (up to 30 s behind earlier ones) and then runs its own,
+// so the runner has to wait longer than one ordinary control message.
+const TARGETED_POST_RECONCILE_MESSAGE_TIMEOUT_MS = 90 * 1000;
 const KEYWORD_PLAN_STORAGE_KEY = "onstarvoice.unattendedKeywordPlan";
 const KEYWORD_RUN_REQUEST_STORAGE_KEY = "onstarvoice.unattendedKeywordRunRequest";
 const KEYWORD_PLAN_RECONCILE_INTERVAL_MS = 5 * 1000;
@@ -17250,12 +17254,16 @@ async function sendTargetedPostControlMessage(message, {
   }
 }
 
-async function reconcileTargetedPostRunState(requestId = "", attemptId = "") {
+async function reconcileTargetedPostRunState(
+  requestId = "",
+  attemptId = "",
+  {timeoutMs = TARGETED_POST_CONTROL_MESSAGE_TIMEOUT_MS} = {},
+) {
   const response = await sendTargetedPostControlMessage({
     type: "onstarvoice:reconcile-targeted-post-run-state",
     requestId: String(requestId || "").trim(),
     attemptId: String(attemptId || "").trim(),
-  });
+  }, {timeoutMs});
   if (response?.ok && response?.reconciled === true) {
     const reconciledRequest =
       response?.data && typeof response.data === "object"
@@ -17834,6 +17842,7 @@ async function maybeClaimAndRunTargetedPostWorkflow() {
       stateResponse = await reconcileTargetedPostRunState(
         requestId,
         attemptId,
+        {timeoutMs: TARGETED_POST_RECONCILE_MESSAGE_TIMEOUT_MS},
       );
     } catch (error) {
       console.warn(
