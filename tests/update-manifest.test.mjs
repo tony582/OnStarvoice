@@ -106,8 +106,8 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 8).map(release => release.version),
-    ['0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
+  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 9).map(release => release.version),
+    ['0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);
@@ -125,10 +125,9 @@ test('extension update manifest matches the packaged source version', () => {
 });
 
 test('0.4.20 announces safe cleanup and the separate Android Runner upgrade without raising the minimum version', async () => {
-  assert.equal(EXTENSION_UPDATE_MANIFEST.releaseDate, '2026-09-28');
   assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
   const latest = EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.20');
-  assert.equal(latest?.releaseDate, EXTENSION_UPDATE_MANIFEST.releaseDate);
+  assert.equal(latest?.releaseDate, '2026-09-28');
   const notes = JSON.stringify(latest?.releaseNotes);
   for (const description of [
     /完成、普通失败或取消[\s\S]*清理失败自动重试[\s\S]*不重新执行任务/u,
@@ -170,18 +169,29 @@ test('extension update endpoint returns the shape consumed by the sidebar', () =
 });
 
 
-test('0.4.22 publishes dedicated-window cleanup while preserving the mobile version and minimum extension', () => {
-  assert.equal(manifest.version, '0.4.22');
+test('0.4.23 publishes the negative patrol reconcile fix while preserving the minimum extension', () => {
+  assert.equal(manifest.version, '0.4.23');
   assert.equal(EXTENSION_UPDATE_MANIFEST.latestVersion, manifest.version);
   assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
   assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
-    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.22-20260928.zip');
+    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.23-20261007.zip');
   const latest = EXTENSION_UPDATE_MANIFEST.releases[0];
   assert.equal(latest.version, manifest.version);
   const notes = JSON.stringify(latest.releaseNotes);
+  for (const phrase of ['正在核对巡查任务状态', '请求之后开始的同步', '服务器暂时不可用时仍不会开跑',
+    '下发 15 分钟后仍未开始', '未更新的节点也生效']) {
+    assert.ok(notes.includes(phrase), phrase);
+  }
+  const latestAbout = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.23<'), aboutHtml.indexOf('扩展 v0.4.22<'));
+  assert.match(latestAbout, /正在核对巡查任务状态[\s\S]*服务器暂时不可用时仍不会开跑/u);
+});
+
+test('0.4.22 keeps its dedicated-window cleanup notes', () => {
+  const release = EXTENSION_UPDATE_MANIFEST.releases.find(item => item.version === '0.4.22');
+  const notes = JSON.stringify(release?.releaseNotes);
   for (const phrase of ['专用采集窗口', '身份可核验', '/jingxuan', '不再先恢复旧搜索页', 'Android Runner 0.2.6 保持不变']) {
     assert.ok(notes.includes(phrase), phrase);
   }
-  const latestAbout = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.22<'), aboutHtml.indexOf('扩展 v0.4.21<'));
-  assert.match(latestAbout, /身份可核验[\s\S]*jingxuan[\s\S]*Android Runner 0\.2\.6/u);
+  const about = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.22<'), aboutHtml.indexOf('扩展 v0.4.21<'));
+  assert.match(about, /身份可核验[\s\S]*jingxuan[\s\S]*Android Runner 0\.2\.6/u);
 });

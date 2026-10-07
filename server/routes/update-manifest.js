@@ -3,12 +3,23 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.22',
+  latestVersion: '0.4.23',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-09-28',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.22-20260928.zip',
+  releaseDate: '2026-10-07',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.23-20261007.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.23',
+      releaseDate: '2026-10-07',
+      releaseNotes: [{
+        tag: '修复',
+        notes: [
+          {title: '负面帖子巡查不再卡在开跑前核对', desc: '巡查开跑前要与服务器核对一次任务状态。后台正在同步时，原来直接让运行页 5 秒后再试，同步较慢的节点（单次超过 5 秒，多见于 Windows）每次都撞上同步，巡查停在「正在核对巡查任务状态，确认后会自动继续」数小时不开始。现在改为等一次在请求之后开始的同步完成再核对。服务器暂时不可用时仍不会开跑。需更新 Extension。'},
+          {title: '下发后迟迟未开始的巡查自动改派', desc: '服务器同时上线兜底：负面帖子巡查下发 15 分钟后仍未开始，工作项退回任务池，由其它节点接力；原节点收到「已由其它节点接力」后停止旧运行页。仅服务器改动，未更新的节点也生效。'},
+        ],
+      }],
+    },
     {
       version: '0.4.22',
       releaseDate: '2026-09-28',
