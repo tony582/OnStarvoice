@@ -6081,10 +6081,13 @@ test("startup reconciliation closes a stranded negative cancel after its exact l
     const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
       (run) => run.id === `${request.id}::${request.attemptId}`,
     );
+    // Relative time: the ledger drops terminal runs after 30 days, and a
+    // fixed date here started failing on 2026-10-07.
+    const finishedAt = new Date(Date.now() - 60_000).toISOString();
     Object.assign(ledgerRun, {
       status: ledgerStatus,
-      finishedAt: "2026-09-07T11:00:00.000Z",
-      updatedAt: "2026-09-07T11:00:00.000Z",
+      finishedAt,
+      updatedAt: finishedAt,
     });
     harness.setTabQueryHandler(async () => []);
 
@@ -6129,11 +6132,12 @@ test("stranded negative reconciliation rejects a physical ledger id with an expl
   const ledgerRun = harness.storage[TASK_LEDGER_KEY].runs.find(
     (run) => run.id === `${request.id}::${request.attemptId}`,
   );
+  const finishedAt = new Date(Date.now() - 60_000).toISOString();
   Object.assign(ledgerRun, {
     attemptId: "negative-older-attempt",
     status: "failed",
-    finishedAt: "2026-09-07T11:02:00.000Z",
-    updatedAt: "2026-09-07T11:02:00.000Z",
+    finishedAt,
+    updatedAt: finishedAt,
   });
   ledgerRun.metadata = {
     ...(ledgerRun.metadata || {}),
