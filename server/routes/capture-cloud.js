@@ -362,6 +362,12 @@ const DUTY_RECOVERY_SETTING_KEYS = Object.freeze([
 ]);
 const ELASTIC_QUEUE_CREATE_ACK_TIMEOUT_MS = 3 * 60 * 1000;
 const ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN = 10;
+// A negative patrol runs within seconds of its create command. One whose
+// create was acknowledged (a snapshot showed it queued) but that never started
+// is stuck on its node even though the node keeps heartbeating, and nothing
+// else releases it: 2026-10-07 three Windows nodes held their patrols over six
+// hours. After this long the item goes back to the queue for another node.
+const NEGATIVE_PATROL_START_TIMEOUT_MIN = 15;
 const LEGACY_LOCAL_CLOSURE_REUSE_QUIESCENCE_MS = 20 * 1000;
 const LOCAL_CLOSURE_PROOF_STRICT_MIN_VERSION_PARTS = Object.freeze([0, 4, 4]);
 // Technical failures release only the failed work item. They are not evidence
@@ -664,6 +670,7 @@ const ELASTIC_BOOTSTRAP_CONGESTION_CODES = new Set([
 const ELASTIC_STALE_TASK_CODES = new Set([
   'ELASTIC_TASK_HEARTBEAT_TIMEOUT',
   'ELASTIC_AGENT_OFFLINE_TIMEOUT',
+  'NEGATIVE_PATROL_START_TIMEOUT',
 ]);
 const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
   'unattended_keyword_capture',
@@ -7096,7 +7103,8 @@ export async function mirrorTaskSnapshot(
         AND capture_tasks.status = 'failed'
         AND UPPER(COALESCE(capture_tasks.error->>'code', '')) IN (
           'ELASTIC_AGENT_OFFLINE_TIMEOUT',
-          'ELASTIC_TASK_HEARTBEAT_TIMEOUT'
+          'ELASTIC_TASK_HEARTBEAT_TIMEOUT',
+          'NEGATIVE_PATROL_START_TIMEOUT'
         )
       )
       -- attempt_number is a monotonic slot, while client_attempt_id identifies
@@ -8977,7 +8985,8 @@ async function claimPriorityAgentControl(tx, {
           task.status
         ) = acknowledgement.status
       RETURNING task.id, task.parent_task_id, task.status,
-        task.assigned_agent_id, task.task_type
+        task.assigned_agent_id, task.task_type,
+        task.error->>'code' AS error_code
     `, [
       agent.tenant_id,
       agent.id,
@@ -8989,6 +8998,17 @@ async function claimPriorityAgentControl(tx, {
     ]);
     for (const acknowledgedTask of acknowledgedTerminalTasks) {
       if (!acknowledgedTask.parent_task_id) continue;
+      // The lease reconciler already sent this patrol's work item back to the
+      // queue as retryable. The node only confirms that its stuck runner has
+      // stopped, and that must not cancel the item before another node takes
+      // it. (The offline-timeout requeue has the same exposure when an offline
+      // node returns and acknowledges; it is left as it was.)
+      if (
+        text(acknowledgedTask.error_code, 100).toUpperCase() ===
+          'NEGATIVE_PATROL_START_TIMEOUT'
+      ) {
+        continue;
+      }
       await projectOrchestrationChildControlOutcome(tx, {
         tenantId: agent.tenant_id,
         childTask: acknowledgedTask,
@@ -16326,18 +16346,28 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         'completed', 'completed_with_warnings', 'completed_with_failures',
         'failed', 'canceled', 'skipped', 'superseded'
       )
-      AND COALESCE(
-        agent.last_liveness_at,
-        agent.last_full_heartbeat_at,
-        agent.last_heartbeat_at,
-        '-infinity'::timestamptz
-      ) < now() - make_interval(mins => $1::integer)
-      AND COALESCE(
-        child.heartbeat_at,
-        child.updated_at,
-        child.started_at,
-        child.created_at
-      ) < now() - make_interval(mins => $1::integer)
+      AND (
+        (
+          COALESCE(
+            agent.last_liveness_at,
+            agent.last_full_heartbeat_at,
+            agent.last_heartbeat_at,
+            '-infinity'::timestamptz
+          ) < now() - make_interval(mins => $1::integer)
+          AND COALESCE(
+            child.heartbeat_at,
+            child.updated_at,
+            child.started_at,
+            child.created_at
+          ) < now() - make_interval(mins => $1::integer)
+        )
+        OR (
+          child.task_type = 'negative_post_patrol'
+          AND child.status = 'pending'
+          AND child.started_at IS NULL
+          AND child.created_at < now() - make_interval(mins => $5::integer)
+        )
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM capture_agent_commands command
@@ -16357,6 +16387,7 @@ export async function reconcileElasticCaptureLeases(input = 50) {
     normalizedLimit,
     tenantId || null,
     parentTaskIds,
+    NEGATIVE_PATROL_START_TIMEOUT_MIN,
   ]);
 
   const scannedItemKeys = new Set([
@@ -16402,18 +16433,28 @@ export async function reconcileElasticCaptureLeases(input = 50) {
           AND child.status IN (
             'pending', 'claimed', 'running', 'recovering', 'waiting_device'
           )
-          AND COALESCE(
-            agent.last_liveness_at,
-            agent.last_full_heartbeat_at,
-            agent.last_heartbeat_at,
-            '-infinity'::timestamptz
-          ) < now() - make_interval(mins => $4::integer)
-          AND COALESCE(
-            child.heartbeat_at,
-            child.updated_at,
-            child.started_at,
-            child.created_at
-          ) < now() - make_interval(mins => $4::integer)
+          AND (
+            (
+              COALESCE(
+                agent.last_liveness_at,
+                agent.last_full_heartbeat_at,
+                agent.last_heartbeat_at,
+                '-infinity'::timestamptz
+              ) < now() - make_interval(mins => $4::integer)
+              AND COALESCE(
+                child.heartbeat_at,
+                child.updated_at,
+                child.started_at,
+                child.created_at
+              ) < now() - make_interval(mins => $4::integer)
+            )
+            OR (
+              child.task_type = 'negative_post_patrol'
+              AND child.status = 'pending'
+              AND child.started_at IS NULL
+              AND child.created_at < now() - make_interval(mins => $5::integer)
+            )
+          )
           AND NOT EXISTS (
             SELECT 1
             FROM capture_agent_commands command
@@ -16427,6 +16468,7 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         candidate.tenant_id,
         candidate.parent_task_id,
         ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
+        NEGATIVE_PATROL_START_TIMEOUT_MIN,
       ]);
       if (!child) return false;
       const agentView = {
@@ -16441,12 +16483,20 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN * 60 * 1000,
       );
       const agentOffline = !agentConnected;
+      const unstartedPatrol =
+        child.task_type === 'negative_post_patrol' &&
+        child.status === 'pending' &&
+        !child.started_at;
       const timeoutCode = agentOffline
         ? 'elastic_agent_offline_timeout'
-        : 'elastic_task_heartbeat_timeout';
+        : unstartedPatrol
+          ? 'negative_patrol_start_timeout'
+          : 'elastic_task_heartbeat_timeout';
       const timeoutMessage = agentOffline
         ? '执行节点持续离线，工作项已退回弹性队列'
-        : '执行节点在线但当前任务心跳中断，工作项已退回弹性队列';
+        : unstartedPatrol
+          ? '负面帖子巡查下发后长时间未开始，工作项已退回弹性队列，由其它节点接力'
+          : '执行节点在线但当前任务心跳中断，工作项已退回弹性队列';
       const sourceItem = await tx.queryOne(`
         SELECT id, item_type, assigned_agent_id, assignment_revision, keyword
         FROM capture_task_items
@@ -16580,6 +16630,9 @@ export async function reconcileElasticCaptureLeases(input = 50) {
         payload: {
           parentTaskId: candidate.parent_task_id,
           offlineTimeoutMinutes: ELASTIC_QUEUE_OFFLINE_TIMEOUT_MIN,
+          ...(unstartedPatrol && !agentOffline
+            ? {startTimeoutMinutes: NEGATIVE_PATROL_START_TIMEOUT_MIN}
+            : {}),
           timeoutCode,
           serverLeaseRevoked: agentOffline,
           sourceLocalClosureProven: localClosureProof.proven === true,

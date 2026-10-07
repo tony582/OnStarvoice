@@ -3419,9 +3419,18 @@ test("elastic queue reclaims stale work without turning closure telemetry into a
   assert.match(lease, /sourceLocalClosureProven: localClosureProof\.proven === true/u);
   assert.match(
     captureCloudRouteSource,
-    /capture_tasks\.error->>'code'[\s\S]*ELASTIC_AGENT_OFFLINE_TIMEOUT[\s\S]*ELASTIC_TASK_HEARTBEAT_TIMEOUT/u,
+    /capture_tasks\.error->>'code'[\s\S]*ELASTIC_AGENT_OFFLINE_TIMEOUT[\s\S]*ELASTIC_TASK_HEARTBEAT_TIMEOUT[\s\S]*NEGATIVE_PATROL_START_TIMEOUT/u,
     'late snapshots from a server-revoked stale runner must remain fenced',
   );
+  // docs/hotfix/20261007-negative-patrol-reconcile-livelock.md: a patrol
+  // acknowledged as queued but never started is released while its node is
+  // still online.
+  assert.match(lease, /NEGATIVE_PATROL_START_TIMEOUT_MIN/u);
+  assert.match(
+    lease,
+    /child\.task_type = 'negative_post_patrol'[\s\S]*child\.status = 'pending'[\s\S]*child\.started_at IS NULL[\s\S]*child\.created_at < now\(\)/u,
+  );
+  assert.match(lease, /'negative_patrol_start_timeout'/u);
   assert.match(
     lease,
     /COALESCE\([\s\S]*agent\.last_liveness_at[\s\S]*'-infinity'::timestamptz[\s\S]*< now\(\)[\s\S]*AND COALESCE\([\s\S]*child\.heartbeat_at[\s\S]*child\.updated_at/u,
