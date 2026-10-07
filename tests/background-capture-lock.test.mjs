@@ -5269,6 +5269,84 @@ test("a sync already in flight when the runner asks does not count as its reconc
   assert.equal(harness.cloudHeartbeats[1].reason, "targeted_post_sidebar_reconcile");
 });
 
+async function holdFirstSyncWithStorageLatency(harness) {
+  // Real chrome.storage reads are IPC calls; without latency a woken caller
+  // could not race another one through the credential read.
+  harness.setStorageGetHandler(async (_keys, result) => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return result;
+  });
+  let active = 0;
+  const concurrency = {max: 0};
+  let releaseFirst = () => {};
+  harness.setCloudHeartbeatHandler(async (_options, heartbeatNumber) => {
+    active += 1;
+    concurrency.max = Math.max(concurrency.max, active);
+    try {
+      await new Promise((resolve) => {
+        if (heartbeatNumber === 1) releaseFirst = resolve;
+        else setTimeout(resolve, 80);
+      });
+      return {ok: true, commands: [], terminalNotices: []};
+    } finally {
+      active -= 1;
+    }
+  });
+  const earlierSync = harness.api.syncCloudTaskAgent({reason: "alarm", force: true});
+  await waitFor(
+    () => harness.cloudHeartbeats.length === 1,
+    "the earlier sync did not reach its heartbeat",
+    {attempts: 200},
+  );
+  return {concurrency, earlierSync, release: () => releaseFirst()};
+}
+
+test("callers woken by the same settled sync still run one sync at a time", async () => {
+  // Review of the 2026-10-07 fix: woken waiters and the pending chain all saw
+  // no sync in flight during the credential read and started their own.
+  for (const scenario of ["pending chain", "two runner messages"]) {
+    const harness = createHarness();
+    const request = seedPendingNegativePatrolRunner(harness, `patrol-single-flight-${scenario.length}`);
+    const {concurrency, earlierSync, release} = await holdFirstSyncWithStorageLatency(harness);
+    const waiting = [reconcileNegativePatrolRunner(harness, request)];
+    if (scenario === "pending chain") {
+      const skipped = await harness.api.syncCloudTaskAgent({reason: "state_changed", force: true});
+      assert.equal(skipped.reason, "sync_in_flight", scenario);
+    } else {
+      waiting.push(reconcileNegativePatrolRunner(harness, request));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    const responses = await Promise.all(waiting);
+    await earlierSync;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    for (const response of responses) {
+      assert.equal(response.reconciled, true, `${scenario}: ${JSON.stringify(response)}`);
+    }
+    assert.equal(concurrency.max, 1, `${scenario}: heartbeats overlapped`);
+  }
+});
+
+test("a sync without an agent credential settles its waiters", async () => {
+  const harness = createHarness();
+  const request = buildTargetedPostRequest({
+    id: "patrol-no-credential",
+    clientTaskId: "patrol-no-credential",
+    attemptId: "patrol-no-credential-attempt",
+    status: "pending",
+  });
+  harness.storage[TARGETED_POST_REQUEST_KEY] = request;
+
+  const response = await reconcileNegativePatrolRunner(harness, request);
+
+  assert.equal(response.reconciled, false);
+  assert.equal(response.reason, "missing_agent_credential");
+  assert.equal(harness.cloudHeartbeats.length, 0);
+  const again = await harness.api.syncCloudTaskAgent({reason: "alarm", force: true});
+  assert.equal(again.reason, "missing_agent_credential", "the in-flight flag was released");
+});
+
 test("a runner reconciliation still fails while the cloud is backing off", async () => {
   const harness = createHarness();
   const request = seedPendingNegativePatrolRunner(harness, "patrol-backoff");

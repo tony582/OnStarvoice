@@ -7878,11 +7878,9 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
     return {ok: false, skipped: true, reason: 'throttled'};
   }
 
-  const credential = await readCloudTaskAgentCredential();
-  if (!credential.id || !credential.token) {
-    return {ok: false, skipped: true, reason: 'missing_agent_credential'};
-  }
-
+  // Claimed before the first await: callers woken together by a settled sync
+  // (syncCloudTaskAgentAfterRequest) must see this one in flight instead of
+  // each starting their own during the credential read.
   cloudTaskAgentSyncInFlight = true;
   const syncSeq = ++cloudTaskAgentSyncSeq;
   let settledResult = null;
@@ -7891,6 +7889,12 @@ async function syncCloudTaskAgent({reason = 'heartbeat', force = false} = {}) {
     resolveSettled = resolve;
   });
   try {
+    const credential = await readCloudTaskAgentCredential();
+    if (!credential.id || !credential.token) {
+      settledResult = {ok: false, skipped: true, reason: 'missing_agent_credential'};
+      return settledResult;
+    }
+
     const degradedHealth = [];
     const markDegraded = (code) => {
       const normalized = String(code || '').trim().toLowerCase();
