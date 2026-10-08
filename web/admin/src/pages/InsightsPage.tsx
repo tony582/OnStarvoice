@@ -5,12 +5,13 @@ import { DashboardTab } from '@/pages/insights/DashboardTab'
 import { NegativePatrolTab } from '@/pages/insights/NegativePatrolTab'
 import { ReportsTab } from '@/pages/insights/ReportsTab'
 import { CustomerDailyReport } from '@/pages/insights/CustomerDailyReport'
+import { CustomerMonthlyReport } from '@/pages/insights/CustomerMonthlyReport'
 
-type Tab = 'daily' | 'dashboard' | 'patrol' | 'reports'
+type Tab = 'daily' | 'monthly' | 'dashboard' | 'patrol' | 'reports'
 
 export function InsightsPage() {
   const { params } = useNav()
-  const initialTab: Tab = params?.tab === 'dashboard' ? 'dashboard' : params?.tab === 'reports' ? 'reports' : params?.tab === 'patrol' ? 'patrol' : 'daily'
+  const initialTab: Tab = params?.tab === 'dashboard' ? 'dashboard' : params?.tab === 'reports' ? 'reports' : params?.tab === 'patrol' ? 'patrol' : params?.tab === 'monthly' ? 'monthly' : 'daily'
   const [tab, setTab] = useState<Tab>(initialTab)
 
   return (
@@ -18,6 +19,7 @@ export function InsightsPage() {
       <WorkbenchTabs
         tabs={[
           { key: 'daily', label: '客户日报' },
+          { key: 'monthly', label: '客户月报' },
           { key: 'dashboard', label: '数据看板' },
           { key: 'patrol', label: '舆情巡查' },
           { key: 'reports', label: '报告中心' },
@@ -26,6 +28,7 @@ export function InsightsPage() {
         onChange={key => setTab(key as Tab)}
       />
       {tab === 'daily' && <CustomerDailyReport />}
+      {tab === 'monthly' && <CustomerMonthlyReport />}
       {tab === 'dashboard' && <DashboardTab onOpenPatrol={() => setTab('patrol')} />}
       {tab === 'patrol' && <NegativePatrolTab />}
       {tab === 'reports' && <ReportsTab />}

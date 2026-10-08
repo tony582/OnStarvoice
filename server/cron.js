@@ -7,6 +7,7 @@ import { queryAll, getSetting } from './db/init.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
 import {processCustomerDailyReports} from './services/customer-daily-reports.js';
+import {processCustomerMonthlyReports} from './services/customer-monthly-reports.js';
 import {processCustomerAssistant} from './services/customer-assistant-service.js';
 import { processCaptureAttentionNotifications } from './services/capture-attention-notifier.js';
 import { enqueueDueCaptureOrchestrations } from './services/capture-orchestration-scheduler.js';
@@ -36,6 +37,7 @@ const DEFAULT_JOBS = Object.freeze({
   labelPendingRecords,
   processCaptureAttentionNotifications,
   processCustomerDailyReports,
+  processCustomerMonthlyReports,
   processCustomerAssistant,
   queryAll,
   reconcileAutomaticCaptureRetries,
@@ -241,6 +243,17 @@ function schedulerDefinitions(jobs, logger) {
           await jobs.processCustomerDailyReports({limit:5});
         } catch {
           safeLog(logger, 'error', '[Cron] Customer daily report queue could not complete this cycle.');
+        }
+      },
+    },
+    {
+      name: 'customer-monthly-delivery',
+      expression: '* * * * *',
+      run: async () => {
+        try {
+          await jobs.processCustomerMonthlyReports({limit:5});
+        } catch {
+          safeLog(logger, 'error', '[Cron] Customer monthly report queue could not complete this cycle.');
         }
       },
     },

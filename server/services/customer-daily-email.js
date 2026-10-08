@@ -6,6 +6,10 @@ import {dailyError,normalizeDailyEmailRecipients} from './customer-daily-report-
 import {renderCustomerDailyReportHtml,renderCustomerDailyReportText,buildCustomerDailyReportWorkbook} from './customer-daily-report-data.js';
 
 const defaultDb = {queryAll,queryOne,execute,withTransaction};
+// The customer monthly report reuses this queue with its own tables and subject.
+export const DAILY_EMAIL_KIND = Object.freeze({table:'customer_daily_email_deliveries',reportTable:'customer_daily_reports',periodColumn:'report_date',
+  lock:'daily-email',messageIdPrefix:'daily-report',notFound:'日报不存在',notFoundCode:'daily_report_not_found',
+  periodText:value => String(value).slice(0,10),subject:({tenantName,period,version}) => `${tenantName}舆情日报 · ${period} · v${version}`});
 const iso = value => value ? new Date(value).toISOString() : null;
 
 export function publicDailyEmailDelivery(row) {
@@ -38,7 +42,7 @@ function safeEmailFailure(error,{sending = false} = {}) {
   return {ambiguous,message};
 }
 
-export function createCustomerDailyEmailService({db = defaultDb,send = sendTenantEmail,readiness = tenantEmailReadiness,buildMessage = buildDailyEmailMessage} = {}) {
+export function createCustomerDailyEmailService({db = defaultDb,send = sendTenantEmail,readiness = tenantEmailReadiness,buildMessage = buildDailyEmailMessage,kind = DAILY_EMAIL_KIND} = {}) {
   async function configuration(tenantId) {
     const row = await db.queryOne('SELECT config FROM customer_daily_report_settings WHERE tenant_id=$1',[tenantId]);
     const recipients = normalizeDailyEmailRecipients(row?.config?.emailRecipients || '');
@@ -48,25 +52,25 @@ export function createCustomerDailyEmailService({db = defaultDb,send = sendTenan
   }
 
   async function delivery(tenantId,reportId) {
-    return publicDailyEmailDelivery(await db.queryOne('SELECT id,status,recipients,sent_at,error_message,ambiguous FROM customer_daily_email_deliveries WHERE tenant_id=$1 AND report_id=$2',[tenantId,reportId]));
+    return publicDailyEmailDelivery(await db.queryOne(`SELECT id,status,recipients,sent_at,error_message,ambiguous FROM ${kind.table} WHERE tenant_id=$1 AND report_id=$2`,[tenantId,reportId]));
   }
 
   async function deliveries(tenantId,reportIds) {
     if (!reportIds.length) return new Map();
-    const rows = await db.queryAll('SELECT id,report_id,status,recipients,sent_at,error_message,ambiguous FROM customer_daily_email_deliveries WHERE tenant_id=$1 AND report_id=ANY($2::uuid[])',[tenantId,reportIds]);
+    const rows = await db.queryAll(`SELECT id,report_id,status,recipients,sent_at,error_message,ambiguous FROM ${kind.table} WHERE tenant_id=$1 AND report_id=ANY($2::uuid[])`,[tenantId,reportIds]);
     return new Map(rows.map(row => [row.report_id,publicDailyEmailDelivery(row)]));
   }
 
   async function enqueue(tenantId,reportId,{resendOf,actorId} = {}) {
     validateDailyResend(resendOf);
     await db.withTransaction(async tx => {
-      await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`daily-email:${tenantId}:${reportId}`]);
-      const report = await tx.queryOne('SELECT snapshot,report_date::text AS report_date,version FROM customer_daily_reports WHERE tenant_id=$1 AND id=$2',[tenantId,reportId]);
-      if (!report) throw dailyError('日报不存在',404,'daily_report_not_found');
-      const previous = await tx.queryOne('SELECT * FROM customer_daily_email_deliveries WHERE tenant_id=$1 AND report_id=$2 FOR UPDATE',[tenantId,reportId]);
+      await tx.queryOne('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`${kind.lock}:${tenantId}:${reportId}`]);
+      const report = await tx.queryOne(`SELECT snapshot,${kind.periodColumn}::text AS period,version FROM ${kind.reportTable} WHERE tenant_id=$1 AND id=$2`,[tenantId,reportId]);
+      if (!report) throw dailyError(kind.notFound,404,kind.notFoundCode);
+      const previous = await tx.queryOne(`SELECT * FROM ${kind.table} WHERE tenant_id=$1 AND report_id=$2 FOR UPDATE`,[tenantId,reportId]);
       if (previous?.status === 'sent' && resendOf) {
         if (!(await readiness(tenantId)).ready) throw dailyError('邮件服务尚未配置。',409,'daily_email_not_configured');
-        await requeueDailySuccess(tx,{table:'customer_daily_email_deliveries',tenantId,reportId,resendOf,actorId});
+        await requeueDailySuccess(tx,{table:kind.table,tenantId,reportId,resendOf,actorId});
         return;
       }
       if (previous && !(previous.status === 'failed' && !previous.ambiguous)) return;
@@ -74,22 +78,22 @@ export function createCustomerDailyEmailService({db = defaultDb,send = sendTenan
       if (previous) {
         // Retry the exact frozen recipient list and report version; config edits
         // never redirect a delivery that the user already requested.
-        await tx.execute("UPDATE customer_daily_email_deliveries SET status='queued',error_message=NULL,claim_token=NULL,claimed_at=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2",[tenantId,previous.id]);
+        await tx.execute(`UPDATE ${kind.table} SET status='queued',error_message=NULL,claim_token=NULL,claimed_at=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2`,[tenantId,previous.id]);
         return;
       }
       const stored = await tx.queryOne('SELECT config FROM customer_daily_report_settings WHERE tenant_id=$1',[tenantId]);
       const recipients = normalizeDailyEmailRecipients(stored?.config?.emailRecipients || '');
       if (!recipients) throw dailyError('日报收件人尚未配置，请联系管理员在设置中填写。',409,'daily_email_recipients_missing');
       const tenantName = String(report.snapshot.tenantName || '客户').replace(/[\r\n]/g,' ').slice(0,100);
-      const subject = `${tenantName}舆情日报 · ${report.report_date} · v${report.version}`;
-      await tx.execute(`INSERT INTO customer_daily_email_deliveries (id,tenant_id,report_id,recipients,subject,snapshot)
+      const subject = kind.subject({tenantName,period:kind.periodText(report.period),version:report.version});
+      await tx.execute(`INSERT INTO ${kind.table} (id,tenant_id,report_id,recipients,subject,snapshot)
         VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,[randomUUID(),tenantId,reportId,recipients,subject,JSON.stringify(report.snapshot)]);
     },{category:'reporting',statementTimeoutMs:15000,lockTimeoutMs:3000,jitOff:true});
     return delivery(tenantId,reportId);
   }
 
   async function recoverStale() {
-    await db.execute(`UPDATE customer_daily_email_deliveries SET status='failed',ambiguous=true,
+    await db.execute(`UPDATE ${kind.table} SET status='failed',ambiguous=true,
       error_message='上次邮件发送中断，发送结果待核实；已停止重试，避免重复发送。',claim_token=NULL,updated_at=now()
       WHERE status='working' AND claimed_at<now()-interval '10 minutes'`);
   }
@@ -97,9 +101,9 @@ export function createCustomerDailyEmailService({db = defaultDb,send = sendTenan
   async function processOne() {
     const token = randomUUID();
     const row = await db.withTransaction(async tx => {
-      const next = await tx.queryOne("SELECT * FROM customer_daily_email_deliveries WHERE status='queued' ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1");
+      const next = await tx.queryOne(`SELECT * FROM ${kind.table} WHERE status='queued' ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1`);
       if (!next) return null;
-      await tx.execute("UPDATE customer_daily_email_deliveries SET status='working',claim_token=$2,claimed_at=now(),attempts=attempts+1,error_message=NULL,updated_at=now() WHERE id=$1",[next.id,token]);
+      await tx.execute(`UPDATE ${kind.table} SET status='working',claim_token=$2,claimed_at=now(),attempts=attempts+1,error_message=NULL,updated_at=now() WHERE id=$1`,[next.id,token]);
       return next;
     },{category:'reporting',statementTimeoutMs:10000,lockTimeoutMs:1000,jitOff:true});
     if (!row) return false;
@@ -109,7 +113,7 @@ export function createCustomerDailyEmailService({db = defaultDb,send = sendTenan
       // The worker sends only the saved snapshot, destination and tenant context.
       sending = true;
       const result = await send({...message,tenantId:row.tenant_id,to:row.recipients,subject:row.subject,
-        messageId:`<daily-report-${row.id}@starvoice.local>`});
+        messageId:`<${kind.messageIdPrefix}-${row.id}@starvoice.local>`});
       const expected = row.recipients.split(',').map(value => value.trim().toLowerCase());
       const accepted = new Set((Array.isArray(result?.accepted) ? result.accepted : []).map(value => String(value?.address || value).toLowerCase()));
       if (!expected.every(address => accepted.has(address)) || result?.rejected?.length) {
@@ -118,10 +122,10 @@ export function createCustomerDailyEmailService({db = defaultDb,send = sendTenan
         const code = accepted.size ? 'DAILY_EMAIL_PARTIAL' : expected.every(address => rejected.has(address)) ? 'EENVELOPE' : 'DAILY_EMAIL_UNCONFIRMED';
         throw Object.assign(new Error('Mail acceptance incomplete'),{code});
       }
-      await db.execute("UPDATE customer_daily_email_deliveries SET status='sent',message_id=$4,sent_at=now(),error_message=NULL,ambiguous=false,claim_token=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND claim_token=$3 AND status='working'",[row.tenant_id,row.id,token,String(result.messageId || '')]);
+      await db.execute(`UPDATE ${kind.table} SET status='sent',message_id=$4,sent_at=now(),error_message=NULL,ambiguous=false,claim_token=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND claim_token=$3 AND status='working'`,[row.tenant_id,row.id,token,String(result.messageId || '')]);
     } catch (error) {
       const failure = safeEmailFailure(error,{sending});
-      await db.execute("UPDATE customer_daily_email_deliveries SET status='failed',ambiguous=$4,error_message=$5,claim_token=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND claim_token=$3 AND status='working'",[row.tenant_id,row.id,token,failure.ambiguous,failure.message]);
+      await db.execute(`UPDATE ${kind.table} SET status='failed',ambiguous=$4,error_message=$5,claim_token=NULL,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND claim_token=$3 AND status='working'`,[row.tenant_id,row.id,token,failure.ambiguous,failure.message]);
     }
     return true;
   }

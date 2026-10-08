@@ -238,7 +238,8 @@ test('v5 single table explains collection attribution, daily event counts and di
 test('the empty insights entry defaults to daily while explicit dashboard navigation remains available', () => {
   const insights = readFileSync(new URL('../web/admin/src/pages/InsightsPage.tsx', import.meta.url), 'utf8');
   assert.match(insights, /params\?\.tab === 'dashboard' \? 'dashboard'/u);
-  assert.match(insights, /params\?\.tab === 'patrol' \? 'patrol' : 'daily'/u);
+  assert.match(insights, /params\?\.tab === 'patrol' \? 'patrol' : params\?\.tab === 'monthly' \? 'monthly' : 'daily'/u);
+  assert.match(insights, /\{ key: 'monthly', label: '客户月报' \}/u);
   const navigation = readFileSync(new URL('../web/admin/src/lib/navigation.tsx', import.meta.url), 'utf8');
   assert.match(navigation, /opinion: 'insights'/u);
   assert.match(navigation, /analytics: \{ page: 'insights', params: \{ tab: 'dashboard' \} \}/u);

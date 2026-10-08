@@ -79,3 +79,15 @@ Settings 另有 `collectionBoundaryTime:'HH:mm'`，默认 `18:00`。`calendarPen
 用户确认使用原采集数字合并为一张九列表。新快照为 `schemaVersion=4`、`summary.format=daily_collection_v4`、`summary.mtdBasis=distinct_records`；保留 rows/day/mtd 完整数量结构，不再包含 collectionSummary。MTD 由原月内去重主帖集合产生，人工保存使用冻结 MTD 加本次逐日编辑差额；无变化保存不改变原 MTD。前端编辑预览与服务端一致，Excel 使用冻结数值。
 
 既有 v1/v2/v3 快照及交付保持旧语义。需要将已有 v3 日报改成单表时，基于冻结 collectionSummary 创建一个新的 v4 版本，旧处理汇总及人工编辑信息保留到 legacyHandling，不修改旧记录。转换不重新采集、分类或发送；id/version 由持有日报日期锁的事务分配。
+
+## v6：按内容分诊处理日期统计（2026-10-08 起）
+
+报表日 ≥ 2026-10-08 的新快照 `schemaVersion=6`，`summary.format=daily_collection_handling_v5`，`summary.monitoringBasis=triage_handling_date_v1`，`evidence.dateField=audit_logs.created_at`。九列全部来自内容分诊主列表范围内当天发生真实状态变更的主帖（同帖同日去重，MTD 按月去重，休息日处理按实际日期单独成行）；当日数量与分诊接口 `handledFrom=handledTo=报表日` 的条数一致。旧日期继续沿用 v5 采集口径。详见 `docs/hotfix/20261008-customer-daily-triage-scope.md`。
+
+## 客户月报 (`/api/customer-monthly-reports`)
+
+- `customer-monthly-report-data.js`：`customerMonthlyPeriod(month,now)` 给出北京时间月份区间（当前月为月初至 now）；`collectCustomerMonthlyReport({tenantId,month,now,db})` 返回快照 `{schemaVersion:1,kind:'customer_monthly_v1',reportMonth,periodStart,periodEnd,cutoffAt,assessedAt,complete,mode,summary:{basis,total,rows:[{date,counts}],byTopic,byPlatform},topNegative,records,warnings,evidence}`，`records` 为冻结明细。
+- `customer-monthly-report-render.js`：HTML（`{email:true}` 内联样式）、文本、`buildCustomerMonthlyReportWorkbook`（月报汇总/内容主题/平台分布/高热负面帖/数据说明）、`buildCustomerMonthlyDetailWorkbook`（明细）。
+- `customer-monthly-reports.js`：`list(tenantId,month?)`、`report(tenantId,id,{includeRecords})`（默认去掉 `records`，附 `recordCount`）、`generate(tenantId,{month,requestId})`（按租户+月份加锁，request_key 幂等，每次新版本）、`sendEmail`、`processDue`（cron 每分钟）。邮件收件人与 SMTP 沿用日报设置。
+- HTTP：`GET /settings`、`GET /?month=YYYY-MM`、`POST /generate {month,requestId?}`（writer）、`GET /:id` => `{report,html,text}`、`GET /:id/excel`、`GET /:id/detail.xlsx`、`POST /:id/email {resendOf?}`（writer，202）。
+- 表：`customer_monthly_reports`、`customer_monthly_email_deliveries`（迁移 092）。详见 `docs/hotfix/20261008-customer-monthly-report.md`。

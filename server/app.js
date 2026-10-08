@@ -20,6 +20,7 @@ import userRouter from './routes/user.js';
 import issuesRouter from './routes/issues.js';
 import reportsRouter from './routes/reports.js';
 import customerDailyReportsRouter from './routes/customer-daily-reports.js';
+import customerMonthlyReportsRouter from './routes/customer-monthly-reports.js';
 import {createCustomerAssistantRouter,createCustomerAssistantWebhookRouter} from './routes/customer-assistant.js';
 import recordsRouter from './routes/records.js';
 import commentsRouter from './routes/comments.js';
@@ -162,6 +163,7 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.use('/api/issues', issuesRouter);
   app.use('/api/reports', reportsRouter);
   app.use('/api/customer-daily-reports', customerDailyReportsRouter);
+  app.use('/api/customer-monthly-reports', customerMonthlyReportsRouter);
   app.use('/api/customer-assistant',createCustomerAssistantRouter());
   app.use('/api/records', recordsRouter);
   app.use('/api/comments', commentsRouter);
