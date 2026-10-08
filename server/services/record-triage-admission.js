@@ -21,6 +21,21 @@ function object(value) {
   try { return JSON.parse(value || '{}') || {}; } catch { return {}; }
 }
 
+// A customer may ask for specific posts to stay in Content Triage although the
+// brand-evidence rule would keep them out (for example posts already reported
+// in sent daily reports). The override admits the post without claiming
+// relevance; its triage status still decides SDB membership.
+export function manualRecordAdmission(record = {}) {
+  const raw = object(record.manual_overrides).triage_admission;
+  const value = typeof raw === 'object' && raw ? raw.value : raw;
+  return value === 'included' ? 'included' : '';
+}
+
+export function manualRecordAdmissionReason(record = {}) {
+  const raw = object(record.manual_overrides).triage_admission;
+  return typeof raw === 'object' && raw && typeof raw.reason === 'string' ? raw.reason.trim() : '';
+}
+
 export function manualRecordRelevance(record) {
   const raw = object(record.manual_overrides).relevance;
   const value = typeof raw === 'object' && raw ? raw.value : raw;
@@ -45,11 +60,17 @@ export function recordTriageAdmission(record = {}) {
   // Stored evidence is explanatory metadata, not an independent rejection.
   // Re-evaluate current source text so older narrow matching cannot hide a post.
   const verified = findRecordMonitoringEvidence(ai, record).length > 0;
-  const admitted = !scoped || reviewRequested || manual === 'relevant' || (!manual && relevance === 'relevant' && verified);
+  const included = manualRecordAdmission(record) === 'included';
+  const admitted = !scoped || included || reviewRequested || manual === 'relevant' || (!manual && relevance === 'relevant' && verified);
   return {
     admitted, scoped, relevance,
-    monitoring_evidence_status: !scoped ? 'not_applicable' : reviewRequested ? 'needs_review' : manual === 'relevant' ? 'manual_confirmed' : admitted ? 'confirmed' : 'needs_review',
+    monitoring_evidence_status: !scoped ? 'not_applicable' : reviewRequested ? 'needs_review' : manual === 'relevant' ? 'manual_confirmed' : included ? 'customer_included' : admitted ? 'confirmed' : 'needs_review',
   };
+}
+
+export function manualRecordAdmissionSql(alias = 'r') {
+  const a = aliasName(alias);
+  return `(CASE WHEN jsonb_typeof(${a}.manual_overrides->'triage_admission') = 'object' THEN ${a}.manual_overrides->'triage_admission'->>'value' ELSE ${a}.manual_overrides->>'triage_admission' END) = 'included'`;
 }
 
 export function manualRecordRelevanceSql(alias = 'r') {
@@ -130,7 +151,7 @@ export function recordMainPostEvidenceSql(alias = 'r') {
 export function recordTriageAdmissionSql(alias = 'r') {
   const a = aliasName(alias);
   const reviewRequested = `COALESCE(${a}.manual_overrides->'triage_review'->>'value' = 'requested',false) AND ${recordEffectiveRelevanceSql(a)} = 'uncertain'`;
-  return `(NOT ${recordSentryScopeSql(a)} OR (${reviewRequested}) OR CASE WHEN ${manualRecordRelevanceSql(a)} IS NOT NULL THEN ${manualRecordRelevanceSql(a)} = 'relevant' ELSE COALESCE(${a}.ai_result->>'relevance' = 'relevant',false) AND ${recordMainPostEvidenceSql(a)} END)`;
+  return `(COALESCE(${manualRecordAdmissionSql(a)},false) OR NOT ${recordSentryScopeSql(a)} OR (${reviewRequested}) OR CASE WHEN ${manualRecordRelevanceSql(a)} IS NOT NULL THEN ${manualRecordRelevanceSql(a)} = 'relevant' ELSE COALESCE(${a}.ai_result->>'relevance' = 'relevant',false) AND ${recordMainPostEvidenceSql(a)} END)`;
 }
 
 export function recordAdmissionSelectSql(alias = 'r', { admitted = null } = {}) {
@@ -144,17 +165,23 @@ export function withRecordAdmissionFields(record = {}) {
   const { admission_scoped, admission_allowed, ...publicRecord } = record;
   const manual = manualRecordRelevance(record);
   const reviewRequested = requestedTriageReview(record, manual || object(record.ai_result).relevance || 'uncertain');
+  const included = manualRecordAdmission(record) === 'included';
   const computed = admission_scoped === undefined ? recordTriageAdmission(record) : {
     scoped: admission_scoped,
     admitted: admission_allowed,
-    monitoring_evidence_status: !admission_scoped ? 'not_applicable' : reviewRequested ? 'needs_review' : manual === 'relevant' ? 'manual_confirmed' : admission_allowed ? 'confirmed' : 'needs_review',
+    monitoring_evidence_status: !admission_scoped ? 'not_applicable' : reviewRequested ? 'needs_review' : manual === 'relevant' ? 'manual_confirmed' : included ? 'customer_included' : admission_allowed ? 'confirmed' : 'needs_review',
   };
   if (computed.scoped && computed.admitted && !reviewRequested) {
     const ai = object(record.ai_result);
     const metadata = normalizeMonitoringEvidence({ ...ai, relevance: manual || ai.relevance }, record);
     // The paged list omits transcript text. A source already admitted by SQL
     // may rely on current media; describe that without reusing an unchecked quote.
-    publicRecord.ai_result = { ...ai, monitoringEvidence: metadata.evidence.length ? metadata : {
+    publicRecord.ai_result = { ...ai, monitoringEvidence: metadata.evidence.length ? metadata : computed.monitoring_evidence_status === 'customer_included' ? {
+      version: MONITORING_EVIDENCE_VERSION,
+      status: 'customer_included',
+      evidence: [],
+      reason: manualRecordAdmissionReason(record) || '客户确认纳入内容分诊，不代表品牌证据成立',
+    } : {
       version: MONITORING_EVIDENCE_VERSION,
       status: 'confirmed',
       evidence: [],
