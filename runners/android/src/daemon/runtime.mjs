@@ -8,6 +8,7 @@ import {ExecutionPermit} from '../core/execution-permit.mjs';
 import {runDiscoveryTask} from '../core/discovery-runner.mjs';
 import {createCardPrefilter} from '../core/card-prefilter.mjs';
 import {readDeviceClosure} from '../core/device-closure.mjs';
+import {recordDiagnostic} from '../core/diagnostics.mjs';
 import {acquireDeviceLock, inspectDeviceLock} from '../core/device-lock.mjs';
 import {createCloudClient} from '../cloud/client.mjs';
 import {createControlClient} from '../cloud/control-client.mjs';
@@ -162,7 +163,21 @@ export class AndroidDaemon {
     this.ready = state.readyForSearch === true;
     this.deviceReason = state.reason ?? null;
     this.deviceProbe = {readyForSearch: this.ready, reason: this.deviceReason, checkedAt: new Date().toISOString(),
-      ...(state.foreground ? {foreground: state.foreground} : {}), ...(state.focus !== undefined ? {focus: state.focus} : {})};
+      ...(state.foreground ? {foreground: state.foreground} : {}), ...(state.focus !== undefined ? {focus: state.focus} : {}),
+      ...(state.memory ? {memory: state.memory} : {})};
+    if (state.memory?.restarted === true) this.noteMemoryRestart(state.memory);
+  }
+  /** The probe restarted Douyin for memory (0.3.1): one local diagnostic note and one line in the one-click window. */
+  noteMemoryRestart(memory) {
+    const at = Date.now();
+    const reading = memory.reading ?? {};
+    this.lastMemoryRestart = {at, reasons: memory.reasons ?? [], memAvailableKb: reading.memAvailableKb ?? null,
+      swapFreeKb: reading.swapFreeKb ?? null, swapTotalKb: reading.swapTotalKb ?? null, memTotalKb: reading.memTotalKb ?? null};
+    try {
+      recordDiagnostic(this.store, {event: 'douyin_restart', reason: 'memory_pressure', at: new Date(at).toISOString(),
+        reasons: this.lastMemoryRestart.reasons, memAvailableKb: this.lastMemoryRestart.memAvailableKb,
+        swapFreeKb: this.lastMemoryRestart.swapFreeKb, swapTotalKb: this.lastMemoryRestart.swapTotalKb, memTotalKb: this.lastMemoryRestart.memTotalKb});
+    } catch { /* A diagnostic never blocks readiness. */ }
   }
   /** A bounded, PII-free probe summary for the poll body: only the foreground identity and when it was read. */
   pollProbe() {

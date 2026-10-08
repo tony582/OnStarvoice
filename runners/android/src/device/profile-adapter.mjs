@@ -68,6 +68,8 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
      * Pre-claim readiness from the current phone state: connected, calibrated profile, Appium ready,
      * screen awake, not locked and Douyin focused (relaunched through the reviewed component when needed).
      * Login and the search entry are verified by inspect before any search; a probe never touches the UI.
+     * 0.3.1: when the phone is out of memory the probe restarts Douyin first (foreground.relieveMemory); that
+     * counts as a launch, so the next task proves login again.
      */
     async probe({signal} = {}) {
       const options = {signal};
@@ -76,8 +78,11 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
         if (now() - staticCheckedAt >= STATIC_PROBE_MS) await checkProfile(options);
         const status = await client.status(options);
         if (status?.ready !== true) throw new DeviceError('appium_not_ready','The Appium server does not report ready');
+        const memory = typeof foreground.relieveMemory === 'function' ? await foreground.relieveMemory({signal}) : null;
         const state = await foreground.ensure({signal});
-        return {readyForSearch:true,reason:null,foreground:{package:state.package,activity:state.activity,launched:state.launched}};
+        return {readyForSearch:true,reason:null,
+          foreground:{package:state.package,activity:state.activity,launched:state.launched || memory?.restarted === true},
+          ...(memory ? {memory} : {})};
       } catch(error) {
         staticCheckedAt = -Infinity;
         return {readyForSearch:false,reason:error.code ?? 'device_unavailable',...(error.focus !== undefined ? {focus:error.focus} : {})};

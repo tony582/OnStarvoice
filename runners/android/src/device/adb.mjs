@@ -1,5 +1,6 @@
 import { DeviceError, bounded } from './bounded.mjs';
 import { runDeviceCommand } from './command.mjs';
+import { parseMemInfo } from './douyin-memory.mjs';
 
 export function validateSerial(serial) {
   if (typeof serial !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(serial)) {
@@ -103,10 +104,18 @@ export function createAdbClient({ adbPath = 'adb', command = runDeviceCommand, t
     const value = (await dump(serial, 'settings get global stay_on_while_plugged_in', options)).trim();
     return /^\d+$/u.test(value) ? Number(value) : null;
   };
+  // Memory pressure (0.3.1): the kB fields of /proc/meminfo, read-only.
+  const memInfo = async (serial, options = {}) => parseMemInfo(await dump(serial, 'cat /proc/meminfo', options));
+  // The only force-stop of Douyin: memory relief between keywords (douyin-foreground.mjs relieveMemory). It keeps
+  // the app's data and login, never clears, resets or reinstalls anything, and is never used while a session is open.
+  const stopDouyin = (serial, options = {}) => {
+    validateSerial(serial);
+    return call(['-s', serial, 'shell', 'am', 'force-stop', 'com.ss.android.ugc.aweme'], options);
+  };
   // Automation-related log lines only (helper crash, low-memory kill), for a local diagnostic after a lost session.
   const automationLog = async (serial, options = {}) => (await dump(serial,
     'logcat -d -t 4000 | grep -E "uiautomator2|UiAutomation|lowmemorykiller|am_kill|FATAL EXCEPTION|Process io\\.appium" | tail -n 30 || true',
     options)).split(/\r?\n/u).map(line => line.trim().slice(0, 240)).filter(Boolean).slice(-30);
   return {listDevices, startServer, inspect, inspectApp, helperPids, stopHelper, windowFocus, resumedActivity, keyguardState,
-    powerState, launchActivity, swipeUp, stayOnWhilePluggedIn, automationLog};
+    powerState, launchActivity, swipeUp, stayOnWhilePluggedIn, automationLog, memInfo, stopDouyin};
 }

@@ -36,6 +36,7 @@ export function diagnoseRunner(store, {hours = 24, now = Date.now()} = {}) {
   return {checkedAt: beijing(now), hours, status: daemonStatus(store),
     summary: {runs: runs.length, finished: runs.filter(run => DONE.has(run.status)).length,
       endedEarly: runs.filter(run => !DONE.has(run.status)).length, links: runs.reduce((sum, run) => sum + run.links, 0),
-      skippedCards: runs.reduce((sum, run) => sum + run.skipped, 0), aiSkipped: runs.reduce((sum, run) => sum + (run.aiSkipped ?? 0), 0), byReason},
+      skippedCards: runs.reduce((sum, run) => sum + run.skipped, 0), aiSkipped: runs.reduce((sum, run) => sum + (run.aiSkipped ?? 0), 0),
+      douyinRestarts: notes.filter(entry => entry.event === 'douyin_restart').length, byReason},
     quarantinedByReason: store.quarantineReasons?.() ?? {}, quarantined: store.listQuarantined?.(20) ?? [], runs, problems, prefilter};
 }

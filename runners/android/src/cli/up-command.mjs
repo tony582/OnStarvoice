@@ -10,6 +10,7 @@ import {resolveAppiumLaunch} from '../daemon/appium-launch.mjs';
 import {ensureAppium, stopAppium, wait} from '../daemon/appium-process.mjs';
 import {createAdbClient} from '../device/adb.mjs';
 import {DOUYIN_P0_PROFILE} from '../device/douyin-profile.mjs';
+import {describeMemory} from '../device/douyin-memory.mjs';
 
 // Plain-language readiness reasons, matching the admin node rail wording.
 const REASON_TEXT = Object.freeze({
@@ -55,6 +56,12 @@ export function describeOutcome(outcome) {
   return parts.join(' · ');
 }
 
+/** One line when the Runner restarted Douyin because the phone was out of memory (0.3.1). */
+export function describeMemoryRestart(restart) {
+  if (!restart) return null;
+  return `【已重启抖音】手机内存不足（${describeMemory(restart)}）· 已强停并重新拉起抖音，下一个关键词会先确认登录`;
+}
+
 /** One line when uploads are held, or when the server refuses discoveries and the rest carry on. */
 export function describeDelivery(delivery) {
   const cause = delivery?.code ? `（${delivery.code}）` : '';
@@ -72,6 +79,7 @@ export function describeDelivery(delivery) {
 
 async function watchReadiness(daemon, {stdout, sleep, signal, watchMs}) {
   let last, lastOutcomeAt = daemon.lastOutcome?.at ?? null, lastHint = null, lastDeliveryAt = null, lastNote = null, lastNoteAt = 0;
+  let lastRestartAt = daemon.lastMemoryRestart?.at ?? null;
   while (!signal.aborted) {
     const line = describeReadiness(daemon);
     if (line !== last) { stdout(line); last = line; }
@@ -80,6 +88,10 @@ async function watchReadiness(daemon, {stdout, sleep, signal, watchMs}) {
     if (daemon.lastOutcome && daemon.lastOutcome.at !== lastOutcomeAt) {
       lastOutcomeAt = daemon.lastOutcome.at;
       stdout(describeOutcome(daemon.lastOutcome));
+    }
+    if (daemon.lastMemoryRestart && daemon.lastMemoryRestart.at !== lastRestartAt) {
+      lastRestartAt = daemon.lastMemoryRestart.at;
+      stdout(describeMemoryRestart(daemon.lastMemoryRestart));
     }
     if (daemon.lastDelivery && daemon.lastDelivery.at !== lastDeliveryAt) {
       lastDeliveryAt = daemon.lastDelivery.at;
