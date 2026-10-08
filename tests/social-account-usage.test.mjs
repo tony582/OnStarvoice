@@ -461,7 +461,7 @@ test("unbound Agent usage is persisted and acknowledged without an account", asy
       eventId: "usage-unassigned",
       platform: "douyin",
       searches: 1,
-      occurredAt: "2026-07-27T03:01:00.000Z",
+      occurredAt: new Date(Date.now() - 60_000).toISOString(),
       accountIdentity: {
         platformAccountId: "account-unconfirmed",
         confidence: "low",
