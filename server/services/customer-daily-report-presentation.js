@@ -1,3 +1,5 @@
+import {isTriageHandlingSnapshot} from './customer-daily-triage-scope.js';
+
 const PLATFORMS = {xiaohongshu: '小红书', xhs: '小红书', douyin: '抖音', weibo: '微博', bilibili: '哔哩哔哩', wechat: '微信', zhihu: '知乎', kuaishou: '快手', toutiao: '今日头条', unknown: '未知平台'};
 
 export const CUSTOMER_DAILY_SECTIONS = Object.freeze({
@@ -15,7 +17,9 @@ export const isGroupedDailyReport = snapshot => isHandlingDailyReport(snapshot) 
 export const isMonthlyDailyReport = snapshot => ['daily_disposition_v2', 'daily_handling_v3', 'daily_collection_v4', 'daily_collection_handling_v5'].includes(snapshot?.summary?.format) && Array.isArray(snapshot.summary.rows);
 export const CUSTOMER_DAILY_HANDLING_HEADERS = Object.freeze(['舆情处理日期', '处理量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-走负面处理流程', '负面-其他']);
 export const CUSTOMER_DAILY_COLLECTION_HEADERS = Object.freeze(['舆情处理日期', '平台监控量', 'SDB范畴', '正面', '中性', '负面-冷处理', '负面-评论区留言', '负面-走负面处理流程', '负面-其他']);
-export const customerDailySummaryBasis = snapshot => isCollectionHandlingDailyReport(snapshot)
+export const customerDailySummaryBasis = snapshot => isTriageHandlingSnapshot(snapshot)
+  ? '按实际处理日期统计内容分诊未归档主帖，含历史帖；同帖同日去重，MTD 按本月帖子去重。'
+  : isCollectionHandlingDailyReport(snapshot)
   ? snapshot.summary.negativeDailyBasis === 'effective_handled_posts'
     ? '采集列沿用采集口径；四项负面按更正后的有效帖子按处理日期去重（含旧帖）；MTD 按帖去重。'
     : '采集列按采集日期统计；四项负面按实际处理日期计次数（含旧帖）；MTD 按帖去重。'

@@ -18,7 +18,8 @@ const stored = new Map();
 const reportFor = date => {
   if (stored.has(date)) return stored.get(date);
   const v1 = date === '2026-09-09';
-  const v3 = !v1 && date !== '2026-09-08';
+  const v6 = date >= '2026-10-08';
+  const v3 = !v6 && !v1 && date !== '2026-09-08';
   const zero = Object.fromEntries(Object.entries(baseCounts).map(([key, value]) => [key, value === null ? null : 0]));
   const rows = workCalendarMonth(date.slice(0, 7)).days.filter(day => day.date <= date).map(day => ({date: day.date, isWorkingDay: day.isWorkingDay, counts: {...(day.isWorkingDay ? baseCounts : zero)}}));
   const collectionRows = structuredClone(rows);
@@ -32,6 +33,13 @@ const reportFor = date => {
     delivery: {status: date === '2026-09-08' ? 'needs_attention' : 'none', canRetry: false, ...(date === '2026-09-08' ? {error: '飞书结果未知'} : {})},
     emailDelivery: {status: date === '2026-09-08' ? 'failed' : 'none', ...(date === '2026-09-08' ? {ambiguous: true, canRetry: false, error: '邮件结果未知'} : {})}};
   stored.set(date, report);
+  if (v6) {
+    rows.find(row => row.date === '2026-10-07').counts = {...zero, monitor: 7, sdb: 6, positive: 1, neutral: 3, comment: 2};
+    report.snapshot.schemaVersion = 6;
+    report.snapshot.summary = {format: 'daily_collection_handling_v5', monitoringBasis: 'triage_handling_date_v1',
+      negativeDailyBasis: 'effective_handled_posts', mtdBasis: 'distinct_records', dayDate: date, rows,
+      day: {...baseCounts}, mtd: {...baseCounts, monitor: 32, sdb: 26, neutral: 16}};
+  }
   report.snapshot.highHeat.push({recordId: 'heat-partial', title: '互动超过门槛但分享数未知', platform: 'xiaohongshu',
     url: 'https://example.com/partial', heat: 215, heatIsLowerBound: true, missingMetrics: ['shares'],
     heatText: '至少 215（分享数未取得）', comparisonText: '暂无可比数据', status: 'negative_feishu', feishuTableNo: '26091801'});
@@ -82,15 +90,15 @@ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const base = `http://127.0.0.1:${server.address().port}/admin/`;
 const browser = await chromium.launch({headless: true, ...(process.env.CHROMIUM_EXECUTABLE ? {executablePath: process.env.CHROMIUM_EXECUTABLE} : {})});
 const errors = [];
-async function open({width = 1440, mobile = false, date = '', query = ''} = {}) {
+async function open({width = 1440, mobile = false, date = '', query = '', now = '2026-09-10T02:00:00Z'} = {}) {
   const context = await browser.newContext({viewport: {width, height: 1100}, timezoneId: 'Asia/Shanghai'});
   const page = await context.newPage();
-  await page.addInitScript(({mobile}) => {
+  await page.addInitScript(({mobile, now}) => {
     const OriginalDate = Date;
-    class FixedDate extends OriginalDate { constructor(...args) { if (args.length) super(...args); else super('2026-09-10T02:00:00Z'); } static now() { return new OriginalDate('2026-09-10T02:00:00Z').getTime(); } }
+    class FixedDate extends OriginalDate { constructor(...args) { if (args.length) super(...args); else super(now); } static now() { return new OriginalDate(now).getTime(); } }
     window.Date = FixedDate;
     localStorage.setItem('osv_ui_mode', mobile ? 'mobile' : 'desktop');
-  }, {mobile});
+  }, {mobile, now});
   page.on('pageerror', error => errors.push(error.message));
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
   await page.goto(`${base}${query || (date ? `?page=insights&tab=daily&date=${date}` : '')}`);
@@ -199,6 +207,32 @@ try {
   await narrow.page.screenshot({path: join(output, 'mobile-details.png'), fullPage: true});
   assert.equal(await narrow.page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
   await narrow.context.close();
+  const october = await open({date: '2026-10-08', now: '2026-10-08T08:00:00Z'});
+  const triageTable = october.page.getByRole('table', {name: '逐日分诊处理汇总及月累计'});
+  await triageTable.waitFor();
+  assert.equal(await triageTable.getByRole('cell', {name: 'MTD 平台监控量', exact: true}).innerText(), '32');
+  assert.equal(await triageTable.getByRole('rowheader', {name: '2026/10/7', exact: true}).count(), 1, 'holiday handling keeps its own date in the next working-day report');
+  assert.equal(await october.page.getByRole('table', {name: '逐日实际采集量与月累计'}).count(), 0);
+  assert.match(await october.page.locator('body').innerText(), /按实际处理日期统计内容分诊/);
+  assert.doesNotMatch(await october.page.locator('body').innerText(), /采集列沿用首次入库/);
+  await october.page.screenshot({path: join(output, 'october-triage-desktop.png'), fullPage: true});
+  await october.page.getByRole('button', {name: '编辑汇总', exact: true}).click();
+  await october.page.getByRole('textbox', {name: '2026-10-08 平台监控量', exact: true}).fill('31');
+  await october.page.getByRole('button', {name: '保存汇总', exact: true}).click();
+  await october.page.getByRole('button', {name: '编辑汇总', exact: true}).waitFor();
+  assert.equal(await triageTable.getByRole('cell', {name: 'MTD 平台监控量', exact: true}).innerText(), '33');
+  assert.equal(reportFor('2026-10-08').snapshot.summary.monitoringBasis, 'triage_handling_date_v1');
+  await october.page.getByRole('button', {name: /查看数据说明/}).click();
+  const explanation = await october.page.getByRole('dialog').innerText();
+  assert.match(explanation, /与帖子发布时间和入库时间无关/);
+  assert.match(explanation, /休息日处理记录带入下一份工作日日报/);
+  assert.doesNotMatch(explanation, /首次成功入库|前夜采集/);
+  await october.context.close();
+  const octoberMobile = await open({width: 390, mobile: true, date: '2026-10-08', now: '2026-10-08T08:00:00Z'});
+  await octoberMobile.page.getByRole('table', {name: '逐日分诊处理汇总及月累计'}).waitFor();
+  assert.equal(await octoberMobile.page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+  await octoberMobile.page.screenshot({path: join(output, 'october-triage-mobile.png'), fullPage: true});
+  await octoberMobile.context.close();
   assert.deepEqual(errors, []);
-  console.log('PASS: desktop/mobile, V3 handling and distinct collection MTD, holiday handling editing, high-heat statuses, V1/V2 compatibility, calendar, correction/email payloads, uncertain-send protection; no console/page errors.');
+  console.log('PASS: desktop/mobile, October triage handling and distinct MTD, legacy V1/V2/V3 compatibility, holiday handling, editing, calendar and delivery protections; no console/page errors.');
 } catch (error) { console.error(error); throw error; } finally { await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }

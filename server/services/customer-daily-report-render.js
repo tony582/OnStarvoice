@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import {isTriageHandlingSnapshot} from './customer-daily-triage-scope.js';
 import { customerDailyHandlingSections, customerDailyHandlingReplyLine, customerDailyHandlingSupplementalNoteLines } from './customer-daily-report-presentation.js';
 import {
   customerDailySummaryHeaders, isMonthlyDailyReport,
@@ -24,6 +25,12 @@ export function customerDailyReportTitle(snapshot) {
   return `${snapshot.tenantName ? `${oneLine(snapshot.tenantName)} · ` : ''}舆情日报 ${snapshot.reportDate}${time}`;
 }
 export function customerDailyReportNotes(snapshot) {
+  if (isTriageHandlingSnapshot(snapshot)) return [
+    customerDailySummaryBasis(snapshot),
+    '平台监控量、SDB、正面、中性和负面处理均来自内容分诊中发生真实处理状态变更的主帖；按北京时间当天归属，与发布时间、采集时间无关。',
+    'SDB扣除已复核-非监控内容；分类和负面处理按本版生成时有效结论统计。重复保存同一状态、补充备注和复采不增加处理数量。',
+    '休息日处理记录仍带入下一份工作日日报，逐日汇总按实际处理日期列示。本期清单可含休息日处理；月累计按本月处理的主帖去重，不将每日数量相加。高热负面仍按近7天发布及互动门槛筛选。',
+  ];
   if (snapshot.summary?.negativeDailyBasis === 'effective_handled_posts') return [
     customerDailySummaryBasis(snapshot),
     '本期清单按本期真实处理日期收录，跨休息日包含多天；四项负面均按各处理日的有效帖子去重统计。更正情感或移出对应状态后不再计入。',

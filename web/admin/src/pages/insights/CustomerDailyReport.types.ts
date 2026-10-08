@@ -39,6 +39,7 @@ export type DailyPost = {
 }
 
 export type DailySummary = {
+  monitoringBasis?: 'triage_handling_date_v1'
   format?: 'daily_disposition_v2' | 'daily_handling_v3' | 'daily_collection_v4' | 'daily_collection_handling_v5'
   mtdBasis?: 'daily_sum' | 'distinct_records'
   negativeDailyBasis?: 'status_transition_events' | 'effective_handled_posts'

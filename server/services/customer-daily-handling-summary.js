@@ -1,5 +1,6 @@
 import {isWorkingDate} from './china-work-calendar.js';
 import {isEffectiveDailyHandling} from './customer-daily-handling-lists.js';
+import {CUSTOMER_DAILY_HANDLING_BASIS} from './customer-daily-triage-scope.js';
 
 export const DAILY_HANDLING_SUMMARY_FORMAT = 'daily_handling_v3';
 export const DAILY_COLLECTION_HANDLING_SUMMARY_FORMAT = 'daily_collection_handling_v5';
@@ -99,6 +100,34 @@ export function buildCustomerDailyHandlingSummary(records, transitions, period, 
 }
 
 const emptyNegativeCounts = () => ({cold: 0, comment: 0, negativeProcess: 0, negativeOther: 0});
+
+/** From Oct 8 all summary columns use the posts actually handled on each date.
+ * Eligibility/classification follows the same current Content Triage population;
+ * immutable report versions preserve the conclusions at generation time. */
+export function buildCustomerDailyTriageHandlingSummary(records, transitions, period, count, options = {}) {
+  const byId = new Map(records.map(record => [String(record.id).toLowerCase(), record]));
+  const normalized = [...byId].map(([id, record]) => ({...record, id}));
+  const handled = buildCustomerDailyHandlingSummary(normalized, transitions, period,
+    rows => count(rows.map(row => byId.get(row.id))), options);
+  const negative = buildCustomerDailyNegativeHandlingSummary(normalized, transitions, period, options);
+  const negativesByDate = new Map(negative.summary.rows.map(row => [row.date, row.counts]));
+  const rows = handled.summary.rows.map(row => ({...row, counts: {...row.counts, ...negativesByDate.get(row.date)}}));
+  if (!rows.some(row => row.date === period.reportDate)) rows.push({date: period.reportDate,
+    isWorkingDay: isWorkingDate(period.reportDate), counts: count([])});
+  const monthRecords = handled.evidence.monthRecordIds.map(id => byId.get(id));
+  return {
+    summary: {format: DAILY_COLLECTION_HANDLING_SUMMARY_FORMAT, monitoringBasis: CUSTOMER_DAILY_HANDLING_BASIS,
+      mtdBasis: 'distinct_records', dayDate: period.reportDate, rows,
+      day: structuredClone(rows.find(row => row.date === period.reportDate).counts),
+      mtd: {...count(monthRecords), ...negative.summary.mtd},
+      negativeDailyBasis: negative.summary.dailyBasis, negativeMtdBasis: negative.summary.mtdBasis,
+      coverageFrom: handled.summary.coverageFrom, coverageComplete: handled.summary.coverageComplete,
+      handlingCoverageFrom: handled.summary.coverageFrom, handlingCoverageComplete: handled.summary.coverageComplete},
+    evidence: {...handled.evidence, monitoringBasis: CUSTOMER_DAILY_HANDLING_BASIS,
+      monthExcludedRecordIds: negative.evidence.monthExcludedRecordIds},
+  };
+}
+
 /** Each handling date counts an eligible post once in its final effective state.
  * Collection dates and collection MTD remain a separate cohort. */
 export function buildCustomerDailyNegativeHandlingSummary(records, transitions, period, {coverageFrom = null, malformedEventIds = []} = {}) {

@@ -60,6 +60,58 @@ function fakeDb(seed = {}) {
   };
 }
 
+test('Oct 8 counts active triage posts by actual handling date, including old posts, with distinct MTD', async () => {
+  const at = value => `2026-10-${value}+08:00`;
+  const old = {first_seen_at: '2026-07-11T03:00:00Z', published_ts: '2026-07-11T02:00:00Z'};
+  const posts = [
+    record(1, {...old, sentiment: 'positive', status: 'reviewed'}),
+    record(2, {first_seen_at: at('08T08:00:00'), status: 'unhandled'}),
+    record(3, {status: 'negative_cold'}),
+    record(4, {...old, sentiment: 'neutral', status: 'reviewed'}),
+    record(5, {status: 'negative_comment', archived_at: at('08T09:30:00')}),
+    record(6, {status: 'reviewed', admission_allowed: false}),
+    record(7, {status: 'reviewed_non_monitor'}),
+    record(8, {status: 'reviewed', business_visibility: 'filtered_out'}),
+    record(9, {status: 'reviewed', relevance: 'irrelevant'}),
+    record(10, {status: 'reviewed', relevance: 'irrelevant', watched: true, sentiment: 'positive'}),
+    record(11, {status: 'future_status'}),
+    record(12, {...old, status: 'negative_comment'}),
+    record(13, {status: 'negative_cold'}),
+    record(14, {status: 'reviewed', record_type: 'comment'}),
+    record(15, {status: 'reviewed'}),
+    record(16, {status: 'reviewed'}),
+  ];
+  const events = [1, 5, 6, 7, 8, 9, 10, 11, 14].map(n => event(n, 'unhandled', posts.find(row => row.id === ID(n)).status, {created_at: at('08T09:00:00')}));
+  events.push(
+    event(4, 'unhandled', 'reviewed', {created_at: at('07T10:00:00')}),
+    event(4, 'reviewed', 'replied', {id: ID(901), created_at: at('08T09:00:00')}),
+    event(4, 'replied', 'reviewed', {id: ID(902), created_at: at('08T10:00:00')}),
+    event(4, 'reviewed', 'reviewed', {id: ID(903), created_at: at('08T11:00:00')}),
+    event(12, 'unhandled', 'negative_comment', {created_at: at('01T10:00:00')}),
+    event(13, 'unhandled', 'negative_cold', {created_at: at('08T12:00:00')}),
+    event(15, 'reviewed', 'reviewed', {created_at: at('08T10:00:00')}),
+    event(16, 'unhandled', 'reviewed', {created_at: at('08T10:00:00'), tenant_id: ID(998)}),
+  );
+  const db = fakeDb({handlingPosts: posts, handlingEvents: events, coverage: '2026-08-01T00:00:00Z'});
+  const report = await collectCustomerDailyReport({tenantId, db,
+    businessPeriod: customerDailyBusinessPeriod('2026-10-08', at('08T12:00:00'))});
+  assert.equal(report.schemaVersion, 6);
+  assert.equal(report.summary.monitoringBasis, 'triage_handling_date_v1');
+  assert.deepEqual(report.evidence.dayRecordIds.sort(), [ID(1), ID(4), ID(7), ID(10)].sort());
+  assert.deepEqual([report.summary.day.monitor, report.summary.day.sdb, report.summary.day.positive, report.summary.day.neutral], [4, 3, 2, 1]);
+  assert.deepEqual([report.summary.mtd.monitor, report.summary.mtd.sdb, report.summary.mtd.comment], [5, 4, 1]);
+  assert.equal(report.summary.rows.reduce((sum, row) => sum + row.counts.monitor, 0), 6, 'daily handling can repeat a post across days, distinct MTD cannot');
+  assert.equal(report.summary.rows.find(row => row.date === '2026-10-07').counts.monitor, 1);
+  assert.deepEqual(report.commentMarked.map(row => row.recordId), [ID(12)], 'holiday handling still appears in the next working report detail');
+  assert.equal(report.summary.day.comment, 0, 'holiday handling is shown on its actual date, not added to Oct 8');
+  assert.equal(report.summary.rows.find(row => row.date === '2026-10-01').counts.comment, 1);
+  assert.equal(db.calls.some(call => /customer_daily:(month|pending_capture)\s/.test(call.sql)), false, 'new report cannot load or count the first-ingest cohort');
+  assert.match(db.calls.find(call => call.sql.includes('customer_daily:handling_posts')).sql, /rt\.archived_at IS NULL/);
+  assert.equal(report.evidence.dateField, 'audit_logs.created_at');
+  assert.doesNotMatch(renderCustomerDailyReportHtml(report), /采集列沿用首次入库/);
+  assert.match(renderCustomerDailyReportText(report), /按实际处理日期/);
+});
+
 test('Shanghai report date defaults to yesterday; realtime ends now and rolls across month/year', () => {
   assert.deepEqual(dailyPeriod(undefined, now), {
     reportDate: '2026-09-07', periodStart: '2026-09-06T16:00:00.000Z', cutoffAt: '2026-09-07T16:00:00.000Z',

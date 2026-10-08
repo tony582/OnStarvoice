@@ -123,11 +123,15 @@ test('month ownership carries the previous workday evening exactly once into the
   assertMtdEqualsRows(september);
 });
 
-test('October holiday rows remain blank and all holiday records belong to October 8 including September carry-in', async () => {
+test('frozen legacy October collection tables retain holiday merging and September carry-in', () => {
   const records = [record(1, '2026-09-30T17:59'), record(2, '2026-09-30T18:00'),
     ...Array.from({length: 7}, (_, index) => record(index + 3, `2026-10-0${index + 1}T12:00`)),
     record(10, '2026-10-08T17:59'), record(11, '2026-10-08T18:00')];
-  const snapshot = await collect('2026-10-08', records);
+  const period = {...customerDailyBusinessPeriod('2026-10-08', '2026-10-08T19:00:00+08:00'),
+    reportBasis: 'customer_workday_v1', monthStart: '2026-09-30T10:00:00.000Z'};
+  const included = records.filter(row => Date.parse(row.first_seen_at) >= Date.parse(period.monthStart)
+    && Date.parse(row.first_seen_at) < Date.parse(period.collectionCutoffAt));
+  const snapshot = {...period, schemaVersion: 2, summary: buildCustomerDailyCollectionSummary(included, period)};
   assert.equal(snapshot.summary.rows.length, 8);
   for (const row of snapshot.summary.rows.slice(0, 7)) {
     assert.equal(row.isWorkingDay, false);

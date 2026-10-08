@@ -24,6 +24,10 @@ export function isCollectionHandlingSummary(snapshot) {
   return snapshot.schemaVersion >= 5 && snapshot.summary.format === 'daily_collection_handling_v5' && Array.isArray(snapshot.summary.rows)
 }
 
+export function isTriageHandlingSummary(snapshot) {
+  return isCollectionHandlingSummary(snapshot) && snapshot.summary.monitoringBasis === 'triage_handling_date_v1'
+}
+
 export function visibleMonthlyRows(rows, includeHandledNonWorkingDays = false) {
   return rows.filter(row => row.isWorkingDay || (includeHandledNonWorkingDays && monthlyFields.some(field => Number(row.counts[field]) > 0)))
 }

@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { useNav } from '@/lib/navigation'
 import * as Dialog from '@radix-ui/react-dialog'
 import { CustomerDailyReportCalendar } from './CustomerDailyReportCalendar'
-import { dailyPostStatusLabel, isCollectionHandlingSummary, isCollectionSummary, isHandlingSummary, isMonthlySummary, monthlyDraftFromRows, monthlyFields, monthlyLabels, monthlySummaryTotals, parseMonthlyDraft, visibleMonthlyRows } from './CustomerDailyReport.summary.mjs'
+import { dailyPostStatusLabel, isCollectionHandlingSummary, isCollectionSummary, isHandlingSummary, isMonthlySummary, isTriageHandlingSummary, monthlyDraftFromRows, monthlyFields, monthlyLabels, monthlySummaryTotals, parseMonthlyDraft, visibleMonthlyRows } from './CustomerDailyReport.summary.mjs'
 import { DAILY_API, dailyError, dailyTime, safeReportUrl, shanghaiDate, type DailyCalendar, type DailyCounts, type DailyPost, type DailyReport, type DailySettings, type DailySnapshot } from './CustomerDailyReport.types'
 
 type ReportResponse = { report: DailyReport; html: string; text: string; messageHtml: string; messageText: string }
@@ -16,6 +16,7 @@ type SummaryField = typeof summaryFields[number] | typeof monthlyFields[number]
 type SummaryDraft = Record<string, Partial<Record<SummaryField, string>>>
 const summaryLabels: Record<SummaryField, string> = { ...monthlyLabels, monitor: '监控数量', sdb: 'SDB范畴', positive: '正向', neutral: '中性', cold: '冷处理', inProgress: '处理中', processed: '已处理' }
 const effectiveHandlingBasis = '采集列沿用首次入库采集集合；四项负面按各处理日更正后的有效帖子去重统计，改情感或移出对应状态后同步移除，重复保存和备注不新增数量。MTD 按本月帖子去重，不把每日数量相加。本期清单跨休息日可能包含多天，请按处理日期核对。'
+const triageHandlingBasis = '按实际处理日期统计内容分诊中未归档的帖子，包含当天处理的历史帖。帖子发布时间、采集时间不决定日报归属。同帖同日去重，重复保存同一状态或仅补备注不增加数量；MTD 按本月帖子去重。'
 const collectionHandlingBasis = '平台监控量、SDB、正面和中性按首次成功入库的采集内容统计，采集 MTD 按本月帖子去重；休息日采集合并到下一工作日。负面四列按北京时间当日实际处理次数统计，同帖多次不同状态变更可重复计，重复同状态及仅修改备注不计；休息日有处理时按实际日期列出。MTD 负面按每帖本月最后处理状态去重归类，已转出这四类状态的不计入，不按每日次数相加。修改日处理次数不会改变MTD去重数量。'
 const pendingStatuses = new Set(['queued', 'working', 'retry_wait'])
 const deliveryLabels: Record<string, string> = {
@@ -464,18 +465,18 @@ function CustomerDailyReportWorkspace() {
           <div className="mb-5 pr-7"><Dialog.Title className="text-base font-semibold text-slate-900">数据说明</Dialog.Title><Dialog.Description className="mt-2 text-xs text-slate-500">用于发送前核对，不加入客户日报正文。</Dialog.Description></div>
           <Dialog.Close aria-label="关闭数据说明" className="absolute right-4 top-4 rounded-lg p-2 text-slate-500 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"><X className="h-4 w-4" /></Dialog.Close>
           <div className="space-y-4 text-xs leading-6 text-slate-600">
-            <p>{snapshot.collectionCutoffAt ? <>新增统计截至 {dailyTime(snapshot.collectionCutoffAt)}；互动统计截至 {dailyTime(snapshot.cutoffAt)}</> : <>新增 / 互动统计截至 {dailyTime(snapshot.cutoffAt)}</>}；复核及冷处理状态截至 {dailyTime(snapshot.assessedAt)}。北京时间。</p>
+            <p>{isTriageHandlingSummary(snapshot) ? <>处理 / 互动统计截至 {dailyTime(snapshot.cutoffAt)}</> : snapshot.collectionCutoffAt ? <>新增统计截至 {dailyTime(snapshot.collectionCutoffAt)}；互动统计截至 {dailyTime(snapshot.cutoffAt)}</> : <>新增 / 互动统计截至 {dailyTime(snapshot.cutoffAt)}</>}；复核及冷处理状态截至 {dailyTime(snapshot.assessedAt)}。北京时间。</p>
             {!!snapshot.warnings.length && <ul className="list-disc space-y-1 pl-5 text-amber-800">{snapshot.warnings.map((warning, index) => <li key={`${warning.code}-${index}`}>{warning.message}</li>)}</ul>}
-            {snapshot.collectionStartAt && snapshot.collectionCutoffAt ? <>
+            {isTriageHandlingSummary(snapshot) ? <p>当日汇总范围：{dailyTime(snapshot.periodStart)} 至 {dailyTime(snapshot.cutoffAt)}。按北京时间实际处理日期统计，与帖子发布时间和入库时间无关。休息日处理记录带入下一份工作日日报，逐日汇总仍按实际处理日期列出。</p> : snapshot.collectionStartAt && snapshot.collectionCutoffAt ? <>
               <p>采集归属范围：{dailyTime(snapshot.collectionStartAt)} 至 {dailyTime(snapshot.collectionCutoffAt)}。前夜采集归当天，周末和法定节假日合并至下一工作日，调休上班日正常出报。</p>
               <p>采集量仅计进入客户内容分诊清单的新增帖子，复采和后续修改状态不重复计数；SDB 扣除已复核的非监控内容。采集 MTD 按日报归属月份累计。</p>
               {snapshot.calendarRevision && <p>工作日历：中国法定节假日及调休安排 · {snapshot.calendarRevision}。</p>}
             </> : <p>此日报按生成时的原统计范围展示：监控为首次成功入库的新帖，复采不重复计数；SDB 扣除已复核的非监控内容。</p>}
             {isHandlingSummary(snapshot) && <p>每日处理量按北京时间当天发生处理状态变化的帖子去重统计，同一帖子当天多次变更计 1 条，按当天最后一次状态归类。处理 MTD 累加各日处理量，同帖跨天处理可再次计入；采集 MTD 按帖子月内去重。休假有处理时按实际日期列出，无处理则不单列。</p>}
             {isCollectionSummary(snapshot) && <p>本表按首次成功入库的采集内容去重统计，复采及后续修改状态不重复计数；MTD 保留本月帖子去重累计，不按每日数值简单相加。手填修改在原累计值上增减对应差额。</p>}
-            {isCollectionHandlingSummary(snapshot) && <p>{snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : collectionHandlingBasis}手填采集数值在原累计值上增减对应差额。</p>}
-            <p>系统统计{isHandlingSummary(snapshot) ? '处理' : isCollectionHandlingSummary(snapshot) ? '采集' : ''}负面：当日 {snapshot.summary.day.negative} 条，MTD {snapshot.summary.mtd.negative} 条。待识别或核对：当日 {snapshot.summary.day.unclassified} 条，MTD {snapshot.summary.mtd.unclassified} 条。客户补填的汇总与系统统计分别保存。</p>
-            {isMonthlySummary(snapshot) ? <p>表内逐日数值可在本页填写并保存，MTD 按报表累计口径展示。{isHandlingSummary(snapshot) ? '实际采集量单独展示，不随手填处理量修改。' : isCollectionHandlingSummary(snapshot) ? snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : '负面日行是实际处理次数，MTD负面按帖子去重；负面处理与采集量分别统计。' : isCollectionSummary(snapshot) ? '每日数量和月累计均为采集统计口径。' : '此历史日报保留生成时的采集统计口径。'}飞书文档里的修改不会自动同步回本页。</p> : <p>处理中、已处理初始为空，空白不代表 0。可在本页填写并保存；飞书文档里的修改不会自动同步回本页。</p>}
+            {isCollectionHandlingSummary(snapshot) && <p>{isTriageHandlingSummary(snapshot) ? triageHandlingBasis : snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : collectionHandlingBasis}{isTriageHandlingSummary(snapshot) ? '手填平台监控量、SDB、正面和中性在原累计值上增减对应差额。' : '手填采集数值在原累计值上增减对应差额。'}</p>}
+            <p>系统统计{isHandlingSummary(snapshot) || isTriageHandlingSummary(snapshot) ? '处理' : isCollectionHandlingSummary(snapshot) ? '采集' : ''}负面：当日 {snapshot.summary.day.negative} 条，MTD {snapshot.summary.mtd.negative} 条。待识别或核对：当日 {snapshot.summary.day.unclassified} 条，MTD {snapshot.summary.mtd.unclassified} 条。客户补填的汇总与系统统计分别保存。</p>
+            {isMonthlySummary(snapshot) ? <p>表内逐日数值可在本页填写并保存，MTD 按报表累计口径展示。{isTriageHandlingSummary(snapshot) ? '所有列均取内容分诊实际处理过的帖子，MTD 按帖子去重。' : isHandlingSummary(snapshot) ? '实际采集量单独展示，不随手填处理量修改。' : isCollectionHandlingSummary(snapshot) ? snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : '负面日行是实际处理次数，MTD负面按帖子去重；负面处理与采集量分别统计。' : isCollectionSummary(snapshot) ? '每日数量和月累计均为采集统计口径。' : '此历史日报保留生成时的采集统计口径。'}飞书文档里的修改不会自动同步回本页。</p> : <p>处理中、已处理初始为空，空白不代表 0。可在本页填写并保存；飞书文档里的修改不会自动同步回本页。</p>}
             <p>7 天发布时间：{dailyTime(snapshot.heatStart)} 至 {dailyTime(snapshot.cutoffAt)}。热度按可见互动数合计；小红书为点赞、评论、收藏之和。</p>
           </div>
         </Dialog.Content></Dialog.Portal>
@@ -502,6 +503,7 @@ function SummaryTable(props: Parameters<typeof LegacySummaryTable>[0]) {
   const { snapshot, draft, canEdit, busy, onEdit, onChange, onCancel, onSave } = props
   const handling = isHandlingSummary(snapshot)
   const collectionHandling = isCollectionHandlingSummary(snapshot)
+  const triageHandling = isTriageHandlingSummary(snapshot)
   const collection = isCollectionSummary(snapshot) || collectionHandling
   const rows = visibleMonthlyRows(snapshot.summary.rows!, handling || collectionHandling)
   let totals: Pick<DailyCounts, typeof monthlyFields[number]> = snapshot.summary.mtd
@@ -512,7 +514,7 @@ function SummaryTable(props: Parameters<typeof LegacySummaryTable>[0]) {
   return <section>
     <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h4 className="text-base font-semibold text-slate-900">{handling || collection ? '一、每日舆情处理量' : '一、监控汇总（采集口径）'}</h4><p className="mt-1.5 text-xs text-slate-500">{snapshot.reportDate.slice(0, 7)} · 月初至报表日</p></div>{canEdit && <div className="flex gap-2">{draft ? <><Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>取消</Button><Button size="sm" disabled={busy || !!totalsError} onClick={onSave}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}保存汇总</Button></> : <Button size="sm" variant="ghost" disabled={busy} onClick={onEdit}><Pencil className="h-3.5 w-3.5" />编辑汇总</Button>}</div>}</div>
     <div className="overflow-x-auto border border-slate-300">
-      <table className="w-full min-w-[780px] border-collapse text-center text-xs tabular-nums" aria-label={collectionHandling ? '逐日采集与负面处理汇总及月累计' : handling ? '逐日舆情处理量与月累计' : '逐日采集汇总与月累计'}>
+      <table className="w-full min-w-[780px] border-collapse text-center text-xs tabular-nums" aria-label={triageHandling ? '逐日分诊处理汇总及月累计' : collectionHandling ? '逐日采集与负面处理汇总及月累计' : handling ? '逐日舆情处理量与月累计' : '逐日采集汇总与月累计'}>
         <thead className="bg-[#101416] text-white">
           <tr className="[&>th]:border-b [&>th]:border-r [&>th]:border-slate-300 [&>th]:px-3 [&>th]:py-3 [&>th]:font-semibold [&>th:last-child]:border-r-0"><th rowSpan={2} scope="col" className="w-32">{handling || collection ? '舆情处理日期' : '日报日期'}</th><th rowSpan={2} scope="col">{labels.monitor}</th><th rowSpan={2} scope="col">SDB范畴</th><th rowSpan={2} scope="col">正面</th><th rowSpan={2} scope="col">中性</th><th colSpan={4} scope="colgroup">负面</th></tr>
           <tr className="[&>th]:border-b [&>th]:border-r [&>th]:border-slate-300 [&>th]:px-3 [&>th]:py-2.5 [&>th]:font-semibold [&>th:last-child]:border-r-0"><th scope="col">冷处理</th><th scope="col">评论区留言</th><th scope="col">走负面处理流程</th><th scope="col">其他</th></tr>
@@ -525,8 +527,8 @@ function SummaryTable(props: Parameters<typeof LegacySummaryTable>[0]) {
       </table>
     </div>
     {totalsError && <p role="alert" className="mt-3 text-xs leading-6 text-rose-700">{totalsError}当前仍显示已保存的月累计。</p>}
-    {collectionHandling && <p className="mt-3 text-xs leading-6 text-slate-500">{snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : collectionHandlingBasis}</p>}
-    {(!collectionHandling || draft) && <p className="mt-3 text-xs leading-6 text-slate-500">{draft ? `${collectionHandling ? '填写非负整数；采集字段的 MTD 按修改差额调整，负面 MTD 保留系统去重数量。' : collection ? '填写非负整数，MTD 在原去重累计上增减对应修改差额。' : '填写非负整数，MTD 自动汇总各日数值。'}请先保存或取消，再切换日期、下载或发送。` : handling ? '按当日处理状态有变化的帖子去重，同帖当天多次变更计 1 条，按当天最后一次状态归类。MTD 累加各日处理量，同帖跨天处理可再次计入。' : collection ? '按首次成功入库的采集内容去重统计，复采不重复计数；MTD 为本月去重累计。休息日采集内容合并到下一工作日。' : '此历史日报沿用采集统计口径，休息日采集内容合并到下一工作日。'}</p>}
+    {collectionHandling && <p className="mt-3 text-xs leading-6 text-slate-500">{triageHandling ? triageHandlingBasis : snapshot.summary.negativeDailyBasis === 'effective_handled_posts' ? effectiveHandlingBasis : collectionHandlingBasis}</p>}
+    {(!collectionHandling || draft) && <p className="mt-3 text-xs leading-6 text-slate-500">{draft ? `${collectionHandling ? `填写非负整数；${triageHandling ? '平台监控量、SDB、正面和中性' : '采集字段'}的 MTD 按修改差额调整，负面 MTD 保留系统去重数量。` : collection ? '填写非负整数，MTD 在原去重累计上增减对应修改差额。' : '填写非负整数，MTD 自动汇总各日数值。'}请先保存或取消，再切换日期、下载或发送。` : handling ? '按当日处理状态有变化的帖子去重，同帖当天多次变更计 1 条，按当天最后一次状态归类。MTD 累加各日处理量，同帖跨天处理可再次计入。' : collection ? '按首次成功入库的采集内容去重统计，复采不重复计数；MTD 为本月去重累计。休息日采集内容合并到下一工作日。' : '此历史日报沿用采集统计口径，休息日采集内容合并到下一工作日。'}</p>}
   </section>
 }
 

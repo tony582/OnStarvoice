@@ -2,7 +2,8 @@ import {buildCustomerDailyHandlingLists, customerDailyHandlingEpisode} from './c
 import {resolveMetricUpdateFromPayload} from '../utils/metrics.js';
 import {recoverCustomerDailyObservationTime} from './customer-daily-metric-evidence.js';
 import {buildMonthlySummary, DAILY_COLLECTION_SUMMARY_FORMAT} from './customer-daily-monthly-summary.js';
-import {buildCustomerDailyMixedSummary, buildCustomerDailyNegativeHandlingSummary, customerDailyHandlingMonthStart, parseCustomerDailyHandlingEvents} from './customer-daily-handling-summary.js';
+import {buildCustomerDailyMixedSummary, buildCustomerDailyNegativeHandlingSummary, buildCustomerDailyTriageHandlingSummary, customerDailyHandlingMonthStart, parseCustomerDailyHandlingEvents} from './customer-daily-handling-summary.js';
+import {CUSTOMER_ACTIVE_TRIAGE_SQL, isActiveDailyTriagePost, usesTriageHandlingDate} from './customer-daily-triage-scope.js';
 import {recordEffectiveRelevanceSql, recordTriageAdmissionSql} from './record-triage-admission.js';
 import {customerDailyPostHeat} from './customer-daily-report-presentation.js';
 
@@ -223,6 +224,7 @@ export function buildCustomerDailyCollectionSummary(records, period) {
 
 export async function collectCustomerDailyNegativeHandling({tenantId, period, db, auditCoverageFrom = null}) {
   if (!tenantId || !db?.queryAll || !db?.queryOne) throw new TypeError('负面处理统计需要租户及只读查询接口');
+  const triageHandling = usesTriageHandlingDate(period);
   const monthStart = customerDailyHandlingMonthStart(period);
   const handlingStart = period.handlingStartAt || period.periodStart;
   const eventStart = ms(handlingStart) < ms(monthStart) ? handlingStart : monthStart;
@@ -242,29 +244,34 @@ export async function collectCustomerDailyNegativeHandling({tenantId, period, db
       COALESCE(rt.status, 'unhandled') AS status,
       ${recordEffectiveRelevanceSql('r')} AS relevance,
       EXISTS (SELECT 1 FROM record_watchlist w WHERE w.tenant_id=r.tenant_id AND w.record_id=r.id) AS watched,
-      true AS admission_allowed
+      true AS admission_allowed, rt.archived_at
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id=r.tenant_id AND rt.record_id=r.id
     WHERE r.tenant_id = $1 AND r.id = ANY($2::uuid[]) AND r.created_at < $3::timestamptz
-      AND ${POST_SQL} AND r.business_visibility = 'eligible' AND (${recordTriageAdmissionSql('r')})
+      AND ${triageHandling ? CUSTOMER_ACTIVE_TRIAGE_SQL : `${POST_SQL} AND r.business_visibility = 'eligible' AND (${recordTriageAdmissionSql('r')})
       AND (${recordEffectiveRelevanceSql('r')} IS DISTINCT FROM 'irrelevant' OR EXISTS (
-        SELECT 1 FROM record_watchlist daily_watched WHERE daily_watched.tenant_id=r.tenant_id AND daily_watched.record_id=r.id))
+        SELECT 1 FROM record_watchlist daily_watched WHERE daily_watched.tenant_id=r.tenant_id AND daily_watched.record_id=r.id))`}
     ORDER BY r.id`, [tenantId, ids, period.cutoffAt]) : [];
-  const records = rows.filter(row => customerPost(row) && row.admission_allowed !== false && ms(row.first_seen_at) < ms(period.cutoffAt));
+  const records = rows.filter(row => customerPost(row) && row.admission_allowed !== false && ms(row.first_seen_at) < ms(period.cutoffAt)
+    && (!triageHandling || isActiveDailyTriagePost(row)));
   const coverage = auditCoverageFrom || (await db.queryOne(`/* customer_daily:audit_coverage */
     SELECT applied_at FROM schema_migrations WHERE version = $1`, ['081_customer_daily_reports.sql']))?.applied_at;
-  return {...buildCustomerDailyNegativeHandlingSummary(records, parsed.transitions, period, {coverageFrom: coverage, malformedEventIds: parsed.malformed}), records, transitions: parsed.transitions, events};
+  const options = {coverageFrom: coverage, malformedEventIds: parsed.malformed};
+  const result = triageHandling ? buildCustomerDailyTriageHandlingSummary(records, parsed.transitions, period, count, options)
+    : buildCustomerDailyNegativeHandlingSummary(records, parsed.transitions, period, options);
+  return {...result, records, transitions: parsed.transitions, events};
 }
 
 export async function collectCustomerDailyReport({tenantId, date, now = new Date(), db, auditCoverageFrom = null, businessPeriod = null}) {
   if (!tenantId) throw Object.assign(new Error('缺少租户'), {statusCode: 400});
   if (!db?.queryAll || !db?.queryOne) throw new TypeError('日报聚合需要数据库事务');
   const period = businessPeriod || dailyPeriod(date, now);
+  const triageHandling = usesTriageHandlingDate(period);
   const {periodStart, cutoffAt, monthStart, heatStart} = period;
   const collectionStart = period.collectionStartAt || periodStart;
   const collectionCutoff = period.collectionCutoffAt || cutoffAt;
   const tenant = await db.queryOne('/* customer_daily:tenant */ SELECT name FROM tenants WHERE id = $1', [tenantId]);
   if (!tenant) throw Object.assign(new Error('租户不存在'), {statusCode: 404});
-  const monthRows = await db.queryAll(`/* customer_daily:month */
+  const monthRows = triageHandling ? [] : await db.queryAll(`/* customer_daily:month */
     SELECT r.id, r.created_at AS first_seen_at, r.record_type, r.sentiment, r.business_visibility,
       r.ai_result->>'relevance' AS relevance,
       EXISTS (SELECT 1 FROM record_watchlist w WHERE w.tenant_id=r.tenant_id AND w.record_id=r.id) AS watched,
@@ -273,29 +280,37 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     WHERE r.tenant_id = $1 AND r.created_at >= $2::timestamptz AND r.created_at < $3::timestamptz AND ${CUSTOMER_POST_SQL}
     ORDER BY r.created_at, r.id`, [tenantId, monthStart, collectionCutoff]);
   const uniqueRows = [...new Map(monthRows.filter(row => customerPost(row) && ms(row.first_seen_at) >= ms(monthStart) && ms(row.first_seen_at) < ms(collectionCutoff)).map(row => [row.id, row])).values()];
-  const dayRows = uniqueRows.filter(row => ms(row.first_seen_at) >= ms(collectionStart));
+  let dayRows = uniqueRows.filter(row => ms(row.first_seen_at) >= ms(collectionStart));
   const warnings = [];
   const warn = (code, message, blocking = false) => warnings.push({code, message, blocking});
-  const collectionSummary = buildCustomerDailyCollectionSummary(uniqueRows, period);
   const handling = await collectCustomerDailyNegativeHandling({tenantId, period, db, auditCoverageFrom});
-  const summary = buildCustomerDailyMixedSummary(collectionSummary, handling.summary);
-  if (!handling.summary.coverageComplete) warn('handling_history_incomplete', `负面处理仅统计可核实的真实状态变更；本月历史记录覆盖不完整，不能视为完整数量。${handling.evidence.malformedEventIds.length ? `有${handling.evidence.malformedEventIds.length}条审计记录缺少有效变更信息。` : ''}`);
-  const conflicts = uniqueRows.filter(row => NEGATIVE_STATES.has(status(row)) && row.sentiment !== 'negative' && status(row) !== 'reviewed_non_monitor');
-  if (summary.mtd.unclassified) warn('unclassified', `本月截至报表日有${summary.mtd.unclassified}条SDB内容尚未完成情感识别（日新增${summary.day.unclassified}条），未自动归为中性。`, true);
+  const summary = triageHandling ? handling.summary : buildCustomerDailyMixedSummary(buildCustomerDailyCollectionSummary(uniqueRows, period), handling.summary);
+  const handledMonthIds = new Set(handling.evidence.monthRecordIds);
+  const reportMonthRows = triageHandling ? handling.records.filter(row => handledMonthIds.has(row.id)) : uniqueRows;
+  if (triageHandling) {
+    const handledDayIds = new Set(handling.evidence.dailyRecordIds[period.reportDate] || []);
+    dayRows = reportMonthRows.filter(row => handledDayIds.has(row.id));
+  }
+  if (!handling.summary.coverageComplete) warn('handling_history_incomplete', `${triageHandling ? '处理量' : '负面处理'}仅统计可核实的真实状态变更；本月历史记录覆盖不完整，不能视为完整数量。${handling.evidence.malformedEventIds.length ? `有${handling.evidence.malformedEventIds.length}条审计记录缺少有效变更信息。` : ''}`);
+  const conflicts = reportMonthRows.filter(row => NEGATIVE_STATES.has(status(row)) && row.sentiment !== 'negative' && status(row) !== 'reviewed_non_monitor');
+  if (summary.mtd.unclassified) warn('unclassified', `本月截至报表日有${summary.mtd.unclassified}条SDB内容尚未完成情感识别（${triageHandling ? '当日处理' : '日新增'}${summary.day.unclassified}条），未自动归为中性。`, true);
   if (conflicts.length) warn('sentiment_status_conflict', `本月内容中${conflicts.length}条情感结论与负面处理状态不一致，按有效情感统计，需核对。`, true);
   const pendingReview = dayRows.filter(row => status(row) === 'unhandled').length;
-  if (businessPeriod && pendingReview) warn('review_pending', `本次采集清单还有${pendingReview}条待复核。`, true);
+  if (!triageHandling && businessPeriod && pendingReview) warn('review_pending', `本次采集清单还有${pendingReview}条待复核。`, true);
+
+  const customerPostSql = triageHandling ? CUSTOMER_ACTIVE_TRIAGE_SQL : CUSTOMER_POST_SQL;
 
   const heatRows = await db.queryAll(`/* customer_daily:heat_posts */
     SELECT r.id, r.title, r.platform, r.url, r.canonical_url, r.record_type, r.sentiment,
       r.published_ts, r.created_at AS first_seen_at, COALESCE(rt.status, 'unhandled') AS status,
-      rt.feishu_table_no
+      rt.feishu_table_no, rt.archived_at, true AS admission_allowed
     FROM records r LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
     WHERE r.tenant_id = $1 AND r.published_ts >= $2::timestamptz AND r.published_ts < $3::timestamptz
-      AND r.created_at < $3::timestamptz AND r.sentiment = 'negative' AND ${CUSTOMER_POST_SQL}
+      AND r.created_at < $3::timestamptz AND r.sentiment = 'negative' AND ${customerPostSql}
       AND COALESCE(rt.status, 'unhandled') <> 'reviewed_non_monitor'
     ORDER BY r.published_ts DESC, r.id`, [tenantId, heatStart, cutoffAt]);
-  const heatCandidates = heatRows.filter(row => mainPost(row) && row.sentiment === 'negative' && status(row) !== 'reviewed_non_monitor' && ms(row.first_seen_at) < ms(cutoffAt) && ms(row.published_ts) >= ms(heatStart) && ms(row.published_ts) < ms(cutoffAt));
+  const heatCandidates = heatRows.filter(row => mainPost(row) && row.sentiment === 'negative' && status(row) !== 'reviewed_non_monitor' && ms(row.first_seen_at) < ms(cutoffAt) && ms(row.published_ts) >= ms(heatStart) && ms(row.published_ts) < ms(cutoffAt)
+    && (!triageHandling || isActiveDailyTriagePost(row)));
   const observations = heatCandidates.length ? await db.queryAll(`/* customer_daily:observations */
     SELECT ro.id, ro.record_id, ro.captured_at, ro.likes, ro.comments_count, ro.collects, ro.shares,
       ${observationPayloadSql()} AS payload
@@ -346,7 +361,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     SELECT COUNT(*)::int AS count FROM records r
     LEFT JOIN record_triage rt ON rt.tenant_id = r.tenant_id AND rt.record_id = r.id
     WHERE r.tenant_id = $1 AND r.created_at >= $2::timestamptz AND r.created_at < $3::timestamptz
-      AND r.published_ts IS NULL AND r.sentiment = 'negative' AND ${CUSTOMER_POST_SQL}
+      AND r.published_ts IS NULL AND r.sentiment = 'negative' AND ${customerPostSql}
       AND COALESCE(rt.status, 'unhandled') <> 'reviewed_non_monitor'`, [tenantId, heatStart, cutoffAt]);
   if (Number(missingPublished?.count) > 0) warn('published_time_missing', `近7天入库的负面帖子中${Number(missingPublished.count)}篇缺少发布时间，无法确认是否落在热度窗口。`);
 
@@ -387,7 +402,7 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   if (!coverageComplete) warn('cold_history_incomplete', `${coldMarked.length ? '历史标记记录不完整，以下为可核实内容。' : '暂未检出，历史标记记录不完整。'}${malformed.length ? `有${malformed.length}条旧审计事件缺少变更前状态。` : ''}`);
   const missingLinks = [...highHeat, ...coldMarked, ...repliedMarked, ...commentMarked].filter(row => !row.url);
   if (missingLinks.length) warn('source_link_missing', `${new Set(missingLinks.map(row => row.recordId)).size}篇清单帖子缺少可用原帖链接，需补齐。`, true);
-  const captureRows = await db.queryAll(`/* customer_daily:pending_capture */
+  const captureRows = triageHandling ? [] : await db.queryAll(`/* customer_daily:pending_capture */
     SELECT t.id, t.status, t.task_type, t.feature_key,
       jsonb_build_object('workflow', t.metadata->'workflow', 'businessTaskType', t.metadata->'businessTaskType',
         'promotedBusinessTaskType', t.metadata->'promotedBusinessTaskType') AS metadata,
@@ -410,11 +425,13 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
   const activeCaptures = captureRows.map(assessCustomerDailyCaptureReadiness).filter(Boolean);
   if (activeCaptures.length) warn('capture_not_settled', `报表日创建的${activeCaptures.length}个普通采集任务存在未完成、失败或同步缺口，监控数量仅包含已成功入库主帖。`, true);
   return {
-    schemaVersion: 5, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, repliedMarked, commentMarked, handlingListsVersion: 1, warnings,
+    schemaVersion: triageHandling ? 6 : 5, tenantId, tenantName: tenant.name || '', ...period, summary, highHeat, coldMarked, repliedMarked, commentMarked, handlingListsVersion: 1, warnings,
     evidence: {
-      scope: '当前租户首次入库且进入客户内容分诊清单的主帖；排除系统过滤和判为无关的内容，保留客户主动关注的帖子；同帖复采不重复计数；SDB再扣除客户标记的非监控内容',
+      scope: triageHandling ? '当前租户内容分诊未归档主帖，按真实处理日期统计；同帖同日去重，含历史帖；月累计按帖去重；SDB扣除已复核-非监控内容'
+        : '当前租户首次入库且进入客户内容分诊清单的主帖；排除系统过滤和判为无关的内容，保留客户主动关注的帖子；同帖复采不重复计数；SDB再扣除客户标记的非监控内容',
+      ...(triageHandling ? {dateField: 'audit_logs.created_at', monitoringBasis: summary.monitoringBasis} : {}),
       firstSeenField: 'records.created_at', timeZone: 'Asia/Shanghai', reviewBasis: '本版生成时有效情感及人工处理状态',
-      monthRecords: uniqueRows.map(row => ({recordId: row.id, firstSeenAt: iso(row.first_seen_at), sentiment: row.sentiment || '', status: status(row), businessVisibility: row.business_visibility || 'eligible'})),
+      monthRecords: reportMonthRows.map(row => ({recordId: row.id, firstSeenAt: iso(row.first_seen_at), sentiment: row.sentiment || '', status: status(row), businessVisibility: row.business_visibility || 'eligible'})),
       dayRecordIds: dayRows.map(row => row.id), conflictRecordIds: conflicts.map(row => row.id),
       handling: handling.evidence,
       heat: {candidateCount: heatCandidates.length, selected: heatEvidence, missingRecordIds: missingHeat, missingPublishedCount: Number(missingPublished?.count) || 0,
@@ -424,3 +441,6 @@ export async function collectCustomerDailyReport({tenantId, date, now = new Date
     },
   };
 }
+
+// Shared by the customer monthly report so both reports classify a post identically.
+export {count as countCustomerDailyPosts};
