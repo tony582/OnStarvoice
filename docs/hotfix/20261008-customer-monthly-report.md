@@ -9,3 +9,11 @@
 未做：飞书文档/群发、自动定时发送、手填汇总、表格图片；月报不含评论记录。9 月月报的数量与 9 月日报累计不同，属口径差异（发布时间 + 内容分诊范围 vs 首次入库 + 数据底座范围）。
 
 验证：`customer-monthly-report.test.mjs`、真库集成 `customer-monthly-report.integration.mjs`（生成、版本冻结、幂等、邮件队列、HTTP 导出与权限）、后台构建、Playwright `customer-monthly-ui.browser.mjs`。发布需跑迁移 092（启动自动应用），替换 server 与后台静态包。
+
+## 发布记录（2026-10-08）
+
+- 12:45 上传发布包到 `/opt/onstarvoice-private/releases/customer-monthly-0c56820-20261008/`（15 个 server 文件 + 后台 dist，SHA256SUMS 远端核对通过，生产 Node 18 语法检查通过）；发布前生产 `server/` 与 main@6ecdc04 校验比对仅 4 个无关文件不同。
+- 12:45–12:50 数据库备份 `/opt/backups/onstarvoice/customer-monthly-pre-0c56820-20261008-124529.dump`（1.0 GB，`pg_restore --list` 可列出）。
+- 12:51:48 执行 `deploy.sh`：备份被替换的 8 个文件到发布目录 `backup/`，复制 15 个文件并原地校验，后台 dist 原子切换（旧目录 `web/admin/dist.before-customer-monthly-0c56820-20261008`），`node db/migrate.js` 应用 092，`pm2 restart onstarvoice`（PID 780619）。
+- 门禁：`/api/health` 200、`/api/health/ready` 200、`/admin/` 200、`/api/customer-monthly-reports/` 未登录 401、公网 health/admin/资源 200；两分钟内无再次重启。回退脚本 `rollback.sh` 在同一目录（迁移表为新增，不回退）。
+- 生产 = main = 0c56820。9 月月报尚未生成：自动模式拒绝在生产执行写入脚本，需在后台「客户月报」页选择 2026-09 点「生成月报」。
