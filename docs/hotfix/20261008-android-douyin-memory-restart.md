@@ -47,3 +47,20 @@ SwapFree:              4 kB
 - 阈值是常量，不能从后台或命令行改；想调整只能改 `douyin-memory.mjs`。
 - 只看内存，不看抖音进程常驻大小或运行时长；若某天内存没满但读屏已经慢，仍要靠人工。
 - 重启后抖音冷启动如果弹出活动/青少年模式弹窗，与原有自动重拉同样依赖下一个任务的登录检查来发现。
+
+## 上线记录（2026-10-08）
+
+| 时间 | 动作 | 结果 |
+|---|---|---|
+| 22:48 | 手动 `am force-stop` + 拉起抖音（根因处置） | 读屏 avg 1.1 s / max 2.6 s；后续 6 个词正常完成 |
+| 23:08 | 提交 `4a98cec`（main）并推送；`git archive` 生成 `runtime-0.3.1-4a98cec`（`release-source.sha`、沿用 `launcher.json`） | 运行目录内 8/8 测试通过 |
+| 23:19:01 | Runner 0.3.0（PID 35682）空闲 90 秒后 SIGINT 受控停止 | 1 秒内退出，`deviceClosureRequired=false`、待上传 0；状态库备份 `backups/runner-0.3.0-12d09bc-before-0.3.1-4a98cec-20261008.sqlite`（完整性 ok） |
+| 23:19–23:26 | 新 Runner 两次启动即退（`Command could not complete`） | 真因 `device_locked`：`/tmp/starvoice-android-device-locks/<serial-hash>.lock` 目录还在但 `owner.json` 已不在，目录改动时间 10-08 00:00:00——macOS 每日清理 /tmp 删掉了 3 天没动过的锁文件（0.3.0 从 10-03 跑到现在）。`cli.mjs close` 对「有目录无 owner」明确拒绝（manual investigation）。人工核对：旧进程已退出、手机无 uiautomator2 helper、无会话后，`rmdir` 空锁目录 |
+| 23:26:25 | 在桌面端终端页签用 ASCII 包装脚本 `launcher/start.sh` 启动 0.3.1（`open` 双击启动器从本会话拉不起 Terminal 窗口） | PID 52965；就绪、`controlError=null`；`deviceProbe.memory` = 可用 3.1 GB、交换区剩 1.5 GB / 2.5 GB、`starved=false` |
+
+本批 13 词最终：已完成 9（凯迪拉克OTA、别克OTA、别克车机升级、上汽通用客服、别克APP、别克远控、ibuick、别克哨兵、别克壁纸/凯迪拉克壁纸见调度中心），3 次用满 3 个（凯迪拉克车机升级：第 3 次撞上手动重启；安吉星、至境哨兵：第 3 次 `invalid_ui_source`），等下一轮自动再采。
+
+## 顺带发现（未改）
+
+1. **锁根在 /tmp 会被系统清理**：`fixedLockRoot()` = `/tmp/starvoice-android-device-locks`，macOS 会删除 3 天未访问的 /tmp 文件（本次 00:00:00 整点）。Runner 连续运行超过 3 天后，退出时 `releaseDeviceLock` 找不到 owner 会抛错，下次启动报 `device_locked`，`close` 也不接受。可选修法：锁根改到不被清理的固定目录（如 `~/Library/Application Support/StarVoice/android-device-locks`，README 里「整台电脑固定目录」的约束要同步改），或运行中定期 touch `owner.json`。
+2. **`invalid_ui_source` 今晚 3 次同一签名**（别克哨兵 22:21、安吉星 22:56、至境哨兵 23:10）：`parser=invalid_attribute`、`tag=android.widget.TextView`、已解析 3 个属性、下一个是 `text`。本地复现：属性值里的 `<` 会报 `invalid_tag` 而不是这个，所以不是 `<`；具体字符仍未捕获（09-26 同样没抓到）。可选：解析失败时把出错属性前后 80 字符记进本地诊断（不上传），下次就能定位。
