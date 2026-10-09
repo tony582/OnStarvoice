@@ -76,3 +76,20 @@ al.target_id = r.id::text OR COALESCE(al.metadata->'recordIds','[]'::jsonb) ? r.
 ## 发布
 
 服务端有迁移和路由改动，后台有静态改动：走 `deploy/deploy.sh`（rsync server + 构建并 rsync admin dist + `node db/migrate.js` + PM2 重启）。回退：代码回到 `4581e2e` 重发；两个索引留着无害（也可 `DROP INDEX`）。
+
+## 发布过程（Asia/Shanghai，2026-10-09）
+
+| 时间 | 操作 | 结果 |
+| --- | --- | --- |
+| 11:3x | 只读预检 | 生产 `triage.js`、`record-triage-query.js`、`app.js` 的 SHA-256 与 `main` `4581e2e` 一致；PostgreSQL 14.24；`audit_logs` 16,067 行 / 15 MB，`records` 37,484 行；就绪检查正常（PID 782111，role=all） |
+| 11:40 | `CREATE INDEX CONCURRENTLY` 建两个索引 | 649 ms / 47 ms，`indisvalid` 均为 t，896 kB / 848 kB |
+| 11:42:10–11:42:40 | `bash deploy/deploy.sh 47.103.125.200` | 构建后台、rsync、`node db/migrate.js` 登记 093（索引已存在，`IF NOT EXISTS` 直接通过）、PM2 重启，脚本退出码 0 |
+| 11:42:40–11:45:56 | **事故：服务起不来，公网 502 约 3 分钟** | 新进程循环崩溃：`PROCESS_ROLE must be explicitly set in production`。原因是 `deploy.sh` 把本机 `server/.env.production`（2026-07-28 的旧文件，18 个键）覆盖到了 `/opt/onstarvoice/server/.env`，而线上这个文件自 7 月以来在服务器上手工加过 9 个键（`PROCESS_ROLE=all`、`PG_GENERAL_WAIT_MS`、`OPS_CONTROL_*`、`CUSTOMER_DAILY_REPORT_ENCRYPTION_KEY`、`ANDROID_DISCOVERY_INGEST_TENANTS`、`CAPTURE_FILTER_VERIFICATION_LIMIT`），最后一次改动是 09-27 17:38。nginx 在 11:42–11:45 共记录 136 个 502 |
+| 11:45:56 | 恢复 | 从 09-28 发布目录保留的 `server-previous/.env`（与 09-27 17:38 的线上文件逐字节相同，27 个键）复制回 `/opt/onstarvoice/server/.env`，`pm2 restart onstarvoice --update-env`；就绪检查与公网健康恢复，PID 807090，role=all |
+| 11:47 | 发布后核对 | 线上 `index.html`、`triage.js`、`record-triage-query.js`、`093_*.sql` 哈希与本分支一致；`schema_migrations` 含 093；只读 `EXPLAIN (ANALYZE, BUFFERS)` 最大租户（30,150 条内容）导出 5,000 行的处理记录子查询：`audit_logs` 走 `BitmapOr(idx_audit_logs_tenant_target, idx_audit_logs_record_ids)`，每行 0.012 ms，整句 3.96 s（冷缓存，含 records 的并行顺序扫描 0.8 s） |
+
+### 事故结论与遗留
+
+- 直接原因：`deploy/deploy.sh` 无条件 `scp server/.env.production → /opt/onstarvoice/server/.env`，而本机那份自 07-28 起没有再同步过线上手工改动。此前几次发布走的是 Codex 的文件包发布器（不碰 `.env`），所以没有暴露。
+- 本机 `server/.env.production`（主工作区与本工作树两份）仍是旧内容；自动模式拒绝我把线上文件拉回本机（凭据落盘），**下一次再跑 `deploy.sh` 之前必须先用线上的 `/opt/onstarvoice/server/.env` 更新本机这份文件**，或者改 `deploy.sh`（发布前备份线上 `.env`、本机副本键数少于线上时拒绝覆盖）——后者是行为变更，留给用户决定。
+- 事故前后数据库没有任何数据变更；两个索引与迁移登记在事故前已完成。
