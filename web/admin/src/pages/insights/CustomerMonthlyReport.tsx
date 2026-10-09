@@ -7,7 +7,7 @@ import { useNav } from '@/lib/navigation'
 import * as Dialog from '@radix-ui/react-dialog'
 import { dailyPostStatusLabel } from './CustomerDailyReport.summary.mjs'
 import { dailyError, safeReportUrl } from './CustomerDailyReport.types'
-import { MONTHLY_API, monthlyTime, shanghaiMonth, type MonthlyCounts, type MonthlyGroup, type MonthlyPost, type MonthlyReport, type MonthlySettings, type MonthlySnapshot } from './CustomerMonthlyReport.types'
+import { MONTHLY_API, monthlyTime, shanghaiMonth, type MonthlyCounts, type MonthlyGroup, type MonthlyPost, type MonthlyReport, type MonthlySettings } from './CustomerMonthlyReport.types'
 
 type ReportResponse = { report: MonthlyReport; html: string; text: string }
 type Notice = { kind: 'success' | 'error'; text: string }
@@ -71,10 +71,13 @@ function CustomerMonthlyReportWorkspace() {
 
   useEffect(() => {
     const sequence = ++requestSequence.current
-    setLoading(true)
-    setNotice(null)
-    setDeliveryNotice(null)
     async function load() {
+      // Reset inside the async task rather than synchronously in the effect
+      // body (react-hooks/set-state-in-effect); the sequence guard keeps a
+      // superseded request from touching state afterwards.
+      setLoading(true)
+      setNotice(null)
+      setDeliveryNotice(null)
       try {
         const data = await api.get<{ reports: MonthlyReport[] }>(`${MONTHLY_API}/?month=${encodeURIComponent(month)}`)
         if (!mounted.current || sequence !== requestSequence.current) return

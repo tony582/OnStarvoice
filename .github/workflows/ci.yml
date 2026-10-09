@@ -6,6 +6,11 @@ on:
     branches:
       - main
       - 'codex/**'
+      - 'refactor/**'
+      - 'fix/**'
+      - 'feat/**'
+      - 'chore/**'
+      - 'hotfix/**'
   workflow_dispatch:
 
 permissions:
