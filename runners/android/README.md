@@ -79,6 +79,8 @@ node runners/android/cli.mjs setup --state-dir /path/to/private/android-state --
 
 0.3.1 起：每次领取关键词前的探测还会读一次手机内存（`adb shell cat /proc/meminfo`）。可用内存（MemAvailable）低于 1 GB，或交换区（swap）剩余不足总量 10%，就先 `am force-stop` 抖音、再通过同一个审核过的启动组件拉起（不清数据、不掉登录），然后照常核对版本与前台；这次拉起和自动重拉一样算一次启动，所以下一个关键词会先去「我」页确认登录。两次重启之间至少隔 30 分钟，期间读数照常上报但不再重启；没有交换区的手机只看可用内存；读不到这两个字段就不重启。只在空闲探测里做，关键词执行中或会话未关闭时绝不触发。一键窗口打印「【已重启抖音】手机内存不足（可用 … · 交换区剩 …）」；`status` 的 `deviceProbe.memory` 是最近一次读数与判定；`diagnose` 的 `problems` 列出每次 `douyin_restart`，`summary.douyinRestarts` 是次数。背景：2026-10-08 抖音进程连续运行 8 天后常驻 2.7 GB、交换区 2.6 GB 用尽，每次读屏 3–11 秒，超过 10 秒上限的那一次就让整个关键词以 `device_timeout` 结束，连续两轮 19 次；手动强停重拉后读屏回到 1–2 秒。见 [20261008 hotfix](../../docs/hotfix/20261008-android-douyin-memory-restart.md)。
 
+0.3.2 起，读屏内容解析失败（`invalid_ui_source`）时，本地诊断里的 `diagnostic` 除规则名和计数外，还带 `context`：出错位置前后各最多 80 个字（按码点截，不会把表情截成半个）、位置偏移，以及这段文字里 XML 不允许的码点（控制字符、孤立代理项、U+FFFE/FFFF，最多 8 个）；属性相关规则还带属性名。这段文字可能含帖子文案，只写进本机状态库（0600）的诊断环，上传给调度中心的完成详情仍只有白名单字段。`diagnose` 的 `problems` 里直接能看到。见 [20261009 hotfix](../../docs/hotfix/20261009-android-lock-root-and-parser-context.md)。
+
 0.3.0 起，读到一屏搜索结果后，Runner 先把这一屏还没见过的卡片（卡片上的完整文案和作者，每次最多 8 张，一次只发一个请求）发给服务端 `POST /api/capture-cloud/android/agent/prefilter`，由服务端用插件「AI 精准筛选」同一套相关性预筛判断，再开始逐张点开；只有服务端明确判为与本租户无关、建议不采（`status=ok`、`skip`、`irrelevant`、置信度在 0–1 之间、无保护信号、`skip_full_capture`）且文案不是占位标题、至少 2 个字的卡片才不点开，其它照旧点开复制链接。被跳过的卡片不占帖子数和卡片数，也不算打开失败；翻页「没有新作品」的判断不变。开关跟随任务方案：只有方案同时打开「列表后自动补详情」和「AI 精准筛选」时，服务端下发的任务才带 `relevancePrefilter.enabled=true`。一律失败放行：请求出错、超过 30 秒、服务端返回 `enabled=false` 或答复不清楚，这一批卡片全部照常点开；连续 2 次请求失败或收到一次 `enabled=false` 后，本任务剩余卡片不再请求、直接点开。预筛失败不会结束任务，也不会要求确认停稳；请求期间收到停止会立即结束、不再点开卡片。完成回执的 `stats` 增加 `prefilterSkipped`（AI 跳过）、`prefilterJudged`（服务端给出判断）、`prefilterUnjudged`（该判未判、照常点开）；一键窗口的每词结果行在有跳过时加一段「AI 跳过 N 条无关」。每张被跳过卡片的判断理由在服务端 `relevance_prefilter_decisions` 表按任务可查；本机每个请求记一条 `card_prefilter`（数量、耗时、失败码，以及最多 8 条被跳过卡片的标题前 60 字与理由前 80 字），存在单独的环（`diagnostics:prefilter`，不挤掉失败记录），只留在本机不上传；`diagnose` 的 `prefilter` 列出最近 20 条，每个关键词行带 `aiSkipped`／`aiJudged`／`aiUnjudged`，`summary.aiSkipped` 为合计。
 
 ```sh
@@ -92,7 +94,7 @@ node runners/android/cli.mjs stop --state-dir /path/to/private/android-state
 
 每次动作发给适配器前，SQLite 先写“待确认停稳”。正常返回才能清除。停止、超时、断线或进程崩溃期间无法确认当前动作结束时，保留手机锁和证据，不报告空闲。
 
-物理锁使用整台电脑固定目录：macOS／Linux 为 `/tmp/starvoice-android-device-locks`，Windows 为 `%ProgramData%\StarVoice\android-device-locks`，锁名由手机 serial 生成。CLI 不能按用户目录、checkout 或状态目录改变锁根；不接受符号链接根目录。其他用户无权访问现有锁目录时直接拒绝操作，不降级到用户私有锁。锁不会仅因 PID 消失或超时自动释放。
+物理锁使用整台电脑固定目录：macOS 为 `/Users/Shared/StarVoice/android-device-locks`，Linux 为 `/var/tmp/starvoice-android-device-locks`，Windows 为 `%ProgramData%\StarVoice\android-device-locks`，锁名由手机 serial 生成。0.3.2 之前 macOS／Linux 用的是 `/tmp`，macOS 会删掉 3 天没人碰过的 /tmp 文件：Runner 连续跑到第 5 天时锁里的 `owner.json` 在 2026-10-08 00:00 被系统清掉，退出后留下一个没有主人的锁目录，下次启动报 `device_locked`，`close` 也按设计拒绝猜测；见 [20261009 hotfix](../../docs/hotfix/20261009-android-lock-root-and-parser-context.md)。CLI 不能按用户目录、checkout 或状态目录改变锁根；不接受符号链接根目录。其他用户无权访问现有锁目录时直接拒绝操作，不降级到用户私有锁。锁不会仅因 PID 消失或超时自动释放。
 
 重启不会继续旧 UI 操作或修改旧事件归属。保存中的运行任务先用原 session 和原 attempt 报告 `interrupted`；丢失的完成响应按原 requestId、原请求体重放。正常结束先等当前 attempt 的所有事件收到持久回执再 complete，等待期间继续续期；截止时间到期或许可撤回则转为中断，剩余事件仅作为迟到证据上传。
 

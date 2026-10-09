@@ -4,9 +4,14 @@ import {createHash, randomUUID} from 'node:crypto';
 import {normalizeCloudUrl} from '../cloud/client.mjs';
 import {validateSerial} from '../device/adb.mjs';
 
+// Host-wide, fixed, and never emptied by a cleaner. /tmp was the root until 0.3.2: macOS removes files there that
+// nobody touched for three days, so after a five-day run owner.json vanished at midnight (2026-10-08) and the next
+// start met a lock directory without its owner (device_locked; `close` rightly refuses to guess). /Users/Shared
+// exists on every Mac and is kept; Linux uses /var/tmp (systemd cleans it only after 30 days by default).
 export const fixedLockRoot = () => process.platform === 'win32'
   ? join(process.env.ProgramData || 'C:/ProgramData', 'StarVoice', 'android-device-locks')
-  : '/tmp/starvoice-android-device-locks';
+  : process.platform === 'darwin' ? '/Users/Shared/StarVoice/android-device-locks'
+    : '/var/tmp/starvoice-android-device-locks';
 export const setCheckpoint = (store, key, value) => store.saveCheckpoint(key, value, store.loadCheckpoint(key)?.revision ?? 0);
 export const stateValue = (store, key) => store.loadCheckpoint(key)?.value ?? null;
 export function readConfig(directory) {

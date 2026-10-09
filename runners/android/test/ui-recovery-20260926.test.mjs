@@ -5,7 +5,7 @@ import {resource} from '../src/device/douyin-profile.mjs';
 import {createProfileSession} from '../src/device/profile-session.mjs';
 import {UNREADABLE_SCREEN_BACKS} from '../src/device/douyin-readiness.mjs';
 import {RunnerStore} from '../src/storage/runner-store.mjs';
-import {runDiscoveryTask} from '../src/core/discovery-runner.mjs';
+import {runDiscoveryTask, faultDetails} from '../src/core/discovery-runner.mjs';
 import {readDiagnostics} from '../src/core/diagnostics.mjs';
 import {fixtureTask, fixtureClock, fixturePermit, fixtureDevice} from './core-fixtures.mjs';
 
@@ -38,7 +38,9 @@ const fakeAdb = () => ({inspect: async () => ({model: 'DE106', apiLevel: 27}), i
 const session = (sources, calls) => createProfileSession({serial: 'phone-1', profileId: 'douyin-40.6.0-de106-api27-p0',
   adb: fakeAdb(), client: fakeAppium(sources, calls)});
 
-test('a parser rejection names its rule with sizes and code points only', () => {
+// 0.3.2: the local diagnostic may carry a bounded window of page text under `context` (and attribute or tag
+// names), because identical failures could not be explained without it; the uploaded details still never do.
+test('a parser rejection names its rule; page text appears only in the local context, never in uploaded details', () => {
   const cases = [
     [unreadable, {parser: 'invalid_code_point', codePoint: 11}],
     [xml('<node text="x" text="y"/>'), {parser: 'duplicate_attribute'}],
@@ -54,10 +56,15 @@ test('a parser rejection names its rule with sizes and code points only', () => 
     try { parseUiTree(source); } catch (caught) { error = caught; }
     assert.equal(error?.code, 'invalid_ui_source', expected.parser);
     for (const [key, value] of Object.entries(expected)) assert.equal(error.diagnostic[key], value, expected.parser);
-    assert.equal(JSON.stringify(error.diagnostic).includes('秘密'), false, 'no page text');
-    for (const value of Object.values(error.diagnostic)) {
-      assert.ok(typeof value === 'number' || value === error.diagnostic.parser, `${expected.parser}: only numbers besides the rule`);
+    const {context, ...rest} = error.diagnostic;
+    assert.equal(JSON.stringify(rest).includes('秘密') || JSON.stringify(rest).includes('stray</node>'), false, 'page text only inside context');
+    for (const [key, value] of Object.entries(rest)) {
+      assert.ok(typeof value === 'number' || value === error.diagnostic.parser
+        || ['attribute', 'entity', 'closeTag', 'openTag'].includes(key) && typeof value === 'string', `${expected.parser}: ${key}`);
     }
+    if (context) assert.deepEqual(Object.keys(context).sort(), ['after', 'before', 'oddCodePoints', 'offset']);
+    const uploaded = JSON.stringify(faultDetails(error));
+    assert.equal(uploaded.includes('秘密') || uploaded.includes('stray</node>') || uploaded.includes('context'), false, 'uploaded details stay whitelisted');
   }
   assert.equal(parseUiTree(ownProfile).nodes.length, 4, 'valid hierarchies are unchanged');
 });
