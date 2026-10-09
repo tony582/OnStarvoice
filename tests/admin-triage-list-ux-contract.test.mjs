@@ -82,7 +82,8 @@ test('fixed processing cell combines handling state with a direct note action', 
 
   assert.match(header, /sticky right-0 z-50 w-\[208px\] min-w-\[208px\]/);
   assert.match(header, /grid-cols-\[112px_48px\]/);
-  assert.match(header, />处理状态</);
+  // 固定列表头是「处理状态」快捷筛选，仍居中放在状态列上方。
+  assert.match(header, /<div className="flex justify-center">\s*<HeaderMultiFilter label="处理状态"/);
   assert.match(header, /sr-only">备注/);
   assert.match(row, /sticky right-0 z-20 w-\[208px\] min-w-\[208px\]/);
   assert.match(row, /<TriageStatusMenu[\s\S]*<InlineRecordProgress record=\{r\} onAdd=\{onAddNote\}/);
@@ -122,7 +123,7 @@ test('empty list keeps filters and the table header usable', () => {
   assert.doesNotMatch(queue, /records\.length === 0 \? \(\s*<EmptyState[\s\S]{0,300}\) : \(\s*<div className="isolate/);
 });
 
-test('one filter bar carries every content dimension once; the table header only labels and sorts', () => {
+test('one filter bar carries every content dimension once; the table header repeats five of them as quick filters on the same state', () => {
   const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
   const primary = between(queue, 'data-triage-toolbar="primary"', 'data-triage-toolbar="secondary"');
   const secondary = between(queue, 'data-triage-toolbar="secondary"', '{/* List */}');
@@ -173,11 +174,22 @@ test('one filter bar carries every content dimension once; the table header only
   assert.doesNotMatch(secondary, /xl:grid-cols-|<TriageSelect|<select/);
   assert.doesNotMatch(queue, /TicketStatusFilter|工单状态筛选/);
 
-  // 表头不再重复放筛选器：只有列名与排序。
-  assert.doesNotMatch(queue, /HeaderSingleFilter|HeaderMultiFilter/);
-  assert.doesNotMatch(header, /<PostIntentFilter|<PostRelevanceFilter|<MultiSelect|onChange=\{setPlatform\}|onChange=\{setSentiment\}|onChange=\{setTriageStatuses\}/);
-  assert.match(header, />处理状态</);
+  // 表头上情感 / AI 判断 / 风险信号 / 疑似身份 / 处理状态是快捷入口：与筛选行共用同一份状态，不另造一套。
+  assert.match(header, /<HeaderSingleFilter label="情感" value=\{sentiment\} onChange=\{setSentiment\} options=\{SENTIMENT_OPTIONS/);
+  assert.match(header, /<PostIntentFilter header value=\{intents\} onChange=\{setIntents\} \/>/);
+  assert.match(header, /<PostRelevanceFilter header value=\{relevances\} confidence=\{relevanceConfidences\} onChange=\{setRelevances\} onConfidenceChange=\{setRelevanceConfidences\} \/>/);
+  assert.match(header, /<HeaderMultiFilter label="风险信号" value=\{risk\} onChange=\{setRisk\} options=\{RISK_OPTIONS\} \/>/);
+  assert.match(header, /<HeaderMultiFilter label="疑似身份" value=\{identity\} onChange=\{setIdentity\} options=\{IDENTITY_OPTIONS\} \/>/);
+  assert.match(header, /<HeaderMultiFilter label="处理状态" value=\{triageStatuses\} onChange=\{setTriageStatuses\} options=\{contentStatusOptions\.map/);
+  assert.match(header, />AI 判断</);
+  // 表头不复用筛选行的 pill 组件，平台等不常用维度也不进表头；互动、评论、点赞等仍只排序。
+  assert.doesNotMatch(header, /<MultiSelect|<SingleSelectFilter|onChange=\{setPlatform\}|onChange=\{setContentTopic\}/);
+  assert.match(header, /<SortableTh label="互动" field="interactions"/);
+  assert.match(header, /<SortableTh label="评论" field="comments"/);
   assert.match(header, /<SortableTh label="发布时间" field="publish"/);
+  // 表头筛选只是入口：筛选行里的每个维度仍各出现一次，表头组件只定义一次。
+  assert.equal((queue.match(/function HeaderSingleFilter\(/g) || []).length, 1);
+  assert.equal((queue.match(/function HeaderMultiFilter\(/g) || []).length, 1);
 });
 
 test('selection is lightweight: no page lock, no banner, cleared when the query changes', () => {

@@ -123,7 +123,10 @@ test('triage filters keep operational dimensions without work-order controls', (
   assert.doesNotMatch(queue, /搜索标题、正文、作者、工单号/);
   assert.match(queue, /aria-label="平台筛选"/);
   assert.match(queue, /<MultiSelect[\s\S]*label="处理状态"[\s\S]*value=\{triageStatuses\}/);
-  assert.doesNotMatch(queue, /HeaderMultiFilter|HeaderSingleFilter/);
+  // 表头快捷筛选与筛选行共用 risk / identity / triageStatuses 等状态。
+  assert.match(queue, /<HeaderMultiFilter label="风险信号" value=\{risk\} onChange=\{setRisk\}/);
+  assert.match(queue, /<HeaderMultiFilter label="疑似身份" value=\{identity\} onChange=\{setIdentity\}/);
+  assert.match(queue, /<HeaderSingleFilter label="情感" value=\{sentiment\} onChange=\{setSentiment\}/);
   assert.match(queue, /aria-label="内容主题筛选"/);
   assert.match(queue, /label="风险信号"/);
   assert.match(queue, /label="疑似身份"/);

@@ -18,3 +18,11 @@ export function triageLoadError(error: unknown): string {
   if (/timeout|timed out|超时/i.test(message)) return '内容加载超时，请稍后重试。'
   return /[\u4e00-\u9fff]/u.test(message) ? message : '内容暂时加载失败，请稍后重试。'
 }
+
+// 导出失败直接转述服务端的说明（例如「导出超时：…」），不套列表加载的「内容加载超时」文案：
+// 列表的 25 秒前端时限与导出无关，导出失败几乎都是服务端明确拒绝或语句超时。
+export function exportFailureMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message.trim() : ''
+  if (!message) return '导出失败，请稍后重试。'
+  return message.startsWith('导出') ? message : `导出失败：${message}`
+}

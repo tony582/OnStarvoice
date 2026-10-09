@@ -61,8 +61,8 @@ test('content status filtering supports selecting multiple states end to end', (
   assert.match(queue, /const \[triageStatuses, setTriageStatuses\] = useState<string\[]>/);
   assert.match(queue, /triageStatuses\.forEach\(status => params\.append\('status', status\)\)/);
   assert.match(queue, /<MultiSelect[\s\S]*label="处理状态"[\s\S]*value=\{triageStatuses\}/);
-  // 状态筛选只在筛选栏出现一次；表头不再重复放一个筛选器。
-  assert.doesNotMatch(queue, /HeaderMultiFilter/);
+  // 筛选行与表头「处理状态」快捷入口共用 triageStatuses。
+  assert.match(queue, /<HeaderMultiFilter label="处理状态" value=\{triageStatuses\} onChange=\{setTriageStatuses\}/);
   assert.match(route, /function appendStatusFilter/);
   assert.match(route, /= ANY\(\$\$\{params\.length\}::text\[\]\)/);
   assert.equal((route.match(/appendStatusFilter\(where, params, status\)/g) || []).length, 2);

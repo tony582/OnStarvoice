@@ -120,10 +120,11 @@ test('list, mobile, board and drawer expose intent and relevance with one filter
   const drawer = source('web/admin/src/components/shared/RecordDrawer.tsx');
   const header = queue.slice(queue.indexOf('<thead data-sticky-header'), queue.indexOf('</thead>'));
   const filters = queue.slice(queue.indexOf('data-triage-toolbar="secondary"'), queue.indexOf('{/* List */}'));
-  // 意图与相关性只在筛选栏出现一次（情感在第一行，相关性在第二行最前）；表头合并成一列「AI 判断」只展示，不再放筛选器。
+  // 意图与相关性在筛选栏出现一次（情感在第二行最左，相关性紧随其后）；表头「AI 判断」列放两个紧凑的快捷入口，绑定同一份状态。
   assert.ok(queue.indexOf('aria-label="情感筛选"') < queue.indexOf('<PostRelevanceFilter value={relevances}'));
   assert.ok(filters.indexOf('<PostRelevanceFilter value={relevances}') < filters.indexOf('<PostIntentFilter value={intents}'));
-  assert.doesNotMatch(header, /<PostIntentFilter|<PostRelevanceFilter/);
+  assert.match(header, /<PostIntentFilter header value=\{intents\} onChange=\{setIntents\} \/>/);
+  assert.match(header, /<PostRelevanceFilter header value=\{relevances\} confidence=\{relevanceConfidences\} onChange=\{setRelevances\} onConfidenceChange=\{setRelevanceConfidences\} \/>/);
   assert.match(header, />AI 判断</);
   assert.match(queue, /appendPostIntentFilter\(params, intents\)/);
   assert.doesNotMatch(queue, /useSelection\('triage-selection-session'\)|<fieldset disabled=\{selectionActive\}/);
