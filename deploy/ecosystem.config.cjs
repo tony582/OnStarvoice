@@ -33,11 +33,13 @@ const ENTRYPOINTS = Object.freeze({
 // Caps, not reservations. The old single process ran with 400M and sat at
 // ~200M after an hour; the production host has 1.6 GB RAM and no swap
 // (2026-10-09: ~640 MB available with the single process up), and each split
-// role idles at ~120-140 MB, so the three caps stay well under the box while
-// still giving the API (HTTP + heartbeats + overview projections) the most.
+// role idles at ~60-80 MB. The API keeps the old 400M: a single triage export
+// (exceljs builds the workbook in memory) took it from 63 MB to 319 MB on
+// 2026-10-09 14:18 before dropping back, so 350M would have restarted it
+// mid-export on a larger tenant.
 const MAX_MEMORY_RESTART = Object.freeze({
   all: '400M',
-  api: '350M',
+  api: '400M',
   scheduler: '260M',
   'ai-media': '300M',
 });
