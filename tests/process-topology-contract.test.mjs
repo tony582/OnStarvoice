@@ -25,6 +25,11 @@ const splitCandidateManifest = path.join(
   'deploy',
   'process-topology.split.candidate.json',
 );
+const compatibilityManifest = path.join(
+  repositoryRoot,
+  'deploy',
+  'process-topology.compatibility.json',
+);
 const serverPackage = path.join(repositoryRoot, 'server', 'package.json');
 
 function processConfig(name, role, instances = 1) {
@@ -43,15 +48,31 @@ function assertTopologyError(callback, code) {
   });
 }
 
-test('production manifest is one deployable all instance', async () => {
+test('production manifest is the deployable split topology with one instance per role', async () => {
   const topology = assertProcessTopologyDeployable(parseProcessTopologyJson(
     await readFile(productionManifest, 'utf8'),
   ));
 
   assert.equal(topology.schemaVersion, 1);
+  assert.equal(topology.topology, 'split');
+  assert.equal(topology.deployable, true);
+  assert.equal(topology.totalInstances, 3);
+  assert.deepEqual(topology.roleCounts, { 'ai-media': 1, api: 1, scheduler: 1 });
+  assert.deepEqual(
+    topology.processes.map(processConfig => processConfig.name),
+    ['onstarvoice-api', 'onstarvoice-scheduler', 'onstarvoice-ai-media'],
+  );
+});
+
+test('compatibility rollback manifest is one deployable all instance named like the legacy process', async () => {
+  const topology = assertProcessTopologyDeployable(parseProcessTopologyJson(
+    await readFile(compatibilityManifest, 'utf8'),
+  ));
+
   assert.equal(topology.topology, 'compatibility');
   assert.equal(topology.deployable, true);
   assert.deepEqual(topology.roleCounts, { all: 1 });
+  assert.equal(topology.processes[0].name, 'onstarvoice');
 });
 
 test('topology validation rejects mixed mode, multiple all, and duplicate execution authority', () => {
@@ -93,38 +114,33 @@ test('topology validation rejects mixed mode, multiple all, and duplicate execut
   );
 });
 
-test('split topology is recognized for review but remains blocked from production release', () => {
+test('split topology with one instance per role is deployable', () => {
   const splitManifest = manifest('split', [
     processConfig('api', 'api'),
     processConfig('scheduler', 'scheduler'),
     processConfig('ai-media', 'ai-media'),
   ]);
-  const topology = validateProcessTopology(splitManifest);
+  const topology = assertProcessTopologyDeployable(splitManifest);
 
   assert.equal(topology.topology, 'split');
-  assert.equal(topology.deployable, false);
+  assert.equal(topology.deployable, true);
   assert.deepEqual(topology.roleCounts, { 'ai-media': 1, api: 1, scheduler: 1 });
-  assertTopologyError(
-    () => assertProcessTopologyDeployable(splitManifest),
-    'TOPOLOGY_SPLIT_RELEASE_BLOCKED',
-  );
 });
 
-test('versioned split candidate has exactly one instance for every P2-C runtime role', async () => {
+test('versioned split candidate matches the production manifest role for role', async () => {
   const candidateManifest = parseProcessTopologyJson(
     await readFile(splitCandidateManifest, 'utf8'),
   );
-  const topology = validateProcessTopology(candidateManifest);
+  const topology = assertProcessTopologyDeployable(candidateManifest);
+  const production = validateProcessTopology(parseProcessTopologyJson(
+    await readFile(productionManifest, 'utf8'),
+  ));
 
   assert.equal(topology.schemaVersion, 1);
   assert.equal(topology.topology, 'split');
-  assert.equal(topology.deployable, false);
+  assert.equal(topology.deployable, true);
   assert.equal(topology.totalInstances, 3);
-  assert.deepEqual(topology.roleCounts, { 'ai-media': 1, api: 1, scheduler: 1 });
-  assertTopologyError(
-    () => assertProcessTopologyDeployable(candidateManifest),
-    'TOPOLOGY_SPLIT_RELEASE_BLOCKED',
-  );
+  assert.deepEqual(topology.roleCounts, production.roleCounts);
 });
 
 test('server package exposes dedicated P2-C entrypoint scripts without changing compatibility scripts', async () => {
@@ -177,7 +193,7 @@ test('JSON parsing fails without echoing manifest contents', () => {
   }
 });
 
-test('CLI uses the shared validator, accepts compatibility, and blocks split without leaking secrets', async () => {
+test('CLI uses the shared validator, accepts both topologies, and never leaks secrets', async () => {
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'onstarvoice-topology-'));
   const compatibilityPath = path.join(tempDirectory, 'compatibility.json');
   const splitPath = path.join(tempDirectory, 'split.json');
@@ -213,15 +229,15 @@ test('CLI uses the shared validator, accepts compatibility, and blocks split wit
       encoding: 'utf8',
     });
     assert.equal(splitCandidate.status, 0, splitCandidate.stderr);
-    assert.match(splitCandidate.stdout, /candidate validation passed \(not production deployable\)/u);
+    assert.match(splitCandidate.stdout, /candidate validation passed/u);
     assert.match(splitCandidate.stdout, /topology=split roles=ai-media:1,api:1,scheduler:1/u);
 
     const split = spawnSync(process.execPath, [checker, splitPath], {
       cwd: repositoryRoot,
       encoding: 'utf8',
     });
-    assert.equal(split.status, 2);
-    assert.match(split.stderr, /TOPOLOGY_SPLIT_RELEASE_BLOCKED/u);
+    assert.equal(split.status, 0, split.stderr);
+    assert.match(split.stdout, /Process topology preflight passed: .*topology=split roles=ai-media:1,api:1,scheduler:1/u);
 
     const malformed = spawnSync(process.execPath, [checker, malformedPath], {
       cwd: repositoryRoot,

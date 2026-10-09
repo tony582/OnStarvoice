@@ -1,4 +1,4 @@
-/** P2-C local split-topology AI/Media candidate. */
+/** Independent AI/media process (PROCESS_ROLE=ai-media): labeling, reports, comment AI, media backfill; holds the ai-media role lock. */
 
 import 'dotenv/config';
 

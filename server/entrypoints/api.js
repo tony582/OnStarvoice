@@ -1,4 +1,4 @@
-/** P2-C local split-topology API candidate. */
+/** Independent API process (PROCESS_ROLE=api): HTTP listener, media dirs and request-side cleanups only. */
 
 import 'dotenv/config';
 

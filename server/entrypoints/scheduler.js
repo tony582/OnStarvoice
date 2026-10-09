@@ -1,4 +1,4 @@
-/** P2-C local split-topology Scheduler candidate. */
+/** Independent scheduler process (PROCESS_ROLE=scheduler): cron + ops-control wakeups; holds the scheduler role lock. */
 
 import 'dotenv/config';
 

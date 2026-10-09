@@ -717,21 +717,45 @@ export async function runTopicAnalysis({ tenantId, analysisId }) {
   }
 }
 
-/** 启动收尸:重启会丢内存里的 setImmediate 任务,遗留 pending/running 永远转不完 → 置 failed。 */
-export async function failStaleAnalyses() {
+/**
+ * 把卡住的话题剖析置为 failed。
+ *
+ * 不带参数 = 启动收尸:重启会丢内存里的 setImmediate 任务,遗留 pending/running 永远
+ * 转不完。只能在 HTTP 与 AI 同进程(兼容 `all`)启动时调用,那时所有在途剖析都已随旧进程死亡。
+ *
+ * 带 olderThanMinutes = 周期清扫:只处理 updated_at 超过阈值仍未推进的剖析
+ * (runTopicAnalysis 每个阶段都写 progress 并刷新 updated_at),供独立 ai-media 进程在
+ * split 拓扑下安全运行,不会误杀 API 进程里正在推进的剖析。
+ */
+export async function failStaleAnalyses({ olderThanMinutes } = {}) {
+  const thresholdMinutes = Math.floor(Number(olderThanMinutes));
+  const ageBased = Number.isFinite(thresholdMinutes) && thresholdMinutes > 0;
+  const errorText = ageBased
+    ? `剖析超过 ${thresholdMinutes} 分钟未推进,已自动终止,请重新发起`
+    : '服务重启导致剖析中断,请重新发起';
   // 逐租户执行,遵守「新增 SQL 一律带 tenant_id 条件」的多租户红线
   const tenants = await queryAll(`SELECT id FROM tenants`);
   let total = 0;
   for (const tenant of tenants) {
+    const params = [tenant.id, errorText];
+    let ageClause = '';
+    if (ageBased) {
+      params.push(thresholdMinutes);
+      ageClause = ` AND updated_at < now() - ($3 * interval '1 minute')`;
+    }
     const result = await execute(
       `UPDATE opinion_topic_analyses
-       SET status = 'failed', error = '服务重启导致剖析中断,请重新发起', updated_at = now()
-       WHERE tenant_id = $1 AND status IN ('pending', 'running')`,
-      [tenant.id]
+       SET status = 'failed', error = $2, updated_at = now()
+       WHERE tenant_id = $1 AND status IN ('pending', 'running')${ageClause}`,
+      params
     );
     total += num(result.rowCount);
   }
-  if (total) console.log(`[OpinionAnalysis] 启动收尸:${total} 个中断任务置为 failed`);
+  if (total) {
+    console.log(ageBased
+      ? `[OpinionAnalysis] 周期清扫:${total} 个超过 ${thresholdMinutes} 分钟未推进的剖析置为 failed`
+      : `[OpinionAnalysis] 启动收尸:${total} 个中断任务置为 failed`);
+  }
   return total;
 }
 

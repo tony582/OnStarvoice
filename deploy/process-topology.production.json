@@ -1,10 +1,20 @@
 {
   "schemaVersion": 1,
-  "topology": "compatibility",
+  "topology": "split",
   "processes": [
     {
-      "name": "onstarvoice",
-      "role": "all",
+      "name": "onstarvoice-api",
+      "role": "api",
+      "instances": 1
+    },
+    {
+      "name": "onstarvoice-scheduler",
+      "role": "scheduler",
+      "instances": 1
+    },
+    {
+      "name": "onstarvoice-ai-media",
+      "role": "ai-media",
       "instances": 1
     }
   ]

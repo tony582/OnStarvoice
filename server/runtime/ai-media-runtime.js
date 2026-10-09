@@ -11,14 +11,28 @@ export const AI_MEDIA_RUNTIME_RESPONSIBILITIES = Object.freeze([
   'configured-reports',
   'comment-ai-refinement',
   'ai-failover-recovery',
+  // Owned by the single ai-media execution authority in both topologies. The
+  // comment reprocess holds the database processor lease, the media backfill
+  // is idempotent over a 24h window, and the stale sweep only touches analyses
+  // that have not advanced for OPINION_ANALYSIS_STALE_AFTER_MINUTES.
+  'comment-reprocess-and-safety-reclassify',
+  'recent-media-backfill',
+  'opinion-analysis-stale-sweep',
 ]);
 
 export const COMPATIBILITY_ONE_SHOT_RESPONSIBILITIES = Object.freeze([
+  // Immediate "everything in flight died with this process" repair. Only true
+  // when HTTP and AI share one process; split API restarts are covered by the
+  // periodic stale sweep instead.
   'opinion-analysis-stale-repair',
-  'comment-reprocess-and-safety-reclassify',
-  'recent-media-backfill',
+  // Historical SAIC-GM relabel. Flag-guarded and tenant-wide; never re-run it
+  // from an independent worker.
   'saicgm-scope-relabel',
 ]);
+
+export const OPINION_ANALYSIS_STALE_SWEEP_INITIAL_DELAY_MS = 90_000;
+export const OPINION_ANALYSIS_STALE_SWEEP_INTERVAL_MS = 5 * 60_000;
+export const OPINION_ANALYSIS_STALE_AFTER_MINUTES = 30;
 
 const DEFAULT_JOBS = Object.freeze({
   failStaleAnalyses,
@@ -186,19 +200,28 @@ export function startAiMediaRuntime({
 
   scheduleRecurring(20_000, 15_000, 'CommentRefine', drainCommentAi);
   scheduleRecurring(60_000, 60_000, 'AIFailover', checkAiFailoverRecovery);
+  scheduleRecurring(
+    15_000,
+    60_000,
+    'Reprocess',
+    reprocessCommentsAndSafetyLabels,
+  );
+  schedule(25_000, () => runTracked('MediaBackfill', backfillRecentMedia));
+  scheduleRecurring(
+    OPINION_ANALYSIS_STALE_SWEEP_INITIAL_DELAY_MS,
+    OPINION_ANALYSIS_STALE_SWEEP_INTERVAL_MS,
+    'OpinionAnalysisSweep',
+    () => jobs.failStaleAnalyses({
+      olderThanMinutes: OPINION_ANALYSIS_STALE_AFTER_MINUTES,
+    }),
+  );
 
-  // These historical startup repairs are not safe to run in split mode: they
-  // lack an owner/lease and can mistake another process's work for stale work.
-  // They stay compatibility-only until Maintenance/P2-D gives them one owner.
+  // Compatibility-only: with HTTP and AI in one process, every analysis that
+  // was pending/running at startup died with the previous process, so it is
+  // safe to fail all of them immediately. The SAIC-GM relabel is a historical,
+  // flag-guarded one-shot that must not be re-run from an independent worker.
   if (compatibilityMode) {
     void runTracked('OpinionAnalysis', () => jobs.failStaleAnalyses());
-    scheduleRecurring(
-      15_000,
-      60_000,
-      'Reprocess',
-      reprocessCommentsAndSafetyLabels,
-    );
-    schedule(25_000, () => runTracked('MediaBackfill', backfillRecentMedia));
     schedule(25_000, () => runTracked('Relabel', relabelSaicgmScope));
   }
 

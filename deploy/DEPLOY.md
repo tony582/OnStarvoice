@@ -2,13 +2,21 @@
 
 本文只描述仓库当前可验证的部署方式。生产域名为
 `https://voice.minilife.online`，应用服务器为 `47.103.125.200`，Express
-监听 `3002`，PM2 进程名为 `onstarvoice`，部署目录为
-`/opt/onstarvoice`。
+监听 `3002`，部署目录为 `/opt/onstarvoice`。自 2026-10-09 起生产按
+**split 拓扑**运行三个 PM2 进程：`onstarvoice-api`（HTTP）、
+`onstarvoice-scheduler`（定时任务与唤醒）、`onstarvoice-ai-media`
+（AI 标注/报告/评论精炼/媒体回填）。进程清单由
+`deploy/process-topology.production.json` 定义，PM2 应用由
+`deploy/ecosystem.config.cjs` 按该清单生成，每个进程显式带 `PROCESS_ROLE`。
 
 > 更完整的开发、备份、发布、回滚和故障处理流程见
 > [`../docs/开发运行与生产发布手册.md`](../docs/开发运行与生产发布手册.md)。
+> 进程拆分的上线依据、验证与回退见
+> [`../docs/进程拆分上线方案-20261009.md`](../docs/进程拆分上线方案-20261009.md)。
 >
-> **当前生产发布必须以该受控手册为准。仓库中的 `deploy/deploy.sh` 是旧库存脚本，只用于审计历史行为，不是获批生产入口；不要直接运行。** P2-B 已通过 PR #21 合并到 `main`，但尚未部署；以下角色说明不表示线上已经配置或部署。
+> `deploy/deploy.sh` 会先用 `scripts/check-process-topology.mjs` 校验清单，再同步代码、
+> 跑迁移、停掉全部 `onstarvoice*` 进程并按清单重建，最后等待 `/api/health/ready`
+> 返回 200。它仍然不做备份、不是零停机；发布前的备份与白名单核对按手册执行。
 
 ## 1. 当前拓扑
 
@@ -19,11 +27,22 @@
 voice.minilife.online
           │ Nginx 反向代理
           ▼
-127.0.0.1:3002 / PM2:onstarvoice
-          ├── PostgreSQL:onstarvoice
+127.0.0.1:3002 / PM2:onstarvoice-api（PROCESS_ROLE=api）
+          ├── PM2:onstarvoice-scheduler（PROCESS_ROLE=scheduler，持 scheduler 角色锁）
+          ├── PM2:onstarvoice-ai-media（PROCESS_ROLE=ai-media，持 ai-media 角色锁）
+          ├── PostgreSQL:onstarvoice（三进程共用；角色锁是 pg advisory lock）
           ├── /opt/onstarvoice/media（运行时媒体）
           └── /opt/onstarvoice/web/admin/dist（管理端静态文件）
 ```
+
+三个进程之间不共享内存：调度器与 API 之间通过数据库表、租约和
+`ops_control_wakeup` 的 PG NOTIFY 协作。只有 API 进程监听端口；scheduler
+与 ai-media 的健康只看 PM2 状态与日志。split 进程由 PM2 配置注入
+`PG_DATABASE_INSTANCE_COUNT=3`、`PG_POOL_MAX=30`（每进程 10 个连接，
+与原单进程默认预算相同），`.env` 里的 `PG_POOL_MAX`、`PROCESS_ROLE` 对它们不再生效；
+PostgreSQL 会话合计约 30 池连接 + 2 角色锁 + 1 LISTEN。单进程兼容拓扑
+（`deploy/process-topology.compatibility.json`，进程名 `onstarvoice`）保留
+为回退目标，两种拓扑绝不能同时运行。
 
 - StarVoice 与同机其他应用复用 Nginx、PostgreSQL 和 PM2，但使用独立端口、
   进程名、应用目录和数据库。
@@ -242,18 +261,27 @@ ssh root@47.103.125.200 '
 ```bash
 ssh root@47.103.125.200 '
   pm2 status
-  pm2 logs onstarvoice --lines 100 --nostream
+  pm2 logs onstarvoice-api --lines 60 --nostream
+  pm2 logs onstarvoice-scheduler --lines 60 --nostream
+  pm2 logs onstarvoice-ai-media --lines 60 --nostream
   stat -c "%U:%G %a %n" /opt/onstarvoice/server/.env
 '
 ```
 
 确认：
 
-- `onstarvoice` 状态为 `online`；
+- `onstarvoice-api`、`onstarvoice-scheduler`、`onstarvoice-ai-media` 三个都是
+  `online`，且没有残留的旧单进程 `onstarvoice`；
 - 没有数据库认证、迁移、端口占用、模块缺失或循环重启错误；
+- scheduler 日志有 `[ProcessRole] role=scheduler executionLocks=scheduler`，
+  ai-media 日志有 `role=ai-media executionLocks=ai-media`，api 日志有
+  `role=api executionLocks=none` 与 `[API] HTTP listener ready on port 3002`；
+  若某个 worker 反复打印 `PROCESS_ROLE_LOCK_UNAVAILABLE`，说明旧进程还没退出或
+  另一个同角色进程仍在运行；
 - 环境文件输出为
   `root:root 600 /opt/onstarvoice/server/.env`；
-- 启动日志中定时任务已注册。
+- scheduler 日志中 `[Cron] Scheduler jobs started`，ai-media 日志中
+  `[Cron] AI jobs started`。
 
 ### 5.2 健康与静态页面
 
@@ -345,12 +373,21 @@ reset 迁移不会因 Git 回滚而自动撤销。涉及清空或重建数据的
 # 状态
 ssh root@47.103.125.200 'pm2 status'
 
-# 最近日志
+# 最近日志（按进程）
 ssh root@47.103.125.200 \
-  'pm2 logs onstarvoice --lines 200 --nostream'
+  'pm2 logs onstarvoice-api --lines 200 --nostream'
+ssh root@47.103.125.200 \
+  'pm2 logs onstarvoice-scheduler --lines 200 --nostream'
+ssh root@47.103.125.200 \
+  'pm2 logs onstarvoice-ai-media --lines 200 --nostream'
 
-# 仅重启（没有同步代码和迁移）
-ssh root@47.103.125.200 'pm2 restart onstarvoice'
+# 仅重启某个进程（没有同步代码和迁移）；worker 会先 drain 最多 30 秒再退出
+ssh root@47.103.125.200 'pm2 restart onstarvoice-api'
+ssh root@47.103.125.200 'pm2 restart onstarvoice-scheduler'
+ssh root@47.103.125.200 'pm2 restart onstarvoice-ai-media'
+
+# 就绪检查（数据库可用 + 迁移齐全 + 角色初始化完成）
+ssh root@47.103.125.200 'curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3002/api/health/ready'
 
 # 查看监听端口
 ssh root@47.103.125.200 'ss -ltnp | grep :3002'
@@ -359,6 +396,29 @@ ssh root@47.103.125.200 'ss -ltnp | grep :3002'
 ssh root@47.103.125.200 \
   'sudo -u postgres psql -d onstarvoice -c "SELECT now();"'
 ```
+
+### 8.1 拓扑回退（split → 单进程兼容）
+
+只在 split 进程本身出问题、而不是代码问题时使用；回退后仍是新代码，只是
+三个角色合回一个进程。两种拓扑绝不能同时运行，所以先停全部 split 进程，
+等它们退出并释放角色锁，再起兼容进程：
+
+```bash
+ssh root@47.103.125.200 '
+  set -e
+  cd /opt/onstarvoice/server
+  pm2 delete onstarvoice-api onstarvoice-scheduler onstarvoice-ai-media
+  PROCESS_TOPOLOGY_MANIFEST=/opt/onstarvoice/deploy/process-topology.compatibility.json \
+    pm2 start /opt/onstarvoice/deploy/ecosystem.config.cjs --update-env
+  pm2 save
+  sleep 5
+  curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3002/api/health/ready
+  pm2 status
+'
+```
+
+回到 split：把 `deploy/process-topology.production.json` 保持为 split 并重新跑
+`deploy/deploy.sh`，脚本会删掉 `onstarvoice` 单进程再按清单重建。
 
 ## 9. 禁止事项
 

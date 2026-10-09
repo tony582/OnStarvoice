@@ -10,6 +10,9 @@ import {
 import {
   AI_MEDIA_RUNTIME_RESPONSIBILITIES,
   COMPATIBILITY_ONE_SHOT_RESPONSIBILITIES,
+  OPINION_ANALYSIS_STALE_AFTER_MINUTES,
+  OPINION_ANALYSIS_STALE_SWEEP_INITIAL_DELAY_MS,
+  OPINION_ANALYSIS_STALE_SWEEP_INTERVAL_MS,
   startAiMediaRuntime,
 } from '../server/runtime/ai-media-runtime.js';
 import {
@@ -352,13 +355,60 @@ test('split ai-media worker excludes compatibility one-shots and has no HTTP lis
   assert.equal('server' in runtime, false);
   assert.equal('port' in runtime, false);
   assert.deepEqual(runtime.responsibilities, AI_MEDIA_RUNTIME_RESPONSIBILITIES);
+  // No immediate "fail everything" repair in split mode: the API process may
+  // still be advancing analyses. Only the age-based sweep timer is armed.
   assert.equal(staleRepairCalls, 0);
-  assert.deepEqual(timers.scheduled.map(({ delay }) => delay), [20_000, 60_000]);
+  assert.deepEqual(timers.scheduled.map(({ delay }) => delay), [
+    20_000,
+    60_000,
+    15_000,
+    25_000,
+    OPINION_ANALYSIS_STALE_SWEEP_INITIAL_DELAY_MS,
+  ]);
 
   runtime.stopNewWork();
   const result = await runtime.drain({ timeoutMs: 20 });
   assert.equal(result.drained, true);
-  assert.equal(events.filter((event) => event.startsWith('timer:clear:')).length, 2);
+  assert.equal(events.filter((event) => event.startsWith('timer:clear:')).length, 5);
+});
+
+test('split ai-media stale sweep only fails analyses that stopped advancing', async () => {
+  const events = [];
+  const timers = fakeTimers(events);
+  const staleRepairArgs = [];
+
+  const runtime = await startAiMediaRuntime({
+    compatibilityMode: false,
+    startCron: () => fakeCronRuntime(events),
+    createDrainController: () => fakeDrainController(events),
+    jobs: {
+      failStaleAnalyses: async (options) => {
+        staleRepairArgs.push(options);
+        return 0;
+      },
+    },
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    logger: quietLogger(),
+  });
+
+  const sweep = timers.scheduled.find(
+    ({ delay }) => delay === OPINION_ANALYSIS_STALE_SWEEP_INITIAL_DELAY_MS,
+  );
+  assert.ok(sweep, 'stale sweep timer is armed');
+  sweep.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(staleRepairArgs, [
+    { olderThanMinutes: OPINION_ANALYSIS_STALE_AFTER_MINUTES },
+  ]);
+  // The sweep re-arms itself on the recurring interval.
+  assert.ok(timers.scheduled.some(
+    ({ delay }) => delay === OPINION_ANALYSIS_STALE_SWEEP_INTERVAL_MS,
+  ));
+
+  runtime.stopNewWork();
+  await runtime.drain({ timeoutMs: 20 });
 });
 
 test('compatibility ai-media owns the explicit one-shot boundary in addition to recurring work', async () => {
@@ -391,12 +441,13 @@ test('compatibility ai-media owns the explicit one-shot boundary in addition to 
     60_000,
     15_000,
     25_000,
+    OPINION_ANALYSIS_STALE_SWEEP_INITIAL_DELAY_MS,
     25_000,
   ]);
 
   runtime.stopNewWork();
   await runtime.drain({ timeoutMs: 20 });
-  assert.equal(events.filter((event) => event.startsWith('timer:clear:')).length, 5);
+  assert.equal(events.filter((event) => event.startsWith('timer:clear:')).length, 6);
 });
 
 test('API, scheduler, and recurring ai-media responsibility sets are pairwise disjoint', () => {

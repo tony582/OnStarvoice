@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "topology": "compatibility",
+  "processes": [
+    {
+      "name": "onstarvoice",
+      "role": "all",
+      "instances": 1
+    }
+  ]
+}
