@@ -19,25 +19,31 @@ import { cn, compact, formatDate, formatNumber, platformName } from '@/lib/utils
 import { StatusBadge } from '@/components/ui/badge'
 import { ThemeToggle } from '@/components/layout/ThemeToggle'
 import { ComingSoon } from '@/pages/ComingSoon'
-import { OverviewPage } from '@/pages/OverviewPage'
-import { OpinionPage } from '@/pages/OpinionPage'
-import { SalesLeadsPage } from '@/pages/SalesLeadsPage'
-import { WorkbenchPage } from '@/pages/WorkbenchPage'
-import { MonitoringPage } from '@/pages/MonitoringPage'
-import { DispatchPage } from '@/pages/dispatch/DispatchPage'
-import { SocialAccountsPage } from '@/pages/SocialAccountsPage'
-import { InsightsPage } from '@/pages/InsightsPage'
-import { OpinionAnalysisPage } from '@/pages/OpinionAnalysisPage'
-import { DataPage } from '@/pages/DataPage'
-import { EventsPage } from '@/pages/EventsPage'
-import { TracksPage } from '@/pages/TracksPage'
-import { BenchmarksPage } from '@/pages/BenchmarksPage'
-import { KeywordsPage } from '@/pages/KeywordsPage'
-import { ContentHomePage } from '@/pages/ContentHomePage'
-import { HitsPage } from '@/pages/HitsPage'
-import { OwnedAccountExclusionsPage } from '@/pages/OwnedAccountExclusionsPage'
-import { OfficialCommentPatrolTab } from '@/pages/monitoring/OfficialCommentPatrolTab'
-import { TenantsPage, UsersPage, AuthCodesPage, SettingsPage } from '@/pages/AdminPages'
+import { lazyPage } from '@/lib/lazy-page'
+
+// Each page is its own chunk, fetched on first navigation (see lib/lazy-page).
+const OverviewPage = lazyPage(() => import('@/pages/OverviewPage'), 'OverviewPage')
+const OpinionPage = lazyPage(() => import('@/pages/OpinionPage'), 'OpinionPage')
+const SalesLeadsPage = lazyPage(() => import('@/pages/SalesLeadsPage'), 'SalesLeadsPage')
+const WorkbenchPage = lazyPage(() => import('@/pages/WorkbenchPage'), 'WorkbenchPage')
+const MonitoringPage = lazyPage(() => import('@/pages/MonitoringPage'), 'MonitoringPage')
+const DispatchPage = lazyPage<{ surface?: 'desktop' | 'mobile' }>(() => import('@/pages/dispatch/DispatchPage'), 'DispatchPage')
+const SocialAccountsPage = lazyPage(() => import('@/pages/SocialAccountsPage'), 'SocialAccountsPage')
+const InsightsPage = lazyPage(() => import('@/pages/InsightsPage'), 'InsightsPage')
+const OpinionAnalysisPage = lazyPage(() => import('@/pages/OpinionAnalysisPage'), 'OpinionAnalysisPage')
+const DataPage = lazyPage(() => import('@/pages/DataPage'), 'DataPage')
+const EventsPage = lazyPage(() => import('@/pages/EventsPage'), 'EventsPage')
+const TracksPage = lazyPage(() => import('@/pages/TracksPage'), 'TracksPage')
+const BenchmarksPage = lazyPage(() => import('@/pages/BenchmarksPage'), 'BenchmarksPage')
+const KeywordsPage = lazyPage(() => import('@/pages/KeywordsPage'), 'KeywordsPage')
+const ContentHomePage = lazyPage(() => import('@/pages/ContentHomePage'), 'ContentHomePage')
+const HitsPage = lazyPage(() => import('@/pages/HitsPage'), 'HitsPage')
+const OwnedAccountExclusionsPage = lazyPage(() => import('@/pages/OwnedAccountExclusionsPage'), 'OwnedAccountExclusionsPage')
+const OfficialCommentPatrolTab = lazyPage(() => import('@/pages/monitoring/OfficialCommentPatrolTab'), 'OfficialCommentPatrolTab')
+const TenantsPage = lazyPage(() => import('@/pages/AdminPages'), 'TenantsPage')
+const UsersPage = lazyPage(() => import('@/pages/AdminPages'), 'UsersPage')
+const AuthCodesPage = lazyPage(() => import('@/pages/AdminPages'), 'AuthCodesPage')
+const SettingsPage = lazyPage(() => import('@/pages/AdminPages'), 'SettingsPage')
 
 type OpenPage = (page: string, params?: Record<string, string>) => void
 type RootTab = 'today' | 'tasks' | 'monitor' | 'insights' | 'more'
