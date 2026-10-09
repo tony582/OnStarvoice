@@ -47,11 +47,11 @@ jobs:
       - name: Check repository hygiene
         run: node scripts/check-repository-hygiene.mjs
 
-      - name: Validate production process topology
+      - name: Validate production process topology (split)
         run: node scripts/check-process-topology.mjs deploy/process-topology.production.json
 
-      - name: Validate local split-topology candidate
-        run: node scripts/check-process-topology.mjs --candidate deploy/process-topology.split.candidate.json
+      - name: Validate compatibility rollback topology
+        run: node scripts/check-process-topology.mjs deploy/process-topology.compatibility.json
 
       - name: Check pull request whitespace
         if: github.event_name == 'pull_request'

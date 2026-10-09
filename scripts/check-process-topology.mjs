@@ -45,9 +45,12 @@ export function parseProcessTopologyJson(jsonText) {
 /**
  * Validate and normalize a versioned topology manifest.
  *
- * This pure validation step recognizes split topology so it can be reviewed
- * and tested. Deployability is deliberately enforced by the separate
- * assertProcessTopologyDeployable() boundary below.
+ * Both compatibility (one `all` process) and split (api + scheduler +
+ * ai-media, one instance each) are deployable since 2026-10-09. Which one
+ * production runs is decided by deploy/process-topology.production.json; the
+ * compatibility manifest is kept as the rollback target. The two modes must
+ * never coexist, which the role-count rules below and the PostgreSQL role
+ * locks enforce.
  */
 export function validateProcessTopology(manifest) {
   if (!isPlainObject(manifest)) {
@@ -170,19 +173,18 @@ export function validateProcessTopology(manifest) {
     processes: Object.freeze(processes),
     roleCounts,
     totalInstances,
-    deployable: manifest.topology === 'compatibility',
+    deployable: true,
   });
 }
 
+/**
+ * Release boundary. Every manifest that passes structural validation is
+ * deployable: the split release block was lifted on 2026-10-09 once the
+ * compatibility-only startup repairs got owners (server/runtime/ai-media-runtime.js)
+ * and the all → split → all drill passed; see docs/进程拆分上线方案-20261009.md.
+ */
 export function assertProcessTopologyDeployable(manifest) {
-  const topology = validateProcessTopology(manifest);
-  if (!topology.deployable) {
-    fail(
-      'TOPOLOGY_SPLIT_RELEASE_BLOCKED',
-      'Split topology is validated only as a local candidate; production release remains blocked pending P2-D/P2-E and explicit release authorization.',
-    );
-  }
-  return topology;
+  return validateProcessTopology(manifest);
 }
 
 export async function loadProcessTopology(
@@ -221,7 +223,7 @@ async function main() {
     });
     if (candidateMode) {
       console.log(
-        `Process topology candidate validation passed (not production deployable): ${formatProcessTopologySummary(topology)}`,
+        `Process topology candidate validation passed: ${formatProcessTopologySummary(topology)}`,
       );
     } else {
       console.log(`Process topology preflight passed: ${formatProcessTopologySummary(topology)}`);
