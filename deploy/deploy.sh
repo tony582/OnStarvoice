@@ -29,6 +29,21 @@ PORT="${PORT:-3002}"
 
 echo "▶ 校验发布拓扑清单 $TOPOLOGY …"
 node "$ROOT/scripts/check-process-topology.mjs" "$TOPOLOGY"
+node "$ROOT/scripts/check-process-topology.mjs" "$ROOT/deploy/process-topology.compatibility.json" >/dev/null
+
+# 10-09 事故:本机过期的 .env.production 覆盖了线上 .env(少 9 个键)→ 3 分钟 502。
+# 发布前核对:线上 .env 里有的键,本地副本必须都有;缺任何一个就停。
+echo "▶ 核对本地 .env.production 覆盖线上 .env 的全部键…"
+REMOTE_KEYS="$(ssh "root@$SERVER" "test -f $APP_DIR/server/.env && cut -d= -f1 $APP_DIR/server/.env | grep -E '^[A-Z_]+$' | sort -u" || true)"
+LOCAL_KEYS="$(cut -d= -f1 "$ROOT/server/.env.production" | grep -E '^[A-Z_]+$' | sort -u)"
+MISSING_KEYS="$(comm -23 <(printf '%s\n' "$REMOTE_KEYS") <(printf '%s\n' "$LOCAL_KEYS") | grep -v '^$' || true)"
+if [ -n "$MISSING_KEYS" ]; then
+  echo "✗ 本地 server/.env.production 缺少线上 .env 已有的键,发布会把它们抹掉:"
+  printf '    %s\n' $MISSING_KEYS
+  echo "  请先把线上 /opt/onstarvoice/server/.env 的差异合回本地再发布。"
+  exit 1
+fi
+echo "  线上 $(printf '%s\n' "$REMOTE_KEYS" | grep -c .) 键均在本地副本中(本地共 $(printf '%s\n' "$LOCAL_KEYS" | grep -c .) 键)"
 
 echo "▶ 使用 node $(node -v) 构建 admin 前端…"
 ( cd "$ROOT/web/admin" && npm run build )
@@ -43,6 +58,8 @@ rsync -avz \
   "$ROOT/deploy/process-topology.production.json" \
   "$ROOT/deploy/process-topology.compatibility.json" \
   "root@$SERVER:$APP_DIR/deploy/"
+# 覆盖前先在线上留一份带时间戳的备份(600),出问题可直接拷回。
+ssh "root@$SERVER" "test -f $APP_DIR/server/.env && cp -p $APP_DIR/server/.env $APP_DIR/server/.env.before-deploy-\$(date +%Y%m%d-%H%M%S) && chmod 600 $APP_DIR/server/.env.before-deploy-* || true"
 scp "$ROOT/server/.env.production" "root@$SERVER:$APP_DIR/server/.env"
 echo "▶ 收紧并校验生产环境文件权限…"
 ssh "root@$SERVER" \
@@ -56,11 +73,21 @@ ssh "root@$SERVER" bash -s <<EOF
   # 迁移只在这里跑一次(唯一的维护步骤);独立角色启动时只做只读核对,不跑迁移。
   node db/migrate.js
 
-  # 先停掉所有 onstarvoice* 进程(包括旧的单进程 onstarvoice),等它们退出并释放
-  # 数据库角色锁后,再按清单起新进程。两种拓扑绝不并存。
-  for NAME in \$(pm2 jlist | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s||'[]').map(p=>p.name).filter(n=>/^onstarvoice/.test(n)).join(' ')))"); do
-    echo "  - 停止 \$NAME"
-    pm2 delete "\$NAME"
+  # 先停掉两份清单里出现过的全部 StarVoice 进程(split 三进程 + 单进程 onstarvoice),
+  # 等它们退出并释放数据库角色锁后,再按当前清单起新进程。两种拓扑绝不并存。
+  # 只按清单里的名字删,不按前缀删,避免误伤同机其它 PM2 应用。
+  KNOWN_NAMES="\$(node -e "
+    const names = new Set();
+    for (const f of ['$APP_DIR/deploy/process-topology.production.json', '$APP_DIR/deploy/process-topology.compatibility.json']) {
+      for (const p of require(f).processes) names.add(p.name);
+    }
+    console.log([...names].join(' '));
+  ")"
+  RUNNING_NAMES="\$(pm2 jlist | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s||'[]').map(p=>p.name).join(' ')))")"
+  for NAME in \$KNOWN_NAMES; do
+    case " \$RUNNING_NAMES " in
+      *" \$NAME "*) echo "  - 停止 \$NAME"; pm2 delete "\$NAME" ;;
+    esac
   done
   pm2 start $APP_DIR/deploy/ecosystem.config.cjs --update-env
   pm2 save
