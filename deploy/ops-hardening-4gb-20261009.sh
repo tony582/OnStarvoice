@@ -42,7 +42,9 @@ sudo -u postgres test -w "$BK" && echo "postgres 可写 $BK"
 grep -E '^(PG_BACKUP|[0-9*])' /etc/cron.d/onstarvoice-pg-backup
 rmdir "$PRIVATE/backups/db" 2>/dev/null && echo "已移除空的旧备份目录 $PRIVATE/backups/db" || true
 echo "开始首轮备份(低优先级,约 1 GB,通常 3–8 分钟)…"
-nohup env PG_BACKUP_DIR="$BK" PG_BACKUP_KEEP_DAYS=14 "$PRIVATE/backups/pg-nightly-backup.sh" > "$BK/first-run.log" 2>&1 &
+# setsid + </dev/null:后台任务完全脱离这个 ssh 会话,否则会话结束后本机 ssh 可能一直等不到通道关闭
+# (10-09 首次运行时远端早已跑完,本机 ssh 却挂到被 Ctrl+C)。
+setsid nohup env PG_BACKUP_DIR="$BK" PG_BACKUP_KEEP_DAYS=14 "$PRIVATE/backups/pg-nightly-backup.sh" < /dev/null > "$BK/first-run.log" 2>&1 &
 BK_PID=$!
 
 echo "--- 2. 根分区扩到整块系统盘 ---"

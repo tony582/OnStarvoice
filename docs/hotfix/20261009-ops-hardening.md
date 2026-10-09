@@ -62,3 +62,10 @@
 - 用户已运行 `ops-hardening-20261009.sh`：cron、logrotate、PG 三参数（768MB / 1.1 / 8MB）均已落地，760 MB 旧日志已删。但**首轮备份失败**：`/opt/onstarvoice-private` 为 root 700，postgres 进不去 → `pg_dump: could not open output file … Permission denied`。
 - 修正：备份默认改到数据盘 `/data/backups/postgres`（父目录 755，44 GB 空闲），保留 14 天；脚本启动时检查 postgres 可写、pg_dump 的 stderr 进日志。`deploy/ops-hardening-4gb-20261009.sh` 负责重装并立刻重跑首轮、把根分区从 40 GB 扩到 50 GB、PG 参数按 3.5 GiB 重算（`shared_buffers=768MB` 需重启，`--restart-postgres` 可选）。
 - PM2 内存上限随 4 GiB 放回 api 400M / scheduler 300M / ai-media 400M（下次部署生效）。
+
+### 4 GiB 跟进执行结果（2026-10-09 14:52–14:59，用户执行 `ops-hardening-4gb-20261009.sh --restart-postgres`）
+
+- 备份：`/data/backups/postgres/onstarvoice-20261009-145405.dump` 974 MB，94 个表数据项，266 秒，`pg_restore --list` 校验通过；cron 已指向数据盘，保留 14 天。
+- 根分区：growpart + resize2fs 在线扩容，40 GB → 49 GB（使用 53%）。
+- PostgreSQL：`effective_cache_size=2GB`、`work_mem=16MB`、`maintenance_work_mem=256MB`、`random_page_cost=1.1` reload 生效；14:58:33 重启后 `shared_buffers=768MB`，`pending_restart=false`。重启让 scheduler / ai-media 的角色锁会话断开，两者按设计立即退出并由 PM2 拉起（各 restarts=1），15:02 核对 advisory 锁 2 把、api 未重启、`/api/health/ready` 200、12 台 Agent 在线。
+- 脚本瑕疵：远端全部执行完后本机 ssh 没有退出（终端停在「3b」），手动中断即可；已给后台备份加 `setsid … < /dev/null`。
