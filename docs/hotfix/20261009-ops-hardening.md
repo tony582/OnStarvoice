@@ -52,4 +52,6 @@
 | 13:56 | 三进程 online、restarts 0（PID 813667/813668/813669）；scheduler/ai-media 日志各持本角色锁（backendPid 813712/813711），`pg_locks` advisory 2；三进程错误日志为空；api 日志 `[REQ]` 行数 0；`/api/health/ready` 本机与公网 200；11 台 Agent 3 分钟内有心跳；切换窗口 nginx 6 个 5xx |
 | 13:56 | 线上 `web/admin/dist/index.html` 预加载 8 个块、不含 `vendor-charts`，共 49 个 JS 块；浏览器打开登录页正常 |
 
+| 14:29:23–14:29:55 | 第二次发布（main `063eb00`）：api 内存上限 350→400M 生效，并带上另一会话的存活上报锁超时 hotfix `687d1fd`；14:42 观察 api 零 Unhandled/55P03、Agent 通道 299 次请求全部 200、整站零 5xx |
+
 服务器侧三项（备份 cron + 首轮备份、PM2 logrotate + 删 760 MB 旧日志、PG 参数）由用户执行 `bash deploy/ops-hardening-20261009.sh 47.103.125.200`，本机自动模式不放行远程写入。

@@ -79,3 +79,9 @@
   2. nginx 里 `/api/capture-cloud/agent/liveness` 的 5xx 应接近零（剩余的 503 只来自行锁或语句超时）；`/agent/heartbeat` 原来的 500 变成 503。
   3. 节点列表里没有节点因此掉线：持锁的心跳本来就写 `last_liveness_at`。
 - 回退：换回上一版文件重启。没有数据变化。
+
+## 发布记录（2026-10-09）
+
+- 14:23 以 merge commit `063eb00` 并入 main（基于 `5d97534`，与分支 `687d1fd` 四个文件逐字节相同）；合并后 Node 回归 3289/3289、隔离库集成 518/518（含新增 `capture-agent-liveness-slot.integration.mjs`）。
+- 14:29:23–14:29:55 由 `deploy/deploy.sh` 发布（与 api 内存上限 350→400M 同批），三进程 PID 815402/815403/815404 重建，切换窗口 nginx 14 个 502。
+- 14:30–14:42 观察：api 错误日志 0 条 `Unhandled error`、0 条 55P03（仅 1 条慢投影告警）；nginx 上 `/agent/heartbeat` 152 次、`/agent/liveness` 147 次全部 200，整站 0 个 5xx（发布前 0–2 次/分钟）；三进程 68/67/57 MB、无重启；`pg_locks` advisory 2；12 台 Agent 心跳正常。
