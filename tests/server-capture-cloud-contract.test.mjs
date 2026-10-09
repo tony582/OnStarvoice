@@ -27,6 +27,7 @@ import {
   sanitizeCloudStructuredObject,
 } from "../server/services/capture-cloud.js";
 import {
+  CAPTURE_AGENT_SESSION_BUSY,
   captureTaskBusinessRootVisibilitySql,
   captureCommandCompletionResultSizeBytes,
   captureCreateCommandExpiryEligible,
@@ -34,6 +35,7 @@ import {
   captureExecutionNeverOpened,
   captureItemRequiresLocalClosureReuseFence,
   captureAgentRemovalBlockerMessage,
+  captureAgentChannelRetryAfterMs,
   captureTaskSnapshotFingerprint,
   clearCaptureOverviewProjectionCache,
   countOperatorStoppedPendingChildren,
@@ -53,6 +55,7 @@ import {
   elasticRecoveryHoldRemainingMs,
   evaluateObservedCompletionCandidate,
   hashCaptureCommandCompletion,
+  isCaptureAgentChannelBusyError,
   isProfilePatrolTask,
   isExplicitUserCancellationSnapshot,
   legacyAcknowledgedNegativePatrolPackStopEligible,
@@ -69,10 +72,12 @@ import {
   projectOperatorStoppedParentState,
   projectElasticKeywordRecoveryStatus,
   projectCanceledChildItemStatus,
+  readCommittedCaptureAgentSession,
   reconcileAutomaticCaptureRetries,
   reconcileElasticCaptureLeases,
   reconcilePendingCaptureCommands,
   resolveStopCommandOutcome,
+  sendCaptureAgentChannelBusy,
   supersedeStalePlanConfigurationAttention,
 } from "../server/routes/capture-cloud.js";
 import {operatorClosedTaskSql as operatorClosedTaskSqlForContract} from "../server/services/capture-operator-close.js";
@@ -5457,3 +5462,171 @@ test("history clear reports unclearable rows instead of failing the whole select
 function operatorClosedTaskSqlSource() {
   return String(operatorClosedTaskSqlForContract('capture_tasks'));
 }
+
+test("liveness never waits for the execution slot and defers to its holder", async () => {
+  const authenticatedAgent = {
+    id: "528f8cbd-42f1-493e-8f77-bd585d53ac31",
+    tenant_id: "tenant-a",
+    auth_code_id: "code-a",
+    auth_binding_id: "binding-a",
+    status: "active",
+  };
+  const row = {...authenticatedAgent, last_full_heartbeat_at: "2026-10-09T05:13:00.000Z"};
+  function executor(locked) {
+    const calls = [];
+    return {
+      calls,
+      execute: async (sql, params) => { calls.push({method: "execute", sql, params}); },
+      queryOne: async (sql, params) => {
+        calls.push({method: "queryOne", sql, params});
+        return /pg_try_advisory_xact_lock/u.test(sql) ? {locked} : row;
+      },
+    };
+  }
+
+  // Slot held by another transaction of this node (its full heartbeat): the
+  // caller learns that at once; the row is neither locked nor read.
+  const busy = executor(false);
+  assert.equal(
+    await lockActiveCaptureAgentSession(busy, authenticatedAgent, {wait: false}),
+    CAPTURE_AGENT_SESSION_BUSY,
+  );
+  assert.ok(CAPTURE_AGENT_SESSION_BUSY, "truthy: waiting callers keep `if (!currentAgent)`");
+  assert.equal(busy.calls.length, 1);
+  assert.match(busy.calls[0].sql, /pg_try_advisory_xact_lock/u);
+  assert.deepEqual(
+    busy.calls[0].params,
+    ["capture_agent_execution_slot", `tenant-a:${authenticatedAgent.id}`],
+  );
+
+  // Free slot: the same locked re-read and entitlement fence as a waiting caller.
+  const free = executor(true);
+  assert.equal(
+    await lockActiveCaptureAgentSession(free, authenticatedAgent, {wait: false}),
+    row,
+  );
+  assert.equal(free.calls.length, 2);
+  assert.match(free.calls[1].sql, /FROM capture_agents[\s\S]*FOR UPDATE/u);
+  assert.ok(
+    !free.calls.some(call => /pg_advisory_xact_lock\(/u.test(call.sql)),
+    "the non-waiting path never issues the blocking lock",
+  );
+  assert.equal(
+    await lockActiveCaptureAgentSession(
+      executor(true),
+      {...authenticatedAgent, auth_binding_id: "binding-b"},
+      {wait: false},
+    ),
+    null,
+  );
+
+  // The committed read never locks and keeps the same entitlement fence.
+  const committed = executor(true);
+  assert.equal(await readCommittedCaptureAgentSession(committed, authenticatedAgent), row);
+  assert.equal(committed.calls.length, 1);
+  assert.equal(committed.calls[0].method, "queryOne");
+  assert.match(committed.calls[0].sql, /FROM capture_agents/u);
+  assert.doesNotMatch(committed.calls[0].sql, /FOR UPDATE|advisory/u);
+  assert.deepEqual(committed.calls[0].params, [authenticatedAgent.id, "tenant-a"]);
+  assert.equal(
+    await readCommittedCaptureAgentSession(
+      executor(true),
+      {...authenticatedAgent, auth_code_id: "code-b"},
+    ),
+    null,
+  );
+  const revoked = {
+    execute: async () => {},
+    queryOne: async () => ({...row, status: "revoked"}),
+  };
+  assert.equal(await readCommittedCaptureAgentSession(revoked, authenticatedAgent), null);
+  assert.equal(await readCommittedCaptureAgentSession(revoked, {id: "not-a-uuid"}), null);
+
+  const liveness = readRouteSection(
+    "router.post('/agent/liveness'",
+    "router.post('/agent/heartbeat'",
+  );
+  assert.match(
+    liveness,
+    /lockActiveCaptureAgentSession\(\s*tx,\s*req\.captureAgent,\s*\{wait: false\},?\s*\)/u,
+  );
+  const busyCheck = liveness.indexOf("currentAgent === CAPTURE_AGENT_SESSION_BUSY");
+  const committedRead = liveness.indexOf("await readCommittedCaptureAgentSession(");
+  const inactiveCheck = liveness.indexOf("if (!currentAgent) return {agentInactive: true};");
+  const write = liveness.indexOf("UPDATE capture_agents");
+  assert.ok(busyCheck >= 0 && busyCheck < committedRead, "busy is decided before any row read");
+  assert.ok(committedRead < inactiveCheck && inactiveCheck < write);
+  assert.match(liveness, /livenessRecorded: false/u);
+  assert.match(liveness, /livenessRecorded: true/u);
+  assert.match(liveness, /livenessRecorded: result\.livenessRecorded/u);
+  assert.doesNotMatch(liveness, /await lockCaptureAgentExecutionSlot\(/u);
+  assert.match(liveness, /category: 'critical',\s*waitTimeoutMs: 500,\s*statementTimeoutMs: 2000,\s*lockTimeoutMs: 500/u);
+});
+
+test("agent heartbeat channels answer lock and statement timeouts with 503 Retry-After", () => {
+  const timeouts = [
+    Object.assign(new Error("canceling statement due to lock timeout"), {code: "55P03"}),
+    Object.assign(new Error("canceling statement due to statement timeout"), {code: "57014"}),
+    Object.assign(new Error("deadlock detected"), {code: "40P01"}),
+    Object.assign(
+      new Error("Database critical capacity is temporarily unavailable."),
+      {code: "DB_CAPACITY_UNAVAILABLE", retryAfterMs: 2500},
+    ),
+  ];
+  for (const error of timeouts) {
+    assert.equal(isCaptureAgentChannelBusyError(error), true, error.code);
+  }
+  for (const error of [
+    new Error("boom"),
+    Object.assign(new Error("duplicate"), {code: "23505"}),
+    Object.assign(new Error("serialization"), {code: "40001"}),
+    null,
+    undefined,
+  ]) {
+    assert.equal(isCaptureAgentChannelBusyError(error), false);
+  }
+  assert.equal(captureAgentChannelRetryAfterMs(timeouts[0]), 1000);
+  assert.equal(captureAgentChannelRetryAfterMs(timeouts[3]), 2500);
+  assert.equal(captureAgentChannelRetryAfterMs({retryAfterMs: 5}), 250);
+  assert.equal(captureAgentChannelRetryAfterMs(null), 1000);
+
+  const headers = {};
+  let status = 0;
+  let body = null;
+  const res = {
+    set(name, value) { headers[name] = value; return this; },
+    status(value) { status = value; return this; },
+    json(value) { body = value; return this; },
+  };
+  sendCaptureAgentChannelBusy(res, timeouts[0], "关键心跳通道繁忙，请稍后重试");
+  assert.equal(status, 503);
+  assert.deepEqual(headers, {"Retry-After": "1"});
+  assert.deepEqual(body, {
+    ok: false,
+    error: "server_busy",
+    message: "关键心跳通道繁忙，请稍后重试",
+    retryAfterMs: 1000,
+  });
+  sendCaptureAgentChannelBusy(res, timeouts[3], "心跳对账通道繁忙，请稍后重试");
+  assert.equal(headers["Retry-After"], "3");
+  assert.equal(body.retryAfterMs, 2500);
+
+  // Both Agent channels: the mapping is the last thing before next(err), so a
+  // lock timeout never reaches the unhandled-error handler as a 500.
+  for (const [name, start, end, message] of [
+    ["liveness", "router.post('/agent/liveness'", "router.post('/agent/heartbeat'", "关键心跳通道繁忙，请稍后重试"],
+    ["heartbeat", "router.post('/agent/heartbeat'", "router.post('/agent/stop-fence-checks/:checkId/complete'", "心跳对账通道繁忙，请稍后重试"],
+  ]) {
+    const route = readRouteSection(start, end);
+    const catchBlock = route.slice(route.lastIndexOf("} catch (err) {"));
+    assert.match(
+      catchBlock,
+      new RegExp(
+        `if \\(isCaptureAgentChannelBusyError\\(err\\)\\) \\{\\s*return sendCaptureAgentChannelBusy\\(res, err, '${message}'\\);\\s*\\}\\s*return next\\(err\\);`,
+        "u",
+      ),
+      name,
+    );
+    assert.doesNotMatch(catchBlock, /isDbCapacityError\(err\)/u, `${name} uses the shared mapping`);
+  }
+});
