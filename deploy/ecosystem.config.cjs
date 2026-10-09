@@ -30,13 +30,16 @@ const ENTRYPOINTS = Object.freeze({
   'ai-media': 'entrypoints/ai-media.js',
 });
 
-// Caps, not reservations. The old single process ran with 400M; the three
-// split processes each carry a slice of that work.
+// Caps, not reservations. The old single process ran with 400M and sat at
+// ~200M after an hour; the production host has 1.6 GB RAM and no swap
+// (2026-10-09: ~640 MB available with the single process up), and each split
+// role idles at ~120-140 MB, so the three caps stay well under the box while
+// still giving the API (HTTP + heartbeats + overview projections) the most.
 const MAX_MEMORY_RESTART = Object.freeze({
   all: '400M',
-  api: '400M',
-  scheduler: '300M',
-  'ai-media': '400M',
+  api: '350M',
+  scheduler: '260M',
+  'ai-media': '300M',
 });
 
 // Graceful drain budget is PROCESS_SHUTDOWN_TIMEOUT_MS (default 30s) plus the
