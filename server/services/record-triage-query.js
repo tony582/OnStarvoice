@@ -9,11 +9,14 @@ const OPTIONS = Object.freeze({category: 'reporting', readOnly: true, jitOff: tr
 // `clientGone` is asked once the read owns its reporting slot. A list request
 // the browser already replaced (every filter change aborts the previous one)
 // then gives the slot back instead of running a statement nobody will read.
-function readUnlessClientGone(read, {clientGone} = {}) {
+// `statementTimeoutMs` lets one read (the export) keep a longer statement
+// limit; the category, read-only mode and lock/wait limits stay shared.
+function readUnlessClientGone(read, {clientGone, statementTimeoutMs} = {}) {
+  const options = statementTimeoutMs ? {...OPTIONS, statementTimeoutMs} : OPTIONS;
   return withTransaction(tx => {
     if (typeof clientGone === 'function' && clientGone()) throw new ClientGoneError();
     return read(tx);
-  }, OPTIONS);
+  }, options);
 }
 
 export function queryTriageAll(sql, params = [], options = {}) {

@@ -1309,6 +1309,86 @@ router.post('/records/:recordId/issues', requireTenantAccess, requireTenantWrite
   }
 });
 
+
+// 导出的「处理记录」：内容备注、状态变更备注、工单过程记录按时间合成一列。每行一个相关子查询；
+// audit_logs 那段的 OR 条件由迁移 093 的两个索引承接（tests/integration/postgres/triage-export-processing-records）。
+export function processingRecordsSql(alias = 'r') {
+  const a = alias;
+  return `        COALESCE((
+          SELECT string_agg(
+            processing.line,
+            E'\n' ORDER BY processing.created_at ASC, processing.activity_id ASC
+          )
+          FROM (
+            SELECT
+              rn.created_at,
+              rn.id::text AS activity_id,
+              to_char(rn.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
+                || ' ' || COALESCE(NULLIF(rn.author_name, ''), '未知用户')
+                || ' 内容备注：' || rn.body AS line
+            FROM record_notes rn
+            WHERE rn.record_id = ${a}.id AND rn.tenant_id = ${a}.tenant_id
+
+            UNION ALL
+
+            SELECT
+              al.created_at,
+              al.id::text AS activity_id,
+              to_char(al.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
+                || ' ' || COALESCE(NULLIF(u.name, ''), u.email, NULLIF(al.actor_id, ''), '系统')
+                || ' 状态备注：' || (al.metadata->>'note') AS line
+            FROM audit_logs al
+            LEFT JOIN users u ON u.id = al.actor_user_id
+            WHERE al.tenant_id = ${a}.tenant_id
+              AND al.action IN ('record.triage_updated', 'record.triage_batch_updated')
+              AND btrim(COALESCE(al.metadata->>'note', '')) <> ''
+              AND (
+                al.target_id = ${a}.id::text
+                OR COALESCE(al.metadata->'recordIds', '[]'::jsonb) ? ${a}.id::text
+              )
+
+            UNION ALL
+
+            SELECT
+              tn.created_at,
+              tn.id::text AS activity_id,
+              to_char(tn.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
+                || ' ' || COALESCE(NULLIF(tn.author_name, ''), '未知用户')
+                || ' 工单' || CASE WHEN t.external_ticket_no <> '' THEN ' ' || t.external_ticket_no ELSE '' END
+                || CASE tn.event_type
+                     WHEN 'closed' THEN ' 结案'
+                     WHEN 'reopened' THEN ' 重开'
+                     WHEN 'done' THEN ' 完成处理'
+                     WHEN 'dismissed' THEN ' 忽略'
+                     ELSE ' 处理进展'
+                   END
+                || CASE WHEN tn.body <> '' THEN '：' || tn.body ELSE '' END AS line
+            FROM ticket_notes tn
+            JOIN tickets t ON t.id = tn.ticket_id AND t.tenant_id = tn.tenant_id
+            WHERE t.tenant_id = ${a}.tenant_id
+              AND t.source_type = 'content'
+              AND t.source_record_id = ${a}.id
+          ) processing
+        ), '')`;
+}
+
+// 导出一次最多 5000 行，每行都带处理记录等相关子查询；语句上限比列表（10 秒）长，仍限定在导出这一条读取里。
+export const EXPORT_STATEMENT_TIMEOUT_MS = 30000;
+export const EXPORT_TIMEOUT_MESSAGE = '导出超时：当前筛选结果较多，请缩小时间范围或筛选条件后重试。';
+
+// 导出失败时告诉用户发生了什么：语句被 statement_timeout 取消是导出超时，数据库通道占满是服务繁忙；
+// 其它错误仍交给统一的 500 处理。返回 null 表示不是这里处理的错误。
+export function exportFailureResponse(err) {
+  if (!err) return null;
+  if (err.status && err.code) return { status: err.status, body: { ok: false, error: err.code, message: err.message } };
+  if (err.code === '57014') return { status: 504, body: { ok: false, error: 'export_timeout', message: EXPORT_TIMEOUT_MESSAGE } };
+  if (isTransientDatabaseReadError(err)) {
+    const retryAfterMs = transientDatabaseReadRetryAfterMs(err, 2000);
+    return { status: 503, retryAfterMs, body: { ok: false, error: 'server_busy', message: '当前服务暂时繁忙，导出失败，请稍后重试。', retryAfterMs } };
+  }
+  return null;
+}
+
 // 导出当前筛选结果为 Excel(与 /records 列表用同一套 where/params,但不分页;排除封面/图片等重字段)
 router.get('/records/export', requireTenantAccess, async (req, res, next) => {
   try {
@@ -1389,62 +1469,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
         ${recordAdmissionSelectSql('r', { admitted: true })},
         r.negative_comment_count, r.publish_time, r.published_ts, r.publish_location,
         r.manual_overrides, ${customTagsSelectSql('r')} AS custom_tags,
-        COALESCE((
-          SELECT string_agg(
-            processing.line,
-            E'\n' ORDER BY processing.created_at ASC, processing.activity_id ASC
-          )
-          FROM (
-            SELECT
-              rn.created_at,
-              rn.id::text AS activity_id,
-              to_char(rn.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
-                || ' ' || COALESCE(NULLIF(rn.author_name, ''), '未知用户')
-                || ' 内容备注：' || rn.body AS line
-            FROM record_notes rn
-            WHERE rn.record_id = r.id AND rn.tenant_id = r.tenant_id
-
-            UNION ALL
-
-            SELECT
-              al.created_at,
-              al.id::text AS activity_id,
-              to_char(al.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
-                || ' ' || COALESCE(NULLIF(u.name, ''), u.email, NULLIF(al.actor_id, ''), '系统')
-                || ' 状态备注：' || (al.metadata->>'note') AS line
-            FROM audit_logs al
-            LEFT JOIN users u ON u.id = al.actor_user_id
-            WHERE al.tenant_id = r.tenant_id
-              AND al.action IN ('record.triage_updated', 'record.triage_batch_updated')
-              AND btrim(COALESCE(al.metadata->>'note', '')) <> ''
-              AND (
-                al.target_id = r.id::text
-                OR COALESCE(al.metadata->'recordIds', '[]'::jsonb) ? r.id::text
-              )
-
-            UNION ALL
-
-            SELECT
-              tn.created_at,
-              tn.id::text AS activity_id,
-              to_char(tn.created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI')
-                || ' ' || COALESCE(NULLIF(tn.author_name, ''), '未知用户')
-                || ' 工单' || CASE WHEN t.external_ticket_no <> '' THEN ' ' || t.external_ticket_no ELSE '' END
-                || CASE tn.event_type
-                     WHEN 'closed' THEN ' 结案'
-                     WHEN 'reopened' THEN ' 重开'
-                     WHEN 'done' THEN ' 完成处理'
-                     WHEN 'dismissed' THEN ' 忽略'
-                     ELSE ' 处理进展'
-                   END
-                || CASE WHEN tn.body <> '' THEN '：' || tn.body ELSE '' END AS line
-            FROM ticket_notes tn
-            JOIN tickets t ON t.id = tn.ticket_id AND t.tenant_id = tn.tenant_id
-            WHERE t.tenant_id = r.tenant_id
-              AND t.source_type = 'content'
-              AND t.source_record_id = r.id
-          ) processing
-        ), '') AS processing_records,
+        ${processingRecordsSql('r')} AS processing_records,
         r.first_seen_at, r.last_seen_at, r.seen_count, r.created_at,
         COALESCE(rt.status, 'unhandled') AS triage_status,
         COALESCE(rt.priority, 'normal') AS triage_priority,
@@ -1473,7 +1498,7 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
       ${where}
       ORDER BY ${orderBySql(req.query.sort, req.query.dir)}
       LIMIT 5000
-    `, params);
+    `, params, { statementTimeoutMs: EXPORT_STATEMENT_TIMEOUT_MS });
 
     const rows = records.map(r => ({
       keyword: r.keyword,
@@ -1562,10 +1587,10 @@ router.get('/records/export', requireTenantAccess, async (req, res, next) => {
 
     await sendXlsx(res, { sheetName: '内容分诊', columns, rows, filename: `内容分诊_${fmtTs(new Date()).slice(0, 10)}.xlsx` });
   } catch (err) {
-    if (err.status && err.code) {
-      return res.status(err.status).json({ ok: false, error: err.code, message: err.message });
-    }
-    return next(err);
+    const failure = exportFailureResponse(err);
+    if (!failure) return next(err);
+    if (failure.retryAfterMs) res.set('Retry-After', String(Math.ceil(failure.retryAfterMs / 1000)));
+    return res.status(failure.status).json(failure.body);
   }
 });
 

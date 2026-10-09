@@ -45,6 +45,10 @@ test('triage reads isolate reporting capacity and transaction settings from ordi
     const scoped = await queryTriageOne(sessionSql);
     assert.deepEqual(scoped, {pid: baseline.pid, read_only: 'on', jit: 'off', statement_timeout: '10s', lock_timeout: '500ms'});
     assert.deepEqual(await queryOne(sessionSql), baseline, 'COMMIT restores all settings on the very same pooled connection');
+    // The export passes a longer statement limit; everything else about the read stays the same.
+    const longer = await queryTriageOne(sessionSql, [], {statementTimeoutMs: 30000});
+    assert.deepEqual(longer, {pid: baseline.pid, read_only: 'on', jit: 'off', statement_timeout: '30s', lock_timeout: '500ms'});
+    assert.deepEqual(await queryOne(sessionSql), baseline);
     assert.equal(getDbExecutionSnapshot().categories.reporting.active, 0);
   });
 
