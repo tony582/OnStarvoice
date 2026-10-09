@@ -771,25 +771,19 @@ export function captureTaskBusinessRootVisibilitySql(alias = 't') {
   )`;
 }
 
-export async function lockActiveCaptureAgentSession(
-  executor,
-  authenticatedAgent = {},
-) {
+// Returned by lockActiveCaptureAgentSession({wait: false}) while another
+// transaction holds this node's execution slot. Deliberately truthy: every
+// waiting caller keeps its `if (!currentAgent)` retirement check unchanged.
+export const CAPTURE_AGENT_SESSION_BUSY = Object.freeze({sessionBusy: true});
+
+function captureAgentSessionIdentity(authenticatedAgent = {}) {
   const tenantId = text(authenticatedAgent.tenant_id, 100);
   const agentId = text(authenticatedAgent.id, 100).toLowerCase();
   if (!tenantId || !UUID_PATTERN.test(agentId)) return null;
+  return {tenantId, agentId};
+}
 
-  // Authentication happens before the route transaction. Serialize with Agent
-  // retirement, then re-read the row so a request authenticated just before
-  // retirement cannot write after the retirement transaction has committed.
-  await lockCaptureAgentExecutionSlot(executor, tenantId, agentId);
-  const currentAgent = await executor.queryOne(`
-    SELECT id, tenant_id, status, auth_code_id, auth_binding_id, host_label,
-      last_heartbeat_at, last_liveness_at, last_full_heartbeat_at
-    FROM capture_agents
-    WHERE id = $1 AND tenant_id = $2
-    FOR UPDATE
-  `, [agentId, tenantId]);
+function activeCaptureAgentSessionOrNull(currentAgent, authenticatedAgent) {
   if (!currentAgent || currentAgent.status !== 'active') return null;
 
   // Also fence an in-flight request authenticated under an entitlement that
@@ -803,6 +797,82 @@ export async function lockActiveCaptureAgentSession(
     return null;
   }
   return currentAgent;
+}
+
+export async function lockActiveCaptureAgentSession(
+  executor,
+  authenticatedAgent = {},
+  {wait = true} = {},
+) {
+  const identity = captureAgentSessionIdentity(authenticatedAgent);
+  if (!identity) return null;
+  const {tenantId, agentId} = identity;
+
+  // Authentication happens before the route transaction. Serialize with Agent
+  // retirement, then re-read the row so a request authenticated just before
+  // retirement cannot write after the retirement transaction has committed.
+  if (wait) {
+    await lockCaptureAgentExecutionSlot(executor, tenantId, agentId);
+  } else if (
+    !(await tryLockCaptureAgentExecutionSlot(executor, tenantId, agentId))
+  ) {
+    // Nothing is read or written: the holder (usually this node's own full
+    // heartbeat) owns the row until it commits.
+    return CAPTURE_AGENT_SESSION_BUSY;
+  }
+  const currentAgent = await executor.queryOne(`
+    SELECT id, tenant_id, status, auth_code_id, auth_binding_id, host_label,
+      last_heartbeat_at, last_liveness_at, last_full_heartbeat_at
+    FROM capture_agents
+    WHERE id = $1 AND tenant_id = $2
+    FOR UPDATE
+  `, [agentId, tenantId]);
+  return activeCaptureAgentSessionOrNull(currentAgent, authenticatedAgent);
+}
+
+// The same entitlement fence on the committed row, without the execution slot
+// and without a row lock, so it never waits for the slot holder. Display-only:
+// no write may be decided on this answer.
+export async function readCommittedCaptureAgentSession(
+  executor,
+  authenticatedAgent = {},
+) {
+  const identity = captureAgentSessionIdentity(authenticatedAgent);
+  if (!identity) return null;
+  const currentAgent = await executor.queryOne(`
+    SELECT id, tenant_id, status, auth_code_id, auth_binding_id, host_label,
+      last_heartbeat_at, last_liveness_at, last_full_heartbeat_at
+    FROM capture_agents
+    WHERE id = $1 AND tenant_id = $2
+  `, [identity.agentId, identity.tenantId]);
+  return activeCaptureAgentSessionOrNull(currentAgent, authenticatedAgent);
+}
+
+// Agent channel failures that mean "try again shortly", never "the server is
+// broken": the execution gate refused the request (DbCapacityError), the
+// transaction hit lock_timeout (55P03) or statement_timeout (57014), or it was
+// the deadlock victim (40P01). The Extension retries any failed heartbeat with
+// its own backoff; a 503 with Retry-After says so instead of an unhandled 500.
+const CAPTURE_AGENT_CHANNEL_BUSY_CODES = new Set(['55P03', '57014', '40P01']);
+
+export function isCaptureAgentChannelBusyError(error) {
+  return isDbCapacityError(error) ||
+    CAPTURE_AGENT_CHANNEL_BUSY_CODES.has(String(error?.code || ''));
+}
+
+export function captureAgentChannelRetryAfterMs(error) {
+  return Math.max(250, Number(error?.retryAfterMs) || 1000);
+}
+
+export function sendCaptureAgentChannelBusy(res, error, message) {
+  const retryAfterMs = captureAgentChannelRetryAfterMs(error);
+  res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+  return res.status(503).json({
+    ok: false,
+    error: 'server_busy',
+    message,
+    retryAfterMs,
+  });
 }
 
 export function orchestrationCheckpointInteger(value) {
@@ -9068,10 +9138,28 @@ async function claimPriorityAgentControl(tx, {
 router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
   try {
     const result = await withTransaction(async tx => {
+      // Never wait for the execution slot. The Extension sends this ping and
+      // its full heartbeat from the same one-minute alarm, so the usual holder
+      // is this node's own heartbeat, which writes last_liveness_at itself
+      // when it commits; an operator or scheduler action holds the slot for a
+      // moment. Waiting only turned a healthy node's ping into a lock timeout.
       const currentAgent = await lockActiveCaptureAgentSession(
         tx,
         req.captureAgent,
+        {wait: false},
       );
+      if (currentAgent === CAPTURE_AGENT_SESSION_BUSY) {
+        const committedAgent = await readCommittedCaptureAgentSession(
+          tx,
+          req.captureAgent,
+        );
+        if (!committedAgent) return {agentInactive: true};
+        return {
+          agentInactive: false,
+          livenessRecorded: false,
+          fullHeartbeatAt: captureAgentFullHeartbeatAt(committedAgent),
+        };
+      }
       if (!currentAgent) return {agentInactive: true};
       await tx.execute(`
         UPDATE capture_agents
@@ -9080,6 +9168,7 @@ router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
       `, [req.captureAgent.id, req.captureAgent.tenant_id]);
       return {
         agentInactive: false,
+        livenessRecorded: true,
         fullHeartbeatAt: captureAgentFullHeartbeatAt(currentAgent),
       };
     }, {
@@ -9097,6 +9186,8 @@ router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
     }
     return res.json({
       ok: true,
+      // false: the slot holder records this node's liveness when it commits.
+      livenessRecorded: result.livenessRecorded,
       agent: {
         id: req.captureAgent.id,
         livenessAt: new Date().toISOString(),
@@ -9105,15 +9196,8 @@ router.post('/agent/liveness', requireCaptureAgent, async (req, res, next) => {
       },
     });
   } catch (err) {
-    if (isDbCapacityError(err)) {
-      const retryAfterMs = Math.max(250, Number(err.retryAfterMs) || 1000);
-      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
-      return res.status(503).json({
-        ok: false,
-        error: 'server_busy',
-        message: '关键心跳通道繁忙，请稍后重试',
-        retryAfterMs,
-      });
+    if (isCaptureAgentChannelBusyError(err)) {
+      return sendCaptureAgentChannelBusy(res, err, '关键心跳通道繁忙，请稍后重试');
     }
     return next(err);
   }
@@ -9558,15 +9642,8 @@ router.post('/agent/heartbeat', requireCaptureAgent, async (req, res, next) => {
         : {}),
     });
   } catch (err) {
-    if (isDbCapacityError(err)) {
-      const retryAfterMs = Math.max(250, Number(err.retryAfterMs) || 1000);
-      res.set('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
-      return res.status(503).json({
-        ok: false,
-        error: 'server_busy',
-        message: '心跳对账通道繁忙，请稍后重试',
-        retryAfterMs,
-      });
+    if (isCaptureAgentChannelBusyError(err)) {
+      return sendCaptureAgentChannelBusy(res, err, '心跳对账通道繁忙，请稍后重试');
     }
     return next(err);
   }
