@@ -78,6 +78,26 @@ import {
   projectNegativePatrolAdmission,
   projectCaptureResourceAdmission,
 } from '../services/capture-resource-policy.js';
+import {
+  AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES,
+  CROSS_DEVICE_RETRY_ITEM_STATUSES,
+  CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES,
+  CROSS_DEVICE_RETRY_SOURCE_STATUSES,
+  CROSS_DEVICE_RETRY_TASK_TYPES,
+  CROSS_DEVICE_RETRY_UNSTARTED_ITEM_STATUSES,
+  DISMISSIBLE_ATTENTION_STATUSES,
+  RECOVERABLE_STATUSES,
+  REMOTELY_STOPPABLE_STATUSES,
+  STOP_FINAL_STATUSES,
+} from '../modules/capture/domain/task-status.js';
+import {
+  CROSS_DEVICE_RETRY_PERMANENT_CODES,
+  ELASTIC_AGENT_CAPACITY_CODES,
+  ELASTIC_BOOTSTRAP_CONGESTION_CODES,
+  ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES,
+  ELASTIC_STALE_TASK_CODES,
+  EXPLICIT_USER_CANCELLATION_CODES,
+} from '../modules/capture/domain/attempt-codes.js';
 import {registerOrchestrationParentProjector} from '../services/android-control/parent-refresh.js';
 import {
   STOP_FENCE_CHECK_CAPABILITY,
@@ -190,67 +210,8 @@ const CAPTURE_OVERVIEW_PROJECTION_BUDGET_MS = 8_000;
 const CAPTURE_OVERVIEW_SLOW_PROJECTION_MS = 2_000;
 const reportCaptureOverviewRead = createRateLimitedReporter({intervalMs: 10_000});
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-const RECOVERABLE_STATUSES = new Set([
-  'interrupted',
-  'needs_action',
-  'failed',
-  'completed_with_failures',
-]);
-const REMOTELY_STOPPABLE_STATUSES = new Set([
-  'pending',
-  'assigned',
-  'dispatch_pending',
-  'dispatched',
-  'waiting_device',
-  'claimed',
-  'running',
-  'recovering',
-  'interrupted',
-  'resume_requested',
-  'needs_action',
-  'failed',
-  'completed_with_failures',
-]);
-const STOP_FINAL_STATUSES = new Set([
-  'completed',
-  'completed_with_warnings',
-  'canceled',
-  'skipped',
-  'superseded',
-]);
-const DISMISSIBLE_ATTENTION_STATUSES = new Set([
-  'failed',
-  'completed_with_failures',
-]);
-const CROSS_DEVICE_RETRY_SOURCE_STATUSES = new Set([
-  'needs_action',
-  'failed',
-  'completed_with_failures',
-]);
-const AUTOMATIC_CROSS_DEVICE_FOLLOWUP_STATUSES = new Set([
-  'pending',
-  'running',
-]);
-const CROSS_DEVICE_RETRY_ITEM_STATUSES = new Set([
-  'pending',
-  'assigned',
-  'dispatch_pending',
-  'dispatched',
-  'waiting_device',
-  'retryable',
-  'needs_action',
-  'failed',
-]);
-const CROSS_DEVICE_RETRY_SOURCE_FINAL_STATUSES = new Set([
-  'completed',
-  'completed_with_warnings',
-  'completed_with_failures',
-  'failed',
-  'canceled',
-  'skipped',
-  'superseded',
-  'needs_action',
-]);
+// Status vocabulary lives in modules/capture/domain/task-status.js (imported
+// above) so the whole state table can be read in one place.
 
 function pruneCaptureOverviewProjectionCache(nowMs) {
   for (const [key, entry] of captureOverviewProjectionCache) {
@@ -396,18 +357,6 @@ const CROSS_DEVICE_RETRY_SAFETY_CODES = new Set(
 const AUTOMATIC_SEARCH_SAFETY_HANDOFF_CODES = new Set(
   CAPTURE_SAFETY_HANDOFF_SEARCH_CODES,
 );
-const ELASTIC_AGENT_CAPACITY_CODES = new Set([
-  'CAPTURE_TASK_GROUP_BUSY',
-  'CAPTURE_TASK_CLEANUP_PENDING',
-  'CAPTURE_TASK_DEBUG_BUSY',
-  'CAPTURE_TASK_DEBUG_PREFLIGHT_UNAVAILABLE',
-  'CAPTURE_TASK_DEBUG_PREFLIGHT_FAILED',
-  'CAPTURE_TASK_DEBUG_STARVOICE_ACTIVE',
-  'CAPTURE_TASK_EXTERNAL_DEBUGGER_BUSY',
-  'CAPTURE_TASK_DEBUG_OWNERSHIP_UNKNOWN',
-  'CAPTURE_LOCK_CONFLICT',
-]);
-
 function captureTaskResourcePolicy(task = {}) {
   const metadata = safeJson(task.metadata || task.parent_metadata);
   return normalizeCaptureResourcePolicy(
@@ -649,61 +598,6 @@ function dutyRecoveryGlobalActionsEnabled(env = process.env) {
     text(env.OPS_CONTROL_RECOVERY_ACTIONS_GLOBAL_ENABLED, 20).toLowerCase(),
   );
 }
-const ELASTIC_NON_CHARGEABLE_ATTEMPT_CODES = new Set([
-  ...ELASTIC_AGENT_CAPACITY_CODES,
-  'CREATE_COMMAND_EXPIRED',
-  'CREATE_AGENT_UNAVAILABLE',
-  'UNATTENDED_BEGIN_FENCE_CHANGED',
-  'STALE_UNATTENDED_ATTEMPT',
-  'UNATTENDED_ATTEMPT_REPLACED',
-  'UNATTENDED_STATUS_REPORT_TIMEOUT',
-  'UNATTENDED_STATUS_REPORT_REJECTED',
-  'UNATTENDED_RUNTIME_MESSAGE_TIMEOUT',
-  'UNATTENDED_REQUEST_NOT_FOUND',
-  'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
-]);
-const ELASTIC_BOOTSTRAP_CONGESTION_CODES = new Set([
-  'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
-  'UNATTENDED_STATUS_REPORT_TIMEOUT',
-  'UNATTENDED_RUNTIME_MESSAGE_TIMEOUT',
-]);
-const ELASTIC_STALE_TASK_CODES = new Set([
-  'ELASTIC_TASK_HEARTBEAT_TIMEOUT',
-  'ELASTIC_AGENT_OFFLINE_TIMEOUT',
-  'NEGATIVE_PATROL_START_TIMEOUT',
-]);
-const CROSS_DEVICE_RETRY_TASK_TYPES = new Set([
-  'unattended_keyword_capture',
-  'negative_post_patrol',
-  'watched_content_patrol',
-  'official_account_comment_patrol',
-  'followed_creator_post_patrol',
-  'official_account_post_discovery',
-]);
-const CROSS_DEVICE_RETRY_UNSTARTED_ITEM_STATUSES = new Set([
-  'pending',
-  'assigned',
-  'dispatch_pending',
-  'dispatched',
-  'waiting_device',
-]);
-const CROSS_DEVICE_RETRY_PERMANENT_CODES = new Set([
-  'CONTENT_UNAVAILABLE',
-  'INVALID_RECORD',
-  'LINK_MISSING',
-  'IDENTITY_MISMATCH',
-  'DOUYIN_DETAIL_ID_MISMATCH',
-  'DOUYIN_COMMENT_ID_MISMATCH',
-  'DOUYIN_COMMENT_ID_CONFLICT',
-  'CANCELED',
-  'DETAIL_CAPTURE_CANCELED',
-  'USER_CANCELED',
-]);
-const EXPLICIT_USER_CANCELLATION_CODES = new Set([
-  'USER_CANCELED',
-  'USER_CANCELLED',
-  'USER_CANCEL_REQUESTED',
-]);
 const CROSS_DEVICE_RETRY_MESSAGES = Object.freeze({
   retry_items_managed_by_elastic_dispatcher: [
     'retry_items_managed_by_elastic_dispatcher',

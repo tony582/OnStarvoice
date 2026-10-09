@@ -81,6 +81,10 @@ const captureCloudRouteSource = await readFile(
   new URL("../server/routes/capture-cloud.js", import.meta.url),
   "utf8",
 );
+const captureTaskStatusSource = await readFile(
+  new URL("../server/modules/capture/domain/task-status.js", import.meta.url),
+  "utf8",
+);
 const cronSource = await readFile(
   new URL("../server/cron.js", import.meta.url),
   "utf8",
@@ -4520,10 +4524,17 @@ test("ended failures can be dismissed from attention without deleting task histo
     "router.post('/tasks/:id/resume'",
   );
 
+  // The status vocabulary lives in the capture domain state table; the route
+  // must import it from there rather than redefine it.
+  assert.match(
+    captureTaskStatusSource,
+    /export const DISMISSIBLE_ATTENTION_STATUSES = new Set\(\[[\s\S]*'failed'[\s\S]*'completed_with_failures'/u,
+  );
   assert.match(
     captureCloudRouteSource,
-    /const DISMISSIBLE_ATTENTION_STATUSES = new Set\(\[[\s\S]*'failed'[\s\S]*'completed_with_failures'/u,
+    /DISMISSIBLE_ATTENTION_STATUSES,[\s\S]*from '\.\.\/modules\/capture\/domain\/task-status\.js'/u,
   );
+  assert.doesNotMatch(captureCloudRouteSource, /const DISMISSIBLE_ATTENTION_STATUSES =/u);
   assert.match(single, /parent_task_id/u);
   assert.match(single, /DISMISSIBLE_ATTENTION_STATUSES\.has\(task\.status\)/u);
   assert.match(single, /attention_dismissed_at = now\(\)/u);
