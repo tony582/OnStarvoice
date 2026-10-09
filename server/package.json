@@ -4,6 +4,9 @@
   "description": "StarVoice 星语舆情监控后端服务",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "test": "bash ../scripts/check-extension-snapshot.zsh && node ../scripts/run-node-regression-tests.mjs",
     "test:integration": "node ../scripts/run-postgres-integration-tests.mjs",

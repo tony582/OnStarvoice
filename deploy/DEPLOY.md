@@ -434,6 +434,7 @@ ssh root@47.103.125.200 '
   `/opt/onstarvoice-private` 下就因 root 700 失败）。异地副本尚未配置，
   需要 OSS bucket 与密钥后在脚本末尾加一行 `ossutil cp`。恢复方法见脚本头部注释，
   永远先恢复到独立验证库。
+- **Node 运行时**：2026-10-09 由 `deploy/upgrade-node-24-20261009.sh` 从 18.20.8 升到 NodeSource `node_24.x`（同机四个 PM2 应用随 `pm2 update` 重启一次，约 10 秒）。回滚：`dpkg -i /opt/onstarvoice-private/rollback/node18/nodejs_18*.deb` 并恢复 `nodesource.list.node18`，再 `pm2 update`。`server/package.json` 声明 `engines.node >= 20`（nodemailer 10 的要求）。
 - **机器升级后的跟进**（2026-10-09 14:45 升到 2 vCPU / 4 GiB / 系统盘 50 GiB）：
   `deploy/ops-hardening-4gb-20261009.sh [IP] [--restart-postgres]` 负责把备份迁到数据盘并重跑、
   根分区在线扩到 50 GB、PostgreSQL 按 3.5 GiB 可用内存重算（`effective_cache_size=2GB`、

@@ -69,3 +69,9 @@
 - 根分区：growpart + resize2fs 在线扩容，40 GB → 49 GB（使用 53%）。
 - PostgreSQL：`effective_cache_size=2GB`、`work_mem=16MB`、`maintenance_work_mem=256MB`、`random_page_cost=1.1` reload 生效；14:58:33 重启后 `shared_buffers=768MB`，`pending_restart=false`。重启让 scheduler / ai-media 的角色锁会话断开，两者按设计立即退出并由 PM2 拉起（各 restarts=1），15:02 核对 advisory 锁 2 把、api 未重启、`/api/health/ready` 200、12 台 Agent 在线。
 - 脚本瑕疵：远端全部执行完后本机 ssh 没有退出（终端停在「3b」），手动中断即可；已给后台备份加 `setsid … < /dev/null`。
+
+## 跟进：Node 18 → 24 与 nodemailer 10（2026-10-09）
+
+- 线上 Node 18.20.8（NodeSource apt，2025-04 EOL）；Node 20 也已于 2026-04 EOL，目标定为 Node 24（与 `.nvmrc`、CI 一致）。同机 minilife（express 5 / pg / bcryptjs）与我们唯一的原生模块 `@resvg/resvg-js`（N-API 预编译）均兼容。
+- `deploy/upgrade-node-24-20261009.sh`：保存 PM2 列表 → 下载 18.20.8 的 .deb 与旧源文件到 `/opt/onstarvoice-private/rollback/node18/` → 源切 `node_24.x` 并安装 → resvg 自检 → `pm2 update`（四个应用重启一次）→ 等 readiness/角色锁/minilife → `pm2 save`。脚本被本机自动模式判为「生产部署」拦截，由用户执行。
+- 分支 `chore/node24-nodemailer10-20261009`（Node 24 上线后再合并部署，nodemailer 10 在 Node 18 上不能跑）：nodemailer 9.1.1 → 10.0.16（`npm audit --omit=dev` 归零）、`engines.node >= 20`、CI 的 Node 18 兼容任务与矩阵改为 Node 24。
