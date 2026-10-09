@@ -45,4 +45,11 @@
 
 ## 发布记录
 
-（待补：部署时间、三进程状态、登录页实测。）
+| 时间 | 事件 |
+|---|---|
+| 13:47–13:51 | 另一会话误用旧版 deploy.sh 覆盖线上磁盘（内存中的三进程未受影响），随后用新版脚本从 `c561758` 重建恢复，详见 `20261009-triage-export-timeout.md`。本分支因此变基到 `c561758`，回归 3287/3287 |
+| 13:55:16–13:55:46 | `bash deploy/deploy.sh 47.103.125.200`：清单预检 → 线上 27 键核对 → admin 构建 → rsync → `.env` 备份后覆盖 → 迁移无新项 → 按清单停三进程并重建 → readiness 200，退出 0 |
+| 13:56 | 三进程 online、restarts 0（PID 813667/813668/813669）；scheduler/ai-media 日志各持本角色锁（backendPid 813712/813711），`pg_locks` advisory 2；三进程错误日志为空；api 日志 `[REQ]` 行数 0；`/api/health/ready` 本机与公网 200；11 台 Agent 3 分钟内有心跳；切换窗口 nginx 6 个 5xx |
+| 13:56 | 线上 `web/admin/dist/index.html` 预加载 8 个块、不含 `vendor-charts`，共 49 个 JS 块；浏览器打开登录页正常 |
+
+服务器侧三项（备份 cron + 首轮备份、PM2 logrotate + 删 760 MB 旧日志、PG 参数）由用户执行 `bash deploy/ops-hardening-20261009.sh 47.103.125.200`，本机自动模式不放行远程写入。
