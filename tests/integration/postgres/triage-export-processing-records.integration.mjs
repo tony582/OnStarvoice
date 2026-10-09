@@ -18,8 +18,9 @@ const ExcelJS = require('exceljs');
 // 10 s reporting limit cancelled the statement. Migration 093 adds the two
 // indexes that serve both sides of that OR; the statement text is unchanged.
 const INDEXES = ['idx_audit_logs_tenant_target', 'idx_audit_logs_record_ids'];
-// Enough audit history that a sequential scan is the expensive choice.
-const FILLER_ROWS = 4000;
+// Enough audit history that a sequential scan is the expensive choice on every
+// supported PostgreSQL (CI runs 14 and 16; production is 14.24 with 16k rows).
+const FILLER_ROWS = 20000;
 
 test('the export composes processing records per row through the 093 indexes and keeps its own statement limit', async t => {
   validatePostgresIntegrationTarget({testDatabaseUrl: process.env.TEST_DATABASE_URL, databaseUrl: process.env.DATABASE_URL, requireDatabaseUrl: true});
@@ -100,7 +101,9 @@ test('the export composes processing records per row through the 093 indexes and
       END,
       '2026-01-01T00:00:00+08:00'::timestamptz + n * interval '1 minute'
     FROM generate_series(1, $2::integer) n`, [tenant, FILLER_ROWS]);
-  await query('ANALYZE audit_logs');
+  // Production built the 093 indexes in bulk; VACUUM folds the GIN pending list
+  // in and refreshes the statistics the planner costs the OR with.
+  await query('VACUUM ANALYZE audit_logs');
 
   function scans(node, found = []) {
     const indexes = new Set();
