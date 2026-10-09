@@ -94,3 +94,21 @@ al.target_id = r.id::text OR COALESCE(al.metadata->'recordIds','[]'::jsonb) ? r.
 - 直接原因：`deploy/deploy.sh` 无条件 `scp server/.env.production → /opt/onstarvoice/server/.env`，而本机那份自 07-28 起没有再同步过线上手工改动。此前几次发布走的是 Codex 的文件包发布器（不碰 `.env`），所以没有暴露。
 - 本机 `server/.env.production`（主工作区与本工作树两份）仍是旧内容；自动模式拒绝我把线上文件拉回本机（凭据落盘），**下一次再跑 `deploy.sh` 之前必须先用线上的 `/opt/onstarvoice/server/.env` 更新本机这份文件**，或者改 `deploy.sh`（发布前备份线上 `.env`、本机副本键数少于线上时拒绝覆盖）——后者是行为变更，留给用户决定。
 - 事故前后数据库没有任何数据变更；两个索引与迁移登记在事故前已完成。
+
+## 追加：导出里的小红书链接（2026-10-09 下午）
+
+用户问「导出文件里小红书的帖子链接为什么是空的」。`postUrl` 自 0.4.0（`ac90461`，08-31）起对小红书一律返回空：当时的结论是笔记链接携带的 `xsec_token` 短期、绑定采集账号，过期后打开报 300031，所以「不写进导出文件，只在后台经采集节点实时打开」。但 0.4.5 起后台列表的「原文」已经直接用存下来的带 token 链接（`validatedStoredXhsSourceUrl`：https 小红书域名、笔记 ID 与 `external_id` 一致、仍带 token），安吉星 18,007 条小红书内容里 18,006 条有这种链接、17,739 条可核验，所以后台能点、导出为空。用户选择「导出与后台原文一致」。
+
+- `887ff22`：`postUrl` 对小红书改为 `validatedStoredXhsSourceUrl(r.url, r.external_id)`，不可核验的仍为空，其它平台不变；注释改成新规则。测试：`tests/triage-export-post-url.test.mjs`（先行失败：函数未导出），集成测试里加一条带 token 的小红书记录核对「帖子链接」列。
+- 已知限制：这种链接和后台「原文」一样会随 token 过期失效（300031）。
+
+### 发布过程与第二次事故
+
+| 时间 | 操作 | 结果 |
+| --- | --- | --- |
+| 13:12 | （另一会话）发布拆分拓扑 `ce6ba02` | 生产变成 `onstarvoice-api` / `onstarvoice-scheduler` / `onstarvoice-ai-media` 三进程，`deploy.sh` 也换成按拓扑清单重建进程并核对 .env 键 |
+| 13:47:48–13:48:08 | 我从仍基于 `a719347` 的工作树跑了**旧版** `deploy.sh` | `rsync --delete` 把 `/opt/onstarvoice/server` 覆盖成拆分前的代码（新增的 `server/modules/capture/domain/*` 被删、`index.js`/entrypoints/runtime 回到旧版），后台静态换成旧 main 的构建；`pm2 start index.js --name onstarvoice` 起的单进程因 scheduler 角色锁被占而 errored（**没有出现双调度**），但被 `pm2 save` 存进了 dump。三个拆分进程仍在内存里跑新代码，公网未中断（nginx 在 13:47–13:51 共 8 个 502，来自两次重启） |
+| 13:50:51–13:51:19 | 变基到 `ce6ba02` 后用**新版** `deploy.sh` 重发 | 拓扑清单校验通过；线上 27 键均在本地副本；先备份线上 `.env`（`.env.before-deploy-20261009-135106`）；按清单停掉三个进程和 errored 的 `onstarvoice`，再按 `ecosystem.config.cjs` 起三进程（PID 812690/812691/812697，13:51:14），API 就绪 |
+| 13:52 | 核对 | `triage.js`、`capture-cloud.js`、`index.js`、`modules/capture/domain/task-status.js`、`ecosystem.config.cjs`、后台 `index.html` 哈希与 `887ff22` 一致；dump 只剩三进程；三进程错误日志为空；`main` 快进到 `887ff22` |
+
+教训：部署前必须 `git fetch` 并确认分支包含 `origin/main`，尤其是同一天有别的会话在发布时；`deploy.sh` 的行为以仓库当前版本为准，不能沿用旧工作树里的脚本。
