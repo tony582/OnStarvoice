@@ -39,3 +39,14 @@
 ## 发布
 
 见文末「上线记录」。
+
+## 上线记录（2026-10-09）
+
+| 时间 | 动作 | 结果 |
+|---|---|---|
+| 09:40 | 发现手机不在（用户手机留在家里），Runner 0.3.1 自 09:40 起 `device_missing`，空闲 | 换版不会打断任务；手机回来前今天手机轮次不会跑 |
+| 09:47 | 提交 `195fce9`（main）并推送；`git archive` 生成 `runtime-0.3.2-195fce9`（`release-source.sha`、沿用 `launcher.json`、ASCII 包装 `start.sh`） | 运行目录内 13/13 测试通过；全套 275/275 |
+| 09:48:24 | 0.3.1（PID 52965）SIGINT 受控停止 | 1 秒内退出，`deviceClosureRequired=false`、待上传 0；状态库备份 `backups/runner-0.3.1-4a98cec-before-0.3.2-195fce9-20261009.sqlite`（完整性 ok）；旧根 `/tmp/starvoice-android-device-locks` 退出后为空目录，已删除 |
+| 09:48:38 | 桌面端终端页签 `bash …/runtime-0.3.2-195fce9/launcher/start.sh` 启动 0.3.2 | PID 56133；`controlError=null`；锁已建在 `/Users/Shared/StarVoice/android-device-locks/<hash>.lock/owner.json`；状态 `device_missing`（手机不在，符合预期） |
+
+待手机插回：探测应自动变为就绪并领取下一轮；0.3.1 的内存重启和本次的解析上下文都在真机上等第一次触发核对。
