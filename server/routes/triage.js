@@ -20,6 +20,7 @@ import {
 } from '../services/record-lifecycle.js';
 import {
   redactXhsRecordNavigation,
+  validatedStoredXhsSourceUrl,
 } from '../services/xhs-source-open.js';
 
 import {
@@ -119,15 +120,17 @@ function platformUserId(authorId, profileUrl, accountNo, payloadNo) {
   return ''; // 没有真号 → 空,不显示假ID
 }
 
-// 小红书 xsec 属于短期、Profile 绑定的导航上下文，禁止写入导出文件或
-// 管理端响应。小红书原文只能在管理端通过 Agent 实时刷新后打开。
+// 小红书 xsec 属于短期、Profile 绑定的导航上下文：0.4 起导出不写小红书链接。
+// 2026-10-09 用户决定导出与后台「原文」保持一致：只输出能核验的已存链接
+// （https 小红书域名、笔记 ID 与 external_id 一致、仍带 xsec_token），其余留空；
+// 这种链接过期后会报 300031，和后台里的「原文」是同一条。
 function isNoteUrl(u) {
   const s = String(u || '');
   if (/\/user\/profile\/|\/user\//.test(s)) return false; // 主页不是帖子
   return /\/explore\/|\/discovery\/item\/|\/note\/|\/video\/|weibo\.com\/detail\/|m\.weibo\.cn\/|\/search_result\//.test(s);
 }
-function postUrl(r) {
-  if (r.platform === 'xiaohongshu') return '';
+export function postUrl(r) {
+  if (r.platform === 'xiaohongshu') return validatedStoredXhsSourceUrl(r.url, r.external_id);
   if (isNoteUrl(r.url)) return r.url;
   const id = String(r.external_id || '').trim();
   if (!id) return r.url || '';

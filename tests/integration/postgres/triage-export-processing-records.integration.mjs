@@ -67,7 +67,7 @@ test('the export composes processing records per row through the 093 indexes and
 
   // Five records; published_ts descends in this order so the export (sort=publish desc) lists them A..E.
   const ids = {};
-  const names = ['single-and-note', 'batch-and-ticket', 'batch-only', 'no-progress', 'status-change-without-note'];
+  const names = ['single-and-note', 'batch-and-ticket', 'batch-only', 'no-progress', 'status-change-without-note', 'xhs-with-token'];
   for (const [index, name] of names.entries()) {
     ids[name] = randomUUID();
     await query(`INSERT INTO records(id,tenant_id,platform,external_id,title,record_type,created_at,first_seen_at,last_seen_at,published_ts,business_visibility,ai_result)
@@ -75,6 +75,11 @@ test('the export composes processing records per row through the 093 indexes and
     [ids[name], tenant, name, new Date(Date.parse('2026-09-08T12:00:00+08:00') - index * 3600_000).toISOString()]);
     await query("INSERT INTO record_triage(tenant_id,record_id,status) VALUES($1,$2,'reviewed')", [tenant, ids[name]]);
   }
+  // A Xiaohongshu record whose stored search link still carries its xsec_token: the export
+  // writes that link out exactly as the admin's 原文 does (2026-10-09 decision).
+  const XHS_NOTE_ID = '6a43d5260000000008032d64';
+  const XHS_TOKEN_URL = `https://www.xiaohongshu.com/search_result/${XHS_NOTE_ID}?xsec_token=ABCdef123%3D&xsec_source=pc_search`;
+  await query("UPDATE records SET platform='xiaohongshu', external_id=$3, url=$4 WHERE tenant_id=$1 AND id=$2", [tenant, ids['xhs-with-token'], XHS_NOTE_ID, XHS_TOKEN_URL]);
   async function audit(action, targetId, metadata, at, {tenantId = tenant, actorUserId = null, actorId = 'ops'} = {}) {
     await query(`INSERT INTO audit_logs(tenant_id,actor_type,actor_id,actor_user_id,action,target_type,target_id,metadata,created_at)
       VALUES($1,'user',$2,$3,$4,'record',$5,$6::jsonb,$7)`, [tenantId, actorId, actorUserId, action, targetId, JSON.stringify(metadata), at]);
@@ -140,10 +145,14 @@ test('the export composes processing records per row through the 093 indexes and
     await workbook.xlsx.load(Buffer.from(await exported.arrayBuffer()));
     const sheet = workbook.worksheets[0];
     const header = sheet.getRow(1).values;
-    const titleColumn = header.indexOf('标题'), processingColumn = header.indexOf('处理记录');
-    assert.ok(titleColumn > 0 && processingColumn > 0, JSON.stringify(header));
-    const byTitle = {};
-    sheet.eachRow((row, number) => { if (number > 1) byTitle[row.getCell(titleColumn).text] = row.getCell(processingColumn).text; });
+    const titleColumn = header.indexOf('标题'), processingColumn = header.indexOf('处理记录'), linkColumn = header.indexOf('帖子链接');
+    assert.ok(titleColumn > 0 && processingColumn > 0 && linkColumn > 0, JSON.stringify(header));
+    const byTitle = {}, linkByTitle = {};
+    sheet.eachRow((row, number) => {
+      if (number === 1) return;
+      byTitle[row.getCell(titleColumn).text] = row.getCell(processingColumn).text;
+      linkByTitle[row.getCell(titleColumn).text] = row.getCell(linkColumn).text;
+    });
     assert.deepEqual(Object.keys(byTitle), names, 'sorted by publish time, newest first');
     assert.deepEqual(byTitle, {
       'single-and-note': '2026-09-08 09:30 张三 内容备注：客户已回电\n2026-09-09 10:00 导出测试员 状态备注：复核完成',
@@ -151,7 +160,10 @@ test('the export composes processing records per row through the 093 indexes and
       'batch-only': '2026-09-09 12:00 ops 状态备注：批量转飞书',
       'no-progress': '',
       'status-change-without-note': '',
+      'xhs-with-token': '',
     });
+    assert.equal(linkByTitle['xhs-with-token'], XHS_TOKEN_URL, 'the verifiable Xiaohongshu link is exported like the admin 原文');
+    assert.equal(linkByTitle['no-progress'], 'https://www.douyin.com/video/no-progress', 'Douyin keeps its id-based link');
     statementTimeouts.length = 0;
     const list = await fetch(`${base}/api/triage/records?${new URLSearchParams({pageSize: '5'})}`, {headers});
     assert.equal(list.status, 200);
