@@ -130,12 +130,20 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
     next();
   });
 
-  app.use((req, res, next) => {
-    if (req.path.startsWith('/api/')) {
-      logger?.log?.(`[REQ] ${req.method} ${req.path} body-keys: ${Object.keys(req.body || {}).join(',')}`);
-    }
-    next();
-  });
+  // Per-request logging is a development aid. In production it wrote ~100
+  // lines/minute (every Agent heartbeat and liveness ping) and grew the PM2
+  // out log to 760 MB with no rotation; nginx's access log already records
+  // every request. Opt back in with LOG_REQUESTS=1.
+  const logRequests = process.env.LOG_REQUESTS === '1'
+    || (process.env.LOG_REQUESTS === undefined && process.env.NODE_ENV !== 'production');
+  if (logRequests) {
+    app.use((req, res, next) => {
+      if (req.path.startsWith('/api/')) {
+        logger?.log?.(`[REQ] ${req.method} ${req.path} body-keys: ${Object.keys(req.body || {}).join(',')}`);
+      }
+      next();
+    });
+  }
 
   app.use('/admin', express.static(join(__dirname, '..', 'web', 'admin', 'dist')));
   app.use('/dashboard', express.static(join(__dirname, '..', 'web', 'dashboard', 'dist')));
