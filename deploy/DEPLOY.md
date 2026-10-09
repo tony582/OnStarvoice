@@ -420,7 +420,38 @@ ssh root@47.103.125.200 '
 回到 split：把 `deploy/process-topology.production.json` 保持为 split 并重新跑
 `deploy/deploy.sh`，脚本会删掉 `onstarvoice` 单进程再按清单重建。
 
-## 9. 禁止事项
+## 9. 备份、日志轮转与数据库参数（2026-10-09 起）
+
+由 `deploy/ops-hardening-20261009.sh [服务器IP]` 一次性安装，可重复执行：
+
+- **每日数据库备份**：`/etc/cron.d/onstarvoice-pg-backup` 每天 02:30 以 root 运行
+  `/opt/onstarvoice-private/backups/pg-nightly-backup.sh`（源码在
+  `deploy/backup/`）。产物在 `/opt/onstarvoice-private/backups/db/`：
+  `onstarvoice-<时间戳>.dump`（pg_dump 自定义格式）+ `.toc` 清单；每次用
+  `pg_restore --list` 校验；最新 2 份永远保留，其余超过 3 天删除；磁盘剩余不足
+  2.5 GB 时拒绝备份并记日志。日志 `backup.log`、`cron.log`。异地副本尚未配置，
+  需要 OSS bucket 与密钥后在脚本末尾加一行 `ossutil cp`。恢复方法见脚本头部注释，
+  永远先恢复到独立验证库。
+- **PM2 日志轮转**：`/etc/logrotate.d/pm2-onstarvoice`（源码 `deploy/logrotate-pm2.conf`）
+  对 `/root/.pm2/logs/*.log` 每天或超过 50 MB 轮转、保留 14 份、压缩、
+  `copytruncate`。不装 pm2-logrotate 模块，省一个常驻进程。旧单进程攒下的
+  760 MB `onstarvoice-out.log` 已删除，`onstarvoice-error.log` 压缩保留。
+- **请求日志**：生产默认不再逐请求打印 `[REQ]`（之前每分钟约 100 行，全是 Agent
+  心跳）；排障时在 `.env` 加 `LOG_REQUESTS=1` 并重启 api 进程即可临时打开。
+  nginx access log 仍记录每个请求。
+- **PostgreSQL 规划器参数**（`ALTER SYSTEM`，写入 `postgresql.auto.conf`，reload 生效）：
+  `effective_cache_size=768MB`（原 5 GB，机器总共 1.6 GB）、`random_page_cost=1.1`
+  （原 4，云盘按 SSD 算）、`work_mem=8MB`（原 4 MB）。`shared_buffers` 未动（需重启）。
+
+检查命令：
+
+```bash
+ssh root@47.103.125.200 'tail -3 /opt/onstarvoice-private/backups/db/backup.log; ls -la /opt/onstarvoice-private/backups/db | tail -4'
+ssh root@47.103.125.200 'logrotate -d /etc/logrotate.d/pm2-onstarvoice 2>&1 | grep -E "rotating|log needs|does not need" | head'
+ssh root@47.103.125.200 "sudo -u postgres psql -Atc \"select name||'='||setting||coalesce(unit,'') from pg_settings where name in ('effective_cache_size','random_page_cost','work_mem')\""
+```
+
+## 10. 禁止事项
 
 - 不在没有备份时执行 reset 迁移、批量删除或租户覆盖。
 - 不使用 `git reset --hard`、直接覆盖 `.env` 或删除持久化媒体来“修复”
