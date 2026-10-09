@@ -426,12 +426,20 @@ ssh root@47.103.125.200 '
 
 - **每日数据库备份**：`/etc/cron.d/onstarvoice-pg-backup` 每天 02:30 以 root 运行
   `/opt/onstarvoice-private/backups/pg-nightly-backup.sh`（源码在
-  `deploy/backup/`）。产物在 `/opt/onstarvoice-private/backups/db/`：
+  `deploy/backup/`）。产物在 100 GB 数据盘 `/data/backups/postgres/`：
   `onstarvoice-<时间戳>.dump`（pg_dump 自定义格式）+ `.toc` 清单；每次用
-  `pg_restore --list` 校验；最新 2 份永远保留，其余超过 3 天删除；磁盘剩余不足
-  2.5 GB 时拒绝备份并记日志。日志 `backup.log`、`cron.log`。异地副本尚未配置，
+  `pg_restore --list` 校验；最新 2 份永远保留，其余超过 14 天删除；磁盘剩余不足
+  2.5 GB 时拒绝备份并记日志。日志 `backup.log`、`cron.log`。pg_dump 以 postgres
+  身份写文件，目录的每级父目录都必须对 postgres 可进入（10-09 首轮放在
+  `/opt/onstarvoice-private` 下就因 root 700 失败）。异地副本尚未配置，
   需要 OSS bucket 与密钥后在脚本末尾加一行 `ossutil cp`。恢复方法见脚本头部注释，
   永远先恢复到独立验证库。
+- **机器升级后的跟进**（2026-10-09 14:45 升到 2 vCPU / 4 GiB / 系统盘 50 GiB）：
+  `deploy/ops-hardening-4gb-20261009.sh [IP] [--restart-postgres]` 负责把备份迁到数据盘并重跑、
+  根分区在线扩到 50 GB、PostgreSQL 按 3.5 GiB 可用内存重算（`effective_cache_size=2GB`、
+  `work_mem=16MB`、`maintenance_work_mem=256MB`、`shared_buffers=768MB`）；`shared_buffers`
+  要重启 PostgreSQL 才生效，带 `--restart-postgres` 时脚本会在首轮备份结束后重启并等两个
+  worker 重新拿到角色锁。
 - **PM2 日志轮转**：`/etc/logrotate.d/pm2-onstarvoice`（源码 `deploy/logrotate-pm2.conf`）
   对 `/root/.pm2/logs/*.log` 每天或超过 50 MB 轮转、保留 14 份、压缩、
   `copytruncate`。不装 pm2-logrotate 模块，省一个常驻进程。旧单进程攒下的
@@ -446,7 +454,7 @@ ssh root@47.103.125.200 '
 检查命令：
 
 ```bash
-ssh root@47.103.125.200 'tail -3 /opt/onstarvoice-private/backups/db/backup.log; ls -la /opt/onstarvoice-private/backups/db | tail -4'
+ssh root@47.103.125.200 'tail -3 /data/backups/postgres/backup.log; ls -la /data/backups/postgres | tail -4'
 ssh root@47.103.125.200 'logrotate -d /etc/logrotate.d/pm2-onstarvoice 2>&1 | grep -E "rotating|log needs|does not need" | head'
 ssh root@47.103.125.200 "sudo -u postgres psql -Atc \"select name||'='||setting||coalesce(unit,'') from pg_settings where name in ('effective_cache_size','random_page_cost','work_mem')\""
 ```

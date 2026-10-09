@@ -55,3 +55,10 @@
 | 14:29:23–14:29:55 | 第二次发布（main `063eb00`）：api 内存上限 350→400M 生效，并带上另一会话的存活上报锁超时 hotfix `687d1fd`；14:42 观察 api 零 Unhandled/55P03、Agent 通道 299 次请求全部 200、整站零 5xx |
 
 服务器侧三项（备份 cron + 首轮备份、PM2 logrotate + 删 760 MB 旧日志、PG 参数）由用户执行 `bash deploy/ops-hardening-20261009.sh 47.103.125.200`，本机自动模式不放行远程写入。
+
+## 跟进：机器升级到 4 GiB（2026-10-09 14:45）
+
+- 用户把轻量服务器升到 2 vCPU / 4 GiB / 系统盘 50 GiB，14:45:39 重启；三进程由 pm2 开机自启全部恢复（restarts 0），`/api/health/ready` 200，角色锁 2 把，12 台 Agent 在线。
+- 用户已运行 `ops-hardening-20261009.sh`：cron、logrotate、PG 三参数（768MB / 1.1 / 8MB）均已落地，760 MB 旧日志已删。但**首轮备份失败**：`/opt/onstarvoice-private` 为 root 700，postgres 进不去 → `pg_dump: could not open output file … Permission denied`。
+- 修正：备份默认改到数据盘 `/data/backups/postgres`（父目录 755，44 GB 空闲），保留 14 天；脚本启动时检查 postgres 可写、pg_dump 的 stderr 进日志。`deploy/ops-hardening-4gb-20261009.sh` 负责重装并立刻重跑首轮、把根分区从 40 GB 扩到 50 GB、PG 参数按 3.5 GiB 重算（`shared_buffers=768MB` 需重启，`--restart-postgres` 可选）。
+- PM2 内存上限随 4 GiB 放回 api 400M / scheduler 300M / ai-media 400M（下次部署生效）。

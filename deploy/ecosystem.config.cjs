@@ -37,11 +37,13 @@ const ENTRYPOINTS = Object.freeze({
 // (exceljs builds the workbook in memory) took it from 63 MB to 319 MB on
 // 2026-10-09 14:18 before dropping back, so 350M would have restarted it
 // mid-export on a larger tenant.
+// 2026-10-09 14:45 the host was upgraded to 2 vCPU / 4 GiB; the worker caps
+// go back to comfortable values (they idle at 60-110 MB).
 const MAX_MEMORY_RESTART = Object.freeze({
   all: '400M',
   api: '400M',
-  scheduler: '260M',
-  'ai-media': '300M',
+  scheduler: '300M',
+  'ai-media': '400M',
 });
 
 // Graceful drain budget is PROCESS_SHUTDOWN_TIMEOUT_MS (default 30s) plus the
