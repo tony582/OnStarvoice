@@ -83,4 +83,5 @@
 - **影响**：15:45:22–15:48:2x 全站不可用约 3 分钟，nginx 记录 132 个 502（含 minilife）；无数据影响。
 - **恢复**（15:48:19–15:48:28）：`pm2 kill` 清掉空守护进程 → `systemctl start pm2-root`（`pm2 resurrect`，dump 是 ExecStop 前一刻写的、含四个应用）→ 四个应用在 Node 24.21.0 上 online、restarts 0，`/api/health/ready` 200、minilife 200、公网 200、角色锁 2、15:49 起零 5xx。随后 `pm2 save`，`pm2-root` enabled。
 - **修正**：脚本第 4 步改为 `systemctl stop pm2-root` → `systemctl start pm2-root`，等待失败时打印 pm2 状态并以非零退出；头部注释写明教训。以后凡是 systemd 托管的 pm2，一律不用 `pm2 update`。
+- 15:50:52–15:51:21 `deploy/deploy.sh` 发布 main `d5f4ded`（nodemailer 10.0.16、engines ≥ 20、worker 内存上限 300/400M）：服务器 `npm install` changed 1 package、0 vulnerabilities；三进程在 Node 24.21.0 上重建（切换窗口 4 个 502）。15:52 核对：四个应用 node=24.21.0、restarts 0、错误日志 0 行、无 DeprecationWarning；api/minilife/公网探针 200；角色锁 2；12 台 Agent 在线；`pm2-root` active+enabled；内存可用 1.8 GiB。
 - 验证通过后合并 `chore/node24-nodemailer10-20261009`（nodemailer 10.0.16、engines ≥ 20、CI 改 Node 24）并以 deploy.sh 发布。
