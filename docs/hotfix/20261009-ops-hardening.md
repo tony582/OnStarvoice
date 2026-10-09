@@ -75,3 +75,12 @@
 - 线上 Node 18.20.8（NodeSource apt，2025-04 EOL）；Node 20 也已于 2026-04 EOL，目标定为 Node 24（与 `.nvmrc`、CI 一致）。同机 minilife（express 5 / pg / bcryptjs）与我们唯一的原生模块 `@resvg/resvg-js`（N-API 预编译）均兼容。
 - `deploy/upgrade-node-24-20261009.sh`：保存 PM2 列表 → 下载 18.20.8 的 .deb 与旧源文件到 `/opt/onstarvoice-private/rollback/node18/` → 源切 `node_24.x` 并安装 → resvg 自检 → `pm2 update`（四个应用重启一次）→ 等 readiness/角色锁/minilife → `pm2 save`。脚本被本机自动模式判为「生产部署」拦截，由用户执行。
 - 分支 `chore/node24-nodemailer10-20261009`（Node 24 上线后再合并部署，nodemailer 10 在 Node 18 上不能跑）：nodemailer 9.1.1 → 10.0.16（`npm audit --omit=dev` 归零）、`engines.node >= 20`、CI 的 Node 18 兼容任务与矩阵改为 Node 24。
+
+### Node 24 升级执行记录与事故（2026-10-09 15:44–15:48）
+
+- 15:44 用户运行 `upgrade-node-24-20261009.sh`：回滚材料落盘（`nodejs_18.20.8-1nodesource1_amd64.deb` + 旧源文件）、源切 `node_24.x`、安装 Node **24.21.0** / npm 11.19.0、resvg 自检通过。
+- **事故**：第 4 步用 `pm2 update` 换守护进程。这台机器的 pm2 由 systemd 单元 `pm2-root` 管理（`Type=forking`，`ExecStop=pm2 kill`）；15:45:21 pm2 update 杀掉旧守护进程并拉起新进程、恢复应用，15:45:22 systemd 发现主 PID 退出即执行 ExecStop，把新守护进程连同刚恢复的四个应用一起杀掉（pm2.log：`pm2 has been killed by signal, dumping process list before exit`）。此后无任何应用在跑，脚本的 90 秒等待静默超时，第 5 步 `pm2 jlist` 又拉起一个空守护进程并因输出混入提示文本而 JSON 解析失败退出。
+- **影响**：15:45:22–15:48:2x 全站不可用约 3 分钟，nginx 记录 132 个 502（含 minilife）；无数据影响。
+- **恢复**（15:48:19–15:48:28）：`pm2 kill` 清掉空守护进程 → `systemctl start pm2-root`（`pm2 resurrect`，dump 是 ExecStop 前一刻写的、含四个应用）→ 四个应用在 Node 24.21.0 上 online、restarts 0，`/api/health/ready` 200、minilife 200、公网 200、角色锁 2、15:49 起零 5xx。随后 `pm2 save`，`pm2-root` enabled。
+- **修正**：脚本第 4 步改为 `systemctl stop pm2-root` → `systemctl start pm2-root`，等待失败时打印 pm2 状态并以非零退出；头部注释写明教训。以后凡是 systemd 托管的 pm2，一律不用 `pm2 update`。
+- 验证通过后合并 `chore/node24-nodemailer10-20261009`（nodemailer 10.0.16、engines ≥ 20、CI 改 Node 24）并以 deploy.sh 发布。
