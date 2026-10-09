@@ -71,6 +71,7 @@ al.target_id = r.id::text OR COALESCE(al.metadata->'recordIds','[]'::jsonb) ? r.
 | PostgreSQL 集成（新测试 + record-triage-query + triage-handled-date + content-topic + record-relevance-filter + record-triage-admission + migrations） | 16 / 16 |
 | 后台 `tsc -b`、`vite build` | 通过 |
 | 后台 lint 基线 | 263 ≤ 288，但 `CustomerMonthlyReport.tsx` 2 处超出单文件上限，是 10-08 月报提交带入的，与本分支无关 |
+| CI（`fix/**` 不触发，推了镜像分支 `codex/fix-triage-export-and-header-filters-20261009`，运行 37881305993） | PostgreSQL 14 / Node 24、PostgreSQL 16 / Node 18、PostgreSQL 16 / Node 24 三个集成任务全部通过（第一轮 37880422901 的计划断言在 4,000 行填充上被 PG14/16 规划器选了顺序扫描，改成 2 万行 + `VACUUM ANALYZE` 后通过）；两个单测任务红在 `main` 已有的三处（cron runtime 两条、Runner 版本断言），与本分支无关 |
 | 本地预览（API 接 3 万条内容的合成库 + vite，一次性测试账号） | 表头情感→负面、处理状态→待处理、风险信号→有负评、疑似身份→4S店、意图→投诉/抱怨、相关性→相关逐个点开：列表请求依次带上 `sentiment/status/risk/identity/intent/relevance`，筛选行同名芯片同步变成激活态、表头触发器变主色并带数量，「清空筛选」一次全部复位；点「导出」对该租户（5,000 行）返回 200 |
 
 ## 发布
