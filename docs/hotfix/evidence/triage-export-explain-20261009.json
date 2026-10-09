@@ -1,0 +1,49 @@
+{
+  "capturedAt": "2026-10-09",
+  "database": "local PostgreSQL 17.9, scratch database onstarvoice_test_triage_export_20261009 (production is PostgreSQL 14)",
+  "syntheticData": {
+    "records": 40000,
+    "recordsExportTenant": 30000,
+    "auditLogs": 83000,
+    "auditLogsExportTenantTriageNotes": 33000,
+    "recordNotes": 15102,
+    "tickets": 6031,
+    "ticketNotes": 18093,
+    "recordWatchlist": 2049
+  },
+  "statement": "GET /api/triage/records/export?sort=publish&dir=desc, SQL captured from the real route (unchanged text), $1 = tenant",
+  "runs": {
+    "baseline LIMIT 500": {
+      "executionMs": 12696.12,
+      "planningMs": 79.433,
+      "sharedHit": 1601798,
+      "sharedRead": 1532,
+      "auditLogsNode": "->  Seq Scan on audit_logs al  (cost=0.00..6103.00 rows=163 width=163) (actual time=6.019..24.825 rows=3 loops=500)"
+    },
+    "baseline LIMIT 5000": {
+      "executionMs": 122559.976,
+      "planningMs": 97.86,
+      "sharedHit": 14176838,
+      "sharedRead": 6173,
+      "auditLogsNode": "->  Seq Scan on audit_logs al  (cost=0.00..6103.00 rows=163 width=163) (actual time=5.892..24.370 rows=3 loops=5000)"
+    },
+    "with 093 indexes LIMIT 500": {
+      "executionMs": 320.664,
+      "planningMs": 77.161,
+      "sharedHit": 208986,
+      "sharedRead": 7864,
+      "auditLogsNode": "->  Bitmap Heap Scan on audit_logs al  (cost=21.50..1842.91 rows=164 width=162) (actual time=0.013..0.019 rows=3 loops=500)"
+    },
+    "with 093 indexes LIMIT 5000": {
+      "executionMs": 570.613,
+      "planningMs": 78.442,
+      "sharedHit": 311396,
+      "sharedRead": 6691,
+      "auditLogsNode": "->  Bitmap Heap Scan on audit_logs al  (cost=21.50..1842.91 rows=164 width=162) (actual time=0.011..0.018 rows=3 loops=5000)"
+    }
+  },
+  "indexes": {
+    "idx_audit_logs_tenant_target": "btree (tenant_id, target_id), 6,096 kB on the synthetic table, built in 244 ms",
+    "idx_audit_logs_record_ids": "GIN ((COALESCE(metadata->'recordIds','[]'::jsonb))), 2,512 kB, built in 59 ms"
+  }
+}

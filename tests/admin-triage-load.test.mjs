@@ -8,7 +8,7 @@ const source = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf
 const compiled = ts.transpileModule(source('web/admin/src/lib/triage-load.ts'), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { withTriageReadDeadline, triageLoadError, TRIAGE_READ_TIMEOUT_MS } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { withTriageReadDeadline, triageLoadError, exportFailureMessage, TRIAGE_READ_TIMEOUT_MS } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 
 test('a stalled triage response exits loading and aborts its underlying read at the deadline', async () => {
   const controller = new AbortController();
@@ -61,4 +61,16 @@ test('list and board cancel superseded reads, load unrestricted selections and e
   assert.match(board, /requestAbort\.current\?\.abort\(\)/);
   assert.match(board, /if \(loadError\) return <div role="alert"/);
   assert.doesNotMatch(board, /\.catch\(\(\) => \[column\.key, \[\]\]/);
+});
+
+test('export failures relay the server message instead of the list loading copy', () => {
+  assert.equal(exportFailureMessage(new Error('导出超时：当前筛选结果较多，请缩小时间范围或筛选条件后重试。')), '导出超时：当前筛选结果较多，请缩小时间范围或筛选条件后重试。');
+  assert.equal(exportFailureMessage(new Error('canceling statement due to statement timeout')), '导出失败：canceling statement due to statement timeout');
+  assert.equal(exportFailureMessage(new Error('当前服务暂时繁忙，导出失败，请稍后重试。')), '导出失败：当前服务暂时繁忙，导出失败，请稍后重试。');
+  assert.equal(exportFailureMessage(new Error('导出失败')), '导出失败');
+  assert.equal(exportFailureMessage(new Error('  ')), '导出失败，请稍后重试。');
+  assert.equal(exportFailureMessage('not an error'), '导出失败，请稍后重试。');
+  const queue = source('web/admin/src/pages/workbench/TriageQueue.tsx');
+  assert.match(queue, /catch \(err\) \{ showBatchFeedback\(exportFailureMessage\(err\), 'error'\) \}/);
+  assert.doesNotMatch(queue, /showBatchFeedback\(triageLoadError\(err\), 'error'\)/);
 });

@@ -47,7 +47,7 @@ import { useBadges } from '@/lib/badges'
 import { useNav } from '@/lib/navigation'
 import { recordDisplayTitle } from '@/lib/record-display'
 import { appendPostIntentFilter, appendPostRelevanceFilters, initialPostIntentFilter, normalizePostRelevanceFilter, normalizePostConfidenceFilter, postJudgment } from '@/lib/post-judgment'
-import { triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
+import { exportFailureMessage, triageLoadError, withTriageReadDeadline } from '@/lib/triage-load'
 import { readWithBusyRetry } from '@/lib/busy-retry.mjs'
 import { filterTriggerClass } from '@/lib/filter-trigger'
 import { CONTENT_TOPIC_FILTER_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
@@ -545,7 +545,7 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
   const exportXlsx = async () => {
     setExporting(true)
     try { await api.download('/triage/records/export?' + filterParams().toString(), '内容分诊.xlsx') }
-    catch (err) { showBatchFeedback(triageLoadError(err), 'error') }
+    catch (err) { showBatchFeedback(exportFailureMessage(err), 'error') }
     finally { setExporting(false) }
   }
 
@@ -1374,12 +1374,19 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                   </th>
                 )}
                 <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">内容</th>
-                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">情感</th>
-                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                  <span className="inline-flex items-center gap-1">AI 判断<span className="normal-case tracking-normal text-muted-foreground/60">意图 · 相关性</span></span>
+                {/* 表头快捷筛选：与上方筛选行共用同一份筛选状态，只是多一个就近的入口。 */}
+                <th className="px-1.5 text-left">
+                  <HeaderSingleFilter label="情感" value={sentiment} onChange={setSentiment} options={SENTIMENT_OPTIONS.map(([value, label]) => ({ value, label }))} />
                 </th>
-                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">风险信号</th>
-                <th className="px-3 text-left text-[11px] font-medium uppercase tracking-wider text-muted-foreground">疑似身份</th>
+                <th className="px-1.5 text-left">
+                  <span className="inline-flex items-center">
+                    <span className="px-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">AI 判断</span>
+                    <PostIntentFilter header value={intents} onChange={setIntents} />
+                    <PostRelevanceFilter header value={relevances} confidence={relevanceConfidences} onChange={setRelevances} onConfidenceChange={setRelevanceConfidences} />
+                  </span>
+                </th>
+                <th className="px-1.5 text-left"><HeaderMultiFilter label="风险信号" value={risk} onChange={setRisk} options={RISK_OPTIONS} /></th>
+                <th className="px-1.5 text-left"><HeaderMultiFilter label="疑似身份" value={identity} onChange={setIdentity} options={IDENTITY_OPTIONS} /></th>
                 <SortableTh label="互动" field="interactions" sort={sort} onSort={toggleSort} align="right" />
                 <SortableTh label="评论" field="comments" sort={sort} onSort={toggleSort} align="right" />
                 <SortableTh label="点赞" field="likes" sort={sort} onSort={toggleSort} align="right" />
@@ -1389,7 +1396,9 @@ export function TriageQueue({ initial }: { initial?: Record<string, string> }) {
                 <th className="hidden whitespace-nowrap px-3 text-right text-[11px] font-medium uppercase tracking-wider text-muted-foreground xl:table-cell">采集次数</th>
                 <th className="sticky right-0 z-50 w-[208px] min-w-[208px] bg-card pl-6 pr-2 text-left before:absolute before:inset-y-0 before:left-0 before:w-px before:bg-border before:content-['']">
                   <div className="grid grid-cols-[112px_48px] items-center gap-2">
-                    <span className="text-center text-[11px] font-medium uppercase tracking-wider text-muted-foreground">处理状态</span>
+                    <div className="flex justify-center">
+                      <HeaderMultiFilter label="处理状态" value={triageStatuses} onChange={setTriageStatuses} options={contentStatusOptions.map(([value, label]) => ({ value, label }))} align="end" />
+                    </div>
                     <span className="sr-only">备注</span>
                   </div>
                 </th>
@@ -2097,6 +2106,114 @@ function TriageStatusMenu({ status, busy, archiveBusy, disabled, onChange, onArc
           )}
           </DropdownMenu.Content>
         </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  )
+}
+
+/* 表头快捷筛选(单选):触发器沿用表头字号;选中后变主色并把当前值写在 title 里。 */
+const HEADER_FILTER_TRIGGER = 'inline-flex h-7 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium uppercase tracking-wider outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-primary/20'
+const HEADER_FILTER_CONTENT = 'z-[100] animate-in fade-in zoom-in-95 rounded-lg border border-border bg-card p-1.5 text-foreground shadow-lg'
+const HEADER_FILTER_ITEM = 'flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[12px] outline-none transition-colors data-[highlighted]:bg-accent'
+function HeaderSingleFilter({ label, value, options, onChange }: {
+  label: string
+  value: string
+  options: Array<{ value: string; label: string }>
+  onChange: (value: string) => void
+}) {
+  const active = Boolean(value)
+  const selectedLabel = options.find(option => option.value === value)?.label
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          aria-label={`${label}筛选${selectedLabel ? `，当前${selectedLabel}` : ''}`}
+          title={selectedLabel ? `${label}：${selectedLabel}` : `筛选${label}`}
+          className={cn(HEADER_FILTER_TRIGGER, active ? 'text-primary' : 'text-muted-foreground')}
+        >
+          <span>{label}</span>
+          <ChevronDown className="h-3 w-3" />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content align="start" sideOffset={5} collisionPadding={10} className={cn(HEADER_FILTER_CONTENT, 'min-w-32')}>
+          <DropdownMenu.RadioGroup
+            value={value || '__all__'}
+            onValueChange={nextValue => onChange(nextValue === '__all__' ? '' : nextValue)}
+            aria-label={`${label}筛选选项`}
+          >
+            {options.map(option => (
+              <DropdownMenu.RadioItem key={option.value || 'all'} value={option.value || '__all__'} className={HEADER_FILTER_ITEM}>
+                <span className={cn('flex-1', option.value === value && 'font-semibold')}>{option.label}</span>
+                <span className="flex h-4 w-4 items-center justify-center">
+                  <DropdownMenu.ItemIndicator><Check className="h-3.5 w-3.5 text-primary" /></DropdownMenu.ItemIndicator>
+                </span>
+              </DropdownMenu.RadioItem>
+            ))}
+          </DropdownMenu.RadioGroup>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  )
+}
+
+/* 表头快捷筛选(多选):选中数量显示在列名旁;菜单首项可一键清空。 */
+function HeaderMultiFilter({ label, value, options, onChange, align = 'start' }: {
+  label: string
+  value: string[]
+  options: Array<{ value: string; label: string }>
+  onChange: (value: string[]) => void
+  align?: 'start' | 'end'
+}) {
+  const toggle = (nextValue: string) => onChange(
+    value.includes(nextValue)
+      ? value.filter(item => item !== nextValue)
+      : [...value, nextValue],
+  )
+  const selectedLabels = options.filter(option => value.includes(option.value)).map(option => option.label)
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          aria-label={`${label}筛选${value.length ? `，已选${value.length}项` : '，全部'}`}
+          title={selectedLabels.length ? `${label}：${selectedLabels.join('、')}` : `筛选${label}`}
+          className={cn(HEADER_FILTER_TRIGGER, value.length ? 'text-primary' : 'text-muted-foreground')}
+        >
+          <span>{label}</span>
+          {value.length > 0 && <span className="rounded bg-primary/15 px-1 text-[10px] font-semibold text-primary">{value.length}</span>}
+          <ChevronDown className="h-3 w-3" />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content align={align} sideOffset={5} collisionPadding={10} className={cn(HEADER_FILTER_CONTENT, 'min-w-48 max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-y-auto')}>
+          {value.length > 0 && (
+            <DropdownMenu.Item
+              onSelect={event => { event.preventDefault(); onChange([]) }}
+              className="flex h-8 cursor-default items-center gap-2 rounded-md px-2.5 text-[11px] text-muted-foreground outline-none data-[highlighted]:bg-accent data-[highlighted]:text-foreground"
+            >
+              <X className="h-3 w-3" />清空已选（{value.length}）
+            </DropdownMenu.Item>
+          )}
+          {options.map(option => {
+            const checked = value.includes(option.value)
+            return (
+              <DropdownMenu.CheckboxItem
+                key={option.value}
+                checked={checked}
+                onCheckedChange={() => toggle(option.value)}
+                onSelect={event => event.preventDefault()}
+                className={HEADER_FILTER_ITEM}
+              >
+                <span className={cn('flex-1', checked && 'font-semibold')}>{option.label}</span>
+                <span className="flex h-4 w-4 items-center justify-center rounded border border-border">
+                  <DropdownMenu.ItemIndicator><Check className="h-3 w-3 text-primary" /></DropdownMenu.ItemIndicator>
+                </span>
+              </DropdownMenu.CheckboxItem>
+            )
+          })}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
     </DropdownMenu.Root>
   )
 }
