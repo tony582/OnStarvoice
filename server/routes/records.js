@@ -982,6 +982,7 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
 /**
  * 媒体透明代理下载：server 带 Referer 抓取直链并流式转发，不落盘。
  * GET /api/records/:id/media-proxy?url=<媒体直链>&filename=<保存文件名>
+ * inline=1：给后台 <video> 播放用（不加下载头、转发 Range）；<video> 带不了自定义头，租户走 ?tenantId=。
  * 安全：校验记录属于当前租户、url 确实属于该记录、host 在白名单内（防 SSRF/越权）。
  */
 router.get('/:id/media-proxy', requireTenantAccess, async (req, res, next) => {
@@ -1009,7 +1010,14 @@ router.get('/:id/media-proxy', requireTenantAccess, async (req, res, next) => {
       return res.status(403).json({ ok: false, error: 'url_not_in_record', message: '该直链不属于这条记录' });
     }
 
-    return streamMediaToResponse({ url, filename, platform: record.platform, res });
+    return streamMediaToResponse({
+      url,
+      filename,
+      platform: record.platform,
+      res,
+      inline: req.query.inline === '1',
+      range: req.headers.range || '',
+    });
   } catch (err) {
     return next(err);
   }

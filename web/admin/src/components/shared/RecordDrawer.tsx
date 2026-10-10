@@ -17,6 +17,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
+import { RecordVideoPlayer } from '@/components/shared/RecordVideoPlayer'
 import {
   FeishuTableNumberControl,
   type FeishuTableNumberSaveResult,
@@ -637,6 +638,7 @@ function RecordDrawerContent({
                         embedded
                       />
                     </section>
+                    {hasVideo(r) && <RecordVideoPlayer key={String(r.id)} record={r} poster={cover} />}
                     {hasVideo(r) && <TranscriptSection record={r} canWrite={canProcess} />}
                     <RecordImageGallery
                       key={`${r.id}-${imageEntries.map(item => `${item.url}::${item.ref}`).join('|')}`}

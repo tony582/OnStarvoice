@@ -167,12 +167,21 @@ function encodeContentDisposition(filename) {
 /**
  * 带 Referer 抓取上游媒体并流式转发到 res（不落盘）。
  * 调用方需已校验 url 属于某条租户记录且 host 在白名单内。
+ *
+ * inline=true 用于后台 <video> 直接播放：不加「下载附件」头，并把浏览器的 Range 请求原样转给上游、
+ * 把 206 / Content-Range 原样回传——Safari 不支持分段就不播，Chrome 没有分段就拖不了进度条。
+ * timeoutMs 只限制「等上游响应头」和「多久没有新数据」，不限制总时长，否则长视频播到一半会被切断。
  */
-export async function streamMediaToResponse({ url, filename, platform, res, timeoutMs = 60000 }) {
+export async function streamMediaToResponse({ url, filename, platform, res, range = '', inline = false, timeoutMs = 60000 }) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timer = setTimeout(() => controller.abort(), timeoutMs);
+  const touch = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), timeoutMs);
+  };
   try {
     const referer = resolveReferer(url, platform);
+    const requestedRange = /^bytes=\d*-\d*(,\s*\d*-\d*)*$/.test(String(range || '').trim()) ? String(range).trim() : '';
     const upstream = await fetch(url, {
       redirect: 'follow',
       signal: controller.signal,
@@ -180,11 +189,17 @@ export async function streamMediaToResponse({ url, filename, platform, res, time
         'User-Agent': BROWSER_UA,
         Accept: '*/*',
         ...(referer ? { Referer: referer } : {}),
+        ...(requestedRange ? { Range: requestedRange } : {}),
       },
     });
 
     if (!upstream.ok || !upstream.body) {
       clearTimeout(timer);
+      if (upstream.status === 416) {
+        const total = upstream.headers.get('content-range');
+        if (total) res.setHeader('Content-Range', total);
+        return res.status(416).end();
+      }
       return res.status(502).json({
         ok: false,
         error: 'upstream_failed',
@@ -196,18 +211,30 @@ export async function streamMediaToResponse({ url, filename, platform, res, time
       });
     }
 
+    res.status(upstream.status === 206 ? 206 : 200);
     res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
     const len = upstream.headers.get('content-length');
     if (len) res.setHeader('Content-Length', len);
-    res.setHeader('Content-Disposition', encodeContentDisposition(filename));
+    const contentRange = upstream.headers.get('content-range');
+    if (upstream.status === 206 && contentRange) res.setHeader('Content-Range', contentRange);
+    const acceptRanges = upstream.headers.get('accept-ranges');
+    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
+    else if (upstream.status === 206) res.setHeader('Accept-Ranges', 'bytes');
+    if (!inline) res.setHeader('Content-Disposition', encodeContentDisposition(filename));
     res.setHeader('Cache-Control', 'no-store');
 
+    touch();
     const nodeStream = Readable.fromWeb(upstream.body);
+    nodeStream.on('data', touch);
     nodeStream.on('error', () => {
+      clearTimeout(timer);
       if (!res.headersSent) res.status(502).end();
-      else res.end();
+      // 已经开始回传时中途断了：直接断开连接，别用 end() 假装发完——
+      // 客户端会一直等声明长度里剩下的字节；断开后播放器会自己按 Range 重新请求。
+      else res.destroy();
     });
     res.on('close', () => {
+      clearTimeout(timer);
       controller.abort();
       nodeStream.destroy();
     });
