@@ -57,3 +57,33 @@
 
 - 后台：把 `video-player-admin-…/backup-admin/index.html` 放回 `/opt/onstarvoice/web/admin/dist/index.html`。
 - 服务端：把 `video-player-server-…/backup/server/` 下的两个文件放回 `/opt/onstarvoice/server/` 对应位置，`pm2 restart onstarvoice-api`（不要 `pm2 update`）。旧后台只用下载模式，与新服务端兼容，所以可以只回退后台。
+
+## 追加：从「内容分诊」打开看不到播放器（14:04 修复上线）
+
+**现象**：13:31 上线后，从「内容分诊」打开视频帖，逐字稿照常显示，但没有播放器。
+
+**根因**：`/api/triage/records` 只返回 `note_type`，不返回 `video_url`／`payload`。逐字稿按 `note_type === 'video'` 显示，播放器拿不到链接就不渲染。上线前只单独测了播放器组件，没从分诊页打开抽屉走真实路径。
+
+**修复**：分支 `fix/video-player-fetch-url-20261010`，提交 `09980e1`。
+- 新增 `GET /api/records/:id/video`，按租户查询，返回 `{ videoUrl }`。取值用 `media-proxy.js` 的 `recordVideoUrl()`，顺序与 `collectRecordMediaUrls` 一致，保证转发时能通过归属校验。
+- 播放器在列表行里没有链接时，调这个接口取一次。
+- 新测试 `tests/record-video-url.test.mjs`。
+
+**验证**
+- CI 运行 38028629535 五项通过；相关测试 19 个文件全部通过。
+- 本地按真实路径验证：真实 API + 本地测试库 + 一次性测试账号，测试帖用生产只读取到的真实抖音链接。
+  - 分诊页列表行里确实没有 `video_url`。
+  - 打开抽屉后出现播放器；直连被拒，自动改走转发，播放 1080×1920、100 秒。
+  - 拖到 85 秒能播，缓冲区出现第二段（0–51.6、83.6–99.9），说明拖动发出了新的分段请求。
+  - 没有视频链接的视频帖不显示播放器。
+
+**发布**：发布包 `~/Documents/claude/releases/OnStarvoice-video-url-09980e1-20261010/`。
+- 演练时发现部署脚本把新路由也要求"前后一致"，正常发布会被误判回滚。已改成"旧三路由不变、新路由 404 → 401"后重新演练，全部符合预期。
+
+| 时间 | 操作 | 结果 |
+| --- | --- | --- |
+| 14:04:34–14:04:39 | 服务端 `bash deploy.sh` | 退出码 0。`onstarvoice-api` 36247 → 37789，约 2 秒就绪；scheduler 7297、ai-media 7298 未变；旧三路由仍 401，新路由 404 → 401 |
+| 14:04:48–14:04:58 | 后台 `python3 publish.py --deploy` | 退出码 0。55 个文件公网逐个核对一致，三个进程未变 |
+| 14:05 | 外部核对 | 公网入口 = 本包（`0871c536…`）；新的 `RecordDrawer` 分包含取链接逻辑；未登录访问 `/video` 返回 401；api 错误日志无新的代码错误 |
+
+发布目录：`/opt/onstarvoice-private/releases/video-url-server-09980e1-20261010`、`/opt/onstarvoice-private/releases/video-url-admin-09980e1-20261010`。回退方式同上。
