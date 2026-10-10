@@ -12,7 +12,7 @@ import { api } from '@/lib/api'
 import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel, friendlyError, proxiedImg } from '@/lib/utils'
 import { captureKeywordPresentation, publishTimePresentation } from '@/lib/publish-time.mjs'
 import { Button } from '@/components/ui/button'
-import { StatusBadge, StatusDot } from '@/components/ui/badge'
+import { StatusBadge, StatusDot, StatusPill } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
@@ -1594,22 +1594,32 @@ type PatrolRecord = {
   content_availability_status?: string | null
 }
 
-const PATROL_STATUS_LABEL: Record<string, string> = {
-  completed: '巡查完成',
-  partial: '部分完成',
-  partially_completed: '部分完成',
-  failed: '巡查失败',
-  running: '巡查中',
-  pending: '等待巡查',
-  queued: '等待巡查',
-  deleted: '原帖已删除',
-  page_unavailable: '已删除或不可访问',
+const PATROL_METRICS = [
+  { key: 'likes', label: '点赞', icon: Heart },
+  { key: 'comments', label: '评论', icon: MessageCircle },
+  { key: 'collects', label: '收藏', icon: Star },
+  { key: 'shares', label: '转发', icon: Share2 },
+] as const
+
+type PatrolMetricKey = typeof PATROL_METRICS[number]['key']
+
+const PATROL_UNAVAILABLE_STATUSES = new Set(['deleted', 'page_unavailable', 'unavailable', 'not_found'])
+const PATROL_ACTIVE_STATUSES = new Set(['pending', 'queued', 'assigned', 'dispatch_pending', 'dispatched', 'waiting_device', 'running', 'retryable'])
+const PATROL_RUNS_PREVIEW = 8
+
+type PatrolTrendPoint = { capturedAt: string; total: number; snapshot: PatrolSnapshot }
+
+type PatrolRunOutcome = {
+  text: string
+  detail?: string
+  tone: 'changed' | 'flat' | 'muted' | 'failed' | 'pending'
 }
 
 export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
   const [timeline, setTimeline] = useState<PatrolTimeline | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [showAllRuns, setShowAllRuns] = useState(false)
 
   useEffect(() => {
     let active = true
@@ -1634,23 +1644,6 @@ export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
 
   const summary = timeline?.summary || {}
   const runs = Array.isArray(timeline?.runs) ? timeline.runs : []
-  const snapshots = (Array.isArray(timeline?.snapshots) ? timeline.snapshots : [])
-    .filter(item => patrolSnapshotCapturedAt(item))
-    .sort((a, b) => new Date(patrolSnapshotCapturedAt(a)).getTime() - new Date(patrolSnapshotCapturedAt(b)).getTime())
-  const delta = summary.delta || runs.find(run => run.measured)?.delta || null
-  const hasMeasuredDelta = Boolean(
-    delta
-    && [delta.likes, delta.comments, delta.collects, delta.shares, delta.interactionTotal]
-      .some(value => typeof value === 'number'),
-  )
-  const availability = String(summary.availabilityStatus || record.content_availability_status || 'available')
-  const unavailable = ['deleted', 'page_unavailable', 'unavailable'].includes(availability)
-  const latestStatus = unavailable ? availability : String(summary.latestStatus || runs[0]?.status || '')
-  const measuredRuns = Number(summary.measuredRuns || runs.filter(run => run.measured).length || 0)
-  const patrolCount = Number(summary.patrolCount ?? summary.runCount ?? runs.length)
-  const interactionDelta = typeof delta?.interactionTotal === 'number'
-    ? delta.interactionTotal
-    : sumKnown([delta?.likes, delta?.comments, delta?.collects, delta?.shares])
 
   if (runs.length === 0) {
     if (record.sentiment !== 'negative') {
@@ -1671,191 +1664,372 @@ export function RecordPatrolPanel({ record }: { record: PatrolRecord }) {
     )
   }
 
-  return (
-    <div className="space-y-5">
-      <section className={cn(
-        'rounded-xl border p-4',
-        unavailable
-          ? 'border-border bg-muted/35'
-          : 'border-primary/15 bg-primary/[0.035]',
-      )}>
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <div className="flex items-center gap-2">
-              <Radar className="h-4 w-4 text-primary" />
-              <h4 className="text-[13px] font-semibold text-foreground">内容巡查状态</h4>
-            </div>
-            <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
-              汇总负面巡查与关注内容巡查；普通重复采集不会混入这里。
-            </p>
-          </div>
-          <StatusBadge tone={unavailable ? 'muted' : latestStatus === 'failed' ? 'negative' : latestStatus === 'running' ? 'reviewing' : 'positive'}>
-            {PATROL_STATUS_LABEL[latestStatus] || '已纳入巡查'}
-          </StatusBadge>
-        </div>
-        {unavailable && (
-          <div className="mt-3 flex items-start gap-2 rounded-lg bg-background/70 px-3 py-2 text-[12px] text-muted-foreground">
-            <Ban className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>当前页面已删除或不可访问；历史巡查快照仍保留，不再把不可访问误算成互动下降。</span>
-          </div>
-        )}
-      </section>
+  const points: PatrolTrendPoint[] = (Array.isArray(timeline?.snapshots) ? timeline.snapshots : [])
+    .map(snapshot => ({ capturedAt: patrolSnapshotCapturedAt(snapshot), total: patrolSnapshotTotal(snapshot), snapshot }))
+    .filter((point): point is PatrolTrendPoint => Boolean(point.capturedAt) && typeof point.total === 'number')
+    .sort((a, b) => new Date(a.capturedAt).getTime() - new Date(b.capturedAt).getTime())
+  const firstPoint = points[0]
+  const lastPoint = points[points.length - 1]
+  // 累计变化 = 最早快照 → 最新快照，和趋势图首尾一致
+  const cumulative: Partial<PatrolDelta> | null = points.length >= 2
+    ? {
+        ...Object.fromEntries(PATROL_METRICS.map(({ key }) => {
+          const from = patrolSnapshotMetric(firstPoint.snapshot, key)
+          const to = patrolSnapshotMetric(lastPoint.snapshot, key)
+          return [key, from == null || to == null ? null : to - from]
+        })),
+        interactionTotal: lastPoint.total - firstPoint.total,
+      }
+    : null
 
-      <section>
-        <div className="mb-2 flex flex-wrap items-end justify-between gap-2">
-          <div>
-            <h4 className="text-[13px] font-semibold text-foreground">最近一次可比巡查增量</h4>
-            <p className="mt-0.5 text-[11px] text-muted-foreground">同一条内容两次巡查快照之间的互动变化，不代表新增评论的情感结论。</p>
-          </div>
-          <span className="text-[11px] text-muted-foreground">
-            {hasMeasuredDelta ? `${measuredRuns} 次可比巡查` : '待形成第二次巡查快照'}
-          </span>
+  const availability = String(summary.availabilityStatus || record.content_availability_status || 'available')
+  const unavailable = PATROL_UNAVAILABLE_STATUSES.has(availability)
+  const latestRun = runs[0]
+  const latestStatus = String(summary.latestStatus || latestRun?.status || '')
+  const patrolCount = Number(summary.patrolCount ?? summary.runCount ?? runs.length)
+  const workflowLabels = new Set(runs.map(patrolWorkflowLabel))
+  const mixedWorkflows = workflowLabels.size > 1
+  const headline = unavailable
+    ? { tone: 'muted', label: '原帖已删除或不可访问' }
+    : latestStatus === 'failed'
+      ? { tone: 'negative', label: '最近一次巡查失败' }
+      : latestStatus === 'needs_action'
+        ? { tone: 'unhandled', label: '最近一次巡查需要处理' }
+        : PATROL_ACTIVE_STATUSES.has(latestStatus)
+          ? { tone: 'reviewing', label: latestStatus === 'running' ? '巡查中' : '等待巡查' }
+          : { tone: 'positive', label: availability === 'available' ? '帖子在线' : '巡查完成' }
+  const facts = [
+    `${mixedWorkflows ? '内容巡查' : [...workflowLabels][0]} ${patrolCount} 次`,
+    summary.firstPatrolledAt ? `${formatPatrolTime(summary.firstPatrolledAt, false)} 起` : '',
+    `最近 ${formatPatrolTime(summary.lastPatrolledAt || patrolRunAt(latestRun))}`,
+  ].filter(Boolean).join(' · ')
+  const visibleRuns = showAllRuns ? runs : runs.slice(0, PATROL_RUNS_PREVIEW)
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-xl border border-border/60 bg-card px-4 py-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <StatusPill tone={headline.tone}>{headline.label}</StatusPill>
+          <span className="text-[11px] tabular-nums text-muted-foreground">{facts}</span>
         </div>
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <PatrolDeltaCard icon={Heart} label="点赞增加" value={delta?.likes} />
-          <PatrolDeltaCard icon={MessageCircle} label="评论增加" value={delta?.comments} />
-          <PatrolDeltaCard icon={Star} label="收藏增加" value={delta?.collects} />
-          <PatrolDeltaCard icon={Share2} label="转发增加" value={delta?.shares} />
-        </div>
+        <p className="mt-2 text-[13px] leading-6 text-foreground">
+          {patrolConclusion({ runs, latestStatus, unavailable, cumulative, cumulativeFrom: firstPoint?.capturedAt })}
+        </p>
       </section>
 
       <section className="rounded-xl border border-border/60 bg-card p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h4 className="text-[13px] font-semibold text-foreground">互动趋势</h4>
-            <p className="mt-0.5 text-[11px] text-muted-foreground">点赞、评论、收藏、转发的快照合计</p>
-          </div>
-          <div className="text-right">
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">本轮总互动变化</div>
-            <div className="text-lg font-bold tabular-nums">{formatPatrolDelta(interactionDelta)}</div>
-          </div>
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h4 className="text-[13px] font-semibold text-foreground">互动</h4>
+          <span className="text-[11px] text-muted-foreground">
+            {cumulative ? `当前值 · 较 ${formatPatrolTime(firstPoint.capturedAt, false)} 首个快照的累计变化` : '当前值'}
+          </span>
         </div>
-        <PatrolTrendChart snapshots={snapshots} />
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {PATROL_METRICS.map(({ key, label, icon }) => (
+            <PatrolMetricCard
+              key={key}
+              icon={icon}
+              label={label}
+              value={lastPoint ? patrolSnapshotMetric(lastPoint.snapshot, key) : null}
+              change={cumulative ? cumulative[key] : null}
+            />
+          ))}
+        </div>
+        <PatrolTrendChart points={points} />
       </section>
 
       <section>
-        <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="mb-2 flex items-baseline justify-between gap-3">
           <h4 className="text-[13px] font-semibold text-foreground">巡查记录</h4>
-          <span className="text-[11px] text-muted-foreground">
-            共 {patrolCount} 次 · 最近 {formatFullDateSec(
-              summary.lastPatrolledAt
-              || runs[0]?.finishedAt
-              || runs[0]?.finished_at
-              || runs[0]?.updatedAt
-              || runs[0]?.updated_at,
-            )}
-          </span>
+          <span className="text-[11px] text-muted-foreground">共 {patrolCount} 次</span>
         </div>
-        <div className="divide-y divide-border/50 rounded-xl border border-border/60 bg-card">
-          {runs.slice(0, 8).map((run, index) => {
-            const status = String(run.availabilityStatus || run.availability_status || run.status || '')
+        <ol className="divide-y divide-border/50 rounded-xl border border-border/60 bg-card">
+          {visibleRuns.map((run, index) => {
+            const outcome = patrolRunOutcome(run)
+            const at = patrolRunAt(run)
             return (
-              <div key={run.itemId || run.id || index} className="p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-[12px] font-semibold">第 {patrolCount - index} 次巡查</span>
-                  <StatusBadge tone={status === 'failed' ? 'negative' : status === 'running' ? 'reviewing' : status.includes('unavailable') || status === 'deleted' ? 'muted' : 'positive'}>
-                    {PATROL_STATUS_LABEL[status] || status || '已完成'}
-                  </StatusBadge>
-                  <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
-                    {run.workflowLabel || (run.workflow === 'watched_content_patrol' ? '关注内容巡查' : '负面帖子巡查')}
+              <li key={run.itemId || run.id || index} className="flex items-start gap-3 px-3 py-2 text-[12px] leading-5">
+                <time className="w-[78px] shrink-0 tabular-nums text-muted-foreground" title={formatFullDateSec(at)}>
+                  {formatPatrolTime(at)}
+                </time>
+                <div className="min-w-0 flex-1">
+                  <span className={cn(
+                    outcome.tone === 'changed' && 'font-semibold text-foreground',
+                    outcome.tone === 'flat' && 'text-muted-foreground',
+                    outcome.tone === 'muted' && 'text-muted-foreground',
+                    outcome.tone === 'pending' && 'text-foreground',
+                    outcome.tone === 'failed' && 'font-semibold text-destructive',
+                  )}>
+                    {outcome.text}
                   </span>
-                  <span className="ml-auto text-[11px] text-muted-foreground">
-                    {formatFullDateSec(run.finishedAt || run.finished_at || run.updatedAt || run.updated_at || run.startedAt || run.started_at || run.createdAt || run.created_at)}
-                  </span>
+                  {outcome.detail && (
+                    <span className={cn('ml-1.5', outcome.tone === 'failed' ? 'text-destructive/80' : 'text-muted-foreground')}>
+                      {outcome.detail}
+                    </span>
+                  )}
+                  {mixedWorkflows && (
+                    <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{patrolWorkflowLabel(run)}</span>
+                  )}
                 </div>
-                <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-                  <span>Agent：{run.agentName || run.agent_name || '未记录'}</span>
-                  <span>{run.measured ? `互动变化 ${formatPatrolDelta(run.delta?.interactionTotal ?? sumKnown([run.delta?.likes, run.delta?.comments, run.delta?.collects, run.delta?.shares]))}` : '缺少成对快照，未计算增量'}</span>
-                </div>
-                {(run.errorMessage || run.error_message) && (
-                  <p className="mt-1.5 text-[11px] leading-5 text-destructive">{run.errorMessage || run.error_message}</p>
-                )}
-              </div>
+              </li>
             )
           })}
-        </div>
+        </ol>
+        {runs.length > PATROL_RUNS_PREVIEW && (
+          <button
+            type="button"
+            onClick={() => setShowAllRuns(value => !value)}
+            className="mt-2 text-[12px] font-medium text-primary hover:underline"
+          >
+            {showAllRuns ? '收起' : `查看全部 ${runs.length} 次`}
+          </button>
+        )}
       </section>
     </div>
   )
 }
 
-function PatrolDeltaCard({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: number | null | undefined }) {
+function PatrolMetricCard({ icon: Icon, label, value, change }: {
+  icon: React.ElementType
+  label: string
+  value: number | null
+  change: number | null | undefined
+}) {
   return (
-    <div className="rounded-lg border border-border/50 bg-muted/30 p-3">
-      <div className="flex items-center gap-1.5 text-[10.5px] font-medium text-muted-foreground">
+    <div className="rounded-lg bg-muted/40 px-3 py-2.5">
+      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
         <Icon className="h-3.5 w-3.5" />{label}
       </div>
-      <div className="mt-1 text-[17px] font-bold tabular-nums">{formatPatrolDelta(value)}</div>
+      <div className="mt-1 flex items-baseline justify-between gap-2">
+        <span className="text-[17px] font-bold tabular-nums">{value == null ? '-' : formatNumber(value)}</span>
+        {typeof change === 'number' && (
+          <span className={cn(
+            'text-[11px] font-semibold tabular-nums',
+            change === 0 ? 'text-muted-foreground' : 'text-amber-700 dark:text-amber-300',
+          )}>
+            {change === 0 ? '无变化' : formatPatrolDelta(change)}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
 
-function PatrolTrendChart({ snapshots }: { snapshots: PatrolSnapshot[] }) {
-  const points = snapshots
-    .map(snapshot => ({
-      capturedAt: patrolSnapshotCapturedAt(snapshot),
-      total: snapshot.interactionTotal ?? snapshot.interaction_total ?? sumKnown([
-        snapshot.likes,
-        snapshot.comments ?? snapshot.comments_count,
-        snapshot.collects,
-        snapshot.shares,
-      ]),
-    }))
-    .filter((point): point is { capturedAt: string; total: number } => typeof point.total === 'number')
-
+function PatrolTrendChart({ points }: { points: PatrolTrendPoint[] }) {
   if (points.length < 2) {
     return (
-      <div className="mt-4 flex h-28 items-center justify-center rounded-lg bg-muted/25 px-4 text-center text-[12px] text-muted-foreground">
+      <div className="mt-4 flex h-24 items-center justify-center rounded-lg bg-muted/25 px-4 text-center text-[12px] text-muted-foreground">
         首次巡查只保存基线；完成下一次巡查后才会显示真实趋势。
       </div>
     )
   }
 
-  const width = 520
-  const height = 136
-  const insetX = 12
-  const insetY = 14
+  const count = points.length
   const values = points.map(point => point.total)
   const min = Math.min(...values)
   const max = Math.max(...values)
-  const range = Math.max(1, max - min)
-  const coords = points.map((point, index) => ({
-    x: insetX + (index / Math.max(1, points.length - 1)) * (width - insetX * 2),
-    y: insetY + ((max - point.total) / range) * (height - insetY * 2),
-    ...point,
-  }))
+  const flat = max === min
+  // 日期刻度最多 7 个；点多时数字只标在刻度上，避免挤在一起
+  const step = Math.max(1, Math.ceil((count - 1) / 6))
+  const tickIndexes = points.map((_, index) => index).filter(index => index % step === 0 || index === count - 1)
+  if (tickIndexes.length > 2 && count - 1 - tickIndexes[tickIndexes.length - 2] < step / 2) tickIndexes.splice(tickIndexes.length - 2, 1)
+  const dense = count > 12
+  const coords = points.map((point, index) => {
+    const neighbors = [points[index - 1]?.total, points[index + 1]?.total].filter((value): value is number => typeof value === 'number')
+    const neighborAverage = neighbors.reduce((sum, value) => sum + value, 0) / neighbors.length
+    return {
+      ...point,
+      x: (index / (count - 1)) * 100,
+      y: flat ? 50 : ((max - point.total) / (max - min)) * 100,
+      // 线从这个点往上走时把数字放在点下方，免得压在线上
+      labelBelow: !flat && neighborAverage > point.total,
+      showLabel: !dense || tickIndexes.includes(index),
+    }
+  })
   const polyline = coords.map(point => `${point.x},${point.y}`).join(' ')
+  const dayCounts = new Map<string, number>()
+  for (const point of points) {
+    const day = formatPatrolTime(point.capturedAt, false)
+    dayCounts.set(day, (dayCounts.get(day) || 0) + 1)
+  }
+  const ticksNeedTime = tickIndexes.some(index => (dayCounts.get(formatPatrolTime(points[index].capturedAt, false)) || 0) > 1)
 
   return (
-    <div className="mt-3">
-      <svg viewBox={`0 0 ${width} ${height}`} className="h-32 w-full overflow-visible" role="img" aria-label="内容巡查互动变化趋势">
-        {[0.2, 0.5, 0.8].map(ratio => (
-          <line key={ratio} x1={insetX} x2={width - insetX} y1={height * ratio} y2={height * ratio}
-            className="stroke-border/70" strokeDasharray="4 5" strokeWidth="1" />
-        ))}
-        <polyline points={polyline} fill="none" className="stroke-primary" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-        {coords.map((point, index) => (
-          <g key={`${point.capturedAt}-${index}`}>
-            <circle cx={point.x} cy={point.y} r="4" className="fill-card stroke-primary" strokeWidth="2.5" />
-            {(index === 0 || index === coords.length - 1) && (
-              <text x={point.x} y={Math.max(10, point.y - 9)} textAnchor={index === 0 ? 'start' : 'end'}
-                className="fill-muted-foreground text-[10px] font-semibold">
-                {formatNumber(point.total)}
-              </text>
-            )}
-          </g>
-        ))}
-      </svg>
-      <div className="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
-        <span>{formatFullDateSec(points[0]?.capturedAt)}</span>
-        <span>{formatFullDateSec(points[points.length - 1]?.capturedAt)}</span>
+    <div className="mt-4">
+      <div className="text-[11px] text-muted-foreground">互动合计走势（点赞 + 评论 + 收藏 + 转发）</div>
+      <div className="px-4">
+        <div className="relative mb-6 mt-7 h-24" role="img" aria-label={`互动合计走势：${coords.map(point => formatNumber(point.total)).join('、')}`}>
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 h-full w-full overflow-visible" aria-hidden="true">
+            {[0, 50, 100].map(y => (
+              <line key={y} x1="0" x2="100" y1={y} y2={y} className="stroke-border" strokeDasharray="3 4" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+            ))}
+            <polyline points={polyline} fill="none" className="stroke-primary" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+          </svg>
+          {coords.map((point, index) => (
+            <div key={`${point.capturedAt}-${index}`} className="absolute" style={{ left: `${point.x}%`, top: `${point.y}%` }}>
+              <span
+                className="absolute left-0 top-0 flex h-5 w-5 -translate-x-1/2 -translate-y-1/2 items-center justify-center"
+                title={patrolSnapshotTitle(point)}
+              >
+                <span className={point.showLabel ? 'h-2.5 w-2.5 rounded-full border-2 border-primary bg-card' : 'h-1.5 w-1.5 rounded-full bg-primary'} />
+              </span>
+              {point.showLabel && (
+                <span className={cn(
+                  'pointer-events-none absolute left-0 -translate-x-1/2 whitespace-nowrap text-[11px] font-semibold leading-none tabular-nums text-foreground',
+                  point.labelBelow ? 'top-2' : 'bottom-2',
+                )}>
+                  {formatNumber(point.total)}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className={cn('relative text-[10px] leading-tight text-muted-foreground', ticksNeedTime ? 'h-7' : 'h-4')}>
+          {tickIndexes.map(index => (
+            <span key={index} className="absolute -translate-x-1/2 whitespace-nowrap text-center tabular-nums" style={{ left: `${coords[index].x}%` }}>
+              {formatPatrolTime(points[index].capturedAt, false)}
+              {ticksNeedTime && <><br />{formatPatrolClock(points[index].capturedAt)}</>}
+            </span>
+          ))}
+        </div>
       </div>
     </div>
   )
 }
 
+function patrolConclusion({ runs, latestStatus, unavailable, cumulative, cumulativeFrom }: {
+  runs: PatrolRun[]
+  latestStatus: string
+  unavailable: boolean
+  cumulative: Partial<PatrolDelta> | null
+  cumulativeFrom?: string
+}): string {
+  if (unavailable) return '原帖已删除或不可访问；历史快照仍保留，不会把不可访问算成互动下降。'
+
+  const sentences: string[] = []
+  const latestError = runs[0]?.errorMessage || runs[0]?.error_message || ''
+  if (latestStatus === 'failed') sentences.push(`最近一次巡查失败${latestError ? `：${latestError}` : ''}。`)
+  else if (latestStatus === 'needs_action') sentences.push(`最近一次巡查需要处理${latestError ? `：${latestError}` : ''}。`)
+  else if (PATROL_ACTIVE_STATUSES.has(latestStatus)) sentences.push('本轮巡查还没完成，完成后会更新互动变化。')
+
+  const measured = runs.filter(run => run.measured && !PATROL_UNAVAILABLE_STATUSES.has(String(run.availabilityStatus || run.availability_status || '')))
+  if (!measured.length) {
+    sentences.push('已保存首个快照，下一次巡查后才能对比互动变化。')
+    return sentences.join('')
+  }
+
+  const latestIsComparable = measured[0] === runs[0]
+  const latestChange = patrolDeltaBreakdown(measured[0].delta)
+  if (latestChange) {
+    const total = patrolDeltaTotal(measured[0].delta)
+    const which = latestIsComparable ? '最近一次巡查' : `${formatPatrolTime(patrolRunAt(measured[0]))} 的巡查`
+    sentences.push(total != null && total > 0
+      ? `${which}新增互动 ${formatPatrolDelta(total)}（${latestChange}）。`
+      : `${which}互动有变化（${latestChange}）。`)
+    return sentences.join('')
+  }
+
+  let flatRuns = 0
+  for (const run of measured) {
+    if (patrolDeltaBreakdown(run.delta)) break
+    flatRuns += 1
+  }
+  const recent = latestIsComparable ? '最近' : '此前'
+  const cumulativeChange = patrolDeltaBreakdown(cumulative)
+  if (!cumulativeChange) {
+    sentences.push(flatRuns === measured.length
+      ? `已对比 ${flatRuns} 次，互动一直没有变化。`
+      : `${recent} ${flatRuns} 次巡查互动无变化。`)
+    return sentences.join('')
+  }
+  sentences.push(`${recent} ${flatRuns} 次巡查互动无变化；较 ${formatPatrolTime(cumulativeFrom, false)} 首个快照累计 ${formatPatrolDelta(patrolDeltaTotal(cumulative))}（${cumulativeChange}）。`)
+  return sentences.join('')
+}
+
+function patrolRunOutcome(run: PatrolRun): PatrolRunOutcome {
+  const status = String(run.status || '')
+  const availability = String(run.availabilityStatus || run.availability_status || '')
+  const errorMessage = run.errorMessage || run.error_message || ''
+  if (status === 'failed') return { text: '巡查失败', detail: errorMessage, tone: 'failed' }
+  if (status === 'needs_action') return { text: '需要处理', detail: errorMessage, tone: 'failed' }
+  if (status === 'canceled') return { text: '已取消', tone: 'muted' }
+  if (status === 'skipped') return { text: '已跳过', tone: 'muted' }
+  if (PATROL_ACTIVE_STATUSES.has(status)) return { text: status === 'running' ? '巡查中' : '等待巡查', tone: 'pending' }
+  if (PATROL_UNAVAILABLE_STATUSES.has(availability)) return { text: '原帖已删除或不可访问', tone: 'muted' }
+  if (!run.measured) return { text: '只保存了快照，没有可对比的上一次', tone: 'muted' }
+  const change = patrolDeltaBreakdown(run.delta)
+  if (!change) return { text: '互动无变化', tone: 'flat' }
+  return { text: `互动 ${formatPatrolDelta(patrolDeltaTotal(run.delta))}`, detail: change, tone: 'changed' }
+}
+
+function patrolWorkflowLabel(run: PatrolRun): string {
+  return run.workflowLabel || (run.workflow === 'watched_content_patrol' ? '关注内容巡查' : '负面帖子巡查')
+}
+
+function patrolRunAt(run: PatrolRun | undefined): string | undefined {
+  if (!run) return undefined
+  return run.finishedAt || run.finished_at || run.updatedAt || run.updated_at || run.startedAt || run.started_at || run.createdAt || run.created_at
+}
+
 function patrolSnapshotCapturedAt(snapshot: PatrolSnapshot): string {
   return String(snapshot.capturedAt || snapshot.captured_at || '')
+}
+
+function patrolSnapshotMetric(snapshot: PatrolSnapshot, key: PatrolMetricKey): number | null {
+  const value = key === 'comments' ? snapshot.comments ?? snapshot.comments_count : snapshot[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function patrolSnapshotTotal(snapshot: PatrolSnapshot): number | null {
+  const total = snapshot.interactionTotal ?? snapshot.interaction_total
+  if (typeof total === 'number' && Number.isFinite(total)) return total
+  return sumKnown(PATROL_METRICS.map(({ key }) => patrolSnapshotMetric(snapshot, key)))
+}
+
+function patrolSnapshotTitle(point: PatrolTrendPoint): string {
+  const metrics = PATROL_METRICS
+    .map(({ key, label }) => {
+      const value = patrolSnapshotMetric(point.snapshot, key)
+      return value == null ? '' : `${label} ${formatNumber(value)}`
+    })
+    .filter(Boolean)
+    .join('、')
+  return `${formatFullDateSec(point.capturedAt)}\n互动合计 ${formatNumber(point.total)}${metrics ? `（${metrics}）` : ''}`
+}
+
+function patrolDeltaTotal(delta: Partial<PatrolDelta> | null | undefined): number | null {
+  if (!delta) return null
+  if (typeof delta.interactionTotal === 'number') return delta.interactionTotal
+  return sumKnown(PATROL_METRICS.map(({ key }) => delta[key]))
+}
+
+// 只列出有变化的指标，例如「点赞 +1、评论 +1」；全部为 0 时返回空串
+function patrolDeltaBreakdown(delta: Partial<PatrolDelta> | null | undefined): string {
+  if (!delta) return ''
+  return PATROL_METRICS
+    .flatMap(({ key, label }) => {
+      const value = delta[key]
+      return typeof value === 'number' && value !== 0 ? [`${label} ${formatPatrolDelta(value)}`] : []
+    })
+    .join('、')
+}
+
+// 巡查时间只到分钟；跨年才带年份
+function formatPatrolTime(value: string | null | undefined, withClock = true): string {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  return date.toLocaleString('zh-CN', {
+    ...(date.getFullYear() === new Date().getFullYear() ? {} : { year: 'numeric' }),
+    month: '2-digit',
+    day: '2-digit',
+    ...(withClock ? { hour: '2-digit', minute: '2-digit', hour12: false } : {}),
+  })
+}
+
+function formatPatrolClock(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
 function sumKnown(values: Array<number | null | undefined>): number | null {

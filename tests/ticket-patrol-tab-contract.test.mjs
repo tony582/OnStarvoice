@@ -10,7 +10,9 @@ test('tickets with a linked content record reuse the live patrol timeline withou
 
   assert.match(recordDrawer, /export function RecordPatrolPanel/);
   assert.match(recordDrawer, /content-patrol\/posts\/\$\{record\.id\}\/timeline/);
-  assert.match(recordDrawer, /汇总负面巡查与关注内容巡查/);
+  // 负面巡查与关注内容巡查都在这里；两种混在一起时每条记录标出类型
+  assert.match(recordDrawer, /watched_content_patrol/);
+  assert.match(recordDrawer, /mixedWorkflows/);
   assert.match(recordDrawer, /run\.workflowLabel/);
   assert.match(recordDrawer, /runs\.length === 0/);
   assert.match(recordDrawer, /record\.sentiment !== 'negative'/);
