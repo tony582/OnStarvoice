@@ -7,7 +7,7 @@ import {
   requireTenantWriter,
 } from '../middleware/auth.js';
 import { getOfficialResponses, getRecordComments } from '../services/comment-workflow.js';
-import { collectRecordMediaUrls, isAllowedMediaHost, streamMediaToResponse } from '../services/media-proxy.js';
+import { collectRecordMediaUrls, isAllowedMediaHost, recordVideoUrl, streamMediaToResponse } from '../services/media-proxy.js';
 import {
   applyRecordCustomTagBatch,
   applyRecordCustomTagPatch,
@@ -974,6 +974,23 @@ router.patch('/:id/official-response', requireTenantAccess, requireTenantWriter,
     if (result.notFound) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
     if (result.archived) return sendRecordArchived(res, [req.params.id]);
     return res.json({ ok: true });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * 详情抽屉播放器取视频链接。GET /api/records/:id/video → { videoUrl }
+ * 内容分诊等列表接口不返回 video_url / payload，抽屉里拿不到链接，播放器单独取一次。
+ */
+router.get('/:id/video', requireTenantAccess, async (req, res, next) => {
+  try {
+    const record = await queryOne(
+      'SELECT id, video_url, payload FROM records WHERE id = $1 AND tenant_id = $2',
+      [req.params.id, req.tenantId]
+    );
+    if (!record) return res.status(404).json({ ok: false, error: 'not_found', message: '内容不存在' });
+    return res.json({ ok: true, videoUrl: recordVideoUrl(record) });
   } catch (err) {
     return next(err);
   }

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Play, VideoOff } from 'lucide-react'
 import { api } from '@/lib/api'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
@@ -50,7 +50,18 @@ function recordVideoUrl(record: VideoRecord): string {
  */
 export function RecordVideoPlayer({ record, poster }: { record: VideoRecord; poster?: string }) {
   const [mode, setMode] = useState<PlaybackMode>('idle')
-  const videoUrl = recordVideoUrl(record)
+  const rowVideoUrl = recordVideoUrl(record)
+  // 内容分诊等列表不带 video_url / payload：行里没有就向服务端单独取一次
+  const [fetchedVideoUrl, setFetchedVideoUrl] = useState('')
+  useEffect(() => {
+    if (rowVideoUrl || record.id == null) return
+    let active = true
+    api.get<{ videoUrl?: string }>(`/records/${record.id}/video`)
+      .then(data => { if (active) setFetchedVideoUrl(String(data.videoUrl || '')) })
+      .catch(() => { /* 取不到就不显示播放器，逐字稿照常 */ })
+    return () => { active = false }
+  }, [record.id, rowVideoUrl])
+  const videoUrl = rowVideoUrl || fetchedVideoUrl
   if (!videoUrl) return null
 
   const tenant = api.getTenant()

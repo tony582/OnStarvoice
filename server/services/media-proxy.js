@@ -137,6 +137,22 @@ export function collectRecordMediaUrls(record) {
   return urls;
 }
 
+/**
+ * 记录的视频直链（不含音频），取值顺序与 collectRecordMediaUrls 的视频部分、web/admin 的 videoUrl 一致，
+ * 所以返回的链接一定能通过 media-proxy 的归属校验。
+ */
+export function recordVideoUrl(record) {
+  if (!record) return '';
+  const payload = safeParse(record.payload) || {};
+  return [
+    record.video_url,
+    pick(payload, 'videoUrl', 'videoLink', 'video_url', 'awemeVideoUrl'),
+    urlFromItem(asArray(payload.videoUrls)[0]),
+  ]
+    .map(value => String(value || '').trim())
+    .find(value => /^https?:\/\//i.test(value)) || '';
+}
+
 export function isAllowedMediaHost(urlStr) {
   let host = '';
   try {
