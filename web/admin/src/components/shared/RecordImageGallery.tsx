@@ -8,12 +8,14 @@ export function RecordImageGallery({
   onOpen,
   recordId,
   canRefresh = false,
+  title = '图片',
 }: {
   images: string[]
   imageRefs?: string[]
   onOpen: (url: string) => void
   recordId?: string
   canRefresh?: boolean
+  title?: string
 }) {
   const [failed, setFailed] = useState<Set<string>>(() => new Set())
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
@@ -148,7 +150,7 @@ export function RecordImageGallery({
   return (
     <section aria-label="内容图片">
       <div className="mb-2 flex items-center justify-between gap-3">
-        <h4 className="text-[13px] font-semibold text-foreground">图片</h4>
+        <h4 className="text-[13px] font-semibold text-foreground">{title}</h4>
         {failed.size > 0 && (
           <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
             <ImageOff className="h-3.5 w-3.5" />
@@ -164,7 +166,7 @@ export function RecordImageGallery({
               className="overflow-hidden rounded-lg border border-border bg-card">
               <button type="button" onClick={() => onOpen(item.url)} title="点击放大"
                 aria-label={`放大第 ${item.index + 1} 张图片`}
-                className="group relative block aspect-square w-full cursor-zoom-in overflow-hidden bg-muted">
+                className="group relative block aspect-[3/4] w-full cursor-zoom-in overflow-hidden bg-muted">
                 <img src={item.url} alt="" className="h-full w-full object-cover transition group-hover:scale-105"
                   referrerPolicy="no-referrer"
                   onError={() => setFailed(current => {

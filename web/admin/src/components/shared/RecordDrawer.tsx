@@ -604,51 +604,16 @@ function RecordDrawerContent({
             ) : (
               <>
                 {tab === 'content' && (
-                  <div className="space-y-5">
-                    <div>
-                      <h4 className="mb-2 text-[13px] font-semibold text-foreground">正文内容</h4>
-                      <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || '无正文'}</p>
-                    </div>
-                    {r.ai_summary && (
-                      <div>
-                        <h4 className="mb-2 text-[13px] font-semibold text-foreground">AI 摘要</h4>
-                        <p className="text-sm leading-relaxed text-muted-foreground">{r.ai_summary}</p>
-                      </div>
-                    )}
-                    <PostJudgmentDetails record={r} />
-                    <section className="border-t border-border/50 pt-5">
-                      <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
-                        <div>
-                          <h4 className="flex items-center gap-1.5 text-[13px] font-semibold text-foreground">
-                            <Sparkles className="h-4 w-4 text-primary" />
-                            深度剖析
-                          </h4>
-                          <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
-                            {r.sentiment === 'negative'
-                              ? '负面内容会自动拆解观点、传播风险与应对建议。'
-                              : '需要时可手动生成观点、风险与应对建议。'}
-                          </p>
-                        </div>
-                        {r.sentiment === 'negative' && <StatusBadge tone="negative">负面自动剖析</StatusBadge>}
-                      </div>
-                      <RecordAnalysisPanel
-                        record={r}
-                        canWrite={canProcess}
-                        autoRun={r.sentiment === 'negative'}
-                        embedded
-                      />
-                    </section>
-                    {hasVideo(r) && <RecordVideoPlayer key={String(r.id)} record={r} poster={cover} />}
-                    {hasVideo(r) && <TranscriptSection record={r} canWrite={canProcess} />}
-                    <RecordImageGallery
-                      key={`${r.id}-${imageEntries.map(item => `${item.url}::${item.ref}`).join('|')}`}
-                      recordId={String(r.id)}
-                      canRefresh={canWrite}
-                      images={images}
-                      imageRefs={imageEntries.map(item => item.ref)}
-                      onOpen={setLightbox}
-                    />
-                  </div>
+                  <RecordContentTab
+                    record={r}
+                    canProcess={canProcess}
+                    canRefreshImages={canWrite}
+                    cover={cover}
+                    images={images}
+                    imageRefs={imageEntries.map(item => item.ref)}
+                    imageKey={`${r.id}-${imageEntries.map(item => `${item.url}::${item.ref}`).join('|')}`}
+                    onOpenImage={setLightbox}
+                  />
                 )}
 
                 {tab === 'comments' && (
@@ -1345,17 +1310,38 @@ function hasVideo(r: any): boolean {
 }
 
 const TRANSCRIPT_TERMINAL = ['done', 'failed', 'expired', 'no_media']
+const CONTENT_SECTION_TITLE = 'text-[13px] font-semibold text-foreground'
+const CONTENT_ACTION_BUTTON = 'inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50'
+const TRANSCRIPT_CLAMP_CHARS = 240
+
+type TranscriptRecord = {
+  id?: string | number
+  transcript_status?: string | null
+  transcript?: string | null
+  transcript_error?: string | null
+  transcript_analysis?: TranscriptAnalysis | null
+}
+
+type TranscriptResponse = {
+  transcript_status?: string | null
+  transcript?: string | null
+  transcript_error?: string | null
+  transcript_analysis?: TranscriptAnalysis | null
+}
+
+type RecordTranscript = ReturnType<typeof useRecordTranscript>
 
 /**
  * 视频逐字稿:用阿里云百炼把视频口播转成文字,补"视频内容盲区"。
- * 转写异步(后台提交+轮询),这里点击触发后轮询 GET /records/:id/transcript。
+ * 转写异步(后台提交+轮询),点击触发后轮询 GET /records/:id/transcript。
+ * 逐字稿原文放在「原帖内容」，基于它的 AI 分析放在「AI 分析」，两处共用这一份状态。
  */
-function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolean }) {
+function useRecordTranscript(record: TranscriptRecord, enabled: boolean) {
   const [status, setStatus] = useState<string>(record.transcript_status || 'none')
   const [text, setText] = useState<string>(record.transcript || '')
   const [error, setError] = useState<string>(record.transcript_error || '')
   const [busy, setBusy] = useState(false)
-  const [analysis, setAnalysis] = useState<any>(record.transcript_analysis || null)
+  const [analysis, setAnalysis] = useState<TranscriptAnalysis | null>(record.transcript_analysis || null)
   const [analyzing, setAnalyzing] = useState(false)
   const [analyzeError, setAnalyzeError] = useState('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -1366,19 +1352,20 @@ function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolea
     stopPoll()
     pollRef.current = setInterval(async () => {
       try {
-        const d: any = await api.get(`/records/${record.id}/transcript`)
+        const d = await api.get<TranscriptResponse>(`/records/${record.id}/transcript`)
         setStatus(d.transcript_status || 'none')
         setText(d.transcript || '')
         setError(d.transcript_error || '')
-        if (TRANSCRIPT_TERMINAL.includes(d.transcript_status)) { stopPoll(); setBusy(false) }
+        if (TRANSCRIPT_TERMINAL.includes(String(d.transcript_status))) { stopPoll(); setBusy(false) }
       } catch { /* 单次轮询失败,下个周期再试 */ }
     }, 3500)
   }
 
   // 打开抽屉时主动从库里拉最新逐字稿 + AI 分析(列表行快照可能不含这些字段);在转写中则接着轮询
   useEffect(() => {
+    if (!enabled) return
     let cancelled = false
-    api.get(`/records/${record.id}/transcript`).then((d: any) => {
+    api.get<TranscriptResponse>(`/records/${record.id}/transcript`).then(d => {
       if (cancelled) return
       setStatus(d.transcript_status || 'none')
       setText(d.transcript || '')
@@ -1388,42 +1375,137 @@ function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolea
     }).catch(() => { /* 拉取失败保持快照初值 */ })
     return () => { cancelled = true; stopPoll() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [enabled])
 
   const generate = async () => {
     setBusy(true); setError('')
     try {
-      const d: any = await api.post(`/records/${record.id}/transcribe`, {})
+      const d = await api.post<{ status?: string }>(`/records/${record.id}/transcribe`, {})
       setStatus(d.status || 'pending')
       if (d.status === 'no_media') { setBusy(false); return }
       startPoll()
-    } catch (e: any) {
-      setStatus('failed'); setError(e?.message || '触发失败'); setBusy(false)
+    } catch (e) {
+      setStatus('failed'); setError(e instanceof Error ? e.message : '触发失败'); setBusy(false)
     }
   }
 
   const analyze = async () => {
     setAnalyzing(true); setAnalyzeError('')
     try {
-      const d: any = await api.post(`/records/${record.id}/analyze-transcript`, {})
+      const d = await api.post<{ analysis?: TranscriptAnalysis | null }>(`/records/${record.id}/analyze-transcript`, {})
       setAnalysis(d.analysis || null)
-    } catch (e: any) {
-      setAnalyzeError(e?.message || 'AI 分析失败')
+    } catch (e) {
+      setAnalyzeError(e instanceof Error ? e.message : 'AI 分析失败')
     } finally {
       setAnalyzing(false)
     }
   }
 
   const inProgress = status === 'pending' || status === 'processing'
-  const hasTranscript = status === 'done' && !!text
+  return {
+    status, text, error, busy, analysis, analyzing, analyzeError, generate, analyze, inProgress,
+    hasTranscript: status === 'done' && !!text,
+  }
+}
 
+type RecordContentTabProps = {
+  record: any
+  canProcess: boolean
+  canRefreshImages: boolean
+  cover: string
+  images: string[]
+  imageRefs: string[]
+  imageKey: string
+  onOpenImage: (url: string) => void
+}
+
+/**
+ * 「内容」页签分两层：上面是原帖本身（视频/图片及其文字、正文、逐字稿），不点原文也能看全；
+ * 下面是 AI 产出（摘要、深度剖析、视频内容分析、判断依据）。
+ */
+function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, images, imageRefs, imageKey, onOpenImage }: RecordContentTabProps) {
+  const video = hasVideo(r)
+  const transcript = useRecordTranscript(r, video)
+  const gallery = (
+    <RecordImageGallery
+      key={imageKey}
+      recordId={String(r.id)}
+      canRefresh={canRefreshImages}
+      images={images}
+      imageRefs={imageRefs}
+      onOpen={onOpenImage}
+      title={video && images.length === 1 ? '封面' : '图片'}
+    />
+  )
+  return (
+    <div className="space-y-9">
+      <section aria-label="原帖内容" className="space-y-6">
+        <ContentGroupHeader icon={FileText} title="原帖内容" />
+        {video && <RecordVideoPlayer key={String(r.id)} record={r} poster={cover} />}
+        {!video && gallery}
+        <div>
+          <h4 className={cn(CONTENT_SECTION_TITLE, 'mb-2')}>正文</h4>
+          <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || '无正文'}</p>
+        </div>
+        {video && <TranscriptTextSection transcript={transcript} canWrite={canProcess} />}
+        {/* 视频帖的图通常只有封面：放在正文和逐字稿后面，主要用来提取封面上的文字 */}
+        {video && gallery}
+      </section>
+
+      <section aria-label="AI 分析" className="space-y-6">
+        <ContentGroupHeader icon={Sparkles} title="AI 分析" />
+        {r.ai_summary && (
+          <div>
+            <h4 className={cn(CONTENT_SECTION_TITLE, 'mb-2')}>摘要</h4>
+            <p className="text-sm leading-relaxed">{r.ai_summary}</p>
+          </div>
+        )}
+        <div>
+          <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h4 className={CONTENT_SECTION_TITLE}>深度剖析</h4>
+              <p className="mt-1 text-[12px] leading-5 text-muted-foreground">
+                {r.sentiment === 'negative'
+                  ? '负面内容会自动拆解观点、传播风险与应对建议。'
+                  : '需要时可手动生成观点、风险与应对建议。'}
+              </p>
+            </div>
+            {r.sentiment === 'negative' && <StatusBadge tone="negative">负面自动剖析</StatusBadge>}
+          </div>
+          <RecordAnalysisPanel
+            record={r}
+            canWrite={canProcess}
+            autoRun={r.sentiment === 'negative'}
+            embedded
+          />
+        </div>
+        {video && transcript.hasTranscript && <TranscriptAnalysisSection transcript={transcript} canWrite={canProcess} />}
+        <PostJudgmentDetails record={r} />
+      </section>
+    </div>
+  )
+}
+
+function ContentGroupHeader({ icon: Icon, title }: { icon: React.ElementType; title: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      <Icon className="h-4 w-4 shrink-0 text-primary" />
+      <h3 className="shrink-0 text-[14px] font-semibold text-foreground">{title}</h3>
+      <span className="h-px flex-1 bg-border/70" aria-hidden="true" />
+    </div>
+  )
+}
+
+function TranscriptTextSection({ transcript, canWrite }: { transcript: RecordTranscript; canWrite: boolean }) {
+  const { status, text, error, busy, inProgress, generate } = transcript
+  const [expanded, setExpanded] = useState(false)
+  const long = text.length > TRANSCRIPT_CLAMP_CHARS
   return (
     <div>
-      <div className="mb-2 flex items-center justify-between">
-        <h4 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">视频逐字稿</h4>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <h4 className={CONTENT_SECTION_TITLE}>视频逐字稿</h4>
         {canWrite && !inProgress && (
-          <button onClick={generate} disabled={busy}
-            className="inline-flex items-center gap-1 rounded-md border border-border px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50">
+          <button type="button" onClick={generate} disabled={busy} className={CONTENT_ACTION_BUTTON}>
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FileText className="h-3.5 w-3.5" />}
             {status === 'done' ? '重新生成' : '生成逐字稿'}
           </button>
@@ -1432,7 +1514,15 @@ function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolea
       {inProgress ? (
         <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在转写中,约需数十秒…</p>
       ) : status === 'done' && text ? (
-        <p className="whitespace-pre-wrap text-sm leading-relaxed">{text}</p>
+        <>
+          <p className={cn('whitespace-pre-wrap text-sm leading-relaxed', long && !expanded && 'line-clamp-6')}>{text}</p>
+          {long && (
+            <button type="button" onClick={() => setExpanded(value => !value)}
+              className="mt-1 text-[12px] font-medium text-primary hover:underline">
+              {expanded ? '收起' : '展开全文'}
+            </button>
+          )}
+        </>
       ) : status === 'done' ? (
         <p className="text-sm text-muted-foreground">转写完成但无文本(可能无人声/纯音乐)。</p>
       ) : status === 'expired' ? (
@@ -1446,29 +1536,31 @@ function TranscriptSection({ record, canWrite }: { record: any; canWrite: boolea
       ) : (
         <p className="text-sm text-muted-foreground">尚未生成。点「生成逐字稿」用 AI 提取视频口播文本。</p>
       )}
+    </div>
+  )
+}
 
-      {hasTranscript && (
-        <div className="mt-4 rounded-lg border border-border/60 bg-muted/30 p-3">
-          <div className="mb-2 flex items-center justify-between">
-            <h4 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">AI 舆情分析</h4>
-            {canWrite && (
-              <button onClick={analyze} disabled={analyzing}
-                className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs font-semibold text-primary transition hover:bg-accent disabled:opacity-50">
-                {analyzing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-                {analysis ? '重新分析' : 'AI 分析'}
-              </button>
-            )}
-          </div>
-          {analyzing ? (
-            <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在分析口播内容…</p>
-          ) : analyzeError ? (
-            <p className="text-sm text-rose-600 dark:text-rose-400">{friendlyError(analyzeError)}</p>
-          ) : analysis ? (
-            <TranscriptInsights data={analysis} />
-          ) : (
-            <p className="text-sm text-muted-foreground">点「AI 分析」基于逐字稿提取核心观点 / 情绪 / 槽点 / 品牌风险 / 用户诉求。</p>
-          )}
-        </div>
+function TranscriptAnalysisSection({ transcript, canWrite }: { transcript: RecordTranscript; canWrite: boolean }) {
+  const { analysis, analyzing, analyzeError, analyze } = transcript
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <h4 className={CONTENT_SECTION_TITLE}>视频内容分析</h4>
+        {canWrite && (
+          <button type="button" onClick={analyze} disabled={analyzing} className={CONTENT_ACTION_BUTTON}>
+            {analyzing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            {analysis ? '重新分析' : 'AI 分析'}
+          </button>
+        )}
+      </div>
+      {analyzing ? (
+        <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />正在分析口播内容…</p>
+      ) : analyzeError ? (
+        <p className="text-sm text-rose-600 dark:text-rose-400">{friendlyError(analyzeError)}</p>
+      ) : analysis ? (
+        <TranscriptInsights data={analysis} />
+      ) : (
+        <p className="text-sm text-muted-foreground">点「AI 分析」基于逐字稿提取核心观点 / 情绪 / 槽点 / 品牌风险 / 用户诉求。</p>
       )}
     </div>
   )
