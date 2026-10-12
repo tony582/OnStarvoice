@@ -1,5 +1,5 @@
 import {FILTER_OPTIONS, hasSemanticFilters, semanticFilterSelector} from '../device/douyin-semantic-filters.mjs';
-import {hasNativeFilters, nativeFilterSelector, nativeFilterApplySelector} from '../device/douyin-native-filters.mjs';
+import {hasNativeFilters, nativeFilterSelector, nativeFilterApplySelector, nativeFilterResetState} from '../device/douyin-native-filters.mjs';
 import { randomUUID } from 'node:crypto';
 import { DeviceError } from '../device/bounded.mjs';
 import { descendants, visible } from '../device/ui-tree.mjs';
@@ -73,20 +73,49 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
     const tree = await ui.waitFor(tree => readSearch(tree, keyword).verified, options);
     return readSearch(tree, keyword);
   };
-  const filterState = async (options) => {
+  const filterState = async (options, verifyExisting = false) => {
     try {
       await ui.clickXPath(`//*[@resource-id='${resource('hb9')}' and @content-desc='筛选，按钮']`, options);
       await ui.setWindowScope(true, options);
-      const tree = await ui.waitFor(tree => (hasNativeFilters(tree) || hasSemanticFilters(tree) || byId(tree, 'hdi').length === 5)
-        && filterReadbackMatches(tree), options);
+      let reset = null;
+      let tree = await ui.waitFor(tree => {
+        reset = null;
+        if (!(hasNativeFilters(tree) || hasSemanticFilters(tree) || byId(tree, 'hdi').length === 5)) return false;
+        if (filterReadbackMatches(tree)) return true;
+        if (!hasNativeFilters(tree)) return false;
+        try { reset = nativeFilterResetState(tree); return reset !== null; }
+        catch (error) { if (error?.code === 'filter_unverified') return false; throw error; }
+      }, options);
       nativeFilters = hasNativeFilters(tree);
       semanticFilters = hasSemanticFilters(tree);
+      if (reset) {
+        // Check every known choice before recovery. The null scope is not accepted as selected: Reset must
+        // restore a fully readable panel, then the requested choices are explicitly applied and re-read.
+        if (verifyExisting && !filtersMatch({...reset.knownGroups, 搜索范围: '不限'}, requireContext().filters)) {
+          throw new DeviceError('search_filters_changed', 'Search filters changed');
+        }
+        await ui.clickXPath(reset.selector, options);
+        tree = await ui.waitFor(tree => hasNativeFilters(tree) && filterReadbackMatches(tree), options);
+        if (verifyExisting) tree = await applySelections(tree, options);
+      }
       return tree;
     } catch (error) { error.stage ??= 'search:filter_panel'; throw error; }
   };
+  const applySelections = async (panel, options) => {
+    const {filters} = requireContext();
+    for (const [group, choice] of [['排序依据', filters.sort], ['发布时间', filters.time],
+      ['视频时长', '不限'], ['搜索范围', '不限'], ['内容形式', filters.content ?? '不限'],
+      ...(semanticFilters || nativeFilters ? [['位置距离','不限']] : [])]) {
+      if (readFilters(panel)[group] === choice) continue;
+      await ui.clickXPath(nativeFilters ? nativeFilterSelector(group,choice,panel)
+        : semanticFilters ? semanticFilterSelector(group,choice,panel) : filterSelector(group, choice), options);
+      panel = await ui.waitFor(tree => filterReadbackMatches(tree, groups => groups[group] === choice), options);
+    }
+    return ui.waitFor(tree => filterReadbackMatches(tree, groups => filtersMatch(groups, filters)), options);
+  };
   const verifyFilters = async (options) => {
     try {
-      const tree = await filterState(options);
+      const tree = await filterState(options, true);
       if (!filtersMatch(readFilters(tree), requireContext().filters)) throw new DeviceError('search_filters_changed', 'Search filters changed');
       await closeFilters(tree, options);
     } finally { await ui.setWindowScope(false, { timeoutMs: 5000 }); }
@@ -105,16 +134,7 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
       await ui.input('et_search_kw', keyword, options); await ui.clickId('0g9', options);
       context = { keyword, filters: { ...filters } }; await results(options);
       try {
-      let panel = await filterState(options);
-      for (const [group, choice] of [['排序依据', filters.sort], ['发布时间', filters.time],
-        ['视频时长', '不限'], ['搜索范围', '不限'], ['内容形式', filters.content ?? '不限'],
-        ...(semanticFilters || nativeFilters ? [['位置距离','不限']] : [])]) {
-        if (readFilters(panel)[group] === choice) continue;
-        await ui.clickXPath(nativeFilters ? nativeFilterSelector(group,choice,panel)
-          : semanticFilters ? semanticFilterSelector(group,choice,panel) : filterSelector(group, choice), options);
-        panel = await ui.waitFor(tree => filterReadbackMatches(tree, groups => groups[group] === choice), options);
-      }
-      tree = await ui.waitFor(tree => filterReadbackMatches(tree, groups => filtersMatch(groups, filters)), options);
+      tree = await applySelections(await filterState(options), options);
       if (!filtersMatch(readFilters(tree), filters)) throw new DeviceError('filter_unverified', 'Filter readback did not match');
       await closeFilters(tree, options);
       } finally { await ui.setWindowScope(false, { timeoutMs: 5000 }); }

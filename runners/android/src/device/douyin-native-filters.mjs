@@ -14,7 +14,7 @@ const panels = tree => tree.nodes.filter(node => is(node, 'iu1')
   && within(node, 'jhx').some(label => label.attributes.text === '排序依据'));
 export const hasNativeFilters = tree => panels(tree).length > 0;
 
-function panelState(tree) {
+function panelState(tree, {repairScope = false} = {}) {
   const matches = panels(tree);
   if (matches.length !== 1) throw new DeviceError('filter_ambiguous', 'Native filter panel is missing or ambiguous');
   const panel = matches[0], groups = {};
@@ -28,16 +28,21 @@ function panelState(tree) {
       const texts = within(node, 'vlc');
       const choice = texts[0]?.attributes.text;
       const state = node.attributes['content-desc']?.match(/^(已选中|未选中)，(.+)，按钮$/u);
-      if (texts.length !== 1 || !FILTER_OPTIONS[group].includes(choice) || state?.[2] !== choice
+      // After returning from a note, Douyin can omit only 搜索范围/不限's description. It is unknown,
+      // never inferred as selected; the repair reader may locate Reset, but cannot apply this panel.
+      const unknown = repairScope && group === '搜索范围' && choice === '不限' && !node.attributes['content-desc'];
+      if (texts.length !== 1 || !FILTER_OPTIONS[group].includes(choice) || (!unknown && state?.[2] !== choice)
         || node.attributes.clickable !== 'true') {
         throw new DeviceError('filter_unverified', 'Native filter choice and accessible state disagree');
       }
-      return {node, choice, selected: state[1] === '已选中'};
+      return {node, choice, selected: unknown ? null : state[1] === '已选中'};
     });
     if (new Set(choices.map(item => item.choice)).size !== choices.length) {
       throw new DeviceError('filter_ambiguous', 'Native filter choice is repeated within its group');
     }
-    if (choices.filter(item => item.selected).length !== 1) {
+    const unknown = choices.some(item => item.selected === null);
+    const selected = choices.filter(item => item.selected === true).length;
+    if (unknown ? selected !== 0 || choices.length !== FILTER_OPTIONS[group].length : selected !== 1) {
       throw new DeviceError('filter_unverified', 'Native filter group must have exactly one selected choice');
     }
     groups[group] = choices;
@@ -67,14 +72,25 @@ export function nativeFilterSelector(group, choice, tree) {
     + ` and @bounds=${bounds} and .//*[@resource-id=${xpathLiteral(id('vlc'))} and @text=${xpathLiteral(choice)}]]`;
 }
 
-export function nativeFilterApplySelector(tree) {
-  const {panel} = panelState(tree);
+function popupButtonSelector(panel, name, text) {
   const popup = panel.parent?.parent;
-  const buttons = popup && is(popup, 'y+_') ? within(popup, 'beg').filter(node =>
-    node.attributes.class === 'android.widget.Button' && node.attributes.text === '查看结果'
+  const buttons = popup && is(popup, 'y+_') ? within(popup, name).filter(node =>
+    node.attributes.class === 'android.widget.Button' && node.attributes.text === text
     && node.attributes.clickable === 'true') : [];
   if (buttons.length !== 1) throw new DeviceError('filter_ambiguous', 'Native filter apply button is missing or ambiguous');
   return `//*[@package=${xpathLiteral(PACKAGE)} and @resource-id=${xpathLiteral(id('y+_'))}]`
-    + `//*[@resource-id=${xpathLiteral(id('beg'))} and @text='查看结果' and @clickable='true'`
+    + `//*[@resource-id=${xpathLiteral(id(name))} and @text=${xpathLiteral(text)} and @clickable='true'`
     + ` and @bounds=${xpathLiteral(buttons[0].attributes.bounds)}]`;
+}
+
+export function nativeFilterApplySelector(tree) {
+  return popupButtonSelector(panelState(tree).panel, 'beg', '查看结果');
+}
+
+/** Only the measured missing scope marker qualifies. All other choices must be readable and unambiguous. */
+export function nativeFilterResetState(tree) {
+  const {panel, groups} = panelState(tree, {repairScope: true});
+  if (!groups['搜索范围'].some(item => item.selected === null)) return null;
+  return {selector: popupButtonSelector(panel, 'bo6', '重置选项'),
+    knownGroups: Object.fromEntries(FILTER_GROUPS.map(group => [group, groups[group].find(item => item.selected === true)?.choice ?? null]))};
 }

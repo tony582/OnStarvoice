@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {parseUiTree, descendants} from '../src/device/ui-tree.mjs';
 import {DeviceError} from '../src/device/bounded.mjs';
-import {hasNativeFilters, readNativeFilters, nativeFilterSelector, nativeFilterApplySelector} from '../src/device/douyin-native-filters.mjs';
+import {hasNativeFilters, readNativeFilters, nativeFilterSelector, nativeFilterApplySelector, nativeFilterResetState} from '../src/device/douyin-native-filters.mjs';
 import {readFilters, readSearch, filtersMatch} from '../src/device/douyin-profile.mjs';
 import {createDouyinCalibrationFlow} from '../src/calibration/douyin-flow.mjs';
 
@@ -14,10 +14,11 @@ const keyword = '测试关键词';
 const desired = {sort: '综合排序', time: '一天内', content: '不限'};
 const fixture = () => parseUiTree(xml);
 const label = (tree, group) => tree.nodes.find(node => node.attributes.text === group);
+const choices = (tree, group) => descendants(label(tree, group).parent).filter(node => node.attributes['resource-id']?.endsWith('/jhg'));
 function select(tree, group, choice) {
-  for (const node of descendants(label(tree, group).parent)) {
-    const state = node.attributes['content-desc']?.match(/^(?:已选中|未选中)，(.+)，按钮$/u);
-    if (state) node.attributes['content-desc'] = `${state[1] === choice ? '已选中' : '未选中'}，${state[1]}，按钮`;
+  for (const node of choices(tree, group)) {
+    const text = descendants(node).find(child => child.attributes['resource-id']?.endsWith('/vlc')).attributes.text;
+    node.attributes['content-desc'] = `${text === choice ? '已选中' : '未选中'}，${text}，按钮`;
   }
   return tree;
 }
@@ -76,8 +77,9 @@ test('native readback rejects missing groups, duplicate panels and ambiguous or 
   assert.throws(() => nativeFilterApplySelector(noApply), {code: 'filter_ambiguous'});
 });
 
-function scenario({ignoreDay = false, ignoreApply = false, missingPanel = false, transientPanel = false, time = '不限', location = '不限'} = {}) {
+function scenario({ignoreDay = false, ignoreApply = false, missingPanel = false, transientPanel = false, time = '不限', location = '不限', missingScope = false, ignoreReset = false} = {}) {
   const panel = select(select(fixture(), '发布时间', time), '位置距离', location);
+  if (missingScope) delete choices(panel, '搜索范围')[0].attributes['content-desc'];
   const opening = fixture(); label(opening, '位置距离').parent.attributes.displayed = 'false';
   const page = results(), actions = [], scopes = [];
   let popup = false, multi = false;
@@ -94,6 +96,11 @@ function scenario({ignoreDay = false, ignoreApply = false, missingPanel = false,
     clickXPath: async selector => {
       actions.push(selector);
       if (selector.includes('筛选，按钮')) popup = true;
+      else if (selector.includes("@text='重置选项'")) {
+        if (!ignoreReset) for (const group of ['排序依据', '发布时间', '视频时长', '搜索范围', '内容形式', '位置距离']) {
+          select(panel, group, group === '排序依据' ? '综合排序' : '不限');
+        }
+      }
       else if (selector.includes("@text='发布时间'")) { if (!ignoreDay) select(panel, '发布时间', '一天内'); }
       else if (selector.includes("@text='位置距离'")) select(panel, '位置距离', '不限');
       else if (selector.includes("@text='查看结果'")) {
@@ -142,4 +149,47 @@ test('reopening the native popup verifies the applied day filter and rejects unl
   await assert.rejects(wrong.flow.adoptCurrentSearch({keyword, filters: desired}), {code: 'search_filters_changed'});
   assert.equal(wrong.actions.length, 1);
   assert.equal(wrong.scopes.at(-1), false);
+});
+
+test('a missing scope marker only authorizes the measured reset, never a filter readback or apply', () => {
+  const tree = fixture(); delete choices(tree, '搜索范围')[0].attributes['content-desc'];
+  assert.throws(() => readNativeFilters(tree), {code: 'filter_unverified'});
+  assert.throws(() => nativeFilterApplySelector(tree), {code: 'filter_unverified'});
+  const reset = nativeFilterResetState(tree);
+  assert.equal(reset.knownGroups['搜索范围'], null);
+  assert.match(reset.selector, /@text='重置选项'/u);
+  choices(tree, '搜索范围')[1].attributes['content-desc'] = '已选中，关注的人，按钮';
+  assert.throws(() => nativeFilterResetState(tree), {code: 'filter_unverified'});
+  const missingDay = fixture(); delete choices(missingDay, '发布时间')[0].attributes['content-desc'];
+  assert.throws(() => nativeFilterResetState(missingDay), {code: 'filter_unverified'});
+  const missingChoice = fixture(); delete choices(missingChoice, '搜索范围')[0].attributes['content-desc'];
+  choices(missingChoice, '搜索范围')[3].attributes.displayed = 'false';
+  assert.throws(() => nativeFilterResetState(missingChoice), {code: 'filter_unverified'});
+});
+
+test('search and reopening reset the missing scope marker once and then explicitly reapply one day', async () => {
+  for (const operation of ['search', 'adoptCurrentSearch']) {
+    const run = scenario({missingScope: true, time: '一天内'});
+    assert.equal((await run.flow[operation]({keyword, filters: desired})).verified, true);
+    assert.equal(run.actions.filter(action => action.includes("@text='重置选项'")).length, 1);
+    const reset = run.actions.findIndex(action => action.includes("@text='重置选项'"));
+    const day = run.actions.findIndex(action => action.includes("@text='一天内'"));
+    const apply = run.actions.findIndex(action => action.includes("@text='查看结果'"));
+    assert.ok(reset < day && day < apply);
+    assert.equal(run.scopes.at(-1), false);
+  }
+});
+
+test('reset failure remains bounded and recovery cannot erase a known changed filter', async () => {
+  for (const operation of ['search', 'adoptCurrentSearch']) {
+    const run = scenario({missingScope: true, ignoreReset: true, time: '一天内'});
+    await assert.rejects(run.flow[operation]({keyword, filters: desired}), {code: 'device_timeout'});
+    assert.equal(run.actions.filter(action => action.includes("@text='重置选项'")).length, 1);
+    assert.equal(run.actions.some(action => action.includes("@text='查看结果'")), false);
+    assert.equal(run.scopes.at(-1), false);
+    await assert.rejects(run.flow.readCards(), {code: 'search_context_unverified'});
+  }
+  const changed = scenario({missingScope: true, time: '不限'});
+  await assert.rejects(changed.flow.adoptCurrentSearch({keyword, filters: desired}), {code: 'search_filters_changed'});
+  assert.equal(changed.actions.length, 1, 'no reset can hide a known time-filter mismatch');
 });
