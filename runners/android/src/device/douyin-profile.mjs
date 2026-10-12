@@ -1,4 +1,5 @@
 import {hasSemanticFilters, readSemanticFilters} from './douyin-semantic-filters.mjs';
+import {hasNativeFilters, readNativeFilters} from './douyin-native-filters.mjs';
 import { createHash } from 'node:crypto';
 import { DeviceError } from './bounded.mjs';
 import { descendants, visible, xpathLiteral } from './ui-tree.mjs';
@@ -27,7 +28,7 @@ export function readSearch(tree, keyword) {
   const tabs = appNodes(tree).filter(node => node.attributes['resource-id'] === 'android:id/text1'
     && node.attributes.text === '综合' && node.attributes.selected === 'true');
   const verified = input.length === 1 && input[0].attributes.text === keyword && tabs.length === 1
-    && !byId(tree, 'hdi').length && !hasSemanticFilters(tree);
+    && !byId(tree, 'hdi').length && !hasSemanticFilters(tree) && !hasNativeFilters(tree);
   const cards = verified ? byId(tree, 'b87').flatMap(card => {
     const title = oneText(within(card, 'desc')); const author = oneText(within(card, 'ab0'));
     if (!title || !author) return [];
@@ -90,6 +91,7 @@ export const isDouyinHome = tree => searchEntryNodes(tree).length === 1
   && homeButtons(tree).length === 1 && homeButtons(tree)[0].attributes.selected === 'true';
 
 export function readFilters(tree) {
+  if (hasNativeFilters(tree)) return readNativeFilters(tree);
   if (hasSemanticFilters(tree)) return readSemanticFilters(tree);
   const groups = {};
   for (const label of byId(tree, 'hdi')) {

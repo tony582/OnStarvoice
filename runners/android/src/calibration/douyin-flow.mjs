@@ -1,4 +1,5 @@
 import {FILTER_OPTIONS, hasSemanticFilters, semanticFilterSelector} from '../device/douyin-semantic-filters.mjs';
+import {hasNativeFilters, nativeFilterSelector, nativeFilterApplySelector} from '../device/douyin-native-filters.mjs';
 import { randomUUID } from 'node:crypto';
 import { DeviceError } from '../device/bounded.mjs';
 import { descendants, visible } from '../device/ui-tree.mjs';
@@ -18,6 +19,13 @@ const MAX_DETAIL_READY_MS = 40_000;
 const RETURN_BUDGET_MS = 15_000;
 // A verified search that shows no card list gets this long for late cards before it counts as empty.
 const EMPTY_RESULTS_BUDGET_MS = 20_000;
+
+// The native popup exposes its first group before its opening/selection animation has filled the rest.
+// An incomplete selection is retried inside waitFor's existing bound; ambiguous panels still fail closed.
+const filterReadbackMatches = (tree, predicate = () => true) => {
+  try { return predicate(readFilters(tree)); }
+  catch (error) { if (error?.code === 'filter_unverified') return false; throw error; }
+};
 
 const cardLists = tree => tree.nodes.filter(node => visible(node)
   && node.attributes.class === 'androidx.recyclerview.widget.RecyclerView'
@@ -47,8 +55,15 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
   let context = null;
   let opened = null;
   let semanticFilters = false;
-  const closeFilters = options => semanticFilters
-    ? ui.clickXPath("//*[@content-desc='关闭筛选']",options) : ui.clickId('zsg',options);
+  let nativeFilters = false;
+  const closeFilters = async (tree, options) => {
+    if (nativeFilters) await ui.clickXPath(nativeFilterApplySelector(tree), options);
+    else if (semanticFilters) await ui.clickXPath("//*[@content-desc='关闭筛选']", options);
+    else await ui.clickId('zsg', options);
+    // Keep popup windows visible until the panel is gone and the requested search is verified.
+    // Switching scope first could hide an unapplied popup and falsely accept the results behind it.
+    await results(options);
+  };
   const requireContext = () => {
     if (!context) throw new DeviceError('search_context_unverified', 'Search calibration has not established a context');
     return context;
@@ -59,17 +74,21 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
     return readSearch(tree, keyword);
   };
   const filterState = async (options) => {
-    await ui.clickXPath(`//*[@resource-id='${resource('hb9')}' and @content-desc='筛选，按钮']`, options);
-    await ui.setWindowScope(false, options);
-    const tree = await ui.waitFor(tree => hasSemanticFilters(tree) || byId(tree, 'hdi').length === 5, options);
-    semanticFilters = hasSemanticFilters(tree);
-    return tree;
+    try {
+      await ui.clickXPath(`//*[@resource-id='${resource('hb9')}' and @content-desc='筛选，按钮']`, options);
+      await ui.setWindowScope(true, options);
+      const tree = await ui.waitFor(tree => (hasNativeFilters(tree) || hasSemanticFilters(tree) || byId(tree, 'hdi').length === 5)
+        && filterReadbackMatches(tree), options);
+      nativeFilters = hasNativeFilters(tree);
+      semanticFilters = hasSemanticFilters(tree);
+      return tree;
+    } catch (error) { error.stage ??= 'search:filter_panel'; throw error; }
   };
   const verifyFilters = async (options) => {
     try {
       const tree = await filterState(options);
       if (!filtersMatch(readFilters(tree), requireContext().filters)) throw new DeviceError('search_filters_changed', 'Search filters changed');
-      await closeFilters(options);
+      await closeFilters(tree, options);
     } finally { await ui.setWindowScope(false, { timeoutMs: 5000 }); }
     return results(options);
   };
@@ -89,14 +108,15 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
       let panel = await filterState(options);
       for (const [group, choice] of [['排序依据', filters.sort], ['发布时间', filters.time],
         ['视频时长', '不限'], ['搜索范围', '不限'], ['内容形式', filters.content ?? '不限'],
-        ...(semanticFilters ? [['位置距离','不限']] : [])]) {
+        ...(semanticFilters || nativeFilters ? [['位置距离','不限']] : [])]) {
         if (readFilters(panel)[group] === choice) continue;
-        await ui.clickXPath(semanticFilters ? semanticFilterSelector(group,choice,panel) : filterSelector(group, choice), options);
-        panel = await ui.waitFor(tree => readFilters(tree)[group] === choice, options);
+        await ui.clickXPath(nativeFilters ? nativeFilterSelector(group,choice,panel)
+          : semanticFilters ? semanticFilterSelector(group,choice,panel) : filterSelector(group, choice), options);
+        panel = await ui.waitFor(tree => filterReadbackMatches(tree, groups => groups[group] === choice), options);
       }
-      tree = await ui.read(options);
+      tree = await ui.waitFor(tree => filterReadbackMatches(tree, groups => filtersMatch(groups, filters)), options);
       if (!filtersMatch(readFilters(tree), filters)) throw new DeviceError('filter_unverified', 'Filter readback did not match');
-      await closeFilters(options);
+      await closeFilters(tree, options);
       } finally { await ui.setWindowScope(false, { timeoutMs: 5000 }); }
       return await results(options);
       } catch (error) { context = null; throw error; }
