@@ -74,6 +74,13 @@ export function detailMatchesCard(detail, card) {
   // Search may join a separate note heading and body with a full stop.
   // Preserve all punctuation inside both fields; this is not fuzzy matching.
   if (detail.kind === 'note' && detail.heading && detail.body) captions.push(`${detail.heading}。${detail.body}`);
+  // The native note page can expose that same heading/body as one tv_desc, joined by a newline (DE106,
+  // 2026-10-13). Only its first line boundary may become the search separator; every other character and
+  // the already-checked author must still match. Never strip punctuation or apply this to video captions.
+  if (detail.kind === 'note' && !detail.heading) {
+    const lines = detail.title.match(/^([^\r\n]+)\r?\n([\s\S]+)$/u);
+    if (lines && normalizeCaption(lines[1]) && normalizeCaption(lines[2])) captions.push(`${lines[1]}。${lines[2]}`);
+  }
   if (captions.some(value => normalizeCaption(value) === wanted)) return true;
   if (detail.kind !== 'video' || detail.captionClickable !== true) return false;
   if (UNFOLDED_LABEL.test(detail.title)) return normalizeCaption(detail.title.replace(UNFOLDED_LABEL, '')) === wanted;
