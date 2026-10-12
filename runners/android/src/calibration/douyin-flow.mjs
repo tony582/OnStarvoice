@@ -19,6 +19,9 @@ const MAX_DETAIL_READY_MS = 40_000;
 const RETURN_BUDGET_MS = 15_000;
 // A verified search that shows no card list gets this long for late cards before it counts as empty.
 const EMPTY_RESULTS_BUDGET_MS = 20_000;
+// Finding the home search button dumps the same slow feed hierarchy as read(): DE106 took 6.7 s
+// on 2026-10-13, exceeding the transport's 5 s default. Only this lookup gets the existing 10 s read bound.
+const HOME_SEARCH_LOOKUP_MS = 10_000;
 
 // The native popup exposes its first group before its opening/selection animation has filled the rest.
 // An incomplete selection is retried inside waitFor's existing bound; ambiguous panels still fail closed.
@@ -126,10 +129,14 @@ export function createDouyinCalibrationFlow({ ui, now = () => performance.now() 
       context = null;
       try {
       assertCalibratedSearch(keyword, filters);
-      const options = { signal }; await ui.setWindowScope(false, options); let tree = await ui.read(options);
-      if (!byId(tree, 'et_search_kw').length && searchEntryNodes(tree).length === 1) {
-        await ui.clickXPath(`//*[@resource-id='${resource('hmy')}' and @content-desc='搜索']`,options); tree = await ui.waitFor(tree => byId(tree, 'et_search_kw').length === 1, options);
-      }
+      const options = { signal }; await ui.setWindowScope(false, options); let tree;
+      try {
+        tree = await ui.read(options);
+        if (!byId(tree, 'et_search_kw').length && searchEntryNodes(tree).length === 1) {
+          await ui.clickXPath(`//*[@resource-id='${resource('hmy')}' and @content-desc='搜索']`, {...options, timeoutMs: HOME_SEARCH_LOOKUP_MS});
+          tree = await ui.waitFor(tree => byId(tree, 'et_search_kw').length === 1, options);
+        }
+      } catch (error) { error.stage ??= 'search:entry'; throw error; }
       if (byId(tree, 'et_search_kw').length !== 1) throw new DeviceError('search_entry_unverified', 'Search entry is not visible');
       await ui.input('et_search_kw', keyword, options); await ui.clickId('0g9', options);
       context = { keyword, filters: { ...filters } }; await results(options);

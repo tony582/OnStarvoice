@@ -187,11 +187,16 @@ test('expired upload window closes interrupted while durable events retain their
       response.statusCode = 503; response.setHeader('retry-after', '60'); json({ok: false}); return true;
     }
   }});
-  f.state.task.deadlineAt = new Date(Date.now() + 60).toISOString();
   const store = new RunnerStore(join(f.directory, 'runner.sqlite'));
   const daemon = new AndroidDaemon({...options(f), store});
   const running = daemon.run();
   t.after(async () => { daemon.requestStop(); await running; store.close(); });
+  // Expire the upload window only after the two events and completion are durable. A 60 ms deadline
+  // from test setup could expire before any device action on a busy CI worker, testing a different path.
+  await until(() => stateValue(store, 'daemon:completion')?.status === 'completed' && store.pendingCount() === 2);
+  const wallNow = Date.now;
+  const advance = Math.max(0, Date.parse(f.state.task.deadlineAt) - wallNow() + 1);
+  t.mock.method(Date, 'now', () => wallNow() + advance);
   await until(() => f.state.completed);
   daemon.requestStop(); await running;
   const complete = f.state.calls.find(c => c.path.endsWith('/complete')).body;

@@ -77,13 +77,14 @@ test('native readback rejects missing groups, duplicate panels and ambiguous or 
   assert.throws(() => nativeFilterApplySelector(noApply), {code: 'filter_ambiguous'});
 });
 
-function scenario({ignoreDay = false, ignoreApply = false, missingPanel = false, transientPanel = false, time = '不限', location = '不限', missingScope = false, ignoreReset = false} = {}) {
+function scenario({ignoreDay = false, ignoreApply = false, missingPanel = false, transientPanel = false, time = '不限', location = '不限', missingScope = false, ignoreReset = false, homeLookupMs = 0} = {}) {
   const panel = select(select(fixture(), '发布时间', time), '位置距离', location);
   if (missingScope) delete choices(panel, '搜索范围')[0].attributes['content-desc'];
   const opening = fixture(); label(opening, '位置距离').parent.attributes.displayed = 'false';
-  const page = results(), actions = [], scopes = [];
-  let popup = false, multi = false;
-  const current = () => popup && multi && !missingPanel ? panel : page;
+  const page = results(), actions = [], scopes = [], actionOptions = [];
+  const home = parseUiTree('<hierarchy><node package="com.ss.android.ugc.aweme" resource-id="com.ss.android.ugc.aweme:id/2r9" content-desc="搜索" displayed="true" bounds="[900,100][1050,200]"/></hierarchy>');
+  let popup = false, multi = false, onHome = homeLookupMs > 0;
+  const current = () => onHome ? home : popup && multi && !missingPanel ? panel : page;
   const ui = {
     setWindowScope: async value => { multi = value; scopes.push(value); },
     read: async () => current(),
@@ -93,9 +94,13 @@ function scenario({ignoreDay = false, ignoreApply = false, missingPanel = false,
       throw new DeviceError('device_timeout', 'Fixture readiness timed out');
     },
     input: async () => {}, clickId: async () => {},
-    clickXPath: async selector => {
-      actions.push(selector);
-      if (selector.includes('筛选，按钮')) popup = true;
+    clickXPath: async (selector, options) => {
+      actions.push(selector); actionOptions.push(options);
+      if (selector.includes("@content-desc='搜索'")) {
+        if ((options?.timeoutMs ?? 5000) < homeLookupMs) throw new DeviceError('device_timeout', 'Slow home lookup timed out');
+        onHome = false;
+      }
+      else if (selector.includes('筛选，按钮')) popup = true;
       else if (selector.includes("@text='重置选项'")) {
         if (!ignoreReset) for (const group of ['排序依据', '发布时间', '视频时长', '搜索范围', '内容形式', '位置距离']) {
           select(panel, group, group === '排序依据' ? '综合排序' : '不限');
@@ -110,7 +115,7 @@ function scenario({ignoreDay = false, ignoreApply = false, missingPanel = false,
       } else assert.fail(`unexpected click: ${selector}`);
     },
   };
-  return {flow: createDouyinCalibrationFlow({ui}), actions, scopes, panel};
+  return {flow: createDouyinCalibrationFlow({ui}), actions, scopes, panel, actionOptions};
 }
 
 test('search reads the separate popup, selects one day and resets location before applying and restoring scope', async () => {
@@ -192,4 +197,18 @@ test('reset failure remains bounded and recovery cannot erase a known changed fi
   const changed = scenario({missingScope: true, time: '不限'});
   await assert.rejects(changed.flow.adoptCurrentSearch({keyword, filters: desired}), {code: 'search_filters_changed'});
   assert.equal(changed.actions.length, 1, 'no reset can hide a known time-filter mismatch');
+});
+
+test('the measured 6.7 second home lookup fits its own bound without extending later actions or retrying clicks', async () => {
+  const run = scenario({homeLookupMs: 6700});
+  const signal = new AbortController().signal;
+  assert.equal((await run.flow.search({keyword, filters: desired, signal})).verified, true);
+  assert.equal(run.actions.filter(action => action.includes("@content-desc='搜索'")).length, 1);
+  assert.equal(run.actionOptions[0].timeoutMs, 10000);
+  assert.equal(run.actionOptions[0].signal, signal);
+  assert.ok(run.actionOptions.slice(1).every(options => options.timeoutMs === undefined && options.signal === signal));
+  const stuck = scenario({homeLookupMs: 12000});
+  await assert.rejects(stuck.flow.search({keyword, filters: desired}), {code: 'device_timeout', stage: 'search:entry'});
+  assert.equal(stuck.actions.length, 1);
+  await assert.rejects(stuck.flow.readCards(), {code: 'search_context_unverified'});
 });
