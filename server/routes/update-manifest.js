@@ -3,12 +3,24 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.23',
+  latestVersion: '0.4.24',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-10-07',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.23-20261007.zip',
+  releaseDate: '2026-10-14',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.24-20261014.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.24',
+      releaseDate: '2026-10-14',
+      releaseNotes: [{
+        tag: '界面',
+        notes: [
+          {title: '新版界面按节点试用', desc: '默认仍为经典界面，从右上角菜单选择「试用新版界面」，新版设置内可「切回经典界面」。选择仅在当前浏览器配置文件生效，不强制其它节点切换；新旧节点继续使用同一套采集服务。'},
+          {title: '采集与结果分区更清楚', desc: '顶部保留笔记页、博主页、搜索页，底部为采集、任务、创意、设置。逐条采集内容与原操作保留；对标监控、帮助和授权入口统一到设置，平台切换在右上角。'},
+          {title: '批量入口统一，采集逻辑不变', desc: '搜索页主按钮旁统一提供批量采集作品、批量采集博主，使用原弹窗与原采集条件；博主需填写完整主页链接。采集引擎、任务协议、同步与安全保护均未修改。升级须在节点空闲且结果安全保存后进行；不要在同一浏览器并装第二份扩展。'},
+        ],
+      }],
+    },
     {
       version: '0.4.23',
       releaseDate: '2026-10-07',

@@ -7,6 +7,14 @@ import path from "node:path";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+// A release may bump only manifest.version; permissions and all other manifest
+// fields must still match the previous shipping snapshot and HEAD.
+const comparable = (name, bytes) => {
+  if (name !== "manifest.json") return bytes;
+  const manifest = JSON.parse(bytes.toString());
+  delete manifest.version;
+  return JSON.stringify(manifest);
+};
 async function files(directory, prefix = "") {
   const entries = await readdir(directory, {withFileTypes: true});
   const result = [];
@@ -23,9 +31,9 @@ for (const name of protectedFiles) {
   const current = await readFile(path.join(root, name));
   const shipping = await readFile(path.join(root, "extension-build", name));
   const baseline = execFileSync("git", ["show", `HEAD:${name}`], {cwd: root, maxBuffer: 24 * 1024 * 1024});
-  if (digest(current) !== digest(shipping) || digest(current) !== digest(baseline)) throw new Error(`Protected collection file changed: ${name}`);
+  if (digest(comparable(name, current)) !== digest(comparable(name, shipping)) || digest(comparable(name, current)) !== digest(comparable(name, baseline))) throw new Error(`Protected collection file changed: ${name}`);
 }
-console.log(`PASS: ${protectedFiles.length} protected files match HEAD and the existing shipping snapshot.`);
+console.log(`PASS: ${protectedFiles.length - 1} protected code files match HEAD and the existing shipping snapshot; manifest matches except release version.`);
 for (const name of ["sidebar/ui-mode.js", "sidebar/ui-next.js", "sidebar/ui-next-icons.js", "sidebar/sidebar-ui.js"]) {
   execFileSync(process.execPath, ["--check", name], {cwd: root, stdio: "inherit"});
 }
