@@ -176,3 +176,30 @@ for (const failure of ["stylesheet", "mount"]) test(`${failure} failure keeps th
   assert.deepEqual(writes.at(-1), [UI_MODE_KEY, "legacy"]);
   assert.match(notices[0], /已保留经典界面/);
 });
+
+test("successful mode changes notify result renderers only after the root mode changes", async () => {
+  const events = [], writes = [], classes = new Set();
+  let mounts = 0, unmounts = 0;
+  const create = () => ({setAttribute() {}, addEventListener() {}, remove() {}, focus() {}});
+  const menu = {...create(), append() {}, classList: {remove() {}}};
+  const document = {
+    getElementById: () => menu, createElement: create,
+    documentElement: {classList: {remove: key => classes.delete(key)}},
+    head: {append(link) {queueMicrotask(() => link.onload());}},
+  };
+  const window = {
+    Event, localStorage: {getItem: () => "legacy", setItem: (...args) => writes.push(args)},
+    dispatchEvent: event => events.push({type:event.type,next:classes.has("sv-next")}),
+  };
+  const controller=initializeMode({document,window,load:async()=>({mountNextUI(){
+    mounts++;classes.add("sv-next");return {unmount(){unmounts++;classes.delete("sv-next");}};
+  }})});
+  assert.equal(await controller.setMode("next"),true);
+  assert.equal(await controller.setMode("next"),true);
+  assert.equal(events.length,1,"already active must not duplicate events or subscriptions");
+  assert.equal(await controller.setMode("legacy"),true);
+  assert.equal(await controller.setMode("next"),true);
+  assert.deepEqual(events,[{type:"starvoice:presentation-mode",next:true},{type:"starvoice:presentation-mode",next:false},{type:"starvoice:presentation-mode",next:true}]);
+  assert.equal(mounts,2);assert.equal(unmounts,1);
+  assert.deepEqual(writes.map(entry=>entry[1]),["next","legacy","next"]);
+});

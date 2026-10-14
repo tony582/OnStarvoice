@@ -4,6 +4,7 @@ import vm from "node:vm";
 import {readFile} from "node:fs/promises";
 import {execFileSync} from "node:child_process";
 import {createHash} from "node:crypto";
+import {normalizeCreativePresentationEngine} from "../scripts/creative-presentation-boundary.mjs";
 
 const root = new URL("../", import.meta.url);
 const read = file => readFile(new URL(file, root), "utf8");
@@ -160,10 +161,12 @@ test("guidance restoration never overwrites a later engine-owned ready message",
   assert.equal(harness.node.textContent, "已就绪：当前是小红书账号主页");
 });
 
-test("historical renderers, platform registry, capture engine and shared state stay byte-identical to HEAD", async () => {
+test("historical renderers and shared state stay byte-identical; engine permits only exact reviewed presentation insertions", async () => {
   for (const file of ["sidebar/sidebar.html", "sidebar/sidebar-ui.js", "sidebar/sidebar-logic.js", "sidebar/state.js", "sidebar/task-center-ui.js", "sidebar/renderers/weibo.js", "utils/platform/registry.js"]) {
     const baseline = execFileSync("git", ["show", `HEAD:${file}`], {cwd: root, encoding: "utf8", maxBuffer: 8 * 1024 * 1024});
     const hash = value => createHash("sha256").update(value).digest("hex");
-    assert.equal(hash(await read(file)), hash(baseline), file);
+    const current = await read(file);
+    assert.equal(hash(file === "sidebar/sidebar-logic.js" ? normalizeCreativePresentationEngine(current, {requireIntegrated: true}) : current),
+      hash(file === "sidebar/sidebar-logic.js" ? normalizeCreativePresentationEngine(baseline) : baseline), file);
   }
 });

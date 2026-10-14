@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import {readFile} from "node:fs/promises";
+import {normalizeCreativePresentationEngine} from "../scripts/creative-presentation-boundary.mjs";
 
 const read = file => readFile(new URL(`../${file}`, import.meta.url), "utf8");
 const [adapter, css, engine] = await Promise.all([
@@ -115,9 +116,11 @@ test("original visible progress replaces the fixed capture dock without rewritin
   assert.ok(progressPadding, "hidden start dock must not reserve duplicate bottom space");
 });
 
-test("the UI fix leaves deployed capture, shared state and background modules byte-for-byte unchanged", async () => {
+test("the UI fix leaves the engine outside exact reviewed presentation insertions and all capture modules unchanged", async () => {
   for (const file of ["sidebar/sidebar-logic.js", "sidebar/state.js", "utils/capture-sync.js", "background.js"]) {
-    assert.equal(await read(file), await read(`extension-build/${file}`), file);
+    const current = await read(file), shipping = await read(`extension-build/${file}`);
+    assert.equal(file === "sidebar/sidebar-logic.js" ? normalizeCreativePresentationEngine(current, {requireIntegrated: true}) : current,
+      file === "sidebar/sidebar-logic.js" ? normalizeCreativePresentationEngine(shipping) : shipping, file);
   }
 });
 

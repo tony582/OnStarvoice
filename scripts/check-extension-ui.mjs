@@ -4,6 +4,7 @@ import {execFileSync} from "node:child_process";
 import {createHash} from "node:crypto";
 import {fileURLToPath} from "node:url";
 import path from "node:path";
+import {assertCreativePresentationBoundary} from "./creative-presentation-boundary.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const digest = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -34,10 +35,18 @@ for (const name of protectedFiles) {
   const current = await readFile(path.join(root, name));
   const shipping = await readFile(path.join(root, "extension-build", name));
   const baseline = execFileSync("git", ["show", `HEAD:${name}`], {cwd: root, maxBuffer: 24 * 1024 * 1024});
+  if (name === "sidebar/sidebar-logic.js") {
+    for (const [label, bytes] of [["current", current], ["HEAD", baseline], ["shipping", shipping]]) {
+      if (!Buffer.from(bytes.toString(), "utf8").equals(bytes)) throw new Error(`Invalid UTF-8 engine bytes: ${label}`);
+    }
+    const result = assertCreativePresentationBoundary(current.toString(), {baseline: baseline.toString(), shipping: shipping.toString()});
+    console.log(`PASS: original sidebar engine matches HEAD and shipping exactly outside ${result.approvedBlocks} hash-and-anchor-locked presentation insertions.`);
+    continue;
+  }
   if (digest(comparable(name, current)) !== digest(comparable(name, shipping)) || digest(comparable(name, current)) !== digest(comparable(name, baseline))) throw new Error(`Protected collection file changed: ${name}`);
 }
-console.log(`PASS: ${protectedFiles.length - 1} protected code files match HEAD and the existing shipping snapshot; manifest matches except release version and retired-platform description.`);
-for (const name of ["sidebar/ui-mode.js", "sidebar/ui-next.js", "sidebar/ui-next-icons.js", "sidebar/sidebar-ui.js"]) {
+console.log(`PASS: ${protectedFiles.length - 2} other protected code files match HEAD and the existing shipping snapshot; manifest matches except release version and retired-platform description.`);
+for (const name of ["sidebar/ui-mode.js", "sidebar/ui-next.js", "sidebar/ui-next-icons.js", "sidebar/sidebar-ui.js", "sidebar/sidebar-logic.js", "sidebar/creative-results.js", "sidebar/creative-share.js", "scripts/creative-presentation-boundary.mjs"]) {
   execFileSync(process.execPath, ["--check", name], {cwd: root, stdio: "inherit"});
 }
 const tests = [
@@ -45,6 +54,7 @@ const tests = [
   "tests/extension-ui-creative-flow.test.mjs",
   "tests/extension-ui-monitor-layout.test.mjs",
   "tests/extension-ui-platform-presentation.test.mjs",
+  "tests/extension-creative-results.test.mjs", "tests/extension-creative-share.test.mjs", "tests/extension-creative-boundary.test.mjs", "tests/extension-creative-bridge.test.mjs",
   "tests/capture-recovery-ui.test.mjs", "tests/capture/ai-relevance-prefilter-ui.test.mjs",
   "tests/capture/sidebar-capture-task-wiring.test.mjs", "tests/capture/sidebar-csv-export.test.mjs",
   "tests/task-center-ui.test.mjs", "tests/task-center.test.mjs",

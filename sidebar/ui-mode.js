@@ -64,6 +64,7 @@ export function initializeMode({document, window, load = () => import("./ui-next
       if (remember && !saveMode(storage, "legacy")) inform("已切回经典界面，但本机未能保存选择。", "warning");
       updateLabel();
       document.getElementById("btnMoreMenu")?.focus();
+      window.dispatchEvent(new window.Event("starvoice:presentation-mode"));
       return true;
     }
     if (adapter) return true;
@@ -72,6 +73,7 @@ export function initializeMode({document, window, load = () => import("./ui-next
     try {
       const [{mountNextUI}, state] = await Promise.all([load(), import("./state.js"), loadStyles()]);
       adapter = mountNextUI({document, window, state});
+      window.dispatchEvent(new window.Event("starvoice:presentation-mode"));
       if (remember && !saveMode(storage, "next")) inform("新版界面已开启，但本机未能保存选择。关闭后将恢复经典界面。", "warning");
       updateLabel();
       return true;

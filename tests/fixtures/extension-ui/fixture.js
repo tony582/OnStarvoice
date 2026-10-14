@@ -3,6 +3,7 @@ import * as state from "/sidebar/state.js";
 import {mountNextUI} from "/sidebar/ui-next.js";
 import {getPlatformCapabilities} from "/sidebar/platform-registry.js";
 import {installLifecycleFixture} from "./creative-lifecycle.js";
+import {installCreativeResultsFixture} from "./creative-results-fixture.js";
 const params = new URLSearchParams(location.search);
 const scenario = params.get("scenario") || "search";
 const platform = params.get("platform") || "xiaohongshu";
@@ -179,6 +180,8 @@ window.addEventListener("load", async () => {
     $("btnDebugSessionStop").onclick = () => window.showMessage?.("隔离演练：未停止任何真实任务。", "info");
   }
   installLifecycleFixture({document, window, state, platform, report, errorLog});
+  const creativePreview = installCreativeResultsFixture({document, window, scenario, platform, report});
+  if (creativePreview) await creativePreview.ready;
   report("隔离界面已就绪。经典版右上角可试用新版；新版在设置内切回经典界面。");
 });
 

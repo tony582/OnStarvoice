@@ -3,12 +3,25 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.25',
+  latestVersion: '0.4.26',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-10-14',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.25-20261014.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.26-20261014.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.26',
+      releaseDate: '2026-10-14',
+      releaseNotes: [{
+        tag: '界面优化',
+        notes: [
+          {title: '三类创意结果统一排版', desc: '赛道机会、对标账号、长尾需求统一字号和分区，先看概览，再展开完整分析与样本依据；减少内层套框，保留样本链接及原有操作。'},
+          {title: '分享文字与图片更清楚', desc: '分享文字按结论、依据和内容分层，保留完整内容；图片按页排版，尾页自动收紧，可逐页预览、复制和下载，不再挤成一张长图。'},
+          {title: '关闭分享不离开创意', desc: '按 Esc 只关闭当前分享预览，不关闭下面的创意结果；关闭后返回原来的操作位置。'},
+          {title: '继续保留经典界面和旧节点', desc: '默认仍为经典界面，新版可切回经典界面，不强制旧节点升级。采集引擎、分析流程、任务协议、同步与安全保护均未修改。请在节点空闲且结果安全保存后升级，不要在同一浏览器并装第二份扩展。'},
+        ],
+      }],
+    },
     {
       version: '0.4.25',
       releaseDate: '2026-10-14',

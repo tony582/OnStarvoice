@@ -377,3 +377,73 @@ html.sv-next {
   .sv-next .data-item-main { min-width: 140px; flex: 1; }
   .sv-next .data-item-side-actions { margin-left: 70px; }
 }
+
+/* Creative results: one report surface, ruled sections, readable evidence.
+   All selectors are opt-in; legacy results and the collection engine are intact. */
+.sv-next .cr-report, .sv-next .cr-demand { color: #23282f; font-size: 14px; font-weight: 400; line-height: 1.75; overflow-wrap: anywhere; min-width: 0; }
+.sv-next .cr-report :is(h2,h3,h4,p,dl,ul), .sv-next .cr-demand :is(h3,p,ul) { margin: 0; }
+.sv-next .cr-report h2 { font-size: 16px; font-weight: 600; line-height: 1.5; }
+.sv-next .cr-report :is(h3,h4), .sv-next .cr-demand h3 { font-size: 14px; font-weight: 600; line-height: 1.6; }
+.sv-next .cr-report-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 12px; padding: 16px 0; border-top: 1px solid #e4e7ec; }
+.sv-next .cr-report-title { flex: 1 1 100px; min-width: 0; }
+.sv-next .cr-eyebrow { display: block; margin-bottom: 3px; color: #68717d; font-size: 12px; }
+.sv-next .cr-meta, .sv-next .cr-boundary-note, .sv-next .cr-report .cr-meta { color: #68717d; font-size: 12px; line-height: 1.7; }
+.sv-next .cr-report-scope { flex-basis: 100%; }
+.sv-next .cr-share-actions, .sv-next .cr-account-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.sv-next :is(.cr-share-actions,.cr-account-actions,.cr-keywords) button,
+.sv-next .cr-text-button { appearance: none; display: inline-flex; align-items: center; justify-content: center; min-height: 34px; padding: 6px 10px; border: 1px solid #d5dce5; border-radius: 5px; background: #fff; color: #36516f; font: inherit; font-size: 12px; line-height: 1.5; cursor: pointer; box-shadow: none; }
+.sv-next :is(.cr-share-actions,.cr-account-actions,.cr-keywords) button:hover:not(:disabled), .sv-next .cr-text-button:hover { border-color: #9cbaec; background: #f3f7fd; color: #2f6fed; }
+.sv-next .cr-account-actions button:first-child { color: #2f6fed; border-color: #bbcef0; }
+.sv-next :is(.cr-report,.cr-demand) :is(button,a,summary):focus-visible { outline: 2px solid #2f6fed; outline-offset: 3px; }
+.sv-next .cr-share-actions button:disabled { opacity: .5; cursor: wait; }
+.sv-next .cr-section { border-top: 1px solid #e4e7ec; padding: 18px 0; }
+.sv-next .cr-section:last-child { padding-bottom: 0; }
+.sv-next .cr-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.sv-next .cr-copy { white-space: pre-line; }
+.sv-next .cr-report .cr-copy + .cr-disclosure, .sv-next .cr-demand .cr-copy + .cr-disclosure { margin-top: 8px; }
+.sv-next .cr-report .cr-boundary-note { margin-bottom: 16px; padding: 9px 10px; background: #f5f7fa; border-radius: 4px; }
+.sv-next .cr-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; margin: 16px 0 10px !important; font-variant-numeric: tabular-nums; }
+.sv-next .cr-metrics > div { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 7px 0; border-bottom: 1px solid #edf0f4; }
+.sv-next .cr-metrics dt { font-size: 12px; color: #68717d; }
+.sv-next .cr-metrics dd { margin: 0; font-size: 14px; font-weight: 500; }
+.sv-next .cr-disclosure { margin-top: 12px; font-size: 12px; color: #68717d; }
+.sv-next .cr-disclosure > summary { width: fit-content; max-width: 100%; padding: 3px 0; color: #36516f; cursor: pointer; }
+.sv-next .cr-disclosure[open] > summary { margin-bottom: 8px; }
+.sv-next .cr-disclosure :is(.cr-copy,.cr-field,.cr-source-list,.cr-evidence-list) { font-size: 13px; color: #3d4958; }
+.sv-next .cr-method dl > div { margin-bottom: 8px; }
+.sv-next .cr-method dt { font-weight: 500; color: #3d4958; }
+.sv-next .cr-method dd { margin: 0; }
+.sv-next .cr-row, .sv-next .cr-account { padding: 15px 0; border-top: 1px solid #e4e7ec; }
+.sv-next .cr-section-heading + :is(.cr-row,.cr-account) { padding-top: 0; border-top: 0; }
+.sv-next :is(.cr-row,.cr-account):last-child { padding-bottom: 0; }
+.sv-next .cr-row > .cr-meta, .sv-next .cr-account > .cr-meta { margin-top: 4px; }
+.sv-next :is(.cr-row,.cr-account) > .cr-copy { margin-top: 8px; }
+.sv-next .cr-account-actions { margin-top: 12px; }
+.sv-next .cr-field { margin-top: 8px !important; }
+.sv-next .cr-field > span { display: block; color: #68717d; font-size: 12px; }
+.sv-next .cr-source-list, .sv-next .cr-evidence-list { padding-left: 18px; }
+.sv-next .cr-source-list li, .sv-next .cr-evidence-list li { margin: 8px 0; }
+.sv-next .cr-source-list a { color: #245db8; text-decoration: underline; text-underline-offset: 3px; }
+.sv-next .cr-source-list .cr-meta { display: block; margin-top: 2px; }
+.sv-next .cr-empty { color: #68717d; padding: 8px 0; }
+.sv-next .cr-error { color: #a3451c; font-size: 12px; }
+.sv-next .cr-longtail-summary { margin: 0 0 18px; }
+.sv-next .cr-longtail-summary .cr-boundary-note { margin-top: 12px; margin-bottom: 0; }
+.sv-next #keywordInsightCategories:has(.cr-demand) { display: block; margin: 0; }
+.sv-next .cr-demand { padding: 16px 0; border-top: 1px solid #e4e7ec; background: #fff; }
+.sv-next .cr-demand:last-child { padding-bottom: 0; }
+.sv-next .cr-demand-head { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.sv-next .cr-text-button { flex-shrink: 0; color: #2f6fed; }
+.sv-next .cr-keywords { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.sv-next .cr-keywords button { min-height: 32px; background: #f7f9fc; }
+.sv-next :is(#keywordStrategyOpportunityPane,#keywordStrategyBenchmarkPane):has(.cr-report) > .keyword-strategy-placeholder { border: 0; padding: 0 0 14px; margin-bottom: 0; background: transparent; }
+.sv-next :is(#keywordStrategyOpportunityPane,#keywordStrategyBenchmarkPane):has(.cr-report) .keyword-strategy-actions { margin-top: 0 !important; }
+.sv-next #keywordStrategyModalOverlay:has(.cr-report) .batch-modal-hint { padding: 8px 10px; background: #f5f7fa; border-radius: 4px; }
+.sv-next #keywordStrategyModalOverlay:has(.cr-report) .keyword-strategy-tabs { margin-bottom: 16px; }
+.sv-next #keywordStrategyModalOverlay:has(.cr-report) :is(.keyword-strategy-action-row,.keyword-expand-controls) { margin: 0 0 14px; gap: 8px; }
+.sv-next #keywordStrategyModalOverlay:has(.cr-report) :is(#btnRunKeywordOpportunity,#btnRunBenchmarkDiscovery,#btnExpandKeywords) { min-height: 34px; padding: 6px 12px; font-size: 12px; }
+@media (max-width: 360px) {
+  .sv-next .cr-share-actions { flex-basis: 100%; }
+  .sv-next .cr-metrics { column-gap: 12px; }
+  .sv-next .cr-metrics > div { flex-direction: column; gap: 0; }
+}

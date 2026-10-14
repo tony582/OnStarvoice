@@ -24,7 +24,7 @@ const server = http.createServer(async (req, res) => {
       body = body.toString().replace("<head>", '<head><script src="/__preview/chrome-mock.js"></script>')
         .replace('src="sidebar-logic.js"', 'src="/__preview/fixture.js"');
     }
-    res.writeHead(200, {"Content-Type": types[path.extname(file)] || "application/octet-stream", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; frame-src 'self'; object-src 'none'"});
+    res.writeHead(200, {"Content-Type": types[path.extname(file)] || "application/octet-stream", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'none'; frame-src 'self'; object-src 'none'"});
     res.end(body);
   } catch { res.writeHead(404).end("Not found"); }
 });

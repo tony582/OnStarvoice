@@ -10,10 +10,10 @@ async function fixture(t, {failDownload = false} = {}) {
   t.after(() => fs.rm(temp, {recursive: true}));
   const root = path.join(temp, 'app'), stage = path.join(temp, 'stage');
   await fs.mkdir(path.join(root, 'public-downloads'), {recursive: true});
-  const release = {commit: 'a'.repeat(40), version: '0.4.25', previous: '0.4.24', zip: 'StarVoice-extension-v0.4.25-20261014.zip', files: []};
+  const release = {commit: 'a'.repeat(40), version: '0.4.26', previous: '0.4.25', zip: 'StarVoice-extension-v0.4.26-20261014.zip', files: []};
   for (const file of metadataPaths) {
-    const before = file.endsWith('ops-control.js') ? "export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.24';" : '0.4.24';
-    const after = before.replace('0.4.24', '0.4.25');
+    const before = file.endsWith('ops-control.js') ? "export const OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.25';" : '0.4.25';
+    const after = before.replace('0.4.25', '0.4.26');
     await fs.mkdir(path.dirname(path.join(root, file)), {recursive: true});
     await fs.mkdir(path.dirname(path.join(stage, 'payload', file)), {recursive: true});
     await fs.writeFile(path.join(root, file), before);

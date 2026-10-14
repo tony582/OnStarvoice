@@ -141,6 +141,10 @@ import {
 } from "../utils/auth-code.js";
 import {extractNoteId} from "../utils/helpers.js";
 import {detectPlatformFromUrl} from "../utils/platform/page-routing.js";
+// @creative-view:start imports
+import {renderCreativeOpportunity, renderCreativeBenchmark, renderCreativeInsightSummary, renderCreativeInsightCategories} from "./creative-results.js";
+import {buildCreativeShareText, openCreativeSharePreview} from "./creative-share.js";
+// @creative-view:end imports
 import {
   buildCaptureRecoveryAnnouncementKey,
   resolveCaptureRecoveryView,
@@ -9686,6 +9690,15 @@ function renderBenchmarkDiscoveryResult() {
   if (!result) {
     return "";
   }
+  // @creative-view:start benchmark-render
+  if (isCreativePresentation()) return renderCreativeBenchmark(result, {
+    fallbackAnalysis: buildBenchmarkDiscoveryFallbackAnalysis,
+    ruleReason: buildBenchmarkDiscoveryRuleReason,
+    decisionAngle: buildBenchmarkDiscoveryDecisionAngle,
+    evidence: buildBenchmarkDiscoveryCandidateEvidence,
+    works: buildBenchmarkDiscoveryRepresentativeWorks,
+  });
+  // @creative-view:end benchmark-render
   const candidates = Array.isArray(result.candidates) ? result.candidates : [];
   const potentialLabels = {
     high: "优先对标",
@@ -9813,6 +9826,9 @@ function renderBenchmarkDiscoveryResult() {
 }
 
 function renderKeywordOpportunityResult() {
+  // @creative-view:start opportunity-render
+  if (isCreativePresentation()) return renderCreativeOpportunity(keywordOpportunityResult, {resolveTitleUrl: resolveKeywordOpportunityTitleUrl});
+  // @creative-view:end opportunity-render
   const result = keywordOpportunityResult;
   if (!result) {
     return "";
@@ -11328,7 +11344,63 @@ function buildBenchmarkDiscoveryShareText() {
   return lines.join("\n").trim();
 }
 
+// @creative-view:start presentation-helpers
+function isCreativePresentation() {
+  return document.documentElement.classList.contains("sv-next");
+}
+
+function getCreativeLongtailSnapshot() {
+  const draft = getKeywordInsightState();
+  const analysis = draft.analysisResult;
+  if (!analysis) return null;
+  return {
+    seedKeyword: getBatchDraftForPlatform().seedKeyword,
+    totalKeywords: expandedKeywordsBuffer.length,
+    summary: analysis.summary,
+    categories: (Array.isArray(analysis.categories) ? analysis.categories : []).filter(category => category && typeof category === "object").map(category => {
+      const samples = draft.sampleResultsByCategoryId?.[category.id];
+      return {...category, sampleKeyword: samples?.usedKeyword, samples: samples?.samples || []};
+    }),
+  };
+}
+
+function creativeShareSnapshot(snapshot) {
+  if (!snapshot) return null;
+  return {...snapshot, platformLabel: snapshot.platformLabel || getPlatformCopy(snapshot.platform || getCurrentBatchDraftPlatform()).label};
+}
+
+async function copyCreativeResult(kind, snapshot, button) {
+  if (!snapshot || !button) {
+    showMessage("暂无分析结果可复制", "warning");
+    return;
+  }
+  const original = button.textContent;
+  button.disabled = true;
+  try {
+    await navigator.clipboard.writeText(buildCreativeShareText(kind, creativeShareSnapshot(snapshot)));
+    showMessage("已复制完整结果，含样本依据", "success");
+  } catch {
+    showMessage("复制失败，请检查剪贴板权限后重试", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+function showCreativeResultImage(kind, snapshot) {
+  if (!snapshot) {
+    showMessage("暂无分析结果可导出", "warning");
+    return;
+  }
+  return openCreativeSharePreview(kind, creativeShareSnapshot(snapshot), {
+    document, window, onMessage: (message, type) => showMessage(message, type),
+  });
+}
+// @creative-view:end presentation-helpers
 function handleCopyBenchmarkDiscovery(btn) {
+  // @creative-view:start benchmark-copy
+  if (isCreativePresentation()) return copyCreativeResult("benchmark", keywordBenchmarkResult, btn);
+  // @creative-view:end benchmark-copy
   const text = buildBenchmarkDiscoveryShareText();
   if (!text || !btn) {
     showMessage("暂无对标账号结果可复制", "warning");
@@ -11386,6 +11458,9 @@ function buildBenchmarkDiscoveryShareData() {
 }
 
 function handleShareBenchmarkDiscoveryAsImage() {
+  // @creative-view:start benchmark-image
+  if (isCreativePresentation()) return showCreativeResultImage("benchmark", keywordBenchmarkResult);
+  // @creative-view:end benchmark-image
   const data = buildBenchmarkDiscoveryShareData();
   if (!data) {
     showMessage("暂无对标账号结果可分享", "warning");
@@ -11415,6 +11490,9 @@ function handleKeywordOpportunityResultActions(event) {
 }
 
 function handleCopyKeywordOpportunity(btn) {
+  // @creative-view:start opportunity-copy
+  if (isCreativePresentation()) return copyCreativeResult("opportunity", keywordOpportunityResult, btn);
+  // @creative-view:end opportunity-copy
   const text = buildKeywordOpportunityShareText();
   if (!text || !btn) {
     return;
@@ -11599,6 +11677,9 @@ function buildKeywordOpportunityShareData() {
 }
 
 function handleShareKeywordOpportunityAsImage() {
+  // @creative-view:start opportunity-image
+  if (isCreativePresentation()) return showCreativeResultImage("opportunity", keywordOpportunityResult);
+  // @creative-view:end opportunity-image
   const data = buildKeywordOpportunityShareData();
   if (!data) {
     showMessage("暂无判断赛道机会结果可分享", "warning");
@@ -11733,6 +11814,12 @@ function renderInsightLoadingState() {
 }
 
 function renderInsightSummaryCard(draft) {
+  // @creative-view:start longtail-summary
+  if (isCreativePresentation()) return renderCreativeInsightSummary({
+    seedKeyword: getBatchDraftForPlatform().seedKeyword,
+    totalKeywords: expandedKeywordsBuffer.length, analysis: draft.analysisResult,
+  });
+  // @creative-view:end longtail-summary
   const analysis = draft.analysisResult;
   if (!analysis) {
     return "";
@@ -11803,6 +11890,14 @@ function renderInsightSampleBlock(sampleStatus, sampleResult) {
 }
 
 function renderInsightCategories(draft) {
+  // @creative-view:start longtail-categories
+  if (isCreativePresentation()) return renderCreativeInsightCategories({
+    analysis: draft.analysisResult, totalKeywords: expandedKeywordsBuffer.length,
+    expandedIds: expandedKeywordInsightCategoryIds,
+    sampleStatusByCategoryId: draft.sampleStatusByCategoryId,
+    sampleResultsByCategoryId: draft.sampleResultsByCategoryId,
+  });
+  // @creative-view:end longtail-categories
   const analysis = draft.analysisResult;
   const categories = Array.isArray(analysis?.categories)
     ? analysis.categories
@@ -12246,6 +12341,9 @@ function handleKeywordInsightSummaryActions(event) {
 }
 
 function handleCopyInsight(btn) {
+  // @creative-view:start longtail-copy
+  if (isCreativePresentation()) return copyCreativeResult("longtail", getCreativeLongtailSnapshot(), btn);
+  // @creative-view:end longtail-copy
   const draft = getKeywordInsightState();
   const analysis = draft.analysisResult;
   if (!analysis || !btn) return;
@@ -12321,6 +12419,9 @@ function buildInsightShareData() {
 }
 
 function handleShareAsImage() {
+  // @creative-view:start longtail-image
+  if (isCreativePresentation()) return showCreativeResultImage("longtail", getCreativeLongtailSnapshot());
+  // @creative-view:end longtail-image
   const data = buildInsightShareData();
   if (!data) {
     showMessage("暂无洞察结果可分享", "warning");
@@ -31722,6 +31823,15 @@ function setCaptureButtonsDisabled(disabled) {
 // ==================== 导出 ====================
 
 // 自动初始化
+// @creative-view:start mode-render-listener
+window.addEventListener("starvoice:presentation-mode", () => {
+  renderKeywordStrategyPanel();
+  const insight = getKeywordInsightState();
+  if (insight.analysisStatus === "success" && insight.analysisResult) {
+    renderKeywordInsightState();
+  }
+});
+// @creative-view:end mode-render-listener
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", initSidebar);
 } else {
