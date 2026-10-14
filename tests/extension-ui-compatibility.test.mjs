@@ -25,6 +25,29 @@ test("header status is derived from existing state and never invents a heartbeat
   assert.equal(presentationStatus({runtime: {captureDebugSession: {state: "attached"}}}).text, "采集中");
   assert.equal(presentationStatus({runtime: {}, sync: {status: "syncing"}}).text, "同步中");
 });
+test("compact 44px header keeps live status left and the original platform control right without duplicate branding", async () => {
+  const [adapter, css] = await Promise.all([read("sidebar/ui-next.js"), read("sidebar/ui-next.css")]);
+  const rules = [...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .map(([, selector, declarations]) => ({selector: selector.trim(), declarations}));
+  assert.doesNotMatch(adapter, /["']sv-brand["']/);
+  assert.doesNotMatch(css, /\.sv-brand\b/);
+  assert.match(adapter, /status\.setAttribute\("aria-live", "polite"\)/);
+  const headers = rules.filter(rule => rule.selector === ".sv-next .header");
+  assert.ok(headers.length > 0);
+  for (const {declarations} of headers) {
+    assert.match(declarations, /(?:^|;)\s*padding:\s*5px\s+\d+px\s*(?:;|$)/, "wide and narrow header must keep 5px vertical padding");
+    assert.doesNotMatch(declarations, /overflow(?:-y)?:\s*hidden/, "platform menu must not be clipped by its header");
+  }
+  assert.ok(rules.some(({selector, declarations}) => selector === ".sv-next .header-top" && /min-height:\s*34px/.test(declarations)), "34px control row plus 5px top and bottom equals 44px");
+  const status = rules.find(rule => rule.selector === ".sv-next .sv-status");
+  assert.ok(status);
+  assert.doesNotMatch(status.declarations, /margin(?:-left)?:[^;]*auto/, "status must not be pushed away from the left edge");
+  assert.match(status.declarations, /white-space:\s*nowrap/);
+  const platform = rules.find(rule => rule.selector === ".sv-next .platform-switcher");
+  assert.ok(platform);
+  assert.match(platform.declarations, /margin:\s*0\s+0\s+0\s+auto|margin-left:\s*auto/);
+  assert.match(css, /\.sv-next \.platform-menu \{[^}]*right:\s*0/);
+});
 test("the presentation modules cannot dispatch, navigate, poll or write business state", async () => {
   const files = await Promise.all([read("sidebar/ui-next.js"), read("sidebar/ui-mode.js")]);
   for (const file of files) {
@@ -48,7 +71,7 @@ test("CSS is scoped and preserves running geometry except minimized dock clearan
       continue;
     }
     for (const rule of match[2].split(";").map(value => value.trim()).filter(Boolean)) {
-      assert.match(rule, /^(?:color|border-color|background)\s*:|^line-height:\s*normal$|^bottom:\s*(?:74|138)px$/, rule);
+      assert.match(rule, /^(?:color|border-color|background)\s*:|^line-height:\s*normal$|^bottom:\s*74px$/, rule);
       if (rule.startsWith("bottom:")) assert.match(match[1], /\.debug-session-dock\s*$/);
     }
   }
@@ -139,7 +162,14 @@ test("batch entry moves the original URL controls only and accurately labels blo
   assert.match(adapter, /listen\(document, "starvoice:sidebar-tab", closeBatchOptions\)/);
   assert.match(adapter, /window\.activateSidebarTab\?\.\(button\.id === "btnOpenBatchNote" \? "noteTab" : "bloggerTab"\)/);
   assert.doesNotMatch(adapter, /batchCaptureByUrls|handleRunBatch|btnRunBatch\w+["']\)\.click|bloggerInput\.value\s*=/);
-  assert.match(css, /\.sv-next \.sv-batch-options \{[^}]*right: 0; bottom: calc\(100% \+ 8px\)/);
+  const menu = css.match(/\.sv-next \.sv-batch-options \{([^}]+)\}/)?.[1];
+  assert.ok(menu);
+  assert.match(menu, /position:\s*absolute/);
+  assert.match(menu, /right:\s*0/);
+  assert.match(menu, /top:\s*calc\(100% \+ 8px\)/, "in-flow start row opens the batch choices below it");
+  assert.doesNotMatch(menu, /bottom:\s*(?!auto\b)[^;]+/);
+  assert.match(menu, /z-index:\s*[1-9]\d*\s*(?:;|$)/);
+  assert.match(css, /\.sv-next \.sv-batch-entry \{[^}]*position:\s*relative/, "batch choices stay anchored to their original search-row entry");
 });
 test("an absent menu or denied localStorage cannot prevent classic UI startup", () => {
   assert.equal(initializeMode({document: {getElementById: () => null}, window: {}}), undefined);

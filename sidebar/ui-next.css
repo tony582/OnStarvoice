@@ -24,15 +24,13 @@ html.sv-next {
 .sv-next .container { max-width: 600px; min-height: 0; }
 .sv-next button, .sv-next input, .sv-next select, .sv-next textarea { font-family: inherit; }
 .sv-next :is(button, a, input, select, textarea, summary):focus-visible { outline: 2px solid #2f6fed; outline-offset: 3px; }
-.sv-next .header { padding: 12px 16px; flex-shrink: 0; background: #1c3b5b; color: #fff; box-shadow: none; }
+.sv-next .header { padding: 5px 16px; flex-shrink: 0; background: #1c3b5b; color: #fff; box-shadow: none; }
 .sv-next .header-top { gap: 10px; min-height: 34px; }
-.sv-next .sv-brand { display: flex; gap: 9px; align-items: center; flex: none; font-size: 20px; font-weight: 650; letter-spacing: 1px; }
-.sv-next .sv-brand img { display: block; width: 32px; height: 32px; }
-.sv-next .platform-switcher { flex: none; margin: 0; padding: 0; border-radius: 0; box-shadow: none; }
+.sv-next .platform-switcher { flex: none; margin: 0 0 0 auto; padding: 0; border-radius: 0; box-shadow: none; }
 .sv-next .platform-trigger { color: #fff; background: transparent; border-radius: 6px; padding: 4px; box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none; gap: 5px; font-size: 12px; max-width: 108px; }
 .sv-next .platform-trigger-logo { width: 26px; height: 26px; border-radius: 7px; }
 .sv-next .platform-trigger-name { max-width: 58px; font-size: 12px; }
-.sv-next .sv-status { display: flex; align-items: center; gap: 5px; margin-left: auto; flex-shrink: 0; color: #eef5ff; font-size: 12px; white-space: nowrap; }
+.sv-next .sv-status { display: flex; align-items: center; gap: 5px; flex-shrink: 0; color: #eef5ff; font-size: 12px; white-space: nowrap; }
 .sv-next .sv-status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: #56c791; }
 .sv-next .sv-status[data-state="waiting"]::before { background: #edbd65; }
 .sv-next .sv-status[data-state="active"]::before { background: #91c4ff; }
@@ -60,7 +58,7 @@ html.sv-next {
 .sv-next .sv-top-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); flex-shrink: 0; background: #eaf2fc; }
 .sv-next .sv-top-nav #mainTabNav { display: contents; }
 .sv-next #mainTabNav [data-target="monitorTab"] { display: none; }
-.sv-next .tab-content { min-height: 0; padding: 14px 14px 94px; overscroll-behavior: contain; scroll-padding-bottom: 100px; }
+.sv-next .tab-content { min-height: 0; padding: 14px; overscroll-behavior: contain; scroll-padding-block: 14px; }
 .sv-next .tab-pane { gap: 12px; }
 .sv-next .panel { border: 1px solid var(--border-light); box-shadow: none; padding: 14px; border-radius: 8px; }
 .sv-next .action-panel { gap: 14px; margin-bottom: 14px; }
@@ -130,15 +128,19 @@ html.sv-next {
 .sv-next .btn-primary:not(:disabled):hover { background: var(--theme-primary-hover); }
 .sv-next .btn-secondary { background: #fff; color: #4f5b6e; border: 1px solid var(--border-color); }
 .sv-next .btn:disabled { cursor: not-allowed; }
-.sv-next :is(#noteTab, #bloggerTab, #searchTab).is-active .action-row { position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%); width: min(100%, 600px); padding: 12px 14px; margin: 0; background: #fff; border-top: 1px solid var(--border-light); z-index: 30; }
+/* Original buttons stay after their configuration, before collected content.
+   No fixed/sticky CTA and no duplicate spacer at the bottom of the scroller. */
+.sv-next :is(#noteTab, #bloggerTab, #searchTab) .action-row { position: static; width: 100%; padding: 12px 0 0; margin: 0; border-top: 1px solid var(--border-light); }
 .sv-next :is(#noteTab, #bloggerTab, #searchTab).is-active .action-row .btn { min-height: 40px; }
+.sv-next :is(#noteTab, #bloggerTab, #searchTab) .action-row > .btn-grow { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.sv-next #searchManualActionRow > .btn-grow { padding-inline: 8px; text-wrap: balance; }
 .sv-next .sv-batch-entry { position: relative; flex: none; }
 .sv-next .sv-batch-summary { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 40px; padding: 0 10px; list-style: none; border: 1px solid var(--border-color); border-radius: 5px; background: #fff; color: #4f5b6e; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap; }
 .sv-next .sv-batch-summary::-webkit-details-marker { display: none; }
 .sv-next .sv-batch-summary svg { width: 14px; height: 14px; }
 .sv-next .sv-batch-entry[open] > .sv-batch-summary { border-color: var(--theme-primary); color: var(--theme-primary); background: var(--theme-primary-light); }
 .sv-next .sv-batch-entry[open] > .sv-batch-summary svg { transform: rotate(180deg); }
-.sv-next .sv-batch-options { position: absolute; right: 0; bottom: calc(100% + 8px); width: 196px; padding: 5px; border: 1px solid var(--border-color); border-radius: 6px; background: #fff; box-shadow: var(--shadow-md); }
+.sv-next .sv-batch-options { position: absolute; right: 0; top: calc(100% + 8px); z-index: 2; width: 196px; padding: 5px; border: 1px solid var(--border-color); border-radius: 6px; background: #fff; box-shadow: var(--shadow-md); }
 .sv-next .sv-batch-options .sv-batch-option { display: flex; width: 100%; height: auto; justify-content: flex-start; gap: 9px; padding: 9px 10px; border: 0; border-radius: 4px; background: #fff; color: var(--text-primary); font-weight: 400; }
 .sv-next .sv-batch-options .sv-batch-option:not(:disabled):hover { color: var(--theme-primary); background: var(--theme-primary-light); }
 .sv-next .sv-batch-input-hint { margin: 8px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-secondary); }
@@ -340,7 +342,6 @@ html.sv-next {
 .sv-next #progressContainer { position: static; inset: auto; z-index: auto; min-height: 0; width: auto; margin: 0; padding: 0; border: 0; border-radius: 0; box-shadow: none; }
 .sv-next #progressText { font-size: 14px; font-weight: 400; line-height: 1.65; overflow-wrap: anywhere; }
 .sv-next body:has(#progressContainer[style*="display: block"]:not([hidden])) :is(#noteTab, #bloggerTab, #searchTab) .action-row { display: none !important; }
-.sv-next body:has(#progressContainer[style*="display: block"]:not([hidden])) .tab-content { padding-bottom: 20px; scroll-padding-bottom: 20px; }
 /* Preserve the full-screen running surface: existing geometry, controls and
    timings stay intact. Only purple accents become blue. Reset inherited line
    height so the new form typography cannot alter this stable surface. */
@@ -360,16 +361,12 @@ html.sv-next {
 .sv-next .debug-session-activity-item::before { background: #6495f5; }
 .sv-next .debug-session-steps li.is-active .debug-step-icon { border-color: #6495f5; background: #6495f5; }
 .sv-next .debug-session-dock-count { border-color: #2f6fed; }
-/* The minimized task stays above the new navigation/action bars. */
-.sv-next .debug-session-dock { bottom: 138px; line-height: normal; }
-.sv-next body:is(.sv-ideas-view, .sv-settings-view, .sv-tasks-view, .sv-no-action) .debug-session-dock { bottom: 74px; }
+/* Only navigation remains pinned; no capture-action bar needs clearance. */
+.sv-next .debug-session-dock { bottom: 74px; line-height: normal; }
 .sv-next body:has(#progressContainer[style*="display: block"]:not([hidden])) .debug-session-dock { position: static; flex-shrink: 0; align-self: flex-end; margin: 0 14px 8px; box-shadow: none; }
 @media (max-width: 360px) {
-  .sv-next .header { padding: 10px; }
+  .sv-next .header { padding: 5px 10px; }
   .sv-next .header-top { gap: 7px; }
-  .sv-next .sv-brand { font-size: 18px; gap: 6px; letter-spacing: 0; }
-  .sv-next .sv-brand img { width: 28px; height: 28px; }
-  .sv-next .sv-status { font-size: 11px; gap: 4px; }
   .sv-next .tab-content { padding-left: 10px; padding-right: 10px; }
   .sv-next .tab-btn { font-size: 13px; }
   .sv-next .panel { padding: 12px; }

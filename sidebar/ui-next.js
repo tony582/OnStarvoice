@@ -84,14 +84,8 @@ export function mountNextUI({document, window, state}) {
     }
     // Keep the original platform control and its event handlers. Its DOM order
     // matches the visual order; classic restores its original left position.
-    const brand = element("div", "sv-brand");
-    const logo = element("img");
-    logo.src = "../images/icon128.png";
-    logo.alt = "";
-    logo.width = 32;
-    logo.height = 32;
-    brand.append(logo, element("span", "", "星语"));
-    add($(".header-top"), brand, $(".header-top").firstChild);
+    // Browser side-panel chrome already identifies StarVoice. Keep this row
+    // for status and the ORIGINAL platform control, without duplicate branding.
     const welcomeLogo = $("#unsupportedPlatformCover .unsupported-platform-brand-icon");
     if (welcomeLogo) attr(welcomeLogo, "src", "../images/icon128.png");
     const status = add($(".header-top"), element("span", "sv-status"), $(".header-actions"));
@@ -351,6 +345,11 @@ export function mountNextUI({document, window, state}) {
     attr(bloggerInput, "aria-describedby", [bloggerInput.getAttribute("aria-describedby"), bloggerHint.id].filter(Boolean).join(" "));
     add($("#textareaBatchLinks").parentNode, element("p", "sv-batch-input-hint", "附加采集选项沿用笔记页设置。"));
     const closeBatchOptions = () => { batchEntry.open = false; };
+    // The entry now scrolls with its form. Reveal its downward menu inside
+    // that same scroller when it opens near the viewport edge; no polling.
+    listen(batchEntry, "toggle", () => {
+      if (batchEntry.open) batchOptions.scrollIntoView({block: "nearest"});
+    });
     listen(batchOptions, "click", event => {
       const button = event.target.closest(".sv-batch-option");
       if (!button || button.disabled) return;

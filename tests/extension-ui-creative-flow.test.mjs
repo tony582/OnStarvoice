@@ -99,7 +99,31 @@ test("creative stop has an independent sibling region when a child capture hides
   }
 });
 
-test("original visible progress replaces the fixed capture dock without rewriting engine availability", () => {
+test("all three original capture action rows stay in normal document flow without a bottom dock spacer", () => {
+  const actionRules = cssRules.filter(({selector}) => /\.action-row\b/.test(selector));
+  const rows = actionRules.filter(({selector, declarations}) => selector.endsWith(".action-row") && /position\s*:\s*static/.test(declarations));
+  assert.ok(rows.length > 0, "capture rows must explicitly stay in normal flow");
+  for (const id of ["noteTab", "bloggerTab", "searchTab"]) {
+    assert.ok(rows.some(({selector}) => selector.includes(`#${id}`)), `${id} must use the in-flow row`);
+  }
+  for (const {declarations} of actionRules) {
+    assert.doesNotMatch(declarations, /position\s*:\s*(?:fixed|sticky|absolute)|(?:^|;)\s*(?:bottom|left|transform)\s*:/, "no viewport docking may override the original action row");
+  }
+  const content = cssRules.find(({selector}) => selector === ".sv-next .tab-content");
+  assert.ok(content);
+  assert.match(content.declarations, /(?:^|;)\s*padding\s*:\s*14px\s*(?:;|$)/);
+  assert.match(content.declarations, /scroll-padding-(?:block|bottom)\s*:\s*14px/);
+  for (const {selector, declarations} of cssRules.filter(({selector}) => /\.tab-content|#mainTabContent/.test(selector))) {
+    assert.doesNotMatch(declarations, /(?:padding|scroll-padding)[^:]*:[^;]*(?:94|100)px/, `${selector}: no reservation for a removed fixed action bar`);
+  }
+  assert.doesNotMatch(css, /bottom\s*:\s*138px/);
+  const dock = cssRules.find(({selector}) => selector === ".sv-next .debug-session-dock");
+  assert.ok(dock);
+  assert.match(dock.declarations, /bottom\s*:\s*74px/, "minimized running task only clears the four-tab navigation");
+  assert.doesNotMatch(adapter, /(?:move|add)\(\$\("#btnCapture(?:Note|Blogger|Search)"\)/, "do not clone or relocate existing capture buttons");
+});
+
+test("original visible progress hides the in-flow capture rows without rewriting engine availability", () => {
   const dockRules = cssRules.filter(({selector, declarations}) =>
     /#progressContainer/.test(selector) && /\.action-row/.test(selector) && /display\s*:\s*none/.test(declarations));
   assert.ok(dockRules.length > 0);
@@ -111,9 +135,9 @@ test("original visible progress replaces the fixed capture dock without rewritin
     assert.doesNotMatch(selector, /disabled|progressText|data-state/);
   }
   assert.doesNotMatch(adapter, /progress\.(?:style|hidden)\s*[.=]|progress\.dataset\.[\w]+\s*=|(?:setCaptureButtonsDisabled|setPrimaryCaptureButtonDisabled|setCurrentCapture|setCurrentRuntime)\s*\(/);
-  const progressPadding = cssRules.find(({selector, declarations}) =>
-    /#progressContainer\[style\*="display: block"\]/.test(selector) && /mainTabContent|\.tab-content/.test(selector) && /padding-bottom\s*:\s*20px/.test(declarations));
-  assert.ok(progressPadding, "hidden start dock must not reserve duplicate bottom space");
+  const content = cssRules.find(({selector}) => selector === ".sv-next .tab-content");
+  assert.match(content.declarations, /(?:^|;)\s*padding\s*:\s*14px\s*(?:;|$)/, "running and idle views share ordinary content padding, not a fixed-action spacer");
+  assert.ok(!cssRules.some(({selector}) => /#progressContainer\[style\*="display: block"\]/.test(selector) && /mainTabContent|\.tab-content/.test(selector)), "showing progress must not need a second padding mode");
 });
 
 test("the UI fix leaves the engine outside exact reviewed presentation insertions and all capture modules unchanged", async () => {

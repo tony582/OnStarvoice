@@ -189,10 +189,21 @@ window.addEventListener("message", async event => {
   if (event.origin !== location.origin || event.source !== parent || event.data?.type !== "sv-ui-test") return;
   const results = [];
   const assert = (condition, message) => { if (!condition) throw new Error(message); results.push("通过 · " + message); };
+  let contractStyle;
   try {
     if (document.documentElement.classList.contains("sv-next")) {
       $("menuBtnInterfaceMode").click();
     }
+    // The controller removes its stylesheet on classic rollback. This direct
+    // mount harness needs a scoped sheet too before checking actual geometry.
+    contractStyle = document.createElement("link");
+    contractStyle.rel = "stylesheet";
+    contractStyle.href = "/sidebar/ui-next.css";
+    await new Promise((resolve, reject) => {
+      contractStyle.onload = resolve;
+      contractStyle.onerror = reject;
+      document.head.append(contractStyle);
+    });
     const originals = [...document.querySelectorAll("input, select, textarea, button[id], #dropdownMoreMenu > a")];
     const initial = originals.map(el => ({el, parent: el.parentNode, value: el.value, checked: el.checked, disabled: el.disabled}));
     const menuItems = [...$("dropdownMoreMenu").children];
@@ -214,6 +225,14 @@ window.addEventListener("message", async event => {
     assert(new Set([...document.querySelectorAll("[id]")].map(el => el.id)).size === document.querySelectorAll("[id]").length, "没有重复 DOM ID");
     assert(document.querySelectorAll(".sv-bottom-nav").length === 1 && [...document.querySelectorAll(".sv-bottom-nav > button")].map(btn => btn.textContent.trim()).join("/") === "采集/任务/创意/设置", "底部为采集、任务、创意、设置四个入口，没有重复数据入口");
     assert(document.querySelector(".header-actions").hidden && [...document.querySelector(".header-top").children].filter(el => !el.hidden).at(-1).classList.contains("platform-switcher"), "更多菜单收起，原平台切换控件位于顶栏最右侧");
+    const statusRect = document.querySelector(".sv-status").getBoundingClientRect();
+    const platformRect = document.querySelector(".platform-switcher").getBoundingClientRect();
+    assert(!document.querySelector(".sv-brand") && document.querySelector(".header").getBoundingClientRect().height === 44 && statusRect.right < platformRect.left && document.querySelector(".sv-status").getAttribute("aria-live") === "polite", "44px 工具栏去掉重复品牌，保留左状态、右平台和状态播报");
+    for (const id of ["btnCaptureNote", "btnCaptureBlogger", "btnCaptureSearch"]) {
+      const button = $(id), row = button.closest(".action-row");
+      assert(window.getComputedStyle(row).position === "static" && row.closest(".action-panel") && Boolean(row.compareDocumentPosition($("mainPoolPanel")) & Node.DOCUMENT_POSITION_FOLLOWING), `${id} 原开始按钮留在配置内、结果之前，无固定或悬浮定位`);
+    }
+    assert(window.getComputedStyle($("mainTabContent")).paddingBottom === "14px", "滚动内容不再为固定开始区保留空白");
     assert(menuSnapshot.filter(x => x.el.tagName === "A").every(x => $("settingsTab").contains(x.el) && x.el.getAttribute("href") === x.href && !x.el.hasAttribute("role")), "四个原帮助与授权链接移入设置，链接不变且恢复原生语义");
     assert($("menuBtnCheckUpdate").closest(".sv-settings-links") && $("menuBtnInterfaceMode").closest(".sv-settings-links") && !$("menuBtnInterfaceMode").hasAttribute("role"), "原检查更新与经典回退按钮移入设置，仍为同一按钮");
     assert($("uiAuthCard").querySelectorAll("a.sv-auth-acquire").length === 1 && document.querySelectorAll(".sv-settings-links a").length === 3 && !$("settingsTab").contains($("menuBtnSettings")) && !$("settingsTab").contains($("menuBtnHistory")), "授权链接仅一处，帮助不重复，已有设置和任务入口不重复添加");
@@ -260,7 +279,7 @@ window.addEventListener("message", async event => {
     assert(!batchEntry.open && !$("noteTab").contains($("btnOpenBatchNote")), "切换采集页自动收起选项，不残留浮层");
     window.activateSidebarTab("searchTab");
     batchSummary.click();
-    document.querySelector(".sv-brand").click();
+    document.querySelector(".header").click();
     assert(!batchEntry.open, "点击外部关闭批量选项");
     const wasBatchDisabled = $("btnOpenBatchBlogger").disabled;
     const openCount = batchOpenHistory.length;
@@ -344,4 +363,5 @@ window.addEventListener("message", async event => {
     assert(errorLog.length === 0, `无浏览器运行错误（${errorLog.length}）`);
     report(results.join("\n") + "\n\n检查完成；当前为经典界面。真实采集需在空闲测试节点验收。");
   } catch (error) { report(results.join("\n") + "\n失败 · " + error.message); }
+  finally { contractStyle?.remove(); }
 });

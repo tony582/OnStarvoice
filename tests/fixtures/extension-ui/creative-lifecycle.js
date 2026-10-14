@@ -167,7 +167,7 @@ export function installLifecycleFixture({document, window, state, platform, repo
       const navigation = document.querySelector(".sv-bottom-nav").getBoundingClientRect();
       assert(content.bottom <= reserved.top + 1 && reserved.bottom <= navigation.top + 1, `${label}：内容、进度、底栏各自占位，无相互覆盖（${window.innerWidth} × ${window.innerHeight}）`);
       assert(progress.left >= -1 && progress.right <= window.innerWidth + 1 && navigation.bottom <= window.innerHeight + 1, `${label}：进度不横向溢出，底栏不越出可视范围`);
-      assert(["btnCaptureNote", "btnCaptureBlogger", "btnCaptureSearch"].every(id => window.getComputedStyle($(id).closest(".action-row")).display === "none"), `${label}：显示进度时三个页面的原固定开始区均让位`);
+      assert(["btnCaptureNote", "btnCaptureBlogger", "btnCaptureSearch"].every(id => window.getComputedStyle($(id).closest(".action-row")).display === "none"), `${label}：显示进度时三个页面的流内开始区均让位`);
     };
     try {
       if (document.documentElement.classList.contains("sv-next")) $("menuBtnInterfaceMode").click();
