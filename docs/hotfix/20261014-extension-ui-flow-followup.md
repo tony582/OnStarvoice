@@ -2,7 +2,7 @@
 
 Date: 2026-10-14. Branch: `codex/extension-ui-refresh`.
 
-This follow-up is not included in the previously published 0.4.24 package. No commit, push, package replacement, deployment, or real-node reload was performed for these changes.
+This record describes the local QA completed before release authorization. At that point no commit, push, package replacement, deployment, or real-node reload had been performed. The follow-up was subsequently published in 0.4.25 after the user requested deployment; see `20261014-extension-ui-0425.md` for the production receipt. It was not included in 0.4.24.
 
 ## Changes
 
