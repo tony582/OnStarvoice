@@ -107,7 +107,7 @@ function initInstantTooltips() {
   };
 
   const getTooltipText = (target) =>
-    String(target?.getAttribute(INSTANT_TOOLTIP_TEXT_ATTR) || "").trim();
+    String(target?.getAttribute("data-sv-tooltip") || target?.getAttribute(INSTANT_TOOLTIP_TEXT_ATTR) || "").trim();
 
   const migrateTitleForElement = (element) => {
     if (!(element instanceof Element) || element === tooltipEl) return;
@@ -122,6 +122,10 @@ function initInstantTooltips() {
     }
 
     element.setAttribute(INSTANT_TOOLTIP_TEXT_ATTR, tooltipText);
+    // Retain the accessible name when an icon-only control's title becomes a tooltip.
+    if (element.matches("button, a, [role='button']") && !element.hasAttribute("aria-label") && !element.textContent.trim()) {
+      element.setAttribute("aria-label", tooltipText);
+    }
   };
 
   const migrateTitleAttrs = (root) => {
@@ -390,6 +394,11 @@ document.addEventListener("DOMContentLoaded", () => {
       mainPoolPanel.style.display = isCapturePanel ? "block" : "none";
     }
     syncUnsupportedPlatformCover(targetId);
+
+    // Optional presentation adapters observe navigation without owning it.
+    document.dispatchEvent(new CustomEvent("starvoice:sidebar-tab", {
+      detail: {targetId},
+    }));
 
     void refreshDataPool();
     if (targetId === "settingsTab") {

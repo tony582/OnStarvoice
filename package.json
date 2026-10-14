@@ -1,5 +1,8 @@
 {
   "name": "onstarvoice-extension",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "test:extension-ui": "node scripts/check-extension-ui.mjs"
+  }
 }
