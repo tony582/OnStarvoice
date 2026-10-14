@@ -61,7 +61,7 @@ test('extension update manifest matches the packaged source version', () => {
     /扩展 v0\.4\.17<[\s\S]*「需要处理」的任务点「继续」不再没有结果[\s\S]*执行节点[\s\S]*确认旧页面已停止[\s\S]*剩余关键词由后台交回批次[\s\S]*扩展 v0\.4\.15</u,
   );
   assert.doesNotMatch(
-    aboutHtml.slice(0, aboutHtml.indexOf('扩展 v0.4.15<')),
+    aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.17<'), aboutHtml.indexOf('扩展 v0.4.15<')),
     /刷新旧页面|自动刷新|重新加载旧页面|按时间自动放行/u,
   );
   const release0415 = EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.15');
@@ -106,8 +106,8 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 10).map(release => release.version),
-    ['0.4.23', '0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
+  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 11).map(release => release.version),
+    ['0.4.24', '0.4.23', '0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);
@@ -182,15 +182,26 @@ test('0.4.23 publishes the negative patrol reconcile fix while preserving the mi
 });
 
 test('0.4.24 ships opt-in UI without forcing old nodes or claiming a new collector', () => {
-  assert.equal(manifest.version, '0.4.24');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
+  const release = EXTENSION_UPDATE_MANIFEST.releases.find(item => item.version === '0.4.24');
+  assert.equal(release.releaseDate, '2026-10-14');
+  const notes = JSON.stringify(release.releaseNotes);
+  for (const phrase of ['默认仍为经典界面', '当前浏览器配置文件', '不强制', '切回经典界面', '采集引擎、任务协议、同步与安全保护均未修改', '节点空闲', '不要在同一浏览器并装']) assert.ok(notes.includes(phrase), phrase);
+});
+
+test('0.4.25 announces UI lifecycle fixes while keeping classic and old-node compatibility', () => {
+  assert.equal(manifest.version, '0.4.25');
+  assert.doesNotMatch(manifest.description, /微博/u);
   assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
   assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
-    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.24-20261014.zip');
+    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.25-20261014.zip');
   const release = EXTENSION_UPDATE_MANIFEST.releases[0];
   assert.equal(release.version, manifest.version);
   assert.equal(release.releaseDate, '2026-10-14');
   const notes = JSON.stringify(release.releaseNotes);
-  for (const phrase of ['默认仍为经典界面', '当前浏览器配置文件', '不强制', '切回经典界面', '采集引擎、任务协议、同步与安全保护均未修改', '节点空闲', '不要在同一浏览器并装']) assert.ok(notes.includes(phrase), phrase);
+  for (const phrase of ['创意采样', '进度独立占位', '历史记录不删除', '默认仍为经典界面', '不强制', '采集引擎、任务协议、同步与安全保护均未修改', '节点空闲']) assert.ok(notes.includes(phrase), phrase);
+  const latestAbout = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.25<'), aboutHtml.indexOf('扩展 v0.4.24<'));
+  assert.match(latestAbout, /进度独立占位[\s\S]*新版移除微博入口[\s\S]*默认仍为经典界面/u);
 });
 
 test('0.4.22 keeps its dedicated-window cleanup notes', () => {

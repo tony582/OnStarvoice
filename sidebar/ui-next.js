@@ -58,7 +58,7 @@ export function mountNextUI({document, window, state}) {
     if (disposed) return;
     disposed = true;
     document.documentElement.classList.remove("sv-next");
-    document.body.classList.remove("sv-ideas-view", "sv-settings-view", "sv-tasks-view", "sv-no-action", "sv-search-ready");
+    document.body.classList.remove("sv-ideas-view", "sv-settings-view", "sv-tasks-view", "sv-no-action", "sv-search-ready", "sv-retired-platform");
     // Continue restoration even if an unrelated renderer removed one region.
     for (const restore of undo.reverse()) { try { restore(); } catch (error) { console.warn("[Sidebar presentation] Restore:", error); } }
   }
@@ -79,7 +79,7 @@ export function mountNextUI({document, window, state}) {
     return select?.selectedOptions?.[0]?.textContent?.replace(/\(默认\)/g, "").trim() || "";
   };
   try {
-    for (const id of ["mainTabContent", "mainTabNav", "noteTab", "bloggerTab", "searchTab", "monitorTab", "mainPoolPanel", "settingsAccordion", "uiAuthCard", "btnMoreMenu", "dropdownMoreMenu", "btnPlatformMenu", "menuBtnCheckUpdate", "menuBtnInterfaceMode", "btnToggleKeywordStrategy", "keywordStrategyModalOverlay", "btnKeywordStrategyModalClose", "keywordStrategyModalTitle", "searchManualActionRow", "btnOpenBatchNote", "btnOpenBatchBlogger", "batchModalOverlay", "btnBatchModalClose", "textareaBatchLinks", "textareaBatchBloggers"]) {
+    for (const id of ["mainTabContent", "mainTabNav", "noteTab", "bloggerTab", "searchTab", "monitorTab", "mainPoolPanel", "settingsAccordion", "uiAuthCard", "btnMoreMenu", "dropdownMoreMenu", "btnPlatformMenu", "menuBtnCheckUpdate", "menuBtnInterfaceMode", "btnToggleKeywordStrategy", "keywordStrategyModalOverlay", "btnKeywordStrategyModalClose", "keywordStrategyModalTitle", "searchManualActionRow", "btnOpenBatchNote", "btnOpenBatchBlogger", "batchModalOverlay", "btnBatchModalClose", "textareaBatchLinks", "textareaBatchBloggers", "progressContainer", "btnRunKeywordOpportunity", "btnRunBenchmarkDiscovery", "btnCancelKeywordOpportunity", "btnCancelBenchmarkDiscovery"]) {
       if (!document.getElementById(id)) throw new Error(`UI contract missing: ${id}`);
     }
     // Keep the original platform control and its event handlers. Its DOM order
@@ -98,6 +98,38 @@ export function mountNextUI({document, window, state}) {
     status.setAttribute("aria-live", "polite");
     move($(".platform-switcher"), $(".header-top"), $(".header-actions"));
     attr($(".header-actions"), "hidden", "");
+    // Retire platform entry points in this presentation only. Historical
+    // records and the classic collector/registry are deliberately untouched.
+    for (const option of all('#taskCenterPlatformFilter option[value="weibo"]')) attr(option, "hidden", "");
+    const unavailablePlatform = add($("#mainTabContent"), element("section", "sv-platform-unavailable"), $("#mainTabContent").firstChild);
+    unavailablePlatform.append(element("h2", "", "当前页面不支持采集"), element("p", "", "目前支持小红书和抖音。请切换到支持的平台页面后继续。"));
+    const guidanceCopies = new Map();
+    const platformHintCopies = new Map();
+    const replaceCopy = (node, replacement) => {
+      if (!node || node.textContent === replacement) return;
+      guidanceCopies.set(node, {original: node.textContent, replacement});
+      node.textContent = replacement;
+    };
+    const updatePlatformGuidance = () => {
+      if (document.body.classList.contains("sv-retired-platform")) {
+        replaceCopy($("#currentPlatformName"), "切换平台");
+        const button = $("#btnPlatformMenu");
+        for (const name of ["title", "data-instant-tooltip", "aria-label"]) {
+          const original = button.getAttribute(name);
+          if (!original?.includes("微博")) continue;
+          platformHintCopies.set(name, original);
+          button.setAttribute(name, "切换平台");
+        }
+      }
+      const node = $("#monitorTabHint .guidance-content");
+      if (!node || !node.textContent.includes("抖音、小红书或微博")) return;
+      replaceCopy(node, node.textContent.replaceAll("抖音、小红书或微博", "小红书或抖音"));
+    };
+    undo.push(() => {
+      for (const [node, {original, replacement}] of guidanceCopies) if (node.textContent === replacement) node.textContent = original;
+      const button = $("#btnPlatformMenu");
+      for (const [name, original] of platformHintCopies) if (button.getAttribute(name) === "切换平台") button.setAttribute(name, original);
+    });
 
     // Keep the original strategy trigger (including its disabled state and
     // handler) outside the platform renderer's replaceable tab children.
@@ -108,19 +140,52 @@ export function mountNextUI({document, window, state}) {
     attr(strategy, "class", `${strategy.className} sv-nav-item sv-ideas-tab`);
     attr(strategy, "data-sv-view", "ideas");
     attr(strategy, "aria-current", null);
+    attr(strategy, "aria-disabled", null);
     attr(strategy, "aria-label", "创意");
     attr(strategy, "data-sv-tooltip", "创意");
     attr(strategy, "aria-controls", "keywordStrategyModalOverlay");
     add(strategy, element("span", "sv-strategy-label", "创意"));
     copy($("#keywordStrategyModalTitle"), "创意");
     const ideas = $("#keywordStrategyModalOverlay");
+    // Navigation intent belongs to the view, not to the current sampled web
+    // page. Runtime updates may select a capture tab or temporarily hide the
+    // original strategy surface; neither is a user request to leave Creative.
+    let ideasSelected = ideas.classList.contains("is-active");
     move(ideas, $("#mainTabContent"));
     attr(ideas.querySelector("[role='dialog']"), "role", "region");
     attr(ideas.querySelector(".modal-card"), "aria-modal", null);
     attr(ideas.querySelector(".modal-card"), "aria-label", "创意");
     attr(ideas.querySelector(".keyword-strategy-tabs"), "aria-label", "创意功能");
+    const feedback = add($(".container"), element("div", "sv-feedback"));
+    const progress = $("#progressContainer");
+    // Analysis can outlive a child capture's progress. Its dedicated stop must
+    // remain reachable even when that original progress node is hidden.
+    const task = add(feedback, element("section", "sv-creative-task"));
+    task.setAttribute("aria-label", "当前创意任务");
+    const taskHeading = element("div", "sv-creative-task-heading");
+    taskHeading.append(element("h2", "sv-opportunity-title", "判断赛道机会"), element("h2", "sv-benchmark-title", "找对标账号"));
+    const taskKeyword = element("p", "sv-creative-task-keyword");
+    const rememberKeyword = () => { taskKeyword.textContent = $("#currentSearchKeywordText")?.textContent.trim() || "当前关键词"; };
+    rememberKeyword();
+    const taskActions = element("div", "sv-creative-task-actions");
+    taskHeading.append(taskActions);
+    task.append(taskHeading, taskKeyword);
+    // Preserve the two ORIGINAL stop handlers: the general capture cancel
+    // does not set the strategy-specific cancellation flag.
+    for (const id of ["btnCancelKeywordOpportunity", "btnCancelBenchmarkDiscovery"]) move($("#" + id), taskActions);
+    for (const id of ["btnRunKeywordOpportunity", "btnRunBenchmarkDiscovery"]) listen($("#" + id), "click", rememberKeyword);
+    const unavailable = add($("#mainTabContent"), element("p", "sv-ideas-unavailable", "当前页面已切换，任务状态请查看下方进度。返回原搜索页后可继续查看创意内容。"));
+    unavailable.setAttribute("role", "note");
+    // A reserved flex row, not an overlay over forms/results. The original
+    // renderer still owns its visibility, messages and recovery actions.
+    move(progress, feedback);
+    // When both are visible, the minimized task gets its own row too. The
+    // full-screen running surface and its original click handler are untouched.
+    if ($("#debugSessionDock")) move($("#debugSessionDock"), $(".container"), feedback);
     const closeIdeas = () => {
-      if (ideas.classList.contains("is-active")) $("#btnKeywordStrategyModalClose").click();
+      const shouldClose = ideasSelected || ideas.classList.contains("is-active");
+      ideasSelected = false;
+      if (shouldClose) $("#btnKeywordStrategyModalClose").click();
     };
     listen(topNav, "click", event => {
       if (event.target.closest(".js-tab-trigger[data-target]")) closeIdeas();
@@ -128,7 +193,7 @@ export function mountNextUI({document, window, state}) {
     // Only presentation navigation uses the existing close handler; analysis,
     // cancel, results and current-page eligibility stay owned by the old engine.
     listen(document, "keydown", event => {
-      if (event.key === "Escape" && ideas.classList.contains("is-active")) {
+      if (event.key === "Escape" && ideasSelected) {
         closeIdeas();
         strategy.focus();
         updateNav();
@@ -152,6 +217,11 @@ export function mountNextUI({document, window, state}) {
       navButtons.set(key, btn);
     }
     listen(nav, "click", event => {
+      if (strategy.contains(event.target) && document.body.classList.contains("sv-retired-platform") && !ideasSelected) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       // A selected navigation item stays open. Classic recovers its original
       // toggle behavior after this reversible listener is removed.
       if (strategy.contains(event.target) && ideas.classList.contains("is-active")) event.stopPropagation();
@@ -357,14 +427,16 @@ export function mountNextUI({document, window, state}) {
         radio.disabled = sourceControl.disabled;
       });
       const active = $("#mainTabContent > .tab-pane.is-active")?.id;
-      const noAction = ideas.classList.contains("is-active") || active === "monitorTab" || (active === "searchTab" && plan);
+      const noAction = ideasSelected || document.body.classList.contains("sv-retired-platform") || active === "monitorTab" || (active === "searchTab" && plan);
       document.body.classList.toggle("sv-no-action", noAction);
     }
     function updateNav() {
       if (disposed) return;
       const active = $("#mainTabContent > .tab-pane.is-active")?.id || "noteTab";
       if (CAPTURE_TABS.has(active)) lastCapture = active;
-      const view = ideas.classList.contains("is-active") ? "ideas" : active === "settingsTab" || active === "monitorTab" ? "settings" : active === "historyTab" ? "tasks" : "capture";
+      const view = ideasSelected ? "ideas" : active === "settingsTab" || active === "monitorTab" ? "settings" : active === "historyTab" ? "tasks" : "capture";
+      if (document.body.classList.contains("sv-retired-platform") && !ideasSelected) strategy.setAttribute("aria-disabled", "true");
+      else strategy.removeAttribute("aria-disabled");
       for (const [key, btn] of navButtons) {
         btn.classList.toggle("is-selected", key === view);
         if (key === view) btn.setAttribute("aria-current", "page"); else btn.removeAttribute("aria-current");
@@ -383,11 +455,14 @@ export function mountNextUI({document, window, state}) {
         closeIdeas();
         const target = view === "settings" ? "settingsTab" : view === "tasks" ? "historyTab" : lastCapture;
         window.activateSidebarTab?.(target);
+      } else if (ideas.classList.contains("is-active")) {
+        ideasSelected = true;
+        rememberKeyword();
       }
       updateNav();
       $("#mainTabContent").scrollTop = 0;
     });
-    listen(document, "starvoice:sidebar-tab", () => { closeIdeas(); updateNav(); });
+    listen(document, "starvoice:sidebar-tab", updateNav);
     listen(document, "change", updateSummaries);
     // Radio/checkbox native change fires after click. Do not overwrite their
     // checked state in the intervening bubbling click event.
@@ -396,6 +471,8 @@ export function mountNextUI({document, window, state}) {
     });
     const updateState = () => {
       const snapshot = state.getStateSnapshot();
+      document.body.classList.toggle("sv-retired-platform", snapshot.runtime?.platform === "weibo" || snapshot.runtime?.selectedPlatform === "weibo");
+      updatePlatformGuidance();
       const view = presentationStatus(snapshot);
       setText(status, view.text);
       if (status.dataset.state !== view.state) status.dataset.state = view.state;

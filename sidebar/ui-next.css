@@ -39,6 +39,20 @@ html.sv-next {
 .sv-next .header-actions { display: none; }
 .sv-next .dropdown-menu { border: 1px solid var(--border-light); border-radius: 8px; box-shadow: var(--shadow-md); padding: 6px; color: var(--text-primary); min-width: 184px; }
 .sv-next .platform-menu { left: auto; right: 0; background: #fff; backdrop-filter: none; -webkit-backdrop-filter: none; }
+.sv-next #dropdownPlatformMenu [data-platform="weibo"],
+.sv-next #unsupportedPlatformGrid [data-platform="weibo"],
+.sv-next #taskCenterPlatformFilter option[value="weibo"],
+.sv-next .sync-history-filter-item[data-platform-filter="weibo"] { display: none; }
+.sv-next .sv-platform-unavailable { display: none; padding: 20px 14px; border: 1px solid var(--border-light); border-radius: 8px; background: #fff; }
+.sv-next .sv-platform-unavailable h2 { margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+.sv-next .sv-platform-unavailable p { margin: 0; font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+.sv-next body.sv-retired-platform:not(.sv-settings-view):not(.sv-tasks-view):not(.sv-ideas-view) .sv-platform-unavailable { display: block; }
+.sv-next body.sv-retired-platform .sv-top-nav,
+.sv-next body.sv-retired-platform #mainTabContent > :is(#noteTab, #bloggerTab, #searchTab, #mainPoolPanel),
+.sv-next body.sv-retired-platform:not(.sv-ideas-view) #keywordStrategyModalOverlay,
+.sv-next body.sv-retired-platform #monitorTab .monitor-action-card,
+.sv-next body.sv-retired-platform .sv-ideas-unavailable,
+.sv-next body.sv-retired-platform #currentPlatformLogo { display: none !important; }
 .sv-next .dropdown-item { font-size: 14px; min-height: 38px; border-radius: 4px; }
 .sv-next .tab-nav { flex-shrink: 0; background: #eaf2fc; border: 0; }
 .sv-next .tab-btn { min-height: 44px; padding: 10px 4px; font-size: 14px; font-weight: 500; transition: none; color: #384963; }
@@ -131,7 +145,7 @@ html.sv-next {
 .sv-next .sv-bottom-nav { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); height: 60px; flex-shrink: 0; border-top: 1px solid var(--border-light); background: #fff; z-index: 31; }
 .sv-next .sv-nav-item { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 3px; border: 0; color: #68717d; background: #fff; cursor: pointer; font-size: 12px; font-weight: 400; }
 .sv-next .sv-bottom-nav .sv-ideas-tab { width: 100%; min-width: 0; height: auto; min-height: 0; padding: 0; margin: 0; border: 0; border-radius: 0; box-shadow: none; }
-.sv-next .sv-ideas-tab:disabled { opacity: .5; cursor: not-allowed; }
+.sv-next .sv-ideas-tab:disabled, .sv-next .sv-ideas-tab[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
 .sv-next .sv-nav-item svg { width: 20px; height: 20px; }
 .sv-next .sv-nav-item.is-selected { color: var(--theme-primary); font-weight: 600; }
 .sv-next .sv-nav-item:hover { background: #f7f9fc; }
@@ -244,7 +258,26 @@ html.sv-next {
 .sv-next .monitor-subject-option-title, .sv-next .monitor-section-title { font-size: 14px; }
 .sv-next .monitor-subject-option-copy, .sv-next .monitor-credit-tip { font-size: 12px; }
 .sv-next .monitor-credit-tip { padding: 12px 0; background: transparent; border: 0; line-height: 1.6; }
-.sv-next .monitor-section { border-top: 1px solid var(--border-light); padding-top: 14px; }
+.sv-next .monitor-section { border: 0; border-top: 1px solid var(--border-light); border-radius: 0; padding: 14px 0 0; background: transparent; box-shadow: none; }
+.sv-next .monitor-section-title-wrap { display: flex; align-items: baseline; gap: 10px; }
+.sv-next .monitor-section-meta { margin: 0; font-size: 12px; }
+.sv-next .monitor-list { gap: 0; }
+.sv-next .monitor-item { border: 0; border-bottom: 1px solid var(--border-light); border-radius: 0; padding: 14px 0; background: transparent; box-shadow: none; }
+.sv-next .monitor-item:last-child { border-bottom: 0; padding-bottom: 0; }
+.sv-next .monitor-item-title { align-items: flex-start; font-size: 14px; font-weight: 600; line-height: 1.5; }
+.sv-next .monitor-item-title > span { white-space: normal !important; overflow-wrap: anywhere; }
+.sv-next .monitor-item-title-link { flex: none; min-height: 22px; }
+.sv-next .monitor-item-labels { gap: 8px; }
+.sv-next .monitor-item-platform-label, .sv-next .monitor-subject-badge { padding: 0; min-height: 0; border: 0; border-radius: 0; background: transparent; font-size: 12px; font-weight: 400; }
+.sv-next .monitor-subject-badge::before { content: "·"; color: var(--text-tertiary); margin-right: 8px; }
+.sv-next .monitor-status-badge { flex: none; padding: 1px 8px; min-height: 22px; font-size: 12px; font-weight: 400; }
+.sv-next .monitor-item-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 12px; gap: 10px 16px; padding: 0; border: 0; border-radius: 0; background: transparent; }
+.sv-next .monitor-item-stat { min-width: 0; gap: 3px; }
+.sv-next .monitor-item-stat-label, .sv-next .monitor-item-stat-value { font-size: 12px; line-height: 1.5; font-weight: 400; overflow-wrap: anywhere; }
+.sv-next .monitor-item-actions { margin-top: 12px; gap: 8px; }
+.sv-next .monitor-item-actions .icon-btn { width: auto !important; height: 32px !important; min-width: 56px; padding: 4px 8px; gap: 5px; font-size: 12px; font-weight: 400; }
+.sv-next .monitor-item-actions .icon-btn::after { content: attr(data-instant-tooltip); }
+.sv-next .monitor-item-actions .icon-btn[title]::after { content: attr(title); }
 .sv-next .modal-overlay { backdrop-filter: none; -webkit-backdrop-filter: none; }
 .sv-next .modal-card { border-radius: 8px; box-shadow: var(--shadow-md); max-width: min(560px, calc(100vw - 24px)); padding: 18px; }
 .sv-next .modal-title, .sv-next .batch-modal-title, .sv-next .task-center-detail-title { font-size: 16px; line-height: 1.5; font-weight: 600; }
@@ -271,8 +304,26 @@ html.sv-next {
 .sv-next #keywordStrategyModalOverlay .batch-modal-hint { margin: 0 0 14px; font-size: 12px; line-height: 1.6; }
 .sv-next #keywordStrategyModalOverlay .keyword-strategy-tabs { gap: 0; margin-bottom: 14px; }
 .sv-next #keywordStrategyModalOverlay .keyword-strategy-tab { flex: 1; min-width: 0; padding: 10px 4px; font-size: 12px; white-space: normal; }
-.sv-next body:has(#keywordStrategyModalOverlay.is-active) #mainTabContent > :is(.tab-pane, #mainPoolPanel, #unsupportedPlatformCover) { display: none !important; }
-.sv-next body:has(#keywordStrategyModalOverlay.is-active) #mainTabContent { padding-bottom: 20px; }
+.sv-next body.sv-ideas-view #mainTabContent > :is(.tab-pane, #mainPoolPanel, #unsupportedPlatformCover) { display: none !important; }
+.sv-next body.sv-ideas-view #mainTabContent { flex: 0 1 auto; padding-bottom: 14px; }
+.sv-next body.sv-ideas-view .sv-bottom-nav { margin-top: auto; }
+.sv-next .sv-creative-task, .sv-next .sv-ideas-unavailable { display: none; }
+.sv-next .sv-creative-task { padding: 0 0 12px; background: #fff; }
+.sv-next .sv-creative-task-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.sv-next .sv-creative-task h2 { display: none; margin: 0; font-size: 14px; font-weight: 600; }
+.sv-next .sv-creative-task-keyword { margin: 8px 0 0; font-size: 14px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.sv-next .sv-creative-task-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.sv-next .sv-creative-task-actions .btn { min-height: 34px; padding: 6px 14px; font-size: 14px; }
+.sv-next body.sv-ideas-view .sv-creative-task:has(.sv-creative-task-actions > button[style*="display: inline-flex"]) { display: block; }
+.sv-next .sv-creative-task:has(#btnCancelKeywordOpportunity[style*="display: inline-flex"]) .sv-opportunity-title,
+.sv-next .sv-creative-task:has(#btnCancelBenchmarkDiscovery[style*="display: inline-flex"]) .sv-benchmark-title { display: block; }
+.sv-next body.sv-ideas-view:not(:has(#keywordStrategyModalOverlay.is-active)) .sv-ideas-unavailable { display: block; margin: 0; padding: 12px 14px; border: 1px solid var(--border-light); border-radius: 8px; background: #fff; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+/* One task heading and its original stop control, not a second loading card. */
+.sv-next body.sv-ideas-view:has(#btnCancelKeywordOpportunity[style*="display: inline-flex"]) :is(#keywordOpportunityIntro, #keywordOpportunityResult > .keyword-strategy-loading-card),
+.sv-next body.sv-ideas-view:has(#btnCancelBenchmarkDiscovery[style*="display: inline-flex"]) :is(#keywordBenchmarkIntro, #keywordBenchmarkResult > .keyword-strategy-loading-card) { display: none; }
+.sv-next body.sv-ideas-view #progressBar { margin-bottom: 0 !important; background: #eef4ff; }
+.sv-next body.sv-ideas-view:has(.sv-creative-task-actions > button[style*="display: inline-flex"]) #progressContainer:not([data-progress-source="capture-recovery"]):not([data-progress-source="keyword-plan"]) #btnCancel { display: none !important; }
+.sv-next body.sv-ideas-view:has(.sv-creative-task-actions > button[style*="display: inline-flex"]) #progressContainer:not([data-progress-source="capture-recovery"]):not([data-progress-source="keyword-plan"]) .capture-recovery-actions:has(#btnRetryRecovery[hidden]):has(#btnDismissRecovery[hidden]) { display: none; }
 .sv-next .unsupported-platform-cover { background: #fff; padding: 28px 14px; border: 1px solid var(--border-light); border-radius: 8px; }
 .sv-next .unsupported-platform-cover::before, .sv-next .unsupported-platform-cover::after { display: none; }
 .sv-next .unsupported-platform-brand-title { font-size: 18px; }
@@ -280,7 +331,16 @@ html.sv-next {
 .sv-next .unsupported-platform-card { border: 1px solid var(--border-light); box-shadow: none; border-radius: 6px; }
 .sv-next .unsupported-platform-card:hover { transform: none; }
 .sv-next body.is-unsupported-platform-cover-visible .tab-content { padding-bottom: 14px; }
-.sv-next .progress-sticky { z-index: 40; }
+/* Reserve physical space above navigation for ALL shared capture progress.
+   The original engine owns block/none, text, cancellation and recovery. Never
+   infer running state from text, or layer progress over forms and start docks. */
+.sv-next .sv-feedback { display: none; flex-shrink: 0; min-height: 0; max-height: min(40dvh, 340px); overflow: auto; overscroll-behavior: contain; margin: 0 14px 12px; padding: 14px; border: 1px solid var(--border-light); border-radius: 8px; background: #fff; }
+.sv-next .sv-feedback:has(#progressContainer[style*="display: block"]:not([hidden])),
+.sv-next body.sv-ideas-view .sv-feedback:has(.sv-creative-task-actions > button[style*="display: inline-flex"]) { display: block; }
+.sv-next #progressContainer { position: static; inset: auto; z-index: auto; min-height: 0; width: auto; margin: 0; padding: 0; border: 0; border-radius: 0; box-shadow: none; }
+.sv-next #progressText { font-size: 14px; font-weight: 400; line-height: 1.65; overflow-wrap: anywhere; }
+.sv-next body:has(#progressContainer[style*="display: block"]:not([hidden])) :is(#noteTab, #bloggerTab, #searchTab) .action-row { display: none !important; }
+.sv-next body:has(#progressContainer[style*="display: block"]:not([hidden])) .tab-content { padding-bottom: 20px; scroll-padding-bottom: 20px; }
 /* Preserve the full-screen running surface: existing geometry, controls and
    timings stay intact. Only purple accents become blue. Reset inherited line
    height so the new form typography cannot alter this stable surface. */
@@ -303,6 +363,7 @@ html.sv-next {
 /* The minimized task stays above the new navigation/action bars. */
 .sv-next .debug-session-dock { bottom: 138px; line-height: normal; }
 .sv-next body:is(.sv-ideas-view, .sv-settings-view, .sv-tasks-view, .sv-no-action) .debug-session-dock { bottom: 74px; }
+.sv-next body:has(#progressContainer[style*="display: block"]:not([hidden])) .debug-session-dock { position: static; flex-shrink: 0; align-self: flex-end; margin: 0 14px 8px; box-shadow: none; }
 @media (max-width: 360px) {
   .sv-next .header { padding: 10px; }
   .sv-next .header-top { gap: 7px; }

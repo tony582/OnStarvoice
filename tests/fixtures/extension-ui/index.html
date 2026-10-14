@@ -1,9 +1,13 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>StarVoice · 新旧界面验收</title><link rel="stylesheet" href="/__preview/preview.css"></head><body>
 <aside><img src="/images/icon128.png" width="36" height="36" alt="星语"><h1>Extension 界面验收</h1><p>实际界面文件 · 隔离演练</p><p class="notice">这里只使用演示数据，不连接后台，不执行真实采集，也不接触正在工作的节点。</p>
 <label>面板宽度<select id="width"><option>320</option><option>360</option><option selected>440</option><option>480</option><option>600</option></select></label>
-<label>平台<select id="platform"><option value="xiaohongshu">小红书</option><option value="douyin">抖音</option><option value="weibo">微博</option></select></label>
+<label>平台<select id="platform"><option value="xiaohongshu">小红书</option><option value="douyin">抖音</option></select></label>
 <label>演示状态<select id="scenario"><option value="search">搜索页 · 已采集</option><option value="keywords">搜索页 · 多个关键词</option><option value="empty">空数据</option><option value="note">笔记页</option><option value="blogger">博主页</option><option value="monitor">对标监控</option><option value="tasks">任务中心</option><option value="running">运行面板 · 采集中</option><option value="waiting">运行面板 · 安全等待</option><option value="settings">授权 · 已激活</option><option value="unauthorized">授权 · 未激活</option><option value="expired">授权 · 已过期</option><option value="unsupported">不支持的平台</option></select></label>
 <button id="reload">载入所选状态</button><button id="contracts">运行兼容性检查</button>
+<details><summary>采集过程 · 隔离演练</summary>
+<label>流程<select id="flow"><option value="opportunity">判断赛道机会</option><option value="benchmark">找对标账号</option><option value="note">笔记采集</option><option value="blogger">博主采集</option><option value="search">搜索采集</option><option value="batch-links">批量作品</option><option value="batch-bloggers">批量博主</option><option value="longtail">长尾需求</option></select></label>
+<label>阶段<select id="stage"><option value="waiting">采样 / 安全等待</option><option value="detail">采样切换详情页</option><option value="ai">AI 分析</option><option value="done">已完成</option><option value="error">异常</option><option value="stop">停止</option></select></label>
+<button id="rehearse">演练所选阶段</button><button id="lifecycle">检查启动与恢复流程</button></details>
 <p>经典版右上角菜单 → 试用新版界面。新版底部设置 → 切回经典界面。</p>
 <output id="report" aria-live="polite"></output><p class="foot">验收重点：原有采集字段与结果完整保留；新旧切换不重载、不清缓存、不启动任务。</p></aside>
 <main><iframe id="extension" title="StarVoice 扩展界面" src="/sidebar/sidebar.html?scenario=search"></iframe></main><script src="/__preview/preview.js" type="module"></script></body></html>

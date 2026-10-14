@@ -41,6 +41,12 @@ test("CSS is scoped and preserves running geometry except minimized dock clearan
   assert.doesNotMatch(css, /@import|@font-face|backdrop-filter\s*:\s*(?!none)[a-z]|@keyframes|animation\s*:/);
   for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
     if (!match[1].includes(".debug-session")) continue;
+    if (match[1].includes('#progressContainer[style*="display: block"]')) {
+      assert.match(match[1], /\.sv-next body:has\([\s\S]*\) \.debug-session-dock\s*$/);
+      assert.match(match[2], /position: static; flex-shrink: 0; align-self: flex-end;/);
+      assert.doesNotMatch(match[1], /debug-session-panel/);
+      continue;
+    }
     for (const rule of match[2].split(";").map(value => value.trim()).filter(Boolean)) {
       assert.match(rule, /^(?:color|border-color|background)\s*:|^line-height:\s*normal$|^bottom:\s*(?:74|138)px$/, rule);
       if (rule.startsWith("bottom:")) assert.match(match[1], /\.debug-session-dock\s*$/);

@@ -2,6 +2,7 @@
 import * as state from "/sidebar/state.js";
 import {mountNextUI} from "/sidebar/ui-next.js";
 import {getPlatformCapabilities} from "/sidebar/platform-registry.js";
+import {installLifecycleFixture} from "./creative-lifecycle.js";
 const params = new URLSearchParams(location.search);
 const scenario = params.get("scenario") || "search";
 const platform = params.get("platform") || "xiaohongshu";
@@ -126,6 +127,10 @@ window.addEventListener("load", async () => {
   await chrome.storage.local.set({
     "onstarvoice.auth": auth,
     "onstarvoice.data_pool": {records: scenario === "empty" ? [] : fixtureRecords()},
+    "onstarvoice.monitor": {items: [
+      {id: "fixture-monitor-1", displayName: "上海安吉星信息服务有限公司", platform, subjectType: "official", status: "active", lastHitAt: null, lastRunAt: "2026-10-14T02:00:00Z", nextRunAt: "2026-10-14T03:00:00Z", createdAt: "2026-10-10T01:00:00Z"},
+      {id: "fixture-monitor-2", displayName: "智驾观察站", platform, subjectType: "creator", status: "paused_insufficient_balance", lastHitAt: "2026-10-13T01:12:00Z", lastRunAt: "2026-10-13T02:00:00Z", nextRunAt: null, createdAt: "2026-10-09T01:00:00Z"},
+    ], executions: []},
     "onstarvoice.taskLedger": {version: 1, runs: [
       {id: "preview-task-1", title: "新能源汽车 · 关键词采集", taskType: "keyword_capture", status: "running", platform, createdAt: now, updatedAt: now, progress: {percent: 61, message: "正在完善作品详情"}},
       {id: "preview-task-2", title: "智驾观察站 · 博主页采集", taskType: "capture", status: "failed", platform, createdAt: now, updatedAt: now, error: {message: "页面校验未通过，请定位到对应标签页后继续。"}},
@@ -173,6 +178,7 @@ window.addEventListener("load", async () => {
     $("debugSessionDock").onclick = () => { $("debugSessionPanel").hidden = false; $("debugSessionDock").hidden = true; };
     $("btnDebugSessionStop").onclick = () => window.showMessage?.("隔离演练：未停止任何真实任务。", "info");
   }
+  installLifecycleFixture({document, window, state, platform, report, errorLog});
   report("隔离界面已就绪。经典版右上角可试用新版；新版在设置内切回经典界面。");
 });
 

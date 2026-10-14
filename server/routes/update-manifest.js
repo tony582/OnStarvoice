@@ -3,12 +3,25 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.24',
+  latestVersion: '0.4.25',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-10-14',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.24-20261014.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.25-20261014.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.25',
+      releaseDate: '2026-10-14',
+      releaseNotes: [{
+        tag: '界面修复',
+        notes: [
+          {title: '创意采样不再跳回搜索表单', desc: '保留当前创意视图，采样更新网页信息时不再误判为离开创意；原有停止、异常恢复和分析流程保持不变。'},
+          {title: '采集进度不再覆盖底部按钮', desc: '笔记、博主、搜索和创意采集的进度独立占位，长提示可滚动，窄屏不遮挡底部导航；批量采集保留原弹窗和停止操作。'},
+          {title: '监控列表更简洁，平台入口收敛', desc: '监控列表去掉内层套框，保留全部信息及暂停、恢复、删除操作。新版移除微博入口，仅显示小红书和抖音；历史记录不删除。'},
+          {title: '继续按节点试用', desc: '默认仍为经典界面，新版可切回经典界面，不强制其它节点升级。采集引擎、任务协议、同步与安全保护均未修改。请在节点空闲且结果安全保存后升级，不要在同一浏览器并装第二份扩展。'},
+        ],
+      }],
+    },
     {
       version: '0.4.24',
       releaseDate: '2026-10-14',

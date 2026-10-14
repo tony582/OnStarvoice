@@ -7,12 +7,15 @@ import path from "node:path";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const digest = bytes => createHash("sha256").update(bytes).digest("hex");
-// A release may bump only manifest.version; permissions and all other manifest
-// fields must still match the previous shipping snapshot and HEAD.
+// Release-only metadata exceptions: version and the exact retired-platform
+// description copy below. Permissions and all other fields must still match.
 const comparable = (name, bytes) => {
   if (name !== "manifest.json") return bytes;
   const manifest = JSON.parse(bytes.toString());
   delete manifest.version;
+  manifest.description = manifest.description
+    .replace('小红书/抖音/微博AI', '小红书/抖音AI')
+    .replace('笔记/视频/微博数据采集', '笔记/视频数据采集');
   return JSON.stringify(manifest);
 };
 async function files(directory, prefix = "") {
@@ -33,12 +36,15 @@ for (const name of protectedFiles) {
   const baseline = execFileSync("git", ["show", `HEAD:${name}`], {cwd: root, maxBuffer: 24 * 1024 * 1024});
   if (digest(comparable(name, current)) !== digest(comparable(name, shipping)) || digest(comparable(name, current)) !== digest(comparable(name, baseline))) throw new Error(`Protected collection file changed: ${name}`);
 }
-console.log(`PASS: ${protectedFiles.length - 1} protected code files match HEAD and the existing shipping snapshot; manifest matches except release version.`);
+console.log(`PASS: ${protectedFiles.length - 1} protected code files match HEAD and the existing shipping snapshot; manifest matches except release version and retired-platform description.`);
 for (const name of ["sidebar/ui-mode.js", "sidebar/ui-next.js", "sidebar/ui-next-icons.js", "sidebar/sidebar-ui.js"]) {
   execFileSync(process.execPath, ["--check", name], {cwd: root, stdio: "inherit"});
 }
 const tests = [
   "tests/extension-ui-compatibility.test.mjs", "tests/extension-ui-batch-wiring.test.mjs",
+  "tests/extension-ui-creative-flow.test.mjs",
+  "tests/extension-ui-monitor-layout.test.mjs",
+  "tests/extension-ui-platform-presentation.test.mjs",
   "tests/capture-recovery-ui.test.mjs", "tests/capture/ai-relevance-prefilter-ui.test.mjs",
   "tests/capture/sidebar-capture-task-wiring.test.mjs", "tests/capture/sidebar-csv-export.test.mjs",
   "tests/task-center-ui.test.mjs", "tests/task-center.test.mjs",
