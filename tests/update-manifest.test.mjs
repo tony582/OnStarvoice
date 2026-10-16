@@ -106,8 +106,8 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 13).map(release => release.version),
-    ['0.4.26', '0.4.25', '0.4.24', '0.4.23', '0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
+  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 14).map(release => release.version),
+    ['0.4.27', '0.4.26', '0.4.25', '0.4.24', '0.4.23', '0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);
@@ -220,12 +220,9 @@ test('0.4.26 publishes presentation-only creative results and sharing without fo
 });
 
 test('0.4.27 publishes compact UI without changing collection or classic fallback', () => {
-  assert.equal(manifest.version, '0.4.27');
   assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
-  assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
-    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.27-20261014.zip');
-  const release = EXTENSION_UPDATE_MANIFEST.releases[0];
-  assert.equal(release.version, manifest.version);
+  const release = EXTENSION_UPDATE_MANIFEST.releases.find(item => item.version === '0.4.27');
+  assert.equal(release.version, '0.4.27');
   assert.equal(release.releaseDate, '2026-10-14');
   const notes = JSON.stringify(release.releaseNotes);
   for (const phrase of [
@@ -238,6 +235,23 @@ test('0.4.27 publishes compact UI without changing collection or classic fallbac
   const latestAbout = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.27<'), aboutHtml.indexOf('扩展 v0.4.26<'));
   assert.match(latestAbout, /去掉侧栏内重复的品牌标识[\s\S]*44px 的状态与平台栏[\s\S]*采集按钮回到页面正常布局[\s\S]*批量采集菜单在入口旁展开/u);
   assert.match(latestAbout, /采集引擎、分析流程、任务协议、同步与安全保护均未修改[\s\S]*默认仍为经典界面[\s\S]*不强制旧节点升级/u);
+});
+
+test('0.4.28 publishes compact typography and preserves collected keyword groups', () => {
+  assert.equal(manifest.version, '0.4.28');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
+    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.28-20261016.zip');
+  const release = EXTENSION_UPDATE_MANIFEST.releases[0];
+  assert.equal(release.version, manifest.version);
+  assert.equal(release.releaseDate, '2026-10-16');
+  const notes = JSON.stringify(release.releaseNotes);
+  for (const phrase of ['13px', '12px', '最外层包围框', '关键词分组框', '蓝色组标题', '逐条内容',
+    '分组折叠', '仅调整新版界面样式', '采集引擎、分析流程、任务协议、同步与安全保护均未修改',
+    '默认仍为经典界面', '切回经典界面', '不强制旧节点升级', '节点空闲']) assert.ok(notes.includes(phrase), phrase);
+  const latestAbout = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.28<'), aboutHtml.indexOf('扩展 v0.4.27<'));
+  assert.match(latestAbout, /13px[\s\S]*最外层包围框[\s\S]*关键词分组框[\s\S]*逐条内容保留/u);
+  assert.match(latestAbout, /采集引擎、分析流程、任务协议、同步与安全保护均未修改[\s\S]*默认仍为经典界面/u);
 });
 
 test('0.4.22 keeps its dedicated-window cleanup notes', () => {

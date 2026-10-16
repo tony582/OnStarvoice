@@ -47,7 +47,7 @@ test("monitor dates remain readable metadata without the old dashed inner box", 
   assert.equal(grid.background, "transparent");
   assert.equal(grid.padding, "0");
   assert.match(grid["grid-template-columns"], /repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
-  assert.equal(declarationsFor(".monitor-item-title")["font-size"], "14px");
+  assert.equal(declarationsFor(".monitor-item-title")["font-size"], "13px");
   assert.equal(declarationsFor(".monitor-item-title")["font-weight"], "600");
   assert.equal(declarationsFor(".monitor-item-stat-label")["font-size"], "12px");
   const value = declarationsFor(".monitor-item-stat-value");

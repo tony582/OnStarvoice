@@ -1,4 +1,4 @@
-// Narrow 0.4.27 metadata/package release. No database or capture-node operations.
+// Narrow 0.4.28 metadata/package release. No database or capture-node operations.
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -10,16 +10,16 @@ export const metadataPaths = ['server/routes/update-manifest.js', 'server/public
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const regular = async file => { if (!(await fs.lstat(file)).isFile()) throw new Error(`Not a regular file: ${file}`); };
 async function atomicCopy(source, target) {
-  const temporary = `${target}.ui-0427-stage`;
+  const temporary = `${target}.ui-0428-stage`;
   await fs.copyFile(source, temporary, 1);
   await fs.chmod(temporary, 0o644);
   await fs.rename(temporary, target);
 }
 
 export async function deploy({root, stage, release, services, checkOnly = false, interrupted = () => false}) {
-  if (release.version !== '0.4.27' || release.previous !== '0.4.26' || !/^[0-9a-f]{40}$/.test(release.commit)) throw new Error('Invalid release identity');
+  if (release.version !== '0.4.28' || release.previous !== '0.4.27' || !/^[0-9a-f]{40}$/.test(release.commit)) throw new Error('Invalid release identity');
   if (JSON.stringify(release.files.map(f => f.path)) !== JSON.stringify(metadataPaths)) throw new Error('Unexpected release surface');
-  if (release.zip !== 'StarVoice-extension-v0.4.27-20261014.zip') throw new Error('Unexpected package');
+  if (release.zip !== 'StarVoice-extension-v0.4.28-20261016.zip') throw new Error('Unexpected package');
   const targetZip = path.join(root, 'public-downloads', release.zip);
   const stageZip = path.join(stage, release.zip);
   await regular(stageZip);
@@ -32,7 +32,7 @@ export async function deploy({root, stage, release, services, checkOnly = false,
   }
   const oldOps = await fs.readFile(path.join(root, metadataPaths[2]), 'utf8');
   const newOps = await fs.readFile(path.join(stage, 'payload', metadataPaths[2]), 'utf8');
-  if (oldOps.replace("OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.26'", "OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.27'") !== newOps) throw new Error('Ops change exceeds version metadata');
+  if (oldOps.replace("OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.27'", "OPS_CONTROL_RUNTIME_BASELINE_VERSION = '0.4.28'") !== newOps) throw new Error('Ops change exceeds version metadata');
   await services.health();
   const beforeManifest = await services.manifest();
   if (beforeManifest.latestVersion !== release.previous || beforeManifest.minSupportedVersion !== '0.3.51') throw new Error('Unexpected live manifest');
@@ -56,7 +56,7 @@ export async function deploy({root, stage, release, services, checkOnly = false,
       if (hash(await fs.readFile(backup)) !== file.before) throw new Error('Backup drift');
     }
     check();
-    const stagedZip = `${targetZip}.ui-0427-stage`;
+    const stagedZip = `${targetZip}.ui-0428-stage`;
     await fs.copyFile(stageZip, stagedZip, 1);
     await fs.chmod(stagedZip, 0o644);
     // Link is atomic and refuses to replace an existing public package.

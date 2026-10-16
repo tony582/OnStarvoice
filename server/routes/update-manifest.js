@@ -3,12 +3,24 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.27',
+  latestVersion: '0.4.28',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-10-14',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.27-20261014.zip',
+  releaseDate: '2026-10-16',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.28-20261016.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.28',
+      releaseDate: '2026-10-16',
+      releaseNotes: [{
+        tag: '界面优化',
+        notes: [
+          {title: '侧栏更紧凑', desc: '新版正文调整为 13px、辅助信息 12px，收紧表单、按钮和选项间距，一屏可查看更多内容。'},
+          {title: '只去掉最外层大框', desc: '配置、结果等主区域去掉最外层包围框，采集结果内部的关键词分组框、蓝色组标题和逐条内容继续保留，分组折叠及原有操作不变。'},
+          {title: '采集保持原样', desc: '本次仅调整新版界面样式，采集引擎、分析流程、任务协议、同步与安全保护均未修改。默认仍为经典界面，新版可切回经典界面，不强制旧节点升级；请在节点空闲且结果安全保存后升级，不要在同一浏览器并装第二份扩展。'},
+        ],
+      }],
+    },
     {
       version: '0.4.27',
       releaseDate: '2026-10-14',
