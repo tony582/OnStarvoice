@@ -56,22 +56,59 @@ export async function cancelDiscoveryDemands(tx, {tenantId,runId}) {
   return {canceledDemands:candidates.length,stopped};
 }
 
-export async function reconcileDiscoveryDetails(tx,{tenantId}) {
+export async function reconcileDiscoveryDetails(tx,{tenantId,taskIds=null}) {
   const rows=await tx.queryAll(`SELECT task.id AS task_id FROM capture_tasks task WHERE task.tenant_id=$1
-    AND task.task_type='discovered_post_capture' AND task.status='pending'
-    AND EXISTS(SELECT 1 FROM capture_agent_commands command WHERE command.task_id=task.id
-      AND command.command_type='create' AND command.expires_at<now())
-    ORDER BY task.id LIMIT 20 FOR UPDATE OF task SKIP LOCKED`,[tenantId]);
+    AND ($2::uuid[] IS NULL OR task.id=ANY($2::uuid[]))
+    AND task.task_type='discovered_post_capture' AND task.attention_dismissed_at IS NULL
+    AND (task.status='pending' OR (task.status='needs_action' AND task.error->>'code'='detail_create_expired'))
+    AND task.started_at IS NULL
+    AND NOT EXISTS(SELECT 1 FROM capture_task_attempts attempt WHERE attempt.tenant_id=task.tenant_id AND attempt.task_id=task.id)
+    AND EXISTS(SELECT 1 FROM capture_agent_commands command WHERE command.tenant_id=task.tenant_id AND command.task_id=task.id
+      AND command.id::text=task.metadata->>'createCommandId'
+      AND command.payload->>'attemptIdentity'=task.metadata->>'attemptIdentity'
+      AND command.command_type='create' AND command.status IN ('pending','acknowledged','expired') AND command.expires_at<now())
+    AND EXISTS(SELECT 1 FROM capture_task_items item WHERE item.tenant_id=task.tenant_id AND item.task_id=task.id
+      AND item.execution_task_id=task.id AND item.status='dispatched' AND item.started_at IS NULL)
+    ORDER BY task.id LIMIT 20 FOR UPDATE OF task SKIP LOCKED`,[tenantId,taskIds]);
+  const settled=[];
   for (const row of rows) {
-    const candidate=await tx.queryOne(`SELECT candidate.id FROM capture_discovery_candidates candidate
-      JOIN capture_task_items item ON item.id=candidate.detail_task_item_id WHERE candidate.tenant_id=$1
-      AND candidate.status='capturing' AND item.execution_task_id=$2 FOR UPDATE OF candidate SKIP LOCKED`,[tenantId,row.task_id]);
+    const candidate=await tx.queryOne(`SELECT candidate.id,candidate.detail_task_item_id FROM capture_discovery_candidates candidate
+      JOIN capture_tasks task ON task.tenant_id=candidate.tenant_id AND task.metadata->>'candidateId'=candidate.id::text
+      WHERE candidate.tenant_id=$1 AND task.id=$2 AND candidate.record_id IS NULL
+      AND (candidate.status='capturing' OR (candidate.status='failed' AND candidate.last_error->>'code'='detail_create_expired'))
+      FOR UPDATE OF candidate SKIP LOCKED`,[tenantId,row.task_id]);
     if (!candidate) continue;
+    // Only the unstarted, current dispatch may expire. Preserve a reassigned
+    // candidate, a running attempt, or a formal receipt that arrived meanwhile.
+    const item=await tx.queryOne(`SELECT item.id,attempt.id AS attempt_id,attempt.attempt_number FROM capture_task_items item
+      JOIN capture_tasks task ON task.id=item.execution_task_id AND task.tenant_id=item.tenant_id
+      JOIN capture_task_item_attempts attempt ON attempt.tenant_id=item.tenant_id AND attempt.item_id=item.id
+        AND attempt.id::text=task.metadata->>'attemptIdentity' AND attempt.execution_task_id=task.id
+        AND attempt.attempt_number=item.attempt_count AND attempt.assignment_revision=item.assignment_revision
+        AND attempt.request_hash=item.request_hash
+      WHERE item.tenant_id=$1 AND item.id=$2 AND item.task_id=$3 AND item.execution_task_id=$3
+        AND item.status='dispatched' AND attempt.status='dispatched'
+        AND item.started_at IS NULL AND attempt.started_at IS NULL
+        AND item.result_record_id IS NULL AND item.result_observation_id IS NULL
+      FOR UPDATE OF item,attempt`,[tenantId,candidate.detail_task_item_id,row.task_id]);
+    if (!item) continue;
+    await tx.execute(`UPDATE capture_task_items SET status='needs_action',error='{"code":"detail_create_expired"}',
+      finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2`,[tenantId,item.id]);
+    await tx.execute(`UPDATE capture_task_item_attempts SET status='needs_action',error='{"code":"detail_create_expired"}',
+      finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2`,[tenantId,item.attempt_id]);
     await tx.execute(`UPDATE capture_discovery_candidates SET status='failed',last_error='{"code":"detail_create_expired"}'
       WHERE tenant_id=$1 AND id=$2`,[tenantId,candidate.id]);
     await tx.execute(`UPDATE capture_discovery_run_candidates SET demand_status='needs_action'
       WHERE tenant_id=$1 AND candidate_id=$2 AND demand_status='active'`,[tenantId,candidate.id]);
+    // Before the first heartbeat the task slot is still zero. Bind it to the
+    // dispatched attempt so a late first report cannot reopen an operator close.
     await tx.execute(`UPDATE capture_tasks SET status='needs_action',error='{"code":"detail_create_expired"}',
-      message='补详情下发未确认',updated_at=now() WHERE tenant_id=$1 AND id=$2 AND status='pending'`,[tenantId,row.task_id]);
+      message='补详情下发未确认',counts='{"total":1,"processed":1,"success":0,"failed":1}',
+      attempt_number=GREATEST(attempt_number,$3),
+      finished_at=COALESCE(finished_at,now()),
+      updated_at=CASE WHEN status='pending' THEN now() ELSE updated_at END
+      WHERE tenant_id=$1 AND id=$2`,[tenantId,row.task_id,item.attempt_number]);
+    settled.push(row.task_id);
   }
+  return settled;
 }

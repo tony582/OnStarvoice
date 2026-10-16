@@ -9,13 +9,14 @@ import {cancelDiscoveryDemands,reconcileDiscoveryDetails} from '../../../server/
 import {createAndroidControlService} from '../../../server/services/android-control/service.js';
 import {createDiscoveryManagementService} from '../../../server/services/capture-discovery/management.js';
 import {listRecordDiscoveryKeywords,readDiscoveryCaptureKeyword} from '../../../server/services/capture-discovery/record-keyword.js';
+import {closeOperatorAttentionRoot,loadOperatorCloseEligibility} from '../../../server/services/capture-operator-close.js';
 
 test('discovery detail pipeline against isolated PostgreSQL',async t=>{
   validatePostgresIntegrationTarget({testDatabaseUrl:process.env.TEST_DATABASE_URL,databaseUrl:process.env.DATABASE_URL,requireDatabaseUrl:true});
   const {runMigrations}=await import('../../../server/db/migrate.js');
   const {getPool,closePool}=await import('../../../server/db/pool.js');
   const {withTransaction}=await import('../../../server/db/query.js');
-  const {projectNegativePatrolSnapshot,mirrorTaskSnapshot}=await import('../../../server/routes/capture-cloud.js');
+  const {projectNegativePatrolSnapshot,mirrorTaskSnapshot,reconcileDeadAttentionRoots}=await import('../../../server/routes/capture-cloud.js');
   const {normalizeCloudTaskSnapshot}=await import('../../../server/services/capture-cloud.js');
   await import('../../../utils/cloud-task-agent.js');
   const {upsertCapturedRecord}=await import('../../../server/services/record-store.js');
@@ -296,13 +297,72 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
       assert.equal((await query('SELECT record_id FROM capture_discovery_candidates WHERE id=$1',[run.receipt.candidateId]))[0].record_id,record.id);
     } finally {await holder.query('ROLLBACK');holder.release();}
   });
-  await t.test('expired dispatch becomes visible failure rather than an eternal capturing item',async st=>{
+  await t.test('expired dispatch settles its item and attempt so the operator can close it to history',async st=>{
     const f=await fixture(st);await f.addRun();const detail=await f.dispatch();
     await query(`UPDATE capture_agent_commands SET expires_at=now()-interval '1 minute' WHERE id=$1`,[detail.commandId]);
     await withTransaction(tx=>reconcileDiscoveryDetails(tx,{tenantId:f.tenantId}));
     const [candidate]=await query('SELECT status,last_error FROM capture_discovery_candidates WHERE tenant_id=$1',[f.tenantId]);
     assert.equal(candidate.status,'failed');assert.equal(candidate.last_error.code,'detail_create_expired');
+    for (const table of ['capture_tasks','capture_task_items','capture_task_item_attempts']) {
+      const [row]=await query(`SELECT status,error,finished_at FROM ${table} WHERE tenant_id=$1 AND ${table==='capture_tasks'?'id':'execution_task_id'}=$2`,[f.tenantId,detail.taskId]);
+      assert.equal(row.status,'needs_action',table);assert.equal(row.error.code,'detail_create_expired');assert.ok(row.finished_at);
+    }
+    const eligibility=await withTransaction(tx=>loadOperatorCloseEligibility(tx,f.tenantId,[detail.taskId]));
+    assert.equal(eligibility.get(detail.taskId).eligible,true);
+    const closed=await withTransaction(tx=>closeOperatorAttentionRoot(tx,{tenantId:f.tenantId,rootId:detail.taskId,actor:{name:'测试关闭'}}));
+    assert.equal(closed.task.status,'failed');assert.ok(closed.task.attention_dismissed_at);
+    assert.equal(closed.task.metadata.operatorClose.originalError.code,'detail_create_expired');
+    assert.equal((await query('SELECT status FROM capture_task_item_attempts WHERE item_id=$1',[detail.itemId]))[0].status,'failed');
+    await assert.rejects(f.store(detail),failure=>['DISCOVERY_RECEIPT_NOT_CURRENT','stale_attempt'].includes(failure.code));
+    await f.mirror(detail,'running');
+    const [afterLateReport]=await query('SELECT status,attention_dismissed_at FROM capture_tasks WHERE id=$1',[detail.taskId]);
+    assert.equal(afterLateReport.status,'failed');assert.ok(afterLateReport.attention_dismissed_at);
+    assert.equal((await query('SELECT id FROM capture_discovery_candidates WHERE tenant_id=$1',[f.tenantId])).length,1,'history retains the discovered work');
   });
+  await t.test('legacy expired tasks repair once without resetting the automatic history deadline',async st=>{
+    const f=await fixture(st);await f.addRun();const detail=await f.dispatch();
+    await query(`UPDATE capture_agent_commands SET status='expired',expires_at=now()-interval '2 hours' WHERE id=$1`,[detail.commandId]);
+    await query(`UPDATE capture_tasks SET status='needs_action',error='{"code":"detail_create_expired"}',updated_at=now()-interval '1 hour' WHERE id=$1`,[detail.taskId]);
+    await query(`UPDATE capture_discovery_candidates SET status='failed',last_error='{"code":"detail_create_expired"}' WHERE id=$1`,[detail.candidateId]);
+    await query(`UPDATE capture_discovery_run_candidates SET demand_status='needs_action' WHERE tenant_id=$1`,[f.tenantId]);
+    const [before]=await query('SELECT updated_at FROM capture_tasks WHERE id=$1',[detail.taskId]);
+    const repair=()=>withTransaction(tx=>reconcileDiscoveryDetails(tx,{tenantId:f.tenantId,taskIds:[detail.taskId]}));
+    assert.deepEqual(await repair(),[detail.taskId]);
+    assert.deepEqual(await repair(),[]);
+    const [after]=await query('SELECT updated_at FROM capture_tasks WHERE id=$1',[detail.taskId]);
+    assert.deepEqual(after.updated_at,before.updated_at);
+    await reconcileDeadAttentionRoots({tenantIds:[f.tenantId],logger:{log(){},error(){}}});
+    const [archived]=await query('SELECT status,attention_dismissed_at,metadata FROM capture_tasks WHERE id=$1',[detail.taskId]);
+    assert.equal(archived.status,'failed');assert.ok(archived.attention_dismissed_at);
+    assert.equal(archived.metadata.operatorClose.mode,'automatic');
+  });
+  await t.test('repair is scoped to the requested tenant and tasks',async st=>{
+    const f=await fixture(st);await f.addRun();const detail=await f.dispatch();
+    await query(`UPDATE capture_agent_commands SET expires_at=now()-interval '1 minute' WHERE id=$1`,[detail.commandId]);
+    for (const scope of [{tenantId:randomUUID(),taskIds:[detail.taskId]},{tenantId:f.tenantId,taskIds:[]},{tenantId:f.tenantId,taskIds:[randomUUID()]}]) {
+      assert.deepEqual(await withTransaction(tx=>reconcileDiscoveryDetails(tx,scope)),[]);
+    }
+    assert.equal((await query('SELECT status FROM capture_task_items WHERE id=$1',[detail.itemId]))[0].status,'dispatched');
+  });
+  for (const scenario of ['unexpired','running','started_attempt','new_command','new_revision','reassigned_candidate','stored']) {
+    await t.test(`expiry preserves ${scenario} work`,async st=>{
+      const f=await fixture(st);await f.addRun();const detail=await f.dispatch();
+      if(scenario!=='unexpired') await query(`UPDATE capture_agent_commands SET expires_at=now()-interval '1 minute' WHERE id=$1`,[detail.commandId]);
+      if(scenario==='running') await f.mirror(detail);
+      if(scenario==='started_attempt') await query('UPDATE capture_task_item_attempts SET started_at=now() WHERE item_id=$1',[detail.itemId]);
+      if(scenario==='new_command') await query(`UPDATE capture_tasks SET metadata=metadata||$2::jsonb WHERE id=$1`,[detail.taskId,{createCommandId:randomUUID()}]);
+      if(scenario==='new_revision') await query('UPDATE capture_task_items SET assignment_revision=assignment_revision+1 WHERE id=$1',[detail.itemId]);
+      if(scenario==='reassigned_candidate') await query('UPDATE capture_discovery_candidates SET detail_task_item_id=NULL WHERE id=$1',[detail.candidateId]);
+      if(scenario==='stored') await f.store(detail);
+      const state=()=>query(`SELECT to_jsonb(task) AS task,to_jsonb(item) AS item,to_jsonb(attempt) AS attempt,to_jsonb(candidate) AS candidate
+        FROM capture_tasks task JOIN capture_task_items item ON item.task_id=task.id
+        JOIN capture_task_item_attempts attempt ON attempt.item_id=item.id
+        JOIN capture_discovery_candidates candidate ON candidate.id=$2 WHERE task.id=$1`,[detail.taskId,detail.candidateId]);
+      const before=await state();
+      assert.deepEqual(await withTransaction(tx=>reconcileDiscoveryDetails(tx,{tenantId:f.tenantId})),[]);
+      assert.deepEqual(await state(),before);
+    });
+  }
   await t.test('a phone-found post is stored under the keyword the phone found it with',async st=>{
     // The browser opens the post by its link: its upload carries no keyword.
     const f=await fixture(st),run=await f.addRun(),detail=await f.dispatch();
