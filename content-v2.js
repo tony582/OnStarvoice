@@ -1553,13 +1553,6 @@ async function ensureKeywordStrategyFilterPanelOpen(notes = []) {
   if (findStrategyFilterPanel()) {
     return true;
   }
-  // 只认「筛选」下拉展开后才可见的文案。"最多点赞/点赞最多"在小红书搜索页的常驻
-  // 排序条上也有,会把"面板已打开"判错——后果是从不去点开「筛选」下拉,发布时间/
-  // 笔记类型等下拉内选项被静默跳过(批量采集"筛选没生效"的根因之一)。
-  if (findStrategyClickableByText(["半年内", "综合排序", "笔记类型"])) {
-    return true;
-  }
-
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const filterTrigger =
       findStrategyFilterTrigger() ||
@@ -1579,12 +1572,6 @@ async function ensureKeywordStrategyFilterPanelOpen(notes = []) {
     if (findStrategyFilterPanel()) {
       return true;
     }
-    if (
-      // 同上:只认下拉展开后才可见的文案,防止常驻排序条造成"已打开"误判
-      findStrategyClickableByText(["半年内", "综合排序", "笔记类型"])
-    ) {
-      return true;
-    }
     await waitForKeywordStrategyUi(400);
   }
 
@@ -1593,38 +1580,50 @@ async function ensureKeywordStrategyFilterPanelOpen(notes = []) {
 }
 
 function findStrategyFilterPanel() {
-  const sectionTexts = [
-    "排序依据",
-    "排序",
-    "笔记类型",
-    "作品类型",
-    "内容类型",
-    "内容形式",
-    "发布时间",
-    "时间",
-    "视频时长",
-    "搜索范围",
-    "位置距离",
-    "距离",
+  // Search cards and AI answers also contain words such as 时间 / 距离.
+  // Require separate, exact section labels with real sibling options; never
+  // infer an open filter panel from prose or two aliases of the same label.
+  const sections = [
+    {labels: ["排序依据", "排序"], options: ["综合", "综合排序", "最新", "最新发布", "最多点赞", "点赞最多"]},
+    {labels: ["笔记类型", "作品类型", "内容类型", "内容形式"], options: ["不限", "全部", "视频", "图文"]},
+    {labels: ["发布时间", "时间"], options: ["不限", "一天内", "一周内", "半年内", "最近半年", "近半年"]},
+    {labels: ["视频时长"], options: ["不限", "1分钟以下", "1-5分钟", "5分钟以上"]},
+    {labels: ["搜索范围"], options: ["不限", "全部", "关注的人", "最近看过", "还未看过", "已看过", "未看过"]},
+    {labels: ["位置距离", "距离"], options: ["不限", "全部", "同城", "附近"]},
   ];
-  const normalized = sectionTexts.map((t) => normalizeStrategyText(t));
-
-  const containers = document.querySelectorAll(
-    '[class*="filter"], [class*="panel"], [class*="dropdown"], [class*="popup"], [class*="overlay"], [class*="screen"], section, aside',
-  );
-  for (const el of containers) {
-    if (!(el instanceof HTMLElement) || !isStrategyNodeVisible(el)) continue;
-    const text = normalizeStrategyText(el.innerText || "");
-    if (normalized.filter((s) => text.includes(s)).length >= 2) return el;
+  const nodes = Array.from(document.querySelectorAll("div, span, label, p, button, li, a"))
+    .filter(node => node instanceof HTMLElement && isStrategyNodeVisible(node));
+  const rows = [];
+  for (const node of nodes) {
+    const label = normalizeStrategyText(node.innerText || "");
+    const section = sections.findIndex(value => value.labels.includes(label));
+    if (section < 0) continue;
+    let row = node.parentElement;
+    for (let depth = 0; row && depth < 3; depth += 1, row = row.parentElement) {
+      if (normalizeStrategyText(row.innerText || "").length > 600) break;
+      const options = new Set(nodes
+        .filter(option => row.contains(option) && !node.contains(option))
+        .map(option => normalizeStrategyText(option.innerText || ""))
+        .filter(value => sections[section].options.includes(value)));
+      if (options.size < 2) continue;
+      rows.push({node: row, section});
+      break;
+    }
   }
-  const allDivs = document.querySelectorAll("div");
-  for (const div of allDivs) {
-    if (!(div instanceof HTMLElement) || !isStrategyNodeVisible(div)) continue;
-    const text = normalizeStrategyText(div.innerText || "");
-    if (text.length > 1200) continue;
-    if (normalized.filter((s) => text.includes(s)).length >= 2) return div;
+  let panel = null;
+  for (const row of rows) {
+    let candidate = row.node.parentElement;
+    for (let depth = 0; candidate && depth < 5; depth += 1, candidate = candidate.parentElement) {
+      if (normalizeStrategyText(candidate.innerText || "").length > 1200) break;
+      const groups = new Set(rows
+        .filter(value => candidate.contains(value.node))
+        .map(value => value.section));
+      if (groups.size < 2) continue;
+      if (!panel || panel.contains(candidate)) panel = candidate;
+      break;
+    }
   }
-  return null;
+  return panel;
 }
 
 async function closeKeywordStrategyFilterPanel(notes = []) {

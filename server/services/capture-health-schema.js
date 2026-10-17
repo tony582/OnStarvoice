@@ -96,6 +96,8 @@ export const CAPTURE_PLATFORM_SAFETY_CODES = Object.freeze([
 
 const RECOVERY_ERROR_CODES = new Set([
   ...CAPTURE_PLATFORM_SAFETY_CODES.map(code => code.toLowerCase()),
+  'search_filter_application_failed',
+  'xhs_search_time_filter_unverified',
   'ai_prefilter_failed',
   'ai_prefilter_timeout',
   'auth_required',

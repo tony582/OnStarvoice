@@ -1274,18 +1274,12 @@ export function crossDeviceRetryItemNeedsManualSafety(item = {}) {
   const error = safeJson(item.error);
   const checkpoint = safeJson(safeJson(item.metadata).checkpoint);
   const evidence = [error, checkpoint];
-  const code = text(
-    error.code || checkpoint.errorCode || checkpoint.error_code,
+  // Technical error codes alone are not safety evidence. Explicit security
+  // evidence must still win even when it accompanies a technical error.
+  return evidence.some(value => CROSS_DEVICE_RETRY_SAFETY_CODES.has(text(
+    value.code || value.errorCode || value.error_code,
     100,
-  ).toUpperCase();
-  if ([
-    'DOUYIN_SEARCH_SERVICE_ABNORMAL',
-    'SEARCH_FILTER_APPLICATION_FAILED',
-    'UNATTENDED_SEARCH_BOOTSTRAP_FAILED',
-  ].includes(code)) {
-    return false;
-  }
-  return CROSS_DEVICE_RETRY_SAFETY_CODES.has(code) ||
+  ).toUpperCase())) ||
     evidence.some(value => [
       'platform_safety_block',
       'login_required',
@@ -1662,6 +1656,7 @@ async function appendFilterVerificationSettledEvent(tx, {
       keyword,
       attempts: settlement.attempts,
       agents: settlement.agents,
+      code: settlement.code,
     }),
     payload: {
       itemId,
@@ -7755,48 +7750,32 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
           AND safety_attempt.attempt_number >
             CASE WHEN item.metadata->>'manualRetryBaseAttemptCount' ~ '^[0-9]+$'
               THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END
-          AND (
-            UPPER(COALESCE(
-              safety_attempt.error->>'code',
-              safety_attempt.checkpoint->>'errorCode',
-              safety_attempt.checkpoint->>'error_code',
-              ''
+          AND EXISTS (
+            -- Evaluate both sources independently: a technical item error
+            -- must not hide a challenge recorded only in its checkpoint.
+            SELECT 1
+            FROM (VALUES (safety_attempt.error), (safety_attempt.checkpoint)) AS evidence(value)
+            WHERE UPPER(COALESCE(
+              NULLIF(evidence.value->>'code', ''),
+              evidence.value->>'errorCode',
+              evidence.value->>'error_code', ''
             )) = ANY($11::text[])
             OR LOWER(COALESCE(
-              safety_attempt.error->>'category',
-              safety_attempt.checkpoint->>'errorCategory',
-              safety_attempt.checkpoint->>'error_category',
-              ''
-            )) IN (
-              'platform_safety_block',
-              'login_required',
-              'authentication_required'
-            )
-            OR COALESCE(
-              safety_attempt.error->>'securityBlocked',
-              safety_attempt.error->>'security_blocked',
-              safety_attempt.error->>'platformSafetyBlocked',
-              safety_attempt.error->>'platform_safety_blocked',
-              safety_attempt.checkpoint->>'securityBlocked',
-              safety_attempt.checkpoint->>'security_blocked',
-              safety_attempt.checkpoint->>'platformSafetyBlocked',
-              safety_attempt.checkpoint->>'platform_safety_blocked',
-              'false'
-            ) = 'true'
-            OR COALESCE(
-              safety_attempt.error->>'requiresManualAction',
-              safety_attempt.error->>'requires_manual_action',
-              safety_attempt.checkpoint->>'requiresManualAction',
-              safety_attempt.checkpoint->>'requires_manual_action',
-              'false'
-            ) = 'true'
-            OR COALESCE(
-              safety_attempt.error #>> '{securityEvidence,confirmed}',
-              safety_attempt.error #>> '{security_evidence,confirmed}',
-              safety_attempt.checkpoint #>> '{securityEvidence,confirmed}',
-              safety_attempt.checkpoint #>> '{security_evidence,confirmed}',
-              'false'
-            ) = 'true'
+              evidence.value->>'category', evidence.value->>'errorCategory',
+              evidence.value->>'error_category', ''
+            )) IN ('platform_safety_block', 'login_required', 'authentication_required')
+            OR 'true' = ANY(ARRAY[
+              evidence.value->>'securityBlocked', evidence.value->>'security_blocked',
+              evidence.value->>'platformSafetyBlocked', evidence.value->>'platform_safety_blocked',
+              evidence.value #>> '{securityEvidence,confirmed}',
+              evidence.value #>> '{security_evidence,confirmed}'
+            ])
+            OR ('true' = ANY(ARRAY[
+              evidence.value->>'requiresManualAction', evidence.value->>'requires_manual_action'
+            ]) AND NOT (UPPER(COALESCE(
+              NULLIF(evidence.value->>'code', ''),
+              evidence.value->>'errorCode', evidence.value->>'error_code', ''
+            )) = ANY($15::text[])))
           )
       )
       AND NOT EXISTS (
@@ -7859,6 +7838,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     excludedItemIds,
     freshCapabilities.remoteTaskEnhancementOptions === true,
     elasticRoundRelaxAfterMs(),
+    Array.from(ELASTIC_FILTER_VERIFICATION_CODES),
   ]);
   if (!candidate) return null;
   const nextCandidate = () => dispatchNextElasticWorkItemWithinBudget(tx, {

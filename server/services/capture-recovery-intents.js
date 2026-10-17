@@ -22,6 +22,7 @@ import {
   verifyCaptureLocalClosureProof,
 } from './capture-local-closure-proof.js';
 import {evaluateCaptureSafetyHandoff} from './capture-safety-handoff-policy.js';
+import {FILTER_VERIFICATION_STOP_REASON, isFilterVerificationCode} from './capture-elastic-policy.js';
 
 export const CAPTURE_RECOVERY_SETTING_KEYS = Object.freeze({
   enabled: 'ops_control_recovery_enabled',
@@ -257,8 +258,8 @@ function recoveryEvidenceHasSafetyBoundary(value = {}) {
     || source.security_blocked === true
     || source.platformSafetyBlocked === true
     || source.platform_safety_blocked === true
-    || source.requiresManualAction === true
-    || source.requires_manual_action === true
+    || ((source.requiresManualAction === true || source.requires_manual_action === true)
+      && !isFilterVerificationCode(recoveryEvidenceCode(source)))
     || object(source.securityEvidence).confirmed === true
     || object(source.security_evidence).confirmed === true
   );
@@ -1294,6 +1295,24 @@ export function classifyCaptureRecoveryCandidate(candidate = {}) {
       code,
       reason: 'item_not_recovery_candidate',
     });
+  }
+  if (isFilterVerificationCode(code)) {
+    if (status === 'failed'
+      && object(candidate.error).automaticRetryStopReason === FILTER_VERIFICATION_STOP_REASON) {
+      return Object.freeze({
+        eligible: false, terminalStatus: 'failed', decision: 'stop',
+        stage, faultClass, code, reason: FILTER_VERIFICATION_STOP_REASON,
+      });
+    }
+    // The elastic pool owns this bounded retry window. A duty-recovery intent
+    // must not start a second independent search or report an account challenge.
+    if (status === 'retryable'
+      && object(candidate.parent_metadata).distributionMode === 'elastic_pool') {
+      return Object.freeze({
+        eligible: false, terminalStatus: null, decision: 'observe',
+        stage, faultClass, code, reason: 'elastic_filter_retry_owned',
+      });
+    }
   }
   if (!fastBudget.exhausted && faultClass !== 'platform_safety') {
     return Object.freeze({

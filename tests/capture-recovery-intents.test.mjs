@@ -206,6 +206,38 @@ function verifyingRecoveryRow(overrides = {}) {
   };
 }
 
+test('filter UI failures do not become account challenges or a second elastic recovery loop', () => {
+  for (const code of ['SEARCH_FILTER_APPLICATION_FAILED', 'XHS_SEARCH_TIME_FILTER_UNVERIFIED']) {
+    const candidate = {
+      status: 'retryable', attempt_count: 8,
+      item_type: 'keyword', item_platform: 'douyin',
+      parent_metadata: {distributionMode: 'elastic_pool'},
+      error: {code, category: 'filter_verification', requiresManualAction: true},
+      source_attempt_checkpoint: {errorCode: code, requiresManualAction: true},
+    };
+    const result = classifyCaptureRecoveryCandidate(candidate);
+    assert.equal(result.code, code);
+    assert.notEqual(result.faultClass, 'platform_safety');
+    assert.equal(result.eligible, false);
+    assert.equal(result.reason, 'elastic_filter_retry_owned');
+    const settled = classifyCaptureRecoveryCandidate({...candidate, status: 'failed',
+      error: {...candidate.error, automaticRetryStopReason: 'filter_verification_repeated'}});
+    assert.equal(settled.eligible, false);
+    assert.equal(settled.terminalStatus, 'failed');
+    assert.equal(settled.reason, 'filter_verification_repeated');
+
+    for (const boundary of [
+      {securityBlocked: true}, {platformSafetyBlocked: true},
+      {securityEvidence: {confirmed: true}}, {category: 'login_required'},
+    ]) {
+      const blocked = classifyCaptureRecoveryCandidate({...candidate,
+        error: {...candidate.error, ...boundary}});
+      assert.equal(blocked.faultClass, 'platform_safety');
+      assert.equal(blocked.terminalStatus, 'waiting_human');
+    }
+  }
+});
+
 test('capture recovery remains globally and tenant disabled by default', () => {
   const defaults = normalizeCaptureRecoverySettings({}, {env: {}});
   assert.equal(defaults.globalEnabled, false);

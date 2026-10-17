@@ -38,6 +38,7 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
   const {getPool, closePool} = await import('../../../server/db/pool.js');
   const {withTransaction} = await import('../../../server/db/init.js');
   const {normalizeCloudTaskSnapshot} = await import('../../../server/services/capture-cloud.js');
+  const {ingestCaptureRecoveryItem} = await import('../../../server/services/capture-recovery-intents.js');
   const {dispatchNextElasticWorkItem, mirrorTaskSnapshot} = await import('../../../server/routes/capture-cloud.js');
   const {createAndroidControlService} = await import('../../../server/services/android-control/service.js');
   const {createApp} = await import('../../../server/app.js');
@@ -57,6 +58,7 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
   const origin = `http://127.0.0.1:${server.address().port}`;
 
   async function fixture(st, {names = NAMES, platform = 'xiaohongshu'} = {}) {
+    const agentCapabilities = {...capabilities, supportedPlatforms: [platform]};
     const [tenant] = await query('INSERT INTO tenants(name) VALUES($1) RETURNING id',
       [`Elastic stuck retry ${randomUUID()}`]);
     st.after(() => query('DELETE FROM tenants WHERE id=$1', [tenant.id]));
@@ -70,7 +72,7 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
         status,allowed_platforms,auth_code_id,auth_binding_id,capabilities,app_version,
         last_heartbeat_at,last_full_heartbeat_at,last_liveness_at)
         VALUES($1,$2,$3,'active',ARRAY[$4],$5,$6,$7,'0.4.18',now(),now(),now()) RETURNING *`,
-      [tenant.id, randomUUID(), name, platform, code.id, binding.id, capabilities]);
+      [tenant.id, randomUUID(), name, platform, code.id, binding.id, agentCapabilities]);
       agents.push(agent);
     }
     const byName = name => {
@@ -89,7 +91,7 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
       headers: {'content-type': 'application/json'}, body: JSON.stringify({email, password})});
     assert.equal(login.status, 200);
     const session = await login.json();
-    return {tenant, agents, byName, session};
+    return {tenant, agents, byName, session, platform, capabilities: agentCapabilities};
   }
 
   async function adminPost(f, path, body) {
@@ -117,27 +119,27 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     const metadata = {
       distributionMode: 'elastic_pool',
       eligibleAgentIds: poolNames.map(name => f.byName(name).id),
-      planSnapshot: xhsPlan(keywords),
+      planSnapshot: {...xhsPlan(keywords), platform: f.platform},
       ...(negativePatrolRun ? {negativePatrolRun: {timezone: 'Asia/Shanghai'}} : {}),
     };
     let scheduleId = null;
     if (schedule) {
       const [template] = await query(`INSERT INTO capture_tasks(tenant_id,client_task_id,task_type,feature_key,
         platform,status,title,metadata) VALUES($1,$2,'capture_orchestration','keyword_orchestration',
-        'xiaohongshu','pending','小红书~日常+负面巡检',$3) RETURNING id`,
-      [f.tenant.id, randomUUID(), {orchestrationTemplate: true, distributionMode: 'elastic_pool'}]);
+        $4,'pending','小红书~日常+负面巡检',$3) RETURNING id`,
+      [f.tenant.id, randomUUID(), {orchestrationTemplate: true, distributionMode: 'elastic_pool'}, f.platform]);
       scheduleId = randomUUID();
       await query(`INSERT INTO capture_orchestration_schedules(id,tenant_id,template_task_id,title,platform,
         status,distribution_mode,plan_snapshot,next_run_at) VALUES($1,$2,$3,'小红书~日常+负面巡检',
-        'xiaohongshu','active','elastic_pool',$4,now()+interval '1 day')`,
-      [scheduleId, f.tenant.id, template.id, xhsPlan(keywords)]);
+        $5,'active','elastic_pool',$4,now()+interval '1 day')`,
+      [scheduleId, f.tenant.id, template.id, metadata.planSnapshot, f.platform]);
       metadata.orchestrationScheduleRun = true;
     }
     const [parent] = await query(`INSERT INTO capture_tasks(tenant_id,client_task_id,task_type,feature_key,
       platform,status,title,metadata,counts,orchestration_revision,orchestration_schedule_id)
-      VALUES($1,$2,'capture_orchestration','keyword_orchestration','xiaohongshu',$3,
+      VALUES($1,$2,'capture_orchestration','keyword_orchestration',$7,$3,
         '小红书~日常+负面巡检 · 09/27 03:30',$4,$5,1,$6) RETURNING *`,
-    [f.tenant.id, randomUUID(), status, metadata, {total: keywords.length}, scheduleId]);
+    [f.tenant.id, randomUUID(), status, metadata, {total: keywords.length}, scheduleId, f.platform]);
     if (scheduleId) {
       await query('UPDATE capture_orchestration_schedules SET last_run_task_id=$1,last_run_status=$2 WHERE id=$3',
         [parent.id, status, scheduleId]);
@@ -145,9 +147,9 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     const items = [];
     for (const [ordinal, keyword] of keywords.entries()) {
       const [item] = await query(`INSERT INTO capture_task_items(tenant_id,task_id,item_key,item_type,keyword,
-        platform,status,ordinal,metadata) VALUES($1,$2,$3,'keyword',$4,'xiaohongshu','pending',$5,$6) RETURNING *`,
+        platform,status,ordinal,metadata) VALUES($1,$2,$3,'keyword',$4,$7,'pending',$5,$6) RETURNING *`,
       [f.tenant.id, parent.id, `keyword:${ordinal}:${keyword}`, keyword, ordinal,
-        {singleRelayV1: true, searchPasses: ['all'], requireVerifiedFilters: true}]);
+        {singleRelayV1: true, searchPasses: ['all'], requireVerifiedFilters: true}, f.platform]);
       items.push(item);
     }
     return {parent, items, scheduleId};
@@ -157,15 +159,15 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     const [child] = await query(`INSERT INTO capture_tasks(tenant_id,parent_task_id,origin_agent_id,assigned_agent_id,
       client_task_id,task_type,feature_key,title,platform,source,trigger_type,status,error,metadata,
       started_at,finished_at) VALUES($1,$2,$3,$3,$4,'unattended_keyword_capture','unattended_keyword_plan',
-      $5,'xiaohongshu','cloud','elastic_pool_claim',$6,$7,$8,now()-interval '2 hours',now()-interval '1 hour')
+      $5,$9,'cloud','elastic_pool_claim',$6,$7,$8,now()-interval '2 hours',now()-interval '1 hour')
       RETURNING *`,
     [f.tenant.id, parent.id, agent.id, randomUUID(), `${parent.title} · 子任务`, status, error,
-      {orchestrationChild: true, parentTaskId: parent.id}]);
+      {orchestrationChild: true, parentTaskId: parent.id}, f.platform]);
     return child;
   }
 
   // Durable history of an item that already failed on `names` (in order).
-  async function seedAttempts(f, parent, item, names, {code = TF, anchor = minutesAgo(5)} = {}) {
+  async function seedAttempts(f, parent, item, names, {code = TF, anchor = minutesAgo(5), extraError = {}} = {}) {
     let child;
     for (const [index, name] of names.entries()) {
       const agent = f.byName(name);
@@ -175,15 +177,15 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
         VALUES($1,$2,$3,$4,$5,$6::integer,$6::integer,'retryable',$7,$8,now()-interval '2 hours',
           now()-interval '1 hour',now()-interval '3 hours'+($6::integer * interval '1 minute'))`,
       [f.tenant.id, item.id, parent.id, child.id, agent.id, index + 1,
-        {code, message: TF_MESSAGE}, {errorCode: code, keyword: item.keyword}]);
+        {code, message: TF_MESSAGE, ...extraError}, {errorCode: code, keyword: item.keyword, ...extraError}]);
     }
     const last = f.byName(names.at(-1));
     await query(`UPDATE capture_task_items SET status='retryable',attempt_count=$2,assignment_revision=$2,
       assigned_agent_id=$3,execution_task_id=$4,error=$5,started_at=now()-interval '2 hours',
       metadata=metadata || jsonb_build_object('elasticAttemptBudgetUsed',$2::integer,'checkpoint',$6::jsonb)
       WHERE id=$1`,
-    [item.id, names.length, last.id, child.id, {code, message: TF_MESSAGE},
-      {keyword: item.keyword, status: 'failed', errorCode: code,
+    [item.id, names.length, last.id, child.id, {code, message: TF_MESSAGE, ...extraError},
+      {keyword: item.keyword, status: 'failed', errorCode: code, ...extraError,
         recovery: {state: 'released_for_handoff', attemptCurrent: names.length, sourceAgentId: last.id,
           handoffReadyAt: anchor, queuedAt: anchor}}]);
     return child;
@@ -211,10 +213,10 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
 
   async function claim(f, name, log = null) {
     return withTransaction(tx => dispatchNextElasticWorkItem(log ? recordingTx(tx, log) : tx,
-      {agent: f.byName(name), capabilities}));
+      {agent: f.byName(name), capabilities: f.capabilities}));
   }
 
-  async function report(f, claimed, {keyword, status = 'failed', code = TF, active = false} = {}) {
+  async function report(f, claimed, {keyword, status = 'failed', code = TF, active = false, extraError = {}} = {}) {
     const command = await row('capture_agent_commands', claimed.commandId);
     const child = await row('capture_tasks', claimed.childTaskId);
     const now = new Date().toISOString();
@@ -223,12 +225,12 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
       keyword, round: 1, status: failed ? 'failed' : 'completed', savedCount: failed ? 0 : 3,
       attemptCount: 1, finishedAt: now,
       ...(failed ? {errorCode: code, errorCategory: code === TF ? 'filter_verification' : 'technical',
-        error: {code, message: TF_MESSAGE}} : {}),
+        ...extraError, error: {code, message: TF_MESSAGE, ...extraError}} : {}),
     };
     const snapshot = normalizeCloudTaskSnapshot({
       id: child.client_task_id, controlTaskId: child.id,
       attemptId: command.payload.attemptIdentity || randomUUID(), attemptNumber: 1, status,
-      platform: 'xiaohongshu', taskType: 'unattended_keyword_capture', featureKey: 'unattended_keyword_plan',
+      platform: f.platform, taskType: 'unattended_keyword_capture', featureKey: 'unattended_keyword_plan',
       source: 'cloud', triggerType: 'orchestration', title: child.title,
       createdAt: child.created_at.toISOString(), updatedAt: now, startedAt: now, finishedAt: now,
       heartbeatAt: now, progressSeq: 1, progress: {keyword},
@@ -236,7 +238,7 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
       checkpoint: active
         ? {round: 1, activeKeyword: keyword, errorCode: failed ? code : ''}
         : {round: 1, keywordResults: [entry]},
-      error: failed ? {code, message: TF_MESSAGE} : {},
+      error: failed ? {code, message: TF_MESSAGE, ...extraError} : {},
       metadata: {planSnapshot: command.payload.planSnapshot},
     });
     const agent = f.agents.find(candidate => candidate.id === command.agent_id);
@@ -363,6 +365,78 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     } finally {
       if (previous === undefined) delete process.env.CAPTURE_ELASTIC_ROUND_RELAX_MINUTES;
       else process.env.CAPTURE_ELASTIC_ROUND_RELAX_MINUTES = previous;
+    }
+  });
+
+  await t.test('Douyin filter errors stop after three nodes and never create a fourth search', async st => {
+    const f = await fixture(st, {platform: 'douyin'});
+    const {parent, items: [item]} = await batch(f, {keywords: ['别克哨兵'], status: 'pending', schedule: true});
+    for (const [index, name] of NAMES.slice(0, 3).entries()) {
+      const claimed = await claim(f, name);
+      assert.equal(claimed.itemId, item.id);
+      await report(f, claimed, {keyword: item.keyword, code: 'SEARCH_FILTER_APPLICATION_FAILED',
+        extraError: {category: 'filter_verification', requiresManualAction: true}});
+      assert.equal((await itemRow(item.id)).status, index === 2 ? 'failed' : 'retryable');
+    }
+    const settled = await itemRow(item.id);
+    assert.equal(settled.error.filterVerificationAttemptCount, 3);
+    assert.equal(settled.error.automaticRetryStopped, true);
+    assert.match(settled.error.message, /无法确认搜索筛选已生效/u);
+    assert.doesNotMatch(settled.error.message, /小红书/u);
+    assert.equal((await row('capture_tasks', parent.id)).status, 'completed_with_failures');
+    assert.equal(await claim(f, NAMES[3]), null);
+    const [commands] = await query(`SELECT count(*)::integer n FROM capture_agent_commands
+      WHERE tenant_id=$1 AND command_type='create'`, [f.tenant.id]);
+    assert.equal(commands.n, 3);
+  });
+
+  await t.test('legacy 8/16 filter failures settle without starting another search despite stale manual flags', async st => {
+    const f = await fixture(st, {platform: 'douyin'});
+    const {parent, items: [item]} = await batch(f, {keywords: ['别克哨兵'], status: 'running'});
+    await seedAttempts(f, parent, item, NAMES, {code: 'SEARCH_FILTER_APPLICATION_FAILED',
+      extraError: {category: 'filter_verification', requiresManualAction: true}});
+    // Recreate the old waiting-human ledger, then restore the actual technical
+    // evidence. The settlement wakeup must terminate that stale intent too.
+    await query(`UPDATE capture_task_items SET error=error || '{"securityBlocked":true}'::jsonb WHERE id=$1`, [item.id]);
+    await ingestCaptureRecoveryItem({tenantId: f.tenant.id, itemId: item.id});
+    const [waiting] = await query('SELECT status FROM capture_recovery_intents WHERE item_id=$1', [item.id]);
+    assert.equal(waiting.status, 'waiting_human');
+    await query("UPDATE capture_task_items SET error=error - 'securityBlocked' WHERE id=$1", [item.id]);
+    assert.equal(await claim(f, NAMES[0]), null);
+    const settled = await itemRow(item.id);
+    assert.equal(settled.status, 'failed');
+    assert.equal(settled.attempt_count, 8);
+    assert.equal(settled.error.filterVerificationAttemptCount, 8);
+    assert.equal(settled.metadata.checkpoint.recovery, undefined);
+    assert.equal((await row('capture_tasks', parent.id)).status, 'completed_with_failures');
+    const reconciliation = await ingestCaptureRecoveryItem({tenantId: f.tenant.id, itemId: item.id});
+    assert.equal(reconciliation.kind, 'terminal_reconciled');
+    const [closed] = await query('SELECT status FROM capture_recovery_intents WHERE item_id=$1', [item.id]);
+    assert.equal(closed.status, 'failed');
+    const [commands] = await query(`SELECT count(*)::integer n FROM capture_agent_commands
+      WHERE tenant_id=$1`, [f.tenant.id]);
+    assert.equal(commands.n, 0);
+  });
+
+  await t.test('a filter code never removes confirmed security or login fences', async st => {
+    for (const boundary of [
+      {error: {securityBlocked: true}},
+      {error: {securityEvidence: {confirmed: true}}},
+      {error: {category: 'login_required'}},
+      {checkpoint: {errorCode: 'DOUYIN_CAPTCHA_REQUIRED'}},
+      {error: {securityBlocked: false}, checkpoint: {securityBlocked: true}},
+      {checkpoint: {errorCode: 'UNKNOWN_CHALLENGE', requiresManualAction: true}},
+    ]) {
+      const f = await fixture(st, {platform: 'douyin'});
+      const {parent, items: [item]} = await batch(f, {keywords: ['别克哨兵'], status: 'running'});
+      await seedAttempts(f, parent, item, NAMES, {code: 'SEARCH_FILTER_APPLICATION_FAILED',
+        extraError: {requiresManualAction: true, ...boundary.error}});
+      if (boundary.checkpoint) {
+        await query('UPDATE capture_task_item_attempts SET checkpoint=checkpoint || $2::jsonb WHERE item_id=$1',
+          [item.id, boundary.checkpoint]);
+      }
+      for (const name of NAMES) assert.equal(await claim(f, name), null);
+      assert.equal((await itemRow(item.id)).status, 'retryable');
     }
   });
 

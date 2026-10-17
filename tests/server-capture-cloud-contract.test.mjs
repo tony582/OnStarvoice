@@ -3265,7 +3265,7 @@ test("elastic queue claims one keyword or platform-bound content item per idle h
   );
   assert.match(
     claim,
-    /safety_attempt\.error[\s\S]*requiresManualAction[\s\S]*securityEvidence/u,
+    /safety_attempt\.error[\s\S]*securityEvidence[\s\S]*requiresManualAction/u,
     'a safety-fenced item/account pair must never be recycled',
   );
   assert.match(claim, /reserveCaptureResourceAdmission\(tx,/u);
@@ -5296,7 +5296,7 @@ test("elastic claim relaxes a stuck round in SQL and settles repeated time-filte
     claim,
     /agent_policy\.agent_attempt_limit = 1\s+OR item\.assigned_agent_id IS DISTINCT FROM \$2::uuid/u,
   );
-  assert.match(claim, /elasticRoundRelaxAfterMs\(\),\s+\]\);/u);
+  assert.match(claim, /elasticRoundRelaxAfterMs\(\),\s+Array\.from\(ELASTIC_FILTER_VERIFICATION_CODES\),\s+\]\);/u);
   assert.match(claim, /roundExclusionRelaxed: candidate\.round_relaxed === true/u);
   assert.match(
     claim,

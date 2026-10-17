@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   ELASTIC_FILTER_VERIFICATION_CODES,
   FILTER_VERIFICATION_SETTLED_MESSAGE,
+  SEARCH_FILTER_VERIFICATION_SETTLED_MESSAGE,
   buildFilterVerificationSettledError,
   elasticFilterVerificationLimit,
   elasticFilterVerificationSettlement,
@@ -48,8 +49,8 @@ test('filter verification limit: default 3, 2-20 accepted, everything else falls
   }
 });
 
-test('only the XHS time-filter verification code is governed', () => {
-  assert.deepEqual(Array.from(ELASTIC_FILTER_VERIFICATION_CODES), [TF]);
+test('time-window and generic filter verification share the bounded retry rule', () => {
+  assert.deepEqual(Array.from(ELASTIC_FILTER_VERIFICATION_CODES), [TF, 'SEARCH_FILTER_APPLICATION_FAILED']);
   assert.equal(filterVerificationErrorCode({code: 'xhs_search_time_filter_unverified'}), TF);
   assert.equal(filterVerificationErrorCode({}, {errorCode: TF}), TF);
   assert.equal(filterVerificationErrorCode({code: 'XHS_SEARCH_PAGE_TIMEOUT'}, {errorCode: TF}),
@@ -96,6 +97,23 @@ test('the settled error keeps the original fields, drops recovery and uses the e
     'the Admin keeps offering 重试失败关键词');
 });
 
+test('generic filter failures settle after three attempts with the original cause retained', async () => {
+  const code = 'SEARCH_FILTER_APPLICATION_FAILED';
+  assert.equal(elasticFilterVerificationSettlement({code, attempts: 2, agents: 2, agentAttemptLimit: 8}).settle, false);
+  const result = await settleElasticFilterVerification(fakeTx({attempts: 2, agents: 2, includes_reporter: false}), {
+    tenantId: 'tenant', itemId: 'item', status: 'retryable', elasticPool: true,
+    agentAttemptLimit: 8, attemptNumber: 3, reporterAgentId: AGENT_C,
+    error: {code, category: 'filter_verification', requiresManualAction: true,
+      message: '搜索筛选未完整生效：publishTime、contentType'},
+    env: {},
+  });
+  assert.equal(result.attempts, 3);
+  assert.equal(result.error.code, code);
+  assert.equal(result.error.message, SEARCH_FILTER_VERIFICATION_SETTLED_MESSAGE);
+  assert.equal(result.error.originalMessage, '搜索筛选未完整生效：publishTime、contentType');
+  assert.equal(result.error.automaticRetryStopped, true);
+});
+
 test('the retry window starts after the later manual base', () => {
   assert.equal(filterVerificationWindowBase({}), 0);
   assert.equal(filterVerificationWindowBase({manualRetryBaseAttemptCount: 4}), 4);
@@ -129,7 +147,7 @@ test('projection counts the reporting attempt exactly once, also for a repeated 
   assert.equal(settled.attempts, 3);
   assert.equal(settled.agents, 3);
   assert.equal(settled.error.automaticRetryStopReason, 'filter_verification_repeated');
-  assert.deepEqual(tx.calls[0].params.slice(2, 6), [0, AGENT_C, 3, [TF]]);
+  assert.deepEqual(tx.calls[0].params.slice(2, 6), [0, AGENT_C, 3, [TF, 'SEARCH_FILTER_APPLICATION_FAILED']]);
   assert.doesNotMatch(tx.calls[0].sql, /PREVIOUS_CAPTURE_STOP_UNCONFIRMED/u);
 
   // A, B, A: the reporter already failed once, it adds an attempt but no Agent.

@@ -2054,7 +2054,7 @@ test("verified sequential-patrol filters fail closed instead of falling through 
   assert.match(filterSource, /SEARCH_FILTER_APPLICATION_FAILED/u);
   assert.match(filterSource, /error\.fatal = true/u);
   assert.match(filterSource, /error\.stopBatch = true/u);
-  assert.match(filterSource, /error\.requiresManualAction = true/u);
+  assert.match(filterSource, /error\.requiresManualAction = false/u);
   assert.match(filterSource, /result\?\.complete !== true/u);
   assert.match(captureSyncSource, /verifyDefaults: requireVerifiedFilters/u);
   assert.match(contentSource, /verifyDefaults: request\?\.verifyDefaults === true/u);

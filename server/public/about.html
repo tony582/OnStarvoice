@@ -70,7 +70,15 @@
       <h2><span class="dot"></span>更新日志</h2>
       <div class="log">
         <div class="ver">
-          <h3>扩展 v0.4.28<span class="date">2026-10-16</span><span class="pill">最新</span></h3>
+          <h3>扩展 v0.4.29<span class="date">2026-10-17</span><span class="pill">最新</span></h3>
+          <ul>
+            <li><strong>抖音筛选识别更准确：</strong>按可见分组和选项确认筛选面板，避免把搜索页的 AI 回答误当成面板，导致发布时间或内容类型未设置。需更新 Extension。</li>
+            <li><strong>重复失败及时收尾：</strong>同一关键词连续出现同类筛选失败时，默认最多尝试 3 次；节点池更小时按池大小收尾，保留失败原因和已完成结果，不再持续换节点空转。筛选未确认时仍不采集。</li>
+            <li><strong>恢复状态更准确：</strong>技术性筛选失败不再误报账号验证，也不再另起一条恢复流程；真实登录、验证码和安全验证仍保留现场。已停止的任务不会自动重开，请在节点空闲且结果安全保存后升级。</li>
+          </ul>
+        </div>
+        <div class="ver">
+          <h3>扩展 v0.4.28<span class="date">2026-10-16</span></h3>
           <ul>
             <li><strong>侧栏更紧凑：</strong>新版正文调整为 13px、辅助信息 12px，收紧表单、按钮和选项间距，一屏可查看更多内容。</li>
             <li><strong>去掉最外层大框：</strong>配置、结果等主区域去掉最外层包围框；采集结果内部的关键词分组框、蓝色组标题和逐条内容保留，分组折叠及原有操作不变。</li>

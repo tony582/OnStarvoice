@@ -16286,7 +16286,9 @@ function createSearchFilterApplicationError(result = null) {
   error.category = 'filter_verification';
   error.fatal = true;
   error.stopBatch = true;
-  error.requiresManualAction = true;
+  // Stop this local capture, but let the server's bounded filter-retry policy
+  // decide the item outcome. A failed UI selector is not account safety evidence.
+  error.requiresManualAction = false;
   error.retryable = false;
   error.filterResult = result;
   return error;

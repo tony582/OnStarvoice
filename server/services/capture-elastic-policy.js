@@ -5,7 +5,7 @@
 //     offline, paused, always busy) would wait forever for its round to
 //     finish. Once the current handoff is older than elasticRoundRelaxAfterMs()
 //     the round exclusion shrinks to "the most recent attempt's Agent only".
-// F2: XHS_SEARCH_TIME_FILTER_UNVERIFIED repeating on several Agents for the
+// F2: filter-verification errors repeating on several Agents for the
 //     same keyword is a page/time-window property, not an Agent failure. Once
 //     it reached the limit inside the current retry window the item settles as
 //     failed instead of burning the whole 2 x pool search budget.
@@ -17,10 +17,13 @@ export const ELASTIC_ROUND_RELAX_DEFAULT_MINUTES = 10;
 export const ELASTIC_FILTER_VERIFICATION_DEFAULT_LIMIT = 3;
 export const ELASTIC_FILTER_VERIFICATION_CODES = Object.freeze(new Set([
   'XHS_SEARCH_TIME_FILTER_UNVERIFIED',
+  'SEARCH_FILTER_APPLICATION_FAILED',
 ]));
 export const FILTER_VERIFICATION_STOP_REASON = 'filter_verification_repeated';
 export const FILTER_VERIFICATION_SETTLED_MESSAGE =
   '多台节点都无法确认小红书时间筛选结果（可能该时段没有新内容或页面有变化），已停止自动重试；可稍后在批次里「重试失败关键词」';
+export const SEARCH_FILTER_VERIFICATION_SETTLED_MESSAGE =
+  '多台节点都无法确认搜索筛选已生效，已停止自动重试；修复筛选问题后可在批次里「重试失败关键词」';
 export const FILTER_VERIFICATION_SETTLED_EVENT = 'elastic_item_filter_verification_settled';
 // Keys a settlement adds to the item error; removed again when an operator
 // puts the item back into the elastic queue.
@@ -214,7 +217,9 @@ export function buildFilterVerificationSettledError(error = {}, {
   const {recovery: _recovery, ...errorWithoutRecovery} = safeJson(error);
   return {
     ...errorWithoutRecovery,
-    message: FILTER_VERIFICATION_SETTLED_MESSAGE,
+    message: filterVerificationErrorCode(error) === 'SEARCH_FILTER_APPLICATION_FAILED'
+      ? SEARCH_FILTER_VERIFICATION_SETTLED_MESSAGE
+      : FILTER_VERIFICATION_SETTLED_MESSAGE,
     originalMessage: String(safeJson(error).message || ''),
     automaticRetryStopped: true,
     automaticRetryStopReason: FILTER_VERIFICATION_STOP_REASON,
@@ -224,7 +229,10 @@ export function buildFilterVerificationSettledError(error = {}, {
   };
 }
 
-export function filterVerificationSettledEventMessage({keyword = '', attempts = 0, agents = 0} = {}) {
+export function filterVerificationSettledEventMessage({keyword = '', attempts = 0, agents = 0, code = ''} = {}) {
+  if (code === 'SEARCH_FILTER_APPLICATION_FAILED') {
+    return `关键词「${String(keyword || '').slice(0, 120)}」搜索筛选已失败 ${attempts} 次（${agents} 台节点），无法确认筛选生效，已停止自动重试`;
+  }
   return `关键词「${String(keyword || '').slice(0, 120)}」时间筛选已失败 ${attempts} 次（${agents} 台节点），无法确认小红书时间筛选，已停止自动重试`;
 }
 
@@ -361,7 +369,9 @@ export async function settleElasticFilterVerificationBatch(tx, {
     SET status = 'failed',
       metadata = item.metadata #- '{checkpoint,recovery}',
       error = (item.error - 'recovery') || jsonb_build_object(
-        'message', $6::text,
+        'message', CASE WHEN UPPER(COALESCE(NULLIF(item.error->>'code', ''),
+          item.metadata #>> '{checkpoint,errorCode}', '')) = 'SEARCH_FILTER_APPLICATION_FAILED'
+          THEN $8::text ELSE $6::text END,
         'originalMessage', COALESCE(item.error->>'message', ''),
         'automaticRetryStopped', true,
         'automaticRetryStopReason', $7::text,
@@ -389,6 +399,7 @@ export async function settleElasticFilterVerificationBatch(tx, {
     poolSize,
     FILTER_VERIFICATION_SETTLED_MESSAGE,
     FILTER_VERIFICATION_STOP_REASON,
+    SEARCH_FILTER_VERIFICATION_SETTLED_MESSAGE,
   ]);
   if (settled.length === 0) return [];
   await tx.execute(`

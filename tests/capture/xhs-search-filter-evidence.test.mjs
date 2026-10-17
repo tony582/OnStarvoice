@@ -251,6 +251,17 @@ test('XHS explicit time window fails closed for missing evidence or relay failur
   assert.equal(await failed(1, {publishTime: 'day'}, {platform: 'douyin'}), null);
 });
 
+test('Douyin incomplete verified filters stop capture without marking the account unsafe', async () => {
+  const run = filterRelay(async () => ({ok: true, data: {ok: true, data: {
+    complete: false, failedFields: ['publishTime', 'contentType'],
+  }}}));
+  await assert.rejects(run(1, {publishTime: 'day', contentType: 'image'}, {
+    platform: 'douyin', requireVerifiedFilters: true,
+  }), error => error.code === 'SEARCH_FILTER_APPLICATION_FAILED'
+    && error.fatal === true && error.stopBatch === true
+    && error.retryable === false && error.requiresManualAction === false);
+});
+
 test('XHS known platform safety evidence is never downgraded to a keyword filter failure', async () => {
   const securityError = createXhsSecurityBlockError({confirmed: true, reason: 'rate_limit', variant: 'cn_rate_limit_300013', language: 'zh-CN'});
   const run = filterRelay(async () => ({ok: true, data: {ok: false, error: securityError}}));

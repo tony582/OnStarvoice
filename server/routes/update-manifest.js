@@ -3,12 +3,24 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.28',
+  latestVersion: '0.4.29',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-10-16',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.28-20261016.zip',
+  releaseDate: '2026-10-17',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.29-20261017.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.29',
+      releaseDate: '2026-10-17',
+      releaseNotes: [{
+        tag: '修复',
+        notes: [
+          {title: '抖音搜索筛选识别更准确', desc: '筛选面板必须包含可见的筛选分组和选项，避免把搜索页的 AI 回答误当成面板，导致发布时间或内容类型没有设置。需更新 Extension。'},
+          {title: '重复筛选失败及时结束', desc: '同一关键词连续出现同类筛选失败时，默认最多尝试 3 次；节点池更小时按池大小收尾，保留失败原因和已完成结果，不再持续换节点空转。筛选未确认时仍不采集。'},
+          {title: '筛选故障不再误报账号验证', desc: '技术性筛选失败交由关键词重试流程处理，不再额外启动人工验证恢复；真实登录、验证码和安全验证仍保留现场。已停止的任务不会自动重开。请在节点空闲且结果安全保存后升级。'},
+        ],
+      }],
+    },
     {
       version: '0.4.28',
       releaseDate: '2026-10-16',
