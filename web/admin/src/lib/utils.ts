@@ -118,7 +118,7 @@ export const LABELS = {
     tenant_admin: '客户管理员', tenant_analyst: '分析员', tenant_viewer: '只读',
   } as Record<string, string>,
   platform: {
-    xiaohongshu: '小红书', douyin: '抖音', weibo: '微博',
+    xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号',
   } as Record<string, string>,
 } as const
 

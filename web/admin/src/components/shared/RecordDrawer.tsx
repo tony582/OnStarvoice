@@ -485,9 +485,10 @@ function RecordDrawerContent({
                   {r.blogger_profile_url && <><MetaDot /><a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-medium text-primary hover:underline"><User className="h-3.5 w-3.5" />主页</a></>}
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-x-3.5 gap-y-1 text-[12px] tabular-nums text-muted-foreground" aria-label="互动数据">
-                  <span title="点赞" className="inline-flex items-center gap-1"><Heart className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.likes)}</span>
+                  {/* 视频号的点赞列是 App 里的「喜欢」（大拇指），收藏列是「推荐」（心形）。 */}
+                  <span title={r.platform === 'wechat_channels' ? '喜欢' : '点赞'} className="inline-flex items-center gap-1"><Heart className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.likes)}</span>
                   <span title="评论" className="inline-flex items-center gap-1"><MessageCircle className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.comments_count)}</span>
-                  <span title="收藏" className="inline-flex items-center gap-1"><Star className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.collects)}</span>
+                  <span title={r.platform === 'wechat_channels' ? '推荐' : '收藏'} className="inline-flex items-center gap-1"><Star className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.collects)}</span>
                   <span title="转发" className="inline-flex items-center gap-1"><Share2 className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.shares)}</span>
                 </div>
               </div>

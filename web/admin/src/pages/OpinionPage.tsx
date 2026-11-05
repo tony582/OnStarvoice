@@ -23,6 +23,7 @@ const PLATFORM_OPTIONS = [
   { value: 'xiaohongshu', label: '小红书' },
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
+  { value: 'wechat_channels', label: '视频号' },
 ]
 const STATE_TONE: Record<string, string> = { pending: 'orange', doing: 'blue', done: 'positive', dismissed: 'muted' }
 const STATE_LABEL: Record<string, string> = { pending: '待处理', doing: '处理中', done: '已处理', dismissed: '已忽略' }

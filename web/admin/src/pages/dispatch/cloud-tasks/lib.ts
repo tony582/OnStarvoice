@@ -231,6 +231,7 @@ export const PLATFORM_LABELS: Record<string, string> = {
   xiaohongshu: '小红书',
   douyin: '抖音',
   weibo: '微博',
+  wechat_channels: '视频号',
   mixed: '小红书＋抖音',
   unknown: '未识别',
 }
@@ -810,6 +811,18 @@ export function taskErrorText(task: CloudTask) {
   return String(error.message || error.reason || error.code || '').trim()
 }
 
+// 手机节点能采的平台：抖音（搜索发现）和视频号（手机整帖采集，Runner 0.4.0 上报后才出现）。
+export function mobileAgentPlatforms(agent: CloudAgent) {
+  const supported = Array.isArray(agent.capabilities?.supportedPlatforms)
+    ? agent.capabilities.supportedPlatforms.map(value => String(value || '').trim()).filter(Boolean)
+    : ['douyin']
+  const allowed = Array.isArray(agent.allowed_platforms)
+    ? agent.allowed_platforms.map(value => String(value || '').trim()).filter(Boolean)
+    : []
+  return ['douyin', 'wechat_channels'].filter(platform =>
+    supported.includes(platform) && (allowed.length === 0 || allowed.includes(platform)))
+}
+
 export function agentCreatePlatforms(agent: CloudAgent) {
   // 云端 create 命令当前只在小红书、抖音执行链实现；微博仍可上报任务，
   // 但不能从管理端新建，避免设备收到无法执行的指令。
@@ -844,6 +857,11 @@ export function isMobileAgent(agent: { capabilities?: Record<string, unknown> | 
 // 离线与否仍由既有的 2 分钟心跳规则（agent.online）决定，调用方在离线时无需展示就绪文案。
 export function mobileReadinessLabel(agent: { capabilities?: Record<string, unknown> | null }) {
   const capabilities = agent.capabilities || {}
+  const ready = Array.isArray(capabilities.readyPlatforms) ? capabilities.readyPlatforms.map(String) : []
+  // Runner 0.4.0 上报本次可用的 App：同时能采视频号时写明平台。
+  if (capabilities.readyForSearch === true && ready.includes('wechat_channels')) {
+    return `可采 ${ready.map(platform => PLATFORM_LABELS[platform] || platform).join('、')}`
+  }
   if (capabilities.readyForSearch === true) return '可执行搜索'
   const reason = String(capabilities.deviceReason || '').trim()
   if (!reason) return '手机未就绪'
@@ -935,10 +953,10 @@ export function agentAssignmentBlockReason(agent: CloudAgent, mode: 'one_time' |
   if (agent.status === 'migrated') return 'Agent 已移出当前租户，不能接收新任务'
   if (agent.status === 'revoked') return 'Agent 已永久停用，不能接收新任务'
   if (agent.status !== 'active') return 'Agent 已暂停，不能接收新任务'
-  // 手机节点不看浏览器扩展的 remoteTaskCreate / remoteUnattendedPlanWrite；只要求手机搜索发现能力与抖音平台。
+  // 手机节点不看浏览器扩展的 remoteTaskCreate / remoteUnattendedPlanWrite；只要求手机搜索发现能力与抖音或视频号平台。
   if (isMobileAgent(agent)) {
     if (agent.capabilities?.mobileSearchDiscoveryV1 !== true) return '手机执行器版本过低，需升级后才能接收搜索发现'
-    if (!agentCreatePlatforms(agent).includes('douyin')) return '手机节点未开通抖音平台'
+    if (!agentCreatePlatforms(agent).includes('douyin') && !mobileAgentPlatforms(agent).includes('wechat_channels')) return '手机节点未开通抖音或视频号平台'
     return ''
   }
   if (agent.capabilities?.remoteTaskCreate !== true) return '客户端扩展版本过低，需升级后才能远程接单'

@@ -50,6 +50,7 @@ const PLATFORM_OPTIONS = [
   { value: 'xiaohongshu', label: '小红书' },
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
+  { value: 'wechat_channels', label: '视频号' },
 ]
 
 const VALID_TABLES: TableKey[] = ['single_notes', 'keyword_notes', 'blogger_profiles', 'blogger_notes', 'comment_leads', 'monitor_content']

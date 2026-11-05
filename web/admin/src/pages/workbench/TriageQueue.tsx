@@ -113,6 +113,7 @@ const PLATFORM_OPTIONS = [
   { value: 'xiaohongshu', label: '小红书' },
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
+  { value: 'wechat_channels', label: '视频号' },
   { value: 'unknown', label: '未知平台' },
 ]
 const SENTIMENT_OPTIONS = [['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const

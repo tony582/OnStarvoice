@@ -23,6 +23,7 @@ const PLATFORM_OPTIONS = [
   { value: 'xiaohongshu', label: '小红书' },
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
+  { value: 'wechat_channels', label: '视频号' },
 ]
 
 function interaction(row: any) {

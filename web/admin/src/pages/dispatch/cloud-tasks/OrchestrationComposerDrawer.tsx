@@ -81,7 +81,10 @@ type EditableAssignment = {
 const PLATFORM_OPTIONS: Array<{ value: OrchestrationPlatform; label: string }> = [
   { value: 'xiaohongshu', label: '小红书' },
   { value: 'douyin', label: '抖音' },
+  { value: 'wechat_channels', label: '视频号' },
 ]
+// 视频号只有手机节点能采（App 里只有不限／最新／最热三种排序，没有发布时间筛选：设了时间范围时手机按「最新」排序、读卡片时间截止）。
+const WECHAT_SORT_LABELS: Record<string, string> = { comprehensive: '不限', latest: '最新', likes: '最热' }
 
 const SORT_OPTIONS = [
   { value: 'comprehensive', label: '综合排序' },
@@ -234,15 +237,18 @@ function agentBlockReason(
   negativePatrolEnabled = false,
 ) {
   if (agent.status !== 'active') return agent.status === 'paused' ? '节点已暂停接单' : '节点已撤销'
-  // 手机节点只做抖音关键词搜索发现：小红书、多段搜索、负面巡查一律不可选并说明原因。
+  // 手机节点做抖音搜索发现和视频号整帖采集：小红书、多段搜索一律不可选；负面巡查只在视频号上由手机执行。
   if (isMobileAgent(agent)) {
     if (agent.capabilities?.mobileSearchDiscoveryV1 !== true) return '手机执行器版本过低，需升级后才能接收搜索发现'
-    if (platform !== 'douyin') return '手机节点仅支持抖音搜索发现'
-    if (!agentPlatforms(agent).includes('douyin')) return '手机节点未开通抖音平台'
+    if (platform === 'xiaohongshu') return '手机节点仅支持抖音和视频号'
+    if (!agentPlatforms(agent).includes(platform)) {
+      return platform === 'wechat_channels' ? '这台手机还没有启用视频号（需手机采集器 0.4.0）' : '手机节点未开通抖音平台'
+    }
     if (sequentialSearchEnabled) return '手机节点不支持多段搜索巡检'
-    if (negativePatrolEnabled) return '手机节点不支持负面巡查'
+    if (negativePatrolEnabled && platform !== 'wechat_channels') return '抖音手机节点不支持负面巡查'
     return ''
   }
+  if (platform === 'wechat_channels') return '视频号只能由手机节点采集'
   if (agent.capabilities?.remoteTaskCreate !== true) return 'Extension 版本不支持云端任务'
   if (!agentPlatforms(agent).includes(platform)) {
     return `该节点不支持${PLATFORM_OPTIONS.find(option => option.value === platform)?.label || platform}`
@@ -522,8 +528,9 @@ export function OrchestrationComposerDrawer({
     }
     const searchFilters = safeRecord(planSnapshot.searchFilters)
     const enhancementSettings = safeRecord(planSnapshot.captureSettings)
-    const editingPlatform = sourcePlan?.orchestration.platform === 'douyin'
-      ? 'douyin'
+    const sourcePlatform = sourcePlan?.orchestration.platform
+    const editingPlatform: OrchestrationPlatform = sourcePlatform === 'douyin' || sourcePlatform === 'wechat_channels'
+      ? sourcePlatform
       : 'xiaohongshu'
     const editingEnhancementEnabled = enhancementSettings.autoDetailCaptureAfterListCapture === true
     const targetNegativePatrol = sourcePlan ? hasUnattendedNegativePatrol(planSnapshot) : initialNegativePatrolEnabled
@@ -769,6 +776,13 @@ export function OrchestrationComposerDrawer({
       setVideoDuration('all')
     } else {
       setDistance('all')
+    }
+    if (value === 'wechat_channels') {
+      // 手机逐条打开视频号作品：详情总是要采，内容只有视频，没有搜索范围和位置筛选。
+      setDistance('all')
+      setContentType('all')
+      setSearchScope('all')
+      setEnhancementEnabled(true)
     }
     if (!SORT_OPTIONS.some(option => option.value === sort && (!option.platform || option.platform === value))) {
       setSort('comprehensive')
@@ -1520,7 +1534,7 @@ export function OrchestrationComposerDrawer({
                       <label className="block text-xs font-medium text-muted-foreground">
                         排序方式
                         <select value={sort} onChange={event => { markDefinitionChanged(); setSort(event.target.value) }} disabled={busy} className={inputClassName}>
-                          {platformSortOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                          {platformSortOptions.map(option => <option key={option.value} value={option.value}>{platform === 'wechat_channels' ? WECHAT_SORT_LABELS[option.value] || option.label : option.label}</option>)}
                         </select>
                       </label>
                       <label className="block text-xs font-medium text-muted-foreground">
@@ -1528,8 +1542,11 @@ export function OrchestrationComposerDrawer({
                         <select value={publishTime} onChange={event => { markDefinitionChanged(); setPublishTime(event.target.value) }} disabled={busy} className={inputClassName}>
                           {PUBLISH_TIME_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </select>
+                        {platform === 'wechat_channels' && publishTime !== 'all' && (
+                          <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">视频号没有发布时间筛选：手机按「最新」排序，读搜索结果卡片右下角的时间，超出范围就结束该词。</span>
+                        )}
                       </label>
-                      {patrolTypeMultiSelectEnabled ? (
+                      {platform === 'wechat_channels' ? null : patrolTypeMultiSelectEnabled ? (
                         <fieldset className="rounded-xl border border-border/70 bg-card px-3 py-2.5 sm:col-span-2">
                           <legend className="px-1 text-xs font-medium text-muted-foreground">巡检类型（受限组合）</legend>
                           <div className="mt-1 flex flex-wrap gap-2">
@@ -1570,12 +1587,14 @@ export function OrchestrationComposerDrawer({
                           </select>
                         </label>
                       )}
+                      {platform !== 'wechat_channels' && (
                       <label className="block text-xs font-medium text-muted-foreground">
                         搜索范围
                         <select value={searchScope} onChange={event => { markDefinitionChanged(); setSearchScope(event.target.value) }} disabled={busy} className={inputClassName}>
                           {SEARCH_SCOPE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </select>
                       </label>
+                      )}
                       {platform === 'xiaohongshu' && (
                         <label className="block text-xs font-medium text-muted-foreground">
                           位置距离
@@ -1600,24 +1619,26 @@ export function OrchestrationComposerDrawer({
                   <label className="flex cursor-pointer items-start gap-3">
                     <input
                       type="checkbox"
-                      checked={enhancementEnabled}
+                      checked={enhancementEnabled || platform === 'wechat_channels'}
                       onChange={event => changeEnhancementEnabled(event.target.checked)}
-                      disabled={busy}
+                      disabled={busy || platform === 'wechat_channels'}
                       className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
                     />
                     <span>
                       <span className="block text-sm font-bold text-foreground">采集增强</span>
-                      <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">逐条打开详情页补充内容；只有支持远程增强参数的 Agent 可接单。</span>
+                      <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">{platform === 'wechat_channels'
+                        ? '视频号由手机逐条打开作品、复制链接读取详情，按需读取评论后直接入库。'
+                        : '逐条打开详情页补充内容；只有支持远程增强参数的 Agent 可接单。'}</span>
                     </span>
                   </label>
                   {enhancementEnabled && (
                     <div className="mt-3 grid gap-2 border-l-2 border-primary/15 pl-3 sm:grid-cols-2">
                       {[
-                        { label: '增强后自动同步后台', checked: autoSync, setter: setAutoSync },
-                        { label: 'AI 精准筛选', checked: aiPrefilter, setter: setAiPrefilter },
-                        { label: '附加博主粉丝与赞藏数', checked: bloggerMetrics, setter: setBloggerMetrics },
-                        { label: '跳过已增强内容', checked: skipCaptured, setter: setSkipCaptured },
-                      ].map(option => (
+                        { label: '增强后自动同步后台', checked: autoSync, setter: setAutoSync, browserOnly: true },
+                        { label: 'AI 精准筛选', checked: aiPrefilter, setter: setAiPrefilter, browserOnly: false },
+                        { label: '附加博主粉丝与赞藏数', checked: bloggerMetrics, setter: setBloggerMetrics, browserOnly: true },
+                        { label: '跳过已增强内容', checked: skipCaptured, setter: setSkipCaptured, browserOnly: true },
+                      ].filter(option => !(platform === 'wechat_channels' && option.browserOnly)).map(option => (
                         <label key={option.label} className="flex min-h-9 cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 text-xs text-foreground hover:bg-muted/60">
                           <input type="checkbox" checked={option.checked} onChange={event => { markDefinitionChanged(); option.setter(event.target.checked) }} disabled={busy} className="mt-0.5 h-4 w-4 accent-primary" />
                           <span>{option.label}</span>
