@@ -55,7 +55,7 @@ export function normalizePostEvent(input, principal) {
       coverUrl: str(preview.coverUrl, 2000), isImage: preview.isImage === true, exportId: str(preview.exportId, 200),
       likeCountFmt: count(preview.likeCountFmt), favCountFmt: count(preview.favCountFmt),
       forwardCountFmt: count(preview.forwardCountFmt), commentCountFmt: count(preview.commentCountFmt)},
-    comments: {status: ['captured', 'partial', 'disabled', 'empty'].includes(input.comments?.status) ? input.comments.status : 'disabled',
+    comments: {status: ['captured', 'partial', 'disabled', 'empty', 'not_relocated'].includes(input.comments?.status) ? input.comments.status : 'disabled',
       headerCount: Number.isSafeInteger(input.comments?.headerCount) ? input.comments.headerCount : null,
       items: items.filter(item => item && typeof item === 'object' && str(item.content, 2000).trim() && str(item.author, 120).trim())
         .map(item => ({author: str(item.author, 120).trim(), location: str(item.location, 20), timeLabel: str(item.timeLabel, 40),

@@ -6,6 +6,7 @@ import {recordDiagnostic} from './diagnostics.mjs';
 import {faultDetails} from './discovery-runner.mjs';
 import {wechatPostEvent, wechatWorkKey} from './wechat-evidence.mjs';
 import {sameCard} from '../device/wechat-ocr-parse.mjs';
+import {runWechatPatrol} from './wechat-patrol.mjs';
 
 const DEFAULT_CLOCK = {wallNow: () => Date.now(), monotonicNow: () => performance.now()};
 const METHODS = ['inspect', 'search', 'readCards', 'openCard', 'copyLink', 'readComments', 'returnToResults', 'recoverResults', 'scroll'];
@@ -80,73 +81,81 @@ export async function runWechatTask({task, store, device, permit, preview, clock
     const state = await call('inspect');
     requireEvidence(state?.deviceId === task.deviceId, 'device_identity_mismatch');
     if (state.readyForSearch === false) throw new RunnerFault(state.reason ?? 'device_not_ready');
-    const sort = windowHours !== null ? 'latest' : (task.filters.sort ?? 'all');
-    const searched = await call('search', {keyword: task.keyword, sort});
-    requireEvidence(searched?.verified === true, 'search_context_unverified');
     const commentLimit = task.comments?.enabled === true ? Math.max(0, Math.min(500, task.comments.limit ?? 50)) : 0;
-    const seen = [];
-    let cards = searched.cards, emptyPages = 0, older = 0, skips = 0, rank = 0;
-    const decide = cardPrefilter(prefilter, task, permit, clock, ledger);
-    while (!result) {
-      const fresh = cards.filter(card => !seen.some(other => sameCard(other, card)));
-      if (!fresh.length) {
-        emptyPages++;
-        if (emptyPages >= 2) { result = {status: 'completed', reason: 'results_end'}; break; }
-        ledger.beforeSwipe();
-        await call('scroll');
-        cards = await call('readCards');
-        continue;
-      }
-      emptyPages = 0;
-      const skip = await decide(fresh);
-      const card = fresh[0];
-      seen.push(card);
-      rank++;
-      if (windowHours !== null && card.age && card.age.minHours > windowHours) {
-        older++;
-        if (older >= 2) { result = {status: 'completed', reason: 'publish_window_end'}; break; }
-        continue;
-      }
-      if (card.age) older = 0;
-      if (skip.has(card.cardKey)) continue;
-      ledger.beforeCard();
-      let shareUrl;
-      try {
-        await call('openCard', {card});
-        ({shareUrl} = await call('copyLink'));
-      } catch (error) {
-        if (!RECOVERABLE.has(error.code) || error.deviceSettled !== true || skips >= MAX_CONSECUTIVE_SKIPS) throw error;
-        note('wechat_card_skipped', error);
-        skips++;
-        try { cards = await call('recoverResults'); }
-        catch (recovery) {
-          if (['user_stop', 'remote_stop', 'lease_expired', 'aborted'].includes(recovery.code)) throw recovery;
-          throw new RunnerFault(error.code, `${error.message}; safe return failed (${recovery.code})`, {...faultDetails(error), recovery: recovery.code});
+    if (task.mode === 'patrol') {
+      const record = event => {
+        if (!store.getEvent(event.eventId)) { store.recordEvent(event); stats.posts++; stats.comments += event.comments.items.length; }
+        lastEventId = event.eventId;
+      };
+      result = await runWechatPatrol({task, call, resolve: resolvePreview, commentLimit, clock, record, note});
+    } else {
+      const sort = windowHours !== null ? 'latest' : (task.filters.sort ?? 'all');
+      const searched = await call('search', {keyword: task.keyword, sort});
+      requireEvidence(searched?.verified === true, 'search_context_unverified');
+      const seen = [];
+      let cards = searched.cards, emptyPages = 0, older = 0, skips = 0, rank = 0;
+      const decide = cardPrefilter(prefilter, task, permit, clock, ledger);
+      while (!result) {
+        const fresh = cards.filter(card => !seen.some(other => sameCard(other, card)));
+        if (!fresh.length) {
+          emptyPages++;
+          if (emptyPages >= 2) { result = {status: 'completed', reason: 'results_end'}; break; }
+          ledger.beforeSwipe();
+          await call('scroll');
+          cards = await call('readCards');
+          continue;
         }
-        continue;
-      }
-      const capturedAt = clock.wallNow();
-      const info = resolvePreview(shareUrl);
-      info.catch(() => {});
-      // A post found outside the window by its exact time is not read further; its comments are skipped.
-      const early = await Promise.race([info.then(value => value, () => null), sleep(EARLY_PREVIEW_WAIT_MS, permit.signal).then(() => null)]);
-      const outside = early && !early.unavailable && windowHours !== null && (capturedAt / 1000 - early.createtime) / 3600 > windowHours;
-      let comments = Promise.resolve({status: 'disabled', items: []});
-      if (commentLimit > 0 && !outside && !early?.unavailable) {
-        try { comments = Promise.resolve(await call('readComments', {limit: commentLimit})); }
-        catch (error) {
-          if (!RECOVERABLE.has(error.code) || error.deviceSettled !== true) throw error;
-          note('wechat_comments_unread', error);
+        emptyPages = 0;
+        const skip = await decide(fresh);
+        const card = fresh[0];
+        seen.push(card);
+        rank++;
+        if (windowHours !== null && card.age && card.age.minHours > windowHours) {
+          older++;
+          if (older >= 2) { result = {status: 'completed', reason: 'publish_window_end'}; break; }
+          continue;
         }
+        if (card.age) older = 0;
+        if (skip.has(card.cardKey)) continue;
+        ledger.beforeCard();
+        let shareUrl;
+        try {
+          await call('openCard', {card});
+          ({shareUrl} = await call('copyLink'));
+        } catch (error) {
+          if (!RECOVERABLE.has(error.code) || error.deviceSettled !== true || skips >= MAX_CONSECUTIVE_SKIPS) throw error;
+          note('wechat_card_skipped', error);
+          skips++;
+          try { cards = await call('recoverResults'); }
+          catch (recovery) {
+            if (['user_stop', 'remote_stop', 'lease_expired', 'aborted'].includes(recovery.code)) throw recovery;
+            throw new RunnerFault(error.code, `${error.message}; safe return failed (${recovery.code})`, {...faultDetails(error), recovery: recovery.code});
+          }
+          continue;
+        }
+        const capturedAt = clock.wallNow();
+        const info = resolvePreview(shareUrl);
+        info.catch(() => {});
+        // A post found outside the window by its exact time is not read further; its comments are skipped.
+        const early = await Promise.race([info.then(value => value, () => null), sleep(EARLY_PREVIEW_WAIT_MS, permit.signal).then(() => null)]);
+        const outside = early && !early.unavailable && windowHours !== null && (capturedAt / 1000 - early.createtime) / 3600 > windowHours;
+        let comments = Promise.resolve({status: 'disabled', items: []});
+        if (commentLimit > 0 && !outside && !early?.unavailable) {
+          try { comments = Promise.resolve(await call('readComments', {limit: commentLimit})); }
+          catch (error) {
+            if (!RECOVERABLE.has(error.code) || error.deviceSettled !== true) throw error;
+            note('wechat_comments_unread', error);
+          }
+        }
+        pending.push(assemble({card, rank, shareUrl, info, comments, capturedAt}));
+        ledger.noteLink(early ? wechatWorkKey(early) : `card:${card.cardKey}`);
+        skips = 0;
+        cards = await call('returnToResults');
+        if (outside && sort === 'latest') { older++; if (older >= 2) { result = {status: 'completed', reason: 'publish_window_end'}; break; } }
+        const [low, high] = postPauseMs;
+        await sleep(low + Math.round(random() * (high - low)), permit.signal);
+        permit.assertAllowed();
       }
-      pending.push(assemble({card, rank, shareUrl, info, comments, capturedAt}));
-      ledger.noteLink(early ? wechatWorkKey(early) : `card:${card.cardKey}`);
-      skips = 0;
-      cards = await call('returnToResults');
-      if (outside && sort === 'latest') { older++; if (older >= 2) { result = {status: 'completed', reason: 'publish_window_end'}; break; } }
-      const [low, high] = postPauseMs;
-      await sleep(low + Math.round(random() * (high - low)), permit.signal);
-      permit.assertAllowed();
     }
   } catch (error) {
     failure = error;

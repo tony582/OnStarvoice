@@ -139,3 +139,55 @@ test('the outbox batches one kind of event at a time', () => {
   assert.deepEqual(store.nextBatch().events.map(event => event.eventId), ['e2', 'e4']);
   store.close();
 });
+
+test('patrol: the stored link refreshes counts; with comments the post is looked up and must match its publish second', async () => {
+  const createtime = 1793671301;
+  const info = (overrides = {}) => ({unavailable: false, description: '承诺更新不履约', createtime, nickname: '上海交通广播', avatarUrl: '',
+    likeCountFmt: '1', favCountFmt: '2', forwardCountFmt: '3', commentCountFmt: '4', coverUrl: '', isImage: false, exportId: '', ...overrides});
+  const patrolTask = comments => task({mode: 'patrol', keyword: '承诺更新不履约', filters: {sort: 'all', publishWindowHours: null},
+    comments, patrolTarget: {recordId: 'r1', url: 'https://weixin.qq.com/sph/Stored1', title: '差评', content: '承诺更新不履约 #别克',
+      author: '上海交通广播', createtime}});
+  // 1. Comments off: one preview of the stored link, no phone search.
+  {
+    const store = new RunnerStore(':memory:');
+    const clock = fixtureClock();
+    const t = patrolTask({enabled: false, limit: 0});
+    const calls = [];
+    const result = await runWechatTask({task: t, store, device: device({pages: [[]], calls}), permit: fixturePermit(t, clock), clock,
+      postPauseMs: [0, 0], preview: {resolve: async () => info()}});
+    assert.equal(result.reason, 'patrol_preview');
+    assert.equal(calls.includes('search'), false);
+    const event = store.getEvent(result.lastEventId).payload;
+    assert.equal(event.mode, 'patrol');
+    assert.equal(event.link.shareUrl, 'https://weixin.qq.com/sph/Stored1');
+    store.close();
+  }
+  // 2. Comments on: a look-alike card from another day is rejected, the real one is read.
+  {
+    const store = new RunnerStore(':memory:');
+    const clock = fixtureClock();
+    const t = patrolTask({enabled: true, limit: 10});
+    const calls = [];
+    const pages = [[card('承诺更新不履约', '上海交通广播', 50), card('承诺更新不履约！#上汽通用', '上海交通广播', 48)]];
+    const result = await runWechatTask({task: t, store, device: device({pages, calls}), permit: fixturePermit(t, clock), clock,
+      postPauseMs: [0, 0], preview: {resolve: async link => link.endsWith('Stored1') ? info() : link.includes('Abc1') ? info({createtime: createtime - 86_400}) : info()}});
+    assert.equal(result.reason, 'patrol_relocated');
+    assert.equal(calls.filter(name => name === 'openCard').length, 2);
+    const event = store.getEvent(result.lastEventId).payload;
+    assert.equal(event.link.shareUrl, 'https://weixin.qq.com/sph/Abc2xyz');
+    assert.equal(event.comments.items.length, 1);
+    store.close();
+  }
+  // 3. Nothing works: no event, a warning ending that only cools the post down on the server.
+  {
+    const store = new RunnerStore(':memory:');
+    const clock = fixtureClock();
+    const t = patrolTask({enabled: true, limit: 10});
+    const result = await runWechatTask({task: t, store, device: device({pages: [[card('别的帖子', '别人', 2)]]}), permit: fixturePermit(t, clock),
+      clock, postPauseMs: [0, 0], preview: {resolve: async () => ({unavailable: true, reason: '内容已删除'})}});
+    assert.equal(result.status, 'completed_with_warnings');
+    assert.equal(result.reason, 'patrol_not_relocated');
+    assert.equal(store.pendingCount(), 0);
+    store.close();
+  }
+});

@@ -1,7 +1,9 @@
 import {truncateWellFormed} from '../utils/well-formed-text.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const PLATFORMS = new Set(['xiaohongshu', 'douyin']);
+// wechat_channels: patrolled by the phone that captured it (docs/hotfix/20261105-wechat-channels-mobile.md).
+const PLATFORMS = new Set(['xiaohongshu', 'douyin', 'wechat_channels']);
+const WECHAT_SHARE_LINK = /^https:\/\/weixin\.qq\.com\/sph\/[A-Za-z0-9_-]{4,40}$/u;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UNAVAILABLE = new Set(['deleted', 'page_unavailable', 'unavailable', 'not_found']);
 export const NEGATIVE_PATROL_TRIAGE_STATUSES = Object.freeze([
@@ -101,6 +103,8 @@ export function unattendedNegativePatrolTargetUrl(record = {}) {
   const platform = lower(record.platform);
   const externalId = text(record.external_id || record.externalId);
   if (!PLATFORMS.has(platform) || !/^[a-z0-9_-]{5,200}$/i.test(externalId)) return '';
+  // A Channels post has no page of its own: its copied share link is the target (the phone may refresh it).
+  if (platform === 'wechat_channels') return WECHAT_SHARE_LINK.test(text(record.url)) ? text(record.url) : '';
   for (const raw of [record.url, record.canonical_url, record.canonicalUrl]) {
     try {
       const url = new URL(raw);

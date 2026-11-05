@@ -1,4 +1,5 @@
 import {batchReceipts, postBatchInput, postLineage, receiptView, saveReceipt, wechatSyncBody} from './posts.js';
+import {bindPatrolResult} from './patrol.js';
 
 /**
  * Upload of phone-captured Channels posts. Ownership and receipts use short transactions of their own; the
@@ -37,7 +38,14 @@ export async function ingestPosts({transaction, persist}, principal, body) {
     const outcome = result.action === 'skipped'
       ? {status: 'rejected', reason: result.reason || 'skipped', externalId}
       : {status: 'accepted', externalId, recordId: result.id || null, observationId: result.observationId || null};
-    receipts.push(receiptView(await transaction(tx => saveReceipt(tx, principal, uploadBatchId, event, outcome))));
+    receipts.push(receiptView(await transaction(async tx => {
+      // A patrol post written within the current attempt is that patrol item's result.
+      if (event.mode === 'patrol' && lineage.current && outcome.observationId) {
+        await bindPatrolResult(tx, {tenantId: principal.tenantId, itemId: event.itemId, executionTaskId: event.taskId,
+          assignmentRevision: event.assignmentRevision, observationId: outcome.observationId});
+      }
+      return saveReceipt(tx, principal, uploadBatchId, event, outcome);
+    })));
   }
   return {uploadBatchId, receipts};
 }

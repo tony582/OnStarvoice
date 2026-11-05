@@ -2,6 +2,7 @@ import {digest,fail,id,json,mobileReasonRequiresManualAction,text} from './valid
 import {currentAttempt,MOBILE_ELASTIC_ATTEMPT_LIMIT} from './leases.js';
 import {refreshOrchestrationParent} from './parent-refresh.js';
 import {parentStopRequested,rollup,saveItemMetadata} from './repository.js';
+import {settlePhonePatrol} from './patrol.js';
 async function parentMetadataFor(tx,principal,task) {
   if (!task.metadata?.orchestrationChild || !task.parent_task_id) return null;
   const row=await tx.queryOne('SELECT metadata FROM capture_tasks WHERE id=$1 AND tenant_id=$2',[task.parent_task_id,principal.tenantId]);
@@ -47,12 +48,18 @@ export async function complete(tx,principal,body) {
   else if (orchestrationChild && item.attempt_count < MOBILE_ELASTIC_ATTEMPT_LIMIT && !stopFlagged) itemStatus='retryable';
   else if (orchestrationChild && !stopFlagged && !mobileReasonRequiresManualAction(payload.reason)) itemStatus='failed';
   else itemStatus='needs_action';
+  // A Channels patrol attempt that ended with the device idle settles the shared rotation state: a bound result
+  // is a formal success, anything else cools the post down (and stops it after three misses). No retry here.
+  let patrolOutcome=null;
+  if (item.item_type==='negative_post' && task.metadata?.mode==='patrol' && body.deviceIdle && status!=='canceled') {
+    ({itemStatus,patrolOutcome}=await settlePhonePatrol(tx,{tenantId:principal.tenantId,item,task,status,reason:payload.reason}));
+  }
   const receipt={accepted:true,deviceHeld:!body.deviceIdle};
   const completion={requestId,hash,receipt};
   await tx.execute(`UPDATE capture_task_item_attempts SET status=$2,checkpoint=checkpoint||$3::jsonb,
     result=result||$4::jsonb,finished_at=now(),updated_at=now() WHERE id=$1`,
   [attempt.id,status,{runner:payload.checkpoint},{completion,reason:payload.reason}]);
-  await saveItemMetadata(tx,item,{...item.metadata,deviceHeld:!body.deviceIdle,completion,
+  await saveItemMetadata(tx,item,{...item.metadata,deviceHeld:!body.deviceIdle,completion,...(patrolOutcome ? {patrolOutcome} : {}),
     reason:payload.reason,deviceClosedAt:body.deviceIdle?new Date().toISOString():null,
     resumeAuthorized:itemStatus==='retryable'?false:item.metadata.resumeAuthorized===true},itemStatus);
   if (itemStatus==='failed') await tx.execute(`UPDATE capture_task_items SET finished_at=COALESCE(finished_at,now()),

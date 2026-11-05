@@ -1,6 +1,7 @@
 import {randomUUID} from 'node:crypto';
 import {digest,fail,id,identity,LEASE_MS,text} from './validation.js';
 import {refreshOrchestrationParent} from './parent-refresh.js';
+import {claimPhonePatrolItem} from './patrol.js';
 import {heldItem,lockAgent,parentStopRequested,rollup,saveItemMetadata,taskRow} from './repository.js';
 import {MOBILE_PLATFORMS,mobileCommentPlan,mobilePlanBlockReason,mobilePlatformForWorkflow,mobileRelevancePrefilterEnabled,
   mobileTaskBudgets,mobileTaskFilters,mobileWorkflowFor,trimMobilePlanSnapshot} from './mobile-tasks.js';
@@ -27,13 +28,16 @@ export function taskIdentity(item,attemptId=item.metadata.attemptId) {
 // plan's capture switches, so a held re-poll reports the same flag as the claim.
 export function taskPayload(item,metadata) {
   const platform=mobilePlatformForWorkflow(metadata.workflow);
-  return {identity:taskIdentity(item),deviceId:metadata.deviceId,keyword:item.keyword,
+  // A Channels patrol searches the start of the post's caption; its item itself has no keyword.
+  return {identity:taskIdentity(item),deviceId:metadata.deviceId,keyword:metadata.mode==='patrol' ? metadata.searchQuery : item.keyword,
     filters:metadata.filters,budgets:metadata.budgets,deadlineAt:metadata.deadlineAt,
     resumeAuthorized:item.metadata.resumeAuthorized===true,
     relevancePrefilter:{enabled:mobileRelevancePrefilterEnabled(metadata.planSnapshot)},
     // 0.4.0: the platform tells the Runner which app runs the task; WeChat Channels carries its comment plan.
     platform,
-    ...(platform==='wechat_channels' ? {mode:'keyword',comments:metadata.comments || mobileCommentPlan(metadata.planSnapshot)} : {})};
+    ...(platform==='wechat_channels' ? {mode:metadata.mode==='patrol' ? 'patrol' : 'keyword',
+      comments:metadata.comments || mobileCommentPlan(metadata.planSnapshot),
+      ...(metadata.mode==='patrol' ? {patrolTarget:metadata.patrolTarget} : {})} : {})};
 }
 function permit(item,metadata,now) {
   return {...taskIdentity(item),leaseId:item.metadata.leaseId,serverTime:new Date(now).toISOString(),
@@ -105,7 +109,8 @@ async function claimElasticItem(tx,principal,agent,now,platforms) {
       AND parent.metadata->>'stopPending' IS DISTINCT FROM 'true'
       AND COALESCE(parent.metadata->>'stopCommandId','')=''
       AND COALESCE(parent.metadata->>'orchestrationTemplate','false') <> 'true'
-      AND item.item_type='keyword' AND item.platform=parent.platform
+      AND (item.item_type='keyword' OR (parent.platform='wechat_channels' AND item.item_type='negative_post'))
+      AND item.platform=parent.platform
       AND item.status IN ('pending','retryable')
       AND item.attempt_count < $3
       AND (item.metadata->>'pinnedAgentId'=$2::text
@@ -130,12 +135,18 @@ async function claimElasticItem(tx,principal,agent,now,platforms) {
   const parent=await tx.queryOne('SELECT * FROM capture_tasks WHERE id=$1 AND tenant_id=$2 FOR UPDATE',[item.task_id,principal.tenantId]);
   const planSnapshot=parent.metadata?.planSnapshot || {};
   if (mobilePlanBlockReason(planSnapshot,parent.platform)) return null;
-  const keywords=[item.keyword];
   const childId=randomUUID(), revision=item.assignment_revision+1;
+  // A Channels negative post: lease it in the shared rotation state first (same rules as browser patrol).
+  const patrol=item.item_type==='negative_post'
+    ? await claimPhonePatrolItem(tx,{tenantId:principal.tenantId,parent,item,childId,revision}) : null;
+  if (item.item_type==='negative_post' && !patrol) return null;
+  const keywords=patrol ? [patrol.searchQuery] : [item.keyword];
   const workflow=mobileWorkflowFor(parent.platform);
   const childMetadata={workflow,agentKind:'android_mobile',deviceId:agent.capabilities.deviceId,
-    filters:mobileTaskFilters(planSnapshot.searchFilters,parent.platform),budgets:mobileTaskBudgets(planSnapshot,1),
+    filters:patrol ? {sort:'all',publishWindowHours:null} : mobileTaskFilters(planSnapshot.searchFilters,parent.platform),
+    budgets:mobileTaskBudgets(planSnapshot,1),
     ...(parent.platform==='wechat_channels' ? {comments:mobileCommentPlan(planSnapshot)} : {}),
+    ...(patrol || {}),
     keywords,deadlineAt:null,planSnapshot:trimMobilePlanSnapshot(planSnapshot,keywords),
     orchestrationChild:true,parentTaskId:parent.id,orchestrationRevision:revision,
     distributionMode:'elastic_pool',claimUnit:'keyword',
@@ -143,10 +154,12 @@ async function claimElasticItem(tx,principal,agent,now,platforms) {
   await tx.execute(`INSERT INTO capture_tasks(id,tenant_id,parent_task_id,origin_agent_id,assigned_agent_id,
     client_task_id,task_type,feature_key,title,platform,source,trigger_type,status,metadata,
     orchestration_revision,orchestration_schedule_id,scheduled_for,schedule_revision,source_updated_at)
-    VALUES($1::uuid,$2,$3,$4,$4,$1::uuid::text,'capture',$5,$6,$12,'android_runner','cloud','pending',$7,
+    VALUES($1::uuid,$2,$3,$4,$4,$1::uuid::text,$13,$5,$6,$12,'android_runner','cloud','pending',$7,
     $8,$9,$10,$11,now())`,
-  [childId,principal.tenantId,parent.id,agent.id,workflow,`${parent.title} · ${String(item.keyword).slice(0,80)}`,childMetadata,
-    revision,parent.orchestration_schedule_id||null,parent.scheduled_for||null,parent.schedule_revision||null,parent.platform]);
+  // A patrol child is a negative_post_patrol task, as the formal patrol success rules expect.
+  [childId,principal.tenantId,parent.id,agent.id,workflow,`${parent.title} · ${String(patrol ? `巡查 ${patrol.searchQuery}` : item.keyword).slice(0,80)}`,childMetadata,
+    revision,parent.orchestration_schedule_id||null,parent.scheduled_for||null,parent.schedule_revision||null,parent.platform,
+    patrol ? 'negative_post_patrol' : 'capture']);
   if (item.execution_task_id && item.execution_task_id!==childId) {
     await tx.execute(`UPDATE capture_tasks SET status='superseded',metadata=metadata||jsonb_build_object(
       'handoffSuccessorTaskId',$1::uuid::text,'handoffReason','android_elastic_claimed','handoffAt',now()::text,

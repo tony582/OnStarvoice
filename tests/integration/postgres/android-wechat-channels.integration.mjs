@@ -153,6 +153,88 @@ test('WeChat Channels on a shared phone: claim by platform, post upload, receipt
     await f.complete(second.task);
   });
 
+  // A negative Channels post from an earlier run, the plan's negative_post item and its rotation scope.
+  async function patrolFixture(f, {url = 'https://weixin.qq.com/sph/ARLmfj5VbT'} = {}) {
+    const {normalizeUnattendedNegativePatrolScope, loadUnattendedNegativePatrolCandidates} =
+      await import('../../../server/services/unattended-negative-patrol.js');
+    const {wechatExternalId} = await import('../../../server/services/android-control/posts.js');
+    const [record] = await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,content,author_name,url,
+        keyword,sentiment,business_visibility,publish_time,created_at)
+      VALUES($1,$2,'wechat_channels','keyword_notes','差评','承诺更新不履约 #别克','上海交通广播',$3,'别克车机升级','negative','eligible',
+        '2026-11-03 10:01:41',now()-interval '1 day') RETURNING *`, [f.tenantId, wechatExternalId(1793671301, '上海交通广播'), url]);
+    const scope = normalizeUnattendedNegativePatrolScope({tenantId: f.tenantId, platforms: ['wechat_channels'],
+      keywords: ['别克车机升级'], runStartedAt: new Date().toISOString()});
+    const candidates = await withTransaction(tx => loadUnattendedNegativePatrolCandidates(tx, {...scope, persistCandidates: true}));
+    assert.equal(candidates.candidates.length, 1, JSON.stringify(candidates.summary));
+    const parentId = await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: [],
+      planSnapshot: {negativePatrol: {enabled: true, lookbackDays: 7}}});
+    await query(`UPDATE capture_tasks SET metadata = metadata || jsonb_build_object('negativePatrolRun', $2::jsonb) WHERE id=$1`,
+      [parentId, JSON.stringify(scope)]);
+    const candidate = candidates.candidates[0];
+    await query(`INSERT INTO capture_task_items(id,tenant_id,task_id,item_key,ordinal,keyword,platform,item_type,record_id,external_id,
+        url_snapshot,status,metadata,assignment_revision)
+      VALUES($1,$2,$3,$4,0,'','wechat_channels','negative_post',$5,$6,$7,'pending',$8::jsonb,0)`,
+    [randomUUID(), f.tenantId, parentId, `negative:wechat_channels:${candidate.externalId}`, candidate.recordId, candidate.externalId,
+      candidate.url, JSON.stringify({unattendedNegativePatrol: true, sourceRecord: candidate.sourceRecord, baseline: candidate.baseline})]);
+    return {record, parentId};
+  }
+
+  await t.test('a Channels negative post is patrolled by the phone; a bound result is a formal patrol success', async st => {
+    const f = await fixture(st);
+    const {record} = await patrolFixture(f);
+    const claim = await f.poll({platforms: ['wechat_channels']});
+    assert.equal(claim.task.mode, 'patrol');
+    assert.equal(claim.task.keyword, '承诺更新不履约');
+    assert.equal(claim.task.patrolTarget.url, 'https://weixin.qq.com/sph/ARLmfj5VbT');
+    assert.equal(claim.task.patrolTarget.createtime, 1793671301);
+    const [child] = await query('SELECT task_type FROM capture_tasks WHERE id=$1', [claim.task.identity.taskId]);
+    assert.equal(child.task_type, 'negative_post_patrol');
+    const event = postEvent(claim.task, {mode: 'patrol', rank: null,
+      preview: {...postEvent(claim.task).preview, createtime: 1793671301, nickname: '上海交通广播', favCountFmt: '600'},
+      comments: {status: 'disabled', headerCount: null, items: []}});
+    const uploaded = await f.service.posts(f.principal, {uploadBatchId: randomUUID(), events: [event]}, persist);
+    assert.equal(uploaded.receipts[0].status, 'accepted');
+    assert.equal(uploaded.receipts[0].recordId, record.id, 'the patrol result updates the original record');
+    await f.complete(claim.task, {reason: 'patrol_preview'});
+    const [item] = await query(`SELECT status, result_observation_id FROM capture_task_items WHERE item_type='negative_post' AND tenant_id=$1`, [f.tenantId]);
+    assert.equal(item.status, 'completed');
+    assert.ok(item.result_observation_id);
+    const [state] = await query('SELECT last_success_at, failure_count, needs_action FROM unattended_negative_patrol_state WHERE tenant_id=$1', [f.tenantId]);
+    assert.ok(state.last_success_at);
+    assert.equal(state.needs_action, false);
+    const [updated] = await query('SELECT likes FROM records WHERE id=$1', [record.id]);
+    assert.equal(Number(updated.likes), 600);
+  });
+
+  await t.test('a patrol that finds nothing only cools the post down; it never marks it deleted', async st => {
+    const f = await fixture(st);
+    const {record, parentId} = await patrolFixture(f);
+    const claim = await f.poll({platforms: ['wechat_channels']});
+    await f.complete(claim.task, {reason: 'patrol_not_relocated'});
+    const [item] = await query(`SELECT status, metadata FROM capture_task_items WHERE item_type='negative_post' AND tenant_id=$1`, [f.tenantId]);
+    assert.equal(item.status, 'completed_with_warnings');
+    assert.equal(item.metadata.patrolOutcome, 'patrol_not_relocated');
+    const [state] = await query('SELECT failure_count, cooldown_until, needs_action, last_success_at FROM unattended_negative_patrol_state WHERE tenant_id=$1', [f.tenantId]);
+    assert.equal(state.failure_count, 1);
+    assert.ok(state.cooldown_until);
+    assert.equal(state.needs_action, false);
+    assert.equal(state.last_success_at, null);
+    const [unchanged] = await query('SELECT content_availability_status FROM records WHERE id=$1', [record.id]);
+    assert.notEqual(unchanged.content_availability_status, 'deleted');
+    await query(`UPDATE unattended_negative_patrol_state SET failure_count=2, cooldown_until=NULL WHERE tenant_id=$1`, [f.tenantId]);
+    // The next run of the plan: the same post is due again after its cooldown (the test reopens the run).
+    await query(`UPDATE capture_task_items SET status='pending' WHERE item_type='negative_post' AND tenant_id=$1`, [f.tenantId]);
+    await query(`UPDATE capture_tasks SET status='running' WHERE id=$1`, [parentId]);
+    const again = await f.poll({platforms: ['wechat_channels']});
+    assert.ok(again.task, JSON.stringify({again, items: await query(`SELECT status, attempt_count, assignment_revision, metadata->>'skipReason' AS skip,
+      execution_task_id FROM capture_task_items WHERE tenant_id=$1`, [f.tenantId]),
+    state: await query('SELECT * FROM unattended_negative_patrol_state WHERE tenant_id=$1', [f.tenantId])}));
+    await f.complete(again.task, {reason: 'patrol_not_relocated'});
+    const [stopped] = await query('SELECT failure_count, needs_action FROM unattended_negative_patrol_state WHERE tenant_id=$1', [f.tenantId]);
+    assert.equal(stopped.failure_count, 3);
+    assert.equal(stopped.needs_action, true, 'the third miss in a row stops the patrol of this post');
+  });
+
   await t.test('a browser never claims Channels work', async st => {
     const f = await fixture(st);
     const code = randomUUID();
