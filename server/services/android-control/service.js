@@ -7,6 +7,7 @@ import {listNodes,listRuns,runView} from './views.js';
 import {id} from './validation.js';
 import {prefilterCards} from './prefilter.js';
 import {prefilterRelevanceBatch} from '../relevance-prefilter.js';
+import {ingestPosts,postReceipts} from './post-ingest.js';
 export function configuredAndroidTenants() {
   return new Set(String(process.env.ANDROID_DISCOVERY_INGEST_TENANTS || '').split(',').map(t=>t.trim()).filter(Boolean));
 }
@@ -26,5 +27,8 @@ export function createAndroidControlService({repository=createAndroidControlRepo
     complete:(principal,body)=>tx(db=>complete(db,principal,body)),
     close:(principal,body)=>tx(db=>closeDevice(db,principal,body)),
     prefilter:(principal,body)=>prefilterCards({transaction:tx,prefilter},principal,body),
+    // WeChat Channels posts (0.4.0); `persist` is the sync path the route layer hands in.
+    posts:(principal,body,persist)=>ingestPosts({transaction:tx,persist},principal,body),
+    postReceipts:(principal,batchId)=>postReceipts({transaction:tx},principal,batchId),
   };
 }

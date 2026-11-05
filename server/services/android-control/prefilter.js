@@ -1,8 +1,8 @@
 import {PREFILTER_PROMPT_VERSION} from '../relevance-prefilter.js';
 import {truncateWellFormed} from '../../utils/well-formed-text.js';
-import {fail,id,identity,WORKFLOW} from './validation.js';
+import {fail,id,identity,MOBILE_RUN_WORKFLOWS} from './validation.js';
 import {currentAttempt} from './leases.js';
-import {mobileRelevancePrefilterEnabled} from './mobile-tasks.js';
+import {mobilePlatformForWorkflow,mobileRelevancePrefilterEnabled} from './mobile-tasks.js';
 
 // Result-card screening for the phone (README.md, "Card prefilter"). The phone
 // sends the new cards of one results page; the server asks the same relevance
@@ -38,9 +38,10 @@ export function prefilterInput(body) {
 async function verifyAttempt(transaction, principal, body) {
   return transaction(async tx => {
     const {ident, task, item, current} = await currentAttempt(tx, principal, body.identity);
-    if (!current || item.metadata?.deviceHeld !== true || task.metadata?.workflow !== WORKFLOW) fail('STALE_ATTEMPT');
+    if (!current || item.metadata?.deviceHeld !== true || !MOBILE_RUN_WORKFLOWS.includes(task.metadata?.workflow)) fail('STALE_ATTEMPT');
     // The keyword is the item's, never the phone's: it scopes the judgement.
-    return {ident, keyword: item.keyword, enabled: mobileRelevancePrefilterEnabled(task.metadata?.planSnapshot)};
+    return {ident, keyword: item.keyword, platform: mobilePlatformForWorkflow(task.metadata.workflow),
+      enabled: mobileRelevancePrefilterEnabled(task.metadata?.planSnapshot)};
   });
 }
 
@@ -68,13 +69,13 @@ export function mapPrefilterItems(cards, items) {
 
 export async function prefilterCards({transaction, prefilter}, principal, body) {
   const {requestId, cards} = prefilterInput(body);
-  const {ident, keyword, enabled} = await verifyAttempt(transaction, principal, body);
+  const {ident, keyword, platform, enabled} = await verifyAttempt(transaction, principal, body);
   if (!enabled) return {enabled: false, degraded: false, items: []};
   // externalId stays '' so the service never touches records.business_visibility:
   // a card is not a record yet. The card id is content-derived, so the service
   // cache still recognises the same card in a later run.
   const result = await prefilter({tenantId: principal.tenantId, body: {
-    requestId, idempotencyKey: `android:${ident.attemptId}:${requestId}`, platform: 'douyin', stage: 'list', keyword,
+    requestId, idempotencyKey: `android:${ident.attemptId}:${requestId}`, platform, stage: 'list', keyword,
     promptVersion: PREFILTER_PROMPT_VERSION, mode: 'conservative', skipThreshold: 0.97,
     taskId: ident.taskId, runId: ident.discoveryRunId, keywordRunId: ident.itemId,
     items: cards.map(c => ({itemId: c.cardId, externalId: '', title: c.title, author: c.author, noteType: '', publishTime: ''})),

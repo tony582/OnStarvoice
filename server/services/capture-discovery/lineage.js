@@ -13,7 +13,8 @@ export async function authorizePrincipal(tx, principal) {
   `, [principal.agentId, principal.tenantId, principal.authCodeId, principal.authBindingId]);
   if (!agent || agent.capabilities?.agentKind !== 'android_mobile'
       || agent.capabilities?.mobileSearchDiscoveryV1 !== true
-      || !agent.allowed_platforms?.includes('douyin')) {
+      // A phone may run Douyin, WeChat Channels or both (0.4.0); it needs at least one of them.
+      || !['douyin', 'wechat_channels'].some(platform => agent.allowed_platforms?.includes(platform))) {
     throw new DiscoveryError('MOBILE_AGENT_NOT_AUTHORIZED', 403);
   }
 }

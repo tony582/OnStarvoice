@@ -5,9 +5,9 @@ import { createAdbClient, validateSerial } from './adb.mjs';
 /** This adapter bridges the runner to the calibrated-profile boundary.
  * No selector guesses or device actions are shipped before real-device acceptance.
  */
-export function createAndroidDeviceAdapter({ serial, adb = createAdbClient(), profileId, appiumUrl, client, onState } = {}) {
+export function createAndroidDeviceAdapter({ serial, adb = createAdbClient(), profileId, appiumUrl, client, onState, sharedWithWechat = false } = {}) {
   validateSerial(serial);
-  if (profileId) return createProfileAdapter({serial,adb,profileId,appiumUrl,client,onState});
+  if (profileId) return createProfileAdapter({serial,adb,profileId,appiumUrl,client,onState,sharedWithWechat});
   const unavailable = async ({ signal } = {}) => {
     throwIfAborted(signal);
     throw new DeviceError('profile_required', 'Automatic Douyin actions require a validated real-device UI profile');

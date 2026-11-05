@@ -26,6 +26,7 @@ const CATEGORY_LABEL = {
 const PLATFORM_LABEL = {
   xiaohongshu: '小红书',
   weibo: '微博',
+  wechat_channels: '视频号',
   douyin: '抖音',
   unknown: '未知平台',
 };

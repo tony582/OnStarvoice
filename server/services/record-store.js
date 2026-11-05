@@ -1185,7 +1185,7 @@ export async function upsertCapturedRecord(record, context) {
     // Only the saved task can supply the search window. Never infer it from a
     // current schedule (which may have changed) or trust an upload's window.
     const captureTask = record.record_type === 'keyword_notes'
-      && ['xiaohongshu', 'douyin'].includes(record.platform)
+      && ['xiaohongshu', 'douyin', 'wechat_channels'].includes(record.platform)
       && UUID_PATTERN.test(String(captureTaskId || ''))
       ? await tx.queryOne(`
           SELECT task.id, task.tenant_id, task.task_type, task.feature_key,

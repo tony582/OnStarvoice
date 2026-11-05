@@ -12,5 +12,8 @@ export function createCloudClient(options = {}) {
   return Object.freeze({
     ingest: (batch, opts) => checked('/agent/discoveries', {...opts, body: batch}),
     getReceipts: (id, opts) => checked(`/agent/discovery-receipts?batchId=${encodeURIComponent(id)}`, opts),
+    // WeChat Channels posts captured on the phone (0.4.0), same batch/receipt contract on their own endpoints.
+    ingestPosts: (batch, opts) => checked('/android/agent/posts', {...opts, body: batch}),
+    getPostReceipts: (id, opts) => checked(`/android/agent/post-receipts?batchId=${encodeURIComponent(id)}`, opts),
   });
 }

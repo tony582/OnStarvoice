@@ -28,7 +28,11 @@ export function nextBatch(db, { limit = 5 } = {}) {
   return transaction(db, () => {
     const previous = db.prepare("SELECT id FROM batches WHERE state = 'open' ORDER BY rowid LIMIT 1").get();
     if (previous) return readBatch(db, previous.id);
-    const rows = db.prepare("SELECT event_id FROM events WHERE state = 'pending' ORDER BY rowid LIMIT ?").all(limit);
+    // One batch carries one kind of event: discoveries and WeChat posts go to different endpoints (0.4.0).
+    const oldest = db.prepare("SELECT json_extract(payload, '$.eventKind') AS kind FROM events WHERE state = 'pending' ORDER BY rowid LIMIT 1").get();
+    if (!oldest) return null;
+    const rows = db.prepare(`SELECT event_id FROM events WHERE state = 'pending'
+      AND COALESCE(json_extract(payload, '$.eventKind'), '') = ? ORDER BY rowid LIMIT ?`).all(oldest.kind ?? '', limit);
     if (!rows.length) return null;
     const id = randomUUID();
     db.prepare('INSERT INTO batches (id, state) VALUES (?, ?)').run(id, 'open');

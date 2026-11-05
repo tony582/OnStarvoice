@@ -2,7 +2,9 @@ const DAY_MS = 86400000;
 const SHANGHAI_OFFSET_MS = 8 * 3600000;
 const WINDOW_DAYS = {day: 1, week: 7, month: 30};
 const WINDOWS = new Set([...Object.keys(WINDOW_DAYS), 'halfyear']);
-const KEYWORD_TASKS = new Set(['unattended_keyword_capture', 'keyword_capture', 'search_capture', 'keyword_orchestration', 'capture.search', 'keyword']);
+// wechat_channels_mobile_capture: a phone keyword run that uploads whole Channels posts (0.4.0).
+const KEYWORD_TASKS = new Set(['unattended_keyword_capture', 'keyword_capture', 'search_capture', 'keyword_orchestration', 'capture.search', 'keyword',
+  'wechat_channels_mobile_capture']);
 const DATE_FIELDS = ['publishDateRaw', 'publishTime', 'publishDate'];
 const REGION_SUFFIX = /\s+(?:北京|天津|上海|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆|香港|澳门)$/u;
 
@@ -169,7 +171,7 @@ export function evaluateCapturePublishWindow({record = {}, task = null, now = nu
     upperBoundTimestamp: null, upperBoundBasis: null, upperBoundExclusive: null};
   const answer = (status, reason, extra = {}) => ({...result, status, reason, ...extra});
   if (record?.record_type !== 'keyword_notes') return answer('not_applicable', 'record_type_not_keyword_notes');
-  if (!['xiaohongshu', 'douyin'].includes(record.platform)) return answer('not_applicable', 'platform_not_supported');
+  if (!['xiaohongshu', 'douyin', 'wechat_channels'].includes(record.platform)) return answer('not_applicable', 'platform_not_supported');
   if (!task || typeof task !== 'object') return answer('not_applicable', 'task_missing');
   const metadata = object(task.metadata);
   if (!isKeywordTask(task, metadata)) return answer('not_applicable', 'task_not_keyword_capture');

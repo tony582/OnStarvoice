@@ -63,9 +63,12 @@ export async function deliverPendingBatch({store, client, retryState = {},
   const accepted = () => ({failures: 0, nextAttemptAt: 0, ...kept, ...oneSingleDone});
   const batch = store.nextBatch({limit: singles > 0 ? 1 : 5});
   if (!batch) return {status: 'idle', retryState: rested()};
+  const posts = batch.events[0]?.eventKind === 'wechat_post';
+  const ingest = (body, options) => posts ? client.ingestPosts(body, options) : client.ingest(body, options);
+  const receiptsOf = (id, options) => posts ? client.getPostReceipts(id, options) : client.getReceipts(id, options);
   const stopped = error => signal?.aborted || error.code === 'cloud_aborted';
   const takeReceipts = async () => {
-    const known = checkedReceipts(await client.getReceipts(batch.uploadBatchId, {signal}), batch);
+    const known = checkedReceipts(await receiptsOf(batch.uploadBatchId, {signal}), batch);
     if (known.length) store.ackBatch(batch.uploadBatchId, known);
     return known;
   };
@@ -79,7 +82,7 @@ export async function deliverPendingBatch({store, client, retryState = {},
         uploadBatchId: batch.uploadBatchId, retryState: accepted()};
     }
     uploading = true;
-    const receipts = checkedReceipts(await client.ingest(batch, {signal}), batch);
+    const receipts = checkedReceipts(await ingest(batch, {signal}), batch);
     if (receipts.length !== batch.events.length) throw new CloudRequestError('incomplete_cloud_receipt');
     store.ackBatch(batch.uploadBatchId, receipts);
     return {status: receipts.some(r => r.status === 'rejected') ? 'needs_action' : 'delivered',

@@ -5,6 +5,7 @@ import {runDoctor} from '../device/index.mjs';
 import {runLocalDemo} from './demo.mjs';
 import {daemonCommand, runControlPlaneDemo} from './daemon-commands.mjs';
 import {runUp} from './up-command.mjs';
+import {enableWechat} from './wechat-command.mjs';
 import {RunnerStore} from '../storage/runner-store.mjs';
 import {createCloudClient} from '../cloud/client.mjs';
 import {deliverPendingBatch} from '../cloud/delivery.mjs';
@@ -34,6 +35,10 @@ export async function runCli(args, {stdout = console.log, stderr = console.error
       return report.readyForP0 ? 0 : 2;
     }
     if (command === 'up') { await runUp(values, {env, stdout}); return 0; }
+    if (command === 'enable-wechat') {
+      stdout(JSON.stringify(await enableWechat({stateDir: values['state-dir'], ...(values.chrome ? {chromePath: values.chrome} : {})}), null, 2));
+      return 0;
+    }
     if (['setup', 'start', 'stop', 'close', 'status', 'diagnose'].includes(command)) {
       const report = await daemonCommand(command, values, {env, stdout});
       stdout(JSON.stringify(report, null, 2));

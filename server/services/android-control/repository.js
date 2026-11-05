@@ -1,6 +1,6 @@
 import {authorizePrincipal} from '../capture-discovery/lineage.js';
 import {lockCaptureAgentExecutionSlot} from '../capture-cloud.js';
-import {fail, WORKFLOW} from './validation.js';
+import {fail, MOBILE_RUN_WORKFLOWS} from './validation.js';
 export function createAndroidControlRepository({database} = {}) {
   return {async transaction(callback) {
     const db = database || await import('../../db/query.js');
@@ -19,7 +19,7 @@ export async function taskRow(tx, tenantId, taskId) {
   // execution_task_id = task_id, orchestration children carry the mobile
   // workflow on the child while the item lives on the orchestration parent.
   const task = await tx.queryOne(`SELECT * FROM capture_tasks WHERE tenant_id=$1 AND id=$2
-    AND metadata->>'workflow'=$3 FOR UPDATE`,[tenantId,taskId,WORKFLOW]);
+    AND metadata->>'workflow'=ANY($3::text[]) FOR UPDATE`,[tenantId,taskId,MOBILE_RUN_WORKFLOWS]);
   if (!task) fail('MOBILE_RUN_NOT_FOUND',404);
   return task;
 }
@@ -39,11 +39,11 @@ export async function heldItem(tx, tenantId, agentId) {
       parent.metadata AS parent_metadata, parent.task_type AS parent_task_type
     FROM capture_task_items item
     JOIN capture_tasks child ON child.id=item.execution_task_id AND child.tenant_id=item.tenant_id
-      AND child.metadata->>'workflow'=$3
+      AND child.metadata->>'workflow'=ANY($3::text[])
     LEFT JOIN capture_tasks parent ON parent.id=item.task_id AND parent.tenant_id=item.tenant_id
       AND parent.id<>item.execution_task_id
     WHERE item.tenant_id=$1 AND item.assigned_agent_id=$2
-      AND item.metadata->>'deviceHeld'='true' ORDER BY item.created_at LIMIT 1 FOR UPDATE OF item`,[tenantId,agentId,WORKFLOW]);
+      AND item.metadata->>'deviceHeld'='true' ORDER BY item.created_at LIMIT 1 FOR UPDATE OF item`,[tenantId,agentId,MOBILE_RUN_WORKFLOWS]);
 }
 export async function saveItemMetadata(tx, item, metadata, status = item.status) {
   await tx.execute(`UPDATE capture_task_items SET metadata=$2,status=$3,updated_at=now() WHERE id=$1`,[item.id,metadata,status]);

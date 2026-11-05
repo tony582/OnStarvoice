@@ -12,7 +12,7 @@ import { getBrandContext, callLLMWithPrompt } from './ai-labeler.js';
 import { getCommentRiskAttentionPolicy } from './comment-risk-attention.js';
 
 const RISK_LEVELS = ['critical', 'warning', 'attention', 'watch']; // 越靠前越严重
-const PLATFORM_TEXT = { xiaohongshu: '小红书', weibo: '微博', douyin: '抖音', unknown: '未知平台' };
+const PLATFORM_TEXT = { xiaohongshu: '小红书', weibo: '微博', douyin: '抖音', wechat_channels: '视频号', unknown: '未知平台' };
 const TOPIC_PROMPT_VERSION = 'topic-v1';
 export const RECORD_ANALYSIS_PROMPT_VERSION = 'record-v1';
 const RECORD_RISK_BY_ALERT_LEVEL = { critical: 'critical', warning: 'warning', info: 'attention' };

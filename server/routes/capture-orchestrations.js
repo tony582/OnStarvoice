@@ -49,10 +49,13 @@ import {
   normalizeUnattendedNegativePatrolScope,
 } from '../services/unattended-negative-patrol.js';
 import {
-  MOBILE_WORKFLOW,
+  MOBILE_PLATFORMS,
+  MOBILE_WORKFLOWS,
+  mobileCommentPlan,
   mobilePlanBlockReason,
   mobileTaskBudgets,
   mobileTaskFilters,
+  mobileWorkflowFor,
   trimMobilePlanSnapshot,
 } from '../services/android-control/mobile-tasks.js';
 import {STOP_FENCE_OPERATOR_RELEASED_REASON} from '../services/capture-stop-fence.js';
@@ -64,7 +67,8 @@ import {
 const router = Router();
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
+// wechat_channels (视频号) is phone-only: agentCompatibilityFailure refuses browser nodes for it.
+const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin', 'wechat_channels']);
 const HANDOFF_SOURCE_FINAL_STATUSES = new Set([
   'completed',
   'completed_with_warnings',
@@ -304,7 +308,7 @@ function normalizeCreateRequest(body) {
     if (!SUPPORTED_PLATFORMS.has(remoteTaskInput.planSnapshot.platform)) {
       return {failure: requestError(
         'unsupported_platform',
-        '编排任务当前只支持小红书和抖音',
+        '编排任务当前只支持小红书、抖音和视频号',
       )};
     }
     if (remoteTaskInput.planSnapshot.keywords.length === 0) {
@@ -513,26 +517,35 @@ function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
   }
   const capabilities = safeJson(agent.capabilities);
   if (capabilities.agentKind === 'android_mobile') {
-    // A phone is a normal douyin keyword-search node: it needs only the mobile
-    // search capability, the douyin platform, and a plain single-pass plan.
+    // A phone is a normal keyword-search node for Douyin and, with Runner 0.4.0
+    // and WeChat set up, for WeChat Channels: it needs the mobile search
+    // capability, one of those platforms, and a plan the phone can run.
     if (capabilities.mobileSearchDiscoveryV1 !== true) {
       return {code: 'agent_mobile_capability_missing', message: '手机节点版本尚不支持关键词搜索发现，请更新手机采集器'};
     }
-    if (platform !== 'douyin') {
-      return {code: 'agent_mobile_platform_mismatch', message: '手机节点仅支持抖音关键词搜索发现'};
+    if (!MOBILE_PLATFORMS.includes(platform)) {
+      return {code: 'agent_mobile_platform_mismatch', message: '手机节点仅支持抖音和视频号关键词搜索'};
     }
     if (mobilePlanBlockReason(planSnapshot, platform)) {
-      return {code: 'agent_mobile_plan_unsupported', message: '手机节点仅支持单段抖音关键词搜索，不支持串行补充、负面巡查或近一月'};
+      return {code: 'agent_mobile_plan_unsupported', message: platform === 'wechat_channels'
+        ? '视频号手机采集不支持串行补充'
+        : '手机节点仅支持单段抖音关键词搜索，不支持串行补充、负面巡查或近一月'};
     }
     const mobileAllowed = Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [];
-    if (mobileAllowed.length > 0 && !mobileAllowed.includes('douyin')) {
+    if (mobileAllowed.length > 0 && !mobileAllowed.includes(platform)) {
       return {code: 'agent_platform_mismatch', message: '目标节点未配置负责该任务平台'};
     }
     const mobileSupported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
-    if (mobileSupported.length > 0 && !mobileSupported.includes('douyin')) {
-      return {code: 'agent_platform_unsupported', message: '目标节点当前版本不支持该任务平台'};
+    if (platform === 'wechat_channels' ? !mobileSupported.includes(platform)
+      : mobileSupported.length > 0 && !mobileSupported.includes(platform)) {
+      return {code: 'agent_platform_unsupported', message: platform === 'wechat_channels'
+        ? '这台手机还没有启用视频号（需手机采集器 0.4.0 并执行 enable-wechat）'
+        : '目标节点当前版本不支持该任务平台'};
     }
     return null;
+  }
+  if (platform === 'wechat_channels') {
+    return {code: 'agent_platform_unsupported', message: '视频号只能由手机节点采集'};
   }
   if (safeJson(planSnapshot.negativePatrol).enabled === true &&
       !(capabilities.remoteTargetedPostCaptureV1 === true &&
@@ -3391,10 +3404,11 @@ router.post(
             const mobileChildTaskId = crypto.randomUUID();
             const mobileKeywords = groupItems.map(item => item.keyword);
             const mobileChildMetadata = {
-              workflow: MOBILE_WORKFLOW,
+              workflow: mobileWorkflowFor(parent.platform),
               agentKind: 'android_mobile',
               deviceId: safeJson(agent.capabilities).deviceId,
-              filters: mobileTaskFilters(planSnapshot.searchFilters),
+              filters: mobileTaskFilters(planSnapshot.searchFilters, parent.platform),
+              ...(parent.platform === 'wechat_channels' ? {comments: mobileCommentPlan(planSnapshot)} : {}),
               budgets: mobileTaskBudgets(planSnapshot, mobileKeywords.length),
               keywords: mobileKeywords,
               deadlineAt: null,
@@ -3415,18 +3429,18 @@ router.post(
                 metadata, message, source_updated_at
               ) VALUES (
                 $1::uuid, $2, $3, $4, $4,
-                $1::uuid::text, 'capture', $5, $6, 'douyin',
+                $1::uuid::text, 'capture', $5, $6, $10,
                 'android_runner', 'orchestration_dispatch', 'pending',
                 $7::jsonb, '{}'::jsonb, $8::jsonb,
                 $9::jsonb, '手机搜索发现子任务已创建，等待手机领取', now()
               )
               RETURNING id, parent_task_id, assigned_agent_id, status
             `, [
-              mobileChildTaskId, req.tenantId, parent.id, agentId, MOBILE_WORKFLOW,
+              mobileChildTaskId, req.tenantId, parent.id, agentId, mobileWorkflowFor(parent.platform),
               sortedAgentIds.length === 1 ? parent.title : `${parent.title} · ${groupIndex + 1}/${sortedAgentIds.length}`,
               JSON.stringify({current: 0, total: mobileKeywords.length, phase: 'queued'}),
               JSON.stringify({total: mobileKeywords.length, processed: 0, success: 0, failed: 0, skipped: 0}),
-              JSON.stringify(mobileChildMetadata),
+              JSON.stringify(mobileChildMetadata), parent.platform === 'wechat_channels' ? 'wechat_channels' : 'douyin',
             ]);
             for (const item of groupItems) {
               const updatedItem = await tx.queryOne(`
@@ -3930,7 +3944,7 @@ router.post(
           const metadata = safeJson(child.metadata);
           const agentId = text(child.assigned_agent_id, 100);
           if (safeJson(child.agent_capabilities).agentKind === 'android_mobile'
-            || metadata.workflow === MOBILE_WORKFLOW) {
+            || MOBILE_WORKFLOWS.includes(metadata.workflow)) {
             // Phones have no command channel and the browser terminal-notice
             // acknowledgement protocol does not apply. Set the android stop flag
             // on the child so poll/renew control() fences it; cancel it now if it
@@ -5858,7 +5872,7 @@ router.post(
         // retry would be accepted and then wait forever. Only reachable once
         // 「结束并移到历史」 settled the phone child; a new phone batch re-captures.
         const mobileSourceTaskIds = new Set(sourceTasks
-          .filter(task => safeJson(task.metadata).workflow === MOBILE_WORKFLOW)
+          .filter(task => MOBILE_WORKFLOWS.includes(safeJson(task.metadata).workflow))
           .map(task => String(task.id)));
         if (mobileSourceTaskIds.size > 0) {
           return {failure: requestError(

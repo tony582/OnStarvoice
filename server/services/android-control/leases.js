@@ -1,8 +1,9 @@
 import {randomUUID} from 'node:crypto';
-import {digest,fail,id,identity,LEASE_MS,text,WORKFLOW} from './validation.js';
+import {digest,fail,id,identity,LEASE_MS,text} from './validation.js';
 import {refreshOrchestrationParent} from './parent-refresh.js';
 import {heldItem,lockAgent,parentStopRequested,rollup,saveItemMetadata,taskRow} from './repository.js';
-import {mobilePlanBlockReason,mobileRelevancePrefilterEnabled,mobileTaskBudgets,mobileTaskFilters,trimMobilePlanSnapshot} from './mobile-tasks.js';
+import {MOBILE_PLATFORMS,mobileCommentPlan,mobilePlanBlockReason,mobilePlatformForWorkflow,mobileRelevancePrefilterEnabled,
+  mobileTaskBudgets,mobileTaskFilters,mobileWorkflowFor,trimMobilePlanSnapshot} from './mobile-tasks.js';
 
 // A phone attempt budget per work item (mirrors the browser elastic pool's
 // bounded attempts). Manual-action safety endings fence the item for this phone.
@@ -25,10 +26,14 @@ export function taskIdentity(item,attemptId=item.metadata.attemptId) {
 // metadata is the child (execution) task's; its trimmed plan snapshot carries the
 // plan's capture switches, so a held re-poll reports the same flag as the claim.
 export function taskPayload(item,metadata) {
+  const platform=mobilePlatformForWorkflow(metadata.workflow);
   return {identity:taskIdentity(item),deviceId:metadata.deviceId,keyword:item.keyword,
     filters:metadata.filters,budgets:metadata.budgets,deadlineAt:metadata.deadlineAt,
     resumeAuthorized:item.metadata.resumeAuthorized===true,
-    relevancePrefilter:{enabled:mobileRelevancePrefilterEnabled(metadata.planSnapshot)}};
+    relevancePrefilter:{enabled:mobileRelevancePrefilterEnabled(metadata.planSnapshot)},
+    // 0.4.0: the platform tells the Runner which app runs the task; WeChat Channels carries its comment plan.
+    platform,
+    ...(platform==='wechat_channels' ? {mode:'keyword',comments:metadata.comments || mobileCommentPlan(metadata.planSnapshot)} : {})};
 }
 function permit(item,metadata,now) {
   return {...taskIdentity(item),leaseId:item.metadata.leaseId,serverTime:new Date(now).toISOString(),
@@ -50,20 +55,26 @@ function boundProbe(probe) {
 function text2(value,max) {
   return typeof value==='string' ? value.slice(0,max) : '';
 }
-async function persistHeartbeat(tx,agent,ready,reason,probe) {
-  const merge={readyForSearch:ready};
+async function persistHeartbeat(tx,agent,ready,reason,probe,platforms) {
+  const merge={readyForSearch:ready,readyPlatforms:platforms};
+  // The apps this phone has run ready (union): plan checks read supportedPlatforms, so a phone that gained WeChat
+  // becomes selectable for 视频号 plans after its first poll with the new Runner.
+  const supported=[...new Set([...(Array.isArray(agent.capabilities?.supportedPlatforms)?agent.capabilities.supportedPlatforms:['douyin']),...platforms])]
+    .filter(platform=>MOBILE_PLATFORMS.includes(platform));
+  merge.supportedPlatforms=supported;
   if (reason) merge.deviceReason=reason; else merge.deviceReason='';
   const bounded=boundProbe(probe);
   if (bounded) {merge.deviceProbe=bounded; merge.deviceProbeAt=bounded.checkedAt || new Date().toISOString();}
   await tx.execute(`UPDATE capture_agents SET last_liveness_at=now(),last_full_heartbeat_at=now(),last_heartbeat_at=now(),
     capabilities=capabilities||$2::jsonb WHERE id=$1 AND (last_liveness_at IS NULL OR last_liveness_at < now()-interval '25 seconds'
-    OR capabilities->>'readyForSearch' IS DISTINCT FROM $3 OR capabilities->>'deviceReason' IS DISTINCT FROM $4)`,
-  [agent.id,merge,String(ready),String(merge.deviceReason||'')]);
+    OR capabilities->>'readyForSearch' IS DISTINCT FROM $3 OR capabilities->>'deviceReason' IS DISTINCT FROM $4
+    OR capabilities->'readyPlatforms' IS DISTINCT FROM $5::jsonb OR capabilities->'supportedPlatforms' IS DISTINCT FROM $6::jsonb)`,
+  [agent.id,merge,String(ready),String(merge.deviceReason||''),JSON.stringify(platforms),JSON.stringify(supported)]);
 }
-async function findAssignedCandidate(tx,tenantId,agentId) {
+async function findAssignedCandidate(tx,tenantId,agentId,workflows) {
   return tx.queryOne(`SELECT item.* FROM capture_task_items item
     JOIN capture_tasks child ON child.id=item.execution_task_id AND child.tenant_id=item.tenant_id
-      AND child.metadata->>'workflow'=$3
+      AND child.metadata->>'workflow'=ANY($3::text[])
     LEFT JOIN capture_tasks parent ON parent.id=item.task_id AND parent.tenant_id=item.tenant_id
       AND parent.id<>item.execution_task_id
     WHERE item.tenant_id=$1 AND item.assigned_agent_id=$2
@@ -76,25 +87,25 @@ async function findAssignedCandidate(tx,tenantId,agentId) {
         AND parent.metadata->>'operatorStopped' IS DISTINCT FROM 'true'
         AND parent.metadata->>'stopPending' IS DISTINCT FROM 'true'
         AND COALESCE(parent.metadata->>'stopCommandId','')=''))
-    ORDER BY child.created_at, item.ordinal LIMIT 1 FOR UPDATE OF item SKIP LOCKED`,[tenantId,agentId,WORKFLOW]);
+    ORDER BY child.created_at, item.ordinal LIMIT 1 FOR UPDATE OF item SKIP LOCKED`,[tenantId,agentId,workflows]);
 }
 // One keyword that runs out of attempts turns the run needs_action; its other keywords stay claimable,
 // as in the browser elastic dispatch. Retries go to the fewest attempts first, so one failing keyword
 // cannot use up all of its retries while the others wait behind it.
-async function claimElasticItem(tx,principal,agent,now) {
+async function claimElasticItem(tx,principal,agent,now,platforms) {
   const item=await tx.queryOne(`SELECT item.* FROM capture_task_items item
     JOIN capture_tasks parent ON parent.id=item.task_id AND parent.tenant_id=item.tenant_id
     WHERE item.tenant_id=$1
       AND parent.task_type='capture_orchestration'
       AND parent.status IN ('pending','running','needs_action')
-      AND parent.platform='douyin'
+      AND parent.platform=ANY($6::text[])
       AND COALESCE(parent.metadata->>'distributionMode','')='elastic_pool'
       AND parent.metadata->>'stopRequested' IS DISTINCT FROM 'true'
       AND parent.metadata->>'operatorStopped' IS DISTINCT FROM 'true'
       AND parent.metadata->>'stopPending' IS DISTINCT FROM 'true'
       AND COALESCE(parent.metadata->>'stopCommandId','')=''
       AND COALESCE(parent.metadata->>'orchestrationTemplate','false') <> 'true'
-      AND item.item_type='keyword' AND item.platform='douyin'
+      AND item.item_type='keyword' AND item.platform=parent.platform
       AND item.status IN ('pending','retryable')
       AND item.attempt_count < $3
       AND (item.metadata->>'pinnedAgentId'=$2::text
@@ -109,19 +120,22 @@ async function claimElasticItem(tx,principal,agent,now) {
         AND (UPPER(COALESCE(sa.error->>'code',''))=ANY($5::text[])
           OR COALESCE(sa.error->>'requiresManualAction',sa.error->>'securityBlocked','false')='true'))
       AND COALESCE(jsonb_array_length(parent.metadata->'planSnapshot'->'searchPasses'),0) <= 1
-      AND COALESCE(parent.metadata->'planSnapshot'->'negativePatrol'->>'enabled','false') <> 'true'
-      AND COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'publishTime','all') <> 'month'
+      AND (parent.platform='wechat_channels' OR (
+        COALESCE(parent.metadata->'planSnapshot'->'negativePatrol'->>'enabled','false') <> 'true'
+        AND COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'publishTime','all') <> 'month'))
     ORDER BY CASE WHEN item.status='pending' THEN 0 ELSE 1 END, parent.created_at, item.attempt_count, item.ordinal, item.id
     FOR UPDATE OF item SKIP LOCKED LIMIT 1`,
-  [principal.tenantId,agent.id,MOBILE_ELASTIC_ATTEMPT_LIMIT,TERMINAL_EXECUTION_STATUSES,MOBILE_SAFETY_ERROR_CODES]);
+  [principal.tenantId,agent.id,MOBILE_ELASTIC_ATTEMPT_LIMIT,TERMINAL_EXECUTION_STATUSES,MOBILE_SAFETY_ERROR_CODES,platforms]);
   if (!item) return null;
   const parent=await tx.queryOne('SELECT * FROM capture_tasks WHERE id=$1 AND tenant_id=$2 FOR UPDATE',[item.task_id,principal.tenantId]);
   const planSnapshot=parent.metadata?.planSnapshot || {};
   if (mobilePlanBlockReason(planSnapshot,parent.platform)) return null;
   const keywords=[item.keyword];
   const childId=randomUUID(), revision=item.assignment_revision+1;
-  const childMetadata={workflow:WORKFLOW,agentKind:'android_mobile',deviceId:agent.capabilities.deviceId,
-    filters:mobileTaskFilters(planSnapshot.searchFilters),budgets:mobileTaskBudgets(planSnapshot,1),
+  const workflow=mobileWorkflowFor(parent.platform);
+  const childMetadata={workflow,agentKind:'android_mobile',deviceId:agent.capabilities.deviceId,
+    filters:mobileTaskFilters(planSnapshot.searchFilters,parent.platform),budgets:mobileTaskBudgets(planSnapshot,1),
+    ...(parent.platform==='wechat_channels' ? {comments:mobileCommentPlan(planSnapshot)} : {}),
     keywords,deadlineAt:null,planSnapshot:trimMobilePlanSnapshot(planSnapshot,keywords),
     orchestrationChild:true,parentTaskId:parent.id,orchestrationRevision:revision,
     distributionMode:'elastic_pool',claimUnit:'keyword',
@@ -129,10 +143,10 @@ async function claimElasticItem(tx,principal,agent,now) {
   await tx.execute(`INSERT INTO capture_tasks(id,tenant_id,parent_task_id,origin_agent_id,assigned_agent_id,
     client_task_id,task_type,feature_key,title,platform,source,trigger_type,status,metadata,
     orchestration_revision,orchestration_schedule_id,scheduled_for,schedule_revision,source_updated_at)
-    VALUES($1::uuid,$2,$3,$4,$4,$1::uuid::text,'capture',$5,$6,'douyin','android_runner','cloud','pending',$7,
+    VALUES($1::uuid,$2,$3,$4,$4,$1::uuid::text,'capture',$5,$6,$12,'android_runner','cloud','pending',$7,
     $8,$9,$10,$11,now())`,
-  [childId,principal.tenantId,parent.id,agent.id,WORKFLOW,`${parent.title} · ${String(item.keyword).slice(0,80)}`,childMetadata,
-    revision,parent.orchestration_schedule_id||null,parent.scheduled_for||null,parent.schedule_revision||null]);
+  [childId,principal.tenantId,parent.id,agent.id,workflow,`${parent.title} · ${String(item.keyword).slice(0,80)}`,childMetadata,
+    revision,parent.orchestration_schedule_id||null,parent.scheduled_for||null,parent.schedule_revision||null,parent.platform]);
   if (item.execution_task_id && item.execution_task_id!==childId) {
     await tx.execute(`UPDATE capture_tasks SET status='superseded',metadata=metadata||jsonb_build_object(
       'handoffSuccessorTaskId',$1::uuid::text,'handoffReason','android_elastic_claimed','handoffAt',now()::text,
@@ -174,7 +188,10 @@ async function claimBoundItem(tx,principal,agent,child,item,sessionId,now) {
   const resumeAuthorized=item.metadata.resumeAuthorized===true
     || (item.status==='retryable' && lastAttempt?.agent_id===agent.id);
   const attemptId=randomUUID(), revision=item.assignment_revision+1;
-  const hash=digest({taskId:child.id,itemId:item.id,keyword:item.keyword,filters:child.metadata.filters,budgets:child.metadata.budgets,revision});
+  const wechat=child.metadata.workflow===mobileWorkflowFor('wechat_channels');
+  // Douyin keeps its original request hash; a Channels attempt also binds its platform and comment plan.
+  const hash=digest({taskId:child.id,itemId:item.id,keyword:item.keyword,filters:child.metadata.filters,budgets:child.metadata.budgets,revision,
+    ...(wechat ? {platform:'wechat_channels',comments:child.metadata.comments || null} : {})});
   const metadata={...withoutHandoffAnchors(item.metadata),attemptId,deviceHeld:true,sessionId,leaseId:randomUUID(),completion:null,
     reason:'',closure:null,deviceClosedAt:null,resumeAuthorized,
     leaseUntil:new Date(Math.min(now+LEASE_MS,Date.parse(child.metadata.deadlineAt))).toISOString()};
@@ -188,12 +205,21 @@ async function claimBoundItem(tx,principal,agent,child,item,sessionId,now) {
   await refreshOrchestrationParent(tx,principal.tenantId,child,agent.id);
   return {task:taskPayload(updated,child.metadata),permit:permit(updated,child.metadata,now),control:{}};
 }
+// The apps the Runner reports ready on this poll, limited to the phone's allowed platforms. A Runner before 0.4.0
+// sends no list: when ready, it is a Douyin phone.
+export function readyPlatforms(body,agent,ready) {
+  if (!ready) return [];
+  const allowed=Array.isArray(agent.allowed_platforms) && agent.allowed_platforms.length ? agent.allowed_platforms : ['douyin'];
+  const reported=Array.isArray(body.platforms) ? body.platforms.filter(p=>typeof p==='string') : ['douyin'];
+  return MOBILE_PLATFORMS.filter(platform=>reported.includes(platform) && allowed.includes(platform));
+}
 export async function poll(tx,principal,body,now=Date.now()) {
   const sessionId=id(body.sessionId,'SESSION_ID');
   const agent=await lockAgent(tx,principal.tenantId,principal.agentId,principal);
   if (text(body.deviceId,'DEVICE_ID',120)!==agent.capabilities.deviceId) fail('DEVICE_ID_MISMATCH',403);
   const ready=body.readyForSearch===true;
-  await persistHeartbeat(tx,agent,ready,text2(body.reason,120),body.probe);
+  const platforms=readyPlatforms(body,agent,ready);
+  await persistHeartbeat(tx,agent,ready,text2(body.reason,120),body.probe,platforms);
   const held=await heldItem(tx,principal.tenantId,agent.id);
   if (held) {
     const stopped=control(held,held.task_metadata,held.parent_metadata,sessionId,now);
@@ -201,13 +227,13 @@ export async function poll(tx,principal,body,now=Date.now()) {
     return {task:taskPayload(held,held.task_metadata),
       permit:{...permit(held,held.task_metadata,now),leaseUntil:held.metadata.leaseUntil},control:{}};
   }
-  if (!ready) return {task:null,permit:null,control:{reason:'device_not_ready'}};
-  let item=await findAssignedCandidate(tx,principal.tenantId,agent.id);
+  if (!ready || !platforms.length) return {task:null,permit:null,control:{reason:'device_not_ready'}};
+  let item=await findAssignedCandidate(tx,principal.tenantId,agent.id,platforms.map(mobileWorkflowFor));
   let child;
   if (item) {
     child=await taskRow(tx,principal.tenantId,item.execution_task_id);
   } else {
-    const claimed=await claimElasticItem(tx,principal,agent,now);
+    const claimed=await claimElasticItem(tx,principal,agent,now,platforms);
     if (!claimed) return {task:null,permit:null,control:{}};
     item=claimed.item; child=claimed.child;
   }

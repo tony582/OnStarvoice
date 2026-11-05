@@ -5,6 +5,16 @@
 // inputs; it never touches the database.
 
 export const MOBILE_WORKFLOW = 'douyin_mobile_discovery';
+// WeChat Channels on the same phone (0.4.0): the phone captures the whole post itself and uploads it.
+export const WECHAT_MOBILE_WORKFLOW = 'wechat_channels_mobile_capture';
+export const MOBILE_WORKFLOWS = Object.freeze([MOBILE_WORKFLOW, WECHAT_MOBILE_WORKFLOW]);
+export const MOBILE_PLATFORMS = Object.freeze(['douyin', 'wechat_channels']);
+export function mobileWorkflowFor(platform) {
+  return String(platform || '').toLowerCase() === 'wechat_channels' ? WECHAT_MOBILE_WORKFLOW : MOBILE_WORKFLOW;
+}
+export function mobilePlatformForWorkflow(workflow) {
+  return workflow === WECHAT_MOBILE_WORKFLOW ? 'wechat_channels' : 'douyin';
+}
 export const MOBILE_KEYWORD_MINUTES_DEFAULT = 15;
 export const MOBILE_BATCH_TAIL_MS = 5 * 60_000;
 
@@ -25,10 +35,18 @@ export function mobileKeywordMs(planSnapshot = {}) {
   return mobileKeywordMinutes(planSnapshot) * 60_000;
 }
 
-export function mobileTaskFilters(searchFilters = {}) {
+// Channels has no publication filter in the App: the phone sorts newest first and stops at the window itself.
+const WECHAT_WINDOW_HOURS = Object.freeze({all: null, day: 24, week: 168, month: 720, halfyear: 4320});
+const WECHAT_SORTS = Object.freeze({comprehensive: 'all', latest: 'latest', likes: 'hot'});
+
+export function mobileTaskFilters(searchFilters = {}, platform = 'douyin') {
   const source = searchFilters && typeof searchFilters === 'object' && !Array.isArray(searchFilters)
     ? searchFilters
     : {};
+  if (String(platform).toLowerCase() === 'wechat_channels') {
+    const windowHours = Object.hasOwn(WECHAT_WINDOW_HOURS, source.publishTime) ? WECHAT_WINDOW_HOURS[source.publishTime] : null;
+    return {sort: windowHours === null ? (WECHAT_SORTS[source.sort] ?? 'all') : 'latest', publishWindowHours: windowHours};
+  }
   return {
     sort: SORT_VALUES.has(source.sort) ? source.sort : 'comprehensive',
     publishTime: PUBLISH_VALUES.has(source.publishTime) ? source.publishTime : 'all',
@@ -79,11 +97,25 @@ export function mobileRelevancePrefilterEnabled(planSnapshot) {
 // A phone can only take a plain single-pass douyin keyword search. Multi-pass
 // sequential searches, negative patrols and the `month` publication window stay
 // browser-only. Returns a reason string when the plan is not phone-eligible.
+// Comments the phone reads per Channels post: the plan's detail-comment switch and limit (default 50).
+export function mobileCommentPlan(planSnapshot = {}) {
+  const settings = planSnapshot && typeof planSnapshot === 'object' ? planSnapshot.captureSettings : null;
+  const enabled = Boolean(settings && settings.includeCommentsOnDetailCapture === true);
+  const raw = Number(settings?.detailCommentsMaxDetectedItems);
+  return {enabled, limit: enabled ? Math.min(500, Math.max(1, Number.isInteger(raw) && raw > 0 ? raw : 50)) : 0};
+}
+
 export function mobilePlanBlockReason(planSnapshot = {}, platform = 'douyin') {
   const source = planSnapshot && typeof planSnapshot === 'object' && !Array.isArray(planSnapshot)
     ? planSnapshot
     : {};
-  if (String(platform || '').toLowerCase() !== 'douyin') return 'platform_not_douyin';
+  const normalized = String(platform || '').toLowerCase();
+  if (normalized === 'wechat_channels') {
+    // Channels: one search pass; the month window works (the phone filters by the card time itself).
+    if (Array.isArray(source.searchPasses) && source.searchPasses.length > 1) return 'sequential_search_unsupported';
+    return '';
+  }
+  if (normalized !== 'douyin') return 'platform_not_douyin';
   if (Array.isArray(source.searchPasses) && source.searchPasses.length > 1) {
     return 'sequential_search_unsupported';
   }

@@ -35,10 +35,18 @@ const OUTCOME_TEXT = Object.freeze({
   card_open_failed: '连续多个作品点不开', appium_http_error: '手机自动化服务意外中断', device_timeout: '手机响应超时',
   douyin_not_foreground: '抖音不在前台', device_asleep: '手机息屏', device_locked: '手机锁屏',
   user_stop: '已手动停止', remote_stop: '调度中心已停止', lease_expired: '与调度中心的连接中断',
+  publish_window_end: '已到时间范围之外', sort_unverified: '「最新」排序未确认', login_or_challenge_required: '需在手机上处理微信提示',
+  link_not_copied: '复制链接失败', share_sheet_unverified: '转发面板未确认', ocr_unavailable: '本机识字工具不可用',
 });
 
 /** One human-readable status line from the daemon's current probe. */
+const PLATFORM_NAMES = Object.freeze({douyin: '抖音', wechat_channels: '视频号'});
 export function describeReadiness(daemon) {
+  // A phone shared with WeChat (0.4.0) lists the apps it can run now; the Douyin-only line stays as it was.
+  const platforms = Array.isArray(daemon.platforms) ? daemon.platforms : [];
+  if (daemon.ready && (platforms.length > 1 || platforms.includes('wechat_channels'))) {
+    return `手机已连接 · 可采 ${platforms.map(p => PLATFORM_NAMES[p] ?? p).join('、')} · 已上线，可在调度中心下发任务`;
+  }
   if (daemon.ready) return '手机已连接 · 抖音在前台 · 已上线，可在调度中心下发任务';
   const reason = daemon.blocked ?? daemon.deviceReason ?? 'profile_required';
   return `${REASON_TEXT[reason] ?? reason} · 等待…`;
@@ -48,7 +56,8 @@ export function describeReadiness(daemon) {
 export function describeOutcome(outcome) {
   if (!outcome) return null;
   const done = outcome.status === 'completed' || outcome.status === 'completed_with_warnings';
-  const parts = [`${done ? '【完成】' : '【提前结束】'}${outcome.keyword}`, `找到 ${outcome.links} 条`];
+  const parts = [`${done ? '【完成】' : '【提前结束】'}${outcome.platform === 'wechat_channels' ? '视频号 · ' : ''}${outcome.keyword}`,
+    outcome.platform === 'wechat_channels' ? `入库 ${outcome.posts ?? 0} 条` : `找到 ${outcome.links} 条`];
   if (outcome.skipped > 0) parts.push(`跳过 ${outcome.skipped} 个无法核对的作品`);
   if (outcome.prefilterSkipped > 0) parts.push(`AI 跳过 ${outcome.prefilterSkipped} 条无关`);
   parts.push(OUTCOME_TEXT[outcome.reason] ?? outcome.reason ?? '已结束');

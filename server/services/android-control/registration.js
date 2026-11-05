@@ -24,7 +24,7 @@ export async function registerMobile(tx,input,enabledTenants) {
     remoteTaskCreate:false,remoteTaskKeywordPostLimit:false,singleRelayV1:false,readyForSearch:false};
   const agent=await tx.queryOne(`INSERT INTO capture_agents(tenant_id,auth_code_id,auth_binding_id,client_uuid,
     client_label,display_name,browser_name,operating_system,app_version,allowed_platforms,capabilities)
-    VALUES($1,$2,$3,$4,$5,$5,'Android Runner','Android',$6,ARRAY['douyin'],$7)
+    VALUES($1,$2,$3,$4,$5,$5,'Android Runner','Android',$6,ARRAY['douyin','wechat_channels'],$7)
     ON CONFLICT(tenant_id,client_uuid) DO UPDATE SET auth_code_id=EXCLUDED.auth_code_id,
     auth_binding_id=EXCLUDED.auth_binding_id,app_version=EXCLUDED.app_version,updated_at=now() RETURNING *`,
   [auth.tenant_id,auth.id,binding.id,stableId,clientLabel,String(input.appVersion || '').slice(0,80),capabilities]);

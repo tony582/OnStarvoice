@@ -1,8 +1,8 @@
-const OPTIONS = new Set(['serial', 'adb-path', 'appium-path', 'appium-cli-path', 'appium-url', 'state-dir', 'cloud-url', 'simulation', 'label', 'evidence-file', 'duration-seconds', 'device-profile', 'appium-launch-file', 'hours']);
+const OPTIONS = new Set(['serial', 'adb-path', 'appium-path', 'appium-cli-path', 'appium-url', 'state-dir', 'cloud-url', 'simulation', 'label', 'evidence-file', 'duration-seconds', 'device-profile', 'appium-launch-file', 'hours', 'chrome']);
 
 export function parseArguments(args) {
   const [command = 'help', ...rest] = args;
-  if (!['help', 'doctor', 'demo', 'status', 'deliver', 'retry-delivery', 'run', 'setup', 'start', 'stop', 'close', 'up', 'diagnose'].includes(command)) {
+  if (!['help', 'doctor', 'demo', 'status', 'deliver', 'retry-delivery', 'run', 'setup', 'start', 'stop', 'close', 'up', 'diagnose', 'enable-wechat'].includes(command)) {
     throw new Error(`Unknown command: ${command}`);
   }
   const values = {};
@@ -14,7 +14,7 @@ export function parseArguments(args) {
     }
     values[name] = rest[i + 1];
   }
-  if (['status', 'deliver', 'retry-delivery', 'setup', 'start', 'stop', 'close', 'up', 'diagnose'].includes(command) && !values['state-dir']) {
+  if (['status', 'deliver', 'retry-delivery', 'setup', 'start', 'stop', 'close', 'up', 'diagnose', 'enable-wechat'].includes(command) && !values['state-dir']) {
     throw new Error('--state-dir is required');
   }
   if (values.simulation && !['true', 'false'].includes(values.simulation)) throw new Error('Invalid simulation mode');
@@ -44,6 +44,8 @@ stop    --state-dir DIR   Durable stop request; inspect status to confirm closur
 close   --state-dir DIR --evidence-file PATH  Explicit independent device closure proof.
 status  --state-dir DIR   Show daemon, device closure and durable outbox state.
 diagnose --state-dir DIR [--hours 24]  Recent keyword runs and why cards or runs ended early (local, read-only).
+enable-wechat --state-dir DIR [--chrome PATH]  Also take WeChat Channels tasks on this phone (WeChat 8.0.80):
+        builds the local OCR helper (swiftc) and records it; the Runner must be stopped.
 demo    --cloud-url http://127.0.0.1:PORT [--duration-seconds 15]
         Opt-in loopback control-plane simulation; never a production tenant.
 deliver --state-dir DIR   One bounded delivery attempt to the configured server.

@@ -354,6 +354,41 @@ async function applyOrQueueCommentWorkflow(record, result, context) {
   return await applyCommentWorkflow(record, result, context);
 }
 
+/**
+ * One normalized record through the same path as POST /api/sync: record + observation, the durable comment
+ * receipt, and the AI label job. Also used by phone uploads that are not activation-code requests
+ * (routes/android-control.js, WeChat Channels posts). Returns {result} or {result, commentStats}.
+ */
+export async function syncNormalizedRecord(record, {tenantId, authCode, captureAgent = null}) {
+  const result = await upsertCapturedRecord(record, {
+    tenantId,
+    authCode,
+    monitorExecutionId: record.monitorExecutionId,
+    captureTaskId: record.captureTaskId,
+    captureTaskItemAttemptId: record.captureTaskItemAttemptId,
+    captureTaskItemRequestHash: record.captureTaskItemRequestHash,
+    captureAgentId: captureAgent?.id || null,
+    captureAgentAuthCodeId: captureAgent?.auth_code_id || null,
+    captureAgentAuthBindingId: captureAgent?.auth_binding_id || null,
+    commentWorkflowExpectedCount: countCommentWorkflowItems(record),
+  });
+  if (result.action === 'skipped') return {result};
+  const commentStats = await applyOrQueueCommentWorkflow(record, result, {
+    tenantId,
+    authCode,
+    observationId: result.observationId,
+  });
+  const aiJob = buildSyncAiJob(result);
+  if (
+    aiJob &&
+    !result.observationReused &&
+    !commentStats.queued &&
+    !commentStats.reused &&
+    !commentStats.officialContent
+  ) queueAiJobs([aiJob]);
+  return {result, commentStats};
+}
+
 router.post('/', requireAuth, optionalCaptureAgent, async (req, res) => {
   try {
     const records = normalizeRecord(req.body);
@@ -362,18 +397,10 @@ router.post('/', requireAuth, optionalCaptureAgent, async (req, res) => {
     }
 
     const record = records[0];
-    const commentWorkflowExpectedCount = countCommentWorkflowItems(record);
-    const result = await upsertCapturedRecord(record, {
+    const {result, commentStats} = await syncNormalizedRecord(record, {
       tenantId: req.tenantId,
       authCode: req.authCode,
-      monitorExecutionId: record.monitorExecutionId,
-      captureTaskId: record.captureTaskId,
-      captureTaskItemAttemptId: record.captureTaskItemAttemptId,
-      captureTaskItemRequestHash: record.captureTaskItemRequestHash,
-      captureAgentId: req.captureAgent?.id || null,
-      captureAgentAuthCodeId: req.captureAgent?.auth_code_id || null,
-      captureAgentAuthBindingId: req.captureAgent?.auth_binding_id || null,
-      commentWorkflowExpectedCount,
+      captureAgent: req.captureAgent,
     });
     if (result.action === 'skipped') {
       return res.status(422).json({
@@ -382,20 +409,6 @@ router.post('/', requireAuth, optionalCaptureAgent, async (req, res) => {
         publishWindowCheck: result.publishWindowCheck,
       });
     }
-    const commentStats = await applyOrQueueCommentWorkflow(record, result, {
-      tenantId: req.tenantId,
-      authCode: req.authCode,
-      observationId: result.observationId,
-    });
-
-    const aiJob = buildSyncAiJob(result);
-    if (
-      aiJob &&
-      !result.observationReused &&
-      !commentStats.queued &&
-      !commentStats.reused &&
-      !commentStats.officialContent
-    ) queueAiJobs([aiJob]);
 
     return res.json({
       ok: true,

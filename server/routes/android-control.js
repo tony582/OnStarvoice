@@ -4,9 +4,15 @@ import {isDbCapacityError} from '../db/query.js';
 import {configuredAndroidTenants,createAndroidControlService} from '../services/android-control/service.js';
 import {DiscoveryError} from '../services/capture-discovery/validation.js';
 import {PrefilterRequestError} from '../services/relevance-prefilter.js';
+import {normalizeRecord,syncNormalizedRecord} from './sync.js';
+// A phone-captured post through the same record path as an Extension sync.
+async function persistSyncBody(body,context) {
+  const [record]=normalizeRecord(body);
+  return syncNormalizedRecord(record,context);
+}
 export function createAndroidControlRouter({service,enabledTenants=configuredAndroidTenants,
   authenticateAgent=requireCaptureAgent,authenticateUser=requireCriticalTenantAccess,
-  sessionUser=requireSessionUser,tenantWriter=requireTenantWriter}={}) {
+  sessionUser=requireSessionUser,tenantWriter=requireTenantWriter,persist=persistSyncBody}={}) {
   service ||= createAndroidControlService({enabledTenants});
   const router=Router(),hits=new Map();
   const enabled=()=>enabledTenants();
@@ -67,6 +73,8 @@ export function createAndroidControlRouter({service,enabledTenants=configuredAnd
   for (const action of ['poll','renew','complete','close']) router.post(`/agent/${action}`,...agent,
     handle(req=>service[action](req.mobilePrincipal,req.body || {})));
   router.post('/agent/prefilter',...agent,failOpen(req=>service.prefilter(req.mobilePrincipal,req.body)));
+  router.post('/agent/posts',...agent,handle(req=>service.posts(req.mobilePrincipal,req.body || {},persist)));
+  router.get('/agent/post-receipts',...agent,handle(req=>service.postReceipts(req.mobilePrincipal,req.query.batchId)));
   return router;
 }
 export default createAndroidControlRouter();

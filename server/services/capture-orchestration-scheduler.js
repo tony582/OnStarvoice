@@ -16,10 +16,12 @@ import {
   normalizeUnattendedNegativePatrolScope,
 } from './unattended-negative-patrol.js';
 import {
-  MOBILE_WORKFLOW,
+  MOBILE_PLATFORMS,
+  mobileCommentPlan,
   mobilePlanBlockReason,
   mobileTaskBudgets,
   mobileTaskFilters,
+  mobileWorkflowFor,
   trimMobilePlanSnapshot,
 } from './android-control/mobile-tasks.js';
 
@@ -144,21 +146,27 @@ function agentFailure(agent, platform, planSnapshot) {
     if (capabilities.mobileSearchDiscoveryV1 !== true) {
       return {code: 'scheduled_agent_mobile_unsupported', message: '手机节点版本不支持关键词搜索发现'};
     }
-    if (platform !== 'douyin') {
-      return {code: 'scheduled_agent_mobile_platform', message: '手机节点仅支持抖音关键词搜索发现'};
+    if (!MOBILE_PLATFORMS.includes(platform)) {
+      return {code: 'scheduled_agent_mobile_platform', message: '手机节点仅支持抖音和视频号关键词搜索'};
     }
     if (mobilePlanBlockReason(planSnapshot, platform)) {
-      return {code: 'scheduled_agent_mobile_plan_unsupported', message: '手机节点仅支持单段抖音关键词搜索，不支持串行补充、负面巡查或近一月'};
+      return {code: 'scheduled_agent_mobile_plan_unsupported', message: platform === 'wechat_channels'
+        ? '视频号手机采集不支持串行补充'
+        : '手机节点仅支持单段抖音关键词搜索，不支持串行补充、负面巡查或近一月'};
     }
     const mobileAllowed = Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [];
-    if (mobileAllowed.length > 0 && !mobileAllowed.includes('douyin')) {
+    if (mobileAllowed.length > 0 && !mobileAllowed.includes(platform)) {
       return {code: 'scheduled_agent_platform_mismatch', message: '执行节点未配置负责当前平台'};
     }
     const mobileSupported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
-    if (mobileSupported.length > 0 && !mobileSupported.includes('douyin')) {
+    if (platform === 'wechat_channels' ? !mobileSupported.includes(platform)
+      : mobileSupported.length > 0 && !mobileSupported.includes(platform)) {
       return {code: 'scheduled_agent_platform_unsupported', message: '执行节点版本不支持当前平台'};
     }
     return null;
+  }
+  if (platform === 'wechat_channels') {
+    return {code: 'scheduled_agent_platform_unsupported', message: '视频号只能由手机节点采集'};
   }
   if (capabilities.remoteTaskCreate !== true) {
     return {code: 'scheduled_agent_version_unsupported', message: '执行节点版本不支持云端任务'};
@@ -204,10 +212,11 @@ async function materializeMobileFixedBatchChild(tx, {
   const childTaskId = crypto.randomUUID();
   const keywords = groupItems.map(item => item.keyword);
   const childMetadata = {
-    workflow: MOBILE_WORKFLOW,
+    workflow: mobileWorkflowFor(schedule.platform),
     agentKind: 'android_mobile',
     deviceId: object(agent.capabilities).deviceId,
-    filters: mobileTaskFilters(planSnapshot.searchFilters),
+    filters: mobileTaskFilters(planSnapshot.searchFilters, schedule.platform),
+    ...(schedule.platform === 'wechat_channels' ? {comments: mobileCommentPlan(planSnapshot)} : {}),
     budgets: mobileTaskBudgets(planSnapshot, keywords.length),
     keywords,
     deadlineAt: null,
@@ -229,18 +238,19 @@ async function materializeMobileFixedBatchChild(tx, {
       orchestration_schedule_id, scheduled_for, schedule_revision
     ) VALUES (
       $1::uuid, $2, $3, $4, $4,
-      $1::uuid::text, 'capture', $5, $6, 'douyin',
+      $1::uuid::text, 'capture', $5, $6, $13,
       'android_runner', 'orchestration_schedule', 'pending', $7::jsonb, '{}'::jsonb, $8::jsonb,
       $9::jsonb, '手机搜索发现子任务已创建，等待手机领取', now(),
       $10, $11, $12
     )
   `, [
-    childTaskId, schedule.tenant_id, runTaskId, agentId, MOBILE_WORKFLOW,
+    childTaskId, schedule.tenant_id, runTaskId, agentId, mobileWorkflowFor(schedule.platform),
     `${schedule.title} · 手机`,
     JSON.stringify({current: 0, total: keywords.length, phase: 'queued'}),
     JSON.stringify({total: keywords.length, processed: 0, success: 0, failed: 0, skipped: 0}),
     JSON.stringify(childMetadata),
     schedule.id, scheduledFor.toISOString(), Number(schedule.revision),
+    schedule.platform === 'wechat_channels' ? 'wechat_channels' : 'douyin',
   ]);
   for (const item of groupItems) {
     await tx.execute(`

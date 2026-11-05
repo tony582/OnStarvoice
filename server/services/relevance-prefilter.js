@@ -28,7 +28,7 @@ export const PREFILTER_FAIL_OPEN_SAMPLE_RATE = 0.1;
 export const PREFILTER_FAIL_OPEN_SAMPLE_MAX = 3;
 export const PREFILTER_DEFER_MINUTES = 15;
 
-const VALID_PLATFORMS = new Set(['xiaohongshu', 'douyin']);
+const VALID_PLATFORMS = new Set(['xiaohongshu', 'douyin', 'wechat_channels']);
 const VALID_MODES = new Set(['disabled', 'shadow', 'conservative']);
 const VALID_DECISIONS = new Set(['keep', 'skip', 'need_detail']);
 const VALID_TENANT_RELEVANCE = new Set(['relevant', 'irrelevant', 'uncertain']);

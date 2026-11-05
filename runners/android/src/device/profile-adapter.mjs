@@ -34,8 +34,12 @@ export function mapSearchFilters(filters) {
   return {sort, time, content};
 }
 
+/**
+ * `sharedWithWechat` (0.4.0): the phone also runs WeChat tasks. The idle probe then never pulls Douyin forward
+ * (it only checks that the phone is awake and unlocked), and a claimed Douyin keyword launches Douyin itself.
+ */
 export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=createAppiumClient({appiumUrl}),onState,
-  foreground=createForegroundGuard({adb,serial}),now=Date.now}) {
+  foreground=createForegroundGuard({adb,serial}),now=Date.now,sharedWithWechat=false}) {
   if (profileId !== DOUYIN_P0_PROFILE.id) throw new DeviceError('profile_required','Unknown device profile');
   const session = createProfileSession({serial,profileId,adb,client,onState});
   let flow = null, context = null, staticCheckedAt = -Infinity;
@@ -79,7 +83,7 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
         const status = await client.status(options);
         if (status?.ready !== true) throw new DeviceError('appium_not_ready','The Appium server does not report ready');
         const memory = typeof foreground.relieveMemory === 'function' ? await foreground.relieveMemory({signal}) : null;
-        const state = await foreground.ensure({signal});
+        const state = sharedWithWechat ? await foreground.awake({signal}) : await foreground.ensure({signal});
         return {readyForSearch:true,reason:null,
           foreground:{package:state.package,activity:state.activity,launched:state.launched || memory?.restarted === true},
           ...(memory ? {memory} : {})};
@@ -91,7 +95,7 @@ export function createProfileAdapter({serial,adb,profileId,appiumUrl,client=crea
     async inspect(options = {}) {
       // The claimed task re-verifies the foreground before a session is created (no relaunch there). After a new
       // session it may relaunch Douyin once, through the reviewed launcher, if the helper app kept focus.
-      await foreground.ensure({signal:options.signal,launch:false});
+      await foreground.ensure({signal:options.signal,launch:false,switching:sharedWithWechat});
       let launchesAtCheck = null;
       const state = await session.inspect({...options, afterCreate: () => regainFocus(options.signal),
         // Evaluated after afterCreate, right before the login check: a relaunch there or in a probe ends the proof.

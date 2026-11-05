@@ -72,6 +72,9 @@ const PLATFORM_ALIASES = Object.freeze({
   douyin: 'douyin',
   tiktok_cn: 'douyin',
   weibo: 'weibo',
+  wechat_channels: 'wechat_channels',
+  channels: 'wechat_channels',
+  shipinhao: 'wechat_channels',
   mixed: 'mixed',
   unknown: 'unknown',
 });
@@ -276,8 +279,8 @@ export function normalizeCaptureAgentPlatforms(value) {
   const source = Array.isArray(value) ? value : [];
   return [...new Set(source
     .map(item => PLATFORM_ALIASES[String(item || '').trim().toLowerCase()] || '')
-    .filter(platform => ['xiaohongshu', 'douyin', 'weibo'].includes(platform)))]
-    .slice(0, 3);
+    .filter(platform => ['xiaohongshu', 'douyin', 'weibo', 'wechat_channels'].includes(platform)))]
+    .slice(0, 4);
 }
 
 /**

@@ -86,12 +86,17 @@ export function createForegroundGuard({adb, serial, launchIntervalMs = 60_000, w
       while (!isDouyin(foreground) && now() < deadline) { await wait(pollMs, signal); foreground = await readForeground({signal}); }
       return {douyin: isDouyin(foreground), focus: describe(foreground)};
     },
-    async ensure({signal, launch = true} = {}) {
+    /**
+     * `switching` (a phone shared with WeChat, 0.4.0): the claimed Douyin keyword brings Douyin forward itself,
+     * once, without the idle relaunch interval. Without it the behaviour is unchanged.
+     */
+    async ensure({signal, launch = true, switching = false} = {}) {
       const options = {signal};
       throwIfAborted(signal);
       await assertAwakeAndUnlocked(options);
       const foreground = await readForeground(options);
       if (isDouyin(foreground)) return {...foreground, launched: false};
+      if (switching) return start(options);
       if (!launch || now() - lastLaunchAt < launchIntervalMs) {
         throw new DeviceError('douyin_not_foreground', 'Douyin must be in the foreground', {focus: describe(foreground), launched: false, deviceSettled: true});
       }
@@ -104,6 +109,13 @@ export function createForegroundGuard({adb, serial, launchIntervalMs = 60_000, w
      * another reason is not restarted on every poll; the reading is still reported. An adb client without the reader,
      * or a reading without the fields, never restarts anything.
      */
+    /** Awake and unlocked, whatever app is in front (a phone shared with WeChat): read-only, never launches. */
+    async awake({signal} = {}) {
+      throwIfAborted(signal);
+      await assertAwakeAndUnlocked({signal});
+      const foreground = await readForeground({signal});
+      return {package: foreground?.package ?? null, activity: foreground?.activity ?? null, launched: false};
+    },
     async relieveMemory({signal} = {}) {
       const options = {signal};
       throwIfAborted(signal);

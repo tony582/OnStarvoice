@@ -11,6 +11,10 @@ const PLATFORM_ALIASES = Object.freeze({
   xiaohongshu: 'xiaohongshu',
   douyin: 'douyin',
   tiktok_cn: 'douyin',
+  // WeChat Channels (视频号), captured only by phone nodes (docs/hotfix/20261105-wechat-channels-mobile.md).
+  wechat_channels: 'wechat_channels',
+  channels: 'wechat_channels',
+  shipinhao: 'wechat_channels',
 });
 
 const ITEM_STATUSES = new Set([

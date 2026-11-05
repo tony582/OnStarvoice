@@ -1,12 +1,9 @@
-import {createAndroidDeviceAdapter} from '../device/adapter.mjs';
-import {createAdbClient} from '../device/adb.mjs';
-import {settleDevice} from './settle-device.mjs';
+import {createRunnerDevice} from './multi-device.mjs';
+import {runClaimedTask} from './task-runner.mjs';
 import {randomUUID} from 'node:crypto';
 import {join} from 'node:path';
 import {RunnerStore} from '../storage/runner-store.mjs';
 import {ExecutionPermit} from '../core/execution-permit.mjs';
-import {runDiscoveryTask} from '../core/discovery-runner.mjs';
-import {createCardPrefilter} from '../core/card-prefilter.mjs';
 import {readDeviceClosure} from '../core/device-closure.mjs';
 import {recordDiagnostic} from '../core/diagnostics.mjs';
 import {acquireDeviceLock, inspectDeviceLock} from '../core/device-lock.mjs';
@@ -43,9 +40,10 @@ export class AndroidDaemon {
     this.ownsStore = !store;
     this.control = control ?? createControlClient({baseUrl: config.baseUrl, agentToken: config.agentToken});
     this.delivery = delivery ?? createCloudClient({baseUrl: config.baseUrl, agentToken: config.agentToken});
-    this.device = device ?? (config.simulation ? createSimulationDevice(config.deviceId) : config.deviceProfile
-      ? createAndroidDeviceAdapter({serial:config.deviceId,profileId:config.deviceProfile,appiumUrl:config.appiumUrl,
-        adb:createAdbClient({adbPath:config.adbPath}),onState:value=>setCheckpoint(this.store,'daemon:device-session',value)}) : null);
+    this.device = device ?? (config.simulation ? createSimulationDevice(config.deviceId) : config.deviceProfile || config.wechat
+      ? createRunnerDevice({config, store: this.store, stateDir,
+        onState: value => setCheckpoint(this.store, 'daemon:device-session', value)}) : null);
+    this.platforms = config.simulation ? ['douyin'] : [];
     this.ready = config.simulation === true && !!this.device;
     this.deviceProbe = null;
     Object.assign(this, {lockRoot, pollMs, renewMs, deliveryMs, watchMs, actionTimeoutMs});
@@ -129,11 +127,8 @@ export class AndroidDaemon {
     setCheckpoint(this.store, 'daemon:active', active);
     this.active = {...active, permit, leaseId: lease.leaseId};
     this.nextRenewAt = Date.now() + this.renewMs;
-    this.taskPromise = runDiscoveryTask({task, store: this.store, device: this.device, permit, clock,
-      actionTimeoutMs: this.actionTimeoutMs, resumeAuthorized: task.resumeAuthorized === true,
-      prefilter: options => createCardPrefilter({...options, client: this.control}),
-      deviceClosureVerified: closureProofFor(this.store, this.config.deviceId)})
-      .then(result => settleDevice({device:this.device,store:this.store,task,result,clock,permit}))
+    this.taskPromise = runClaimedTask({task, device: this.device, store: this.store, permit, clock, control: this.control,
+      actionTimeoutMs: this.actionTimeoutMs, deviceClosureVerified: closureProofFor(this.store, this.config.deviceId)})
       .then(result => {
         if (result.status.startsWith('completed')) {
           try { permit.assertAllowed(); }
@@ -142,8 +137,8 @@ export class AndroidDaemon {
         }
         if (this.device?.probe && DEVICE_READINESS_REASONS.has(result.reason)) { this.ready = false; this.deviceReason = result.reason; }
         // Plain summary for the one-click window; keyword and counts only.
-        this.lastOutcome = {keyword: task.keyword, status: result.status, reason: result.reason ?? null,
-          links: result.stats?.links ?? 0, skipped: result.stats?.skippedCards ?? 0, prefilterSkipped: result.stats?.prefilterSkipped ?? 0,
+        this.lastOutcome = {keyword: task.keyword, platform: task.platform ?? 'douyin', status: result.status, reason: result.reason ?? null,
+          links: result.stats?.links ?? 0, posts: result.stats?.posts ?? null, skipped: result.stats?.skippedCards ?? 0, prefilterSkipped: result.stats?.prefilterSkipped ?? 0,
           elapsedMs: result.stats?.keywordElapsedMs ?? null, at: Date.now()};
         this.saveCompletion({...active, leaseId: this.active?.leaseId ?? active.leaseId}, result);
         return result;
@@ -162,6 +157,8 @@ export class AndroidDaemon {
     const state = await this.device.probe({signal: this.shutdown.signal});
     this.ready = state.readyForSearch === true;
     this.deviceReason = state.reason ?? null;
+    // A single-app (Douyin) adapter reports no list: when it is ready, Douyin is the one platform.
+    this.platforms = Array.isArray(state.platforms) ? state.platforms : this.ready ? ['douyin'] : [];
     this.deviceProbe = {readyForSearch: this.ready, reason: this.deviceReason, checkedAt: new Date().toISOString(),
       ...(state.foreground ? {foreground: state.foreground} : {}), ...(state.focus !== undefined ? {focus: state.focus} : {}),
       ...(state.memory ? {memory: state.memory} : {})};
@@ -216,7 +213,8 @@ export class AndroidDaemon {
     if (!this.active && this.device?.probe) await this.probeDevice();
     let started = performance.now();
     const polled = await this.control.poll({deviceId: this.config.deviceId, sessionId: this.sessionId,
-      readyForSearch: this.ready, reason: this.deviceReason ?? null, probe: this.pollProbe()}, {signal: this.shutdown.signal});
+      readyForSearch: this.ready, reason: this.deviceReason ?? null, platforms: this.platforms, probe: this.pollProbe()},
+    {signal: this.shutdown.signal});
     // Only an answered poll ends a failure streak; turns skipped for backoff or a block keep the count and the error.
     this.controlFailures = 0; this.lastControlError = null;
     this.nextControlAt = Date.now() + Math.max(this.pollMs, polled.pollAfterMs ?? 0);
@@ -322,6 +320,7 @@ export class AndroidDaemon {
       signal?.removeEventListener('abort', onAbort);
       this.lockOwned = false;
       this.finished = true;
+      try { this.device?.shutdown?.(); } catch { /* OCR/preview helpers already gone */ }
       if (this.ownsStore) this.store.close();
     }
   }
