@@ -13,6 +13,10 @@ const NOISE_PREFIX = /^[^\p{L}\p{N}]+/u;
 // "4条回复～"; OCR sometimes reads 复 or the arrow as く/～, so only the number and 条回 are required.
 const REPLIES = /^(?:展开)?(\d{1,4})\s*条回/u;
 const REPLIES_TAIL = /\s*(?:展开)?\d{1,4}\s*条回\S{0,2}$/u;
+// A highlighted search term in a comment carries a small magnifier/link icon that OCR reads as "Q" or "°"
+// right after the term ("OTAQ算是", "NVH°功底"); a model name like "Q5" or "25°C" is left alone.
+const TERM_ICON = /(?<=[\p{Script=Han}A-Za-z])(?:Q(?=[\p{Script=Han}，。！？、+\s]|$)|°(?![CF]))/gu;
+export const cleanCommentText = text => String(text).replace(TERM_ICON, '').trim();
 
 function header(row) {
   const text = row.text.normalize('NFKC').trim();
@@ -79,7 +83,7 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
   }
   const last = comments.at(-1);
   return {headerCount, post, expand, comments: comments.filter(item => item.content.trim())
-    .map(({key: _key, headerY: _y, lastY, ...item}) => ({...item, content: item.content.replace(REPLIES_TAIL, '').trim(),
+    .map(({key: _key, headerY: _y, lastY, ...item}) => ({...item, content: cleanCommentText(item.content.replace(REPLIES_TAIL, '')),
       cut: bottom - lastY < 130 && item === last})),
   bottomCut: !!last && bottom - last.lastY < 130};
 }

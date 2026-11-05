@@ -128,3 +128,13 @@ test('preview answers: complete posts, unavailable posts and malformed bodies', 
   assert.throws(() => readFeedInfo(body({authorInfo: {}, feedInfo: {description: 'x', createtime: 1793671301}, errMsg: {type: 0}})),
     {code: 'preview_incomplete'});
 });
+
+test('search-term icons read as Q or ° are removed from comment text; model names stay', async () => {
+  const {cleanCommentText} = await import('../src/device/wechat-comments-parse.mjs');
+  assert.equal(cleanCommentText('这次OTAQ算是完整秀了一把'), '这次OTA算是完整秀了一把');
+  assert.equal(cleanCommentText('智驾高速Q很好用'), '智驾高速很好用');
+  assert.equal(cleanCommentText('别克NVH°功底在线'), '别克NVHNVH功底在线'.replace('NVHNVH', 'NVH'));
+  assert.equal(cleanCommentText('广州小鹏飞行汽车Q+直升机X'), '广州小鹏飞行汽车+直升机X');
+  assert.equal(cleanCommentText('奥迪Q5和25°C'), '奥迪Q5和25°C');
+  assert.equal(cleanCommentText('别克服务Q至于交付'), '别克服务至于交付');
+});

@@ -10,7 +10,7 @@ import {diagnoseRunner} from '../daemon/diagnose.mjs';
 
 export async function startRunner({stateDir, durationMs, stdout = console.log}) {
   const config = readConfig(stateDir);
-  const daemon = new AndroidDaemon({stateDir,config,actionTimeoutMs:config.deviceProfile ? 60000 : 10000});
+  const daemon = new AndroidDaemon({stateDir,config,actionTimeoutMs:config.deviceProfile || config.wechat ? 60000 : 10000});
   const stop = () => daemon.requestStop('user_stop');
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);

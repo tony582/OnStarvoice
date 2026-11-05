@@ -41,12 +41,30 @@
 
 - `POST /api/capture-cloud/android/agent/posts {uploadBatchId, events}`（1–5 条）→ `{uploadBatchId, receipts:[{eventId, status, receiptId, recordId}]}`；`GET /agent/post-receipts?batchId=`。回执幂等，同一事件不同内容返回 409。
 - 作品编号（服务端计算）：`wxc_` + sha256(`createtime|昵称`) 前 24 位。评论编号：sha256(作品编号、父评论序号对应的作者+内容、作者、规范化内容)。
-- 记录字段：`url` 为本次复制的短链；`publish_time` 由 `createtime` 换算为北京时间；`likes ← likeCountFmt`、`collects ← favCountFmt`（后台在视频号上显示为「推荐」）、`shares ← forwardCountFmt`、`comments_count ← commentCountFmt`。
+- 记录字段：`url` 为本次复制的短链；`publish_time` 由 `createtime` 换算为北京时间；按 8.0.80 的图标标签，`likes ← favCountFmt`（大拇指「喜欢」，也是搜索卡片上的数）、`collects ← likeCountFmt`（心形「推荐」，后台在视频号上显示为「推荐」）、`shares ← forwardCountFmt`、`comments_count ← commentCountFmt`；四个原始数另存在记录内容里。
 - 迟到规则：只要事件属于该手机的这次尝试、采集时间在尝试期间，关键词结束或被停止后到达也入库。
 
 ### 负面巡查
 
 计划附带负面巡查时，视频号的负面帖子（规则同抖音小红书）生成 `negative_post` 工作项，由手机节点领取：先用记录里的短链经预览页复查互动数与是否失效；计划开了评论时，手机再按文案片段搜索找回原帖（作者一致、预览 `createtime` 一致才算找到），读评论后作为一次新观测写回。找不到只冷却，连续 3 轮停止巡查。
+
+## 手机端使用
+
+1. 停掉正式 Runner（窗口里 Ctrl-C，等「手机已释放」）。
+2. 在 Runner 目录执行 `node cli.mjs enable-wechat --state-dir <状态目录>`：用本机 `swiftc` 编译识字工具到 `<状态目录>/bin/starvoice-ocr`，并在 `connection.json` 记下微信校准配置。需要 Xcode 命令行工具和 Google Chrome。
+3. 照常双击启动器。窗口显示「手机已连接 · 可采 抖音、视频号」即可接两种任务；轮询带上 `platforms`，服务端据此只派可用 App 的任务。
+4. 手机微信要保持 8.0.80、关闭自动更新；升级后视频号报 `profile_version_mismatch` 暂停，抖音不受影响。
+
+## 验证（2026-11-05）
+
+- 解析：用真机识字结果做的夹具覆盖结果卡片（时长行锚点、缩略图文字排除、截断的时间标签、繁简 OCR 变体）、评论面板（表头、作者行、楼中楼缩进、「N条回复」）、转发面板「复制链接」、预览页答复、修改版 UTF-7。
+- Runner 全套 305 项、服务端单元 3459 项、模块边界 114 个模块通过；隔离 PostgreSQL 新增 7 项集成检查（按平台领取、上传与回执、迟到上传、浏览器不领视频号、负面巡查成功与未找回冷却到停止）通过。
+- 真机 + 本地服务端到端（`onstarvoice_e2e_wechat_20261105`，未连生产）：
+  - 「别克车机升级」24 小时：读 3 张卡、打开 2 张，1 条入库；1 条卡片写「22 小时」但预览页精确时间已超 24 小时，被丢弃；随后「前天」的卡片触发窗口截止。用时 85 秒。
+  - 「别克昂科威」一周、上限 3 条：3 条入库，发布时间到秒。
+  - 「别克车机升级」最热、不限时间、上限 2 条：2 条热门帖各读入 20 条评论（作者、地区、日期、点赞数、内容）。
+  - 同一手机同时启用两个 App：先跑抖音「别克壁纸」（从微信切到抖音，找到 2 条链接，70 秒），再跑视频号「别克君越」（从抖音切回微信，入库 2 条，60 秒）；结束后手机释放、输入法恢复为锤子输入法。
+- 未在真机跑过的部分：负面巡查找回（与关键词共用同一组手机动作，已有单元与集成测试）；长时间连续运行。
 
 ## 设计取舍
 

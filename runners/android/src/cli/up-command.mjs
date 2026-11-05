@@ -192,7 +192,7 @@ export async function runUp(values, {env = process.env, stdout = console.log, de
     stdout(started ? 'Appium 执行器已由启动器拉起' : 'Appium 执行器已在运行');
   }
   if (!config.simulation && config.deviceProfile) await warnWhenScreenCanSleep({adb, serial: config.deviceId, stdout});
-  const daemon = createDaemon({stateDir, config, actionTimeoutMs: config.deviceProfile ? 60000 : 10000});
+  const daemon = createDaemon({stateDir, config, actionTimeoutMs: config.deviceProfile || config.wechat ? 60000 : 10000});
   const cleanup = onSignals(() => daemon.requestStop('user_stop'));
   const watch = new AbortController();
   const watcher = watchReadiness(daemon, {stdout, sleep, signal: watch.signal, watchMs});
