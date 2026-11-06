@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
-import {comparable, findText, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
+import {comparable, findText, findWord, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
 import {mergeCommentScreens, parseCommentScreen} from '../src/device/wechat-comments-parse.mjs';
 import {encodeModifiedUtf7} from '../src/device/adb-screen.mjs';
 import {readFeedInfo} from '../src/preview/share-preview.mjs';
@@ -137,4 +137,20 @@ test('search-term icons read as Q or ° are removed from comment text; model nam
   assert.equal(cleanCommentText('广州小鹏飞行汽车Q+直升机X'), '广州小鹏飞行汽车+直升机X');
   assert.equal(cleanCommentText('奥迪Q5和25°C'), '奥迪Q5和25°C');
   assert.equal(cleanCommentText('别克服务Q至于交付'), '别克服务至于交付');
+});
+
+test('a 服务号 card on top of the results: the tabs read as one line and the 视频 tab is still found inside it', () => {
+  const screen = rows('results-service-card-20261105');
+  const region = {y0: 240, y1: 350, x1: 400};
+  assert.equal(isResultsPage(screen, 'ibuick'), true);
+  assert.equal(findText(screen, '视频', {region}).length, 0, 'the exact match that failed on 2026-11-05');
+  const [tab] = findWord(screen, '视频', {region});
+  assert.equal(tab.text, '视频');
+  // "视频 账号" spans x 202–462: the label is its first word, left of 账号 and right of 全部 (x 39–127).
+  assert.ok(tab.center.x > 202 && tab.center.x < 300, `x ${tab.center.x}`);
+  assert.equal(tab.center.y, 303);
+  // An exact row still wins, and a longer word that only contains the label is not it.
+  const plain = rows('results-latest-20261105');
+  assert.deepEqual(findWord(plain, '视频', {region}).map(row => row.center), findText(plain, '视频', {region}).map(row => row.center));
+  assert.equal(findWord([{text: '视频号 账号', x: 200, y: 280, w: 260, h: 50, conf: 1}], '视频', {region}).length, 0);
 });

@@ -46,6 +46,27 @@ export function findText(rows, wanted, {region = null, exact = true} = {}) {
   return hits.sort(byPosition).map(row => ({...row, center: center(row)}));
 }
 
+/**
+ * A short label OCR may read together with its neighbours as one line: with a 服务号 card on top of the results the tabs
+ * came back as "视频 账号" (2026-11-05, ibuick/别克远控/上汽通用客服). Exact rows win; otherwise a row whose space-separated
+ * words include the label, centred on that word's share of the row width.
+ */
+export function findWord(rows, wanted, {region = null} = {}) {
+  const exact = findText(rows, wanted, {region});
+  if (exact.length) return exact;
+  const goal = comparable(wanted);
+  const hits = [];
+  for (const row of findText(rows, wanted, {region, exact: false})) {
+    const words = String(row.text ?? '').normalize('NFKC').split(/\s+/u).filter(Boolean);
+    const index = words.findIndex(word => comparable(word) === goal);
+    if (index < 0) continue;
+    const total = words.reduce((sum, word) => sum + word.length, 0) + words.length - 1;
+    const before = words.slice(0, index).reduce((sum, word) => sum + word.length + 1, 0);
+    hits.push({...row, text: words[index], center: {x: row.x + Math.round(row.w * (before + words[index].length / 2) / total), y: row.center.y}});
+  }
+  return hits;
+}
+
 const UNIT_HOURS = {分钟: 1 / 60, 小时: 1, 天: 24, 周: 168, 星期: 168, 个月: 720, 月: 720, 年: 8760};
 /**
  * A relative or dated publication label ("8分钟前", "1 小时…", "前天", "11月3日", "2025年3月1日") as an age range in

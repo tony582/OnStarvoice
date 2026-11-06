@@ -2,7 +2,7 @@ import {DeviceError, throwIfAborted} from './bounded.mjs';
 import {pause} from './ui-wait.mjs';
 import {UNICODE_IME} from './adb-screen.mjs';
 import {ACTIVITY, MAIN_TABS, POINT, REGION, SWIPE, WECHAT_MAIN} from './wechat-profile.mjs';
-import {findText, isResultsPage, parseResultCards} from './wechat-ocr-parse.mjs';
+import {findText, findWord, isResultsPage, parseResultCards} from './wechat-ocr-parse.mjs';
 import {readCommentPanel} from './wechat-comment-reader.mjs';
 
 export const SHARE_LINK = /^https:\/\/weixin\.qq\.com\/sph\/[A-Za-z0-9_-]{4,40}$/u;
@@ -92,7 +92,7 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
       await screen.tap(submit.center.x, submit.center.y, {signal});
       await pause(1800, signal);
       let page = await resultsPage(keyword, signal);
-      const tab = findText(page.rows, '视频', {region: {y0: 240, y1: 350, x1: 400}})[0];
+      const tab = findWord(page.rows, '视频', {region: {y0: 240, y1: 350, x1: 400}})[0];
       if (!tab) throw settled('video_tab_missing', 'The 视频 results tab was not found');
       await screen.tap(tab.center.x, tab.center.y, {signal});
       await pause(1500, signal);
