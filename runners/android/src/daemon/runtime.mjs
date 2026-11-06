@@ -117,6 +117,10 @@ export class AndroidDaemon {
   }
   launch(task, lease, requestStartedAt) {
     if (!this.ready || this.active || this.taskPromise || this.blocked) return;
+    // A poll sent while the previous task ran can be answered after it finished, still naming the lease the server
+    // keeps open until the completion arrives. That attempt is done here: never start it twice (0.4.1).
+    if (stateValue(this.store, 'daemon:completion')) return;
+    if (task?.identity?.attemptId && stateValue(this.store, 'daemon:last-task')?.task?.identity?.attemptId === task.identity.attemptId) return;
     if (task?.deviceId !== this.config.deviceId || task.identity?.agentId !== this.config.agentId
       || !Number.isFinite(Date.parse(task.deadlineAt))) {
       throw new Error('assigned_device_mismatch');
