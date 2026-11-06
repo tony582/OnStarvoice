@@ -4,7 +4,7 @@ import {readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {commentButton, comparable, findText, findWord, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
 import {MORE_VIDEOS_SHIFT, POINT, feedLink} from '../src/device/wechat-profile.mjs';
-import {mergeCommentScreens, parseCommentScreen} from '../src/device/wechat-comments-parse.mjs';
+import {mergeCommentScreens, namesAgree, parseCommentScreen, textsAgree} from '../src/device/wechat-comments-parse.mjs';
 import {createAdbScreen, encodeModifiedUtf7} from '../src/device/adb-screen.mjs';
 import {readFeedInfo} from '../src/preview/share-preview.mjs';
 import {agesAscending} from '../src/device/wechat-flow.mjs';
@@ -218,4 +218,44 @@ test('a post is opened by its export id through WeChat\'s scheme entry for the m
   await assert.rejects(screen.openLink('com.tencent.mm/.X', 'weixin://a b'), {code: 'invalid_link'});
   const refusing = createAdbScreen({serial: '829d89', command: async () => ({stdout: 'Error: Activity not started'})});
   await assert.rejects(refusing.openLink('com.tencent.mm/.X', feedLink(id)), {code: 'app_launch_failed', deviceSettled: true});
+});
+
+// OnStar test 2026-11-06: four posts whose comments came back duplicated or with foreign text.
+const panel = name => parseCommentScreen(rows(name));
+const summary = comments => comments.map(item => [item.author, item.location, item.content]);
+
+test('an ad card under a comment and the 「首评」 label are not comment text; scrolled readings stay one comment', () => {
+  const first = panel('comments-ad-20261106-0'), second = panel('comments-ad-20261106-1');
+  // Before: 「XT59接入豆包了吗？首评岚图汽车官方…岚图梦想家，限时18,000元…」, kept 2–4 times.
+  assert.deepEqual(summary(first.comments), [['果然多', '浙江', 'XT59接入豆包了吗？']]);
+  assert.deepEqual(summary(second.comments), [['果然多', '浙江', 'XT59接入豆包了吗？']]);
+  assert.equal(mergeCommentScreens([first, second, second]).length, 1);
+  assert.deepEqual(summary(panel('comments-first-label-20261106-0').comments),
+    [['沪上青山Vlog', '上海', '换这款多少钱啊'], ['勇哥的视界', '山东', '同问']]);
+});
+
+test('a badge read as another character and a sticker read as 起 still merge into one comment per commenter', () => {
+  const first = panel('comments-stickers-20261106-0'), second = panel('comments-stickers-20261106-1');
+  assert.deepEqual(first.comments.map(item => item.author), ['田纳西瓜皮', '迷途懒猫心', '强']);
+  assert.deepEqual(second.comments.map(item => item.author), ['田纳西瓜皮', '迷途懒猫凶', '强']);
+  const merged = mergeCommentScreens([first, second]);
+  assert.equal(merged.length, 3, JSON.stringify(summary(merged)));
+  assert.ok(merged[2].content.endsWith('最后一地鸡毛'), '首评 is not part of the text');
+  assert.equal(namesAgree('迷途懒猫心', '迷途懒猫凶'), true);
+  assert.equal(namesAgree('迷途懒猫', '迷途懒猫心'), true);
+  assert.equal(namesAgree('张三', '张四'), false, 'two-character names must match exactly');
+  assert.equal(namesAgree('迷途懒猫', '迷途小猫咪'), false);
+  assert.equal(textsAgree('安吉星也要付钱的，一天一块钱', '安吉星“也要付钱的，一天一块钱起'), true);
+  assert.equal(textsAgree('没见过凯迪拉克打过广告，人家钱都放安全上了', '没见过凯迪拉克打过广告的，人家钱都放安全上了'), true);
+  assert.equal(textsAgree('好看', '好看吗'), false);
+  assert.equal(textsAgree('同问', '同问'), true);
+});
+
+test('an IP region run into the name is split off; a missed 「评论 N」 title does not lose the screen', () => {
+  const first = panel('comments-regions-20261106-0');
+  assert.equal(first.headerCount, null, 'the title was not read on this screen');
+  assert.deepEqual(summary(first.comments), [['哆啦A梦快乐豆', '河南', '[图片]'], ['哟改名字了997200', '四川', '界个欠费的是哪个车起'],
+    ['凌晨三点', '山东', '开朋友别克误碰过，还没挂就接通了，慌忙道歉说点错了']]);
+  const merged = mergeCommentScreens([first, panel('comments-regions-20261106-1')]);
+  assert.deepEqual(merged.map(item => item.author), ['哆啦A梦快乐豆', '哟改名字了997200', '凌晨三点', '里程']);
 });

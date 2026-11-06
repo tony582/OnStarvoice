@@ -1,4 +1,5 @@
-import {batchReceipts, postBatchInput, postLineage, receiptView, saveReceipt, wechatSyncBody} from './posts.js';
+import {batchReceipts, knownWechatComments, postBatchInput, postLineage, receiptView, reuseKnownCommentIds, saveReceipt,
+  wechatSyncBody} from './posts.js';
 import {bindPatrolResult} from './patrol.js';
 
 /**
@@ -27,6 +28,11 @@ export async function ingestPosts({transaction, persist}, principal, body) {
     // a post that arrives after the keyword moved on is still stored, without that binding.
     const {externalId, body: syncBody} = wechatSyncBody(event, {keyword: lineage.keyword, taskId: event.taskId,
       attemptId: lineage.current ? event.attemptId : '', requestHash: lineage.current ? event.requestHash : ''});
+    // A post seen before: comments read again through OCR keep their stored ids instead of becoming near-duplicates.
+    if (syncBody.payload.commentsCleanedItems.length) {
+      const known = await transaction(tx => knownWechatComments(tx, principal.tenantId, externalId));
+      if (known.length) syncBody.payload.commentsCleanedItems = reuseKnownCommentIds(syncBody.payload.commentsCleanedItems, known);
+    }
     let result;
     try {
       ({result} = await persist(syncBody, {tenantId: principal.tenantId, authCode,

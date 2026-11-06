@@ -136,6 +136,27 @@ test('WeChat Channels on a shared phone: claim by platform, post upload, receipt
     await f.complete(claim.task);
   });
 
+  await t.test('a post captured again keeps its comment ids although OCR read the comments a little differently', async st => {
+    const f = await fixture(st);
+    await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星', '安吉星收费']});
+    const first = await f.poll({platforms: ['wechat_channels']});
+    const reading = (author, content) => ({author, location: '上海', timeLabel: '1天前', content, likeCount: 0, reply: false, parentIndex: null});
+    const preview = {...postEvent(first.task).preview, nickname: '尼克杨开凯迪', createtime: Math.floor(Date.now() / 1000) - 7200};
+    await f.service.posts(f.principal, {uploadBatchId: randomUUID(), events: [postEvent(first.task, {preview,
+      comments: {status: 'captured', headerCount: 2, items: [reading('迷途懒猫心', '没有一滴油是白喝起'), reading('田纳西瓜皮', '安吉星也要付钱的，一天一块钱C')]}})]}, persist);
+    const [stored] = await query(`SELECT payload->'commentsCleanedItems' AS items FROM records WHERE tenant_id=$1`, [f.tenantId]);
+    await f.complete(first.task);
+    // Next keyword, the same post: the badge after the name and the sticker at the end were read differently.
+    const second = await f.poll({platforms: ['wechat_channels']});
+    await f.service.posts(f.principal, {uploadBatchId: randomUUID(), events: [postEvent(second.task, {preview,
+      comments: {status: 'captured', headerCount: 3, items: [reading('迷途懒猫凶', '没有一滴油是白喝起'),
+        reading('田纳西瓜皮', '安吉星“也要付钱的，一天一块钱起'), reading('新来的', '安吉星好用')]}})]}, persist);
+    const [again] = await query(`SELECT payload->'commentsCleanedItems' AS items FROM records WHERE tenant_id=$1`, [f.tenantId]);
+    assert.deepEqual(again.items.slice(0, 2).map(item => item.commentId), stored.items.map(item => item.commentId));
+    assert.ok(!stored.items.some(item => item.commentId === again.items[2].commentId), 'the new comment has its own id');
+    await f.complete(second.task);
+  });
+
   await t.test('a post arriving after the keyword moved on is stored without the attempt binding; foreign attempts are refused', async st => {
     const f = await fixture(st);
     await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['君越车机']});

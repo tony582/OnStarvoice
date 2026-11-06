@@ -110,6 +110,74 @@ export function wechatComments(externalId, comments, capturedAt) {
   });
 }
 
+// Comment readings come from OCR: the same comment read on another day can differ by a badge glyph after the name,
+// a sticker read as a character or a dropped particle (OnStar test 2026-11-06). The rules match the phone's merge
+// of scrolled screens (runners/android/src/device/wechat-comments-parse.mjs).
+const bare = value => comparable(value).replace(/[^\p{L}\p{N}]/gu, '');
+function dice(a, b) {
+  if (a.length < 3 || b.length < 3) return a === b ? 1 : 0;
+  const pairs = text => { const map = new Map(); for (let i = 0; i < text.length - 1; i++) map.set(text.slice(i, i + 2), (map.get(text.slice(i, i + 2)) ?? 0) + 1); return map; };
+  const one = pairs(a), two = pairs(b);
+  let shared = 0;
+  for (const [pair, n] of one) shared += Math.min(n, two.get(pair) ?? 0);
+  return (2 * shared) / (a.length - 1 + b.length - 1);
+}
+export function commentNamesAgree(a, b) {
+  const x = bare(a), y = bare(b);
+  if (x === y) return Boolean(x);
+  let prefix = 0;
+  while (prefix < x.length && prefix < y.length && x[prefix] === y[prefix]) prefix++;
+  const shorter = Math.min(x.length, y.length);
+  return shorter >= 3 && Math.abs(x.length - y.length) <= 1 && prefix >= shorter - 1;
+}
+export function commentTextsAgree(a, b) {
+  const x = bare(a), y = bare(b);
+  if (x === y) return true;
+  if (!x || !y) return false;
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  if (short.length >= 4 && long.startsWith(short.slice(0, -1))) return true;
+  return dice(x, y) >= 0.8;
+}
+
+/**
+ * A re-captured post keeps the ids of the comments already stored for it: each new reading that agrees with a stored
+ * comment (one to one; exact ids first) takes that id, so the comment is updated instead of stored again. Replies follow
+ * their parent's stored id.
+ */
+export function reuseKnownCommentIds(items, known) {
+  const used = new Set(), renamed = new Map();
+  const ids = new Set(known.map(row => row.commentId));
+  for (const item of items) if (ids.has(item.commentId)) used.add(item.commentId);
+  const mapped = items.map(item => {
+    if (used.has(item.commentId) && ids.has(item.commentId)) return item;
+    const match = known.find(row => !used.has(row.commentId) && commentNamesAgree(row.authorName, item.authorName)
+      && commentTextsAgree(row.content, item.content));
+    if (!match) return item;
+    used.add(match.commentId);
+    renamed.set(item.commentId, match.commentId);
+    return {...item, commentId: match.commentId};
+  });
+  return mapped.map(item => renamed.has(item.parentCommentId) ? {...item, parentCommentId: renamed.get(item.parentCommentId)} : item);
+}
+
+/** Comments already known for a Channels post: stored rows and the last capture's list (its rows may still be queued). */
+export async function knownWechatComments(tx, tenantId, externalId) {
+  const rows = await tx.queryAll(`SELECT c.external_comment_id AS "commentId", c.author_name AS "authorName", c.content
+    FROM record_comments c JOIN records r ON r.id = c.record_id AND r.tenant_id = c.tenant_id
+    WHERE r.tenant_id = $1 AND r.platform = 'wechat_channels' AND r.external_id = $2 AND c.external_comment_id LIKE 'wxcc_%'
+    ORDER BY c.floor_index, c.created_at LIMIT 2000`, [tenantId, externalId]);
+  const latest = await tx.queryOne(`SELECT payload->'commentsCleanedItems' AS items FROM records
+    WHERE tenant_id = $1 AND platform = 'wechat_channels' AND external_id = $2`, [tenantId, externalId]);
+  const seen = new Set(rows.map(row => row.commentId));
+  for (const item of Array.isArray(latest?.items) ? latest.items : []) {
+    if (typeof item?.commentId === 'string' && item.commentId.startsWith('wxcc_') && !seen.has(item.commentId)) {
+      seen.add(item.commentId);
+      rows.push({commentId: item.commentId, authorName: String(item.authorName ?? ''), content: String(item.content ?? '')});
+    }
+  }
+  return rows;
+}
+
 /** The /api/sync body the browser would send for this post: detail values, the server's keyword and lineage. */
 export function wechatSyncBody(event, {keyword, taskId, attemptId, requestHash}) {
   const externalId = wechatExternalId(event.preview.createtime, event.preview.nickname);
