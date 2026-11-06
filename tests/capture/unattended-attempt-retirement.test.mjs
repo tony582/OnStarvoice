@@ -74,6 +74,7 @@ function createRunner({
     retiredUnattendedAttemptKey: "",
     UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS: flushMs,
   });
+  context.sendUnattendedRuntimeMessage = message => context.chrome.runtime.sendMessage(message);
   vm.runInContext(
     `${retirementSource}\nthis.__handle = handleUnattendedRunRequestStorageChange;\n` +
       `this.__retire = retireSupersededUnattendedAttempt;`,
@@ -321,4 +322,57 @@ test("retirement cannot claim a flush while durable checkpoint reports remain", 
   }
   assert.equal(runner.calls.messages.at(-1).flushed, true);
   assert.equal(runner.calls.messages.at(-1).pendingUploads, 0);
+});
+
+test('a runner without uploads automatically resends a failed retirement receipt under its original identity', async () => {
+  const runner = createRunner({queue: null, flushMs: 10});
+  const realTimeout = setTimeout;
+  runner.context.setTimeout = (handler, ms) => realTimeout(handler, [500, 2000].includes(ms) ? 0 : ms);
+  const scopes = [];
+  runner.context.flushPendingUnattendedCheckpointReports = async scope => {scopes.push(scope); return {ok: true, retained: 0};};
+  let sends = 0;
+  runner.context.chrome.runtime.sendMessage = async message => {
+    runner.calls.messages.push(JSON.parse(JSON.stringify(message)));
+    if (++sends <= 3) throw new Error('worker transport unavailable');
+    return {ok: true};
+  };
+  await runner.context.__retire({requestId: 'request-r', attemptId: 'attempt-1'});
+  assert.equal(sends, 3);
+  runner.context.activeUnattendedRunRequestId = 'successor';
+  runner.context.activeUnattendedRunAttemptId = 'attempt-2';
+  let successorTouched = false;
+  runner.context.activeUnattendedStreamingSyncQueue = {retire() {successorTouched = true;}};
+  for (let i = 0; i < 30 && sends === 3; i++) await new Promise(resolve => realTimeout(resolve, 5));
+  assert.equal(sends, 4, 'retiredKey must not suppress the automatic receipt retry');
+  assert.equal(successorTouched, false);
+  assert.ok(scopes.every(scope => scope.requestId === 'request-r' && scope.attemptId === 'attempt-1'));
+  assert.ok(runner.calls.messages.every(message => message.flushed === true && message.pendingUploads === 0));
+  assert.ok(runner.calls.messages.every(message => message.requestId === undefined && message.attemptId === undefined), 'background must continue deriving identity from the sender');
+});
+
+
+test('a hung retirement receipt is bounded and a late acknowledgment cannot restart the retired pipeline', async () => {
+  const runner = createRunner({queue: null, flushMs: 10});
+  const realTimeout = setTimeout;
+  runner.context.setTimeout = (handler, ms) => realTimeout(handler, [500, 2000].includes(ms) ? 0 : ms);
+  runner.context.UNATTENDED_RUNTIME_MESSAGE_TIMEOUT_MS = 2;
+  const lateAcks = [];
+  let sends = 0;
+  runner.context.chrome.runtime.sendMessage = async message => {
+    runner.calls.messages.push(JSON.parse(JSON.stringify(message)));
+    if (++sends <= 3) return await new Promise(resolve => lateAcks.push(resolve));
+    return {ok: true};
+  };
+  vm.runInContext(readSection(sidebarSource, 'async function sendUnattendedRuntimeMessage(',
+    'async function reportUnattendedTerminalRun('), runner.context);
+  await runner.context.__retire({requestId: 'request-r', attemptId: 'attempt-1'});
+  assert.equal(sends, 3);
+  for (let i = 0; i < 30 && sends === 3; i++) await new Promise(resolve => realTimeout(resolve, 5));
+  assert.equal(sends, 4);
+  runner.context.activeUnattendedRunRequestId = 'new-request';
+  runner.context.activeUnattendedRunAttemptId = 'new-attempt';
+  lateAcks.forEach(resolve => resolve({ok: true}));
+  await new Promise(resolve => realTimeout(resolve, 30));
+  assert.equal(sends, 4); assert.equal(runner.calls.heartbeatStops, 1);
+  assert.equal(runner.context.activeUnattendedRunRequestId, 'new-request');
 });

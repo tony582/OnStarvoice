@@ -62,6 +62,7 @@ function createStorage(initial = {}) {
 function createFinalFlushRecoveryHarness({
   initial = {},
   flushResults = [],
+  flushReports = null,
 } = {}) {
   const storage = createStorage(initial);
   const timers = new Map();
@@ -103,8 +104,9 @@ function createFinalFlushRecoveryHarness({
     },
     chrome: {storage: {local: storage}},
     async sleep() {},
-    async flushPendingUnattendedCheckpointReports() {
+    async flushPendingUnattendedCheckpointReports(options) {
       flushCallCount += 1;
+      if (flushReports) return await flushReports(options, storage);
       return queuedFlushResults.length > 0
         ? queuedFlushResults.shift()
         : {ok: false, retained: 1, reason: "transport_error"};
@@ -425,7 +427,7 @@ async function runDirectReport({response, durableCheckpoint = true} = {}) {
   };
   const baseReporter = sourceSection(
     "async function reportUnattendedKeywordRun(",
-    "let unattendedCheckpointOutboxFlushPromise",
+    "const unattendedCheckpointOutboxFlushPromisesByScope",
   );
   runInNewContext(
     `${baseReporter}\nglobalThis.__reportUnattendedKeywordRun = reportUnattendedKeywordRun;`,
@@ -1058,7 +1060,7 @@ test("only settled checkpoints use durable acknowledgement semantics", () => {
   );
   const baseReporter = sourceSection(
     "async function reportUnattendedKeywordRun(",
-    "let unattendedCheckpointOutboxFlushPromise",
+    "const unattendedCheckpointOutboxFlushPromisesByScope",
   );
 
   assert.match(checkpointReporter, /durableCheckpoint:\s*true/u);
@@ -1075,4 +1077,84 @@ test("only settled checkpoints use durable acknowledgement semantics", () => {
     /accepted\s*&&\s*durableCheckpoint[\s\S]*discardUnattendedCheckpointReports/u,
     "an accepted direct report must not delete a newer queued checkpoint",
   );
+});
+
+test('scoped checkpoint flush drains only its exact request and attempt', async () => {
+  const storage = createStorage();
+  for (const [requestId, attemptId] of [['R', 'old'], ['R', 'new'], ['other', 'old']]) {
+    await enqueueUnattendedCheckpointReport({requestId, attemptId, patch: checkpointPatch(1)}, {storage});
+  }
+  const messages = [];
+  const result = await flushUnattendedCheckpointReportOutbox({requestId: 'R', attemptId: 'new',
+    send: async message => {messages.push(message); return {ok: true, accepted: true};}}, {storage});
+  assert.equal(result.retained, 0, 'unrelated attempts cannot block this attempt closure');
+  assert.deepEqual(messages.map(m => [m.requestId, m.attemptId]), [['R', 'new']]);
+  assert.deepEqual(storedEntries(storage).map(e => [e.requestId, e.attemptId]).sort(), [['R', 'old'], ['other', 'old']]);
+});
+
+test('scoped flush preserves 503 evidence and exact revision after an older acknowledgment', async () => {
+  const storage = createStorage();
+  for (const requestId of ['R', 'other']) {
+    await enqueueUnattendedCheckpointReport({requestId, attemptId: 'A', patch: checkpointPatch(1)}, {storage});
+  }
+  let sends = 0;
+  const failed = await flushUnattendedCheckpointReportOutbox({requestId: 'R', attemptId: 'A',
+    send: async () => {sends++; throw new Error('HTTP 503');}}, {storage});
+  assert.equal(failed.retained, 1); assert.equal(sends, 1); assert.equal(storedEntries(storage).length, 2);
+  const raced = await flushUnattendedCheckpointReportOutbox({requestId: 'R', attemptId: 'A',
+    send: async () => {
+      await enqueueUnattendedCheckpointReport({requestId: 'R', attemptId: 'A', patch: checkpointPatch(2)}, {storage});
+      return {ok: true, accepted: true};
+    }}, {storage});
+  assert.equal(raced.retained, 1);
+  assert.equal(storedEntries(storage).find(e => e.requestId === 'R').patch.progressSeq, 2);
+  assert.equal(storedEntries(storage).find(e => e.requestId === 'other').patch.progressSeq, 1);
+});
+
+test('an incomplete scope is rejected instead of falling back to a global flush', async () => {
+  const storage = createStorage();
+  await enqueueUnattendedCheckpointReport({requestId: 'R', attemptId: 'A', patch: checkpointPatch(1)}, {storage});
+  let sends = 0;
+  const result = await flushUnattendedCheckpointReportOutbox({requestId: 'R', send: async () => {sends++;}}, {storage});
+  assert.equal(result.reason, 'invalid_attempt_scope'); assert.equal(sends, 0); assert.equal(storedEntries(storage).length, 1);
+});
+
+test('sidebar checkpoint single-flight isolates different attempts and the global startup sweep', async () => {
+  const pending = [];
+  const context = {Map, console, unattendedCheckpointOutboxFlushPromise: null,
+    unattendedCheckpointOutboxFlushPromisesByScope: new Map(), sendUnattendedRuntimeMessage() {},
+    flushUnattendedCheckpointReportOutbox: options => new Promise(resolve => pending.push({options, resolve}))};
+  runInNewContext(sourceSection('function flushPendingUnattendedCheckpointReports(',
+    'function buildUnattendedLocalClosureReadyStorageKey(') + '\nthis.flush = flushPendingUnattendedCheckpointReports;', context);
+  const a = context.flush({requestId: 'R', attemptId: 'A'});
+  const sameA = context.flush({requestId: 'R', attemptId: 'A', quiet: true});
+  const b = context.flush({requestId: 'R', attemptId: 'B'});
+  const global = context.flush();
+  assert.equal(a, sameA); assert.equal(pending.length, 3);
+  assert.deepEqual(pending.map(p => [p.options.requestId || '', p.options.attemptId || '']), [['R', 'A'], ['R', 'B'], ['', '']]);
+  pending[0].resolve({ok: false, retained: 1}); pending[1].resolve({ok: true, retained: 0}); pending[2].resolve({ok: false, retained: 2});
+  assert.equal((await a).retained, 1); assert.equal((await b).retained, 0); assert.equal((await global).retained, 2);
+});
+
+
+test('final closure drains its own real outbox while another request and successor attempt remain unacknowledged', async () => {
+  const request = {id: 'R', attemptId: 'old', status: 'failed'};
+  const sent = [];
+  const harness = createFinalFlushRecoveryHarness({
+    initial: {[KEYWORD_RUN_REQUEST_STORAGE_KEY]: request},
+    flushReports: (scope, storage) => flushUnattendedCheckpointReportOutbox({...scope,
+      send: async message => {
+        sent.push([message.requestId, message.attemptId]);
+        assert.equal(message.requestId, 'R'); assert.equal(message.attemptId, 'old');
+        return {ok: true, accepted: false, reason: 'terminal'};
+      }}, {storage}),
+  });
+  for (const [requestId, attemptId] of [['other', 'A'], ['R', 'new'], ['R', 'old']]) {
+    await enqueueUnattendedCheckpointReport({requestId, attemptId, patch: checkpointPatch(1)}, {storage: harness.storage});
+  }
+  const result = await harness.api.finalizeUnattendedLocalClosureAfterFlush('R', 'old');
+  assert.equal(result.ok, true); assert.deepEqual(sent, [['R', 'old']]);
+  assert.equal(harness.storage.data[`${UNATTENDED_LOCAL_CLOSURE_READY_STORAGE_PREFIX}R.old`]?.attemptId, 'old');
+  assert.deepEqual(storedEntries(harness.storage).map(e => [e.requestId, e.attemptId]).sort(), [['R', 'new'], ['other', 'A']]);
+  assert.equal(harness.timers.size, 0);
 });

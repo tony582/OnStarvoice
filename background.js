@@ -9458,8 +9458,9 @@ async function inspectUnattendedCheckpointOutboxAttempt(
       !entryAttemptId ||
       !entryId ||
       entryId !== `${entryRequestId}:${entryAttemptId}` ||
+      typeof value.revision !== 'string' ||
       !revision ||
-      key !== `${UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX}${revision}` ||
+      !key.slice(UNATTENDED_CHECKPOINT_OUTBOX_STORAGE_PREFIX.length).trim() ||
       !patch ||
       !patch.checkpoint ||
       typeof patch.checkpoint !== 'object' ||
@@ -9469,6 +9470,9 @@ async function inspectUnattendedCheckpointOutboxAttempt(
       // Treat it as unknown instead of manufacturing a zero-pending result.
       return {known: false, pendingCount: null, reason: 'outbox_identity_unknown'};
     }
+    // The outbox updates an attempt in place to avoid needing a second storage
+    // slot at quota. Its key retains the first revision while the value gets a
+    // new revision; scope by the validated request/attempt identity, not key age.
     if (
       entryRequestId === normalizedRequestId &&
       (anyAttempt === true || entryAttemptId === normalizedAttemptId)
@@ -16131,6 +16135,24 @@ async function claimUnattendedKeywordRun({
 }
 
 async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch = {}} = {}) {
+  const checkpointReplay = Boolean(
+    patch && typeof patch === 'object' && !Array.isArray(patch) &&
+      patch.checkpoint && typeof patch.checkpoint === 'object' &&
+      !Array.isArray(patch.checkpoint),
+  );
+  if (requestId && attemptId && checkpointReplay) {
+    const current = await readUnattendedKeywordRunRequest();
+    if (
+      current?.id === requestId && current.attemptId === attemptId &&
+      isTerminalUnattendedRunStatus(current.status)
+    ) {
+      // A durable terminal attempt absorbs this exact checkpoint replay. This
+      // read-only rejection must not wait behind slow browser cleanup holding
+      // the mutation queue: the runner needs it to drain its outbox. It is not
+      // a closure receipt and cannot release resources or update a newer run.
+      return {accepted: false, reason: 'terminal', data: current};
+    }
+  }
   const result = await runUnattendedRunMutation(async () => {
     const request = await readUnattendedKeywordRunRequest();
     if (!request || !requestId || request.id !== requestId) {
@@ -16398,14 +16420,18 @@ async function updateUnattendedKeywordRun({requestId = '', attemptId = '', patch
         delayMs: 250,
       });
     }
-    const terminalCleanup = await cleanupTerminalUnattendedRuntime(
-      result.data,
-      [result.previousRunnerTabId, result.data?.progress?.runnerTabId],
-    );
-    return {
-      ...result,
-      data: terminalCleanup.request || result.data,
-    };
+    // The request and ledger are already durable. Acknowledging that write
+    // must not depend on browser cancellation/cleanup, which can exceed the
+    // runner's message deadline and cause its checkpoint to replay forever.
+    // Exact resource ownership and the durable cleanup retry remain unchanged.
+    setTimeout(() => {
+      void cleanupTerminalUnattendedRuntime(
+        result.data,
+        [result.previousRunnerTabId, result.data?.progress?.runnerTabId],
+      ).catch((error) => {
+        console.warn('[Background] terminal unattended cleanup deferred:', error);
+      });
+    }, 0);
   }
   return result;
 }

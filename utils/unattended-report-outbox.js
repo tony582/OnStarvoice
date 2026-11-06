@@ -410,17 +410,25 @@ export async function discardUnattendedCheckpointReports(
 }
 
 export async function flushUnattendedCheckpointReportOutbox(
-  {send, limit = MAX_OUTBOX_ENTRIES} = {},
+  {send, limit = MAX_OUTBOX_ENTRIES, requestId = "", attemptId = ""} = {},
   {storage = null} = {},
 ) {
   if (typeof send !== "function") {
     throw new TypeError("outbox send must be a function");
   }
+  const scopedRequestId = normalizeIdentity(requestId);
+  const scopedAttemptId = normalizeIdentity(attemptId);
+  if (Boolean(scopedRequestId) !== Boolean(scopedAttemptId)) {
+    return {ok: false, reason: "invalid_attempt_scope", delivered: 0, discarded: 0, retained: null};
+  }
+  const inScope = entry => !scopedRequestId ||
+    (entry.requestId === scopedRequestId && entry.attemptId === scopedAttemptId);
   const area = resolveStorageArea(storage);
+  const retainedCount = async () => (await readEntries(area)).filter(inScope).length;
   const entries = (await runStorageMutation(
     area,
     () => pruneEntries(area),
-  )).sort((left, right) => {
+  )).filter(inScope).sort((left, right) => {
     const timeDifference = timestamp(left) - timestamp(right);
     return timeDifference || compareNewest(left, right);
   });
@@ -442,7 +450,7 @@ export async function flushUnattendedCheckpointReportOutbox(
         reason: "transport_error",
         delivered,
         discarded,
-        retained: (await readEntries(area)).length,
+        retained: await retainedCount(),
         error,
       };
     }
@@ -467,7 +475,7 @@ export async function flushUnattendedCheckpointReportOutbox(
       reason: reason || (explicitRejection ? "rejected" : "no_response"),
       delivered,
       discarded,
-      retained: (await readEntries(area)).length,
+      retained: await retainedCount(),
     };
   }
   return {
@@ -475,7 +483,7 @@ export async function flushUnattendedCheckpointReportOutbox(
     reason: "drained",
     delivered,
     discarded,
-    retained: (await readEntries(area)).length,
+    retained: await retainedCount(),
   };
 }
 

@@ -3,12 +3,25 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.30',
+  latestVersion: '0.4.31',
   minSupportedVersion: '0.3.51',
   releaseDate: '2026-11-06',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.30-20261106.zip',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.31-20261106.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.31',
+      releaseDate: '2026-11-06',
+      releaseNotes: [{
+        tag: '任务收尾',
+        notes: [
+          {title: '终态上报及时确认', desc: '任务终态和检查点可靠保存后及时返回确认，页面停止与资源清理继续独立核验，减少清理耗时导致的重复补报；确认上报不代表旧页面已安全停止。'},
+          {title: '补报按任务轮次隔离', desc: '各任务及执行轮次分别补报，避免其它任务遗留队列阻塞当前任务收尾；尚未确认的数据继续保留。'},
+          {title: '退役回执自动重试', desc: '旧执行轮次退出时，回执遇到临时通信失败会自动重试；只有收到明确确认才结束补报，不因等待过久丢弃数据。'},
+          {title: '合法队列校验', desc: '正确识别连续更新的合法补报记录，减少误判未知状态；身份不明或格式异常的记录仍阻止自动放行。以上修复需更新 Extension 至 0.4.31，旧节点不会仅因服务器更新而获得修复。请在节点空闲且结果安全保存后升级，在原目录替换扩展并重载，不要在同一浏览器并装第二份扩展；无法确认已停止的旧页面仍需人工核验。'},
+        ],
+      }],
+    },
     {
       version: '0.4.30',
       releaseDate: '2026-11-06',

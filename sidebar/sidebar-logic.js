@@ -3223,18 +3223,24 @@ async function retireSupersededUnattendedAttempt({
   let pendingUploads = 0;
   const sendReceipt = async (receipt) => {
     let deliveredReceipt = receipt;
+    let retryScheduled = false;
+    const scheduleReceiptRetry = () => {
+      if (retryScheduled) return;
+      retryScheduled = true;
+      const retry = setTimeout(() => {
+        void sendReceipt(receipt).catch(error => console.warn(
+          "[Sidebar] Retired receipt remains pending:", error));
+      }, UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS);
+      retry?.unref?.();
+    };
     if (receipt.flushed === true) {
       // Streaming drain does not prove the durable checkpoint outbox is empty.
-      const checkpointFlush = await flushPendingUnattendedCheckpointReports({quiet: true});
+      const checkpointFlush = await flushPendingUnattendedCheckpointReports({requestId, attemptId, quiet: true});
       if (checkpointFlush?.ok !== true || Number(checkpointFlush?.retained || 0) !== 0) {
         deliveredReceipt = {...receipt, flushed: false, flushing: true,
           pendingUploads: Math.max(Number(receipt.pendingUploads) || 0,
             Number(checkpointFlush?.retained) || 1)};
-        const retry = setTimeout(() => {
-          void sendReceipt(receipt).catch(error => console.warn(
-            "[Sidebar] Retired checkpoint flush remains pending:", error));
-        }, UNATTENDED_ATTEMPT_RETIREMENT_FLUSH_MS);
-        retry?.unref?.();
+        scheduleReceiptRetry();
       }
     }
     for (const delayMs of [0, 500, 2000]) {
@@ -3242,7 +3248,7 @@ async function retireSupersededUnattendedAttempt({
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
       try {
-        const response = await chrome.runtime.sendMessage({
+        const response = await sendUnattendedRuntimeMessage({
           type: "onstarvoice:unattended-attempt-retired",
           reason,
           heartbeatStopped: true,
@@ -3253,6 +3259,10 @@ async function retireSupersededUnattendedAttempt({
         console.warn("[Sidebar] Unattended retirement receipt not delivered:", error);
       }
     }
+    // With no upload queue there is no finishFlush observer to retry a lost
+    // receipt. Keep this old attempt's closure and payload, even if the page
+    // has activated a successor by the time the transport becomes available.
+    if (!queue?.enabled || !beforeStats) scheduleReceiptRetry();
     return false;
   };
   // 3. 等采集生产者退出后冲刷全部已入队结果。心跳已停、
@@ -15760,29 +15770,36 @@ async function reportUnattendedKeywordRun(
   }
 }
 
-let unattendedCheckpointOutboxFlushPromise = null;
+const unattendedCheckpointOutboxFlushPromisesByScope = new Map();
 
-function flushPendingUnattendedCheckpointReports({quiet = false} = {}) {
-  if (unattendedCheckpointOutboxFlushPromise) {
-    return unattendedCheckpointOutboxFlushPromise;
-  }
-  unattendedCheckpointOutboxFlushPromise =
-    flushUnattendedCheckpointReportOutbox({
-      send: sendUnattendedRuntimeMessage,
+function flushPendingUnattendedCheckpointReports({
+  quiet = false,
+  requestId = "",
+  attemptId = "",
+} = {}) {
+  const normalizedRequestId = String(requestId || "").trim().slice(0, 160);
+  const normalizedAttemptId = String(attemptId || "").trim().slice(0, 160);
+  // A global startup sweep and an exact attempt drain may overlap. They must
+  // never share the other's retained count; outbox deletion remains revision-fenced.
+  const scopeKey = JSON.stringify([normalizedRequestId, normalizedAttemptId]);
+  const existing = unattendedCheckpointOutboxFlushPromisesByScope.get(scopeKey);
+  if (existing) return existing;
+  const inFlight = flushUnattendedCheckpointReportOutbox({
+    send: sendUnattendedRuntimeMessage,
+    requestId: normalizedRequestId,
+    attemptId: normalizedAttemptId,
+  })
+    .catch((error) => {
+      if (!quiet) console.warn("[Sidebar] Flush unattended checkpoint outbox failed:", error);
+      return {ok: false, reason: "flush_error", error};
     })
-      .catch((error) => {
-        if (!quiet) {
-          console.warn(
-            "[Sidebar] Flush unattended checkpoint outbox failed:",
-            error,
-          );
-        }
-        return {ok: false, reason: "flush_error", error};
-      })
-      .finally(() => {
-        unattendedCheckpointOutboxFlushPromise = null;
-      });
-  return unattendedCheckpointOutboxFlushPromise;
+    .finally(() => {
+      if (unattendedCheckpointOutboxFlushPromisesByScope.get(scopeKey) === inFlight) {
+        unattendedCheckpointOutboxFlushPromisesByScope.delete(scopeKey);
+      }
+    });
+  unattendedCheckpointOutboxFlushPromisesByScope.set(scopeKey, inFlight);
+  return inFlight;
 }
 
 function buildUnattendedLocalClosureReadyStorageKey(
@@ -16111,7 +16128,9 @@ async function finalizeUnattendedLocalClosureAfterFlush(
       let flushResult = null;
       for (const delayMs of UNATTENDED_FINAL_FLUSH_RETRY_DELAYS_MS) {
         if (delayMs > 0) await sleep(delayMs);
-        flushResult = await flushPendingUnattendedCheckpointReports({quiet: true});
+        flushResult = await flushPendingUnattendedCheckpointReports({
+          requestId: normalizedRequestId, attemptId: normalizedAttemptId, quiet: true,
+        });
         if (
           flushResult?.ok === true &&
           Number(flushResult?.retained || 0) === 0

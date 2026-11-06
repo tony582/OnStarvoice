@@ -106,8 +106,8 @@ test('extension update manifest matches the packaged source version', () => {
     aboutHtml,
     new RegExp(`扩展 v${manifest.version.replaceAll('.', '\\.')}[^<]*<span class="date">${EXTENSION_UPDATE_MANIFEST.releaseDate}<\\/span><span class="pill">最新<\\/span>`, 'u'),
   );
-  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 16).map(release => release.version),
-    ['0.4.29', '0.4.28', '0.4.27', '0.4.26', '0.4.25', '0.4.24', '0.4.23', '0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
+  assert.deepEqual(EXTENSION_UPDATE_MANIFEST.releases.slice(1, 17).map(release => release.version),
+    ['0.4.30', '0.4.29', '0.4.28', '0.4.27', '0.4.26', '0.4.25', '0.4.24', '0.4.23', '0.4.22', '0.4.21', '0.4.20', '0.4.19', '0.4.18', '0.4.17', '0.4.15', '0.4.14']);
   assert.match(JSON.stringify(EXTENSION_UPDATE_MANIFEST.releases.find(release => release.version === '0.4.8')?.releaseNotes), /半年内[\s\S]*不限时间[\s\S]*月历[\s\S]*邮件/u);
   assert.match(aboutHtml, /扩展 v0\.4\.7<span class="date">2026-09-08<\/span><\/h3>/u);
   assert.equal((aboutHtml.match(/<span class="pill">最新<\/span>/gu) || []).length, 1);
@@ -258,4 +258,28 @@ test('0.4.22 keeps its dedicated-window cleanup notes', () => {
   }
   const about = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.22<'), aboutHtml.indexOf('扩展 v0.4.21<'));
   assert.match(about, /身份可核验[\s\S]*jingxuan[\s\S]*Android Runner 0\.2\.6/u);
+});
+
+test('0.4.31 describes client finalization fixes without promising field recovery or weakening stop safety', () => {
+  assert.equal(EXTENSION_UPDATE_MANIFEST.minSupportedVersion, '0.3.51');
+  assert.equal(EXTENSION_UPDATE_MANIFEST.downloadUrl,
+    'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.31-20261106.zip');
+  const release = EXTENSION_UPDATE_MANIFEST.releases.find(item => item.version === '0.4.31');
+  assert.equal(release?.releaseDate, '2026-11-06');
+  const notes = JSON.stringify(release.releaseNotes);
+  const about = aboutHtml.slice(aboutHtml.indexOf('扩展 v0.4.31<'), aboutHtml.indexOf('扩展 v0.4.30<'));
+  for (const phrase of [
+    '终态上报及时确认', '补报按任务轮次隔离', '退役回执自动重试', '合法队列校验',
+    '可靠保存后及时返回确认', '确认上报不代表旧页面已安全停止',
+    '尚未确认的数据继续保留', '只有收到明确确认才结束补报', '不因等待过久丢弃数据',
+    '身份不明或格式异常的记录仍阻止自动放行',
+    '需更新 Extension 至 0.4.31', '旧节点不会仅因服务器更新而获得修复',
+    '节点空闲且结果安全保存后升级', '在原目录替换扩展并重载',
+    '不要在同一浏览器并装第二份扩展', '无法确认已停止的旧页面仍需人工核验',
+  ]) {
+    assert.ok(notes.includes(phrase), `update manifest: ${phrase}`);
+    assert.ok(about.includes(phrase), `about page: ${phrase}`);
+  }
+  assert.doesNotMatch(notes, /现场已恢复|所有失败.*解决|全部错误.*解决|自动刷新|按时间自动放行/u);
+  assert.doesNotMatch(about, /现场已恢复|所有失败.*解决|全部错误.*解决|自动刷新|按时间自动放行/u);
 });
