@@ -811,7 +811,10 @@ test('stop-fence closure asks the source node, releases only on proof or operato
     const rotated = await f.check(old.id);
     assert.equal(rotated.lastOfferedAt, null);
     // The node stays away for 40 minutes.
-    await f.patchCheck(old.id, {issuedAt: past(40), firstIssuedAt: past(40), expiresAt: past(30)});
+    // newCheckRound writes the same instant to both fields for this unoffered
+    // first round; separate Date.now() calls can fabricate a prior epoch.
+    const unofferedIssuedAt = past(40);
+    await f.patchCheck(old.id, {issuedAt: unofferedIssuedAt, firstIssuedAt: unofferedIssuedAt, expiresAt: past(30)});
     assert.equal((await f.overview()).get(f.agents[0].id).stop_fence.phase, 'offline');
 
     const [offer] = (await f.heartbeat()).stopFenceChecks;
