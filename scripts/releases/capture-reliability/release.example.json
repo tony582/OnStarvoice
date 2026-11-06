@@ -1,0 +1,79 @@
+{
+  "version": "0.4.30",
+  "previous": "0.4.29",
+  "commit": "618125f6f2966a2aaa8429c2e38718833530758d",
+  "zip": "StarVoice-extension-v0.4.30-20261106.zip",
+  "zipSha256": "61d05cc31029b6f05b1ffbb1929275876b418a5a5acdda213f8261af5fc18238",
+  "files": [
+    {
+      "path": "server/services/capture-health-schema.js",
+      "before": "REPLACE_BASELINE_SHA256",
+      "after": "REPLACE_PAYLOAD_SHA256"
+    },
+    {
+      "path": "server/services/capture-cloud.js",
+      "before": "REPLACE_BASELINE_SHA256",
+      "after": "REPLACE_PAYLOAD_SHA256"
+    },
+    {
+      "path": "server/services/capture-orchestration.js",
+      "before": "REPLACE_BASELINE_SHA256",
+      "after": "REPLACE_PAYLOAD_SHA256"
+    },
+    {
+      "path": "server/services/capture-recovery-intents.js",
+      "before": "REPLACE_BASELINE_SHA256",
+      "after": "REPLACE_PAYLOAD_SHA256"
+    },
+    {
+      "path": "server/routes/capture-cloud.js",
+      "before": "REPLACE_BASELINE_SHA256",
+      "after": "REPLACE_PAYLOAD_SHA256"
+    },
+    {
+      "path": "server/services/ops-control.js",
+      "before": "REPLACE_BASELINE_SHA256",
+      "after": "REPLACE_PAYLOAD_SHA256"
+    },
+    {
+      "path": "server/public/about.html",
+      "before": "REPLACE_BASELINE_SHA256",
+      "after": "REPLACE_PAYLOAD_SHA256"
+    },
+    {
+      "path": "server/routes/update-manifest.js",
+      "before": "REPLACE_BASELINE_SHA256",
+      "after": "REPLACE_PAYLOAD_SHA256"
+    }
+  ],
+  "guards": [
+    {
+      "path": "server/.env",
+      "sha256": "REPLACE_BASELINE_SHA256"
+    },
+    {
+      "path": "server/package.json",
+      "sha256": "REPLACE_BASELINE_SHA256"
+    },
+    {
+      "path": "server/package-lock.json",
+      "sha256": "REPLACE_BASELINE_SHA256"
+    },
+    {
+      "path": "web/admin/dist/index.html",
+      "sha256": "REPLACE_BASELINE_SHA256"
+    },
+    {
+      "path": "public-downloads/StarVoice-extension-v0.4.29-20261017.zip",
+      "sha256": "REPLACE_BASELINE_SHA256"
+    },
+    {
+      "path": "server/services/android-control/posts.js",
+      "sha256": "REPLACE_BASELINE_SHA256"
+    },
+    {
+      "path": "server/services/android-control/post-ingest.js",
+      "sha256": "REPLACE_BASELINE_SHA256"
+    }
+  ]
+}
