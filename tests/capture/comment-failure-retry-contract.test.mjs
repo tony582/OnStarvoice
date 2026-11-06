@@ -145,7 +145,7 @@ test("a fresh detail payload inherits saved comments before Douyin comment prefl
     "export async function syncRecord",
   );
   const inheritedItemsAt = batchBlock.indexOf(
-    "const previouslySavedCommentItems",
+    "const commentCheckpointPayload",
   );
   const newPayloadAt = batchBlock.indexOf(
     "let detailPayload = applyCommentStatusToPayload(",
@@ -162,7 +162,7 @@ test("a fresh detail payload inherits saved comments before Douyin comment prefl
   assert.ok(preflightAt > newPayloadAt);
   assert.match(
     inheritanceBlock,
-    /record\.payload\?\.detailPayload\?\.commentsCleanedItems/u,
+    /resumeDetailPayload \|\| record\.payload\?\.detailPayload/u,
   );
   assert.match(
     inheritanceBlock,

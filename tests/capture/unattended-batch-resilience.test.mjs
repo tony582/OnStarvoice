@@ -1568,6 +1568,7 @@ function createBatchHarness({
   };
 
   const context = {
+    ENHANCEMENT_RETRY_EXHAUSTED: "ENHANCEMENT_RETRY_EXHAUSTED",
     BATCH_INTER_KEYWORD_DELAY_MAX_MS: 0,
     BATCH_INTER_KEYWORD_DELAY_MIN_MS: 0,
     BATCH_KEYWORD_AFTER_NAV_WAIT_MS: 0,
@@ -2892,4 +2893,27 @@ test("two consecutive unattended rounds do not reuse results or listeners", asyn
     /(?:still cleaning|cleanup pending|group busy|仍在清理|已绑定.*Tab)/i,
     "a clean second round must not inherit stale cleanup or task-group errors",
   );
+});
+
+
+test("exhausted enhancement preserves partial evidence and never reports a full keyword success", async () => {
+  const evidence = {version: 1, failedRecordIds: ["词1-record"], savedDetailRecordIds: ["词1-record"],
+    failureStages: ["comments_capture"], autoRetryCount: 1, budgetStopReason: "attempt_budget"};
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    afterKeywordCapture: async ({current}) => current === 1
+      ? {ok: false, partial: true, error: {code: "ENHANCEMENT_RETRY_EXHAUSTED", message: "自动续采预算已用完"}, enhancementFailure: evidence}
+      : {ok: true},
+  });
+  const result = await harness.run({keywords: ["词1", "词2"]});
+  assert.equal(result.results[0].ok, false);
+  assert.equal(result.results[0].partial, true);
+  assert.equal(result.results[0].searchCompleted, true);
+  assert.equal(result.results[0].errorCode, "ENHANCEMENT_RETRY_EXHAUSTED");
+  assert.equal(result.results[0].retryable, false);
+  assert.deepEqual(result.results[0].enhancementFailure, evidence);
+  assert.equal(result.results[1].ok, true);
+  assert.equal(result.stats.failed, 1);
+  assert.equal(result.stats.success, 1);
+  assert.equal(harness.settled[0].result.errorCode, "ENHANCEMENT_RETRY_EXHAUSTED");
 });

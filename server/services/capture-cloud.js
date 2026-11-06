@@ -205,12 +205,35 @@ function jsonObject(value, fallback = {}) {
 const SENSITIVE_KEY_PATTERN =
   /(?:authorization|cookie|password|passwd|secret|token|api[_-]?key|auth(?:entication)?[_-]?code|activation[_-]?code|credential|session)/i;
 
+function boundedEnhancementFailure(value) {
+  if (!value || typeof value !== 'object' || Number(value.version) !== 1) return null;
+  const strings = (values, count, length) => [...new Set(
+    (Array.isArray(values) ? values : []).slice(0, count)
+      .filter(item => typeof item === 'string').map(item => text(item, length)).filter(Boolean),
+  )];
+  return {
+    version: 1,
+    failedRecordIds: strings(value.failedRecordIds, 200, 240),
+    savedDetailRecordIds: strings(value.savedDetailRecordIds, 200, 240),
+    failureStages: strings(value.failureStages, 20, 80),
+    autoRetryCount: Number.isFinite(Number(value.autoRetryCount))
+      ? Math.max(0, Math.floor(Number(value.autoRetryCount))) : 0,
+    budgetStopReason: text(value.budgetStopReason, 80),
+  };
+}
+
 function safeStructuredValue(value, key = '', depth = 0, budget = null) {
   const limits = budget || {remainingNodes: 2000, remainingChars: 100000};
   if (limits.remainingNodes <= 0 || limits.remainingChars <= 0) return '[TRUNCATED]';
   limits.remainingNodes -= 1;
   const normalizedKey = String(key || '').replace(/([a-z0-9])([A-Z])/g, '$1_$2');
   if (SENSITIVE_KEY_PATTERN.test(normalizedKey)) return '[REDACTED]';
+  // This known, bounded leaf lives below checkpoint.keywordResults. Preserve
+  // its arrays instead of stringifying them at the generic depth limit, while
+  // still sharing the snapshot's total node/character budget and redaction.
+  if (normalizedKey.toLowerCase() === 'enhancement_failure') {
+    return safeStructuredValue(boundedEnhancementFailure(value), '', 0, limits);
+  }
   if (value === null || typeof value === 'boolean') return value;
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
   if (typeof value === 'string') {

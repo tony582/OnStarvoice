@@ -1,6 +1,21 @@
 import {DOUYIN_SEARCH_SERVICE_ABNORMAL_CODE} from "./capture/douyin-search-guard.js";
 
 const DEFAULT_MAX_ATTEMPTS = 2;
+const ENHANCEMENT_RETRY_EXHAUSTED = "ENHANCEMENT_RETRY_EXHAUSTED";
+
+function enhancementRetryExhausted(value = {}) {
+  return text(value?.errorCode || value?.error?.code || value?.code).toUpperCase() === ENHANCEMENT_RETRY_EXHAUSTED;
+}
+
+function normalizeEnhancementFailure(value) {
+  if (!value || typeof value !== "object" || Number(value.version) !== 1) return null;
+  const ids = values => [...new Set((Array.isArray(values) ? values : []).map(item => text(item).slice(0, 200)).filter(Boolean))].slice(0, 1000);
+  return {version: 1, failedRecordIds: ids(value.failedRecordIds),
+    savedDetailRecordIds: ids(value.savedDetailRecordIds),
+    failureStages: ids(value.failureStages).map(stage => stage.slice(0, 80)),
+    autoRetryCount: nonNegativeInt(value.autoRetryCount),
+    budgetStopReason: text(value.budgetStopReason).slice(0, 80)};
+}
 
 function text(value) {
   return String(value == null ? "" : value).trim();
@@ -136,6 +151,9 @@ export function normalizeUnattendedKeywordCheckpoint(
         : {}),
       ...(errorCode ? {errorCode} : {}),
       ...(errorCategory ? {errorCategory} : {}),
+      ...(enhancementRetryExhausted(rawEntry) ? {retryable: false} : {}),
+      ...(normalizeEnhancementFailure(rawEntry?.enhancementFailure)
+        ? {enhancementFailure: normalizeEnhancementFailure(rawEntry?.enhancementFailure)} : {}),
       ...(securityBlocked ? {securityBlocked: true} : {}),
       ...(platformSafetyBlocked ? {platformSafetyBlocked: true} : {}),
       ...(requiresManualAction ? {requiresManualAction: true} : {}),
@@ -184,7 +202,7 @@ export function findUnattendedResumeKeyword(
         (entry) =>
           positiveInt(entry?.round) === round &&
           text(entry?.status) === "failed" &&
-          nonNegativeInt(entry?.attemptCount) >= positiveInt(maxAttempts),
+          (nonNegativeInt(entry?.attemptCount) >= positiveInt(maxAttempts) || enhancementRetryExhausted(entry)),
       )
       .map((entry) => text(entry?.keyword))
       .filter(Boolean),
@@ -495,7 +513,11 @@ export async function runUnattendedKeywordAttempts({
         }),
       );
     }
-    pendingKeywords = retryKeywords;
+    const exhaustedEnhancements = new Set(
+      (Array.isArray(attemptResult?.results) ? attemptResult.results : [])
+        .filter(enhancementRetryExhausted).map(item => text(item.keyword)),
+    );
+    pendingKeywords = retryKeywords.filter(keyword => !exhaustedEnhancements.has(keyword));
     if (
       pendingKeywords.length === 0 ||
       attempt >= normalizedMaxAttempts
@@ -712,6 +734,8 @@ export function settleUnattendedKeywordCheckpoint({
     ? "failed"
     : canceled
       ? "partial"
+      : enhancementRetryExhausted(result)
+        ? "failed"
       : result?.ok === true && !partial
         ? "completed"
       : result?.ok === true
@@ -758,6 +782,9 @@ export function settleUnattendedKeywordCheckpoint({
       ? {scanComplete: true}
       : {}),
     ...(resolvedErrorCode ? {errorCode: resolvedErrorCode} : {}),
+    ...(enhancementRetryExhausted(result) ? {retryable: false} : {}),
+    ...(normalizeEnhancementFailure(result?.enhancementFailure)
+      ? {enhancementFailure: normalizeEnhancementFailure(result.enhancementFailure)} : {}),
     ...(resolvedErrorCategory
       ? {errorCategory: resolvedErrorCategory}
       : {}),

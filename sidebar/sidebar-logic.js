@@ -23098,6 +23098,7 @@ async function resolveMonitorRecordIdsForPublishWindow({
         ? `${attemptContext.retryCount}/${attemptContext.maxRetries}`
         : "";
       return await batchCaptureDetailsForRecords(attemptRecordIds, {
+        enhancementRetrySession: attemptContext.retrySession,
         shouldStop,
         onProgress: (progress = {}) => {
           const detailMessage =
@@ -23784,6 +23785,7 @@ async function executeMonitorRunItem({
                   ? `${attemptContext.retryCount}/${attemptContext.maxRetries}`
                   : "";
                 return await batchCaptureDetailsForRecords(attemptRecordIds, {
+                  enhancementRetrySession: attemptContext.retrySession,
                   shouldStop,
                   onProgress: (progress = {}) => {
                     const commentMessage =
@@ -26347,6 +26349,7 @@ async function runDetailCaptureForRecordIds(
           );
         }
         return await batchCaptureDetailsForRecords(attemptRecordIds, {
+          enhancementRetrySession: attemptContext.retrySession,
           onProgress: (progress) =>
             handleDetailProgress(progress, attemptContext),
           shouldStop: () =>

@@ -1185,6 +1185,9 @@ export function classifyCaptureRecoveryDisposition(
     error.category || checkpoint.errorCategory || checkpoint.error_category,
     100,
   ).toLowerCase();
+  if (code === 'ENHANCEMENT_RETRY_EXHAUSTED') {
+    return {kind: 'enhancement_retry_exhausted', automatic: false};
+  }
   if (
     dutyRecovery &&
     (
@@ -1333,6 +1336,10 @@ export function projectElasticKeywordRecoveryStatus({
     error,
     metadata: {checkpoint},
   });
+  if (!safetyBlocked && text(safeJson(error).code || safeJson(checkpoint).errorCode ||
+    safeJson(checkpoint).error_code, 100).toUpperCase() === 'ENHANCEMENT_RETRY_EXHAUSTED') {
+    return 'failed';
+  }
   const automaticAttemptLimit = safetyBlocked
     ? normalizedAttemptLimit
     : normalizedAttemptLimit * ELASTIC_TECHNICAL_RETRY_ROUNDS;
@@ -6056,6 +6063,10 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
     const attemptCount = orchestrationCheckpointInteger(entry.attemptCount);
     const savedCount = orchestrationCheckpointInteger(entry.savedCount);
     const finishedAt = orchestrationCheckpointTimestamp(entry.finishedAt);
+    const enhancementFailure = entryErrorCode === 'ENHANCEMENT_RETRY_EXHAUSTED' &&
+      Number(entry.enhancementFailure?.version) === 1
+      ? sanitizeCloudStructuredObject({enhancementFailure: entry.enhancementFailure}).enhancementFailure
+      : null;
     const rawEntryError = entry.error;
     const baseError = rawEntryError && typeof rawEntryError === 'object'
       ? sanitizeCloudStructuredObject(rawEntryError)
@@ -6117,6 +6128,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       status: keywordServiceAbnormal ? 'completed' : text(entry.status, 80),
       attemptCount,
       savedCount,
+      ...(enhancementFailure ? {enhancementFailure, retryable: false} : {}),
       ...(entry.searchPassCompletion
         ? {searchPassCompletion: entry.searchPassCompletion}
         : {}),
@@ -9727,6 +9739,20 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
           ['capture_orchestration_control', commandRef.parent_task_id],
         );
+      }
+
+      // Keep the control fence before the Agent slot, but acquire the slot
+      // before any parent/task row. A heartbeat already owns this slot while
+      // projecting its child into the parent. Holding the parent here while
+      // waiting for that heartbeat's slot creates a parent <-> slot deadlock.
+      // Re-read authorization under the slot before accepting the receipt.
+      const currentAgent = await lockActiveCaptureAgentSession(
+        tx,
+        req.captureAgent,
+      );
+      if (!currentAgent) return {agentInactive: true};
+
+      if (commandRef.parent_task_id) {
         await tx.queryOne(`
           SELECT id
           FROM capture_tasks
@@ -9734,12 +9760,6 @@ router.post('/agent/commands/:id/complete', requireCaptureAgent, async (req, res
           FOR UPDATE
         `, [commandRef.parent_task_id, req.tenantId]);
       }
-
-      const currentAgent = await lockActiveCaptureAgentSession(
-        tx,
-        req.captureAgent,
-      );
-      if (!currentAgent) return {agentInactive: true};
 
       // Match heartbeat and expiry ordering: task first, then its command.
       const lockedTask = await tx.queryOne(`

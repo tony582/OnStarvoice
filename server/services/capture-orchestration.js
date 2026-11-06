@@ -865,6 +865,13 @@ export function checkpointEntryToItemStatus(
     queued: 'pending',
   };
   const status = aliases[rawStatus] || rawStatus;
+  // Detail enhancement already spent its bounded local retry budget. A new
+  // keyword relay would repeat the successful search and saved detail work.
+  // Keep the incomplete result visible as failed, never as a successful item.
+  if (['failed', 'partial', 'retryable'].includes(status) &&
+    checkpointEntryErrorCode(source) === 'ENHANCEMENT_RETRY_EXHAUSTED') {
+    return 'failed';
+  }
   if (['partial', 'retry', 'retrying', 'interrupted', 'recovering'].includes(status)) {
     return 'retryable';
   }

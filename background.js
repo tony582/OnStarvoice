@@ -1640,6 +1640,18 @@ function getUnattendedTaskCenterCore() {
   return core && typeof core === 'object' ? core : null;
 }
 
+function normalizeUnattendedEnhancementFailure(value) {
+  if (!value || typeof value !== 'object' || Number(value.version) !== 1) return null;
+  const ids = values => [...new Set((Array.isArray(values) ? values : [])
+    .map(item => String(item || '').trim().slice(0, 200)).filter(Boolean))].slice(0, 1000);
+  const autoRetryCount = Math.floor(Number(value.autoRetryCount));
+  return {version: 1, failedRecordIds: ids(value.failedRecordIds),
+    savedDetailRecordIds: ids(value.savedDetailRecordIds),
+    failureStages: ids(value.failureStages).map(stage => stage.slice(0, 80)),
+    autoRetryCount: Number.isFinite(autoRetryCount) ? Math.max(0, autoRetryCount) : 0,
+    budgetStopReason: String(value.budgetStopReason || '').trim().slice(0, 80)};
+}
+
 function buildTaskCenterCheckpointFromUnattendedRequest(request) {
   const source =
     request?.checkpoint && typeof request.checkpoint === 'object'
@@ -1706,6 +1718,9 @@ function buildTaskCenterCheckpointFromUnattendedRequest(request) {
       error: String(entry?.error || '').trim(),
       errorCode: String(entry?.errorCode || '').trim(),
       errorCategory: String(entry?.errorCategory || '').trim(),
+      ...(entry?.retryable === false ? {retryable: false} : {}),
+      ...(normalizeUnattendedEnhancementFailure(entry?.enhancementFailure)
+        ? {enhancementFailure: normalizeUnattendedEnhancementFailure(entry.enhancementFailure)} : {}),
       securityBlocked: entry?.securityBlocked === true,
       requiresManualAction: entry?.requiresManualAction === true,
       finishedAt: String(entry?.finishedAt || ''),

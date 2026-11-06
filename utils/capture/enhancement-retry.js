@@ -1,3 +1,5 @@
+import {createEnhancementRetrySession, ENHANCEMENT_RETRY_EXHAUSTED} from './enhancement-retry-session.js';
+
 const RETRYABLE_FAILURE_CODES = new Set([
   "PAGE_OPEN_TIMEOUT",
   "PAGE_OPEN_FAILED",
@@ -80,6 +82,7 @@ function isNonRetryableFailure(item = {}) {
     item?.canceled === true ||
       item?.securityBlocked === true ||
       NON_RETRYABLE_FAILURE_CATEGORIES.has(category) ||
+      code === ENHANCEMENT_RETRY_EXHAUSTED ||
       code === "CANCELED" ||
       code === "DETAIL_CAPTURE_CANCELED" ||
       code === "XHS_SECURITY_BLOCK" ||
@@ -538,6 +541,43 @@ export function mergeEnhancementAttemptResults({
   };
 }
 
+function finalizeEnhancementRetry(finalResult, retrySession, retryCount) {
+  const unresolved = (finalResult.results || []).filter(item => item?.ok === false);
+  const exhausted = unresolved.length > 0 &&
+    !finalResult.canceled && !finalResult.securityBlocked &&
+    !finalResult.platformSafetyBlocked && !finalResult.requiresManualAction &&
+    !finalResult.integrityBlocked && !finalResult.fatal && !finalResult.stopBatch &&
+    !finalResult.runnerInterrupted && !finalResult.recoveryRequired &&
+    unresolved.some(item => (retryCount > 0 && isRetryableEnhancementFailure(item)) ||
+      readFailureCode(item) === ENHANCEMENT_RETRY_EXHAUSTED);
+  if (!exhausted) return finalResult;
+  const budgetStopReason = retrySession.remainingMs() <= 0
+    ? 'retry_time_budget'
+    : unresolved.find(item => item?.budgetStopReason)?.budgetStopReason || 'attempt_budget';
+  const enhancementFailure = {
+    version: 1,
+    failedRecordIds: unresolved.map(item => normalizeText(item.recordId)).filter(Boolean),
+    failureStages: [...new Set(unresolved.map(item => normalizeText(item.stage)).filter(Boolean))],
+    autoRetryCount: retryCount,
+    savedDetailRecordIds: retrySession.savedRecordIds(),
+    budgetStopReason,
+  };
+  return {
+    ...finalResult,
+    ok: false,
+    partial: true,
+    retryable: false,
+    enhancementFailure,
+    error: {
+      code: ENHANCEMENT_RETRY_EXHAUSTED,
+      category: 'enhancement_incomplete',
+      retryable: false,
+      message: `采集增强有 ${unresolved.length} 条仍未完成，自动续采预算已用完；已保留已采结果`,
+      ...enhancementFailure,
+    },
+  };
+}
+
 export async function runEnhancementWithSingleRetry({
   recordIds = [],
   runAttempt,
@@ -548,6 +588,8 @@ export async function runEnhancementWithSingleRetry({
   shouldStop = null,
   smallBatchThreshold = 2,
   smallBatchMaxRetries = 2,
+  maxRetryDurationMs,
+  now = Date.now,
 } = {}) {
   if (typeof runAttempt !== "function") {
     throw new TypeError("enhancement retry requires runAttempt");
@@ -560,11 +602,13 @@ export async function runEnhancementWithSingleRetry({
         .filter(Boolean),
     ),
   ];
+  const retrySession = createEnhancementRetrySession({now, maxRetryDurationMs});
   let initialResult;
   try {
     const rawInitialResult = await runAttempt(normalizedRecordIds, {
       attempt: 1,
       isRetry: false,
+      retrySession,
     });
     const shouldSynthesizeMissing = Boolean(
       !rawInitialResult ||
@@ -583,7 +627,7 @@ export async function runEnhancementWithSingleRetry({
     fallbackRecordIds: normalizedRecordIds,
   });
   if (retryRecordIds.length === 0) {
-    return {
+    return finalizeEnhancementRetry({
       ...initialResult,
       autoRetryHandled: true,
       autoRetryAttempted: false,
@@ -592,7 +636,7 @@ export async function runEnhancementWithSingleRetry({
       autoRetryRecoveredIds: [],
       autoRetryStillFailedIds: [],
       autoRetryScheduled: false,
-    };
+    }, retrySession, 0);
   }
 
   const stopRequested = () => {
@@ -679,6 +723,8 @@ export async function runEnhancementWithSingleRetry({
       requiresContextRebuild: isRunnerContextFailure(mergedResult),
       initialFailureCode: readTopLevelFailureCode(mergedResult),
     };
+    retrySession.beginRetry();
+    if (retrySession.remainingMs() <= 0) break;
     retryScheduled = true;
     try {
       await onRetryScheduled?.(retryMetadata);
@@ -731,6 +777,7 @@ export async function runEnhancementWithSingleRetry({
         isRetry: true,
         retryCount: retryIndex,
         maxRetries,
+        retrySession,
       });
       retryResult = normalizeAttemptResult(rawRetryResult, retryRecordIds, {
         synthesizeMissing: true,
@@ -753,5 +800,5 @@ export async function runEnhancementWithSingleRetry({
     });
   }
 
-  return withRetrySummary(mergedResult);
+  return finalizeEnhancementRetry(withRetrySummary(mergedResult), retrySession, retryCount);
 }

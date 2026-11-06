@@ -65,6 +65,7 @@ import {
   recordDiagnosticStage,
 } from './diagnostics.js';
 import {buildDetailEnhanceStage} from './capture/stage-diagnostics.js';
+import {ENHANCEMENT_RETRY_EXHAUSTED} from './capture/enhancement-retry-session.js';
 import {
   DETAIL_RUNNER_MODE,
   closeOwnedDetailRunnerTab,
@@ -3368,6 +3369,7 @@ function buildDouyinDetailIdentityError(
 function isDouyinIdentityIntegrityError(error) {
   const code = String(error?.code || '').trim().toUpperCase();
   return (
+    code === 'IDENTITY_MISMATCH' ||
     code === 'DOUYIN_DETAIL_ID_MISMATCH' ||
     code === 'DOUYIN_COMMENT_ID_MISMATCH' ||
     code === 'DOUYIN_COMMENT_ID_CONFLICT'
@@ -3425,6 +3427,7 @@ export async function batchCaptureDetailsForRecords(
     captureTaskId = '',
     relevanceKeyword = '',
     enableAiRelevancePrefilter = null,
+    enhancementRetrySession = null,
   } = {},
 ) {
   const uniqueRecordIds = Array.isArray(recordIds)
@@ -5068,6 +5071,24 @@ export async function batchCaptureDetailsForRecords(
           ? resolveExpectedDouyinCommentNoteId(record, noteUrl)
           : '';
 
+      const checkpointTargetId = recordPlatform === 'douyin'
+        ? expectedDouyinNoteId : extractNoteId(noteUrl);
+      const checkpointScope = checkpointTargetId ? JSON.stringify([
+        recordPlatform, checkpointTargetId, noteUrl, captureTaskId,
+        includeComments, includeBloggerMetrics, relevanceKeyword,
+        enableAiRelevancePrefilter, resolvedEnableAiRelevancePrefilter,
+        enableLowFollowerHitFilter, lowFollowerHitThreshold,
+        settings.enableLowFollowerHitFilterOnDetailCapture,
+        settings.lowFollowerHitThresholdOnDetailCapture,
+        settings.enableLowFollowerHitFilter, settings.lowFollowerHitThreshold,
+        enableCommentLeadsFilter, settings.enableCommentLeadsFilterOnDetailCapture,
+        settings.commentLeadsKeywords, settings.commentLeadsIps,
+        normalizedCommentsMaxDetectedItems,
+      ]) : '';
+      let resumeDetailPayload = enhancementRetrySession?.read(recordId, checkpointScope) || null;
+      const budgetError = reason => Object.assign(new Error(
+        '当前增强自动续采预算已用完，已保留已采结果，请核对未完成阶段',
+      ), {code: ENHANCEMENT_RETRY_EXHAUSTED, budgetStopReason: reason, retryable: false});
       const startedAt = Date.now();
       activeDetailItemContext = {
         ...activeDetailItemContext,
@@ -5133,6 +5154,9 @@ export async function batchCaptureDetailsForRecords(
       let nextPrefetchCandidate = null;
       let nextPrefetchCandidatePromise = null;
       captureCurrentDetail: try {
+        if (enhancementRetrySession?.remainingMs() <= 0) {
+          throw budgetError('retry_time_budget');
+        }
         const stalePrefetchSlot = detailPrefetchPipeline
           .snapshot()
           .slots.find(
@@ -5266,6 +5290,15 @@ export async function batchCaptureDetailsForRecords(
             code: 'TARGET_POST_UNAVAILABLE', detailAvailability: availability,
           });
         }
+        if (resumeDetailPayload && recordPlatform === 'xiaohongshu') {
+          // A saved payload is not proof of the newly opened page. Require the
+          // current route to remain bound to this note before skipping its body.
+          const currentWorkerTab = await chrome.tabs.get(runnerContext.runnerTabId);
+          if (detectPlatformFromUrl(currentWorkerTab?.url) !== recordPlatform ||
+              extractNoteId(currentWorkerTab?.url) !== checkpointTargetId) {
+            resumeDetailPayload = null;
+          }
+        }
         activeStage = 'note_capture';
         activeDetailItemContext.activeStage = activeStage;
         const noteCaptureWorkerSnapshot = detailPrefetchPipeline.snapshot();
@@ -5297,7 +5330,9 @@ export async function batchCaptureDetailsForRecords(
               preferWorksTabForBloggerMetrics: false,
             },
           });
-        let noteResult = await captureCurrentNotePayload();
+        let noteResult = resumeDetailPayload
+          ? {ok: true, data: resumeDetailPayload}
+          : await captureCurrentNotePayload();
 
         const isRecoverableDouyinExtractorFailure = (result) => {
           if (result?.ok === true || isCaptureCanceledResult(result)) {
@@ -5430,11 +5465,10 @@ export async function batchCaptureDetailsForRecords(
           throw noteCaptureError;
         }
 
+        const commentCheckpointPayload = resumeDetailPayload || record.payload?.detailPayload;
         const previouslySavedCommentItems = Array.isArray(
-          record.payload?.detailPayload?.commentsCleanedItems,
-        )
-          ? record.payload.detailPayload.commentsCleanedItems
-          : [];
+          commentCheckpointPayload?.commentsCleanedItems,
+        ) ? commentCheckpointPayload.commentsCleanedItems : [];
         let detailPayload = applyCommentStatusToPayload(
           noteResult.data,
           createCommentStatusPatch({
@@ -5476,7 +5510,7 @@ export async function batchCaptureDetailsForRecords(
             listRelevanceDecision.executionDisposition ===
               'collect_minimal_detail',
         );
-        if (needsMinimalDetailDecision) {
+        if (needsMinimalDetailDecision && !resumeDetailPayload) {
           activeStage = 'ai_detail_relevance';
           activeDetailItemContext.activeStage = activeStage;
           await reportProgressFailSoft(onProgress, {
@@ -5659,7 +5693,8 @@ export async function batchCaptureDetailsForRecords(
         }
 
         let stopAfterCurrent = false;
-        if (shouldCaptureBloggerMetricsForRecord) {
+        if (shouldCaptureBloggerMetricsForRecord &&
+            (!resumeDetailPayload || resumeDetailPayload.bloggerMetricsCaptureStatus !== BLOGGER_METRICS_CAPTURE_STATUS.DONE)) {
           activeStage = 'blogger_metrics_capture';
           activeDetailItemContext.activeStage = activeStage;
           if (onProgress) {
@@ -5898,6 +5933,42 @@ export async function batchCaptureDetailsForRecords(
           !stopAfterCurrent &&
           !shouldSkipConfirmedEmptyComments
         ) {
+          const checkpointIds = new Set([
+            String(detailPayload?.noteId || '').trim(),
+            extractNoteId(detailPayload?.url), extractNoteId(detailPayload?.noteUrl),
+          ].filter(Boolean));
+          if (checkpointTargetId && checkpointIds.size === 1 && checkpointIds.has(checkpointTargetId)) {
+            // Persisting a partial body is a write too. Recheck the current
+            // worker after optional profile navigation, before storing proof.
+            if (recordPlatform === 'douyin') {
+              const checkpointReady = await probeDouyinTargetRouteSafety(runnerContext.runnerTabId, {
+                targetUrl: noteUrl, verifiedNoteId: expectedDouyinNoteId,
+                requireVerifiedNoteId: true, shouldStop: shouldStopDetailBatch,
+                timeoutMs: DOUYIN_COMMENT_RECOVERY_READY_TIMEOUT_MS,
+              });
+              if (extractDouyinDetailGuardItemId(checkpointReady?.currentNoteId) !== expectedDouyinNoteId) {
+                throw buildDouyinDetailIdentityError(expectedDouyinNoteId, {noteId: checkpointReady?.currentNoteId});
+              }
+            } else if (recordPlatform === 'xiaohongshu') {
+              await probeDetailPreloadSafety(runnerContext.runnerTabId, {targetUrl: noteUrl, shouldStop: shouldStopDetailBatch});
+              const checkpointTab = await chrome.tabs.get(runnerContext.runnerTabId);
+              if (detectPlatformFromUrl(checkpointTab?.url) !== recordPlatform ||
+                  extractNoteId(checkpointTab?.url) !== checkpointTargetId) {
+                const identityError = new Error('当前作品页面与已采正文不一致，已停止以防数据错配');
+                identityError.code = 'IDENTITY_MISMATCH';
+                throw identityError;
+              }
+            }
+            if (shouldStopDetailBatch()) throw new Error('DETAIL_CAPTURE_CANCELED');
+            enhancementRetrySession?.remember(recordId, checkpointScope, detailPayload);
+            const latestBeforeComments = (await getRecord(recordId)) || record;
+            await updateRecord(recordId, {status: RECORD_STATUS.DRAFT, payload: {
+              ...latestBeforeComments.payload,
+              detailPayload: sanitizeMediaFieldsForStorage(
+                normalizeDetailPayloadAgainstRecord(latestBeforeComments, detailPayload),
+              ),
+            }});
+          }
           activeStage = 'comments_capture';
           if (activeDetailItemContext) {
             activeDetailItemContext.activeStage = activeStage;
@@ -5993,6 +6064,8 @@ export async function batchCaptureDetailsForRecords(
             : [];
           let commentsResult;
           try {
+            const admission = enhancementRetrySession?.beginComments(recordId);
+            if (admission && !admission.ok) throw budgetError(admission.reason);
             commentsResult = await captureCommentsForCurrentNote({
               tabId: commentCaptureIdentity.runnerTabId,
               captureRequestId: commentCaptureIdentity.captureRequestId,
@@ -6001,7 +6074,12 @@ export async function batchCaptureDetailsForRecords(
               total: uniqueRecordIds.length,
               existingItems: existingCommentItems,
               maxDetectedItems: normalizedCommentsMaxDetectedItems,
-              maxDurationMs: settings.sharedMaxDurationMs,
+              maxDurationMs: Number.isFinite(enhancementRetrySession?.remainingMs())
+                ? Math.max(1, Math.min(
+                    Number(settings.sharedMaxDurationMs) || 10 * 60 * 1000,
+                    enhancementRetrySession.remainingMs(),
+                  ))
+                : settings.sharedMaxDurationMs,
               waitMinMs: settings.sharedWaitMinMs,
               waitMaxMs: settings.sharedWaitMaxMs,
               stallTimeoutMs: settings.sharedStallTimeoutMs,
@@ -6265,6 +6343,12 @@ export async function batchCaptureDetailsForRecords(
         if (isDouyinIdentityIntegrityError(effectiveError)) {
           integrityBlocked = true;
         }
+        if (securityBlocked || integrityBlocked) {
+          enhancementRetrySession?.forget(recordId);
+        } else if (effectiveError?.partialDetailPayload &&
+                   enhancementRetrySession?.read(recordId, checkpointScope)) {
+          enhancementRetrySession.remember(recordId, checkpointScope, effectiveError.partialDetailPayload);
+        }
         const canceledByUser =
           !pipelineFatalError && isDetailCaptureCanceledError(effectiveError);
         if (canceledByUser) {
@@ -6380,6 +6464,7 @@ export async function batchCaptureDetailsForRecords(
           runnerInterrupted: runnerContextInterrupted,
           recoveryRequired: runnerContextInterrupted,
           retryable: effectiveError?.retryable === true,
+          ...(effectiveError?.budgetStopReason ? {budgetStopReason: effectiveError.budgetStopReason} : {}),
           ...captureTraceFields,
         };
         results.push(result);
@@ -12519,7 +12604,7 @@ function buildDetailCaptureFailure(code, stage, diagnosticMessage = '') {
         code: normalizedCode,
         stage: normalizedStage,
         category: DETAIL_CAPTURE_FAILURE_CATEGORY.INTEGRITY_BLOCKED,
-        userMessage: '无法确认当前抖音作品身份，已停止以防数据错配',
+        userMessage: '无法确认当前作品身份，已停止以防数据错配',
         diagnosticMessage:
           normalizedDiagnostic || '目标作品 ID 与页面或采集结果不一致',
       };
@@ -12606,6 +12691,11 @@ function classifyDetailCaptureFailure(error, { stage = 'unknown' } = {}) {
   const rawCode = String(error?.code || '').trim().toUpperCase();
   const normalizedStage =
     String(stage || 'unknown').trim().toLowerCase() || 'unknown';
+
+  if (rawCode === ENHANCEMENT_RETRY_EXHAUSTED) {
+    return {code: rawCode, stage: normalizedStage, category: 'enhancement_incomplete',
+      userMessage: '自动续采预算已用完，已保留已采结果', diagnosticMessage: rawMessage};
+  }
 
   if (
     rawCode === 'DOUYIN_CONTENT_UNAVAILABLE' ||
@@ -17660,6 +17750,18 @@ export async function batchCaptureByKeywords({
           keywordResult.partial = true;
           keywordResult.warning =
             enhanceResult?.error?.message || keywordResult.warning || '采集增强未完整完成';
+          if (enhanceResult.error?.code === ENHANCEMENT_RETRY_EXHAUSTED) {
+            if (keywordResult.ok === true) {
+              successCount = Math.max(0, successCount - 1);
+              failedCount += 1;
+            }
+            keywordResult.ok = false;
+            keywordResult.searchCompleted = true;
+            keywordResult.errorCode = ENHANCEMENT_RETRY_EXHAUSTED;
+            keywordResult.errorCategory = 'enhancement_incomplete';
+            keywordResult.retryable = false;
+            keywordResult.enhancementFailure = enhanceResult.enhancementFailure;
+          }
         } else if (!stopAfterKeyword && !enhanceResult?.skipped) {
           keywordResult.enhanceStatus = 'done';
         }

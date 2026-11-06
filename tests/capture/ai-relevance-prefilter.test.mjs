@@ -532,10 +532,11 @@ test('detail batch invokes AI before creating a detail runner and only for keywo
     'an actionable list skip must exit before detail, comment or blogger capture',
   );
 
-  const noteCaptureAt = fullBody.indexOf('let noteResult = await captureCurrentNotePayload();');
+  const noteCaptureAt = fullBody.indexOf('let noteResult = resumeDetailPayload');
   const secondStageAt = fullBody.indexOf('await evaluateRelevanceDetailRecord(');
   const bloggerAt = fullBody.indexOf('await captureBloggerMetricsForDetailPayload(');
   const commentsAt = fullBody.indexOf('await captureCommentsForCurrentNote(');
+  assert.ok(noteCaptureAt >= 0, 'minimal note capture marker is missing');
   assert.ok(secondStageAt > noteCaptureAt, 'detail AI must run after minimal note capture');
   assert.ok(bloggerAt > secondStageAt, 'detail AI must run before blogger metrics');
   assert.ok(commentsAt > secondStageAt, 'detail AI must run before comments');

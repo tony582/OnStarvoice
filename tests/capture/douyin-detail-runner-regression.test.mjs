@@ -85,7 +85,7 @@ test("AI prefilter completion continues into worker registration and detail capt
   );
   const batchStartAt = body.indexOf("phase: 'detail_batch_start'", registrationAt);
   const detailCaptureAt = body.indexOf(
-    "let noteResult = await captureCurrentNotePayload()",
+    "let noteResult = resumeDetailPayload",
     batchStartAt,
   );
 
@@ -94,4 +94,6 @@ test("AI prefilter completion continues into worker registration and detail capt
   assert.ok(registrationAt > runnerAt, "the dedicated worker must be registered");
   assert.ok(batchStartAt > registrationAt, "detail batch must start after registration");
   assert.ok(detailCaptureAt > batchStartAt, "detail extraction must remain reachable");
+  assert.match(body.slice(detailCaptureAt), /: await captureCurrentNotePayload\(\);/u,
+    "a missing stage checkpoint must still read the current note");
 });

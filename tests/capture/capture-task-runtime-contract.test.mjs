@@ -478,7 +478,7 @@ test("standby prefetch is queued before current note extraction begins", () => {
     acquireAt,
   );
   const noteCaptureAt = captureSyncSource.indexOf(
-    "let noteResult = await captureCurrentNotePayload()",
+    "let noteResult = resumeDetailPayload",
     acquireAt,
   );
   const persistenceAt = captureSyncSource.indexOf(

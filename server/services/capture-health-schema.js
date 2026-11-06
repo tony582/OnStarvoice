@@ -146,6 +146,7 @@ const RECOVERY_ERROR_CODES = new Set([
   'fence_changed',
   'frame_removed',
   'extension_runtime_restarted',
+  'enhancement_retry_exhausted',
   'login_required',
   'network_error',
   'network_offline',

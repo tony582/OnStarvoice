@@ -3631,6 +3631,13 @@ test("parent stop and child completion share orchestration control lock order", 
   const completionParentRowLockIndex = completion.indexOf(
     'SELECT id\n          FROM capture_tasks',
   );
+  const completionAgentSlotIndex = completion.indexOf(
+    'const currentAgent = await lockActiveCaptureAgentSession(',
+  );
+  assert.ok(completionAgentSlotIndex > completionControlLockIndex,
+    'control operations keep their fence before the Agent slot');
+  assert.ok(completionParentRowLockIndex > completionAgentSlotIndex,
+    'a command waiting for the heartbeat slot must not hold its parent row');
   assert.ok(completionParentRowLockIndex > completionControlLockIndex);
   assert.ok(completionParentRowLockIndex < completionChildLockIndex);
   assert.match(

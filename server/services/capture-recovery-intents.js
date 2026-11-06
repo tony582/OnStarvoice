@@ -1296,6 +1296,15 @@ export function classifyCaptureRecoveryCandidate(candidate = {}) {
       reason: 'item_not_recovery_candidate',
     });
   }
+  // The extension already exhausted its enhancement-only retry budget. Duty
+  // recovery must not open another full keyword search behind the elastic
+  // queue's terminal result. Explicit operator retry remains a separate action.
+  if (code === 'ENHANCEMENT_RETRY_EXHAUSTED') {
+    return Object.freeze({
+      eligible: false, terminalStatus: 'failed', decision: 'stop',
+      stage, faultClass, code, reason: 'enhancement_retry_exhausted',
+    });
+  }
   if (isFilterVerificationCode(code)) {
     if (status === 'failed'
       && object(candidate.error).automaticRetryStopReason === FILTER_VERIFICATION_STOP_REASON) {

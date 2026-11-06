@@ -277,6 +277,46 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     return {f, parent, item};
   }
 
+  await t.test('enhancement exhaustion stops automatic relays and duty recovery but allows explicit manual retry', async st => {
+    const f = await fixture(st);
+    const {parent, items: [item]} = await batch(f, {
+      keywords: ['synthetic enhancement exhaustion'], status: 'pending', schedule: true,
+    });
+    const first = await claim(f, NAMES[0]);
+    assert.equal(first.itemId, item.id);
+    const enhancementFailure = {version: 1, failedRecordIds: ['synthetic-record'],
+      savedDetailRecordIds: ['synthetic-record'], failureStages: ['comments_capture'],
+      autoRetryCount: 1, budgetStopReason: 'retry_time_budget'};
+    await report(f, first, {keyword: item.keyword, code: 'ENHANCEMENT_RETRY_EXHAUSTED',
+      extraError: {category: 'enhancement_incomplete', retryable: false,
+        savedCount: 40, enhancementFailure}});
+    const settled = await itemRow(item.id);
+    assert.equal(settled.status, 'failed');
+    assert.equal(settled.attempt_count, 1);
+    assert.equal(settled.error.code, 'ENHANCEMENT_RETRY_EXHAUSTED');
+    assert.ok(settled.finished_at);
+    assert.equal(settled.metadata.checkpoint.recovery, undefined);
+    assert.deepEqual(settled.metadata.checkpoint.enhancementFailure, enhancementFailure,
+      'failure records and stages survive snapshot sanitizing and durable item projection');
+    assert.equal((await row('capture_tasks', parent.id)).status, 'completed_with_failures');
+    assert.equal(await claim(f, NAMES[1]), null);
+    const recovery = await ingestCaptureRecoveryItem({tenantId: f.tenant.id, itemId: item.id});
+    assert.equal(recovery.kind, 'terminal_reconciled');
+    assert.equal(recovery.classification.reason, 'enhancement_retry_exhausted');
+    assert.deepEqual(recovery.intents, []);
+    const [commands] = await query(`SELECT count(*)::integer n FROM capture_agent_commands
+      WHERE tenant_id=$1 AND command_type='create'`, [f.tenant.id]);
+    assert.equal(commands.n, 1, 'no second full-keyword execution is created');
+    const manual = await adminPost(f, `/orchestrations/${parent.id}/retry-items`, {
+      requestKey: randomUUID(),
+      expectedRevision: Number((await row('capture_tasks', parent.id)).orchestration_revision),
+      itemIds: [item.id],
+    });
+    assert.equal(manual.status, 201, JSON.stringify(manual.body));
+    const second = await claim(f, NAMES[1]);
+    assert.equal(second?.itemId, item.id, 'an operator can deliberately start a fresh attempt');
+  });
+
   await t.test('F1 replay: untried fenced nodes keep the keyword waiting only for the relax window', async st => {
     const {f, parent, item} = await replay0927(st);
     for (const name of NAMES) assert.equal(await claim(f, name), null, `${name} before the window`);
