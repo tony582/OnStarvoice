@@ -77,3 +77,11 @@
   - 第一次 19:44：迁移 094 已执行，重启 API 后健康检查在端口监听前就请求，判为失败并自动回滚代码（迁移是纯新增，保留）；回滚后三进程在线、就绪 200。发布脚本改为最多等 30 秒就绪后重做预检。
   - 第二次 19:49:44 发布成功：api / scheduler / ai-media 三进程重启在线，就绪 200，后台入口已切到新版本；回滚备份 `web/admin/dist.before-6f71d5b`，发布记录在 `/opt/onstarvoice-private/releases/wechat-channels-6f71d5b-20261105`。生产服务端 = 本分支 `6f71d5b` 的服务端代码。
 - 手机：`runtime-0.4.0-6f71d5b` 已放在 `~/Documents/claude/StarVoice-Android`，正式状态目录已执行 `enable-wechat`（`connection.json` 与状态库发布前备份在 `backups/`）。由用户双击该目录 `launcher/StarVoice 手机采集.command` 启动；首次轮询后后台节点显示可采视频号，才能在计划里选它。
+
+## OnStar 首轮试跑与 Runner 0.4.1（2026-11-05 / 11-06）
+
+- 试跑放在租户 OnStar（安吉星客户在用，不碰）：线上 `ANDROID_DISCOVERY_INGEST_TENANTS` 加入 OnStar 后只重启 api；DE106 以 OnStar 激活码另注册一个只开视频号的节点（状态目录 `state-829d89-onstar`）；计划「视频号手机采集（试运行）」11-05 21:12 跑 13 个词（一天内、最新、每词 10 条、评论 20）。结果 10 成 3 败，入库 6 条，其中 1 条带 5 条评论。
+- 暴露的问题与处理：
+  - 任务刚结束时，一次在它运行期间发出的轮询才返回，仍带着服务端尚未关闭的租约，Runner 又启动了同一任务，第二遍报 `resume_authorization_required`，并用 `needs_action` 覆盖了已保存的「完成」结果（别克OTA、ibuick）。基线就有，抖音同样受影响。0.4.1：有未送达的完成结果，或与上一个任务同一 attempt 时不再启动（`daemon-relaunch-20261105.test.mjs`，修复前失败）。
+  - `video_tab_missing`（上汽通用客服、别克远控、ibuick 各 3 次）：结果页顶部有服务号卡片时，识字把标签读成一行「视频 账号」，精确匹配找不到「视频」。0.4.1 新增 `findWord`：精确行优先，否则在合并行里按整词定位（夹具 `results-service-card-20261105`）。11-06 真机重搜 ibuick、别克远控各通过。
+  - 「评论 1」却读到 0 条：真机打开该帖确认唯一一条评论是图片（作者行「那年夏天 湖北 1天前」下面没有文字），解析按「没有文字的评论不上传」处理，不是漏读。是否以占位文字保留图片评论留给用户决定。
