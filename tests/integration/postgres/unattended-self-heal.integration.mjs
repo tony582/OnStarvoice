@@ -834,7 +834,7 @@ const retirementSource = sourceBlock(
 );
 const checkpointFlushSource = sourceBlock(
   sidebarSource,
-  "let unattendedCheckpointOutboxFlushPromise = null;",
+  "const unattendedCheckpointOutboxFlushPromisesByScope = new Map();",
   "function buildUnattendedLocalClosureReadyStorageKey(",
 );
 

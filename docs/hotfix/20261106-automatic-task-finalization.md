@@ -25,6 +25,16 @@
 - 终态回执：真实 outbox、更新、持久化、清理和 mutation 函数复现 3 项失败，均为已持久终态却 `transport_error`、队列保留 1；修后含身份/普通心跳/畸形补报反例 13/13 通过。
 - 范围较大的后台、停止核对和 ACK 回归 392/392 通过。首次异步启动清理暴露了迟到 A 与直接注入 B 的竞态测试；改为下一事件轮再开始清理，保留原安全断言后通过。
 - sidebar/outbox 新增失败回归先在旧实现复现 5 项失败；修后相关 89/89 通过，包含跨任务、同请求换轮次、并发新 revision、无队列回执失败和未清空上传保护。
-- 独立审查与全量回归结果在完成后补充。上述数量存在交叉，不相加作为总数。
+- 独立审查未发现阻断问题；另行运行 ACK/inspection 18/18、sidebar/outbox 42/42 通过。
+- 本地完整 Node 回归 3,509/3,509 通过。首次在沙箱内运行时，HTTP 边界用例因禁止监听 127.0.0.1 而失败；保留该次日志，经正常授权在沙箱外重跑全量后通过，未跳过测试。
+- 首次远端 CI 的 tests/builds 与生产 Node 24 兼容性通过；三个 PostgreSQL 矩阵任务在测试初始化时失败，原因是源码提取仍使用旧的全局 flush Promise 声明作为定位标记。同步定位标记后重新验证，业务断言不作删减；最终矩阵结果在完成后补充。
+
+上述数量存在交叉，不相加作为总数。
+
+## 候选包
+
+0.4.31 候选包已生成并逐文件校验：116 个文件与本分支源码一致，使用生产 API，不包含环境文件、密钥或嵌套安装包。相较本机实际加载目录中的 0.4.30，仅 `background.js`、`sidebar/sidebar-logic.js`、`utils/unattended-report-outbox.js` 和 `manifest.json` 不同。
+
+ZIP SHA-256：`fa7bf3cd27dfc8477c1c85cd735fc147bf19394dbc22c3320a1f4ea77fa7c4dd`。包位于 `outputs/task-finalization-20261106/StarVoice-extension-v0.4.31-20261106.zip`，校验记录为同目录的 `package-verification.json`。这是未发布候选包，版本号不表示已上线。
 
 原始日志：`outputs/task-finalization-20261106/tests/`。目前未更新主工作区的实际加载目录、未部署候选包、未操作现场扩展重载，也未强制结束任务。

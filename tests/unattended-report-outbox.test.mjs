@@ -1121,7 +1121,7 @@ test('an incomplete scope is rejected instead of falling back to a global flush'
 
 test('sidebar checkpoint single-flight isolates different attempts and the global startup sweep', async () => {
   const pending = [];
-  const context = {Map, console, unattendedCheckpointOutboxFlushPromise: null,
+  const context = {Map, console,
     unattendedCheckpointOutboxFlushPromisesByScope: new Map(), sendUnattendedRuntimeMessage() {},
     flushUnattendedCheckpointReportOutbox: options => new Promise(resolve => pending.push({options, resolve}))};
   runInNewContext(sourceSection('function flushPendingUnattendedCheckpointReports(',
