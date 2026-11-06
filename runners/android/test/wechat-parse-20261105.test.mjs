@@ -154,3 +154,18 @@ test('a 服务号 card on top of the results: the tabs read as one line and the 
   assert.deepEqual(findWord(plain, '视频', {region}).map(row => row.center), findText(plain, '视频', {region}).map(row => row.center));
   assert.equal(findWord([{text: '视频号 账号', x: 200, y: 280, w: 260, h: 50, conf: 1}], '视频', {region}).length, 0);
 });
+
+test('an image-only comment is kept as 「[图片]」; a header with its text still below the screen is not', () => {
+  // 2026-11-06: 「评论1」 whose only comment is a picture — header line, then 400 px of image, then the 首评 badge.
+  const screen = parseCommentScreen(rows('comments-image-only-20261106'));
+  assert.equal(screen.headerCount, 1);
+  assert.deepEqual(screen.comments.map(item => [item.author, item.location, item.timeLabel, item.content, item.reply]),
+    [['那年夏天', '湖北', '1天前', '[图片]', false]]);
+  assert.equal(screen.bottomCut, false);
+  // The same comment seen again after a scroll stays one comment.
+  assert.equal(mergeCommentScreens([screen, screen]).length, 1);
+  // 漫步人生's header sits 74 px above the comment input: its text is on the next screen, so it is not an image.
+  const busy = parseCommentScreen(rows('comments-207-20261105'));
+  assert.ok(!busy.comments.some(item => item.content === '[图片]'));
+  assert.ok(!busy.comments.some(item => item.author === '漫步人生'));
+});

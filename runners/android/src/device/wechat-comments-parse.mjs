@@ -17,6 +17,10 @@ const REPLIES_TAIL = /\s*(?:展开)?\d{1,4}\s*条回\S{0,2}$/u;
 // right after the term ("OTAQ算是", "NVH°功底"); a model name like "Q5" or "25°C" is left alone.
 const TERM_ICON = /(?<=[\p{Script=Han}A-Za-z])(?:Q(?=[\p{Script=Han}，。！？、+\s]|$)|°(?![CF]))/gu;
 export const cleanCommentText = text => String(text).replace(TERM_ICON, '').trim();
+// An image or sticker comment has its header line and no text under it. A text line starts ~60 px below its header;
+// the image comment measured on 2026-11-06 left 400 px before the next row. Such a comment is kept as 「[图片]」.
+export const IMAGE_COMMENT = '[图片]';
+const IMAGE_GAP = 200;
 
 function header(row) {
   const text = row.text.normalize('NFKC').trim();
@@ -80,6 +84,11 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
     if (current && (row.x >= (current.reply ? REPLY_X[0] : TOP_LEVEL_X[0])) && row.y - current.lastY < 140) {
       current.content += row.text; current.lastY = row.y;
     }
+  }
+  // A header near the bottom with no text yet is left for the next screen; only a clear gap below means an image.
+  const nextRowY = y => visible.find(row => row.y > y + 20 && row.x < LIKE_X)?.y ?? bottom;
+  for (const item of comments) {
+    if (!item.content.trim() && nextRowY(item.headerY) - item.headerY >= IMAGE_GAP) item.content = IMAGE_COMMENT;
   }
   const last = comments.at(-1);
   return {headerCount, post, expand, comments: comments.filter(item => item.content.trim())
