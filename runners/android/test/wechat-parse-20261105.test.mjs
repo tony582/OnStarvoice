@@ -169,3 +169,16 @@ test('an image-only comment is kept as 「[图片]」; a header with its text st
   assert.ok(!busy.comments.some(item => item.content === '[图片]'));
   assert.ok(!busy.comments.some(item => item.author === '漫步人生'));
 });
+
+test('a keyword longer than the search box is confirmed by the beginning the box shows', () => {
+  // 2026-11-06 patrol of a 20-character caption start: the box reads 「忍无可忍，无须再忍！凯迪拉克/」.
+  const screen = rows('results-long-keyword-20261106');
+  assert.equal(isResultsPage(screen, '忍无可忍，无须再忍！凯迪拉克ATSL升级'), true);
+  assert.equal(isResultsPage(screen, '忍无可忍，无须再忍！别克GL8升级'), false, 'another ending is another keyword');
+  // A short shown beginning proves nothing, and a keyword that fits the box still has to match in full.
+  const box = text => [{text, conf: 1, x: 140, y: 145, w: 600, h: 60}, {text: '视频', conf: 1, x: 202, y: 280, w: 84, h: 42}];
+  assert.equal(isResultsPage(box('忍无可忍/'), '忍无可忍，无须再忍！凯迪拉克ATSL升级'), false);
+  assert.equal(isResultsPage(box('别克车机升'), '别克车机升级'), false);
+  assert.equal(isResultsPage(box('别克车机升级'), '别克车机升级'), true);
+  assert.equal(findWord(screen, '视频', {region: {y0: 240, y1: 350, x1: 400}}).length, 1);
+});

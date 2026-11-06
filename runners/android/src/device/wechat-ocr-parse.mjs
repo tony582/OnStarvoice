@@ -159,9 +159,19 @@ export function sameCard(a, b) {
   return authorsAgree && similarity(a.snippet, b.snippet) >= 0.75;
 }
 
+// Letters and digits only, for comparing text that OCR may punctuate or cut differently.
+const bareText = value => comparable(value).replace(/[^\p{L}\p{N}]/gu, '');
+// The search box shows about 14 characters: a longer keyword (a patrol caption start) reads back as its beginning,
+// e.g. 「忍无可忍，无须再忍！凯迪拉克/」 for a 20-character query (2026-11-06). At least 8 shown characters must match.
+const BOX_PREFIX_MIN = 8;
+function boxShows(text, keyword) {
+  if (comparable(text) === comparable(keyword)) return true;
+  const shown = bareText(text), goal = bareText(keyword);
+  return shown.length >= BOX_PREFIX_MIN && shown.length < goal.length && goal.startsWith(shown);
+}
+
 export function isResultsPage(rows, keyword) {
-  const goal = comparable(keyword);
-  const box = rows.some(row => row.y < 230 && row.x < 700 && comparable(row.text) === goal);
+  const box = rows.some(row => row.y < 230 && row.x < 700 && boxShows(row.text, keyword));
   const tabs = rows.some(row => row.y > 230 && row.y < 360 && /视频/u.test(row.text));
   return box && tabs;
 }
