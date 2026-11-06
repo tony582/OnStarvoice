@@ -3,12 +3,25 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.29',
+  latestVersion: '0.4.30',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-10-17',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.29-20261017.zip',
+  releaseDate: '2026-11-06',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.30-20261106.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.30',
+      releaseDate: '2026-11-06',
+      releaseNotes: [{
+        tag: '采集稳定性',
+        notes: [
+          {title: '增强重试复用已完成阶段', desc: '同一次采集内，评论等后续阶段失败后复用已保存的详情，仅补做未完成阶段，减少重复打开和采集。需更新 Extension。'},
+          {title: '额外重试有明确预算', desc: '额外增强重试共享最多 10 分钟预算，评论失败最多补偿 1 次；10 分钟是额外重试窗口，不是整项任务的总时限。需更新 Extension。'},
+          {title: '耗尽后保留失败与已采结果', desc: '增强重试耗尽后保留失败记录、失败阶段和已保存详情，不再自动重新搜索整个关键词，也不再交给其它节点整词重开；普通可重试失败仍按原规则处理。需更新 Extension 并配合服务端更新。'},
+          {title: '减少心跳与回执锁冲突', desc: '服务端统一命令回执与心跳的锁获取顺序，缓解锁冲突；保留停止、撤销和旧回执校验。请在节点空闲且结果安全保存后升级，在原目录替换扩展并重载，不要在同一浏览器并装第二份扩展。'},
+        ],
+      }],
+    },
     {
       version: '0.4.29',
       releaseDate: '2026-10-17',
