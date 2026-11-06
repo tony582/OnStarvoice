@@ -79,6 +79,20 @@ export function createAdbScreen({adbPath = 'adb', serial, command = runDeviceCom
       const versions = [...new Set([...out.matchAll(/versionName=([^\s]+)/gu)].map(match => match[1]))];
       return versions.length === 1 ? versions[0] : null;
     },
+    /**
+     * Hand one app link to an app's own exported entry, for the main user only, so no browser or app-twin chooser
+     * appears. The link travels inside single quotes on the device shell: quotes, spaces and $`\ are refused.
+     */
+    async openLink(component, link, options = {}) {
+      if (!/^[a-z]\w*(?:\.\w+)+\/\.?[\w.$]+$/u.test(component)) throw new DeviceError('invalid_component', 'An explicit component is required');
+      if (typeof link !== 'string' || link.length > 600 || !/^[a-z][a-z0-9+.-]*:\/\/[^\s'"\\`$]+$/u.test(link)) {
+        throw new DeviceError('invalid_link', 'The app link cannot be passed safely');
+      }
+      const out = await shell(['am', 'start', '--user', '0', '-a', 'android.intent.action.VIEW', '-c', 'android.intent.category.BROWSABLE',
+        '-n', component, '-d', `'${link}'`], options);
+      if (/Error|Exception/u.test(out)) throw new DeviceError('app_launch_failed', 'The app did not accept the link', {deviceSettled: true});
+      return {launched: true};
+    },
     /** Bring an app's main screen forward; clearTop also closes the app's own screens above it. */
     async launch(component, {clearTop = false, ...options} = {}) {
       if (!/^[a-z]\w*(?:\.\w+)+\/\.?[\w.$]+$/u.test(component)) throw new DeviceError('invalid_component', 'An explicit component is required');

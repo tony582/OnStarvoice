@@ -1,6 +1,7 @@
 import {RunnerFault} from './errors.mjs';
 import {wechatPostEvent} from './wechat-evidence.mjs';
 import {comparable, similarity} from '../device/wechat-ocr-parse.mjs';
+import {EXPORT_ID} from '../device/wechat-profile.mjs';
 
 // Negative patrol of one Channels post (docs/hotfix/20261105-wechat-channels-mobile.md). The stored share link is
 // read through the preview page first (counts, still there?). With comments in the plan the phone also looks the
@@ -9,6 +10,8 @@ import {comparable, similarity} from '../device/wechat-ocr-parse.mjs';
 // found is never declared deleted: the run reports patrol_not_relocated and the server cools it down.
 export const MAX_OPENS = 3;
 const MAX_PAGES = 2;
+// Ways opening the post by its export id can fail with the phone left settled: then the post is searched instead.
+const OPEN_FALLBACK = new Set(['app_launch_failed', 'screen_unverified', 'comments_unverified', 'invalid_export_id', 'invalid_link']);
 
 const authorFits = (card, nickname) => {
   const a = comparable(card.author), b = comparable(nickname);
@@ -24,7 +27,7 @@ export const sameWork = (info, target) => Boolean(info && !info.unavailable && N
   && info.createtime === target.createtime && comparable(info.nickname) === comparable(target.author));
 
 /** One patrol item: call(method, params) runs a gated device action; resolve(link) reads a preview. */
-export async function runWechatPatrol({task, call, resolve, commentLimit, clock, record, note}) {
+export async function runWechatPatrol({task, call, resolve, commentLimit, clock, record, note, canOpenPost = false}) {
   const target = task.patrolTarget;
   if (!target || typeof target.url !== 'string') throw new RunnerFault('invalid_patrol_target');
   let stored = null;
@@ -32,7 +35,19 @@ export async function runWechatPatrol({task, call, resolve, commentLimit, clock,
   const reference = {...target, createtime: Number.isSafeInteger(target.createtime) ? target.createtime : stored?.createtime ?? null};
   if (stored && !stored.unavailable && !sameWork(stored, reference)) stored = null;
   let found = null;
-  if (commentLimit > 0) {
+  // The stored link's fresh preview names the post's export id: WeChat opens that post directly (2026-11-06).
+  // A failure that left the phone settled falls back to the search below.
+  if (commentLimit > 0 && canOpenPost && stored && !stored.unavailable && EXPORT_ID.test(stored.exportId ?? '')) {
+    try {
+      await call('openPost', {exportId: stored.exportId});
+      const comments = await call('readComments', {limit: commentLimit});
+      found = {card: null, shareUrl: target.url, info: stored, comments};
+    } catch (error) {
+      if (!OPEN_FALLBACK.has(error.code) || error.deviceSettled !== true) throw error;
+      note('wechat_patrol_open_failed', error);
+    }
+  }
+  if (commentLimit > 0 && !found) {
     // The server sends the start of the caption (hashtags and emoji removed) as the task keyword.
     let cards = (await call('search', {keyword: task.keyword, sort: 'all'})).cards;
     const tried = new Set();

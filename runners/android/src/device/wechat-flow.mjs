@@ -1,8 +1,8 @@
 import {DeviceError, throwIfAborted} from './bounded.mjs';
 import {pause} from './ui-wait.mjs';
 import {UNICODE_IME} from './adb-screen.mjs';
-import {ACTIVITY, MAIN_TABS, POINT, REGION, SWIPE, WECHAT_MAIN} from './wechat-profile.mjs';
-import {findText, findWord, isResultsPage, parseResultCards} from './wechat-ocr-parse.mjs';
+import {ACTIVITY, MAIN_TABS, MORE_VIDEOS_SHIFT, POINT, REGION, SWIPE, WECHAT_MAIN, WECHAT_SCHEME_ENTRY, feedLink} from './wechat-profile.mjs';
+import {commentButton, findText, findWord, isResultsPage, parseResultCards} from './wechat-ocr-parse.mjs';
 import {readCommentPanel} from './wechat-comment-reader.mjs';
 
 export const SHARE_LINK = /^https:\/\/weixin\.qq\.com\/sph\/[A-Za-z0-9_-]{4,40}$/u;
@@ -147,13 +147,24 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
     },
     /** Comment panel open → read → closed again; the work page is in front afterwards. */
     async readComments({limit, expandLimit = 3, signal}) {
-      await screen.tap(POINT.comments.x, POINT.comments.y, {signal});
+      // The bar moves up when WeChat adds its 「更多视频」 strip: find it on the screen before tapping.
+      const bar = commentButton(await view.look({signal, roi: REGION.workBar}), {fallback: POINT.comments, shift: MORE_VIDEOS_SHIFT});
+      await screen.tap(bar.x, bar.y, {signal});
       await pause(1500, signal);
       try { return await readCommentPanel({screen, view, limit, expandLimit, signal}); }
       finally {
         await screen.back({timeoutMs: 5000});
         await pause(700);
       }
+    },
+    /** Open one post straight from its export id (negative patrol); the work page must take focus. */
+    async openPost({exportId, signal}) {
+      context = null;
+      throwIfAborted(signal);
+      await screen.openLink(WECHAT_SCHEME_ENTRY, feedLink(exportId), {signal});
+      await view.waitFor(ACTIVITY.detail, {signal, timeoutMs: 8000});
+      await pause(1200, signal);
+      return {opened: true};
     },
     async returnToResults({signal}) {
       const {keyword} = requireContext();

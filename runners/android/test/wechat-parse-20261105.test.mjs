@@ -2,9 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
-import {comparable, findText, findWord, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
+import {commentButton, comparable, findText, findWord, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
+import {MORE_VIDEOS_SHIFT, POINT, feedLink} from '../src/device/wechat-profile.mjs';
 import {mergeCommentScreens, parseCommentScreen} from '../src/device/wechat-comments-parse.mjs';
-import {encodeModifiedUtf7} from '../src/device/adb-screen.mjs';
+import {createAdbScreen, encodeModifiedUtf7} from '../src/device/adb-screen.mjs';
 import {readFeedInfo} from '../src/preview/share-preview.mjs';
 import {agesAscending} from '../src/device/wechat-flow.mjs';
 
@@ -181,4 +182,40 @@ test('a keyword longer than the search box is confirmed by the beginning the box
   assert.equal(isResultsPage(box('别克车机升'), '别克车机升级'), false);
   assert.equal(isResultsPage(box('别克车机升级'), '别克车机升级'), true);
   assert.equal(findWord(screen, '视频', {region: {y0: 240, y1: 350, x1: 400}}).length, 1);
+});
+
+test('the 评论 button is found from the bar counts, also when the 「更多视频」 strip pushes the bar up', () => {
+  const options = {fallback: POINT.comments, shift: MORE_VIDEOS_SHIFT};
+  // Counts 9 / 6 / 1 at y 2127–2131: the icon row stays where the fixed point is.
+  const plain = commentButton(rows('work-page-20261106'), options);
+  assert.equal(plain.from, 'counts');
+  assert.equal(plain.x, POINT.comments.x);
+  assert.ok(Math.abs(plain.y - POINT.comments.y) <= 10, `y ${plain.y}`);
+  // Opened by link: only 9 was read, at y 1951, above 「↑更多视频」. The icon row (author line) is at y 1905.
+  const lifted = commentButton(rows('work-page-more-videos-20261106'), options);
+  assert.equal(lifted.from, 'counts');
+  assert.ok(Math.abs(lifted.y - 1905) <= 10, `y ${lifted.y}`);
+  // No count read: the strip alone shifts the fixed point; nothing at all keeps it.
+  const stripOnly = rows('work-page-more-videos-20261106').filter(row => !/^\d+$/u.test(row.text));
+  assert.deepEqual(commentButton(stripOnly, options), {x: POINT.comments.x, y: POINT.comments.y - MORE_VIDEOS_SHIFT, from: 'more_videos'});
+  assert.deepEqual(commentButton([], options), {...POINT.comments, from: 'fixed'});
+});
+
+test('a post is opened by its export id through WeChat\'s scheme entry for the main user; unsafe ids never reach the shell', async () => {
+  const id = 'export/UzFfBgAAxKWAeCIjPWGPk8zT4DCsIuXYLQcsJMdCb2FRt--U894rO25aoQ';
+  assert.equal(feedLink(id), `weixin://biz/finder/openFinderFeed/exportId=${id}&actionType=0&commentScene=39&entryScene=64&entryCardType=48&requestScene=0`);
+  for (const bad of ['', 'export/', 'export/abc', "export/abcdefgh'; rm -rf /", 'export/abcdefgh$(id)', 'https://x/abcdefgh']) {
+    assert.throws(() => feedLink(bad), {code: 'invalid_export_id'}, bad);
+  }
+  const sent = [];
+  const screen = createAdbScreen({serial: '829d89', command: async (_bin, args) => { sent.push(args); return {stdout: 'Status: ok'}; }});
+  await screen.openLink('com.tencent.mm/.plugin.base.stub.WXCustomSchemeEntryActivity', feedLink(id));
+  const args = sent[0];
+  assert.deepEqual(args.slice(args.indexOf('shell') + 1, args.indexOf('-d')), ['am', 'start', '--user', '0', '-a', 'android.intent.action.VIEW',
+    '-c', 'android.intent.category.BROWSABLE', '-n', 'com.tencent.mm/.plugin.base.stub.WXCustomSchemeEntryActivity']);
+  assert.equal(args.at(-1), `'${feedLink(id)}'`, 'the link is one quoted word on the device shell');
+  await assert.rejects(screen.openLink('com.tencent.mm/.X', "weixin://a'b"), {code: 'invalid_link'});
+  await assert.rejects(screen.openLink('com.tencent.mm/.X', 'weixin://a b'), {code: 'invalid_link'});
+  const refusing = createAdbScreen({serial: '829d89', command: async () => ({stdout: 'Error: Activity not started'})});
+  await assert.rejects(refusing.openLink('com.tencent.mm/.X', feedLink(id)), {code: 'app_launch_failed', deviceSettled: true});
 });
