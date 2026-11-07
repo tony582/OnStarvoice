@@ -3,6 +3,7 @@ import {
   DISCOVERY_AUTO_REQUEUED_CODE,
   DISCOVERY_AUTO_RETRY_LIMIT,
   DISCOVERY_LATE_RECEIPT_GRACE_MS,
+  discoveryAutoRetryCount,
   requeueDiscoveryCandidate,
   shouldAutoRetryDiscovery,
 } from './auto-retry.js';
@@ -57,11 +58,14 @@ export async function projectDiscoveryTaskResult(tx,{tenantId,task,snapshot={}})
   // Not stored and not stopped: hand the post to another browser instead of a
   // person, a bounded number of times. A completed snapshot without receipt
   // first waits for its late upload before another browser repeats the work.
-  // Terminal snapshots are replayed; a task already handed on keeps that
-  // outcome instead of requeueing (or escalating) a second time.
-  const alreadyRequeued=task.error?.code===DISCOVERY_AUTO_REQUEUED_CODE;
+  // Terminal snapshots are replayed, and the mirror rewrites the task's error
+  // from each one first. A candidate still queued from this task's item was
+  // already handed on: keep that outcome instead of requeueing (or
+  // escalating) a second time.
+  const alreadyRequeued=task.error?.code===DISCOVERY_AUTO_REQUEUED_CODE
+    ||(candidate.status==='queued'&&discoveryAutoRetryCount(candidate)>0);
   const autoRetry=stored||canceled ? 0
-    : alreadyRequeued ? Math.max(1,Math.floor(Number(task.error?.autoRetry))||1)
+    : alreadyRequeued ? Math.max(1,Math.floor(Number(task.error?.autoRetry))||discoveryAutoRetryCount(candidate)||1)
     : shouldAutoRetryDiscovery({candidate,sourceCode:source.sourceCode})
       ? await requeueDiscoveryCandidate(tx,{tenantId,candidate,agentId:task.assigned_agent_id,
           sourceCode:source.sourceCode||'detail_finished_without_ingestion',

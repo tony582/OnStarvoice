@@ -139,28 +139,39 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
     assert.equal((await query('SELECT id FROM records WHERE tenant_id=$1',[f.tenantId])).length,1);
   });
   await t.test('client completed snapshot cannot claim success without a formal ingestion receipt',async st=>{
-    const f=await fixture(st); await f.addRun(); const detail=await f.dispatch();
+    const f=await fixture(st),run=await f.addRun(); const detail=await f.dispatch();
     const [task]=await query('SELECT * FROM capture_tasks WHERE id=$1',[detail.taskId]);
     const projected=await withTransaction(tx=>projectNegativePatrolSnapshot(tx,f.browser,task,{status:'completed'}));
-    assert.equal(projected.status,'needs_action');
+    // No receipt is never success: the work goes back to the queue for another
+    // browser, after a grace period for the late upload.
+    assert.equal(projected.status,'failed');assert.equal(projected.error.code,'detail_auto_requeued');
     const [item]=await query('SELECT * FROM capture_task_items WHERE id=$1',[detail.itemId]);
-    assert.equal(item.status,'needs_action');
+    assert.equal(item.status,'failed');
+    const [candidate]=await query('SELECT * FROM capture_discovery_candidates WHERE id=$1',[run.receipt.candidateId]);
+    assert.equal(candidate.status,'queued');
+    assert.ok(candidate.last_error.autoRetry.notBefore>new Date().toISOString(),'waits for a late upload first');
+    assert.equal(await f.dispatch(),null,'the same browser cannot take it back, and nobody before the grace period');
     assert.equal((await query('SELECT * FROM records WHERE tenant_id=$1',[f.tenantId])).length,0);
   });
   await t.test('a real timeout heartbeat keeps the original cause until a formal late receipt arrives',async st=>{
     const f=await fixture(st),run=await f.addRun(),detail=await f.dispatch();
     const error={code:'TARGET_RUNNER_TAB_TIMEOUT',message:'定向作品采集页打开超时',phase:'target_navigating'};
     const mirrored=await f.mirror(detail,'failed',{error,progress:{current:1,total:1,phase:'discovered_post_capture'}});
-    assert.equal(mirrored.status,'needs_action');
-    assert.equal(mirrored.error.code,'detail_finished_without_ingestion');assert.equal(mirrored.error.reportedStatus,'failed');
+    assert.equal(mirrored.status,'failed');
+    assert.equal(mirrored.error.code,'detail_auto_requeued');assert.equal(mirrored.error.reportedStatus,'failed');
     assert.equal(mirrored.error.sourceCode,error.code);assert.equal(mirrored.error.sourceMessage,error.message);
     assert.equal(mirrored.error.sourcePhase,error.phase);assert.match(mirrored.message,/定向作品采集页打开超时.*TARGET_RUNNER_TAB_TIMEOUT/u);
+    assert.match(mirrored.message,/已自动换节点重试（第 1\/2 次）/u);
     assert.deepEqual(mirrored.counts,{total:1,processed:1,success:0,failed:1});
     const [item]=await query('SELECT * FROM capture_task_items WHERE id=$1',[detail.itemId]);
     const [attempt]=await query('SELECT * FROM capture_task_item_attempts WHERE item_id=$1',[detail.itemId]);
     const [candidate]=await query('SELECT * FROM capture_discovery_candidates WHERE id=$1',[run.receipt.candidateId]);
     assert.deepEqual(item.error,mirrored.error);assert.deepEqual(attempt.error,mirrored.error);
-    assert.deepEqual(candidate.last_error,mirrored.error);assert.equal(item.result_observation_id,null);
+    assert.equal(candidate.status,'queued');assert.deepEqual(candidate.last_error.autoRetry.excludedAgentIds,[f.browser.id]);
+    assert.equal(candidate.last_error.autoRetry.lastCode,error.code);assert.equal(item.result_observation_id,null);
+    await f.mirror(detail,'failed',{error});
+    const [replayed]=await query('SELECT last_error FROM capture_discovery_candidates WHERE id=$1',[run.receipt.candidateId]);
+    assert.equal(replayed.last_error.autoRetry.count,1,'a replayed snapshot does not requeue again');
     assert.equal((await query('SELECT id FROM records WHERE tenant_id=$1',[f.tenantId])).length,0);
     const stored=await f.store(detail);assert.ok(stored.observationId);
     const [settled]=await query('SELECT * FROM capture_tasks WHERE id=$1',[detail.taskId]);
@@ -180,7 +191,8 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
   });
   await t.test('real completion snapshot arriving before current sync is recovered without false failure',async st=>{
     const f=await fixture(st);await f.addRun();const detail=await f.dispatch();
-    const mirrored=await f.mirror(detail,'completed');assert.equal(mirrored.status,'needs_action');
+    const mirrored=await f.mirror(detail,'completed');assert.equal(mirrored.status,'failed');
+    assert.equal(mirrored.error.code,'detail_auto_requeued');
     const stored=await f.store(detail);
     const [task]=await query('SELECT status FROM capture_tasks WHERE id=$1',[detail.taskId]);
     assert.equal(task.status,'completed');
@@ -297,8 +309,21 @@ test('discovery detail pipeline against isolated PostgreSQL',async t=>{
       assert.equal((await query('SELECT record_id FROM capture_discovery_candidates WHERE id=$1',[run.receipt.candidateId]))[0].record_id,record.id);
     } finally {await holder.query('ROLLBACK');holder.release();}
   });
+  await t.test('an unacknowledged dispatch is handed to another browser before a person',async st=>{
+    const f=await fixture(st),run=await f.addRun();const detail=await f.dispatch();
+    await query(`UPDATE capture_agent_commands SET expires_at=now()-interval '1 minute' WHERE id=$1`,[detail.commandId]);
+    await withTransaction(tx=>reconcileDiscoveryDetails(tx,{tenantId:f.tenantId}));
+    const [candidate]=await query('SELECT status,last_error FROM capture_discovery_candidates WHERE id=$1',[run.receipt.candidateId]);
+    assert.equal(candidate.status,'queued');assert.equal(candidate.last_error.autoRetry.lastCode,'detail_create_expired');
+    const [task]=await query('SELECT status,error,message FROM capture_tasks WHERE id=$1',[detail.taskId]);
+    assert.equal(task.status,'failed');assert.equal(task.error.code,'detail_auto_requeued');
+    assert.match(task.message,/已自动换节点重试/u);
+    assert.equal(await f.dispatch(),null,'the browser that never acknowledged it is excluded');
+  });
   await t.test('expired dispatch settles its item and attempt so the operator can close it to history',async st=>{
     const f=await fixture(st);await f.addRun();const detail=await f.dispatch();
+    // Automatic retries already used up: the post now waits for a person.
+    await query(`UPDATE capture_discovery_candidates SET last_error='{"autoRetry":{"count":2}}' WHERE id=$1`,[detail.candidateId]);
     await query(`UPDATE capture_agent_commands SET expires_at=now()-interval '1 minute' WHERE id=$1`,[detail.commandId]);
     await withTransaction(tx=>reconcileDiscoveryDetails(tx,{tenantId:f.tenantId}));
     const [candidate]=await query('SELECT status,last_error FROM capture_discovery_candidates WHERE tenant_id=$1',[f.tenantId]);

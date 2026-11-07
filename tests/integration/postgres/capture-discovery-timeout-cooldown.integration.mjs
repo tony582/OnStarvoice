@@ -95,7 +95,12 @@ test('discovery-only timeout admission against isolated PostgreSQL', async t => 
     const candidate=await f.candidate(); assert.equal(await f.dispatch(),null);
     const [unchanged]=await query('SELECT status,detail_task_item_id FROM capture_discovery_candidates WHERE id=$1',[candidate.candidateId]);
     assert.deepEqual(unchanged,{status:'queued',detail_task_item_id:null});
-    const other=await f.dispatch(f.healthy); assert.equal(other.candidateId,candidate.candidateId);
+    // The three timed-out posts were requeued for other browsers too; the
+    // healthy browser takes the oldest queued work first.
+    const queued=await query(`SELECT id FROM capture_discovery_candidates WHERE tenant_id=$1 AND status='queued'
+      ORDER BY first_seen_at,id`,[f.tenantId]);
+    assert.equal(queued.length,4);
+    const other=await f.dispatch(f.healthy); assert.equal(other.candidateId,queued[0].id);
   });
   await t.test('expiry survives repeated snapshots and admits only one probe, whose failure pauses again',async st=>{
     const f=await fixture(st); await f.fail(); await f.fail(); const last=await f.fail();

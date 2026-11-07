@@ -314,11 +314,13 @@ test('the task board, the sidebar counts and the content list stay usable while 
     assert.equal('stale' in recovered.body, false);
     assert.equal(recovered.body.badges.triagePending, 4);
 
-    // No counts to fall back to: the failure stays visible to the caller.
+    // No counts to fall back to: the failure stays visible to the caller, as
+    // a retryable busy answer rather than a terminal server error.
     clearWorkspaceBadgesCache();
     const holdingAgain = saturateReporting(4.5);
     const failed = await get('/workspace/badges');
-    assert.equal(failed.status, 500);
+    assert.equal(failed.status, 503);
+    assert.equal(failed.body.error, 'server_busy');
     await (await holdingAgain);
     await reportingIdle();
   });

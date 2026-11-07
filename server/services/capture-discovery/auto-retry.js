@@ -63,6 +63,10 @@ export async function requeueDiscoveryCandidate(tx, {
         'requeuedAt',${ISO_NOW_SQL},
         'notBefore',to_char((now()+($6::bigint*interval '1 millisecond')) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')))
     WHERE tenant_id=$1 AND id=$2 AND record_id IS NULL AND status IN ('capturing','failed')
+      -- Only work some run still wants: a requeued candidate without an active
+      -- demand would never be dispatched again.
+      AND EXISTS (SELECT 1 FROM capture_discovery_run_candidates demand
+        WHERE demand.tenant_id=$1 AND demand.candidate_id=$2 AND demand.demand_status='active')
     RETURNING id`,
   [tenantId, candidate.id, code, count, JSON.stringify(excluded), Math.max(0, Math.floor(Number(delayMs) || 0))]);
   return updated ? count : 0;

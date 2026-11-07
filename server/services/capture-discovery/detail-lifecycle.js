@@ -62,7 +62,7 @@ export async function cancelDiscoveryDemands(tx, {tenantId,runId}) {
 }
 
 export async function reconcileDiscoveryDetails(tx,{tenantId,taskIds=null}) {
-  const rows=await tx.queryAll(`SELECT task.id AS task_id,task.assigned_agent_id FROM capture_tasks task WHERE task.tenant_id=$1
+  const rows=await tx.queryAll(`SELECT task.id AS task_id,task.assigned_agent_id,task.status AS task_status FROM capture_tasks task WHERE task.tenant_id=$1
     AND ($2::uuid[] IS NULL OR task.id=ANY($2::uuid[]))
     AND task.task_type='discovered_post_capture' AND task.attention_dismissed_at IS NULL
     AND (task.status='pending' OR (task.status='needs_action' AND task.error->>'code'='detail_create_expired'))
@@ -98,8 +98,9 @@ export async function reconcileDiscoveryDetails(tx,{tenantId,taskIds=null}) {
       FOR UPDATE OF item,attempt`,[tenantId,candidate.detail_task_item_id,row.task_id]);
     if (!item) continue;
     // The browser never acknowledged the job: give it to another browser
-    // first; only a repeatedly unacknowledged post waits for a person.
-    const autoRetry=shouldAutoRetryDiscovery({candidate,sourceCode:'detail_create_expired'})
+    // first; only a repeatedly unacknowledged post waits for a person. A
+    // legacy needs_action row is only settled, never put back in the queue.
+    const autoRetry=row.task_status==='pending'&&shouldAutoRetryDiscovery({candidate,sourceCode:'detail_create_expired'})
       ? await requeueDiscoveryCandidate(tx,{tenantId,candidate,agentId:row.assigned_agent_id,
           sourceCode:'detail_create_expired'})
       : 0;

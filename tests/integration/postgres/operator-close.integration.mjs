@@ -253,6 +253,8 @@ test('operator close ends dead needs_action roots without releasing fences, live
       return withTransaction(tx => mirrorTaskSnapshot(tx, browser, normalizeCloudTaskSnapshot(payload.tasks[0])));
     }
     const sourceError = {code: 'TARGET_RUNNER_TAB_TIMEOUT', message: '定向作品采集页打开超时', phase: 'target_navigating'};
+    // Automatic browser retries already used up: this post waits for a person.
+    await query(`UPDATE capture_discovery_candidates SET last_error='{"autoRetry":{"count":2}}' WHERE id=$1`, [receipt.candidateId]);
     const failedDetail = await mirrorDetail('failed', {error: sourceError});
     assert.equal(failedDetail.status, 'needs_action');
     assert.equal(failedDetail.error.code, 'detail_finished_without_ingestion');
