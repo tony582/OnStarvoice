@@ -510,6 +510,38 @@
     return safeEvents.slice(-MAX_EVENTS_PER_RUN);
   }
 
+  // Bounded copy of a keyword's exhausted-enhancement evidence. The server
+  // uses failedTargets to hand only the failed posts to another browser.
+  function normalizeEnhancementFailure(value) {
+    const source = objectValue(value);
+    if (Number(source.version) !== 1) return null;
+    const strings = (values, count, length) => [...new Set(
+      (Array.isArray(values) ? values : []).slice(0, count)
+        .map((item) => sanitizeText(item, length)).filter(Boolean),
+    )];
+    const seen = new Set();
+    const failedTargets = (Array.isArray(source.failedTargets) ? source.failedTargets : [])
+      .slice(0, 200)
+      .map((target) => ({
+        recordId: sanitizeText(target?.recordId, 200),
+        externalId: sanitizeText(target?.externalId, 120),
+        url: sanitizeText(target?.url, 2000),
+        platform: sanitizeText(target?.platform, 40),
+        stage: sanitizeText(target?.stage, 80),
+      }))
+      .filter((target) => target.externalId && /^https:\/\//i.test(target.url) &&
+        !seen.has(target.externalId) && seen.add(target.externalId));
+    return {
+      version: 1,
+      failedRecordIds: strings(source.failedRecordIds, 200, 200),
+      failedTargets,
+      savedDetailRecordIds: strings(source.savedDetailRecordIds, 200, 200),
+      failureStages: strings(source.failureStages, 20, 80),
+      autoRetryCount: normalizeNonNegativeInteger(source.autoRetryCount),
+      budgetStopReason: sanitizeText(source.budgetStopReason, 80),
+    };
+  }
+
   function normalizeCheckpoint(value = {}) {
     const input = objectValue(value);
     const keywordResults = Array.isArray(input.keywordResults)
@@ -548,6 +580,10 @@
               error: sanitizeText(source.error),
               ...(errorCode ? {errorCode} : {}),
               ...(errorCategory ? {errorCategory} : {}),
+              ...(source.retryable === false ? {retryable: false} : {}),
+              ...(normalizeEnhancementFailure(source.enhancementFailure)
+                ? {enhancementFailure: normalizeEnhancementFailure(source.enhancementFailure)}
+                : {}),
               ...(!keywordServiceAbnormal &&
               source.securityBlocked === true
                 ? {securityBlocked: true}

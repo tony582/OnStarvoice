@@ -296,8 +296,9 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     assert.equal(settled.error.code, 'ENHANCEMENT_RETRY_EXHAUSTED');
     assert.ok(settled.finished_at);
     assert.equal(settled.metadata.checkpoint.recovery, undefined);
-    assert.deepEqual(settled.metadata.checkpoint.enhancementFailure, enhancementFailure,
+    assert.deepEqual(settled.metadata.checkpoint.enhancementFailure, {...enhancementFailure, failedTargets: []},
       'failure records and stages survive snapshot sanitizing and durable item projection');
+    assert.equal(settled.metadata.keywordRepair, undefined, 'no post identity, so no repair handoff');
     assert.equal((await row('capture_tasks', parent.id)).status, 'completed_with_failures');
     assert.equal(await claim(f, NAMES[1]), null);
     const recovery = await ingestCaptureRecoveryItem({tenantId: f.tenant.id, itemId: item.id});
@@ -315,6 +316,77 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     assert.equal(manual.status, 201, JSON.stringify(manual.body));
     const second = await claim(f, NAMES[1]);
     assert.equal(second?.itemId, item.id, 'an operator can deliberately start a fresh attempt');
+  });
+
+  await t.test('exhausted posts are handed to another repair-capable browser and complete the keyword', async st => {
+    const f = await fixture(st);
+    const {parent, items: [item]} = await batch(f, {keywords: ['安吉星'], status: 'pending'});
+    const repairCapable = {...f.capabilities, keywordRepairTargetsV1: true};
+    const claimAs = (name, caps = repairCapable) => withTransaction(tx =>
+      dispatchNextElasticWorkItem(tx, {agent: f.byName(name), capabilities: caps}));
+    const first = await claimAs('火星');
+    assert.equal(first.itemId, item.id);
+    const target = {recordId: 'rec_keyword_notes_a', externalId: '6aa1e9900000000012027610',
+      url: 'https://www.xiaohongshu.com/explore/6aa1e9900000000012027610?xsec_token=integration-only',
+      platform: 'xiaohongshu', stage: 'navigation'};
+    const exhausted = (failedTargets) => ({category: 'enhancement_incomplete', retryable: false, savedCount: 30,
+      enhancementFailure: {version: 1, failedRecordIds: failedTargets.map(t => t.recordId), failedTargets,
+        savedDetailRecordIds: [], failureStages: ['navigation'], autoRetryCount: 1, budgetStopReason: 'retry_time_budget'}});
+    await report(f, first, {keyword: item.keyword, code: 'ENHANCEMENT_RETRY_EXHAUSTED', extraError: exhausted([target])});
+    let current = await itemRow(item.id);
+    assert.equal(current.status, 'retryable');
+    assert.equal(current.error.code, 'KEYWORD_REPAIR_PENDING');
+    assert.equal(current.error.sourceCode, 'ENHANCEMENT_RETRY_EXHAUSTED');
+    assert.match(current.error.message, /已交给其它节点补采这 1 条帖子（第 1\/2 次）/u);
+    assert.equal(current.metadata.keywordRepair.state, 'pending');
+    assert.equal(current.metadata.keywordRepair.count, 1);
+    assert.deepEqual(current.metadata.keywordRepair.targets, [{externalId: target.externalId, url: target.url, stage: 'navigation'}]);
+    assert.notEqual((await row('capture_tasks', parent.id)).status, 'completed_with_failures');
+
+    await report(f, first, {keyword: item.keyword, code: 'ENHANCEMENT_RETRY_EXHAUSTED', extraError: exhausted([target])});
+    assert.equal((await itemRow(item.id)).metadata.keywordRepair.count, 1, 'a replayed terminal snapshot plans once');
+
+    assert.equal(await claimAs('北京', f.capabilities), null, 'an old browser never re-searches a repair relay');
+    assert.equal(await claimAs('火星'), null, 'the browser that failed it never takes it back');
+    const repair = await claimAs('北京');
+    assert.equal(repair?.itemId, item.id);
+    const command = await row('capture_agent_commands', repair.commandId);
+    assert.deepEqual(command.payload.planSnapshot.keywordRepair.targets, current.metadata.keywordRepair.targets);
+    assert.equal(command.payload.planSnapshot.keywordRepair.round, 1);
+    assert.equal(command.payload.checkpoint.round, 1);
+    assert.equal((await row('capture_tasks', repair.childTaskId)).metadata.keywordRepairTargetCount, 1);
+
+    await report(f, repair, {keyword: item.keyword, status: 'completed'});
+    current = await itemRow(item.id);
+    assert.equal(current.status, 'completed');
+    assert.equal(current.metadata.keywordRepair.state, 'completed');
+    assert.equal((await row('capture_tasks', parent.id)).status, 'completed');
+  });
+
+  await t.test('a keyword repaired twice without success settles as failed', async st => {
+    const f = await fixture(st);
+    const {parent, items: [item]} = await batch(f, {keywords: ['至境哨兵'], status: 'pending'});
+    const repairCapable = {...f.capabilities, keywordRepairTargetsV1: true};
+    const claimAs = name => withTransaction(tx =>
+      dispatchNextElasticWorkItem(tx, {agent: f.byName(name), capabilities: repairCapable}));
+    const target = {recordId: 'rec_b', externalId: '6bb1e9900000000012027611',
+      url: 'https://www.xiaohongshu.com/explore/6bb1e9900000000012027611', platform: 'xiaohongshu', stage: 'comments_capture'};
+    const extraError = {category: 'enhancement_incomplete', retryable: false,
+      enhancementFailure: {version: 1, failedRecordIds: ['rec_b'], failedTargets: [target], savedDetailRecordIds: [],
+        failureStages: ['comments_capture'], autoRetryCount: 1, budgetStopReason: 'comment_attempt_budget'}};
+    let claimed = await claimAs('木星');
+    for (const name of ['金星', '成都']) {
+      await report(f, claimed, {keyword: item.keyword, code: 'ENHANCEMENT_RETRY_EXHAUSTED', extraError});
+      assert.equal((await itemRow(item.id)).status, 'retryable');
+      claimed = await claimAs(name);
+      assert.equal(claimed?.itemId, item.id, name);
+    }
+    await report(f, claimed, {keyword: item.keyword, code: 'ENHANCEMENT_RETRY_EXHAUSTED', extraError});
+    const settled = await itemRow(item.id);
+    assert.equal(settled.status, 'failed');
+    assert.equal(settled.error.code, 'ENHANCEMENT_RETRY_EXHAUSTED');
+    assert.equal(settled.metadata.keywordRepair.count, 2);
+    assert.equal((await row('capture_tasks', parent.id)).status, 'completed_with_failures');
   });
 
   await t.test('F1 replay: untried fenced nodes keep the keyword waiting only for the relax window', async st => {

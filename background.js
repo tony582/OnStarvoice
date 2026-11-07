@@ -1645,7 +1645,17 @@ function normalizeUnattendedEnhancementFailure(value) {
   const ids = values => [...new Set((Array.isArray(values) ? values : [])
     .map(item => String(item || '').trim().slice(0, 200)).filter(Boolean))].slice(0, 1000);
   const autoRetryCount = Math.floor(Number(value.autoRetryCount));
+  const seenTargets = new Set();
+  const failedTargets = (Array.isArray(value.failedTargets) ? value.failedTargets : []).map(target => ({
+    recordId: String(target?.recordId || '').trim().slice(0, 200),
+    externalId: String(target?.externalId || '').trim().slice(0, 120),
+    url: String(target?.url || '').trim().slice(0, 2000),
+    platform: String(target?.platform || '').trim().slice(0, 40),
+    stage: String(target?.stage || '').trim().slice(0, 80),
+  })).filter(target => target.externalId && /^https:\/\//i.test(target.url) &&
+    !seenTargets.has(target.externalId) && seenTargets.add(target.externalId)).slice(0, 200);
   return {version: 1, failedRecordIds: ids(value.failedRecordIds),
+    failedTargets,
     savedDetailRecordIds: ids(value.savedDetailRecordIds),
     failureStages: ids(value.failureStages).map(stage => stage.slice(0, 80)),
     autoRetryCount: Number.isFinite(autoRetryCount) ? Math.max(0, autoRetryCount) : 0,

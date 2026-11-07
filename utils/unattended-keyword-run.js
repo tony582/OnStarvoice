@@ -7,10 +7,23 @@ function enhancementRetryExhausted(value = {}) {
   return text(value?.errorCode || value?.error?.code || value?.code).toUpperCase() === ENHANCEMENT_RETRY_EXHAUSTED;
 }
 
+function normalizeEnhancementFailureTargets(values) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : []).map(target => ({
+    recordId: text(target?.recordId).slice(0, 200),
+    externalId: text(target?.externalId).slice(0, 120),
+    url: text(target?.url).slice(0, 2000),
+    platform: text(target?.platform).slice(0, 40),
+    stage: text(target?.stage).slice(0, 80),
+  })).filter(target => target.externalId && /^https:\/\//i.test(target.url) &&
+    !seen.has(target.externalId) && seen.add(target.externalId)).slice(0, 200);
+}
+
 function normalizeEnhancementFailure(value) {
   if (!value || typeof value !== "object" || Number(value.version) !== 1) return null;
   const ids = values => [...new Set((Array.isArray(values) ? values : []).map(item => text(item).slice(0, 200)).filter(Boolean))].slice(0, 1000);
   return {version: 1, failedRecordIds: ids(value.failedRecordIds),
+    failedTargets: normalizeEnhancementFailureTargets(value.failedTargets),
     savedDetailRecordIds: ids(value.savedDetailRecordIds),
     failureStages: ids(value.failureStages).map(stage => stage.slice(0, 80)),
     autoRetryCount: nonNegativeInt(value.autoRetryCount),

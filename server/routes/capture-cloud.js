@@ -145,6 +145,14 @@ import {
 } from '../services/capture-operator-close.js';
 import {sweepDeadAttentionRoots} from '../services/capture-dead-attention.js';
 import {
+  KEYWORD_REPAIR_STARVATION_MS,
+  buildKeywordRepairCheckpoint,
+  keywordRepairPendingError,
+  pendingKeywordRepair,
+  planKeywordRepair,
+  settleKeywordRepair,
+} from '../services/capture-keyword-repair.js';
+import {
   AGENT_HEALTH_STARVATION_MS,
   agentPlatformAdmission,
   elasticItemStarving,
@@ -6262,6 +6270,33 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       status = 'failed';
       error = filterVerification.error;
     }
+    // Exhausted per-post enhancement: relay only the failed posts of this
+    // step to another browser instead of ending the keyword as failed.
+    const itemAgentAttemptLimit =
+      elasticItemAgentAttemptLimit(parent.metadata, currentItemState?.metadata);
+    const keywordRepairPlan = elasticPool && status === 'failed' &&
+      !filterVerification && currentItemState
+      ? planKeywordRepair({
+          entry,
+          checkpoint,
+          itemMetadata: currentItemState.metadata,
+          planSnapshot: safeJson(parent.metadata).planSnapshot,
+          parentMetadata: parent.metadata,
+          platform: text(task.platform || parent.platform, 40),
+          sourceAgentId: agent.id,
+          executionTaskId: task.id,
+          attemptBudgetRemaining:
+            Math.max(serverAttemptCount, Number(attemptBudgetProjection.attemptBudget) || 0) <
+            itemAgentAttemptLimit * ELASTIC_TECHNICAL_RETRY_ROUNDS,
+        })
+      : null;
+    const keywordRepairPatch = keywordRepairPlan || (currentItemState
+      ? settleKeywordRepair({itemMetadata: currentItemState.metadata, checkpoint, status})
+      : null);
+    if (keywordRepairPlan) {
+      status = 'retryable';
+      error = keywordRepairPendingError(error, keywordRepairPlan);
+    }
     const recovery = buildElasticRecoveryMetadata({
       status,
       error,
@@ -6269,7 +6304,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       attemptCount: serverAttemptCount,
       sourceAgentId: agent.id,
       existingRecovery: elasticRecoveryMetadataForItem(currentItemState),
-      agentAttemptLimit: elasticItemAgentAttemptLimit(parent.metadata, currentItemState?.metadata),
+      agentAttemptLimit: itemAgentAttemptLimit,
     });
     if (elasticPool && entry.searchPassCompletion) {
       annotateSearchPassRecoveryLimit(error, {
@@ -6289,6 +6324,10 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
           CASE
             WHEN $11::boolean THEN $12::jsonb
             ELSE '{}'::jsonb
+          END ||
+          CASE
+            WHEN $13::jsonb IS NULL THEN '{}'::jsonb
+            ELSE jsonb_build_object('keywordRepair', $13::jsonb)
           END,
         started_at = CASE
           WHEN $1 IN (
@@ -6322,6 +6361,7 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       keyword,
       elasticPool,
       JSON.stringify(attemptBudgetProjection.metadataPatch),
+      keywordRepairPatch ? JSON.stringify(keywordRepairPatch) : null,
     ]);
     if (!item) continue;
     projectedItemIds.push(item.id);
@@ -8049,6 +8089,24 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   if (requiresSingleRelay && freshCapabilities.singleRelayV1 !== true) {
     return nextCandidate();
   }
+  // A repair relay carries only the posts another browser failed to enhance.
+  // Browsers that cannot skip the search leave it to capable ones, unless it
+  // has waited long enough that an ordinary keyword relay is better than none.
+  const pendingRepair = candidate.item_type === 'keyword' &&
+    candidate.item_status === 'retryable'
+    ? pendingKeywordRepair(itemMetadata)
+    : null;
+  const repairStarving = Boolean(pendingRepair) &&
+    Date.now() - Date.parse(String(candidate.item_updated_at || '')) >=
+      KEYWORD_REPAIR_STARVATION_MS;
+  if (pendingRepair && freshCapabilities.keywordRepairTargetsV1 !== true &&
+      !repairStarving) {
+    return nextCandidate();
+  }
+  const keywordRepairClaim =
+    pendingRepair && freshCapabilities.keywordRepairTargetsV1 === true
+      ? pendingRepair
+      : null;
   const negativePost = candidate.item_type === 'negative_post';
   const watchedContent = candidate.item_type === 'watched_content';
   const targetedContent = negativePost || watchedContent;
@@ -8150,11 +8208,13 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   }
   const sequentialResumeCheckpoint = targetedContent
     ? null
-    : buildSequentialSearchResumeCheckpoint({
-        planSnapshot,
-        itemMetadata,
-        keyword: candidate.keyword,
-      });
+    : keywordRepairClaim
+      ? buildKeywordRepairCheckpoint({repair: keywordRepairClaim, itemMetadata})
+      : buildSequentialSearchResumeCheckpoint({
+          planSnapshot,
+          itemMetadata,
+          keyword: candidate.keyword,
+        });
 
   const childTaskId = crypto.randomUUID();
   const commandId = crypto.randomUUID();
@@ -8301,14 +8361,31 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         },
       },
     });
-    childPlan = childInput.planSnapshot;
+    childPlan = keywordRepairClaim
+      ? {
+          ...childInput.planSnapshot,
+          keywordRepair: {
+            version: 1,
+            keyword: keywordRepairClaim.keyword,
+            round: keywordRepairClaim.round,
+            platform: keywordRepairClaim.platform || childInput.planSnapshot.platform,
+            targets: keywordRepairClaim.targets,
+            count: keywordRepairClaim.count,
+          },
+        }
+      : childInput.planSnapshot;
     requestHash = hashOrchestrationRequest({
       parentTaskId: candidate.parent_id,
       itemId: candidate.item_id,
       assignmentRevision,
       agentId: agent.id,
-      taskInput: childInput,
+      taskInput: keywordRepairClaim
+        ? {...childInput, planSnapshot: childPlan}
+        : childInput,
     });
+    if (keywordRepairClaim) {
+      childMessage = `已从云端领取关键词补采（${keywordRepairClaim.targets.length} 条帖子），等待设备确认`;
+    }
     commandPayload = {
       taskId: childTaskId,
       clientTaskId: childTaskId,
@@ -8390,10 +8467,17 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     claimUnit,
     attemptIdentity,
     ...(bootstrapPacing ? {bootstrapPacing} : {}),
-    ...(sequentialResumeCheckpoint
+    ...(sequentialResumeCheckpoint && !keywordRepairClaim
       ? {
           resumedSequentialSearch: true,
           resumeRound: sequentialResumeCheckpoint.round,
+        }
+      : {}),
+    ...(keywordRepairClaim
+      ? {
+          keywordRepairRound: keywordRepairClaim.round,
+          keywordRepairTargetCount: keywordRepairClaim.targets.length,
+          keywordRepairCount: keywordRepairClaim.count,
         }
       : {}),
     createAckTimeoutSeconds:

@@ -6474,6 +6474,11 @@ export async function batchCaptureDetailsForRecords(
           recoveryRequired: runnerContextInterrupted,
           retryable: effectiveError?.retryable === true,
           ...(effectiveError?.budgetStopReason ? {budgetStopReason: effectiveError.budgetStopReason} : {}),
+          // The post identity lets the server hand only this post to another
+          // browser if the keyword's local retry budget runs out.
+          ...(checkpointTargetId && noteUrl
+            ? {targetExternalId: checkpointTargetId, targetUrl: noteUrl, targetPlatform: recordPlatform}
+            : {}),
           ...captureTraceFields,
         };
         results.push(result);
@@ -16544,6 +16549,64 @@ function buildInterKeywordDelayMessage({
   return `已采「${keyword}」，采集增强未执行，${seconds} 秒后再搜下一个关键词(防风控·随机间隔)…`;
 }
 
+// Repair handoff from the server (planSnapshot.keywordRepair): the failed
+// posts of one keyword step that another browser could not enhance.
+export function resolveKeywordRepairTargets(repair, {keyword = '', round = 1, platform = ''} = {}) {
+  if (!repair || typeof repair !== 'object' || Number(repair.version) !== 1) return [];
+  if (String(repair.keyword || '').trim() !== String(keyword || '').trim()) return [];
+  if (Math.max(1, Number(repair.round) || 1) !== Math.max(1, Number(round) || 1)) return [];
+  const repairPlatform = String(repair.platform || '').trim().toLowerCase();
+  if (repairPlatform && platform && repairPlatform !== String(platform).trim().toLowerCase()) return [];
+  const seen = new Set();
+  return (Array.isArray(repair.targets) ? repair.targets : [])
+    .map((target) => ({
+      externalId: String(target?.externalId || '').trim().slice(0, 120),
+      url: String(target?.url || '').trim().slice(0, 2000),
+      title: String(target?.title || '').trim().slice(0, 500),
+    }))
+    .filter((target) => {
+      if (!target.externalId || seen.has(target.externalId)) return false;
+      try {
+        const parsed = new URL(target.url);
+        if (parsed.protocol !== 'https:' || detectPlatformFromUrl(target.url) !== platform) return false;
+      } catch {
+        return false;
+      }
+      seen.add(target.externalId);
+      return true;
+    })
+    .slice(0, 200);
+}
+
+async function prepareKeywordRepairRecords({keyword, platform, targets}) {
+  const items = targets.map((target) => ({
+    noteId: target.externalId,
+    id: target.externalId,
+    url: target.url,
+    title: target.title || '',
+  }));
+  try {
+    const saved = await saveCaptureResultRecords({
+      type: 'keyword_notes',
+      platform,
+      data: {keyword, items, totalCount: items.length, keywordRepair: true},
+      meta: {source: 'keyword_repair'},
+    });
+    const recordIds = Array.isArray(saved?.recordIds) ? saved.recordIds.filter(Boolean) : [];
+    if (recordIds.length === 0) {
+      return {keyword, ok: false, partial: true, recordIds: [], keywordRepair: true,
+        errorCode: 'KEYWORD_REPAIR_RECORDS_UNAVAILABLE',
+        error: '补采帖子未能写入本地数据池，已保留等待重试'};
+    }
+    return {keyword, ok: true, recordIds, candidateCount: recordIds.length,
+      scanComplete: true, keywordRepair: true};
+  } catch (error) {
+    return {keyword, ok: false, partial: true, recordIds: [], keywordRepair: true,
+      errorCode: 'KEYWORD_REPAIR_RECORDS_UNAVAILABLE',
+      error: error?.message || '补采帖子未能写入本地数据池，已保留等待重试'};
+  }
+}
+
 export async function batchCaptureByKeywords({
   keywords = [],
   platform = '',
@@ -16560,10 +16623,17 @@ export async function batchCaptureByKeywords({
   waitForegroundTabId = null,
   onProgress = null,
   shouldStop = null,
+  keywordRepair = null,
+  keywordRepairRound = 1,
 } = {}) {
   if (!keywords.length) {
     return { ok: true, results: [], stats: { total: 0, success: 0, failed: 0 } };
   }
+  const repairTargetsForKeyword = keywordRepair
+    ? (keyword) => resolveKeywordRepairTargets(keywordRepair, {
+        keyword, round: keywordRepairRound, platform,
+      })
+    : () => [];
   const xhsPublishTimeWindow = platform === 'xiaohongshu' &&
     isXhsPublishTimeWindow(searchFilters?.publishTime)
       ? searchFilters.publishTime
@@ -16843,20 +16913,32 @@ export async function batchCaptureByKeywords({
 
     const keyword = keywords[i];
     let keywordResult = null;
+    const repairTargets = repairTargetsForKeyword(keyword);
 
     if (onProgress) {
       onProgress({
         current: i + 1,
         total: keywords.length,
         keyword,
-        phase: isDouyinPlatform(platform) ? 'submitting_search' : 'navigating',
-        message: isDouyinPlatform(platform)
-          ? `正在切换并搜索关键词「${keyword}」(${i + 1}/${keywords.length})...`
-          : `正在导航到关键词「${keyword}」(${i + 1}/${keywords.length})...`,
+        phase: repairTargets.length > 0
+          ? 'repair_preparing'
+          : isDouyinPlatform(platform) ? 'submitting_search' : 'navigating',
+        message: repairTargets.length > 0
+          ? `正在补采关键词「${keyword}」上一节点未完成的 ${repairTargets.length} 条帖子...`
+          : isDouyinPlatform(platform)
+            ? `正在切换并搜索关键词「${keyword}」(${i + 1}/${keywords.length})...`
+            : `正在导航到关键词「${keyword}」(${i + 1}/${keywords.length})...`,
       });
     }
 
-    try {
+    // Repair handoff: the search already ran on another browser. Only its
+    // failed posts come here; they enter the same enhancement path below.
+    if (repairTargets.length > 0) {
+      keywordResult = await prepareKeywordRepairRecords({keyword, platform, targets: repairTargets});
+      results.push(keywordResult);
+      if (keywordResult.ok) successCount++;
+      else failedCount++;
+    } else try {
       if (isDouyinPlatform(platform)) {
         await assertNoDouyinSearchSecurityChallengeInTab(runnerTabId);
       }

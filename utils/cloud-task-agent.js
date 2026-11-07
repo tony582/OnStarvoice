@@ -43,10 +43,45 @@
       );
   }
 
+  // A keyword's exhausted-enhancement evidence sits below the generic depth
+  // limit (checkpoint.keywordResults[].enhancementFailure.*). Keep its bounded
+  // arrays instead of flattening them to text, so the server can hand only
+  // the failed posts to another browser.
+  function sanitizeEnhancementFailure(value) {
+    if (!value || typeof value !== "object" || Number(value.version) !== 1) return null;
+    const strings = (values, count, length) => [...new Set(
+      (Array.isArray(values) ? values : []).slice(0, count)
+        .map((item) => sanitizeText(item, length)).filter(Boolean),
+    )];
+    const seen = new Set();
+    const failedTargets = (Array.isArray(value.failedTargets) ? value.failedTargets : [])
+      .slice(0, 200)
+      .map((target) => ({
+        recordId: sanitizeText(target?.recordId, 200),
+        externalId: sanitizeText(target?.externalId, 120),
+        url: sanitizeText(target?.url, 2000),
+        platform: sanitizeText(target?.platform, 40),
+        stage: sanitizeText(target?.stage, 80),
+      }))
+      .filter((target) => target.externalId && /^https:\/\//i.test(target.url) &&
+        !seen.has(target.externalId) && seen.add(target.externalId));
+    const autoRetryCount = Math.floor(Number(value.autoRetryCount));
+    return {
+      version: 1,
+      failedRecordIds: strings(value.failedRecordIds, 200, 200),
+      failedTargets,
+      savedDetailRecordIds: strings(value.savedDetailRecordIds, 200, 200),
+      failureStages: strings(value.failureStages, 20, 80),
+      autoRetryCount: Number.isFinite(autoRetryCount) ? Math.max(0, autoRetryCount) : 0,
+      budgetStopReason: sanitizeText(value.budgetStopReason, 80),
+    };
+  }
+
   function sanitizeStructuredValue(value, key = "", depth = 0) {
     const normalizedKey = String(key || "")
       .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
       .toLowerCase();
+    if (normalizedKey === "enhancement_failure") return sanitizeEnhancementFailure(value);
     // These are closure-state booleans, not session identifiers. Preserve the
     // exact false values so the server can fail-closed verify local teardown.
     const isLocalClosureSessionFlag =
@@ -1190,6 +1225,8 @@
           remoteTaskKeywordPostLimit: true,
           remoteSequentialSearchPassesV1: true,
           singleRelayV1: true,
+          // 0.4.32：能只补采交来的失败帖子（planSnapshot.keywordRepair），不重搜整个关键词。
+          keywordRepairTargetsV1: true,
           localClosureReuseFenceV1: true,
           remoteOrchestrationRecoveryMergeV1: true,
           negativePostPatrol: true,

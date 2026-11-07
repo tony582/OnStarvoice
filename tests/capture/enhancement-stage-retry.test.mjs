@@ -123,6 +123,20 @@ test('retry admission budget starts after initial capture and limits the next co
   assert.equal(calls.comments[0].maxDurationMs, 600_000, 'initial collection keeps the configured duration');
   assert.equal(calls.comments[1].maxDurationMs, 5_000);
   assert.equal(calls.comments.length, 2);
+  assert.deepEqual(result.enhancementFailure.failedTargets.map(({externalId, url, platform}) => ({externalId, url, platform})),
+    [{externalId: noteId, url: noteUrl, platform: 'xiaohongshu'}], 'the failed post can be handed to another browser');
+});
+
+test('a repair handoff yields only the same platform https targets for its keyword and step', async () => {
+  const {resolveKeywordRepairTargets} = await import('../../utils/capture-sync.js');
+  const repair = {version: 1, keyword: '安吉星', round: 2, platform: 'xiaohongshu',
+    targets: [{externalId: noteId, url: noteUrl}, {externalId: 'dy', url: 'https://www.douyin.com/video/7704843464386924651'},
+      {externalId: noteId, url: noteUrl}, {externalId: 'insecure', url: 'http://www.xiaohongshu.com/explore/x'}]};
+  assert.deepEqual(resolveKeywordRepairTargets(repair, {keyword: '安吉星', round: 2, platform: 'xiaohongshu'})
+    .map(target => target.externalId), [noteId]);
+  assert.deepEqual(resolveKeywordRepairTargets(repair, {keyword: '安吉星', round: 1, platform: 'xiaohongshu'}), []);
+  assert.deepEqual(resolveKeywordRepairTargets(repair, {keyword: '别克APP', round: 2, platform: 'xiaohongshu'}), []);
+  assert.deepEqual(resolveKeywordRepairTargets(null, {keyword: '安吉星', round: 2, platform: 'xiaohongshu'}), []);
 });
 
 test('stage checkpoints are scoped, copied and never shared across invocations', () => {

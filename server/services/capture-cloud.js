@@ -211,9 +211,23 @@ function boundedEnhancementFailure(value) {
     (Array.isArray(values) ? values : []).slice(0, count)
       .filter(item => typeof item === 'string').map(item => text(item, length)).filter(Boolean),
   )];
+  const seenTargets = new Set();
+  const failedTargets = (Array.isArray(value.failedTargets) ? value.failedTargets : [])
+    .slice(0, 200)
+    .filter(target => target && typeof target === 'object' && !Array.isArray(target))
+    .map(target => ({
+      recordId: text(target.recordId, 240),
+      externalId: text(target.externalId, 120),
+      url: text(target.url, 2000),
+      platform: text(target.platform, 40),
+      stage: text(target.stage, 80),
+    }))
+    .filter(target => target.externalId && /^https:\/\//i.test(target.url) &&
+      !seenTargets.has(target.externalId) && seenTargets.add(target.externalId));
   return {
     version: 1,
     failedRecordIds: strings(value.failedRecordIds, 200, 240),
+    failedTargets,
     savedDetailRecordIds: strings(value.savedDetailRecordIds, 200, 240),
     failureStages: strings(value.failureStages, 20, 80),
     autoRetryCount: Number.isFinite(Number(value.autoRetryCount))

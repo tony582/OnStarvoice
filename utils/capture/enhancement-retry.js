@@ -554,9 +554,26 @@ function finalizeEnhancementRetry(finalResult, retrySession, retryCount) {
   const budgetStopReason = retrySession.remainingMs() <= 0
     ? 'retry_time_budget'
     : unresolved.find(item => item?.budgetStopReason)?.budgetStopReason || 'attempt_budget';
+  // Posts another browser can repair: a canonical identity plus the opened URL.
+  const failedTargets = [];
+  const seenTargets = new Set();
+  for (const item of unresolved) {
+    const externalId = normalizeText(item?.targetExternalId).slice(0, 120);
+    const url = normalizeText(item?.targetUrl).slice(0, 2000);
+    if (!externalId || !/^https:\/\//i.test(url) || seenTargets.has(externalId)) continue;
+    seenTargets.add(externalId);
+    failedTargets.push({
+      recordId: normalizeText(item.recordId).slice(0, 200),
+      externalId,
+      url,
+      platform: normalizeText(item?.targetPlatform).slice(0, 40),
+      stage: normalizeText(item?.stage).slice(0, 80),
+    });
+  }
   const enhancementFailure = {
     version: 1,
     failedRecordIds: unresolved.map(item => normalizeText(item.recordId)).filter(Boolean),
+    failedTargets: failedTargets.slice(0, 200),
     failureStages: [...new Set(unresolved.map(item => normalizeText(item.stage)).filter(Boolean))],
     autoRetryCount: retryCount,
     savedDetailRecordIds: retrySession.savedRecordIds(),

@@ -22,6 +22,10 @@ const project = checkpoint => plain(background.checkpoint({checkpoint}));
 const evidence = {
   version: 1,
   failedRecordIds: ["record-2", "record-3"],
+  failedTargets: [
+    {recordId: "record-2", externalId: "7704843464386924651",
+      url: "https://www.douyin.com/video/7704843464386924651", platform: "douyin", stage: "comments"},
+  ],
   savedDetailRecordIds: ["record-1", "record-2", "record-3"],
   failureStages: ["comments"],
   autoRetryCount: 1,

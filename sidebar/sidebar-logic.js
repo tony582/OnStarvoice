@@ -14917,6 +14917,8 @@ async function handleBatchKeywordCapture(options = {}) {
         searchFilters: roundSearchFilters,
         disableAutomaticSearchRetry,
         requireVerifiedFilters,
+        keywordRepair: runOptions.keywordRepair || null,
+        keywordRepairRound: round,
         captureParams: {
           minLikes: keywordMinLikes,
           sortDimension: sortContext.dimension,
@@ -20604,6 +20606,8 @@ async function runUnattendedKeywordPlanRequest(request) {
         ? request.orchestrationContext.itemAttempts
         : [],
       searchPasses: sequentialSearchEnabled ? searchPasses : null,
+      // Server handoff of only the posts another browser failed to enhance.
+      keywordRepair: plan.keywordRepair || null,
       searchFilters: plan.searchFilters || {},
       disableAutomaticSearchRetry:
         plan.recoveryPolicy?.disableAutomaticSearchRetry === true,
