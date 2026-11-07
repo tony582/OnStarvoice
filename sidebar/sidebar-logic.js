@@ -3221,11 +3221,15 @@ async function retireSupersededUnattendedAttempt({
   adoptedUnattendedCaptureExecutionLockId = "";
   let flushed = true;
   let pendingUploads = 0;
+  // The background derives the runner identity from this page's URL. When it
+  // answers not_unattended_runner, every resend would get the same answer.
+  let receiptRefused = false;
   const sendReceipt = async (receipt) => {
+    if (receiptRefused) return false;
     let deliveredReceipt = receipt;
     let retryScheduled = false;
     const scheduleReceiptRetry = () => {
-      if (retryScheduled) return;
+      if (retryScheduled || receiptRefused) return;
       retryScheduled = true;
       const retry = setTimeout(() => {
         void sendReceipt(receipt).catch(error => console.warn(
@@ -3255,6 +3259,11 @@ async function retireSupersededUnattendedAttempt({
           ...deliveredReceipt,
         });
         if (response?.ok) return true;
+        if (response?.ok === false && response.reason === "not_unattended_runner") {
+          receiptRefused = true;
+          console.warn("[Sidebar] Unattended retirement receipt refused; not resending:", response.reason);
+          return false;
+        }
       } catch (error) {
         console.warn("[Sidebar] Unattended retirement receipt not delivered:", error);
       }
@@ -3280,7 +3289,9 @@ async function retireSupersededUnattendedAttempt({
       const pending = pendingFrom(stats);
       const complete = pending === 0 && !stats?.canceled && !stats?.blocked;
       const delivered = await sendReceipt({flushed: complete, flushing: !complete, pendingUploads: pending});
-      if (!complete || !delivered) {
+      // Pending uploads keep draining after a refused receipt; only the
+      // receipt itself stops being resent.
+      if (!complete || (!delivered && !receiptRefused)) {
         const timer = setTimeout(() => {
           queue.retryFailed?.();
           queue.drain().then(finishFlush).catch(() => finishFlush(queue.getStats()));

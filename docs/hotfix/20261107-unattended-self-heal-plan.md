@@ -100,3 +100,17 @@
   - 手机补详情换节点重试。
 - 全量 Node 回归和 CI 全绿。
 - 上线后连续观察 3 轮日常巡检，标准是"需要处理"只剩登录或验证码类，且每个失败帖子都有去向。
+
+## 实施状态（11-07）
+
+S1–S6 已在 `codex/feat-unattended-self-heal-20261106` 实现，版本 0.4.32（含未单独发布的 0.4.31 收尾修复）。
+
+- **S1**：`server/services/capture-agent-platform-health.js`。弹性领活和手机补详情派发都先查健康度；读取超时 750 ms 时放行，不挡领活。指定节点的工作不受隔离。
+- **S2**：耗尽时上报 `failedTargets`（最多 200 条）。服务端 `server/services/capture-keyword-repair.js` 把关键词记为 `KEYWORD_REPAIR_PENDING` 并换节点；带 `keywordRepairTargetsV1` 能力的节点跳过搜索，只补这些帖子。同一快照重放不会多算次数。旧节点等满 60 分钟才可领，避免没人做。修复了扩展任务账本和云端快照丢掉 `enhancementFailure` 的问题，这是生产上补采信息为空的原因。
+- **S3**：数据库忙在单条同步里返回 `server_busy` 并标记可重试，整请求返回 503 和 Retry-After。扩展在运行结束前分别于 15 秒、45 秒补传可重试的失败记录。
+- **S4**：`server/services/capture-discovery/auto-retry.js`。未入库的补详情自动排回队列，排除失败节点 30 分钟，最多 2 次；没有原因的完成快照先等 3 分钟迟到回执。下发未确认（指令过期）同样换节点。重放的终态快照不会二次排队或转人工。迟到的入库回执仍能完成原任务。
+- **S5**：预算用完时阶段记为 `retry_budget`。
+- **S6**：后台回答 `not_unattended_runner` 时退役回执不再重发，待上传数据照常传完。
+- 落地页：「已离开目标作品」的报错带上落地页地址和实际作品号。
+
+验证：完整 Node 回归、PostgreSQL 集成 546/546、发布工具模拟 11/11。发布工具在 `scripts/releases/self-heal-0432/`，替换 11 个文件、新建 3 个文件，重启 api 和 scheduler，不做迁移、不改配置。

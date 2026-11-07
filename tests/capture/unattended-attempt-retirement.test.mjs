@@ -376,3 +376,28 @@ test('a hung retirement receipt is bounded and a late acknowledgment cannot rest
   assert.equal(sends, 4); assert.equal(runner.calls.heartbeatStops, 1);
   assert.equal(runner.context.activeUnattendedRunRequestId, 'new-request');
 });
+
+test('a retirement receipt the background refuses is not resent, while pending uploads keep draining', async () => {
+  const realTimeout = setTimeout;
+  for (const withQueue of [false, true]) {
+    let drains = 0;
+    const queue = withQueue ? {
+      enabled: true,
+      getStats: () => ({processedCount: drains, remainingCount: drains >= 3 ? 0 : 1}),
+      retryFailed() {},
+      drain: async () => { drains += 1; return {processedCount: drains, remainingCount: drains >= 3 ? 0 : 1}; },
+    } : null;
+    const runner = createRunner({queue, flushMs: 5});
+    runner.context.setTimeout = (handler, ms) => realTimeout(handler, [500, 2000].includes(ms) ? 0 : ms);
+    runner.context.flushPendingUnattendedCheckpointReports = async () => ({ok: true, retained: 0});
+    let sends = 0;
+    runner.context.chrome.runtime.sendMessage = async message => {
+      sends += 1; runner.calls.messages.push(JSON.parse(JSON.stringify(message)));
+      return {ok: false, reason: 'not_unattended_runner'};
+    };
+    await runner.context.__retire({requestId: 'request-r', attemptId: 'attempt-1'});
+    await new Promise(resolve => realTimeout(resolve, 80));
+    assert.equal(sends, 1, `the first refusal is final (${withQueue ? 'with' : 'without'} uploads)`);
+    if (withQueue) assert.ok(drains >= 3, 'uploads still drain to completion');
+  }
+});
