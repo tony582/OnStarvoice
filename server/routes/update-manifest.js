@@ -3,12 +3,26 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.31',
+  latestVersion: '0.4.32',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-11-06',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.31-20261106.zip',
+  releaseDate: '2026-11-07',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.32-20261107.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.32',
+      releaseDate: '2026-11-07',
+      releaseNotes: [{
+        tag: '无人值守自愈',
+        notes: [
+          {title: '失败帖子换节点补采', desc: '关键词的帖子补采在本节点用完自动重试后，服务器只把未完成的帖子交给另一台节点补采，不再重搜整个关键词，最多换 2 次；补齐后关键词按完成结算，仍未完成的保留失败及原因。需更新 Extension 至 0.4.32，旧节点不会领取补采任务。'},
+          {title: '上传繁忙自动重传', desc: '服务器数据库繁忙时，上传结果会标为可重试，扩展自动退避重传，运行结束前再补传一轮；补传成功后不再计为失败。'},
+          {title: '问题节点暂停领取', desc: '某台节点在某个平台近期大多失败、而其它节点明显正常时，暂停该节点在该平台自动领取新任务，每小时试领 1 次，成功即恢复；20 分钟无人领取的任务仍可由它执行，平台整体异常时不暂停。'},
+          {title: '手机补详情自动换节点', desc: '手机发现作品补详情未入库时自动换另一台浏览器重试，最多 2 次；作品不可用或已停止等无法改变的结果，以及重试用尽后，才需要人工处理。'},
+          {title: '落地页记录', desc: '补详情离开目标作品时记录落地页面和实际作品号，便于区分跳转和串号。'},
+        ],
+      }],
+    },
     {
       version: '0.4.31',
       releaseDate: '2026-11-06',
