@@ -342,6 +342,14 @@ export function createRecordSyncQueue({
       stats.failedCount += 1;
       counts.failedCount += 1;
     } else {
+      // A resend that finally lands clears this record's earlier upload
+      // failure: 失败 reports what is still not on the server.
+      const previousFailure = failedJobs.get(job.recordId);
+      if (previousFailure && previousFailure.result?.skipped !== true &&
+          counts.failedCount > 0) {
+        stats.failedCount = Math.max(0, stats.failedCount - counts.failedCount);
+        counts.failedCount = 0;
+      }
       stats.successCount += 1;
       counts.successCount += 1;
       succeededIds.add(job.recordId);
@@ -423,6 +431,13 @@ export function createRecordSyncQueue({
       return seenIds.has(normalizeRecordId(recordId));
     },
     getStats,
+    countRetryableFailed() {
+      let count = 0;
+      for (const job of failedJobs.values()) {
+        if (isRetryableResult(job.result, {recordId: job.recordId, meta: job.meta})) count += 1;
+      }
+      return count;
+    },
     // Retirement may outlive a temporary network failure. Requeue only
     // retryable failed jobs, keeping their original task/item identity.
     retryFailed() {

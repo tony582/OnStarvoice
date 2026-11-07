@@ -709,6 +709,11 @@ const RATE_LIMIT_SYNC_REASONS = new Set([
   'rate_limited',
   'too_many_requests',
   '429',
+  // The server refused before writing (database gate full or comment
+  // post-processing queue full). Back off and resend like a rate limit.
+  'server_busy',
+  'database_capacity_unavailable',
+  'comment_workflow_capacity',
 ]);
 const INDETERMINATE_SYNC_REASONS = new Set([
   'timeout',
@@ -5155,6 +5160,10 @@ export async function batchCaptureDetailsForRecords(
       let nextPrefetchCandidatePromise = null;
       captureCurrentDetail: try {
         if (enhancementRetrySession?.remainingMs() <= 0) {
+          // Never opened: the shared retry window ended first. Reporting it as
+          // a navigation failure would blame a page that was not tried.
+          activeStage = 'retry_budget';
+          activeDetailItemContext.activeStage = activeStage;
           throw budgetError('retry_time_budget');
         }
         const stalePrefetchSlot = detailPrefetchPipeline
@@ -9488,6 +9497,14 @@ function isRateLimitedSyncItem(item, batchResult) {
   if (item?.ok === true || isCapturePublishWindowExclusion(item)) {
     return false;
   }
+  // The server marks a per-record refusal retryable only when nothing was
+  // written; a stale attempt or validation failure stays terminal.
+  if (
+    (item?.retryable === true || item?.error?.retryable === true) &&
+    normalizeSyncItemFailureReason(item, batchResult) !== 'stale_attempt'
+  ) {
+    return true;
+  }
   return isRateLimitedSyncReason(
     normalizeSyncItemFailureReason(item, batchResult),
     normalizeSyncItemFailureMessage(item, batchResult),
@@ -9499,7 +9516,7 @@ function isRateLimitedSyncItem(item, batchResult) {
 }
 
 function isRateLimitedSyncReason(reason, message = '', httpStatus = null) {
-  if (Number(httpStatus) === 429) {
+  if (Number(httpStatus) === 429 || Number(httpStatus) === 503) {
     return true;
   }
   const normalizedReason = String(reason || '').trim().toLowerCase();
@@ -9507,7 +9524,7 @@ function isRateLimitedSyncReason(reason, message = '', httpStatus = null) {
     return true;
   }
   const searchable = `${normalizedReason} ${String(message || '').toLowerCase()}`;
-  return /(^|\s)429(\s|$)|too many requests|rate limit|rate_limited/.test(searchable);
+  return /(^|\s)429(\s|$)|too many requests|rate limit|rate_limited|capacity is temporarily unavailable|server_busy|服务当前繁忙/.test(searchable);
 }
 
 function isIndeterminateBatchResult(batchResult) {

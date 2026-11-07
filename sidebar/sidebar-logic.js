@@ -14052,7 +14052,7 @@ function isTransientStreamingSyncFailure(result = {}) {
     .map((value) => String(value || "").trim().toLowerCase())
     .filter(Boolean);
   const failureText = fragments.join(" ");
-  return /(?:timeout|timed out|network|fetch|offline|rate.?limit|too many requests|econn|enet|eai_again|socket|connection|http[_ ]?5\d\d|\b(?:429|500|502|503|504)\b|网络|超时|限流|请求失败|服务繁忙|连接(?:失败|中断|重置))/i.test(
+  return /(?:timeout|timed out|network|fetch|offline|rate.?limit|too many requests|server.?busy|capacity|temporarily unavailable|econn|enet|eai_again|socket|connection|http[_ ]?5\d\d|\b(?:429|500|502|503|504)\b|网络|超时|限流|请求失败|服务繁忙|服务当前繁忙|连接(?:失败|中断|重置))/i.test(
     failureText,
   );
 }
@@ -14206,6 +14206,16 @@ function appendStreamingSyncSummary(message, streamingSyncQueue) {
   return summary ? `${String(message || "").trim()} · ${summary}` : message;
 }
 
+async function waitForStreamingSyncResend(streamingSyncQueue, delayMs) {
+  const deadline = Date.now() + Math.max(0, Number(delayMs) || 0);
+  while (Date.now() < deadline) {
+    if (streamingSyncQueue?.getStats?.()?.canceled) return false;
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(1000, Math.max(0, deadline - Date.now()))));
+  }
+  return !streamingSyncQueue?.getStats?.()?.canceled;
+}
+
 async function drainStreamingDetailSyncQueue(
   streamingSyncQueue,
   {round = null, updateProgress = null, notifyProgress = null} = {},
@@ -14230,7 +14240,31 @@ async function drainStreamingDetailSyncQueue(
     notifyProgress?.(waitingProgress);
   }
 
-  const result = await streamingSyncQueue.drain();
+  let result = await streamingSyncQueue.drain();
+  // A busy server or a network blip at the end of a run must not leave
+  // records for a person to resend. Resend only transiently failed records,
+  // under their original task identity, after a bounded backoff.
+  const resendDelaysMs =
+    typeof streamingSyncQueue.retryFailed === "function" ? [15 * 1000, 45 * 1000] : [];
+  for (const delayMs of resendDelaysMs) {
+    if (
+      Number(result?.failedCount || 0) === 0 ||
+      result?.blocked || result?.canceled ||
+      Number(streamingSyncQueue.countRetryableFailed?.() ?? 1) === 0
+    ) break;
+    const resendProgress = {
+      current: Number(result.processedCount || 0),
+      total: Number(result.enqueuedCount || 0),
+      round,
+      phase: "streaming_sync_resend_wait",
+      message: `有 ${Number(result.failedCount || 0)} 条数据上传失败，${Math.ceil(delayMs / 1000)} 秒后自动重传...`,
+    };
+    updateProgress?.(resendProgress);
+    notifyProgress?.(resendProgress);
+    const waited = await waitForStreamingSyncResend(streamingSyncQueue, delayMs);
+    if (!waited || streamingSyncQueue.retryFailed() === 0) break;
+    result = await streamingSyncQueue.drain();
+  }
   await Promise.all([refreshDataPool(), refreshSyncHistory()]).catch(
     () => null,
   );

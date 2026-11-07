@@ -14,6 +14,7 @@ import {
 } from '../utils/metrics.js';
 import { extractPublishLocation, stripPublishLocation } from '../utils/publish-location.js';
 import { queryAll } from '../db/init.js';
+import { isDbCapacityError } from '../db/query.js';
 import {
   runProcessBackgroundWork,
   scheduleProcessBackgroundWork,
@@ -493,22 +494,32 @@ router.post('/batch', requireAuth, optionalCaptureAgent, async (req, res) => {
         !commentStats.officialContent
       ) aiJobs.push(aiJob);
     } catch (err) {
-      const message = err?.message || '同步失败';
-      const reason = ['stale_attempt', 'comment_workflow_capacity'].includes(
-        err?.code,
-      )
-        ? err.code
-        : 'server_error';
+      // A full database gate is temporary: the record was not written, so the
+      // Extension must back off and resend it instead of marking it failed.
+      const capacity = isDbCapacityError(err);
+      const message = capacity
+        ? '服务当前繁忙，本条数据稍后自动重传'
+        : err?.message || '同步失败';
+      const reason = capacity
+        ? 'server_busy'
+        : ['stale_attempt', 'comment_workflow_capacity'].includes(err?.code)
+          ? err.code
+          : 'server_error';
+      const retryAfterMs = capacity
+        ? Math.max(100, Number(err?.retryAfterMs) || 1000)
+        : undefined;
       results.push({
         ok: false,
         recordId: originalRecordId,
         action: 'skipped',
         reason,
         message,
+        ...(retryAfterMs ? {retryAfterMs} : {}),
         error: {
           reason,
           message,
-          retryable: err?.retryable === true,
+          retryable: capacity || err?.retryable === true,
+          ...(retryAfterMs ? {retryAfterMs} : {}),
         },
       });
     }

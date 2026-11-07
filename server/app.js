@@ -7,6 +7,7 @@ import { sendTestEmail } from './services/email-notifier.js';
 import { labelPendingRecords } from './services/ai-labeler.js';
 import { generateDailyReport, generateWeeklyReport, generateMonthlyReport } from './services/report-generator.js';
 import { requireAdmin } from './middleware/auth.js';
+import { isDbCapacityError } from './db/query.js';
 
 import authRouter from './routes/auth.js';
 import verifyRouter from './routes/verify.js';
@@ -236,6 +237,20 @@ export function createApp({ corsOrigins, health, healthProvider, logger = consol
   app.get('/', (req, res) => { res.redirect('/admin'); });
 
   app.use((err, req, res, next) => {
+    if (isDbCapacityError(err)) {
+      // The database gate refused the request before work began. Clients must
+      // see a retryable busy signal instead of a terminal server error.
+      const retryAfterMs = Math.max(100, Number(err?.retryAfterMs) || 1000);
+      res.set('Retry-After', String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+      return res.status(503).json({
+        ok: false,
+        error: 'server_busy',
+        reason: 'server_busy',
+        code: 'database_capacity_unavailable',
+        retryAfterMs,
+        message: '服务当前繁忙，请稍后重试',
+      });
+    }
     logger?.error?.('[Server] Unhandled error:', err);
     return res.status(500).json({ ok: false, error: 'server_error', message: err.message });
   });

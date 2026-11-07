@@ -199,6 +199,18 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
         };
       }
 
+      // Keep a server busy signal (HTTP 429/5xx with a JSON body) visible to
+      // callers so uploads can back off instead of treating it as terminal.
+      const transientHttpStatus =
+        response.status === 429 || response.status >= 500
+          ? response.status
+          : undefined;
+      const busySignal = {
+        ...(typeof data.code === 'string' && data.code ? {code: data.code} : {}),
+        ...(Number(data.retryAfterMs) > 0 ? {retryAfterMs: Number(data.retryAfterMs)} : {}),
+        ...(transientHttpStatus ? {httpStatus: transientHttpStatus} : {}),
+      };
+
       void recordDiagnosticError({
         source: 'api',
         action: endpoint,
@@ -206,6 +218,7 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
         error: {
           reason: data.reason,
           message: data.message,
+          ...busySignal,
         },
       }).catch(() => null);
 
@@ -214,6 +227,7 @@ async function requestOnce(baseUrl, endpoint, options = {}) {
         error: {
           reason: data.reason,
           message: data.message,
+          ...busySignal,
         },
       };
     }
