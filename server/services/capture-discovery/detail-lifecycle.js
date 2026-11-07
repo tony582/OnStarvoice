@@ -1,5 +1,10 @@
 import {randomUUID} from 'node:crypto';
 import {DiscoveryError} from './validation.js';
+import {
+  DISCOVERY_AUTO_REQUEUED_CODE,
+  requeueDiscoveryCandidate,
+  shouldAutoRetryDiscovery,
+} from './auto-retry.js';
 
 // Global lock order matches browser mirroring: detail task -> candidate -> item.
 // The caller already owns the mobile run lock. Never lock a detail task while
@@ -57,7 +62,7 @@ export async function cancelDiscoveryDemands(tx, {tenantId,runId}) {
 }
 
 export async function reconcileDiscoveryDetails(tx,{tenantId,taskIds=null}) {
-  const rows=await tx.queryAll(`SELECT task.id AS task_id FROM capture_tasks task WHERE task.tenant_id=$1
+  const rows=await tx.queryAll(`SELECT task.id AS task_id,task.assigned_agent_id FROM capture_tasks task WHERE task.tenant_id=$1
     AND ($2::uuid[] IS NULL OR task.id=ANY($2::uuid[]))
     AND task.task_type='discovered_post_capture' AND task.attention_dismissed_at IS NULL
     AND (task.status='pending' OR (task.status='needs_action' AND task.error->>'code'='detail_create_expired'))
@@ -72,7 +77,7 @@ export async function reconcileDiscoveryDetails(tx,{tenantId,taskIds=null}) {
     ORDER BY task.id LIMIT 20 FOR UPDATE OF task SKIP LOCKED`,[tenantId,taskIds]);
   const settled=[];
   for (const row of rows) {
-    const candidate=await tx.queryOne(`SELECT candidate.id,candidate.detail_task_item_id FROM capture_discovery_candidates candidate
+    const candidate=await tx.queryOne(`SELECT candidate.id,candidate.detail_task_item_id,candidate.record_id,candidate.last_error FROM capture_discovery_candidates candidate
       JOIN capture_tasks task ON task.tenant_id=candidate.tenant_id AND task.metadata->>'candidateId'=candidate.id::text
       WHERE candidate.tenant_id=$1 AND task.id=$2 AND candidate.record_id IS NULL
       AND (candidate.status='capturing' OR (candidate.status='failed' AND candidate.last_error->>'code'='detail_create_expired'))
@@ -92,22 +97,35 @@ export async function reconcileDiscoveryDetails(tx,{tenantId,taskIds=null}) {
         AND item.result_record_id IS NULL AND item.result_observation_id IS NULL
       FOR UPDATE OF item,attempt`,[tenantId,candidate.detail_task_item_id,row.task_id]);
     if (!item) continue;
-    await tx.execute(`UPDATE capture_task_items SET status='needs_action',error='{"code":"detail_create_expired"}',
-      finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2`,[tenantId,item.id]);
-    await tx.execute(`UPDATE capture_task_item_attempts SET status='needs_action',error='{"code":"detail_create_expired"}',
-      finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2`,[tenantId,item.attempt_id]);
-    await tx.execute(`UPDATE capture_discovery_candidates SET status='failed',last_error='{"code":"detail_create_expired"}'
-      WHERE tenant_id=$1 AND id=$2`,[tenantId,candidate.id]);
-    await tx.execute(`UPDATE capture_discovery_run_candidates SET demand_status='needs_action'
-      WHERE tenant_id=$1 AND candidate_id=$2 AND demand_status='active'`,[tenantId,candidate.id]);
+    // The browser never acknowledged the job: give it to another browser
+    // first; only a repeatedly unacknowledged post waits for a person.
+    const autoRetry=shouldAutoRetryDiscovery({candidate,sourceCode:'detail_create_expired'})
+      ? await requeueDiscoveryCandidate(tx,{tenantId,candidate,agentId:row.assigned_agent_id,
+          sourceCode:'detail_create_expired'})
+      : 0;
+    const status=autoRetry?'failed':'needs_action';
+    const error=autoRetry
+      ? {code:DISCOVERY_AUTO_REQUEUED_CODE,sourceCode:'detail_create_expired',autoRetry}
+      : {code:'detail_create_expired'};
+    await tx.execute(`UPDATE capture_task_items SET status=$3,error=$4,
+      finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2`,[tenantId,item.id,status,error]);
+    await tx.execute(`UPDATE capture_task_item_attempts SET status=$3,error=$4,
+      finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2`,[tenantId,item.attempt_id,status,error]);
+    if (!autoRetry) {
+      await tx.execute(`UPDATE capture_discovery_candidates SET status='failed',last_error='{"code":"detail_create_expired"}'
+        WHERE tenant_id=$1 AND id=$2`,[tenantId,candidate.id]);
+      await tx.execute(`UPDATE capture_discovery_run_candidates SET demand_status='needs_action'
+        WHERE tenant_id=$1 AND candidate_id=$2 AND demand_status='active'`,[tenantId,candidate.id]);
+    }
     // Before the first heartbeat the task slot is still zero. Bind it to the
     // dispatched attempt so a late first report cannot reopen an operator close.
-    await tx.execute(`UPDATE capture_tasks SET status='needs_action',error='{"code":"detail_create_expired"}',
-      message='补详情下发未确认',counts='{"total":1,"processed":1,"success":0,"failed":1}',
+    await tx.execute(`UPDATE capture_tasks SET status=$4,error=$5,
+      message=$6,counts='{"total":1,"processed":1,"success":0,"failed":1}',
       attempt_number=GREATEST(attempt_number,$3),
       finished_at=COALESCE(finished_at,now()),
       updated_at=CASE WHEN status='pending' THEN now() ELSE updated_at END
-      WHERE tenant_id=$1 AND id=$2`,[tenantId,row.task_id,item.attempt_number]);
+      WHERE tenant_id=$1 AND id=$2`,[tenantId,row.task_id,item.attempt_number,status,error,
+      autoRetry?`补详情下发未确认；已自动换节点重试（第 ${autoRetry} 次）`:'补详情下发未确认']);
     settled.push(row.task_id);
   }
   return settled;

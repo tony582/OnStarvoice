@@ -2,6 +2,8 @@ import {randomUUID, createHash} from 'node:crypto';
 import {findCaptureAgentExecutionSlotBlocker} from '../capture-cloud.js';
 import {reconcileDiscoveryDetails} from './detail-lifecycle.js';
 import {readDiscoveryDetailTimeoutCooldownMs} from './detail-timeout-cooldown.js';
+import {AGENT_HEALTH_STARVATION_MS, readAgentPlatformHealth} from '../capture-agent-platform-health.js';
+import {DISCOVERY_AUTO_RETRY_EXCLUSION_MS} from './auto-retry.js';
 
 export const DISCOVERED_POST_WORKFLOW = 'discovered_post_capture';
 export function canCaptureDiscoveredPost(agent, capabilities = agent?.capabilities || {}) {
@@ -20,11 +22,24 @@ export async function dispatchDiscoveredPost(tx, {agent, capabilities = agent?.c
   if (await readDiscoveryDetailTimeoutCooldownMs(tx, {
     tenantId:agent.tenant_id, agentId:agent.id,
   }) > 0) return null;
+  // A browser that mostly fails Douyin work while others succeed only takes
+  // a probe per hour, or candidates nobody else has picked up for a while.
+  const health = await readAgentPlatformHealth(tx, {
+    tenantId:agent.tenant_id, agentId:agent.id, platform:'douyin',
+  });
+  const starvedOnly = health.quarantined && !health.probeAllowed;
+  // An automatically requeued candidate skips the browsers that already
+  // failed it, unless none of the others took it within the exclusion window.
   const candidate = await tx.queryOne(`SELECT candidate.* FROM capture_discovery_candidates candidate
     WHERE candidate.tenant_id=$1 AND candidate.status='queued' AND EXISTS (
       SELECT 1 FROM capture_discovery_run_candidates demand WHERE demand.tenant_id=candidate.tenant_id
         AND demand.candidate_id=candidate.id AND demand.demand_status='active')
-    ORDER BY candidate.first_seen_at,candidate.id LIMIT 1 FOR UPDATE OF candidate SKIP LOCKED`, [agent.tenant_id]);
+      AND COALESCE(candidate.last_error->'autoRetry'->>'notBefore','') <= to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+      AND NOT (COALESCE(candidate.last_error->'autoRetry'->'excludedAgentIds','[]'::jsonb) ? $2::text
+        AND COALESCE(candidate.last_error->'autoRetry'->>'requeuedAt','') > to_char((now() - ($3::bigint * interval '1 millisecond')) AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
+      AND (NOT $4::boolean OR candidate.first_seen_at <= now() - ($5::bigint * interval '1 millisecond'))
+    ORDER BY candidate.first_seen_at,candidate.id LIMIT 1 FOR UPDATE OF candidate SKIP LOCKED`,
+  [agent.tenant_id, agent.id, DISCOVERY_AUTO_RETRY_EXCLUSION_MS, starvedOnly, AGENT_HEALTH_STARVATION_MS]);
   if (!candidate) return null;
   const taskId=randomUUID(),itemId=randomUUID(),attemptId=randomUUID(),commandId=randomUUID();
   const workflow=DISCOVERED_POST_WORKFLOW;
@@ -56,7 +71,10 @@ export async function dispatchDiscoveredPost(tx, {agent, capabilities = agent?.c
   await tx.execute(`INSERT INTO capture_agent_commands(id,tenant_id,agent_id,task_id,command_type,payload,
     requested_by_name,expires_at) VALUES($1,$2,$3,$4,'create',$5,'手机候选补详情',now()+interval '2 minutes')`,
   [commandId,agent.tenant_id,agent.id,taskId,payload]);
-  await tx.execute(`UPDATE capture_discovery_candidates SET status='capturing',detail_task_item_id=$1,last_error='{}'
+  // Keep the automatic retry ledger across claims; it bounds requeues and
+  // remembers which browsers already failed this work.
+  await tx.execute(`UPDATE capture_discovery_candidates SET status='capturing',detail_task_item_id=$1,
+    last_error=CASE WHEN last_error ? 'autoRetry' THEN jsonb_build_object('autoRetry',last_error->'autoRetry') ELSE '{}'::jsonb END
     WHERE tenant_id=$2 AND id=$3`,[itemId,agent.tenant_id,candidate.id]);
   await tx.execute(`UPDATE capture_discovery_run_candidates SET detail_task_item_id=$1,is_detail_owner=(run_id=(SELECT run_id
       FROM capture_discovery_run_candidates WHERE tenant_id=$2 AND candidate_id=$3 AND demand_status='active' ORDER BY run_id LIMIT 1))

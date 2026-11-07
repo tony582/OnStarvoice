@@ -3,9 +3,12 @@ import test from 'node:test';
 import {projectDiscoveryTaskResult} from '../server/services/capture-discovery/detail-projection.js';
 
 const rawError={code:'TARGET_RUNNER_TAB_TIMEOUT',message:'定向作品采集页打开超时',phase:'target_navigating'};
-function fixture(overrides={}) {
+// By default the automatic retries are used up, so these cases exercise the
+// escalation to a person. Automatic handoff has its own tests below.
+function fixture(overrides={},candidateOverrides={}) {
   const task={id:'detail-task',status:'running',metadata:{candidateId:'candidate'},...overrides};
-  const candidate={id:'candidate',item_id:'item',record_id:null,observation_id:null,attempt_count:1,assignment_revision:1};
+  const candidate={id:'candidate',item_id:'item',record_id:null,observation_id:null,attempt_count:1,assignment_revision:1,
+    status:'capturing',last_error:{autoRetry:{count:2,excludedAgentIds:[]}},...candidateOverrides};
   const writes=[];
   const tx={async execute(sql,values) {writes.push({sql,values});},async queryOne(sql,values) {
     if(sql.includes('SELECT candidate.*')) return candidate;

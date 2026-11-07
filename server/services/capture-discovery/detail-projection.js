@@ -1,4 +1,11 @@
 import {operatorClosedTask} from '../capture-operator-close.js';
+import {
+  DISCOVERY_AUTO_REQUEUED_CODE,
+  DISCOVERY_AUTO_RETRY_LIMIT,
+  DISCOVERY_LATE_RECEIPT_GRACE_MS,
+  requeueDiscoveryCandidate,
+  shouldAutoRetryDiscovery,
+} from './auto-retry.js';
 
 const terminal=new Set(['completed','completed_with_warnings','completed_with_failures','failed','needs_action','canceled','skipped','superseded']);
 
@@ -46,19 +53,34 @@ export async function projectDiscoveryTaskResult(tx,{tenantId,task,snapshot={}})
   if (!candidate) return null;
   const stored=Boolean(candidate.record_id&&candidate.observation_id);
   const canceled=['canceled','superseded'].includes(task.status)||['canceled','superseded'].includes(status);
-  const itemStatus=stored?'completed':canceled?'canceled':'needs_action';
-  const taskStatus=canceled?status==='superseded'?'superseded':'canceled':stored?'completed':'needs_action';
   const source=stored?{}:failureSource(task,snapshot);
+  // Not stored and not stopped: hand the post to another browser instead of a
+  // person, a bounded number of times. A completed snapshot without receipt
+  // first waits for its late upload before another browser repeats the work.
+  // Terminal snapshots are replayed; a task already handed on keeps that
+  // outcome instead of requeueing (or escalating) a second time.
+  const alreadyRequeued=task.error?.code===DISCOVERY_AUTO_REQUEUED_CODE;
+  const autoRetry=stored||canceled ? 0
+    : alreadyRequeued ? Math.max(1,Math.floor(Number(task.error?.autoRetry))||1)
+    : shouldAutoRetryDiscovery({candidate,sourceCode:source.sourceCode})
+      ? await requeueDiscoveryCandidate(tx,{tenantId,candidate,agentId:task.assigned_agent_id,
+          sourceCode:source.sourceCode||'detail_finished_without_ingestion',
+          delayMs:source.sourceCode?0:DISCOVERY_LATE_RECEIPT_GRACE_MS})
+      : 0;
+  const itemStatus=stored?'completed':canceled?'canceled':autoRetry?'failed':'needs_action';
+  const taskStatus=canceled?status==='superseded'?'superseded':'canceled':stored?'completed':autoRetry?'failed':'needs_action';
   const cause=source.sourceMessage
     ? `${source.sourceMessage}${source.sourceCode&&!source.sourceMessage.includes(source.sourceCode)?`（${source.sourceCode}）`:''}`
     : source.sourceCode||'';
   const message=stored?'手机发现作品已补齐详情并入库':canceled
     ? cause?`补详情已停止：${cause}`:'补详情已停止'
-    : cause?`补详情未入库：${cause}；尚未取得入库回执，需要处理`:'补详情结束但未取得入库回执，需要处理';
+    : autoRetry
+      ? `补详情未入库${cause?`：${cause}`:''}；已自动换节点重试（第 ${autoRetry}/${DISCOVERY_AUTO_RETRY_LIMIT} 次）`
+      : cause?`补详情未入库：${cause}；尚未取得入库回执，需要处理`:'补详情结束但未取得入库回执，需要处理';
   // The stable code is a receipt/recovery contract. Keep the observed failure
   // separately so rendering it cannot change whether a late receipt is accepted.
-  const error=stored?{}:{code:canceled?'detail_canceled':'detail_finished_without_ingestion',reportedStatus:status,
-    ...source,...(cause?{message}:{})};
+  const error=stored?{}:{code:canceled?'detail_canceled':autoRetry?DISCOVERY_AUTO_REQUEUED_CODE:'detail_finished_without_ingestion',
+    reportedStatus:status,...source,...(autoRetry?{autoRetry}:{}),...(cause||autoRetry?{message}:{})};
   await tx.execute(`UPDATE capture_task_items SET status=$3,result_record_id=$4,result_observation_id=$5,error=$6,
     finished_at=COALESCE(finished_at,now()),updated_at=now() WHERE tenant_id=$1 AND id=$2`,
   [tenantId,candidate.item_id,itemStatus,candidate.record_id,candidate.observation_id,error]);
@@ -66,7 +88,7 @@ export async function projectDiscoveryTaskResult(tx,{tenantId,task,snapshot={}})
     result=jsonb_build_object('recordId',$5::uuid,'observationId',$6::uuid),finished_at=COALESCE(finished_at,now()),updated_at=now()
     WHERE tenant_id=$1 AND item_id=$2 AND attempt_number=$7 AND assignment_revision=$8 AND execution_task_id=$9`,
   [tenantId,candidate.item_id,itemStatus,error,candidate.record_id,candidate.observation_id,candidate.attempt_count,candidate.assignment_revision,task.id]);
-  if (!stored) {
+  if (!stored && !autoRetry) {
     await tx.execute(`UPDATE capture_discovery_candidates SET status='failed',last_error=$3 WHERE tenant_id=$1 AND id=$2`,[tenantId,candidate.id,error]);
     await tx.execute(`UPDATE capture_discovery_run_candidates SET demand_status='needs_action'
       WHERE tenant_id=$1 AND candidate_id=$2 AND demand_status='active'`,[tenantId,candidate.id]);

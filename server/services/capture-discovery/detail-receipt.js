@@ -1,6 +1,7 @@
 import {projectDiscoveryTaskResult} from './detail-projection.js';
 import {assertUiBoundIngestion} from './ui-binding.js';
 import {DiscoveryError} from './validation.js';
+import {DISCOVERY_AUTO_REQUEUED_CODE} from './auto-retry.js';
 
 // Runs in the very same transaction as records + observations. Existing strict
 // attempt checks remain authoritative; this additionally fences mobile demand
@@ -17,12 +18,16 @@ export async function recordDiscoveryIngestion(tx, context, lineage) {
   const candidate=await tx.queryOne(`SELECT * FROM capture_discovery_candidates
     WHERE tenant_id=$1 AND id=$2 FOR UPDATE`,[context.tenantId,task.metadata.candidateId]);
   const liveTask=task;
-  const lateReceipt=task.error?.code==='detail_finished_without_ingestion';
+  // A task handed to another browser still owns its candidate until the next
+  // claim; its late upload completes the work and takes it out of the queue.
+  const requeuedLate=task.error?.code===DISCOVERY_AUTO_REQUEUED_CODE&&candidate?.status==='queued';
+  const lateReceipt=task.error?.code==='detail_finished_without_ingestion'||requeuedLate;
   const demand=await tx.queryOne(`SELECT 1 FROM capture_discovery_run_candidates
     WHERE tenant_id=$1 AND candidate_id=$2 AND (demand_status IN ('active','fulfilled') OR ($3::boolean AND demand_status='needs_action')) LIMIT 1`,
   [context.tenantId,candidate?.id,lateReceipt]);
   if (!candidate || !demand || liveTask.metadata.stopRequested || liveTask.metadata.stopCommandId
-      || ['canceled','failed','superseded'].includes(liveTask.status)
+      || ['canceled','superseded'].includes(liveTask.status)
+      || (liveTask.status==='failed'&&!requeuedLate)
       || (liveTask.status==='needs_action'&&!lateReceipt)
       || candidate.detail_task_item_id !== lineage.capture_task_item_id
       || context.record.platform !== 'douyin' || context.record.external_id !== candidate.external_id) {
