@@ -75,7 +75,24 @@ export async function waitForDiscoveredPostTab({
   const checkCanceled = () => {
     if (shouldStop()) throw readinessError('TARGET_CAPTURE_CANCELED', '定向作品任务已停止');
   };
-  const changed = () => readinessError('TARGET_IDENTITY_MISMATCH', '定向作品采集页已离开目标作品');
+  // Name where the page actually landed (host + path, never the query, and
+  // the work id it shows) so a redirect can be told apart from a wrong work.
+  const landedSummary = (url) => {
+    try {
+      const parsed = new URL(String(url || ''));
+      let landedId = '';
+      try { landedId = canonicalizeTargetUrl(parsed.href, platform).externalId || ''; } catch { landedId = ''; }
+      const path = `${parsed.hostname}${parsed.pathname}`.slice(0, 160);
+      return landedId && landedId !== expected.externalId ? `${path}，实际作品 ${landedId}` : path;
+    } catch {
+      return '';
+    }
+  };
+  const changed = (url = '') => {
+    const landed = landedSummary(url);
+    return readinessError('TARGET_IDENTITY_MISMATCH',
+      landed ? `定向作品采集页已离开目标作品（落地页 ${landed}）` : '定向作品采集页已离开目标作品');
+  };
   const documentChanged = () => Object.assign(
     readinessError('TARGET_RUNNER_DOCUMENT_CHANGED', '定向作品采集页文档已更换，已停止本次采集并保留页面'),
     {requiresManualAction: true, category: 'document_identity_changed', retryable: false},
@@ -130,16 +147,16 @@ export async function waitForDiscoveredPostTab({
   const observe = async (expiresAt) => {
     const tab = await getTab(expiresAt);
     if (isOpeningPlaceholder(tab.url)) {
-      if (verifiedDocumentId || (tab.pendingUrl && !matches(tab.pendingUrl))) throw changed();
+      if (verifiedDocumentId || (tab.pendingUrl && !matches(tab.pendingUrl))) throw changed(tab.pendingUrl || tab.url);
       return null;
     }
-    if (!samePlatform(tab.url)) throw changed();
+    if (!samePlatform(tab.url)) throw changed(tab.url);
     // The current DOM still belongs to the old document while even a same-URL
     // navigation is pending. Observe the committed document on a later pass.
     if (tab.pendingUrl && matches(tab.pendingUrl)) return null;
     const before = await bounded(() => readDocument(tabId), expiresAt);
     if (!before?.documentId) return null;
-    if (!samePlatform(before.url)) throw changed();
+    if (!samePlatform(before.url)) throw changed(before.url);
     if (verifiedDocumentId && before.documentId !== verifiedDocumentId) throw documentChanged();
     if (before.loginRequired === true) {
       const confirmed = await bounded(() => readDocument(tabId), expiresAt);
@@ -173,9 +190,9 @@ export async function waitForDiscoveredPostTab({
       if (verifiedDocumentId) throw documentChanged();
       return null; // The initial navigation may still be committing.
     }
-    if (!samePlatform(after.url) || !samePlatform(liveTab.url)) throw changed();
+    if (!samePlatform(after.url) || !samePlatform(liveTab.url)) throw changed(samePlatform(after.url) ? liveTab.url : after.url);
     if (liveTab.pendingUrl) {
-      if (!matches(liveTab.pendingUrl)) throw changed();
+      if (!matches(liveTab.pendingUrl)) throw changed(liveTab.pendingUrl);
       return null;
     }
     // The safety probe throws directly; its error needs the same post-probe
@@ -187,9 +204,11 @@ export async function waitForDiscoveredPostTab({
         retryable: false,
       });
     }
-    if (!matches(before.url) || !matches(after.url) || !matches(liveTab.url)) throw changed();
+    if (!matches(before.url) || !matches(after.url) || !matches(liveTab.url)) {
+      throw changed([before.url, after.url, liveTab.url].find(url => !matches(url)));
+    }
     if (!safety || safety.skipped || !matches(safety.currentUrl)) return null;
-    if (safety.activeWorkIdentityConflict === true) throw changed();
+    if (safety.activeWorkIdentityConflict === true) throw changed(safety.currentUrl || liveTab.url);
     verifiedDocumentId = before.documentId;
     // `complete` retains the old navigation contract; the normal detail capture
     // still adjudicates unavailable content and validates ingestion. A proven

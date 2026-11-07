@@ -414,3 +414,22 @@ test('ordinary missing-ingestion needs_action and non-initial discovery errors d
     assert.equal(api.shouldPreservePlatformTab({workflow: 'discovered_post_capture', status: 'needs_action', error}), false);
   }
 });
+
+test('an identity mismatch names the landed page and work without its query', async () => {
+  const wrongWork = scenario();
+  wrongWork.state.tab = {id: 21, url: `${otherUrl}?token=secret`, status: 'complete'};
+  wrongWork.state.document = {documentId: 'doc-1', url: `${otherUrl}?token=secret`, readyState: 'complete'};
+  wrongWork.state.safety = {currentUrl: otherUrl, isDouyin: true, targetMatched: false, detailReady: true};
+  await assert.rejects(wrongWork.run(), (error) => {
+    assert.equal(error.code, 'TARGET_IDENTITY_MISMATCH');
+    assert.match(error.message, /落地页 www\.douyin\.com\/video\/76543210987654322，实际作品 76543210987654322/u);
+    assert.doesNotMatch(error.message, /secret/u);
+    return true;
+  });
+  const foreign = scenario();
+  foreign.state.tab.url = 'https://example.com/login?next=1';
+  await assert.rejects(foreign.run(), (error) => {
+    assert.match(error.message, /落地页 example\.com\/login）$/u);
+    return true;
+  });
+});
