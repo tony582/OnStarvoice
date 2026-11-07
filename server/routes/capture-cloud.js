@@ -145,6 +145,11 @@ import {
 } from '../services/capture-operator-close.js';
 import {sweepDeadAttentionRoots} from '../services/capture-dead-attention.js';
 import {
+  AGENT_HEALTH_STARVATION_MS,
+  agentPlatformAdmission,
+  elasticItemStarving,
+} from '../services/capture-agent-platform-health.js';
+import {
   createLastGoodStore,
   createRateLimitedReporter,
   isTransientDatabaseReadError,
@@ -7482,12 +7487,17 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
   // hold. Neither result feeds the candidate SQL, and settling other items in
   // this transaction cannot occupy this Agent's slot, so they run once.
   slotChecked = false,
+  // Platforms this Agent is paused on for this heartbeat (see
+  // capture-agent-platform-health.js) and the per-heartbeat health reads.
+  quarantinedPlatforms = [],
+  healthCache = new Map(),
 } = {}, remainingSkipBudget) {
   if (remainingSkipBudget <= 0) {
     // Keep heartbeat work bounded without repeatedly scanning the same busy
     // keyword head on every heartbeat and starving spare-capacity revisits.
     return targetedOnly || !allowTargetedFallback ? null : dispatchNextElasticWorkItemWithinBudget(tx, {
       agent, capabilities, excludedItemIds, targetedOnly: true, slotChecked: true,
+      quarantinedPlatforms, healthCache,
     }, 10);
   }
   if (agent?.capabilities?.agentKind === 'android_mobile') return null;
@@ -7587,6 +7597,8 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
       item.url_snapshot,
       item.status AS item_status,
       item.started_at AS item_started_at,
+      item.updated_at AS item_updated_at,
+      parent.created_at AS parent_created_at,
       item.attempt_count,
       item.safety_handoff_count,
       item.assignment_revision,
@@ -7728,6 +7740,18 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
           THEN (item.metadata->>'manualRetryBaseAttemptCount')::integer ELSE 0 END
       AND (cardinality($4::text[]) = 0 OR item.platform = ANY($4::text[]))
       AND (cardinality($5::text[]) = 0 OR item.platform = ANY($5::text[]))
+      -- An Agent paused on a platform still takes its pinned work and any
+      -- item nobody else has claimed within the starvation window.
+      AND (
+        cardinality($16::text[]) = 0
+        OR NOT (item.platform = ANY($16::text[]))
+        OR item.metadata->>'pinnedAgentId' = $2::text
+        OR (item.status = 'retryable'
+          AND item.updated_at <= now() - ($17::bigint * interval '1 millisecond'))
+        OR (item.status = 'pending'
+          AND COALESCE(parent.scheduled_for, parent.created_at)
+            <= now() - ($17::bigint * interval '1 millisecond'))
+      )
       -- WeChat Channels work is phone-only: a browser never claims it, whatever its platform lists say.
       AND item.platform <> 'wechat_channels'
       AND (
@@ -7853,6 +7877,8 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     freshCapabilities.remoteTaskEnhancementOptions === true,
     elasticRoundRelaxAfterMs(),
     Array.from(ELASTIC_FILTER_VERIFICATION_CODES),
+    quarantinedPlatforms,
+    AGENT_HEALTH_STARVATION_MS,
   ]);
   if (!candidate) return null;
   const nextCandidate = () => dispatchNextElasticWorkItemWithinBudget(tx, {
@@ -7860,7 +7886,40 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     allowTargetedFallback: allowTargetedFallback || candidate.item_type === 'keyword',
     excludedItemIds: [...excludedItemIds, candidate.item_id],
     slotChecked: true,
+    quarantinedPlatforms, healthCache,
   }, remainingSkipBudget - 1);
+
+  const candidatePlatform = text(candidate.item_platform || candidate.parent_platform, 40);
+  if (
+    candidatePlatform &&
+    !quarantinedPlatforms.includes(candidatePlatform) &&
+    safeJson(candidate.item_metadata).pinnedAgentId !== agent.id
+  ) {
+    const platformHealth = await agentPlatformAdmission(tx, {
+      cache: healthCache,
+      tenantId: agent.tenant_id,
+      agentId: agent.id,
+      platform: candidatePlatform,
+    });
+    if (
+      platformHealth.quarantined &&
+      !platformHealth.probeAllowed &&
+      !elasticItemStarving({
+        itemStatus: candidate.item_status,
+        itemUpdatedAt: candidate.item_updated_at,
+        waitingSince: candidate.scheduled_for || candidate.parent_created_at,
+      })
+    ) {
+      // Search again without this platform's fresh work; healthier Agents
+      // take it first. One extra candidate scan per paused heartbeat.
+      return dispatchNextElasticWorkItemWithinBudget(tx, {
+        agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback,
+        slotChecked: true,
+        quarantinedPlatforms: [...quarantinedPlatforms, candidatePlatform],
+        healthCache,
+      }, remainingSkipBudget - 1);
+    }
+  }
 
   // F2 backstop for keywords that were already retryable before the
   // projection rule existed: settle the whole parent's repeated time-filter
@@ -7909,7 +7968,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     if (settledItems.some(settledItem => settledItem.id === candidate.item_id)) {
       return dispatchNextElasticWorkItemWithinBudget(tx, {
         agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback,
-        slotChecked: true,
+        slotChecked: true, quarantinedPlatforms, healthCache,
       }, remainingSkipBudget - 1);
     }
   }
@@ -7968,7 +8027,8 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
         payload: {itemId: candidate.item_id, recordId: candidate.record_id},
       });
       return dispatchNextElasticWorkItemWithinBudget(
-        tx, {agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback, slotChecked: true},
+        tx, {agent, capabilities, excludedItemIds, targetedOnly, allowTargetedFallback, slotChecked: true,
+          quarantinedPlatforms, healthCache},
         remainingSkipBudget - 1,
       );
     }

@@ -5303,7 +5303,7 @@ test("elastic claim relaxes a stuck round in SQL and settles repeated time-filte
     claim,
     /agent_policy\.agent_attempt_limit = 1\s+OR item\.assigned_agent_id IS DISTINCT FROM \$2::uuid/u,
   );
-  assert.match(claim, /elasticRoundRelaxAfterMs\(\),\s+Array\.from\(ELASTIC_FILTER_VERIFICATION_CODES\),\s+\]\);/u);
+  assert.match(claim, /elasticRoundRelaxAfterMs\(\),\s+Array\.from\(ELASTIC_FILTER_VERIFICATION_CODES\),\s+quarantinedPlatforms,\s+AGENT_HEALTH_STARVATION_MS,\s+\]\);/u);
   assert.match(claim, /roundExclusionRelaxed: candidate\.round_relaxed === true/u);
   assert.match(
     claim,
@@ -5318,9 +5318,11 @@ test("elastic claim relaxes a stuck round in SQL and settles repeated time-filte
   assert.ok(claim.indexOf('const candidate = await tx.queryOne(') > claim.indexOf('elasticRecoveryHoldRemainingMs(recentRecoveryAttempt)'));
   // [0] precedes the definition, [1] is the definition itself.
   const recursions = claim.split('dispatchNextElasticWorkItemWithinBudget(').slice(2);
-  assert.equal(recursions.length, 4);
+  // Four candidate skips plus the unhealthy-platform rescan.
+  assert.equal(recursions.length, 5);
   for (const call of recursions) {
     assert.match(call.slice(0, 260), /slotChecked: true/u, call.slice(0, 260));
+    assert.match(call.slice(0, 320), /healthCache/u, 'every rescan keeps the heartbeat health reads');
   }
 
   const backstop = claim.slice(
