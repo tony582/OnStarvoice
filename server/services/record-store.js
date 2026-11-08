@@ -1113,6 +1113,18 @@ export function mergeObservationMetrics(record = {}, existing = {}) {
   return merged;
 }
 
+// Titles the Extension invents when a search card carried no data. Such a
+// record has nothing to triage until its detail is captured.
+const PLACEHOLDER_TITLE_PATTERN =
+  /^(?:无标题(?:数据)?|搜索结果笔记|抖音搜索结果(?:\s*\d+)?)$/u;
+
+export function isPlaceholderListRecord(record = {}, existing = {}) {
+  const field = name => String(record?.[name] || existing?.[name] || '').trim();
+  const titles = [record?.title, existing?.title].map(value => String(value || '').trim()).filter(Boolean);
+  return titles.length > 0 && titles.every(title => PLACEHOLDER_TITLE_PATTERN.test(title)) &&
+    !field('content') && !field('author_name');
+}
+
 export function resolveRecordBusinessVisibility(record = {}, existing = {}) {
   let payload = record?.payload;
   if (typeof payload === 'string') {
@@ -1142,9 +1154,13 @@ export function resolveRecordBusinessVisibility(record = {}, existing = {}) {
     // that a previous observation already captured successfully.
     return previous === 'eligible' ? 'eligible' : 'deferred';
   }
+  if (detailStatus === 'done') return 'eligible';
+  // Wait for the detail: an empty placeholder in triage only costs a person a look.
+  if (isPlaceholderListRecord(record, existing)) {
+    return previous === 'filtered_out' ? 'filtered_out' : 'deferred';
+  }
   if (
-    detailStatus === 'done'
-    || disposition === 'collect_full'
+    disposition === 'collect_full'
     || disposition === 'collect_minimal_detail'
   ) return 'eligible';
   return ['eligible', 'filtered_out', 'deferred'].includes(previous)

@@ -572,6 +572,23 @@ test('prefilter audit projects records into one explicit business visibility sta
   ), 'deferred');
 });
 
+test('a search card without data waits for its detail before it reaches triage', () => {
+  const placeholder = {title: '抖音搜索结果 7705537689119245434', content: '', author_name: '',
+    payload: {detailCaptureStatus: 'failed', aiRelevancePrefilter: {executionDisposition: 'collect_full'}}};
+  assert.equal(resolveRecordBusinessVisibility(placeholder), 'deferred');
+  assert.equal(resolveRecordBusinessVisibility(placeholder, {business_visibility: 'eligible'}), 'deferred',
+    'an already visible empty placeholder leaves triage on its next sync');
+  assert.equal(resolveRecordBusinessVisibility(placeholder, {business_visibility: 'filtered_out'}), 'filtered_out');
+  assert.equal(resolveRecordBusinessVisibility({...placeholder, payload: {detailCaptureStatus: 'done'}}), 'eligible',
+    'a captured detail admits it');
+  assert.equal(resolveRecordBusinessVisibility(placeholder,
+    {title: '别克车机壁纸分享', content: '', author_name: '', business_visibility: 'eligible'}), 'eligible',
+    'an incoming placeholder never hides a post already captured with a title');
+  assert.equal(resolveRecordBusinessVisibility({...placeholder, author_name: '真实用户'}), 'eligible');
+  assert.equal(resolveRecordBusinessVisibility({...placeholder, title: '', payload: {}}), 'eligible',
+    'a record without any title is not treated as a placeholder');
+});
+
 test('prefilter persistence keeps an already eligible record visible on a later deferred decision', async () => {
   const prefilter = await readFile(new URL('../server/services/relevance-prefilter.js', import.meta.url), 'utf8');
   assert.match(prefilter, /WHEN business_visibility = 'eligible' AND \$4 = 'deferred'\s+THEN 'eligible'/u);

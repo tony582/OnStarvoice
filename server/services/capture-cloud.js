@@ -221,6 +221,7 @@ function boundedEnhancementFailure(value) {
       url: text(target.url, 2000),
       platform: text(target.platform, 40),
       stage: text(target.stage, 80),
+      ...(text(target.code, 100) ? {code: text(target.code, 100)} : {}),
     }))
     .filter(target => target.externalId && /^https:\/\//i.test(target.url) &&
       !seenTargets.has(target.externalId) && seenTargets.add(target.externalId));

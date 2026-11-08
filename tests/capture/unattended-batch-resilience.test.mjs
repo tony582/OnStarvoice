@@ -1569,6 +1569,12 @@ function createBatchHarness({
 
   const context = {
     ENHANCEMENT_RETRY_EXHAUSTED: "ENHANCEMENT_RETRY_EXHAUSTED",
+    resolveKeywordRepairTargets: (repair, {keyword} = {}) =>
+      repair?.keyword === keyword ? repair.targets : [],
+    prepareKeywordRepairRecords: async ({keyword, targets}) => ({
+      keyword, ok: true, keywordRepair: true, scanComplete: true, candidateCount: targets.length,
+      recordIds: targets.map((target) => `rec-${target.externalId}`),
+    }),
     BATCH_INTER_KEYWORD_DELAY_MAX_MS: 0,
     BATCH_INTER_KEYWORD_DELAY_MIN_MS: 0,
     BATCH_KEYWORD_AFTER_NAV_WAIT_MS: 0,
@@ -1721,6 +1727,8 @@ function createBatchHarness({
       disableAutomaticSearchRetry:
         options.disableAutomaticSearchRetry === true,
       requireVerifiedFilters: options.requireVerifiedFilters === true,
+      keywordRepair: options.keywordRepair || null,
+      keywordRepairRound: options.keywordRepairRound || 1,
       shouldStop: options.shouldStop || (() => false),
     });
 
@@ -2916,4 +2924,45 @@ test("exhausted enhancement preserves partial evidence and never reports a full 
   assert.equal(result.stats.failed, 1);
   assert.equal(result.stats.success, 1);
   assert.equal(harness.settled[0].result.errorCode, "ENHANCEMENT_RETRY_EXHAUSTED");
+});
+
+test("a repair run whose post still fails reports the post and its own reason", async () => {
+  const target = {externalId: "6aa1e9900000000012027610", url: "https://www.xiaohongshu.com/explore/6aa1e9900000000012027610"};
+  const keywordRepair = {version: 1, keyword: "词1", round: 1, targets: [target]};
+  const unresolved = {recordId: `rec-${target.externalId}`, ok: false, reason: "CONTENT_UNAVAILABLE",
+    stage: "navigation", message: "作品暂时无法打开"};
+  const harness = createBatchHarness({
+    captureKeyword: async () => { throw new Error("a repair run never searches"); },
+    afterKeywordCapture: async () => ({ok: false, results: [unresolved]}),
+  });
+  const result = await harness.run({keywords: ["词1"], keywordRepair});
+  assert.equal(harness.captureCalls.length, 0);
+  const entry = JSON.parse(JSON.stringify(result.results[0]));
+  assert.equal(entry.ok, false);
+  assert.equal(entry.errorCode, "ENHANCEMENT_RETRY_EXHAUSTED", "the server counts it as a repair, not an unexplained failure");
+  assert.equal(entry.retryable, false);
+  assert.equal(entry.searchCompleted, true);
+  assert.deepEqual(entry.enhancementFailure.failedTargets, [{...target, platform: "xiaohongshu", stage: "navigation", code: "CONTENT_UNAVAILABLE"}]);
+  assert.equal(entry.enhancementFailure.budgetStopReason, "repair_failed");
+  assert.match(entry.warning, /补采的 1 条帖子仍未完成：作品暂时无法打开/u);
+  assert.equal(result.stats.failed, 1);
+  assert.equal(result.stats.success, 0);
+
+  const reported = [{...target, platform: "xiaohongshu", stage: "navigation", code: "PAGE_OPEN_TIMEOUT"}];
+  const withTargets = createBatchHarness({
+    captureKeyword: async () => { throw new Error("a repair run never searches"); },
+    afterKeywordCapture: async () => ({ok: false, results: [unresolved], unresolvedTargets: reported}),
+  });
+  const second = await withTargets.run({keywords: ["词1"], keywordRepair});
+  assert.deepEqual(JSON.parse(JSON.stringify(second.results[0].enhancementFailure.failedTargets)), reported, "per-post evidence from the detail run wins");
+});
+
+test("an ordinary keyword run keeps its unexplained enhancement failure unchanged", async () => {
+  const harness = createBatchHarness({
+    captureKeyword: async ({captureParams}) => successCapture(captureParams.keyword),
+    afterKeywordCapture: async () => ({ok: false, results: [{recordId: "r", ok: false, reason: "CONTENT_UNAVAILABLE"}]}),
+  });
+  const result = await harness.run({keywords: ["词1"]});
+  assert.notEqual(result.results[0].errorCode, "ENHANCEMENT_RETRY_EXHAUSTED");
+  assert.equal(result.results[0].enhancementFailure, undefined);
 });

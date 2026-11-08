@@ -199,3 +199,27 @@ test('legacy completed pages remain completed without fabricating missing step e
     assert.equal(orchestrationResultRecovery(item, {status}, {parentStatus: status, evidence}).state, 'completed')
   }
 })
+
+test('a keyword finished without posts no browser could open is a completed result with its note, not work for a person', () => {
+  const message = '1 条帖子在 3 个节点都打不开，可能已删除或审核中；关键词其余结果已保存，下一轮巡检搜到时会再试'
+  const item = {id: 'ibuick', keyword: 'ibuick', item_type: 'keyword', execution_task_id: 'last', status: 'completed_with_warnings',
+    error: {code: 'KEYWORD_POSTS_UNOPENABLE', message},
+    metadata: {checkpoint: {searchPassCompletion: {expected: 2, completed: [1], missing: [2]}}}}
+  const execution = {id: 'last', status: 'completed_with_failures', checkpoint: {keywordResults: [
+    {keyword: 'ibuick', round: 1, status: 'completed', savedCount: 35},
+    {keyword: 'ibuick', round: 2, status: 'failed', savedCount: 1, error: '补采的 1 条帖子仍未完成'},
+  ]}}
+  const evidence = orchestrationResultEvidence(item, execution, 2)
+  assert.equal(evidence.postsUnopenable, true)
+  assert.equal(evidence.childIncomplete, false)
+  assert.equal(evidence.missingCompletedSteps, false)
+  assert.deepEqual(evidence.unfinishedStepLabels, [])
+  const recovery = orchestrationResultRecovery(item, execution, {evidence})
+  assert.equal(recovery.state, 'completed')
+  assert.equal(recovery.label, '完成有提示')
+  assert.equal(recovery.message, message)
+  assert.equal(recovery.currentError, '')
+  const failed = orchestrationResultEvidence({...item, status: 'failed'}, execution, 2)
+  assert.equal(failed.postsUnopenable, false, 'only the server-settled warning is exempt')
+  assert.equal(failed.childIncomplete, true)
+})

@@ -15,6 +15,7 @@ function normalizeEnhancementFailureTargets(values) {
     url: text(target?.url).slice(0, 2000),
     platform: text(target?.platform).slice(0, 40),
     stage: text(target?.stage).slice(0, 80),
+    ...(text(target?.code) ? {code: text(target.code).slice(0, 100)} : {}),
   })).filter(target => target.externalId && /^https:\/\//i.test(target.url) &&
     !seen.has(target.externalId) && seen.add(target.externalId)).slice(0, 200);
 }

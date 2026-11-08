@@ -389,6 +389,50 @@ test('elastic retry rounds relax after a bounded wait and repeated time-filter f
     assert.equal((await row('capture_tasks', parent.id)).status, 'completed_with_failures');
   });
 
+  await t.test('a post three browsers cannot open finishes the keyword with a warning, not a failure', async st => {
+    // 11-08 ibuick: generic repair failures did not count, so the keyword went
+    // around seven browsers twelve times and still waited for a person.
+    const f = await fixture(st);
+    const {parent, items: [item]} = await batch(f, {keywords: ['ibuick'], status: 'pending'});
+    const repairCapable = {...f.capabilities, keywordRepairTargetsV1: true};
+    const claimAs = name => withTransaction(tx =>
+      dispatchNextElasticWorkItem(tx, {agent: f.byName(name), capabilities: repairCapable}));
+    const target = {recordId: 'rec_c', externalId: '6cc1e9900000000012027612',
+      url: 'https://www.xiaohongshu.com/explore/6cc1e9900000000012027612', platform: 'xiaohongshu', stage: 'navigation'};
+    const exhausted = {category: 'enhancement_incomplete', retryable: false,
+      enhancementFailure: {version: 1, failedRecordIds: ['rec_c'], failedTargets: [target], savedDetailRecordIds: [],
+        failureStages: ['navigation'], autoRetryCount: 2, budgetStopReason: 'attempt_budget'}};
+    const first = await claimAs('木星');
+    await report(f, first, {keyword: item.keyword, code: 'ENHANCEMENT_RETRY_EXHAUSTED', extraError: exhausted});
+    assert.equal((await itemRow(item.id)).metadata.keywordRepair.count, 1);
+
+    const second = await claimAs('金星');
+    assert.equal(second?.itemId, item.id);
+    // An older browser: the repair failed without naming the post or the reason.
+    await report(f, second, {keyword: item.keyword, code: 'CAPTURE_ENHANCEMENT_INCOMPLETE'});
+    let current = await itemRow(item.id);
+    assert.equal(current.status, 'retryable');
+    assert.equal(current.metadata.keywordRepair.count, 2, 'the unexplained repair failure is counted');
+    assert.match(current.error.message, /第 2\/2 次/u);
+    await report(f, second, {keyword: item.keyword, code: 'CAPTURE_ENHANCEMENT_INCOMPLETE'});
+    assert.equal((await itemRow(item.id)).metadata.keywordRepair.count, 2, 'a replay is not counted twice');
+    assert.equal(await claimAs('木星'), null, 'a browser that failed the post does not get it again');
+    assert.equal(await claimAs('金星'), null);
+
+    const third = await claimAs('成都');
+    assert.equal(third?.itemId, item.id);
+    await report(f, third, {keyword: item.keyword, code: 'CAPTURE_ENHANCEMENT_INCOMPLETE'});
+    current = await itemRow(item.id);
+    assert.equal(current.status, 'completed_with_warnings');
+    assert.equal(current.error.code, 'KEYWORD_POSTS_UNOPENABLE');
+    assert.match(current.error.message, /1 条帖子在 3 个节点都打不开/u);
+    assert.equal(current.metadata.keywordRepair.state, 'unopenable');
+    assert.equal((await row('capture_tasks', parent.id)).status, 'completed_with_warnings');
+    await report(f, third, {keyword: item.keyword, code: 'CAPTURE_ENHANCEMENT_INCOMPLETE'});
+    assert.equal((await itemRow(item.id)).status, 'completed_with_warnings', 'a replayed final snapshot keeps the result');
+    assert.equal(await claimAs('上海'), null, 'nothing is left to relay');
+  });
+
   await t.test('F1 replay: untried fenced nodes keep the keyword waiting only for the relax window', async st => {
     const {f, parent, item} = await replay0927(st);
     for (const name of NAMES) assert.equal(await claim(f, name), null, `${name} before the window`);

@@ -147,9 +147,9 @@ import {sweepDeadAttentionRoots} from '../services/capture-dead-attention.js';
 import {
   KEYWORD_REPAIR_STARVATION_MS,
   buildKeywordRepairCheckpoint,
-  keywordRepairPendingError,
+  decideKeywordRepair,
+  keywordRepairFailedAgentIds,
   pendingKeywordRepair,
-  planKeywordRepair,
   settleKeywordRepair,
 } from '../services/capture-keyword-repair.js';
 import {
@@ -6271,31 +6271,39 @@ async function projectOrchestrationSnapshot(tx, agent, task, snapshot) {
       error = filterVerification.error;
     }
     // Exhausted per-post enhancement: relay only the failed posts of this
-    // step to another browser instead of ending the keyword as failed.
+    // step to another browser instead of ending the keyword as failed. Every
+    // failed repair run counts; posts no browser could open end the keyword
+    // with a warning instead of a failure.
     const itemAgentAttemptLimit =
       elasticItemAgentAttemptLimit(parent.metadata, currentItemState?.metadata);
-    const keywordRepairPlan = elasticPool && status === 'failed' &&
-      !filterVerification && currentItemState
-      ? planKeywordRepair({
-          entry,
-          checkpoint,
-          itemMetadata: currentItemState.metadata,
-          planSnapshot: safeJson(parent.metadata).planSnapshot,
-          parentMetadata: parent.metadata,
-          platform: text(task.platform || parent.platform, 40),
-          sourceAgentId: agent.id,
-          executionTaskId: task.id,
-          attemptBudgetRemaining:
-            Math.max(serverAttemptCount, Number(attemptBudgetProjection.attemptBudget) || 0) <
-            itemAgentAttemptLimit * ELASTIC_TECHNICAL_RETRY_ROUNDS,
-        })
-      : null;
-    const keywordRepairPatch = keywordRepairPlan || (currentItemState
-      ? settleKeywordRepair({itemMetadata: currentItemState.metadata, checkpoint, status})
-      : null);
-    if (keywordRepairPlan) {
-      status = 'retryable';
-      error = keywordRepairPendingError(error, keywordRepairPlan);
+    let keywordRepairDecision = null;
+    if (currentItemState && filterVerification) {
+      const settled = settleKeywordRepair({
+        itemMetadata: currentItemState.metadata, checkpoint, status, executionTaskId: task.id,
+      });
+      keywordRepairDecision = settled ? {status, error, repair: settled} : null;
+    } else if (elasticPool && currentItemState) {
+      keywordRepairDecision = decideKeywordRepair({
+        entry,
+        checkpoint,
+        status,
+        error,
+        itemMetadata: currentItemState.metadata,
+        childRepair: safeJson(safeJson(task.metadata).planSnapshot).keywordRepair,
+        planSnapshot: safeJson(parent.metadata).planSnapshot,
+        parentMetadata: parent.metadata,
+        platform: text(task.platform || parent.platform, 40),
+        agentId: agent.id,
+        executionTaskId: task.id,
+        attemptBudgetRemaining:
+          Math.max(serverAttemptCount, Number(attemptBudgetProjection.attemptBudget) || 0) <
+          itemAgentAttemptLimit * ELASTIC_TECHNICAL_RETRY_ROUNDS,
+      });
+    }
+    const keywordRepairPatch = keywordRepairDecision?.repair || null;
+    if (keywordRepairDecision) {
+      status = keywordRepairDecision.status;
+      error = keywordRepairDecision.error;
     }
     const recovery = buildElasticRecoveryMetadata({
       status,
@@ -8107,6 +8115,12 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
     pendingRepair && freshCapabilities.keywordRepairTargetsV1 === true
       ? pendingRepair
       : null;
+  // A browser that already failed one of these posts would most likely fail
+  // it again; leave the repair to a browser that has not tried it.
+  if (keywordRepairClaim && !repairStarving &&
+      keywordRepairFailedAgentIds(keywordRepairClaim).includes(agent.id)) {
+    return nextCandidate();
+  }
   const negativePost = candidate.item_type === 'negative_post';
   const watchedContent = candidate.item_type === 'watched_content';
   const targetedContent = negativePost || watchedContent;

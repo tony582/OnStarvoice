@@ -1652,6 +1652,7 @@ function normalizeUnattendedEnhancementFailure(value) {
     url: String(target?.url || '').trim().slice(0, 2000),
     platform: String(target?.platform || '').trim().slice(0, 40),
     stage: String(target?.stage || '').trim().slice(0, 80),
+    ...(String(target?.code || '').trim() ? {code: String(target.code).trim().slice(0, 100)} : {}),
   })).filter(target => target.externalId && /^https:\/\//i.test(target.url) &&
     !seenTargets.has(target.externalId) && seenTargets.add(target.externalId)).slice(0, 200);
   return {version: 1, failedRecordIds: ids(value.failedRecordIds),

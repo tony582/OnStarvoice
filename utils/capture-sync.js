@@ -17934,6 +17934,61 @@ export async function batchCaptureByKeywords({
       }
     }
 
+    // A repair run is only these posts. One that still failed ends the step
+    // with each post's own reason, so the server counts this run toward the
+    // repair limit instead of relaying the keyword as an unexplained failure.
+    if (
+      repairTargets.length > 0 &&
+      keywordResult?.enhanceStatus === 'failed' &&
+      keywordResult.errorCode !== ENHANCEMENT_RETRY_EXHAUSTED &&
+      !keywordResult.securityBlocked && !keywordResult.canceled && !keywordResult.fatal &&
+      !keywordResult.recoverableInterruption && !keywordResult.recoveryRequired
+    ) {
+      const enhancement = keywordResult.enhanceResult || {};
+      const unresolvedItem = (Array.isArray(enhancement.results) ? enhancement.results : [])
+        .find((item) => item?.ok === false) || {};
+      const fallbackCode = String(
+        unresolvedItem.reason || unresolvedItem.code || unresolvedItem.error?.code ||
+          enhancement.error?.code || '',
+      ).trim().toUpperCase().slice(0, 100);
+      const fallbackStage = String(unresolvedItem.stage || '').trim().slice(0, 80);
+      const reported = Array.isArray(enhancement.unresolvedTargets) ? enhancement.unresolvedTargets : [];
+      const failedTargets = reported.length > 0
+        ? reported
+        : repairTargets.map((target) => ({
+            externalId: target.externalId,
+            url: target.url,
+            platform,
+            stage: fallbackStage,
+            ...(fallbackCode ? {code: fallbackCode} : {}),
+          }));
+      const reason = String(
+        unresolvedItem.message || unresolvedItem.error?.message ||
+          enhancement.error?.message || keywordResult.warning || '',
+      ).trim();
+      if (keywordResult.ok === true) {
+        successCount = Math.max(0, successCount - 1);
+        failedCount += 1;
+      }
+      keywordResult.ok = false;
+      keywordResult.partial = true;
+      keywordResult.searchCompleted = true;
+      keywordResult.errorCode = ENHANCEMENT_RETRY_EXHAUSTED;
+      keywordResult.errorCategory = 'enhancement_incomplete';
+      keywordResult.retryable = false;
+      keywordResult.enhancementFailure = {
+        version: 1,
+        failedRecordIds: [],
+        failedTargets,
+        failureStages: [...new Set(failedTargets.map((target) => target.stage).filter(Boolean))],
+        autoRetryCount: Math.max(0, Math.floor(Number(enhancement.autoRetryCount) || 0)),
+        savedDetailRecordIds: [],
+        budgetStopReason: 'repair_failed',
+      };
+      keywordResult.warning =
+        `补采的 ${failedTargets.length} 条帖子仍未完成${reason ? `：${reason}` : ''}`;
+    }
+
     if (keywordResult && typeof onKeywordSettled === 'function') {
       await onKeywordSettled({
         current: i + 1,

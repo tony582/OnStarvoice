@@ -232,3 +232,21 @@ test('cancellation during cached retry remains canceled and never becomes exhaus
   assert.notEqual(record.payload.detailCaptureStatus, 'done');
   assert.equal(workers.size, 0);
 });
+
+test('a post failing without a retry still names itself and its reason for a repair run', async () => {
+  const target = {targetExternalId: noteId, targetUrl: noteUrl, targetPlatform: 'xiaohongshu'};
+  const result = await runEnhancementWithSingleRetry({recordIds: ['unavailable'],
+    runAttempt: async () => ({ok: false, results: [{recordId: 'unavailable', ok: false,
+      reason: 'CONTENT_UNAVAILABLE', stage: 'navigation', ...target}]}),
+  });
+  assert.notEqual(result.error?.code, ENHANCEMENT_RETRY_EXHAUSTED, 'a non-retryable failure is not reported as exhausted');
+  assert.equal(result.enhancementFailure, undefined);
+  assert.deepEqual(result.unresolvedTargets, [{recordId: 'unavailable', externalId: noteId, url: noteUrl,
+    platform: 'xiaohongshu', stage: 'navigation', code: 'CONTENT_UNAVAILABLE'}]);
+  const exhausted = await runEnhancementWithSingleRetry({recordIds: ['timeout'],
+    runAttempt: async () => ({ok: false, results: [{recordId: 'timeout', ok: false,
+      reason: 'PAGE_OPEN_TIMEOUT', stage: 'navigation', ...target}]}),
+  });
+  assert.equal(exhausted.error.code, ENHANCEMENT_RETRY_EXHAUSTED);
+  assert.equal(exhausted.enhancementFailure.failedTargets[0].code, 'PAGE_OPEN_TIMEOUT');
+});

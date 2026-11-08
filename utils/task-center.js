@@ -528,6 +528,7 @@
         url: sanitizeText(target?.url, 2000),
         platform: sanitizeText(target?.platform, 40),
         stage: sanitizeText(target?.stage, 80),
+        ...(sanitizeText(target?.code, 100) ? {code: sanitizeText(target.code, 100)} : {}),
       }))
       .filter((target) => target.externalId && /^https:\/\//i.test(target.url) &&
         !seen.has(target.externalId) && seen.add(target.externalId));

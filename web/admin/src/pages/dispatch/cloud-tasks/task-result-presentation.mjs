@@ -171,13 +171,17 @@ export function orchestrationResultEvidence(item, execution, expectedSearchPasse
   const sync = resultSyncEvidence(execution?.progress)
   const missingCompletedSteps = item.item_type === 'keyword' && expected > 1 && (steps.length > 0 || reportedMissing.length > 0) && missingRounds.length > 0
   const recovered = SUCCESS_RESULTS.has(String(item.status)) && completedRounds.size >= expected && failedSteps.length === 0
+  // The server finished this keyword without posts several browsers could not
+  // open. Its unfinished step is that warning, not work left for a person.
+  const postsUnopenable = SUCCESS_RESULTS.has(String(item.status)) && itemError.code === 'KEYWORD_POSTS_UNOPENABLE'
   return {
     steps,
-    childIncomplete: !recovered && ['failed', 'completed_with_failures', 'needs_action', 'interrupted'].includes(String(execution?.status)),
-    failedStepCount: failedSteps.length,
+    childIncomplete: !recovered && !postsUnopenable && ['failed', 'completed_with_failures', 'needs_action', 'interrupted'].includes(String(execution?.status)),
+    failedStepCount: postsUnopenable ? 0 : failedSteps.length,
     completedStepCount: completedRounds.size,
-    missingCompletedSteps,
-    unfinishedStepLabels: missingCompletedSteps ? missingRounds.map(round => orchestrationSearchStepLabel(round, searchPasses)) : failedSteps.map(step => orchestrationSearchStepLabel(Number(step.round || 1), searchPasses)),
+    missingCompletedSteps: postsUnopenable ? false : missingCompletedSteps,
+    postsUnopenable,
+    unfinishedStepLabels: postsUnopenable ? [] : missingCompletedSteps ? missingRounds.map(round => orchestrationSearchStepLabel(round, searchPasses)) : failedSteps.map(step => orchestrationSearchStepLabel(Number(step.round || 1), searchPasses)),
     syncNeedsReview: (sync.failed ?? 0) > 0 || (sync.remaining ?? 0) > 0,
   }
 }
@@ -192,6 +196,7 @@ export function orchestrationResultRecovery(item, execution, {parentStatus = '',
   const currentError = SUCCESS_RESULTS.has(status) && !evidence.childIncomplete && evidence.failedStepCount === 0 && !evidence.missingCompletedSteps
     ? '' : resultMessage(item.error) || resultMessage(execution?.error)
   const answer = (state, label, message = '') => ({state, label, message, currentError})
+  if (evidence.postsUnopenable && !evidence.syncNeedsReview) return answer('completed', '完成有提示', resultMessage(item.error))
   if (resolved) return answer('completed', '已完成')
   if (status === 'canceled' || status === 'skipped') return answer('stopped', status === 'canceled' ? '已取消' : '已跳过')
   if (status === 'needs_action') {
