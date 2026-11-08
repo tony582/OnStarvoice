@@ -3,12 +3,25 @@ import { Router } from 'express';
 const router = Router();
 
 export const EXTENSION_UPDATE_MANIFEST = Object.freeze({
-  latestVersion: '0.4.32',
+  latestVersion: '0.4.33',
   minSupportedVersion: '0.3.51',
-  releaseDate: '2026-11-07',
-  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.32-20261107.zip',
+  releaseDate: '2026-11-08',
+  downloadUrl: 'https://voice.minilife.online/downloads/StarVoice-extension-v0.4.33-20261108.zip',
   changelogUrl: 'https://voice.minilife.online/changelog',
   releases: [
+    {
+      version: '0.4.33',
+      releaseDate: '2026-11-08',
+      releaseNotes: [{
+        tag: '补采收尾',
+        notes: [
+          {title: '补采每次都计数', desc: '补采节点无论怎样失败都算一次，最多换 2 个节点；已经失败过的节点不再领取同一批帖子。'},
+          {title: '打不开的帖子不再等人', desc: '同一条帖子在 3 个不同节点都卡在打开页面这一步时，关键词按“完成有提示”结束，并说明可能已删除或审核中，下一轮巡检搜到时会再试；其它原因的失败仍显示为失败。'},
+          {title: '补采上报真实原因', desc: '补采时每条帖子都带上本节点的失败原因，即使没有重试。需更新 Extension 至 0.4.33。'},
+          {title: '空帖子不进分诊', desc: '只有占位标题、没有正文和作者的搜索结果，等详情补齐后才进入内容分诊。'},
+        ],
+      }],
+    },
     {
       version: '0.4.32',
       releaseDate: '2026-11-07',
