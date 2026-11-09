@@ -197,7 +197,7 @@ test('production task center exposes real multi-Agent compose and detail flows',
   assert.match(composer, /searchPasses/u);
   assert.match(
     composer,
-    /searchFilters:\s*\{[\s\S]*sort,[\s\S]*publishTime,[\s\S]*contentType:[\s\S]*searchScope,[\s\S]*distance:[\s\S]*videoDuration:/u,
+    /searchFilters:\s*\{[\s\S]*sort: effectiveSort,[\s\S]*publishTime,[\s\S]*contentType:[\s\S]*searchScope,[\s\S]*distance:[\s\S]*videoDuration:/u,
   );
   assert.match(composer, /disableAutomaticSearchRetry: sequentialSearchEnabled/u);
   assert.match(composer, /requireVerifiedFilters: sequentialSearchEnabled/u);

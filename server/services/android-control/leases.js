@@ -4,7 +4,7 @@ import {refreshOrchestrationParent} from './parent-refresh.js';
 import {claimPhonePatrolItem} from './patrol.js';
 import {heldItem,lockAgent,parentStopRequested,rollup,saveItemMetadata,taskRow} from './repository.js';
 import {MOBILE_PLATFORMS,mobileCommentPlan,mobilePlanBlockReason,mobilePlatformForWorkflow,mobileRelevancePrefilterEnabled,
-  mobileTaskBudgets,mobileTaskFilters,mobileWorkflowFor,trimMobilePlanSnapshot} from './mobile-tasks.js';
+  mobileTaskBudgets,mobileTaskFilters,mobileWorkflowFor,trimMobilePlanSnapshot,WECHAT_SEARCH_FILTERS_FEATURE} from './mobile-tasks.js';
 
 // A phone attempt budget per work item (mirrors the browser elastic pool's
 // bounded attempts). Manual-action safety endings fence the item for this phone.
@@ -59,8 +59,9 @@ function boundProbe(probe) {
 function text2(value,max) {
   return typeof value==='string' ? value.slice(0,max) : '';
 }
-async function persistHeartbeat(tx,agent,ready,reason,probe,platforms) {
-  const merge={readyForSearch:ready,readyPlatforms:platforms};
+async function persistHeartbeat(tx,agent,ready,reason,probe,platforms,features=[]) {
+  // runnerFeatures is what the admin reads to tell a phone that can apply 视频号 时长 / 范围 from an older one.
+  const merge={readyForSearch:ready,readyPlatforms:platforms,runnerFeatures:features};
   // The apps this phone has run ready (union): plan checks read supportedPlatforms, so a phone that gained WeChat
   // becomes selectable for 视频号 plans after its first poll with the new Runner.
   const supported=[...new Set([...(Array.isArray(agent.capabilities?.supportedPlatforms)?agent.capabilities.supportedPlatforms:['douyin']),...platforms])]
@@ -72,8 +73,9 @@ async function persistHeartbeat(tx,agent,ready,reason,probe,platforms) {
   await tx.execute(`UPDATE capture_agents SET last_liveness_at=now(),last_full_heartbeat_at=now(),last_heartbeat_at=now(),
     capabilities=capabilities||$2::jsonb WHERE id=$1 AND (last_liveness_at IS NULL OR last_liveness_at < now()-interval '25 seconds'
     OR capabilities->>'readyForSearch' IS DISTINCT FROM $3 OR capabilities->>'deviceReason' IS DISTINCT FROM $4
-    OR capabilities->'readyPlatforms' IS DISTINCT FROM $5::jsonb OR capabilities->'supportedPlatforms' IS DISTINCT FROM $6::jsonb)`,
-  [agent.id,merge,String(ready),String(merge.deviceReason||''),JSON.stringify(platforms),JSON.stringify(supported)]);
+    OR capabilities->'readyPlatforms' IS DISTINCT FROM $5::jsonb OR capabilities->'supportedPlatforms' IS DISTINCT FROM $6::jsonb
+    OR capabilities->'runnerFeatures' IS DISTINCT FROM $7::jsonb)`,
+  [agent.id,merge,String(ready),String(merge.deviceReason||''),JSON.stringify(platforms),JSON.stringify(supported),JSON.stringify(features)]);
 }
 async function findAssignedCandidate(tx,tenantId,agentId,workflows) {
   return tx.queryOne(`SELECT item.* FROM capture_task_items item
@@ -96,7 +98,7 @@ async function findAssignedCandidate(tx,tenantId,agentId,workflows) {
 // One keyword that runs out of attempts turns the run needs_action; its other keywords stay claimable,
 // as in the browser elastic dispatch. Retries go to the fewest attempts first, so one failing keyword
 // cannot use up all of its retries while the others wait behind it.
-async function claimElasticItem(tx,principal,agent,now,platforms) {
+async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=false) {
   const item=await tx.queryOne(`SELECT item.* FROM capture_task_items item
     JOIN capture_tasks parent ON parent.id=item.task_id AND parent.tenant_id=item.tenant_id
     WHERE item.tenant_id=$1
@@ -128,9 +130,13 @@ async function claimElasticItem(tx,principal,agent,now,platforms) {
       AND (parent.platform='wechat_channels' OR (
         COALESCE(parent.metadata->'planSnapshot'->'negativePatrol'->>'enabled','false') <> 'true'
         AND COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'publishTime','all') <> 'month'))
+      -- A 视频号 keyword with the App's 时长 / 范围 choices only goes to a Runner that applies them (0.4.5).
+      AND ($7::boolean OR parent.platform<>'wechat_channels' OR item.item_type<>'keyword' OR (
+        COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'videoDuration','all') NOT IN ('under_5m','5_20m','over_20m')
+        AND COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'searchScope','all') NOT IN ('followed','viewed')))
     ORDER BY CASE WHEN item.status='pending' THEN 0 ELSE 1 END, parent.created_at, item.attempt_count, item.ordinal, item.id
     FOR UPDATE OF item SKIP LOCKED LIMIT 1`,
-  [principal.tenantId,agent.id,MOBILE_ELASTIC_ATTEMPT_LIMIT,TERMINAL_EXECUTION_STATUSES,MOBILE_SAFETY_ERROR_CODES,platforms]);
+  [principal.tenantId,agent.id,MOBILE_ELASTIC_ATTEMPT_LIMIT,TERMINAL_EXECUTION_STATUSES,MOBILE_SAFETY_ERROR_CODES,platforms,wechatFilters]);
   if (!item) return null;
   const parent=await tx.queryOne('SELECT * FROM capture_tasks WHERE id=$1 AND tenant_id=$2 FOR UPDATE',[item.task_id,principal.tenantId]);
   const planSnapshot=parent.metadata?.planSnapshot || {};
@@ -220,6 +226,10 @@ async function claimBoundItem(tx,principal,agent,child,item,sessionId,now) {
 }
 // The apps the Runner reports ready on this poll, limited to the phone's allowed platforms. A Runner before 0.4.0
 // sends no list: when ready, it is a Douyin phone.
+/** The optional abilities a Runner names in its poll (0.4.5+); unknown names are dropped. */
+export function runnerFeatures(body) {
+  return Array.isArray(body?.features) ? [...new Set(body.features.filter(name=>name===WECHAT_SEARCH_FILTERS_FEATURE))] : [];
+}
 export function readyPlatforms(body,agent,ready) {
   if (!ready) return [];
   const allowed=Array.isArray(agent.allowed_platforms) && agent.allowed_platforms.length ? agent.allowed_platforms : ['douyin'];
@@ -232,7 +242,8 @@ export async function poll(tx,principal,body,now=Date.now()) {
   if (text(body.deviceId,'DEVICE_ID',120)!==agent.capabilities.deviceId) fail('DEVICE_ID_MISMATCH',403);
   const ready=body.readyForSearch===true;
   const platforms=readyPlatforms(body,agent,ready);
-  await persistHeartbeat(tx,agent,ready,text2(body.reason,120),body.probe,platforms);
+  const features=runnerFeatures(body);
+  await persistHeartbeat(tx,agent,ready,text2(body.reason,120),body.probe,platforms,features);
   const held=await heldItem(tx,principal.tenantId,agent.id);
   if (held) {
     const stopped=control(held,held.task_metadata,held.parent_metadata,sessionId,now);
@@ -246,7 +257,7 @@ export async function poll(tx,principal,body,now=Date.now()) {
   if (item) {
     child=await taskRow(tx,principal.tenantId,item.execution_task_id);
   } else {
-    const claimed=await claimElasticItem(tx,principal,agent,now,platforms);
+    const claimed=await claimElasticItem(tx,principal,agent,now,platforms,features.includes(WECHAT_SEARCH_FILTERS_FEATURE));
     if (!claimed) return {task:null,permit:null,control:{}};
     item=claimed.item; child=claimed.child;
   }

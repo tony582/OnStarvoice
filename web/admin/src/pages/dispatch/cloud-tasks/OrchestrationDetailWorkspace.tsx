@@ -34,6 +34,7 @@ import type {
 } from './types'
 // 平台/状态文案与时间格式化统一以 lib.ts 为准，避免两处定义漂移。
 import { PLATFORM_LABELS, STATUS_LABELS, formatTime } from './lib'
+import { wechatFilterSummary } from './wechatFilters'
 import { KeywordExecutionReport } from './KeywordExecutionReport'
 import { OrchestrationResultReport } from './OrchestrationResultReport'
 import { TaskResultTimes } from './TaskResultSections'
@@ -2065,7 +2066,10 @@ export function OrchestrationDetailWorkspace({
           {(Number.isFinite(keywordLimit) || searchFilters || captureSettings) && (
             <div className="mt-4 flex flex-wrap gap-x-5 gap-y-2 border-t border-border/70 pt-3 text-[11px] text-muted-foreground">
               {Number.isFinite(keywordLimit) && keywordLimit > 0 && <span>每词上限 <strong className="font-semibold text-foreground">{keywordLimit} 条</strong></span>}
-              {searchFilters && <span>筛选 <strong className="font-semibold text-foreground">
+              {searchFilters && orchestration.platform === 'wechat_channels' && <span>筛选 <strong className="font-semibold text-foreground">
+                {wechatFilterSummary(searchFilters)}
+              </strong></span>}
+              {searchFilters && orchestration.platform !== 'wechat_channels' && <span>筛选 <strong className="font-semibold text-foreground">
                 {SORT_LABELS[String(searchFilters.sort || '')] || String(searchFilters.sort || '默认')} · {PUBLISH_TIME_LABELS[String(searchFilters.publishTime || '')] || String(searchFilters.publishTime || '不限')} · {sequentialSearchEnabled ? patrolPathLabel : CONTENT_TYPE_LABELS[String(searchFilters.contentType || 'all')] || String(searchFilters.contentType || '全部')} · {SEARCH_SCOPE_LABELS[String(searchFilters.searchScope || 'all')] || String(searchFilters.searchScope || '全部')}
                 {orchestration.platform === 'xiaohongshu' ? ` · ${DISTANCE_LABELS[String(searchFilters.distance || 'all')] || String(searchFilters.distance || '不限距离')}` : ''}
                 {orchestration.platform === 'douyin' ? ` · ${VIDEO_DURATION_LABELS[String(searchFilters.videoDuration || 'all')] || String(searchFilters.videoDuration || '不限时长')}` : ''}

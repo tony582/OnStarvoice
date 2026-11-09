@@ -1,8 +1,9 @@
 import {DeviceError, throwIfAborted} from './bounded.mjs';
 import {pause} from './ui-wait.mjs';
 import {UNICODE_IME} from './adb-screen.mjs';
-import {ACTIVITY, MAIN_TABS, MORE_VIDEOS_SHIFT, POINT, REGION, SWIPE, WECHAT_MAIN, WECHAT_SCHEME_ENTRY, feedLink} from './wechat-profile.mjs';
-import {commentButton, findText, findWord, isResultsPage, parseResultCards} from './wechat-ocr-parse.mjs';
+import {ACTIVITY, MAIN_TABS, MORE_VIDEOS_SHIFT, POINT, REGION, SEARCH_FILTERS, SWIPE, WECHAT_MAIN, WECHAT_SCHEME_ENTRY, feedLink}
+  from './wechat-profile.mjs';
+import {commentButton, filterButton, findText, findWord, isResultsPage, parseResultCards, sheetOption} from './wechat-ocr-parse.mjs';
 import {readCommentPanel} from './wechat-comment-reader.mjs';
 
 export const SHARE_LINK = /^https:\/\/weixin\.qq\.com\/sph\/[A-Za-z0-9_-]{4,40}$/u;
@@ -57,12 +58,38 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
     }
     throw settled('search_context_unverified', 'The keyword results page was not confirmed');
   };
+  // A re-sorted or re-filtered list loads after the page itself: give late cards a few more readings.
+  const settledResults = async (keyword, signal) => {
+    let page = await resultsPage(keyword, signal);
+    for (let wait = 0; wait < 3 && !page.cards.length; wait++) { await pause(1200, signal); page = await resultsPage(keyword, signal); }
+    return page;
+  };
+  // 时长 / 范围: button → bottom sheet (its title confirms it) → option; the button must then show the option.
+  const pickFilter = async (kind, key, keyword, signal) => {
+    const filter = SEARCH_FILTERS[kind];
+    const button = filterButton(await view.look({signal, roi: REGION.filterRow}), filter);
+    if (!button) throw settled('filter_unverified', `The ${filter.button} button was not found`, {filter: kind});
+    if (button.shows !== key) {
+      await screen.tap(button.center.x, button.center.y, {signal});
+      await pause(1300, signal);
+      const option = sheetOption(await view.look({signal, roi: REGION.filterSheet}), filter, key);
+      if (!option) throw settled('filter_unverified', `The ${filter.button} sheet or its option was not confirmed`, {filter: kind});
+      await screen.tap(option.center.x, option.center.y, {signal});
+      await pause(2200, signal);
+      if (filterButton(await view.look({signal, roi: REGION.filterRow}), filter)?.shows !== key) {
+        throw settled('filter_unverified', `The ${filter.button} choice did not take effect`, {filter: kind});
+      }
+    }
+    return settledResults(keyword, signal);
+  };
   const flow = {
     /** Main screen (logged in) → 发现 → 视频号 → search → keyword → 视频 tab → sort. Returns the first results. */
-    async search({keyword, sort = 'latest', signal}) {
+    async search({keyword, sort = 'latest', duration = 'all', scope = 'all', signal}) {
       context = null;
-      if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 60 || !SORTS.has(sort)) {
-        throw settled('unsupported_search', 'Unsupported Channels keyword or sort');
+      if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 60 || !SORTS.has(sort)
+        || !(duration === 'all' || Object.hasOwn(SEARCH_FILTERS.duration.options, duration))
+        || !(scope === 'all' || Object.hasOwn(SEARCH_FILTERS.scope.options, scope))) {
+        throw settled('unsupported_search', 'Unsupported Channels keyword, sort or filter');
       }
       throwIfAborted(signal);
       await screen.launch(WECHAT_MAIN, {clearTop: true, signal});
@@ -96,18 +123,22 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
       if (!tab) throw settled('video_tab_missing', 'The 视频 results tab was not found');
       await screen.tap(tab.center.x, tab.center.y, {signal});
       await pause(1500, signal);
-      for (let tries = 0; tries < 2; tries++) {
+      let sorted = false;
+      for (let tries = 0; tries < 2 && !sorted; tries++) {
         await screen.tap(POINT.sort[sort].x, POINT.sort[sort].y, {signal});
         await pause(2000, signal);
-        page = await resultsPage(keyword, signal);
-        // The re-sorted list loads after the page itself: give late cards a few more readings.
-        for (let wait = 0; wait < 3 && !page.cards.length; wait++) { await pause(1200, signal); page = await resultsPage(keyword, signal); }
-        if (sort !== 'latest' || agesAscending(page.cards)) {
-          context = {keyword, sort, verifiedAt: now()};
-          return {verified: true, keyword, sort, cards: page.cards, sortVerified: sort === 'latest' ? (page.cards.length >= 3 ? 'ascending_ages' : 'too_few_cards') : 'tapped'};
-        }
+        page = await settledResults(keyword, signal);
+        sorted = sort !== 'latest' || agesAscending(page.cards);
       }
-      throw settled('sort_unverified', 'The newest-first order was not confirmed on the results');
+      if (!sorted) throw settled('sort_unverified', 'The newest-first order was not confirmed on the results');
+      // The App's own 时长 / 范围 choices, each confirmed on its button before the results are read again.
+      for (const [kind, key] of [['duration', duration], ['scope', scope]]) {
+        if (key !== 'all') page = await pickFilter(kind, key, keyword, signal);
+      }
+      if (sort === 'latest' && !agesAscending(page.cards)) throw settled('sort_unverified', 'The newest-first order was lost after filtering');
+      context = {keyword, sort, verifiedAt: now()};
+      return {verified: true, keyword, sort, duration, scope, cards: page.cards,
+        sortVerified: sort === 'latest' ? (page.cards.length >= 3 ? 'ascending_ages' : 'too_few_cards') : 'tapped'};
     },
     async readCards({signal}) {
       const {keyword} = requireContext();

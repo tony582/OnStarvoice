@@ -35,6 +35,12 @@ export const POINT = Object.freeze({
 });
 // The same bar sits 180 px higher when WeChat adds its 「↑更多视频」 strip below it (seen opening a post by link).
 export const MORE_VIDEOS_SHIFT = 180;
+// The 视频 tab's 时长 and 范围 buttons (right of the sort row) open bottom sheets; picking an option closes the sheet and
+// the button then shows that option. A new search starts at 不限 again (measured 2026-11-09). Keys are the server's.
+export const SEARCH_FILTERS = Object.freeze({
+  duration: {button: '时长', options: Object.freeze({under_5m: '5分钟以下', '5_20m': '5-20分钟', over_20m: '20分钟以上'})},
+  scope: {button: '范围', options: Object.freeze({followed: '已关注', viewed: '最近看过'})},
+});
 export const SWIPE = Object.freeze({
   results: [540, 1900, 540, 820, 450],
   comments: [540, 1950, 540, 1050, 450],
@@ -43,6 +49,9 @@ export const SWIPE = Object.freeze({
 export const REGION = Object.freeze({
   shareSheet: [0, 1500, 1080, 742],
   workBar: [0, 1650, 1080, 592],
+  // The sort / 时长 / 范围 row under the result tabs, and the filter bottom sheet (title y≈1747, options y≈1880 and 2000).
+  filterRow: [0, 370, 1080, 120],
+  filterSheet: [0, 1650, 1080, 592],
   bottomTabs: [0, 2120, 1080, 122],
 });
 // Texts that mean the owner must act on the phone (login wall, security check, rate warning).

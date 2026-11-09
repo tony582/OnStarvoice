@@ -14,6 +14,9 @@ import {createSimulationDevice} from './simulation.mjs';
 import {assertSimulationOrigin, fixedLockRoot, readConfig, setCheckpoint, stateValue} from './state.mjs';
 
 const clock = {wallNow: Date.now, monotonicNow: () => performance.now()};
+// What this Runner can do beyond the platforms list; the server only hands it work that needs these when they are named.
+// wechat_search_filters (0.4.5): the 视频号 App's own 时长 / 范围 choices.
+export const RUNNER_FEATURES = Object.freeze(['wechat_search_filters']);
 // Results with these reasons mean the phone itself is not ready; the runner stops advertising readiness at once.
 const DEVICE_READINESS_REASONS = new Set(['douyin_not_foreground', 'device_locked', 'device_asleep', 'login_required',
   'login_or_challenge_required', 'login_state_unverified', 'challenge_or_unknown', 'profile_version_mismatch', 'system_overlay_blocked']);
@@ -217,7 +220,8 @@ export class AndroidDaemon {
     if (!this.active && this.device?.probe) await this.probeDevice();
     let started = performance.now();
     const polled = await this.control.poll({deviceId: this.config.deviceId, sessionId: this.sessionId,
-      readyForSearch: this.ready, reason: this.deviceReason ?? null, platforms: this.platforms, probe: this.pollProbe()},
+      readyForSearch: this.ready, reason: this.deviceReason ?? null, platforms: this.platforms, probe: this.pollProbe(),
+      features: RUNNER_FEATURES},
     {signal: this.shutdown.signal});
     // Only an answered poll ends a failure streak; turns skipped for backoff or a block keep the count and the error.
     this.controlFailures = 0; this.lastControlError = null;

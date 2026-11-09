@@ -24,6 +24,7 @@ import { NegativePatrolScheduleOption } from './NegativePatrolScheduleOption'
 import { hasUnattendedNegativePatrol, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable, DEFAULT_NEGATIVE_PATROL_STATUSES, negativePatrolTriageStatuses, validNegativePatrolStatuses, negativePatrolStatusSummary } from './unattendedNegativePatrol.mjs'
 import { Drawer } from '@/components/shared/Drawer'
 import { isMobileAgent, mobileReadinessLabel, shanghaiToday } from './lib'
+import { WECHAT_DURATION_OPTIONS, WECHAT_PUBLISH_TIME_OPTIONS, WECHAT_SCOPE_OPTIONS, WECHAT_SORT_OPTIONS, wechatEffectiveSort, wechatSortLocked } from './wechatFilters'
 import { isAgentStopFenced } from './stop-fence-presentation.mjs'
 import type {
   CaptureEnhancementSettings,
@@ -84,7 +85,6 @@ const PLATFORM_OPTIONS: Array<{ value: OrchestrationPlatform; label: string }> =
   { value: 'wechat_channels', label: '视频号' },
 ]
 // 视频号只有手机节点能采（App 里只有不限／最新／最热三种排序，没有发布时间筛选：设了时间范围时手机按「最新」排序、读卡片时间截止）。
-const WECHAT_SORT_LABELS: Record<string, string> = { comprehensive: '不限', latest: '最新', likes: '最热' }
 
 const SORT_OPTIONS = [
   { value: 'comprehensive', label: '综合排序' },
@@ -235,6 +235,7 @@ function agentBlockReason(
   enhancementEnabled: boolean,
   sequentialSearchEnabled = false,
   negativePatrolEnabled = false,
+  wechatAppFilters = false,
 ) {
   if (agent.status !== 'active') return agent.status === 'paused' ? '节点已暂停接单' : '节点已撤销'
   // 手机节点做抖音搜索发现和视频号整帖采集：小红书、多段搜索一律不可选；负面巡查只在视频号上由手机执行。
@@ -246,6 +247,10 @@ function agentBlockReason(
     }
     if (sequentialSearchEnabled) return '手机节点不支持多段搜索巡检'
     if (negativePatrolEnabled && platform !== 'wechat_channels') return '抖音手机节点不支持负面巡查'
+    const features = agent.capabilities?.runnerFeatures
+    if (wechatAppFilters && platform === 'wechat_channels' && !(Array.isArray(features) && features.includes('wechat_search_filters'))) {
+      return '手机采集器需升级到 0.4.5 才能按视频号的「时长」「范围」筛选'
+    }
     return ''
   }
   if (platform === 'wechat_channels') return '视频号只能由手机节点采集'
@@ -459,6 +464,11 @@ export function OrchestrationComposerDrawer({
   const draftCleanupPromiseRef = useRef<Promise<boolean> | null>(null)
 
   const keywords = useMemo(() => uniqueKeywords(keywordText), [keywordText])
+  // 视频号按 App 自己的筛选下发；选了发布时间范围，排序固定为「最新」（手机读到超出范围就停）。
+  const wechatSelected = platform === 'wechat_channels'
+  const sortLocked = wechatSelected && wechatSortLocked(publishTime)
+  const effectiveSort = wechatSelected ? wechatEffectiveSort(sort, publishTime) : sort
+  const wechatAppFilters = wechatSelected && (videoDuration !== 'all' || searchScope !== 'all')
   const sequentialSearchEnabled = Boolean(
     supplementalContentType &&
     platform === 'douyin' &&
@@ -484,18 +494,18 @@ export function OrchestrationComposerDrawer({
     [platform],
   )
   const sortedAgents = useMemo(() => agents.filter(agent => !lockAgentSelection || initialAgentIds?.includes(agent.id)).sort((left, right) => {
-    const leftBlocked = Boolean(agentBlockReason(left, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol))
-    const rightBlocked = Boolean(agentBlockReason(right, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol))
+    const leftBlocked = Boolean(agentBlockReason(left, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol, wechatAppFilters))
+    const rightBlocked = Boolean(agentBlockReason(right, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol, wechatAppFilters))
     if (leftBlocked !== rightBlocked) return leftBlocked ? 1 : -1
     if (left.online !== right.online) return left.online ? -1 : 1
     return `${left.host_label}${left.display_name}`.localeCompare(`${right.host_label}${right.display_name}`, 'zh-CN')
-  }), [agents, enhancementEnabled, platform, sequentialSearchEnabled, includeNegativePatrol, initialAgentIds, lockAgentSelection])
+  }), [agents, enhancementEnabled, platform, sequentialSearchEnabled, includeNegativePatrol, wechatAppFilters, initialAgentIds, lockAgentSelection])
   const validSelectedAgentIds = useMemo(
     () => selectedAgentIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
-      return agent ? !agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol) : false
+      return agent ? !agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol, wechatAppFilters) : false
     }),
-    [agents, enhancementEnabled, platform, selectedAgentIds, sequentialSearchEnabled, includeNegativePatrol],
+    [agents, enhancementEnabled, platform, selectedAgentIds, sequentialSearchEnabled, includeNegativePatrol, wechatAppFilters],
   )
   const selectedAgents = useMemo(
     () => validSelectedAgentIds
@@ -771,17 +781,19 @@ export function OrchestrationComposerDrawer({
     markDefinitionChanged()
     const nextSequentialSearchEnabled = sequentialSearchEnabled && value === 'douyin'
     setPlatform(value)
+    // 时长的取值各平台不同（视频号用 App 自己的三档），换平台一律回到不限。
+    if (value !== platform) setVideoDuration('all')
     if (value !== 'douyin') {
       setSupplementalContentType('')
-      setVideoDuration('all')
     } else {
       setDistance('all')
     }
+    if ((value === 'wechat_channels') !== (platform === 'wechat_channels')) setSearchScope('all')
+    if (value !== 'wechat_channels' && publishTime === 'month') setPublishTime('all')
     if (value === 'wechat_channels') {
-      // 手机逐条打开视频号作品：详情总是要采，内容只有视频，没有搜索范围和位置筛选。
+      // 手机逐条打开视频号作品：详情总是要采，内容只有视频，没有位置筛选；范围用 App 的「范围」。
       setDistance('all')
       setContentType('all')
-      setSearchScope('all')
       setEnhancementEnabled(true)
     }
     if (!SORT_OPTIONS.some(option => option.value === sort && (!option.platform || option.platform === value))) {
@@ -918,13 +930,13 @@ export function OrchestrationComposerDrawer({
       : {}),
     keywords,
     keywordMaxDetectedItems,
-    sort,
+    sort: effectiveSort,
     publishTime,
     contentType: searchPasses[0],
     searchPasses,
     searchScope,
     distance: platform === 'xiaohongshu' ? distance : 'all',
-    videoDuration: platform === 'douyin' ? videoDuration : 'all',
+    videoDuration: platform === 'douyin' || platform === 'wechat_channels' ? videoDuration : 'all',
     captureSettings,
     allowIdleAgentHandoff,
     distributionMode,
@@ -1063,12 +1075,12 @@ export function OrchestrationComposerDrawer({
           keywordMaxDetectedItems,
           ...(mobileSelected ? { mobileKeywordMaxMinutes } : {}),
           searchFilters: {
-            sort,
+            sort: effectiveSort,
             publishTime,
             contentType: searchPasses[0],
             searchScope,
             distance: platform === 'xiaohongshu' ? distance : 'all',
-            videoDuration: platform === 'douyin' ? videoDuration : 'all',
+            videoDuration: platform === 'douyin' || platform === 'wechat_channels' ? videoDuration : 'all',
           },
           ...(sequentialSearchEnabled ? { searchPasses } : {}),
           recoveryPolicy: {
@@ -1153,12 +1165,12 @@ export function OrchestrationComposerDrawer({
             keywordMaxDetectedItems,
             ...(mobileSelected ? { mobileKeywordMaxMinutes } : {}),
             searchFilters: {
-              sort,
+              sort: effectiveSort,
               publishTime,
               contentType: searchPasses[0],
               searchScope,
               distance: platform === 'xiaohongshu' ? distance : 'all',
-              videoDuration: platform === 'douyin' ? videoDuration : 'all',
+              videoDuration: platform === 'douyin' || platform === 'wechat_channels' ? videoDuration : 'all',
             },
             ...(sequentialSearchEnabled ? { searchPasses } : {}),
             recoveryPolicy: {
@@ -1533,20 +1545,42 @@ export function OrchestrationComposerDrawer({
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="block text-xs font-medium text-muted-foreground">
                         排序方式
-                        <select value={sort} onChange={event => { markDefinitionChanged(); setSort(event.target.value) }} disabled={busy} className={inputClassName}>
-                          {platformSortOptions.map(option => <option key={option.value} value={option.value}>{platform === 'wechat_channels' ? WECHAT_SORT_LABELS[option.value] || option.label : option.label}</option>)}
+                        <select value={effectiveSort} onChange={event => { markDefinitionChanged(); setSort(event.target.value) }} disabled={busy || sortLocked} className={inputClassName}>
+                          {(wechatSelected ? WECHAT_SORT_OPTIONS : platformSortOptions).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </select>
+                        {sortLocked && (
+                          <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">选了发布时间范围，排序固定为「最新」。</span>
+                        )}
                       </label>
                       <label className="block text-xs font-medium text-muted-foreground">
                         发布时间
                         <select value={publishTime} onChange={event => { markDefinitionChanged(); setPublishTime(event.target.value) }} disabled={busy} className={inputClassName}>
-                          {PUBLISH_TIME_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                          {(wechatSelected ? WECHAT_PUBLISH_TIME_OPTIONS : PUBLISH_TIME_OPTIONS).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </select>
-                        {platform === 'wechat_channels' && publishTime !== 'all' && (
-                          <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">视频号没有发布时间筛选：手机按「最新」排序，读搜索结果卡片右下角的时间，超出范围就结束该词。</span>
+                        {wechatSelected && publishTime !== 'all' && (
+                          <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">视频号 App 没有发布时间筛选：手机按「最新」排序，读每张卡片右下角的时间，超出范围就结束该词。</span>
                         )}
                       </label>
-                      {platform === 'wechat_channels' ? null : patrolTypeMultiSelectEnabled ? (
+                      {wechatSelected && (
+                        <>
+                          <label className="block text-xs font-medium text-muted-foreground">
+                            时长
+                            <select value={videoDuration} onChange={event => { markDefinitionChanged(); setVideoDuration(event.target.value) }} disabled={busy} className={inputClassName}>
+                              {WECHAT_DURATION_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                            </select>
+                          </label>
+                          <label className="block text-xs font-medium text-muted-foreground">
+                            范围
+                            <select value={searchScope} onChange={event => { markDefinitionChanged(); setSearchScope(event.target.value) }} disabled={busy} className={inputClassName}>
+                              {WECHAT_SCOPE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                            </select>
+                            {searchScope !== 'all' && (
+                              <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">按手机上登录的微信号来算{searchScope === 'followed' ? '「已关注」' : '「最近看过」'}。</span>
+                            )}
+                          </label>
+                        </>
+                      )}
+                      {wechatSelected ? null : patrolTypeMultiSelectEnabled ? (
                         <fieldset className="rounded-xl border border-border/70 bg-card px-3 py-2.5 sm:col-span-2">
                           <legend className="px-1 text-xs font-medium text-muted-foreground">巡检类型（受限组合）</legend>
                           <div className="mt-1 flex flex-wrap gap-2">
@@ -1760,7 +1794,7 @@ export function OrchestrationComposerDrawer({
                 ) : (
                   <div className="mt-3 max-h-[520px] space-y-2 overflow-y-auto pr-1">
                     {sortedAgents.map(agent => {
-                      const blockReason = agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol)
+                      const blockReason = agentBlockReason(agent, platform, enhancementEnabled, sequentialSearchEnabled, includeNegativePatrol, wechatAppFilters)
                       const checked = validSelectedAgentIds.includes(agent.id)
                       const mobile = isMobileAgent(agent)
                       const workloadKnown = agent.active_task_count !== undefined || agent.queued_task_count !== undefined

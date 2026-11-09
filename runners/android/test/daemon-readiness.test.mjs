@@ -116,3 +116,14 @@ test('a retained closure proof reaches a task only for the pending operation it 
     assert.equal(closureProofFor(store, task.deviceId), null, 'nothing pending means nothing to prove');
   } finally { store.close(); }
 });
+
+test('the poll names the optional Runner features, so the server can hold back work an older Runner would run wrongly', async t => {
+  const f = await mockControlPlane(t);
+  const store = new RunnerStore(join(f.directory, 'runner.sqlite'));
+  const daemon = new AndroidDaemon({...options(f), store, device: createSimulationDevice(f.config.deviceId)});
+  const running = daemon.run();
+  t.after(async () => { daemon.requestStop(); await running; store.close(); });
+  await until(() => polls(f).length > 0);
+  daemon.requestStop(); await running;
+  assert.deepEqual(polls(f)[0].body.features, ['wechat_search_filters']);
+});

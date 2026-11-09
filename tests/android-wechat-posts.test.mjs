@@ -5,7 +5,9 @@ import {commentDate, commentNamesAgree, commentTextsAgree, normalizePostEvent, p
   from '../server/services/android-control/posts.js';
 import {mobileCommentPlan, mobilePlanBlockReason, mobileTaskFilters, mobileWorkflowFor, mobilePlatformForWorkflow}
   from '../server/services/android-control/mobile-tasks.js';
-import {readyPlatforms, taskPayload} from '../server/services/android-control/leases.js';
+import {readyPlatforms, runnerFeatures, taskPayload} from '../server/services/android-control/leases.js';
+import {normalizeOrchestrationRequest} from '../server/services/capture-orchestration.js';
+import {normalizeRemoteTaskInput} from '../server/services/capture-cloud.js';
 import {normalizeRecord} from '../server/routes/sync.js';
 
 const principal = {tenantId: '11111111-1111-4111-8111-111111111111', agentId: '22222222-2222-4222-8222-222222222222'};
@@ -152,3 +154,25 @@ test('a re-captured post keeps the stored ids of comments OCR read slightly diff
   assert.equal(commentTextsAgree('XT59接入豆包了吗？首评岚图汽车官方…', 'XT59接入豆包了吗？'), true);
   assert.equal(commentTextsAgree('好看', '好看吗'), false);
 });
+
+test('the 视频号 App\'s own 时长 / 范围 reach the phone task; values from another platform fall back to 不限', () => {
+  assert.deepEqual(mobileTaskFilters({sort: 'likes', publishTime: 'all', videoDuration: 'under_5m', searchScope: 'viewed'}, 'wechat_channels'),
+    {sort: 'hot', publishWindowHours: null, duration: 'under_5m', scope: 'viewed'});
+  assert.deepEqual(mobileTaskFilters({publishTime: 'week', videoDuration: '5_20m', searchScope: 'all'}, 'wechat_channels'),
+    {sort: 'latest', publishWindowHours: 168, duration: '5_20m'});
+  assert.deepEqual(mobileTaskFilters({publishTime: 'day', videoDuration: 'under_1m', searchScope: 'unviewed'}, 'wechat_channels'),
+    {sort: 'latest', publishWindowHours: 24}, 'Douyin / 小红书 values never reach a 视频号 task');
+  const plan = (platform, searchFilters) => normalizeOrchestrationRequest({platform, keywords: ['安吉星'], searchFilters}).taskInput.searchFilters;
+  assert.deepEqual(pick(plan('wechat_channels', {videoDuration: 'over_20m', searchScope: 'followed'})), {videoDuration: 'over_20m', searchScope: 'followed'});
+  assert.deepEqual(pick(plan('wechat_channels', {videoDuration: '1_5m', searchScope: 'unviewed'})), {videoDuration: 'all', searchScope: 'all'});
+  assert.deepEqual(pick(plan('douyin', {videoDuration: 'under_5m', searchScope: 'viewed'})), {videoDuration: 'all', searchScope: 'viewed'});
+  assert.deepEqual(pick(plan('douyin', {videoDuration: '1_5m'})), {videoDuration: '1_5m', searchScope: 'all'}, 'Douyin keeps its own durations');
+  const remote = (platform, searchFilters) => normalizeRemoteTaskInput({clientTaskId: id(7), title: 't',
+    planSnapshot: {platform, keywords: ['安吉星'], searchFilters}}).planSnapshot.searchFilters;
+  assert.deepEqual(pick(remote('wechat_channels', {videoDuration: '5_20m', searchScope: 'viewed'})), {videoDuration: '5_20m', searchScope: 'viewed'});
+  assert.deepEqual(pick(remote('douyin', {videoDuration: 'over_20m'})), {videoDuration: 'all', searchScope: 'all'});
+  // Only named features count; an older Runner names none.
+  assert.deepEqual(runnerFeatures({features: ['wechat_search_filters', 'unknown', 'wechat_search_filters']}), ['wechat_search_filters']);
+  assert.deepEqual(runnerFeatures({}), []);
+});
+const pick = filters => ({videoDuration: filters.videoDuration, searchScope: filters.searchScope});

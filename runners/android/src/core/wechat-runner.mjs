@@ -91,7 +91,9 @@ export async function runWechatTask({task, store, device, permit, preview, clock
         canOpenPost: typeof device.openPost === 'function'});
     } else {
       const sort = windowHours !== null ? 'latest' : (task.filters.sort ?? 'all');
-      const searched = await call('search', {keyword: task.keyword, sort});
+      // The App's own 时长 / 范围 choices (0.4.5); absent means 不限.
+      const searched = await call('search', {keyword: task.keyword, sort,
+        duration: task.filters.duration ?? 'all', scope: task.filters.scope ?? 'all'});
       requireEvidence(searched?.verified === true, 'search_context_unverified');
       const seen = [];
       let cards = searched.cards, emptyPages = 0, older = 0, skips = 0, rank = 0;

@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
-import {commentButton, comparable, findText, findWord, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
-import {MORE_VIDEOS_SHIFT, POINT, feedLink} from '../src/device/wechat-profile.mjs';
+import {commentButton, comparable, filterButton, sheetOption, findText, findWord, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
+import {MORE_VIDEOS_SHIFT, POINT, SEARCH_FILTERS, feedLink} from '../src/device/wechat-profile.mjs';
 import {mergeCommentScreens, namesAgree, parseCommentScreen, textsAgree} from '../src/device/wechat-comments-parse.mjs';
 import {createAdbScreen, encodeModifiedUtf7} from '../src/device/adb-screen.mjs';
 import {readFeedInfo} from '../src/preview/share-preview.mjs';
@@ -258,4 +258,29 @@ test('an IP region run into the name is split off; a missed 「评论 N」 title
     ['凌晨三点', '山东', '开朋友别克误碰过，还没挂就接通了，慌忙道歉说点错了']]);
   const merged = mergeCommentScreens([first, panel('comments-regions-20261106-1')]);
   assert.deepEqual(merged.map(item => item.author), ['哆啦A梦快乐豆', '哟改名字了997200', '凌晨三点', '里程']);
+});
+
+// 2026-11-09, DE106 / 微信 8.0.80, keyword 安吉星: the 视频 tab's own 时长 and 范围 sheets.
+test('the 时长 / 范围 buttons, their sheets and the picked choice are read from the screen', () => {
+  const {duration, scope} = SEARCH_FILTERS;
+  const start = rows('filters-start-20261109');
+  assert.deepEqual([filterButton(start, duration).shows, filterButton(start, scope).shows], ['all', 'all']);
+  assert.ok(Math.abs(filterButton(start, duration).center.x - 598) < 40, 'the 时长 button, not the sort row');
+  // The sheet: its title confirms it; options are matched exactly (5-20分钟 is not 20分钟以上).
+  const sheet = rows('filters-duration-sheet-20261109');
+  const fiveTwenty = sheetOption(sheet, duration, '5_20m');
+  const under = sheetOption(sheet, duration, 'under_5m');
+  const over = sheetOption(sheet, duration, 'over_20m');
+  assert.ok(under && fiveTwenty && over);
+  assert.ok(under.center.x > 540 && under.center.y < fiveTwenty.center.y, 'right column, first row');
+  assert.ok(over.center.x > 540 && fiveTwenty.center.x < 540);
+  assert.equal(sheetOption(sheet, scope, 'viewed'), null, 'the 范围 options are not on the 时长 sheet');
+  assert.equal(sheetOption(start, duration, 'under_5m'), null, 'no sheet open');
+  const scopeSheet = rows('filters-scope-sheet-20261109');
+  assert.ok(sheetOption(scopeSheet, scope, 'viewed').center.y > sheetOption(scopeSheet, scope, 'followed').center.y);
+  // After picking, each button shows its choice.
+  assert.equal(filterButton(rows('filters-duration-picked-20261109'), duration).shows, 'under_5m');
+  assert.equal(filterButton(rows('filters-duration-picked-20261109'), scope).shows, 'all');
+  const both = rows('filters-both-picked-20261109');
+  assert.deepEqual([filterButton(both, duration).shows, filterButton(both, scope).shows], ['under_5m', 'viewed']);
 });

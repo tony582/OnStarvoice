@@ -173,6 +173,29 @@ export function commentButton(rows, {fallback, shift}) {
   return strip ? {x: fallback.x, y: fallback.y - shift, from: 'more_videos'} : {...fallback, from: 'fixed'};
 }
 
+const dashed = value => comparable(value).replace(/[–—－~～]/gu, '-').replace(/-+$/u, '');
+/**
+ * The 时长 or 范围 button in the filter row (`filter` from SEARCH_FILTERS): its own label, or the option it shows once one
+ * was picked ("5分钟以下～"). `shows` is that option's key, or 'all' while the button still reads its own label.
+ */
+export function filterButton(rows, filter) {
+  const inRow = rows.filter(row => row.y >= 370 && row.y <= 490 && row.x >= 480).sort(byPosition);
+  for (const row of inRow) {
+    const text = dashed(row.text);
+    const shown = Object.entries(filter.options).find(([, label]) => text.includes(dashed(label)));
+    if (shown || text.includes(comparable(filter.button))) return {...row, center: center(row), shows: shown ? shown[0] : 'all'};
+  }
+  return null;
+}
+/** One option in the open bottom sheet of `filter`; null unless the sheet's own title is there too. */
+export function sheetOption(rows, filter, key) {
+  const label = filter.options[key];
+  if (!label || !findText(rows, filter.button, {region: {y0: 1650, y1: 1850}}).length) return null;
+  const goal = dashed(label);
+  const option = rows.filter(row => row.y >= 1820 && dashed(row.text) === goal).sort(byPosition)[0];
+  return option ? {...option, center: center(option)} : null;
+}
+
 // Letters and digits only, for comparing text that OCR may punctuate or cut differently.
 const bareText = value => comparable(value).replace(/[^\p{L}\p{N}]/gu, '');
 // The search box shows about 14 characters: a longer keyword (a patrol caption start) reads back as its beginning,

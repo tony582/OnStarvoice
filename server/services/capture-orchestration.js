@@ -82,8 +82,22 @@ const SEARCH_FILTER_VALUES = Object.freeze({
   contentType: new Set(['all', 'image', 'video']),
   searchScope: new Set(['all', 'followed', 'viewed', 'unviewed']),
   distance: new Set(['all', 'city', 'nearby']),
-  videoDuration: new Set(['all', 'under_1m', '1_5m', 'over_5m']),
+  // under_5m / 5_20m / over_20m are the 视频号 App's own 时长 choices; see platformSearchFilters.
+  videoDuration: new Set(['all', 'under_1m', '1_5m', 'over_5m', 'under_5m', '5_20m', 'over_20m']),
 });
+
+// 视频号 (WeChat 8.0.80) has its own 时长 sheet and only 范围不限 / 已关注 / 最近看过; the other platforms never take
+// its durations. A value that does not fit the platform falls back to 不限, as an unknown value does.
+const WECHAT_VIDEO_DURATIONS = new Set(['all', 'under_5m', '5_20m', 'over_20m']);
+const WECHAT_SEARCH_SCOPES = new Set(['all', 'followed', 'viewed']);
+function platformSearchFilters(platform, filters) {
+  if (platform === 'wechat_channels') {
+    return {...filters, videoDuration: WECHAT_VIDEO_DURATIONS.has(filters.videoDuration) ? filters.videoDuration : 'all',
+      searchScope: WECHAT_SEARCH_SCOPES.has(filters.searchScope) ? filters.searchScope : 'all'};
+  }
+  return WECHAT_VIDEO_DURATIONS.has(filters.videoDuration) && filters.videoDuration !== 'all'
+    ? {...filters, videoDuration: 'all'} : filters;
+}
 
 const SEARCH_FILTER_DEFAULTS = Object.freeze({
   sort: 'comprehensive',
@@ -596,14 +610,14 @@ export function normalizeOrchestrationRequest(
     taskInput: {
       keywordCoverage,
       ...(eachAgentKeywords ? {eachAgentKeywords} : {}),
-      searchFilters: {
+      searchFilters: platformSearchFilters(platform, {
         sort: readFilter('sort'),
         publishTime: readFilter('publishTime'),
         contentType: effectiveSearchPasses[0],
         searchScope: readFilter('searchScope'),
         distance: readFilter('distance'),
         videoDuration: readFilter('videoDuration'),
-      },
+      }),
       keywordMaxDetectedItems: integer(
         source.keywordMaxDetectedItems,
         50,

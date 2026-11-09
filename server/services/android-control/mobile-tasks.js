@@ -38,6 +38,16 @@ export function mobileKeywordMs(planSnapshot = {}) {
 // Channels has no publication filter in the App: the phone sorts newest first and stops at the window itself.
 const WECHAT_WINDOW_HOURS = Object.freeze({all: null, day: 24, week: 168, month: 720, halfyear: 4320});
 const WECHAT_SORTS = Object.freeze({comprehensive: 'all', latest: 'latest', likes: 'hot'});
+// The 视频 tab's 时长 and 范围 sheets in the App (2026-11-09): 不限 / 5分钟以下 / 5-20分钟 / 20分钟以上 and
+// 范围不限 / 已关注 / 最近看过. A Runner applies them only when its poll names the wechat_search_filters feature (0.4.5).
+const WECHAT_DURATIONS = new Set(['under_5m', '5_20m', 'over_20m']);
+const WECHAT_SCOPES = new Set(['followed', 'viewed']);
+export const WECHAT_SEARCH_FILTERS_FEATURE = 'wechat_search_filters';
+export function wechatSearchChoices(searchFilters = {}) {
+  const source = searchFilters && typeof searchFilters === 'object' && !Array.isArray(searchFilters) ? searchFilters : {};
+  return {duration: WECHAT_DURATIONS.has(source.videoDuration) ? source.videoDuration : 'all',
+    scope: WECHAT_SCOPES.has(source.searchScope) ? source.searchScope : 'all'};
+}
 
 export function mobileTaskFilters(searchFilters = {}, platform = 'douyin') {
   const source = searchFilters && typeof searchFilters === 'object' && !Array.isArray(searchFilters)
@@ -45,7 +55,10 @@ export function mobileTaskFilters(searchFilters = {}, platform = 'douyin') {
     : {};
   if (String(platform).toLowerCase() === 'wechat_channels') {
     const windowHours = Object.hasOwn(WECHAT_WINDOW_HOURS, source.publishTime) ? WECHAT_WINDOW_HOURS[source.publishTime] : null;
-    return {sort: windowHours === null ? (WECHAT_SORTS[source.sort] ?? 'all') : 'latest', publishWindowHours: windowHours};
+    const {duration, scope} = wechatSearchChoices(source);
+    // The App's own 时长 / 范围 are only sent when chosen, so plans without them keep their task shape.
+    return {sort: windowHours === null ? (WECHAT_SORTS[source.sort] ?? 'all') : 'latest', publishWindowHours: windowHours,
+      ...(duration !== 'all' ? {duration} : {}), ...(scope !== 'all' ? {scope} : {})};
   }
   return {
     sort: SORT_VALUES.has(source.sort) ? source.sort : 'comprehensive',

@@ -136,6 +136,25 @@ test('WeChat Channels on a shared phone: claim by platform, post upload, receipt
     await f.complete(claim.task);
   });
 
+  await t.test('a keyword with the App\'s 时长 / 范围 goes only to a Runner that names the feature, and carries both', async st => {
+    const f = await fixture(st);
+    await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星'],
+      planSnapshot: {searchFilters: {sort: 'likes', publishTime: 'all', contentType: 'all', videoDuration: 'under_5m', searchScope: 'viewed'}}});
+    assert.equal((await f.poll({platforms: ['wechat_channels']})).task, null, 'an older Runner would search without them');
+    const [older] = await query('SELECT capabilities FROM capture_agents WHERE id=$1', [f.phone.id]);
+    assert.deepEqual(older.capabilities.runnerFeatures, []);
+    const claim = await f.poll({platforms: ['wechat_channels'], features: ['wechat_search_filters']});
+    assert.deepEqual(claim.task.filters, {sort: 'hot', publishWindowHours: null, duration: 'under_5m', scope: 'viewed'});
+    const [phone] = await query('SELECT capabilities FROM capture_agents WHERE id=$1', [f.phone.id]);
+    assert.deepEqual(phone.capabilities.runnerFeatures, ['wechat_search_filters']);
+    await f.complete(claim.task);
+    // A plan without them is unchanged for every Runner.
+    await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['别克']});
+    const plain = await f.poll({platforms: ['wechat_channels']});
+    assert.deepEqual(plain.task.filters, {sort: 'latest', publishWindowHours: 24});
+    await f.complete(plain.task);
+  });
+
   await t.test('a post captured again keeps its comment ids although OCR read the comments a little differently', async st => {
     const f = await fixture(st);
     await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星', '安吉星收费']});

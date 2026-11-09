@@ -230,3 +230,21 @@ test('patrol: the stored link refreshes counts; with comments the post is looked
     store.close();
   }
 });
+
+test('the App\'s own 时长 / 范围 choices from the task reach the phone search; a task without them searches with 不限', async () => {
+  for (const [filters, expected] of [
+    [{sort: 'latest', publishWindowHours: 24, duration: 'under_5m', scope: 'viewed'}, {sort: 'latest', duration: 'under_5m', scope: 'viewed'}],
+    [{sort: 'hot', publishWindowHours: null}, {sort: 'hot', duration: 'all', scope: 'all'}],
+  ]) {
+    const store = new RunnerStore(':memory:');
+    const clock = fixtureClock();
+    const t = task({filters});
+    const base = device({pages: [[]]});
+    let searched = null;
+    const watching = {...base, search: async params => { searched = params; return base.search(params); }};
+    await runWechatTask({task: t, store, device: watching, permit: fixturePermit(t, clock), clock, postPauseMs: [0, 0],
+      preview: {resolve: async () => ({unavailable: true})}});
+    assert.deepEqual({sort: searched.sort, duration: searched.duration, scope: searched.scope}, expected);
+    store.close();
+  }
+});
