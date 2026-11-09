@@ -30,7 +30,7 @@ export async function ingestPosts({transaction, persist}, principal, body) {
       attemptId: lineage.current ? event.attemptId : '', requestHash: lineage.current ? event.requestHash : ''});
     // A post seen before: comments read again through OCR keep their stored ids instead of becoming near-duplicates.
     if (syncBody.payload.commentsCleanedItems.length) {
-      const known = await transaction(tx => knownWechatComments(tx, principal.tenantId, externalId));
+      const known = await transaction(tx => knownWechatComments(tx, principal.tenantId, externalId, event.platform));
       if (known.length) syncBody.payload.commentsCleanedItems = reuseKnownCommentIds(syncBody.payload.commentsCleanedItems, known);
     }
     let result;

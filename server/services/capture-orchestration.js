@@ -1,3 +1,4 @@
+import {validateArticleFilters} from './android-control/articles.js';
 import crypto from 'node:crypto';
 import { normalizeNegativePatrolTriageStatuses } from './unattended-negative-patrol.js';
 import {
@@ -13,6 +14,7 @@ const PLATFORM_ALIASES = Object.freeze({
   tiktok_cn: 'douyin',
   // WeChat Channels (视频号), captured only by phone nodes (docs/hotfix/20261105-wechat-channels-mobile.md).
   wechat_channels: 'wechat_channels',
+  wechat_articles: 'wechat_articles',
   channels: 'wechat_channels',
   shipinhao: 'wechat_channels',
 });
@@ -91,6 +93,7 @@ const SEARCH_FILTER_VALUES = Object.freeze({
 const WECHAT_VIDEO_DURATIONS = new Set(['all', 'under_5m', '5_20m', 'over_20m']);
 const WECHAT_SEARCH_SCOPES = new Set(['all', 'followed', 'viewed']);
 function platformSearchFilters(platform, filters) {
+  if (platform === 'wechat_articles') return {...filters, videoDuration: 'all', searchScope: 'all', contentType: 'all'};
   if (platform === 'wechat_channels') {
     return {...filters, videoDuration: WECHAT_VIDEO_DURATIONS.has(filters.videoDuration) ? filters.videoDuration : 'all',
       searchScope: WECHAT_SEARCH_SCOPES.has(filters.searchScope) ? filters.searchScope : 'all'};
@@ -563,6 +566,8 @@ export function normalizeOrchestrationRequest(
     );
   }
   const platform = normalizePlatform(source.platform);
+  if (platform === 'wechat_articles') validateArticleFilters(Object.fromEntries(
+    ['sort', 'searchScope', 'videoDuration', 'contentType', 'distance'].map(key => [key, Object.hasOwn(source, key) ? source[key] : rawFilters[key]])));
   const baseContentType = readFilter('contentType');
   const searchPasses = normalizeSequentialSearchPasses(
     source.searchPasses ?? source.search_passes,

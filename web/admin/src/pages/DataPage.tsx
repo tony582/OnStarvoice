@@ -4,7 +4,7 @@ import {
   Filter, Image as ImageIcon, Layers3, Loader2, RefreshCw, Search, X,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatDate, formatNumber, platformName, friendlyError } from '@/lib/utils'
+import { formatDate, formatNumber, formatRecordMetric, platformName, friendlyError } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { Button } from '@/components/ui/button'
@@ -51,6 +51,7 @@ const PLATFORM_OPTIONS = [
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
   { value: 'wechat_channels', label: '视频号' },
+  { value: 'wechat_articles', label: '微信文章' },
 ]
 
 const VALID_TABLES: TableKey[] = ['single_notes', 'keyword_notes', 'blogger_profiles', 'blogger_notes', 'comment_leads', 'monitor_content']
@@ -824,9 +825,9 @@ function mobileRecordStats(row: any, table: TableKey) {
     ]
   }
   return [
-    { label: '赞', value: formatNumber(row.likes as any) },
-    { label: '藏', value: formatNumber(row.collects as any) },
-    { label: '评', value: formatNumber(row.comments_count as any) },
+    { label: '赞', value: formatRecordMetric(row, 'likes') },
+    { label: row.platform === 'wechat_articles' || row.platform === 'wechat_channels' ? '推荐' : '藏', value: formatRecordMetric(row, 'collects') },
+    { label: '评', value: formatRecordMetric(row, 'comments_count') },
   ]
 }
 
@@ -908,8 +909,8 @@ function columnsForTable(table: TableKey, platform = ''): Column[] {
     col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
-    col('likes', '点赞数', r => metricCell(r.likes)),
-    col('collects', '收藏数', r => metricCell(r.collects)),
+    col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+    col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
   ]
 }
 
@@ -921,9 +922,9 @@ function keywordNoteColumns(platform: string): Column[] {
       col('profile', '博主主页', r => linkCell(authorHomepage(r), '查看博主主页')),
       col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-      col('likes', '点赞数', r => metricCell(r.likes)),
-      col('collects', '收藏数', r => metricCell(r.collects)),
-      col('comments', '评论数', r => metricCell(r.comments_count)),
+      col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+      col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
+      col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
       col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
       col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
       col('url', '笔记链接', r => recordSourceCell(r)),
@@ -948,9 +949,9 @@ function keywordNoteColumns(platform: string): Column[] {
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
     col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-    col('likes', '点赞数', r => metricCell(r.likes)),
-    col('collects', '收藏数', r => metricCell(r.collects)),
-    col('comments', '评论数', r => metricCell(r.comments_count)),
+    col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+    col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
+    col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
     col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
     col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
     col('url', '笔记链接', r => recordSourceCell(r)),
@@ -1001,10 +1002,10 @@ function bloggerNoteColumns(platform: string): Column[] {
       col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
       col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-      col('likes', '点赞数', r => metricCell(r.likes)),
-      col('collects', '收藏数', r => metricCell(r.collects)),
-      col('comments', '评论数', r => metricCell(r.comments_count)),
-      col('shares', '转发数', r => metricCell(r.shares)),
+      col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+      col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
+      col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
+      col('shares', '转发数', r => <span className="tabular-nums">{formatRecordMetric(r, 'shares')}</span>),
       col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
       col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
       col('profile', '博主主页', r => linkCell(authorHomepage(r), '查看博主主页')),
@@ -1027,9 +1028,9 @@ function bloggerNoteColumns(platform: string): Column[] {
     col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
     col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-    col('likes', '点赞数', r => metricCell(r.likes)),
-    col('collects', '收藏数', r => metricCell(r.collects)),
-    col('comments', '评论数', r => metricCell(r.comments_count)),
+    col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+    col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
+    col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
     col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
     col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
     col('video', '视频链接', r => linkCell(videoUrl(r), '查看视频')),
@@ -1047,13 +1048,13 @@ function monitorContentColumns(platform: string): Column[] {
     col('url', '笔记链接', r => recordSourceCell(r)),
     col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
     col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
-    col('likes', '点赞数', r => metricCell(r.likes)),
-    col('collects', '收藏数', r => metricCell(r.collects)),
-    col('comments', '评论数', r => metricCell(r.comments_count)),
+    col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+    col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
+    col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
   ]
 
   if (isDouyin || !platform) {
-    columns.push(col('shares', '转发数', r => metricCell(r.shares)))
+    columns.push(col('shares', '转发数', r => <span className="tabular-nums">{formatRecordMetric(r, 'shares')}</span>))
   }
 
   columns.push(
@@ -1125,9 +1126,9 @@ function singleNoteColumns(platform: string): Column[] {
       col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
       col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
       col('tags', '话题标签', r => tagCell(r.tags)),
-      col('likes', '点赞数', r => metricCell(r.likes)),
-      col('collects', '收藏数', r => metricCell(r.collects)),
-      col('comments', '评论数', r => metricCell(r.comments_count)),
+      col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+      col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
+      col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
       col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
       col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
       col('url', '笔记链接', r => recordSourceCell(r)),
@@ -1159,10 +1160,10 @@ function singleNoteColumns(platform: string): Column[] {
       col('coverLink', '封面链接', r => linkCell(primaryImage(r), '封面')),
       col('cover', '封面图', r => imageCell(primaryImage(r), r.title)),
       col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
-      col('likes', '点赞数', r => metricCell(r.likes)),
-      col('collects', '收藏数', r => metricCell(r.collects)),
-      col('comments', '评论数', r => metricCell(r.comments_count)),
-      col('shares', '转发数', r => metricCell(r.shares)),
+      col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+      col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
+      col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
+      col('shares', '转发数', r => <span className="tabular-nums">{formatRecordMetric(r, 'shares')}</span>),
       col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
       col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
       col('url', '笔记链接', r => recordSourceCell(r)),
@@ -1197,10 +1198,10 @@ function singleNoteColumns(platform: string): Column[] {
     col('title', '标题', (r, ctx) => longCell(recordDisplayTitle(r), 180, ctx)),
     col('content', '正文', (r, ctx) => longCell(r.content, 220, ctx)),
     col('tags', '话题标签', r => tagCell(r.tags)),
-    col('likes', '点赞数', r => metricCell(r.likes)),
-    col('collects', '收藏数', r => metricCell(r.collects)),
-    col('comments', '评论数', r => metricCell(r.comments_count)),
-    col('shares', '转发数', r => metricCell(r.shares)),
+    col('likes', '点赞数', r => <span className="tabular-nums">{formatRecordMetric(r, 'likes')}</span>),
+    col('collects', '收藏/推荐', r => <span className="tabular-nums">{formatRecordMetric(r, 'collects')}</span>),
+    col('comments', '评论数', r => <span className="tabular-nums">{formatRecordMetric(r, 'comments_count')}</span>),
+    col('shares', '转发数', r => <span className="tabular-nums">{formatRecordMetric(r, 'shares')}</span>),
     col('noteRating', '笔记评级', r => ratingBadge(noteRating(r))),
     col('collectRating', '收藏评级', r => ratingBadge(collectRating(r))),
     col('url', '笔记链接', r => recordSourceCell(r)),
@@ -1521,6 +1522,7 @@ function noteTypeLabel(row: any) {
   if (type === 'image' || type === '图文') return '图文'
   if (type === 'video' || type === '视频') return '视频'
   if (type === 'live') return '直播'
+  if (type === 'article') return '文章'
   return type || '-'
 }
 
@@ -1529,6 +1531,7 @@ function interaction(row: any) {
 }
 
 function noteRating(row: any) {
+  if (row.platform === 'wechat_articles' && ['likes', 'comments_count', 'collects', 'shares'].some(key => row[key] == null)) return { label: '互动未采全', tone: 'muted' }
   const total = interaction(row)
   if (total >= 10000) return { label: '爆款', tone: 'urgent' }
   if (total >= 1000) return { label: '潜力', tone: 'high' }
@@ -1537,6 +1540,7 @@ function noteRating(row: any) {
 }
 
 function collectRating(row: any) {
+  if (row.platform === 'wechat_articles') return { label: '不适用', tone: 'muted' }
   const collects = Number(row.collects || 0)
   if (collects >= 1000) return { label: '高收藏', tone: 'urgent' }
   if (collects >= 100) return { label: '可收藏', tone: 'high' }

@@ -295,6 +295,7 @@ export function resolveMetricFromPayload(payload, dimension, keys = []) {
 export function resolveRecordMetrics(row = {}) {
   const recordPayload = row.record_payload || row.payload || {};
   const observationPayload = row.observation_payload || {};
+  const article = row.platform === 'wechat_articles' || parseJsonObject(recordPayload).platform === 'wechat_articles';
   const metric = (rowValue, dimension, keys) => {
     const observedUpdate = resolveMetricUpdateFromPayload(
       observationPayload,
@@ -313,7 +314,7 @@ export function resolveRecordMetrics(row = {}) {
     );
     if (recordUpdate !== null) return recordUpdate;
 
-    return resolveMetricFromPayload(recordPayload, dimension, keys);
+    return article ? (rowValue === 0 ? 0 : null) : resolveMetricFromPayload(recordPayload, dimension, keys);
   };
 
   return {
@@ -356,8 +357,8 @@ export function resolveRecordMetrics(row = {}) {
 export function applyResolvedMetrics(row = {}) {
   const { record_payload, observation_payload, payload, ...rest } = row;
   const metrics = resolveRecordMetrics({ ...row, record_payload, observation_payload, payload });
-  const interactionTotal =
-    metrics.likes + metrics.comments_count + metrics.collects + metrics.shares;
+  const interactionTotal = Object.values(metrics).some(value => value === null) ? null
+    : metrics.likes + metrics.comments_count + metrics.collects + metrics.shares;
   return {
     ...rest,
     ...metrics,

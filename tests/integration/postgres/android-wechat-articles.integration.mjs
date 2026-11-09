@@ -1,0 +1,472 @@
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+import {readFile} from 'node:fs/promises';
+import test from 'node:test';
+import {validatePostgresIntegrationTarget} from '../../../scripts/lib/postgres-integration-target.mjs';
+import {createAndroidControlService} from '../../../server/services/android-control/service.js';
+import {articleExternalId, canonicalArticleUrl} from '../../../server/services/android-control/articles.js';
+
+// Runs only against an explicitly isolated PostgreSQL database. Optional real-phone evidence is replayed
+// with a newly issued test lease; body/comments/metrics and capture time remain the phone's actual values.
+test('WeChat articles: phone capability, records, nullable observations, comments, patrol and durable receipts', async t => {
+  validatePostgresIntegrationTarget({testDatabaseUrl: process.env.TEST_DATABASE_URL, databaseUrl: process.env.DATABASE_URL, requireDatabaseUrl: true});
+  const {runMigrations} = await import('../../../server/db/migrate.js');
+  const {getPool, closePool} = await import('../../../server/db/pool.js');
+  const {normalizeRecord, syncNormalizedRecord} = await import('../../../server/routes/sync.js');
+  const {dispatchNextElasticWorkItem} = await import('../../../server/routes/capture-cloud.js');
+  const {withTransaction} = await import('../../../server/db/init.js');
+  const {reprocessPendingCommentWorkflowReceipts} = await import('../../../server/services/comment-workflow.js');
+  await runMigrations();
+  const pool = getPool();
+  t.after(closePool);
+  const query = async (sql, values = []) => (await pool.query(sql, values)).rows;
+  const persist = async (body, context) => syncNormalizedRecord(normalizeRecord(body)[0], context);
+  const drain = async f => {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await reprocessPendingCommentWorkflowReceipts({queuedGraceSeconds: 0});
+      const pending = await query(`SELECT comment_workflow_status AS status,comment_workflow_error AS error
+        FROM record_observations WHERE tenant_id=$1 AND comment_workflow_status NOT IN ('not_required','persisted')`, [f.tenantId]);
+      assert.ok(!pending.some(row => row.status === 'failed'), JSON.stringify(pending));
+      if (!pending.length) return;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.fail('comment receipt did not settle within 3 seconds');
+  };
+  const send = (f, event) => f.service.posts(f.principal, {uploadBatchId: randomUUID(), events: [event]}, persist);
+
+  async function fixture(st, options = {}) {
+    const [{id: tenantId}] = await query('INSERT INTO tenants(name) VALUES($1) RETURNING id', [`article-test-${randomUUID()}`]);
+    st.after(async () => {
+      for (const table of ['capture_mobile_post_receipts', 'record_comments', 'record_observations', 'records',
+        'capture_task_item_attempts', 'capture_task_items', 'capture_agent_commands', 'capture_tasks']) {
+        await query(`DELETE FROM ${table} WHERE tenant_id=$1`, [tenantId]);
+      }
+      await query('DELETE FROM tenants WHERE id=$1', [tenantId]);
+    });
+    const code = randomUUID();
+    await query('INSERT INTO auth_codes(tenant_id,code,max_bindings) VALUES($1,$2,4)', [tenantId, code]);
+    const service = createAndroidControlService({enabledTenants: () => new Set([tenantId]), ...options});
+    const registration = {code, clientUuid: randomUUID(), deviceId: `test-${randomUUID()}`};
+    const registered = await service.register(registration);
+    const [phone] = await query('SELECT * FROM capture_agents WHERE id=$1', [registered.agent.id]);
+    const principal = {tenantId, agentId: phone.id, authCodeId: phone.auth_code_id, authBindingId: phone.auth_binding_id};
+    const sessionId = randomUUID();
+    const poll = (extra = {}) => service.poll(principal, {sessionId, deviceId: registration.deviceId, readyForSearch: true,
+      platforms: ['wechat_articles'], features: ['wechat_articles'], ...extra});
+    const complete = (task, extra = {}) => service.complete(principal, {requestId: randomUUID(), identity: task.identity, sessionId,
+      status: 'completed', deviceIdle: true, ...extra});
+    return {tenantId, service, phone, principal, poll, complete};
+  }
+  async function parent(f, {keywords = ['安吉星'], eligibleAgentIds = [f.phone.id], planSnapshot = {}} = {}) {
+    const id = randomUUID();
+    const metadata = {distributionMode: 'elastic_pool', eligibleAgentIds, claimUnit: 'keyword', executionMode: 'one_time',
+      planSnapshot: {platform: 'wechat_articles', keywords, searchFilters: {sort: 'comprehensive', publishTime: 'all', contentType: 'all', searchScope: 'all'},
+        keywordMaxDetectedItems: 20, recoveryPolicy: {disableAutomaticSearchRetry: true, singleRelayV1: true},
+        captureSettings: {autoDetailCaptureAfterListCapture: true, includeCommentsOnDetailCapture: true, detailCommentsMaxDetectedItems: 30},
+        ...planSnapshot}};
+    await query(`INSERT INTO capture_tasks(id,tenant_id,client_task_id,task_type,feature_key,title,platform,source,trigger_type,status,metadata,orchestration_revision,counts,progress)
+      VALUES($1::uuid,$2,$1::text,'capture_orchestration','keyword_orchestration','文章测试','wechat_articles','cloud','manual','running',$3,1,$4::jsonb,'{}'::jsonb)`,
+    [id, f.tenantId, metadata, JSON.stringify({total: keywords.length, assigned: 0})]);
+    for (const [ordinal, keyword] of keywords.entries()) {
+      await query(`INSERT INTO capture_task_items(id,tenant_id,task_id,item_key,ordinal,keyword,platform,item_type,status,assignment_revision)
+        VALUES($1,$2,$3,$4,$5,$6,'wechat_articles','keyword','pending',0)`, [randomUUID(), f.tenantId, id, `keyword:${ordinal}`, ordinal, keyword]);
+    }
+    return id;
+  }
+  const metric = value => ({raw: value == null ? '' : String(value), value, precision: value == null ? 'unknown' : 'displayed_integer'});
+  const eventFor = (task, overrides = {}) => ({eventKind: 'wechat_article', eventId: randomUUID(), ...task.identity,
+    mode: 'keyword', rank: 1, capturedAt: new Date().toISOString(),
+    card: {snippet: '安吉星文章', author: '测试公众号', timeLabel: '昨天'},
+    link: {shareUrl: 'https://mp.weixin.qq.com/s/article_test_0001?scene=1#wechat_redirect'},
+    article: {title: '安吉星服务文章', content: '这是一篇完整的安吉星服务文章，正文即使关闭评论仍可采集。', account: '测试公众号', author: '作者甲',
+      publishedAt: '2026-11-08 10:32', timeLabel: '2026年11月8日 10:32', timePrecision: 'minute', location: '上海',
+      bodyStatus: 'complete', bodyReason: '', source: 'screen_ocr', contentType: 'article',
+      metrics: {read: {raw: '1.2万', value: 12000, precision: 'abbreviated'}, like: metric(null), share: metric(null), recommend: metric(null)},
+      bodyBlocks: [{type: 'text', text: '按阅读顺序的正文'}], images: [],
+      evidence: {screens: 3, bodyEndObserved: true, overlapVerified: true, originalImagesCaptured: false}},
+    comments: {status: 'unavailable', postingState: 'unknown', reason: 'comment_entry_not_visible', headerCount: null, items: []},
+    ...overrides});
+  const stored = async f => (await query('SELECT * FROM records WHERE tenant_id=$1', [f.tenantId]));
+
+  await t.test('old phones and browsers cannot claim article work; new phone receives the separate workflow', async st => {
+    const f = await fixture(st);
+    await parent(f);
+    assert.equal((await f.poll({features: []})).task, null, 'listing a platform without its feature is insufficient');
+    assert.equal((await f.poll({features: ['wechat_search_filters'], platforms: ['wechat_channels']})).task, null);
+    const claim = await f.poll();
+    assert.equal(claim.task.platform, 'wechat_articles');
+    assert.deepEqual(claim.task.comments, {enabled: true, limit: 30});
+    const [child] = await query('SELECT metadata FROM capture_tasks WHERE id=$1', [claim.task.identity.taskId]);
+    assert.equal(child.metadata.workflow, 'wechat_articles_mobile_capture');
+    const heldOnOlder = await f.poll({features: []});
+    assert.equal(heldOnOlder.task, null);
+    assert.equal(heldOnOlder.control.reason, 'article_capability_missing');
+    await f.complete(claim.task);
+    const code = randomUUID();
+    const [{id: codeId}] = await query("INSERT INTO auth_codes(tenant_id,code,status,expires_at) VALUES($1,$2,'active',now()+interval '1 day') RETURNING id", [f.tenantId, code]);
+    const [{id: bindingId}] = await query('INSERT INTO auth_bindings(code_id,fingerprint) VALUES($1,$2) RETURNING id', [codeId, randomUUID()]);
+    const capabilities = {remoteTaskCreate: true, remoteTaskKeywordPostLimit: true, singleRelayV1: true, taskStateKnown: true, supportedPlatforms: []};
+    const [browser] = await query(`INSERT INTO capture_agents(tenant_id,client_uuid,display_name,status,allowed_platforms,auth_code_id,auth_binding_id,capabilities,last_heartbeat_at,last_full_heartbeat_at,last_liveness_at)
+      VALUES($1,$2,'Browser test','active',ARRAY[]::text[],$3,$4,$5,now(),now(),now()) RETURNING *`, [f.tenantId, randomUUID(), codeId, bindingId, capabilities]);
+    await parent(f, {eligibleAgentIds: [browser.id]});
+    assert.equal(await withTransaction(tx => dispatchNextElasticWorkItem(tx, {agent: browser, capabilities})), null);
+  });
+
+  await t.test('article manual dispatch and daily scheduling require the feature and create phone children', async st => {
+    const f = await fixture(st);
+    const {createApp} = await import('../../../server/app.js');
+    const {hashSessionToken} = await import('../../../server/services/auth-service.js');
+    const {runCaptureOrchestrationScheduleNow} = await import('../../../server/services/capture-orchestration-scheduler.js');
+    const token = randomUUID();
+    const [{id: userId}] = await query(`INSERT INTO users(email,name,password_hash,is_internal,global_role,must_change_password)
+      VALUES($1,'Article test','not-a-login-password',true,'platform_admin',false) RETURNING id`, [`${randomUUID()}@example.invalid`]);
+    await query(`INSERT INTO user_sessions(user_id,token_hash,expires_at) VALUES($1,$2,now()+interval '1 hour')`, [userId, hashSessionToken(token)]);
+    st.after(() => query('DELETE FROM users WHERE id=$1', [userId]));
+    const server = await new Promise((resolve, reject) => {
+      const listener = createApp({logger: {log() {}, error() {}}}).listen(0, '127.0.0.1');
+      listener.once('listening', () => resolve(listener)); listener.once('error', reject);
+    });
+    st.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+    const parentId = await parent(f);
+    await query(`UPDATE capture_tasks SET status='pending',orchestration_revision=0,
+      metadata=metadata||'{"distributionMode":"fixed_batch","draft":true}'::jsonb WHERE id=$1`, [parentId]);
+    const items = await query('SELECT id FROM capture_task_items WHERE task_id=$1', [parentId]);
+    const dispatch = async () => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/api/capture-cloud/orchestrations/${parentId}/dispatch`, {
+        method: 'POST', headers: {'content-type': 'application/json', authorization: `Bearer ${token}`, 'x-tenant-id': f.tenantId},
+        body: JSON.stringify({expectedRevision: 0, assignments: items.map(item => ({itemId: item.id, agentId: f.phone.id}))}),
+      });
+      return {status: response.status, body: await response.json()};
+    };
+    await f.poll({features: []});
+    assert.ok((await dispatch()).status >= 400, 'old phone cannot receive an article assignment');
+    await f.poll();
+    const accepted = await dispatch();
+    assert.ok([200, 201].includes(accepted.status), JSON.stringify(accepted.body));
+    assert.equal(accepted.body.executions[0].commandId, null);
+    const [manual] = await query(`SELECT * FROM capture_tasks WHERE parent_task_id=$1 AND metadata->>'workflow'='wechat_articles_mobile_capture'`, [parentId]);
+    assert.equal(manual.platform, 'wechat_articles');
+    assert.deepEqual(manual.metadata.comments, {enabled: true, limit: 30});
+    const claim = await f.poll();
+    assert.equal(claim.task.identity.taskId, manual.id);
+    await f.complete(claim.task);
+
+    const templateId = await parent(f, {keywords: ['安吉星计划']});
+    await query(`UPDATE capture_tasks SET status='pending',metadata=metadata||'{"orchestrationTemplate":true,"distributionMode":"fixed_batch"}'::jsonb WHERE id=$1`, [templateId]);
+    await query('UPDATE capture_task_items SET assigned_agent_id=$2,assignment_revision=1 WHERE task_id=$1', [templateId, f.phone.id]);
+    const scheduleId = randomUUID();
+    const plan = {mode: 'daily', startTime: '09:00', maxRounds: 1, roundGapMin: 10, platform: 'wechat_articles', keywords: ['安吉星计划'],
+      searchFilters: {sort: 'likes', publishTime: 'all', contentType: 'all'}, keywordMaxDetectedItems: 3,
+      captureSettings: {autoDetailCaptureAfterListCapture: true, includeCommentsOnDetailCapture: false}};
+    await query(`INSERT INTO capture_orchestration_schedules(id,tenant_id,template_task_id,title,platform,status,schedule_mode,timezone,start_time,
+      random_offset_min,custom_dates,overlap_policy,late_start_grace_min,allocation_mode,distribution_mode,revision,plan_snapshot,next_run_at)
+      VALUES($1,$2,$3,'文章计划','wechat_articles','active','daily','Asia/Shanghai','09:00',0,ARRAY[]::date[],'skip',360,'balanced','fixed_batch',1,$4::jsonb,now())`,
+    [scheduleId, f.tenantId, templateId, JSON.stringify(plan)]);
+    const scheduled = await runCaptureOrchestrationScheduleNow({tenantId: f.tenantId, scheduleId, requestKey: randomUUID()});
+    assert.equal(scheduled.kind, 'created', JSON.stringify(scheduled));
+    const [daily] = await query(`SELECT * FROM capture_tasks WHERE parent_task_id=$1 AND metadata->>'workflow'='wechat_articles_mobile_capture'`, [scheduled.runTaskId]);
+    assert.equal(daily.platform, 'wechat_articles');
+    assert.deepEqual(daily.metadata.filters, {sort: 'hot', publishWindowHours: null});
+    assert.deepEqual(daily.metadata.comments, {enabled: false, limit: 0});
+    const dailyClaim = await f.poll();
+    assert.equal(dailyClaim.task.identity.taskId, daily.id);
+    await f.complete(dailyClaim.task);
+  });
+
+  await t.test('closed and unavailable comments still store full body; unknown counts stay null and receipts replay', async st => {
+    const f = await fixture(st);
+    await parent(f);
+    const {task} = await f.poll();
+    const event = eventFor(task, {comments: {status: 'closed', postingState: 'closed', reason: 'explicit_closed', headerCount: null, items: []}});
+    const batch = {uploadBatchId: randomUUID(), events: [event]};
+    const first = await f.service.posts(f.principal, batch, persist);
+    assert.equal(first.receipts[0].status, 'accepted');
+    const [record] = await stored(f);
+    assert.equal(record.platform, 'wechat_articles');
+    assert.equal(record.external_id, articleExternalId(event.link.shareUrl));
+    assert.equal(record.url, canonicalArticleUrl(event.link.shareUrl));
+    assert.equal(record.content, event.article.content);
+    assert.equal(record.publish_time, '2026-11-08 10:32');
+    assert.deepEqual([record.likes, record.comments_count, record.collects, record.shares], [null, null, null, null]);
+    assert.equal(record.payload.wechatArticle.comments.status, 'closed');
+    assert.equal(record.payload.wechatArticle.metrics.read.precision, 'abbreviated');
+    assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, false);
+    const [observation] = await query('SELECT * FROM record_observations WHERE tenant_id=$1', [f.tenantId]);
+    assert.equal(observation.capture_task_item_attempt_id, task.identity.attemptId);
+    assert.deepEqual([observation.likes, observation.comments_count, observation.collects, observation.shares], [null, null, null, null]);
+    const replay = await f.service.posts(f.principal, batch, persist);
+    assert.equal(replay.receipts[0].receiptId, first.receipts[0].receiptId);
+    assert.equal((await f.service.postReceipts(f.principal, batch.uploadBatchId)).receipts.length, 1);
+    await assert.rejects(send(f, {...event, rank: 2}), {code: 'EVENT_PAYLOAD_CONFLICT'});
+    await query(`INSERT INTO tenant_settings(tenant_id,key,value) VALUES($1,'wechat_forward_recipients','文件传输助手')`, [f.tenantId]);
+    await assert.rejects(f.service.forward(f.tenantId, {recordId: record.id, recipients: ['文件传输助手']}), {code: 'RECORD_NOT_WECHAT_CHANNELS'});
+    await f.complete(task);
+  });
+
+  await t.test('cross-keyword recapture updates one record and preserves known body/counts while the new observation stays unknown', async st => {
+    const f = await fixture(st);
+    await parent(f, {keywords: ['安吉星', '安吉星服务']});
+    const first = (await f.poll()).task;
+    const initial = eventFor(first);
+    initial.article.metrics.like = metric(12);
+    initial.article.metrics.share = metric(0);
+    initial.comments = {status: 'empty', postingState: 'open', reason: 'explicit_zero', headerCount: 0, items: []};
+    assert.equal((await send(f, initial)).receipts[0].status, 'accepted');
+    await f.complete(first);
+    const second = (await f.poll()).task;
+    const partial = eventFor(second);
+    partial.article.content = '这是一篇';
+    partial.article.bodyStatus = 'partial';
+    partial.article.bodyReason = 'screen_budget';
+    partial.link.shareUrl = 'https://mp.weixin.qq.com/s/article_test_0001?scene=2';
+    await send(f, partial);
+    const rows = await stored(f);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].content, initial.article.content);
+    assert.equal(rows[0].likes, 12);
+    assert.equal(rows[0].shares, 0);
+    assert.equal(rows[0].payload.wechatArticle.bodyStatus, 'complete');
+    assert.equal(rows[0].payload.wechatArticle.latestCapture.bodyStatus, 'partial');
+    assert.equal(rows[0].payload.wechatArticle.latestCapture.metrics.like.value, null);
+    const observations = await query('SELECT * FROM record_observations WHERE tenant_id=$1 ORDER BY captured_at', [f.tenantId]);
+    assert.equal(observations.length, 2);
+    assert.equal(observations[1].likes, null);
+    assert.equal(observations[1].comments_count, null);
+    assert.equal(observations[1].payload.wechatArticle.bodyStatus, 'partial');
+    await f.complete(second);
+  });
+
+  await t.test('DOM body and ordered image URLs enter the existing record path while phone evidence stays separate', async st => {
+    const {isAllowedMediaHost} = await import('../../../server/services/media-proxy.js');
+    const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
+    const imageUrls = ['https://mmbiz.qpic.cn/offline-fixture/first.png', 'https://mmbiz.qpic.cn/offline-fixture/second.png'];
+    assert.ok(imageUrls.every(url => !isAllowedMediaHost(url)), 'offline fixture must stay blocked by the existing CDN policy');
+    const f = await fixture(st);
+    await parent(f, {keywords: ['安吉星', '安吉星更新', '安吉星长图', '安吉星再巡查', '安吉星无图正文']});
+    const first = (await f.poll()).task;
+    const dom = eventFor(first);
+    const bodyAt = new Date(Date.now()-60_000).toISOString(), phoneAt = new Date(Date.now()-30_000).toISOString();
+    Object.assign(dom.article, {source: 'page_dom', capturedAt: bodyAt, timeSource: 'page_dom', content: '来自网页 DOM 的完整正文。',
+      images: imageUrls.map((url, order) => ({url, alt: `图${order + 1}`, order, source: 'page_dom', stored: true})),
+      bodyBlocks: [{type: 'text', text: '来自网页 DOM 的完整正文。'}, ...imageUrls.map(url => ({type: 'image', url}))]});
+    dom.article.metrics.like = {raw: '7', value: 7, source: 'screen_ocr', capturedAt: phoneAt};
+    dom.article.metrics.read = {raw: '', value: null, source: 'page_dom', capturedAt: bodyAt};
+    dom.comments = {status: 'captured', source: 'screen_ocr', capturedAt: phoneAt, postingState: 'open', headerCount: 1,
+      items: [{author: '手机读者', content: '手机页尾真实可读留言', timeLabel: '昨天', likeCount: null, reply: false}]};
+    const receipt = (await send(f, dom)).receipts[0];
+    assert.equal(receipt.status, 'accepted');
+    await drain(f);
+    await ensureRecordImagesLocal(receipt.recordId, imageUrls, 'wechat_articles');
+    const [record] = await stored(f);
+    assert.deepEqual(record.image_urls, imageUrls);
+    assert.deepEqual(record.image_local_urls, [], 'source URLs remain undownloaded under the unchanged CDN policy');
+    assert.equal(record.payload.wechatArticle.source, 'page_dom');
+    assert.equal(record.payload.wechatArticle.capturedAt, bodyAt);
+    assert.equal(record.payload.wechatArticle.metrics.like.source, 'screen_ocr');
+    assert.equal(record.payload.wechatArticle.metrics.like.capturedAt, phoneAt);
+    assert.equal(record.payload.wechatArticle.metrics.read.value, null);
+    assert.ok(record.payload.wechatArticle.images.every(image => !image.stored && !image.downloadEligible));
+    const [comment] = await query('SELECT payload FROM record_comments WHERE record_id=$1', [record.id]);
+    assert.equal(comment.payload.source, 'screen_ocr');
+    assert.equal(comment.payload.capturedAt, phoneAt);
+    await f.complete(first);
+    const second = (await f.poll()).task;
+    const ocr = eventFor(second); ocr.article.content = '手机只看见一小段'; ocr.article.bodyStatus = 'partial';
+    await send(f, ocr);
+    const [updated] = await stored(f);
+    assert.equal(updated.content, dom.article.content);
+    assert.deepEqual(updated.image_urls, imageUrls);
+    assert.equal(updated.payload.wechatArticle.source, 'page_dom');
+    assert.equal(updated.payload.wechatArticle.capturedAt, bodyAt);
+    assert.equal(updated.payload.wechatArticle.latestCapture.source, 'screen_ocr');
+    const [latest] = await query('SELECT payload FROM record_observations WHERE capture_task_item_attempt_id=$1', [second.identity.attemptId]);
+    assert.equal(latest.payload.wechatArticle.source, 'screen_ocr');
+    assert.equal(latest.payload.wechatArticle.content, ocr.article.content);
+    await f.complete(second);
+    const third = (await f.poll()).task;
+    const imageOnly = eventFor(third);
+    Object.assign(imageOnly.article, {source: 'page_dom', content: '', images: dom.article.images,
+      bodyBlocks: imageUrls.map(url => ({type: 'image', url})), bodyStatus: 'complete'});
+    await send(f, imageOnly);
+    const [imageRecord] = await stored(f);
+    assert.equal(imageRecord.content, '', 'a verified image-only DOM body replaces stale textual content');
+    assert.deepEqual(imageRecord.image_urls, imageUrls);
+    await f.complete(third);
+    const fourth = (await f.poll()).task;
+    await send(f, eventFor(fourth));
+    const [kept] = await stored(f);
+    assert.equal(kept.content, '', 'even an OCR result marked complete cannot replace a complete DOM body');
+    assert.equal(kept.payload.wechatArticle.source, 'page_dom');
+    assert.equal(kept.payload.wechatArticle.latestCapture.source, 'screen_ocr');
+    await f.complete(fourth);
+    await ensureRecordImagesLocal(receipt.recordId, imageUrls, 'wechat_articles');
+    await query('UPDATE records SET image_local_urls=$2::jsonb WHERE id=$1', [receipt.recordId,
+      JSON.stringify([{source_url: imageUrls[0], source_hash: 'offline-placeholder', url: '/media/images/offline-placeholder.png'}])]);
+    const fifth = (await f.poll()).task;
+    const textOnly = eventFor(fifth); textOnly.article.source = 'page_dom';
+    await send(f, textOnly);
+    const [textRecord] = await stored(f);
+    assert.deepEqual(textRecord.image_urls, []);
+    assert.deepEqual(textRecord.image_local_urls, [], 'a replacement DOM body without images cannot keep a stale image gallery');
+    await f.complete(fifth);
+  });
+
+  await t.test('comments and replies are persisted with stable IDs; missing likes do not invent zero', async st => {
+    const f = await fixture(st);
+    await parent(f, {keywords: ['安吉星', '安吉星评论']});
+    const comments = {status: 'captured', postingState: 'followers_only', headerCount: 2, items: [
+      {author: '读者甲', content: '这篇服务说明写得很清楚', location: '上海', timeLabel: '昨天', likeCount: null, reply: false},
+      {author: '公众号', content: '谢谢阅读', location: '上海', timeLabel: '昨天', likeCount: 0, reply: true, parentIndex: 0}]};
+    const first = (await f.poll()).task;
+    await send(f, eventFor(first, {comments}));
+    await drain(f);
+    const one = await query('SELECT * FROM record_comments WHERE tenant_id=$1 ORDER BY floor_index', [f.tenantId]);
+    assert.equal(one.length, 2);
+    assert.equal(one[0].like_count, null);
+    assert.equal(one[1].like_count, 0);
+    assert.equal(one[1].parent_comment_id, one[0].external_comment_id);
+    await f.complete(first);
+    const second = (await f.poll()).task;
+    await send(f, eventFor(second, {comments}));
+    await drain(f);
+    const two = await query('SELECT id FROM record_comments WHERE tenant_id=$1 ORDER BY floor_index', [f.tenantId]);
+    assert.deepEqual(two.map(row => row.id), one.map(row => row.id));
+    await f.complete(second);
+  });
+
+  await t.test('wrong attempts/tenants/platforms fail; late historical events keep a durable receipt and no false lease binding', async st => {
+    const f = await fixture(st), other = await fixture(st);
+    await parent(f);
+    const first = (await f.poll()).task;
+    await assert.rejects(send(f, {...eventFor(first), requestHash: 'f'.repeat(64)}), {code: 'ATTEMPT_LINEAGE_MISMATCH'});
+    await assert.rejects(send(other, {...eventFor(first), agentId: other.phone.id}), {code: 'ATTEMPT_LINEAGE_MISMATCH'});
+    const channel = {eventKind: 'wechat_post', ...first.identity, eventId: randomUUID(), capturedAt: new Date().toISOString(),
+      link: {shareUrl: 'https://weixin.qq.com/sph/testabcd'}, preview: {createtime: Math.floor(Date.now()/1000)-100, nickname: '测试', description: 'wrong platform'}};
+    await assert.rejects(send(f, channel), {code: 'ATTEMPT_LINEAGE_MISMATCH'});
+    const event = eventFor(first);
+    await f.complete(first, {status: 'interrupted', reason: 'lease_expired'});
+    const second = (await f.poll()).task;
+    assert.notEqual(second.identity.attemptId, first.identity.attemptId);
+    assert.equal((await send(f, event)).receipts[0].status, 'accepted');
+    const [observation] = await query('SELECT capture_task_item_attempt_id FROM record_observations WHERE tenant_id=$1', [f.tenantId]);
+    assert.equal(observation.capture_task_item_attempt_id, null);
+    const outside = {...event, eventId: randomUUID(), capturedAt: new Date(Date.now()-3600_000).toISOString()};
+    assert.equal((await send(f, outside)).receipts[0].reason, 'captured_outside_attempt');
+    await f.complete(second);
+  });
+
+  await t.test('article prefilter uses the leased tenant, keyword and article platform', async st => {
+    let seen;
+    const f = await fixture(st, {prefilter: async input => { seen = input; return {items: []}; }});
+    await parent(f, {planSnapshot: {captureSettings: {autoDetailCaptureAfterListCapture: true, enableAiRelevancePrefilter: true}}});
+    const {task} = await f.poll();
+    const response = await f.service.prefilter(f.principal, {requestId: randomUUID(), identity: task.identity,
+      keyword: 'untrusted keyword', cards: [{cardId: 'a'.repeat(64), title: '文章标题', author: '公众号'}]});
+    assert.equal(seen.tenantId, f.tenantId);
+    assert.equal(seen.body.platform, 'wechat_articles');
+    assert.equal(seen.body.keyword, '安吉星');
+    assert.equal(response.items[0].executionDisposition, 'collect_full', 'missing model result fails open');
+    await f.complete(task);
+  });
+
+  await t.test('a restricted article window rejects unknown time and minute/day intervals crossing its cutoff', async st => {
+    const f = await fixture(st);
+    await parent(f, {planSnapshot: {searchFilters: {sort: 'latest', publishTime: 'day', contentType: 'all'}}});
+    const {task} = await f.poll();
+    const reference = new Date();
+    reference.setUTCSeconds(30, 0);
+    await query('UPDATE capture_tasks SET started_at=$2::timestamptz WHERE id=$1', [task.identity.taskId, reference.toISOString()]);
+    const beijing = ms => new Date(ms + 8 * 3600_000).toISOString().slice(0, 16).replace('T', ' ');
+    const cutoff = beijing(reference.getTime() - 86400_000);
+    for (const [precision, time] of [['unknown', ''], ['minute', cutoff], ['date', cutoff.slice(0, 10)]]) {
+      const event = eventFor(task);
+      Object.assign(event.article, {publishedAt: time, timePrecision: precision});
+      const result = await send(f, event);
+      assert.equal(result.receipts[0].status, 'rejected');
+      assert.equal(result.receipts[0].reason, 'capture_publish_time_unverified');
+    }
+    assert.equal((await stored(f)).length, 0);
+    const recent = eventFor(task);
+    recent.article.publishedAt = beijing(reference.getTime() - 600_000);
+    assert.equal((await send(f, recent)).receipts[0].status, 'accepted');
+    await f.complete(task);
+  });
+
+  await t.test('negative article patrol revisits the canonical link and binds its observation to shared rotation state', async st => {
+    const f = await fixture(st);
+    const url = 'https://mp.weixin.qq.com/s/article_test_0001';
+    const [record] = await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,content,author_name,url,
+      keyword,sentiment,business_visibility,publish_time,created_at)
+      VALUES($1,$2,'wechat_articles','keyword_notes','安吉星服务文章','旧正文','测试公众号',$3,'安吉星','negative','eligible',
+      '2026-11-08 10:32',now()-interval '1 day') RETURNING *`, [f.tenantId, articleExternalId(url), url]);
+    const {normalizeUnattendedNegativePatrolScope, loadUnattendedNegativePatrolCandidates} = await import('../../../server/services/unattended-negative-patrol.js');
+    const scope = normalizeUnattendedNegativePatrolScope({tenantId: f.tenantId, platforms: ['wechat_articles'], keywords: ['安吉星'], runStartedAt: new Date().toISOString()});
+    const candidates = await withTransaction(tx => loadUnattendedNegativePatrolCandidates(tx, {...scope, persistCandidates: true}));
+    assert.equal(candidates.candidates.length, 1);
+    const parentId = await parent(f, {keywords: [], planSnapshot: {negativePatrol: {enabled: true, lookbackDays: 7}}});
+    await query(`UPDATE capture_tasks SET metadata=metadata||jsonb_build_object('negativePatrolRun',$2::jsonb) WHERE id=$1`, [parentId, JSON.stringify(scope)]);
+    const candidate = candidates.candidates[0];
+    await query(`INSERT INTO capture_task_items(id,tenant_id,task_id,item_key,ordinal,keyword,platform,item_type,record_id,external_id,
+      url_snapshot,status,metadata,assignment_revision)
+      VALUES($1,$2,$3,$4,0,'','wechat_articles','negative_post',$5,$6,$7,'pending',$8::jsonb,0)`,
+    [randomUUID(), f.tenantId, parentId, `negative:wechat_articles:${candidate.externalId}`, candidate.recordId, candidate.externalId,
+      candidate.url, JSON.stringify({unattendedNegativePatrol: true, sourceRecord: candidate.sourceRecord, baseline: candidate.baseline})]);
+    assert.equal((await f.poll({features: []})).task, null);
+    const {task} = await f.poll();
+    assert.equal(task.mode, 'patrol');
+    assert.equal(task.patrolTarget.platform, 'wechat_articles');
+    assert.equal(task.patrolTarget.url, url);
+    assert.equal(task.keyword, '安吉星服务文章');
+    const result = await send(f, eventFor(task, {mode: 'patrol', rank: null}));
+    assert.equal(result.receipts[0].recordId, record.id);
+    await f.complete(task, {reason: 'patrol_preview'});
+    const [item] = await query(`SELECT status,result_observation_id FROM capture_task_items WHERE tenant_id=$1 AND item_type='negative_post'`, [f.tenantId]);
+    assert.equal(item.status, 'completed');
+    assert.ok(item.result_observation_id);
+    const [state] = await query('SELECT last_success_at, needs_action FROM unattended_negative_patrol_state WHERE tenant_id=$1', [f.tenantId]);
+    assert.ok(state.last_success_at);
+    assert.equal(state.needs_action, false);
+  });
+
+  await t.test('real phone evidence survives ingest and replay without replacing body, comments or metrics', {
+    skip: !process.env.WECHAT_ARTICLE_EVENT_FILE && 'Set WECHAT_ARTICLE_EVENT_FILE to an actual phone events.json to run this acceptance step',
+  }, async st => {
+    const input = JSON.parse(await readFile(process.env.WECHAT_ARTICLE_EVENT_FILE, 'utf8'));
+    const events = Array.isArray(input) ? input : input.events;
+    assert.ok(Array.isArray(events) && events.length, 'evidence file must contain actual captured events');
+    const f = await fixture(st);
+    await parent(f);
+    const {task} = await f.poll();
+    const times = events.map(event => Date.parse(event.capturedAt));
+    assert.ok(times.every(Number.isFinite));
+    // Fit only the isolated lease to historical evidence, never forge a new capture time.
+    await query('UPDATE capture_task_item_attempts SET started_at=$2::timestamptz WHERE id=$1',
+      [task.identity.attemptId, new Date(Math.min(...times)-1000).toISOString()]);
+    for (const captured of events) {
+      assert.equal(captured.eventKind, 'wechat_article');
+      const event = {...captured, ...task.identity, eventId: randomUUID()};
+      const batch = {uploadBatchId: randomUUID(), events: [event]};
+      const first = await f.service.posts(f.principal, batch, persist);
+      assert.equal(first.receipts[0].status, 'accepted');
+      const [record] = await query('SELECT * FROM records WHERE id=$1', [first.receipts[0].recordId]);
+      assert.equal(record.url, canonicalArticleUrl(captured.link.shareUrl));
+      assert.equal(record.payload.wechatArticle.comments.status, captured.comments.status);
+      assert.equal(record.payload.wechatArticle.latestCapture.bodyStatus, captured.article.bodyStatus);
+      const [observation] = await query(`SELECT o.* FROM record_observations o JOIN capture_mobile_post_receipts r ON r.observation_id=o.id WHERE r.id=$1`, [first.receipts[0].receiptId]);
+      assert.equal(observation.payload.wechatArticle.content, captured.article.content.normalize('NFC'));
+      for (const key of ['read', 'like', 'share', 'recommend']) {
+        assert.equal(observation.payload.wechatArticle.metrics[key].value, captured.article.metrics?.[key]?.value ?? null);
+        assert.equal(observation.payload.wechatArticle.metrics[key].raw, captured.article.metrics?.[key]?.raw ?? '');
+      }
+      await drain(f);
+      const comments = await query('SELECT content FROM record_comments WHERE tenant_id=$1 AND record_id=$2', [f.tenantId, record.id]);
+      for (const item of captured.comments.items) assert.ok(comments.some(row => row.content === item.content.normalize('NFC').trim()));
+      const replay = await f.service.posts(f.principal, batch, persist);
+      assert.equal(replay.receipts[0].receiptId, first.receipts[0].receiptId);
+      st.diagnostic(JSON.stringify({evidence: process.env.WECHAT_ARTICLE_EVENT_FILE, url: record.url,
+        bodyStatus: captured.article.bodyStatus, commentsStatus: captured.comments.status,
+        capturedComments: captured.comments.items.length, recordId: record.id, receiptId: first.receipts[0].receiptId}));
+    }
+    await f.complete(task);
+  });
+});

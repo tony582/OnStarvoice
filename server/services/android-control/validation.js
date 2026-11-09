@@ -3,7 +3,7 @@ import {DiscoveryError, requireUuid} from '../capture-discovery/validation.js';
 export const WORKFLOW = 'douyin_mobile_discovery';
 // Every phone run, Douyin discovery or WeChat Channels capture (0.4.0). Queries that look up "a phone run"
 // match this list; queries that mean Douyin discovery keep WORKFLOW.
-export const MOBILE_RUN_WORKFLOWS = Object.freeze(['douyin_mobile_discovery', 'wechat_channels_mobile_capture']);
+export const MOBILE_RUN_WORKFLOWS = Object.freeze(['douyin_mobile_discovery', 'wechat_channels_mobile_capture', 'wechat_articles_mobile_capture']);
 export const LEASE_MS = 90_000;
 // Runner endings only the phone's owner can clear (login wall, verification).
 // A keyword ending with one stays needs_action for a person, never failed

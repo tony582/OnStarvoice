@@ -40,7 +40,7 @@ import {
 const router = Router();
 
 // 导出用中文标签映射(MAP[v]||v||'')
-const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号' };
+const PLATFORM_CN = { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号', wechat_articles: '微信文章' };
 const SENTIMENT_CN = { positive: '正面', neutral: '中性', negative: '负面' };
 const TRIAGE_STATUS_CN = {
   unhandled: '待处理',

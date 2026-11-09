@@ -6,7 +6,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import {
-  cn, formatDate, formatFullDate, formatFullDateSec, formatNumber, identityLabel,
+  cn, formatDate, formatFullDate, formatFullDateSec, formatNumber, formatRecordMetric, identityLabel,
   LABELS, platformName, proxiedImg,
 } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -498,10 +498,10 @@ function TicketDrawerContent({
                         {observations.map((item, index) => (
                           <div key={item.id || index} className="flex items-center justify-between gap-3 py-3">
                             <div className="flex flex-wrap items-center gap-3 text-[12px] tabular-nums">
-                              <span className="flex items-center gap-1"><Heart className="h-3 w-3 text-muted-foreground" />{formatNumber(item.likes)}</span>
-                              <span className="flex items-center gap-1"><MessageCircle className="h-3 w-3 text-muted-foreground" />{formatNumber(item.comments_count)}</span>
-                              <span className="flex items-center gap-1"><Star className="h-3 w-3 text-muted-foreground" />{formatNumber(item.collects)}</span>
-                              <span className="flex items-center gap-1"><Share2 className="h-3 w-3 text-muted-foreground" />{formatNumber(item.shares)}</span>
+                              <span className="flex items-center gap-1"><Heart className="h-3 w-3 text-muted-foreground" />{formatRecordMetric(item, 'likes')}</span>
+                              <span className="flex items-center gap-1"><MessageCircle className="h-3 w-3 text-muted-foreground" />{formatRecordMetric(item, 'comments_count')}</span>
+                              <span className="flex items-center gap-1"><Star className="h-3 w-3 text-muted-foreground" />{formatRecordMetric(item, 'collects')}</span>
+                              <span className="flex items-center gap-1"><Share2 className="h-3 w-3 text-muted-foreground" />{formatRecordMetric(item, 'shares')}</span>
                             </div>
                             <span className="shrink-0 text-[11px] text-muted-foreground">{formatFullDateSec(item.captured_at)}</span>
                           </div>

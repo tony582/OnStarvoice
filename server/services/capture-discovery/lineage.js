@@ -14,7 +14,7 @@ export async function authorizePrincipal(tx, principal) {
   if (!agent || agent.capabilities?.agentKind !== 'android_mobile'
       || agent.capabilities?.mobileSearchDiscoveryV1 !== true
       // A phone may run Douyin, WeChat Channels or both (0.4.0); it needs at least one of them.
-      || !['douyin', 'wechat_channels'].some(platform => agent.allowed_platforms?.includes(platform))) {
+      || !['douyin', 'wechat_channels', 'wechat_articles'].some(platform => agent.allowed_platforms?.includes(platform))) {
     throw new DiscoveryError('MOBILE_AGENT_NOT_AUTHORIZED', 403);
   }
 }

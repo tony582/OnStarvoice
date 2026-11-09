@@ -29,7 +29,7 @@ export function patrolSearchQuery(target) {
  * null when the item cannot be patrolled now (it is skipped for this run unless the refusal is transient).
  */
 export async function claimPhonePatrolItem(tx, {tenantId, parent, item, childId, revision}) {
-  const record = await tx.queryOne(`SELECT r.id, r.title, r.content, r.author_name, r.publish_time, r.url, triage.archived_at
+  const record = await tx.queryOne(`SELECT r.id, r.platform, r.title, r.content, r.author_name, r.publish_time, r.url, triage.archived_at
     FROM records r LEFT JOIN record_triage triage ON triage.tenant_id = r.tenant_id AND triage.record_id = r.id
     WHERE r.tenant_id = $1 AND r.id = $2`, [tenantId, item.record_id]);
   const skip = async reason => {
@@ -45,7 +45,8 @@ export async function claimPhonePatrolItem(tx, {tenantId, parent, item, childId,
   if (!claimed.claimed) return TRANSIENT.has(claimed.reason) ? null : skip(claimed.reason || 'no_longer_eligible');
   const target = {recordId: record.id, url: item.url_snapshot || record.url, title: record.title || '', content: record.content || '',
     author: record.author_name || '', createtime: beijingSeconds(record.publish_time)};
-  return {mode: 'patrol', patrolTarget: target, searchQuery: patrolSearchQuery(target)};
+  if (record.platform === 'wechat_articles') target.platform = record.platform;
+  return {mode: 'patrol', patrolTarget: target, searchQuery: patrolSearchQuery(record.platform === 'wechat_articles' ? {...target, content: target.title} : target)};
 }
 
 /** Settle the rotation state when the phone reports the patrol attempt; returns the item status and outcome to keep. */

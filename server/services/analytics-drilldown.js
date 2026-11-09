@@ -2,7 +2,7 @@ import { queryAll, queryOne } from '../db/init.js';
 import { PUBLISHED_RECORD_PERIOD_SQL, RELEVANT_RECORD_SQL } from './report-generator.js';
 
 const DIMENSION_VALUES = {
-  platform: new Set(['xiaohongshu', 'douyin', 'weibo', 'wechat_channels', 'unknown']),
+  platform: new Set(['xiaohongshu', 'douyin', 'weibo', 'wechat_channels', 'wechat_articles', 'unknown']),
   sentiment: new Set(['positive', 'neutral', 'negative', 'pending']),
   status: new Set([
     'unhandled',
@@ -19,7 +19,7 @@ const DIMENSION_VALUES = {
 
 const DIMENSION_LABELS = { platform: '平台', sentiment: '情感', status: '处理模式' };
 const VALUE_LABELS = {
-  platform: { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号', unknown: '未知平台' },
+  platform: { xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号', wechat_articles: '微信文章', unknown: '未知平台' },
   sentiment: { positive: '正面', neutral: '中性', negative: '负面', pending: '待标注' },
   status: {
     unhandled: '待处理',

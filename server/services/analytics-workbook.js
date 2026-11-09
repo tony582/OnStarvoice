@@ -22,7 +22,7 @@ const PLATFORM_LABELS = {
   xiaohongshu: '小红书',
   douyin: '抖音',
   weibo: '微博',
-  wechat_channels: '视频号',
+  wechat_channels: '视频号', wechat_articles: '微信文章',
   unknown: '未知平台',
   '': '未知平台',
 };

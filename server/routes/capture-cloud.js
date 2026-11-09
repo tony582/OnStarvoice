@@ -179,7 +179,7 @@ async function requireBrowserTaskControl(req, res, next) {
   try {
     const task = await queryOne(`SELECT metadata->>'workflow' AS workflow FROM capture_tasks
       WHERE tenant_id=$1 AND id=$2`, [req.tenantId, req.params.id], null, {category: 'critical'});
-    if (['douyin_mobile_discovery', 'wechat_channels_mobile_capture'].includes(task?.workflow)) {
+    if (['douyin_mobile_discovery', 'wechat_channels_mobile_capture', 'wechat_articles_mobile_capture'].includes(task?.workflow)) {
       return res.status(409).json({ok: false, error: 'android_control_protocol_required'});
     }
     return next();
@@ -7801,7 +7801,7 @@ async function dispatchNextElasticWorkItemWithinBudget(tx, {
             <= now() - ($17::bigint * interval '1 millisecond'))
       )
       -- WeChat Channels work is phone-only: a browser never claims it, whatever its platform lists say.
-      AND item.platform <> 'wechat_channels'
+      AND item.platform NOT IN ('wechat_channels', 'wechat_articles')
       AND (
         item.execution_task_id IS NULL
         OR EXISTS (
@@ -10925,7 +10925,7 @@ router.get('/history', requireTenantAccess, requireSessionUser, async (req, res,
       ? Math.min(3650, Math.max(0, Math.floor(daysInput)))
       : 30;
     const allowedPlatforms = new Set([
-      'xiaohongshu', 'douyin', 'weibo', 'wechat_channels', 'mixed', 'unknown',
+      'xiaohongshu', 'douyin', 'weibo', 'wechat_channels', 'wechat_articles', 'mixed', 'unknown',
     ]);
     const allowedStatuses = new Set([
       'completed', 'completed_with_warnings', 'completed_with_failures',

@@ -1,3 +1,4 @@
+import {articleFilterBlockReason} from './articles.js';
 // Shared, dependency-free mapping from an orchestration plan snapshot to the
 // mobile Runner's task shape. Used by the poll claim (elastic + assigned), the
 // scheduler's fixed-batch materialization and the manual fixed-batch dispatch,
@@ -7,13 +8,17 @@
 export const MOBILE_WORKFLOW = 'douyin_mobile_discovery';
 // WeChat Channels on the same phone (0.4.0): the phone captures the whole post itself and uploads it.
 export const WECHAT_MOBILE_WORKFLOW = 'wechat_channels_mobile_capture';
-export const MOBILE_WORKFLOWS = Object.freeze([MOBILE_WORKFLOW, WECHAT_MOBILE_WORKFLOW]);
-export const MOBILE_PLATFORMS = Object.freeze(['douyin', 'wechat_channels']);
+export const WECHAT_ARTICLE_WORKFLOW = 'wechat_articles_mobile_capture';
+export const WECHAT_ARTICLE_FEATURE = 'wechat_articles';
+export const isWechatMobilePlatform = platform => ['wechat_channels', 'wechat_articles'].includes(platform);
+export const MOBILE_WORKFLOWS = Object.freeze([MOBILE_WORKFLOW, WECHAT_MOBILE_WORKFLOW, WECHAT_ARTICLE_WORKFLOW]);
+export const MOBILE_PLATFORMS = Object.freeze(['douyin', 'wechat_channels', 'wechat_articles']);
 export function mobileWorkflowFor(platform) {
-  return String(platform || '').toLowerCase() === 'wechat_channels' ? WECHAT_MOBILE_WORKFLOW : MOBILE_WORKFLOW;
+  const normalized = String(platform || '').toLowerCase();
+  return normalized === 'wechat_articles' ? WECHAT_ARTICLE_WORKFLOW : normalized === 'wechat_channels' ? WECHAT_MOBILE_WORKFLOW : MOBILE_WORKFLOW;
 }
 export function mobilePlatformForWorkflow(workflow) {
-  return workflow === WECHAT_MOBILE_WORKFLOW ? 'wechat_channels' : 'douyin';
+  return workflow === WECHAT_ARTICLE_WORKFLOW ? 'wechat_articles' : workflow === WECHAT_MOBILE_WORKFLOW ? 'wechat_channels' : 'douyin';
 }
 export const MOBILE_KEYWORD_MINUTES_DEFAULT = 15;
 export const MOBILE_BATCH_TAIL_MS = 5 * 60_000;
@@ -53,10 +58,11 @@ export function mobileTaskFilters(searchFilters = {}, platform = 'douyin') {
   const source = searchFilters && typeof searchFilters === 'object' && !Array.isArray(searchFilters)
     ? searchFilters
     : {};
-  if (String(platform).toLowerCase() === 'wechat_channels') {
+  const normalized = String(platform).toLowerCase();
+  if (isWechatMobilePlatform(normalized)) {
     const windowHours = Object.hasOwn(WECHAT_WINDOW_HOURS, source.publishTime) ? WECHAT_WINDOW_HOURS[source.publishTime] : null;
-    const {duration, scope} = wechatSearchChoices(source);
-    // The App's own 时长 / 范围 are only sent when chosen, so plans without them keep their task shape.
+    const {duration, scope} = normalized === 'wechat_channels' ? wechatSearchChoices(source) : {duration: 'all', scope: 'all'};
+    // Both WeChat surfaces share sorting and date windows. Only 视频号 has calibrated 时长 / 范围 choices.
     return {sort: windowHours === null ? (WECHAT_SORTS[source.sort] ?? 'all') : 'latest', publishWindowHours: windowHours,
       ...(duration !== 'all' ? {duration} : {}), ...(scope !== 'all' ? {scope} : {})};
   }
@@ -123,7 +129,11 @@ export function mobilePlanBlockReason(planSnapshot = {}, platform = 'douyin') {
     ? planSnapshot
     : {};
   const normalized = String(platform || '').toLowerCase();
-  if (normalized === 'wechat_channels') {
+  if (normalized === 'wechat_articles') {
+    const reason = articleFilterBlockReason(source.searchFilters || {});
+    if (reason) return reason;
+  }
+  if (isWechatMobilePlatform(normalized)) {
     // Channels: one search pass; the month window works (the phone filters by the card time itself).
     if (Array.isArray(source.searchPasses) && source.searchPasses.length > 1) return 'sequential_search_unsupported';
     return '';

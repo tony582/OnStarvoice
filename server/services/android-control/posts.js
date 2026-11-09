@@ -3,7 +3,8 @@ import {truncateWellFormed} from '../../utils/well-formed-text.js';
 import {DiscoveryError, requireUuid} from '../capture-discovery/validation.js';
 import {digest, fail} from './validation.js';
 import {lockAgent} from './repository.js';
-import {WECHAT_MOBILE_WORKFLOW} from './mobile-tasks.js';
+import {mobileWorkflowFor} from './mobile-tasks.js';
+import {ARTICLE_EVENT_KIND, ARTICLE_PLATFORM, normalizeArticleEvent, articleSyncBody} from './articles.js';
 
 // WeChat Channels posts captured completely on the phone (docs/hotfix/20261105-wechat-channels-mobile.md).
 // The phone uploads at most five posts per batch; each event gets one durable receipt. The work identity, the
@@ -29,6 +30,7 @@ function count(value) {
 }
 
 export function normalizePostEvent(input, principal) {
+  if (input?.eventKind === ARTICLE_EVENT_KIND) return normalizeArticleEvent(input, principal);
   if (!input || typeof input !== 'object' || Array.isArray(input) || input.eventKind !== 'wechat_post') fail('INVALID_POST_EVENT', 422);
   const event = {};
   for (const key of ['eventId', 'discoveryRunId', 'taskId', 'itemId', 'attemptId', 'agentId']) event[key] = requireUuid(input[key], key);
@@ -47,7 +49,7 @@ export function normalizePostEvent(input, principal) {
     || typeof preview.description !== 'string') fail('INVALID_PREVIEW', 422);
   const items = Array.isArray(input.comments?.items) ? input.comments.items.slice(0, 500) : [];
   return {
-    ...event, capturedAt, mode: input.mode === 'patrol' ? 'patrol' : 'keyword',
+    ...event, platform: 'wechat_channels', capturedAt, mode: input.mode === 'patrol' ? 'patrol' : 'keyword',
     rank: Number.isSafeInteger(input.rank) && input.rank > 0 && input.rank < 100_000 ? input.rank : null,
     shareUrl,
     card: {snippet: str(input.card?.snippet, 400), author: str(input.card?.author, 120), timeLabel: str(input.card?.timeLabel, 40)},
@@ -161,13 +163,13 @@ export function reuseKnownCommentIds(items, known) {
 }
 
 /** Comments already known for a Channels post: stored rows and the last capture's list (its rows may still be queued). */
-export async function knownWechatComments(tx, tenantId, externalId) {
+export async function knownWechatComments(tx, tenantId, externalId, platform = 'wechat_channels') {
   const rows = await tx.queryAll(`SELECT c.external_comment_id AS "commentId", c.author_name AS "authorName", c.content
     FROM record_comments c JOIN records r ON r.id = c.record_id AND r.tenant_id = c.tenant_id
-    WHERE r.tenant_id = $1 AND r.platform = 'wechat_channels' AND r.external_id = $2 AND c.external_comment_id LIKE 'wxcc_%'
-    ORDER BY c.floor_index, c.created_at LIMIT 2000`, [tenantId, externalId]);
+    WHERE r.tenant_id = $1 AND r.platform = $3 AND r.external_id = $2 AND c.external_comment_id LIKE 'wxcc_%'
+    ORDER BY c.floor_index, c.created_at LIMIT 2000`, [tenantId, externalId, platform]);
   const latest = await tx.queryOne(`SELECT payload->'commentsCleanedItems' AS items FROM records
-    WHERE tenant_id = $1 AND platform = 'wechat_channels' AND external_id = $2`, [tenantId, externalId]);
+    WHERE tenant_id = $1 AND platform = $3 AND external_id = $2`, [tenantId, externalId, platform]);
   const seen = new Set(rows.map(row => row.commentId));
   for (const item of Array.isArray(latest?.items) ? latest.items : []) {
     if (typeof item?.commentId === 'string' && item.commentId.startsWith('wxcc_') && !seen.has(item.commentId)) {
@@ -180,6 +182,7 @@ export async function knownWechatComments(tx, tenantId, externalId) {
 
 /** The /api/sync body the browser would send for this post: detail values, the server's keyword and lineage. */
 export function wechatSyncBody(event, {keyword, taskId, attemptId, requestHash}) {
+  if (event.platform === ARTICLE_PLATFORM) return articleSyncBody(event, {keyword, taskId, attemptId, requestHash}, wechatComments);
   const externalId = wechatExternalId(event.preview.createtime, event.preview.nickname);
   const {preview} = event;
   const firstLine = preview.description.split(/\r?\n/u).find(line => line.trim())?.trim() ?? '';
@@ -213,7 +216,7 @@ export async function postLineage(tx, principal, event) {
     if (previous.payload_hash !== event.payloadHash) fail('EVENT_PAYLOAD_CONFLICT', 409);
     return {previous};
   }
-  const lineage = await tx.queryOne(`SELECT attempt.started_at, attempt.finished_at, item.keyword, task.metadata->>'workflow' AS workflow,
+  const lineage = await tx.queryOne(`SELECT attempt.started_at, attempt.finished_at, item.keyword, task.metadata->>'workflow' AS workflow, task.platform AS task_platform, item.platform AS item_platform,
       (item.metadata->>'attemptId' = attempt.id::text AND item.assignment_revision = attempt.assignment_revision
         AND item.execution_task_id = attempt.execution_task_id AND item.assigned_agent_id = attempt.agent_id) AS current
     FROM capture_task_item_attempts attempt
@@ -222,7 +225,7 @@ export async function postLineage(tx, principal, event) {
     WHERE attempt.id=$1 AND attempt.tenant_id=$2 AND attempt.item_id=$3 AND attempt.agent_id=$4 AND attempt.execution_task_id=$5
       AND attempt.assignment_revision=$6 AND attempt.request_hash=$7`,
   [event.attemptId, principal.tenantId, event.itemId, principal.agentId, event.taskId, event.assignmentRevision, event.requestHash]);
-  if (!lineage || lineage.workflow !== WECHAT_MOBILE_WORKFLOW) throw new DiscoveryError('ATTEMPT_LINEAGE_MISMATCH', 403);
+  if (!lineage || lineage.workflow !== mobileWorkflowFor(event.platform) || lineage.task_platform !== event.platform || lineage.item_platform !== event.platform) throw new DiscoveryError('ATTEMPT_LINEAGE_MISMATCH', 403);
   const started = Date.parse(lineage.started_at), finished = lineage.finished_at ? Date.parse(lineage.finished_at) : null;
   const inWindow = event.capturedAt >= started - SKEW_MS && (finished === null || event.capturedAt <= finished + SKEW_MS);
   return {lineage: {...lineage, inWindow}};
@@ -230,11 +233,11 @@ export async function postLineage(tx, principal, event) {
 
 export async function saveReceipt(tx, principal, uploadBatchId, event, {status, reason = '', externalId = '', recordId = null, observationId = null}) {
   const row = await tx.queryOne(`INSERT INTO capture_mobile_post_receipts(tenant_id, agent_id, task_id, item_id, attempt_id, event_key,
-      upload_batch_id, payload_hash, external_id, status, reason, record_id, observation_id)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      upload_batch_id, payload_hash, external_id, status, reason, record_id, observation_id, platform)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     ON CONFLICT (tenant_id, agent_id, event_key) DO NOTHING RETURNING *`,
   [principal.tenantId, principal.agentId, event.taskId, event.itemId, event.attemptId, event.eventId, uploadBatchId, event.payloadHash,
-    externalId, status, String(reason).slice(0, 120), recordId, observationId]);
+    externalId, status, String(reason).slice(0, 120), recordId, observationId, event.platform]);
   return row ?? tx.queryOne('SELECT * FROM capture_mobile_post_receipts WHERE tenant_id=$1 AND agent_id=$2 AND event_key=$3',
     [principal.tenantId, principal.agentId, event.eventId]);
 }

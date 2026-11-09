@@ -9,7 +9,7 @@ import {sameCard} from '../device/wechat-ocr-parse.mjs';
 import {runWechatPatrol} from './wechat-patrol.mjs';
 import {runWechatForward} from './wechat-forward.mjs';
 
-const DEFAULT_CLOCK = {wallNow: () => Date.now(), monotonicNow: () => performance.now()};
+export const DEFAULT_CLOCK = {wallNow: () => Date.now(), monotonicNow: () => performance.now()};
 const METHODS = ['inspect', 'search', 'readCards', 'openCard', 'copyLink', 'readComments', 'returnToResults', 'recoverResults', 'scroll'];
 // One post that fails in a known, settled way is skipped once the results page is proven again.
 const RECOVERABLE = new Set(['card_open_failed', 'share_sheet_unverified', 'link_not_copied', 'comments_unverified', 'screen_unverified']);
@@ -19,25 +19,29 @@ export const POST_PAUSE_MS = [3000, 6000];
 const PREVIEW_RETRIES = [0, 1000, 3000];
 const EARLY_PREVIEW_WAIT_MS = 2500;
 
-function outcome(error) {
+export function outcome(error) {
   if (error.code === 'budget_exhausted') return {status: 'completed_with_warnings', reason: error.details.reason};
   if (['user_stop', 'operator_takeover', 'remote_stop'].includes(error.code)) return {status: 'canceled', reason: error.code};
   if (['lease_expired', 'usb_disconnected'].includes(error.code)) return {status: 'interrupted', reason: error.code};
   return {status: 'needs_action', reason: error.code ?? 'device_failure'};
 }
 
-function validateTask(task, permit, device) {
+export function validateWechatIdentity(task, permit) {
   requireEvidence(task?.identity && typeof task.keyword === 'string' && task.keyword.trim(), 'invalid_task');
-  requireEvidence(task.platform === 'wechat_channels' && task.filters && typeof task.filters === 'object', 'invalid_task');
   for (const field of ['taskId', 'itemId', 'attemptId', 'requestHash', 'agentId', 'discoveryRunId']) {
     requireEvidence(typeof task.identity[field] === 'string' && task.identity[field], 'invalid_task_identity');
     requireEvidence(permit.identity[field] === task.identity[field], 'permit_identity_mismatch');
   }
   requireEvidence(task.identity.discoveryRunId === task.identity.taskId, 'invalid_discovery_run');
+}
+
+function validateTask(task, permit, device) {
+  validateWechatIdentity(task, permit);
+  requireEvidence(task.platform === 'wechat_channels' && task.filters && typeof task.filters === 'object', 'invalid_task');
   for (const method of METHODS) requireEvidence(typeof device[method] === 'function', 'invalid_device_adapter');
 }
 
-const sleep = (ms, signal) => new Promise(resolve => {
+export const sleep = (ms, signal) => new Promise(resolve => {
   if (signal?.aborted) { resolve(); return; }
   const timer = setTimeout(done, ms);
   function done() { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); }
@@ -183,7 +187,7 @@ export async function runWechatTask({task, store, device, permit, preview, clock
 
 // The relevance prefilter on card text (snippet + author), the same switch and skip rule as on Douyin; any
 // failure opens the cards. Returns decide(cards) → Set of card keys to leave unopened.
-function cardPrefilter(prefilter, task, permit, clock, ledger) {
+export function cardPrefilter(prefilter, task, permit, clock, ledger) {
   let filter = null;
   try { filter = typeof prefilter === 'function' ? prefilter({task, signal: permit.signal, now: clock.monotonicNow}) : null; } catch { filter = null; }
   if (filter?.enabled !== true) return async () => new Set();

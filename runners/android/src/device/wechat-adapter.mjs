@@ -10,10 +10,16 @@ import {ocrHelperAvailable} from './ocr-pool.mjs';
 // The WeChat Channels device adapter. It opens no automation session: adb screenshots, taps and keys, local OCR,
 // and the Appium settings app for the Unicode keyboard and the clipboard. `ime` remembers the owner's keyboard
 // ({load, save}) so an interrupted keyword entry is repaired by the next probe.
-export function createWechatAdapter({serial, adb, adbPath = 'adb', ocr, ocrBinary, ime = {load: () => null, save: () => {}},
-  screen = createAdbScreen({adbPath, serial}), now = Date.now}) {
+const CHANNEL_METHODS = ['search', 'readCards', 'openCard', 'openPost', 'forwardPost', 'copyLink', 'readComments', 'returnToResults', 'recoverResults', 'scroll'];
+
+export function createWechatAdapter(options) { return createWechatDeviceAdapter(options); }
+
+/** Shared WeChat device lifecycle; platform-specific UI flows supply only their operations. */
+export function createWechatDeviceAdapter({serial, adb, adbPath = 'adb', ocr, ocrBinary, ime = {load: () => null, save: () => {}},
+  screen = createAdbScreen({adbPath, serial}), now = Date.now}, {flowFactory = createWechatFlow, flowMethods = CHANNEL_METHODS,
+  platform = WECHAT_PROFILE.platform, profileId = WECHAT_PROFILE.id} = {}) {
   const view = createWechatScreen({adb, screen, ocr, serial});
-  const flow = createWechatFlow({screen, view, rememberIme: value => ime.save(value), restoreIme: ime.load(), now});
+  const flow = flowFactory({screen, view, rememberIme: value => ime.save(value), restoreIme: ime.load(), now});
   const pending = new Set();
   const check = async options => {
     const device = selectDevice(await adb.listDevices(options), serial);
@@ -36,8 +42,8 @@ export function createWechatAdapter({serial, adb, adbPath = 'adb', ocr, ocrBinar
     return true;
   };
   const adapter = {
-    platform: WECHAT_PROFILE.platform,
-    profileId: WECHAT_PROFILE.id,
+    platform,
+    profileId,
     async probe({signal} = {}) {
       try {
         const options = {signal};
@@ -57,16 +63,6 @@ export function createWechatAdapter({serial, adb, adbPath = 'adb', ocr, ocrBinar
       flow.reset();
       return {...info, deviceId: serial, connected: true, unlocked: true, loggedIn: true, challenge: false, readyForSearch: true};
     },
-    search: params => flow.search(params),
-    readCards: params => flow.readCards(params),
-    openCard: params => flow.openCard(params),
-    openPost: params => flow.openPost(params),
-    forwardPost: params => flow.forwardPost(params),
-    copyLink: params => flow.copyLink(params),
-    readComments: params => flow.readComments(params),
-    returnToResults: params => flow.returnToResults(params),
-    recoverResults: params => flow.recoverResults(params),
-    scroll: params => flow.scroll(params),
     async parkHome({permit, timeoutMs = 15000}) {
       permit.assertAllowed();
       return bounded(signal => flow.parkHome({signal}), {signal: permit.signal, timeoutMs});
@@ -79,7 +75,8 @@ export function createWechatAdapter({serial, adb, adbPath = 'adb', ocr, ocrBinar
       return {closed: true, verifiedAt: new Date(now()).toISOString(), evidenceId: randomUUID()};
     },
   };
-  for (const name of ['inspect', 'search', 'readCards', 'openCard', 'openPost', 'forwardPost', 'copyLink', 'readComments', 'returnToResults', 'recoverResults', 'scroll']) {
+  for (const name of flowMethods) adapter[name] = params => flow[name](params);
+  for (const name of ['inspect', ...flowMethods]) {
     const method = adapter[name];
     adapter[name] = params => {
       throwIfAborted(params?.signal);

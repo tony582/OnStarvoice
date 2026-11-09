@@ -1,5 +1,6 @@
 import {runDiscoveryTask} from '../core/discovery-runner.mjs';
 import {runWechatTask} from '../core/wechat-runner.mjs';
+import {runWechatArticleTask} from '../core/wechat-article-runner.mjs';
 import {createCardPrefilter} from '../core/card-prefilter.mjs';
 import {settleDevice} from './settle-device.mjs';
 import {PLATFORMS} from './multi-device.mjs';
@@ -18,6 +19,7 @@ export async function runClaimedTask({task, device, store, permit, clock, contro
   }
   const result = platform === PLATFORMS.wechat
     ? await runWechatTask({...common, device: adapter, preview: device.preview})
-    : await runDiscoveryTask({...common, device: adapter});
+    : platform === PLATFORMS.articles ? await runWechatArticleTask({...common, device: adapter, preview: device.preview})
+      : await runDiscoveryTask({...common, device: adapter});
   return settleDevice({device: adapter, store, task, result, clock, permit});
 }

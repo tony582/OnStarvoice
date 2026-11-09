@@ -4,7 +4,7 @@ import {
   Loader2, MessageCircle, Radar, RefreshCw, Share2, Target, UserRound,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { compact, formatDate, formatFullDate, formatNumber, LABELS, platformName } from '@/lib/utils'
+import { compact, formatDate, formatFullDate, formatNumber, formatRecordMetric, LABELS, platformName } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
@@ -24,6 +24,7 @@ const PLATFORM_OPTIONS = [
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
   { value: 'wechat_channels', label: '视频号' },
+  { value: 'wechat_articles', label: '微信文章' },
 ]
 
 function interaction(row: any) {
@@ -278,7 +279,7 @@ export function MonitorHitsTab({ initial }: { initial?: Record<string, string> }
                     <td className="px-4 py-3 tabular-nums">
                       <div className="font-semibold">{formatNumber(interaction(hit))}</div>
                       <div className="mt-1 text-xs text-muted-foreground">
-                        赞 {formatNumber(hit.likes)} / 评 {formatNumber(hit.comments_count)} / 藏 {formatNumber(hit.collects)}
+                        赞 {formatRecordMetric(hit, 'likes')} / 评 {formatRecordMetric(hit, 'comments_count')} / 藏 {formatRecordMetric(hit, 'collects')}
                       </div>
                     </td>
                     <td className="px-4 py-3">

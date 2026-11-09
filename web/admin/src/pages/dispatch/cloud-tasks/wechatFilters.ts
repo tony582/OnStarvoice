@@ -1,5 +1,6 @@
-// 视频号搜索结果「视频」页自己的筛选（微信 8.0.80，2026-11-09 真机核对）：排序 不限 / 最新 / 最热，
-// 「时长」「范围」两个底部弹层。发布时间不是 App 的筛选：手机固定按「最新」排序，读卡片右下角时间，超出范围就结束该词。
+// 微信视频号、文章共用排序 不限 / 最新 / 最热和发布时间范围。
+// 视频号额外提供「时长」「范围」；文章未验证的范围选项不开放。
+// 发布时间由手机按「最新」读取内容后筛选，不是 App 原生筛选。
 // 取值沿用服务端 searchFilters 的键：sort、publishTime、videoDuration、searchScope。
 
 export type WechatOption = { value: string; label: string }
@@ -45,13 +46,15 @@ export function wechatEffectiveSort(sort: unknown, publishTime: unknown) {
   return WECHAT_SORT_OPTIONS.some(option => option.value === sort) ? String(sort) : 'comprehensive'
 }
 
-/** 计划详情里的一行筛选：排序 · 发布时间 · 时长 · 范围，用 App 里的叫法。 */
-export function wechatFilterSummary(searchFilters: Record<string, unknown> | null | undefined) {
+/** 两种微信内容共用计划摘要；文章不显示时长或尚未验证的范围。 */
+export function wechatFilterSummary(searchFilters: Record<string, unknown> | null | undefined, platform: 'wechat_channels' | 'wechat_articles' = 'wechat_channels') {
   const filters = searchFilters || {}
   return [
     label(WECHAT_SORT_OPTIONS, wechatEffectiveSort(filters.sort, filters.publishTime)),
     label(WECHAT_PUBLISH_TIME_OPTIONS, filters.publishTime),
-    `时长${label(WECHAT_DURATION_OPTIONS, filters.videoDuration)}`,
-    label(WECHAT_SCOPE_OPTIONS, filters.searchScope),
+    ...(platform === 'wechat_articles' ? ['文章及图文'] : [
+      `时长${label(WECHAT_DURATION_OPTIONS, filters.videoDuration)}`,
+      label(WECHAT_SCOPE_OPTIONS, filters.searchScope),
+    ]),
   ].join(' · ')
 }

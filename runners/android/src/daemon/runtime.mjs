@@ -16,7 +16,8 @@ import {assertSimulationOrigin, fixedLockRoot, readConfig, setCheckpoint, stateV
 const clock = {wallNow: Date.now, monotonicNow: () => performance.now()};
 // What this Runner can do beyond the platforms list; the server only hands it work that needs these when they are named.
 // wechat_search_filters (0.4.5): the 视频号 App's own 时长 / 范围 choices; wechat_forward (0.4.6): 「发到微信」.
-export const RUNNER_FEATURES = Object.freeze(['wechat_search_filters', 'wechat_forward']);
+// wechat_articles (0.5.0): 搜一搜 → 文章, including body text when comments are unavailable.
+export const RUNNER_FEATURES = Object.freeze(['wechat_search_filters', 'wechat_forward', 'wechat_articles']);
 // Results with these reasons mean the phone itself is not ready; the runner stops advertising readiness at once.
 const DEVICE_READINESS_REASONS = new Set(['douyin_not_foreground', 'device_locked', 'device_asleep', 'login_required',
   'login_or_challenge_required', 'login_state_unverified', 'challenge_or_unknown', 'profile_version_mismatch', 'system_overlay_blocked']);

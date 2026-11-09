@@ -13,7 +13,7 @@ type ReportResponse = { report: MonthlyReport; html: string; text: string }
 type Notice = { kind: 'success' | 'error'; text: string }
 const fields = ['monitor', 'sdb', 'positive', 'neutral', 'cold', 'comment', 'negativeProcess', 'negativeOther'] as const
 const fieldLabels: Record<typeof fields[number], string> = { monitor: '平台监控量', sdb: 'SDB范畴', positive: '正面', neutral: '中性', cold: '冷处理', comment: '评论区留言', negativeProcess: '走负面处理流程', negativeOther: '其他' }
-const platforms: Record<string, string> = { xiaohongshu: '小红书', xhs: '小红书', douyin: '抖音', weibo: '微博', bilibili: '哔哩哔哩', wechat: '微信', zhihu: '知乎', kuaishou: '快手', toutiao: '今日头条' }
+const platforms: Record<string, string> = { xiaohongshu: '小红书', xhs: '小红书', douyin: '抖音', weibo: '微博', bilibili: '哔哩哔哩', wechat: '微信', wechat_channels: '视频号', wechat_articles: '微信文章', zhihu: '知乎', kuaishou: '快手', toutiao: '今日头条' }
 const basisText = '按帖子发布时间（北京时间）统计内容分诊中未归档的主帖，同帖只计一次；SDB 扣除已复核-非监控内容；情感、处理状态和内容主题取本版生成时的有效结论。'
 
 export function CustomerMonthlyReport() {

@@ -9,7 +9,7 @@ import {
 
 const PANEL_MIN = 480, PANEL_MAX = 900, PANEL_DEFAULT = 620
 import { api } from '@/lib/api'
-import { formatNumber, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel, friendlyError, proxiedImg } from '@/lib/utils'
+import { formatNumber, formatRecordMetric, formatDate, formatFullDateSec, LABELS, platformName, cn, identityLabel, friendlyError, proxiedImg } from '@/lib/utils'
 import { captureKeywordPresentation, publishTimePresentation } from '@/lib/publish-time.mjs'
 import { Button } from '@/components/ui/button'
 import { StatusBadge, StatusDot, StatusPill } from '@/components/ui/badge'
@@ -33,6 +33,7 @@ import { isRecordDetailDegraded, recordDisplayTitle } from '@/lib/record-display
 import { PostJudgmentDetails } from '@/components/shared/PostJudgment'
 import { postJudgment } from '@/lib/post-judgment'
 import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
+import { wechatArticlePresentation } from '@/lib/wechat-article.mjs'
 
 /**
  * 内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
@@ -376,11 +377,12 @@ function RecordDrawerContent({
   const negComments = Number(r.negative_comment_count || 0)
   const deleted = String(r.content_availability_status || '') === 'deleted'
   const hasSignals = alerts > 0 || negComments > 0 || deleted
+  const article = r.platform === 'wechat_articles' ? wechatArticlePresentation(r, comments.length) : null
   const triageStatus = r.triage_status || 'unhandled'
 
   const TABS = [
     { id: 'content' as const, label: '内容', icon: FileText },
-    { id: 'comments' as const, label: `评论 (${comments.length})`, icon: MessageCircle },
+    { id: 'comments' as const, label: article?.commentTab || `评论 (${comments.length})`, icon: MessageCircle },
     { id: 'official' as const, label: `官方回复 (${officialResponses.length})`, icon: CheckCircle },
     { id: 'snapshot' as const, label: '采集', icon: Camera },
     ...(r.sentiment === 'negative'
@@ -486,12 +488,21 @@ function RecordDrawerContent({
                   {r.blogger_profile_url && <><MetaDot /><a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-medium text-primary hover:underline"><User className="h-3.5 w-3.5" />主页</a></>}
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-x-3.5 gap-y-1 text-[12px] tabular-nums text-muted-foreground" aria-label="互动数据">
+                  {article ? <>
+                    <span className="inline-flex items-center gap-1"><Eye className="h-3.5 w-3.5" />阅读 {formatRecordMetric(r, 'reads')}</span>
+                    <span className="inline-flex items-center gap-1"><Heart className="h-3.5 w-3.5" />点赞 {formatRecordMetric(r, 'likes')}</span>
+                    <span className="inline-flex items-center gap-1"><Share2 className="h-3.5 w-3.5" />分享 {formatRecordMetric(r, 'shares')}</span>
+                    <span className="inline-flex items-center gap-1"><Star className="h-3.5 w-3.5" />推荐 {formatRecordMetric(r, 'collects')}</span>
+                    <span className="inline-flex items-center gap-1"><MessageCircle className="h-3.5 w-3.5" />留言 {formatRecordMetric(r, 'comments_count')}</span>
+                  </> : <>
                   {/* 视频号的点赞列是 App 里的「喜欢」（大拇指），收藏列是「推荐」（心形）。 */}
-                  <span title={r.platform === 'wechat_channels' ? '喜欢' : '点赞'} className="inline-flex items-center gap-1"><Heart className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.likes)}</span>
-                  <span title="评论" className="inline-flex items-center gap-1"><MessageCircle className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.comments_count)}</span>
-                  <span title={r.platform === 'wechat_channels' ? '推荐' : '收藏'} className="inline-flex items-center gap-1"><Star className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.collects)}</span>
-                  <span title="转发" className="inline-flex items-center gap-1"><Share2 className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.shares)}</span>
+                  <span title={r.platform === 'wechat_channels' ? '喜欢' : '点赞'} className="inline-flex items-center gap-1"><Heart className="h-3.5 w-3.5" strokeWidth={2} />{formatRecordMetric(r, 'likes')}</span>
+                  <span title="评论" className="inline-flex items-center gap-1"><MessageCircle className="h-3.5 w-3.5" strokeWidth={2} />{formatRecordMetric(r, 'comments_count')}</span>
+                  <span title={r.platform === 'wechat_channels' || r.platform === 'wechat_articles' ? '推荐' : '收藏'} className="inline-flex items-center gap-1"><Star className="h-3.5 w-3.5" strokeWidth={2} />{formatRecordMetric(r, 'collects')}</span>
+                  <span title="转发" className="inline-flex items-center gap-1"><Share2 className="h-3.5 w-3.5" strokeWidth={2} />{formatRecordMetric(r, 'shares')}</span>
+                  </>}
                 </div>
+                {article?.metricNotice && <p className="mt-1 text-[11px] text-muted-foreground">{article.metricNotice}</p>}
                 {r.platform === 'wechat_channels' && r.id && <WechatForwardAction recordId={String(r.id)} canWrite={canProcess} />}
               </div>
             </div>
@@ -620,8 +631,10 @@ function RecordDrawerContent({
                 )}
 
                 {tab === 'comments' && (
-                  comments.length === 0 ? (
-                    <EmptyState icon={MessageCircle} title="暂无评论数据" description="需要在插件采集时开启评论采集" />
+                  <div className="space-y-3">
+                  {article && comments.length > 0 && <div className="rounded-lg border border-border bg-muted/30 p-3 text-xs leading-5"><p className="font-medium">{article.commentTitle}</p><p className="text-muted-foreground">{article.commentDescription}</p>{article.postingNote && <p className="text-muted-foreground">{article.postingNote}</p>}</div>}
+                  {comments.length === 0 ? (
+                    <EmptyState icon={MessageCircle} title={article?.commentTitle || "暂无评论数据"} description={article ? [article.commentDescription, article.postingNote].filter(Boolean).join(" ") : "需要在采集任务中开启评论采集"} />
                   ) : (
                     <div className="space-y-3">
                       {comments.map((c: any, i: number) => (
@@ -642,12 +655,13 @@ function RecordDrawerContent({
                             </div>
                           )}
                           <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
-                            <span>{formatNumber(c.like_count)} 赞{c.ip_location ? ` · IP ${c.ip_location}` : ''}</span>
+                            <span>{article && c.like_count == null ? '—' : formatNumber(c.like_count)} 赞{c.ip_location ? ` · IP ${c.ip_location}` : ''}</span>
                           </div>
                         </div>
                       ))}
                     </div>
-                  )
+                  )}
+                  </div>
                 )}
 
                 {tab === 'official' && (
@@ -696,10 +710,10 @@ function RecordDrawerContent({
                         {observations.slice(0, 10).map((o: any, i: number) => (
                           <div key={i} className="flex items-center justify-between rounded-lg bg-muted/50 p-3">
                             <div className="flex items-center gap-3 text-sm tabular-nums">
-                              <span className="flex items-center gap-1"><Heart className="h-3 w-3 text-muted-foreground" />{formatNumber(o.likes)}</span>
-                              <span className="flex items-center gap-1"><MessageCircle className="h-3 w-3 text-muted-foreground" />{formatNumber(o.comments_count)}</span>
-                              <span className="flex items-center gap-1"><Star className="h-3 w-3 text-muted-foreground" />{formatNumber(o.collects)}</span>
-                              <span className="flex items-center gap-1"><Share2 className="h-3 w-3 text-muted-foreground" />{formatNumber(o.shares)}</span>
+                              <span className="flex items-center gap-1"><Heart className="h-3 w-3 text-muted-foreground" />{formatRecordMetric({ ...o, platform: r.platform }, 'likes')}</span>
+                              <span className="flex items-center gap-1"><MessageCircle className="h-3 w-3 text-muted-foreground" />{formatRecordMetric({ ...o, platform: r.platform }, 'comments_count')}</span>
+                              <span className="flex items-center gap-1"><Star className="h-3 w-3 text-muted-foreground" />{formatRecordMetric({ ...o, platform: r.platform }, 'collects')}</span>
+                              <span className="flex items-center gap-1"><Share2 className="h-3 w-3 text-muted-foreground" />{formatRecordMetric({ ...o, platform: r.platform }, 'shares')}</span>
                             </div>
                             <span className="text-xs text-muted-foreground">{formatFullDateSec(o.captured_at)}</span>
                           </div>
@@ -1428,6 +1442,7 @@ type RecordContentTabProps = {
  */
 function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, images, imageRefs, imageKey, onOpenImage }: RecordContentTabProps) {
   const video = hasVideo(r)
+  const article = r.platform === 'wechat_articles' ? wechatArticlePresentation(r) : null
   const transcript = useRecordTranscript(r, video)
   const gallery = (
     <RecordImageGallery
@@ -1448,7 +1463,8 @@ function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, imag
         {!video && gallery}
         <div>
           <h4 className={cn(CONTENT_SECTION_TITLE, 'mb-2')}>正文</h4>
-          <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || '无正文'}</p>
+          {article && <div className="mb-3 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs leading-5"><p className="font-medium">{article.bodyLabel}</p><p className="text-muted-foreground">{article.bodyDescription}</p></div>}
+          <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || (article ? '本次未取得正文' : '无正文')}</p>
         </div>
         {video && <TranscriptTextSection transcript={transcript} canWrite={canProcess} />}
         {/* 视频帖的图通常只有封面：放在正文和逐字稿后面，主要用来提取封面上的文字 */}

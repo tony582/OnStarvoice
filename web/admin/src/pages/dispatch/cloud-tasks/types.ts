@@ -1,6 +1,6 @@
 import type { AgentStopFence } from './stop-fence-presentation.mjs'
 
-export type OrchestrationPlatform = 'xiaohongshu' | 'douyin' | 'wechat_channels'
+export type OrchestrationPlatform = 'xiaohongshu' | 'douyin' | 'wechat_channels' | 'wechat_articles'
 export type OrchestrationExecutionMode = 'one_time' | 'unattended_plan'
 
 export type OrchestrationLaunchIntent = {

@@ -147,26 +147,29 @@ function agentFailure(agent, platform, planSnapshot) {
       return {code: 'scheduled_agent_mobile_unsupported', message: '手机节点版本不支持关键词搜索发现'};
     }
     if (!MOBILE_PLATFORMS.includes(platform)) {
-      return {code: 'scheduled_agent_mobile_platform', message: '手机节点仅支持抖音和视频号关键词搜索'};
+      return {code: 'scheduled_agent_mobile_platform', message: '手机节点仅支持抖音、视频号和微信文章关键词搜索'};
     }
     if (mobilePlanBlockReason(planSnapshot, platform)) {
-      return {code: 'scheduled_agent_mobile_plan_unsupported', message: platform === 'wechat_channels'
-        ? '视频号手机采集不支持串行补充'
+      return {code: 'scheduled_agent_mobile_plan_unsupported', message: ['wechat_channels', 'wechat_articles'].includes(platform)
+        ? '微信手机采集不支持该筛选组合或串行补充'
         : '手机节点仅支持单段抖音关键词搜索，不支持串行补充、负面巡查或近一月'};
     }
     const mobileAllowed = Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [];
     if (mobileAllowed.length > 0 && !mobileAllowed.includes(platform)) {
       return {code: 'scheduled_agent_platform_mismatch', message: '执行节点未配置负责当前平台'};
     }
+    if (platform === 'wechat_articles' && !capabilities.runnerFeatures?.includes('wechat_articles')) {
+      return {code: 'scheduled_agent_platform_unsupported', message: '这台手机还没有启用微信文章，请更新手机采集器'};
+    }
     const mobileSupported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
-    if (platform === 'wechat_channels' ? !mobileSupported.includes(platform)
+    if (['wechat_channels', 'wechat_articles'].includes(platform) ? !mobileSupported.includes(platform)
       : mobileSupported.length > 0 && !mobileSupported.includes(platform)) {
       return {code: 'scheduled_agent_platform_unsupported', message: '执行节点版本不支持当前平台'};
     }
     return null;
   }
-  if (platform === 'wechat_channels') {
-    return {code: 'scheduled_agent_platform_unsupported', message: '视频号只能由手机节点采集'};
+  if (['wechat_channels', 'wechat_articles'].includes(platform)) {
+    return {code: 'scheduled_agent_platform_unsupported', message: '微信内容只能由手机节点采集'};
   }
   if (capabilities.remoteTaskCreate !== true) {
     return {code: 'scheduled_agent_version_unsupported', message: '执行节点版本不支持云端任务'};
@@ -216,7 +219,7 @@ async function materializeMobileFixedBatchChild(tx, {
     agentKind: 'android_mobile',
     deviceId: object(agent.capabilities).deviceId,
     filters: mobileTaskFilters(planSnapshot.searchFilters, schedule.platform),
-    ...(schedule.platform === 'wechat_channels' ? {comments: mobileCommentPlan(planSnapshot)} : {}),
+    ...(['wechat_channels', 'wechat_articles'].includes(schedule.platform) ? {comments: mobileCommentPlan(planSnapshot)} : {}),
     budgets: mobileTaskBudgets(planSnapshot, keywords.length),
     keywords,
     deadlineAt: null,
@@ -250,7 +253,7 @@ async function materializeMobileFixedBatchChild(tx, {
     JSON.stringify({total: keywords.length, processed: 0, success: 0, failed: 0, skipped: 0}),
     JSON.stringify(childMetadata),
     schedule.id, scheduledFor.toISOString(), Number(schedule.revision),
-    schedule.platform === 'wechat_channels' ? 'wechat_channels' : 'douyin',
+    schedule.platform,
   ]);
   for (const item of groupItems) {
     await tx.execute(`

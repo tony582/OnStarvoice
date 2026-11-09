@@ -125,5 +125,5 @@ test('the poll names the optional Runner features, so the server can hold back w
   t.after(async () => { daemon.requestStop(); await running; store.close(); });
   await until(() => polls(f).length > 0);
   daemon.requestStop(); await running;
-  assert.deepEqual(polls(f)[0].body.features, ['wechat_search_filters', 'wechat_forward']);
+  assert.deepEqual(polls(f)[0].body.features, ['wechat_search_filters', 'wechat_forward', 'wechat_articles']);
 });

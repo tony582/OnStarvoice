@@ -63,7 +63,7 @@ export async function deliverPendingBatch({store, client, retryState = {},
   const accepted = () => ({failures: 0, nextAttemptAt: 0, ...kept, ...oneSingleDone});
   const batch = store.nextBatch({limit: singles > 0 ? 1 : 5});
   if (!batch) return {status: 'idle', retryState: rested()};
-  const posts = batch.events[0]?.eventKind === 'wechat_post';
+  const posts = ['wechat_post', 'wechat_article'].includes(batch.events[0]?.eventKind);
   const ingest = (body, options) => posts ? client.ingestPosts(body, options) : client.ingest(body, options);
   const receiptsOf = (id, options) => posts ? client.getPostReceipts(id, options) : client.getReceipts(id, options);
   const stopped = error => signal?.aborted || error.code === 'cloud_aborted';

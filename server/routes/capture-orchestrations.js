@@ -68,7 +68,7 @@ const router = Router();
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 // wechat_channels (视频号) is phone-only: agentCompatibilityFailure refuses browser nodes for it.
-const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin', 'wechat_channels']);
+const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'douyin', 'wechat_channels', 'wechat_articles']);
 const HANDOFF_SOURCE_FINAL_STATUSES = new Set([
   'completed',
   'completed_with_warnings',
@@ -308,7 +308,7 @@ function normalizeCreateRequest(body) {
     if (!SUPPORTED_PLATFORMS.has(remoteTaskInput.planSnapshot.platform)) {
       return {failure: requestError(
         'unsupported_platform',
-        '编排任务当前只支持小红书、抖音和视频号',
+        '编排任务当前只支持小红书、抖音、视频号和微信文章',
       )};
     }
     if (remoteTaskInput.planSnapshot.keywords.length === 0) {
@@ -524,19 +524,22 @@ function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
       return {code: 'agent_mobile_capability_missing', message: '手机节点版本尚不支持关键词搜索发现，请更新手机采集器'};
     }
     if (!MOBILE_PLATFORMS.includes(platform)) {
-      return {code: 'agent_mobile_platform_mismatch', message: '手机节点仅支持抖音和视频号关键词搜索'};
+      return {code: 'agent_mobile_platform_mismatch', message: '手机节点仅支持抖音、视频号和微信文章关键词搜索'};
     }
     if (mobilePlanBlockReason(planSnapshot, platform)) {
-      return {code: 'agent_mobile_plan_unsupported', message: platform === 'wechat_channels'
-        ? '视频号手机采集不支持串行补充'
+      return {code: 'agent_mobile_plan_unsupported', message: ['wechat_channels', 'wechat_articles'].includes(platform)
+        ? '微信手机采集不支持该筛选组合或串行补充'
         : '手机节点仅支持单段抖音关键词搜索，不支持串行补充、负面巡查或近一月'};
     }
     const mobileAllowed = Array.isArray(agent.allowed_platforms) ? agent.allowed_platforms : [];
     if (mobileAllowed.length > 0 && !mobileAllowed.includes(platform)) {
       return {code: 'agent_platform_mismatch', message: '目标节点未配置负责该任务平台'};
     }
+    if (platform === 'wechat_articles' && !capabilities.runnerFeatures?.includes('wechat_articles')) {
+      return {code: 'agent_platform_unsupported', message: '这台手机还没有启用微信文章，请更新手机采集器'};
+    }
     const mobileSupported = normalizeCaptureAgentPlatforms(capabilities.supportedPlatforms);
-    if (platform === 'wechat_channels' ? !mobileSupported.includes(platform)
+    if (['wechat_channels', 'wechat_articles'].includes(platform) ? !mobileSupported.includes(platform)
       : mobileSupported.length > 0 && !mobileSupported.includes(platform)) {
       return {code: 'agent_platform_unsupported', message: platform === 'wechat_channels'
         ? '这台手机还没有启用视频号（需手机采集器 0.4.0 并执行 enable-wechat）'
@@ -544,8 +547,8 @@ function agentCompatibilityFailure(agent, platform, planSnapshot = {}) {
     }
     return null;
   }
-  if (platform === 'wechat_channels') {
-    return {code: 'agent_platform_unsupported', message: '视频号只能由手机节点采集'};
+  if (['wechat_channels', 'wechat_articles'].includes(platform)) {
+    return {code: 'agent_platform_unsupported', message: '微信内容只能由手机节点采集'};
   }
   if (safeJson(planSnapshot.negativePatrol).enabled === true &&
       !(capabilities.remoteTargetedPostCaptureV1 === true &&
@@ -3408,7 +3411,7 @@ router.post(
               agentKind: 'android_mobile',
               deviceId: safeJson(agent.capabilities).deviceId,
               filters: mobileTaskFilters(planSnapshot.searchFilters, parent.platform),
-              ...(parent.platform === 'wechat_channels' ? {comments: mobileCommentPlan(planSnapshot)} : {}),
+              ...(['wechat_channels', 'wechat_articles'].includes(parent.platform) ? {comments: mobileCommentPlan(planSnapshot)} : {}),
               budgets: mobileTaskBudgets(planSnapshot, mobileKeywords.length),
               keywords: mobileKeywords,
               deadlineAt: null,
@@ -3440,7 +3443,7 @@ router.post(
               sortedAgentIds.length === 1 ? parent.title : `${parent.title} · ${groupIndex + 1}/${sortedAgentIds.length}`,
               JSON.stringify({current: 0, total: mobileKeywords.length, phase: 'queued'}),
               JSON.stringify({total: mobileKeywords.length, processed: 0, success: 0, failed: 0, skipped: 0}),
-              JSON.stringify(mobileChildMetadata), parent.platform === 'wechat_channels' ? 'wechat_channels' : 'douyin',
+              JSON.stringify(mobileChildMetadata), parent.platform,
             ]);
             for (const item of groupItems) {
               const updatedItem = await tx.queryOne(`

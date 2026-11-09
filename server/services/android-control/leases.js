@@ -5,7 +5,7 @@ import {claimPhonePatrolItem} from './patrol.js';
 import {FORWARD_ITEM_TYPE,forwardTarget,WECHAT_FORWARD_FEATURE} from './forward.js';
 import {heldItem,lockAgent,parentStopRequested,rollup,saveItemMetadata,taskRow} from './repository.js';
 import {MOBILE_PLATFORMS,mobileCommentPlan,mobilePlanBlockReason,mobilePlatformForWorkflow,mobileRelevancePrefilterEnabled,
-  mobileTaskBudgets,mobileTaskFilters,mobileWorkflowFor,trimMobilePlanSnapshot,WECHAT_SEARCH_FILTERS_FEATURE} from './mobile-tasks.js';
+  mobileTaskBudgets,mobileTaskFilters,mobileWorkflowFor,trimMobilePlanSnapshot,WECHAT_SEARCH_FILTERS_FEATURE,WECHAT_ARTICLE_FEATURE,isWechatMobilePlatform} from './mobile-tasks.js';
 
 // A phone attempt budget per work item (mirrors the browser elastic pool's
 // bounded attempts). Manual-action safety endings fence the item for this phone.
@@ -36,7 +36,7 @@ export function taskPayload(item,metadata) {
     relevancePrefilter:{enabled:mobileRelevancePrefilterEnabled(metadata.planSnapshot)},
     // 0.4.0: the platform tells the Runner which app runs the task; WeChat Channels carries its comment plan.
     platform,
-    ...(platform==='wechat_channels' ? {mode:['patrol','forward'].includes(metadata.mode) ? metadata.mode : 'keyword',
+    ...(isWechatMobilePlatform(platform) ? {mode:['patrol','forward'].includes(metadata.mode) ? metadata.mode : 'keyword',
       comments:metadata.comments || mobileCommentPlan(metadata.planSnapshot),
       ...(metadata.mode==='patrol' ? {patrolTarget:metadata.patrolTarget} : {}),
       ...(metadata.mode==='forward' ? {forwardTarget:metadata.forwardTarget} : {})} : {})};
@@ -113,9 +113,9 @@ async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=f
       AND parent.metadata->>'stopPending' IS DISTINCT FROM 'true'
       AND COALESCE(parent.metadata->>'stopCommandId','')=''
       AND COALESCE(parent.metadata->>'orchestrationTemplate','false') <> 'true'
-      AND (item.item_type='keyword' OR (parent.platform='wechat_channels' AND item.item_type IN ('negative_post','wechat_forward')))
+      AND (item.item_type='keyword' OR (parent.platform IN ('wechat_channels','wechat_articles') AND item.item_type IN ('negative_post','wechat_forward')))
       -- 「发到微信」 goes only to a Runner that can forward (0.4.6) and is tried once: a second try could send twice.
-      AND (item.item_type<>'wechat_forward' OR ($8::boolean AND item.attempt_count=0))
+      AND (item.item_type<>'wechat_forward' OR (parent.platform='wechat_channels' AND $8::boolean AND item.attempt_count=0))
       AND item.platform=parent.platform
       AND item.status IN ('pending','retryable')
       AND item.attempt_count < $3
@@ -131,7 +131,7 @@ async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=f
         AND (UPPER(COALESCE(sa.error->>'code',''))=ANY($5::text[])
           OR COALESCE(sa.error->>'requiresManualAction',sa.error->>'securityBlocked','false')='true'))
       AND COALESCE(jsonb_array_length(parent.metadata->'planSnapshot'->'searchPasses'),0) <= 1
-      AND (parent.platform='wechat_channels' OR (
+      AND (parent.platform IN ('wechat_channels','wechat_articles') OR (
         COALESCE(parent.metadata->'planSnapshot'->'negativePatrol'->>'enabled','false') <> 'true'
         AND COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'publishTime','all') <> 'month'))
       -- A 视频号 keyword with the App's 时长 / 范围 choices only goes to a Runner that applies them (0.4.5).
@@ -163,7 +163,7 @@ async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=f
   const childMetadata={workflow,agentKind:'android_mobile',deviceId:agent.capabilities.deviceId,
     filters:patrol || forward ? {sort:'all',publishWindowHours:null} : mobileTaskFilters(planSnapshot.searchFilters,parent.platform),
     budgets:mobileTaskBudgets(planSnapshot,1),
-    ...(parent.platform==='wechat_channels' ? {comments:forward ? {enabled:false,limit:0} : mobileCommentPlan(planSnapshot)} : {}),
+    ...(isWechatMobilePlatform(parent.platform) ? {comments:forward ? {enabled:false,limit:0} : mobileCommentPlan(planSnapshot)} : {}),
     ...(patrol || {}),
     ...(forward ? {mode:'forward',forwardTarget:forward} : {}),
     keywords,deadlineAt:null,planSnapshot:trimMobilePlanSnapshot(planSnapshot,keywords),
@@ -220,10 +220,11 @@ async function claimBoundItem(tx,principal,agent,child,item,sessionId,now) {
   const resumeAuthorized=item.metadata.resumeAuthorized===true
     || (item.status==='retryable' && lastAttempt?.agent_id===agent.id);
   const attemptId=randomUUID(), revision=item.assignment_revision+1;
-  const wechat=child.metadata.workflow===mobileWorkflowFor('wechat_channels');
+  const platform=mobilePlatformForWorkflow(child.metadata.workflow);
+  const wechat=isWechatMobilePlatform(platform);
   // Douyin keeps its original request hash; a Channels attempt also binds its platform and comment plan.
   const hash=digest({taskId:child.id,itemId:item.id,keyword:item.keyword,filters:child.metadata.filters,budgets:child.metadata.budgets,revision,
-    ...(wechat ? {platform:'wechat_channels',comments:child.metadata.comments || null} : {})});
+    ...(wechat ? {platform,comments:child.metadata.comments || null} : {})});
   const metadata={...withoutHandoffAnchors(item.metadata),attemptId,deviceHeld:true,sessionId,leaseId:randomUUID(),completion:null,
     reason:'',closure:null,deviceClosedAt:null,resumeAuthorized,
     leaseUntil:new Date(Math.min(now+LEASE_MS,Date.parse(child.metadata.deadlineAt))).toISOString()};
@@ -241,14 +242,15 @@ async function claimBoundItem(tx,principal,agent,child,item,sessionId,now) {
 // sends no list: when ready, it is a Douyin phone.
 /** The optional abilities a Runner names in its poll (0.4.5+); unknown names are dropped. */
 export function runnerFeatures(body) {
-  const known=[WECHAT_SEARCH_FILTERS_FEATURE,WECHAT_FORWARD_FEATURE];
+  const known=[WECHAT_SEARCH_FILTERS_FEATURE,WECHAT_FORWARD_FEATURE,WECHAT_ARTICLE_FEATURE];
   return Array.isArray(body?.features) ? [...new Set(body.features.filter(name=>known.includes(name)))] : [];
 }
 export function readyPlatforms(body,agent,ready) {
   if (!ready) return [];
   const allowed=Array.isArray(agent.allowed_platforms) && agent.allowed_platforms.length ? agent.allowed_platforms : ['douyin'];
   const reported=Array.isArray(body.platforms) ? body.platforms.filter(p=>typeof p==='string') : ['douyin'];
-  return MOBILE_PLATFORMS.filter(platform=>reported.includes(platform) && allowed.includes(platform));
+  return MOBILE_PLATFORMS.filter(platform=>reported.includes(platform) && allowed.includes(platform)
+    && (platform !== 'wechat_articles' || runnerFeatures(body).includes(WECHAT_ARTICLE_FEATURE)));
 }
 export async function poll(tx,principal,body,now=Date.now()) {
   const sessionId=id(body.sessionId,'SESSION_ID');
@@ -262,6 +264,9 @@ export async function poll(tx,principal,body,now=Date.now()) {
   if (held) {
     const stopped=control(held,held.task_metadata,held.parent_metadata,sessionId,now);
     if (stopped) return {task:null,permit:null,control:stopped};
+    if (mobilePlatformForWorkflow(held.task_metadata.workflow) === 'wechat_articles' && !features.includes(WECHAT_ARTICLE_FEATURE)) {
+      return {task:null,permit:null,control:{stopRequested:true,blocked:true,reason:'article_capability_missing',identity:taskIdentity(held)}};
+    }
     return {task:taskPayload(held,held.task_metadata),
       permit:{...permit(held,held.task_metadata,now),leaseUntil:held.metadata.leaseUntil},control:{}};
   }

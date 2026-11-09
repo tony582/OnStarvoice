@@ -215,7 +215,7 @@ export function HistoryView({
             <option value="">全部平台</option>
             <option value="xiaohongshu">小红书</option>
             <option value="douyin">抖音</option>
-            <option value="weibo">微博</option>
+            <option value="weibo">微博</option><option value="wechat_channels">视频号</option><option value="wechat_articles">微信文章</option>
             <option value="mixed">多平台</option>
           </select>
           <select

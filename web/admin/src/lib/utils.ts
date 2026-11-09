@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from 'clsx'
 import { twMerge } from 'tailwind-merge'
+import { wechatArticleMetric } from './wechat-article.mjs'
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -10,6 +11,12 @@ export function formatNumber(v: number | string | undefined | null): string {
   if (isNaN(num)) return '0'
   if (num >= 10000) return (num / 10000).toFixed(1) + '万'
   return num.toLocaleString('zh-CN')
+}
+
+export function formatRecordMetric(record: Record<string, unknown>, field: string): string {
+  return record.platform === 'wechat_articles'
+    ? wechatArticleMetric(record, field)
+    : formatNumber(record[field] as number | string | null | undefined)
 }
 
 export function formatDate(v: string | undefined | null): string {
@@ -118,7 +125,7 @@ export const LABELS = {
     tenant_admin: '客户管理员', tenant_analyst: '分析员', tenant_viewer: '只读',
   } as Record<string, string>,
   platform: {
-    xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号',
+    xiaohongshu: '小红书', douyin: '抖音', weibo: '微博', wechat_channels: '视频号', wechat_articles: '微信文章',
   } as Record<string, string>,
 } as const
 

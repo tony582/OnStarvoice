@@ -1,3 +1,4 @@
+import {validateArticleFilters} from './android-control/articles.js';
 import crypto from 'crypto';
 import { withTransaction } from '../db/query.js';
 import {
@@ -73,6 +74,7 @@ const PLATFORM_ALIASES = Object.freeze({
   tiktok_cn: 'douyin',
   weibo: 'weibo',
   wechat_channels: 'wechat_channels',
+  wechat_articles: 'wechat_articles',
   channels: 'wechat_channels',
   shipinhao: 'wechat_channels',
   mixed: 'mixed',
@@ -117,6 +119,7 @@ const SEARCH_FILTER_VALUES = Object.freeze({
 const WECHAT_VIDEO_DURATIONS = new Set(['all', 'under_5m', '5_20m', 'over_20m']);
 const WECHAT_SEARCH_SCOPES = new Set(['all', 'followed', 'viewed']);
 function platformSearchFilters(platform, filters) {
+  if (platform === 'wechat_articles') return {...filters, videoDuration: 'all', searchScope: 'all', contentType: 'all'};
   if (platform === 'wechat_channels') {
     return {...filters, videoDuration: WECHAT_VIDEO_DURATIONS.has(filters.videoDuration) ? filters.videoDuration : 'all',
       searchScope: WECHAT_SEARCH_SCOPES.has(filters.searchScope) ? filters.searchScope : 'all'};
@@ -331,7 +334,7 @@ export function normalizeCaptureAgentPlatforms(value) {
   const source = Array.isArray(value) ? value : [];
   return [...new Set(source
     .map(item => PLATFORM_ALIASES[String(item || '').trim().toLowerCase()] || '')
-    .filter(platform => ['xiaohongshu', 'douyin', 'weibo', 'wechat_channels'].includes(platform)))]
+    .filter(platform => ['xiaohongshu', 'douyin', 'weibo', 'wechat_channels', 'wechat_articles'].includes(platform)))]
     .slice(0, 4);
 }
 
@@ -381,6 +384,8 @@ export function normalizeRemoteTaskInput(input = {}) {
   }
 
   const rawFilters = jsonObject(read('searchFilters'));
+  if (platform === 'wechat_articles') validateArticleFilters(Object.fromEntries(
+    ['sort', 'searchScope', 'videoDuration', 'contentType', 'distance'].map(key => [key, has(request, key) ? request[key] : rawFilters[key]])));
   const filterValue = (key) => normalizeSingleSearchFilter(
     key,
     has(request, key) ? request[key] : rawFilters[key],

@@ -581,7 +581,7 @@ function AgentDetailPane({
               <fieldset>
                 <legend className="text-xs font-medium text-muted-foreground">负责平台</legend>
                 <div className="mt-2 flex flex-wrap gap-2">
-                  {['xiaohongshu', 'douyin', 'weibo'].map(platform => (
+                  {(isMobileAgent(agent) ? ['douyin', 'wechat_channels', 'wechat_articles'] : ['xiaohongshu', 'douyin', 'weibo']).map(platform => (
                     <label key={platform} className="flex min-h-9 items-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-xs">
                       <input type="checkbox" checked={allowedPlatforms.includes(platform)} onChange={() => togglePlatform(platform)} disabled={!writable} />
                       {PLATFORM_LABELS[platform]}

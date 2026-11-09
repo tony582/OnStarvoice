@@ -23,7 +23,7 @@ import { ScheduledDatesPicker } from './ScheduledDatesPicker'
 import { NegativePatrolScheduleOption } from './NegativePatrolScheduleOption'
 import { hasUnattendedNegativePatrol, unattendedNegativePatrolRequest, negativePatrolCapabilityAvailable, DEFAULT_NEGATIVE_PATROL_STATUSES, negativePatrolTriageStatuses, validNegativePatrolStatuses, negativePatrolStatusSummary } from './unattendedNegativePatrol.mjs'
 import { Drawer } from '@/components/shared/Drawer'
-import { isMobileAgent, mobileReadinessLabel, shanghaiToday } from './lib'
+import { agentCreatePlatforms, isMobileAgent, mobileAgentPlatforms, mobileReadinessLabel, shanghaiToday } from './lib'
 import { WECHAT_DURATION_OPTIONS, WECHAT_PUBLISH_TIME_OPTIONS, WECHAT_SCOPE_OPTIONS, WECHAT_SORT_OPTIONS, wechatEffectiveSort, wechatSortLocked } from './wechatFilters'
 import { isAgentStopFenced } from './stop-fence-presentation.mjs'
 import type {
@@ -83,6 +83,7 @@ const PLATFORM_OPTIONS: Array<{ value: OrchestrationPlatform; label: string }> =
   { value: 'xiaohongshu', label: '小红书' },
   { value: 'douyin', label: '抖音' },
   { value: 'wechat_channels', label: '视频号' },
+  { value: 'wechat_articles', label: '微信文章' },
 ]
 // 视频号只有手机节点能采（App 里只有不限／最新／最热三种排序，没有发布时间筛选：设了时间范围时手机按「最新」排序、读卡片时间截止）。
 
@@ -215,18 +216,10 @@ function stringList(value: unknown) {
 }
 
 function agentPlatforms(agent: OrchestrationCloudAgent) {
-  const supportedPlatforms = Array.isArray(agent.capabilities?.supportedPlatforms)
-    ? agent.capabilities.supportedPlatforms.map(value => String(value || '').trim()).filter(Boolean)
-    : []
-  const allowedPlatforms = Array.isArray(agent.allowed_platforms)
-    ? agent.allowed_platforms.map(value => String(value || '').trim()).filter(Boolean)
-    : []
+  const supportedPlatforms = isMobileAgent(agent) ? mobileAgentPlatforms(agent) : agentCreatePlatforms(agent)
   return PLATFORM_OPTIONS
     .map(option => option.value)
-    .filter(platform =>
-      (supportedPlatforms.length === 0 || supportedPlatforms.includes(platform)) &&
-      (allowedPlatforms.length === 0 || allowedPlatforms.includes(platform)),
-    )
+    .filter(platform => supportedPlatforms.includes(platform))
 }
 
 function agentBlockReason(
@@ -238,22 +231,22 @@ function agentBlockReason(
   wechatAppFilters = false,
 ) {
   if (agent.status !== 'active') return agent.status === 'paused' ? '节点已暂停接单' : '节点已撤销'
-  // 手机节点做抖音搜索发现和视频号整帖采集：小红书、多段搜索一律不可选；负面巡查只在视频号上由手机执行。
+  // 手机节点共用平台与 feature 门槛；视频号和文章支持负面巡查。
   if (isMobileAgent(agent)) {
     if (agent.capabilities?.mobileSearchDiscoveryV1 !== true) return '手机执行器版本过低，需升级后才能接收搜索发现'
-    if (platform === 'xiaohongshu') return '手机节点仅支持抖音和视频号'
+    if (platform === 'xiaohongshu') return '手机节点仅支持抖音、视频号和微信文章'
     if (!agentPlatforms(agent).includes(platform)) {
-      return platform === 'wechat_channels' ? '这台手机还没有启用视频号（需手机采集器 0.4.0）' : '手机节点未开通抖音平台'
+      return platform === 'wechat_channels' ? '这台手机还没有启用视频号（需手机采集器 0.4.0）' : platform === 'wechat_articles' ? '这台手机还没有启用微信文章采集' : '手机节点未开通抖音平台'
     }
     if (sequentialSearchEnabled) return '手机节点不支持多段搜索巡检'
-    if (negativePatrolEnabled && platform !== 'wechat_channels') return '抖音手机节点不支持负面巡查'
+    if (negativePatrolEnabled && platform !== 'wechat_channels' && platform !== 'wechat_articles') return '这个手机平台暂不支持负面巡查'
     const features = agent.capabilities?.runnerFeatures
     if (wechatAppFilters && platform === 'wechat_channels' && !(Array.isArray(features) && features.includes('wechat_search_filters'))) {
       return '手机采集器需升级到 0.4.5 及以上才能按视频号的「时长」「范围」筛选'
     }
     return ''
   }
-  if (platform === 'wechat_channels') return '视频号只能由手机节点采集'
+  if (platform === 'wechat_channels' || platform === 'wechat_articles') return '微信内容只能由手机节点采集'
   if (agent.capabilities?.remoteTaskCreate !== true) return 'Extension 版本不支持云端任务'
   if (!agentPlatforms(agent).includes(platform)) {
     return `该节点不支持${PLATFORM_OPTIONS.find(option => option.value === platform)?.label || platform}`
@@ -465,10 +458,11 @@ export function OrchestrationComposerDrawer({
 
   const keywords = useMemo(() => uniqueKeywords(keywordText), [keywordText])
   // 视频号按 App 自己的筛选下发；选了发布时间范围，排序固定为「最新」（手机读到超出范围就停）。
-  const wechatSelected = platform === 'wechat_channels'
+  const wechatSelected = platform === 'wechat_channels' || platform === 'wechat_articles'
+  const wechatArticlesSelected = platform === 'wechat_articles'
   const sortLocked = wechatSelected && wechatSortLocked(publishTime)
   const effectiveSort = wechatSelected ? wechatEffectiveSort(sort, publishTime) : sort
-  const wechatAppFilters = wechatSelected && (videoDuration !== 'all' || searchScope !== 'all')
+  const wechatAppFilters = platform === 'wechat_channels' && (videoDuration !== 'all' || searchScope !== 'all')
   const sequentialSearchEnabled = Boolean(
     supplementalContentType &&
     platform === 'douyin' &&
@@ -539,7 +533,7 @@ export function OrchestrationComposerDrawer({
     const searchFilters = safeRecord(planSnapshot.searchFilters)
     const enhancementSettings = safeRecord(planSnapshot.captureSettings)
     const sourcePlatform = sourcePlan?.orchestration.platform
-    const editingPlatform: OrchestrationPlatform = sourcePlatform === 'douyin' || sourcePlatform === 'wechat_channels'
+    const editingPlatform: OrchestrationPlatform = sourcePlatform === 'douyin' || sourcePlatform === 'wechat_channels' || sourcePlatform === 'wechat_articles'
       ? sourcePlatform
       : 'xiaohongshu'
     const editingEnhancementEnabled = enhancementSettings.autoDetailCaptureAfterListCapture === true
@@ -565,7 +559,7 @@ export function OrchestrationComposerDrawer({
     const candidateAgentIds = sourcePlan ? editingAgentIds : (initialAgentIds ?? [])
     const firstSelectedAgent = agents.find(agent => candidateAgentIds.includes(agent.id))
     const targetPlatform = sourcePlan ? editingPlatform : firstSelectedAgent ? agentPlatforms(firstSelectedAgent)[0] || 'xiaohongshu' : 'xiaohongshu'
-    const targetEnhancementEnabled = sourcePlan ? editingEnhancementEnabled : false
+    const targetEnhancementEnabled = targetPlatform === 'wechat_articles' || targetPlatform === 'wechat_channels' || (sourcePlan ? editingEnhancementEnabled : false)
     const targetSequentialSearchEnabled = sourcePlan ? editingSequentialSearchEnabled : false
     const compatibleInitialAgentIds = candidateAgentIds.filter(agentId => {
       const agent = agents.find(candidate => candidate.id === agentId)
@@ -612,17 +606,17 @@ export function OrchestrationComposerDrawer({
     setSort(String(searchFilters.sort || 'comprehensive'))
     setPublishTime(String(searchFilters.publishTime || 'all'))
     setContentType(
-      editingSequentialSearchEnabled
+      targetPlatform === 'wechat_articles' || editingSequentialSearchEnabled
         ? 'all'
         : ['all', 'image', 'video'].includes(String(searchFilters.contentType || ''))
           ? String(searchFilters.contentType) as PatrolContentType
           : 'all',
     )
-    setSearchScope(String(searchFilters.searchScope || 'all'))
+    setSearchScope(targetPlatform === 'wechat_articles' ? 'all' : String(searchFilters.searchScope || 'all'))
     setDistance(String(searchFilters.distance || 'all'))
-    setVideoDuration(String(searchFilters.videoDuration || 'all'))
+    setVideoDuration(targetPlatform === 'wechat_articles' ? 'all' : String(searchFilters.videoDuration || 'all'))
     setSupplementalContentType(editingSupplementalContentType)
-    setEnhancementEnabled(editingEnhancementEnabled)
+    setEnhancementEnabled(targetEnhancementEnabled)
     setAutoSync(enhancementSettings.autoSyncAfterDetailCapture === true)
     setAiPrefilter(enhancementSettings.enableAiRelevancePrefilter === true)
     setBloggerMetrics(enhancementSettings.includeBloggerMetricsOnDetailCapture === true)
@@ -788,9 +782,9 @@ export function OrchestrationComposerDrawer({
     } else {
       setDistance('all')
     }
-    if ((value === 'wechat_channels') !== (platform === 'wechat_channels')) setSearchScope('all')
-    if (value !== 'wechat_channels' && publishTime === 'month') setPublishTime('all')
-    if (value === 'wechat_channels') {
+    if (value !== platform) setSearchScope('all')
+    if (value !== 'wechat_channels' && value !== 'wechat_articles' && publishTime === 'month') setPublishTime('all')
+    if (value === 'wechat_channels' || value === 'wechat_articles') {
       // 手机逐条打开视频号作品：详情总是要采，内容只有视频，没有位置筛选；范围用 App 的「范围」。
       setDistance('all')
       setContentType('all')
@@ -903,7 +897,7 @@ export function OrchestrationComposerDrawer({
     )
   }
 
-  const captureSettings: CaptureEnhancementSettings | undefined = enhancementEnabled
+  const captureSettings: CaptureEnhancementSettings | undefined = enhancementEnabled || wechatSelected
     ? {
         autoDetailCaptureAfterListCapture: true,
         autoSyncAfterDetailCapture: autoSync,
@@ -934,7 +928,7 @@ export function OrchestrationComposerDrawer({
     publishTime,
     contentType: searchPasses[0],
     searchPasses,
-    searchScope,
+    searchScope: wechatArticlesSelected ? 'all' : searchScope,
     distance: platform === 'xiaohongshu' ? distance : 'all',
     videoDuration: platform === 'douyin' || platform === 'wechat_channels' ? videoDuration : 'all',
     captureSettings,
@@ -1078,7 +1072,7 @@ export function OrchestrationComposerDrawer({
             sort: effectiveSort,
             publishTime,
             contentType: searchPasses[0],
-            searchScope,
+            searchScope: wechatArticlesSelected ? 'all' : searchScope,
             distance: platform === 'xiaohongshu' ? distance : 'all',
             videoDuration: platform === 'douyin' || platform === 'wechat_channels' ? videoDuration : 'all',
           },
@@ -1168,7 +1162,7 @@ export function OrchestrationComposerDrawer({
               sort: effectiveSort,
               publishTime,
               contentType: searchPasses[0],
-              searchScope,
+              searchScope: wechatArticlesSelected ? 'all' : searchScope,
               distance: platform === 'xiaohongshu' ? distance : 'all',
               videoDuration: platform === 'douyin' || platform === 'wechat_channels' ? videoDuration : 'all',
             },
@@ -1558,10 +1552,10 @@ export function OrchestrationComposerDrawer({
                           {(wechatSelected ? WECHAT_PUBLISH_TIME_OPTIONS : PUBLISH_TIME_OPTIONS).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </select>
                         {wechatSelected && publishTime !== 'all' && (
-                          <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">视频号 App 没有发布时间筛选：手机按「最新」排序，读每张卡片右下角的时间，超出范围就结束该词。</span>
+                          <span className="mt-1.5 block text-[11px] leading-4 text-muted-foreground">{wechatArticlesSelected ? '手机按「最新」搜索，再按文章实际发布时间筛选；时间无法确认的内容不会算作范围内。' : '视频号 App 没有发布时间筛选：手机按「最新」排序，读每张卡片右下角的时间，超出范围就结束该词。'}</span>
                         )}
                       </label>
-                      {wechatSelected && (
+                      {platform === 'wechat_channels' && (
                         <>
                           <label className="block text-xs font-medium text-muted-foreground">
                             时长
@@ -1621,7 +1615,7 @@ export function OrchestrationComposerDrawer({
                           </select>
                         </label>
                       )}
-                      {platform !== 'wechat_channels' && (
+                      {!wechatSelected && (
                       <label className="block text-xs font-medium text-muted-foreground">
                         搜索范围
                         <select value={searchScope} onChange={event => { markDefinitionChanged(); setSearchScope(event.target.value) }} disabled={busy} className={inputClassName}>
@@ -1653,26 +1647,27 @@ export function OrchestrationComposerDrawer({
                   <label className="flex cursor-pointer items-start gap-3">
                     <input
                       type="checkbox"
-                      checked={enhancementEnabled || platform === 'wechat_channels'}
+                      checked={enhancementEnabled || wechatSelected}
                       onChange={event => changeEnhancementEnabled(event.target.checked)}
-                      disabled={busy || platform === 'wechat_channels'}
+                      disabled={busy || wechatSelected}
                       className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
                     />
                     <span>
                       <span className="block text-sm font-bold text-foreground">采集增强</span>
-                      <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">{platform === 'wechat_channels'
-                        ? '视频号由手机逐条打开作品、复制链接读取详情，按需读取评论后直接入库。'
+                      <span className="mt-0.5 block text-[11px] leading-4 text-muted-foreground">{wechatArticlesSelected
+                        ? '手机逐条打开文章或图文，读取正文和文末可见留言；未读完整或评论关闭会单独标明。'
+                        : platform === 'wechat_channels' ? '视频号由手机逐条打开作品、复制链接读取详情，按需读取评论后直接入库。'
                         : '逐条打开详情页补充内容；只有支持远程增强参数的 Agent 可接单。'}</span>
                     </span>
                   </label>
-                  {enhancementEnabled && (
+                  {(enhancementEnabled || wechatSelected) && (
                     <div className="mt-3 grid gap-2 border-l-2 border-primary/15 pl-3 sm:grid-cols-2">
                       {[
                         { label: '增强后自动同步后台', checked: autoSync, setter: setAutoSync, browserOnly: true },
                         { label: 'AI 精准筛选', checked: aiPrefilter, setter: setAiPrefilter, browserOnly: false },
                         { label: '附加博主粉丝与赞藏数', checked: bloggerMetrics, setter: setBloggerMetrics, browserOnly: true },
                         { label: '跳过已增强内容', checked: skipCaptured, setter: setSkipCaptured, browserOnly: true },
-                      ].filter(option => !(platform === 'wechat_channels' && option.browserOnly)).map(option => (
+                      ].filter(option => !(wechatSelected && option.browserOnly)).map(option => (
                         <label key={option.label} className="flex min-h-9 cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 text-xs text-foreground hover:bg-muted/60">
                           <input type="checkbox" checked={option.checked} onChange={event => { markDefinitionChanged(); option.setter(event.target.checked) }} disabled={busy} className="mt-0.5 h-4 w-4 accent-primary" />
                           <span>{option.label}</span>

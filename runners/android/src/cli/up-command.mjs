@@ -37,14 +37,26 @@ const OUTCOME_TEXT = Object.freeze({
   user_stop: '已手动停止', remote_stop: '调度中心已停止', lease_expired: '与调度中心的连接中断',
   publish_window_end: '已到时间范围之外', sort_unverified: '「最新」排序未确认', login_or_challenge_required: '需在手机上处理微信提示',
   link_not_copied: '复制链接失败', share_sheet_unverified: '转发面板未确认', ocr_unavailable: '本机识字工具不可用',
+  article_body_incomplete: '已保留正文，部分内容未采完整', article_time_unverified: '部分文章发布时间无法确认，未纳入时间范围',
+  article_identity_unverified: '文章标题无法核对', article_header_unverified: '文章信息无法核对',
+  article_link_mismatch: '打开的文章与原链接不一致', article_link_entry_unverified: '原链接打开入口无法确认',
+  body_load_timeout: '文章正文加载超时，已保留可见内容',
+  article_preview_identity_mismatch: '网页与文章原链接不一致', article_preview_verification_required: '文章网页需要处理访问验证',
+  article_preview_unavailable: '文章网页暂不可访问', article_preview_body_folded: '网页正文未完整展开',
+  article_preview_incomplete: '文章网页尚未读取完整', article_page_incomplete: '文章网页信息不完整',
+  article_preview_invalid_time: '文章网页时间无法确认', article_preview_navigation_failed: '文章网页打开失败',
+  article_preview_dom_error: '文章网页读取失败', preview_unavailable: '电脑网页读取工具未就绪', preview_timeout: '网页读取超时',
+  article_entry_missing: '未找到微信搜一搜入口', article_tab_missing: '未找到文章分类',
+  search_box_missing: '微信搜索页未加载完成', search_context_unverified: '文章搜索结果无法确认',
+  patrol_relocated: '已找到原文章并更新', patrol_not_relocated: '未找到原文章，保留已有内容',
 });
 
 /** One human-readable status line from the daemon's current probe. */
-const PLATFORM_NAMES = Object.freeze({douyin: '抖音', wechat_channels: '视频号'});
+const PLATFORM_NAMES = Object.freeze({douyin: '抖音', wechat_channels: '视频号', wechat_articles: '微信文章/图文'});
 export function describeReadiness(daemon) {
   // A phone shared with WeChat (0.4.0) lists the apps it can run now; the Douyin-only line stays as it was.
   const platforms = Array.isArray(daemon.platforms) ? daemon.platforms : [];
-  if (daemon.ready && (platforms.length > 1 || platforms.includes('wechat_channels'))) {
+  if (daemon.ready && (platforms.length > 1 || platforms.some(p => p === 'wechat_channels' || p === 'wechat_articles'))) {
     return `手机已连接 · 可采 ${platforms.map(p => PLATFORM_NAMES[p] ?? p).join('、')} · 已上线，可在调度中心下发任务`;
   }
   if (daemon.ready) return '手机已连接 · 抖音在前台 · 已上线，可在调度中心下发任务';
@@ -56,8 +68,9 @@ export function describeReadiness(daemon) {
 export function describeOutcome(outcome) {
   if (!outcome) return null;
   const done = outcome.status === 'completed' || outcome.status === 'completed_with_warnings';
-  const parts = [`${done ? '【完成】' : '【提前结束】'}${outcome.platform === 'wechat_channels' ? '视频号 · ' : ''}${outcome.keyword}`,
-    outcome.platform === 'wechat_channels' ? `入库 ${outcome.posts ?? 0} 条` : `找到 ${outcome.links} 条`];
+  const isWechat = ['wechat_channels', 'wechat_articles'].includes(outcome.platform);
+  const parts = [`${done ? '【完成】' : '【提前结束】'}${isWechat ? `${PLATFORM_NAMES[outcome.platform]} · ` : ''}${outcome.keyword}`,
+    isWechat ? `入库 ${outcome.posts ?? 0} 条` : `找到 ${outcome.links} 条`];
   if (outcome.skipped > 0) parts.push(`跳过 ${outcome.skipped} 个无法核对的作品`);
   if (outcome.prefilterSkipped > 0) parts.push(`AI 跳过 ${outcome.prefilterSkipped} 条无关`);
   parts.push(OUTCOME_TEXT[outcome.reason] ?? outcome.reason ?? '已结束');

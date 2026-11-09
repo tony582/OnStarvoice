@@ -11,7 +11,7 @@ import {
 } from 'lucide-react'
 import { mergeRecordPatches, mergePatchMaps, reconcileQueryRecords } from '@/lib/triage-edit-context'
 import { api, isApiNetworkError } from '@/lib/api'
-import { formatNumber, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
+import { formatNumber, formatRecordMetric, formatDateCompact, LABELS, platformName, cn, identityLabel } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { StatusBadge } from '@/components/ui/badge'
@@ -114,6 +114,7 @@ const PLATFORM_OPTIONS = [
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
   { value: 'wechat_channels', label: '视频号' },
+  { value: 'wechat_articles', label: '微信文章' },
   { value: 'unknown', label: '未知平台' },
 ]
 const SENTIMENT_OPTIONS = [['', '全部情感'], ['negative', '负面'], ['neutral', '中性'], ['positive', '正面']] as const
@@ -1949,8 +1950,8 @@ function RecordRow({ record: r, canWrite, open, selected, outOfFilter, onToggle,
       <td className="px-3 py-3 align-middle"><RiskSignals record={r} /></td>
       <td className="px-3 py-3 align-middle"><IdentityBadge sourceType={r.source_type} fans={r.author_fans} name={r.author_name} override={r.identity_override} /></td>
       <td className={`px-3 py-3 text-right align-middle text-[12px] font-semibold tabular-nums ${negativeInteractionClass(r.sentiment, interactions, 'text-foreground')}`}>{formatNumber(interactions)}</td>
-      <td className="px-3 py-3 text-right align-middle text-[12px] tabular-nums text-muted-foreground">{formatNumber(r.comments_count)}</td>
-      <td className="px-3 py-3 text-right align-middle text-[12px] tabular-nums text-muted-foreground">{formatNumber(r.likes)}</td>
+      <td className="px-3 py-3 text-right align-middle text-[12px] tabular-nums text-muted-foreground">{formatRecordMetric(r, 'comments_count')}</td>
+      <td className="px-3 py-3 text-right align-middle text-[12px] tabular-nums text-muted-foreground">{formatRecordMetric(r, 'likes')}</td>
       <td className="hidden whitespace-nowrap px-3 py-3 align-middle text-[11px] text-muted-foreground lg:table-cell">{r.publish_display || '—'}</td>
       <td className="hidden whitespace-nowrap px-3 py-3 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.first_seen_at)}</td>
       <td className="hidden whitespace-nowrap px-3 py-3 align-middle text-[11px] text-muted-foreground xl:table-cell">{formatDateCompact(r.last_seen_at)}</td>

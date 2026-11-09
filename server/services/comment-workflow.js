@@ -180,7 +180,7 @@ function commentContent(item) {
   return normalizeText(item?.content || item?.text || item?.commentText || item?.body || '');
 }
 
-function normalizeComment(item, index) {
+function normalizeComment(item, index, platform) {
   const content = commentContent(item);
   const authorName = normalizeText(item?.authorName || item?.author || item?.userName || item?.nickname || '');
   const authorId = normalizeText(item?.authorId || item?.userId || item?.uid || '');
@@ -193,7 +193,8 @@ function normalizeComment(item, index) {
     author_id: authorId,
     author_avatar: normalizeText(item?.authorAvatar || item?.avatarUrl || item?.avatar || ''),
     content,
-    like_count: cleanNumber(item?.likes ?? item?.likeCount),
+    like_count: platform === 'wechat_articles' && item?.likes == null && item?.likeCount == null
+      ? null : cleanNumber(item?.likes ?? item?.likeCount),
     published_at: publishedAt,
     ip_location: normalizeText(item?.ipLocation || ''),
     floor_index: Number.isFinite(Number(item?.floorIndex ?? item?.index)) ? Number(item?.floorIndex ?? item?.index) : index + 1,
@@ -341,7 +342,7 @@ async function upsertComment(tx, { tenantId, recordId, platform, comment, offici
         author_id = COALESCE(NULLIF($2, ''), author_id),
         author_avatar = COALESCE(NULLIF($3, ''), author_avatar),
         content = COALESCE(NULLIF($4, ''), content),
-        like_count = $5,
+        like_count = COALESCE($5, like_count),
         published_at = COALESCE(NULLIF($6, ''), published_at),
         ip_location = COALESCE(NULLIF($7, ''), ip_location),
         is_official = $8,
@@ -612,7 +613,7 @@ export async function upsertRecordComments(recordId, record, context) {
   // PHASE 1(规则快速分类,不调 LLM):评论以规则分类立即入库、马上可见;
   // 非官方评论标 aiClassified=false,留给后台 refineCommentsWithAI 批量 AI 精炼。
   const prepared = comments.map((raw, index) => {
-    const comment = normalizeComment(raw, index);
+    const comment = normalizeComment(raw, index, platform);
     const officialAccount = findOfficialCommentAuthor({
       platform,
       author_name: comment.author_name,

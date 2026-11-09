@@ -23,7 +23,7 @@ const deliveryLabels: Record<string, string> = {
   none: '尚未交付', queued: '已提交，通常在下一分钟开始准备', working: '已提交，正在准备文档与发送', retry_wait: '等待继续处理',
   needs_attention: '需要处理', document_ready: '飞书文档已就绪', sent: '已发送到群',
 }
-const platforms: Record<string, string> = { xiaohongshu: '小红书', xhs: '小红书', douyin: '抖音', weibo: '微博', bilibili: '哔哩哔哩', wechat: '微信', zhihu: '知乎', kuaishou: '快手', toutiao: '今日头条' }
+const platforms: Record<string, string> = { xiaohongshu: '小红书', xhs: '小红书', douyin: '抖音', weibo: '微博', bilibili: '哔哩哔哩', wechat: '微信', wechat_channels: '视频号', wechat_articles: '微信文章', zhihu: '知乎', kuaishou: '快手', toutiao: '今日头条' }
 
 export function CustomerDailyReport() {
   const { tenantId } = useAuth()

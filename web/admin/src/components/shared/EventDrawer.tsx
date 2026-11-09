@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { X, Loader2, Heart, MessageCircle, Star, Share2, Activity, TrendingUp, Globe, Clock, ArrowLeft } from 'lucide-react'
 import { api } from '@/lib/api'
-import { formatNumber, formatFullDate, platformName, LABELS, cn } from '@/lib/utils'
+import { formatNumber, formatRecordMetric, formatFullDate, platformName, LABELS, cn } from '@/lib/utils'
 import { StatusBadge } from '@/components/ui/badge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
@@ -97,10 +97,10 @@ export function EventDrawer({ eventId, onClose }: { eventId: string; onClose: ()
                           <div className="text-[13px] font-medium leading-snug">{r.title || r.content || '(无标题)'}</div>
                           <div className="mt-1.5 flex items-center gap-3 text-[11px] text-muted-foreground">
                             <span>{r.author_name || '未知'}</span>
-                            <span className="inline-flex items-center gap-0.5"><Heart className="h-3 w-3" />{formatNumber(r.likes)}</span>
-                            <span className="inline-flex items-center gap-0.5"><MessageCircle className="h-3 w-3" />{formatNumber(r.comments_count)}</span>
-                            <span className="inline-flex items-center gap-0.5"><Star className="h-3 w-3" />{formatNumber(r.collects)}</span>
-                            <span className="inline-flex items-center gap-0.5"><Share2 className="h-3 w-3" />{formatNumber(r.shares)}</span>
+                            <span className="inline-flex items-center gap-0.5"><Heart className="h-3 w-3" />{formatRecordMetric(r, 'likes')}</span>
+                            <span className="inline-flex items-center gap-0.5"><MessageCircle className="h-3 w-3" />{formatRecordMetric(r, 'comments_count')}</span>
+                            <span className="inline-flex items-center gap-0.5"><Star className="h-3 w-3" />{formatRecordMetric(r, 'collects')}</span>
+                            <span className="inline-flex items-center gap-0.5"><Share2 className="h-3 w-3" />{formatRecordMetric(r, 'shares')}</span>
                             <span className="ml-auto font-medium text-foreground">{formatNumber(inter)} 互动</span>
                             <RecordSourceAction record={r} compact className="text-[11px]" />
                           </div>

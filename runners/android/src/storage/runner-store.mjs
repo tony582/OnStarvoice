@@ -49,12 +49,14 @@ export class RunnerStore {
   }
   quarantinedCount() { return this.db.prepare("SELECT COUNT(*) AS count FROM events WHERE state = 'rejected'").get().count; }
   discoveredWorkIds({ discoveryRunId, itemId }) {
-    const rows = this.db.prepare(`SELECT DISTINCT CASE WHEN json_extract(payload, '$.verification') = 'ui_bound'
+    const rows = this.db.prepare(`SELECT DISTINCT CASE WHEN json_extract(payload, '$.eventKind') = 'wechat_article'
+      THEN json_extract(payload, '$.workKey') WHEN json_extract(payload, '$.verification') = 'ui_bound'
       THEN 'ui:' || json_extract(payload, '$.uiBinding.cardId')
       ELSE json_extract(payload, '$.verifiedExternalId') END AS work_id
       FROM events WHERE json_extract(payload, '$.discoveryRunId') = ? AND json_extract(payload, '$.itemId') = ?
-      AND json_extract(payload, '$.verification') IN ('verified','ui_bound')`).all(discoveryRunId, itemId);
-    return rows.map((row) => row.work_id).filter((id) => typeof id === 'string' && /^(?:\d{16,22}|ui:[a-f0-9]{64})$/.test(id));
+      AND (json_extract(payload, '$.verification') IN ('verified','ui_bound')
+        OR json_extract(payload, '$.eventKind') = 'wechat_article')`).all(discoveryRunId, itemId);
+    return rows.map((row) => row.work_id).filter((id) => typeof id === 'string' && /^(?:\d{16,22}|ui:[a-f0-9]{64}|wxa_[a-f0-9]{24})$/.test(id));
   }
   /** Read-only, text-free listing of locally quarantined events, newest first. */
   listQuarantined(limit = 20) {

@@ -132,6 +132,8 @@ const PLATFORM_COLOR: Record<string, string> = {
   xiaohongshu: '#DC2626',
   douyin: '#111827',
   weibo: '#D97706',
+  wechat_channels: '#16A34A',
+  wechat_articles: '#0D9488',
   unknown: '#94A3B8',
 }
 

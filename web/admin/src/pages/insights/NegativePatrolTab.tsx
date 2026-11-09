@@ -104,6 +104,7 @@ const PLATFORM_OPTIONS = [
   { value: 'douyin', label: '抖音' },
   { value: 'weibo', label: '微博' },
   { value: 'wechat_channels', label: '视频号' },
+  { value: 'wechat_articles', label: '微信文章' },
 ]
 
 const STATUS_OPTIONS = [

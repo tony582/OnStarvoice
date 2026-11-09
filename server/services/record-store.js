@@ -1,3 +1,4 @@
+import {mergeArticleRecord} from './android-control/article-record.js';
 import {recordDiscoveryIngestion,finishDiscoveryObservation} from './capture-discovery/detail-receipt.js';
 import {readDiscoveryCaptureKeyword} from './capture-discovery/record-keyword.js';
 import crypto from 'crypto';
@@ -1033,7 +1034,8 @@ async function insertObservation(tx, {
     observationSourceKey,
     Math.max(0, Number(commentWorkflowExpectedCount) || 0),
     record.platform || 'unknown', record.keyword || '', record.rank_position || null,
-    cleanNumber(record.likes), cleanNumber(record.comments_count), cleanNumber(record.collects), cleanNumber(record.shares),
+    ...['likes', 'comments_count', 'collects', 'shares'].map(key => record.platform === 'wechat_articles'
+      ? cleanOptionalNumber(record[key]) : cleanNumber(record[key])),
     payloadJson,
   ]);
 
@@ -1187,7 +1189,7 @@ export async function upsertCapturedRecord(record, context) {
   const canonicalUrl = normalizeUrl(record.canonical_url || record.url);
   const contentHash = buildContentHash(record, canonicalUrl);
   const tags = jsonText(record.tags, '[]');
-  const imageUrls = jsonText(record.image_urls, '[]');
+  let imageUrls = jsonText(record.image_urls, '[]');
   let payload = jsonText(record.payload, '{}');
 
   const runUpsertTransaction = () => withTransaction(async tx => {
@@ -1201,7 +1203,7 @@ export async function upsertCapturedRecord(record, context) {
     // Only the saved task can supply the search window. Never infer it from a
     // current schedule (which may have changed) or trust an upload's window.
     const captureTask = record.record_type === 'keyword_notes'
-      && ['xiaohongshu', 'douyin', 'wechat_channels'].includes(record.platform)
+      && ['xiaohongshu', 'douyin', 'wechat_channels', 'wechat_articles'].includes(record.platform)
       && UUID_PATTERN.test(String(captureTaskId || ''))
       ? await tx.queryOne(`
           SELECT task.id, task.tenant_id, task.task_type, task.feature_key,
@@ -1236,6 +1238,17 @@ export async function upsertCapturedRecord(record, context) {
     // Unrelated manual capture and patrol retain their existing path.
     if (existing && (publishWindowCheck.applies || recordPayloadObject(existing.payload).serverPublishWindow)) {
       existing = await tx.queryOne('SELECT * FROM records WHERE id = $1 FOR UPDATE', [existing.id]);
+    }
+    if (record.platform === 'wechat_articles' && publishWindowCheck.applies && publishWindowCheck.status === 'unverified') {
+      const lineageContext = {tenantId, captureTaskId, captureAgentId, captureAgentAuthCodeId,
+        captureAgentAuthBindingId, captureTaskItemAttemptId, captureTaskItemRequestHash,
+        recordId: existing?.id || null, monitorExecutionId, record};
+      assertCaptureAttemptLineage(lineageContext, await loadCaptureObservationLineage(tx, lineageContext));
+      await tx.execute(`INSERT INTO capture_task_events(tenant_id,task_id,event_type,status,message,payload)
+        VALUES($1,$2,'capture_publish_time_unverified','skipped','未能确认文章发布时间在本次范围内，已跳过',$3::jsonb)`,
+      [tenantId, captureTaskId, JSON.stringify({externalId: record.external_id, platform: record.platform, ...publishWindowCheck})]);
+      return {id: null, action: 'skipped', reason: 'capture_publish_time_unverified', retryable: false,
+        message: '未能确认文章发布时间在本次范围内，已跳过', publishWindowCheck};
     }
     const previousWindow = recordPayloadObject(existing?.payload).serverPublishWindow;
     const receivedAt = Date.now();
@@ -1375,8 +1388,12 @@ export async function upsertCapturedRecord(record, context) {
     record = {...record, record_type: officialResolution.recordType};
 
     const dailyMetricEvidence = buildCustomerDailyMetricEvidence(incomingMetricRecord,resolveGuardedCommentsCount(incomingMetricRecord,existing || {}));
+    // An observation describes this visit, even when the record retains previously known article values.
+    const articleObservation = record.platform === 'wechat_articles' ? {...record} : null;
     record = guardRecordCommentCount(record, existing || {});
     record = guardRecordTextCompleteness(record, existing || {});
+    record = mergeArticleRecord(record, existing || {});
+    if (articleObservation) imageUrls = jsonText(record.image_urls, '[]');
     payload = jsonText(record.payload, '{}');
     const releasedWindowExclusion = previousWindow?.status === 'out_of_range'
       && (publishWindowCheck.status === 'in_range' || unrestrictedWindow || widerWindowReleasesUpperBound);
@@ -1397,7 +1414,8 @@ export async function upsertCapturedRecord(record, context) {
         UPDATE records SET
           record_type = COALESCE(NULLIF($1, ''), record_type),
           title = COALESCE(NULLIF($2, ''), title),
-          content = COALESCE(NULLIF($3, ''), content),
+          content = CASE WHEN platform='wechat_articles' AND $31::jsonb->'wechatArticle'->>'source'='page_dom'
+            AND $31::jsonb->'wechatArticle'->>'bodyStatus'='complete' THEN $3 ELSE COALESCE(NULLIF($3, ''), content) END,
           author_name = COALESCE(NULLIF($4, ''), author_name),
           author_id = COALESCE(NULLIF($5, ''), author_id),
           author_avatar = COALESCE(NULLIF($6, ''), author_avatar),
@@ -1416,7 +1434,10 @@ export async function upsertCapturedRecord(record, context) {
           END,
           tags = CASE WHEN $17::jsonb <> '[]'::jsonb THEN $17::jsonb ELSE tags END,
           blogger_profile_url = COALESCE(NULLIF($18, ''), blogger_profile_url),
-          image_urls = CASE WHEN $19::jsonb <> '[]'::jsonb THEN $19::jsonb ELSE image_urls END,
+          image_urls = CASE WHEN platform='wechat_articles' OR $19::jsonb <> '[]'::jsonb THEN $19::jsonb ELSE image_urls END,
+          image_local_urls = CASE WHEN platform='wechat_articles' THEN COALESCE(
+            (SELECT jsonb_agg(entry) FROM jsonb_array_elements(image_local_urls) entry
+              WHERE $19::jsonb ? (entry->>'source_url')), '[]'::jsonb) ELSE image_local_urls END,
           comments_text = COALESCE(NULLIF($20, ''), comments_text),
           comments_capture_status = COALESCE(NULLIF($21, ''), comments_capture_status),
           comments_total_captured = COALESCE(NULLIF($22, 0), comments_total_captured),
@@ -1494,7 +1515,7 @@ export async function upsertCapturedRecord(record, context) {
         captureTaskItemRequestHash,
         commentWorkflowExpectedCount,
         dailyMetricEvidence,
-        record: mergeObservationMetrics({...record, payload}, existing),
+        record: articleObservation || mergeObservationMetrics({...record, payload}, existing),
       });
 
       if (changedFields.length > 0) {
@@ -1560,7 +1581,8 @@ export async function upsertCapturedRecord(record, context) {
       record.title || '', record.content || '',
       record.author_name || '', record.author_id || '', record.author_avatar || '', cleanNumber(record.author_fans),
       record.url || '', canonicalUrl, record.cover_url || '', record.note_type || '',
-      cleanNumber(record.likes), cleanNumber(record.comments_count), cleanNumber(record.collects), cleanNumber(record.shares),
+      ...['likes', 'comments_count', 'collects', 'shares'].map(key => record.platform === 'wechat_articles'
+      ? cleanOptionalNumber(record[key]) : cleanNumber(record[key])),
       record.publish_time || '', tags,
       record.blogger_profile_url || '', imageUrls, record.comments_text || '',
       cleanNumber(record.blogger_liked_collected), record.blogger_account_type || '',

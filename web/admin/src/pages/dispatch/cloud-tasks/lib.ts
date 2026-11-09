@@ -232,6 +232,7 @@ export const PLATFORM_LABELS: Record<string, string> = {
   douyin: '抖音',
   weibo: '微博',
   wechat_channels: '视频号',
+  wechat_articles: '微信文章',
   mixed: '小红书＋抖音',
   unknown: '未识别',
 }
@@ -811,19 +812,24 @@ export function taskErrorText(task: CloudTask) {
   return String(error.message || error.reason || error.code || '').trim()
 }
 
-// 手机节点能采的平台：抖音（搜索发现）和视频号（手机整帖采集，Runner 0.4.0 上报后才出现）。
-export function mobileAgentPlatforms(agent: CloudAgent) {
+type AgentPlatformCapabilities = { capabilities?: Record<string, unknown> | null; allowed_platforms?: string[] }
+
+// 节点列表、任务编排、就绪文案共用手机平台判断；新文章能力必须显式上报 feature。
+export function mobileAgentPlatforms(agent: AgentPlatformCapabilities) {
+  if (!isMobileAgent(agent)) return []
   const supported = Array.isArray(agent.capabilities?.supportedPlatforms)
     ? agent.capabilities.supportedPlatforms.map(value => String(value || '').trim()).filter(Boolean)
     : ['douyin']
   const allowed = Array.isArray(agent.allowed_platforms)
     ? agent.allowed_platforms.map(value => String(value || '').trim()).filter(Boolean)
     : []
-  return ['douyin', 'wechat_channels'].filter(platform =>
-    supported.includes(platform) && (allowed.length === 0 || allowed.includes(platform)))
+  return ['douyin', 'wechat_channels', 'wechat_articles'].filter(platform =>
+    supported.includes(platform) && (allowed.length === 0 || allowed.includes(platform)) &&
+    (platform !== 'wechat_articles' || (Array.isArray(agent.capabilities?.runnerFeatures)
+      && agent.capabilities.runnerFeatures.includes('wechat_articles'))))
 }
 
-export function agentCreatePlatforms(agent: CloudAgent) {
+export function agentCreatePlatforms(agent: AgentPlatformCapabilities) {
   // 云端 create 命令当前只在小红书、抖音执行链实现；微博仍可上报任务，
   // 但不能从管理端新建，避免设备收到无法执行的指令。
   const allPlatforms = ['xiaohongshu', 'douyin']
@@ -857,9 +863,10 @@ export function isMobileAgent(agent: { capabilities?: Record<string, unknown> | 
 // 离线与否仍由既有的 2 分钟心跳规则（agent.online）决定，调用方在离线时无需展示就绪文案。
 export function mobileReadinessLabel(agent: { capabilities?: Record<string, unknown> | null }) {
   const capabilities = agent.capabilities || {}
-  const ready = Array.isArray(capabilities.readyPlatforms) ? capabilities.readyPlatforms.map(String) : []
+  const supported = mobileAgentPlatforms(agent)
+  const ready = Array.isArray(capabilities.readyPlatforms) ? capabilities.readyPlatforms.map(String).filter(platform => supported.includes(platform)) : []
   // Runner 0.4.0 上报本次可用的 App：同时能采视频号时写明平台。
-  if (capabilities.readyForSearch === true && ready.includes('wechat_channels')) {
+  if (capabilities.readyForSearch === true && ready.some(platform => platform === 'wechat_channels' || platform === 'wechat_articles')) {
     return `可采 ${ready.map(platform => PLATFORM_LABELS[platform] || platform).join('、')}`
   }
   if (capabilities.readyForSearch === true) return '可执行搜索'
@@ -956,7 +963,7 @@ export function agentAssignmentBlockReason(agent: CloudAgent, mode: 'one_time' |
   // 手机节点不看浏览器扩展的 remoteTaskCreate / remoteUnattendedPlanWrite；只要求手机搜索发现能力与抖音或视频号平台。
   if (isMobileAgent(agent)) {
     if (agent.capabilities?.mobileSearchDiscoveryV1 !== true) return '手机执行器版本过低，需升级后才能接收搜索发现'
-    if (!agentCreatePlatforms(agent).includes('douyin') && !mobileAgentPlatforms(agent).includes('wechat_channels')) return '手机节点未开通抖音或视频号平台'
+    if (mobileAgentPlatforms(agent).length === 0) return '手机节点未开通支持的采集平台'
     return ''
   }
   if (agent.capabilities?.remoteTaskCreate !== true) return '客户端扩展版本过低，需升级后才能远程接单'
