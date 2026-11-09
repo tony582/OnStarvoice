@@ -150,6 +150,8 @@ export function createSharePreview({chromePath = DEFAULT_CHROME, profileDir, por
       if (kind === 'article') {
         // Keep Chrome's normal desktop UA. The Channels-only mobile override never applies to article tabs.
         await send('Emulation.setDeviceMetricsOverride', {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false}, sessionId, signal);
+        await send('Emulation.setLocaleOverride', {locale: 'zh-CN'}, sessionId, signal);
+        await send('Emulation.setTimezoneOverride', {timezoneId: 'Asia/Shanghai'}, sessionId, signal);
         await send('Page.enable', {}, sessionId, signal);
         const loaded = new Promise(resolve => {
           listener = message => { if (message.sessionId === sessionId && message.method === 'Page.loadEventFired') resolve(); };

@@ -267,6 +267,15 @@ test('articles and Channels reuse one browser/queue; article tab has desktop lay
   assert.equal(mobile.length,1);assert.match(mobile[0].sessionId,/target-2$/u);
   const desktop=fixture.calls.find(call=>call.method==='Emulation.setDeviceMetricsOverride');
   assert.equal(desktop.params.mobile,false);assert.equal(desktop.params.width,1280);
+  for (const [method,params] of [['Emulation.setLocaleOverride',{locale:'zh-CN'}],
+    ['Emulation.setTimezoneOverride',{timezoneId:'Asia/Shanghai'}]]) {
+    const overrides=fixture.calls.filter(call=>call.method===method);
+    assert.equal(overrides.length,1);assert.equal(overrides[0].sessionId,desktop.sessionId);
+    assert.deepEqual(overrides[0].params,params);
+    const navigation=fixture.calls.find(call=>call.method==='Page.navigate'&&call.sessionId===desktop.sessionId);
+    assert.ok(fixture.calls.indexOf(overrides[0])<fixture.calls.indexOf(navigation));
+    assert.notEqual(overrides[0].sessionId,mobile[0].sessionId);
+  }
   assert.equal(fixture.targets.size,0);
 });
 
