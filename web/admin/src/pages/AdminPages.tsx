@@ -764,6 +764,9 @@ export function SettingsPage() {
       for (const k of ['report_daily_time', 'report_weekly_time', 'report_monthly_day', 'report_monthly_time']) body[k] = settings[k]
     } else if (group === 'comment-risk') {
       body.comment_risk_attention_enabled = settings.comment_risk_attention_enabled === 'false' ? 'false' : 'true'
+    } else if (group === 'wechat-forward') {
+      body.wechat_forward_recipients = (settings.wechat_forward_recipients || '')
+        .split(/\r?\n/).map(line => line.normalize('NFC').trim()).filter(Boolean).filter((name, index, names) => names.indexOf(name) === index).join('\n')
     } else if (group === 'ops-control') {
       for (const key of [
         'ops_control_enabled',
@@ -788,6 +791,7 @@ export function SettingsPage() {
     }
     await api.put('/admin/settings', body)
     if (group === 'llm' || group === 'llm-relay') await loadSettings()
+    if (group === 'wechat-forward') setSettings(current => ({ ...current, wechat_forward_recipients: body.wechat_forward_recipients }))
     if (group === 'comment-risk') refreshBadges()
     alert('保存成功')
   }
@@ -1030,6 +1034,25 @@ export function SettingsPage() {
             </span>
           </span>
         </label>
+      </SettingsCard>
+
+      <SettingsCard
+        title="视频号发到微信"
+        description="内容详情里「发到微信」可以选的接收人。采集手机会在它登录的微信里按名字搜索并转发视频号卡片。"
+        onSave={() => { save('wechat-forward').catch(error => alert(error instanceof Error ? error.message : '保存失败')) }}
+      >
+        <Field label="接收人（每行一个）" full>
+          <textarea
+            value={settings.wechat_forward_recipients || ''}
+            onChange={event => u('wechat_forward_recipients', event.target.value)}
+            rows={4}
+            placeholder={'金明Tony\n文件传输助手'}
+            className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/10"
+          />
+        </Field>
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+          名字要和采集手机微信里显示的完全一致（有备注就写备注）。每个名字 1–40 个字，最多 20 个；只对当前租户生效。详情里可多选，手机会逐个发送。清空并保存后将无法新建发送。
+        </p>
       </SettingsCard>
 
       <SettingsCard

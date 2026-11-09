@@ -70,7 +70,7 @@ export function createAndroidControlRouter({service,enabledTenants=configuredAnd
   router.post('/runs/:id/stop',...writer,handle(req=>service.stop(req.tenantId,req.params.id,req.body || {})));
   router.post('/runs/:id/resume',...writer,handle(req=>service.resume(req.tenantId,req.params.id)));
   router.post('/wechat-forwards',...writer,handle(req=>service.forward(req.tenantId,{recordId:req.body?.recordId,
-    recipient:req.body?.recipient,userId:req.user?.id || '',userName:req.actorName || ''})));
+    recipients:req.body?.recipients,recipient:req.body?.recipient,userId:req.user?.id || '',userName:req.actorName || ''})));
   router.get('/wechat-forwards',...user,handle(req=>service.forwards(req.tenantId,req.query.recordId)));
   const agent=[authenticateAgent,flag,principal];
   for (const action of ['poll','renew','complete','close']) router.post(`/agent/${action}`,...agent,

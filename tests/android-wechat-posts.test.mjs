@@ -8,7 +8,7 @@ import {mobileCommentPlan, mobilePlanBlockReason, mobileTaskFilters, mobileWorkf
 import {readyPlatforms, runnerFeatures, taskPayload} from '../server/services/android-control/leases.js';
 import {normalizeOrchestrationRequest} from '../server/services/capture-orchestration.js';
 import {normalizeRemoteTaskInput} from '../server/services/capture-cloud.js';
-import {forwardItemStatus, forwardRecipient} from '../server/services/android-control/forward.js';
+import {forwardItemStatus, forwardRecipient, normalizeForwardRecipients} from '../server/services/android-control/forward.js';
 import {normalizeRecord} from '../server/routes/sync.js';
 
 const principal = {tenantId: '11111111-1111-4111-8111-111111111111', agentId: '22222222-2222-4222-8222-222222222222'};
@@ -181,9 +181,15 @@ const pick = filters => ({videoDuration: filters.videoDuration, searchScope: fil
 test('发到微信: the contact name is checked before it can reach the phone; a forward is never retried', () => {
   assert.equal(forwardRecipient('  金明Tony '), '金明Tony');
   assert.equal(forwardRecipient('A B'), 'A B');
-  for (const bad of ['', '   ', 'x'.repeat(41), "金明'Tony", '金明"', 'a$b', 'a`b', 'a\\b', 'a\nb']) {
+  for (const bad of ['', '   ', 'x'.repeat(41), "金明'Tony", '金明"', 'a$b', 'a`b', 'a\\b', 'a\nb', null, 123, ['金明Tony'], {}]) {
     assert.throws(() => forwardRecipient(bad), {code: 'INVALID_FORWARD_RECIPIENT'}, JSON.stringify(bad));
   }
+  assert.equal(normalizeForwardRecipients(' 金明Tony \r\n\n文件传输助手\n金明Tony'), '金明Tony\n文件传输助手');
+  assert.equal(normalizeForwardRecipients(''), '');
+  assert.equal(normalizeForwardRecipients('Cafe\u0301\nCaf\u00e9'), 'Caf\u00e9');
+  for (const bad of [123, {}, ['金明Tony']]) assert.throws(() => normalizeForwardRecipients(bad), {code: 'INVALID_FORWARD_RECIPIENT'});
+  assert.throws(() => normalizeForwardRecipients('好人\n坏"人'), {code: 'INVALID_FORWARD_RECIPIENT'});
+  assert.throws(() => normalizeForwardRecipients(Array.from({length: 21}, (_, i) => `人${i}`).join('\n')), {code: 'TOO_MANY_FORWARD_RECIPIENTS'});
   assert.equal(forwardItemStatus('completed', 'forward_sent'), 'completed');
   assert.equal(forwardItemStatus('completed', 'forward_unconfirmed'), 'completed_with_warnings');
   for (const status of ['needs_action', 'interrupted']) assert.equal(forwardItemStatus(status, 'forward_recipient_not_found'), 'failed');

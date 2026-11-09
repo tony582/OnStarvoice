@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
+import {createRequire} from 'node:module';
+import {once} from 'node:events';
 import test from 'node:test';
 import {validatePostgresIntegrationTarget} from '../../../scripts/lib/postgres-integration-target.mjs';
 import {createAndroidControlService} from '../../../server/services/android-control/service.js';
@@ -155,18 +157,24 @@ test('WeChat Channels on a shared phone: claim by platform, post upload, receipt
     await f.complete(plain.task);
   });
 
-  await t.test('发到微信: one queued forward per post and contact, claimed first by a Runner that can forward, never retried', async st => {
+  await t.test('发到微信: only configured contacts, one queued forward per post and contact, claimed first by a Runner that can forward, never retried', async st => {
     const f = await fixture(st);
     const [record] = await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,content,author_name,url,keyword,publish_time)
       VALUES($1,'wxc_forward_test','wechat_channels','keyword_notes','忍无可忍','忍无可忍，无须再忍！','萧枫-东莞新起点凯迪专修',
         'https://weixin.qq.com/sph/AsvBQklNxh','凯迪拉克车机升级','2026-11-05 12:00:01') RETURNING id`, [f.tenantId]);
-    await assert.rejects(f.service.forward(f.tenantId, {recordId: record.id, recipient: "金明'"}), {code: 'INVALID_FORWARD_RECIPIENT'});
-    // A keyword already waiting does not hold the forward back.
+    await assert.rejects(f.service.forward(f.tenantId, {recordId: record.id, recipients: ['金明Tony']}), {code: 'FORWARD_RECIPIENTS_NOT_CONFIGURED'});
+    await query(`INSERT INTO tenant_settings(tenant_id,key,value) VALUES($1,'wechat_forward_recipients',$2)`, [f.tenantId, '金明Tony\n文件传输助手']);
+    st.after(() => query('DELETE FROM tenant_settings WHERE tenant_id=$1', [f.tenantId]));
+    await assert.rejects(f.service.forward(f.tenantId, {recordId: record.id, recipients: ['别人']}), {code: 'FORWARD_RECIPIENT_NOT_ALLOWED'});
+    await assert.rejects(f.service.forward(f.tenantId, {recordId: record.id, recipients: []}), {code: 'INVALID_FORWARD_RECIPIENT'});
+    // A keyword already waiting does not hold the forwards back.
     await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星']});
-    const {forward} = await f.service.forward(f.tenantId, {recordId: record.id, recipient: '金明Tony', userName: '测试员'});
-    assert.equal(forward.status, 'pending');
-    const again = await f.service.forward(f.tenantId, {recordId: record.id, recipient: '金明Tony'});
-    assert.equal(again.forward.id, forward.id, 'the same post to the same contact is not queued twice');
+    const {forwards} = await f.service.forward(f.tenantId, {recordId: record.id, recipients: ['金明Tony', '文件传输助手', '金明Tony'], userName: '测试员'});
+    assert.deepEqual(forwards.map(item => [item.recipient, item.status]), [['金明Tony', 'pending'], ['文件传输助手', 'pending']]);
+    const again = await f.service.forward(f.tenantId, {recordId: record.id, recipients: ['金明Tony']});
+    assert.equal(again.forwards[0].id, forwards[0].id, 'the same post to the same contact is not queued twice');
+    const listedNow = await f.service.forwards(f.tenantId, record.id);
+    assert.deepEqual(listedNow.recipients, ['金明Tony', '文件传输助手']);
     const older = await f.poll({platforms: ['wechat_channels'], features: ['wechat_search_filters']});
     assert.equal(older.task.mode, 'keyword', 'a Runner that cannot forward takes the keyword instead');
     await f.complete(older.task);
@@ -179,18 +187,122 @@ test('WeChat Channels on a shared phone: claim by platform, post upload, receipt
     const [child] = await query('SELECT task_type FROM capture_tasks WHERE id=$1', [claim.task.identity.taskId]);
     assert.equal(child.task_type, 'wechat_forward');
     await f.complete(claim.task, {reason: 'forward_sent'});
-    let [listed] = (await f.service.forwards(f.tenantId, record.id)).forwards;
-    assert.deepEqual([listed.status, listed.reason, listed.requestedBy], ['completed', 'forward_sent', '测试员']);
-    // A failed forward stays failed: no second claim, even for the same phone.
-    await f.service.forward(f.tenantId, {recordId: record.id, recipient: '另一个人'});
-    const failing = await f.poll({platforms: ['wechat_channels'], features: ['wechat_forward']});
-    await f.complete(failing.task, {status: 'needs_action', reason: 'forward_recipient_not_found'});
-    [listed] = (await f.service.forwards(f.tenantId, record.id)).forwards;
-    assert.deepEqual([listed.recipient, listed.status, listed.errorCode], ['另一个人', 'failed', 'WECHAT_FORWARD_FAILED']);
+    // The next contact fails: it stays failed, no second claim.
+    const second = await f.poll({platforms: ['wechat_channels'], features: ['wechat_forward']});
+    assert.equal(second.task.keyword, '文件传输助手');
+    await f.complete(second.task, {status: 'needs_action', reason: 'forward_recipient_not_found'});
+    const listed = (await f.service.forwards(f.tenantId, record.id)).forwards;
+    assert.deepEqual(listed.map(item => [item.recipient, item.status, item.reason, item.errorCode]).sort(),
+      [['文件传输助手', 'failed', 'forward_recipient_not_found', 'WECHAT_FORWARD_FAILED'], ['金明Tony', 'completed', 'forward_sent', '']]);
+    assert.equal(listed[0].requestedBy, '测试员');
     assert.equal((await f.poll({platforms: ['wechat_channels'], features: ['wechat_forward']})).task, null);
-    await assert.rejects(f.service.forward(f.tenantId, {recordId: (await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,url)
-      VALUES($1,'dy1','douyin','keyword_notes','t','https://www.douyin.com/video/1') RETURNING id`, [f.tenantId]))[0].id, recipient: '金明Tony'}),
-    {code: 'RECORD_NOT_WECHAT_CHANNELS'});
+    const [douyin] = await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,url)
+      VALUES($1,'dy1','douyin','keyword_notes','t','https://www.douyin.com/video/1') RETURNING id`, [f.tenantId]);
+    await assert.rejects(f.service.forward(f.tenantId, {recordId: douyin.id, recipients: ['金明Tony']}), {code: 'RECORD_NOT_WECHAT_CHANNELS'});
+  });
+
+  await t.test('multi-contact forwards are atomic, tenant-scoped and de-duplicated under concurrent reversed selections', async st => {
+    const f = await fixture(st);
+    const other = await fixture(st);
+    const [record] = await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,url)
+      VALUES($1,'wxc_multi_forward','wechat_channels','keyword_notes','批量转发','https://weixin.qq.com/sph/AsvBQklNxh') RETURNING id`, [f.tenantId]);
+    const recipients = Array.from({length: 20}, (_, i) => `接收人${String(i).padStart(2, '0')}`);
+    await query(`INSERT INTO tenant_settings(tenant_id,key,value) VALUES($1,'wechat_forward_recipients',$2),($3,'wechat_forward_recipients','其他租户联系人')`,
+      [f.tenantId, recipients.join('\n'), other.tenantId]);
+    await assert.rejects(f.service.forward(f.tenantId, {recordId: record.id, recipients: [recipients[0], '其他租户联系人']}),
+      {code: 'FORWARD_RECIPIENT_NOT_ALLOWED'});
+    await assert.rejects(f.service.forward(other.tenantId, {recordId: record.id, recipients: ['其他租户联系人']}), {code: 'RECORD_NOT_FOUND'});
+    for (const invalid of [null, recipients[0], {}, [recipients[0], 123]]) {
+      await assert.rejects(f.service.forward(f.tenantId, {recordId: record.id, recipients: invalid, recipient: recipients[0]}),
+        {code: 'INVALID_FORWARD_RECIPIENT'});
+    }
+    assert.equal((await query('SELECT id FROM capture_task_items WHERE tenant_id=$1', [f.tenantId])).length, 0,
+      'a rejected multi-contact request does not leave the allowed contacts queued');
+    const [first, second] = await Promise.all([
+      f.service.forward(f.tenantId, {recordId: record.id, recipients}),
+      f.service.forward(f.tenantId, {recordId: record.id, recipients: [...recipients].reverse()}),
+    ]);
+    const byRecipient = result => Object.fromEntries(result.forwards.map(item => [item.recipient, item.id]));
+    assert.deepEqual(byRecipient(first), byRecipient(second), 'opposite order concurrent requests share the same pending tasks');
+    assert.equal((await query('SELECT id FROM capture_task_items WHERE tenant_id=$1', [f.tenantId])).length, 20);
+    assert.deepEqual((await f.service.forwards(f.tenantId, record.id)).recipients, recipients);
+    assert.deepEqual(await other.service.forwards(other.tenantId, record.id), {forwards: [], recipients: ['其他租户联系人']});
+
+    // Completed history must not crowd out any of the 20 current contacts in the detail panel.
+    await query(`UPDATE capture_task_items SET status='completed',finished_at=now() WHERE tenant_id=$1`, [f.tenantId]);
+    await query(`UPDATE capture_tasks SET status='completed',finished_at=now() WHERE tenant_id=$1`, [f.tenantId]);
+    const newest = await f.service.forward(f.tenantId, {recordId: record.id, recipients});
+    const listed = await f.service.forwards(f.tenantId, record.id);
+    assert.equal(listed.forwards.length, 20);
+    assert.deepEqual(byRecipient(listed), byRecipient(newest));
+    assert.ok(listed.forwards.every(item => item.status === 'pending'));
+    // The previous single-recipient request field remains valid for already-open admin pages.
+    const legacy = await f.service.forward(f.tenantId, {recordId: record.id, recipient: recipients[0]});
+    assert.equal(legacy.forwards[0].id, byRecipient(newest)[recipients[0]]);
+  });
+
+  await t.test('HTTP settings validate contacts and new tenants never inherit another customer’s recipients', async st => {
+    const f = await fixture(st);
+    const {default: adminRouter} = await import('../../../server/routes/admin.js');
+    const {createAndroidControlRouter} = await import('../../../server/routes/android-control.js');
+    const {hashSessionToken} = await import('../../../server/services/auth-service.js');
+    const {getDefaultTenantId} = await import('../../../server/db/init.js');
+    const require = createRequire(new URL('../../../server/package.json', import.meta.url));
+    const express = require('express'), app = express();
+    const token = randomUUID();
+    const [{id: userId}] = await query(`INSERT INTO users(email,name,password_hash,is_internal,global_role,must_change_password)
+      VALUES($1,'Forward integration','not-a-login-password',true,'platform_admin',false) RETURNING id`, [`${randomUUID()}@example.invalid`]);
+    st.after(() => query('DELETE FROM users WHERE id=$1', [userId]));
+    await query(`INSERT INTO user_sessions(user_id,token_hash,expires_at) VALUES($1,$2,now()+interval '1 hour')`, [userId, hashSessionToken(token)]);
+    app.use(express.json());
+    app.use('/admin', adminRouter);
+    app.use('/android', createAndroidControlRouter({enabledTenants: () => new Set([f.tenantId])}));
+    app.use((error, _req, res, _next) => res.status(500).json({ok: false, error: error.code || 'test_server_error'}));
+    const server = app.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    st.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+    const request = async (path, {method = 'GET', body, tenantId = f.tenantId} = {}) => {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}${path}`, {method,
+        headers: {authorization: `Bearer ${token}`, 'x-tenant-id': tenantId, 'content-type': 'application/json'},
+        body: body === undefined ? undefined : JSON.stringify(body)});
+      return {status: response.status, payload: await response.json()};
+    };
+    assert.equal((await request('/admin/settings', {method: 'PUT', body: {wechat_forward_recipients: ' 金明Tony\r\n文件传输助手\n金明Tony'}})).status, 200);
+    assert.equal((await query(`SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='wechat_forward_recipients'`, [f.tenantId]))[0].value,
+      '金明Tony\n文件传输助手');
+    for (const invalid of ['安全联系人\n坏"人', Array.from({length: 21}, (_, i) => `接收人${i}`).join('\n'), ['金明Tony']]) {
+      assert.equal((await request('/admin/settings', {method: 'PUT', body: {wechat_forward_recipients: invalid}})).status, 400);
+    }
+    assert.equal((await query(`SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='wechat_forward_recipients'`, [f.tenantId]))[0].value,
+      '金明Tony\n文件传输助手', 'an invalid settings save leaves the previous contact list intact');
+    const [record] = await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,url)
+      VALUES($1,'wxc_http_forward','wechat_channels','keyword_notes','HTTP 转发','https://weixin.qq.com/sph/AsvBQklNxh') RETURNING id`, [f.tenantId]);
+    const queued = await request('/android/wechat-forwards', {method: 'POST', body: {recordId: record.id, recipients: ['金明Tony', '文件传输助手']}});
+    assert.equal(queued.status, 200);
+    assert.deepEqual(queued.payload.forwards.map(item => item.recipient), ['金明Tony', '文件传输助手']);
+    const listed = await request(`/android/wechat-forwards?recordId=${record.id}`);
+    assert.deepEqual(listed.payload.recipients, ['金明Tony', '文件传输助手']);
+    assert.equal(listed.payload.forwards.length, 2);
+
+    const defaultTenantId = await getDefaultTenantId();
+    const [original] = await query(`SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='wechat_forward_recipients'`, [defaultTenantId]);
+    st.after(async () => {
+      if (original) await query(`UPDATE tenant_settings SET value=$2 WHERE tenant_id=$1 AND key='wechat_forward_recipients'`, [defaultTenantId, original.value]);
+      else await query(`DELETE FROM tenant_settings WHERE tenant_id=$1 AND key='wechat_forward_recipients'`, [defaultTenantId]);
+    });
+    assert.equal((await request('/admin/settings', {method: 'PUT', tenantId: defaultTenantId,
+      body: {wechat_forward_recipients: '默认客户联系人'}})).status, 200);
+    const created = await request('/admin/tenants', {method: 'POST', body: {name: `forward-copy-${randomUUID()}`}});
+    assert.equal(created.status, 200);
+    st.after(() => query('DELETE FROM tenants WHERE id=$1', [created.payload.tenant.id]));
+    assert.deepEqual(await query(`SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key='wechat_forward_recipients'`, [created.payload.tenant.id]), []);
+
+    // Tenant viewers can see configured choices and progress, but cannot send or edit the list.
+    await query(`UPDATE users SET global_role='',is_internal=false WHERE id=$1`, [userId]);
+    await query(`INSERT INTO user_memberships(user_id,tenant_id,role) VALUES($1,$2,'tenant_viewer')`, [userId, f.tenantId]);
+    assert.equal((await request(`/android/wechat-forwards?recordId=${record.id}`)).status, 200);
+    assert.equal((await request('/android/wechat-forwards', {method: 'POST', body: {recordId: record.id, recipients: ['金明Tony']}})).status, 403);
+    assert.equal((await request('/admin/settings', {method: 'PUT', body: {wechat_forward_recipients: '别人'}})).status, 403);
   });
 
   await t.test('a post captured again keeps its comment ids although OCR read the comments a little differently', async st => {

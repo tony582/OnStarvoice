@@ -15,23 +15,55 @@ const VIEW_COLUMNS = `parent.id, parent.status AS task_status, parent.created_at
   parent.metadata->'wechatForward'->>'requestedByName' AS requested_by`;
 
 export function forwardRecipient(value) {
-  const name = String(value ?? '').normalize('NFC').trim();
+  if (typeof value !== 'string') fail('INVALID_FORWARD_RECIPIENT', 422);
+  const name = value.normalize('NFC').trim();
   if (!RECIPIENT.test(name)) fail('INVALID_FORWARD_RECIPIENT', 422);
   return name;
+}
+
+// The contacts an operator may pick, set per tenant in 系统设置 (one name per line). Only these can be sent to.
+export const WECHAT_FORWARD_RECIPIENTS_SETTING = 'wechat_forward_recipients';
+export const MAX_FORWARD_RECIPIENTS = 20;
+/** The stored form of the list: valid names, one per line, de-duplicated; an invalid name rejects the whole list. */
+export function normalizeForwardRecipients(value) {
+  if (value != null && typeof value !== 'string') fail('INVALID_FORWARD_RECIPIENT', 422);
+  const names = [...new Set(String(value ?? '').split(/\r?\n/u).map(line => line.trim()).filter(Boolean).map(forwardRecipient))];
+  if (names.length > MAX_FORWARD_RECIPIENTS) fail('TOO_MANY_FORWARD_RECIPIENTS', 422);
+  return names.join('\n');
+}
+export async function forwardRecipients(tx, tenantId) {
+  const row = await tx.queryOne('SELECT value FROM tenant_settings WHERE tenant_id=$1 AND key=$2', [tenantId, WECHAT_FORWARD_RECIPIENTS_SETTING]);
+  return normalizeForwardRecipients(row?.value).split('\n').filter(Boolean);
 }
 
 const view = row => row && ({id: row.id, recordId: row.record_id, recipient: row.recipient, requestedBy: row.requested_by || '',
   status: row.status, reason: row.reason || '', errorCode: row.error_code || '', createdAt: row.created_at, finishedAt: row.finished_at});
 
-/** Queue one forward. A same post → same recipient request still waiting or running is returned instead of a second one. */
-export async function requestForward(tx, tenantId, {recordId, recipient, userId = '', userName = ''}) {
-  const name = forwardRecipient(recipient);
+/**
+ * Queue one forward per chosen contact (each must be on the tenant's list). A same post → same contact request still
+ * waiting or running is returned instead of a second one.
+ */
+export async function requestForwards(tx, tenantId, {recordId, recipients, recipient, userId = '', userName = ''} = {}) {
+  if (recipients !== undefined && !Array.isArray(recipients)) fail('INVALID_FORWARD_RECIPIENT', 422);
+  const wanted = [...new Set((recipients ?? [recipient]).map(forwardRecipient))];
+  if (!wanted.length || wanted.length > MAX_FORWARD_RECIPIENTS) fail('INVALID_FORWARD_RECIPIENT', 422);
+  const allowed = await forwardRecipients(tx, tenantId);
+  if (!allowed.length) fail('FORWARD_RECIPIENTS_NOT_CONFIGURED', 409);
+  if (wanted.some(name => !allowed.includes(name))) fail('FORWARD_RECIPIENT_NOT_ALLOWED', 422);
+  // Hold one lock per post for the whole batch. Individual contact locks can deadlock when two operators
+  // pick the same contacts in opposite orders. The transaction also keeps a rejected batch all-or-nothing.
+  await tx.execute('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [tenantId, `wechat_forward:${id(recordId, 'RECORD_ID')}`]);
+  const forwards = [];
+  for (const name of wanted) forwards.push(await requestForward(tx, tenantId, {recordId, name, userId, userName}));
+  return forwards;
+}
+
+async function requestForward(tx, tenantId, {recordId, name, userId, userName}) {
   const record = await tx.queryOne(`SELECT id, platform, url, external_id, title, author_name, publish_time FROM records
     WHERE tenant_id=$1 AND id=$2`, [tenantId, id(recordId, 'RECORD_ID')]);
   if (!record) fail('RECORD_NOT_FOUND', 404);
   if (record.platform !== 'wechat_channels') fail('RECORD_NOT_WECHAT_CHANNELS', 422);
   if (!SHARE_LINK.test(String(record.url || ''))) fail('RECORD_SHARE_LINK_MISSING', 422);
-  await tx.execute('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [tenantId, `wechat_forward:${record.id}:${name}`]);
   const open = await tx.queryOne(`SELECT ${VIEW_COLUMNS} FROM capture_task_items item JOIN capture_tasks parent ON parent.id=item.task_id
     WHERE item.tenant_id=$1 AND item.item_type=$2 AND item.record_id=$3 AND item.keyword=$4 AND item.status IN ('pending','running')
     ORDER BY parent.created_at DESC LIMIT 1`, [tenantId, FORWARD_ITEM_TYPE, record.id, name]);
@@ -45,9 +77,10 @@ export async function requestForward(tx, tenantId, {recordId, recipient, userId 
     wechatForward: {recordId: record.id, recipient: name, requestedByUserId: userId, requestedByName: String(userName).slice(0, 120)},
     planSnapshot: {platform: 'wechat_channels', keywords: [name], searchFilters: {}, keywordMaxDetectedItems: 1, captureSettings: {}}};
   await tx.execute(`INSERT INTO capture_tasks(id,tenant_id,client_task_id,task_type,feature_key,title,platform,source,trigger_type,
-      status,metadata,orchestration_revision,counts,progress,message)
+      status,metadata,orchestration_revision,counts,progress,message,created_at)
     VALUES($1::uuid,$2,$1::uuid::text,'capture_orchestration','keyword_orchestration',$3,'wechat_channels','cloud','manual',
-      'pending',$4,1,'{"total":1}'::jsonb,'{"current":0,"total":1}'::jsonb,'等待手机空闲后发送')`,
+      'pending',$4,1,'{"total":1}'::jsonb,'{"current":0,"total":1}'::jsonb,'等待手机空闲后发送',clock_timestamp())`,
+  // clock_timestamp: contacts picked together are sent in the order they were picked (the claim orders by creation).
   [parentId, tenantId, `发到微信 · ${name}`.slice(0, 240), metadata]);
   await tx.execute(`INSERT INTO capture_task_items(id,tenant_id,task_id,item_key,ordinal,keyword,platform,item_type,record_id,
       external_id,url_snapshot,status,metadata,assignment_revision)
@@ -58,10 +91,14 @@ export async function requestForward(tx, tenantId, {recordId, recipient, userId 
     WHERE parent.id=$1 AND parent.tenant_id=$2`, [parentId, tenantId]));
 }
 
-/** The latest forwards of one post, newest first (the drawer shows their state). */
+/** The latest forwards of one post, newest first (the drawer shows the newest per contact). */
 export async function recordForwards(tx, tenantId, recordId) {
-  const rows = await tx.queryAll(`SELECT ${VIEW_COLUMNS} FROM capture_task_items item JOIN capture_tasks parent ON parent.id=item.task_id
-    WHERE item.tenant_id=$1 AND item.item_type=$2 AND item.record_id=$3 ORDER BY parent.created_at DESC LIMIT 5`,
+  const rows = await tx.queryAll(`SELECT * FROM (
+      SELECT DISTINCT ON (item.keyword) ${VIEW_COLUMNS}
+      FROM capture_task_items item JOIN capture_tasks parent ON parent.id=item.task_id
+      WHERE item.tenant_id=$1 AND item.item_type=$2 AND item.record_id=$3
+      ORDER BY item.keyword, parent.created_at DESC, parent.id DESC
+    ) latest ORDER BY created_at DESC, id DESC LIMIT 100`,
   [tenantId, FORWARD_ITEM_TYPE, id(recordId, 'RECORD_ID')]);
   return rows.map(view);
 }

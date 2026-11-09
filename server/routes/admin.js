@@ -27,6 +27,7 @@ import {
   normalizeOpsControlSettingPatch,
   OpsControlSettingsError,
 } from '../services/ops-control.js';
+import { normalizeForwardRecipients, WECHAT_FORWARD_RECIPIENTS_SETTING } from '../services/android-control/forward.js';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
@@ -137,6 +138,8 @@ router.post('/tenants', requirePlatformAdmin, async (req, res, next) => {
          WHERE tenant_id = $2
            -- 人工安全验证通知属于客户自己的收件地址，绝不能继承默认租户。
            AND key <> 'capture_attention_email_to'
+           -- 微信接收人属于各租户自己的通讯录，必须单独配置。
+           AND key <> 'wechat_forward_recipients'
            -- 无人值守控制面必须由每个新租户单独启用，运维收件人也不得串租户。
            AND key NOT IN (
              'ops_control_enabled',
@@ -927,6 +930,20 @@ router.put('/settings', async (req, res, next) => {
         });
       }
       settings[COMMENT_RISK_ATTENTION_SETTING] = value;
+    }
+    // 视频号「发到微信」的接收人：每行一个，名字不合法就整份拒收，避免手机搜到别的联系人。
+    if (Object.prototype.hasOwnProperty.call(settings, WECHAT_FORWARD_RECIPIENTS_SETTING)) {
+      try {
+        settings[WECHAT_FORWARD_RECIPIENTS_SETTING] = normalizeForwardRecipients(settings[WECHAT_FORWARD_RECIPIENTS_SETTING]);
+      } catch (error) {
+        return res.status(400).json({
+          ok: false,
+          error: error.code || 'invalid_wechat_forward_recipients',
+          message: error.code === 'TOO_MANY_FORWARD_RECIPIENTS'
+            ? '接收人最多 20 个'
+            : '接收人每行一个，1–40 个字，不能含引号、反斜杠或 $ 符号',
+        });
+      }
     }
     const failoverKeys = Object.keys(settings).filter(key =>
       key.startsWith('llm_failover_'));
