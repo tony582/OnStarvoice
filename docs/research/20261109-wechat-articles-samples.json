@@ -1,0 +1,376 @@
+{
+  "schema": "starvoice.wechat_articles_research.v1",
+  "kind": "manual_research_observations_not_ingest_events",
+  "date": "2026-11-09",
+  "timezone": "Asia/Shanghai",
+  "branch": "codex/research-wechat-articles-20261109",
+  "baseline": "dcb5d11",
+  "entry": "发现 → 搜一搜 → 文章",
+  "query": "安吉星",
+  "device": {
+    "model": "DE106",
+    "androidApi": 27,
+    "wechatVersion": "8.0.80",
+    "screen": [
+      1080,
+      2242
+    ]
+  },
+  "scope": {
+    "productionCodeChanged": false,
+    "productionIngestPerformed": false,
+    "articleForwardPerformed": false,
+    "automatedFullCaptureImplemented": false,
+    "sameArticleCrossLinkIdentityVerified": false,
+    "sourceTextFactualAccuracyAssessed": false
+  },
+  "samples": [
+    {
+      "id": "text-with-comments",
+      "title": "5年后安吉星要不要续费",
+      "account": "白白过一天",
+      "sourceUrl": "https://mp.weixin.qq.com/s/bMWKCZnPrhVlz2uCqmRzKw",
+      "publishedAtDisplay": "2026年8月24日 14:39 内蒙古",
+      "publishedAt": "2026-08-24T14:39+08:00",
+      "timePrecision": "minute",
+      "contentKind": "text_article",
+      "bodyCaptureStatus": "partial",
+      "nativeBodyAvailable": false,
+      "bodyImagesStored": false,
+      "metrics": {
+        "read": {
+          "raw": "1406",
+          "value": 1406,
+          "precision": "displayed_integer"
+        },
+        "like": {
+          "raw": "8",
+          "value": 8
+        },
+        "share": {
+          "raw": "10",
+          "value": 10
+        },
+        "recommend": {
+          "raw": "推荐",
+          "value": null
+        }
+      },
+      "comments": {
+        "availability": "visible",
+        "postingState": "input_visible",
+        "headerCount": 2,
+        "observedCount": 2,
+        "visibleScopeComplete": true,
+        "fieldsObserved": [
+          "author",
+          "location",
+          "date_label",
+          "body",
+          "reply_control",
+          "like_control"
+        ],
+        "likeCountsDisplayed": false,
+        "note": "Two visible top-level comments; 首评 is a badge. No replies were expanded."
+      },
+      "evidence": [
+        "21-article-first.png",
+        "36-body-1.png",
+        "36-body-2.png",
+        "36-body-3.png",
+        "37-comments-end.png",
+        "32-copy-link.png",
+        "33-link-copied.png",
+        "public/report.json"
+      ]
+    },
+    {
+      "id": "image-with-follow-restricted-posting",
+      "title": "安吉星微信小程序上线啦！",
+      "account": "安吉星服务",
+      "sourceUrl": "https://mp.weixin.qq.com/s/kL-i_FzeHUakdh5_x49Sog",
+      "publishedAtDisplay": "2026年7月10日 14:57 上海",
+      "publishedAt": "2026-07-10T14:57+08:00",
+      "timePrecision": "minute",
+      "contentKind": "image_heavy_article",
+      "bodyCaptureStatus": "partial",
+      "nativeBodyAvailable": false,
+      "bodyImagesStored": false,
+      "embeddedMediaObserved": [
+        "video",
+        "mini_program_card"
+      ],
+      "metrics": {
+        "read": {
+          "raw": "4.8万",
+          "value": 48000,
+          "precision": "abbreviated_display_not_exact"
+        },
+        "like": {
+          "raw": "512",
+          "value": 512
+        },
+        "share": {
+          "raw": "263",
+          "value": 263
+        },
+        "recommend": {
+          "raw": "102",
+          "value": 102
+        }
+      },
+      "comments": {
+        "availability": "visible",
+        "postingState": "followers_only",
+        "postingStateRaw": "作者已设置关注后可以留言",
+        "headerCount": 1,
+        "observedCount": 1,
+        "visibleScopeComplete": true,
+        "followPerformed": false,
+        "fieldsObserved": [
+          "author",
+          "location",
+          "date_label",
+          "body",
+          "reply_control",
+          "like_control"
+        ]
+      },
+      "evidence": [
+        "39-image-article.png",
+        "40-image-loaded.png",
+        "41-image-body-1.png",
+        "41-image-body-2.png",
+        "41-image-body-3.png",
+        "41-image-body-4.png",
+        "41-image-body-5.png",
+        "41-image-body-6.png",
+        "42-image-footer-1.png",
+        "43-image-comments.png",
+        "46-image-link.png",
+        "article-ui.xml",
+        "public/report-image.json"
+      ]
+    },
+    {
+      "id": "no-visible-comment-entry",
+      "title": "2.2亿美元和解之后，你急刹数据归谁",
+      "account": "汽车前瞻资讯",
+      "sourceUrl": "https://mp.weixin.qq.com/s/FYL3oVvFiTPoeeaxO0ERCQ",
+      "publishedAtDisplay": "2026年11月8日23:59 上海",
+      "publishedAt": "2026-11-08T23:59+08:00",
+      "timePrecision": "minute",
+      "contentKind": "text_article_with_cover",
+      "originalBadgeObserved": true,
+      "bodyCaptureStatus": "partial",
+      "nativeBodyAvailable": null,
+      "bodyImagesStored": false,
+      "metrics": {
+        "read": {
+          "raw": "3",
+          "value": 3,
+          "precision": "displayed_integer"
+        },
+        "like": {
+          "raw": "1",
+          "value": 1
+        },
+        "share": {
+          "raw": "分享",
+          "value": null
+        },
+        "recommend": {
+          "raw": "1",
+          "value": 1
+        }
+      },
+      "comments": {
+        "availability": "unavailable",
+        "reason": "no_visible_comment_entry_at_observed_article_end",
+        "postingState": "unknown",
+        "headerCount": null,
+        "observedCount": null,
+        "explicitClosedTextObserved": false,
+        "endEvidence": [
+          "closing_body_section",
+          "previous_article_navigation",
+          "read_count_row",
+          "stable_bottom_after_further_swipes",
+          "no_footer_comment_icon"
+        ],
+        "visibleScopeComplete": null
+      },
+      "evidence": [
+        "50-latest-loaded.png",
+        "51-latest-article.png",
+        "52-latest-body-1.png",
+        "52-latest-body-2.png",
+        "52-latest-body-6.png",
+        "55-no-comments-link.png"
+      ]
+    }
+  ],
+  "runtimeRestored": {
+    "tenant": "安吉星",
+    "runtime": "0.4.7-97583fa",
+    "verifiedAt": "2026-11-09T16:08:49+08:00",
+    "processAlive": true,
+    "running": true,
+    "readyForSearch": true,
+    "controlError": null,
+    "deviceClosureRequired": false
+  },
+  "evidenceStorage": "Local ignored output directory; source files are not committed. Hashes describe this research snapshot.",
+  "evidence": [
+    {
+      "path": "output/wechat-articles/20-articles-loaded.png",
+      "sha256": "571ec3466d053e54eb3aef048022aaf9425fd00818efb8e9ef1627e169ac7ab7",
+      "bytes": 597477
+    },
+    {
+      "path": "output/wechat-articles/21-article-first.png",
+      "sha256": "1b09b798780d738fca93666f7054313f0ee4843590c7133710172e914ecac454",
+      "bytes": 277951
+    },
+    {
+      "path": "output/wechat-articles/32-copy-link.png",
+      "sha256": "02d3e0d5cb5abbedfa09353944dc18175a6b6de0c49136a3a8faba7690e54f47",
+      "bytes": 212862
+    },
+    {
+      "path": "output/wechat-articles/33-link-copied.png",
+      "sha256": "de169c2b8839f486e6ab226ac10e7fc60f7430bbe8e6cf854a5e0be1b2cccd09",
+      "bytes": 326096
+    },
+    {
+      "path": "output/wechat-articles/36-body-1.png",
+      "sha256": "1fd67b1e2922e71c0934e588d39833e37f4fbc305ba60474cc1149443cb1ded3",
+      "bytes": 275663
+    },
+    {
+      "path": "output/wechat-articles/36-body-2.png",
+      "sha256": "f7d85453786c18dff4fca1468cdb5aa04a527a3fb3956f7c325667d329aae899",
+      "bytes": 272175
+    },
+    {
+      "path": "output/wechat-articles/36-body-3.png",
+      "sha256": "f9aaf43dcecf2702e6355e58b5d06727aa8d59c90c0130d5468a304e6fd8b416",
+      "bytes": 230303
+    },
+    {
+      "path": "output/wechat-articles/37-comments-end.png",
+      "sha256": "3a33d8f549f4710d72835ed472a37b764da5052a8e52cf2f8d804816c5ab7733",
+      "bytes": 210366
+    },
+    {
+      "path": "output/wechat-articles/39-image-article.png",
+      "sha256": "652c7dafffe526e13a7e80a5323023b505f70ed06cacaf1ae5682c376bb1f68b",
+      "bytes": 86895
+    },
+    {
+      "path": "output/wechat-articles/40-image-loaded.png",
+      "sha256": "ba7bc58c25398912b92f1ef5c955ed0279bc5d16105ce6debc3dd5b7c095c08e",
+      "bytes": 1939151
+    },
+    {
+      "path": "output/wechat-articles/41-image-body-1.png",
+      "sha256": "4c9b4581b2611b5bc93eda4aa88e8cd5144a2b449f71d698eb097168797f1210",
+      "bytes": 1647127
+    },
+    {
+      "path": "output/wechat-articles/41-image-body-2.png",
+      "sha256": "99f22a35eb9e7ec5e79ed9ce6b3f2c8a03a85187f2c9fa1d2b4c56f0d1f56a7b",
+      "bytes": 1615813
+    },
+    {
+      "path": "output/wechat-articles/41-image-body-3.png",
+      "sha256": "8904345d22b233821fc824fe1ab6200d3e8f5f2c426be9aff615caab2cce8614",
+      "bytes": 2221663
+    },
+    {
+      "path": "output/wechat-articles/41-image-body-4.png",
+      "sha256": "65c5809452371e9f467be5be4abe6ae51df9351c5ce2803ffb4deebf50776ab2",
+      "bytes": 1877277
+    },
+    {
+      "path": "output/wechat-articles/41-image-body-5.png",
+      "sha256": "7e2753ce96c1e0b15d69fbb99cbeac9388faaf213a81e8679cf817c9914464c2",
+      "bytes": 1754814
+    },
+    {
+      "path": "output/wechat-articles/41-image-body-6.png",
+      "sha256": "8d01c28c0c4ccc7bda6f4bf0f80e11752aa7dfa2619374f4232b432c50952812",
+      "bytes": 1104168
+    },
+    {
+      "path": "output/wechat-articles/42-image-footer-1.png",
+      "sha256": "2a8f425912c674a5dff55d3ebd0ba940cc5d8bb6156dfffd9e5119ac449a7fcc",
+      "bytes": 301015
+    },
+    {
+      "path": "output/wechat-articles/43-image-comments.png",
+      "sha256": "2a8f425912c674a5dff55d3ebd0ba940cc5d8bb6156dfffd9e5119ac449a7fcc",
+      "bytes": 301015
+    },
+    {
+      "path": "output/wechat-articles/46-image-link.png",
+      "sha256": "3d33145f0d0d76b101eb0a5184d5a8d1c2a03bb64e457cc85a59ada636e45300",
+      "bytes": 344905
+    },
+    {
+      "path": "output/wechat-articles/50-latest-loaded.png",
+      "sha256": "7dd7825035bebe0c723a4e861772ca89e0833765efdb15092d2533de44f154bf",
+      "bytes": 503290
+    },
+    {
+      "path": "output/wechat-articles/51-latest-article.png",
+      "sha256": "b58609b3864e3b7a67ad30bd704ca64bf344831b786f26fe94563b04777f512e",
+      "bytes": 298675
+    },
+    {
+      "path": "output/wechat-articles/52-latest-body-1.png",
+      "sha256": "a55a87c37d78c5dd02797d703b7f60d576ce193cab18ffa622a2998f4b529882",
+      "bytes": 281864
+    },
+    {
+      "path": "output/wechat-articles/52-latest-body-2.png",
+      "sha256": "a55a87c37d78c5dd02797d703b7f60d576ce193cab18ffa622a2998f4b529882",
+      "bytes": 281864
+    },
+    {
+      "path": "output/wechat-articles/52-latest-body-6.png",
+      "sha256": "a55a87c37d78c5dd02797d703b7f60d576ce193cab18ffa622a2998f4b529882",
+      "bytes": 281864
+    },
+    {
+      "path": "output/wechat-articles/55-no-comments-link.png",
+      "sha256": "c04d09f58f5af50a24a5120db8ba7fcc684ed9cce9a9ef83032d5802f4b19d5b",
+      "bytes": 330427
+    },
+    {
+      "path": "output/wechat-articles/58-interaction-filter.png",
+      "sha256": "03711f00d33fdfeecd112cc7c8b6e3ba6eafdd4c7fc50254d4e370aa87186794",
+      "bytes": 280430
+    },
+    {
+      "path": "output/wechat-articles/article-ui.xml",
+      "sha256": "eb2228f83d17c8d45613bd087714b97ef10c4f5c3f3b06bfa14a7e144169e0b8",
+      "bytes": 367
+    },
+    {
+      "path": "output/wechat-articles/public/report-image.json",
+      "sha256": "f847e25df1be99c642b7cad73a28d16e6d26f34d2cbd8d0e1fd44edeea626f63",
+      "bytes": 2647
+    },
+    {
+      "path": "output/wechat-articles/public/report.json",
+      "sha256": "f168ed5f9fbe014fa6585506fdd2041bd3c182c56442cf91e3e0466d622b9747",
+      "bytes": 3017
+    },
+    {
+      "path": "output/wechat-articles/runner-restored.log",
+      "sha256": "617068f9f3317b9193958c315abde8e8f44e892d65f138def30ca79a78566f4b",
+      "bytes": 447
+    }
+  ]
+}
