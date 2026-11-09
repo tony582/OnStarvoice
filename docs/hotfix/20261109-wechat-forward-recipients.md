@@ -22,3 +22,14 @@
 - 独立本机 PostgreSQL：`onstarvoice_test_wechat_multi_20261109`，12/12 通过。覆盖名单格式、事务原子性、租户隔离、20 人状态、并发反序请求去重、旧请求兼容、真实 HTTP 设置与权限、新客户不继承名单。
 - Admin 构建、转发组件 ESLint 通过。真实本地后台验证：配置保存去重、空选禁发、两人提交分别排队、成功选择记忆、取消不覆盖记忆。使用本地隔离数据库，没有向手机发送。
 - 发布与真机结果单独记录；本地证据目录为 `outputs/wechat-forward-multi-20261109/`，UI 截图在工作树 `output/playwright/wechat-forward-multi-20261109/`。
+
+## 生产发布与真机验收
+
+- 功能提交 `1ade51e3b9f4625e6e17675f9135d0307177f84b`，已推送 `codex/feat-wechat-filters-20261109`。2026-11-09 **14:54:04 +08:00** 发布完成；逐文件与静态资源哈希核对通过，公开 HTTPS Admin 入口与本次构建一致。仅 API 重启；scheduler 和 ai-media 保持原进程。
+- 生产发布与回滚证据：`/opt/onstarvoice-private/releases/wechat-forward-multi-1ade51e3b9f4-20261109/`。本轮无数据迁移；OnStar 与安吉星分别配置「金明Tony」「文件传输助手」，没有改其他租户的设置。
+- **14:54:46** 在 OnStar 对已有萧枫帖子 `8fe30da6-32c0-4d28-b69d-e29e56ac69eb` 提交一次两人多选。两条任务均由原 0.4.7 手机采集器执行，最终 `completed / forward_sent`，手机实际捕捉到发送成功提示。本轮给两位接收人各新增一张卡片，没有重试或额外重复发送。
+  - 金明Tony：`f4d10068-a36c-4836-b3fe-fe3edb3763d0`。
+  - 文件传输助手：`ce6e83c7-c007-4570-ba4f-ddcc5f843c78`。
+- 验收后 OnStar 测试采集器正常停止、释放设备锁。**14:57** 安吉星 `runtime-0.4.7-97583fa` 恢复 `running=true / ready=true / controlError=null`，生产心跳确认 `wechat_forward` 能力，抖音与视频号均就绪。
+- 安吉星当时没有视频号记录，因此真实发送验收使用 OnStar 的现有帖子；没有将测试内容导入安吉星。安吉星配置及手机就绪已确认，业务内容产生后的首条真实发送仍属于后续使用验收。
+- 功能提交的 [GitHub CI](https://github.com/tony582/OnStarvoice/actions/runs/42575844752) 五项作业全部成功：测试与构建、生产 Node 24 兼容性、PostgreSQL 14 / Node 24.12.0、PostgreSQL 16 / Node 24.12.0、PostgreSQL 16 / Node 24；集成作业也完成手机采集器对真实控制面的检查。本条发布记录为纯文档补记，不改变已部署代码。
