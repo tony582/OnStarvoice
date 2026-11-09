@@ -249,7 +249,7 @@ test('actual runner merge and JSON event serialization satisfy the server DOM/ph
     bodyBlocks: [{type: 'text', text: paragraph}, {type: 'image', url: urls[0], alt: '图 1'},
       {type: 'text', text: '第二段'}, {type: 'image', url: urls[1], alt: '图 2'}],
     evidence: {bodyEndObserved: true, domContentObserved: true, domReadyState: 'complete',
-      imageUrlsObserved: 2, selectorAcceptance: 'offline_fixtures_only', originalImagesCaptured: false},
+      imageUrlsObserved: 2, selectorAcceptance: 'live_dom_20261109', originalImagesCaptured: false},
     metrics: {like: {value: 7, raw: '7', capturedAt: bodyAt}, read: {value: 48000, raw: '4.8万', precision: 'rounded', capturedAt: bodyAt}}};
   const phone = {article: {title: '手机标题不用于覆盖网页', content: '', bodyStatus: 'delegated', source: 'screen_ocr',
     evidence: {screens: 4, bodyEndObserved: false, overlapVerified: null},
@@ -278,7 +278,7 @@ test('actual runner merge and JSON event serialization satisfy the server DOM/ph
     page.bodyBlocks.map(({type, text, url}) => type === 'text' ? {type, text} : {type, url}));
   assert.deepEqual(normalized.article.evidence, {screens: null, bodyEndObserved: true, overlapVerified: null,
     originalImagesCaptured: false, domContentObserved: true, domReadyState: 'complete', imageUrlsObserved: 2,
-    commentScreens: 4, selectorAcceptance: 'offline_fixtures_only'});
+    commentScreens: 4, selectorAcceptance: 'live_dom_20261109'});
   for (const [key, value, source, capturedAt] of [['like', 0, 'screen_ocr', phoneAt], ['read', 48000, 'page_dom', bodyAt],
     ['recommend', 3, 'screen_ocr', phoneAt], ['share', null, 'page_dom', bodyAt]]) {
     assert.equal(normalized.article.metrics[key].value, value, key);

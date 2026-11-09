@@ -79,7 +79,7 @@ test('desktop prose and images combine with phone-only comments and independentl
     images: [{url: 'https://images.example.test/article.png', alt: '正文配图'}],
     bodyBlocks: [{type: 'text', text: '直接读取的完整网页正文'}, {type: 'image', url: 'https://images.example.test/article.png'}],
     metrics: {like: {value: 7, raw: '7'}, read: {value: 48000, raw: '4.8万', capturedAt}},
-    evidence: {domContentObserved: true, bodyEndObserved: true}});
+    evidence: {domContentObserved: true, bodyEndObserved: true, selectorAcceptance: 'live_dom_20261109'}});
   const seen = [];
   const {events, result} = await run({device: p.device, bodySource: 'page_dom', preview: {
     resolveArticle: async (link, options) => { seen.push({link, signal: options.signal}); return page; },
@@ -87,6 +87,7 @@ test('desktop prose and images combine with phone-only comments and independentl
   assert.equal(result.stats.posts, 1); assert.equal(seen[0].link, url); assert.ok(seen[0].signal);
   const event = events[0];
   assert.equal(event.article.source, 'page_dom'); assert.equal(event.article.content, page.content);
+  assert.equal(event.article.evidence.selectorAcceptance, 'live_dom_20261109');
   assert.equal(event.article.metrics.like.value, 0); assert.equal(event.article.metrics.like.source, 'screen_ocr');
   assert.equal(event.article.metrics.read.value, 48000); assert.equal(event.article.metrics.read.source, 'page_dom');
   assert.equal(event.article.metrics.read.capturedAt, capturedAt);

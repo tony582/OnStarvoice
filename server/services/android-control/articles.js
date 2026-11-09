@@ -156,7 +156,8 @@ export function normalizeArticleEvent(input, principal) {
           && source.evidence.imageUrlsObserved <= 100 ? source.evidence.imageUrlsObserved : null,
         commentScreens: Number.isSafeInteger(source.evidence?.commentScreens) && source.evidence.commentScreens >= 0
           && source.evidence.commentScreens <= 10_000 ? source.evidence.commentScreens : null,
-        selectorAcceptance: source.evidence?.selectorAcceptance === 'offline_fixtures_only' ? 'offline_fixtures_only' : ''},
+        selectorAcceptance: ['offline_fixtures_only', 'live_dom_20261109'].includes(source.evidence?.selectorAcceptance)
+          ? source.evidence.selectorAcceptance : ''},
       metrics: Object.fromEntries(['read', 'like', 'share', 'recommend'].map(key => [key, metric(source.metrics?.[key], source.source, capturedAt)])),
       ...body},
     comments: {status: comments.status, headerCount, items, source: 'screen_ocr', capturedAt: observedAt(comments.capturedAt, capturedAt),

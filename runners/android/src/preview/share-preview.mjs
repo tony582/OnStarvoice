@@ -113,13 +113,14 @@ export function createSharePreview({chromePath = DEFAULT_CHROME, profileDir, por
     Promise.resolve(operation).then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
   });
   const readArticle = async (link, sessionId, signal) => {
-    let observed = null;
+    let observed = null, repeatedReason = null, repeatedFailures = 0;
     while (!signal.aborted) {
       const expression = `(${readArticleDocument.toString()})(document,${JSON.stringify({expectedUrl: link, capturedAt: new Date().toISOString()})})`;
       const result = await send('Runtime.evaluate', {expression, returnByValue: true}, sessionId, signal);
       if (result.exceptionDetails) throw new PreviewError('article_preview_dom_error');
       const value = result.result?.value;
       if (value?.ok === true && value.article?.url === link && value.article?.source === 'page_dom') {
+        repeatedReason = null; repeatedFailures = 0;
         const signature = JSON.stringify([value.article.title, value.article.account, value.article.publishedAt, value.article.bodyBlocks]);
         // The current DOM must have stopped changing; no private page state is used as a readiness shortcut.
         if (signature === observed) return value.article;
@@ -127,6 +128,10 @@ export function createSharePreview({chromePath = DEFAULT_CHROME, profileDir, por
       } else {
         observed = null;
         if (!value?.retryable) throw new PreviewError(value?.reason || 'article_preview_incomplete');
+        const reason = value.reason || 'article_preview_incomplete';
+        repeatedFailures = value.readyState === 'complete' ? (reason === repeatedReason ? repeatedFailures + 1 : 1) : 0;
+        repeatedReason = value.readyState === 'complete' ? reason : null;
+        if (repeatedFailures >= 8) throw new PreviewError(reason);
       }
       await whileActive(sleep(250), signal);
     }

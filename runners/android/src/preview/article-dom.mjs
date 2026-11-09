@@ -1,10 +1,11 @@
 /**
- * Candidate selectors, verified only with local DOM fixtures. Actual mp pages have NOT been accepted.
+ * Selectors replayed against user-provided live DOM snapshots from 2026-11-09, without site access.
+ * Snapshot acceptance does not establish end-to-end browser or image-download acceptance.
  * This function is self-contained so the existing preview browser can evaluate it in its page.
  * Reads rendered DOM only: no page globals, cookies, tokens, API calls or hidden script payloads.
  */
 export function readArticleDocument(document, {expectedUrl, capturedAt = new Date().toISOString(), getStyle} = {}) {
-  const failure = (reason, retryable = false) => ({ok: false, reason, retryable});
+  const failure = (reason, retryable = false) => ({ok: false, reason, retryable, readyState: document?.readyState ?? ''});
   const canonical = value => {
     try {
       const url = new URL(value);
@@ -21,10 +22,16 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
   capturedAt = new Date(at).toISOString();
   const styleOf = getStyle ?? (node => document.defaultView?.getComputedStyle?.(node));
   const hidden = node => {
-    for (let current = node?.nodeType === 3 ? node.parentElement : node; current; current = current.parentElement) {
+    const element = node?.nodeType === 3 ? node.parentElement : node;
+    for (let current = element; current; current = current.parentElement) {
       if (current.hidden || current.getAttribute?.('aria-hidden') === 'true') return true;
       const style = styleOf(current);
-      if (style?.display === 'none' || ['hidden', 'collapse'].includes(style?.visibility) || style?.opacity === '0') return true;
+      // Lazy images expose their public URL before scrolling reveals their bitmap. This exception is
+      // only for the image itself: a hidden ancestor, display:none or visibility:hidden still hides it.
+      const placeholder = current === element && current.tagName?.toUpperCase() === 'IMG'
+        && (current.getAttribute?.('data-src') || String(current.getAttribute?.('class') ?? '').split(/\s+/u).includes('js_img_placeholder'));
+      if (style?.display === 'none' || ['hidden', 'collapse'].includes(style?.visibility)
+        || (style?.opacity === '0' && !placeholder)) return true;
     }
     return false;
   };
@@ -49,9 +56,16 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
   const title = nodeText(first('#activity-name, .rich_media_title'));
   const account = nodeText(first('#js_name, .rich_media_meta_nickname'));
   if (!title || !account || title.length > 500 || account.length > 200) return failure('article_preview_header_incomplete', true);
-  const author = nodeText(first('#js_author_name')) || account;
+  const author = nodeText(first('#js_author_name_text')) || nodeText(first('#js_author_name')) || account;
   const timeLabel = nodeText(first('#publish_time, #js_publish_time'));
-  const date = timeLabel.match(/(20\d{2})[年/.-]\s*(\d{1,2})[月/.-]\s*(\d{1,2})日?(?:\s+(\d{1,2})[:：](\d{2}))?/u);
+  let date = timeLabel.match(/(20\d{2})[年/.-]\s*(\d{1,2})[月/.-]\s*(\d{1,2})日?(?:\s+(\d{1,2})[:：](\d{2}))?/u);
+  const englishDate = timeLabel.match(/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s*(20\d{2}),\s*(\d{1,2}):(\d{2})\s+(AM|PM)$/iu);
+  if (!date && englishDate) {
+    const [, month, day, year, hour, minute, period] = englishDate;
+    if (+hour < 1 || +hour > 12) return failure('article_preview_invalid_time');
+    const months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    date = ['', year, String(months.indexOf(month.toLowerCase()) + 1), day, String(+hour % 12 + (period.toUpperCase() === 'PM' ? 12 : 0)), minute];
+  }
   let publishedAt = null, timePrecision = 'unknown';
   if (date) {
     const [, y, m, d, h, minute] = date, utc = new Date(Date.UTC(+y, +m - 1, +d, +(h ?? 0), +(minute ?? 0)));
@@ -77,7 +91,7 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
       if (!value) continue;
       try {
         const url = new URL(value, document.URL);
-        if (['https:', 'http:'].includes(url.protocol) && !url.username && !url.password) return url.href;
+        if (['https:', 'http:'].includes(url.protocol) && !url.username && !url.password) { url.hash = ''; return url.href; }
       } catch { /* An unobserved/invalid image is never invented. */ }
     }
     return '';
@@ -89,7 +103,8 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
     const tag = node.tagName?.toUpperCase();
     if ((tag === 'BUTTON' || node.getAttribute?.('role') === 'button') && /^(?:阅读全文|展开全文|继续阅读|展开更多)$/u.test(nodeText(node))) folded = true;
     if (excluded.has(tag)) return;
-    if (['IFRAME', 'VIDEO', 'AUDIO', 'CANVAS'].includes(tag)) { unreadMedia = true; return; }
+    if (['IFRAME', 'VIDEO', 'AUDIO', 'CANVAS', 'MP-COMMON', 'MPVOICE', 'MP-MINIPROGRAM'].includes(tag)
+      || (tag === 'SECTION' && String(node.getAttribute?.('class') ?? '').split(/\s+/u).includes('channels_iframe_wrp'))) { unreadMedia = true; return; }
     if (tag === 'IMG') {
       flush();
       const url = imageUrl(node);
@@ -127,10 +142,12 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
     return [key, {value: known ? value : null, raw, precision: !known ? 'unknown' : count[3] ? 'lower_bound' : count[2] ? 'rounded' : 'displayed_integer', source: 'page_dom', capturedAt}];
   }));
   const bodyReason = truncated ? 'content_limit' : imageMissing ? 'image_url_unavailable' : unreadMedia ? 'embedded_media_unread' : '';
+  const locationNode = first('#js_ip_wording_wrp');
+  const location = clean(locationNode?.getAttribute?.('aria-label')) || nodeText(locationNode) || null;
   return {ok: true, article: {url: wanted, source: 'page_dom', capturedAt, timeSource: 'page_dom', title, account, author,
-    publishedAt, timeLabel, timePrecision, location: nodeText(first('#js_ip_wording')) || null,
+    publishedAt, timeLabel, timePrecision, location,
     content, contentType: !content && images.length ? 'image' : 'article', bodyStatus: bodyReason ? 'partial' : 'complete', bodyReason,
     evidence: {bodyEndObserved: !bodyReason, originalImagesCaptured: false, domContentObserved: true,
-      domReadyState: document.readyState, imageUrlsObserved: images.length, selectorAcceptance: 'offline_fixtures_only'},
+      domReadyState: document.readyState, imageUrlsObserved: images.length, selectorAcceptance: 'live_dom_20261109'},
     images, bodyBlocks, metrics}};
 }

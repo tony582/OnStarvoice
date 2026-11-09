@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
-import {mkdtempSync, rmSync} from 'node:fs';
+import {mkdtempSync, readFileSync, rmSync} from 'node:fs';
+import {createHash} from 'node:crypto';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import vm from 'node:vm';
@@ -56,7 +57,7 @@ test('visible DOM supplies exact paragraphs and ordered image references without
   assert.deepEqual(article.images.map(image => [image.order,image.url,image.stored]), [[0,'https://images.example.test/one.png',false],[1,'https://images.example.test/two.jpg',false]]);
   assert.equal(article.source, 'page_dom');
   assert.equal(article.publishedAt, '2026-11-09T17:30:00+08:00');
-  assert.equal(article.evidence.selectorAcceptance, 'offline_fixtures_only');
+  assert.equal(article.evidence.selectorAcceptance, 'live_dom_20261109');
   assert.equal(article.bodyStatus, 'complete');
 });
 
@@ -99,6 +100,110 @@ test('date precision and unknown dates are preserved, invalid/future dates fail'
   for (const date of ['2026年2月30日','2026年13月1日','2026年11月9日 25:00','2027年1月1日']) {
     assert.equal(extract(documentFixture({date})).reason,'article_preview_invalid_time');
   }
+  for (const [date, time] of [['Nov 8, 2026, 11:59 PM','23:59'], ['Nov 8, 2026, 12:01 AM','00:01'], ['Nov 8, 2026, 12:00 PM','12:00']]) {
+    assert.equal(extract(documentFixture({date})).article.publishedAt,`2026-11-08T${time}:00+08:00`);
+  }
+  for (const date of ['Feb 30, 2026, 1:00 PM','Nov 8, 2026, 0:01 AM','Nov 8, 2026, 13:01 PM','Nov 8, 2026, 12:60 AM']) {
+    assert.equal(extract(documentFixture({date})).reason,'article_preview_invalid_time');
+  }
+});
+
+test('lazy image opacity does not hide its observed URL, but hidden ancestors and other visibility rules still do', () => {
+  const image=element('img',{'data-src':'https://mmbiz.qpic.cn/mmbiz_png/public/640?wx_fmt=png#imgIndex=1'});
+  image.style.opacity='0';
+  const article=extract(documentFixture({content:[image]})).article;
+  assert.equal(article.contentType,'image');assert.equal(article.images.length,1);
+  assert.equal(article.images[0].url,'https://mmbiz.qpic.cn/mmbiz_png/public/640?wx_fmt=png');
+  assert.equal(article.bodyBlocks[0].url,article.images[0].url);
+  for (const [property,value] of [['opacity','0'],['display','none'],['visibility','hidden']]) {
+    const parent=element('section',{},image);parent.style[property]=value;
+    assert.equal(extract(documentFixture({content:[parent]})).reason,'article_preview_body_empty');
+  }
+  image.style.display='none';
+  assert.equal(extract(documentFixture({content:[image]})).reason,'article_preview_body_empty');
+  const classPlaceholder=element('img',{class:'js_img_placeholder',src:'https://mmbiz.qpic.cn/public/640'});
+  classPlaceholder.style.opacity='0';
+  assert.equal(extract(documentFixture({content:[classPlaceholder]})).article.images.length,1);
+});
+
+test('visible author text and region wrapper take precedence over hidden legacy elements', () => {
+  const old=element('span',{id:'js_author_name'},'旧作者');old.style.display='none';
+  const region=element('em',{id:'js_ip_wording_wrp','aria-label':'上海'},element('span',{id:'js_ip_wording','aria-hidden':'true'},'地区字样'));
+  const article=extract(documentFixture({extra:[old,element('span',{id:'js_author_name_text'},'可见作者'),region]})).article;
+  assert.equal(article.author,'可见作者');assert.equal(article.location,'上海');
+  assert.equal(extract(documentFixture({extra:[element('em',{id:'js_ip_wording_wrp'},'北京')]})).article.location,'北京');
+  assert.equal(extract(documentFixture()).article.location,null);
+});
+
+test('unread embedded WeChat cards do not leak their child text or images into the article', () => {
+  for (const [tag,attributes] of [['section',{class:'channels_iframe_wrp'}],['mp-common',{}],['mpvoice',{}],['mp-miniprogram',{}]]) {
+    const article=extract(documentFixture({content:[element('p',{},'已读正文'),element(tag,attributes,'卡片文字',element('img',{src:'https://images.example.test/card.png'}))]})).article;
+    assert.equal(article.content,'已读正文');assert.equal(article.images.length,0);
+    assert.equal(article.bodyStatus,'partial');assert.equal(article.bodyReason,'embedded_media_unread');
+  }
+});
+
+function liveFixture(name) {
+  const directory=new URL('./fixtures/wechat-articles/dom/',import.meta.url);
+  const html=readFileSync(new URL(`${name}.html`,directory),'utf8');
+  const snapshot=JSON.parse(readFileSync(new URL(`${name}.tree.json`,directory),'utf8'));
+  assert.equal(createHash('sha256').update(html).digest('hex'),snapshot.htmlSha256);
+  assert.equal(snapshot.provenance,'user_provided_live_dom_20261109');
+  assert.doesNotMatch(html,/<script\b/iu);
+  const hydrate=value=>{
+    if (typeof value==='string') return value;
+    const [tag,attributes,children]=value;
+    const node=element(tag,attributes,...children.map(hydrate));
+    for (const property of ['display','visibility','opacity']) {
+      const match=String(attributes.style??'').match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;!]+)`,'iu'));
+      if (match) node.style[property]=match[1].trim();
+    }
+    node.hidden=Object.hasOwn(attributes,'hidden');
+    return node;
+  };
+  return {url:snapshot.url,document:documentFixture({url:snapshot.url,bodyOnly:hydrate(snapshot.tree)})};
+}
+
+for (const expected of [
+  {id:'FYL3oVvFiTPoeeaxO0ERCQ',title:'2.2亿美元和解之后，你的急刹数据归谁',account:'汽车前瞻资讯',author:'汽车前瞻资讯',publishedAt:'2026-11-08T23:59:00+08:00',characters:4148,images:4,type:'article'},
+  {id:'1ZigfwkDqDuKmKi-M0baeA',title:'解锁安吉星小程序4大板块',account:'安吉星',author:'安吉星',publishedAt:'2026-07-13T14:59:00+08:00',characters:0,images:7,type:'image'},
+  // Four other IMG nodes have opacity:0 ancestors in this supplied snapshot. The task's ancestor
+  // visibility rule excludes them; this inline-style model is not real-browser computed-style proof.
+  {id:'kL-i_FzeHUakdh5_x49Sog',title:'安吉星微信小程序上线啦！',account:'安吉星服务',author:'安吉星服务',publishedAt:'2026-07-10T14:57:00+08:00',characters:0,images:3,type:'image'},
+]) test(`provided live DOM replay: ${expected.id}`,()=>{
+  const {url,document}=liveFixture(expected.id);
+  const result=extract(document,{expectedUrl:url});
+  assert.equal(result.ok,true);
+  const article=result.article;
+  for (const key of ['title','account','author','publishedAt']) assert.equal(article[key],expected[key],key);
+  assert.equal(article.location,'上海');assert.equal(article.timePrecision,'minute');
+  assert.equal(article.content.length,expected.characters);assert.equal(article.images.length,expected.images);
+  assert.equal(article.contentType,expected.type);
+  assert.equal(article.evidence.selectorAcceptance,'live_dom_20261109');
+  assert.ok(article.images.every(image=>!new URL(image.url).hash&&image.stored===false));
+  assert.ok(Object.values(article.metrics).every(metric=>metric.value===null));
+  assert.deepEqual(article.bodyBlocks.filter(block=>block.type==='image').map(block=>block.url),article.images.map(image=>image.url));
+  assert.equal(article.bodyStatus,'complete');assert.equal(article.bodyReason,'');
+});
+
+test('kL-i snapshot retains all seven IMG nodes; four have hidden ancestors and are not fabricated as visible',()=>{
+  const {document}=liveFixture('kL-i_FzeHUakdh5_x49Sog');
+  const content=document.querySelectorAll('#js_content')[0];
+  const images=document.querySelectorAll('img').filter(image=>content.contains(image));
+  const ancestorHidden=images.filter(image=>{
+    for (let node=image.parentElement;node&&node!==content;node=node.parentElement) if (node.style.opacity==='0') return true;
+    return false;
+  });
+  assert.equal(images.length,7);assert.equal(ancestorHidden.length,4);
+});
+
+test('fourth supplied sample is a JSON-only observation, not a fabricated live DOM fixture',()=>{
+  const sample=JSON.parse(readFileSync(new URL('./fixtures/wechat-articles/dom/bMWKCZnPrhVlz2uCqmRzKw.extracted.json',import.meta.url),'utf8'));
+  assert.equal(sample.title,'5年后安吉星要不要续费');assert.equal(sample.account,'白白过一天');
+  assert.equal(sample.content.length,740);assert.equal(sample.images.length,0);
+  // Exercise its observed English label in the synthetic fixture without claiming original HTML exists.
+  const parsed=extract(documentFixture({date:sample.timeLabel})).article;
+  assert.equal(parsed.publishedAt,'2026-08-24T14:39:00+08:00');
 });
 
 test('only visible labelled footer counts are metrics; unknown stays null and true zero stays zero', () => {
@@ -130,7 +235,7 @@ function cdpFixture(t, {holdNavigation=false, delayCreationMs=0, result, maxTabs
         if (method==='Page.navigate') targets.get(sessions.get(sessionId)).url=params.url;
         if (method==='Runtime.evaluate') {
           const url=targets.get(sessions.get(sessionId)).url;
-          answer={result:{value:result ?? extract(documentFixture({url}),{expectedUrl:url})}};
+          answer={result:{value:typeof result==='function' ? result() : result ?? extract(documentFixture({url}),{expectedUrl:url})}};
         }
         if (method==='Network.getResponseBody') answer={body:JSON.stringify({errCode:0,data:{feedInfo:{description:'视频号原路径',createtime:1794000000},authorInfo:{nickname:'账号'}}})};
         emit(this,{id,result:answer});
@@ -181,6 +286,28 @@ test('timeout closes a loading article tab',async t=>{
   const fixture=cdpFixture(t,{holdNavigation:true,timeoutMs:25});
   await assert.rejects(fixture.preview.resolveArticle(URL_A),{code:'preview_timeout'});
   assert.equal(fixture.targets.size,0);
+});
+
+test('eight repeated completed-page failures stop with the observed reason and close the tab',async t=>{
+  const fixture=cdpFixture(t,{timeoutMs:4000,result:{ok:false,reason:'article_preview_body_empty',retryable:true,readyState:'complete'}});
+  await assert.rejects(fixture.preview.resolveArticle(URL_A),{code:'article_preview_body_empty'});
+  assert.equal(fixture.calls.filter(call=>call.method==='Runtime.evaluate').length,8);assert.equal(fixture.targets.size,0);
+});
+
+test('the repeated-failure threshold does not apply while the document is still loading',async t=>{
+  let attempts=0;
+  const fixture=cdpFixture(t,{timeoutMs:4000,result:()=>++attempts<=8
+    ? {ok:false,reason:'article_preview_body_empty',retryable:true,readyState:'loading'} : extract(documentFixture())});
+  assert.equal((await fixture.preview.resolveArticle(URL_A)).title,'测试文章');
+  assert.equal(attempts,10);
+});
+
+test('a different retryable reason resets the completed-page failure streak',async t=>{
+  let attempts=0;
+  const fixture=cdpFixture(t,{timeoutMs:5000,result:()=>++attempts<=9
+    ? {ok:false,reason:attempts<=4?'article_preview_body_empty':'article_preview_header_incomplete',retryable:true,readyState:'complete'} : extract(documentFixture())});
+  assert.equal((await fixture.preview.resolveArticle(URL_A)).title,'测试文章');
+  assert.equal(attempts,11);
 });
 
 test('queued abort never opens its URL, active abort closes its own tab',async t=>{

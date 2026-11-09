@@ -70,7 +70,8 @@ export function articleEvent({task, card, rank, shareUrl, article, comments, cap
         bodyEndObserved: article.evidence?.bodyEndObserved === true, overlapVerified: source === 'page_dom' ? null : article.evidence?.overlapVerified === true,
         originalImagesCaptured: false, domContentObserved: source === 'page_dom' && article.evidence?.domContentObserved === true,
         domReadyState: source === 'page_dom' ? text(article.evidence?.domReadyState, 20) : '',
-        selectorAcceptance: article.evidence?.selectorAcceptance === 'offline_fixtures_only' ? 'offline_fixtures_only' : '',
+        selectorAcceptance: ['offline_fixtures_only', 'live_dom_20261109'].includes(article.evidence?.selectorAcceptance)
+          ? article.evidence.selectorAcceptance : '',
         imageUrlsObserved: images.length, commentScreens: Number.isSafeInteger(article.evidence?.commentScreens) ? article.evidence.commentScreens : null},
       metrics: Object.fromEntries(['read', 'like', 'share', 'recommend'].map(name => [name, metric(article.metrics?.[name], source, capturedAt)]))},
     comments: {status: comments?.status ?? 'unknown', postingState: comments?.postingState ?? 'unknown',
