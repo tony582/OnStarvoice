@@ -10,6 +10,10 @@ import {articleEvent, articleWorkKey, canonicalArticleUrl, articleWindowState, m
 const METHODS = ['inspect', 'search', 'readCards', 'openCard', 'copyLink', 'readArticle', 'returnToResults', 'recoverResults', 'scroll'];
 const RECOVERABLE = new Set(['card_open_failed', 'share_sheet_unverified', 'link_not_copied', 'screen_unverified',
   'article_link_invalid', 'article_header_unverified', 'article_identity_unverified', 'article_unavailable']);
+const PAGE_FAILURES = new Set(['preview_timeout', 'preview_unavailable', 'preview_cdp_error',
+  'article_preview_loading', 'article_preview_body_empty', 'article_preview_header_incomplete', 'article_preview_unavailable',
+  'article_preview_navigation_failed', 'article_preview_dom_error', 'article_preview_incomplete', 'article_preview_body_folded',
+  'article_preview_invalid_time']);
 
 function validate(task, permit, device) {
   validateWechatIdentity(task, permit);
@@ -28,7 +32,7 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
   preview, bodySource = 'page_dom', resumeAuthorized = false, deviceClosureVerified = null,
   prefilter = null, random = Math.random, postPauseMs = POST_PAUSE_MS}) {
   let ledger, gate, result, failure = null, lastEventId = null;
-  const stats = {posts: 0, comments: 0, partialBodies: 0, unavailableBodies: 0, outsideWindow: 0, timeUnverified: 0};
+  const stats = {posts: 0, comments: 0, partialBodies: 0, unavailableBodies: 0, outsideWindow: 0, timeUnverified: 0, pageFailures: 0};
   const note = (event, error = null, extra = {}) => recordDiagnostic(store, {at: new Date(clock.wallNow()).toISOString(), event,
     runId: task?.identity?.discoveryRunId ?? null, itemId: task?.identity?.itemId ?? null, keyword: task?.keyword ?? null,
     code: error?.code ?? null, operation: error?.operation ?? null, details: error ? faultDetails(error) : null, ...extra});
@@ -62,8 +66,24 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
     const readOpened = async (card, rank, shareUrl) => {
       // The normal runtime uses the same desktop preview service as Channels. OCR remains an explicit
       // diagnostic mode; a refused or challenged web page never silently falls back to another access path.
-      const page = bodySource === 'page_dom' ? await gate.run(signal => preview.resolveArticle(shareUrl, {signal}), 'resolveArticle') : null;
-      if (page) {
+      const resolved = bodySource === 'page_dom' ? await gate.run(async signal => {
+        try { return {page: await preview.resolveArticle(shareUrl, {signal})}; }
+        catch (error) {
+          if (signal.aborted) throw signal.reason ?? error;
+          permit.assertAllowed();
+          if (patrol || !PAGE_FAILURES.has(error?.code)) throw error;
+          // A settled page failure is a normal gate return, so returning the phone to results remains safe.
+          // Stops, uncertain operation timeouts, challenges and identity failures must still leave this gate.
+          return {pageFailure: error};
+        }
+      }, 'resolveArticle') : null;
+      if (resolved?.pageFailure) {
+        stats.pageFailures++; note('wechat_article_page_failed', resolved.pageFailure, {operation: 'resolveArticle'});
+        return {pageFailed: true};
+      }
+      const page = resolved?.page;
+      if (bodySource === 'page_dom') {
+        requireEvidence(!!page, 'article_page_incomplete');
         requireEvidence(canonicalArticleUrl(page.url) === canonicalArticleUrl(shareUrl), 'article_link_mismatch');
         requireEvidence(page.source === 'page_dom' && page.title?.trim() && page.account?.trim()
           && (page.content?.trim() || page.images?.length), 'article_page_incomplete');
@@ -145,8 +165,11 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
           if (links.has(articleWorkKey(shareUrl))) {
             cards = await call('returnToResults'); continue;
           }
-          await readOpened(card, rank, shareUrl);
-          links.add(articleWorkKey(shareUrl)); ledger.noteLink(articleWorkKey(shareUrl)); skips = 0;
+          const read = await readOpened(card, rank, shareUrl);
+          // Failed links are attempted once in this run, without consuming the durable success budget.
+          links.add(articleWorkKey(shareUrl));
+          if (!read?.pageFailed) ledger.noteLink(articleWorkKey(shareUrl));
+          skips = 0;
         } catch (error) {
           if (!RECOVERABLE.has(error.code) || error.deviceSettled !== true || ++skips > 4) throw error;
           ledger.noteSkippedCard(); note('wechat_article_skipped', error);
@@ -156,6 +179,9 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
         await sleep(postPauseMs[0] + Math.round(random() * (postPauseMs[1] - postPauseMs[0])), permit.signal);
         permit.assertAllowed();
       }
+    }
+    if (result.status === 'completed' && stats.pageFailures) {
+      result = {...result, status: 'completed_with_warnings', reason: 'article_page_incomplete'};
     }
     if (result.status === 'completed' && (stats.partialBodies || stats.unavailableBodies)) {
       result = {...result, status: 'completed_with_warnings', reason: 'article_body_incomplete'};
