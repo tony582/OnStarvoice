@@ -118,3 +118,4 @@
 - 服务端：`POST /api/capture-cloud/android/wechat-forwards {recordId, recipient}` 建一个只含一项（`item_type='wechat_forward'`）的弹性编排，资格节点 = 该租户开了视频号的手机；同一帖子发给同一人在排队或发送中时不重复建；`GET …/wechat-forwards?recordId=` 列最近 5 次。手机领取时转发项排在最前（当前关键词采完就轮到它），只派给轮询报了 `wechat_forward` 能力的采集器，且只领一次：结束即定局（发送成功 completed、没看到「已发送」提示 completed_with_warnings、其余 failed），不重试，避免发送后回执丢失导致重复发送。
 - Runner 0.4.6：读存下链接的预览（发布时间到秒 + 作者核对同一帖，取新的 exportId）→ 直开原帖 → 转发（按底栏数字行定位）→「转发给朋友」→「选择聊天」页搜索接收人 → 只点名字完全一致的那一行 →「发送给：」确认页必须写着这个名字才点「发送」，否则点取消并退回作品页 → 看「已发送」提示。其它采集流程一旦误入选择聊天页会立即退出（原先只防旧版的 SelectConversationUI）。
 - 验证：Runner 319 项、服务端单元、隔离 PostgreSQL 10 项通过；真机（本机代码、不经服务器）把萧枫那条转发给金明Tony：预览 4 秒、打开 2 秒、转发 18 秒，看到「已发送」。
+- 生产首测（OnStar，14:02，0.4.6）：经新接口排队一条「萧枫 → 金明Tony」，手机领到后发送成功（采集号聊天列表 14:02 显示「[视频号]萧枫-东莞新起点凯迪专修的视频」），但「已发送」提示没被看到，结果记为 completed_with_warnings / forward_unconfirmed。0.4.7：点发送后立刻看一次，再隔 0.4 秒看最多 4 次。

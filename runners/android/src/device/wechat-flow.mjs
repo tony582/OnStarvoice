@@ -242,10 +242,11 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
         await leave();
         throw error;
       }
-      // Sent from here on: no error may make the caller try again.
+      // Sent from here on: no error may make the caller try again. The toast stays about two seconds: look at once,
+      // then a few more times (the first production forward on 2026-11-09 was sent but its toast was missed).
       let toast = false;
-      for (let look = 0; look < 3 && !toast; look++) {
-        await pause(700);
+      for (let look = 0; look < 5 && !toast; look++) {
+        if (look) await pause(400);
         try { toast = forwardToastSeen(await view.look({roi: REGION.workBar})); } catch { /* the toast only confirms */ }
       }
       try { await leave(); } catch { /* parking returns to the main screen anyway */ }
