@@ -87,7 +87,8 @@ export async function runWechatTask({task, store, device, permit, preview, clock
         if (!store.getEvent(event.eventId)) { store.recordEvent(event); stats.posts++; stats.comments += event.comments.items.length; }
         lastEventId = event.eventId;
       };
-      result = await runWechatPatrol({task, call, resolve: resolvePreview, commentLimit, clock, record, note});
+      result = await runWechatPatrol({task, call, resolve: resolvePreview, commentLimit, clock, record, note,
+        canOpenPost: typeof device.openPost === 'function'});
     } else {
       const sort = windowHours !== null ? 'latest' : (task.filters.sort ?? 'all');
       const searched = await call('search', {keyword: task.keyword, sort});

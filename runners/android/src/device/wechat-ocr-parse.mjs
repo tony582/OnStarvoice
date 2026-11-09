@@ -159,9 +159,33 @@ export function sameCard(a, b) {
   return authorsAgree && similarity(a.snippet, b.snippet) >= 0.75;
 }
 
+/**
+ * Where to tap 评论 on a work page, from a screenshot of its lower part. The bar's counts (喜欢 转发 推荐 评论) are read
+ * under their icons; the comment icon sits 65 px above the rightmost count (measured 2026-11-06: counts at y 2131 → icon
+ * 2085; with the 「↑更多视频」 strip counts at y 1951). No count read: shifted by the strip if it is there, else `fallback`.
+ */
+export function commentButton(rows, {fallback, shift}) {
+  const counts = rows.filter(row => row.x >= 700 && row.y >= 1700 && row.y <= 2200
+    && /^(?:\d+(?:\.\d+)?万?|评论)$/u.test(String(row.text).normalize('NFKC').replace(/\s+/gu, '')));
+  const rightmost = counts.sort((a, b) => b.x - a.x)[0];
+  if (rightmost) return {x: fallback.x, y: rightmost.y + Math.round(rightmost.h / 2) - 65, from: 'counts'};
+  const strip = rows.some(row => row.y >= 1950 && /更多视频/u.test(row.text));
+  return strip ? {x: fallback.x, y: fallback.y - shift, from: 'more_videos'} : {...fallback, from: 'fixed'};
+}
+
+// Letters and digits only, for comparing text that OCR may punctuate or cut differently.
+const bareText = value => comparable(value).replace(/[^\p{L}\p{N}]/gu, '');
+// The search box shows about 14 characters: a longer keyword (a patrol caption start) reads back as its beginning,
+// e.g. 「忍无可忍，无须再忍！凯迪拉克/」 for a 20-character query (2026-11-06). At least 8 shown characters must match.
+const BOX_PREFIX_MIN = 8;
+function boxShows(text, keyword) {
+  if (comparable(text) === comparable(keyword)) return true;
+  const shown = bareText(text), goal = bareText(keyword);
+  return shown.length >= BOX_PREFIX_MIN && shown.length < goal.length && goal.startsWith(shown);
+}
+
 export function isResultsPage(rows, keyword) {
-  const goal = comparable(keyword);
-  const box = rows.some(row => row.y < 230 && row.x < 700 && comparable(row.text) === goal);
+  const box = rows.some(row => row.y < 230 && row.x < 700 && boxShows(row.text, keyword));
   const tabs = rows.some(row => row.y > 230 && row.y < 360 && /视频/u.test(row.text));
   return box && tabs;
 }

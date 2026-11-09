@@ -13,7 +13,14 @@ const STALL_SCREENS = 2;
 export async function readCommentPanel({screen, view, limit = 50, expandLimit = 3, signal, maxScreens = null}) {
   let rows = await view.look({signal});
   let first = parseCommentScreen(rows);
-  if (first.headerCount === null && !findText(rows, '评论', {region: {y0: 600, y1: 720, x1: 400}}).length) {
+  const titled = () => first.headerCount !== null || findText(rows, '评论', {region: {y0: 600, y1: 720, x1: 400}}).length > 0;
+  // The 「评论 N」 title was missed on a first reading while the comments were already there (2026-11-06): look again.
+  for (let again = 0; again < 2 && !titled(); again++) {
+    await pause(700, signal);
+    rows = await view.look({signal});
+    first = parseCommentScreen(rows);
+  }
+  if (!titled()) {
     throw new DeviceError('comments_unverified', 'The comment panel was not confirmed', {deviceSettled: true});
   }
   const empty = findText(rows, '暂无评论', {exact: false}).length > 0;

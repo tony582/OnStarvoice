@@ -178,6 +178,45 @@ test('patrol: the stored link refreshes counts; with comments the post is looked
     assert.equal(event.comments.items.length, 1);
     store.close();
   }
+  // 2b. The stored link's preview carries an export id: the post is opened directly, no search, comments read.
+  {
+    const store = new RunnerStore(':memory:');
+    const clock = fixtureClock();
+    const t = patrolTask({enabled: true, limit: 10});
+    const calls = [];
+    const exportId = 'export/UzFfBgAAxKWAeCIjPWGPk8zT4DCsIuXYLQ';
+    const base = device({pages: [[]], calls});
+    const opened = [];
+    const linked = {...base, openPost: async params => { calls.push('openPost'); opened.push(params.exportId); return {opened: true}; },
+      readComments: async () => { calls.push('readComments'); return {status: 'captured', headerCount: 1, post: null,
+        items: [{author: '那年夏天', location: '湖北', timeLabel: '1天前', content: '[图片]', likeCount: null, reply: false, parentIndex: null}]}; }};
+    const result = await runWechatTask({task: t, store, device: linked, permit: fixturePermit(t, clock), clock,
+      postPauseMs: [0, 0], preview: {resolve: async () => info({exportId})}});
+    assert.equal(result.reason, 'patrol_relocated');
+    assert.deepEqual(opened, [exportId]);
+    assert.equal(calls.includes('search'), false);
+    const event = store.getEvent(result.lastEventId).payload;
+    assert.equal(event.link.shareUrl, 'https://weixin.qq.com/sph/Stored1', 'the stored link stays the post link');
+    assert.deepEqual(event.comments.items.map(item => item.content), ['[图片]']);
+    store.close();
+  }
+  // 2c. Opening by link does not reach the work page (phone settled): the search path still finds the post.
+  {
+    const store = new RunnerStore(':memory:');
+    const clock = fixtureClock();
+    const t = patrolTask({enabled: true, limit: 10});
+    const calls = [];
+    const pages = [[card('承诺更新不履约！#上汽通用', '上海交通广播', 48)]];
+    const base = device({pages, calls});
+    const failing = {...base, openPost: async () => { calls.push('openPost');
+      throw Object.assign(new Error('WeChat did not reach the expected screen'), {code: 'screen_unverified', deviceSettled: true}); }};
+    const result = await runWechatTask({task: t, store, device: failing, permit: fixturePermit(t, clock), clock, postPauseMs: [0, 0],
+      preview: {resolve: async () => info({exportId: 'export/UzFfBgAAxKWAeCIjPWGPk8zT4DCsIuXYLQ'})}});
+    assert.equal(result.reason, 'patrol_relocated');
+    assert.deepEqual(calls.filter(name => ['openPost', 'search', 'openCard'].includes(name)), ['openPost', 'search', 'openCard']);
+    assert.equal(store.getEvent(result.lastEventId).payload.link.shareUrl, 'https://weixin.qq.com/sph/Abc1xyz');
+    store.close();
+  }
   // 3. Nothing works: no event, a warning ending that only cools the post down on the server.
   {
     const store = new RunnerStore(':memory:');

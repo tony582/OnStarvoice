@@ -8,6 +8,15 @@ export const WECHAT_PROFILE = Object.freeze({
   model: 'DE106', apiLevel: '27', screen: {width: 1080, height: 2242}, productionAccepted: false,
 });
 export const WECHAT_MAIN = 'com.tencent.mm/.ui.LauncherUI';
+// WeChat's own entry for weixin:// links. A share link opened in the phone browser ends here with this feed link
+// (logcat, 2026-11-06); started directly for user 0 it opens the post without the browser or the app-twin chooser.
+export const WECHAT_SCHEME_ENTRY = 'com.tencent.mm/.plugin.base.stub.WXCustomSchemeEntryActivity';
+// The preview page's sceneInfo.dynamicExportId: a new value on every read, each one opens the same post.
+export const EXPORT_ID = /^export\/[A-Za-z0-9_-]{8,200}$/u;
+export function feedLink(exportId) {
+  if (!EXPORT_ID.test(String(exportId ?? ''))) throw new DeviceError('invalid_export_id', 'The post export id is not usable');
+  return `weixin://biz/finder/openFinderFeed/exportId=${exportId}&actionType=0&commentScene=39&entryScene=64&entryCardType=48&requestScene=0`;
+}
 export const ACTIVITY = Object.freeze({
   main: 'com.tencent.mm.ui.LauncherUI',
   channelsHome: 'com.tencent.mm.plugin.finder.ui.FinderHomeAffinityUI',
@@ -24,6 +33,8 @@ export const POINT = Object.freeze({
   // Work page bottom bar (label row y 2124–2163): 喜欢, 转发, 推荐, 评论.
   share: {x: 763, y: 2085}, comments: {x: 1003, y: 2085},
 });
+// The same bar sits 180 px higher when WeChat adds its 「↑更多视频」 strip below it (seen opening a post by link).
+export const MORE_VIDEOS_SHIFT = 180;
 export const SWIPE = Object.freeze({
   results: [540, 1900, 540, 820, 450],
   comments: [540, 1950, 540, 1050, 450],
@@ -31,6 +42,7 @@ export const SWIPE = Object.freeze({
 });
 export const REGION = Object.freeze({
   shareSheet: [0, 1500, 1080, 742],
+  workBar: [0, 1650, 1080, 592],
   bottomTabs: [0, 2120, 1080, 122],
 });
 // Texts that mean the owner must act on the phone (login wall, security check, rate warning).

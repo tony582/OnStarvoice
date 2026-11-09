@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {commentDate, normalizePostEvent, postBatchInput, wechatComments, wechatExternalId, wechatSyncBody}
+import {commentDate, commentNamesAgree, commentTextsAgree, normalizePostEvent, postBatchInput, reuseKnownCommentIds, wechatComments,
+  wechatExternalId, wechatSyncBody}
   from '../server/services/android-control/posts.js';
 import {mobileCommentPlan, mobilePlanBlockReason, mobileTaskFilters, mobileWorkflowFor, mobilePlatformForWorkflow}
   from '../server/services/android-control/mobile-tasks.js';
@@ -118,4 +119,36 @@ test('task payloads name their platform; a Channels task carries its comment pla
   assert.equal(wechat.platform, 'wechat_channels');
   assert.equal(wechat.mode, 'keyword');
   assert.deepEqual(wechat.comments, {enabled: true, limit: 30});
+});
+
+test('a re-captured post keeps the stored ids of comments OCR read slightly differently; new comments get new ids', () => {
+  // OnStar 2026-11-06: the same three comments read on two days.
+  const capturedAt = Date.parse('2026-11-06T04:00:00.000Z');
+  const ext = wechatExternalId(1793851201, '尼克杨开凯迪');
+  const first = wechatComments(ext, {items: [
+    {author: '田纳西瓜皮', location: '福建', timeLabel: '1天前', content: '安吉星也要付钱的，一天一块钱C', likeCount: 0, reply: false, parentIndex: null},
+    {author: '迷途懒猫心', location: '上海', timeLabel: '1天前', content: '没有一滴油是白喝起', likeCount: 0, reply: false, parentIndex: null},
+    {author: '强广西', location: '', timeLabel: '1天前', content: '没见过凯迪拉克打过广告的，人家钱都放安全上了首评', likeCount: 0, reply: false, parentIndex: null},
+  ]}, capturedAt);
+  const known = first.map(item => ({commentId: item.commentId, authorName: item.authorName, content: item.content}));
+  const again = wechatComments(ext, {items: [
+    {author: '田纳西瓜皮', location: '福建', timeLabel: '1天前', content: '安吉星“也要付钱的，一天一块钱起', likeCount: 0, reply: false, parentIndex: null},
+    {author: '迷途懒猫凶', location: '上海', timeLabel: '1天前', content: '没有一滴油是白喝起', likeCount: 0, reply: false, parentIndex: null},
+    {author: '迷途懒猫凶', location: '上海', timeLabel: '1天前', content: '回复：说得对', likeCount: 0, reply: true, parentIndex: 1},
+    {author: '新来的', location: '江苏', timeLabel: '1小时前', content: '安吉星好用', likeCount: 0, reply: false, parentIndex: null},
+  ]}, capturedAt);
+  assert.notEqual(again[0].commentId, first[0].commentId, 'the text-derived ids differ, as they did in production');
+  const mapped = reuseKnownCommentIds(again, known);
+  assert.equal(mapped[0].commentId, first[0].commentId);
+  assert.equal(mapped[1].commentId, first[1].commentId);
+  assert.equal(mapped[2].parentCommentId, first[1].commentId, 'a reply follows its parent to the stored id');
+  assert.equal(mapped[3].commentId, again[3].commentId, 'a new comment keeps its own id');
+  // One stored comment is reused once; an exact id is kept as it is.
+  assert.equal(new Set(mapped.map(item => item.commentId)).size, mapped.length);
+  assert.deepEqual(reuseKnownCommentIds(first, known), first);
+  // 「强广西」 was the old reading of 强 + 广西: too short to call the same commenter; it stays a new comment.
+  assert.equal(commentNamesAgree('强广西', '强'), false);
+  assert.equal(commentNamesAgree('迷途懒猫', '迷途懒猫心'), true);
+  assert.equal(commentTextsAgree('XT59接入豆包了吗？首评岚图汽车官方…', 'XT59接入豆包了吗？'), true);
+  assert.equal(commentTextsAgree('好看', '好看吗'), false);
 });

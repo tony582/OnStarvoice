@@ -21,6 +21,14 @@ export const cleanCommentText = text => String(text).replace(TERM_ICON, '').trim
 // the image comment measured on 2026-11-06 left 400 px before the next row. Such a comment is kept as 「[图片]」.
 export const IMAGE_COMMENT = '[图片]';
 const IMAGE_GAP = 200;
+// The IP regions WeChat shows after a commenter's name (provinces and regions; longest first so 黑龙江 wins over 龙江).
+const REGIONS = ['内蒙古', '黑龙江', '北京', '天津', '上海', '重庆', '河北', '山西', '辽宁', '吉林', '江苏', '浙江', '安徽', '福建', '江西',
+  '山东', '河南', '湖北', '湖南', '广东', '海南', '四川', '贵州', '云南', '陕西', '甘肃', '青海', '台湾', '广西', '西藏', '宁夏', '新疆', '香港', '澳门'];
+// Labels on their own line, never part of a comment: 「首评」 (first comment) and friends sit under the text.
+const LABEL = /^(?:首评|作者赞过|作者回复过|置顶|热评)$/u;
+const LABEL_BELOW = new Set(['首评', '作者赞过', '作者回复过']);
+// A sticker at the end of a line comes back as a lone bracket or @; a real comment does not end that way.
+const TRAILING_GLYPH = /[（(@]$/u;
 
 function header(row) {
   const text = row.text.normalize('NFKC').trim();
@@ -30,8 +38,14 @@ function header(row) {
   if (!tokens.length) return null;
   let location = '';
   if (tokens.length > 1 && /^[一-龥]{2,3}$/u.test(tokens.at(-1))) location = tokens.pop();
+  else {
+    // OCR sometimes runs the IP region into the name: 「哟改名字了997200四川」, 「凌晨三点…山东」 (2026-11-06).
+    const last = tokens.at(-1);
+    const region = REGIONS.find(name => last.length > name.length && last.endsWith(name));
+    if (region) { location = region; tokens[tokens.length - 1] = last.slice(0, -region.length); }
+  }
   // Verified/medal glyphs after a name come back as symbols (∞, ♥, V).
-  const author = tokens.join(' ').replace(/[\s.。…·•∞♥♡❤✓√()（）]+0*$/u, '').replace(/\s+0+$/u, '').trim();
+  const author = tokens.join(' ').replace(/[\s.。…·•∞♥♡❤✓√()（）°]+0*$/u, '').replace(/\s+0+$/u, '').trim();
   return author ? {author, location, timeLabel: match[2].replace(/\s+/gu, '')} : null;
 }
 
@@ -50,11 +64,17 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
   const title = visible.find(row => row.y < PANEL_TOP + 60 && /^评论/u.test(row.text.replace(/\s+/gu, '')));
   const headerCount = title ? number(title.text.replace(/^评论/u, '')) : null;
   const comments = [], expand = [];
-  let post = null, current = null, captionOpen = false;
+  // An ad card in the list carries a 「广告」 mark at the right of its title line; nothing in it is a comment.
+  const adLines = visible.filter(row => row.x >= 800 && /^广告/u.test(row.text.replace(/\s+/gu, ''))).map(row => row.y);
+  let post = null, current = null, captionOpen = false, inAd = false;
   for (const row of visible) {
     if (row === title || row.y < PANEL_TOP + 60) continue;
+    if (adLines.some(y => Math.abs(row.y - y) < 40)) { current = null; captionOpen = false; inAd = true; continue; }
     const inTop = row.x >= TOP_LEVEL_X[0] && row.x <= TOP_LEVEL_X[1];
     const inReply = row.x >= REPLY_X[0] && row.x <= REPLY_X[1];
+    // 「首评」 and similar labels close the comment above them: whatever follows (often an ad) is not its text.
+    const label = row.text.replace(/\s+/gu, '').match(LABEL);
+    if (label) { if (LABEL_BELOW.has(label[0])) current = null; continue; }
     if (row.x >= LIKE_X) {
       if (current && Math.abs(row.y - current.headerY) < 30 && current.likeCount === null) current.likeCount = number(row.text);
       continue;
@@ -67,6 +87,8 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
       continue;
     }
     const head = (inTop || inReply) ? header(row) : null;
+    if (head) inAd = false;
+    else if (inAd) continue;
     if (head && /作者/u.test(row.text) && !post) {
       post = {...head, caption: ''}; captionOpen = true; current = null;
       continue;
@@ -92,24 +114,43 @@ export function parseCommentScreen(rows, {bottom = COMMENT_INPUT_TOP} = {}) {
   }
   const last = comments.at(-1);
   return {headerCount, post, expand, comments: comments.filter(item => item.content.trim())
-    .map(({key: _key, headerY: _y, lastY, ...item}) => ({...item, content: cleanCommentText(item.content.replace(REPLIES_TAIL, '')),
+    .map(({key: _key, headerY: _y, lastY, ...item}) => ({...item,
+      content: cleanCommentText(item.content.replace(REPLIES_TAIL, '').replace(/首评$/u, '')).replace(TRAILING_GLYPH, '').trim(),
       cut: bottom - lastY < 130 && item === last})),
   bottomCut: !!last && bottom - last.lastY < 130};
 }
 
+// Letters and digits only: the same comment read twice differs in punctuation, a badge or a sticker glyph.
+const bareText = value => comparable(value).replace(/[^\p{L}\p{N}]/gu, '');
+const commonPrefix = (a, b) => { let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i++; return i; };
+/** Two readings of one commenter: a medal or emoji after the name can come back as one more or one other character. */
+export function namesAgree(a, b) {
+  const x = bareText(a), y = bareText(b);
+  if (x === y) return Boolean(x);
+  const shorter = Math.min(x.length, y.length);
+  return shorter >= 3 && Math.abs(x.length - y.length) <= 1 && commonPrefix(x, y) >= shorter - 1;
+}
+/** Two readings of one comment text: cut short, a sticker read as a character, a small OCR slip. */
+export function textsAgree(a, b) {
+  const x = bareText(a), y = bareText(b);
+  if (x === y) return true;
+  if (!x || !y) return false;
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  if (short.length >= 4 && long.startsWith(short.slice(0, -1))) return true;
+  return similarity(x, y) >= 0.8;
+}
+export const sameComment = (a, b) => namesAgree(a.author, b.author) && textsAgree(a.content, b.content);
+
 /**
- * Merge screens in scroll order. Overlapping comments (same author, near-identical text) are kept once; a cut
- * comment is replaced by its longer, later reading. Replies point at the index of their top-level comment.
+ * Merge screens in scroll order. Overlapping comments (same commenter, same text as far as OCR lets us tell) are
+ * kept once; a cut comment is replaced by its longer, later reading. Replies point at the index of their top-level comment.
  */
 export function mergeCommentScreens(screens, {limit = Infinity} = {}) {
   const merged = [];
   let parentIndex = null;
   for (const screen of screens) {
     for (const item of screen.comments) {
-      const author = comparable(item.author);
-      const existing = merged.findIndex(seen => comparable(seen.author) === author
-        && (similarity(seen.content, item.content) >= 0.85 || comparable(seen.content).startsWith(comparable(item.content))
-          || comparable(item.content).startsWith(comparable(seen.content))));
+      const existing = merged.findIndex(seen => sameComment(seen, item));
       if (existing >= 0) {
         const seen = merged[existing];
         if (comparable(item.content).length > comparable(seen.content).length) Object.assign(seen, {content: item.content, cut: item.cut});
