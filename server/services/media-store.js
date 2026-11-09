@@ -8,15 +8,16 @@
  * 复用 media-proxy 的 Referer 规则与 host 白名单(防盗链 + 防 SSRF)。
  */
 import { mkdirSync, createWriteStream, existsSync } from 'node:fs';
-import { rename, unlink } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
-import { join, dirname } from 'node:path';
+import { rename, unlink, readFile, stat } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { queryOne, queryAll, execute } from '../db/query.js';
 import { resolveReferer, isAllowedMediaHost } from './media-proxy.js';
 import { runProcessBackgroundWork } from '../runtime/process-background-work.js';
+import {inspectWechatImage, WECHAT_IMAGE_MAX_BYTES} from './wechat-image-validation.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // server 在 /opt/onstarvoice/server,上两级 + media = /opt/onstarvoice/media(rsync 不碰)
@@ -38,16 +39,28 @@ export function ensureMediaDirs() {
 // 下载单张图片 → 落盘 → 返回对外路径;任何失败返回 null(调用方回退原链接)。换 OSS 只改这里。
 async function downloadImage(url, key, platform, targetDir, publicDir) {
   if (!url || !/^https?:\/\//i.test(url) || !isAllowedMediaHost(url)) return null;
+  const article = platform === 'wechat_articles';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   let tempPath = '';
   try {
-    const referer = resolveReferer(url, platform);
-    const resp = await fetch(url, {
-      redirect: 'follow',
-      signal: controller.signal,
-      headers: { 'User-Agent': BROWSER_UA, Accept: 'image/*,*/*', ...(referer ? { Referer: referer } : {}) },
-    });
+    let current = url, resp;
+    for (let redirects = 0; redirects <= 3; redirects++) {
+      if (article) {
+        const parsed = new URL(current);
+        if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.port || !isAllowedMediaHost(current)) return null;
+      }
+      const referer = resolveReferer(current, platform);
+      resp = await fetch(current, {
+        redirect: article ? 'manual' : 'follow', signal: controller.signal,
+        headers: { 'User-Agent': BROWSER_UA, Accept: 'image/*,*/*', ...(referer ? { Referer: referer } : {}) },
+      });
+      if (!article || resp.status < 300 || resp.status >= 400) break;
+      const location = resp.headers.get('location');
+      await resp.body?.cancel();
+      if (!location || redirects === 3) return null;
+      current = new URL(location, current).toString();
+    }
     if (!resp.ok || !resp.body) return null;
     const type = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
     const ext = EXT_BY_TYPE[type];
@@ -57,14 +70,24 @@ async function downloadImage(url, key, platform, targetDir, publicDir) {
     ensureMediaDirs();
     const filename = `${key}.${ext}`;
     const targetPath = join(targetDir, filename);
-    tempPath = `${targetPath}.${process.pid}.${Date.now()}.part`;
-    await pipeline(Readable.fromWeb(resp.body), createWriteStream(tempPath));
+    tempPath = `${targetPath}.${process.pid}.${article ? randomUUID() : Date.now()}.part`;
+    if (article) {
+      let received = 0;
+      const bounded = new Transform({transform(chunk, encoding, done) {
+        received += chunk.length;
+        done(received > WECHAT_IMAGE_MAX_BYTES ? new Error('wechat_image_too_large') : null, chunk);
+      }});
+      await pipeline(Readable.fromWeb(resp.body), bounded, createWriteStream(tempPath));
+      const verified = inspectWechatImage(await readFile(tempPath));
+      if (!verified || verified.mime !== (type === 'image/jpg' ? 'image/jpeg' : type)) return null;
+    } else await pipeline(Readable.fromWeb(resp.body), createWriteStream(tempPath));
     await rename(tempPath, targetPath);
     tempPath = '';
     return `/media/${publicDir}/${filename}`;
   } catch {
     return null;
   } finally {
+    if (article) controller.abort();
     if (tempPath) await unlink(tempPath).catch(() => {});
     clearTimeout(timer);
   }
@@ -131,7 +154,7 @@ export function imageSourceIdentity(value) {
   return raw;
 }
 
-function parseImageUrls(value) {
+function parseImageUrls(value, limit = 20) {
   let parsed = value;
   if (typeof parsed === 'string') {
     try { parsed = JSON.parse(parsed); } catch { parsed = []; }
@@ -145,7 +168,7 @@ function parseImageUrls(value) {
     if (!/^https?:\/\//i.test(url) || !identity || seen.has(identity)) continue;
     seen.add(identity);
     urls.push(url);
-    if (urls.length >= 20) break;
+    if (urls.length >= limit) break;
   }
   return urls;
 }
@@ -171,18 +194,46 @@ function localImageExists(url) {
   return existsSync(join(MEDIA_DIR, String(url).slice(prefix.length)));
 }
 
+async function verifiedArticleLocalImage(url) {
+  if (!String(url || '').startsWith('/media/')) return null;
+  const path = resolve(MEDIA_DIR, url.slice('/media/'.length));
+  if (!path.startsWith(resolve(MEDIA_DIR) + sep)) return null;
+  try {
+    const file = await stat(path);
+    if (!file.isFile() || file.size > WECHAT_IMAGE_MAX_BYTES) return null;
+    return inspectWechatImage(await readFile(path));
+  } catch { return null; }
+}
+
+const articleImageJobs = new Map();
 export async function ensureRecordImagesLocal(recordId, imageUrls, platform) {
-  const urls = parseImageUrls(imageUrls);
+  if (platform !== 'wechat_articles') return localizeRecordImages(recordId, imageUrls, platform);
+  // Serialize only this record's article jobs. Read the latest mappings after the previous job finishes.
+  const previous = articleImageJobs.get(recordId) ?? Promise.resolve();
+  const pending = previous.catch(() => {}).then(() => localizeRecordImages(recordId, imageUrls, platform));
+  articleImageJobs.set(recordId, pending);
+  try { return await pending; }
+  finally { if (articleImageJobs.get(recordId) === pending) articleImageJobs.delete(recordId); }
+}
+
+async function localizeRecordImages(recordId, imageUrls, platform) {
+  const article = platform === 'wechat_articles';
+  const urls = parseImageUrls(imageUrls, article ? 100 : 20);
   if (!recordId || urls.length === 0) return;
   try {
-    const row = await queryOne('SELECT image_local_urls FROM records WHERE id = $1', [recordId]);
+    const row = await queryOne(article
+      ? 'SELECT image_local_urls, image_urls, payload FROM records WHERE id = $1'
+      : 'SELECT image_local_urls FROM records WHERE id = $1', [recordId]);
     if (!row) return;
+    // A detached job must never attach images to a different revision of the body.
+    if (article && JSON.stringify(parseImageUrls(row.image_urls, 100)) !== JSON.stringify(urls)) return;
     const current = new Map();
     for (const entry of parseLocalImageEntries(row.image_local_urls)) {
       const hash = String(entry?.source_hash || '');
       const sourceUrl = String(entry?.source_url || '');
       const url = String(entry?.url || '');
       if (!url || !localImageExists(url)) continue;
+      if (article && !await verifiedArticleLocalImage(url)) continue;
       if (hash) current.set(hash, url);
       // 兼容旧版本按完整签名 URL 生成的 source_hash：只要素材 token 相同，
       // 新采集的 URL 变了也直接复用已经落地的文件。
@@ -198,9 +249,28 @@ export async function ensureRecordImagesLocal(recordId, imageUrls, platform) {
         if (!localUrl) {
           localUrl = await downloadImage(url, `${recordId}-${sourceHash}`, platform, IMAGES_DIR, 'images') || '';
         }
-        if (localUrl) localized.push({ source_url: url, source_hash: sourceHash, url: localUrl });
+        if (localUrl) {
+          const verified = article ? await verifiedArticleLocalImage(localUrl) : null;
+          if (article && !verified) continue;
+          localized.push({ source_url: url, source_hash: sourceHash, url: localUrl,
+            ...(verified ? {byte_size: verified.bytes, width: verified.width, height: verified.height} : {}) });
+        }
       }
-      await execute(
+      if (article) {
+        const saved = new Map(localized.map(entry => [entry.source_url, entry.url]));
+        const body = row.payload?.wechatArticle ?? {};
+        const images = (body.images ?? []).map(image => ({...image, stored: saved.has(image.url), localUrl: saved.get(image.url) || ''}));
+        const evidence = {originalImagesCaptured: urls.length > 0 && localized.length === urls.length,
+          imageStorage: {expected: urls.length, stored: localized.length, checkedAt: new Date().toISOString()}};
+        await execute(`UPDATE records SET image_local_urls=$1::jsonb,
+          payload=jsonb_set(jsonb_set(payload,'{wechatArticle,evidence}',
+            COALESCE(payload#>'{wechatArticle,evidence}','{}'::jsonb)||$3::jsonb),'{wechatArticle,images}',$4::jsonb)
+          WHERE id=$2 AND platform='wechat_articles' AND image_urls=$5::jsonb
+            AND payload#>>'{wechatArticle,capturedAt}' IS NOT DISTINCT FROM $6::text
+            AND image_local_urls=$7::jsonb`,
+        [JSON.stringify(localized), recordId, JSON.stringify(evidence), JSON.stringify(images), JSON.stringify(row.image_urls), body.capturedAt ?? null,
+          JSON.stringify(row.image_local_urls)]);
+      } else await execute(
         'UPDATE records SET image_local_urls = $1::jsonb WHERE id = $2',
         [JSON.stringify(localized), recordId],
       );

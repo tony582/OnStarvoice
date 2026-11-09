@@ -1,15 +1,36 @@
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
-import {readFile} from 'node:fs/promises';
+import {readFile, mkdtemp, rm, writeFile, stat, readdir} from 'node:fs/promises';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
 import test from 'node:test';
 import {validatePostgresIntegrationTarget} from '../../../scripts/lib/postgres-integration-target.mjs';
-import {createAndroidControlService} from '../../../server/services/android-control/service.js';
 import {articleExternalId, canonicalArticleUrl} from '../../../server/services/android-control/articles.js';
+import {pngFixture} from '../../helpers/wechat-image-fixtures.mjs';
 
 // Runs only against an explicitly isolated PostgreSQL database. Optional real-phone evidence is replayed
 // with a newly issued test lease; body/comments/metrics and capture time remain the phone's actual values.
 test('WeChat articles: phone capability, records, nullable observations, comments, patrol and durable receipts', async t => {
   validatePostgresIntegrationTarget({testDatabaseUrl: process.env.TEST_DATABASE_URL, databaseUrl: process.env.DATABASE_URL, requireDatabaseUrl: true});
+  const mediaDir = await mkdtemp(join(tmpdir(), 'wechat-article-media-test-'));
+  const previousMediaDir = process.env.MEDIA_DIR, previousFetch = globalThis.fetch;
+  process.env.MEDIA_DIR = mediaDir;
+  const mockedImages = new Map(), fetchedImages = [], unexpectedFetches = [];
+  // Every fetch is intercepted for this entire test process, including detached media tasks.
+  globalThis.fetch = async (url, options) => {
+    const key = String(url); fetchedImages.push({url: key, options});
+    if (!mockedImages.has(key)) { unexpectedFetches.push(key); throw new Error('Unmocked outbound request refused'); }
+    return mockedImages.get(key)(options);
+  };
+  const {createAndroidControlService} = await import('../../../server/services/android-control/service.js');
+  const {getProcessBackgroundWorkSnapshot} = await import('../../../server/runtime/process-background-work.js');
+  const settleBackground = async () => {
+    for (let i = 0; i < 500; i++) {
+      if (!getProcessBackgroundWorkSnapshot().inFlight) return;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.fail('local background jobs did not settle');
+  };
   const {runMigrations} = await import('../../../server/db/migrate.js');
   const {getPool, closePool} = await import('../../../server/db/pool.js');
   const {normalizeRecord, syncNormalizedRecord} = await import('../../../server/routes/sync.js');
@@ -18,7 +39,14 @@ test('WeChat articles: phone capability, records, nullable observations, comment
   const {reprocessPendingCommentWorkflowReceipts} = await import('../../../server/services/comment-workflow.js');
   await runMigrations();
   const pool = getPool();
-  t.after(closePool);
+  t.after(async () => {
+    try { await settleBackground(); await closePool(); assert.deepEqual(unexpectedFetches, []); }
+    finally {
+      globalThis.fetch = previousFetch;
+      if (previousMediaDir === undefined) delete process.env.MEDIA_DIR; else process.env.MEDIA_DIR = previousMediaDir;
+      await rm(mediaDir, {recursive: true, force: true});
+    }
+  });
   const query = async (sql, values = []) => (await pool.query(sql, values)).rows;
   const persist = async (body, context) => syncNormalizedRecord(normalizeRecord(body)[0], context);
   const drain = async f => {
@@ -37,6 +65,7 @@ test('WeChat articles: phone capability, records, nullable observations, comment
   async function fixture(st, options = {}) {
     const [{id: tenantId}] = await query('INSERT INTO tenants(name) VALUES($1) RETURNING id', [`article-test-${randomUUID()}`]);
     st.after(async () => {
+      await settleBackground();
       for (const table of ['capture_mobile_post_receipts', 'record_comments', 'record_observations', 'records',
         'capture_task_item_attempts', 'capture_task_items', 'capture_agent_commands', 'capture_tasks']) {
         await query(`DELETE FROM ${table} WHERE tenant_id=$1`, [tenantId]);
@@ -87,6 +116,14 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     comments: {status: 'unavailable', postingState: 'unknown', reason: 'comment_entry_not_visible', headerCount: null, items: []},
     ...overrides});
   const stored = async f => (await query('SELECT * FROM records WHERE tenant_id=$1', [f.tenantId]));
+  async function imageRecord(f, urls, platform = 'wechat_articles') {
+    const payload = {wechatArticle: {title: '本地图片测试', capturedAt: new Date().toISOString(), source: 'page_dom',
+      images: urls.map(url => ({url, stored: false})), evidence: {originalImagesCaptured: false}}};
+    const [row] = await query(`INSERT INTO records(tenant_id,external_id,platform,title,image_urls,payload)
+      VALUES($1,$2,$3,'本地图片测试',$4::jsonb,$5::jsonb) RETURNING *`,
+    [f.tenantId, randomUUID(), platform, JSON.stringify(urls), JSON.stringify(payload)]);
+    return row;
+  }
 
   await t.test('old phones and browsers cannot claim article work; new phone receives the separate workflow', async st => {
     const f = await fixture(st);
@@ -132,8 +169,9 @@ test('WeChat articles: phone capability, records, nullable observations, comment
       metadata=metadata||'{"distributionMode":"fixed_batch","draft":true}'::jsonb WHERE id=$1`, [parentId]);
     const items = await query('SELECT id FROM capture_task_items WHERE task_id=$1', [parentId]);
     const dispatch = async () => {
-      const response = await fetch(`http://127.0.0.1:${server.address().port}/api/capture-cloud/orchestrations/${parentId}/dispatch`, {
-        method: 'POST', headers: {'content-type': 'application/json', authorization: `Bearer ${token}`, 'x-tenant-id': f.tenantId},
+      // The sole real HTTP request targets this test's loopback listener; never follow a redirect.
+      const response = await previousFetch(`http://127.0.0.1:${server.address().port}/api/capture-cloud/orchestrations/${parentId}/dispatch`, {
+        method: 'POST', redirect: 'error', headers: {'content-type': 'application/json', authorization: `Bearer ${token}`, 'x-tenant-id': f.tenantId},
         body: JSON.stringify({expectedRevision: 0, assignments: items.map(item => ({itemId: item.id, agentId: f.phone.id}))}),
       });
       return {status: response.status, body: await response.json()};
@@ -240,7 +278,8 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     const {isAllowedMediaHost} = await import('../../../server/services/media-proxy.js');
     const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
     const imageUrls = ['https://mmbiz.qpic.cn/offline-fixture/first.png', 'https://mmbiz.qpic.cn/offline-fixture/second.png'];
-    assert.ok(imageUrls.every(url => !isAllowedMediaHost(url)), 'offline fixture must stay blocked by the existing CDN policy');
+    assert.ok(imageUrls.every(isAllowedMediaHost));
+    for (const url of imageUrls) mockedImages.set(url, () => new Response(pngFixture(), {headers: {'content-type': 'image/png'}}));
     const f = await fixture(st);
     await parent(f, {keywords: ['安吉星', '安吉星更新', '安吉星长图', '安吉星再巡查', '安吉星无图正文']});
     const first = (await f.poll()).task;
@@ -256,16 +295,29 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     const receipt = (await send(f, dom)).receipts[0];
     assert.equal(receipt.status, 'accepted');
     await drain(f);
-    await ensureRecordImagesLocal(receipt.recordId, imageUrls, 'wechat_articles');
+    await settleBackground();
     const [record] = await stored(f);
     assert.deepEqual(record.image_urls, imageUrls);
-    assert.deepEqual(record.image_local_urls, [], 'source URLs remain undownloaded under the unchanged CDN policy');
+    assert.equal(record.image_local_urls.length, 2, 'the real ingestion queue downloaded both locally mocked images');
+    for (const entry of record.image_local_urls) assert.ok((await stat(join(mediaDir, entry.url.slice('/media/'.length)))).size > 0);
+    assert.ok(fetchedImages.filter(item => imageUrls.includes(item.url)).every(item => item.options.headers.Referer === 'https://mp.weixin.qq.com/'));
+    assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, true);
+    assert.deepEqual({...record.payload.wechatArticle.evidence.imageStorage, checkedAt: null}, {expected: 2, stored: 2, checkedAt: null});
     assert.equal(record.payload.wechatArticle.source, 'page_dom');
     assert.equal(record.payload.wechatArticle.capturedAt, bodyAt);
     assert.equal(record.payload.wechatArticle.metrics.like.source, 'screen_ocr');
     assert.equal(record.payload.wechatArticle.metrics.like.capturedAt, phoneAt);
     assert.equal(record.payload.wechatArticle.metrics.read.value, null);
-    assert.ok(record.payload.wechatArticle.images.every(image => !image.stored && !image.downloadEligible));
+    assert.ok(record.payload.wechatArticle.images.every(image => image.stored && image.downloadEligible && image.localUrl.startsWith('/media/')));
+    const [{payload: capturedPayload}] = await query(`SELECT o.payload FROM record_observations o
+      JOIN capture_mobile_post_receipts r ON r.observation_id=o.id WHERE r.id=$1`, [receipt.receiptId]);
+    assert.equal(capturedPayload.wechatArticle.evidence.originalImagesCaptured, false, 'capture evidence is not rewritten after download');
+    const fetchedBeforeReuse = fetchedImages.length;
+    await ensureRecordImagesLocal(receipt.recordId, imageUrls, 'wechat_articles');
+    assert.equal(fetchedImages.length, fetchedBeforeReuse, 'verified existing files are reused');
+    await rm(join(mediaDir, record.image_local_urls[0].url.slice('/media/'.length)));
+    await ensureRecordImagesLocal(receipt.recordId, imageUrls, 'wechat_articles');
+    assert.equal(fetchedImages.length, fetchedBeforeReuse + 1, 'a deleted local file is downloaded again rather than trusted');
     const [comment] = await query('SELECT payload FROM record_comments WHERE record_id=$1', [record.id]);
     assert.equal(comment.payload.source, 'screen_ocr');
     assert.equal(comment.payload.capturedAt, phoneAt);
@@ -309,6 +361,135 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     assert.deepEqual(textRecord.image_urls, []);
     assert.deepEqual(textRecord.image_local_urls, [], 'a replacement DOM body without images cannot keep a stale image gallery');
     await f.complete(fifth);
+  });
+
+  await t.test('WeChat image storage rejects placeholders, actual oversized streams and unsafe redirects, then revalidates reused files', async st => {
+    const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
+    const f = await fixture(st);
+    const prefix = 'https://mmbiz.qpic.cn/offline-fixture/validation/';
+    const urls = ['valid.png', 'placeholder.png', 'html.png', 'oversized.png', 'redirect.png', 'truncated.png'].map(name => prefix + name);
+    mockedImages.set(urls[0], () => new Response(pngFixture(), {headers: {'content-type': 'image/png'}}));
+    mockedImages.set(urls[1], () => new Response(Buffer.concat([pngFixture(20, 20), Buffer.alloc(2000)]), {headers: {'content-type': 'image/png'}}));
+    mockedImages.set(urls[2], () => new Response('<html>not authorized</html>'.repeat(1000), {headers: {'content-type': 'image/png'}}));
+    let emitted = 0;
+    mockedImages.set(urls[3], () => new Response(new ReadableStream({pull(controller) {
+      if (emitted++ === 32) controller.close(); else controller.enqueue(new Uint8Array(1024 * 1024));
+    }}), {headers: {'content-type': 'image/png', 'content-length': '64'}}));
+    mockedImages.set(urls[4], () => new Response('', {status: 302, headers: {location: 'https://private.example/forbidden'}}));
+    mockedImages.set(urls[5], () => new Response(pngFixture().subarray(0, 24), {headers: {'content-type': 'image/png', 'content-length': '24'}}));
+    const record = await imageRecord(f, urls);
+    await ensureRecordImagesLocal(record.id, urls, 'wechat_articles');
+    let [updated] = await stored(f);
+    assert.equal(updated.image_local_urls.length, 1);
+    assert.equal(updated.payload.wechatArticle.evidence.originalImagesCaptured, false);
+    assert.equal(updated.payload.wechatArticle.evidence.imageStorage.expected, 6);
+    assert.equal(updated.payload.wechatArticle.evidence.imageStorage.stored, 1);
+    assert.ok(!fetchedImages.some(item => item.url === 'https://private.example/forbidden'));
+    assert.ok(emitted < 32, 'the byte limit cancels the oversized stream instead of buffering it to completion');
+    assert.ok((await readdir(join(mediaDir, 'images'))).every(name => !name.endsWith('.part')));
+    const localPath = join(mediaDir, updated.image_local_urls[0].url.slice('/media/'.length));
+    await writeFile(localPath, pngFixture(20, 20));
+    mockedImages.set(urls[0], () => new Response('', {status: 503}));
+    emitted = 0;
+    await ensureRecordImagesLocal(record.id, urls, 'wechat_articles');
+    [updated] = await stored(f);
+    assert.equal(updated.image_local_urls.length, 0, 'a corrupt/placeholder cached file is not trusted');
+    assert.equal(updated.payload.wechatArticle.evidence.imageStorage.stored, 0);
+  });
+
+  await t.test('an old image job cannot overwrite a newer body revision or attach images that were removed', async st => {
+    const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
+    const f = await fixture(st), url = 'https://mmecoa.qpic.cn/offline-fixture/slow.png';
+    const row = await imageRecord(f, [url]);
+    let releaseFetch, markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    mockedImages.set(url, async () => {
+      markStarted(); await new Promise(resolve => { releaseFetch = resolve; });
+      return new Response(pngFixture(), {headers: {'content-type': 'image/png'}});
+    });
+    const running = ensureRecordImagesLocal(row.id, [url], 'wechat_articles');
+    await started;
+    const newer = {...row.payload, wechatArticle: {...row.payload.wechatArticle, capturedAt: '2026-11-09T23:59:00.000Z',
+      images: [], evidence: {originalImagesCaptured: false}}};
+    await query("UPDATE records SET image_urls='[]'::jsonb,payload=$2::jsonb WHERE id=$1", [row.id, JSON.stringify(newer)]);
+    releaseFetch(); await running;
+    const [record] = await stored(f);
+    assert.deepEqual(record.image_local_urls, []);
+    assert.deepEqual(record.payload, newer, 'the old job cannot replace the new body storage evidence');
+  });
+
+  await t.test('concurrent article jobs wait for the same record and reuse the completed image mapping', async st => {
+    const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
+    const f = await fixture(st);
+    const urls = ['https://mmbiz.qpic.cn/offline-fixture/concurrent-first.png', 'https://mmecoa.qpic.cn/offline-fixture/concurrent-second.png'];
+    const row = await imageRecord(f, urls);
+    let markStarted, releaseFetch, firstCalls = 0, secondCalls = 0;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    mockedImages.set(urls[0], async () => {
+      firstCalls++;
+      if (firstCalls === 1) { markStarted(); await new Promise(resolve => { releaseFetch = resolve; }); }
+      return new Response(pngFixture(), {headers: {'content-type': 'image/png'}});
+    });
+    mockedImages.set(urls[1], () => {
+      secondCalls++;
+      return new Response(pngFixture(), {headers: {'content-type': 'image/png'}});
+    });
+    const first = ensureRecordImagesLocal(row.id, urls, 'wechat_articles');
+    await started;
+    const second = ensureRecordImagesLocal(row.id, urls, 'wechat_articles');
+    try {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      assert.equal(firstCalls, 1, 'the second job must wait before reading/downloading the record');
+    } finally { releaseFetch(); await Promise.all([first, second]); }
+    const [record] = await stored(f);
+    assert.equal(firstCalls, 1); assert.equal(secondCalls, 1);
+    assert.equal(record.image_local_urls.length, 2);
+    assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, true);
+    assert.equal(record.payload.wechatArticle.evidence.imageStorage.stored, 2);
+  });
+
+  await t.test('article image limit is 100 while existing platform localization remains limited to 20', async st => {
+    const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
+    const f = await fixture(st);
+    const urls = Array.from({length: 100}, (_, index) => `https://mmbiz.qpic.cn/offline-fixture/many/${index}.png`);
+    for (const url of urls) mockedImages.set(url, () => new Response(pngFixture(), {headers: {'content-type': 'image/png'}}));
+    const row = await imageRecord(f, urls);
+    await ensureRecordImagesLocal(row.id, urls, 'wechat_articles');
+    const [record] = await query('SELECT * FROM records WHERE id=$1', [row.id]);
+    assert.equal(record.image_local_urls.length, 100);
+    assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, true);
+    const oldUrls = Array.from({length: 21}, (_, index) => `https://p3.douyinpic.com/offline-fixture/${index}.png`);
+    for (const url of oldUrls) mockedImages.set(url, () => new Response(pngFixture(20, 20), {headers: {'content-type': 'image/png'}}));
+    const oldRow = await imageRecord(f, oldUrls, 'douyin');
+    await ensureRecordImagesLocal(oldRow.id, oldUrls, 'douyin');
+    const [oldRecord] = await query('SELECT * FROM records WHERE id=$1', [oldRow.id]);
+    assert.equal(oldRecord.image_local_urls.length, 20, 'old image count and small-image behavior remain unchanged');
+  });
+
+  await t.test('article OCR resolves the stored image and caches a strictly mocked OCR response', async st => {
+    const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
+    const {extractRecordImageText} = await import('../../../server/services/image-text-extraction.js');
+    const f = await fixture(st), url = 'https://mmecoa.qpic.cn/offline-fixture/ocr.png';
+    mockedImages.set(url, () => new Response(pngFixture(), {headers: {'content-type': 'image/png'}}));
+    const row = await imageRecord(f, [url]);
+    await ensureRecordImagesLocal(row.id, [url], 'wechat_articles');
+    for (const [key, value] of Object.entries({qwen_ocr_api_key: 'offline-test-key', qwen_ocr_model: 'qwen3.5-ocr',
+      qwen_ocr_api_endpoint: 'https://ocr.example.test/compatible-mode/v1'})) {
+      await query('INSERT INTO tenant_settings(tenant_id,key,value) VALUES($1,$2,$3) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value', [f.tenantId, key, value]);
+    }
+    let ocrCalls = 0;
+    mockedImages.set('https://ocr.example.test/compatible-mode/v1/chat/completions', options => {
+      ocrCalls++;
+      const request = JSON.parse(options.body), image = request.messages[0].content[1].image_url.url;
+      assert.equal(image, `data:image/png;base64,${pngFixture().toString('base64')}`);
+      return new Response(JSON.stringify({choices: [{message: {content: '本地模拟图中文字'}}]}), {headers: {'content-type': 'application/json'}});
+    });
+    const fetchCount = fetchedImages.filter(item => item.url === url).length;
+    const options = {tenantId: f.tenantId, recordId: row.id, imageRef: url};
+    const first = await extractRecordImageText(options), second = await extractRecordImageText(options);
+    assert.equal(first.text, '本地模拟图中文字'); assert.equal(second.cached, true); assert.equal(ocrCalls, 1);
+    assert.equal(fetchedImages.filter(item => item.url === url).length, fetchCount, 'OCR used the local file, not the remote URL');
+    await assert.rejects(extractRecordImageText({...options, imageRef: 'https://mmecoa.qpic.cn/not-in-record.png'}), {code: 'image_not_found'});
   });
 
   await t.test('comments and replies are persisted with stable IDs; missing likes do not invent zero', async st => {

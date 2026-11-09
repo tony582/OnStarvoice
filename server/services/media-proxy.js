@@ -17,6 +17,8 @@ const BROWSER_UA =
 
 // 允许代理的媒体 CDN 域名后缀（防止把本接口当成任意 URL 的开放代理 / SSRF）
 const ALLOWED_HOST_SUFFIXES = [
+  // 微信文章正文图片（不扩大到 qq.com）
+  'qpic.cn',
   // 小红书
   'xhscdn.com',
   'xiaohongshu.com',
@@ -44,12 +46,14 @@ const ALLOWED_HOST_SUFFIXES = [
 
 // 按域名解析合适的 Referer，绕过防盗链
 const REFERER_RULES = [
+  { test: /(^|\.)qpic\.cn$/i, hostname: true, referer: 'https://mp.weixin.qq.com/' },
   { test: /xhscdn\.com|xiaohongshu\.com/i, referer: 'https://www.xiaohongshu.com/' },
   { test: /douyinvod\.com|douyinpic\.com|bytevod\.com|byteimg\.com|bytecdn\.cn|pstatp\.com|zjcdn\.com|amemv\.com|douyin/i, referer: 'https://www.douyin.com/' },
   { test: /sinaimg|weibocdn|weiboimg|miaopai|weibo\.com/i, referer: 'https://weibo.com/' },
 ];
 
 const PLATFORM_REFERER = {
+  wechat_articles: 'https://mp.weixin.qq.com/',
   xiaohongshu: 'https://www.xiaohongshu.com/',
   douyin: 'https://www.douyin.com/',
   weibo: 'https://weibo.com/',
@@ -167,7 +171,11 @@ export function isAllowedMediaHost(urlStr) {
 
 export function resolveReferer(urlStr, platform = '') {
   for (const rule of REFERER_RULES) {
-    if (rule.test.test(urlStr)) return rule.referer;
+    let subject = urlStr;
+    if (rule.hostname) {
+      try { subject = new URL(urlStr).hostname; } catch { continue; }
+    }
+    if (rule.test.test(subject)) return rule.referer;
   }
   return PLATFORM_REFERER[String(platform || '').toLowerCase()] || '';
 }

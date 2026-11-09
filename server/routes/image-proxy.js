@@ -8,6 +8,7 @@ import express from 'express';
 const router = express.Router();
 
 const HOST_RULES = [
+  { test: (h) => h === 'qpic.cn' || h.endsWith('.qpic.cn'), referer: 'https://mp.weixin.qq.com/' },
   { test: (h) => h.endsWith('.sinaimg.cn') || h.endsWith('.sinaimg.com') || h.endsWith('.weiboimg.cn') || h.endsWith('.weiboimg.com'), referer: 'https://weibo.com/' },
   { test: (h) => h.endsWith('.xhscdn.com') || h.endsWith('.xiaohongshu.com'), referer: 'https://www.xiaohongshu.com/' },
   { test: (h) => h.endsWith('.douyinpic.com') || h.endsWith('.douyinstatic.com') || h.endsWith('.pstatp.com') || h.endsWith('.bytecdn.cn') || h.endsWith('.byteimg.com') || h.endsWith('.bdxiguaimg.com'), referer: 'https://www.douyin.com/' },
@@ -32,6 +33,8 @@ router.get('/', async (req, res) => {
   const host = parsed.hostname.toLowerCase();
   const rule = HOST_RULES.find((r) => r.test(host));
   if (!rule) return res.status(403).send('host not allowed');
+  const wechat = host === 'qpic.cn' || host.endsWith('.qpic.cn');
+  if (wechat && (parsed.username || parsed.password || parsed.port)) return res.status(403).send('host not allowed');
 
   // 统一升级到 https,降低被拦概率
   if (parsed.protocol === 'http:') parsed.protocol = 'https:';
@@ -39,16 +42,32 @@ router.get('/', async (req, res) => {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
-    const upstream = await fetch(parsed.toString(), {
+    const options = {
       signal: controller.signal,
-      redirect: 'follow',
+      redirect: wechat ? 'manual' : 'follow',
       headers: {
         Referer: rule.referer,
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
       },
-    }).finally(() => clearTimeout(timer));
+    };
+    let current = parsed.toString(), upstream;
+    try {
+      for (let redirects = 0; redirects <= 3; redirects++) {
+        if (wechat) {
+          const target = new URL(current);
+          if (target.protocol !== 'https:' || target.username || target.password || target.port
+            || !(target.hostname === 'qpic.cn' || target.hostname.endsWith('.qpic.cn'))) return res.status(403).send('host not allowed');
+        }
+        upstream = await fetch(current, options);
+        if (!wechat || upstream.status < 300 || upstream.status >= 400) break;
+        const location = upstream.headers.get('location');
+        await upstream.body?.cancel();
+        if (!location || redirects === 3) return res.status(502).send('redirect failed');
+        current = new URL(location, current).toString();
+      }
+    } finally { clearTimeout(timer); }
 
     if (!upstream.ok) return res.status(upstream.status).send('upstream ' + upstream.status);
 

@@ -206,8 +206,8 @@ test('page DOM body, phone comments and each metric retain separate sources and 
   assert.deepEqual(body.payload.imageUrls, input.article.images.map(image => image.url));
   assert.deepEqual(article.bodyBlocks.map(block => block.type), ['text', 'image', 'text', 'image']);
   assert.deepEqual(article.bodyBlocks.filter(block => block.type === 'image').map(block => block.imageIndex), [0, 1]);
-  assert.ok(article.images.every(image => image.source === 'page_dom' && !image.stored && !image.downloadEligible),
-    'existing media allowlist does not yet authorize this CDN; a URL never proves a local file');
+  assert.ok(article.images.every(image => image.source === 'page_dom' && !image.stored && image.downloadEligible),
+    'the authorized CDN is download eligible, but a URL alone never proves a local file');
   input.comments.source = 'page_dom';
   assert.throws(() => sync(input), {code: 'INVALID_ARTICLE_COMMENT_SOURCE'});
   input.comments.source = 'screen_ocr';
