@@ -7,6 +7,7 @@ import {faultDetails} from './discovery-runner.mjs';
 import {wechatPostEvent, wechatWorkKey} from './wechat-evidence.mjs';
 import {sameCard} from '../device/wechat-ocr-parse.mjs';
 import {runWechatPatrol} from './wechat-patrol.mjs';
+import {runWechatForward} from './wechat-forward.mjs';
 
 const DEFAULT_CLOCK = {wallNow: () => Date.now(), monotonicNow: () => performance.now()};
 const METHODS = ['inspect', 'search', 'readCards', 'openCard', 'copyLink', 'readComments', 'returnToResults', 'recoverResults', 'scroll'];
@@ -82,7 +83,11 @@ export async function runWechatTask({task, store, device, permit, preview, clock
     requireEvidence(state?.deviceId === task.deviceId, 'device_identity_mismatch');
     if (state.readyForSearch === false) throw new RunnerFault(state.reason ?? 'device_not_ready');
     const commentLimit = task.comments?.enabled === true ? Math.max(0, Math.min(500, task.comments.limit ?? 50)) : 0;
-    if (task.mode === 'patrol') {
+    if (task.mode === 'forward') {
+      // 「发到微信」 (0.4.6): no search, no upload; the result is whether the post was sent.
+      requireEvidence(typeof device.openPost === 'function' && typeof device.forwardPost === 'function', 'invalid_device_adapter');
+      result = await runWechatForward({task, call, resolve: resolvePreview, note});
+    } else if (task.mode === 'patrol') {
       const record = event => {
         if (!store.getEvent(event.eventId)) { store.recordEvent(event); stats.posts++; stats.comments += event.comments.items.length; }
         lastEventId = event.eventId;

@@ -2,6 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {digest,fail,id,identity,LEASE_MS,text} from './validation.js';
 import {refreshOrchestrationParent} from './parent-refresh.js';
 import {claimPhonePatrolItem} from './patrol.js';
+import {FORWARD_ITEM_TYPE,forwardTarget,WECHAT_FORWARD_FEATURE} from './forward.js';
 import {heldItem,lockAgent,parentStopRequested,rollup,saveItemMetadata,taskRow} from './repository.js';
 import {MOBILE_PLATFORMS,mobileCommentPlan,mobilePlanBlockReason,mobilePlatformForWorkflow,mobileRelevancePrefilterEnabled,
   mobileTaskBudgets,mobileTaskFilters,mobileWorkflowFor,trimMobilePlanSnapshot,WECHAT_SEARCH_FILTERS_FEATURE} from './mobile-tasks.js';
@@ -35,9 +36,10 @@ export function taskPayload(item,metadata) {
     relevancePrefilter:{enabled:mobileRelevancePrefilterEnabled(metadata.planSnapshot)},
     // 0.4.0: the platform tells the Runner which app runs the task; WeChat Channels carries its comment plan.
     platform,
-    ...(platform==='wechat_channels' ? {mode:metadata.mode==='patrol' ? 'patrol' : 'keyword',
+    ...(platform==='wechat_channels' ? {mode:['patrol','forward'].includes(metadata.mode) ? metadata.mode : 'keyword',
       comments:metadata.comments || mobileCommentPlan(metadata.planSnapshot),
-      ...(metadata.mode==='patrol' ? {patrolTarget:metadata.patrolTarget} : {})} : {})};
+      ...(metadata.mode==='patrol' ? {patrolTarget:metadata.patrolTarget} : {}),
+      ...(metadata.mode==='forward' ? {forwardTarget:metadata.forwardTarget} : {})} : {})};
 }
 function permit(item,metadata,now) {
   return {...taskIdentity(item),leaseId:item.metadata.leaseId,serverTime:new Date(now).toISOString(),
@@ -98,7 +100,7 @@ async function findAssignedCandidate(tx,tenantId,agentId,workflows) {
 // One keyword that runs out of attempts turns the run needs_action; its other keywords stay claimable,
 // as in the browser elastic dispatch. Retries go to the fewest attempts first, so one failing keyword
 // cannot use up all of its retries while the others wait behind it.
-async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=false) {
+async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=false,wechatForward=false) {
   const item=await tx.queryOne(`SELECT item.* FROM capture_task_items item
     JOIN capture_tasks parent ON parent.id=item.task_id AND parent.tenant_id=item.tenant_id
     WHERE item.tenant_id=$1
@@ -111,7 +113,9 @@ async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=f
       AND parent.metadata->>'stopPending' IS DISTINCT FROM 'true'
       AND COALESCE(parent.metadata->>'stopCommandId','')=''
       AND COALESCE(parent.metadata->>'orchestrationTemplate','false') <> 'true'
-      AND (item.item_type='keyword' OR (parent.platform='wechat_channels' AND item.item_type='negative_post'))
+      AND (item.item_type='keyword' OR (parent.platform='wechat_channels' AND item.item_type IN ('negative_post','wechat_forward')))
+      -- 「发到微信」 goes only to a Runner that can forward (0.4.6) and is tried once: a second try could send twice.
+      AND (item.item_type<>'wechat_forward' OR ($8::boolean AND item.attempt_count=0))
       AND item.platform=parent.platform
       AND item.status IN ('pending','retryable')
       AND item.attempt_count < $3
@@ -134,9 +138,10 @@ async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=f
       AND ($7::boolean OR parent.platform<>'wechat_channels' OR item.item_type<>'keyword' OR (
         COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'videoDuration','all') NOT IN ('under_5m','5_20m','over_20m')
         AND COALESCE(parent.metadata->'planSnapshot'->'searchFilters'->>'searchScope','all') NOT IN ('followed','viewed')))
-    ORDER BY CASE WHEN item.status='pending' THEN 0 ELSE 1 END, parent.created_at, item.attempt_count, item.ordinal, item.id
+    ORDER BY CASE WHEN item.item_type='wechat_forward' THEN 0 ELSE 1 END, CASE WHEN item.status='pending' THEN 0 ELSE 1 END,
+      parent.created_at, item.attempt_count, item.ordinal, item.id
     FOR UPDATE OF item SKIP LOCKED LIMIT 1`,
-  [principal.tenantId,agent.id,MOBILE_ELASTIC_ATTEMPT_LIMIT,TERMINAL_EXECUTION_STATUSES,MOBILE_SAFETY_ERROR_CODES,platforms,wechatFilters]);
+  [principal.tenantId,agent.id,MOBILE_ELASTIC_ATTEMPT_LIMIT,TERMINAL_EXECUTION_STATUSES,MOBILE_SAFETY_ERROR_CODES,platforms,wechatFilters,wechatForward]);
   if (!item) return null;
   const parent=await tx.queryOne('SELECT * FROM capture_tasks WHERE id=$1 AND tenant_id=$2 FOR UPDATE',[item.task_id,principal.tenantId]);
   const planSnapshot=parent.metadata?.planSnapshot || {};
@@ -146,13 +151,21 @@ async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=f
   const patrol=item.item_type==='negative_post'
     ? await claimPhonePatrolItem(tx,{tenantId:principal.tenantId,parent,item,childId,revision}) : null;
   if (item.item_type==='negative_post' && !patrol) return null;
+  // 「发到微信」: the post and the contact; a post whose link is gone fails at once instead of waiting.
+  const forward=item.item_type===FORWARD_ITEM_TYPE ? await forwardTarget(tx,principal.tenantId,item) : null;
+  if (item.item_type===FORWARD_ITEM_TYPE && !forward) {
+    await tx.execute(`UPDATE capture_task_items SET status='failed',finished_at=now(),updated_at=now(),
+      error=jsonb_build_object('code','RECORD_SHARE_LINK_MISSING') WHERE id=$1`,[item.id]);
+    return null;
+  }
   const keywords=patrol ? [patrol.searchQuery] : [item.keyword];
   const workflow=mobileWorkflowFor(parent.platform);
   const childMetadata={workflow,agentKind:'android_mobile',deviceId:agent.capabilities.deviceId,
-    filters:patrol ? {sort:'all',publishWindowHours:null} : mobileTaskFilters(planSnapshot.searchFilters,parent.platform),
+    filters:patrol || forward ? {sort:'all',publishWindowHours:null} : mobileTaskFilters(planSnapshot.searchFilters,parent.platform),
     budgets:mobileTaskBudgets(planSnapshot,1),
-    ...(parent.platform==='wechat_channels' ? {comments:mobileCommentPlan(planSnapshot)} : {}),
+    ...(parent.platform==='wechat_channels' ? {comments:forward ? {enabled:false,limit:0} : mobileCommentPlan(planSnapshot)} : {}),
     ...(patrol || {}),
+    ...(forward ? {mode:'forward',forwardTarget:forward} : {}),
     keywords,deadlineAt:null,planSnapshot:trimMobilePlanSnapshot(planSnapshot,keywords),
     orchestrationChild:true,parentTaskId:parent.id,orchestrationRevision:revision,
     distributionMode:'elastic_pool',claimUnit:'keyword',
@@ -165,7 +178,7 @@ async function claimElasticItem(tx,principal,agent,now,platforms,wechatFilters=f
   // A patrol child is a negative_post_patrol task, as the formal patrol success rules expect.
   [childId,principal.tenantId,parent.id,agent.id,workflow,`${parent.title} · ${String(patrol ? `巡查 ${patrol.searchQuery}` : item.keyword).slice(0,80)}`,childMetadata,
     revision,parent.orchestration_schedule_id||null,parent.scheduled_for||null,parent.schedule_revision||null,parent.platform,
-    patrol ? 'negative_post_patrol' : 'capture']);
+    patrol ? 'negative_post_patrol' : forward ? 'wechat_forward' : 'capture']);
   if (item.execution_task_id && item.execution_task_id!==childId) {
     await tx.execute(`UPDATE capture_tasks SET status='superseded',metadata=metadata||jsonb_build_object(
       'handoffSuccessorTaskId',$1::uuid::text,'handoffReason','android_elastic_claimed','handoffAt',now()::text,
@@ -228,7 +241,8 @@ async function claimBoundItem(tx,principal,agent,child,item,sessionId,now) {
 // sends no list: when ready, it is a Douyin phone.
 /** The optional abilities a Runner names in its poll (0.4.5+); unknown names are dropped. */
 export function runnerFeatures(body) {
-  return Array.isArray(body?.features) ? [...new Set(body.features.filter(name=>name===WECHAT_SEARCH_FILTERS_FEATURE))] : [];
+  const known=[WECHAT_SEARCH_FILTERS_FEATURE,WECHAT_FORWARD_FEATURE];
+  return Array.isArray(body?.features) ? [...new Set(body.features.filter(name=>known.includes(name)))] : [];
 }
 export function readyPlatforms(body,agent,ready) {
   if (!ready) return [];
@@ -257,7 +271,8 @@ export async function poll(tx,principal,body,now=Date.now()) {
   if (item) {
     child=await taskRow(tx,principal.tenantId,item.execution_task_id);
   } else {
-    const claimed=await claimElasticItem(tx,principal,agent,now,platforms,features.includes(WECHAT_SEARCH_FILTERS_FEATURE));
+    const claimed=await claimElasticItem(tx,principal,agent,now,platforms,features.includes(WECHAT_SEARCH_FILTERS_FEATURE),
+      features.includes(WECHAT_FORWARD_FEATURE));
     if (!claimed) return {task:null,permit:null,control:{}};
     item=claimed.item; child=claimed.child;
   }

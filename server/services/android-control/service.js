@@ -8,6 +8,7 @@ import {id} from './validation.js';
 import {prefilterCards} from './prefilter.js';
 import {prefilterRelevanceBatch} from '../relevance-prefilter.js';
 import {ingestPosts,postReceipts} from './post-ingest.js';
+import {recordForwards,requestForward} from './forward.js';
 export function configuredAndroidTenants() {
   return new Set(String(process.env.ANDROID_DISCOVERY_INGEST_TENANTS || '').split(',').map(t=>t.trim()).filter(Boolean));
 }
@@ -30,5 +31,8 @@ export function createAndroidControlService({repository=createAndroidControlRepo
     // WeChat Channels posts (0.4.0); `persist` is the sync path the route layer hands in.
     posts:(principal,body,persist)=>ingestPosts({transaction:tx,persist},principal,body),
     postReceipts:(principal,batchId)=>postReceipts({transaction:tx},principal,batchId),
+    // 「发到微信」 from the admin: queue one forward of a stored 视频号 post; list a post's recent forwards.
+    forward:(tenant,input)=>tx(async db=>({forward:await requestForward(db,id(tenant),input)})),
+    forwards:(tenant,recordId)=>tx(async db=>({forwards:await recordForwards(db,id(tenant),recordId)})),
   };
 }

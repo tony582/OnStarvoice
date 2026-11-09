@@ -8,6 +8,7 @@ import {mobileCommentPlan, mobilePlanBlockReason, mobileTaskFilters, mobileWorkf
 import {readyPlatforms, runnerFeatures, taskPayload} from '../server/services/android-control/leases.js';
 import {normalizeOrchestrationRequest} from '../server/services/capture-orchestration.js';
 import {normalizeRemoteTaskInput} from '../server/services/capture-cloud.js';
+import {forwardItemStatus, forwardRecipient} from '../server/services/android-control/forward.js';
 import {normalizeRecord} from '../server/routes/sync.js';
 
 const principal = {tenantId: '11111111-1111-4111-8111-111111111111', agentId: '22222222-2222-4222-8222-222222222222'};
@@ -176,3 +177,14 @@ test('the 视频号 App\'s own 时长 / 范围 reach the phone task; values from
   assert.deepEqual(runnerFeatures({}), []);
 });
 const pick = filters => ({videoDuration: filters.videoDuration, searchScope: filters.searchScope});
+
+test('发到微信: the contact name is checked before it can reach the phone; a forward is never retried', () => {
+  assert.equal(forwardRecipient('  金明Tony '), '金明Tony');
+  assert.equal(forwardRecipient('A B'), 'A B');
+  for (const bad of ['', '   ', 'x'.repeat(41), "金明'Tony", '金明"', 'a$b', 'a`b', 'a\\b', 'a\nb']) {
+    assert.throws(() => forwardRecipient(bad), {code: 'INVALID_FORWARD_RECIPIENT'}, JSON.stringify(bad));
+  }
+  assert.equal(forwardItemStatus('completed', 'forward_sent'), 'completed');
+  assert.equal(forwardItemStatus('completed', 'forward_unconfirmed'), 'completed_with_warnings');
+  for (const status of ['needs_action', 'interrupted']) assert.equal(forwardItemStatus(status, 'forward_recipient_not_found'), 'failed');
+});

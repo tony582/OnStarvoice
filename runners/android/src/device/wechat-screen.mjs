@@ -20,14 +20,14 @@ export function createWechatScreen({adb, screen, ocr, serial, now = () => perfor
       if (parseKeyguard(await adb.keyguardState(serial, options)) === true) throw new DeviceError('device_locked', 'Unlock the phone to continue', {deviceSettled: true});
     },
     /** Poll the focused activity until it is one of `wanted`; the chat picker is left at once and stops the step. */
-    async waitFor(wanted, {signal, timeoutMs = 6000} = {}) {
+    async waitFor(wanted, {signal, timeoutMs = 6000, allowPicker = false} = {}) {
       const goals = [wanted].flat();
       const deadline = now() + timeoutMs;
       let current;
       while (true) {
         throwIfAborted(signal);
         current = await activity({signal});
-        if (current.activity === ACTIVITY.chooseChat) {
+        if ([ACTIVITY.chooseChat, ACTIVITY.chooseContact].includes(current.activity) && !goals.includes(current.activity) && !allowPicker) {
           await screen.back({signal});
           throw new DeviceError('unexpected_screen', 'WeChat opened the chat picker; nothing was sent', {deviceSettled: true});
         }

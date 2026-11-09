@@ -17,6 +17,7 @@ import { EmptyState } from '@/components/shared/EmptyState'
 import { Tooltip } from '@/components/shared/Tooltip'
 import { RecordImageGallery } from '@/components/shared/RecordImageGallery'
 import { RecordSourceAction } from '@/components/shared/RecordSourceAction'
+import { WechatForwardAction } from '@/components/shared/WechatForwardAction'
 import { RecordVideoPlayer } from '@/components/shared/RecordVideoPlayer'
 import {
   FeishuTableNumberControl,
@@ -491,6 +492,7 @@ function RecordDrawerContent({
                   <span title={r.platform === 'wechat_channels' ? '推荐' : '收藏'} className="inline-flex items-center gap-1"><Star className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.collects)}</span>
                   <span title="转发" className="inline-flex items-center gap-1"><Share2 className="h-3.5 w-3.5" strokeWidth={2} />{formatNumber(r.shares)}</span>
                 </div>
+                {r.platform === 'wechat_channels' && r.id && <WechatForwardAction recordId={String(r.id)} canWrite={canProcess} />}
               </div>
             </div>
 

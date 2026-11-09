@@ -248,3 +248,34 @@ test('the App\'s own 时长 / 范围 choices from the task reach the phone searc
     store.close();
   }
 });
+
+test('发到微信: the stored link must still be the same post; then the post is opened and forwarded once', async () => {
+  const createtime = 1793851201;
+  const info = (overrides = {}) => ({unavailable: false, description: '忍无可忍', createtime, nickname: '萧枫-东莞新起点凯迪专修', avatarUrl: '',
+    likeCountFmt: '', favCountFmt: '', forwardCountFmt: '', commentCountFmt: '', coverUrl: '', isImage: false,
+    exportId: 'export/UzFfBgAAxKWAeCIjPWGPk8zT4DCsIobzXQ', ...overrides});
+  const forwardTask = () => task({mode: 'forward', keyword: '金明Tony', filters: {sort: 'all', publishWindowHours: null},
+    comments: {enabled: false, limit: 0}, forwardTarget: {recordId: 'r1', url: 'https://weixin.qq.com/sph/AsvBQklNxh', recipient: '金明Tony',
+      title: '忍无可忍', author: '萧枫-东莞新起点凯迪专修', createtime}});
+  const run = async (preview, sent = {sent: true, confirmed: true}) => {
+    const store = new RunnerStore(':memory:');
+    const clock = fixtureClock();
+    const t = forwardTask();
+    const calls = [];
+    const base = device({pages: [[]], calls});
+    const phone = {...base, openPost: async params => { calls.push(['openPost', params.exportId]); return {opened: true}; },
+      forwardPost: async params => { calls.push(['forwardPost', params.recipient]); return sent; }};
+    const result = await runWechatTask({task: t, store, device: phone, permit: fixturePermit(t, clock), clock, postPauseMs: [0, 0], preview: {resolve: preview}});
+    store.close();
+    return {result, calls: calls.filter(Array.isArray), searched: calls.includes('search')};
+  };
+  const ok = await run(async () => info());
+  assert.deepEqual([ok.result.status, ok.result.reason], ['completed', 'forward_sent']);
+  assert.deepEqual(ok.calls, [['openPost', 'export/UzFfBgAAxKWAeCIjPWGPk8zT4DCsIobzXQ'], ['forwardPost', '金明Tony']]);
+  assert.equal(ok.searched, false);
+  assert.equal((await run(async () => info(), {sent: true, confirmed: false})).result.reason, 'forward_unconfirmed');
+  const moved = await run(async () => info({createtime: createtime - 60}));
+  assert.deepEqual([moved.result.status, moved.result.reason, moved.calls.length], ['needs_action', 'forward_post_mismatch', 0]);
+  const gone = await run(async () => ({unavailable: true}));
+  assert.deepEqual([gone.result.reason, gone.calls.length], ['forward_post_unavailable', 0]);
+});

@@ -69,6 +69,9 @@ export function createAndroidControlRouter({service,enabledTenants=configuredAnd
   router.get('/runs/:id',...user,handle(req=>service.detail(req.tenantId,req.params.id)));
   router.post('/runs/:id/stop',...writer,handle(req=>service.stop(req.tenantId,req.params.id,req.body || {})));
   router.post('/runs/:id/resume',...writer,handle(req=>service.resume(req.tenantId,req.params.id)));
+  router.post('/wechat-forwards',...writer,handle(req=>service.forward(req.tenantId,{recordId:req.body?.recordId,
+    recipient:req.body?.recipient,userId:req.user?.id || '',userName:req.actorName || ''})));
+  router.get('/wechat-forwards',...user,handle(req=>service.forwards(req.tenantId,req.query.recordId)));
   const agent=[authenticateAgent,flag,principal];
   for (const action of ['poll','renew','complete','close']) router.post(`/agent/${action}`,...agent,
     handle(req=>service[action](req.mobilePrincipal,req.body || {})));

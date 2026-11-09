@@ -24,6 +24,10 @@ export const ACTIVITY = Object.freeze({
   detail: 'com.tencent.mm.plugin.finder.ui.FinderShareFeedRelUI',
   // Choosing a chat to send the post to: never act here, go back at once.
   chooseChat: 'com.tencent.mm.ui.transmit.SelectConversationUI',
+  // 转发给朋友 in 8.0.80 (2026-11-09): the 选择聊天 picker, then the 「发送给：…」 confirmation sheet. Only 「发到微信」 acts
+  // here; everywhere else the picker is left at once like chooseChat.
+  chooseContact: 'com.tencent.mm.ui.mvvm.MvvmContactListUI',
+  sendConfirm: 'com.tencent.mm.ui.halfscreen.HalfScreenTransparentActivity',
 });
 export const POINT = Object.freeze({
   // Channels home: the magnifier left of the "me" icon (the icon at x 990 opens one's own Channels page).

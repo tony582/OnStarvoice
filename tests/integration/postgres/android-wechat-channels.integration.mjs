@@ -155,6 +155,44 @@ test('WeChat Channels on a shared phone: claim by platform, post upload, receipt
     await f.complete(plain.task);
   });
 
+  await t.test('发到微信: one queued forward per post and contact, claimed first by a Runner that can forward, never retried', async st => {
+    const f = await fixture(st);
+    const [record] = await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,content,author_name,url,keyword,publish_time)
+      VALUES($1,'wxc_forward_test','wechat_channels','keyword_notes','忍无可忍','忍无可忍，无须再忍！','萧枫-东莞新起点凯迪专修',
+        'https://weixin.qq.com/sph/AsvBQklNxh','凯迪拉克车机升级','2026-11-05 12:00:01') RETURNING id`, [f.tenantId]);
+    await assert.rejects(f.service.forward(f.tenantId, {recordId: record.id, recipient: "金明'"}), {code: 'INVALID_FORWARD_RECIPIENT'});
+    // A keyword already waiting does not hold the forward back.
+    await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星']});
+    const {forward} = await f.service.forward(f.tenantId, {recordId: record.id, recipient: '金明Tony', userName: '测试员'});
+    assert.equal(forward.status, 'pending');
+    const again = await f.service.forward(f.tenantId, {recordId: record.id, recipient: '金明Tony'});
+    assert.equal(again.forward.id, forward.id, 'the same post to the same contact is not queued twice');
+    const older = await f.poll({platforms: ['wechat_channels'], features: ['wechat_search_filters']});
+    assert.equal(older.task.mode, 'keyword', 'a Runner that cannot forward takes the keyword instead');
+    await f.complete(older.task);
+    const claim = await f.poll({platforms: ['wechat_channels'], features: ['wechat_search_filters', 'wechat_forward']});
+    assert.equal(claim.task.mode, 'forward');
+    assert.equal(claim.task.keyword, '金明Tony');
+    assert.deepEqual(claim.task.forwardTarget, {recordId: record.id, url: 'https://weixin.qq.com/sph/AsvBQklNxh', recipient: '金明Tony',
+      title: '忍无可忍', author: '萧枫-东莞新起点凯迪专修', createtime: 1793851201});
+    assert.deepEqual(claim.task.comments, {enabled: false, limit: 0});
+    const [child] = await query('SELECT task_type FROM capture_tasks WHERE id=$1', [claim.task.identity.taskId]);
+    assert.equal(child.task_type, 'wechat_forward');
+    await f.complete(claim.task, {reason: 'forward_sent'});
+    let [listed] = (await f.service.forwards(f.tenantId, record.id)).forwards;
+    assert.deepEqual([listed.status, listed.reason, listed.requestedBy], ['completed', 'forward_sent', '测试员']);
+    // A failed forward stays failed: no second claim, even for the same phone.
+    await f.service.forward(f.tenantId, {recordId: record.id, recipient: '另一个人'});
+    const failing = await f.poll({platforms: ['wechat_channels'], features: ['wechat_forward']});
+    await f.complete(failing.task, {status: 'needs_action', reason: 'forward_recipient_not_found'});
+    [listed] = (await f.service.forwards(f.tenantId, record.id)).forwards;
+    assert.deepEqual([listed.recipient, listed.status, listed.errorCode], ['另一个人', 'failed', 'WECHAT_FORWARD_FAILED']);
+    assert.equal((await f.poll({platforms: ['wechat_channels'], features: ['wechat_forward']})).task, null);
+    await assert.rejects(f.service.forward(f.tenantId, {recordId: (await query(`INSERT INTO records(tenant_id,external_id,platform,record_type,title,url)
+      VALUES($1,'dy1','douyin','keyword_notes','t','https://www.douyin.com/video/1') RETURNING id`, [f.tenantId]))[0].id, recipient: '金明Tony'}),
+    {code: 'RECORD_NOT_WECHAT_CHANNELS'});
+  });
+
   await t.test('a post captured again keeps its comment ids although OCR read the comments a little differently', async st => {
     const f = await fixture(st);
     await elasticParent(f.tenantId, {platform: 'wechat_channels', eligibleAgentIds: [f.phone.id], keywords: ['安吉星', '安吉星收费']});

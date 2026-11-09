@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
-import {commentButton, comparable, filterButton, sheetOption, findText, findWord, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
+import {commentButton, comparable, filterButton, forwardEntry, forwardToastSeen, pickerMatch, pickerSearch, sendConfirmation, sheetOption, findText, findWord, isResultsPage, parseResultCards, parseTimeLabel, sameCard} from '../src/device/wechat-ocr-parse.mjs';
 import {MORE_VIDEOS_SHIFT, POINT, SEARCH_FILTERS, feedLink} from '../src/device/wechat-profile.mjs';
 import {mergeCommentScreens, namesAgree, parseCommentScreen, textsAgree} from '../src/device/wechat-comments-parse.mjs';
 import {createAdbScreen, encodeModifiedUtf7} from '../src/device/adb-screen.mjs';
@@ -283,4 +283,23 @@ test('the 时长 / 范围 buttons, their sheets and the picked choice are read f
   assert.equal(filterButton(rows('filters-duration-picked-20261109'), scope).shows, 'all');
   const both = rows('filters-both-picked-20261109');
   assert.deepEqual([filterButton(both, duration).shows, filterButton(both, scope).shows], ['under_5m', 'viewed']);
+});
+
+// 2026-11-09 13:23, the 萧枫 post forwarded to 金明Tony by hand: share sheet, 选择聊天, 「发送给：」 sheet, 「已发送」.
+test('转发给朋友 screens: the entry, the picker search and contact row, the confirmation that names the contact, the toast', () => {
+  const entry = forwardEntry(rows('forward-share-sheet-20261109'));
+  assert.ok(entry && entry.x < 200 && entry.y < 1664, 'on the icon above the 转发给朋友 label, never 收藏 or 朋友圈');
+  assert.equal(forwardEntry(rows('forward-sent-20261109')), null);
+  const picker = rows('forward-picker-20261109');
+  assert.ok(pickerSearch(picker).center.y < 340);
+  assert.ok(pickerMatch(picker, '金明Tony').center.y > 560);
+  assert.equal(pickerMatch(picker, '金明'), null, 'only the exact name');
+  assert.equal(pickerMatch([{text: '金明Tony', x: 140, y: 150, w: 200, h: 50, conf: 1}], '金明Tony'), null, 'the search field echo is not a contact');
+  const sheet = sendConfirmation(rows('forward-confirm-20261109'), '金明Tony');
+  assert.equal(sheet.confirmed, true);
+  assert.ok(sheet.send.center.x > 540 && sheet.cancel.center.x < 540);
+  assert.equal(sendConfirmation(rows('forward-confirm-20261109'), '别人').confirmed, false, 'another name never confirms');
+  assert.equal(sendConfirmation(rows('forward-picker-20261109'), '金明Tony').confirmed, false);
+  assert.equal(forwardToastSeen(rows('forward-sent-20261109')), true);
+  assert.equal(forwardToastSeen(rows('forward-confirm-20261109')), false);
 });

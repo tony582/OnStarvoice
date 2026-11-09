@@ -3,7 +3,8 @@ import {pause} from './ui-wait.mjs';
 import {UNICODE_IME} from './adb-screen.mjs';
 import {ACTIVITY, MAIN_TABS, MORE_VIDEOS_SHIFT, POINT, REGION, SEARCH_FILTERS, SWIPE, WECHAT_MAIN, WECHAT_SCHEME_ENTRY, feedLink}
   from './wechat-profile.mjs';
-import {commentButton, filterButton, findText, findWord, isResultsPage, parseResultCards, sheetOption} from './wechat-ocr-parse.mjs';
+import {commentButton, filterButton, findText, findWord, forwardEntry, forwardToastSeen, isResultsPage, parseResultCards, pickerMatch,
+  pickerSearch, sendConfirmation, sheetOption} from './wechat-ocr-parse.mjs';
 import {readCommentPanel} from './wechat-comment-reader.mjs';
 
 export const SHARE_LINK = /^https:\/\/weixin\.qq\.com\/sph\/[A-Za-z0-9_-]{4,40}$/u;
@@ -29,12 +30,13 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
     if (!context) throw settled('search_context_unverified', 'No verified Channels search');
     return context;
   };
-  const typeKeyword = async (keyword, signal) => {
+  // `box` is the field to focus first (the Channels search box by default); the text replaces what it holds.
+  const typeKeyword = async (keyword, signal, box = POINT.searchBox) => {
     let original = await screen.defaultIme({signal});
     if (original === UNICODE_IME) original = restoreIme;
     if (!original || original.startsWith('io.appium.settings/')) throw settled('input_method_unknown', 'The phone keyboard to restore is unknown');
     rememberIme(original);
-    await screen.tap(POINT.searchBox.x, POINT.searchBox.y, {signal});
+    await screen.tap(box.x, box.y, {signal});
     await pause(400, signal);
     await screen.key(KEY.moveEnd, {signal});
     await screen.key(KEY.del, {repeat: 40, signal});
@@ -196,6 +198,58 @@ export function createWechatFlow({screen, view, rememberIme = () => {}, restoreI
       await view.waitFor(ACTIVITY.detail, {signal, timeoutMs: 8000});
       await pause(1200, signal);
       return {opened: true};
+    },
+    /**
+     * 「发到微信」 on the open work page: 转发 → 转发给朋友 → search the contact → its exact row → the 「发送给：<name>」 sheet →
+     * 发送. Nothing is sent unless that sheet names the contact; any mismatch backs out to the work page first. Returns
+     * whether WeChat's 「已发送」 toast was seen afterwards.
+     */
+    async forwardPost({recipient, signal}) {
+      const leave = async () => {
+        for (let presses = 0; presses < 5; presses++) {
+          const current = await view.activity({signal: undefined});
+          if (current.activity === ACTIVITY.detail) return;
+          await screen.back({timeoutMs: 5000});
+          await pause(800);
+        }
+      };
+      await view.waitFor(ACTIVITY.detail, {signal, timeoutMs: 3000});
+      const share = commentButton(await view.look({signal, roi: REGION.workBar}), {fallback: POINT.share, shift: MORE_VIDEOS_SHIFT});
+      await screen.tap(share.x, share.y, {signal});
+      await pause(1200, signal);
+      const entry = forwardEntry(await view.look({signal, roi: REGION.shareSheet}));
+      if (!entry) { await screen.back({signal}); throw settled('share_sheet_unverified', 'The share sheet or its 转发给朋友 entry was not confirmed'); }
+      await screen.tap(entry.x, entry.y, {signal});
+      try {
+        await view.waitFor(ACTIVITY.chooseContact, {signal, timeoutMs: 6000});
+        await pause(800, signal);
+        const search = pickerSearch(await view.look({signal}));
+        if (!search) throw settled('forward_picker_unverified', 'The chat picker search was not found');
+        await typeKeyword(recipient, signal, search.center);
+        await pause(1500, signal);
+        const match = pickerMatch(await view.look({signal}), recipient);
+        if (!match) throw settled('forward_recipient_not_found', 'No contact with exactly that name');
+        await screen.tap(match.center.x, match.center.y, {signal});
+        await view.waitFor(ACTIVITY.sendConfirm, {signal, timeoutMs: 5000, allowPicker: true});
+        await pause(700, signal);
+        const sheet = sendConfirmation(await view.look({signal}), recipient);
+        if (!sheet.confirmed) {
+          if (sheet.cancel) await screen.tap(sheet.cancel.center.x, sheet.cancel.center.y, {signal});
+          throw settled('forward_confirm_unverified', 'The send sheet did not name that contact');
+        }
+        await screen.tap(sheet.send.center.x, sheet.send.center.y, {signal});
+      } catch (error) {
+        await leave();
+        throw error;
+      }
+      // Sent from here on: no error may make the caller try again.
+      let toast = false;
+      for (let look = 0; look < 3 && !toast; look++) {
+        await pause(700);
+        try { toast = forwardToastSeen(await view.look({roi: REGION.workBar})); } catch { /* the toast only confirms */ }
+      }
+      try { await leave(); } catch { /* parking returns to the main screen anyway */ }
+      return {sent: true, confirmed: toast};
     },
     async returnToResults({signal}) {
       const {keyword} = requireContext();

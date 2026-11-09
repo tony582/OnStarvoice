@@ -196,6 +196,33 @@ export function sheetOption(rows, filter, key) {
   return option ? {...option, center: center(option)} : null;
 }
 
+// 转发给朋友 (2026-11-09, 8.0.80): share sheet → 选择聊天 picker → 「发送给：…」 sheet → toast 「已发送」.
+/** 转发给朋友 on the share sheet's first row; the tap goes on its icon, just above the label. */
+export function forwardEntry(rows) {
+  const label = findText(rows, '转发给朋友', {region: {y0: 1500, y1: 1800, x1: 300}})[0];
+  return label ? {x: label.center.x, y: label.y - 40} : null;
+}
+/** The picker's search field (「Q 搜索」 under the title). */
+export function pickerSearch(rows) {
+  return findText(rows, '搜索', {region: {y0: 200, y1: 340, x1: 600}, exact: false})[0] ?? null;
+}
+/** A contact or chat row whose name is exactly `name`, below the search field (which echoes the typed name). */
+export function pickerMatch(rows, name) {
+  const goal = comparable(name);
+  const row = rows.filter(r => r.y >= 360 && r.y < COMMENT_INPUT_TOP && comparable(r.text) === goal).sort(byPosition)[0];
+  return row ? {...row, center: center(row)} : null;
+}
+/** The confirmation sheet: 「发送给：」, the recipient's name right under it, and its 发送 / 取消 buttons. */
+export function sendConfirmation(rows, name) {
+  const title = rows.find(r => /^发送给/u.test(String(r.text).normalize('NFKC').trim()));
+  const goal = comparable(name);
+  const named = Boolean(title) && rows.some(r => r.y > title.y && r.y < title.y + 260 && comparable(r.text) === goal);
+  const send = findText(rows, '发送', {region: {y0: 1800, y1: 2200, x0: 540}})[0] ?? null;
+  const cancel = findText(rows, '取消', {region: {y0: 1800, y1: 2200, x1: 540}})[0] ?? null;
+  return {confirmed: Boolean(title && named && send), send, cancel};
+}
+export const forwardToastSeen = rows => rows.some(r => /已发送/u.test(r.text));
+
 // Letters and digits only, for comparing text that OCR may punctuate or cut differently.
 const bareText = value => comparable(value).replace(/[^\p{L}\p{N}]/gu, '');
 // The search box shows about 14 characters: a longer keyword (a patrol caption start) reads back as its beginning,

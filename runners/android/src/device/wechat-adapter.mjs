@@ -61,6 +61,7 @@ export function createWechatAdapter({serial, adb, adbPath = 'adb', ocr, ocrBinar
     readCards: params => flow.readCards(params),
     openCard: params => flow.openCard(params),
     openPost: params => flow.openPost(params),
+    forwardPost: params => flow.forwardPost(params),
     copyLink: params => flow.copyLink(params),
     readComments: params => flow.readComments(params),
     returnToResults: params => flow.returnToResults(params),
@@ -78,7 +79,7 @@ export function createWechatAdapter({serial, adb, adbPath = 'adb', ocr, ocrBinar
       return {closed: true, verifiedAt: new Date(now()).toISOString(), evidenceId: randomUUID()};
     },
   };
-  for (const name of ['inspect', 'search', 'readCards', 'openCard', 'openPost', 'copyLink', 'readComments', 'returnToResults', 'recoverResults', 'scroll']) {
+  for (const name of ['inspect', 'search', 'readCards', 'openCard', 'openPost', 'forwardPost', 'copyLink', 'readComments', 'returnToResults', 'recoverResults', 'scroll']) {
     const method = adapter[name];
     adapter[name] = params => {
       throwIfAborted(params?.signal);

@@ -249,7 +249,7 @@ function agentBlockReason(
     if (negativePatrolEnabled && platform !== 'wechat_channels') return '抖音手机节点不支持负面巡查'
     const features = agent.capabilities?.runnerFeatures
     if (wechatAppFilters && platform === 'wechat_channels' && !(Array.isArray(features) && features.includes('wechat_search_filters'))) {
-      return '手机采集器需升级到 0.4.5 才能按视频号的「时长」「范围」筛选'
+      return '手机采集器需升级到 0.4.5 及以上才能按视频号的「时长」「范围」筛选'
     }
     return ''
   }

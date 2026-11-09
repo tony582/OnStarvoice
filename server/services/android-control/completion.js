@@ -3,6 +3,7 @@ import {currentAttempt,MOBILE_ELASTIC_ATTEMPT_LIMIT} from './leases.js';
 import {refreshOrchestrationParent} from './parent-refresh.js';
 import {parentStopRequested,rollup,saveItemMetadata} from './repository.js';
 import {settlePhonePatrol} from './patrol.js';
+import {FORWARD_ITEM_TYPE,forwardItemStatus} from './forward.js';
 async function parentMetadataFor(tx,principal,task) {
   if (!task.metadata?.orchestrationChild || !task.parent_task_id) return null;
   const row=await tx.queryOne('SELECT metadata FROM capture_tasks WHERE id=$1 AND tenant_id=$2',[task.parent_task_id,principal.tenantId]);
@@ -54,6 +55,9 @@ export async function complete(tx,principal,body) {
   if (item.item_type==='negative_post' && task.metadata?.mode==='patrol' && body.deviceIdle && status!=='canceled') {
     ({itemStatus,patrolOutcome}=await settlePhonePatrol(tx,{tenantId:principal.tenantId,item,task,status,reason:payload.reason}));
   }
+  // 「发到微信」 is never retried: whatever ended an idle attempt is its result.
+  const forward=item.item_type===FORWARD_ITEM_TYPE && body.deviceIdle && status!=='canceled';
+  if (forward) itemStatus=forwardItemStatus(status,payload.reason);
   const receipt={accepted:true,deviceHeld:!body.deviceIdle};
   const completion={requestId,hash,receipt};
   await tx.execute(`UPDATE capture_task_item_attempts SET status=$2,checkpoint=checkpoint||$3::jsonb,
@@ -62,7 +66,10 @@ export async function complete(tx,principal,body) {
   await saveItemMetadata(tx,item,{...item.metadata,deviceHeld:!body.deviceIdle,completion,...(patrolOutcome ? {patrolOutcome} : {}),
     reason:payload.reason,deviceClosedAt:body.deviceIdle?new Date().toISOString():null,
     resumeAuthorized:itemStatus==='retryable'?false:item.metadata.resumeAuthorized===true},itemStatus);
-  if (itemStatus==='failed') await tx.execute(`UPDATE capture_task_items SET finished_at=COALESCE(finished_at,now()),
+  if (itemStatus==='failed' && forward) await tx.execute(`UPDATE capture_task_items SET finished_at=COALESCE(finished_at,now()),
+    error=COALESCE(error,'{}'::jsonb)||jsonb_build_object('code','WECHAT_FORWARD_FAILED','reason',$2::text) WHERE id=$1`,
+  [item.id,payload.reason]);
+  else if (itemStatus==='failed') await tx.execute(`UPDATE capture_task_items SET finished_at=COALESCE(finished_at,now()),
     error=COALESCE(error,'{}'::jsonb)||jsonb_build_object('code','MOBILE_ATTEMPTS_EXHAUSTED','reason',$2::text,
       'message',$3::text) WHERE id=$1`,
   [item.id,payload.reason,`手机已尝试 ${MOBILE_ELASTIC_ATTEMPT_LIMIT} 次仍未完成，已标记失败`]);
