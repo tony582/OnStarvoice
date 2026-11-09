@@ -33,7 +33,7 @@ import { isRecordDetailDegraded, recordDisplayTitle } from '@/lib/record-display
 import { PostJudgmentDetails } from '@/components/shared/PostJudgment'
 import { postJudgment } from '@/lib/post-judgment'
 import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
-import { wechatArticlePresentation } from '@/lib/wechat-article.mjs'
+import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticlePresentation } from '@/lib/wechat-article.mjs'
 
 /**
  * 内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
@@ -378,6 +378,8 @@ function RecordDrawerContent({
   const deleted = String(r.content_availability_status || '') === 'deleted'
   const hasSignals = alerts > 0 || negComments > 0 || deleted
   const article = r.platform === 'wechat_articles' ? wechatArticlePresentation(r, comments.length) : null
+  const articleDetail = article ? wechatArticleDetail(r) : null
+  const sourceName = articleDetail?.account || r.author_name || ''
   const triageStatus = r.triage_status || 'unhandled'
 
   const TABS = [
@@ -477,24 +479,28 @@ function RecordDrawerContent({
                 <div className="mt-1.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[12px] text-muted-foreground">
                   <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-foreground/90">
                     <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-muted text-[10px] font-bold text-muted-foreground">
-                      {(r.author_name || '?').slice(0, 1)}
+                      {(sourceName || '?').slice(0, 1)}
                     </span>
-                    <span className="truncate">{r.author_name || '未知作者'}</span>
+                    <span className="truncate">{sourceName || '未知作者'}</span>
                   </span>
                   {Number(r.author_fans) > 0 && <><MetaDot /><span>粉丝 {formatNumber(r.author_fans)}</span></>}
                   <MetaDot /><span>{platformName(r.platform)}</span>
-                  {r.publish_display && <><MetaDot /><span>发布于 {r.publish_display}</span></>}
+                  {articleDetail ? <>
+                    <MetaDot /><span>作者：{articleDetail.author || '未显示'}</span>
+                    <MetaDot /><span>地区：{articleDetail.location || '未显示'}</span>
+                    <MetaDot /><span>{articleDetail.published ? `发布于 ${articleDetail.published}` : '发布时间未显示'}</span>
+                  </> : r.publish_display && <><MetaDot /><span>发布于 {r.publish_display}</span></>}
                   <MetaDot /><RecordSourceAction record={r} className="gap-1 text-[12px] font-medium" />
                   {r.blogger_profile_url && <><MetaDot /><a href={r.blogger_profile_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-medium text-primary hover:underline"><User className="h-3.5 w-3.5" />主页</a></>}
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-x-3.5 gap-y-1 text-[12px] tabular-nums text-muted-foreground" aria-label="互动数据">
-                  {article ? <>
-                    <span className="inline-flex items-center gap-1"><Eye className="h-3.5 w-3.5" />阅读 {formatRecordMetric(r, 'reads')}</span>
-                    <span className="inline-flex items-center gap-1"><Heart className="h-3.5 w-3.5" />点赞 {formatRecordMetric(r, 'likes')}</span>
-                    <span className="inline-flex items-center gap-1"><Share2 className="h-3.5 w-3.5" />分享 {formatRecordMetric(r, 'shares')}</span>
-                    <span className="inline-flex items-center gap-1"><Star className="h-3.5 w-3.5" />推荐 {formatRecordMetric(r, 'collects')}</span>
-                    <span className="inline-flex items-center gap-1"><MessageCircle className="h-3.5 w-3.5" />留言 {formatRecordMetric(r, 'comments_count')}</span>
-                  </> : <>
+                  {articleDetail ? articleDetail.metrics.map(metric => {
+                    const Icon = { read: Eye, like: Heart, share: Share2, recommend: Star, comments: MessageCircle }[metric.key]
+                    return <div key={metric.key} className="flex min-w-0 flex-col gap-0.5 py-0.5">
+                      <span className="inline-flex items-center gap-1"><Icon className="h-3.5 w-3.5" />{metric.label} {metric.value}</span>
+                      <span className="text-[10px] text-muted-foreground">{metric.source} · {metric.capturedAt === '读取时间未记录' ? metric.capturedAt : `读取于 ${metric.capturedAt}`}</span>
+                    </div>
+                  }) : <>
                   {/* 视频号的点赞列是 App 里的「喜欢」（大拇指），收藏列是「推荐」（心形）。 */}
                   <span title={r.platform === 'wechat_channels' ? '喜欢' : '点赞'} className="inline-flex items-center gap-1"><Heart className="h-3.5 w-3.5" strokeWidth={2} />{formatRecordMetric(r, 'likes')}</span>
                   <span title="评论" className="inline-flex items-center gap-1"><MessageCircle className="h-3.5 w-3.5" strokeWidth={2} />{formatRecordMetric(r, 'comments_count')}</span>
@@ -1443,6 +1449,7 @@ type RecordContentTabProps = {
 function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, images, imageRefs, imageKey, onOpenImage }: RecordContentTabProps) {
   const video = hasVideo(r)
   const article = r.platform === 'wechat_articles' ? wechatArticlePresentation(r) : null
+  const articleBlocks = article ? wechatArticleBodyBlocks(r, images.map((url, index) => ({ url, ref: imageRefs[index] || '' }))) : []
   const transcript = useRecordTranscript(r, video)
   const gallery = (
     <RecordImageGallery
@@ -1460,11 +1467,17 @@ function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, imag
       <section aria-label="原帖内容" className="space-y-6">
         <ContentGroupHeader icon={FileText} title="原帖内容" />
         {video && <RecordVideoPlayer key={String(r.id)} record={r} poster={cover} />}
-        {!video && gallery}
+        {!video && articleBlocks.length === 0 && gallery}
         <div>
           <h4 className={cn(CONTENT_SECTION_TITLE, 'mb-2')}>正文</h4>
           {article && <div className="mb-3 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs leading-5"><p className="font-medium">{article.bodyLabel}</p><p className="text-muted-foreground">{article.bodyDescription}</p></div>}
-          <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || (article ? '本次未取得正文' : '无正文')}</p>
+          {articleBlocks.length > 0 ? <div className="space-y-4">
+            {articleBlocks.map((block, index) => block.type === 'text'
+              ? <p key={`text-${index}`} className="whitespace-pre-wrap break-words text-sm leading-relaxed">{block.text}</p>
+              : <RecordImageGallery key={`${r.id}-${index}-${block.ref}-${block.url}`}
+                  recordId={String(r.id)} canRefresh={canRefreshImages} layout="article" title="正文配图"
+                  images={[proxiedImg(block.url)]} imageRefs={[block.ref]} imageAlts={[block.alt]} onOpen={onOpenImage} />)}
+          </div> : <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || (article ? '本次未取得正文' : '无正文')}</p>}
         </div>
         {video && <TranscriptTextSection transcript={transcript} canWrite={canProcess} />}
         {/* 视频帖的图通常只有封面：放在正文和逐字稿后面，主要用来提取封面上的文字 */}

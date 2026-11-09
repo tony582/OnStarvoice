@@ -15,11 +15,12 @@ test('the content tab shows the post itself first and the AI output below it', (
     return index;
   };
 
-  // 原帖：视频 / 图片、正文、逐字稿原文
+  // 原帖：视频 / 普通图库、按段落穿插的文章配图、正文、逐字稿原文
   const original = at('title="原帖内容"');
   const ai = at('title="AI 分析"');
   assert.ok(original < ai);
-  for (const marker of ['<RecordVideoPlayer', '{!video && gallery}', '>正文</h4>', '<TranscriptTextSection', '{video && gallery}']) {
+  for (const marker of ['<RecordVideoPlayer', '{!video && articleBlocks.length === 0 && gallery}', '>正文</h4>',
+    'articleBlocks.map(', '<TranscriptTextSection', '{video && gallery}']) {
     const index = at(marker);
     assert.ok(original < index && index < ai, `${marker} belongs to 原帖内容`);
   }

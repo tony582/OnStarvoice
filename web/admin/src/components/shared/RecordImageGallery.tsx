@@ -5,17 +5,21 @@ import { api } from '@/lib/api'
 export function RecordImageGallery({
   images,
   imageRefs,
+  imageAlts,
   onOpen,
   recordId,
   canRefresh = false,
   title = '图片',
+  layout = 'grid',
 }: {
   images: string[]
   imageRefs?: string[]
+  imageAlts?: string[]
   onOpen: (url: string) => void
   recordId?: string
   canRefresh?: boolean
   title?: string
+  layout?: 'grid' | 'article'
 }) {
   const [failed, setFailed] = useState<Set<string>>(() => new Set())
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
@@ -160,14 +164,15 @@ export function RecordImageGallery({
       </div>
 
       {visible.length > 0 ? (
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <div className={layout === 'article' ? 'grid grid-cols-1 gap-3' : 'grid grid-cols-2 gap-2 sm:grid-cols-3'}>
           {visible.map(item => (
             <div key={item.key}
               className="overflow-hidden rounded-lg border border-border bg-card">
               <button type="button" onClick={() => onOpen(item.url)} title="点击放大"
                 aria-label={`放大第 ${item.index + 1} 张图片`}
-                className="group relative block aspect-[3/4] w-full cursor-zoom-in overflow-hidden bg-muted">
-                <img src={item.url} alt="" className="h-full w-full object-cover transition group-hover:scale-105"
+                className={layout === 'article' ? 'group relative block w-full cursor-zoom-in overflow-hidden bg-muted' : 'group relative block aspect-[3/4] w-full cursor-zoom-in overflow-hidden bg-muted'}>
+                <img src={item.url} alt={imageAlts?.[item.index] || ''}
+                  className={layout === 'article' ? 'block h-auto w-full object-contain' : 'h-full w-full object-cover transition group-hover:scale-105'}
                   referrerPolicy="no-referrer"
                   onError={() => setFailed(current => {
                     const next = new Set(current)
@@ -195,7 +200,7 @@ export function RecordImageGallery({
                       ? '查看文字'
                       : results[item.index]?.status === 'error'
                         ? '重试识别'
-                        : '提取文字'}
+                        : layout === 'article' ? '识别图中文字' : '提取文字'}
                 </button>
               )}
             </div>
