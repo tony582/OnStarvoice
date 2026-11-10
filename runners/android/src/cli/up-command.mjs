@@ -18,6 +18,7 @@ const REASON_TEXT = Object.freeze({
   device_missing: '手机未连接', appium_not_ready: 'Appium 执行器未就绪', profile_required: '未配置采集组合',
   login_required: '需登录抖音', login_or_challenge_required: '需登录抖音', challenge_or_unknown: '需在手机上处理验证',
   profile_version_mismatch: '机型或抖音版本不匹配', device_closure_required: '需人工确认手机停稳',
+  ocr_warming: '本机文字识别正在预热', ocr_unavailable: '本机文字识别暂不可用，将重试预热',
 });
 
 // What the operator can do about a readiness reason; printed once each time the reason appears.

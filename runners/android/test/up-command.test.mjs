@@ -60,6 +60,8 @@ test('readiness lines map the probe reason to plain language', () => {
   assert.match(describeReadiness({ready: true}), /已上线，可在调度中心下发任务/u);
   assert.match(describeReadiness({ready: false, deviceReason: 'douyin_not_foreground'}), /抖音未在前台/u);
   assert.match(describeReadiness({ready: false, deviceReason: 'device_asleep'}), /手机息屏/u);
+  assert.match(describeReadiness({ready: false, deviceReason: 'ocr_warming'}), /文字识别正在预热/u);
+  assert.match(describeReadiness({ready: false, deviceReason: 'ocr_unavailable'}), /将重试预热/u);
   assert.match(describeReadiness({ready: false, blocked: 'device_closure_required'}), /需人工确认手机停稳/u);
 });
 

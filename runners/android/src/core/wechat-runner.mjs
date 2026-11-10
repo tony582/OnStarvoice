@@ -2,7 +2,7 @@ import {BudgetLedger} from './budget.mjs';
 import {OperationGate} from './operation-gate.mjs';
 import {RunnerFault, requireEvidence} from './errors.mjs';
 import {DeviceClosureJournal, readDeviceClosure} from './device-closure.mjs';
-import {recordDiagnostic} from './diagnostics.mjs';
+import {recordDiagnostic, localOcrDetails} from './diagnostics.mjs';
 import {faultDetails} from './discovery-runner.mjs';
 import {wechatPostEvent, wechatWorkKey} from './wechat-evidence.mjs';
 import {sameCard} from '../device/wechat-ocr-parse.mjs';
@@ -50,13 +50,14 @@ export const sleep = (ms, signal) => new Promise(resolve => {
 
 /** One Channels keyword on the phone: search, then per in-window card open → copy link → comments → back. */
 export async function runWechatTask({task, store, device, permit, preview, clock = DEFAULT_CLOCK, resumeAuthorized = false,
-  deviceClosureVerified = null, actionTimeoutMs = 60_000, prefilter = null, random = Math.random, postPauseMs = POST_PAUSE_MS}) {
+  deviceClosureVerified = null, actionTimeoutMs = 60_000, prefilter = null, random = Math.random, postPauseMs = POST_PAUSE_MS, preparationMs = 0}) {
   let ledger, gate, result, failure = null, lastEventId = null;
   const stats = {posts: 0, previewFailed: 0, previewUnavailable: 0, outsideWindow: 0, comments: 0};
   const pending = [];
   const note = (event, error = null, extra = {}) => recordDiagnostic(store, {at: new Date(clock.wallNow()).toISOString(), event,
     runId: task?.identity?.discoveryRunId ?? null, itemId: task?.identity?.itemId ?? null, keyword: task?.keyword ?? null,
-    code: error?.code ?? null, operation: error?.operation ?? null, details: error ? faultDetails(error) : null, ...extra});
+    code: error?.code ?? null, operation: error?.operation ?? null, details: error ? faultDetails(error) : null,
+    ocr: localOcrDetails(error), ...extra});
   const windowHours = Number.isFinite(task?.filters?.publishWindowHours) ? task.filters.publishWindowHours : null;
   const resolvePreview = async link => {
     let last;
@@ -80,7 +81,7 @@ export async function runWechatTask({task, store, device, permit, preview, clock
     requireEvidence(preview && typeof preview.resolve === 'function', 'preview_unavailable');
     permit.assertAllowed();
     const journal = new DeviceClosureJournal({store, task, clock, deviceClosureVerified});
-    ledger = new BudgetLedger({task, store, clock, resumeAuthorized});
+    ledger = new BudgetLedger({task, store, clock, resumeAuthorized, excludedElapsedMs: preparationMs});
     gate = new OperationGate({permit, beforeAction: () => ledger.assertAllowed(), journal, timeoutMs: actionTimeoutMs});
     const call = (method, params = {}) => gate.run(signal => device[method]({...params, signal}), method);
     const state = await call('inspect');

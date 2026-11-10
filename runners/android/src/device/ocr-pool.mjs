@@ -11,6 +11,7 @@ import {DeviceError} from './bounded.mjs';
 // helper reads them and are deleted with the reply; neither images nor recognized text are kept.
 export const OCR_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_RESTARTS = 3;
+const STDERR_BYTES = 2048;
 
 export function ocrHelperAvailable(binaryPath) {
   if (typeof binaryPath !== 'string' || !binaryPath) return false;
@@ -18,68 +19,130 @@ export function ocrHelperAvailable(binaryPath) {
 }
 
 export function createOcrPool({binaryPath, tmpDir, concurrency = 3, spawnImpl = spawn,
-  requestTimeoutMs = OCR_REQUEST_TIMEOUT_MS} = {}) {
+  requestTimeoutMs = OCR_REQUEST_TIMEOUT_MS, now = Date.now} = {}) {
   if (typeof tmpDir !== 'string' || !tmpDir) throw new DeviceError('ocr_unavailable', 'OCR scratch directory is required');
-  let child = null, restarts = 0, closed = false;
+  let child = null, restarts = 0, closed = false, lastSuccessAt = null;
   const pending = new Map();
-  const fail = (code, message) => {
-    for (const [id, entry] of pending) { clearTimeout(entry.timer); rmSync(entry.path, {force: true}); entry.reject(new DeviceError(code, message)); pending.delete(id); }
+  const details = (worker, extra = {}) => {
+    let stderr = worker.stderr.toString('utf8');
+    // Decoding a partial UTF-8 boundary can add replacement bytes; retain the same byte ceiling.
+    while (Buffer.byteLength(stderr) > STDERR_BYTES) stderr = stderr.slice(stderr.codePointAt(0) > 0xffff ? 2 : 1);
+    return {...extra, stderr};
+  };
+  const error = (worker, code, message, extra) => new DeviceError(code, message, {details: details(worker, extra)});
+  const settle = (id, failure, value) => {
+    const entry = pending.get(id);
+    if (!entry) return;
+    pending.delete(id);
+    clearTimeout(entry.timer);
+    entry.signal?.removeEventListener('abort', entry.onAbort);
+    rmSync(entry.path, {force: true});
+    if (failure) entry.reject(failure); else entry.resolve(value);
+  };
+  const retire = (worker, code, message, extra = {}, unexpected = false) => {
+    if (worker.retired) return;
+    worker.retired = true;
+    if (child === worker) { child = null; lastSuccessAt = null; }
+    if (unexpected) restarts++;
+    for (const [id, entry] of pending) {
+      if (entry.worker === worker) settle(id, error(worker, code, message, extra));
+    }
+    worker.reader?.close();
+    try { worker.proc.stdin.end(); worker.proc.kill('SIGTERM'); } catch { /* already gone */ }
   };
   const start = () => {
+    if (child?.exited) throw error(child, 'ocr_unavailable', 'The local OCR helper stopped', child.exited);
     if (child) return child;
     if (closed) throw new DeviceError('ocr_unavailable', 'OCR helper was closed');
     if (!ocrHelperAvailable(binaryPath)) throw new DeviceError('ocr_unavailable', 'The local OCR helper is not installed');
     if (restarts > MAX_RESTARTS) throw new DeviceError('ocr_unavailable', 'The local OCR helper keeps stopping');
     mkdirSync(tmpDir, {recursive: true, mode: 0o700});
-    const proc = spawnImpl(binaryPath, ['--concurrency', String(Math.max(1, Math.min(6, concurrency)))],
-      {stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true});
-    child = proc;
-    createInterface({input: proc.stdout}).on('line', line => {
+    let proc;
+    try {
+      proc = spawnImpl(binaryPath, ['--concurrency', String(Math.max(1, Math.min(6, concurrency)))],
+        {stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true});
+    } catch (cause) {
+      restarts++; lastSuccessAt = null;
+      throw new DeviceError('ocr_unavailable', 'The local OCR helper could not start', {details: {
+        error: typeof cause?.code === 'string' ? cause.code : 'process_error',
+        message: String(cause?.message ?? cause).slice(0, 512), stderr: '',
+      }});
+    }
+    const worker = {proc, stderr: Buffer.alloc(0), retired: false};
+    child = worker;
+    proc.stderr?.on('data', chunk => {
+      worker.stderr = Buffer.from(Buffer.concat([worker.stderr, Buffer.from(chunk)]).subarray(-STDERR_BYTES));
+    });
+    worker.reader = createInterface({input: proc.stdout});
+    worker.reader.on('line', line => {
+      if (worker.retired) return;
       let reply;
       try { reply = JSON.parse(line); } catch { return; }
       const entry = pending.get(reply?.id);
-      if (!entry) return;
-      pending.delete(reply.id);
-      clearTimeout(entry.timer);
-      rmSync(entry.path, {force: true});
-      if (reply.ok !== true || !Array.isArray(reply.rows)) entry.reject(new DeviceError('ocr_failed', 'Text recognition failed'));
-      else entry.resolve({rows: reply.rows.map(normalizeRow).filter(Boolean), width: reply.width, height: reply.height, ms: reply.ms});
+      if (!entry || entry.worker !== worker) return;
+      if (reply.ok !== true || !Array.isArray(reply.rows)) {
+        settle(reply.id, error(worker, 'ocr_failed', 'Text recognition failed', {
+          error: typeof reply.error === 'string' ? reply.error.slice(0, 256) : 'invalid_reply',
+          ...(typeof reply.domain === 'string' ? {domain: reply.domain.slice(0, 256)} : {}),
+          ...(Number.isSafeInteger(reply.code) ? {code: reply.code} : {}),
+        }));
+      } else {
+        if (child === worker && !worker.exited) lastSuccessAt = now();
+        settle(reply.id, null, {rows: reply.rows.map(normalizeRow).filter(Boolean), width: reply.width, height: reply.height, ms: reply.ms});
+      }
     });
-    const ended = () => {
-      if (child !== proc) return;
-      child = null; restarts++;
-      fail('ocr_unavailable', 'The local OCR helper stopped');
-    };
-    proc.on('exit', ended);
-    proc.on('error', ended);
-    proc.stdin.on('error', () => {});
-    return proc;
+    proc.on('exit', (exitCode, signal) => {
+      worker.exited = {exitCode, signal};
+      if (child === worker) lastSuccessAt = null;
+    });
+    // close follows stdout/stderr drainage; an exit event alone may omit the final error bytes.
+    proc.on('close', (exitCode, signal) => retire(worker, 'ocr_unavailable', 'The local OCR helper stopped', {exitCode, signal}, true));
+    const unavailable = cause => retire(worker, 'ocr_unavailable', 'The local OCR helper stopped', {
+      error: typeof cause?.code === 'string' ? cause.code : 'process_error',
+      message: String(cause?.message ?? cause).slice(0, 512),
+    }, true);
+    proc.on('error', unavailable);
+    proc.stdin.on('error', unavailable);
+    worker.unavailable = unavailable;
+    return worker;
   };
   return {
     /** Recognize one PNG screenshot (Buffer). `roi` = [x, y, w, h] in pixels limits the work to one area. */
-    recognize(png, {roi = null, signal} = {}) {
+    async recognize(png, {roi = null, signal, timeoutMs = requestTimeoutMs} = {}) {
       if (!Buffer.isBuffer(png) || png.length < 8) return Promise.reject(new DeviceError('ocr_failed', 'Screenshot is empty'));
-      const proc = start();
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new DeviceError('invalid_timeout', 'OCR timeout must be between 1 and 120000 ms');
+      if (signal?.aborted) throw new DeviceError('aborted', 'Text recognition was canceled');
+      const worker = start();
       const id = randomUUID();
       const path = join(tmpDir, `${id}.png`);
       writeFileSync(path, png, {mode: 0o600});
       return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { pending.delete(id); rmSync(path, {force: true});
-          reject(new DeviceError('ocr_timeout', 'Text recognition exceeded its time budget')); }, requestTimeoutMs);
-        pending.set(id, {resolve, reject, timer, path});
-        signal?.addEventListener('abort', () => {
+        const timer = setTimeout(() => {
+          settle(id, error(worker, 'ocr_timeout', 'Text recognition exceeded its time budget', {timeoutMs}));
+          // A timed-out Vision request may still hold a slot. Retire it before another warmup/request.
+          retire(worker, 'ocr_unavailable', 'The local OCR helper was restarted after a timeout', {error: 'request_timeout'});
+        }, timeoutMs);
+        const onAbort = () => {
           if (!pending.has(id)) return;
-          pending.delete(id); clearTimeout(timer); rmSync(path, {force: true});
-          reject(new DeviceError('aborted', 'Text recognition was canceled'));
-        }, {once: true});
-        proc.stdin.write(`${JSON.stringify({id, path, ...(roi ? {roi} : {})})}\n`);
+          settle(id, error(worker, 'aborted', 'Text recognition was canceled'));
+          retire(worker, 'ocr_unavailable', 'The local OCR helper was restarted after cancellation', {error: 'request_aborted'});
+        };
+        pending.set(id, {resolve, reject, timer, path, worker, signal, onAbort});
+        signal?.addEventListener('abort', onAbort, {once: true});
+        if (signal?.aborted) { onAbort(); return; }
+        try {
+          worker.proc.stdin.write(`${JSON.stringify({id, path, ...(roi ? {roi} : {})})}\n`, cause => {
+            if (cause) worker.unavailable(cause);
+          });
+        } catch (cause) { worker.unavailable(cause); }
       });
     },
     get pending() { return pending.size; },
+    get lastSuccessAt() { return lastSuccessAt; },
     close() {
       closed = true;
-      fail('aborted', 'OCR helper closed');
-      if (child) { try { child.stdin.end(); child.kill('SIGTERM'); } catch { /* already gone */ } child = null; }
+      if (child) retire(child, 'aborted', 'OCR helper closed');
+      lastSuccessAt = null;
     },
   };
 }

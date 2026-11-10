@@ -2,7 +2,7 @@ import {BudgetLedger} from './budget.mjs';
 import {OperationGate} from './operation-gate.mjs';
 import {RunnerFault, requireEvidence} from './errors.mjs';
 import {DeviceClosureJournal, readDeviceClosure} from './device-closure.mjs';
-import {recordDiagnostic} from './diagnostics.mjs';
+import {recordDiagnostic, localOcrDetails} from './diagnostics.mjs';
 import {faultDetails} from './discovery-runner.mjs';
 import {cardPrefilter, POST_PAUSE_MS, DEFAULT_CLOCK as CLOCK, outcome, sleep, validateWechatIdentity} from './wechat-runner.mjs';
 import {articleEvent, articleWorkKey, canonicalArticleUrl, articleWindowState, mergeArticleCapture} from './wechat-article-evidence.mjs';
@@ -31,12 +31,13 @@ function validate(task, permit, device) {
 /** Each read yields before the operation deadline. Body collection does not depend on comment availability. */
 export async function runWechatArticleTask({task, store, device, permit, clock = CLOCK, actionTimeoutMs = 60_000,
   preview, bodySource = 'page_dom', resumeAuthorized = false, deviceClosureVerified = null,
-  prefilter = null, random = Math.random, postPauseMs = POST_PAUSE_MS}) {
+  prefilter = null, random = Math.random, postPauseMs = POST_PAUSE_MS, preparationMs = 0}) {
   let ledger, gate, result, failure = null, lastEventId = null;
   const stats = {posts: 0, comments: 0, partialBodies: 0, unavailableBodies: 0, outsideWindow: 0, timeUnverified: 0, pageFailures: 0};
   const note = (event, error = null, extra = {}) => recordDiagnostic(store, {at: new Date(clock.wallNow()).toISOString(), event,
     runId: task?.identity?.discoveryRunId ?? null, itemId: task?.identity?.itemId ?? null, keyword: task?.keyword ?? null,
-    code: error?.code ?? null, operation: error?.operation ?? null, details: error ? faultDetails(error) : null, ...extra});
+    code: error?.code ?? null, operation: error?.operation ?? null, details: error ? faultDetails(error) : null,
+    ocr: localOcrDetails(error), ...extra});
   const hours = Number.isFinite(task?.filters?.publishWindowHours) ? task.filters.publishWindowHours : null;
   const record = (card, rank, shareUrl, read, capturedAt) => {
     const window = task.mode === 'patrol' ? 'inside' : articleWindowState(read.article, capturedAt, hours);
@@ -54,7 +55,7 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
     validate(task, permit, device); permit.assertAllowed();
     requireEvidence(['page_dom', 'screen_ocr'].includes(bodySource), 'invalid_article_source');
     if (bodySource === 'page_dom') requireEvidence(typeof preview?.resolveArticle === 'function', 'preview_unavailable');
-    ledger = new BudgetLedger({task, store, clock, resumeAuthorized});
+    ledger = new BudgetLedger({task, store, clock, resumeAuthorized, excludedElapsedMs: preparationMs});
     gate = new OperationGate({permit, beforeAction: () => ledger.assertAllowed(), timeoutMs: actionTimeoutMs,
       journal: new DeviceClosureJournal({store, task, clock, deviceClosureVerified})});
     const call = (method, params = {}) => gate.run((signal, {budgetMs}) => device[method]({...params, signal,

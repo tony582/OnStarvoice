@@ -44,7 +44,9 @@ func recognize(id: String, path: String, roi: [Double]?) {
   do {
     try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
   } catch {
-    reply(["id": id, "ok": false, "error": "recognition_failed"]); return
+    let failure = error as NSError
+    reply(["id": id, "ok": false, "error": "recognition_failed",
+      "domain": failure.domain, "code": failure.code]); return
   }
   let region = request.regionOfInterest
   var rows: [[String: Any]] = []

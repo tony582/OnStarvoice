@@ -168,6 +168,7 @@ export class AndroidDaemon {
     // A single-app (Douyin) adapter reports no list: when it is ready, Douyin is the one platform.
     this.platforms = Array.isArray(state.platforms) ? state.platforms : this.ready ? ['douyin'] : [];
     this.deviceProbe = {readyForSearch: this.ready, reason: this.deviceReason, checkedAt: new Date().toISOString(),
+      ...(state.platformReasons ? {platformReasons: state.platformReasons} : {}), ...(state.ocr ? {ocr: state.ocr} : {}),
       ...(state.foreground ? {foreground: state.foreground} : {}), ...(state.focus !== undefined ? {focus: state.focus} : {}),
       ...(state.memory ? {memory: state.memory} : {})};
     if (state.memory?.restarted === true) this.noteMemoryRestart(state.memory);

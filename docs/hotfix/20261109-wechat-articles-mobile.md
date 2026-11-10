@@ -445,3 +445,46 @@ T13 已经用户审查并由 Claude 真机复测通过，本轮在 `1b3d902` 上
 - 本地：`output/wechat-articles/deploy-20261110/remote-evidence/`、`release-d747336-20261110/mobile-preparation/`、`deploy-20261110/onstar-smoke-failed-after-rollback.jpg`。只下载发布证据，数据库备份留在生产私有目录。
 - 发布 SSH 客户端在远端脚本结束后未自行断开；确认无发布子进程、部署锁已释放后，仅关闭该本地 SSH 客户端（退出 255）。远端 `staged-applied`、6 轮观察和服务证据已核验；该清理不作为应用发布失败原因。失败点是之后的真机 OCR。
 - 本节为纯文档收尾，提交带 `[skip ci]`。本轮不继续修复或再次上线；下一次部署应先确认真实启动器路径下 OCR 稳定性，并将“旧代码 + 已应用 095 + 回滚目录”作为新的生产基线。
+
+
+## 第九轮 T15：OCR 冷启动修复（0.5.1候选）
+
+在 `5b53fce` 上完成本地候选 0.5.1；代码、测试、内置预热图及文档为本轮一个提交，精确提交号见完成报告。本轮不 push、不部署，不启动、停止、切换或操作真实手机，也没有重新运行真实 Vision、编译或替换已安装的 OCR helper。上一轮回滚状态没有被本轮更改；本轮没有重新检查生产进程，不能把历史 ready 当成本轮实测。
+
+### 实现
+
+- 视频号和文章共用一个 OCR 就绪控制器。启动后异步识别 `tools/ocr/warmup.png`（320×96，7159 bytes，内容“星语文字识别”），单次上限 120000 ms；完成前两个微信平台均为 `ocr_warming`，不进入可接单平台列表。抖音按自己的探测结果接单，不等待 OCR。
+- 空闲时距最后成功识字满 240000 ms 再使用同一张图保活；任何成功的真实识字都会刷新这个时间。任务从准备开始直到收尾结束均为忙碌，不发起新的空闲保活。任务前预热与已在进行的预热共用同一次请求，不叠加三个冷识字任务；预热不截图、不调用 adb、不操作手机。
+- 微信任务领取后、创建 OperationGate 和 BudgetLedger 之前，超过 4 分钟则补预热。等待时控制循环仍续租并可停止；预热前后核对 permit。失败正常返回 `needs_action / ocr_unavailable`，停止保留 user_stop、remote_stop 或 lease_expired。此时不回首页、不关闭手机会话，也不擅自清除既有未闭合动作记录。
+- 任务恢复时，只从预算中过滤本轮实际测得的预热等待；之前已花费的预算和离线间隔仍保留。新任务的关键词与批次计时在预热后开始；服务器绝对截止时间不延长。
+- 预热失败显示 `ocr_unavailable`，空闲时 30000 ms 后重试，任务前可立即补试。常规截图 OCR 仍为 15000 ms。超时或取消会退役旧 helper，清理临时图、等待项及监听器，下一次重新启动，避免旧 Vision 工作积压。原有连续保护仍在：本进程生命周期累计意外 helper 退出/启动失败超过 3 次后拒绝继续启动，需要处理原因并重启采集器；超时/取消不消耗这个次数。不能据此宣称所有进程故障都可自动恢复。
+- `DeviceError.details` 保留 helper `error`、NSError `domain/code` 和末尾最多 2048 字节 stderr；UTF-8 边界安全。预热及任务内失败均记入本地诊断环，完成回执仍使用原白名单，不上传这些私有诊断。Swift 源码只增加 recognition_failed 的 NSError 字段。
+- 本地 `deviceProbe.ocr` 记录就绪状态、最近成功时间及预热耗时，`deviceProbe.platformReasons` 区分平台。服务器既有心跳只保存有界前台摘要，因此 OCR 详细字段仅在本地；后台看 `readyPlatforms` 是否含 `wechat_articles`。混合节点全局 ready 可以只是抖音就绪，下一轮冒烟须确认文章平台就绪后再建任务。
+- `package.json` 及新节点注册版本均为 0.5.1，启动窗口加入中文预热/不可用提示。随 runtime 导出整个 `runners/android` 时会包含已提交的预热 PNG。
+
+### 离线验证结果
+
+| 验证 | 实际结果 | 证据（output/wechat-articles/codex-validation-20261110/） |
+| --- | --- | --- |
+| Android 全量 | 554/554，0 失败、0 跳过，12.499 秒 | `T15-runner-full-unrestricted.log` |
+| 新增 OCR pool / readiness / 多平台 / 任务生命周期测试 | 9 + 12 + 4 + 14 = 39 项，已包含在全量 | 上述全量日志 |
+| 启动窗口中文提示（全量后新增两个断言） | 原 7 项全部通过，不增加全量测试项数 | `T15-startup-window.log` |
+| 模块边界 | 131 模块，最大 337 行，通过 | `T15-boundaries.log` |
+| diff whitespace | 通过 | `T15-diff-check.log` |
+
+关键模拟数字：冷启动 40000 ms 后从 warming 变 ready；空闲满 240000 ms 发起保活，近期真实识字可推迟；失败 30000 ms 后重试。两个微信平台新任务预热 40000 ms，关键词/批次已用时间均为 0；恢复任务保留前次 2000 ms + 离线 1000 ms = 3000 ms，排除本轮 40000 ms。绝对截止时间先到仍拒绝手机操作。纯内存控制面测试在预热等待时执行了 1 次 poll 和 1 次 renew；三种停止均保留闭合记录；错误 stderr 本地保留最多 2048 bytes、上传回执不含私有内容。
+
+首轮受限环境结果原样保留：554 项中 528 通过、26 失败，全部为原有模拟 HTTP 服务绑定 `127.0.0.1` 的 `listen EPERM`；日志 `T15-runner-full.log`。允许本机测试端口后，同一全量套件全部通过；没有修改业务代码来绕过失败，也没有连接生产服务。实际手机/真实 Vision 的冷启动耗时及闲置 15 分钟后耗时本轮均未测，交由 Claude 验证，不把 fake 40000 ms 当成真机结果。
+
+### Swift helper 后续编译位置（本轮未执行）
+
+先在后续已授权的测试/发布窗口确认对应采集器停稳，使用本轮 runtime 中的 Swift 源码。沿用 `src/cli/wechat-command.mjs` 的构建方式：
+
+```sh
+swiftc -O "/absolute/runtime-0.5.1-<提交短号>/tools/ocr/StarVoiceOCR.swift" -o "/absolute/state-directory/bin/starvoice-ocr"
+"/absolute/state-directory/bin/starvoice-ocr" --version
+```
+
+输出必须放到该状态目录 `connection.json` 已配置的 `wechat.ocrHelper` 路径，不能只编到工作树里：当前约定的 OnStar 目录为 `/Users/dulaidila/Documents/claude/StarVoice-Android/state-829d89-onstar/bin/starvoice-ocr`，安吉星为 `/Users/dulaidila/Documents/claude/StarVoice-Android/state-829d89/bin/starvoice-ocr`；实际执行前核对配置，若不同以配置为准。只有后续获准升级的状态目录才替换，勿在本轮动安吉星 0.4.7。
+
+旧 helper 与新的预热请求协议兼容，但只有编译新 Swift 源码后才会提供 NSError domain/code；只替换 JavaScript 不会让旧 binary 多出这些字段。`--version` 只验证程序可启动，不代表 Vision 已预热。下一轮 Claude 真机验证应记录真实 `lastWarmupMs`、后台文章平台就绪、闲置 15 分钟后的真实 OCR 耗时，再按新的发布授权执行冒烟。

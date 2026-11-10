@@ -7,7 +7,8 @@ const DEFAULTS = Object.freeze({ maxLinks: 20, maxCards: 40, maxSwipes: 20, keyw
 const UNLIMITED_KEYS = new Set(['maxLinks', 'maxCards', 'maxSwipes', 'batchMs']);
 
 export class BudgetLedger {
-  constructor({ task, store, clock, resumeAuthorized = false }) {
+  constructor({ task, store, clock, resumeAuthorized = false, excludedElapsedMs = 0 }) {
+    if (!Number.isFinite(excludedElapsedMs) || excludedElapsedMs < 0) throw new RunnerFault('invalid_preparation_time');
     this.task = task;
     this.store = store;
     this.clock = clock;
@@ -26,7 +27,8 @@ export class BudgetLedger {
     if (this.state.limitsHash !== payloadHash(this.limits)) throw new RunnerFault('budget_configuration_changed');
     if (now < this.state.lastWallAt) throw new RunnerFault('wall_clock_regressed');
     if (requestedDeadline !== null) this.state.deadlineAt = Math.min(this.state.deadlineAt ?? Infinity, requestedDeadline);
-    this.state.elapsedMs += now - this.state.lastWallAt;
+    // Exclude only this attempt's measured pre-task warmup, including on resume. Absolute deadlines stay fixed.
+    this.state.elapsedMs += Math.max(0, now - this.state.lastWallAt - excludedElapsedMs);
     this.itemKey = task.identity.itemId;
     let item = this.state.items[this.itemKey];
     if (item) {
@@ -37,7 +39,7 @@ export class BudgetLedger {
       if (['completed', 'completed_with_warnings', 'canceled'].includes(item.status)) throw new RunnerFault('terminal_item', 'terminal_item', previous);
       if (item.attemptId === task.identity.attemptId || task.identity.assignmentRevision <= item.assignmentRevision) throw new RunnerFault('fresh_attempt_required', 'fresh_attempt_required', previous);
       if (item.definitionHash !== payloadHash({ keyword: task.keyword, filters: task.filters })) throw new RunnerFault('item_definition_changed', 'item_definition_changed', previous);
-      item.elapsedMs += now - item.lastWallAt;
+      item.elapsedMs += Math.max(0, now - item.lastWallAt - excludedElapsedMs);
       item.attemptId = task.identity.attemptId;
       item.assignmentRevision = task.identity.assignmentRevision;
       item.status = 'running';
