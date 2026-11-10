@@ -3,6 +3,7 @@ import {eventIdFor} from './discovery-evidence.mjs';
 import {requireEvidence} from './errors.mjs';
 
 const text = (value, limit) => typeof value === 'string' ? value.slice(0, limit).toWellFormed() : '';
+const imageLayer = value => ['visible', 'interactive'].includes(value) ? {layer: value} : {};
 export function canonicalArticleUrl(value) {
   let url;
   try { url = new URL(value); } catch { return ''; }
@@ -46,7 +47,7 @@ export function articleEvent({task, card, rank, shareUrl, article, comments, cap
   const truncated = (article.content?.length ?? 0) > content.length;
   const source = article.source === 'page_dom' ? 'page_dom' : 'screen_ocr';
   const images = source === 'page_dom' ? (article.images ?? []).slice(0, 100).filter(item => /^https?:\/\//u.test(item?.url ?? ''))
-    .map((item, order) => ({url: text(item.url, 2000), alt: text(item.alt, 1000), order, source, stored: false})) : [];
+    .map((item, order) => ({url: text(item.url, 2000), alt: text(item.alt, 1000), order, source, stored: false, ...imageLayer(item.layer)})) : [];
   const imageUrls = new Set(images.map(item => item.url));
   let remainingText = 100_000;
   const bodyBlocks = source === 'page_dom' ? (article.bodyBlocks ?? []).slice(0, 2000).flatMap(item => {
@@ -54,7 +55,7 @@ export function articleEvent({task, card, rank, shareUrl, article, comments, cap
       const value = text(item.text, remainingText); remainingText -= value.length;
       return [{type: 'text', text: value}];
     }
-    return item.type === 'image' && imageUrls.has(item.url) ? [{type: 'image', url: text(item.url, 2000), alt: text(item.alt, 1000)}] : [];
+    return item.type === 'image' && imageUrls.has(item.url) ? [{type: 'image', url: text(item.url, 2000), alt: text(item.alt, 1000), ...imageLayer(item.layer)}] : [];
   }) : [];
   return {eventKind: 'wechat_article', workKey: key, eventId: eventIdFor(task, {detailId: key}, key), ...task.identity,
     keyword: task.keyword, mode: task.mode === 'patrol' ? 'patrol' : 'keyword', rank,

@@ -108,14 +108,22 @@ test('date precision and unknown dates are preserved, invalid/future dates fail'
   }
 });
 
-test('lazy image opacity does not hide its observed URL, but hidden ancestors and other visibility rules still do', () => {
+test('transparent or zero-height image ancestors mark interaction layers without exposing hidden text', () => {
   const image=element('img',{'data-src':'https://mmbiz.qpic.cn/mmbiz_png/public/640?wx_fmt=png#imgIndex=1'});
   image.style.opacity='0';
   const article=extract(documentFixture({content:[image]})).article;
   assert.equal(article.contentType,'image');assert.equal(article.images.length,1);
   assert.equal(article.images[0].url,'https://mmbiz.qpic.cn/mmbiz_png/public/640?wx_fmt=png');
   assert.equal(article.bodyBlocks[0].url,article.images[0].url);
-  for (const [property,value] of [['opacity','0'],['display','none'],['visibility','hidden']]) {
+  assert.equal(article.images[0].layer,'visible');
+  for (const [property,value] of [['opacity','0'],['height','0px']]) {
+    const parent=element('section',{},image);parent.style[property]=value;
+    const captured=extract(documentFixture({content:[parent]})).article;
+    assert.equal(captured.images[0].layer,'interactive');assert.equal(captured.bodyBlocks[0].layer,'interactive');
+  }
+  const transparent=element('section',{},'不应读取的透明文字',image);transparent.style.opacity='0';
+  assert.equal(extract(documentFixture({content:[transparent]})).article.content,'');
+  for (const [property,value] of [['display','none'],['visibility','hidden'],['visibility','collapse']]) {
     const parent=element('section',{},image);parent.style[property]=value;
     assert.equal(extract(documentFixture({content:[parent]})).reason,'article_preview_body_empty');
   }
@@ -124,6 +132,40 @@ test('lazy image opacity does not hide its observed URL, but hidden ancestors an
   const classPlaceholder=element('img',{class:'js_img_placeholder',src:'https://mmbiz.qpic.cn/public/640'});
   classPlaceholder.style.opacity='0';
   assert.equal(extract(documentFixture({content:[classPlaceholder]})).article.images.length,1);
+  for (const attribute of ['hidden','aria-hidden']) {
+    const parent=element('section',{[attribute]:'true'},image);parent.hidden=attribute==='hidden';
+    assert.equal(extract(documentFixture({content:[parent]})).reason,'article_preview_body_empty');
+  }
+});
+
+test('SVG and arbitrary element backgrounds precede their text and deduplicate at first URL position', () => {
+  const first='https://mmbiz.qpic.cn/first/640?x=1;y=2';
+  const second='https://mmecoa.qpic.cn/second/640?wx_fmt=png';
+  const svg=element('svg',{'data-lazy-bgimg':first+'#one','aria-label':'主图'},element('text',{},'SVG文字'),
+    element('foreignObject',{},element('p',{},'子正文')));
+  const hiddenLayer=element('section',{},element('div',{style:`background-image: url('${second}#layer')`},'透明文字'));
+  hiddenLayer.style.opacity='0';
+  const result=extract(documentFixture({content:[element('p',{},'开头'),svg,
+    element('div',{style:`background-image: url("${first}#again")`}),hiddenLayer,
+    element('img',{'data-src':second}),element('p',{},'结尾')]})).article;
+  assert.deepEqual(result.images.map(({url,layer})=>({url,layer})),[{url:first,layer:'visible'},{url:second,layer:'interactive'}]);
+  assert.deepEqual(result.bodyBlocks.map(block=>block.type),['text','image','text','text','image','text']);
+  assert.equal(result.content,'开头\nSVG文字\n子正文\n结尾');
+  assert.equal(result.images[0].alt,'主图');
+});
+
+test('lazy background attributes win placeholders; data URLs and hard-hidden backgrounds stay excluded', () => {
+  const url='https://mmbiz.qpic.cn/background/640?wx_fmt=png';
+  const result=extract(documentFixture({content:[
+    element('div',{'data-lazy-bgimg':url,style:'background-image:url("data:image/gif;base64,eA==")'}),
+    element('section',{'data-lazy-bgimg':'data:image/png;base64,eA==',style:'background-image:url("https://mmbiz.qpic.cn/do-not-fallback")'}),
+    element('svg',{style:'background-image:url(data:image/gif;base64,eA==)'}),
+  ]})).article;
+  assert.deepEqual(result.images.map(image=>image.url),[url]);
+  for (const style of [{display:'none'},{visibility:'hidden'}]) {
+    const parent=element('div',{},element('svg',{'data-lazy-bgimg':url}));parent.style=style;
+    assert.equal(extract(documentFixture({content:[parent]})).reason,'article_preview_body_empty');
+  }
 });
 
 test('visible author text and region wrapper take precedence over hidden legacy elements', () => {
@@ -154,7 +196,7 @@ function liveFixture(name) {
     if (typeof value==='string') return value;
     const [tag,attributes,children]=value;
     const node=element(tag,attributes,...children.map(hydrate));
-    for (const property of ['display','visibility','opacity']) {
+    for (const property of ['display','visibility','opacity','height']) {
       const match=String(attributes.style??'').match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;!]+)`,'iu'));
       if (match) node.style[property]=match[1].trim();
     }
@@ -165,11 +207,9 @@ function liveFixture(name) {
 }
 
 for (const expected of [
-  {id:'FYL3oVvFiTPoeeaxO0ERCQ',title:'2.2亿美元和解之后，你的急刹数据归谁',account:'汽车前瞻资讯',author:'汽车前瞻资讯',publishedAt:'2026-11-08T23:59:00+08:00',characters:4148,images:4,type:'article'},
-  {id:'1ZigfwkDqDuKmKi-M0baeA',title:'解锁安吉星小程序4大板块',account:'安吉星',author:'安吉星',publishedAt:'2026-07-13T14:59:00+08:00',characters:0,images:7,type:'image'},
-  // Four other IMG nodes have opacity:0 ancestors in this supplied snapshot. The task's ancestor
-  // visibility rule excludes them; this inline-style model is not real-browser computed-style proof.
-  {id:'kL-i_FzeHUakdh5_x49Sog',title:'安吉星微信小程序上线啦！',account:'安吉星服务',author:'安吉星服务',publishedAt:'2026-07-10T14:57:00+08:00',characters:0,images:3,type:'image'},
+  {id:'FYL3oVvFiTPoeeaxO0ERCQ',title:'2.2亿美元和解之后，你的急刹数据归谁',account:'汽车前瞻资讯',author:'汽车前瞻资讯',publishedAt:'2026-11-08T23:59:00+08:00',characters:4148,images:4,interactive:0,type:'article'},
+  {id:'1ZigfwkDqDuKmKi-M0baeA',title:'解锁安吉星小程序4大板块',account:'安吉星',author:'安吉星',publishedAt:'2026-07-13T14:59:00+08:00',characters:0,images:38,interactive:15,type:'image'},
+  {id:'kL-i_FzeHUakdh5_x49Sog',title:'安吉星微信小程序上线啦！',account:'安吉星服务',author:'安吉星服务',publishedAt:'2026-07-10T14:57:00+08:00',characters:0,images:42,interactive:19,type:'image'},
 ]) test(`provided live DOM replay: ${expected.id}`,()=>{
   const {url,document}=liveFixture(expected.id);
   const result=extract(document,{expectedUrl:url});
@@ -179,14 +219,23 @@ for (const expected of [
   assert.equal(article.location,'上海');assert.equal(article.timePrecision,'minute');
   assert.equal(article.content.length,expected.characters);assert.equal(article.images.length,expected.images);
   assert.equal(article.contentType,expected.type);
+  assert.equal(article.images.filter(image=>image.layer==='interactive').length,expected.interactive);
+  assert.equal(article.images.filter(image=>image.layer==='visible').length,expected.images-expected.interactive);
+  assert.equal(new Set(article.images.map(image=>image.url)).size,expected.images);
+  assert.ok(article.images.every(image=>new URL(image.url).hostname.endsWith('.qpic.cn')));
+  if (expected.type==='image') {
+    const first=document.querySelectorAll('svg').find(node=>node.getAttribute('data-lazy-bgimg'));
+    assert.equal(article.images[0].url,first.getAttribute('data-lazy-bgimg').split('#')[0]);
+  }
   assert.equal(article.evidence.selectorAcceptance,'live_dom_20261109');
   assert.ok(article.images.every(image=>!new URL(image.url).hash&&image.stored===false));
   assert.ok(Object.values(article.metrics).every(metric=>metric.value===null));
   assert.deepEqual(article.bodyBlocks.filter(block=>block.type==='image').map(block=>block.url),article.images.map(image=>image.url));
+  assert.deepEqual(article.bodyBlocks.filter(block=>block.type==='image').map(block=>block.layer),article.images.map(image=>image.layer));
   assert.equal(article.bodyStatus,'complete');assert.equal(article.bodyReason,'');
 });
 
-test('kL-i snapshot retains all seven IMG nodes; four have hidden ancestors and are not fabricated as visible',()=>{
+test('kL-i retains all seven IMG nodes under zero-height parents, including four opacity-hidden layers',()=>{
   const {document}=liveFixture('kL-i_FzeHUakdh5_x49Sog');
   const content=document.querySelectorAll('#js_content')[0];
   const images=document.querySelectorAll('img').filter(image=>content.contains(image));
@@ -195,6 +244,12 @@ test('kL-i snapshot retains all seven IMG nodes; four have hidden ancestors and 
     return false;
   });
   assert.equal(images.length,7);assert.equal(ancestorHidden.length,4);
+  const url=document.URL;
+  const article=extract(document,{expectedUrl:url}).article;
+  for (const image of images) {
+    const source=new URL(image.getAttribute('data-src'));source.hash='';
+    assert.equal(article.images.find(item=>item.url===source.href)?.layer,'interactive');
+  }
 });
 
 test('fourth supplied sample is a JSON-only observation, not a fabricated live DOM fixture',()=>{

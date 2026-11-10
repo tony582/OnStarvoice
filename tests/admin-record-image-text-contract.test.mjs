@@ -41,3 +41,16 @@ test('record galleries expose explicit per-image extraction and copy without aut
   );
   assert.doesNotMatch(lifecycle, /image-text|extractText\(/);
 });
+
+test('article interactive layers keep ordinary image rendering and carry a note beneath the image', async () => {
+  const [gallery, drawer] = await Promise.all([
+    source('web/admin/src/components/shared/RecordImageGallery.tsx'),
+    source('web/admin/src/components/shared/RecordDrawer.tsx'),
+  ]);
+  assert.match(drawer, /imageLayers=\{\[block\.layer\]\}/u);
+  assert.match(gallery, /imageLayers\?\.\[item\.index\] === 'interactive'/u);
+  const imageStart = gallery.indexOf('<img src={item.url}');
+  const noteStart = gallery.indexOf('点击后显示');
+  const ocrStart = gallery.indexOf('recordId && imageRefs?.[item.index]');
+  assert.ok(imageStart >= 0 && noteStart > imageStart && ocrStart > noteStart);
+});

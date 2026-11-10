@@ -77,13 +77,14 @@ function mediaUrl(value) {
   try { const url = new URL(text); return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password ? text : ''; }
   catch { return ''; }
 }
+const imageLayer = value => ['visible', 'interactive'].includes(value) ? {layer: value} : {};
 function normalizeBody(article) {
   const source = article.source;
   const images = (Array.isArray(article.images) ? article.images : []).slice(0, 100).map((item, index) => {
     const url = mediaUrl(item?.url);
     return {index, order: index, url, alt: str(item?.alt, 1000), caption: str(item?.caption, 1000), ocrText: str(item?.ocrText, 20_000),
       // URL extraction is not image download. Only media-store's local file mapping proves storage.
-      stored: false, downloadEligible: Boolean(url && isAllowedMediaHost(url)), source: evidenceSource(item?.source, source)};
+      stored: false, downloadEligible: Boolean(url && isAllowedMediaHost(url)), source: evidenceSource(item?.source, source), ...imageLayer(item?.layer)};
   });
   const bodyBlocks = (Array.isArray(article.bodyBlocks) ? article.bodyBlocks : []).slice(0, 2000)
     .filter(item => item && ['text', 'image', 'video', 'audio', 'card'].includes(item.type))
@@ -92,7 +93,7 @@ function normalizeBody(article) {
       const matched = url ? images.findIndex(image => image.url === url) : -1;
       return {type: item.type, text: str(item.text, ARTICLE_CONTENT_MAX), url, alt: str(item.alt, 1000),
         imageIndex: Number.isSafeInteger(item.imageIndex) && item.imageIndex >= 0 && item.imageIndex < images.length ? item.imageIndex : matched >= 0 ? matched : null,
-        source: evidenceSource(item.source, source)};
+        source: evidenceSource(item.source, source), ...(item.type === 'image' ? imageLayer(item.layer) : {})};
     });
   if (JSON.stringify({images, bodyBlocks}).length > 500_000) fail('ARTICLE_BODY_TOO_LARGE', 413);
   return {images, bodyBlocks};

@@ -2,7 +2,7 @@
  * Selectors replayed against user-provided live DOM snapshots from 2026-11-09, without site access.
  * Snapshot acceptance does not establish end-to-end browser or image-download acceptance.
  * This function is self-contained so the existing preview browser can evaluate it in its page.
- * Reads rendered DOM only: no page globals, cookies, tokens, API calls or hidden script payloads.
+ * Reads article DOM, including annotated interaction images: no globals, cookies, APIs or script payloads.
  */
 export function readArticleDocument(document, {expectedUrl, capturedAt = new Date().toISOString(), getStyle} = {}) {
   const failure = (reason, retryable = false) => ({ok: false, reason, retryable, readyState: document?.readyState ?? ''});
@@ -21,17 +21,17 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
   if (!Number.isFinite(at)) return failure('article_preview_invalid_time');
   capturedAt = new Date(at).toISOString();
   const styleOf = getStyle ?? (node => document.defaultView?.getComputedStyle?.(node));
-  const hidden = node => {
+  const hidden = (node, includeTransparentImages = false) => {
     const element = node?.nodeType === 3 ? node.parentElement : node;
     for (let current = element; current; current = current.parentElement) {
       if (current.hidden || current.getAttribute?.('aria-hidden') === 'true') return true;
       const style = styleOf(current);
-      // Lazy images expose their public URL before scrolling reveals their bitmap. This exception is
-      // only for the image itself: a hidden ancestor, display:none or visibility:hidden still hides it.
+      // Text keeps its visibility rules. Images in transparent interaction layers remain evidence,
+      // but display/visibility/hidden/aria-hidden still exclude the entire subtree.
       const placeholder = current === element && current.tagName?.toUpperCase() === 'IMG'
         && (current.getAttribute?.('data-src') || String(current.getAttribute?.('class') ?? '').split(/\s+/u).includes('js_img_placeholder'));
       if (style?.display === 'none' || ['hidden', 'collapse'].includes(style?.visibility)
-        || (style?.opacity === '0' && !placeholder)) return true;
+        || (!includeTransparentImages && style?.opacity === '0' && !placeholder)) return true;
     }
     return false;
   };
@@ -39,7 +39,7 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
   const clean = value => String(value ?? '').replace(/\u00a0/gu, ' ').replace(/[\t\r ]+/gu, ' ').trim();
   const first = selectors => [...document.querySelectorAll(selectors)].find(visible) ?? null;
   const nodeText = node => visible(node) ? clean(node.innerText ?? node.textContent) : '';
-  const root = first('#js_content, .rich_media_content');
+  const root = [...document.querySelectorAll('#js_content, .rich_media_content')].find(node => !hidden(node, true));
   const verification = [...document.querySelectorAll('[role="dialog"], #js_verify_container, #verify_container')]
     .some(node => visible(node) && /环境异常|访问过于频繁|完成验证|安全验证|请输入验证码|访问受限/u.test(nodeText(node)));
   if (verification) return failure('article_preview_verification_required');
@@ -75,7 +75,7 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
     timePrecision = h === undefined ? 'date' : 'minute';
     publishedAt = h === undefined ? day : `${day}T${h.padStart(2, '0')}:${minute}:00+08:00`;
   }
-  const bodyBlocks = [], images = [];
+  const bodyBlocks = [], images = [], imageUrls = new Set();
   const blocks = new Set(['P', 'DIV', 'SECTION', 'ARTICLE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'UL', 'OL', 'BLOCKQUOTE', 'PRE', 'TR']);
   const excluded = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'BUTTON', 'INPUT', 'TEXTAREA', 'SELECT']);
   let buffer = '', characters = 0, truncated = false, unreadMedia = false, folded = false, imageMissing = false;
@@ -86,8 +86,8 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
     characters += value.length;
     bodyBlocks.push({type: 'text', text: value});
   };
-  const imageUrl = node => {
-    for (const value of [node.getAttribute?.('data-src'), node.currentSrc, node.getAttribute?.('src')]) {
+  const imageUrl = values => {
+    for (const value of values) {
       if (!value) continue;
       try {
         const url = new URL(value, document.URL);
@@ -96,27 +96,53 @@ export function readArticleDocument(document, {expectedUrl, capturedAt = new Dat
     }
     return '';
   };
+  const imageLayer = node => {
+    for (let current = node.parentElement; current; current = current.parentElement) {
+      const style = styleOf(current);
+      if (style?.opacity === '0' || /^0(?:\.0+)?(?:px|em|rem|%)?$/u.test(String(style?.height ?? '').trim())) return 'interactive';
+    }
+    // An IMG's own lazy placeholder opacity is not an interaction layer.
+    const lazy = node.tagName?.toUpperCase() === 'IMG' && (node.getAttribute?.('data-src')
+      || String(node.getAttribute?.('class') ?? '').split(/\s+/u).includes('js_img_placeholder'));
+    return styleOf(node)?.opacity === '0' && !lazy ? 'interactive' : 'visible';
+  };
+  const addImage = (node, url) => {
+    if (!url || imageUrls.has(url)) return;
+    flush();
+    if (images.length >= 100 || bodyBlocks.length >= 2000) { truncated = true; return; }
+    const alt = clean(node.getAttribute?.('alt') || node.getAttribute?.('aria-label')).slice(0, 1000);
+    const layer = imageLayer(node);
+    imageUrls.add(url);
+    images.push({url, alt, layer, order: images.length, source: 'page_dom', stored: false});
+    bodyBlocks.push({type: 'image', url, alt, layer});
+  };
+  const backgroundImage = node => {
+    const lazy = node.getAttribute?.('data-lazy-bgimg');
+    if (lazy !== null && lazy !== undefined) return imageUrl([lazy]);
+    const inline = node.style?.backgroundImage || String(node.getAttribute?.('style') ?? '')
+      .match(/(?:^|;)\s*background-image\s*:\s*([\s\S]*)/iu)?.[1] || '';
+    const url = inline.match(/^\s*url\(\s*(?:"([^"]*)"|'([^']*)'|([^\s)]+))\s*\)/iu);
+    return imageUrl(url ? [url[1] ?? url[2] ?? url[3]] : []);
+  };
   const walk = node => {
-    if (!node || hidden(node)) return;
-    if (node.nodeType === 3) { buffer += node.textContent ?? ''; return; }
+    if (!node || hidden(node, true)) return;
+    if (node.nodeType === 3) { if (!hidden(node)) buffer += node.textContent ?? ''; return; }
     if (node.nodeType !== 1) return;
     const tag = node.tagName?.toUpperCase();
+    const textVisible = !hidden(node);
     if ((tag === 'BUTTON' || node.getAttribute?.('role') === 'button') && /^(?:阅读全文|展开全文|继续阅读|展开更多)$/u.test(nodeText(node))) folded = true;
     if (excluded.has(tag)) return;
+    addImage(node, backgroundImage(node));
     if (['IFRAME', 'VIDEO', 'AUDIO', 'CANVAS', 'MP-COMMON', 'MPVOICE', 'MP-MINIPROGRAM'].includes(tag)
-      || (tag === 'SECTION' && String(node.getAttribute?.('class') ?? '').split(/\s+/u).includes('channels_iframe_wrp'))) { unreadMedia = true; return; }
+      || (tag === 'SECTION' && String(node.getAttribute?.('class') ?? '').split(/\s+/u).includes('channels_iframe_wrp'))) { if (textVisible) unreadMedia = true; return; }
     if (tag === 'IMG') {
-      flush();
-      const url = imageUrl(node);
+      const url = imageUrl([node.getAttribute?.('data-src'), node.currentSrc, node.getAttribute?.('src')]);
       if (!url) { imageMissing = true; return; }
-      if (images.length >= 100 || bodyBlocks.length >= 2000) { truncated = true; return; }
-      const alt = clean(node.getAttribute?.('alt')).slice(0, 1000);
-      images.push({url, alt, order: images.length, source: 'page_dom', stored: false});
-      bodyBlocks.push({type: 'image', url, alt}); return;
+      addImage(node, url); return;
     }
-    if (tag === 'BR' || blocks.has(tag)) flush();
+    if (textVisible && (tag === 'BR' || blocks.has(tag))) flush();
     for (const child of node.childNodes ?? []) walk(child);
-    if (blocks.has(tag)) flush();
+    if (textVisible && blocks.has(tag)) flush();
   };
   walk(root); flush();
   const content = bodyBlocks.filter(block => block.type === 'text').map(block => block.text).join('\n');

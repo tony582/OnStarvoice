@@ -245,9 +245,9 @@ test('actual runner merge and JSON event serialization satisfy the server DOM/ph
   const urls = ['https://images.example.test/one.png', 'https://images.example.test/two.png'];
   const page = {...event().article, url: link, source: 'page_dom', capturedAt: bodyAt, timeSource: 'page_dom',
     content: `${paragraph}\n第二段`,
-    images: urls.map((url, order) => ({url, alt: `图 ${order + 1}`, order, source: 'page_dom', stored: false})),
-    bodyBlocks: [{type: 'text', text: paragraph}, {type: 'image', url: urls[0], alt: '图 1'},
-      {type: 'text', text: '第二段'}, {type: 'image', url: urls[1], alt: '图 2'}],
+    images: urls.map((url, order) => ({url, alt: `图 ${order + 1}`, order, source: 'page_dom', stored: false, layer: order ? 'interactive' : 'visible'})),
+    bodyBlocks: [{type: 'text', text: paragraph}, {type: 'image', url: urls[0], alt: '图 1', layer: 'visible'},
+      {type: 'text', text: '第二段'}, {type: 'image', url: urls[1], alt: '图 2', layer: 'interactive'}],
     evidence: {bodyEndObserved: true, domContentObserved: true, domReadyState: 'complete',
       imageUrlsObserved: 2, selectorAcceptance: 'live_dom_20261109', originalImagesCaptured: false},
     metrics: {like: {value: 7, raw: '7', capturedAt: bodyAt}, read: {value: 48000, raw: '4.8万', precision: 'rounded', capturedAt: bodyAt}}};
@@ -273,7 +273,8 @@ test('actual runner merge and JSON event serialization satisfy the server DOM/ph
   assert.equal(normalized.article.timeSource, 'page_dom');
   assert.equal(normalized.article.publishedAt, '2026-11-08 23:59');
   assert.equal(normalized.article.timePrecision, 'minute');
-  assert.deepEqual(normalized.article.images.map(({url, order, source, stored}) => ({url, order, source, stored})), page.images.map(({alt, ...image}) => image));
+  assert.deepEqual(normalized.article.images.map(({url, order, source, stored, layer}) => ({url, order, source, stored, layer})), page.images.map(({alt, ...image}) => image));
+  assert.deepEqual(normalized.article.bodyBlocks.filter(block => block.type === 'image').map(block => block.layer), ['visible', 'interactive']);
   assert.deepEqual(normalized.article.bodyBlocks.map(({type, text, url}) => type === 'text' ? {type, text} : {type, url}),
     page.bodyBlocks.map(({type, text, url}) => type === 'text' ? {type, text} : {type, url}));
   assert.deepEqual(normalized.article.evidence, {screens: null, bodyEndObserved: true, overlapVerified: null,
@@ -296,4 +297,24 @@ test('actual runner merge and JSON event serialization satisfy the server DOM/ph
   assert.equal(record.shares, null);
   assert.deepEqual(body.payload.imageUrls, urls);
   assert.equal(body.payload.commentsCleanedItems[1].parentCommentId, body.payload.commentsCleanedItems[0].commentId);
+});
+
+test('only visible and interactive image layers survive both runner serialization and server normalization', async () => {
+  const {articleEvent} = await import('../runners/android/src/core/wechat-article-evidence.mjs');
+  const input = event(); input.article.source = 'page_dom';
+  const layers = ['visible', 'interactive', 'hidden', 'INTERACTIVE', '', null, 1, undefined];
+  input.article.images = layers.map((layer, index) => ({url: `https://mmbiz.qpic.cn/offline/layer-${index}.png`, layer}));
+  input.article.bodyBlocks = input.article.images.map(image => ({type: 'image', url: image.url, layer: image.layer}));
+  input.article.bodyBlocks.unshift({type: 'text', text: '正文', layer: 'interactive'});
+  const task = {identity: {...identity}, keyword: '安吉星', mode: 'keyword'};
+  const serialized = articleEvent({task, card: {}, rank: 1, shareUrl: link,
+    article: input.article, comments: input.comments, capturedAt: Date.parse(input.capturedAt)});
+  for (const article of [serialized.article, normalizeArticleEvent(input, principal).article, normalizeArticleEvent(serialized, principal).article]) {
+    for (const [index, image] of article.images.entries()) {
+      const block = article.bodyBlocks[index + 1];
+      if (index < 2) {assert.equal(image.layer, layers[index]); assert.equal(block.layer, layers[index]);}
+      else {assert.equal(Object.hasOwn(image, 'layer'), false); assert.equal(Object.hasOwn(block, 'layer'), false);}
+    }
+    assert.equal(Object.hasOwn(article.bodyBlocks[0], 'layer'), false);
+  }
 });

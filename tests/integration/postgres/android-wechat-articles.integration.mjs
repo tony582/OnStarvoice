@@ -286,8 +286,8 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     const dom = eventFor(first);
     const bodyAt = new Date(Date.now()-60_000).toISOString(), phoneAt = new Date(Date.now()-30_000).toISOString();
     Object.assign(dom.article, {source: 'page_dom', capturedAt: bodyAt, timeSource: 'page_dom', content: '来自网页 DOM 的完整正文。',
-      images: imageUrls.map((url, order) => ({url, alt: `图${order + 1}`, order, source: 'page_dom', stored: true})),
-      bodyBlocks: [{type: 'text', text: '来自网页 DOM 的完整正文。'}, ...imageUrls.map(url => ({type: 'image', url}))]});
+      images: imageUrls.map((url, order) => ({url, alt: `图${order + 1}`, order, source: 'page_dom', stored: true, layer: order ? 'interactive' : 'visible'})),
+      bodyBlocks: [{type: 'text', text: '来自网页 DOM 的完整正文。'}, ...imageUrls.map((url, order) => ({type: 'image', url, layer: order ? 'interactive' : 'visible'}))]});
     dom.article.metrics.like = {raw: '7', value: 7, source: 'screen_ocr', capturedAt: phoneAt};
     dom.article.metrics.read = {raw: '', value: null, source: 'page_dom', capturedAt: bodyAt};
     dom.comments = {status: 'captured', source: 'screen_ocr', capturedAt: phoneAt, postingState: 'open', headerCount: 1,
@@ -309,9 +309,13 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     assert.equal(record.payload.wechatArticle.metrics.like.capturedAt, phoneAt);
     assert.equal(record.payload.wechatArticle.metrics.read.value, null);
     assert.ok(record.payload.wechatArticle.images.every(image => image.stored && image.downloadEligible && image.localUrl.startsWith('/media/')));
+    assert.deepEqual(record.payload.wechatArticle.images.map(image => image.layer), ['visible', 'interactive']);
+    assert.deepEqual(record.payload.wechatArticle.bodyBlocks.filter(block => block.type === 'image').map(block => block.layer), ['visible', 'interactive']);
     const [{payload: capturedPayload}] = await query(`SELECT o.payload FROM record_observations o
       JOIN capture_mobile_post_receipts r ON r.observation_id=o.id WHERE r.id=$1`, [receipt.receiptId]);
     assert.equal(capturedPayload.wechatArticle.evidence.originalImagesCaptured, false, 'capture evidence is not rewritten after download');
+    assert.deepEqual(capturedPayload.wechatArticle.images.map(image => image.layer), ['visible', 'interactive']);
+    assert.deepEqual(capturedPayload.wechatArticle.bodyBlocks.filter(block => block.type === 'image').map(block => block.layer), ['visible', 'interactive']);
     const fetchedBeforeReuse = fetchedImages.length;
     await ensureRecordImagesLocal(receipt.recordId, imageUrls, 'wechat_articles');
     assert.equal(fetchedImages.length, fetchedBeforeReuse, 'verified existing files are reused');

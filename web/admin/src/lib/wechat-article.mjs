@@ -86,7 +86,8 @@ export function wechatArticleBodyBlocks(record = {}, displayImages = []) {
     const image = saved.get(block.url)
     const local = image?.stored === true && typeof image.localUrl === 'string' && image.localUrl.startsWith('/media/') ? image.localUrl : ''
     const display = entries.get(block.url)
-    return [{ type: 'image', url: display?.startsWith('/media/') ? display : local || display || block.url, ref: block.url, alt: String(block.alt || '') }]
+    return [{ type: 'image', url: display?.startsWith('/media/') ? display : local || display || block.url, ref: block.url, alt: String(block.alt || ''),
+      ...(['visible', 'interactive'].includes(block.layer) ? { layer: block.layer } : {}) }]
   })
 }
 

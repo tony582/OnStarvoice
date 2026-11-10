@@ -7,7 +7,7 @@ export interface WechatArticleMetricDetail {
 export function wechatArticleDetail(record?: Record<string, unknown>): {
   account: string; author: string; location: string; published: string; metrics: WechatArticleMetricDetail[]
 }
-export type WechatArticleBodyBlock = { type: 'text'; text: string } | { type: 'image'; url: string; ref: string; alt: string }
+export type WechatArticleBodyBlock = { type: 'text'; text: string } | { type: 'image'; url: string; ref: string; alt: string; layer?: 'visible' | 'interactive' }
 export function wechatArticleBodyBlocks(record?: Record<string, unknown>, displayImages?: { url: string; ref: string }[]): WechatArticleBodyBlock[]
 export function wechatArticlePresentation(record?: Record<string, unknown>, capturedComments?: number): {
   bodyStatus: string; bodyLabel: string; bodyDescription: string; metricNotice: string;

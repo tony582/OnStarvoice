@@ -102,6 +102,16 @@ test('article detail preserves text/image order and matches local images by orig
   assert.deepEqual(wechatArticleBodyBlocks({content:'旧正文'}),[])
 })
 
+test('article detail preserves validated image layers without inventing layers on old or invalid data', () => {
+  const url='https://mmbiz.qpic.cn/layer/640'
+  const record={metadata:{wechatArticle:{images:[{url,stored:true,localUrl:'/media/images/layer.png'}],
+    bodyBlocks:['visible','interactive','invalid',null,undefined].map(layer=>({type:'image',url,layer}))}}}
+  const blocks=wechatArticleBodyBlocks(record)
+  assert.deepEqual(blocks.map(block=>block.layer),['visible','interactive',undefined,undefined,undefined])
+  assert.ok(blocks.every(block=>block.ref===url&&block.url==='/media/images/layer.png'))
+  assert.ok(blocks.slice(2).every(block=>!Object.hasOwn(block,'layer')))
+})
+
 test('detail metrics prioritize unknown values, retain genuine zero and record individual source/time', () => {
   const record={likes:0,metadata:{wechatArticle:{metrics:{
     read:{value:100000,raw:'10万+',source:'page_dom',capturedAt:'2026-11-09T01:02:03Z'},

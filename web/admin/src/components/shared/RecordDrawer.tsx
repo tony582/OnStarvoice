@@ -1476,7 +1476,7 @@ function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, imag
               ? <p key={`text-${index}`} className="whitespace-pre-wrap break-words text-sm leading-relaxed">{block.text}</p>
               : <RecordImageGallery key={`${r.id}-${index}-${block.ref}-${block.url}`}
                   recordId={String(r.id)} canRefresh={canRefreshImages} layout="article" title="正文配图"
-                  images={[proxiedImg(block.url)]} imageRefs={[block.ref]} imageAlts={[block.alt]} onOpen={onOpenImage} />)}
+                  images={[proxiedImg(block.url)]} imageRefs={[block.ref]} imageAlts={[block.alt]} imageLayers={[block.layer]} onOpen={onOpenImage} />)}
           </div> : <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || (article ? '本次未取得正文' : '无正文')}</p>}
         </div>
         {video && <TranscriptTextSection transcript={transcript} canWrite={canProcess} />}

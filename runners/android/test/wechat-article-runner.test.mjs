@@ -76,8 +76,8 @@ test('desktop prose and images combine with phone-only comments and independentl
   }}), comments: {status: 'captured', items: [comment]}, hasMore: false}]});
   const capturedAt = '2026-09-22T01:59:00.000Z';
   const page = article({url, source: 'page_dom', capturedAt, content: '直接读取的完整网页正文',
-    images: [{url: 'https://images.example.test/article.png', alt: '正文配图'}],
-    bodyBlocks: [{type: 'text', text: '直接读取的完整网页正文'}, {type: 'image', url: 'https://images.example.test/article.png'}],
+    images: [{url: 'https://images.example.test/article.png', alt: '正文配图', layer: 'interactive'}],
+    bodyBlocks: [{type: 'text', text: '直接读取的完整网页正文'}, {type: 'image', url: 'https://images.example.test/article.png', layer: 'interactive'}],
     metrics: {like: {value: 7, raw: '7'}, read: {value: 48000, raw: '4.8万', capturedAt}},
     evidence: {domContentObserved: true, bodyEndObserved: true, selectorAcceptance: 'live_dom_20261109'}});
   const seen = [];
@@ -94,6 +94,7 @@ test('desktop prose and images combine with phone-only comments and independentl
   assert.equal(event.article.metrics.share.value, null);
   assert.equal(event.comments.source, 'screen_ocr'); assert.equal(event.comments.items[0].content, comment.content);
   assert.equal(event.article.images[0].stored, false); assert.equal(event.article.evidence.originalImagesCaptured, false);
+  assert.equal(event.article.images[0].layer, 'interactive'); assert.equal(event.article.bodyBlocks[1].layer, 'interactive');
   assert.equal(p.calls.find(call => call.name === 'readArticle').params.bodyRequired, false);
 });
 

@@ -6,6 +6,7 @@ export function RecordImageGallery({
   images,
   imageRefs,
   imageAlts,
+  imageLayers,
   onOpen,
   recordId,
   canRefresh = false,
@@ -15,6 +16,7 @@ export function RecordImageGallery({
   images: string[]
   imageRefs?: string[]
   imageAlts?: string[]
+  imageLayers?: ('visible' | 'interactive' | undefined)[]
   onOpen: (url: string) => void
   recordId?: string
   canRefresh?: boolean
@@ -183,6 +185,9 @@ export function RecordImageGallery({
                   <ZoomIn className="h-4 w-4 text-white" />
                 </span>
               </button>
+              {imageLayers?.[item.index] === 'interactive' && (
+                <p className="px-3 py-1.5 text-[11px] text-muted-foreground" title="原文中的显示方式">点击后显示</p>
+              )}
               {recordId && imageRefs?.[item.index] && (
                 <button type="button"
                   onClick={() => extractText(item.index)}
