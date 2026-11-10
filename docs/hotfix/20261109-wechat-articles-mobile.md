@@ -101,10 +101,27 @@ Claude 提供的证据支持采集器自己的预览组件能够读取微信文�
 | 3 纯图文 7 图保存并抽 1 图识字 | 未执行 | 无数据 | 无数据 | 无数据 | 无数据 | 无数据 |
 | 4 无留言入口目标重跑 | 未执行；旧 no-comments-link-v6 仍是失败证据 | 无数据 | 无数据 | 无数据 | 无数据 | 无数据 |
 | 5 同链接重采只新增观察，再按原链接巡查 | 未执行；没有本轮真实记录／观察增量 | 无数据 | 无数据 | 无数据 | 无数据 | 无数据 |
-| 6 中途停止、回首页、关闭确认 | 未执行；另有停止语义差异 | 无数据 | 无数据 | 无数据 | 无数据 | 无数据 |
+| 6 中途停止后核对 closure、deviceClosureRequired=false，下一次任务能正常启动 | 未执行；T8 已统一验收口径 | 无数据 | 无数据 | 无数据 | 无数据 | 无数据 |
 
-步骤 6 另需处理：`runners/android/src/daemon/settle-device.mjs:4–13` 对 canceled/interrupted、user_stop/remote_stop 等主动跳过回首页，随后独立关闭会话（43–48 行）。所以关闭确认成功不等于已回首页；正常收尾的历史证据不能代替“中途停止”测试。本轮没有修改视频号共享停止行为来强行满足这条验收。
+步骤 6 按 T8 采用视频号已上线的共享语义：`runners/android/src/daemon/settle-device.mjs` 对 canceled/interrupted、user_stop/remote_stop 等主动跳过回首页，随后独立关闭会话。验收要求是「中途停止后 closure 被核对、`deviceClosureRequired=false`，下一次任务能正常启动」，不要求回首页。正常收尾的历史证据不能代替中途停止和下一次启动的实际测试；本轮没有修改共享停止代码。
 
 本轮没有停止或切换生产采集器，因此没有“测试后恢复”操作。20:58:35 北京时间仅只读核对：原 PID 69397 存活，工作目录为 `/Users/dulaidila/Documents/claude/StarVoice-Android/runtime-0.4.7-97583fa`；安吉星 `state-829d89` 状态 readyForSearch=true、activeIdentity=null、pendingEvents=0、completionPending=false、deviceClosureRequired=false。证据为 `codex-validation-20261109/anjixing-readonly-status.json`，不是手机画面验收。
 
-交给 Claude 的后续重点：补齐缺失 HTML、解决 kL-i 3/7 的可见性差异，然后逐项执行 T6。旧 `live/run.mjs` 未接 `preview`，默认 page_dom 会报 preview_unavailable；旧 `live/supplement.mjs` 固定旧 PID/输出目录，不能直接当联合验收脚本使用。所有新真机测试仍须只用 OnStar 和隔离 PG，结束后核对恢复原安吉星 0.4.7。
+该轮交接时的待办是补齐缺失 HTML、解决 kL-i 3/7 的可见性差异，然后逐项执行 T6；图片问题在下面的 T7 离线回放中已修正。旧 `live/run.mjs` 未接 `preview`，默认 page_dom 会报 preview_unavailable；旧 `live/supplement.mjs` 固定旧 PID/输出目录，不能直接当联合验收脚本使用。所有新真机测试仍须只用 OnStar 和隔离 PG，结束后核对恢复原安吉星 0.4.7。
+
+## 第二轮 T7–T8（2026-11-10）
+
+T7（`0c3afb7`）补齐 SVG 背景图及交互层。任意正文元素的 `data-lazy-bgimg` 优先，仅缺少该属性时使用内联背景图片；只接受 http(s)，去掉 URL 片段后按第一次 DOM 位置去重。透明／零高祖先中的图片标记为 interactive，硬隐藏仍排除，文字隐藏规则不变。标记贯通事件、服务端、观察记录和后台详情，交互图片下方显示「点击后显示」。
+
+| 已有样本离线回放 | 去重图片 | visible | interactive | 正文字数 |
+| --- | ---: | ---: | ---: | ---: |
+| FYL3oVvFiTPoeeaxO0ERCQ | 4 | 4 | 0 | 4148 |
+| 1ZigfwkDqDuKmKi-M0baeA | 38 | 23 | 15 | 0 |
+| kL-i_FzeHUakdh5_x49Sog | 42 | 23 | 19 | 0 |
+| bMWKCZnPrhVlz2uCqmRzKw（仅既有 JSON） | 0 | 0 | 0 | 740 |
+
+两篇纯图文首图均为原 HTML 第一张 SVG 背景图；前述 T1 的 7／3 图为历史实现结果。T7 仍只证明用户提供 DOM 的离线解析，不能当作新版联网提取、图片下载或识字验收；bMWK 没有新增 HTML。
+
+T8 仅修改本文中的停止验收要求，未改采集器停止行为。T7 后验证：采集器全量 **455/455**，服务端全量 **3583/3583**，文章隔离 PostgreSQL **17/17**，视频号 PostgreSQL **12/12**；跨端和详情相关 **57/57**，后台类型检查及构建通过，boundaries、hygiene、diff check 通过。数据库使用本机隔离库，图片／OCR 请求严格模拟；真实事件部分重放历史 `ordinary-v8`，未新增真机结果。日志见 `output/wechat-articles/codex-validation-20261110/T7-*.log`，后台及跨端日志在 `codex-validation-20261109/T7-*.log`。
+
+本轮未 push、未部署、未运行生产迁移、未停止或升级生产采集器。后续先按任务单 T9 修复真实读屏暴露的问题，再对 T10 逐步记录实际验收或阻塞。
