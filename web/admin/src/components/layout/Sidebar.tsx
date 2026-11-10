@@ -8,6 +8,8 @@ import {
 } from 'lucide-react'
 import { cn, LABELS } from '@/lib/utils'
 import { useAuth } from '@/lib/auth'
+import logoLight from '@/assets/brand/logo-horizontal-light.svg'
+import logoDark from '@/assets/brand/logo-horizontal-dark.svg'
 import { useBadges, type Badges } from '@/lib/badges'
 import { useNav, type Workspace } from '@/lib/navigation'
 import { ThemeToggle } from '@/components/layout/ThemeToggle'
@@ -146,11 +148,9 @@ export function Sidebar({
       >
       {/* 头部:Logo + 隐藏 */}
       <div className="flex items-center gap-2.5 px-3 pb-1 pt-[max(0.75rem,env(safe-area-inset-top))]">
-        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary lg:h-8 lg:w-8">
-          <img src="/images/logo-starvoice.svg" alt="" className="h-[18px] w-[18px] object-contain brightness-0 invert" />
-        </div>
-        <div className="min-w-0">
-          <div className="truncate text-[13px] font-bold text-foreground">StarVoice 星语</div>
+        <div className="min-w-0 flex-1">
+          <img src={logoLight} alt="StarVoice 星语" className="h-auto w-[140px] max-w-full dark:hidden" />
+          <img src={logoDark} alt="StarVoice 星语" className="hidden h-auto w-[140px] max-w-full dark:block" />
           <div className="mt-0.5 text-[10px] font-medium tracking-wide text-muted-foreground lg:hidden">移动值守台</div>
         </div>
         <button onClick={onMobileClose} title="关闭导航"

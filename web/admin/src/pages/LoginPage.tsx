@@ -3,6 +3,8 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAuth } from '@/lib/auth'
 import { Loader2 } from 'lucide-react'
+import logoLight from '@/assets/brand/logo-light.svg'
+import logoDark from '@/assets/brand/logo-dark.svg'
 
 export function LoginPage() {
   const { login } = useAuth()
@@ -26,11 +28,10 @@ export function LoginPage() {
         className="animate-fade-up w-full max-w-[400px] space-y-7 rounded-lg border border-border bg-card p-6 shadow-sm sm:p-8">
 
         <div className="flex flex-col items-center">
-          <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-lg border border-border bg-muted/40">
-            <img src="/images/logo-starvoice.svg" alt="" className="h-7 w-7" />
-          </div>
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">StarVoice</h1>
-          <p className="mt-1.5 text-[13px] font-medium tracking-widest uppercase text-muted-foreground">舆情作战台</p>
+          <h1 className="sr-only">StarVoice 星语</h1>
+          <img src={logoLight} alt="" aria-hidden="true" className="h-auto w-[208px] max-w-full dark:hidden" />
+          <img src={logoDark} alt="" aria-hidden="true" className="hidden h-auto w-[208px] max-w-full dark:block" />
+          <p className="mt-4 text-[13px] font-medium tracking-widest uppercase text-muted-foreground">舆情作战台</p>
         </div>
 
         <div className="space-y-5">
