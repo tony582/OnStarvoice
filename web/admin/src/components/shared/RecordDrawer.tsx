@@ -33,7 +33,7 @@ import { isRecordDetailDegraded, recordDisplayTitle } from '@/lib/record-display
 import { PostJudgmentDetails } from '@/components/shared/PostJudgment'
 import { postJudgment } from '@/lib/post-judgment'
 import { CONTENT_TOPIC_OPTIONS, contentTopicLabel } from '@/lib/content-topic'
-import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticlePresentation } from '@/lib/wechat-article.mjs'
+import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticleImageStorageError, wechatArticlePresentation } from '@/lib/wechat-article.mjs'
 
 /**
  * 内容详情抽屉。写操作由调用方持有，抽屉保留当前内容并同步处理记录。
@@ -1458,6 +1458,8 @@ function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, imag
       canRefresh={canRefreshImages}
       images={images}
       imageRefs={imageRefs}
+      imageStorageErrors={article ? imageRefs.map(ref => wechatArticleImageStorageError(r, ref)) : undefined}
+      layout={article ? 'article' : 'grid'}
       onOpen={onOpenImage}
       title={video && images.length === 1 ? '封面' : '图片'}
     />
@@ -1476,7 +1478,8 @@ function RecordContentTab({ record: r, canProcess, canRefreshImages, cover, imag
               ? <p key={`text-${index}`} className="whitespace-pre-wrap break-words text-sm leading-relaxed">{block.text}</p>
               : <RecordImageGallery key={`${r.id}-${index}-${block.ref}-${block.url}`}
                   recordId={String(r.id)} canRefresh={canRefreshImages} layout="article" title="正文配图"
-                  images={[proxiedImg(block.url)]} imageRefs={[block.ref]} imageAlts={[block.alt]} imageLayers={[block.layer]} onOpen={onOpenImage} />)}
+                  images={[proxiedImg(block.url)]} imageRefs={[block.ref]} imageAlts={[block.alt]} imageLayers={[block.layer]}
+                  imageStorageErrors={[block.storageError]} onOpen={onOpenImage} />)}
           </div> : <p className="whitespace-pre-wrap text-sm leading-relaxed">{r.content || (article ? '本次未取得正文' : '无正文')}</p>}
         </div>
         {video && <TranscriptTextSection transcript={transcript} canWrite={canProcess} />}

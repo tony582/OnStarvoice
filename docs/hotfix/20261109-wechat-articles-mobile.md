@@ -168,3 +168,23 @@ T8 仅修改本文中的停止验收要求，未改采集器停止行为。T7 �
 既有 Claude `s1-renew-d` 的真实结果是 `completed_with_warnings/link_limit`、4 篇 page_dom 完整正文事件、2 条留言、639621ms，pendingEvents=4。该脚本无控制面／上传，故这些文件只能证明本地采集，不能证明“4 篇服务端全部入库”。详见 `codex-validation-20261110/T10-prior-s1-audit.json`。重采验收应在同一隔离租户／代理下建立两个不同 attempt，保留真实内容和采集时间，断言 record 不增、observation 新增、同批重放 receipt 不变；真实 qpic 下载及千问识字仍需单独证明。
 
 第四轮尚未完成，不具备发布依据；本轮版本化提交只记录准备与阻塞。详细提交号、日志和各步未执行情况已追加至同目录完成报告。
+
+## 第五轮 T11：同租户离线重采与超限图片提示（2026-11-10）
+
+T10 的真机部分由 Claude 单独执行。本轮只使用既有文件、本机隔离 PostgreSQL、模拟图片响应及离线组件渲染，未访问外网、操作手机或生产环境。
+
+新增 `replays two real captures of the same links in one tenant`。环境变量 `WECHAT_ARTICLE_EVENT_FILES` 接受逗号分隔的多个 events.json 路径，未设置则跳过。只建一个租户和代理，每个文件领取不同 attempt；同一规范链接保持同一个 record，每次新增 observation，同批重放 receipt 不变。断言原始文件及解析对象不变、每次正文／指标／来源时间保存正确，后续采集不改写历史观察。
+
+按任务单先将 `t6/s1-renew-d/events.json` **原样重放两次**：1 租户、1 代理、2 attempts，4 records、8 observations、8 receipts。第二次每个链接记录增量 0、观察增量 1；全部 8 个回执在同批重放时保持 ID。真实样本的独立 SHA 数为 1，真实指标变化对数和不完整正文保护案例均为 0，因此不把该次重放冒称为两次不同的真机采集。新 s5-again 尚未作为本轮验收输入。
+
+用户已明确修正正文保护口径：不完整的第二次保留旧完整正文；明确完整但更短的第二次更新成新版本。产品合并代码未改。两个单独标记 synthetic 的 PG 对照用例验证：赞数 12→99 写入新观察、旧观察仍 12 且旧完整正文保留；完整正文 36→9 字时当前记录更新、首次观察仍保留旧正文。
+
+真实采集时间位于 observation 的 `payload.captureTimestamp`、`payload.wechatArticle.capturedAt` 及逐项 metrics/comments.capturedAt；`record_observations.captured_at` 是既有入库时间，不能当作手机采集时间。日志分别输出这些时间及全部实际 record/observation/receipt IDs。
+
+图片保持 **8×1024×1024 字节上限**。只在响应长度、实际流量或本地文件大小明确超限时，向当前文章 images 写入 `storageError: {code:'too_large', maxBytes, observedBytes, source}`。普通首次失败不伪造过大原因；同 URL 后续临时失败保留已确认原因，成功校验保存后清除；历史观察不被下载状态回写。详情页保留图片位置并显示「过大未保存」和 8 MB 上限，文章普通加载失败也保留占位。已知超限图不发起图片加载、不提供无效识字按钮。
+
+9.3 MB GIF 的现场大小由 Claude 提供；本轮用明确标注的模拟响应验证超限处理，不重新下载真实 GIF，不将模拟字节数当成该文件实测大小。真实 React 组件离线渲染 6/6：超限图、交互层图、普通图库及混合图库均输出正确占位；正常本地图片仍展示并可识字。fetch 尝试 0；这是首屏 HTML 验证，不是浏览器布局／交互或真机验收。
+
+验证：文章 PostgreSQL **21/21**、视频号 PostgreSQL **12/12**、服务端全量 **3592/3592**、图片／后台定向 **53/53**，均无跳过；后台类型检查与构建通过；hygiene 通过（1466 源文件）、diff check 通过。文章 PG 的 30 次真实图源请求均由本地 503 模拟响应拒绝，真实下载 0。PG 仅使用 `onstarvoice_test_wechat_articles_20261109`，没有生产迁移。
+
+证据：`codex-validation-20261109/T11-postgres-final.log`、`T11-postgres-results.json`（全部实际 IDs／时间）、`T11-image-targeted-tests.log`、`T11-admin-build.log`；`codex-validation-20261110/T11-channels-pg.log`、`T11-server-full.log`；`t11/render-gallery-report.json`、渲染脚本及 HTML。本轮一个本地提交，不 push、不部署。

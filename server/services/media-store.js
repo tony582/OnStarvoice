@@ -37,12 +37,13 @@ export function ensureMediaDirs() {
 }
 
 // 下载单张图片 → 落盘 → 返回对外路径;任何失败返回 null(调用方回退原链接)。换 OSS 只改这里。
-async function downloadImage(url, key, platform, targetDir, publicDir) {
+export async function downloadImage(url, key, platform, targetDir, publicDir, onFailure) {
   if (!url || !/^https?:\/\//i.test(url) || !isAllowedMediaHost(url)) return null;
   const article = platform === 'wechat_articles';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   let tempPath = '';
+  let overflowBytes = 0;
   try {
     let current = url, resp;
     for (let redirects = 0; redirects <= 3; redirects++) {
@@ -66,7 +67,13 @@ async function downloadImage(url, key, platform, targetDir, publicDir) {
     const ext = EXT_BY_TYPE[type];
     if (!ext) return null; // 非图片(可能是 403 的 html 错误页)
     const len = Number(resp.headers.get('content-length') || 0);
-    if (len && len > MAX_BYTES) return null;
+    if (len && len > MAX_BYTES) {
+      if (article && Number.isSafeInteger(len)) {
+        onFailure?.({code: 'too_large', maxBytes: WECHAT_IMAGE_MAX_BYTES, observedBytes: len, source: 'content_length'});
+        await resp.body.cancel();
+      }
+      return null;
+    }
     ensureMediaDirs();
     const filename = `${key}.${ext}`;
     const targetPath = join(targetDir, filename);
@@ -75,6 +82,7 @@ async function downloadImage(url, key, platform, targetDir, publicDir) {
       let received = 0;
       const bounded = new Transform({transform(chunk, encoding, done) {
         received += chunk.length;
+        if (received > WECHAT_IMAGE_MAX_BYTES) overflowBytes = received;
         done(received > WECHAT_IMAGE_MAX_BYTES ? new Error('wechat_image_too_large') : null, chunk);
       }});
       await pipeline(Readable.fromWeb(resp.body), bounded, createWriteStream(tempPath));
@@ -85,6 +93,8 @@ async function downloadImage(url, key, platform, targetDir, publicDir) {
     tempPath = '';
     return `/media/${publicDir}/${filename}`;
   } catch {
+    if (article && overflowBytes > WECHAT_IMAGE_MAX_BYTES) onFailure?.({code: 'too_large', maxBytes: WECHAT_IMAGE_MAX_BYTES,
+      observedBytes: overflowBytes, source: 'stream'});
     return null;
   } finally {
     if (article) controller.abort();
@@ -194,15 +204,33 @@ function localImageExists(url) {
   return existsSync(join(MEDIA_DIR, String(url).slice(prefix.length)));
 }
 
-async function verifiedArticleLocalImage(url) {
+export async function verifiedArticleLocalImage(url, onFailure) {
   if (!String(url || '').startsWith('/media/')) return null;
   const path = resolve(MEDIA_DIR, url.slice('/media/'.length));
   if (!path.startsWith(resolve(MEDIA_DIR) + sep)) return null;
   try {
     const file = await stat(path);
-    if (!file.isFile() || file.size > WECHAT_IMAGE_MAX_BYTES) return null;
+    if (!file.isFile()) return null;
+    if (file.size > WECHAT_IMAGE_MAX_BYTES) {
+      onFailure?.({code: 'too_large', maxBytes: WECHAT_IMAGE_MAX_BYTES, observedBytes: file.size, source: 'local_file'});
+      return null;
+    }
     return inspectWechatImage(await readFile(path));
   } catch { return null; }
+}
+
+function imageSizeFailure(value) {
+  return value?.code === 'too_large' && value.maxBytes === WECHAT_IMAGE_MAX_BYTES
+    && Number.isSafeInteger(value.observedBytes) && value.observedBytes > value.maxBytes
+    && ['content_length', 'stream', 'local_file'].includes(value.source)
+    ? {code: 'too_large', maxBytes: value.maxBytes, observedBytes: value.observedBytes, source: value.source} : null;
+}
+
+export function articleImageStorageResult(image, localUrl = '', failure) {
+  const {storageError: previousError, ...currentImage} = image;
+  // A later timeout/403 does not disprove an earlier measured size. A verified successful save clears it.
+  const storageError = !localUrl ? imageSizeFailure(failure) || imageSizeFailure(previousError) : null;
+  return {...currentImage, stored: Boolean(localUrl), localUrl, ...(storageError ? {storageError} : {})};
 }
 
 const articleImageJobs = new Map();
@@ -227,13 +255,16 @@ async function localizeRecordImages(recordId, imageUrls, platform) {
     if (!row) return;
     // A detached job must never attach images to a different revision of the body.
     if (article && JSON.stringify(parseImageUrls(row.image_urls, 100)) !== JSON.stringify(urls)) return;
-    const current = new Map();
+    const current = new Map(), failures = new Map();
     for (const entry of parseLocalImageEntries(row.image_local_urls)) {
       const hash = String(entry?.source_hash || '');
       const sourceUrl = String(entry?.source_url || '');
       const url = String(entry?.url || '');
       if (!url || !localImageExists(url)) continue;
-      if (article && !await verifiedArticleLocalImage(url)) continue;
+      if (article && !await verifiedArticleLocalImage(url, failure => {
+        const original = sourceUrl || urls.find(candidate => imageSourceHash(candidate) === hash);
+        if (original) failures.set(original, failure);
+      })) continue;
       if (hash) current.set(hash, url);
       // 兼容旧版本按完整签名 URL 生成的 source_hash：只要素材 token 相同，
       // 新采集的 URL 变了也直接复用已经落地的文件。
@@ -247,10 +278,11 @@ async function localizeRecordImages(recordId, imageUrls, platform) {
         const sourceHash = imageSourceHash(url);
         let localUrl = current.get(sourceHash) || '';
         if (!localUrl) {
-          localUrl = await downloadImage(url, `${recordId}-${sourceHash}`, platform, IMAGES_DIR, 'images') || '';
+          localUrl = await downloadImage(url, `${recordId}-${sourceHash}`, platform, IMAGES_DIR, 'images',
+            article ? failure => failures.set(url, failure) : undefined) || '';
         }
         if (localUrl) {
-          const verified = article ? await verifiedArticleLocalImage(localUrl) : null;
+          const verified = article ? await verifiedArticleLocalImage(localUrl, failure => failures.set(url, failure)) : null;
           if (article && !verified) continue;
           localized.push({ source_url: url, source_hash: sourceHash, url: localUrl,
             ...(verified ? {byte_size: verified.bytes, width: verified.width, height: verified.height} : {}) });
@@ -259,7 +291,7 @@ async function localizeRecordImages(recordId, imageUrls, platform) {
       if (article) {
         const saved = new Map(localized.map(entry => [entry.source_url, entry.url]));
         const body = row.payload?.wechatArticle ?? {};
-        const images = (body.images ?? []).map(image => ({...image, stored: saved.has(image.url), localUrl: saved.get(image.url) || ''}));
+        const images = (body.images ?? []).map(image => articleImageStorageResult(image, saved.get(image.url) || '', failures.get(image.url)));
         const evidence = {originalImagesCaptured: urls.length > 0 && localized.length === urls.length,
           imageStorage: {expected: urls.length, stored: localized.length, checkedAt: new Date().toISOString()}};
         await execute(`UPDATE records SET image_local_urls=$1::jsonb,

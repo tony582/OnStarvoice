@@ -7,6 +7,7 @@ export function RecordImageGallery({
   imageRefs,
   imageAlts,
   imageLayers,
+  imageStorageErrors,
   onOpen,
   recordId,
   canRefresh = false,
@@ -17,6 +18,7 @@ export function RecordImageGallery({
   imageRefs?: string[]
   imageAlts?: string[]
   imageLayers?: ('visible' | 'interactive' | undefined)[]
+  imageStorageErrors?: ({ code: 'too_large'; maxBytes: number } | undefined)[]
   onOpen: (url: string) => void
   recordId?: string
   canRefresh?: boolean
@@ -34,7 +36,7 @@ export function RecordImageGallery({
   const resultPanelRef = useRef<HTMLDivElement>(null)
   const visible = images
     .map((url, index) => ({ url, index, key: `${url}-${index}` }))
-    .filter(item => !failed.has(item.key))
+    .filter(item => layout === 'article' || !failed.has(item.key))
   const activeResult = activeIndex == null ? null : results[activeIndex]
 
   useEffect(() => () => {
@@ -160,7 +162,7 @@ export function RecordImageGallery({
         {failed.size > 0 && (
           <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
             <ImageOff className="h-3.5 w-3.5" />
-            {failed.size} 张平台原图已失效
+            {failed.size} {layout === 'article' ? '张配图暂时无法显示' : '张平台原图已失效'}
           </span>
         )}
       </div>
@@ -170,7 +172,14 @@ export function RecordImageGallery({
           {visible.map(item => (
             <div key={item.key}
               className="overflow-hidden rounded-lg border border-border bg-card">
-              <button type="button" onClick={() => onOpen(item.url)} title="点击放大"
+              {imageStorageErrors?.[item.index]?.code === 'too_large' || failed.has(item.key) ? (
+                <div role="img" aria-label={imageStorageErrors?.[item.index]?.code === 'too_large' ? '过大未保存' : '配图暂时无法显示'}
+                  className="flex min-h-28 flex-col items-center justify-center gap-2 bg-muted/40 px-4 py-5 text-center text-[12px] text-muted-foreground">
+                  <ImageOff className="h-5 w-5" />
+                  <span>{imageStorageErrors?.[item.index]?.code === 'too_large' ? '过大未保存' : '配图暂时无法显示'}</span>
+                  {imageStorageErrors?.[item.index]?.code === 'too_large' && <span className="text-[11px]">超过单张图片 {imageStorageErrors[item.index]!.maxBytes / 1024 / 1024} MB 的保存上限</span>}
+                </div>
+              ) : <button type="button" onClick={() => onOpen(item.url)} title="点击放大"
                 aria-label={`放大第 ${item.index + 1} 张图片`}
                 className={layout === 'article' ? 'group relative block w-full cursor-zoom-in overflow-hidden bg-muted' : 'group relative block aspect-[3/4] w-full cursor-zoom-in overflow-hidden bg-muted'}>
                 <img src={item.url} alt={imageAlts?.[item.index] || ''}
@@ -184,11 +193,11 @@ export function RecordImageGallery({
                 <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/20 group-hover:opacity-100">
                   <ZoomIn className="h-4 w-4 text-white" />
                 </span>
-              </button>
+              </button>}
               {imageLayers?.[item.index] === 'interactive' && (
                 <p className="px-3 py-1.5 text-[11px] text-muted-foreground" title="原文中的显示方式">点击后显示</p>
               )}
-              {recordId && imageRefs?.[item.index] && (
+              {recordId && imageRefs?.[item.index] && !imageStorageErrors?.[item.index] && (
                 <button type="button"
                   onClick={() => extractText(item.index)}
                   disabled={busyIndex !== null}

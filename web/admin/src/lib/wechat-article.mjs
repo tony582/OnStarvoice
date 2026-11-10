@@ -72,6 +72,19 @@ export function wechatArticleDetail(record = {}) {
   }
 }
 
+function imageStorageError(image) {
+  const error = object(image?.storageError)
+  return image?.stored !== true && error.code === 'too_large' && Number.isSafeInteger(error.maxBytes) && error.maxBytes > 0
+    && Number.isSafeInteger(error.observedBytes) && error.observedBytes > error.maxBytes
+    && ['content_length', 'stream', 'local_file'].includes(error.source)
+    ? { code: 'too_large', maxBytes: error.maxBytes, observedBytes: error.observedBytes, source: error.source } : undefined
+}
+
+export function wechatArticleImageStorageError(record = {}, imageRef) {
+  const images = wechatArticleData(record).images
+  return imageStorageError(Array.isArray(images) ? images.find(image => image?.url === imageRef) : null)
+}
+
 /** Map by original source URL, never the gallery's reordered/local-first index. Repeats stay in place. */
 export function wechatArticleBodyBlocks(record = {}, displayImages = []) {
   const article = wechatArticleData(record)
@@ -84,9 +97,11 @@ export function wechatArticleBodyBlocks(record = {}, displayImages = []) {
     try { parsed = new URL(block.url) } catch { return [] }
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return []
     const image = saved.get(block.url)
+    const storageError = imageStorageError(image)
     const local = image?.stored === true && typeof image.localUrl === 'string' && image.localUrl.startsWith('/media/') ? image.localUrl : ''
     const display = entries.get(block.url)
     return [{ type: 'image', url: display?.startsWith('/media/') ? display : local || display || block.url, ref: block.url, alt: String(block.alt || ''),
+      ...(storageError ? { storageError } : {}),
       ...(['visible', 'interactive'].includes(block.layer) ? { layer: block.layer } : {}) }]
   })
 }

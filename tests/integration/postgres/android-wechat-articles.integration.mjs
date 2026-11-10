@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {randomUUID} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {readFile, mkdtemp, rm, writeFile, stat, readdir} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
@@ -61,6 +61,33 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     assert.fail('comment receipt did not settle within 3 seconds');
   };
   const send = (f, event) => f.service.posts(f.principal, {uploadBatchId: randomUUID(), events: [event]}, persist);
+  const metricKeys = ['read', 'like', 'share', 'recommend'];
+  const iso = value => new Date(value).toISOString();
+  const observationEvidence = row => ({captureTimestamp: row.payload.captureTimestamp,
+    article: row.payload.wechatArticle, likes: row.likes, comments: row.comments_count,
+    collects: row.collects, shares: row.shares, insertedAt: iso(row.captured_at)});
+  function assertCapturedObservation(row, captured) {
+    const article = row.payload.wechatArticle;
+    assert.equal(row.payload.captureTimestamp, Date.parse(captured.capturedAt));
+    assert.equal(article.capturedAt, iso(captured.article.capturedAt ?? captured.capturedAt));
+    assert.equal(article.content, captured.article.content.normalize('NFC'));
+    assert.equal(article.bodyStatus, captured.article.bodyStatus);
+    assert.equal(article.comments.status, captured.comments.status);
+    assert.equal(article.comments.capturedAt, iso(captured.comments.capturedAt ?? captured.capturedAt));
+    for (const key of metricKeys) {
+      assert.equal(article.metrics[key].value, captured.article.metrics?.[key]?.value ?? null);
+      assert.equal(article.metrics[key].raw, captured.article.metrics?.[key]?.raw ?? '');
+      assert.equal(article.metrics[key].source, captured.article.metrics?.[key]?.source ?? captured.article.source);
+      assert.equal(article.metrics[key].capturedAt, iso(captured.article.metrics?.[key]?.capturedAt ?? captured.capturedAt));
+    }
+  }
+  function refuseEvidenceImageDownloads(events) {
+    const urls = new Set(events.flatMap(event => [event.article?.coverUrl, ...(event.article?.images ?? []).map(image => image.url)]).filter(Boolean));
+    // These exact supplied URLs remain in evidence. Their download attempts receive an explicit local
+    // failure; neither real qpic requests nor successful image-storage claims are allowed in replay.
+    for (const url of urls) mockedImages.set(url, () => new Response('Offline evidence replay: download not performed', {status: 503}));
+    return urls;
+  }
 
   async function fixture(st, options = {}) {
     const [{id: tenantId}] = await query('INSERT INTO tenants(name) VALUES($1) RETURNING id', [`article-test-${randomUUID()}`]);
@@ -274,6 +301,78 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     await f.complete(second);
   });
 
+  await t.test('synthetic recaptures preserve prior metric/time evidence and a complete DOM body when the next body is partial', async st => {
+    const f = await fixture(st);
+    await parent(f, {keywords: ['离线合成首次', '离线合成重采']});
+    const first = (await f.poll()).task, firstAt = iso(Date.now() - 120_000), secondAt = iso(Date.now() - 60_000);
+    const initial = eventFor(first, {capturedAt: firstAt});
+    Object.assign(initial.article, {source: 'page_dom', capturedAt: firstAt,
+      content: '仅用于离线合成回归：第一次采集到的完整正文，第二次片段不得替换它。',
+      metrics: {read: metric(1200), like: metric(12), share: metric(0), recommend: metric(null)}});
+    const initialReceipt = (await send(f, initial)).receipts[0];
+    assert.equal(initialReceipt.status, 'accepted');
+    const [initialObservation] = await query('SELECT * FROM record_observations WHERE capture_task_item_attempt_id=$1', [first.identity.attemptId]);
+    assertCapturedObservation(initialObservation, initial);
+    const before = observationEvidence(initialObservation);
+    await f.complete(first);
+    const second = (await f.poll()).task;
+    const partial = eventFor(second, {capturedAt: secondAt});
+    Object.assign(partial.article, {source: 'page_dom', capturedAt: secondAt, content: '仅用于离线合成回归', bodyStatus: 'partial', bodyReason: 'content_limit',
+      metrics: {read: metric(1500), like: metric(99), share: metric(0), recommend: metric(null)},
+      evidence: {domContentObserved: true, bodyEndObserved: false, originalImagesCaptured: false}});
+    partial.link.shareUrl = 'https://mp.weixin.qq.com/s/article_test_0001?scene=synthetic_second#tracked';
+    const batch = {uploadBatchId: randomUUID(), events: [partial]};
+    const receipt = (await f.service.posts(f.principal, batch, persist)).receipts[0];
+    assert.equal(receipt.status, 'accepted'); assert.equal(receipt.recordId, initialReceipt.recordId);
+    const [record] = await stored(f);
+    assert.equal(record.content, initial.article.content);
+    assert.equal(record.payload.wechatArticle.bodyStatus, 'complete');
+    assert.equal(record.payload.wechatArticle.capturedAt, firstAt);
+    assert.equal(record.payload.wechatArticle.latestCapture.bodyStatus, 'partial');
+    assert.equal(record.payload.wechatArticle.latestCapture.capturedAt, secondAt);
+    assert.equal(record.likes, 99);
+    const [secondObservation] = await query('SELECT * FROM record_observations WHERE capture_task_item_attempt_id=$1', [second.identity.attemptId]);
+    assertCapturedObservation(secondObservation, partial);
+    assert.notEqual(secondObservation.id, initialObservation.id);
+    const [unchanged] = await query('SELECT * FROM record_observations WHERE id=$1', [initialObservation.id]);
+    assert.deepEqual(observationEvidence(unchanged), before);
+    assert.equal((await f.service.posts(f.principal, batch, persist)).receipts[0].receiptId, receipt.receiptId);
+    assert.equal((await query('SELECT id FROM record_observations WHERE tenant_id=$1', [f.tenantId])).length, 2);
+    await f.complete(second);
+    st.diagnostic(JSON.stringify({kind: 'synthetic_regression', recordId: record.id,
+      first: {observationId: initialObservation.id, receiptId: initialReceipt.receiptId, eventCapturedAt: firstAt, likes: 12},
+      second: {observationId: secondObservation.id, receiptId: receipt.receiptId, eventCapturedAt: secondAt, likes: 99},
+      completeBodyPreserved: true, originalImagesDownloaded: false}));
+  });
+
+  await t.test('a synthetic complete but shorter DOM recapture updates the current body without rewriting the first observation', async st => {
+    const f = await fixture(st);
+    await parent(f, {keywords: ['离线合成完整旧稿', '离线合成完整短稿']});
+    const first = (await f.poll()).task, initial = eventFor(first);
+    initial.article.source = 'page_dom';
+    initial.article.content = '离线合成旧稿：这是第一次读到的完整长正文，后续已确认完整的新稿可以更短。';
+    assert.equal((await send(f, initial)).receipts[0].status, 'accepted');
+    const [observation] = await query('SELECT * FROM record_observations WHERE capture_task_item_attempt_id=$1', [first.identity.attemptId]);
+    const before = observationEvidence(observation);
+    await f.complete(first);
+    const second = (await f.poll()).task, shorter = eventFor(second);
+    Object.assign(shorter.article, {source: 'page_dom', content: '离线合成完整短稿。', bodyStatus: 'complete'});
+    const receipt = (await send(f, shorter)).receipts[0];
+    assert.equal(receipt.status, 'accepted');
+    const [record] = await stored(f);
+    assert.equal(record.content, shorter.article.content);
+    assert.equal(record.payload.wechatArticle.bodyStatus, 'complete');
+    assert.equal(record.payload.wechatArticle.latestCapture.bodyStatus, 'complete');
+    const [unchanged] = await query('SELECT * FROM record_observations WHERE id=$1', [observation.id]);
+    assert.deepEqual(observationEvidence(unchanged), before);
+    const [updated] = await query('SELECT * FROM record_observations WHERE capture_task_item_attempt_id=$1', [second.identity.attemptId]);
+    assertCapturedObservation(updated, shorter);
+    await f.complete(second);
+    st.diagnostic(JSON.stringify({kind: 'synthetic_complete_shorter', recordId: record.id,
+      oldCharacters: initial.article.content.length, newCharacters: shorter.article.content.length,
+      firstObservationId: observation.id, secondObservationId: updated.id, latestBodyUpdated: true}));
+  });
+
   await t.test('DOM body and ordered image URLs enter the existing record path while phone evidence stays separate', async st => {
     const {isAllowedMediaHost} = await import('../../../server/services/media-proxy.js');
     const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
@@ -388,6 +487,9 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     assert.equal(updated.payload.wechatArticle.evidence.originalImagesCaptured, false);
     assert.equal(updated.payload.wechatArticle.evidence.imageStorage.expected, 6);
     assert.equal(updated.payload.wechatArticle.evidence.imageStorage.stored, 1);
+    assert.deepEqual(updated.payload.wechatArticle.images[3].storageError,
+      {code: 'too_large', maxBytes: 8 * 1024 * 1024, observedBytes: 9 * 1024 * 1024, source: 'stream'});
+    assert.ok(updated.payload.wechatArticle.images.filter((_, index) => index !== 3).every(image => !image.storageError));
     assert.ok(!fetchedImages.some(item => item.url === 'https://private.example/forbidden'));
     assert.ok(emitted < 32, 'the byte limit cancels the oversized stream instead of buffering it to completion');
     assert.ok((await readdir(join(mediaDir, 'images'))).every(name => !name.endsWith('.part')));
@@ -399,6 +501,43 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     [updated] = await stored(f);
     assert.equal(updated.image_local_urls.length, 0, 'a corrupt/placeholder cached file is not trusted');
     assert.equal(updated.payload.wechatArticle.evidence.imageStorage.stored, 0);
+  });
+
+  await t.test('oversized image facts update only the current record and clear after a verified save, never rewriting capture evidence', async st => {
+    const {ensureRecordImagesLocal} = await import('../../../server/services/media-store.js');
+    const f = await fixture(st), url = 'https://mmbiz.qpic.cn/offline-fixture/size-evidence.gif';
+    const reportedBytes = Math.ceil(9.3 * 1024 * 1024);
+    const failure = {code: 'too_large', maxBytes: 8 * 1024 * 1024, observedBytes: reportedBytes, source: 'content_length'};
+    mockedImages.set(url, () => new Response('offline oversized-header fixture',
+      {headers: {'content-type': 'image/gif', 'content-length': String(reportedBytes)}}));
+    await parent(f);
+    const {task} = await f.poll(), event = eventFor(task);
+    Object.assign(event.article, {source: 'page_dom', images: [{url, source: 'page_dom', stored: false}],
+      bodyBlocks: [{type: 'text', text: event.article.content}, {type: 'image', url}]});
+    const receipt = (await send(f, event)).receipts[0];
+    assert.equal(receipt.status, 'accepted'); await settleBackground();
+    let [record] = await stored(f);
+    assert.deepEqual(record.payload.wechatArticle.images[0].storageError, failure);
+    assert.equal(record.payload.wechatArticle.images[0].stored, false);
+    assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, false);
+    assert.equal(record.payload.wechatArticle.evidence.imageStorage.stored, 0);
+    const [observation] = await query('SELECT * FROM record_observations WHERE capture_task_item_attempt_id=$1', [task.identity.attemptId]);
+    const before = observationEvidence(observation);
+    assert.equal(observation.payload.wechatArticle.images[0].storageError, undefined);
+    assert.equal(observation.payload.wechatArticle.evidence.originalImagesCaptured, false);
+    mockedImages.set(url, () => new Response('', {status: 403}));
+    await ensureRecordImagesLocal(record.id, [url], 'wechat_articles');
+    [record] = await stored(f);
+    assert.deepEqual(record.payload.wechatArticle.images[0].storageError, failure, 'an unknown later failure cannot erase the measured header fact');
+    mockedImages.set(url, () => new Response(pngFixture(), {headers: {'content-type': 'image/png'}}));
+    await ensureRecordImagesLocal(record.id, [url], 'wechat_articles');
+    [record] = await stored(f);
+    assert.equal(record.payload.wechatArticle.images[0].stored, true);
+    assert.equal(record.payload.wechatArticle.images[0].storageError, undefined);
+    assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, true);
+    const [unchanged] = await query('SELECT * FROM record_observations WHERE id=$1', [observation.id]);
+    assert.deepEqual(observationEvidence(unchanged), before, 'localization facts belong to current storage, not historical capture observations');
+    await f.complete(task);
   });
 
   await t.test('an old image job cannot overwrite a newer body revision or attach images that were removed', async st => {
@@ -613,12 +752,120 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     assert.equal(state.needs_action, false);
   });
 
+  await t.test('replays two real captures of the same links in one tenant', {
+    skip: !process.env.WECHAT_ARTICLE_EVENT_FILES && 'Set WECHAT_ARTICLE_EVENT_FILES to comma-separated actual events.json paths (the same file may be replayed twice)',
+  }, async st => {
+    const paths = process.env.WECHAT_ARTICLE_EVENT_FILES.split(',').map(path => path.trim()).filter(Boolean);
+    assert.ok(paths.length >= 2, 'at least two evidence files/attempts are required');
+    const captures = [];
+    for (const path of paths) {
+      const bytes = await readFile(path), input = JSON.parse(bytes.toString('utf8'));
+      const events = Array.isArray(input) ? input : input.events;
+      assert.ok(Array.isArray(events) && events.length, 'each evidence file must contain actual captured events');
+      assert.ok(events.every(event => event.eventKind === 'wechat_article' && Number.isFinite(Date.parse(event.capturedAt))));
+      const links = events.map(event => canonicalArticleUrl(event.link?.shareUrl));
+      assert.ok(links.every(Boolean));
+      assert.equal(new Set(links).size, events.length, 'one file must contain one captured event per canonical link');
+      captures.push({path, bytes, events, sha256: createHash('sha256').update(bytes).digest('hex')});
+    }
+    const urls = refuseEvidenceImageDownloads(captures.flatMap(capture => capture.events));
+    const fetchStart = fetchedImages.length;
+    const f = await fixture(st);
+    await parent(f, {keywords: captures.map(() => '安吉星')});
+    const attempts = new Set(), recordsByLink = new Map(), history = [], previousByLink = new Map();
+    let repeatedLinks = 0, metricValueChanges = 0, protectedBodies = 0;
+    for (const [captureIndex, capture] of captures.entries()) {
+      const {task} = await f.poll();
+      assert.ok(task, `file ${captureIndex + 1} must receive its own leased attempt`);
+      assert.equal(task.identity.agentId, f.phone.id);
+      assert.ok(!attempts.has(task.identity.attemptId)); attempts.add(task.identity.attemptId);
+      // Historical evidence remains unchanged; only the isolated test lease window and identities move.
+      const earliest = Math.min(...capture.events.map(event => Date.parse(event.capturedAt)));
+      await query('UPDATE capture_task_item_attempts SET started_at=$2::timestamptz WHERE id=$1',
+        [task.identity.attemptId, iso(earliest - 1000)]);
+      const evidenceBefore = JSON.stringify(capture.events);
+      for (let offset = 0; offset < capture.events.length; offset += 5) {
+        const originals = capture.events.slice(offset, offset + 5);
+        const batch = {uploadBatchId: randomUUID(), events: originals.map(event => ({...event, ...task.identity, eventId: randomUUID()}))};
+        const first = await f.service.posts(f.principal, batch, persist);
+        assert.equal(first.receipts.length, originals.length);
+        await drain(f); await settleBackground();
+        const replay = await f.service.posts(f.principal, batch, persist);
+        assert.deepEqual(replay.receipts.map(receipt => receipt.receiptId), first.receipts.map(receipt => receipt.receiptId));
+        assert.equal((await f.service.postReceipts(f.principal, batch.uploadBatchId)).receipts.length, originals.length);
+        for (const [index, captured] of originals.entries()) {
+          const receipt = first.receipts[index], url = canonicalArticleUrl(captured.link.shareUrl);
+          assert.equal(receipt.status, 'accepted');
+          const [record] = await query('SELECT * FROM records WHERE id=$1 AND tenant_id=$2', [receipt.recordId, f.tenantId]);
+          assert.equal(record.url, url);
+          assert.equal((await query('SELECT id FROM records WHERE tenant_id=$1 AND url=$2', [f.tenantId, url])).length, 1);
+          if (recordsByLink.has(url)) { repeatedLinks++; assert.equal(record.id, recordsByLink.get(url)); }
+          else recordsByLink.set(url, record.id);
+          const [observation] = await query(`SELECT o.* FROM record_observations o
+            JOIN capture_mobile_post_receipts r ON r.observation_id=o.id WHERE r.id=$1 AND o.tenant_id=$2`, [receipt.receiptId, f.tenantId]);
+          assert.ok(observation); assert.equal(observation.record_id, record.id);
+          assert.equal(observation.capture_task_item_attempt_id, task.identity.attemptId);
+          assert.ok(!history.some(item => item.id === observation.id), 'each file/link must create a new observation');
+          assertCapturedObservation(observation, captured);
+          const previous = previousByLink.get(url);
+          if (previous) {
+            metricValueChanges += metricKeys.some(key => previous.article.metrics[key].value !== observation.payload.wechatArticle.metrics[key].value) ? 1 : 0;
+            const old = previous.recordArticle;
+            const protect = (old.content || old.images?.length) && old.bodyStatus === 'complete'
+              && (captured.article.bodyStatus !== 'complete' || (old.source === 'page_dom' && captured.article.source !== 'page_dom'));
+            if (protect) {
+              protectedBodies++;
+              assert.equal(record.content, old.content);
+              assert.equal(record.payload.wechatArticle.bodyStatus, 'complete');
+              assert.equal(record.payload.wechatArticle.capturedAt, old.capturedAt);
+            } else if (captured.article.bodyStatus === 'complete') {
+              assert.equal(record.content, captured.article.content.normalize('NFC'), 'a complete newer DOM may legitimately be shorter');
+            }
+          }
+          assert.equal(record.payload.wechatArticle.evidence.originalImagesCaptured, false);
+          assert.equal((record.image_local_urls ?? []).length, 0, 'offline refusal cannot be claimed as image storage');
+          assert.ok(record.payload.wechatArticle.images.every(image => image.stored === false && !image.localUrl));
+          const comments = await query('SELECT content FROM record_comments WHERE tenant_id=$1 AND record_id=$2', [f.tenantId, record.id]);
+          for (const item of captured.comments.items) assert.ok(comments.some(row => row.content === item.content.normalize('NFC').trim()));
+          history.push({id: observation.id, evidence: observationEvidence(observation)});
+          previousByLink.set(url, {article: observation.payload.wechatArticle, recordArticle: record.payload.wechatArticle});
+          st.diagnostic(JSON.stringify({kind: 'real_capture_replay', capture: captureIndex + 1, file: capture.path, sha256: capture.sha256,
+            tenantId: f.tenantId, agentId: f.phone.id, attemptId: task.identity.attemptId, url, recordId: record.id,
+            observationId: observation.id, receiptId: receipt.receiptId,
+            eventCapturedAt: iso(observation.payload.captureTimestamp), articleCapturedAt: observation.payload.wechatArticle.capturedAt,
+            observationInsertedAt: iso(observation.captured_at),
+            metrics: Object.fromEntries(metricKeys.map(key => [key, observation.payload.wechatArticle.metrics[key].value])),
+            bodyStatus: captured.article.bodyStatus, imageDownloads: 'offline_refused'}));
+        }
+      }
+      assert.equal(JSON.stringify(capture.events), evidenceBefore, 'replay cannot mutate the parsed source evidence');
+      await f.complete(task);
+      for (const original of history) {
+        const [unchanged] = await query('SELECT * FROM record_observations WHERE id=$1', [original.id]);
+        assert.deepEqual(observationEvidence(unchanged), original.evidence, 'later captures cannot rewrite prior observation metrics, times or body');
+      }
+    }
+    assert.ok(repeatedLinks > 0, 'the supplied captures must share at least one canonical link');
+    const records = await stored(f), observations = await query('SELECT id FROM record_observations WHERE tenant_id=$1', [f.tenantId]);
+    const receipts = await query('SELECT id FROM capture_mobile_post_receipts WHERE tenant_id=$1', [f.tenantId]);
+    const expectedObservations = captures.reduce((total, capture) => total + capture.events.length, 0);
+    assert.equal(records.length, recordsByLink.size); assert.equal(observations.length, expectedObservations); assert.equal(receipts.length, expectedObservations);
+    for (const capture of captures) assert.deepEqual(await readFile(capture.path), capture.bytes, 'original evidence file remains byte-identical');
+    st.diagnostic(JSON.stringify({kind: 'real_capture_replay_summary', tenantId: f.tenantId, agentId: f.phone.id,
+      files: captures.length, distinctEvidenceHashes: new Set(captures.map(capture => capture.sha256)).size,
+      attempts: attempts.size, records: records.length, observations: observations.length, receipts: receipts.length,
+      repeatedLinks, realMetricValueChangePairs: metricValueChanges, realBodyProtectionCases: protectedBodies,
+      offlineImageRefusals: fetchedImages.slice(fetchStart).filter(item => urls.has(item.url)).length,
+      liveImageDownloads: 0, sourceFilesUnchanged: true}));
+  });
+
   await t.test('real phone evidence survives ingest and replay without replacing body, comments or metrics', {
     skip: !process.env.WECHAT_ARTICLE_EVENT_FILE && 'Set WECHAT_ARTICLE_EVENT_FILE to an actual phone events.json to run this acceptance step',
   }, async st => {
     const input = JSON.parse(await readFile(process.env.WECHAT_ARTICLE_EVENT_FILE, 'utf8'));
     const events = Array.isArray(input) ? input : input.events;
     assert.ok(Array.isArray(events) && events.length, 'evidence file must contain actual captured events');
+    refuseEvidenceImageDownloads(events);
     const f = await fixture(st);
     await parent(f);
     const {task} = await f.poll();

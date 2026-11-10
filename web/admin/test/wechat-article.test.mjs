@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticleMetric, wechatArticlePresentation } from '../src/lib/wechat-article.mjs'
+import { wechatArticleBodyBlocks, wechatArticleDetail, wechatArticleImageStorageError, wechatArticleMetric, wechatArticlePresentation } from '../src/lib/wechat-article.mjs'
 import { proxiedImg } from '../src/lib/utils.ts'
 import { agentCreatePlatforms, mobileAgentPlatforms, mobileReadinessLabel } from '../src/pages/dispatch/cloud-tasks/lib.ts'
 import { wechatFilterSummary } from '../src/pages/dispatch/cloud-tasks/wechatFilters.ts'
@@ -110,6 +110,24 @@ test('article detail preserves validated image layers without inventing layers o
   assert.deepEqual(blocks.map(block=>block.layer),['visible','interactive',undefined,undefined,undefined])
   assert.ok(blocks.every(block=>block.ref===url&&block.url==='/media/images/layer.png'))
   assert.ok(blocks.slice(2).every(block=>!Object.hasOwn(block,'layer')))
+})
+
+test('article oversized-image evidence reaches the body and fallback gallery without mislabeling ordinary failures',()=>{
+  const url='https://mmbiz.qpic.cn/oversized.gif', maxBytes=8*1024*1024
+  const storageError={code:'too_large',maxBytes,observedBytes:maxBytes+1,source:'stream'}
+  const image={url,stored:false,storageError}
+  const record={metadata:{wechatArticle:{images:[image],bodyBlocks:[{type:'image',url,layer:'interactive'}]}}}
+  assert.deepEqual(wechatArticleBodyBlocks(record)[0].storageError,storageError)
+  assert.deepEqual(wechatArticleImageStorageError(record,url),storageError)
+  assert.equal(wechatArticleBodyBlocks(record)[0].layer,'interactive')
+  image.stored=true
+  assert.equal(wechatArticleImageStorageError(record,url),undefined)
+  image.stored=false
+  for (const failure of [{code:'download_failed'}, {...storageError,observedBytes:100}, {...storageError,source:'unknown'}, {}]) {
+    image.storageError=failure
+    assert.equal(wechatArticleImageStorageError(record,url),undefined)
+    assert.equal(Object.hasOwn(wechatArticleBodyBlocks(record)[0],'storageError'),false)
+  }
 })
 
 test('detail metrics prioritize unknown values, retain genuine zero and record individual source/time', () => {

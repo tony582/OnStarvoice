@@ -7,7 +7,11 @@ export interface WechatArticleMetricDetail {
 export function wechatArticleDetail(record?: Record<string, unknown>): {
   account: string; author: string; location: string; published: string; metrics: WechatArticleMetricDetail[]
 }
-export type WechatArticleBodyBlock = { type: 'text'; text: string } | { type: 'image'; url: string; ref: string; alt: string; layer?: 'visible' | 'interactive' }
+export interface WechatArticleImageStorageError {
+  code: 'too_large'; maxBytes: number; observedBytes: number; source: 'content_length' | 'stream' | 'local_file'
+}
+export function wechatArticleImageStorageError(record: Record<string, unknown>, imageRef: string): WechatArticleImageStorageError | undefined
+export type WechatArticleBodyBlock = { type: 'text'; text: string } | { type: 'image'; url: string; ref: string; alt: string; layer?: 'visible' | 'interactive'; storageError?: WechatArticleImageStorageError }
 export function wechatArticleBodyBlocks(record?: Record<string, unknown>, displayImages?: { url: string; ref: string }[]): WechatArticleBodyBlock[]
 export function wechatArticlePresentation(record?: Record<string, unknown>, capturedComments?: number): {
   bodyStatus: string; bodyLabel: string; bodyDescription: string; metricNotice: string;
