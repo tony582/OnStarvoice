@@ -1,0 +1,2 @@
+# Real WeChat article DOM snapshots: kept byte-exact (tests verify their SHA-256), so whitespace checks skip them.
+runners/android/test/fixtures/wechat-articles/dom/*.html -whitespace
