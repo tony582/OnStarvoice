@@ -2,12 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {createWechatArticleFlow} from '../src/device/wechat-article-flow.mjs';
-import {ARTICLE_ACTIVITY, ARTICLE_LINK_ACTIVITY, ARTICLE_LANDING, ARTICLE_SEARCH, parseArticleCards} from '../src/device/wechat-article-parse.mjs';
+import {ARTICLE_ACTIVITY, ARTICLE_LINK_ACTIVITY, ARTICLE_LANDING, ARTICLE_SEARCH, parseArticleCards, parseArticleHeader} from '../src/device/wechat-article-parse.mjs';
 import {ACTIVITY} from '../src/device/wechat-profile.mjs';
+import {runWechatArticleTask} from '../src/core/wechat-article-runner.mjs';
+import {RunnerStore} from '../src/storage/runner-store.mjs';
+import {fixtureTask, fixtureClock, fixturePermit} from './core-fixtures.mjs';
 const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-articles/${name}.json`, import.meta.url)));
 const row = (text, x, y, w = 200, h = 45) => ({text, x, y, w, h});
 const shareUrl = 'https://mp.weixin.qq.com/s/bMWKCZnPrhVlz2uCqmRzKw';
 const t9 = name => fixture('t9-claude-phone-20261109')[name].rows;
+const previewHeader = (overrides = {}) => ({url: shareUrl, source: 'page_dom', headerVerified: true, title: '5年后安吉星要不要续费',
+  account: '白白过一天', author: '网页作者', publishedAt: '2026-08-24T14:39:00+08:00', timeLabel: '2026年8月24日 14:39',
+  timePrecision: 'minute', location: '内蒙古', capturedAt: '2026-11-10T03:15:00.000Z', timeSource: 'page_dom', ...overrides});
+const promotionHeader = () => previewHeader({title: '11.11首次立减！车载吸尘器、车载靠枕惊喜派送中…', account: '安吉星服务',
+  author: '网页署名', publishedAt: '2026-11-06T15:00:00+08:00', timeLabel: '2026年11月6日 15:00', location: '上海'});
 function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast = true, hazard = null, blankInput = false, resumedArticle = false, oneStep = false, missingMenu = false, staleHome = 0, badLinkCard = false, articleActivity = ARTICLE_ACTIVITY, proxyReads = 0, restoreAfterCopy = false, blankArticleReads = 0, resultPages = null, articlePage = null, onWait = null} = {}) {
   let inputValue = '', clipboard = previousLink, emptyReads = blankInput ? 1 : 0; const calls = [];
   const activity = () => proxyReads-- > 0 ? 'com.tencent.mm.plugin.webview.stub.WebViewStubProxyUI' : hazard ?? ({home: ACTIVITY.main, discover: ACTIVITY.main, landing: ARTICLE_LANDING,
@@ -216,7 +224,7 @@ test('T12 recovery clears a failed pending open before the next card, from eithe
   }
 });
 
-test('T12 real header with audio and AI metadata verifies on the normal card-opening path', async () => {
+test('T12 real header with audio and AI metadata verifies on the diagnostic card-opening path', async () => {
   const {flow} = fake({resultPages: [fixture('50-latest-loaded')], articlePage: fixture('t12-claude-header-012').rows});
   const result = await flow.search({keyword: '安吉星', sort: 'all'});
   assert.equal((await flow.openCard({card: result.cards[0]})).opened, true);
@@ -281,18 +289,114 @@ test('a late restored body position after copy is rechecked and sought before bo
   assert.equal(calls.filter(call => call[0] === 'type').length, 1);
 });
 
-test('supplemental reading requires the verified current article and a fresh copy, then keeps its restored position', async () => {
+test('supplemental reading requires a matched DOM header and a fresh copy, then keeps its restored position', async () => {
   await assert.rejects(fake({stage: 'article'}).flow.readArticle({bodyRequired: false}), {code: 'article_identity_unverified'});
   const {flow, calls} = fake({restoreAfterCopy: true});
   const result = await flow.search({keyword: '安吉星', sort: 'all'});
   await flow.openCard({card: result.cards[0]});
   await assert.rejects(flow.readArticle({bodyRequired: false}), {code: 'article_identity_unverified'});
   await flow.copyLink(); const before = calls.length;
-  const read = await flow.readArticle({bodyRequired: false});
+  await assert.rejects(flow.readArticle({bodyRequired: false}), {code: 'article_identity_unverified'}, 'mobile header proof alone cannot authorize DOM supplement mode');
+  const read = await flow.readArticle({bodyRequired: false, initialHeader: previewHeader()});
   assert.equal(read.hasMore, false); assert.equal(read.article.bodyStatus, 'delegated'); assert.equal(read.article.content, '');
   assert.equal(read.article.evidence.bodyEndObserved, true); assert.equal(read.comments.items.length, 2);
   assert.ok(calls.slice(before).filter(call => call[0] === 'swipe').every(call => call[4] < call[2]), 'no return to top');
   await assert.rejects(flow.readArticle(), {code: 'article_reader_mode_mismatch'});
   await flow.returnToResults(); await flow.openCard({card: result.cards[0]});
   await assert.rejects(flow.readArticle({bodyRequired: false}), {code: 'article_identity_unverified'}, 'copy proof cannot carry into another opening');
+});
+
+test('T12 DOM opening accepts real 090 with an unparseable phone date without seeking the header', async () => {
+  const phonePage = fixture('t12-claude-header-090').rows;
+  assert.equal(parseArticleHeader(phonePage).headerVerified, false);
+  const {flow, calls} = fake({resultPages: [fixture('t12-claude-results-008').rows], articlePage: phonePage, restoreAfterCopy: true});
+  const result = await flow.search({keyword: '安吉星', sort: 'all'});
+  const before = calls.length;
+  assert.deepEqual(await flow.openCard({card: result.cards[1], bodySource: 'page_dom'}), {opened: true, hasMore: false});
+  assert.equal(calls.slice(before).filter(call => call[0] === 'swipe').length, 0);
+  await flow.copyLink();
+  const supplement = await flow.readArticle({bodyRequired: false, initialHeader: promotionHeader()});
+  assert.equal(supplement.article.title, promotionHeader().title); assert.equal(supplement.article.account, '安吉星服务');
+  assert.equal(supplement.article.author, '网页署名'); assert.equal(supplement.article.publishedAt, '2026-11-06T15:00:00+08:00');
+  assert.equal(supplement.article.location, '上海'); assert.equal(supplement.article.source, 'page_dom');
+  assert.equal(supplement.article.content, ''); assert.equal(supplement.comments.items.length, 2);
+  assert.ok(calls.slice(before).filter(call => call[0] === 'swipe').every(call => call[2] === call[4] || call[4] < call[2]), 'only menu swipe and forward comment scrolling');
+  await assert.rejects(flow.readArticle({bodyRequired: true}), {code: 'article_reader_mode_mismatch'});
+});
+
+test('DOM opening needs the article menu, tolerates an image-only viewport, and refuses stale results or send screens', async () => {
+  const menu = row('•••', 973, 137, 62, 26);
+  const imageOnly = fake({articlePage: [menu]});
+  const card = (await imageOnly.flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
+  assert.equal((await imageOnly.flow.openCard({card, bodySource: 'page_dom'})).opened, true);
+  assert.equal(imageOnly.calls.filter(call => call[0] === 'swipe').length, 0);
+  for (const page of [[], fixture('21-article-first').filter(item => !/^[•·.⋯…]{2,}$/u.test(item.text)),
+    [...fixture('20-articles-loaded'), menu]]) {
+    const blocked = fake({articlePage: page});
+    const selected = (await blocked.flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
+    await assert.rejects(blocked.flow.openCard({card: selected, bodySource: 'page_dom'}), {code: 'article_unavailable'});
+    assert.equal(blocked.calls.filter(call => call[0] === 'swipe').length, 0);
+  }
+  const send = fake({articleActivity: ACTIVITY.sendConfirm});
+  const selected = (await send.flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
+  await assert.rejects(send.flow.openCard({card: selected, bodySource: 'page_dom'}), {code: 'unexpected_screen'});
+  assert.equal(send.calls.filter(call => call[0] === 'back').length, 1);
+});
+
+test('DOM patrol verifies its freshly copied canonical link without requiring a search card or mobile header', async () => {
+  const {flow, calls} = fake({articlePage: fixture('t12-claude-header-090').rows, restoreAfterCopy: true,
+    articleActivity: ARTICLE_LINK_ACTIVITY, copiedLink: `${shareUrl}?search_click_id=fixture#wechat_redirect`});
+  assert.deepEqual(await flow.openArticleLink({url: shareUrl, bodySource: 'page_dom'}), {opened: true, hasMore: false});
+  assert.equal(calls.filter(call => call[0] === 'swipe').length, 0);
+  await flow.copyLink();
+  const result = await flow.readArticle({bodyRequired: false, initialHeader: promotionHeader()});
+  assert.equal(result.comments.items.length, 2); assert.equal(result.article.url, shareUrl);
+});
+
+test('DOM supplemental header and copy proofs cannot be missing, changed, or reused across article openings', async () => {
+  const {flow, calls, setStage} = fake({restoreAfterCopy: true});
+  const result = await flow.search({keyword: '安吉星', sort: 'all'});
+  await flow.openCard({card: result.cards[0], bodySource: 'page_dom'});
+  await assert.rejects(flow.readArticle({bodyRequired: false, initialHeader: previewHeader()}), {code: 'article_identity_unverified'});
+  await flow.copyLink();
+  const badHeaders = [undefined, previewHeader({headerVerified: false}), previewHeader({source: 'screen_ocr'}),
+    previewHeader({url: 'https://mp.weixin.qq.com/s/anotherArticle12'}), previewHeader({title: '完全不同的文章'}),
+    previewHeader({account: '另一个公众号'}), previewHeader({title: ''})];
+  for (const initialHeader of badHeaders) await assert.rejects(flow.readArticle({bodyRequired: false, initialHeader}), {code: 'article_identity_unverified'});
+  const initialHeader = previewHeader();
+  assert.equal((await flow.readArticle({bodyRequired: false, initialHeader, budgetMs: 1000})).hasMore, true);
+  const beforeTamper = calls.length;
+  await assert.rejects(flow.readArticle({bodyRequired: false, initialHeader: {...initialHeader, author: '被改写的署名'}}), {code: 'article_identity_unverified'});
+  assert.equal(calls.length, beforeTamper);
+  assert.equal((await flow.readArticle({bodyRequired: false, initialHeader})).hasMore, false);
+  setStage('results'); await flow.recoverResults();
+  setStage('article');
+  await assert.rejects(flow.readArticle({bodyRequired: false, initialHeader}), {code: 'article_identity_unverified'}, 'recovering results invalidates the former copy and reader');
+  setStage('results'); await flow.openCard({card: result.cards[0], bodySource: 'page_dom'});
+  await assert.rejects(flow.readArticle({bodyRequired: false, initialHeader}), {code: 'article_identity_unverified'}, 'the next article must copy again');
+});
+
+test('real core and flow use DOM metadata plus phone comments despite the 090 phone header parse failure', async () => {
+  // Select one complete card from the real result frame; all original rows remain in the provenance fixture.
+  const resultRows = fixture('t12-claude-results-008').rows.filter(item => item.y < 520 || (item.y >= 900 && item.y < 1300));
+  const {flow, calls} = fake({resultPages: [resultRows], articlePage: fixture('t12-claude-header-090').rows, restoreAfterCopy: true});
+  const task = fixtureTask({platform: 'wechat_articles', keyword: '安吉星', filters: {sort: 'all', publishWindowHours: null},
+    comments: {enabled: true, limit: 20}, budgets: {maxLinks: 1}});
+  const clock = fixtureClock(); clock.wallOnly(Date.parse('2026-11-10T03:15:00Z') - clock.wallNow());
+  const permit = fixturePermit(task, clock), store = new RunnerStore(':memory:');
+  const page = {...promotionHeader(), content: '离线模拟网页提供的正文', bodyStatus: 'complete', contentType: 'article',
+    metrics: {}, bodyBlocks: [{type: 'text', text: '离线模拟网页提供的正文'}], images: []};
+  try {
+    const result = await runWechatArticleTask({task, clock, permit, store, bodySource: 'page_dom', postPauseMs: [0, 0],
+      device: {...flow, inspect: async () => ({deviceId: task.deviceId, readyForSearch: true})},
+      preview: {resolveArticle: async () => page}});
+    assert.equal(result.stats.posts, 1);
+    const events = store.nextBatch()?.events ?? []; assert.equal(events.length, 1);
+    assert.equal(events[0].article.source, 'page_dom'); assert.equal(events[0].article.content, page.content);
+    assert.equal(events[0].article.title, page.title); assert.equal(events[0].article.author, page.author);
+    assert.equal(events[0].article.publishedAt, page.publishedAt); assert.equal(events[0].article.location, '上海');
+    assert.equal(events[0].comments.items.length, 2); assert.equal(events[0].comments.source, 'screen_ocr');
+    assert.equal(events[0].article.metrics.read.source, 'screen_ocr');
+    assert.ok(calls.filter(call => call[0] === 'swipe').every(call => call[2] === call[4] || call[4] < call[2]), 'no upward header seeking');
+  } finally { store.close(); }
 });

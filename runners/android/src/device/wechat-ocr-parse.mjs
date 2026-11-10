@@ -1,4 +1,6 @@
 import {createHash} from 'node:crypto';
+import {comparable, similarity} from '../shared/wechat-text-match.mjs';
+export {comparable, similarity} from '../shared/wechat-text-match.mjs';
 
 // Pure readers of recognized text rows ({text, conf, x, y, w, h} in screenshot pixels) for WeChat 8.0.80 on the
 // calibrated 1080x2242 DE106 screen. Nothing here touches the phone.
@@ -15,29 +17,6 @@ const DURATION = /^\d{1,2}[:：]\d{2}(?:[:：]\d{2})?$/u;
 const FOLD = /[.。…·•]+$/u;
 const center = row => ({x: row.x + Math.round(row.w / 2), y: row.y + Math.round(row.h / 2)});
 const byPosition = (a, b) => a.y - b.y || a.x - b.x;
-
-/** Comparable form of recognized text: NFKC, no spaces, no fold marks, common OCR variant characters mapped. */
-export function comparable(value) {
-  return String(value ?? '').normalize('NFKC').replace(/[別]/gu, '别').replace(/[\s​]+/gu, '')
-    .replace(/[.。…·•｜|]+/gu, '').toLowerCase();
-}
-
-function bigrams(text) {
-  const set = new Map();
-  for (let i = 0; i < text.length - 1; i++) { const pair = text.slice(i, i + 2); set.set(pair, (set.get(pair) ?? 0) + 1); }
-  return set;
-}
-/** Dice similarity of two comparable strings (0..1); short strings must match exactly. */
-export function similarity(a, b) {
-  const left = comparable(a), right = comparable(b);
-  if (!left || !right) return 0;
-  if (left === right) return 1;
-  if (left.length < 3 || right.length < 3) return 0;
-  const one = bigrams(left), two = bigrams(right);
-  let shared = 0;
-  for (const [pair, count] of one) shared += Math.min(count, two.get(pair) ?? 0);
-  return (2 * shared) / (left.length - 1 + right.length - 1);
-}
 
 export function findText(rows, wanted, {region = null, exact = true} = {}) {
   const goal = comparable(wanted);

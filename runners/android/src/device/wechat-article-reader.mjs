@@ -85,11 +85,11 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
         }
         let rows = await readScreen(signal);
         const first = state.pages === 0;
-        const observed = parseArticleHeader(rows, {card});
+        const observed = bodyRequired ? parseArticleHeader(rows, {card}) : null;
         if (first) {
-          const fallback = initialHeader && observed.titleObserved && sameArticleTitle(observed.title, initialHeader.title) ? initialHeader : null;
+          const fallback = initialHeader && observed?.titleObserved && sameArticleTitle(observed.title, initialHeader.title) ? initialHeader : null;
           state.header = !bodyRequired ? initialHeader : observed.headerVerified ? observed : fallback ?? observed;
-          if (initialHeader && observed.timePrecision !== 'unknown' && observed.bodyTop) state.header = {...state.header, bodyTop: observed.bodyTop};
+          if (initialHeader && observed && observed.timePrecision !== 'unknown' && observed.bodyTop) state.header = {...state.header, bodyTop: observed.bodyTop};
         }
         // A large inertial jump must not silently create a 'complete' body. Reverse a short distance once and reread.
         if (bodyRequired && !first && !state.reachedEnd && !stableScreen(state.rows, rows)
@@ -103,7 +103,7 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
         const stable = !first && !state.justExpanded && stableScreen(state.rows, rows);
         state.justExpanded = false;
         state.stable = stable ? state.stable + 1 : 0;
-        const visibleHeader = observed.headerVerified && sameArticleTitle(observed.title, state.header?.title) ? observed : null;
+        const visibleHeader = observed?.headerVerified && sameArticleTitle(observed.title, state.header?.title) ? observed : null;
         const body = bodyRequired ? articleBodyRows(rows, {first: first || !!visibleHeader, header: visibleHeader ?? state.header, reachedEnd: state.reachedEnd}) : [];
         if (body.length && !stable) {
           const merged = bodyText.add(body);

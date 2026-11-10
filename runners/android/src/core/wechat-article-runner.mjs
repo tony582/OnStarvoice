@@ -6,6 +6,7 @@ import {recordDiagnostic} from './diagnostics.mjs';
 import {faultDetails} from './discovery-runner.mjs';
 import {cardPrefilter, POST_PAUSE_MS, DEFAULT_CLOCK as CLOCK, outcome, sleep, validateWechatIdentity} from './wechat-runner.mjs';
 import {articleEvent, articleWorkKey, canonicalArticleUrl, articleWindowState, mergeArticleCapture} from './wechat-article-evidence.mjs';
+import {cardMatchesHeader} from '../shared/wechat-article-identity.mjs';
 
 const METHODS = ['inspect', 'search', 'readCards', 'openCard', 'copyLink', 'readArticle', 'returnToResults', 'recoverResults', 'scroll'];
 const RECOVERABLE = new Set(['card_open_failed', 'share_sheet_unverified', 'link_not_copied', 'screen_unverified',
@@ -82,19 +83,31 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
         return {pageFailed: true};
       }
       const page = resolved?.page;
+      let initialHeader;
       if (bodySource === 'page_dom') {
         requireEvidence(!!page, 'article_page_incomplete');
         requireEvidence(canonicalArticleUrl(page.url) === canonicalArticleUrl(shareUrl), 'article_link_mismatch');
         requireEvidence(page.source === 'page_dom' && page.title?.trim() && page.account?.trim()
           && (page.content?.trim() || page.images?.length), 'article_page_incomplete');
+        if (card && !cardMatchesHeader(card, page)) {
+          // The preview gate has returned and no device action is in flight. This mismatch can safely
+          // return to results and skip one card; throwing inside that gate would leave closure uncertain.
+          throw Object.assign(new RunnerFault('article_identity_unverified', 'The webpage title or account did not match the selected result'), {deviceSettled: true});
+        }
         const window = patrol ? 'inside' : articleWindowState(page, clock.wallNow(), hours);
         if (window === 'outside') { stats.outsideWindow++; return; }
         if (window === 'unknown') { stats.timeUnverified++; return; }
+        // Only a checked DOM page may authorize supplemental phone reading. Do not forward arbitrary
+        // preview fields or use mobile OCR metadata; the adapter also binds this URL to its fresh copy.
+        initialHeader = Object.freeze({url: canonicalArticleUrl(shareUrl), source: 'page_dom', headerVerified: true,
+          title: page.title, account: page.account, author: page.author, publishedAt: page.publishedAt,
+          timeLabel: page.timeLabel, timePrecision: page.timePrecision, location: page.location,
+          capturedAt: page.capturedAt, timeSource: 'page_dom'});
       }
       let read, merged;
       for (let chunk = 0; chunk < 80; chunk++) {
         try {
-          read = await call('readArticle', {limit: commentLimit, maxPages: 8, bodyRequired: !page});
+          read = await call('readArticle', {limit: commentLimit, maxPages: 8, bodyRequired: !page, ...(initialHeader ? {initialHeader} : {})});
           merged = mergeArticleCapture(page, read, clock.wallNow());
         }
         catch (error) {
@@ -118,7 +131,7 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
       ledger.beforeCard();
       let opened;
       for (let chunk = 0; chunk < 80; chunk++) {
-        opened = await call('openArticleLink', {url});
+        opened = await call('openArticleLink', {url, bodySource});
         if (!opened?.hasMore) break;
       }
       requireEvidence(opened?.opened === true, 'article_header_unverified');
@@ -156,7 +169,7 @@ export async function runWechatArticleTask({task, store, device, permit, clock =
         try {
           let opened;
           for (let chunk = 0; chunk < 80; chunk++) {
-            opened = await call('openCard', {card});
+            opened = await call('openCard', {card, bodySource});
             if (!opened?.hasMore) break;
           }
           requireEvidence(opened?.opened === true, 'article_header_unverified');

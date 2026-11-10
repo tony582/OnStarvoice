@@ -6,6 +6,7 @@ import {comparable, findText} from './wechat-ocr-parse.mjs';
 import {ARTICLE_ACTIVITIES, ARTICLE_LANDING, ARTICLE_SEARCH, ARTICLE_LINK, articleSortTarget, articleBodyRows, footerEvidence, isArticleResults,
   parseArticleCards, parseArticleHeader, sameArticleTitle, cardMatchesHeader, resultsTop, findTab, hasArticleTabs} from './wechat-article-parse.mjs';
 import {createArticleReader} from './wechat-article-reader.mjs';
+import {verifiedPageHeader, waitForArticlePage} from './wechat-article-page.mjs';
 const fail = (code, message, details = {}) => new DeviceError(code, message, {deviceSettled: true, ...details});
 const HAZARDS = [ACTIVITY.chooseChat, ACTIVITY.chooseContact, ACTIVITY.sendConfirm, 'com.tencent.mm.ui.chatting.ChattingUI'];
 const latestOrder = cards => cards.map(card => card.age?.minHours).filter(Number.isFinite)
@@ -13,6 +14,11 @@ const latestOrder = cards => cards.map(card => card.age?.minHours).filter(Number
 
 export function createWechatArticleFlow({screen, view, rememberIme = () => {}, restoreIme = null, now = Date.now, wait = pause}) {
   let context = null, currentCard = null, reader = null, opening = null, currentHeader = null, copiedArticleUrl = null, readerBodyRequired = null;
+  let articleReady = false, articleBodySource = 'screen_ocr', readerHeaderKey = null;
+  const clearArticle = () => {
+    currentCard = null; reader = null; opening = null; currentHeader = null; copiedArticleUrl = null; readerBodyRequired = null;
+    articleReady = false; articleBodySource = 'screen_ocr'; readerHeaderKey = null;
+  };
   const assertPage = async (wanted, {signal} = {}) => {
     throwIfAborted(signal);
     let current;
@@ -139,7 +145,8 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
         if (actual && !cardMatchesHeader(actual, header)) {
           await screen.back({signal}); throw fail('article_identity_unverified', 'The visible article title or account did not match the result');
         }
-        currentCard = actual ?? {title: header.title, snippet: header.title, account: header.account, author: header.account}; currentHeader = header; return {opened: true, hasMore: false, title: header.title};
+        currentCard = actual ?? {title: header.title, snippet: header.title, account: header.account, author: header.account};
+        currentHeader = header; articleReady = true; return {opened: true, hasMore: false, title: header.title};
       }
       opening.headerCandidate = null;
       if (now() >= deadline - 3500) break;
@@ -187,10 +194,11 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
         sortVerified: sort === 'latest' && page.cards.length >= 3 ? 'ascending_ages' : 'control_tapped'};
     },
     async readCards({signal} = {}) { return (await results(signal)).cards; },
-    async openCard({card, signal, budgetMs = 30000}) {
+    async openCard({card, signal, budgetMs = 30000, bodySource = 'screen_ocr'}) {
       requireContext();
+      if (!['page_dom', 'screen_ocr'].includes(bodySource) || (opening && articleBodySource !== bodySource)) throw fail('article_reader_mode_mismatch', 'The article body source cannot change during opening');
       if (!opening) {
-        reader = null; currentCard = null; currentHeader = null; copiedArticleUrl = null; readerBodyRequired = null;
+        clearArticle(); articleBodySource = bodySource;
         const page = await results(signal, 2);
         const actual = page.cards.find(item => item.cardKey === card.cardKey || (sameArticleTitle(item.title, card.title ?? card.snippet)
           && comparable(item.author) === comparable(card.author)));
@@ -199,13 +207,18 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
         // The re-read card can differ by an OCR character from the one requested; key the opening by the request.
         opening = {card: actual, requestedKey: card.cardKey, swipes: 0, readings: 0};
       } else if ((opening.requestedKey ?? opening.card?.cardKey) !== card.cardKey) throw fail('article_identity_unverified', 'Another article header is still being located');
+      if (bodySource === 'page_dom') {
+        await waitForArticlePage({look, assertArticle: options => assertPage(ARTICLE_ACTIVITIES, options), wait, now, signal, budgetMs});
+        currentCard = card; opening = null; articleReady = true; return {opened: true, hasMore: false};
+      }
       return seekHeader(signal, budgetMs);
     },
-    async openArticleLink({url, signal, budgetMs = 30000}) {
+    async openArticleLink({url, signal, budgetMs = 30000, bodySource = 'screen_ocr'}) {
       const started = now();
+      if (!['page_dom', 'screen_ocr'].includes(bodySource) || (opening && articleBodySource !== bodySource)) throw fail('article_reader_mode_mismatch', 'The article body source cannot change during opening');
       if (!ARTICLE_LINK.test(url ?? '')) throw fail('article_link_invalid', 'Only a verified WeChat article short link can be opened');
       if (!opening) {
-        flow.reset(); await submitQuery(url, signal); context = {keyword: url, directLink: true};
+        flow.reset(); articleBodySource = bodySource; await submitQuery(url, signal); context = {keyword: url, directLink: true};
         let target;
         for (let attempt = 0; attempt < 5; attempt++) {
           await assertPage(ARTICLE_SEARCH, {signal}); const rows = await look({signal});
@@ -220,6 +233,11 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
         await tap(target, ARTICLE_SEARCH, signal); await waitFor(ARTICLE_ACTIVITIES, {signal, timeoutMs: 10000}); await wait(900, signal);
         opening = {card: null, url, swipes: 0, readings: 0};
       } else if (opening.url !== url) throw fail('article_identity_unverified', 'A different article link is still being opened');
+      if (bodySource === 'page_dom') {
+        await waitForArticlePage({look, assertArticle: options => assertPage(ARTICLE_ACTIVITIES, options), wait, now, signal,
+          budgetMs: Math.max(1000, budgetMs - (now() - started))});
+        opening = null; articleReady = true; return {opened: true, hasMore: false};
+      }
       return seekHeader(signal, Math.max(1000, budgetMs - (now() - started)));
     },
     async copyLink({signal} = {}) {
@@ -257,10 +275,13 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
     async readArticle(options = {}) {
       const started = now(); await assertPage(ARTICLE_ACTIVITIES, options);
       const bodyRequired = options.bodyRequired !== false;
-      if (!bodyRequired && (!currentHeader?.headerVerified || !currentCard || !copiedArticleUrl || opening)) {
-        throw fail('article_identity_unverified', 'Supplemental reading requires the verified article and a fresh copied link');
+      if ((reader && readerBodyRequired !== bodyRequired) || (bodyRequired && articleBodySource === 'page_dom')) throw fail('article_reader_mode_mismatch', 'The current article reader mode cannot change between chunks');
+      if (!bodyRequired) {
+        if (!articleReady || opening) throw fail('article_identity_unverified', 'No current article is ready for supplemental reading');
+        const header = verifiedPageHeader(options.initialHeader, copiedArticleUrl, currentCard), key = JSON.stringify(header);
+        if (reader && readerHeaderKey !== key) throw fail('article_identity_unverified', 'The preview header changed during supplemental reading');
+        if (!reader) { currentHeader = header; readerHeaderKey = key; }
       }
-      if (reader && readerBodyRequired !== bodyRequired) throw fail('article_reader_mode_mismatch', 'The current article reader mode cannot change between chunks');
       if (!reader) {
         // Link pages can restore their previous scroll position after the initial header has painted.
         // Reuse the bounded header seeker immediately before the first body screen, including after copying.
@@ -281,11 +302,11 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
     async returnToResults({signal} = {}) {
       requireContext(); await assertPage(ARTICLE_ACTIVITIES, {signal}); await screen.back({signal});
       await waitFor(ARTICLE_SEARCH, {signal}); await wait(650, signal); const page = await results(signal);
-      reader = null; currentCard = null; currentHeader = null; copiedArticleUrl = null; readerBodyRequired = null; return page.cards;
+      clearArticle(); return page.cards;
     },
     async recoverResults({signal} = {}) {
       // A failed open must not leave its half-finished state to block every later card.
-      requireContext(); opening = null; const page = await view.activity({signal});
+      requireContext(); clearArticle(); const page = await view.activity({signal});
       if (page.activity === ARTICLE_SEARCH) return (await results(signal)).cards;
       if (ARTICLE_ACTIVITIES.includes(page.activity)) return flow.returnToResults({signal});
       await assertPage([...ARTICLE_ACTIVITIES, ARTICLE_SEARCH], {signal});
@@ -306,7 +327,7 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
       if (!MAIN_TABS.every(label => findText(rows, label, {region: {y0: 2050, y1: 2242}}).length)) throw fail('home_unverified', 'WeChat home tabs were not confirmed');
       flow.reset(); return {parked: true};
     },
-    reset() { context = null; currentCard = null; reader = null; opening = null; currentHeader = null; copiedArticleUrl = null; readerBodyRequired = null; },
+    reset() { context = null; clearArticle(); },
   };
   return flow;
 }

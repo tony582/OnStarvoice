@@ -1,16 +1,11 @@
 import {createHash} from 'node:crypto';
 import {eventIdFor} from './discovery-evidence.mjs';
 import {requireEvidence} from './errors.mjs';
+import {canonicalArticleUrl} from '../shared/wechat-article-identity.mjs';
+export {canonicalArticleUrl} from '../shared/wechat-article-identity.mjs';
 
 const text = (value, limit) => typeof value === 'string' ? value.slice(0, limit).toWellFormed() : '';
 const imageLayer = value => ['visible', 'interactive'].includes(value) ? {layer: value} : {};
-export function canonicalArticleUrl(value) {
-  let url;
-  try { url = new URL(value); } catch { return ''; }
-  if (url.protocol !== 'https:' || url.hostname !== 'mp.weixin.qq.com' || url.username || url.password || url.port
-    || !/^\/s\/[A-Za-z0-9_-]{8,128}\/?$/u.test(url.pathname)) return '';
-  return `https://mp.weixin.qq.com${url.pathname.replace(/\/$/u, '')}`;
-}
 export function articleWorkKey(value) {
   const url = canonicalArticleUrl(value);
   requireEvidence(!!url, 'article_link_invalid');

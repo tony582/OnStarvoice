@@ -1,4 +1,5 @@
-import {cardKey, comparable, findWord, parseTimeLabel, similarity} from './wechat-ocr-parse.mjs';
+import {cardKey, comparable, findWord, parseTimeLabel} from './wechat-ocr-parse.mjs';
+export {sameArticleTitle, cardMatchesHeader} from '../shared/wechat-article-identity.mjs';
 
 export const ARTICLE_ACTIVITY = 'com.tencent.mm.plugin.brandservice.ui.timeline.preload.ui.TmplWebViewMMUI';
 export const ARTICLE_LINK_ACTIVITY = 'com.tencent.mm.plugin.webview.ui.tools.fts.MMSosWebViewUI';
@@ -166,19 +167,4 @@ export function articleBodyRows(rows, {first = false, header = null, reachedEnd 
     && !(first && row.y < (header?.bodyTop ?? 550) + 100 && /(?:听全文|A[I1l]摘要|A[I1l]总结)/u.test(row.text))
     && !/^(?:听全文|听|AI总结|AI摘要|原文|已复制到剪贴板)$/u.test(row.text.trim())
     && !/^(?:.*听全文.*AI.*|上一篇|下一篇|＜上一篇|<上一篇)/u.test(row.text.trim())).sort(position);
-}
-export function sameArticleTitle(left, right) { return similarity(left, right) >= 0.78; }
-// A result card can show only the tail of a long title (its first line sits under the sticky bar) and the
-// header byline can read "作者 公众号". Containment of at least 6 characters counts as the same text.
-const contains = (whole, part) => { const a = comparable(whole), b = comparable(part);
-  return [...b.replace(/[^\p{L}\p{N}]/gu, '')].length >= 6 && a.includes(b); };
-const nameParts = value => String(value ?? '').normalize('NFKC').trim().split(/\s+/u).map(comparable);
-const sameName = (left, right) => { const a = comparable(left), b = comparable(right);
-  // A visible byline can contain both the author and the account. Match complete name tokens, never a
-  // substring such as 安吉星 inside the distinct account 安吉星服务.
-  return !!a && !!b && (a === b || (Math.min(a.length, b.length) >= 2
-    && (nameParts(left).includes(b) || nameParts(right).includes(a)))); };
-export function cardMatchesHeader(card, header) {
-  const title = card?.title ?? card?.snippet;
-  return (sameArticleTitle(header?.title, title) || contains(header?.title, title)) && sameName(header?.account, card?.account ?? card?.author);
 }

@@ -5,6 +5,7 @@ import {runWechatArticleTask} from '../src/core/wechat-article-runner.mjs';
 import {articleWorkKey, canonicalArticleUrl, articleOutsideWindow, articleWindowState} from '../src/core/wechat-article-evidence.mjs';
 import {deliverPendingBatch} from '../src/cloud/delivery.mjs';
 import {BudgetLedger} from '../src/core/budget.mjs';
+import {readDiagnostics} from '../src/core/diagnostics.mjs';
 import {fixtureClock, fixturePermit, fixtureTask} from './core-fixtures.mjs';
 
 const url = 'https://mp.weixin.qq.com/s/bMWKCZnPrhVlz2uCqmRzKw';
@@ -14,9 +15,9 @@ const article = (overrides = {}) => ({title: '文章标题', content: '正文第
 const comment = {author: '读者', content: '正文后的留言', likeCount: null};
 const task = overrides => fixtureTask({platform: 'wechat_articles', filters: {sort: 'latest', publishWindowHours: 24},
   comments: {enabled: true, limit: 20}, ...overrides});
-function phone({reads = [{article: article(), comments: {status: 'captured', items: [comment]}, hasMore: false}], urls = [url]} = {}) {
+function phone({reads = [{article: article(), comments: {status: 'captured', items: [comment]}, hasMore: false}], urls = [url], cards: givenCards} = {}) {
   let opened = 0, chunk = 0;
-  const calls = [], cards = urls.map((_, i) => ({cardKey: `card-${i}`, snippet: '文章标题', author: '账号'}));
+  const calls = [], cards = givenCards ?? urls.map((_, i) => ({cardKey: `card-${i}`, snippet: '文章标题', author: '账号'}));
   const methods = {inspect: async () => ({deviceId: 'phone-1', readyForSearch: true}),
     search: async () => ({verified: true, cards}), readCards: async () => cards, scroll: async () => {},
     openCard: async ({card}) => { opened = cards.indexOf(card); chunk = 0; return {opened: true}; }, copyLink: async () => ({shareUrl: urls[opened]}),
@@ -30,7 +31,8 @@ async function run({t = task(), device, clock = fixtureClock(), permit = fixture
   const store = new RunnerStore(':memory:');
   const result = await runWechatArticleTask({task: t, store, device, clock, permit, bodySource: 'screen_ocr', postPauseMs: [0, 0], ...options});
   const events = store.nextBatch()?.events ?? [];
-  store.close(); return {result, events};
+  const diagnostics = readDiagnostics(store);
+  store.close(); return {result, events, diagnostics};
 }
 
 test('long articles read across bounded chunks, with one durable event and footer comments', async () => {
@@ -43,6 +45,8 @@ test('long articles read across bounded chunks, with one durable event and foote
   assert.equal(events[0].article.content, '正文第一段\n正文最后一段');
   assert.equal(events[0].comments.items[0].content, comment.content);
   assert.equal(events[0].article.metrics.like.value, null);
+  assert.equal(p.calls.find(call => call.name === 'openCard').params.bodySource, 'screen_ocr');
+  assert.ok(p.calls.filter(call => call.name === 'readArticle').every(call => call.params.bodyRequired && !Object.hasOwn(call.params, 'initialHeader')));
 });
 
 test('closed, absent and disabled comments all retain the full body and null unknown counts', async () => {
@@ -96,6 +100,72 @@ test('desktop prose and images combine with phone-only comments and independentl
   assert.equal(event.article.images[0].stored, false); assert.equal(event.article.evidence.originalImagesCaptured, false);
   assert.equal(event.article.images[0].layer, 'interactive'); assert.equal(event.article.bodyBlocks[1].layer, 'interactive');
   assert.equal(p.calls.find(call => call.name === 'readArticle').params.bodyRequired, false);
+  assert.equal(p.calls.find(call => call.name === 'openCard').params.bodySource, 'page_dom');
+});
+
+test('a truncated card title or one-character OCR error can be checked against the complete DOM header', async () => {
+  for (const [title, fullTitle] of [
+    ['务，统统一键解决！', '安吉星手机应用再次升级，修车保养、续费服务，统统一键解决！'],
+    ['17.11首次立减！安吉星续费优惠活动正式开启', '11.11首次立减！安吉星续费优惠活动正式开启'],
+  ]) {
+    const p = phone({cards: [{cardKey: 'truncated-card', title, author: '安吉星服务'}]});
+    const page = article({url, source: 'page_dom', title: fullTitle, account: '安吉星服务'});
+    const {result, events} = await run({device: p.device, bodySource: 'page_dom', preview: {resolveArticle: async () => page}});
+    assert.equal(result.stats.posts, 1); assert.equal(events[0].article.title, fullTitle);
+    assert.equal(p.calls.find(call => call.name === 'readArticle').params.initialHeader.title, fullTitle);
+  }
+});
+
+test('only the checked DOM header authorizes every supplemental chunk and owns final metadata', async () => {
+  const p = phone({reads: [
+    {article: article({title: '手机错标题', account: '手机错账号', author: '手机错作者', publishedAt: null, location: '手机错地区'}), hasMore: true},
+    {article: article({title: '另一个错标题', account: '另一个错账号', publishedAt: '2000-01-01', timePrecision: 'date'}),
+      comments: {status: 'captured', items: [comment]}, hasMore: false},
+  ]});
+  const page = article({url: `${url}?scene=21#page`, source: 'page_dom', author: '网页作者', location: '上海',
+    capturedAt: '2026-09-22T01:59:00.000Z', bodyTop: 9999, headerVerified: false, titleObserved: false,
+    arbitraryPageField: 'must not be forwarded to the phone'});
+  const {events} = await run({device: p.device, bodySource: 'page_dom', preview: {resolveArticle: async () => page}});
+  const reads = p.calls.filter(call => call.name === 'readArticle');
+  assert.equal(reads.length, 2);
+  const header = reads[0].params.initialHeader;
+  assert.ok(reads.every(call => call.params.bodyRequired === false && call.params.initialHeader === header));
+  assert.ok(Object.isFrozen(header));
+  assert.deepEqual(header, {url, source: 'page_dom', headerVerified: true, title: page.title, account: page.account,
+    author: page.author, publishedAt: page.publishedAt, timeLabel: page.timeLabel, timePrecision: page.timePrecision,
+    location: page.location, capturedAt: page.capturedAt, timeSource: 'page_dom'});
+  for (const key of ['title', 'account', 'author', 'publishedAt', 'timeLabel', 'timePrecision', 'location']) {
+    assert.equal(events[0].article[key], page[key]);
+  }
+  assert.equal(events[0].comments.items[0].content, comment.content);
+});
+
+test('a settled DOM title or account mismatch skips its card and safely continues with the next article', async () => {
+  const secondUrl = 'https://mp.weixin.qq.com/s/MatchingArticle123';
+  for (const mismatch of [{title: '完全无关的文章标题'}, {account: '账号服务'}]) {
+    const p = phone({urls: [url, secondUrl]});
+    const {events, result, diagnostics} = await run({device: p.device, bodySource: 'page_dom', preview: {
+      resolveArticle: async link => article({url: link, source: 'page_dom', ...(link === url ? mismatch : {})}),
+    }});
+    assert.equal(result.status, 'completed'); assert.equal(result.stats.posts, 1); assert.equal(result.stats.skippedCards, 1);
+    assert.equal(result.deviceIdle, true); assert.equal(result.deviceClosure.required, false);
+    assert.deepEqual(events.map(event => event.link.shareUrl), [secondUrl]);
+    assert.equal(p.calls.filter(call => call.name === 'recoverResults').length, 1);
+    const reads = p.calls.filter(call => call.name === 'readArticle');
+    assert.equal(reads.length, 1); assert.equal(reads[0].params.initialHeader.url, secondUrl);
+    assert.ok(diagnostics.some(note => note.event === 'wechat_article_skipped' && note.code === 'article_identity_unverified'));
+  }
+});
+
+test('missing or untrusted DOM header fields never authorize phone comment reading', async () => {
+  for (const fields of [{title: ''}, {account: ''}, {source: 'screen_ocr'}, {content: '', images: []}]) {
+    const p = phone();
+    const {events, result} = await run({device: p.device, bodySource: 'page_dom', preview: {
+      resolveArticle: async () => article({url, source: 'page_dom', headerVerified: true, ...fields}),
+    }});
+    assert.equal(result.reason, 'article_page_incomplete'); assert.equal(events.length, 0);
+    assert.equal(p.calls.some(call => call.name === 'readArticle'), false);
+  }
 });
 
 test('desktop access failures do not silently fall back to screen OCR or invent an article', async () => {
@@ -117,12 +187,15 @@ test('a different desktop canonical link is refused before phone comment collect
 });
 
 test('desktop publish time applies the same strict time window before phone supplements', async () => {
-  const p = phone();
-  const {events, result} = await run({device: p.device, bodySource: 'page_dom', preview: {
-    resolveArticle: async () => article({url, source: 'page_dom', publishedAt: '2026-09-20', timePrecision: 'date'}),
-  }});
-  assert.equal(result.stats.outsideWindow, 1); assert.equal(events.length, 0);
-  assert.equal(p.calls.some(call => call.name === 'readArticle'), false);
+  for (const [fields, counter] of [[{publishedAt: '2026-09-20', timePrecision: 'date'}, 'outsideWindow'],
+    [{publishedAt: null, timePrecision: 'unknown'}, 'timeUnverified']]) {
+    const p = phone();
+    const {events, result} = await run({device: p.device, bodySource: 'page_dom', preview: {
+      resolveArticle: async () => article({url, source: 'page_dom', ...fields}),
+    }});
+    assert.equal(result.stats[counter], 1); assert.equal(events.length, 0);
+    assert.equal(p.calls.some(call => call.name === 'readArticle'), false);
+  }
 });
 
 test('a stop during the desktop read prevents subsequent phone gestures and upload', async () => {
@@ -170,6 +243,45 @@ test('patrol opens the exact link without title search and verifies the copied c
   assert.equal(events[0].link.shareUrl, url); assert.equal(p.calls.filter(x => x.name === 'readArticle').length, 1);
   assert.equal(p.calls.some(x => x.name === 'search'), false);
   assert.equal(p.calls.find(x => x.name === 'openArticleLink').params.url, url);
+  assert.equal(p.calls.find(x => x.name === 'openArticleLink').params.bodySource, 'screen_ocr');
+});
+
+test('DOM patrol verifies target, copied and page URLs while accepting a current header different from its old title', async () => {
+  const p = phone({urls: [`${url}?scene=1#copy`]}), resolved = [];
+  const page = article({url: `${url}/?scene=2#page`, source: 'page_dom', title: '已更新的网页文章标题', account: '网页公众号'});
+  const {result, events} = await run({device: p.device, bodySource: 'page_dom',
+    t: task({mode: 'patrol', patrolTarget: {url: `${url}?old=1`, title: '历史旧标题', author: '历史公众号'}}),
+    preview: {resolveArticle: async link => { resolved.push(link); return page; }}});
+  assert.equal(result.reason, 'patrol_relocated'); assert.equal(events.length, 1);
+  assert.equal(events[0].article.title, page.title); assert.equal(events[0].article.account, page.account);
+  assert.deepEqual(resolved, [url]); assert.equal(events[0].link.shareUrl, url);
+  assert.equal(p.calls.find(call => call.name === 'openArticleLink').params.bodySource, 'page_dom');
+  assert.equal(p.calls.find(call => call.name === 'readArticle').params.initialHeader.url, url);
+  assert.equal(p.calls.find(call => call.name === 'readArticle').params.initialHeader.title, page.title);
+  assert.equal(p.calls.some(call => call.name === 'search'), false);
+});
+
+test('DOM patrol rejects either a different copied link or a different resolved page before sending a header to the phone', async () => {
+  const other = 'https://mp.weixin.qq.com/s/OtherArticle123';
+  for (const mismatch of ['copied', 'page']) {
+    const p = phone({urls: [mismatch === 'copied' ? other : url]}), resolved = [];
+    const {result, events} = await run({device: p.device, bodySource: 'page_dom',
+      t: task({mode: 'patrol', patrolTarget: {url, title: '文章标题'}}),
+      preview: {resolveArticle: async link => { resolved.push(link); return article({url: other, source: 'page_dom'}); }}});
+    assert.equal(result.reason, 'article_link_mismatch'); assert.equal(events.length, 0);
+    assert.equal(resolved.length, mismatch === 'copied' ? 0 : 1);
+    assert.equal(p.calls.some(call => call.name === 'readArticle'), false);
+  }
+});
+
+test('explicit screen OCR diagnostics never resolve a webpage or receive a DOM header', async () => {
+  const p = phone(); let previews = 0;
+  const {result, events} = await run({device: p.device, bodySource: 'screen_ocr',
+    preview: {resolveArticle: async () => { previews++; throw new Error('diagnostics must not use preview'); }}});
+  assert.equal(result.stats.posts, 1); assert.equal(previews, 0); assert.equal(events[0].article.source, 'screen_ocr');
+  assert.equal(p.calls.find(call => call.name === 'openCard').params.bodySource, 'screen_ocr');
+  const read = p.calls.find(call => call.name === 'readArticle').params;
+  assert.equal(read.bodyRequired, true); assert.equal(Object.hasOwn(read, 'initialHeader'), false);
 });
 
 test('patrol refuses a different copied link even when the title is similar', async () => {
