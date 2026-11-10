@@ -100,7 +100,9 @@ function publicationRow(row) {
   const match = row.text.match(DATE); if (!match) return null;
   const account = row.text.slice(0, match.index).trim().replace(/^原创\s*/u, '');
   if (account && !validAccount(account)) return null;
-  const trailing = row.text.slice(match.index + match[0].length).trim().replace(/\s*\d{0,3}\s*听全文$/u, '').trim();
+  const trailing = row.text.slice(match.index + match[0].length).trim()
+    .replace(/\s*\d{0,3}\s*听全文(?:\s*A[I1l](?:摘要|总结))?$/u, '')
+    .replace(/\s*A[I1l](?:摘要|总结)$/u, '').trim();
   const location = HEADER_LOCATIONS.find(value => trailing === value) ?? null;
   // Publication metadata is a complete small-font row, never a date embedded in a sentence. A date-only
   // row additionally needs an observed location; a minute timestamp may omit the location.

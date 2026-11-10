@@ -196,8 +196,9 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
           && comparable(item.author) === comparable(card.author)));
         if (!actual) throw fail('card_open_failed', 'The selected article is no longer visible');
         await tap(actual.tap, ARTICLE_SEARCH, signal); await waitFor(ARTICLE_ACTIVITIES, {signal}); await wait(1100, signal);
-        opening = {card: actual, swipes: 0, readings: 0};
-      } else if (opening.card.cardKey !== card.cardKey) throw fail('article_identity_unverified', 'Another article header is still being located');
+        // The re-read card can differ by an OCR character from the one requested; key the opening by the request.
+        opening = {card: actual, requestedKey: card.cardKey, swipes: 0, readings: 0};
+      } else if ((opening.requestedKey ?? opening.card?.cardKey) !== card.cardKey) throw fail('article_identity_unverified', 'Another article header is still being located');
       return seekHeader(signal, budgetMs);
     },
     async openArticleLink({url, signal, budgetMs = 30000}) {
@@ -283,7 +284,8 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
       reader = null; currentCard = null; currentHeader = null; copiedArticleUrl = null; readerBodyRequired = null; return page.cards;
     },
     async recoverResults({signal} = {}) {
-      requireContext(); const page = await view.activity({signal});
+      // A failed open must not leave its half-finished state to block every later card.
+      requireContext(); opening = null; const page = await view.activity({signal});
       if (page.activity === ARTICLE_SEARCH) return (await results(signal)).cards;
       if (ARTICLE_ACTIVITIES.includes(page.activity)) return flow.returnToResults({signal});
       await assertPage([...ARTICLE_ACTIVITIES, ARTICLE_SEARCH], {signal});

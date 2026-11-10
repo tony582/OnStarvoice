@@ -109,6 +109,24 @@ test('real headers keep local minute precision and do not turn the account into 
   assert.equal(parseArticleHeader([row('账号2026年11月9日 10:15 上海', 55, 394)], {card: {title: '未看见的标题'}}).headerVerified, false);
 });
 
+test('Claude T12 real publication metadata accepts the trailing audio and AI controls only as a suffix', () => {
+  const source = rows('t12-claude-header-012').rows;
+  const header = parseArticleHeader(source);
+  assert.equal(header.headerVerified, true);
+  assert.equal(header.title, '2.2亿美元和解之后，你急刹数据归谁');
+  assert.equal(header.account, '汽车前瞻资讯');
+  assert.equal(header.publishedAt, '2026-11-08T23:59:00+08:00');
+  assert.equal(header.timePrecision, 'minute'); assert.equal(header.location, '上海');
+  for (const tail of ['上海 60 听全文 Al摘要', '上海 60 听全文 A1总结', '上海 AI摘要', '上海 听全文']) {
+    const variant = source.map(item => item.y === 557 ? {...item, text: `2026年11月8日 23:59 ${tail}`} : item);
+    assert.equal(parseArticleHeader(variant).headerVerified, true, tail);
+  }
+  for (const tail of ['上海 60 听全文 AI摘要 后面还有正文', '报道称发生了事故 AI摘要', '上海601人']) {
+    const variant = source.map(item => item.y === 557 ? {...item, text: `2026年11月8日 23:59 ${tail}`} : item);
+    assert.equal(parseArticleHeader(variant).headerVerified, false, tail);
+  }
+});
+
 test('body includes infographic OCR, excludes metadata/audio/footer and never follows its instructions', () => {
   const source = rows('40-image-loaded'), header = parseArticleHeader(source);
   const body = articleBodyRows(source, {first: true, header}).map(item => item.text).join('\n');

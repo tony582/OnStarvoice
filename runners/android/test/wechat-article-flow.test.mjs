@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {createWechatArticleFlow} from '../src/device/wechat-article-flow.mjs';
-import {ARTICLE_ACTIVITY, ARTICLE_LINK_ACTIVITY, ARTICLE_LANDING, ARTICLE_SEARCH} from '../src/device/wechat-article-parse.mjs';
+import {ARTICLE_ACTIVITY, ARTICLE_LINK_ACTIVITY, ARTICLE_LANDING, ARTICLE_SEARCH, parseArticleCards} from '../src/device/wechat-article-parse.mjs';
 import {ACTIVITY} from '../src/device/wechat-profile.mjs';
 const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-articles/${name}.json`, import.meta.url)));
 const row = (text, x, y, w = 200, h = 45) => ({text, x, y, w, h});
@@ -55,7 +55,8 @@ function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast =
   const view = {activity: async () => ({package: 'com.tencent.mm', activity: activity()}),
     capture: async () => ({text: Promise.resolve({rows: rows()})})};
   return {flow: createWechatArticleFlow({screen, view, wait: async ms => { calls.push(['wait', ms]); await onWait?.(ms); }, now: () => 1}), calls,
-    setResultPages: pages => { resultPages = pages; }};
+    setResultPages: pages => { resultPages = pages; }, setStage: value => { stage = value; },
+    setArticlePage: rows => { articlePage = rows; resumedArticle = false; }};
 }
 
 test('search tolerates the real blank first paint and restores keyboard, then returns arrays after an article', async () => {
@@ -176,6 +177,49 @@ test('header seeking yields across bounded calls without reopening the result ca
   assert.equal(second.opened, true); assert.equal(second.hasMore, false);
   assert.equal(calls.filter(call => call[0] === 'tap' && call[2] > 520 && call[2] < 800).length, 2,
     'one landing-field tap and one result-card tap; no repeated article opening');
+});
+
+test('T12 opening continuation keeps the requested card key when a reread changes one OCR character', async () => {
+  const {flow, calls, setResultPages} = fake({resumedArticle: 10});
+  const result = await flow.search({keyword: '安吉星', sort: 'all'});
+  const card = result.cards[0];
+  // Deliberately alter one recognized character in memory; the original real fixture remains untouched.
+  const reread = fixture('20-articles-loaded').map(item => ({...item, text: item.text.replace('要不要续费', '要不要续貴')}));
+  assert.notEqual(parseArticleCards(reread)[0].cardKey, card.cardKey);
+  setResultPages([reread]);
+  const first = await flow.openCard({card});
+  assert.equal(first.opened, false); assert.equal(first.hasMore, true);
+  const beforeWrongCard = calls.length;
+  await assert.rejects(flow.openCard({card: result.cards[1]}), {code: 'article_identity_unverified'});
+  assert.equal(calls.length, beforeWrongCard, 'a genuinely different requested card still cannot reuse the pending open');
+  const second = await flow.openCard({card});
+  assert.equal(second.opened, true); assert.equal(second.hasMore, false);
+  assert.equal(calls.filter(call => call[0] === 'tap' && call[1] === parseArticleCards(reread)[0].tap.x
+    && call[2] === parseArticleCards(reread)[0].tap.y).length, 1, 'continuation never reopens the card');
+});
+
+test('T12 recovery clears a failed pending open before the next card, from either article or results', async () => {
+  for (const alreadyReturned of [false, true]) {
+    const failure = Object.assign(new Error('OCR capture failed during header seeking'), {code: 'ocr_unavailable'});
+    let failOnce = true, armed = false;
+    const {flow, calls, setArticlePage, setStage} = fake({resumedArticle: 10, resultPages: [t9('s1-renew/070')],
+      onWait: ms => { if (armed && ms === 600 && failOnce) { failOnce = false; throw failure; } }});
+    const result = await flow.search({keyword: '安吉星 续费', sort: 'all'});
+    armed = true;
+    await assert.rejects(flow.openCard({card: result.cards[0]}), {code: 'ocr_unavailable'});
+    if (alreadyReturned) setStage('results');
+    assert.equal((await flow.recoverResults()).length, 4);
+    setArticlePage(t9('s1-renew/072'));
+    const next = await flow.openCard({card: result.cards[2]});
+    assert.equal(next.opened, true); assert.equal(next.hasMore, false);
+    assert.equal(calls.filter(call => call[0] === 'back').length, alreadyReturned ? 0 : 1);
+  }
+});
+
+test('T12 real header with audio and AI metadata verifies on the normal card-opening path', async () => {
+  const {flow} = fake({resultPages: [fixture('50-latest-loaded')], articlePage: fixture('t12-claude-header-012').rows});
+  const result = await flow.search({keyword: '安吉星', sort: 'all'});
+  assert.equal((await flow.openCard({card: result.cards[0]})).opened, true);
 });
 
 test('One Step overlay blocks article and home verification despite unchanged WeChat activity', async () => {
