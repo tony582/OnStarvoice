@@ -488,3 +488,103 @@ swiftc -O "/absolute/runtime-0.5.1-<提交短号>/tools/ocr/StarVoiceOCR.swift" 
 输出必须放到该状态目录 `connection.json` 已配置的 `wechat.ocrHelper` 路径，不能只编到工作树里：当前约定的 OnStar 目录为 `/Users/dulaidila/Documents/claude/StarVoice-Android/state-829d89-onstar/bin/starvoice-ocr`，安吉星为 `/Users/dulaidila/Documents/claude/StarVoice-Android/state-829d89/bin/starvoice-ocr`；实际执行前核对配置，若不同以配置为准。只有后续获准升级的状态目录才替换，勿在本轮动安吉星 0.4.7。
 
 旧 helper 与新的预热请求协议兼容，但只有编译新 Swift 源码后才会提供 NSError domain/code；只替换 JavaScript 不会让旧 binary 多出这些字段。`--version` 只验证程序可启动，不代表 Vision 已预热。下一轮 Claude 真机验证应记录真实 `lastWarmupMs`、后台文章平台就绪、闲置 15 分钟后的真实 OCR 耗时，再按新的发布授权执行冒烟。
+
+## 2026-11-10 第二次生产发布与真机验收（0.5.1）
+
+服务端、后台和新 logo 已发布，安吉星手机已升级 0.5.1 并独立托管。用户在文章配图 1/2 验收后明确要求“不回退”，以原有视频号可用为本轮上线条件，随后取消抖音实测。视频号已实测上传成功；文章图片未全存和任务详情 404 作为遗留保留，不宣称文章全部验收条件通过。
+
+本节证据根目录为 `output/wechat-articles/deploy-second-20261110/`；时间均为北京时间，另标 UTC 的 JSON 时间除外。
+
+### 源码、预热调整和 CI
+
+- 发布源码：`5f90a18ecd9b9133ec51f26f8fcb85fa1b63a9cf`，分支 `codex/research-wechat-articles-20261109`。第 0 步单独提交：保活距上次成功识字 **210 秒**触发，新鲜期仍 **240 秒**；有效期内正在进行的保活不使 ready 闪成 `ocr_warming`。超出 30 秒余量仍会正常降级，失败仍报不可用。
+- 保活定向回归 **42/42**；本机 Android 全量 **557/557**，0 失败、0 跳过，12.287 秒；边界 **131 模块、最大 337 行**。证据：`keepalive-runner-full.log`、`keepalive-boundaries.log`。
+- 精确源码 CI [42780878899](https://github.com/tony582/OnStarvoice/actions/runs/42780878899) **5/5 jobs 成功**。主 Node 回归与生产 Node 兼容回归各 **3596/3596**；Android **557/557**。三个 PostgreSQL 矩阵各 **574 总项、572 通过、2 跳过、0 失败**；两个 Node 24.12.0 矩阵另有控制面集成 **1/1**，浮动 Node 24 未列入该集成结果。跳过项不可计为通过。证据：`ci-test-counts.json`、`release-5f90a18/ci-green.json`。
+- Claude 提供的前序真实 helper 验证：启动 2.4 秒、两次保活各 0.17 秒、闲置 10 分钟后的截图识字 0.645 秒；当时 Vision 已热，未复现 40–80 秒冷启动。这些是前序验证，本次真实启动数字另列如下。
+
+### 生产发布：已完成并核验
+
+- **16:20:24 北京时间**只读预检：仍为 `1ade51e` 回滚后的状态，锚定 `wechat-articles-d747336-20261110/rollback-applied` 的 **15:09:09** 记录；32 个服务路径全部符合 `dcb5d11` 基线（29 个原文件、3 个新路径不存在）。活动任务、待执行命令和手机占用工作项均 **0**。
+- 发布包仅有 **32 个 JS** 和 **60 个后台文件**，包含 logo 提交 `1303e0dda77cf21b1caf6f3fe94f0400cd32dcd7`；**迁移文件 0 个**。包大小 **1,257,930 bytes**，SHA-256 `506ab60a00d3105ac2eea35100f1a2fa14bd16d86665d7b9e2848152f6e183ed`。
+- 095 **没有再次执行、没有再次登记，也没有替换磁盘上的 SQL**。只核对登记恰好 **1 行**、9 个可空列、2 个已验证平台约束、1 个 valid/ready 的部分索引、2 个 Android 节点权限遗漏 **0**；保留 SQL SHA-256 `dd447e583fbe1805d65881753a7b4ef95928bf4dd740a6d4b29babd505713bc4`。
+- 数据库备份 **16:21:20–16:27:50**，大小 **2,126,984,358 bytes**，SHA-256 `a7d3cf5d1518dde76a307a6fe1c2fe29a4004b7fd832c52aaef8f6b0b97f4b0a`。自定义归档目录核验通过，未做恢复演练。
+- 32 个 JS 校验后替换，按 API → scheduler → ai-media 顺序重启；每次新进程连续 5 次稳定 online/ready 后继续。后台先放资源，最后替换 `index.html`。没有使用 `pm2 update`。
+
+| 服务 | 发布前 PID / 重启计数 | 发布后 PID / 重启计数 | 新进程 ready 核验时间（北京时间） |
+| --- | --- | --- | --- |
+| API | 1281936 / 24 | 1285536 / 25 | 16:28:12 |
+| scheduler | 1282035 / 3 | 1285719 / 4 | 16:28:20 |
+| ai-media | 1282132 / 4 | 1285813 / 5 | 16:28:29 |
+
+- **16:28:30**文件、三个进程、API health/ready 和后台入口哈希核验通过。随后 **6 轮、405.488 秒**观察，各轮运行检查通过，PID/重启次数稳定；**16:36:07**写入 `applied`。
+- 观察中的 **24 条“5xx 数字”候选行**均为普通 CommentWorkflow 记录 UUID，没有 Unhandled/服务异常签名。应用没有逐响应状态日志，因此不能写“所有请求 5xx=0”；请求级 5xx 数量未知。
+- 新 logo 已在真实后台页面显示，截图 `admin-logo-live.jpg`。服务端证据：`preflight-initial.json`、`applied-server-summary.txt`、`final-observation-result.txt`；远端目录 `/opt/onstarvoice-private/releases/wechat-articles-5f90a18-20261110/`。
+
+### 0.5.1 OnStar 文章冒烟：入库成功，图片验收未全过
+
+- runtime 为 `runtime-0.5.1-5f90a18`；按提交导出，并核对 **216 个 runtime 文件**。本次没有重新编译 Swift，继续使用协议兼容的旧 helper。
+- 在 OnStar 手机节点 **16:37:54** 的生产新心跳确认 `ready=true`，可接单平台同时包含 `wechat_channels` 和 `wechat_articles`，三项 features 为 `wechat_search_filters`、`wechat_forward`、`wechat_articles`。**16:38:14**完成就绪门禁留证，随后才创建冒烟任务。
+- 同一 OnStar 进程本地 `deviceProbe.ocr.lastWarmupMs` 实测 **426 ms**，预热成功。该耗时**来自本地状态，不是生产心跳字段**；当前心跳只保存平台就绪和前台摘要。证据 `mobile/onstar-ready-gate.json` 同时保存了两份来源。
+- 冒烟关键词「安吉星 续费」，上限 2，留言开启。父任务 `cd1796ce-e4e7-4df4-a3cf-44b1b16c9872`；执行任务 `5725be52-8701-41ae-bc17-3147b53fe7cd`；attempt `5438e0fb-4e58-4cf1-bb6b-bf4f042e388a`。执行 **16:41:41–16:43:12**，约 **91.560 秒**，以 `link_limit` 正常结束。
+- 生产 accepted 回执 **2**、关联记录 **2**、观察记录 **2**，不是只有手机本地结果。正文完整状态和发布时间均由网页提供；留言与阅读数来自手机识字。
+
+| 项目 | 文章一 | 文章二 |
+| --- | --- | --- |
+| 标题 | 5年后安吉星要不要续费 | 【安吉星续费2000块？别急着掏钱，先搞懂这4个问题！】 |
+| 记录 ID | `e054da16-dd8d-49b6-9b47-438a947a02d5` | `b2feec5c-366a-4a30-858f-dc485184cdf5` |
+| 链接末段 | `bMWKCZnPrhVlz2uCqmRzKw` | `AnSgmqGvukuQ9qTuUtAWcw` |
+| 正文 | **738 字符**，`page_dom / complete` | **1315 字符**，`page_dom / complete` |
+| 采集并展示的发布时间 | 2026-08-24 14:39，`page_dom / minute` | 2025-12-13 00:00，`page_dom / minute` |
+| 网页提取图片 / 已存图片 | **0 / 0**（没有提取到配图） | **2 / 1**，未全部保存 |
+| 留言 | **2 条**，`screen_ocr / captured`，标题数 2 | **0 条**，`screen_ocr / empty`，标题数 0 |
+| 阅读 | **1423**，`screen_ocr / exact` | **150**，`screen_ocr / exact` |
+| 其他手机可见数字 | 赞 8、分享 12 | 分享 5；赞未知 |
+
+- 文章一的两条留言已关联入库，后台显示“留言(2)”和具体内容；第二篇显示留言 0，仍有完整网页正文。正文/指标/留言截图或文本：`mobile/smoke-article-1-body.txt`、`mobile/smoke-article-comments.jpg`、`mobile/smoke-article-image-partial.jpg`。
+- 第二篇图片存储摘要明确为 `stored:1, expected:2`、`all_images_stored:false`。第 2 张已存，映射大小 **609,051 bytes**、尺寸 **912×968**；第 1 张 `stored:false`，无本地 URL，`storage_error` 空。**原因未知，不能将它解释为过大、网络超时或正常跳过，也不能把已提取的两个 URL 说成两张原图都保存了。** 后台同时显示“已发现配图已保存 1/2 张”。数据库证据 `mobile/smoke-media-comments.txt`。
+- **16:47:46**本地核验：OnStar PID 38687、0.5.1 runtime，`ready=true`、active=null、pendingEvents=0、quarantinedEvents=0、completionPending=false、deviceClosureRequired=false；当时最近一次保活 **157 ms**。这证明本次文章结果与完成回执已清空，不代表图片验收全部通过。
+
+### 现场与遗留问题
+
+1. **图片未完整保存**：第二篇 2 张仅 1 张保存，失败原因字段为空，待后续定位；保留了数据库明细、采集器诊断和截图。本轮不把文章模块写成所有条件都验收通过。
+2. **后台任务读取提示**：真实后台截图出现“操作暂未完成，请刷新核对后重试”。已只读核实 Nginx 在 16:41:57、16:46:24 对本次文章子任务 `/api/capture-cloud/android/runs/5725be52-8701-41ae-bc17-3147b53fe7cd` 返回 404。`views.js` 仍只查询 `douyin_mobile_discovery`，排除了文章和视频号任务；这是任务详情读取的既存兼容缺口，不是已完成采集的失败。裁剪后的请求证据与根因在 `mobile/run-view-404-evidence.txt`，未混同浏览器 listener 错误。
+3. 保留现场文件 `mobile/onstar-diagnose-after-smoke.json`、`mobile/onstar-screen-after-smoke.png`、`mobile/smoke-task-result-01.txt`、`mobile/smoke-media-comments.txt` 及以上任务 ID。没有因文章图片缺失回滚已通过检查的服务端。
+4. 用户后续明确“不回退”，之后又取消抖音测试。视频号已完成下述真机回归，抖音本轮未测试、未创建测试任务、未为测试修改配置。安吉星已交给 0.5.1 双击启动器托管，实际结果见后文。
+
+### 原有视频号回归和抖音范围
+
+- 视频号关键词「安吉星」真实采集 **1 条并完成入库**，父任务 `6c3625c0-f987-486e-8090-6b7c3a9d277b`，主执行方核验执行时间 **16:50:37–16:51:38，约 61 秒**。本地 `mobile/onstar-051-regression.log` 记录“【完成】视频号 · 安吉星 · 入库 1 条 · 已达帖子上限”；`mobile/video-idle-before-stop.json` 于 **16:52:23**核验 PID 49870，ready=true、active=null、pendingEvents=0、completionPending=false、deviceClosureRequired=false，之后日志确认已停止并释放手机。启动预热本地记录 **363 ms**。生产 accepted 回执 **1**、记录关联 **1**、新增观察 **1**；记录 `23f737f0-9d18-4b37-8963-d8cfc014ee5a` 是 11 月 6 日已有记录，本轮没有重复建帖。新观察 `d952222b-094c-4264-af15-26928cd481a7` 含 **21 条评论**；标题“安吉星、仁王盾双重守护车主的安全”，作者凯迪-大圣。执行子任务 `68352e38-60b1-4a98-bcf6-0217cfdbc02d`，attempt `07ad4d45-8bde-4b56-a6d4-8649f5a61638`，耗时 **60.968 秒**。手机 checkpoint 原状态 `completed_with_warnings`，上传清空后服务端 completed；不能将 21 条说成页面全部评论都采齐。证据 `mobile/video-regression-result.txt`。
+- 用户取消抖音真机测试，因此 **本轮无抖音测试结果**；未创建抖音任务，未为测试修改设备配置。不得写成“抖音已真机通过”。
+- 代码范围只核对 **`5b53fce..5f90a18` 的 T15 + 提前保活改动**：抖音专用 `device/douyin-*`、通用 `device/adapter.mjs`、原 `discovery-runner.mjs`、OperationGate 和 settle-device 合计 **13 个源码文件逐字节未改**；详见 `douyin-code-scope.json`。这不是 0.4.7 → 0.5.1 全部版本差异的结论。
+- 共用路径确有改动，不能说“所有抖音执行路径完全没变”：`task-runner` 给所有任务加了忙碌标记/收尾 finally，微信平台才执行预热；共用预算新增默认 0 的预热排除参数；runtime 保存本地平台/OCR 就绪字段；multi-device 增加微信就绪门禁但抖音仍按自身 probe；up 仅增加 OCR 中文提示，setup 上报 0.5.1，diagnostics 新增本地 OCR 明细。OCR pool/Swift 供两个微信平台使用。现有离线测试证明抖音不等待 OCR 且收尾完成前保持忙碌，不等于当日抖音真机验收。
+
+
+### 安吉星手机最终交接
+
+- **16:54:44**经 Finder 双击新版正式启动器，启动 PID **58018**；cwd 为 `/Users/dulaidila/Documents/claude/StarVoice-Android/runtime-0.5.1-5f90a18`。只读进程链为 `node(58018) → zsh(57700) → login(57696) → Terminal(1808) → launchd(1)`，未长期挂在工具会话。电脑使用工具不允许读取 Terminal 窗口，故托管证据来自进程链、本地采集器状态及生产心跳，不声称看到了终端内界面。
+- 该进程启动预热 **531 ms**；**17:04:45**再次核对同一 PID 持续存活、空闲 ready、pendingEvents=0、completionPending=false、deviceClosureRequired=false，最新保活 **175 ms**。quarantinedEvents=64，与发布前已存在的 64 一致，没有当作新上传事件或清理。
+- 生产新心跳确认 ready，平台包括 `douyin / wechat_channels / wechat_articles`；runnerFeatures 为 `wechat_search_filters / wechat_forward / wechat_articles`。详细证据在 `mobile/anjixing-051-final-status.json`、`mobile/anjixing-051-final-heartbeat.json`、`mobile/anjixing-process-chain.json`。
+- OnStar 测试进程均已正常停稳并释放锁。安吉星和 OnStar 两份 connection.json 与停机备份 SHA 完全一致（`mobile/configs-unchanged.json`），没有做过临时抖音配置修改。
+- 以后启动请双击 `/Users/dulaidila/Documents/claude/StarVoice-Android/runtime-0.5.1-5f90a18/launcher/StarVoice 手机采集.command`。旧版目录保留但没有回退运行。
+- **17:06:10**服务端最终只读复核：32 JS 哈希仍全部正确，三个服务仍是发布后的 PID 与重启次数，health/ready 均正常，rollback marker 不存在。`server-final-readonly.json` 为证据；首次检查脚本因未加 PM2 服务名前缀发生本地 KeyError，修正只读断言后通过，没有重启或修改线上服务。
+
+### 用户追加：安吉星每天 20:30 视频号计划
+
+- 用户明确确认每天 **20:30**、**最新一天内**。已在安吉星通过后台创建并启用正式每日计划，非测试任务。保存时间 **16:59:56**，首次运行 **2026-11-10 20:30:00 +08:00**，随机延迟 **0**，run_count=0（本轮没有提前运行）。
+- 计划 ID `8232e042-db6f-4c53-ae64-3b4b1acaa2d8`；模板 `e3a834c1-faaa-45b8-9631-1fe2ec8e5289`；唯一节点为安吉星手机 `24899b1a-1b95-4ae0-819f-0b7b9b4cba60`。
+- 复制原手机抖音计划的全部 **13 个关键词**：凯迪拉克OTA、别克OTA、凯迪拉克车机升级、别克车机升级、上汽通用客服、安吉星、别克APP、别克远控、ibuick、别克哨兵、至境哨兵、别克壁纸、凯迪拉克壁纸。逐词顺序已比对一致。
+- `sort=latest / publishTime=day`，视频号实际按最新排序并读取卡片时间、超过 24 小时结束该词；每词最多 **50 条**，详情开启，AI 精准筛选开启，附加评论每帖最多 **50 条**，时长和搜索范围不限。微信走直接上传，因此 autoSyncAfterDetailCapture=false 为平台正常设置，未误称与抖音所有字段相同。
+- 为给 22:00 原抖音轮留出时间，每词搜索上限已保存并验证为 **5 分钟**。13×5=65 分钟是搜索预算，不是实际总耗时承诺；每词上限 50 也不代表保证采足 50 条或采齐平台全部内容。
+- 已逐字段确认原抖音 **22:00（今晚实际下次 22:02）**和 **02:00（明晨实际下次 02:02）**两个计划完全未改，仍 active；`mobile/final-plans-verified.json`、`mobile/anjixing-video-plan-enabled.jpg` 留证。
+
+### 新计划时限保存缺口：单计划配置修正
+
+创建后的只读核查发现 UI 的 5 分钟没有保存：`normalizeOrchestrationRequest` 保留该值，但随后 `normalizeRemoteTaskInput` 的计划白名单丢弃 `mobileKeywordMaxMinutes`，创建和编辑 API 都经过此路径。缺字段实际为 15 分钟。此问题属于已有计划保存逻辑，本轮没有临时改线上代码或扩大 32 JS 发布包。
+
+为完成用户已授权的新计划配置，先备份该计划和模板 JSON，再以 `lock_timeout=3s / statement_timeout=15s`、固定租户/计划/模板/节点/版本/未来首次运行时间/零运行次数的条件做事务演练；仅 2 行更新，结果回滚。**17:09:35**正式执行相同脚本并提交：只在该计划和模板的 planSnapshot 增加 `mobileKeywordMaxMinutes=5`，同步 schedule/template 版本至 2。原创建幂等哈希保留；未改变关键词、筛选、时刻、节点或任何抖音计划，未创建运行任务。
+
+提交后再次读取数据库，并调用发布版本的真实 `mobileTaskBudgets` / `mobileTaskFilters` 函数核对：每词 **300000 ms**，单词子任务 batch **600000 ms**，maxLinks **50**，sort **latest**、publishWindowHours **24**。搜索时间预算合计 65 分钟不包括启动、收尾或异常等待，不能当作整轮硬截止，也不能提前保证今晚实际执行完成；原有抖音计划未停用、未挪动。
+
+证据：`mobile/queries/fix-new-video-plan-budget.sql`、`mobile/new-plan-budget-rehearsal.txt`、`mobile/new-plan-budget-applied.txt`、`mobile/final-plans-after-budget.json`、`mobile/final-plan-budget-verified.json`、`mobile/effective-video-budgets.json`。**后续若从后台再次编辑保存这条计划，该字段仍可能被旧归一化逻辑丢弃；应先修复该逻辑再编辑，当前修正没有宣称修好了通用产品缺陷。**
+
+本轮没有回滚服务端、后台或手机；正式版本为 **0.5.1 / 5f90a18**。报告收尾为纯文档提交，消息带 `[skip ci]`，不把文档提交描述为再次部署。
