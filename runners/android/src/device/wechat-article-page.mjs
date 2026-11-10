@@ -4,9 +4,10 @@ import {canonicalArticleUrl, cardMatchesHeader} from '../shared/wechat-article-i
 
 const fail = (code, message) => new DeviceError(code, message, {deviceSettled: true});
 /** DOM collection only needs a loaded article surface; publication metadata is verified by the preview. */
-export async function waitForArticlePage({look, assertArticle, wait, now, signal, budgetMs = 7000}) {
-  const deadline = now() + Math.max(1000, Math.min(7000, budgetMs));
-  for (let attempt = 0; attempt < 5; attempt++) {
+export async function waitForArticlePage({look, assertArticle, wait, now, signal, budgetMs = 14000, revealToolbar = null}) {
+  const deadline = now() + Math.max(1000, Math.min(14000, budgetMs));
+  let revealed = false, contentReads = 0;
+  for (let attempt = 0; attempt < 9; attempt++) {
     await assertArticle({signal});
     const rows = await look({signal});
     const menu = rows.some(row => row.y >= 90 && row.y < 210 && row.x > 900 && /^[•·.⋯…]{2,}$/u.test(row.text.trim()));
@@ -14,7 +15,18 @@ export async function waitForArticlePage({look, assertArticle, wait, now, signal
       && rows.some(row => row.y >= 90 && row.y < 230 && row.x > 700 && /^(?:搜索|取消)$/u.test(row.text.trim()));
     // A restored image-only page may have no OCR body text. Its copied URL and DOM still need verification.
     if (menu && !results) return;
-    if (attempt === 4 || now() >= deadline - 650) break;
+    // The toolbar can be hidden or its gray ••• missed by OCR. After repeated reads with article content
+    // and no search UI, accept the page; the
+    // share menu that copyLink opens is still verified by its own labels.
+    const content = !results && rows.filter(row => row.y >= 260 && row.y + row.h < 1900 && row.text.trim().length >= 2).length >= 2;
+    contentReads = content ? contentReads + 1 : 0;
+    if (contentReads >= 2 && attempt >= 3) return;
+    if (attempt === 8 || now() >= deadline - 650) break;
+    // A previously read article reopens at its old scroll position with the title bar (and its •••) hidden.
+    // One short downward drag shows the bar again without leaving the article.
+    if (!menu && !results && attempt >= 1 && !revealed && revealToolbar && now() < deadline - 1250) {
+      await assertArticle({signal}); await revealToolbar(signal); revealed = true;
+    }
     await wait(650, signal);
   }
   throw fail('article_unavailable', 'A loaded article page and its menu were not confirmed');

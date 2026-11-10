@@ -208,7 +208,8 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
         opening = {card: actual, requestedKey: card.cardKey, swipes: 0, readings: 0};
       } else if ((opening.requestedKey ?? opening.card?.cardKey) !== card.cardKey) throw fail('article_identity_unverified', 'Another article header is still being located');
       if (bodySource === 'page_dom') {
-        await waitForArticlePage({look, assertArticle: options => assertPage(ARTICLE_ACTIVITIES, options), wait, now, signal, budgetMs});
+        await waitForArticlePage({look, assertArticle: options => assertPage(ARTICLE_ACTIVITIES, options), wait, now, signal,
+          revealToolbar: sig => screen.swipe(540, 900, 540, 1250, 600, {signal: sig}), budgetMs});
         currentCard = card; opening = null; articleReady = true; return {opened: true, hasMore: false};
       }
       return seekHeader(signal, budgetMs);
@@ -235,6 +236,7 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
       } else if (opening.url !== url) throw fail('article_identity_unverified', 'A different article link is still being opened');
       if (bodySource === 'page_dom') {
         await waitForArticlePage({look, assertArticle: options => assertPage(ARTICLE_ACTIVITIES, options), wait, now, signal,
+          revealToolbar: sig => screen.swipe(540, 900, 540, 1250, 600, {signal: sig}),
           budgetMs: Math.max(1000, budgetMs - (now() - started))});
         opening = null; articleReady = true; return {opened: true, hasMore: false};
       }
@@ -253,7 +255,7 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
       }
       // This icon can disappear from OCR. Only a previously verified article on the calibrated profile may
       // use its measured menu location; the opened menu and every subsequent action still require labels.
-      if (!more && (!currentHeader?.headerVerified || !currentCard)) throw fail('share_sheet_unverified', 'The article menu button was not found');
+      if (!more && !articleReady && (!currentHeader?.headerVerified || !currentCard)) throw fail('share_sheet_unverified', 'The article menu button was not found');
       await tap(more ? {x: more.x + more.w / 2, y: more.y + more.h / 2} : {x: 1000, y: 148}, ARTICLE_ACTIVITIES, signal); await wait(750, signal);
       rows = await look({signal});
       if (!findText(rows, '转发给朋友', {region: {y0: 1500, y1: 1800}}).length || !findText(rows, '取消', {region: {y0: 2080, y1: 2240}}).length) {

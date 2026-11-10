@@ -64,7 +64,9 @@ export function isArticleResults(rows, keyword, {controlledInput = false, scroll
   if (!keywordSeen || !tabs) return false;
   if (articleSortTarget(rows, 'all')) return true;
   // Scrolling an already verified search hides the sort row; the sticky keyword box and tab bar stay.
-  return scrolledOk && !!findTab(rows.map(row => ({...row, text: row.text.replace(/[｜|]/gu, ' ')})), 'AI搜索');
+  // The tab bar itself can be scrolled sideways (AI搜索 off-screen), so require two other known tab labels.
+  const others = ['AI搜索', '全部', '视频', '我的互动', '账号', '评论', '商品'].filter(label => findTab(rows, label));
+  return scrolledOk && others.length >= 2;
 }
 /** First y of result cards: below the sort row when it is visible, else right below the sticky tab bar. */
 export function resultsTop(rows) { return articleSortTarget(rows, 'all') ? 520 : 360; }

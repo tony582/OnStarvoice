@@ -7,6 +7,30 @@ import {mergeArticleComments, parseArticleComments} from '../src/device/wechat-a
 const rows = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-articles/${name}.json`, import.meta.url)));
 const row = (text, x, y, w = 500, h = 45) => ({text, x, y, w, h, conf: 1});
 const t9 = name => rows('t9-claude-phone-20261109')[name].rows;
+const t13 = name => rows('t13-claude-phone-20261110')[name].rows;
+
+test('T13 real shifted tabs need the keyword, article tab and two distinct known neighbours', () => {
+  const source = t13('t12-renew-b/049');
+  assert.equal(findTab(source, 'AI搜索'), null);
+  assert.equal(isArticleResults(source, '安吉星 续费', {scrolledOk: true}), true);
+  assert.equal(isArticleResults(source, '安吉星 续费'), false);
+  assert.equal(isArticleResults(source, '不同关键词', {scrolledOk: true}), false);
+  const controls = source.filter(item => item.y < 240);
+  const article = row('文章', 480, 287, 90);
+  assert.equal(isArticleResults([...controls, article, row('视频', 640, 287, 90)], '安吉星 续费', {scrolledOk: true}), false);
+  assert.equal(isArticleResults([...controls, article, row('视频 视频', 640, 287, 180)], '安吉星 续费', {scrolledOk: true}), false);
+  assert.equal(isArticleResults([...controls, article, row('视频 评论', 640, 287, 240)], '安吉星 续费', {scrolledOk: true}), true);
+  assert.equal(isArticleResults([...controls, row('视频 评论', 640, 287, 240)], '安吉星 续费', {scrolledOk: true}), false);
+});
+
+test('T13 followers-only empty prompt is zero while genuine comments and missing entries remain distinct', () => {
+  const parsed = parseArticleComments(t13('t12-week/128'));
+  assert.equal(parsed.empty, true); assert.equal(parsed.headerCount, 0); assert.equal(parsed.postingState, 'followers_only');
+  const quote = [row('留言', 55, 700, 90), row('作者已设置关注后可以留言', 75, 850), row('读者 上海 11月9日', 163, 1000), row('还没有留言', 446, 1100, 190)];
+  const comment = parseArticleComments(quote);
+  assert.equal(comment.empty, false); assert.equal(comment.headerCount, null); assert.equal(comment.comments[0].content, '还没有留言');
+  assert.equal(parseArticleComments([row('还没有留言', 446, 1100, 190)], {reachedEnd: true}).empty, false);
+});
 
 test('Claude phone results match a clipped title and a complete account token in the article byline', () => {
   const cards = parseArticleCards(t9('s1-renew/070'));

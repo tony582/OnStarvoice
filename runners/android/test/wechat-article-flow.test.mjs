@@ -11,12 +11,13 @@ const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-artic
 const row = (text, x, y, w = 200, h = 45) => ({text, x, y, w, h});
 const shareUrl = 'https://mp.weixin.qq.com/s/bMWKCZnPrhVlz2uCqmRzKw';
 const t9 = name => fixture('t9-claude-phone-20261109')[name].rows;
+const t13 = name => fixture('t13-claude-phone-20261110')[name].rows;
 const previewHeader = (overrides = {}) => ({url: shareUrl, source: 'page_dom', headerVerified: true, title: '5年后安吉星要不要续费',
   account: '白白过一天', author: '网页作者', publishedAt: '2026-08-24T14:39:00+08:00', timeLabel: '2026年8月24日 14:39',
   timePrecision: 'minute', location: '内蒙古', capturedAt: '2026-11-10T03:15:00.000Z', timeSource: 'page_dom', ...overrides});
 const promotionHeader = () => previewHeader({title: '11.11首次立减！车载吸尘器、车载靠枕惊喜派送中…', account: '安吉星服务',
   author: '网页署名', publishedAt: '2026-11-06T15:00:00+08:00', timeLabel: '2026年11月6日 15:00', location: '上海'});
-function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast = true, hazard = null, blankInput = false, resumedArticle = false, oneStep = false, missingMenu = false, staleHome = 0, badLinkCard = false, articleActivity = ARTICLE_ACTIVITY, proxyReads = 0, restoreAfterCopy = false, blankArticleReads = 0, resultPages = null, articlePage = null, onWait = null} = {}) {
+function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast = true, hazard = null, blankInput = false, resumedArticle = false, oneStep = false, missingMenu = false, staleHome = 0, badLinkCard = false, articleActivity = ARTICLE_ACTIVITY, proxyReads = 0, restoreAfterCopy = false, blankArticleReads = 0, resultPages = null, articlePage = null, articlePages = null, menuPage = null, onWait = null} = {}) {
   let inputValue = '', clipboard = previousLink, emptyReads = blankInput ? 1 : 0; const calls = [];
   const activity = () => proxyReads-- > 0 ? 'com.tencent.mm.plugin.webview.stub.WebViewStubProxyUI' : hazard ?? ({home: ACTIVITY.main, discover: ACTIVITY.main, landing: ARTICLE_LANDING,
     input: ARTICLE_SEARCH, results: ARTICLE_SEARCH, article: articleActivity, menu: articleActivity, copy: articleActivity,
@@ -33,13 +34,14 @@ function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast =
       return inputValue.startsWith('https://') ? fixture('link-open-results').map(row =>
         badLinkCard && row.y === 538 ? {...row, text: 'mp.weixin.qq.com.evil.test/s/token'} : row) : fixture('20-articles-loaded');
     }
-    if (stage === 'menu') return fixture('30-menu-confirmed');
+    if (stage === 'menu') return menuPage ?? fixture('30-menu-confirmed');
     if (stage === 'copy') return fixture('32-copy-link');
     if (stage === 'copied' && restoreAfterCopy) return [...fixture('37-comments-end'), ...fixture('33-link-copied')];
     if (stage === 'copied' && toast) return fixture('33-link-copied');
     if (stage === 'article' && blankArticleReads-- > 0) return fixture('21-article-first').filter(row => row.y < 600 || row.y > 2100);
     if (stage === 'article' && resumedArticle) return fixture('37-comments-end');
-    return (articlePage ?? fixture('21-article-first')).filter(row => !missingMenu || !/^[•·.⋯…]{2,}$/u.test(row.text));
+    const articleRows = articlePages?.length ? (articlePages.length > 1 ? articlePages.shift() : articlePages[0]) : articlePage ?? fixture('21-article-first');
+    return articleRows.filter(row => !missingMenu || !/^[•·.⋯…]{2,}$/u.test(row.text));
   };
   const screen = {
     launch: async () => { stage = 'home'; }, defaultIme: async () => 'owner.keyboard/.IME',
@@ -64,7 +66,7 @@ function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast =
     capture: async () => ({text: Promise.resolve({rows: rows()})})};
   return {flow: createWechatArticleFlow({screen, view, wait: async ms => { calls.push(['wait', ms]); await onWait?.(ms); }, now: () => 1}), calls,
     setResultPages: pages => { resultPages = pages; }, setStage: value => { stage = value; },
-    setArticlePage: rows => { articlePage = rows; resumedArticle = false; }};
+    setArticlePage: rows => { articlePage = rows; resumedArticle = false; }, setArticlePages: pages => { articlePages = pages; }};
 }
 
 test('search tolerates the real blank first paint and restores keyboard, then returns arrays after an article', async () => {
@@ -330,17 +332,64 @@ test('DOM opening needs the article menu, tolerates an image-only viewport, and 
   const card = (await imageOnly.flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
   assert.equal((await imageOnly.flow.openCard({card, bodySource: 'page_dom'})).opened, true);
   assert.equal(imageOnly.calls.filter(call => call[0] === 'swipe').length, 0);
-  for (const page of [[], fixture('21-article-first').filter(item => !/^[•·.⋯…]{2,}$/u.test(item.text)),
-    [...fixture('20-articles-loaded'), menu]]) {
+  for (const page of [[], [...fixture('20-articles-loaded'), menu]]) {
     const blocked = fake({articlePage: page});
     const selected = (await blocked.flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
     await assert.rejects(blocked.flow.openCard({card: selected, bodySource: 'page_dom'}), {code: 'article_unavailable'});
-    assert.equal(blocked.calls.filter(call => call[0] === 'swipe').length, 0);
+    const reveal = blocked.calls.filter(call => call[0] === 'swipe');
+    assert.ok(reveal.length <= 1);
+    if (reveal.length) assert.deepEqual(reveal[0], ['swipe', 540, 900, 540, 1250, 600]);
   }
   const send = fake({articleActivity: ACTIVITY.sendConfirm});
   const selected = (await send.flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
   await assert.rejects(send.flow.openCard({card: selected, bodySource: 'page_dom'}), {code: 'unexpected_screen'});
   assert.equal(send.calls.filter(call => call[0] === 'back').length, 1);
+});
+
+test('T13 hidden article toolbar is revealed once, with real content fallback and verified copy menu', async () => {
+  for (const pages of [[...['035', '036', '037', '038'].map(frame => t13(`t12-week-b/${frame}`))],
+    [t13('t12-week-c/049'), t13('t12-week-c/056')]]) {
+    const {flow, calls, setArticlePages} = fake({articlePages: pages});
+    const card = (await flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
+    assert.equal((await flow.openCard({card, bodySource: 'page_dom'})).opened, true);
+    assert.deepEqual(calls.filter(call => call[0] === 'swipe'), [['swipe', 540, 900, 540, 1250, 600]]);
+    setArticlePages(['033', '034', '035'].map(frame => t13(`t12-week-c/${frame}`)));
+    assert.equal((await flow.copyLink()).shareUrl, shareUrl);
+    assert.ok(calls.some(call => call[0] === 'tap' && call[1] === 1000 && call[2] === 148));
+    assert.equal(calls.filter(call => call[0] === 'swipe' && call[2] !== call[4]).length, 1);
+  }
+});
+
+test('T13 image-only hidden toolbar gets one reveal; absent menu evidence and changed activity still stop safely', async () => {
+  const menu = row('•••', 973, 137, 62, 26);
+  const picture = fake({articlePages: [[], [], [menu]]});
+  const selected = (await picture.flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
+  assert.equal((await picture.flow.openCard({card: selected, bodySource: 'page_dom'})).opened, true);
+  assert.deepEqual(picture.calls.filter(call => call[0] === 'swipe'), [['swipe', 540, 900, 540, 1250, 600]]);
+  const badMenu = fake({articlePage: t13('t12-week-b/035'), menuPage: []});
+  const card = (await badMenu.flow.search({keyword: '安吉星', sort: 'all'})).cards[0];
+  await badMenu.flow.openCard({card, bodySource: 'page_dom'});
+  const beforeCopy = badMenu.calls.length;
+  await assert.rejects(badMenu.flow.copyLink(), {code: 'share_sheet_unverified'});
+  assert.deepEqual(badMenu.calls.slice(beforeCopy).filter(call => ['tap', 'swipe', 'back'].includes(call[0])), [['tap', 1000, 148], ['back']]);
+  let armed = false;
+  const moved = fake({articlePage: t13('t12-week-b/035'), onWait: ms => { if (armed && ms === 650) moved.setStage('results'); }});
+  const chosen = (await moved.flow.search({keyword: '安吉星', sort: 'all'})).cards[0]; armed = true;
+  await assert.rejects(moved.flow.openCard({card: chosen, bodySource: 'page_dom'}), {code: 'screen_unverified'});
+  assert.equal(moved.calls.filter(call => call[0] === 'swipe').length, 0);
+  await assert.rejects(fake({stage: 'article', articlePage: t13('t12-week-b/035')}).flow.copyLink(), {code: 'share_sheet_unverified'},
+    'the fixed menu point is not available before the article page is verified');
+});
+
+test('T13 shifted search tabs retain access only for a successfully verified search', async () => {
+  const {flow, setResultPages} = fake({resultPages: [t9('s1-renew/070')]});
+  await flow.search({keyword: '安吉星 续费', sort: 'all'});
+  setResultPages([t13('t12-renew-b/049')]);
+  assert.equal((await flow.readCards()).length, 4);
+  assert.deepEqual(await flow.scroll(), {scrolled: true});
+  const unverified = fake({resultPages: [t13('t12-renew-b/049')]});
+  await assert.rejects(unverified.flow.search({keyword: '安吉星 续费', sort: 'all'}), {code: 'search_context_unverified'});
+  await assert.rejects(unverified.flow.readCards(), {code: 'search_context_unverified'});
 });
 
 test('DOM patrol verifies its freshly copied canonical link without requiring a search card or mobile header', async () => {

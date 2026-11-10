@@ -9,6 +9,7 @@ const line = number => `这段正文记录第${number}条独立事实，采集�
 const lines = (from, to, y = 300, step = 90) => Array.from({length: to - from}, (_, i) => row(line(from + i), 55, y + step * i));
 const footer = [row('阅读100', 55, 1850, 180), row('不喜欢', 855, 1850, 160)];
 const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-articles/${name}.json`, import.meta.url)));
+const t13 = name => fixture('t13-claude-phone-20261110')[name].rows;
 function harness(pages, options = {}) {
   let index = 0, checks = 0; const swipes = [];
   const reader = createArticleReader({screen: {swipe: async (...args) => { swipes.push(args.slice(0, 5)); index = Math.min(index + 1, pages.length - 1); }},
@@ -157,6 +158,50 @@ test('a stale initial header cannot certify a reader that actually starts in the
 });
 
 const supplemental = {bodyRequired: false, initialHeader: parseArticleHeader(header)};
+
+test('T13 real animated ads and changing dislike icons stop after one verified forward swipe at the same footer', async () => {
+  for (const frames of [['018', '019'], ['151', '152']]) {
+    const {reader, swipes} = harness(frames.map(frame => t13(`t12-week/${frame}`)), supplemental);
+    const result = await reader.read();
+    assert.equal(result.hasMore, false); assert.equal(result.pagesRead, 2);
+    assert.deepEqual(swipes, [[540, 1750, 540, 1200, 1100]]);
+    assert.notEqual(result.article.evidence.scanReason, 'screen_budget_exhausted');
+    assert.equal(result.comments.status, frames[0] === '018' ? 'unavailable' : 'empty');
+  }
+  const empty = await harness([t13('t12-week/128'), t13('t12-week/128')], supplemental).reader.read();
+  assert.equal(empty.comments.status, 'empty'); assert.equal(empty.comments.headerCount, 0);
+  assert.equal(empty.comments.postingState, 'followers_only');
+});
+
+test('T13 footer pinning cannot equate different anchor types, numbers or a movement beyond eight pixels', async () => {
+  const first = [row('阅读100', 55, 500, 180), row('不喜欢', 855, 500, 160), row('留言', 55, 700, 90),
+    row('写留言', 75, 850, 140), row('上一幅广告介绍', 200, 1200, 500)];
+  const changingAd = [row('这一幅广告完全不同', 200, 1180), row('第二条动画广告说明', 200, 1280), row('第三条动画广告说明', 200, 1380)];
+  const cases = [
+    [row('留言', 55, 500, 90), row('写留言', 75, 850, 140), ...changingAd],
+    [row('阅读101', 55, 500, 180), row('不喜欢', 855, 500, 160), row('留言', 55, 700, 90), row('写留言', 75, 850, 140), ...changingAd],
+    [row('阅读100', 55, 509, 180), row('不喜欢', 855, 509, 160), row('留言', 55, 700, 90), row('写留言', 75, 850, 140), ...changingAd],
+  ];
+  for (const second of cases) {
+    const {reader} = harness([first, second], {...supplemental, maxChunkPages: 1});
+    assert.equal((await reader.read()).hasMore, true);
+    assert.equal((await reader.read()).hasMore, true, 'a changed footer is not proof of the scroll limit');
+  }
+});
+
+test('T13 a newly expanded reply cannot count as a pinned footer without a completed forward swipe', async () => {
+  const common = [row('阅读100', 55, 500, 180), row('不喜欢', 855, 500, 160), row('留言2', 55, 700, 90),
+    row('读者 上海 11月9日', 163, 950, 450), row('第一条留言', 163, 1040, 450)];
+  const before = [...common, row('展开1条回复', 163, 1140, 450)];
+  const after = [...common, row('回复者 北京 11月9日', 250, 1250, 450), row('这是一条新回复', 250, 1340, 450)];
+  let index = 0; const taps = [], swipes = [];
+  const reader = createArticleReader({...supplemental, maxChunkPages: 1, now: () => 1, wait: async () => {}, assertArticle: async () => {},
+    look: async () => index ? after : before, screen: {tap: async (...args) => { taps.push(args); index++; }, swipe: async (...args) => swipes.push(args)}});
+  assert.equal((await reader.read()).hasMore, true); assert.equal(taps.length, 1);
+  const expanded = await reader.read();
+  assert.equal(expanded.hasMore, true); assert.equal(expanded.comments.items.length, 2);
+  assert.equal(swipes.length, 0, 'reply expansion is not a scroll-limit observation');
+});
 
 test('delegated body scanning continues in bounded short steps from the current position and distinguishes a missing comment entry', async () => {
   const end = fixture('52-latest-body-6');

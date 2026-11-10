@@ -34,9 +34,9 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
   }
   // The centered invitation is a system empty state only in the observed comment area, not a comment
   // containing those words. Keep normal comment text intact and never override an observed nonzero count.
-  const emptyPrompt = !headers.length && !unparsed && !(Number(count?.[0]) > 0) && footer.header && open
+  const emptyPrompt = !headers.length && !unparsed && !(Number(count?.[0]) > 0) && footer.header && (open || restricted)
     && relevant.find(row => Math.abs(row.x + row.w / 2 - 540) < 140 && row.h <= 60
-      && /^还没有留言[，,]?\s*来写首评$/u.test(row.text.trim()));
+      && /^还没有留言(?:[，,]?\s*来写首评)?$/u.test(row.text.trim()));
   const empty = !!emptyPrompt || relevant.some(row => row.x < 200 && /^(暂无留言|暂无评论)$/u.test(row.text.trim()));
   const expand = relevant.filter(row => row.x >= 145 && row.x < 800 && row.y < 1980
     && /^(?:展开(?:全部)?\s*\d*\s*条?回复|共\s*\d+\s*条回复)$/u.test(row.text.trim()))

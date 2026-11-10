@@ -35,6 +35,11 @@ function mergeMetrics(previous, incoming, capturedAt) {
   return Object.fromEntries(Object.entries(incoming).map(([key, value]) => [key, value.value !== null
     ? {...value, source: 'screen_ocr', capturedAt} : previous?.[key] ?? value]));
 }
+function footerAnchor(rows) {
+  const footer = footerEvidence(rows), kind = footer.read ? 'read' : 'comments';
+  const row = footer.read ?? footer.header;
+  return row && row.y + row.h < 1900 ? {kind, text: comparable(row.text), y: row.y} : null;
+}
 /** Holds one open article across bounded OperationGate calls. No article text is interpreted as an instruction. */
 export function createArticleReader({screen, look, assertArticle, card = null, now = Date.now, wait = pause,
   initialHeader = null, bodyRequired = true, maxPages = 80, maxCharacters = 100000, maxChunkPages = 8}) {
@@ -78,10 +83,12 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
       let chunkPages = 0;
       while (!state.done && chunkPages < maxChunkPages && (chunkPages === 0 || now() < deadline - 4000)) {
         throwIfAborted(signal);
+        let scrolledForward = false;
         if (state.next) {
           await assertArticle({signal});
           await screen.swipe(540, 1750, 540, 1200, 1100, {signal});
           await wait(850, signal);
+          scrolledForward = true;
         }
         let rows = await readScreen(signal);
         const first = state.pages === 0;
@@ -96,11 +103,18 @@ export function createArticleReader({screen, look, assertArticle, card = null, n
           && !articleScreenOverlap(visible(state.rows), visible(rows))) {
           await assertArticle({signal});
           await screen.swipe(540, 1000, 540, 1350, 1100, {signal});
+          scrolledForward = false;
           await wait(850, signal);
           rows = await readScreen(signal);
           if (!stableScreen(state.rows, rows) && !articleScreenOverlap(visible(state.rows), visible(rows))) state.gap = true;
         }
-        const stable = !first && !state.justExpanded && stableScreen(state.rows, rows);
+        // At the bottom of a short page an animated ad or OCR jitter on the like icon ("♥/Q/③ 不喜欢") keeps
+        // whole-screen comparison from ever matching. A footer anchor that did not move after a swipe proves
+        // the page cannot scroll further.
+        const before = state.reachedEnd ? footerAnchor(state.rows) : null, after = footerAnchor(rows);
+        const pinned = !first && scrolledForward && !state.justExpanded && before && after
+          && before.kind === after.kind && before.text === after.text && Math.abs(before.y - after.y) <= 8;
+        const stable = !first && !state.justExpanded && (pinned || stableScreen(state.rows, rows));
         state.justExpanded = false;
         state.stable = stable ? state.stable + 1 : 0;
         const visibleHeader = observed?.headerVerified && sameArticleTitle(observed.title, state.header?.title) ? observed : null;
