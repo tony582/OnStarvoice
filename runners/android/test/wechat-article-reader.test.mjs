@@ -53,6 +53,16 @@ test('a stable footer without a comment entry reports unavailable/null and keeps
   assert.equal(result.article.bodyStatus, 'partial', 'the fixture jump intentionally has a missing body interval');
 });
 
+test('Claude centered first-comment invitation is empty/open with real footer metrics, not no-entry', async () => {
+  const end = fixture('t9-claude-phone-20261109')['s1-renew/069'].rows;
+  const {reader} = harness([end], {bodyRequired: false, initialHeader: parseArticleHeader(header)});
+  const result = await reader.read();
+  assert.equal(result.comments.status, 'empty'); assert.equal(result.comments.headerCount, 0);
+  assert.equal(result.comments.postingState, 'open'); assert.deepEqual(result.comments.items, []);
+  assert.equal(result.article.metrics.read.value, 148); assert.equal(result.article.metrics.share.value, 5);
+  assert.equal(result.article.metrics.recommend.raw, null); assert.equal(result.hasMore, false);
+});
+
 test('followers-only footer preserves the public comment and does not request follow', async () => {
   const end = fixture('43-image-comments');
   const {reader} = harness([fixture('40-image-loaded'), end, end]);

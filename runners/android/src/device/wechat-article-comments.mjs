@@ -11,7 +11,6 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
   const closed = relevant.some(row => row.x < 200 && CLOSED.test(row.text.trim()));
   const restricted = relevant.some(row => row.x < 200 && /^作者已设置关注后可以留言$/u.test(row.text.trim()));
   const open = relevant.some(row => row.x < 200 && /^写留言$/u.test(row.text.trim()));
-  const empty = relevant.some(row => row.x < 200 && /^(暂无留言|暂无评论)$/u.test(row.text.trim()));
   const count = footer.header?.text.match(/\d+/u);
   const headers = [], uncertainBoundaries = []; let unparsed = false;
   for (const row of relevant) {
@@ -33,6 +32,12 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
     if (!author || author.length > 60) { unparsed = true; continue; }
     headers.push({...row, author, location, timeLabel: date[1], reply: row.x >= 225});
   }
+  // The centered invitation is a system empty state only in the observed comment area, not a comment
+  // containing those words. Keep normal comment text intact and never override an observed nonzero count.
+  const emptyPrompt = !headers.length && !unparsed && !(Number(count?.[0]) > 0) && footer.header && open
+    && relevant.find(row => Math.abs(row.x + row.w / 2 - 540) < 140 && row.h <= 60
+      && /^还没有留言[，,]?\s*来写首评$/u.test(row.text.trim()));
+  const empty = !!emptyPrompt || relevant.some(row => row.x < 200 && /^(暂无留言|暂无评论)$/u.test(row.text.trim()));
   const expand = relevant.filter(row => row.x >= 145 && row.x < 800 && row.y < 1980
     && /^(?:展开(?:全部)?\s*\d*\s*条?回复|共\s*\d+\s*条回复)$/u.test(row.text.trim()))
     .map(row => {
@@ -52,7 +57,7 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
       content: lines.map(item => item.text).join(''), likeCount: likes ? Number(likes.text) : null, reply: row.reply, cut};
   }).filter(item => item.content);
   return {comments, unparsed, expand, headerCount: count ? Number(count[0]) : empty ? 0 : null, empty,
-    postingState: closed ? 'closed' : restricted ? 'followers_only' : open ? 'open' : 'unknown', closed,
+    postingState: closed ? 'closed' : restricted ? 'followers_only' : open || emptyPrompt ? 'open' : 'unknown', closed,
     entrySeen: !!footer.header || closed || restricted || open || empty,
     bottomCut: comments.some(item => item.cut),
     unexpanded: relevant.some(row => /^(?:展开.*回复|共\d+条回复)$/u.test(row.text.trim()))};

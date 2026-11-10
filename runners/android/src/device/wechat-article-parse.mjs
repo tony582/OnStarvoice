@@ -13,7 +13,8 @@ const LOCATIONS = '内蒙古 黑龙江 新疆 西藏 宁夏 广西 香港 澳门
 export function metric(raw, {read = false} = {}) {
   const text = String(raw ?? '').trim().replace(/^(?:阅读|赞|分享|推荐)\s*/u, '');
   const hit = text.match(/^(\d+(?:\.\d+)?)(万|亿)?(\+)?$/u);
-  return {raw: text || null, value: hit ? Number(hit[1]) * ({万: 10000, 亿: 100000000}[hit[2]] ?? 1) : null,
+  // Only a displayed number is an observation; a bare control label (写留言/推荐) never becomes a raw value.
+  return {raw: hit ? text : null, value: hit ? Number(hit[1]) * ({万: 10000, 亿: 100000000}[hit[2]] ?? 1) : null,
     ...(read ? {precision: !hit ? 'unknown' : hit[3] ? 'lower_bound' : hit[2] ? 'rounded' : 'exact'} : {})};
 }
 export function articleSortTarget(rows, sort) {
@@ -21,7 +22,32 @@ export function articleSortTarget(rows, sort) {
   return label ? findWord(rows.map(row => ({...row, text: row.text.replace(/[｜|]/gu, ' ')})), label,
     {region: {y0: 350, y1: 520}})[0] : null;
 }
-export function isArticleResults(rows, keyword, {controlledInput = false} = {}) {
+// OCR can merge adjacent tab labels into one box ("文章视频"). Split only boxes made entirely of known tab
+// labels and place the tap by character offset; any other text never yields a tab.
+const TAB_LABELS = ['AI搜索', '全部', '文章', '视频', '我的互动', '账号', '评论', '划线', '商品', '小店', '表情', '直播', '听一听', '新闻', '贴图', '读书', '朋友圈', '百科'];
+function tabSegments(row) {
+  if (row.y < 240 || row.y >= 350 || row.x < 0 || row.x >= 1080 || !(row.w > 0) || !(row.h > 0)) return [];
+  const text = String(row.text ?? '').normalize('NFKC');
+  const parts = []; let offset = 0;
+  while (offset < text.length) {
+    if (/[\s|=]/u.test(text[offset])) { offset++; continue; }
+    const label = TAB_LABELS.find(item => text.startsWith(item, offset));
+    if (!label) return [];
+    parts.push({label, center: {x: Math.round(row.x + row.w * (offset + label.length / 2) / text.length),
+      y: Math.round(row.y + row.h / 2)}});
+    offset += label.length;
+  }
+  return parts;
+}
+export function hasArticleTabs(rows) { return rows.some(row => tabSegments(row).some(part => ['全部', '视频', 'AI搜索'].includes(part.label))); }
+export function findTab(rows, label) {
+  for (const row of rows) {
+    const hit = tabSegments(row).find(part => part.label === label);
+    if (hit) return {...row, text: label, center: hit.center};
+  }
+  return null;
+}
+export function isArticleResults(rows, keyword, {controlledInput = false, scrolledOk = false} = {}) {
   const wanted = comparable(keyword);
   const keywordSeen = rows.some(row => {
     if (!(row.y > 90 && row.y < 230 && row.x > 90 && row.x < 800)) return false;
@@ -33,11 +59,17 @@ export function isArticleResults(rows, keyword, {controlledInput = false} = {}) 
     return controlledInput && row.w >= 400 && row.x + row.w >= 650 && prefix.length < wanted.length
       && units * row.h * 0.8 > 600 && wanted.startsWith(prefix);
   });
-  return keywordSeen && !!findWord(rows, '文章', {region: {y0: 240, y1: 350}}).length && !!articleSortTarget(rows, 'all');
+  const tabs = !!findTab(rows, '文章');
+  if (!keywordSeen || !tabs) return false;
+  if (articleSortTarget(rows, 'all')) return true;
+  // Scrolling an already verified search hides the sort row; the sticky keyword box and tab bar stay.
+  return scrolledOk && !!findTab(rows.map(row => ({...row, text: row.text.replace(/[｜|]/gu, ' ')})), 'AI搜索');
 }
-export function parseArticleCards(rows, {now = Date.now()} = {}) {
-  const visible = rows.filter(row => row.y >= 520 && row.y + row.h < 2070).sort(position);
-  const cards = []; let previousBottom = 510;
+/** First y of result cards: below the sort row when it is visible, else right below the sticky tab bar. */
+export function resultsTop(rows) { return articleSortTarget(rows, 'all') ? 520 : 360; }
+export function parseArticleCards(rows, {now = Date.now(), top = 520} = {}) {
+  const visible = rows.filter(row => row.y >= top && row.y + row.h < 2070).sort(position);
+  const cards = []; let previousBottom = top - 10;
   for (const row of visible) {
     if (row.x < 220 || row.x > 500) continue;
     const time = row.text.match(TIME); if (!time) continue;
@@ -123,7 +155,7 @@ export function parseArticleMetrics(rows) {
   const four = bar.some(row => row.x >= 570 && row.x < 680 && /^(?:\d|赞|喜欢)/u.test(row.text));
   if (!three && !four) return {read: metric(read?.text, {read: true}), like: metric(null), share: metric(null), recommend: metric(null)};
   return {read: metric(read?.text, {read: true}), like: metric(at(three ? 710 : 570, three ? 790 : 680)),
-    share: metric(at(three ? 790 : 680, three ? 900 : 790)), recommend: metric(at(three ? 930 : 790, three ? 1020 : 905))};
+    share: metric(at(three ? 790 : 680, three ? 900 : 790)), recommend: metric(at(three ? 930 : 790, three ? 1020 : 880))};
 }
 export function articleBodyRows(rows, {first = false, header = null, reachedEnd = false} = {}) {
   if (reachedEnd) return [];
@@ -134,3 +166,17 @@ export function articleBodyRows(rows, {first = false, header = null, reachedEnd 
     && !/^(?:.*听全文.*AI.*|上一篇|下一篇|＜上一篇|<上一篇)/u.test(row.text.trim())).sort(position);
 }
 export function sameArticleTitle(left, right) { return similarity(left, right) >= 0.78; }
+// A result card can show only the tail of a long title (its first line sits under the sticky bar) and the
+// header byline can read "作者 公众号". Containment of at least 6 characters counts as the same text.
+const contains = (whole, part) => { const a = comparable(whole), b = comparable(part);
+  return [...b.replace(/[^\p{L}\p{N}]/gu, '')].length >= 6 && a.includes(b); };
+const nameParts = value => String(value ?? '').normalize('NFKC').trim().split(/\s+/u).map(comparable);
+const sameName = (left, right) => { const a = comparable(left), b = comparable(right);
+  // A visible byline can contain both the author and the account. Match complete name tokens, never a
+  // substring such as 安吉星 inside the distinct account 安吉星服务.
+  return !!a && !!b && (a === b || (Math.min(a.length, b.length) >= 2
+    && (nameParts(left).includes(b) || nameParts(right).includes(a)))); };
+export function cardMatchesHeader(card, header) {
+  const title = card?.title ?? card?.snippet;
+  return (sameArticleTitle(header?.title, title) || contains(header?.title, title)) && sameName(header?.account, card?.account ?? card?.author);
+}

@@ -2,10 +2,75 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import {ARTICLE_LINK, articleBodyRows, articleSortTarget, footerEvidence, isArticleResults, metric,
-  parseArticleCards, parseArticleHeader, parseArticleMetrics} from '../src/device/wechat-article-parse.mjs';
+  parseArticleCards, parseArticleHeader, parseArticleMetrics, cardMatchesHeader, findTab, hasArticleTabs, resultsTop} from '../src/device/wechat-article-parse.mjs';
 import {mergeArticleComments, parseArticleComments} from '../src/device/wechat-article-comments.mjs';
 const rows = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-articles/${name}.json`, import.meta.url)));
 const row = (text, x, y, w = 500, h = 45) => ({text, x, y, w, h, conf: 1});
+const t9 = name => rows('t9-claude-phone-20261109')[name].rows;
+
+test('Claude phone results match a clipped title and a complete account token in the article byline', () => {
+  const cards = parseArticleCards(t9('s1-renew/070'));
+  const longHeader = parseArticleHeader(t9('s1-renew/072'));
+  const bylineHeader = parseArticleHeader(t9('s1-renew/076'));
+  assert.equal(longHeader.headerVerified, true); assert.equal(bylineHeader.headerVerified, true);
+  assert.equal(cards[2].title, '务，统统一键解决！');
+  assert.equal(cardMatchesHeader(cards[2], longHeader), true);
+  assert.equal(cardMatchesHeader(cards[3], bylineHeader), true);
+  assert.equal(cardMatchesHeader({...cards[3], account: bylineHeader.account}, {...bylineHeader, account: '连确'}), true);
+  for (const account of ['连确汽车', '连确俱乐部', '另一个公众号']) {
+    assert.equal(cardMatchesHeader(cards[3], {...bylineHeader, account}), false);
+  }
+  assert.equal(cardMatchesHeader({...cards[3], account: '安吉星'}, {...bylineHeader, account: '安吉星服务'}), false);
+  assert.equal(cardMatchesHeader({...cards[2], title: '统统一键解'}, longHeader), false, 'five characters are insufficient');
+  assert.equal(cardMatchesHeader({...cards[2], title: '统一键解！！！'}, longHeader), false, 'punctuation does not reach the six-character threshold');
+  assert.equal(cardMatchesHeader({...cards[2], account: '另一个公众号'}, longHeader), false);
+  assert.equal(cardMatchesHeader({...cards[3], title: '一篇完全无关的文章'}, bylineHeader), false);
+});
+
+test('Claude scrolled results retain the first complete card only after explicit context verification', () => {
+  const source = t9('s1-renew/080');
+  assert.equal(isArticleResults(source, '安吉星 续费'), false);
+  assert.equal(isArticleResults(source, '安吉星 续费', {scrolledOk: true}), true);
+  assert.equal(isArticleResults(source, '另一个词', {scrolledOk: true}), false);
+  assert.equal(resultsTop(source), 360);
+  const cards = parseArticleCards(source, {top: resultsTop(source)});
+  assert.equal(cards.length, 4);
+  assert.equal(cards[0].title, '安吉星手机应用再次升级，修车保养、续费服务，统统一键解决！');
+  assert.equal(resultsTop(t9('s1-renew/070')), 520);
+});
+
+test('only complete known tab labels can be split, with an integer tap inside 文章', () => {
+  const source = t9('s1-renew-c/006');
+  const target = findTab(source, '文章');
+  assert.equal(target.center.x, 543); assert.equal(target.center.y, 308);
+  assert.ok(target.center.x >= 478 && target.center.x < 608);
+  for (const text of ['热门文章', '文章 交流群', 'AI搜索 异常提示', '文章视频未知']) {
+    assert.equal(findTab([row(text, 100, 280)], '文章'), null);
+    assert.equal(hasArticleTabs([row(text, 100, 280)]), false);
+  }
+  assert.equal(hasArticleTabs(t9('s2-week/006')), false);
+  assert.equal(hasArticleTabs(t9('s2-week/007')), true, '007 has the 视频 anchor inside a merged known-label box');
+  assert.equal(hasArticleTabs([row('账号 评论', 200, 280)]), false);
+  assert.equal(hasArticleTabs([row('全部 视频 AI搜索', 100, 700)]), false, 'body text is not a tab row');
+});
+
+test('Claude empty-comment screen keeps unknown metrics null even when OCR drops or reorders labels', () => {
+  const source = t9('s1-renew/069');
+  for (const page of [source, [...source].reverse(), source.filter(item => item.text !== '推荐')]) {
+    const metrics = parseArticleMetrics(page);
+    assert.equal(metrics.read.value, 148); assert.equal(metrics.like.value, null); assert.equal(metrics.share.value, 5);
+    assert.deepEqual(metrics.recommend, {raw: null, value: null});
+  }
+  for (const label of ['写留言', '推荐', '赞']) assert.deepEqual(metric(label), {raw: null, value: null});
+  const parsed = parseArticleComments(source);
+  assert.equal(parsed.empty, true); assert.equal(parsed.headerCount, 0); assert.equal(parsed.postingState, 'open');
+  const phrase = '还没有留言，来写首评';
+  assert.equal(parseArticleComments([row(phrase, 351, 700, 381, 49)]).empty, false, 'body text cannot claim empty comments');
+  assert.equal(parseArticleComments([row(phrase, 351, 900, 381, 49)], {reachedEnd: true}).empty, false,
+    'historical footer evidence cannot turn a comment fragment into a zero count');
+  const quoted = parseArticleComments([row('留言', 52, 1000), row('测试者 上海 11月9日', 156, 1200), row(phrase, 156, 1300)]);
+  assert.equal(quoted.empty, false); assert.equal(quoted.headerCount, null); assert.equal(quoted.comments[0].content, phrase);
+});
 
 test('real article results: complete cards, wrapped titles and thumbnail text exclusion', () => {
   const all = parseArticleCards(rows('20-articles-loaded'));

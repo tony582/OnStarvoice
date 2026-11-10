@@ -7,7 +7,8 @@ import {ACTIVITY} from '../src/device/wechat-profile.mjs';
 const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/wechat-articles/${name}.json`, import.meta.url)));
 const row = (text, x, y, w = 200, h = 45) => ({text, x, y, w, h});
 const shareUrl = 'https://mp.weixin.qq.com/s/bMWKCZnPrhVlz2uCqmRzKw';
-function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast = true, hazard = null, blankInput = false, resumedArticle = false, oneStep = false, missingMenu = false, staleHome = 0, badLinkCard = false, articleActivity = ARTICLE_ACTIVITY, proxyReads = 0, restoreAfterCopy = false, blankArticleReads = 0} = {}) {
+const t9 = name => fixture('t9-claude-phone-20261109')[name].rows;
+function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast = true, hazard = null, blankInput = false, resumedArticle = false, oneStep = false, missingMenu = false, staleHome = 0, badLinkCard = false, articleActivity = ARTICLE_ACTIVITY, proxyReads = 0, restoreAfterCopy = false, blankArticleReads = 0, resultPages = null, articlePage = null, onWait = null} = {}) {
   let inputValue = '', clipboard = previousLink, emptyReads = blankInput ? 1 : 0; const calls = [];
   const activity = () => proxyReads-- > 0 ? 'com.tencent.mm.plugin.webview.stub.WebViewStubProxyUI' : hazard ?? ({home: ACTIVITY.main, discover: ACTIVITY.main, landing: ARTICLE_LANDING,
     input: ARTICLE_SEARCH, results: ARTICLE_SEARCH, article: articleActivity, menu: articleActivity, copy: articleActivity,
@@ -19,15 +20,18 @@ function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast =
     if (stage === 'discover') return [...main, row('搜一搜', 100, 1250)];
     if (stage === 'landing') return [row('搜索', 94, 502)];
     if (stage === 'input') return emptyReads-- > 0 ? [row('16:33', 26, 23)] : [row('搜索或提问', 137, 143), row('搜索', 921, 303, 80)];
-    if (stage === 'results') return inputValue.startsWith('https://') ? fixture('link-open-results').map(row =>
-      badLinkCard && row.y === 538 ? {...row, text: 'mp.weixin.qq.com.evil.test/s/token'} : row) : fixture('20-articles-loaded');
+    if (stage === 'results') {
+      if (resultPages?.length) return resultPages.length > 1 ? resultPages.shift() : resultPages[0];
+      return inputValue.startsWith('https://') ? fixture('link-open-results').map(row =>
+        badLinkCard && row.y === 538 ? {...row, text: 'mp.weixin.qq.com.evil.test/s/token'} : row) : fixture('20-articles-loaded');
+    }
     if (stage === 'menu') return fixture('30-menu-confirmed');
     if (stage === 'copy') return fixture('32-copy-link');
     if (stage === 'copied' && restoreAfterCopy) return [...fixture('37-comments-end'), ...fixture('33-link-copied')];
     if (stage === 'copied' && toast) return fixture('33-link-copied');
     if (stage === 'article' && blankArticleReads-- > 0) return fixture('21-article-first').filter(row => row.y < 600 || row.y > 2100);
     if (stage === 'article' && resumedArticle) return fixture('37-comments-end');
-    return fixture('21-article-first').filter(row => !missingMenu || !/^[•·.⋯…]{2,}$/u.test(row.text));
+    return (articlePage ?? fixture('21-article-first')).filter(row => !missingMenu || !/^[•·.⋯…]{2,}$/u.test(row.text));
   };
   const screen = {
     launch: async () => { stage = 'home'; }, defaultIme: async () => 'owner.keyboard/.IME',
@@ -50,7 +54,8 @@ function fake({stage = 'home', previousLink = '', copiedLink = shareUrl, toast =
   };
   const view = {activity: async () => ({package: 'com.tencent.mm', activity: activity()}),
     capture: async () => ({text: Promise.resolve({rows: rows()})})};
-  return {flow: createWechatArticleFlow({screen, view, wait: async () => {}, now: () => 1}), calls};
+  return {flow: createWechatArticleFlow({screen, view, wait: async ms => { calls.push(['wait', ms]); await onWait?.(ms); }, now: () => 1}), calls,
+    setResultPages: pages => { resultPages = pages; }};
 }
 
 test('search tolerates the real blank first paint and restores keyboard, then returns arrays after an article', async () => {
@@ -62,6 +67,73 @@ test('search tolerates the real blank first paint and restores keyboard, then re
   assert.equal((await flow.copyLink()).shareUrl, shareUrl);
   const returned = await flow.returnToResults(); assert.equal(returned.length, 4);
   assert.equal((await flow.recoverResults()).length, 4);
+});
+
+test('Claude merged article tab opens its left half, then clipped titles and account bylines verify', async () => {
+  for (const [index, header] of [[2, 's1-renew/072'], [3, 's1-renew/076']]) {
+    const {flow, calls} = fake({resultPages: [t9('s1-renew-c/006'), t9('s1-renew/070')], articlePage: t9(header)});
+    const result = await flow.search({keyword: '安吉星 续费', sort: 'all'});
+    assert.ok(calls.some(call => call[0] === 'tap' && call[1] === 543 && call[2] === 308));
+    assert.equal((await flow.openCard({card: result.cards[index]})).opened, true);
+    assert.equal(calls.filter(call => call[0] === 'swipe').length, 0);
+  }
+});
+
+test('Claude blank-to-shifted tab sequence waits before sliding, then recovers right after two left attempts', async () => {
+  const shifted = t9('s2-week/007');
+  const {flow, calls} = fake({resultPages: [t9('s2-week/006'), shifted, shifted, shifted, fixture('20-articles-loaded')]});
+  assert.equal((await flow.search({keyword: '安吉星', sort: 'all'})).verified, true);
+  const horizontal = calls.filter(call => call[0] === 'swipe');
+  assert.deepEqual(horizontal, [['swipe', 920, 305, 290, 305, 1000], ['swipe', 920, 305, 290, 305, 1000], ['swipe', 290, 305, 920, 305, 1000]]);
+  assert.ok(calls.findIndex(call => call[0] === 'wait' && call[1] === 800) < calls.findIndex(call => call[0] === 'swipe'));
+});
+
+test('four blank first paints wait 800ms each and can recover without any tab gesture', async () => {
+  const blank = t9('s2-week/006');
+  const {flow, calls} = fake({resultPages: [blank, blank, blank, blank, fixture('20-articles-loaded')]});
+  assert.equal((await flow.search({keyword: '安吉星', sort: 'all'})).verified, true);
+  assert.equal(calls.filter(call => call[0] === 'wait' && call[1] === 800).length, 4);
+  assert.equal(calls.filter(call => call[0] === 'swipe').length, 0);
+});
+
+test('unpainted or unproven tab bars fail after four waits without horizontal gestures', async () => {
+  for (const rows of [t9('s2-week/006'), [row('账号 评论', 200, 280)], [row('全部 视频 AI搜索', 100, 700)]]) {
+    const {flow, calls} = fake({resultPages: [rows]});
+    await assert.rejects(flow.search({keyword: '安吉星', sort: 'all'}), {code: 'article_tab_missing'});
+    assert.equal(calls.filter(call => call[0] === 'wait' && call[1] === 800).length, 4);
+    assert.equal(calls.filter(call => call[0] === 'swipe').length, 0);
+  }
+});
+
+test('missing article tab has two bounded left and right gestures, and cancellation prevents further movement', async () => {
+  const {flow, calls} = fake({resultPages: [t9('s2-week/007')]});
+  await assert.rejects(flow.search({keyword: '安吉星', sort: 'all'}), {code: 'article_tab_missing'});
+  assert.deepEqual(calls.filter(call => call[0] === 'swipe').map(call => call.slice(1, 4)), [[920, 305, 290], [920, 305, 290], [290, 305, 920], [290, 305, 920]]);
+  const controller = new AbortController(), reason = Object.assign(new Error('stopped'), {code: 'user_stop'});
+  const canceled = fake({resultPages: [t9('s2-week/006')], onWait: ms => { if (ms === 800) controller.abort(reason); }});
+  await assert.rejects(canceled.flow.search({keyword: '安吉星', sort: 'all', signal: controller.signal}), {code: 'aborted'});
+  assert.equal(canceled.calls.filter(call => call[0] === 'swipe').length, 0);
+});
+
+test('scrolled article results work after verified search while absent sorts and failed searches cannot establish context', async () => {
+  const {flow, setResultPages} = fake({resultPages: [t9('s1-renew/070')]});
+  await flow.search({keyword: '安吉星 续费', sort: 'all'});
+  setResultPages([t9('s1-renew/080')]);
+  assert.equal((await flow.readCards()).length, 4);
+  assert.deepEqual(await flow.scroll(), {scrolled: true});
+  const missing = fake({resultPages: [t9('s1-renew/080')]});
+  await assert.rejects(missing.flow.search({keyword: '安吉星 续费', sort: 'all'}), {code: 'search_context_unverified'});
+  // A present 不限 control can verify the initial page, but cannot establish the requested 最新 sort.
+  const noLatest = t9('s1-renew/070').map(item => item.text.startsWith('不限') ? {...item, text: '不限'} : item);
+  const failed = fake({resultPages: [noLatest]});
+  await assert.rejects(failed.flow.search({keyword: '安吉星 续费', sort: 'latest'}), {code: 'sort_unverified'});
+  failed.setResultPages([t9('s1-renew/070')]);
+  const afterFailure = failed.calls.length;
+  for (const operation of [() => failed.flow.readCards(), () => failed.flow.scroll(), () => failed.flow.openCard({card: {}}),
+    () => failed.flow.recoverResults(), () => failed.flow.returnToResults()]) {
+    await assert.rejects(operation(), {code: 'search_context_unverified'});
+  }
+  assert.equal(failed.calls.length, afterFailure, 'a failed search cannot authorize later device actions');
 });
 
 test('copy verifies the bottom menu text and allows the same link only with a fresh copy toast', async () => {
@@ -141,7 +213,7 @@ test('a transient WebView proxy is waited out before input; a persistent proxy i
   assert.equal((await transient.flow.copyLink()).shareUrl, shareUrl);
   const persistent = fake({stage: 'article', hazard: 'com.tencent.mm.plugin.webview.stub.WebViewStubProxyUI'});
   await assert.rejects(persistent.flow.copyLink(), {code: 'screen_unverified'});
-  assert.equal(persistent.calls.length, 0);
+  assert.equal(persistent.calls.filter(call => call[0] !== 'wait').length, 0);
   await assert.rejects(fake({stage: 'article', hazard: 'com.tencent.mm.plugin.webview.ui.tools.WebViewUI'}).flow.copyLink(), {code: 'screen_unverified'});
 });
 

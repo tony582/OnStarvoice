@@ -2,9 +2,9 @@ import {DeviceError, throwIfAborted} from './bounded.mjs';
 import {pause} from './ui-wait.mjs';
 import {UNICODE_IME} from './adb-screen.mjs';
 import {ACTIVITY, MAIN_TABS, WECHAT_MAIN} from './wechat-profile.mjs';
-import {comparable, findText, findWord} from './wechat-ocr-parse.mjs';
+import {comparable, findText} from './wechat-ocr-parse.mjs';
 import {ARTICLE_ACTIVITIES, ARTICLE_LANDING, ARTICLE_SEARCH, ARTICLE_LINK, articleSortTarget, articleBodyRows, footerEvidence, isArticleResults,
-  parseArticleCards, parseArticleHeader, sameArticleTitle} from './wechat-article-parse.mjs';
+  parseArticleCards, parseArticleHeader, sameArticleTitle, cardMatchesHeader, resultsTop, findTab, hasArticleTabs} from './wechat-article-parse.mjs';
 import {createArticleReader} from './wechat-article-reader.mjs';
 const fail = (code, message, details = {}) => new DeviceError(code, message, {deviceSettled: true, ...details});
 const HAZARDS = [ACTIVITY.chooseChat, ACTIVITY.chooseContact, ACTIVITY.sendConfirm, 'com.tencent.mm.ui.chatting.ChattingUI'];
@@ -54,13 +54,16 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
   const tap = async (target, allowed, signal) => {
     await assertPage(allowed, {signal}); await screen.tap(Math.round(target.center?.x ?? target.x), Math.round(target.center?.y ?? target.y), {signal});
   };
-  const requireContext = () => { if (!context) throw fail('search_context_unverified', 'No verified article search'); return context; };
-  const results = async (signal, attempts = 4) => {
-    const {keyword} = requireContext();
+  const requireContext = ({pending = false} = {}) => {
+    if (!context || (!pending && context.verified !== true)) throw fail('search_context_unverified', 'No verified article search');
+    return context;
+  };
+  const results = async (signal, attempts = 4, {scrolledOk = true} = {}) => {
+    const {keyword, verified} = requireContext({pending: !scrolledOk});
     for (let i = 0; i < attempts; i++) {
       await assertPage(ARTICLE_SEARCH, {signal});
       const rows = await look({signal});
-      if (isArticleResults(rows, keyword, {controlledInput: true})) return {rows, cards: parseArticleCards(rows, {now: now()})};
+      if (isArticleResults(rows, keyword, {controlledInput: true, scrolledOk: scrolledOk && verified === true})) return {rows, cards: parseArticleCards(rows, {now: now(), top: resultsTop(rows)})};
       await wait(850, signal);
     }
     throw fail('search_context_unverified', 'The article tab and keyword were not confirmed');
@@ -133,7 +136,7 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
           await wait(650, signal); continue;
         }
         const actual = opening.card; opening = null;
-        if (actual && (!sameArticleTitle(header.title, actual.title) || !sameArticleTitle(header.account, actual.account ?? actual.author))) {
+        if (actual && !cardMatchesHeader(actual, header)) {
           await screen.back({signal}); throw fail('article_identity_unverified', 'The visible article title or account did not match the result');
         }
         currentCard = actual ?? {title: header.title, snippet: header.title, account: header.account, author: header.account}; currentHeader = header; return {opened: true, hasMore: false, title: header.title};
@@ -153,25 +156,33 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
       if (typeof keyword !== 'string' || !keyword.trim() || keyword.length > 60 || !['all', 'latest', 'hot'].includes(sort)
         || scope !== 'all' || duration !== 'all') throw fail('unsupported_search', 'Article collection currently supports all accounts and all/latest/hot sorting');
       await submitQuery(keyword, signal);
-      let rows;
-      let articleTab;
-      for (let i = 0; i < 4; i++) {
-        rows = await look({signal}); articleTab = findWord(rows, '文章', {region: {y0: 240, y1: 350}})[0];
-        if (articleTab) break;
+      let articleTab, emptyWaits = 0, tabSwipes = 0;
+      while (true) {
         await assertPage(ARTICLE_SEARCH, {signal});
-        await screen.swipe(920, 305, 290, 305, 1000, {signal}); await wait(700, signal);
+        const rows = await look({signal}); articleTab = findTab(rows, '文章');
+        if (articleTab) break;
+        // A blank first paint is not evidence that the tab is offscreen. Wait before any horizontal gesture.
+        if (!hasArticleTabs(rows)) {
+          if (emptyWaits++ >= 4) break;
+          await wait(800, signal); continue;
+        }
+        if (tabSwipes >= 4) break;
+        await assertPage(ARTICLE_SEARCH, {signal});
+        const left = tabSwipes++ < 2;
+        await screen.swipe(left ? 920 : 290, 305, left ? 290 : 920, 305, 1000, {signal}); await wait(700, signal);
       }
       if (!articleTab) throw fail('article_tab_missing', 'The 文章 category was not found');
       await tap(articleTab, ARTICLE_SEARCH, signal); await wait(1800, signal);
-      context = {keyword, sort};
-      let page = await results(signal);
+      context = {keyword, sort, verified: false};
+      let page = await results(signal, 4, {scrolledOk: false});
       const sortTarget = articleSortTarget(page.rows, sort);
       if (!sortTarget) throw fail('sort_unverified', 'The article sort controls were not found');
-      await tap(sortTarget, ARTICLE_SEARCH, signal); await wait(2300, signal); page = await results(signal);
+      await tap(sortTarget, ARTICLE_SEARCH, signal); await wait(2300, signal); page = await results(signal, 4, {scrolledOk: false});
       if (sort === 'latest' && !latestOrder(page.cards)) {
-        await wait(1500, signal); page = await results(signal);
+        await wait(1500, signal); page = await results(signal, 4, {scrolledOk: false});
         if (!latestOrder(page.cards)) throw fail('sort_unverified', 'The newest-first article order was not confirmed');
       }
+      context.verified = true;
       return {verified: true, keyword, sort, scope, duration, cards: page.cards,
         sortVerified: sort === 'latest' && page.cards.length >= 3 ? 'ascending_ages' : 'control_tapped'};
     },
