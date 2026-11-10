@@ -658,6 +658,84 @@ test('WeChat articles: phone capability, records, nullable observations, comment
     await f.complete(second);
   });
 
+  await t.test('T14 uncertain authors retain empty names, distinct place/date identities and immutable observation evidence', async st => {
+    const {articleEvent} = await import('../../../runners/android/src/core/wechat-article-evidence.mjs');
+    const f = await fixture(st);
+    await parent(f, {keywords: ['安吉星', '安吉星留言复查']});
+    const comments = {status: 'partial', postingState: 'followers_only', headerCount: 13, items: [
+      {author: '', authorUncertain: true, content: '这个我觉得蛮正常', location: '上海', timeLabel: '2023年9月14日', likeCount: null},
+      {author: '', authorUncertain: true, content: '这个我觉得蛮正常', location: '江苏', timeLabel: '2023年9月14日', likeCount: null},
+      {author: '', authorUncertain: true, content: '这个我觉得蛮正常', location: '上海', timeLabel: '2023年9月15日', likeCount: 0},
+      {author: '公众号', content: '作者回复', location: '上海', timeLabel: '2023年9月15日', likeCount: null, reply: true, parentIndex: 0},
+      {author: '另一位读者', content: '另一个父留言', location: '上海', timeLabel: '2023年9月14日', likeCount: null},
+      {author: '', authorUncertain: true, content: '收到', location: '上海', timeLabel: '2023年9月14日', reply: true, parentIndex: 0},
+      {author: '', authorUncertain: true, content: '收到', location: '上海', timeLabel: '2023年9月14日', reply: true, parentIndex: 4},
+      {author: '', authorUncertain: true, content: '缺少地区日期的同一句留言'},
+      {author: '', authorUncertain: true, content: '缺少地区日期的同一句留言'},
+      {author: '', authorUncertain: true, content: '回复缺少信息的父留言', location: '上海', timeLabel: '2023年9月14日', reply: true, parentIndex: 7},
+      {author: '', authorUncertain: true, content: '回复缺少信息的父留言', location: '上海', timeLabel: '2023年9月14日', reply: true, parentIndex: 8},
+      {author: '已知回复者', content: '已知作者的相同回复', location: '上海', timeLabel: '2023年9月14日', reply: true, parentIndex: 7},
+      {author: '已知回复者', content: '已知作者的相同回复', location: '上海', timeLabel: '2023年9月14日', reply: true, parentIndex: 8}]};
+    const serialized = task => {
+      const source = eventFor(task, {comments});
+      return JSON.parse(JSON.stringify(articleEvent({task, card: source.card, rank: source.rank, shareUrl: source.link.shareUrl,
+        article: source.article, comments: source.comments, capturedAt: Date.parse(source.capturedAt)})));
+    };
+    const first = (await f.poll()).task, firstEvent = serialized(first);
+    const batch = {uploadBatchId: randomUUID(), events: [firstEvent]};
+    const accepted = await f.service.posts(f.principal, batch, persist);
+    assert.equal(accepted.receipts[0].status, 'accepted');
+    await drain(f);
+    const one = await query('SELECT * FROM record_comments WHERE tenant_id=$1 ORDER BY floor_index', [f.tenantId]);
+    assert.equal(one.length, 13, 'distinct context, parent or uncertain occurrence must not collapse');
+    assert.equal(new Set(one.map(row => row.external_comment_id)).size, 13);
+    assert.equal(new Set(one.map(row => row.content_hash)).size, 13);
+    for (const row of one.filter((_, index) => comments.items[index].authorUncertain === true)) {
+      assert.equal(row.author_name, ''); assert.equal(row.payload.authorName, ''); assert.equal(row.payload.authorUncertain, true);
+      assert.equal(row.content, comments.items[row.floor_index - 1].content); assert.equal(row.payload.source, 'screen_ocr');
+      assert.equal(row.payload.capturedAt, firstEvent.comments.capturedAt);
+    }
+    assert.equal(one[0].like_count, null); assert.equal(one[2].like_count, 0);
+    for (const [index, parentIndex] of [[3, 0], [5, 0], [6, 4], [9, 7], [10, 8], [11, 7], [12, 8]]) {
+      assert.equal(one[index].parent_comment_id, one[parentIndex].external_comment_id);
+    }
+    assert.equal(Object.hasOwn(one[3].payload, 'authorUncertain'), false);
+    for (const index of [11, 12]) {
+      assert.equal(one[index].author_name, '已知回复者');
+      assert.equal(Object.hasOwn(one[index].payload, 'authorUncertain'), false);
+      assert.equal(Object.hasOwn(one[index].payload, 'uncertainArticleParent'), false);
+    }
+    const [record] = await stored(f);
+    assert.deepEqual(record.payload.commentsCleanedItems.map(item => item.authorName), comments.items.map(item => item.author));
+    const [observation] = await query('SELECT * FROM record_observations WHERE tenant_id=$1', [f.tenantId]);
+    assert.deepEqual(observation.payload.commentsCleanedItems.map(item => item.authorUncertain === true), comments.items.map(item => item.authorUncertain === true));
+    assert.deepEqual(observation.payload.commentsCleanedItems.map(item => item.authorName), comments.items.map(item => item.author));
+    assert.ok(observation.payload.commentsCleanedItems.every(item => !Object.hasOwn(item, 'uncertainArticleParent')));
+    assertCapturedObservation(observation, firstEvent);
+    const evidenceBefore = structuredClone(observation.payload);
+    const replay = await f.service.posts(f.principal, batch, persist);
+    assert.equal(replay.receipts[0].receiptId, accepted.receipts[0].receiptId);
+    assert.equal((await query('SELECT id FROM record_observations WHERE tenant_id=$1', [f.tenantId])).length, 1);
+    await f.complete(first);
+    const second = (await f.poll()).task, secondEvent = serialized(second);
+    const later = await send(f, secondEvent);
+    await drain(f);
+    const two = await query('SELECT * FROM record_comments WHERE tenant_id=$1 ORDER BY floor_index', [f.tenantId]);
+    assert.deepEqual(two.map(row => row.id), one.map(row => row.id), 'same place/date/text recapture updates the same rows');
+    assert.deepEqual(two.map(row => row.parent_comment_id), one.map(row => row.parent_comment_id));
+    assert.ok(two.every(row => row.seen_count > one.find(previous => previous.id === row.id).seen_count));
+    const observations = await query('SELECT * FROM record_observations WHERE tenant_id=$1 ORDER BY id', [f.tenantId]);
+    assert.equal(observations.length, 2);
+    assert.deepEqual(observations.find(row => row.id === observation.id).payload, evidenceBefore);
+    assertCapturedObservation(observations.find(row => row.id !== observation.id), secondEvent);
+    st.diagnostic(JSON.stringify({case: 'T14-author-uncertain', recordId: record.id, commentIds: two.map(row => row.id),
+      externalCommentIds: two.map(row => row.external_comment_id), commentCount: two.length,
+      parentIds: two.map(row => row.parent_comment_id), emptyAuthors: two.filter(row => row.author_name === '').length,
+      observationIds: observations.map(row => row.id), receiptIds: [accepted.receipts[0].receiptId, later.receipts[0].receiptId],
+      captureTimestamps: observations.map(row => row.payload.captureTimestamp), preservedOriginalObservation: true}));
+    await f.complete(second);
+  });
+
   await t.test('wrong attempts/tenants/platforms fail; late historical events keep a durable receipt and no false lease binding', async st => {
     const f = await fixture(st), other = await fixture(st);
     await parent(f);

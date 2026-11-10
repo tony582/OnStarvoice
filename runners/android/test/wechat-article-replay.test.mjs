@@ -48,3 +48,29 @@ test('image-v1 real phone replay: sparse infographic content survives scrolling 
   assert.equal(result.comments.postingState, 'followers_only'); assert.equal(result.comments.items.length, 1);
   assert.equal(result.article.evidence.originalImagesCaptured, false);
 });
+
+test('T14 original 014–026 replay keeps ten distinct comments, removes the whole ad, and preserves three uncertain authors', async () => {
+  const pages = Object.values(fixture('t14-comment-quality-20261110')); let index = 0;
+  const reader = createArticleReader({bodyRequired: false,
+    initialHeader: {title: '离线回放已核对的文章', account: '汽车365热线', headerVerified: true, source: 'page_dom'},
+    screen: {swipe: async () => { index = Math.min(index + 1, pages.length - 1); }}, look: async () => pages[index].rows,
+    assertArticle: async () => {}, wait: async () => {}, now: () => 1});
+  const first = await reader.read({limit: 50});
+  assert.equal(first.hasMore, true); assert.equal(first.pagesRead, 8);
+  const result = await reader.read({limit: 50}), items = result.comments.items;
+  assert.equal(result.hasMore, false); assert.equal(result.pagesRead, 13);
+  assert.equal(result.article.bodyStatus, 'delegated'); assert.equal(result.article.content, '');
+  assert.equal(result.article.metrics.read.value, 36000);
+  assert.equal(result.comments.status, 'partial'); assert.equal(result.comments.headerCount, 13);
+  assert.equal(result.comments.visibleScopeComplete, false); assert.equal(result.comments.postingState, 'followers_only');
+  assert.equal(items.length, 10);
+  assert.equal(items.filter(item => item.content.startsWith('这个通用没毛病')).length, 1);
+  assert.equal(items.filter(item => item.content === '这个我觉得蛮正常').length, 1);
+  assert.equal(items.find(item => item.author === '欲.').content, '收费也能理解，毕竟人家提供了服务嘛');
+  assert.ok(items.every(item => !/全友|629元|了解更多|厂告|广告/u.test(item.content)));
+  const uncertain = items.filter(item => item.authorUncertain);
+  assert.equal(uncertain.length, 3); assert.ok(uncertain.every(item => item.author === '' && item.likeCount === null));
+  assert.deepEqual(uncertain.map(item => item.content), ['这个还真的要交钱，别克对2条回～', '这个我觉得蛮正常',
+    '如果不是车带的功能，是额外的网络功能，要收费挺正常啊。']);
+  assert.ok(items.filter(item => item.author).every(item => !Object.hasOwn(item, 'authorUncertain')));
+});

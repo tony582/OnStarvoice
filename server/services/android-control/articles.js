@@ -127,10 +127,12 @@ export function normalizeArticleEvent(input, principal) {
   const rawItems = Array.isArray(comments.items) ? comments.items.slice(0, 500) : [];
   // Refuse malformed items instead of dropping them and shifting the parent's array index.
   const items = rawItems.map((item, index) => {
-    if (!item || !str(item.author, 120).trim() || !str(item.content, 2000).trim()) fail('INVALID_ARTICLE_COMMENT', 422);
+    if (!item || (!str(item.author, 120).trim() && item.authorUncertain !== true)
+      || !str(item.content, 2000).trim()) fail('INVALID_ARTICLE_COMMENT', 422);
     const parentIndex = item.reply === true && Number.isSafeInteger(item.parentIndex) && item.parentIndex >= 0 && item.parentIndex < index
       ? item.parentIndex : null;
-    return {author: str(item.author, 120).trim(), content: str(item.content, 2000).trim(), location: str(item.location, 40),
+    return {author: item.authorUncertain === true ? '' : str(item.author, 120).trim(), content: str(item.content, 2000).trim(), location: str(item.location, 40),
+      ...(item.authorUncertain === true ? {authorUncertain: true} : {}),
       timeLabel: str(item.timeLabel, 80), likeCount: Number.isSafeInteger(item.likeCount) && item.likeCount >= 0 ? item.likeCount : null,
       reply: item.reply === true, parentIndex};
   });
@@ -172,8 +174,9 @@ export function articleSyncBody(event, {keyword, taskId, attemptId, requestHash}
     comments: comments.headerCount, publishTime: article.publishedAt,
     metricKnown: {likes: article.metrics.like.value !== null, collects: article.metrics.recommend.value !== null,
       shares: article.metrics.share.value !== null, comments: comments.headerCount !== null}, commentsCountSource: 'article_visible_header'};
-  const commentItems = convertComments(externalId, comments, Date.parse(comments.capturedAt)).map((item, index) => ({...item,
-    likes: comments.items[index].likeCount, source: comments.source, capturedAt: comments.capturedAt}));
+  const commentItems = convertComments(externalId, comments, Date.parse(comments.capturedAt), {platform: ARTICLE_PLATFORM})
+    .map((item, index) => ({...item, ...(comments.items[index].authorUncertain === true ? {authorUncertain: true} : {}),
+      likes: comments.items[index].likeCount, source: comments.source, capturedAt: comments.capturedAt}));
   return {externalId, body: {syncType: 'keyword_notes', captureTaskId: taskId, captureTaskItemAttemptId: attemptId,
     captureTaskItemRequestHash: requestHash,
     payload: {noteId: externalId, platform: ARTICLE_PLATFORM, title: article.title, content: article.content,

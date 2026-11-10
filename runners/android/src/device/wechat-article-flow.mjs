@@ -224,9 +224,9 @@ export function createWechatArticleFlow({screen, view, rememberIme = () => {}, r
         for (let attempt = 0; attempt < 5; attempt++) {
           await assertPage(ARTICLE_SEARCH, {signal}); const rows = await look({signal});
           const visit = findText(rows, '访问网页', {region: {y0: 330, y1: 650, x0: 200, x1: 600}})[0];
-          // OCR can read the i in weixin as l. The exact target is typed, then verified again by copyLink.
+          // OCR can read the i in weixin as l, 1 or r. The exact target is typed, then verified again by copyLink.
           const domain = visit && rows.some(row => row.x > 200 && row.y > visit.y && row.y < visit.y + 150
-            && /^mp\.we[il]xin\.qq\.com\/s\//iu.test(row.text.trim()));
+            && /^mp\.we[il1r]xin\.qq\.com\/s\//iu.test(row.text.trim()));
           if (visit && domain) { target = visit; break; }
           await wait(650, signal);
         }

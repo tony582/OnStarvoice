@@ -73,7 +73,8 @@ export function articleEvent({task, card, rank, shareUrl, article, comments, cap
     comments: {status: comments?.status ?? 'unknown', postingState: comments?.postingState ?? 'unknown',
       source: 'screen_ocr', capturedAt: captureTime(comments?.capturedAt, capturedAt),
       reason: text(comments?.reason, 160), headerCount: Number.isSafeInteger(comments?.headerCount) ? comments.headerCount : null,
-      items: (comments?.items ?? []).slice(0, 500).map(item => ({author: text(item.author, 120), content: text(item.content, 2000),
+      items: (comments?.items ?? []).slice(0, 500).map(item => ({author: item.authorUncertain === true ? '' : text(item.author, 120), content: text(item.content, 2000),
+        ...(item.authorUncertain === true ? {authorUncertain: true} : {}),
         location: text(item.location, 40), timeLabel: text(item.timeLabel, 80),
         likeCount: Number.isSafeInteger(item.likeCount) ? item.likeCount : null, reply: item.reply === true,
         parentIndex: Number.isSafeInteger(item.parentIndex) ? item.parentIndex : null}))}};

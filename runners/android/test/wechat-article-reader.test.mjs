@@ -283,6 +283,25 @@ test('T13 original 130–135 screens reach comments after the merged read row an
   assert.equal(result.comments.items.find(item => item.author === '欲.').content, '收费也能理解，毕竟人家提供了服务嘛');
 });
 
+test('T14 bounded reader chunks keep uncertain text and preserve a later observed author over subsequent symbol frames', async () => {
+  const pages = [
+    [row('留言1', 55, 400), row('↓ 安徽 2023年9月14日', 163, 600), row('这个我觉得蛮正常', 163, 680)],
+    [row('真实读者 安徽 2023年9月14日', 163, 400), row('这个我觉得蛮正常', 163, 480)],
+    [row('※ 安徽 2023年9月14日', 163, 240), row('这个我觉得蛮正常', 163, 320)],
+  ];
+  const {reader} = harness(pages, {...supplemental, maxChunkPages: 1, maxPages: 3});
+  const first = await reader.read({limit: 50});
+  assert.equal(first.comments.items[0].author, ''); assert.equal(first.comments.items[0].authorUncertain, true);
+  assert.equal(first.comments.items[0].content, '这个我觉得蛮正常');
+  const second = await reader.read({limit: 50});
+  assert.equal(second.comments.items.length, 1); assert.equal(second.comments.items[0].author, '真实读者');
+  const last = await reader.read({limit: 50});
+  assert.equal(last.comments.items.length, 1); assert.equal(last.comments.items[0].author, '真实读者');
+  assert.equal(Object.hasOwn(last.comments.items[0], 'authorUncertain'), false);
+  assert.equal(Object.hasOwn(last.comments.items[0], 'cut'), false);
+  assert.equal(last.comments.status, 'partial');
+});
+
 test('T13 original header-only 131–135 screens independently start comment reading without a fabricated read count', async () => {
   const pages = Array.from({length: 5}, (_, index) => t13Comments(131 + index));
   const {reader, swipes} = harness(pages, {...supplemental, maxPages: pages.length, maxChunkPages: 1});

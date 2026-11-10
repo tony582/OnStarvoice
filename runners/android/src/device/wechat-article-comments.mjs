@@ -4,6 +4,30 @@ const REGIONS = '内蒙古 黑龙江 新疆 西藏 宁夏 广西 香港 澳门 �
 const TIME = /((?:\d{4}年)?\d{1,2}月\d{1,2}日|\d{1,2}-\d{1,2}|\d+(?:分钟|小时|天|周|个月)前?|昨天|前天|刚刚)\s*$/u;
 const CLOSED = /^(?:作者已关闭留言|该文章已关闭留言|留言功能已关闭|评论已关闭|暂不开放留言)$/u;
 const IGNORE = /^(?:回复[凸赞]*\s*\d*|首评|作者赞过|作者回复过|精选留言|写留言|暂无留言|暂无评论|展开.*回复|共\d+条回复)$/u;
+function authorIdentity(author) {
+  const value = String(author ?? '').trim();
+  return !value || /^(?:总|[\p{P}\p{S}])$/u.test(value) ? {author: '', authorUncertain: true} : {author: value};
+}
+function validTime(value) {
+  if (typeof value !== 'string' || value.match(TIME)?.[0] !== value) return false;
+  const date = value.match(/^(?:(\d{4})年)?(\d{1,2})(?:月|-)(\d{1,2})日?$/u);
+  if (!date) return true;
+  const year = Number(date[1] ?? 2000), month = Number(date[2]), day = Number(date[3]);
+  return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+function sameComment(old, item) {
+  if (old.reply !== item.reply || old.timeLabel !== item.timeLabel || !validTime(item.timeLabel)) return false;
+  const oldRegion = REGIONS.includes(old.location), newRegion = REGIONS.includes(item.location);
+  if (oldRegion && newRegion && old.location !== item.location) return false;
+  const sameKnownAuthor = old.author && item.author && !old.authorUncertain && !item.authorUncertain
+    && comparable(old.author) === comparable(item.author);
+  // Hidden/foreign IP already used same-name matching. Cross-name evidence must have known equal regions.
+  if (!sameKnownAuthor && !(oldRegion && newRegion && old.location === item.location)) return false;
+  const before = comparable(old.content), after = comparable(item.content);
+  return !!before && !!after && (similarity(before, after) >= (sameKnownAuthor ? 0.7 : 0.9)
+    || before.includes(after) || after.includes(before));
+}
+const authorQuality = item => (item.author.match(/\p{Script=Han}/gu)?.length ?? 0) * 100 + (item.author ? 1 : 0);
 export function parseArticleComments(rows, {reachedEnd = false} = {}) {
   const footer = footerEvidence(rows);
   const from = footer.header?.y ?? footer.read?.y ?? (reachedEnd ? 205 : Infinity);
@@ -13,9 +37,11 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
   const open = relevant.some(row => row.x < 200 && /^写留言$/u.test(row.text.trim()));
   const count = footer.header?.text.match(/\d+/u);
   const headers = [], uncertainBoundaries = []; let unparsed = false;
-  // A small right-side ad label delimits the preceding comment. Brand names in ordinary text do not.
-  const adBoundaries = relevant.filter(row => row.x > 900 && row.h <= 60 && /^广告[\p{P}\p{S}\s]*$/u.test(row.text.trim()))
-    .map(row => row.y);
+  // OCR sometimes drops 广's dot (厂告). The label and brand share a baseline; start at its upper edge,
+  // not the label's y, so every ad line is excluded. Brand names in ordinary comments are never a signal.
+  const adBoundaries = relevant.filter(row => row.x > 900 && row.w <= 180 && row.h <= 60 && /^[广厂]告[\p{P}\p{S}\s]*$/u.test(row.text.trim()))
+    .map(marker => Math.min(marker.y, ...relevant.filter(row => row.x >= 140 && row.x < 850 && row.h <= 75
+      && Math.abs(row.y + row.h / 2 - marker.y - marker.h / 2) <= 30).map(row => row.y)));
   for (const row of relevant) {
     if (row.x < 140 || row.x > 430 || row.h > 75) continue;
     const date = row.text.match(TIME);
@@ -33,7 +59,9 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
     if (!location) { unparsed = true; if (!replyControl) { uncertainBoundaries.push(row.y); continue; } }
     const author = location ? prefix.slice(0, -location.length).trim() : prefix;
     if (!author || author.length > 60) { unparsed = true; uncertainBoundaries.push(row.y); continue; }
-    headers.push({...row, author, location, timeLabel: date[1], reply: row.x >= 225});
+    const identity = authorIdentity(author);
+    if (identity.authorUncertain) unparsed = true;
+    headers.push({...row, ...identity, location, timeLabel: date[1], reply: row.x >= 225});
   }
   // The centered invitation is a system empty state only in the observed comment area, not a comment
   // containing those words. Keep normal comment text intact and never override an observed nonzero count.
@@ -56,7 +84,7 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
     const last = lines.at(-1);
     const cut = uncertainBoundaries.includes(next) || next === 1900 && (row.y > 1700 || (last?.y ?? 0) + (last?.h ?? 0) > 1800);
     const likes = relevant.find(item => Math.abs(item.y - row.y) < 40 && item.x > 940 && /^\d+$/u.test(item.text));
-    return {author: row.author, location: row.location, timeLabel: row.timeLabel,
+    return {author: row.author, ...(row.authorUncertain ? {authorUncertain: true} : {}), location: row.location, timeLabel: row.timeLabel,
       content: lines.map(item => item.text).join(''), likeCount: likes ? Number(likes.text) : null, reply: row.reply, cut};
   }).filter(item => item.content);
   return {comments, unparsed, expand, headerCount: count ? Number(count[0]) : empty ? 0 : null, empty,
@@ -66,18 +94,22 @@ export function parseArticleComments(rows, {reachedEnd = false} = {}) {
     unexpanded: relevant.some(row => /^(?:展开.*回复|共\d+条回复)$/u.test(row.text.trim()))};
 }
 export function mergeArticleComments(existing, incoming, limit = 500) {
-  const output = existing.map(item => ({...item}));
-  for (const item of incoming) {
-    const index = output.findIndex(old => old.reply === item.reply && comparable(old.author) === comparable(item.author)
-      && old.timeLabel === item.timeLabel && (similarity(old.content, item.content) >= 0.7 || comparable(old.content).includes(comparable(item.content))
-        || comparable(item.content).includes(comparable(old.content))));
+  const normalizeAuthor = ({authorUncertain, ...item}) => ({...item, ...authorIdentity(authorUncertain === true ? '' : item.author)});
+  const output = existing.map(normalizeAuthor);
+  let parentIndex = output.findLastIndex(item => !item.reply);
+  for (const incomingItem of incoming) {
+    const item = normalizeAuthor(incomingItem);
+    const index = output.findIndex(old => sameComment(old, item) && (!item.reply || old.parentIndex === (parentIndex >= 0 ? parentIndex : null)));
+    if (!item.reply) parentIndex = index >= 0 ? index : output.length < limit ? output.length : -1;
     if (index >= 0) {
       const previous = output[index];
+      const identity = authorIdentity((authorQuality(item) > authorQuality(previous) ? item : previous).author);
       if ((previous.cut && !item.cut) || (item.cut === previous.cut && item.content.length > previous.content.length)) output[index] = {...previous, ...item};
       else if (!item.cut) output[index].cut = false;
+      delete output[index].authorUncertain;
+      Object.assign(output[index], identity);
     } else if (output.length < limit) {
-      const parentIndex = item.reply ? output.findLastIndex(old => !old.reply) : null;
-      output.push({...item, parentIndex: parentIndex >= 0 ? parentIndex : null});
+      output.push({...item, parentIndex: item.reply && parentIndex >= 0 ? parentIndex : null});
     }
   }
   return output;

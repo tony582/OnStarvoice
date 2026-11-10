@@ -303,20 +303,21 @@ async function loadOfficialAccounts(tx, tenantId) {
   );
 }
 
-function buildCommentHash(recordId, comment) {
+function buildCommentHash(recordId, comment, platform, uncertainArticleParent = false) {
   const base = [
     recordId,
     comment.author_id || comment.author_name,
     comment.content,
     comment.published_at,
-  ].join('|');
-  return sha256(base);
+  ];
+  if (platform === 'wechat_articles' && (comment.payload?.authorUncertain === true || uncertainArticleParent)) base.push(comment.external_comment_id);
+  return sha256(base.join('|'));
 }
 
 // classification:入库用的(规则)分类。aiClassified:是否已是终判(官方评论)。
 // 评论入库不调 LLM —— 新评论先存规则分类、ai_classified_at 留 NULL,由后台 refineCommentsWithAI 精炼。
-async function upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification = null, aiClassified = false, koeTerms = [] }) {
-  const contentHash = buildCommentHash(recordId, comment);
+async function upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification = null, aiClassified = false, koeTerms = [], uncertainArticleParent = false }) {
+  const contentHash = buildCommentHash(recordId, comment, platform, uncertainArticleParent);
   const sourceType = detectKoeSourceType(comment.author_name, koeTerms);
   if (!classification) classification = ruleClassificationWithMetadata(classifyComment(comment, Boolean(officialAccount)));
   let existing = null;
@@ -612,6 +613,9 @@ export async function upsertRecordComments(recordId, record, context) {
 
   // PHASE 1(规则快速分类,不调 LLM):评论以规则分类立即入库、马上可见;
   // 非官方评论标 aiClassified=false,留给后台 refineCommentsWithAI 批量 AI 精炼。
+  // This is internal identity context only; a known reply author does not become authorUncertain.
+  const uncertainParentIds = new Set(platform === 'wechat_articles' ? comments.filter(raw => raw.authorUncertain === true)
+    .map(raw => normalizeText(raw.commentId || raw.id || raw.cid || '')).filter(Boolean) : []);
   const prepared = comments.map((raw, index) => {
     const comment = normalizeComment(raw, index, platform);
     const officialAccount = findOfficialCommentAuthor({
@@ -620,7 +624,8 @@ export async function upsertRecordComments(recordId, record, context) {
       author_id: comment.author_id,
     }, accounts);
     const classification = ruleClassificationWithMetadata(classifyComment(comment, Boolean(officialAccount)));
-    return { comment, officialAccount, classification, aiClassified: Boolean(officialAccount) };
+    return { comment, officialAccount, classification, aiClassified: Boolean(officialAccount),
+      uncertainArticleParent: uncertainParentIds.has(comment.parent_comment_id) };
   });
 
   // PHASE 2:事务里只做快速写库(无 LLM)。大帖不再把事务开着等几十分钟、也不会因 LLM 超时整篇回滚。
@@ -649,8 +654,8 @@ export async function upsertRecordComments(recordId, record, context) {
       })]);
     }
 
-    for (const { comment, officialAccount, classification, aiClassified } of prepared) {
-      const result = await upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification, aiClassified, koeTerms });
+    for (const { comment, officialAccount, classification, aiClassified, uncertainArticleParent } of prepared) {
+      const result = await upsertComment(tx, { tenantId, recordId, platform, comment, officialAccount, classification, aiClassified, koeTerms, uncertainArticleParent });
       if (result.inserted) inserted += 1;
       else updated += 1;
       if (officialAccount) {

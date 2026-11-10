@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {randomUUID} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
 import {canonicalArticleUrl, articleExternalId, articlePublishTime, normalizeArticleEvent} from '../server/services/android-control/articles.js';
-import {normalizePostEvent, wechatSyncBody} from '../server/services/android-control/posts.js';
+import {normalizePostEvent, wechatComments, wechatSyncBody} from '../server/services/android-control/posts.js';
 import {mergeArticleRecord} from '../server/services/android-control/article-record.js';
 import {readyPlatforms, runnerFeatures, taskPayload} from '../server/services/android-control/leases.js';
 import {mobileTaskFilters, mobilePlanBlockReason, mobileWorkflowFor} from '../server/services/android-control/mobile-tasks.js';
@@ -87,6 +87,100 @@ test('closed posting retains readable old comments and reply parent relationship
   assert.equal(comments[0].likes, null);
   assert.equal(comments[1].parentCommentId, comments[0].commentId);
   assert.equal(comments[1].likes, 0);
+});
+
+test('T14 uncertain article authors survive actual runner serialization, normalization and the sync payload as empty names', async () => {
+  const {articleEvent} = await import('../runners/android/src/core/wechat-article-evidence.mjs');
+  const input = event({comments: {status: 'partial', postingState: 'followers_only', headerCount: 13, items: [
+    {author: '', authorUncertain: true, content: '这个我觉得蛮正常', location: '安徽', timeLabel: '2023年9月14日', likeCount: null},
+    {author: '公众号', content: '作者回复', likeCount: 0, reply: true, parentIndex: 0}]}});
+  const serialized = JSON.parse(JSON.stringify(articleEvent({task: {identity, keyword: '安吉星'}, card: input.card, rank: 1,
+    shareUrl: link, article: input.article, comments: input.comments, capturedAt: Date.parse(input.capturedAt)})));
+  const normalized = normalizeArticleEvent(serialized, principal);
+  assert.equal(serialized.comments.items[0].author, ''); assert.equal(serialized.comments.items[0].authorUncertain, true);
+  assert.equal(normalized.comments.items[0].author, ''); assert.equal(normalized.comments.items[0].authorUncertain, true);
+  assert.equal(normalized.comments.items[0].content, input.comments.items[0].content);
+  assert.equal(normalized.comments.items[0].likeCount, null);
+  assert.equal(Object.hasOwn(normalized.comments.items[1], 'authorUncertain'), false);
+  const {body} = sync(serialized), [record] = normalizeRecord(body), stored = JSON.parse(record.payload).commentsCleanedItems;
+  assert.equal(stored[0].authorName, ''); assert.equal(stored[0].authorUncertain, true); assert.equal(stored[0].likes, null);
+  assert.equal(stored[0].source, 'screen_ocr'); assert.equal(stored[0].capturedAt, '2026-11-09T08:00:00.000Z');
+  assert.equal(stored[1].parentCommentId, stored[0].commentId); assert.equal(stored[1].likes, 0);
+  assert.equal(body.payload.wechatArticle.content, input.article.content);
+  assert.equal(body.payload.wechatArticle.metrics.read.value, input.article.metrics.read.value);
+  assert.equal(body.payload.wechatArticle.comments.status, 'partial'); assert.equal(body.payload.wechatArticle.comments.headerCount, 13);
+  for (const unreliableAuthor of ['※', '总', '看似正常的名字']) {
+    input.comments.items[0].author = unreliableAuthor;
+    assert.equal(normalizeArticleEvent(input, principal).comments.items[0].author, '', 'the server enforces the uncertainty flag before storage');
+    const boundary = articleEvent({task: {identity, keyword: '安吉星'}, card: {}, rank: 1, shareUrl: link,
+      article: input.article, comments: input.comments, capturedAt: Date.parse(input.capturedAt)});
+    assert.equal(boundary.comments.items[0].author, '', 'the runner never serializes an uncertain name as a reliable author');
+    assert.equal(sync(input).body.payload.commentsCleanedItems[0].authorName, '');
+  }
+});
+
+test('T14 only literal true permits an empty article author; invalid flags do not relax comment validation', async () => {
+  const {articleEvent} = await import('../runners/android/src/core/wechat-article-evidence.mjs');
+  for (const flag of [false, 1, 'true', {}, null, undefined]) {
+    const input = event({comments: {status: 'partial', items: [{author: '', authorUncertain: flag, content: '可读留言'}]}});
+    assert.throws(() => normalizeArticleEvent(input, principal), {code: 'INVALID_ARTICLE_COMMENT'});
+    const serialized = articleEvent({task: {identity, keyword: '安吉星'}, card: {}, rank: 1, shareUrl: link,
+      article: input.article, comments: input.comments, capturedAt: Date.parse(input.capturedAt)});
+    assert.equal(Object.hasOwn(serialized.comments.items[0], 'authorUncertain'), false);
+    assert.throws(() => normalizeArticleEvent(serialized, principal), {code: 'INVALID_ARTICLE_COMMENT'});
+    input.comments.items[0].author = '已知读者';
+    assert.equal(Object.hasOwn(normalizeArticleEvent(input, principal).comments.items[0], 'authorUncertain'), false);
+  }
+  assert.throws(() => sync(event({comments: {status: 'partial', items: [{author: '', authorUncertain: true, content: ' '}]}})),
+    {code: 'INVALID_ARTICLE_COMMENT'});
+});
+
+test('T14 uncertain article IDs distinguish same text by location/date while known authors and videos keep their old IDs', () => {
+  const comments = {status: 'partial', items: [
+    {author: '', authorUncertain: true, content: '说得对', location: '上海', timeLabel: '2023年9月14日'},
+    {author: '', authorUncertain: true, content: '说得对', location: '江苏', timeLabel: '2023年9月14日'},
+    {author: '', authorUncertain: true, content: '说得对', location: '上海', timeLabel: '2023年9月15日'},
+  ]};
+  const at = Date.parse(event().capturedAt), id = articleExternalId(link);
+  const articleItems = wechatComments(id, comments, at, {platform: 'wechat_articles'});
+  assert.equal(new Set(articleItems.map(item => item.commentId)).size, 3);
+  assert.deepEqual(wechatComments(id, comments, at, {platform: 'wechat_articles'}).map(item => item.commentId), articleItems.map(item => item.commentId));
+  const oldId = (author, content) => `wxcc_${createHash('sha256').update(`${id}||${author}|${content}`).digest('hex').slice(0, 24)}`;
+  for (const platform of [undefined, 'wechat_channels']) {
+    assert.deepEqual(wechatComments(id, comments, at, {platform}).map(item => item.commentId), Array(3).fill(oldId('', '说得对')));
+  }
+  const known = {items: comments.items.map(({authorUncertain, ...item}) => ({...item, author: '已知读者'}))};
+  assert.deepEqual(wechatComments(id, known, at, {platform: 'wechat_articles'}).map(item => item.commentId), Array(3).fill(oldId('已知读者', '说得对')));
+});
+
+test('T14 uncertain occurrences preserve missing or invalid contexts and bind replies to each actual parent occurrence', () => {
+  const uncertain = {author: '', authorUncertain: true, content: '同一句留言'};
+  const reply = {...uncertain, content: '收到', location: '上海', timeLabel: '2023年9月14日', reply: true};
+  const comments = {items: [
+    {author: '甲', content: '第一位父留言'}, {author: '乙', content: '第二位父留言'},
+    {...reply, parentIndex: 0}, {...reply, parentIndex: 1},
+    {...uncertain}, {...uncertain}, {...reply, parentIndex: 4}, {...reply, parentIndex: 5},
+    {author: '已知回复者', content: '已知作者的相同回复', reply: true, parentIndex: 5},
+    {...uncertain, location: '未知地区', timeLabel: '2023年2月30日'},
+    {...uncertain, location: '未知地区', timeLabel: '2023年2月30日'},
+    {...reply, parentIndex: 8},
+    {author: '已知回复者', content: '已知作者的相同回复', reply: true, parentIndex: 4},
+  ]};
+  const at = Date.parse(event().capturedAt), id = articleExternalId(link), options = {platform: 'wechat_articles'};
+  const items = wechatComments(id, comments, at, options);
+  assert.equal(new Set(items.map(item => item.commentId)).size, comments.items.length);
+  assert.deepEqual(wechatComments(id, comments, at, options), items, 'identical ordered evidence replays deterministically');
+  for (const [index, parent] of [[2, 0], [3, 1], [6, 4], [7, 5], [8, 5], [11, 8], [12, 4]]) {
+    assert.equal(items[index].parentCommentId, items[parent].commentId);
+  }
+  for (const index of [8, 12]) {
+    assert.equal(items[index].authorName, '已知回复者');
+    assert.equal(Object.hasOwn(items[index], 'authorUncertain'), false);
+    assert.equal(Object.hasOwn(items[index], 'uncertainArticleParent'), false, 'internal parent identity must not become a payload field');
+  }
+  const shifted = wechatComments(id, {items: [{author: '另一个已知作者', content: '前面新增的一条'}, ...comments.items.slice(4, 6)]}, at, options);
+  assert.deepEqual(shifted.slice(1).map(item => item.commentId), items.slice(4, 6).map(item => item.commentId),
+    'occurrence is per matching key, not the absolute floor index');
 });
 
 test('article date validation preserves calendar precision without making up seconds', () => {

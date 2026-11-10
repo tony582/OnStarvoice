@@ -100,16 +100,35 @@ export function commentDate(label, capturedAt) {
   return at === null ? '' : beijing(Math.floor(at / 1000)).slice(0, 10);
 }
 
-/** Comment ids from the post id, the parent's author/text and the comment's own author/text (no times). */
-export function wechatComments(externalId, comments, capturedAt) {
-  const keyOf = item => `${comparable(item.author)}|${comparable(item.content)}`;
-  return comments.items.map((item, index) => {
+/** Keep established author/text ids; uncertain article identities also use observed context and occurrence. */
+export function wechatComments(externalId, comments, capturedAt, {platform} = {}) {
+  // An unreadable article author cannot distinguish identical short comments from different places/dates.
+  // Keep video and known-author identities unchanged unless the article parent is uncertain.
+  const keyOf = item => `${comparable(item.author)}|${comparable(item.content)}`
+    + (platform === ARTICLE_PLATFORM && item.authorUncertain === true
+      ? `|${comparable(item.location)}|${commentDate(item.timeLabel, capturedAt)}` : '');
+  const converted = [], occurrences = new Map();
+  comments.items.forEach((item, index) => {
     const parent = item.reply && item.parentIndex !== null && comments.items[item.parentIndex] ? comments.items[item.parentIndex] : null;
-    const commentId = `wxcc_${sha(`${externalId}|${parent ? keyOf(parent) : ''}|${keyOf(item)}`).slice(0, 24)}`;
-    const parentCommentId = parent ? `wxcc_${sha(`${externalId}||${keyOf(parent)}`).slice(0, 24)}` : '';
-    return {commentId, parentCommentId, authorName: item.author, content: item.content, likes: item.likeCount ?? 0,
-      publishedAt: commentDate(item.timeLabel, capturedAt), ipLocation: item.location, floorIndex: index + 1, isReply: item.reply};
+    const parentCommentId = parent ? (platform === ARTICLE_PLATFORM && (item.authorUncertain === true || parent.authorUncertain === true) && converted[item.parentIndex]
+      ? converted[item.parentIndex].commentId : `wxcc_${sha(`${externalId}||${keyOf(parent)}`).slice(0, 24)}`) : '';
+    let identity = `${externalId}|${parent ? keyOf(parent) : ''}|${keyOf(item)}`;
+    if (platform === ARTICLE_PLATFORM && item.authorUncertain === true) {
+      const key = `${externalId}|${parentCommentId}|${keyOf(item)}`;
+      const occurrence = (occurrences.get(key) ?? 0) + 1;
+      occurrences.set(key, occurrence);
+      // Do not merge comments the device kept separate, including missing/invalid place or date context.
+      // This preserves same-batch order, not identity across reordered OCR captures.
+      identity = `${key}|occurrence:${occurrence}`;
+    } else if (platform === ARTICLE_PLATFORM && parent?.authorUncertain === true) {
+      // A known author replying to two uncertain parent occurrences must keep each parent relationship.
+      identity = `${externalId}|${parentCommentId}|${keyOf(item)}`;
+    }
+    const commentId = `wxcc_${sha(identity).slice(0, 24)}`;
+    converted.push({commentId, parentCommentId, authorName: item.author, content: item.content, likes: item.likeCount ?? 0,
+      publishedAt: commentDate(item.timeLabel, capturedAt), ipLocation: item.location, floorIndex: index + 1, isReply: item.reply});
   });
+  return converted;
 }
 
 // Comment readings come from OCR: the same comment read on another day can differ by a badge glyph after the name,

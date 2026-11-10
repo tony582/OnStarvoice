@@ -402,6 +402,33 @@ test('DOM patrol verifies its freshly copied canonical link without requiring a 
   assert.equal(result.comments.items.length, 2); assert.equal(result.article.url, shareUrl);
 });
 
+test('T14 real werxin OCR permits only the visit entry while typed and copied URLs stay exact', async () => {
+  const source = fixture('t14-claude-link-008').rows;
+  const target = 'https://mp.weixin.qq.com/s/DMk6rGTh3iI0OwUOm0htTg';
+  const visit = source.find(item => item.text === '访问网页');
+  const isVisitTap = call => call[0] === 'tap' && call[1] === Math.round(visit.x + visit.w / 2)
+    && call[2] === Math.round(visit.y + visit.h / 2);
+  for (const spelling of ['werxin', 'we1xin', 'welxin', 'weixin']) {
+    const rows = source.map(item => item.text.startsWith('mp.werxin.qq.com/s/')
+      ? {...item, text: item.text.replace('werxin', spelling)} : item);
+    const {flow, calls} = fake({resultPages: [rows], articleActivity: ARTICLE_LINK_ACTIVITY, copiedLink: target});
+    assert.deepEqual(await flow.openArticleLink({url: target, bodySource: 'page_dom'}), {opened: true, hasMore: false});
+    assert.deepEqual(calls.filter(call => call[0] === 'type'), [['type', target]]);
+    assert.ok(calls.some(isVisitTap));
+    assert.equal((await flow.copyLink()).shareUrl, target);
+  }
+  const wrongCopy = fake({resultPages: [source], articleActivity: ARTICLE_LINK_ACTIVITY,
+    copiedLink: target.replace('weixin', 'werxin')});
+  await wrongCopy.flow.openArticleLink({url: target, bodySource: 'page_dom'});
+  await assert.rejects(wrongCopy.flow.copyLink(), {code: 'link_not_copied'});
+  for (const domain of ['mp.werxin.qq.com.evil.test/s/DMk6', 'mp.we0xin.qq.com/s/DMk6']) {
+    const rows = source.map(item => item.text.startsWith('mp.werxin.qq.com/s/') ? {...item, text: domain} : item);
+    const {flow, calls} = fake({resultPages: [rows]});
+    await assert.rejects(flow.openArticleLink({url: target, bodySource: 'page_dom'}), {code: 'article_link_entry_unverified'});
+    assert.ok(!calls.some(isVisitTap), 'no visit tap for an unverified domain');
+  }
+});
+
 test('DOM supplemental header and copy proofs cannot be missing, changed, or reused across article openings', async () => {
   const {flow, calls, setStage} = fake({restoreAfterCopy: true});
   const result = await flow.search({keyword: '安吉星', sort: 'all'});

@@ -9,6 +9,99 @@ const row = (text, x, y, w = 500, h = 45) => ({text, x, y, w, h, conf: 1});
 const t9 = name => rows('t9-claude-phone-20261109')[name].rows;
 const t13 = name => rows('t13-claude-phone-20261110')[name].rows;
 const t13Comments = number => rows('t13-comment-footer-20261110')[`t12-renew-d/${number}`].rows;
+const t14Comments = number => rows('t14-comment-quality-20261110')[`t13-hidden-read-b/${number}`].rows;
+
+test('T14 real advertisement variants exclude the brand baseline and every ad line across consecutive frames', () => {
+  let merged = [];
+  for (const number of ['021', '022', '023']) {
+    const parsed = parseArticleComments(t14Comments(number), {reachedEnd: true});
+    assert.equal(parsed.comments.find(item => item.author === '欲.').content, '收费也能理解，毕竟人家提供了服务嘛');
+    merged = mergeArticleComments(merged, parsed.comments);
+  }
+  assert.equal(merged.find(item => item.author === '欲.').content, '收费也能理解，毕竟人家提供了服务嘛');
+  for (const marker of ['厂告～', '厂告♥', '广告～']) {
+    const parsed = parseArticleComments([row('留言2', 55, 400), row('甲 上海 11月9日', 163, 600),
+      row('我在全友全屋定制看到广告，这也是留言正文', 163, 680), row('任意品牌', 159, 793, 231, 39),
+      row(marker, 921, 800, 98, 33), row('这段是广告文案', 163, 850), row('了解更多', 163, 990),
+      row('乙 江苏 11月9日', 163, 1100), row('广告后的下一条正常留言', 163, 1180)]);
+    assert.deepEqual(parsed.comments.map(item => item.content), ['我在全友全屋定制看到广告，这也是留言正文', '广告后的下一条正常留言']);
+  }
+  const ordinary = parseArticleComments([row('留言1', 55, 400), row('甲 上海 11月9日', 163, 600),
+    row('厂告～', 163, 680), row('我在全友全屋定制看到广告', 163, 750)]);
+  assert.ok(ordinary.comments[0].content.includes('全友全屋定制'), 'a brand name or left-side text alone is not an ad boundary');
+});
+
+test('T14 uncertain single-symbol authors retain their comments and only mark uncertainty when present', () => {
+  for (const author of ['↓', '～', '※', '总']) {
+    const parsed = parseArticleComments([row('留言1', 55, 400), row(`${author} 安徽 2023年9月14日`, 163, 600), row('这个我觉得蛮正常', 163, 680)]);
+    assert.equal(parsed.comments.length, 1);
+    assert.equal(parsed.comments[0].author, ''); assert.equal(parsed.comments[0].authorUncertain, true);
+    assert.equal(parsed.comments[0].content, '这个我觉得蛮正常'); assert.equal(parsed.comments[0].likeCount, null);
+  }
+  for (const author of ['M.', '欲.', '王', '总经理']) {
+    const item = parseArticleComments([row('留言1', 55, 400), row(`${author} 安徽 2023年9月14日`, 163, 600), row('有效作者的留言', 163, 680)]).comments[0];
+    assert.equal(item.author, author); assert.equal(Object.hasOwn(item, 'authorUncertain'), false);
+  }
+});
+
+test('T14 cross-author merging needs valid equal region and date and chooses the better observed name', () => {
+  const one = {author: '杨瑞们', location: '安徽', timeLabel: '2023年9月14日', content: '这个通用没毛病，安吉星服务员里面也写的很清楚。我的雪佛兰就是。', reply: false, cut: false};
+  assert.equal(mergeArticleComments([one], [{...one, author: '杨瑞物'}]).length, 1);
+  const better = mergeArticleComments([{...one, author: '杨瑞', content: one.content + '长尾', cut: true}], [one]);
+  assert.equal(better.length, 1); assert.equal(better[0].author, one.author); assert.equal(better[0].content, one.content);
+  for (const change of [{location: '上海'}, {timeLabel: '2023年9月15日'}, {location: null}, {timeLabel: ''}]) {
+    assert.equal(mergeArticleComments([one], [{...one, author: '另一个人', ...change}]).length, 2);
+  }
+  for (const context of [{location: null}, {location: '未知'}, {timeLabel: '未显示'}, {timeLabel: '2023年13月14日'}, {timeLabel: '2023年2月30日'}]) {
+    assert.equal(mergeArticleComments([{...one, ...context}], [{...one, ...context, author: '另一个人'}]).length, 2);
+  }
+  const short = {...one, content: '确实这样'};
+  for (const author of [short.author, '另一个人', '']) {
+    const item = {...short, author, ...(author ? {} : {authorUncertain: true})};
+    assert.equal(mergeArticleComments([item], [{...item, location: '江苏'}]).length, 2);
+    assert.equal(mergeArticleComments([item], [{...item, timeLabel: '2023年9月15日'}]).length, 2);
+  }
+});
+
+test('T14 same-known-author hidden or foreign IP retains old overlap merging without using empty authors as proof', () => {
+  const one = {author: 'Alice 加拿大', location: null, timeLabel: '11月9日', content: '这是一条地区不显示的完整留言', reply: false, cut: true};
+  assert.equal(mergeArticleComments([one], [{...one, cut: false}]).length, 1);
+  assert.equal(mergeArticleComments([one], [{...one, location: '安徽', cut: false}]).length, 1);
+  const uncertain = {...one, author: '', authorUncertain: true};
+  assert.equal(mergeArticleComments([uncertain], [uncertain]).length, 2);
+  const explicitlyUncertain = mergeArticleComments([], [{...one, author: '错误读名', authorUncertain: true}])[0];
+  assert.equal(explicitlyUncertain.author, ''); assert.equal(explicitlyUncertain.authorUncertain, true);
+  const similar = {...uncertain, location: '安徽', content: '这是另一条地区不显示的完整留言'};
+  assert.equal(mergeArticleComments([{...uncertain, location: '安徽'}], [similar]).length, 2, 'uncertain authors cannot use the looser same-name threshold');
+});
+
+test('T14 a better author survives later uncertain frames while content completion and reply parent indices are preserved', () => {
+  const parent = {author: '', authorUncertain: true, location: '安徽', timeLabel: '2023年9月14日', content: '这个我觉得蛮正常', reply: false, cut: true};
+  const known = {...parent, author: '真实读者', cut: false}; delete known.authorUncertain;
+  const reply = {...known, content: '这是一条回复', reply: true};
+  const merged = mergeArticleComments([], [parent, reply]);
+  assert.equal(merged[1].parentIndex, 0);
+  const completed = mergeArticleComments(merged, [known, {...parent, cut: false}]);
+  assert.equal(completed.length, 2); assert.equal(completed[0].author, '真实读者');
+  assert.equal(Object.hasOwn(completed[0], 'authorUncertain'), false); assert.equal(completed[0].cut, false);
+  assert.equal(completed[1].reply, true); assert.equal(completed[1].parentIndex, 0);
+  assert.equal(mergeArticleComments([], [parent, {...parent, author: '另一条', content: '内容不同'}], 1).length, 1);
+});
+
+test('T14 identical replies under different parents stay separate and a repeated parent restores its reply context', () => {
+  const first = {author: '父甲', location: '安徽', timeLabel: '11月9日', content: '汽车套餐需要怎样续费', reply: false, cut: false};
+  const second = {...first, author: '父乙', content: '远程控制到期之后怎么办'};
+  const reply = {...first, author: '↓', content: '收到', reply: true};
+  const initial = mergeArticleComments([], [first, reply, second, {...reply, author: '※'}]);
+  assert.equal(initial.length, 4);
+  assert.deepEqual(initial.filter(item => item.reply).map(item => item.parentIndex), [0, 2]);
+  const repeated = mergeArticleComments(initial, [first, {...reply, author: '～'}]);
+  assert.equal(repeated.length, 4); assert.deepEqual(repeated.filter(item => item.reply).map(item => item.parentIndex), [0, 2]);
+  const newReply = mergeArticleComments(initial, [first, {...reply, author: '真实读者', content: '我也想知道续费方法'}]);
+  assert.equal(newReply.length, 5); assert.equal(newReply.at(-1).parentIndex, 0);
+  const limited = mergeArticleComments(initial.slice(0, 2), [second, {...reply, author: '父乙的新读者'}], 2);
+  assert.equal(limited[1].author, '', 'an unrecorded parent at the limit cannot authorize changing another parent\'s reply');
+});
 
 test('T13 merged 阅读原文 and read count require the paired footer control and preserve rounded precision', () => {
   const source = t13Comments(130), read = footerEvidence(source).read;
